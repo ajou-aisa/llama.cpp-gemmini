@@ -6,5 +6,5 @@ if [ "$1" = "static" ]; then
 fi
 mkdir -p "build-$target"
 cd "build-$target"
-cmake -DCMAKE_TOOLCHAIN_FILE=../cmake/$target.cmake ..
+cmake -DGGML_GEMMINI=ON -DCMAKE_TOOLCHAIN_FILE=../cmake/$target.cmake ..
 make llama-cli -j
