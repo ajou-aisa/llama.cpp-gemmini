@@ -6,7 +6,7 @@
 #include <vector>
 #include <cstring>
 
-// #include "gemmini.h"
+#include "include/gemmini.h"
 
 struct ggml_backend_gemmini_context {
     int n_threads = GGML_DEFAULT_N_THREADS;
