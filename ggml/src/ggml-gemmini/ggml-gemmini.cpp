@@ -11,7 +11,7 @@ static void ggml_backend_gemmini_mul_mat(
                                          struct ggml_tensor *dst, // FP32 output (I×J)
                                          struct ggml_tensor *bias) // optional FP32 bias (->int32)
 {
-    // pull test
+    // pull request test
     DBG("[Gemmini] mul_mat call\n");
 
     // 0. 원본 FP32 입력 텐서
