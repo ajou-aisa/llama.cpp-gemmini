@@ -19,6 +19,7 @@ struct ggml_backend_gemmini_context {
 
 static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context * ctx, struct ggml_tensor * dst) {
     printf("MUL_MAT called !\n");
+    // test
     GGML_UNUSED(ctx);
     GGML_UNUSED(dst);
 }
