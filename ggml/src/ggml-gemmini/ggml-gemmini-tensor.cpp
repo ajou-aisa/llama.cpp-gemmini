@@ -42,16 +42,16 @@ namespace zerogod
         this->cols_ = tensor_->ne[0];
 
         /* 4. __________________buffer 할당____________________ */
-        const size_t row_bytes = align_up(this.cols_ * elem_size, GEMMINI_ALIGN);
+        const size_t row_bytes = align_up(this->cols_ * elem_size, GEMMINI_ALIGN);
         buf_bytes_ = row_bytes * src_rows;
 
         if (buf_bytes_ == 0)
             buf_bytes_ = GEMMINI_ALIGN; // 최소 16 B 확보
 
         this->data_ = std::aligned_alloc(GEMMINI_ALIGN, buf_bytes_); // buffer을 16B 경계에 할당
-        GGML_ASSERT(this.data_ != nullptr);
+        GGML_ASSERT(this->data_ != nullptr);
 
-        tensor_->data = this.data_;
+        tensor_->data = this->data_;
         tensor_->nb[0] = elem_size;
         tensor_->nb[1] = row_bytes;
         stride_ = row_bytes / elem_size;
@@ -161,7 +161,7 @@ namespace zerogod
 
                 // 0-fill
                 if (src_cols < this->cols_)
-                    std::memset(dst_elem + src_cols, 0, (this.cols_ - src_cols) * elem_size);
+                    std::memset(dst_elem + src_cols, 0, (this->cols_ - src_cols) * elem_size);
 
                 dst_row += dst_row_bytes;
             }
