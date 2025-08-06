@@ -1,27 +1,84 @@
-#include "ggml-impl.h"
-#include "ggml-gemmini.h"
-#include "ggml-backend-impl.h"
+#define DEBUG 1
 
-#include <future>
-#include <vector>
-#include <cstring>
-
+#include "ggml-gemmini-tensor.h"
 #include "include/gemmini.h"
+#include <optional>
 
-struct ggml_backend_gemmini_context {
-    int n_threads = GGML_DEFAULT_N_THREADS;
-    std::unique_ptr<char[]> work_data;
-    size_t work_size = 0;
-#ifndef GGML_USE_OPENMP
-    std::vector<std::future<void>> tasks;
-#endif
-};
+using namespace zerogod;
 
-static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context * ctx, struct ggml_tensor * dst) {
-    printf("MUL_MAT called !\n");
-    // test
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
+static void ggml_backend_gemmini_mul_mat(
+                                         ggml_backend_gemmini_context *ctx,
+                                         struct ggml_tensor *dst, // FP32 output (I×J)
+                                         struct ggml_tensor *bias) // optional FP32 bias (->int32)
+{
+    // TODO: bias 처리
+    DBG("[Gemmini] mul_mat call\n");
+
+    // 0. 원본 FP32 입력 텐서
+    const auto *src0 = dst->src[0];         // A:  I × K
+    const auto *src1 = dst->src[1];         // B:  K × J (But transpose되어 메모리상 J x K)
+
+    DBG("\ndst shape:\n ne = [%llu, %llu, %llu, %llu]\n", dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
+    DBG("\nsrc0 shape:\n ne = [%llu, %llu, %llu, %llu]\n", src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);
+    DBG("\nsrc1 shape:\n ne = [%llu, %llu, %llu, %llu]\n", src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3]);
+
+    ggml_gemmini_tensor<int8_t> tA(ctx->tmp_ctx, src0, ".i8");
+    ggml_gemmini_tensor<int8_t> tB(ctx->tmp_ctx, src1, ".i8", false, true);
+    ggml_gemmini_tensor<int8_t> tC(ctx->tmp_ctx, dst, ".i8", true);
+    std::optional<ggml_gemmini_tensor<int32_t>> tD;
+    if (bias)
+        tD.emplace(ctx->tmp_ctx, bias, ".i32");
+
+    const size_t I = tC.get_rows(); // I = A.ne[1], K = A.ne[0]
+    const size_t J = tC.get_cols(); // K = B.ne[0], J = B.ne[1] (transpose)
+    const size_t K = tA.get_cols();
+    DBG("I=%zu, J=%zu, K=%zu\n", I, J, K);
+
+    // stride
+    const size_t sA = tA.get_stride();
+    const size_t sB = tB.get_stride();
+    const size_t sC = tC.get_stride();
+    GGML_ASSERT(sA % 16 == 0);
+    GGML_ASSERT(sB % 16 == 0);
+    GGML_ASSERT(sC % 16 == 0);
+
+    // bias tensor
+    std::vector<int32_t> zero_bias(tC.get_cols(), 0); 
+
+    const int32_t *bias_data = tD ? static_cast<int32_t *>(tD->get()) : zero_bias.data();
+    const size_t sD = tD ? tD->get_stride() : 0;
+    const bool repeating = tD ? tD->get_rows() == 1 : true;
+
+    DBG("calling tiled_matmul_auto: ptrA=%p ptrB=%p ptrD=%p ptrC=%p\n",
+           (void*)tA.get(), (void*)tB.get(), (void*)bias_data, (void*)tC.get());
+
+    // 5. Gemmini 호출
+    tiled_matmul_auto(I, J, K,
+                      (elem_t*)tA.get(),
+                      (elem_t*)tB.get(),
+                      (void*)bias_data,
+                      (elem_t*)tC.get(),
+                      sA, sB, sD, sC,
+                      1.f, 1.f, 1.f,
+                      NO_ACTIVATION,
+                      1, 1,
+                      repeating,
+                      false,    // transpose_A
+                      false,    // transpose_B
+                      false, false,
+                      0, CPU);
+
+    /*
+    // 6. int32 -> float 결과 복사 (stride 사용)
+    float   *out_f = (float*)dst->data;
+    int32_t *acc32 = (int32_t*)tC->data;
+    const size_t row_stride  = stride_e_C;
+
+    for (size_t r = 0; r < I; ++r)
+        memcpy(out_f + r * J,
+               acc32 + r * row_stride,
+               J * sizeof(float));
+    */
 }
 
 static void ggml_backend_gemmini_out_prod(ggml_backend_gemmini_context * ctx, struct ggml_tensor * dst) {
@@ -46,29 +103,56 @@ static void ggml_backend_gemmini_free(ggml_backend_t backend) {
 static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_gemmini_context * ctx = (ggml_backend_gemmini_context *)backend->context;
 
+    // (1) bias_map 갱신
+    ctx->bias_map.clear();
     for (int i = 0; i < cgraph->n_nodes; i++) {
-        struct ggml_tensor * node = cgraph->nodes[i];
+        auto *node = cgraph->nodes[i];
+        if (node->op == GGML_OP_ADD && node->src[0]->op == GGML_OP_MUL_MAT)
+            ctx->bias_map[node->src[0]] = node->src[1];
+    }
 
-        switch (node->op) {
-            case GGML_OP_MUL_MAT:
-                ggml_backend_gemmini_mul_mat(ctx, node);
-                break;
 
-            case GGML_OP_OUT_PROD:
-                // ggml_backend_gemmini_out_prod(ctx, node);
-                break;
+        struct ggml_init_params ip = {
+            /* .mem_size   = */ 320ull * 1024 * 1024, // 320MiB
+            /* .mem_buffer = */ NULL,
+            /* .no_alloc   = */ true, // 헤더만 
+        };
 
-            case GGML_OP_NONE:
-            case GGML_OP_RESHAPE:
-            case GGML_OP_VIEW:
-            case GGML_OP_PERMUTE:
-            case GGML_OP_TRANSPOSE:
-                break;
+        ctx->tmp_ctx = ggml_init(ip);
+        GGML_ASSERT(ctx->tmp_ctx);
 
-            default:
-                GGML_ABORT("%s: unsupported op %s\n", __func__, ggml_op_desc(node));
+
+    for (int i = 0; i < cgraph->n_nodes; i++)
+    {
+        struct ggml_tensor *node = cgraph->nodes[i];
+
+        switch (node->op)
+        {
+        case GGML_OP_MUL_MAT: {
+            ggml_tensor *bias = nullptr;
+            auto it = ctx->bias_map.find(node);
+            if (it != ctx->bias_map.end())
+                bias = it->second;
+
+            ggml_backend_gemmini_mul_mat(ctx, node, bias);
+
+        }
+        case GGML_OP_OUT_PROD:
+            // ggml_backend_gemmini_out_prod(ctx, node);
+            break;
+
+        case GGML_OP_NONE:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+            break;
+
+        default:
+            GGML_ABORT("%s: unsupported op %s\n", __func__, ggml_op_desc(node));
         }
     }
+    ctx->bias_map.clear();
 
     return GGML_STATUS_SUCCESS;
 
