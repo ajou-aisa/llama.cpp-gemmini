@@ -37,7 +37,6 @@ static inline int8_t sat_i8(int x) {
 
 static void ggml_backend_gemmini_mul_mat_test(const int i, const int j, const int k, tiled_matmul_type_t PATH) {
     GGML_ASSERT(i > 0 && j > 0 && k > 0);
-    GGML_ASSERT(i % 16 == 0 && j % 16 == 0 && k % 16 == 0);
 
     DBG("\n[Gemmini] mul_mat test called");
 
