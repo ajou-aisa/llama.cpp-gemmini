@@ -3,7 +3,6 @@
 
 #include "../ggml-gemmini-util.h"
 #include "include/gemmini.h"
-#include <optional>
 
 template <typename T>
 static inline void dump_matrix(const char* name, const T* m, int r, int c, int s);

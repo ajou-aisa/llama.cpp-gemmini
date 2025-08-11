@@ -1,4 +1,7 @@
 // ggml-gemmini-util.h
+#ifndef GGML_GEMMINI_UTIL_H
+#define GGML_GEMMINI_UTIL_H
+
 #ifndef DEBUG
 #define DEBUG 0
 #endif
@@ -131,3 +134,4 @@ namespace zerogod
         peak_bytes = zerogod::align_up(peak_bytes + 16*1024, GEMMINI_ALIGN);
     }
 }
+#endif // GGML_GEMMINI_UTIL_H
