@@ -1,8 +1,10 @@
 #define DEBUG 1
+#define TEST 1
 
 #include "ggml-gemmini-tensor.h"
 #include "include/gemmini.h"
 #include <optional>
+#include <test/ggml-gemmini-test.h>
 
 using namespace zerogod;
 
@@ -11,7 +13,11 @@ static void ggml_backend_gemmini_mul_mat(
                                          struct ggml_tensor *dst, // FP32 output (I×J)
                                          struct ggml_tensor *bias) // optional FP32 bias (->int32)
 {
-    // pull request test
+    if (TEST) {
+        ggml_backend_gemmini_mul_mat_test();
+        return;
+    }
+    
     DBG("[Gemmini] mul_mat call\n");
 
     // 0. 원본 FP32 입력 텐서
