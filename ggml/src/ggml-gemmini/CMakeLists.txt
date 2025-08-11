@@ -6,6 +6,7 @@ set(GEMMINI_SW_PATH $ENV{GEM_HOME})
 ggml_add_backend_library(ggml-gemmini
                          ggml-gemmini.cpp
                          ggml-gemmini-tensor.cpp
+                         test/ggml-gemmini-test.cpp
                         )
 
 target_compile_options(ggml-gemmini PRIVATE
