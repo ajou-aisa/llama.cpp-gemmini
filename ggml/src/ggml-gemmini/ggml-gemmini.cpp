@@ -4,7 +4,7 @@
 #include "ggml-gemmini-tensor.h"
 #include "include/gemmini.h"
 #include <optional>
-#include <test/ggml-gemmini-test.h>
+#include "test/ggml-gemmini-test.h"
 
 using namespace zerogod;
 

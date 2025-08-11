@@ -1,7 +1,7 @@
 #ifndef __GGML_GEMMINI_TEST_H__
 #define __GGML_GEMMINI_TEST_H__
 
-#include "ggml-gemmini-util.h"
+#include "../ggml-gemmini-util.h"
 #include "include/gemmini.h"
 #include <optional>
 
