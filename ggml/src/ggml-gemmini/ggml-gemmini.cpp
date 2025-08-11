@@ -54,31 +54,37 @@ static void ggml_backend_gemmini_mul_mat(
 
     // 5. Gemmini 호출
     tiled_matmul_auto(I, J, K,
-                      (elem_t*)tA.get(),
-                      (elem_t*)tB.get(),
-                      (void*)bias_data,
-                      (elem_t*)tC.get(),
+                      (elem_t *)tA.get(),
+                      (elem_t *)tB.get(),
+                      (void *)bias_data,
+                      (elem_t *)tC.get(),
                       sA, sB, sD, sC,
                       1.f, 1.f, 1.f,
                       NO_ACTIVATION,
                       1, 1,
                       repeating,
-                      false,    // transpose_A
-                      false,    // transpose_B
+                      false, // transpose_A
+                      false, // transpose_B
                       false, false,
                       0, CPU);
 
-    /*
-    // 6. int32 -> float 결과 복사 (stride 사용)
-    float   *out_f = (float*)dst->data;
-    int32_t *acc32 = (int32_t*)tC->data;
-    const size_t row_stride  = stride_e_C;
+    // 6. 결과를 tC(int8) -> dst(float)로 반영
+    const size_t sC = tC.get_stride(); // int8 요소 단위 stride (패딩 포함)
+    const size_t nb1_out = dst->nb[1]; // 출력 텐서 행 stride (bytes)
+
+    int8_t *c_i8 = static_cast<int8_t *>(tC.get());
+    uint8_t *out_base = static_cast<uint8_t *>(dst->data);
 
     for (size_t r = 0; r < I; ++r)
-        memcpy(out_f + r * J,
-               acc32 + r * row_stride,
-               J * sizeof(float));
-    */
+    {
+        const int8_t *row_c = c_i8 + r * sC;
+        float *row_out = reinterpret_cast<float *>(out_base + r * nb1_out);
+
+        // 스케일/클리핑 없이 그대로 float 캐스팅
+        for (size_t c = 0; c < J; ++c)
+            row_out[c] = static_cast<float>(row_c[c]);
+            // 패딩 영역(row_c[J..sC-1])은 무시
+    }
 }
 
 static void ggml_backend_gemmini_out_prod(ggml_backend_gemmini_context * ctx, struct ggml_tensor * dst) {
