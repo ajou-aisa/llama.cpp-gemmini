@@ -8,91 +8,6 @@
 
 using namespace zerogod;
 
-static void ggml_backend_gemmini_mul_mat(
-                                         ggml_backend_gemmini_context *ctx,
-                                         struct ggml_tensor *dst, // FP32 output (I×J)
-                                         struct ggml_tensor *bias) // optional FP32 bias (->int32)
-{
-    if (TEST)
-    {
-        ggml_backend_gemmini_mul_mat_test();
-        return;
-    }
-
-    DBG("[Gemmini] mul_mat call\n");
-
-    // 0. 원본 FP32 입력 텐서
-    const auto *src0 = dst->src[0];         // A:  I × K
-    const auto *src1 = dst->src[1];         // B:  K × J (But transpose되어 메모리상 J x K)
-
-    DBG("\ndst shape:\n ne = [%llu, %llu, %llu, %llu]\n", dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
-    DBG("\nsrc0 shape:\n ne = [%llu, %llu, %llu, %llu]\n", src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);
-    DBG("\nsrc1 shape:\n ne = [%llu, %llu, %llu, %llu]\n", src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3]);
-
-    ggml_gemmini_tensor<int8_t> tA(ctx->tmp_ctx, src0, ".i8");
-    ggml_gemmini_tensor<int8_t> tB(ctx->tmp_ctx, src1, ".i8", false, true);
-    ggml_gemmini_tensor<int8_t> tC(ctx->tmp_ctx, dst, ".i8", true);
-    std::optional<ggml_gemmini_tensor<int32_t>> tD;
-    if (bias)
-        tD.emplace(ctx->tmp_ctx, bias, ".i32");
-
-    const size_t I = tC.get_rows(); // I = A.ne[1], K = A.ne[0]
-    const size_t J = tC.get_cols(); // K = B.ne[0], J = B.ne[1] (transpose)
-    const size_t K = tA.get_cols();
-    DBG("I=%zu, J=%zu, K=%zu\n", I, J, K);
-
-    // stride
-    const size_t sA = tA.get_stride();
-    const size_t sB = tB.get_stride();
-    const size_t sC = tC.get_stride();
-    GGML_ASSERT(sA % 16 == 0);
-    GGML_ASSERT(sB % 16 == 0);
-    GGML_ASSERT(sC % 16 == 0);
-
-    // bias tensor
-    std::vector<int32_t> zero_bias(tC.get_cols(), 0); 
-
-    const int32_t *bias_data = tD ? static_cast<int32_t *>(tD->get()) : zero_bias.data();
-    const size_t sD = tD ? tD->get_stride() : 0;
-    const bool repeating = tD ? tD->get_rows() == 1 : true;
-
-    DBG("calling tiled_matmul_auto: ptrA=%p ptrB=%p ptrD=%p ptrC=%p\n",
-           (void*)tA.get(), (void*)tB.get(), (void*)bias_data, (void*)tC.get());
-
-    // 5. Gemmini 호출
-    tiled_matmul_auto(I, J, K,
-                      (elem_t *)tA.get(),
-                      (elem_t *)tB.get(),
-                      (void *)bias_data,
-                      (elem_t *)tC.get(),
-                      sA, sB, sD, sC,
-                      1.f, 1.f, 1.f,
-                      NO_ACTIVATION,
-                      1, 1,
-                      repeating,
-                      false, // transpose_A
-                      false, // transpose_B
-                      false, false,
-                      0, CPU);
-
-    // 6. 결과를 tC(int8) -> dst(float)로 반영
-    const size_t nb1_out = dst->nb[1]; // 출력 텐서 행 stride (bytes)
-
-    int8_t *c_i8 = static_cast<int8_t *>(tC.get());
-    uint8_t *out_base = static_cast<uint8_t *>(dst->data);
-
-    for (size_t r = 0; r < I; ++r)
-    {
-        const int8_t *row_c = c_i8 + r * sC;
-        float *row_out = reinterpret_cast<float *>(out_base + r * nb1_out);
-
-        // 스케일/클리핑 없이 그대로 float 캐스팅
-        for (size_t c = 0; c < J; ++c)
-            row_out[c] = static_cast<float>(row_c[c]);
-            // 패딩 영역(row_c[J..sC-1])은 무시
-    }
-}
-
 static void ggml_backend_gemmini_mul_mat_test() {
     DBG("[Gemmini] mul_mat test called");
 
@@ -169,6 +84,93 @@ static void ggml_backend_gemmini_mul_mat_test() {
     printf(ok ? "[OK] Gemmini matmul(+bias) matches expected\n"
               : "[FAIL] mismatch detected\n");
 }
+
+static void ggml_backend_gemmini_mul_mat(
+                                         ggml_backend_gemmini_context *ctx,
+                                         struct ggml_tensor *dst, // FP32 output (I×J)
+                                         struct ggml_tensor *bias) // optional FP32 bias (->int32)
+{
+    #if TEST
+    {
+        ggml_backend_gemmini_mul_mat_test();
+        return;
+    }
+    #endif
+
+    DBG("[Gemmini] mul_mat call\n");
+
+    // 0. 원본 FP32 입력 텐서
+    const auto *src0 = dst->src[0];         // A:  I × K
+    const auto *src1 = dst->src[1];         // B:  K × J (But transpose되어 메모리상 J x K)
+
+    DBG("\ndst shape:\n ne = [%llu, %llu, %llu, %llu]\n", dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
+    DBG("\nsrc0 shape:\n ne = [%llu, %llu, %llu, %llu]\n", src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);
+    DBG("\nsrc1 shape:\n ne = [%llu, %llu, %llu, %llu]\n", src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3]);
+
+    ggml_gemmini_tensor<int8_t> tA(ctx->tmp_ctx, src0, ".i8");
+    ggml_gemmini_tensor<int8_t> tB(ctx->tmp_ctx, src1, ".i8", false, true);
+    ggml_gemmini_tensor<int8_t> tC(ctx->tmp_ctx, dst, ".i8", true);
+    std::optional<ggml_gemmini_tensor<int32_t>> tD;
+    if (bias)
+        tD.emplace(ctx->tmp_ctx, bias, ".i32");
+
+    const size_t I = tC.get_rows(); // I = A.ne[1], K = A.ne[0]
+    const size_t J = tC.get_cols(); // K = B.ne[0], J = B.ne[1] (transpose)
+    const size_t K = tA.get_cols();
+    DBG("I=%zu, J=%zu, K=%zu\n", I, J, K);
+
+    // stride
+    const size_t sA = tA.get_stride();
+    const size_t sB = tB.get_stride();
+    const size_t sC = tC.get_stride();
+    GGML_ASSERT(sA % 16 == 0);
+    GGML_ASSERT(sB % 16 == 0);
+    GGML_ASSERT(sC % 16 == 0);
+
+    // bias tensor
+    std::vector<int32_t> zero_bias(tC.get_cols(), 0); 
+
+    const int32_t *bias_data = tD ? static_cast<int32_t *>(tD->get()) : zero_bias.data();
+    const size_t sD = tD ? tD->get_stride() : 0;
+    const bool repeating = tD ? tD->get_rows() == 1 : true;
+
+    DBG("calling tiled_matmul_auto: ptrA=%p ptrB=%p ptrD=%p ptrC=%p\n",
+           (void*)tA.get(), (void*)tB.get(), (void*)bias_data, (void*)tC.get());
+
+    // 5. Gemmini 호출
+    tiled_matmul_auto(I, J, K,
+                      (elem_t *)tA.get(),
+                      (elem_t *)tB.get(),
+                      (void *)bias_data,
+                      (elem_t *)tC.get(),
+                      sA, sB, sD, sC,
+                      1.f, 1.f, 1.f,
+                      NO_ACTIVATION,
+                      1, 1,
+                      repeating,
+                      false, // transpose_A
+                      false, // transpose_B
+                      false, false,
+                      0, CPU);
+
+    // 6. 결과를 tC(int8) -> dst(float)로 반영
+    const size_t nb1_out = dst->nb[1]; // 출력 텐서 행 stride (bytes)
+
+    int8_t *c_i8 = static_cast<int8_t *>(tC.get());
+    uint8_t *out_base = static_cast<uint8_t *>(dst->data);
+
+    for (size_t r = 0; r < I; ++r)
+    {
+        const int8_t *row_c = c_i8 + r * sC;
+        float *row_out = reinterpret_cast<float *>(out_base + r * nb1_out);
+
+        // 스케일/클리핑 없이 그대로 float 캐스팅
+        for (size_t c = 0; c < J; ++c)
+            row_out[c] = static_cast<float>(row_c[c]);
+            // 패딩 영역(row_c[J..sC-1])은 무시
+    }
+}
+
 
 static void ggml_backend_gemmini_out_prod(ggml_backend_gemmini_context * ctx, struct ggml_tensor * dst) {
     GGML_UNUSED(ctx);
