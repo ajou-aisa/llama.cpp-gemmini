@@ -69,7 +69,6 @@ static void ggml_backend_gemmini_mul_mat(
                       0, CPU);
 
     // 6. 결과를 tC(int8) -> dst(float)로 반영
-    const size_t sC = tC.get_stride(); // int8 요소 단위 stride (패딩 포함)
     const size_t nb1_out = dst->nb[1]; // 출력 텐서 행 stride (bytes)
 
     int8_t *c_i8 = static_cast<int8_t *>(tC.get());
