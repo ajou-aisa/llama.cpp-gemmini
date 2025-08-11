@@ -1,5 +1,7 @@
 // ggml-gemmini-test.cpp
 #include "ggml-gemmini-test.h"
+#include <cstdio>
+#include <type_traits>
 
 template <typename T>
 static inline void dump_matrix(const char *name, const T *m, int r, int c, int s)
