@@ -35,42 +35,60 @@ static inline int8_t sat_i8(int x) {
     return x > 127 ? 127 : (x < -128 ? -128 : (int8_t)x);
 }
 
-static void ggml_backend_gemmini_mul_mat_test() {
-    DBG("[Gemmini] mul_mat test called");
+static void ggml_backend_gemmini_mul_mat_test(const int i, const int j, const int k, tiled_matmul_type_t PATH) {
+    GGML_ASSERT(i > 0 && j > 0 && k > 0);
+    GGML_ASSERT(i % 16 == 0 && j % 16 == 0 && k % 16 == 0);
 
-    constexpr int I = 2, J = 2, K = 2;
-    constexpr size_t sA = K, sB = J, sD = J, sC = J;
+    DBG("\n[Gemmini] mul_mat test called");
 
-    alignas(16) elem_t A[I * sA] = {}; // IxK
-    alignas(16) elem_t B[K * sB] = {}; // KxJ
-    alignas(16) elem_t C[I * sC] = {}; // IxJ
+    const size_t I = (size_t)i, J = (size_t)j, K = (size_t)k;
+    const size_t sA = K, sB = J, sC = J, sD = J;
+    DBG("\nI=%zu, J=%zu, K=%zu\n", I, J, K);
 
-    alignas(64) elem_t C_expected[I * sC] = {}; // 기대값
-    alignas(16) acc_t D[I * sC] = {1, 2, 3, 4}; // IxJ, bias
-
-    int e = 1;
-    auto init_matrix = [&e](elem_t *mat, int row, int stride)
+    auto alloc16 = [](size_t bytes) -> void *
     {
-        for (int i = 0; i < row; i++)
-            for (int j = 0; j < stride; j++)
-                mat[i * stride + j] = e++;
+        void *p = std::aligned_alloc(16, bytes);
+        if(!p) fprintf(stderr, "aligned_alloc failed\n");
+        memset(p, 0, bytes);
+        return p;
     };
 
-    init_matrix(A, I, sA); // [[1, 2], [3, 4]]
-    init_matrix(B, K, sB); // KxJ, [[5, 6], [7, 8]]
+    elem_t *A = (elem_t *)alloc16(I * sA * sizeof(elem_t)); // IxK
+    elem_t *B = (elem_t *)alloc16(K * sB * sizeof(elem_t)); // K×J
+    elem_t *C = (elem_t *)alloc16(I * sC * sizeof(elem_t)); // I×J
+
+    elem_t *C_expected = (elem_t *)alloc16(I * sC * sizeof(elem_t)); // expected value
+    acc_t *D = (acc_t *)alloc16(I * sD * sizeof(acc_t));             // I×J bias
+
+    int e = 1;
+
+    // init A
+    for (size_t r = 0; r < I; ++r)
+        for (size_t c = 0; c < K; ++c)
+            A[r * sA + c] = (elem_t)(e++);
+
+    e = 10;
+    // init B
+    for (size_t r = 0; r < K; ++r)
+        for (size_t c = 0; c < J; ++c)
+            B[r * sB + c] = (elem_t)(e++);
+
+    // init D
+    for (size_t r = 0; r < I; ++r)
+        for (size_t c = 0; c < J; ++c)
+            D[r * sD + c] = (acc_t)((r * J + c) % 7);
 
     // expected
-    for (int i = 0; i < I; ++i)
+    for (size_t r = 0; r < I; ++r)
     {
-        for (int j = 0; j < J; ++j)
+        for (size_t c = 0; c < J; ++c)
         {
             int acc = 0; // 필요시 acc_t
             for (int k = 0; k < K; ++k)
-            {
-                acc += (int)A[i * sA + k] * (int)B[k * sB + j];
-            }
-            acc += (int)D[i * sD + j];
-            C_expected[i * sC + j] = (elem_t)sat_i8(acc);
+                acc += (int)A[r * sA + k] * (int)B[k * sB + c];
+
+            acc += (int)D[r * sD + c];
+            C_expected[r * sC + c] = (elem_t)sat_i8(acc);
         }
     }
 
@@ -89,21 +107,21 @@ static void ggml_backend_gemmini_mul_mat_test() {
                       false, // transpose_A
                       false, // transpose_B
                       false, false,
-                      0, CPU);
+                      0, PATH);
 
     dump_matrix("C (result from gemmini)", C, I, J, sC);
 
     // compare
     bool ok = true;
-    for (int i = 0; i < I; ++i)
+    for (size_t r = 0; r < I; ++r)
     {
-        for (int j = 0; j < J; ++j)
+        for (size_t c = 0; c < J; ++c)
         {
-            int8_t got = C[i * sC + j];
-            int8_t exp = C_expected[i * sC + j];
+            elem_t got = C[r * sC + c];
+            elem_t exp = C_expected[r * sC + c];
             if (got != exp)
             {
-                printf("[NG] mismatch (%d, %d): got=%d exp=%d\n", i, j, got, exp);
+                printf("[NG] mismatch (%d, %d): got=%d exp=%d\n", r, c, got, exp);
                 ok = false;
             }
         }
