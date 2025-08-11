@@ -15,8 +15,8 @@ static void ggml_backend_gemmini_mul_mat(
 {
     #if TEST
     {
-        //Resnet test와 동일 차원
-        ggml_backend_gemmini_mul_mat_test(12544, 64, 256, CPU);
+        //Resnet test와 동일 차원 스케일
+        ggml_backend_gemmini_mul_mat_test(784, 4, 16, CPU);
         return;
     }
     #endif

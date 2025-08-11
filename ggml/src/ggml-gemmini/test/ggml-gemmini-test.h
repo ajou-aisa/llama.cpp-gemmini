@@ -61,22 +61,25 @@ static void ggml_backend_gemmini_mul_mat_test(const int i, const int j, const in
     acc_t *D = (acc_t *)alloc16(I * sD * sizeof(acc_t));             // I×J bias
 
     int e = 1;
+    // 포화 방지
+    int t = (int)std::floor(std::sqrt(127.0 / (double)K));
+    int leftover = 127 - (int)(K * t * (long long)t); // 0..127
+    int db = std::min(4, std::max(0, leftover));
 
     // init A
     for (size_t r = 0; r < I; ++r)
         for (size_t c = 0; c < K; ++c)
-            A[r * sA + c] = (elem_t)(e++);
+            A[r * sA + c] = (elem_t)(e++ % (2 * t + 1) - t);
 
-    e = 10;
     // init B
     for (size_t r = 0; r < K; ++r)
         for (size_t c = 0; c < J; ++c)
-            B[r * sB + c] = (elem_t)(e++);
+            B[r * sB + c] = (elem_t)(e++ % (2 * t + 1) - t);
 
     // init D
     for (size_t r = 0; r < I; ++r)
         for (size_t c = 0; c < J; ++c)
-            D[r * sD + c] = (acc_t)((r * J + c) % 7);
+            D[r * sD + c] = (acc_t)((e++ % (2*db + 1)) - db);
 
     // expected
     for (size_t r = 0; r < I; ++r)
