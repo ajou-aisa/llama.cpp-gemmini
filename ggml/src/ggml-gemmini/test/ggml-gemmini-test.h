@@ -2,7 +2,7 @@
 #ifndef __GGML_GEMMINI_TEST_H__
 #define __GGML_GEMMINI_TEST_H__
 
-#include "include/gemmini.h"
+#include "include/gemmini_params.h"
 
 
 template <typename T>
