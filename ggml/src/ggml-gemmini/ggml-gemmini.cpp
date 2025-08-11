@@ -1,5 +1,5 @@
 #define DEBUG 1
-#define TEST 1
+#define TEST 0
 
 #include "ggml-gemmini-tensor.h"
 #include "include/gemmini.h"
@@ -15,8 +15,8 @@ static void ggml_backend_gemmini_mul_mat(
 {
     #if TEST
     {
-        //Resnet test와 동일 차원 스케일
-        ggml_backend_gemmini_mul_mat_test(784, 4, 16, CPU);
+        //Resnet test와 동일 차원 스케일 (784, 4, 16) 통과
+        ggml_backend_gemmini_mul_mat_test(2, 3, 2, CPU);
         return;
     }
     #endif
