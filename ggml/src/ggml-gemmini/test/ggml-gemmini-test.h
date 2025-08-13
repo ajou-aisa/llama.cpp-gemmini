@@ -41,14 +41,22 @@ static void ggml_backend_gemmini_mul_mat_test(const int i, const int j, const in
     DBG("\n[Gemmini] mul_mat test called");
 
     const size_t I = (size_t)i, J = (size_t)j, K = (size_t)k;
-    const size_t sA = K, sB = J, sC = J, sD = J;
+    // stride
+    const size_t sA = align_up(K, 16 / sizeof(elem_t));
+    const size_t sB = align_up(J, 16 / sizeof(elem_t)); 
+    const size_t sC = align_up(J, 16 / sizeof(elem_t));
+    const size_t sD = align_up(J, 16 / sizeof(acc_t));
+
     DBG("\nI=%zu, J=%zu, K=%zu\n", I, J, K);
 
     auto alloc16 = [](size_t bytes) -> void *
     {
         void *p = std::aligned_alloc(16, bytes);
-        if(!p) fprintf(stderr, "aligned_alloc failed\n");
-        memset(p, 0, bytes);
+        if(!p) {
+            DBG("aligned_alloc failed (bytes=%zu)\n", bytes);
+            std::abort();
+        }
+        std::memset(p, 0, bytes);
         return p;
     };
 
@@ -123,7 +131,7 @@ static void ggml_backend_gemmini_mul_mat_test(const int i, const int j, const in
             elem_t exp = C_expected[r * sC + c];
             if (got != exp)
             {
-                printf("[NG] mismatch (%d, %d): got=%d exp=%d\n", r, c, got, exp);
+                printf("[NG] mismatch (%zu, %zu): got=%d exp=%d\n", r, c, (int)got, (int)exp);
                 ok = false;
             }
         }

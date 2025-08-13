@@ -15,8 +15,11 @@ static void ggml_backend_gemmini_mul_mat(
 {
     #if TEST
     {
-        //Resnet test와 동일 차원 스케일 (784, 4, 16) 통과
-        ggml_backend_gemmini_mul_mat_test(2, 3, 2, CPU);
+        // PATH로 'OS', 'WS', 'CPU' 제어
+        ggml_backend_gemmini_mul_mat_test(/* I */2, 
+                                          /* J */3, 
+                                          /* K */2, 
+                                          /* PATH */ CPU);
         return;
     }
     #endif
