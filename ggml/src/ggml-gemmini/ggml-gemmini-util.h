@@ -23,8 +23,12 @@
 #if DEBUG 
     #define DBG(fmt, ...) \
         fprintf(stderr, "[%s:%d] %s(): " fmt "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__)
+    // simple debug    
+    #define DBG0(fmt, ...) \
+        fprintf(stderr, fmt, ##__VA_ARGS__)
 #else
     #define DBG(fmt, ...)  ((void)0)
+    #define DBG0(fmt, ...) ((void)0)
 #endif
 
 
