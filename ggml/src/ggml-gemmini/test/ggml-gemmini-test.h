@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <type_traits>
 
+using namespace zerogod;
+
 template <typename T>
 static inline void dump_matrix(const char* name, const T* m, int r, int c, int s) {
     printf("%s =\n", name);
