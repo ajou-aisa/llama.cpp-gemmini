@@ -10,26 +10,26 @@ using namespace zerogod;
 
 template <typename T>
 static inline void dump_matrix(const char* name, const T* m, int r, int c, int s) {
-    printf("%s =\n", name);
+    DBG0("%s =\n", name);
     for (int i = 0; i < r; ++i)
     {
-        printf("[ ");
+        DBG0("[ ");
         for (int j = 0; j < c; ++j)
         {
             const T v = m[i * s + j];
             if constexpr (std::is_integral_v<T>)
             {
                 if constexpr (sizeof(T) <= sizeof(int))
-                    printf("%d ", (int)v);
+                    DBG0("%d ", (int)v);
                 else
-                    printf("%lld ", (long long)v);
+                    DBG0("%lld ", (long long)v);
             }
             else
             {
-                printf("%g ", (double)v);
+                DBG0("%g ", (double)v);
             }
         }
-        printf("]\n");
+        DBG0("]\n");
     }
 };
 
@@ -40,7 +40,7 @@ static inline int8_t sat_i8(int x) {
 static void ggml_backend_gemmini_mul_mat_test(const int i, const int j, const int k, tiled_matmul_type_t PATH) {
     GGML_ASSERT(i > 0 && j > 0 && k > 0);
 
-    DBG("\n[Gemmini] mul_mat test called");
+    DBG0("\n[Gemmini] mul_mat test called");
 
     const size_t I = (size_t)i, J = (size_t)j, K = (size_t)k;
     // stride
@@ -49,13 +49,13 @@ static void ggml_backend_gemmini_mul_mat_test(const int i, const int j, const in
     const size_t sC = align_up(J, 16 / sizeof(elem_t));
     const size_t sD = align_up(J, 16 / sizeof(acc_t));
 
-    DBG("\nI=%zu, J=%zu, K=%zu\n", I, J, K);
+    DBG0("\nI=%zu, J=%zu, K=%zu\n", I, J, K);
 
     auto alloc16 = [](size_t bytes) -> void *
     {
         void *p = std::aligned_alloc(16, bytes);
         if(!p) {
-            DBG("aligned_alloc failed (bytes=%zu)\n", bytes);
+            DBG0("aligned_alloc failed (bytes=%zu)\n", bytes);
             std::abort();
         }
         std::memset(p, 0, bytes);
@@ -133,12 +133,14 @@ static void ggml_backend_gemmini_mul_mat_test(const int i, const int j, const in
             elem_t exp = C_expected[r * sC + c];
             if (got != exp)
             {
-                printf("[NG] mismatch (%zu, %zu): got=%d exp=%d\n", r, c, (int)got, (int)exp);
+                DBG0("[NG] mismatch (%zu, %zu): got=%d exp=%d\n", r, c, (int)got, (int)exp);
                 ok = false;
             }
         }
     }
-    printf(ok ? "[OK] Gemmini matmul(+bias) matches expected\n"
-              : "[FAIL] mismatch detected\n");
+    if (ok)
+        DBG0("[OK] Gemmini matmul(+bias) matches expected\n");
+    else    
+        DBG0("[FAIL] mismatch detected\n");
 }
 #endif // __GGML_GEMMINI_TEST_H__
