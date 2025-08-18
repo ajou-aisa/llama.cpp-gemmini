@@ -129,16 +129,14 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
             ctx->bias_map[node->src[0]] = node->src[1];
     }
 
+    struct ggml_init_params ip = {
+        /* .mem_size   = */ 320ull * 1024 * 1024, // 320MiB
+        /* .mem_buffer = */ NULL,
+        /* .no_alloc   = */ true, // 헤더만
+    };
 
-        struct ggml_init_params ip = {
-            /* .mem_size   = */ 320ull * 1024 * 1024, // 320MiB
-            /* .mem_buffer = */ NULL,
-            /* .no_alloc   = */ true, // 헤더만 
-        };
-
-        ctx->tmp_ctx = ggml_init(ip);
-        GGML_ASSERT(ctx->tmp_ctx);
-
+    ctx->tmp_ctx = ggml_init(ip);
+    GGML_ASSERT(ctx->tmp_ctx);
 
     for (int i = 0; i < cgraph->n_nodes; i++)
     {
