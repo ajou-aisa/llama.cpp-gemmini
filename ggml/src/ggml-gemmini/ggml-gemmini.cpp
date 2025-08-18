@@ -151,7 +151,7 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
                 bias = it->second;
 
             ggml_backend_gemmini_mul_mat(ctx, node, bias);
-
+            break;
         }
         case GGML_OP_OUT_PROD:
             // ggml_backend_gemmini_out_prod(ctx, node);
@@ -169,6 +169,9 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
         }
     }
     ctx->bias_map.clear();
+    // tmp_ctx 해제
+    ggml_free(ctx->tmp_ctx);
+    ctx->tmp_ctx = nullptr;
 
     return GGML_STATUS_SUCCESS;
 
