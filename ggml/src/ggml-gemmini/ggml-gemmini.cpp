@@ -36,9 +36,9 @@ static void ggml_backend_gemmini_mul_mat(
     DBG("\nsrc0 shape:\n ne = [%llu, %llu, %llu, %llu]\n", src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);
     DBG("\nsrc1 shape:\n ne = [%llu, %llu, %llu, %llu]\n", src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3]);
 
-    ggml_gemmini_tensor<int8_t> tA(ctx->tmp_ctx, src0, ".i8");
-    ggml_gemmini_tensor<int8_t> tB(ctx->tmp_ctx, src1, ".i8", false, true);
-    ggml_gemmini_tensor<int8_t> tC(ctx->tmp_ctx, dst, ".i8", true);
+    ggml_gemmini_tensor<int8_t> tA(ctx->tmp_ctx, src1, ".i8"); // IxK (1xK)
+    ggml_gemmini_tensor<int8_t> tB(ctx->tmp_ctx, src0, ".i8", false, true); // KxJ
+    ggml_gemmini_tensor<int8_t> tC(ctx->tmp_ctx, dst, ".i8", true); // IxJ (1xJ)
     std::optional<ggml_gemmini_tensor<int32_t>> tD;
     if (bias)
         tD.emplace(ctx->tmp_ctx, bias, ".i32");
@@ -137,7 +137,7 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
     }
 
     struct ggml_init_params ip = {
-        /* .mem_size   = */ 8ull * 1024 * 1024, // 320MiB
+        /* .mem_size   = */ 8ull * 1024 * 1024, // 8MiB
         /* .mem_buffer = */ NULL,
         /* .no_alloc   = */ true, // 헤더만
     };
