@@ -13,6 +13,8 @@ static void ggml_backend_gemmini_mul_mat(
                                          struct ggml_tensor *dst, // FP32 output (I×J)
                                          struct ggml_tensor *bias) // optional FP32 bias (->int32)
 {
+    size_t mu0 = ggml_used_mem(ctx->tmp_ctx);
+
     #if TEST
     {
         // PATH로 'OS', 'WS', 'CPU' 제어
@@ -40,6 +42,11 @@ static void ggml_backend_gemmini_mul_mat(
     std::optional<ggml_gemmini_tensor<int32_t>> tD;
     if (bias)
         tD.emplace(ctx->tmp_ctx, bias, ".i32");
+
+    // 메모리 사용량 측정
+    size_t mu1 = ggml_used_mem(ctx->tmp_ctx);
+    size_t mul_hdr = (mu1 >= mu0) ? (mu1 - mu0) : mu1;
+    DBG("[Gemmini] MUL_MAT header used = %zu bytes\n", mul_hdr);
 
     const size_t I = tC.get_rows(); // I = A.ne[1], K = A.ne[0]
     const size_t J = tC.get_cols(); // K = B.ne[0], J = B.ne[1] (transpose)
@@ -130,13 +137,18 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
     }
 
     struct ggml_init_params ip = {
-        /* .mem_size   = */ 320ull * 1024 * 1024, // 320MiB
+        /* .mem_size   = */ 8ull * 1024 * 1024, // 320MiB
         /* .mem_buffer = */ NULL,
         /* .no_alloc   = */ true, // 헤더만
     };
 
     ctx->tmp_ctx = ggml_init(ip);
     GGML_ASSERT(ctx->tmp_ctx);
+
+    // 메모리 사용량 측정
+    DBG("[Gemmini] sizeof(ggml_tensor) = %zu\n", sizeof(struct ggml_tensor));
+    size_t used0 = ggml_used_mem(ctx->tmp_ctx);
+    DBG("[Gemmini] tmp_ctx used(start) = %zu bytes\n", used0);
 
     for (int i = 0; i < cgraph->n_nodes; i++)
     {
@@ -168,6 +180,10 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
             GGML_ABORT("%s: unsupported op %s\n", __func__, ggml_op_desc(node));
         }
     }
+    size_t used1 = ggml_used_mem(ctx->tmp_ctx);
+    size_t hdr_bytes = (used1 >= used0) ? (used1 - used0) : used1; // 방어적
+    DBG("[Gemmini] tmp_ctx header used(total) = %zu bytes (%.2f MiB)\n", hdr_bytes, hdr_bytes / (1024.0 * 1024.0));
+
     ctx->bias_map.clear();
     // tmp_ctx 해제
     ggml_free(ctx->tmp_ctx);
