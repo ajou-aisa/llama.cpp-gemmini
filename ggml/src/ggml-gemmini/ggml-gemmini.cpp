@@ -110,7 +110,7 @@ static void ggml_backend_gemmini_mul_mat(
                       false, // transpose_A
                       false, // transpose_B
                       false, false,
-                      0, CPU);
+                      0, OPTION);
     /* _______________________________________ */
 
     /* _____________ 6. Gemmini 연산 결과를 원본 출력 텐서로 반영 _____________ */
