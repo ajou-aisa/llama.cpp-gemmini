@@ -1,6 +1,4 @@
-#define DEBUG 1
-#define TEST 0
-#define OPTION CPU // OS, WS, CPU
+// ggml-gemmini.cpp
 
 #include "ggml-gemmini-tensor.h"
 #include "include/gemmini.h"
