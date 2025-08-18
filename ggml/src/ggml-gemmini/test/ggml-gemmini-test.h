@@ -2,6 +2,10 @@
 #ifndef __GGML_GEMMINI_TEST_H__
 #define __GGML_GEMMINI_TEST_H__
 
+#ifndef OPTION
+#define OPTION CPU
+#endif
+
 #include "include/gemmini.h"
 #include <cstdio>
 #include <type_traits>
@@ -37,7 +41,7 @@ static inline int8_t sat_i8(int x) {
     return x > 127 ? 127 : (x < -128 ? -128 : (int8_t)x);
 }
 
-static void ggml_backend_gemmini_mul_mat_test(const int i, const int j, const int k, tiled_matmul_type_t PATH) {
+static void ggml_backend_gemmini_mul_mat_test(const int i, const int j, const int k) {
     GGML_ASSERT(i > 0 && j > 0 && k > 0);
 
     DBG0("\n[Gemmini] mul_mat test called");
@@ -119,7 +123,7 @@ static void ggml_backend_gemmini_mul_mat_test(const int i, const int j, const in
                       false, // transpose_A
                       false, // transpose_B
                       false, false,
-                      0, PATH);
+                      0, OPTION);
 
     dump_matrix("C (result from gemmini)", C, I, J, sC);
 

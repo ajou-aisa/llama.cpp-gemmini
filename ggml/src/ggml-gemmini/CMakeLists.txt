@@ -19,6 +19,14 @@ target_compile_options(ggml-gemmini PRIVATE
   -ffast-math
 )
 
+target_compile_definitions(ggml-gemmini PRIVATE
+  DEBUG=1         # ggml-gemmini-util.h에서 쓰는 DEBUG 매크로
+  TEST=0          # 필요 시
+  PRINT_TILE=0    # 필요 시
+  OPTION=CPU      # OS/WS/CPU
+)
+
+
 target_include_directories(ggml-gemmini PRIVATE
   ${RISCV_TOOL_PATH}/sysroot/include
   ${GEMMINI_SW_PATH}/gemmini-rocc-tests
