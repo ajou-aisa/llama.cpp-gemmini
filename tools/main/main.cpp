@@ -5,7 +5,7 @@
 #include "sampling.h"
 #include "llama.h"
 #include "chat.h"
-
+#include "../../../gemmini-rocc-tests/include/cyclereader.h"
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -90,6 +90,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    uint64_t start_cycle = read_cycles();
+    printf("start cycle : %lu \n", start_cycle);
     common_init();
 
     auto & sparams = params.sampling;
@@ -973,5 +975,8 @@ int main(int argc, char ** argv) {
     ggml_threadpool_free_fn(threadpool);
     ggml_threadpool_free_fn(threadpool_batch);
 
+    uint64_t end_cycle = read_cycles();
+    printf("end cycle : %lu \n", end_cycle);
+    printf("total elapsed cycle : %lu \n", end_cycle - start_cycle);
     return 0;
 }
