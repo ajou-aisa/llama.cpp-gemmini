@@ -7,6 +7,7 @@
 
 using namespace zerogod;
 
+// Cycle 측정 용
 uint64_t start, end;
 uint64_t bias_mapping_cycles = 0, bias_getting_cycles = 0, tmp_ctx_cycles = 0, gemmini_tensor_cycles = 0, 
 out_copy_cycles = 0, before_gemmini_overhead_cycles = 0, after_gemmini_overhead_cycles = 0;
@@ -102,9 +103,9 @@ static void ggml_backend_gemmini_mul_mat(
 
     end = read_cycles();
     gemmini_tensor_cycles = (end - start);
-    fprintf(stderr, "[gemmini_tensor_cycles] start = %d, end = %d, elapsed = %d\n", start, end, end - start);
+    fprintf(stderr, "[gemmini_tensor_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
     before_gemmini_overhead_cycles += gemmini_tensor_cycles;
-    fprintf(stderr, "[before_gemmini_overhead_cycles] = %d\n", before_gemmini_overhead_cycles);
+    fprintf(stderr, "[before_gemmini_overhead_cycles] = %lu\n", before_gemmini_overhead_cycles);
     /* --------------------------------- Cycle -------------------------------- */
 
     /* __ 5. Gemmini tiled_matmul_auto 호출 __ */
@@ -146,11 +147,11 @@ static void ggml_backend_gemmini_mul_mat(
     /* ____________________________________________________________________ */
     end = read_cycles();
     out_copy_cycles = (end - start);
-    fprintf(stderr, "[out_copy_cycles] start = %d, end = %d, elapsed = %d\n", start, end, end - start);
+    fprintf(stderr, "[out_copy_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
 
     after_gemmini_overhead_cycles += out_copy_cycles;
     /* --------------------------------- Cycle -------------------------------- */
-    fprintf(stderr, "[after_gemmini_overhead_cycles] = %d\n", after_gemmini_overhead_cycles);
+    fprintf(stderr, "[after_gemmini_overhead_cycles] = %lu\n", after_gemmini_overhead_cycles);
 
 }
 
@@ -190,7 +191,7 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
     }
     end = read_cycles();
     bias_mapping_cycles = (end - start);
-    fprintf(stderr, "[bias_mapping_cycles] start = %d, end = %d, elapsed = %d\n", start, end, end - start);
+    printf("[bias_mapping_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
 
     start = read_cycles();
     struct ggml_init_params ip = {
@@ -204,7 +205,7 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
 
     end = read_cycles();
     tmp_ctx_cycles += (end - start);
-    fprintf(stderr, "[tmp_ctx_cycles] start = %d, end = %d, elapsed = %d\n", start, end, end - start);
+    printf("[tmp_ctx_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
     /* --------------------------------- Cycle -------------------------------- */
 
 /* __________________________ Debug: 헤더 사용량 측정 ____________________________ */
@@ -234,7 +235,7 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
 
             end = read_cycles();
             bias_getting_cycles += (start - end);
-            fprintf(stderr, "[bias_getting_cycles] start = %d, end = %d, elapsed = %d\n", start, end, end - start);
+            fprintf(stderr, "[bias_getting_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
             /* --------------------------------- Cycle -------------------------------- */
             
             ggml_backend_gemmini_mul_mat(ctx, node, bias);
