@@ -169,6 +169,7 @@ namespace zerogod
         }
         case GGML_TYPE_Q8_0:
         {
+            DBG("----------------------Q8_0 type----------------------\n")
             DBG("\nchecking q8_0 tensor: type=%s, cols=%d, rows=%d, buf_bytes=%zu\n", ggml_type_name(src->type), src->ne[0], src>ne[1], buf_bytes_);
 
             const int64_t K = src0->ne[0];                 // 열 길이 (k)
@@ -200,6 +201,7 @@ namespace zerogod
 
             std::memset(dst_row, 0, buf_bytes_); // 임시 패딩
             break;
+            DBG("----------------------Q8_0 type end----------------------\n")
         }
         default:
         {
