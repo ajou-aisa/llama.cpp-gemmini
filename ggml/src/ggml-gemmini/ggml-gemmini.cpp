@@ -153,6 +153,7 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
+        case GGML_OP_ADD:
             break;
 
         default:
