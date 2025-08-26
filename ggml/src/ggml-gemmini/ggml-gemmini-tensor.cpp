@@ -169,8 +169,34 @@ namespace zerogod
         }
         case GGML_TYPE_Q8_0:
         {
+            DBG("\nchecking q8_0 tensor: type=%s, cols=%d, rows=%d, buf_bytes=%zu\n", ggml_type_name(src->type), src->ne[0], src>ne[1], buf_bytes_);
+
+            const int64_t K = src0->ne[0];                 // 열 길이 (k)
+            const int64_t I = src0->ne[1] * (src0->ne[2] ? src0->ne[2] : 1) * (src0->ne[3] ? src0->ne[3] : 1); // 총 행 수
+            const size_t  row_stride_bytes_q = src0->nb[1]; // Q8_0 텐서의 행 간 byte stride
+            const size_t  row_stride_blocks  = row_stride_bytes_q / sizeof(block_q8_0); // 한 행에서 block 개수 * sizeof(block_q8_0) 와 일치해야 함
+
+            // 임시 float 버퍼 (연속 메모리): A_f[I*K], B_f[I*K]
+            float *A_f = (float *)malloc(sizeof(float)*I*K);
+            float *B_f = (float *)malloc(sizeof(float)*I*K);
+
+            // --- src0이 Q8_0일 때 ---
+            if (src0->type == GGML_TYPE_Q8_0) {
+                for (int64_t i = 0; i < I; ++i) {
+                    const block_q8_0 *row_blocks = (const block_q8_0 *)((const char*)src0->data + i * row_stride_bytes_q);
+                    dequantize_row_q8_0(row_blocks, A_f + i*K, K); // 이 함수는 한 행(k개)을 복원
+                }
+            }
+
+            // --- src1도 동일한 방식으로 B_f 채우기 ---
+            if (src1->type == GGML_TYPE_Q8_0) {
+                const size_t row_stride_bytes_q1 = src1->nb[1];
+                for (int64_t i = 0; i < I; ++i) {
+                    const block_q8_0 *row_blocks = (const block_q8_0 *)((const char*)src1->data + i * row_stride_bytes_q1);
+                    dequantize_row_q8_0(row_blocks, B_f + i*K, K);
+                }
+            } 
             /* TODO: copy */
-             DBG("\nchecking q8_0 tensor: type=%s, cols=%d, rows=%d, buf_bytes=%zu\n", ggml_type_name(src->type), src->ne[0], src>ne[1], buf_bytes_);
 
             std::memset(dst_row, 0, buf_bytes_); // 임시 패딩
             break;
