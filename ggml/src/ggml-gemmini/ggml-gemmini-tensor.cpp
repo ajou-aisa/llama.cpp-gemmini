@@ -170,6 +170,8 @@ namespace zerogod
         case GGML_TYPE_Q8_0:
         {
             /* TODO: copy */
+             DBG("\nchecking q8_0 tensor: type=%s, cols=%d, rows=%d, buf_bytes=%zu\n", ggml_type_name(src->type), src->ne[0], src>ne[1], buf_bytes_);
+
             std::memset(dst_row, 0, buf_bytes_); // 임시 패딩
             break;
         }
