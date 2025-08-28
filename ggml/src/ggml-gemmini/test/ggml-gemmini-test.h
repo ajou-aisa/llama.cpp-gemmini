@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <type_traits>
 #include <vector>
+#include <cmath>
 #include "ggml.h"
 
 using namespace zerogod;
@@ -80,19 +81,21 @@ static void ggml_backend_gemmini_mul_mat_test(struct ggml_context * ctx, const s
     struct ggml_tensor *C_sliced = ggml_view_2d(ctx, C_out, I, J, C_out->nb[1], 0);
 
     const void* d_data_ptr;
-    size_t d_stride_elem;
-    std::vector<acc_t> zero_bias_storage;
+    size_t sD;
+    std::vector<acc_t> zero_bias;
 
     if (D_bias) {
         GGML_ASSERT(D_bias->data && "D_bias->data is invalid");
         struct ggml_tensor* D_sliced = ggml_view_2d(ctx, const_cast<struct ggml_tensor *>(D_bias), I, J, D_bias->nb[1], 0);
         d_data_ptr = D_sliced->data;
-        d_stride_elem = D_sliced->nb[1] / sizeof(acc_t);
+        sD = D_sliced->nb[1] / sizeof(acc_t);
     } else {
-        zero_bias_storage.assign(I * sD_elem, 0);
-        d_data_ptr = zero_bias_storage.data();
-        d_stride_elem = sD_elem;
+        zero_bias.assign(I * sD_elem, 0);
+        d_data_ptr = zero_bias.data();
+        sD = sD_elem;
     }
+
+    const float test_scale = 0.5f;
 
     // expected
     for (size_t r = 0; r < I; ++r)
@@ -103,20 +106,22 @@ static void ggml_backend_gemmini_mul_mat_test(struct ggml_context * ctx, const s
             for (int k_idx = 0; k_idx < K; ++k_idx) // Renamed k to k_idx to avoid conflict with function parameter k
                 acc += (int)((elem_t*)A_sliced->data)[r * (A_sliced->nb[1] / sizeof(elem_t)) + k_idx] * (int)((elem_t*)B_sliced->data)[c * (B_sliced->nb[1] / sizeof(elem_t)) + k_idx]; // Access B as transposed
 
-            acc += (int)((const acc_t*)d_data_ptr)[r * d_stride_elem + c];
-            C_expected[r * sC + c] = (elem_t)sat_i8(acc);
+            acc += (int)((const acc_t*)d_data_ptr)[r * sD + c];
+
+            int32_t scaled_acc = roundf((float)acc * test_scale);
+            C_expected[r * sC + c] = (elem_t)sat_i8(scaled_acc);
         }
     }
 
     dump_matrix("A (I x K)", (elem_t*)A_sliced->data, I, K, A_sliced->nb[1] / sizeof(elem_t));
     dump_matrix("B (J x K, stored transposed)", (elem_t*)B_sliced->data, J, K, B_sliced->nb[1] / sizeof(elem_t)); // Dump as JxK
-    dump_matrix("D (I x J), acc_t", (const acc_t*)d_data_ptr, I, J, d_stride_elem);
+    dump_matrix("D (I x J), acc_t", (const acc_t*)d_data_ptr, I, J, sD);
     dump_matrix("Expected C (I x J)", C_expected, I, J, sC);
 
     tiled_matmul_auto(I, J, K,
                       (elem_t*)A_sliced->data, (elem_t*)B_sliced->data, d_data_ptr, (void *)C_sliced->data,
-                      sA, sB, d_stride_elem, sC, // Use original strides for tiled_matmul_auto
-                      1.f, 1.f, 1.f,
+                      sA, sB, sD, sC, // Use original strides for tiled_matmul_auto
+                      test_scale, test_scale, test_scale,
                       NO_ACTIVATION,
                       1, 1,
                       false,
