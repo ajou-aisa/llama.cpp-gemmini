@@ -70,10 +70,21 @@ static void ggml_backend_gemmini_mul_mat_test(struct ggml_context * ctx, const s
 
     elem_t *C_expected = (elem_t *)alloc16(I * sC * sizeof(elem_t)); // expected value
 
+    GGML_ASSERT(A_in != NULL && "A_in is NULL");
+    GGML_ASSERT(B_in != NULL && "B_in is NULL");
+    GGML_ASSERT(C_out != NULL && "C_out is NULL");
+
     struct ggml_tensor *A_sliced = ggml_view_2d(ctx, const_cast<struct ggml_tensor *>(A_in), I, K, A_in->nb[1], 0);
     struct ggml_tensor *B_sliced = ggml_view_2d(ctx, const_cast<struct ggml_tensor *>(B_in), J, K, B_in->nb[1], 0); // B is J x K, stored transposed
     struct ggml_tensor *C_sliced = ggml_view_2d(ctx, C_out, I, J, C_out->nb[1], 0);
-    struct ggml_tensor *D_sliced = ggml_view_2d(ctx, const_cast<struct ggml_tensor *>(D_bias), I, J, D_bias->nb[1], 0);
+
+    struct ggml_tensor *D_sliced;
+    if (D_bias) {
+        D_sliced = ggml_view_2d(ctx, const_cast<struct ggml_tensor *>(D_bias), I, J, D_bias->nb[1], 0);
+    } else {
+        D_sliced = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, J, I);
+        ggml_set_zero(D_sliced);
+    }
 
     // expected
     for (size_t r = 0; r < I; ++r)
