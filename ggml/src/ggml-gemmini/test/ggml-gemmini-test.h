@@ -9,6 +9,7 @@
 #include "include/gemmini.h"
 #include <cstdio>
 #include <type_traits>
+#include "ggml.h"
 
 using namespace zerogod;
 
@@ -41,7 +42,8 @@ static inline int8_t sat_i8(int x) {
     return x > 127 ? 127 : (x < -128 ? -128 : (int8_t)x);
 }
 
-static void ggml_backend_gemmini_mul_mat_test(const int i, const int j, const int k) {
+// 원본 텐서를 원하는 크기로 slicing하여 연산 테스트
+static void ggml_backend_gemmini_mul_mat_test(struct ggml_context * ctx, struct ggml_tensor *A_in, struct ggml_tensor *B_in, struct ggml_tensor *C_out, struct ggml_tensor *D_bias, const int i, const int j, const int k) {
     GGML_ASSERT(i > 0 && j > 0 && k > 0);
 
     DBG0("\n[Gemmini] mul_mat test called");
@@ -49,7 +51,7 @@ static void ggml_backend_gemmini_mul_mat_test(const int i, const int j, const in
     const size_t I = (size_t)i, J = (size_t)j, K = (size_t)k;
     // stride
     const size_t sA = align_up(K, 16 / sizeof(elem_t));
-    const size_t sB = align_up(J, 16 / sizeof(elem_t)); 
+    const size_t sB = align_up(J, 16 / sizeof(elem_t));
     const size_t sC = align_up(J, 16 / sizeof(elem_t));
     const size_t sD = align_up(J, 16 / sizeof(acc_t));
 
@@ -66,33 +68,12 @@ static void ggml_backend_gemmini_mul_mat_test(const int i, const int j, const in
         return p;
     };
 
-    elem_t *A = (elem_t *)alloc16(I * sA * sizeof(elem_t)); // IxK
-    elem_t *B = (elem_t *)alloc16(K * sB * sizeof(elem_t)); // K×J
-    elem_t *C = (elem_t *)alloc16(I * sC * sizeof(elem_t)); // I×J
-
     elem_t *C_expected = (elem_t *)alloc16(I * sC * sizeof(elem_t)); // expected value
-    acc_t *D = (acc_t *)alloc16(I * sD * sizeof(acc_t));             // I×J bias
 
-    int e = 1;
-    // 포화 방지
-    int t = (int)std::floor(std::sqrt(127.0 / (double)K));
-    int leftover = 127 - (int)(K * t * (long long)t); // 0..127
-    int db = std::min(4, std::max(0, leftover));
-
-    // init A
-    for (size_t r = 0; r < I; ++r)
-        for (size_t c = 0; c < K; ++c)
-            A[r * sA + c] = (elem_t)(e++ % (2 * t + 1) - t);
-
-    // init B
-    for (size_t r = 0; r < K; ++r)
-        for (size_t c = 0; c < J; ++c)
-            B[r * sB + c] = (elem_t)(e++ % (2 * t + 1) - t);
-
-    // init D
-    for (size_t r = 0; r < I; ++r)
-        for (size_t c = 0; c < J; ++c)
-            D[r * sD + c] = (acc_t)((e++ % (2*db + 1)) - db);
+    struct ggml_tensor *A_sliced = ggml_view_2d(ctx, A_in, I, K, A_in->nb[1], 0);
+    struct ggml_tensor *B_sliced = ggml_view_2d(ctx, B_in, J, K, B_in->nb[1], 0); // B is J x K, stored transposed
+    struct ggml_tensor *C_sliced = ggml_view_2d(ctx, C_out, I, J, C_out->nb[1], 0);
+    struct ggml_tensor *D_sliced = ggml_view_2d(ctx, D_bias, I, J, D_bias->nb[1], 0);
 
     // expected
     for (size_t r = 0; r < I; ++r)
@@ -100,32 +81,32 @@ static void ggml_backend_gemmini_mul_mat_test(const int i, const int j, const in
         for (size_t c = 0; c < J; ++c)
         {
             int acc = 0; // 필요시 acc_t
-            for (int k = 0; k < K; ++k)
-                acc += (int)A[r * sA + k] * (int)B[k * sB + c];
+            for (int k_idx = 0; k_idx < K; ++k_idx) // Renamed k to k_idx to avoid conflict with function parameter k
+                acc += (int)((elem_t*)A_sliced->data)[r * (A_sliced->nb[1] / sizeof(elem_t)) + k_idx] * (int)((elem_t*)B_sliced->data)[c * (B_sliced->nb[1] / sizeof(elem_t)) + k_idx]; // Access B as transposed
 
-            acc += (int)D[r * sD + c];
+            acc += (int)((acc_t*)D_sliced->data)[r * (D_sliced->nb[1] / sizeof(acc_t)) + c];
             C_expected[r * sC + c] = (elem_t)sat_i8(acc);
         }
     }
 
-    dump_matrix("A (I x K)", A, I, K, sA);
-    dump_matrix("B (K x J)", B, K, J, sB);
-    dump_matrix("D (I x J), acc_t", D, I, J, sD);
+    dump_matrix("A (I x K)", (elem_t*)A_sliced->data, I, K, A_sliced->nb[1] / sizeof(elem_t));
+    dump_matrix("B (J x K, stored transposed)", (elem_t*)B_sliced->data, J, K, B_sliced->nb[1] / sizeof(elem_t)); // Dump as JxK
+    dump_matrix("D (I x J), acc_t", (acc_t*)D_sliced->data, I, J, D_sliced->nb[1] / sizeof(acc_t));
     dump_matrix("Expected C (I x J)", C_expected, I, J, sC);
 
     tiled_matmul_auto(I, J, K,
-                      A, B, (const void *)D, (void *)C,
-                      sA, sB, sD, sC,
+                      (elem_t*)A_sliced->data, (elem_t*)B_sliced->data, (const void *)D_sliced->data, (void *)C_sliced->data,
+                      sA, sB, sD, sC, // Use original strides for tiled_matmul_auto
                       1.f, 1.f, 1.f,
                       NO_ACTIVATION,
                       1, 1,
                       false,
                       false, // transpose_A
-                      false, // transpose_B
+                      true, // transpose_B
                       false, false,
                       0, OPTION);
 
-    dump_matrix("C (result from gemmini)", C, I, J, sC);
+    dump_matrix("C (result from gemmini)", (elem_t*)C_sliced->data, I, J, C_sliced->nb[1] / sizeof(elem_t));
 
     // compare
     bool ok = true;
@@ -133,7 +114,7 @@ static void ggml_backend_gemmini_mul_mat_test(const int i, const int j, const in
     {
         for (size_t c = 0; c < J; ++c)
         {
-            elem_t got = C[r * sC + c];
+            elem_t got = ((elem_t*)C_sliced->data)[r * (C_sliced->nb[1] / sizeof(elem_t)) + c];
             elem_t exp = C_expected[r * sC + c];
             if (got != exp)
             {

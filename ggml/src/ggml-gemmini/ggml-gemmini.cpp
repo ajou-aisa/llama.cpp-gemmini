@@ -29,34 +29,7 @@ static void ggml_backend_gemmini_mul_mat(
         const auto *src0 = dst->src[0]; // src0: weight (J × K) -> 전치하여 K x J로 사용 (B)
         const auto *src1 = dst->src[1]; // src1: activation (K x J) -> 전치 없음 (A)
 
-        const size_t I = dst->ne[1]; // I = A.ne[1], K = A.ne[0]
-        const size_t J = dst->ne[0]; // K = B.ne[0], J = B.ne[1] (transpose)
-        const size_t K = src->ne[0];
-
-            const size_t sA = src1->nb[1];
-            const size_t sB = src0->nb[0];
-            const size_t sC = dst->nb[1];
-
-        std::vector<int32_t> zero_bias(dst->ne[0], 0);
-
-        const int32_t *bias_data = bias ? bias->data : zero_bias.data();
-        const size_t sD = bias ? bias->nb[1] / sizeof(int32_t) : 0;
-        const bool repeating = bias ? bias->ne[1] == 1 : true;
-
-        tiled_matmul_auto(I, J, K,
-                      (elem_t *)src1->data,
-                      (elem_t *)src0->data,
-                      (void *)bias_data,
-                      (elem_t *)dst->data,
-                      sA, sB, sD, sC,
-                      1.f, 1.f, 1.f,
-                      NO_ACTIVATION,
-                      1, 1,
-                      repeating,
-                      false, // transpose_A
-                      true, // transpose_B
-                      false, false,
-                      0, OPTION);
+        ggml_backend_gemmini_mul_mat_test(ctx->tmp_ctx, src1, src0, dst, bias, 1, 4, 4);
     }
 #endif
     /* ______________________________________________________ */
