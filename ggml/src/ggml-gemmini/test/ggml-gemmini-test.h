@@ -9,6 +9,7 @@
 #include "include/gemmini.h"
 #include <cstdio>
 #include <type_traits>
+#include <vector>
 #include "ggml.h"
 
 using namespace zerogod;
@@ -53,7 +54,7 @@ static void ggml_backend_gemmini_mul_mat_test(struct ggml_context * ctx, const s
     const size_t sA = align_up(K, 16 / sizeof(elem_t));
     const size_t sB = align_up(J, 16 / sizeof(elem_t));
     const size_t sC = align_up(J, 16 / sizeof(elem_t));
-    const size_t sD = align_up(J, 16 / sizeof(acc_t));
+    const size_t sD_elem = align_up(J, 16 / sizeof(acc_t));
 
     DBG0("\nI=%zu, J=%zu, K=%zu\n", I, J, K);
 
@@ -70,20 +71,27 @@ static void ggml_backend_gemmini_mul_mat_test(struct ggml_context * ctx, const s
 
     elem_t *C_expected = (elem_t *)alloc16(I * sC * sizeof(elem_t)); // expected value
 
-    GGML_ASSERT(A_in != NULL && "A_in is NULL");
-    GGML_ASSERT(B_in != NULL && "B_in is NULL");
-    GGML_ASSERT(C_out != NULL && "C_out is NULL");
+    GGML_ASSERT(A_in && A_in->data && "A_in is invalid");
+    GGML_ASSERT(B_in && B_in->data && "B_in is invalid");
+    GGML_ASSERT(C_out && C_out->data && "C_out is invalid");
 
     struct ggml_tensor *A_sliced = ggml_view_2d(ctx, const_cast<struct ggml_tensor *>(A_in), I, K, A_in->nb[1], 0);
-    struct ggml_tensor *B_sliced = ggml_view_2d(ctx, const_cast<struct ggml_tensor *>(B_in), J, K, B_in->nb[1], 0); // B is J x K, stored transposed
+    struct ggml_tensor *B_sliced = ggml_view_2d(ctx, const_cast<struct ggml_tensor *>(B_in), J, K, B_in->nb[1], 0);
     struct ggml_tensor *C_sliced = ggml_view_2d(ctx, C_out, I, J, C_out->nb[1], 0);
 
-    struct ggml_tensor *D_sliced;
+    const void* d_data_ptr;
+    size_t d_stride_elem;
+    std::vector<acc_t> zero_bias_storage;
+
     if (D_bias) {
-        D_sliced = ggml_view_2d(ctx, const_cast<struct ggml_tensor *>(D_bias), I, J, D_bias->nb[1], 0);
+        GGML_ASSERT(D_bias->data && "D_bias->data is invalid");
+        struct ggml_tensor* D_sliced = ggml_view_2d(ctx, const_cast<struct ggml_tensor *>(D_bias), I, J, D_bias->nb[1], 0);
+        d_data_ptr = D_sliced->data;
+        d_stride_elem = D_sliced->nb[1] / sizeof(acc_t);
     } else {
-        D_sliced = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, J, I);
-        ggml_set_zero(D_sliced);
+        zero_bias_storage.assign(I * sD_elem, 0);
+        d_data_ptr = zero_bias_storage.data();
+        d_stride_elem = sD_elem;
     }
 
     // expected
@@ -95,19 +103,19 @@ static void ggml_backend_gemmini_mul_mat_test(struct ggml_context * ctx, const s
             for (int k_idx = 0; k_idx < K; ++k_idx) // Renamed k to k_idx to avoid conflict with function parameter k
                 acc += (int)((elem_t*)A_sliced->data)[r * (A_sliced->nb[1] / sizeof(elem_t)) + k_idx] * (int)((elem_t*)B_sliced->data)[c * (B_sliced->nb[1] / sizeof(elem_t)) + k_idx]; // Access B as transposed
 
-            acc += (int)((acc_t*)D_sliced->data)[r * (D_sliced->nb[1] / sizeof(acc_t)) + c];
+            acc += (int)((const acc_t*)d_data_ptr)[r * d_stride_elem + c];
             C_expected[r * sC + c] = (elem_t)sat_i8(acc);
         }
     }
 
     dump_matrix("A (I x K)", (elem_t*)A_sliced->data, I, K, A_sliced->nb[1] / sizeof(elem_t));
     dump_matrix("B (J x K, stored transposed)", (elem_t*)B_sliced->data, J, K, B_sliced->nb[1] / sizeof(elem_t)); // Dump as JxK
-    dump_matrix("D (I x J), acc_t", (acc_t*)D_sliced->data, I, J, D_sliced->nb[1] / sizeof(acc_t));
+    dump_matrix("D (I x J), acc_t", (const acc_t*)d_data_ptr, I, J, d_stride_elem);
     dump_matrix("Expected C (I x J)", C_expected, I, J, sC);
 
     tiled_matmul_auto(I, J, K,
-                      (elem_t*)A_sliced->data, (elem_t*)B_sliced->data, (const void *)D_sliced->data, (void *)C_sliced->data,
-                      sA, sB, sD, sC, // Use original strides for tiled_matmul_auto
+                      (elem_t*)A_sliced->data, (elem_t*)B_sliced->data, d_data_ptr, (void *)C_sliced->data,
+                      sA, sB, d_stride_elem, sC, // Use original strides for tiled_matmul_auto
                       1.f, 1.f, 1.f,
                       NO_ACTIVATION,
                       1, 1,
