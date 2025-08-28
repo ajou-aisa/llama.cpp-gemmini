@@ -43,7 +43,7 @@ static inline int8_t sat_i8(int x) {
 }
 
 // 원본 텐서를 원하는 크기로 slicing하여 연산 테스트
-static void ggml_backend_gemmini_mul_mat_test(struct ggml_context * ctx, struct ggml_tensor *A_in, struct ggml_tensor *B_in, struct ggml_tensor *C_out, struct ggml_tensor *D_bias, const int i, const int j, const int k) {
+static void ggml_backend_gemmini_mul_mat_test(struct ggml_context * ctx, const struct ggml_tensor *A_in, const struct ggml_tensor *B_in, struct ggml_tensor *C_out, const struct ggml_tensor *D_bias, const int i, const int j, const int k) {
     GGML_ASSERT(i > 0 && j > 0 && k > 0);
 
     DBG0("\n[Gemmini] mul_mat test called");
@@ -70,10 +70,10 @@ static void ggml_backend_gemmini_mul_mat_test(struct ggml_context * ctx, struct 
 
     elem_t *C_expected = (elem_t *)alloc16(I * sC * sizeof(elem_t)); // expected value
 
-    struct ggml_tensor *A_sliced = ggml_view_2d(ctx, A_in, I, K, A_in->nb[1], 0);
-    struct ggml_tensor *B_sliced = ggml_view_2d(ctx, B_in, J, K, B_in->nb[1], 0); // B is J x K, stored transposed
+    struct ggml_tensor *A_sliced = ggml_view_2d(ctx, const_cast<struct ggml_tensor *>(A_in), I, K, A_in->nb[1], 0);
+    struct ggml_tensor *B_sliced = ggml_view_2d(ctx, const_cast<struct ggml_tensor *>(B_in), J, K, B_in->nb[1], 0); // B is J x K, stored transposed
     struct ggml_tensor *C_sliced = ggml_view_2d(ctx, C_out, I, J, C_out->nb[1], 0);
-    struct ggml_tensor *D_sliced = ggml_view_2d(ctx, D_bias, I, J, D_bias->nb[1], 0);
+    struct ggml_tensor *D_sliced = ggml_view_2d(ctx, const_cast<struct ggml_tensor *>(D_bias), I, J, D_bias->nb[1], 0);
 
     // expected
     for (size_t r = 0; r < I; ++r)
