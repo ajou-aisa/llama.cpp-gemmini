@@ -113,8 +113,9 @@ static void ggml_backend_gemmini_mul_mat_test(struct ggml_context * ctx, const s
                 if (B_sliced->type == GGML_TYPE_Q8_0) {
                     const block_q8_0 * q_b = (const block_q8_0 *)B_sliced->data;
                     // B is transposed, so we access it as B[c, k_idx]
-                    const int block_idx = (c * K + k_idx) / QK8_0;
-                    const int quant_idx = (c * K + k_idx) % QK8_0;
+                    const int b_idx = k_idx * J + c;
+                    const int block_idx = b_idx / QK8_0;
+                    const int quant_idx = b_idx % QK8_0;
                     const float d = GGML_FP16_TO_FP32(q_b[block_idx].d);
                     b_val = (float)q_b[block_idx].qs[quant_idx] * d;
                 } else {
