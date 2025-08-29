@@ -12,6 +12,8 @@
 #include <vector>
 #include <cmath>
 #include "ggml.h"
+#include "ggml-quants.h"
+#include "ggml-impl.h"
 
 using namespace zerogod;
 
@@ -95,21 +97,36 @@ static void ggml_backend_gemmini_mul_mat_test(struct ggml_context * ctx, const s
         sD = sD_elem;
     }
 
-    const float test_scale = 0.5f;
+    const float test_scale = 0.01f;
 
     // expected
     for (size_t r = 0; r < I; ++r)
     {
         for (size_t c = 0; c < J; ++c)
         {
-            int acc = 0; // 필요시 acc_t
+            float acc = 0; // Use float accumulator for precision
             for (int k_idx = 0; k_idx < K; ++k_idx) // Renamed k to k_idx to avoid conflict with function parameter k
-                acc += (int)((elem_t*)A_sliced->data)[r * (A_sliced->nb[1] / sizeof(elem_t)) + k_idx] * (int)((elem_t*)B_sliced->data)[c * (B_sliced->nb[1] / sizeof(elem_t)) + k_idx]; // Access B as transposed
+            {
+                const float a_val = (float)((elem_t*)A_sliced->data)[r * (A_sliced->nb[1] / sizeof(elem_t)) + k_idx];
 
-            acc += (int)((const acc_t*)d_data_ptr)[r * sD + c];
+                float b_val;
+                if (B_sliced->type == GGML_TYPE_Q8_0) {
+                    const block_q8_0 * q_b = (const block_q8_0 *)B_sliced->data;
+                    // B is transposed, so we access it as B[c, k_idx]
+                    const int block_idx = (c * K + k_idx) / QK8_0;
+                    const int quant_idx = (c * K + k_idx) % QK8_0;
+                    const float d = GGML_FP16_TO_FP32(q_b[block_idx].d);
+                    b_val = (float)q_b[block_idx].qs[quant_idx] * d;
+                } else {
+                    b_val = (float)((elem_t*)B_sliced->data)[c * (B_sliced->nb[1] / sizeof(elem_t)) + k_idx];
+                }
+                acc += a_val * b_val;
+            }
 
-            int32_t scaled_acc = roundf((float)acc * test_scale);
-            C_expected[r * sC + c] = (elem_t)sat_i8(scaled_acc);
+            acc += (float)((const acc_t*)d_data_ptr)[r * sD + c];
+
+            float scaled_acc = acc * test_scale;
+            C_expected[r * sC + c] = (elem_t)sat_i8(roundf(scaled_acc));
         }
     }
 
@@ -121,9 +138,9 @@ static void ggml_backend_gemmini_mul_mat_test(struct ggml_context * ctx, const s
     tiled_matmul_auto(I, J, K,
                       (elem_t*)A_sliced->data, (elem_t*)B_sliced->data, d_data_ptr, (void *)C_sliced->data,
                       sA, sB, sD, sC, // Use original strides for tiled_matmul_auto
-                      test_scale, test_scale, test_scale,
+                      1.0f, 1.0f, 1.0f,
                       NO_ACTIVATION,
-                      1, 1,
+                      test_scale, 1,
                       false,
                       false, // transpose_A
                       true, // transpose_B
