@@ -24,6 +24,20 @@ target_compile_definitions(ggml-gemmini PRIVATE
   TEST=0          # 필요 시
   PRINT_TILE=0    # 필요 시
   OPTION=CPU      # OS/WS/CPU
+
+  # test switches (DUMP는 소스에서 자동 파생)
+  TRANSPOSE_B=1 # B 전치 여부
+  TEST_SHAPE=0 # 원본/변환 tensor shape 확인
+  TEST_SLICE=0 # ㅇ
+  TEST_CPU_REF=0
+  TEST_GEMMINI=0
+  TEST_COMPARE=0
+  TEST_WRITEBACK=0
+
+  # slice 크기
+  SLICE_I=1
+  SLICE_K=4
+  SLICE_J=6
 )
 
 

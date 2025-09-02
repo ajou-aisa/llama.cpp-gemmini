@@ -25,12 +25,9 @@ static void ggml_backend_gemmini_mul_mat(
 
 /* ________________ Test: 테스트 호출용 ___________________ */
 #if TEST
-    {
-        const auto *src0 = dst->src[0]; // src0: weight (J × K) -> 전치하여 K x J로 사용 (B)
-        const auto *src1 = dst->src[1]; // src1: activation (K x J) -> 전치 없음 (A)
+    static_assert(TRANSPOSE_B == 1, "This test assumes physical-transposed B (KxJ).");
+    ggml_gemmini_test(ctx, dst, bias);
 
-        ggml_backend_gemmini_mul_mat_test(ctx->tmp_ctx, src1, src0, dst, bias, 1, 4, 4);
-    }
 #endif
     /* ______________________________________________________ */
 
