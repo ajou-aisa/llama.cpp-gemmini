@@ -1,12 +1,51 @@
 // test/ggml-gemmini-test.h
-#ifndef __GGML_GEMMINI_TEST_H__
-#define __GGML_GEMMINI_TEST_H__
+#pragma once
 
 #ifndef OPTION
 #define OPTION CPU
 #endif
 
+// 1: src0(JxK) -> 변환 시 물리 전치(KxJ)로 배치(현재 기본)
+// 0: src0(JxK) -> 전치 없이 JxK로 배치
+#ifndef TRANSPOSE_B
+#define TRANSPOSE_B 1  
+#endif
+#ifndef TEST_SHAPE
+#define TEST_SHAPE 0
+#endif
+#ifndef TEST_SLICE
+#define TEST_SLICE 0
+#endif
+#ifndef TEST_CPU_REF
+#define TEST_CPU_REF 0
+#endif
+#ifndef TEST_GEMMINI
+#define TEST_GEMMINI 0
+#endif
+#ifndef TEST_COMPARE
+#define TEST_COMPARE 0
+#endif
+#ifndef TEST_WRITEBACK
+#define TEST_WRITEBACK 0
+#endif
+#ifndef DUMP
+#define DUMP (TEST_SLICE || TEST_CPU_REF || TEST_COMPARE)
+#endif
+
+// slice 크기
+#ifndef SLICE_I
+#define SLICE_I 1      // A/C는 행 1만 출력
+#endif
+#ifndef SLICE_K
+#define SLICE_K 4     // K 방향 최대 출력 열
+#endif
+#ifndef SLICE_J
+#define SLICE_J 6     // J 방향 최대 출력 열(논리 J 기준)
+#endif
+
 #include "include/gemmini.h"
+#include "../ggml-gemmini-util.h"
+#include "../ggml-gemmini-tensor.h"
 #include <cstdio>
 #include <type_traits>
 #include <vector>
@@ -17,8 +56,21 @@
 
 using namespace zerogod;
 
+// ====== 최상위 테스트 엔트리 (ggml 백엔드 경로에서 호출) ======
+void ggml_gemmini_test(ggml_backend_gemmini_context *ctx,
+                       struct ggml_tensor *dst,   // FP32 output (I×J)
+                       struct ggml_tensor *bias); // optional FP32 bias (->int32)
+
+// ====== 유틸 ======
+static inline int8_t sat_i8(int x)
+{
+    return x > 127 ? 127 : (x < -128 ? -128 : (int8_t)x);
+}
+
 template <typename T>
-static inline void dump_matrix(const char* name, const T* m, int r, int c, int s) {
+static inline void dump_matrix(const char *name, const T *m, int r, int c, int s)
+{
+#if DUMP
     DBG0("%s =\n", name);
     for (int i = 0; i < r; ++i)
     {
@@ -40,134 +92,65 @@ static inline void dump_matrix(const char* name, const T* m, int r, int c, int s
         }
         DBG0("]\n");
     }
+#else
+    (void)name;
+    (void)m;
+    (void)r;
+    (void)c;
+    (void)s;
+#endif
+}
+
+// ====== Shape 추출 & 검사 ======
+struct mm_shape
+{
+    int I; // rows of C (and A)
+    int J; // cols of C (and B)
+    int K; // inner dim
 };
 
-static inline int8_t sat_i8(int x) {
-    return x > 127 ? 127 : (x < -128 ? -128 : (int8_t)x);
-}
+// dst: (I x J) => ggml의 관례상 ne[0]=J, ne[1]=I
+// src0(weight): (J x K) layout (ne[0]=J, ne[1]=K) — 실행 시 B는 KxJ로 multiply
+// src1(act): (I x K) layout (ne[0]=K, ne[1]=I) — 실행 시 A는 IxK
+mm_shape extract_and_check_shapes(const ggml_tensor *dst);
 
-// 원본 텐서를 원하는 크기로 slicing하여 연산 테스트
-static void ggml_backend_gemmini_mul_mat_test(struct ggml_context * ctx, const struct ggml_tensor *A_in, const struct ggml_tensor *B_in, struct ggml_tensor *C_out, const struct ggml_tensor *D_bias, const int i, const int j, const int k) {
-    GGML_ASSERT(i > 0 && j > 0 && k > 0);
+// ====== CPU 참조 계산 & 검증 ======
+void cpu_reference_C(const elem_t *A, size_t sA,
+                     const elem_t *B, size_t sB,
+                     const acc_t *D, size_t sD,
+                     elem_t *C_exp, size_t sC,
+                     int I, int J, int K);
 
-    DBG0("\n[Gemmini] mul_mat test called");
+bool compare_C_and_report(const elem_t *C, size_t sC,
+                          const elem_t *C_exp, size_t sE,
+                          int I, int J);
 
-    const size_t I = (size_t)i, J = (size_t)j, K = (size_t)k;
-    // stride
-    const size_t sA = align_up(K, 16 / sizeof(elem_t));
-    const size_t sB = align_up(J, 16 / sizeof(elem_t));
-    const size_t sC = align_up(J, 16 / sizeof(elem_t));
-    const size_t sD_elem = align_up(J, 16 / sizeof(acc_t));
+// ====== ggml 텐서 slicing & 관찰 ======
+// ggml 2D 텐서를 (nb1/sizeof(T))를 stride로 보아 일부만 덤프
+void dump_tensor_auto_2d(const char *name, const ggml_tensor *t,
+                         int max_rows = -1, int max_cols = -1);
 
-    DBG0("\nI=%zu, J=%zu, K=%zu\n", I, J, K);
+// A_in: act(K×I), B_in: weight(J×K), C_out: dst(J×I), D_bias: bias(J×I)
+// I,J,K를 기준으로 view_2d를 만들고, bias 없을 경우 0으로 채운 가상 버퍼를 준비.
+// 반환: d_data_ptr(누산 버퍼 포인터), sD(요소 단위 stride), zero_bias(생성 시 소유).
+struct sliced_views
+{
+    ggml_tensor *A_sliced; // (ne0=K, ne1=I) -> 관찰 시 rows=I, cols=K, stride=nb1/sizeof(T)
+    ggml_tensor *B_sliced; // (ne0=J, ne1=K) -> 관찰 시 rows=K, cols=J, stride=nb1/sizeof(T)
+    ggml_tensor *C_sliced; // (ne0=J, ne1=I) -> 관찰 시 rows=I, cols=J, stride=nb1/sizeof(T)
+    ggml_tensor *D_sliced; // nullable, same layout as C
 
-    auto alloc16 = [](size_t bytes) -> void *
-    {
-        void *p = std::aligned_alloc(16, bytes);
-        if(!p) {
-            DBG0("aligned_alloc failed (bytes=%zu)\n", bytes);
-            std::abort();
-        }
-        std::memset(p, 0, bytes);
-        return p;
-    };
+    const void *d_data_ptr; // acc_t* (bias or zero buffer)
+    size_t sD;              // stride in elements for D (nb1/sizeof(acc_t))
+};
 
-    elem_t *C_expected = (elem_t *)alloc16(I * sC * sizeof(elem_t)); // expected value
+sliced_views make_and_dump_mm_views(ggml_context *ctx,
+                                    const ggml_tensor *A_in,
+                                    const ggml_tensor *B_in,
+                                    ggml_tensor *C_out,
+                                    const ggml_tensor *D_bias,
+                                    int I, int J, int K,
+                                    std::vector<acc_t> &zero_bias_out);
 
-    GGML_ASSERT(A_in && A_in->data && "A_in is invalid");
-    GGML_ASSERT(B_in && B_in->data && "B_in is invalid");
-    GGML_ASSERT(C_out && C_out->data && "C_out is invalid");
-
-    struct ggml_tensor *A_sliced = ggml_view_2d(ctx, const_cast<struct ggml_tensor *>(A_in), I, K, A_in->nb[1], 0);
-    struct ggml_tensor *B_sliced = ggml_view_2d(ctx, const_cast<struct ggml_tensor *>(B_in), J, K, B_in->nb[1], 0);
-    struct ggml_tensor *C_sliced = ggml_view_2d(ctx, C_out, I, J, C_out->nb[1], 0);
-
-    const void* d_data_ptr;
-    size_t sD;
-    std::vector<acc_t> zero_bias;
-
-    if (D_bias) {
-        GGML_ASSERT(D_bias->data && "D_bias->data is invalid");
-        struct ggml_tensor* D_sliced = ggml_view_2d(ctx, const_cast<struct ggml_tensor *>(D_bias), I, J, D_bias->nb[1], 0);
-        d_data_ptr = D_sliced->data;
-        sD = D_sliced->nb[1] / sizeof(acc_t);
-    } else {
-        zero_bias.assign(I * sD_elem, 0);
-        d_data_ptr = zero_bias.data();
-        sD = sD_elem;
-    }
-
-    const float test_scale = 0.01f;
-
-    // expected
-    for (size_t r = 0; r < I; ++r)
-    {
-        for (size_t c = 0; c < J; ++c)
-        {
-            float acc = 0; // Use float accumulator for precision
-            for (int k_idx = 0; k_idx < K; ++k_idx) // Renamed k to k_idx to avoid conflict with function parameter k
-            {
-                const float a_val = (float)((elem_t*)A_sliced->data)[r * (A_sliced->nb[1] / sizeof(elem_t)) + k_idx];
-
-                float b_val;
-                if (B_sliced->type == GGML_TYPE_Q8_0) {
-                    const block_q8_0 * q_b = (const block_q8_0 *)B_sliced->data;
-                    // B is transposed, so we access it as B[c, k_idx]
-                    const int b_idx = k_idx * J + c;
-                    const int block_idx = b_idx / QK8_0;
-                    const int quant_idx = b_idx % QK8_0;
-                    const float d = GGML_FP16_TO_FP32(q_b[block_idx].d);
-                    b_val = (float)q_b[block_idx].qs[quant_idx] * d;
-                } else {
-                    b_val = (float)((elem_t*)B_sliced->data)[c * (B_sliced->nb[1] / sizeof(elem_t)) + k_idx];
-                }
-                acc += a_val * b_val;
-            }
-
-            acc += (float)((const acc_t*)d_data_ptr)[r * sD + c];
-
-            float scaled_acc = acc * test_scale;
-            C_expected[r * sC + c] = (elem_t)sat_i8(roundf(scaled_acc));
-        }
-    }
-
-    dump_matrix("A (I x K)", (elem_t*)A_sliced->data, I, K, A_sliced->nb[1] / sizeof(elem_t));
-    dump_matrix("B (J x K, stored transposed)", (elem_t*)B_sliced->data, J, K, B_sliced->nb[1] / sizeof(elem_t)); // Dump as JxK
-    dump_matrix("D (I x J), acc_t", (const acc_t*)d_data_ptr, I, J, sD);
-    dump_matrix("Expected C (I x J)", C_expected, I, J, sC);
-
-    tiled_matmul_auto(I, J, K,
-                      (elem_t*)A_sliced->data, (elem_t*)B_sliced->data, d_data_ptr, (void *)C_sliced->data,
-                      sA, sB, sD, sC, // Use original strides for tiled_matmul_auto
-                      1.0f, 1.0f, 1.0f,
-                      NO_ACTIVATION,
-                      test_scale, 1,
-                      false,
-                      false, // transpose_A
-                      true, // transpose_B
-                      false, false,
-                      0, OPTION);
-
-    dump_matrix("C (result from gemmini)", (elem_t*)C_sliced->data, I, J, C_sliced->nb[1] / sizeof(elem_t));
-
-    // compare
-    bool ok = true;
-    for (size_t r = 0; r < I; ++r)
-    {
-        for (size_t c = 0; c < J; ++c)
-        {
-            elem_t got = ((elem_t*)C_sliced->data)[r * (C_sliced->nb[1] / sizeof(elem_t)) + c];
-            elem_t exp = C_expected[r * sC + c];
-            if (got != exp)
-            {
-                DBG0("[NG] mismatch (%zu, %zu): got=%d exp=%d\n", r, c, (int)got, (int)exp);
-                ok = false;
-            }
-        }
-    }
-    if (ok)
-        DBG0("[OK] Gemmini matmul(+bias) matches expected\n");
-    else    
-        DBG0("[FAIL] mismatch detected\n");
-}
-#endif // __GGML_GEMMINI_TEST_H__
+void test_writeback_f32_from_i8(const elem_t *C_i8, size_t sC,
+                                int I, int J, ggml_tensor *dst);
