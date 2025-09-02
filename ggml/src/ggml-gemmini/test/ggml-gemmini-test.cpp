@@ -179,15 +179,15 @@ void ggml_gemmini_test(ggml_backend_gemmini_context *ctx,
 // ===== Shape 추출/검사 =====
 mm_shape extract_and_check_shapes(const ggml_tensor *dst)
 {
-    const ggml_tensor *src0 = dst->src[0]; // weight (J×K) layout: ne0=J, ne1=K
+    const ggml_tensor *src0 = dst->src[0]; // weight (J×K) layout: ne0=K, ne1=J
     const ggml_tensor *src1 = dst->src[1]; // act    (I×K) layout: ne0=K, ne1=I
     GGML_ASSERT(src0 && src1);
 
     const int J = (int)dst->ne[0];
     const int I = (int)dst->ne[1];
 
-    const int J0 = (int)src0->ne[0];
-    const int K0 = (int)src0->ne[1];
+    const int J0 = (int)src0->ne[1];
+    const int K0 = (int)src0->ne[0];
 
     const int K1 = (int)src1->ne[0];
     const int I1 = (int)src1->ne[1];
