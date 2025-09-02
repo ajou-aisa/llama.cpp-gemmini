@@ -8,6 +8,8 @@
 using namespace zerogod;
 
 // Cycle 측정 용
+extern "C" volatile uint64_t gemmini_tiled_matmul_cycles = 0; // gemmini.h
+
 uint64_t start, end;
 uint64_t bias_mapping_cycles = 0, bias_getting_cycles = 0, tmp_ctx_cycles = 0, gemmini_tensor_cycles = 0, 
 out_copy_cycles = 0, before_gemmini_overhead_cycles = 0, after_gemmini_overhead_cycles = 0;
