@@ -5,6 +5,10 @@
 
 namespace zerogod
 {
+    struct block_q8_0 {
+        int8_t       qs[QK8_0];  // 우리가 추출할 대상
+        ggml_fp16_t  d;          // 스케일(이번 작업에서는 폐기)
+    };
     template <typename T>
     static inline ggml_type ggml_type_of()
     {
