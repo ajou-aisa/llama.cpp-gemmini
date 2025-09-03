@@ -25,8 +25,8 @@
 #ifndef TEST_COMPARE
 #define TEST_COMPARE 0
 #endif
-#ifndef TEST_WRITEBACK
-#define TEST_WRITEBACK 0
+#ifndef TEST_DEQUANTiZE
+#define TEST_DEQUANTIZE 0
 #endif
 #ifndef DUMP
 #define DUMP (TEST_SLICE || TEST_CPU_REF || TEST_COMPARE)
