@@ -49,7 +49,6 @@
 #include <cstdio>
 #include <type_traits>
 #include <vector>
-#include <cmath>
 #include "ggml.h"
 #include "ggml-quants.h"
 #include "ggml-impl.h"
@@ -71,23 +70,30 @@ template <typename T>
 static inline void dump_matrix(const char *name, const T *m, int r, int c, int s)
 {
 #if DUMP
-    DBG0("%s =\n", name);
-    for (int i = 0; i < r; ++i)
-    {
+    if (!m) { DBG0("%s: <null>\n", name); return; }
+    DBG0("%s (r=%d, c=%d, ld=%d) =\n", name, r, c, s);
+
+    for (int i = 0; i < r; ++i) {
         DBG0("[ ");
-        for (int j = 0; j < c; ++j)
-        {
-            const T v = m[i * s + j];
-            if constexpr (std::is_integral_v<T>)
-            {
-                if constexpr (sizeof(T) <= sizeof(int))
-                    DBG0("%d ", (int)v);
-                else
+        for (int j = 0; j < c; ++j) {
+            const T v = m[(size_t)i * (size_t)s + (size_t)j];
+
+            if constexpr (std::is_same_v<T, float>) {
+                // fp32
+                DBG0("%.6g ", (double)v);
+            } else if constexpr (std::is_same_v<T, int8_t>) {
+                // int8 -> 가독성을 위해 int로 승격 출력
+                DBG0("%d ", (int)v);
+            } else if constexpr (std::is_same_v<T, acc_t>) {
+                // acc_t (일반적으로 int32_t)
+                if constexpr (std::numeric_limits<acc_t>::is_signed)
                     DBG0("%lld ", (long long)v);
-            }
-            else
-            {
-                DBG0("%g ", (double)v);
+                else
+                    DBG0("%llu ", (unsigned long long)v);
+            } else {
+                // 컴파일 타임 가드: 지원 타입 외 사용 방지
+                static_assert(std::is_same_v<T, void>,
+                              "dump_matrix: supported types are float, int8_t, acc_t only.");
             }
         }
         DBG0("]\n");
@@ -101,18 +107,15 @@ static inline void dump_matrix(const char *name, const T *m, int r, int c, int s
 #endif
 }
 
-// ====== Shape 추출 & 검사 ======
-struct mm_shape
-{
-    int I; // rows of C (and A)
-    int J; // cols of C (and B)
-    int K; // inner dim
-};
-
 // dst: (I x J) => ggml의 관례상 ne[0]=J, ne[1]=I
-// src0(weight): (J x K) layout (ne[0]=J, ne[1]=K) — 실행 시 B는 KxJ로 multiply
+// src0(weight): (K x J) layout (ne[0]=K, ne[1]=J) — 실행 시 B는 transpose하여 KxJ로 multiply
 // src1(act): (I x K) layout (ne[0]=K, ne[1]=I) — 실행 시 A는 IxK
-mm_shape extract_and_check_shapes(const ggml_tensor *dst);
+void extract_and_check_shapes(const ggml_tensor *dst, int &I, int &J, int &K);
+
+void log_shapes(const ggml_tensor *dst,
+                const ggml_tensor *src0,
+                const ggml_tensor *src1,
+                int I, int J, int K);
 
 // ====== CPU 참조 계산 & 검증 ======
 void cpu_reference_C(const elem_t *A, size_t sA,
@@ -125,32 +128,13 @@ bool compare_C_and_report(const elem_t *C, size_t sC,
                           const elem_t *C_exp, size_t sE,
                           int I, int J);
 
-// ====== ggml 텐서 slicing & 관찰 ======
-// ggml 2D 텐서를 (nb1/sizeof(T))를 stride로 보아 일부만 덤프
-void dump_tensor_auto_2d(const char *name, const ggml_tensor *t,
-                         int max_rows = -1, int max_cols = -1);
+// TEST_SLICE: 원본 ggml 텐서와 변환 버퍼(tA,tB,tC)를 SLICE_* 규칙으로 일부만 덤프
+void test_dump_slices(ggml_context* tmp_ctx,
+                      const ggml_tensor* src1, const ggml_tensor* src0, ggml_tensor* dst,
+                      int I, int J, int K,
+                      const elem_t* A_i8, size_t sA,
+                      const elem_t* B_i8, size_t sB,
+                      const elem_t* C_i8, size_t sC);
 
-// A_in: act(K×I), B_in: weight(J×K), C_out: dst(J×I), D_bias: bias(J×I)
-// I,J,K를 기준으로 view_2d를 만들고, bias 없을 경우 0으로 채운 가상 버퍼를 준비.
-// 반환: d_data_ptr(누산 버퍼 포인터), sD(요소 단위 stride), zero_bias(생성 시 소유).
-struct sliced_views
-{
-    ggml_tensor *A_sliced; // (ne0=K, ne1=I) -> 관찰 시 rows=I, cols=K, stride=nb1/sizeof(T)
-    ggml_tensor *B_sliced; // (ne0=J, ne1=K) -> 관찰 시 rows=K, cols=J, stride=nb1/sizeof(T)
-    ggml_tensor *C_sliced; // (ne0=J, ne1=I) -> 관찰 시 rows=I, cols=J, stride=nb1/sizeof(T)
-    ggml_tensor *D_sliced; // nullable, same layout as C
-
-    const void *d_data_ptr; // acc_t* (bias or zero buffer)
-    size_t sD;              // stride in elements for D (nb1/sizeof(acc_t))
-};
-
-sliced_views make_and_dump_mm_views(ggml_context *ctx,
-                                    const ggml_tensor *A_in,
-                                    const ggml_tensor *B_in,
-                                    ggml_tensor *C_out,
-                                    const ggml_tensor *D_bias,
-                                    int I, int J, int K,
-                                    std::vector<acc_t> &zero_bias_out);
-
-void test_writeback_f32_from_i8(const elem_t *C_i8, size_t sC,
+void test_dequantize_output(const elem_t *C_i8, size_t sC,
                                 int I, int J, ggml_tensor *dst);
