@@ -9,6 +9,110 @@ namespace zerogod
         int8_t       qs[QK8_0];  // 우리가 추출할 대상
         ggml_fp16_t  d;          // 스케일(이번 작업에서는 폐기)
     };
+
+
+    inline const block_q8_0 *get_q80_row_ptr(const ggml_tensor *src,
+                                         int64_t iy, int64_t iz, int64_t iw) 
+    {
+        const char *base = (const char *)(src->view_src ? src->view_src->data : src->data);
+        const size_t offs = src->view_src ? src->view_offs : 0;
+        return reinterpret_cast<const block_q8_0 *>(
+            base + offs + iw * src->nb[3] + iz * src->nb[2] + iy * src->nb[1]
+        );
+    }
+    template<typename T>
+    inline void copy_qs_block_to_T(const block_q8_0 &blk, T *dst) 
+    {
+        if constexpr (std::is_same_v<T, int8_t>) {
+            std::memcpy(dst, blk.qs, QK8_0 * sizeof(int8_t));
+        } else {
+            for (int j = 0; j < QK8_0; ++j) dst[j] = static_cast<T>(blk.qs[j]);
+        }
+    }   
+
+    template<typename T>
+    inline void copy_qs_block_to_T(const block_q8_0 &blk, T *dst) {
+        if constexpr (std::is_same_v<T, int8_t>) {
+            std::memcpy(dst, blk.qs, QK8_0 * sizeof(int8_t));
+        } else {
+            for (int j = 0; j < QK8_0; ++j) dst[j] = static_cast<T>(blk.qs[j]);
+        }
+    }
+
+    // (transpose=false) : 행 단위로 블록 복사 (가장 빠름)
+    template<typename T>
+    inline void q80_to_T_rowwise(const ggml_tensor *src,
+                                 T *dst_base, size_t dst_stride_elems,
+                                 int64_t rows, int64_t cols) {
+        GGML_ASSERT(src->type == GGML_TYPE_Q8_0);
+        GGML_ASSERT(cols % QK8_0 == 0);
+        const int64_t nblk = cols / QK8_0;
+
+        // (w,z) 전개
+        const int64_t ny = src->ne[1] ? src->ne[1] : 1;
+        const int64_t nz = src->ne[2] ? src->ne[2] : 1;
+        const int64_t nw = src->ne[3] ? src->ne[3] : 1;
+
+        int64_t row_idx = 0;
+        for (int64_t iw = 0; iw < nw; ++iw) {
+            for (int64_t iz = 0; iz < nz; ++iz) {
+                for (int64_t iy = 0; iy < ny; ++iy) {
+                    const block_q8_0 *row_blocks = get_q80_row_ptr(src, iy, iz, iw);
+                    T *dst_row = dst_base + row_idx * dst_stride_elems;
+
+                    for (int64_t b = 0; b < nblk; ++b) {
+                        copy_qs_block_to_T<T>(row_blocks[b], dst_row + b * QK8_0);
+                    }
+                    ++row_idx;
+                }
+            }
+        }
+        GGML_ASSERT(row_idx == rows);
+    }
+    template<typename T>
+    inline void q80_to_T_transposed(const ggml_tensor *src,
+                                    T *dst_base, size_t dst_stride_elems,
+                                    int64_t rows, int64_t cols) {
+        GGML_ASSERT(src->type == GGML_TYPE_Q8_0);
+        GGML_ASSERT(rows % QK8_0 == 0 || rows % QK8_0 == 0 || rows > 0); // rows(=src->ne[0]) 제약은 호출부에서 보장
+        const int64_t nx_src = src->ne[0]; // 원 src의 x 길이
+        GGML_ASSERT(nx_src % QK8_0 == 0);
+        const int64_t nblk_x = nx_src / QK8_0;
+
+        const int64_t ny = src->ne[1] ? src->ne[1] : 1;
+        const int64_t nz = src->ne[2] ? src->ne[2] : 1;
+        const int64_t nw = src->ne[3] ? src->ne[3] : 1;
+
+        // 논리적으로 dst_rows = src_cols(ny*nz*nw), dst_cols = src_rows(nx_src)
+        // 여기서 rows = dst_rows, cols = dst_cols 로 들어온다.
+        // (w,z) 묶음으로 각 y를 'dst의 행'으로 봄
+        int64_t dst_row_idx = 0;
+        for (int64_t iw = 0; iw < nw; ++iw) {
+            for (int64_t iz = 0; iz < nz; ++iz) {
+                for (int64_t iy = 0; iy < ny; ++iy) {
+                    const block_q8_0 *src_row_blocks = get_q80_row_ptr(src, iy, iz, iw);
+                    T *dst_row = dst_base + dst_row_idx * dst_stride_elems;
+
+                    // dst_row[c] = src(x=c, y=iy, z=iz, w=iw)
+                    // src(x=c) → block = c / 32, off = c % 32
+                    for (int64_t c = 0; c < cols; ++c) {
+                        const int64_t blk = c / QK8_0;
+                        const int     off = static_cast<int>(c % QK8_0);
+                        if constexpr (std::is_same_v<T, int8_t>) {
+                            dst_row[c] = src_row_blocks[blk].qs[off];
+                        } else {
+                            dst_row[c] = static_cast<T>(src_row_blocks[blk].qs[off]);
+                        }
+                    }
+                    ++dst_row_idx;
+                }
+            }
+        }
+        GGML_ASSERT(dst_row_idx == rows);
+    }
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
     template <typename T>
     static inline ggml_type ggml_type_of()
     {
@@ -72,9 +176,36 @@ namespace zerogod
 
         DBG("\ngenerated tensor: type=%s, cols=%d, rows=%d, buf_bytes=%zu\n", ggml_type_name(type), tensor_->ne[0], tensor_->ne[1], buf_bytes_);
 
+
         /* 5. _______________casting & 0-fill _________________ */
+
+
         if (!acc)
-            ggml_gemmini_cast(src, transpose);
+            if (src->type == GGML_TYPE_Q8_0){
+                const int64_t rows = src_rows;
+                const int64_t cols = src_cols;
+
+                // 목적지: 패딩 반영된 행 스트라이드(요소 단위)
+                T *dst_base = reinterpret_cast<T *>(this->data_);
+                const size_t dst_stride_elems = this->stride_;
+
+                if (!transpose) {
+                    // src의 x축 방향(Q8_0 블록)이 그대로 열이며, 행 단위 직복사
+                    q80_to_T_rowwise<T>(src, dst_base, dst_stride_elems, rows, cols);
+                } else {
+                    // 전치: dst(r,c) = src(x=r, y=c). 1원소 gather
+                    q80_to_T_transposed<T>(src, dst_base, dst_stride_elems, rows, cols);
+                }
+
+                // 패딩 영역은 0으로 채우기(열 패딩분)
+                if (padded_cols > src_cols) {
+                    for (int64_t r = 0; r < rows; ++r) {
+                        T *rowp = dst_base + r * dst_stride_elems;
+                        std::memset(rowp + src_cols, 0, (padded_cols - src_cols) * sizeof(T));
+                    }
+                }
+            }else 
+                ggml_gemmini_cast(src, transpose);
         else
             std::memset(data_, 0, buf_bytes_);
 
@@ -239,27 +370,31 @@ namespace zerogod
         }
         case GGML_TYPE_Q8_0:
         {
-            DBG("----------------------Q8_0 type----------------------\n")
-            DBG("\nchecking q8_0 tensor: type=%s, cols=%d, rows=%d, buf_bytes=%zu\n", ggml_type_name(src->type), src->ne[0], src->ne[1], buf_bytes_);
-            assert(ctx && t_q80);
-            assert(t_q80->type == GGML_TYPE_Q8_0);
-            assert(t_q80->ne[0] % QK8_0 == 0);
+            // DBG("----------------------Q8_0 type----------------------\n")
+            // DBG("\nchecking q8_0 tensor: type=%s, cols=%d, rows=%d, buf_bytes=%zu\n", ggml_type_name(src->type), src->ne[0], src->ne[1], buf_bytes_);
+            // assert(ctx && src);
+            // assert(src->type == GGML_TYPE_Q8_0);
+            // assert(t_q80->ne[0] % QK8_0 == 0);
 
-            int64_t ne[4] = { t_q80->ne[0], t_q80->ne[1], t_q80->ne[2], t_q80->ne[3] };
+            // int64_t ne[4] = { t_q80->ne[0], t_q80->ne[1], t_q80->ne[2], t_q80->ne[3] };
 
-            // ggml 타입 매핑
-            constexpr ggml_type out_type = ggml_type_of<T>::value;
-            ggml_tensor *t_out = ggml_new_tensor(ctx, out_type, 4, ne);
+            // // ggml 타입 매핑
+            // constexpr ggml_type out_type = ggml_type_of<T>::value;
+            // ggml_tensor *t_out = ggml_new_tensor(ctx, out_type, 4, ne);
 
-            const int64_t n = numel4(t_q80);
-            // 임시 연속 버퍼에 추출 후 텐서 메모리에 복사
-            // (ggml_new_tensor()는 보통 contiguous)
-            T *tmp = reinterpret_cast<T *>(malloc(sizeof(T) * (size_t)n));
-            assert(tmp);
+            // const int64_t n = numel4(t_q80);
+            // // 임시 연속 버퍼에 추출 후 텐서 메모리에 복사
+            // // (ggml_new_tensor()는 보통 contiguous)
+            // T *tmp = reinterpret_cast<T *>(malloc(sizeof(T) * (size_t)n));
+            // assert(tmp);
 
-            extract_q80_qs_to_linear<T>(t_q80, tmp);
-            std::memset(dst_row, tmp, sizeof(T) * (size_t)n)
-            free(tmp);
+            // extract_q80_qs_to_linear<T>(t_q80, tmp);
+            // std::memset(dst_row, tmp, sizeof(T) * (size_t)n)
+            // free(tmp);
+
+            ////////////////////////////////////////////////////////////////////////////////////////////
+            
+
             // const int64_t K = src->ne[0];                 // 열 길이 (k)
             // const int64_t I = src->ne[1] * (src->ne[2] ? src->ne[2] : 1) * (src->ne[3] ? src->ne[3] : 1); // 총 행 수
             // const size_t  row_stride_bytes_q = src->nb[1]; // Q8_0 텐서의 행 간 byte stride
@@ -278,8 +413,8 @@ namespace zerogod
             // /* TODO: copy */
 
             // std::memset(dst_row, 0, buf_bytes_); // 임시 패딩
-            break;
-            DBG("----------------------Q8_0 type end----------------------\n")
+            // break;
+            // DBG("----------------------Q8_0 type end----------------------\n")
         }
         default:
         {
