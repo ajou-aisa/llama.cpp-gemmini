@@ -16,22 +16,11 @@ void ggml_gemmini_test(ggml_backend_gemmini_context *ctx,
     GGML_ASSERT(src0 && src1);
 
     // 0) Shape 검증/확정(논리 I,J,K)
-    const mm_shape shp = extract_and_check_shapes(dst);
-    const int I_log = shp.I;
-    const int J_log = shp.J;
-    const int K_log = shp.K;
+    int I_log = 0, J_log = 0, K_log = 0;
+    extract_and_check_shapes(dst, I_log, J_log, K_log);
 
-#if TEST_SHAPE // 원본 ggml 차원 검증 (출력)
-    DBG0("[TEST_SHAPE] I=%d, J=%d, K=%d\n", I_log, J_log, K_log);
-    DBG0(" dst ne=[%llu,%llu], nb=[%llu,%llu]\n",
-         (unsigned long long)dst->ne[0], (unsigned long long)dst->ne[1],
-         (unsigned long long)dst->nb[0], (unsigned long long)dst->nb[1]);
-    DBG0(" src0(W) ne=[%llu,%llu], nb=[%llu,%llu]\n",
-         (unsigned long long)src0->ne[0], (unsigned long long)src0->ne[1],
-         (unsigned long long)src0->nb[0], (unsigned long long)src0->nb[1]);
-    DBG0(" src1(A) ne=[%llu,%llu], nb=[%llu,%llu]\n",
-         (unsigned long long)src1->ne[0], (unsigned long long)src1->ne[1],
-         (unsigned long long)src1->nb[0], (unsigned long long)src1->nb[1]);
+#if TEST_SHAPE
+    log_shapes(dst, src0, src1, I_log, J_log, K_log);
 #endif
 
     /* 1) Gemmini용 캐스팅/배치 (ggml-gemmini-tensor.cpp 사용)
@@ -66,35 +55,12 @@ void ggml_gemmini_test(ggml_backend_gemmini_context *ctx,
     GGML_ASSERT(sA % 16 == 0 && sB % 16 == 0 && sC % 16 == 0);
 
 #if TEST_SLICE // 원본 텐서와 변환 텐서를 일정 크기로 잘라내어 출력 - shape, 구조 확인
-    const size_t b_rows = tB.get_rows();
-    const size_t b_cols = tB.get_cols();
-    // a) 원본 텐서 관찰용 view (src1/src0/dst)
-    DBG0("[SLICE] I=%zu J(p)=%zu K=%zu | tB(KxJ)=(%zu,%zu)\n", I, J, K, b_rows, b_cols);
-
-    {
-        std::vector<acc_t> zero_bias_view;
-        auto views = make_and_dump_mm_views(ctx->tmp_ctx, src1, src0, dst, bias, I_log, J_log, K_log, zero_bias_view);
-        (void)views;
-    }
-    // b) 변환된 내부 버퍼 일부 dump
-    {
-        // A(IxK): I는 1로 제한, K는 SLICE_K까지
-        const int rA = std::min<int>((int)I, SLICE_I);
-        const int cA = std::min<int>((int)K, SLICE_K);
-
-        // B(KxJ): K는 SLICE_K까지, J는 논리 J와 SLICE_J 중 작은 값 (패딩은 출력 안 함)
-        const int rB = std::min<int>((int)b_rows, SLICE_K);                        // rows=K
-        const int cB = std::min<int>((int)std::min<size_t>(b_cols, (size_t)J_log), // cols=J (no padding)
-                                     SLICE_J);
-
-        // C(IxJ): I는 1로 제한, J는 논리 J와 SLICE_J 중 작은 값
-        const int rC = std::min<int>((int)I, SLICE_I);
-        const int cC = std::min<int>(J_log, SLICE_J);
-
-        dump_matrix<elem_t>("tA (IxK)", (const elem_t *)tA.get(), rA, cA, (int)sA);
-        dump_matrix<elem_t>("tB (KxJ)", (const elem_t *)tB.get(), rB, cB, (int)sB);
-        dump_matrix<elem_t>("tC (IxJ)", (const elem_t *)tC.get(), rC, cC, (int)sC);
-    }
+    test_dump_slices(ctx->tmp_ctx,
+                     src1, src0, dst,
+                     I_log, J_log, K_log,
+                     (const elem_t *)tA.get(), sA,
+                     (const elem_t *)tB.get(), sB,
+                     (const elem_t *)tC.get(), sC);
 #endif
 
     // 3) Bias 준비 (int32). 없으면 1×J(패딩) zero-bias를 repeating으로 사용
@@ -121,7 +87,7 @@ void ggml_gemmini_test(ggml_backend_gemmini_context *ctx,
     }
 
     // 4) (선택) CPU 레퍼런스
-#if TEST_CPU_REF || TEST_COMPARE
+#if TEST_CPU_REF
     // CPU 참조는 논리 J까지만 계산/검증
     const size_t sC_exp = sC; // 동일 stride 사용
     std::vector<elem_t> C_exp(I * sC_exp, (elem_t)0);
@@ -151,16 +117,16 @@ void ggml_gemmini_test(ggml_backend_gemmini_context *ctx,
 #endif
 
     // 6) (선택) 결과 비교
-#if TEST_COMPARE
+#if TEST_CPU_REF && TEST_GEMMINI && TEST_COMPARE
     (void)compare_C_and_report((const elem_t *)tC.get(), sC,
                                (const elem_t *)C_exp.data(), sC_exp,
                                (int)I, J_log);
 #endif
 
     // 7) (선택) dst(F32)로 반영 — 논리 J만 복사
-#if TEST_WRITEBACK
-    test_writeback_f32_from_i8((const elem_t *)tC.get(), sC,
-                               (int)I, J_log, dst);
+#if TEST_GEMMINI && TEST_WRITEBACK
+    test_dequantize_output((const elem_t *)tC.get(), sC,
+                           (int)I, J_log, dst);
 #endif
 
     // (미사용 경고 방지)
@@ -177,18 +143,17 @@ void ggml_gemmini_test(ggml_backend_gemmini_context *ctx,
 }
 
 // ===== Shape 추출/검사 =====
-mm_shape extract_and_check_shapes(const ggml_tensor *dst)
+void extract_and_check_shapes(const ggml_tensor *dst, int &I, int &J, int &K)
 {
-    const ggml_tensor *src0 = dst->src[0]; // weight (J×K) layout: ne0=K, ne1=J
-    const ggml_tensor *src1 = dst->src[1]; // act    (I×K) layout: ne0=K, ne1=I
+    const ggml_tensor *src0 = dst->src[0]; // weight stored KxJ (W^T): ne0=K, ne1=J
+    const ggml_tensor *src1 = dst->src[1]; // act    stored KxI      : ne0=K, ne1=I
     GGML_ASSERT(src0 && src1);
 
-    const int J = (int)dst->ne[0];
-    const int I = (int)dst->ne[1];
+    J = (int)dst->ne[0];
+    I = (int)dst->ne[1];
 
-    const int J0 = (int)src0->ne[1];
     const int K0 = (int)src0->ne[0];
-
+    const int J0 = (int)src0->ne[1];
     const int K1 = (int)src1->ne[0];
     const int I1 = (int)src1->ne[1];
 
@@ -196,7 +161,24 @@ mm_shape extract_and_check_shapes(const ggml_tensor *dst)
     GGML_ASSERT(I1 == I);
     GGML_ASSERT(K0 == K1);
 
-    return mm_shape{I, J, K1};
+    K = K1;
+}
+
+void log_shapes(const ggml_tensor *dst,
+                const ggml_tensor *src0,
+                const ggml_tensor *src1,
+                int I, int J, int K)
+{
+    DBG0("[TEST_SHAPE] I=%d, J=%d, K=%d\n", I, J, K);
+    DBG0(" dst  (logical I x J) stored ne=[%llu,%llu], nb=[%llu,%llu]\n",
+         (unsigned long long)dst->ne[0], (unsigned long long)dst->ne[1],
+         (unsigned long long)dst->nb[0], (unsigned long long)dst->nb[1]);
+    DBG0(" src0 (W^T stored K x J, logical W J x K) ne=[%llu,%llu], nb=[%llu,%llu]\n",
+         (unsigned long long)src0->ne[0], (unsigned long long)src0->ne[1],
+         (unsigned long long)src0->nb[0], (unsigned long long)src0->nb[1]);
+    DBG0(" src1 (A stored K x I,   logical A I x K) ne=[%llu,%llu], nb=[%llu,%llu]\n",
+         (unsigned long long)src1->ne[0], (unsigned long long)src1->ne[1],
+         (unsigned long long)src1->nb[0], (unsigned long long)src1->nb[1]);
 }
 
 // ===== CPU 참조/검증 =====
@@ -242,156 +224,82 @@ bool compare_C_and_report(const elem_t *C, size_t sC,
     return ok;
 }
 
-// ===== ggml 텐서 덤프 (nb 기반 직접 접근) =====
-void dump_tensor_auto_2d(const char *name, const ggml_tensor *t,
-                         int max_rows, int max_cols)
+// test_dump_slices: dump_matrix만 사용
+void test_dump_slices(ggml_context *tmp_ctx,
+                      const ggml_tensor *src1, // act: stored (ne0=K, ne1=I)
+                      const ggml_tensor *src0, // W^T: stored (ne0=K, ne1=J)
+                      ggml_tensor *dst,        // dst: stored (ne0=J, ne1=I) (F32)
+                      int I, int J, int K,
+                      const elem_t *A_i8, size_t sA, // tA (I x K), stride elems
+                      const elem_t *B_i8, size_t sB, // tB (K x J), stride elems
+                      const elem_t *C_i8, size_t sC) // tC (I x J), stride elems
 {
 #if DUMP
-    if (!t)
-        return;
-    const int rows = (int)t->ne[1];
-    const int cols = (int)t->ne[0];
-    const int rlim = (max_rows < 0 ? rows : std::min(rows, max_rows));
-    const int clim = (max_cols < 0 ? cols : std::min(cols, max_cols));
-    const char *base = (const char *)t->data;
-    const size_t nb0 = t->nb[0];
-    const size_t nb1 = t->nb[1];
-
-    DBG0("%s (type=%s) rows=%d cols=%d row_stride(bytes)=%zu\n",
-         name, ggml_type_name(t->type), rows, cols, nb1);
-
-    if (t->type == GGML_TYPE_I8)
-    {
-        for (int i = 0; i < rlim; ++i)
-        {
-            DBG0("[ ");
-            for (int j = 0; j < clim; ++j)
-            {
-                const int8_t *p = (const int8_t *)(base + (size_t)i * nb1 + (size_t)j * nb0);
-                DBG0("%d ", (int)*p);
-            }
-            if (clim < cols)
-                DBG0("...");
-            DBG0("]\n");
-        }
-    }
-    else if (t->type == GGML_TYPE_F32)
-    {
-        for (int i = 0; i < rlim; ++i)
-        {
-            DBG0("[ ");
-            for (int j = 0; j < clim; ++j)
-            {
-                const float *p = (const float *)(base + (size_t)i * nb1 + (size_t)j * nb0);
-                DBG0("%g ", (double)*p);
-            }
-            if (clim < cols)
-                DBG0("...");
-            DBG0("]\n");
-        }
-    }
-    else if (t->type == GGML_TYPE_I32)
-    {
-        for (int i = 0; i < rlim; ++i)
-        {
-            DBG0("[ ");
-            for (int j = 0; j < clim; ++j)
-            {
-                const int32_t *p = (const int32_t *)(base + (size_t)i * nb1 + (size_t)j * nb0);
-                DBG0("%d ", (int)*p);
-            }
-            if (clim < cols)
-                DBG0("...");
-            DBG0("]\n");
-        }
-    }
-    else
-    {
-        DBG0("%s: dump not implemented for type=%d\n", name, (int)t->type);
-    }
-    if (rlim < rows)
-        DBG0("...\n");
-#else
-    (void)name;
-    (void)t;
-    (void)max_rows;
-    (void)max_cols;
-#endif
-}
-
-// ===== slicing & 관찰 =====
-sliced_views make_and_dump_mm_views(ggml_context *ctx,
-                                    const ggml_tensor *A_in,
-                                    const ggml_tensor *B_in,
-                                    ggml_tensor *C_out,
-                                    const ggml_tensor *D_bias,
-                                    int I, int J, int K,
-                                    std::vector<acc_t> &zero_bias_out)
-{
-    GGML_ASSERT(A_in && A_in->data && "A_in is invalid");
-    GGML_ASSERT(B_in && B_in->data && "B_in is invalid");
-    GGML_ASSERT(C_out && C_out->data && "C_out is invalid");
-
-    // SLICE 한도 적용
-    const int vI = std::min(I, SLICE_I); // 1
+    // SLICE 한도 (논리 크기 기준 clamp)
+    const int vI = std::min(I, SLICE_I); // 보통 1
     const int vK = std::min(K, SLICE_K);
     const int vJ = std::min(J, SLICE_J);
 
-    // A_sliced: (ne0=K, ne1=I) -> rows=vI, cols=vK
-    ggml_tensor *A_sliced = ggml_view_2d(ctx,
-                                         const_cast<ggml_tensor *>(A_in),
-                                         /*ne0=*/vK, /*ne1=*/vI,
-                                         /*nb1=*/A_in->nb[1], /*offset=*/0);
+    // ===== 원본 ggml 텐서 slice view 만들기 =====
+    ggml_tensor *A_slice = ggml_view_2d(tmp_ctx,
+                                        const_cast<ggml_tensor *>(src1),
+                                        /*ne0=*/vK, /*ne1=*/vI,
+                                        /*nb1=*/src1->nb[1], /*offset=*/0);
 
-    // B_sliced: (ne0=J, ne1=K) -> rows=vK, cols=vJ  (W^T 관찰용)
-    ggml_tensor *B_sliced = ggml_view_2d(ctx,
-                                         const_cast<ggml_tensor *>(B_in),
-                                         /*ne0=*/vJ, /*ne1=*/vK,
-                                         /*nb1=*/B_in->nb[1], /*offset=*/0);
+    ggml_tensor *B_slice = ggml_view_2d(tmp_ctx,
+                                        const_cast<ggml_tensor *>(src0),
+                                        /*ne0=*/vJ, /*ne1=*/vK,
+                                        /*nb1=*/src0->nb[1], /*offset=*/0);
 
-    // C_sliced: (ne0=J, ne1=I) -> rows=vI, cols=vJ
-    ggml_tensor *C_sliced = ggml_view_2d(ctx,
-                                         C_out,
-                                         /*ne0=*/vJ, /*ne1=*/vI,
-                                         /*nb1=*/C_out->nb[1], /*offset=*/0);
+    ggml_tensor *C_slice = ggml_view_2d(tmp_ctx,
+                                        dst,
+                                        /*ne0=*/vJ, /*ne1=*/vI,
+                                        /*nb1=*/dst->nb[1], /*offset=*/0);
 
-    ggml_tensor *D_sliced = nullptr;
-    const void *d_data_ptr = nullptr;
-    size_t sD = 0;
+    DBG0("[SLICE] vI=%d vK=%d vJ=%d | I=%d K=%d J=%d\n", vI, vK, vJ, I, K, J);
 
-    if (D_bias)
-    {
-        GGML_ASSERT(D_bias->data && "D_bias->data is invalid");
-        D_sliced = ggml_view_2d(
-            ctx, const_cast<ggml_tensor *>(D_bias),
-            /*ne0=*/vJ, /*ne1=*/vI,
-            /*nb1=*/D_bias->nb[1], /*offset=*/0);
-        d_data_ptr = D_sliced->data;
-        sD = (size_t)(D_sliced->nb[1] / sizeof(acc_t));
-    }
-    else
-    {
-        // zero-bias도 slice 크기에 맞춰 최소만 준비
-        const size_t sD_elem = align_up((size_t)vJ, (size_t)(GEMMINI_ALIGN / sizeof(acc_t)));
-        zero_bias_out.assign((size_t)vI * sD_elem, 0);
-        d_data_ptr = zero_bias_out.data();
-        sD = sD_elem;
-    }
+    // ===== 원본 ggml slice를 dump_matrix로 출력 =====
+    // A/B는 int8, C는 F32(현재 경로 가정). 열 연속성(nb0==sizeof(T)) 확인 후 stride=nb1/sizeof(T).
+    GGML_ASSERT(A_slice->type == GGML_TYPE_I8 && A_slice->nb[0] == sizeof(elem_t));
+    GGML_ASSERT(B_slice->type == GGML_TYPE_I8 && B_slice->nb[0] == sizeof(elem_t));
+    GGML_ASSERT(C_slice->type == GGML_TYPE_F32 && C_slice->nb[0] == sizeof(float));
 
-#if DUMP
-    // view 자체가 잘린 크기이므로 전체 출력(-1,-1)로 충분
-    dump_tensor_auto_2d("A_sliced (I x K view of act)", A_sliced, -1, -1);
-    dump_tensor_auto_2d("B_sliced (K x J view of W^T)", B_sliced, -1, -1);
-    dump_tensor_auto_2d("C_sliced (I x J view of dst)", C_sliced, -1, -1);
-    if (D_bias)
-        dump_tensor_auto_2d("D_sliced (I x J bias)", D_sliced, -1, -1);
+    const int sA_view = (int)(A_slice->nb[1] / sizeof(elem_t));
+    const int sB_view = (int)(B_slice->nb[1] / sizeof(elem_t));
+    const int sC_view = (int)(C_slice->nb[1] / sizeof(float));
+
+    dump_matrix<elem_t>("A_slice (I x K, from src1)",
+                        (const elem_t *)A_slice->data, vI, vK, sA_view);
+
+    dump_matrix<elem_t>("B_slice (K x J, from src0)",
+                        (const elem_t *)B_slice->data, vK, vJ, sB_view);
+
+    dump_matrix<float>("C_slice (I x J, from dst )",
+                       (const float *)C_slice->data, vI, vJ, sC_view);
+
+    // ===== 변환된 내부 버퍼(tA/tB/tC) 일부 덤프 =====
+    dump_matrix<elem_t>("tA (IxK)", A_i8, vI, vK, (int)sA);
+    dump_matrix<elem_t>("tB (KxJ)", B_i8, vK, vJ, (int)sB);
+    dump_matrix<elem_t>("tC (IxJ)", C_i8, vI, vJ, (int)sC);
+#else
+    (void)tmp_ctx;
+    (void)src1;
+    (void)src0;
+    (void)dst;
+    (void)I;
+    (void)J;
+    (void)K;
+    (void)A_i8;
+    (void)sA;
+    (void)B_i8;
+    (void)sB;
+    (void)C_i8;
+    (void)sC;
 #endif
-
-    return sliced_views{A_sliced, B_sliced, C_sliced, D_sliced, d_data_ptr, sD};
 }
 
-void test_writeback_f32_from_i8(const elem_t *C_i8, size_t sC,
-                                int I, int J, ggml_tensor *dst)
+void test_dequantize_output(const elem_t *C_i8, size_t sC,
+                            int I, int J, ggml_tensor *dst)
 {
     if (dst->type != GGML_TYPE_F32)
     {
