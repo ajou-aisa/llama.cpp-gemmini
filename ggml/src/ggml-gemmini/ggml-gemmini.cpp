@@ -6,9 +6,6 @@
 
 using namespace zerogod;
 
-extern "C" volatile uint64_t gemmini_tiled_matmul_cycles = 0; // gemmini.h
-
-
 static void ggml_backend_gemmini_mul_mat(
                                          ggml_backend_gemmini_context *ctx,
                                          struct ggml_tensor *dst, // FP32 output (I×J)
