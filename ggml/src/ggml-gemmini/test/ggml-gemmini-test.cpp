@@ -224,7 +224,7 @@ bool compare_C_and_report(const elem_t *C, size_t sC,
     return ok;
 }
 
-// test_dump_slices: dump_matrix만 사용
+// test_dump_slices: dump_matrix만 사용 (원본 텐서는 타입 분기)
 void test_dump_slices(ggml_context *tmp_ctx,
                       const ggml_tensor *src1, // act: stored (ne0=K, ne1=I)
                       const ggml_tensor *src0, // W^T: stored (ne0=K, ne1=J)
@@ -257,27 +257,48 @@ void test_dump_slices(ggml_context *tmp_ctx,
                                         /*nb1=*/dst->nb[1], /*offset=*/0);
 
     DBG0("[SLICE] vI=%d vK=%d vJ=%d | I=%d K=%d J=%d\n", vI, vK, vJ, I, K, J);
+    DBG0("  A_slice: type=%s nb0=%zu nb1=%zu\n", ggml_type_name(A_slice->type),
+         (size_t)A_slice->nb[0], (size_t)A_slice->nb[1]);
+    DBG0("  B_slice: type=%s nb0=%zu nb1=%zu\n", ggml_type_name(B_slice->type),
+         (size_t)B_slice->nb[0], (size_t)B_slice->nb[1]);
+    DBG0("  C_slice: type=%s nb0=%zu nb1=%zu\n", ggml_type_name(C_slice->type),
+         (size_t)C_slice->nb[0], (size_t)C_slice->nb[1]);
 
-    // ===== 원본 ggml slice를 dump_matrix로 출력 =====
-    // A/B는 int8, C는 F32(현재 경로 가정). 열 연속성(nb0==sizeof(T)) 확인 후 stride=nb1/sizeof(T).
-    GGML_ASSERT(A_slice->type == GGML_TYPE_I8 && A_slice->nb[0] == sizeof(elem_t));
-    GGML_ASSERT(B_slice->type == GGML_TYPE_I8 && B_slice->nb[0] == sizeof(elem_t));
-    GGML_ASSERT(C_slice->type == GGML_TYPE_F32 && C_slice->nb[0] == sizeof(float));
-
+    // stride
     const int sA_view = (int)(A_slice->nb[1] / sizeof(elem_t));
     const int sB_view = (int)(B_slice->nb[1] / sizeof(elem_t));
     const int sC_view = (int)(C_slice->nb[1] / sizeof(float));
 
-    dump_matrix<elem_t>("A_slice (I x K, from src1)",
-                        (const elem_t *)A_slice->data, vI, vK, sA_view);
+    // ===== 타입 분기 덤프 유틸
+    auto dump_any = [](const char *tag, const ggml_tensor *t, int r, int c, int s)
+    {
+        switch (t->type)
+        {
+        case GGML_TYPE_I8:
+            GGML_ASSERT(t->nb[0] == sizeof(int8_t));
+            dump_matrix<int8_t>(tag, (const int8_t *)t->data, r, c, s);
+            break;
+        case GGML_TYPE_F32:
+            GGML_ASSERT(t->nb[0] == sizeof(float));
+            dump_matrix<float>(tag, (const float *)t->data, r, c, s);
+            break;
+        case GGML_TYPE_I32: // acc_t 경로(필요 시)
+            GGML_ASSERT(t->nb[0] == sizeof(acc_t));
+            dump_matrix<acc_t>(tag, (const acc_t *)t->data, r, c, s);
+            break;
+        default:
+            DBG0("%s: unsupported ggml type=%d (nb0=%zu, nb1=%zu) — skipped\n",
+                 tag, (int)t->type, (size_t)t->nb[0], (size_t)t->nb[1]);
+            break;
+        }
+    };
 
-    dump_matrix<elem_t>("B_slice (K x J, from src0)",
-                        (const elem_t *)B_slice->data, vK, vJ, sB_view);
+    // ===== 원본 ggml slice 덤프 =====
+    dump_any("A_slice (I x K, from src1)", A_slice, vI, vK, sA_view);
+    dump_any("B_slice (K x J, from src0)", B_slice, vK, vJ, sB_view);
+    dump_any("C_slice (I x J, from dst )", C_slice, vI, vJ, sC_view);
 
-    dump_matrix<float>("C_slice (I x J, from dst )",
-                       (const float *)C_slice->data, vI, vJ, sC_view);
-
-    // ===== 변환된 내부 버퍼(tA/tB/tC) 일부 덤프 =====
+    // ===== 변환된 내부 버퍼(tA/tB/tC) 일부 덤프 — 항상 I8 =====
     dump_matrix<elem_t>("tA (IxK)", A_i8, vI, vK, (int)sA);
     dump_matrix<elem_t>("tB (KxJ)", B_i8, vK, vJ, (int)sB);
     dump_matrix<elem_t>("tC (IxJ)", C_i8, vI, vJ, (int)sC);
