@@ -145,6 +145,7 @@ void ggml_gemmini_test(ggml_backend_gemmini_context *ctx,
 // ===== Shape 추출/검사 =====
 void extract_and_check_shapes(const ggml_tensor *dst, int &I, int &J, int &K)
 {
+    DBG0("[extract_and_check_shapes] called: \n");
     const ggml_tensor *src0 = dst->src[0]; // weight stored KxJ (W^T): ne0=K, ne1=J
     const ggml_tensor *src1 = dst->src[1]; // act    stored KxI      : ne0=K, ne1=I
     GGML_ASSERT(src0 && src1);
@@ -169,6 +170,8 @@ void log_shapes(const ggml_tensor *dst,
                 const ggml_tensor *src1,
                 int I, int J, int K)
 {
+    DBG0("[log_shapes] called\n");
+
     DBG0("[TEST_SHAPE] I=%d, J=%d, K=%d\n", I, J, K);
     DBG0(" dst  (logical I x J) stored ne=[%llu,%llu], nb=[%llu,%llu]\n",
          (unsigned long long)dst->ne[0], (unsigned long long)dst->ne[1],
@@ -188,6 +191,8 @@ void cpu_reference_C(const elem_t *A, size_t sA,
                      elem_t *C_exp, size_t sC,
                      int I, int J, int K)
 {
+    DBG0("[cpu_reference_C] called\n");
+
     for (int i = 0; i < I; ++i)
     {
         for (int j = 0; j < J; ++j)
@@ -205,6 +210,7 @@ bool compare_C_and_report(const elem_t *C, size_t sC,
                           const elem_t *C_exp, size_t sE,
                           int I, int J)
 {
+    DBG0("[compare_C_and_report] called\n");
     bool ok = true;
     for (int i = 0; i < I; ++i)
     {
@@ -234,6 +240,7 @@ void test_dump_slices(ggml_context *tmp_ctx,
                       const elem_t *B_i8, size_t sB, // tB (K x J), stride elems
                       const elem_t *C_i8, size_t sC) // tC (I x J), stride elems
 {
+    DBG0("[TEST_SLICE] called\n");
 #if DUMP
     // SLICE 한도 (논리 크기 기준 clamp)
     const int vI = std::min(I, SLICE_I); // 보통 1
@@ -322,6 +329,7 @@ void test_dump_slices(ggml_context *tmp_ctx,
 void test_dequantize_output(const elem_t *C_i8, size_t sC,
                             int I, int J, ggml_tensor *dst)
 {
+    DBG0("[TEST_WRITEBACK] called\n");
     if (dst->type != GGML_TYPE_F32)
     {
         DBG0("[TEST_WRITEBACK] skip: dst type is not F32 (type=%d)\n", (int)dst->type);
