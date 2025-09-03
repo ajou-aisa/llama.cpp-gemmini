@@ -3,12 +3,19 @@
 
 #include "ggml-gemmini-tensor.h"
 
+
+
 namespace zerogod
 {
+    #ifndef QK8_0
+    #define QK8_0 32
+    #endif
+
     struct block_q8_0 {
         int8_t       qs[QK8_0];  // 우리가 추출할 대상
         ggml_fp16_t  d;          // 스케일(이번 작업에서는 폐기)
     };
+
 
 
     inline const block_q8_0 *get_q80_row_ptr(const ggml_tensor *src,
@@ -176,7 +183,7 @@ namespace zerogod
 
         DBG("\ngenerated tensor: type=%s, cols=%d, rows=%d, buf_bytes=%zu\n", ggml_type_name(type), tensor_->ne[0], tensor_->ne[1], buf_bytes_);
 
-
+ggml tensor의  GGML_TYPE_Q8_0 type
         /* 5. _______________casting & 0-fill _________________ */
 
 
