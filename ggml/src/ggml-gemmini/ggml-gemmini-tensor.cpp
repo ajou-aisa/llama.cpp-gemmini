@@ -37,14 +37,6 @@ namespace zerogod
         }
     }   
 
-    template<typename T>
-    inline void copy_qs_block_to_T(const block_q8_0 &blk, T *dst) {
-        if constexpr (std::is_same_v<T, int8_t>) {
-            std::memcpy(dst, blk.qs, QK8_0 * sizeof(int8_t));
-        } else {
-            for (int j = 0; j < QK8_0; ++j) dst[j] = static_cast<T>(blk.qs[j]);
-        }
-    }
 
     // (transpose=false) : 행 단위로 블록 복사 (가장 빠름)
     template<typename T>
@@ -183,11 +175,10 @@ namespace zerogod
 
         DBG("\ngenerated tensor: type=%s, cols=%d, rows=%d, buf_bytes=%zu\n", ggml_type_name(type), tensor_->ne[0], tensor_->ne[1], buf_bytes_);
 
-ggml tensor의  GGML_TYPE_Q8_0 type
         /* 5. _______________casting & 0-fill _________________ */
 
 
-        if (!acc)
+        if (!acc){
             if (src->type == GGML_TYPE_Q8_0){
                 const int64_t rows = src_rows;
                 const int64_t cols = src_cols;
@@ -211,10 +202,12 @@ ggml tensor의  GGML_TYPE_Q8_0 type
                         std::memset(rowp + src_cols, 0, (padded_cols - src_cols) * sizeof(T));
                     }
                 }
-            }else 
+            } else 
                 ggml_gemmini_cast(src, transpose);
-        else
+            }
+        else{
             std::memset(data_, 0, buf_bytes_);
+        }
 
         /* 6. _________________stride 업데이트__________________ */
         update_stride();
