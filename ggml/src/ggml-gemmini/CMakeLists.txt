@@ -33,7 +33,7 @@ target_compile_definitions(ggml-gemmini PRIVATE
   TEST_CPU_REF=0
   TEST_GEMMINI=0
   TEST_COMPARE=0
-  TEST_WRITEBACK=0
+  TEST_DEQUANTIZE=0
 
   # slice 크기
   SLICE_I=1
