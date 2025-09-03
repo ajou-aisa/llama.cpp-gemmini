@@ -240,7 +240,7 @@ void test_dump_slices(ggml_context *tmp_ctx,
                       const elem_t *B_i8, size_t sB, // tB (K x J), stride elems
                       const elem_t *C_i8, size_t sC) // tC (I x J), stride elems
 {
-    DBG0("[TEST_SLICE] called\n");
+    DBG0("[test_dump_slices] called\n");
 #if DUMP
     // SLICE 한도 (논리 크기 기준 clamp)
     const int vI = std::min(I, SLICE_I); // 보통 1
@@ -329,10 +329,10 @@ void test_dump_slices(ggml_context *tmp_ctx,
 void test_dequantize_output(const elem_t *C_i8, size_t sC,
                             int I, int J, ggml_tensor *dst)
 {
-    DBG0("[TEST_WRITEBACK] called\n");
+    DBG0("[test_dequantize_output] called\n");
     if (dst->type != GGML_TYPE_F32)
     {
-        DBG0("[TEST_WRITEBACK] skip: dst type is not F32 (type=%d)\n", (int)dst->type);
+        DBG0("[TEST_DEQUANTIZE] skip: dst type is not F32 (type=%d)\n", (int)dst->type);
         return;
     }
     const size_t nb1 = dst->nb[1];
