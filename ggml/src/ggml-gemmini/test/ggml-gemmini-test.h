@@ -1,150 +1,140 @@
 // test/ggml-gemmini-test.h
-#ifndef __GGML_GEMMINI_TEST_H__
-#define __GGML_GEMMINI_TEST_H__
+#pragma once
 
 #ifndef OPTION
 #define OPTION CPU
 #endif
 
+// 1: src0(JxK) -> 변환 시 물리 전치(KxJ)로 배치(현재 기본)
+// 0: src0(JxK) -> 전치 없이 JxK로 배치
+#ifndef TRANSPOSE_B
+#define TRANSPOSE_B 1  
+#endif
+#ifndef TEST_SHAPE
+#define TEST_SHAPE 0
+#endif
+#ifndef TEST_SLICE
+#define TEST_SLICE 0
+#endif
+#ifndef TEST_CPU_REF
+#define TEST_CPU_REF 0
+#endif
+#ifndef TEST_GEMMINI
+#define TEST_GEMMINI 0
+#endif
+#ifndef TEST_COMPARE
+#define TEST_COMPARE 0
+#endif
+#ifndef TEST_DEQUANTiZE
+#define TEST_DEQUANTIZE 0
+#endif
+#ifndef DUMP
+#define DUMP (TEST_SLICE || TEST_CPU_REF || TEST_COMPARE)
+#endif
+
+// slice 크기
+#ifndef SLICE_I
+#define SLICE_I 1      // A/C는 행 1만 출력
+#endif
+#ifndef SLICE_K
+#define SLICE_K 4     // K 방향 최대 출력 열
+#endif
+#ifndef SLICE_J
+#define SLICE_J 6     // J 방향 최대 출력 열(논리 J 기준)
+#endif
+
 #include "include/gemmini.h"
+#include "../ggml-gemmini-util.h"
+#include "../ggml-gemmini-tensor.h"
 #include <cstdio>
 #include <type_traits>
+#include <vector>
+#include "ggml.h"
+#include "ggml-quants.h"
+#include "ggml-impl.h"
 
 using namespace zerogod;
 
+// ====== 최상위 테스트 엔트리 (ggml 백엔드 경로에서 호출) ======
+void ggml_gemmini_test(ggml_backend_gemmini_context *ctx,
+                       struct ggml_tensor *dst,   // FP32 output (I×J)
+                       struct ggml_tensor *bias); // optional FP32 bias (->int32)
+
+// ====== 유틸 ======
+static inline int8_t sat_i8(int x)
+{
+    return x > 127 ? 127 : (x < -128 ? -128 : (int8_t)x);
+}
+
 template <typename T>
-static inline void dump_matrix(const char* name, const T* m, int r, int c, int s) {
-    DBG0("%s =\n", name);
-    for (int i = 0; i < r; ++i)
-    {
+static inline void dump_matrix(const char *name, const T *m, int r, int c, int s)
+{
+#if DUMP
+    if (!m) { DBG0("%s: <null>\n", name); return; }
+    DBG0("%s (r=%d, c=%d, ld=%d) =\n", name, r, c, s);
+
+    for (int i = 0; i < r; ++i) {
         DBG0("[ ");
-        for (int j = 0; j < c; ++j)
-        {
-            const T v = m[i * s + j];
-            if constexpr (std::is_integral_v<T>)
-            {
-                if constexpr (sizeof(T) <= sizeof(int))
-                    DBG0("%d ", (int)v);
-                else
+        for (int j = 0; j < c; ++j) {
+            const T v = m[(size_t)i * (size_t)s + (size_t)j];
+
+            if constexpr (std::is_same_v<T, float>) {
+                // fp32
+                DBG0("%.6g ", (double)v);
+            } else if constexpr (std::is_same_v<T, int8_t>) {
+                // int8 -> 가독성을 위해 int로 승격 출력
+                DBG0("%d ", (int)v);
+            } else if constexpr (std::is_same_v<T, acc_t>) {
+                // acc_t (일반적으로 int32_t)
+                if constexpr (std::numeric_limits<acc_t>::is_signed)
                     DBG0("%lld ", (long long)v);
-            }
-            else
-            {
-                DBG0("%g ", (double)v);
+                else
+                    DBG0("%llu ", (unsigned long long)v);
+            } else {
+                // 컴파일 타임 가드: 지원 타입 외 사용 방지
+                static_assert(std::is_same_v<T, void>,
+                              "dump_matrix: supported types are float, int8_t, acc_t only.");
             }
         }
         DBG0("]\n");
     }
-};
-
-static inline int8_t sat_i8(int x) {
-    return x > 127 ? 127 : (x < -128 ? -128 : (int8_t)x);
+#else
+    (void)name;
+    (void)m;
+    (void)r;
+    (void)c;
+    (void)s;
+#endif
 }
 
-static void ggml_backend_gemmini_mul_mat_test(const int i, const int j, const int k) {
-    GGML_ASSERT(i > 0 && j > 0 && k > 0);
+// dst: (I x J) => ggml의 관례상 ne[0]=J, ne[1]=I
+// src0(weight): (K x J) layout (ne[0]=K, ne[1]=J) — 실행 시 B는 transpose하여 KxJ로 multiply
+// src1(act): (I x K) layout (ne[0]=K, ne[1]=I) — 실행 시 A는 IxK
+void extract_and_check_shapes(const ggml_tensor *dst, int &I, int &J, int &K);
 
-    DBG0("\n[Gemmini] mul_mat test called");
+void log_shapes(const ggml_tensor *dst,
+                const ggml_tensor *src0,
+                const ggml_tensor *src1,
+                int I, int J, int K);
 
-    const size_t I = (size_t)i, J = (size_t)j, K = (size_t)k;
-    // stride
-    const size_t sA = align_up(K, 16 / sizeof(elem_t));
-    const size_t sB = align_up(J, 16 / sizeof(elem_t)); 
-    const size_t sC = align_up(J, 16 / sizeof(elem_t));
-    const size_t sD = align_up(J, 16 / sizeof(acc_t));
+// ====== CPU 참조 계산 & 검증 ======
+void cpu_reference_C(const elem_t *A, size_t sA,
+                     const elem_t *B, size_t sB,
+                     const acc_t *D, size_t sD,
+                     elem_t *C_exp, size_t sC,
+                     int I, int J, int K);
 
-    DBG0("\nI=%zu, J=%zu, K=%zu\n", I, J, K);
+bool compare_C_and_report(const elem_t *C, size_t sC,
+                          const elem_t *C_exp, size_t sE,
+                          int I, int J);
 
-    auto alloc16 = [](size_t bytes) -> void *
-    {
-        void *p = std::aligned_alloc(16, bytes);
-        if(!p) {
-            DBG0("aligned_alloc failed (bytes=%zu)\n", bytes);
-            std::abort();
-        }
-        std::memset(p, 0, bytes);
-        return p;
-    };
+// TEST_SLICE: 원본 ggml 텐서와 변환 버퍼(tA,tB,tC)를 SLICE_* 규칙으로 일부만 덤프
+void test_dump_slices(ggml_context* tmp_ctx,
+                      const ggml_tensor* src1, const ggml_tensor* src0, ggml_tensor* dst,
+                      int I, int J, int K,
+                      const elem_t* A_i8, size_t sA,
+                      const elem_t* B_i8, size_t sB,
+                      const elem_t* C_i8, size_t sC);
 
-    elem_t *A = (elem_t *)alloc16(I * sA * sizeof(elem_t)); // IxK
-    elem_t *B = (elem_t *)alloc16(K * sB * sizeof(elem_t)); // K×J
-    elem_t *C = (elem_t *)alloc16(I * sC * sizeof(elem_t)); // I×J
-
-    elem_t *C_expected = (elem_t *)alloc16(I * sC * sizeof(elem_t)); // expected value
-    acc_t *D = (acc_t *)alloc16(I * sD * sizeof(acc_t));             // I×J bias
-
-    int e = 1;
-    // 포화 방지
-    int t = (int)std::floor(std::sqrt(127.0 / (double)K));
-    int leftover = 127 - (int)(K * t * (long long)t); // 0..127
-    int db = std::min(4, std::max(0, leftover));
-
-    // init A
-    for (size_t r = 0; r < I; ++r)
-        for (size_t c = 0; c < K; ++c)
-            A[r * sA + c] = (elem_t)(e++ % (2 * t + 1) - t);
-
-    // init B
-    for (size_t r = 0; r < K; ++r)
-        for (size_t c = 0; c < J; ++c)
-            B[r * sB + c] = (elem_t)(e++ % (2 * t + 1) - t);
-
-    // init D
-    for (size_t r = 0; r < I; ++r)
-        for (size_t c = 0; c < J; ++c)
-            D[r * sD + c] = (acc_t)((e++ % (2*db + 1)) - db);
-
-    // expected
-    for (size_t r = 0; r < I; ++r)
-    {
-        for (size_t c = 0; c < J; ++c)
-        {
-            int acc = 0; // 필요시 acc_t
-            for (int k = 0; k < K; ++k)
-                acc += (int)A[r * sA + k] * (int)B[k * sB + c];
-
-            acc += (int)D[r * sD + c];
-            C_expected[r * sC + c] = (elem_t)sat_i8(acc);
-        }
-    }
-
-    dump_matrix("A (I x K)", A, I, K, sA);
-    dump_matrix("B (K x J)", B, K, J, sB);
-    dump_matrix("D (I x J), acc_t", D, I, J, sD);
-    dump_matrix("Expected C (I x J)", C_expected, I, J, sC);
-
-    tiled_matmul_auto(I, J, K,
-                      A, B, (const void *)D, (void *)C,
-                      sA, sB, sD, sC,
-                      1.f, 1.f, 1.f,
-                      NO_ACTIVATION,
-                      1, 1,
-                      false,
-                      false, // transpose_A
-                      false, // transpose_B
-                      false, false,
-                      0, OPTION);
-
-    dump_matrix("C (result from gemmini)", C, I, J, sC);
-
-    // compare
-    bool ok = true;
-    for (size_t r = 0; r < I; ++r)
-    {
-        for (size_t c = 0; c < J; ++c)
-        {
-            elem_t got = C[r * sC + c];
-            elem_t exp = C_expected[r * sC + c];
-            if (got != exp)
-            {
-                DBG0("[NG] mismatch (%zu, %zu): got=%d exp=%d\n", r, c, (int)got, (int)exp);
-                ok = false;
-            }
-        }
-    }
-    if (ok)
-        DBG0("[OK] Gemmini matmul(+bias) matches expected\n");
-    else    
-        DBG0("[FAIL] mismatch detected\n");
-}
-#endif // __GGML_GEMMINI_TEST_H__
+void test_dequantize_output(const elem_t *C_i8, size_t sC,
+                                int I, int J, ggml_tensor *dst);

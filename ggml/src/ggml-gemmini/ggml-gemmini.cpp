@@ -8,6 +8,8 @@
 using namespace zerogod;
 
 // Cycle 측정 용
+extern "C" volatile uint64_t gemmini_tiled_matmul_cycles = 0; // gemmini.h
+
 uint64_t start, end;
 uint64_t bias_mapping_cycles = 0, bias_getting_cycles = 0, tmp_ctx_cycles = 0, gemmini_tensor_cycles = 0, 
 out_copy_cycles = 0, before_gemmini_overhead_cycles = 0, after_gemmini_overhead_cycles = 0;
@@ -25,13 +27,9 @@ static void ggml_backend_gemmini_mul_mat(
 
 /* ________________ Test: 테스트 호출용 ___________________ */
 #if TEST
-    {
-        // OPTION에 따라 동작
-        ggml_backend_gemmini_mul_mat_test(/* I */ 2,
-                                          /* J */ 3,
-                                          /* K */ 2);
-        return;
-    }
+    static_assert(TRANSPOSE_B == 1, "This test assumes physical-transposed B (KxJ).");
+    ggml_gemmini_test(ctx, dst, bias);
+    return;
 #endif
     /* ______________________________________________________ */
 
