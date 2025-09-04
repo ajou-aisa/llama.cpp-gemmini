@@ -124,7 +124,7 @@ void ggml_gemmini_test(ggml_backend_gemmini_context *ctx,
 #endif
 
     // 7) (선택) dst(F32)로 반영 — 논리 J만 복사
-#if TEST_GEMMINI && TEST_WRITEBACK
+#if TEST_GEMMINI && TEST_DEQUANTIZE
     test_dequantize_output((const elem_t *)tC.get(), sC,
                            (int)I, J_log, dst);
 #endif
