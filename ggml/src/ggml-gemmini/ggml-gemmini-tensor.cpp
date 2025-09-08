@@ -118,16 +118,6 @@ namespace zerogod
                                               : GGML_TYPE_I32;
     }
 
-    template <typename T>
-    inline int64_t numel4(const ggml_tensor *t) 
-    {
-        const int64_t n0 = t->ne[0] ? t->ne[0] : 1;
-        const int64_t n1 = t->ne[1] ? t->ne[1] : 1;
-        const int64_t n2 = t->ne[2] ? t->ne[2] : 1;
-        const int64_t n3 = t->ne[3] ? t->ne[3] : 1;
-        return n0 * n1 * n2 * n3;
-    }
-
     // 생성자
     template <typename T>
     ggml_gemmini_tensor<T>::ggml_gemmini_tensor(ggml_context *ctx,
@@ -260,61 +250,6 @@ namespace zerogod
             other.rows_ = other.cols_ = other.stride_ = 0;
         }
         return *this;
-    }
-    template <typename T>
-    void extract_q80_qs_to_linear(
-                                const ggml_tensor *t_q80,
-                                T *out_linear      // 길이 = numel4(t_q80)
-                                ) 
-    {
-        static_assert(std::is_integral<T>::value || std::is_floating_point<T>::value,
-                      "T must be arithmetic type");
-        assert(t_q80);
-        assert(t_q80->type == GGML_TYPE_Q8_0);
-        assert(t_q80->ne[0] % QK8_0 == 0);
-
-        const int64_t nx = t_q80->ne[0];
-        const int64_t ny = t_q80->ne[1] ? t_q80->ne[1] : 1;
-        const int64_t nz = t_q80->ne[2] ? t_q80->ne[2] : 1;
-        const int64_t nw = t_q80->ne[3] ? t_q80->ne[3] : 1;
-
-        // view 대응
-        const char  *base = (const char *)(t_q80->view_src ? t_q80->view_src->data : t_q80->data);
-        const size_t offs  = t_q80->view_src ? t_q80->view_offs : 0;
-
-        const size_t nb1 = t_q80->nb[1];
-        const size_t nb2 = t_q80->nb[2];
-        const size_t nb3 = t_q80->nb[3];
-
-        const int64_t nblk = nx / QK8_0;
-
-        int64_t row_idx = 0;
-        for (int64_t iw = 0; iw < nw; ++iw) {
-            for (int64_t iz = 0; iz < nz; ++iz) {
-                for (int64_t iy = 0; iy < ny; ++iy) {
-                    const char *row_ptr = base + offs + iw * nb3 + iz * nb2 + iy * nb1;
-                    const block_q8_0 *row_blocks = reinterpret_cast<const block_q8_0 *>(row_ptr);
-
-                    T *dst_row = out_linear + row_idx * nx;
-
-                    // 블록 단위로 qs[32]를 복사/캐스팅
-                    for (int64_t b = 0; b < nblk; ++b) {
-                        // qs는 int8_t[32]. T가 int8_t면 memcpy, 아니면 캐스팅 복사
-                        if constexpr (std::is_same<T,int8_t>::value) {
-                            std::memcpy(dst_row + b * QK8_0, row_blocks[b].qs, QK8_0 * sizeof(int8_t));
-                        } else {
-                            for (int j = 0; j < QK8_0; ++j) {
-                                dst_row[b * QK8_0 + j] = static_cast<T>(row_blocks[b].qs[j]);
-                            }
-                        }
-                    }
-
-                    ++row_idx;
-                }
-            }
-        }
-        // sanity
-        assert(row_idx == (ny * nz * nw));
     }
 
 
