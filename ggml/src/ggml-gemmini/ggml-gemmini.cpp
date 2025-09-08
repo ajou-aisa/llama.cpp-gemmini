@@ -7,17 +7,12 @@
 
 using namespace zerogod;
 
-<<<<<<< HEAD
-extern "C" volatile uint64_t gemmini_tiled_matmul_cycles = 0; // gemmini.h
-
-=======
 // Cycle 측정 용
 extern "C" volatile uint64_t gemmini_tiled_matmul_cycles = 0; // gemmini.h
 
 uint64_t start, end;
 uint64_t bias_mapping_cycles = 0, bias_getting_cycles = 0, tmp_ctx_cycles = 0, gemmini_tensor_cycles = 0, 
 out_copy_cycles = 0, before_gemmini_overhead_cycles = 0, after_gemmini_overhead_cycles = 0;
->>>>>>> 5547defaff5219a1070b7713021701d2db5a2d39
 
 static void ggml_backend_gemmini_mul_mat(
                                          ggml_backend_gemmini_context *ctx,
