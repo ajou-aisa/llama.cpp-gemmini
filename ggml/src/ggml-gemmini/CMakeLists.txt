@@ -6,6 +6,7 @@ set(GEMMINI_SW_PATH $ENV{GEM_HOME})
 ggml_add_backend_library(ggml-gemmini
                          ggml-gemmini.cpp
                          ggml-gemmini-tensor.cpp
+                         test/ggml-gemmini-test.cpp
                         )
 
 target_compile_options(ggml-gemmini PRIVATE
@@ -18,6 +19,28 @@ target_compile_options(ggml-gemmini PRIVATE
   -fno-common
   -ffast-math
 )
+
+target_compile_definitions(ggml-gemmini PRIVATE
+  DEBUG=0         # ggml-gemmini-util.h에서 쓰는 DEBUG 매크로
+  TEST=0          # 필요 시
+  PRINT_TILE=0    # 필요 시
+  OPTION=CPU      # OS/WS/CPU
+
+  # test switches (DUMP는 소스에서 자동 파생)
+  TRANSPOSE_B=1 # B 전치 여부
+  TEST_SHAPE=0 # 원본/변환 tensor shape 확인
+  TEST_SLICE=0 # ㅇ
+  TEST_CPU_REF=0
+  TEST_GEMMINI=0
+  TEST_COMPARE=0
+  TEST_DEQUANTIZE=0
+
+  # slice 크기
+  SLICE_I=1
+  SLICE_K=4
+  SLICE_J=6
+)
+
 
 target_include_directories(ggml-gemmini PRIVATE
   ${RISCV_TOOL_PATH}/sysroot/include

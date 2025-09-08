@@ -1,4 +1,7 @@
 // ggml-gemmini-util.h
+#ifndef GGML_GEMMINI_UTIL_H
+#define GGML_GEMMINI_UTIL_H
+
 #ifndef DEBUG
 #define DEBUG 0
 #endif
@@ -20,8 +23,12 @@
 #if DEBUG 
     #define DBG(fmt, ...) \
         fprintf(stderr, "[%s:%d] %s(): " fmt "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__)
+    // simple debug    
+    #define DBG0(fmt, ...) \
+        fprintf(stderr, fmt, ##__VA_ARGS__)
 #else
     #define DBG(fmt, ...)  ((void)0)
+    #define DBG0(fmt, ...) ((void)0)
 #endif
 
 
@@ -131,3 +138,4 @@ namespace zerogod
         peak_bytes = zerogod::align_up(peak_bytes + 16*1024, GEMMINI_ALIGN);
     }
 }
+#endif // GGML_GEMMINI_UTIL_H
