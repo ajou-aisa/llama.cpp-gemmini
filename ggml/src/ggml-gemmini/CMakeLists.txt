@@ -29,7 +29,7 @@ target_compile_definitions(ggml-gemmini PRIVATE
   # test switches (DUMP는 소스에서 자동 파생)
   TRANSPOSE_B=1 # B 전치 여부
   TEST_SHAPE=0 # 원본/변환 tensor shape 확인
-  TEST_SLICE=0 # ㅇ
+  TEST_SLICE=0 # 
   TEST_CPU_REF=0
   TEST_GEMMINI=0
   TEST_COMPARE=0
