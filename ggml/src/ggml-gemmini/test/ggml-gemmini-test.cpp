@@ -247,6 +247,15 @@ void test_dump_slices(ggml_context *tmp_ctx,
     const int vK = std::min(K, SLICE_K);
     const int vJ = std::min(J, SLICE_J);
 
+    struct block_q8_0 {
+        int8_t       qs[6];  // 우리가 추출할 대상
+    };
+    const char *base = (const char *)(src->view_src ? src->view_src->data : src->data);
+    const size_t offs = src->view_src ? src->view_offs : 0;
+    const block_q8_0 *slice = reinterpret_cast<const block_q8_0 *>(
+    base + offs + (6*8)
+    );
+
     // ===== 원본 ggml 텐서 slice view 만들기 =====
     ggml_tensor *A_slice = ggml_view_2d(tmp_ctx,
                                         const_cast<ggml_tensor *>(src1),
@@ -302,7 +311,8 @@ void test_dump_slices(ggml_context *tmp_ctx,
 
     // ===== 원본 ggml slice 덤프 =====
     dump_any("A_slice (I x K, from src1)", A_slice, vI, vK, sA_view);
-    dump_any("B_slice (K x J, from src0)", B_slice, vK, vJ, sB_view);
+    printf("[%d %d %d %d %d]\n", slice.qs[0], slice.qs[1], slice.qs[2],  slice.qs[3], slice.qs[4], slice.qs[5]);
+
     dump_any("C_slice (I x J, from dst )", C_slice, vI, vJ, sC_view);
 
     // ===== 변환된 내부 버퍼(tA/tB/tC) 일부 덤프 — 항상 I8 =====
