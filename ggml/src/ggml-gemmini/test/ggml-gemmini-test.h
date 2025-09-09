@@ -25,7 +25,7 @@
 #ifndef TEST_COMPARE
 #define TEST_COMPARE 0
 #endif
-#ifndef TEST_DEQUANTiZE
+#ifndef TEST_DEQUANTIZE
 #define TEST_DEQUANTIZE 0
 #endif
 #ifndef DUMP
