@@ -311,8 +311,8 @@ void test_dump_slices(ggml_context *tmp_ctx,
 
     // ===== 원본 ggml slice 덤프 =====
     dump_any("A_slice (I x K, from src1)", A_slice, vI, vK, sA_view);
-    printf("[%d %d %d %d %d]\n", slice.qs[0], slice.qs[1], slice.qs[2],  slice.qs[3], slice.qs[4], slice.qs[5]);
-
+    dump_any("B_slice (K x J, from src0)", B_slice, vK, vJ, sB_view);
+    printf("[%d %d %d %d %d]\n", slice[0].qs[0], slice[0].qs[1], slice[0].qs[2],  slice[0].qs[3], slice[0].qs[4], slice[0].qs[5]);
     dump_any("C_slice (I x J, from dst )", C_slice, vI, vJ, sC_view);
 
     // ===== 변환된 내부 버퍼(tA/tB/tC) 일부 덤프 — 항상 I8 =====
