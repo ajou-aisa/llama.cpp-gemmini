@@ -35,7 +35,6 @@ target_compile_definitions(ggml-gemmini PRIVATE
   TEST_GEMMINI=0 # gemmini 호출
   TEST_COMPARE=0 # 결과 비교
   TEST_DEQUANTIZE=0 # 연산 결과 복사(dequantize)
-  TEST_DUMP=(TEST_SLICE || TEST_CPU_REF || TEST_COMPARE)
 
   # slice 크기
   SLICE_I=1
