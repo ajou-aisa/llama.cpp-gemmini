@@ -13,7 +13,7 @@
 #ifndef TEST_SHAPE
 #define TEST_SHAPE 0
 #endif
-#ifdef TEST_TYPE
+#ifndef TEST_TYPE
 #define TEST_TYPE 0
 #endif
 #ifndef TEST_SLICE
