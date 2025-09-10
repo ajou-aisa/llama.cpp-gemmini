@@ -13,6 +13,9 @@
 #ifndef TEST_SHAPE
 #define TEST_SHAPE 0
 #endif
+#ifdef TEST_TYPE
+#define TEST_TYPE 0
+#endif
 #ifndef TEST_SLICE
 #define TEST_SLICE 0
 #endif
@@ -116,6 +119,9 @@ void log_shapes(const ggml_tensor *dst,
                 const ggml_tensor *src0,
                 const ggml_tensor *src1,
                 int I, int J, int K);
+
+// tensor의 type 검증
+void check_types_equal(const ggml_tensor *dst);
 
 // ====== CPU 참조 계산 & 검증 ======
 void cpu_reference_C(const elem_t *A, size_t sA,
