@@ -19,6 +19,10 @@ void ggml_gemmini_test(ggml_backend_gemmini_context *ctx,
     int I_log = 0, J_log = 0, K_log = 0;
     extract_and_check_shapes(dst, I_log, J_log, K_log);
 
+#if TEST_TYPE
+    check_types_equal(dst);
+#endif
+
 #if TEST_SHAPE
     log_shapes(dst, src0, src1, I_log, J_log, K_log);
 #endif
