@@ -181,23 +181,10 @@ namespace zerogod
         tensor_->nb[1] = row_bytes;
         stride_ = row_bytes / elem_size;
 
-
-        uint64_t start, end;
         /* 5. _______________casting & 0-fill _________________ */
+        uint64_t start, end;
         if (!acc){
             start = read_cycles();
-            ggml_gemmini_cast(src, transpose);
-            end = read_cycles();
-            DBG("[gemmini_tensor_casting_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
-        }
-        else
-
-        DBG("\ngenerated tensor: type=%s, cols=%d, rows=%d, buf_bytes=%zu stride = %d \n", ggml_type_name(type), tensor_->ne[0], tensor_->ne[1], buf_bytes_, stride_);
-
-        /* 5. _______________casting & 0-fill _________________ */
-
-
-        if (!acc){
             if (src->type == GGML_TYPE_Q8_0){
                 const int64_t rows = src_rows;
                 const int64_t cols = src_cols;
@@ -215,15 +202,19 @@ namespace zerogod
                 DBG("checking bp4\n");
                 // 패딩 영역은 0으로 채우기(열 패딩분)
                 if (padded_cols > src_cols) {
-                    DBG0("padding..."); 
-                    for (int64_t r = 0; r < rows; ++r) {
+                    DBG0("padding...");
+                    for (int64_t r = 0; r < rows; ++r)
+                    {
                         T *rowp = dst_base + r * dst_stride_elems;
                         std::memset(rowp + src_cols, 0, (padded_cols - src_cols) * sizeof(T));
                     }
                 }
-            } else 
-                ggml_gemmini_cast(src, transpose);
             }
+            else ggml_gemmini_cast(src, transpose);
+            end = read_cycles();
+            DBG("[gemmini_tensor_casting_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
+        }
+
         else{
             std::memset(data_, 0, buf_bytes_);
         }
