@@ -19,6 +19,10 @@ void ggml_gemmini_test(ggml_backend_gemmini_context *ctx,
     int I_log = 0, J_log = 0, K_log = 0;
     extract_and_check_shapes(dst, I_log, J_log, K_log);
 
+#if TEST_TYPE
+    check_types_equal(dst);
+#endif
+
 #if TEST_SHAPE
     log_shapes(dst, src0, src1, I_log, J_log, K_log);
 #endif
@@ -182,6 +186,38 @@ void log_shapes(const ggml_tensor *dst,
     DBG0(" src1 (A stored K x I,   logical A I x K) ne=[%llu,%llu], nb=[%llu,%llu]\n",
          (unsigned long long)src1->ne[0], (unsigned long long)src1->ne[1],
          (unsigned long long)src1->nb[0], (unsigned long long)src1->nb[1]);
+}
+
+// int * int 조합 확인
+void check_types_equal(const ggml_tensor *dst)
+{
+    DBG0("[check_types_equal] called\n");
+
+    if (!dst || !dst->src[0] || !dst->src[1])
+    {
+        DBG0("dst/src0/src1 is NULL\n");
+        return;
+    }
+
+    const struct ggml_tensor *s0 = dst->src[0];
+    const struct ggml_tensor *s1 = dst->src[1];
+
+    const char *name_dst = (dst->name ? dst->name : "(dst)");
+    const char *name_s0 = (s0->name ? s0->name : "(src0)");
+    const char *name_s1 = (s1->name ? s1->name : "(src1)");
+
+    const char *tn_dst = ggml_type_name(dst->type);
+    const char *tn_s0 = ggml_type_name(s0->type);
+    const char *tn_s1 = ggml_type_name(s1->type);
+
+    DBG0("dst  %s : %s\n", name_dst, tn_dst);
+    DBG0("src0 %s : %s\n", name_s0, tn_s0);
+    DBG0("src1 %s : %s\n", name_s1, tn_s1);
+
+    if (s0->type == s1->type)
+        DBG0("TYPE OK: %s and %s are the same type (%s)\n", name_s0, name_s1, tn_s0);
+    else
+        DBG0("TYPE MISMATCH: %s (%s) vs %s (%s)\n", name_s0, tn_s0, name_s1, tn_s1);
 }
 
 // ===== CPU 참조/검증 =====

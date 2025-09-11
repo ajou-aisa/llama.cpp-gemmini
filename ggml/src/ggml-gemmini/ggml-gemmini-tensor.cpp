@@ -1,6 +1,7 @@
 // ggml-gemmini-tensor.cpp
 
 #include "ggml-gemmini-tensor.h"
+#include "include/gemmini.h"
 
 
 
@@ -145,9 +146,6 @@ namespace zerogod
                                                 bool acc,
                                                 bool transpose)
     {
-
-        DBG("\ngenerate ggml_gemmini_tensor from: %s, type=%s transpose=%d\n", src->name, ggml_type_name(src->type), transpose);
-
         /* 1. ____________________원본 행/열____________________
               ggml 네이티브: ne[0] = columns(X), ne[1] = rows(Y) */
         const int src_cols = transpose ? src->ne[1] : src->ne[0];
@@ -182,6 +180,17 @@ namespace zerogod
         tensor_->nb[0] = elem_size;
         tensor_->nb[1] = row_bytes;
         stride_ = row_bytes / elem_size;
+
+
+        uint64_t start, end;
+        /* 5. _______________casting & 0-fill _________________ */
+        if (!acc){
+            start = read_cycles();
+            ggml_gemmini_cast(src, transpose);
+            end = read_cycles();
+            DBG("[gemmini_tensor_casting_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
+        }
+        else
 
         DBG("\ngenerated tensor: type=%s, cols=%d, rows=%d, buf_bytes=%zu stride = %d \n", ggml_type_name(type), tensor_->ne[0], tensor_->ne[1], buf_bytes_, stride_);
 
