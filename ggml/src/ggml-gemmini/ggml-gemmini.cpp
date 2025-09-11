@@ -153,6 +153,13 @@ static void ggml_backend_gemmini_mul_mat(
 
 }
 
+static void ggml_backend_gemmini_add(
+                                        ggml_backend_gemmini_context *ctx,
+                                        struct ggml_tensor *dst, // FP32 output (I×J)
+                                        struct ggml_tensor *bias){
+
+}
+
 static void ggml_backend_gemmini_out_prod(ggml_backend_gemmini_context * ctx, struct ggml_tensor * dst) {
     GGML_UNUSED(ctx);
     GGML_UNUSED(dst);
@@ -248,6 +255,7 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
+        case GGML_OP_ADD:
             break;
 
         default:
@@ -384,6 +392,8 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
+        case GGML_OP_ADD:
+
         case GGML_OP_TRANSPOSE:
             return true;
 
