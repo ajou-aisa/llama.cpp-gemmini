@@ -25,7 +25,7 @@ namespace zerogod
         BenchTensor(BenchTensor &&) noexcept;            // 이동 생성자
         BenchTensor &operator=(BenchTensor &&) noexcept; // 이동 대입
 
-        BenchTensor(const ggml_gemmini_tensor &) = delete;            // 복사 생성자 금지
+        BenchTensor(const BenchTensor &) = delete;            // 복사 생성자 금지
         BenchTensor &operator=(const BenchTensor &) = delete; // 복사 대입 금지
 
         // Gemmini 커널용 데이터 버퍼
