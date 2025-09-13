@@ -42,11 +42,10 @@ static void ggml_backend_gemmini_mul_mat(
     DBG("\nsrc0 shape:\n ne = [%llu, %llu, %llu, %llu]\n", src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);
     DBG("\nsrc1 shape:\n ne = [%llu, %llu, %llu, %llu]\n", src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3]);
 
-    /* --------------------------------- Cycle -------------------------------- */
     start = read_cycles();
     /* _____________________________ 1. Gemmini용 텐서 생성 _____________________________ */
     BenchTensor<int8_t> tA(src1, ".i8");              // IxK (1xK)
-    BenchTensor<int8_t> tB(src0, ".i8", false);       // KxJ, 전치 x
+    BenchTensor<int8_t> tB(src0, ".i8", false, TRANSPOSE_B);       // KxJ, 전치
     BenchTensor<int8_t> tC(dst, ".i8", true);         // IxJ (1xJ)
     
     end = read_cycles();
@@ -91,7 +90,7 @@ static void ggml_backend_gemmini_mul_mat(
                       1, 1,
                       repeating,
                       false, // transpose_A
-                      TRANSPOSE_B, // transpose_B
+                      false, // transpose_B
                       false, false,
                       0, OPTION);
 
