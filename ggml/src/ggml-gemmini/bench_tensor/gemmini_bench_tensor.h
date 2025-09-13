@@ -57,5 +57,5 @@ namespace zerogod
     };
 }
 
-#include "bench_tensor/gemmini_bench_tensor.tpp"
+#include "gemmini_bench_tensor.tpp"
 
