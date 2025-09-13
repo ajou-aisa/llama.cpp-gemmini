@@ -8,32 +8,36 @@ namespace zerogod
                                 const char *suffix,
                                 bool acc,
                                 bool transpose)
+        : name_{std::string(src->name) + (suffix ? suffix : "")}
+        , type_{src->type}
     {
+        (void)ctx;
         /* 1. ____________________원본 행/열____________________
-              ggml 네이티브: ne[0] = columns(X), ne[1] = rows(Y) */
-        const int64_t cols_ = transpose ? src->ne[1] : src->ne[0];
-        const int64_t rows_ = transpose ? src->ne[0] : src->ne[1];
-        ggml_type type_ = src->type;
+        ggml 네이티브: ne[0] = columns(X), ne[1] = rows(Y) */
+        cols_ = transpose ? src->ne[1] : src->ne[0];
+        rows_ = transpose ? src->ne[0] : src->ne[1];
 
         /* 3. ___________________tensor 이름___________________ */
         snprintf(name_, sizeof(src->name), "%s%s", src->name, suffix);
 
-
         /* 4. __________________buffer 할당____________________ */
         const size_t elem_size = sizeof(T);
-        const size_t row_bytes = cols_ * elem_size;
-        buf_bytes_ = row_bytes * rows_;
+        const size_t row_bytes = static_cast<size_t>(cols_) * elem_size;
+        buf_bytes_ = row_bytes * static_cast<size_t>(rows_);
 
         if (buf_bytes_ == 0)
             buf_bytes_ = GEMMINI_ALIGN; // 최소 16 B 확보
 
-        data_ = std::aligned_alloc(GEMMINI_ALIGN, buf_bytes_); // buffer을 16B 경계에 할당
+        void *p = nullptr;
+        if (posix_memalign(&p, GEMMINI_ALIGN, buf_bytes_) !=0 )
+            p = nullptr; // buffer을 16B 경계에 할당
+        data_ = p;
         GGML_ASSERT(this->data_ != nullptr);
 
         stride_ = row_bytes / elem_size;
 
         /* 5. _______________ 0-fill _________________ */
-            std::memset(data_, 0, buf_bytes_);
+        std::memset(data_, 0, buf_bytes_);
     }
 
     template <typename T>
@@ -51,13 +55,10 @@ namespace zerogod
     // other: 기존 객체
     template <typename T>
     BenchTensor<T>::BenchTensor(BenchTensor &&other) noexcept
-        : name_{other.name_}, type_{other.type_}, 
-          data_{other.data_}, buf_bytes_(other.buf_bytes_), 
+        : name_{std:::move(other.name_)}, type_{other.type_},
+          data_{other.data_}, buf_bytes_(other.buf_bytes_),
           rows_(other.rows_), cols_(other.cols_), stride_(other.stride_)
     {
-        other.name_ = "";
-        other.type_ = "";
-        
         other.data_ = nullptr;
         other.buf_bytes_ = 0;
         other.rows_ = other.cols_ = other.stride_ = 0;
@@ -69,8 +70,10 @@ namespace zerogod
     {
         if (this != &other)
         {
+            GGML_ASSERT(type_ == other.type_);
+
             freeBuffer();
-            name_ = other.name_;
+            name_ = std::move(other.name_);
             type_ = other.type_;
             data_ = other.data_;
             buf_bytes_ = other.buf_bytes_;
@@ -78,8 +81,6 @@ namespace zerogod
             cols_ = other.cols_;
             stride_ = other.stride_;
 
-            other.name_ = "";
-            other.type_ = "";
             other.data_ = nullptr;
             other.buf_bytes_ = 0;
             other.rows_ = other.cols_ = other.stride_ = 0;
