@@ -216,8 +216,6 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
             */
             
             ggml_backend_gemmini_mul_mat(ctx, node, nullptr);
-            printf("[before_gemmini_overhead_cycles] = %lu\n", before_gemmini_overhead_cycles);
-            printf("[after_gemmini_overhead_cycles] = %lu\n", after_gemmini_overhead_cycles);
             break;
         }
         case GGML_OP_OUT_PROD:
@@ -253,6 +251,9 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
     ctx->tmp_ctx = nullptr;
 #endif
 
+    printf("[before_gemmini_overhead_cycles] = %lu\n", before_gemmini_overhead_cycles);
+    printf("[after_gemmini_overhead_cycles] = %lu\n", after_gemmini_overhead_cycles);
+    
     GGML_UNUSED(backend);
     return GGML_STATUS_SUCCESS;
 }
