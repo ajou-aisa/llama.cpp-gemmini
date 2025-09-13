@@ -79,8 +79,6 @@ static void ggml_backend_gemmini_mul_mat(
     DBG("calling tiled_matmul_auto: ptrA=%p ptrB=%p ptrD=%p ptrC=%p\n",
         (void *)tA.get(), (void *)tB.get(), (void *)bias_data, (void *)tC.get());
 
-    before_gemmini_overhead_cycles += gen_tensor_cycles + preprocess_cycles;
-
     /* __ 5. Gemmini tiled_matmul_auto 호출 __ */
     tiled_matmul_auto(I, J, K,
                       (elem_t *)tA.get(),
@@ -118,10 +116,6 @@ static void ggml_backend_gemmini_mul_mat(
     end = read_cycles();
     out_copy_cycles = (end - start);
     printf("[out_copy_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
-
-    after_gemmini_overhead_cycles += out_copy_cycles;
-    /* --------------------------------- Cycle -------------------------------- */
-
 }
 
 static void ggml_backend_gemmini_add(
@@ -250,9 +244,6 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
     ggml_free(ctx->tmp_ctx);
     ctx->tmp_ctx = nullptr;
 #endif
-
-    printf("[before_gemmini_overhead_cycles] = %lu\n", before_gemmini_overhead_cycles);
-    printf("[after_gemmini_overhead_cycles] = %lu\n", after_gemmini_overhead_cycles);
     
     GGML_UNUSED(backend);
     return GGML_STATUS_SUCCESS;
