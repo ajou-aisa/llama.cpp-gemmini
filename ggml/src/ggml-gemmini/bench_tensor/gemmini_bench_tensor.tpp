@@ -4,11 +4,10 @@
 namespace zerogod
 {
     template <typename T>
-    BenchTensor<T>::BenchTensor(ggml_context *ctx,
-                              const ggml_tensor *src,
-                              const char *suffix,
-                              bool acc,
-                              bool transpose)
+    BenchTensor<T>::BenchTensor(const ggml_tensor *src,
+                                const char *suffix,
+                                bool acc,
+                                bool transpose)
     {
         /* 1. ____________________원본 행/열____________________
               ggml 네이티브: ne[0] = columns(X), ne[1] = rows(Y) */
@@ -45,7 +44,6 @@ namespace zerogod
             std::free(data_);
             data_ = nullptr;
         }
-        tensor_ = nullptr;
         buf_bytes_ = 0;
     }
 

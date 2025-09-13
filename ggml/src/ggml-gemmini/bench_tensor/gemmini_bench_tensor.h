@@ -15,8 +15,7 @@ namespace zerogod
     class BenchTensor
     {
     public:
-        BenchTensor(ggml_context *ctx,
-                    const ggml_tensor *src,
+        BenchTensor(const ggml_tensor *src,
                     const char *suffix = ".bench",
                     bool acc = false,
                     bool transpose = false);
