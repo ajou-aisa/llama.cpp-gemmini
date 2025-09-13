@@ -8,17 +8,12 @@ namespace zerogod
                                 const char *suffix,
                                 bool acc,
                                 bool transpose)
-        : name_{std::string(src->name) + (suffix ? suffix : "")}
-        , type_{src->type}
+        : name_{std::string(src->name) + (suffix ? suffix : "")}, type_{src->type}
     {
-        (void)ctx;
         /* 1. ____________________원본 행/열____________________
         ggml 네이티브: ne[0] = columns(X), ne[1] = rows(Y) */
         cols_ = transpose ? src->ne[1] : src->ne[0];
         rows_ = transpose ? src->ne[0] : src->ne[1];
-
-        /* 3. ___________________tensor 이름___________________ */
-        snprintf(name_, sizeof(src->name), "%s%s", src->name, suffix);
 
         /* 4. __________________buffer 할당____________________ */
         const size_t elem_size = sizeof(T);
@@ -29,7 +24,7 @@ namespace zerogod
             buf_bytes_ = GEMMINI_ALIGN; // 최소 16 B 확보
 
         void *p = nullptr;
-        if (posix_memalign(&p, GEMMINI_ALIGN, buf_bytes_) !=0 )
+        if (posix_memalign(&p, GEMMINI_ALIGN, buf_bytes_) != 0)
             p = nullptr; // buffer을 16B 경계에 할당
         data_ = p;
         GGML_ASSERT(this->data_ != nullptr);
@@ -55,7 +50,7 @@ namespace zerogod
     // other: 기존 객체
     template <typename T>
     BenchTensor<T>::BenchTensor(BenchTensor &&other) noexcept
-        : name_{std:::move(other.name_)}, type_{other.type_},
+        : name_{std::move(other.name_)}, type_{other.type_},
           data_{other.data_}, buf_bytes_(other.buf_bytes_),
           rows_(other.rows_), cols_(other.cols_), stride_(other.stride_)
     {
