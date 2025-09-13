@@ -7,6 +7,7 @@ ggml_add_backend_library(ggml-gemmini
                          ggml-gemmini.cpp
                          ggml-gemmini-tensor.cpp
                          test/ggml-gemmini-test.cpp
+                         bench_tensor/gemmini_bench_tensor.tpp
                         )
 
 target_compile_options(ggml-gemmini PRIVATE

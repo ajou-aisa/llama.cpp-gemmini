@@ -56,3 +56,6 @@ namespace zerogod
         int64_t stride_ = 0; // stride in elements
     };
 }
+
+#include "bench_tensor/gemmini_bench_tensor.tpp"
+
