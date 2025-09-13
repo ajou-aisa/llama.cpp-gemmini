@@ -153,7 +153,7 @@ static void ggml_backend_gemmini_free(ggml_backend_t backend) {
 static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_gemmini_context * ctx = (ggml_backend_gemmini_context *)backend->context;
     
-    /*
+#if 0
     // cycle 초기화
     before_gemmini_overhead_cycles = 0;
     after_gemmini_overhead_cycles = 0;
@@ -193,7 +193,7 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
     DBG("[Gemmini] tmp_ctx used(start) = %zu bytes\n", used0);
 
 #endif
-    */
+#endif
 
     for (int i = 0; i < cgraph->n_nodes; i++)
     {
@@ -237,6 +237,7 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
         }
     }
 
+#if 0
 /* _______________________________________ Debug: 헤더 사용량 측정 ________________________________________________ */
 #if DEBUG
 
@@ -245,14 +246,12 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
     DBG("[Gemmini] tmp_ctx header used(total) = %zu bytes (%.2f MiB)\n", hdr_bytes, hdr_bytes / (1024.0 * 1024.0));
 
 #endif
-/* _______________________________________________________________________________________________________________ */
 
     ctx->bias_map.clear();
     // tmp_ctx 해제
     ggml_free(ctx->tmp_ctx);
     ctx->tmp_ctx = nullptr;
-
-    before_gemmini_overhead_cycles += bias_mapping_cycles + bias_getting_cycles + tmp_ctx_cycles;
+#endif
 
     GGML_UNUSED(backend);
     return GGML_STATUS_SUCCESS;
