@@ -1,6 +1,7 @@
 #!/bin/bash
 set -e
 
+echo "2nd QEMU running..."
 echo "[1/3] build-riscv.sh"
 sleep 1
 
