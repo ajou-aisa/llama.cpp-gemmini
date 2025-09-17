@@ -4,10 +4,11 @@
 #include <cstddef>
 #include <type_traits>
 #include <cstdlib>
-#include <cstring>
+#include <string>
 
 #include "ggml.h"
-#include "../ggml-gemmini-util.h"
+
+struct ggml_backend_gemmini_context;
 
 namespace zerogod
 {
