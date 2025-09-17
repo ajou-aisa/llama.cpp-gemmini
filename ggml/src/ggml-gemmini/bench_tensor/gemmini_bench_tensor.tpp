@@ -1,15 +1,16 @@
 #include "include/gemmini.h"
 #include "gemmini_bench_tensor.h"
 #include "../ggml-gemmini-util.h"
+#include <memory>
 
 namespace zerogod
 {
     template <typename T>
     BenchTensor<T> *BenchTensor<T>::getOrCreate(ggml_backend_gemmini_context *ctx,
                                                        const ggml_tensor *src,
-                                                       const char *suffix = ".bench",
-                                                       bool acc = false,
-                                                       bool transpose = false)
+                                                       const char *suffix,
+                                                       bool acc,
+                                                       bool transpose)
     {
         // 1. cache에서 이미 생성된 tensor 확인
         auto it = ctx->tensor_cache.find(src);
@@ -91,7 +92,6 @@ namespace zerogod
 
             freeBuffer();
             name_ = std::move(other.name_);
-            type_ = other.type_;
             data_ = other.data_;
             buf_bytes_ = other.buf_bytes_;
             rows_ = other.rows_;
