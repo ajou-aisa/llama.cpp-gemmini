@@ -44,9 +44,9 @@ static void ggml_backend_gemmini_mul_mat(
 
     start = read_cycles();
     /* _____________________________ 1. Gemmini용 텐서 생성 _____________________________ */
-    const auto* tA = BenchTensor<int8_t>::getOrCreate(ctx->tmp_ctx, src1, ".i8"); // IxK (1xK)
-    const auto* tB = BenchTensor<int8_t>::getOrCreate(ctx->tmp_ctx, src0, ".i8", false, TRANSPOSE_B);  // KxJ, 전치
-    const auto* tC = BenchTensor<int8_t>::getOrCreate(ctx->tmp_ctx, dst, ".i8_out", true); // IxJ (1xJ)
+    const auto* tA = BenchTensor<int8_t>::getOrCreate(ctx, src1, ".i8"); // IxK (1xK)
+    const auto* tB = BenchTensor<int8_t>::getOrCreate(ctx, src0, ".i8", false, TRANSPOSE_B);  // KxJ, 전치
+    const auto* tC = BenchTensor<int8_t>::getOrCreate(ctx, dst, ".i8_out", true); // IxJ (1xJ)
     
     end = read_cycles();
     gen_tensor_cycles = (end - start);
