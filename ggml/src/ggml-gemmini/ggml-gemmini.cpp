@@ -8,6 +8,22 @@
 
 using namespace zerogod;
 
+struct ggml_backend_gemmini_context
+{
+    int n_threads = GGML_DEFAULT_N_THREADS;
+    std::unique_ptr<char[]> work_data;
+    size_t work_size = 0;
+    std::map<ggml_tensor *, ggml_tensor *> bias_map;
+    std::map<const ggml_tensor *, std::unique_ptr<zerogod::BenchTensor<int8_t>>> tensor_cache;
+    struct ggml_context *tmp_ctx = nullptr;
+    void *arena = nullptr;
+    bool tmp_ctx_initialized = false;
+
+#ifndef GGML_USE_OPENMP
+    std::vector<std::future<void>> tasks;
+#endif
+};
+
 // Cycle 측정 용
 extern "C" volatile uint64_t gemmini_tiled_matmul_cycles = 0; // gemmini.h
 

@@ -9,7 +9,6 @@
 #include "ggml-impl.h"
 #include "ggml-gemmini.h"
 #include "ggml-backend-impl.h"
-#include "bench_tensor/gemmini_bench_tensor.h"
 
 #include <future>
 #include <vector>
@@ -32,25 +31,8 @@
     #define DBG0(fmt, ...) ((void)0)
 #endif
 
-
-struct ggml_backend_gemmini_context
-{
-    int n_threads = GGML_DEFAULT_N_THREADS;
-    std::unique_ptr<char[]> work_data;
-    size_t work_size = 0;
-    std::map<ggml_tensor *, ggml_tensor *> bias_map;
-    std::map<const ggml_tensor *, std::unique_ptr<zerogod::BenchTensor<int8_t>>> tensor_cache;
-    struct ggml_context *tmp_ctx = nullptr;
-    void *arena = nullptr;
-    bool tmp_ctx_initialized = false;
-
-#ifndef GGML_USE_OPENMP
-    std::vector<std::future<void>> tasks;
-#endif
-};
-
 namespace zerogod
-{   
+{ 
     constexpr size_t GEMMINI_ALIGN = 16; // 16-byte align
 
     static inline size_t align_up(size_t val, size_t align)
