@@ -1,6 +1,5 @@
 #include "include/gemmini.h"
 #include "gemmini_bench_tensor.h"
-#include "../ggml-gemmini-util.h"
 #include <memory>
 #include <cstring>
 

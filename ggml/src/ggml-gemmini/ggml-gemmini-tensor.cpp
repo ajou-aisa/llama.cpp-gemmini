@@ -3,8 +3,6 @@
 #include "ggml-gemmini-tensor.h"
 #include "include/gemmini.h"
 
-
-
 namespace zerogod
 {
     #ifndef QK8_0

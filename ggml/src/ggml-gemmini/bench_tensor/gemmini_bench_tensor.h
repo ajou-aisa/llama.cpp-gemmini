@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../ggml-gemmini-util.h"
 #include <cstdint>
 #include <cstddef>
 #include <type_traits>
@@ -7,8 +8,6 @@
 #include <string>
 
 #include "ggml.h"
-
-struct ggml_backend_gemmini_context;
 
 namespace zerogod
 {
