@@ -17,6 +17,8 @@
 #include <cstring>
 
 struct ggml_backend_gemmini_context;
+constexpr size_t GEMMINI_ALIGN = 16; // 16-byte align
+
 #include "bench_tensor/gemmini_bench_tensor.h"
 
 struct ggml_backend_gemmini_context
@@ -54,8 +56,6 @@ struct ggml_backend_gemmini_context;
 
 namespace zerogod
 { 
-    constexpr size_t GEMMINI_ALIGN = 16; // 16-byte align
-
     static inline size_t align_up(size_t val, size_t align)
     {
         return (val + align - 1) / align * align;
