@@ -44,9 +44,9 @@ static void ggml_backend_gemmini_mul_mat(
 
     start = read_cycles();
     /* _____________________________ 1. Gemmini용 텐서 생성 _____________________________ */
-    BenchTensor<int8_t> tA(src1, ".i8");              // IxK (1xK)
-    BenchTensor<int8_t> tB(src0, ".i8", false, TRANSPOSE_B);       // KxJ, 전치
-    BenchTensor<int8_t> tC(dst, ".i8", true);         // IxJ (1xJ)
+    const auto* tA = BenchTensor<int8_t>::getOrCreate(ctx, src1, ".i8"); // IxK (1xK)
+    const auto* tB = BenchTensor<int8_t>::getOrCreate(ctx, src0, ".i8", false, TRANSPOSE_B);  // KxJ, 전치
+    const auto* tC = BenchTensor<int8_t>::getOrCreate(ctx, dst, ".i8_out", true); // IxJ (1xJ)
     
     end = read_cycles();
     gen_tensor_cycles = (end - start);
@@ -54,18 +54,18 @@ static void ggml_backend_gemmini_mul_mat(
     
     start = read_cycles();
     /* _______________________ 2. Gemmini용 dimension _____________________ */
-    const size_t I = tC.getRows(); // I = A.ne[1], K = A.ne[0]
-    const size_t J = tC.getCols(); // K = B.ne[0], J = B.ne[1] (transpose)
-    const size_t K = tA.getCols();
+    const size_t I = tC->getRows(); // I = A.ne[1], K = A.ne[0]
+    const size_t J = tC->getCols(); // K = B.ne[0], J = B.ne[1] (transpose)
+    const size_t K = tA->getCols();
     DBG("I=%zu, J=%zu, K=%zu\n", I, J, K);
 
     /* _____ 3. Gemmini용 stride _____ */
-    const size_t sA = tA.getStride();
-    const size_t sB = tB.getStride();
-    const size_t sC = tC.getStride();
+    const size_t sA = tA->getStride();
+    const size_t sB = tB->getStride();
+    const size_t sC = tC->getStride();
 
     /* ______________________________ 4. bias 텐서 처리 _________________________________ */
-    std::vector<int32_t> zero_bias(tC.getCols(), 0);
+    std::vector<int32_t> zero_bias(tC->getCols(), 0);
 
     const int32_t *bias_data = zero_bias.data();
     const size_t sD = 0;
@@ -80,10 +80,10 @@ static void ggml_backend_gemmini_mul_mat(
 
     /* __ 5. Gemmini tiled_matmul_auto 호출 __ */
     tiled_matmul_auto(I, J, K,
-                      (elem_t *)tA.get(),
-                      (elem_t *)tB.get(),
+                      (elem_t *)tA->get(),
+                      (elem_t *)tB->get(),
                       (void *)bias_data,
-                      (elem_t *)tC.get(),
+                      (elem_t *)tC->get(),
                       sA, sB, sD, sC,
                       1.f, 1.f, 1.f,
                       NO_ACTIVATION,
@@ -99,7 +99,7 @@ static void ggml_backend_gemmini_mul_mat(
     const size_t nb1_out = dst->nb[1]; // 출력 텐서 행 stride (bytes)
     const size_t J_log = dst->ne[0];   // 실제 논리 열 수
 
-    int8_t *c_i8 = static_cast<int8_t *>(tC.get());
+    const int8_t *c_i8 = static_cast<const int8_t *>(tC->get());
     uint8_t *out_base = static_cast<uint8_t *>(dst->data);
 
     for (size_t r = 0; r < I; ++r)
