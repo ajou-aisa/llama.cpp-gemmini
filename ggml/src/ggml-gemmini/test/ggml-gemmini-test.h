@@ -58,6 +58,8 @@
 
 using namespace zerogod;
 
+struct ggml_backend_gemmini_context;
+
 // ====== 최상위 테스트 엔트리 (ggml 백엔드 경로에서 호출) ======
 void ggml_gemmini_test(ggml_backend_gemmini_context *ctx,
                        struct ggml_tensor *dst,   // FP32 output (I×J)
