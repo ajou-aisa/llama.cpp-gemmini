@@ -31,6 +31,8 @@
     #define DBG0(fmt, ...) ((void)0)
 #endif
 
+struct ggml_backend_gemmini_context;
+
 namespace zerogod
 { 
     constexpr size_t GEMMINI_ALIGN = 16; // 16-byte align
