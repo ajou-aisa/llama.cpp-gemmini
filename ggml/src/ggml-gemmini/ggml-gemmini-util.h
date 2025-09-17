@@ -9,6 +9,7 @@
 #include "ggml-impl.h"
 #include "ggml-gemmini.h"
 #include "ggml-backend-impl.h"
+#include "bench_tensor/gemmini_bench_tensor.h"
 
 #include <future>
 #include <vector>
@@ -38,6 +39,7 @@ struct ggml_backend_gemmini_context
     std::unique_ptr<char[]> work_data;
     size_t work_size = 0;
     std::map<ggml_tensor *, ggml_tensor *> bias_map;
+    std::map<const ggml_tensor *, std::unique_ptr<zerogod::BenchTensor<int8_t>>> tensor_cache;
     struct ggml_context *tmp_ctx = nullptr;
     void *arena = nullptr;
     bool tmp_ctx_initialized = false;

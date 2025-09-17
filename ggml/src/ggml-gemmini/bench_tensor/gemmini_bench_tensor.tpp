@@ -1,8 +1,30 @@
 #include "include/gemmini.h"
 #include "gemmini_bench_tensor.h"
+#include "../ggml-gemmini-util.h"
 
 namespace zerogod
 {
+    template <typename T>
+    BenchTensor<T> *BenchTensor<T>::getOrCreate(ggml_backend_gemmini_context *ctx,
+                                                       const ggml_tensor *src,
+                                                       const char *suffix = ".bench",
+                                                       bool acc = false,
+                                                       bool transpose = false)
+    {
+        // 1. cache에서 이미 생성된 tensor 확인
+        auto it = ctx->tensor_cache.find(src);
+        if (it != ctx->tensor_cache.end())
+            return it->second.get(); // hit
+
+        // miss
+        auto new_tensor = std::make_unique<BenchTensor<T>>(src, suffix, acc, transpose);
+        BenchTensor<T> *ptr = new_tensor.get(); 
+
+        // 2. move
+        ctx->tensor_cache[src] = std::move(new_tensor);
+        return ptr;
+    }
+
     template <typename T>
     BenchTensor<T>::BenchTensor(const ggml_tensor *src,
                                 const char *suffix,
@@ -10,6 +32,8 @@ namespace zerogod
                                 bool transpose)
         : name_{std::string(src->name) + (suffix ? suffix : "")}, type_{src->type}
     {
+        if(tensors.find(src) != tensors.end())
+            return;
         /* 1. ____________________원본 행/열____________________
         ggml 네이티브: ne[0] = columns(X), ne[1] = rows(Y) */
         cols_ = transpose ? src->ne[1] : src->ne[0];

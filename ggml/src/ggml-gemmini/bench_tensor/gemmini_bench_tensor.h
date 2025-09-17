@@ -15,10 +15,11 @@ namespace zerogod
     class BenchTensor
     {
     public:
-        BenchTensor(const ggml_tensor *src,
-                    const char *suffix = ".bench",
-                    bool acc = false,
-                    bool transpose = false);
+        static BenchTensor<T> *getOrCreate(ggml_backend_gemmini_context *ctx,
+                                           const ggml_tensor *src,
+                                           const char *suffix = ".bench",
+                                           bool acc = false,
+                                           bool transpose = false);
 
         // 이동 전용 구현
         BenchTensor(BenchTensor &&) noexcept;            // 이동 생성자
@@ -42,6 +43,10 @@ namespace zerogod
         ~BenchTensor() { freeBuffer(); }
 
     private:
+        BenchTensor(const ggml_tensor *src,
+                    const char *suffix = ".bench",
+                    bool acc = false,
+                    bool transpose = false);
         void freeBuffer();
 
         std::string name_;
