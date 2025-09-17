@@ -32,8 +32,6 @@ namespace zerogod
                                 bool transpose)
         : name_{std::string(src->name) + (suffix ? suffix : "")}, type_{src->type}
     {
-        if(tensors.find(src) != tensors.end())
-            return;
         /* 1. ____________________원본 행/열____________________
         ggml 네이티브: ne[0] = columns(X), ne[1] = rows(Y) */
         cols_ = transpose ? src->ne[1] : src->ne[0];
