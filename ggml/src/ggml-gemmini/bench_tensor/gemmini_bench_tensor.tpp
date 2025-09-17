@@ -18,7 +18,7 @@ namespace zerogod
             return it->second.get(); // hit
 
         // miss
-        auto new_tensor = std::make_unique<BenchTensor<T>>(src, suffix, acc, transpose);
+        auto new_tensor = std::unique_ptr<BenchTensor<T>>(new BenchTensor<T>(src, suffix, acc, transpose));
         BenchTensor<T> *ptr = new_tensor.get(); 
 
         // 2. move
