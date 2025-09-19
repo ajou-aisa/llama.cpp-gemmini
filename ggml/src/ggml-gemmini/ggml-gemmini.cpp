@@ -1,12 +1,12 @@
 // ggml-gemmini.cpp
 
 #include "ggml-gemmini-tensor.h"
-#include "bench_tensor/gemmini_bench_tensor.h"
+#include "gemmini_tensor/gemmini_tensor_interface.h"
 #include "include/gemmini.h"
 #include <optional>
 #include "test/ggml-gemmini-test.h"
 
-using namespace zerogod;
+using namespace aisa;
 
 // Cycle 측정 용
 extern "C" volatile uint64_t gemmini_tiled_matmul_cycles = 0; // gemmini.h
@@ -44,9 +44,9 @@ static void ggml_backend_gemmini_mul_mat(
 
     start = read_cycles();
     /* _____________________________ 1. Gemmini용 텐서 생성 _____________________________ */
-    const auto* tA = BenchTensor<int8_t>::getOrCreate(ctx, src1, ".i8"); // IxK (1xK)
-    const auto* tB = BenchTensor<int8_t>::getOrCreate(ctx, src0, ".i8", false, TRANSPOSE_B);  // KxJ, 전치
-    const auto* tC = BenchTensor<int8_t>::getOrCreate(ctx, dst, ".i8_out", true); // IxJ (1xJ)
+    const auto* tA = GemminiTensor<int8_t>::getOrCreate(ctx, src1, ".i8"); // IxK (1xK)
+    const auto* tB = GemminiTensor<int8_t>::getOrCreate(ctx, src0, ".i8", false, TRANSPOSE_B);  // KxJ, 전치
+    const auto* tC = GemminiTensor<int8_t>::getOrCreate(ctx, dst, ".i8_out", true); // IxJ (1xJ)
     
     end = read_cycles();
     gen_tensor_cycles = (end - start);
@@ -90,7 +90,7 @@ static void ggml_backend_gemmini_mul_mat(
                       1, 1,
                       repeating,
                       false, // transpose_A
-                      false, // transpose_B
+                      !TRANSPOSE_B, // transpose_B
                       false, false,
                       0, OPTION);
 

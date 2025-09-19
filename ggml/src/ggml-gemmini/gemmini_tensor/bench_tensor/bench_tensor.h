@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../ggml-gemmini-util.h"
+#include "../../ggml-gemmini-util.h"
 #include <cstdint>
 #include <cstddef>
 #include <type_traits>
@@ -9,7 +9,7 @@
 
 #include "ggml.h"
 
-namespace zerogod
+namespace aisa
 {
     template <typename T>
     class BenchTensor
@@ -61,5 +61,5 @@ namespace zerogod
     };
 }
 
-#include "gemmini_bench_tensor.tpp"
+#include "bench_tensor.tpp"
 
