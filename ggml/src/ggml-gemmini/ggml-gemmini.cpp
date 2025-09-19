@@ -20,10 +20,6 @@ static void ggml_backend_gemmini_mul_mat(
                                          struct ggml_tensor *dst, // FP32 output (I×J)
                                          struct ggml_tensor *bias) // optional FP32 bias (->int32)
 {
-/* ______________ Debug: 헤더 사용량 측정 _______________ */
-#if DEBUG
-    size_t mu0 = ggml_used_mem(ctx->tmp_ctx);
-#endif
 
 /* ________________ Test: 테스트 호출용 ___________________ */
 #if TEST
@@ -165,27 +161,7 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
     printf("[bias_mapping_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
 
     start = read_cycles();
-    struct ggml_init_params ip = {
-        /* .mem_size   = */ 8ull * 1024 * 1024, // 8MiB
-        /* .mem_buffer = */ NULL,
-        /* .no_alloc   = */ true, // 헤더만
-    };
     
-    ctx->tmp_ctx = ggml_init(ip);
-    GGML_ASSERT(ctx->tmp_ctx);
-
-    end = read_cycles();
-    tmp_ctx_cycles += (end - start);
-    printf("[tmp_ctx_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
-
-/* __________________________ Debug: 헤더 사용량 측정 ____________________________ */
-#if DEBUG
-
-    DBG("[Gemmini] sizeof(ggml_tensor) = %zu\n", sizeof(struct ggml_tensor));
-    size_t used0 = ggml_used_mem(ctx->tmp_ctx);
-    DBG("[Gemmini] tmp_ctx used(start) = %zu bytes\n", used0);
-
-#endif
 #endif
 
     for (int i = 0; i < cgraph->n_nodes; i++)
@@ -227,22 +203,6 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
             GGML_ABORT("%s: unsupported op %s\n", __func__, ggml_op_desc(node));
         }
     }
-
-#if 0
-/* _______________________________________ Debug: 헤더 사용량 측정 ________________________________________________ */
-#if DEBUG
-
-    size_t used1 = ggml_used_mem(ctx->tmp_ctx);
-    size_t hdr_bytes = (used1 >= used0) ? (used1 - used0) : used1; // 방어적
-    DBG("[Gemmini] tmp_ctx header used(total) = %zu bytes (%.2f MiB)\n", hdr_bytes, hdr_bytes / (1024.0 * 1024.0));
-
-#endif
-
-    ctx->bias_map.clear();
-    // tmp_ctx 해제
-    ggml_free(ctx->tmp_ctx);
-    ctx->tmp_ctx = nullptr;
-#endif
     
     GGML_UNUSED(backend);
     return GGML_STATUS_SUCCESS;
