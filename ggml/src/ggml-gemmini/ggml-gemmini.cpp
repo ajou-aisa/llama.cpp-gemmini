@@ -15,10 +15,8 @@ uint64_t start, end;
 uint64_t bias_mapping_cycles = 0, preprocess_cycles = 0, tmp_ctx_cycles = 0, gen_tensor_cycles = 0, 
 out_copy_cycles = 0, before_gemmini_overhead_cycles = 0, after_gemmini_overhead_cycles = 0;
 
-static void ggml_backend_gemmini_mul_mat(
-                                         ggml_backend_gemmini_context *ctx,
-                                         struct ggml_tensor *dst, // FP32 output (I×J)
-                                         struct ggml_tensor *bias) // optional FP32 bias (->int32)
+static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
+                                         struct ggml_tensor *dst) // FP32 output (I×J)
 {
 
 /* ________________ Test: 테스트 호출용 ___________________ */
@@ -142,28 +140,6 @@ static void ggml_backend_gemmini_free(ggml_backend_t backend) {
 static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_gemmini_context * ctx = (ggml_backend_gemmini_context *)backend->context;
     
-#if 0
-    // cycle 초기화
-    before_gemmini_overhead_cycles = 0;
-    after_gemmini_overhead_cycles = 0;
-
-    start = read_cycles();
-    // (1) bias_map 갱신
-    ctx->bias_map.clear();
-    
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        auto *node = cgraph->nodes[i];
-        if (node->op == GGML_OP_ADD && node->src[0]->op == GGML_OP_MUL_MAT)
-            ctx->bias_map[node->src[0]] = node->src[1];
-    }
-    end = read_cycles();
-    bias_mapping_cycles = (end - start);
-    printf("[bias_mapping_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
-
-    start = read_cycles();
-    
-#endif
-
     for (int i = 0; i < cgraph->n_nodes; i++)
     {
         struct ggml_tensor *node = cgraph->nodes[i];
@@ -171,20 +147,7 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
         switch (node->op)
         {
         case GGML_OP_MUL_MAT: {
-            /*
-            start = read_cycles();
-
-            ggml_tensor *bias = nullptr;
-            auto it = ctx->bias_map.find(node);
-            if (it != ctx->bias_map.end())
-                bias = it->second;
-
-            end = read_cycles();
-            bias_getting_cycles += (start - end);
-            printf("[bias_getting_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
-            */
-            
-            ggml_backend_gemmini_mul_mat(ctx, node, nullptr);
+            ggml_backend_gemmini_mul_mat(ctx, node);
             break;
         }
         case GGML_OP_OUT_PROD:
