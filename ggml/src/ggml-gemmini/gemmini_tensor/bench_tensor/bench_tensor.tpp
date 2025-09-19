@@ -1,9 +1,9 @@
 #include "include/gemmini.h"
-#include "gemmini_bench_tensor.h"
+#include "bench_tensor.h"
 #include <memory>
 #include <cstring>
 
-namespace zerogod
+namespace aisa
 {
     template <typename T>
     BenchTensor<T> *BenchTensor<T>::getOrCreate(ggml_backend_gemmini_context *ctx,
@@ -46,10 +46,7 @@ namespace zerogod
         if (buf_bytes_ == 0)
             buf_bytes_ = GEMMINI_ALIGN; // 최소 16 B 확보
 
-        void *p = nullptr;
-        if (posix_memalign(&p, GEMMINI_ALIGN, buf_bytes_) != 0)
-            p = nullptr; // buffer을 16B 경계에 할당
-        data_ = p;
+        this->data_ = std::aligned_alloc(GEMMINI_ALIGN, buf_bytes_); // buffer을 16B 경계에 할당
         GGML_ASSERT(this->data_ != nullptr);
 
         stride_ = row_bytes / elem_size;
