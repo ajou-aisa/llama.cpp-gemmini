@@ -5,9 +5,7 @@ set(GEMMINI_SW_PATH $ENV{GEM_HOME})
 
 ggml_add_backend_library(ggml-gemmini
                          ggml-gemmini.cpp
-                         ggml-gemmini-tensor.cpp
                          test/ggml-gemmini-test.cpp
-                         bench_tensor/gemmini_bench_tensor.tpp
                         )
 
 target_compile_options(ggml-gemmini PRIVATE
@@ -22,6 +20,7 @@ target_compile_options(ggml-gemmini PRIVATE
 )
 
 target_compile_definitions(ggml-gemmini PRIVATE
+  USE_GEMMINI_BENCH_TENSOR=0 # true: BenchTensor | false: BaselineTensor
   DEBUG=0         # ggml-gemmini-util.h에서 쓰는 DEBUG 매크로
   TEST=0          # 필요 시
   PRINT_TILE=0    # 필요 시
