@@ -12,8 +12,6 @@
 #include <future>
 #include <vector>
 #include <map>
-#include <set>
-#include <cstring>
 
 struct ggml_backend_gemmini_context;
 constexpr size_t GEMMINI_ALIGN = 16; // 16-byte align
