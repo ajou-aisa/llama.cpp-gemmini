@@ -1,9 +1,8 @@
 // ggml-gemmini.cpp
 
-#include "ggml-gemmini-tensor.h"
+#include "ggml-gemmini-util.h"
 #include "gemmini_tensor/gemmini_tensor_interface.h"
 #include "include/gemmini.h"
-#include <optional>
 #include "test/ggml-gemmini-test.h"
 
 using namespace aisa;
