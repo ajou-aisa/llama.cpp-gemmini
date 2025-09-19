@@ -14,7 +14,11 @@
 #include <map>
 
 struct ggml_backend_gemmini_context;
-constexpr size_t GEMMINI_ALIGN = 16; // 16-byte align
+namespace aisa {
+    template<typename T> class BaselineTensor; 
+    template<typename T> class BenchTensor;
+    constexpr size_t GEMMINI_ALIGN = 16; // 16-byte align
+}
 
 #include "gemmini_tensor/gemmini_tensor_interface.h"
 
@@ -24,8 +28,8 @@ struct ggml_backend_gemmini_context
     std::unique_ptr<char[]> work_data;
     size_t work_size = 0;
     std::map<ggml_tensor *, ggml_tensor *> bias_map;
-    std::map<const ggml_tensor *, std::unique_ptr<aisa::GemminiTensor<int8_t>>> tensor_cache;
-    std::vector<std::unique_ptr<aisa::GemminiTensor<int8_t>>> temp_tensors;
+    std::map<const ggml_tensor *, std::unique_ptr<aisa::BenchTensor<int8_t>>> tensor_cache;
+    std::vector<std::unique_ptr<aisa::BaselineTensor<int8_t>>> temp_tensors;
 #ifndef GGML_USE_OPENMP
     std::vector<std::future<void>> tasks;
 #endif
