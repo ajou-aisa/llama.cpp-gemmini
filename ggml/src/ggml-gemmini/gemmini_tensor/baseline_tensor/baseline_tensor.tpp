@@ -56,50 +56,7 @@ namespace aisa
         else
             castBaselineData(src, transpose);
         end = read_cycles();
-
-        if (!acc)
-        {
-            start = read_cycles();
-            if (src->type == GGML_TYPE_Q8_0)
-            {
-                const int64_t rows = src_rows;
-                const int64_t cols = src_cols;
-
-                // 목적지: 패딩 반영된 행 스트라이드(요소 단위)
-                T *dst_base = reinterpret_cast<T *>(this->data_);
-                const size_t dst_stride_elems = this->stride_;
-                if (!transpose)
-                {
-                    // src의 x축 방향(Q8_0 블록)이 그대로 열이며, 행 단위 직복사
-                    q80_to_T_rowwise<T>(src, dst_base, dst_stride_elems, rows, cols);
-                }
-                else
-                {
-                    // 전치: dst(r,c) = src(x=r, y=c). 1원소 gather
-                    q80_to_T_transposed<T>(src, dst_base, dst_stride_elems, rows, cols);
-                }
-                DBG("checking bp4\n");
-                // 패딩 영역은 0으로 채우기(열 패딩분)
-                if (padded_cols > src_cols)
-                {
-                    DBG0("padding...");
-                    for (int64_t r = 0; r < rows; ++r)
-                    {
-                        T *rowp = dst_base + r * dst_stride_elems;
-                        std::memset(rowp + src_cols, 0, (padded_cols - src_cols) * sizeof(T));
-                    }
-                }
-            }
-            else
-                ggml_gemmini_cast(src, transpose);
-            end = read_cycles();
-            DBG("[casting data] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
-        }
-
-        else
-        {
-            std::memset(data_, 0, buf_bytes_);
-        }
+        printf("[casting data] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
     }
 
     template <typename T>
