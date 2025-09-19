@@ -1,6 +1,7 @@
 // ggml-gemmini.cpp
 
 #include "ggml-gemmini-tensor.h"
+#include "bench_tensor/gemmini_bench_tensor.h"
 #include "include/gemmini.h"
 #include <optional>
 #include "test/ggml-gemmini-test.h"
@@ -11,7 +12,7 @@ using namespace zerogod;
 extern "C" volatile uint64_t gemmini_tiled_matmul_cycles = 0; // gemmini.h
 
 uint64_t start, end;
-uint64_t bias_mapping_cycles = 0, bias_getting_cycles = 0, tmp_ctx_cycles = 0, gemmini_tensor_cycles = 0, 
+uint64_t bias_mapping_cycles = 0, preprocess_cycles = 0, tmp_ctx_cycles = 0, gen_tensor_cycles = 0, 
 out_copy_cycles = 0, before_gemmini_overhead_cycles = 0, after_gemmini_overhead_cycles = 0;
 
 static void ggml_backend_gemmini_mul_mat(
@@ -23,7 +24,6 @@ static void ggml_backend_gemmini_mul_mat(
 #if DEBUG
     size_t mu0 = ggml_used_mem(ctx->tmp_ctx);
 #endif
-/* _____________________________________________________ */
 
 /* ________________ Test: 테스트 호출용 ___________________ */
 #if TEST
@@ -31,7 +31,6 @@ static void ggml_backend_gemmini_mul_mat(
     ggml_gemmini_test(ctx, dst, bias);
     return;
 #endif
-    /* ______________________________________________________ */
 
     DBG("[Gemmini] mul_mat call\n");
 
@@ -42,76 +41,49 @@ static void ggml_backend_gemmini_mul_mat(
     DBG("\ndst shape:\n ne = [%llu, %llu, %llu, %llu]\n", dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
     DBG("\nsrc0 shape:\n ne = [%llu, %llu, %llu, %llu]\n", src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);
     DBG("\nsrc1 shape:\n ne = [%llu, %llu, %llu, %llu]\n", src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3]);
-    /* _______________________________________________________________________________________________________ */
 
-    /* --------------------------------- Cycle -------------------------------- */
     start = read_cycles();
     /* _____________________________ 1. Gemmini용 텐서 생성 _____________________________ */
-    ggml_gemmini_tensor<int8_t> tA(ctx->tmp_ctx, src1, ".i8");              // IxK (1xK)
-    ggml_gemmini_tensor<int8_t> tB(ctx->tmp_ctx, src0, ".i8", false, true); // KxJ, 전치
-    ggml_gemmini_tensor<int8_t> tC(ctx->tmp_ctx, dst, ".i8", true);         // IxJ (1xJ)
-    std::optional<ggml_gemmini_tensor<int32_t>> tD;                         // optional로 임시 생성
-    if (bias)
-        tD.emplace(ctx->tmp_ctx, bias, ".i32");
-
-/* ____________________ Debug: 헤더 사용량 측정 ___________________ */
-#if DEBUG
-
-    size_t mu1 = ggml_used_mem(ctx->tmp_ctx);
-    size_t mul_hdr = (mu1 >= mu0) ? (mu1 - mu0) : mu1;
-    DBG("[Gemmini] MUL_MAT header used = %zu bytes\n", mul_hdr);
+    const auto* tA = BenchTensor<int8_t>::getOrCreate(ctx, src1, ".i8"); // IxK (1xK)
+    const auto* tB = BenchTensor<int8_t>::getOrCreate(ctx, src0, ".i8", false, TRANSPOSE_B);  // KxJ, 전치
+    const auto* tC = BenchTensor<int8_t>::getOrCreate(ctx, dst, ".i8_out", true); // IxJ (1xJ)
     
-#endif
-/* ______________________________________________________________ */
-
-    /* ___________________ Guard: runtime dimension _____________________ */
-    GGML_ASSERT(tA.get_rows() == dst->ne[1]);    // I == dst rows (보통 1)
-    GGML_ASSERT(tA.get_cols() == tB.get_rows()); // K == K
-    GGML_ASSERT(tC.get_rows() == tA.get_rows()); // I == I
-    GGML_ASSERT(tC.get_cols() == tB.get_cols()); // J(padded) == J(padded)
-    GGML_ASSERT(dst->ne[0] <= tC.get_cols());    // 논리 J <= 패딩 J
-    /* __________________________________________________________________ */
-
+    end = read_cycles();
+    gen_tensor_cycles = (end - start);
+    printf("[gen_tensor_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, gen_tensor_cycles);
+    
+    start = read_cycles();
     /* _______________________ 2. Gemmini용 dimension _____________________ */
-    const size_t I = tC.get_rows(); // I = A.ne[1], K = A.ne[0]
-    const size_t J = tC.get_cols(); // K = B.ne[0], J = B.ne[1] (transpose)
-    const size_t K = tA.get_cols();
+    const size_t I = tC->getRows(); // I = A.ne[1], K = A.ne[0]
+    const size_t J = tC->getCols(); // K = B.ne[0], J = B.ne[1] (transpose)
+    const size_t K = tA->getCols();
     DBG("I=%zu, J=%zu, K=%zu\n", I, J, K);
-    /* ____________________________________________________________________ */
 
     /* _____ 3. Gemmini용 stride _____ */
-    const size_t sA = tA.get_stride();
-    const size_t sB = tB.get_stride();
-    const size_t sC = tC.get_stride();
-    GGML_ASSERT(sA % 16 == 0);
-    GGML_ASSERT(sB % 16 == 0);
-    GGML_ASSERT(sC % 16 == 0);
-    /* _______________________________ */
+    const size_t sA = tA->getStride();
+    const size_t sB = tB->getStride();
+    const size_t sC = tC->getStride();
 
     /* ______________________________ 4. bias 텐서 처리 _________________________________ */
-    std::vector<int32_t> zero_bias(tC.get_cols(), 0);
+    std::vector<int32_t> zero_bias(tC->getCols(), 0);
 
-    const int32_t *bias_data = tD ? static_cast<int32_t *>(tD->get()) : zero_bias.data();
-    const size_t sD = tD ? tD->get_stride() : 0;
-    const bool repeating = tD ? tD->get_rows() == 1 : true;
+    const int32_t *bias_data = zero_bias.data();
+    const size_t sD = 0;
+    const bool repeating = true;
+
+    end = read_cycles();
+    preprocess_cycles = (end - start);
+    printf("[preprocess_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, preprocess_cycles);
 
     DBG("calling tiled_matmul_auto: ptrA=%p ptrB=%p ptrD=%p ptrC=%p\n",
         (void *)tA.get(), (void *)tB.get(), (void *)bias_data, (void *)tC.get());
-    /* _________________________________________________________________________________ */
-
-    end = read_cycles();
-    gemmini_tensor_cycles = (end - start);
-    printf("[gemmini_tensor_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
-    before_gemmini_overhead_cycles += gemmini_tensor_cycles;
-    printf("[before_gemmini_overhead_cycles] = %lu\n", before_gemmini_overhead_cycles);
-    /* --------------------------------- Cycle -------------------------------- */
 
     /* __ 5. Gemmini tiled_matmul_auto 호출 __ */
     tiled_matmul_auto(I, J, K,
-                      (elem_t *)tA.get(),
-                      (elem_t *)tB.get(),
+                      (elem_t *)tA->get(),
+                      (elem_t *)tB->get(),
                       (void *)bias_data,
-                      (elem_t *)tC.get(),
+                      (elem_t *)tC->get(),
                       sA, sB, sD, sC,
                       1.f, 1.f, 1.f,
                       NO_ACTIVATION,
@@ -121,15 +93,13 @@ static void ggml_backend_gemmini_mul_mat(
                       false, // transpose_B
                       false, false,
                       0, OPTION);
-    /* _______________________________________ */
 
-    /* --------------------------------- Cycle -------------------------------- */
     start = read_cycles();
     /* _____________ 6. Gemmini 연산 결과를 원본 출력 텐서로 반영 _____________ */
     const size_t nb1_out = dst->nb[1]; // 출력 텐서 행 stride (bytes)
     const size_t J_log = dst->ne[0];   // 실제 논리 열 수
 
-    int8_t *c_i8 = static_cast<int8_t *>(tC.get());
+    const int8_t *c_i8 = static_cast<const int8_t *>(tC->get());
     uint8_t *out_base = static_cast<uint8_t *>(dst->data);
 
     for (size_t r = 0; r < I; ++r)
@@ -142,15 +112,9 @@ static void ggml_backend_gemmini_mul_mat(
             row_out[c] = static_cast<float>(row_c[c]);
         // 패딩 영역(row_c[J..sC-1])은 무시
     }
-    /* ____________________________________________________________________ */
     end = read_cycles();
     out_copy_cycles = (end - start);
     printf("[out_copy_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
-
-    after_gemmini_overhead_cycles += out_copy_cycles;
-    /* --------------------------------- Cycle -------------------------------- */
-    printf("[after_gemmini_overhead_cycles] = %lu\n", after_gemmini_overhead_cycles);
-
 }
 
 static void ggml_backend_gemmini_add(
@@ -181,14 +145,16 @@ static void ggml_backend_gemmini_free(ggml_backend_t backend) {
 
 static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_gemmini_context * ctx = (ggml_backend_gemmini_context *)backend->context;
+    
+#if 0
     // cycle 초기화
     before_gemmini_overhead_cycles = 0;
     after_gemmini_overhead_cycles = 0;
 
-    /* --------------------------------- Cycle -------------------------------- */
     start = read_cycles();
     // (1) bias_map 갱신
     ctx->bias_map.clear();
+    
     for (int i = 0; i < cgraph->n_nodes; i++) {
         auto *node = cgraph->nodes[i];
         if (node->op == GGML_OP_ADD && node->src[0]->op == GGML_OP_MUL_MAT)
@@ -204,14 +170,13 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
         /* .mem_buffer = */ NULL,
         /* .no_alloc   = */ true, // 헤더만
     };
-
+    
     ctx->tmp_ctx = ggml_init(ip);
     GGML_ASSERT(ctx->tmp_ctx);
 
     end = read_cycles();
     tmp_ctx_cycles += (end - start);
     printf("[tmp_ctx_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
-    /* --------------------------------- Cycle -------------------------------- */
 
 /* __________________________ Debug: 헤더 사용량 측정 ____________________________ */
 #if DEBUG
@@ -221,7 +186,7 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
     DBG("[Gemmini] tmp_ctx used(start) = %zu bytes\n", used0);
 
 #endif
-/* _____________________________________________________________________________ */
+#endif
 
     for (int i = 0; i < cgraph->n_nodes; i++)
     {
@@ -230,7 +195,7 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
         switch (node->op)
         {
         case GGML_OP_MUL_MAT: {
-            /* --------------------------------- Cycle -------------------------------- */
+            /*
             start = read_cycles();
 
             ggml_tensor *bias = nullptr;
@@ -241,9 +206,9 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
             end = read_cycles();
             bias_getting_cycles += (start - end);
             printf("[bias_getting_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
-            /* --------------------------------- Cycle -------------------------------- */
+            */
             
-            ggml_backend_gemmini_mul_mat(ctx, node, bias);
+            ggml_backend_gemmini_mul_mat(ctx, node, nullptr);
             break;
         }
         case GGML_OP_OUT_PROD:
@@ -263,6 +228,7 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
         }
     }
 
+#if 0
 /* _______________________________________ Debug: 헤더 사용량 측정 ________________________________________________ */
 #if DEBUG
 
@@ -271,15 +237,13 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
     DBG("[Gemmini] tmp_ctx header used(total) = %zu bytes (%.2f MiB)\n", hdr_bytes, hdr_bytes / (1024.0 * 1024.0));
 
 #endif
-/* _______________________________________________________________________________________________________________ */
 
     ctx->bias_map.clear();
     // tmp_ctx 해제
     ggml_free(ctx->tmp_ctx);
     ctx->tmp_ctx = nullptr;
-
-    before_gemmini_overhead_cycles += bias_mapping_cycles + bias_getting_cycles + tmp_ctx_cycles;
-
+#endif
+    
     GGML_UNUSED(backend);
     return GGML_STATUS_SUCCESS;
 }
