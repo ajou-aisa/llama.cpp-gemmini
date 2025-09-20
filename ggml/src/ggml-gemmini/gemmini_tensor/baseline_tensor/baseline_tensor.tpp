@@ -1,7 +1,6 @@
 #include "include/gemmini.h"
 #include "baseline_tensor.h"
 #include "../dequantize_weight.h"
-#include "../../ggml-gemmini-util.h"
 #include <memory>
 #include <cstring>
 
