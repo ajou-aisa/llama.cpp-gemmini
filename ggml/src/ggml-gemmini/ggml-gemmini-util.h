@@ -12,11 +12,13 @@
 #include <future>
 #include <vector>
 #include <map>
+#include <memory>
 
-struct ggml_backend_gemmini_context;
+#include "gemmini_tensor/baseline_tensor/baseline_tensor.h"
+#include "gemmini_tensor/bench_tensor/bench_tensor.h"
+#include "gemmini_tensor/gemmini_tensor_interface.h"
+
 namespace aisa {
-    template<typename T> class BaselineTensor; 
-    template<typename T> class BenchTensor;
     constexpr size_t GEMMINI_ALIGN = 16; // 16-byte align
 }
 
