@@ -1,3 +1,4 @@
+// gemmini_tensor/bench_tensor/bench_tensor.tpp
 #include "include/gemmini.h"
 #include "bench_tensor.h"
 #include <memory>
