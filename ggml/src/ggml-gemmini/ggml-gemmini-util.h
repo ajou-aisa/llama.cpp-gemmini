@@ -14,9 +14,22 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <cstring>
+#include <type_traits>
 
 #ifndef PRINT_TILE
 #define PRINT_TILE 0
+#endif
+
+#if DEBUG 
+    #define DBG(fmt, ...) \
+        fprintf(stderr, "[%s:%d] %s(): " fmt "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__)
+    // simple debug    
+    #define DBG0(fmt, ...) \
+        fprintf(stderr, fmt, ##__VA_ARGS__)
+#else
+    #define DBG(fmt, ...)  ((void)0)
+    #define DBG0(fmt, ...) ((void)0)
 #endif
 
 // Forward declare the context struct
@@ -28,6 +41,7 @@ namespace aisa {
     constexpr size_t GEMMINI_ALIGN = 16; // 16-byte align
 }
 
+#include "gemmini_tensor/dequantize_weight.h"
 #include "gemmini_tensor/baseline_tensor/baseline_tensor.h"
 #include "gemmini_tensor/bench_tensor/bench_tensor.h"
 
@@ -45,17 +59,6 @@ struct ggml_backend_gemmini_context
 };
 
 #include "gemmini_tensor/gemmini_tensor_interface.h"
-#include "gemmini_tensor/dequantize_weight.h"
 
-#if DEBUG 
-    #define DBG(fmt, ...) \
-        fprintf(stderr, "[%s:%d] %s(): " fmt "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__)
-    // simple debug    
-    #define DBG0(fmt, ...) \
-        fprintf(stderr, fmt, ##__VA_ARGS__)
-#else
-    #define DBG(fmt, ...)  ((void)0)
-    #define DBG0(fmt, ...) ((void)0)
-#endif
 
 
