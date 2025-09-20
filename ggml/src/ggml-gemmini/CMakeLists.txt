@@ -34,7 +34,7 @@ target_compile_definitions(ggml-gemmini PRIVATE
   TEST_CPU_REF=0 # 기대값 계산
   TEST_GEMMINI=0 # gemmini 호출
   TEST_COMPARE=0 # 결과 비교
-  TEST_DEQUANTIZE=0 # 연산 결과 복사(dequantize)
+  TEST_DEQUANTIZE_OUT=0 # 연산 결과 복사(dequantize)
 
   # slice 크기
   SLICE_I=1
