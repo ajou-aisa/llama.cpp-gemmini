@@ -3,7 +3,6 @@
 #include <cstring>
 #include <cstdint>
 #include <type_traits>
-#include "../ggml-gemmini-util.h" 
 
 #include "include/gemmini.h"
 #include "ggml.h"

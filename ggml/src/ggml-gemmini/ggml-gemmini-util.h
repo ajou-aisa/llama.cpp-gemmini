@@ -13,6 +13,11 @@
 #include <vector>
 #include <map>
 #include <memory>
+#include <string>
+
+#ifndef PRINT_TILE
+#define PRINT_TILE 0
+#endif
 
 // Forward declare the context struct
 struct ggml_backend_gemmini_context;
@@ -25,7 +30,6 @@ namespace aisa {
 
 #include "gemmini_tensor/baseline_tensor/baseline_tensor.h"
 #include "gemmini_tensor/bench_tensor/bench_tensor.h"
-#include "gemmini_tensor/gemmini_tensor_interface.h"
 
 struct ggml_backend_gemmini_context
 {
@@ -40,9 +44,8 @@ struct ggml_backend_gemmini_context
 #endif
 };
 
-#ifndef PRINT_TILE
-#define PRINT_TILE 0
-#endif
+#include "gemmini_tensor/gemmini_tensor_interface.h"
+#include "gemmini_tensor/dequantize_weight.h"
 
 #if DEBUG 
     #define DBG(fmt, ...) \
@@ -54,3 +57,5 @@ struct ggml_backend_gemmini_context
     #define DBG(fmt, ...)  ((void)0)
     #define DBG0(fmt, ...) ((void)0)
 #endif
+
+
