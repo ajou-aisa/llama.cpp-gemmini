@@ -1,12 +1,11 @@
 // ggml-gemmini.cpp
 
-#include "ggml-gemmini-tensor.h"
-#include "bench_tensor/gemmini_bench_tensor.h"
+#include "ggml-gemmini-util.h"
+#include "gemmini_tensor/gemmini_tensor_interface.h"
 #include "include/gemmini.h"
-#include <optional>
 #include "test/ggml-gemmini-test.h"
 
-using namespace zerogod;
+using namespace aisa;
 
 // Cycle 측정 용
 extern "C" volatile uint64_t gemmini_tiled_matmul_cycles = 0; // gemmini.h
@@ -15,15 +14,9 @@ uint64_t start, end;
 uint64_t bias_mapping_cycles = 0, preprocess_cycles = 0, tmp_ctx_cycles = 0, gen_tensor_cycles = 0, 
 out_copy_cycles = 0, before_gemmini_overhead_cycles = 0, after_gemmini_overhead_cycles = 0;
 
-static void ggml_backend_gemmini_mul_mat(
-                                         ggml_backend_gemmini_context *ctx,
-                                         struct ggml_tensor *dst, // FP32 output (I×J)
-                                         struct ggml_tensor *bias) // optional FP32 bias (->int32)
+static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
+                                         struct ggml_tensor *dst) // FP32 output (I×J)
 {
-/* ______________ Debug: 헤더 사용량 측정 _______________ */
-#if DEBUG
-    size_t mu0 = ggml_used_mem(ctx->tmp_ctx);
-#endif
 
 /* ________________ Test: 테스트 호출용 ___________________ */
 #if TEST
@@ -44,9 +37,9 @@ static void ggml_backend_gemmini_mul_mat(
 
     start = read_cycles();
     /* _____________________________ 1. Gemmini용 텐서 생성 _____________________________ */
-    const auto* tA = BenchTensor<int8_t>::getOrCreate(ctx, src1, ".i8"); // IxK (1xK)
-    const auto* tB = BenchTensor<int8_t>::getOrCreate(ctx, src0, ".i8", false, TRANSPOSE_B);  // KxJ, 전치
-    const auto* tC = BenchTensor<int8_t>::getOrCreate(ctx, dst, ".i8_out", true); // IxJ (1xJ)
+    const auto* tA = GemminiTensor<int8_t>::getOrCreate(ctx, src1, ".i8"); // IxK (1xK)
+    const auto* tB = GemminiTensor<int8_t>::getOrCreate(ctx, src0, ".i8", false, TRANSPOSE_B);  // KxJ, 전치
+    const auto* tC = GemminiTensor<int8_t>::getOrCreate(ctx, dst, ".i8_out", true); // IxJ (1xJ)
     
     end = read_cycles();
     gen_tensor_cycles = (end - start);
@@ -90,7 +83,7 @@ static void ggml_backend_gemmini_mul_mat(
                       1, 1,
                       repeating,
                       false, // transpose_A
-                      false, // transpose_B
+                      !TRANSPOSE_B, // transpose_B
                       false, false,
                       0, OPTION);
 
@@ -146,48 +139,6 @@ static void ggml_backend_gemmini_free(ggml_backend_t backend) {
 static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_gemmini_context * ctx = (ggml_backend_gemmini_context *)backend->context;
     
-#if 0
-    // cycle 초기화
-    before_gemmini_overhead_cycles = 0;
-    after_gemmini_overhead_cycles = 0;
-
-    start = read_cycles();
-    // (1) bias_map 갱신
-    ctx->bias_map.clear();
-    
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        auto *node = cgraph->nodes[i];
-        if (node->op == GGML_OP_ADD && node->src[0]->op == GGML_OP_MUL_MAT)
-            ctx->bias_map[node->src[0]] = node->src[1];
-    }
-    end = read_cycles();
-    bias_mapping_cycles = (end - start);
-    printf("[bias_mapping_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
-
-    start = read_cycles();
-    struct ggml_init_params ip = {
-        /* .mem_size   = */ 8ull * 1024 * 1024, // 8MiB
-        /* .mem_buffer = */ NULL,
-        /* .no_alloc   = */ true, // 헤더만
-    };
-    
-    ctx->tmp_ctx = ggml_init(ip);
-    GGML_ASSERT(ctx->tmp_ctx);
-
-    end = read_cycles();
-    tmp_ctx_cycles += (end - start);
-    printf("[tmp_ctx_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
-
-/* __________________________ Debug: 헤더 사용량 측정 ____________________________ */
-#if DEBUG
-
-    DBG("[Gemmini] sizeof(ggml_tensor) = %zu\n", sizeof(struct ggml_tensor));
-    size_t used0 = ggml_used_mem(ctx->tmp_ctx);
-    DBG("[Gemmini] tmp_ctx used(start) = %zu bytes\n", used0);
-
-#endif
-#endif
-
     for (int i = 0; i < cgraph->n_nodes; i++)
     {
         struct ggml_tensor *node = cgraph->nodes[i];
@@ -195,20 +146,7 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
         switch (node->op)
         {
         case GGML_OP_MUL_MAT: {
-            /*
-            start = read_cycles();
-
-            ggml_tensor *bias = nullptr;
-            auto it = ctx->bias_map.find(node);
-            if (it != ctx->bias_map.end())
-                bias = it->second;
-
-            end = read_cycles();
-            bias_getting_cycles += (start - end);
-            printf("[bias_getting_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
-            */
-            
-            ggml_backend_gemmini_mul_mat(ctx, node, nullptr);
+            ggml_backend_gemmini_mul_mat(ctx, node);
             break;
         }
         case GGML_OP_OUT_PROD:
@@ -227,22 +165,6 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
             GGML_ABORT("%s: unsupported op %s\n", __func__, ggml_op_desc(node));
         }
     }
-
-#if 0
-/* _______________________________________ Debug: 헤더 사용량 측정 ________________________________________________ */
-#if DEBUG
-
-    size_t used1 = ggml_used_mem(ctx->tmp_ctx);
-    size_t hdr_bytes = (used1 >= used0) ? (used1 - used0) : used1; // 방어적
-    DBG("[Gemmini] tmp_ctx header used(total) = %zu bytes (%.2f MiB)\n", hdr_bytes, hdr_bytes / (1024.0 * 1024.0));
-
-#endif
-
-    ctx->bias_map.clear();
-    // tmp_ctx 해제
-    ggml_free(ctx->tmp_ctx);
-    ctx->tmp_ctx = nullptr;
-#endif
     
     GGML_UNUSED(backend);
     return GGML_STATUS_SUCCESS;
