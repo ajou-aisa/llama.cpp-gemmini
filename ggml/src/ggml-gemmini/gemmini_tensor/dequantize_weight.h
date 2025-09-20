@@ -1,3 +1,10 @@
+//gemmini_tensor/dequantize_weight.h
+#pragma once
+#include <cstring>
+#include <cstdint>
+#include <type_traits>
+#include "../ggml-gemmini-util.h" 
+
 #include "include/gemmini.h"
 #include "ggml.h"
 
