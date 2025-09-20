@@ -1,3 +1,4 @@
+// gemmini_tensor/baseline_tensor/baseline_tensor.tpp
 #include "include/gemmini.h"
 #include "baseline_tensor.h"
 #include "../dequantize_weight.h"
@@ -9,9 +10,9 @@ namespace aisa
     template <typename T>
     BaselineTensor<T> *BaselineTensor<T>::getOrCreate(ggml_backend_gemmini_context *ctx,
                                                       const ggml_tensor *src,
-                                                      const char *suffix = ".base",
-                                                      bool acc = false,
-                                                      bool transpose = false)
+                                                      const char *suffix,
+                                                      bool acc,
+                                                      bool transpose)
     {
         // 1. initiate
         auto new_tensor = std::unique_ptr<BaselineTensor<T>>(new BaselineTensor<T>(src, suffix, acc, transpose));
