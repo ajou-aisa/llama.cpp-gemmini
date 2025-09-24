@@ -1,3 +1,5 @@
+#include "../ggml-gemmini/labeling/label.h"
+
 #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
 #define _USE_MATH_DEFINES // For M_PI on MSVC
 
@@ -1809,11 +1811,17 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_NORM:
             {
+                uint64_t t0 = read_cycles();
                 ggml_compute_forward_norm(params, tensor);
+                uint64_t t1 = read_cycles();
+                printf("[layer=%s][norm] start = %lu, end = %lu, elapsed = %lu\n", labelFromCpuOp("norm", tensor->name), t0, t1, t1 - t0);
             } break;
         case GGML_OP_RMS_NORM:
             {
+                uint64_t t0 = read_cycles();
                 ggml_compute_forward_rms_norm(params, tensor);
+                uint64_t t1 = read_cycles();
+                printf("[layer=%s][norm] start = %lu, end = %lu, elapsed = %lu\n", labelFromCpuOp("rms_norm", tensor->name), t0, t1, t1 - t0);
             } break;
         case GGML_OP_RMS_NORM_BACK:
             {
@@ -1893,7 +1901,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_SOFT_MAX:
             {
+                uint64_t t0 = read_cycles();
                 ggml_compute_forward_soft_max(params, tensor);
+                uint64_t t1 = read_cycles();
+                printf("[layer=%s][softmax] start = %lu, end = %lu, elapsed = %lu\n", labelFromCpuOp("softmax", tensor->name), t0, t1, t1 - t0);
             } break;
         case GGML_OP_SOFT_MAX_BACK:
             {
@@ -1969,7 +1980,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_LEAKY_RELU:
             {
+                uint64_t t0 = read_cycles();
                 ggml_compute_forward_leaky_relu(params, tensor);
+                uint64_t t1 = read_cycles();
+                printf("[layer=%s][leaky_relu] start = %lu, end = %lu, elapsed = %lu\n", labelFromCpuOp("leaky_relu", tensor->name), t0, t1, t1 - t0);
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
