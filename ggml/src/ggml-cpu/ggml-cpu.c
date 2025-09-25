@@ -1,5 +1,5 @@
 #include "../ggml-gemmini/labeling/label.h"
-#include "~/firesim/target-design/chipyard/generators/gemmini/software/gemmini-rocc-tests/include/cyclereader.h" // 절대경로
+#include "/home/alveo/firesim/target-design/chipyard/generators/gemmini/software/gemmini-rocc-tests/include" // 절대경로
 
 #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
 #define _USE_MATH_DEFINES // For M_PI on MSVC
