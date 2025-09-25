@@ -1,5 +1,5 @@
 #include "../ggml-gemmini/labeling/label.h"
-#include "include/gemmini.h"
+#include "~/firesim/target-design/chipyard/generators/gemmini/software/gemmini-rocc-tests/include/cyclereader.h" // 절대경로
 
 #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
 #define _USE_MATH_DEFINES // For M_PI on MSVC
@@ -2015,7 +2015,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_UNARY:
             {
+                uint64_t t0 = read_cycles();
                 ggml_compute_forward_unary(params, tensor);
+                uint64_t t1 = read_cycles();
+                printf("[layer=%s][unary] start = %lu, end = %lu, elapsed = %lu\n", labelFromCpuOp("unary", tensor->name), t0, t1, t1 - t0);
             } break;
         case GGML_OP_GET_REL_POS:
             {
