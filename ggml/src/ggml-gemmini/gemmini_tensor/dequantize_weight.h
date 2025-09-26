@@ -10,14 +10,15 @@
 #ifndef QK8_0
 #define QK8_0 32
 #endif
+struct block_q8_0
+{
+    int8_t qs[QK8_0]; // 우리가 추출할 대상
+    ggml_fp16_t d;    // 스케일(이번 작업에서는 폐기)
+};
 
 namespace aisa
 {
-    struct block_q8_0
-    {
-        int8_t qs[QK8_0]; // 우리가 추출할 대상
-        ggml_fp16_t d;    // 스케일(이번 작업에서는 폐기)
-    };
+
 
     inline const block_q8_0 *get_q80_row_ptr(const ggml_tensor *src,
                                              int64_t iy, int64_t iz, int64_t iw)
@@ -123,13 +124,7 @@ namespace aisa
                         const int off = static_cast<int>(c % QK8_0);
                         if constexpr (std::is_same_v<T, int8_t>)
                         {
-                            if (iy == 824)
-                            {
-                                // DBG0("checking value : %d\n", src_row_blocks[blk].qs[off]);
-                                // DBG0("addr : %d", &dst_row[c]);
-                                // DBG0("blk : %d\n", blk);
-                                // DBG0("off : %d\n", off);
-                            }
+                            
                             dst_row[c] = src_row_blocks[blk].qs[off];
                             // DBG("checking Is copy sucess");
                         }
@@ -138,6 +133,64 @@ namespace aisa
                             // DBG("no constexpr\n");
                             dst_row[c] = static_cast<T>(src_row_blocks[blk].qs[off]);
                         }
+                    }
+                    ++dst_row_idx;
+                }
+            }
+        }
+        GGML_ASSERT(dst_row_idx == rows);
+    }
+    template <typename T>
+    inline void dequantizeToFp16(const ggml_tensor *src,
+                                    T *dst_base, size_t dst_stride_elems,
+                                    int64_t rows, int64_t cols)
+    {
+        DBG("checking bp3\n");
+        GGML_ASSERT(src->type == GGML_TYPE_Q8_0);
+        GGML_ASSERT(rows % QK8_0 == 0 || rows % QK8_0 == 0 || rows > 0); // rows(=src->ne[0]) 제약은 호출부에서 보장
+        const int64_t nx_src = src->ne[0];                               // 원 src의 x 길이
+        GGML_ASSERT(nx_src % QK8_0 == 0);
+        const int64_t nblk_x = nx_src / QK8_0;
+        const int64_t ny = src->ne[0] ? src->ne[0] : 1;
+        const int64_t nz = src->ne[2] ? src->ne[2] : 1;
+        const int64_t nw = src->ne[3] ? src->ne[3] : 1;
+        // DBG0("rows : %d ny : %d, nz: %d, nw %d\n",rows, ny, nz, nw);
+
+        // 논리적으로 dst_rows = src_cols(ny*nz*nw), dst_cols = src_rows(nx_src)
+        // 여기서 rows = dst_rows, cols = dst_cols 로 들어온다.
+        // (w,z) 묶음으로 각 y를 'dst의 행'으로 봄
+        int64_t dst_row_idx = 0;
+        for (int64_t iw = 0; iw < nw; ++iw)
+        {
+
+            // DBG("checing bp w: %d \n", iw);
+            for (int64_t iz = 0; iz < nz; ++iz)
+            {
+
+                // DBG("checking bp z: ");
+                for (int64_t iy = 0; iy < ny; ++iy)
+                {
+                    // DBG0("Checking bp y : %d\n", iy);
+                    const block_q8_0 *src_row_blocks = get_q80_row_ptr(src, iy, iz, iw);
+                    // DBG("getting ptr sucess...\n");
+                    ggml_fp16_t *dst_row = dst_base + dst_row_idx * dst_stride_elems ;
+                    // DBG0("dst_base = %d, dst_row = %d, dst_stride = %d", dst_base, dst_row_idx, dst_stride_elems);
+                    // DBG0("cols : %d", cols);
+                    //  dst_row[c] = src(x=c, y=iy, z=iz, w=iw)
+                    //  src(x=c) → block = c / 32, off = c % 32
+                    float f = ggml_fp16_to_fp32(src_row_blocks->d);
+                    for (int64_t c = 0; c < cols; ++c)
+                    {
+
+                        // if (iy == 824)
+                        // DBG0("C=%d", c);
+                        const int64_t blk = c / QK8_0;
+                        const int off = static_cast<int>(c % QK8_0);
+                        auto deq = src_row_blocks[blk].qs[off]*f
+                        DBG0("int = %d, float = %.6f, ans = %.6f\n"src_row_blocks[blk].qs[off], f, deq)
+                        dst_row[c] = ggml_fp32_to_fp16(deq);
+                        // DBG("checking Is copy sucess");
+
                     }
                     ++dst_row_idx;
                 }

@@ -36,8 +36,15 @@ namespace aisa
         rows_ = transpose ? src->ne[0] : src->ne[1];
 
         /* 4. __________________buffer 할당____________________ */
+
         const size_t elem_size = sizeof(T);
         const size_t row_bytes = static_cast<size_t>(cols_) * elem_size;
+
+        //more data allocation for DEQUANTIZE option.
+        if (src->type == GGML_TYPE_Q8_0 && DEQUANTIZE){
+            row_bytes *= 2;
+        }
+
         buf_bytes_ = row_bytes * static_cast<size_t>(rows_);
 
         if (buf_bytes_ == 0)
@@ -47,6 +54,14 @@ namespace aisa
         GGML_ASSERT(this->data_ != nullptr);
 
         stride_ = row_bytes / elem_size; // element 단위
+
+        //cheicking DEQUANTIZE cycle.
+        if (src->type == GGML_TYPE_Q8_0 && DEQUANTIZE){
+            T *dst_base = static_cast<T *>(this->data_)
+            dequantizeToFp16<T>(src, dst_base, src->stride, rows_, cols_);
+            check
+        }
+
 
         /* 5. _______________casting & 0-fill _________________ */
         uint64_t start, end;
@@ -100,7 +115,8 @@ namespace aisa
         }
         case GGML_TYPE_Q8_0:
         {
-            if (!transpose)
+
+            else if (!transpose)
                 q80_to_T_rowwise<T>(src, dst_base, stride_, this->rows_, this->cols_);
             else
                 q80_to_T_transposed<T>(src, dst_base, stride_, this->rows_, this->cols_);
