@@ -12,8 +12,9 @@
 #endif
 struct block_q8_0
 {
+    ggml_fp16_t d;
     int8_t qs[QK8_0]; // 우리가 추출할 대상
-    ggml_fp16_t d;    // 스케일(이번 작업에서는 폐기)
+    // 스케일(이번 작업에서는 폐기)
 };
 
 namespace aisa
@@ -178,7 +179,6 @@ namespace aisa
                     // DBG0("cols : %d", cols);
                     //  dst_row[c] = src(x=c, y=iy, z=iz, w=iw)
                     //  src(x=c) → block = c / 32, off = c % 32
-                    float changer = ggml_fp16_to_fp32(src_row_blocks->d);
                     for (int64_t c = 0; c < cols; ++c)
                     {
 
@@ -186,8 +186,11 @@ namespace aisa
                         // DBG0("C=%d", c);
                         const int64_t blk = c / QK8_0;
                         const int off = static_cast<int>(c % QK8_0);
-                        auto deq = src_row_blocks[blk].qs[off]*changer
-                        DBG("int = %d, float = %lf, ans = %.6f\n", src_row_blocks[blk].qs[off], changer, deq)
+                        float changer = ggml_fp16_to_fp32(src_row_blocks[blk].d);
+
+                        auto deq = src_row_blocks[blk].qs[off]*changer;
+                        if(c < 5);
+                            DBG("int = %d, float = %.6f, ans = %.6f\n", src_row_blocks[blk].qs[off], changer, deq);
                         dst_row[c] = ggml_fp32_to_fp16(deq);
                         // DBG("checking Is copy sucess");
 
