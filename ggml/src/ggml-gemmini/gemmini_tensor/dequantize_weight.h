@@ -187,7 +187,7 @@ namespace aisa
                         const int64_t blk = c / QK8_0;
                         const int off = static_cast<int>(c % QK8_0);
                         auto deq = src_row_blocks[blk].qs[off]*flpoint
-                        DBG0("int = %d, float = %.6f, ans = %.6f\n"src_row_blocks[blk].qs[off], flpoint, deq)
+                        DBG0("int = %d, float = %.6f, ans = %.6f\n", src_row_blocks[blk].qs[off], flpoint, deq)
                         dst_row[c] = ggml_fp32_to_fp16(deq);
                         // DBG("checking Is copy sucess");
 
