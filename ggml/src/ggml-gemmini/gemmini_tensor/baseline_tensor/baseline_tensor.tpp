@@ -40,14 +40,12 @@ namespace aisa
         /* 4. __________________buffer 할당____________________ */
 
         const size_t elem_size = sizeof(T);
+        size_t row_bytes = static_cast<size_t>(cols_) * elem_size;
 
         //more data allocation for DEQUANTIZE option.
-        if (src->type == GGML_TYPE_Q8_0 && DEQUANTIZE){
-            const size_t row_bytes = static_cast<size_t>(cols_) * elem_size *2;
+        if (src->type == GGML_TYPE_Q8_0 && DEQUANTIZE)
+            row_bytes = static_cast<size_t>(cols_) * elem_size *2;
 
-        }else{
-            const size_t row_bytes = static_cast<size_t>(cols_) * elem_size;
-        }
 
         buf_bytes_ = row_bytes * static_cast<size_t>(rows_);
 
@@ -61,7 +59,7 @@ namespace aisa
 
         //cheicking DEQUANTIZE cycle.
         if (src->type == GGML_TYPE_Q8_0 && DEQUANTIZE){
-            ggml_fp16 *dst_base = static_cast<ggml_fp16 *>(this->data_);
+            ggml_fp16_t *dst_base = static_cast<ggml_fp16_t *>(this->data_);
             dequantizeToFp16<T>(src, dst_base, stride_, rows_, cols_);
             float temp = ggml_fp32_to_fp16(dst_base[0]);
         }
