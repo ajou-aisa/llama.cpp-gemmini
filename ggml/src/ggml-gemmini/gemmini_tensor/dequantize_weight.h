@@ -178,7 +178,7 @@ namespace aisa
                     // DBG0("cols : %d", cols);
                     //  dst_row[c] = src(x=c, y=iy, z=iz, w=iw)
                     //  src(x=c) → block = c / 32, off = c % 32
-                    float flpoint = ggml_fp16_to_fp32(src_row_blocks->d);
+                    float changer = ggml_fp16_to_fp32(src_row_blocks->d);
                     for (int64_t c = 0; c < cols; ++c)
                     {
 
@@ -186,8 +186,8 @@ namespace aisa
                         // DBG0("C=%d", c);
                         const int64_t blk = c / QK8_0;
                         const int off = static_cast<int>(c % QK8_0);
-                        auto deq = src_row_blocks[blk].qs[off]*flpoint
-                        DBG0("int = %d, float = %.6f, ans = %.6f\n", src_row_blocks[blk].qs[off], flpoint, deq)
+                        auto deq = src_row_blocks[blk].qs[off]*changer
+                        DBG0("int = %d, float = %.6f, ans = %.6f\n", src_row_blocks[blk].qs[off], changer, deq)
                         dst_row[c] = ggml_fp32_to_fp16(deq);
                         // DBG("checking Is copy sucess");
 
