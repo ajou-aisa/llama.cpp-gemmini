@@ -59,9 +59,9 @@ namespace aisa
 
         //cheicking DEQUANTIZE cycle.
         if (src->type == GGML_TYPE_Q8_0 && DEQUANTIZE){
-            ggml_fp16_t *dst_base = static_cast<ggml_fp16_t *>(this->data_);
-            dequantizeToFp16<T>(src, dst_base, stride_, rows_, cols_);
-            float temp = ggml_fp32_to_fp16(dst_base[0]);
+            ggml_fp16_t *dst_base = reinterpret_cast<ggml_fp16_t *>(this->data_);
+            dequantizeToFp16<ggml_fp16_t>(src, dst_base, stride_/2, rows_, cols_);
+            T * change_base = reinterpret_cast<T*>(dst_base);
         }
 
 

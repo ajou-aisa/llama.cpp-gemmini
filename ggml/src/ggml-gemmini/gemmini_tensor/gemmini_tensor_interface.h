@@ -1,6 +1,6 @@
 #pragma once
 
-#if defined(USE_GEMMINI_BENCH_TENSOR)
+#if USE_GEMMINI_BENCH_TENSOR
     // Target(Bench) Tensor 사용
     #include "bench_tensor/bench_tensor.h"
     namespace aisa {
