@@ -1838,10 +1838,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_MUL_MAT:
             {
-                uint64_t t0 = read_cycles();
+                // uint64_t t0 = read_cycles();
                 ggml_compute_forward_mul_mat(params, tensor);
-                uint64_t t1 = read_cycles();
-                printf("[layer=%s][mul_mat] start = %lu, end = %lu, elapsed = %lu\n", labelFromWeight(tensor->name), t0, t1, t1 - t0);
+                // uint64_t t1 = read_cycles();
+                // printf("[layer=%s][mul_mat] start = %lu, end = %lu, elapsed = %lu\n", labelFromWeight(tensor->name), t0, t1, t1 - t0);
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
