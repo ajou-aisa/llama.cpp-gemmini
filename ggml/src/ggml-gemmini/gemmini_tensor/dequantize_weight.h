@@ -152,7 +152,7 @@ namespace aisa
         const int64_t nx_src = src->ne[0];                               // 원 src의 x 길이
         GGML_ASSERT(nx_src % QK8_0 == 0);
         const int64_t nblk_x = nx_src / QK8_0;
-        const int64_t ny = src->ne[0] ? src->ne[0] : 1;
+        const int64_t ny = src->ne[1] ? src->ne[1] : 1;
         const int64_t nz = src->ne[2] ? src->ne[2] : 1;
         const int64_t nw = src->ne[3] ? src->ne[3] : 1;
         // DBG0("rows : %d ny : %d, nz: %d, nw %d\n",rows, ny, nz, nw);
@@ -179,7 +179,7 @@ namespace aisa
                     // DBG0("cols : %d", cols);
                     //  dst_row[c] = src(x=c, y=iy, z=iz, w=iw)
                     //  src(x=c) → block = c / 32, off = c % 32
-                    for (int64_t c = 0; c < cols; ++c)
+                    for (int64_t c = 0; c < rows; ++c)
                     {
 
                         // if (iy == 824)
@@ -199,6 +199,6 @@ namespace aisa
                 }
             }
         }
-        GGML_ASSERT(dst_row_idx == rows);
+        GGML_ASSERT(dst_row_idx == cols);
     }
 }
