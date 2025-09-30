@@ -57,16 +57,22 @@ namespace aisa
 
         stride_ = row_bytes / elem_size; // element 단위
 
+        uint64_t start, end;
+
         //cheicking DEQUANTIZE cycle.
         if (src->type == GGML_TYPE_Q8_0 && DEQUANTIZE){
+            start = read_cycles();
             ggml_fp16_t *dst_base = reinterpret_cast<ggml_fp16_t *>(this->data_);
             dequantizeToFp16<ggml_fp16_t>(src, dst_base, rows_, rows_, cols_);
+            end = read_cycles();
             T * change_base = reinterpret_cast<T*>(dst_base);
+            printf("[dequantizing cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
+
         }
 
 
         /* 5. _______________casting & 0-fill _________________ */
-        uint64_t start, end;
+
         start = read_cycles();
         if (acc)
             std::memset(data_, 0, buf_bytes_);
