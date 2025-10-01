@@ -62,10 +62,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     end = read_cycles();
     printf("[layer=%s][preprocessArgument] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
-
-    DBG("calling tiled_matmul_auto: ptrA=%p ptrB=%p ptrD=%p ptrC=%p\n",
-        (void *)tA.get(), (void *)tB.get(), (void *)bias_data, (void *)tC.get());
-
     printf("[layer=%s]", layer); // tiled_matmul_auto 내부 사이클 출력에 layer 추가
     /* __ 5. Gemmini tiled_matmul_auto 호출 __ */
     tiled_matmul_auto(I, J, K,
