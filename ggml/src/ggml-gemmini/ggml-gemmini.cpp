@@ -20,7 +20,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 /* ________________ Test: 테스트 호출용 ___________________ */
 #if TEST
     static_assert(TRANSPOSE_B == 1, "This test assumes physical-transposed B (KxJ).");
-    ggml_gemmini_test(ctx, dst, bias);
+    ggml_gemmini_test(ctx, dst);
     return;
 #endif
 
