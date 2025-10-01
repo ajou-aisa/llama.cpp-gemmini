@@ -225,10 +225,15 @@ namespace aisa
             }
         };
 
-        // 4. 원본 ggml 텐서의 슬라이스 뷰를 덤프
-        const int sA_view = (int)(A_slice->nb[1] / sizeof(int8_t));
-        const int sB_view = (int)(B_slice->nb[1] / sizeof(int8_t));
-        const int sC_view = (int)(C_slice->nb[1] / sizeof(float));
+        auto elems_stride = [](const ggml_tensor *t) -> int
+        {
+            GGML_ASSERT(t && t->nb[0] > 0);
+            return (int)(t->nb[1] / t->nb[0]);
+        };
+
+        const int sA_view = elems_stride(A_slice);
+        const int sB_view = elems_stride(B_slice);
+        const int sC_view = elems_stride(C_slice);
 
         dump_any("Original A Slice (from src1)", A_slice, vI, vK, sA_view);
         dump_any("Original B Slice (from src0)", B_slice, vK, vJ, sB_view);
