@@ -56,9 +56,9 @@ namespace aisa
         I_ = (int)dst_->ne[1];
         K_ = (int)src1_->ne[1];
 
-        GGML_ASSERT((int)src0_->ne[1] == J_);
+        GGML_ASSERT((int)src0_->ne[0] == J_);
         GGML_ASSERT((int)src1_->ne[1] == I_);
-        GGML_ASSERT((int)src0_->ne[0] == K_);
+        GGML_ASSERT((int)src0_->ne[1] == K_);
     }
 
     void GemminiTestbench::debugShapes()
