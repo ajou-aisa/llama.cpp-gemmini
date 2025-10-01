@@ -1,6 +1,7 @@
 // gemmini_tensor/bench_tensor/bench_tensor.tpp
 #include "include/gemmini.h"
 #include "bench_tensor.h"
+#include "../tensor_cache_key.h"
 #include <memory>
 #include <cstring>
 
