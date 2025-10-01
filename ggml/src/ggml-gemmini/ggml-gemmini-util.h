@@ -45,13 +45,32 @@ namespace aisa {
 #include "gemmini_tensor/baseline_tensor/baseline_tensor.h"
 #include "gemmini_tensor/bench_tensor/bench_tensor.h"
 
+// TensorCacheKey 구조체 
+struct TensorCacheKey {
+    const ggml_tensor* ptr;
+    bool transpose;
+    bool acc;
+    
+    // map의 키로 사용하기 위한 비교 연산자
+    bool operator<(const TensorCacheKey& other) const {
+        if (ptr != other.ptr) return ptr < other.ptr;
+        if (transpose != other.transpose) return transpose < other.transpose;
+        return acc < other.acc;
+    }
+    
+    // 디버깅용 equality 연산자 (선택사항)
+    bool operator==(const TensorCacheKey& other) const {
+        return ptr == other.ptr && transpose == other.transpose && acc == other.acc;
+    }
+};
+
 struct ggml_backend_gemmini_context
 {
     int n_threads = GGML_DEFAULT_N_THREADS;
     std::unique_ptr<char[]> work_data;
     size_t work_size = 0;
     std::map<ggml_tensor *, ggml_tensor *> bias_map;
-    std::map<const ggml_tensor *, std::unique_ptr<aisa::BenchTensor<int8_t>>> tensor_cache;
+    std::map<TensorCacheKey, std::unique_ptr<aisa::BenchTensor<int8_t>>> tensor_cache;
     std::vector<std::unique_ptr<aisa::BaselineTensor<int8_t>>> temp_tensors;
 #ifndef GGML_USE_OPENMP
     std::vector<std::future<void>> tasks;
