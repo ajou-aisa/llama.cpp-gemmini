@@ -41,28 +41,10 @@ namespace aisa {
     constexpr size_t GEMMINI_ALIGN = 16; // 16-byte align
 }
 
+#include "gemmini_tensor/tensor_cache_key.h"
 #include "gemmini_tensor/dequantize_weight.h"
 #include "gemmini_tensor/baseline_tensor/baseline_tensor.h"
 #include "gemmini_tensor/bench_tensor/bench_tensor.h"
-
-// TensorCacheKey 구조체 
-struct TensorCacheKey {
-    const ggml_tensor* ptr;
-    bool transpose;
-    bool acc;
-    
-    // map의 키로 사용하기 위한 비교 연산자
-    bool operator<(const TensorCacheKey& other) const {
-        if (ptr != other.ptr) return ptr < other.ptr;
-        if (transpose != other.transpose) return transpose < other.transpose;
-        return acc < other.acc;
-    }
-    
-    // 디버깅용 equality 연산자 (선택사항)
-    bool operator==(const TensorCacheKey& other) const {
-        return ptr == other.ptr && transpose == other.transpose && acc == other.acc;
-    }
-};
 
 struct ggml_backend_gemmini_context
 {
