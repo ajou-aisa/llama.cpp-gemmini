@@ -34,9 +34,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     start = read_cycles();
     /* _____________________________ 1. Gemmini용 텐서 생성 _____________________________ */
-    const auto* tA = GemminiTensor<int8_t>::getOrCreate(ctx, src1, ".i8"); // IxK (1xK)
+    const auto* tA = GemminiTensor<int8_t>::getOrCreateTransient(ctx, src1, ".i8", false); // IxK (1xK)
     const auto* tB = GemminiTensor<int8_t>::getOrCreate(ctx, src0, ".i8", false, TRANSPOSE_B);  // KxJ, 전치
-    const auto* tC = GemminiTensor<int8_t>::getOrCreate(ctx, dst, ".i8_out", true); // IxJ (1xJ)
+    const auto* tC = GemminiTensor<int8_t>::getOrCreateTransient(ctx, dst, ".i8_out", false); // IxJ (1xJ)
     
     end = read_cycles();
     printf("[layer=%s][generateTensor] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
