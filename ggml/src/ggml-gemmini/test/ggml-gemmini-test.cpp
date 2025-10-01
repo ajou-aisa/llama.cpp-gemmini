@@ -77,17 +77,55 @@ namespace aisa
 
     void GemminiTestbench::createTensors()
     {
+        DBG0("[createTensors] Creating GemminiTensors...\n");
         tA_ = aisa::GemminiTensor<int8_t>::getOrCreate(ctx_, src1_, ".i8_A", false, false);
         tB_ = aisa::GemminiTensor<int8_t>::getOrCreate(ctx_, src0_, ".i8_B", false, TRANSPOSE_B); // 항상 KxJ로 간주
         tC_ = aisa::GemminiTensor<int8_t>::getOrCreate(ctx_, dst_, ".i8_C", true, false);
 
-        // 생성된 텐서들의 shape 검증
-        GGML_ASSERT(tA_->getRows() == (size_t)I_);
+        DBG0("[createTensors] Validating tensor dimensions...\n");
+
+        // tA 검증 (I x K)
+        if (tA_->getRows() != (size_t)I_)
+        {
+            DBG0("[ERROR] tA dimension mismatch!\n");
+            DBG0("  Source tensor (src1): ne=[%lld,%lld] (K x I in storage)\n", 
+                 (long long)src1_->ne[0], (long long)src1_->ne[1]);
+            DBG0("  Expected logical dims: I=%d, K=%d => tA should be %dx%d\n", I_, K_, I_, K_);
+            DBG0("  Actual tA dims: %zux%zu\n", tA_->getRows(), tA_->getCols());
+            DBG0("  transpose_A=%s\n", "false");
+            GGML_ASSERT(false);
+        }
         GGML_ASSERT(tA_->getCols() == (size_t)K_);
-        GGML_ASSERT(tB_->getRows() == (size_t)K_);
+        
+        // tB 검증 (K x J)
+        if (tB_->getRows() != (size_t)K_)
+        {
+            DBG0("[ERROR] tB dimension mismatch!\n");
+            DBG0("  Source tensor (src0): ne=[%lld,%lld] (K x J in storage)\n", 
+                 (long long)src0_->ne[0], (long long)src0_->ne[1]);
+            DBG0("  Expected logical dims: J=%d, K=%d => tB should be %dx%d\n", J_, K_, K_, J_);
+            DBG0("  Actual tB dims: %zux%zu\n", tB_->getRows(), tB_->getCols());
+            DBG0("  transpose_B=%s\n", TRANSPOSE_B ? "true" : "false");
+            GGML_ASSERT(false);
+        }
         GGML_ASSERT(tB_->getCols() == (size_t)J_);
-        GGML_ASSERT(tC_->getRows() == (size_t)I_);
+        
+        // tC 검증 (I x J)
+        if (tC_->getRows() != (size_t)I_)
+        {
+            DBG0("[ERROR] tC dimension mismatch!\n");
+            DBG0("  Source tensor (dst): ne=[%lld,%lld] (J x I in storage)\n", 
+                 (long long)dst_->ne[0], (long long)dst_->ne[1]);
+            DBG0("  Expected logical dims: I=%d, J=%d => tC should be %dx%d\n", I_, J_, I_, J_);
+            DBG0("  Actual tC dims: %zux%zu\n", tC_->getRows(), tC_->getCols());
+            GGML_ASSERT(false);
+        }
         GGML_ASSERT(tC_->getCols() == (size_t)J_);
+        
+        DBG0("[createTensors] All tensor dimensions validated successfully.\n");
+        DBG0("  tA: %zux%zu (I=%d x K=%d) ✓\n", tA_->getRows(), tA_->getCols(), I_, K_);
+        DBG0("  tB: %zux%zu (K=%d x J=%d) ✓\n", tB_->getRows(), tB_->getCols(), K_, J_);
+        DBG0("  tC: %zux%zu (I=%d x J=%d) ✓\n", tC_->getRows(), tC_->getCols(), I_, J_);
     }
 
     void GemminiTestbench::prepareBias()
