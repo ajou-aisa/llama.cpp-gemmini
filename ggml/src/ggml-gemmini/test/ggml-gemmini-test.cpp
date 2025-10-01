@@ -54,11 +54,11 @@ namespace aisa
         DBG0("[setUpDimensions]...\n");
         J_ = (int)dst_->ne[0];
         I_ = (int)dst_->ne[1];
-        K_ = (int)src1_->ne[1];
+        K_ = (int)src1_->ne[0];
 
-        GGML_ASSERT((int)src0_->ne[0] == J_);
+        GGML_ASSERT((int)src0_->ne[1] == J_);
         GGML_ASSERT((int)src1_->ne[1] == I_);
-        GGML_ASSERT((int)src0_->ne[1] == K_);
+        GGML_ASSERT((int)src0_->ne[0] == K_);
     }
 
     void GemminiTestbench::debugShapes()
@@ -186,10 +186,19 @@ namespace aisa
         const int vK = std::min(K_, SLICE_K);
         const int vJ = std::min(J_, SLICE_J);
 
+        // 1) 로컬 뷰 컨텍스트 (메타데이터만, 데이터는 부모 공유)
+        ggml_init_params ip = {};
+        ip.mem_size  = 256 * 1024;   // 텐서 노드 3~6개면 충분 (필요시 512KB로)
+        ip.mem_buffer= nullptr;
+        ip.no_alloc  = true;
+
+        ggml_context* vctx = ggml_init(ip);
+        GGML_ASSERT(vctx);
+        
         // 2. 클래스 멤버 변수(ctx_, src1_, src0_, dst_)를 사용하여 ggml 뷰 생성
-        ggml_tensor *A_slice = ggml_view_2d(ctx_->tmp_ctx, const_cast<ggml_tensor *>(src1_), vK, vI, src1_->nb[1], 0);
-        ggml_tensor *B_slice = ggml_view_2d(ctx_->tmp_ctx, const_cast<ggml_tensor *>(src0_), vJ, vK, src0_->nb[1], 0);
-        ggml_tensor *C_slice = ggml_view_2d(ctx_->tmp_ctx, dst_, vJ, vI, dst_->nb[1], 0);
+        ggml_tensor *A_slice = ggml_view_2d(vctx, const_cast<ggml_tensor *>(src1_), vK, vI, src1_->nb[1], 0);
+        ggml_tensor *B_slice = ggml_view_2d(vctx, const_cast<ggml_tensor *>(src0_), vJ, vK, src0_->nb[1], 0);
+        ggml_tensor *C_slice = ggml_view_2d(vctx, dst_, vJ, vI, dst_->nb[1], 0);
 
         DBG0("[SLICE] View Dims: vI=%d, vK=%d, vJ=%d | Logical Dims: I=%d, K=%d, J=%d\n", vI, vK, vJ, I_, K_, J_);
 
