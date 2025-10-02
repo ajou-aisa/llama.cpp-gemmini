@@ -22,6 +22,14 @@ namespace aisa
                                               bool acc = false,
                                               bool transpose = false);
 
+        /* Static Polymorphism용 추가
+         * BenchTensor와 인터페이스 통일
+         * 구현은 단순히 getOrCreate 호출 (BaselineTensor는 캐싱 안 함) */
+        static BaselineTensor<T> *getOrCreateTransient(ggml_backend_gemmini_context *ctx,
+                                                        const ggml_tensor *src,
+                                                        const char *suffix = ".base",
+                                                        bool transpose = false);
+
         // 이동 전용 구현
         BaselineTensor(BaselineTensor &&) noexcept;            // 이동 생성자
         BaselineTensor &operator=(BaselineTensor &&) noexcept; // 이동 대입

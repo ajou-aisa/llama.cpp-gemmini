@@ -1,3 +1,4 @@
+// gemmini_tensor/bench_tensor/bench_tensor.h
 #pragma once
 
 #include <cstdint>
@@ -8,6 +9,7 @@
 
 #include "ggml.h"
 
+// Forward declarations
 struct ggml_backend_gemmini_context;
 
 namespace aisa
@@ -16,11 +18,22 @@ namespace aisa
     class BenchTensor
     {
     public:
+        /* Weight용: 완전 캐싱 (값 포함)
+         * 포인터 + dimension + transpose 기반 캐싱
+         * Weight는 고정값(0-fill)이므로 한번 생성 후 계속 재사용 */
         static BenchTensor<T> *getOrCreate(ggml_backend_gemmini_context *ctx,
                                            const ggml_tensor *src,
                                            const char *suffix = ".bench",
                                            bool acc = false,
                                            bool transpose = false);
+
+        /* Activation/Output용: 버퍼만 재사용
+         * dimension 기반으로 버퍼 풀에서 재사용
+         * 값은 매번 quantize(Activation) 또는 Gemmini 연산(Output)으로 갱신 */
+        static BenchTensor<T> *getOrCreateTransient(ggml_backend_gemmini_context *ctx,
+                                                     const ggml_tensor *src,
+                                                     const char *suffix = ".transient",
+                                                     bool transpose = false);
 
         // 이동 전용 구현
         BenchTensor(BenchTensor &&) noexcept;            // 이동 생성자
