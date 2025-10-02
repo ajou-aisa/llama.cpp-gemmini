@@ -1,29 +1,77 @@
 // gemmini_tensor/bench_tensor/bench_tensor.tpp
 #include "include/gemmini.h"
 #include "bench_tensor.h"
+#include "../tensor_cache_key.h"
+#include "../transient_key.h"
 #include <memory>
 #include <cstring>
 
 namespace aisa
 {
+    // Weight용: 완전 캐싱
     template <typename T>
     BenchTensor<T> *BenchTensor<T>::getOrCreate(ggml_backend_gemmini_context *ctx,
-                                                       const ggml_tensor *src,
-                                                       const char *suffix,
-                                                       bool acc,
-                                                       bool transpose)
+                                                const ggml_tensor *src,
+                                                const char *suffix,
+                                                bool acc,
+                                                bool transpose)
     {
-        // 1. cache에서 이미 생성된 tensor 확인
-        auto it = ctx->tensor_cache.find(src);
-        if (it != ctx->tensor_cache.end())
-            return it->second.get(); // hit
+        // 캐시 키 생성 (포인터, dimension, transpose, acc)
+        TensorCacheKey key{src, src->ne[0], src->ne[1], transpose, acc};
 
-        // miss
-        auto new_tensor = std::unique_ptr<BenchTensor<T>>(new BenchTensor<T>(src, suffix, acc, transpose));
-        BenchTensor<T> *ptr = new_tensor.get(); 
+        // weight_cache 사용
+        auto it = ctx->weight_cache.find(key);
+        if (it != ctx->weight_cache.end())
+        {
+#if DEBUG
+            DBG0("[WEIGHT CACHE HIT] ptr=%p, ne=[%lld,%lld]\n",
+                 (void *)src, (long long)src->ne[0], (long long)src->ne[1]);
+#endif
+            return it->second.get();
+        }
 
-        // 2. move
-        ctx->tensor_cache[src] = std::move(new_tensor);
+#if DEBUG
+        DBG0("[WEIGHT CACHE MISS] Creating: ptr=%p, ne=[%lld,%lld]\n",
+             (void *)src, (long long)src->ne[0], (long long)src->ne[1]);
+#endif
+
+        auto new_tensor = std::unique_ptr<BenchTensor<T>>(
+            new BenchTensor<T>(src, suffix, acc, transpose));
+        BenchTensor<T> *ptr = new_tensor.get();
+        ctx->weight_cache[key] = std::move(new_tensor);
+        return ptr;
+    }
+
+    // Activation/Output용: 버퍼만 재사용
+    template <typename T>
+    BenchTensor<T> *BenchTensor<T>::getOrCreateTransient(ggml_backend_gemmini_context *ctx,
+                                                         const ggml_tensor *src,
+                                                         const char *suffix,
+                                                         bool transpose)
+    {
+        int64_t rows = transpose ? src->ne[0] : src->ne[1];
+        int64_t cols = transpose ? src->ne[1] : src->ne[0];
+        TransientKey key{rows, cols};
+
+        auto it = ctx->transient_pool.find(key);
+        if (it != ctx->transient_pool.end())
+        {
+#if DEBUG
+            DBG0("[TRANSIENT POOL HIT] dims=%lldx%lld\n",
+                 (long long)rows, (long long)cols);
+#endif
+            return it->second.get();
+        }
+
+#if DEBUG
+        DBG0("[TRANSIENT POOL MISS] Creating buffer: %lldx%lld\n",
+             (long long)rows, (long long)cols);
+#endif
+
+        auto new_tensor = std::unique_ptr<BenchTensor<T>>(
+            new BenchTensor<T>(src, suffix, false, transpose));
+        BenchTensor<T> *ptr = new_tensor.get();
+        ctx->transient_pool[key] = std::move(new_tensor);
         return ptr;
     }
 

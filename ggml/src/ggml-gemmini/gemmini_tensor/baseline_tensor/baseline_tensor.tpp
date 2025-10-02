@@ -25,6 +25,20 @@ namespace aisa
         return ptr;
     }
 
+    /* Static Polymorphism용 추가
+     * BenchTensor와 인터페이스 통일을 위해 추가
+     * BaselineTensor는 캐싱 구분이 불필요하므로 단순히 getOrCreate 호출 */
+    template <typename T>
+    BaselineTensor<T> *BaselineTensor<T>::getOrCreateTransient(
+        ggml_backend_gemmini_context *ctx,
+        const ggml_tensor *src,
+        const char *suffix,
+        bool transpose)
+    {
+        // BaselineTensor는 캐싱하지 않으므로 getOrCreate와 동일
+        return getOrCreate(ctx, src, suffix, false, transpose);
+    }
+
     template <typename T>
     BaselineTensor<T>::BaselineTensor(const ggml_tensor *src,
                                       const char *suffix,
