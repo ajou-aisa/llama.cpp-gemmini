@@ -69,11 +69,85 @@ namespace aisa
                   [](const auto &a, const auto &b)
                   { return a.first > b.first; });
 
-        // 정렬된 값만 추출
-        DBG0("[sortActivation]...\n");
-        DBG0("[");
+        // 통계 계산
+        float max_val = indexed_data[0].first;
+        float min_val = indexed_data.back().first;
+
+        double sum = 0.0;
         for (const auto &pair : indexed_data)
-            DBG0("%f ", pair.first);
+            sum += pair.first;
+        float mean = sum / elem_count;
+
+        double variance = 0.0;
+        for (const auto &pair : indexed_data)
+            variance += (pair.first - mean) * (pair.first - mean);
+        float stddev = std::sqrt(variance / elem_count);
+
+        DBG0("[sortActivation] Stats:\n");
+        DBG0("  Total elements: %zu\n", elem_count);
+        DBG0("  Max: %.6f, Min: %.6f\n", max_val, min_val);
+        DBG0("  Mean: %.6f, StdDev: %.6f\n", mean, stddev);
+        DBG0("  Mean+2σ: %.6f\n", mean + 2.0f * stddev);
+
+        // 후보 구간별 분석 (상위 1%, 3%, 5%, 10%)
+        const std::vector<float> percentiles = {0.01f, 0.03f, 0.05f, 0.10f, 0.20f};
+        DBG0("\n[Outlier Candidate Regions]\n");
+
+        for (float p : percentiles)
+        {
+            size_t idx = static_cast<size_t>(elem_count * p);
+            if (idx >= elem_count)
+                idx = elem_count - 1;
+
+            float threshold = indexed_data[idx].first;
+            DBG0("  Top %.1f%% (α=%zu): threshold >= %.6f\n",
+                 p * 100, idx + 1, threshold);
+        }
+
+        // 급격한 감소 지점 찾기 (elbow point)
+        DBG0("\n[Sharp Drop Points]\n");
+        std::vector<std::tuple<size_t, float, float, float>> drops;
+
+        for (size_t i = 0; i < std::min(elem_count - 1, size_t(1000)); ++i)
+        {
+            float curr = indexed_data[i].first;
+            float next = indexed_data[i + 1].first;
+
+            if (curr > 0)
+            {
+                float drop = curr - next;
+                float drop_rate = drop / curr;
+
+                // 10% 이상 급감 지점 기록
+                if (drop_rate > 0.10f)
+                {
+                    drops.push_back({i, curr, next, drop_rate});
+                }
+            }
+        }
+
+        // 상위 10개 급감 지점 출력
+        std::sort(drops.begin(), drops.end(),
+                  [](const auto &a, const auto &b)
+                  {
+                      return std::get<3>(a) > std::get<3>(b);
+                  });
+
+        for (size_t i = 0; i < std::min(drops.size(), size_t(10)); ++i)
+        {
+            auto [idx, curr, next, rate] = drops[i];
+            DBG0("  Rank %zu at index %zu: %.6f->%.6f (drop: %.2f%%)\n",
+                 i + 1, idx, curr, next, rate * 100);
+        }
+
+        // 상위 100개 값 출력 (시각화용)
+        DBG0("\n[Top 100 Values]\n[");
+        for (size_t i = 0; i < std::min(elem_count, size_t(100)); ++i)
+        {
+            DBG0("%.6f ", indexed_data[i].first);
+            if ((i + 1) % 10 == 0)
+                DBG0("\n ");
+        }
         DBG0("]\n");
     }
 
