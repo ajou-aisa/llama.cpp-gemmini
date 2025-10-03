@@ -80,6 +80,7 @@ namespace aisa
         void runGemminiComputation();
         void compareAndReport();
         void dequantizeAndFinalize();
+        void sortActivation();
 
 
         // 멤버 변수들
