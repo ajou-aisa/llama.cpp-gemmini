@@ -49,6 +49,31 @@ namespace aisa
             dequantizeAndFinalize();
     }
 
+    void GemminiTestbench::sortActivation()
+    {
+        const size_t elem_count = src1_->ne[0] * src1_->ne[1];
+        const float *src_data = static_cast<const float *>(src1_->data);
+
+        // 값과 인덱스 쌍으로 정렬
+        std::vector<std::pair<float, size_t>> indexed_data(elem_count);
+        for (size_t i = 0; i < elem_count; ++i)
+        {
+            indexed_data[i] = {std::abs(src_data[i]), i};
+        }
+
+        // 내림차순 정렬 (값 기준)
+        std::sort(indexed_data.begin(), indexed_data.end(),
+                  [](const auto &a, const auto &b)
+                  { return a.first > b.first; });
+
+        // 정렬된 값만 추출
+        DBG0("[sortActivation]...\n");
+        DBG0("[");
+        for (const auto &pair : indexed_data)
+            DBG("%f ", pair.first);
+        DBG0("]\n");
+    }
+
     void GemminiTestbench::setUpDimensions()
     {
         DBG0("[setUpDimensions]...\n");
