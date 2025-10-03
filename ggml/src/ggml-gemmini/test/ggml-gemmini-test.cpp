@@ -73,7 +73,7 @@ namespace aisa
         DBG0("[sortActivation]...\n");
         DBG0("[");
         for (const auto &pair : indexed_data)
-            DBG("%f ", pair.first);
+            DBG0("%f ", pair.first);
         DBG0("]\n");
     }
 
