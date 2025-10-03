@@ -16,6 +16,9 @@
 #ifndef TEST_SHAPE
 #define TEST_SHAPE 0
 #endif
+#ifndef TEST_SORT
+#define TEST_SORT 0
+#endif
 #ifndef TEST_TYPE
 #define TEST_TYPE 0
 #endif
@@ -56,6 +59,7 @@ namespace aisa
     {
         bool test_shape = TEST_SHAPE;
         bool test_slice = TEST_SLICE;
+        bool test_sort = TEST_SORT;
         bool run_cpu_ref = TEST_CPU_REF;
         bool run_gemmini = TEST_GEMMINI;
         bool compare_results = TEST_CPU_REF && TEST_GEMMINI && TEST_COMPARE;

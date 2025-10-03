@@ -32,6 +32,9 @@ namespace aisa
         if (config_.test_shape)
             debugShapes();
 
+        if (config_.test_sort)
+            sortActivation();
+
         createTensors();
 
         if (config_.test_slice)
