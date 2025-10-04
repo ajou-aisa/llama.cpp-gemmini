@@ -36,7 +36,7 @@ namespace aisa
 #endif
 
         auto new_tensor = std::unique_ptr<BenchTensor<T>>(
-            new BenchTensor<T>(src, suffix, acc, transpose));
+            new BenchTensor<T>(nullptr, src, suffix, acc, transpose));
         BenchTensor<T> *ptr = new_tensor.get();
         ctx->weight_cache[key] = std::move(new_tensor);
         return ptr;
@@ -70,7 +70,7 @@ namespace aisa
 #endif
 
         auto new_tensor = std::unique_ptr<BenchTensor<T>>(
-            new BenchTensor<T>(src, suffix, false, transpose));
+            new BenchTensor<T>(nullptr, src, suffix, false, transpose));
         BenchTensor<T> *ptr = new_tensor.get();
         ctx->transient_pool[key] = std::move(new_tensor);
         return ptr;
@@ -119,6 +119,11 @@ namespace aisa
                 std::memset(data_, 0, buf_bytes_);
                 break;
             }
+            default:
+            {
+                std::memset(data_, 0, buf_bytes_);
+                break;
+            }
             }
         else
             std::memset(data_, 0, buf_bytes_);
@@ -130,10 +135,11 @@ namespace aisa
             return;
         
         int8_t *dst = static_cast<int8_t *>(data_);
+        const float* srcf = static_cast<const float*>(src->data);
         const size_t N = static_cast<size_t>(rows_) * static_cast<size_t>(cols_);
 
-        for (int i=0; i<N; i++) {
-            const float x = src[i];
+        for (size_t i=0; i < N; i++) {
+            const float x = srcf[i];
             int xhat = static_cast<int>(std::lrintf(x / SCALE));
             xhat = std::max(-127, std::min(127, xhat));
             dst[i] = static_cast<int8_t>(xhat);
