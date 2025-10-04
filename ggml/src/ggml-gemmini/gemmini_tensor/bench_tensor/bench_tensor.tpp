@@ -45,6 +45,7 @@ namespace aisa
     // Activation/Output용: 버퍼만 재사용
     template <typename T>
     BenchTensor<T> *BenchTensor<T>::getOrCreateTransient(ggml_backend_gemmini_context *ctx,
+                                                         const char *layer,
                                                          const ggml_tensor *src,
                                                          const char *suffix,
                                                          bool transpose)
@@ -76,7 +77,8 @@ namespace aisa
     }
 
     template <typename T>
-    BenchTensor<T>::BenchTensor(const ggml_tensor *src,
+    BenchTensor<T>::BenchTensor(const char *layer,
+                                const ggml_tensor *src,
                                 const char *suffix,
                                 bool acc,
                                 bool transpose)
@@ -101,7 +103,41 @@ namespace aisa
         stride_ = row_bytes / elem_size;
 
         /* 5. _______________ 0-fill _________________ */
-        std::memset(data_, 0, buf_bytes_);
+        if (!acc)
+            switch (src->type)
+            {
+            case GGML_TYPE_F32:
+            {
+                uint64_t start =read_cycles();
+                quantizeActivation(src);
+                uint64_t end = read_cycles();
+                printf("[layer=%s][quantizeActivation] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
+                break;
+            }
+            case GGML_TYPE_Q8_0:
+            {
+                std::memset(data_, 0, buf_bytes_);
+                break;
+            }
+            }
+        else
+            std::memset(data_, 0, buf_bytes_);
+    }
+
+    template <typename T>
+    void BenchTensor<T>::quantizeActivation(const ggml_tensor *src) {
+        if (src->type != GGML_TYPE_F32)
+            return;
+        
+        int8_t *dst = static_cast<int8_t *>(data_);
+        const size_t N = static_cast<size_t>(rows_) * static_cast<size_t>(cols_);
+
+        for (int i=0; i<N; i++) {
+            const float x = src[i];
+            int xhat = static_cast<int>(std::lrintf(x / SCALE));
+            xhat = std::max(-127, std::min(127, xhat));
+            dst[i] = static_cast<int8_t>(xhat);
+        }
     }
 
     template <typename T>

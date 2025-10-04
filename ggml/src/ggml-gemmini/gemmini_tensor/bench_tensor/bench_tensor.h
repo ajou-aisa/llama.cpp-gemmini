@@ -9,6 +9,8 @@
 
 #include "ggml.h"
 
+#define SCALE 0.002441f
+
 // Forward declarations
 struct ggml_backend_gemmini_context;
 
@@ -31,9 +33,10 @@ namespace aisa
          * dimension 기반으로 버퍼 풀에서 재사용
          * 값은 매번 quantize(Activation) 또는 Gemmini 연산(Output)으로 갱신 */
         static BenchTensor<T> *getOrCreateTransient(ggml_backend_gemmini_context *ctx,
-                                                     const ggml_tensor *src,
-                                                     const char *suffix = ".transient",
-                                                     bool transpose = false);
+                                                    const char *layer,
+                                                    const ggml_tensor *src,
+                                                    const char *suffix = ".transient",
+                                                    bool transpose = false);
 
         // 이동 전용 구현
         BenchTensor(BenchTensor &&) noexcept;            // 이동 생성자
@@ -57,11 +60,14 @@ namespace aisa
         ~BenchTensor() { freeBuffer(); }
 
     private:
-        BenchTensor(const ggml_tensor *src,
+        BenchTensor(const char* layer,
+                    const ggml_tensor *src,
                     const char *suffix = ".bench",
                     bool acc = false,
                     bool transpose = false);
         void freeBuffer();
+
+        void quantizeActivation(const ggml_tensor *src);
 
         std::string name_;
         const ggml_type type_;

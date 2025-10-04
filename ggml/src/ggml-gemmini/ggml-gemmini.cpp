@@ -5,6 +5,7 @@
 #include "include/gemmini.h"
 #include "labeling/label.h"
 #include "test/ggml-gemmini-test.h"
+#include "error_compensation/activation_DEC.h"
 
 using namespace aisa;
 
@@ -32,14 +33,11 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     const char *w_name = (src0 && src0->name) ? src0->name : ""; // weight name
     const char *layer = labelFromWeight(w_name); // layer 이름 추출
 
-    start = read_cycles();
-    /* _____________________________ 1. Gemmini용 텐서 생성 _____________________________ */
-    const auto* tA = GemminiTensor<int8_t>::getOrCreateTransient(ctx, src1, ".i8", false); // IxK (1xK)
-    const auto* tB = GemminiTensor<int8_t>::getOrCreate(ctx, src0, ".i8", false, TRANSPOSE_B);  // KxJ, 전치
-    const auto* tC = GemminiTensor<int8_t>::getOrCreateTransient(ctx, dst, ".i8_out", false); // IxJ (1xJ)
     
-    end = read_cycles();
-    printf("[layer=%s][generateTensor] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
+    /* _____________________________ 1. Gemmini용 텐서 생성 _____________________________ */
+    const auto* tA = GemminiTensor<int8_t>::getOrCreateTransient(ctx, layer, src1, ".i8", false); // IxK (1xK)
+    const auto* tB = GemminiTensor<int8_t>::getOrCreate(ctx, src0, ".i8", false, TRANSPOSE_B);  // KxJ, 전치
+    const auto* tC = GemminiTensor<int8_t>::getOrCreateTransient(ctx, layer, dst, ".i8_out", false); // IxJ (1xJ)
     
     start = read_cycles();
     /* _______________________ 2. Gemmini용 dimension _____________________ */
@@ -63,6 +61,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     end = read_cycles();
     printf("[layer=%s][preprocessArgument] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
     printf("[layer=%s]", layer); // tiled_matmul_auto 내부 사이클 출력에 layer 추가
+
     /* __ 5. Gemmini tiled_matmul_auto 호출 __ */
     tiled_matmul_auto(I, J, K,
                       (elem_t *)tA->get(),
@@ -99,6 +98,14 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     }
     end = read_cycles();
     printf("[layer=%s][CopyOutput] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
+
+#if USE_GEMMINI_BENCH_TENSOR
+    start = read_cycles();
+    // Dynamic Error Compensation
+    ActivationDEC::compensate(src1, tA, tB, dst);
+    end = read_cycles();
+    printf("[layer=%s][ErrorCompensation] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
+#endif
 }
 
 static void ggml_backend_gemmini_add(
