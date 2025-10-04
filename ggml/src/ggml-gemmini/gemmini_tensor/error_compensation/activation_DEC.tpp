@@ -6,7 +6,7 @@ namespace aisa
 {
     void ActivationDEC::compensate(const ggml_tensor *A,
                                    const BenchTensor<int8_t> *qA,
-                                   BenchTensor<int8_t> *qW,
+                                   const BenchTensor<int8_t> *qW,
                                    ggml_tensor *C_out)
     {
         ActivationDEC dec(A, qA);
@@ -15,7 +15,7 @@ namespace aisa
         const size_t J = qW->getCols();
         std::vector<float> y_com(J, 0.f);
 
-        int8_t *What = static_cast<int8_t *>(qW->get());
+        const int8_t *What = static_cast<const int8_t *>(qW->get());
         dec.computeCompensation(What, J, y_com.data());
         
         float* y_fp = static_cast<float*>(C_out->data);
@@ -62,7 +62,7 @@ namespace aisa
         }
     }
 
-    void ActivationDEC::computeCompensation(int8_t *W, size_t J, float *y_com)
+    void ActivationDEC::computeCompensation(const int8_t *W, size_t J, float *y_com)
     {
         // S.size() == D.size() == alpha
         for (int i = 0; i < alpha_; ++i)
