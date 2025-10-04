@@ -10,10 +10,10 @@ namespace aisa
     {
     public:
         void computeResidual();
-        void computeCompensation(int8_t *W, size_t J, float *y_out);
+        void computeCompensation(const int8_t *W, size_t J, float *y_out);
         static void compensate(const ggml_tensor *A,
                         const BenchTensor<int8_t> *qA,
-                        BenchTensor<int8_t> *W,
+                        const BenchTensor<int8_t> *W,
                         ggml_tensor *C_out);
 
         size_t K() const { return alpha_; }
