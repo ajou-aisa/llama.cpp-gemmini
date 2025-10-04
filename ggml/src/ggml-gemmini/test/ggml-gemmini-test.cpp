@@ -183,7 +183,7 @@ namespace aisa
         // Activation: 버퍼만 재사용, 값은 매번 갱신 (BenchTensor)
         tA_ = aisa::GemminiTensor<int8_t>::getOrCreateTransient(ctx_, "test", src1_, ".i8_A", false);
         // Weight: 완전 캐싱 (0-fill) 고정 (BenchTensor)
-        tB_ = aisa::GemminiTensor<int8_t>::getOrCreate(ctx_, src0_, ".i8_B", false, TRANSPOSE_B); // 항상 KxJ로 간주
+        tB_ = aisa::GemminiTensor<int8_t>::getOrCreate(ctx_, "test", src0_, ".i8_B", false, TRANSPOSE_B); // 항상 KxJ로 간주
         // Output: 버퍼만 재사용. Gemmini 결과 저장
         tC_ = aisa::GemminiTensor<int8_t>::getOrCreateTransient(ctx_, "test", dst_, ".i8_C", false);
 
