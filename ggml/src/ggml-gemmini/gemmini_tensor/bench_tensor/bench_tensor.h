@@ -24,6 +24,7 @@ namespace aisa
          * 포인터 + dimension + transpose 기반 캐싱
          * Weight는 고정값(0-fill)이므로 한번 생성 후 계속 재사용 */
         static BenchTensor<T> *getOrCreate(ggml_backend_gemmini_context *ctx,
+                                           const char *layer,  
                                            const ggml_tensor *src,
                                            const char *suffix = ".bench",
                                            bool acc = false,
