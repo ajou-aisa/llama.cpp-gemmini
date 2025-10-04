@@ -11,6 +11,7 @@ namespace aisa
     // Weight용: 완전 캐싱
     template <typename T>
     BenchTensor<T> *BenchTensor<T>::getOrCreate(ggml_backend_gemmini_context *ctx,
+                                                const char *layer,
                                                 const ggml_tensor *src,
                                                 const char *suffix,
                                                 bool acc,
@@ -36,7 +37,7 @@ namespace aisa
 #endif
 
         auto new_tensor = std::unique_ptr<BenchTensor<T>>(
-            new BenchTensor<T>(nullptr, src, suffix, acc, transpose));
+            new BenchTensor<T>(layer, src, suffix, acc, transpose));
         BenchTensor<T> *ptr = new_tensor.get();
         ctx->weight_cache[key] = std::move(new_tensor);
         return ptr;
@@ -70,7 +71,7 @@ namespace aisa
 #endif
 
         auto new_tensor = std::unique_ptr<BenchTensor<T>>(
-            new BenchTensor<T>(nullptr, src, suffix, false, transpose));
+            new BenchTensor<T>(layer, src, suffix, false, transpose));
         BenchTensor<T> *ptr = new_tensor.get();
         ctx->transient_pool[key] = std::move(new_tensor);
         return ptr;
