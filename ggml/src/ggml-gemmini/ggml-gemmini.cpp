@@ -5,7 +5,7 @@
 #include "include/gemmini.h"
 #include "labeling/label.h"
 #include "test/ggml-gemmini-test.h"
-#include "error_compensation/activation_DEC.h"
+#include "gemmini_tensor/error_compensation/activation_DEC.h"
 
 using namespace aisa;
 
