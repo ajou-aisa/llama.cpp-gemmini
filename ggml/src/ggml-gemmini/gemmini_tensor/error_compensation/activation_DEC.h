@@ -2,6 +2,7 @@
 #include "../bench_tensor/bench_tensor.h"
 #include "ggml.h"
 #include "vector"
+#define SCALE_W 1.0f // 임시
 
 namespace aisa
 {
