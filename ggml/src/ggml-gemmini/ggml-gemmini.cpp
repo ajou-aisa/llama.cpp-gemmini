@@ -100,11 +100,11 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     printf("[layer=%s][CopyOutput] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
 
 #if USE_GEMMINI_BENCH_TENSOR
-    start = read_cycles();
+    // start = read_cycles();
     // Dynamic Error Compensation
     ActivationDEC::compensate(src1, tA, tB, dst);
-    end = read_cycles();
-    printf("[layer=%s][ErrorCompensation] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
+    // end = read_cycles();
+    // printf("[layer=%s][ErrorCompensation] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
 #endif
 }
 
