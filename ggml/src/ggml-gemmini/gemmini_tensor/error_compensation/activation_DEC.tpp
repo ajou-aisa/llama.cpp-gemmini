@@ -2,7 +2,6 @@
 #include <algorithm>
 #include <cmath>
 #include <include/gemmini.h>
-uint64_t start, end;
 
 namespace aisa
 {
@@ -18,9 +17,9 @@ namespace aisa
 
         const int8_t *What = static_cast<const int8_t *>(qW->get());
 
-        start = read_cycles();
+        uint64_t start = read_cycles();
         dec.computeCompensation(What, J, y_com.data());
-        end = read_cycles();
+        uint64_t end = read_cycles();
         printf("[layer=%s][computeCompensation] start = %lu, end = %lu, elapsed = %lu\n", "", start, end, end - start);
 
         float *y_fp = static_cast<float *>(C_out->data);
@@ -46,14 +45,14 @@ namespace aisa
         const size_t stride_qA = qA_->getStride();
 
         // 각 row마다 Top-K 선택 + Residual 계산 병합
-        start = read_cycles();
+        uint64_t start = read_cycles();
         for (size_t r = 0; r < I_; ++r)
         {
             const float *row_fp = x + r * K_;
             const int8_t *row_q = qx + r * stride_qA;
             selectTopKandComputeResidual(r, row_fp, row_q);
         }
-        end = read_cycles();
+        uint64_t end = read_cycles();
         printf("[layer=%s][selectTopKandComputeResidual] start = %lu, end = %lu, elapsed = %lu\n", "", start, end, end - start);
     }
 
