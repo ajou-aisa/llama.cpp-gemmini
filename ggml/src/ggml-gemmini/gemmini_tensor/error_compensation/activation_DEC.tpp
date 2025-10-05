@@ -22,9 +22,12 @@ namespace aisa
         uint64_t end = read_cycles();
         printf("[layer=%s][computeCompensation] start = %lu, end = %lu, elapsed = %lu\n", "", start, end, end - start);
 
+        start = read_cycles();
         float *y_fp = static_cast<float *>(C_out->data);
         for (size_t i = 0; i < J; ++i)
-            y_fp[i] += y_com[i]; // W scale 보정은 없는 상태
+            y_fp[i] += y_com[i] * SCALE_W; // W scale 로 dequantize
+        end = read_cycles();
+        printf("[layer=%s][applyCompensation] start = %lu, end = %lu, elapsed = %lu\n", "", start, end, end - start);
     }
 
     ActivationDEC::ActivationDEC(const ggml_tensor *A, const BenchTensor<int8_t> *qA, double ratio)
@@ -79,8 +82,9 @@ namespace aisa
             S_[row_idx][i] = k;
             
             // Residual 계산 
+            // origin: 0.811 -> quantized: 127 ~ 127 
             const float xhat = static_cast<float>(row_q[k]) * SCALE;
-            delta_[row_idx][i] = row_fp[k] - xhat;
+            delta_[row_idx][i] = row_fp[k] - xhat; // delat: dequantize 오차 
         }
     }
 
@@ -99,7 +103,7 @@ namespace aisa
                 const int8_t *wrow = W + static_cast<size_t>(k) * stride_W;
 
                 for (size_t j = 0; j < J; ++j)
-                    y_com[j] += d * static_cast<float>(wrow[j]);
+                    y_com[j] += d * static_cast<float>(wrow[j]); // d에 해당하는 보정이 모든 채널에 적용
             }
         }
     }

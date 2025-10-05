@@ -7,6 +7,10 @@
 #include "test/ggml-gemmini-test.h"
 #include "gemmini_tensor/error_compensation/activation_DEC.h"
 
+#define SCALE_A SCALE           // Activation: bench_tensor.h에 정의됨 (0.002441f)
+#define SCALE_B 1.0f            // 임시 Weight 스케일 값
+#define SCALE_C (SCALE_A * SCALE_B)  // Output scale
+
 using namespace aisa;
 
 // Cycle 측정 용
@@ -79,13 +83,16 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                       0, OPTION);
 
     start = read_cycles();
-    /* _____________ 6. Gemmini 연산 결과를 원본 출력 텐서로 반영 _____________ */
+    /* _____________ 6. Gemmini 연산 결과 dequantize 및 복사 _____________ */
     const size_t nb1_out = dst->nb[1]; // 출력 텐서 행 stride (bytes)
     const size_t J_log = dst->ne[0];   // 실제 논리 열 수
 
     const int8_t *c_i8 = static_cast<const int8_t *>(tC->get());
     uint8_t *out_base = static_cast<uint8_t *>(dst->data);
 
+    // Dequantization scale: int8 -> float
+    // Gemmini output = (A_q8 * B_q8) 
+    // 따라서 원래 값 복원 = output_q8 * SCALE_C
     for (size_t r = 0; r < I; ++r)
     {
         const int8_t *row_c = c_i8 + r * sC;
@@ -93,18 +100,13 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
         // 스케일/클리핑 없이 그대로 float 캐스팅
         for (size_t c = 0; c < J_log; ++c)
-            row_out[c] = static_cast<float>(row_c[c]);
-        // 패딩 영역(row_c[J..sC-1])은 무시
+            row_out[c] = static_cast<float>(row_c[c]) * SCALE_C;
     }
     end = read_cycles();
-    printf("[layer=%s][CopyOutput] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
+    printf("[layer=%s][dequantizeGemminiOutput] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
 
 #if USE_GEMMINI_BENCH_TENSOR
-    // start = read_cycles();
-    // Dynamic Error Compensation
     ActivationDEC::compensate(src1, tA, tB, dst);
-    // end = read_cycles();
-    // printf("[layer=%s][ErrorCompensation] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
 #endif
 }
 
