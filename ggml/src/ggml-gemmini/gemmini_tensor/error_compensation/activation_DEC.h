@@ -9,8 +9,6 @@ namespace aisa
     class ActivationDEC
     {
     public:
-        void computeResidual();
-        void computeCompensation(const int8_t *W, size_t J, float *y_out);
         static void compensate(const ggml_tensor *A,
                         const BenchTensor<int8_t> *qA,
                         const BenchTensor<int8_t> *W,
@@ -31,7 +29,8 @@ namespace aisa
         std::vector<std::pair<float, size_t>> sorted_;
 
         ActivationDEC(const ggml_tensor *A, const BenchTensor<int8_t> *qA, double ratio = 0.05);
-        void selectTopKForRow(size_t row_idx, const float* row_data, double ratio);
+        void computeCompensation(const int8_t *W, size_t J, float *y_out);
+        void selectTopKandComputeResidual(size_t row_idx, const float *row_fp, const int8_t *row_q);
     };
 }
 

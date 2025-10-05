@@ -10,7 +10,6 @@ namespace aisa
                                    ggml_tensor *C_out)
     {
         ActivationDEC dec(A, qA);
-        dec.computeResidual();
 
         const size_t J = qW->getCols();
         std::vector<float> y_com(J, 0.f);
@@ -19,7 +18,7 @@ namespace aisa
         dec.computeCompensation(What, J, y_com.data());
 
         float *y_fp = static_cast<float *>(C_out->data);
-        for (size_t i = 0; i < qW->getCols(); i++)
+        for (size_t i = 0; i < J; ++i)
             y_fp[i] += y_com[i]; // W scale 보정은 없는 상태
     }
 
@@ -37,54 +36,43 @@ namespace aisa
         delta_.resize(I_);
 
         const float *x = static_cast<const float *>(A_->data);
-
-        // 각 row마다 독립적으로 Top-K 선택
-        for (size_t r = 0; r < I_; ++r)
-        {
-            const float *row_ptr = x + r * K_;
-            selectTopKForRow(r, row_ptr, ratio);
-        }
-    }
-
-    void ActivationDEC::selectTopKForRow(size_t row_idx, const float *row_data, double ratio)
-    {
-        // row의 K개 원소를 절대값 기준으로 정렬
-        std::vector<std::pair<float, int>> sorted(K_);
-        for (size_t k = 0; k < K_; ++k)
-            sorted[k] = {row_data[k], static_cast<int>(k)};
-
-        // 내림차순(절댓값)
-        std::sort(sorted.begin(), sorted.end(),
-                  [](const auto &a, const auto &b)
-                  {
-                      return std::abs(a.first) > std::abs(b.first);
-                  });
-
-        // Top-alpha_ 개 인덱스 저장 (row 내 local index)
-        S_[row_idx].resize(alpha_);
-        for (size_t i = 0; i < alpha_; ++i)
-            S_[row_idx][i] = sorted[i].second;
-    }
-
-    void ActivationDEC::computeResidual()
-    {
-        const float *x = static_cast<const float *>(A_->data);
         const int8_t *qx = static_cast<const int8_t *>(qA_->get());
         const size_t stride_qA = qA_->getStride();
 
+        // 각 row마다 Top-K 선택 + Residual 계산 병합
         for (size_t r = 0; r < I_; ++r)
         {
             const float *row_fp = x + r * K_;
             const int8_t *row_q = qx + r * stride_qA;
+            selectTopKandComputeResidual(r, row_fp, row_q);
+        }
+    }
 
-            delta_[r].resize(alpha_);
+    void ActivationDEC::selectTopKandComputeResidual(size_t row_idx, 
+                                                      const float *row_fp, 
+                                                      const int8_t *row_q)
+    {
+        // 임시 벡터: 절대값과 인덱스
+        std::vector<std::pair<float, int>> temp(K_);
+        for (size_t k = 0; k < K_; ++k)
+            temp[k] = {std::abs(row_fp[k]), static_cast<int>(k)};
 
-            for (size_t i = 0; i < alpha_; ++i)
-            {
-                const int k = S_[r][i]; // row 내 local index
-                const float xhat = static_cast<float>(row_q[k]) * SCALE;
-                delta_[r][i] = row_fp[k] - xhat;
-            }
+        // partial_sort: 상위 alpha_개만 정렬 (O(K log alpha))
+        std::partial_sort(temp.begin(), temp.begin() + alpha_, temp.end(), [](const auto &a, const auto &b)
+                          { return a.first > b.first; });
+
+        // Top-K 인덱스 저장 + Residual 계산
+        S_[row_idx].resize(alpha_);
+        delta_[row_idx].resize(alpha_);
+
+        for (size_t i = 0; i < alpha_; ++i)
+        {
+            const int k = temp[i].second;
+            S_[row_idx][i] = k;
+            
+            // Residual 계산 
+            const float xhat = static_cast<float>(row_q[k]) * SCALE;
+            delta_[row_idx][i] = row_fp[k] - xhat;
         }
     }
 
