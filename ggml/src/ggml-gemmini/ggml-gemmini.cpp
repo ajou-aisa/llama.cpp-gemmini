@@ -3,6 +3,7 @@
 #include "ggml-gemmini-util.h"
 #include "gemmini_tensor/gemmini_tensor_interface.h"
 #include "include/gemmini.h"
+#include "labeling/label.h"
 #include "test/ggml-gemmini-test.h"
 
 using namespace aisa;
@@ -10,9 +11,7 @@ using namespace aisa;
 // Cycle 측정 용
 extern "C" volatile uint64_t gemmini_tiled_matmul_cycles = 0; // gemmini.h
 
-uint64_t start, end;
-uint64_t bias_mapping_cycles = 0, preprocess_cycles = 0, tmp_ctx_cycles = 0, gen_tensor_cycles = 0, 
-out_copy_cycles = 0, before_gemmini_overhead_cycles = 0, after_gemmini_overhead_cycles = 0;
+uint64_t start, end; // 일반 사이클 측정
 
 static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                                          struct ggml_tensor *dst) // FP32 output (I×J)
@@ -21,7 +20,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 /* ________________ Test: 테스트 호출용 ___________________ */
 #if TEST
     static_assert(TRANSPOSE_B == 1, "This test assumes physical-transposed B (KxJ).");
-    ggml_gemmini_test(ctx, dst, bias);
+    ggml_gemmini_test(ctx, dst);
     return;
 #endif
 
@@ -30,20 +29,17 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     /* ____________________________________ 0. 원본 FP32 입력 텐서 ____________________________________________ */
     const auto *src0 = dst->src[0]; // src0: weight (J × K) -> 전치하여 K x J로 사용 (B)
     const auto *src1 = dst->src[1]; // src1: activation (K x J) -> 전치 없음 (A)
-
-    DBG("\ndst shape:\n ne = [%llu, %llu, %llu, %llu]\n", dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
-    DBG("\nsrc0 shape:\n ne = [%llu, %llu, %llu, %llu]\n", src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);
-    DBG("\nsrc1 shape:\n ne = [%llu, %llu, %llu, %llu]\n", src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3]);
+    const char *w_name = (src0 && src0->name) ? src0->name : ""; // weight name
+    const char *layer = labelFromWeight(w_name); // layer 이름 추출
 
     start = read_cycles();
     /* _____________________________ 1. Gemmini용 텐서 생성 _____________________________ */
-    const auto* tA = GemminiTensor<int8_t>::getOrCreate(ctx, src1, ".i8"); // IxK (1xK)
+    const auto* tA = GemminiTensor<int8_t>::getOrCreateTransient(ctx, src1, ".i8", false); // IxK (1xK)
     const auto* tB = GemminiTensor<int8_t>::getOrCreate(ctx, src0, ".i8", false, TRANSPOSE_B);  // KxJ, 전치
-    const auto* tC = GemminiTensor<int8_t>::getOrCreate(ctx, dst, ".i8_out", true); // IxJ (1xJ)
+    const auto* tC = GemminiTensor<int8_t>::getOrCreateTransient(ctx, dst, ".i8_out", false); // IxJ (1xJ)
     
     end = read_cycles();
-    gen_tensor_cycles = (end - start);
-    printf("[gen_tensor_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, gen_tensor_cycles);
+    printf("[layer=%s][generateTensor] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
     
     start = read_cycles();
     /* _______________________ 2. Gemmini용 dimension _____________________ */
@@ -65,12 +61,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     const bool repeating = true;
 
     end = read_cycles();
-    preprocess_cycles = (end - start);
-    printf("[preprocess_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, preprocess_cycles);
-
-    DBG("calling tiled_matmul_auto: ptrA=%p ptrB=%p ptrD=%p ptrC=%p\n",
-        (void *)tA.get(), (void *)tB.get(), (void *)bias_data, (void *)tC.get());
-
+    printf("[layer=%s][preprocessArgument] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
+    printf("[layer=%s]", layer); // tiled_matmul_auto 내부 사이클 출력에 layer 추가
     /* __ 5. Gemmini tiled_matmul_auto 호출 __ */
     tiled_matmul_auto(I, J, K,
                       (elem_t *)tA->get(),
@@ -106,8 +98,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         // 패딩 영역(row_c[J..sC-1])은 무시
     }
     end = read_cycles();
-    out_copy_cycles = (end - start);
-    printf("[out_copy_cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
+    printf("[layer=%s][CopyOutput] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
 }
 
 static void ggml_backend_gemmini_add(
