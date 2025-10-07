@@ -18,7 +18,7 @@ namespace aisa
         const int8_t *What = static_cast<const int8_t *>(qW->get());
 
         uint64_t start = read_cycles();
-        dec.computeCompensation(What, J, y_com.data());
+        dec.computeCompensation_kGrouped(What, J, y_com.data());
         uint64_t end = read_cycles();
         printf("[layer=%s][computeCompensation] start = %lu, end = %lu, elapsed = %lu\n", "", start, end, end - start);
 
@@ -108,4 +108,53 @@ namespace aisa
         }
     }
 
+    void ActivationDEC::computeCompensation_kGrouped(const int8_t *W, size_t J, float *y_com)
+    {
+        const size_t stride_W = J;
+        // 1) k별 d-합만 계산 (sparse)
+        std::vector<int> uniq_k;
+        uniq_k.reserve(I_ * alpha_);
+        std::vector<float> dsum;
+        dsum.reserve(I_ * alpha_);
+        // 빠른 look-up을 위해 임시 해시/맵 대신 마킹 배열 사용
+        std::vector<int> mark(K_, -1); // -1: 없음, >=0: uniq_k 내 인덱스
+
+        for (size_t r = 0; r < I_; ++r)
+        {
+            for (size_t i = 0; i < alpha_; ++i)
+            {
+                int k = S_[r][i];
+                float d = delta_[r][i];
+                int idx = mark[k];
+                if (idx < 0)
+                { // 첫 등장
+                    idx = (int)uniq_k.size();
+                    mark[k] = idx;
+                    uniq_k.push_back(k);
+                    dsum.push_back(d);
+                }
+                else
+                {
+                    dsum[idx] += d; // 누적
+                }
+            }
+        }
+
+        // 2) 고유 k들만 스캔하여 y_com 누적
+        for (size_t t = 0; t < uniq_k.size(); ++t)
+        {
+            int k = uniq_k[t];
+            const int8_t *wrow = W + (size_t)k * stride_W;
+            float scale = dsum[t];
+            // 가능하면 FMA / 타일링 / OpenMP는 이후 단계에서
+            for (size_t j = 0; j < J; ++j)
+            {
+                y_com[j] += scale * (float)wrow[j];
+            }
+        }
+
+        // 3) mark 리셋 (sparse-reset)
+        for (int k : uniq_k)
+            mark[k] = -1;
+    }
 }
