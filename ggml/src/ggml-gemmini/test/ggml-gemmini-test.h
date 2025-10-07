@@ -52,6 +52,18 @@
 #define SLICE_J 6 // J 방향 최대 출력 열(논리 J 기준)
 #endif
 
+#ifndef TEST_DEC_METRICS
+#define TEST_DEC_METRICS 1      // 0=off, 1=on (테스트 중 k-중복도 계측)
+#endif
+
+// alpha
+#ifndef DEC_ALPHA_RATIO
+#define DEC_ALPHA_RATIO 0.01    // 1% 
+#endif
+#ifndef DEC_ALPHA_MIN
+#define DEC_ALPHA_MIN 1
+#endif  
+
 namespace aisa
 {
     // 1. 테스트 설정을 위한 구조체
@@ -60,6 +72,7 @@ namespace aisa
         bool test_shape = TEST_SHAPE;
         bool test_slice = TEST_SLICE;
         bool test_sort = TEST_SORT;
+        bool test_dec_metrics = TEST_DEC_METRICS;
         bool run_cpu_ref = TEST_CPU_REF;
         bool run_gemmini = TEST_GEMMINI;
         bool compare_results = TEST_CPU_REF && TEST_GEMMINI && TEST_COMPARE;
@@ -85,6 +98,7 @@ namespace aisa
         void compareAndReport();
         void dequantizeAndFinalize();
         void sortActivation();
+        void analyzeActivationMultiplicity();
 
 
         // 멤버 변수들
