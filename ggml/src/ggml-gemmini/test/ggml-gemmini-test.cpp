@@ -157,10 +157,9 @@ namespace aisa
 
     void GemminiTestbench::analyzeActivationMultiplicity()
     {
-#if TEST_DEC_METRICS
         DBG0("[DEC][metrics] analyzeActivationMultiplicity...\n");
 
-        // src1_: A (저장: K x I), 논리: I x K
+        // src1_: A (I x K)
         GGML_ASSERT(src1_ && src1_->type == GGML_TYPE_F32);
         const float *A = static_cast<const float *>(src1_->data);
         const int64_t row_stride_bytes = src1_->nb[1]; // 다음 행(row r)의 byte stride
@@ -204,7 +203,7 @@ namespace aisa
 
         const size_t nnz = (size_t)I * alpha;
         const size_t unique_k = freq.size();
-        const double R = unique_k ? double(nnz) / double(unique_k) : 0.0;
+        const double R = unique_k ? (double(nnz) / double(unique_k)) : 0.0;
 
         size_t max_cnt = 0;
         for (auto &kv : freq)
@@ -227,22 +226,14 @@ namespace aisa
             ++printed;
         }
 
-        // 간단 가이드 출력
         if (R <= 1.10)
-        {
-            DBG0("[DEC][guide] 중복 거의 없음(R<=1.10): k-정렬/통합 이득 작을 가능성 큼\n");
-        }
+            DBG0("[DEC][guide] 중복 거의 없음 (R<=1.10)\n");
+        
         else if (R >= 1.50)
-        {
-            DBG0("[DEC][guide] 중복 뚜렷(R>=1.50): k-정렬/통합 고려 가치 큼 (W의 k행 1회 스캔)\n");
-        }
+            DBG0("[DEC][guide] 중복 있음 (R>=1.50)\n");
+    
         else
-        {
-            DBG0("[DEC][guide] 애매한 구간: 데이터/정렬 비용에 따라 케바케\n");
-        }
-#else
-        (void)this;
-#endif
+            DBG0("[DEC][guide] 애매한 구간\n");
     }
 
     void GemminiTestbench::setUpDimensions()
