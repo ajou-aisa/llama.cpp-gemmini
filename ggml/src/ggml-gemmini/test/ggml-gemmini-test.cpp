@@ -163,7 +163,7 @@ namespace aisa
         // src1_: A (저장: K x I), 논리: I x K
         GGML_ASSERT(src1_ && src1_->type == GGML_TYPE_F32);
         const float *A = static_cast<const float *>(src1_->data);
-        const int64_t ldA_bytes = src1_->nb[1]; // 다음 행(row r)의 byte stride
+        const int64_t row_stride_bytes = src1_->nb[1]; // 다음 행(row r)의 byte stride
         const int K = K_, I = I_;
 
         // α 계산 (비율 기반)
@@ -176,8 +176,8 @@ namespace aisa
         uint64_t t0 = read_cycles();
         for (int r = 0; r < I; ++r)
         {
-            const float *row_fp = reinterpret_cast<const float *>(
-                reinterpret_cast<const uint8_t *>(A) + (size_t)r * ldA_bytes);
+            const uint8_t* row_base = reinterpret_cast<const uint8_t*>(A) + r*row_stride_bytes;
+            const float* row_fp = reinterpret_cast<const float*>(row_base);
 
             // (값, k) 페어 준비
             std::vector<std::pair<float, int>> tmp;
