@@ -53,7 +53,7 @@
 #endif
 
 #ifndef TEST_DEC_METRICS
-#define TEST_DEC_METRICS 1      // 0=off, 1=on (테스트 중 k-중복도 계측)
+#define TEST_DEC_METRICS 0      // 0=off, 1=on (테스트 중 k-중복도 계측)
 #endif
 
 // alpha

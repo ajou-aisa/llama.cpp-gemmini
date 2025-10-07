@@ -31,6 +31,7 @@ target_compile_definitions(ggml-gemmini PRIVATE
   TEST_SHAPE=0 # 원본/변환 tensor shape 확인
   TEST_TYPE=0 # 타입 확인
   TEST_SORT=0 # sort 테스트
+  TEST_DEC_METRICS=0 # k 중복 측정
   TEST_SLICE=0 # slicing 하여 dump
   TEST_CPU_REF=0 # 기대값 계산
   TEST_GEMMINI=0 # gemmini 호출
@@ -41,6 +42,10 @@ target_compile_definitions(ggml-gemmini PRIVATE
   SLICE_I=1
   SLICE_K=4
   SLICE_J=6
+
+  #alpha ratio
+  DEC_ALPHA_RATIO=0.01
+  DEC_ALPHA_MIN=1
 )
 
 
