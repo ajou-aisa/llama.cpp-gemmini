@@ -6,6 +6,7 @@
 #include <type_traits>
 #include <limits>
 #include "include/gemmini.h"
+#include <map> 
 
 namespace aisa
 {
@@ -155,81 +156,94 @@ namespace aisa
     }
 
     void GemminiTestbench::analyzeActivationMultiplicity()
-{
-#if TEST_DEC_METRICS
-    DBG0("[DEC][metrics] analyzeActivationMultiplicity...\n");
-
-    // src1_: A (저장: K x I), 논리: I x K
-    GGML_ASSERT(src1_ && src1_->type == GGML_TYPE_F32);
-    const float* A = static_cast<const float*>(src1_->data);
-    const int64_t ldA_bytes = src1_->nb[1];                 // 다음 행(row r)의 byte stride
-    const int     K = K_, I = I_;
-
-    // α 계산 (비율 기반)
-    size_t alpha = std::max<size_t>(DEC_ALPHA_MIN, std::min<size_t>(K, (size_t)std::llround(K * DEC_ALPHA_RATIO)));
-
-    // S[r] 저장용: 행 r의 top-α k index 리스트
-    std::vector<std::vector<int>> S; S.resize(I);
-
-    uint64_t t0 = read_cycles();
-    for (int r = 0; r < I; ++r) {
-        const float* row_fp = reinterpret_cast<const float*>(
-                                reinterpret_cast<const uint8_t*>(A) + (size_t)r * ldA_bytes);
-
-        // (값, k) 페어 준비
-        std::vector<std::pair<float,int>> tmp; tmp.resize(K);
-        for (int k = 0; k < K; ++k) tmp[k] = { std::abs(row_fp[k]), k };
-
-        // 상위 alpha만 partial_sort
-        std::partial_sort(tmp.begin(), tmp.begin() + alpha, tmp.end(),
-                          [](const auto& a, const auto& b){ return a.first > b.first; });
-
-        S[r].resize(alpha);
-        for (size_t i = 0; i < alpha; ++i) S[r][i] = tmp[i].second;
-    }
-    uint64_t t1 = read_cycles();
-
-    // k 빈도 집계
-    std::unordered_map<int,size_t> freq;
-    freq.reserve((size_t)I * alpha * 2);
-    for (int r = 0; r < I; ++r) for (size_t i = 0; i < S[r].size(); ++i) ++freq[S[r][i]];
-
-    const size_t nnz = (size_t)I * alpha;
-    const size_t unique_k = freq.size();
-    const double R = unique_k ? double(nnz)/double(unique_k) : 0.0;
-
-    size_t max_cnt = 0;
-    for (auto& kv : freq) max_cnt = std::max(max_cnt, kv.second);
-    std::vector<size_t> hist(max_cnt + 1, 0);
-    for (auto& kv : freq) ++hist[kv.second];
-
-    DBG0("[DEC][metrics] I=%d, K=%d, alpha=%zu (ratio=%.4f)\n", I, K, alpha, (double)DEC_ALPHA_RATIO);
-    DBG0("[DEC][metrics] nnz=%zu, unique_k=%zu, R=%.3f\n", nnz, unique_k, R);
-    DBG0("[DEC][metrics] topK selection cycles: %lu\n", (unsigned long)(t1 - t0));
-
-    // 히스토그램(상위 몇 구간만)
-    size_t printed = 0;
-    for (size_t c = 1; c < hist.size() && printed < 10; ++c) {
-        if (hist[c] == 0) continue;
-        DBG0("  count=%zu -> %zu distinct k's\n", c, hist[c]);
-        ++printed;
-    }
-
-    // 간단 가이드 출력
-    if (R <= 1.10) {
-        DBG0("[DEC][guide] 중복 거의 없음(R<=1.10): k-정렬/통합 이득 작을 가능성 큼\n");
-    } else if (R >= 1.50) {
-        DBG0("[DEC][guide] 중복 뚜렷(R>=1.50): k-정렬/통합 고려 가치 큼 (W의 k행 1회 스캔)\n");
-    }
-    else
     {
-        DBG0("[DEC][guide] 애매한 구간: 데이터/정렬 비용에 따라 케바케\n");
-    }
-#else
-    (void)this;
-#endif
-}
+#if TEST_DEC_METRICS
+        DBG0("[DEC][metrics] analyzeActivationMultiplicity...\n");
 
+        // src1_: A (저장: K x I), 논리: I x K
+        GGML_ASSERT(src1_ && src1_->type == GGML_TYPE_F32);
+        const float *A = static_cast<const float *>(src1_->data);
+        const int64_t ldA_bytes = src1_->nb[1]; // 다음 행(row r)의 byte stride
+        const int K = K_, I = I_;
+
+        // α 계산 (비율 기반)
+        size_t alpha = std::max<size_t>(DEC_ALPHA_MIN, std::min<size_t>(K, (size_t)std::llround(K * DEC_ALPHA_RATIO)));
+
+        // S[r] 저장용: 행 r의 top-α k index 리스트
+        std::vector<std::vector<int>> S;
+        S.resize(I);
+
+        uint64_t t0 = read_cycles();
+        for (int r = 0; r < I; ++r)
+        {
+            const float *row_fp = reinterpret_cast<const float *>(
+                reinterpret_cast<const uint8_t *>(A) + (size_t)r * ldA_bytes);
+
+            // (값, k) 페어 준비
+            std::vector<std::pair<float, int>> tmp;
+            tmp.resize(K);
+            for (int k = 0; k < K; ++k)
+                tmp[k] = {std::abs(row_fp[k]), k};
+
+            // 상위 alpha만 partial_sort
+            std::partial_sort(tmp.begin(), tmp.begin() + alpha, tmp.end(),
+                              [](const auto &a, const auto &b)
+                              { return a.first > b.first; });
+
+            S[r].resize(alpha);
+            for (size_t i = 0; i < alpha; ++i)
+                S[r][i] = tmp[i].second;
+        }
+        uint64_t t1 = read_cycles();
+
+        // k 빈도 집계
+        std::map<int, size_t> freq;
+        for (int r = 0; r < I; ++r)
+            for (size_t i = 0; i < S[r].size(); ++i)
+                ++freq[S[r][i]];
+
+        const size_t nnz = (size_t)I * alpha;
+        const size_t unique_k = freq.size();
+        const double R = unique_k ? double(nnz) / double(unique_k) : 0.0;
+
+        size_t max_cnt = 0;
+        for (auto &kv : freq)
+            max_cnt = std::max(max_cnt, kv.second);
+        std::vector<size_t> hist(max_cnt + 1, 0);
+        for (auto &kv : freq)
+            ++hist[kv.second];
+
+        DBG0("[DEC][metrics] I=%d, K=%d, alpha=%zu (ratio=%.4f)\n", I, K, alpha, (double)DEC_ALPHA_RATIO);
+        DBG0("[DEC][metrics] nnz=%zu, unique_k=%zu, R=%.3f\n", nnz, unique_k, R);
+        DBG0("[DEC][metrics] topK selection cycles: %lu\n", (unsigned long)(t1 - t0));
+
+        // 히스토그램(상위 몇 구간만)
+        size_t printed = 0;
+        for (size_t c = 1; c < hist.size() && printed < 10; ++c)
+        {
+            if (hist[c] == 0)
+                continue;
+            DBG0("  count=%zu -> %zu distinct k's\n", c, hist[c]);
+            ++printed;
+        }
+
+        // 간단 가이드 출력
+        if (R <= 1.10)
+        {
+            DBG0("[DEC][guide] 중복 거의 없음(R<=1.10): k-정렬/통합 이득 작을 가능성 큼\n");
+        }
+        else if (R >= 1.50)
+        {
+            DBG0("[DEC][guide] 중복 뚜렷(R>=1.50): k-정렬/통합 고려 가치 큼 (W의 k행 1회 스캔)\n");
+        }
+        else
+        {
+            DBG0("[DEC][guide] 애매한 구간: 데이터/정렬 비용에 따라 케바케\n");
+        }
+#else
+        (void)this;
+#endif
+    }
 
     void GemminiTestbench::setUpDimensions()
     {
