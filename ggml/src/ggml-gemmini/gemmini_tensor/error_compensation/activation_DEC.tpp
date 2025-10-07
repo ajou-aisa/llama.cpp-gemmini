@@ -94,13 +94,13 @@ namespace aisa
 
         for (size_t r = 0; r < I_; ++r)
         {
-            for (size_t i = 0; i < alpha_; ++i)
+            for (size_t k = 0; k < alpha_; ++k)
             {
-                const int k = S_[r][i]; // row 내 local index (0 ~ K-1)
-                const float d = delta_[r][i];
+                const int channel = S_[r][k]; // row 내 local index (실제 channel 인덱스) (0 ~ K-1)
+                const float d = delta_[r][k];
 
-                // W의 k번째 행
-                const int8_t *wrow = W + static_cast<size_t>(k) * stride_W;
+                // W의 channel 행
+                const int8_t *wrow = W + static_cast<size_t>(channel) * stride_W;
 
                 for (size_t j = 0; j < J; ++j)
                     y_com[j] += d * static_cast<float>(wrow[j]); // d에 해당하는 보정이 모든 채널에 적용
