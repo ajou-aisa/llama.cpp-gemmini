@@ -3,6 +3,9 @@
 #include "ggml.h"
 #include "vector"
 #define SCALE_W 1.0f // 임시
+#ifndef DEC_ALPHA_RATIO
+#define DEC_ALPHA_RATIO 0.05    // 5% 
+#endif
 
 namespace aisa
 {
@@ -29,7 +32,7 @@ namespace aisa
         std::vector<std::vector<float>> delta_; // row 별 residual
         std::vector<std::pair<float, size_t>> sorted_;
 
-        ActivationDEC(const ggml_tensor *A, const BenchTensor<int8_t> *qA, double ratio = 0.05);
+        ActivationDEC(const ggml_tensor *A, const BenchTensor<int8_t> *qA);
         void computeCompensation(const int8_t *W, size_t J, float *y_out);
         void computeCompensation_kGrouped(const int8_t *W, size_t J, float *y_com);
         void selectTopKandComputeResidual(size_t row_idx, const float *row_fp, const int8_t *row_q);
