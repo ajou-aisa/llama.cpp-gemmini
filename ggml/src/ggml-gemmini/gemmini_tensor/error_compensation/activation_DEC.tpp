@@ -30,7 +30,7 @@ namespace aisa
         printf("[layer=%s][applyCompensation] start = %lu, end = %lu, elapsed = %lu\n", "", start, end, end - start);
     }
 
-    ActivationDEC::ActivationDEC(const ggml_tensor *A, const BenchTensor<int8_t> *qA, double ratio)
+    ActivationDEC::ActivationDEC(const ggml_tensor *A, const BenchTensor<int8_t> *qA)
         : A_(A), qA_(qA)
     {
         // A의 dimension: ne[0]=K (columns), ne[1]=I (rows)
@@ -38,7 +38,7 @@ namespace aisa
         I_ = static_cast<size_t>(A_->ne[1]);
 
         // row 별 Top_K 개수
-        alpha_ = std::max<size_t>(1, std::min(K_, static_cast<size_t>(std::llround(K_ * ratio))));
+        alpha_ = std::max<size_t>(1, std::min(K_, static_cast<size_t>(std::llround(K_ * DEC_ALPHA_RATIO))));
 
         S_.resize(I_);
         delta_.resize(I_);

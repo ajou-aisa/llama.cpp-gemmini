@@ -44,7 +44,7 @@ target_compile_definitions(ggml-gemmini PRIVATE
   SLICE_J=6
 
   #alpha ratio
-  DEC_ALPHA_RATIO=0.01
+  DEC_ALPHA_RATIO=0.05
   DEC_ALPHA_MIN=1
 )
 
