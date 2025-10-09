@@ -56,6 +56,9 @@ namespace aisa
 
         // stride 접근
         size_t getStride() const noexcept { return stride_; }
+        
+        // 이름
+        std::string getName() const noexcept { return name_; }
 
         // 소멸자 & 버퍼 해제
         ~BenchTensor() { freeBuffer(); }

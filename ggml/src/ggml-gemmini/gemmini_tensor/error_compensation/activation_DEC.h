@@ -1,5 +1,6 @@
 #pragma once
 #include "../bench_tensor/bench_tensor.h"
+#include "../../labeling/label.h"
 #include "ggml.h"
 #include "vector"
 #define SCALE_W 1.0f // 임시
@@ -15,16 +16,14 @@ namespace aisa
     public:
         static void compensate(const ggml_tensor *A,
                         const BenchTensor<int8_t> *qA,
-                        const BenchTensor<int8_t> *W,
+                        const BenchTensor<int8_t> *qW,
                         ggml_tensor *C_out);
-
-        size_t K() const { return alpha_; }
 
     private:
         const ggml_tensor *A_;          // F32 activation
         const BenchTensor<int8_t> *qA_; // quantized activation
-
-        size_t I_;  // number of rows
+        const char* layer_; // layer
+        size_t I_;  // number of rows  
         size_t K_;  // columns per row
         size_t alpha_;             // number of salient input channels
 
