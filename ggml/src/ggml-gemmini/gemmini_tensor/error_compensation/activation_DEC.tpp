@@ -13,6 +13,7 @@ namespace aisa
         ActivationDEC dec(A, qA);
 
         const size_t J = qW->getCols();
+        dec.layer_= labelFromWeight(qW->getName().c_str()); // layer 이름 추출
         std::vector<float> y_com(J, 0.f);
 
         const int8_t *What = static_cast<const int8_t *>(qW->get());
@@ -20,14 +21,14 @@ namespace aisa
         uint64_t start = read_cycles();
         dec.computeCompensation_kGrouped(What, J, y_com.data());
         uint64_t end = read_cycles();
-        printf("[layer=%s][computeCompensation] start = %lu, end = %lu, elapsed = %lu\n", "", start, end, end - start);
+        printf("[layer=%s][computeCompensation] start = %lu, end = %lu, elapsed = %lu\n", dec.layer_, start, end, end - start);
 
         start = read_cycles();
         float *y_fp = static_cast<float *>(C_out->data);
         for (size_t i = 0; i < J; ++i)
             y_fp[i] += y_com[i] * SCALE_W; // W scale 로 dequantize
         end = read_cycles();
-        printf("[layer=%s][applyCompensation] start = %lu, end = %lu, elapsed = %lu\n", "", start, end, end - start);
+        printf("[layer=%s][applyCompensation] start = %lu, end = %lu, elapsed = %lu\n", dec.layer_, start, end, end - start);
     }
 
     ActivationDEC::ActivationDEC(const ggml_tensor *A, const BenchTensor<int8_t> *qA)
@@ -56,7 +57,7 @@ namespace aisa
             selectTopKandComputeResidual(r, row_fp, row_q);
         }
         uint64_t end = read_cycles();
-        printf("[layer=%s][selectTopKandComputeResidual] start = %lu, end = %lu, elapsed = %lu\n", "", start, end, end - start);
+        printf("[layer=%s][selectTopKandComputeResidual] start = %lu, end = %lu, elapsed = %lu\n", layer_, start, end, end - start);
     }
 
     void ActivationDEC::selectTopKandComputeResidual(size_t row_idx, 
