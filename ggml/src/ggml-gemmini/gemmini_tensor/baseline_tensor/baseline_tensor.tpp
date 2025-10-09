@@ -71,29 +71,15 @@ namespace aisa
 
         stride_ = row_bytes / elem_size; // element 단위
 
-        uint64_t start, end;
-
-        //cheicking DEQUANTIZE cycle.
-        if (src->type == GGML_TYPE_Q8_0 && DEQUANTIZE){
-            start = read_cycles();
-            ggml_fp16_t *dst_base = reinterpret_cast<ggml_fp16_t *>(this->data_);
-            dequantizeToFp16<ggml_fp16_t>(src, dst_base, rows_, rows_, cols_);
-            end = read_cycles();
-            T * change_base = reinterpret_cast<T*>(dst_base);
-            printf("[dequantizing cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
-
-        }
-
 
         /* 5. _______________casting & 0-fill _________________ */
 
-        start = read_cycles();
+
         if (acc)
             std::memset(data_, 0, buf_bytes_);
         else
             castBaselineData(src, transpose);
-        end = read_cycles();
-        printf("[casting data] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
+
     }
 
     template <typename T>
@@ -137,11 +123,12 @@ namespace aisa
         }
         case GGML_TYPE_Q8_0:
         {
+            uint64_t start, end;
 
-            if (!transpose)
-                q80_to_T_rowwise<T>(src, dst_base, stride_, this->rows_, this->cols_);
-            else
-                q80_to_T_transposed<T>(src, dst_base, stride_, this->rows_, this->cols_);
+            start = read_cycles();
+            dequantizingWithGgml(src);
+            end = read_cycles();
+            printf("[dequantizing cycles] start = %lu, end = %lu, elapsed = %lu\n", start, end, end - start);
 
             break;
         }
