@@ -63,7 +63,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     const bool repeating = true;
 
     end = read_cycles();
-    printf("[layer=%s][preprocessArgument] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
+    printf("[layer=%s][Set Argument for calling tiled_matmul_auto of Gemmini ] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
     printf("[layer=%s]", layer); // tiled_matmul_auto 내부 사이클 출력에 layer 추가
 
     /* __ 5. Gemmini tiled_matmul_auto 호출 __ */
@@ -103,7 +103,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             row_out[c] = static_cast<float>(row_c[c]) * SCALE_C;
     }
     end = read_cycles();
-    printf("[layer=%s][dequantizeGemminiOutput] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
+    printf("[layer=%s][Dequantize output of Gemmini to CPU] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
 
 #if USE_GEMMINI_BENCH_TENSOR
     ActivationDEC::compensate(src1, tA, tB, dst);
