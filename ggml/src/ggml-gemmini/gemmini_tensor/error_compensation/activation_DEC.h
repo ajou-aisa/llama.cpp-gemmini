@@ -2,7 +2,7 @@
 #include "../bench_tensor/bench_tensor.h"
 #include "../../labeling/label.h"
 #include "ggml.h"
-#include "vector"
+#include <vector>
 #define SCALE_W 1.0f // 임시
 #ifndef DEC_ALPHA_RATIO
 #define DEC_ALPHA_RATIO 0.05    // 5% 
@@ -22,7 +22,7 @@ namespace aisa
     private:
         const ggml_tensor *A_;          // F32 activation
         const BenchTensor<int8_t> *qA_; // quantized activation
-        const char* layer_; // layer
+        const char* layer_ = "others"; // layer
         size_t I_;  // number of rows  
         size_t K_;  // columns per row
         size_t alpha_;             // number of salient input channels
@@ -31,7 +31,8 @@ namespace aisa
         std::vector<std::vector<float>> delta_; // row 별 residual
         std::vector<std::pair<float, size_t>> sorted_;
 
-        ActivationDEC(const ggml_tensor *A, const BenchTensor<int8_t> *qA);
+        ActivationDEC(const ggml_tensor *A, const BenchTensor<int8_t> *qA) : A_(A), qA_(qA) {}
+        void prepare();
         void computeCompensation(const int8_t *W, size_t J, float *y_out);
         void computeCompensation_kGrouped(const int8_t *W, size_t J, float *y_com);
         void selectTopKandComputeResidual(size_t row_idx, const float *row_fp, const int8_t *row_q);
