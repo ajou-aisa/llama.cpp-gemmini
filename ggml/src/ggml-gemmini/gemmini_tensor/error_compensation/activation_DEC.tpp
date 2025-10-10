@@ -116,16 +116,18 @@ namespace aisa
     {
         const size_t stride_W = J;
 
-        // 1) k별 d-합 s_k 계산 (sparse)
-        std::vector<int> uniq_k;
-        std::vector<float> s_k;
+        uint64_t start = read_cycles();
+        // step. 1) k별 d-합 d_sum[k] 계산 (sparse)
+        std::vector<int> uniq_k; // uniq_k[t]: 등장한 고유 channel k_t 
+        std::vector<float> d_sum; // d_sum[uniq_k[t]]: 해당 channel의 누적 보상값
 
         // 메모리 예약
         uniq_k.reserve(I_ * alpha_);
-        s_k.reserve(I_ * alpha_);
+        d_sum.reserve(I_ * alpha_);
 
-        // unique_k 내 인덱스 (없으면 -1)
-        std::vector<int> mark(K_, -1);
+        // unique_k 내 인덱스 => map(k, t)
+        // mark[k] == t <-> uniq_k[t] == k
+        std::vector<int> mark(K_, -1); // mark[k] = t이면 k가 uniq_k[t]에 존재. 없으면 -1
 
         for (size_t r = 0; r < I_; ++r)
         {
@@ -139,26 +141,27 @@ namespace aisa
                     idx = (int)uniq_k.size();
                     mark[k] = idx;
                     uniq_k.push_back(k);
-                    s_k.push_back(d); // s_k[idx] = d
+                    d_sum.push_back(d); // d_sum[idx] = d
                 }
                 else
-                    s_k[idx] += d; // 누적
+                    d_sum[idx] += d; // 누적
             }
         }
+        uint64_t end = read_cycles();
+        printf("[layer=%s][Compute per-k sum d_{sum}[k]] start = %lu, end = %lu, elapsed = %lu\n", layer_, start, end, end - start);
 
-        // 2) 고유 k만 스캔하여 y_com 누적
+        // step. 2) 고유 k만 스캔하여 y_com 누적
+        start = read_cycles();
         for (size_t t = 0; t < uniq_k.size(); ++t)
         {
             int k = uniq_k[t];
             const int8_t *wrow = W + (size_t)k * stride_W; // W[k,:]
-            float s = s_k[t];
+            float s = d_sum[t];
 
             for (size_t j = 0; j < J; ++j)
                 y_com[j] += s * (float)wrow[j];
         }
-
-        // 3) mark 리셋 (sparse reset)
-        for (int k : uniq_k)
-            mark[k] = -1;
+        end = read_cycles();
+        printf("[layer=%s][Accumulate y_{com} using unique k values] start = %lu, end = %lu, elapsed = %lu\n", layer_, start, end, end - start);
     }
 }
