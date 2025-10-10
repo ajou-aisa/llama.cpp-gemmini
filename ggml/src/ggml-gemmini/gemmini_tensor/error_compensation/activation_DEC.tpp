@@ -10,25 +10,19 @@ namespace aisa
                                    const BenchTensor<int8_t> *qW,
                                    ggml_tensor *C_out)
     {
-        ActivationDEC dec(A, qA);
+        ActivationDEC dec(A, qA, qW);
         dec.layer_= labelFromWeight(qW->getName().c_str()); // layer 이름 추출
 
         // 전처리(Top-K 선택 및 residual 계산) + 로깅
         dec.prepare();
 
-        const size_t J = qW->getCols();
-        std::vector<float> y_com(J, 0.f);
+        std::vector<float> y_com(dec.J_, 0.f);
 
         const int8_t *What = static_cast<const int8_t *>(qW->get());
 
-        dec.computeCompensation_kGrouped(What, J, y_com.data());
+        dec.computeCompensation_kGrouped(What, dec.J_, y_com.data());
 
-        start = read_cycles();
-        float *y_fp = static_cast<float *>(C_out->data);
-        for (size_t i = 0; i < J; ++i)
-            y_fp[i] += y_com[i] * SCALE_W; // W scale 로 dequantize
-        end = read_cycles();
-        printf("[layer=%s][Apply compensation to output] start = %lu, end = %lu, elapsed = %lu\n", dec.layer_, start, end, end - start);
+        dec.applyCompensation(C_out, y_com);
     }
 
     void ActivationDEC::prepare()
@@ -36,7 +30,7 @@ namespace aisa
         // A의 dimension: ne[0]=K (columns), ne[1]=I (rows)
         K_ = static_cast<size_t>(A_->ne[0]); // cols
         I_ = static_cast<size_t>(A_->ne[1]); // rows
-
+        J_ = qW_->getCols();
         // row별 Top-K 개수
         alpha_ = std::max<size_t>(1, std::min(K_, static_cast<size_t>(std::llround(K_ * DEC_ALPHA_RATIO))));
 
@@ -165,5 +159,16 @@ namespace aisa
         }
         end = read_cycles();
         printf("[layer=%s][Accumulate y_{com} using unique k values] start = %lu, end = %lu, elapsed = %lu\n", layer_, start, end, end - start);
+    }
+
+    void ActivationDEC::applyCompensation(ggml_tensor *C_out, const std::vector<float> &y_com) {
+        uint64_t start = read_cycles();
+
+        float *y_fp = static_cast<float *>(C_out->data);
+        for (size_t i = 0; i < J_; ++i)
+            y_fp[i] += y_com[i] * SCALE_W; // W scale 로 dequantize
+        
+        end = read_cycles();
+        printf("[layer=%s][Apply compensation to output] start = %lu, end = %lu, elapsed = %lu\n", layer_, start, end, end - start);
     }
 }
