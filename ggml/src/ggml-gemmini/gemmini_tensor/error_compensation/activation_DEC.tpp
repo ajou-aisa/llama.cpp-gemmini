@@ -21,17 +21,14 @@ namespace aisa
 
         const int8_t *What = static_cast<const int8_t *>(qW->get());
 
-        uint64_t start = read_cycles();
         dec.computeCompensation_kGrouped(What, J, y_com.data());
-        uint64_t end = read_cycles();
-        printf("[layer=%s][computeCompensation] start = %lu, end = %lu, elapsed = %lu\n", dec.layer_, start, end, end - start);
 
         start = read_cycles();
         float *y_fp = static_cast<float *>(C_out->data);
         for (size_t i = 0; i < J; ++i)
             y_fp[i] += y_com[i] * SCALE_W; // W scale 로 dequantize
         end = read_cycles();
-        printf("[layer=%s][applyCompensation] start = %lu, end = %lu, elapsed = %lu\n", dec.layer_, start, end, end - start);
+        printf("[layer=%s][Apply compensation to output] start = %lu, end = %lu, elapsed = %lu\n", dec.layer_, start, end, end - start);
     }
 
     void ActivationDEC::prepare()
@@ -52,34 +49,37 @@ namespace aisa
         const size_t stride_qA = qA_->getStride();
 
         // 각 row마다 Top-K 선택 + Residual 계산
-        uint64_t start = read_cycles();
         for (size_t r = 0; r < I_; ++r)
         {
             const float *row_fp = x + r * K_;
             const int8_t *row_q = qx + r * stride_qA;
             selectTopKandComputeResidual(r, row_fp, row_q);
         }
-        uint64_t end = read_cycles();
-        printf("[layer=%s][selectTopKandComputeResidual] start = %lu, end = %lu, elapsed = %lu\n", layer_, start, end, end - start);
+
     }
 
     void ActivationDEC::selectTopKandComputeResidual(size_t row_idx, 
                                                       const float *row_fp, 
                                                       const int8_t *row_q)
     {
-        // 임시 벡터: 절대값과 인덱스
+        //Step 1: Create temporary vector with absolute values
         std::vector<std::pair<float, int>> temp(K_);
         for (size_t k = 0; k < K_; ++k)
             temp[k] = {std::abs(row_fp[k]), static_cast<int>(k)};
 
-        // partial_sort: 상위 alpha_개만 정렬 (O(K log alpha))
+        uint64_t start = read_cycles();
+        // Step 2: Partial sort to find top-alpha channels
         std::partial_sort(temp.begin(), temp.begin() + alpha_, temp.end(), [](const auto &a, const auto &b)
                           { return a.first > b.first; });
+        uint64_t end = read_cycles();
+        printf("[layer=%s][Partial sort to find top-alpha channels] start = %lu, end = %lu, elapsed = %lu\n", layer_, start, end, end - start);
 
-        // Top-K 인덱스 저장 + Residual 계산
+
+        // Step 3: Store indices and compute residual
         S_[row_idx].resize(alpha_);
         delta_[row_idx].resize(alpha_);
 
+        start = read_cycles();
         for (size_t i = 0; i < alpha_; ++i)
         {
             const int k = temp[i].second;
@@ -90,6 +90,8 @@ namespace aisa
             const float xhat = static_cast<float>(row_q[k]) * SCALE;
             delta_[row_idx][i] = row_fp[k] - xhat; // delat: dequantize 오차 
         }
+        end = read_cycles();
+        printf("[layer=%s][Store indices and compute residual] start = %lu, end = %lu, elapsed = %lu\n", layer_, start, end, end - start);
     }
 
     void ActivationDEC::computeCompensation(const int8_t *W, size_t J, float *y_com)
