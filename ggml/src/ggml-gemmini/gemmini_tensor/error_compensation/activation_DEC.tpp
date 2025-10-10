@@ -11,9 +11,12 @@ namespace aisa
                                    ggml_tensor *C_out)
     {
         ActivationDEC dec(A, qA);
+        dec.layer_= labelFromWeight(qW->getName().c_str()); // layer 이름 추출
+
+        // 전처리(Top-K 선택 및 residual 계산) + 로깅
+        dec.prepare();
 
         const size_t J = qW->getCols();
-        dec.layer_= labelFromWeight(qW->getName().c_str()); // layer 이름 추출
         std::vector<float> y_com(J, 0.f);
 
         const int8_t *What = static_cast<const int8_t *>(qW->get());
@@ -31,24 +34,24 @@ namespace aisa
         printf("[layer=%s][applyCompensation] start = %lu, end = %lu, elapsed = %lu\n", dec.layer_, start, end, end - start);
     }
 
-    ActivationDEC::ActivationDEC(const ggml_tensor *A, const BenchTensor<int8_t> *qA)
-        : A_(A), qA_(qA)
+    void ActivationDEC::prepare()
     {
         // A의 dimension: ne[0]=K (columns), ne[1]=I (rows)
-        K_ = static_cast<size_t>(A_->ne[0]);
-        I_ = static_cast<size_t>(A_->ne[1]);
+        K_ = static_cast<size_t>(A_->ne[0]); // cols
+        I_ = static_cast<size_t>(A_->ne[1]); // rows
 
-        // row 별 Top_K 개수
+        // row별 Top-K 개수
         alpha_ = std::max<size_t>(1, std::min(K_, static_cast<size_t>(std::llround(K_ * DEC_ALPHA_RATIO))));
 
-        S_.resize(I_);
-        delta_.resize(I_);
+        // 버퍼 준비
+        S_.assign(I_, {});
+        delta_.assign(I_, {});
 
         const float *x = static_cast<const float *>(A_->data);
         const int8_t *qx = static_cast<const int8_t *>(qA_->get());
         const size_t stride_qA = qA_->getStride();
 
-        // 각 row마다 Top-K 선택 + Residual 계산 병합
+        // 각 row마다 Top-K 선택 + Residual 계산
         uint64_t start = read_cycles();
         for (size_t r = 0; r < I_; ++r)
         {
