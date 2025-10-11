@@ -100,10 +100,10 @@ namespace aisa
         const auto &Sr = S_[0];
         const auto &Dr = delta_[0];
 
-        const size_t JB = (J >= 8192 ? 4096 : J); // J가 작으면 무타일
+        const size_t JB = (J >= 8192 ? 4096 : J);
         std::vector<float> wbuf(JB);
 
-        uint64_t t0 = read_cycles();
+        uint64_t start = read_cycles();
         uint64_t conv_time = 0, acc_time = 0;
 
         for (size_t j0 = 0; j0 < J; j0 += JB)
@@ -129,10 +129,19 @@ namespace aisa
             }
         }
 
-        uint64_t t1 = read_cycles();
-        printf("[layer=%s][Row-major I=1] J=%zu, alpha=%zu, JB=%zu | total=%lu, conv=%lu (%.1f%%), acc=%lu (%.1f%%)\n",
-               layer_, J, alpha_, (J >= 8192 ? (size_t)4096 : J),
-               (t1 - t0), conv_time, 100.0 * conv_time / (t1 - t0), acc_time, 100.0 * acc_time / (t1 - t0));
+        uint64_t end = read_cycles();
+        uint64_t total = end - start;
+        uint64_t overhead = (total > conv_time + acc_time) ? (total - conv_time - acc_time) : 0;
+
+        printf("[layer=%s][Row-major I=1] start = %lu, end = %lu, elapsed = %lu\n",
+               layer_, start, end, total);
+        printf("[layer=%s][  ├─ J=%zu, alpha=%zu, JB=%zu\n", layer_, J, alpha_, JB);
+        printf("[layer=%s][  ├─ Conversion time] %lu (%.1f%%)\n",
+               layer_, conv_time, 100.0 * conv_time / total);
+        printf("[layer=%s][  ├─ Accumulation time] %lu (%.1f%%)\n",
+               layer_, acc_time, 100.0 * acc_time / total);
+        printf("[layer=%s][  └─ Overhead time] %lu (%.1f%%)\n",
+               layer_, overhead, 100.0 * overhead / total);
     }
 
     void ActivationDEC::computeCompensation_CSC(const int8_t *W, size_t J, float *y_com)
@@ -141,12 +150,13 @@ namespace aisa
         const size_t JB = (J >= 8192 ? 4096 : J);
         std::vector<float> wbuf(JB);
 
-        // 0) unique_k 추출 (O(I*alpha))
-        uint64_t u0 = read_cycles();
+        // 0) unique_k 추출
+        uint64_t u_start = read_cycles();
         std::vector<int> unique_k;
         unique_k.reserve(I_ * alpha_);
         std::vector<uint8_t> seen(K_, 0);
         size_t nnz = 0;
+
         for (int r = 0; r < (int)I_; ++r)
         {
             nnz += S_[r].size();
@@ -161,13 +171,13 @@ namespace aisa
                 }
             }
         }
-        uint64_t u1 = read_cycles();
+        uint64_t u_end = read_cycles();
 
-        printf("[layer=%s][DEC setup] I=%zu, J=%zu, K=%zu, alpha=%zu, nnz=%zu, unique_k=%zu, JB=%zu | uniq_build=%lu\n",
-               layer_, I_, J_, K_, alpha_, nnz, unique_k.size(), JB, (u1 - u0));
+        printf("[layer=%s][Build unique_k from S_] start = %lu, end = %lu, elapsed = %lu (I=%zu, J=%zu, K=%zu, alpha=%zu, nnz=%zu, unique_k=%zu, JB=%zu)\n",
+               layer_, u_start, u_end, u_end - u_start, I_, J_, K_, alpha_, nnz, unique_k.size(), JB);
 
         // 1) 메인 루프
-        uint64_t t0 = read_cycles();
+        uint64_t start = read_cycles();
         uint64_t conv_time = 0, acc_time = 0, lookup_time = 0;
 
         for (size_t j0 = 0; j0 < J; j0 += JB)
@@ -183,13 +193,13 @@ namespace aisa
                     wbuf[j] = (float)wrow_i8[j];
                 conv_time += (read_cycles() - c0);
 
-                // 선택 행만 누적 (I <= 6 → 선형 탐색으로도 충분)
+                // 선택 행만 누적
                 for (int r = 0; r < (int)I_; ++r)
                 {
                     const auto &Sr = S_[r];
                     const auto &Dr = delta_[r];
 
-                    // lookup을 hit/미스 모두 포함해서 측정
+                    // lookup 측정
                     uint64_t l0 = read_cycles();
                     float d = 0.f;
                     bool hit = false;
@@ -218,18 +228,22 @@ namespace aisa
             }
         }
 
-        uint64_t t1 = read_cycles();
-        uint64_t total = (t1 - t0);
+        uint64_t end = read_cycles();
+        uint64_t total = end - start;
         uint64_t overhead = (total > conv_time + acc_time + lookup_time)
                                 ? (total - conv_time - acc_time - lookup_time)
                                 : 0;
 
-        printf("[layer=%s][Column on-the-fly] total=%lu | conv=%lu (%.1f%%), acc=%lu (%.1f%%), lookup=%lu (%.1f%%), overhead=%lu (%.1f%%)\n",
-               layer_, total,
-               conv_time, 100.0 * conv_time / total,
-               acc_time, 100.0 * acc_time / total,
-               lookup_time, 100.0 * lookup_time / total,
-               overhead, 100.0 * overhead / total);
+        printf("[layer=%s][Column on-the-fly main loop] start = %lu, end = %lu, elapsed = %lu\n",
+               layer_, start, end, total);
+        printf("[layer=%s][  ├─ Conversion time] %lu (%.1f%%)\n",
+               layer_, conv_time, 100.0 * conv_time / total);
+        printf("[layer=%s][  ├─ Accumulation time] %lu (%.1f%%)\n",
+               layer_, acc_time, 100.0 * acc_time / total);
+        printf("[layer=%s][  ├─ Lookup time] %lu (%.1f%%)\n",
+               layer_, lookup_time, 100.0 * lookup_time / total);
+        printf("[layer=%s][  └─ Overhead time] %lu (%.1f%%)\n",
+               layer_, overhead, 100.0 * overhead / total);
     }
 
     void ActivationDEC::applyCompensation(ggml_tensor *C_out, const std::vector<float> &y_com)
