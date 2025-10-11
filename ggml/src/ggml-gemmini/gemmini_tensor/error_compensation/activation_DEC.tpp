@@ -110,6 +110,7 @@ namespace aisa
 
     void ActivationDEC::computeCompensation_kGrouped(const int8_t *W, size_t J, float *y_com)
     {
+        printf("computeCompesation_kGrouped: I = %zu\n", I_);
         const size_t stride_W = J;
 
         uint64_t start = read_cycles();
@@ -168,7 +169,7 @@ namespace aisa
         for (size_t i = 0; i < J_; ++i)
             y_fp[i] += y_com[i] * SCALE_W; // W scale 로 dequantize
         
-        end = read_cycles();
+        uint64_t end = read_cycles();
         printf("[layer=%s][Apply compensation to output] start = %lu, end = %lu, elapsed = %lu\n", layer_, start, end, end - start);
     }
 }
