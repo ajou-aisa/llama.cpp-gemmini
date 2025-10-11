@@ -20,7 +20,7 @@ namespace aisa
 
         const int8_t *What = static_cast<const int8_t *>(qW->get());
 
-        dec.computeCompensation_kGrouped(What, dec.J_, y_com.data());
+        dec.computeCompensation_CSC(What, dec.J_, y_com.data());
 
         dec.applyCompensation(C_out, y_com);
     }
@@ -108,58 +108,113 @@ namespace aisa
         }
     }
 
-    void ActivationDEC::computeCompensation_kGrouped(const int8_t *W, size_t J, float *y_com)
+    void ActivationDEC::computeCompensation_CSC(const int8_t *W, size_t J, float *y_com)
     {
-        printf("computeCompesation_kGrouped: I = %zu\n", I_);
+        uint64_t start, end;
         const size_t stride_W = J;
 
-        uint64_t start = read_cycles();
-        // step. 1) k별 d-합 d_sum[k] 계산 (sparse)
-        std::vector<int> uniq_k; // uniq_k[t]: 등장한 고유 channel k_t 
-        std::vector<float> d_sum; // d_sum[uniq_k[t]]: 해당 channel의 누적 보상값
+        // ========== 1) CSR 구조 구성 ==========
+        start = read_cycles();
 
-        // 메모리 예약
-        uniq_k.reserve(I_ * alpha_);
-        d_sum.reserve(I_ * alpha_);
-
-        // unique_k 내 인덱스 => map(k, t)
-        // mark[k] == t <-> uniq_k[t] == k
-        std::vector<int> mark(K_, -1); // mark[k] = t이면 k가 uniq_k[t]에 존재. 없으면 -1
-
-        for (size_t r = 0; r < I_; ++r)
+        // 1-1) k별 개수 카운트
+        std::vector<int> cnt(K_, 0);
+        for (int r = 0; r < (int)I_; ++r)
         {
             for (size_t i = 0; i < alpha_; ++i)
             {
-                int k = S_[r][i];
-                float d = delta_[r][i];
-                int idx = mark[k];
-                if (idx < 0)
-                { // 첫 등장
-                    idx = (int)uniq_k.size();
-                    mark[k] = idx;
-                    uniq_k.push_back(k);
-                    d_sum.push_back(d); // d_sum[idx] = d
-                }
-                else
-                    d_sum[idx] += d; // 누적
+                ++cnt[S_[r][i]];
             }
         }
-        uint64_t end = read_cycles();
-        printf("[layer=%s][Compute per-k sum d_{sum}[k]] start = %lu, end = %lu, elapsed = %lu\n", layer_, start, end, end - start);
 
-        // step. 2) 고유 k만 스캔하여 y_com 누적
-        start = read_cycles();
-        for (size_t t = 0; t < uniq_k.size(); ++t)
-        {
-            int k = uniq_k[t];
-            const int8_t *wrow = W + (size_t)k * stride_W; // W[k,:]
-            float s = d_sum[t];
-
-            for (size_t j = 0; j < J; ++j)
-                y_com[j] += s * (float)wrow[j];
-        }
         end = read_cycles();
-        printf("[layer=%s][Accumulate y_{com} using unique k values] start = %lu, end = %lu, elapsed = %lu\n", layer_, start, end, end - start);
+        printf("[layer=%s][Count k occurrences] start=%lu, end=%lu, elapsed=%lu\n",
+               layer_, start, end, end - start);
+
+        // 1-2) prefix sum → 오프셋
+        start = read_cycles();
+
+        std::vector<int> off(K_ + 1, 0);
+        for (int k = 0; k < (int)K_; ++k)
+        {
+            off[k + 1] = off[k] + cnt[k];
+        }
+        const int nnz = off[K_];
+
+        end = read_cycles();
+        printf("[layer=%s][Compute prefix sum] start=%lu, end=%lu, elapsed=%lu\n",
+               layer_, start, end, end - start);
+
+        // 1-3) 저장 버퍼 사전 할당
+        start = read_cycles();
+
+        std::vector<int> row_idx(nnz);
+        std::vector<float> d_val(nnz);
+
+        end = read_cycles();
+        printf("[layer=%s][Allocate buffers] start=%lu, end=%lu, elapsed=%lu (nnz=%d)\n",
+               layer_, start, end, end - start, nnz);
+
+        // 1-4) 데이터 채우기
+        start = read_cycles();
+
+        std::fill(cnt.begin(), cnt.end(), 0);
+        for (int r = 0; r < (int)I_; ++r)
+        {
+            for (size_t i = 0; i < alpha_; ++i)
+            {
+                const int k = S_[r][i];
+                const int p = off[k] + cnt[k]++;
+                row_idx[p] = r;
+                d_val[p] = delta_[r][i];
+            }
+        }
+
+        end = read_cycles();
+        printf("[layer=%s][Fill CSR data] start=%lu, end=%lu, elapsed=%lu\n",
+               layer_, start, end, end - start);
+
+        // ========== 2) 메인 누적 루프 ==========
+        start = read_cycles();
+
+        uint64_t inner_loop_cycles = 0;
+        uint64_t conversion_cycles = 0;
+        int total_updates = 0;
+
+        for (int k = 0; k < (int)K_; ++k)
+        {
+            const int begin = off[k], end_idx = off[k + 1];
+            if (begin == end_idx)
+                continue;
+
+            const int8_t *wrow = W + (size_t)k * stride_W;
+
+            for (int p = begin; p < end_idx; ++p)
+            {
+                const int r = row_idx[p];
+                const float d = d_val[p];
+                float *y_row = y_com + (size_t)r * J;
+
+                uint64_t inner_start = read_cycles();
+
+                // 기본 루프 - 컴파일러 자동 벡터화 힌트
+                for (size_t j = 0; j < J; ++j)
+                {
+                    y_row[j] += d * (float)wrow[j];
+                }
+
+                inner_loop_cycles += read_cycles() - inner_start;
+                total_updates++;
+            }
+        }
+
+        end = read_cycles();
+        printf("[layer=%s][Main accumulation loop] start=%lu, end=%lu, elapsed=%lu\n",
+               layer_, start, end, end - start);
+        printf("[layer=%s][  └─ Inner loop average] cycles_per_update=%lu (total_updates=%d)\n",
+               layer_, total_updates > 0 ? inner_loop_cycles / total_updates : 0, total_updates);
+
+        // ========== 3) 총 사이클 요약 ==========
+        printf("[layer=%s][TOTAL] All cycles included above\n", layer_);
     }
 
     void ActivationDEC::applyCompensation(ggml_tensor *C_out, const std::vector<float> &y_com) {
