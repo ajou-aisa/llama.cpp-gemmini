@@ -16,146 +16,143 @@ namespace aisa
         // 전처리(Top-K 선택 및 residual 계산) + 로깅
         dec.prepare();
 
-        std::vector<float> y_com(dec.I_ * dec.J_, 0.f);
+        // y_com: IxJ 보상 행렬
+        std::vector<float> Y_com(dec.I_ * dec.J_, 0.f);
 
-        const int8_t *What = static_cast<const int8_t *>(qW->get());
+        const int8_t *W = static_cast<const int8_t *>(qW->get());
 
-        dec.computeCompensation(What, dec.J_, y_com.data());
+        dec.computeCompensation(W, Y_com.data());
 
-        dec.applyCompensation(C_out, y_com);
+        dec.applyCompensation(C_out, Y_com);
     }
 
     void ActivationDEC::prepare()
     {
-        // A의 dimension: ne[0]=K (columns), ne[1]=I (rows)
+        // dimension: I (rows), K (channels) J (outputs) α (salient 개수)
+        // ne[0]=K (columns), ne[1]=I (rows)
         K_ = static_cast<size_t>(A_->ne[0]); // cols
         I_ = static_cast<size_t>(A_->ne[1]); // rows
         J_ = qW_->getCols();
         // row별 Top-K 개수
         alpha_ = std::max<size_t>(1, std::min(K_, static_cast<size_t>(std::llround(K_ * DEC_ALPHA_RATIO))));
 
-        // 버퍼 준비
+        // S[r], δ[r,k] 초기화
         S_.assign(I_, {});
         delta_.assign(I_, {});
 
-        const float *x = static_cast<const float *>(A_->data);
-        const int8_t *qx = static_cast<const int8_t *>(qA_->get());
-        const size_t stride_qA = qA_->getStride();
+        const float *x = static_cast<const float *>(A_->data);      // x (F32)
+        const int8_t *qx = static_cast<const int8_t *>(qA_->get()); // x̂ (int8)
+        // getStide는 element 단위 <- BehcnTensor<int8_t>이므로 byte와 동일
+        const size_t stride_qA_elems = qA_->getStride();
 
-        // 각 row마다 Top-K 선택 + Residual 계산
+        // 각 행 r에 대해 Top-K 선택 + δ[r,k] 계산
         for (size_t r = 0; r < I_; ++r)
         {
-            const float *row_fp = x + r * K_;
-            const int8_t *row_q = qx + r * stride_qA;
-            selectTopKandComputeResidual(r, row_fp, row_q);
+            const float *x_r = x + r * K_;
+            const int8_t *qx_r = qx + r * stride_qA_elems;
+            selectTopKandComputeResidual(r, x_r, qx_r);
         }
     }
 
-    void ActivationDEC::selectTopKandComputeResidual(size_t row_idx,
-                                                     const float *row_fp,
-                                                     const int8_t *row_q)
+    void ActivationDEC::selectTopKandComputeResidual(size_t r,
+                                                     const float *x_r,   // x[r,:]
+                                                     const int8_t *qx_r) // x̂[r,:]
     {
+        uint64_t start, end;
         // Step 1: Create temporary vector with absolute values
+        start = read_cycles();
+        
         std::vector<std::pair<float, int>> temp(K_);
         for (size_t k = 0; k < K_; ++k)
-            temp[k] = {std::abs(row_fp[k]), static_cast<int>(k)};
+            temp[k] = {std::abs(x_r[k]), static_cast<int>(k)};
 
-        uint64_t start = read_cycles();
+        end = read_cycles();
+        printf("[layer=%s][Create temporary vector] start = %lu, end = %lu, elapsed = %lu\n", layer_, start, end, end - start);
+
         // Step 2: Partial sort to find top-alpha channels
+        start = read_cycles();
         std::partial_sort(temp.begin(), temp.begin() + alpha_, temp.end(), [](const auto &a, const auto &b)
                           { return a.first > b.first; });
         uint64_t end = read_cycles();
         printf("[layer=%s][Partial sort to find top-alpha channels] start = %lu, end = %lu, elapsed = %lu\n", layer_, start, end, end - start);
 
         // Step 3: Store indices and compute residual
-        S_[row_idx].resize(alpha_);
-        delta_[row_idx].resize(alpha_);
-
         start = read_cycles();
+        
+        S_[r].resize(alpha_);
+        delta_[r].resize(alpha_);
+        
         for (size_t i = 0; i < alpha_; ++i)
         {
             const int k = temp[i].second;
-            S_[row_idx][i] = k;
+            S_[r][i] = k;
 
             // Residual 계산
-            // origin: 0.811 -> quantized: 127 ~ 127
-            const float xhat = static_cast<float>(row_q[k]) * SCALE;
-            delta_[row_idx][i] = row_fp[k] - xhat; // delat: dequantize 오차
+            // δ[r,i] = x_i - x̂_i·s_x
+            delta_[r][i] = x_r[k] - static_cast<float>(qx_r[k]) * SCALE; // delta: dequantize 오차
         }
         end = read_cycles();
         printf("[layer=%s][Store indices and compute residual] start = %lu, end = %lu, elapsed = %lu\n", layer_, start, end, end - start);
     }
 
-    void ActivationDEC::computeCompensation(const int8_t *W, size_t J, float *y_com)
+    void ActivationDEC::computeCompensation(const int8_t *W, float *y_com)
     {
         if (I_ == 1)
-            computeCompensation_RowMajor(W, J, y_com);
+            computeCompensation_RowMajor(W, y_com);
         else
-            computeCompensation_CSC(W, J, y_com);
+            computeCompensation_CSC(W, y_com);
     }
 
-    void ActivationDEC::computeCompensation_RowMajor(const int8_t *W, size_t J, float *y_com)
+    void ActivationDEC::computeCompensation_RowMajor(const int8_t *W, float *Y_com)
     {
-        const size_t stride_W = J;
-        const auto &Sr = S_[0];
-        const auto &Dr = delta_[0];
+        uint64_t start, end;
+        const auto &S_r = S_[0];         // S[0]
+        const auto &delta_r = delta_[0]; // δ[r,:]
 
-        const size_t JB = (J >= 8192 ? 4096 : J);
-        std::vector<float> wbuf(JB);
+        const size_t JB = (J_ >= 8192 ? 4096 : J_);
+        std::vector<float> W_k_float(JB); // Ŵ[k, j_tile] float 변환 버퍼
 
-        uint64_t start = read_cycles();
-        uint64_t conv_time = 0, acc_time = 0;
+        // Step 1: Compute and accumulate compensation
+        start = read_cycles();
 
-        for (size_t j0 = 0; j0 < J; j0 += JB)
+        for (size_t j0 = 0; j0 < J_; j0 += JB)
         {
-            const size_t jb = std::min(JB, J - j0);
-            float *y = y_com + j0;
+            const size_t jb = std::min(JB, J_ - j0);
+            float *Y_tile = Y_com + j0;
 
-            for (size_t i = 0; i < Sr.size(); ++i)
+            for (size_t i = 0; i < S_r.size(); ++i)
             {
-                const int k = Sr[i];
-                const float d = Dr[i];
-                const int8_t *wrow_i8 = W + (size_t)k * stride_W + j0;
+                const int k = S_r[i];
+                const float d = delta_r[i];
+                const int8_t *W_k = W + (size_t)k * J_ + j0; // Ŵ[k, j_tile]
 
-                uint64_t c0 = read_cycles();
+                // Ŵ -> float 타입 캐스팅
                 for (size_t j = 0; j < jb; ++j)
-                    wbuf[j] = (float)wrow_i8[j];
-                conv_time += (read_cycles() - c0);
+                    W_k_float[j] = (float)W_k[j];
 
-                uint64_t a0 = read_cycles();
+                // Y_com[0,j] += δ[0,k] * Ŵ[k,j]
                 for (size_t j = 0; j < jb; ++j)
-                    y[j] += d * wbuf[j];
-                acc_time += (read_cycles() - a0);
+                    Y_tile[j] += d * W_k_float[j];
             }
         }
 
-        uint64_t end = read_cycles();
-        uint64_t total = end - start;
-        uint64_t overhead = (total > conv_time + acc_time) ? (total - conv_time - acc_time) : 0;
-
-        printf("[layer=%s][Row-major I=1] start = %lu, end = %lu, elapsed = %lu\n",
-               layer_, start, end, total);
-        printf("[layer=%s][  ├─ J=%zu, alpha=%zu, JB=%zu\n", layer_, J, alpha_, JB);
-        printf("[layer=%s][  ├─ Conversion time] %lu (%.1f%%)\n",
-               layer_, conv_time, 100.0 * conv_time / total);
-        printf("[layer=%s][  ├─ Accumulation time] %lu (%.1f%%)\n",
-               layer_, acc_time, 100.0 * acc_time / total);
-        printf("[layer=%s][  └─ Overhead time] %lu (%.1f%%)\n",
-               layer_, overhead, 100.0 * overhead / total);
+        end = read_cycles();
+        printf("[layer=%s][Compute and accumulate compensation] start = %lu, end = %lu, elapsed = %lu\n", layer_, start, end, end - start);
     }
 
-    void ActivationDEC::computeCompensation_CSC(const int8_t *W, size_t J, float *y_com)
+    void ActivationDEC::computeCompensation_CSC(const int8_t *W, float *Y_com)
     {
-        const size_t stride_W = J;
-        const size_t JB = (J >= 8192 ? 4096 : J);
-        std::vector<float> wbuf(JB);
+        uint64_t start, end;
 
-        // 0) unique_k 추출
-        uint64_t u_start = read_cycles();
+        const size_t JB = (J_ >= 8192 ? 4096 : J_);
+        std::vector<float> W_k_float(JB);
+
+        // Step 1: Build unique_k from S_
+        start = read_cycles();
         std::vector<int> unique_k;
         unique_k.reserve(I_ * alpha_);
         std::vector<uint8_t> seen(K_, 0);
-        size_t nnz = 0;
+        size_t nnz = 0; // number of non-zero
 
         for (int r = 0; r < (int)I_; ++r)
         {
@@ -171,94 +168,73 @@ namespace aisa
                 }
             }
         }
-        uint64_t u_end = read_cycles();
+        end = read_cycles();
 
-        printf("[layer=%s][Build unique_k from S_] start = %lu, end = %lu, elapsed = %lu (I=%zu, J=%zu, K=%zu, alpha=%zu, nnz=%zu, unique_k=%zu, JB=%zu)\n",
-               layer_, u_start, u_end, u_end - u_start, I_, J_, K_, alpha_, nnz, unique_k.size(), JB);
+        printf("[layer=%s][Build unique_k] start = %lu, end = %lu, elapsed = %lu\n", layer_, start, end, end - start);
 
-        // 1) 메인 루프
-        uint64_t start = read_cycles();
-        uint64_t conv_time = 0, acc_time = 0, lookup_time = 0;
+        // Step 2: Compute and accumulate compensation
+        start = read_cycles();
 
-        for (size_t j0 = 0; j0 < J; j0 += JB)
+        for (size_t j0 = 0; j0 < J_; j0 += JB)
         {
-            const size_t jb = std::min(JB, J - j0);
+            const size_t jb = std::min(JB, J_ - j0);
 
             for (int k : unique_k)
             {
-                // 변환: k, tile 당 1회
-                uint64_t c0 = read_cycles();
-                const int8_t *wrow_i8 = W + (size_t)k * stride_W + j0;
+                // int8->float 변환: k, tile 당 1회
+                const int8_t *W_k = W + (size_t)k * J_ + j0; // Ŵ[k, j_tile]
                 for (size_t j = 0; j < jb; ++j)
-                    wbuf[j] = (float)wrow_i8[j];
-                conv_time += (read_cycles() - c0);
+                    W_k_float[j] = (float)W_k[j];
 
                 // 선택 행만 누적
+                // Σ_{r∈R_k} where R_k = {r | k∈S[r]}
                 for (int r = 0; r < (int)I_; ++r)
                 {
-                    const auto &Sr = S_[r];
-                    const auto &Dr = delta_[r];
+                    const auto &S_r = S_[r];
+                    const auto &delta_r = delta_[r];
 
-                    // lookup 측정
-                    uint64_t l0 = read_cycles();
+                    // k ∈ S[r] 인가? (R_k 확인)
                     float d = 0.f;
                     bool hit = false;
-                    for (size_t i = 0; i < Sr.size(); ++i)
+                    for (size_t i = 0; i < S_r.size(); ++i)
                     {
-                        if (Sr[i] == k)
+                        if (S_r[i] == k)
                         {
-                            d = Dr[i];
+                            d = delta_r[i]; // δ[r,k]
                             hit = true;
                             break;
                         }
                     }
-                    uint64_t l1 = read_cycles();
-                    lookup_time += (l1 - l0);
 
-                    if (!hit)
+                    if (!hit) // r ∉ R_k
                         continue;
 
                     // 누적
-                    uint64_t a0 = read_cycles();
-                    float *y_row = y_com + (size_t)r * J + j0;
+                    // Y_com[r,j] += δ[r,k]·Ŵ[k,j]
+                    float *Y_r = Y_com + (size_t)r * J_ + j0;
                     for (size_t j = 0; j < jb; ++j)
-                        y_row[j] += d * wbuf[j];
-                    acc_time += (read_cycles() - a0);
+                        Y_r[j] += d * W_k_float[j];
                 }
             }
         }
 
-        uint64_t end = read_cycles();
-        uint64_t total = end - start;
-        uint64_t overhead = (total > conv_time + acc_time + lookup_time)
-                                ? (total - conv_time - acc_time - lookup_time)
-                                : 0;
-
-        printf("[layer=%s][Column on-the-fly main loop] start = %lu, end = %lu, elapsed = %lu\n",
-               layer_, start, end, total);
-        printf("[layer=%s][  ├─ Conversion time] %lu (%.1f%%)\n",
-               layer_, conv_time, 100.0 * conv_time / total);
-        printf("[layer=%s][  ├─ Accumulation time] %lu (%.1f%%)\n",
-               layer_, acc_time, 100.0 * acc_time / total);
-        printf("[layer=%s][  ├─ Lookup time] %lu (%.1f%%)\n",
-               layer_, lookup_time, 100.0 * lookup_time / total);
-        printf("[layer=%s][  └─ Overhead time] %lu (%.1f%%)\n",
-               layer_, overhead, 100.0 * overhead / total);
+        end = read_cycles();
+        printf("[layer=%s][Compute and accumulate compensation] start = %lu, end = %lu, elapsed = %lu\n", layer_, start, end, end - start);
     }
 
-    void ActivationDEC::applyCompensation(ggml_tensor *C_out, const std::vector<float> &y_com)
+    void ActivationDEC::applyCompensation(ggml_tensor *C_out, const std::vector<float> &Y_com)
     {
         uint64_t start = read_cycles();
 
         float *C = static_cast<float *>(C_out->data);
-        const size_t ldc = C_out->nb[1] / sizeof(float); // ggml row stride
+        const size_t stride_C = C_out->nb[1] / sizeof(float); // ggml row stride
         for (size_t r = 0; r < I_; ++r)
         {
-            const float *y = y_com.data() + r * J_;
-            float *crow = C + r * ldc;
+            const float *Y_r = Y_com.data() + r * J_;
+            float *C_r = C + r * stride_C;
             // s_w는 여기서 한 번만 적용하거나, 위 누적 루프에서 d에 곱해도 됨(둘 중 하나만)
             for (size_t j = 0; j < J_; ++j)
-                crow[j] += y[j] * SCALE_W;
+                C_r[j] += Y_r[j] * SCALE_W;
         }
 
         uint64_t end = read_cycles();

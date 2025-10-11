@@ -39,9 +39,9 @@ namespace aisa
                       const BenchTensor<int8_t> *qW) : A_(A), qA_(qA), qW_(qW){}
         void prepare();
         void selectTopKandComputeResidual(size_t row_idx, const float *row_fp, const int8_t *row_q);
-        void computeCompensation(const int8_t *W, size_t J, float *y_out);
-        void computeCompensation_RowMajor(const int8_t *W, size_t J, float *y_com);
-        void computeCompensation_CSC(const int8_t *W, size_t J, float *y_com);
+        void computeCompensation(const int8_t *W, float *y_out);
+        void computeCompensation_RowMajor(const int8_t *W, float *y_com);
+        void computeCompensation_CSC(const int8_t *W, float *y_com);
         void applyCompensation(ggml_tensor *C_out, const std::vector<float> &y_com);
     };
 }
