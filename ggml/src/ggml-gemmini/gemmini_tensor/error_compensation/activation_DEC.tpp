@@ -73,7 +73,7 @@ namespace aisa
         start = read_cycles();
         std::partial_sort(temp.begin(), temp.begin() + alpha_, temp.end(), [](const auto &a, const auto &b)
                           { return a.first > b.first; });
-        uint64_t end = read_cycles();
+        end = read_cycles();
         printf("[layer=%s][Partial sort to find top-alpha channels] start = %lu, end = %lu, elapsed = %lu\n", layer_, start, end, end - start);
 
         // Step 3: Store indices and compute residual
