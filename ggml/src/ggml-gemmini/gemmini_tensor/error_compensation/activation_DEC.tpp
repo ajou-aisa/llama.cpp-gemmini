@@ -128,7 +128,7 @@ namespace aisa
 
         end = read_cycles();
         printf("[layer=%s][Count k occurrences] start=%lu, end=%lu, elapsed=%lu\n",
-               layer_, start, end, end - start);
+            layer_, start, end, end - start);
 
         // 1-2) prefix sum → 오프셋
         start = read_cycles();
@@ -142,7 +142,7 @@ namespace aisa
 
         end = read_cycles();
         printf("[layer=%s][Compute prefix sum] start=%lu, end=%lu, elapsed=%lu\n",
-               layer_, start, end, end - start);
+            layer_, start, end, end - start);
 
         // 1-3) 저장 버퍼 사전 할당
         start = read_cycles();
@@ -152,7 +152,7 @@ namespace aisa
 
         end = read_cycles();
         printf("[layer=%s][Allocate buffers] start=%lu, end=%lu, elapsed=%lu (nnz=%d)\n",
-               layer_, start, end, end - start, nnz);
+            layer_, start, end, end - start, nnz);
 
         // 1-4) 데이터 채우기
         start = read_cycles();
@@ -171,14 +171,18 @@ namespace aisa
 
         end = read_cycles();
         printf("[layer=%s][Fill CSR data] start=%lu, end=%lu, elapsed=%lu\n",
-               layer_, start, end, end - start);
+            layer_, start, end, end - start);
 
-        // ========== 2) 메인 누적 루프 ==========
+        // ========== 2) 메인 누적 루프 (최적화) ==========
         start = read_cycles();
 
-        uint64_t inner_loop_cycles = 0;
-        uint64_t conversion_cycles = 0;
+        uint64_t conversion_time = 0;
+        uint64_t accumulation_time = 0;
         int total_updates = 0;
+        int active_k_count = 0;
+
+        // W를 float로 변환할 임시 버퍼 (재사용)
+        std::vector<float> wrow_float(J);
 
         for (int k = 0; k < (int)K_; ++k)
         {
@@ -186,34 +190,69 @@ namespace aisa
             if (begin == end_idx)
                 continue;
 
-            const int8_t *wrow = W + (size_t)k * stride_W;
+            active_k_count++;
+            const int8_t *wrow_int8 = W + (size_t)k * stride_W;
 
+            // ===== 최적화 1: W[k,:]를 float로 한 번만 변환 =====
+            uint64_t conv_start = read_cycles();
+            
+            for (size_t j = 0; j < J; ++j)
+            {
+                wrow_float[j] = (float)wrow_int8[j];
+            }
+            
+            conversion_time += read_cycles() - conv_start;
+
+            // ===== 최적화 2: 변환된 float 배열을 모든 관련 행에 재사용 =====
+            uint64_t acc_start = read_cycles();
+            
             for (int p = begin; p < end_idx; ++p)
             {
                 const int r = row_idx[p];
                 const float d = d_val[p];
                 float *y_row = y_com + (size_t)r * J;
 
-                uint64_t inner_start = read_cycles();
-
-                // 기본 루프 - 컴파일러 자동 벡터화 힌트
-                for (size_t j = 0; j < J; ++j)
+                // 최적화 3: 8-way 루프 언롤링
+                size_t j = 0;
+                for (; j + 8 <= J; j += 8)
                 {
-                    y_row[j] += d * (float)wrow[j];
+                    y_row[j+0] += d * wrow_float[j+0];
+                    y_row[j+1] += d * wrow_float[j+1];
+                    y_row[j+2] += d * wrow_float[j+2];
+                    y_row[j+3] += d * wrow_float[j+3];
+                    y_row[j+4] += d * wrow_float[j+4];
+                    y_row[j+5] += d * wrow_float[j+5];
+                    y_row[j+6] += d * wrow_float[j+6];
+                    y_row[j+7] += d * wrow_float[j+7];
                 }
-
-                inner_loop_cycles += read_cycles() - inner_start;
+                
+                // 나머지 처리
+                for (; j < J; ++j)
+                {
+                    y_row[j] += d * wrow_float[j];
+                }
+                
                 total_updates++;
             }
+            
+            accumulation_time += read_cycles() - acc_start;
         }
 
         end = read_cycles();
+        uint64_t total_time = end - start;
+        uint64_t overhead_time = total_time - conversion_time - accumulation_time;
+        
         printf("[layer=%s][Main accumulation loop] start=%lu, end=%lu, elapsed=%lu\n",
-               layer_, start, end, end - start);
-        printf("[layer=%s][  └─ Inner loop average] cycles_per_update=%lu (total_updates=%d)\n",
-               layer_, total_updates > 0 ? inner_loop_cycles / total_updates : 0, total_updates);
+            layer_, start, end, total_time);
+        printf("[layer=%s][  ├─ Conversion time] %lu (%.1f%%) - int8→float for %d active k\n",
+            layer_, conversion_time, 100.0 * conversion_time / total_time, active_k_count);
+        printf("[layer=%s][  ├─ Accumulation time] %lu (%.1f%%) - FMA operations\n",
+            layer_, accumulation_time, 100.0 * accumulation_time / total_time);
+        printf("[layer=%s][  └─ Overhead time] %lu (%.1f%%) - loop/indexing overhead\n",
+            layer_, overhead_time, 100.0 * overhead_time / total_time);
+        printf("[layer=%s][  └─ Stats] %d updates, avg cycles/update=%lu\n",
+            layer_, total_updates, total_updates > 0 ? accumulation_time / total_updates : 0);
 
-        // ========== 3) 총 사이클 요약 ==========
         printf("[layer=%s][TOTAL] All cycles included above\n", layer_);
     }
 
