@@ -113,147 +113,108 @@ namespace aisa
         uint64_t start, end;
         const size_t stride_W = J;
 
-        // ========== 1) CSR 구조 구성 ==========
+        // ===== 1) S_에서 k별 데이터 구조 구성 =====
         start = read_cycles();
-
-        // 1-1) k별 개수 카운트
-        std::vector<int> cnt(K_, 0);
+        
+        // k별 등장 횟수 카운트
+        std::vector<int> k_count(K_, 0);
         for (int r = 0; r < (int)I_; ++r)
         {
             for (size_t i = 0; i < alpha_; ++i)
             {
-                ++cnt[S_[r][i]];
+                ++k_count[S_[r][i]];
             }
         }
-
-        end = read_cycles();
-        printf("[layer=%s][Count k occurrences] start=%lu, end=%lu, elapsed=%lu\n",
-            layer_, start, end, end - start);
-
-        // 1-2) prefix sum → 오프셋
-        start = read_cycles();
-
-        std::vector<int> off(K_ + 1, 0);
+        
+        // Prefix sum으로 각 k의 데이터 시작 위치 계산
+        std::vector<int> k_offset(K_ + 1, 0);
         for (int k = 0; k < (int)K_; ++k)
         {
-            off[k + 1] = off[k] + cnt[k];
+            k_offset[k + 1] = k_offset[k] + k_count[k];
         }
-        const int nnz = off[K_];
-
-        end = read_cycles();
-        printf("[layer=%s][Compute prefix sum] start=%lu, end=%lu, elapsed=%lu\n",
-            layer_, start, end, end - start);
-
-        // 1-3) 저장 버퍼 사전 할당
-        start = read_cycles();
-
+        const int nnz = k_offset[K_];
+        
+        // (r, delta) 쌍을 저장할 배열
         std::vector<int> row_idx(nnz);
         std::vector<float> d_val(nnz);
-
-        end = read_cycles();
-        printf("[layer=%s][Allocate buffers] start=%lu, end=%lu, elapsed=%lu (nnz=%d)\n",
-            layer_, start, end, end - start, nnz);
-
-        // 1-4) 데이터 채우기
-        start = read_cycles();
-
-        std::fill(cnt.begin(), cnt.end(), 0);
+        
+        // 데이터 채우기
+        std::fill(k_count.begin(), k_count.end(), 0);
         for (int r = 0; r < (int)I_; ++r)
         {
             for (size_t i = 0; i < alpha_; ++i)
             {
                 const int k = S_[r][i];
-                const int p = off[k] + cnt[k]++;
+                const int p = k_offset[k] + k_count[k]++;
                 row_idx[p] = r;
                 d_val[p] = delta_[r][i];
             }
         }
-
+        
         end = read_cycles();
-        printf("[layer=%s][Fill CSR data] start=%lu, end=%lu, elapsed=%lu\n",
-            layer_, start, end, end - start);
+        printf("[layer=%s][Build CSC structure from S_] start=%lu, end=%lu, elapsed=%lu (nnz=%d)\n",
+            layer_, start, end, end - start, nnz);
 
-        // ========== 2) 메인 누적 루프 (최적화) ==========
+        // ===== 2) Salient channel만 순회하며 처리 =====
         start = read_cycles();
 
         uint64_t conversion_time = 0;
         uint64_t accumulation_time = 0;
-        int total_updates = 0;
-        int active_k_count = 0;
-
-        // W를 float로 변환할 임시 버퍼 (재사용)
+        int salient_k_count = 0;
+        
+        // W row를 float로 변환할 재사용 버퍼
         std::vector<float> wrow_float(J);
 
         for (int k = 0; k < (int)K_; ++k)
         {
-            const int begin = off[k], end_idx = off[k + 1];
-            if (begin == end_idx)
-                continue;
-
-            active_k_count++;
+            const int begin = k_offset[k];
+            const int end_idx = k_offset[k + 1];
+            
+            // 이 k가 선택되지 않았으면 건너뜀
+            if (begin == end_idx) continue;
+            
+            salient_k_count++;
             const int8_t *wrow_int8 = W + (size_t)k * stride_W;
 
-            // ===== 최적화 1: W[k,:]를 float로 한 번만 변환 =====
+            // W[k,:]를 float로 한 번만 변환
             uint64_t conv_start = read_cycles();
-            
             for (size_t j = 0; j < J; ++j)
             {
                 wrow_float[j] = (float)wrow_int8[j];
             }
-            
             conversion_time += read_cycles() - conv_start;
 
-            // ===== 최적화 2: 변환된 float 배열을 모든 관련 행에 재사용 =====
+            // 이 k를 선택한 모든 행에 적용
             uint64_t acc_start = read_cycles();
-            
             for (int p = begin; p < end_idx; ++p)
             {
                 const int r = row_idx[p];
                 const float d = d_val[p];
                 float *y_row = y_com + (size_t)r * J;
 
-                // 최적화 3: 8-way 루프 언롤링
-                size_t j = 0;
-                for (; j + 8 <= J; j += 8)
-                {
-                    y_row[j+0] += d * wrow_float[j+0];
-                    y_row[j+1] += d * wrow_float[j+1];
-                    y_row[j+2] += d * wrow_float[j+2];
-                    y_row[j+3] += d * wrow_float[j+3];
-                    y_row[j+4] += d * wrow_float[j+4];
-                    y_row[j+5] += d * wrow_float[j+5];
-                    y_row[j+6] += d * wrow_float[j+6];
-                    y_row[j+7] += d * wrow_float[j+7];
-                }
-                
-                // 나머지 처리
-                for (; j < J; ++j)
+                // 단순 루프 (컴파일러 자동 최적화 의존)
+                for (size_t j = 0; j < J; ++j)
                 {
                     y_row[j] += d * wrow_float[j];
                 }
-                
-                total_updates++;
             }
-            
             accumulation_time += read_cycles() - acc_start;
         }
 
         end = read_cycles();
         uint64_t total_time = end - start;
-        uint64_t overhead_time = total_time - conversion_time - accumulation_time;
+        uint64_t overhead = total_time - conversion_time - accumulation_time;
         
-        printf("[layer=%s][Main accumulation loop] start=%lu, end=%lu, elapsed=%lu\n",
+        printf("[layer=%s][Main loop (salient k only)] start=%lu, end=%lu, elapsed=%lu\n",
             layer_, start, end, total_time);
-        printf("[layer=%s][  ├─ Conversion time] %lu (%.1f%%) - int8→float for %d active k\n",
-            layer_, conversion_time, 100.0 * conversion_time / total_time, active_k_count);
-        printf("[layer=%s][  ├─ Accumulation time] %lu (%.1f%%) - FMA operations\n",
+        printf("[layer=%s][  ├─ Salient channels] %d / %d (%.1f%%)\n",
+            layer_, salient_k_count, (int)K_, 100.0 * salient_k_count / K_);
+        printf("[layer=%s][  ├─ Conversion time] %lu (%.1f%%)\n",
+            layer_, conversion_time, 100.0 * conversion_time / total_time);
+        printf("[layer=%s][  ├─ Accumulation time] %lu (%.1f%%)\n",
             layer_, accumulation_time, 100.0 * accumulation_time / total_time);
-        printf("[layer=%s][  └─ Overhead time] %lu (%.1f%%) - loop/indexing overhead\n",
-            layer_, overhead_time, 100.0 * overhead_time / total_time);
-        printf("[layer=%s][  └─ Stats] %d updates, avg cycles/update=%lu\n",
-            layer_, total_updates, total_updates > 0 ? accumulation_time / total_updates : 0);
-
-        printf("[layer=%s][TOTAL] All cycles included above\n", layer_);
+        printf("[layer=%s][  └─ Overhead time] %lu (%.1f%%)\n",
+            layer_, overhead, 100.0 * overhead / total_time);
     }
 
     void ActivationDEC::applyCompensation(ggml_tensor *C_out, const std::vector<float> &y_com) {
