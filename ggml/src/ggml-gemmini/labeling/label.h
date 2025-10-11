@@ -7,7 +7,7 @@ static inline const char *labelFromWeight(const char *w_name)
     if (!w_name)
         return "others";
     if (strstr(w_name, "token_embd"))
-        return "token_embd";z
+        return "token_embd";
     if (strstr(w_name, "position_embd"))
         return "position_embd";
     if (strstr(w_name, "attn_qkv"))
