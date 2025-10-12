@@ -21,7 +21,7 @@ namespace aisa
         std::vector<float> Y_com(dec.I_ * dec.J_, 0.f);
         const int8_t *W = static_cast<const int8_t *>(qW->get());
 
-        dec.computeCompensation(W, Y_com.data());
+        dec.computeCompensation_unrolled(W, Y_com.data());
         dec.applyCompensation(C_out, Y_com);
     }
 
@@ -33,7 +33,7 @@ namespace aisa
 
         // Top-K salient channels per row (at least 1, at most K)
         alpha_ = std::max<size_t>(1, std::min(K_,
-                 static_cast<size_t>(std::llround(K_ * DEC_ALPHA_RATIO))));
+                                              static_cast<size_t>(std::llround(K_ * DEC_ALPHA_RATIO))));
 
         S_.assign(I_, {});
         delta_.assign(I_, {});
@@ -42,14 +42,14 @@ namespace aisa
         scratch_idx_.resize(K_);
         scratch_abs_.resize(K_);
 
-        const float  *x  = static_cast<const float *>(A_->data);
+        const float *x = static_cast<const float *>(A_->data);
         const int8_t *qx = static_cast<const int8_t *>(qA_->get());
         const size_t stride_qA = qA_->getStride();
 
         // Select top-K and compute residuals for each row
         for (size_t r = 0; r < I_; ++r)
         {
-            const float  *x_r  = x  + r * K_;
+            const float *x_r = x + r * K_;
             const int8_t *qx_r = qx + r * stride_qA;
             selectTopKandComputeResidual(r, x_r, qx_r);
         }
@@ -67,10 +67,11 @@ namespace aisa
         // Step 1: Initialize scratch arrays + cache |x_r[k]|
         start = read_cycles();
         auto &idx = scratch_idx_;
-        auto &ax  = scratch_abs_;
-        for (size_t k = 0; k < K_; ++k) {
+        auto &ax = scratch_abs_;
+        for (size_t k = 0; k < K_; ++k)
+        {
             idx[k] = static_cast<int>(k);
-            ax[k]  = std::fabs(x_r[k]);
+            ax[k] = std::fabs(x_r[k]);
         }
         end = read_cycles();
         printf("[layer=%s][Create index+abs arrays] start = %lu, end = %lu, elapsed = %lu\n",
@@ -78,10 +79,12 @@ namespace aisa
 
         // Step 2: Find top-alpha channels (skip if alpha == K)
         const size_t topk = std::min(alpha_, K_);
-        if (topk < K_) {
+        if (topk < K_)
+        {
             start = read_cycles();
             std::partial_sort(idx.begin(), idx.begin() + topk, idx.end(),
-                [&ax](int a, int b) { return ax[a] > ax[b]; });
+                              [&ax](int a, int b)
+                              { return ax[a] > ax[b]; });
             end = read_cycles();
             printf("[layer=%s][Partial sort to find top-alpha channels] start = %lu, end = %lu, elapsed = %lu\n",
                    layer_, start, end, end - start);
@@ -150,7 +153,7 @@ namespace aisa
     {
         // Unified path for both I=1 and I>1
         // Formula: Y[r,j] += Σ_{k} Σ_{(r,δ)∈R_k} δ · Ŵ[k,j]
-        
+
         uint64_t start = read_cycles();
 
         // Temporary buffer for int8→float conversion (per k)
@@ -170,10 +173,10 @@ namespace aisa
             // Accumulate for all (r, δ[r,k]) in R_k
             for (size_t t = beg; t < end; ++t)
             {
-                const int   r = rk_pairs_[t].first;
+                const int r = rk_pairs_[t].first;
                 const float d = rk_pairs_[t].second;
                 float *Yr = Y_com + (size_t)r * J_;
-                
+
                 for (size_t j = 0; j < J_; ++j)
                     Yr[j] += d * Wk_f[j];
             }
@@ -184,8 +187,60 @@ namespace aisa
                layer_, start, end_cycle, end_cycle - start);
     }
 
+    // 언롤링 적용 버전: Y[r,j] += Σ_k Σ_{(r,δ)∈R_k} δ · Ŵ[k,j]
+    void ActivationDEC::computeCompensation_unrolled(const int8_t *W, float *Y_com)
+    {
+        uint64_t t0 = read_cycles();
+
+        // k당 1회 int8->float 변환 버퍼
+        std::vector<float> Wk_f(J_);
+
+        for (int k : unique_k_)
+        {
+            const size_t beg = rk_offs_[k];
+            const size_t end = rk_offs_[k + 1];
+            const int8_t *Wk = W + (size_t)k * J_;
+
+            // Ŵ[k,:] -> float (k마다 1회)
+            for (size_t j = 0; j < J_; ++j)
+                Wk_f[j] = static_cast<float>(Wk[j]);
+
+            // R_k의 각 (r, δ[r,k])에 대해 언롤링 적용
+            for (size_t t = beg; t < end; ++t)
+            {
+                const int r = rk_pairs_[t].first;
+                const float d = rk_pairs_[t].second;
+                float *Yr = Y_com + (size_t)r * J_;
+
+                size_t j = 0;
+
+                // 8-way unroll
+                for (; j + 7 < J_; j += 8)
+                {
+                    Yr[j + 0] += d * Wk_f[j + 0];
+                    Yr[j + 1] += d * Wk_f[j + 1];
+                    Yr[j + 2] += d * Wk_f[j + 2];
+                    Yr[j + 3] += d * Wk_f[j + 3];
+                    Yr[j + 4] += d * Wk_f[j + 4];
+                    Yr[j + 5] += d * Wk_f[j + 5];
+                    Yr[j + 6] += d * Wk_f[j + 6];
+                    Yr[j + 7] += d * Wk_f[j + 7];
+                }
+                // 잔여 원소 처리
+                for (; j < J_; ++j)
+                {
+                    Yr[j] += d * Wk_f[j];
+                }
+            }
+        }
+
+        uint64_t t1 = read_cycles();
+        printf("[layer=%s][Compute and accumulate compensation_unrolled] start = %lu, end = %lu, elapsed = %lu\n",
+               layer_, t0, t1, t1 - t0);
+    }
+
     void ActivationDEC::applyCompensation(ggml_tensor *C_out,
-                                         const std::vector<float> &Y_com)
+                                          const std::vector<float> &Y_com)
     {
         uint64_t start = read_cycles();
 

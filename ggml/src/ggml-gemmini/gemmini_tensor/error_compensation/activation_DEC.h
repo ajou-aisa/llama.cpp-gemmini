@@ -63,6 +63,7 @@ namespace aisa
                                          const int8_t *row_q);
         void buildRk();
         void computeCompensation(const int8_t *W, float *y_out);
+        void computeCompensation_unrolled(const int8_t *W, float *Y_com);
         void applyCompensation(ggml_tensor *C_out,
                               const std::vector<float> &y_com);
     };
