@@ -32,22 +32,24 @@ namespace aisa
         J_ = qW_->getCols();                 // output channels
 
         // Top-K salient channels per row (at least 1, at most K)
-        alpha_ = std::max<size_t>(1, std::min(K_, static_cast<size_t>(std::llround(K_ * DEC_ALPHA_RATIO))));
+        alpha_ = std::max<size_t>(1, std::min(K_,
+                 static_cast<size_t>(std::llround(K_ * DEC_ALPHA_RATIO))));
 
         S_.assign(I_, {});
         delta_.assign(I_, {});
 
-        // Allocate scratch buffer once (reused across all rows)
+        // Allocate scratch buffers once (reused across all rows)
         scratch_idx_.resize(K_);
+        scratch_abs_.resize(K_);
 
-        const float *x = static_cast<const float *>(A_->data);
+        const float  *x  = static_cast<const float *>(A_->data);
         const int8_t *qx = static_cast<const int8_t *>(qA_->get());
         const size_t stride_qA = qA_->getStride();
 
         // Select top-K and compute residuals for each row
         for (size_t r = 0; r < I_; ++r)
         {
-            const float *x_r = x + r * K_;
+            const float  *x_r  = x  + r * K_;
             const int8_t *qx_r = qx + r * stride_qA;
             selectTopKandComputeResidual(r, x_r, qx_r);
         }
@@ -62,38 +64,43 @@ namespace aisa
     {
         uint64_t start, end;
 
-        // Step 1: Initialize scratch index array (reused, no allocation)
+        // Step 1: Initialize scratch arrays + cache |x_r[k]|
         start = read_cycles();
-        auto &indices = scratch_idx_; // reference to member scratch buffer
-        for (size_t k = 0; k < K_; ++k)
-            indices[k] = static_cast<int>(k);
+        auto &idx = scratch_idx_;
+        auto &ax  = scratch_abs_;
+        for (size_t k = 0; k < K_; ++k) {
+            idx[k] = static_cast<int>(k);
+            ax[k]  = std::fabs(x_r[k]);
+        }
         end = read_cycles();
-        printf("[layer=%s][Initialize index array] start = %lu, end = %lu, elapsed = %lu\n", layer_, start, end, end - start);
-
-        // Step 2: nth_element to find top-alpha channels (O(n) instead of O(n log k))
-        start = read_cycles();
-        std::nth_element(indices.begin(), indices.begin() + alpha_, indices.end(),
-                         [&x_r](int a, int b)
-                         {
-                             return std::abs(x_r[a]) > std::abs(x_r[b]);
-                         });
-        end = read_cycles();
-        printf("[layer=%s][nth_element to find top-alpha channels] start = %lu, end = %lu, elapsed = %lu\n",
+        printf("[layer=%s][Create index+abs arrays] start = %lu, end = %lu, elapsed = %lu\n",
                layer_, start, end, end - start);
+
+        // Step 2: Find top-alpha channels (skip if alpha == K)
+        const size_t topk = std::min(alpha_, K_);
+        if (topk < K_) {
+            start = read_cycles();
+            std::partial_sort(idx.begin(), idx.begin() + topk, idx.end(),
+                [&ax](int a, int b) { return ax[a] > ax[b]; });
+            end = read_cycles();
+            printf("[layer=%s][Partial sort to find top-alpha channels] start = %lu, end = %lu, elapsed = %lu\n",
+                   layer_, start, end, end - start);
+        }
 
         // Step 3: Store indices and compute residuals (float path)
         start = read_cycles();
-        S_[r].resize(alpha_);
-        delta_[r].resize(alpha_);
-        for (size_t i = 0; i < alpha_; ++i)
+        S_[r].resize(topk);
+        delta_[r].resize(topk);
+        for (size_t i = 0; i < topk; ++i)
         {
-            const int k = indices[i];
+            const int k = idx[i];
             S_[r][i] = k;
             // δ[r,k] = x[r,k] - x̂[r,k] * s_x
             delta_[r][i] = x_r[k] - static_cast<float>(qx_r[k]) * SCALE;
         }
         end = read_cycles();
-        printf("[layer=%s][Store indices and compute residual] start = %lu, end = %lu, elapsed = %lu\n", layer_, start, end, end - start);
+        printf("[layer=%s][Store indices and compute residual] start = %lu, end = %lu, elapsed = %lu\n",
+               layer_, start, end, end - start);
     }
 
     void ActivationDEC::buildRk()
@@ -135,14 +142,15 @@ namespace aisa
                 unique_k_.push_back((int)k);
 
         uint64_t end = read_cycles();
-        printf("[layer=%s][Build R_k] start = %lu, end = %lu, elapsed = %lu\n", layer_, start, end, end - start);
+        printf("[layer=%s][Build R_k] start = %lu, end = %lu, elapsed = %lu (nnz = %zu, unique = %zu)\n",
+               layer_, start, end, end - start, nnz, unique_k_.size());
     }
 
     void ActivationDEC::computeCompensation(const int8_t *W, float *Y_com)
     {
         // Unified path for both I=1 and I>1
         // Formula: Y[r,j] += Σ_{k} Σ_{(r,δ)∈R_k} δ · Ŵ[k,j]
-
+        
         uint64_t start = read_cycles();
 
         // Temporary buffer for int8→float conversion (per k)
@@ -162,10 +170,10 @@ namespace aisa
             // Accumulate for all (r, δ[r,k]) in R_k
             for (size_t t = beg; t < end; ++t)
             {
-                const int r = rk_pairs_[t].first;
+                const int   r = rk_pairs_[t].first;
                 const float d = rk_pairs_[t].second;
                 float *Yr = Y_com + (size_t)r * J_;
-
+                
                 for (size_t j = 0; j < J_; ++j)
                     Yr[j] += d * Wk_f[j];
             }
@@ -177,7 +185,7 @@ namespace aisa
     }
 
     void ActivationDEC::applyCompensation(ggml_tensor *C_out,
-                                          const std::vector<float> &Y_com)
+                                         const std::vector<float> &Y_com)
     {
         uint64_t start = read_cycles();
 
