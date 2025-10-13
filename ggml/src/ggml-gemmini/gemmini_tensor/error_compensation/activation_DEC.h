@@ -18,7 +18,7 @@ namespace aisa
      * 
      * Implements: Y_com = Σ_k Σ_{r∈R_k} δ_{r,k} · Ŵ[k,j]
      * - Optimized for single-pass W[k,:] access per salient channel
-     * - Zero-overhead R_k construction: staging during Top-K selection
+     * - Zero-overhead R_k construction (no S_/delta_ rescan)
      * - Unified path for both I=1 and I>1 cases
      */
     class ActivationDEC
@@ -40,7 +40,7 @@ namespace aisa
         size_t J_;      // output channels
         size_t alpha_;  // number of salient channels per row
 
-        // Per-row salient channels and residuals (maintained for compatibility)
+        // Per-row salient channels and residuals
         std::vector<std::vector<int>>   S_;      // S[r]: salient indices
         std::vector<std::vector<float>> delta_;  // delta[r][i]: residuals (float)
 
@@ -49,7 +49,7 @@ namespace aisa
         std::vector<std::pair<int, float>> rk_pairs_; // (row, delta) pairs
         std::vector<int> unique_k_;                   // non-empty k indices
 
-        // On-the-fly staging: construct R_k during Top-K selection
+        // On-the-fly staging for R_k construction (eliminates rescan overhead)
         struct Triplet { int k; int r; float d; };
         std::vector<Triplet> rk_stage_;
 
@@ -67,6 +67,7 @@ namespace aisa
                                          const float *row_fp,
                                          const int8_t *row_q);
         void buildRk();
+        void computeCompensation(const int8_t *W, float *y_out);
         void computeCompensation_unrolled(const int8_t *W, float *Y_com);
         void applyCompensation(ggml_tensor *C_out,
                               const std::vector<float> &y_com);
