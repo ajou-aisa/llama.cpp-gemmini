@@ -5,7 +5,6 @@
 #include <vector>
 #include <cstdint>
 
-#define SCALE   1.0f // s_x (activation quantization scale)
 #define SCALE_W 1.0f // s_w (weight quantization scale)
 #ifndef DEC_ALPHA_RATIO
 #define DEC_ALPHA_RATIO 0.05    // 5% salient channels
