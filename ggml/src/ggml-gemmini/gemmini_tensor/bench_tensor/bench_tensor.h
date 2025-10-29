@@ -73,6 +73,11 @@ namespace aisa
 
         void quantizeActivation(const ggml_tensor *src);
 
+        void refresh(const char *layer,
+                     const ggml_tensor *src,
+                     const char *suffix,
+                     bool transpose);
+
         std::string name_;
         const ggml_type type_;
 
@@ -86,4 +91,3 @@ namespace aisa
 }
 
 #include "bench_tensor.tpp"
-
