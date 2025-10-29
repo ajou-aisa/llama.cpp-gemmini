@@ -62,7 +62,9 @@ namespace aisa
             DBG0("[TRANSIENT POOL HIT] dims=%lldx%lld\n",
                  (long long)rows, (long long)cols);
 #endif
-            return it->second.get();
+            BenchTensor<T> *ptr = it->second.get();
+            ptr->refresh(layer, src, suffix, transpose);
+            return ptr;
         }
 
 #if DEBUG
@@ -83,7 +85,7 @@ namespace aisa
                                 const char *suffix,
                                 bool acc,
                                 bool transpose)
-        : name_{std::string(src->name) + (suffix ? suffix : "")}, type_{src->type}
+        : name_{std::string(src->name ? src->name : "") + (suffix ? suffix : "")}, type_{src->type}
     {
         /* 1. ____________________원본 행/열____________________
         ggml 네이티브: ne[0] = columns(X), ne[1] = rows(Y) */
@@ -97,6 +99,8 @@ namespace aisa
 
         if (buf_bytes_ == 0)
             buf_bytes_ = GEMMINI_ALIGN; // 최소 16 B 확보
+        else
+            buf_bytes_ = ((buf_bytes_ + GEMMINI_ALIGN - 1) / GEMMINI_ALIGN) * GEMMINI_ALIGN;
 
         this->data_ = std::aligned_alloc(GEMMINI_ALIGN, buf_bytes_); // buffer을 16B 경계에 할당
         GGML_ASSERT(this->data_ != nullptr);
@@ -144,6 +148,36 @@ namespace aisa
             int xhat = static_cast<int>(std::lrintf(x / SCALE));
             xhat = std::max(-127, std::min(127, xhat));
             dst[i] = static_cast<int8_t>(xhat);
+        }
+    }
+
+    template <typename T>
+    void BenchTensor<T>::refresh(const char *layer,
+                                 const ggml_tensor *src,
+                                 const char *suffix,
+                                 bool transpose)
+    {
+        GGML_ASSERT(src != nullptr);
+
+        const char *src_name = (src->name != nullptr) ? src->name : "";
+        name_ = std::string(src_name) + (suffix ? suffix : "");
+
+        const int64_t expected_rows = transpose ? src->ne[0] : src->ne[1];
+        const int64_t expected_cols = transpose ? src->ne[1] : src->ne[0];
+        GGML_ASSERT(expected_rows == rows_);
+        GGML_ASSERT(expected_cols == cols_);
+
+        if (src->type == GGML_TYPE_F32)
+        {
+            uint64_t start = read_cycles();
+            quantizeActivation(src);
+            uint64_t end = read_cycles();
+            printf("[layer=%s][quantizeActivation] start = %lu, end = %lu, elapsed = %lu\n",
+                   layer ? layer : "others", start, end, end - start);
+        }
+        else
+        {
+            std::memset(data_, 0, buf_bytes_);
         }
     }
 
