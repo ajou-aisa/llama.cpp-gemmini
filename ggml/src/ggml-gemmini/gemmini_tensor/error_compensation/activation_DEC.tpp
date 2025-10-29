@@ -6,215 +6,292 @@
 
 namespace aisa
 {
+    /**
+     * @brief DEC(Dynamic Error Compensation) 메인 함수
+     * 
+     * 양자화 오차를 보상하여 정확도를 향상시키는 함수
+     * 
+     * @param A 원본 활성화 텐서 (float)
+     * @param qA 양자화된 활성화 텐서 (int8_t)
+     * @param qW 양자화된 가중치 텐서 (int8_t)
+     * @param C_out 출력 텐서 (보상이 적용될 결과)
+     */
     void ActivationDEC::compensate(const ggml_tensor *A,
                                    const BenchTensor<int8_t> *qA,
                                    const BenchTensor<int8_t> *qW,
                                    ggml_tensor *C_out)
     {
+        // DEC 객체 초기화
         ActivationDEC dec(A, qA, qW);
         dec.layer_ = labelFromWeight(qW->getName().c_str());
 
-        // Prepare: select top-K, compute residuals, build R_k
+        // 준비 단계: Top-K 채널 선택, 잔차 계산, R_k CSC 구조 구축
         dec.prepare();
 
-        // Compute compensation matrix Y_com (I×J)
+        // 보상 행렬 Y_com (I×J) 계산
         std::vector<float> Y_com(dec.I_ * dec.J_, 0.f);
         const int8_t *W = static_cast<const int8_t *>(qW->get());
 
+        // 언롤링된 버전으로 보상 계산
         dec.computeCompensation_unrolled(W, Y_com.data());
+        
+        // 계산된 보상을 출력에 적용
         dec.applyCompensation(C_out, Y_com);
     }
 
+    /**
+     * @brief DEC 알고리즘 준비 단계
+     * 
+     * 3단계로 구성:
+     * 1. 차원 및 버퍼 초기화
+     * 2. 각 행에 대해 Top-K 채널 선택 및 잔차 계산
+     * 3. R_k CSC(Compressed Sparse Column) 구조 구축
+     */
     void ActivationDEC::prepare()
     {
-        K_ = static_cast<size_t>(A_->ne[0]); // columns (channels)
-        I_ = static_cast<size_t>(A_->ne[1]); // rows
-        J_ = qW_->getCols();                 // output channels
+        uint64_t start, end;
 
-        // Top-K salient channels per row (at least 1, at most K)
-        alpha_ = std::max<size_t>(1, std::min(K_,
-                                              static_cast<size_t>(std::llround(K_ * DEC_ALPHA_RATIO))));
+        // ========== 1단계: 차원 및 버퍼 초기화 ==========
+        start = read_cycles();
+        
+        // K: 입력 채널 수, I: 행 수, J: 출력 채널 수
+        K_ = static_cast<size_t>(A_->ne[0]);
+        I_ = static_cast<size_t>(A_->ne[1]);
+        J_ = qW_->getCols();
+        
+        // alpha: 각 행에서 선택할 top-K 채널 수 (K의 DEC_ALPHA_RATIO 비율)
+        alpha_ = std::max<size_t>(1, std::min(K_, static_cast<size_t>(std::llround(K_ * DEC_ALPHA_RATIO))));
 
+        // S_[r]: 각 행 r의 선택된 채널 인덱스들
         S_.assign(I_, {});
+        
+        // delta_[r]: 각 행 r의 선택된 채널별 잔차(residual) 값들
         delta_.assign(I_, {});
+        
+        // 임시 버퍼들
+        scratch_idx_.resize(K_);   // 인덱스 정렬용
+        scratch_abs_.resize(K_);   // 절댓값 캐싱용
+        
+        // rk_offs_: CSC 형식의 열 오프셋 배열 (크기 K+1)
+        rk_offs_.assign(K_ + 1, 0);
+        
+        // rk_stage_: R_k 구축 전 임시 저장소
+        rk_stage_.clear();
+        rk_stage_.reserve(I_ * std::min(alpha_, K_));
+        
+        end = read_cycles();
+        printf("[layer=%s][DEC: Initialize dimensions and buffers] start=%lu end=%lu elapsed=%lu\n",
+               layer_, start, end, end - start);
 
-        // Allocate scratch buffers once (reused across all rows)
-        scratch_idx_.resize(K_);
-        scratch_abs_.resize(K_);
-
-        const float *x = static_cast<const float *>(A_->data);
-        const int8_t *qx = static_cast<const int8_t *>(qA_->get());
+        // ========== 2단계: 모든 행에 대해 Top-K 선택 및 잔차 계산 ==========
+        const float *x = static_cast<const float *>(A_->data);      // 원본 활성화
+        const int8_t *qx = static_cast<const int8_t *>(qA_->get()); // 양자화된 활성화
         const size_t stride_qA = qA_->getStride();
 
-        // Select top-K and compute residuals for each row
+        start = read_cycles();
         for (size_t r = 0; r < I_; ++r)
         {
             const float *x_r = x + r * K_;
             const int8_t *qx_r = qx + r * stride_qA;
             selectTopKandComputeResidual(r, x_r, qx_r);
         }
+        end = read_cycles();
+        printf("[layer=%s][DEC: Select top-K and stage R_k for all rows] start=%lu end=%lu elapsed=%lu\n",
+               layer_, start, end, end - start);
 
-        // Build R_k from S[r] and delta[r]
+        // ========== 3단계: R_k CSC 구조 구축 ==========
         buildRk();
     }
 
+    /**
+     * @brief 특정 행에 대해 Top-K 채널 선택 및 잔차 계산
+     * 
+     * 절댓값이 큰 상위 alpha개의 채널을 선택하고,
+     * 각 채널의 양자화 오차(잔차)를 계산하여 저장
+     * 
+     * @param r 행 인덱스
+     * @param x_r 원본 활성화 값 배열 (크기 K)
+     * @param qx_r 양자화된 활성화 값 배열 (크기 K)
+     */
     void ActivationDEC::selectTopKandComputeResidual(size_t r,
                                                      const float *x_r,
                                                      const int8_t *qx_r)
     {
-        uint64_t start, end;
-
-        // Step 1: Initialize scratch arrays + cache |x_r[k]|
-        start = read_cycles();
+        // 인덱스 배열 초기화 및 절댓값 캐싱
         auto &idx = scratch_idx_;
         auto &ax = scratch_abs_;
         for (size_t k = 0; k < K_; ++k)
         {
             idx[k] = static_cast<int>(k);
-            ax[k] = std::fabs(x_r[k]);
+            ax[k] = std::fabs(x_r[k]);  // 절댓값을 미리 계산하여 캐싱
         }
-        end = read_cycles();
-        printf("[layer=%s][Create index+abs arrays] start = %lu, end = %lu, elapsed = %lu\n",
-               layer_, start, end, end - start);
 
-        // Step 2: Find top-alpha channels (skip if alpha == K)
+        // Top-alpha 채널 선택 (partial_sort 사용)
+        // alpha가 K와 같으면 모든 채널 선택하므로 정렬 생략
         const size_t topk = std::min(alpha_, K_);
         if (topk < K_)
         {
-            start = read_cycles();
+            // 절댓값이 큰 순서로 상위 topk개만 부분 정렬
             std::partial_sort(idx.begin(), idx.begin() + topk, idx.end(),
-                              [&ax](int a, int b)
-                              { return ax[a] > ax[b]; });
-            end = read_cycles();
-            printf("[layer=%s][Partial sort to find top-alpha channels] start = %lu, end = %lu, elapsed = %lu\n",
-                   layer_, start, end, end - start);
+                              [&ax](int a, int b) { return ax[a] > ax[b]; });
         }
 
-        // Step 3: Store indices and compute residuals (float path)
-        start = read_cycles();
+        // 선택된 채널에 대한 처리
         S_[r].resize(topk);
         delta_[r].resize(topk);
         for (size_t i = 0; i < topk; ++i)
         {
-            const int k = idx[i];
+            const int k = idx[i];  // 선택된 채널 인덱스
+            
+            // 잔차 계산: δ[r,k] = x[r,k] - q̂x[r,k] * scale
+            // 여기서 q̂x는 양자화된 값을 역양자화한 것
+            const float d = x_r[k] - static_cast<float>(qx_r[k]) * SCALE;
+            
+            // 채널 인덱스와 잔차 저장
             S_[r][i] = k;
-            // δ[r,k] = x[r,k] - x̂[r,k] * s_x
-            delta_[r][i] = x_r[k] - static_cast<float>(qx_r[k]) * SCALE;
+            delta_[r][i] = d;
+
+            // R_k 구축을 위한 스테이징: (채널 k, 행 r, 잔차 d)
+            rk_stage_.push_back({k, static_cast<int>(r), d});
+            
+            // 각 채널 k의 출현 횟수 카운트 (나중에 prefix-sum으로 오프셋 변환)
+            rk_offs_[k + 1]++;
         }
-        end = read_cycles();
-        printf("[layer=%s][Store indices and compute residual] start = %lu, end = %lu, elapsed = %lu\n",
-               layer_, start, end, end - start);
     }
 
+    /**
+     * @brief R_k를 CSC(Compressed Sparse Column) 형식으로 구축
+     * 
+     * R_k[k]: 채널 k에 대해 non-zero 잔차를 가진 모든 (행 인덱스, 잔차) 쌍의 리스트
+     * CSC 형식:
+     *   - rk_offs_[k]: 채널 k의 데이터 시작 위치
+     *   - rk_pairs_: 모든 (행, 잔차) 쌍을 연속 배열로 저장
+     */
     void ActivationDEC::buildRk()
     {
         uint64_t start = read_cycles();
 
-        rk_offs_.assign(K_ + 1, 0);
-
-        // 1) Count occurrences of each k
-        for (int r = 0; r < (int)I_; ++r)
-            for (int k : S_[r])
-                rk_offs_[k + 1]++;
-
-        // 2) Prefix sum to get offsets
+        // Prefix-sum으로 카운트를 오프셋으로 변환
+        // rk_offs_[k]는 채널 k의 데이터가 시작하는 위치를 가리킴
         for (size_t k = 1; k <= K_; ++k)
             rk_offs_[k] += rk_offs_[k - 1];
-
+        
+        // 전체 non-zero 원소 개수
         const size_t nnz = rk_offs_[K_];
-        rk_pairs_.resize(nnz);
+        rk_pairs_.assign(nnz, {0, 0.f});
 
-        // 3) Fill (row, delta) pairs
-        std::vector<size_t> pos = rk_offs_;
-        for (int r = 0; r < (int)I_; ++r)
+        // 스테이징된 triplet (k, r, d)을 CSC 형식의 pairs (r, d)로 산포(scatter)
+        std::vector<size_t> pos = rk_offs_;  // 각 채널별 현재 삽입 위치
+        for (const auto &t : rk_stage_)
         {
-            const auto &Sr = S_[r];
-            const auto &Dr = delta_[r];
-            for (size_t i = 0; i < Sr.size(); ++i)
-            {
-                const int k = Sr[i];
-                rk_pairs_[pos[k]++] = {r, Dr[i]};
-            }
+            const size_t dst = pos[t.k]++;  // 채널 t.k의 다음 삽입 위치
+            rk_pairs_[dst] = {t.r, t.d};    // (행, 잔차) 쌍 저장
         }
 
-        // 4) Collect non-empty k indices
+        // Non-empty 채널 인덱스 수집 (최적화: 빈 채널은 스킵)
         unique_k_.clear();
         unique_k_.reserve(K_);
         for (size_t k = 0; k < K_; ++k)
-            if (rk_offs_[k] != rk_offs_[k + 1])
-                unique_k_.push_back((int)k);
+            if (rk_offs_[k] != rk_offs_[k + 1])  // 이 채널에 데이터가 있는 경우
+                unique_k_.push_back(static_cast<int>(k));
+
+        // 스테이징 메모리 해제
+        rk_stage_.clear();
+        rk_stage_.shrink_to_fit();
 
         uint64_t end = read_cycles();
-        printf("[layer=%s][Build R_k] start = %lu, end = %lu, elapsed = %lu (nnz = %zu, unique = %zu)\n",
-               layer_, start, end, end - start, nnz, unique_k_.size());
+        printf("[layer=%s][DEC: Build R_k CSC structure] start=%lu end=%lu elapsed=%lu\n",
+               layer_, start, end, end - start);
     }
 
+    /**
+     * @brief 보상 행렬 계산 (기본 버전)
+     * 
+     * Y_com[r,j] = Σ_k δ[r,k] * Ŵ[k,j]
+     * 
+     * 각 salient 채널 k에 대해:
+     *   1. 가중치 행 Ŵ[k,:]을 float로 변환
+     *   2. R_k에 있는 모든 (행 r, 잔차 δ)에 대해
+     *      Y_com[r,:] += δ * Ŵ[k,:]를 누적
+     * 
+     * @param W 양자화된 가중치 행렬 (K×J)
+     * @param Y_com 출력 보상 행렬 (I×J)
+     */
     void ActivationDEC::computeCompensation(const int8_t *W, float *Y_com)
     {
-        // Unified path for both I=1 and I>1
-        // Formula: Y[r,j] += Σ_{k} Σ_{(r,δ)∈R_k} δ · Ŵ[k,j]
-
         uint64_t start = read_cycles();
 
-        // Temporary buffer for int8→float conversion (per k)
-        std::vector<float> Wk_f(J_);
+        std::vector<float> Wk_f(J_);  // 가중치 행 버퍼
 
-        // Iterate over each salient channel k
+        // Non-zero 잔차를 가진 각 채널 k에 대해
         for (int k : unique_k_)
         {
-            const size_t beg = rk_offs_[k];
-            const size_t end = rk_offs_[k + 1];
-            const int8_t *Wk = W + (size_t)k * J_;
+            const size_t beg = rk_offs_[k];      // 채널 k의 시작 오프셋
+            const size_t end = rk_offs_[k + 1];  // 채널 k의 끝 오프셋
+            const int8_t *Wk = W + static_cast<size_t>(k) * J_;  // Ŵ[k,:] 포인터
 
-            // Convert Ŵ[k,:] once per k (critical optimization)
+            // 가중치 행 Ŵ[k,:]을 float로 한 번 변환 (재사용)
             for (size_t j = 0; j < J_; ++j)
                 Wk_f[j] = static_cast<float>(Wk[j]);
 
-            // Accumulate for all (r, δ[r,k]) in R_k
+            // R_k의 모든 (행 r, 잔차 δ)에 대해 누적
             for (size_t t = beg; t < end; ++t)
             {
-                const int r = rk_pairs_[t].first;
-                const float d = rk_pairs_[t].second;
-                float *Yr = Y_com + (size_t)r * J_;
+                const int r = rk_pairs_[t].first;    // 행 인덱스
+                const float d = rk_pairs_[t].second;  // 잔차
+                float *Yr = Y_com + static_cast<size_t>(r) * J_;  // Y_com[r,:] 포인터
 
+                // Y_com[r,j] += δ[r,k] * Ŵ[k,j]
                 for (size_t j = 0; j < J_; ++j)
                     Yr[j] += d * Wk_f[j];
             }
         }
 
         uint64_t end_cycle = read_cycles();
-        printf("[layer=%s][Compute and accumulate compensation] start = %lu, end = %lu, elapsed = %lu\n",
+        printf("[layer=%s][DEC: Compute and accumulate compensation] start=%lu end=%lu elapsed=%lu\n",
                layer_, start, end_cycle, end_cycle - start);
     }
 
-    // 언롤링 적용 버전: Y[r,j] += Σ_k Σ_{(r,δ)∈R_k} δ · Ŵ[k,j]
+    /**
+     * @brief 보상 행렬 계산 (8-way 언롤링 최적화 버전)
+     * 
+     * computeCompensation과 동일한 로직이지만,
+     * 내부 루프를 8-way 언롤링하여 성능 향상
+     * 
+     * 언롤링의 이점:
+     *   - 루프 오버헤드 감소
+     *   - 명령어 수준 병렬성(ILP) 향상
+     *   - 파이프라인 효율 증가
+     * 
+     * @param W 양자화된 가중치 행렬 (K×J)
+     * @param Y_com 출력 보상 행렬 (I×J)
+     */
     void ActivationDEC::computeCompensation_unrolled(const int8_t *W, float *Y_com)
     {
-        uint64_t t0 = read_cycles();
+        uint64_t start = read_cycles();
 
-        // k당 1회 int8->float 변환 버퍼
         std::vector<float> Wk_f(J_);
 
+        // Non-zero 잔차를 가진 각 채널 k에 대해
         for (int k : unique_k_)
         {
             const size_t beg = rk_offs_[k];
             const size_t end = rk_offs_[k + 1];
-            const int8_t *Wk = W + (size_t)k * J_;
+            const int8_t *Wk = W + static_cast<size_t>(k) * J_;
 
-            // Ŵ[k,:] -> float (k마다 1회)
+            // 가중치 행 Ŵ[k,:]을 float로 변환
             for (size_t j = 0; j < J_; ++j)
                 Wk_f[j] = static_cast<float>(Wk[j]);
 
-            // R_k의 각 (r, δ[r,k])에 대해 언롤링 적용
+            // 각 (행, 잔차) 쌍에 대해 보상 누적
             for (size_t t = beg; t < end; ++t)
             {
                 const int r = rk_pairs_[t].first;
                 const float d = rk_pairs_[t].second;
-                float *Yr = Y_com + (size_t)r * J_;
+                float *Yr = Y_com + static_cast<size_t>(r) * J_;
 
+                // 8-way 언롤링: 한 번에 8개 원소 처리
                 size_t j = 0;
-
-                // 8-way unroll
                 for (; j + 7 < J_; j += 8)
                 {
                     Yr[j + 0] += d * Wk_f[j + 0];
@@ -226,19 +303,27 @@ namespace aisa
                     Yr[j + 6] += d * Wk_f[j + 6];
                     Yr[j + 7] += d * Wk_f[j + 7];
                 }
-                // 잔여 원소 처리
+                // 나머지 원소 처리 (J가 8의 배수가 아닌 경우)
                 for (; j < J_; ++j)
-                {
                     Yr[j] += d * Wk_f[j];
-                }
             }
         }
 
-        uint64_t t1 = read_cycles();
-        printf("[layer=%s][Compute and accumulate compensation_unrolled] start = %lu, end = %lu, elapsed = %lu\n",
-               layer_, t0, t1, t1 - t0);
+        uint64_t end = read_cycles();
+        printf("[layer=%s][DEC: Compute and accumulate compensation (unrolled)] start=%lu end=%lu elapsed=%lu\n",
+               layer_, start, end, end - start);
     }
 
+    /**
+     * @brief 계산된 보상을 출력 텐서에 적용
+     * 
+     * C_out[r,j] += Y_com[r,j] * scale_w
+     * 
+     * scale_w: 가중치의 양자화 스케일 팩터
+     * 
+     * @param C_out 출력 텐서 (양자화된 행렬곱 결과)
+     * @param Y_com 보상 행렬 (I×J)
+     */
     void ActivationDEC::applyCompensation(ggml_tensor *C_out,
                                           const std::vector<float> &Y_com)
     {
@@ -247,17 +332,17 @@ namespace aisa
         float *C = static_cast<float *>(C_out->data);
         const size_t stride_C = C_out->nb[1] / sizeof(float);
 
-        // C[r,j] += Y_com[r,j] * s_w
+        // 각 원소에 보상 적용: C[r,j] += Y_com[r,j] * s_w
         for (size_t r = 0; r < I_; ++r)
         {
             const float *Yr = Y_com.data() + r * J_;
             float *Cr = C + r * stride_C;
             for (size_t j = 0; j < J_; ++j)
-                Cr[j] += Yr[j] * SCALE_W;
+                Cr[j] += Yr[j] * SCALE_W;  // 가중치 스케일 팩터 적용
         }
 
         uint64_t end = read_cycles();
-        printf("[layer=%s][Apply compensation to output] start = %lu, end = %lu, elapsed = %lu\n",
+        printf("[layer=%s][DEC: Apply compensation to output] start=%lu end=%lu elapsed=%lu\n",
                layer_, start, end, end - start);
     }
 }

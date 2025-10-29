@@ -5,7 +5,6 @@
 #include <vector>
 #include <cstdint>
 
-#define SCALE   1.0f // s_x (activation quantization scale)
 #define SCALE_W 1.0f // s_w (weight quantization scale)
 #ifndef DEC_ALPHA_RATIO
 #define DEC_ALPHA_RATIO 0.05    // 5% salient channels
@@ -18,6 +17,7 @@ namespace aisa
      * 
      * Implements: Y_com = Σ_k Σ_{r∈R_k} δ_{r,k} · Ŵ[k,j]
      * - Optimized for single-pass W[k,:] access per salient channel
+     * - Zero-overhead R_k construction (no S_/delta_ rescan)
      * - Unified path for both I=1 and I>1 cases
      */
     class ActivationDEC
@@ -47,6 +47,10 @@ namespace aisa
         std::vector<size_t> rk_offs_;                 // K_+1 prefix sums
         std::vector<std::pair<int, float>> rk_pairs_; // (row, delta) pairs
         std::vector<int> unique_k_;                   // non-empty k indices
+
+        // On-the-fly staging for R_k construction (eliminates rescan overhead)
+        struct Triplet { int k; int r; float d; };
+        std::vector<Triplet> rk_stage_;
 
         // Scratch buffers for row-wise operations (reused across rows)
         std::vector<int>   scratch_idx_;              // K_ indices for sorting
