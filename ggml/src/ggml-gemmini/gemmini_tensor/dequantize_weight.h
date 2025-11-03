@@ -5,17 +5,12 @@
 #include <type_traits>
 
 #include "include/gemmini.h"
+#include "../../ggml_common.h"
 #include "ggml.h"
 
 #ifndef QK8_0
 #define QK8_0 32
 #endif
-struct block_q8_0
-{
-    ggml_fp16_t d;
-    int8_t qs[QK8_0]; // 우리가 추출할 대상
-    // 스케일(이번 작업에서는 폐기)
-};
 
 namespace aisa
 {
