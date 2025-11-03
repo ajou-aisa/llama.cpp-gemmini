@@ -17,20 +17,21 @@ namespace aisa
      * @param C_out 출력 텐서 (보상이 적용될 결과)
      */
     void ActivationDEC::compensate(const ggml_tensor *A,
-                                   const BenchTensor<int8_t> *qA,
-                                   const BenchTensor<int8_t> *qW,
-                                   ggml_tensor *C_out)
+                                   ConstQuantTensorView qA,
+                                   ConstQuantTensorView qW,
+                                   ggml_tensor *C_out,
+                                   const char *layer_name)
     {
         // DEC 객체 초기화
         ActivationDEC dec(A, qA, qW);
-        dec.layer_ = labelFromWeight(qW->getName().c_str());
+        dec.layer_ = layer_name ? layer_name : "others";
 
         // 준비 단계: Top-K 채널 선택, 잔차 계산, R_k CSC 구조 구축
         dec.prepare();
 
         // 보상 행렬 Y_com (I×J) 계산
         std::vector<float> Y_com(dec.I_ * dec.J_, 0.f);
-        const int8_t *W = static_cast<const int8_t *>(qW->get());
+        const int8_t *W = qW.data;
 
         // 언롤링된 버전으로 보상 계산
         dec.computeCompensation_unrolled(W, Y_com.data());
@@ -54,10 +55,13 @@ namespace aisa
         // ========== 1단계: 차원 및 버퍼 초기화 ==========
         start = read_cycles();
         
+        GGML_ASSERT(!qA_.empty());
+        GGML_ASSERT(!qW_.empty());
+
         // K: 입력 채널 수, I: 행 수, J: 출력 채널 수
-        K_ = static_cast<size_t>(A_->ne[0]);
-        I_ = static_cast<size_t>(A_->ne[1]);
-        J_ = qW_->getCols();
+        K_ = qA_.cols ? qA_.cols : static_cast<size_t>(A_->ne[0]);
+        I_ = qA_.rows ? qA_.rows : static_cast<size_t>(A_->ne[1]);
+        J_ = qW_.cols;
         
         // alpha: 각 행에서 선택할 top-K 채널 수 (K의 DEC_ALPHA_RATIO 비율)
         alpha_ = std::max<size_t>(1, std::min(K_, static_cast<size_t>(std::llround(K_ * DEC_ALPHA_RATIO))));
@@ -85,8 +89,8 @@ namespace aisa
 
         // ========== 2단계: 모든 행에 대해 Top-K 선택 및 잔차 계산 ==========
         const float *x = static_cast<const float *>(A_->data);      // 원본 활성화
-        const int8_t *qx = static_cast<const int8_t *>(qA_->get()); // 양자화된 활성화
-        const size_t stride_qA = qA_->getStride();
+        const int8_t *qx = qA_.data;                                // 양자화된 활성화
+        const size_t stride_qA = qA_.stride;
 
         start = read_cycles();
         for (size_t r = 0; r < I_; ++r)
@@ -223,12 +227,14 @@ namespace aisa
 
         std::vector<float> Wk_f(J_);  // 가중치 행 버퍼
 
+        const size_t stride_qW = qW_.stride ? qW_.stride : J_;
+
         // Non-zero 잔차를 가진 각 채널 k에 대해
         for (int k : unique_k_)
         {
             const size_t beg = rk_offs_[k];      // 채널 k의 시작 오프셋
             const size_t end = rk_offs_[k + 1];  // 채널 k의 끝 오프셋
-            const int8_t *Wk = W + static_cast<size_t>(k) * J_;  // Ŵ[k,:] 포인터
+            const int8_t *Wk = W + static_cast<size_t>(k) * stride_qW;  // Ŵ[k,:] 포인터
 
             // 가중치 행 Ŵ[k,:]을 float로 한 번 변환 (재사용)
             for (size_t j = 0; j < J_; ++j)
@@ -272,12 +278,14 @@ namespace aisa
 
         std::vector<float> Wk_f(J_);
 
+        const size_t stride_qW = qW_.stride ? qW_.stride : J_;
+
         // Non-zero 잔차를 가진 각 채널 k에 대해
         for (int k : unique_k_)
         {
             const size_t beg = rk_offs_[k];
             const size_t end = rk_offs_[k + 1];
-            const int8_t *Wk = W + static_cast<size_t>(k) * J_;
+            const int8_t *Wk = W + static_cast<size_t>(k) * stride_qW;
 
             // 가중치 행 Ŵ[k,:]을 float로 변환
             for (size_t j = 0; j < J_; ++j)
