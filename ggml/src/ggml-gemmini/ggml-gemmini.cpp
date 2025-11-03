@@ -46,7 +46,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     const char *w_name = (src0 && src0->name) ? src0->name : ""; // weight name
     const char *layer = labelFromWeight(w_name); // layer 이름 추출
     args.layer_name = layer;
-    args.Transpose_B = TRANSPOSE_B;
+    args.transpose_B = TRANSPOSE_B;
     args.scale_A = SCALE_A;
     
     /* _______________________ 2. Gemmini용 dimension _____________________ */
