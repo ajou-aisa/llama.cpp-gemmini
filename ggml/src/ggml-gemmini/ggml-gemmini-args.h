@@ -17,7 +17,10 @@
 #undef GGML_COMMON_DECL_CPP
 #undef GGML_GEMMINI_ARGS_DEFINE_GGML_COMMON
 #endif
-#include "include/gemmini.h"
+#include "include/gemmini_params.h"
+
+// Forward declaration to avoid including full gemmini.h (breaks include cycles)
+enum tiled_matmul_type_t : int;
 
 /*  
 Gemmini 호출 인자를 한 데 모은 구조체 + Q8_0 전처리 헬퍼
@@ -53,7 +56,7 @@ typedef struct ggml_gemmini_args_t {
     bool low_D = false;
 
     uint8_t weightA = 0;
-    tiled_matmul_type_t tiled_matmul_type = CPU;
+    tiled_matmul_type_t tiled_matmul_type = static_cast<tiled_matmul_type_t>(0);
 
     // metadata extracted from Q8_0 tensors
     const block_q8_0 *B_blocks = nullptr;
