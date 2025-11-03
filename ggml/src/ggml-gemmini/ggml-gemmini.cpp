@@ -1,15 +1,19 @@
 // ggml-gemmini.cpp
 
+#include <cstring>
+#include <vector>
+
 #include "ggml-gemmini-util.h"
 #include "gemmini_tensor/gemmini_tensor_interface.h"
 #include "include/gemmini.h"
 #include "labeling/label.h"
 #include "test/ggml-gemmini-test.h"
 #include "gemmini_tensor/error_compensation/activation_DEC.h"
+#include "gemmini_tensor/quant_tensor_view.h"
+#include "ggml-gemmini-args.h"
 
-#define SCALE_A SCALE           // Activation: bench_tensor.h에 정의됨 (0.002441f)
-#define SCALE_B 1.0f            // 임시 Weight 스케일 값
-#define SCALE_C (SCALE_A * SCALE_B)  // Output scale
+#define SCALE_A 0.002441f
+// #define SCALE_C (SCALE_A * SCALE_B)  // Output scale
 
 using namespace aisa;
 
@@ -32,81 +36,110 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     DBG("[Gemmini] mul_mat call\n");
 
     /* ____________________________________ 0. 원본 FP32 입력 텐서 ____________________________________________ */
-    const auto *src0 = dst->src[0]; // src0: weight (J × K) -> 전치하여 K x J로 사용 (B)
-    const auto *src1 = dst->src[1]; // src1: activation (K x J) -> 전치 없음 (A)
+    const auto *src0 = dst->src[0]; // src0: weight (K x J) -> 전치
+    const auto *src1 = dst->src[1]; // src1: activation (I x K) -> 전치 없음 (A)
+
+    ggml_gemmini_args_t args; // DEC과 gemmini 호출을 위한 args 
+    // set args
+    start = read_cycles();
+
     const char *w_name = (src0 && src0->name) ? src0->name : ""; // weight name
     const char *layer = labelFromWeight(w_name); // layer 이름 추출
-
+    args.layer_name = layer;
+    args.Transpose_B = TRANSPOSE_B;
+    args.scale_A = SCALE_A;
     
-    /* _____________________________ 1. Gemmini용 텐서 생성 _____________________________ */
-    const auto* tA = GemminiTensor<int8_t>::getOrCreateTransient(ctx, layer, src1, ".i8", false); // IxK (1xK)
-    const auto* tB = GemminiTensor<int8_t>::getOrCreate(ctx, layer, src0, ".i8", false, TRANSPOSE_B);  // KxJ, 전치
-    const auto* tC = GemminiTensor<int8_t>::getOrCreateTransient(ctx, layer, dst, ".i8_out", false); // IxJ (1xJ)
-    
-    start = read_cycles();
     /* _______________________ 2. Gemmini용 dimension _____________________ */
-    const size_t I = tC->getRows(); // I = A.ne[1], K = A.ne[0]
-    const size_t J = tC->getCols(); // K = B.ne[0], J = B.ne[1] (transpose)
-    const size_t K = tA->getCols();
+    const size_t I = dst->ne[1]; // I = A.ne[1], K = A.ne[0]
+    const size_t J = dst->ne[0]; // K = B.ne[0], J = B.ne[1] (transpose)
+    const size_t K = src1->ne[0]; // K = A.ne[0]
     DBG("I=%zu, J=%zu, K=%zu\n", I, J, K);
 
+    args.I = I;
+    args.J = J;
+    args.K = K;
+    args.scale_A = SCALE_A;
+    
     /* _____ 3. Gemmini용 stride _____ */
-    const size_t sA = tA->getStride();
-    const size_t sB = tB->getStride();
-    const size_t sC = tC->getStride();
+    const size_t sC = dst->nb[1] / sizeof(int8_t);
 
+    args.sC = sC;
+
+    // quantize activation
+    static thread_local std::vector<int8_t> activation_q;
+    activation_q.resize(I * K);
+    int8_t *qx = activation_q.data();
+    ggml_gemmini_quantize_activation(src1, args, qx);
+    args.A = reinterpret_cast<elem_t *>(qx);
+    args.sA = K;
+    QuantTensorView qA_view{qx, I, K, args.sA};
+    ConstQuantTensorView qA_const = make_const_view(qA_view);
+
+    // breackdown weight to int8_t & scale
+    const int64_t dim_z = src0->ne[2] ? src0->ne[2] : 1;
+    const int64_t dim_w = src0->ne[3] ? src0->ne[3] : 1;
+
+    GGML_ASSERT(K % QK8_0 == 0);
+    const size_t blocks_K = static_cast<size_t>(K) / QK8_0;
+    const size_t logical_cols = static_cast<size_t>(J * dim_z * dim_w);
+
+    static thread_local std::vector<int8_t> weight_q;
+    static thread_local std::vector<float> weight_scales;
+
+    const size_t q_size = static_cast<size_t>(K) * logical_cols;
+    if (weight_q.size() != q_size) 
+        weight_q.resize(q_size);
+    
+    const size_t scale_size = blocks_K * logical_cols;
+    if (weight_scales.size() != scale_size) 
+        weight_scales.resize(scale_size);
+
+    int8_t *qw = weight_q.data();
+    float *block_scale_w = weight_scales.data();
+
+    args.sB = logical_cols;
+    ggml_gemmini_pack_q80(src0,
+                          TRANSPOSE_B,
+                          reinterpret_cast<elem_t *>(qw),
+                          args.sB,
+                          block_scale_w,
+                          args);
+    args.B = reinterpret_cast<elem_t *>(qw);
+    ConstQuantTensorView qW_view = make_const_view(QuantTensorView{qw, static_cast<size_t>(K), logical_cols, args.sB});
+    
     /* ______________________________ 4. bias 텐서 처리 _________________________________ */
-    std::vector<int32_t> zero_bias(tC->getCols(), 0);
+    std::vector<int32_t> zero_bias(J, 0);
 
     const int32_t *bias_data = zero_bias.data();
     const size_t sD = 0;
-    const bool repeating = true;
+    args.sD = sD;
+    args.D = bias_data;
+    args.repeating_bias = true;
 
     end = read_cycles();
     printf("[layer=%s][Set Argument for calling tiled_matmul_auto of Gemmini ] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
     printf("[layer=%s]", layer); // tiled_matmul_auto 내부 사이클 출력에 layer 추가
 
-    /* __ 5. Gemmini tiled_matmul_auto 호출 __ */
-    tiled_matmul_auto(I, J, K,
-                      (elem_t *)tA->get(),
-                      (elem_t *)tB->get(),
-                      (void *)bias_data,
-                      (elem_t *)tC->get(),
-                      sA, sB, sD, sC,
-                      1.f, 1.f, 1.f,
-                      NO_ACTIVATION,
-                      1, 1,
-                      repeating,
-                      false, // transpose_A
-                      !TRANSPOSE_B, // transpose_B
-                      false, false,
-                      0, OPTION);
+    // output 버퍼
+    static thread_local std::vector<int8_t> c_i8;
+    c_i8.resize(I * J);
+    args.C = c_i8.data();
+
+    args.f_out = static_cast<float*>(dst->data);
+    args.stride_f_out = dst->nb[1] / sizeof(float);
+
+
+    /* __ 5. Gemmini 호출 __ */
+    aisa::tiled_matmul_auto_fp(&args); // gemmini 커널에서 tile과 block 매칭 -> tiled_matmul 호출 후 dequantize까지 수행
+    // dst에는 gemmini 커널에서 dequantize한 결과가 들어옴 
 
     start = read_cycles();
-    /* _____________ 6. Gemmini 연산 결과 dequantize 및 복사 _____________ */
-    const size_t nb1_out = dst->nb[1]; // 출력 텐서 행 stride (bytes)
-    const size_t J_log = dst->ne[0];   // 실제 논리 열 수
-
-    const int8_t *c_i8 = static_cast<const int8_t *>(tC->get());
-    uint8_t *out_base = static_cast<uint8_t *>(dst->data);
-
-    // Dequantization scale: int8 -> float
-    // Gemmini output = (A_q8 * B_q8) 
-    // 따라서 원래 값 복원 = output_q8 * SCALE_C
-    for (size_t r = 0; r < I; ++r)
-    {
-        const int8_t *row_c = c_i8 + r * sC;
-        float *row_out = reinterpret_cast<float *>(out_base + r * nb1_out);
-
-        // 스케일/클리핑 없이 그대로 float 캐스팅
-        for (size_t c = 0; c < J_log; ++c)
-            row_out[c] = static_cast<float>(row_c[c]) * SCALE_C;
-    }
-    end = read_cycles();
-    printf("[layer=%s][Dequantize output of Gemmini to CPU] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
 
 #if USE_GEMMINI_BENCH_TENSOR
-    ActivationDEC::compensate(src1, tA, tB, dst);
+    ActivationDEC::compensate(src1, qA_const, qW_view, dst, layer);
+#else
+    GGML_UNUSED(qA_view);
+    GGML_UNUSED(qW_view);
 #endif
 }
 
