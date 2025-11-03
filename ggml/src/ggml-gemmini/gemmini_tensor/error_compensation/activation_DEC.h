@@ -1,5 +1,5 @@
 #pragma once
-#include "../bench_tensor/bench_tensor.h"
+#include "../quant_tensor_view.h"
 #include "../../labeling/label.h"
 #include "ggml.h"
 #include <vector>
@@ -24,14 +24,15 @@ namespace aisa
     {
     public:
         static void compensate(const ggml_tensor *A,
-                               const BenchTensor<int8_t> *qA,
-                               const BenchTensor<int8_t> *qW,
-                               ggml_tensor *C_out);
+                               ConstQuantTensorView qA,
+                               ConstQuantTensorView qW,
+                               ggml_tensor *C_out,
+                               const char *layer_name = nullptr);
 
     private:
         const ggml_tensor *A_;          // F32 activation
-        const BenchTensor<int8_t> *qA_; // quantized activation
-        const BenchTensor<int8_t> *qW_; // quantized weight
+        ConstQuantTensorView qA_;       // quantized activation view
+        ConstQuantTensorView qW_;       // quantized weight view
 
         const char* layer_ = "others";
         size_t I_;      // number of rows
@@ -57,8 +58,8 @@ namespace aisa
         std::vector<float> scratch_abs_;              // cached |x_r[k]| values
 
         ActivationDEC(const ggml_tensor *A,
-                      const BenchTensor<int8_t> *qA,
-                      const BenchTensor<int8_t> *qW)
+                      ConstQuantTensorView qA,
+                      ConstQuantTensorView qW)
             : A_(A), qA_(qA), qW_(qW) {}
 
         void prepare();
