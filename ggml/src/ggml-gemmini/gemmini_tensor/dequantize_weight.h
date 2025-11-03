@@ -5,7 +5,7 @@
 #include <type_traits>
 
 #include "include/gemmini.h"
-#include "../../ggml_common.h"
+#include "../../ggml-common.h"
 #include "ggml.h"
 
 #ifndef QK8_0
