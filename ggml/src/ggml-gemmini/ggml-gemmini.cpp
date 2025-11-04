@@ -46,7 +46,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     const char *w_name = (src0 && src0->name) ? src0->name : ""; // weight name
     const char *layer = labelFromWeight(w_name); // layer 이름 추출
     args.layer_name = layer;
-    args.transpose_B = TRANSPOSE_B;
+    const bool pack_transpose_B = TRANSPOSE_B != 0;
+    args.transpose_B = !pack_transpose_B; // Gemmini 쪽에는 실제 메모리 레이아웃에 맞게 전달
     args.scale_A = SCALE_A;
     
     /* _______________________ 2. Gemmini용 dimension _____________________ */
@@ -95,15 +96,21 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     int8_t *qw = weight_q.data();
     float *block_scale_w = weight_scales.data();
 
-    args.sB = K;
+    args.sB = pack_transpose_B ? logical_cols : static_cast<size_t>(K);
     ggml_gemmini_pack_q80(src0,
-                          TRANSPOSE_B,
+                          pack_transpose_B,
                           reinterpret_cast<elem_t *>(qw),
                           args.sB,
                           block_scale_w,
                           args);
     args.B = reinterpret_cast<elem_t *>(qw);
-    ConstQuantTensorView qW_view = make_const_view(QuantTensorView{qw, logical_cols, static_cast<size_t>(K), args.sB});
+    QuantTensorView qW_view_local;
+    if (pack_transpose_B) {
+        qW_view_local = QuantTensorView{qw, static_cast<size_t>(K), logical_cols, args.sB};
+    } else {
+        qW_view_local = QuantTensorView{qw, logical_cols, static_cast<size_t>(K), args.sB};
+    }
+    ConstQuantTensorView qW_view = make_const_view(qW_view_local);
     
     /* ______________________________ 4. bias 텐서 처리 _________________________________ */
     std::vector<int32_t> zero_bias(J, 0);
