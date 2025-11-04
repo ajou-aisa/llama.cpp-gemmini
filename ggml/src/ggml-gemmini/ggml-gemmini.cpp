@@ -95,7 +95,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     int8_t *qw = weight_q.data();
     float *block_scale_w = weight_scales.data();
 
-    args.sB = logical_cols;
+    args.sB = K;
     ggml_gemmini_pack_q80(src0,
                           TRANSPOSE_B,
                           reinterpret_cast<elem_t *>(qw),
@@ -103,7 +103,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                           block_scale_w,
                           args);
     args.B = reinterpret_cast<elem_t *>(qw);
-    ConstQuantTensorView qW_view = make_const_view(QuantTensorView{qw, static_cast<size_t>(K), logical_cols, args.sB});
+    ConstQuantTensorView qW_view = make_const_view(QuantTensorView{qw, logical_cols, static_cast<size_t>(K), args.sB});
     
     /* ______________________________ 4. bias 텐서 처리 _________________________________ */
     std::vector<int32_t> zero_bias(J, 0);
@@ -125,6 +125,11 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     args.f_out = static_cast<float*>(dst->data);
     args.stride_f_out = dst->nb[1] / sizeof(float);
+
+    printf("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out=%zu nb1=%zu\n",
+           layer, args.A, args.B, args.C, args.D,
+           args.I, args.J, args.K, args.sA, args.sB, args.sC,
+           args.stride_f_out, dst->nb[1]);
 
 
     args.tiled_matmul_type = OPTION;
