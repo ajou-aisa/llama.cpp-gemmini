@@ -61,9 +61,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.scale_A = SCALE_A;
     
     /* _____ 3. Gemmini용 stride _____ */
-    const size_t sC = dst->nb[1] / sizeof(int8_t);
-
-    args.sC = sC;
+    args.sA = K;
+    args.sC = J;
 
     // quantize activation
     static thread_local std::vector<int8_t> activation_q;
@@ -71,7 +70,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     int8_t *qx = activation_q.data();
     ggml_gemmini_quantize_activation(src1, args, qx);
     args.A = reinterpret_cast<elem_t *>(qx);
-    args.sA = K;
     QuantTensorView qA_view{qx, I, K, args.sA};
     ConstQuantTensorView qA_const = make_const_view(qA_view);
 
