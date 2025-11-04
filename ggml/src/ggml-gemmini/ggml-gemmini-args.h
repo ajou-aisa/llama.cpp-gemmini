@@ -45,7 +45,7 @@ typedef struct ggml_gemmini_args_t {
     scale_t scale_A = 1.f;
     scale_t scale_B = 1.f;
     scale_acc_t scale_D = 1;
-    int act = NO_ACTIVATION;
+    int act = 0; // default NO_ACTIVATION
     acc_scale_t scale = 1.0f;
     acc_scale_t bert_scale = 1.0f;
 
@@ -80,8 +80,6 @@ typedef struct ggml_gemmini_args_t {
     bool measure_cycles = true;
 
 } ggml_gemmini_args_t;
-
-constexpr float GGML_GEMMINI_DEFAULT_SCALE_A = 0.002441f;
 
 /*
 기존 dequantize_weight.h의 get_q80_row_ptr()/q80_to_T_* 흐름을 참고하여, Q8_0 블록에서
