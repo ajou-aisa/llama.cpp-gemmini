@@ -157,20 +157,22 @@ inline void ggml_gemmini_pack_q80(const ggml_tensor *src,
 
     if (dst_base) {
         if (transpose) {
-            // Produce a (logical_cols x K) row-major buffer where each logical column is a row
-            size_t row_idx = 0;
-            for (int64_t iw = 0; iw < dim_w; ++iw) {
-                for (int64_t iz = 0; iz < dim_z; ++iz) {
-                    for (int64_t iy = 0; iy < dim_j; ++iy, ++row_idx) {
-                        const block_q8_0 *row_blocks = ggml_gemmini_get_q80_row_ptr(src, iy, iz, iw);
-                        elem_t *dst_row = dst_base + row_idx * dst_stride_elems;
-                        for (size_t blk = 0; blk < blocks_K; ++blk) {
-                            std::memcpy(dst_row + blk * QK8_0, row_blocks[blk].qs, QK8_0 * sizeof(elem_t));
+            // Produce a (K x logical_cols) row-major buffer so that Gemmini consumes a true K×J matrix.
+            for (int64_t k = 0; k < dim_k; ++k) {
+                elem_t *dst_row = dst_base + static_cast<size_t>(k) * dst_stride_elems;
+                size_t col_idx = 0;
+                for (int64_t iw = 0; iw < dim_w; ++iw) {
+                    for (int64_t iz = 0; iz < dim_z; ++iz) {
+                        for (int64_t iy = 0; iy < dim_j; ++iy, ++col_idx) {
+                            const block_q8_0 *row_blocks = ggml_gemmini_get_q80_row_ptr(src, iy, iz, iw);
+                            const size_t blk = static_cast<size_t>(k) / QK8_0;
+                            const int off = static_cast<int>(k % QK8_0);
+                            dst_row[col_idx] = row_blocks[blk].qs[off];
                         }
                     }
                 }
+                GGML_ASSERT(col_idx == logical_cols);
             }
-            GGML_ASSERT(row_idx == logical_cols);
         } else {
             // Keep original (logical_cols x K) row-major layout
             size_t row_idx = 0;
