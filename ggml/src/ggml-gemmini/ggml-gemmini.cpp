@@ -13,8 +13,16 @@
 #include "ggml-gemmini-args.h"
 
 #define SCALE_A 0.002441f
-// #define SCALE_C (SCALE_A * SCALE_B)  // Output scale
 
+#ifndef FULL_C
+#define FULL_C 0
+#endif
+#ifndef LOW_D
+#define LOW_D 0
+#endif
+#ifndef ERROR_COMPENSATION
+#define ERROR_COMPENSATION 0
+#endif 
 using namespace aisa;
 
 // Cycle 측정 용
@@ -49,6 +57,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     const bool pack_transpose_B = TRANSPOSE_B != 0;
     args.transpose_B = !pack_transpose_B; // Gemmini 쪽에는 실제 메모리 레이아웃에 맞게 전달
     args.scale_A = SCALE_A;
+    args.full_C = FULL_C;
+    args.low_D = LOW_D;
     
     /* _______________________ 2. Gemmini용 dimension _____________________ */
     const size_t I = dst->ne[1]; // I = A.ne[1], K = A.ne[0]
@@ -146,7 +156,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     start = read_cycles();
 
-#if USE_GEMMINI_BENCH_TENSOR
+#if ERROR_COMPENSATION
     ActivationDEC::compensate(src1, qA_const, qW_view, dst, layer);
 #else
     GGML_UNUSED(qA_view);
