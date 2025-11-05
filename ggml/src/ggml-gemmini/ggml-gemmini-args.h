@@ -204,7 +204,7 @@ inline void ggml_gemmini_pack_q80(const ggml_tensor *src,
 
 // Activation tensor quantization helper shared across Gemmini helpers.
 inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
-                                             const ggml_gemmini_args_t &args,
+                                             ggml_gemmini_args_t &args,
                                              int8_t *dst) {
     if (src == nullptr || dst == nullptr) 
         return;
@@ -216,11 +216,26 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
 
     const float *srcf = static_cast<const float *>(src->data);
     const size_t total = args.I * args.K;
-    const float scale = (args.scale_A != 0.0f) ? args.scale_A : 1.f;
+    if (total == 0) 
+        return;
+    
+    float max_abs = 0.0f;
+    for (size_t i = 0; i < total; ++i)
+        max_abs = std::max(max_abs, std::fabs(srcf[i]));
+
+    constexpr float eps = 1e-8f;
+    const float denom = std::max(max_abs, eps);
+    float scale = denom / 127.0f;
+    if (!std::isfinite(scale) || scale < eps) 
+        scale = 1.0f;
+    
+    args.scale_A = scale;
+
+    const float inv_scale = 1.0f / scale;
 
     for (size_t i = 0; i < total; ++i) {
         const float x = srcf[i];
-        int qx = static_cast<int>(std::lrintf(x / scale));
+        int qx = static_cast<int>(std::lrintf(x * inv_scale));
         qx = std::clamp(qx, -127, 127);
         dst[i] = static_cast<int8_t>(qx);
     }
