@@ -202,12 +202,12 @@ inline void ggml_gemmini_pack_q80(const ggml_tensor *src,
     args.block_size_k = QK8_0;
 }
 
-
 // Activation tensor quantization helper shared across Gemmini helpers.
 inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
                                              ggml_gemmini_args_t &args,
-                                             int8_t *dst) {
-    if (src == nullptr || dst == nullptr) 
+                                             int8_t *dst)
+{
+    if (src == nullptr || dst == nullptr)
         return;
 
     if (src->type != GGML_TYPE_F32)
@@ -217,9 +217,10 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
 
     const float *srcf = static_cast<const float *>(src->data);
     const size_t total = args.I * args.K;
-    if (total == 0) 
+    if (total == 0)
         return;
-    
+
+    // 통계
     float max_abs = 0.0f;
     float min_val = srcf[0];
     float max_val = srcf[0];
@@ -227,24 +228,28 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
     double sum_sq = 0.0;
     size_t near_zero = 0;
     constexpr float zero_eps = 1e-6f;
-    for (size_t i = 0; i < total; ++i) {
+
+    for (size_t i = 0; i < total; ++i)
+    {
         const float v = srcf[i];
         max_abs = std::max(max_abs, std::fabs(v));
         min_val = std::min(min_val, v);
         max_val = std::max(max_val, v);
         sum += static_cast<double>(v);
         sum_sq += static_cast<double>(v) * static_cast<double>(v);
-        if (std::fabs(v) < zero_eps) {
+        if (std::fabs(v) < zero_eps)
+        {
             ++near_zero;
         }
     }
 
+    // scale 결정
     constexpr float eps = 1e-8f;
     const float denom = std::max(max_abs, eps);
     float scale = denom / 127.0f;
-    if (!std::isfinite(scale) || scale < eps) 
+    if (!std::isfinite(scale) || scale < eps)
         scale = 1.0f;
-    
+
     args.scale_A = scale;
 
     const float inv_scale = 1.0f / scale;
@@ -253,39 +258,53 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
     const double variance = std::max(0.0, (sum_sq / static_cast<double>(total)) - mean * mean);
     const double stddev = std::sqrt(variance);
     const double zero_ratio = static_cast<double>(near_zero) / static_cast<double>(total);
-    printf("[layer=%s][quant] total=%zu min=%f max=%f max_abs=%f scale_A=%f mean=%f std=%f near_zero=%.2f%%\n",
-           layer_name,
-           total,
-           min_val,
-           max_val,
-           max_abs,
-           scale,
-           static_cast<float>(mean),
-           static_cast<float>(stddev),
-           zero_ratio * 100.0);
 
-    size_t sat_pos = 0;
-    size_t sat_neg = 0;
-    for (size_t i = 0; i < total; ++i) {
+    // 양자화 + 복원오차 지표(MAE/RMSE/SNR)
+    size_t sat_pos = 0, sat_neg = 0;
+    long double err_abs_sum = 0.0L, err_sq_sum = 0.0L, x_sq_sum = 0.0L;
+    float max_abs_err = 0.0f;
+
+    for (size_t i = 0; i < total; ++i)
+    {
         const float x = srcf[i];
         float scaled = x * inv_scale;
         int qx = static_cast<int>(std::lrintf(scaled));
-        if (qx > 127) {
+        if (qx > 127)
+        {
             qx = 127;
             ++sat_pos;
-        } else if (qx < -127) {
+        }
+        else if (qx < -127)
+        {
             qx = -127;
             ++sat_neg;
         }
         dst[i] = static_cast<int8_t>(qx);
-        if (i < 8) 
-            printf("[layer=%s][quant] sample[%zu]=%f -> %d\n", layer_name, i, x, qx);
+
+        const float deq = static_cast<float>(qx) * scale;
+        const float err = deq - x;
+        const float aerr = std::fabs(err);
+        err_abs_sum += aerr;
+        err_sq_sum += static_cast<long double>(err) * static_cast<long double>(err);
+        x_sq_sum += static_cast<long double>(x) * static_cast<long double>(x);
+        max_abs_err = std::max(max_abs_err, aerr);
     }
-    if (sat_pos || sat_neg) {
-        printf("[layer=%s][quant] saturation pos=%zu neg=%zu (%.4f%% of tensor)\n",
-               layer_name,
-               sat_pos,
-               sat_neg,
-               (static_cast<double>(sat_pos + sat_neg) * 100.0) / static_cast<double>(total));
+
+    const double mae = static_cast<double>(err_abs_sum) / static_cast<double>(total);
+    const double rmse = std::sqrt(static_cast<double>(err_sq_sum) / static_cast<double>(total));
+    const double snr_db = (err_sq_sum > 0.0L && x_sq_sum > 0.0L)
+                              ? 10.0 * std::log10(static_cast<double>(x_sq_sum / err_sq_sum))
+                              : INFINITY;
+    const double sat_ratio = (static_cast<double>(sat_pos + sat_neg) * 100.0) / static_cast<double>(total);
+
+    // 요약 로그
+    printf("[layer=%s][qact] N=%zu scale_A=%.6g sat=%.3f%% min=%g max=%g mean=%.6g std=%.6g mae=%.6g rmse=%.6g max|err|=%.6g snr=%.2f dB near0=%.2f%%\n",
+           layer_name, total, scale, sat_ratio, min_val, max_val, mean, stddev, mae, rmse, max_abs_err, snr_db, zero_ratio * 100.0);
+
+    // 포화되었을 때만 경고
+    if (sat_pos || sat_neg)
+    {
+        printf("[layer=%s][qact.warn] saturation pos=%zu neg=%zu (%.4f%%)\n",
+               layer_name, sat_pos, sat_neg, sat_ratio);
     }
 }
