@@ -21,10 +21,15 @@ target_compile_options(ggml-gemmini PRIVATE
 
 target_compile_definitions(ggml-gemmini PRIVATE
   USE_GEMMINI_BENCH_TENSOR=0 # true: BenchTensor | false: BaselineTensor
+  ERROR_COMPENSATION=0
   DEBUG=0         # ggml-gemmini-util.h에서 쓰는 DEBUG 매크로
   TEST=0          # 필요 시
+
+  # gemmini flag
   PRINT_TILE=0    # 필요 시
   OPTION=CPU      # OS/WS/CPU
+  FULL_C=0        # full_C
+  LOW_D=0         # low_D
 
   # test switches (DUMP는 소스에서 자동 파생)
   TRANSPOSE_B=1 # B 전치 여부
