@@ -221,8 +221,23 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
         return;
     
     float max_abs = 0.0f;
-    for (size_t i = 0; i < total; ++i)
-        max_abs = std::max(max_abs, std::fabs(srcf[i]));
+    float min_val = srcf[0];
+    float max_val = srcf[0];
+    double sum = 0.0;
+    double sum_sq = 0.0;
+    size_t near_zero = 0;
+    constexpr float zero_eps = 1e-6f;
+    for (size_t i = 0; i < total; ++i) {
+        const float v = srcf[i];
+        max_abs = std::max(max_abs, std::fabs(v));
+        min_val = std::min(min_val, v);
+        max_val = std::max(max_val, v);
+        sum += static_cast<double>(v);
+        sum_sq += static_cast<double>(v) * static_cast<double>(v);
+        if (std::fabs(v) < zero_eps) {
+            ++near_zero;
+        }
+    }
 
     constexpr float eps = 1e-8f;
     const float denom = std::max(max_abs, eps);
@@ -234,14 +249,43 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
 
     const float inv_scale = 1.0f / scale;
     const char *layer_name = args.layer_name ? args.layer_name : "";
-    printf("[layer=%s][quant] total=%zu max_abs=%f scale_A=%f\n", layer_name, total, max_abs, scale);
+    const double mean = sum / static_cast<double>(total);
+    const double variance = std::max(0.0, (sum_sq / static_cast<double>(total)) - mean * mean);
+    const double stddev = std::sqrt(variance);
+    const double zero_ratio = static_cast<double>(near_zero) / static_cast<double>(total);
+    printf("[layer=%s][quant] total=%zu min=%f max=%f max_abs=%f scale_A=%f mean=%f std=%f near_zero=%.2f%%\n",
+           layer_name,
+           total,
+           min_val,
+           max_val,
+           max_abs,
+           scale,
+           static_cast<float>(mean),
+           static_cast<float>(stddev),
+           zero_ratio * 100.0);
 
+    size_t sat_pos = 0;
+    size_t sat_neg = 0;
     for (size_t i = 0; i < total; ++i) {
         const float x = srcf[i];
-        int qx = static_cast<int>(std::lrintf(x * inv_scale));
-        qx = std::clamp(qx, -127, 127);
+        float scaled = x * inv_scale;
+        int qx = static_cast<int>(std::lrintf(scaled));
+        if (qx > 127) {
+            qx = 127;
+            ++sat_pos;
+        } else if (qx < -127) {
+            qx = -127;
+            ++sat_neg;
+        }
         dst[i] = static_cast<int8_t>(qx);
         if (i < 8) 
             printf("[layer=%s][quant] sample[%zu]=%f -> %d\n", layer_name, i, x, qx);
+    }
+    if (sat_pos || sat_neg) {
+        printf("[layer=%s][quant] saturation pos=%zu neg=%zu (%.4f%% of tensor)\n",
+               layer_name,
+               sat_pos,
+               sat_neg,
+               (static_cast<double>(sat_pos + sat_neg) * 100.0) / static_cast<double>(total));
     }
 }
