@@ -12,8 +12,9 @@
 #include "gemmini_tensor/quant_tensor_view.h"
 #include "ggml-gemmini-args.h"
 
-#define SCALE_A 0.002441f
-
+#ifndef SCALE_A
+#define SCALE_A 1.0f
+#endif
 #ifndef FULL_C
 #define FULL_C 0
 #endif
