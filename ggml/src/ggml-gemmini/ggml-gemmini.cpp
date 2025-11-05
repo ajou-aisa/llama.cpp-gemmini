@@ -151,7 +151,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     args.tiled_matmul_type = OPTION;
     /* __ 5. Gemmini 호출 __ */
-    aisa::tiled_matmul_auto_fp(&args); // gemmini 커널에서 tile과 block 매칭 -> tiled_matmul 호출 후 dequantize까지 수행
+    aisa::tiled_matmul_auto_fp32(&args); // gemmini 커널에서 tile과 block 매칭 -> tiled_matmul 호출 후 dequantize까지 수행
     // dst에는 gemmini 커널에서 dequantize한 결과가 들어옴 
 
     start = read_cycles();
