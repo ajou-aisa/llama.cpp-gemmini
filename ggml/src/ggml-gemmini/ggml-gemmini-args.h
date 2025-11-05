@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 
 #include "ggml.h"
 
@@ -232,11 +233,15 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
     args.scale_A = scale;
 
     const float inv_scale = 1.0f / scale;
+    const char *layer_name = args.layer_name ? args.layer_name : "";
+    printf("[layer=%s][quant] total=%zu max_abs=%f scale_A=%f\n", layer_name, total, max_abs, scale);
 
     for (size_t i = 0; i < total; ++i) {
         const float x = srcf[i];
         int qx = static_cast<int>(std::lrintf(x * inv_scale));
         qx = std::clamp(qx, -127, 127);
         dst[i] = static_cast<int8_t>(qx);
+        if (i < 8) 
+            printf("[layer=%s][quant] sample[%zu]=%f -> %d\n", layer_name, i, x, qx);
     }
 }
