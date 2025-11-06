@@ -215,7 +215,7 @@ namespace aisa
         rk_stage_.shrink_to_fit();
 
         uint64_t end = read_cycles();
-        printf("[layer=%s][DEC: Build R_k CSC structure] start=%lu end=%lu elapsed=%lu\n",
+        fprintf(stderr, "[layer=%s][DEC: Build R_k CSC structure] start=%lu end=%lu elapsed=%lu\n",
                layer_, start, end, end - start);
     }
 
@@ -265,7 +265,7 @@ namespace aisa
         }
 
         uint64_t end_cycle = read_cycles();
-        printf("[layer=%s][DEC: Compute and accumulate compensation] start=%lu end=%lu elapsed=%lu\n",
+        fprintf(stderr, "[layer=%s][DEC: Compute and accumulate compensation] start=%lu end=%lu elapsed=%lu\n",
                layer_, start, end_cycle, end_cycle - start);
     }
 
@@ -329,7 +329,7 @@ namespace aisa
         }
 
         uint64_t end = read_cycles();
-        printf("[layer=%s][DEC: Compute and accumulate compensation (unrolled)] start=%lu end=%lu elapsed=%lu\n",
+        fprintf(stderr, "[layer=%s][DEC: Compute and accumulate compensation (unrolled)] start=%lu end=%lu elapsed=%lu\n",
                layer_, start, end, end - start);
     }
 
@@ -381,7 +381,7 @@ namespace aisa
         }
 
         uint64_t end = read_cycles();
-        printf("[layer=%s][DEC: Compute and accumulate compensation (unrolled)] start=%lu end=%lu elapsed=%lu\n",
+        fprintf(stderr, "[layer=%s][DEC: Compute and accumulate compensation (unrolled)] start=%lu end=%lu elapsed=%lu\n",
                layer_, start, end, end - start);
     }
 
@@ -413,7 +413,7 @@ namespace aisa
         }
 
         uint64_t end = read_cycles();
-        printf("[layer=%s][DEC: Apply compensation to output] start=%lu end=%lu elapsed=%lu\n",
+        fprintf(stderr, "[layer=%s][DEC: Apply compensation to output] start=%lu end=%lu elapsed=%lu\n",
                layer_, start, end, end - start);
     }
 
@@ -433,7 +433,7 @@ namespace aisa
         }
 
         uint64_t end = read_cycles();
-        printf("[layer=%s][DEC: Apply compensation to output] start=%lu end=%lu elapsed=%lu\n",
+        fprintf(stderr, "[layer=%s][DEC: Apply compensation to output] start=%lu end=%lu elapsed=%lu\n",
                layer_, start, end, end - start);
     }
 
