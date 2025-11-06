@@ -165,7 +165,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     // dst에는 gemmini 커널에서 dequantize한 결과가 들어옴 
 
 #if ERROR_COMPENSATION
-    ActivationDEC::compensate(src1, qA_const, qW_view, dst, layer);
+    ActivationDEC::compensate(src1, &args);
 #else
     GGML_UNUSED(qA_view);
     GGML_UNUSED(qW_view);
