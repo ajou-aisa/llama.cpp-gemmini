@@ -24,6 +24,10 @@
 #ifndef ERROR_COMPENSATION
 #define ERROR_COMPENSATION 0
 #endif 
+#ifndef CYCLE_LOG
+#define CYCLE_LOG 1
+#endif
+
 using namespace aisa;
 
 // Cycle 측정 용
@@ -144,10 +148,12 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.tiled_matmul_type = OPTION;
 
     end = read_cycles();
-    printf("[layer=%s][Set Argument for calling tiled_matmul_auto of Gemmini ] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
+#if CYCLE_LOG
+    printf("[layer=%s][Set Args for calling gemmini] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
     printf("[layer=%s]", layer); // tiled_matmul_auto 내부 사이클 출력에 layer 추가
-    
-    printf("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out=%zu nb1=%zu\n",
+#endif
+
+    DBG("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out=%zu nb1=%zu\n",
            layer, args.A, args.B, args.C, args.D,
            args.I, args.J, args.K, args.sA, args.sB, args.sC,
            args.stride_f_out, dst->nb[1]);
