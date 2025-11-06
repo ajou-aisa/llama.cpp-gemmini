@@ -54,10 +54,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     const char *w_name = (src0 && src0->name) ? src0->name : ""; // weight name
     const char *layer = labelFromWeight(w_name); // layer 이름 추출
-    args.layer_name = layer;
     const bool pack_transpose_B = TRANSPOSE_B != 0;
+    
     args.transpose_B = !pack_transpose_B; // Gemmini 쪽에는 실제 메모리 레이아웃에 맞게 전달
-    args.scale_A = SCALE_A;
+    args.layer_name = layer;
     args.full_C = FULL_C;
     args.low_D = LOW_D;
     
@@ -70,7 +70,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.I = I;
     args.J = J;
     args.K = K;
-    args.scale_A = SCALE_A;
     
     /* _____ 3. Gemmini용 stride _____ */
     args.sA = K;
@@ -80,8 +79,11 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     static thread_local std::vector<int8_t> activation_q;
     activation_q.resize(I * K);
     int8_t *qx = activation_q.data();
+
     ggml_gemmini_quantize_activation(src1, args, qx);
+    
     args.A = reinterpret_cast<elem_t *>(qx);
+    
     QuantTensorView qA_view{qx, I, K, args.sA};
     ConstQuantTensorView qA_const = make_const_view(qA_view);
 
@@ -108,19 +110,17 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     float *block_scale_w = weight_scales.data();
 
     args.sB = pack_transpose_B ? logical_cols : static_cast<size_t>(K);
-    ggml_gemmini_pack_q80(src0,
-                          pack_transpose_B,
-                          reinterpret_cast<elem_t *>(qw),
-                          args.sB,
-                          block_scale_w,
-                          args);
+
+    ggml_gemmini_pack_q80(src0, pack_transpose_B, reinterpret_cast<elem_t *>(qw), args.sB, block_scale_w, args);
+
     args.B = reinterpret_cast<elem_t *>(qw);
+    
     QuantTensorView qW_view_local;
-    if (pack_transpose_B) {
+    if (pack_transpose_B) 
         qW_view_local = QuantTensorView{qw, static_cast<size_t>(K), logical_cols, args.sB};
-    } else {
+    else 
         qW_view_local = QuantTensorView{qw, logical_cols, static_cast<size_t>(K), args.sB};
-    }
+    
     ConstQuantTensorView qW_view = make_const_view(qW_view_local);
     
     /* ______________________________ 4. bias 텐서 처리 _________________________________ */
@@ -128,34 +128,35 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     const int32_t *bias_data = zero_bias.data();
     const size_t sD = 0;
+
     args.sD = sD;
     args.D = bias_data;
     args.repeating_bias = true;
 
-    end = read_cycles();
-    printf("[layer=%s][Set Argument for calling tiled_matmul_auto of Gemmini ] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
-    printf("[layer=%s]", layer); // tiled_matmul_auto 내부 사이클 출력에 layer 추가
-
+    
     // output 버퍼
     static thread_local std::vector<int8_t> c_i8;
     c_i8.resize(I * J);
+    
     args.C = c_i8.data();
-
     args.f_out = static_cast<float*>(dst->data);
     args.stride_f_out = dst->nb[1] / sizeof(float);
+    args.tiled_matmul_type = OPTION;
 
+    end = read_cycles();
+    printf("[layer=%s][Set Argument for calling tiled_matmul_auto of Gemmini ] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
+    printf("[layer=%s]", layer); // tiled_matmul_auto 내부 사이클 출력에 layer 추가
+    
     printf("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out=%zu nb1=%zu\n",
            layer, args.A, args.B, args.C, args.D,
            args.I, args.J, args.K, args.sA, args.sB, args.sC,
            args.stride_f_out, dst->nb[1]);
 
 
-    args.tiled_matmul_type = OPTION;
+
     /* __ 5. Gemmini 호출 __ */
     aisa::tiled_matmul_auto_fp32(&args); // gemmini 커널에서 tile과 block 매칭 -> tiled_matmul 호출 후 dequantize까지 수행
     // dst에는 gemmini 커널에서 dequantize한 결과가 들어옴 
-
-    start = read_cycles();
 
 #if ERROR_COMPENSATION
     ActivationDEC::compensate(src1, qA_const, qW_view, dst, layer);
