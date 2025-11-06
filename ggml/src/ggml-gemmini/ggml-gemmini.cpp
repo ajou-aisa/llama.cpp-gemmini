@@ -149,8 +149,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     end = read_cycles();
 #if CYCLE_LOG
-    printf("[layer=%s][Set Args for calling gemmini] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
-    printf("[layer=%s]", layer); // tiled_matmul_auto 내부 사이클 출력에 layer 추가
+    fprintf(stderr, "[layer=%s][Set Args for calling gemmini] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
+    fprintf(stderr, "[layer=%s]", layer); // tiled_matmul_auto 내부 사이클 출력에 layer 추가
 #endif
 
     DBG("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out=%zu nb1=%zu\n",
