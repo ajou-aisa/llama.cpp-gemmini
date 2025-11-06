@@ -98,7 +98,7 @@ namespace aisa
         {
             qx_ = reinterpret_cast<const int8_t *>(args->A);
             W_ = reinterpret_cast<const int8_t *>(args->B);
-            B_is_KxJ_ = !args->transposd_B;
+            B_is_KxJ_ = !args->transpose_B;
             block_size_k_ = args->block_size_k ? args->block_size_k : QK8_0;
             layer_ = args->layer_name ? args->layer_name : "others";
         }
