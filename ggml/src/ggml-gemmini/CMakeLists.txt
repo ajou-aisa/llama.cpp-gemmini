@@ -21,6 +21,7 @@ target_compile_options(ggml-gemmini PRIVATE
 
 target_compile_definitions(ggml-gemmini PRIVATE
   USE_GEMMINI_BENCH_TENSOR=0 # true: BenchTensor | false: BaselineTensor
+  CYCLE_LOG=1
   ERROR_COMPENSATION=0
   DEBUG=0         # ggml-gemmini-util.h에서 쓰는 DEBUG 매크로
   TEST=0          # 필요 시
