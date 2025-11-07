@@ -27,6 +27,10 @@ target_compile_definitions(ggml-gemmini PRIVATE
   DEBUG=0         # ggml-gemmini-util.h에서 쓰는 DEBUG 매크로
   TEST=0          # 필요 시
 
+  # debug
+  GEMMINI_GOLDEN_MM=0
+  GEMMINI_GOLDEN_CHECK=0
+
   # gemmini flag
   PRINT_TILE=0    # 필요 시
   OPTION=CPU      # OS/WS/CPU
