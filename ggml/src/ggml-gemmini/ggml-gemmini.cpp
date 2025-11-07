@@ -1,5 +1,7 @@
 // ggml-gemmini.cpp
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -26,6 +28,12 @@
 #endif 
 #ifndef CYCLE_LOG
 #define CYCLE_LOG 1
+#endif
+#ifndef GEMMINI_GOLDEN_CHECK
+#define GEMMINI_GOLDEN_CHECK 0
+#endif
+#ifndef GEMMINI_GOLDEN_MM
+#define GEMMINI_GOLDEN_MM 0
 #endif
 
 using namespace aisa;
@@ -118,6 +126,81 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     ggml_gemmini_pack_q80(src0, pack_transpose_B, reinterpret_cast<elem_t *>(qw), args.sB, block_scale_w, args);
 
     args.B = reinterpret_cast<elem_t *>(qw);
+
+    // Ensure the logical transpose/stride flags match the physical packing.
+    if (pack_transpose_B)
+    {
+        GGML_ASSERT(args.transpose_B == false);
+        GGML_ASSERT(args.sB == logical_cols);
+    }
+    else
+    {
+        GGML_ASSERT(args.transpose_B == true);
+        GGML_ASSERT(args.sB == static_cast<size_t>(K));
+    }
+
+#if defined(GEMMINI_GOLDEN_CHECK) && GEMMINI_GOLDEN_CHECK
+    // Compare the packed (qs, d) representation against the original Q8_0 blocks.
+    GGML_ASSERT(args.B_scales != nullptr);
+    GGML_ASSERT(args.blocks_J >= static_cast<size_t>(J));
+
+    const auto get_q80_row_ptr = [&](size_t logical_col) -> const block_q8_0 *
+    {
+        size_t rem = logical_col;
+        const size_t dim_j_sz = static_cast<size_t>(dim_j ? dim_j : 1);
+        const size_t dim_z_sz = static_cast<size_t>(dim_z ? dim_z : 1);
+        const size_t cols_per_w = dim_j_sz * dim_z_sz;
+        const int64_t iw_idx = cols_per_w ? static_cast<int64_t>(rem / cols_per_w) : 0;
+        rem = cols_per_w ? rem % cols_per_w : 0;
+        const int64_t iz_idx = dim_j_sz ? static_cast<int64_t>(rem / dim_j_sz) : 0;
+        const int64_t iy_idx = dim_j_sz ? static_cast<int64_t>(rem % dim_j_sz) : 0;
+        return ggml_gemmini_get_q80_row_ptr(src0, iy_idx, iz_idx, iw_idx);
+    };
+
+    const auto get_w_ref = [&](size_t k, size_t j) -> float
+    {
+        const size_t blk = k / QK8_0;
+        const size_t off = k % QK8_0;
+        const block_q8_0 *row_blocks = get_q80_row_ptr(j);
+        return ggml_fp16_to_fp32(row_blocks[blk].d) * static_cast<float>(row_blocks[blk].qs[off]);
+    };
+
+    const auto get_w_sep = [&](size_t k, size_t j) -> float
+    {
+        const size_t blk = k / args.block_size_k;
+        const float d = args.B_scales[blk * args.blocks_J + j];
+        const int8_t q = args.transpose_B ? qw[j * args.sB + k] : qw[k * args.sB + j];
+        return d * static_cast<float>(q);
+    };
+
+    size_t bad = 0, tot = 0;
+    double mae = 0.0, rmse = 0.0, maxd = 0.0;
+    const size_t J_chk = std::min(static_cast<size_t>(J), static_cast<size_t>(8));
+    const size_t K_chk = std::min(static_cast<size_t>(K), static_cast<size_t>(64));
+    for (size_t jx = 0; jx < J_chk; ++jx)
+    {
+        for (size_t kx = 0; kx < K_chk; ++kx)
+        {
+            const double diff = static_cast<double>(get_w_ref(kx, jx)) - static_cast<double>(get_w_sep(kx, jx));
+            mae += std::fabs(diff);
+            rmse += diff * diff;
+            maxd = std::max(maxd, std::fabs(diff));
+            ++tot;
+            if (std::fabs(diff) > 1e-5)
+            {
+                ++bad;
+            }
+        }
+    }
+    if (tot)
+    {
+        mae /= static_cast<double>(tot);
+        rmse = std::sqrt(rmse / static_cast<double>(tot));
+    }
+    fprintf(stderr, "[golden-W] bad=%zu/%zu mae=%.3e rmse=%.3e max|d|=%.3e tB=%d sB=%zu\n",
+            bad, tot, mae, rmse, maxd, static_cast<int>(args.transpose_B), args.sB);
+    GGML_ASSERT(bad == 0 && "B(qs,d) != dequant(Q8_0): transpose/stride/order mismatch");
+#endif
     
     /* ______________________________ 4. bias 텐서 처리 _________________________________ */
     std::vector<int32_t> zero_bias(J, 0);
@@ -154,6 +237,79 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     /* __ 5. Gemmini 호출 __ */
     aisa::tiled_matmul_auto_fp32(&args); // gemmini 커널에서 tile과 block 매칭 -> tiled_matmul 호출 후 dequantize까지 수행
     // dst에는 gemmini 커널에서 dequantize한 결과가 들어옴 
+
+#if defined(GEMMINI_GOLDEN_MM) && GEMMINI_GOLDEN_MM
+    {
+        const float *A_f32 = static_cast<const float *>(src1->data);
+        float *dst_f32 = static_cast<float *>(dst->data);
+        if (A_f32 != nullptr && dst_f32 != nullptr)
+        {
+            const size_t stride_a_f32 = src1->nb[1] ? static_cast<size_t>(src1->nb[1] / sizeof(float)) : static_cast<size_t>(K);
+            const size_t stride_dst = args.stride_f_out ? args.stride_f_out : J;
+
+            const auto get_q80_row_ptr = [&](size_t logical_col) -> const block_q8_0 *
+            {
+                size_t rem = logical_col;
+                const size_t dim_j_sz = static_cast<size_t>(dim_j ? dim_j : 1);
+                const size_t dim_z_sz = static_cast<size_t>(dim_z ? dim_z : 1);
+                const size_t cols_per_w = dim_j_sz * dim_z_sz;
+                const int64_t iw_idx = cols_per_w ? static_cast<int64_t>(rem / cols_per_w) : 0;
+                rem = cols_per_w ? rem % cols_per_w : 0;
+                const int64_t iz_idx = dim_j_sz ? static_cast<int64_t>(rem / dim_j_sz) : 0;
+                const int64_t iy_idx = dim_j_sz ? static_cast<int64_t>(rem % dim_j_sz) : 0;
+                return ggml_gemmini_get_q80_row_ptr(src0, iy_idx, iz_idx, iw_idx);
+            };
+
+            const auto weight_ref_at = [&](size_t k, size_t j) -> float
+            {
+                const size_t blk = k / QK8_0;
+                const size_t off = k % QK8_0;
+                const block_q8_0 *row_blocks = get_q80_row_ptr(j);
+                return ggml_fp16_to_fp32(row_blocks[blk].d) * static_cast<float>(row_blocks[blk].qs[off]);
+            };
+
+            double mae = 0.0, rmse = 0.0, maxd = 0.0;
+            size_t bad = 0, tot = 0;
+            const size_t I_chk = std::min(static_cast<size_t>(I), static_cast<size_t>(4));
+            const size_t J_chk = std::min(static_cast<size_t>(J), static_cast<size_t>(8));
+
+            for (size_t i0 = 0; i0 < I_chk; ++i0)
+            {
+                const float *row_a = A_f32 + i0 * stride_a_f32;
+                const float *row_dst = dst_f32 + i0 * stride_dst;
+                for (size_t j0 = 0; j0 < J_chk; ++j0)
+                {
+                    double ref = 0.0;
+                    for (size_t k0 = 0; k0 < K; ++k0)
+                    {
+                        ref += static_cast<double>(row_a[k0]) * static_cast<double>(weight_ref_at(k0, j0));
+                    }
+                    const double got = static_cast<double>(row_dst[j0]);
+                    const double diff = ref - got;
+                    mae += std::fabs(diff);
+                    rmse += diff * diff;
+                    maxd = std::max(maxd, std::fabs(diff));
+                    ++tot;
+                    if (std::fabs(diff) > 5e-3)
+                    {
+                        ++bad;
+                    }
+                }
+            }
+            if (tot)
+            {
+                mae /= static_cast<double>(tot);
+                rmse = std::sqrt(rmse / static_cast<double>(tot));
+            }
+            fprintf(stderr, "[golden-MM] bad=%zu/%zu mae=%.3e rmse=%.3e max|d|=%.3e\n",
+                    bad, tot, mae, rmse, maxd);
+        }
+        else
+        {
+            fprintf(stderr, "[golden-MM] skipped (missing src/dst data)\n");
+        }
+    }
+#endif
 
 #if ERROR_COMPENSATION
     ActivationDEC::compensate(src1, &args);
