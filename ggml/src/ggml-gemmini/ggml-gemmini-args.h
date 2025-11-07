@@ -20,7 +20,7 @@
 #undef GGML_GEMMINI_ARGS_DEFINE_GGML_COMMON
 #endif
 #include "include/gemmini_params.h"
-#include "../ggml-gemmini-util.h"
+#include "ggml-gemmini-util.h"
 
 // Forward declaration to avoid including full gemmini.h (breaks include cycles)
 enum tiled_matmul_type_t : int;
