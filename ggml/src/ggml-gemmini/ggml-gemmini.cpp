@@ -39,7 +39,7 @@
 using namespace aisa;
 
 // Cycle 측정 용
-extern "C" volatile uint64_t gemmini_tiled_matmul_cycles; // gemmini.h
+extern "C" volatile uint64_t gemmini_tiled_matmul_cycles = 0; // gemmini.h
 
 uint64_t start, end; // 일반 사이클 측정
 
