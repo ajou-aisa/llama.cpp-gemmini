@@ -346,7 +346,7 @@ namespace aisa
     {
         if (B_is_KxJ_)
         {
-            const int8_t *row = W_ + (size_t)k * sB_; // 연속 J_
+            const int8_t *row = qW_ + (size_t)k * sB_; // 연속 J_
             for (size_t j = 0; j < J_; ++j)
                 Wk_f[j] = (float)row[j];
         }
@@ -354,7 +354,7 @@ namespace aisa
         {
             // 물리 JxK (열우선) 형태: 각 j에서 k를 stride로 접근
             for (size_t j = 0; j < J_; ++j)
-                Wk_f[j] = (float)W_[j * sB_ + k];
+                Wk_f[j] = (float)qW_[j * sB_ + k];
         }
         if (B_scales_)
         {
