@@ -217,31 +217,49 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
 
     GGML_ASSERT(src->data != nullptr);
 
-    const float *srcf = static_cast<const float *>(src->data);
-    const size_t total = args.I * args.K;
+    // Resolve base pointer and strides (handle views).
+    const char *base_ptr = static_cast<const char *>(
+        src->view_src ? src->view_src->data : src->data);
+    const size_t view_offs = src->view_src ? src->view_offs : 0;
+    const char *data_ptr = base_ptr + view_offs;
+
+    const size_t stride_k_bytes = src->nb[0] ? src->nb[0] : sizeof(float);
+    const size_t stride_i_bytes = src->nb[1]
+                                      ? src->nb[1]
+                                      : static_cast<size_t>(args.K) * stride_k_bytes;
+
+    const size_t I = args.I;
+    const size_t K = args.K;
+    const size_t total = I * K;
     if (total == 0)
         return;
 
     // 통계
     float max_abs = 0.0f;
-    float min_val = srcf[0];
-    float max_val = srcf[0];
+    const float first_val =
+        *reinterpret_cast<const float *>(data_ptr + 0 * stride_i_bytes + 0 * stride_k_bytes);
+    float min_val = first_val;
+    float max_val = first_val;
     double sum = 0.0;
     double sum_sq = 0.0;
     size_t near_zero = 0;
     constexpr float zero_eps = 1e-6f;
 
-    for (size_t i = 0; i < total; ++i)
+    for (size_t i = 0; i < I; ++i)
     {
-        const float v = srcf[i];
-        max_abs = std::max(max_abs, std::fabs(v));
-        min_val = std::min(min_val, v);
-        max_val = std::max(max_val, v);
-        sum += static_cast<double>(v);
-        sum_sq += static_cast<double>(v) * static_cast<double>(v);
-        if (std::fabs(v) < zero_eps)
+        const char *row_ptr = data_ptr + i * stride_i_bytes;
+        for (size_t k = 0; k < K; ++k)
         {
-            ++near_zero;
+            const float v = *reinterpret_cast<const float *>(row_ptr + k * stride_k_bytes);
+            max_abs = std::max(max_abs, std::fabs(v));
+            min_val = std::min(min_val, v);
+            max_val = std::max(max_val, v);
+            sum += static_cast<double>(v);
+            sum_sq += static_cast<double>(v) * static_cast<double>(v);
+            if (std::fabs(v) < zero_eps)
+            {
+                ++near_zero;
+            }
         }
     }
 
@@ -266,30 +284,35 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
     long double err_abs_sum = 0.0L, err_sq_sum = 0.0L, x_sq_sum = 0.0L;
     float max_abs_err = 0.0f;
 
-    for (size_t i = 0; i < total; ++i)
+    for (size_t i = 0; i < I; ++i)
     {
-        const float x = srcf[i];
-        float scaled = x * inv_scale;
-        int qx = static_cast<int>(std::lrintf(scaled));
-        if (qx > 127)
+        const char *row_ptr = data_ptr + i * stride_i_bytes;
+        int8_t *row_dst = dst + i * K;
+        for (size_t k = 0; k < K; ++k)
         {
-            qx = 127;
-            ++sat_pos;
-        }
-        else if (qx < -127)
-        {
-            qx = -127;
-            ++sat_neg;
-        }
-        dst[i] = static_cast<int8_t>(qx);
+            const float x = *reinterpret_cast<const float *>(row_ptr + k * stride_k_bytes);
+            float scaled = x * inv_scale;
+            int qx = static_cast<int>(std::lrintf(scaled));
+            if (qx > 127)
+            {
+                qx = 127;
+                ++sat_pos;
+            }
+            else if (qx < -127)
+            {
+                qx = -127;
+                ++sat_neg;
+            }
+            row_dst[k] = static_cast<int8_t>(qx);
 
-        const float deq = static_cast<float>(qx) * scale;
-        const float err = deq - x;
-        const float aerr = std::fabs(err);
-        err_abs_sum += aerr;
-        err_sq_sum += static_cast<long double>(err) * static_cast<long double>(err);
-        x_sq_sum += static_cast<long double>(x) * static_cast<long double>(x);
-        max_abs_err = std::max(max_abs_err, aerr);
+            const float deq = static_cast<float>(qx) * scale;
+            const float err = deq - x;
+            const float aerr = std::fabs(err);
+            err_abs_sum += aerr;
+            err_sq_sum += static_cast<long double>(err) * static_cast<long double>(err);
+            x_sq_sum += static_cast<long double>(x) * static_cast<long double>(x);
+            max_abs_err = std::max(max_abs_err, aerr);
+        }
     }
 
     const double mae = static_cast<double>(err_abs_sum) / static_cast<double>(total);
