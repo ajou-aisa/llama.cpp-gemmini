@@ -39,7 +39,7 @@
 using namespace aisa;
 
 // Cycle 측정 용
-extern "C" volatile uint64_t gemmini_tiled_matmul_cycles = 0; // gemmini.h
+extern "C" volatile uint64_t gemmini_tiled_matmul_cycles; // gemmini.h
 
 uint64_t start, end; // 일반 사이클 측정
 
@@ -64,7 +64,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     // set args
     start = read_cycles();
 
-    const char *w_name = (src0 && src0->name) ? src0->name : ""; // weight name
+    const char *w_name = (src0 && src0->name[0]) ? src0->name : ""; // weight name
     const char *layer = labelFromWeight(w_name); // layer 이름 추출
     const bool pack_transpose_B = TRANSPOSE_B != 0;
     
@@ -100,12 +100,13 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     ConstQuantTensorView qA_const = make_const_view(qA_view);
 
     // breackdown weight to int8_t & scale
+    const int64_t dim_j = src0->ne[1] ? src0->ne[1] : 1;
     const int64_t dim_z = src0->ne[2] ? src0->ne[2] : 1;
     const int64_t dim_w = src0->ne[3] ? src0->ne[3] : 1;
 
     GGML_ASSERT(K % QK8_0 == 0);
     const size_t blocks_K = static_cast<size_t>(K) / QK8_0;
-    const size_t logical_cols = static_cast<size_t>(J * dim_z * dim_w);
+    const size_t logical_cols = static_cast<size_t>(dim_j * dim_z * dim_w);
 
     static thread_local std::vector<int8_t> weight_q;
     static thread_local std::vector<float> weight_scales;
@@ -128,6 +129,21 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.B = reinterpret_cast<elem_t *>(qw);
 
     // Ensure the logical transpose/stride flags match the physical packing.
+#if (GEMMINI_GOLDEN_CHECK || GEMMINI_GOLDEN_MM)
+    const auto get_q80_row_ptr = [&](size_t logical_col) -> const block_q8_0 *
+    {
+        size_t rem = logical_col;
+        const size_t dim_j_sz = static_cast<size_t>(dim_j ? dim_j : 1);
+        const size_t dim_z_sz = static_cast<size_t>(dim_z ? dim_z : 1);
+        const size_t cols_per_w = dim_j_sz * dim_z_sz;
+        const int64_t iw_idx = cols_per_w ? static_cast<int64_t>(rem / cols_per_w) : 0;
+        rem = cols_per_w ? rem % cols_per_w : 0;
+        const int64_t iz_idx = dim_j_sz ? static_cast<int64_t>(rem / dim_j_sz) : 0;
+        const int64_t iy_idx = dim_j_sz ? static_cast<int64_t>(rem % dim_j_sz) : 0;
+        return ggml_gemmini_get_q80_row_ptr(src0, iy_idx, iz_idx, iw_idx);
+    };
+#endif
+
     if (pack_transpose_B)
     {
         GGML_ASSERT(args.transpose_B == false);
@@ -143,19 +159,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     // Compare the packed (qs, d) representation against the original Q8_0 blocks.
     GGML_ASSERT(args.B_scales != nullptr);
     GGML_ASSERT(args.blocks_J >= static_cast<size_t>(J));
-
-    const auto get_q80_row_ptr = [&](size_t logical_col) -> const block_q8_0 *
-    {
-        size_t rem = logical_col;
-        const size_t dim_j_sz = static_cast<size_t>(dim_j ? dim_j : 1);
-        const size_t dim_z_sz = static_cast<size_t>(dim_z ? dim_z : 1);
-        const size_t cols_per_w = dim_j_sz * dim_z_sz;
-        const int64_t iw_idx = cols_per_w ? static_cast<int64_t>(rem / cols_per_w) : 0;
-        rem = cols_per_w ? rem % cols_per_w : 0;
-        const int64_t iz_idx = dim_j_sz ? static_cast<int64_t>(rem / dim_j_sz) : 0;
-        const int64_t iy_idx = dim_j_sz ? static_cast<int64_t>(rem % dim_j_sz) : 0;
-        return ggml_gemmini_get_q80_row_ptr(src0, iy_idx, iz_idx, iw_idx);
-    };
 
     const auto get_w_ref = [&](size_t k, size_t j) -> float
     {
@@ -247,19 +250,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             const size_t stride_a_f32 = src1->nb[1] ? static_cast<size_t>(src1->nb[1] / sizeof(float)) : static_cast<size_t>(K);
             const size_t stride_dst = args.stride_f_out ? args.stride_f_out : J;
 
-            const auto get_q80_row_ptr = [&](size_t logical_col) -> const block_q8_0 *
-            {
-                size_t rem = logical_col;
-                const size_t dim_j_sz = static_cast<size_t>(dim_j ? dim_j : 1);
-                const size_t dim_z_sz = static_cast<size_t>(dim_z ? dim_z : 1);
-                const size_t cols_per_w = dim_j_sz * dim_z_sz;
-                const int64_t iw_idx = cols_per_w ? static_cast<int64_t>(rem / cols_per_w) : 0;
-                rem = cols_per_w ? rem % cols_per_w : 0;
-                const int64_t iz_idx = dim_j_sz ? static_cast<int64_t>(rem / dim_j_sz) : 0;
-                const int64_t iy_idx = dim_j_sz ? static_cast<int64_t>(rem % dim_j_sz) : 0;
-                return ggml_gemmini_get_q80_row_ptr(src0, iy_idx, iz_idx, iw_idx);
-            };
-
             const auto weight_ref_at = [&](size_t k, size_t j) -> float
             {
                 const size_t blk = k / QK8_0;
@@ -313,6 +303,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
 #if ERROR_COMPENSATION
     ActivationDEC::compensate(src1, &args);
+#endif
 }
 
 static void ggml_backend_gemmini_add(
