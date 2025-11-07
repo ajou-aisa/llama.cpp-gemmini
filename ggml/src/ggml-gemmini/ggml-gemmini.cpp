@@ -119,14 +119,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     args.B = reinterpret_cast<elem_t *>(qw);
     
-    QuantTensorView qW_view_local;
-    if (pack_transpose_B) 
-        qW_view_local = QuantTensorView{qw, static_cast<size_t>(K), logical_cols, args.sB};
-    else 
-        qW_view_local = QuantTensorView{qw, logical_cols, static_cast<size_t>(K), args.sB};
-    
-    ConstQuantTensorView qW_view = make_const_view(qW_view_local);
-    
     /* ______________________________ 4. bias 텐서 처리 _________________________________ */
     std::vector<int32_t> zero_bias(J, 0);
 
@@ -149,8 +141,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     end = read_cycles();
 #if CYCLE_LOG
-    fprintf(stderr, "[layer=%s][Set Args for calling gemmini] start = %lu, end = %lu, elapsed = %lu\n", layer, start, end, end - start);
-    fprintf(stderr, "[layer=%s]", layer); // tiled_matmul_auto 내부 사이클 출력에 layer 추가
+    PRINT_CYCLE(layer, "Set Args for calling gemmini", start, end, end - start);
 #endif
 
     DBG("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out=%zu nb1=%zu\n",
@@ -166,10 +157,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
 #if ERROR_COMPENSATION
     ActivationDEC::compensate(src1, &args);
-#else
-    GGML_UNUSED(qA_view);
-    GGML_UNUSED(qW_view);
-#endif
 }
 
 static void ggml_backend_gemmini_add(
