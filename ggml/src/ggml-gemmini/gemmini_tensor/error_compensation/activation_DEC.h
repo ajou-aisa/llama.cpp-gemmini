@@ -42,7 +42,7 @@ namespace aisa
         // act/weight buffers & layout
         const int8_t *qx_ = nullptr; // args->A
         size_t sA_ = 0;
-        const int8_t *W_ = nullptr; // args->B
+        const int8_t *qW_ = nullptr; // args->B
         size_t sB_ = 0;
         bool B_is_KxJ_ = true;
 
@@ -83,7 +83,7 @@ namespace aisa
               blocks_J_(args->blocks_J), blocks_K_(args->blocks_K)
         {
             qx_ = reinterpret_cast<const int8_t *>(args->A);
-            W_ = reinterpret_cast<const int8_t *>(args->B);
+            qW_ = reinterpret_cast<const int8_t *>(args->B);
             B_is_KxJ_ = !args->transpose_B;
             block_size_k_ = args->block_size_k ? args->block_size_k : QK8_0;
             layer_ = args->layer_name ? args->layer_name : "others";
