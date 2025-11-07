@@ -194,56 +194,6 @@ namespace aisa
     }
 
     /**
-     * @brief 보상 행렬 계산 (기본 버전)
-     *
-     * Y_com[r,j] = Σ_k δ[r,k] * Ŵ[k,j]
-     *
-     * 각 salient 채널 k에 대해:
-     *   1. 가중치 행 Ŵ[k,:]을 float로 변환
-     *   2. R_k에 있는 모든 (행 r, 잔차 δ)에 대해
-     *      Y_com[r,:] += δ * Ŵ[k,:]를 누적
-     *
-     * @param W 양자화된 가중치 행렬 (K×J)
-     * @param Y_com 출력 보상 행렬 (I×J)
-     */
-    void ActivationDEC::computeCompensation(const int8_t *W, float *Y_com)
-    {
-        uint64_t start = read_cycles();
-
-        std::vector<float> Wk_f(J_); // 가중치 행 버퍼
-
-        const size_t stride_qW = qW_.stride ? qW_.stride : J_;
-
-        // Non-zero 잔차를 가진 각 채널 k에 대해
-        for (int k : unique_k_)
-        {
-            const size_t beg = rk_offs_[k];                            // 채널 k의 시작 오프셋
-            const size_t end = rk_offs_[k + 1];                        // 채널 k의 끝 오프셋
-            const int8_t *Wk = W + static_cast<size_t>(k) * stride_qW; // Ŵ[k,:] 포인터
-
-            // 가중치 행 Ŵ[k,:]을 float로 한 번 변환 (재사용)
-            for (size_t j = 0; j < J_; ++j)
-                Wk_f[j] = static_cast<float>(Wk[j]);
-
-            // R_k의 모든 (행 r, 잔차 δ)에 대해 누적
-            for (size_t t = beg; t < end; ++t)
-            {
-                const int r = rk_pairs_[t].first;                // 행 인덱스
-                const float d = rk_pairs_[t].second;             // 잔차
-                float *Yr = Y_com + static_cast<size_t>(r) * J_; // Y_com[r,:] 포인터
-
-                // Y_com[r,j] += δ[r,k] * Ŵ[k,j]
-                for (size_t j = 0; j < J_; ++j)
-                    Yr[j] += d * Wk_f[j];
-            }
-        }
-
-        uint64_t end_cycle = read_cycles();
-        fprintf(stderr, "[layer=%s][DEC: Compute and accumulate compensation] start=%lu end=%lu elapsed=%lu\n",
-               layer_, start, end_cycle, end_cycle - start);
-    }
-
-    /**
      * @brief 보상 행렬 계산 (8-way 언롤링 최적화 버전)
      *
      * computeCompensation과 동일한 로직이지만,
