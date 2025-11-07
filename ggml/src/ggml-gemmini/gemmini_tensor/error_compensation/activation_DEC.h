@@ -26,20 +26,11 @@ namespace aisa
     class ActivationDEC
     {
     public:
-        static void compensate(const ggml_tensor *A,
-                               ConstQuantTensorView qA,
-                               ConstQuantTensorView qW,
-                               ggml_tensor *C_out,
-                               const char *layer_name = nullptr);
-
         static void compensate(const ggml_tensor *A, ggml_gemmini_args_t *args);
 
     private:
         const ggml_tensor *A_ = nullptr; // F32 activation
         const ggml_gemmini_args_t *args_ = nullptr;
-
-        ConstQuantTensorView qA_; // quantized activation view
-        ConstQuantTensorView qW_; // quantized weight view
 
         const char *layer_ = "others";
 
@@ -84,11 +75,6 @@ namespace aisa
         std::vector<int> scratch_idx_;   // K_ indices for sorting
         std::vector<float> scratch_abs_; // cached |x_r[k]| values
 
-        ActivationDEC(const ggml_tensor *A,
-                      ConstQuantTensorView qA,
-                      ConstQuantTensorView qW)
-            : A_(A), qA_(qA), qW_(qW) {}
-
         ActivationDEC(const ggml_tensor *A, ggml_gemmini_args_t *args)
             : A_(A), args_(args), 
               I_(args->I), J_(args->J), K_(args->K),
@@ -109,9 +95,7 @@ namespace aisa
                                           const int8_t *row_q);
         void buildRk();
         void computeCompensation(const int8_t *W, float *y_out);
-        void computeCompensation_unrolled(const int8_t *W, float *Y_com);
         void computeCompensation_unrolled(float *Y_com);
-        void applyCompensation(ggml_tensor *C_out, const std::vector<float> &y_com);
         void applyCompensation(float *out, size_t stride, const std::vector<float> &Y_com);
 
         inline void load_W_row_scaled(int k, std::vector<float> &Wk_f) const;
