@@ -13,33 +13,7 @@ namespace aisa
      * 양자화 오차를 보상하여 정확도를 향상시키는 함수
      *
      * @param A 원본 활성화 텐서 (float)
-     * @param qA 양자화된 활성화 텐서 (int8_t)
-     * @param qW 양자화된 가중치 텐서 (int8_t)
-     * @param C_out 출력 텐서 (보상이 적용될 결과)
      */
-    void ActivationDEC::compensate(const ggml_tensor *A,
-                                   ConstQuantTensorView qA,
-                                   ConstQuantTensorView qW,
-                                   ggml_tensor *C_out,
-                                   const char *layer_name)
-    {
-        // DEC 객체 초기화
-        ActivationDEC dec(A, qA, qW);
-        dec.layer_ = layer_name ? layer_name : "others";
-
-        // 준비 단계: Top-K 채널 선택, 잔차 계산, R_k CSC 구조 구축
-        dec.prepare();
-
-        // 보상 행렬 Y_com (I×J) 계산
-        std::vector<float> Y_com(dec.I_ * dec.J_, 0.f);
-        const int8_t *W = qW.data;
-
-        // 언롤링된 버전으로 보상 계산
-        dec.computeCompensation_unrolled(W, Y_com.data());
-
-        // 계산된 보상을 출력에 적용
-        dec.applyCompensation(C_out, Y_com);
-    }
 
     // args를 활용하는 per-block scale 적용
     void ActivationDEC::compensate(const ggml_tensor *A, ggml_gemmini_args_t *args)
@@ -283,55 +257,6 @@ namespace aisa
      * @param W 양자화된 가중치 행렬 (K×J)
      * @param Y_com 출력 보상 행렬 (I×J)
      */
-    void ActivationDEC::computeCompensation_unrolled(const int8_t *W, float *Y_com)
-    {
-        uint64_t start = read_cycles();
-
-        std::vector<float> Wk_f(J_);
-
-        const size_t stride_qW = qW_.stride ? qW_.stride : J_;
-
-        // Non-zero 잔차를 가진 각 채널 k에 대해
-        for (int k : unique_k_)
-        {
-            const size_t beg = rk_offs_[k];
-            const size_t end = rk_offs_[k + 1];
-            const int8_t *Wk = W + static_cast<size_t>(k) * stride_qW;
-
-            // 가중치 행 Ŵ[k,:]을 float로 변환
-            for (size_t j = 0; j < J_; ++j)
-                Wk_f[j] = static_cast<float>(Wk[j]);
-
-            // 각 (행, 잔차) 쌍에 대해 보상 누적
-            for (size_t t = beg; t < end; ++t)
-            {
-                const int r = rk_pairs_[t].first;
-                const float d = rk_pairs_[t].second;
-                float *Yr = Y_com + static_cast<size_t>(r) * J_;
-
-                // 8-way 언롤링: 한 번에 8개 원소 처리
-                size_t j = 0;
-                for (; j + 7 < J_; j += 8)
-                {
-                    Yr[j + 0] += d * Wk_f[j + 0];
-                    Yr[j + 1] += d * Wk_f[j + 1];
-                    Yr[j + 2] += d * Wk_f[j + 2];
-                    Yr[j + 3] += d * Wk_f[j + 3];
-                    Yr[j + 4] += d * Wk_f[j + 4];
-                    Yr[j + 5] += d * Wk_f[j + 5];
-                    Yr[j + 6] += d * Wk_f[j + 6];
-                    Yr[j + 7] += d * Wk_f[j + 7];
-                }
-                // 나머지 원소 처리 (J가 8의 배수가 아닌 경우)
-                for (; j < J_; ++j)
-                    Yr[j] += d * Wk_f[j];
-            }
-        }
-
-        uint64_t end = read_cycles();
-        fprintf(stderr, "[layer=%s][DEC: Compute and accumulate compensation (unrolled)] start=%lu end=%lu elapsed=%lu\n",
-               layer_, start, end, end - start);
-    }
 
     void ActivationDEC::computeCompensation_unrolled(float *Y_com)
     {
@@ -395,27 +320,6 @@ namespace aisa
      * @param C_out 출력 텐서 (양자화된 행렬곱 결과)
      * @param Y_com 보상 행렬 (I×J)
      */
-    void ActivationDEC::applyCompensation(ggml_tensor *C_out,
-                                          const std::vector<float> &Y_com)
-    {
-        uint64_t start = read_cycles();
-
-        float *C = static_cast<float *>(C_out->data);
-        const size_t stride_C = C_out->nb[1] / sizeof(float);
-
-        // 각 원소에 보상 적용: C[r,j] += Y_com[r,j] * s_w
-        for (size_t r = 0; r < I_; ++r)
-        {
-            const float *Yr = Y_com.data() + r * J_;
-            float *Cr = C + r * stride_C;
-            for (size_t j = 0; j < J_; ++j)
-                Cr[j] += Yr[j] * SCALE_W; // 가중치 스케일 팩터 적용
-        }
-
-        uint64_t end = read_cycles();
-        fprintf(stderr, "[layer=%s][DEC: Apply compensation to output] start=%lu end=%lu elapsed=%lu\n",
-               layer_, start, end, end - start);
-    }
 
     void ActivationDEC::applyCompensation(float *out, size_t stride, const std::vector<float> &Y_com)
     {
