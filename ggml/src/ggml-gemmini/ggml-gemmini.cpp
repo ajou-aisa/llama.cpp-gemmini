@@ -236,11 +236,11 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
 #if defined(GEMMINI_GOLDEN_MM) && GEMMINI_GOLDEN_MM
     {
-        const float *A_f32 = static_cast<const float *>(src1->data);
+        const int8_t *A_q = reinterpret_cast<const int8_t *>(args.A);
         float *dst_f32 = static_cast<float *>(dst->data);
-        if (A_f32 != nullptr && dst_f32 != nullptr)
+        if (A_q != nullptr && dst_f32 != nullptr)
         {
-            const size_t stride_a_f32 = src1->nb[1] ? static_cast<size_t>(src1->nb[1] / sizeof(float)) : static_cast<size_t>(K);
+            const size_t stride_a_q = args.sA ? args.sA : K;
             const size_t stride_dst = args.stride_f_out ? args.stride_f_out : J;
             const size_t stride_dst_col = args.col_stride_f_out ? args.col_stride_f_out : 1;
 
@@ -259,14 +259,15 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
             for (size_t i0 = 0; i0 < I_chk; ++i0)
             {
-                const float *row_a = A_f32 + i0 * stride_a_f32;
+                const int8_t *row_a = A_q + i0 * stride_a_q;
                 const float *row_dst = dst_f32 + i0 * stride_dst;
                 for (size_t j0 = 0; j0 < J_chk; ++j0)
                 {
                     double ref = 0.0;
                     for (size_t k0 = 0; k0 < K; ++k0)
                     {
-                        ref += static_cast<double>(row_a[k0]) * static_cast<double>(weight_ref_at(k0, j0));
+                        const double a_deq = static_cast<double>(GEMMINI_SCALE(row_a[k0], args.scale_A));
+                        ref += a_deq * static_cast<double>(weight_ref_at(k0, j0));
                     }
                     const double got = static_cast<double>(row_dst[j0 * stride_dst_col]);
                     const double diff = ref - got;
