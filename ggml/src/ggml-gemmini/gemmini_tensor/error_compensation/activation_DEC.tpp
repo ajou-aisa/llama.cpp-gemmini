@@ -31,7 +31,10 @@ namespace aisa
         dec.computeCompensation_unrolled(Y_com.data()); // 내부에서 per-block scale 적용
 
         // 계산된 보상을 출력에 적용
-        dec.applyCompensation(args->f_out, args->stride_f_out, Y_com);
+        dec.applyCompensation(args->f_out,
+                              args->stride_f_out,
+                              args->col_stride_f_out ? args->col_stride_f_out : 1,
+                              Y_com);
     }
 
     /**
@@ -271,19 +274,22 @@ namespace aisa
      * @param Y_com 보상 행렬 (I×J)
      */
 
-    void ActivationDEC::applyCompensation(float *out, size_t stride, const std::vector<float> &Y_com)
+    void ActivationDEC::applyCompensation(float *out,
+                                          size_t row_stride,
+                                          size_t col_stride,
+                                          const std::vector<float> &Y_com)
     {
         uint64_t start = read_cycles();
 
         float *C = out;
 
-        // 각 원소에 보상 적용: C[r,j] += Y_com[r,j] * s_w
+        // 각 원소에 보상 적용: C[r,j] += Y_com[r,j]
         for (size_t r = 0; r < I_; ++r)
         {
             const float *Yr = Y_com.data() + r * J_;
-            float *Cr = C + r * stride;
+            float *Cr = C + r * row_stride;
             for (size_t j = 0; j < J_; ++j)
-                Cr[j] += Yr[j];
+                Cr[j * col_stride] += Yr[j];
         }
 
         uint64_t end = read_cycles();

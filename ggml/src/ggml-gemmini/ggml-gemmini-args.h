@@ -75,7 +75,8 @@ typedef struct ggml_gemmini_args_t {
 
     // origin output
     float* f_out = nullptr;
-    size_t stride_f_out = 0;
+    size_t stride_f_out = 0;      // row stride in elements
+    size_t col_stride_f_out = 0;  // column stride in elements
 
     // logging & profiling helpers
     const char *layer_name = "";
