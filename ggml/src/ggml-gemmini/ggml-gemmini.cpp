@@ -66,9 +66,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     const char *w_name = (src0 && src0->name[0]) ? src0->name : ""; // weight name
     const char *layer = labelFromWeight(w_name); // layer 이름 추출
-    const bool pack_transpose_B = TRANSPOSE_B != 0;
-    
-    args.transpose_B = !pack_transpose_B; // Gemmini 쪽에는 실제 메모리 레이아웃에 맞게 전달
+    (void)TRANSPOSE_B; // 항상 (K x J) row-major 정책 사용
+
+    args.transpose_B = false;
     args.layer_name = layer;
     args.full_C = FULL_C;
     args.low_D = LOW_D;
@@ -122,9 +122,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     int8_t *qw = weight_q.data();
     float *block_scale_w = weight_scales.data();
 
-    args.sB = pack_transpose_B ? logical_cols : static_cast<size_t>(K);
+    args.sB = logical_cols;
 
-    ggml_gemmini_pack_q80(src0, pack_transpose_B, reinterpret_cast<elem_t *>(qw), args.sB, block_scale_w, args);
+    ggml_gemmini_pack_q80(src0, /*transpose=*/true, reinterpret_cast<elem_t *>(qw), args.sB, block_scale_w, args);
 
     args.B = reinterpret_cast<elem_t *>(qw);
 
@@ -144,16 +144,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     };
 #endif
 
-    if (pack_transpose_B)
-    {
-        GGML_ASSERT(args.transpose_B == false);
-        GGML_ASSERT(args.sB == logical_cols);
-    }
-    else
-    {
-        GGML_ASSERT(args.transpose_B == true);
-        GGML_ASSERT(args.sB == static_cast<size_t>(K));
-    }
+    GGML_ASSERT(args.transpose_B == false);
+    GGML_ASSERT(args.sB == logical_cols);
 
 #if defined(GEMMINI_GOLDEN_CHECK) && GEMMINI_GOLDEN_CHECK
     // Compare the packed (qs, d) representation against the original Q8_0 blocks.
@@ -172,7 +164,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     {
         const size_t blk = k / args.block_size_k;
         const float d = args.B_scales[blk * args.blocks_J + j];
-        const int8_t q = args.transpose_B ? qw[j * args.sB + k] : qw[k * args.sB + j];
+        const int8_t q = qw[k * args.sB + j];
         return d * static_cast<float>(q);
     };
 
