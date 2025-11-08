@@ -30,6 +30,7 @@ target_compile_definitions(ggml-gemmini PRIVATE
   # debug
   GEMMINI_GOLDEN_MM=0
   GEMMINI_GOLDEN_CHECK=0
+  GEMMINI_KBLOCK_DEBUG=1
 
   # gemmini flag
   PRINT_TILE=0    # 필요 시
