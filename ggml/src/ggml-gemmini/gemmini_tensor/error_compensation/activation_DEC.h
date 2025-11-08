@@ -95,7 +95,10 @@ namespace aisa
                                           const int8_t *row_q);
         void buildRk();
         void computeCompensation_unrolled(float *Y_com);
-        void applyCompensation(float *out, size_t stride, const std::vector<float> &Y_com);
+        void applyCompensation(float *out,
+                               size_t row_stride,
+                               size_t col_stride,
+                               const std::vector<float> &Y_com);
 
         inline void load_W_row_scaled(int k, std::vector<float> &Wk_f) const;
     };

@@ -214,6 +214,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     
     args.C = c_i8.data();
     args.f_out = static_cast<float*>(dst->data);
+    args.col_stride_f_out = dst->nb[0] / sizeof(float);
     args.stride_f_out = dst->nb[1] / sizeof(float);
     args.tiled_matmul_type = OPTION;
 
@@ -222,10 +223,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     PRINT_CYCLE(layer, "Set Args for calling gemmini", start, end, end - start);
 #endif
 
-    DBG("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out=%zu nb1=%zu\n",
+    DBG("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out(row)=%zu stride_f_out(col)=%zu nb1=%zu nb0=%zu\n",
            layer, args.A, args.B, args.C, args.D,
            args.I, args.J, args.K, args.sA, args.sB, args.sC,
-           args.stride_f_out, dst->nb[1]);
+           args.stride_f_out, args.col_stride_f_out, dst->nb[1], dst->nb[0]);
 
 
 
@@ -241,6 +242,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         {
             const size_t stride_a_f32 = src1->nb[1] ? static_cast<size_t>(src1->nb[1] / sizeof(float)) : static_cast<size_t>(K);
             const size_t stride_dst = args.stride_f_out ? args.stride_f_out : J;
+            const size_t stride_dst_col = args.col_stride_f_out ? args.col_stride_f_out : 1;
 
             const auto weight_ref_at = [&](size_t k, size_t j) -> float
             {
@@ -266,7 +268,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                     {
                         ref += static_cast<double>(row_a[k0]) * static_cast<double>(weight_ref_at(k0, j0));
                     }
-                    const double got = static_cast<double>(row_dst[j0]);
+                    const double got = static_cast<double>(row_dst[j0 * stride_dst_col]);
                     const double diff = ref - got;
                     mae += std::fabs(diff);
                     rmse += diff * diff;
