@@ -266,7 +266,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                     double ref = 0.0;
                     for (size_t k0 = 0; k0 < K; ++k0)
                     {
-                        const double a_deq = static_cast<double>(GEMMINI_SCALE(row_a[k0], args.scale_A));
+                        const double a_deq = static_cast<double>(row_a[k0]) * static_cast<double>(args.scale_A);
                         ref += a_deq * static_cast<double>(weight_ref_at(k0, j0));
                     }
                     const double got = static_cast<double>(row_dst[j0 * stride_dst_col]);
