@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
+#include <string>
 
 #include "ggml-gemmini-util.h"
 #include "include/gemmini.h"
@@ -55,13 +56,62 @@ static inline char *ggml_tensor_data_start(struct ggml_tensor *tensor)
     return base + offs;
 }
 
-static inline bool ggml_gemmini_is_output_layer(const char *layer_name, const struct ggml_tensor *dst)
+static inline std::string ggml_gemmini_trim(const std::string &s)
 {
-    if (layer_name && std::strstr(layer_name, "output") != nullptr)
-        return true;
+    const auto first = s.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+        return {};
+    const auto last = s.find_last_not_of(" \t\r\n");
+    return s.substr(first, last - first + 1);
+}
+
+static inline const std::vector<std::string> &ggml_gemmini_force_layer_tokens()
+{
+    static bool initialized = false;
+    static std::vector<std::string> tokens;
+    if (!initialized)
+    {
+        const char *env = std::getenv("GGML_GEMMINI_FORCE_GGML_LAYERS");
+        if (env && *env)
+        {
+            std::string raw(env);
+            size_t pos = 0;
+            while (pos < raw.size())
+            {
+                const size_t comma = raw.find(',', pos);
+                const std::string token = ggml_gemmini_trim(raw.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
+                if (!token.empty())
+                    tokens.push_back(token);
+                if (comma == std::string::npos)
+                    break;
+                pos = comma + 1;
+            }
+        }
+        if (tokens.empty())
+        {
+            tokens.push_back("output");   // lm_head 등
+            tokens.push_back("ffn_down"); // FFN projection
+        }
+        initialized = true;
+    }
+    return tokens;
+}
+
+static inline bool ggml_gemmini_should_force_ggml(const char *layer_name, const struct ggml_tensor *dst)
+{
+    if (layer_name)
+    {
+        for (const auto &token : ggml_gemmini_force_layer_tokens())
+        {
+            if (!token.empty() && std::strstr(layer_name, token.c_str()) != nullptr)
+                return true;
+        }
+    }
     const struct ggml_tensor *src0 = dst->src[0];
-    // vocab size tends to be large (e.g. 50k). Use heuristic to detect.
-    return (src0 && src0->ne[1] >= 32000);
+    // vocab size tends to be large (e.g. 50k). Use heuristic to detect output-like heads automatically.
+    if (src0 && src0->ne[1] >= 32000)
+        return true;
+    return false;
 }
 
 static bool ggml_gemmini_mul_mat_cpu_output(struct ggml_tensor *dst)
@@ -142,11 +192,17 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     (void)TRANSPOSE_B; // 항상 (K x J) row-major 정책 사용
 
 #ifdef GGML_GEMMINI_FORCE_GGML_OUTPUT
-    if (ggml_gemmini_is_output_layer(layer, dst))
+    if (ggml_gemmini_should_force_ggml(layer, dst))
     {
         if (ggml_gemmini_mul_mat_cpu_output(dst))
         {
+            DBG_SIMPLE("[Gemmini] layer=%s handled by ggml CPU (force list)\n", layer ? layer : "(unnamed)");
             return;
+        }
+        else
+        {
+            DBG_SIMPLE("[Gemmini] layer=%s requested CPU force but shape/type unsupported, falling back to Gemmini\n",
+                       layer ? layer : "(unnamed)");
         }
     }
 #endif
