@@ -25,6 +25,8 @@ target_compile_definitions(ggml-gemmini PRIVATE
   ERROR_COMPENSATION=0
   DEBUG=0         # ggml-gemmini-util.h에 정의된 DEBUG 매크로
   TEST=0          # 필요 시
+  QACT_USE_PERCENTILE=0
+  QACT_PCTL=0.999f
 
   # debug
   GEMMINI_GOLDEN_MM=0
