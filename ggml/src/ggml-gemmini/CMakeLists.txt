@@ -21,10 +21,9 @@ target_compile_options(ggml-gemmini PRIVATE
 
 target_compile_definitions(ggml-gemmini PRIVATE
   # llama
-  USE_GEMMINI_BENCH_TENSOR=0 # true: BenchTensor | false: BaselineTensor
   CYCLE_LOG=1 # print cycle log
   ERROR_COMPENSATION=0
-  DEBUG=0         # ggml-gemmini-util.h에서 쓰는 DEBUG 매크로
+  DEBUG=0         # ggml-gemmini-util.h에 정의된 DEBUG 매크로
   TEST=0          # 필요 시
 
   # debug
