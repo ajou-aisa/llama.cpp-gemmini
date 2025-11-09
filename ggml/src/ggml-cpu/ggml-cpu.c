@@ -1815,14 +1815,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 uint64_t t0 = read_cycles();
                 ggml_compute_forward_norm(params, tensor);
                 uint64_t t1 = read_cycles();
-                fprintf(stderr, "[layer=%s][norm] start = %lu, end = %lu, elapsed = %lu\n", labelFromCpuOp("norm", tensor->name), t0, t1, t1 - t0);
+                PRINT_CYCLE(labelFromCpuOp("norm", tensor->name), "[norm]", t0, t1, t1 - t0);
             } break;
         case GGML_OP_RMS_NORM:
             {
                 uint64_t t0 = read_cycles();
                 ggml_compute_forward_rms_norm(params, tensor);
                 uint64_t t1 = read_cycles();
-                fprintf(stderr, "[layer=%s][norm] start = %lu, end = %lu, elapsed = %lu\n", labelFromCpuOp("rms_norm", tensor->name), t0, t1, t1 - t0);
+                PRINT_CYCLE(labelFromCpuOp("rms_norm", tensor->name), "[norm]", t0, t1, t1 - t0);
             } break;
         case GGML_OP_RMS_NORM_BACK:
             {
@@ -1908,7 +1908,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 uint64_t t0 = read_cycles();
                 ggml_compute_forward_soft_max(params, tensor);
                 uint64_t t1 = read_cycles();
-                fprintf(stderr, "[layer=%s][softmax] start = %lu, end = %lu, elapsed = %lu\n", labelFromCpuOp("softmax", tensor->name), t0, t1, t1 - t0);
+                PRINT_CYCLE(labelFromCpuOp("softmax", tensor->name), "[softmax]", t0, t1, t1 - t0);
             } break;
         case GGML_OP_SOFT_MAX_BACK:
             {
@@ -1987,7 +1987,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 uint64_t t0 = read_cycles();
                 ggml_compute_forward_leaky_relu(params, tensor);
                 uint64_t t1 = read_cycles();
-                fprintf(stderr, "[layer=%s][leaky_relu] start = %lu, end = %lu, elapsed = %lu\n", labelFromCpuOp("leaky_relu", tensor->name), t0, t1, t1 - t0);
+                PRINT_CYCLE(labelFromCpuOp("leaky_relu", tensor->name), "[leaky_relu]", t0, t1, t1 - t0);
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
@@ -2021,7 +2021,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 uint64_t t0 = read_cycles();
                 ggml_compute_forward_unary(params, tensor);
                 uint64_t t1 = read_cycles();
-                fprintf(stderr, "[layer=%s][unary] start = %lu, end = %lu, elapsed = %lu\n", labelFromCpuOp("unary", tensor->name), t0, t1, t1 - t0);
+                PRINT_CYCLE(labelFromCpuOp("unary", tensor->name), "[unary]", t0, t1, t1 - t0);
             } break;
         case GGML_OP_GET_REL_POS:
             {
