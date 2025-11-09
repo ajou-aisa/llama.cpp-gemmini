@@ -309,6 +309,14 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
     const double sat_ratio = (static_cast<double>(sat_pos + sat_neg) * 100.0) / static_cast<double>(total);
 
     // 요약 로그
+    //  - scale_A : fp32 → int8 로 나눌 때 사용한 스케일 (값이 클수록 동적 범위가 넓음)
+    //  - sat      : 정수 범위(±127)를 넘어서 잘린 비율, 스케일이 부족하면 급증
+    //  - min/max  : 양자화 이전 fp32 입력의 범위
+    //  - mean/std : 입력 분포 통계 (디버그/스케일 튜닝 참고용)
+    //  - mae/rmse : fp32 vs dequant(int8·scale_A) 오차, 작을수록 양자화가 잘 된 것
+    //  - max|err| : 단일 요소 최대 오차
+    //  - snr      : 원신호 대비 오차에 대한 SNR(dB), 30dB↑이면 양호
+    //  - near0    : 거의 0인 값 비율(희소성 지표)
     DBG_SIMPLE("[layer=%s][qact] N=%zu scale_A=%.6g sat=%.3f%% min=%g max=%g mean=%.6g std=%.6g mae=%.6g rmse=%.6g max|err|=%.6g snr=%.2f dB near0=%.2f%%\n",
            layer_name, total, scale, sat_ratio, min_val, max_val, mean, stddev, mae, rmse, max_abs_err, snr_db, zero_ratio * 100.0);
     fprintf(stderr, "[layer=%s][qact] N=%zu scale_A=%.6g sat=%.3f%% min=%g max=%g mean=%.6g std=%.6g mae=%.6g rmse=%.6g max|err|=%.6g snr=%.2f dB near0=%.2f%%\n",
