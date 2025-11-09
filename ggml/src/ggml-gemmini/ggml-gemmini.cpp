@@ -43,7 +43,7 @@ uint64_t start, end; // 일반 사이클 측정
 static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                                          struct ggml_tensor *dst) // FP32 output (I×J)
 {
-    DBG("[Gemmini] mul_mat call\n");
+    DBG_DETAIL("[Gemmini] mul_mat call\n");
 
     /* ____________________________________ 0. 원본 FP32 입력 텐서 ____________________________________________ */
     const auto *src0 = dst->src[0]; // src0: weight (K x J) -> 전치
@@ -66,7 +66,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     const size_t I = dst->ne[1]; // I = A.ne[1], K = A.ne[0]
     const size_t J = dst->ne[0]; // K = B.ne[0], J = B.ne[1] (transpose)
     const size_t K = src1->ne[0]; // K = A.ne[0]
-    DBG("I=%zu, J=%zu, K=%zu\n", I, J, K);
+    DBG_DETAIL("I=%zu, J=%zu, K=%zu\n", I, J, K);
 
     args.I = I;
     args.J = J;
@@ -178,7 +178,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         mae /= static_cast<double>(tot);
         rmse = std::sqrt(rmse / static_cast<double>(tot));
     }
-    fprintf(stderr, "[golden-W] bad=%zu/%zu mae=%.3e rmse=%.3e max|d|=%.3e tB=%d sB=%zu\n",
+    DBG_SIMPLE("[golden-W] bad=%zu/%zu mae=%.3e rmse=%.3e max|d|=%.3e tB=%d sB=%zu\n",
             bad, tot, mae, rmse, maxd, static_cast<int>(args.transpose_B), args.sB);
     GGML_ASSERT(bad == 0 && "B(qs,d) != dequant(Q8_0): transpose/stride/order mismatch");
 #endif
@@ -209,7 +209,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     PRINT_CYCLE(layer, "Set Args for calling gemmini", start, end, end - start);
 #endif
 
-    DBG("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out(row)=%zu stride_f_out(col)=%zu nb1=%zu nb0=%zu\n",
+    DBG_SIMPLE("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out(row)=%zu stride_f_out(col)=%zu nb1=%zu nb0=%zu\n",
            layer, args.A, args.B, args.C, args.D,
            args.I, args.J, args.K, args.sA, args.sB, args.sC,
            args.stride_f_out, args.col_stride_f_out, dst->nb[1], dst->nb[0]);
@@ -272,12 +272,11 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 mae /= static_cast<double>(tot);
                 rmse = std::sqrt(rmse / static_cast<double>(tot));
             }
-            fprintf(stderr, "[golden-MM] bad=%zu/%zu mae=%.3e rmse=%.3e max|d|=%.3e\n",
-                    bad, tot, mae, rmse, maxd);
+            DEBUG_SIMPLE("[golden-MM] bad=%zu/%zu mae=%.3e rmse=%.3e max|d|=%.3e\n", bad, tot, mae, rmse, maxd);
         }
         else
         {
-            fprintf(stderr, "[golden-MM] skipped (missing src/dst data)\n");
+            DEBUG_SIMPLE("[golden-MM] skipped (missing src/dst data)\n");
         }
     }
 #endif

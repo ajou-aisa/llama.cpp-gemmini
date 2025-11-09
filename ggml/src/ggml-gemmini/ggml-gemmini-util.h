@@ -22,14 +22,14 @@
 #endif
 
 #if DEBUG
-#define DBG(fmt, ...) \
+#define DBG_DETAIL(fmt, ...) \
     fprintf(stderr, "[%s:%d] %s(): " fmt "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__)
 // simple debug
-#define DBG0(fmt, ...) \
+#define DBG_SIMPLE(fmt, ...) \
     fprintf(stderr, fmt, ##__VA_ARGS__)
 #else
-#define DBG(fmt, ...) ((void)0)
-#define DBG0(fmt, ...) ((void)0)
+#define DBG_DETAIL(fmt, ...) ((void)0)
+#define DBG_SIMPLE(fmt, ...) ((void)0)
 #endif
 
 // Forward declare the context struct
@@ -44,25 +44,20 @@ namespace aisa
     constexpr size_t GEMMINI_ALIGN = 16; // 16-byte align
 }
 
-#include "gemmini_tensor/tensor_cache_key.h"
-#include "gemmini_tensor/transient_key.h"
-#include "gemmini_tensor/dequantize_weight.h"
-#include "gemmini_tensor/baseline_tensor/baseline_tensor.h"
-#include "gemmini_tensor/bench_tensor/bench_tensor.h"
+// #include "gemmini_tensor/tensor_cache_key.h"
+// #include "gemmini_tensor/transient_key.h"
+// #include "gemmini_tensor/dequantize_weight.h"
+// #include "gemmini_tensor/baseline_tensor/baseline_tensor.h"
+// #include "gemmini_tensor/bench_tensor/bench_tensor.h"
 
 struct ggml_backend_gemmini_context
 {
     int n_threads = GGML_DEFAULT_N_THREADS;
     std::unique_ptr<char[]> work_data;
     size_t work_size = 0;
-
-    std::map<TensorCacheKey, std::unique_ptr<aisa::BenchTensor<int8_t>>> weight_cache;
-    std::map<TransientKey, std::unique_ptr<aisa::BenchTensor<int8_t>>> transient_pool;
-
-    std::vector<std::unique_ptr<aisa::BaselineTensor<int8_t>>> temp_tensors;
 #ifndef GGML_USE_OPENMP
     std::vector<std::future<void>> tasks;
 #endif
 };
 
-#include "gemmini_tensor/gemmini_tensor_interface.h"
+// #include "gemmini_tensor/gemmini_tensor_interface.h"

@@ -1,8 +1,7 @@
-// gemmini_tensor/error_compensation_activation_DEC.h
+// error_compensation_activation_DEC.h
 #pragma once
-#include "../quant_tensor_view.h"
-#include "../../labeling/label.h"
-#include "../../ggml-gemmini-args.h"
+#include "../labeling/label.h"
+#include "../ggml-gemmini-args.h"
 
 #include "ggml.h"
 #include <vector>
