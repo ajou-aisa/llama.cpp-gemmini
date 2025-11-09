@@ -42,7 +42,7 @@ extern "C" volatile uint64_t gemmini_tiled_matmul_cycles = 0; // gemmini.h
 
 uint64_t start, end; // 일반 사이클 측정
 
-#ifdef GGML_GEMMINI_FORCE_GGML_OUTPUT
+#if defined(GGML_GEMMINI_FORCE_GGML_OUTPUT) && GGML_GEMMINI_FORCE_GGML_OUTPUT
 static inline const char *ggml_tensor_data_start(const struct ggml_tensor *tensor)
 {
     const char *base = reinterpret_cast<const char *>(tensor->view_src ? tensor->view_src->data : tensor->data);
@@ -218,7 +218,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     const char *layer = labelFromWeight(w_name); // layer 이름 추출
     (void)TRANSPOSE_B; // 항상 (K x J) row-major 정책 사용
 
-#ifdef GGML_GEMMINI_FORCE_GGML_OUTPUT
+#if defined(GGML_GEMMINI_FORCE_GGML_OUTPUT) && GGML_GEMMINI_FORCE_GGML_OUTPUT
     const bool force_all_layers = ggml_gemmini_force_all_layers();
     if (force_all_layers || ggml_gemmini_should_force_ggml(layer, dst))
     {
