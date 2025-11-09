@@ -7,6 +7,17 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <vector>
+
+#ifndef QACT_USE_PERCENTILE
+#define QACT_USE_PERCENTILE 1
+#endif
+#ifndef QACT_PCTL
+#define QACT_PCTL 0.999f
+#endif
+#ifndef QACT_SAMPLE_MAX
+#define QACT_SAMPLE_MAX 8192u
+#endif
 
 #include "ggml.h"
 
@@ -220,6 +231,13 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
     if (total == 0)
         return;
 
+#if QACT_USE_PERCENTILE
+    const size_t sample_cap = std::max<size_t>(size_t(1), static_cast<size_t>(QACT_SAMPLE_MAX));
+    std::vector<float> qact_samples;
+    qact_samples.reserve(sample_cap);
+    const size_t sample_stride = std::max<size_t>(size_t(1), total / sample_cap);
+#endif
+
     // 통계
     float max_abs = 0.0f;
     const float first_val =
@@ -246,13 +264,31 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
             {
                 ++near_zero;
             }
+#if QACT_USE_PERCENTILE
+            const size_t idx = i * K + k;
+            if ((idx % sample_stride) == 0 && qact_samples.size() < sample_cap)
+            {
+                qact_samples.push_back(std::fabs(v));
+            }
+#endif
         }
     }
 
     // scale 결정
     constexpr float eps = 1e-8f;
-    const float denom = std::max(max_abs, eps);
-    float scale = denom / 127.0f;
+    float cap = std::max(max_abs, eps);
+#if QACT_USE_PERCENTILE
+    if (!qact_samples.empty())
+    {
+        const float pct_raw = QACT_PCTL;
+        const float pct = pct_raw <= 0.0f ? 0.0f : (pct_raw >= 1.0f ? 1.0f : pct_raw);
+        const size_t last_idx = qact_samples.size() - 1;
+        const size_t pidx = static_cast<size_t>(std::floor(static_cast<double>(last_idx) * static_cast<double>(pct)));
+        std::nth_element(qact_samples.begin(), qact_samples.begin() + pidx, qact_samples.end());
+        cap = std::max(qact_samples[pidx] * 1.05f, eps);
+    }
+#endif
+    float scale = cap / 127.0f;
     if (!std::isfinite(scale) || scale < eps)
         scale = 1.0f;
 
