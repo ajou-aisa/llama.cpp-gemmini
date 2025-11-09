@@ -21,7 +21,7 @@ target_compile_options(ggml-gemmini PRIVATE
 
 target_compile_definitions(ggml-gemmini PRIVATE
   # llama
-  CYCLE_LOG=1 # print cycle log
+  CYCLE_LOG=0 # print cycle log
   ERROR_COMPENSATION=0
   DEBUG=0         # ggml-gemmini-util.h에 정의된 DEBUG 매크로
   TEST=0          # 필요 시
@@ -30,13 +30,13 @@ target_compile_definitions(ggml-gemmini PRIVATE
   GEMMINI_GOLDEN_MM=0
   GEMMINI_GOLDEN_CHECK=0
   GEMMINI_KBLOCK_DEBUG=1
-  GGML_GEMMINI_FORCE_GGML_OUTPUT=1
+  GGML_GEMMINI_FORCE_GGML_OUTPUT=0
   GGML_GEMMINI_FORCE_GGML_ALL=0
 
   # gemmini flag
   PRINT_TILE=0    # 필요 시
   OPTION=CPU      # OS/WS/CPU
-  FULL_C=0        # full_C
+  FULL_C=1        # full_C
   LOW_D=0         # low_D
 
   # test switches (DUMP는 소스에서 자동 파생)
