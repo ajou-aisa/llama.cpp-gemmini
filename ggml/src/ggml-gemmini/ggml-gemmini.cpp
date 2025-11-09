@@ -274,12 +274,12 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 mae /= static_cast<double>(tot);
                 rmse = std::sqrt(rmse / static_cast<double>(tot));
             }
-            DEBUG_SIMPLE("[golden-MM] bad=%zu/%zu mae=%.3e rmse=%.3e max|d|=%.3e\n", bad, tot, mae, rmse, maxd);
+            DBG_SIMPLE("[golden-MM] bad=%zu/%zu mae=%.3e rmse=%.3e max|d|=%.3e\n", bad, tot, mae, rmse, maxd);
             fprintf(stderr, "[golden-MM] bad=%zu/%zu mae=%.3e rmse=%.3e max|d|=%.3e\n", bad, tot, mae, rmse, maxd); // 임시
         }
         else
         {
-            DEBUG_SIMPLE("[golden-MM] skipped (missing src/dst data)\n");
+            DBG_SIMPLE("[golden-MM] skipped (missing src/dst data)\n");
             fprintf(stderr, "[golden-MM] skipped (missing src/dst data)\n"); // 임시 
         }
     }
