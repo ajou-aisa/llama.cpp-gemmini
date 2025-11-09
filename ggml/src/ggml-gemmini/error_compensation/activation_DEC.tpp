@@ -74,7 +74,9 @@ namespace aisa
         rk_stage_.reserve(I_ * std::min(alpha_, K_));
 
         end = read_cycles();
+        #if CYCLE_LOG
         PRINT_CYCLE(layer_, "[DEC: Initialize dimensions and buffers]", start, end, end - start);
+        #endif
 
         // ========== 2단계: 모든 행에 대해 Top-K 선택 및 잔차 계산 ==========
         const float *x = static_cast<const float *>(A_->data); // 원본 활성화
@@ -87,7 +89,9 @@ namespace aisa
             selectTopKandComputeResidual(r, x_r, qx_r);
         }
         end = read_cycles();
+        #if CYCLE_LOG
         PRINT_CYCLE(layer_, "[DEC: Select top-K and stage R_k for all rows]", start, end, end - start);
+        #endif
 
         // ========== 3단계: R_k CSC 구조 구축 ==========
         buildRk();
@@ -191,7 +195,9 @@ namespace aisa
         rk_stage_.shrink_to_fit();
 
         uint64_t end = read_cycles();
+        #if CYCLE_LOG
         PRINT_CYCLE(layer_, "[DEC: Build R_k CSC structure]", start, end, end - start);
+        #endif
     }
 
     /**
@@ -257,7 +263,9 @@ namespace aisa
         }
 
         uint64_t end = read_cycles();
+        #if CYCLE_LOG
         PRINT_CYCLE(layer_, "[DEC: Compute and accumulate compensation]", start, end, end - start);
+        #endif
     }
 
     /**
@@ -290,7 +298,9 @@ namespace aisa
         }
 
         uint64_t end = read_cycles();
+        #if CYCLE_LOG
         PRINT_CYCLE(layer_, "[DEC: Apply compensation to output]", start, end, end - start);
+        #endif
     }
 
     // int8 -> float (W의 k번째 행) + per-block scale 적용 (있으면)
