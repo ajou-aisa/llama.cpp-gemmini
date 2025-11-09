@@ -4,7 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <include/gemmini.h>
-#include "ggml-gemmini-util.h"
+#include "../ggml-gemmini-util.h"
 
 namespace aisa
 {
