@@ -9,6 +9,7 @@
 
 #include "ggml-gemmini-util.h"
 #include "include/gemmini.h"
+#include "ggml-gemmini-cycle.h"
 #include "labeling/label.h"
 #include "error_compensation/activation_DEC.h"
 #include "ggml-gemmini-args.h"
@@ -384,9 +385,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.tiled_matmul_type = OPTION;
 
     end = read_cycles();
-#if CYCLE_LOG
     PRINT_CYCLE(layer, "Set Args for calling gemmini", start, end, end - start);
-#endif
 
     DBG_SIMPLE("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out(row)=%zu stride_f_out(col)=%zu nb1=%zu nb0=%zu\n",
            layer, args.A, args.B, args.C, args.D,
