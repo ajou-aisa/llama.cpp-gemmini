@@ -40,6 +40,90 @@ extern "C" volatile uint64_t gemmini_tiled_matmul_cycles = 0; // gemmini.h
 
 uint64_t start, end; // 일반 사이클 측정
 
+#ifdef GGML_GEMMINI_FORCE_GGML_OUTPUT
+static inline const char *ggml_tensor_data_start(const struct ggml_tensor *tensor)
+{
+    const char *base = reinterpret_cast<const char *>(tensor->view_src ? tensor->view_src->data : tensor->data);
+    const size_t offs = tensor->view_src ? tensor->view_offs : 0;
+    return base + offs;
+}
+
+static inline char *ggml_tensor_data_start(struct ggml_tensor *tensor)
+{
+    char *base = reinterpret_cast<char *>(tensor->view_src ? tensor->view_src->data : tensor->data);
+    const size_t offs = tensor->view_src ? tensor->view_offs : 0;
+    return base + offs;
+}
+
+static inline bool ggml_gemmini_is_output_layer(const char *layer_name, const struct ggml_tensor *dst)
+{
+    if (layer_name && std::strstr(layer_name, "output") != nullptr)
+        return true;
+    const struct ggml_tensor *src0 = dst->src[0];
+    // vocab size tends to be large (e.g. 50k). Use heuristic to detect.
+    return (src0 && src0->ne[1] >= 32000);
+}
+
+static bool ggml_gemmini_mul_mat_cpu_output(struct ggml_tensor *dst)
+{
+    const struct ggml_tensor *src0 = dst->src[0];
+    const struct ggml_tensor *src1 = dst->src[1];
+
+    if (src0 == nullptr || src1 == nullptr)
+        return false;
+    if (src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32)
+        return false;
+
+    const size_t I = dst->ne[1] ? dst->ne[1] : 1;
+    const size_t J = dst->ne[0];
+    const size_t K = src1->ne[0];
+
+    if (K % QK8_0 != 0)
+        return false;
+
+    const int64_t dim_j = src0->ne[1] ? src0->ne[1] : 1;
+    const int64_t dim_z = src0->ne[2] ? src0->ne[2] : 1;
+    const int64_t dim_w = src0->ne[3] ? src0->ne[3] : 1;
+    const size_t logical_cols = static_cast<size_t>(dim_j * dim_z * dim_w);
+    GGML_ASSERT(J <= logical_cols);
+
+    const char *a_base = ggml_tensor_data_start(src1);
+    char *dst_base = ggml_tensor_data_start(dst);
+
+    for (size_t i = 0; i < I; ++i)
+    {
+        for (size_t j = 0; j < J; ++j)
+        {
+            size_t rem = j;
+            const size_t cols_per_w = static_cast<size_t>(dim_j * dim_z);
+            const int64_t iw_idx = cols_per_w ? static_cast<int64_t>(rem / cols_per_w) : 0;
+            rem = cols_per_w ? rem % cols_per_w : 0;
+            const int64_t iz_idx = dim_j ? static_cast<int64_t>(rem / dim_j) : 0;
+            const int64_t iy_idx = dim_j ? static_cast<int64_t>(rem % dim_j) : 0;
+
+            const block_q8_0 *row_blocks = ggml_gemmini_get_q80_row_ptr(src0, iy_idx, iz_idx, iw_idx);
+            GGML_ASSERT(row_blocks != nullptr);
+
+            double acc = 0.0;
+            for (size_t k = 0; k < K; ++k)
+            {
+                const size_t blk = k / QK8_0;
+                const size_t off = k % QK8_0;
+                const block_q8_0 &b = row_blocks[blk];
+                const float w = ggml_fp16_to_fp32(b.d) * static_cast<float>(b.qs[off]);
+                const float *a_ptr = reinterpret_cast<const float *>(a_base + i * src1->nb[1] + k * src1->nb[0]);
+                acc += static_cast<double>(*a_ptr) * static_cast<double>(w);
+            }
+
+            float *dst_ptr = reinterpret_cast<float *>(dst_base + i * dst->nb[1] + j * dst->nb[0]);
+            *dst_ptr = static_cast<float>(acc);
+        }
+    }
+
+    return true;
+}
+#endif
+
 static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                                          struct ggml_tensor *dst) // FP32 output (I×J)
 {
@@ -56,6 +140,16 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     const char *w_name = (src0 && src0->name[0]) ? src0->name : ""; // weight name
     const char *layer = labelFromWeight(w_name); // layer 이름 추출
     (void)TRANSPOSE_B; // 항상 (K x J) row-major 정책 사용
+
+#ifdef GGML_GEMMINI_FORCE_GGML_OUTPUT
+    if (ggml_gemmini_is_output_layer(layer, dst))
+    {
+        if (ggml_gemmini_mul_mat_cpu_output(dst))
+        {
+            return;
+        }
+    }
+#endif
 
     args.transpose_B = false;
     args.layer_name = layer;
