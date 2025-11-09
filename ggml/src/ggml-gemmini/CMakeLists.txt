@@ -1,18 +1,5 @@
 message(STATUS "GEMMINI found")
 
-if(NOT DEFINED CYCLE_LOG)
-  set(CYCLE_LOG 1)
-endif()
-
-set(_GGML_CYCLE_LOG_DEF "$<BOOL:${CYCLE_LOG}>")
-
-get_property(_GGML_ALL_TARGETS GLOBAL PROPERTY TARGETS)
-foreach(_GGML_TARGET ${_GGML_ALL_TARGETS})
-  if(_GGML_TARGET MATCHES "^ggml-cpu")
-    target_compile_definitions(${_GGML_TARGET} PRIVATE CYCLE_LOG=${_GGML_CYCLE_LOG_DEF})
-  endif()
-endforeach()
-
 set(RISCV_TOOL_PATH $ENV{RISCV})
 set(GEMMINI_SW_PATH $ENV{GEM_HOME})
 
@@ -34,7 +21,7 @@ target_compile_options(ggml-gemmini PRIVATE
 
 target_compile_definitions(ggml-gemmini PRIVATE
   # llama
-  CYCLE_LOG=${_GGML_CYCLE_LOG_DEF} # print cycle log
+  CYCLE_LOG=1 # print cycle log
   ERROR_COMPENSATION=0
   DEBUG=0         # ggml-gemmini-util.h에 정의된 DEBUG 매크로
   TEST=0          # 필요 시
