@@ -1,5 +1,10 @@
 #include "../ggml-gemmini/labeling/label.h"
 #include "/home/alveo/firesim/target-design/chipyard/generators/gemmini/software/gemmini-rocc-tests/include/cyclereader.h" // 절대경로
+
+#ifndef CYCLE_LOG
+#define CYCLE_LOG 1
+#endif
+
 #include "../ggml-gemmini/ggml-gemmini-cycle.h"
 
 #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
