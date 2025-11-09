@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cctype>
 #include <vector>
 #include <string>
 
@@ -95,6 +96,32 @@ static inline const std::vector<std::string> &ggml_gemmini_force_layer_tokens()
         initialized = true;
     }
     return tokens;
+}
+
+static inline bool ggml_gemmini_force_all_layers()
+{
+    static bool initialized = false;
+    static bool force_all = true;
+    if (!initialized)
+    {
+        const char *env = std::getenv("GGML_GEMMINI_FORCE_GGML_ALL");
+        if (env && *env)
+        {
+            std::string value = ggml_gemmini_trim(env);
+            std::transform(value.begin(), value.end(), value.begin(),
+                           [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+            if (value == "0" || value == "false" || value == "no")
+                force_all = false;
+            else
+                force_all = true;
+        }
+        else
+        {
+            force_all = true;
+        }
+        initialized = true;
+    }
+    return force_all;
 }
 
 static inline bool ggml_gemmini_should_force_ggml(const char *layer_name, const struct ggml_tensor *dst)
@@ -192,11 +219,13 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     (void)TRANSPOSE_B; // 항상 (K x J) row-major 정책 사용
 
 #ifdef GGML_GEMMINI_FORCE_GGML_OUTPUT
-    if (ggml_gemmini_should_force_ggml(layer, dst))
+    const bool force_all_layers = ggml_gemmini_force_all_layers();
+    if (force_all_layers || ggml_gemmini_should_force_ggml(layer, dst))
     {
         if (ggml_gemmini_mul_mat_cpu_output(dst))
         {
-            DBG_SIMPLE("[Gemmini] layer=%s handled by ggml CPU (force list)\n", layer ? layer : "(unnamed)");
+            DBG_SIMPLE("[Gemmini] layer=%s handled by ggml CPU (%s)\n",
+                       layer ? layer : "(unnamed)", force_all_layers ? "force all" : "force list");
             return;
         }
         else
