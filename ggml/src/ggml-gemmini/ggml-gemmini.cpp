@@ -512,20 +512,15 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
             ggml_backend_gemmini_mul_mat(ctx, node);
             break;
         }
-        case GGML_OP_OUT_PROD:
-            // ggml_backend_gemmini_out_prod(ctx, node);
-            break;
-
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
-        case GGML_OP_ADD:
             break;
 
         default:
-            GGML_ABORT("%s: unsupported op %s\n", __func__, ggml_op_desc(node));
+            GGML_ABORT("%s: unsupported op assigned to GEMMINI: %s\n", __func__, ggml_op_desc(node));
         }
     }
     
@@ -606,7 +601,7 @@ static void ggml_backend_gemmini_device_get_props(ggml_backend_dev_t dev, struct
     ggml_backend_gemmini_device_get_memory(dev, &props->memory_free, &props->memory_total);
     props->caps = {
         /* .async                 = */ false,
-        /* .host_buffer           = */ false,
+        /* .host_buffer           = */ true,
         /* .buffer_from_host_ptr  = */ true,
         /* .events                = */ false,
     };
@@ -633,15 +628,11 @@ static ggml_backend_buffer_t ggml_backend_gemmini_device_buffer_from_host_ptr(gg
 }
 
 static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    const struct ggml_tensor * src0 = op->src[0];
-    const struct ggml_tensor * src1 = op->src[1];
-
     switch (op->op) {
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
-        case GGML_OP_ADD:
 
         case GGML_OP_TRANSPOSE:
             return true;
@@ -649,25 +640,26 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_MUL_MAT:
         {
             // BLAS usually is only faster for large matrices
-            const struct ggml_tensor * src0 = op->src[0];
-            const struct ggml_tensor * src1 = op->src[1];
+            const struct ggml_tensor *a = op->src[0]; // W
+            const struct ggml_tensor *b = op->src[1]; // x
+            if (!a || !b)
+                return false;
 
-            const int64_t ne10 = src1->ne[0];
+            // Q8_0 × F32 -> F32 만 처리 (우리가 구현한 경로)
+            if (a->type != GGML_TYPE_Q8_0)
+                return false;
+            if (b->type != GGML_TYPE_F32)
+                return false;
+            if (op->type != GGML_TYPE_F32)
+                return false;
 
-            const int64_t ne0 = op->ne[0];
-            const int64_t ne1 = op->ne[1];
-
-            // TODO: find the optimal value
-            const int64_t min_batch = 32;
-
-            return ggml_is_contiguous(src0) &&
-                   ggml_is_contiguous(src1) &&
-                   // src1->type == GGML_TYPE_F32 &&
-                   // (ne0 >= min_batch && ne1 >= min_batch && ne10 >= min_batch) &&
-                   // (src0->type == GGML_TYPE_F32 || ggml_get_type_traits(src0->type)->to_float != NULL);
-                   true;
+            // 필요시 연속성 제약은 완화/강화
+            if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b))
+                return false;
+            return true;
         }
 
+        case GGML_OP_ADD:
         case GGML_OP_OUT_PROD:
             // return op->src[0]->type == GGML_TYPE_F32 &&
             //        op->src[1]->type == GGML_TYPE_F32 &&
