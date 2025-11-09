@@ -6,19 +6,16 @@
 #include <vector>
 
 #include "ggml-gemmini-util.h"
-#include "gemmini_tensor/gemmini_tensor_interface.h"
 #include "include/gemmini.h"
 #include "labeling/label.h"
-#include "test/ggml-gemmini-test.h"
-#include "gemmini_tensor/error_compensation/activation_DEC.h"
-#include "gemmini_tensor/quant_tensor_view.h"
+#include "error_compensation/activation_DEC.h"
 #include "ggml-gemmini-args.h"
 
-#ifndef SCALE_A
-#define SCALE_A 1.0f
+#ifndef TRANSPOSE_B
+#define TRANSPOSE_B 1
 #endif
 #ifndef FULL_C
-#define FULL_C 0
+#define FULL_C 1
 #endif
 #ifndef LOW_D
 #define LOW_D 0
@@ -46,14 +43,6 @@ uint64_t start, end; // 일반 사이클 측정
 static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                                          struct ggml_tensor *dst) // FP32 output (I×J)
 {
-
-/* ________________ Test: 테스트 호출용 ___________________ */
-#if TEST
-    static_assert(TRANSPOSE_B == 1, "This test assumes physical-transposed B (KxJ).");
-    ggml_gemmini_test(ctx, dst);
-    return;
-#endif
-
     DBG("[Gemmini] mul_mat call\n");
 
     /* ____________________________________ 0. 원본 FP32 입력 텐서 ____________________________________________ */
@@ -95,9 +84,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     ggml_gemmini_quantize_activation(src1, args, qx);
     
     args.A = reinterpret_cast<elem_t *>(qx);
-    
-    QuantTensorView qA_view{qx, I, K, args.sA};
-    ConstQuantTensorView qA_const = make_const_view(qA_view);
 
     // breackdown weight to int8_t & scale
     const int64_t dim_j = src0->ne[1] ? src0->ne[1] : 1;
