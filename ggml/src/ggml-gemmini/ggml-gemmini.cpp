@@ -359,8 +359,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     }
     DBG_SIMPLE("[golden-W] bad=%zu/%zu mae=%.3e rmse=%.3e max|d|=%.3e tB=%d sB=%zu\n",
                bad, tot, mae, rmse, maxd, static_cast<int>(args.transpose_B), args.sB);
-    fprintf(stderr, "[golden-W] bad=%zu/%zu mae=%.3e rmse=%.3e max|d|=%.3e tB=%d sB=%zu\n",
-               bad, tot, mae, rmse, maxd, static_cast<int>(args.transpose_B), args.sB); // 임시
     GGML_ASSERT(bad == 0 && "B(qs,d) != dequant(Q8_0): transpose/stride/order mismatch");
 #endif
     
@@ -458,12 +456,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             //  - mae/rmse: 양자화 경로 vs 참조(복원된 qA × fp32 W)의 평균/제곱근 평균 오차
             //  - max|d|: 단일 요소 최대 오차 (이 값이 작으면 전체 벡터도 잘 맞음)
             DBG_SIMPLE("[golden-MM] bad=%zu/%zu mae=%.3e rmse=%.3e max|d|=%.3e\n", bad, tot, mae, rmse, maxd);
-            fprintf(stderr, "[golden-MM] bad=%zu/%zu mae=%.3e rmse=%.3e max|d|=%.3e\n", bad, tot, mae, rmse, maxd); // 임시
         }
         else
         {
             DBG_SIMPLE("[golden-MM] skipped (missing src/dst data)\n");
-            fprintf(stderr, "[golden-MM] skipped (missing src/dst data)\n"); // 임시 
         }
     }
 #endif
