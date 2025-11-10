@@ -256,16 +256,26 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.sA = K;
     args.sC = J;
 
+    end = read_cycles();
+    PRINT_CYCLE(layer, "Set Args for calling gemmini", start, end, end - start);
+
+
     // quantize activation
+    start = read_cycles();
+
     static thread_local std::vector<int8_t> activation_q;
     activation_q.resize(I * K);
     int8_t *qx = activation_q.data();
 
     ggml_gemmini_quantize_activation(src1, args, qx);
-    
+
     args.A = reinterpret_cast<elem_t *>(qx);
 
+    end = read_cycles();
+    PRINT_CYCLE(layer, "Quantize activation", start, end, end - start);
+    
     // breackdown weight to int8_t & scale
+    start = read_cycles();
     const int64_t dim_j = src0->ne[1] ? src0->ne[1] : 1;
     const int64_t dim_z = src0->ne[2] ? src0->ne[2] : 1;
     const int64_t dim_w = src0->ne[3] ? src0->ne[3] : 1;
@@ -293,6 +303,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     ggml_gemmini_pack_q80(src0, /*transpose=*/true, reinterpret_cast<elem_t *>(qw), args.sB, block_scale_w, args);
 
     args.B = reinterpret_cast<elem_t *>(qw);
+
+    end = read_cycles();
+    PRINT_CYCLE(layer, "Breakdown Q8_0", start, end, end - start);
 
     // Ensure the logical transpose/stride flags match the physical packing.
 #if (GEMMINI_GOLDEN_CHECK || GEMMINI_GOLDEN_MM)
@@ -363,6 +376,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     GGML_ASSERT(bad == 0 && "B(qs,d) != dequant(Q8_0): transpose/stride/order mismatch");
 #endif
     
+    start = read_cycles();
     /* ______________________________ 4. bias 텐서 처리 _________________________________ */
     std::vector<int32_t> zero_bias(J, 0);
 
