@@ -1,539 +1,539 @@
-// ggml-gemmini-test.cpp
-#include "ggml-gemmini-test.h"
-#include <algorithm>
-#include <memory>
-#include <cstdio>  
-#include <type_traits>
-#include <limits>
-#include "include/gemmini.h"
-#include <map> 
+// // ggml-gemmini-test.cpp
+// #include "ggml-gemmini-test.h"
+// #include <algorithm>
+// #include <memory>
+// #include <cstdio>  
+// #include <type_traits>
+// #include <limits>
+// #include "include/gemmini.h"
+// #include <map> 
 
-namespace aisa
-{
-    // 1. 최상위 테스트 엔트리
-    void ggml_gemmini_test(ggml_backend_gemmini_context *ctx, struct ggml_tensor *dst)
-    {
-        TestConfig config;
+// namespace aisa
+// {
+//     // 1. 최상위 테스트 엔트리
+//     void ggml_gemmini_test(ggml_backend_gemmini_context *ctx, struct ggml_tensor *dst)
+//     {
+//         TestConfig config;
 
-        // Testbench 객체를 생성하고 실행
-        GemminiTestbench testbench(ctx, dst, config);
-        testbench.run();
-    }
+//         // Testbench 객체를 생성하고 실행
+//         GemminiTestbench testbench(ctx, dst, config);
+//         testbench.run();
+//     }
 
-    // 2. GemminiTestbench 클래스 구현
-    GemminiTestbench::GemminiTestbench(ggml_backend_gemmini_context *ctx, ggml_tensor *dst, const TestConfig &config)
-        : ctx_(ctx), dst_(dst), src0_(dst->src[0]), src1_(dst->src[1]), config_(config)
-    {
-        GGML_ASSERT(ctx_ && dst_ && src0_ && src1_);
-    }
+//     // 2. GemminiTestbench 클래스 구현
+//     GemminiTestbench::GemminiTestbench(ggml_backend_gemmini_context *ctx, ggml_tensor *dst, const TestConfig &config)
+//         : ctx_(ctx), dst_(dst), src0_(dst->src[0]), src1_(dst->src[1]), config_(config)
+//     {
+//         GGML_ASSERT(ctx_ && dst_ && src0_ && src1_);
+//     }
 
-    void GemminiTestbench::run()
-    {
-        setUpDimensions();
-        if (config_.test_shape)
-            debugShapes();
+//     void GemminiTestbench::run()
+//     {
+//         setUpDimensions();
+//         if (config_.test_shape)
+//             debugShapes();
 
-        if (config_.test_sort)
-            sortActivation();
+//         if (config_.test_sort)
+//             sortActivation();
 
-        if (config_.test_dec_metrics)
-            analyzeActivationMultiplicity();
+//         if (config_.test_dec_metrics)
+//             analyzeActivationMultiplicity();
 
-        createTensors();
+//         createTensors();
 
-        if (config_.test_slice)
-            dumpTensorSlices();
+//         if (config_.test_slice)
+//             dumpTensorSlices();
 
-        prepareBias();
+//         prepareBias();
 
-        if (config_.run_cpu_ref)
-            runCpuReference();
-        if (config_.run_gemmini)
-            runGemminiComputation();
-        if (config_.compare_results)
-            compareAndReport();
-        if (config_.dequantize_output)
-            dequantizeAndFinalize();
-    }
+//         if (config_.run_cpu_ref)
+//             runCpuReference();
+//         if (config_.run_gemmini)
+//             runGemminiComputation();
+//         if (config_.compare_results)
+//             compareAndReport();
+//         if (config_.dequantize_output)
+//             dequantizeAndFinalize();
+//     }
 
-    void GemminiTestbench::sortActivation()
-    {
-        const size_t elem_count = src1_->ne[0] * src1_->ne[1];
-        const float *src_data = static_cast<const float *>(src1_->data);
+//     void GemminiTestbench::sortActivation()
+//     {
+//         const size_t elem_count = src1_->ne[0] * src1_->ne[1];
+//         const float *src_data = static_cast<const float *>(src1_->data);
 
-        // 값과 인덱스 쌍으로 정렬
-        std::vector<std::pair<float, size_t>> indexed_data(elem_count);
-        for (size_t i = 0; i < elem_count; ++i)
-        {
-            indexed_data[i] = {std::abs(src_data[i]), i};
-        }
+//         // 값과 인덱스 쌍으로 정렬
+//         std::vector<std::pair<float, size_t>> indexed_data(elem_count);
+//         for (size_t i = 0; i < elem_count; ++i)
+//         {
+//             indexed_data[i] = {std::abs(src_data[i]), i};
+//         }
 
-        // 내림차순 정렬 (값 기준)
-        std::sort(indexed_data.begin(), indexed_data.end(),
-                  [](const auto &a, const auto &b)
-                  { return a.first > b.first; });
+//         // 내림차순 정렬 (값 기준)
+//         std::sort(indexed_data.begin(), indexed_data.end(),
+//                   [](const auto &a, const auto &b)
+//                   { return a.first > b.first; });
 
-        // 통계 계산
-        float max_val = indexed_data[0].first;
-        float min_val = indexed_data.back().first;
+//         // 통계 계산
+//         float max_val = indexed_data[0].first;
+//         float min_val = indexed_data.back().first;
 
-        double sum = 0.0;
-        for (const auto &pair : indexed_data)
-            sum += pair.first;
-        float mean = sum / elem_count;
+//         double sum = 0.0;
+//         for (const auto &pair : indexed_data)
+//             sum += pair.first;
+//         float mean = sum / elem_count;
 
-        double variance = 0.0;
-        for (const auto &pair : indexed_data)
-            variance += (pair.first - mean) * (pair.first - mean);
-        float stddev = std::sqrt(variance / elem_count);
+//         double variance = 0.0;
+//         for (const auto &pair : indexed_data)
+//             variance += (pair.first - mean) * (pair.first - mean);
+//         float stddev = std::sqrt(variance / elem_count);
 
-        DBG0("[sortActivation] Stats:\n");
-        DBG0("  Total elements: %zu\n", elem_count);
-        DBG0("  Max: %.6f, Min: %.6f\n", max_val, min_val);
-        DBG0("  Mean: %.6f, StdDev: %.6f\n", mean, stddev);
-        DBG0("  Mean+2σ: %.6f\n", mean + 2.0f * stddev);
+//         DBG0("[sortActivation] Stats:\n");
+//         DBG0("  Total elements: %zu\n", elem_count);
+//         DBG0("  Max: %.6f, Min: %.6f\n", max_val, min_val);
+//         DBG0("  Mean: %.6f, StdDev: %.6f\n", mean, stddev);
+//         DBG0("  Mean+2σ: %.6f\n", mean + 2.0f * stddev);
 
-        // 후보 구간별 분석 (상위 1%, 3%, 5%, 10%)
-        const std::vector<float> percentiles = {0.01f, 0.03f, 0.05f, 0.10f, 0.20f};
-        DBG0("\n[Outlier Candidate Regions]\n");
+//         // 후보 구간별 분석 (상위 1%, 3%, 5%, 10%)
+//         const std::vector<float> percentiles = {0.01f, 0.03f, 0.05f, 0.10f, 0.20f};
+//         DBG0("\n[Outlier Candidate Regions]\n");
 
-        for (float p : percentiles)
-        {
-            size_t idx = static_cast<size_t>(elem_count * p);
-            if (idx >= elem_count)
-                idx = elem_count - 1;
+//         for (float p : percentiles)
+//         {
+//             size_t idx = static_cast<size_t>(elem_count * p);
+//             if (idx >= elem_count)
+//                 idx = elem_count - 1;
 
-            float threshold = indexed_data[idx].first;
-            DBG0("  Top %.1f%% (α=%zu): threshold >= %.6f\n",
-                 p * 100, idx + 1, threshold);
-        }
+//             float threshold = indexed_data[idx].first;
+//             DBG0("  Top %.1f%% (α=%zu): threshold >= %.6f\n",
+//                  p * 100, idx + 1, threshold);
+//         }
 
-        // 급격한 감소 지점 찾기 (elbow point)
-        DBG0("\n[Sharp Drop Points]\n");
-        std::vector<std::tuple<size_t, float, float, float>> drops;
+//         // 급격한 감소 지점 찾기 (elbow point)
+//         DBG0("\n[Sharp Drop Points]\n");
+//         std::vector<std::tuple<size_t, float, float, float>> drops;
 
-        for (size_t i = 0; i < std::min(elem_count - 1, size_t(1000)); ++i)
-        {
-            float curr = indexed_data[i].first;
-            float next = indexed_data[i + 1].first;
+//         for (size_t i = 0; i < std::min(elem_count - 1, size_t(1000)); ++i)
+//         {
+//             float curr = indexed_data[i].first;
+//             float next = indexed_data[i + 1].first;
 
-            if (curr > 0)
-            {
-                float drop = curr - next;
-                float drop_rate = drop / curr;
+//             if (curr > 0)
+//             {
+//                 float drop = curr - next;
+//                 float drop_rate = drop / curr;
 
-                // 10% 이상 급감 지점 기록
-                if (drop_rate > 0.10f)
-                {
-                    drops.push_back({i, curr, next, drop_rate});
-                }
-            }
-        }
+//                 // 10% 이상 급감 지점 기록
+//                 if (drop_rate > 0.10f)
+//                 {
+//                     drops.push_back({i, curr, next, drop_rate});
+//                 }
+//             }
+//         }
 
-        // 상위 10개 급감 지점 출력
-        std::sort(drops.begin(), drops.end(),
-                  [](const auto &a, const auto &b)
-                  {
-                      return std::get<3>(a) > std::get<3>(b);
-                  });
+//         // 상위 10개 급감 지점 출력
+//         std::sort(drops.begin(), drops.end(),
+//                   [](const auto &a, const auto &b)
+//                   {
+//                       return std::get<3>(a) > std::get<3>(b);
+//                   });
 
-        for (size_t i = 0; i < std::min(drops.size(), size_t(10)); ++i)
-        {
-            auto [idx, curr, next, rate] = drops[i];
-            DBG0("  Rank %zu at index %zu: %.6f->%.6f (drop: %.2f%%)\n",
-                 i + 1, idx, curr, next, rate * 100);
-        }
+//         for (size_t i = 0; i < std::min(drops.size(), size_t(10)); ++i)
+//         {
+//             auto [idx, curr, next, rate] = drops[i];
+//             DBG0("  Rank %zu at index %zu: %.6f->%.6f (drop: %.2f%%)\n",
+//                  i + 1, idx, curr, next, rate * 100);
+//         }
 
-        // 상위 100개 값 출력 (시각화용)
-        DBG0("\n[Top 100 Values]\n[");
-        for (size_t i = 0; i < std::min(elem_count, size_t(100)); ++i)
-        {
-            DBG0("%.6f ", indexed_data[i].first);
-            if ((i + 1) % 10 == 0)
-                DBG0("\n ");
-        }
-        DBG0("]\n");
-    }
+//         // 상위 100개 값 출력 (시각화용)
+//         DBG0("\n[Top 100 Values]\n[");
+//         for (size_t i = 0; i < std::min(elem_count, size_t(100)); ++i)
+//         {
+//             DBG0("%.6f ", indexed_data[i].first);
+//             if ((i + 1) % 10 == 0)
+//                 DBG0("\n ");
+//         }
+//         DBG0("]\n");
+//     }
 
-    void GemminiTestbench::analyzeActivationMultiplicity()
-    {
-        DBG0("[DEC][metrics] analyzeActivationMultiplicity...\n");
+//     void GemminiTestbench::analyzeActivationMultiplicity()
+//     {
+//         DBG0("[DEC][metrics] analyzeActivationMultiplicity...\n");
 
-        // src1_: A (I x K)
-        GGML_ASSERT(src1_ && src1_->type == GGML_TYPE_F32);
-        const float *A = static_cast<const float *>(src1_->data);
-        const int64_t row_stride_bytes = src1_->nb[1]; // 다음 행(row r)의 byte stride
-        const int K = K_, I = I_;
+//         // src1_: A (I x K)
+//         GGML_ASSERT(src1_ && src1_->type == GGML_TYPE_F32);
+//         const float *A = static_cast<const float *>(src1_->data);
+//         const int64_t row_stride_bytes = src1_->nb[1]; // 다음 행(row r)의 byte stride
+//         const int K = K_, I = I_;
 
-        // α 계산 (비율 기반)
-        size_t alpha = std::max<size_t>(DEC_ALPHA_MIN, std::min<size_t>(K, (size_t)std::llround(K * DEC_ALPHA_RATIO)));
+//         // α 계산 (비율 기반)
+//         size_t alpha = std::max<size_t>(DEC_ALPHA_MIN, std::min<size_t>(K, (size_t)std::llround(K * DEC_ALPHA_RATIO)));
 
-        // S[r] 저장용: 행 r의 top-α k index 리스트
-        std::vector<std::vector<int>> S;
-        S.resize(I);
+//         // S[r] 저장용: 행 r의 top-α k index 리스트
+//         std::vector<std::vector<int>> S;
+//         S.resize(I);
 
-        uint64_t t0 = read_cycles();
-        for (int r = 0; r < I; ++r)
-        {
-            const uint8_t* row_base = reinterpret_cast<const uint8_t*>(A) + r*row_stride_bytes;
-            const float* row_fp = reinterpret_cast<const float*>(row_base);
+//         uint64_t t0 = read_cycles();
+//         for (int r = 0; r < I; ++r)
+//         {
+//             const uint8_t* row_base = reinterpret_cast<const uint8_t*>(A) + r*row_stride_bytes;
+//             const float* row_fp = reinterpret_cast<const float*>(row_base);
 
-            // (값, k) 페어 준비
-            std::vector<std::pair<float, int>> tmp;
-            tmp.resize(K);
-            for (int k = 0; k < K; ++k)
-                tmp[k] = {std::abs(row_fp[k]), k};
+//             // (값, k) 페어 준비
+//             std::vector<std::pair<float, int>> tmp;
+//             tmp.resize(K);
+//             for (int k = 0; k < K; ++k)
+//                 tmp[k] = {std::abs(row_fp[k]), k};
 
-            // 상위 alpha만 partial_sort
-            std::partial_sort(tmp.begin(), tmp.begin() + alpha, tmp.end(),
-                              [](const auto &a, const auto &b)
-                              { return a.first > b.first; });
+//             // 상위 alpha만 partial_sort
+//             std::partial_sort(tmp.begin(), tmp.begin() + alpha, tmp.end(),
+//                               [](const auto &a, const auto &b)
+//                               { return a.first > b.first; });
 
-            S[r].resize(alpha);
-            for (size_t i = 0; i < alpha; ++i)
-                S[r][i] = tmp[i].second;
-        }
-        uint64_t t1 = read_cycles();
+//             S[r].resize(alpha);
+//             for (size_t i = 0; i < alpha; ++i)
+//                 S[r][i] = tmp[i].second;
+//         }
+//         uint64_t t1 = read_cycles();
 
-        // k 빈도 집계
-        std::map<int, size_t> freq;
-        for (int r = 0; r < I; ++r)
-            for (size_t i = 0; i < S[r].size(); ++i)
-                ++freq[S[r][i]];
+//         // k 빈도 집계
+//         std::map<int, size_t> freq;
+//         for (int r = 0; r < I; ++r)
+//             for (size_t i = 0; i < S[r].size(); ++i)
+//                 ++freq[S[r][i]];
 
-        const size_t nnz = (size_t)I * alpha;
-        const size_t unique_k = freq.size();
-        const double R = unique_k ? (double(nnz) / double(unique_k)) : 0.0;
+//         const size_t nnz = (size_t)I * alpha;
+//         const size_t unique_k = freq.size();
+//         const double R = unique_k ? (double(nnz) / double(unique_k)) : 0.0;
 
-        size_t max_cnt = 0;
-        for (auto &kv : freq)
-            max_cnt = std::max(max_cnt, kv.second);
-        std::vector<size_t> hist(max_cnt + 1, 0);
-        for (auto &kv : freq)
-            ++hist[kv.second];
+//         size_t max_cnt = 0;
+//         for (auto &kv : freq)
+//             max_cnt = std::max(max_cnt, kv.second);
+//         std::vector<size_t> hist(max_cnt + 1, 0);
+//         for (auto &kv : freq)
+//             ++hist[kv.second];
 
-        DBG0("[DEC][metrics] I=%d, K=%d, alpha=%zu (ratio=%.4f)\n", I, K, alpha, (double)DEC_ALPHA_RATIO);
-        DBG0("[DEC][metrics] nnz=%zu, unique_k=%zu, R=%.3f\n", nnz, unique_k, R);
-        DBG0("[DEC][metrics] topK selection cycles: %lu\n", (unsigned long)(t1 - t0));
+//         DBG0("[DEC][metrics] I=%d, K=%d, alpha=%zu (ratio=%.4f)\n", I, K, alpha, (double)DEC_ALPHA_RATIO);
+//         DBG0("[DEC][metrics] nnz=%zu, unique_k=%zu, R=%.3f\n", nnz, unique_k, R);
+//         DBG0("[DEC][metrics] topK selection cycles: %lu\n", (unsigned long)(t1 - t0));
 
-        // 히스토그램(상위 몇 구간만)
-        size_t printed = 0;
-        for (size_t c = 1; c < hist.size() && printed < 10; ++c)
-        {
-            if (hist[c] == 0)
-                continue;
-            DBG0("  count=%zu -> %zu distinct k's\n", c, hist[c]);
-            ++printed;
-        }
+//         // 히스토그램(상위 몇 구간만)
+//         size_t printed = 0;
+//         for (size_t c = 1; c < hist.size() && printed < 10; ++c)
+//         {
+//             if (hist[c] == 0)
+//                 continue;
+//             DBG0("  count=%zu -> %zu distinct k's\n", c, hist[c]);
+//             ++printed;
+//         }
 
-        if (R <= 1.10)
-            DBG0("[DEC][guide] 중복 거의 없음 (R<=1.10)\n");
+//         if (R <= 1.10)
+//             DBG0("[DEC][guide] 중복 거의 없음 (R<=1.10)\n");
         
-        else if (R >= 1.50)
-            DBG0("[DEC][guide] 중복 있음 (R>=1.50)\n");
+//         else if (R >= 1.50)
+//             DBG0("[DEC][guide] 중복 있음 (R>=1.50)\n");
     
-        else
-            DBG0("[DEC][guide] 애매한 구간\n");
-    }
+//         else
+//             DBG0("[DEC][guide] 애매한 구간\n");
+//     }
 
-    void GemminiTestbench::setUpDimensions()
-    {
-        DBG0("[setUpDimensions]...\n");
-        J_ = (int)dst_->ne[0];
-        I_ = (int)dst_->ne[1];
-        K_ = (int)src1_->ne[0];
+//     void GemminiTestbench::setUpDimensions()
+//     {
+//         DBG0("[setUpDimensions]...\n");
+//         J_ = (int)dst_->ne[0];
+//         I_ = (int)dst_->ne[1];
+//         K_ = (int)src1_->ne[0];
 
-        GGML_ASSERT((int)src0_->ne[1] == J_);
-        GGML_ASSERT((int)src1_->ne[1] == I_);
-        GGML_ASSERT((int)src0_->ne[0] == K_);
-    }
+//         GGML_ASSERT((int)src0_->ne[1] == J_);
+//         GGML_ASSERT((int)src1_->ne[1] == I_);
+//         GGML_ASSERT((int)src0_->ne[0] == K_);
+//     }
 
-    void GemminiTestbench::debugShapes()
-    {
-        DBG0("[debugShapes] Logical Dims: I=%d, J=%d, K=%d\n", I_, J_, K_);
-        DBG0(" dst  (logical I x J) stored ne=[%llu,%llu], nb=[%llu,%llu]\n",
-             (unsigned long long)dst_->ne[0], (unsigned long long)dst_->ne[1],
-             (unsigned long long)dst_->nb[0], (unsigned long long)dst_->nb[1]);
-        DBG0(" src0 (W^T stored K x J, logical W J x K) ne=[%llu,%llu], nb=[%llu,%llu]\n",
-             (unsigned long long)src0_->ne[0], (unsigned long long)src0_->ne[1],
-             (unsigned long long)src0_->nb[0], (unsigned long long)src0_->nb[1]);
-        DBG0(" src1 (A stored K x I,   logical A I x K) ne=[%llu,%llu], nb=[%llu,%llu]\n",
-             (unsigned long long)src1_->ne[0], (unsigned long long)src1_->ne[1],
-             (unsigned long long)src1_->nb[0], (unsigned long long)src1_->nb[1]);
-    }
+//     void GemminiTestbench::debugShapes()
+//     {
+//         DBG0("[debugShapes] Logical Dims: I=%d, J=%d, K=%d\n", I_, J_, K_);
+//         DBG0(" dst  (logical I x J) stored ne=[%llu,%llu], nb=[%llu,%llu]\n",
+//              (unsigned long long)dst_->ne[0], (unsigned long long)dst_->ne[1],
+//              (unsigned long long)dst_->nb[0], (unsigned long long)dst_->nb[1]);
+//         DBG0(" src0 (W^T stored K x J, logical W J x K) ne=[%llu,%llu], nb=[%llu,%llu]\n",
+//              (unsigned long long)src0_->ne[0], (unsigned long long)src0_->ne[1],
+//              (unsigned long long)src0_->nb[0], (unsigned long long)src0_->nb[1]);
+//         DBG0(" src1 (A stored K x I,   logical A I x K) ne=[%llu,%llu], nb=[%llu,%llu]\n",
+//              (unsigned long long)src1_->ne[0], (unsigned long long)src1_->ne[1],
+//              (unsigned long long)src1_->nb[0], (unsigned long long)src1_->nb[1]);
+//     }
 
-    void GemminiTestbench::createTensors()
-    {
-        DBG0("[createTensors] Creating GemminiTensors...\n");
-        // Activation: 버퍼만 재사용, 값은 매번 갱신 (BenchTensor)
-        tA_ = aisa::GemminiTensor<int8_t>::getOrCreateTransient(ctx_, "test", src1_, ".i8_A", false);
-        // Weight: 완전 캐싱 (0-fill) 고정 (BenchTensor)
-        tB_ = aisa::GemminiTensor<int8_t>::getOrCreate(ctx_, "test", src0_, ".i8_B", false, TRANSPOSE_B); // 항상 KxJ로 간주
-        // Output: 버퍼만 재사용. Gemmini 결과 저장
-        tC_ = aisa::GemminiTensor<int8_t>::getOrCreateTransient(ctx_, "test", dst_, ".i8_C", false);
+//     void GemminiTestbench::createTensors()
+//     {
+//         DBG0("[createTensors] Creating GemminiTensors...\n");
+//         // Activation: 버퍼만 재사용, 값은 매번 갱신 (BenchTensor)
+//         tA_ = aisa::GemminiTensor<int8_t>::getOrCreateTransient(ctx_, "test", src1_, ".i8_A", false);
+//         // Weight: 완전 캐싱 (0-fill) 고정 (BenchTensor)
+//         tB_ = aisa::GemminiTensor<int8_t>::getOrCreate(ctx_, "test", src0_, ".i8_B", false, TRANSPOSE_B); // 항상 KxJ로 간주
+//         // Output: 버퍼만 재사용. Gemmini 결과 저장
+//         tC_ = aisa::GemminiTensor<int8_t>::getOrCreateTransient(ctx_, "test", dst_, ".i8_C", false);
 
-        DBG0("[createTensors] Validating tensor dimensions...\n");
+//         DBG0("[createTensors] Validating tensor dimensions...\n");
 
-        // tA 검증 (I x K)
-        if (tA_->getRows() != (size_t)I_)
-        {
-            DBG0("[ERROR] tA dimension mismatch!\n");
-            DBG0("  Source tensor (src1): ne=[%lld,%lld] (K x I in storage)\n", 
-                 (long long)src1_->ne[0], (long long)src1_->ne[1]);
-            DBG0("  Expected logical dims: I=%d, K=%d => tA should be %dx%d\n", I_, K_, I_, K_);
-            DBG0("  Actual tA dims: %zux%zu\n", tA_->getRows(), tA_->getCols());
-            DBG0("  transpose_A=%s\n", "false");
-            GGML_ASSERT(false);
-        }
-        GGML_ASSERT(tA_->getCols() == (size_t)K_);
+//         // tA 검증 (I x K)
+//         if (tA_->getRows() != (size_t)I_)
+//         {
+//             DBG0("[ERROR] tA dimension mismatch!\n");
+//             DBG0("  Source tensor (src1): ne=[%lld,%lld] (K x I in storage)\n", 
+//                  (long long)src1_->ne[0], (long long)src1_->ne[1]);
+//             DBG0("  Expected logical dims: I=%d, K=%d => tA should be %dx%d\n", I_, K_, I_, K_);
+//             DBG0("  Actual tA dims: %zux%zu\n", tA_->getRows(), tA_->getCols());
+//             DBG0("  transpose_A=%s\n", "false");
+//             GGML_ASSERT(false);
+//         }
+//         GGML_ASSERT(tA_->getCols() == (size_t)K_);
         
-        // tB 검증 (K x J)
-        if (tB_->getRows() != (size_t)K_)
-        {
-            DBG0("[ERROR] tB dimension mismatch!\n");
-            DBG0("  Source tensor (src0): ne=[%lld,%lld] (K x J in storage)\n", 
-                 (long long)src0_->ne[0], (long long)src0_->ne[1]);
-            DBG0("  Expected logical dims: J=%d, K=%d => tB should be %dx%d\n", J_, K_, K_, J_);
-            DBG0("  Actual tB dims: %zux%zu\n", tB_->getRows(), tB_->getCols());
-            DBG0("  transpose_B=%s\n", TRANSPOSE_B ? "true" : "false");
-            GGML_ASSERT(false);
-        }
-        GGML_ASSERT(tB_->getCols() == (size_t)J_);
+//         // tB 검증 (K x J)
+//         if (tB_->getRows() != (size_t)K_)
+//         {
+//             DBG0("[ERROR] tB dimension mismatch!\n");
+//             DBG0("  Source tensor (src0): ne=[%lld,%lld] (K x J in storage)\n", 
+//                  (long long)src0_->ne[0], (long long)src0_->ne[1]);
+//             DBG0("  Expected logical dims: J=%d, K=%d => tB should be %dx%d\n", J_, K_, K_, J_);
+//             DBG0("  Actual tB dims: %zux%zu\n", tB_->getRows(), tB_->getCols());
+//             DBG0("  transpose_B=%s\n", TRANSPOSE_B ? "true" : "false");
+//             GGML_ASSERT(false);
+//         }
+//         GGML_ASSERT(tB_->getCols() == (size_t)J_);
         
-        // tC 검증 (I x J)
-        if (tC_->getRows() != (size_t)I_)
-        {
-            DBG0("[ERROR] tC dimension mismatch!\n");
-            DBG0("  Source tensor (dst): ne=[%lld,%lld] (J x I in storage)\n", 
-                 (long long)dst_->ne[0], (long long)dst_->ne[1]);
-            DBG0("  Expected logical dims: I=%d, J=%d => tC should be %dx%d\n", I_, J_, I_, J_);
-            DBG0("  Actual tC dims: %zux%zu\n", tC_->getRows(), tC_->getCols());
-            GGML_ASSERT(false);
-        }
-        GGML_ASSERT(tC_->getCols() == (size_t)J_);
+//         // tC 검증 (I x J)
+//         if (tC_->getRows() != (size_t)I_)
+//         {
+//             DBG0("[ERROR] tC dimension mismatch!\n");
+//             DBG0("  Source tensor (dst): ne=[%lld,%lld] (J x I in storage)\n", 
+//                  (long long)dst_->ne[0], (long long)dst_->ne[1]);
+//             DBG0("  Expected logical dims: I=%d, J=%d => tC should be %dx%d\n", I_, J_, I_, J_);
+//             DBG0("  Actual tC dims: %zux%zu\n", tC_->getRows(), tC_->getCols());
+//             GGML_ASSERT(false);
+//         }
+//         GGML_ASSERT(tC_->getCols() == (size_t)J_);
         
-        DBG0("[createTensors] All tensor dimensions validated successfully.\n");
-        DBG0("  tA: %zux%zu (I=%d x K=%d) ✓\n", tA_->getRows(), tA_->getCols(), I_, K_);
-        DBG0("  tB: %zux%zu (K=%d x J=%d) ✓\n", tB_->getRows(), tB_->getCols(), K_, J_);
-        DBG0("  tC: %zux%zu (I=%d x J=%d) ✓\n", tC_->getRows(), tC_->getCols(), I_, J_);
-    }
+//         DBG0("[createTensors] All tensor dimensions validated successfully.\n");
+//         DBG0("  tA: %zux%zu (I=%d x K=%d) ✓\n", tA_->getRows(), tA_->getCols(), I_, K_);
+//         DBG0("  tB: %zux%zu (K=%d x J=%d) ✓\n", tB_->getRows(), tB_->getCols(), K_, J_);
+//         DBG0("  tC: %zux%zu (I=%d x J=%d) ✓\n", tC_->getRows(), tC_->getCols(), I_, J_);
+//     }
 
-    void GemminiTestbench::prepareBias()
-    {
-        static const std::vector<int32_t> zero_bias(J_, 0);
-        bias_data_ = zero_bias.data();
-    }
+//     void GemminiTestbench::prepareBias()
+//     {
+//         static const std::vector<int32_t> zero_bias(J_, 0);
+//         bias_data_ = zero_bias.data();
+//     }
 
-    void GemminiTestbench::runCpuReference()
-    {
-        DBG0("[runCpuReference]...\n");
-        const int8_t *A = static_cast<const int8_t *>(tA_->get());
-        const int8_t *B = static_cast<const int8_t *>(tB_->get());
-        const size_t sA = tA_->getStride();
-        const size_t sB = tB_->getStride();
-        const size_t sC = tC_->getStride();
+//     void GemminiTestbench::runCpuReference()
+//     {
+//         DBG0("[runCpuReference]...\n");
+//         const int8_t *A = static_cast<const int8_t *>(tA_->get());
+//         const int8_t *B = static_cast<const int8_t *>(tB_->get());
+//         const size_t sA = tA_->getStride();
+//         const size_t sB = tB_->getStride();
+//         const size_t sC = tC_->getStride();
 
-        cpu_ref_c_.assign(I_ * sC, 0);
+//         cpu_ref_c_.assign(I_ * sC, 0);
 
-        for (int i = 0; i < I_; ++i)
-        {
-            for (int j = 0; j < J_; ++j)
-            {
-                int32_t acc = 0;
-                for (int k = 0; k < K_; ++k)
-                    acc += (int32_t)A[i * sA + k] * (int32_t)B[k * sB + j];
-                acc += bias_data_[j];
-                cpu_ref_c_[i * sC + j] = saturationToInt8(acc);
-            }
-        }
-    }
+//         for (int i = 0; i < I_; ++i)
+//         {
+//             for (int j = 0; j < J_; ++j)
+//             {
+//                 int32_t acc = 0;
+//                 for (int k = 0; k < K_; ++k)
+//                     acc += (int32_t)A[i * sA + k] * (int32_t)B[k * sB + j];
+//                 acc += bias_data_[j];
+//                 cpu_ref_c_[i * sC + j] = saturationToInt8(acc);
+//             }
+//         }
+//     }
 
-    void GemminiTestbench::runGemminiComputation()
-    {
-        DBG0("[runGemminiComputation]...\n");
-        tiled_matmul_auto(
-            I_, J_, K_,
-            (elem_t *)tA_->get(), (elem_t *)tB_->get(),
-            (void *)bias_data_, (elem_t *)tC_->get(),
-            tA_->getStride(), tB_->getStride(), 0, tC_->getStride(),
-            1.f, 1.f, 1.f, NO_ACTIVATION,
-            1, 1, true, false, !TRANSPOSE_B, false, false, 0, OPTION);
-    }
+//     void GemminiTestbench::runGemminiComputation()
+//     {
+//         DBG0("[runGemminiComputation]...\n");
+//         tiled_matmul_auto(
+//             I_, J_, K_,
+//             (elem_t *)tA_->get(), (elem_t *)tB_->get(),
+//             (void *)bias_data_, (elem_t *)tC_->get(),
+//             tA_->getStride(), tB_->getStride(), 0, tC_->getStride(),
+//             1.f, 1.f, 1.f, NO_ACTIVATION,
+//             1, 1, true, false, !TRANSPOSE_B, false, false, 0, OPTION);
+//     }
 
-    void GemminiTestbench::compareAndReport()
-    {
-        DBG0("[compareAndReport]...\n");
+//     void GemminiTestbench::compareAndReport()
+//     {
+//         DBG0("[compareAndReport]...\n");
 
-        bool ok = true;
-        const int8_t *C_gemmini = static_cast<const int8_t *>(tC_->get());
-        const size_t sC = tC_->getStride();
+//         bool ok = true;
+//         const int8_t *C_gemmini = static_cast<const int8_t *>(tC_->get());
+//         const size_t sC = tC_->getStride();
 
-        for (int i = 0; i < I_; ++i)
-        {
-            for (int j = 0; j < J_; ++j)
-            {
-                elem_t got = C_gemmini[i * sC + j];
-                elem_t exp = cpu_ref_c_[i * sC + j];
-                if (got != exp)
-                {
-                    DBG0("[NG] mismatch (%d,%d): got=%d exp=%d\n", i, j, (int)got, (int)exp);
-                    ok = false;
-                }
-            }
-        }
-        DBG0(ok ? "[OK] Gemmini matmul matches CPU reference\n"
-                : "[FAIL] Mismatch detected\n");
-    }
+//         for (int i = 0; i < I_; ++i)
+//         {
+//             for (int j = 0; j < J_; ++j)
+//             {
+//                 elem_t got = C_gemmini[i * sC + j];
+//                 elem_t exp = cpu_ref_c_[i * sC + j];
+//                 if (got != exp)
+//                 {
+//                     DBG0("[NG] mismatch (%d,%d): got=%d exp=%d\n", i, j, (int)got, (int)exp);
+//                     ok = false;
+//                 }
+//             }
+//         }
+//         DBG0(ok ? "[OK] Gemmini matmul matches CPU reference\n"
+//                 : "[FAIL] Mismatch detected\n");
+//     }
 
-    void GemminiTestbench::dequantizeAndFinalize()
-    {
-        DBG0("[dequantizeAndFinalize]...\n");
-        if (dst_->type != GGML_TYPE_F32)
-            return;
+//     void GemminiTestbench::dequantizeAndFinalize()
+//     {
+//         DBG0("[dequantizeAndFinalize]...\n");
+//         if (dst_->type != GGML_TYPE_F32)
+//             return;
 
-        const int8_t *C_i8 = static_cast<const int8_t *>(tC_->get());
-        const size_t sC = tC_->getStride();
-        const size_t nb1 = dst_->nb[1];
-        uint8_t *out_base = static_cast<uint8_t *>(dst_->data);
-        for (int r = 0; r < I_; ++r)
-        {
-            const elem_t *row_c = C_i8 + (size_t)r * sC;
-            float *row_out = reinterpret_cast<float *>(out_base + (size_t)r * nb1);
-            for (int j = 0; j < J_; ++j)
-                row_out[j] = (float)row_c[j];
-        }
-    }
+//         const int8_t *C_i8 = static_cast<const int8_t *>(tC_->get());
+//         const size_t sC = tC_->getStride();
+//         const size_t nb1 = dst_->nb[1];
+//         uint8_t *out_base = static_cast<uint8_t *>(dst_->data);
+//         for (int r = 0; r < I_; ++r)
+//         {
+//             const elem_t *row_c = C_i8 + (size_t)r * sC;
+//             float *row_out = reinterpret_cast<float *>(out_base + (size_t)r * nb1);
+//             for (int j = 0; j < J_; ++j)
+//                 row_out[j] = (float)row_c[j];
+//         }
+//     }
 
-    void GemminiTestbench::dumpTensorSlices()
-    {
-#if DUMP
-        DBG0("[dumpTensorSlices]...\n");
+//     void GemminiTestbench::dumpTensorSlices()
+//     {
+// #if DUMP
+//         DBG0("[dumpTensorSlices]...\n");
 
-        // 1. 클래스 멤버 변수(I_, K_, J_)를 사용하여 슬라이스 크기 계산
-        const int vI = std::min(I_, SLICE_I);
-        const int vK = std::min(K_, SLICE_K);
-        const int vJ = std::min(J_, SLICE_J);
+//         // 1. 클래스 멤버 변수(I_, K_, J_)를 사용하여 슬라이스 크기 계산
+//         const int vI = std::min(I_, SLICE_I);
+//         const int vK = std::min(K_, SLICE_K);
+//         const int vJ = std::min(J_, SLICE_J);
 
-        // 1) 로컬 뷰 컨텍스트 (메타데이터만, 데이터는 부모 공유)
-        ggml_init_params ip = {};
-        ip.mem_size  = 256 * 1024;   // 텐서 노드 3~6개면 충분 (필요시 512KB로)
-        ip.mem_buffer= nullptr;
-        ip.no_alloc  = true;
+//         // 1) 로컬 뷰 컨텍스트 (메타데이터만, 데이터는 부모 공유)
+//         ggml_init_params ip = {};
+//         ip.mem_size  = 256 * 1024;   // 텐서 노드 3~6개면 충분 (필요시 512KB로)
+//         ip.mem_buffer= nullptr;
+//         ip.no_alloc  = true;
 
-        ggml_context* vctx = ggml_init(ip);
-        GGML_ASSERT(vctx);
+//         ggml_context* vctx = ggml_init(ip);
+//         GGML_ASSERT(vctx);
         
-        // 2. 클래스 멤버 변수(ctx_, src1_, src0_, dst_)를 사용하여 ggml 뷰 생성
-        ggml_tensor *A_slice = ggml_view_2d(vctx, const_cast<ggml_tensor *>(src1_), vK, vI, src1_->nb[1], 0);
-        ggml_tensor *B_slice = ggml_view_2d(vctx, const_cast<ggml_tensor *>(src0_), vJ, vK, src0_->nb[1], 0);
-        ggml_tensor *C_slice = ggml_view_2d(vctx, dst_, vJ, vI, dst_->nb[1], 0);
+//         // 2. 클래스 멤버 변수(ctx_, src1_, src0_, dst_)를 사용하여 ggml 뷰 생성
+//         ggml_tensor *A_slice = ggml_view_2d(vctx, const_cast<ggml_tensor *>(src1_), vK, vI, src1_->nb[1], 0);
+//         ggml_tensor *B_slice = ggml_view_2d(vctx, const_cast<ggml_tensor *>(src0_), vJ, vK, src0_->nb[1], 0);
+//         ggml_tensor *C_slice = ggml_view_2d(vctx, dst_, vJ, vI, dst_->nb[1], 0);
 
-        DBG0("[SLICE] View Dims: vI=%d, vK=%d, vJ=%d | Logical Dims: I=%d, K=%d, J=%d\n", vI, vK, vJ, I_, K_, J_);
+//         DBG0("[SLICE] View Dims: vI=%d, vK=%d, vJ=%d | Logical Dims: I=%d, K=%d, J=%d\n", vI, vK, vJ, I_, K_, J_);
 
-        // 3. 타입에 따라 행렬을 덤프하는 람다 함수
-        auto dump_any = [](const char *tag, const ggml_tensor *t, int r, int c, int s)
-        {
-            switch (t->type)
-            {
-            case GGML_TYPE_I8:
-                GGML_ASSERT(t->nb[0] == sizeof(int8_t));
-                aisa::dumpMatrix<int8_t>(tag, (const int8_t *)t->data, r, c, s);
-                break;
-            case GGML_TYPE_F32:
-                GGML_ASSERT(t->nb[0] == sizeof(float));
-                aisa::dumpMatrix<float>(tag, (const float *)t->data, r, c, s);
-                break;
-            case GGML_TYPE_I32:
-                GGML_ASSERT(t->nb[0] == sizeof(acc_t));
-                aisa::dumpMatrix<acc_t>(tag, (const acc_t *)t->data, r, c, s);
-                break;
-            default:
-                DBG0("%s: unsupported ggml type=%d — skipped\n", tag, (int)t->type);
-                break;
-            }
-        };
+//         // 3. 타입에 따라 행렬을 덤프하는 람다 함수
+//         auto dump_any = [](const char *tag, const ggml_tensor *t, int r, int c, int s)
+//         {
+//             switch (t->type)
+//             {
+//             case GGML_TYPE_I8:
+//                 GGML_ASSERT(t->nb[0] == sizeof(int8_t));
+//                 aisa::dumpMatrix<int8_t>(tag, (const int8_t *)t->data, r, c, s);
+//                 break;
+//             case GGML_TYPE_F32:
+//                 GGML_ASSERT(t->nb[0] == sizeof(float));
+//                 aisa::dumpMatrix<float>(tag, (const float *)t->data, r, c, s);
+//                 break;
+//             case GGML_TYPE_I32:
+//                 GGML_ASSERT(t->nb[0] == sizeof(acc_t));
+//                 aisa::dumpMatrix<acc_t>(tag, (const acc_t *)t->data, r, c, s);
+//                 break;
+//             default:
+//                 DBG0("%s: unsupported ggml type=%d — skipped\n", tag, (int)t->type);
+//                 break;
+//             }
+//         };
 
-        auto elems_stride = [](const ggml_tensor *t) -> int
-        {
-            GGML_ASSERT(t && t->nb[0] > 0);
-            return (int)(t->nb[1] / t->nb[0]);
-        };
+//         auto elems_stride = [](const ggml_tensor *t) -> int
+//         {
+//             GGML_ASSERT(t && t->nb[0] > 0);
+//             return (int)(t->nb[1] / t->nb[0]);
+//         };
 
-        const int sA_view = elems_stride(A_slice);
-        const int sB_view = elems_stride(B_slice);
-        const int sC_view = elems_stride(C_slice);
+//         const int sA_view = elems_stride(A_slice);
+//         const int sB_view = elems_stride(B_slice);
+//         const int sC_view = elems_stride(C_slice);
 
-        dump_any("Original A Slice (from src1)", A_slice, vI, vK, sA_view);
-        dump_any("Original B Slice (from src0)", B_slice, vK, vJ, sB_view);
-        dump_any("Original C Slice (from dst)", C_slice, vI, vJ, sC_view);
+//         dump_any("Original A Slice (from src1)", A_slice, vI, vK, sA_view);
+//         dump_any("Original B Slice (from src0)", B_slice, vK, vJ, sB_view);
+//         dump_any("Original C Slice (from dst)", C_slice, vI, vJ, sC_view);
 
-        // 5. 변환된 GemminiTensor의 내부 버퍼를 덤프
-        aisa::dumpMatrix<int8_t>("Converted tA (I x K)",
-                                 static_cast<const int8_t *>(tA_->get()), vI, vK, (int)tA_->getStride());
-        aisa::dumpMatrix<int8_t>("Converted tB (K x J)",
-                                 static_cast<const int8_t *>(tB_->get()), vK, vJ, (int)tB_->getStride());
-        aisa::dumpMatrix<int8_t>("Converted tC (I x J)",
-                                 static_cast<const int8_t *>(tC_->get()), vI, vJ, (int)tC_->getStride());
-#endif // DUMP
-    }
+//         // 5. 변환된 GemminiTensor의 내부 버퍼를 덤프
+//         aisa::dumpMatrix<int8_t>("Converted tA (I x K)",
+//                                  static_cast<const int8_t *>(tA_->get()), vI, vK, (int)tA_->getStride());
+//         aisa::dumpMatrix<int8_t>("Converted tB (K x J)",
+//                                  static_cast<const int8_t *>(tB_->get()), vK, vJ, (int)tB_->getStride());
+//         aisa::dumpMatrix<int8_t>("Converted tC (I x J)",
+//                                  static_cast<const int8_t *>(tC_->get()), vI, vJ, (int)tC_->getStride());
+// #endif // DUMP
+//     }
 
-    // utils
-    static inline int8_t saturationToInt8(int x)
-    {
-        return x > 127 ? 127 : (x < -128 ? -128 : (int8_t)x);
-    }
+//     // utils
+//     static inline int8_t saturationToInt8(int x)
+//     {
+//         return x > 127 ? 127 : (x < -128 ? -128 : (int8_t)x);
+//     }
 
-    template <typename T>
-    static inline void dumpMatrix(const char *name, const T *m, int r, int c, int s)
-    {
-#if DUMP
-        if (!m)
-        {
-            DBG0("%s: <null>\n", name);
-            return;
-        }
-        DBG0("%s (r=%d, c=%d, ld=%d) =\n", name, r, c, s);
+//     template <typename T>
+//     static inline void dumpMatrix(const char *name, const T *m, int r, int c, int s)
+//     {
+// #if DUMP
+//         if (!m)
+//         {
+//             DBG0("%s: <null>\n", name);
+//             return;
+//         }
+//         DBG0("%s (r=%d, c=%d, ld=%d) =\n", name, r, c, s);
 
-        for (int i = 0; i < r; ++i)
-        {
-            DBG0("[ ");
-            for (int j = 0; j < c; ++j)
-            {
-                const T v = m[(size_t)i * (size_t)s + (size_t)j];
+//         for (int i = 0; i < r; ++i)
+//         {
+//             DBG0("[ ");
+//             for (int j = 0; j < c; ++j)
+//             {
+//                 const T v = m[(size_t)i * (size_t)s + (size_t)j];
 
-                if constexpr (std::is_same_v<T, float>)
-                {
-                    // fp32
-                    DBG0("%.6g ", (double)v);
-                }
-                else if constexpr (std::is_same_v<T, int8_t>)
-                {
-                    // int8 -> 가독성을 위해 int로 승격 출력
-                    DBG0("%d ", (int)v);
-                }
-                else if constexpr (std::is_same_v<T, acc_t>)
-                {
-                    // acc_t (일반적으로 int32_t)
-                    if constexpr (std::numeric_limits<acc_t>::is_signed)
-                        DBG0("%lld ", (long long)v);
-                    else
-                        DBG0("%llu ", (unsigned long long)v);
-                }
-                else
-                {
-                    // 컴파일 타임 가드: 지원 타입 외 사용 방지
-                    static_assert(std::is_same_v<T, void>,
-                                  "dump_matrix: supported types are float, int8_t, acc_t only.");
-                }
-            }
-            DBG0("]\n");
-        }
-#else
-        (void)name;
-        (void)m;
-        (void)r;
-        (void)c;
-        (void)s;
-#endif
-    }
-}
+//                 if constexpr (std::is_same_v<T, float>)
+//                 {
+//                     // fp32
+//                     DBG0("%.6g ", (double)v);
+//                 }
+//                 else if constexpr (std::is_same_v<T, int8_t>)
+//                 {
+//                     // int8 -> 가독성을 위해 int로 승격 출력
+//                     DBG0("%d ", (int)v);
+//                 }
+//                 else if constexpr (std::is_same_v<T, acc_t>)
+//                 {
+//                     // acc_t (일반적으로 int32_t)
+//                     if constexpr (std::numeric_limits<acc_t>::is_signed)
+//                         DBG0("%lld ", (long long)v);
+//                     else
+//                         DBG0("%llu ", (unsigned long long)v);
+//                 }
+//                 else
+//                 {
+//                     // 컴파일 타임 가드: 지원 타입 외 사용 방지
+//                     static_assert(std::is_same_v<T, void>,
+//                                   "dump_matrix: supported types are float, int8_t, acc_t only.");
+//                 }
+//             }
+//             DBG0("]\n");
+//         }
+// #else
+//         (void)name;
+//         (void)m;
+//         (void)r;
+//         (void)c;
+//         (void)s;
+// #endif
+//     }
+// }

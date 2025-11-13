@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <include/gemmini.h>
+#include "../ggml-gemmini-util.h"
 
 namespace aisa
 {
@@ -31,7 +32,10 @@ namespace aisa
         dec.computeCompensation_unrolled(Y_com.data()); // 내부에서 per-block scale 적용
 
         // 계산된 보상을 출력에 적용
-        dec.applyCompensation(args->f_out, args->stride_f_out, Y_com);
+        dec.applyCompensation(args->f_out,
+                              args->stride_f_out,
+                              args->col_stride_f_out ? args->col_stride_f_out : 1,
+                              Y_com);
     }
 
     /**
@@ -70,8 +74,7 @@ namespace aisa
         rk_stage_.reserve(I_ * std::min(alpha_, K_));
 
         end = read_cycles();
-        fprintf(stderr, "[layer=%s][DEC: Initialize dimensions and buffers] start=%lu end=%lu elapsed=%lu\n",
-                layer_, start, end, end - start);
+        PRINT_CYCLE(layer_, "DEC: Initialize dimensions and buffers", start, end, end - start);
 
         // ========== 2단계: 모든 행에 대해 Top-K 선택 및 잔차 계산 ==========
         const float *x = static_cast<const float *>(A_->data); // 원본 활성화
@@ -84,8 +87,7 @@ namespace aisa
             selectTopKandComputeResidual(r, x_r, qx_r);
         }
         end = read_cycles();
-        fprintf(stderr, "[layer=%s][DEC: Select top-K and stage R_k for all rows] start=%lu end=%lu elapsed=%lu\n",
-                layer_, start, end, end - start);
+        PRINT_CYCLE(layer_, "DEC: Select top-K and stage R_k for all rows", start, end, end - start);
 
         // ========== 3단계: R_k CSC 구조 구축 ==========
         buildRk();
@@ -189,8 +191,7 @@ namespace aisa
         rk_stage_.shrink_to_fit();
 
         uint64_t end = read_cycles();
-        fprintf(stderr, "[layer=%s][DEC: Build R_k CSC structure] start=%lu end=%lu elapsed=%lu\n",
-               layer_, start, end, end - start);
+        PRINT_CYCLE(layer_, "DEC: Build R_k CSC structure", start, end, end - start);
     }
 
     /**
@@ -256,8 +257,7 @@ namespace aisa
         }
 
         uint64_t end = read_cycles();
-        fprintf(stderr, "[layer=%s][DEC: Compute and accumulate compensation (unrolled)] start=%lu end=%lu elapsed=%lu\n",
-               layer_, start, end, end - start);
+        PRINT_CYCLE(layer_, "DEC: Compute and accumulate compensation", start, end, end - start);
     }
 
     /**
@@ -271,24 +271,26 @@ namespace aisa
      * @param Y_com 보상 행렬 (I×J)
      */
 
-    void ActivationDEC::applyCompensation(float *out, size_t stride, const std::vector<float> &Y_com)
+    void ActivationDEC::applyCompensation(float *out,
+                                          size_t row_stride,
+                                          size_t col_stride,
+                                          const std::vector<float> &Y_com)
     {
         uint64_t start = read_cycles();
 
         float *C = out;
 
-        // 각 원소에 보상 적용: C[r,j] += Y_com[r,j] * s_w
+        // 각 원소에 보상 적용: C[r,j] += Y_com[r,j]
         for (size_t r = 0; r < I_; ++r)
         {
             const float *Yr = Y_com.data() + r * J_;
-            float *Cr = C + r * stride;
+            float *Cr = C + r * row_stride;
             for (size_t j = 0; j < J_; ++j)
-                Cr[j] += Yr[j];
+                Cr[j * col_stride] += Yr[j];
         }
 
         uint64_t end = read_cycles();
-        fprintf(stderr, "[layer=%s][DEC: Apply compensation to output] start=%lu end=%lu elapsed=%lu\n",
-               layer_, start, end, end - start);
+        PRINT_CYCLE(layer_, "DEC: Apply compensation to output", start, end, end - start);
     }
 
     // int8 -> float (W의 k번째 행) + per-block scale 적용 (있으면)

@@ -1,14 +1,13 @@
-// gemmini_tensor/error_compensation_activation_DEC.h
+// error_compensation_activation_DEC.h
 #pragma once
-#include "../quant_tensor_view.h"
-#include "../../labeling/label.h"
-#include "../../ggml-gemmini-args.h"
+#include "../labeling/label.h"
+#include "../ggml-gemmini-args.h"
+#include "../ggml-gemmini-cycle.h"
 
 #include "ggml.h"
 #include <vector>
 #include <cstdint>
 
-#define SCALE_W 1.0f // s_w (weight quantization scale)
 #ifndef DEC_ALPHA_RATIO
 #define DEC_ALPHA_RATIO 0.05 // 5% salient channels
 #endif
@@ -95,7 +94,10 @@ namespace aisa
                                           const int8_t *row_q);
         void buildRk();
         void computeCompensation_unrolled(float *Y_com);
-        void applyCompensation(float *out, size_t stride, const std::vector<float> &Y_com);
+        void applyCompensation(float *out,
+                               size_t row_stride,
+                               size_t col_stride,
+                               const std::vector<float> &Y_com);
 
         inline void load_W_row_scaled(int k, std::vector<float> &Wk_f) const;
     };
