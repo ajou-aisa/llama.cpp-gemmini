@@ -225,13 +225,13 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     {
         if (ggml_gemmini_mul_mat_cpu_output(dst))
         {
-            DBG_SIMPLE("[Gemmini] layer=%s handled by ggml CPU (%s)\n",
+            DBG_SIMPLE("[Gemmini] layer=%s handled by ggml CPU (%s)",
                        layer ? layer : "(unnamed)", force_all_layers ? "force all" : "force list");
             return;
         }
         else
         {
-            DBG_SIMPLE("[Gemmini] layer=%s requested CPU force but shape/type unsupported, falling back to Gemmini\n",
+            DBG_SIMPLE("[Gemmini] layer=%s requested CPU force but shape/type unsupported, falling back to Gemmini",
                        layer ? layer : "(unnamed)");
         }
     }
@@ -371,7 +371,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         mae /= static_cast<double>(tot);
         rmse = std::sqrt(rmse / static_cast<double>(tot));
     }
-    DBG_SIMPLE("[golden-W] bad=%zu/%zu mae=%.3e rmse=%.3e max|d|=%.3e tB=%d sB=%zu\n",
+    DBG_SIMPLE("[golden-W] bad=%zu/%zu mae=%.3e rmse=%.3e max|d|=%.3e tB=%d sB=%zu",
                bad, tot, mae, rmse, maxd, static_cast<int>(args.transpose_B), args.sB);
     GGML_ASSERT(bad == 0 && "B(qs,d) != dequant(Q8_0): transpose/stride/order mismatch");
 #endif
@@ -401,7 +401,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     end = read_cycles();
     PRINT_CYCLE(layer, "Set Args for calling gemmini", start, end, end - start);
 
-    DBG_SIMPLE("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out(row)=%zu stride_f_out(col)=%zu nb1=%zu nb0=%zu\n",
+    DBG_SIMPLE("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out(row)=%zu stride_f_out(col)=%zu nb1=%zu nb0=%zu",
            layer, args.A, args.B, args.C, args.D,
            args.I, args.J, args.K, args.sA, args.sB, args.sC,
            args.stride_f_out, args.col_stride_f_out, dst->nb[1], dst->nb[0]);
@@ -468,11 +468,11 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             //  - bad: 허용 오차(현재 5e-3)보다 큰 비교 지점 수 / 전체 샘플 수
             //  - mae/rmse: 양자화 경로 vs 참조(복원된 qA × fp32 W)의 평균/제곱근 평균 오차
             //  - max|d|: 단일 요소 최대 오차 (이 값이 작으면 전체 벡터도 잘 맞음)
-            DBG_SIMPLE("[golden-MM] bad=%zu/%zu mae=%.3e rmse=%.3e max|d|=%.3e\n", bad, tot, mae, rmse, maxd);
+            DBG_SIMPLE("[golden-MM] bad=%zu/%zu mae=%.3e rmse=%.3e max|d|=%.3e", bad, tot, mae, rmse, maxd);
         }
         else
         {
-            DBG_SIMPLE("[golden-MM] skipped (missing src/dst data)\n");
+            DBG_SIMPLE("[golden-MM] skipped (missing src/dst data)");
         }
     }
 #endif
