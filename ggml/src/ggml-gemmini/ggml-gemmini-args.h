@@ -7,6 +7,17 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <vector>
+
+#ifndef QACT_USE_PERCENTILE
+#define QACT_USE_PERCENTILE 1
+#endif
+#ifndef QACT_PCTL
+#define QACT_PCTL 0.999f
+#endif
+#ifndef QACT_SAMPLE_MAX
+#define QACT_SAMPLE_MAX 8192u
+#endif
 
 
 #define BLOCK_SCALING 1
@@ -86,7 +97,8 @@ typedef struct ggml_gemmini_args_t {
 
     // origin output
     float* f_out = nullptr;
-    size_t stride_f_out = 0;
+    size_t stride_f_out = 0;      // row stride in elements
+    size_t col_stride_f_out = 0;  // column stride in elements
 
     // logging & profiling helpers
     const char *layer_name = "";
@@ -170,38 +182,23 @@ inline void ggml_gemmini_pack_q80(const ggml_tensor *src,
     const size_t logical_cols = static_cast<size_t>(dim_j * dim_z * dim_w);
 
     if (dst_base) {
-        if (transpose) {
-            // Produce a (K x logical_cols) row-major buffer so that Gemmini consumes a true K×J matrix.
-            for (int64_t k = 0; k < dim_k; ++k) {
-                elem_t *dst_row = dst_base + static_cast<size_t>(k) * dst_stride_elems;
-                size_t col_idx = 0;
-                for (int64_t iw = 0; iw < dim_w; ++iw) {
-                    for (int64_t iz = 0; iz < dim_z; ++iz) {
-                        for (int64_t iy = 0; iy < dim_j; ++iy, ++col_idx) {
-                            const block_q8_0 *row_blocks = ggml_gemmini_get_q80_row_ptr(src, iy, iz, iw);
-                            const size_t blk = static_cast<size_t>(k) / QK8_0;
-                            const int off = static_cast<int>(k % QK8_0);
-                            dst_row[col_idx] = row_blocks[blk].qs[off];
-                        }
-                    }
-                }
-                GGML_ASSERT(col_idx == logical_cols);
-            }
-        } else {
-            // Keep original (logical_cols x K) row-major layout
-            size_t row_idx = 0;
+        GGML_ASSERT(transpose && "Gemmini pack must produce a KxJ row-major buffer");
+
+        // Produce a (K x logical_cols) row-major buffer so that Gemmini consumes a true K×J matrix.
+        for (int64_t k = 0; k < dim_k; ++k) {
+            elem_t *dst_row = dst_base + static_cast<size_t>(k) * dst_stride_elems;
+            size_t col_idx = 0;
             for (int64_t iw = 0; iw < dim_w; ++iw) {
                 for (int64_t iz = 0; iz < dim_z; ++iz) {
-                    for (int64_t iy = 0; iy < dim_j; ++iy, ++row_idx) {
+                    for (int64_t iy = 0; iy < dim_j; ++iy, ++col_idx) {
                         const block_q8_0 *row_blocks = ggml_gemmini_get_q80_row_ptr(src, iy, iz, iw);
-                        elem_t *dst_row = dst_base + row_idx * dst_stride_elems;
-                        for (size_t blk = 0; blk < blocks_K; ++blk) {
-                            std::memcpy(dst_row + blk * QK8_0, row_blocks[blk].qs, QK8_0 * sizeof(elem_t));
-                        }
+                        const size_t blk = static_cast<size_t>(k) / QK8_0;
+                        const int off = static_cast<int>(k % QK8_0);
+                        dst_row[col_idx] = row_blocks[blk].qs[off];
                     }
                 }
             }
-            GGML_ASSERT(row_idx == logical_cols);
+            GGML_ASSERT(col_idx == logical_cols);
         }
     }
 
@@ -247,6 +244,7 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
             return;
         const float * v =  static_cast<const float *>(data_ptr);
         block_q8_0 * quantized_output;
+
 
         quantize_row_q8_0_ref(v, quantized_output, total);
 
@@ -356,15 +354,33 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
                     ++near_zero;
                 }
             }
+#if QACT_USE_PERCENTILE
+            const size_t idx = i * K + k;
+            if ((idx % sample_stride) == 0 && qact_samples.size() < sample_cap)
+            {
+                qact_samples.push_back(std::fabs(v));
+            }
+#endif
         }
 
-        // scale 결정
-        constexpr float eps = 1e-8f;
-        const float denom = std::max(max_abs, eps);
-        float scale = denom / 127.0f;
-        if (!std::isfinite(scale) || scale < eps)
-            scale = 1.0f;
 
+    // scale 결정
+    constexpr float eps = 1e-8f;
+    float cap = std::max(max_abs, eps);
+#if QACT_USE_PERCENTILE
+    if (!qact_samples.empty())
+    {
+        const float pct_raw = QACT_PCTL;
+        const float pct = pct_raw <= 0.0f ? 0.0f : (pct_raw >= 1.0f ? 1.0f : pct_raw);
+        const size_t last_idx = qact_samples.size() - 1;
+        const size_t pidx = static_cast<size_t>(std::floor(static_cast<double>(last_idx) * static_cast<double>(pct)));
+        std::nth_element(qact_samples.begin(), qact_samples.begin() + pidx, qact_samples.end());
+        cap = std::max(qact_samples[pidx] * 1.05f, eps);
+    }
+#endif
+    float scale = cap / 127.0f;
+    if (!std::isfinite(scale) || scale < eps)
+        scale = 1.0f;
         args.scale_A = scale;
 
         const float inv_scale = 1.0f / scale;
@@ -417,15 +433,23 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
             : INFINITY;
         const double sat_ratio = (static_cast<double>(sat_pos + sat_neg) * 100.0) / static_cast<double>(total);
 
-        // 요약 로그
-        DBG0("[layer=%s][qact] N=%zu scale_A=%.6g sat=%.3f%% min=%g max=%g mean=%.6g std=%.6g mae=%.6g rmse=%.6g max|err|=%.6g snr=%.2f dB near0=%.2f%%\n",
-                layer_name, total, scale, sat_ratio, min_val, max_val, mean, stddev, mae, rmse, max_abs_err, snr_db, zero_ratio * 100.0);
 
-        // 포화되었을 때만 경고
-        if (sat_pos || sat_neg)
-        {
-            DBG0("[layer=%s][qact.warn] saturation pos=%zu neg=%zu (%.4f%%)\n",
-                    layer_name, sat_pos, sat_neg, sat_ratio);
-        }
-    //}
+    // 요약 로그
+    //  - scale_A : fp32 → int8 로 나눌 때 사용한 스케일 (값이 클수록 동적 범위가 넓음)
+    //  - sat      : 정수 범위(±127)를 넘어서 잘린 비율, 스케일이 부족하면 급증
+    //  - min/max  : 양자화 이전 fp32 입력의 범위
+    //  - mean/std : 입력 분포 통계 (디버그/스케일 튜닝 참고용)
+    //  - mae/rmse : fp32 vs dequant(int8·scale_A) 오차, 작을수록 양자화가 잘 된 것
+    //  - max|err| : 단일 요소 최대 오차
+    //  - snr      : 원신호 대비 오차에 대한 SNR(dB), 30dB↑이면 양호
+    //  - near0    : 거의 0인 값 비율(희소성 지표)
+    DBG_SIMPLE("[layer=%s][qact] N=%zu scale_A=%.6g sat=%.3f%% min=%g max=%g mean=%.6g std=%.6g mae=%.6g rmse=%.6g max|err|=%.6g snr=%.2f dB near0=%.2f%%\n",
+           layer_name, total, scale, sat_ratio, min_val, max_val, mean, stddev, mae, rmse, max_abs_err, snr_db, zero_ratio * 100.0);
+
+    // 포화되었을 때만 경고
+    if (sat_pos || sat_neg)
+    {
+        DBG_SIMPLE("[layer=%s][qact.warn] saturation pos=%zu neg=%zu (%.4f%%)\n",
+               layer_name, sat_pos, sat_neg, sat_ratio);
+    }
 }

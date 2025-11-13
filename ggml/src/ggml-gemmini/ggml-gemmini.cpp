@@ -3,22 +3,22 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cctype>
 #include <vector>
+#include <string>
 
 #include "ggml-gemmini-util.h"
-#include "gemmini_tensor/gemmini_tensor_interface.h"
 #include "include/gemmini.h"
+#include "ggml-gemmini-cycle.h"
 #include "labeling/label.h"
-#include "test/ggml-gemmini-test.h"
-#include "gemmini_tensor/error_compensation/activation_DEC.h"
-#include "gemmini_tensor/quant_tensor_view.h"
+#include "error_compensation/activation_DEC.h"
 #include "ggml-gemmini-args.h"
 
-#ifndef SCALE_A
-#define SCALE_A 1.0f
+#ifndef TRANSPOSE_B
+#define TRANSPOSE_B 1
 #endif
 #ifndef FULL_C
-#define FULL_C 0
+#define FULL_C 1
 #endif
 #ifndef LOW_D
 #define LOW_D 0
@@ -43,18 +43,169 @@ extern "C" volatile uint64_t gemmini_tiled_matmul_cycles = 0; // gemmini.h
 
 uint64_t start, end; // 일반 사이클 측정
 
+#if defined(GGML_GEMMINI_FORCE_GGML_OUTPUT) && GGML_GEMMINI_FORCE_GGML_OUTPUT
+static inline const char *ggml_tensor_data_start(const struct ggml_tensor *tensor)
+{
+    const char *base = reinterpret_cast<const char *>(tensor->view_src ? tensor->view_src->data : tensor->data);
+    const size_t offs = tensor->view_src ? tensor->view_offs : 0;
+    return base + offs;
+}
+
+static inline char *ggml_tensor_data_start(struct ggml_tensor *tensor)
+{
+    char *base = reinterpret_cast<char *>(tensor->view_src ? tensor->view_src->data : tensor->data);
+    const size_t offs = tensor->view_src ? tensor->view_offs : 0;
+    return base + offs;
+}
+
+static inline std::string ggml_gemmini_trim(const std::string &s)
+{
+    const auto first = s.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+        return {};
+    const auto last = s.find_last_not_of(" \t\r\n");
+    return s.substr(first, last - first + 1);
+}
+
+static inline const std::vector<std::string> &ggml_gemmini_force_layer_tokens()
+{
+    static bool initialized = false;
+    static std::vector<std::string> tokens;
+    if (!initialized)
+    {
+        const char *env = std::getenv("GGML_GEMMINI_FORCE_GGML_LAYERS");
+        if (env && *env)
+        {
+            std::string raw(env);
+            size_t pos = 0;
+            while (pos < raw.size())
+            {
+                const size_t comma = raw.find(',', pos);
+                const std::string token = ggml_gemmini_trim(raw.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
+                if (!token.empty())
+                    tokens.push_back(token);
+                if (comma == std::string::npos)
+                    break;
+                pos = comma + 1;
+            }
+        }
+        if (tokens.empty())
+        {
+            tokens.push_back("output");   // lm_head 등
+            tokens.push_back("ffn_down"); // FFN projection
+        }
+        initialized = true;
+    }
+    return tokens;
+}
+
+static inline bool ggml_gemmini_force_all_layers()
+{
+    static bool initialized = false;
+    static bool force_all = true;
+    if (!initialized)
+    {
+        const char *env = std::getenv("GGML_GEMMINI_FORCE_GGML_ALL");
+        if (env && *env)
+        {
+            std::string value = ggml_gemmini_trim(env);
+            std::transform(value.begin(), value.end(), value.begin(),
+                           [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+            if (value == "0" || value == "false" || value == "no")
+                force_all = false;
+            else
+                force_all = true;
+        }
+        else
+        {
+            force_all = true;
+        }
+        initialized = true;
+    }
+    return force_all;
+}
+
+static inline bool ggml_gemmini_should_force_ggml(const char *layer_name, const struct ggml_tensor *dst)
+{
+    if (layer_name)
+    {
+        for (const auto &token : ggml_gemmini_force_layer_tokens())
+        {
+            if (!token.empty() && std::strstr(layer_name, token.c_str()) != nullptr)
+                return true;
+        }
+    }
+    const struct ggml_tensor *src0 = dst->src[0];
+    // vocab size tends to be large (e.g. 50k). Use heuristic to detect output-like heads automatically.
+    if (src0 && src0->ne[1] >= 32000)
+        return true;
+    return false;
+}
+
+static bool ggml_gemmini_mul_mat_cpu_output(struct ggml_tensor *dst)
+{
+    const struct ggml_tensor *src0 = dst->src[0];
+    const struct ggml_tensor *src1 = dst->src[1];
+
+    if (src0 == nullptr || src1 == nullptr)
+        return false;
+    if (src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32)
+        return false;
+
+    const size_t I = dst->ne[1] ? dst->ne[1] : 1;
+    const size_t J = dst->ne[0];
+    const size_t K = src1->ne[0];
+
+    if (K % QK8_0 != 0)
+        return false;
+
+    const int64_t dim_j = src0->ne[1] ? src0->ne[1] : 1;
+    const int64_t dim_z = src0->ne[2] ? src0->ne[2] : 1;
+    const int64_t dim_w = src0->ne[3] ? src0->ne[3] : 1;
+    const size_t logical_cols = static_cast<size_t>(dim_j * dim_z * dim_w);
+    GGML_ASSERT(J <= logical_cols);
+
+    const char *a_base = ggml_tensor_data_start(src1);
+    char *dst_base = ggml_tensor_data_start(dst);
+
+    for (size_t i = 0; i < I; ++i)
+    {
+        for (size_t j = 0; j < J; ++j)
+        {
+            size_t rem = j;
+            const size_t cols_per_w = static_cast<size_t>(dim_j * dim_z);
+            const int64_t iw_idx = cols_per_w ? static_cast<int64_t>(rem / cols_per_w) : 0;
+            rem = cols_per_w ? rem % cols_per_w : 0;
+            const int64_t iz_idx = dim_j ? static_cast<int64_t>(rem / dim_j) : 0;
+            const int64_t iy_idx = dim_j ? static_cast<int64_t>(rem % dim_j) : 0;
+
+            const block_q8_0 *row_blocks = ggml_gemmini_get_q80_row_ptr(src0, iy_idx, iz_idx, iw_idx);
+            GGML_ASSERT(row_blocks != nullptr);
+
+            double acc = 0.0;
+            for (size_t k = 0; k < K; ++k)
+            {
+                const size_t blk = k / QK8_0;
+                const size_t off = k % QK8_0;
+                const block_q8_0 &b = row_blocks[blk];
+                const float w = ggml_fp16_to_fp32(b.d) * static_cast<float>(b.qs[off]);
+                const float *a_ptr = reinterpret_cast<const float *>(a_base + i * src1->nb[1] + k * src1->nb[0]);
+                acc += static_cast<double>(*a_ptr) * static_cast<double>(w);
+            }
+
+            float *dst_ptr = reinterpret_cast<float *>(dst_base + i * dst->nb[1] + j * dst->nb[0]);
+            *dst_ptr = static_cast<float>(acc);
+        }
+    }
+
+    return true;
+}
+#endif
+
 static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                                          struct ggml_tensor *dst) // FP32 output (I×J)
 {
-
-/* ________________ Test: 테스트 호출용 ___________________ */
-#if TEST
-    static_assert(TRANSPOSE_B == 1, "This test assumes physical-transposed B (KxJ).");
-    ggml_gemmini_test(ctx, dst);
-    return;
-#endif
-
-    DBG("[Gemmini] mul_mat call\n");
+    DBG_DETAIL("[Gemmini] mul_mat call\n");
 
     /* ____________________________________ 0. 원본 FP32 입력 텐서 ____________________________________________ */
     const auto *src0 = dst->src[0]; // src0: weight (K x J) -> 전치
@@ -66,9 +217,27 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     const char *w_name = (src0 && src0->name[0]) ? src0->name : ""; // weight name
     const char *layer = labelFromWeight(w_name); // layer 이름 추출
-    const bool pack_transpose_B = TRANSPOSE_B != 0;
-    
-    args.transpose_B = !pack_transpose_B; // Gemmini 쪽에는 실제 메모리 레이아웃에 맞게 전달
+    (void)TRANSPOSE_B; // 항상 (K x J) row-major 정책 사용
+
+#if defined(GGML_GEMMINI_FORCE_GGML_OUTPUT) && GGML_GEMMINI_FORCE_GGML_OUTPUT
+    const bool force_all_layers = ggml_gemmini_force_all_layers();
+    if (force_all_layers || ggml_gemmini_should_force_ggml(layer, dst))
+    {
+        if (ggml_gemmini_mul_mat_cpu_output(dst))
+        {
+            DBG_SIMPLE("[Gemmini] layer=%s handled by ggml CPU (%s)\n",
+                       layer ? layer : "(unnamed)", force_all_layers ? "force all" : "force list");
+            return;
+        }
+        else
+        {
+            DBG_SIMPLE("[Gemmini] layer=%s requested CPU force but shape/type unsupported, falling back to Gemmini\n",
+                       layer ? layer : "(unnamed)");
+        }
+    }
+#endif
+
+    args.transpose_B = false;
     args.layer_name = layer;
     args.full_C = FULL_C;
     args.low_D = LOW_D;
@@ -77,7 +246,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     const size_t I = dst->ne[1]; // I = A.ne[1], K = A.ne[0]
     const size_t J = dst->ne[0]; // K = B.ne[0], J = B.ne[1] (transpose)
     const size_t K = src1->ne[0]; // K = A.ne[0]
-    DBG("I=%zu, J=%zu, K=%zu\n", I, J, K);
+    DBG_DETAIL("I=%zu, J=%zu, K=%zu\n", I, J, K);
 
     args.I = I;
     args.J = J;
@@ -87,19 +256,26 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.sA = K;
     args.sC = J;
 
+    end = read_cycles();
+    PRINT_CYCLE(layer, "Set Args for calling gemmini", start, end, end - start);
+
+
     // quantize activation
+    start = read_cycles();
+
     static thread_local std::vector<int8_t> activation_q;
     activation_q.resize(I * K);
     int8_t *qx = activation_q.data();
 
     ggml_gemmini_quantize_activation(src1, args, qx);
-    
-    args.A = reinterpret_cast<elem_t *>(qx);
-    
-    QuantTensorView qA_view{qx, I, K, args.sA};
-    ConstQuantTensorView qA_const = make_const_view(qA_view);
 
+    args.A = reinterpret_cast<elem_t *>(qx);
+
+    end = read_cycles();
+    PRINT_CYCLE(layer, "Quantize activation", start, end, end - start);
+    
     // breackdown weight to int8_t & scale
+    start = read_cycles();
     const int64_t dim_j = src0->ne[1] ? src0->ne[1] : 1;
     const int64_t dim_z = src0->ne[2] ? src0->ne[2] : 1;
     const int64_t dim_w = src0->ne[3] ? src0->ne[3] : 1;
@@ -122,11 +298,14 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     int8_t *qw = weight_q.data();
     float *block_scale_w = weight_scales.data();
 
-    args.sB = pack_transpose_B ? logical_cols : static_cast<size_t>(K);
+    args.sB = logical_cols;
 
-    ggml_gemmini_pack_q80(src0, pack_transpose_B, reinterpret_cast<elem_t *>(qw), args.sB, block_scale_w, args);
+    ggml_gemmini_pack_q80(src0, /*transpose=*/true, reinterpret_cast<elem_t *>(qw), args.sB, block_scale_w, args);
 
     args.B = reinterpret_cast<elem_t *>(qw);
+
+    end = read_cycles();
+    PRINT_CYCLE(layer, "Breakdown Q8_0", start, end, end - start);
 
     // Ensure the logical transpose/stride flags match the physical packing.
 #if (GEMMINI_GOLDEN_CHECK || GEMMINI_GOLDEN_MM)
@@ -144,16 +323,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     };
 #endif
 
-    if (pack_transpose_B)
-    {
-        GGML_ASSERT(args.transpose_B == false);
-        GGML_ASSERT(args.sB == logical_cols);
-    }
-    else
-    {
-        GGML_ASSERT(args.transpose_B == true);
-        GGML_ASSERT(args.sB == static_cast<size_t>(K));
-    }
+    GGML_ASSERT(args.transpose_B == false);
+    GGML_ASSERT(args.sB == logical_cols);
 
 #if defined(GEMMINI_GOLDEN_CHECK) && GEMMINI_GOLDEN_CHECK
     // Compare the packed (qs, d) representation against the original Q8_0 blocks.
@@ -172,7 +343,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     {
         const size_t blk = k / args.block_size_k;
         const float d = args.B_scales[blk * args.blocks_J + j];
-        const int8_t q = args.transpose_B ? qw[j * args.sB + k] : qw[k * args.sB + j];
+        const int8_t q = qw[k * args.sB + j];
         return d * static_cast<float>(q);
     };
 
@@ -200,11 +371,12 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         mae /= static_cast<double>(tot);
         rmse = std::sqrt(rmse / static_cast<double>(tot));
     }
-    fprintf(stderr, "[golden-W] bad=%zu/%zu mae=%.3e rmse=%.3e max|d|=%.3e tB=%d sB=%zu\n",
-            bad, tot, mae, rmse, maxd, static_cast<int>(args.transpose_B), args.sB);
+    DBG_SIMPLE("[golden-W] bad=%zu/%zu mae=%.3e rmse=%.3e max|d|=%.3e tB=%d sB=%zu\n",
+               bad, tot, mae, rmse, maxd, static_cast<int>(args.transpose_B), args.sB);
     GGML_ASSERT(bad == 0 && "B(qs,d) != dequant(Q8_0): transpose/stride/order mismatch");
 #endif
     
+    start = read_cycles();
     /* ______________________________ 4. bias 텐서 처리 _________________________________ */
     std::vector<int32_t> zero_bias(J, 0);
 
@@ -222,18 +394,17 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     
     args.C = c_i8.data();
     args.f_out = static_cast<float*>(dst->data);
+    args.col_stride_f_out = dst->nb[0] / sizeof(float);
     args.stride_f_out = dst->nb[1] / sizeof(float);
     args.tiled_matmul_type = OPTION;
 
     end = read_cycles();
-#if CYCLE_LOG
     PRINT_CYCLE(layer, "Set Args for calling gemmini", start, end, end - start);
-#endif
 
-    DBG("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out=%zu nb1=%zu\n",
+    DBG_SIMPLE("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out(row)=%zu stride_f_out(col)=%zu nb1=%zu nb0=%zu\n",
            layer, args.A, args.B, args.C, args.D,
            args.I, args.J, args.K, args.sA, args.sB, args.sC,
-           args.stride_f_out, dst->nb[1]);
+           args.stride_f_out, args.col_stride_f_out, dst->nb[1], dst->nb[0]);
 
 
 
@@ -243,12 +414,13 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
 #if defined(GEMMINI_GOLDEN_MM) && GEMMINI_GOLDEN_MM
     {
-        const float *A_f32 = static_cast<const float *>(src1->data);
+        const int8_t *A_q = reinterpret_cast<const int8_t *>(args.A);
         float *dst_f32 = static_cast<float *>(dst->data);
-        if (A_f32 != nullptr && dst_f32 != nullptr)
+        if (A_q != nullptr && dst_f32 != nullptr)
         {
-            const size_t stride_a_f32 = src1->nb[1] ? static_cast<size_t>(src1->nb[1] / sizeof(float)) : static_cast<size_t>(K);
+            const size_t stride_a_q = args.sA ? args.sA : K;
             const size_t stride_dst = args.stride_f_out ? args.stride_f_out : J;
+            const size_t stride_dst_col = args.col_stride_f_out ? args.col_stride_f_out : 1;
 
             const auto weight_ref_at = [&](size_t k, size_t j) -> float
             {
@@ -265,16 +437,17 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
             for (size_t i0 = 0; i0 < I_chk; ++i0)
             {
-                const float *row_a = A_f32 + i0 * stride_a_f32;
+                const int8_t *row_a = A_q + i0 * stride_a_q;
                 const float *row_dst = dst_f32 + i0 * stride_dst;
                 for (size_t j0 = 0; j0 < J_chk; ++j0)
                 {
                     double ref = 0.0;
                     for (size_t k0 = 0; k0 < K; ++k0)
                     {
-                        ref += static_cast<double>(row_a[k0]) * static_cast<double>(weight_ref_at(k0, j0));
+                        const double a_deq = static_cast<double>(row_a[k0]) * static_cast<double>(args.scale_A);
+                        ref += a_deq * static_cast<double>(weight_ref_at(k0, j0));
                     }
-                    const double got = static_cast<double>(row_dst[j0]);
+                    const double got = static_cast<double>(row_dst[j0 * stride_dst_col]);
                     const double diff = ref - got;
                     mae += std::fabs(diff);
                     rmse += diff * diff;
@@ -291,12 +464,15 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 mae /= static_cast<double>(tot);
                 rmse = std::sqrt(rmse / static_cast<double>(tot));
             }
-            fprintf(stderr, "[golden-MM] bad=%zu/%zu mae=%.3e rmse=%.3e max|d|=%.3e\n",
-                    bad, tot, mae, rmse, maxd);
+            // golden-MM 로그 해석:
+            //  - bad: 허용 오차(현재 5e-3)보다 큰 비교 지점 수 / 전체 샘플 수
+            //  - mae/rmse: 양자화 경로 vs 참조(복원된 qA × fp32 W)의 평균/제곱근 평균 오차
+            //  - max|d|: 단일 요소 최대 오차 (이 값이 작으면 전체 벡터도 잘 맞음)
+            DBG_SIMPLE("[golden-MM] bad=%zu/%zu mae=%.3e rmse=%.3e max|d|=%.3e\n", bad, tot, mae, rmse, maxd);
         }
         else
         {
-            fprintf(stderr, "[golden-MM] skipped (missing src/dst data)\n");
+            DBG_SIMPLE("[golden-MM] skipped (missing src/dst data)\n");
         }
     }
 #endif
@@ -345,20 +521,15 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
             ggml_backend_gemmini_mul_mat(ctx, node);
             break;
         }
-        case GGML_OP_OUT_PROD:
-            // ggml_backend_gemmini_out_prod(ctx, node);
-            break;
-
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
-        case GGML_OP_ADD:
             break;
 
         default:
-            GGML_ABORT("%s: unsupported op %s\n", __func__, ggml_op_desc(node));
+            GGML_ABORT("%s: unsupported op assigned to GEMMINI: %s\n", __func__, ggml_op_desc(node));
         }
     }
     
@@ -439,7 +610,7 @@ static void ggml_backend_gemmini_device_get_props(ggml_backend_dev_t dev, struct
     ggml_backend_gemmini_device_get_memory(dev, &props->memory_free, &props->memory_total);
     props->caps = {
         /* .async                 = */ false,
-        /* .host_buffer           = */ false,
+        /* .host_buffer           = */ true,
         /* .buffer_from_host_ptr  = */ true,
         /* .events                = */ false,
     };
@@ -466,15 +637,11 @@ static ggml_backend_buffer_t ggml_backend_gemmini_device_buffer_from_host_ptr(gg
 }
 
 static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    const struct ggml_tensor * src0 = op->src[0];
-    const struct ggml_tensor * src1 = op->src[1];
-
     switch (op->op) {
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
-        case GGML_OP_ADD:
 
         case GGML_OP_TRANSPOSE:
             return true;
@@ -482,25 +649,26 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_MUL_MAT:
         {
             // BLAS usually is only faster for large matrices
-            const struct ggml_tensor * src0 = op->src[0];
-            const struct ggml_tensor * src1 = op->src[1];
+            const struct ggml_tensor *a = op->src[0]; // W
+            const struct ggml_tensor *b = op->src[1]; // x
+            if (!a || !b)
+                return false;
 
-            const int64_t ne10 = src1->ne[0];
+            // Q8_0 × F32 -> F32 만 처리 (우리가 구현한 경로)
+            if (a->type != GGML_TYPE_Q8_0)
+                return false;
+            if (b->type != GGML_TYPE_F32)
+                return false;
+            if (op->type != GGML_TYPE_F32)
+                return false;
 
-            const int64_t ne0 = op->ne[0];
-            const int64_t ne1 = op->ne[1];
-
-            // TODO: find the optimal value
-            const int64_t min_batch = 32;
-
-            return ggml_is_contiguous(src0) &&
-                   ggml_is_contiguous(src1) &&
-                   // src1->type == GGML_TYPE_F32 &&
-                   // (ne0 >= min_batch && ne1 >= min_batch && ne10 >= min_batch) &&
-                   // (src0->type == GGML_TYPE_F32 || ggml_get_type_traits(src0->type)->to_float != NULL);
-                   true;
+            // 필요시 연속성 제약은 완화/강화
+            if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b))
+                return false;
+            return true;
         }
 
+        case GGML_OP_ADD:
         case GGML_OP_OUT_PROD:
             // return op->src[0]->type == GGML_TYPE_F32 &&
             //        op->src[1]->type == GGML_TYPE_F32 &&
