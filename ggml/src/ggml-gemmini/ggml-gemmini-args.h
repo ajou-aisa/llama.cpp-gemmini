@@ -245,7 +245,7 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
         const size_t total = I * K;
         if (total == 0)
             return;
-        const float * v = *reinterpret_cast<const float *>(data_ptr);
+        const float * v =  static_cast<const float *>(data_ptr);
         block_q8_0 * quantized_output;
 
         quantize_row_q8_0_ref(v, quantized_output, total);
