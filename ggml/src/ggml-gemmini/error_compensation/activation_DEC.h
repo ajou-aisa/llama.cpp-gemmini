@@ -2,6 +2,7 @@
 #pragma once
 #include "../labeling/label.h"
 #include "../ggml-gemmini-args.h"
+#include "../ggml-gemmini-cycle.h"
 
 #include "ggml.h"
 #include <vector>

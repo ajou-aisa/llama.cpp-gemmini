@@ -355,15 +355,11 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
     //  - near0    : 거의 0인 값 비율(희소성 지표)
     DBG_SIMPLE("[layer=%s][qact] N=%zu scale_A=%.6g sat=%.3f%% min=%g max=%g mean=%.6g std=%.6g mae=%.6g rmse=%.6g max|err|=%.6g snr=%.2f dB near0=%.2f%%\n",
            layer_name, total, scale, sat_ratio, min_val, max_val, mean, stddev, mae, rmse, max_abs_err, snr_db, zero_ratio * 100.0);
-    fprintf(stderr, "[layer=%s][qact] N=%zu scale_A=%.6g sat=%.3f%% min=%g max=%g mean=%.6g std=%.6g mae=%.6g rmse=%.6g max|err|=%.6g snr=%.2f dB near0=%.2f%%\n",
-           layer_name, total, scale, sat_ratio, min_val, max_val, mean, stddev, mae, rmse, max_abs_err, snr_db, zero_ratio * 100.0); // 임시
 
     // 포화되었을 때만 경고
     if (sat_pos || sat_neg)
     {
         DBG_SIMPLE("[layer=%s][qact.warn] saturation pos=%zu neg=%zu (%.4f%%)\n",
                layer_name, sat_pos, sat_neg, sat_ratio);
-        fprintf(stderr, "[layer=%s][qact.warn] saturation pos=%zu neg=%zu (%.4f%%)\n",
-               layer_name, sat_pos, sat_neg, sat_ratio); // 임시
     }
 }

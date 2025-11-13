@@ -1,6 +1,12 @@
 #include "../ggml-gemmini/labeling/label.h"
 #include "/home/alveo/firesim/target-design/chipyard/generators/gemmini/software/gemmini-rocc-tests/include/cyclereader.h" // 절대경로
 
+#ifndef CYCLE_LOG
+#define CYCLE_LOG 1
+#endif
+
+#include "../ggml-gemmini/ggml-gemmini-cycle.h"
+
 #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
 #define _USE_MATH_DEFINES // For M_PI on MSVC
 
@@ -1815,18 +1821,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 uint64_t t0 = read_cycles();
                 ggml_compute_forward_norm(params, tensor);
                 uint64_t t1 = read_cycles();
-                #if CYCLE_LOG
-                PRINT_CYCLE(labelFromCpuOp("norm", tensor->name), "[norm]", t0, t1, t1 - t0);
-                #endif
+                PRINT_CYCLE(labelFromCpuOp("norm", tensor->name), "norm", t0, t1, t1 - t0);
             } break;
         case GGML_OP_RMS_NORM:
             {
                 uint64_t t0 = read_cycles();
                 ggml_compute_forward_rms_norm(params, tensor);
                 uint64_t t1 = read_cycles();
-                #if CYCLE_LOG
-                PRINT_CYCLE(labelFromCpuOp("rms_norm", tensor->name), "[norm]", t0, t1, t1 - t0);
-                #endif
+                PRINT_CYCLE(labelFromCpuOp("rms_norm", tensor->name), "norm", t0, t1, t1 - t0);
             } break;
         case GGML_OP_RMS_NORM_BACK:
             {
@@ -1912,9 +1914,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 uint64_t t0 = read_cycles();
                 ggml_compute_forward_soft_max(params, tensor);
                 uint64_t t1 = read_cycles();
-                #if CYCLE_LOG
-                PRINT_CYCLE(labelFromCpuOp("softmax", tensor->name), "[softmax]", t0, t1, t1 - t0);
-                #endif
+                PRINT_CYCLE(labelFromCpuOp("softmax", tensor->name), "softmax", t0, t1, t1 - t0);
             } break;
         case GGML_OP_SOFT_MAX_BACK:
             {
@@ -1993,9 +1993,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 uint64_t t0 = read_cycles();
                 ggml_compute_forward_leaky_relu(params, tensor);
                 uint64_t t1 = read_cycles();
-                #if CYCLE_LOG
-                PRINT_CYCLE(labelFromCpuOp("leaky_relu", tensor->name), "[leaky_relu]", t0, t1, t1 - t0);
-                #endif
+                PRINT_CYCLE(labelFromCpuOp("leaky_relu", tensor->name), "leaky_relu", t0, t1, t1 - t0);
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
@@ -2029,9 +2027,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 uint64_t t0 = read_cycles();
                 ggml_compute_forward_unary(params, tensor);
                 uint64_t t1 = read_cycles();
-                #if CYCLE_LOG
-                PRINT_CYCLE(labelFromCpuOp("unary", tensor->name), "[unary]", t0, t1, t1 - t0);
-                #endif
+                PRINT_CYCLE(labelFromCpuOp("unary", tensor->name), "unary", t0, t1, t1 - t0);
             } break;
         case GGML_OP_GET_REL_POS:
             {
