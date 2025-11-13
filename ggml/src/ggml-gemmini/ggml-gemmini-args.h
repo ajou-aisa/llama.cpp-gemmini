@@ -246,35 +246,35 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
         if (total == 0)
             return;
         const float v = *reinterpret_cast<const float *>(data_ptr);
-        const block_q8_0 * quantized_output[src->ne[0]/32];
+        block_q8_0 * quantized_output;
 
-        quantize_row_q80_ref(v, quantized_output, total);
+        quantize_row_q8_0_ref(v, quantized_output, total);
 
         args.A_blocks = quantized_output;
 
-        const float dequantized_v = nullptr;
+        float * dequantized_v = nullptr;
 
         dequantize_row_q8_0(args.A_blocks, dequantized_v, total);
 
         //error check
-        float min_val[total/QK8_0] = 0.0f;
-        float max_val[total/QK8_0] = 0.0f;
+        float min_val[total/QK8_0];
+        float max_val[total/QK8_0];
         size_t sat_pos = 0, sat_neg = 0;
         long double err_abs_sum = 0.0L, err_sq_sum = 0.0L, x_sq_sum = 0.0L;
         float max_abs_err = 0.0f;
 
-        for (int i = 0; i < total; ++i)
+        for (size_t i = 0; i < total; ++i)
         {
             min_val[i/32] = (min_val[i/32]>dequantized_v[i])? dequantized_v[i] : min_val[i/32];
             max_val[i/32] = (max_val[i/32]<dequantized_v[i])? dequantized_v[i] : max_val[i/32];
 
         }
-        for (int i = 0; i < total; ++i)
+        for (size_t i = 0; i < total; ++i)
         {   
-            if (v > max_val)
+            if (v[i] > max_val[i/32])
                 sat_pos += 1;
 
-            if (v < min_val)
+            if (v[i] < min_val[i/32])
                 sat_neg += 1;
 
             float error = dequantized_v[i] - v[i];
