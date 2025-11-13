@@ -20,8 +20,9 @@
 #define QACT_SAMPLE_MAX 8192u
 #endif
 
-
-#define BLOCK_SCALING 1
+#ifndef ACTIVATON_BLOCK_SCALE
+#define ACTIVATION_BLOCK_SCALE 1
+#endif
 #include "ggml.h"
 #include "ggml-quants.h"
 #ifndef GGML_COMMON_DECL
@@ -71,6 +72,8 @@ typedef struct ggml_gemmini_args_t {
     //for block scaling ////////////////////////////////////
     const block_q8_0 * A_blocks = nullptr;
     const float * A_scales = nullptr;
+    size_t A_scale_rows = 0; // number of activation rows with Q8_0 block scales
+    size_t A_scale_cols = 0; // number of Q8_0 blocks per row (K / QK8_0)
 
 
     //setiing flags 
@@ -245,6 +248,8 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
 #if BLOCK_SCALING
     args.A_blocks = nullptr;
     args.A_scales = nullptr;
+    args.A_scale_rows = 0;
+    args.A_scale_cols = 0;
     static thread_local std::vector<float> q80_input_linear;
     static thread_local std::vector<block_q8_0> q80_blocks;
     static thread_local std::vector<float> q80_dequantized;
@@ -323,7 +328,7 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
     const double stddev = std::sqrt(variance);
     const double zero_ratio = static_cast<double>(near_zero) / static_cast<double>(total);
 
-#if BLOCK_SCALING
+#if ACTIVATION_BLOCK_SCALE
     if ((total % QK8_0) == 0)
     {
         const size_t block_cnt = total / QK8_0;
@@ -395,6 +400,16 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
 
         args.A_blocks = q80_blocks.data();
         args.A_scales = q80_block_scales.data();
+
+        if (I > 0 && (K % QK8_0) == 0)
+        {
+            const size_t blocks_per_row = static_cast<size_t>(K) / QK8_0;
+            if (blocks_per_row != 0 && block_cnt == I * blocks_per_row)
+            {
+                args.A_scale_rows = I;
+                args.A_scale_cols = blocks_per_row;
+            }
+        }
 
         DBG_SIMPLE("[layer=%s][q80.qact] N=%zu scale_A=%.6g sat=%.3f%% min=%g max=%g mean=%.6g std=%.6g mae=%.6g rmse=%.6g max|err|=%.6g snr=%.2f dB near0=%.2f%%",
             layer_name, total, q80_avg_scale, q80_sat_ratio, min_val, max_val, mean, stddev, q80_mae, q80_rmse, q80_max_abs_err, q80_snr_db, zero_ratio * 100.0);
