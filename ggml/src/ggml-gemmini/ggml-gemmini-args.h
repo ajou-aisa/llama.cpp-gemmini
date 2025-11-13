@@ -20,7 +20,7 @@
 #define QACT_SAMPLE_MAX 8192u
 #endif
 
-#ifndef ACTIVATON_BLOCK_SCALE
+#ifndef ACTIVATION_BLOCK_SCALE
 #define ACTIVATION_BLOCK_SCALE 1
 #endif
 #include "ggml.h"
@@ -245,7 +245,7 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
     if (total == 0)
         return;
 
-#if BLOCK_SCALING
+#if ACTIVATION_BLOCK_SCALE
     args.A_blocks = nullptr;
     args.A_scales = nullptr;
     args.A_scale_rows = 0;
@@ -281,7 +281,7 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
         for (size_t k = 0; k < K; ++k)
         {
             const float v = *reinterpret_cast<const float *>(row_ptr + k * stride_k_bytes);
-#if BLOCK_SCALING
+#if ACTIVATION_BLOCK_SCALE
             q80_input_linear[i * K + k] = v;
 #endif
             max_abs = std::max(max_abs, std::fabs(v));
