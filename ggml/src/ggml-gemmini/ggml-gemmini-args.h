@@ -457,8 +457,7 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
 
     if (sat_pos || sat_neg)
     {
-        DBG_SIMPLE("[layer=%s][qact.warn] saturation pos=%zu neg=%zu (%.4f%%)
-",
+        DBG_SIMPLE("[layer=%s][qact.warn] saturation pos=%zu neg=%zu (%.4f%%)",
             layer_name, sat_pos, sat_neg, sat_ratio);
     }
 }
