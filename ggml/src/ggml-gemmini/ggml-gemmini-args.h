@@ -8,7 +8,10 @@
 #include <cstring>
 #include <cstdio>
 
+
+#define BLOCK_SCALING 1
 #include "ggml.h"
+#include "ggml-quants.h"
 #ifndef GGML_COMMON_DECL
 #define GGML_GEMMINI_ARGS_DEFINE_GGML_COMMON
 #define GGML_COMMON_DECL_CPP
@@ -254,19 +257,19 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
         dequantize_row_q8_0(args.A_blocks, dequantized_v, total);
 
         //error check
-        float min_val[total/QK8_0] = 0;
-        float max_val[total/QK8_0] = 0;
+        float min_val[total/QK8_0] = 0.0f;
+        float max_val[total/QK8_0] = 0.0f;
         size_t sat_pos = 0, sat_neg = 0;
         long double err_abs_sum = 0.0L, err_sq_sum = 0.0L, x_sq_sum = 0.0L;
         float max_abs_err = 0.0f;
 
-        for (size_t i = 0; i < total; ++i)
+        for (int i = 0; i < total; ++i)
         {
-            min_val[i/32] = (min_val>dequantized_v)? dequantized_v : min_val;
-            max_val[i/32] = (max_val<dequantized_v)? dequantized_v : max_val;
+            min_val[i/32] = (min_val[i/32]>dequantized_v[i])? dequantized_v[i] : min_val[i/32];
+            max_val[i/32] = (max_val[i/32]<dequantized_v[i])? dequantized_v[i] : max_val[i/32];
 
         }
-        for (size_t i = 0; i < total; ++i)
+        for (int i = 0; i < total; ++i)
         {   
             if (v > max_val)
                 sat_pos += 1;
