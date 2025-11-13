@@ -19,8 +19,10 @@
 #define QACT_SAMPLE_MAX 8192u
 #endif
 
-#include "ggml.h"
 
+#define BLOCK_SCALING 1
+#include "ggml.h"
+#include "ggml-quants.h"
 #ifndef GGML_COMMON_DECL
 #define GGML_GEMMINI_ARGS_DEFINE_GGML_COMMON
 #define GGML_COMMON_DECL_CPP
@@ -37,15 +39,16 @@
 enum tiled_matmul_type_t : int;
 
 /*  
-Gemmini 호출 인자를 한 데 모은 구조체 + Q8_0 전처리 헬퍼
-기존에는 GemminiTensor가 ggml 텐서를 INT8 버퍼로 변환했으나, 정확도 측정을 위한 Q8_0 지원을 위해
-변환된 버퍼와 블록별 스케일을 명시적으로 관리할 필요 */
+    Gemmini 호출 인자를 한 데 모은 구조체 + Q8_0 전처리 헬퍼
+    기존에는 GemminiTensor가 ggml 텐서를 INT8 버퍼로 변환했으나, 정확도 측정을 위한 Q8_0 지원을 위해
+    변환된 버퍼와 블록별 스케일을 명시적으로 관리할 필요 */
 typedef struct ggml_gemmini_args_t {
     // tiled_matmul_auto args
     size_t I = 0;
     size_t J = 0;
     size_t K = 0;
 
+    //elements
     elem_t *A = nullptr;
     elem_t *B = nullptr;
     void *C = nullptr;
@@ -56,6 +59,7 @@ typedef struct ggml_gemmini_args_t {
     size_t sC = 0;
     size_t sD = 0;
 
+    //scales, gemmini input val. 
     scale_t scale_A = 1.f;
     scale_t scale_B = 1.f;
     scale_acc_t scale_D = 1;
@@ -63,12 +67,19 @@ typedef struct ggml_gemmini_args_t {
     acc_scale_t scale = 1.0f;
     acc_scale_t bert_scale = 1.0f;
 
+    //for block scaling ////////////////////////////////////
+    const block_q8_0 * A_blocks = nullptr;
+    const float * A_scales = nullptr;
+
+
+    //setiing flags 
     bool repeating_bias = false;
     bool transpose_A = false;
     bool transpose_B = false;
-    bool full_C = false;
+    bool full_C = true;
     bool low_D = false;
 
+    //for weight checking   
     uint8_t weightA = 0;
     tiled_matmul_type_t tiled_matmul_type = static_cast<tiled_matmul_type_t>(0);
 
@@ -97,15 +108,15 @@ typedef struct ggml_gemmini_args_t {
 } ggml_gemmini_args_t;
 
 /*
-기존 dequantize_weight.h의 get_q80_row_ptr()/q80_to_T_* 흐름을 참고하여, Q8_0 블록에서
-qs만 추출해 Gemmini가 요구하는 INT8 행렬을 구성하고 블록 스케일까지 계산하는 헬퍼. 
-*/
+   기존 dequantize_weight.h의 get_q80_row_ptr()/q80_to_T_* 흐름을 참고하여, Q8_0 블록에서
+   qs만 추출해 Gemmini가 요구하는 INT8 행렬을 구성하고 블록 스케일까지 계산하는 헬퍼. 
+   */
 
 // ggml 텐서에서 (iy, iz, iw) 좌표에 해당하는 Q8_0 행의 시작 블록을 반환
 inline const block_q8_0 *ggml_gemmini_get_q80_row_ptr(const ggml_tensor *tensor,
-                                                      int64_t iy,
-                                                      int64_t iz,
-                                                      int64_t iw) {
+        int64_t iy,
+        int64_t iz,
+        int64_t iw) {
     const char *base = (const char *)(tensor->view_src ? tensor->view_src->data : tensor->data);
     const size_t offs = tensor->view_src ? tensor->view_offs : 0;
     return reinterpret_cast<const block_q8_0 *>(base + offs + iw * tensor->nb[3] + iz * tensor->nb[2] + iy * tensor->nb[1]);
@@ -120,9 +131,9 @@ inline const block_q8_0 *ggml_gemmini_args_block_base(const ggml_tensor *tensor)
 
 // 각 Q8_0 블록의 스케일(d)을 float 배열로 추출한다.
 inline void ggml_gemmini_extract_q80_scales(const ggml_tensor *src,
-                                            float *dst_scales,
-                                            size_t blocks_K,
-                                            size_t logical_cols) {
+        float *dst_scales,
+        size_t blocks_K,
+        size_t logical_cols) {
     if (dst_scales == nullptr) {
         return;
     }
@@ -153,11 +164,11 @@ inline void ggml_gemmini_extract_q80_scales(const ggml_tensor *src,
 //  - ggml_gemmini_args_t에 관련 메타데이터를 기록
 // 이후 Gemmini와 DEC가 동일 버퍼/스케일을 공유할 수 있도록 한 번만 호출
 inline void ggml_gemmini_pack_q80(const ggml_tensor *src,
-                                   bool transpose,
-                                   elem_t *dst_base,
-                                   size_t dst_stride_elems,
-                                   float *dst_scales,
-                                   ggml_gemmini_args_t &args) {
+        bool transpose,
+        elem_t *dst_base,
+        size_t dst_stride_elems,
+        float *dst_scales,
+        ggml_gemmini_args_t &args) {
     GGML_ASSERT(src);
     GGML_ASSERT(src->type == GGML_TYPE_Q8_0);
 
@@ -203,66 +214,145 @@ inline void ggml_gemmini_pack_q80(const ggml_tensor *src,
 
 // Activation tensor quantization helper shared across Gemmini helpers.
 inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
-                                             ggml_gemmini_args_t &args,
-                                             int8_t *dst)
+        ggml_gemmini_args_t &args,
+        int8_t *dst)
 {
-    if (src == nullptr || dst == nullptr)
-        return;
 
-    if (src->type != GGML_TYPE_F32)
-        return;
-
-    GGML_ASSERT(src->data != nullptr);
-
-    // Resolve base pointer and strides (handle views).
-    const char *base_ptr = static_cast<const char *>(
-        src->view_src ? src->view_src->data : src->data);
-    const size_t view_offs = src->view_src ? src->view_offs : 0;
-    const char *data_ptr = base_ptr + view_offs;
-
-    const size_t stride_k_bytes = src->nb[0] ? src->nb[0] : sizeof(float);
-    const size_t stride_i_bytes = src->nb[1]
-                                      ? src->nb[1]
-                                      : static_cast<size_t>(args.K) * stride_k_bytes;
-
-    const size_t I = args.I;
-    const size_t K = args.K;
-    const size_t total = I * K;
-    if (total == 0)
-        return;
-
-#if QACT_USE_PERCENTILE
-    const size_t sample_cap = std::max<size_t>(size_t(1), static_cast<size_t>(QACT_SAMPLE_MAX));
-    std::vector<float> qact_samples;
-    qact_samples.reserve(sample_cap);
-    const size_t sample_stride = std::max<size_t>(size_t(1), total / sample_cap);
-#endif
-
-    // 통계
-    float max_abs = 0.0f;
-    const float first_val =
-        *reinterpret_cast<const float *>(data_ptr + 0 * stride_i_bytes + 0 * stride_k_bytes);
-    float min_val = first_val;
-    float max_val = first_val;
-    double sum = 0.0;
-    double sum_sq = 0.0;
-    size_t near_zero = 0;
-    constexpr float zero_eps = 1e-6f;
-
-    for (size_t i = 0; i < I; ++i)
+    if(BLOCK_SCALING == 1) //if block scaling the activation 
     {
-        const char *row_ptr = data_ptr + i * stride_i_bytes;
-        for (size_t k = 0; k < K; ++k)
+        if (src == nullptr || dst == nullptr)
+            return;
+
+        if (src->type != GGML_TYPE_F32)
+            return;
+
+        GGML_ASSERT(src->data != nullptr);
+        const char *base_ptr = static_cast<const char *>(
+                src->view_src ? src->view_src->data : src->data);
+        const size_t view_offs = src->view_src ? src->view_offs : 0;
+        const char *data_ptr = base_ptr + view_offs;
+
+        const size_t stride_k_bytes = src->nb[0] ? src->nb[0] : sizeof(float);
+        const size_t stride_i_bytes = src->nb[1]
+            ? src->nb[1]
+            : static_cast<size_t>(args.K) * stride_k_bytes;
+
+        const size_t I = args.I;
+        const size_t K = args.K;
+        const size_t total = I * K;
+        if (total == 0)
+            return;
+        const float * v =  static_cast<const float *>(data_ptr);
+        block_q8_0 * quantized_output;
+
+
+        quantize_row_q8_0_ref(v, quantized_output, total);
+
+        args.A_blocks = quantized_output;
+
+        float * dequantized_v = nullptr;
+
+        dequantize_row_q8_0(args.A_blocks, dequantized_v, total);
+
+        //error check
+        float min_val[total/QK8_0];
+        float max_val[total/QK8_0];
+        size_t sat_pos = 0, sat_neg = 0;
+        long double err_abs_sum = 0.0L, err_sq_sum = 0.0L, x_sq_sum = 0.0L;
+        float max_abs_err = 0.0f;
+
+        for (size_t i = 0; i < total; ++i)
         {
-            const float v = *reinterpret_cast<const float *>(row_ptr + k * stride_k_bytes);
-            max_abs = std::max(max_abs, std::fabs(v));
-            min_val = std::min(min_val, v);
-            max_val = std::max(max_val, v);
-            sum += static_cast<double>(v);
-            sum_sq += static_cast<double>(v) * static_cast<double>(v);
-            if (std::fabs(v) < zero_eps)
+            min_val[i/32] = (min_val[i/32]>dequantized_v[i])? dequantized_v[i] : min_val[i/32];
+            max_val[i/32] = (max_val[i/32]<dequantized_v[i])? dequantized_v[i] : max_val[i/32];
+
+        }
+        for (size_t i = 0; i < total; ++i)
+        {   
+            if (v[i] > max_val[i/32])
+                sat_pos += 1;
+
+            if (v[i] < min_val[i/32])
+                sat_neg += 1;
+
+            float error = dequantized_v[i] - v[i];
+            float abs_err = std::fabs(error);
+            err_abs_sum += abs_err;
+            max_abs_err = (max_abs_err < abs_err) ? abs_err : max_abs_err;
+            err_sq_sum += error * error;
+            x_sq_sum += v[i] * v[i]; 
+        }
+
+        const double mae = static_cast<double>(err_abs_sum) / static_cast<double>(total);
+        const double rmse = std::sqrt(static_cast<double>(err_sq_sum) / static_cast<double>(total));
+        const double snr_db = (err_sq_sum > 0.0L && x_sq_sum > 0.0L)
+            ? 10.0 * std::log10(static_cast<double>(x_sq_sum / err_sq_sum))
+            : INFINITY;
+        const double sat_ratio = (static_cast<double>(sat_pos + sat_neg) * 100.0) / static_cast<double>(total);
+
+        DBG0("(for sigle attention block [layer=%s][qact] N=%zu scale_A=%.6g sat=%.3f%% min=%g max=%g mean=%.6g std=%.6g mae=%.6g rmse=%.6g max|err|=%.6g snr=%.2f dB near0=%.2f%%\n",
+                layer_name, total, scale, sat_ratio, min_val, max_val, mean, stddev, mae, rmse, max_abs_err, snr_db, zero_ratio * 100.0);
+
+        // 포화되었을 때만 경고
+        if (sat_pos || sat_neg)
+        {
+            DBG0("[layer=%s][qact.warn] saturation pos=%zu neg=%zu (%.4f%%)\n",
+                    layer_name, sat_pos, sat_neg, sat_ratio);
+        }
+    }
+    //else
+    //{
+        if (src == nullptr || dst == nullptr)
+            return;
+
+        if (src->type != GGML_TYPE_F32)
+            return;
+
+        GGML_ASSERT(src->data != nullptr);
+
+        // Resolve base pointer and strides (handle views).
+        const char *base_ptr = static_cast<const char *>(
+                src->view_src ? src->view_src->data : src->data);
+        const size_t view_offs = src->view_src ? src->view_offs : 0;
+        const char *data_ptr = base_ptr + view_offs;
+
+        const size_t stride_k_bytes = src->nb[0] ? src->nb[0] : sizeof(float);
+        const size_t stride_i_bytes = src->nb[1]
+            ? src->nb[1]
+            : static_cast<size_t>(args.K) * stride_k_bytes;
+
+        const size_t I = args.I;
+        const size_t K = args.K;
+        const size_t total = I * K;
+        if (total == 0)
+            return;
+
+        // 통계
+        float max_abs = 0.0f;
+        const float first_val =
+            *reinterpret_cast<const float *>(data_ptr + 0 * stride_i_bytes + 0 * stride_k_bytes);
+        float min_val = first_val;
+        float max_val = first_val;
+        double sum = 0.0;
+        double sum_sq = 0.0;
+        size_t near_zero = 0;
+        constexpr float zero_eps = 1e-6f;
+
+        for (size_t i = 0; i < I; ++i)
+        {
+            const char *row_ptr = data_ptr + i * stride_i_bytes;
+            for (size_t k = 0; k < K; ++k)
             {
-                ++near_zero;
+                const float v = *reinterpret_cast<const float *>(row_ptr + k * stride_k_bytes);
+                max_abs = std::max(max_abs, std::fabs(v));
+                min_val = std::min(min_val, v);
+                max_val = std::max(max_val, v);
+                sum += static_cast<double>(v);
+                sum_sq += static_cast<double>(v) * static_cast<double>(v);
+                if (std::fabs(v) < zero_eps)
+                {
+                    ++near_zero;
+                }
             }
 #if QACT_USE_PERCENTILE
             const size_t idx = i * K + k;
@@ -272,7 +362,7 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
             }
 #endif
         }
-    }
+
 
     // scale 결정
     constexpr float eps = 1e-8f;
@@ -291,58 +381,58 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
     float scale = cap / 127.0f;
     if (!std::isfinite(scale) || scale < eps)
         scale = 1.0f;
+        args.scale_A = scale;
 
-    args.scale_A = scale;
+        const float inv_scale = 1.0f / scale;
+        const char *layer_name = args.layer_name ? args.layer_name : "";
+        const double mean = sum / static_cast<double>(total);
+        const double variance = std::max(0.0, (sum_sq / static_cast<double>(total)) - mean * mean);
+        const double stddev = std::sqrt(variance);
+        const double zero_ratio = static_cast<double>(near_zero) / static_cast<double>(total);
 
-    const float inv_scale = 1.0f / scale;
-    const char *layer_name = args.layer_name ? args.layer_name : "";
-    const double mean = sum / static_cast<double>(total);
-    const double variance = std::max(0.0, (sum_sq / static_cast<double>(total)) - mean * mean);
-    const double stddev = std::sqrt(variance);
-    const double zero_ratio = static_cast<double>(near_zero) / static_cast<double>(total);
+        // 양자화 + 복원오차 지표(MAE/RMSE/SNR)
+        size_t sat_pos = 0, sat_neg = 0;
+        long double err_abs_sum = 0.0L, err_sq_sum = 0.0L, x_sq_sum = 0.0L;
+        float max_abs_err = 0.0f;
 
-    // 양자화 + 복원오차 지표(MAE/RMSE/SNR)
-    size_t sat_pos = 0, sat_neg = 0;
-    long double err_abs_sum = 0.0L, err_sq_sum = 0.0L, x_sq_sum = 0.0L;
-    float max_abs_err = 0.0f;
-
-    for (size_t i = 0; i < I; ++i)
-    {
-        const char *row_ptr = data_ptr + i * stride_i_bytes;
-        int8_t *row_dst = dst + i * K;
-        for (size_t k = 0; k < K; ++k)
+        for (size_t i = 0; i < I; ++i)
         {
-            const float x = *reinterpret_cast<const float *>(row_ptr + k * stride_k_bytes);
-            float scaled = x * inv_scale;
-            int qx = static_cast<int>(std::lrintf(scaled));
-            if (qx > 127)
+            const char *row_ptr = data_ptr + i * stride_i_bytes;
+            int8_t *row_dst = dst + i * K;
+            for (size_t k = 0; k < K; ++k)
             {
-                qx = 127;
-                ++sat_pos;
-            }
-            else if (qx < -127)
-            {
-                qx = -127;
-                ++sat_neg;
-            }
-            row_dst[k] = static_cast<int8_t>(qx);
+                const float x = *reinterpret_cast<const float *>(row_ptr + k * stride_k_bytes);
+                float scaled = x * inv_scale;
+                int qx = static_cast<int>(std::lrintf(scaled));
+                if (qx > 127)
+                {
+                    qx = 127;
+                    ++sat_pos;
+                }
+                else if (qx < -127)
+                {
+                    qx = -127;
+                    ++sat_neg;
+                }
+                row_dst[k] = static_cast<int8_t>(qx);
 
-            const float deq = static_cast<float>(qx) * scale;
-            const float err = deq - x;
-            const float aerr = std::fabs(err);
-            err_abs_sum += aerr;
-            err_sq_sum += static_cast<long double>(err) * static_cast<long double>(err);
-            x_sq_sum += static_cast<long double>(x) * static_cast<long double>(x);
-            max_abs_err = std::max(max_abs_err, aerr);
+                const float deq = static_cast<float>(qx) * scale;
+                const float err = deq - x;
+                const float aerr = std::fabs(err);
+                err_abs_sum += aerr;
+                err_sq_sum += static_cast<long double>(err) * static_cast<long double>(err);
+                x_sq_sum += static_cast<long double>(x) * static_cast<long double>(x);
+                max_abs_err = std::max(max_abs_err, aerr);
+            }
         }
-    }
 
-    const double mae = static_cast<double>(err_abs_sum) / static_cast<double>(total);
-    const double rmse = std::sqrt(static_cast<double>(err_sq_sum) / static_cast<double>(total));
-    const double snr_db = (err_sq_sum > 0.0L && x_sq_sum > 0.0L)
-                              ? 10.0 * std::log10(static_cast<double>(x_sq_sum / err_sq_sum))
-                              : INFINITY;
-    const double sat_ratio = (static_cast<double>(sat_pos + sat_neg) * 100.0) / static_cast<double>(total);
+        const double mae = static_cast<double>(err_abs_sum) / static_cast<double>(total);
+        const double rmse = std::sqrt(static_cast<double>(err_sq_sum) / static_cast<double>(total));
+        const double snr_db = (err_sq_sum > 0.0L && x_sq_sum > 0.0L)
+            ? 10.0 * std::log10(static_cast<double>(x_sq_sum / err_sq_sum))
+            : INFINITY;
+        const double sat_ratio = (static_cast<double>(sat_pos + sat_neg) * 100.0) / static_cast<double>(total);
+
 
     // 요약 로그
     //  - scale_A : fp32 → int8 로 나눌 때 사용한 스케일 (값이 클수록 동적 범위가 넓음)
