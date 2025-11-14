@@ -136,7 +136,19 @@ namespace aisa
 
             // 잔차 계산: δ[r,k] = x[r,k] - q̂x[r,k] * scale
             // 여기서 q̂x는 양자화된 값을 역양자화한 것
-            const float d = x_r[k] - static_cast<float>(qx_r[k]) * scale_A_;
+            float act_scale = scale_A_;
+            if (kActBlockScaleEnabled &&
+                A_scales_ && A_scale_cols_ > 0 && act_block_size_ > 0 &&
+                r < A_scale_rows_)
+            {
+                const size_t blk = static_cast<size_t>(k) / act_block_size_;
+                if (blk < A_scale_cols_)
+                {
+                    const size_t scale_idx = static_cast<size_t>(r) * A_scale_cols_ + blk;
+                    act_scale = A_scales_[scale_idx];
+                }
+            }
+            const float d = x_r[k] - static_cast<float>(qx_r[k]) * act_scale;
 
             // 채널 인덱스와 잔차 저장
             S_[r][i] = k;

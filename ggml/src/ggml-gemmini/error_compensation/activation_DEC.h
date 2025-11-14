@@ -5,6 +5,7 @@
 #include "../ggml-gemmini-cycle.h"
 
 #include "ggml.h"
+#include <algorithm>
 #include <vector>
 #include <cstdint>
 
@@ -47,6 +48,10 @@ namespace aisa
 
         // scales
         float scale_A_ = 1.0f;
+        const float *A_scales_ = nullptr;
+        size_t A_scale_rows_ = 0;
+        size_t A_scale_cols_ = 0;
+        size_t act_block_size_ = QK8_0;
         const float *B_scales_ = nullptr;
         size_t blocks_K_ = 0, blocks_J_ = 0, block_size_k_ = QK8_0;
 
@@ -78,7 +83,12 @@ namespace aisa
             : A_(A), args_(args), 
               I_(args->I), J_(args->J), K_(args->K),
               sA_(args->sA), sB_(args->sB),
-              scale_A_(args->scale_A), B_scales_(args->B_scales),
+              scale_A_(args->scale_A),
+              A_scales_(args->A_scales),
+              A_scale_rows_(args->A_scale_rows),
+              A_scale_cols_(args->A_scale_cols),
+              act_block_size_(infer_act_block_size(args)),
+              B_scales_(args->B_scales),
               blocks_J_(args->blocks_J), blocks_K_(args->blocks_K)
         {
             qx_ = reinterpret_cast<const int8_t *>(args->A);
@@ -100,7 +110,24 @@ namespace aisa
                                const std::vector<float> &Y_com);
 
         inline void load_W_row_scaled(int k, std::vector<float> &Wk_f) const;
+
+        static constexpr bool kActBlockScaleEnabled = (ACTIVATION_BLOCK_SCALE != 0);
+        static size_t infer_act_block_size(const ggml_gemmini_args_t *args);
     };
+}
+
+inline size_t aisa::ActivationDEC::infer_act_block_size(const ggml_gemmini_args_t *args)
+{
+    if (!kActBlockScaleEnabled || args == nullptr)
+        return QK8_0;
+
+    const size_t blocks_per_row = args->A_scale_cols;
+    const size_t k = args->K;
+    if (blocks_per_row == 0 || k == 0)
+        return QK8_0;
+
+    const size_t derived = k / blocks_per_row;
+    return std::max<size_t>(size_t{1}, derived);
 }
 
 #include "activation_DEC.tpp"
