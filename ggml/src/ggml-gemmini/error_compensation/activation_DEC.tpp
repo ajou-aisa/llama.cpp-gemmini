@@ -138,6 +138,7 @@ namespace aisa
             // 여기서 q̂x는 양자화된 값을 역양자화한 것
             float act_scale = scale_A_;
             if (kActBlockScaleEnabled &&
+                activation_block_scaled_ &&
                 A_scales_ && A_scale_cols_ > 0 && act_block_size_ > 0 &&
                 r < A_scale_rows_)
             {

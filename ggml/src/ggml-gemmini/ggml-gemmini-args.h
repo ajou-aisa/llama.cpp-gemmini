@@ -83,6 +83,9 @@ typedef struct ggml_gemmini_args_t {
     bool full_C = true;
     bool low_D = false;
 
+    // activation quantization metadata
+    bool activation_block_scaled = false;
+
     //for weight checking   
     uint8_t weightA = 0;
     tiled_matmul_type_t tiled_matmul_type = static_cast<tiled_matmul_type_t>(0);
@@ -221,6 +224,8 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
         ggml_gemmini_args_t &args,
         int8_t *dst)
 {
+    args.activation_block_scaled = false;
+
     if (src == nullptr || dst == nullptr)
         return;
 

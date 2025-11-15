@@ -52,6 +52,7 @@ namespace aisa
         size_t A_scale_rows_ = 0;
         size_t A_scale_cols_ = 0;
         size_t act_block_size_ = QK8_0;
+        bool activation_block_scaled_ = false;
         const float *B_scales_ = nullptr;
         size_t blocks_K_ = 0, blocks_J_ = 0, block_size_k_ = QK8_0;
 
@@ -88,6 +89,7 @@ namespace aisa
               A_scale_rows_(args->A_scale_rows),
               A_scale_cols_(args->A_scale_cols),
               act_block_size_(infer_act_block_size(args)),
+              activation_block_scaled_(args->activation_block_scaled),
               B_scales_(args->B_scales),
               blocks_J_(args->blocks_J), blocks_K_(args->blocks_K)
         {
