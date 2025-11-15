@@ -255,6 +255,7 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
     args.A_scales = nullptr;
     args.A_scale_rows = 0;
     args.A_scale_cols = 0;
+    bool used_block_scale = false;
     static thread_local std::vector<float> q80_input_linear;
     static thread_local std::vector<block_q8_0> q80_blocks;
     static thread_local std::vector<float> q80_dequantized;
@@ -413,6 +414,16 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
             {
                 args.A_scale_rows = I;
                 args.A_scale_cols = blocks_per_row;
+                if (dst != nullptr)
+                {
+                    for (size_t blk = 0; blk < block_cnt; ++blk)
+                    {
+                        const block_q8_0 &b = q80_blocks[blk];
+                        std::memcpy(dst + blk * QK8_0, b.qs, QK8_0 * sizeof(int8_t));
+                    }
+                    args.activation_block_scaled = true;
+                    used_block_scale = true;
+                }
             }
         }
 
@@ -422,6 +433,11 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
         if (q80_sat_pos || q80_sat_neg)
         {
             DBG_SIMPLE("[layer=%s][q80.qact.warn] saturation pos=%zu neg=%zu (%.4f%%)", layer_name, q80_sat_pos, q80_sat_neg, q80_sat_ratio);
+        }
+
+        if (used_block_scale)
+        {
+            return;
         }
     }
     else
