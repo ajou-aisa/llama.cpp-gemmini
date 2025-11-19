@@ -27,6 +27,7 @@ target_compile_definitions(ggml-gemmini PRIVATE
   GEMMINI_DEBUG=0 # gemmini의 debug 로그 매크로
   TEST=0          # 필요 시
   ACTIVATION_BLOCK_SCALE=1 # block-scale 사용
+  ACTIVATION_TENSOR_SCALE=0 # per-tensor scale 사용
   QACT_USE_PERCENTILE=0
   QACT_PCTL=0.999f
 

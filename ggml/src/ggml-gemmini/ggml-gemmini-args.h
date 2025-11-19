@@ -23,6 +23,9 @@
 #ifndef ACTIVATION_BLOCK_SCALE
 #define ACTIVATION_BLOCK_SCALE 1
 #endif
+#ifndef ACTIVATION_TENSOR_SCALE
+#define ACTIVATION_TENSOR_SCALE 1
+#endif
 #include "ggml.h"
 #include "ggml-quants.h"
 #ifndef GGML_COMMON_DECL
@@ -327,7 +330,6 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
         scale = 1.0f;
     args.scale_A = scale;
 
-    const float inv_scale = 1.0f / scale;
     const char *layer_name = args.layer_name ? args.layer_name : "";
     const double mean = sum / static_cast<double>(total);
     const double variance = std::max(0.0, (sum_sq / static_cast<double>(total)) - mean * mean);
@@ -446,6 +448,8 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
     }
 #endif
 
+#if ACTIVATION_TENSOR_SCALE
+    const float inv_scale = 1.0f / scale;
     size_t sat_pos = 0, sat_neg = 0;
     long double err_abs_sum = 0.0L, err_sq_sum = 0.0L, x_sq_sum = 0.0L;
     float max_abs_err = 0.0f;
@@ -496,4 +500,5 @@ inline void ggml_gemmini_quantize_activation(const ggml_tensor *src,
         DBG_SIMPLE("[layer=%s][qact.warn] saturation pos=%zu neg=%zu (%.4f%%)",
             layer_name, sat_pos, sat_neg, sat_ratio);
     }
+#endif
 }
