@@ -1,15 +1,24 @@
-cmake_minimum_required(VERSION 3.14)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)
 
-# Paths
-get_filename_component(PROJECT_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
-set(COMMON_DIR "${PROJECT_ROOT}/common")
+set(TEMPLATE_FILE "${CMAKE_CURRENT_SOURCE_DIR}/common/build-info.cpp.in")
+set(OUTPUT_FILE   "${CMAKE_CURRENT_SOURCE_DIR}/common/build-info.cpp")
 
-# Reuse the shared build-info logic (sets BUILD_NUMBER, BUILD_COMMIT, BUILD_COMPILER, BUILD_TARGET)
-include("${PROJECT_ROOT}/cmake/build-info.cmake")
-
-# Render the cpp from template
-configure_file(
-  "${COMMON_DIR}/build-info.cpp.in"
-  "${COMMON_DIR}/build-info.cpp"
-  @ONLY
-)
+# Only write the build info if it changed
+if(EXISTS ${OUTPUT_FILE})
+    file(READ ${OUTPUT_FILE} CONTENTS)
+    string(REGEX MATCH "LLAMA_COMMIT = \"([^\"]*)\";" _ ${CONTENTS})
+    set(OLD_COMMIT ${CMAKE_MATCH_1})
+    string(REGEX MATCH "LLAMA_COMPILER = \"([^\"]*)\";" _ ${CONTENTS})
+    set(OLD_COMPILER ${CMAKE_MATCH_1})
+    string(REGEX MATCH "LLAMA_BUILD_TARGET = \"([^\"]*)\";" _ ${CONTENTS})
+    set(OLD_TARGET ${CMAKE_MATCH_1})
+    if (
+        NOT OLD_COMMIT   STREQUAL BUILD_COMMIT   OR
+        NOT OLD_COMPILER STREQUAL BUILD_COMPILER OR
+        NOT OLD_TARGET   STREQUAL BUILD_TARGET
+    )
+        configure_file(${TEMPLATE_FILE} ${OUTPUT_FILE})
+    endif()
+else()
+    configure_file(${TEMPLATE_FILE} ${OUTPUT_FILE})
+endif()
