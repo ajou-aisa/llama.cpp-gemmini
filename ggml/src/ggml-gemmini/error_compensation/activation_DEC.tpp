@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <include/gemmini.h>
+#include <gemmini.h>
 #include "../ggml-gemmini-util.h"
 
 namespace aisa

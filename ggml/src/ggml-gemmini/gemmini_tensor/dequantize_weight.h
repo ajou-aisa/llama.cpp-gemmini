@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <type_traits>
 
-#include "include/gemmini.h"
+#include "gemmini.h"
 #include "../../ggml-common.h"
 #include "ggml.h"
 

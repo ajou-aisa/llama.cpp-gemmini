@@ -1,5 +1,5 @@
 #include "../ggml-gemmini/labeling/label.h"
-#include "/home/alveo/firesim/target-design/chipyard/generators/gemmini/software/gemmini-rocc-tests/include/cyclereader.h" // 절대경로
+#include "cyclereader.h"
 
 #ifndef CYCLE_LOG
 #define CYCLE_LOG 1

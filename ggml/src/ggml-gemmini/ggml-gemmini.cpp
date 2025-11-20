@@ -8,7 +8,7 @@
 #include <string>
 
 #include "ggml-gemmini-util.h"
-#include "include/gemmini.h"
+#include "gemmini.h"
 #include "ggml-gemmini-cycle.h"
 #include "labeling/label.h"
 #include "error_compensation/activation_DEC.h"

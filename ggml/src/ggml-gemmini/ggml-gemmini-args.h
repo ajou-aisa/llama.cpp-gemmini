@@ -37,7 +37,7 @@
 #undef GGML_COMMON_DECL_CPP
 #undef GGML_GEMMINI_ARGS_DEFINE_GGML_COMMON
 #endif
-#include "include/gemmini_params.h"
+#include "gemmini_params.h"
 #include "ggml-gemmini-util.h"
 
 // Forward declaration to avoid including full gemmini.h (breaks include cycles)
