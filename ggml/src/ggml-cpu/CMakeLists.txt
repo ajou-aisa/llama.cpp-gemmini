@@ -51,10 +51,14 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         )
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
-    # L55-L58: added by zerogod
+    # L55-L63: added by zerogod
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu
         ${CMAKE_CURRENT_SOURCE_DIR}/../ggml-gemmini
-        ${GEMMINI_SW_PATH})
+        ${GEMMINI_SW_PATH}
+        ${GEMMINI_SW_PATH}/include
+        ${GEMMINI_SW_PATH}/gemmini-rocc-tests
+        ${GEMMINI_SW_PATH}/gemmini-rocc-tests/include
+        ${GEMMINI_SW_PATH}/rocc-software/src)
     target_compile_definitions(${GGML_CPU_NAME} PRIVATE CYCLE_LOG=$<IF:$<BOOL:${GGML_CPU_CYCLE_LOG}>,1,0>)
 
     if (APPLE AND GGML_ACCELERATE)

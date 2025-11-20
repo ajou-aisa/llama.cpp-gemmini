@@ -17,4 +17,10 @@ if (NOT EXISTS "${GEMMINI_SW_PATH}/gemmini.h")
     set(GEMMINI_SW_PATH "${LLAMA_ROOT}/../RISC-V-DynDNN-gemmini-include")
 endif()
 
-target_include_directories(${TARGET} PRIVATE ${GEMMINI_SW_PATH} ${CMAKE_CURRENT_SOURCE_DIR}/../../ggml/src/ggml-gemmini)
+target_include_directories(${TARGET} PRIVATE
+    ${GEMMINI_SW_PATH}
+    ${GEMMINI_SW_PATH}/include
+    ${GEMMINI_SW_PATH}/gemmini-rocc-tests
+    ${GEMMINI_SW_PATH}/gemmini-rocc-tests/include
+    ${GEMMINI_SW_PATH}/rocc-software/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../ggml/src/ggml-gemmini)

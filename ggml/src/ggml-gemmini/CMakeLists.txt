@@ -96,14 +96,13 @@ target_compile_definitions(ggml-gemmini PRIVATE
 
 target_include_directories(ggml-gemmini PRIVATE
   ${CMAKE_CURRENT_LIST_DIR}
-)
-target_include_directories(ggml-gemmini PRIVATE
+  ${RISCV_TOOL_PATH}/sysroot/include
   ${GEMMINI_SW_PATH}
+  ${GEMMINI_SW_PATH}/include
   ${GEMMINI_SW_PATH}/gemmini-rocc-tests
+  ${GEMMINI_SW_PATH}/gemmini-rocc-tests/include
+  ${GEMMINI_SW_PATH}/rocc-software/src
 )
-if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv" AND EXISTS "${RISCV_TOOL_PATH}/sysroot/include")
-  target_include_directories(ggml-gemmini PRIVATE ${RISCV_TOOL_PATH}/sysroot/include)
-endif()
 
 target_link_libraries(ggml-gemmini PRIVATE
   # ${RISCV_TOOL_PATH}/sysroot/lib/libm.so
