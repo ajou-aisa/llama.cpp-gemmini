@@ -12,4 +12,4 @@ cmake -B "$BUILD_DIR" -S . \
   -DLLAMA_CURL="${LLAMA_CURL_DEFAULT}" \
   "$@"
 
-cmake --build "$BUILD_DIR" --target llama-cli -j"$(nproc)"
+cmake --build "$BUILD_DIR" --target llama-cli llama-perplexity -j"$(nproc)"
