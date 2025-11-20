@@ -4,3 +4,6 @@ build-*/
 
 # Generated sources
 common/build-info.cpp
+
+# Large model artifacts
+models/*.gguf
