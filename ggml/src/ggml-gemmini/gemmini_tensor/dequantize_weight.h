@@ -5,13 +5,12 @@
 #include <type_traits>
 
 #include "include/gemmini.h"
+#include "../../ggml-common.h"
 #include "ggml.h"
-#include "ggml-quants.h"
 
 #ifndef QK8_0
 #define QK8_0 32
 #endif
-
 
 namespace aisa
 {
@@ -178,14 +177,14 @@ namespace aisa
                     for (int64_t c = 0; c < rows; ++c)
                     {
 
-                        if ( c < 5 && ( iy < 5 || iy > ny - 5 )) 
-                            DBG0("C=%d", c);
+                        // if (iy == 824)
+                        // DBG0("C=%d", c);
                         const int64_t blk = c / QK8_0;
                         const int off = static_cast<int>(c % QK8_0);
                         float changer = ggml_fp16_to_fp32(src_row_blocks[blk].d);
 
                         auto deq = src_row_blocks[blk].qs[off]*changer;
-                        if(c && ( iy < 5 || iy > ny - 5 ));
+                        if(c < 5);
                             DBG("int = %d, float = %.6f, ans = %.6f\n", src_row_blocks[blk].qs[off], changer, deq);
                         dst_row[c] = ggml_fp32_to_fp16(deq);
                         // DBG("checking Is copy sucess");
@@ -197,13 +196,4 @@ namespace aisa
         }
         GGML_ASSERT(dst_row_idx == cols);
     }
-inline void dequantizingWithGgml(const ggml_tensor * src){                                                                 
-    const int64_t k = ggml_nelements(src); // 총 element 수                                                                   
-    const block_q8_0 * dataByBlocks = (const block_q8_0 *) src->data;                                                         
-                                                                                                                               
-    float * dst = (float *)malloc(sizeof(float) * k);                                                                         
-                                                                                                                               
-    dequantize_row_q8_0(dataByBlocks, dst, k);                                                                                
-    free(dst);                                                                                                                
-    }                                                                                                                           
-}            
+}
