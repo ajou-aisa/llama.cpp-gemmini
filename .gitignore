@@ -1,0 +1,6 @@
+# Build artifacts
+build/*
+build-*/
+
+# Generated sources
+common/build-info.cpp
