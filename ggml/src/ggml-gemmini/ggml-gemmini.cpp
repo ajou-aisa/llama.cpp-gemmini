@@ -13,6 +13,7 @@
 #include "labeling/label.h"
 #include "error_compensation/activation_DEC.h"
 #include "ggml-gemmini-args.h"
+#include "quantization/ggml-gemmini-quantize.h"
 
 #ifndef TRANSPOSE_B
 #define TRANSPOSE_B 1
@@ -34,6 +35,9 @@
 #endif
 #ifndef GEMMINI_GOLDEN_MM
 #define GEMMINI_GOLDEN_MM 0
+#endif
+#ifndef OPTION
+#define OPTION CPU
 #endif
 
 using namespace aisa;
