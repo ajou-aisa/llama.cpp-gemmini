@@ -38,6 +38,7 @@ set(GEMMINI_RISCV_FLAGS
 
 ggml_add_backend_library(ggml-gemmini
                          ggml-gemmini.cpp
+                         quantization/ggml-gemmini-quantize.cpp
                          test/ggml-gemmini-test.cpp
                         )
 

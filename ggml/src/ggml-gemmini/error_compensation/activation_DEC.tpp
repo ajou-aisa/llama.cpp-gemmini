@@ -76,18 +76,33 @@ namespace aisa
         end = read_cycles();
         PRINT_CYCLE(layer_, "DEC: Initialize dimensions and buffers", start, end, end - start);
 
-        // ========== 2단계: 모든 행에 대해 Top-K 선택 및 잔차 계산 ==========
-        const float *x = static_cast<const float *>(A_->data); // 원본 활성화
-
-        start = read_cycles();
-        for (size_t r = 0; r < I_; ++r)
+        // ========== 2단계: DEC 입력 선택 및 잔차 계산 ==========
+#if ACTIVATION_TENSOR_SCALE
+        if (!activation_block_scaled_)
         {
-            const float *x_r = x + r * K_;
-            const int8_t *qx_r = qx_ + r * sA_;
-            selectTopKandComputeResidual(r, x_r, qx_r);
+            const float *x = static_cast<const float *>(A_->data); // 원본 활성화
+            start = read_cycles();
+            for (size_t r = 0; r < I_; ++r)
+            {
+                const float *x_r = x + r * K_;
+                const int8_t *qx_r = qx_ + r * sA_;
+                selectTopKandComputeResidual(r, x_r, qx_r);
+            }
+            end = read_cycles();
+            PRINT_CYCLE(layer_, "DEC: Select top-K and stage R_k for all rows", start, end, end - start);
         }
-        end = read_cycles();
-        PRINT_CYCLE(layer_, "DEC: Select top-K and stage R_k for all rows", start, end, end - start);
+#endif
+
+#if ACTIVATION_BLOCK_SCALE
+        if (activation_block_scaled_)
+        {
+            start = read_cycles();
+            // block-wise quantization에서 발생한 saturation(outlier)에 대한 residual 추가
+            selectSalientandComputeResidual();
+            end = read_cycles();
+            PRINT_CYCLE(layer_, "DEC: Select salient (block) and stage R_k for all rows", start, end, end - start);
+        }
+#endif
 
         // ========== 3단계: R_k CSC 구조 구축 ==========
         buildRk();
@@ -161,6 +176,56 @@ namespace aisa
             // 각 채널 k의 출현 횟수 카운트 (나중에 prefix-sum으로 오프셋 변환)
             rk_offs_[k + 1]++;
         }
+    }
+
+    void ActivationDEC::selectSalientandComputeResidual()
+    {
+        if (args_ == nullptr || args_->activation_outliers.empty())
+        {
+            return;
+        }
+
+        for (const auto &outlier : args_->activation_outliers)
+        {
+            const int k = outlier.col;
+            const int r_idx = outlier.row;
+            if (k < 0 || r_idx < 0)
+            {
+                continue;
+            }
+
+            const size_t r = static_cast<size_t>(r_idx);
+            if (r >= I_ || static_cast<size_t>(k) >= K_)
+            {
+                continue; // skip invalid indices
+            }
+
+            auto &row_idx = S_[r];
+            auto &row_delta = delta_[r];
+            const float residual = outlier.original - outlier.saturated;
+
+            row_idx.push_back(k);
+            row_delta.push_back(residual);
+            rk_stage_.push_back({k, static_cast<int>(r), residual});
+            rk_offs_[static_cast<size_t>(k) + 1]++;
+        }
+
+        size_t total_selected = 0;
+        size_t rows_over_alpha = 0;
+        size_t max_row_selected = 0;
+        for (const auto &row_idx : S_)
+        {
+            const size_t cnt = row_idx.size();
+            total_selected += cnt;
+            max_row_selected = std::max(max_row_selected, cnt);
+            if (cnt > alpha_)
+            {
+                ++rows_over_alpha;
+            }
+        }
+
+        DBG_SIMPLE("[layer=%s][dec.salient] rows=%zu selected=%zu max_row=%zu alpha=%zu rows>alpha=%zu",
+                   layer_, I_, total_selected, max_row_selected, alpha_, rows_over_alpha);
     }
 
     /**
