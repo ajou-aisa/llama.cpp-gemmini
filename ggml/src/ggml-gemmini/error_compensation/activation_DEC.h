@@ -104,6 +104,7 @@ namespace aisa
         void selectTopKandComputeResidual(size_t row_idx,
                                           const float *row_fp,
                                           const int8_t *row_q);
+        void selectSalientandComputeResidual();
         void buildRk();
         void computeCompensation_unrolled(float *Y_com);
         void applyCompensation(float *out,

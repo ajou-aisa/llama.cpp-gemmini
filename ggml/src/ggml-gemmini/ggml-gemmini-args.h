@@ -10,6 +10,14 @@
 #include <vector>
 #include <limits>
 
+struct ggml_gemmini_qact_outlier
+{
+    int row = 0;       // activation row index (i)
+    int col = 0;       // activation channel index (k)
+    float original = 0.f;
+    float saturated = 0.f;
+};
+
 #ifndef QACT_USE_PERCENTILE
 #define QACT_USE_PERCENTILE 1
 #endif
@@ -88,6 +96,7 @@ typedef struct ggml_gemmini_args_t {
 
     // activation quantization metadata
     bool activation_block_scaled = false;
+    std::vector<ggml_gemmini_qact_outlier> activation_outliers; // per-activation saturation records
 
     //for weight checking   
     uint8_t weightA = 0;

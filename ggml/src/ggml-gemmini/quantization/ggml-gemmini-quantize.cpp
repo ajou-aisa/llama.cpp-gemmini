@@ -295,15 +295,13 @@ namespace
             return false;
         }
 
+        args.activation_outliers.clear();
+
         BlockBuffers &buffers = block_buffers();
         const size_t block_cnt = view.total / QK8_0;
         // Quantize contiguous activations to Q8_0 blocks.
         buffers.blocks.resize(block_cnt);
         quantize_row_q8_0_ref(buffers.input_linear.data(), buffers.blocks.data(), static_cast<int64_t>(view.total));
-
-        // Dequantize back to float to measure reconstruction error and saturation versus original input.
-        buffers.dequantized.resize(view.total);
-        dequantize_row_q8_0(buffers.blocks.data(), buffers.dequantized.data(), static_cast<int64_t>(view.total));
 
         // Extract per-block scales (fp16 d -> fp32).
         buffers.block_scales.resize(block_cnt);
@@ -312,47 +310,59 @@ namespace
             buffers.block_scales[blk] = ggml_fp16_to_fp32(buffers.blocks[blk].d); // d holds fp16 scale
         }
 
-        // Track block-wise min/max from dequantized values to detect saturation when comparing to the original.
-        std::vector<float> block_min(block_cnt, std::numeric_limits<float>::infinity());
-        std::vector<float> block_max(block_cnt, -std::numeric_limits<float>::infinity());
-        for (size_t idx = 0; idx < view.total; ++idx)
-        {
-            const size_t blk = idx / QK8_0;
-            const float dq = buffers.dequantized[idx];
-            block_min[blk] = std::min(block_min[blk], dq);
-            block_max[blk] = std::max(block_max[blk], dq);
-        }
-
-        // Compute saturation counters and error metrics against the original float input.
         bqs = {};
-        for (size_t idx = 0; idx < view.total; ++idx)
-        {
-            const size_t blk = idx / QK8_0;
-            const float orig = buffers.input_linear[idx];
-            const float dq = buffers.dequantized[idx];
-            if (orig > block_max[blk])
-            {
-                ++bqs.sat_pos; // original exceeds max representable in this block
-            }
-            else if (orig < block_min[blk])
-            {
-                ++bqs.sat_neg; // original below min representable in this block
-            }
-
-            const float err = dq - orig;                                                     // reconstruction error
-            const float aerr = std::fabs(err);                                               // |error|
-            bqs.err_abs_sum += aerr;                                                         // accumulate |error|
-            bqs.err_sq_sum += static_cast<long double>(err) * static_cast<long double>(err); // accumulate error^2
-            bqs.x_sq_sum += static_cast<long double>(orig) * static_cast<long double>(orig); // accumulate x^2 (for SNR)
-            bqs.max_abs_err = std::max(bqs.max_abs_err, aerr);                               // track max |error|
-        }
-
+#if DEBUG_QACT
         double q80_scale_sum = 0.0; // sum of per-block scales to compute average
         for (const float s : buffers.block_scales)
         {
             q80_scale_sum += static_cast<double>(s);
         }
         bqs.avg_scale = block_cnt ? (q80_scale_sum / static_cast<double>(block_cnt)) : 0.0; // average scale for logging
+#endif
+
+        // Detect saturation and (optionally) collect debug stats against the original float input.
+        for (size_t idx = 0; idx < view.total; ++idx)
+        {
+            const size_t blk = idx / QK8_0;
+            const size_t off = idx % QK8_0;
+            const float block_scale = buffers.block_scales[blk];
+            const float sat_hi = block_scale * 127.0f;
+            const float sat_lo = -sat_hi;
+
+            const float orig = buffers.input_linear[idx];
+            const bool sat_pos = orig > sat_hi;
+            const bool sat_neg = orig < sat_lo;
+
+            if (sat_pos || sat_neg)
+            {
+                const float sat_val = sat_pos ? sat_hi : sat_lo;
+                args.activation_outliers.push_back({static_cast<int>(idx / view.K),
+                                                    static_cast<int>(idx % view.K),
+                                                    orig,
+                                                    sat_val});
+#if DEBUG_QACT
+                if (sat_pos)
+                {
+                    ++bqs.sat_pos; // original exceeds max representable in this block
+                }
+                else
+                {
+                    ++bqs.sat_neg; // original below min representable in this block
+                }
+#endif
+            }
+
+#if DEBUG_QACT
+            const int8_t q = buffers.blocks[blk].qs[off];
+            const float dq = static_cast<float>(q) * block_scale;
+            const float err = dq - orig;                                                     // reconstruction error
+            const float aerr = std::fabs(err);                                               // |error|
+            bqs.err_abs_sum += aerr;                                                         // accumulate |error|
+            bqs.err_sq_sum += static_cast<long double>(err) * static_cast<long double>(err); // accumulate error^2
+            bqs.x_sq_sum += static_cast<long double>(orig) * static_cast<long double>(orig); // accumulate x^2 (for SNR)
+            bqs.max_abs_err = std::max(bqs.max_abs_err, aerr);                               // track max |error|
+#endif
+        }
 
         // Wire per-block buffers into args so downstream Gemmini kernel and DEC can reuse them.
         args.A_blocks = buffers.blocks.data();
@@ -382,8 +392,18 @@ namespace
             }
         }
 
+        if (!used_block_scale)
+        {
+            args.activation_outliers.clear(); // discard outlier info when block path is not used
+        }
+
+        // Log only when debugging reference reconstruction.
+#if DEBUG_QACT
         const double sat_ratio = (static_cast<double>(bqs.sat_pos + bqs.sat_neg) * 100.0) / static_cast<double>(ctx.total);
         log_block_quant(ctx, bqs, sat_ratio);
+#else
+        (void)ctx;
+#endif
         return used_block_scale;
     }
 #endif // ACTIVATION_BLOCK_SCALE
@@ -440,6 +460,7 @@ void ggml_gemmini_quantize_activation(const ggml_tensor *src,
                                       int8_t *dst)
 {
     args.activation_block_scaled = false; // default: assume tensor scale unless block path succeeds
+    args.activation_outliers.clear();     // clear stale saturation records from prior invocations
 
     if (src == nullptr || dst == nullptr)
     {
