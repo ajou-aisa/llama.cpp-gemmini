@@ -6,6 +6,7 @@
 #include <cctype>
 #include <vector>
 #include <string>
+#include <utility>
 
 #include "ggml-gemmini-util.h"
 #include "include/gemmini.h"
@@ -278,35 +279,80 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     end = read_cycles();
     PRINT_CYCLE(layer, "Quantize activation", start, end, end - start);
     
-    // breackdown weight to int8_t & scale
+    // breackdown weight to int8_t & scale (cache per weight tensor)
     start = read_cycles();
+    const int64_t dim_k = src0->ne[0];
     const int64_t dim_j = src0->ne[1] ? src0->ne[1] : 1;
     const int64_t dim_z = src0->ne[2] ? src0->ne[2] : 1;
     const int64_t dim_w = src0->ne[3] ? src0->ne[3] : 1;
 
-    GGML_ASSERT(K % QK8_0 == 0);
-    const size_t blocks_K = static_cast<size_t>(K) / QK8_0;
+    GGML_ASSERT(dim_k % QK8_0 == 0);
+    const size_t blocks_K = static_cast<size_t>(dim_k) / QK8_0;
     const size_t logical_cols = static_cast<size_t>(dim_j * dim_z * dim_w);
-
-    static thread_local std::vector<int8_t> weight_q;
-    static thread_local std::vector<float> weight_scales;
-
-    const size_t q_size = static_cast<size_t>(K) * logical_cols;
-    if (weight_q.size() != q_size) 
-        weight_q.resize(q_size);
-    
-    const size_t scale_size = blocks_K * logical_cols;
-    if (weight_scales.size() != scale_size) 
-        weight_scales.resize(scale_size);
-
-    int8_t *qw = weight_q.data();
-    float *block_scale_w = weight_scales.data();
 
     args.sB = logical_cols;
 
-    ggml_gemmini_pack_q80(src0, /*transpose=*/true, reinterpret_cast<elem_t *>(qw), args.sB, block_scale_w, args);
+    const block_q8_0 *block_base = ggml_gemmini_args_block_base(src0);
+    ggml_gemmini_args_t::unpacked_weight *cached = nullptr;
 
-    args.B = reinterpret_cast<elem_t *>(qw);
+    auto it = ctx->weight_cache.find(src0);
+    if (it != ctx->weight_cache.end() &&
+        it->second.matches(block_base,
+                           dim_k,
+                           dim_j,
+                           dim_z,
+                           dim_w,
+                           args.sB,
+                           blocks_K,
+                           logical_cols)) {
+        cached = &it->second;
+    } else {
+        ggml_gemmini_args_t::unpacked_weight entry;
+        entry.blocks = block_base;
+        entry.dim_k = dim_k;
+        entry.dim_j = dim_j;
+        entry.dim_z = dim_z;
+        entry.dim_w = dim_w;
+        entry.logical_cols = logical_cols;
+        entry.blocks_K = blocks_K;
+        entry.blocks_J = logical_cols;
+        entry.blocks_I = static_cast<size_t>(dim_k);
+        entry.block_size_k = QK8_0;
+        entry.stride = args.sB;
+
+        const size_t q_size = static_cast<size_t>(dim_k) * logical_cols;
+        const size_t scale_size = blocks_K * logical_cols;
+        entry.q.resize(q_size);
+        entry.scales.resize(scale_size);
+
+        ggml_gemmini_pack_q80(src0,
+                              /*transpose=*/true,
+                              reinterpret_cast<elem_t *>(entry.q.data()),
+                              entry.stride,
+                              entry.scales.data(),
+                              args);
+
+        entry.blocks = args.B_blocks;
+        entry.blocks_K = args.blocks_K;
+        entry.blocks_J = args.blocks_J;
+        entry.blocks_I = args.blocks_I;
+        entry.block_size_k = args.block_size_k;
+
+        if (it == ctx->weight_cache.end()) {
+            it = ctx->weight_cache.emplace(src0, std::move(entry)).first;
+        } else {
+            it->second = std::move(entry);
+        }
+        cached = &it->second;
+    }
+
+    args.B = reinterpret_cast<elem_t *>(cached->q.data());
+    args.B_blocks = cached->blocks;
+    args.B_scales = cached->scales.data();
+    args.blocks_K = cached->blocks_K;
+    args.blocks_J = cached->blocks_J;
+    args.blocks_I = cached->blocks_I;
+    args.block_size_k = cached->block_size_k;
 
     end = read_cycles();
     PRINT_CYCLE(layer, "Breakdown Q8_0", start, end, end - start);
@@ -334,6 +380,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     // Compare the packed (qs, d) representation against the original Q8_0 blocks.
     GGML_ASSERT(args.B_scales != nullptr);
     GGML_ASSERT(args.blocks_J >= static_cast<size_t>(J));
+    const int8_t *qw = reinterpret_cast<const int8_t *>(args.B);
 
     const auto get_w_ref = [&](size_t k, size_t j) -> float
     {

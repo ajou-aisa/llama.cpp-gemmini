@@ -1,4 +1,5 @@
 #include "ggml-gemmini-quantize.h"
+#include "../ggml-gemmini-util.h"
 
 // Activation quantization for Gemmini split by concern:
 //  - Build a flat view over the source tensor (respects ggml views and strides).

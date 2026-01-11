@@ -46,7 +46,6 @@ struct ggml_gemmini_qact_outlier
 #undef GGML_GEMMINI_ARGS_DEFINE_GGML_COMMON
 #endif
 #include "include/gemmini_params.h"
-#include "ggml-gemmini-util.h"
 
 // Forward declaration to avoid including full gemmini.h (breaks include cycles)
 enum tiled_matmul_type_t : int;
@@ -103,6 +102,56 @@ typedef struct ggml_gemmini_args_t {
     tiled_matmul_type_t tiled_matmul_type = static_cast<tiled_matmul_type_t>(0);
 
     // metadata extracted from Q8_0 tensors
+    struct unpacked_weight {
+        std::vector<int8_t> q;
+        std::vector<float> scales;
+        const block_q8_0 *blocks = nullptr;
+
+        int64_t dim_k = 0;
+        int64_t dim_j = 0;
+        int64_t dim_z = 0;
+        int64_t dim_w = 0;
+
+        size_t logical_cols = 0;
+        size_t blocks_K = 0;
+        size_t blocks_J = 0;
+        size_t blocks_I = 0;
+        uint32_t block_size_k = QK8_0;
+        size_t stride = 0;
+
+        bool matches(const block_q8_0 *base,
+                int64_t k,
+                int64_t j,
+                int64_t z,
+                int64_t w,
+                size_t stride_elems,
+                size_t blocks_k,
+                size_t logical_cols_) const {
+            if (blocks != base) {
+                return false;
+            }
+            if (dim_k != k || dim_j != j || dim_z != z || dim_w != w) {
+                return false;
+            }
+            if (stride != stride_elems) {
+                return false;
+            }
+            if (blocks_K != blocks_k || blocks_J != logical_cols_) {
+                return false;
+            }
+            if (block_size_k != QK8_0 || logical_cols != logical_cols_) {
+                return false;
+            }
+            if (q.size() != static_cast<size_t>(k) * logical_cols_) {
+                return false;
+            }
+            if (scales.size() != blocks_k * logical_cols_) {
+                return false;
+            }
+            return true;
+        }
+    };
+
     const block_q8_0 *B_blocks = nullptr;
     const float *B_scales = nullptr;
 

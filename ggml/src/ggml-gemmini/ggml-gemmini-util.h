@@ -8,6 +8,7 @@
 #include "ggml-impl.h"
 #include "ggml-gemmini.h"
 #include "ggml-backend-impl.h"
+#include "ggml-gemmini-args.h"
 
 #include <future>
 #include <vector>
@@ -58,6 +59,8 @@ struct ggml_backend_gemmini_context
 #ifndef GGML_USE_OPENMP
     std::vector<std::future<void>> tasks;
 #endif
+    std::map<const ggml_tensor *, ggml_gemmini_args_t::unpacked_weight> weight_cache; // packed Q8_0 per weight tensor
+    
 };
 
 // #include "gemmini_tensor/gemmini_tensor_interface.h"
