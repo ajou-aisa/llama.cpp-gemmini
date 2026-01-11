@@ -306,7 +306,19 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                            blocks_K,
                            logical_cols)) {
         cached = &it->second;
+        DBG_SIMPLE("[Breakdowned weight cache] hit layer=%s ptr=%p K=%lld cols=%zu sB=%zu blocks_K=%zu",
+                   layer, (const void *)src0, static_cast<long long>(dim_k),
+                   logical_cols, args.sB, blocks_K);
     } else {
+        if (it == ctx->weight_cache.end()) {
+            DBG_SIMPLE("[Breakdowned weight cache] miss layer=%s ptr=%p K=%lld cols=%zu sB=%zu blocks_K=%zu",
+                       layer, (const void *)src0, static_cast<long long>(dim_k),
+                       logical_cols, args.sB, blocks_K);
+        } else {
+            DBG_SIMPLE("[Breakdowned weight cache] refresh layer=%s ptr=%p K=%lld cols=%zu sB=%zu blocks_K=%zu",
+                       layer, (const void *)src0, static_cast<long long>(dim_k),
+                       logical_cols, args.sB, blocks_K);
+        }
         ggml_gemmini_args_t::unpacked_weight entry;
         entry.blocks = block_base;
         entry.dim_k = dim_k;
@@ -353,6 +365,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.blocks_J = cached->blocks_J;
     args.blocks_I = cached->blocks_I;
     args.block_size_k = cached->block_size_k;
+    DBG_SIMPLE("[Gemmini addr] layer=%s A=%p B=%p B_blocks=%p B_scales=%p",
+               layer, (void *)args.A, (void *)args.B, (const void *)args.B_blocks, (const void *)args.B_scales);
 
     end = read_cycles();
     PRINT_CYCLE(layer, "Breakdown Q8_0", start, end, end - start);
@@ -456,6 +470,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
            layer, args.A, args.B, args.C, args.D,
            args.I, args.J, args.K, args.sA, args.sB, args.sC,
            args.stride_f_out, args.col_stride_f_out, dst->nb[1], dst->nb[0]);
+    DBG_SIMPLE("[Gemmini addr] layer=%s f_out=%p stride_f_out=%zu col_stride_f_out=%zu",
+               layer, (void *)args.f_out, args.stride_f_out, args.col_stride_f_out);
 
 
 
