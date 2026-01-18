@@ -154,9 +154,41 @@ if (LLAMA_USE_SYSTEM_GGML)
     add_library(ggml ALIAS ggml::ggml)
 endif()
 
+# ---- Research (AISA) integration ----
+option(LLAMA_WITH_ORCA "Build and link ORCA (research) library" ON)
+
+if (LLAMA_WITH_ORCA)
+    # llama.cpp-gemmini 와 orca(연구)가 모두 workspace/ 디렉터리라는 가정
+    get_filename_component(ORCA_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../orca" ABSOLUTE)
+
+    if (EXISTS "${ORCA_SRC_DIR}/CMakeLists.txt")
+        # 외부 소스 디렉터리를 add_subdirectory 할 때는 build dir를 반드시 따로 준다
+        add_subdirectory("${ORCA_SRC_DIR}" "${CMAKE_BINARY_DIR}/orca-build")
+    else()
+        message(FATAL_ERROR "ORCA repo not found: ${ORCA_SRC_DIR}")
+    endif()
+endif()
+
+# ---- ggml build (must come AFTER orca) ----
 if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     add_subdirectory(ggml)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
+endif()
+
+# ---- Link ORCA to ggml targets that include <orca/...> ----
+if (LLAMA_WITH_ORCA)
+    if (TARGET ggml-cpu AND TARGET orca)
+        target_link_libraries(ggml-cpu PRIVATE orca)
+
+        # C 타겟이지만 C++ 라이브러리를 링크하므로 링크 단계는 C++로
+        set_target_properties(ggml-cpu PROPERTIES LINKER_LANGUAGE CXX)
+    endif()
+
+    # gemmini도 orca를 쓰면 동일하게
+    if (TARGET ggml-gemmini AND TARGET orca)
+        target_link_libraries(ggml-gemmini PRIVATE orca)
+        # ggml-gemmini는 C++이므로 LINKER_LANGUAGE는 보통 불필요
+    endif()
 endif()
 
 #

@@ -110,3 +110,10 @@ target_include_directories(ggml-gemmini PRIVATE
 target_link_libraries(ggml-gemmini PRIVATE
   # ${RISCV_TOOL_PATH}/sysroot/lib/libm.so
 )
+
+if (TARGET orca)
+  target_link_libraries(ggml-gemmini PRIVATE orca)
+  target_compile_definitions(ggml-gemmini PRIVATE GGML_GEMMINI_WITH_ORCA=1)
+else()
+  message(STATUS "orca not found; building ggml-gemmini without orca")
+endif()
