@@ -4,3 +4,6 @@ build-*/
 
 # Generated sources
 common/build-info.cpp
+
+# cycle log
+log/
