@@ -6,6 +6,7 @@
 #endif
 
 #include "../ggml-gemmini/ggml-gemmini-cycle.h"
+#include <orca/layer.h>
 #include <orca/log.h>
 
 #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
@@ -1822,15 +1823,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 uint64_t t0 = read_cycles();
                 ggml_compute_forward_norm(params, tensor);
                 uint64_t t1 = read_cycles();
-                orca_log_cycle(labelFromCpuOp("norm", tensor->name), "norm", t0, t1);
-                // PRINT_CYCLE(labelFromCpuOp("norm", tensor->name), "norm", t0, t1, t1 - t0);
+                orca_log_cycle_to(orca_log_file("test-log.jsonl"), tensor->name, "norm", t0, t1);
             } break;
         case GGML_OP_RMS_NORM:
             {
                 uint64_t t0 = read_cycles();
                 ggml_compute_forward_rms_norm(params, tensor);
                 uint64_t t1 = read_cycles();
-                PRINT_CYCLE(labelFromCpuOp("rms_norm", tensor->name), "norm", t0, t1, t1 - t0);
+                orca_log_cycle_to(orca_log_file("test-log.jsonl"), tensor->name, "norm", t0, t1);
             } break;
         case GGML_OP_RMS_NORM_BACK:
             {
