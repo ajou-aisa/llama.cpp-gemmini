@@ -1,9 +1,9 @@
 // error_compensation_activation_DEC.h
 #pragma once
-#include "../labeling/label.h"
-#include "../ggml-gemmini-args.h"
-#include "../ggml-gemmini-cycle.h"
+#include <orca/layer.h>
+#include <orca/log.hpp>
 
+#include "../ggml-gemmini-args.h"
 #include "ggml.h"
 #include <algorithm>
 #include <vector>

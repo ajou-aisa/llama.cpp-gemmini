@@ -1,6 +1,5 @@
 #include "ggml-gemmini-quantize.h"
-#include "../ggml-gemmini-util.h"
-
+#include <orca/log.hpp>
 // Activation quantization for Gemmini split by concern:
 //  - Build a flat view over the source tensor (respects ggml views and strides).
 //  - Gather per-element stats (min/max/mean/std/near-zero) plus optional percentile samples for scale selection.
@@ -242,20 +241,20 @@ namespace
     static void log_block_quant(const QuantLogContext &ctx, const BlockQuantStats &bqs, double sat_ratio)
     {
         // Mirrors legacy logging format for block-scaled activations.
-        DBG_SIMPLE("[layer=%s][q80.qact] N=%zu scale_A=%.6g sat=%.3f%% min=%g max=%g mean=%.6g std=%.6g mae=%.6g rmse=%.6g max|err|=%.6g snr=%.2f dB near0=%.2f%%",
-                   ctx.layer_name, ctx.total, bqs.avg_scale, sat_ratio, ctx.min_val, ctx.max_val, ctx.mean, ctx.stddev,
-                   static_cast<double>(bqs.err_abs_sum) / static_cast<double>(ctx.total),
-                   std::sqrt(static_cast<double>(bqs.err_sq_sum) / static_cast<double>(ctx.total)),
-                   bqs.max_abs_err,
-                   (bqs.err_sq_sum > 0.0L && bqs.x_sq_sum > 0.0L)
-                       ? 10.0 * std::log10(static_cast<double>(bqs.x_sq_sum / bqs.err_sq_sum))
-                       : INFINITY,
-                   ctx.zero_ratio * 100.0);
+        // orca::log::debug(ctx.layer_name, "[q80.qact] N=%zu scale_A=%.6g sat=%.3f%% min=%g max=%g mean=%.6g std=%.6g mae=%.6g rmse=%.6g max|err|=%.6g snr=%.2f dB near0=%.2f%%",
+        //                  ctx.total, bqs.avg_scale, sat_ratio, ctx.min_val, ctx.max_val, ctx.mean, ctx.stddev,
+        //                  static_cast<double>(bqs.err_abs_sum) / static_cast<double>(ctx.total),
+        //                  std::sqrt(static_cast<double>(bqs.err_sq_sum) / static_cast<double>(ctx.total)),
+        //                  bqs.max_abs_err,
+        //                  (bqs.err_sq_sum > 0.0L && bqs.x_sq_sum > 0.0L)
+        //                      ? 10.0 * std::log10(static_cast<double>(bqs.x_sq_sum / bqs.err_sq_sum))
+        //                      : INFINITY,
+        //                  ctx.zero_ratio * 100.0);
 
         if (bqs.sat_pos || bqs.sat_neg)
         {
-            DBG_SIMPLE("[layer=%s][q80.qact.warn] saturation pos=%zu neg=%zu (%.4f%%)",
-                       ctx.layer_name, bqs.sat_pos, bqs.sat_neg, sat_ratio);
+            // orca::log::debug(ctx.layer_name, "[q80.qact.warn] saturation pos=%zu neg=%zu (%.4f%%)",
+            //                  bqs.sat_pos, bqs.sat_neg, sat_ratio);
         }
     }
 #endif // ACTIVATION_BLOCK_SCALE
@@ -271,13 +270,13 @@ namespace
                                   : INFINITY;
         const double sat_ratio = (static_cast<double>(tqs.sat_pos + tqs.sat_neg) * 100.0) / static_cast<double>(ctx.total);
 
-        DBG_SIMPLE("[layer=%s][qact] N=%zu scale_A=%.6g sat=%.3f%% min=%g max=%g mean=%.6g std=%.6g mae=%.6g rmse=%.6g max|err|=%.6g snr=%.2f dB near0=%.2f%%",
-                   ctx.layer_name, ctx.total, scale, sat_ratio, ctx.min_val, ctx.max_val, ctx.mean, ctx.stddev, mae, rmse, tqs.max_abs_err, snr_db, ctx.zero_ratio * 100.0);
+        orca::log::debug(ctx.layer_name, "[qact] N=%zu scale_A=%.6g sat=%.3f%% min=%g max=%g mean=%.6g std=%.6g mae=%.6g rmse=%.6g max|err|=%.6g snr=%.2f dB near0=%.2f%%",
+                         ctx.total, scale, sat_ratio, ctx.min_val, ctx.max_val, ctx.mean, ctx.stddev, mae, rmse, tqs.max_abs_err, snr_db, ctx.zero_ratio * 100.0);
 
         if (tqs.sat_pos || tqs.sat_neg)
         {
-            DBG_SIMPLE("[layer=%s][qact.warn] saturation pos=%zu neg=%zu (%.4f%%)",
-                       ctx.layer_name, tqs.sat_pos, tqs.sat_neg, sat_ratio);
+            // orca::log::debug(ctx.layer_name, "[qact.warn] saturation pos=%zu neg=%zu (%.4f%%)",
+            //                  tqs.sat_pos, tqs.sat_neg, sat_ratio);
         }
     }
 #endif // ACTIVATION_TENSOR_SCALE
@@ -292,7 +291,7 @@ namespace
         // Try block Q8_0 path; returns true if dst/args were populated with block data.
         if ((view.total % QK8_0) != 0)
         {
-            DBG_SIMPLE("[layer=%s][q80.qact] skipped (N=%zu not aligned to %d)", ctx.layer_name, view.total, QK8_0);
+            orca::log::debug(ctx.layer_name, "[q80.qact] skipped (N=%zu not aligned to %d)", view.total, QK8_0);
             return false;
         }
 

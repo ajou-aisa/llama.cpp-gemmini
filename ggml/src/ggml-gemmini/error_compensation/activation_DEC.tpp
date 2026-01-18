@@ -4,7 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <include/gemmini.h>
-#include "../ggml-gemmini-util.h"
+#include <orca/log.hpp>
 
 namespace aisa
 {
@@ -74,7 +74,7 @@ namespace aisa
         rk_stage_.reserve(I_ * std::min(alpha_, K_));
 
         end = read_cycles();
-        PRINT_CYCLE(layer_, "DEC: Initialize dimensions and buffers", start, end, end - start);
+        orca::log::cycle(layer_, "DEC: Initialize dimensions and buffers", start, end);
 
         // ========== 2단계: DEC 입력 선택 및 잔차 계산 ==========
 #if ACTIVATION_TENSOR_SCALE
@@ -89,7 +89,7 @@ namespace aisa
                 selectTopKandComputeResidual(r, x_r, qx_r);
             }
             end = read_cycles();
-            PRINT_CYCLE(layer_, "DEC: Select top-K and stage R_k for all rows", start, end, end - start);
+            orca::log::cycle(layer_, "DEC: Select top-K and stage R_k for all rows", start, end);
         }
 #endif
 
@@ -100,7 +100,7 @@ namespace aisa
             // block-wise quantization에서 발생한 saturation(outlier)에 대한 residual 추가
             selectSalientandComputeResidual();
             end = read_cycles();
-            PRINT_CYCLE(layer_, "DEC: Select salient (block) and stage R_k for all rows", start, end, end - start);
+            orca::log::cycle(layer_, "DEC: Select salient (block) and stage R_k for all rows", start, end);
         }
 #endif
 
@@ -224,8 +224,8 @@ namespace aisa
             }
         }
 
-        DBG_SIMPLE("[layer=%s][dec.salient] rows=%zu selected=%zu max_row=%zu alpha=%zu rows>alpha=%zu",
-                   layer_, I_, total_selected, max_row_selected, alpha_, rows_over_alpha);
+        // orca::log::debug(layer_, "[dec.salient] rows=%zu selected=%zu max_row=%zu alpha=%zu rows>alpha=%zu",
+        //                  I_, total_selected, max_row_selected, alpha_, rows_over_alpha);
     }
 
     /**
@@ -269,7 +269,7 @@ namespace aisa
         rk_stage_.shrink_to_fit();
 
         uint64_t end = read_cycles();
-        PRINT_CYCLE(layer_, "DEC: Build R_k CSC structure", start, end, end - start);
+        orca::log::cycle(layer_, "DEC: Build R_k CSC structure", start, end);
     }
 
     /**
@@ -335,7 +335,7 @@ namespace aisa
         }
 
         uint64_t end = read_cycles();
-        PRINT_CYCLE(layer_, "DEC: Compute and accumulate compensation", start, end, end - start);
+        orca::log::cycle(layer_, "DEC: Compute and accumulate compensation", start, end);
     }
 
     /**
@@ -368,7 +368,7 @@ namespace aisa
         }
 
         uint64_t end = read_cycles();
-        PRINT_CYCLE(layer_, "DEC: Apply compensation to output", start, end, end - start);
+        orca::log::cycle(layer_, "DEC: Apply compensation to output", start, end);
     }
 
     // int8 -> float (W의 k번째 행) + per-block scale 적용 (있으면)
