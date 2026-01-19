@@ -101,8 +101,15 @@ target_link_libraries(ggml-gemmini PRIVATE
   # ${RISCV_TOOL_PATH}/sysroot/lib/libm.so
 )
 
-if (TARGET orca)
-  target_link_libraries(ggml-gemmini PRIVATE orca)
+# orca 연동: ggml 의존이 없는 orca-ggml이 있으면 그것을 사용, 없으면 log/capi로 폴백.
+if (TARGET orca-ggml)
+  target_link_libraries(ggml-gemmini PRIVATE orca-ggml)
+  target_compile_definitions(ggml-gemmini PRIVATE GGML_GEMMINI_WITH_ORCA=1)
+elseif (TARGET orca-capi)
+  target_link_libraries(ggml-gemmini PRIVATE orca-capi)
+  target_compile_definitions(ggml-gemmini PRIVATE GGML_GEMMINI_WITH_ORCA=1)
+elseif (TARGET orca-log)
+  target_link_libraries(ggml-gemmini PRIVATE orca-log)
   target_compile_definitions(ggml-gemmini PRIVATE GGML_GEMMINI_WITH_ORCA=1)
 else()
   message(STATUS "orca not found; building ggml-gemmini without orca")

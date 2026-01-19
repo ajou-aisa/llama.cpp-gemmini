@@ -192,7 +192,8 @@ endif()
 # ---- Link ORCA to ggml targets that include <orca/...> ----
 if (LLAMA_WITH_ORCA)
     if (TARGET ggml-cpu AND TARGET orca)
-        target_link_libraries(ggml-cpu PRIVATE orca)
+        # ggml-cpu는 C API(log/layer)만 필요하므로 ggml 의존이 없는 orca-capi에 연결
+        target_link_libraries(ggml-cpu PUBLIC orca-capi)
 
         # C 타겟이지만 C++ 라이브러리를 링크하므로 링크 단계는 C++로
         set_target_properties(ggml-cpu PROPERTIES LINKER_LANGUAGE CXX)
@@ -200,7 +201,7 @@ if (LLAMA_WITH_ORCA)
 
     # gemmini도 orca를 쓰면 동일하게
     if (TARGET ggml-gemmini AND TARGET orca)
-        target_link_libraries(ggml-gemmini PRIVATE orca)
+        target_link_libraries(ggml-gemmini PUBLIC orca-capi)
         # ggml-gemmini는 C++이므로 LINKER_LANGUAGE는 보통 불필요
     endif()
 endif()
