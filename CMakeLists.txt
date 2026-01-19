@@ -173,6 +173,8 @@ endif()
 set(_ggml_orca_defs
     LOG_DEBUG=1
     LOG_CYCLE=1
+    ACTIVATION_BLOCK_SCALE=1
+    ACTIVATION_TENSOR_SCALE=0
 )
 
 # ---- ggml build (must come AFTER orca) ----
