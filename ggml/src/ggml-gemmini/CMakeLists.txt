@@ -101,8 +101,17 @@ target_link_libraries(ggml-gemmini PRIVATE
   # ${RISCV_TOOL_PATH}/sysroot/lib/libm.so
 )
 
-# orca 연동: ggml 의존이 없는 orca-ggml이 있으면 그것을 사용, 없으면 log/capi로 폴백.
-if (TARGET orca-ggml)
+# orca 연동:
+# - orca 서브프로젝트는 ggml을 먼저 add_subdirectory() 한 다음 orca-ggml을 정의한다.
+#   그 때문에 이 CMakeLists가 실행될 때는 orca-ggml 타깃이 아직 없어서, 기존 로직은
+#   orca-capi/orca-log로 폴백되어 quant(orca::ggml adapter)가 비활성화되는 문제가 있었다.
+# - 해결: ggml-gemmini는 "orca" INTERFACE 타깃(정의가 빠름)에 링크한다.
+#   이후 orca가 orca-ggml을 orca 인터페이스에 추가하면, 최종 generate 시점에
+#   ggml-gemmini에도 자동으로 반영된다.
+if (TARGET orca)
+  target_link_libraries(ggml-gemmini PRIVATE orca)
+  target_compile_definitions(ggml-gemmini PRIVATE GGML_GEMMINI_WITH_ORCA=1)
+elseif (TARGET orca-ggml)
   target_link_libraries(ggml-gemmini PRIVATE orca-ggml)
   target_compile_definitions(ggml-gemmini PRIVATE GGML_GEMMINI_WITH_ORCA=1)
 elseif (TARGET orca-capi)
