@@ -178,12 +178,14 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         entry.q.resize(q_size);
         entry.scales.resize(scale_size);
 
-        ggml_gemmini_pack_q80(src0,
-                              /*transpose=*/true,
-                              reinterpret_cast<elem_t *>(entry.q.data()),
-                              entry.stride,
-                              entry.scales.data(),
-                              args);
+        // Use orca::ggml wrapper instead of inline ggml_gemmini_pack_q80
+        orca::ggml::quants::ggml_gemmini_unpack_q80_weight(
+            src0,
+            args,
+            reinterpret_cast<int8_t *>(entry.q.data()),
+            entry.stride,
+            entry.scales.data()
+        );
 
         entry.blocks = args.B_blocks;
         entry.blocks_K = args.blocks_K;
@@ -210,7 +212,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     //                  layer, (void *)args.A, (void *)args.B, (const void *)args.B_blocks, (const void *)args.B_scales);
 
     end = read_cycles();
-    orca::log::cycle(layer, "Breakdown Q8_0", start, end);
+    orca::log::cycle(layer, "cpu.Breakdown Q8_0", start, end);
 
     GGML_ASSERT(args.transpose_B == false);
     GGML_ASSERT(args.sB == logical_cols);
