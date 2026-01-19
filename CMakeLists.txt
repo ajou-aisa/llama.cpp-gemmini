@@ -169,10 +169,24 @@ if (LLAMA_WITH_ORCA)
     endif()
 endif()
 
+# set log option
+set(_ggml_orca_defs
+    LOG_DEBUG=1
+    LOG_CYCLE=1
+)
+
 # ---- ggml build (must come AFTER orca) ----
 if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     add_subdirectory(ggml)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
+endif()
+
+# Apply the same logging macros to ORCA itself so its compiled code matches ggml consumers
+if (TARGET orca-log)
+    target_compile_definitions(orca-log PUBLIC ${_ggml_orca_defs})
+endif()
+if (TARGET orca-capi)
+    target_compile_definitions(orca-capi PRIVATE ${_ggml_orca_defs})
 endif()
 
 # ---- Link ORCA to ggml targets that include <orca/...> ----

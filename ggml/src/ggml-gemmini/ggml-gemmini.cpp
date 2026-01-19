@@ -37,9 +37,6 @@
 #ifndef ERROR_COMPENSATION
 #define ERROR_COMPENSATION 0
 #endif 
-#ifndef CYCLE_LOG
-#define CYCLE_LOG 1
-#endif
 #ifndef OPTION
 #define OPTION CPU
 #endif

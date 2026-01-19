@@ -51,7 +51,6 @@ endif()
 
 target_compile_definitions(ggml-gemmini PRIVATE
   # llama
-  CYCLE_LOG=1 # print cycle log
   ERROR_COMPENSATION=0
   DEBUG=0         # ggml-gemmini-util.h에 정의된 DEBUG 매크로
   GEMMINI_DEBUG=0 # gemmini의 debug 로그 매크로
@@ -74,17 +73,8 @@ target_compile_definitions(ggml-gemmini PRIVATE
   FULL_C=1        # full_C
   LOW_D=0         # low_D
 
-  # test switches (DUMP는 소스에서 자동 파생)
+  # switches
   TRANSPOSE_B=1 # B 전치 여부
-  TEST_SHAPE=0 # 원본/변환 tensor shape 확인
-  TEST_TYPE=0 # 타입 확인
-  TEST_SORT=0 # sort 테스트
-  TEST_DEC_METRICS=0 # k 중복 측정
-  TEST_SLICE=0 # slicing 하여 dump
-  TEST_CPU_REF=0 # 기대값 계산
-  TEST_GEMMINI=0 # gemmini 호출
-  TEST_COMPARE=0 # 결과 비교
-  TEST_DEQUANTIZE_OUT=0 # 연산 결과 복사(dequantize)
 
   # slice 크기
   SLICE_I=1
