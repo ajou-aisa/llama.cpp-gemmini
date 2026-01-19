@@ -19,11 +19,12 @@
 
 #include <orca/log.hpp>
 #include <orca/layer.h>
+#include <orca/ggml/ggml_orca.hpp>
 
 #include "include/gemmini.h"
 #include "error_compensation/activation_DEC.h"
 #include "ggml-gemmini-args.h"
-#include "quantization/ggml-gemmini-quantize.h"
+//#include "quantization/ggml-gemmini-quantize.h"
 
 #ifndef TRANSPOSE_B
 #define TRANSPOSE_B 1
@@ -102,7 +103,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.sC = J;
 
     end = read_cycles();
-    orca::log::cycle(layer, "Set Args for calling gemmini", start, end);
+    orca::log::cycle(layer, "cpu.Set Args for calling gemmini", start, end);
 
     // quantize activation
     start = read_cycles();
@@ -111,12 +112,13 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     activation_q.resize(I * K);
     int8_t *qx = activation_q.data();
 
-    ggml_gemmini_quantize_activation(src1, args, qx);
+    orca::ggml::quants::ggml_gemmini_quantize_activation(src1, args, qx);
+    // ggml_gemmini_quantize_activation(src1, args, qx);
 
     args.A = reinterpret_cast<elem_t *>(qx);
 
     end = read_cycles();
-    orca::log::cycle(layer, "Quantize activation", start, end);
+    orca::log::cycle(layer, "cpu.Quantize activation", start, end);
 
     // breackdown weight to int8_t & scale (cache per weight tensor)
     start = read_cycles();
