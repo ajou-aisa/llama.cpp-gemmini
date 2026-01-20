@@ -20,9 +20,11 @@
 #include <orca/log.hpp>
 #include <orca/layer.h>
 #include <orca/ggml/ggml_orca.hpp>
+#include <orca/ggml/dec_orca.hpp>
 
 #include "include/gemmini.h"
-#include "error_compensation/activation_DEC.h"
+// Legacy aisa::ActivationDEC is replaced by orca::ggml::ggml_gemmini_activation_dec
+// #include "error_compensation/activation_DEC.h"
 #include "ggml-gemmini-args.h"
 //#include "quantization/ggml-gemmini-quantize.h"
 
@@ -255,7 +257,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     // dst에는 gemmini 커널에서 dequantize한 결과가 들어옴 
 
 #if ERROR_COMPENSATION
-    ActivationDEC::compensate(src1, &args);
+    orca::ggml::ggml_gemmini_activation_dec(src1, args);
 #endif
 }
 
