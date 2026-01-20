@@ -48,23 +48,6 @@ else()
 endif()
 
 target_compile_definitions(ggml-gemmini PRIVATE
-  # llama
-  ERROR_COMPENSATION=0
-  DEBUG=0         # ggml-gemmini-util.h에 정의된 DEBUG 매크로
-  GEMMINI_DEBUG=0 # gemmini의 debug 로그 매크로
-  TEST=0          # 필요 시
-  ACTIVATION_BLOCK_SCALE=1 # block-scale 사용
-  ACTIVATION_TENSOR_SCALE=0 # per-tensor scale 사용
-  QACT_USE_PERCENTILE=0
-  QACT_PCTL=0.999f
-
-  # debug
-  GEMMINI_GOLDEN_MM=0
-  GEMMINI_GOLDEN_CHECK=0
-  GEMMINI_KBLOCK_DEBUG=1
-  GGML_GEMMINI_FORCE_GGML_OUTPUT=${GGML_GEMMINI_FORCE_GGML_OUTPUT_DEF}
-  GGML_GEMMINI_FORCE_GGML_ALL=${GGML_GEMMINI_FORCE_GGML_ALL_DEF}
-
   # gemmini flag
   PRINT_TILE=0    # 필요 시
   OPTION=CPU      # OS/WS/CPU
@@ -78,11 +61,6 @@ target_compile_definitions(ggml-gemmini PRIVATE
   SLICE_I=1
   SLICE_K=4
   SLICE_J=6
-
-# error compensation
-  SCALE_A=0.0035f
-  DEC_ALPHA_RATIO=0.05
-  DEC_ALPHA_MIN=1
 )
 
 target_include_directories(ggml-gemmini PRIVATE
