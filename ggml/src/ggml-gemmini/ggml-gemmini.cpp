@@ -242,7 +242,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.tiled_matmul_type = OPTION;
 
     end = read_cycles();
-    orca::log::cycle(layer, "Set Args for calling gemmini", start, end);
+    orca::log::cycle(layer, "cpu.Set Args for calling gemmini", start, end);
 
     // orca::log::debug("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out(row)=%zu stride_f_out(col)=%zu nb1=%zu nb0=%zu",
     //                  layer, args.A, args.B, args.C, args.D,
