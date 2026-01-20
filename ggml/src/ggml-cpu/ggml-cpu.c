@@ -1,4 +1,4 @@
-#include "cyclereader.h"
+#include <orca/cycle/cycle_reader.h>
 #include <orca/layer.h>
 #include <orca/log.h>
 
@@ -1734,443 +1734,443 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     switch (tensor->op) {
         case GGML_OP_DUP:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_dup(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.dup", start, end);
             } break;
         case GGML_OP_ADD:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_add(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.add", start, end);
             } break;
         case GGML_OP_ADD1:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_add1(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.add1", start, end);
             } break;
         case GGML_OP_ACC:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_acc(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.acc", start, end);
             } break;
         case GGML_OP_SUB:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_sub(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.sub", start, end);
             } break;
         case GGML_OP_MUL:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_mul(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.mul", start, end);
             } break;
         case GGML_OP_DIV:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_div(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.div", start, end);
             } break;
         case GGML_OP_SQR:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_sqr(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.sqr", start, end);
             } break;
         case GGML_OP_SQRT:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_sqrt(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.sqrt", start, end);
             } break;
         case GGML_OP_LOG:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_log(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.log", start, end);
             } break;
         case GGML_OP_SIN:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_sin(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.sin", start, end);
             } break;
         case GGML_OP_COS:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_cos(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.cos", start, end);
             } break;
         case GGML_OP_SUM:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_sum(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.sum", start, end);
             } break;
         case GGML_OP_SUM_ROWS:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_sum_rows(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.sum_rows", start, end);
             } break;
         case GGML_OP_MEAN:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_mean(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.mean", start, end);
             } break;
         case GGML_OP_ARGMAX:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_argmax(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.argmax", start, end);
             } break;
         case GGML_OP_COUNT_EQUAL:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_count_equal(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.count_equal", start, end);
             } break;
         case GGML_OP_REPEAT:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_repeat(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.repeat", start, end);
             } break;
         case GGML_OP_REPEAT_BACK:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_repeat_back(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.repeat_back", start, end);
             } break;
         case GGML_OP_CONCAT:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_concat(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.concat", start, end);
             } break;
         case GGML_OP_SILU_BACK:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_silu_back(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.silu_back", start, end);
             } break;
         case GGML_OP_NORM:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_norm(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.norm", start, end);
             } break;
         case GGML_OP_RMS_NORM:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_rms_norm(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.rms_norm", start, end);
             } break;
         case GGML_OP_RMS_NORM_BACK:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_rms_norm_back(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.rms_norm_back", start, end);
             } break;
         case GGML_OP_GROUP_NORM:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_group_norm(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.group_norm", start, end);
             } break;
         case GGML_OP_L2_NORM:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_l2_norm(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.l2_norm", start, end);
             } break;
         case GGML_OP_MUL_MAT:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_mul_mat(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.mul_mat", start, end);
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_mul_mat_id(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.mul_mat_id", start, end);
             } break;
         case GGML_OP_OUT_PROD:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_out_prod(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.out_prod", start, end);
             } break;
         case GGML_OP_SCALE:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_scale(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.scale", start, end);
             } break;
         case GGML_OP_SET:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_set(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.set", start, end);
             } break;
         case GGML_OP_CPY:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_cpy(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.cpy", start, end);
             } break;
         case GGML_OP_CONT:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_cont(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.cont", start, end);
             } break;
         case GGML_OP_RESHAPE:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_reshape(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.reshape", start, end);
             } break;
         case GGML_OP_VIEW:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_view(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.view", start, end);
             } break;
         case GGML_OP_PERMUTE:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_permute(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.permute", start, end);
             } break;
         case GGML_OP_TRANSPOSE:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_transpose(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.transpose", start, end);
             } break;
         case GGML_OP_GET_ROWS:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_get_rows(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.get_rows", start, end);
             } break;
         case GGML_OP_GET_ROWS_BACK:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_get_rows_back(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.get_rows_back", start, end);
             } break;
         case GGML_OP_DIAG:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_diag(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.diag", start, end);
             } break;
         case GGML_OP_DIAG_MASK_INF:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_diag_mask_inf(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.diag_mask_inf", start, end);
             } break;
         case GGML_OP_DIAG_MASK_ZERO:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_diag_mask_zero(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.diag_mask_zero", start, end);
             } break;
         case GGML_OP_SOFT_MAX:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_soft_max(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.softmax", start, end);
             } break;
         case GGML_OP_SOFT_MAX_BACK:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_soft_max_ext_back(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.softmax_back", start, end);
             } break;
         case GGML_OP_ROPE:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_rope(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.rope", start, end);
             } break;
         case GGML_OP_ROPE_BACK:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_rope_back(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.rope_back", start, end);
             } break;
         case GGML_OP_CLAMP:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_clamp(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.clamp", start, end);
             } break;
         case GGML_OP_CONV_TRANSPOSE_1D:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_conv_transpose_1d(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.conv_transpose_1d", start, end);
             } break;
         case GGML_OP_IM2COL:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_im2col(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.im2col", start, end);
             } break;
         case GGML_OP_IM2COL_BACK:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_im2col_back_f32(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.im2col_back", start, end);
             } break;
         case GGML_OP_CONV_2D_DW:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_conv_2d_dw(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.conv_2d_dw", start, end);
             } break;
         case GGML_OP_CONV_TRANSPOSE_2D:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_conv_transpose_2d(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.conv_transpose_2d", start, end);
             } break;
         case GGML_OP_POOL_1D:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_pool_1d(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.pool_1d", start, end);
             } break;
         case GGML_OP_POOL_2D:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_pool_2d(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.pool_2d", start, end);
             } break;
         case GGML_OP_POOL_2D_BACK:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_pool_2d_back(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.pool_2d_back", start, end);
             } break;
         case GGML_OP_UPSCALE:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_upscale(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.upscale", start, end);
             } break;
         case GGML_OP_PAD:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_pad(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.pad", start, end);
             } break;
         case GGML_OP_PAD_REFLECT_1D:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_pad_reflect_1d(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.pad_reflect_1d", start, end);
             } break;
         case GGML_OP_ARANGE:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_arange(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.arange", start, end);
             } break;
         case GGML_OP_TIMESTEP_EMBEDDING:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_timestep_embedding(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.timestep_embedding", start, end);
             } break;
         case GGML_OP_ARGSORT:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_argsort(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.argsort", start, end);
             } break;
         case GGML_OP_LEAKY_RELU:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_leaky_relu(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.leaky_relu", start, end);
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_flash_attn_ext(params, tensor->src[0], tensor->src[1], tensor->src[2], tensor->src[3], tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.flash_attn_ext", start, end);
             } break;
         case GGML_OP_FLASH_ATTN_BACK:
@@ -2179,134 +2179,134 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 GGML_ASSERT(t == 0 || t == 1);
                 bool masked = t != 0;
 
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_flash_attn_back(params, masked, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.flash_attn_back", start, end);
             } break;
         case GGML_OP_SSM_CONV:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_ssm_conv(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.ssm_conv", start, end);
             } break;
         case GGML_OP_SSM_SCAN:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_ssm_scan(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.ssm_scan", start, end);
             } break;
         case GGML_OP_WIN_PART:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_win_part(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.win_part", start, end);
             } break;
         case GGML_OP_WIN_UNPART:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_win_unpart(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.win_unpart", start, end);
             } break;
         case GGML_OP_UNARY:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_unary(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.unary", start, end);
             } break;
         case GGML_OP_GET_REL_POS:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_get_rel_pos(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.get_rel_pos", start, end);
             } break;
         case GGML_OP_ADD_REL_POS:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_add_rel_pos(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.add_rel_pos", start, end);
             } break;
         case GGML_OP_RWKV_WKV6:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_rwkv_wkv6(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.rwkv_wkv6", start, end);
             } break;
         case GGML_OP_GATED_LINEAR_ATTN:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_gla(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.gated_linear_attn", start, end);
             } break;
         case GGML_OP_RWKV_WKV7:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_rwkv_wkv7(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.rwkv_wkv7", start, end);
             } break;
         case GGML_OP_MAP_CUSTOM1:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_map_custom1(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.map_custom1", start, end);
             }
             break;
         case GGML_OP_MAP_CUSTOM2:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_map_custom2(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.map_custom2", start, end);
             }
             break;
         case GGML_OP_MAP_CUSTOM3:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_map_custom3(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.map_custom3", start, end);
             }
             break;
         case GGML_OP_CUSTOM:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_custom(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.custom", start, end);
             }
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_cross_entropy_loss(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.cross_entropy_loss", start, end);
             }
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_cross_entropy_loss_back(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.cross_entropy_loss_back", start, end);
             }
             break;
         case GGML_OP_OPT_STEP_ADAMW:
             {
-                start = read_cycles();
+                start = orca_read_cycles();
                 ggml_compute_forward_opt_step_adamw(params, tensor);
-                end = read_cycles();
+                end = orca_read_cycles();
                 orca_log_cycle_to(orca_log_file("log/cycle-log.jsonl"), layer, "cpu.opt_step_adamw", start, end);
             }
             break;
