@@ -5,7 +5,6 @@
 #include "sampling.h"
 #include "llama.h"
 #include "chat.h"
-#include "cyclereader.h"
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -14,6 +13,8 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+#include <orca/cycle/cycle_reader.hpp>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
@@ -90,10 +91,9 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    uint64_t start_cycle = read_cycles();
-    #if CYCLE_LOG
+    uint64_t start_cycle = orca::cycle::read();
     fprintf(stderr, "start cycle : %lu \n", start_cycle);
-    #endif
+
     common_init();
 
     auto & sparams = params.sampling;
@@ -977,10 +977,9 @@ int main(int argc, char ** argv) {
     ggml_threadpool_free_fn(threadpool);
     ggml_threadpool_free_fn(threadpool_batch);
 
-    uint64_t end_cycle = read_cycles();
-    #if CYCLE_LOG
+    uint64_t end_cycle = orca::cycle::read();
     fprintf(stderr, "end cycle : %lu \n", end_cycle);
     fprintf(stderr, "total elapsed cycle : %lu \n", end_cycle - start_cycle);
-    #endif
+
     return 0;
 }

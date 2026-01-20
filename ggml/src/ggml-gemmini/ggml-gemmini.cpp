@@ -81,7 +81,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     ggml_gemmini_args_t args; // DEC과 gemmini 호출을 위한 args 
 
     // set args
-    start = read_cycles();
+    start = orca::cycle::read();
     (void)TRANSPOSE_B; // 항상 (K x J) row-major 정책 사용
 
     args.transpose_B = false;
@@ -104,11 +104,11 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.sA = K;
     args.sC = J;
 
-    end = read_cycles();
+    end = orca::cycle::read();
     orca::log::cycle(layer, "cpu.Set Args for calling gemmini", start, end);
 
     // quantize activation
-    start = read_cycles();
+    start = orca::cycle::read();
 
     static thread_local std::vector<int8_t> activation_q;
     activation_q.resize(I * K);
@@ -119,11 +119,11 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     args.A = reinterpret_cast<elem_t *>(qx);
 
-    end = read_cycles();
+    end = orca::cycle::read();
     orca::log::cycle(layer, "cpu.Quantize activation", start, end);
 
     // breackdown weight to int8_t & scale (cache per weight tensor)
-    start = read_cycles();
+    start = orca::cycle::read();
     const int64_t dim_k = src0->ne[0];
     const int64_t dim_j = src0->ne[1] ? src0->ne[1] : 1;
     const int64_t dim_z = src0->ne[2] ? src0->ne[2] : 1;
@@ -213,13 +213,13 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     // orca::log::debug("[Gemmini addr] layer=%s A=%p B=%p B_blocks=%p B_scales=%p",
     //                  layer, (void *)args.A, (void *)args.B, (const void *)args.B_blocks, (const void *)args.B_scales);
 
-    end = read_cycles();
+    end = orca::cycle::read();
     orca::log::cycle(layer, "cpu.Breakdown Q8_0", start, end);
 
     GGML_ASSERT(args.transpose_B == false);
     GGML_ASSERT(args.sB == logical_cols);
 
-    start = read_cycles();
+    start = orca::cycle::read();
     /* ______________________________ 4. bias 텐서 처리 _________________________________ */
     std::vector<int32_t> zero_bias(J, 0);
 
@@ -241,7 +241,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.stride_f_out = dst->nb[1] / sizeof(float);
     args.tiled_matmul_type = OPTION;
 
-    end = read_cycles();
+    end = orca::cycle::read();
     orca::log::cycle(layer, "cpu.Set Args for calling gemmini", start, end);
 
     // orca::log::debug("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out(row)=%zu stride_f_out(col)=%zu nb1=%zu nb0=%zu",
