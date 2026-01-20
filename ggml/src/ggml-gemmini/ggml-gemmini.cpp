@@ -52,7 +52,7 @@ struct ggml_backend_gemmini_context
 #ifndef GGML_USE_OPENMP
     std::vector<std::future<void>> tasks;
 #endif
-    std::map<const ggml_tensor *, ggml_gemmini_args_t::unpacked_weight> weight_cache; // packed Q8_0 per weight tensor
+    std::map<const block_q8_0 *, ggml_gemmini_args_t::unpacked_weight> weight_cache; // packed Q8_0 per weight base pointer
     
 };
 
@@ -138,7 +138,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     const block_q8_0 *block_base = ggml_gemmini_args_block_base(src0);
     ggml_gemmini_args_t::unpacked_weight *cached = nullptr;
 
-    auto it = ctx->weight_cache.find(src0);
+    auto it = ctx->weight_cache.find(block_base);
     if (it != ctx->weight_cache.end() &&
         it->second.matches(block_base,
                            dim_k,
@@ -149,18 +149,30 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                            blocks_K,
                            logical_cols)) {
         cached = &it->second;
-        // orca::log::debug("[Breakdowned weight cache] hit layer=%s ptr=%p K=%lld cols=%zu sB=%zu blocks_K=%zu",
-        //                  layer, (const void *)src0, static_cast<long long>(dim_k),
-        //                  logical_cols, args.sB, blocks_K);
+        orca::log::debug(layer,
+                         "[Q8_0 cache] hit base=%p K=%lld cols=%zu sB=%zu blocks_K=%zu",
+                         (const void *)block_base,
+                         static_cast<long long>(dim_k),
+                         logical_cols,
+                         args.sB,
+                         blocks_K);
     } else {
         if (it == ctx->weight_cache.end()) {
-            // orca::log::debug("[Breakdowned weight cache] miss layer=%s ptr=%p K=%lld cols=%zu sB=%zu blocks_K=%zu",
-            //                 layer, (const void *)src0, static_cast<long long>(dim_k),
-            //                 logical_cols, args.sB, blocks_K);
+            orca::log::debug(layer,
+                             "[Q8_0 cache] miss base=%p K=%lld cols=%zu sB=%zu blocks_K=%zu",
+                             (const void *)block_base,
+                             static_cast<long long>(dim_k),
+                             logical_cols,
+                             args.sB,
+                             blocks_K);
         } else {
-            // orca::log::debug("[Breakdowned weight cache] refresh layer=%s ptr=%p K=%lld cols=%zu sB=%zu blocks_K=%zu",
-            //                  layer, (const void *)src0, static_cast<long long>(dim_k),
-            //                  logical_cols, args.sB, blocks_K);
+            orca::log::debug(layer,
+                             "[Q8_0 cache] refresh base=%p K=%lld cols=%zu sB=%zu blocks_K=%zu",
+                             (const void *)block_base,
+                             static_cast<long long>(dim_k),
+                             logical_cols,
+                             args.sB,
+                             blocks_K);
         }
         ggml_gemmini_args_t::unpacked_weight entry;
         entry.blocks = block_base;
@@ -196,7 +208,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         entry.block_size_k = args.block_size_k;
 
         if (it == ctx->weight_cache.end()) {
-            it = ctx->weight_cache.emplace(src0, std::move(entry)).first;
+            it = ctx->weight_cache.emplace(block_base, std::move(entry)).first;
         } else {
             it->second = std::move(entry);
         }
