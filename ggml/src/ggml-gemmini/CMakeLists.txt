@@ -49,6 +49,7 @@ endif()
 
 target_compile_definitions(ggml-gemmini PRIVATE
   # gemmini flag
+  GEMMINI_VERIFY_DEQ=0
   PRINT_TILE=0    # 필요 시
   OPTION=CPU      # OS/WS/CPU
   FULL_C=1        # full_C
