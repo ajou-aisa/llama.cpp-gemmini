@@ -15,6 +15,7 @@
 #include <vector>
 
 #include <orca/cycle/cycle_reader.hpp>
+#include <orca/log.hpp>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
@@ -85,6 +86,10 @@ static void sigint_handler(int signo) {
 #endif
 
 int main(int argc, char ** argv) {
+    // set file path
+    orca::log::debug.set_output_path("log/debug-log.jsonl");
+    orca::log::cycle.set_output_path("log/cycle-log.jsonl");
+
     common_params params;
     g_params = &params;
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_MAIN, print_usage)) {
