@@ -18,6 +18,13 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+# Ensure runtime shared libs are found from the executable directory in the rootfs.
+if (UNIX AND NOT APPLE)
+    set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
+    set(CMAKE_BUILD_RPATH "$ORIGIN")
+    set(CMAKE_INSTALL_RPATH "$ORIGIN")
+endif()
+
 if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(LLAMA_STANDALONE ON)
 
@@ -154,9 +161,59 @@ if (LLAMA_USE_SYSTEM_GGML)
     add_library(ggml ALIAS ggml::ggml)
 endif()
 
+# ---- Research (AISA) integration ----
+option(LLAMA_WITH_ORCA "Build and link ORCA (research) library" ON)
+
+if (LLAMA_WITH_ORCA)
+    # llama.cpp-gemmini 와 orca(연구)가 모두 workspace/ 디렉터리라는 가정
+    get_filename_component(ORCA_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../orca" ABSOLUTE)
+
+    if (EXISTS "${ORCA_SRC_DIR}/CMakeLists.txt")
+        # 외부 소스 디렉터리를 add_subdirectory 할 때는 build dir를 반드시 따로 준다
+        add_subdirectory("${ORCA_SRC_DIR}" "${CMAKE_BINARY_DIR}/orca-build")
+    else()
+        message(FATAL_ERROR "ORCA repo not found: ${ORCA_SRC_DIR}")
+    endif()
+endif()
+
+# set log option
+set(_ggml_orca_defs
+    LOG_DEBUG=1
+    LOG_CYCLE=1
+    ERROR_COMPENSATION=1
+    ACTIVATION_BLOCK_SCALE=1
+    ACTIVATION_TENSOR_SCALE=0
+)
+
+# ---- ggml build (must come AFTER orca) ----
 if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     add_subdirectory(ggml)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
+endif()
+
+# Apply the same logging macros to ORCA itself so its compiled code matches ggml consumers
+if (TARGET orca-log)
+    target_compile_definitions(orca-log PUBLIC ${_ggml_orca_defs})
+endif()
+if (TARGET orca-capi)
+    target_compile_definitions(orca-capi PRIVATE ${_ggml_orca_defs})
+endif()
+
+# ---- Link ORCA to ggml targets that include <orca/...> ----
+if (LLAMA_WITH_ORCA)
+    if (TARGET ggml-cpu AND TARGET orca)
+        # ggml-cpu는 C API(log/layer)만 필요하므로 ggml 의존이 없는 orca-capi에 연결
+        target_link_libraries(ggml-cpu PUBLIC orca-capi)
+
+        # C 타겟이지만 C++ 라이브러리를 링크하므로 링크 단계는 C++로
+        set_target_properties(ggml-cpu PROPERTIES LINKER_LANGUAGE CXX)
+    endif()
+
+    # gemmini도 orca를 쓰면 동일하게
+    if (TARGET ggml-gemmini AND TARGET orca)
+        target_link_libraries(ggml-gemmini PUBLIC orca-capi)
+        # ggml-gemmini는 C++이므로 LINKER_LANGUAGE는 보통 불필요
+    endif()
 endif()
 
 #
