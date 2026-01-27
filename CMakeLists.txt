@@ -165,7 +165,7 @@ endif()
 option(LLAMA_WITH_ORCA "Build and link ORCA (research) library" ON)
 
 # ORCA activation quant mode (forwarded to ORCA and compile definitions)
-set(ORCA_ACTIVATION_QUANT_MODE "AUTO" CACHE STRING "Activation quantization mode (AUTO|BLOCK|TENSOR|EXPONENT)")
+set(ORCA_ACTIVATION_QUANT_MODE "EXPONENT" CACHE STRING "Activation quantization mode (AUTO|BLOCK|TENSOR|EXPONENT)")
 set_property(CACHE ORCA_ACTIVATION_QUANT_MODE PROPERTY STRINGS AUTO BLOCK TENSOR EXPONENT)
 if (DEFINED ENV{ORCA_ACTIVATION_QUANT_MODE})
     set(ORCA_ACTIVATION_QUANT_MODE "$ENV{ORCA_ACTIVATION_QUANT_MODE}" CACHE STRING "Activation quantization mode" FORCE)
@@ -197,13 +197,17 @@ if (LLAMA_WITH_ORCA)
 endif()
 
 # set log option
+# Force activation quant mode here (overrides cache/env) so ggml/orca stay in EXPONENT mode.
+set(ORCA_ACTIVATION_QUANT_MODE "EXPONENT" CACHE STRING "Activation quantization mode (AUTO|BLOCK|TENSOR|EXPONENT)" FORCE)
 set(_ggml_orca_defs
     LOG_DEBUG=1
     LOG_CYCLE=1
-    ERROR_COMPENSATION=1
-    ACTIVATION_BLOCK_SCALE=1
+    ERROR_COMPENSATION=0
+    ACTIVATION_EXPONENT_SCALE=1
+    ACTIVATION_BLOCK_SCALE=0
     ACTIVATION_TENSOR_SCALE=0
-    ${_ORCA_ACT_QUANT_MODE_DEF}
+    ORCA_ACTIVATION_QUANT_MODE=ORCA_ACTIVATION_QUANT_MODE_EXPONENT
+    GEMMINI_VERIFY_DEQ=1
 )
 
 # ---- ggml build (must come AFTER orca) ----
