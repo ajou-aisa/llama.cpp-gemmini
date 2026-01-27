@@ -4,8 +4,8 @@ set -euo pipefail
 # Build Gemmini in CPU fallback mode on x86; outputs live in build/bin
 BUILD_DIR=${BUILD_DIR:-build}
 LLAMA_CURL_DEFAULT=${LLAMA_CURL_DEFAULT:-OFF} # disable libcurl requirement on local x86 unless explicitly enabled
-CMAKE_BUILD_TYPE_DEFAULT=${CMAKE_BUILD_TYPE_DEFAULT:-Debug} # Debug | Release
-GGML_NATIVE_DEFAULT=${GGML_NATIVE_DEFAULT:-OFF} # ON | OFF
+CMAKE_BUILD_TYPE_DEFAULT=${CMAKE_BUILD_TYPE_DEFAULT:-Release} # Debug | Release
+GGML_NATIVE_DEFAULT=${GGML_NATIVE_DEFAULT:-ON} # ON | OFF
 
 cmake -B "$BUILD_DIR" -S . \
   -DGGML_GEMMINI=ON \

@@ -80,6 +80,7 @@ typedef struct ggml_gemmini_args_t {
     // activation quantization metadata
     bool activation_block_scaled = false;
     std::vector<ggml_gemmini_qact_outlier> activation_outliers; // per-activation saturation records
+    int activation_shamt = 0; // exponent quant shift amount (s_x)
 
     //for weight checking   
     uint8_t weightA = 0;
