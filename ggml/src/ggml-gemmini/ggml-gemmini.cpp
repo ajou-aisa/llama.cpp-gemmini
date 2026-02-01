@@ -19,6 +19,7 @@
 
 #include <orca/log.hpp>
 #include <orca/layer.h>
+#include <orca/ggml/log_dump.hpp>
 #include <orca/ggml/ggml_orca.hpp>
 #include <orca/ggml/dec_orca.hpp>
 
@@ -73,6 +74,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     /* ____________________________________ 0. 원본 FP32 입력 텐서 ____________________________________________ */
     const auto *src0 = dst->src[0]; // src0: weight (K x J) -> 전치
     const auto *src1 = dst->src[1]; // src1: activation (I x K) -> 전치 없음 (A)
+
+    orca::log::dump(orca::log::file("log/tensor_data/act.jsonl"), layer, src1);
 
     ggml_gemmini_args_t args; // DEC과 gemmini 호출을 위한 args 
 
