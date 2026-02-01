@@ -92,8 +92,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     const size_t J = dst->ne[0]; // K = B.ne[0], J = B.ne[1] (transpose)
     const size_t K = src1->ne[0]; // K = A.ne[0]
 
+#if LOG_DUMP
     // fp32 activation dump (call signature unchanged)
     orca::log::dump(orca::log::file("log/tensor_data/act.jsonl"), layer, src1);
+#endif
     
     orca::log::debug(layer, "I=%zu, J=%zu, K=%zu", I, J, K);
 
@@ -303,6 +305,7 @@ static void ggml_backend_gemmini_free(ggml_backend_t backend) {
 static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_gemmini_context * ctx = (ggml_backend_gemmini_context *)backend->context;
 
+#if LOG_DUMP
     uint32_t mxI = 0;
     bool decode_start_marker = false;
     for (int i = 0; i < cgraph->n_nodes; i++)
@@ -393,6 +396,30 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
             GGML_ABORT("%s: unsupported op assigned to GEMMINI: %s\n", __func__, ggml_op_desc(node));
         }
     }
+#else
+    for (int i = 0; i < cgraph->n_nodes; i++)
+    {
+        struct ggml_tensor *node = cgraph->nodes[i];
+
+        switch (node->op)
+        {
+        case GGML_OP_MUL_MAT: {
+            ggml_backend_gemmini_mul_mat(ctx, node);
+            break;
+        }
+        case GGML_OP_NONE:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+        case GGML_OP_ADD:
+            break;
+
+        default:
+            GGML_ABORT("%s: unsupported op assigned to GEMMINI: %s\n", __func__, ggml_op_desc(node));
+        }
+    }
+#endif
     
     GGML_UNUSED(backend);
     return GGML_STATUS_SUCCESS;
