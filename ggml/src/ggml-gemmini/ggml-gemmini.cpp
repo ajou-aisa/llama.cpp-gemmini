@@ -10,6 +10,7 @@
 #include <utility>
 #include <future>
 #include <vector>
+#include <limits>
 #include <map>
 #include <memory>
 #include <type_traits>
@@ -121,6 +122,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     // ggml_gemmini_quantize_activation(src1, args, qx);
 
     args.A = reinterpret_cast<elem_t *>(qx);
+    static_assert(sizeof(elem_t) == 1, "Q8_0 path assumes elem_t is int8 (1 byte).");
 
     end = orca::cycle::read();
     orca::log::cycle(layer, "cpu.Quantize activation", start, end);
@@ -134,7 +136,15 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     GGML_ASSERT(dim_k % QK8_0 == 0);
     const size_t blocks_K = static_cast<size_t>(dim_k) / QK8_0;
-    const size_t logical_rows = static_cast<size_t>(dim_j * dim_z * dim_w);
+    // Overflow guard for logical_rows and subsequent allocations.
+    const __int128 logical_rows_128 =
+        static_cast<__int128>(dim_j) * static_cast<__int128>(dim_z) * static_cast<__int128>(dim_w);
+    if (logical_rows_128 <= 0 ||
+        logical_rows_128 > static_cast<__int128>(std::numeric_limits<size_t>::max())) {
+        GGML_ASSERT(false);
+        return;
+    }
+    const size_t logical_rows = static_cast<size_t>(logical_rows_128);
 
     args.sB = static_cast<size_t>(dim_k);
 
@@ -190,19 +200,38 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         entry.block_size_k = QK8_0;
         entry.stride = args.sB;
 
-        const size_t q_size = static_cast<size_t>(dim_k) * logical_rows;
-        const size_t scale_size = blocks_K * logical_rows;
+        const __int128 q_size_128 =
+            static_cast<__int128>(dim_k) * static_cast<__int128>(logical_rows);
+        if (q_size_128 < 0 ||
+            q_size_128 > static_cast<__int128>(std::numeric_limits<size_t>::max())) {
+            GGML_ASSERT(false);
+            return;
+        }
+        const size_t q_size = static_cast<size_t>(q_size_128);
+        // Scale table layout: [logical_rows][blocks_K] row-major
+        const __int128 scale_size_128 =
+            static_cast<__int128>(blocks_K) * static_cast<__int128>(logical_rows);
+        if (scale_size_128 < 0 ||
+            scale_size_128 > static_cast<__int128>(std::numeric_limits<size_t>::max())) {
+            GGML_ASSERT(false);
+            return;
+        }
+        const size_t scale_size = static_cast<size_t>(scale_size_128);
         entry.q.resize(q_size);
         entry.scales.resize(scale_size);
 
         // Use orca::ggml wrapper instead of inline ggml_gemmini_pack_q80
-        orca::ggml::quants::ggml_gemmini_unpack_q80_weight(
+        const bool ok = orca::ggml::quants::ggml_gemmini_unpack_q80_weight(
             src0,
             args,
             reinterpret_cast<int8_t *>(entry.q.data()),
             entry.stride,
             entry.scales.data()
         );
+        GGML_ASSERT(ok);
+        if (!ok) {
+            return;
+        }
 
         entry.blocks = args.B_blocks;
         entry.blocks_K = args.blocks_K;
