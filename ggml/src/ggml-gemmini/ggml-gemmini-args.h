@@ -97,12 +97,12 @@ typedef struct ggml_gemmini_args_t {
         int64_t dim_z = 0;
         int64_t dim_w = 0;
 
-        size_t logical_cols = 0;
+        size_t logical_cols = 0; // logical rows (J * Z * W) [legacy name]
         size_t blocks_K = 0;
         size_t blocks_J = 0;
         size_t blocks_I = 0;
         uint32_t block_size_k = QK8_0;
-        size_t stride = 0;
+        size_t stride = 0; // row stride in elements (K for JxK row-major)
 
         bool matches(const block_q8_0 *base,
                 int64_t k,
@@ -141,7 +141,7 @@ typedef struct ggml_gemmini_args_t {
     const float *B_scales = nullptr;
 
     size_t blocks_K = 0;      // number of Q8_0 blocks along the K dimension
-    size_t blocks_J = 0;      // number of logical columns covered by scale table
+    size_t blocks_J = 0;      // number of logical rows covered by scale table (J * Z * W)
     size_t blocks_I = 0;      // optional helper for rows (when needed)
 
     uint32_t block_size_k = QK8_0;
