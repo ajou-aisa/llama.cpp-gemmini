@@ -181,6 +181,7 @@ set(_ggml_orca_defs
     LOG_DEBUG=1
     LOG_CYCLE=1
     LOG_DUMP=1
+    LOG_DUMP_SCALE=1
     ERROR_COMPENSATION=0
     ACTIVATION_EXPONENT_SCALE=0
     ACTIVATION_BLOCK_SCALE=1
@@ -242,6 +243,12 @@ if (TARGET orca-log)
 endif()
 if (TARGET orca-capi)
     target_compile_definitions(orca-capi PRIVATE ${_ggml_orca_defs})
+endif()
+if (TARGET orca-dump-scale)
+    target_compile_definitions(orca-dump-scale PRIVATE ${_ggml_orca_defs})
+endif()
+if (TARGET orca-ggml)
+    target_compile_definitions(orca-ggml PRIVATE ${_ggml_orca_defs})
 endif()
 
 # ---- Link ORCA to ggml targets that include <orca/...> ----
