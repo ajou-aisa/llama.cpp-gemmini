@@ -78,9 +78,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     // set args
     start = orca::cycle::read();
-    (void)TRANSPOSE_B; // 항상 (K x J) row-major 정책 사용
-
-    args.transpose_B = false;
+    args.transpose_B = (TRANSPOSE_B != 0);
     args.layer_name = layer;
     args.full_C = FULL_C;
     args.low_D = LOW_D;
@@ -129,7 +127,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     const size_t blocks_K = static_cast<size_t>(dim_k) / QK8_0;
     const size_t logical_cols = static_cast<size_t>(dim_j * dim_z * dim_w);
 
-    args.sB = logical_cols;
+    // Weight matrix layout follows TRANSPOSE_B:
+    // - true:  JxK row-major (stride = K)
+    // - false: KxJ row-major (stride = J_flat)
+    args.sB = args.transpose_B ? static_cast<size_t>(dim_k) : logical_cols;
 
     const block_q8_0 *block_base = ggml_gemmini_args_block_base(src0);
     ggml_gemmini_args_t::unpacked_weight *cached = nullptr;
@@ -143,32 +144,36 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                            dim_w,
                            args.sB,
                            blocks_K,
-                           logical_cols)) {
+                           logical_cols,
+                           args.transpose_B)) {
         cached = &it->second;
         orca::log::debug(layer,
-                         "[Q8_0 cache] hit base=%p K=%lld cols=%zu sB=%zu blocks_K=%zu",
+                         "[Q8_0 cache] hit base=%p K=%lld cols=%zu sB=%zu blocks_K=%zu transpose_B=%d",
                          (const void *)block_base,
                          static_cast<long long>(dim_k),
                          logical_cols,
                          args.sB,
-                         blocks_K);
+                         blocks_K,
+                         args.transpose_B ? 1 : 0);
     } else {
         if (it == ctx->weight_cache.end()) {
             orca::log::debug(layer,
-                             "[Q8_0 cache] miss base=%p K=%lld cols=%zu sB=%zu blocks_K=%zu",
+                             "[Q8_0 cache] miss base=%p K=%lld cols=%zu sB=%zu blocks_K=%zu transpose_B=%d",
                              (const void *)block_base,
                              static_cast<long long>(dim_k),
                              logical_cols,
                              args.sB,
-                             blocks_K);
+                             blocks_K,
+                             args.transpose_B ? 1 : 0);
         } else {
             orca::log::debug(layer,
-                             "[Q8_0 cache] refresh base=%p K=%lld cols=%zu sB=%zu blocks_K=%zu",
+                             "[Q8_0 cache] refresh base=%p K=%lld cols=%zu sB=%zu blocks_K=%zu transpose_B=%d",
                              (const void *)block_base,
                              static_cast<long long>(dim_k),
                              logical_cols,
                              args.sB,
-                             blocks_K);
+                             blocks_K,
+                             args.transpose_B ? 1 : 0);
         }
         ggml_gemmini_args_t::unpacked_weight entry;
         entry.blocks = block_base;
@@ -182,6 +187,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         entry.blocks_I = static_cast<size_t>(dim_k);
         entry.block_size_k = QK8_0;
         entry.stride = args.sB;
+        entry.transpose_b = args.transpose_B;
 
         const size_t q_size = static_cast<size_t>(dim_k) * logical_cols;
         const size_t scale_size = blocks_K * logical_cols;
@@ -218,14 +224,14 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.blocks_J = cached->blocks_J;
     args.blocks_I = cached->blocks_I;
     args.block_size_k = cached->block_size_k;
+    orca::ggml::ggml_gemmini_prepare_group_meta(args);
     // orca::log::debug("[Gemmini addr] layer=%s A=%p B=%p B_blocks=%p B_scales=%p",
     //                  layer, (void *)args.A, (void *)args.B, (const void *)args.B_blocks, (const void *)args.B_scales);
 
     end = orca::cycle::read();
     orca::log::cycle(layer, "cpu.Breakdown Q8_0", start, end);
 
-    GGML_ASSERT(args.transpose_B == false);
-    GGML_ASSERT(args.sB == logical_cols);
+    GGML_ASSERT(args.sB == (args.transpose_B ? static_cast<size_t>(dim_k) : logical_cols));
 
     start = orca::cycle::read();
     /* ______________________________ 4. bias 텐서 처리 _________________________________ */

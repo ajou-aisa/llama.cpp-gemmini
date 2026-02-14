@@ -47,22 +47,18 @@ else()
   target_compile_options(ggml-gemmini PRIVATE ${GEMMINI_COMMON_FLAGS})
 endif()
 
-target_compile_definitions(ggml-gemmini PRIVATE
-  # gemmini flag
-  GEMMINI_VERIFY_DEQ=0
-  PRINT_TILE=0    # 필요 시
-  OPTION=CPU      # OS/WS/CPU
-  FULL_C=1        # full_C
-  LOW_D=0         # low_D
-
-  # switches
-  TRANSPOSE_B=1 # B 전치 여부
-
-  # slice 크기
-  SLICE_I=1
-  SLICE_K=4
-  SLICE_J=6
-)
+if (DEFINED GGML_GEMMINI_COMPILE_DEFS AND NOT "${GGML_GEMMINI_COMPILE_DEFS}" STREQUAL "")
+  target_compile_definitions(ggml-gemmini PRIVATE ${GGML_GEMMINI_COMPILE_DEFS})
+else()
+  # Standalone/subdir safety fallback with legacy defaults.
+  target_compile_definitions(ggml-gemmini PRIVATE
+    PRINT_TILE=0
+    OPTION=CPU
+    FULL_C=1
+    LOW_D=0
+    TRANSPOSE_B=1
+  )
+endif()
 
 target_include_directories(ggml-gemmini PRIVATE
   ${CMAKE_CURRENT_LIST_DIR}
