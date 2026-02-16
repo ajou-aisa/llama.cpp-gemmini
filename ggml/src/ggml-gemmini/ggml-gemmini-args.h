@@ -96,7 +96,7 @@ typedef struct ggml_gemmini_args_t {
     // metadata extracted from Q8_0 tensors
     struct unpacked_weight {
         std::vector<int8_t> q;
-        std::vector<float> scales;
+        std::vector<float> scales; // [logical_rows][blocks_K] row-major
         const block_q8_0 *blocks = nullptr;
 
         int64_t dim_k = 0;
@@ -104,10 +104,10 @@ typedef struct ggml_gemmini_args_t {
         int64_t dim_z = 0;
         int64_t dim_w = 0;
 
-        size_t logical_cols = 0;
+        size_t logical_cols = 0; // logical rows (J * Z * W) [legacy name]
         size_t blocks_K = 0;
-        size_t blocks_J = 0;
-        size_t blocks_I = 0;
+        size_t blocks_J = 0;     // logical rows (J * Z * W) for scale rows
+        size_t blocks_I = 0;     // legacy alias for logical rows (keep for ABI)
         uint32_t block_size_k = QK8_0;
         size_t stride = 0;
         bool transpose_b = true;
@@ -130,10 +130,10 @@ typedef struct ggml_gemmini_args_t {
             if (stride != stride_elems) {
                 return false;
             }
-            if (blocks_K != blocks_k || blocks_J != logical_cols_) {
+            if (blocks_K != blocks_k || blocks_J != logical_rows_) {
                 return false;
             }
-            if (block_size_k != QK8_0 || logical_cols != logical_cols_) {
+            if (block_size_k != QK8_0 || logical_cols != logical_rows_) {
                 return false;
             }
             if (transpose_b != transpose_b_layout) {
@@ -142,7 +142,7 @@ typedef struct ggml_gemmini_args_t {
             if (q.size() != static_cast<size_t>(k) * logical_cols_) {
                 return false;
             }
-            if (scales.size() != blocks_k * logical_cols_) {
+            if (scales.size() != blocks_k * logical_rows_) {
                 return false;
             }
             return true;
@@ -150,11 +150,11 @@ typedef struct ggml_gemmini_args_t {
     };
 
     const block_q8_0 *B_blocks = nullptr;
-    const float *B_scales = nullptr;
+    const float *B_scales = nullptr; // [blocks_J][blocks_K] row-major (row = J*Z*W)
 
     size_t blocks_K = 0;      // number of Q8_0 blocks along the K dimension
-    size_t blocks_J = 0;      // number of logical columns covered by scale table
-    size_t blocks_I = 0;      // optional helper for rows (when needed)
+    size_t blocks_J = 0;      // number of logical rows covered by scale table (J * Z * W)
+    size_t blocks_I = 0;      // legacy alias for rows (kept for ABI)
 
     // quant-group metadata resolved by orca quant logic
     ggml_gemmini_group_scope_t group_scope = GGML_GEMMINI_GROUP_BLOCK;

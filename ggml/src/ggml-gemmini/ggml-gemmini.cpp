@@ -1,6 +1,7 @@
 // ggml-gemmini.cpp
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <cctype>
@@ -9,6 +10,7 @@
 #include <utility>
 #include <future>
 #include <vector>
+#include <limits>
 #include <map>
 #include <memory>
 #include <type_traits>
@@ -19,6 +21,7 @@
 
 #include <orca/log.hpp>
 #include <orca/layer.h>
+#include <orca/ggml/log_dump.hpp>
 #include <orca/ggml/ggml_orca.hpp>
 #include <orca/ggml/dec_orca.hpp>
 
@@ -76,7 +79,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     orca::log::debug(layer, "ggml_backend_gemmini_mul_mat called");
 
     /* ____________________________________ 0. 원본 FP32 입력 텐서 ____________________________________________ */
-    const auto *src0 = dst->src[0]; // src0: weight (K x J) -> 전치
+    const auto *src0 = dst->src[0]; // src0: weight (J x K), row-major, 전치 상태
     const auto *src1 = dst->src[1]; // src1: activation (I x K) -> 전치 없음 (A)
 
     ggml_gemmini_args_t args; // DEC과 gemmini 호출을 위한 args 
@@ -90,7 +93,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     
     /* _______________________ 2. Gemmini용 dimension _____________________ */
     const size_t I = dst->ne[1]; // I = A.ne[1], K = A.ne[0]
-    const size_t J = dst->ne[0]; // K = B.ne[0], J = B.ne[1] (transpose)
+    const size_t J = dst->ne[0]; // J = B.ne[1], K = B.ne[0]
     const size_t K = src1->ne[0]; // K = A.ne[0]
 
 #if LOG_DUMP
@@ -121,6 +124,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     // ggml_gemmini_quantize_activation(src1, args, qx);
 
     args.A = reinterpret_cast<elem_t *>(qx);
+    static_assert(sizeof(elem_t) == 1, "Q8_0 path assumes elem_t is int8 (1 byte).");
 
     end = orca::cycle::read();
     orca::log::cycle(layer, "cpu.Quantize activation", start, end);
@@ -134,7 +138,15 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     GGML_ASSERT(dim_k % QK8_0 == 0);
     const size_t blocks_K = static_cast<size_t>(dim_k) / QK8_0;
-    const size_t logical_cols = static_cast<size_t>(dim_j * dim_z * dim_w);
+    // Overflow guard for logical_rows and subsequent allocations.
+    const __int128 logical_rows_128 =
+        static_cast<__int128>(dim_j) * static_cast<__int128>(dim_z) * static_cast<__int128>(dim_w);
+    if (logical_rows_128 <= 0 ||
+        logical_rows_128 > static_cast<__int128>(std::numeric_limits<size_t>::max())) {
+        GGML_ASSERT(false);
+        return;
+    }
+    const size_t logical_rows = static_cast<size_t>(logical_rows_128);
 
     // Weight matrix layout follows TRANSPOSE_B:
     // - true:  JxK row-major (stride = K)
@@ -160,7 +172,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                          "[Q8_0 cache] hit base=%p K=%lld cols=%zu sB=%zu blocks_K=%zu transpose_B=%d",
                          (const void *)block_base,
                          static_cast<long long>(dim_k),
-                         logical_cols,
+                         logical_rows,
                          args.sB,
                          blocks_K,
                          args.transpose_B ? 1 : 0);
@@ -170,7 +182,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                              "[Q8_0 cache] miss base=%p K=%lld cols=%zu sB=%zu blocks_K=%zu transpose_B=%d",
                              (const void *)block_base,
                              static_cast<long long>(dim_k),
-                             logical_cols,
+                             logical_rows,
                              args.sB,
                              blocks_K,
                              args.transpose_B ? 1 : 0);
@@ -179,7 +191,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                              "[Q8_0 cache] refresh base=%p K=%lld cols=%zu sB=%zu blocks_K=%zu transpose_B=%d",
                              (const void *)block_base,
                              static_cast<long long>(dim_k),
-                             logical_cols,
+                             logical_rows,
                              args.sB,
                              blocks_K,
                              args.transpose_B ? 1 : 0);
@@ -190,27 +202,46 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         entry.dim_j = dim_j;
         entry.dim_z = dim_z;
         entry.dim_w = dim_w;
-        entry.logical_cols = logical_cols;
+        entry.logical_cols = logical_rows;
         entry.blocks_K = blocks_K;
-        entry.blocks_J = logical_cols;
-        entry.blocks_I = static_cast<size_t>(dim_k);
+        entry.blocks_J = logical_rows;
+        entry.blocks_I = logical_rows;
         entry.block_size_k = QK8_0;
         entry.stride = args.sB;
         entry.transpose_b = args.transpose_B;
 
-        const size_t q_size = static_cast<size_t>(dim_k) * logical_cols;
-        const size_t scale_size = blocks_K * logical_cols;
+        const __int128 q_size_128 =
+            static_cast<__int128>(dim_k) * static_cast<__int128>(logical_rows);
+        if (q_size_128 < 0 ||
+            q_size_128 > static_cast<__int128>(std::numeric_limits<size_t>::max())) {
+            GGML_ASSERT(false);
+            return;
+        }
+        const size_t q_size = static_cast<size_t>(q_size_128);
+        // Scale table layout: [logical_rows][blocks_K] row-major
+        const __int128 scale_size_128 =
+            static_cast<__int128>(blocks_K) * static_cast<__int128>(logical_rows);
+        if (scale_size_128 < 0 ||
+            scale_size_128 > static_cast<__int128>(std::numeric_limits<size_t>::max())) {
+            GGML_ASSERT(false);
+            return;
+        }
+        const size_t scale_size = static_cast<size_t>(scale_size_128);
         entry.q.resize(q_size);
         entry.scales.resize(scale_size);
 
         // Use orca::ggml wrapper instead of inline ggml_gemmini_pack_q80
-        orca::ggml::quants::ggml_gemmini_unpack_q80_weight(
+        const bool ok = orca::ggml::quants::ggml_gemmini_unpack_q80_weight(
             src0,
             args,
             reinterpret_cast<int8_t *>(entry.q.data()),
             entry.stride,
             entry.scales.data()
         );
+        GGML_ASSERT(ok);
+        if (!ok) {
+            return;
+        }
 
         entry.blocks = args.B_blocks;
         entry.blocks_K = args.blocks_K;
@@ -394,6 +425,7 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
             GGML_ABORT("%s: unsupported op assigned to GEMMINI: %s\n", __func__, ggml_op_desc(node));
         }
     }
+#endif
     
     GGML_UNUSED(backend);
     return GGML_STATUS_SUCCESS;

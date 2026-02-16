@@ -257,6 +257,48 @@ set(_ggml_orca_defs
     GEMMINI_VERIFY_DEQ=1
 )
 
+# ORCA activation quant mode (forwarded to ORCA and compile definitions).
+# Mode is derived from _ggml_orca_defs (scale flags).
+set(_act_exp 0)
+set(_act_block 0)
+set(_act_tensor 0)
+foreach(_def IN LISTS _ggml_orca_defs)
+    if (_def MATCHES "^ACTIVATION_EXPONENT_SCALE=")
+        string(REPLACE "ACTIVATION_EXPONENT_SCALE=" "" _act_exp "${_def}")
+    elseif (_def MATCHES "^ACTIVATION_BLOCK_SCALE=")
+        string(REPLACE "ACTIVATION_BLOCK_SCALE=" "" _act_block "${_def}")
+    elseif (_def MATCHES "^ACTIVATION_TENSOR_SCALE=")
+        string(REPLACE "ACTIVATION_TENSOR_SCALE=" "" _act_tensor "${_def}")
+    endif()
+endforeach()
+
+set(_ORCA_ACT_MODE_FROM_SCALES "AUTO")
+if (_act_exp)
+    set(_ORCA_ACT_MODE_FROM_SCALES "EXPONENT")
+elseif (_act_block AND NOT _act_tensor)
+    set(_ORCA_ACT_MODE_FROM_SCALES "BLOCK")
+elseif (_act_tensor AND NOT _act_block)
+    set(_ORCA_ACT_MODE_FROM_SCALES "TENSOR")
+else()
+    set(_ORCA_ACT_MODE_FROM_SCALES "AUTO")
+endif()
+
+set(ORCA_ACTIVATION_QUANT_MODE "${_ORCA_ACT_MODE_FROM_SCALES}" CACHE STRING "Activation quantization mode (AUTO|BLOCK|TENSOR|EXPONENT)" FORCE)
+set_property(CACHE ORCA_ACTIVATION_QUANT_MODE PROPERTY STRINGS AUTO BLOCK TENSOR EXPONENT)
+
+set(_ORCA_ACT_QUANT_MODE_DEF "ORCA_ACTIVATION_QUANT_MODE=ORCA_ACTIVATION_QUANT_MODE_AUTO")
+if (ORCA_ACTIVATION_QUANT_MODE STREQUAL "BLOCK")
+    set(_ORCA_ACT_QUANT_MODE_DEF "ORCA_ACTIVATION_QUANT_MODE=ORCA_ACTIVATION_QUANT_MODE_BLOCK")
+elseif (ORCA_ACTIVATION_QUANT_MODE STREQUAL "TENSOR")
+    set(_ORCA_ACT_QUANT_MODE_DEF "ORCA_ACTIVATION_QUANT_MODE=ORCA_ACTIVATION_QUANT_MODE_TENSOR")
+elseif (ORCA_ACTIVATION_QUANT_MODE STREQUAL "EXPONENT")
+    set(_ORCA_ACT_QUANT_MODE_DEF "ORCA_ACTIVATION_QUANT_MODE=ORCA_ACTIVATION_QUANT_MODE_EXPONENT")
+elseif (ORCA_ACTIVATION_QUANT_MODE STREQUAL "AUTO")
+    set(_ORCA_ACT_QUANT_MODE_DEF "ORCA_ACTIVATION_QUANT_MODE=ORCA_ACTIVATION_QUANT_MODE_AUTO")
+else()
+    message(FATAL_ERROR "Invalid ORCA_ACTIVATION_QUANT_MODE: ${ORCA_ACTIVATION_QUANT_MODE}")
+endif()
+
 # ---- ggml build (must come AFTER orca) ----
 if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     add_subdirectory(ggml)
@@ -269,6 +311,12 @@ if (TARGET orca-log)
 endif()
 if (TARGET orca-capi)
     target_compile_definitions(orca-capi PRIVATE ${_ggml_orca_defs})
+endif()
+if (TARGET orca-dump-scale)
+    target_compile_definitions(orca-dump-scale PRIVATE ${_ggml_orca_defs})
+endif()
+if (TARGET orca-ggml)
+    target_compile_definitions(orca-ggml PRIVATE ${_ggml_orca_defs})
 endif()
 
 # ---- Link ORCA to ggml targets that include <orca/...> ----
