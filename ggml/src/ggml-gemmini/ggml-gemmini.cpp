@@ -151,7 +151,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     // Weight matrix layout follows TRANSPOSE_B:
     // - true:  JxK row-major (stride = K)
     // - false: KxJ row-major (stride = J_flat)
-    args.sB = args.transpose_B ? static_cast<size_t>(dim_k) : logical_cols;
+    args.sB = args.transpose_B ? static_cast<size_t>(dim_k) : logical_rows;
 
     const block_q8_0 *block_base = ggml_gemmini_args_block_base(src0);
     ggml_gemmini_args_t::unpacked_weight *cached = nullptr;
@@ -165,7 +165,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                            dim_w,
                            args.sB,
                            blocks_K,
-                           logical_cols,
+                           logical_rows,
                            args.transpose_B)) {
         cached = &it->second;
         orca::log::debug(layer,
@@ -271,7 +271,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     end = orca::cycle::read();
     orca::log::cycle(layer, "cpu.Breakdown Q8_0", start, end);
 
-    GGML_ASSERT(args.sB == (args.transpose_B ? static_cast<size_t>(dim_k) : logical_cols));
+    GGML_ASSERT(args.sB == (args.transpose_B ? static_cast<size_t>(dim_k) : logical_rows));
 
     start = orca::cycle::read();
     /* ______________________________ 4. bias 텐서 처리 _________________________________ */
@@ -425,8 +425,7 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
             GGML_ABORT("%s: unsupported op assigned to GEMMINI: %s\n", __func__, ggml_op_desc(node));
         }
     }
-#endif
-    
+
     GGML_UNUSED(backend);
     return GGML_STATUS_SUCCESS;
 }

@@ -130,10 +130,10 @@ typedef struct ggml_gemmini_args_t {
             if (stride != stride_elems) {
                 return false;
             }
-            if (blocks_K != blocks_k || blocks_J != logical_rows_) {
+            if (blocks_K != blocks_k || blocks_J != logical_cols_) {
                 return false;
             }
-            if (block_size_k != QK8_0 || logical_cols != logical_rows_) {
+            if (block_size_k != QK8_0 || logical_cols != logical_cols_) {
                 return false;
             }
             if (transpose_b != transpose_b_layout) {
@@ -142,7 +142,7 @@ typedef struct ggml_gemmini_args_t {
             if (q.size() != static_cast<size_t>(k) * logical_cols_) {
                 return false;
             }
-            if (scales.size() != blocks_k * logical_rows_) {
+            if (scales.size() != blocks_k * logical_cols_) {
                 return false;
             }
             return true;
