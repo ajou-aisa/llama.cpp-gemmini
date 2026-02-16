@@ -28,6 +28,11 @@
 #include "ggml-gemmini-args.h"
 //#include "quantization/ggml-gemmini-quantize.h"
 
+#if LOG_DUMP
+#include <atomic>
+#include <orca/ggml/log_dump.hpp>
+#endif
+
 #ifndef TRANSPOSE_B
 #define TRANSPOSE_B 1
 #endif
@@ -87,6 +92,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     const size_t I = dst->ne[1]; // I = A.ne[1], K = A.ne[0]
     const size_t J = dst->ne[0]; // K = B.ne[0], J = B.ne[1] (transpose)
     const size_t K = src1->ne[0]; // K = A.ne[0]
+
+#if LOG_DUMP
+    orca::log::dump(orca::log::file("log/tensor_data/act.jsonl"), layer, src1);
+#endif
     
     orca::log::debug(layer, "I=%zu, J=%zu, K=%zu", I, J, K);
 
@@ -303,7 +312,59 @@ static void ggml_backend_gemmini_free(ggml_backend_t backend) {
 
 static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_gemmini_context * ctx = (ggml_backend_gemmini_context *)backend->context;
-    
+
+#if LOG_DUMP
+    uint32_t mxI = 0;
+    bool decode_start_marker = false;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        struct ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_MUL_MAT) {
+            const uint32_t I = node->ne[1] > 0 ? static_cast<uint32_t>(node->ne[1]) : 1u;
+            if (I > mxI) {
+                mxI = I;
+            }
+            const struct ggml_tensor * src1 = node->src[1];
+            if (!decode_start_marker && src1 && src1->name &&
+                std::strcmp(src1->name, "attn_norm-0") == 0 &&
+                I == 1 && src1->ne[1] == 1) {
+                decode_start_marker = true;
+            }
+        }
+    }
+
+    static std::atomic<bool> g_seen_any_graph{false};
+    static std::atomic<bool> g_decode_started{false};
+    static std::atomic<uint64_t> g_decode_count{0};
+    orca::log::DumpPhase phase = orca::log::DumpPhase::unknown;
+    uint64_t step_id = 1;
+
+    const bool first_graph = !g_seen_any_graph.exchange(true, std::memory_order_relaxed);
+    if (first_graph) {
+        phase = orca::log::DumpPhase::prefill;
+        step_id = 1;
+        g_decode_started.store(false, std::memory_order_relaxed);
+        g_decode_count.store(0, std::memory_order_relaxed);
+    } else if (!g_decode_started.load(std::memory_order_relaxed)) {
+        if (decode_start_marker) {
+            g_decode_started.store(true, std::memory_order_relaxed);
+            g_decode_count.store(1, std::memory_order_relaxed);
+            phase = orca::log::DumpPhase::decode;
+            step_id = 2;
+        } else {
+            phase = orca::log::DumpPhase::prefill;
+            step_id = 1;
+        }
+    } else {
+        if (decode_start_marker) {
+            g_decode_count.fetch_add(1, std::memory_order_relaxed);
+        }
+        phase = orca::log::DumpPhase::decode;
+        step_id = 1 + g_decode_count.load(std::memory_order_relaxed);
+    }
+
+    orca::log::dump_begin_graph(phase, step_id, mxI);
+#endif
+
     for (int i = 0; i < cgraph->n_nodes; i++)
     {
         struct ggml_tensor *node = cgraph->nodes[i];
@@ -311,6 +372,10 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
         switch (node->op)
         {
         case GGML_OP_MUL_MAT: {
+#if LOG_DUMP
+            const int32_t node_idx = node->ne[0] > 0 ? static_cast<int32_t>(node->ne[0]) : 1;
+            orca::log::dump_set_node_idx(node_idx);
+#endif
             ggml_backend_gemmini_mul_mat(ctx, node);
             break;
         }
@@ -320,6 +385,9 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
         case GGML_OP_ADD:
+#if LOG_DUMP
+            orca::log::dump_set_node_idx(-1);
+#endif
             break;
 
         default:
