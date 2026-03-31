@@ -1729,7 +1729,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     // cycle var
     uint64_t start, end;
     // layer name
-    const char *layer = get_layer(tensor->name);
+    char layer[32];
+    get_layer(tensor->name, layer, sizeof(layer));
     
     switch (tensor->op) {
         case GGML_OP_DUP:
