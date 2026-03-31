@@ -25,12 +25,13 @@ set(GGML_GEMMINI_FORCE_GGML_ALL_DEF    $<IF:$<BOOL:${GGML_GEMMINI_FORCE_GGML_ALL
 
 set(GEMMINI_COMMON_FLAGS
   -fno-common
-  -fno-tree-loop-distribute-patterns
+  # -fno-tree-loop-distribute-patterns
   -ffast-math
 )
 
 set(GEMMINI_RISCV_FLAGS
   -std=gnu99
+  -fno-tree-loop-distribute-patterns 
   -fno-builtin-printf
   -march=rv64gc
   -Wa,-march=rv64gc
