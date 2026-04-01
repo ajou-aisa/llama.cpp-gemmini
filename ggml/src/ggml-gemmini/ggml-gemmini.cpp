@@ -74,6 +74,8 @@ uint64_t start, end; // 일반 사이클 측정
 static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                                          struct ggml_tensor *dst) // FP32 output (I×J)
 {
+    orca::log::cycle.set_output_path("log/cycle-log.jsonl");
+    orca::log::debug.set_output_path("log/debug-log.jsonl");
     const auto layer_type = orca::types::parse_layer(dst->src[1]->name);
     const char *layer = orca::types::to_string(layer_type);
     orca::log::debug(layer, "ggml_backend_gemmini_mul_mat called");
