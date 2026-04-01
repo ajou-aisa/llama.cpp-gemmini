@@ -20,10 +20,10 @@
 #include "ggml-backend-impl.h"
 
 #include <orca/log.hpp>
-#include <orca/layer.h>
 #include <orca/ggml/log_dump.hpp>
 #include <orca/ggml/ggml_orca.hpp>
 #include <orca/ggml/dec_orca.hpp>
+#include <orca/types/layer.hpp>
 
 #include "include/gemmini.h"
 // Legacy aisa::ActivationDEC is replaced by orca::ggml::ggml_gemmini_activation_dec
@@ -74,8 +74,8 @@ uint64_t start, end; // 일반 사이클 측정
 static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                                          struct ggml_tensor *dst) // FP32 output (I×J)
 {
-    // layer name
-    const char* layer = get_layer(dst->src[1]->name);
+    const auto layer_type = orca::types::parse_layer(dst->src[1]->name);
+    const char *layer = orca::types::to_string(layer_type);
     orca::log::debug(layer, "ggml_backend_gemmini_mul_mat called");
 
     /* ____________________________________ 0. 원본 FP32 입력 텐서 ____________________________________________ */
@@ -87,7 +87,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     // set args
     start = orca::cycle::read();
     args.transpose_B = (TRANSPOSE_B != 0);
-    args.layer_name = layer;
+    args.layer_type = layer_type;
     args.full_C = FULL_C;
     args.low_D = LOW_D;
     
