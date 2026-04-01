@@ -1,10 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 # Build Gemmini in CPU fallback mode on Apple Silicon; outputs live in build/bin
-BUILD_DIR=${BUILD_DIR:-"$script_dir/build-arm64"}
+BUILD_DIR=${BUILD_DIR:-build-arm64}
 LLAMA_CURL_DEFAULT=${LLAMA_CURL_DEFAULT:-OFF} # disable libcurl requirement on local macOS unless explicitly enabled
 CMAKE_BUILD_TYPE_DEFAULT=${CMAKE_BUILD_TYPE_DEFAULT:-Release} # Debug | Release
 GGML_NATIVE_DEFAULT=${GGML_NATIVE_DEFAULT:-ON} # ON | OFF
@@ -21,7 +19,7 @@ GGML_GEMMINI_TRANSPOSE_B_DEFAULT=${GGML_GEMMINI_TRANSPOSE_B:-1} # 0 | 1
 APPLE_SILICON_ARCH_DEFAULT=${APPLE_SILICON_ARCH:-arm64}
 BUILD_JOBS_DEFAULT=${BUILD_JOBS:-$(sysctl -n hw.logicalcpu)}
 
-cmake -B "$BUILD_DIR" -S "$script_dir" \
+cmake -B "$BUILD_DIR" -S . \
   -DGGML_METAL=OFF \
   -DGGML_BLAS=OFF \
   -DGGML_GEMMINI=ON \
