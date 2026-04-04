@@ -172,8 +172,16 @@ typedef struct ggml_gemmini_args_t {
 
     // logging & profiling helpers
     orca::types::LayerType layer_type = orca::types::LayerType::unknown;
+    const char *model_arch = "";
     const char *tag = "";
     bool measure_cycles = true;
+
+    bool ethos_override_enabled = false;
+    int ethos_q = 0;
+    int ethos_delta = 0;
+    bool ethos_l2_enabled = false;
+    int ethos_l2_c = 1;
+    int ethos_l2_d = 1;
 
 } ggml_gemmini_args_t;
 

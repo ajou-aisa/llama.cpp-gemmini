@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <cctype>
 #include <vector>
@@ -18,6 +19,7 @@
 #include "ggml-impl.h"
 #include "ggml-gemmini.h"
 #include "ggml-backend-impl.h"
+#include "ggml-gemmini-ethos-config.hpp"
 
 #include <orca/log.hpp>
 #include <orca/ggml/log_dump.hpp>
@@ -61,6 +63,8 @@ struct ggml_backend_gemmini_context
     std::vector<std::future<void>> tasks;
 #endif
     std::map<const block_q8_0 *, ggml_gemmini_args_t::unpacked_weight> weight_cache; // packed Q8_0 per weight base pointer
+    std::string model_arch;
+    ggml_gemmini_ethos_config_registry ethos_config;
     
 };
 
@@ -90,8 +94,21 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     start = orca::cycle::read();
     args.transpose_B = (TRANSPOSE_B != 0);
     args.layer_type = layer_type;
+    args.model_arch = ctx->model_arch.c_str();
+    orca::log::debug(layer, "model_arch=%s\n", args.model_arch ? args.model_arch : "");
     args.full_C = FULL_C;
     args.low_D = LOW_D;
+
+    const auto ethos_override = ggml_gemmini_resolve_ethos_override(ctx->ethos_config, ctx->model_arch, layer_type);
+    if (ethos_override.has_value())
+    {
+        args.ethos_override_enabled = true;
+        args.ethos_q = ethos_override->q;
+        args.ethos_delta = ethos_override->delta;
+        args.ethos_l2_enabled = ethos_override->l2_enabled;
+        args.ethos_l2_c = ethos_override->l2_c;
+        args.ethos_l2_d = ethos_override->l2_d;
+    }
     
     /* _______________________ 2. Gemmini용 dimension _____________________ */
     const size_t I = dst->ne[1]; // I = A.ne[1], K = A.ne[0]
@@ -512,10 +529,13 @@ static void ggml_backend_gemmini_device_get_props(ggml_backend_dev_t dev, struct
 }
 
 static ggml_backend_t ggml_backend_gemmini_device_init_backend(ggml_backend_dev_t dev, const char * params) {
-    return ggml_backend_gemmini_init();
+    ggml_backend_t backend = ggml_backend_gemmini_init();
+    auto * ctx = (ggml_backend_gemmini_context *) backend->context;
+    ctx->model_arch = params ? params : "";
+    ctx->ethos_config = ggml_gemmini_load_ethos_config_registry();
+    return backend;
 
     GGML_UNUSED(dev);
-    GGML_UNUSED(params);
 }
 
 static ggml_backend_buffer_type_t ggml_backend_gemmini_device_get_buffer_type(ggml_backend_dev_t dev) {
