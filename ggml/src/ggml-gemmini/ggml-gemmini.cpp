@@ -24,7 +24,7 @@
 #include <orca/log.hpp>
 #include <orca/ggml/log_dump.hpp>
 #include <orca/ggml/ggml_orca.hpp>
-#include <orca/ggml/dec_orca.hpp>
+#include <orca/ggml/dec_ggml.hpp>
 #include <orca/types/layer.hpp>
 
 #include "include/gemmini.h"

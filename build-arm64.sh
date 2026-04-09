@@ -18,6 +18,25 @@ GGML_GEMMINI_LOW_D_DEFAULT=${GGML_GEMMINI_LOW_D:-0} # 0 | 1
 GGML_GEMMINI_TRANSPOSE_B_DEFAULT=${GGML_GEMMINI_TRANSPOSE_B:-1} # 0 | 1
 APPLE_SILICON_ARCH_DEFAULT=${APPLE_SILICON_ARCH:-arm64}
 BUILD_JOBS_DEFAULT=${BUILD_JOBS:-$(sysctl -n hw.logicalcpu)}
+OPENMP_ENABLED_DEFAULT=${ORCA_ENABLE_OPENMP_DEFAULT:-ON}
+LIBOMP_PREFIX_DEFAULT=${LIBOMP_PREFIX:-}
+BREW_BIN=""
+
+if command -v brew >/dev/null 2>&1; then
+  BREW_BIN="$(command -v brew)"
+elif [[ -x "/opt/homebrew/bin/brew" ]]; then
+  BREW_BIN="/opt/homebrew/bin/brew"
+elif [[ -x "/usr/local/bin/brew" ]]; then
+  BREW_BIN="/usr/local/bin/brew"
+fi
+
+if [[ -z "$LIBOMP_PREFIX_DEFAULT" ]] && [[ -n "$BREW_BIN" ]]; then
+  if "$BREW_BIN" list libomp >/dev/null 2>&1; then
+    LIBOMP_PREFIX_DEFAULT="$("$BREW_BIN" --prefix libomp)"
+  fi
+fi
+
+CMAKE_PREFIX_PATH_DEFAULT="${CMAKE_PREFIX_PATH:-}"
 
 cmake -B "$BUILD_DIR" -S . \
   -DGGML_METAL=OFF \
@@ -39,6 +58,9 @@ cmake -B "$BUILD_DIR" -S . \
   -DGGML_NATIVE="${GGML_NATIVE_DEFAULT}" \
   -DLLAMA_CURL="${LLAMA_CURL_DEFAULT}" \
   -DCMAKE_OSX_ARCHITECTURES="${APPLE_SILICON_ARCH_DEFAULT}" \
+  -DGGML_OPENMP="${OPENMP_ENABLED_DEFAULT}" \
+  ${LIBOMP_PREFIX_DEFAULT:+-DOpenMP_ROOT="${LIBOMP_PREFIX_DEFAULT}"} \
+  ${LIBOMP_PREFIX_DEFAULT:+-DCMAKE_PREFIX_PATH="${LIBOMP_PREFIX_DEFAULT}${CMAKE_PREFIX_PATH_DEFAULT:+:${CMAKE_PREFIX_PATH_DEFAULT}}"} \
   "$@"
 
 cmake --build "$BUILD_DIR" --target llama-cli llama-perplexity -j"${BUILD_JOBS_DEFAULT}"
