@@ -10,6 +10,8 @@
 #include <vector>
 #include <limits>
 
+#include <orca/types/layer.hpp>
+
 struct ggml_gemmini_qact_outlier
 {
     int row = 0;       // activation row index (i)
@@ -62,20 +64,12 @@ typedef struct ggml_gemmini_args_t {
     size_t sC = 0;
     size_t sD = 0;
 
-    //scales, gemmini input val. 
-    scale_t scale_A = 1.f;
+    // scales, gemmini input val.
     scale_t scale_B = 1.f;
     scale_acc_t scale_D = 1;
     int act = 0; // default NO_ACTIVATION
     acc_scale_t scale = 1.0f;
     acc_scale_t bert_scale = 1.0f;
-
-    //for block scaling ////////////////////////////////////
-    const block_q8_0 * A_blocks = nullptr;
-    const float * A_scales = nullptr;
-    size_t A_scale_rows = 0; // number of activation rows with Q8_0 block scales
-    size_t A_scale_cols = 0; // number of Q8_0 blocks per row (K / QK8_0)
-
 
     //setiing flags 
     bool repeating_bias = false;
@@ -85,9 +79,9 @@ typedef struct ggml_gemmini_args_t {
     bool low_D = false;
 
     // activation quantization metadata
-    bool activation_block_scaled = false;
+    int16_t activation_e_t = std::numeric_limits<int16_t>::min();
+    int16_t activation_m = 0;
     std::vector<ggml_gemmini_qact_outlier> activation_outliers; // per-activation saturation records
-    int activation_shamt = 0; // reserved (legacy field)
 
     //for weight checking   
     uint8_t weightA = 0;
@@ -162,12 +156,6 @@ typedef struct ggml_gemmini_args_t {
     size_t effective_group_size_k = 0;         // K-axis group span used for Gemmini split
     size_t effective_group_size_aligned = 0;   // DIM(16)-aligned K-axis group span
 
-    // Activation-scale layout metadata (data-driven polymorphism for dequant)
-    bool activation_scale_table_enabled = false;
-    size_t activation_scale_group_size_k = 0;  // K span per activation scale group
-    size_t activation_scale_row_stride = 0;    // scale index += row * row_stride
-    size_t activation_scale_group_stride = 0;  // scale index += k_group * group_stride
-
     size_t gemmini_call_k_logical = 0;         // logical K used by latest Gemmini call
     size_t gemmini_call_k_aligned = 0;         // padded K used by latest Gemmini call
     size_t gemmini_call_tile_k_elems = 0;      // tile_k * DIM used by latest call
@@ -183,9 +171,17 @@ typedef struct ggml_gemmini_args_t {
     size_t col_stride_f_out = 0;  // column stride in elements
 
     // logging & profiling helpers
-    const char *layer_name = "";
+    orca::types::LayerType layer_type = orca::types::LayerType::unknown;
+    const char *model_arch = "";
     const char *tag = "";
     bool measure_cycles = true;
+
+    bool ethos_override_enabled = false;
+    int ethos_q = 0;
+    int ethos_delta = 0;
+    bool ethos_l2_enabled = false;
+    int ethos_l2_c = 1;
+    int ethos_l2_d = 1;
 
 } ggml_gemmini_args_t;
 

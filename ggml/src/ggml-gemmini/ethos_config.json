@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "defaults": {
+    "q": 8,
+    "delta": 0,
+    "l2": {
+      "enabled": false,
+      "c": 1,
+      "d": 1
+    }
+  },
+  "architectures": {
+    "gpt2": {
+      "default": {},
+      "layers": {
+        "attn_norm": {
+          "q": 8,
+          "delta": 4
+        },
+        "ffn_norm": {
+          "q": 8,
+          "delta": 3
+        },
+        "ffn_gelu": {
+          "q": 8,
+          "delta": 3
+        },
+        "kqv_out": {
+          "q": 7,
+          "delta": 4
+        },
+        "result_norm": {
+          "q": 8,
+          "delta": 1,
+          "l2": {
+            "enabled": true
+          }
+        }
+      }
+    },
+    "llama": {
+      "default": {},
+      "layers": {
+        "attn_norm": {},
+        "ffn_norm": {},
+        "ffn_gate_par": {},
+        "kqv_out": {},
+        "result_norm": {
+          "l2": {
+            "enabled": true
+          }
+        }
+      }
+    }
+  }
+}

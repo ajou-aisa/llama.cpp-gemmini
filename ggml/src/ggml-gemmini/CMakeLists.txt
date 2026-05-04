@@ -39,6 +39,7 @@ set(GEMMINI_RISCV_FLAGS
 
 ggml_add_backend_library(ggml-gemmini
                          ggml-gemmini.cpp
+                         ggml-gemmini-ethos-config.cpp
                         )
 
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
