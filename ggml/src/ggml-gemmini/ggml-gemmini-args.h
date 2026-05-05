@@ -89,6 +89,13 @@ typedef struct ggml_gemmini_args_t {
 
     // metadata extracted from Q8_0 tensors
     struct unpacked_weight {
+        // Q8_0_R path (default): row-wise double-quantized interleaved weights
+        std::vector<int8_t> q_interleaved; // [logical_rows][blocks_per_row*33+4]
+        std::vector<uint8_t> s_bi;         // [logical_rows][blocks_per_row]
+        std::vector<float> s_rf;           // [logical_rows]
+        std::vector<uint32_t> R;           // [logical_rows]
+
+        // Legacy Q8_0 path (preserved, not used by default)
         std::vector<int8_t> q;
         std::vector<float> scales; // [logical_rows][blocks_K] row-major
         const block_q8_0 *blocks = nullptr;
@@ -111,17 +118,14 @@ typedef struct ggml_gemmini_args_t {
                 int64_t j,
                 int64_t z,
                 int64_t w,
-                size_t stride_elems,
+                size_t /*stride_elems*/,
                 size_t blocks_k,
                 size_t logical_cols_,
-                bool transpose_b_layout) const {
+                bool /*transpose_b_layout*/) const {
             if (blocks != base) {
                 return false;
             }
             if (dim_k != k || dim_j != j || dim_z != z || dim_w != w) {
-                return false;
-            }
-            if (stride != stride_elems) {
                 return false;
             }
             if (blocks_K != blocks_k || blocks_J != logical_cols_) {
@@ -130,13 +134,18 @@ typedef struct ggml_gemmini_args_t {
             if (block_size_k != QK8_0 || logical_cols != logical_cols_) {
                 return false;
             }
-            if (transpose_b != transpose_b_layout) {
+            // Q8_0_R validity check
+            const size_t row_stride = blocks_k * 33 + sizeof(float);
+            if (q_interleaved.size() != logical_cols_ * row_stride) {
                 return false;
             }
-            if (q.size() != static_cast<size_t>(k) * logical_cols_) {
+            if (s_bi.size() != blocks_k * logical_cols_) {
                 return false;
             }
-            if (scales.size() != blocks_k * logical_cols_) {
+            if (s_rf.size() != logical_cols_) {
+                return false;
+            }
+            if (R.size() != logical_cols_) {
                 return false;
             }
             return true;
@@ -145,6 +154,12 @@ typedef struct ggml_gemmini_args_t {
 
     const block_q8_0 *B_blocks = nullptr;
     const float *B_scales = nullptr; // [blocks_J][blocks_K] row-major (row = J*Z*W)
+
+    // Q8_0_R weight fields (default path, no mode flag needed)
+    const uint8_t  *s_bi = nullptr;       // [J * blocks_per_row] per-block effective code
+    const float    *s_rf = nullptr;       // [J] per-row float scale
+    const uint32_t *R = nullptr;          // [J] per-row offset
+    size_t blocks_per_row = 0;            // K / 32
 
     size_t blocks_K = 0;      // number of Q8_0 blocks along the K dimension
     size_t blocks_J = 0;      // number of logical rows covered by scale table (J * Z * W)
@@ -176,6 +191,12 @@ typedef struct ggml_gemmini_args_t {
     const char *tag = "";
     bool measure_cycles = true;
 
+    // tile size of gemmini auto_tiling
+    size_t tile_I = 0;
+    size_t tile_J = 0;
+    size_t tile_K = 0;
+
+    // ethos parameter
     bool ethos_override_enabled = false;
     int ethos_q = 0;
     int ethos_delta = 0;

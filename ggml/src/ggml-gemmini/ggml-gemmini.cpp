@@ -124,13 +124,19 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.I = I;
     args.J = J;
     args.K = K;
-    
+
     /* _____ 3. Gemmini용 stride _____ */
     args.sA = K;
     args.sC = J;
 
     end = orca::cycle::read();
     orca::log::cycle(layer, "cpu.Set Args for calling gemmini", start, end);
+
+    // set tile size
+    start = orca::cycle::read();
+    orca::gemmini_set_tile(&args);
+    end = orca::cycle::read();
+    orca::log::cycle(layer, "cpu.Set tile size", start, end);
 
     // quantize activation
     start = orca::cycle::read();
@@ -198,22 +204,18 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     } else {
         if (it == ctx->weight_cache.end()) {
             orca::log::debug(layer,
-                             "[Q8_0 cache] miss base=%p K=%lld cols=%zu sB=%zu blocks_K=%zu transpose_B=%d",
+                             "[Q8_0_R cache] miss base=%p K=%lld cols=%zu blocks_K=%zu",
                              (const void *)block_base,
                              static_cast<long long>(dim_k),
                              logical_rows,
-                             args.sB,
-                             blocks_K,
-                             args.transpose_B ? 1 : 0);
+                             blocks_K);
         } else {
             orca::log::debug(layer,
-                             "[Q8_0 cache] refresh base=%p K=%lld cols=%zu sB=%zu blocks_K=%zu transpose_B=%d",
+                             "[Q8_0_R cache] refresh base=%p K=%lld cols=%zu blocks_K=%zu",
                              (const void *)block_base,
                              static_cast<long long>(dim_k),
                              logical_rows,
-                             args.sB,
-                             blocks_K,
-                             args.transpose_B ? 1 : 0);
+                             blocks_K);
         }
         ggml_gemmini_args_t::unpacked_weight entry;
         entry.blocks = block_base;
@@ -226,36 +228,16 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         entry.blocks_J = logical_rows;
         entry.blocks_I = logical_rows;
         entry.block_size_k = QK8_0;
-        entry.stride = args.sB;
         entry.transpose_b = args.transpose_B;
 
-        const __int128 q_size_128 =
-            static_cast<__int128>(dim_k) * static_cast<__int128>(logical_rows);
-        if (q_size_128 < 0 ||
-            q_size_128 > static_cast<__int128>(std::numeric_limits<size_t>::max())) {
-            GGML_ASSERT(false);
-            return;
-        }
-        const size_t q_size = static_cast<size_t>(q_size_128);
-        // Scale table layout: [logical_rows][blocks_K] row-major
-        const __int128 scale_size_128 =
-            static_cast<__int128>(blocks_K) * static_cast<__int128>(logical_rows);
-        if (scale_size_128 < 0 ||
-            scale_size_128 > static_cast<__int128>(std::numeric_limits<size_t>::max())) {
-            GGML_ASSERT(false);
-            return;
-        }
-        const size_t scale_size = static_cast<size_t>(scale_size_128);
-        entry.q.resize(q_size);
-        entry.scales.resize(scale_size);
-
-        // Use orca::ggml wrapper instead of inline ggml_gemmini_pack_q80
-        const bool ok = orca::ggml::quants::ggml_gemmini_unpack_q80_weight(
+        // Use Q8_0_R wrapper: vectors are resized by the unpack function
+        const bool ok = orca::ggml::quants::ggml_gemmini_unpack_q80_r_weight(
             src0,
             args,
-            reinterpret_cast<int8_t *>(entry.q.data()),
-            entry.stride,
-            entry.scales.data()
+            entry.q_interleaved,
+            entry.s_bi,
+            entry.s_rf,
+            entry.R
         );
         GGML_ASSERT(ok);
         if (!ok) {
@@ -267,6 +249,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         entry.blocks_J = args.blocks_J;
         entry.blocks_I = args.blocks_I;
         entry.block_size_k = args.block_size_k;
+        entry.stride = args.sB;
 
         if (it == ctx->weight_cache.end()) {
             it = ctx->weight_cache.emplace(block_base, std::move(entry)).first;
@@ -276,21 +259,29 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         cached = &it->second;
     }
 
-    args.B = reinterpret_cast<elem_t *>(cached->q.data());
+    args.B = reinterpret_cast<elem_t *>(cached->q_interleaved.data());
     args.B_blocks = cached->blocks;
-    args.B_scales = cached->scales.data();
+    args.B_scales = nullptr;
+    args.s_bi = cached->s_bi.data();
+    args.s_rf = cached->s_rf.data();
+    args.R = cached->R.data();
+    args.blocks_per_row = cached->blocks_K;
     args.blocks_K = cached->blocks_K;
     args.blocks_J = cached->blocks_J;
     args.blocks_I = cached->blocks_I;
     args.block_size_k = cached->block_size_k;
+    args.sB = cached->stride;
     orca::ggml::ggml_gemmini_prepare_group_meta(args);
+
+    orca::log::debug(layer,
+        "[Q8_0_R cache] restore B=%p sB=%zu s_bi=%p s_rf=%p R=%p blocks_per_row=%zu",
+        (void *)args.B, args.sB, (void *)args.s_bi, (void *)args.s_rf, (void *)args.R,
+        args.blocks_per_row);
     // orca::log::debug("[Gemmini addr] layer=%s A=%p B=%p B_blocks=%p B_scales=%p",
     //                  layer, (void *)args.A, (void *)args.B, (const void *)args.B_blocks, (const void *)args.B_scales);
 
     end = orca::cycle::read();
-    orca::log::cycle(layer, "cpu.Breakdown Q8_0", start, end);
-
-    GGML_ASSERT(args.sB == (args.transpose_B ? static_cast<size_t>(dim_k) : logical_rows));
+    orca::log::cycle(layer, "cpu.Breakdown Q8_0_R", start, end);
 
     start = orca::cycle::read();
     /* ______________________________ 4. bias 텐서 처리 _________________________________ */
@@ -326,7 +317,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     //                  layer, (void *)args.f_out, args.stride_f_out, args.col_stride_f_out);
 
     /* __ 5. Gemmini 호출 __ */
-    aisa::tiled_matmul_auto_fp32(&args); // gemmini 커널에서 tile과 block 매칭 -> tiled_matmul 호출 후 dequantize까지 수행
+    args.tiled_matmul_type = CPU;
+    orca::tiled_block_matmul_auto(&args);
     // dst에는 gemmini 커널에서 dequantize한 결과가 들어옴 
 
 #if ERROR_COMPENSATION
