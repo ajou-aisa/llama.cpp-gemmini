@@ -89,11 +89,11 @@ typedef struct ggml_gemmini_args_t {
 
     // metadata extracted from Q8_0 tensors
     struct unpacked_weight {
-        // Q8_0_R path (default): row-wise double-quantized interleaved weights
-        std::vector<int8_t> q_interleaved; // [logical_rows][blocks_per_row*33+4]
-        std::vector<uint8_t> s_bi;         // [logical_rows][blocks_per_row]
+        // Q8_0_R path (default): row-wise double-quantized planar weights
+        std::vector<int8_t> q_qs;          // [logical_rows * K] dense int8 weights
+        std::vector<uint8_t> c_b;         // [logical_rows][blocks_per_row]
         std::vector<float> s_rf;           // [logical_rows]
-        std::vector<uint32_t> R;           // [logical_rows]
+        std::vector<uint16_t> R;            // [logical_rows]
 
         // Legacy Q8_0 path (preserved, not used by default)
         std::vector<int8_t> q;
@@ -134,12 +134,11 @@ typedef struct ggml_gemmini_args_t {
             if (block_size_k != QK8_0 || logical_cols != logical_cols_) {
                 return false;
             }
-            // Q8_0_R validity check
-            const size_t row_stride = blocks_k * 33 + sizeof(float);
-            if (q_interleaved.size() != logical_cols_ * row_stride) {
+            // Q8_0_R planar validity check
+            if (q_qs.size() != logical_cols_ * static_cast<size_t>(k)) {
                 return false;
             }
-            if (s_bi.size() != blocks_k * logical_cols_) {
+            if (c_b.size() != blocks_k * logical_cols_) {
                 return false;
             }
             if (s_rf.size() != logical_cols_) {
@@ -156,9 +155,9 @@ typedef struct ggml_gemmini_args_t {
     const float *B_scales = nullptr; // [blocks_J][blocks_K] row-major (row = J*Z*W)
 
     // Q8_0_R weight fields (default path, no mode flag needed)
-    const uint8_t  *s_bi = nullptr;       // [J * blocks_per_row] per-block effective code
+    const uint8_t  *c_b = nullptr;       // [J * blocks_per_row] per-block effective code
     const float    *s_rf = nullptr;       // [J] per-row float scale
-    const uint32_t *R = nullptr;          // [J] per-row offset
+    const uint16_t *R = nullptr;           // [J] per-row offset
     size_t blocks_per_row = 0;            // K / 32
 
     size_t blocks_K = 0;      // number of Q8_0 blocks along the K dimension

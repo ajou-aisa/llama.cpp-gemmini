@@ -234,8 +234,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         const bool ok = orca::ggml::quants::ggml_gemmini_unpack_q80_r_weight(
             src0,
             args,
-            entry.q_interleaved,
-            entry.s_bi,
+            entry.q_qs,
+            entry.c_b,
             entry.s_rf,
             entry.R
         );
@@ -259,10 +259,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         cached = &it->second;
     }
 
-    args.B = reinterpret_cast<elem_t *>(cached->q_interleaved.data());
+    args.B = reinterpret_cast<elem_t *>(cached->q_qs.data());
     args.B_blocks = cached->blocks;
     args.B_scales = nullptr;
-    args.s_bi = cached->s_bi.data();
+    args.c_b = cached->c_b.data();
     args.s_rf = cached->s_rf.data();
     args.R = cached->R.data();
     args.blocks_per_row = cached->blocks_K;
@@ -270,12 +270,12 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.blocks_J = cached->blocks_J;
     args.blocks_I = cached->blocks_I;
     args.block_size_k = cached->block_size_k;
-    args.sB = cached->stride;
+    args.sB = static_cast<size_t>(cached->dim_k);
     orca::ggml::ggml_gemmini_prepare_group_meta(args);
 
     orca::log::debug(layer,
-        "[Q8_0_R cache] restore B=%p sB=%zu s_bi=%p s_rf=%p R=%p blocks_per_row=%zu",
-        (void *)args.B, args.sB, (void *)args.s_bi, (void *)args.s_rf, (void *)args.R,
+        "[Q8_0_R cache] restore B=%p sB=%zu c_b=%p s_rf=%p R=%p blocks_per_row=%zu",
+        (void *)args.B, args.sB, (void *)args.c_b, (void *)args.s_rf, (void *)args.R,
         args.blocks_per_row);
     // orca::log::debug("[Gemmini addr] layer=%s A=%p B=%p B_blocks=%p B_scales=%p",
     //                  layer, (void *)args.A, (void *)args.B, (const void *)args.B_blocks, (const void *)args.B_scales);
