@@ -70,6 +70,99 @@ struct ggml_backend_gemmini_context
 
 using namespace aisa;
 
+static bool ggml_gemmini_compute_panel_scales(
+    const ggml_tensor *src0,
+    size_t logical_rows,
+    size_t blocks_per_row,
+    size_t panel_J,
+    std::vector<float> &s_rf_panel,
+    std::vector<uint16_t> &R_panel)
+{
+    if (panel_J <= 1 || logical_rows == 0 || blocks_per_row == 0) {
+        return false;
+    }
+
+    const size_t num_panels = (logical_rows + panel_J - 1) / panel_J;
+    s_rf_panel.assign(num_panels, 0.0f);
+    R_panel.assign(num_panels, 0);
+
+    const int64_t dim_j = src0->ne[1] ? src0->ne[1] : 1;
+    const int64_t dim_z = src0->ne[2] ? src0->ne[2] : 1;
+    const int64_t dim_w = src0->ne[3] ? src0->ne[3] : 1;
+
+    const char *base = (const char *)(src0->view_src ? src0->view_src->data : src0->data);
+    const size_t offs = src0->view_src ? src0->view_offs : 0;
+    const char *effective_base = base + offs;
+
+    const size_t nb0 = src0->nb[0];
+    const size_t nb1 = src0->nb[1];
+    const size_t nb2 = src0->nb[2];
+    const size_t nb3 = src0->nb[3];
+
+    std::vector<float> panel_min(num_panels, std::numeric_limits<float>::infinity());
+    std::vector<float> panel_max(num_panels, -std::numeric_limits<float>::infinity());
+
+    size_t row_idx = 0;
+    for (int64_t iw = 0; iw < dim_w; ++iw) {
+        for (int64_t iz = 0; iz < dim_z; ++iz) {
+            for (int64_t iy = 0; iy < dim_j; ++iy) {
+                const size_t panel_idx = row_idx / panel_J;
+
+                const char *row_ptr = effective_base
+                    + iw * nb3
+                    + iz * nb2
+                    + iy * nb1;
+
+                for (size_t blk = 0; blk < blocks_per_row; ++blk) {
+                    const char *blk_ptr = row_ptr + blk * nb0;
+                    ggml_fp16_t d;
+                    std::memcpy(&d, blk_ptr + offsetof(block_q8_0, d), sizeof(d));
+                    const float s_b = GGML_FP16_TO_FP32(d);
+
+                    if (std::isfinite(s_b)) {
+                        panel_min[panel_idx] = std::min(panel_min[panel_idx], s_b);
+                        panel_max[panel_idx] = std::max(panel_max[panel_idx], s_b);
+                    }
+                }
+
+                ++row_idx;
+            }
+        }
+    }
+
+    constexpr float q8_0_r_scale_bins = 255.0f;
+    for (size_t p = 0; p < num_panels; ++p) {
+        const float scale_range = panel_max[p] - panel_min[p];
+        if (!std::isfinite(scale_range) || scale_range <= 0.0f) {
+            if (panel_min[p] > 0.0f && std::isfinite(panel_min[p])) {
+                s_rf_panel[p] = panel_min[p];
+                R_panel[p] = 1;
+            } else {
+                s_rf_panel[p] = 0.0f;
+                R_panel[p] = 0;
+            }
+            continue;
+        }
+
+        s_rf_panel[p] = scale_range / q8_0_r_scale_bins;
+        if (!std::isfinite(s_rf_panel[p]) || s_rf_panel[p] <= 0.0f) {
+            if (panel_min[p] > 0.0f && std::isfinite(panel_min[p])) {
+                s_rf_panel[p] = panel_min[p];
+                R_panel[p] = 1;
+            } else {
+                s_rf_panel[p] = 0.0f;
+                R_panel[p] = 0;
+            }
+            continue;
+        }
+
+        const double r_val = std::round(static_cast<double>(panel_min[p]) / static_cast<double>(s_rf_panel[p]));
+        R_panel[p] = static_cast<uint16_t>(std::min(65535.0, std::max(0.0, r_val)));
+    }
+
+    return true;
+}
+
 // Cycle 측정 용
 extern "C" volatile uint64_t gemmini_tiled_matmul_cycles = 0; // gemmini.h
 
@@ -191,7 +284,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                            args.sB,
                            blocks_K,
                            logical_rows,
-                           args.transpose_B)) {
+                           args.transpose_B,
+                           args.panel_J)) {
         cached = &it->second;
         orca::log::debug(layer,
                          "[Q8_0 cache] hit base=%p K=%lld cols=%zu sB=%zu blocks_K=%zu transpose_B=%d",
@@ -251,6 +345,13 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         entry.block_size_k = args.block_size_k;
         entry.stride = args.sB;
 
+        if (args.panel_J > 1) {
+            entry.panel_J = args.panel_J;
+            ggml_gemmini_compute_panel_scales(
+                src0, logical_rows, blocks_K, args.panel_J,
+                entry.s_rf_panel, entry.R_panel);
+        }
+
         if (it == ctx->weight_cache.end()) {
             it = ctx->weight_cache.emplace(block_base, std::move(entry)).first;
         } else {
@@ -271,12 +372,15 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.blocks_I = cached->blocks_I;
     args.block_size_k = cached->block_size_k;
     args.sB = static_cast<size_t>(cached->dim_k);
+    args.panel_J = cached->panel_J;
+    args.s_rf_panel = cached->panel_J > 1 ? cached->s_rf_panel.data() : nullptr;
+    args.R_panel = cached->panel_J > 1 ? cached->R_panel.data() : nullptr;
     orca::ggml::ggml_gemmini_prepare_group_meta(args);
 
     orca::log::debug(layer,
-        "[Q8_0_R cache] restore B=%p sB=%zu c_b=%p s_rf=%p R=%p blocks_per_row=%zu",
+        "[Q8_0_R cache] restore B=%p sB=%zu c_b=%p s_rf=%p R=%p blocks_per_row=%zu panel_J=%zu",
         (void *)args.B, args.sB, (void *)args.c_b, (void *)args.s_rf, (void *)args.R,
-        args.blocks_per_row);
+        args.blocks_per_row, args.panel_J);
     // orca::log::debug("[Gemmini addr] layer=%s A=%p B=%p B_blocks=%p B_scales=%p",
     //                  layer, (void *)args.A, (void *)args.B, (const void *)args.B_blocks, (const void *)args.B_scales);
 

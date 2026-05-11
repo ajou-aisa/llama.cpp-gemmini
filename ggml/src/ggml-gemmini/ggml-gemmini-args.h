@@ -95,6 +95,11 @@ typedef struct ggml_gemmini_args_t {
         std::vector<float> s_rf;           // [logical_rows]
         std::vector<uint16_t> R;            // [logical_rows]
 
+        // Panel-wise scale metadata (panel_J > 1)
+        std::vector<float> s_rf_panel;      // [num_panels_J] per-panel float scale
+        std::vector<uint16_t> R_panel;      // [num_panels_J] per-panel offset
+        size_t panel_J = 0;                 // panel tile dimension (0 or 1 = row-wise)
+
         // Legacy Q8_0 path (preserved, not used by default)
         std::vector<int8_t> q;
         std::vector<float> scales; // [logical_rows][blocks_K] row-major
@@ -121,7 +126,8 @@ typedef struct ggml_gemmini_args_t {
                 size_t /*stride_elems*/,
                 size_t blocks_k,
                 size_t logical_cols_,
-                bool /*transpose_b_layout*/) const {
+                bool /*transpose_b_layout*/,
+                size_t panel_J_ = 0) const {
             if (blocks != base) {
                 return false;
             }
@@ -147,6 +153,18 @@ typedef struct ggml_gemmini_args_t {
             if (R.size() != logical_cols_) {
                 return false;
             }
+            if (panel_J != panel_J_) {
+                return false;
+            }
+            if (panel_J_ > 1) {
+                const size_t num_panels = (logical_cols_ + panel_J_ - 1) / panel_J_;
+                if (s_rf_panel.size() != num_panels) {
+                    return false;
+                }
+                if (R_panel.size() != num_panels) {
+                    return false;
+                }
+            }
             return true;
         }
     };
@@ -159,6 +177,10 @@ typedef struct ggml_gemmini_args_t {
     const float    *s_rf = nullptr;       // [J] per-row float scale
     const uint16_t *R = nullptr;           // [J] per-row offset
     size_t blocks_per_row = 0;            // K / 32
+
+    size_t panel_J = 0;                  // panel tile dimension for weight scale sharing
+    const float *s_rf_panel = nullptr;   // [num_panels_J] per-panel float scale
+    const uint16_t *R_panel = nullptr;    // [num_panels_J] per-panel offset
 
     size_t blocks_K = 0;      // number of Q8_0 blocks along the K dimension
     size_t blocks_J = 0;      // number of logical rows covered by scale table (J * Z * W)
