@@ -79,8 +79,10 @@ typedef struct ggml_gemmini_args_t {
     bool low_D = false;
 
     // activation quantization metadata
+    const ggml_tensor *activation_src = nullptr; // source tensor for tile-row re-quantization in Gemmini loops
     int16_t activation_e_t = std::numeric_limits<int16_t>::min();
     int16_t activation_m = 0;
+    std::vector<int16_t> activation_e_t_per_tile; // one exponent per logical tile_I x K row panel
     std::vector<ggml_gemmini_qact_outlier> activation_outliers; // per-activation saturation records
 
     //for weight checking   
@@ -95,10 +97,11 @@ typedef struct ggml_gemmini_args_t {
         std::vector<float> s_rf;           // [logical_rows]
         std::vector<uint16_t> R;            // [logical_rows]
 
-        // Panel-wise scale metadata (panel_J > 1)
+        // Panel-wise scale metadata (panel_J logical output columns per shared panel)
         std::vector<float> s_rf_panel;      // [num_panels_J] per-panel float scale
         std::vector<uint16_t> R_panel;      // [num_panels_J] per-panel offset
-        size_t panel_J = 0;                 // panel tile dimension (0 or 1 = row-wise)
+        size_t panel_J = 0;                 // producer panel width used for unpacked panel metadata (0 or 1 = row-wise)
+        size_t logical_panel_J = 1;         // active cache contract width on the logical J axis (row-wise = 1)
 
         // Legacy Q8_0 path (preserved, not used by default)
         std::vector<int8_t> q;
@@ -127,6 +130,7 @@ typedef struct ggml_gemmini_args_t {
                 size_t blocks_k,
                 size_t logical_cols_,
                 bool /*transpose_b_layout*/,
+                size_t logical_panel_J_ = 1,
                 size_t panel_J_ = 0) const {
             if (blocks != base) {
                 return false;
@@ -151,6 +155,9 @@ typedef struct ggml_gemmini_args_t {
                 return false;
             }
             if (R.size() != logical_cols_) {
+                return false;
+            }
+            if (logical_panel_J != logical_panel_J_) {
                 return false;
             }
             if (panel_J != panel_J_) {
@@ -178,7 +185,7 @@ typedef struct ggml_gemmini_args_t {
     const uint16_t *R = nullptr;           // [J] per-row offset
     size_t blocks_per_row = 0;            // K / 32
 
-    size_t panel_J = 0;                  // panel tile dimension for weight scale sharing
+    size_t panel_J = 0;                  // logical output-column element count per shared scale panel
     const float *s_rf_panel = nullptr;   // [num_panels_J] per-panel float scale
     const uint16_t *R_panel = nullptr;    // [num_panels_J] per-panel offset
 
@@ -212,10 +219,15 @@ typedef struct ggml_gemmini_args_t {
     const char *tag = "";
     bool measure_cycles = true;
 
-    // tile size of gemmini auto_tiling
+    // Gemmini auto-tiling counts in DIM units. Use tile_*_elems() for logical element spans.
     size_t tile_I = 0;
     size_t tile_J = 0;
     size_t tile_K = 0;
+
+    inline size_t tile_I_elems() const { return tile_I * static_cast<size_t>(DIM); }
+    inline size_t tile_J_elems() const { return tile_J * static_cast<size_t>(DIM); }
+    inline size_t tile_K_elems() const { return tile_K * static_cast<size_t>(DIM); }
+    inline size_t panel_J_or_rowwise_elems() const { return panel_J > 0 ? panel_J : 1; }
 
     // ethos parameter
     bool ethos_override_enabled = false;

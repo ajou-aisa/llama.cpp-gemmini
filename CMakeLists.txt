@@ -266,10 +266,8 @@ endif()
 # ---- Link ORCA to ggml targets that include <orca/...> ----
 if (LLAMA_WITH_ORCA)
     if (TARGET ggml-cpu AND TARGET orca)
-        # ggml-cpu는 C API(log/layer)만 필요하므로 ggml 의존이 없는 orca-capi에 연결
         target_link_libraries(ggml-cpu PUBLIC orca-capi)
 
-        # C 타겟이지만 C++ 라이브러리를 링크하므로 링크 단계는 C++로
         set_target_properties(ggml-cpu PROPERTIES LINKER_LANGUAGE CXX)
     endif()
 
