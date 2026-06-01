@@ -5,6 +5,7 @@
 #include "../common/tensor_util.hpp"
 
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
