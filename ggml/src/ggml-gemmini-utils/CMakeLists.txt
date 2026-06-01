@@ -4,6 +4,7 @@ add_library(ggml-gemmini-utils STATIC
     src/log-capi.cpp
     src/cycle_reader-capi.cpp
 )
+set_target_properties(ggml-gemmini-utils PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(ggml-gemmini-utils
     PUBLIC
