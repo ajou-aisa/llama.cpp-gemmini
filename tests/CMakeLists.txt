@@ -154,7 +154,8 @@ endif()
 # llama_build_and_test(test-opt.cpp) # SLOW
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
-llama_build_and_test(test-orca-ch-kernel.cpp)
+llama_build_and_test(test-gemmini-quant-contract.cpp)
+target_link_libraries(test-gemmini-quant-contract PRIVATE ggml-gemmini)
 
 llama_build_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_build_and_test(test-autorelease.cpp        LABEL "model")
