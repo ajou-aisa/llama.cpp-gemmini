@@ -15,6 +15,12 @@ endif()
 # Add path to modules
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
 
+# Gemmini include path (needed for gemmini_params.h in ggml-gemmini-args.h)
+get_filename_component(GEMMINI_SW_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../RISC-V-DynDNN-gemmini-include" ABSOLUTE)
+if (EXISTS "${GEMMINI_SW_PATH}/gemmini.h" OR EXISTS "${GEMMINI_SW_PATH}/include/gemmini.h")
+    include_directories(${GEMMINI_SW_PATH} ${GEMMINI_SW_PATH}/include)
+endif()
+
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
@@ -161,9 +167,6 @@ if (LLAMA_USE_SYSTEM_GGML)
     add_library(ggml ALIAS ggml::ggml)
 endif()
 
-# ---- Research (AISA) integration ----
-option(LLAMA_WITH_ORCA "Build and link ORCA (research) library" ON)
-
 # Gemmini compile-time switches (source of truth: root cache + build scripts).
 set(GGML_GEMMINI_PRINT_TILE "0" CACHE STRING "Gemmini PRINT_TILE macro (0|1)")
 set_property(CACHE GGML_GEMMINI_PRINT_TILE PROPERTY STRINGS 0 1)
@@ -210,18 +213,6 @@ set(GGML_GEMMINI_COMPILE_DEFS
     GEMMINI_DISABLE_WS_REUSE=${GGML_GEMMINI_DISABLE_WS_REUSE}
 )
 
-if (LLAMA_WITH_ORCA)
-    # llama.cpp-gemmini 와 orca(연구)가 모두 workspace/ 디렉터리라는 가정
-    get_filename_component(ORCA_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../orca" ABSOLUTE)
-
-    if (EXISTS "${ORCA_SRC_DIR}/CMakeLists.txt")
-        # 외부 소스 디렉터리를 add_subdirectory 할 때는 build dir를 반드시 따로 준다
-        add_subdirectory("${ORCA_SRC_DIR}" "${CMAKE_BINARY_DIR}/orca-build")
-    else()
-        message(FATAL_ERROR "ORCA repo not found: ${ORCA_SRC_DIR}")
-    endif()
-endif()
-
 # set log option
 set(LOG_DEBUG "1" CACHE STRING "Enable debug logs (0|1)")
 set_property(CACHE LOG_DEBUG PROPERTY STRINGS 0 1)
@@ -234,7 +225,7 @@ set_property(CACHE LOG_DUMP_SCALE PROPERTY STRINGS 0 1)
 set(ERROR_COMPENSATION "0" CACHE STRING "Enable activation error compensation (0|1)")
 set_property(CACHE ERROR_COMPENSATION PROPERTY STRINGS 0 1)
 
-set(_ggml_orca_defs
+set(GGML_GEMMINI_RUNTIME_COMPILE_DEFS
     LOG_DEBUG=${LOG_DEBUG}
     LOG_CYCLE=${LOG_CYCLE}
     LOG_DUMP=${LOG_DUMP}
@@ -243,39 +234,13 @@ set(_ggml_orca_defs
     GEMMINI_VERIFY_DEQ=1
 )
 
-# ---- ggml build (must come AFTER orca) ----
+list(APPEND GGML_GEMMINI_COMPILE_DEFS ${GGML_GEMMINI_RUNTIME_COMPILE_DEFS})
+set(GGML_GEMMINI_UTILS_COMPILE_DEFS ${GGML_GEMMINI_RUNTIME_COMPILE_DEFS})
+
+# ---- ggml build ----
 if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     add_subdirectory(ggml)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
-endif()
-
-# Apply the same logging macros to ORCA itself so its compiled code matches ggml consumers
-if (TARGET orca-log)
-    target_compile_definitions(orca-log PUBLIC ${_ggml_orca_defs})
-endif()
-if (TARGET orca-capi)
-    target_compile_definitions(orca-capi PRIVATE ${_ggml_orca_defs})
-endif()
-if (TARGET orca-dump-scale)
-    target_compile_definitions(orca-dump-scale PRIVATE ${_ggml_orca_defs})
-endif()
-if (TARGET orca-ggml)
-    target_compile_definitions(orca-ggml PRIVATE ${_ggml_orca_defs})
-endif()
-
-# ---- Link ORCA to ggml targets that include <orca/...> ----
-if (LLAMA_WITH_ORCA)
-    if (TARGET ggml-cpu AND TARGET orca)
-        target_link_libraries(ggml-cpu PUBLIC orca-capi)
-
-        set_target_properties(ggml-cpu PROPERTIES LINKER_LANGUAGE CXX)
-    endif()
-
-    # gemmini도 orca를 쓰면 동일하게
-    if (TARGET ggml-gemmini AND TARGET orca)
-        target_link_libraries(ggml-gemmini PUBLIC orca-capi)
-        # ggml-gemmini는 C++이므로 LINKER_LANGUAGE는 보통 불필요
-    endif()
 endif()
 
 #

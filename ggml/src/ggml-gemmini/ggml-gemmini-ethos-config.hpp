@@ -4,7 +4,7 @@
 #include <optional>
 #include <string>
 
-#include <orca/types/layer.hpp>
+#include <gemmini/layer.hpp>
 
 struct ggml_gemmini_ethos_patch
 {
@@ -18,7 +18,7 @@ struct ggml_gemmini_ethos_patch
 struct ggml_gemmini_ethos_arch_config
 {
     ggml_gemmini_ethos_patch defaults;
-    std::map<orca::types::LayerType, ggml_gemmini_ethos_patch> layers;
+    std::map<ggml::gemmini::types::LayerType, ggml_gemmini_ethos_patch> layers;
 };
 
 struct ggml_gemmini_ethos_config_registry
@@ -42,4 +42,4 @@ ggml_gemmini_ethos_config_registry ggml_gemmini_load_ethos_config_registry();
 std::optional<ggml_gemmini_resolved_ethos_override> ggml_gemmini_resolve_ethos_override(
     const ggml_gemmini_ethos_config_registry &registry,
     const std::string &model_arch,
-    orca::types::LayerType layer_type);
+    ggml::gemmini::types::LayerType layer_type);

@@ -1,17 +1,15 @@
 // ggml-gemmini.cpp
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <cctype>
 #include <vector>
 #include <string>
 #include <utility>
-#include <future>
-#include <vector>
+
 #include <limits>
+
 #include <map>
 #include <memory>
 #include <type_traits>
@@ -21,21 +19,20 @@
 #include "ggml-backend-impl.h"
 #include "ggml-gemmini-ethos-config.hpp"
 
-#include <orca/log.hpp>
-#include <orca/ggml/log_dump.hpp>
-#include <orca/ggml/ggml_orca.hpp>
-#include <orca/ggml/dec_ggml.hpp>
-#include <orca/types/layer.hpp>
+#include <gemmini/log.hpp>
+#include "dump/dump_tensor.hpp"
 
-#include "include/gemmini.h"
-// Legacy aisa::ActivationDEC is replaced by orca::ggml::ggml_gemmini_activation_dec
+#include <gemmini.h>
+// Legacy aisa::ActivationDEC is replaced by ggml::gemmini::quants::dec
 // #include "error_compensation/activation_DEC.h"
 #include "ggml-gemmini-args.h"
+#include "quants/common/tensor_util.hpp"
+#include "quants/act/quantize.hpp"
+#include "quants/weight/unpack_Q8_0.hpp"
 //#include "quantization/ggml-gemmini-quantize.h"
 
 #if LOG_DUMP
 #include <atomic>
-#include <orca/ggml/log_dump.hpp>
 #endif
 
 #ifndef TRANSPOSE_B
@@ -50,25 +47,25 @@
 #ifndef ERROR_COMPENSATION
 #define ERROR_COMPENSATION 0
 #endif 
+#if ERROR_COMPENSATION
+#include "quants/dec/dec.hpp"
+#endif
 #ifndef OPTION
 #define OPTION CPU
 #endif
+
+using namespace ggml::gemmini::quants;
 
 struct ggml_backend_gemmini_context
 {
     int n_threads = GGML_DEFAULT_N_THREADS;
     std::unique_ptr<char[]> work_data;
     size_t work_size = 0;
-#ifndef GGML_USE_OPENMP
-    std::vector<std::future<void>> tasks;
-#endif
     std::map<const block_q8_0 *, ggml_gemmini_args_t::unpacked_weight> weight_cache; // packed Q8_0 per weight base pointer
     std::string model_arch;
     ggml_gemmini_ethos_config_registry ethos_config;
     
 };
-
-using namespace aisa;
 
 // Cycle 측정 용
 extern "C" volatile uint64_t gemmini_tiled_matmul_cycles = 0; // gemmini.h
@@ -78,11 +75,11 @@ uint64_t start, end; // 일반 사이클 측정
 static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                                          struct ggml_tensor *dst) // FP32 output (I×J)
 {
-    orca::log::cycle.set_output_path("log/cycle-log.jsonl");
-    orca::log::debug.set_output_path("log/debug-log.jsonl");
-    const auto layer_type = orca::types::parse_layer(dst->src[1]->name);
-    const char *layer = orca::types::to_string(layer_type);
-    orca::log::debug(layer, "ggml_backend_gemmini_mul_mat called");
+    ggml::gemmini::log::cycle.set_output_path("log/cycle-log.jsonl");
+    ggml::gemmini::log::debug.set_output_path("log/debug-log.jsonl");
+    const auto layer_type = ggml::gemmini::types::parse_layer(dst->src[1]->name);
+    const char *layer = ggml::gemmini::types::to_string(layer_type);
+    ggml::gemmini::log::debug(layer, "ggml_backend_gemmini_mul_mat called");
 
     /* ____________________________________ 0. 원본 FP32 입력 텐서 ____________________________________________ */
     const auto *src0 = dst->src[0]; // src0: weight (J x K), row-major, 전치 상태
@@ -94,10 +91,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     const size_t K = src1->ne[0]; // K = A.ne[0]
 
 #if LOG_DUMP
-    orca::log::dump(orca::log::file("log/tensor_data/act.jsonl"), layer, src1);
+    ggml::gemmini::log::dump(ggml::gemmini::log::file("log/tensor_data/act.jsonl"), layer, src1);
 #endif
     
-    orca::log::debug(layer, "I=%zu, J=%zu, K=%zu", I, J, K);
+    ggml::gemmini::log::debug(layer, "I=%zu, J=%zu, K=%zu", I, J, K);
 
     if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) {
             std::vector<float> src0_f32;
@@ -112,20 +109,20 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 }
                 src0_f = src0_f32.data();
             }
-            orca::matmul_cpu_fp(false, true, I, J, K,
-                                (const float *)src1->data, src0_f, NULL, (float *)dst->data,
-                                K, K, 0, J);
+            ggml::gemmini::matmul_cpu_fp(false, true, I, J, K,
+                                         (const float *)src1->data, src0_f, NULL, (float *)dst->data,
+                                         K, K, 0, J);
             return;
         }
 
     ggml_gemmini_args_t args; // DEC과 gemmini 호출을 위한 args 
 
     // set args
-    start = orca::cycle::read();
+    start = ggml::gemmini::cycle::read();
     args.transpose_B = (TRANSPOSE_B != 0);
     args.layer_type = layer_type;
     args.model_arch = ctx->model_arch.c_str();
-    orca::log::debug(layer, "model_arch=%s\n", args.model_arch ? args.model_arch : "");
+    ggml::gemmini::log::debug(layer, "model_arch=%s\n", args.model_arch ? args.model_arch : "");
     args.full_C = FULL_C;
     args.low_D = LOW_D;
 
@@ -148,34 +145,49 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.sA = K;
     args.sC = J;
 
-    end = orca::cycle::read();
-    orca::log::cycle(layer, "cpu.Set Args for calling gemmini", start, end);
+    end = ggml::gemmini::cycle::read();
+    ggml::gemmini::log::cycle(layer, "cpu.Set Args for calling gemmini", start, end);
 
     // set tile size
-    start = orca::cycle::read();
-    orca::gemmini_set_tile(&args);
-    end = orca::cycle::read();
-    orca::log::cycle(layer, "cpu.Set tile size", start, end);
+    start = ggml::gemmini::cycle::read();
+    ggml::gemmini::gemmini_set_tile(&args);
+    end = ggml::gemmini::cycle::read();
+    ggml::gemmini::log::cycle(layer, "cpu.Set tile size", start, end);
 
     // quantize activation
-    start = orca::cycle::read();
+    start = ggml::gemmini::cycle::read();
 
     static thread_local std::vector<int8_t> activation_q;
     activation_q.resize(I * K);
     int8_t *qx = activation_q.data();
 
     args.activation_src = src1;
-    orca::ggml::quants::ggml_gemmini_quantize_activation(src1, args, qx);
-    // ggml_gemmini_quantize_activation(src1, args, qx);
+    reset_activation_quant_state(args);
+    auto activation_cfg = make_activation_quant_config(args);
+    ggml::gemmini::log::debug(
+        ggml::gemmini::types::to_string(args.layer_type),
+        "[ethos] final cfg model_arch=%s override=%d m=%d qmax=%d delta=%d l2_on=%d l2.c=%d l2.d=%d",
+        args.model_arch ? args.model_arch : "",
+        args.ethos_override_enabled ? 1 : 0,
+        static_cast<int>(activation_cfg.m),
+        static_cast<int>(activation_cfg.qmax),
+        activation_cfg.delta,
+        activation_cfg.l2_on ? 1 : 0,
+        activation_cfg.l2.c,
+        activation_cfg.l2.d);
+
+    args.group_scope = GGML_GEMMINI_GROUP_BLOCK;
+    auto activation_res = ggml::gemmini::quants::quantize_activation_f32(src1, args, qx, activation_cfg);
+    capture_activation_quant_result(args, activation_cfg, activation_res);
 
     args.A = reinterpret_cast<elem_t *>(qx);
     static_assert(sizeof(elem_t) == 1, "Q8_0 path assumes elem_t is int8 (1 byte).");
 
-    end = orca::cycle::read();
-    orca::log::cycle(layer, "cpu.Quantize activation", start, end);
+    end = ggml::gemmini::cycle::read();
+    ggml::gemmini::log::cycle(layer, "cpu.Quantize activation", start, end);
 
     // breackdown weight to int8_t & scale (cache per weight tensor)
-    start = orca::cycle::read();
+    start = ggml::gemmini::cycle::read();
     const int64_t dim_k = src0->ne[0];
     const int64_t dim_j = src0->ne[1] ? src0->ne[1] : 1;
     const int64_t dim_z = src0->ne[2] ? src0->ne[2] : 1;
@@ -189,7 +201,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     if (logical_rows_128 <= 0 ||
         logical_rows_128 > static_cast<__int128>(std::numeric_limits<size_t>::max())) {
         GGML_ASSERT(false);
-        return;
     }
     const size_t logical_rows = static_cast<size_t>(logical_rows_128);
 
@@ -199,7 +210,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.sB = args.transpose_B ? static_cast<size_t>(dim_k) : logical_rows;
 
     const size_t logical_panel_J = args.panel_J > 1 ? args.tile_J_elems() : 1;
-    const block_q8_0 *block_base = ggml_gemmini_args_block_base(src0);
+    const block_q8_0 *block_base = ggml::gemmini::weight_block_base(src0);
     ggml_gemmini_args_t::unpacked_weight *cached = nullptr;
 
     auto it = ctx->weight_cache.find(block_base);
@@ -216,7 +227,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                            logical_panel_J,
                            args.panel_J)) {
         cached = &it->second;
-        orca::log::debug(layer,
+        ggml::gemmini::log::debug(layer,
                          "[Q8_0 cache] hit base=%p K=%lld cols=%zu sB=%zu blocks_K=%zu transpose_B=%d logical_panel_J=%zu panel_J=%zu",
                          (const void *)block_base,
                          static_cast<long long>(dim_k),
@@ -228,7 +239,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                          args.panel_J);
     } else {
         if (it == ctx->weight_cache.end()) {
-            orca::log::debug(layer,
+            ggml::gemmini::log::debug(layer,
                              "[Q8_0_R cache] miss base=%p K=%lld cols=%zu blocks_K=%zu logical_panel_J=%zu panel_J=%zu",
                              (const void *)block_base,
                              static_cast<long long>(dim_k),
@@ -237,7 +248,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                              logical_panel_J,
                              args.panel_J);
         } else {
-            orca::log::debug(layer,
+            ggml::gemmini::log::debug(layer,
                              "[Q8_0_R cache] refresh base=%p K=%lld cols=%zu blocks_K=%zu logical_panel_J=%zu panel_J=%zu",
                              (const void *)block_base,
                              static_cast<long long>(dim_k),
@@ -260,8 +271,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         entry.transpose_b = args.transpose_B;
         entry.logical_panel_J = logical_panel_J;
 
-        // Use Q8_0_R wrapper: vectors are resized by the unpack function
-        const bool ok = orca::ggml::quants::ggml_gemmini_unpack_q80_r_weight(
+        // Populate cached Q8_0_R buffers directly from absorbed algorithms.
+        const bool ok = unpack_q80_r_weight(
             src0,
             args,
             entry.q_qs,
@@ -310,19 +321,19 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.panel_J = cached->panel_J;
     args.s_rf_panel = cached->panel_J > 1 ? cached->s_rf_panel.data() : nullptr;
     args.R_panel = cached->panel_J > 1 ? cached->R_panel.data() : nullptr;
-    orca::ggml::ggml_gemmini_prepare_group_meta(args);
+    args.prepare_group_meta();
 
-    orca::log::debug(layer,
+    ggml::gemmini::log::debug(layer,
         "[Q8_0_R cache] restore B=%p sB=%zu c_b=%p s_rf=%p R=%p blocks_per_row=%zu logical_panel_J=%zu panel_J=%zu",
         (void *)args.B, args.sB, (void *)args.c_b, (void *)args.s_rf, (void *)args.R,
         args.blocks_per_row, cached->logical_panel_J, args.panel_J);
-    // orca::log::debug("[Gemmini addr] layer=%s A=%p B=%p B_blocks=%p B_scales=%p",
+    // ggml::gemmini::log::debug("[Gemmini addr] layer=%s A=%p B=%p B_blocks=%p B_scales=%p",
     //                  layer, (void *)args.A, (void *)args.B, (const void *)args.B_blocks, (const void *)args.B_scales);
 
-    end = orca::cycle::read();
-    orca::log::cycle(layer, "cpu.Breakdown Q8_0_R", start, end);
+    end = ggml::gemmini::cycle::read();
+    ggml::gemmini::log::cycle(layer, "cpu.Breakdown Q8_0_R", start, end);
 
-    start = orca::cycle::read();
+    start = ggml::gemmini::cycle::read();
     /* ______________________________ 4. bias 텐서 처리 _________________________________ */
     std::vector<int32_t> zero_bias(J, 0);
 
@@ -344,24 +355,46 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.stride_f_out = dst->nb[1] / sizeof(float);
     args.tiled_matmul_type = OPTION;
 
-    end = orca::cycle::read();
-    orca::log::cycle(layer, "cpu.Set Args for calling gemmini", start, end);
+    end = ggml::gemmini::cycle::read();
+    ggml::gemmini::log::cycle(layer, "cpu.Set Args for calling gemmini", start, end);
 
-    // orca::log::debug("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out(row)=%zu stride_f_out(col)=%zu nb1=%zu nb0=%zu",
+    // ggml::gemmini::log::debug("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out(row)=%zu stride_f_out(col)=%zu nb1=%zu nb0=%zu",
     //                  layer, args.A, args.B, args.C, args.D,
     //                  args.I, args.J, args.K, args.sA, args.sB, args.sC,
     //                  args.stride_f_out, args.col_stride_f_out, dst->nb[1], dst->nb[0]);
 
-    // orca::log::debug("[Gemmini addr] layer=%s f_out=%p stride_f_out=%zu col_stride_f_out=%zu",
+    // ggml::gemmini::log::debug("[Gemmini addr] layer=%s f_out=%p stride_f_out=%zu col_stride_f_out=%zu",
     //                  layer, (void *)args.f_out, args.stride_f_out, args.col_stride_f_out);
 
     /* __ 5. Gemmini 호출 __ */
     args.tiled_matmul_type = CPU;
-    orca::tiled_block_matmul_auto(&args);
+    ggml::gemmini::tiled_block_matmul_auto(&args);
     // dst에는 gemmini 커널에서 dequantize한 결과가 들어옴 
 
 #if ERROR_COMPENSATION
-    orca::ggml::ggml_gemmini_activation_dec(src1, args);
+    if (dec::should_apply_dec(args)) {
+        std::vector<ggml::gemmini::quants::QactOutlier> outliers;
+
+        uint64_t start_dec = ggml::gemmini::cycle::read();
+        dec::append_activation_outliers(args, outliers);
+        uint64_t end_dec = ggml::gemmini::cycle::read();
+        ggml::gemmini::log::cycle(layer, "[dec] cpu.Create views", start_dec, end_dec);
+
+        ggml::gemmini::quants::dec::ActivationDECConfig dec_cfg {};
+        dec_cfg.layer = layer;
+        dec_cfg.fuse_apply = false;
+        dec_cfg.unroll8 = true;
+        dec_cfg.record_stats = true;
+
+        auto dec_result = ggml::gemmini::quants::dec::compensate_activation_dec(outliers, args, dec_cfg, nullptr);
+        if (dec_result.success && dec_result.nnz > 0) {
+            ggml::gemmini::log::debug(layer,
+                             "[dec.summary] staged=%zu nnz=%zu unique_k=%zu",
+                             dec_result.total_selected,
+                             dec_result.nnz,
+                             dec_result.unique_k_count);
+        }
+    }
 #endif
 }
 
@@ -369,7 +402,9 @@ static void ggml_backend_gemmini_add(
                                         ggml_backend_gemmini_context *ctx,
                                         struct ggml_tensor *dst, // FP32 output (I×J)
                                         struct ggml_tensor *bias){
-
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(bias);
 }
 
 static void ggml_backend_gemmini_out_prod(ggml_backend_gemmini_context * ctx, struct ggml_tensor * dst) {
@@ -416,12 +451,12 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
     static std::atomic<bool> g_seen_any_graph{false};
     static std::atomic<bool> g_decode_started{false};
     static std::atomic<uint64_t> g_decode_count{0};
-    orca::log::DumpPhase phase = orca::log::DumpPhase::unknown;
+    ggml::gemmini::log::DumpPhase phase = ggml::gemmini::log::DumpPhase::unknown;
     uint64_t step_id = 1;
 
     const bool first_graph = !g_seen_any_graph.exchange(true, std::memory_order_relaxed);
     if (first_graph) {
-        phase = orca::log::DumpPhase::prefill;
+        phase = ggml::gemmini::log::DumpPhase::prefill;
         step_id = 1;
         g_decode_started.store(false, std::memory_order_relaxed);
         g_decode_count.store(0, std::memory_order_relaxed);
@@ -429,21 +464,21 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
         if (decode_start_marker) {
             g_decode_started.store(true, std::memory_order_relaxed);
             g_decode_count.store(1, std::memory_order_relaxed);
-            phase = orca::log::DumpPhase::decode;
+            phase = ggml::gemmini::log::DumpPhase::decode;
             step_id = 2;
         } else {
-            phase = orca::log::DumpPhase::prefill;
+            phase = ggml::gemmini::log::DumpPhase::prefill;
             step_id = 1;
         }
     } else {
         if (decode_start_marker) {
             g_decode_count.fetch_add(1, std::memory_order_relaxed);
         }
-        phase = orca::log::DumpPhase::decode;
+        phase = ggml::gemmini::log::DumpPhase::decode;
         step_id = 1 + g_decode_count.load(std::memory_order_relaxed);
     }
 
-    orca::log::dump_begin_graph(phase, step_id, mxI);
+    ggml::gemmini::log::dump_begin_graph(phase, step_id, mxI);
 #endif
 
     for (int i = 0; i < cgraph->n_nodes; i++)
@@ -455,7 +490,7 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
         case GGML_OP_MUL_MAT: {
 #if LOG_DUMP
             const int32_t node_idx = node->ne[0] > 0 ? static_cast<int32_t>(node->ne[0]) : 1;
-            orca::log::dump_set_node_idx(node_idx);
+            ggml::gemmini::log::dump_set_node_idx(node_idx);
 #endif
             ggml_backend_gemmini_mul_mat(ctx, node);
             break;
@@ -467,7 +502,7 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
         case GGML_OP_TRANSPOSE:
         case GGML_OP_ADD:
 #if LOG_DUMP
-            orca::log::dump_set_node_idx(-1);
+            ggml::gemmini::log::dump_set_node_idx(-1);
 #endif
             break;
 

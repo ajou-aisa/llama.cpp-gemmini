@@ -190,8 +190,8 @@ ggml_gemmini_ethos_config_registry ggml_gemmini_load_ethos_config_registry()
                         require_object(arch_value_it.value(), "architectures." + arch_it.key() + ".layers");
                         for (auto layer_it = arch_value_it.value().begin(); layer_it != arch_value_it.value().end(); ++layer_it)
                         {
-                            const auto layer_type = orca::types::parse_layer(layer_it.key());
-                            if (layer_type == orca::types::LayerType::unknown)
+                            const auto layer_type = ggml::gemmini::types::parse_layer(layer_it.key());
+                            if (layer_type == ggml::gemmini::types::LayerType::unknown)
                             {
                                 throw_json_error(
                                     "architectures." + arch_it.key() + ".layers",
@@ -232,7 +232,7 @@ ggml_gemmini_ethos_config_registry ggml_gemmini_load_ethos_config_registry()
 std::optional<ggml_gemmini_resolved_ethos_override> ggml_gemmini_resolve_ethos_override(
     const ggml_gemmini_ethos_config_registry &registry,
     const std::string &model_arch,
-    orca::types::LayerType layer_type)
+    ggml::gemmini::types::LayerType layer_type)
 {
     if (!registry.available)
         return std::nullopt;

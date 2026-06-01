@@ -2,15 +2,12 @@
 #pragma once
 
 #include <algorithm>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
 #include <vector>
 #include <limits>
-
-#include <orca/types/layer.hpp>
 
 struct ggml_gemmini_qact_outlier
 {
@@ -27,8 +24,11 @@ enum ggml_gemmini_group_scope_t : uint8_t {
     GGML_GEMMINI_GROUP_TENSOR = 3,
 };
 
-#include "ggml.h"
-#include "ggml-quants.h"
+namespace ggml::gemmini::types {
+enum class LayerType : uint8_t;
+}
+
+#include <ggml.h>
 #ifndef GGML_COMMON_DECL
 #define GGML_GEMMINI_ARGS_DEFINE_GGML_COMMON
 #define GGML_COMMON_DECL_CPP
@@ -38,7 +38,7 @@ enum ggml_gemmini_group_scope_t : uint8_t {
 #undef GGML_COMMON_DECL_CPP
 #undef GGML_GEMMINI_ARGS_DEFINE_GGML_COMMON
 #endif
-#include "include/gemmini_params.h"
+#include <gemmini_params.h>
 
 // Forward declaration to avoid including full gemmini.h (breaks include cycles)
 enum tiled_matmul_type_t : int;
@@ -193,7 +193,7 @@ typedef struct ggml_gemmini_args_t {
     size_t blocks_J = 0;      // number of logical rows covered by scale table (J * Z * W)
     size_t blocks_I = 0;      // legacy alias for rows (kept for ABI)
 
-    // quant-group metadata resolved by orca quant logic
+    // quant-group metadata resolved by ggml::gemmini quant logic
     ggml_gemmini_group_scope_t group_scope = GGML_GEMMINI_GROUP_BLOCK;
     size_t effective_group_size = 0;           // group element count (scope-aware)
     size_t effective_group_size_k = 0;         // K-axis group span used for Gemmini split
@@ -214,7 +214,7 @@ typedef struct ggml_gemmini_args_t {
     size_t col_stride_f_out = 0;  // column stride in elements
 
     // logging & profiling helpers
-    orca::types::LayerType layer_type = orca::types::LayerType::unknown;
+    ggml::gemmini::types::LayerType layer_type = static_cast<ggml::gemmini::types::LayerType>(0);
     const char *model_arch = "";
     const char *tag = "";
     bool measure_cycles = true;
@@ -228,6 +228,59 @@ typedef struct ggml_gemmini_args_t {
     inline size_t tile_J_elems() const { return tile_J * static_cast<size_t>(DIM); }
     inline size_t tile_K_elems() const { return tile_K * static_cast<size_t>(DIM); }
     inline size_t panel_J_or_rowwise_elems() const { return panel_J > 0 ? panel_J : 1; }
+    inline int16_t resolve_tile_row_activation_e_t(int tile_row) const {
+        if (tile_row >= 0 && !activation_e_t_per_tile.empty()) {
+            const size_t panel_idx = static_cast<size_t>(tile_row);
+            if (panel_idx < activation_e_t_per_tile.size()) {
+                return activation_e_t_per_tile[panel_idx];
+            }
+        }
+        return activation_e_t;
+    }
+
+    inline void prepare_group_meta() {
+        const size_t dim_k = K;
+        const size_t weight_block_k = block_size_k > 0
+                                          ? static_cast<size_t>(block_size_k)
+                                          : static_cast<size_t>(QK8_0);
+        const auto ceil_div_size = [](size_t a, size_t b) {
+            return (a + b - 1) / b;
+        };
+
+        if (group_scope == GGML_GEMMINI_GROUP_BLOCK) {
+            const size_t group_k = std::max<size_t>(1, weight_block_k);
+            const size_t aligned =
+                std::max<size_t>(16, ceil_div_size(group_k, static_cast<size_t>(16)) * static_cast<size_t>(16));
+
+            effective_group_size = group_k;
+            effective_group_size_k = group_k;
+            effective_group_size_aligned = aligned;
+            return;
+        }
+
+        size_t group = effective_group_size;
+        if (group == 0) {
+            group = block_size_k > 0 ? block_size_k : QK8_0;
+        }
+
+        group = std::max<size_t>(1, group);
+        size_t group_k = effective_group_size_k;
+        if (group_k == 0) {
+            if (dim_k > 0 && group > dim_k) {
+                group_k = dim_k;
+            } else {
+                group_k = group;
+            }
+        }
+        group_k = std::max<size_t>(1, group_k);
+
+        const size_t aligned =
+            std::max<size_t>(16, ceil_div_size(group_k, static_cast<size_t>(16)) * static_cast<size_t>(16));
+
+        effective_group_size = group;
+        effective_group_size_k = group_k;
+        effective_group_size_aligned = aligned;
+    }
 
     // ethos parameter
     bool ethos_override_enabled = false;
@@ -239,9 +292,4 @@ typedef struct ggml_gemmini_args_t {
 
 } ggml_gemmini_args_t;
 
-// TODO: Consider moving cache management to orca::ggml layer
-inline const block_q8_0 *ggml_gemmini_args_block_base(const ggml_tensor *tensor) {
-    const char *base = (const char *)(tensor->view_src ? tensor->view_src->data : tensor->data);
-    const size_t offs = tensor->view_src ? tensor->view_offs : 0;
-    return reinterpret_cast<const block_q8_0 *>(base + offs);
-}
+
