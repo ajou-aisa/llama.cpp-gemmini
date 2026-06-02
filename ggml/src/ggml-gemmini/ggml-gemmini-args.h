@@ -82,7 +82,7 @@ typedef struct ggml_gemmini_args_t {
     const ggml_tensor *activation_src = nullptr; // source tensor for tile-row re-quantization in Gemmini loops
     int16_t activation_e_t = std::numeric_limits<int16_t>::min();
     int16_t activation_m = 0;
-    std::vector<int16_t> activation_e_t_per_tile; // one exponent per logical tile_I x K row panel
+    std::vector<int16_t> activation_e_t_per_stripe_i; // one exponent per logical tile_I x K row stripe
     std::vector<ggml_gemmini_qact_outlier> activation_outliers; // per-activation saturation records
 
     //for weight checking   
@@ -97,11 +97,11 @@ typedef struct ggml_gemmini_args_t {
         std::vector<float> s_rf;           // [logical_rows]
         std::vector<uint16_t> R;            // [logical_rows]
 
-        // Panel-wise scale metadata (panel_J logical output columns per shared panel)
-        std::vector<float> s_rf_panel;      // [num_panels_J] per-panel float scale
-        std::vector<uint16_t> R_panel;      // [num_panels_J] per-panel offset
-        size_t panel_J = 0;                 // producer panel width used for unpacked panel metadata (0 or 1 = row-wise)
-        size_t logical_panel_J = 1;         // active cache contract width on the logical J axis (row-wise = 1)
+        // Stripe-wise scale metadata (stripe_J logical output columns per shared stripe)
+        std::vector<float> s_rf_stripe;      // [num_stripes_J] per-stripe float scale
+        std::vector<uint16_t> R_stripe;      // [num_stripes_J] per-stripe offset
+        size_t stripe_J = 0;                 // producer stripe width used for unpacked stripe metadata (0 or 1 = row-wise)
+        size_t logical_stripe_J = 1;         // active cache contract width on the logical J axis (row-wise = 1)
 
         // Legacy Q8_0 path (preserved, not used by default)
         std::vector<int8_t> q;
@@ -130,8 +130,8 @@ typedef struct ggml_gemmini_args_t {
                 size_t blocks_k,
                 size_t logical_cols_,
                 bool /*transpose_b_layout*/,
-                size_t logical_panel_J_ = 1,
-                size_t panel_J_ = 0) const {
+                size_t logical_stripe_J_ = 1,
+                size_t stripe_J_ = 0) const {
             if (blocks != base) {
                 return false;
             }
@@ -157,18 +157,18 @@ typedef struct ggml_gemmini_args_t {
             if (R.size() != logical_cols_) {
                 return false;
             }
-            if (logical_panel_J != logical_panel_J_) {
+            if (logical_stripe_J != logical_stripe_J_) {
                 return false;
             }
-            if (panel_J != panel_J_) {
+            if (stripe_J != stripe_J_) {
                 return false;
             }
-            if (panel_J_ > 1) {
-                const size_t num_panels = (logical_cols_ + panel_J_ - 1) / panel_J_;
-                if (s_rf_panel.size() != num_panels) {
+            if (stripe_J_ > 1) {
+                const size_t num_stripes = (logical_cols_ + stripe_J_ - 1) / stripe_J_;
+                if (s_rf_stripe.size() != num_stripes) {
                     return false;
                 }
-                if (R_panel.size() != num_panels) {
+                if (R_stripe.size() != num_stripes) {
                     return false;
                 }
             }
@@ -185,9 +185,9 @@ typedef struct ggml_gemmini_args_t {
     const uint16_t *R = nullptr;           // [J] per-row offset
     size_t blocks_per_row = 0;            // K / 32
 
-    size_t panel_J = 0;                  // logical output-column element count per shared scale panel
-    const float *s_rf_panel = nullptr;   // [num_panels_J] per-panel float scale
-    const uint16_t *R_panel = nullptr;    // [num_panels_J] per-panel offset
+    size_t stripe_J = 0;                  // logical output-column element count per shared scale stripe
+    const float *s_rf_stripe = nullptr;   // [num_stripes_J] per-stripe float scale
+    const uint16_t *R_stripe = nullptr;    // [num_stripes_J] per-stripe offset
 
     size_t blocks_K = 0;      // number of Q8_0 blocks along the K dimension
     size_t blocks_J = 0;      // number of logical rows covered by scale table (J * Z * W)
@@ -227,12 +227,12 @@ typedef struct ggml_gemmini_args_t {
     inline size_t tile_I_elems() const { return tile_I * static_cast<size_t>(DIM); }
     inline size_t tile_J_elems() const { return tile_J * static_cast<size_t>(DIM); }
     inline size_t tile_K_elems() const { return tile_K * static_cast<size_t>(DIM); }
-    inline size_t panel_J_or_rowwise_elems() const { return panel_J > 0 ? panel_J : 1; }
+    inline size_t stripe_J_or_rowwise_elems() const { return stripe_J > 0 ? stripe_J : 1; }
     inline int16_t resolve_tile_row_activation_e_t(int tile_row) const {
-        if (tile_row >= 0 && !activation_e_t_per_tile.empty()) {
-            const size_t panel_idx = static_cast<size_t>(tile_row);
-            if (panel_idx < activation_e_t_per_tile.size()) {
-                return activation_e_t_per_tile[panel_idx];
+        if (tile_row >= 0 && !activation_e_t_per_stripe_i.empty()) {
+            const size_t stripe_idx = static_cast<size_t>(tile_row);
+            if (stripe_idx < activation_e_t_per_stripe_i.size()) {
+                return activation_e_t_per_stripe_i[stripe_idx];
             }
         }
         return activation_e_t;

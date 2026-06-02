@@ -209,7 +209,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     // - false: KxJ row-major (stride = J_flat)
     args.sB = args.transpose_B ? static_cast<size_t>(dim_k) : logical_rows;
 
-    const size_t logical_panel_J = args.panel_J > 1 ? args.tile_J_elems() : 1;
+    const size_t logical_stripe_J = args.stripe_J > 1 ? args.tile_J_elems() : 1;
     const block_q8_0 *block_base = ggml::gemmini::weight_block_base(src0);
     ggml_gemmini_args_t::unpacked_weight *cached = nullptr;
 
@@ -224,38 +224,38 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                            blocks_K,
                            logical_rows,
                            args.transpose_B,
-                           logical_panel_J,
-                           args.panel_J)) {
+                           logical_stripe_J,
+                           args.stripe_J)) {
         cached = &it->second;
         ggml::gemmini::log::debug(layer,
-                         "[Q8_0 cache] hit base=%p K=%lld cols=%zu sB=%zu blocks_K=%zu transpose_B=%d logical_panel_J=%zu panel_J=%zu",
+                         "[Q8_0 cache] hit base=%p K=%lld cols=%zu sB=%zu blocks_K=%zu transpose_B=%d logical_stripe_J=%zu stripe_J=%zu",
                          (const void *)block_base,
                          static_cast<long long>(dim_k),
                          logical_rows,
                          args.sB,
                          blocks_K,
                          args.transpose_B ? 1 : 0,
-                         logical_panel_J,
-                         args.panel_J);
+                         logical_stripe_J,
+                         args.stripe_J);
     } else {
         if (it == ctx->weight_cache.end()) {
             ggml::gemmini::log::debug(layer,
-                             "[Q8_0_R cache] miss base=%p K=%lld cols=%zu blocks_K=%zu logical_panel_J=%zu panel_J=%zu",
+                             "[Q8_0_R cache] miss base=%p K=%lld cols=%zu blocks_K=%zu logical_stripe_J=%zu stripe_J=%zu",
                              (const void *)block_base,
                              static_cast<long long>(dim_k),
                              logical_rows,
                              blocks_K,
-                             logical_panel_J,
-                             args.panel_J);
+                             logical_stripe_J,
+                             args.stripe_J);
         } else {
             ggml::gemmini::log::debug(layer,
-                             "[Q8_0_R cache] refresh base=%p K=%lld cols=%zu blocks_K=%zu logical_panel_J=%zu panel_J=%zu",
+                             "[Q8_0_R cache] refresh base=%p K=%lld cols=%zu blocks_K=%zu logical_stripe_J=%zu stripe_J=%zu",
                              (const void *)block_base,
                              static_cast<long long>(dim_k),
                              logical_rows,
                              blocks_K,
-                             logical_panel_J,
-                             args.panel_J);
+                             logical_stripe_J,
+                             args.stripe_J);
         }
         ggml_gemmini_args_t::unpacked_weight entry;
         entry.blocks = block_base;
@@ -269,7 +269,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         entry.blocks_I = logical_rows;
         entry.block_size_k = QK8_0;
         entry.transpose_b = args.transpose_B;
-        entry.logical_panel_J = logical_panel_J;
+        entry.logical_stripe_J = logical_stripe_J;
 
         // Populate cached Q8_0_R buffers directly from absorbed algorithms.
         const bool ok = unpack_q80_r_weight(
@@ -279,8 +279,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             entry.c_b,
             entry.s_rf,
             entry.R,
-            args.panel_J > 1 ? &entry.s_rf_panel : nullptr,
-            args.panel_J > 1 ? &entry.R_panel : nullptr
+            args.stripe_J > 1 ? &entry.s_rf_stripe : nullptr,
+            args.stripe_J > 1 ? &entry.R_stripe : nullptr
         );
         GGML_ASSERT(ok);
         if (!ok) {
@@ -294,8 +294,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         entry.block_size_k = args.block_size_k;
         entry.stride = args.sB;
 
-        if (args.panel_J > 1) {
-            entry.panel_J = args.panel_J;
+        if (args.stripe_J > 1) {
+            entry.stripe_J = args.stripe_J;
         }
 
         if (it == ctx->weight_cache.end()) {
@@ -318,15 +318,15 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.blocks_I = cached->blocks_I;
     args.block_size_k = cached->block_size_k;
     args.sB = static_cast<size_t>(cached->dim_k);
-    args.panel_J = cached->panel_J;
-    args.s_rf_panel = cached->panel_J > 1 ? cached->s_rf_panel.data() : nullptr;
-    args.R_panel = cached->panel_J > 1 ? cached->R_panel.data() : nullptr;
+    args.stripe_J = cached->stripe_J;
+    args.s_rf_stripe = cached->stripe_J > 1 ? cached->s_rf_stripe.data() : nullptr;
+    args.R_stripe = cached->stripe_J > 1 ? cached->R_stripe.data() : nullptr;
     args.prepare_group_meta();
 
     ggml::gemmini::log::debug(layer,
-        "[Q8_0_R cache] restore B=%p sB=%zu c_b=%p s_rf=%p R=%p blocks_per_row=%zu logical_panel_J=%zu panel_J=%zu",
+        "[Q8_0_R cache] restore B=%p sB=%zu c_b=%p s_rf=%p R=%p blocks_per_row=%zu logical_stripe_J=%zu stripe_J=%zu",
         (void *)args.B, args.sB, (void *)args.c_b, (void *)args.s_rf, (void *)args.R,
-        args.blocks_per_row, cached->logical_panel_J, args.panel_J);
+        args.blocks_per_row, cached->logical_stripe_J, args.stripe_J);
     // ggml::gemmini::log::debug("[Gemmini addr] layer=%s A=%p B=%p B_blocks=%p B_scales=%p",
     //                  layer, (void *)args.A, (void *)args.B, (const void *)args.B_blocks, (const void *)args.B_scales);
 

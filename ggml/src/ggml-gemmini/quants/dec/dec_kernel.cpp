@@ -18,7 +18,7 @@ namespace ggml::gemmini::quants::dec { namespace
         return args.B &&
                !args.B_scales &&
                args.c_b &&
-               ((args.panel_J > 1) || (args.s_rf && args.R)) &&
+               ((args.stripe_J > 1) || (args.s_rf && args.R)) &&
                args.blocks_per_row > 0;
     }
 

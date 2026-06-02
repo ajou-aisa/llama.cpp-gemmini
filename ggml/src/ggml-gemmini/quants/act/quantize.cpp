@@ -33,22 +33,22 @@ namespace ggml::gemmini::quants { namespace
     }
 
     template <typename Args>
-    void store_tile_panel_activation_e_t(Args &args, int tile_row, int tile_col, int16_t e_t) {
+    void store_tile_stripe_activation_e_t(Args &args, int tile_row, int tile_col, int16_t e_t) {
         (void)tile_col;
         if (tile_row < 0) {
             return;
         }
 
         if (tile_row == 0) {
-            args.activation_e_t_per_tile.clear();
+            args.activation_e_t_per_stripe_i.clear();
         }
 
-        const size_t panel_idx = static_cast<size_t>(tile_row);
-        if (args.activation_e_t_per_tile.size() <= panel_idx) {
-            args.activation_e_t_per_tile.resize(panel_idx + 1, e_t);
+        const size_t stripe_idx = static_cast<size_t>(tile_row);
+        if (args.activation_e_t_per_stripe_i.size() <= stripe_idx) {
+            args.activation_e_t_per_stripe_i.resize(stripe_idx + 1, e_t);
         }
 
-        args.activation_e_t_per_tile[panel_idx] = e_t;
+        args.activation_e_t_per_stripe_i[stripe_idx] = e_t;
     }
 
     void copy_tile_k_chunk(
@@ -337,7 +337,7 @@ void ggml_gemmini_quantize_activation_tile(
         tile_col_offset,
         tile_k_actual);
 
-    store_tile_panel_activation_e_t(args, tile_row, tile_col, res.e_t);
+    store_tile_stripe_activation_e_t(args, tile_row, tile_col, res.e_t);
     capture_activation_quant_result(args, cfg, res);
 }
 } // namespace ggml::gemmini::quants

@@ -104,13 +104,13 @@ bool quantize_row_q8_0_r(
     return true;
 }
 
-bool quantize_panel_q8_0_r(
+bool quantize_stripe_q8_0_r(
     const block_q8_0 *src_blocks,
     int blocks_per_row,
     int num_rows,
     BlockQ8_0_R *dst,
-    float *dst_s_rf_panel,
-    uint16_t *dst_R_panel
+    float *dst_s_rf_stripe,
+    uint16_t *dst_R_stripe
 ) {
     if (blocks_per_row <= 0 || num_rows < 0) {
         return false;
@@ -118,7 +118,7 @@ bool quantize_panel_q8_0_r(
     if (num_rows == 0) {
         return true;
     }
-    if (!src_blocks || !dst || !dst_s_rf_panel || !dst_R_panel) {
+    if (!src_blocks || !dst || !dst_s_rf_stripe || !dst_R_stripe) {
         return false;
     }
 
@@ -158,8 +158,8 @@ bool quantize_panel_q8_0_r(
         for (int row_idx = 0; row_idx < num_rows; ++row_idx) {
             set_constant_scale(min_s, blocks_per_row, &dst[row_idx]);
         }
-        *dst_s_rf_panel = dst[0].s_rf;
-        *dst_R_panel = dst[0].R;
+        *dst_s_rf_stripe = dst[0].s_rf;
+        *dst_R_stripe = dst[0].R;
         return true;
     }
 
@@ -168,16 +168,16 @@ bool quantize_panel_q8_0_r(
         for (int row_idx = 0; row_idx < num_rows; ++row_idx) {
             set_constant_scale(min_s, blocks_per_row, &dst[row_idx]);
         }
-        *dst_s_rf_panel = dst[0].s_rf;
-        *dst_R_panel = dst[0].R;
+        *dst_s_rf_stripe = dst[0].s_rf;
+        *dst_R_stripe = dst[0].R;
         return true;
     }
 
     const double r_val = std::round(static_cast<double>(min_s) / static_cast<double>(s_rf));
     const uint16_t R = static_cast<uint16_t>(std::min(65535.0, std::max(0.0, r_val)));
 
-    *dst_s_rf_panel = s_rf;
-    *dst_R_panel = R;
+    *dst_s_rf_stripe = s_rf;
+    *dst_R_stripe = R;
 
     for (int row_idx = 0; row_idx < num_rows; ++row_idx) {
         const size_t row_offset = static_cast<size_t>(row_idx) * static_cast<size_t>(blocks_per_row);

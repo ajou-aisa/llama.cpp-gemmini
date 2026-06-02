@@ -95,6 +95,6 @@ bool unpack_q80_r_weight(
     std::vector<uint8_t> &dst_c_b,
     std::vector<float> &dst_s_rf,
     std::vector<uint16_t> &dst_R,
-    std::vector<float> *dst_s_rf_panel,
-    std::vector<uint16_t> *dst_R_panel);
+    std::vector<float> *dst_s_rf_stripe,
+    std::vector<uint16_t> *dst_R_stripe);
 } // namespace ggml::gemmini::quants

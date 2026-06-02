@@ -29,7 +29,7 @@ namespace ggml::gemmini::quants::dec { namespace
         return args.B &&
                !args.B_scales &&
                args.c_b &&
-               ((args.panel_J > 1) || (args.s_rf && args.R)) &&
+               ((args.stripe_J > 1) || (args.s_rf && args.R)) &&
                args.blocks_per_row > 0;
     }
 
@@ -72,7 +72,7 @@ namespace ggml::gemmini::quants::dec { namespace
             const size_t rows = args.blocks_J ? args.blocks_J : args.J;
             const size_t cols = args.blocks_per_row;
             const size_t block_size = 32;
-            const bool panel_mode = args.panel_J > 1;
+            const bool stripe_mode = args.stripe_J > 1;
 
             if (rows == 0 || cols == 0 ||
                 (args.block_size_k != 0 && args.block_size_k != block_size) ||
@@ -81,13 +81,13 @@ namespace ggml::gemmini::quants::dec { namespace
                 return result;
             }
 
-            if (panel_mode && (!args.s_rf_panel || !args.R_panel))
+            if (stripe_mode && (!args.s_rf_stripe || !args.R_stripe))
             {
                 result.supported = false;
                 return result;
             }
 
-            if (!panel_mode && (!args.s_rf || !args.R))
+            if (!stripe_mode && (!args.s_rf || !args.R))
             {
                 return result;
             }
@@ -95,9 +95,9 @@ namespace ggml::gemmini::quants::dec { namespace
             scratch.weight_scales.resize(rows * cols);
             for (size_t j = 0; j < rows; ++j)
             {
-                const size_t panel_idx = panel_mode ? (j / args.panel_J) : 0;
-                const float s_rf = panel_mode ? args.s_rf_panel[panel_idx] : args.s_rf[j];
-                const uint16_t R = panel_mode ? args.R_panel[panel_idx] : args.R[j];
+                const size_t stripe_idx = stripe_mode ? (j / args.stripe_J) : 0;
+                const float s_rf = stripe_mode ? args.s_rf_stripe[stripe_idx] : args.s_rf[j];
+                const uint16_t R = stripe_mode ? args.R_stripe[stripe_idx] : args.R[j];
 
                 for (size_t blk = 0; blk < cols; ++blk)
                 {
@@ -167,8 +167,8 @@ ActivationDECResult compensate_activation_dec(
     {
         ggml::gemmini::log::debug(
             cfg.layer,
-            "[dec] reject unsupported panel metadata path: panel_J=%zu missing shared panel scales",
-            args.panel_J);
+            "[dec] reject unsupported stripe metadata path: stripe_J=%zu missing shared stripe scales",
+            args.stripe_J);
         return result;
     }
 

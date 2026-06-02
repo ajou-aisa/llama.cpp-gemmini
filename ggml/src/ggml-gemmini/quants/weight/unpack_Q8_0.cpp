@@ -80,20 +80,20 @@ bool quantize_row_scales_q80_r(
     return true;
 }
 
-bool quantize_panel_scales_q80_r(
-    const float *panel_scales,
+bool quantize_stripe_scales_q80_r(
+    const float *stripe_scales,
     size_t blocks_per_row,
     size_t num_rows,
     uint8_t *dst_c_b,
     float *dst_s_rf,
     uint16_t *dst_R,
-    float &dst_s_rf_panel,
-    uint16_t &dst_R_panel) {
+    float &dst_s_rf_stripe,
+    uint16_t &dst_R_stripe) {
     float min_s = std::numeric_limits<float>::max();
     float max_s = std::numeric_limits<float>::lowest();
 
     for (size_t row_idx = 0; row_idx < num_rows; ++row_idx) {
-        const float *row_scales = panel_scales + row_idx * blocks_per_row;
+        const float *row_scales = stripe_scales + row_idx * blocks_per_row;
         for (size_t block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
             const float s_b = row_scales[block_idx];
             if (!std::isfinite(s_b)) {
@@ -110,8 +110,8 @@ bool quantize_panel_scales_q80_r(
         for (size_t row_idx = 0; row_idx < num_rows; ++row_idx) {
             set_constant_scale(min_s, blocks_per_row, dst_c_b + row_idx * blocks_per_row, dst_s_rf[row_idx], dst_R[row_idx]);
         }
-        dst_s_rf_panel = dst_s_rf[0];
-        dst_R_panel = dst_R[0];
+        dst_s_rf_stripe = dst_s_rf[0];
+        dst_R_stripe = dst_R[0];
         return true;
     }
 
@@ -120,19 +120,19 @@ bool quantize_panel_scales_q80_r(
         for (size_t row_idx = 0; row_idx < num_rows; ++row_idx) {
             set_constant_scale(min_s, blocks_per_row, dst_c_b + row_idx * blocks_per_row, dst_s_rf[row_idx], dst_R[row_idx]);
         }
-        dst_s_rf_panel = dst_s_rf[0];
-        dst_R_panel = dst_R[0];
+        dst_s_rf_stripe = dst_s_rf[0];
+        dst_R_stripe = dst_R[0];
         return true;
     }
 
     const double r_val = std::round(static_cast<double>(min_s) / static_cast<double>(s_rf));
     const uint16_t R = static_cast<uint16_t>(std::min(65535.0, std::max(0.0, r_val)));
 
-    dst_s_rf_panel = s_rf;
-    dst_R_panel = R;
+    dst_s_rf_stripe = s_rf;
+    dst_R_stripe = R;
 
     for (size_t row_idx = 0; row_idx < num_rows; ++row_idx) {
-        const float *row_scales = panel_scales + row_idx * blocks_per_row;
+        const float *row_scales = stripe_scales + row_idx * blocks_per_row;
         uint8_t *row_codes = dst_c_b + row_idx * blocks_per_row;
         dst_s_rf[row_idx] = s_rf;
         dst_R[row_idx] = R;
@@ -300,8 +300,8 @@ bool unpack_q80_r_weight(
     std::vector<uint8_t> &dst_c_b,
     std::vector<float> &dst_s_rf,
     std::vector<uint16_t> &dst_R,
-    std::vector<float> *dst_s_rf_panel,
-    std::vector<uint16_t> *dst_R_panel) {
+    std::vector<float> *dst_s_rf_stripe,
+    std::vector<uint16_t> *dst_R_stripe) {
     if (!src_q80 || src_q80->type != GGML_TYPE_Q8_0) {
         return false;
     }
@@ -348,38 +348,38 @@ bool unpack_q80_r_weight(
     dst_s_rf.assign(meta.logical_cols, 0.0f);
     dst_R.assign(meta.logical_cols, 0u);
 
-    const size_t panel_J = args.panel_J > 1 ? args.panel_J : 1;
-    const bool use_panel_metadata = panel_J > 1;
-    if (use_panel_metadata) {
-        if (!dst_s_rf_panel || !dst_R_panel) {
+    const size_t stripe_J = args.stripe_J > 1 ? args.stripe_J : 1;
+    const bool use_stripe_metadata = stripe_J > 1;
+    if (use_stripe_metadata) {
+        if (!dst_s_rf_stripe || !dst_R_stripe) {
             return false;
         }
 
-        const size_t num_panels = (meta.logical_cols + panel_J - 1) / panel_J;
-        dst_s_rf_panel->assign(num_panels, 0.0f);
-        dst_R_panel->assign(num_panels, 0u);
+        const size_t num_stripes = (meta.logical_cols + stripe_J - 1) / stripe_J;
+        dst_s_rf_stripe->assign(num_stripes, 0.0f);
+        dst_R_stripe->assign(num_stripes, 0u);
 
-        for (size_t panel_idx = 0; panel_idx < num_panels; ++panel_idx) {
-            const size_t row_begin = panel_idx * panel_J;
-            const size_t panel_rows = std::min(panel_J, meta.logical_cols - row_begin);
-            if (!quantize_panel_scales_q80_r(
+        for (size_t stripe_idx = 0; stripe_idx < num_stripes; ++stripe_idx) {
+            const size_t row_begin = stripe_idx * stripe_J;
+            const size_t stripe_rows = std::min(stripe_J, meta.logical_cols - row_begin);
+            if (!quantize_stripe_scales_q80_r(
                 block_scales.data() + row_begin * meta.blocks_K,
                 meta.blocks_K,
-                panel_rows,
+                stripe_rows,
                 dst_c_b.data() + row_begin * meta.blocks_K,
                 dst_s_rf.data() + row_begin,
                 dst_R.data() + row_begin,
-                (*dst_s_rf_panel)[panel_idx],
-                (*dst_R_panel)[panel_idx])) {
+                (*dst_s_rf_stripe)[stripe_idx],
+                (*dst_R_stripe)[stripe_idx])) {
                 return false;
             }
         }
     } else {
-        if (dst_s_rf_panel) {
-            dst_s_rf_panel->clear();
+        if (dst_s_rf_stripe) {
+            dst_s_rf_stripe->clear();
         }
-        if (dst_R_panel) {
-            dst_R_panel->clear();
+        if (dst_R_stripe) {
+            dst_R_stripe->clear();
         }
 
         for (size_t row_idx = 0; row_idx < meta.logical_cols; ++row_idx) {

@@ -41,24 +41,24 @@ bool quantize_row_q8_0_r(
     BlockQ8_0_R *dst
 );
 
-/// Convert a panel of Q8_0 rows to Q8_0_R rows using one shared panel scale range.
+/// Convert a stripe of Q8_0 rows to Q8_0_R rows using one shared stripe scale range.
 ///
-/// The input Q8_0 fp16 scales are double-quantized across the full panel:
-///   s_rf = (max_panel_scale - min_panel_scale) / 255
-///   R = round(min_panel_scale / s_rf)
+/// The input Q8_0 fp16 scales are double-quantized across the full stripe:
+///   s_rf = (max_stripe_scale - min_stripe_scale) / 255
+///   R = round(min_stripe_scale / s_rf)
 ///   c_b[row, block] = clamp(round(s_b[row, block] / s_rf) - R, 0, 255)
 ///
-/// dst contains num_rows caller-owned row views. dst_s_rf_panel and dst_R_panel
-/// receive the shared panel metadata.
+/// dst contains num_rows caller-owned row views. dst_s_rf_stripe and dst_R_stripe
+/// receive the shared stripe metadata.
 ///
 /// @return true on success, false on validation failure.
-bool quantize_panel_q8_0_r(
+bool quantize_stripe_q8_0_r(
     const block_q8_0 *src_blocks,
     int blocks_per_row,
     int num_rows,
     BlockQ8_0_R *dst,
-    float *dst_s_rf_panel,
-    uint16_t *dst_R_panel
+    float *dst_s_rf_stripe,
+    uint16_t *dst_R_stripe
 );
 
 /// Recover the fp32 scale for a block in a Q8_0_R row.
