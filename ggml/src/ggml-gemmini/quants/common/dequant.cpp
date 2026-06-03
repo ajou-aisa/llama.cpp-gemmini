@@ -1,5 +1,4 @@
-#include <cstddef>
-#include <cstdint>
+#include "dequant.hpp"
 
 #include "../../ggml-gemmini-args.h"
 #include "../../ggml-gemmini-config.hpp"

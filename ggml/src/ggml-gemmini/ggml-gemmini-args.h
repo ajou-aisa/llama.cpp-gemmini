@@ -205,6 +205,9 @@ typedef struct ggml_gemmini_args_t {
     inline size_t tile_J_elems() const { return tile_J * static_cast<size_t>(DIM); }
     inline size_t tile_K_elems() const { return tile_K * static_cast<size_t>(DIM); }
     inline size_t stripe_J_or_rowwise_elems() const { return stripe_J > 0 ? stripe_J : 1; }
+    inline bool stripe_mode_matches_tile_j(size_t tile_J_elems) const {
+        return stripe_J <= 1 || (tile_J_elems > 0 && stripe_J == tile_J_elems);
+    }
     inline int16_t resolve_stripe_activation_e_s(int stripe_idx) const {
         if (stripe_idx >= 0 && !activation_e_s_per_stripe_i.empty()) {
             const size_t s = static_cast<size_t>(stripe_idx);
