@@ -17,13 +17,6 @@ struct ggml_gemmini_qact_outlier
     float saturated = 0.f;
 };
 
-enum ggml_gemmini_group_scope_t : uint8_t {
-    GGML_GEMMINI_GROUP_BLOCK = 0,
-    GGML_GEMMINI_GROUP_TILE = 1,
-    GGML_GEMMINI_GROUP_ROW = 2,
-    GGML_GEMMINI_GROUP_TENSOR = 3,
-};
-
 namespace ggml::gemmini::types {
 enum class LayerType : uint8_t;
 }
@@ -79,10 +72,9 @@ typedef struct ggml_gemmini_args_t {
     bool low_D = false;
 
     // activation quantization metadata
-    const ggml_tensor *activation_src = nullptr; // source tensor for tile-row re-quantization in Gemmini loops
-    int16_t activation_e_t = std::numeric_limits<int16_t>::min();
+    int16_t activation_e_s = std::numeric_limits<int16_t>::min();
     int16_t activation_m = 0;
-    std::vector<int16_t> activation_e_t_per_stripe_i; // one exponent per logical tile_I x K row stripe
+    std::vector<int16_t> activation_e_s_per_stripe_i; // one exponent per stripe (tile_I x K)
     std::vector<ggml_gemmini_qact_outlier> activation_outliers; // per-activation saturation records
 
     //for weight checking   
@@ -193,31 +185,16 @@ typedef struct ggml_gemmini_args_t {
     size_t blocks_J = 0;      // number of logical rows covered by scale table (J * Z * W)
     size_t blocks_I = 0;      // legacy alias for rows (kept for ABI)
 
-    // quant-group metadata resolved by ggml::gemmini quant logic
-    ggml_gemmini_group_scope_t group_scope = GGML_GEMMINI_GROUP_BLOCK;
-    size_t effective_group_size = 0;           // group element count (scope-aware)
-    size_t effective_group_size_k = 0;         // K-axis group span used for Gemmini split
-    size_t effective_group_size_aligned = 0;   // DIM(16)-aligned K-axis group span
-
-    size_t gemmini_call_k_logical = 0;         // logical K used by latest Gemmini call
-    size_t gemmini_call_k_aligned = 0;         // padded K used by latest Gemmini call
-    size_t gemmini_call_tile_k_elems = 0;      // tile_k * DIM used by latest call
-
-    // Weight block scale granularity (Q8_0 scale table axis).
     uint32_t block_size_k = GGML_GEMMINI_BLOCK_SIZE;
 
-    float scale_out = 1.0f;
+    // output buffer (float, dequantized)
+    float *f_out = nullptr;
+    size_t col_stride_f_out = 0;
+    size_t stride_f_out = 0;
 
-    // origin output
-    float* f_out = nullptr;
-    size_t stride_f_out = 0;      // row stride in elements
-    size_t col_stride_f_out = 0;  // column stride in elements
-
-    // logging & profiling helpers
-    ggml::gemmini::types::LayerType layer_type = static_cast<ggml::gemmini::types::LayerType>(0);
-    const char *model_arch = "";
-    const char *tag = "";
-    bool measure_cycles = true;
+    // layer/model metadata
+    ggml::gemmini::types::LayerType layer_type{};
+    const char *model_arch = nullptr;
 
     // Gemmini auto-tiling counts in DIM units. Use tile_*_elems() for logical element spans.
     size_t tile_I = 0;
@@ -228,59 +205,20 @@ typedef struct ggml_gemmini_args_t {
     inline size_t tile_J_elems() const { return tile_J * static_cast<size_t>(DIM); }
     inline size_t tile_K_elems() const { return tile_K * static_cast<size_t>(DIM); }
     inline size_t stripe_J_or_rowwise_elems() const { return stripe_J > 0 ? stripe_J : 1; }
-    inline int16_t resolve_tile_row_activation_e_t(int tile_row) const {
-        if (tile_row >= 0 && !activation_e_t_per_stripe_i.empty()) {
-            const size_t stripe_idx = static_cast<size_t>(tile_row);
-            if (stripe_idx < activation_e_t_per_stripe_i.size()) {
-                return activation_e_t_per_stripe_i[stripe_idx];
+    inline int16_t resolve_stripe_activation_e_s(int stripe_idx) const {
+        if (stripe_idx >= 0 && !activation_e_s_per_stripe_i.empty()) {
+            const size_t s = static_cast<size_t>(stripe_idx);
+            if (s < activation_e_s_per_stripe_i.size()) {
+                return activation_e_s_per_stripe_i[s];
             }
         }
-        return activation_e_t;
+        return activation_e_s;
     }
 
-    inline void prepare_group_meta() {
-        const size_t dim_k = K;
-        const size_t weight_block_k = block_size_k > 0
-                                          ? static_cast<size_t>(block_size_k)
-                                          : static_cast<size_t>(QK8_0);
-        const auto ceil_div_size = [](size_t a, size_t b) {
-            return (a + b - 1) / b;
-        };
-
-        if (group_scope == GGML_GEMMINI_GROUP_BLOCK) {
-            const size_t group_k = std::max<size_t>(1, weight_block_k);
-            const size_t aligned =
-                std::max<size_t>(16, ceil_div_size(group_k, static_cast<size_t>(16)) * static_cast<size_t>(16));
-
-            effective_group_size = group_k;
-            effective_group_size_k = group_k;
-            effective_group_size_aligned = aligned;
-            return;
-        }
-
-        size_t group = effective_group_size;
-        if (group == 0) {
-            group = block_size_k > 0 ? block_size_k : QK8_0;
-        }
-
-        group = std::max<size_t>(1, group);
-        size_t group_k = effective_group_size_k;
-        if (group_k == 0) {
-            if (dim_k > 0 && group > dim_k) {
-                group_k = dim_k;
-            } else {
-                group_k = group;
-            }
-        }
-        group_k = std::max<size_t>(1, group_k);
-
-        const size_t aligned =
-            std::max<size_t>(16, ceil_div_size(group_k, static_cast<size_t>(16)) * static_cast<size_t>(16));
-
-        effective_group_size = group;
-        effective_group_size_k = group_k;
-        effective_group_size_aligned = aligned;
-    }
+    // Gemmini call metadata (for debugging/validation)
+    size_t gemmini_call_k_logical = 0;
+    size_t gemmini_call_k_aligned = 0;
+    size_t gemmini_call_tile_k_elems = 0;
 
     // ethos parameter
     bool ethos_override_enabled = false;

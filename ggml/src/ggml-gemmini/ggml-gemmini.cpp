@@ -170,12 +170,11 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     activation_q.resize(I * K);
     int8_t *qx = activation_q.data();
 
-    args.activation_src = src1;
     reset_activation_quant_state(args);
     auto activation_cfg = make_activation_quant_config(args);
     ggml::gemmini::log::debug(
         ggml::gemmini::types::to_string(args.layer_type),
-        "[ethos] final cfg model_arch=%s override=%d m=%d qmax=%d delta=%d l2_on=%d l2.c=%d l2.d=%d",
+        "[" GGML_GEMMINI_ACTIVATION_QUANT_NAME "] final cfg model_arch=%s override=%d m=%d qmax=%d delta=%d l2_on=%d l2.c=%d l2.d=%d",
         args.model_arch ? args.model_arch : "",
         args.ethos_override_enabled ? 1 : 0,
         static_cast<int>(activation_cfg.m),
@@ -185,7 +184,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         activation_cfg.l2.c,
         activation_cfg.l2.d);
 
-    args.group_scope = GGML_GEMMINI_GROUP_BLOCK;
     auto activation_res = ggml::gemmini::quants::quantize_activation_f32(src1, args, qx, activation_cfg);
     capture_activation_quant_result(args, activation_cfg, activation_res);
 
@@ -332,7 +330,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.stripe_J = cached->stripe_J;
     args.s_rf_stripe = cached->stripe_J > 1 ? cached->s_rf_stripe.data() : nullptr;
     args.R_stripe = cached->stripe_J > 1 ? cached->R_stripe.data() : nullptr;
-    args.prepare_group_meta();
 
     ggml::gemmini::log::debug(layer,
         "[Q8_0_R cache] restore B=%p sB=%zu c_b=%p s_rf=%p R=%p blocks_per_row=%zu logical_stripe_J=%zu stripe_J=%zu",

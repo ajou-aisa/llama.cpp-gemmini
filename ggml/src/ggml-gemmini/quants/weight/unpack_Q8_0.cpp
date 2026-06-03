@@ -408,7 +408,7 @@ bool unpack_q80_r_weight(
     args.blocks_J = meta.logical_cols;
     args.blocks_I = meta.logical_cols;
     args.block_size_k = QK8_0;
-    args.group_scope = GGML_GEMMINI_GROUP_BLOCK;
+
 
     return true;
 }

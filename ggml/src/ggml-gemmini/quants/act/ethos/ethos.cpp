@@ -1,5 +1,7 @@
 #include "ethos.hpp"
 #include "../../common/fp16_util.hpp"
+#include "../../common/math.hpp"
+#include "../../../ggml-gemmini-args.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -54,15 +56,15 @@ bool Initializer::init(
         return false;
 
     meta.block.clear();
-    meta.tile = TileState{};
+    meta.stripe = StripeState{};
 
-    TileState &tile = meta.tile;
+    StripeState &stripe = meta.stripe;
     size_t blk_per_row = cols / N; // block per row
-    tile.blk_num = rows * blk_per_row;
+    stripe.blk_num = rows * blk_per_row;
     const size_t computed_num_real_blocks = rows * blk_per_row;
-    tile.num_real_blocks = cfg.num_real_blocks > 0 ? cfg.num_real_blocks : computed_num_real_blocks;
+    stripe.num_real_blocks = cfg.num_real_blocks > 0 ? cfg.num_real_blocks : computed_num_real_blocks;
 
-    meta.block.resize(tile.blk_num); // block memory init
+    meta.block.resize(stripe.blk_num); // block memory init
 
     // init block's state
     for (size_t i = 0; i < rows; ++i)
@@ -253,7 +255,7 @@ bool Ethos::run(
     int8_t *dst)
 {
     cfg.result.outliers.clear();
-    cfg.result.e_t = std::numeric_limits<int16_t>::min();
+    cfg.result.e_s = std::numeric_limits<int16_t>::min();
 
     if (!dst)
     {
@@ -269,13 +271,13 @@ bool Ethos::run(
     const size_t blk_per_row = cols / cfg.block_size;
 
     // Step 2.0. Block-wise quantize for real blocks
-    TileState &tile = meta_.tile;
-    if (tile.num_real_blocks == 0)
+    StripeState &stripe = meta_.stripe;
+    if (stripe.num_real_blocks == 0)
     {
         return false;
     }
 
-    for (size_t blk_idx = 0; blk_idx < tile.num_real_blocks; ++blk_idx)
+    for (size_t blk_idx = 0; blk_idx < stripe.num_real_blocks; ++blk_idx)
     {
         // Step 2.1: Detect L1-Outlier & pre-Quantize
         unit_l1_.detect_l1(cfg, meta_, static_cast<int>(blk_idx), unit_q_, unit_c_);
@@ -320,7 +322,7 @@ bool Ethos::run(
             blk.e_b2 = blk.e_max2;
         }
 
-        tile.e_min = std::min(tile.e_min, blk.e_b);
+        stripe.e_min = std::min(stripe.e_min, blk.e_b);
 
         // update s_e
         blk.s_e = blk.e_b - cfg.m;
@@ -349,7 +351,7 @@ bool Ethos::run(
 
     // Step 2.4: Padding blocks are already represented by T5's padded input.
     // They are excluded from exponent detection and recoding.
-    for (size_t blk_idx = tile.num_real_blocks; blk_idx < tile.blk_num; ++blk_idx)
+    for (size_t blk_idx = stripe.num_real_blocks; blk_idx < stripe.blk_num; ++blk_idx)
     {
         for (size_t i = 0; i < cfg.block_size; ++i)
         {
@@ -357,22 +359,22 @@ bool Ethos::run(
         }
     }
 
-    // e_min must be updated by at least one valid block before tile recoding.
-    if (tile.e_min == std::numeric_limits<int16_t>::max())
+        // e_min must be updated by at least one valid block before stripe recoding.
+    if (stripe.e_min == std::numeric_limits<int16_t>::max())
     {
         return false;
     }
 
-    tile.e_t = tile.e_min + cfg.delta;
-    cfg.result.e_t = tile.e_t;
-    cfg.result.e_t_per_tile.push_back(tile.e_t);
-    cfg.result.num_padding_blocks = tile.blk_num - tile.num_real_blocks;
+stripe.e_s = stripe.e_min + cfg.delta;
+cfg.result.e_s = stripe.e_s;
+cfg.result.e_s_per_stripe.push_back(stripe.e_s);
+    cfg.result.num_padding_blocks = stripe.blk_num - stripe.num_real_blocks;
 
-    for (size_t blk_idx = 0; blk_idx < tile.num_real_blocks; ++blk_idx)
+    for (size_t blk_idx = 0; blk_idx < stripe.num_real_blocks; ++blk_idx)
     {
         // Step 3.1: set shamt for a block
         BlockState &blk = meta_.block[blk_idx];
-        const int shamt = blk.e_b - tile.e_t;
+        const int shamt = blk.e_b - stripe.e_s;
         const size_t row = blk_idx / blk_per_row;
         const size_t block_col = blk_idx % blk_per_row;
 
@@ -406,7 +408,7 @@ bool Ethos::run(
             if (blk.outlier_mask & (1u << i))
             {
                 const float orig = load_value(data_ptr, stride_i_bytes, stride_k_bytes, row, col);
-                const int scale_shift = static_cast<int>(tile.e_t) - static_cast<int>(cfg.m);
+                const int scale_shift = static_cast<int>(stripe.e_s) - static_cast<int>(cfg.m);
                 float sat;
                 if (scale_shift >= 0)
                 {
@@ -429,5 +431,47 @@ bool Ethos::run(
     }
 
     return true;
+}
+
+void dequantize(
+    const ggml_gemmini_args_t &args,
+    size_t k_offset,
+    size_t block_k,
+    const int32_t *acc32,
+    size_t acc_stride)
+{
+    if (!args.f_out || !acc32 || block_k == 0 || args.I == 0 || args.J == 0) {
+        return;
+    }
+
+    const size_t weight_block_size = args.block_size_k > 0 ? args.block_size_k : static_cast<size_t>(QK8_0);
+    const size_t k_begin = k_offset;
+    const size_t k_end = k_offset + block_k;
+    const size_t total_weight_scale_elems = args.blocks_K * args.blocks_J;
+    const size_t out_col_stride = args.col_stride_f_out ? args.col_stride_f_out : 1;
+    const size_t out_row_stride = args.stride_f_out ? args.stride_f_out : args.J;
+
+    for (size_t i = 0; i < args.I; ++i) {
+        const int32_t *row_acc32 = acc32 + i * acc_stride;
+        float *row_out = args.f_out + i * out_row_stride;
+
+        for (size_t j = 0; j < args.J; ++j) {
+            float scale_w = 1.0f;
+
+            if (args.B_scales && args.blocks_K > 0) {
+                const size_t weight_blk = k_begin / weight_block_size;
+                if (weight_blk < args.blocks_K) {
+                    const size_t weight_scale_idx = j * args.blocks_K + weight_blk;
+                    if (weight_scale_idx < total_weight_scale_elems) {
+                        scale_w = args.B_scales[weight_scale_idx];
+                    }
+                }
+            }
+
+            float contrib = static_cast<float>(row_acc32[j]) * scale_w;
+            contrib = ggml::gemmini::apply_activation_exponent(contrib, args.activation_e_s, args.activation_m);
+            row_out[j * out_col_stride] += contrib;
+        }
+    }
 }
 } // namespace ggml::gemmini::quants::act::ethos

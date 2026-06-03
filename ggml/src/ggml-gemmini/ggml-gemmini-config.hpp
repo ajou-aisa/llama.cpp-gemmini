@@ -44,6 +44,7 @@ enum class ComputeType : uint8_t {
 // To add: append enum entry with next integer, update CURRENT_ACTIVATION_QUANT.
 enum class ActivationQuantAlgo : uint8_t {
     ETHOS = 0,
+    TENSOR = 1,
 };
 
 // Macro → enum mapping (compile-time) ---------------------------------------
@@ -62,13 +63,22 @@ inline constexpr ComputeType CURRENT_COMPUTE_TYPE =
 inline constexpr ActivationQuantAlgo CURRENT_ACTIVATION_QUANT =
 #if GGML_GEMMINI_ACTIVATION_QUANT == 0
     ActivationQuantAlgo::ETHOS;
+#elif GGML_GEMMINI_ACTIVATION_QUANT == 1
+    ActivationQuantAlgo::TENSOR;
 #else
     #error "Invalid GGML_GEMMINI_ACTIVATION_QUANT value"
 #endif
 
-// Upper-bound sanity checks -------------------------------------------------
-// Keep the right hand side equal to the largest enum value.
+#define GGML_GEMMINI_ACTIVATION_QUANT_NAMEETHOS "ethos"
+#define GGML_GEMMINI_ACTIVATION_QUANT_NAMETENSOR "tensor"
+
+#if GGML_GEMMINI_ACTIVATION_QUANT == 0
+    #define GGML_GEMMINI_ACTIVATION_QUANT_NAME GGML_GEMMINI_ACTIVATION_QUANT_NAMEETHOS
+#elif GGML_GEMMINI_ACTIVATION_QUANT == 1
+    #define GGML_GEMMINI_ACTIVATION_QUANT_NAME GGML_GEMMINI_ACTIVATION_QUANT_NAMETENSOR
+#endif
+
 static_assert(static_cast<uint8_t>(CURRENT_COMPUTE_TYPE) <= 1, "CURRENT_COMPUTE_TYPE must be INT or FLOAT");
-static_assert(static_cast<uint8_t>(CURRENT_ACTIVATION_QUANT) <= 0, "CURRENT_ACTIVATION_QUANT must be ETHOS");
+static_assert(static_cast<uint8_t>(CURRENT_ACTIVATION_QUANT) <= 1, "CURRENT_ACTIVATION_QUANT must be ETHOS or TENSOR");
 
 } // namespace

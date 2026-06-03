@@ -7,6 +7,8 @@
 #include <limits>
 #include <vector>
 
+struct ggml_gemmini_args_t;
+
 namespace ggml::gemmini::quants::act::ethos
 {
 struct BlockState
@@ -26,14 +28,14 @@ struct BlockState
     uint32_t outlier_mask = 0; // block outlier mask
 };
 
-struct TileState
+struct StripeState
 {
     size_t blk_num = 0; // total blocks
 
     int16_t e_min = std::numeric_limits<int16_t>::max();
 
-    // tile exponent
-    int16_t e_t = std::numeric_limits<int16_t>::min();
+    // stripe exponent
+    int16_t e_s = std::numeric_limits<int16_t>::min();
 
     size_t num_real_blocks = 0;
 };
@@ -41,7 +43,7 @@ struct TileState
 struct Metadata
 {
     std::vector<BlockState> block;
-    TileState tile;
+    StripeState stripe;
 };
 
 class Initializer
@@ -108,5 +110,12 @@ public:
         return meta_;
     }
 };
+
+void dequantize(
+    const ggml_gemmini_args_t &args,
+    size_t k_offset,
+    size_t block_k,
+    const int32_t *acc32,
+    size_t acc_stride);
 
 } // namespace ggml::gemmini::quants::act::ethos

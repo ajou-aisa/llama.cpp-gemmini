@@ -1,6 +1,7 @@
 #include "quantize.hpp"
 #include "ethos/ethos.hpp"
 #include "ethos/types.hpp"
+#include "tensor/tensor.hpp"
 #include "../../ggml-gemmini-args.h"
 #include "../common/tensor_util.hpp"
 
@@ -32,45 +33,6 @@ namespace ggml::gemmini::quants { namespace
         return ((value + alignment - 1) / alignment) * alignment;
     }
 
-    template <typename Args>
-    void store_tile_stripe_activation_e_t(Args &args, int tile_row, int tile_col, int16_t e_t) {
-        (void)tile_col;
-        if (tile_row < 0) {
-            return;
-        }
-
-        if (tile_row == 0) {
-            args.activation_e_t_per_stripe_i.clear();
-        }
-
-        const size_t stripe_idx = static_cast<size_t>(tile_row);
-        if (args.activation_e_t_per_stripe_i.size() <= stripe_idx) {
-            args.activation_e_t_per_stripe_i.resize(stripe_idx + 1, e_t);
-        }
-
-        args.activation_e_t_per_stripe_i[stripe_idx] = e_t;
-    }
-
-    void copy_tile_k_chunk(
-        const int8_t *src,
-        size_t src_stride_elems,
-        int8_t *dst,
-        size_t dst_stride_elems,
-        size_t rows,
-        size_t tile_col_offset,
-        size_t tile_k_actual) {
-        if (!src || !dst || src_stride_elems == 0 || dst_stride_elems == 0 || rows == 0 || tile_k_actual == 0) {
-            return;
-        }
-
-        for (size_t row = 0; row < rows; ++row) {
-            int8_t *dst_row = dst + row * dst_stride_elems;
-            std::fill_n(dst_row, dst_stride_elems, int8_t {0});
-
-            const int8_t *src_row = src + row * src_stride_elems + tile_col_offset;
-            std::memcpy(dst_row, src_row, tile_k_actual * sizeof(int8_t));
-        }
-    }
 }
 
 size_t qact_outlier_count(const ActivationQuantResult &result)
@@ -96,7 +58,8 @@ ActivationQuantResult quantize_activation_f32(
 {
     ActivationQuantConfig internal_cfg = cfg;
     internal_cfg.result.outliers.clear();
-    internal_cfg.result.e_t = std::numeric_limits<int16_t>::min();
+    internal_cfg.result.e_s = std::numeric_limits<int16_t>::min();
+    internal_cfg.result.e_s_per_stripe.clear();
 
     if (!src || src->type != GGML_TYPE_F32 || !dst || args.I == 0 || args.K == 0)
     {
@@ -117,106 +80,55 @@ ActivationQuantResult quantize_activation_f32(
         return internal_cfg.result;
     }
 
-    act::ethos::Ethos ethos;
-    if (!ethos.run(
-            internal_cfg,
-            reinterpret_cast<const char *>(src_data),
-            stride_i_bytes,
-            stride_k_bytes,
-            args.I,
-            args.K,
-            0,
-            0,
-            dst))
+    switch (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT) {
+    case ggml::gemmini::config::ActivationQuantAlgo::ETHOS:
+    default:
     {
-        return internal_cfg.result;
-    }
+        ActivationQuantResult aggregated;
+        aggregated.e_s = std::numeric_limits<int16_t>::min();
 
-    return internal_cfg.result;
-}
+        const size_t stripe_I = args.tile_I > 0 ? args.tile_I : args.I;
+        const size_t num_stripes = (args.I + stripe_I - 1) / stripe_I;
+        size_t current_row_offset = 0;
 
-ActivationQuantResult quantize_activation_f32_tile(
-    const ggml_tensor *src,
-    ggml_gemmini_args_t &args,
-    int8_t *dst,
-    ActivationQuantConfig &cfg,
-    int tile_row)
-{
-    ActivationQuantConfig internal_cfg = cfg;
-    internal_cfg.result.outliers.clear();
-    internal_cfg.result.e_t = std::numeric_limits<int16_t>::min();
-    internal_cfg.result.e_t_per_tile.clear();
-    internal_cfg.result.num_padding_blocks = 0;
+        for (size_t s = 0; s < num_stripes; ++s) {
+            const size_t rows_this_stripe = std::min(stripe_I, args.I - current_row_offset);
 
-    if (!src || src->type != GGML_TYPE_F32 || tile_row < 0 || !dst)
-    {
-        return internal_cfg.result;
-    }
+            internal_cfg.result.outliers.clear();
+            internal_cfg.result.e_s = std::numeric_limits<int16_t>::min();
+            internal_cfg.result.e_s_per_stripe.clear();
+            internal_cfg.num_real_blocks = 0;
 
-    const float *src_data = ggml::gemmini::activation_data(src);
-    if (!src_data)
-    {
-        return internal_cfg.result;
-    }
-
-    const size_t stride_k_bytes = src->nb[0] ? src->nb[0] : sizeof(float);
-    const size_t stride_i_bytes = src->nb[1] ? src->nb[1] : args.K * stride_k_bytes;
-    const size_t tile_row_offset = static_cast<size_t>(tile_row) * args.tile_I;
-    const size_t real_I = clamp_tile_extent(args.I, tile_row_offset, args.tile_I);
-    const size_t real_K = args.K;
-
-    if (real_I == 0 || real_K == 0)
-    {
-        return internal_cfg.result;
-    }
-
-    if (internal_cfg.block_size == 0)
-    {
-        return internal_cfg.result;
-    }
-
-    const char *quant_src = reinterpret_cast<const char *>(src_data) + tile_row_offset * stride_i_bytes;
-    size_t quant_stride_i_bytes = stride_i_bytes;
-    size_t quant_stride_k_bytes = stride_k_bytes;
-
-    const size_t padded_K = align_up(real_K, internal_cfg.block_size);
-
-    std::vector<float> padded_buf;
-
-    if (padded_K != real_K)
-    {
-        padded_buf.assign(real_I * padded_K, 0.0f);
-
-        for (size_t i = 0; i < real_I; ++i)
-        {
-            const char *src_row = quant_src + i * quant_stride_i_bytes;
-            float *dst_row = padded_buf.data() + i * padded_K;
-            for (size_t k = 0; k < real_K; ++k)
+            act::ethos::Ethos ethos;
+            if (!ethos.run(
+                    internal_cfg,
+                    reinterpret_cast<const char *>(src_data) + current_row_offset * stride_i_bytes,
+                    stride_i_bytes,
+                    stride_k_bytes,
+                    rows_this_stripe,
+                    args.K,
+                    current_row_offset,
+                    0,
+                    dst + current_row_offset * args.K))
             {
-                dst_row[k] = *reinterpret_cast<const float *>(src_row + k * quant_stride_k_bytes);
+                return internal_cfg.result;
             }
+
+            aggregated.e_s_per_stripe.push_back(internal_cfg.result.e_s);
+            if (aggregated.e_s == std::numeric_limits<int16_t>::min()) {
+                aggregated.e_s = internal_cfg.result.e_s;
+            }
+            aggregated.outliers.insert(
+                aggregated.outliers.end(),
+                internal_cfg.result.outliers.begin(),
+                internal_cfg.result.outliers.end());
+
+            current_row_offset += rows_this_stripe;
         }
 
-        quant_src = reinterpret_cast<const char *>(padded_buf.data());
-        quant_stride_i_bytes = padded_K * sizeof(float);
-        quant_stride_k_bytes = sizeof(float);
+        return aggregated;
     }
-
-    const size_t num_real_blocks = real_I * (real_K / internal_cfg.block_size);
-    internal_cfg.num_real_blocks = num_real_blocks;
-
-    act::ethos::Ethos ethos;
-    if (!ethos.run(
-            internal_cfg,
-            quant_src,
-            quant_stride_i_bytes,
-            quant_stride_k_bytes,
-            real_I,
-            padded_K,
-            tile_row_offset,
-            0,
-            dst))
-    {
+    case ggml::gemmini::config::ActivationQuantAlgo::TENSOR:
         return internal_cfg.result;
     }
 
@@ -225,7 +137,7 @@ ActivationQuantResult quantize_activation_f32_tile(
 
 void reset_activation_quant_state(ggml_gemmini_args_t &args) {
     args.activation_outliers.clear();
-    args.activation_e_t = std::numeric_limits<int16_t>::min();
+    args.activation_e_s = std::numeric_limits<int16_t>::min();
     args.activation_m = 0;
     args.gemmini_call_k_logical = 0;
     args.gemmini_call_k_aligned = 0;
@@ -243,6 +155,9 @@ ActivationQuantConfig make_activation_quant_config(const ggml_gemmini_args_t &ar
     case ggml::gemmini::config::ActivationQuantAlgo::ETHOS:
     default:
         act::ethos::set_config(cfg);
+        break;
+    case ggml::gemmini::config::ActivationQuantAlgo::TENSOR:
+        act::tensor::set_config(cfg);
         break;
     }
     if (args.ethos_override_enabled) {
@@ -263,18 +178,9 @@ void capture_activation_quant_result(
     ggml_gemmini_args_t &args,
     const ActivationQuantConfig &cfg,
     const ActivationQuantResult &res) {
-    args.activation_e_t = res.e_t;
+    args.activation_e_s = res.e_s;
     args.activation_m = cfg.m;
-
-    size_t resolved_group_size = cfg.block_size > 0 ? cfg.block_size : static_cast<size_t>(QK8_0);
-    resolved_group_size = std::max<size_t>(1, resolved_group_size);
-
-    const size_t logical_k = args.K > 0 ? args.K : 1;
-    const size_t resolved_group_size_k = std::max<size_t>(1, std::min(resolved_group_size, logical_k));
-
-    args.effective_group_size = resolved_group_size;
-    args.effective_group_size_k = resolved_group_size_k;
-    args.effective_group_size_aligned = std::max<size_t>(16, ((resolved_group_size_k + 15) / 16) * 16);
+    args.activation_e_s_per_stripe_i = res.e_s_per_stripe;
 
     const size_t outlier_count = qact_outlier_count(res);
     if (outlier_count == 0) {
@@ -288,61 +194,5 @@ void capture_activation_quant_result(
         const auto &outlier = outliers[i];
         args.activation_outliers.push_back({outlier.row, outlier.col, outlier.original, outlier.saturated});
     }
-}
-
-void ggml_gemmini_quantize_activation_tile(
-    const ggml_tensor *src,
-    ggml_gemmini_args_t &args,
-    int8_t *dst,
-    int tile_row,
-    int tile_col) {
-    reset_activation_quant_state(args);
-    if (!src || !dst || tile_row < 0 || tile_col < 0) {
-        return;
-    }
-
-    const size_t tile_row_offset = static_cast<size_t>(tile_row) * args.tile_I;
-    const size_t tile_i_actual = clamp_tile_extent(args.I, tile_row_offset, args.tile_I);
-    if (tile_i_actual == 0 || args.K == 0) {
-        return;
-    }
-
-    const size_t tile_col_offset = static_cast<size_t>(tile_col) * args.tile_K;
-    const size_t tile_k_actual = clamp_tile_extent(args.K, tile_col_offset, args.tile_K);
-    if (tile_k_actual == 0) {
-        return;
-    }
-
-    auto cfg = make_activation_quant_config(args);
-    ggml::gemmini::log::debug(
-        ggml::gemmini::types::to_string(args.layer_type),
-        "[ethos] final cfg model_arch=%s override=%d m=%d qmax=%d delta=%d l2_on=%d l2.c=%d l2.d=%d",
-        args.model_arch ? args.model_arch : "",
-        args.ethos_override_enabled ? 1 : 0,
-        static_cast<int>(cfg.m),
-        static_cast<int>(cfg.qmax),
-        cfg.delta,
-        cfg.l2_on ? 1 : 0,
-        cfg.l2.c,
-        cfg.l2.d);
-
-    args.group_scope = GGML_GEMMINI_GROUP_BLOCK;
-
-    const size_t padded_view_k = align_up(args.K, cfg.block_size);
-    std::vector<int8_t> quantized_tile_row(tile_i_actual * padded_view_k, 0);
-    auto res = quantize_activation_f32_tile(src, args, quantized_tile_row.data(), cfg, tile_row);
-
-    const size_t dst_stride_elems = align_up(tile_k_actual, cfg.block_size);
-    copy_tile_k_chunk(
-        quantized_tile_row.data(),
-        padded_view_k,
-        dst,
-        dst_stride_elems,
-        tile_i_actual,
-        tile_col_offset,
-        tile_k_actual);
-
-    store_tile_stripe_activation_e_t(args, tile_row, tile_col, res.e_t);
-    capture_activation_quant_result(args, cfg, res);
 }
 } // namespace ggml::gemmini::quants

@@ -1,7 +1,6 @@
-// quantize.hpp
 #pragma once
 
-#include "ethos/types.hpp"
+#include "types.hpp"
 #include "ggml-gemmini-config.hpp"
 
 struct ggml_tensor;
@@ -9,8 +8,8 @@ struct ggml_gemmini_args_t;
 
 namespace ggml::gemmini::quants
 {
-    using ActivationQuantConfig = act::ethos::Config;
-    using ActivationQuantResult = act::ethos::Result;
+    using ActivationQuantConfig = act::Config;
+    using ActivationQuantResult = act::Result;
 
 // Accessor functions for outliers (encapsulated, not direct vector access)
 size_t qact_outlier_count(const ActivationQuantResult &result);
@@ -27,17 +26,6 @@ ActivationQuantResult quantize_activation_f32(
     int8_t *dst,
     ActivationQuantConfig &cfg);
 
-// Tile-aware quantization: handles tile-row tensors with padded buffer allocation.
-// Pads K to block_size alignment, allocates zero-initialized
-// buffer, copies real data, and runs ethos with the padded view.
-// Returns per-tile result with e_t_per_tile populated.
-ActivationQuantResult quantize_activation_f32_tile(
-    const ggml_tensor *src,
-    ggml_gemmini_args_t &args,
-    int8_t *dst,
-    ActivationQuantConfig &cfg,
-    int tile_row);
-
 void reset_activation_quant_state(ggml_gemmini_args_t &args);
 
 ActivationQuantConfig make_activation_quant_config(const ggml_gemmini_args_t &args);
@@ -47,10 +35,5 @@ void capture_activation_quant_result(
     const ActivationQuantConfig &cfg,
     const ActivationQuantResult &res);
 
-void ggml_gemmini_quantize_activation_tile(
-    const ggml_tensor *src,
-    ggml_gemmini_args_t &args,
-    int8_t *dst,
-    int tile_row,
-    int tile_col);
+
 } // namespace ggml::gemmini::quants

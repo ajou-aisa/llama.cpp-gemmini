@@ -1,14 +1,11 @@
 #pragma once
 
+#include "../types.hpp"
 #include "../../view/act_view.hpp"
 #include <gemmini/layer.hpp>
 #include "../../../types/model.hpp"
 
-#include <cstddef>
-#include <cstdint>
-#include <limits>
 #include <utility>
-#include <vector>
 
 #ifndef GGML_GEMMINI_ETHOS_C_DEFAULT
 #define GGML_GEMMINI_ETHOS_C_DEFAULT 1
@@ -28,37 +25,14 @@
 
 namespace ggml::gemmini::quants::act::ethos
 {
-struct L2Config
-{
-    int c = GGML_GEMMINI_ETHOS_C_DEFAULT;
-    int d = GGML_GEMMINI_ETHOS_D_DEFAULT;
-};
+using Config = ::ggml::gemmini::quants::act::Config;
+using Result = ::ggml::gemmini::quants::act::Result;
+using L2Config = ::ggml::gemmini::quants::act::L2Config;
 
-struct Result
-{
-    std::vector<::ggml::gemmini::quants::QactOutlier> outliers;
-    int16_t e_t = std::numeric_limits<int16_t>::min(); // tile exponent
-
-    std::vector<int16_t> e_t_per_tile;
-    size_t num_padding_blocks = 0;
-};
-
-struct Config
-{
-    std::pair<ggml::gemmini::types::ModelType, ggml::gemmini::types::LayerType> preset = {
-        ggml::gemmini::types::ModelType::gpt2,
-        ggml::gemmini::types::LayerType::ffn_norm,
-    };
-
-    size_t block_size = 32;
-    int16_t m = GGML_GEMMINI_ETHOS_Q_DEFAULT - 2;
-    int8_t qmax = (1 << (GGML_GEMMINI_ETHOS_Q_DEFAULT - 1)) - 1;
-    int delta = 0;
-    bool l2_on = false;
-    L2Config l2{};
-    Result result{};
-    size_t num_real_blocks = 0;
-};
+inline void apply_ethos_defaults(Config &cfg) {
+    cfg.m = GGML_GEMMINI_ETHOS_Q_DEFAULT - 2;
+    cfg.qmax = static_cast<int8_t>((1 << (GGML_GEMMINI_ETHOS_Q_DEFAULT - 1)) - 1);
+}
 
 void set_config(Config &cfg);
 
