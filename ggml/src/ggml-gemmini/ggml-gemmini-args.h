@@ -117,7 +117,7 @@ typedef struct ggml_gemmini_args_t {
         size_t blocks_K = 0;
         size_t blocks_J = 0;     // logical rows (J * Z * W) for scale rows
         size_t blocks_I = 0;     // legacy alias for logical rows (keep for ABI)
-        uint32_t block_size_k = QK8_0;
+        uint32_t block_size_k = GGML_GEMMINI_BLOCK_SIZE;
         size_t stride = 0;
         bool transpose_b = true;
 
@@ -204,7 +204,7 @@ typedef struct ggml_gemmini_args_t {
     size_t gemmini_call_tile_k_elems = 0;      // tile_k * DIM used by latest call
 
     // Weight block scale granularity (Q8_0 scale table axis).
-    uint32_t block_size_k = QK8_0;
+    uint32_t block_size_k = GGML_GEMMINI_BLOCK_SIZE;
 
     float scale_out = 1.0f;
 

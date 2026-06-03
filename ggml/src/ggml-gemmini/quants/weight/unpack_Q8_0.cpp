@@ -1,6 +1,7 @@
 // Q8_0 weight unpacking implementation (ggml-free)
 
 #include "unpack_Q8_0.hpp"
+#include "../../ggml-gemmini-config.hpp"
 #include "../../ggml-gemmini-args.h"
 #include "../common/tensor_util.hpp"
 
@@ -166,8 +167,9 @@ bool unpack_q8_0(
         return false;
     }
 
+    static_assert(GGML_GEMMINI_BLOCK_SIZE == 32, "GGML_GEMMINI_BLOCK_SIZE must be 32 to match Q8_0 weight format");
     if (block_size != 32) {
-        return false; // Q8_0 requires block_size = 32
+        return false;
     }
 
     // Normalize dimensions (treat 0 as 1)

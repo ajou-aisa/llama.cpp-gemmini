@@ -2,6 +2,7 @@
 #pragma once
 
 #include "ethos/types.hpp"
+#include "ggml-gemmini-config.hpp"
 
 struct ggml_tensor;
 struct ggml_gemmini_args_t;

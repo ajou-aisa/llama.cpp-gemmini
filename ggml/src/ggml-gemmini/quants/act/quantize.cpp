@@ -234,12 +234,17 @@ void reset_activation_quant_state(ggml_gemmini_args_t &args) {
 
 ActivationQuantConfig make_activation_quant_config(const ggml_gemmini_args_t &args) {
     ActivationQuantConfig cfg {};
-    cfg.block_size = static_cast<size_t>(QK8_0);
+    cfg.block_size = static_cast<size_t>(GGML_GEMMINI_BLOCK_SIZE);
     if (args.layer_type != ggml::gemmini::types::LayerType::unknown) {
         cfg.preset.second = args.layer_type;
     }
 
-    act::ethos::set_config(cfg);
+    switch (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT) {
+    case ggml::gemmini::config::ActivationQuantAlgo::ETHOS:
+    default:
+        act::ethos::set_config(cfg);
+        break;
+    }
     if (args.ethos_override_enabled) {
         const int q = args.ethos_q;
         if (q >= 2 && q <= 8) {

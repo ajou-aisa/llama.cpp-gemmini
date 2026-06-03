@@ -185,6 +185,42 @@ set_property(CACHE GGML_GEMMINI_WS_DEBUG PROPERTY STRINGS 0 1)
 set(GGML_GEMMINI_DISABLE_WS_REUSE "0" CACHE STRING "Disable WS A/B reuse for debugging (0|1)")
 set_property(CACHE GGML_GEMMINI_DISABLE_WS_REUSE PROPERTY STRINGS 0 1)
 
+# ---------------------------------------------------------------------------
+# Adding a new compile-time option
+# ---------------------------------------------------------------------------
+# 1. Choose a macro name (must match the C++ header, e.g. GGML_GEMMINI_*).
+# 2. Add a set(CACHE ...) + set_property(STRINGS ...) block below.
+# 3. Validate the string input and map it to an integer value.
+# 4. Append the integer to GGML_GEMMINI_COMPILE_DEFS so it reaches #ifdef.
+# 5. In the C++ header add the enum entry, #elif branch, and static_assert.
+# 6. In the dispatch site (e.g. quantize.cpp) add a case / if constexpr branch.
+# ---------------------------------------------------------------------------
+set(GGML_GEMMINI_COMPUTE_TYPE "INT" CACHE STRING "Gemmini compute type: INT or FLOAT")
+set_property(CACHE GGML_GEMMINI_COMPUTE_TYPE PROPERTY STRINGS INT FLOAT)
+string(TOUPPER "${GGML_GEMMINI_COMPUTE_TYPE}" _GGML_GEMMINI_COMPUTE_TYPE_UPPER)
+if(NOT _GGML_GEMMINI_COMPUTE_TYPE_UPPER STREQUAL "INT" AND NOT _GGML_GEMMINI_COMPUTE_TYPE_UPPER STREQUAL "FLOAT")
+    message(FATAL_ERROR "GGML_GEMMINI_COMPUTE_TYPE must be one of: INT, FLOAT")
+endif()
+if(_GGML_GEMMINI_COMPUTE_TYPE_UPPER STREQUAL "INT")
+    set(_GGML_GEMMINI_COMPUTE_TYPE_VALUE 0)
+else()
+    set(_GGML_GEMMINI_COMPUTE_TYPE_VALUE 1)
+endif()
+
+set(GGML_GEMMINI_ACTIVATION_QUANT "ETHOS" CACHE STRING "Gemmini activation quant type")
+set_property(CACHE GGML_GEMMINI_ACTIVATION_QUANT PROPERTY STRINGS ETHOS)
+string(TOUPPER "${GGML_GEMMINI_ACTIVATION_QUANT}" _GGML_GEMMINI_ACTIVATION_QUANT_UPPER)
+if(NOT _GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "ETHOS")
+    message(FATAL_ERROR "GGML_GEMMINI_ACTIVATION_QUANT must be ETHOS, got '${GGML_GEMMINI_ACTIVATION_QUANT}'")
+endif()
+set(_GGML_GEMMINI_ACTIVATION_QUANT_VALUE 0)
+
+set(GGML_GEMMINI_BLOCK_SIZE "32" CACHE STRING "Gemmini block size (must be 32 to match Q8_0)")
+if (NOT GGML_GEMMINI_BLOCK_SIZE EQUAL 32)
+    message(FATAL_ERROR "GGML_GEMMINI_BLOCK_SIZE must be 32 to match Q8_0 weight format, got '${GGML_GEMMINI_BLOCK_SIZE}'")
+endif()
+set(_GGML_GEMMINI_BLOCK_SIZE_VALUE "${GGML_GEMMINI_BLOCK_SIZE}")
+
 foreach(_GGML_GEMMINI_BOOL_VAR IN ITEMS
         GGML_GEMMINI_PRINT_TILE
         GGML_GEMMINI_FULL_C
@@ -213,6 +249,9 @@ set(GGML_GEMMINI_COMPILE_DEFS
     TRANSPOSE_B=${GGML_GEMMINI_TRANSPOSE_B}
     GEMMINI_WS_DEBUG=${GGML_GEMMINI_WS_DEBUG}
     GEMMINI_DISABLE_WS_REUSE=${GGML_GEMMINI_DISABLE_WS_REUSE}
+    GGML_GEMMINI_COMPUTE_TYPE=${_GGML_GEMMINI_COMPUTE_TYPE_VALUE}
+    GGML_GEMMINI_ACTIVATION_QUANT=${_GGML_GEMMINI_ACTIVATION_QUANT_VALUE}
+    GGML_GEMMINI_BLOCK_SIZE=${_GGML_GEMMINI_BLOCK_SIZE_VALUE}
 )
 
 # set log option
@@ -234,6 +273,8 @@ set(GGML_GEMMINI_RUNTIME_COMPILE_DEFS
     LOG_DUMP_SCALE=${LOG_DUMP_SCALE}
     ERROR_COMPENSATION=${ERROR_COMPENSATION}
     GEMMINI_VERIFY_DEQ=1
+    GGML_GEMMINI_COMPUTE_TYPE=${_GGML_GEMMINI_COMPUTE_TYPE}
+    GGML_GEMMINI_ACTIVATION_QUANT=${_GGML_GEMMINI_ACT_QUANT_VALUE}
 )
 
 list(APPEND GGML_GEMMINI_COMPILE_DEFS ${GGML_GEMMINI_RUNTIME_COMPILE_DEFS})

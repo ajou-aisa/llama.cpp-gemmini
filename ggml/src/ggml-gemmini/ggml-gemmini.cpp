@@ -1,7 +1,5 @@
 // ggml-gemmini.cpp
 
-#include <algorithm>
-#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -12,11 +10,11 @@
 
 #include <map>
 #include <memory>
-#include <type_traits>
-
 #include "ggml-impl.h"
 #include "ggml-gemmini.h"
+#include "ggml-gemmini-config.hpp"
 #include "ggml-backend-impl.h"
+#include "ggml-quants.h"
 #include "ggml-gemmini-ethos-config.hpp"
 
 #include <gemmini/log.hpp>
@@ -96,7 +94,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     
     ggml::gemmini::log::debug(layer, "I=%zu, J=%zu, K=%zu", I, J, K);
 
-    if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) {
+    if constexpr (ggml::gemmini::config::CURRENT_COMPUTE_TYPE == ggml::gemmini::config::ComputeType::FLOAT) {
+        if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) {
             std::vector<float> src0_f32;
             const float *src0_f = (const float *)src0->data;
             if (src0->type == GGML_TYPE_F16) {
@@ -113,7 +112,17 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                                          (const float *)src1->data, src0_f, NULL, (float *)dst->data,
                                          K, K, 0, J);
             return;
+        } else if (src0->type == GGML_TYPE_Q8_0) {
+            std::vector<float> src0_f32(J * K);
+            dequantize_row_q8_0((const block_q8_0 *)src0->data, src0_f32.data(), J * K);
+            ggml::gemmini::matmul_cpu_fp(false, true, I, J, K,
+                                         (const float *)src1->data, src0_f32.data(), NULL, (float *)dst->data,
+                                         K, K, 0, J);
+            return;
+        } else {
+            GGML_ASSERT(false && "FLOAT compute type: unsupported weight type");
         }
+    }
 
     ggml_gemmini_args_t args; // DEC과 gemmini 호출을 위한 args 
 
@@ -157,7 +166,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     // quantize activation
     start = ggml::gemmini::cycle::read();
 
-    static thread_local std::vector<int8_t> activation_q;
+    [[maybe_unused]] static thread_local std::vector<int8_t> activation_q;
     activation_q.resize(I * K);
     int8_t *qx = activation_q.data();
 
@@ -181,7 +190,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     capture_activation_quant_result(args, activation_cfg, activation_res);
 
     args.A = reinterpret_cast<elem_t *>(qx);
+#if GGML_GEMMINI_COMPUTE_TYPE == 0
     static_assert(sizeof(elem_t) == 1, "Q8_0 path assumes elem_t is int8 (1 byte).");
+#endif
 
     end = ggml::gemmini::cycle::read();
     ggml::gemmini::log::cycle(layer, "cpu.Quantize activation", start, end);
@@ -193,8 +204,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     const int64_t dim_z = src0->ne[2] ? src0->ne[2] : 1;
     const int64_t dim_w = src0->ne[3] ? src0->ne[3] : 1;
 
-    GGML_ASSERT(dim_k % QK8_0 == 0);
-    const size_t blocks_K = static_cast<size_t>(dim_k) / QK8_0;
+    GGML_ASSERT(dim_k % GGML_GEMMINI_BLOCK_SIZE == 0);
+    const size_t blocks_K = static_cast<size_t>(dim_k) / GGML_GEMMINI_BLOCK_SIZE;
     // Overflow guard for logical_rows and subsequent allocations.
     const __int128 logical_rows_128 =
         static_cast<__int128>(dim_j) * static_cast<__int128>(dim_z) * static_cast<__int128>(dim_w);
@@ -346,7 +357,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     
     // output 버퍼
-    static thread_local std::vector<int8_t> c_i8;
+    [[maybe_unused]] static thread_local std::vector<int8_t> c_i8;
     c_i8.resize(I * J);
     
     args.C = c_i8.data();
