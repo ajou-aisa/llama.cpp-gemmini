@@ -87,7 +87,7 @@ ActivationQuantResult quantize_activation_f32(
         ActivationQuantResult aggregated;
         aggregated.e_s = std::numeric_limits<int16_t>::min();
 
-        const size_t stripe_I = args.tile_I > 0 ? args.tile_I : args.I;
+        const size_t stripe_I = args.tile_I > 0 ? args.tile_I * DIM : args.I;
         const size_t num_stripes = (args.I + stripe_I - 1) / stripe_I;
         size_t current_row_offset = 0;
 
