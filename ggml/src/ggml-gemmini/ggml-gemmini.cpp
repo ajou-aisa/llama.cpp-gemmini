@@ -218,7 +218,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     // - false: KxJ row-major (stride = J_flat)
     args.sB = args.transpose_B ? static_cast<size_t>(dim_k) : logical_rows;
 
-    const size_t logical_stripe_J = args.stripe_J > 1 ? args.tile_J_elems() : 1;
+    const size_t logical_stripe_J = args.stripe_J > 1 ? args.tile_J * DIM : 1;
     const block_q8_0 *block_base = ggml::gemmini::weight_block_base(src0);
     ggml_gemmini_args_t::unpacked_weight *cached = nullptr;
 
@@ -376,7 +376,15 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     /* __ 5. Gemmini 호출 __ */
     args.tiled_matmul_type = CPU;
-    ggml::gemmini::tiled_block_matmul_auto(&args);
+    if constexpr (ggml::gemmini::config::CURRENT_COMPUTE_TYPE == ggml::gemmini::config::ComputeType::INT) {
+        if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::ETHOS) {
+            ggml::gemmini::tiled_matmul_auto_im2p(&args);
+        } else if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TENSOR) {
+            ggml::gemmini::tiled_matmul_auto_tensor(&args);
+        }
+    } else {
+        ggml::gemmini::tiled_matmul_auto_fp(&args);
+    }
     // dst에는 gemmini 커널에서 dequantize한 결과가 들어옴 
 
 #if ERROR_COMPENSATION

@@ -196,14 +196,11 @@ typedef struct ggml_gemmini_args_t {
     ggml::gemmini::types::LayerType layer_type{};
     const char *model_arch = nullptr;
 
-    // Gemmini auto-tiling counts in DIM units. Use tile_*_elems() for logical element spans.
+    // Gemmini auto-tiling counts in DIM units (multiply by DIM to get element counts).
     size_t tile_I = 0;
     size_t tile_J = 0;
     size_t tile_K = 0;
 
-    inline size_t tile_I_elems() const { return tile_I * static_cast<size_t>(DIM); }
-    inline size_t tile_J_elems() const { return tile_J * static_cast<size_t>(DIM); }
-    inline size_t tile_K_elems() const { return tile_K * static_cast<size_t>(DIM); }
     inline size_t stripe_J_or_rowwise_elems() const { return stripe_J > 0 ? stripe_J : 1; }
     inline bool stripe_mode_matches_tile_j(size_t tile_J_elems) const {
         return stripe_J <= 1 || (tile_J_elems > 0 && stripe_J == tile_J_elems);
