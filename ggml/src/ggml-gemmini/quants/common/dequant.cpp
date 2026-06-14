@@ -20,7 +20,7 @@ void dequantize(
         quants::act::ethos::dequantize(args, k_offset, block_k, acc32, acc_stride);
         break;
     case ggml::gemmini::config::ActivationQuantAlgo::TENSOR:
-        quants::act::tensor::dequantize(args, k_offset, block_k, acc32, acc_stride);
+        quants::act::tensor::dequantize(args, acc32, acc_stride);
         break;
     }
 }

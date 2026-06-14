@@ -116,6 +116,9 @@ ActivationQuantResult quantize_activation_f32(
         return aggregated;
     }
     case ggml::gemmini::config::ActivationQuantAlgo::TENSOR:
+        if (!act::tensor::quantize(internal_cfg, src, args, dst)) {
+            return internal_cfg.result;
+        }
         return internal_cfg.result;
     }
 

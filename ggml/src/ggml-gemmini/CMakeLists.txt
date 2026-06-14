@@ -44,6 +44,7 @@ ggml_add_backend_library(ggml-gemmini
                          quants/act/quantize.cpp
                          quants/act/ethos/types.cpp
                          quants/act/ethos/ethos.cpp
+                         quants/act/tensor/tensor.cpp
                          quants/weight/quantize_Q8_0_R.cpp
                          quants/weight/unpack_Q8_0.cpp
                          quants/common/fp16_util.cpp
