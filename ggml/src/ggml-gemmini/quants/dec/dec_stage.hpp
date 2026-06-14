@@ -23,9 +23,7 @@ void build_rk_csc(size_t K, ActivationDECScratch &scratch);
 inline size_t get_rk_nnz(size_t K, const ActivationDECScratch &scratch)
 {
     if (scratch.rk_offs.size() <= K)
-    {
         return 0;
-    }
 
     return scratch.rk_offs[K];
 }

@@ -5,9 +5,8 @@
 namespace ggml::gemmini {
 
 inline const float *activation_data(const ggml_tensor *tensor) {
-    if (!tensor) {
+    if (!tensor)
         return nullptr;
-    }
 
     const char *base = reinterpret_cast<const char *>(tensor->view_src ? tensor->view_src->data : tensor->data);
     const size_t offs = tensor->view_src ? tensor->view_offs : 0;
@@ -15,9 +14,8 @@ inline const float *activation_data(const ggml_tensor *tensor) {
 }
 
 inline const block_q8_0 *weight_block_base(const ggml_tensor *tensor) {
-    if (!tensor) {
+    if (!tensor)
         return nullptr;
-    }
 
     const char *base = reinterpret_cast<const char *>(tensor->view_src ? tensor->view_src->data : tensor->data);
     const size_t offs = tensor->view_src ? tensor->view_offs : 0;

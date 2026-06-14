@@ -18,9 +18,8 @@ namespace ggml::gemmini::quants { namespace {
 constexpr float q8_0_r_scale_bins = 255.0f;
 
 uint8_t quantize_scale_code(float s_b, float s_rf, uint16_t R) {
-    if (!std::isfinite(s_b) || !std::isfinite(s_rf) || s_rf <= 0.0f) {
+    if (!std::isfinite(s_b) || !std::isfinite(s_rf) || s_rf <= 0.0f)
         return 0;
-    }
 
     const double c_eff = std::round(static_cast<double>(s_b) / static_cast<double>(s_rf));
     const double shifted_code = c_eff - static_cast<double>(R);
@@ -51,9 +50,8 @@ bool quantize_row_scales_q80_r(
 
     for (size_t block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
         const float s_b = row_scales[block_idx];
-        if (!std::isfinite(s_b)) {
+        if (!std::isfinite(s_b))
             return false;
-        }
 
         min_s = std::min(min_s, s_b);
         max_s = std::max(max_s, s_b);
@@ -74,9 +72,8 @@ bool quantize_row_scales_q80_r(
     const double r_val = std::round(static_cast<double>(min_s) / static_cast<double>(dst_s_rf));
     dst_R = static_cast<uint16_t>(std::min(65535.0, std::max(0.0, r_val)));
 
-    for (size_t block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
+    for (size_t block_idx = 0; block_idx < blocks_per_row; ++block_idx)
         dst_c_b[block_idx] = quantize_scale_code(row_scales[block_idx], dst_s_rf, dst_R);
-    }
 
     return true;
 }
@@ -97,9 +94,8 @@ bool quantize_stripe_scales_q80_r(
         const float *row_scales = stripe_scales + row_idx * blocks_per_row;
         for (size_t block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
             const float s_b = row_scales[block_idx];
-            if (!std::isfinite(s_b)) {
+            if (!std::isfinite(s_b))
                 return false;
-            }
 
             min_s = std::min(min_s, s_b);
             max_s = std::max(max_s, s_b);
@@ -108,9 +104,8 @@ bool quantize_stripe_scales_q80_r(
 
     const float scale_range = max_s - min_s;
     if (!std::isfinite(scale_range) || scale_range <= 0.0f) {
-        for (size_t row_idx = 0; row_idx < num_rows; ++row_idx) {
+        for (size_t row_idx = 0; row_idx < num_rows; ++row_idx)
             set_constant_scale(min_s, blocks_per_row, dst_c_b + row_idx * blocks_per_row, dst_s_rf[row_idx], dst_R[row_idx]);
-        }
         dst_s_rf_stripe = dst_s_rf[0];
         dst_R_stripe = dst_R[0];
         return true;
@@ -118,9 +113,8 @@ bool quantize_stripe_scales_q80_r(
 
     const float s_rf = scale_range / q8_0_r_scale_bins;
     if (!std::isfinite(s_rf) || s_rf <= 0.0f) {
-        for (size_t row_idx = 0; row_idx < num_rows; ++row_idx) {
+        for (size_t row_idx = 0; row_idx < num_rows; ++row_idx)
             set_constant_scale(min_s, blocks_per_row, dst_c_b + row_idx * blocks_per_row, dst_s_rf[row_idx], dst_R[row_idx]);
-        }
         dst_s_rf_stripe = dst_s_rf[0];
         dst_R_stripe = dst_R[0];
         return true;
@@ -138,9 +132,8 @@ bool quantize_stripe_scales_q80_r(
         dst_s_rf[row_idx] = s_rf;
         dst_R[row_idx] = R;
 
-        for (size_t block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
+        for (size_t block_idx = 0; block_idx < blocks_per_row; ++block_idx)
             row_codes[block_idx] = quantize_scale_code(row_scales[block_idx], s_rf, R);
-        }
     }
 
     return true;
@@ -163,20 +156,17 @@ bool unpack_q8_0(
     UnpackQ80Result *out_meta
 ) {
     // Validate inputs
-    if (!src || src->type != GGML_TYPE_Q8_0 || !dst_jxk || !dst_scales) {
+    if (!src || src->type != GGML_TYPE_Q8_0 || !dst_jxk || !dst_scales)
         return false;
-    }
 
     static_assert(GGML_GEMMINI_BLOCK_SIZE == 32, "GGML_GEMMINI_BLOCK_SIZE must be 32 to match Q8_0 weight format");
-    if (block_size != 32) {
+    if (block_size != 32)
         return false;
-    }
 
     // Normalize dimensions (treat 0 as 1)
     const block_q8_0 *block_base = ggml::gemmini::weight_block_base(src);
-    if (!block_base) {
+    if (!block_base)
         return false;
-    }
 
     const size_t nb0 = src->nb[0];
     const size_t nb1 = src->nb[1];
@@ -188,17 +178,15 @@ bool unpack_q8_0(
     const int64_t dim_w = (src->ne[3] > 0) ? src->ne[3] : 1;
 
     // Validate K dimension
-    if (dim_k <= 0 || (dim_k % static_cast<int64_t>(block_size)) != 0) {
+    if (dim_k <= 0 || (dim_k % static_cast<int64_t>(block_size)) != 0)
         return false;
-    }
 
     // Compute metadata (avoid overflow on logical_rows)
     size_t blocks_K = static_cast<size_t>(dim_k) / block_size;
     const __int128 logical_rows_128 =
         static_cast<__int128>(dim_j) * static_cast<__int128>(dim_z) * static_cast<__int128>(dim_w);
-    if (logical_rows_128 > static_cast<__int128>(std::numeric_limits<size_t>::max())) {
+    if (logical_rows_128 > static_cast<__int128>(std::numeric_limits<size_t>::max()))
         return false;
-    }
     size_t logical_rows = static_cast<size_t>(logical_rows_128);
 
     // Validate stride
@@ -214,9 +202,8 @@ bool unpack_q8_0(
         layout != Q80OutputLayout::KXJ_ROW_MAJOR) {
         return false;
     }
-    if (nb0 == 0 || nb0 < sizeof(BlockQ8_0)) {
+    if (nb0 == 0 || nb0 < sizeof(BlockQ8_0))
         return false;
-    }
 
     const char *effective_base = reinterpret_cast<const char *>(block_base);
 
@@ -304,14 +291,12 @@ bool unpack_q80_r_weight(
     std::vector<uint16_t> &dst_R,
     std::vector<float> *dst_s_rf_stripe,
     std::vector<uint16_t> *dst_R_stripe) {
-    if (!src_q80 || src_q80->type != GGML_TYPE_Q8_0) {
+    if (!src_q80 || src_q80->type != GGML_TYPE_Q8_0)
         return false;
-    }
 
     const block_q8_0 *block_base = ggml::gemmini::weight_block_base(src_q80);
-    if (!block_base || src_q80->ne[0] <= 0 || src_q80->ne[0] % QK8_0 != 0) {
+    if (!block_base || src_q80->ne[0] <= 0 || src_q80->ne[0] % QK8_0 != 0)
         return false;
-    }
 
     const int64_t dim_k = src_q80->ne[0];
     const int64_t dim_j = src_q80->ne[1] > 0 ? src_q80->ne[1] : 1;
@@ -319,16 +304,14 @@ bool unpack_q80_r_weight(
     const int64_t dim_w = src_q80->ne[3] > 0 ? src_q80->ne[3] : 1;
     const __int128 logical_rows_128 =
         static_cast<__int128>(dim_j) * static_cast<__int128>(dim_z) * static_cast<__int128>(dim_w);
-    if (logical_rows_128 <= 0 || logical_rows_128 > static_cast<__int128>(std::numeric_limits<size_t>::max())) {
+    if (logical_rows_128 <= 0 || logical_rows_128 > static_cast<__int128>(std::numeric_limits<size_t>::max()))
         return false;
-    }
 
     const size_t logical_rows = static_cast<size_t>(logical_rows_128);
     const size_t k_elems = static_cast<size_t>(dim_k);
     const size_t blocks_per_row = k_elems / static_cast<size_t>(QK8_0);
-    if (blocks_per_row == 0 || logical_rows > std::numeric_limits<size_t>::max() / k_elems) {
+    if (blocks_per_row == 0 || logical_rows > std::numeric_limits<size_t>::max() / k_elems)
         return false;
-    }
 
     dst_qs.assign(logical_rows * k_elems, 0);
     std::vector<float> block_scales(logical_rows * blocks_per_row, 0.0f);
@@ -342,9 +325,8 @@ bool unpack_q80_r_weight(
         block_scales.data(),
         Q80OutputLayout::JXK_ROW_MAJOR,
         &meta);
-    if (!unpacked) {
+    if (!unpacked)
         return false;
-    }
 
     dst_c_b.assign(meta.logical_cols * meta.blocks_K, 0);
     dst_s_rf.assign(meta.logical_cols, 0.0f);
@@ -353,9 +335,8 @@ bool unpack_q80_r_weight(
     const size_t stripe_J = args.stripe_J > 1 ? args.stripe_J : 1;
     const bool use_stripe_metadata = stripe_J > 1;
     if (use_stripe_metadata) {
-        if (!dst_s_rf_stripe || !dst_R_stripe) {
+        if (!dst_s_rf_stripe || !dst_R_stripe)
             return false;
-        }
 
         const size_t num_stripes = (meta.logical_cols + stripe_J - 1) / stripe_J;
         dst_s_rf_stripe->assign(num_stripes, 0.0f);
@@ -377,12 +358,10 @@ bool unpack_q80_r_weight(
             }
         }
     } else {
-        if (dst_s_rf_stripe) {
+        if (dst_s_rf_stripe)
             dst_s_rf_stripe->clear();
-        }
-        if (dst_R_stripe) {
+        if (dst_R_stripe)
             dst_R_stripe->clear();
-        }
 
         for (size_t row_idx = 0; row_idx < meta.logical_cols; ++row_idx) {
             if (!quantize_row_scales_q80_r(

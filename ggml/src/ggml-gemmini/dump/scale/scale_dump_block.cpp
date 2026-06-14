@@ -13,9 +13,7 @@ namespace ggml::gemmini::log::scale::detail
         char buf[32];
         const int len = std::snprintf(buf, sizeof(buf), "%.9g", static_cast<double>(v));
         if (len > 0)
-        {
             std::fwrite(buf, 1, static_cast<size_t>(len), out);
-        }
     }
 
     void write_k_block_hints(FILE *out, const DumpMeta &meta, const ScaleTableView &view)
@@ -24,16 +22,12 @@ namespace ggml::gemmini::log::scale::detail
         for (size_t blk = 0; blk < view.cols; ++blk)
         {
             if (blk > 0)
-            {
                 std::fputc(',', out);
-            }
             const size_t start = blk * view.block_size;
             char buf[32];
             const int len = std::snprintf(buf, sizeof(buf), "%zu", start);
             if (len > 0)
-            {
                 std::fwrite(buf, 1, static_cast<size_t>(len), out);
-            }
         }
         std::fputc(']', out);
 
@@ -41,9 +35,7 @@ namespace ggml::gemmini::log::scale::detail
         for (size_t blk = 0; blk < view.cols; ++blk)
         {
             if (blk > 0)
-            {
                 std::fputc(',', out);
-            }
             const size_t end_raw = (blk + 1) * view.block_size;
             size_t end = end_raw;
             if (meta.K > 0)
@@ -54,9 +46,7 @@ namespace ggml::gemmini::log::scale::detail
             char buf[32];
             const int len = std::snprintf(buf, sizeof(buf), "%zu", end);
             if (len > 0)
-            {
                 std::fwrite(buf, 1, static_cast<size_t>(len), out);
-            }
         }
         std::fputc(']', out);
     }
@@ -85,9 +75,7 @@ namespace ggml::gemmini::log::scale::detail
             static_cast<long long>(meta.J),
             static_cast<long long>(meta.K));
         if (len > 0)
-        {
             std::fwrite(buf, 1, static_cast<size_t>(len), out);
-        }
 
         std::fputs(",\"row_axis\":\"", out);
         ggml::gemmini::log::dump_detail::write_json_escaped(out, meta.row_axis ? meta.row_axis : "row");
@@ -108,9 +96,7 @@ namespace ggml::gemmini::log::scale::detail
                 view.block_size,
                 static_cast<long long>(meta.K));
             if (len2 > 0)
-            {
                 std::fwrite(buf2, 1, static_cast<size_t>(len2), out);
-            }
         }
 
         write_k_block_hints(out, meta, view);
@@ -122,16 +108,12 @@ namespace ggml::gemmini::log::scale::detail
         for (size_t row = 0; row < view.rows; ++row)
         {
             if (row > 0)
-            {
                 std::fputc(',', out);
-            }
             std::fputc('[', out);
             for (size_t col = 0; col < view.cols; ++col)
             {
                 if (col > 0)
-                {
                     std::fputc(',', out);
-                }
                 const float scale = view.scales[row * view.cols + col];
                 write_float(out, scale);
             }
@@ -151,9 +133,7 @@ DumpResult dump_block(
     DumpResult result{};
 
     if (!out || !view.scales || view.rows == 0 || view.cols == 0 || view.block_size == 0)
-    {
         return result;
-    }
 
     write_common_header(out, meta, view);
     write_scale_data_2d(out, view);

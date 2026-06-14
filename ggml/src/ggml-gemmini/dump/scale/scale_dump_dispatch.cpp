@@ -29,9 +29,7 @@ namespace ggml::gemmini::log::scale {
                 FILE *out = select_output(target.path, &owns);
                 DumpResult result = write(out, meta, view, cfg);
                 if (owns && out)
-                {
                     std::fclose(out);
-                }
                 return result;
             }
 
@@ -49,17 +47,11 @@ namespace ggml::gemmini::log::scale {
                 return detail::dump_tensor(out, meta, view, cfg);
 #else
                 if (cfg.enable_block)
-                {
                     return detail::dump_block(out, meta, view, cfg.block);
-                }
                 if (cfg.enable_tile)
-                {
                     return detail::dump_tile(out, meta, view, cfg.tile);
-                }
                 if (cfg.enable_tensor)
-                {
                     return detail::dump_tensor(out, meta, view, cfg.tensor);
-                }
                 return DumpResult{};
 #endif
             }

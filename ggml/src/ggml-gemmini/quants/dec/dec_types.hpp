@@ -50,21 +50,15 @@ namespace ggml::gemmini::quants::dec
             Wk_f.resize(J);
 
             if (need_ycom)
-            {
                 Y_com.assign(I * J, 0.f);
-            }
             else
-            {
                 Y_com.clear();
-            }
         }
 
         void reset_counts(size_t K)
         {
             if (rk_counts.size() != K + 1)
-            {
                 rk_counts.assign(K + 1, 0);
-            }
             else
             {
                 std::fill(rk_counts.begin(), rk_counts.end(), size_t {0});
@@ -80,13 +74,9 @@ namespace ggml::gemmini::quants::dec
         void reset_i1_delta(size_t K)
         {
             if (i1_delta_by_k.size() != K)
-            {
                 i1_delta_by_k.assign(K, 0.f);
-            }
             else
-            {
                 std::fill(i1_delta_by_k.begin(), i1_delta_by_k.end(), 0.f);
-            }
 
             i1_total_abs_residual = 0.0;
         }
@@ -95,13 +85,9 @@ namespace ggml::gemmini::quants::dec
         {
             const size_t sz = I * J;
             if (Y_com.size() != sz)
-            {
                 Y_com.assign(sz, 0.f);
-            }
             else
-            {
                 std::fill(Y_com.begin(), Y_com.end(), 0.f);
-            }
         }
     };
 

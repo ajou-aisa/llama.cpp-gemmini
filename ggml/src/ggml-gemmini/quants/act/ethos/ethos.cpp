@@ -236,9 +236,7 @@ void L2Detector::detect_l2(Config &cfg, Metadata &meta, int blk_idx)
                 blk.e_b = tmp;
             }
             else if (tmp > blk.e_b2)
-            {
                 blk.e_b2 = tmp;
-            }
         }
     }
 }
@@ -258,24 +256,18 @@ bool Ethos::run(
     cfg.result.e_s = std::numeric_limits<int16_t>::min();
 
     if (!dst)
-    {
         return false;
-    }
 
     // Step 1.0: initialize meta data.
     if (!unit_i_.init(cfg, meta_, data_ptr, stride_i_bytes, stride_k_bytes, rows, cols))
-    {
         return false;
-    }
 
     const size_t blk_per_row = cols / cfg.block_size;
 
     // Step 2.0. Block-wise quantize for real blocks
     StripeState &stripe = meta_.stripe;
     if (stripe.num_real_blocks == 0)
-    {
         return false;
-    }
 
     for (size_t blk_idx = 0; blk_idx < stripe.num_real_blocks; ++blk_idx)
     {
@@ -354,16 +346,12 @@ bool Ethos::run(
     for (size_t blk_idx = stripe.num_real_blocks; blk_idx < stripe.blk_num; ++blk_idx)
     {
         for (size_t i = 0; i < cfg.block_size; ++i)
-        {
             dst[blk_idx * cfg.block_size + i] = 0;
-        }
     }
 
         // e_min must be updated by at least one valid block before stripe recoding.
     if (stripe.e_min == std::numeric_limits<int16_t>::max())
-    {
         return false;
-    }
 
 stripe.e_s = stripe.e_min + cfg.delta;
 cfg.result.e_s = stripe.e_s;
@@ -399,9 +387,7 @@ cfg.result.e_s_per_stripe.push_back(stripe.e_s);
             }
 
             if (clipped)
-            {
                 blk.outlier_mask |= (1u << i);
-            }
 
             dst[out_idx] = static_cast<int8_t>(qt);
 
@@ -411,13 +397,9 @@ cfg.result.e_s_per_stripe.push_back(stripe.e_s);
                 const int scale_shift = static_cast<int>(stripe.e_s) - static_cast<int>(cfg.m);
                 float sat;
                 if (scale_shift >= 0)
-                {
                     sat = static_cast<float>(static_cast<int64_t>(qt) << scale_shift);
-                }
                 else
-                {
                     sat = static_cast<float>(qt) / static_cast<float>(int64_t(1) << (-scale_shift));
-                }
                 cfg.result.outliers.push_back({
                     static_cast<int>(row + row_offset),
                     static_cast<int>(col + col_offset),
@@ -440,9 +422,8 @@ void dequantize(
     const int32_t *acc32,
     size_t acc_stride)
 {
-    if (!args.f_out || !acc32 || block_k == 0 || args.I == 0 || args.J == 0) {
+    if (!args.f_out || !acc32 || block_k == 0 || args.I == 0 || args.J == 0)
         return;
-    }
 
     const size_t weight_block_size = args.block_size_k > 0 ? args.block_size_k : static_cast<size_t>(QK8_0);
     const size_t k_begin = k_offset;
@@ -462,9 +443,8 @@ void dequantize(
                 const size_t weight_blk = k_begin / weight_block_size;
                 if (weight_blk < args.blocks_K) {
                     const size_t weight_scale_idx = j * args.blocks_K + weight_blk;
-                    if (weight_scale_idx < total_weight_scale_elems) {
+                    if (weight_scale_idx < total_weight_scale_elems)
                         scale_w = args.B_scales[weight_scale_idx];
-                    }
                 }
             }
 

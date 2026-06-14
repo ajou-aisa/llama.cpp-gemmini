@@ -90,15 +90,11 @@ namespace ggml { namespace gemmini { namespace log
         void write_tensor_dump(FILE *out, const char *layer, const ggml_tensor *tensor)
         {
             if (!out || !tensor)
-            {
                 return;
-            }
 
             const char *tensor_name = tensor->name;
             if (!tensor_name || tensor_name[0] == '\0')
-            {
                 tensor_name = "";
-            }
 
             const int64_t n0 = tensor->ne[0];
             const int64_t n1 = tensor->ne[1] > 0 ? tensor->ne[1] : 1;
@@ -117,9 +113,7 @@ namespace ggml { namespace gemmini { namespace log
             const char *base = reinterpret_cast<const char *>(tensor->view_src ? tensor->view_src->data : tensor->data);
             const size_t offs = tensor->view_src ? tensor->view_offs : 0;
             if (!base)
-            {
                 return;
-            }
 
             const size_t nb0 = tensor->nb[0];
             const size_t nb1 = tensor->nb[1];
@@ -128,9 +122,7 @@ namespace ggml { namespace gemmini { namespace log
 
             LoadFn load = select_loader(tensor->type);
             if (!load)
-            {
                 return;
-            }
 
             std::fwrite("{\"layer\":\"", 1, 10, out);
             dump_detail::write_json_escaped(out, layer ? layer : "");
@@ -148,9 +140,7 @@ namespace ggml { namespace gemmini { namespace log
                                               ",\"step_id\":%llu",
                                               static_cast<unsigned long long>(step_id_out));
                 if (len > 0)
-                {
                     std::fwrite(buf, 1, static_cast<size_t>(len), out);
-                }
             }
 
             {
@@ -162,9 +152,7 @@ namespace ggml { namespace gemmini { namespace log
                                               static_cast<long long>(out_J),
                                               static_cast<long long>(out_K));
                 if (len > 0)
-                {
                     std::fwrite(buf, 1, static_cast<size_t>(len), out);
-                }
             }
 
             std::fwrite(",\"data\":[", 1, 9, out);
@@ -177,9 +165,7 @@ namespace ggml { namespace gemmini { namespace log
                     for (int64_t i1 = 0; i1 < n1; ++i1)
                     {
                         if (!first_row)
-                        {
                             std::fputc(',', out);
-                        }
                         first_row = false;
                         std::fputc('[', out);
 
@@ -187,17 +173,13 @@ namespace ggml { namespace gemmini { namespace log
                         for (int64_t j = 0; j < n0; ++j)
                         {
                             if (j > 0)
-                            {
                                 std::fputc(',', out);
-                            }
                             const char *elem_ptr = row_ptr + j * nb0;
                             const float v = load(elem_ptr);
                             char buf[32];
                             const int len = std::snprintf(buf, sizeof(buf), "%.9g", static_cast<double>(v));
                             if (len > 0)
-                            {
                                 std::fwrite(buf, 1, static_cast<size_t>(len), out);
-                            }
                         }
 
                         std::fputc(']', out);
@@ -245,9 +227,7 @@ namespace ggml { namespace gemmini { namespace log
         FILE *out = select_output(target.path, &owns);
         write_tensor_dump(out, layer, tensor);
         if (owns && out)
-        {
             std::fclose(out);
-        }
     }
 
     void DumpTensorLog::operator()(const char *layer, const ggml_tensor *tensor)

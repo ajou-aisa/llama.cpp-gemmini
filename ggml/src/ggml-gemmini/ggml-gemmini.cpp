@@ -102,9 +102,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 src0_f32.resize(J * K);
                 const ggml_fp16_t *src0_f16 = (const ggml_fp16_t *)src0->data;
                 for (size_t j = 0; j < J; j++) {
-                    for (size_t k = 0; k < K; k++) {
+                    for (size_t k = 0; k < K; k++)
                         src0_f32[j * K + k] = ggml_fp16_to_fp32(src0_f16[j * K + k]);
-                    }
                 }
                 src0_f = src0_f32.data();
             }
@@ -292,9 +291,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             args.stripe_J > 1 ? &entry.R_stripe : nullptr
         );
         GGML_ASSERT(ok);
-        if (!ok) {
+        if (!ok)
             return;
-        }
 
         entry.blocks = args.B_blocks;
         entry.blocks_K = args.blocks_K;
@@ -303,9 +301,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         entry.block_size_k = args.block_size_k;
         entry.stride = args.sB;
 
-        if (args.stripe_J > 1) {
+        if (args.stripe_J > 1)
             entry.stripe_J = args.stripe_J;
-        }
 
         if (it == ctx->weight_cache.end()) {
             it = ctx->weight_cache.emplace(block_base, std::move(entry)).first;
@@ -452,9 +449,8 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
         struct ggml_tensor * node = cgraph->nodes[i];
         if (node->op == GGML_OP_MUL_MAT) {
             const uint32_t I = node->ne[1] > 0 ? static_cast<uint32_t>(node->ne[1]) : 1u;
-            if (I > mxI) {
+            if (I > mxI)
                 mxI = I;
-            }
             const struct ggml_tensor * src1 = node->src[1];
             if (!decode_start_marker && src1 && src1->name &&
                 std::strcmp(src1->name, "attn_norm-0") == 0 &&
@@ -487,9 +483,8 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
             step_id = 1;
         }
     } else {
-        if (decode_start_marker) {
+        if (decode_start_marker)
             g_decode_count.fetch_add(1, std::memory_order_relaxed);
-        }
         phase = ggml::gemmini::log::DumpPhase::decode;
         step_id = 1 + g_decode_count.load(std::memory_order_relaxed);
     }

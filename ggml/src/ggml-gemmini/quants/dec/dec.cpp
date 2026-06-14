@@ -36,9 +36,7 @@ namespace ggml::gemmini::quants::dec { namespace
     WeightLayout resolve_weight_layout(const ggml_gemmini_args_t &args)
     {
         if (is_q80_r_weight_args(args) || args.transpose_B)
-        {
             return WeightLayout::JxK_ColMajor;
-        }
 
         return WeightLayout::KxJ_RowMajor;
     }
@@ -46,9 +44,7 @@ namespace ggml::gemmini::quants::dec { namespace
     size_t resolve_weight_stride_elems(const ggml_gemmini_args_t &args)
     {
         if (is_q80_r_weight_args(args))
-        {
             return args.K;
-        }
 
         const size_t fallback_stride = args.transpose_B ? args.K : args.J;
         return args.sB ? args.sB : fallback_stride;
@@ -88,9 +84,7 @@ namespace ggml::gemmini::quants::dec { namespace
             }
 
             if (!stripe_mode && (!args.s_rf || !args.R))
-            {
                 return result;
-            }
 
             scratch.weight_scales.resize(rows * cols);
             for (size_t j = 0; j < rows; ++j)
@@ -118,9 +112,7 @@ namespace ggml::gemmini::quants::dec { namespace
         }
 
         if (!args.B_scales)
-        {
             return result;
-        }
 
         result.data = args.B_scales;
         result.rows = args.blocks_J;
@@ -424,13 +416,11 @@ ActivationDECResult compensate_activation_dec(
 }
 
 bool should_apply_dec(const ggml_gemmini_args_t &args) {
-    if (!args.B || !args.f_out) {
+    if (!args.B || !args.f_out)
         return false;
-    }
 
-    if (args.I == 0 || args.K == 0 || args.J == 0) {
+    if (args.I == 0 || args.K == 0 || args.J == 0)
         return false;
-    }
 
     return true;
 }
@@ -439,9 +429,8 @@ void append_activation_outliers(
     const ggml_gemmini_args_t &args,
     std::vector<QactOutlier> &outliers) {
     outliers.clear();
-    if (args.act_quant.outliers.empty()) {
+    if (args.act_quant.outliers.empty())
         return;
-    }
 
     static_assert(sizeof(ggml_gemmini_qact_outlier) == sizeof(QactOutlier), "Outlier struct size mismatch");
     static_assert(offsetof(ggml_gemmini_qact_outlier, row) == offsetof(QactOutlier, row), "Outlier::row offset mismatch");
@@ -451,8 +440,7 @@ void append_activation_outliers(
 
     const auto *ptr = reinterpret_cast<const QactOutlier *>(args.act_quant.outliers.data());
     outliers.reserve(args.act_quant.outliers.size());
-    for (size_t idx = 0; idx < args.act_quant.outliers.size(); ++idx) {
+    for (size_t idx = 0; idx < args.act_quant.outliers.size(); ++idx)
         outliers.push_back(ptr[idx]);
-    }
 }
 } // namespace ggml::gemmini::quants::dec

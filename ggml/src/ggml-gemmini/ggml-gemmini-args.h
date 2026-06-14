@@ -26,9 +26,8 @@ struct ggml_gemmini_activation_ethos_meta_t
     inline int16_t resolve_stripe_e_s(int stripe_idx) const {
         if (stripe_idx >= 0 && !e_s_per_stripe_i.empty()) {
             const size_t s = static_cast<size_t>(stripe_idx);
-            if (s < e_s_per_stripe_i.size()) {
+            if (s < e_s_per_stripe_i.size())
                 return e_s_per_stripe_i[s];
-            }
         }
         return e_s;
     }
@@ -166,45 +165,33 @@ typedef struct ggml_gemmini_args_t {
                 bool /*transpose_b_layout*/,
                 size_t logical_stripe_J_ = 1,
                 size_t stripe_J_ = 0) const {
-            if (blocks != base) {
+            if (blocks != base)
                 return false;
-            }
-            if (dim_k != k || dim_j != j || dim_z != z || dim_w != w) {
+            if (dim_k != k || dim_j != j || dim_z != z || dim_w != w)
                 return false;
-            }
-            if (blocks_K != blocks_k || blocks_J != logical_cols_) {
+            if (blocks_K != blocks_k || blocks_J != logical_cols_)
                 return false;
-            }
-            if (block_size_k != QK8_0 || logical_cols != logical_cols_) {
+            if (block_size_k != QK8_0 || logical_cols != logical_cols_)
                 return false;
-            }
             // Q8_0_R planar validity check
-            if (q_qs.size() != logical_cols_ * static_cast<size_t>(k)) {
+            if (q_qs.size() != logical_cols_ * static_cast<size_t>(k))
                 return false;
-            }
-            if (c_b.size() != blocks_k * logical_cols_) {
+            if (c_b.size() != blocks_k * logical_cols_)
                 return false;
-            }
-            if (s_rf.size() != logical_cols_) {
+            if (s_rf.size() != logical_cols_)
                 return false;
-            }
-            if (R.size() != logical_cols_) {
+            if (R.size() != logical_cols_)
                 return false;
-            }
-            if (logical_stripe_J != logical_stripe_J_) {
+            if (logical_stripe_J != logical_stripe_J_)
                 return false;
-            }
-            if (stripe_J != stripe_J_) {
+            if (stripe_J != stripe_J_)
                 return false;
-            }
             if (stripe_J_ > 1) {
                 const size_t num_stripes = (logical_cols_ + stripe_J_ - 1) / stripe_J_;
-                if (s_rf_stripe.size() != num_stripes) {
+                if (s_rf_stripe.size() != num_stripes)
                     return false;
-                }
-                if (R_stripe.size() != num_stripes) {
+                if (R_stripe.size() != num_stripes)
                     return false;
-                }
             }
             return true;
         }

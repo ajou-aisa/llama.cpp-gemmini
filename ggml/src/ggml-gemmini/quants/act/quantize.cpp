@@ -16,9 +16,7 @@ namespace ggml::gemmini::quants { namespace
     size_t clamp_tile_extent(size_t total, size_t offset, size_t tile_span)
     {
         if (offset >= total)
-        {
             return 0;
-        }
 
         return std::min(tile_span, total - offset);
     }
@@ -26,9 +24,7 @@ namespace ggml::gemmini::quants { namespace
     size_t align_up(size_t value, size_t alignment)
     {
         if (alignment == 0)
-        {
             return value;
-        }
 
         return ((value + alignment - 1) / alignment) * alignment;
     }
@@ -43,9 +39,7 @@ size_t qact_outlier_count(const ActivationQuantResult &result)
 const QactOutlier *qact_outliers(const ActivationQuantResult &result)
 {
     if (result.outliers.empty())
-    {
         return nullptr;
-    }
 
     return result.outliers.data();
 }
@@ -62,23 +56,17 @@ ActivationQuantResult quantize_activation_f32(
     internal_cfg.result.e_s_per_stripe.clear();
 
     if (!src || src->type != GGML_TYPE_F32 || !dst || args.I == 0 || args.K == 0)
-    {
         return internal_cfg.result;
-    }
 
     const float *src_data = ggml::gemmini::activation_data(src);
     if (!src_data)
-    {
         return internal_cfg.result;
-    }
 
     const size_t stride_k_bytes = src->nb[0] ? src->nb[0] : sizeof(float);
     const size_t stride_i_bytes = src->nb[1] ? src->nb[1] : args.K * stride_k_bytes;
 
     if (internal_cfg.block_size == 0 || (args.K % internal_cfg.block_size) != 0)
-    {
         return internal_cfg.result;
-    }
 
     switch (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT) {
     case ggml::gemmini::config::ActivationQuantAlgo::ETHOS:
@@ -115,9 +103,8 @@ ActivationQuantResult quantize_activation_f32(
             }
 
             aggregated.e_s_per_stripe.push_back(internal_cfg.result.e_s);
-            if (aggregated.e_s == std::numeric_limits<int16_t>::min()) {
+            if (aggregated.e_s == std::numeric_limits<int16_t>::min())
                 aggregated.e_s = internal_cfg.result.e_s;
-            }
             aggregated.outliers.insert(
                 aggregated.outliers.end(),
                 internal_cfg.result.outliers.begin(),
@@ -145,9 +132,8 @@ void reset_activation_quant_state(ggml_gemmini_args_t &args) {
 ActivationQuantConfig make_activation_quant_config(const ggml_gemmini_args_t &args) {
     ActivationQuantConfig cfg {};
     cfg.block_size = static_cast<size_t>(GGML_GEMMINI_BLOCK_SIZE);
-    if (args.layer_type != ggml::gemmini::types::LayerType::unknown) {
+    if (args.layer_type != ggml::gemmini::types::LayerType::unknown)
         cfg.preset.second = args.layer_type;
-    }
 
     switch (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT) {
     case ggml::gemmini::config::ActivationQuantAlgo::ETHOS:
@@ -181,9 +167,8 @@ void capture_activation_quant_result(
     args.act_quant.ethos.e_s_per_stripe_i = res.e_s_per_stripe;
 
     const size_t outlier_count = qact_outlier_count(res);
-    if (outlier_count == 0) {
+    if (outlier_count == 0)
         return;
-    }
 
     const auto *outliers = qact_outliers(res);
     args.act_quant.outliers.clear();

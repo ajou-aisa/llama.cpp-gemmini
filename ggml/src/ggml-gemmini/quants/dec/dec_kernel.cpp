@@ -25,9 +25,7 @@ namespace ggml::gemmini::quants::dec { namespace
     WeightLayout resolve_weight_layout(const ggml_gemmini_args_t &args)
     {
         if (is_q80_r_weight_args(args) || args.transpose_B)
-        {
             return WeightLayout::JxK_ColMajor;
-        }
 
         return WeightLayout::KxJ_RowMajor;
     }
@@ -35,9 +33,7 @@ namespace ggml::gemmini::quants::dec { namespace
     size_t resolve_weight_stride_elems(const ggml_gemmini_args_t &args)
     {
         if (is_q80_r_weight_args(args))
-        {
             return args.K;
-        }
 
         const size_t fallback_stride = args.transpose_B ? args.K : args.J;
         return args.sB ? args.sB : fallback_stride;
@@ -66,9 +62,7 @@ namespace ggml::gemmini::quants::dec { namespace
             char *end = nullptr;
             const long parsed = std::strtol(env, &end, 10);
             if (end != env && end && *end == '\0' && parsed > 0)
-            {
                 dec_threads = static_cast<int>(parsed);
-            }
         }
 
         return std::max(1, dec_threads);
@@ -90,9 +84,7 @@ namespace ggml::gemmini::quants::dec { namespace
         }
 
         for (; j < J; ++j)
-        {
             dst[j] += delta * Wk_f[j];
-        }
     }
 
     inline void accumulate_row_simple(float *dst, const float *Wk_f, float delta, size_t J)

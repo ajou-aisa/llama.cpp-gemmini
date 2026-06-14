@@ -28,9 +28,8 @@ void update_q80_r_output_impl(
     size_t dst_row_stride,
     size_t dst_col_stride)
 {
-    if (stripe_c.empty() || !acc64 || !dst || acc_stride == 0 || dst_row_stride == 0 || dst_col_stride == 0) {
+    if (stripe_c.empty() || !acc64 || !dst || acc_stride == 0 || dst_row_stride == 0 || dst_col_stride == 0)
         return;
-    }
 
     for (size_t i = 0; i < stripe_c.I; ++i) {
         const int64_t *row_acc64 = acc64 + i * acc_stride;

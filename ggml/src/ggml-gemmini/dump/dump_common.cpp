@@ -20,9 +20,7 @@ const char *dump_phase_to_string(DumpPhase phase)
 void write_json_escaped(FILE *out, const char *s)
 {
     if (!out || !s)
-    {
         return;
-    }
 
     for (const unsigned char *p = reinterpret_cast<const unsigned char *>(s); *p; ++p)
     {
@@ -56,14 +54,10 @@ void write_json_escaped(FILE *out, const char *s)
                 char buf[7];
                 const int len = std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned int>(c));
                 if (len > 0)
-                {
                     std::fwrite(buf, 1, static_cast<size_t>(len), out);
-                }
             }
             else
-            {
                 std::fputc(static_cast<int>(c), out);
-            }
             break;
         }
     }

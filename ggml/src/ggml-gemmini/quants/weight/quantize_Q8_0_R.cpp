@@ -16,9 +16,8 @@ constexpr float q8_0_r_scale_bins = 255.0f;
 
 uint8_t round_to_u8(float value)
 {
-    if (!std::isfinite(value) || value <= 0.0f) {
+    if (!std::isfinite(value) || value <= 0.0f)
         return 0;
-    }
 
     const double rounded = std::round(static_cast<double>(value));
     const double clamped = std::min(255.0, std::max(0.0, rounded));
@@ -27,9 +26,8 @@ uint8_t round_to_u8(float value)
 
 uint8_t quantize_scale_code(float s_b, float s_rf, uint16_t R)
 {
-    if (!std::isfinite(s_b) || !std::isfinite(s_rf) || s_rf <= 0.0f) {
+    if (!std::isfinite(s_b) || !std::isfinite(s_rf) || s_rf <= 0.0f)
         return 0;
-    }
 
     const double c_eff = std::round(static_cast<double>(s_b) / static_cast<double>(s_rf));
     const double shifted_code = c_eff - static_cast<double>(R);
@@ -57,9 +55,8 @@ bool quantize_row_q8_0_r(
     int blocks_per_row,
     BlockQ8_0_R *dst
 ) {
-    if (!src_blocks || !dst || !dst->c_b || !dst->qs || blocks_per_row <= 0) {
+    if (!src_blocks || !dst || !dst->c_b || !dst->qs || blocks_per_row <= 0)
         return false;
-    }
 
     float min_s = std::numeric_limits<float>::infinity();
     float max_s = -std::numeric_limits<float>::infinity();
@@ -67,9 +64,8 @@ bool quantize_row_q8_0_r(
     for (int block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
         const block_q8_0 &src_block = src_blocks[block_idx];
         const float s_b = fp16_to_fp32(src_block.d);
-        if (!std::isfinite(s_b)) {
+        if (!std::isfinite(s_b))
             return false;
-        }
 
         min_s = std::min(min_s, s_b);
         max_s = std::max(max_s, s_b);
@@ -112,20 +108,16 @@ bool quantize_stripe_q8_0_r(
     float *dst_s_rf_stripe,
     uint16_t *dst_R_stripe
 ) {
-    if (blocks_per_row <= 0 || num_rows < 0) {
+    if (blocks_per_row <= 0 || num_rows < 0)
         return false;
-    }
-    if (num_rows == 0) {
+    if (num_rows == 0)
         return true;
-    }
-    if (!src_blocks || !dst || !dst_s_rf_stripe || !dst_R_stripe) {
+    if (!src_blocks || !dst || !dst_s_rf_stripe || !dst_R_stripe)
         return false;
-    }
 
     for (int row_idx = 0; row_idx < num_rows; ++row_idx) {
-        if (!dst[row_idx].c_b || !dst[row_idx].qs) {
+        if (!dst[row_idx].c_b || !dst[row_idx].qs)
             return false;
-        }
     }
 
     float min_s = std::numeric_limits<float>::infinity();
@@ -138,9 +130,8 @@ bool quantize_stripe_q8_0_r(
         for (int block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
             const block_q8_0 &src_block = src_blocks[row_offset + static_cast<size_t>(block_idx)];
             const float s_b = fp16_to_fp32(src_block.d);
-            if (!std::isfinite(s_b)) {
+            if (!std::isfinite(s_b))
                 return false;
-            }
 
             min_s = std::min(min_s, s_b);
             max_s = std::max(max_s, s_b);
@@ -155,9 +146,8 @@ bool quantize_stripe_q8_0_r(
 
     const float scale_range = max_s - min_s;
     if (!std::isfinite(scale_range) || scale_range <= 0.0f) {
-        for (int row_idx = 0; row_idx < num_rows; ++row_idx) {
+        for (int row_idx = 0; row_idx < num_rows; ++row_idx)
             set_constant_scale(min_s, blocks_per_row, &dst[row_idx]);
-        }
         *dst_s_rf_stripe = dst[0].s_rf;
         *dst_R_stripe = dst[0].R;
         return true;
@@ -165,9 +155,8 @@ bool quantize_stripe_q8_0_r(
 
     const float s_rf = scale_range / q8_0_r_scale_bins;
     if (!std::isfinite(s_rf) || s_rf <= 0.0f) {
-        for (int row_idx = 0; row_idx < num_rows; ++row_idx) {
+        for (int row_idx = 0; row_idx < num_rows; ++row_idx)
             set_constant_scale(min_s, blocks_per_row, &dst[row_idx]);
-        }
         *dst_s_rf_stripe = dst[0].s_rf;
         *dst_R_stripe = dst[0].R;
         return true;
@@ -196,9 +185,8 @@ bool quantize_stripe_q8_0_r(
 
 float recover_block_scale(const BlockQ8_0_R *block, int block_idx)
 {
-    if (!block || !block->c_b || block_idx < 0) {
+    if (!block || !block->c_b || block_idx < 0)
         return 0.0f;
-    }
 
     const uint64_t c_eff =
         static_cast<uint64_t>(block->c_b[block_idx]) + static_cast<uint64_t>(block->R);
