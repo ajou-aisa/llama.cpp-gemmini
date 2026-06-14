@@ -17,6 +17,51 @@ struct ggml_gemmini_qact_outlier
     float saturated = 0.f;
 };
 
+struct ggml_gemmini_activation_ethos_meta_t
+{
+    int16_t e_s = std::numeric_limits<int16_t>::min();
+    int16_t m = 0;
+    std::vector<int16_t> e_s_per_stripe_i; // one exponent per stripe (tile_I x K)
+
+    inline int16_t resolve_stripe_e_s(int stripe_idx) const {
+        if (stripe_idx >= 0 && !e_s_per_stripe_i.empty()) {
+            const size_t s = static_cast<size_t>(stripe_idx);
+            if (s < e_s_per_stripe_i.size()) {
+                return e_s_per_stripe_i[s];
+            }
+        }
+        return e_s;
+    }
+
+    inline void reset() {
+        e_s = std::numeric_limits<int16_t>::min();
+        m = 0;
+        e_s_per_stripe_i.clear();
+    }
+};
+
+struct ggml_gemmini_activation_tensor_meta_t
+{
+    float scale = 1.0f;
+
+    inline void reset() {
+        scale = 1.0f;
+    }
+};
+
+struct ggml_gemmini_activation_quant_meta_t
+{
+    std::vector<ggml_gemmini_qact_outlier> outliers; // per-activation saturation records
+    ggml_gemmini_activation_ethos_meta_t ethos{};
+    ggml_gemmini_activation_tensor_meta_t tensor{};
+
+    inline void reset() {
+        outliers.clear();
+        ethos.reset();
+        tensor.reset();
+    }
+};
+
 namespace ggml::gemmini::types {
 enum class LayerType : uint8_t;
 }
@@ -72,10 +117,7 @@ typedef struct ggml_gemmini_args_t {
     bool low_D = false;
 
     // activation quantization metadata
-    int16_t activation_e_s = std::numeric_limits<int16_t>::min();
-    int16_t activation_m = 0;
-    std::vector<int16_t> activation_e_s_per_stripe_i; // one exponent per stripe (tile_I x K)
-    std::vector<ggml_gemmini_qact_outlier> activation_outliers; // per-activation saturation records
+    ggml_gemmini_activation_quant_meta_t act_quant{};
 
     //for weight checking   
     uint8_t weightA = 0;
@@ -206,13 +248,7 @@ typedef struct ggml_gemmini_args_t {
         return stripe_J <= 1 || (tile_J_elems > 0 && stripe_J == tile_J_elems);
     }
     inline int16_t resolve_stripe_activation_e_s(int stripe_idx) const {
-        if (stripe_idx >= 0 && !activation_e_s_per_stripe_i.empty()) {
-            const size_t s = static_cast<size_t>(stripe_idx);
-            if (s < activation_e_s_per_stripe_i.size()) {
-                return activation_e_s_per_stripe_i[s];
-            }
-        }
-        return activation_e_s;
+        return act_quant.ethos.resolve_stripe_e_s(stripe_idx);
     }
 
     // Gemmini call metadata (for debugging/validation)
@@ -229,5 +265,4 @@ typedef struct ggml_gemmini_args_t {
     int ethos_l2_d = 1;
 
 } ggml_gemmini_args_t;
-
 

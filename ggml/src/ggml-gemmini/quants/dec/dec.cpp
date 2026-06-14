@@ -439,7 +439,7 @@ void append_activation_outliers(
     const ggml_gemmini_args_t &args,
     std::vector<QactOutlier> &outliers) {
     outliers.clear();
-    if (args.activation_outliers.empty()) {
+    if (args.act_quant.outliers.empty()) {
         return;
     }
 
@@ -449,9 +449,9 @@ void append_activation_outliers(
     static_assert(offsetof(ggml_gemmini_qact_outlier, original) == offsetof(QactOutlier, original), "Outlier::original offset mismatch");
     static_assert(offsetof(ggml_gemmini_qact_outlier, saturated) == offsetof(QactOutlier, saturated), "Outlier::saturated offset mismatch");
 
-    const auto *ptr = reinterpret_cast<const QactOutlier *>(args.activation_outliers.data());
-    outliers.reserve(args.activation_outliers.size());
-    for (size_t idx = 0; idx < args.activation_outliers.size(); ++idx) {
+    const auto *ptr = reinterpret_cast<const QactOutlier *>(args.act_quant.outliers.data());
+    outliers.reserve(args.act_quant.outliers.size());
+    for (size_t idx = 0; idx < args.act_quant.outliers.size(); ++idx) {
         outliers.push_back(ptr[idx]);
     }
 }

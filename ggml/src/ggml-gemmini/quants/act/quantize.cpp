@@ -136,9 +136,7 @@ ActivationQuantResult quantize_activation_f32(
 }
 
 void reset_activation_quant_state(ggml_gemmini_args_t &args) {
-    args.activation_outliers.clear();
-    args.activation_e_s = std::numeric_limits<int16_t>::min();
-    args.activation_m = 0;
+    args.act_quant.reset();
     args.gemmini_call_k_logical = 0;
     args.gemmini_call_k_aligned = 0;
     args.gemmini_call_tile_k_elems = 0;
@@ -178,9 +176,9 @@ void capture_activation_quant_result(
     ggml_gemmini_args_t &args,
     const ActivationQuantConfig &cfg,
     const ActivationQuantResult &res) {
-    args.activation_e_s = res.e_s;
-    args.activation_m = cfg.m;
-    args.activation_e_s_per_stripe_i = res.e_s_per_stripe;
+    args.act_quant.ethos.e_s = res.e_s;
+    args.act_quant.ethos.m = cfg.m;
+    args.act_quant.ethos.e_s_per_stripe_i = res.e_s_per_stripe;
 
     const size_t outlier_count = qact_outlier_count(res);
     if (outlier_count == 0) {
@@ -188,11 +186,11 @@ void capture_activation_quant_result(
     }
 
     const auto *outliers = qact_outliers(res);
-    args.activation_outliers.clear();
-    args.activation_outliers.reserve(outlier_count);
+    args.act_quant.outliers.clear();
+    args.act_quant.outliers.reserve(outlier_count);
     for (size_t i = 0; i < outlier_count; ++i) {
         const auto &outlier = outliers[i];
-        args.activation_outliers.push_back({outlier.row, outlier.col, outlier.original, outlier.saturated});
+        args.act_quant.outliers.push_back({outlier.row, outlier.col, outlier.original, outlier.saturated});
     }
 }
 } // namespace ggml::gemmini::quants

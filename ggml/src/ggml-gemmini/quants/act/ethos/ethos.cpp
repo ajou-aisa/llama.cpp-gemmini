@@ -469,7 +469,7 @@ void dequantize(
             }
 
             float contrib = static_cast<float>(row_acc32[j]) * scale_w;
-            contrib = ggml::gemmini::apply_activation_exponent(contrib, args.activation_e_s, args.activation_m);
+            contrib = ggml::gemmini::apply_activation_exponent(contrib, args.act_quant.ethos.e_s, args.act_quant.ethos.m);
             row_out[j * out_col_stride] += contrib;
         }
     }
