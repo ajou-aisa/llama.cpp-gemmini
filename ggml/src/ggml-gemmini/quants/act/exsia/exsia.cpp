@@ -15,7 +15,9 @@ namespace ggml::gemmini::quants::act::exsia
         return static_cast<int16_t>(std::ilogb(std::abs(x)));
     }
 
-    void ExpScanner::scan_top2_exp(const Meta &meta, const std::vector<float> &x, BlockState &blk)
+    void ExpScanner::scan_top2_exp(const Meta &meta,
+                                   const std::vector<float> &x,
+                                   BlockState &blk)
     {
         const size_t n = meta.B_size < x.size() ? meta.B_size : x.size();
         blk.blk_size = n;
@@ -34,7 +36,10 @@ namespace ggml::gemmini::quants::act::exsia
         }
     }
 
-    void ExpScanner::update_block_top2_exp(const BitMask &mask, size_t row, size_t blk_idx, BlockState &blk)
+    void ExpScanner::update_block_top2_exp(const BitMask &mask,
+                                           size_t row,
+                                           size_t blk_idx,
+                                           BlockState &blk)
     {
         blk.e1 = std::numeric_limits<int16_t>::min();
         blk.e2 = std::numeric_limits<int16_t>::min();
@@ -53,44 +58,85 @@ namespace ggml::gemmini::quants::act::exsia
                 blk.e1 = exp;
             }
             else if (exp < blk.e1 && exp > blk.e2)
-                blk.e2 = blk.e[i];
+                blk.e2 = exp;
         }
     }
 
-    void ExpScanner::update_stripe_top2_exp(StripeState &, int16_t)
+    void ExpScanner::update_stripe_top2_exp(StripeState &stripe, int16_t exp)
     {
-        GGML_ASSERT(false && "not yet implemented");
+        if (exp > stripe.e1)
+        {
+            stripe.e2 = stripe.e1;
+            stripe.e1 = exp;
+        }
+        else if (exp < stripe.e1 && exp > stripe.e2)
+            stripe.e2 = exp;
     }
 
-    void OutlierMarker::mark_outlier(StripeState &, const BitMask &) const
+    void OutlierMarker::mark_outlier(StripeState &stripe,
+                                     size_t row,
+                                     size_t blk_idx,
+                                     size_t blk_size,
+                                     const BitMask &d_mask) const
     {
-        GGML_ASSERT(false && "not yet implemented");
+        size_t n = blk_size;
+        for (int i = 0; i < n; i++)
+        {
+            size_t col = blk_idx * n + i;
+            if (d_mask.is_set(0, i))
+                stripe.outlier_mask.set(row, col);
+        }
     }
 
-    int32_t WideQuantizer::quantize(float, int16_t)
+    std::vector<int32_t> WideQuantizer::quantize_block(const std::vector<float> &x,
+                                                       int16_t theta_b)
     {
-        GGML_ASSERT(false && "not yet implemented");
-        return 0;
+        std::vector<int32_t> q;
+        q.reserve(x.size());
+
+        for (auto &e : x)
+            q.push_back(static_cast<int32_t>(std::lrint(std::ldexp(e, -theta_b))));
+
+        return q;
     }
 
-    std::tuple<int32_t, int64_t, int64_t> WideQuantizer::quantize(float, size_t, size_t, const BitMask &, int16_t)
+    std::tuple<std::vector<int32_t>, int64_t, int64_t>
+    WideQuantizer::quantize_block(const std::vector<float> &x,
+                                  size_t row,
+                                  size_t blk_idx,
+                                  const BitMask &mask,
+                                  int16_t theta_b)
     {
-        GGML_ASSERT(false && "not yet implemented");
-        return {0, 0, 0};
+        std::vector<int32_t> q;
+        size_t n = x.size();
+        q.reserve(n);
+
+        int64_t S = 0;
+        int64_t SS = 0;
+        for (int i = 0; i < n; i++)
+        {
+            size_t col = blk_idx * n + i;
+            int32_t tmp = std::lrint(std::ldexp(x[i], -theta_b));
+            q.push_back(static_cast<int32_t>(tmp));
+            if (!mask.is_set(row, col))
+            {
+                S += tmp;
+                SS += tmp * tmp;
+            }
+        }
+        return {q, S, SS};
     }
 
-    bool SigmaDetector::detect_3sigma(int32_t, int64_t, int64_t)
+    bool SigmaDetector::detect_3sigma(int32_t q, int64_t S, int64_t SS, size_t N)
     {
-        GGML_ASSERT(false && "not yet implemented");
-        return false;
+        return (N * q - S) * (N * q - S) > 9 * (N * SS - S * S);
     }
 
     std::pair<int8_t, int32_t> ResidualClipper::clip_with_residual(int32_t q)
     {
-        (void)q;
-
-        GGML_ASSERT(false && "not yet implemented");
-        return {0, 0};
+        int32_t q8 = q > 127 ? 127 : (q < -127 ? -127 : q);
+        int32_t res = q - q8;
+        return {static_cast<int8_t>(q8), res};
     }
 
     bool LocalStage::run(
