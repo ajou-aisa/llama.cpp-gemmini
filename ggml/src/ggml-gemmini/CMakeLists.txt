@@ -40,11 +40,10 @@ set(GEMMINI_RISCV_FLAGS
 
 ggml_add_backend_library(ggml-gemmini
                          ggml-gemmini.cpp
-                         ggml-gemmini-ethos-config.cpp
-                         quants/act/quantize.cpp
-                         quants/act/ethos/types.cpp
-                         quants/act/ethos/ethos.cpp
-                         quants/act/tensor/tensor.cpp
+                          ggml-gemmini-exsia-config.cpp
+                          quants/act/quantize.cpp
+                          quants/act/exsia/exsia.cpp
+                          quants/act/tensor/tensor.cpp
                          quants/weight/quantize_Q8_0_R.cpp
                          quants/weight/unpack_Q8_0.cpp
                          quants/common/fp16_util.cpp
@@ -92,7 +91,7 @@ target_include_directories(ggml-gemmini PUBLIC
 target_include_directories(ggml-gemmini PRIVATE
   ${CMAKE_CURRENT_LIST_DIR}/quants
   ${CMAKE_CURRENT_LIST_DIR}/quants/act
-  ${CMAKE_CURRENT_LIST_DIR}/quants/act/ethos
+  ${CMAKE_CURRENT_LIST_DIR}/quants/act/exsia
   ${CMAKE_CURRENT_LIST_DIR}/quants/common
   ${CMAKE_CURRENT_LIST_DIR}/quants/dec
   ${CMAKE_CURRENT_LIST_DIR}/quants/view

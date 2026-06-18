@@ -5,27 +5,27 @@
 namespace ggml::gemmini::quants::act::tensor
 {
     // per-tensor에서는 의미 없음. 
-void set_config(Config &cfg)
+void set_config(Meta &meta)
 {
-    (void)cfg;
+    (void)meta;
 }
 
-void set_scale(const ggml_gemmini_args_t &args, Config &cfg)
+void set_scale(const ggml_gemmini_args_t &args, Meta &meta)
 {
     // TODO: per-tensor scale 결정. outlier 리스트에 해당하는 값은 scale 계산에 포함하지 않도록 해야 함
     (void)args;
-    (void)cfg;
+    (void)meta;
 }
 
 bool quantize(
-    Config &cfg,
+    Meta &meta,
     const ggml_tensor *src,
     const ggml_gemmini_args_t &args,
     int8_t *dst)
 {
     // TODO: per-tensor quantization. 
     // Outlier는 옵션에 따라 처리. 
-    (void)cfg;
+    (void)meta;
     (void)src;
     (void)args;
     (void)dst;

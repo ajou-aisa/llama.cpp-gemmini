@@ -7,10 +7,7 @@
 #include <utility>
 #include <vector>
 
-namespace ggml::gemmini::quants
-{
-    struct QactOutlier;
-}
+#include "../act/types.hpp"
 
 namespace ggml::gemmini::quants::dec
 {

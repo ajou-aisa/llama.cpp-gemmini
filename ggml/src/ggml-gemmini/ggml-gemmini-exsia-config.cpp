@@ -1,4 +1,4 @@
-#include "ggml-gemmini-ethos-config.hpp"
+#include "ggml-gemmini-exsia-config.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -11,25 +11,17 @@ namespace
 {
     using json = nlohmann::ordered_json;
 
-    void merge_ethos_patch(
-        ggml_gemmini_ethos_patch &dst,
-        const ggml_gemmini_ethos_patch &src)
+    void merge_exsia_patch(
+        ggml_gemmini_exsia_patch &dst,
+        const ggml_gemmini_exsia_patch &src)
     {
         if (src.q.has_value())
             dst.q = src.q;
-        if (src.delta.has_value())
-            dst.delta = src.delta;
-        if (src.l2_enabled.has_value())
-            dst.l2_enabled = src.l2_enabled;
-        if (src.l2_c.has_value())
-            dst.l2_c = src.l2_c;
-        if (src.l2_d.has_value())
-            dst.l2_d = src.l2_d;
     }
 
     [[noreturn]] void throw_json_error(const std::string &context, const std::string &message)
     {
-        throw std::runtime_error("ethos_config.json " + context + ": " + message);
+        throw std::runtime_error("exsia_config.json " + context + ": " + message);
     }
 
     void require_object(const json &value, const std::string &context)
@@ -46,25 +38,17 @@ namespace
         return value.get<int>();
     }
 
-    bool require_bool(const json &value, const std::string &context)
-    {
-        if (!value.is_boolean())
-            throw_json_error(context, "must be a boolean");
-
-        return value.get<bool>();
-    }
-
     void validate_q(int q, const std::string &context)
     {
         if (q < 2 || q > 8)
             throw_json_error(context, "q must be in [2, 8]");
     }
 
-    ggml_gemmini_ethos_patch parse_ethos_patch(const json &value, const std::string &context)
+    ggml_gemmini_exsia_patch parse_exsia_patch(const json &value, const std::string &context)
     {
         require_object(value, context);
 
-        ggml_gemmini_ethos_patch patch{};
+        ggml_gemmini_exsia_patch patch{};
         for (auto it = value.begin(); it != value.end(); ++it)
         {
             if (it.key() == "q")
@@ -75,51 +59,17 @@ namespace
                 continue;
             }
 
-            if (it.key() == "delta")
-            {
-                patch.delta = require_int(it.value(), context + ".delta");
-                continue;
-            }
-
-            if (it.key() == "l2")
-            {
-                require_object(it.value(), context + ".l2");
-                for (auto l2_it = it.value().begin(); l2_it != it.value().end(); ++l2_it)
-                {
-                    if (l2_it.key() == "enabled")
-                    {
-                        patch.l2_enabled = require_bool(l2_it.value(), context + ".l2.enabled");
-                        continue;
-                    }
-
-                    if (l2_it.key() == "c")
-                    {
-                        patch.l2_c = require_int(l2_it.value(), context + ".l2.c");
-                        continue;
-                    }
-
-                    if (l2_it.key() == "d")
-                    {
-                        patch.l2_d = require_int(l2_it.value(), context + ".l2.d");
-                        continue;
-                    }
-
-                    throw_json_error(context + ".l2", "unknown key '" + l2_it.key() + "'");
-                }
-                continue;
-            }
-
             throw_json_error(context, "unknown key '" + it.key() + "'");
         }
 
         return patch;
     }
 
-    std::filesystem::path find_ethos_config_path()
+    std::filesystem::path find_exsia_config_path()
     {
         namespace fs = std::filesystem;
 
-        const fs::path local = fs::path(__FILE__).parent_path() / "ethos_config.json";
+        const fs::path local = fs::path(__FILE__).parent_path() / "exsia_config.json";
         if (fs::exists(local) && fs::is_regular_file(local))
             return local;
 
@@ -127,18 +77,18 @@ namespace
     }
 }
 
-ggml_gemmini_ethos_config_registry ggml_gemmini_load_ethos_config_registry()
+ggml_gemmini_exsia_config_registry ggml_gemmini_load_exsia_config_registry()
 {
     namespace fs = std::filesystem;
 
-    ggml_gemmini_ethos_config_registry registry{};
-    const fs::path config_path = find_ethos_config_path();
+    ggml_gemmini_exsia_config_registry registry{};
+    const fs::path config_path = find_exsia_config_path();
     if (config_path.empty())
         return registry;
 
     std::ifstream input(config_path);
     if (!input)
-        throw std::runtime_error("failed to open ethos_config.json: " + config_path.string());
+        throw std::runtime_error("failed to open exsia_config.json: " + config_path.string());
 
     json root;
     try
@@ -147,7 +97,7 @@ ggml_gemmini_ethos_config_registry ggml_gemmini_load_ethos_config_registry()
     }
     catch (const json::exception &e)
     {
-        throw std::runtime_error("failed to parse ethos_config.json: " + std::string(e.what()));
+        throw std::runtime_error("failed to parse exsia_config.json: " + std::string(e.what()));
     }
 
     require_object(root, "root");
@@ -163,7 +113,7 @@ ggml_gemmini_ethos_config_registry ggml_gemmini_load_ethos_config_registry()
 
         if (it.key() == "defaults")
         {
-            registry.defaults = parse_ethos_patch(it.value(), "defaults");
+            registry.defaults = parse_exsia_patch(it.value(), "defaults");
             continue;
         }
 
@@ -173,13 +123,13 @@ ggml_gemmini_ethos_config_registry ggml_gemmini_load_ethos_config_registry()
             for (auto arch_it = it.value().begin(); arch_it != it.value().end(); ++arch_it)
             {
                 require_object(arch_it.value(), "architectures." + arch_it.key());
-                ggml_gemmini_ethos_arch_config arch_cfg{};
+                ggml_gemmini_exsia_arch_config arch_cfg{};
 
                 for (auto arch_value_it = arch_it.value().begin(); arch_value_it != arch_it.value().end(); ++arch_value_it)
                 {
                     if (arch_value_it.key() == "default")
                     {
-                        arch_cfg.defaults = parse_ethos_patch(
+                        arch_cfg.defaults = parse_exsia_patch(
                             arch_value_it.value(),
                             "architectures." + arch_it.key() + ".default");
                         continue;
@@ -198,7 +148,7 @@ ggml_gemmini_ethos_config_registry ggml_gemmini_load_ethos_config_registry()
                                     "unknown layer '" + layer_it.key() + "'");
                             }
 
-                            arch_cfg.layers[layer_type] = parse_ethos_patch(
+                            arch_cfg.layers[layer_type] = parse_exsia_patch(
                                 layer_it.value(),
                                 "architectures." + arch_it.key() + ".layers." + layer_it.key());
                         }
@@ -218,19 +168,15 @@ ggml_gemmini_ethos_config_registry ggml_gemmini_load_ethos_config_registry()
         throw_json_error("root", "unknown key '" + it.key() + "'");
     }
 
-    if (!registry.defaults.q.has_value() ||
-        !registry.defaults.delta.has_value() ||
-        !registry.defaults.l2_enabled.has_value() ||
-        !registry.defaults.l2_c.has_value() ||
-        !registry.defaults.l2_d.has_value())
-        throw_json_error("defaults", "must define q, delta, l2.enabled, l2.c, and l2.d");
+    if (!registry.defaults.q.has_value())
+        throw_json_error("defaults", "must define q");
 
     registry.available = true;
     return registry;
 }
 
-std::optional<ggml_gemmini_resolved_ethos_override> ggml_gemmini_resolve_ethos_override(
-    const ggml_gemmini_ethos_config_registry &registry,
+std::optional<ggml_gemmini_resolved_exsia_override> ggml_gemmini_resolve_exsia_override(
+    const ggml_gemmini_exsia_config_registry &registry,
     const std::string &model_arch,
     ggml::gemmini::types::LayerType layer_type)
 {
@@ -241,23 +187,17 @@ std::optional<ggml_gemmini_resolved_ethos_override> ggml_gemmini_resolve_ethos_o
     if (arch_it == registry.architectures.end())
         return std::nullopt;
 
-    ggml_gemmini_ethos_patch merged = registry.defaults;
-    merge_ethos_patch(merged, arch_it->second.defaults);
+    ggml_gemmini_exsia_patch merged = registry.defaults;
+    merge_exsia_patch(merged, arch_it->second.defaults);
 
     const auto layer_it = arch_it->second.layers.find(layer_type);
     if (layer_it != arch_it->second.layers.end())
-        merge_ethos_patch(merged, layer_it->second);
+        merge_exsia_patch(merged, layer_it->second);
 
-    if (!merged.q.has_value() || !merged.delta.has_value() ||
-        !merged.l2_enabled.has_value() || !merged.l2_c.has_value() ||
-        !merged.l2_d.has_value())
-        throw std::runtime_error("ethos_config.json resolved an incomplete Ethos override");
+    if (!merged.q.has_value())
+        throw std::runtime_error("exsia_config.json resolved an incomplete ExSIA override");
 
-    return ggml_gemmini_resolved_ethos_override{
+    return ggml_gemmini_resolved_exsia_override{
         *merged.q,
-        *merged.delta,
-        *merged.l2_enabled,
-        *merged.l2_c,
-        *merged.l2_d,
     };
 }

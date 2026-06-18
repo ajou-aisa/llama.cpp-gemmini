@@ -15,7 +15,7 @@
 #include "ggml-gemmini-config.hpp"
 #include "ggml-backend-impl.h"
 #include "ggml-quants.h"
-#include "ggml-gemmini-ethos-config.hpp"
+#include "ggml-gemmini-exsia-config.hpp"
 
 #include <gemmini/log.hpp>
 #include "dump/dump_tensor.hpp"
@@ -61,7 +61,7 @@ struct ggml_backend_gemmini_context
     size_t work_size = 0;
     std::map<const block_q8_0 *, ggml_gemmini_args_t::unpacked_weight> weight_cache; // packed Q8_0 per weight base pointer
     std::string model_arch;
-    ggml_gemmini_ethos_config_registry ethos_config;
+    ggml_gemmini_exsia_config_registry exsia_config;
     
 };
 
@@ -134,15 +134,11 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.full_C = FULL_C;
     args.low_D = LOW_D;
 
-    const auto ethos_override = ggml_gemmini_resolve_ethos_override(ctx->ethos_config, ctx->model_arch, layer_type);
-    if (ethos_override.has_value())
+    const auto exsia_override = ggml_gemmini_resolve_exsia_override(ctx->exsia_config, ctx->model_arch, layer_type);
+    if (exsia_override.has_value())
     {
-        args.ethos_override_enabled = true;
-        args.ethos_q = ethos_override->q;
-        args.ethos_delta = ethos_override->delta;
-        args.ethos_l2_enabled = ethos_override->l2_enabled;
-        args.ethos_l2_c = ethos_override->l2_c;
-        args.ethos_l2_d = ethos_override->l2_d;
+        args.exsia_override_enabled = true;
+        args.exsia_q = exsia_override->q;
     }
     
     args.I = I;
@@ -169,24 +165,15 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     activation_q.resize(I * K);
     int8_t *qx = activation_q.data();
 
-    reset_activation_quant_state(args);
-    auto activation_cfg = make_activation_quant_config(args);
+    args.A = reinterpret_cast<elem_t *>(qx);
     ggml::gemmini::log::debug(
         ggml::gemmini::types::to_string(args.layer_type),
-        "[" GGML_GEMMINI_ACTIVATION_QUANT_NAME "] final cfg model_arch=%s override=%d m=%d qmax=%d delta=%d l2_on=%d l2.c=%d l2.d=%d",
+        "[" GGML_GEMMINI_ACTIVATION_QUANT_NAME "] final cfg model_arch=%s override=%d q=%d",
         args.model_arch ? args.model_arch : "",
-        args.ethos_override_enabled ? 1 : 0,
-        static_cast<int>(activation_cfg.m),
-        static_cast<int>(activation_cfg.qmax),
-        activation_cfg.delta,
-        activation_cfg.l2_on ? 1 : 0,
-        activation_cfg.l2.c,
-        activation_cfg.l2.d);
+        args.exsia_override_enabled ? 1 : 0,
+        args.exsia_q);
 
-    auto activation_res = ggml::gemmini::quants::quantize_activation_f32(src1, args, qx, activation_cfg);
-    capture_activation_quant_result(args, activation_cfg, activation_res);
-
-    args.A = reinterpret_cast<elem_t *>(qx);
+    ggml::gemmini::quants::quantize_activation(src1, args);
 #if GGML_GEMMINI_COMPUTE_TYPE == 0
     static_assert(sizeof(elem_t) == 1, "Q8_0 path assumes elem_t is int8 (1 byte).");
 #endif
@@ -374,7 +361,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     /* __ 5. Gemmini 호출 __ */
     args.tiled_matmul_type = CPU;
     if constexpr (ggml::gemmini::config::CURRENT_COMPUTE_TYPE == ggml::gemmini::config::ComputeType::INT) {
-        if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::ETHOS) {
+        if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA) {
             ggml::gemmini::tiled_matmul_auto_im2p(&args);
         } else if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TENSOR) {
             ggml::gemmini::tiled_matmul_auto_tensor(&args);
@@ -609,7 +596,7 @@ static ggml_backend_t ggml_backend_gemmini_device_init_backend(ggml_backend_dev_
     ggml_backend_t backend = ggml_backend_gemmini_init();
     auto * ctx = (ggml_backend_gemmini_context *) backend->context;
     ctx->model_arch = params ? params : "";
-    ctx->ethos_config = ggml_gemmini_load_ethos_config_registry();
+    ctx->exsia_config = ggml_gemmini_load_exsia_config_registry();
     return backend;
 
     GGML_UNUSED(dev);

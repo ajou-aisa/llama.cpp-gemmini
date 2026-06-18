@@ -3,13 +3,17 @@
 #include "dec_stage.hpp"
 #include "dec_weight.hpp"
 #include "../../ggml-gemmini-args.h"
-#include "../view/act_view.hpp"
 #include <gemmini/log.hpp>
 #include <gemmini/cycle_reader.hpp>
 
 #include <cmath>
 #include <limits>
 #include <vector>
+
+namespace ggml::gemmini::quants
+{
+    std::vector<QactOutlier> activation_outliers(const ggml_gemmini_args_t &args);
+}
 
 namespace ggml::gemmini::quants::dec { namespace
 {
@@ -428,19 +432,6 @@ bool should_apply_dec(const ggml_gemmini_args_t &args) {
 void append_activation_outliers(
     const ggml_gemmini_args_t &args,
     std::vector<QactOutlier> &outliers) {
-    outliers.clear();
-    if (args.act_quant.outliers.empty())
-        return;
-
-    static_assert(sizeof(ggml_gemmini_qact_outlier) == sizeof(QactOutlier), "Outlier struct size mismatch");
-    static_assert(offsetof(ggml_gemmini_qact_outlier, row) == offsetof(QactOutlier, row), "Outlier::row offset mismatch");
-    static_assert(offsetof(ggml_gemmini_qact_outlier, col) == offsetof(QactOutlier, col), "Outlier::col offset mismatch");
-    static_assert(offsetof(ggml_gemmini_qact_outlier, original) == offsetof(QactOutlier, original), "Outlier::original offset mismatch");
-    static_assert(offsetof(ggml_gemmini_qact_outlier, saturated) == offsetof(QactOutlier, saturated), "Outlier::saturated offset mismatch");
-
-    const auto *ptr = reinterpret_cast<const QactOutlier *>(args.act_quant.outliers.data());
-    outliers.reserve(args.act_quant.outliers.size());
-    for (size_t idx = 0; idx < args.act_quant.outliers.size(); ++idx)
-        outliers.push_back(ptr[idx]);
+    outliers = ggml::gemmini::quants::activation_outliers(args);
 }
 } // namespace ggml::gemmini::quants::dec

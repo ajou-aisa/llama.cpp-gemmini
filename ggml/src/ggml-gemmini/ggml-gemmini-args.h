@@ -1,65 +1,18 @@
 // ggml-gemmini/ggml-gemmini-args.h
 #pragma once
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
 #include <vector>
-#include <limits>
 
-struct ggml_gemmini_qact_outlier
-{
-    int row = 0;       // activation row index (i)
-    int col = 0;       // activation channel index (k)
-    float original = 0.f;
-    float saturated = 0.f;
-};
+#include "quants/act/meta.hpp"
+#include "quants/act/types.hpp"
 
-struct ggml_gemmini_activation_ethos_meta_t
-{
-    int16_t e_s = std::numeric_limits<int16_t>::min();
-    int16_t m = 0;
-    std::vector<int16_t> e_s_per_stripe_i; // one exponent per stripe (tile_I x K)
+namespace act = ggml::gemmini::quants::act;
 
-    inline int16_t resolve_stripe_e_s(int stripe_idx) const {
-        if (stripe_idx >= 0 && !e_s_per_stripe_i.empty()) {
-            const size_t s = static_cast<size_t>(stripe_idx);
-            if (s < e_s_per_stripe_i.size())
-                return e_s_per_stripe_i[s];
-        }
-        return e_s;
-    }
-
-    inline void reset() {
-        e_s = std::numeric_limits<int16_t>::min();
-        m = 0;
-        e_s_per_stripe_i.clear();
-    }
-};
-
-struct ggml_gemmini_activation_tensor_meta_t
-{
-    float scale = 1.0f;
-
-    inline void reset() {
-        scale = 1.0f;
-    }
-};
-
-struct ggml_gemmini_activation_quant_meta_t
-{
-    std::vector<ggml_gemmini_qact_outlier> outliers; // per-activation saturation records
-    ggml_gemmini_activation_ethos_meta_t ethos{};
-    ggml_gemmini_activation_tensor_meta_t tensor{};
-
-    inline void reset() {
-        outliers.clear();
-        ethos.reset();
-        tensor.reset();
-    }
-};
+using ggml_gemmini_qact_outlier = act::ggml_gemmini_qact_outlier;
 
 namespace ggml::gemmini::types {
 enum class LayerType : uint8_t;
@@ -116,7 +69,7 @@ typedef struct ggml_gemmini_args_t {
     bool low_D = false;
 
     // activation quantization metadata
-    ggml_gemmini_activation_quant_meta_t act_quant{};
+    act::Meta act_quant{};
 
     //for weight checking   
     uint8_t weightA = 0;
@@ -234,22 +187,12 @@ typedef struct ggml_gemmini_args_t {
     inline bool stripe_mode_matches_tile_j(size_t tile_J_elems) const {
         return stripe_J <= 1 || (tile_J_elems > 0 && stripe_J == tile_J_elems);
     }
-    inline int16_t resolve_stripe_activation_e_s(int stripe_idx) const {
-        return act_quant.ethos.resolve_stripe_e_s(stripe_idx);
-    }
-
     // Gemmini call metadata (for debugging/validation)
     size_t gemmini_call_k_logical = 0;
     size_t gemmini_call_k_aligned = 0;
     size_t gemmini_call_tile_k_elems = 0;
 
-    // ethos parameter
-    bool ethos_override_enabled = false;
-    int ethos_q = 0;
-    int ethos_delta = 0;
-    bool ethos_l2_enabled = false;
-    int ethos_l2_c = 1;
-    int ethos_l2_d = 1;
+    bool exsia_override_enabled = false;
+    int exsia_q = 0;
 
 } ggml_gemmini_args_t;
-

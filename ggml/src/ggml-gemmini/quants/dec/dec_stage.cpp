@@ -1,6 +1,5 @@
 #include "dec_stage.hpp"
 #include <gemmini/log.hpp>
-#include "../view/act_view.hpp"
 
 #include <cmath>
 
