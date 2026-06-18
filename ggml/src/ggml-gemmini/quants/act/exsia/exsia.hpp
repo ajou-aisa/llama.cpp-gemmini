@@ -63,6 +63,7 @@ struct BitMask
 
 struct BlockState
 {
+    size_t blk_size;
     std::vector<int16_t> e;
     int16_t e1 = std::numeric_limits<int16_t>::min(); // top-1 exponent of a block
     int16_t e2 = std::numeric_limits<int16_t>::min(); // top-2 exponent of a block
@@ -89,6 +90,7 @@ struct StripeState
 
 struct ExSIAState
 {
+    size_t B_size;
     std::vector<StripeState> stripe; // vector of stripe states for the entire matrix
     std::vector<int32_t> q_wide; // Q_X_i32 shared by local wide-quantization and stripe folding
     std::vector<int16_t> block_top1_exp; // E_s[r, b / B] shared block max exponents
@@ -101,7 +103,7 @@ public:
     void scan_top2_exp(const Meta &meta, const std::vector<float> &x, BlockState &blk); // scan top-2 exponents for a block and store them in the block state
 
     // scan top-2 exponents for a block with a bitmask, only considering unmasked positions
-    void masked_top2_exp(const BitMask &mask, size_t row, size_t col_begin, BlockState &blk); 
+    void update_block_top2_exp(const BitMask &mask, size_t row, size_t blk_idx, BlockState &blk); 
 
     // update the stripe-level top-2 exponents based on a block's max exponent, and determine whether to promote the block exponent to the stripe level
     void update_stripe_top2_exp(StripeState &stripe, int16_t e_b); 
@@ -172,8 +174,8 @@ class ExSIA
 {
 private:
     ExSIAState state_;
-    LocalStage unit_local_;
-    StripeFolding unit_folding_;
+    LocalStage local_;
+    StripeFolding folding_;
 
 public:
     bool run(

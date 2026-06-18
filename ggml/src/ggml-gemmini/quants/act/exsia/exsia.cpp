@@ -18,22 +18,43 @@ namespace ggml::gemmini::quants::act::exsia
     void ExpScanner::scan_top2_exp(const Meta &meta, const std::vector<float> &x, BlockState &blk)
     {
         const size_t n = meta.B_size < x.size() ? meta.B_size : x.size();
+        blk.blk_size = n;
         for (size_t i = 0; i < n; ++i)
         {
             int16_t exp = unbiased_exp(x[i]);
+            blk.x.push_back(x[i]);
             blk.e.push_back(exp);
-            if (exp > blk.e1) {
+            if (exp > blk.e1)
+            {
                 blk.e2 = blk.e1;
                 blk.e1 = exp;
-            } else if (exp > blk.e2) {
-                blk.e2 = exp;
             }
+            else if (exp < blk.e1 && exp > blk.e2)
+                blk.e2 = exp;
         }
     }
 
-    void ExpScanner::masked_top2_exp(const BitMask &, size_t, size_t, BlockState &)
+    void ExpScanner::update_block_top2_exp(const BitMask &mask, size_t row, size_t blk_idx, BlockState &blk)
     {
-        GGML_ASSERT(false && "not yet implemented");
+        blk.e1 = std::numeric_limits<int16_t>::min();
+        blk.e2 = std::numeric_limits<int16_t>::min();
+
+        const size_t n = blk.blk_size;
+        for (int i = 0; i < n; i++)
+        {
+            size_t col = blk_idx * n + i;
+            if (mask.is_set(row, col))
+                continue;
+
+            const int16_t exp = blk.e[i];
+            if (exp > blk.e1)
+            {
+                blk.e2 = blk.e1;
+                blk.e1 = exp;
+            }
+            else if (exp < blk.e1 && exp > blk.e2)
+                blk.e2 = blk.e[i];
+        }
     }
 
     void ExpScanner::update_stripe_top2_exp(StripeState &, int16_t)
@@ -73,11 +94,12 @@ namespace ggml::gemmini::quants::act::exsia
     }
 
     bool LocalStage::run(
-        Meta &,
-        ExSIAState &,
-        ggml_gemmini_args_t &,
-        size_t)
+        Meta &meta,
+        ExSIAState &state,
+        ggml_gemmini_args_t &args,
+        size_t stripe_idx)
     {
+
         GGML_ASSERT(false && "not yet implemented");
         return false;
     }
@@ -98,11 +120,14 @@ namespace ggml::gemmini::quants::act::exsia
     }
 
     bool ExSIA::run(
-        Meta &,
-        const ggml_tensor *,
-        ggml_gemmini_args_t &)
+        Meta &meta,
+        const ggml_tensor *A,
+        ggml_gemmini_args_t &args)
     {
-        GGML_ASSERT(false && "ExSIA::run not yet implemented");
+        int s;
+        state_.B_size = meta.B_size;
+
+        local_.run(meta, state_, args, s);
         return false;
     }
 
