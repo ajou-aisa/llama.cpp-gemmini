@@ -3,6 +3,8 @@
 #include "exsia.hpp"
 #include "types.hpp"
 
+#include "ggml-gemmini-args.h"
+
 #include <cmath>
 
 namespace ggml::gemmini::quants::act::exsia
@@ -15,11 +17,10 @@ namespace ggml::gemmini::quants::act::exsia
         return static_cast<int16_t>(std::ilogb(std::abs(x)));
     }
 
-    void ExpScanner::scan_top2_exp(const Meta &meta,
-                                   const std::vector<float> &x,
+    void ExpScanner::scan_top2_exp(const std::vector<float> &x,
                                    BlockState &blk)
     {
-        const size_t n = meta.B_size < x.size() ? meta.B_size : x.size();
+        const size_t n = x.size();
         blk.blk_size = n;
         for (size_t i = 0; i < n; ++i)
         {
@@ -45,7 +46,7 @@ namespace ggml::gemmini::quants::act::exsia
         blk.e2 = std::numeric_limits<int16_t>::min();
 
         const size_t n = blk.blk_size;
-        for (int i = 0; i < n; i++)
+        for (size_t i = 0; i < n; ++i)
         {
             size_t col = blk_idx * n + i;
             if (mask.is_set(row, col))
@@ -80,7 +81,7 @@ namespace ggml::gemmini::quants::act::exsia
                                      const BitMask &d_mask) const
     {
         size_t n = blk_size;
-        for (int i = 0; i < n; i++)
+        for (size_t i = 0; i < n; ++i)
         {
             size_t col = blk_idx * n + i;
             if (d_mask.is_set(0, i))
@@ -113,7 +114,7 @@ namespace ggml::gemmini::quants::act::exsia
 
         int64_t S = 0;
         int64_t SS = 0;
-        for (int i = 0; i < n; i++)
+        for (size_t i = 0; i < n; ++i)
         {
             size_t col = blk_idx * n + i;
             int32_t tmp = std::lrint(std::ldexp(x[i], -theta_b));
@@ -142,21 +143,26 @@ namespace ggml::gemmini::quants::act::exsia
     bool LocalStage::run(
         Meta &meta,
         ExSIAState &state,
-        ggml_gemmini_args_t &args,
-        size_t stripe_idx)
+        StripeState &stripe,
+        BlockState &blk,
+        size_t row,
+        size_t blk_idx)
     {
+        (void)meta;
+        (void)state;
+        (void)stripe;
+        (void)blk;
+        (void)row;
+        (void)blk_idx;
 
-        GGML_ASSERT(false && "not yet implemented");
         return false;
     }
 
     bool StripeFolding::run(
         Meta &,
         ExSIAState &,
+        StripeState &,
         ggml_gemmini_args_t &,
-        size_t,
-        size_t,
-        size_t,
         size_t,
         int8_t *,
         int32_t *)
@@ -170,10 +176,14 @@ namespace ggml::gemmini::quants::act::exsia
         const ggml_tensor *A,
         ggml_gemmini_args_t &args)
     {
-        int s;
-        state_.B_size = meta.B_size;
+        (void)meta;
+        (void)A;
 
-        local_.run(meta, state_, args, s);
+        state_.B_size = BLOCK_SIZE;
+        state_.K_padded = ((args.K + state_.B_size - 1) / state_.B_size) * state_.B_size;
+        state_.blocks_per_row = state_.K_padded / state_.B_size;
+
+        GGML_ASSERT(false && "ExSIA::run not yet implemented");
         return false;
     }
 

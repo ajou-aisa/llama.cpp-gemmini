@@ -7,14 +7,11 @@
 #include <limits>
 #include <vector>
 
-#include <gemmini/layer.hpp>
-
 namespace ggml::gemmini::quants::act::exsia
 {
 
 struct Meta
 {
-    size_t B_size = BLOCK_SIZE;
     int16_t e_s = std::numeric_limits<int16_t>::min();
     int16_t rho = 6;
     std::vector<int16_t> theta;

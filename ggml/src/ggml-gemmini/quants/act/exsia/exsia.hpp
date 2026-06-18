@@ -9,6 +9,12 @@
 #include <tuple>
 #include <vector>
 
+#include <gemmini/layer.hpp>
+
+#ifndef BLOCK_SIZE
+#define BLOCK_SIZE 32
+#endif
+
 struct ggml_tensor;
 struct ggml_gemmini_args_t;
 
@@ -63,7 +69,7 @@ namespace ggml::gemmini::quants::act::exsia
 
     struct BlockState
     {
-        size_t blk_size;
+        size_t blk_size = 0;
         std::vector<int16_t> e;
         int16_t e1 = std::numeric_limits<int16_t>::min();      // top-1 exponent of a block
         int16_t e2 = std::numeric_limits<int16_t>::min();      // top-2 exponent of a block
@@ -90,7 +96,9 @@ namespace ggml::gemmini::quants::act::exsia
 
     struct ExSIAState
     {
-        size_t B_size;
+        size_t B_size = BLOCK_SIZE;
+        size_t K_padded = 0;
+        size_t blocks_per_row = 0;
         std::vector<StripeState> stripe;     // vector of stripe states for the entire matrix
         std::vector<int32_t> q_wide;         // Q_X_i32 shared by local wide-quantization and stripe folding
         std::vector<int16_t> block_top1_exp; // E_s[r, b / B] shared block max exponents
@@ -100,8 +108,7 @@ namespace ggml::gemmini::quants::act::exsia
     {
     public:
         int16_t unbiased_exp(const float &x);
-        void scan_top2_exp(const Meta &meta,
-                           const std::vector<float> &x,
+        void scan_top2_exp(const std::vector<float> &x,
                            BlockState &blk); // scan top-2 exponents for a block and store them in the block state
 
         // scan top-2 exponents for a block with a bitmask, only considering unmasked positions
@@ -155,8 +162,10 @@ namespace ggml::gemmini::quants::act::exsia
         bool run(
             Meta &meta,
             ExSIAState &state,
-            ggml_gemmini_args_t &args,
-            size_t stripe_idx);
+            StripeState &stripe,
+            BlockState &blk,
+            size_t row,
+            size_t blk_idx);
 
     private:
         ExpScanner unit_exp_;
@@ -171,11 +180,9 @@ namespace ggml::gemmini::quants::act::exsia
         bool run(
             Meta &meta,
             ExSIAState &state,
+            StripeState &stripe,
             ggml_gemmini_args_t &args,
             size_t stripe_idx,
-            size_t cols,
-            size_t row_offset,
-            size_t col_offset,
             int8_t *dst,
             int32_t *residual);
 
