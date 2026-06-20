@@ -150,7 +150,7 @@ namespace ggml::gemmini::quants::act::exsia
     class SigmaDetector
     {
     public:
-        bool detect_3sigma(int32_t q, int64_t S, int64_t SS, size_t N);
+        bool detect_3sigma(int32_t q, __int128_t S, __int128_t SS, size_t N);
     };
 
     class ResidualClipper

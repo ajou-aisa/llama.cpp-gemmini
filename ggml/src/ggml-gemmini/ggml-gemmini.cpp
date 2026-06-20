@@ -15,7 +15,6 @@
 #include "ggml-gemmini-config.hpp"
 #include "ggml-backend-impl.h"
 #include "ggml-quants.h"
-#include "ggml-gemmini-exsia-config.hpp"
 
 #include <gemmini/log.hpp>
 #include "dump/dump_tensor.hpp"
@@ -61,7 +60,6 @@ struct ggml_backend_gemmini_context
     size_t work_size = 0;
     std::map<const block_q8_0 *, ggml_gemmini_args_t::unpacked_weight> weight_cache; // packed Q8_0 per weight base pointer
     std::string model_arch;
-    ggml_gemmini_exsia_config_registry exsia_config;
     
 };
 
@@ -133,13 +131,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     ggml::gemmini::log::debug(layer, "model_arch=%s\n", args.model_arch ? args.model_arch : "");
     args.full_C = FULL_C;
     args.low_D = LOW_D;
-
-    const auto exsia_override = ggml_gemmini_resolve_exsia_override(ctx->exsia_config, ctx->model_arch, layer_type);
-    if (exsia_override.has_value())
-    {
-        args.exsia_override_enabled = true;
-        args.exsia_q = exsia_override->q;
-    }
     
     args.I = I;
     args.J = J;
@@ -168,10 +159,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.A = reinterpret_cast<elem_t *>(qx);
     ggml::gemmini::log::debug(
         ggml::gemmini::types::to_string(args.layer_type),
-        "[" GGML_GEMMINI_ACTIVATION_QUANT_NAME "] final cfg model_arch=%s override=%d q=%d",
-        args.model_arch ? args.model_arch : "",
-        args.exsia_override_enabled ? 1 : 0,
-        args.exsia_q);
+        "[" GGML_GEMMINI_ACTIVATION_QUANT_NAME "] final cfg model_arch=%s",
+        args.model_arch ? args.model_arch : "");
 
     ggml::gemmini::quants::quantize_activation(src1, args);
 #if GGML_GEMMINI_COMPUTE_TYPE == 0
@@ -596,7 +585,6 @@ static ggml_backend_t ggml_backend_gemmini_device_init_backend(ggml_backend_dev_
     ggml_backend_t backend = ggml_backend_gemmini_init();
     auto * ctx = (ggml_backend_gemmini_context *) backend->context;
     ctx->model_arch = params ? params : "";
-    ctx->exsia_config = ggml_gemmini_load_exsia_config_registry();
     return backend;
 
     GGML_UNUSED(dev);

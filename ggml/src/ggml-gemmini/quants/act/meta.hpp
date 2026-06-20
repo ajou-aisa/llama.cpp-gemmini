@@ -16,13 +16,13 @@ namespace ggml::gemmini::quants::act
 
     struct Meta
     {
-        MetaStorage storage_{NoneMeta{}};
+        MetaStorage storage_;
 
         Meta() = default;
 
         void reset()
         {
-            storage_ = NoneMeta{};
+            storage_.emplace<NoneMeta>();
         }
 
         const MetaStorage &storage() const

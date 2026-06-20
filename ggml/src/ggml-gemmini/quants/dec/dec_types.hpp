@@ -11,27 +11,21 @@
 
 namespace ggml::gemmini::quants::dec
 {
-    enum class WeightLayout
-    {
-        KxJ_RowMajor,
-        JxK_ColMajor,
-    };
-
     struct RkTriplet
     {
         int k;
         int r;
-        float d;
+        int32_t d;
     };
 
     struct ActivationDECScratch
     {
         std::vector<size_t> rk_counts;
         std::vector<size_t> rk_offs;
-        std::vector<std::pair<int, float>> rk_pairs;
+        std::vector<std::pair<int, int32_t>> rk_pairs;
         std::vector<int> unique_k;
         std::vector<RkTriplet> rk_stage;
-        std::vector<float> i1_delta_by_k;
+        std::vector<int64_t> i1_delta_by_k;
         double i1_total_abs_residual = 0.0;
         std::vector<float> Wk_f;
         std::vector<float> Y_com;
@@ -71,9 +65,9 @@ namespace ggml::gemmini::quants::dec
         void reset_i1_delta(size_t K)
         {
             if (i1_delta_by_k.size() != K)
-                i1_delta_by_k.assign(K, 0.f);
+                i1_delta_by_k.assign(K, int64_t {0});
             else
-                std::fill(i1_delta_by_k.begin(), i1_delta_by_k.end(), 0.f);
+                std::fill(i1_delta_by_k.begin(), i1_delta_by_k.end(), int64_t {0});
 
             i1_total_abs_residual = 0.0;
         }

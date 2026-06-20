@@ -1,36 +1,9 @@
 #include "dec_weight.hpp"
+#include "dec_internal.hpp"
 #include "dec_types.hpp"
 #include "../../ggml-gemmini-args.h"
 
-namespace ggml::gemmini::quants::dec { namespace
-{
-    bool is_q80_r_weight_args(const ggml_gemmini_args_t &args)
-    {
-        return args.B &&
-               !args.B_scales &&
-               args.c_b &&
-               ((args.stripe_J > 1) || (args.s_rf && args.R)) &&
-               args.blocks_per_row > 0;
-    }
-
-    WeightLayout resolve_weight_layout(const ggml_gemmini_args_t &args)
-    {
-        if (is_q80_r_weight_args(args) || args.transpose_B)
-            return WeightLayout::JxK_ColMajor;
-
-        return WeightLayout::KxJ_RowMajor;
-    }
-
-    size_t resolve_weight_stride_elems(const ggml_gemmini_args_t &args)
-    {
-        if (is_q80_r_weight_args(args))
-            return args.K;
-
-        const size_t fallback_stride = args.transpose_B ? args.K : args.J;
-        return args.sB ? args.sB : fallback_stride;
-    }
-}
-
+namespace ggml::gemmini::quants::dec {
 void load_weight_row_scaled(
     size_t k,
     const ggml_gemmini_args_t &args,

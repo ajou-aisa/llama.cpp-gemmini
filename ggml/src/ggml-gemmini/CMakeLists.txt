@@ -39,19 +39,18 @@ set(GEMMINI_RISCV_FLAGS
 )
 
 ggml_add_backend_library(ggml-gemmini
-                         ggml-gemmini.cpp
-                          ggml-gemmini-exsia-config.cpp
-                          quants/act/quantize.cpp
-                          quants/act/exsia/exsia.cpp
+                          ggml-gemmini.cpp
+                            quants/act/dispatch.cpp
+                            quants/act/quantize.cpp
+                            quants/act/exsia/exsia.cpp
                           quants/act/tensor/tensor.cpp
                          quants/weight/quantize_Q8_0_R.cpp
                          quants/weight/unpack_Q8_0.cpp
                          quants/common/fp16_util.cpp
                          quants/common/dequant.cpp
-                         quants/dec/dec.cpp
-                         quants/dec/dec_stage.cpp
-                         quants/dec/dec_weight.cpp
-                         quants/dec/dec_kernel.cpp
+                          quants/dec/dec.cpp
+                          quants/dec/dec_weight.cpp
+                          quants/dec/dec_kernel.cpp
                          dump/dump_common.cpp
                          dump/dump_tensor.cpp
                          dump/scale/scale_dump_block.cpp

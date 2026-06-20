@@ -1,4 +1,5 @@
 #include "dec_kernel.hpp"
+#include "dec_internal.hpp"
 #include "../../ggml-gemmini-args.h"
 
 #include <algorithm>
@@ -12,32 +13,6 @@ namespace ggml::gemmini::quants::dec { namespace
 {
     constexpr size_t kBlockedJWidth = 128;
     constexpr size_t kDecodeJWidth = 64;
-
-    bool is_q80_r_weight_args(const ggml_gemmini_args_t &args)
-    {
-        return args.B &&
-               !args.B_scales &&
-               args.c_b &&
-               ((args.stripe_J > 1) || (args.s_rf && args.R)) &&
-               args.blocks_per_row > 0;
-    }
-
-    WeightLayout resolve_weight_layout(const ggml_gemmini_args_t &args)
-    {
-        if (is_q80_r_weight_args(args) || args.transpose_B)
-            return WeightLayout::JxK_ColMajor;
-
-        return WeightLayout::KxJ_RowMajor;
-    }
-
-    size_t resolve_weight_stride_elems(const ggml_gemmini_args_t &args)
-    {
-        if (is_q80_r_weight_args(args))
-            return args.K;
-
-        const size_t fallback_stride = args.transpose_B ? args.K : args.J;
-        return args.sB ? args.sB : fallback_stride;
-    }
 
     size_t resolve_out_stride_row(const ggml_gemmini_args_t &args)
     {
@@ -113,9 +88,10 @@ namespace ggml::gemmini::quants::dec { namespace
         size_t scale_rows,
         size_t I,
         size_t J,
+        const float *activation_scales,
         const std::vector<int> &unique_k,
         const std::vector<size_t> &rk_offs,
-        const std::pair<int, float> *rk_pairs,
+        const std::pair<int, int32_t> *rk_pairs,
         float *Y_com,
         std::vector<float> &y_block)
     {
@@ -161,7 +137,9 @@ namespace ggml::gemmini::quants::dec { namespace
                     if (r < 0 || static_cast<size_t>(r) >= I)
                         continue;
 
-                    y_block[static_cast<size_t>(r) * block_width + t] += rk_pairs[p].second * weight;
+                    const float activation_scale = activation_scales ? activation_scales[r] : 1.0f;
+                    const float delta = static_cast<float>(rk_pairs[p].second) * activation_scale;
+                    y_block[static_cast<size_t>(r) * block_width + t] += delta * weight;
                 }
             }
         }
@@ -177,8 +155,9 @@ namespace ggml::gemmini::quants::dec { namespace
         size_t blocks_k,
         size_t scale_rows,
         size_t J,
+        const float *activation_scales,
         const std::vector<int> &unique_k,
-        const std::vector<float> &delta_by_k,
+        const std::vector<int64_t> &delta_by_k,
         float *Y_com,
         std::vector<float> &y_block)
     {
@@ -205,9 +184,12 @@ namespace ggml::gemmini::quants::dec { namespace
                 if (k_sz >= args.K || k_sz >= delta_by_k.size())
                     continue;
 
-                const float delta = delta_by_k[k_sz];
-                if (delta == 0.0f)
+                const int64_t delta_i64 = delta_by_k[k_sz];
+                if (delta_i64 == 0)
                     continue;
+
+                const float activation_scale = activation_scales ? activation_scales[0] : 1.0f;
+                const float delta = static_cast<float>(delta_i64) * activation_scale;
 
                 float weight = static_cast<float>(weight_row[k_sz]);
                 if (scale_row && block_size_k > 0)
@@ -235,9 +217,10 @@ void accumulate_to_ycom_jmajor_blocked(
     size_t block_size_k,
     size_t I,
     size_t J,
+    const float *activation_scales,
     const std::vector<int> &unique_k,
     const std::vector<size_t> &rk_offs,
-    const std::pair<int, float> *rk_pairs,
+    const std::pair<int, int32_t> *rk_pairs,
     float *Y_com)
 {
     const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
@@ -259,7 +242,7 @@ void accumulate_to_ycom_jmajor_blocked(
         for (ptrdiff_t jb_idx = 0; jb_idx < static_cast<ptrdiff_t>(block_count); ++jb_idx)
         {
             const size_t jb = static_cast<size_t>(jb_idx) * kBlockedJWidth;
-            accumulate_j_block(jb, args, weight_scales, block_size_k, blocks_k, scale_rows, I, J, unique_k, rk_offs, rk_pairs, Y_com, y_block);
+            accumulate_j_block(jb, args, weight_scales, block_size_k, blocks_k, scale_rows, I, J, activation_scales, unique_k, rk_offs, rk_pairs, Y_com, y_block);
         }
     }
 #else
@@ -267,7 +250,7 @@ void accumulate_to_ycom_jmajor_blocked(
     for (size_t jb_idx = 0; jb_idx < block_count; ++jb_idx)
     {
         const size_t jb = jb_idx * kBlockedJWidth;
-        accumulate_j_block(jb, args, weight_scales, block_size_k, blocks_k, scale_rows, I, J, unique_k, rk_offs, rk_pairs, Y_com, y_block);
+        accumulate_j_block(jb, args, weight_scales, block_size_k, blocks_k, scale_rows, I, J, activation_scales, unique_k, rk_offs, rk_pairs, Y_com, y_block);
     }
 #endif
 }
@@ -279,8 +262,9 @@ void accumulate_single_row_to_ycom_jmajor_blocked(
     size_t blocks_k,
     size_t block_size_k,
     size_t J,
+    const float *activation_scales,
     const std::vector<int> &unique_k,
-    const std::vector<float> &delta_by_k,
+    const std::vector<int64_t> &delta_by_k,
     float *Y_com)
 {
     const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
@@ -297,7 +281,7 @@ void accumulate_single_row_to_ycom_jmajor_blocked(
     for (size_t jb_idx = 0; jb_idx < block_count; ++jb_idx)
     {
         const size_t jb = jb_idx * kDecodeJWidth;
-        accumulate_single_row_j_block(jb, args, weight_scales, block_size_k, blocks_k, scale_rows, J, unique_k, delta_by_k, Y_com, y_block);
+        accumulate_single_row_j_block(jb, args, weight_scales, block_size_k, blocks_k, scale_rows, J, activation_scales, unique_k, delta_by_k, Y_com, y_block);
     }
 }
 
@@ -306,7 +290,8 @@ void accumulate_to_output(
     size_t J,
     size_t rk_beg,
     size_t rk_end,
-    const std::pair<int, float> *rk_pairs,
+    const std::pair<int, int32_t> *rk_pairs,
+    const float *activation_scales,
     const ggml_gemmini_args_t &args,
     bool unroll8)
 {
@@ -320,9 +305,11 @@ void accumulate_to_output(
     for (size_t t = rk_beg; t < rk_end; ++t)
     {
         const int r = rk_pairs[t].first;
-        const float d = rk_pairs[t].second;
         if (r < 0 || static_cast<size_t>(r) >= args.I)
             continue;
+
+        const float activation_scale = activation_scales ? activation_scales[r] : 1.0f;
+        const float d = static_cast<float>(rk_pairs[t].second) * activation_scale;
 
         if (stride_col == 1)
         {
@@ -341,12 +328,45 @@ void accumulate_to_output(
     }
 }
 
+void accumulate_single_row_delta_to_output(
+    const float *Wk_f,
+    size_t J,
+    int64_t delta_i64,
+    const float *activation_scales,
+    const ggml_gemmini_args_t &args,
+    bool unroll8)
+{
+    float *out_data = args.f_out;
+    if (!Wk_f || !out_data || J == 0 || delta_i64 == 0)
+        return;
+
+    const float activation_scale = activation_scales ? activation_scales[0] : 1.0f;
+    const float d = static_cast<float>(delta_i64) * activation_scale;
+    const size_t stride_col = resolve_out_stride_col(args);
+
+    if (stride_col == 1)
+    {
+        float *Yr = out_data;
+        if (unroll8)
+            accumulate_row_unrolled(Yr, Wk_f, d, J);
+        else
+            accumulate_row_simple(Yr, Wk_f, d, J);
+    }
+    else
+    {
+        float *row_base = out_data;
+        for (size_t j = 0; j < J; ++j)
+            row_base[j * stride_col] += d * Wk_f[j];
+    }
+}
+
 void accumulate_to_ycom(
     const float *Wk_f,
     size_t J,
     size_t rk_beg,
     size_t rk_end,
-    const std::pair<int, float> *rk_pairs,
+    const std::pair<int, int32_t> *rk_pairs,
+    const float *activation_scales,
     float *Y_com,
     bool unroll8)
 {
@@ -356,9 +376,11 @@ void accumulate_to_ycom(
     for (size_t t = rk_beg; t < rk_end; ++t)
     {
         const int r = rk_pairs[t].first;
-        const float d = rk_pairs[t].second;
         if (r < 0)
             continue;
+
+        const float activation_scale = activation_scales ? activation_scales[r] : 1.0f;
+        const float d = static_cast<float>(rk_pairs[t].second) * activation_scale;
 
         float *Yr = Y_com + static_cast<size_t>(r) * J;
         if (unroll8)
@@ -366,6 +388,26 @@ void accumulate_to_ycom(
         else
             accumulate_row_simple(Yr, Wk_f, d, J);
     }
+}
+
+void accumulate_single_row_delta_to_ycom(
+    const float *Wk_f,
+    size_t J,
+    int64_t delta_i64,
+    const float *activation_scales,
+    float *Y_com,
+    bool unroll8)
+{
+    if (!Wk_f || !Y_com || J == 0 || delta_i64 == 0)
+        return;
+
+    const float activation_scale = activation_scales ? activation_scales[0] : 1.0f;
+    const float d = static_cast<float>(delta_i64) * activation_scale;
+
+    if (unroll8)
+        accumulate_row_unrolled(Y_com, Wk_f, d, J);
+    else
+        accumulate_row_simple(Y_com, Wk_f, d, J);
 }
 
 void apply_ycom_to_output(

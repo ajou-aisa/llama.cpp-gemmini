@@ -120,8 +120,8 @@ namespace ggml::gemmini::quants::act::exsia
         size_t n = x.size();
         q.reserve(n);
 
-        int64_t S = 0;
-        int64_t SS = 0;
+        __int128_t S = 0;
+        __int128_t SS = 0;
         const bool use_mask = mask.rows != 0 && mask.cols != 0;
         const bool null_theta = theta_b == std::numeric_limits<int16_t>::min();
         for (size_t i = 0; i < n; ++i)
@@ -132,19 +132,19 @@ namespace ggml::gemmini::quants::act::exsia
             if (!use_mask || !mask.is_set(row, col))
             {
                 S += tmp;
-                SS += static_cast<int64_t>(tmp) * tmp;
+                SS += static_cast<__int128_t>(tmp) * tmp;
             }
         }
         return {q, S, SS};
     }
 
-    bool SigmaDetector::detect_3sigma(int32_t q, int64_t S, int64_t SS, size_t N)
+    bool SigmaDetector::detect_3sigma(int32_t q, __int128_t S, __int128_t SS, size_t N)
     {
         if (N == 0)
             return false;
 
-        const int64_t n = static_cast<int64_t>(N);
-        const int64_t centered = n * q - S;
+        const __int128_t n = static_cast<__int128_t>(N);
+        const __int128_t centered = n * q - S;
         return centered * centered > 9 * (n * SS - S * S);
     }
 

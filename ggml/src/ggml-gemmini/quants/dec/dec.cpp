@@ -1,11 +1,13 @@
 #include "dec.hpp"
+#include "dec_internal.hpp"
 #include "dec_kernel.hpp"
-#include "dec_stage.hpp"
 #include "dec_weight.hpp"
+#include "../act/dispatch.hpp"
 #include "../../ggml-gemmini-args.h"
 #include <gemmini/log.hpp>
 #include <gemmini/cycle_reader.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <vector>
@@ -26,32 +28,6 @@ namespace ggml::gemmini::quants::dec { namespace
     {
         static thread_local Q80RDECScratch scratch;
         return scratch;
-    }
-
-    bool is_q80_r_weight_args(const ggml_gemmini_args_t &args)
-    {
-        return args.B &&
-               !args.B_scales &&
-               args.c_b &&
-               ((args.stripe_J > 1) || (args.s_rf && args.R)) &&
-               args.blocks_per_row > 0;
-    }
-
-    WeightLayout resolve_weight_layout(const ggml_gemmini_args_t &args)
-    {
-        if (is_q80_r_weight_args(args) || args.transpose_B)
-            return WeightLayout::JxK_ColMajor;
-
-        return WeightLayout::KxJ_RowMajor;
-    }
-
-    size_t resolve_weight_stride_elems(const ggml_gemmini_args_t &args)
-    {
-        if (is_q80_r_weight_args(args))
-            return args.K;
-
-        const size_t fallback_stride = args.transpose_B ? args.K : args.J;
-        return args.sB ? args.sB : fallback_stride;
     }
 
     struct WeightScaleInfo
@@ -124,6 +100,180 @@ namespace ggml::gemmini::quants::dec { namespace
         result.block_size = args.block_size_k ? args.block_size_k : QK8_0;
         return result;
     }
+
+    size_t stage_from_outliers(
+        const std::vector<QactOutlier> &outliers,
+        size_t I,
+        size_t K,
+        ActivationDECScratch &scratch)
+    {
+        if (outliers.empty() || I == 0 || K == 0)
+            return 0;
+
+        size_t staged = 0;
+        for (const auto &outlier : outliers)
+        {
+            const int k = outlier.col;
+            const int r_idx = outlier.row;
+            if (k < 0 || r_idx < 0)
+                continue;
+
+            const size_t r = static_cast<size_t>(r_idx);
+            const size_t k_sz = static_cast<size_t>(k);
+            if (r >= I || k_sz >= K)
+                continue;
+
+            scratch.rk_stage.push_back({k, static_cast<int>(r), outlier.residual});
+            scratch.rk_counts[k_sz + 1]++;
+            ++staged;
+        }
+
+#if LOG_DEBUG
+        if (staged > 0)
+        {
+            double residual_sum = 0.0;
+            double residual_sq_sum = 0.0;
+            double residual_max = 0.0;
+            const size_t start_idx = scratch.rk_stage.size() - staged;
+            for (size_t i = start_idx; i < scratch.rk_stage.size(); ++i)
+            {
+                const double abs_res = std::fabs(static_cast<double>(scratch.rk_stage[i].d));
+                residual_sum += abs_res;
+                residual_sq_sum += abs_res * abs_res;
+                residual_max = std::max(residual_max, abs_res);
+            }
+
+            const double residual_mean = residual_sum / staged;
+            const double residual_std = std::sqrt((residual_sq_sum / staged) - (residual_mean * residual_mean));
+            ggml::gemmini::log::debug(
+                nullptr,
+                "[dec.select.outlier] total_outliers=%zu staged=%zu mean_residual=%.6g std_residual=%.6g max_residual=%.6g",
+                outliers.size(),
+                staged,
+                residual_mean,
+                residual_std,
+                residual_max);
+        }
+#endif
+
+        return staged;
+    }
+
+    size_t stage_from_outliers_i1(
+        const std::vector<QactOutlier> &outliers,
+        size_t K,
+        ActivationDECScratch &scratch)
+    {
+        if (outliers.empty() || K == 0)
+            return 0;
+
+        size_t staged = 0;
+#if LOG_DEBUG
+        double residual_sum = 0.0;
+        double residual_sq_sum = 0.0;
+        double residual_max = 0.0;
+#endif
+
+        for (const auto &outlier : outliers)
+        {
+            const int k = outlier.col;
+            const int r_idx = outlier.row;
+            if (k < 0 || r_idx != 0)
+                continue;
+
+            const size_t k_sz = static_cast<size_t>(k);
+            if (k_sz >= K)
+                continue;
+
+            if (scratch.rk_counts[k_sz + 1] == 0)
+                scratch.unique_k.push_back(k);
+
+            scratch.i1_delta_by_k[k_sz] += static_cast<int64_t>(outlier.residual);
+            const double abs_res = std::fabs(static_cast<double>(outlier.residual));
+            scratch.i1_total_abs_residual += abs_res;
+            scratch.rk_counts[k_sz + 1]++;
+            ++staged;
+
+#if LOG_DEBUG
+            residual_sum += abs_res;
+            residual_sq_sum += abs_res * abs_res;
+            residual_max = std::max(residual_max, abs_res);
+#endif
+        }
+
+#if LOG_DEBUG
+        if (staged > 0)
+        {
+            const double residual_mean = residual_sum / staged;
+            const double residual_std = std::sqrt((residual_sq_sum / staged) - (residual_mean * residual_mean));
+            ggml::gemmini::log::debug(
+                nullptr,
+                "[dec.select.outlier] total_outliers=%zu staged=%zu mean_residual=%.6g std_residual=%.6g max_residual=%.6g",
+                outliers.size(),
+                staged,
+                residual_mean,
+                residual_std,
+                residual_max);
+        }
+#endif
+
+        return staged;
+    }
+
+    void build_rk_csc(size_t K, ActivationDECScratch &scratch)
+    {
+        if (K == 0)
+            return;
+
+        if (scratch.rk_offs.size() != K + 1)
+            scratch.rk_offs.resize(K + 1);
+
+        for (size_t k = 0; k <= K; ++k)
+            scratch.rk_offs[k] = scratch.rk_counts[k];
+
+        for (size_t k = 1; k <= K; ++k)
+            scratch.rk_offs[k] += scratch.rk_offs[k - 1];
+
+        const size_t nnz = scratch.rk_offs[K];
+        scratch.rk_pairs.assign(nnz, {0, 0});
+
+        if (nnz == 0)
+        {
+            scratch.unique_k.clear();
+            return;
+        }
+
+        std::vector<size_t> pos(scratch.rk_offs.begin(), scratch.rk_offs.end() - 1);
+        for (const auto &t : scratch.rk_stage)
+        {
+            const size_t k = static_cast<size_t>(t.k);
+            if (k >= K)
+                continue;
+
+            const size_t dst = pos[k]++;
+            if (dst < nnz)
+                scratch.rk_pairs[dst] = {t.r, t.d};
+        }
+
+        scratch.unique_k.clear();
+        scratch.unique_k.reserve(K);
+        for (size_t k = 0; k < K; ++k)
+        {
+            if (scratch.rk_offs[k] != scratch.rk_offs[k + 1])
+                scratch.unique_k.push_back(static_cast<int>(k));
+        }
+
+        scratch.rk_stage.clear();
+    }
+
+    size_t get_rk_nnz(size_t K, const ActivationDECScratch &scratch)
+    {
+        if (scratch.rk_offs.size() <= K)
+            return 0;
+
+        return scratch.rk_offs[K];
+    }
+
 }
 
 ActivationDECScratch &get_dec_scratch()
@@ -159,6 +309,8 @@ ActivationDECResult compensate_activation_dec(
 
     const WeightLayout weight_layout = resolve_weight_layout(args);
     const WeightScaleInfo weight_scales = build_weight_scale_info(args);
+    auto activation_scales_vec = act::activation_scales(args, I);
+    const float *activation_scales = activation_scales_vec.data();
     if (!weight_scales.supported)
     {
         ggml::gemmini::log::debug(
@@ -252,6 +404,7 @@ ActivationDECResult compensate_activation_dec(
                 weight_scales.cols,
                 weight_scales.block_size,
                 J,
+                activation_scales,
                 scr.unique_k,
                 scr.i1_delta_by_k,
                 scr.Y_com.data());
@@ -264,9 +417,6 @@ ActivationDECResult compensate_activation_dec(
                 if (k_sz >= scr.i1_delta_by_k.size())
                     continue;
 
-                const float delta = scr.i1_delta_by_k[k_sz];
-                std::pair<int, float> single_pair[] = {{0, delta}};
-
                 load_weight_row_scaled(
                     k_sz,
                     args,
@@ -278,23 +428,21 @@ ActivationDECResult compensate_activation_dec(
 
                 if (cfg.fuse_apply)
                 {
-                    accumulate_to_output(
+                    accumulate_single_row_delta_to_output(
                         scr.Wk_f.data(),
                         J,
-                        0,
-                        1,
-                        single_pair,
+                        scr.i1_delta_by_k[k_sz],
+                        activation_scales,
                         args,
                         cfg.unroll8);
                 }
                 else
                 {
-                    accumulate_to_ycom(
+                    accumulate_single_row_delta_to_ycom(
                         scr.Wk_f.data(),
                         J,
-                        0,
-                        1,
-                        single_pair,
+                        scr.i1_delta_by_k[k_sz],
+                        activation_scales,
                         scr.Y_com.data(),
                         cfg.unroll8);
                 }
@@ -311,6 +459,7 @@ ActivationDECResult compensate_activation_dec(
             weight_scales.block_size,
             I,
             J,
+            activation_scales,
             scr.unique_k,
             scr.rk_offs,
             scr.rk_pairs.data(),
@@ -341,6 +490,7 @@ ActivationDECResult compensate_activation_dec(
                     beg,
                     rk_end,
                     scr.rk_pairs.data(),
+                    activation_scales,
                     args,
                     cfg.unroll8);
             }
@@ -352,6 +502,7 @@ ActivationDECResult compensate_activation_dec(
                     beg,
                     rk_end,
                     scr.rk_pairs.data(),
+                    activation_scales,
                     scr.Y_com.data(),
                     cfg.unroll8);
             }
@@ -395,7 +546,7 @@ ActivationDECResult compensate_activation_dec(
                     const size_t rk_end = scr.rk_offs[k_sz + 1];
 
                     for (size_t t = beg; t < rk_end; ++t)
-                        total_compensation += std::fabs(scr.rk_pairs[t].second);
+                        total_compensation += std::fabs(static_cast<double>(scr.rk_pairs[t].second));
                 }
             }
 

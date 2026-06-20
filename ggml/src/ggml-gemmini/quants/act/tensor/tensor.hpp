@@ -13,11 +13,7 @@ namespace ggml::gemmini::quants::act::tensor
 
     void set_scale(const ggml_gemmini_args_t &args, Meta &meta);
 
-    bool quantize(
-        Meta &meta,
-        const ggml_tensor *src,
-        const ggml_gemmini_args_t &args,
-        int8_t *dst);
+    bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args);
 
     void dequantize(
         const ggml_gemmini_args_t &args,

@@ -192,7 +192,4 @@ typedef struct ggml_gemmini_args_t {
     size_t gemmini_call_k_aligned = 0;
     size_t gemmini_call_tile_k_elems = 0;
 
-    bool exsia_override_enabled = false;
-    int exsia_q = 0;
-
 } ggml_gemmini_args_t;

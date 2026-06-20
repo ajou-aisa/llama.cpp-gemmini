@@ -1,9 +1,7 @@
 #include "dequant.hpp"
 
 #include "../../ggml-gemmini-args.h"
-#include "../../ggml-gemmini-config.hpp"
-#include "../act/exsia/exsia.hpp"
-#include "../act/tensor/tensor.hpp"
+#include "../act/dispatch.hpp"
 
 namespace ggml::gemmini {
 
@@ -14,15 +12,7 @@ void dequantize(
     const int32_t *acc32,
     size_t acc_stride)
 {
-    switch (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT) {
-    case ggml::gemmini::config::ActivationQuantAlgo::EXSIA:
-    default:
-        quants::act::exsia::dequantize(args, k_offset, block_k, acc32, acc_stride);
-        break;
-    case ggml::gemmini::config::ActivationQuantAlgo::TENSOR:
-        quants::act::tensor::dequantize(args, acc32, acc_stride);
-        break;
-    }
+    quants::act::dequantize(args, k_offset, block_k, acc32, acc_stride);
 }
 
 }
