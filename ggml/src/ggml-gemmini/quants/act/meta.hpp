@@ -7,32 +7,32 @@
 
 namespace ggml::gemmini::quants::act
 {
-struct NoneMeta
-{
-    void reset() {}
-};
-
-using MetaStorage = std::variant<NoneMeta, exsia::Meta, tensor::Meta>;
-
-struct Meta
-{
-    MetaStorage storage_{NoneMeta{}};
-
-    Meta() = default;
-
-    void reset()
+    struct NoneMeta
     {
-        storage_ = NoneMeta{};
-    }
+        void reset() {}
+    };
 
-    const MetaStorage & storage() const
-    {
-        return storage_;
-    }
+    using MetaStorage = std::variant<NoneMeta, exsia::Meta, tensor::Meta>;
 
-    MetaStorage & storage()
+    struct Meta
     {
-        return storage_;
-    }
-};
+        MetaStorage storage_{NoneMeta{}};
+
+        Meta() = default;
+
+        void reset()
+        {
+            storage_ = NoneMeta{};
+        }
+
+        const MetaStorage &storage() const
+        {
+            return storage_;
+        }
+
+        MetaStorage &storage()
+        {
+            return storage_;
+        }
+    };
 }

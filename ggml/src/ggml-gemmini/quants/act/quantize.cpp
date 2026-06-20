@@ -46,9 +46,6 @@ void quantize_activation(const ggml_tensor *src, ggml_gemmini_args_t &args)
     case ggml::gemmini::config::ActivationQuantAlgo::EXSIA:
     default:
     {
-        if (args.K % static_cast<size_t>(GGML_GEMMINI_BLOCK_SIZE) != 0) {
-            return;
-        }
         init_exsia_meta(args);
         configure_exsia_meta(args, get_exsia_meta_mut(args));
         act::exsia::ExSIA exsia;

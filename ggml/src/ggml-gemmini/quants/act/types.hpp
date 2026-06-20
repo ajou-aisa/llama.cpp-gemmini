@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 
 #ifndef BLOCK_SIZE
 #define BLOCK_SIZE 32
@@ -10,8 +11,7 @@ struct ggml_gemmini_qact_outlier
 {
     int row = 0;
     int col = 0;
-    float original = 0.f;
-    float saturated = 0.f;
+    int32_t residual = 0;
 };
 
 }

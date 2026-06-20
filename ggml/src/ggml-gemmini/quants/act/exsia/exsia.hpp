@@ -89,7 +89,7 @@ namespace ggml::gemmini::quants::act::exsia
         int16_t e1 = std::numeric_limits<int16_t>::min();  // top-1 exponent among all blocks in a stripe
         int16_t e2 = std::numeric_limits<int16_t>::min();  // top-2 exponent among all blocks in a stripe
         int16_t e_s = std::numeric_limits<int16_t>::min(); // final scale exponent of a stripe
-        bool promote_top_block = false;                    // flag indicating whether to promote the top block's exponent to the stripe level
+        bool promote_top_block = false;                    // set by StripeFolding when e2 != -inf; promotes top-1 exponent blocks to outliers
 
         BitMask outlier_mask; // bitmask indicating outlier positions in a stripe
     };
@@ -97,11 +97,14 @@ namespace ggml::gemmini::quants::act::exsia
     struct ExSIAState
     {
         size_t B_size = BLOCK_SIZE;
+        size_t K_logical = 0;
         size_t K_padded = 0;
         size_t blocks_per_row = 0;
         std::vector<StripeState> stripe;     // vector of stripe states for the entire matrix
+        std::vector<float> x_f32;            // original activations, padded to I * K_padded
         std::vector<int32_t> q_wide;         // Q_X_i32 shared by local wide-quantization and stripe folding
-        std::vector<int16_t> block_top1_exp; // E_s[r, b / B] shared block max exponents
+        std::vector<int16_t> block_exp; // E_s[r, b / B] shared block max exponents
+        std::vector<int32_t> residual;       // shared residual buffer for stripe folding, same shape as q_wide (I * K_padded)
     };
 
     class ExpScanner
@@ -163,7 +166,7 @@ namespace ggml::gemmini::quants::act::exsia
             Meta &meta,
             ExSIAState &state,
             StripeState &stripe,
-            BlockState &blk,
+            const std::vector<float> &x,
             size_t row,
             size_t blk_idx);
 

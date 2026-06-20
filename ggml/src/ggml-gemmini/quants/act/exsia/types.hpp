@@ -27,9 +27,9 @@ struct Meta
 
     int16_t resolve_stripe_theta(int stripe_idx) const
     {
-        if (stripe_idx < 0 || static_cast<size_t>(stripe_idx) >= theta.size()) {
-            return e_s;
-        }
+        if (stripe_idx < 0 || static_cast<size_t>(stripe_idx) >= theta.size())
+            return std::numeric_limits<int16_t>::min();
+
         return theta[static_cast<size_t>(stripe_idx)];
     }
 };
