@@ -249,11 +249,4 @@ namespace ggml::gemmini::quants::act::exsia
         size_t cols,
         const ggml_gemmini_args_t &args);
 
-    void dequantize(
-        const ggml_gemmini_args_t &args,
-        size_t k_offset,
-        size_t block_k,
-        const int32_t *acc32,
-        size_t acc_stride);
-
 } // namespace ggml::gemmini::quants::act::exsia

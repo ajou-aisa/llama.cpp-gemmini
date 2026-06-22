@@ -23,8 +23,4 @@ namespace ggml::gemmini::quants::act::tensor
         size_t cols,
         const ggml_gemmini_args_t &args);
 
-    void dequantize(
-        const ggml_gemmini_args_t &args,
-        const int32_t *acc32,
-        size_t acc_stride);
 }

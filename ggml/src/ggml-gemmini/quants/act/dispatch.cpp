@@ -60,21 +60,6 @@ bool dequantize_activation(float *dst,
     }
 }
 
-void dequantize(const ggml_gemmini_args_t &args,
-                size_t k_offset, size_t block_k,
-                const int32_t *acc32, size_t acc_stride)
-{
-    switch (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT) {
-    case ggml::gemmini::config::ActivationQuantAlgo::EXSIA:
-    default:
-        exsia::dequantize(args, k_offset, block_k, acc32, acc_stride);
-        break;
-    case ggml::gemmini::config::ActivationQuantAlgo::TENSOR:
-        tensor::dequantize(args, acc32, acc_stride);
-        break;
-    }
-}
-
 std::vector<QactOutlier> outliers(const ggml_gemmini_args_t &args)
 {
     const auto &storage = args.act_quant.storage();

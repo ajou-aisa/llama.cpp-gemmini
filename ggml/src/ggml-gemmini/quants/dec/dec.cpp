@@ -1,8 +1,8 @@
 #include "dec.hpp"
 #include "dec_internal.hpp"
 #include "dec_kernel.hpp"
-#include "../act/dispatch.hpp"
 #include "../../ggml-gemmini-args.h"
+#include "../act/dispatch.hpp"
 #include <gemmini/log.hpp>
 #include <gemmini/cycle_reader.hpp>
 
@@ -12,11 +12,6 @@
 #include <limits>
 #include <utility>
 #include <vector>
-
-namespace ggml::gemmini::quants
-{
-    std::vector<QactOutlier> activation_outliers(const ggml_gemmini_args_t &args);
-}
 
 namespace ggml::gemmini::quants::dec { namespace
 {
@@ -51,20 +46,6 @@ namespace ggml::gemmini::quants::dec { namespace
             Y_com.assign(I * J, 0.f);
         }
 
-        void reset_counts(size_t K)
-        {
-            if (rk_counts.size() != K + 1)
-                rk_counts.assign(K + 1, 0);
-            else
-                std::fill(rk_counts.begin(), rk_counts.end(), size_t {0});
-        }
-
-        void reset_stage()
-        {
-            rk_stage.clear();
-            unique_k.clear();
-        }
-
         void reset_i1_delta(size_t K)
         {
             if (i1_delta_by_k.size() != K)
@@ -74,23 +55,11 @@ namespace ggml::gemmini::quants::dec { namespace
 
             i1_total_abs_residual = 0.0;
         }
-
     };
 
     ActivationDECScratch &get_dec_scratch()
     {
         static thread_local ActivationDECScratch scratch;
-        return scratch;
-    }
-
-    struct Q80RDECScratch
-    {
-        std::vector<float> weight_scales;
-    };
-
-    Q80RDECScratch &get_q80_r_dec_scratch()
-    {
-        static thread_local Q80RDECScratch scratch;
         return scratch;
     }
 
@@ -108,7 +77,7 @@ namespace ggml::gemmini::quants::dec { namespace
         WeightScaleInfo result{};
         if (is_q80_r_weight_args(args))
         {
-            auto &scratch = get_q80_r_dec_scratch();
+            static thread_local std::vector<float> weight_scales;
             const size_t rows = args.blocks_J ? args.blocks_J : args.J;
             const size_t cols = args.blocks_per_row;
             const size_t block_size = 32;
@@ -130,7 +99,7 @@ namespace ggml::gemmini::quants::dec { namespace
             if (!stripe_mode && (!args.s_rf || !args.R))
                 return result;
 
-            scratch.weight_scales.resize(rows * cols);
+            weight_scales.resize(rows * cols);
             for (size_t j = 0; j < rows; ++j)
             {
                 const size_t stripe_idx = stripe_mode ? (j / args.stripe_J) : 0;
@@ -143,12 +112,12 @@ namespace ggml::gemmini::quants::dec { namespace
                     const uint64_t c_eff =
                         static_cast<uint64_t>(static_cast<uint16_t>(args.c_b[idx])) +
                         static_cast<uint64_t>(R);
-                    scratch.weight_scales[idx] = static_cast<float>(
+                    weight_scales[idx] = static_cast<float>(
                         static_cast<double>(s_rf) * static_cast<double>(c_eff));
                 }
             }
 
-            result.data = scratch.weight_scales.data();
+            result.data = weight_scales.data();
             result.rows = rows;
             result.cols = cols;
             result.block_size = block_size;
@@ -379,10 +348,9 @@ namespace ggml::gemmini::quants::dec { namespace
 ActivationDECResult compensate_activation_dec(
     const std::vector<ggml::gemmini::quants::QactOutlier> &outliers,
     ggml_gemmini_args_t &args,
-    const ActivationDECConfig &cfg)
+    const char *layer)
 {
     uint64_t start = ggml::gemmini::cycle::read();
-    const char *layer = cfg.layer;
 
     ActivationDECResult result{};
     const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
@@ -407,7 +375,7 @@ ActivationDECResult compensate_activation_dec(
     if (!weight_scales.supported)
     {
         ggml::gemmini::log::debug(
-            cfg.layer,
+            layer,
             "[dec] reject unsupported stripe metadata path: stripe_J=%zu missing shared stripe scales",
             args.stripe_J);
         return result;
@@ -442,10 +410,7 @@ ActivationDECResult compensate_activation_dec(
 
     result.total_selected = total_staged;
     if (total_staged == 0)
-    {
-        result.success = true;
         return result;
-    }
 
     end = ggml::gemmini::cycle::read();
     ggml::gemmini::log::cycle(layer, "[dec] cpu.Stage outlier residuals", start, end);
@@ -464,10 +429,7 @@ ActivationDECResult compensate_activation_dec(
     }
 
     if (result.unique_k_count == 0)
-    {
-        result.success = true;
         return result;
-    }
 
     end = ggml::gemmini::cycle::read();
     ggml::gemmini::log::cycle(layer, "[dec] cpu.Build R_k CSC structure", start, end);
@@ -570,13 +532,10 @@ ActivationDECResult compensate_activation_dec(
     start = ggml::gemmini::cycle::read();
     apply_ycom_to_output(scr.Y_com.data(), I, J, args);
 
-    result.success = true;
-
 #if LOG_DEBUG
-    if (cfg.record_stats)
     {
         ggml::gemmini::log::debug(
-            cfg.layer,
+            layer,
             "[dec] I=%zu K=%zu J=%zu staged=%zu nnz=%zu unique_k=%zu",
             I,
             K,
@@ -609,7 +568,7 @@ ActivationDECResult compensate_activation_dec(
             const double comp_density = total_compensation / (I * J);
 
             ggml::gemmini::log::debug(
-                cfg.layer,
+                layer,
                 "[dec.summary] total_comp=%.6g avg_comp_per_entry=%.6g sparsity=%.6f%% comp_density=%.6g",
                 total_compensation,
                 avg_compensation_per_entry,
@@ -622,21 +581,5 @@ ActivationDECResult compensate_activation_dec(
     end = ggml::gemmini::cycle::read();
     ggml::gemmini::log::cycle(layer, "[dec] cpu.Apply Y_com to output", start, end);
     return result;
-}
-
-bool should_apply_dec(const ggml_gemmini_args_t &args) {
-    if (!args.B || !args.f_out)
-        return false;
-
-    if (args.I == 0 || args.K == 0 || args.J == 0)
-        return false;
-
-    return true;
-}
-
-void append_activation_outliers(
-    const ggml_gemmini_args_t &args,
-    std::vector<QactOutlier> &outliers) {
-    outliers = ggml::gemmini::quants::activation_outliers(args);
 }
 } // namespace ggml::gemmini::quants::dec

@@ -431,26 +431,18 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     // dst에는 gemmini 커널에서 dequantize한 결과가 들어옴 
 
 #if ERROR_COMPENSATION
-    if (dec::should_apply_dec(args)) {
-        std::vector<ggml::gemmini::quants::QactOutlier> outliers;
+    uint64_t start_dec = ggml::gemmini::cycle::read();
+    auto outliers = ggml::gemmini::quants::activation_outliers(args);
+    uint64_t end_dec = ggml::gemmini::cycle::read();
+    ggml::gemmini::log::cycle(layer, "[dec] cpu.Create views", start_dec, end_dec);
 
-        uint64_t start_dec = ggml::gemmini::cycle::read();
-        dec::append_activation_outliers(args, outliers);
-        uint64_t end_dec = ggml::gemmini::cycle::read();
-        ggml::gemmini::log::cycle(layer, "[dec] cpu.Create views", start_dec, end_dec);
-
-        ggml::gemmini::quants::dec::ActivationDECConfig dec_cfg {};
-        dec_cfg.layer = layer;
-        dec_cfg.record_stats = true;
-
-        auto dec_result = ggml::gemmini::quants::dec::compensate_activation_dec(outliers, args, dec_cfg);
-        if (dec_result.success && dec_result.nnz > 0) {
-            ggml::gemmini::log::debug(layer,
-                             "[dec.summary] staged=%zu nnz=%zu unique_k=%zu",
-                             dec_result.total_selected,
-                             dec_result.nnz,
-                             dec_result.unique_k_count);
-        }
+    auto dec_result = ggml::gemmini::quants::dec::compensate_activation_dec(outliers, args, layer);
+    if (dec_result.nnz > 0) {
+        ggml::gemmini::log::debug(layer,
+                         "[dec.summary] staged=%zu nnz=%zu unique_k=%zu",
+                         dec_result.total_selected,
+                         dec_result.nnz,
+                         dec_result.unique_k_count);
     }
 #endif
 }

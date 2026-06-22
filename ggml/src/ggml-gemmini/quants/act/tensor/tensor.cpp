@@ -80,15 +80,4 @@ bool dequantize_activation(
     return true;
 }
 
-void dequantize(
-    const ggml_gemmini_args_t &args,
-    const int32_t *acc32,
-    size_t acc_stride)
-{
-    // TODO: per-tensor dequantization.
-    (void)args;
-    (void)acc32;
-    (void)acc_stride;
-}
-
 }

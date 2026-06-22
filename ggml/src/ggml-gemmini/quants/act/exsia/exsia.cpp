@@ -616,25 +616,4 @@ namespace ggml::gemmini::quants::act::exsia
         return true;
     }
 
-    void dequantize(
-        const ggml_gemmini_args_t &args,
-        size_t k_offset,
-        size_t block_k,
-        const int32_t *acc32,
-        size_t acc_stride)
-    {
-        (void)args;
-        (void)k_offset;
-        (void)block_k;
-        (void)acc32;
-        (void)acc_stride;
-
-        // Step 1: Read per-stripe theta from meta.resolve_stripe_theta(stripe_idx)
-        //         and rho from meta.rho.
-        // Step 2: For each accumulator element, apply inverse activation scaling.
-        // Step 3: Apply sparse residual correction using meta.outliers.
-        //         Each outlier entry stores (row, col, residual_i32), where
-        //         residual_i32 = q_shifted - q_i8 in the folded stripe integer domain.
-        // TODO: implement dequantize / residual-correction algorithm.
-    }
 }
