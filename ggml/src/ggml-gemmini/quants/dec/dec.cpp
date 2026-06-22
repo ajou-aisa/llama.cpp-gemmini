@@ -1,7 +1,6 @@
 #include "dec.hpp"
 #include "dec_internal.hpp"
 #include "dec_kernel.hpp"
-#include "dec_weight.hpp"
 #include "../act/dispatch.hpp"
 #include "../../ggml-gemmini-args.h"
 #include <gemmini/log.hpp>
@@ -9,7 +8,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
+#include <utility>
 #include <vector>
 
 namespace ggml::gemmini::quants
@@ -19,6 +20,69 @@ namespace ggml::gemmini::quants
 
 namespace ggml::gemmini::quants::dec { namespace
 {
+    struct RkTriplet
+    {
+        int k;
+        int r;
+        int32_t d;
+    };
+
+    struct ActivationDECScratch
+    {
+        std::vector<size_t> rk_counts;
+        std::vector<size_t> rk_offs;
+        std::vector<std::pair<int, int32_t>> rk_pairs;
+        std::vector<int> unique_k;
+        std::vector<RkTriplet> rk_stage;
+        std::vector<int64_t> i1_delta_by_k;
+        double i1_total_abs_residual = 0.0;
+        std::vector<float> Wk_f;
+        std::vector<float> Y_com;
+
+        void resize_for_dims(size_t I, size_t K, size_t J)
+        {
+            rk_counts.assign(K + 1, 0);
+            rk_offs.resize(K + 1);
+            unique_k.clear();
+            unique_k.reserve(K);
+            rk_stage.clear();
+            rk_stage.reserve(I);
+            Wk_f.resize(J);
+            Y_com.assign(I * J, 0.f);
+        }
+
+        void reset_counts(size_t K)
+        {
+            if (rk_counts.size() != K + 1)
+                rk_counts.assign(K + 1, 0);
+            else
+                std::fill(rk_counts.begin(), rk_counts.end(), size_t {0});
+        }
+
+        void reset_stage()
+        {
+            rk_stage.clear();
+            unique_k.clear();
+        }
+
+        void reset_i1_delta(size_t K)
+        {
+            if (i1_delta_by_k.size() != K)
+                i1_delta_by_k.assign(K, int64_t {0});
+            else
+                std::fill(i1_delta_by_k.begin(), i1_delta_by_k.end(), int64_t {0});
+
+            i1_total_abs_residual = 0.0;
+        }
+
+    };
+
+    ActivationDECScratch &get_dec_scratch()
+    {
+        static thread_local ActivationDECScratch scratch;
+        return scratch;
+    }
+
     struct Q80RDECScratch
     {
         std::vector<float> weight_scales;
@@ -99,6 +163,48 @@ namespace ggml::gemmini::quants::dec { namespace
         result.cols = args.blocks_K;
         result.block_size = args.block_size_k ? args.block_size_k : QK8_0;
         return result;
+    }
+
+    void load_weight_row_scaled(
+        size_t k,
+        const ggml_gemmini_args_t &args,
+        const float *weight_scales,
+        size_t scale_rows,
+        size_t blocks_k,
+        size_t block_size_k,
+        float *Wk_f)
+    {
+        const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
+        const size_t J = args.J;
+        if (!weights || !Wk_f || J == 0)
+            return;
+
+        const size_t weight_stride = resolve_weight_stride_elems(args);
+        if (weight_stride == 0)
+            return;
+
+        if (resolve_weight_layout(args) == WeightLayout::KxJ_RowMajor)
+        {
+            const int8_t *row = weights + k * weight_stride;
+            for (size_t j = 0; j < J; ++j)
+                Wk_f[j] = static_cast<float>(row[j]);
+        }
+        else
+        {
+            for (size_t j = 0; j < J; ++j)
+                Wk_f[j] = static_cast<float>(weights[j * weight_stride + k]);
+        }
+
+        if (weight_scales && block_size_k > 0 && blocks_k > 0)
+        {
+            const size_t blk = k / block_size_k;
+
+            for (size_t j = 0; j < J; ++j)
+            {
+                if (j < scale_rows && blk < blocks_k)
+                    Wk_f[j] *= weight_scales[j * blocks_k + blk];
+            }
+        }
     }
 
     size_t stage_from_outliers(
@@ -220,10 +326,10 @@ namespace ggml::gemmini::quants::dec { namespace
         return staged;
     }
 
-    void build_rk_csc(size_t K, ActivationDECScratch &scratch)
+    size_t build_rk_csc(size_t K, ActivationDECScratch &scratch)
     {
         if (K == 0)
-            return;
+            return 0;
 
         if (scratch.rk_offs.size() != K + 1)
             scratch.rk_offs.resize(K + 1);
@@ -240,7 +346,8 @@ namespace ggml::gemmini::quants::dec { namespace
         if (nnz == 0)
         {
             scratch.unique_k.clear();
-            return;
+            scratch.rk_stage.clear();
+            return nnz;
         }
 
         std::vector<size_t> pos(scratch.rk_offs.begin(), scratch.rk_offs.end() - 1);
@@ -264,29 +371,15 @@ namespace ggml::gemmini::quants::dec { namespace
         }
 
         scratch.rk_stage.clear();
+        return nnz;
     }
 
-    size_t get_rk_nnz(size_t K, const ActivationDECScratch &scratch)
-    {
-        if (scratch.rk_offs.size() <= K)
-            return 0;
-
-        return scratch.rk_offs[K];
-    }
-
-}
-
-ActivationDECScratch &get_dec_scratch()
-{
-    static thread_local ActivationDECScratch scratch;
-    return scratch;
 }
 
 ActivationDECResult compensate_activation_dec(
     const std::vector<ggml::gemmini::quants::QactOutlier> &outliers,
     ggml_gemmini_args_t &args,
-    const ActivationDECConfig &cfg,
-    ActivationDECScratch *scratch)
+    const ActivationDECConfig &cfg)
 {
     uint64_t start = ggml::gemmini::cycle::read();
     const char *layer = cfg.layer;
@@ -320,24 +413,18 @@ ActivationDECResult compensate_activation_dec(
         return result;
     }
 
-    ActivationDECScratch &scr = scratch ? *scratch : get_dec_scratch();
+    ActivationDECScratch &scr = get_dec_scratch();
 
     uint64_t end = ggml::gemmini::cycle::read();
     ggml::gemmini::log::cycle(layer, "[dec] cpu.Ready compensation", start, end);
 
     start = ggml::gemmini::cycle::read();
 
-    const bool need_ycom = !cfg.fuse_apply;
     const bool decode = I == 1;
 
-    scr.resize_for_dims(I, K, J, need_ycom);
-    scr.reset_counts(K);
-    scr.reset_stage();
+    scr.resize_for_dims(I, K, J);
     if (decode)
         scr.reset_i1_delta(K);
-
-    if (need_ycom)
-        scr.reset_ycom(I, J);
 
     end = ggml::gemmini::cycle::read();
     ggml::gemmini::log::cycle(layer, "[dec] cpu.Initialize scratch", start, end);
@@ -372,8 +459,7 @@ ActivationDECResult compensate_activation_dec(
     }
     else
     {
-        build_rk_csc(K, scr);
-        result.nnz = get_rk_nnz(K, scr);
+        result.nnz = build_rk_csc(K, scr);
         result.unique_k_count = scr.unique_k.size();
     }
 
@@ -389,7 +475,6 @@ ActivationDECResult compensate_activation_dec(
     start = ggml::gemmini::cycle::read();
 
     const bool use_jmajor_blocked =
-        need_ycom &&
         weight_layout == WeightLayout::JxK_ColMajor &&
         weight_stride >= K;
 
@@ -426,26 +511,12 @@ ActivationDECResult compensate_activation_dec(
                     weight_scales.block_size,
                     scr.Wk_f.data());
 
-                if (cfg.fuse_apply)
-                {
-                    accumulate_single_row_delta_to_output(
-                        scr.Wk_f.data(),
-                        J,
-                        scr.i1_delta_by_k[k_sz],
-                        activation_scales,
-                        args,
-                        cfg.unroll8);
-                }
-                else
-                {
-                    accumulate_single_row_delta_to_ycom(
-                        scr.Wk_f.data(),
-                        J,
-                        scr.i1_delta_by_k[k_sz],
-                        activation_scales,
-                        scr.Y_com.data(),
-                        cfg.unroll8);
-                }
+                accumulate_single_row_delta_to_ycom(
+                    scr.Wk_f.data(),
+                    J,
+                    scr.i1_delta_by_k[k_sz],
+                    activation_scales,
+                    scr.Y_com.data());
             }
         }
     }
@@ -482,30 +553,14 @@ ActivationDECResult compensate_activation_dec(
                 weight_scales.block_size,
                 scr.Wk_f.data());
 
-            if (cfg.fuse_apply)
-            {
-                accumulate_to_output(
-                    scr.Wk_f.data(),
-                    J,
-                    beg,
-                    rk_end,
-                    scr.rk_pairs.data(),
-                    activation_scales,
-                    args,
-                    cfg.unroll8);
-            }
-            else
-            {
-                accumulate_to_ycom(
-                    scr.Wk_f.data(),
-                    J,
-                    beg,
-                    rk_end,
-                    scr.rk_pairs.data(),
-                    activation_scales,
-                    scr.Y_com.data(),
-                    cfg.unroll8);
-            }
+            accumulate_to_ycom(
+                scr.Wk_f.data(),
+                J,
+                beg,
+                rk_end,
+                scr.rk_pairs.data(),
+                activation_scales,
+                scr.Y_com.data());
         }
     }
 
@@ -513,8 +568,7 @@ ActivationDECResult compensate_activation_dec(
     ggml::gemmini::log::cycle(layer, "[dec] cpu.Compute and accumulate compensation", start, end);
 
     start = ggml::gemmini::cycle::read();
-    if (!cfg.fuse_apply)
-        apply_ycom_to_output(scr.Y_com.data(), I, J, args);
+    apply_ycom_to_output(scr.Y_com.data(), I, J, args);
 
     result.success = true;
 

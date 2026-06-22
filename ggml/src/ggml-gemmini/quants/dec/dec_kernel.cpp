@@ -62,12 +62,6 @@ namespace ggml::gemmini::quants::dec { namespace
             dst[j] += delta * Wk_f[j];
     }
 
-    inline void accumulate_row_simple(float *dst, const float *Wk_f, float delta, size_t J)
-    {
-        for (size_t j = 0; j < J; ++j)
-            dst[j] += delta * Wk_f[j];
-    }
-
     inline void flush_y_block(const float *block, size_t I, size_t block_width, size_t J, size_t jb, float *Y_com)
     {
         for (size_t r = 0; r < I; ++r)
@@ -285,81 +279,6 @@ void accumulate_single_row_to_ycom_jmajor_blocked(
     }
 }
 
-void accumulate_to_output(
-    const float *Wk_f,
-    size_t J,
-    size_t rk_beg,
-    size_t rk_end,
-    const std::pair<int, int32_t> *rk_pairs,
-    const float *activation_scales,
-    const ggml_gemmini_args_t &args,
-    bool unroll8)
-{
-    float *out_data = args.f_out;
-    if (!Wk_f || !rk_pairs || !out_data || J == 0)
-        return;
-
-    const size_t stride_row = resolve_out_stride_row(args);
-    const size_t stride_col = resolve_out_stride_col(args);
-
-    for (size_t t = rk_beg; t < rk_end; ++t)
-    {
-        const int r = rk_pairs[t].first;
-        if (r < 0 || static_cast<size_t>(r) >= args.I)
-            continue;
-
-        const float activation_scale = activation_scales ? activation_scales[r] : 1.0f;
-        const float d = static_cast<float>(rk_pairs[t].second) * activation_scale;
-
-        if (stride_col == 1)
-        {
-            float *Yr = out_data + static_cast<size_t>(r) * stride_row;
-            if (unroll8)
-                accumulate_row_unrolled(Yr, Wk_f, d, J);
-            else
-                accumulate_row_simple(Yr, Wk_f, d, J);
-        }
-        else
-        {
-            float *row_base = out_data + static_cast<size_t>(r) * stride_row;
-            for (size_t j = 0; j < J; ++j)
-                row_base[j * stride_col] += d * Wk_f[j];
-        }
-    }
-}
-
-void accumulate_single_row_delta_to_output(
-    const float *Wk_f,
-    size_t J,
-    int64_t delta_i64,
-    const float *activation_scales,
-    const ggml_gemmini_args_t &args,
-    bool unroll8)
-{
-    float *out_data = args.f_out;
-    if (!Wk_f || !out_data || J == 0 || delta_i64 == 0)
-        return;
-
-    const float activation_scale = activation_scales ? activation_scales[0] : 1.0f;
-    const float d = static_cast<float>(delta_i64) * activation_scale;
-    const size_t stride_col = resolve_out_stride_col(args);
-
-    if (stride_col == 1)
-    {
-        float *Yr = out_data;
-        if (unroll8)
-            accumulate_row_unrolled(Yr, Wk_f, d, J);
-        else
-            accumulate_row_simple(Yr, Wk_f, d, J);
-    }
-    else
-    {
-        float *row_base = out_data;
-        for (size_t j = 0; j < J; ++j)
-            row_base[j * stride_col] += d * Wk_f[j];
-    }
-}
-
 void accumulate_to_ycom(
     const float *Wk_f,
     size_t J,
@@ -367,8 +286,7 @@ void accumulate_to_ycom(
     size_t rk_end,
     const std::pair<int, int32_t> *rk_pairs,
     const float *activation_scales,
-    float *Y_com,
-    bool unroll8)
+    float *Y_com)
 {
     if (!Wk_f || !rk_pairs || !Y_com || J == 0)
         return;
@@ -383,10 +301,7 @@ void accumulate_to_ycom(
         const float d = static_cast<float>(rk_pairs[t].second) * activation_scale;
 
         float *Yr = Y_com + static_cast<size_t>(r) * J;
-        if (unroll8)
-            accumulate_row_unrolled(Yr, Wk_f, d, J);
-        else
-            accumulate_row_simple(Yr, Wk_f, d, J);
+        accumulate_row_unrolled(Yr, Wk_f, d, J);
     }
 }
 
@@ -395,8 +310,7 @@ void accumulate_single_row_delta_to_ycom(
     size_t J,
     int64_t delta_i64,
     const float *activation_scales,
-    float *Y_com,
-    bool unroll8)
+    float *Y_com)
 {
     if (!Wk_f || !Y_com || J == 0 || delta_i64 == 0)
         return;
@@ -404,10 +318,7 @@ void accumulate_single_row_delta_to_ycom(
     const float activation_scale = activation_scales ? activation_scales[0] : 1.0f;
     const float d = static_cast<float>(delta_i64) * activation_scale;
 
-    if (unroll8)
-        accumulate_row_unrolled(Y_com, Wk_f, d, J);
-    else
-        accumulate_row_simple(Y_com, Wk_f, d, J);
+    accumulate_row_unrolled(Y_com, Wk_f, d, J);
 }
 
 void apply_ycom_to_output(

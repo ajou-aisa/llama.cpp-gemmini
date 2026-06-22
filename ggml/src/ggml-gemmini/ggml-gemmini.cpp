@@ -53,6 +53,27 @@
 
 using namespace ggml::gemmini::quants;
 
+namespace
+{
+    bool gemmini_dim_to_size(int64_t dim, size_t &out)
+    {
+        if (dim <= 0)
+            return false;
+
+        out = static_cast<size_t>(dim);
+        return true;
+    }
+
+    bool gemmini_checked_mul(size_t lhs, size_t rhs, size_t &out)
+    {
+        if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs)
+            return false;
+
+        out = lhs * rhs;
+        return true;
+    }
+}
+
 struct ggml_backend_gemmini_context
 {
     int n_threads = GGML_DEFAULT_N_THREADS;
@@ -82,9 +103,23 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     const auto *src1 = dst->src[1]; // src1: activation (I x K) -> 전치 없음 (A)
 
     /* _______________________ 2. Gemmini용 dimension _____________________ */
-    const size_t I = dst->ne[1]; // I = A.ne[1], K = A.ne[0]
-    const size_t J = dst->ne[0]; // J = B.ne[1], K = B.ne[0]
-    const size_t K = src1->ne[0]; // K = A.ne[0]
+    size_t I = 0;
+    size_t J = 0;
+    size_t K = 0;
+    if (!gemmini_dim_to_size(dst->ne[1], I) ||
+        !gemmini_dim_to_size(dst->ne[0], J) ||
+        !gemmini_dim_to_size(src1->ne[0], K)) {
+        GGML_ABORT("Gemmini mul_mat received invalid dimensions");
+    }
+
+    size_t ik_count = 0;
+    size_t jk_count = 0;
+    size_t ij_count = 0;
+    if (!gemmini_checked_mul(I, K, ik_count) ||
+        !gemmini_checked_mul(J, K, jk_count) ||
+        !gemmini_checked_mul(I, J, ij_count)) {
+        GGML_ABORT("Gemmini mul_mat size overflow");
+    }
 
 #if LOG_DUMP
     ggml::gemmini::log::dump(ggml::gemmini::log::file("log/tensor_data/act.jsonl"), layer, src1);
@@ -97,7 +132,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             std::vector<float> src0_f32;
             const float *src0_f = (const float *)src0->data;
             if (src0->type == GGML_TYPE_F16) {
-                src0_f32.resize(J * K);
+                src0_f32.resize(jk_count);
                 const ggml_fp16_t *src0_f16 = (const ggml_fp16_t *)src0->data;
                 for (size_t j = 0; j < J; j++) {
                     for (size_t k = 0; k < K; k++)
@@ -110,8 +145,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                                          K, K, 0, J);
             return;
         } else if (src0->type == GGML_TYPE_Q8_0) {
-            std::vector<float> src0_f32(J * K);
-            dequantize_row_q8_0((const block_q8_0 *)src0->data, src0_f32.data(), J * K);
+            std::vector<float> src0_f32(jk_count);
+            dequantize_row_q8_0((const block_q8_0 *)src0->data, src0_f32.data(), jk_count);
             ggml::gemmini::matmul_cpu_fp(false, true, I, J, K,
                                          (const float *)src1->data, src0_f32.data(), NULL, (float *)dst->data,
                                          K, K, 0, J);
@@ -153,7 +188,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     start = ggml::gemmini::cycle::read();
 
     [[maybe_unused]] static thread_local std::vector<int8_t> activation_q;
-    activation_q.resize(I * K);
+    activation_q.resize(ik_count);
     int8_t *qx = activation_q.data();
 
     args.A = reinterpret_cast<elem_t *>(qx);
@@ -169,6 +204,43 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     end = ggml::gemmini::cycle::read();
     ggml::gemmini::log::cycle(layer, "cpu.Quantize activation", start, end);
+
+    if constexpr (ggml::gemmini::config::CURRENT_COMPUTE_TYPE == ggml::gemmini::config::ComputeType::DEQUANT_FP_TEST) {
+        std::vector<float> activation_f32(ik_count);
+        const bool dequant_ok = ggml::gemmini::quants::dequantize_activation(
+            activation_f32.data(),
+            K,
+            1,
+            I,
+            K,
+            args);
+        GGML_ASSERT(dequant_ok && "DEQUANT_FP_TEST: activation dequantization failed");
+        if (!dequant_ok)
+            return;
+
+        std::vector<float> src0_f32;
+        const float *src0_f = reinterpret_cast<const float *>(src0->data);
+        if (src0->type == GGML_TYPE_F16) {
+            src0_f32.resize(jk_count);
+            const ggml_fp16_t *src0_f16 = reinterpret_cast<const ggml_fp16_t *>(src0->data);
+            for (size_t j = 0; j < J; j++) {
+                for (size_t k = 0; k < K; k++)
+                    src0_f32[j * K + k] = ggml_fp16_to_fp32(src0_f16[j * K + k]);
+            }
+            src0_f = src0_f32.data();
+        } else if (src0->type == GGML_TYPE_Q8_0) {
+            src0_f32.resize(jk_count);
+            dequantize_row_q8_0(reinterpret_cast<const block_q8_0 *>(src0->data), src0_f32.data(), jk_count);
+            src0_f = src0_f32.data();
+        } else if (src0->type != GGML_TYPE_F32) {
+            GGML_ABORT("DEQUANT_FP_TEST compute type: unsupported weight type");
+        }
+
+        ggml::gemmini::matmul_cpu_fp(false, true, I, J, K,
+                                     activation_f32.data(), src0_f, NULL, static_cast<float *>(dst->data),
+                                     K, K, 0, J);
+        return;
+    }
 
     // breackdown weight to int8_t & scale (cache per weight tensor)
     start = ggml::gemmini::cycle::read();
@@ -328,7 +400,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     
     // output 버퍼
     [[maybe_unused]] static thread_local std::vector<int8_t> c_i8;
-    c_i8.resize(I * J);
+    c_i8.resize(ij_count);
     
     args.C = c_i8.data();
     args.f_out = static_cast<float*>(dst->data);
@@ -355,8 +427,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         } else if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TENSOR) {
             ggml::gemmini::tiled_matmul_auto_tensor(&args);
         }
-    } else {
-        ggml::gemmini::tiled_matmul_auto_fp(&args);
     }
     // dst에는 gemmini 커널에서 dequantize한 결과가 들어옴 
 
@@ -371,11 +441,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
         ggml::gemmini::quants::dec::ActivationDECConfig dec_cfg {};
         dec_cfg.layer = layer;
-        dec_cfg.fuse_apply = false;
-        dec_cfg.unroll8 = true;
         dec_cfg.record_stats = true;
 
-        auto dec_result = ggml::gemmini::quants::dec::compensate_activation_dec(outliers, args, dec_cfg, nullptr);
+        auto dec_result = ggml::gemmini::quants::dec::compensate_activation_dec(outliers, args, dec_cfg);
         if (dec_result.success && dec_result.nnz > 0) {
             ggml::gemmini::log::debug(layer,
                              "[dec.summary] staged=%zu nnz=%zu unique_k=%zu",
@@ -625,10 +693,60 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
                 return false;
             if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b))
                 return false;
-            // Q8_0 weights → Gemmini HW, FP weights → CPU fallback via matmul_cpu_fp
-            if (a->type == GGML_TYPE_Q8_0 || a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16)
+            if (a->ne[0] != b->ne[0])
+                return false;
+
+            size_t I = 0;
+            size_t J = 0;
+            size_t K = 0;
+            size_t unused = 0;
+            if (!gemmini_dim_to_size(op->ne[1], I) ||
+                !gemmini_dim_to_size(op->ne[0], J) ||
+                !gemmini_dim_to_size(b->ne[0], K) ||
+                !gemmini_checked_mul(I, K, unused) ||
+                !gemmini_checked_mul(J, K, unused) ||
+                !gemmini_checked_mul(I, J, unused)) {
+                return false;
+            }
+
+            if constexpr (
+                ggml::gemmini::config::CURRENT_COMPUTE_TYPE ==
+                ggml::gemmini::config::ComputeType::INT
+            ) {
+                // INT Gemmini path currently only supports Q8_0 static weights.
+                if (a->type != GGML_TYPE_Q8_0)
+                    return false;
+
+                if (a->ne[0] <= 0 || a->ne[0] % QK8_0 != 0)
+                    return false;
+
+                const block_q8_0 * base = ggml::gemmini::weight_block_base(a);
+                if (base == nullptr)
+                    return false;
+
+                if (a->nb[0] == 0 || a->nb[0] < sizeof(block_q8_0))
+                    return false;
+
                 return true;
-            return false;
+            }
+
+            if constexpr (
+                ggml::gemmini::config::CURRENT_COMPUTE_TYPE ==
+                    ggml::gemmini::config::ComputeType::FLOAT ||
+                ggml::gemmini::config::CURRENT_COMPUTE_TYPE ==
+                    ggml::gemmini::config::ComputeType::DEQUANT_FP_TEST
+            ) {
+                if constexpr (
+                    ggml::gemmini::config::CURRENT_COMPUTE_TYPE ==
+                    ggml::gemmini::config::ComputeType::DEQUANT_FP_TEST
+                ) {
+                    if (a->ne[2] != 1 || a->ne[3] != 1 ||
+                        b->ne[2] != 1 || b->ne[3] != 1 ||
+                        op->ne[2] != 1 || op->ne[3] != 1)
+                        return false;
+                }
+                return a->type == GGML_TYPE_Q8_0 || a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16;
+            }
         }
 
         case GGML_OP_ADD:

@@ -28,6 +28,20 @@ void quantize_activation(const ggml_tensor *src, ggml_gemmini_args_t &args)
     act::quantize(src, args);
 }
 
+bool dequantize_activation(float *dst,
+                           size_t dst_row_stride,
+                           size_t dst_col_stride,
+                           size_t rows,
+                           size_t cols,
+                           const ggml_gemmini_args_t &args)
+{
+    if (!dst || dst_row_stride == 0 || dst_col_stride == 0 || rows == 0 || cols == 0) {
+        return false;
+    }
+
+    return act::dequantize_activation(dst, dst_row_stride, dst_col_stride, rows, cols, args);
+}
+
 void reset_activation_quant_state(ggml_gemmini_args_t &args) {
     args.act_quant.reset();
     args.gemmini_call_k_logical = 0;

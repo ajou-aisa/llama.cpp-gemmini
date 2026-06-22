@@ -31,12 +31,14 @@ namespace ggml::gemmini::config
 #endif
 
 // ComputeType ----------------------------------------------------------------
-// 0 = INT  : activation quant + weight unpacking + int matmul
-// 1 = FLOAT: bypass quant, call matmul_cpu_fp directly
+// 0 = INT              : activation quant + weight unpacking + int matmul
+// 1 = FLOAT            : bypass quant, call matmul_cpu_fp directly
+// 2 = DEQUANT_FP_TEST  : activation quant + activation dequant + fp matmul test path
 // To add: append enum entry with next integer, update CURRENT_COMPUTE_TYPE.
 enum class ComputeType : uint8_t {
     INT = 0,
     FLOAT = 1,
+    DEQUANT_FP_TEST = 2,
 };
 
 // ActivationQuantAlgo --------------------------------------------------------
@@ -55,6 +57,8 @@ inline constexpr ComputeType CURRENT_COMPUTE_TYPE =
     ComputeType::INT;
 #elif GGML_GEMMINI_COMPUTE_TYPE == 1
     ComputeType::FLOAT;
+#elif GGML_GEMMINI_COMPUTE_TYPE == 2
+    ComputeType::DEQUANT_FP_TEST;
 #else
     #error "Invalid GGML_GEMMINI_COMPUTE_TYPE value"
 #endif
@@ -77,7 +81,7 @@ inline constexpr ActivationQuantAlgo CURRENT_ACTIVATION_QUANT =
     #define GGML_GEMMINI_ACTIVATION_QUANT_NAME GGML_GEMMINI_ACTIVATION_QUANT_NAMETENSOR
 #endif
 
-static_assert(static_cast<uint8_t>(CURRENT_COMPUTE_TYPE) <= 1, "CURRENT_COMPUTE_TYPE must be INT or FLOAT");
+static_assert(static_cast<uint8_t>(CURRENT_COMPUTE_TYPE) <= 2, "CURRENT_COMPUTE_TYPE must be INT, FLOAT, or DEQUANT_FP_TEST");
 static_assert(static_cast<uint8_t>(CURRENT_ACTIVATION_QUANT) <= 1, "CURRENT_ACTIVATION_QUANT must be EXSIA or TENSOR");
 
 } // namespace

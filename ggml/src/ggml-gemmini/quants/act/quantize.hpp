@@ -3,6 +3,7 @@
 #include "exsia/types.hpp"
 #include "types.hpp"
 
+#include <cstddef>
 #include <vector>
 
 struct ggml_tensor;
@@ -11,6 +12,13 @@ struct ggml_gemmini_args_t;
 namespace ggml::gemmini::quants
 {
 void quantize_activation(const ggml_tensor *src, ggml_gemmini_args_t &args);
+
+bool dequantize_activation(float *dst,
+                           size_t dst_row_stride,
+                           size_t dst_col_stride,
+                           size_t rows,
+                           size_t cols,
+                           const ggml_gemmini_args_t &args);
 
 void reset_activation_quant_state(ggml_gemmini_args_t &args);
 

@@ -49,7 +49,6 @@ ggml_add_backend_library(ggml-gemmini
                          quants/common/fp16_util.cpp
                          quants/common/dequant.cpp
                           quants/dec/dec.cpp
-                          quants/dec/dec_weight.cpp
                           quants/dec/dec_kernel.cpp
                          dump/dump_common.cpp
                          dump/dump_tensor.cpp

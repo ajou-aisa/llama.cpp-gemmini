@@ -11,6 +11,19 @@
 
 namespace ggml::gemmini::quants::act {
 
+namespace {
+
+bool checked_mul_size(size_t lhs, size_t rhs, size_t &out)
+{
+    if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs)
+        return false;
+
+    out = lhs * rhs;
+    return true;
+}
+
+}
+
 void quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
 {
     switch (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT) {
@@ -28,6 +41,22 @@ void quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
         tensor::quantize(src, args);
         break;
     }
+    }
+}
+
+bool dequantize_activation(float *dst,
+                           size_t dst_row_stride,
+                           size_t dst_col_stride,
+                           size_t rows,
+                           size_t cols,
+                           const ggml_gemmini_args_t &args)
+{
+    switch (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT) {
+    case ggml::gemmini::config::ActivationQuantAlgo::EXSIA:
+    default:
+        return exsia::dequantize_activation(dst, dst_row_stride, dst_col_stride, rows, cols, args);
+    case ggml::gemmini::config::ActivationQuantAlgo::TENSOR:
+        return tensor::dequantize_activation(dst, dst_row_stride, dst_col_stride, rows, cols, args);
     }
 }
 
@@ -63,7 +92,10 @@ std::vector<float> activation_scales(const ggml_gemmini_args_t &args, size_t row
 
     if (const auto *meta = std::get_if<exsia::Meta>(&storage)) {
         const int16_t invalid_theta = std::numeric_limits<int16_t>::min();
-        const size_t rows_per_stripe = args.tile_I > 0 ? args.tile_I * DIM : args.I;
+        size_t rows_per_stripe = args.I;
+        if (args.tile_I > 0 && !checked_mul_size(args.tile_I, DIM, rows_per_stripe)) {
+            return scales;
+        }
         if (rows_per_stripe == 0) {
             return scales;
         }

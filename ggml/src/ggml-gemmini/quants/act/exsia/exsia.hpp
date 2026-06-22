@@ -26,12 +26,40 @@ namespace ggml::gemmini::quants::act::exsia
         size_t cols = 0;
         std::vector<uint64_t> words;
 
-        // resize the bitmask matrix to the specified number of rows and columns
-        void resize(size_t row_count, size_t col_count)
+        static bool checked_mul(size_t lhs, size_t rhs, size_t &out)
         {
+            if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs)
+                return false;
+
+            out = lhs * rhs;
+            return true;
+        }
+
+        static bool checked_add(size_t lhs, size_t rhs, size_t &out)
+        {
+            if (lhs > std::numeric_limits<size_t>::max() - rhs)
+                return false;
+
+            out = lhs + rhs;
+            return true;
+        }
+
+        // resize the bitmask matrix to the specified number of rows and columns
+        bool resize(size_t row_count, size_t col_count)
+        {
+            size_t bit_count = 0;
+            size_t rounded_bit_count = 0;
+            if (!checked_mul(row_count, col_count, bit_count) ||
+                !checked_add(bit_count, 63, rounded_bit_count))
+            {
+                clear();
+                return false;
+            }
+
             rows = row_count;
             cols = col_count;
-            words.assign((rows * cols + 63) / 64, 0);
+            words.assign(rounded_bit_count / 64, 0);
+            return true;
         }
 
         // clear the bitmask matrix, setting all bits to 0
@@ -212,6 +240,14 @@ namespace ggml::gemmini::quants::act::exsia
             return state_;
         }
     };
+
+    bool dequantize_activation(
+        float *dst,
+        size_t dst_row_stride,
+        size_t dst_col_stride,
+        size_t rows,
+        size_t cols,
+        const ggml_gemmini_args_t &args);
 
     void dequantize(
         const ggml_gemmini_args_t &args,

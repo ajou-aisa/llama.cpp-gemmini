@@ -1,6 +1,6 @@
 #pragma once
 
-#include "dec_types.hpp"
+#include "../act/types.hpp"
 
 #include <cstddef>
 #include <vector>
@@ -11,8 +11,6 @@ namespace ggml::gemmini::quants::dec
 {
 struct ActivationDECConfig
 {
-    bool fuse_apply = false;
-    bool unroll8 = true;
     bool record_stats = false;
     const char *layer = "";
 };
@@ -28,8 +26,7 @@ struct ActivationDECResult
 ActivationDECResult compensate_activation_dec(
     const std::vector<QactOutlier> &outliers,
     ggml_gemmini_args_t &args,
-    const ActivationDECConfig &cfg,
-    ActivationDECScratch *scratch = nullptr);
+    const ActivationDECConfig &cfg);
 
 bool should_apply_dec(const ggml_gemmini_args_t &args);
 
