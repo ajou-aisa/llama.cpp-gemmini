@@ -1,34 +1,24 @@
 // ggml-gemmini/ggml-gemmini-args.h
 #pragma once
 
-#include <algorithm>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
 #include <vector>
-#include <limits>
 
-#include <orca/types/layer.hpp>
+#include "quants/act/meta.hpp"
+#include "quants/act/types.hpp"
 
-struct ggml_gemmini_qact_outlier
-{
-    int row = 0;       // activation row index (i)
-    int col = 0;       // activation channel index (k)
-    float original = 0.f;
-    float saturated = 0.f;
-};
+namespace act = ggml::gemmini::quants::act;
 
-enum ggml_gemmini_group_scope_t : uint8_t {
-    GGML_GEMMINI_GROUP_BLOCK = 0,
-    GGML_GEMMINI_GROUP_TILE = 1,
-    GGML_GEMMINI_GROUP_ROW = 2,
-    GGML_GEMMINI_GROUP_TENSOR = 3,
-};
+using ggml_gemmini_qact_outlier = act::ggml_gemmini_qact_outlier;
 
-#include "ggml.h"
-#include "ggml-quants.h"
+namespace ggml::gemmini::types {
+enum class LayerType : uint8_t;
+}
+
+#include <ggml.h>
 #ifndef GGML_COMMON_DECL
 #define GGML_GEMMINI_ARGS_DEFINE_GGML_COMMON
 #define GGML_COMMON_DECL_CPP
@@ -38,7 +28,7 @@ enum ggml_gemmini_group_scope_t : uint8_t {
 #undef GGML_COMMON_DECL_CPP
 #undef GGML_GEMMINI_ARGS_DEFINE_GGML_COMMON
 #endif
-#include "include/gemmini_params.h"
+#include <gemmini_params.h>
 
 // Forward declaration to avoid including full gemmini.h (breaks include cycles)
 enum tiled_matmul_type_t : int;
@@ -79,9 +69,7 @@ typedef struct ggml_gemmini_args_t {
     bool low_D = false;
 
     // activation quantization metadata
-    int16_t activation_e_t = std::numeric_limits<int16_t>::min();
-    int16_t activation_m = 0;
-    std::vector<ggml_gemmini_qact_outlier> activation_outliers; // per-activation saturation records
+    act::Meta act_quant{};
 
     //for weight checking   
     uint8_t weightA = 0;
@@ -89,6 +77,19 @@ typedef struct ggml_gemmini_args_t {
 
     // metadata extracted from Q8_0 tensors
     struct unpacked_weight {
+        // Q8_0_R path (default): row-wise double-quantized planar weights
+        std::vector<int8_t> q_qs;          // [logical_rows * K] dense int8 weights
+        std::vector<uint8_t> c_b;         // [logical_rows][blocks_per_row]
+        std::vector<float> s_rf;           // [logical_rows]
+        std::vector<uint16_t> R;            // [logical_rows]
+
+        // Stripe-wise scale metadata (stripe_J logical output columns per shared stripe)
+        std::vector<float> s_rf_stripe;      // [num_stripes_J] per-stripe float scale
+        std::vector<uint16_t> R_stripe;      // [num_stripes_J] per-stripe offset
+        size_t stripe_J = 0;                 // producer stripe width used for unpacked stripe metadata (0 or 1 = row-wise)
+        size_t logical_stripe_J = 1;         // active cache contract width on the logical J axis (row-wise = 1)
+
+        // Legacy Q8_0 path (preserved, not used by default)
         std::vector<int8_t> q;
         std::vector<float> scales; // [logical_rows][blocks_K] row-major
         const block_q8_0 *blocks = nullptr;
@@ -102,7 +103,7 @@ typedef struct ggml_gemmini_args_t {
         size_t blocks_K = 0;
         size_t blocks_J = 0;     // logical rows (J * Z * W) for scale rows
         size_t blocks_I = 0;     // legacy alias for logical rows (keep for ABI)
-        uint32_t block_size_k = QK8_0;
+        uint32_t block_size_k = GGML_GEMMINI_BLOCK_SIZE;
         size_t stride = 0;
         bool transpose_b = true;
 
@@ -111,33 +112,39 @@ typedef struct ggml_gemmini_args_t {
                 int64_t j,
                 int64_t z,
                 int64_t w,
-                size_t stride_elems,
+                size_t /*stride_elems*/,
                 size_t blocks_k,
                 size_t logical_cols_,
-                bool transpose_b_layout) const {
-            if (blocks != base) {
+                bool /*transpose_b_layout*/,
+                size_t logical_stripe_J_ = 1,
+                size_t stripe_J_ = 0) const {
+            if (blocks != base)
                 return false;
-            }
-            if (dim_k != k || dim_j != j || dim_z != z || dim_w != w) {
+            if (dim_k != k || dim_j != j || dim_z != z || dim_w != w)
                 return false;
-            }
-            if (stride != stride_elems) {
+            if (blocks_K != blocks_k || blocks_J != logical_cols_)
                 return false;
-            }
-            if (blocks_K != blocks_k || blocks_J != logical_cols_) {
+            if (block_size_k != QK8_0 || logical_cols != logical_cols_)
                 return false;
-            }
-            if (block_size_k != QK8_0 || logical_cols != logical_cols_) {
+            // Q8_0_R planar validity check
+            if (q_qs.size() != logical_cols_ * static_cast<size_t>(k))
                 return false;
-            }
-            if (transpose_b != transpose_b_layout) {
+            if (c_b.size() != blocks_k * logical_cols_)
                 return false;
-            }
-            if (q.size() != static_cast<size_t>(k) * logical_cols_) {
+            if (s_rf.size() != logical_cols_)
                 return false;
-            }
-            if (scales.size() != blocks_k * logical_cols_) {
+            if (R.size() != logical_cols_)
                 return false;
+            if (logical_stripe_J != logical_stripe_J_)
+                return false;
+            if (stripe_J != stripe_J_)
+                return false;
+            if (stripe_J_ > 1) {
+                const size_t num_stripes = (logical_cols_ + stripe_J_ - 1) / stripe_J_;
+                if (s_rf_stripe.size() != num_stripes)
+                    return false;
+                if (R_stripe.size() != num_stripes)
+                    return false;
             }
             return true;
         }
@@ -146,48 +153,43 @@ typedef struct ggml_gemmini_args_t {
     const block_q8_0 *B_blocks = nullptr;
     const float *B_scales = nullptr; // [blocks_J][blocks_K] row-major (row = J*Z*W)
 
+    // Q8_0_R weight fields (default path, no mode flag needed)
+    const uint8_t  *c_b = nullptr;       // [J * blocks_per_row] per-block effective code
+    const float    *s_rf = nullptr;       // [J] per-row float scale
+    const uint16_t *R = nullptr;           // [J] per-row offset
+    size_t blocks_per_row = 0;            // K / 32
+
+    size_t stripe_J = 0;                  // logical output-column element count per shared scale stripe
+    const float *s_rf_stripe = nullptr;   // [num_stripes_J] per-stripe float scale
+    const uint16_t *R_stripe = nullptr;    // [num_stripes_J] per-stripe offset
+
     size_t blocks_K = 0;      // number of Q8_0 blocks along the K dimension
     size_t blocks_J = 0;      // number of logical rows covered by scale table (J * Z * W)
     size_t blocks_I = 0;      // legacy alias for rows (kept for ABI)
 
-    // quant-group metadata resolved by orca quant logic
-    ggml_gemmini_group_scope_t group_scope = GGML_GEMMINI_GROUP_BLOCK;
-    size_t effective_group_size = 0;           // group element count (scope-aware)
-    size_t effective_group_size_k = 0;         // K-axis group span used for Gemmini split
-    size_t effective_group_size_aligned = 0;   // DIM(16)-aligned K-axis group span
+    uint32_t block_size_k = GGML_GEMMINI_BLOCK_SIZE;
 
-    size_t gemmini_call_k_logical = 0;         // logical K used by latest Gemmini call
-    size_t gemmini_call_k_aligned = 0;         // padded K used by latest Gemmini call
-    size_t gemmini_call_tile_k_elems = 0;      // tile_k * DIM used by latest call
+    // output buffer (float, dequantized)
+    float *f_out = nullptr;
+    size_t col_stride_f_out = 0;
+    size_t stride_f_out = 0;
 
-    // Weight block scale granularity (Q8_0 scale table axis).
-    uint32_t block_size_k = QK8_0;
+    // layer/model metadata
+    ggml::gemmini::types::LayerType layer_type{};
+    const char *model_arch = nullptr;
 
-    float scale_out = 1.0f;
+    // Gemmini auto-tiling counts in DIM units (multiply by DIM to get element counts).
+    size_t tile_I = 0;
+    size_t tile_J = 0;
+    size_t tile_K = 0;
 
-    // origin output
-    float* f_out = nullptr;
-    size_t stride_f_out = 0;      // row stride in elements
-    size_t col_stride_f_out = 0;  // column stride in elements
-
-    // logging & profiling helpers
-    orca::types::LayerType layer_type = orca::types::LayerType::unknown;
-    const char *model_arch = "";
-    const char *tag = "";
-    bool measure_cycles = true;
-
-    bool ethos_override_enabled = false;
-    int ethos_q = 0;
-    int ethos_delta = 0;
-    bool ethos_l2_enabled = false;
-    int ethos_l2_c = 1;
-    int ethos_l2_d = 1;
+    inline size_t stripe_J_or_rowwise_elems() const { return stripe_J > 0 ? stripe_J : 1; }
+    inline bool stripe_mode_matches_tile_j(size_t tile_J_elems) const {
+        return stripe_J <= 1 || (tile_J_elems > 0 && stripe_J == tile_J_elems);
+    }
+    // Gemmini call metadata (for debugging/validation)
+    size_t gemmini_call_k_logical = 0;
+    size_t gemmini_call_k_aligned = 0;
+    size_t gemmini_call_tile_k_elems = 0;
 
 } ggml_gemmini_args_t;
-
-// TODO: Consider moving cache management to orca::ggml layer
-inline const block_q8_0 *ggml_gemmini_args_block_base(const ggml_tensor *tensor) {
-    const char *base = (const char *)(tensor->view_src ? tensor->view_src->data : tensor->data);
-    const size_t offs = tensor->view_src ? tensor->view_offs : 0;
-    return reinterpret_cast<const block_q8_0 *>(base + offs);
-}

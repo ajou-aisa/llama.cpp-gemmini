@@ -281,6 +281,8 @@ function(ggml_add_cpu_backend_variant tag_name)
     ggml_add_cpu_backend_variant_impl(${tag_name})
 endfunction()
 
+add_subdirectory(ggml-gemmini-utils)
+
 ggml_add_backend(CPU)
 
 if (GGML_CPU_ALL_VARIANTS)

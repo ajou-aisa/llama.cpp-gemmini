@@ -15,6 +15,14 @@ endif()
 # Add path to modules
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
 
+# Gemmini include path (needed for gemmini_params.h in ggml-gemmini-args.h)
+get_filename_component(GEMMINI_SW_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../RISC-V-DynDNN-gemmini-include" ABSOLUTE)
+if (EXISTS "${GEMMINI_SW_PATH}/gemmini.h" OR EXISTS "${GEMMINI_SW_PATH}/include/gemmini.h")
+    include_directories(${GEMMINI_SW_PATH} ${GEMMINI_SW_PATH}/include)
+else()
+    unset(GEMMINI_SW_PATH)
+endif()
+
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
@@ -161,9 +169,6 @@ if (LLAMA_USE_SYSTEM_GGML)
     add_library(ggml ALIAS ggml::ggml)
 endif()
 
-# ---- Research (AISA) integration ----
-option(LLAMA_WITH_ORCA "Build and link ORCA (research) library" ON)
-
 # Gemmini compile-time switches (source of truth: root cache + build scripts).
 set(GGML_GEMMINI_PRINT_TILE "0" CACHE STRING "Gemmini PRINT_TILE macro (0|1)")
 set_property(CACHE GGML_GEMMINI_PRINT_TILE PROPERTY STRINGS 0 1)
@@ -179,6 +184,52 @@ set(GGML_GEMMINI_WS_DEBUG "0" CACHE STRING "Gemmini WS debug logs (0|1)")
 set_property(CACHE GGML_GEMMINI_WS_DEBUG PROPERTY STRINGS 0 1)
 set(GGML_GEMMINI_DISABLE_WS_REUSE "0" CACHE STRING "Disable WS A/B reuse for debugging (0|1)")
 set_property(CACHE GGML_GEMMINI_DISABLE_WS_REUSE PROPERTY STRINGS 0 1)
+
+# ---------------------------------------------------------------------------
+# Adding a new compile-time option
+# ---------------------------------------------------------------------------
+# 1. Choose a macro name (must match the C++ header, e.g. GGML_GEMMINI_*).
+# 2. Add a set(CACHE ...) + set_property(STRINGS ...) block below.
+# 3. Validate the string input and map it to an integer value.
+# 4. Append the integer to GGML_GEMMINI_COMPILE_DEFS so it reaches #ifdef.
+# 5. In the C++ header add the enum entry, #elif branch, and static_assert.
+# 6. In the dispatch site (e.g. quantize.cpp) add a case / if constexpr branch.
+# ---------------------------------------------------------------------------
+set(GGML_GEMMINI_COMPUTE_TYPE "INT" CACHE STRING "Gemmini compute type: INT, FLOAT, or DEQUANT_FP_TEST")
+set_property(CACHE GGML_GEMMINI_COMPUTE_TYPE PROPERTY STRINGS INT FLOAT DEQUANT_FP_TEST)
+string(TOUPPER "${GGML_GEMMINI_COMPUTE_TYPE}" _GGML_GEMMINI_COMPUTE_TYPE_UPPER)
+if(NOT _GGML_GEMMINI_COMPUTE_TYPE_UPPER STREQUAL "INT" AND
+   NOT _GGML_GEMMINI_COMPUTE_TYPE_UPPER STREQUAL "FLOAT" AND
+   NOT _GGML_GEMMINI_COMPUTE_TYPE_UPPER STREQUAL "DEQUANT_FP_TEST")
+    message(FATAL_ERROR "GGML_GEMMINI_COMPUTE_TYPE must be one of: INT, FLOAT, DEQUANT_FP_TEST")
+endif()
+if(_GGML_GEMMINI_COMPUTE_TYPE_UPPER STREQUAL "INT")
+    set(_GGML_GEMMINI_COMPUTE_TYPE_VALUE 0)
+elseif(_GGML_GEMMINI_COMPUTE_TYPE_UPPER STREQUAL "FLOAT")
+    set(_GGML_GEMMINI_COMPUTE_TYPE_VALUE 1)
+else()
+    set(_GGML_GEMMINI_COMPUTE_TYPE_VALUE 2)
+endif()
+
+set(GGML_GEMMINI_ACTIVATION_QUANT "EXSIA" CACHE STRING "Gemmini activation quant type")
+set_property(CACHE GGML_GEMMINI_ACTIVATION_QUANT PROPERTY STRINGS EXSIA TENSOR)
+string(TOUPPER "${GGML_GEMMINI_ACTIVATION_QUANT}" _GGML_GEMMINI_ACTIVATION_QUANT_UPPER)
+if(NOT _GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "EXSIA" AND NOT _GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "TENSOR")
+    message(FATAL_ERROR "GGML_GEMMINI_ACTIVATION_QUANT must be EXSIA or TENSOR, got '${GGML_GEMMINI_ACTIVATION_QUANT}'")
+endif()
+if(_GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "EXSIA")
+    set(_GGML_GEMMINI_ACTIVATION_QUANT_VALUE 0)
+else()
+    set(_GGML_GEMMINI_ACTIVATION_QUANT_VALUE 1)
+endif()
+
+set(GGML_GEMMINI_BLOCK_SIZE "32" CACHE STRING "Gemmini block size")
+if (_GGML_GEMMINI_COMPUTE_TYPE_UPPER STREQUAL "INT" AND
+        _GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "EXSIA" AND
+        NOT GGML_GEMMINI_BLOCK_SIZE EQUAL 32)
+    message(FATAL_ERROR "GGML_GEMMINI_BLOCK_SIZE must be 32 for INT + EXSIA Q8_0_R weight format, got '${GGML_GEMMINI_BLOCK_SIZE}'")
+endif()
+set(_GGML_GEMMINI_BLOCK_SIZE_VALUE "${GGML_GEMMINI_BLOCK_SIZE}")
 
 foreach(_GGML_GEMMINI_BOOL_VAR IN ITEMS
         GGML_GEMMINI_PRINT_TILE
@@ -208,19 +259,10 @@ set(GGML_GEMMINI_COMPILE_DEFS
     TRANSPOSE_B=${GGML_GEMMINI_TRANSPOSE_B}
     GEMMINI_WS_DEBUG=${GGML_GEMMINI_WS_DEBUG}
     GEMMINI_DISABLE_WS_REUSE=${GGML_GEMMINI_DISABLE_WS_REUSE}
+    GGML_GEMMINI_COMPUTE_TYPE=${_GGML_GEMMINI_COMPUTE_TYPE_VALUE}
+    GGML_GEMMINI_ACTIVATION_QUANT=${_GGML_GEMMINI_ACTIVATION_QUANT_VALUE}
+    GGML_GEMMINI_BLOCK_SIZE=${_GGML_GEMMINI_BLOCK_SIZE_VALUE}
 )
-
-if (LLAMA_WITH_ORCA)
-    # llama.cpp-gemmini 와 orca(연구)가 모두 workspace/ 디렉터리라는 가정
-    get_filename_component(ORCA_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../orca" ABSOLUTE)
-
-    if (EXISTS "${ORCA_SRC_DIR}/CMakeLists.txt")
-        # 외부 소스 디렉터리를 add_subdirectory 할 때는 build dir를 반드시 따로 준다
-        add_subdirectory("${ORCA_SRC_DIR}" "${CMAKE_BINARY_DIR}/orca-build")
-    else()
-        message(FATAL_ERROR "ORCA repo not found: ${ORCA_SRC_DIR}")
-    endif()
-endif()
 
 # set log option
 set(LOG_DEBUG "1" CACHE STRING "Enable debug logs (0|1)")
@@ -234,50 +276,24 @@ set_property(CACHE LOG_DUMP_SCALE PROPERTY STRINGS 0 1)
 set(ERROR_COMPENSATION "0" CACHE STRING "Enable activation error compensation (0|1)")
 set_property(CACHE ERROR_COMPENSATION PROPERTY STRINGS 0 1)
 
-set(_ggml_orca_defs
+set(GGML_GEMMINI_RUNTIME_COMPILE_DEFS
     LOG_DEBUG=${LOG_DEBUG}
     LOG_CYCLE=${LOG_CYCLE}
     LOG_DUMP=${LOG_DUMP}
     LOG_DUMP_SCALE=${LOG_DUMP_SCALE}
     ERROR_COMPENSATION=${ERROR_COMPENSATION}
     GEMMINI_VERIFY_DEQ=1
+    GGML_GEMMINI_COMPUTE_TYPE=${_GGML_GEMMINI_COMPUTE_TYPE_VALUE}
+    GGML_GEMMINI_ACTIVATION_QUANT=${_GGML_GEMMINI_ACTIVATION_QUANT_VALUE}
 )
 
-# ---- ggml build (must come AFTER orca) ----
+list(APPEND GGML_GEMMINI_COMPILE_DEFS ${GGML_GEMMINI_RUNTIME_COMPILE_DEFS})
+set(GGML_GEMMINI_UTILS_COMPILE_DEFS ${GGML_GEMMINI_RUNTIME_COMPILE_DEFS})
+
+# ---- ggml build ----
 if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     add_subdirectory(ggml)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
-endif()
-
-# Apply the same logging macros to ORCA itself so its compiled code matches ggml consumers
-if (TARGET orca-log)
-    target_compile_definitions(orca-log PUBLIC ${_ggml_orca_defs})
-endif()
-if (TARGET orca-capi)
-    target_compile_definitions(orca-capi PRIVATE ${_ggml_orca_defs})
-endif()
-if (TARGET orca-dump-scale)
-    target_compile_definitions(orca-dump-scale PRIVATE ${_ggml_orca_defs})
-endif()
-if (TARGET orca-ggml)
-    target_compile_definitions(orca-ggml PRIVATE ${_ggml_orca_defs})
-endif()
-
-# ---- Link ORCA to ggml targets that include <orca/...> ----
-if (LLAMA_WITH_ORCA)
-    if (TARGET ggml-cpu AND TARGET orca)
-        # ggml-cpu는 C API(log/layer)만 필요하므로 ggml 의존이 없는 orca-capi에 연결
-        target_link_libraries(ggml-cpu PUBLIC orca-capi)
-
-        # C 타겟이지만 C++ 라이브러리를 링크하므로 링크 단계는 C++로
-        set_target_properties(ggml-cpu PROPERTIES LINKER_LANGUAGE CXX)
-    endif()
-
-    # gemmini도 orca를 쓰면 동일하게
-    if (TARGET ggml-gemmini AND TARGET orca)
-        target_link_libraries(ggml-gemmini PUBLIC orca-capi)
-        # ggml-gemmini는 C++이므로 LINKER_LANGUAGE는 보통 불필요
-    endif()
 endif()
 
 #
