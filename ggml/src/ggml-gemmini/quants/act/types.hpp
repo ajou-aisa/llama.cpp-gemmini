@@ -1,8 +1,12 @@
 #pragma once
 #include <cstdint>
 
+#ifndef GGML_GEMMINI_BLOCK_SIZE
+#define GGML_GEMMINI_BLOCK_SIZE 32
+#endif
+
 #ifndef BLOCK_SIZE
-#define BLOCK_SIZE 32
+#define BLOCK_SIZE GGML_GEMMINI_BLOCK_SIZE
 #endif
 
 namespace ggml::gemmini::quants::act
