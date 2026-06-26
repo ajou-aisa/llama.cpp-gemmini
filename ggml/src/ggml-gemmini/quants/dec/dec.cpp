@@ -69,12 +69,27 @@ namespace ggml::gemmini::quants::dec { namespace
         size_t rows = 0;
         size_t cols = 0;
         size_t block_size = 0;
+        float scalar = 1.0f;
+        bool scalar_mode = false;
         bool supported = true;
     };
 
     WeightScaleInfo build_weight_scale_info(const ggml_gemmini_args_t &args)
     {
         WeightScaleInfo result{};
+        if (args.weight_i8_scale_active)
+        {
+            if (!args.B)
+                return result;
+
+            result.rows = args.J;
+            result.cols = 1;
+            result.block_size = 1;
+            result.scalar = args.weight_scale;
+            result.scalar_mode = true;
+            return result;
+        }
+
         if (is_q80_r_weight_args(args))
         {
             static thread_local std::vector<float> weight_scales;
@@ -141,6 +156,8 @@ namespace ggml::gemmini::quants::dec { namespace
         size_t scale_rows,
         size_t blocks_k,
         size_t block_size_k,
+        bool scalar_mode,
+        float scalar_weight_scale,
         float *Wk_f)
     {
         const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
@@ -164,7 +181,12 @@ namespace ggml::gemmini::quants::dec { namespace
                 Wk_f[j] = static_cast<float>(weights[j * weight_stride + k]);
         }
 
-        if (weight_scales && block_size_k > 0 && blocks_k > 0)
+        if (scalar_mode)
+        {
+            for (size_t j = 0; j < J; ++j)
+                Wk_f[j] *= scalar_weight_scale;
+        }
+        else if (weight_scales && block_size_k > 0 && blocks_k > 0)
         {
             const size_t blk = k / block_size_k;
 
@@ -437,6 +459,7 @@ ActivationDECResult compensate_activation_dec(
     start = ggml::gemmini::cycle::read();
 
     const bool use_jmajor_blocked =
+        !weight_scales.scalar_mode &&
         weight_layout == WeightLayout::JxK_ColMajor &&
         weight_stride >= K;
 
@@ -471,6 +494,8 @@ ActivationDECResult compensate_activation_dec(
                     weight_scales.rows,
                     weight_scales.cols,
                     weight_scales.block_size,
+                    weight_scales.scalar_mode,
+                    weight_scales.scalar,
                     scr.Wk_f.data());
 
                 accumulate_single_row_delta_to_ycom(
@@ -513,6 +538,8 @@ ActivationDECResult compensate_activation_dec(
                 weight_scales.rows,
                 weight_scales.cols,
                 weight_scales.block_size,
+                weight_scales.scalar_mode,
+                weight_scales.scalar,
                 scr.Wk_f.data());
 
             accumulate_to_ycom(

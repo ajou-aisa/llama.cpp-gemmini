@@ -18,6 +18,8 @@ struct WeightScaleInfo
     size_t rows = 0;
     size_t cols = 0;
     size_t block_size = 0;
+    float scalar = 1.0f;
+    bool scalar_mode = false;
     bool supported = true;
 };
 
@@ -44,6 +46,18 @@ bool checked_mul_size(size_t lhs, size_t rhs, size_t &out)
 WeightScaleInfo build_weight_scale_info(const ggml_gemmini_args_t &args)
 {
     WeightScaleInfo result{};
+    if (args.weight_i8_scale_active) {
+        if (!args.B)
+            return result;
+
+        result.rows = args.J;
+        result.cols = 1;
+        result.block_size = 1;
+        result.scalar = args.weight_scale;
+        result.scalar_mode = true;
+        return result;
+    }
+
     if (quants::dec::is_q80_r_weight_args(args)) {
         auto &scratch = get_q80_r_output_dequant_scratch();
         const size_t rows = args.blocks_J ? args.blocks_J : args.J;
@@ -138,19 +152,24 @@ void dequantize(
         return;
 
     const WeightScaleInfo scales = build_weight_scale_info(args);
-    if (!scales.supported || !scales.data || scales.rows < args.J ||
-        scales.cols == 0 || scales.block_size == 0) {
+    if (!scales.supported || scales.rows < args.J) {
         return;
     }
 
-    size_t k_end = 0;
-    if (!checked_k_end(k_offset, block_k, k_end))
-        return;
+    size_t first_block = 0;
+    if (!scales.scalar_mode) {
+        if (!scales.data || scales.cols == 0 || scales.block_size == 0)
+            return;
 
-    const size_t first_block = k_offset / scales.block_size;
-    const size_t last_block = k_end / scales.block_size;
-    if (first_block != last_block || first_block >= scales.cols)
-        return;
+        size_t k_end = 0;
+        if (!checked_k_end(k_offset, block_k, k_end))
+            return;
+
+        first_block = k_offset / scales.block_size;
+        const size_t last_block = k_end / scales.block_size;
+        if (first_block != last_block || first_block >= scales.cols)
+            return;
+    }
 
     const size_t row_stride = args.stride_f_out ? args.stride_f_out : args.J;
     const size_t col_stride = args.col_stride_f_out ? args.col_stride_f_out : 1;
@@ -165,7 +184,9 @@ void dequantize(
             if (!output_offset(i, j, row_stride, col_stride, dst_offset))
                 return;
 
-            const float weight_scale = scales.data[j * scales.cols + first_block];
+            const float weight_scale = scales.scalar_mode ?
+                scales.scalar :
+                scales.data[j * scales.cols + first_block];
             const double scaled = static_cast<double>(row_acc32[j]) *
                                   static_cast<double>(weight_scale) *
                                   static_cast<double>(activation_scale);

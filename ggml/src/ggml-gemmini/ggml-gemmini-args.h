@@ -153,6 +153,9 @@ typedef struct ggml_gemmini_args_t {
     const block_q8_0 *B_blocks = nullptr;
     const float *B_scales = nullptr; // [blocks_J][blocks_K] row-major (row = J*Z*W)
 
+    bool weight_i8_scale_active = false;
+    float weight_scale = 1.0f;
+
     // Q8_0_R weight fields (default path, no mode flag needed)
     const uint8_t  *c_b = nullptr;       // [J * blocks_per_row] per-block effective code
     const float    *s_rf = nullptr;       // [J] per-row float scale

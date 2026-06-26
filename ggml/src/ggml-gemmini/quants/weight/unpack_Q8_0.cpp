@@ -159,9 +159,6 @@ bool unpack_q8_0(
     if (!src || src->type != GGML_TYPE_Q8_0 || !dst_jxk || !dst_scales)
         return false;
 
-#if GGML_GEMMINI_COMPUTE_TYPE == 0 && GGML_GEMMINI_ACTIVATION_QUANT == 0
-    static_assert(GGML_GEMMINI_BLOCK_SIZE == 32, "GGML_GEMMINI_BLOCK_SIZE must be 32 for INT + EXSIA Q8_0_R weight format");
-#endif
     if (block_size != 32)
         return false;
 
