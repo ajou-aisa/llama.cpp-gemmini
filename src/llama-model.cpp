@@ -1710,7 +1710,20 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     return t;
                 }
             }
-            return ml.create_tensor(ctx, tn, ne, flags);
+            ggml_tensor * tensor = ml.create_tensor(ctx, tn, ne, flags);
+            if (tensor != nullptr && tensor->type == GGML_TYPE_I8) {
+                const std::string scale_name = tn.str() + ".scale";
+                const ggml_tensor * scale_meta = ml.get_tensor_meta(scale_name.c_str());
+                if (scale_meta != nullptr) {
+                    if (scale_meta->type != GGML_TYPE_F32 || ggml_nelements(scale_meta) != 1) {
+                        throw std::runtime_error(format("tensor '%s' has invalid I8 scale sidecar", scale_name.c_str()));
+                    }
+                    ggml_tensor * scale = ggml_dup_tensor(ctx, scale_meta);
+                    ggml_set_name(scale, scale_name.c_str());
+                    tensor->src[GGML_MAX_SRC - 1] = scale;
+                }
+            }
+            return tensor;
         };
 
         layers.resize(n_layer);

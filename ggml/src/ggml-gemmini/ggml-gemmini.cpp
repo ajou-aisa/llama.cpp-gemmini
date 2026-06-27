@@ -493,10 +493,17 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     //                  layer, (void *)args.f_out, args.stride_f_out, args.col_stride_f_out);
 
     /* __ 5. Gemmini 호출 __ */
-    args.tiled_matmul_type = CPU;
     if constexpr (ggml::gemmini::config::CURRENT_COMPUTE_TYPE == ggml::gemmini::config::ComputeType::INT) {
         if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA) {
-            ggml::gemmini::tiled_matmul_auto_im2p(&args);
+            if (args.weight_i8_scale_active) {
+                ggml::gemmini::log::debug(layer,
+                    "[exsia] route dense_i8 weight_scale=%.9f dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
+                    static_cast<double>(args.weight_scale), args.I, args.J, args.K, args.sB,
+                    static_cast<int>(args.tiled_matmul_type));
+                ggml::gemmini::tiled_matmul_auto_exsia(&args);
+            } else {
+                ggml::gemmini::tiled_matmul_auto_im2p(&args);
+            }
         } else if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TENSOR) {
             ggml::gemmini::tiled_matmul_auto_tensor(&args);
         }

@@ -19,7 +19,7 @@ endif()
 
 option(GGML_GEMMINI_FORCE_GGML_OUTPUT "Force Gemmini backend to produce outputs via GGML CPU path" OFF)
 option(GGML_GEMMINI_FORCE_GGML_ALL "Force all Gemmini layers to GGML CPU fallback when forcing output" OFF)
-option(GGML_GEMMINI_ENABLE_OPENMP "Enable OpenMP for Gemmini DEC kernels" OFF)
+option(GGML_GEMMINI_ENABLE_OPENMP "Enable OpenMP for Gemmini CPU-side kernels" OFF)
 
 set(GGML_GEMMINI_FORCE_GGML_OUTPUT_DEF $<IF:$<BOOL:${GGML_GEMMINI_FORCE_GGML_OUTPUT}>,1,0>)
 set(GGML_GEMMINI_FORCE_GGML_ALL_DEF    $<IF:$<BOOL:${GGML_GEMMINI_FORCE_GGML_ALL}>,1,0>)

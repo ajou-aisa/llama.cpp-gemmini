@@ -11,6 +11,11 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
+static bool llama_tensor_name_is_weight_sidecar(const std::string & name) {
+    static const std::string suffix = ".weight.scale";
+    return name.size() >= suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -812,8 +817,16 @@ struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_conte
 }
 
 void llama_model_loader::done_getting_tensors() const {
-    if (n_created != n_tensors) {
-        throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
+    int n_sidecar_tensors = 0;
+    for (const auto & it : weights_map) {
+        if (llama_tensor_name_is_weight_sidecar(it.first)) {
+            n_sidecar_tensors++;
+        }
+    }
+
+    const int n_expected = n_tensors - n_sidecar_tensors;
+    if (n_created != n_expected) {
+        throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_expected, n_created));
     }
 }
 
