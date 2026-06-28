@@ -103,8 +103,8 @@ namespace ggml::gemmini::quants::act::exsia
     {
         size_t blk_size = 0;
         std::vector<int16_t> e;
-        int16_t e1 = std::numeric_limits<int16_t>::min();      // top-1 exponent of a block
-        int16_t e2 = std::numeric_limits<int16_t>::min();      // top-2 exponent of a block
+        int16_t e1 = std::numeric_limits<int16_t>::min();      // top-1 distinct exponent of a block
+        int16_t e2 = std::numeric_limits<int16_t>::min();      // top-2 distinct exponent of a block
         int16_t e_b = std::numeric_limits<int16_t>::min();     // final max exponent of a block
         int16_t theta_b = std::numeric_limits<int16_t>::min(); // final scale exponent of a block
 
@@ -118,8 +118,8 @@ namespace ggml::gemmini::quants::act::exsia
         size_t blk_num = 0;         // number of blocks in a stripe
         size_t num_real_blocks = 0; // number of real blocks in a stripe (excluding padding blocks)
 
-        int16_t e1 = std::numeric_limits<int16_t>::min();  // top-1 exponent among all blocks in a stripe
-        int16_t e2 = std::numeric_limits<int16_t>::min();  // top-2 exponent among all blocks in a stripe
+        int16_t e1 = std::numeric_limits<int16_t>::min();  // top-1 distinct exponent among all blocks in a stripe
+        int16_t e2 = std::numeric_limits<int16_t>::min();  // top-2 distinct exponent among all blocks in a stripe
         int16_t e_s = std::numeric_limits<int16_t>::min(); // final scale exponent of a stripe
         bool promote_top_block = false;                    // set by StripeFolding when e2 != -inf; promotes top-1 exponent blocks to outliers
 
@@ -135,7 +135,7 @@ namespace ggml::gemmini::quants::act::exsia
         std::vector<StripeState> stripe;     // vector of stripe states for the entire matrix
         std::vector<float> x_f32;            // original activations, padded to I * K_padded
         std::vector<int32_t> q_wide;         // Q_X_i32 shared by local wide-quantization and stripe folding
-        std::vector<int16_t> block_exp; // E_s[r, b / B] shared block max exponents
+        std::vector<int16_t> block_exp;      // E_s[r, b / B] shared block max exponents
         std::vector<int32_t> residual;       // shared residual buffer for stripe folding, same shape as q_wide (I * K_padded)
     };
 
@@ -144,15 +144,15 @@ namespace ggml::gemmini::quants::act::exsia
     public:
         int16_t unbiased_exp(const float &x);
         void scan_top2_exp(const std::vector<float> &x,
-                           BlockState &blk); // scan top-2 exponents for a block and store them in the block state
+                           BlockState &blk); // scan top-2 distinct exponents for a block and store them in the block state
 
-        // scan top-2 exponents for a block with a bitmask, only considering unmasked positions
+        // scan top-2 distinct exponents for a block with a bitmask, only considering unmasked positions
         void update_block_top2_exp(const BitMask &mask,
                                    size_t row,
                                    size_t blk_idx,
                                    BlockState &blk);
 
-        // update the stripe-level top-2 exponents based on a block's max exponent, and determine whether to promote the block exponent to the stripe level
+        // update the stripe-level top-2 distinct exponents based on a block's max exponent
         void update_stripe_top2_exp(StripeState &stripe, int16_t e_b);
     };
 
@@ -171,7 +171,7 @@ namespace ggml::gemmini::quants::act::exsia
     {
     public:
         std::vector<int32_t> quantize_block(const std::vector<float> &x, int16_t theta_b); //
-        std::tuple<std::vector<int32_t>, int64_t, int64_t>
+        std::tuple<std::vector<int32_t>, __int128_t, __int128_t>
         quantize_block(const std::vector<float> &x,
                        size_t row,
                        size_t col,

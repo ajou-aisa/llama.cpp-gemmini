@@ -45,6 +45,41 @@ namespace ggml::gemmini::quants::act::exsia
             out = (adjusted / multiple) * multiple;
             return true;
         }
+
+        static inline int16_t exp_to_theta(int16_t e, int16_t rho)
+        {
+            const int16_t neg_inf = std::numeric_limits<int16_t>::min();
+
+            if (e == neg_inf)
+                return neg_inf;
+
+            return static_cast<int16_t>(static_cast<int>(e) - static_cast<int>(rho));
+        }
+
+        static inline int32_t quantize_to_i32(float x, int16_t theta)
+        {
+            const int16_t neg_inf = std::numeric_limits<int16_t>::min();
+
+            if (theta == neg_inf || !std::isfinite(x))
+                return 0;
+
+            const double scaled = std::ldexp(static_cast<double>(x), -static_cast<int>(theta));
+
+            if (!std::isfinite(scaled))
+                return scaled < 0.0
+                           ? std::numeric_limits<int32_t>::min()
+                           : std::numeric_limits<int32_t>::max();
+
+            const double min_i32 = static_cast<double>(std::numeric_limits<int32_t>::min());
+            const double max_i32 = static_cast<double>(std::numeric_limits<int32_t>::max());
+
+            if (scaled <= min_i32)
+                return std::numeric_limits<int32_t>::min();
+            if (scaled >= max_i32)
+                return std::numeric_limits<int32_t>::max();
+
+            return static_cast<int32_t>(std::lrint(scaled));
+        }
     }
 
     int16_t ExpScanner::unbiased_exp(const float &x)
@@ -140,12 +175,12 @@ namespace ggml::gemmini::quants::act::exsia
         }
 
         for (auto &e : x)
-            q.push_back(static_cast<int32_t>(std::lrint(std::ldexp(e, -theta_b))));
+            q.push_back(quantize_to_i32(e, theta_b));
 
         return q;
     }
 
-    std::tuple<std::vector<int32_t>, int64_t, int64_t>
+    std::tuple<std::vector<int32_t>, __int128_t, __int128_t>
     WideQuantizer::quantize_block(const std::vector<float> &x,
                                   size_t row,
                                   size_t col_offset,
@@ -163,8 +198,8 @@ namespace ggml::gemmini::quants::act::exsia
         for (size_t i = 0; i < n; ++i)
         {
             size_t col = col_offset + i;
-            int32_t tmp = null_theta ? 0 : std::lrint(std::ldexp(x[i], -theta_b));
-            q.push_back(static_cast<int32_t>(tmp));
+            const int32_t tmp = null_theta ? 0 : quantize_to_i32(x[i], theta_b);
+            q.push_back(tmp);
             if (!use_mask || !mask.is_set(row, col))
             {
                 S += tmp;
@@ -205,16 +240,16 @@ namespace ggml::gemmini::quants::act::exsia
         GGML_ASSERT(x.size() == blk_size);
         BlockState blk;
 
-        // Step 1: scan block exponents and identify top-2 exponent buckets.
+        // Step 1: scan block exponents and identify top-2 distinct exponent buckets.
         unit_exp_.scan_top2_exp(x, blk);
 
-        // Step 2: promote elements in the top-1 exponent bucket into the mask.
+        // Step 2: promote the top-1 exponent bucket only when a lower bucket exists.
         const int16_t neg_inf = std::numeric_limits<int16_t>::min();
         BitMask top1_exp_mask;
 
         if (!top1_exp_mask.resize(1, blk_size))
             return false;
-        bool has_second_bucket = (blk.e2 != neg_inf);
+        const bool has_second_bucket = (blk.e2 != neg_inf);
 
         if (has_second_bucket)
         {
@@ -230,9 +265,9 @@ namespace ggml::gemmini::quants::act::exsia
         GGML_ASSERT(stripe.outlier_mask.cols >= state.K_padded);
         unit_outlier_.mark_outlier(stripe, row, blk_idx, blk_size, top1_exp_mask);
 
-        // Step 3.1: set a provisional block scale from the second exponent bucket.
-        const int16_t theta_pre = has_second_bucket ? static_cast<int16_t>(blk.e2 - meta.rho)
-                                                    : static_cast<int16_t>(blk.e1 - meta.rho);
+        // Step 3.1: set a provisional block scale from e2, or e1 for a single-bucket block.
+        const int16_t e_pre = has_second_bucket ? blk.e2 : blk.e1;
+        const int16_t theta_pre = exp_to_theta(e_pre, meta.rho);
 
         // Step 3.2: wide-quantize remaining inliers and collect local statistics.
         auto [q_tmp, S, SS] = unit_quant_.quantize_block(blk.x,
@@ -272,7 +307,7 @@ namespace ggml::gemmini::quants::act::exsia
         {
             // Step 4.1: reuse the pre-quantized block if no extra outlier is found.
             blk.e_b = has_second_bucket ? blk.e2 : blk.e1;
-            blk.theta_b = theta_pre;
+            blk.theta_b = exp_to_theta(blk.e_b, meta.rho);
             q_final = std::move(q_tmp);
         }
         else
@@ -281,12 +316,15 @@ namespace ggml::gemmini::quants::act::exsia
             unit_outlier_.mark_outlier(stripe, row, blk_idx, blk_size, int_outlier_mask);
             unit_exp_.update_block_top2_exp(stripe.outlier_mask, row, blk_idx, blk);
 
-            // Step 4.3: re-quantize the block using the updated exponent.
+            // Step 4.3: compute the updated block exponent and scale.
             blk.e_b = blk.e1;
-            blk.theta_b = blk.e_b == neg_inf
-                              ? neg_inf
-                              : static_cast<int16_t>(blk.e_b - meta.rho);
-            q_final = unit_quant_.quantize_block(blk.x, blk.theta_b);
+            blk.theta_b = exp_to_theta(blk.e_b, meta.rho);
+
+            // Step 4.4: re-quantize only if the scale actually changed.
+            if (blk.theta_b == theta_pre)
+                q_final = std::move(q_tmp);
+            else
+                q_final = unit_quant_.quantize_block(blk.x, blk.theta_b);
         }
 
         // Step 5: store the local result for stripe folding.
@@ -313,8 +351,14 @@ namespace ggml::gemmini::quants::act::exsia
     {
         const int16_t neg_inf = std::numeric_limits<int16_t>::min();
 
-        // Step 1: determine stripe exponent from top-2 block exponents.
-        if (stripe.e2 == neg_inf)
+        // Step 1: determine stripe exponent from top-2 distinct block exponents.
+        if (stripe.e1 == neg_inf)
+        {
+            // All-zero stripe. Any finite stripe scale reconstructs zero correctly.
+            stripe.e_s = 0;
+            stripe.promote_top_block = false;
+        }
+        else if (stripe.e2 == neg_inf)
         {
             stripe.e_s = stripe.e1;
             stripe.promote_top_block = false;
@@ -326,9 +370,7 @@ namespace ggml::gemmini::quants::act::exsia
         }
 
         // Step 2: store the per-stripe dequantization exponent.
-        const int16_t theta_s = stripe.e_s == neg_inf
-                                    ? neg_inf
-                                    : static_cast<int16_t>(stripe.e_s - meta.rho);
+        const int16_t theta_s = exp_to_theta(stripe.e_s, meta.rho);
         if (meta.theta.size() <= stripe_idx)
             meta.theta.resize(stripe_idx + 1, std::numeric_limits<int16_t>::min());
         meta.theta[stripe_idx] = theta_s;
@@ -403,7 +445,7 @@ namespace ggml::gemmini::quants::act::exsia
                     state.residual[padded_idx] = residual_i32;
                     residual[padded_idx] = residual_i32;
 
-                    if (outlier)
+                    if (outlier && residual_i32 != 0)
                     {
                         meta.outliers.push_back({
                             static_cast<int>(r),
