@@ -6,6 +6,9 @@ BUILD_DIR=${BUILD_DIR:-build-x86}
 LLAMA_CURL_DEFAULT=${LLAMA_CURL_DEFAULT:-OFF} # disable libcurl requirement on local x86 unless explicitly enabled
 CMAKE_BUILD_TYPE_DEFAULT=${CMAKE_BUILD_TYPE_DEFAULT:-Release} # Debug | Release
 GGML_NATIVE_DEFAULT=${GGML_NATIVE_DEFAULT:-ON} # ON | OFF
+GGML_GEMMINI_ENABLE_OPENMP_DEFAULT=${GGML_GEMMINI_ENABLE_OPENMP:-ON}
+# Runtime Gemmini OpenMP threads: GEMMINI_OPENMP_THREADS=6 ./build-x86/bin/llama-cli ...
+# Per-path overrides: IM2P_THREADS=6 ... or EXSIA_THREADS=6 ...
 LOG_DEBUG_DEFAULT=${LOG_DEBUG:-1} # 0 | 1
 LOG_CYCLE_DEFAULT=${LOG_CYCLE:-1} # 0 | 1
 LOG_DUMP_DEFAULT=${LOG_DUMP:-0} # 0 | 1
@@ -40,6 +43,7 @@ cmake -B "$BUILD_DIR" -S . \
   -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE_DEFAULT}" \
   -DGGML_NATIVE="${GGML_NATIVE_DEFAULT}" \
   -DLLAMA_CURL="${LLAMA_CURL_DEFAULT}" \
+  -DGGML_GEMMINI_ENABLE_OPENMP="${GGML_GEMMINI_ENABLE_OPENMP_DEFAULT}" \
   "$@"
 
 cmake --build "$BUILD_DIR" --target llama-cli llama-perplexity -j"$(nproc)"
