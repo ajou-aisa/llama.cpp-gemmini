@@ -72,6 +72,48 @@ namespace
         out = lhs * rhs;
         return true;
     }
+
+    struct ggml_tensor * gemmini_i8_scale_tensor(const struct ggml_tensor * weight)
+    {
+        if (weight == nullptr || weight->type != GGML_TYPE_I8)
+            return nullptr;
+
+        return weight->src[GGML_MAX_SRC - 1];
+    }
+
+    bool gemmini_i8_scale_tensor_is_valid(const struct ggml_tensor * scale)
+    {
+        return scale != nullptr &&
+               scale->type == GGML_TYPE_F32 &&
+               ggml_nelements(scale) == 1;
+    }
+
+    const float * gemmini_i8_weight_scale_data(const struct ggml_tensor * weight)
+    {
+        const struct ggml_tensor * scale = gemmini_i8_scale_tensor(weight);
+        if (!gemmini_i8_scale_tensor_is_valid(scale) || scale->data == nullptr)
+            return nullptr;
+
+        return static_cast<const float *>(scale->data);
+    }
+
+    bool gemmini_i8_weight_layout_is_supported(const struct ggml_tensor * weight, bool transpose_b)
+    {
+        return transpose_b &&
+               weight != nullptr &&
+               weight->type == GGML_TYPE_I8 &&
+               weight->ne[0] > 0 &&
+               weight->nb[0] == sizeof(int8_t) &&
+               weight->nb[1] == static_cast<size_t>(weight->ne[0]);
+    }
+
+    const float * gemmini_i8_supported_scale_data(const struct ggml_tensor * weight, bool transpose_b)
+    {
+        if (!gemmini_i8_weight_layout_is_supported(weight, transpose_b))
+            return nullptr;
+
+        return gemmini_i8_weight_scale_data(weight);
+    }
 }
 
 struct ggml_backend_gemmini_context
@@ -249,8 +291,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     const int64_t dim_z = src0->ne[2] ? src0->ne[2] : 1;
     const int64_t dim_w = src0->ne[3] ? src0->ne[3] : 1;
 
-    GGML_ASSERT(dim_k % GGML_GEMMINI_BLOCK_SIZE == 0);
-    const size_t blocks_K = static_cast<size_t>(dim_k) / GGML_GEMMINI_BLOCK_SIZE;
     // Overflow guard for logical_rows and subsequent allocations.
     const __int128 logical_rows_128 =
         static_cast<__int128>(dim_j) * static_cast<__int128>(dim_z) * static_cast<__int128>(dim_w);
@@ -265,126 +305,159 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     // - false: KxJ row-major (stride = J_flat)
     args.sB = args.transpose_B ? static_cast<size_t>(dim_k) : logical_rows;
 
-    const size_t logical_stripe_J = args.stripe_J > 1 ? args.tile_J * DIM : 1;
-    const block_q8_0 *block_base = ggml::gemmini::weight_block_base(src0);
-    ggml_gemmini_args_t::unpacked_weight *cached = nullptr;
+    if (src0->type == GGML_TYPE_I8) {
+        const float * scale = gemmini_i8_supported_scale_data(src0, args.transpose_B);
+        if (scale == nullptr) {
+            GGML_ABORT("Gemmini dense I8 weight is missing a loaded F32 scalar scale sidecar or has unsupported layout");
+        }
 
-    auto it = ctx->weight_cache.find(block_base);
-    if (it != ctx->weight_cache.end() &&
-        it->second.matches(block_base,
-                           dim_k,
-                           dim_j,
-                           dim_z,
-                           dim_w,
-                           args.sB,
-                           blocks_K,
-                           logical_rows,
-                           args.transpose_B,
-                           logical_stripe_J,
-                           args.stripe_J)) {
-        cached = &it->second;
-        ggml::gemmini::log::debug(layer,
-                         "[Q8_0 cache] hit base=%p K=%lld cols=%zu sB=%zu blocks_K=%zu transpose_B=%d logical_stripe_J=%zu stripe_J=%zu",
-                         (const void *)block_base,
-                         static_cast<long long>(dim_k),
-                         logical_rows,
-                         args.sB,
-                         blocks_K,
-                         args.transpose_B ? 1 : 0,
-                         logical_stripe_J,
-                         args.stripe_J);
+        args.B = static_cast<elem_t *>(src0->data);
+        args.B_blocks = nullptr;
+        args.B_scales = nullptr;
+        args.weight_i8_scale_active = true;
+        args.weight_scale = *scale;
+        args.c_b = nullptr;
+        args.s_rf = nullptr;
+        args.R = nullptr;
+        args.blocks_per_row = 0;
+        args.blocks_K = 0;
+        args.blocks_J = logical_rows;
+        args.blocks_I = logical_rows;
+        args.block_size_k = 1;
+        args.sB = static_cast<size_t>(dim_k);
+        args.stripe_J = 0;
+        args.s_rf_stripe = nullptr;
+        args.R_stripe = nullptr;
+
+        end = ggml::gemmini::cycle::read();
+        ggml::gemmini::log::cycle(layer, "cpu.Use dense I8 weight", start, end);
     } else {
-        if (it == ctx->weight_cache.end()) {
+
+        GGML_ASSERT(dim_k % QK8_0 == 0);
+        const size_t blocks_K = static_cast<size_t>(dim_k) / QK8_0;
+        const size_t logical_stripe_J = args.stripe_J > 1 ? args.tile_J * DIM : 1;
+        const block_q8_0 *block_base = ggml::gemmini::weight_block_base(src0);
+        ggml_gemmini_args_t::unpacked_weight *cached = nullptr;
+
+        auto it = ctx->weight_cache.find(block_base);
+        if (it != ctx->weight_cache.end() &&
+            it->second.matches(block_base,
+                               dim_k,
+                               dim_j,
+                               dim_z,
+                               dim_w,
+                               args.sB,
+                               blocks_K,
+                               logical_rows,
+                               args.transpose_B,
+                               logical_stripe_J,
+                               args.stripe_J)) {
+            cached = &it->second;
             ggml::gemmini::log::debug(layer,
-                             "[Q8_0_R cache] miss base=%p K=%lld cols=%zu blocks_K=%zu logical_stripe_J=%zu stripe_J=%zu",
+                             "[Q8_0 cache] hit base=%p K=%lld cols=%zu sB=%zu blocks_K=%zu transpose_B=%d logical_stripe_J=%zu stripe_J=%zu",
                              (const void *)block_base,
                              static_cast<long long>(dim_k),
                              logical_rows,
+                             args.sB,
                              blocks_K,
+                             args.transpose_B ? 1 : 0,
                              logical_stripe_J,
                              args.stripe_J);
         } else {
-            ggml::gemmini::log::debug(layer,
-                             "[Q8_0_R cache] refresh base=%p K=%lld cols=%zu blocks_K=%zu logical_stripe_J=%zu stripe_J=%zu",
-                             (const void *)block_base,
-                             static_cast<long long>(dim_k),
-                             logical_rows,
-                             blocks_K,
-                             logical_stripe_J,
-                             args.stripe_J);
+            if (it == ctx->weight_cache.end()) {
+                ggml::gemmini::log::debug(layer,
+                                 "[Q8_0_R cache] miss base=%p K=%lld cols=%zu blocks_K=%zu logical_stripe_J=%zu stripe_J=%zu",
+                                 (const void *)block_base,
+                                 static_cast<long long>(dim_k),
+                                 logical_rows,
+                                 blocks_K,
+                                 logical_stripe_J,
+                                 args.stripe_J);
+            } else {
+                ggml::gemmini::log::debug(layer,
+                                 "[Q8_0_R cache] refresh base=%p K=%lld cols=%zu blocks_K=%zu logical_stripe_J=%zu stripe_J=%zu",
+                                 (const void *)block_base,
+                                 static_cast<long long>(dim_k),
+                                 logical_rows,
+                                 blocks_K,
+                                 logical_stripe_J,
+                                 args.stripe_J);
+            }
+            ggml_gemmini_args_t::unpacked_weight entry;
+            entry.blocks = block_base;
+            entry.dim_k = dim_k;
+            entry.dim_j = dim_j;
+            entry.dim_z = dim_z;
+            entry.dim_w = dim_w;
+            entry.logical_cols = logical_rows;
+            entry.blocks_K = blocks_K;
+            entry.blocks_J = logical_rows;
+            entry.blocks_I = logical_rows;
+            entry.block_size_k = QK8_0;
+            entry.transpose_b = args.transpose_B;
+            entry.logical_stripe_J = logical_stripe_J;
+
+            // Populate cached Q8_0_R buffers directly from absorbed algorithms.
+            const bool ok = unpack_q80_r_weight(
+                src0,
+                args,
+                entry.q_qs,
+                entry.c_b,
+                entry.s_rf,
+                entry.R,
+                args.stripe_J > 1 ? &entry.s_rf_stripe : nullptr,
+                args.stripe_J > 1 ? &entry.R_stripe : nullptr
+            );
+            GGML_ASSERT(ok);
+            if (!ok)
+                return;
+
+            entry.blocks = args.B_blocks;
+            entry.blocks_K = args.blocks_K;
+            entry.blocks_J = args.blocks_J;
+            entry.blocks_I = args.blocks_I;
+            entry.block_size_k = args.block_size_k;
+            entry.stride = args.sB;
+
+            if (args.stripe_J > 1)
+                entry.stripe_J = args.stripe_J;
+
+            if (it == ctx->weight_cache.end()) {
+                it = ctx->weight_cache.emplace(block_base, std::move(entry)).first;
+            } else {
+                it->second = std::move(entry);
+            }
+            cached = &it->second;
         }
-        ggml_gemmini_args_t::unpacked_weight entry;
-        entry.blocks = block_base;
-        entry.dim_k = dim_k;
-        entry.dim_j = dim_j;
-        entry.dim_z = dim_z;
-        entry.dim_w = dim_w;
-        entry.logical_cols = logical_rows;
-        entry.blocks_K = blocks_K;
-        entry.blocks_J = logical_rows;
-        entry.blocks_I = logical_rows;
-        entry.block_size_k = QK8_0;
-        entry.transpose_b = args.transpose_B;
-        entry.logical_stripe_J = logical_stripe_J;
 
-        // Populate cached Q8_0_R buffers directly from absorbed algorithms.
-        const bool ok = unpack_q80_r_weight(
-            src0,
-            args,
-            entry.q_qs,
-            entry.c_b,
-            entry.s_rf,
-            entry.R,
-            args.stripe_J > 1 ? &entry.s_rf_stripe : nullptr,
-            args.stripe_J > 1 ? &entry.R_stripe : nullptr
-        );
-        GGML_ASSERT(ok);
-        if (!ok)
-            return;
+        args.B = reinterpret_cast<elem_t *>(cached->q_qs.data());
+        args.B_blocks = cached->blocks;
+        args.B_scales = nullptr;
+        args.weight_i8_scale_active = false;
+        args.weight_scale = 1.0f;
+        args.c_b = cached->c_b.data();
+        args.s_rf = cached->s_rf.data();
+        args.R = cached->R.data();
+        args.blocks_per_row = cached->blocks_K;
+        args.blocks_K = cached->blocks_K;
+        args.blocks_J = cached->blocks_J;
+        args.blocks_I = cached->blocks_I;
+        args.block_size_k = cached->block_size_k;
+        args.sB = static_cast<size_t>(cached->dim_k);
+        args.stripe_J = cached->stripe_J;
+        args.s_rf_stripe = cached->stripe_J > 1 ? cached->s_rf_stripe.data() : nullptr;
+        args.R_stripe = cached->stripe_J > 1 ? cached->R_stripe.data() : nullptr;
 
-        entry.blocks = args.B_blocks;
-        entry.blocks_K = args.blocks_K;
-        entry.blocks_J = args.blocks_J;
-        entry.blocks_I = args.blocks_I;
-        entry.block_size_k = args.block_size_k;
-        entry.stride = args.sB;
+        ggml::gemmini::log::debug(layer,
+            "[Q8_0_R cache] restore B=%p sB=%zu c_b=%p s_rf=%p R=%p blocks_per_row=%zu logical_stripe_J=%zu stripe_J=%zu",
+            (void *)args.B, args.sB, (void *)args.c_b, (void *)args.s_rf, (void *)args.R,
+            args.blocks_per_row, cached->logical_stripe_J, args.stripe_J);
+        // ggml::gemmini::log::debug("[Gemmini addr] layer=%s A=%p B=%p B_blocks=%p B_scales=%p",
+        //                  layer, (void *)args.A, (void *)args.B, (const void *)args.B_blocks, (const void *)args.B_scales);
 
-        if (args.stripe_J > 1)
-            entry.stripe_J = args.stripe_J;
-
-        if (it == ctx->weight_cache.end()) {
-            it = ctx->weight_cache.emplace(block_base, std::move(entry)).first;
-        } else {
-            it->second = std::move(entry);
-        }
-        cached = &it->second;
+        end = ggml::gemmini::cycle::read();
+        ggml::gemmini::log::cycle(layer, "cpu.Breakdown Q8_0_R", start, end);
     }
-
-    args.B = reinterpret_cast<elem_t *>(cached->q_qs.data());
-    args.B_blocks = cached->blocks;
-    args.B_scales = nullptr;
-    args.c_b = cached->c_b.data();
-    args.s_rf = cached->s_rf.data();
-    args.R = cached->R.data();
-    args.blocks_per_row = cached->blocks_K;
-    args.blocks_K = cached->blocks_K;
-    args.blocks_J = cached->blocks_J;
-    args.blocks_I = cached->blocks_I;
-    args.block_size_k = cached->block_size_k;
-    args.sB = static_cast<size_t>(cached->dim_k);
-    args.stripe_J = cached->stripe_J;
-    args.s_rf_stripe = cached->stripe_J > 1 ? cached->s_rf_stripe.data() : nullptr;
-    args.R_stripe = cached->stripe_J > 1 ? cached->R_stripe.data() : nullptr;
-
-    ggml::gemmini::log::debug(layer,
-        "[Q8_0_R cache] restore B=%p sB=%zu c_b=%p s_rf=%p R=%p blocks_per_row=%zu logical_stripe_J=%zu stripe_J=%zu",
-        (void *)args.B, args.sB, (void *)args.c_b, (void *)args.s_rf, (void *)args.R,
-        args.blocks_per_row, cached->logical_stripe_J, args.stripe_J);
-    // ggml::gemmini::log::debug("[Gemmini addr] layer=%s A=%p B=%p B_blocks=%p B_scales=%p",
-    //                  layer, (void *)args.A, (void *)args.B, (const void *)args.B_blocks, (const void *)args.B_scales);
-
-    end = ggml::gemmini::cycle::read();
-    ggml::gemmini::log::cycle(layer, "cpu.Breakdown Q8_0_R", start, end);
 
     start = ggml::gemmini::cycle::read();
     /* ______________________________ 4. bias 텐서 처리 _________________________________ */
@@ -420,10 +493,17 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     //                  layer, (void *)args.f_out, args.stride_f_out, args.col_stride_f_out);
 
     /* __ 5. Gemmini 호출 __ */
-    args.tiled_matmul_type = CPU;
     if constexpr (ggml::gemmini::config::CURRENT_COMPUTE_TYPE == ggml::gemmini::config::ComputeType::INT) {
         if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA) {
-            ggml::gemmini::tiled_matmul_auto_im2p(&args);
+            if (args.weight_i8_scale_active) {
+                ggml::gemmini::log::debug(layer,
+                    "[exsia] route dense_i8 weight_scale=%.9f dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
+                    static_cast<double>(args.weight_scale), args.I, args.J, args.K, args.sB,
+                    static_cast<int>(args.tiled_matmul_type));
+                ggml::gemmini::tiled_matmul_auto_exsia(&args);
+            } else {
+                ggml::gemmini::tiled_matmul_auto_im2p(&args);
+            }
         } else if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TENSOR) {
             ggml::gemmini::tiled_matmul_auto_tensor(&args);
         }
@@ -705,11 +785,11 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
                 ggml::gemmini::config::CURRENT_COMPUTE_TYPE ==
                 ggml::gemmini::config::ComputeType::INT
             ) {
-                // INT Gemmini path currently only supports Q8_0 static weights.
-                if (a->type != GGML_TYPE_Q8_0)
-                    return false;
+                if (a->type == GGML_TYPE_I8) {
+                    return gemmini_i8_supported_scale_data(a, TRANSPOSE_B != 0) != nullptr;
+                }
 
-                if (a->ne[0] <= 0 || a->ne[0] % QK8_0 != 0)
+                if (a->type != GGML_TYPE_Q8_0 || a->ne[0] <= 0 || a->ne[0] % QK8_0 != 0)
                     return false;
 
                 const block_q8_0 * base = ggml::gemmini::weight_block_base(a);
