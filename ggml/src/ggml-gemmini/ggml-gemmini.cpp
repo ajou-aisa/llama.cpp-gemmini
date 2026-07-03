@@ -274,6 +274,18 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             src0_f32.resize(jk_count);
             dequantize_row_q8_0(reinterpret_cast<const block_q8_0 *>(src0->data), src0_f32.data(), jk_count);
             src0_f = src0_f32.data();
+        } else if (src0->type == GGML_TYPE_I8) {
+            const float *scale = gemmini_i8_supported_scale_data(src0, args.transpose_B);
+            if (scale == nullptr) {
+                GGML_ABORT("DEQUANT_FP_TEST compute type: dense I8 weight is missing a loaded F32 scalar scale sidecar or has unsupported layout");
+            }
+
+            src0_f32.resize(jk_count);
+            const int8_t *src0_i8 = reinterpret_cast<const int8_t *>(src0->data);
+            for (size_t idx = 0; idx < jk_count; ++idx) {
+                src0_f32[idx] = static_cast<float>(src0_i8[idx]) * *scale;
+            }
+            src0_f = src0_f32.data();
         } else if (src0->type != GGML_TYPE_F32) {
             GGML_ABORT("DEQUANT_FP_TEST compute type: unsupported weight type");
         }
@@ -817,6 +829,10 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
                         op->ne[2] != 1 || op->ne[3] != 1)
                         return false;
                 }
+                if (a->type == GGML_TYPE_I8) {
+                    return gemmini_i8_supported_scale_data(a, TRANSPOSE_B != 0) != nullptr;
+                }
+
                 return a->type == GGML_TYPE_Q8_0 || a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16;
             }
         }
