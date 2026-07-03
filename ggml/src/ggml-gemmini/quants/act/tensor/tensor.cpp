@@ -8,6 +8,7 @@
 #include "tensor.hpp"
 
 #include "../../../ggml-gemmini-args.h"
+#include "../../common/tensor_util.hpp"
 
 namespace ggml::gemmini::quants::act::tensor
 {
@@ -99,6 +100,34 @@ bool compute_tensor_stats(const float *src_data, const ggml_gemmini_args_t &args
     return true;
 }
 
+bool mark_outliers_3sigma(const float *src_data, const ggml_gemmini_args_t &args, const TensorStats &stats, BitMask &mask)
+{
+    if (!src_data || !mask.resize(args.I, args.K)) {
+        return false;
+    }
+
+    if (stats.sigma == 0.0) {
+        return true;
+    }
+
+    for (size_t row = 0; row < args.I; ++row) {
+        for (size_t col = 0; col < args.K; ++col) {
+            const float value = src_data[row * args.K + col];
+            if (!std::isfinite(value)) {
+                mask.mark_outlier(row, col);
+                continue;
+            }
+
+            const double z_score = (static_cast<double>(value) - stats.mean) / stats.sigma;
+            if (std::fabs(z_score) > 3.0) {
+                mask.mark_outlier(row, col);
+            }
+        }
+    }
+
+    return true;
+}
+
 }
 
     // per-tensor에서는 의미 없음. 
@@ -129,8 +158,18 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
     }
 
     #if ERROR_COMPENSATION
-        // TODO 3sigma rule (mean, sigma) 적용하여 outlier selection
-        // inlier만 quantization.
+        const float *src_data = ggml::gemmini::activation_data(src);
+        if (!src_data) {
+            return false;
+        }
+
+        TensorStats stats;
+        BitMask outliers;
+        if (!compute_tensor_stats(src_data, args, stats) ||
+            !mark_outliers_3sigma(src_data, args, stats, outliers)) {
+            return false;
+        }
+        (void)outliers;
     #endif
     // TODO: outlier selection하지 않고 모든 값을 inlier로 간주.
 
