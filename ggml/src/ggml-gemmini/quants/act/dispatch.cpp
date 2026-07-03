@@ -66,6 +66,9 @@ std::vector<QactOutlier> outliers(const ggml_gemmini_args_t &args)
     if (const auto *meta = std::get_if<exsia::Meta>(&storage)) {
         return meta->outliers;
     }
+    if (const auto *meta = std::get_if<tensor::Meta>(&storage)) {
+        return meta->outliers;
+    }
 
     return {};
 }
