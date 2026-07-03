@@ -257,13 +257,57 @@ bool dequantize_activation(
     }
     const Meta &meta = *meta_ptr;
 
-    const size_t src_row_stride = args.sA != 0 ? args.sA : args.K;
+    if (args.sA != 0 && args.sA != args.K) {
+        return false;
+    }
+
+    const size_t src_row_stride = args.K;
     const size_t row_count = std::min(rows, args.I);
     const size_t col_count = std::min(cols, args.K);
+    const size_t max_size = std::numeric_limits<size_t>::max();
+    if (row_count != 0 && col_count > max_size / row_count) {
+        return false;
+    }
+
+    std::vector<int32_t> residuals(row_count * col_count, 0);
+
+    #if ERROR_COMPENSATION
+        for (const auto &outlier : meta.outliers) {
+            if (outlier.row < 0 || outlier.col < 0) {
+                continue;
+            }
+
+            const size_t row = static_cast<size_t>(outlier.row);
+            const size_t col = static_cast<size_t>(outlier.col);
+            if (row < row_count && col < col_count) {
+                residuals[row * col_count + col] += outlier.residual;
+            }
+        }
+    #endif
+
     for (size_t row = 0; row < row_count; ++row) {
         for (size_t col = 0; col < col_count; ++col) {
-            const int8_t q = src[row * src_row_stride + col];
-            dst[row * dst_row_stride + col * dst_col_stride] =
+            if ((row != 0 && src_row_stride > max_size / row) ||
+                (row != 0 && dst_row_stride > max_size / row) ||
+                (col != 0 && dst_col_stride > max_size / col)) {
+                return false;
+            }
+
+            const size_t src_row_offset = row * src_row_stride;
+            if (src_row_offset > max_size - col) {
+                return false;
+            }
+
+            const size_t dst_row_offset = row * dst_row_stride;
+            const size_t dst_col_offset = col * dst_col_stride;
+            if (dst_row_offset > max_size - dst_col_offset) {
+                return false;
+            }
+
+            const int32_t q =
+                static_cast<int32_t>(src[src_row_offset + col]) +
+                residuals[row * col_count + col];
+            dst[dst_row_offset + dst_col_offset] =
                 static_cast<float>(q) * meta.scale;
         }
     }
