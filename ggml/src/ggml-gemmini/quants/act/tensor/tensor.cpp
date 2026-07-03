@@ -165,8 +165,10 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
 
         TensorStats stats;
         BitMask outliers;
-        if (!compute_tensor_stats(src_data, args, stats) ||
-            !mark_outliers_3sigma(src_data, args, stats, outliers)) {
+        if (!compute_tensor_stats(src_data, args, stats)) {
+            return false;
+        }
+        if (!mark_outliers_3sigma(src_data, args, stats, outliers)) {
             return false;
         }
         (void)outliers;
