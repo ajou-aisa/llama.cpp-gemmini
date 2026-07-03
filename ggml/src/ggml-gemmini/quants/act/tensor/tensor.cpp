@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <variant>
@@ -55,6 +56,48 @@ struct BitMask
         words[idx / 64] |= uint64_t(1) << (idx % 64);
     }
 };
+
+struct TensorStats
+{
+    double mean = 0.0;
+    double sigma = 0.0;
+    size_t count = 0;
+};
+
+bool compute_tensor_stats(const float *src_data, const ggml_gemmini_args_t &args, TensorStats &stats)
+{
+    if (!src_data) {
+        return false;
+    }
+
+    double t_sum = 0.0;
+    double t_sum_sq = 0.0;
+    size_t t_count = 0;
+    for (size_t row = 0; row < args.I; ++row) {
+        for (size_t col = 0; col < args.K; ++col) {
+            const float value = src_data[row * args.K + col];
+            if (!std::isfinite(value)) {
+                continue;
+            }
+
+            const double x = static_cast<double>(value);
+            t_sum += x;
+            t_sum_sq += x * x;
+            ++t_count;
+        }
+    }
+
+    if (t_count == 0) {
+        return false;
+    }
+
+    stats.count = t_count;
+    stats.mean = t_sum / static_cast<double>(t_count);
+
+    const double variance = std::max(0.0, t_sum_sq / static_cast<double>(t_count) - stats.mean * stats.mean);
+    stats.sigma = std::sqrt(variance);
+    return true;
+}
 
 }
 
