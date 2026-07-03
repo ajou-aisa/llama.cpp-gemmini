@@ -1,12 +1,63 @@
+#include <algorithm>
+#include <cstdint>
+#include <limits>
+#include <variant>
+#include <vector>
+
 #include "tensor.hpp"
 
 #include "../../../ggml-gemmini-args.h"
 
-#include <algorithm>
-#include <variant>
-
 namespace ggml::gemmini::quants::act::tensor
 {
+
+namespace {
+
+bool checked_mul_size(size_t lhs, size_t rhs, size_t &out)
+{
+    if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs) {
+        return false;
+    }
+
+    out = lhs * rhs;
+    return true;
+}
+
+struct BitMask
+{
+    size_t rows = 0;
+    size_t cols = 0;
+    std::vector<uint64_t> words;
+
+    bool resize(size_t row_count, size_t col_count)
+    {
+        size_t bit_count = 0;
+        if (!checked_mul_size(row_count, col_count, bit_count)) {
+            rows = 0;
+            cols = 0;
+            words.clear();
+            return false;
+        }
+
+        rows = row_count;
+        cols = col_count;
+        words.assign((bit_count + 63) / 64, 0);
+        return true;
+    }
+
+    void mark_outlier(size_t row, size_t col)
+    {
+        if (row >= rows || col >= cols) {
+            return;
+        }
+
+        const size_t idx = row * cols + col;
+        words[idx / 64] |= uint64_t(1) << (idx % 64);
+    }
+};
+
+}
+
     // per-tensor에서는 의미 없음. 
 void set_config(Meta &meta)
 {
