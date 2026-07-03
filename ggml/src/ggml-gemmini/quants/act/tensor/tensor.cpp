@@ -5,10 +5,9 @@
 #include <variant>
 #include <vector>
 
-#include "tensor.hpp"
-
 #include "../../../ggml-gemmini-args.h"
 #include "../../common/tensor_util.hpp"
+#include "tensor.hpp"
 
 namespace ggml::gemmini::quants::act::tensor
 {
@@ -62,6 +61,7 @@ struct TensorStats
 {
     double mean = 0.0;
     double sigma = 0.0;
+    double max_abs = 0.0;
     size_t count = 0;
 };
 
@@ -84,6 +84,7 @@ bool compute_tensor_stats(const float *src_data, const ggml_gemmini_args_t &args
             const double x = static_cast<double>(value);
             t_sum += x;
             t_sum_sq += x * x;
+            stats.max_abs = std::max(stats.max_abs, std::fabs(x));
             ++t_count;
         }
     }
@@ -100,14 +101,15 @@ bool compute_tensor_stats(const float *src_data, const ggml_gemmini_args_t &args
     return true;
 }
 
-bool mark_outliers_3sigma(const float *src_data, const ggml_gemmini_args_t &args, const TensorStats &stats, BitMask &mask)
+bool mark_outliers_3sigma(
+    const float *src_data,
+    const ggml_gemmini_args_t &args,
+    const TensorStats &stats,
+    BitMask &mask,
+    TensorStats &inlier_stats)
 {
     if (!src_data || !mask.resize(args.I, args.K)) {
         return false;
-    }
-
-    if (stats.sigma == 0.0) {
-        return true;
     }
 
     for (size_t row = 0; row < args.I; ++row) {
@@ -118,28 +120,52 @@ bool mark_outliers_3sigma(const float *src_data, const ggml_gemmini_args_t &args
                 continue;
             }
 
-            const double z_score = (static_cast<double>(value) - stats.mean) / stats.sigma;
+            const double x = static_cast<double>(value);
+            const double z_score = stats.sigma == 0.0 ? 0.0 : (x - stats.mean) / stats.sigma;
             if (std::fabs(z_score) > 3.0) {
                 mask.mark_outlier(row, col);
+                continue;
             }
+
+            inlier_stats.max_abs = std::max(inlier_stats.max_abs, std::fabs(x));
+            ++inlier_stats.count;
         }
     }
 
     return true;
 }
 
+int32_t quantize_to_i32(float value, float scale)
+{
+    if (!std::isfinite(value) || !std::isfinite(scale) || scale <= 0.0f) {
+        return 0;
+    }
+
+    return static_cast<int32_t>(std::round(value / scale));
 }
 
-    // per-tensor에서는 의미 없음. 
+int8_t clip_to_i8(int32_t value)
+{
+    const int32_t clipped = value > 127 ? 127 : (value < -128 ? -128 : value);
+    return static_cast<int8_t>(clipped);
+}
+
+bool set_scale(const TensorStats &stats, Meta &meta)
+{
+    if (stats.count == 0 || stats.max_abs == 0.0) {
+        meta.scale = 1.0f;
+        return true;
+    }
+
+    meta.scale = static_cast<float>(stats.max_abs / 127.0);
+    return std::isfinite(meta.scale) && meta.scale > 0.0f;
+}
+
+}
+
+// per-tensor에서는 의미 없음.
 void set_config(Meta &meta)
 {
-    (void)meta;
-}
-
-void set_scale(const ggml_gemmini_args_t &args, Meta &meta)
-{
-    // TODO: per-tensor scale 결정. outlier 리스트에 해당하는 값은 scale 계산에 포함하지 않도록 해야 함
-    (void)args;
     (void)meta;
 }
 
@@ -157,27 +183,57 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
         return false;
     }
 
-    #if ERROR_COMPENSATION
-        const float *src_data = ggml::gemmini::activation_data(src);
-        if (!src_data) {
-            return false;
-        }
+    const float *src_data = ggml::gemmini::activation_data(src);
+    if (!src_data) {
+        return false;
+    }
 
+    #if ERROR_COMPENSATION
         TensorStats stats;
+        TensorStats inlier_stats;
         BitMask outliers;
         if (!compute_tensor_stats(src_data, args, stats)) {
             return false;
         }
-        if (!mark_outliers_3sigma(src_data, args, stats, outliers)) {
+        if (!mark_outliers_3sigma(src_data, args, stats, outliers, inlier_stats)) {
             return false;
         }
-        (void)outliers;
+        const TensorStats &scale_stats = inlier_stats.count != 0 ? inlier_stats : stats;
+        if (!set_scale(scale_stats, *meta)) {
+            return false;
+        }
+        meta->outliers.clear();
+    #else
+        TensorStats stats;
+        if (!compute_tensor_stats(src_data, args, stats)) {
+            return false;
+        }
+        if (!set_scale(stats, *meta)) {
+            return false;
+        }
     #endif
-    // TODO: outlier selection하지 않고 모든 값을 inlier로 간주.
 
-    // TODO: int32_t 타입으로 양자화 후 [-128, 127]을 초과하는 값의 clipping된 residual을 index와 함께 outlier로 저장.
-    // TODO: quantization 완료 시 true 반환, 실패 시 false 반환
-    return false;
+    for (size_t row = 0; row < args.I; ++row) {
+        for (size_t col = 0; col < args.K; ++col) {
+            const size_t idx = row * args.K + col;
+            const int32_t q32 = quantize_to_i32(src_data[idx], meta->scale);
+            const int8_t q8 = clip_to_i8(q32);
+            dst[idx] = q8;
+
+            #if ERROR_COMPENSATION
+                const int32_t residual = q32 - static_cast<int32_t>(q8);
+                if (residual != 0) {
+                    meta->outliers.push_back({
+                        static_cast<int>(row),
+                        static_cast<int>(col),
+                        residual,
+                    });
+                }
+            #endif
+        }
+    }
+
+    return true;
 }
 
 bool dequantize_activation(
