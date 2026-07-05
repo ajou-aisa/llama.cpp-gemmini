@@ -31,6 +31,55 @@ import gguf
 
 logger = logging.getLogger("hf-to-gguf")
 
+GEMMINI_I8_OUTTYPE = "gemmini_i8"
+GEMMINI_I8_F32_TENSORS = frozenset({"output.weight", "token_embd.weight"})
+
+
+def should_use_gemmini_i8(
+    outtype_name_override: str | None,
+    new_name: str,
+    n_dims: int,
+    data_qtype: gguf.GGMLQuantizationType | bool,
+) -> bool:
+    return (
+        outtype_name_override == GEMMINI_I8_OUTTYPE
+        and isinstance(data_qtype, bool)
+        and n_dims == 2
+        and new_name.endswith(".weight")
+        and not new_name.endswith("_norm.weight")
+        and new_name not in GEMMINI_I8_F32_TENSORS
+    )
+
+
+def quantize_gemmini_i8(data: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    data_f32 = np.array(data, dtype=np.float32, copy=True)
+    absmax = float(np.max(np.abs(data_f32))) if data_f32.size else 0.0
+    scale = 1.0 if absmax == 0.0 else absmax / 127.0
+    scaled = data_f32 / scale
+    rounded = np.sign(scaled) * np.floor(np.abs(scaled) + np.float32(0.5))
+    quantized = np.clip(rounded, -127, 127).astype(np.int8)
+    return quantized, np.array([scale], dtype=np.float32)
+
+
+def _self_check_gemmini_i8() -> None:
+    zero_q, zero_scale = quantize_gemmini_i8(np.zeros((2, 2), dtype=np.float32))
+    assert zero_scale.shape == (1,)
+    assert zero_scale.dtype == np.float32
+    assert float(zero_scale[0]) == 1.0
+    assert zero_q.dtype == np.int8
+    assert np.all(zero_q == 0)
+
+    data = np.array([[-2.0, 0.0], [2.0, 1.0]], dtype=np.float32)
+    q, scale = quantize_gemmini_i8(data)
+    assert np.isclose(scale[0], np.float32(2.0 / 127.0))
+    assert q.tolist() == [[-127, 0], [127, 64]]
+
+    rng = np.random.default_rng(123)
+    large_data = rng.normal(size=(768, 2304)).astype(np.float32)
+    large_q, _ = quantize_gemmini_i8(large_data)
+    assert large_q.min() < 0
+    assert 0.45 < float(np.mean(large_q < 0)) < 0.55
+
 
 ###### MODEL DEFINITIONS ######
 
@@ -73,6 +122,7 @@ class ModelBase:
     metadata_override: Path | None
     dir_model_card: Path
     remote_hf_model_id: str | None
+    outtype_name_override: str | None
 
     # subclasses should define this!
     model_arch: gguf.MODEL_ARCH
@@ -85,7 +135,8 @@ class ModelBase:
                  use_temp_file: bool = False, eager: bool = False,
                  metadata_override: Path | None = None, model_name: str | None = None,
                  split_max_tensors: int = 0, split_max_size: int = 0, dry_run: bool = False,
-                 small_first_shard: bool = False, hparams: dict[str, Any] | None = None, remote_hf_model_id: str | None = None):
+                 small_first_shard: bool = False, hparams: dict[str, Any] | None = None,
+                 remote_hf_model_id: str | None = None, outtype_name_override: str | None = None):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is VisionModel:
@@ -120,6 +171,7 @@ class ModelBase:
         self.metadata_override = metadata_override
         self.model_name = model_name
         self.dir_model_card = dir_model  # overridden in convert_lora_to_gguf.py
+        self.outtype_name_override = outtype_name_override
 
         # Apply heuristics to figure out typical tensor encoding based on first layer tensor encoding type
         if self.ftype == gguf.LlamaFileType.GUESSED:
@@ -328,6 +380,14 @@ class ModelBase:
                         # TODO: use Q4_K and Q6_K
                         data_qtype = gguf.GGMLQuantizationType.F16
 
+                if should_use_gemmini_i8(self.outtype_name_override, new_name, n_dims, data_qtype):
+                    data, scale = quantize_gemmini_i8(data)
+                    shape_str = f"{{{', '.join(str(n) for n in reversed(data.shape))}}}"
+                    logger.info(f"{f'%-{max_name_len}s' % f'{new_name},'} {old_dtype} --> I8, shape = {shape_str}")
+                    self.gguf_writer.add_tensor(new_name, data, raw_dtype=gguf.GGMLQuantizationType.I8)
+                    self.gguf_writer.add_tensor(f"{new_name}.scale", scale, raw_dtype=gguf.GGMLQuantizationType.F32)
+                    continue
+
                 # No override (data_qtype is False), or wants to be quantized (data_qtype is True)
                 if isinstance(data_qtype, bool):
                     if self.ftype == gguf.LlamaFileType.ALL_F32:
@@ -488,7 +548,7 @@ class TextModel(ModelBase):
 
         total_params = self.gguf_writer.get_total_parameter_count()[0]
         # Extract the encoding scheme from the file type name. e.g. 'gguf.LlamaFileType.MOSTLY_Q8_0' --> 'Q8_0'
-        output_type: str = self.ftype.name.partition("_")[2]
+        output_type = self.outtype_name_override or self.ftype.name.partition("_")[2]
 
         # Filename Output
         if self.fname_out.is_dir():
@@ -6027,8 +6087,8 @@ def parse_args() -> argparse.Namespace:
         help="path to write to; default: based on input. {ftype} will be replaced by the outtype.",
     )
     parser.add_argument(
-        "--outtype", type=str, choices=["f32", "f16", "bf16", "q8_0", "tq1_0", "tq2_0", "auto"], default="f16",
-        help="output format - use f32 for float32, f16 for float16, bf16 for bfloat16, q8_0 for Q8_0, tq1_0 or tq2_0 for ternary, and auto for the highest-fidelity 16-bit float type depending on the first loaded tensor type",
+        "--outtype", type=str, choices=["f32", "f16", "bf16", "q8_0", "tq1_0", "tq2_0", "gemmini_i8", "auto"], default="f16",
+        help="output format - use f32 for float32, f16 for float16, bf16 for bfloat16, q8_0 for Q8_0, tq1_0 or tq2_0 for ternary, gemmini_i8 for dense int8 + scale sidecars, and auto for the highest-fidelity 16-bit float type depending on the first loaded tensor type",
     )
     parser.add_argument(
         "--bigendian", action="store_true",
@@ -6091,6 +6151,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if not args.print_supported_models and args.model is None:
         parser.error("the following arguments are required: model")
+    if args.outtype == GEMMINI_I8_OUTTYPE and not args.no_lazy:
+        parser.error("--outtype gemmini_i8 requires --no-lazy because per-tensor scale computation materializes full tensors")
     return args
 
 
@@ -6158,6 +6220,7 @@ def main() -> None:
         "q8_0": gguf.LlamaFileType.MOSTLY_Q8_0,
         "tq1_0": gguf.LlamaFileType.MOSTLY_TQ1_0,
         "tq2_0": gguf.LlamaFileType.MOSTLY_TQ2_0,
+        "gemmini_i8": gguf.LlamaFileType.ALL_F32,
         "auto": gguf.LlamaFileType.GUESSED,
     }
 
@@ -6199,6 +6262,7 @@ def main() -> None:
                                      split_max_tensors=args.split_max_tensors,
                                      split_max_size=split_str_to_n_bytes(args.split_max_size), dry_run=args.dry_run,
                                      small_first_shard=args.no_tensor_first_split,
+                                     outtype_name_override=GEMMINI_I8_OUTTYPE if args.outtype == GEMMINI_I8_OUTTYPE else None,
                                      remote_hf_model_id=str(args.model) if args.remote else None)
 
         if args.vocab_only:
