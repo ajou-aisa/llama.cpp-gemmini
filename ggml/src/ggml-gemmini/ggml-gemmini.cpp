@@ -218,6 +218,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.I = I;
     args.J = J;
     args.K = K;
+    args.tiled_matmul_type = OPTION;
 
     /* _____ 3. Gemmini용 stride _____ */
     args.sA = K;
@@ -485,7 +486,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.f_out = static_cast<float*>(dst->data);
     args.col_stride_f_out = dst->nb[0] / sizeof(float);
     args.stride_f_out = dst->nb[1] / sizeof(float);
-    args.tiled_matmul_type = OPTION;
 
     end = ggml::gemmini::cycle::read();
     ggml::gemmini::log::cycle(layer, "cpu.Set Args for calling gemmini", start, end);
