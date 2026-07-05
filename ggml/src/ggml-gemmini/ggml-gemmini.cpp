@@ -134,8 +134,14 @@ uint64_t start, end; // 일반 사이클 측정
 static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                                          struct ggml_tensor *dst) // FP32 output (I×J)
 {
-    ggml::gemmini::log::cycle.set_output_path("log/cycle-log.jsonl");
-    ggml::gemmini::log::debug.set_output_path("log/debug-log.jsonl");
+    if (!ggml::gemmini::log::cycle.has_explicit_output())
+    {
+        ggml::gemmini::log::cycle.set_output_path("log/cycle-log.jsonl");
+    }
+    if (!ggml::gemmini::log::debug.has_explicit_output())
+    {
+        ggml::gemmini::log::debug.set_output_path("log/debug-log.jsonl");
+    }
     const auto layer_type = ggml::gemmini::types::parse_layer(dst->src[1]->name);
     const char *layer = ggml::gemmini::types::to_string(layer_type);
     ggml::gemmini::log::debug(layer, "ggml_backend_gemmini_mul_mat called");

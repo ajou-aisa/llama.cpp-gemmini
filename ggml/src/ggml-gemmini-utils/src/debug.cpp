@@ -310,6 +310,8 @@ namespace ggml::gemmini::log
 
     void Log::set_output(FILE *out)
     {
+        has_explicit_output_ = true;
+
         if (out == out_ && !owns_)
         {
             return;
@@ -321,6 +323,8 @@ namespace ggml::gemmini::log
 
     bool Log::set_output_path(const char *path)
     {
+        has_explicit_output_ = true;
+
         if (path == nullptr || *path == '\0')
         {
             set_output(stderr);
