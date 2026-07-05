@@ -1,0 +1,5 @@
+Graph-based approximate nearest neighbor search (ANNS) algorithms are widely used to identify the most similar vectors to a given query vector. 
+Graph-based ANNS consists of two stages: constructing a graph and searching on the graph for a given query vector. 
+While reducing the query response time is of great practical importance, less attention has been paid to improving the online search method than the offline graph construction method. 
+This paper provides an extensive experimental analysis on the popular greedy search and other search optimization strategies. 
+We also propose a novel angular distance-guided search method for graphbased ANNS (ADA-NNS
