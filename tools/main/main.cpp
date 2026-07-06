@@ -49,6 +49,7 @@ static void print_usage(int argc, char ** argv) {
     LOG("\nexample usage:\n");
     LOG("\n  text generation:     %s -m your_model.gguf -p \"I believe the meaning of life is\" -n 128 -no-cnv\n", argv[0]);
     LOG("\n  chat (conversation): %s -m your_model.gguf -sys \"You are a helpful assistant\"\n", argv[0]);
+    LOG("\n  Gemmini debug log:   %s --gemmini-debug-log log/debug-log.jsonl\n", argv[0]);
     LOG("\n");
 }
 
@@ -62,6 +63,18 @@ static bool file_is_empty(const std::string & path) {
     f.exceptions(std::ifstream::failbit | std::ifstream::badbit);
     f.open(path.c_str(), std::ios::in | std::ios::binary | std::ios::ate);
     return f.tellg() == 0;
+}
+
+static bool set_gemmini_debug_log_output(const char * path) {
+    if (std::strcmp(path, "stdout") == 0 || std::strcmp(path, "-") == 0) {
+        ggml::gemmini::log::debug.set_output(stdout);
+        return true;
+    }
+    if (std::strcmp(path, "stderr") == 0) {
+        ggml::gemmini::log::debug.set_output(stderr);
+        return true;
+    }
+    return ggml::gemmini::log::debug.set_output_path(path);
 }
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
@@ -86,13 +99,32 @@ static void sigint_handler(int signo) {
 #endif
 
 int main(int argc, char ** argv) {
-    // set file path
-    ggml::gemmini::log::debug.set_output_path("log/debug-log.jsonl");
+    std::vector<char *> args;
+    args.reserve(argc);
+    args.push_back(argv[0]);
+
+    const char * gemmini_debug_log = "log/debug-log.jsonl";
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--gemmini-debug-log") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "error: --gemmini-debug-log requires PATH, stdout, stderr, or -\n");
+                return 1;
+            }
+            gemmini_debug_log = argv[i];
+            continue;
+        }
+        args.push_back(argv[i]);
+    }
+
+    if (!set_gemmini_debug_log_output(gemmini_debug_log)) {
+        fprintf(stderr, "error: failed to open Gemmini debug log output: %s\n", gemmini_debug_log);
+        return 1;
+    }
     ggml::gemmini::log::cycle.set_output_path("log/cycle-log.jsonl");
 
     common_params params;
     g_params = &params;
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_MAIN, print_usage)) {
+    if (!common_params_parse((int) args.size(), args.data(), params, LLAMA_EXAMPLE_MAIN, print_usage)) {
         return 1;
     }
 
