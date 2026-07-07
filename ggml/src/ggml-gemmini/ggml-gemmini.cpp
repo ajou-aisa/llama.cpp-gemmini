@@ -517,7 +517,15 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 ggml::gemmini::tiled_matmul_auto_im2p(&args);
             }
         } else if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TENSOR) {
-            ggml::gemmini::tiled_matmul_auto_tensor(&args);
+            if (args.weight_i8_scale_active) {
+                ggml::gemmini::log::debug(layer,
+                    "[tensor] route dense_i8 weight_scale=%.9f dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
+                    static_cast<double>(args.weight_scale), args.I, args.J, args.K, args.sB,
+                    static_cast<int>(args.tiled_matmul_type));
+                ggml::gemmini::tiled_matmul_auto_tensor(&args);
+            } else {
+                ggml::gemmini::tiled_matmul_auto_im2p(&args);
+            }
         }
     }
     // dst에는 gemmini 커널에서 dequantize한 결과가 들어옴 
