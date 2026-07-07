@@ -11,6 +11,12 @@
 #include <cctype>
 #include <algorithm>
 
+#if defined(_WIN32)
+#include <cstdlib>
+#else
+#include <stdlib.h>
+#endif
+
 struct quant_option {
     std::string name;
     llama_ftype ftype;
@@ -67,6 +73,7 @@ static const char * const LLM_KV_QUANTIZE_IMATRIX_FILE       = "quantize.imatrix
 static const char * const LLM_KV_QUANTIZE_IMATRIX_DATASET    = "quantize.imatrix.dataset";
 static const char * const LLM_KV_QUANTIZE_IMATRIX_N_ENTRIES  = "quantize.imatrix.entries_count";
 static const char * const LLM_KV_QUANTIZE_IMATRIX_N_CHUNKS   = "quantize.imatrix.chunks_count";
+static const char * const GEMMINI_Q8_0_R_ARTIFACT_ENV        = "LLAMA_GEMMINI_Q8_0_R_ARTIFACT";
 
 static bool striequals(const char * a, const char * b) {
     while (*a && *b) {
@@ -113,7 +120,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 [[noreturn]]
 static void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights] [--exclude-weights] [--output-tensor-type]\n", executable);
-    printf("       [--token-embedding-type] [--tensor-type] [--keep-split] [--override-kv] model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
+    printf("       [--token-embedding-type] [--tensor-type] [--keep-split] [--override-kv] [--gemmini-q8-0-r-artifact] model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize: Allows requantizing tensors that have already been quantized. Warning: This can severely reduce quality compared to quantizing from 16bit or 32bit\n");
     printf("  --leave-output-tensor: Will leave output.weight un(re)quantized. Increases model size but may also increase quality, especially when requantizing\n");
     printf("  --pure: Disable k-quant mixtures and quantize all tensors to the same type\n");
@@ -125,6 +132,7 @@ static void usage(const char * executable) {
     printf("  --tensor-type TENSOR=TYPE: quantize this tensor to this ggml_type. example: --tensor-type attn_q=q8_0\n");
     printf("      Advanced option to selectively quantize tensors. May be specified multiple times.\n");
     printf("  --keep-split: will generate quantized model in the same shards as input\n");
+    printf("  --gemmini-q8-0-r-artifact file_name: write a Gemmini Q8_0_R sidecar while producing Q8_0 GGUF\n");
     printf("  --override-kv KEY=TYPE:VALUE\n");
     printf("      Advanced option to override model metadata by key in the quantized model. May be specified multiple times.\n");
     printf("Note: --include-weights and --exclude-weights cannot be used together\n");
@@ -298,6 +306,7 @@ int main(int argc, char ** argv) {
     std::vector<std::string> included_weights, excluded_weights;
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<tensor_quantization> tensor_types;
+    std::string gemmini_q8_0_r_artifact;
 
     for (; arg_idx < argc && strncmp(argv[arg_idx], "--", 2) == 0; arg_idx++) {
         if (strcmp(argv[arg_idx], "--leave-output-tensor") == 0) {
@@ -352,6 +361,12 @@ int main(int argc, char ** argv) {
             }
         } else if (strcmp(argv[arg_idx], "--keep-split") == 0) {
             params.keep_split = true;
+        } else if (strcmp(argv[arg_idx], "--gemmini-q8-0-r-artifact") == 0) {
+            if (arg_idx < argc-1) {
+                gemmini_q8_0_r_artifact = argv[++arg_idx];
+            } else {
+                usage(argv[0]);
+            }
         } else {
             usage(argv[0]);
         }
@@ -410,6 +425,13 @@ int main(int argc, char ** argv) {
     }
     if (!tensor_types.empty()) {
         params.tensor_types = &tensor_types;
+    }
+    if (!gemmini_q8_0_r_artifact.empty()) {
+#if defined(_WIN32)
+        _putenv_s(GEMMINI_Q8_0_R_ARTIFACT_ENV, gemmini_q8_0_r_artifact.c_str());
+#else
+        setenv(GEMMINI_Q8_0_R_ARTIFACT_ENV, gemmini_q8_0_r_artifact.c_str(), 1);
+#endif
     }
 
     llama_backend_init();
