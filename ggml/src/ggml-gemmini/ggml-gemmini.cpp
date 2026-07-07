@@ -797,6 +797,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                     static_cast<double>(args.weight_scale), args.I, args.J, args.K, args.sB,
                     static_cast<int>(args.tiled_matmul_type));
                 ggml::gemmini::tiled_matmul_auto_tensor(&args);
+            } else {
+                ggml::gemmini::tiled_matmul_auto_im2p(&args);
             }
         }
     }
