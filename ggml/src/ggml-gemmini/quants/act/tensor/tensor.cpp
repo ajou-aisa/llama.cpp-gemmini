@@ -58,6 +58,16 @@ struct BitMask
         const size_t idx = row * cols + col;
         words[idx / 64] |= uint64_t(1) << (idx % 64);
     }
+
+    bool is_marked(size_t row, size_t col) const
+    {
+        if (row >= rows || col >= cols) {
+            return false;
+        }
+
+        const size_t idx = row * cols + col;
+        return (words[idx / 64] & (uint64_t(1) << (idx % 64))) != 0;
+    }
 };
 
 struct TensorStats
@@ -227,7 +237,7 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
 
             #if ERROR_COMPENSATION
                 const int32_t residual = q32 - static_cast<int32_t>(q8);
-                if (residual != 0) {
+                if (outliers.is_marked(row, col) && residual != 0) {
                     meta->outliers.push_back({
                         static_cast<int>(row),
                         static_cast<int>(col),
