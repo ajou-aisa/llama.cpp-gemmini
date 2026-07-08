@@ -7,3 +7,10 @@ common/build-info.cpp
 
 # cycle log
 log/
+
+# model source
+gpt2/*
+
+#venv files
+
+.venv/*
