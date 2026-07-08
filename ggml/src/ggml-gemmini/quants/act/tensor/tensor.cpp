@@ -9,6 +9,9 @@
 #include "../../common/tensor_util.hpp"
 #include "tensor.hpp"
 
+#include <gemmini/layer.hpp>
+#include <gemmini/log.hpp>
+
 namespace ggml::gemmini::quants::act::tensor
 {
 
@@ -188,6 +191,8 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
         return false;
     }
 
+    const char *layer = ggml::gemmini::types::to_string(args.layer_type);
+
     #if ERROR_COMPENSATION
         TensorStats stats;
         TensorStats inlier_stats;
@@ -232,6 +237,23 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
             #endif
         }
     }
+
+    #if ERROR_COMPENSATION
+        ggml::gemmini::log::debug(layer,
+            "[quantize_tensor] I=%zu K=%zu scale=%.9g mean=%.6g sigma=%.6g max_abs=%.6g count=%zu "
+            "inlier_max_abs=%.6g inlier_count=%zu residual_outliers=%zu",
+            args.I, args.K,
+            static_cast<double>(meta->scale),
+            stats.mean, stats.sigma, stats.max_abs, stats.count,
+            inlier_stats.max_abs, inlier_stats.count,
+            meta->outliers.size());
+    #else
+        ggml::gemmini::log::debug(layer,
+            "[quantize_tensor] I=%zu K=%zu scale=%.9g mean=%.6g sigma=%.6g max_abs=%.6g count=%zu",
+            args.I, args.K,
+            static_cast<double>(meta->scale),
+            stats.mean, stats.sigma, stats.max_abs, stats.count);
+    #endif
 
     return true;
 }
