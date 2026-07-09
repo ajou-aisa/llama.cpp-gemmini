@@ -64,6 +64,8 @@ namespace ggml::gemmini::log
 
         bool set_output_path(const char *path);
 
+        bool has_explicit_output() const { return has_explicit_output_; }
+
     protected:
         FILE *select_output(const char *path, bool *owns) const;
 
@@ -73,6 +75,7 @@ namespace ggml::gemmini::log
         void close_owned();
 
         bool owns_;
+        bool has_explicit_output_ = false;
     };
 
     class DebugLog : public Log

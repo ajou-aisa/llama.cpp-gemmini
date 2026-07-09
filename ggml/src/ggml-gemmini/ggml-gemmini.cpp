@@ -134,8 +134,14 @@ uint64_t start, end; // 일반 사이클 측정
 static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                                          struct ggml_tensor *dst) // FP32 output (I×J)
 {
-    ggml::gemmini::log::cycle.set_output_path("log/cycle-log.jsonl");
-    ggml::gemmini::log::debug.set_output_path("log/debug-log.jsonl");
+    if (!ggml::gemmini::log::cycle.has_explicit_output())
+    {
+        ggml::gemmini::log::cycle.set_output_path("log/cycle-log.jsonl");
+    }
+    if (!ggml::gemmini::log::debug.has_explicit_output())
+    {
+        ggml::gemmini::log::debug.set_output_path("log/debug-log.jsonl");
+    }
     const auto layer_type = ggml::gemmini::types::parse_layer(dst->src[1]->name);
     const char *layer = ggml::gemmini::types::to_string(layer_type);
     ggml::gemmini::log::debug(layer, "ggml_backend_gemmini_mul_mat called");
@@ -212,6 +218,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.I = I;
     args.J = J;
     args.K = K;
+    args.tiled_matmul_type = OPTION;
 
     /* _____ 3. Gemmini용 stride _____ */
     args.sA = K;
@@ -479,7 +486,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.f_out = static_cast<float*>(dst->data);
     args.col_stride_f_out = dst->nb[0] / sizeof(float);
     args.stride_f_out = dst->nb[1] / sizeof(float);
-    args.tiled_matmul_type = OPTION;
 
     end = ggml::gemmini::cycle::read();
     ggml::gemmini::log::cycle(layer, "cpu.Set Args for calling gemmini", start, end);
