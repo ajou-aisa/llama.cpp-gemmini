@@ -1,4 +1,4 @@
-#include "llama-gemmini-q80r.h"
+#include "llama-gemmini-q8_h1.h"
 
 #include <algorithm>
 #include <cmath>
@@ -12,9 +12,9 @@ namespace {
 
 constexpr size_t GEMMINI_Q8_0_BLOCK_SIZE = 32;
 constexpr size_t GEMMINI_Q8_0_BLOCK_BYTES = sizeof(ggml_fp16_t) + GEMMINI_Q8_0_BLOCK_SIZE;
-constexpr float GEMMINI_Q8_0_R_SCALE_BINS = 255.0f;
+constexpr float GEMMINI_Q8_H1_SCALE_BINS = 255.0f;
 
-uint8_t gemmini_q8_0_r_sub(float scale, float sups, uint16_t z) {
+uint8_t gemmini_q8_h1_sub(float scale, float sups, uint16_t z) {
     if (!std::isfinite(scale) || !std::isfinite(sups) || sups <= 0.0f) {
         return 0;
     }
@@ -25,7 +25,7 @@ uint8_t gemmini_q8_0_r_sub(float scale, float sups, uint16_t z) {
     return static_cast<uint8_t>(clamped);
 }
 
-struct gemmini_q8_0_r_tensor {
+struct gemmini_q8_h1_tensor {
     std::vector<int8_t> qs;
     std::vector<uint8_t> subs;
     std::vector<ggml_fp16_t> sups;
@@ -61,7 +61,7 @@ bool checked_logical_rows(const ggml_tensor * tensor, int64_t & out) {
     return true;
 }
 
-bool gemmini_q8_0_r_from_q8_0(q8_0_tensor_view src, gemmini_q8_0_r_tensor & dst) {
+bool gemmini_q8_h1_from_q8_0(q8_0_tensor_view src, gemmini_q8_h1_tensor & dst) {
     if (!src.data || src.ne0 <= 0 || src.logical_rows <= 0 || src.ne0 % static_cast<int64_t>(GEMMINI_Q8_0_BLOCK_SIZE) != 0) {
         return false;
     }
@@ -111,7 +111,7 @@ bool gemmini_q8_0_r_from_q8_0(q8_0_tensor_view src, gemmini_q8_0_r_tensor & dst)
             continue;
         }
 
-        const float range_sups = scale_range / GEMMINI_Q8_0_R_SCALE_BINS;
+        const float range_sups = scale_range / GEMMINI_Q8_H1_SCALE_BINS;
         const float offset_sups = min_scale > 0.0f ? min_scale / static_cast<float>(std::numeric_limits<uint16_t>::max()) : 0.0f;
         const float sups = std::max(range_sups, offset_sups);
         if (!std::isfinite(sups) || sups <= 0.0f) {
@@ -127,7 +127,7 @@ bool gemmini_q8_0_r_from_q8_0(q8_0_tensor_view src, gemmini_q8_0_r_tensor & dst)
 
         const float stored_sups = ggml_fp16_to_fp32(dst.sups[row]);
         for (size_t block = 0; block < blocks_per_row; ++block) {
-            dst.subs[row * blocks_per_row + block] = gemmini_q8_0_r_sub(scales[block], stored_sups, z);
+            dst.subs[row * blocks_per_row + block] = gemmini_q8_h1_sub(scales[block], stored_sups, z);
         }
     }
 
@@ -154,35 +154,35 @@ void gemmini_write_i64(std::ofstream & file, int64_t value) {
 
 }
 
-gemmini_q8_0_r_artifact_writer::gemmini_q8_0_r_artifact_writer(const char * path) {
+gemmini_q8_h1_artifact_writer::gemmini_q8_h1_artifact_writer(const char * path) {
     if (!path) {
         return;
     }
     file = std::ofstream(path, std::ios::binary);
     file.exceptions(std::ofstream::failbit);
-    const char magic[8] = {'G', 'Q', '8', '0', 'R', 0, 1, 0};
+    const char magic[8] = {'G', 'Q', '8', 'H', '1', 0, 1, 0};
     file.write(magic, sizeof(magic));
     gemmini_write_u32(file, 1);
     gemmini_write_u32(file, 0);
     gemmini_write_u64(file, 0);
 }
 
-void gemmini_q8_0_r_artifact_writer::add_tensor(const std::string & name, const ggml_tensor * tensor, const void * data) {
+void gemmini_q8_h1_artifact_writer::add_tensor(const std::string & name, const ggml_tensor * tensor, const void * data) {
     if (!file.is_open()) {
         return;
     }
 
     int64_t logical_rows = 0;
     if (!checked_logical_rows(tensor, logical_rows)) {
-        throw std::runtime_error("invalid Gemmini Q8_0_R tensor shape " + name);
+        throw std::runtime_error("invalid Gemmini Q8_H1 tensor shape " + name);
     }
     if (tensor->ne[0] <= 0 || tensor->ne[0] % static_cast<int64_t>(GEMMINI_Q8_0_BLOCK_SIZE) != 0) {
-        throw std::runtime_error("invalid Gemmini Q8_0_R tensor K dimension " + name);
+        throw std::runtime_error("invalid Gemmini Q8_H1 tensor K dimension " + name);
     }
-    gemmini_q8_0_r_tensor q80r;
+    gemmini_q8_h1_tensor q8_h1;
     const q8_0_tensor_view view { data, tensor->ne[0], logical_rows };
-    if (!gemmini_q8_0_r_from_q8_0(view, q80r)) {
-        throw std::runtime_error("failed to build Gemmini Q8_0_R artifact tensor " + name);
+    if (!gemmini_q8_h1_from_q8_0(view, q8_h1)) {
+        throw std::runtime_error("failed to build Gemmini Q8_H1 artifact tensor " + name);
     }
 
     gemmini_write_u32(file, static_cast<uint32_t>(name.size()));
@@ -193,18 +193,18 @@ void gemmini_q8_0_r_artifact_writer::add_tensor(const std::string & name, const 
     gemmini_write_u64(file, static_cast<uint64_t>(logical_rows));
     gemmini_write_u64(file, static_cast<uint64_t>(tensor->ne[0]));
     gemmini_write_u64(file, static_cast<uint64_t>(tensor->ne[0] / static_cast<int64_t>(GEMMINI_Q8_0_BLOCK_SIZE)));
-    gemmini_write_u64(file, static_cast<uint64_t>(q80r.qs.size() * sizeof(q80r.qs[0])));
-    gemmini_write_u64(file, static_cast<uint64_t>(q80r.subs.size() * sizeof(q80r.subs[0])));
-    gemmini_write_u64(file, static_cast<uint64_t>(q80r.sups.size() * sizeof(q80r.sups[0])));
-    gemmini_write_u64(file, static_cast<uint64_t>(q80r.z.size() * sizeof(q80r.z[0])));
-    gemmini_write_bytes(file, q80r.qs.data(), q80r.qs.size() * sizeof(q80r.qs[0]));
-    gemmini_write_bytes(file, q80r.subs.data(), q80r.subs.size() * sizeof(q80r.subs[0]));
-    gemmini_write_bytes(file, q80r.sups.data(), q80r.sups.size() * sizeof(q80r.sups[0]));
-    gemmini_write_bytes(file, q80r.z.data(), q80r.z.size() * sizeof(q80r.z[0]));
+    gemmini_write_u64(file, static_cast<uint64_t>(q8_h1.qs.size() * sizeof(q8_h1.qs[0])));
+    gemmini_write_u64(file, static_cast<uint64_t>(q8_h1.subs.size() * sizeof(q8_h1.subs[0])));
+    gemmini_write_u64(file, static_cast<uint64_t>(q8_h1.sups.size() * sizeof(q8_h1.sups[0])));
+    gemmini_write_u64(file, static_cast<uint64_t>(q8_h1.z.size() * sizeof(q8_h1.z[0])));
+    gemmini_write_bytes(file, q8_h1.qs.data(), q8_h1.qs.size() * sizeof(q8_h1.qs[0]));
+    gemmini_write_bytes(file, q8_h1.subs.data(), q8_h1.subs.size() * sizeof(q8_h1.subs[0]));
+    gemmini_write_bytes(file, q8_h1.sups.data(), q8_h1.sups.size() * sizeof(q8_h1.sups[0]));
+    gemmini_write_bytes(file, q8_h1.z.data(), q8_h1.z.size() * sizeof(q8_h1.z[0]));
     ++tensor_count;
 }
 
-void gemmini_q8_0_r_artifact_writer::finish() {
+void gemmini_q8_h1_artifact_writer::finish() {
     if (!file.is_open()) {
         return;
     }

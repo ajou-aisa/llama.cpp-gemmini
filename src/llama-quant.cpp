@@ -1,7 +1,7 @@
 #include "llama-quant.h"
 
 #include "llama-impl.h"
-#include "llama-gemmini-q80r.h"
+#include "llama-gemmini-q8_h1.h"
 #include "llama-model.h"
 #include "llama-model-loader.h"
 
@@ -22,7 +22,7 @@ struct tensor_quantization {
     ggml_type quant = GGML_TYPE_COUNT;
 };
 
-static const char * const GEMMINI_Q8_0_R_ARTIFACT_ENV = "LLAMA_GEMMINI_Q8_0_R_ARTIFACT";
+static const char * const GEMMINI_Q8_H1_ARTIFACT_ENV = "LLAMA_GEMMINI_Q8_H1_ARTIFACT";
 
 static void zeros(std::ofstream & file, size_t n) {
     char zero = 0;
@@ -477,8 +477,8 @@ static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * 
 static void llama_model_quantize_impl(const std::string & fname_inp, const std::string & fname_out, const llama_model_quantize_params * params) {
     ggml_type default_type;
     llama_ftype ftype = params->ftype;
-    const char * gemmini_q8_0_r_artifact = std::getenv(GEMMINI_Q8_0_R_ARTIFACT_ENV);
-    if (gemmini_q8_0_r_artifact && params->ftype != LLAMA_FTYPE_MOSTLY_Q8_0) {
+    const char * gemmini_q8_h1_artifact = std::getenv(GEMMINI_Q8_H1_ARTIFACT_ENV);
+    if (gemmini_q8_h1_artifact && params->ftype != LLAMA_FTYPE_MOSTLY_Q8_0) {
         throw std::runtime_error("--gemmini-q8-0-r-artifact requires Q8_0 output");
     }
 
@@ -661,7 +661,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     std::vector<no_init<uint8_t>> read_data;
     std::vector<no_init<uint8_t>> work;
     std::vector<no_init<float>> f32_conv_buf;
-    gemmini_q8_0_r_artifact_writer q80r_artifact(gemmini_q8_0_r_artifact);
+    gemmini_q8_h1_artifact_writer q8_h1_artifact(gemmini_q8_h1_artifact);
 
     uint16_t n_split = 1;
 
@@ -922,8 +922,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         GGML_ASSERT(gguf_get_tensor_size(ctx_outs[cur_split].get(), gguf_find_tensor(ctx_outs[cur_split].get(), name.c_str())) == new_size);
         gguf_set_tensor_data(ctx_outs[cur_split].get(), name.c_str(), new_data);
 
-        if (gemmini_q8_0_r_artifact && new_type == GGML_TYPE_Q8_0) {
-            q80r_artifact.add_tensor(name, tensor, new_data);
+        if (gemmini_q8_h1_artifact && new_type == GGML_TYPE_Q8_0) {
+            q8_h1_artifact.add_tensor(name, tensor, new_data);
         }
 
         // write tensor data + padding
@@ -931,7 +931,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         zeros(fout, GGML_PAD(new_size, align) - new_size);
     }
     close_ofstream();
-    q80r_artifact.finish();
+    q8_h1_artifact.finish();
 
     LLAMA_LOG_INFO("%s: model size  = %8.2f MB\n", __func__, total_size_org/1024.0/1024.0);
     LLAMA_LOG_INFO("%s: quant size  = %8.2f MB\n", __func__, total_size_new/1024.0/1024.0);

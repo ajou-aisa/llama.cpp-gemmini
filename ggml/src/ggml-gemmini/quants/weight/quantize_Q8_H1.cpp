@@ -1,6 +1,6 @@
-// Q8_0_R weight quantization implementation (ggml-free)
+// Q8_H1 weight quantization implementation (ggml-free)
 
-#include "quantize_Q8_0_R.hpp"
+#include "quantize_Q8_H1.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -12,7 +12,7 @@
 namespace ggml::gemmini::quants { namespace {
 
 constexpr size_t q8_0_block_size = 32;
-constexpr float q8_0_r_scale_bins = 255.0f;
+constexpr float q8_h1_scale_bins = 255.0f;
 
 uint8_t round_to_u8(float value)
 {
@@ -35,7 +35,7 @@ uint8_t quantize_scale_code(float s_b, float s_rf, uint16_t R)
     return static_cast<uint8_t>(clamped);
 }
 
-void set_constant_scale(float s_b, int blocks_per_row, BlockQ8_0_R *dst)
+void set_constant_scale(float s_b, int blocks_per_row, BlockQ8_H1 *dst)
 {
     if (s_b > 0.0f && std::isfinite(s_b)) {
         dst->s_rf = s_b;
@@ -50,10 +50,10 @@ void set_constant_scale(float s_b, int blocks_per_row, BlockQ8_0_R *dst)
 
 } // namespace
 
-bool quantize_row_q8_0_r(
+bool quantize_row_q8_h1(
     const block_q8_0 *src_blocks,
     int blocks_per_row,
-    BlockQ8_0_R *dst
+    BlockQ8_H1 *dst
 ) {
     if (!src_blocks || !dst || !dst->c_b || !dst->qs || blocks_per_row <= 0)
         return false;
@@ -83,7 +83,7 @@ bool quantize_row_q8_0_r(
         return true;
     }
 
-    dst->s_rf = scale_range / q8_0_r_scale_bins;
+    dst->s_rf = scale_range / q8_h1_scale_bins;
     if (!std::isfinite(dst->s_rf) || dst->s_rf <= 0.0f) {
         set_constant_scale(min_s, blocks_per_row, dst);
         return true;
@@ -100,11 +100,11 @@ bool quantize_row_q8_0_r(
     return true;
 }
 
-bool quantize_stripe_q8_0_r(
+bool quantize_stripe_q8_h1(
     const block_q8_0 *src_blocks,
     int blocks_per_row,
     int num_rows,
-    BlockQ8_0_R *dst,
+    BlockQ8_H1 *dst,
     float *dst_s_rf_stripe,
     uint16_t *dst_R_stripe
 ) {
@@ -125,7 +125,7 @@ bool quantize_stripe_q8_0_r(
 
     for (int row_idx = 0; row_idx < num_rows; ++row_idx) {
         const size_t row_offset = static_cast<size_t>(row_idx) * static_cast<size_t>(blocks_per_row);
-        BlockQ8_0_R &dst_row = dst[row_idx];
+        BlockQ8_H1 &dst_row = dst[row_idx];
 
         for (int block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
             const block_q8_0 &src_block = src_blocks[row_offset + static_cast<size_t>(block_idx)];
@@ -153,7 +153,7 @@ bool quantize_stripe_q8_0_r(
         return true;
     }
 
-    const float s_rf = scale_range / q8_0_r_scale_bins;
+    const float s_rf = scale_range / q8_h1_scale_bins;
     if (!std::isfinite(s_rf) || s_rf <= 0.0f) {
         for (int row_idx = 0; row_idx < num_rows; ++row_idx)
             set_constant_scale(min_s, blocks_per_row, &dst[row_idx]);
@@ -170,7 +170,7 @@ bool quantize_stripe_q8_0_r(
 
     for (int row_idx = 0; row_idx < num_rows; ++row_idx) {
         const size_t row_offset = static_cast<size_t>(row_idx) * static_cast<size_t>(blocks_per_row);
-        BlockQ8_0_R &dst_row = dst[row_idx];
+        BlockQ8_H1 &dst_row = dst[row_idx];
         dst_row.s_rf = s_rf;
         dst_row.R = R;
 
@@ -183,7 +183,7 @@ bool quantize_stripe_q8_0_r(
     return true;
 }
 
-float recover_block_scale(const BlockQ8_0_R *block, int block_idx)
+float recover_block_scale(const BlockQ8_H1 *block, int block_idx)
 {
     if (!block || !block->c_b || block_idx < 0)
         return 0.0f;

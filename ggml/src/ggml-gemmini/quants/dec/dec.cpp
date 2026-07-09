@@ -90,7 +90,7 @@ namespace ggml::gemmini::quants::dec { namespace
             return result;
         }
 
-        if (is_q80_r_weight_args(args))
+        if (is_q8_h1_weight_args(args))
         {
             static thread_local std::vector<float> weight_scales;
             const size_t rows = args.blocks_J ? args.blocks_J : args.J;

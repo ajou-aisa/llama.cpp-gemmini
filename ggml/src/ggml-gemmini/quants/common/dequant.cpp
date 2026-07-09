@@ -23,14 +23,14 @@ struct WeightScaleInfo
     bool supported = true;
 };
 
-struct Q80ROutputDequantScratch
+struct Q8H1OutputDequantScratch
 {
     std::vector<float> weight_scales;
 };
 
-Q80ROutputDequantScratch &get_q80_r_output_dequant_scratch()
+Q8H1OutputDequantScratch &get_q8_h1_output_dequant_scratch()
 {
-    static thread_local Q80ROutputDequantScratch scratch;
+    static thread_local Q8H1OutputDequantScratch scratch;
     return scratch;
 }
 
@@ -58,8 +58,8 @@ WeightScaleInfo build_weight_scale_info(const ggml_gemmini_args_t &args)
         return result;
     }
 
-    if (quants::dec::is_q80_r_weight_args(args)) {
-        auto &scratch = get_q80_r_output_dequant_scratch();
+    if (quants::dec::is_q8_h1_weight_args(args)) {
+        auto &scratch = get_q8_h1_output_dequant_scratch();
         const size_t rows = args.blocks_J ? args.blocks_J : args.J;
         const size_t cols = args.blocks_per_row;
         const size_t block_size = QK8_0;

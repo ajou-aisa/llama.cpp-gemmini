@@ -12,7 +12,7 @@ namespace ggml::gemmini::quants::dec
         JxK_ColMajor,
     };
 
-    inline bool is_q80_r_weight_args(const ggml_gemmini_args_t &args)
+    inline bool is_q8_h1_weight_args(const ggml_gemmini_args_t &args)
     {
         return args.B &&
                !args.B_scales &&
@@ -23,7 +23,7 @@ namespace ggml::gemmini::quants::dec
 
     inline WeightLayout resolve_weight_layout(const ggml_gemmini_args_t &args)
     {
-        if (is_q80_r_weight_args(args) || args.transpose_B)
+        if (is_q8_h1_weight_args(args) || args.transpose_B)
             return WeightLayout::JxK_ColMajor;
 
         return WeightLayout::KxJ_RowMajor;
@@ -31,7 +31,7 @@ namespace ggml::gemmini::quants::dec
 
     inline size_t resolve_weight_stride_elems(const ggml_gemmini_args_t &args)
     {
-        if (is_q80_r_weight_args(args))
+        if (is_q8_h1_weight_args(args))
             return args.K;
 
         const size_t fallback_stride = args.transpose_B ? args.K : args.J;
