@@ -77,7 +77,7 @@ typedef struct ggml_gemmini_args_t {
 
     // metadata extracted from Q8_0 tensors
     struct unpacked_weight {
-        // Q8_0_R path (default): row-wise double-quantized planar weights
+        // Q8_H1 path (default): row-wise double-quantized planar weights
         std::vector<int8_t> q_qs;          // [logical_rows * K] dense int8 weights
         std::vector<uint8_t> c_b;         // [logical_rows][blocks_per_row]
         std::vector<float> s_rf;           // [logical_rows]
@@ -126,7 +126,7 @@ typedef struct ggml_gemmini_args_t {
                 return false;
             if (block_size_k != QK8_0 || logical_cols != logical_cols_)
                 return false;
-            // Q8_0_R planar validity check
+            // Q8_H1 planar validity check
             if (q_qs.size() != logical_cols_ * static_cast<size_t>(k))
                 return false;
             if (c_b.size() != blocks_k * logical_cols_)
@@ -156,7 +156,7 @@ typedef struct ggml_gemmini_args_t {
     bool weight_i8_scale_active = false;
     float weight_scale = 1.0f;
 
-    // Q8_0_R weight fields (default path, no mode flag needed)
+    // Q8_H1 weight fields (default path, no mode flag needed)
     const uint8_t  *c_b = nullptr;       // [J * blocks_per_row] per-block effective code
     const float    *s_rf = nullptr;       // [J] per-row float scale
     const uint16_t *R = nullptr;           // [J] per-row offset

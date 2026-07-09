@@ -6,9 +6,9 @@
 #include <fstream>
 #include <string>
 
-class gemmini_q8_0_r_artifact_writer {
+class gemmini_q8_h1_artifact_writer {
 public:
-    explicit gemmini_q8_0_r_artifact_writer(const char * path);
+    explicit gemmini_q8_h1_artifact_writer(const char * path);
 
     void add_tensor(const std::string & name, const ggml_tensor * tensor, const void * data);
     void finish();

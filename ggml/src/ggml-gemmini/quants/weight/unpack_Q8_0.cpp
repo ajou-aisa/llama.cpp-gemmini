@@ -15,7 +15,7 @@
 
 namespace ggml::gemmini::quants { namespace {
 
-constexpr float q8_0_r_scale_bins = 255.0f;
+constexpr float q8_h1_scale_bins = 255.0f;
 
 uint8_t quantize_scale_code(float s_b, float s_rf, uint16_t R) {
     if (!std::isfinite(s_b) || !std::isfinite(s_rf) || s_rf <= 0.0f)
@@ -63,7 +63,7 @@ bool quantize_row_scales_q80_r(
         return true;
     }
 
-    dst_s_rf = scale_range / q8_0_r_scale_bins;
+    dst_s_rf = scale_range / q8_h1_scale_bins;
     if (!std::isfinite(dst_s_rf) || dst_s_rf <= 0.0f) {
         set_constant_scale(min_s, blocks_per_row, dst_c_b, dst_s_rf, dst_R);
         return true;
@@ -111,7 +111,7 @@ bool quantize_stripe_scales_q80_r(
         return true;
     }
 
-    const float s_rf = scale_range / q8_0_r_scale_bins;
+    const float s_rf = scale_range / q8_h1_scale_bins;
     if (!std::isfinite(s_rf) || s_rf <= 0.0f) {
         for (size_t row_idx = 0; row_idx < num_rows; ++row_idx)
             set_constant_scale(min_s, blocks_per_row, dst_c_b + row_idx * blocks_per_row, dst_s_rf[row_idx], dst_R[row_idx]);

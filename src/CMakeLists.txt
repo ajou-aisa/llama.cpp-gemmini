@@ -14,7 +14,7 @@ add_library(llama
             llama-batch.cpp
             llama-chat.cpp
             llama-context.cpp
-            llama-gemmini-q80r.cpp
+            llama-gemmini-q8_h1.cpp
             llama-grammar.cpp
             llama-graph.cpp
             llama-hparams.cpp

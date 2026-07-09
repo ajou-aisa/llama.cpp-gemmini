@@ -378,7 +378,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         } else {
             if (it == ctx->weight_cache.end()) {
                 ggml::gemmini::log::debug(layer,
-                                 "[Q8_0_R cache] miss base=%p K=%lld cols=%zu blocks_K=%zu logical_stripe_J=%zu stripe_J=%zu",
+                                 "[Q8_H1 cache] miss base=%p K=%lld cols=%zu blocks_K=%zu logical_stripe_J=%zu stripe_J=%zu",
                                  (const void *)block_base,
                                  static_cast<long long>(dim_k),
                                  logical_rows,
@@ -387,7 +387,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                                  args.stripe_J);
             } else {
                 ggml::gemmini::log::debug(layer,
-                                 "[Q8_0_R cache] refresh base=%p K=%lld cols=%zu blocks_K=%zu logical_stripe_J=%zu stripe_J=%zu",
+                                 "[Q8_H1 cache] refresh base=%p K=%lld cols=%zu blocks_K=%zu logical_stripe_J=%zu stripe_J=%zu",
                                  (const void *)block_base,
                                  static_cast<long long>(dim_k),
                                  logical_rows,
@@ -409,7 +409,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             entry.transpose_b = args.transpose_B;
             entry.logical_stripe_J = logical_stripe_J;
 
-            // Populate cached Q8_0_R buffers directly from absorbed algorithms.
+            // Populate cached Q8_H1 buffers directly from absorbed algorithms.
             const bool ok = unpack_q80_r_weight(
                 src0,
                 args,
@@ -461,14 +461,14 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         args.R_stripe = cached->stripe_J > 1 ? cached->R_stripe.data() : nullptr;
 
         ggml::gemmini::log::debug(layer,
-            "[Q8_0_R cache] restore B=%p sB=%zu c_b=%p s_rf=%p R=%p blocks_per_row=%zu logical_stripe_J=%zu stripe_J=%zu",
+            "[Q8_H1 cache] restore B=%p sB=%zu c_b=%p s_rf=%p R=%p blocks_per_row=%zu logical_stripe_J=%zu stripe_J=%zu",
             (void *)args.B, args.sB, (void *)args.c_b, (void *)args.s_rf, (void *)args.R,
             args.blocks_per_row, cached->logical_stripe_J, args.stripe_J);
         // ggml::gemmini::log::debug("[Gemmini addr] layer=%s A=%p B=%p B_blocks=%p B_scales=%p",
         //                  layer, (void *)args.A, (void *)args.B, (const void *)args.B_blocks, (const void *)args.B_scales);
 
         end = ggml::gemmini::cycle::read();
-        ggml::gemmini::log::cycle(layer, "cpu.Breakdown Q8_0_R", start, end);
+        ggml::gemmini::log::cycle(layer, "cpu.Breakdown Q8_H1", start, end);
     }
 
     start = ggml::gemmini::cycle::read();
