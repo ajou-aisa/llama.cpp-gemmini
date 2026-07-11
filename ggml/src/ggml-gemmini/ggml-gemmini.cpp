@@ -4,15 +4,15 @@
 #include <cstring>
 #include <vector>
 #include <string>
-#include <utility>
 
 #include <limits>
 
-#include <map>
 #include <memory>
 #include "ggml-impl.h"
 #include "ggml-gemmini.h"
 #include "ggml-gemmini-config.hpp"
+#include "ggml-gemmini-q8-h1-artifact.hpp"
+#include "ggml-gemmini-q8-h1-reprocess.hpp"
 #include "ggml-backend-impl.h"
 #include "ggml-quants.h"
 
@@ -25,6 +25,7 @@
 #include "ggml-gemmini-args.h"
 #include "quants/common/tensor_util.hpp"
 #include "quants/act/quantize.hpp"
+#include "quants/weight/quantize_Q8_H1.hpp"
 #include "quants/weight/unpack_Q8_0.hpp"
 //#include "quantization/ggml-gemmini-quantize.h"
 
@@ -51,10 +52,59 @@
 #define OPTION CPU
 #endif
 
-using namespace ggml::gemmini::quants;
-
 namespace
 {
+    bool log_prepare_q8_0_rows_for_q8_h1_fail(const char * reason, const ggml_tensor * src, int64_t row = -1) {
+        const int64_t ne0 = src ? src->ne[0] : -1;
+        const int64_t ne1 = src ? src->ne[1] : -1;
+        const int64_t ne2 = src ? src->ne[2] : -1;
+        const int64_t ne3 = src ? src->ne[3] : -1;
+        const size_t nb0 = src ? src->nb[0] : 0;
+        const size_t nb1 = src ? src->nb[1] : 0;
+        const size_t nb2 = src ? src->nb[2] : 0;
+        const size_t nb3 = src ? src->nb[3] : 0;
+        const ggml_type type = src ? src->type : GGML_TYPE_COUNT;
+        const void * data = src ? src->data : nullptr;
+        const void * view = src ? src->view_src : nullptr;
+        const size_t view_offs = src ? src->view_offs : 0;
+        if (row >= 0) {
+            ggml::gemmini::log::debug("Q8_0->Q8_H1",
+                "[prepare_q8_0_rows_for_q8_h1] row=%lld reason=%s src=%p type=%d data=%p view_src=%p view_offs=%zu ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]",
+                (long long) row,
+                reason ? reason : "",
+                (void *)src,
+                (int)type,
+                data,
+                view,
+                view_offs,
+                (long long) ne0, (long long) ne1, (long long) ne2, (long long) ne3,
+                nb0, nb1, nb2, nb3);
+        } else {
+            ggml::gemmini::log::debug("Q8_0->Q8_H1",
+                "[prepare_q8_0_rows_for_q8_h1] reason=%s src=%p type=%d data=%p view_src=%p view_offs=%zu ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]",
+                reason ? reason : "",
+                (void *)src,
+                (int)type,
+                data,
+                view,
+                view_offs,
+                (long long) ne0, (long long) ne1, (long long) ne2, (long long) ne3,
+                nb0, nb1, nb2, nb3);
+        }
+        return false;
+    }
+
+    void ggml_gemmini_log_q8_h1_contract_issue(const char * layer, const ggml_gemmini_args_t & args) {
+        ggml::gemmini::log::debug(layer,
+            "[Q8_H1 contract] format=%d J=%zu K=%zu blocks_per_row=%zu logical_rows=%zu block_count=%zu ptr=%p",
+            (int) args.weight_format,
+            args.J,
+            args.K,
+            args.blocks_per_row,
+            args.q8_h1_native_block_count,
+            (const void *)args.q8_h1_native_blocks);
+    }
+
     bool gemmini_dim_to_size(int64_t dim, size_t &out)
     {
         if (dim <= 0)
@@ -116,39 +166,154 @@ namespace
     }
 }
 
+bool ggml::gemmini::prepare_q8_0_rows_for_q8_h1(
+    const ggml_tensor * src,
+    std::vector<block_q8_h1> & dst,
+    size_t * blocks_per_row_out,
+    size_t * logical_rows_out) {
+    if (src == nullptr) {
+        return log_prepare_q8_0_rows_for_q8_h1_fail("source tensor is null", src);
+    }
+    if (src->type != GGML_TYPE_Q8_0) {
+        return log_prepare_q8_0_rows_for_q8_h1_fail("source tensor type is not Q8_0", src);
+    }
+    if (src->data == nullptr) {
+        return log_prepare_q8_0_rows_for_q8_h1_fail("source tensor data is null", src);
+    }
+    if (src->ne[0] <= 0 || src->ne[0] % QK8_0 != 0) {
+        return log_prepare_q8_0_rows_for_q8_h1_fail("source K dimension is invalid for Q8_0 blocks", src);
+    }
+    if (src->view_src != nullptr && src->view_offs % sizeof(block_q8_0) != 0) {
+        return log_prepare_q8_0_rows_for_q8_h1_fail("source view offset is not block-aligned", src);
+    }
+
+    const int64_t dim_j = src->ne[1] > 0 ? src->ne[1] : 1;
+    const int64_t dim_z = src->ne[2] > 0 ? src->ne[2] : 1;
+    const int64_t dim_w = src->ne[3] > 0 ? src->ne[3] : 1;
+    const size_t dim_k = static_cast<size_t>(src->ne[0]);
+    const size_t blocks_per_row = dim_k / QK8_0;
+    if (blocks_per_row == 0 || blocks_per_row > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        return log_prepare_q8_0_rows_for_q8_h1_fail("blocks_per_row out of range", src);
+    }
+
+    const __int128 logical_rows_128 =
+        static_cast<__int128>(dim_j) * static_cast<__int128>(dim_z) * static_cast<__int128>(dim_w);
+    if (logical_rows_128 <= 0 || logical_rows_128 > static_cast<__int128>(std::numeric_limits<size_t>::max())) {
+        return log_prepare_q8_0_rows_for_q8_h1_fail("logical row count overflow", src);
+    }
+
+    const size_t logical_rows = static_cast<size_t>(logical_rows_128);
+    size_t row_bytes = 0;
+    size_t plane_bytes = 0;
+    size_t storage_bytes = 0;
+    size_t block_count = 0;
+    if (!gemmini_checked_mul(blocks_per_row, sizeof(block_q8_0), row_bytes) ||
+        !gemmini_checked_mul(row_bytes, static_cast<size_t>(dim_j), plane_bytes) ||
+        !gemmini_checked_mul(plane_bytes, static_cast<size_t>(dim_z), storage_bytes) ||
+        !gemmini_checked_mul(storage_bytes, static_cast<size_t>(dim_w), storage_bytes) ||
+        !gemmini_checked_mul(logical_rows, blocks_per_row, block_count) ||
+        src->nb[0] != sizeof(block_q8_0) || src->nb[1] != row_bytes ||
+        src->nb[2] != plane_bytes || src->nb[3] != storage_bytes) {
+        return log_prepare_q8_0_rows_for_q8_h1_fail("invalid source layout metadata", src);
+    }
+    if (src->view_src != nullptr) {
+        const size_t source_bytes = ggml_nbytes(src->view_src);
+        if (src->view_offs > source_bytes || storage_bytes > source_bytes - src->view_offs) {
+            return log_prepare_q8_0_rows_for_q8_h1_fail("view source out of range", src);
+        }
+    }
+
+    const char * base = reinterpret_cast<const char *>(src->view_src ? src->view_src->data : src->data);
+    if (base == nullptr) {
+        return log_prepare_q8_0_rows_for_q8_h1_fail("source base pointer is null", src);
+    }
+    if (src->view_src != nullptr) {
+        base += src->view_offs;
+    }
+    if (reinterpret_cast<uintptr_t>(base) % alignof(block_q8_0) != 0) {
+        return log_prepare_q8_0_rows_for_q8_h1_fail("source base pointer alignment mismatch", src);
+    }
+
+    std::vector<block_q8_h1> converted(block_count);
+    std::vector<ggml::gemmini::quants::BlockQ8_0> source_row(blocks_per_row);
+    std::vector<uint8_t> codes(blocks_per_row);
+    std::vector<int8_t> qs(dim_k);
+    for (size_t row = 0; row < logical_rows; ++row) {
+        std::memcpy(source_row.data(), base + row * row_bytes, row_bytes);
+        for (const ggml::gemmini::quants::BlockQ8_0 & source_block : source_row) {
+            if ((source_block.d & 0x7c00) == 0x7c00) {
+                return log_prepare_q8_0_rows_for_q8_h1_fail("source block has invalid scale", src, static_cast<int64_t>(row));
+            }
+        }
+        ggml::gemmini::quants::BlockQ8_H1 row_h1 = { 0.0f, 0, codes.data(), qs.data() };
+        if (!ggml::gemmini::quants::quantize_row_q8_h1(
+                source_row.data(), static_cast<int>(blocks_per_row), &row_h1)) {
+            return log_prepare_q8_0_rows_for_q8_h1_fail("quantization failed", src, static_cast<int64_t>(row));
+        }
+
+        for (size_t block = 0; block < blocks_per_row; ++block) {
+            block_q8_h1 & dst_block = converted[row * blocks_per_row + block];
+            std::memcpy(dst_block.qs, qs.data() + block * QK8_0, QK8_0);
+            dst_block.c_b = codes[block];
+            dst_block.s_rf = row_h1.s_rf;
+            dst_block.R = row_h1.R;
+        }
+    }
+
+    dst = std::move(converted);
+    if (blocks_per_row_out != nullptr) {
+        *blocks_per_row_out = blocks_per_row;
+    }
+    if (logical_rows_out != nullptr) {
+        *logical_rows_out = logical_rows;
+    }
+    return true;
+}
+
 struct ggml_backend_gemmini_context
 {
     int n_threads = GGML_DEFAULT_N_THREADS;
     std::unique_ptr<char[]> work_data;
     size_t work_size = 0;
-    std::map<const block_q8_0 *, ggml_gemmini_args_t::unpacked_weight> weight_cache; // packed Q8_0 per weight base pointer
     std::string model_arch;
-    
+    ggml::gemmini::q8_h1_artifact_runtime_state q8_h1_artifact;
 };
 
 // Cycle 측정 용
 extern "C" volatile uint64_t gemmini_tiled_matmul_cycles = 0; // gemmini.h
 
-uint64_t start, end; // 일반 사이클 측정
+static void setup_gemmini_log_outputs_if_needed(void) {
+    static thread_local bool configured = false;
+    if (configured) {
+        return;
+    }
+
+    if (!ggml::gemmini::log::cycle.has_explicit_output() &&
+        !ggml::gemmini::log::cycle.set_output_path("log/cycle-log.jsonl")) {
+        GGML_LOG_WARN("%s: failed to set default cycle log path 'log/cycle-log.jsonl'\n", __func__);
+    }
+    if (!ggml::gemmini::log::debug.has_explicit_output() &&
+        !ggml::gemmini::log::debug.set_output_path("log/debug-log.jsonl")) {
+        GGML_LOG_WARN("%s: failed to set default debug log path 'log/debug-log.jsonl'\n", __func__);
+    }
+    configured = true;
+}
 
 static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                                          struct ggml_tensor *dst) // FP32 output (I×J)
 {
-    if (!ggml::gemmini::log::cycle.has_explicit_output())
-    {
-        ggml::gemmini::log::cycle.set_output_path("log/cycle-log.jsonl");
-    }
-    if (!ggml::gemmini::log::debug.has_explicit_output())
-    {
-        ggml::gemmini::log::debug.set_output_path("log/debug-log.jsonl");
+    setup_gemmini_log_outputs_if_needed();
+    if (dst == nullptr || dst->src[0] == nullptr || dst->src[1] == nullptr) {
+        GGML_ABORT("Gemmini mul_mat received null tensor pointers");
     }
     const auto layer_type = ggml::gemmini::types::parse_layer(dst->src[1]->name);
     const char *layer = ggml::gemmini::types::to_string(layer_type);
     ggml::gemmini::log::debug(layer, "ggml_backend_gemmini_mul_mat called");
-
-    /* ____________________________________ 0. 원본 FP32 입력 텐서 ____________________________________________ */
     const auto *src0 = dst->src[0]; // src0: weight (J x K), row-major, 전치 상태
     const auto *src1 = dst->src[1]; // src1: activation (I x K) -> 전치 없음 (A)
+
+    uint64_t start = 0;
+    uint64_t end = 0;
 
     /* _______________________ 2. Gemmini용 dimension _____________________ */
     size_t I = 0;
@@ -157,6 +322,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     if (!gemmini_dim_to_size(dst->ne[1], I) ||
         !gemmini_dim_to_size(dst->ne[0], J) ||
         !gemmini_dim_to_size(src1->ne[0], K)) {
+        ggml::gemmini::log::debug(layer, "invalid dimensions: dst(ne1=%lld, ne0=%lld) src1(ne0=%lld)",
+                                 (long long)dst->ne[1], (long long)dst->ne[0], (long long)src1->ne[0]);
         GGML_ABORT("Gemmini mul_mat received invalid dimensions");
     }
 
@@ -166,6 +333,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     if (!gemmini_checked_mul(I, K, ik_count) ||
         !gemmini_checked_mul(J, K, jk_count) ||
         !gemmini_checked_mul(I, J, ij_count)) {
+        ggml::gemmini::log::debug(layer, "dimension overflow: I=%zu J=%zu K=%zu", I, J, K);
         GGML_ABORT("Gemmini mul_mat size overflow");
     }
 
@@ -200,6 +368,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                                          K, K, 0, J);
             return;
         } else {
+            ggml::gemmini::log::debug(layer, "FLOAT path unsupported weight type=%d", (int)src0->type);
             GGML_ASSERT(false && "FLOAT compute type: unsupported weight type");
         }
     }
@@ -263,6 +432,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             I,
             K,
             args);
+        if (!dequant_ok) {
+            ggml::gemmini::log::debug(layer, "DEQUANT_FP_TEST activation dequantize failed");
+        }
         GGML_ASSERT(dequant_ok && "DEQUANT_FP_TEST: activation dequantization failed");
         if (!dequant_ok)
             return;
@@ -282,6 +454,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             dequantize_row_q8_0(reinterpret_cast<const block_q8_0 *>(src0->data), src0_f32.data(), jk_count);
             src0_f = src0_f32.data();
         } else if (src0->type != GGML_TYPE_F32) {
+            ggml::gemmini::log::debug(layer, "DEQUANT_FP_TEST unsupported weight type=%d", (int)src0->type);
             GGML_ABORT("DEQUANT_FP_TEST compute type: unsupported weight type");
         }
 
@@ -291,7 +464,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         return;
     }
 
-    // breackdown weight to int8_t & scale (cache per weight tensor)
     start = ggml::gemmini::cycle::read();
     const int64_t dim_k = src0->ne[0];
     const int64_t dim_j = src0->ne[1] ? src0->ne[1] : 1;
@@ -303,7 +475,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         static_cast<__int128>(dim_j) * static_cast<__int128>(dim_z) * static_cast<__int128>(dim_w);
     if (logical_rows_128 <= 0 ||
         logical_rows_128 > static_cast<__int128>(std::numeric_limits<size_t>::max())) {
-        GGML_ASSERT(false);
+        ggml::gemmini::log::debug(layer,
+            "logical_rows overflow: logical_rows_128=%lld dim_k=%lld dim_j=%lld dim_z=%lld dim_w=%lld",
+            (long long) logical_rows_128, (long long) dim_k, (long long) dim_j, (long long) dim_z, (long long) dim_w);
+        GGML_ABORT("Gemmini logical_rows overflow");
     }
     const size_t logical_rows = static_cast<size_t>(logical_rows_128);
 
@@ -312,11 +487,14 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     // - false: KxJ row-major (stride = J_flat)
     args.sB = args.transpose_B ? static_cast<size_t>(dim_k) : logical_rows;
 
+    [[maybe_unused]] static thread_local std::vector<block_q8_h1> reprocessed_q8_h1;
     if (src0->type == GGML_TYPE_I8) {
-        const float * scale = gemmini_i8_supported_scale_data(src0, args.transpose_B);
-        if (scale == nullptr) {
-            GGML_ABORT("Gemmini dense I8 weight is missing a loaded F32 scalar scale sidecar or has unsupported layout");
-        }
+            const float * scale = gemmini_i8_supported_scale_data(src0, args.transpose_B);
+            if (scale == nullptr) {
+                ggml::gemmini::log::debug(layer,
+                    "[weight] I8 scale tensor missing or unsupported for transpose_b=%d", args.transpose_B ? 1 : 0);
+                GGML_ABORT("Gemmini dense I8 weight is missing a loaded F32 scalar scale sidecar or has unsupported layout");
+            }
 
         args.B = static_cast<elem_t *>(src0->data);
         args.B_blocks = nullptr;
@@ -339,131 +517,101 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         end = ggml::gemmini::cycle::read();
         ggml::gemmini::log::cycle(layer, "cpu.Use dense I8 weight", start, end);
     } else {
+        if (src0->type == GGML_TYPE_Q8_H1) {
+            const char * base = reinterpret_cast<const char *>(src0->view_src ? src0->view_src->data : src0->data);
+            if (base == nullptr) {
+                ggml::gemmini::log::debug(layer, "[Q8_H1 direct] base pointer is null, src0=%p view_src=%p", (void *)src0, (void *)src0->view_src);
+                GGML_ABORT("Gemmini Q8_H1 weight tensor base pointer is null");
+            }
+            const size_t view_offset = src0->view_src ? static_cast<size_t>(src0->view_offs) : 0;
+            const char * data = base + view_offset;
+            const block_q8_h1 * blocks = reinterpret_cast<const block_q8_h1 *>(data);
+            if (reinterpret_cast<uintptr_t>(data) % alignof(block_q8_h1) != 0) {
+                ggml::gemmini::log::debug(layer,
+                    "[Q8_H1 direct] pointer alignment failure ptr=%p align=%zu",
+                    (void *)data, (size_t)alignof(block_q8_h1));
+                GGML_ABORT("Gemmini Q8_H1 weight tensor data pointer is not block-aligned");
+            }
 
-        GGML_ASSERT(dim_k % QK8_0 == 0);
-        const size_t blocks_K = static_cast<size_t>(dim_k) / QK8_0;
-        const size_t logical_stripe_J = args.stripe_J > 1 ? args.tile_J * DIM : 1;
-        const block_q8_0 *block_base = ggml::gemmini::weight_block_base(src0);
-        ggml_gemmini_args_t::unpacked_weight *cached = nullptr;
+            args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1_native;
+            args.B = nullptr;
+            args.B_blocks = nullptr;
+            args.B_scales = nullptr;
+            args.weight_i8_scale_active = false;
+            args.weight_scale = 1.0f;
+            args.c_b = nullptr;
+            args.s_rf = nullptr;
+            args.R = nullptr;
+            args.blocks_per_row = static_cast<size_t>(dim_k) / QK8_0;
+            args.blocks_K = args.blocks_per_row;
+            args.blocks_J = logical_rows;
+            args.blocks_I = logical_rows;
+            args.block_size_k = QK8_0;
+            args.stripe_J = 0;
+            args.s_rf_stripe = nullptr;
+            args.R_stripe = nullptr;
+            args.q8_h1_native_blocks = blocks;
+            if (!gemmini_checked_mul(logical_rows, args.blocks_per_row, args.q8_h1_native_block_count)) {
+                GGML_ABORT("Gemmini Q8_H1 weight tensor block metadata overflows");
+            }
+            args.q8_h1_native_rows = logical_rows;
 
-        auto it = ctx->weight_cache.find(block_base);
-        if (it != ctx->weight_cache.end() &&
-            it->second.matches(block_base,
-                               dim_k,
-                               dim_j,
-                               dim_z,
-                               dim_w,
-                               args.sB,
-                               blocks_K,
-                               logical_rows,
-                               args.transpose_B,
-                               logical_stripe_J,
-                               args.stripe_J)) {
-            cached = &it->second;
+            if (!args.has_q8_h1_native_im2p_contract()) {
+                ggml_gemmini_log_q8_h1_contract_issue(layer, args);
+                GGML_ABORT("Gemmini Q8_H1 im2p contract failed");
+            }
             ggml::gemmini::log::debug(layer,
-                             "[Q8_0 cache] hit base=%p K=%lld cols=%zu sB=%zu blocks_K=%zu transpose_B=%d logical_stripe_J=%zu stripe_J=%zu",
-                             (const void *)block_base,
-                             static_cast<long long>(dim_k),
-                             logical_rows,
-                             args.sB,
-                             blocks_K,
-                             args.transpose_B ? 1 : 0,
-                             logical_stripe_J,
-                             args.stripe_J);
-        } else {
-            if (it == ctx->weight_cache.end()) {
-                ggml::gemmini::log::debug(layer,
-                                 "[Q8_H1 cache] miss base=%p K=%lld cols=%zu blocks_K=%zu logical_stripe_J=%zu stripe_J=%zu",
-                                 (const void *)block_base,
-                                 static_cast<long long>(dim_k),
-                                 logical_rows,
-                                 blocks_K,
-                                 logical_stripe_J,
-                                 args.stripe_J);
-            } else {
-                ggml::gemmini::log::debug(layer,
-                                 "[Q8_H1 cache] refresh base=%p K=%lld cols=%zu blocks_K=%zu logical_stripe_J=%zu stripe_J=%zu",
-                                 (const void *)block_base,
-                                 static_cast<long long>(dim_k),
-                                 logical_rows,
-                                 blocks_K,
-                                 logical_stripe_J,
-                                 args.stripe_J);
-            }
-            ggml_gemmini_args_t::unpacked_weight entry;
-            entry.blocks = block_base;
-            entry.dim_k = dim_k;
-            entry.dim_j = dim_j;
-            entry.dim_z = dim_z;
-            entry.dim_w = dim_w;
-            entry.logical_cols = logical_rows;
-            entry.blocks_K = blocks_K;
-            entry.blocks_J = logical_rows;
-            entry.blocks_I = logical_rows;
-            entry.block_size_k = QK8_0;
-            entry.transpose_b = args.transpose_B;
-            entry.logical_stripe_J = logical_stripe_J;
-
-            // Populate cached Q8_H1 buffers directly from absorbed algorithms.
-            const bool ok = unpack_q80_r_weight(
+                "[Q8_H1 direct] blocks=%p blocks_per_row=%zu logical_rows=%zu",
+                (void *)args.q8_h1_native_blocks, args.blocks_per_row, logical_rows);
+        } else if (src0->type == GGML_TYPE_Q8_0) {
+            start = ggml::gemmini::cycle::read();
+            size_t q8_0_reprocess_rows = logical_rows;
+            const bool ok = ggml::gemmini::prepare_q8_0_rows_for_q8_h1(
                 src0,
-                args,
-                entry.q_qs,
-                entry.c_b,
-                entry.s_rf,
-                entry.R,
-                args.stripe_J > 1 ? &entry.s_rf_stripe : nullptr,
-                args.stripe_J > 1 ? &entry.R_stripe : nullptr
+                reprocessed_q8_h1,
+                &args.blocks_per_row,
+                &q8_0_reprocess_rows
             );
-            GGML_ASSERT(ok);
-            if (!ok)
+            if (!ok) {
+                GGML_LOG_ERROR("%s: Q8_0 reprocessing failed for weight tensor '%s'\n",
+                    __func__, src0->name);
                 return;
-
-            entry.blocks = args.B_blocks;
-            entry.blocks_K = args.blocks_K;
-            entry.blocks_J = args.blocks_J;
-            entry.blocks_I = args.blocks_I;
-            entry.block_size_k = args.block_size_k;
-            entry.stride = args.sB;
-
-            if (args.stripe_J > 1)
-                entry.stripe_J = args.stripe_J;
-
-            if (it == ctx->weight_cache.end()) {
-                it = ctx->weight_cache.emplace(block_base, std::move(entry)).first;
-            } else {
-                it->second = std::move(entry);
             }
-            cached = &it->second;
+
+            args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1_native;
+            args.B = nullptr;
+            args.B_blocks = nullptr;
+            args.weight_i8_scale_active = false;
+            args.weight_scale = 1.0f;
+            args.c_b = nullptr;
+            args.s_rf = nullptr;
+            args.R = nullptr;
+            args.blocks_K = args.blocks_per_row;
+            args.blocks_J = q8_0_reprocess_rows;
+            args.blocks_I = q8_0_reprocess_rows;
+            args.block_size_k = QK8_0;
+            args.sB = static_cast<size_t>(dim_k);
+            args.stripe_J = 0;
+            args.s_rf_stripe = nullptr;
+            args.R_stripe = nullptr;
+            args.q8_h1_native_blocks = reprocessed_q8_h1.data();
+            args.q8_h1_native_block_count = reprocessed_q8_h1.size();
+            args.q8_h1_native_rows = q8_0_reprocess_rows;
+            if (!args.has_q8_h1_native_im2p_contract()) {
+                ggml_gemmini_log_q8_h1_contract_issue(layer, args);
+                GGML_ABORT("Gemmini Q8_0 reprocessed im2p contract failed");
+            }
+
+            ggml::gemmini::log::debug(layer,
+                "[Q8_0 reprocess] blocks=%p sB=%zu blocks_per_row=%zu logical_rows=%zu",
+                (void *)reprocessed_q8_h1.data(), args.sB, args.blocks_per_row, q8_0_reprocess_rows);
+            end = ggml::gemmini::cycle::read();
+            ggml::gemmini::log::cycle(layer, "cpu.Reprocess Q8_0 to Q8_H1", start, end);
+        } else {
+            ggml::gemmini::log::debug(layer, "int compute unsupported weight type=%d", (int)src0->type);
+            GGML_ABORT("Gemmini int mul_mat received unsupported weight type");
         }
 
-        args.B = reinterpret_cast<elem_t *>(cached->q_qs.data());
-        args.B_blocks = cached->blocks;
-        args.B_scales = nullptr;
-        args.weight_i8_scale_active = false;
-        args.weight_scale = 1.0f;
-        args.c_b = cached->c_b.data();
-        args.s_rf = cached->s_rf.data();
-        args.R = cached->R.data();
-        args.blocks_per_row = cached->blocks_K;
-        args.blocks_K = cached->blocks_K;
-        args.blocks_J = cached->blocks_J;
-        args.blocks_I = cached->blocks_I;
-        args.block_size_k = cached->block_size_k;
-        args.sB = static_cast<size_t>(cached->dim_k);
-        args.stripe_J = cached->stripe_J;
-        args.s_rf_stripe = cached->stripe_J > 1 ? cached->s_rf_stripe.data() : nullptr;
-        args.R_stripe = cached->stripe_J > 1 ? cached->R_stripe.data() : nullptr;
-
-        ggml::gemmini::log::debug(layer,
-            "[Q8_H1 cache] restore B=%p sB=%zu c_b=%p s_rf=%p R=%p blocks_per_row=%zu logical_stripe_J=%zu stripe_J=%zu",
-            (void *)args.B, args.sB, (void *)args.c_b, (void *)args.s_rf, (void *)args.R,
-            args.blocks_per_row, cached->logical_stripe_J, args.stripe_J);
-        // ggml::gemmini::log::debug("[Gemmini addr] layer=%s A=%p B=%p B_blocks=%p B_scales=%p",
-        //                  layer, (void *)args.A, (void *)args.B, (const void *)args.B_blocks, (const void *)args.B_scales);
-
-        end = ggml::gemmini::cycle::read();
-        ggml::gemmini::log::cycle(layer, "cpu.Breakdown Q8_H1", start, end);
     }
 
     start = ggml::gemmini::cycle::read();
@@ -506,12 +654,30 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                     "[exsia] route dense_i8 weight_scale=%.9f dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
                     static_cast<double>(args.weight_scale), args.I, args.J, args.K, args.sB,
                     static_cast<int>(args.tiled_matmul_type));
+                start = ggml::gemmini::cycle::read();
                 ggml::gemmini::tiled_matmul_auto_exsia(&args);
+                end = ggml::gemmini::cycle::read();
+                ggml::gemmini::log::cycle(layer, "gemmini.tiled_matmul_auto_exsia", start, end);
             } else {
+                const char *weight_route = src0->type == GGML_TYPE_Q8_H1
+                    ? "Q8_H1 direct"
+                    : "Q8_0 reprocessed";
+                const char *cycle_op = src0->type == GGML_TYPE_Q8_H1
+                    ? "gemmini.im2p Q8_H1 direct"
+                    : "gemmini.im2p Q8_0 reprocessed";
+                ggml::gemmini::log::debug(layer,
+                    "[exsia] route im2p weight=%s dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
+                    weight_route, args.I, args.J, args.K, args.sB, static_cast<int>(args.tiled_matmul_type));
+                start = ggml::gemmini::cycle::read();
                 ggml::gemmini::tiled_matmul_auto_im2p(&args);
+                end = ggml::gemmini::cycle::read();
+                ggml::gemmini::log::cycle(layer, cycle_op, start, end);
             }
         } else if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TENSOR) {
+            start = ggml::gemmini::cycle::read();
             ggml::gemmini::tiled_matmul_auto_tensor(&args);
+            end = ggml::gemmini::cycle::read();
+            ggml::gemmini::log::cycle(layer, "gemmini.tiled_matmul_auto_tensor", start, end);
         }
     }
     // dst에는 gemmini 커널에서 dequantize한 결과가 들어옴 
@@ -671,6 +837,13 @@ static ggml_guid_t ggml_backend_gemmini_guid(void) {
 
 ggml_backend_t ggml_backend_gemmini_init(void) {
     ggml_backend_gemmini_context * ctx = new ggml_backend_gemmini_context;
+    ggml::gemmini::load_q8_h1_artifact_from_env(ctx->q8_h1_artifact);
+    if (ctx->q8_h1_artifact.status == ggml::gemmini::q8_h1_artifact_runtime_status::disabled_load_error) {
+        GGML_LOG_WARN("%s: disabling LLAMA_GEMMINI_Q8_H1_ARTIFACT='%s': %s\n",
+                __func__,
+                ctx->q8_h1_artifact.path.c_str(),
+                ctx->q8_h1_artifact.error.c_str());
+    }
 
     ggml_backend_t backend = new ggml_backend {
         /* .guid      = */ ggml_backend_gemmini_guid(),
@@ -793,6 +966,75 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
             ) {
                 if (a->type == GGML_TYPE_I8) {
                     return gemmini_i8_supported_scale_data(a, TRANSPOSE_B != 0) != nullptr;
+                }
+
+                if (a->type == GGML_TYPE_Q8_H1) {
+                    const int64_t dim_j = a->ne[1] ? a->ne[1] : 1;
+                    const int64_t dim_z = a->ne[2] ? a->ne[2] : 1;
+                    const int64_t dim_w = a->ne[3] ? a->ne[3] : 1;
+
+                    if (a->ne[0] <= 0 || a->ne[0] % QK8_0 != 0)
+                        return false;
+
+                    const size_t blocks_per_row = static_cast<size_t>(a->ne[0]) / QK8_0;
+                    if (blocks_per_row == 0)
+                        return false;
+
+                    const __int128 logical_rows_128 =
+                        static_cast<__int128>(dim_j) * static_cast<__int128>(dim_z) * static_cast<__int128>(dim_w);
+                    if (logical_rows_128 <= 0 || logical_rows_128 > static_cast<__int128>(std::numeric_limits<size_t>::max()))
+                        return false;
+
+                    const size_t logical_rows = static_cast<size_t>(logical_rows_128);
+
+                    size_t row_bytes = 0;
+                    size_t plane_bytes = 0;
+                    size_t storage_bytes = 0;
+                    if (!gemmini_checked_mul(blocks_per_row, sizeof(block_q8_h1), row_bytes) ||
+                        !gemmini_checked_mul(row_bytes, static_cast<size_t>(dim_j), plane_bytes) ||
+                        !gemmini_checked_mul(plane_bytes, static_cast<size_t>(dim_z), storage_bytes) ||
+                        !gemmini_checked_mul(storage_bytes, static_cast<size_t>(dim_w), storage_bytes)) {
+                        return false;
+                    }
+
+                    if (a->nb[0] != sizeof(block_q8_h1) || a->nb[1] != row_bytes ||
+                        a->nb[2] != plane_bytes || a->nb[3] != storage_bytes) {
+                        return false;
+                    }
+
+                    const char * base = reinterpret_cast<const char *>(a->view_src ? a->view_src->data : a->data);
+                    const size_t view_offset = a->view_src ? static_cast<size_t>(a->view_offs) : 0;
+                    if (base == nullptr)
+                        return false;
+                    if (a->view_src != nullptr) {
+                        const size_t source_bytes = ggml_nbytes(a->view_src);
+                        if (view_offset > source_bytes || storage_bytes > source_bytes - view_offset)
+                            return false;
+                    } else if (view_offset != 0) {
+                        return false;
+                    }
+
+                    const char *data = base + view_offset;
+                    if (reinterpret_cast<uintptr_t>(data) % alignof(block_q8_h1) != 0)
+                        return false;
+
+                    const size_t blocks_per_row_contract = static_cast<size_t>(a->ne[0]) / QK8_0;
+                    size_t q8_h1_block_count = 0;
+                    if (!gemmini_checked_mul(logical_rows, blocks_per_row_contract, q8_h1_block_count)) {
+                        return false;
+                    }
+
+                    const block_q8_h1 * blocks = reinterpret_cast<const block_q8_h1 *>(data);
+                    ggml_gemmini_args_t args;
+                    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1_native;
+                    args.J = logical_rows;
+                    args.K = static_cast<size_t>(a->ne[0]);
+                    args.block_size_k = QK8_0;
+                    args.blocks_per_row = blocks_per_row_contract;
+                    args.q8_h1_native_blocks = blocks;
+                    args.q8_h1_native_block_count = q8_h1_block_count;
+                    args.q8_h1_native_rows = logical_rows;
+                    return args.has_q8_h1_native_im2p_contract();
                 }
 
                 if (a->type != GGML_TYPE_Q8_0 || a->ne[0] <= 0 || a->ne[0] % QK8_0 != 0)

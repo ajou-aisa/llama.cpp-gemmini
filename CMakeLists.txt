@@ -324,6 +324,10 @@ if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
     add_subdirectory(tools)
 endif()
 
+if (TARGET test-quantize-atomic-output)
+    add_dependencies(test-quantize-atomic-output llama-gguf-split)
+endif()
+
 #
 # install
 #

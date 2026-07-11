@@ -41,26 +41,6 @@ bool quantize_row_q8_h1(
     BlockQ8_H1 *dst
 );
 
-/// Convert a stripe of Q8_0 rows to Q8_H1 rows using one shared stripe scale range.
-///
-/// The input Q8_0 fp16 scales are double-quantized across the full stripe:
-///   s_rf = (max_stripe_scale - min_stripe_scale) / 255
-///   R = round(min_stripe_scale / s_rf)
-///   c_b[row, block] = clamp(round(s_b[row, block] / s_rf) - R, 0, 255)
-///
-/// dst contains num_rows caller-owned row views. dst_s_rf_stripe and dst_R_stripe
-/// receive the shared stripe metadata.
-///
-/// @return true on success, false on validation failure.
-bool quantize_stripe_q8_h1(
-    const block_q8_0 *src_blocks,
-    int blocks_per_row,
-    int num_rows,
-    BlockQ8_H1 *dst,
-    float *dst_s_rf_stripe,
-    uint16_t *dst_R_stripe
-);
-
 /// Recover the fp32 scale for a block in a Q8_H1 row.
 float recover_block_scale(const BlockQ8_H1 *block, int block_idx);
 } // namespace ggml::gemmini::quants
