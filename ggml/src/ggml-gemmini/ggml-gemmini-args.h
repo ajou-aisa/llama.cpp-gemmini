@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <cmath>
+#include <limits>
 #include <vector>
 
 #include "quants/act/meta.hpp"
@@ -38,6 +40,13 @@ enum tiled_matmul_type_t : int;
     기존에는 GemminiTensor가 ggml 텐서를 INT8 버퍼로 변환했으나, 정확도 측정을 위한 Q8_0 지원을 위해
     변환된 버퍼와 블록별 스케일을 명시적으로 관리할 필요 */
 typedef struct ggml_gemmini_args_t {
+    enum class im2p_weight_format_t : uint8_t {
+        q8_0_unpacked_to_h1 = 0,
+        q8_h1 = 1,
+        q8_h2 = 2,
+        q8_h1_native = 3,
+    };
+
     // tiled_matmul_auto args
     size_t I = 0;
     size_t J = 0;
@@ -87,7 +96,7 @@ typedef struct ggml_gemmini_args_t {
         std::vector<float> s_rf_stripe;      // [num_stripes_J] per-stripe float scale
         std::vector<uint16_t> R_stripe;      // [num_stripes_J] per-stripe offset
         size_t stripe_J = 0;                 // producer stripe width used for unpacked stripe metadata (0 or 1 = row-wise)
-        size_t logical_stripe_J = 1;         // active cache contract width on the logical J axis (row-wise = 1)
+        size_t logical_stripe_J = 1;
 
         // Legacy Q8_0 path (preserved, not used by default)
         std::vector<int8_t> q;
@@ -107,47 +116,6 @@ typedef struct ggml_gemmini_args_t {
         size_t stride = 0;
         bool transpose_b = true;
 
-        bool matches(const block_q8_0 *base,
-                int64_t k,
-                int64_t j,
-                int64_t z,
-                int64_t w,
-                size_t /*stride_elems*/,
-                size_t blocks_k,
-                size_t logical_cols_,
-                bool /*transpose_b_layout*/,
-                size_t logical_stripe_J_ = 1,
-                size_t stripe_J_ = 0) const {
-            if (blocks != base)
-                return false;
-            if (dim_k != k || dim_j != j || dim_z != z || dim_w != w)
-                return false;
-            if (blocks_K != blocks_k || blocks_J != logical_cols_)
-                return false;
-            if (block_size_k != QK8_0 || logical_cols != logical_cols_)
-                return false;
-            // Q8_H1 planar validity check
-            if (q_qs.size() != logical_cols_ * static_cast<size_t>(k))
-                return false;
-            if (c_b.size() != blocks_k * logical_cols_)
-                return false;
-            if (s_rf.size() != logical_cols_)
-                return false;
-            if (R.size() != logical_cols_)
-                return false;
-            if (logical_stripe_J != logical_stripe_J_)
-                return false;
-            if (stripe_J != stripe_J_)
-                return false;
-            if (stripe_J_ > 1) {
-                const size_t num_stripes = (logical_cols_ + stripe_J_ - 1) / stripe_J_;
-                if (s_rf_stripe.size() != num_stripes)
-                    return false;
-                if (R_stripe.size() != num_stripes)
-                    return false;
-            }
-            return true;
-        }
     };
 
     const block_q8_0 *B_blocks = nullptr;
@@ -155,6 +123,11 @@ typedef struct ggml_gemmini_args_t {
 
     bool weight_i8_scale_active = false;
     float weight_scale = 1.0f;
+    im2p_weight_format_t weight_format = im2p_weight_format_t::q8_0_unpacked_to_h1;
+
+    const block_q8_h1 *q8_h1_native_blocks = nullptr;
+    size_t q8_h1_native_block_count = 0;
+    size_t q8_h1_native_rows = 0;
 
     // Q8_H1 weight fields (default path, no mode flag needed)
     const uint8_t  *c_b = nullptr;       // [J * blocks_per_row] per-block effective code
@@ -194,5 +167,59 @@ typedef struct ggml_gemmini_args_t {
     size_t gemmini_call_k_logical = 0;
     size_t gemmini_call_k_aligned = 0;
     size_t gemmini_call_tile_k_elems = 0;
+
+    inline const block_q8_h1 *q8_h1_native_block(size_t row, size_t block) const {
+        if (q8_h1_native_blocks == nullptr || blocks_per_row == 0 ||
+            row >= q8_h1_native_rows || block >= blocks_per_row ||
+            row > std::numeric_limits<size_t>::max() / blocks_per_row) {
+            return nullptr;
+        }
+
+        const size_t row_offset = row * blocks_per_row;
+        if (block > std::numeric_limits<size_t>::max() - row_offset) {
+            return nullptr;
+        }
+
+        const size_t offset = row_offset + block;
+        if (offset >= q8_h1_native_block_count) {
+            return nullptr;
+        }
+
+        return q8_h1_native_blocks + offset;
+    }
+
+    inline bool has_q8_h1_native_im2p_contract() const {
+        if (weight_format != im2p_weight_format_t::q8_h1_native ||
+            q8_h1_native_blocks == nullptr || J == 0 || K == 0 ||
+            blocks_per_row == 0 || q8_h1_native_block_count == 0 || q8_h1_native_rows < J ||
+            reinterpret_cast<uintptr_t>(q8_h1_native_blocks) % alignof(block_q8_h1) != 0 ||
+            K > std::numeric_limits<size_t>::max() - (QK8_0 - 1) ||
+            blocks_per_row != (K + QK8_0 - 1) / QK8_0 ||
+            J > std::numeric_limits<size_t>::max() / blocks_per_row) {
+            return false;
+        }
+
+        if (q8_h1_native_block_count < J * blocks_per_row) {
+            return false;
+        }
+
+        for (size_t row = 0; row < J; ++row) {
+            const block_q8_h1 *first = q8_h1_native_block(row, 0);
+            if (first == nullptr || !std::isfinite(first->s_rf) || first->s_rf < 0.0f ||
+                (first->s_rf == 0.0f && (first->R != 0 || first->c_b != 0))) {
+                return false;
+            }
+
+            for (size_t block = 1; block < blocks_per_row; ++block) {
+                const block_q8_h1 *current = q8_h1_native_block(row, block);
+                if (current == nullptr || current->s_rf != first->s_rf || current->R != first->R ||
+                    (first->s_rf == 0.0f && current->c_b != 0)) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
 
 } ggml_gemmini_args_t;

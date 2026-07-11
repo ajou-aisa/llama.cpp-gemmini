@@ -105,27 +105,35 @@ namespace ggml::gemmini::quants::dec { namespace
                 return result;
             }
 
-            if (stripe_mode && (!args.s_rf_stripe || !args.R_stripe))
+            const bool native_h1 = is_q8_h1_native_args(args);
+            if (!native_h1 && stripe_mode && (!args.s_rf_stripe || !args.R_stripe))
             {
                 result.supported = false;
                 return result;
             }
 
-            if (!stripe_mode && (!args.s_rf || !args.R))
+            if (!native_h1 && !stripe_mode && (!args.s_rf || !args.R))
                 return result;
 
             weight_scales.resize(rows * cols);
             for (size_t j = 0; j < rows; ++j)
             {
                 const size_t stripe_idx = stripe_mode ? (j / args.stripe_J) : 0;
-                const float s_rf = stripe_mode ? args.s_rf_stripe[stripe_idx] : args.s_rf[j];
-                const uint16_t R = stripe_mode ? args.R_stripe[stripe_idx] : args.R[j];
 
                 for (size_t blk = 0; blk < cols; ++blk)
                 {
                     const size_t idx = j * cols + blk;
+                    const block_q8_h1 *native_block = native_h1 ? args.q8_h1_native_block(j, blk) : nullptr;
+                    if (native_h1 && native_block == nullptr) {
+                        result.supported = false;
+                        return result;
+                    }
+                    const float s_rf = native_h1 ? native_block->s_rf :
+                        (stripe_mode ? args.s_rf_stripe[stripe_idx] : args.s_rf[j]);
+                    const uint16_t R = native_h1 ? native_block->R :
+                        (stripe_mode ? args.R_stripe[stripe_idx] : args.R[j]);
                     const uint64_t c_eff =
-                        static_cast<uint64_t>(static_cast<uint16_t>(args.c_b[idx])) +
+                        static_cast<uint64_t>(native_h1 ? native_block->c_b : static_cast<uint16_t>(args.c_b[idx])) +
                         static_cast<uint64_t>(R);
                     weight_scales[idx] = static_cast<float>(
                         static_cast<double>(s_rf) * static_cast<double>(c_eff));
@@ -162,14 +170,22 @@ namespace ggml::gemmini::quants::dec { namespace
     {
         const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
         const size_t J = args.J;
-        if (!weights || !Wk_f || J == 0)
+        const bool native_h1 = is_q8_h1_native_args(args);
+        if ((!weights && !native_h1) || !Wk_f || J == 0)
             return;
 
         const size_t weight_stride = resolve_weight_stride_elems(args);
         if (weight_stride == 0)
             return;
 
-        if (resolve_weight_layout(args) == WeightLayout::KxJ_RowMajor)
+        if (native_h1)
+        {
+            const size_t block = k / QK8_0;
+            const size_t offset = k % QK8_0;
+            for (size_t j = 0; j < J; ++j)
+                Wk_f[j] = static_cast<float>(args.q8_h1_native_block(j, block)->qs[offset]);
+        }
+        else if (resolve_weight_layout(args) == WeightLayout::KxJ_RowMajor)
         {
             const int8_t *row = weights + k * weight_stride;
             for (size_t j = 0; j < J; ++j)
@@ -376,7 +392,8 @@ ActivationDECResult compensate_activation_dec(
 
     ActivationDECResult result{};
     const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
-    if (!weights || !args.f_out)
+    const bool native_h1 = args.has_q8_h1_native_im2p_contract();
+    if ((!weights && !native_h1) || !args.f_out)
         return result;
 
     const size_t I = args.I;
@@ -398,7 +415,7 @@ ActivationDECResult compensate_activation_dec(
     {
         ggml::gemmini::log::debug(
             layer,
-            "[dec] reject unsupported stripe metadata path: stripe_J=%zu missing shared stripe scales",
+            "[dec] reject unsupported weight metadata path: stripe_J=%zu",
             args.stripe_J);
         return result;
     }
@@ -459,6 +476,7 @@ ActivationDECResult compensate_activation_dec(
     start = ggml::gemmini::cycle::read();
 
     const bool use_jmajor_blocked =
+        !native_h1 &&
         !weight_scales.scalar_mode &&
         weight_layout == WeightLayout::JxK_ColMajor &&
         weight_stride >= K;
