@@ -129,6 +129,10 @@ typedef struct ggml_gemmini_args_t {
     size_t q8_h1_native_block_count = 0;
     size_t q8_h1_native_rows = 0;
 
+    const block_q8_h2 *q8_h2_blocks = nullptr;
+    size_t q8_h2_block_count = 0;
+    size_t q8_h2_blocks_per_row = 0;
+
     // Q8_H1 weight fields (default path, no mode flag needed)
     const uint8_t  *c_b = nullptr;       // [J * blocks_per_row] per-block effective code
     const float    *s_rf = nullptr;       // [J] per-row float scale
@@ -167,6 +171,43 @@ typedef struct ggml_gemmini_args_t {
     size_t gemmini_call_k_logical = 0;
     size_t gemmini_call_k_aligned = 0;
     size_t gemmini_call_tile_k_elems = 0;
+
+    inline const block_q8_h2 *q8_h2_block(size_t row, size_t block) const {
+        if (q8_h2_blocks == nullptr || q8_h2_blocks_per_row == 0 ||
+            row >= J || block >= q8_h2_blocks_per_row ||
+            row > std::numeric_limits<size_t>::max() / q8_h2_blocks_per_row) {
+            return nullptr;
+        }
+
+        const size_t row_offset = row * q8_h2_blocks_per_row;
+        if (block > std::numeric_limits<size_t>::max() - row_offset) {
+            return nullptr;
+        }
+
+        const size_t offset = row_offset + block;
+        return offset < q8_h2_block_count ? q8_h2_blocks + offset : nullptr;
+    }
+
+    inline bool has_q8_h2_im2p_contract() const {
+        if (weight_format != im2p_weight_format_t::q8_h2 ||
+            q8_h2_blocks == nullptr || J == 0 || K == 0 ||
+            K % QK8_H2 != 0 || q8_h2_blocks_per_row != K / QK8_H2 ||
+            reinterpret_cast<uintptr_t>(q8_h2_blocks) % alignof(block_q8_h2) != 0 ||
+            J > std::numeric_limits<size_t>::max() / q8_h2_blocks_per_row ||
+            q8_h2_block_count != J * q8_h2_blocks_per_row) {
+            return false;
+        }
+
+        for (size_t i = 0; i < q8_h2_block_count; ++i) {
+            uint32_t scale_bits = 0;
+            std::memcpy(&scale_bits, &q8_h2_blocks[i].channel_scale, sizeof(scale_bits));
+            if ((scale_bits & 0x7f800000u) == 0x7f800000u) {
+                return false;
+            }
+        }
+
+        return true;
+    }
 
     inline const block_q8_h1 *q8_h1_native_block(size_t row, size_t block) const {
         if (q8_h1_native_blocks == nullptr || blocks_per_row == 0 ||

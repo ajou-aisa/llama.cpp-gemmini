@@ -123,6 +123,86 @@ namespace
         return true;
     }
 
+    bool gemmini_set_q8_h2_weight_args(const ggml_tensor * weight, ggml_gemmini_args_t & args)
+    {
+        size_t dim_k = 0;
+        size_t dim_j = 0;
+        size_t dim_z = 0;
+        size_t dim_w = 0;
+        if (weight == nullptr || weight->type != GGML_TYPE_Q8_H2 ||
+            !gemmini_dim_to_size(weight->ne[0], dim_k) || dim_k % QK8_H2 != 0 ||
+            !gemmini_dim_to_size(weight->ne[1], dim_j) ||
+            !gemmini_dim_to_size(weight->ne[2], dim_z) ||
+            !gemmini_dim_to_size(weight->ne[3], dim_w)) {
+            return false;
+        }
+
+        size_t logical_rows = 0;
+        size_t row_bytes = 0;
+        size_t plane_bytes = 0;
+        size_t volume_bytes = 0;
+        size_t storage_bytes = 0;
+        size_t block_count = 0;
+        const size_t blocks_per_row = dim_k / QK8_H2;
+        if (blocks_per_row == 0 ||
+            !gemmini_checked_mul(dim_j, dim_z, logical_rows) ||
+            !gemmini_checked_mul(logical_rows, dim_w, logical_rows) ||
+            !gemmini_checked_mul(blocks_per_row, sizeof(block_q8_h2), row_bytes) ||
+            !gemmini_checked_mul(row_bytes, dim_j, plane_bytes) ||
+            !gemmini_checked_mul(plane_bytes, dim_z, volume_bytes) ||
+            !gemmini_checked_mul(volume_bytes, dim_w, storage_bytes) ||
+            !gemmini_checked_mul(logical_rows, blocks_per_row, block_count) ||
+            (args.J != 0 && args.J != logical_rows) ||
+            (args.K != 0 && args.K != dim_k) ||
+            weight->nb[0] != sizeof(block_q8_h2) || weight->nb[1] != row_bytes ||
+            weight->nb[2] != plane_bytes || weight->nb[3] != volume_bytes ||
+            (weight->view_src == nullptr && weight->view_offs != 0)) {
+            return false;
+        }
+
+        const char * base = reinterpret_cast<const char *>(weight->view_src ? weight->view_src->data : weight->data);
+        const size_t view_offset = weight->view_src ? static_cast<size_t>(weight->view_offs) : 0;
+        if (base == nullptr) {
+            return false;
+        }
+        if (weight->view_src != nullptr) {
+            const size_t source_bytes = ggml_nbytes(weight->view_src);
+            if (view_offset > source_bytes || storage_bytes > source_bytes - view_offset) {
+                return false;
+            }
+        }
+
+        const char * data = base + view_offset;
+        if (reinterpret_cast<uintptr_t>(data) % alignof(block_q8_h2) != 0) {
+            return false;
+        }
+
+        args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h2;
+        args.J = logical_rows;
+        args.K = dim_k;
+        args.B = nullptr;
+        args.B_blocks = nullptr;
+        args.B_scales = nullptr;
+        args.weight_i8_scale_active = false;
+        args.weight_scale = 1.0f;
+        args.c_b = nullptr;
+        args.s_rf = nullptr;
+        args.R = nullptr;
+        args.blocks_per_row = blocks_per_row;
+        args.blocks_K = blocks_per_row;
+        args.blocks_J = logical_rows;
+        args.blocks_I = logical_rows;
+        args.block_size_k = QK8_H2;
+        args.sB = dim_k;
+        args.stripe_J = 0;
+        args.s_rf_stripe = nullptr;
+        args.R_stripe = nullptr;
+        args.q8_h2_blocks = reinterpret_cast<const block_q8_h2 *>(data);
+        args.q8_h2_block_count = block_count;
+        args.q8_h2_blocks_per_row = blocks_per_row;
+        return args.has_q8_h2_im2p_contract();
+    }
+
     struct ggml_tensor * gemmini_i8_scale_tensor(const struct ggml_tensor * weight)
     {
         if (weight == nullptr || weight->type != GGML_TYPE_I8)
@@ -575,6 +655,29 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             ggml::gemmini::log::debug(layer,
                 "[Q8_H1 direct] blocks=%p blocks_per_row=%zu logical_rows=%zu",
                 (void *)args.q8_h1_native_blocks, args.blocks_per_row, logical_rows);
+        } else if (src0->type == GGML_TYPE_Q8_H2) {
+            if (args.tiled_matmul_type != CPU) {
+                GGML_ABORT("Gemmini Q8_H2 is supported only by the CPU im2p route");
+            }
+            if constexpr (
+                ggml::gemmini::config::CURRENT_ACTIVATION_QUANT !=
+                ggml::gemmini::config::ActivationQuantAlgo::EXSIA
+            ) {
+                GGML_ABORT("Gemmini Q8_H2 requires the EXSIA im2p route");
+            }
+            args.tiled_matmul_type = CPU;
+            if (!gemmini_set_q8_h2_weight_args(src0, args)) {
+                ggml::gemmini::log::debug(layer,
+                    "[Q8_H2 direct] contract failed ptr=%p ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]",
+                    src0->data,
+                    (long long)src0->ne[0], (long long)src0->ne[1],
+                    (long long)src0->ne[2], (long long)src0->ne[3],
+                    src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3]);
+                GGML_ABORT("Gemmini Q8_H2 im2p contract failed");
+            }
+            ggml::gemmini::log::debug(layer,
+                "[Q8_H2 direct] blocks=%p blocks_per_row=%zu logical_rows=%zu",
+                (const void *)args.q8_h2_blocks, args.q8_h2_blocks_per_row, logical_rows);
         } else if (src0->type == GGML_TYPE_Q8_0) {
             start = ggml::gemmini::cycle::read();
             size_t q8_0_reprocess_rows = logical_rows;
@@ -673,10 +776,12 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             } else {
                 const char *weight_route = src0->type == GGML_TYPE_Q8_H1
                     ? "Q8_H1 direct"
-                    : "Q8_0 reprocessed";
+                    : src0->type == GGML_TYPE_Q8_H2 ? "Q8_H2 direct" : "Q8_0 reprocessed";
                 const char *cycle_op = src0->type == GGML_TYPE_Q8_H1
                     ? "gemmini.im2p Q8_H1 direct"
-                    : "gemmini.im2p Q8_0 reprocessed";
+                    : src0->type == GGML_TYPE_Q8_H2
+                        ? "gemmini.im2p Q8_H2 direct"
+                        : "gemmini.im2p Q8_0 reprocessed";
                 ggml::gemmini::log::debug(layer,
                     "[exsia] route im2p weight=%s dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
                     weight_route, args.I, args.J, args.K, args.sB, static_cast<int>(args.tiled_matmul_type));
@@ -1050,6 +1155,22 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
                     args.q8_h1_native_block_count = q8_h1_block_count;
                     args.q8_h1_native_rows = logical_rows;
                     return args.has_q8_h1_native_im2p_contract();
+                }
+
+                if (a->type == GGML_TYPE_Q8_H2) {
+                    if constexpr (OPTION != CPU) {
+                        return false;
+                    }
+                    if constexpr (
+                        ggml::gemmini::config::CURRENT_ACTIVATION_QUANT !=
+                        ggml::gemmini::config::ActivationQuantAlgo::EXSIA
+                    ) {
+                        return false;
+                    }
+
+                    ggml_gemmini_args_t args;
+                    args.tiled_matmul_type = CPU;
+                    return gemmini_set_q8_h2_weight_args(a, args);
                 }
 
                 if (a->type != GGML_TYPE_Q8_0 || a->ne[0] <= 0 || a->ne[0] % QK8_0 != 0)

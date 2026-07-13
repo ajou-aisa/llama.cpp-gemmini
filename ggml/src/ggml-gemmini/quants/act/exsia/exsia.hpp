@@ -19,6 +19,10 @@
 #define BLOCK_SIZE GGML_GEMMINI_BLOCK_SIZE
 #endif
 
+#ifndef GGML_GEMMINI_EXSIA_SIGMA
+#define GGML_GEMMINI_EXSIA_SIGMA 3
+#endif
+
 struct ggml_tensor;
 struct ggml_gemmini_args_t;
 
@@ -182,7 +186,7 @@ namespace ggml::gemmini::quants::act::exsia
     class SigmaDetector
     {
     public:
-        bool detect_3sigma(int32_t q, __int128_t S, __int128_t SS, size_t N);
+        bool detect_sigma(int32_t q, __int128_t S, __int128_t SS, size_t N);
     };
 
     class ResidualClipper

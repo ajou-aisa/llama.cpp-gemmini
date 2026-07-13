@@ -18,6 +18,13 @@ namespace ggml::gemmini::quants::dec
                args.q8_h1_native_blocks != nullptr;
     }
 
+    inline bool is_q8_h2_args(const ggml_gemmini_args_t &args)
+    {
+        return args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_h2 &&
+               args.q8_h2_blocks != nullptr &&
+               args.q8_h2_blocks_per_row > 0;
+    }
+
     inline bool is_q8_h1_weight_args(const ggml_gemmini_args_t &args)
     {
         return is_q8_h1_native_args(args) ||

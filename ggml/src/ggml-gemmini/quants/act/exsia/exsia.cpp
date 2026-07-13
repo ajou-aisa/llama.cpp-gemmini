@@ -13,6 +13,8 @@
 
 namespace ggml::gemmini::quants::act::exsia
 {
+    static_assert(GGML_GEMMINI_EXSIA_SIGMA > 0, "GGML_GEMMINI_EXSIA_SIGMA must be positive");
+
     namespace
     {
         bool checked_mul_size(size_t lhs, size_t rhs, size_t &out)
@@ -209,14 +211,15 @@ namespace ggml::gemmini::quants::act::exsia
         return {q, S, SS};
     }
 
-    bool SigmaDetector::detect_3sigma(int32_t q, __int128_t S, __int128_t SS, size_t N)
+    bool SigmaDetector::detect_sigma(int32_t q, __int128_t S, __int128_t SS, size_t N)
     {
         if (N == 0)
             return false;
 
         const __int128_t n = static_cast<__int128_t>(N);
+        const __int128_t sigma = GGML_GEMMINI_EXSIA_SIGMA;
         const __int128_t centered = n * q - S;
-        return centered * centered > 9 * (n * SS - S * S);
+        return centered * centered > sigma * sigma * (n * SS - S * S);
     }
 
     std::pair<int8_t, int32_t> ResidualClipper::clip_with_residual(int32_t q)
@@ -295,7 +298,7 @@ namespace ggml::gemmini::quants::act::exsia
             if (col >= state.K_logical || stripe.outlier_mask.is_set(row, col))
                 continue;
 
-            if (unit_sigma_.detect_3sigma(q_tmp[i], S, SS, unmasked_count))
+            if (unit_sigma_.detect_sigma(q_tmp[i], S, SS, unmasked_count))
             {
                 int_outlier_mask.set(0, i);
                 has_int_outlier = true;

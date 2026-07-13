@@ -228,6 +228,18 @@ static_assert(offsetof(block_q8_h1, s_rf) == 36, "wrong q8_h1 s_rf offset");
 static_assert(offsetof(block_q8_h1, R) == 40, "wrong q8_h1 R offset");
 static_assert(sizeof(block_q8_h1) == 44, "wrong q8_h1 block size/padding");
 
+#define QK8_H2 32
+typedef struct {
+    int8_t  qs[QK8_H2];
+    uint8_t m;
+    uint8_t padding[3];
+    float   channel_scale;
+} block_q8_h2;
+static_assert(offsetof(block_q8_h2, qs) == 0, "wrong q8_h2 qs offset");
+static_assert(offsetof(block_q8_h2, m) == QK8_H2, "wrong q8_h2 m offset");
+static_assert(offsetof(block_q8_h2, channel_scale) == 36, "wrong q8_h2 channel_scale offset");
+static_assert(sizeof(block_q8_h2) == 40, "wrong q8_h2 block size/padding");
+
 #define QK8_1 32
 typedef struct {
     GGML_EXTENSION union {
