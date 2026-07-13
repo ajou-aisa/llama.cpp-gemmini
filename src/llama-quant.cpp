@@ -279,7 +279,7 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
                      ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
                 new_type = GGML_TYPE_Q5_K;
             }
-            else if (new_type != GGML_TYPE_Q8_0 && new_type != GGML_TYPE_Q8_H1) {
+            else if (new_type != GGML_TYPE_Q8_0 && new_type != GGML_TYPE_Q8_H1 && new_type != GGML_TYPE_Q8_H2) {
                 new_type = GGML_TYPE_Q6_K;
             }
         }
@@ -594,6 +594,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         case LLAMA_FTYPE_MOSTLY_Q5_1: default_type = GGML_TYPE_Q5_1; break;
         case LLAMA_FTYPE_MOSTLY_Q8_0: default_type = GGML_TYPE_Q8_0; break;
         case LLAMA_FTYPE_MOSTLY_Q8_H1: default_type = GGML_TYPE_Q8_H1; break;
+        case LLAMA_FTYPE_MOSTLY_Q8_H2: default_type = GGML_TYPE_Q8_H2; break;
         case LLAMA_FTYPE_MOSTLY_F16:  default_type = GGML_TYPE_F16;  break;
         case LLAMA_FTYPE_MOSTLY_BF16: default_type = GGML_TYPE_BF16; break;
         case LLAMA_FTYPE_ALL_F32:     default_type = GGML_TYPE_F32;  break;
@@ -786,6 +787,19 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             quantize &= name.find("attn_rel_b.weight") == std::string::npos;
             if (quantize && tensor->ne[0] % q8_h1_block_size != 0) {
                 throw std::runtime_error(format("Q8_H1 requires tensor %s width %" PRId64 " to be divisible by %" PRId64, tensor->name, tensor->ne[0], q8_h1_block_size));
+            }
+        }
+    }
+    if (default_type == GGML_TYPE_Q8_H2 && !params->only_copy) {
+        const int64_t q8_h2_block_size = ggml_blck_size(GGML_TYPE_Q8_H2);
+        for (const auto * it : tensors) {
+            const ggml_tensor * tensor = it->tensor;
+            bool quantize = std::string(tensor->name).rfind("weight") == std::string(tensor->name).size() - 6;
+            quantize &= ggml_n_dims(tensor) >= 2;
+            quantize &= std::string(tensor->name).find("_norm.weight") == std::string::npos;
+            quantize &= params->quantize_output_tensor || std::string(tensor->name) != "output.weight";
+            if (quantize && tensor->ne[0] % q8_h2_block_size != 0) {
+                throw std::runtime_error(format("Q8_H2 requires tensor %s width %" PRId64 " to be divisible by %" PRId64, tensor->name, tensor->ne[0], q8_h2_block_size));
             }
         }
     }

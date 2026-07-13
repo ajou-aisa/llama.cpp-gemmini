@@ -90,6 +90,36 @@ namespace ggml::gemmini::quants::dec { namespace
             return result;
         }
 
+        if (is_q8_h2_args(args))
+        {
+            static thread_local std::vector<float> weight_scales;
+            const size_t rows = args.J;
+            const size_t cols = args.q8_h2_blocks_per_row;
+            if (rows == 0 || cols == 0 || rows > std::numeric_limits<size_t>::max() / cols)
+                return result;
+
+            weight_scales.resize(rows * cols);
+            for (size_t row = 0; row < rows; ++row)
+            {
+                for (size_t block = 0; block < cols; ++block)
+                {
+                    const block_q8_h2 * qblock = args.q8_h2_block(row, block);
+                    if (qblock == nullptr)
+                    {
+                        result.supported = false;
+                        return result;
+                    }
+                    weight_scales[row * cols + block] = qblock->channel_scale * qblock->m / 255.0f;
+                }
+            }
+
+            result.data = weight_scales.data();
+            result.rows = rows;
+            result.cols = cols;
+            result.block_size = QK8_H2;
+            return result;
+        }
+
         if (is_q8_h1_weight_args(args))
         {
             static thread_local std::vector<float> weight_scales;
@@ -171,14 +201,22 @@ namespace ggml::gemmini::quants::dec { namespace
         const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
         const size_t J = args.J;
         const bool native_h1 = is_q8_h1_native_args(args);
-        if ((!weights && !native_h1) || !Wk_f || J == 0)
+        const bool q8_h2 = is_q8_h2_args(args);
+        if ((!weights && !native_h1 && !q8_h2) || !Wk_f || J == 0)
             return;
 
         const size_t weight_stride = resolve_weight_stride_elems(args);
         if (weight_stride == 0)
             return;
 
-        if (native_h1)
+        if (q8_h2)
+        {
+            const size_t block = k / QK8_H2;
+            const size_t offset = k % QK8_H2;
+            for (size_t j = 0; j < J; ++j)
+                Wk_f[j] = static_cast<float>(args.q8_h2_block(j, block)->qs[offset]);
+        }
+        else if (native_h1)
         {
             const size_t block = k / QK8_0;
             const size_t offset = k % QK8_0;
@@ -393,7 +431,8 @@ ActivationDECResult compensate_activation_dec(
     ActivationDECResult result{};
     const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
     const bool native_h1 = args.has_q8_h1_native_im2p_contract();
-    if ((!weights && !native_h1) || !args.f_out)
+    const bool q8_h2 = is_q8_h2_args(args);
+    if ((!weights && !native_h1 && !q8_h2) || !args.f_out)
         return result;
 
     const size_t I = args.I;
@@ -477,6 +516,7 @@ ActivationDECResult compensate_activation_dec(
 
     const bool use_jmajor_blocked =
         !native_h1 &&
+        !q8_h2 &&
         !weight_scales.scalar_mode &&
         weight_layout == WeightLayout::JxK_ColMajor &&
         weight_stride >= K;
