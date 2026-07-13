@@ -16,6 +16,143 @@ namespace ggml::gemmini::quants::act::token
 {
     namespace
     {
+        bool checked_mul_size(size_t lhs, size_t rhs, size_t &out)
+        {
+            if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs)
+            {
+                return false;
+            }
+
+            out = lhs * rhs;
+            return true;
+        }
+
+        struct BitMask
+        {
+            size_t rows = 0;
+            size_t cols = 0;
+            std::vector<uint64_t> words;
+
+            bool resize(size_t row_count, size_t col_count)
+            {
+                size_t bit_count = 0;
+                if (!checked_mul_size(row_count, col_count, bit_count))
+                {
+                    rows = 0;
+                    cols = 0;
+                    words.clear();
+                    return false;
+                }
+
+                rows = row_count;
+                cols = col_count;
+                words.assign((bit_count + 63) / 64, 0);
+                return true;
+            }
+
+            void mark_outlier(size_t row, size_t col)
+            {
+                if (row >= rows || col >= cols)
+                {
+                    return;
+                }
+
+                const size_t idx = row * cols + col;
+                words[idx / 64] |= uint64_t(1) << (idx % 64);
+            }
+
+            bool is_marked(size_t row, size_t col) const
+            {
+                if (row >= rows || col >= cols)
+                {
+                    return false;
+                }
+
+                const size_t idx = row * cols + col;
+                return (words[idx / 64] & (uint64_t(1) << (idx % 64))) != 0;
+            }
+        };
+
+        struct RowStats
+        {
+            double mean = 0.0;
+            double sigma = 0.0;
+            double max_abs = 0.0;
+            size_t count = 0;
+        };
+
+        bool compute_row_stats(const float *src_data, const ggml_gemmini_args_t &args, size_t row, RowStats &stats)
+        {
+            if (!src_data || row >= args.I)
+            {
+                return false;
+            }
+
+            double sum = 0.0;
+            double sum_sq = 0.0;
+            for (size_t col = 0; col < args.K; ++col)
+            {
+                const float value = src_data[row * args.K + col];
+                if (!std::isfinite(value))
+                {
+                    continue;
+                }
+
+                const double x = static_cast<double>(value);
+                sum += x;
+                sum_sq += x * x;
+                stats.max_abs = std::max(stats.max_abs, std::fabs(x));
+                ++stats.count;
+            }
+
+            if (stats.count == 0)
+            {
+                return true;
+            }
+
+            stats.mean = sum / static_cast<double>(stats.count);
+            const double variance = std::max(0.0, sum_sq / static_cast<double>(stats.count) - stats.mean * stats.mean);
+            stats.sigma = std::sqrt(variance);
+            return true;
+        }
+
+        bool mark_row_outliers_3sigma(
+            const float *src_data,
+            const ggml_gemmini_args_t &args,
+            size_t row,
+            const RowStats &stats,
+            BitMask &mask,
+            RowStats &inlier_stats)
+        {
+            if (!src_data || row >= args.I || mask.rows < args.I || mask.cols < args.K)
+            {
+                return false;
+            }
+
+            for (size_t col = 0; col < args.K; ++col)
+            {
+                const float value = src_data[row * args.K + col];
+                if (!std::isfinite(value))
+                {
+                    mask.mark_outlier(row, col);
+                    continue;
+                }
+
+                const double x = static_cast<double>(value);
+                const double z_score = stats.sigma == 0.0 ? 0.0 : (x - stats.mean) / stats.sigma;
+                if (std::fabs(z_score) > 3.0)
+                {
+                    mask.mark_outlier(row, col);
+                    continue;
+                }
+
+                inlier_stats.max_abs = std::max(inlier_stats.max_abs, std::fabs(x));
+                ++inlier_stats.count;
+            }
+
+            return true;
+        }
+
         int32_t quantize_to_i32(float value, float scale)
         {
             if (!std::isfinite(value) || !std::isfinite(scale) || scale <= 0.0f)
@@ -69,40 +206,22 @@ namespace ggml::gemmini::quants::act::token
             return std::isfinite(scale) && scale > 0.0f ? scale : 1.0f;
         }
 
-        Meta &active_meta()
+        bool set_scale(size_t row, const RowStats &stats, Meta &meta)
         {
-            static thread_local Meta meta;
-            return meta;
-        }
-
-        bool set_scale(const float *src_data, const ggml_gemmini_args_t &args, Meta &meta)
-        {
-            if (!src_data || args.I == 0 || args.K == 0)
+            if (row >= meta.scales.size())
             {
                 return false;
             }
 
-            meta.scales.assign(args.I, 1.0f);
-            for (size_t row = 0; row < args.I; ++row)
+            if (stats.count == 0 || stats.max_abs == 0.0)
             {
-                double max_abs = 0.0;
-                for (size_t col = 0; col < args.K; ++col)
-                {
-                    const float value = src_data[row * args.K + col];
-                    if (std::isfinite(value))
-                    {
-                        max_abs = std::max(max_abs, std::fabs(static_cast<double>(value)));
-                    }
-                }
-
-                if (max_abs != 0.0)
-                {
-                    const float scale = static_cast<float>(max_abs / 127.0);
-                    meta.scales[row] = std::isfinite(scale) && scale > 0.0f ? scale : 1.0f;
-                }
+                meta.scales[row] = 1.0f;
+                return true;
             }
 
-            return true;
+            const float scale = static_cast<float>(stats.max_abs / 127.0);
+            meta.scales[row] = std::isfinite(scale) && scale > 0.0f ? scale : 1.0f;
+            return std::isfinite(meta.scales[row]) && meta.scales[row] > 0.0f;
         }
     }
 
@@ -119,30 +238,87 @@ namespace ggml::gemmini::quants::act::token
             return false;
         }
 
-        const float *src_data = ggml::gemmini::activation_data(src);
-        Meta &meta = active_meta();
-        if (!src_data || !set_scale(src_data, args, meta))
+        auto *meta = std::get_if<Meta>(&args.act_quant.storage());
+        if (!meta)
         {
             return false;
         }
 
-        meta.outliers.clear();
+        const float *src_data = ggml::gemmini::activation_data(src);
+        if (!src_data)
+        {
+            return false;
+        }
+
+        meta->scales.assign(args.I, 1.0f);
+        meta->outliers.clear();
+
+#if ERROR_COMPENSATION
+        BitMask outliers;
+        if (!outliers.resize(args.I, args.K))
+        {
+            return false;
+        }
+        size_t residual_outlier_count = 0;
+#endif
 
         for (size_t row = 0; row < args.I; ++row)
         {
-            const float scale = resolve_scale(meta, row);
+            RowStats row_stats;
+            if (!compute_row_stats(src_data, args, row, row_stats))
+            {
+                return false;
+            }
+
+#if ERROR_COMPENSATION
+            RowStats inlier_stats;
+            if (!mark_row_outliers_3sigma(src_data, args, row, row_stats, outliers, inlier_stats))
+            {
+                return false;
+            }
+            const RowStats &scale_stats = inlier_stats.count != 0 ? inlier_stats : row_stats;
+#else
+            const RowStats &scale_stats = row_stats;
+#endif
+
+            if (!set_scale(row, scale_stats, *meta))
+            {
+                return false;
+            }
+
+            const float scale = resolve_scale(*meta, row);
             for (size_t col = 0; col < args.K; ++col)
             {
                 const size_t idx = row * args.K + col;
                 const int32_t q32 = quantize_to_i32(src_data[idx], scale);
-                dst[idx] = clip_to_i8(q32);
+                const int8_t q8 = clip_to_i8(q32);
+                dst[idx] = q8;
+
+#if ERROR_COMPENSATION
+                const int32_t residual = q32 - static_cast<int32_t>(q8);
+                if (outliers.is_marked(row, col) && residual != 0)
+                {
+                    meta->outliers.push_back({
+                        static_cast<int>(row),
+                        static_cast<int>(col),
+                        residual,
+                    });
+                    ++residual_outlier_count;
+                }
+#endif
             }
         }
 
         const char *layer = ggml::gemmini::types::to_string(args.layer_type);
+#if ERROR_COMPENSATION
+        ggml::gemmini::log::debug(layer,
+                                  "[quantize_token] I=%zu K=%zu row_scales=%zu residual_outliers=%zu",
+                                  args.I, args.K, meta->scales.size(), residual_outlier_count);
+#else
         ggml::gemmini::log::debug(layer,
                                   "[quantize_token] I=%zu K=%zu row_scales=%zu",
-                                  args.I, args.K, meta.scales.size());
+                                  args.I, args.K, meta->scales.size());
+#endif
 
         return true;
     }
@@ -163,7 +339,12 @@ namespace ggml::gemmini::quants::act::token
             return false;
         }
 
-        const Meta &meta = active_meta();
+        const auto *meta_ptr = std::get_if<Meta>(&args.act_quant.storage());
+        if (!meta_ptr)
+        {
+            return false;
+        }
+        const Meta &meta = *meta_ptr;
 
         if (args.sA != 0 && args.sA != args.K)
         {
@@ -174,6 +355,30 @@ namespace ggml::gemmini::quants::act::token
         const size_t row_count = std::min(rows, args.I);
         const size_t col_count = std::min(cols, args.K);
         const size_t max_size = std::numeric_limits<size_t>::max();
+        size_t residual_count = 0;
+        if (!checked_mul_size(row_count, col_count, residual_count))
+        {
+            return false;
+        }
+
+        std::vector<int32_t> residuals(residual_count, 0);
+
+#if ERROR_COMPENSATION
+        for (const auto &outlier : meta.outliers)
+        {
+            if (outlier.row < 0 || outlier.col < 0)
+            {
+                continue;
+            }
+
+            const size_t row = static_cast<size_t>(outlier.row);
+            const size_t col = static_cast<size_t>(outlier.col);
+            if (row < row_count && col < col_count)
+            {
+                residuals[row * col_count + col] += outlier.residual;
+            }
+        }
+#endif
 
         for (size_t row = 0; row < row_count; ++row)
         {
@@ -202,7 +407,10 @@ namespace ggml::gemmini::quants::act::token
 
                 const size_t src_idx = src_row_offset + col;
                 const size_t dst_idx = dst_row_offset + dst_col_offset;
-                dst[dst_idx] = static_cast<float>(src[src_idx]) * scale;
+                const int32_t q =
+                    static_cast<int32_t>(src[src_idx]) +
+                    residuals[row * col_count + col];
+                dst[dst_idx] = static_cast<float>(q) * scale;
             }
         }
 
