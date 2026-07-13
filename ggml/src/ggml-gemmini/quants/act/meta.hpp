@@ -2,6 +2,7 @@
 
 #include "exsia/types.hpp"
 #include "tensor/types.hpp"
+#include "token/types.hpp"
 
 #include <variant>
 
@@ -12,7 +13,7 @@ namespace ggml::gemmini::quants::act
         void reset() {}
     };
 
-    using MetaStorage = std::variant<NoneMeta, exsia::Meta, tensor::Meta>;
+    using MetaStorage = std::variant<NoneMeta, exsia::Meta, tensor::Meta, token::Meta>;
 
     struct Meta
     {
