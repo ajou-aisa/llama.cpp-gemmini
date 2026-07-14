@@ -533,6 +533,18 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             src0_f32.resize(jk_count);
             dequantize_row_q8_0(reinterpret_cast<const block_q8_0 *>(src0->data), src0_f32.data(), jk_count);
             src0_f = src0_f32.data();
+        } else if (src0->type == GGML_TYPE_I8) {
+            const float *scale = gemmini_i8_supported_scale_data(src0, args.transpose_B);
+            if (scale == nullptr) {
+                GGML_ABORT("DEQUANT_FP_TEST compute type: dense I8 weight is missing a loaded F32 scalar scale sidecar or has unsupported layout");
+            }
+
+            src0_f32.resize(jk_count);
+            const int8_t *src0_i8 = reinterpret_cast<const int8_t *>(src0->data);
+            for (size_t idx = 0; idx < jk_count; ++idx) {
+                src0_f32[idx] = static_cast<float>(src0_i8[idx]) * *scale;
+            }
+            src0_f = src0_f32.data();
         } else if (src0->type != GGML_TYPE_F32) {
             ggml::gemmini::log::debug(layer, "DEQUANT_FP_TEST unsupported weight type=%d", (int)src0->type);
             GGML_ABORT("DEQUANT_FP_TEST compute type: unsupported weight type");
@@ -750,39 +762,39 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     //                  layer, (void *)args.f_out, args.stride_f_out, args.col_stride_f_out);
 
     /* __ 5. Gemmini 호출 __ */
-    if constexpr (ggml::gemmini::config::CURRENT_COMPUTE_TYPE == ggml::gemmini::config::ComputeType::INT) {
-        if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA) {
-            if (args.weight_i8_scale_active) {
-                ggml::gemmini::log::debug(layer,
-                    "[exsia] route dense_i8 weight_scale=%.9f dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
-                    static_cast<double>(args.weight_scale), args.I, args.J, args.K, args.sB,
-                    static_cast<int>(args.tiled_matmul_type));
+        if constexpr (ggml::gemmini::config::CURRENT_COMPUTE_TYPE == ggml::gemmini::config::ComputeType::INT) {
+            if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA) {
+                if (args.weight_i8_scale_active) {
+                    ggml::gemmini::log::debug(layer,
+                        "[exsia] route dense_i8 weight_scale=%.9f dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
+                        static_cast<double>(args.weight_scale), args.I, args.J, args.K, args.sB,
+                        static_cast<int>(args.tiled_matmul_type));
+                    start = ggml::gemmini::cycle::read();
+                    ggml::gemmini::tiled_matmul_auto_exsia(&args);
+                    end = ggml::gemmini::cycle::read();
+                    ggml::gemmini::log::cycle(layer, "gemmini.tiled_matmul_auto_exsia", start, end);
+                } else {
+                    const char *weight_route = src0->type == GGML_TYPE_Q8_H1
+                        ? "Q8_H1 direct"
+                        : src0->type == GGML_TYPE_Q8_H2 ? "Q8_H2 direct" : "Q8_0 reprocessed";
+                    const char *cycle_op = src0->type == GGML_TYPE_Q8_H1
+                        ? "gemmini.im2p Q8_H1 direct"
+                        : src0->type == GGML_TYPE_Q8_H2
+                            ? "gemmini.im2p Q8_H2 direct"
+                            : "gemmini.im2p Q8_0 reprocessed";
+                    ggml::gemmini::log::debug(layer,
+                        "[exsia] route im2p weight=%s dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
+                        weight_route, args.I, args.J, args.K, args.sB, static_cast<int>(args.tiled_matmul_type));
+                    start = ggml::gemmini::cycle::read();
+                    ggml::gemmini::tiled_matmul_auto_im2p(&args);
+                    end = ggml::gemmini::cycle::read();
+                    ggml::gemmini::log::cycle(layer, cycle_op, start, end);
+                }
+            } else if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TENSOR) {
                 start = ggml::gemmini::cycle::read();
-                ggml::gemmini::tiled_matmul_auto_exsia(&args);
+                ggml::gemmini::tiled_matmul_auto_tensor(&args);
                 end = ggml::gemmini::cycle::read();
-                ggml::gemmini::log::cycle(layer, "gemmini.tiled_matmul_auto_exsia", start, end);
-            } else {
-                const char *weight_route = src0->type == GGML_TYPE_Q8_H1
-                    ? "Q8_H1 direct"
-                    : src0->type == GGML_TYPE_Q8_H2 ? "Q8_H2 direct" : "Q8_0 reprocessed";
-                const char *cycle_op = src0->type == GGML_TYPE_Q8_H1
-                    ? "gemmini.im2p Q8_H1 direct"
-                    : src0->type == GGML_TYPE_Q8_H2
-                        ? "gemmini.im2p Q8_H2 direct"
-                        : "gemmini.im2p Q8_0 reprocessed";
-                ggml::gemmini::log::debug(layer,
-                    "[exsia] route im2p weight=%s dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
-                    weight_route, args.I, args.J, args.K, args.sB, static_cast<int>(args.tiled_matmul_type));
-                start = ggml::gemmini::cycle::read();
-                ggml::gemmini::tiled_matmul_auto_im2p(&args);
-                end = ggml::gemmini::cycle::read();
-                ggml::gemmini::log::cycle(layer, cycle_op, start, end);
-            }
-        } else if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TENSOR) {
-            start = ggml::gemmini::cycle::read();
-            ggml::gemmini::tiled_matmul_auto_tensor(&args);
-            end = ggml::gemmini::cycle::read();
-            ggml::gemmini::log::cycle(layer, "gemmini.tiled_matmul_auto_tensor", start, end);
+                ggml::gemmini::log::cycle(layer, "gemmini.tiled_matmul_auto_tensor", start, end);
         }
     }
     // dst에는 gemmini 커널에서 dequantize한 결과가 들어옴 
@@ -1186,6 +1198,10 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
                         op->ne[2] != 1 || op->ne[3] != 1)
                         return false;
                 }
+                if (a->type == GGML_TYPE_I8) {
+                    return gemmini_i8_supported_scale_data(a, TRANSPOSE_B != 0) != nullptr;
+                }
+
                 return a->type == GGML_TYPE_Q8_0 || a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16;
             }
         }

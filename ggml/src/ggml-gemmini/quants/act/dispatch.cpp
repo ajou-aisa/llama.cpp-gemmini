@@ -5,6 +5,7 @@
 #include "../../ggml-gemmini-config.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <limits>
 #include <variant>
@@ -38,7 +39,9 @@ void quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
     case ggml::gemmini::config::ActivationQuantAlgo::TENSOR:
     {
         args.act_quant.storage().emplace<tensor::Meta>();
-        tensor::quantize(src, args);
+        if (!tensor::quantize(src, args)) {
+            std::abort();
+        }
         break;
     }
     }
@@ -64,6 +67,9 @@ std::vector<QactOutlier> outliers(const ggml_gemmini_args_t &args)
 {
     const auto &storage = args.act_quant.storage();
     if (const auto *meta = std::get_if<exsia::Meta>(&storage)) {
+        return meta->outliers;
+    }
+    if (const auto *meta = std::get_if<tensor::Meta>(&storage)) {
         return meta->outliers;
     }
 
