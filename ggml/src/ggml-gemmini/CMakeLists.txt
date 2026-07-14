@@ -40,12 +40,13 @@ set(GEMMINI_RISCV_FLAGS
 
 ggml_add_backend_library(ggml-gemmini
                           ggml-gemmini.cpp
+                          ggml-gemmini-q8-h1-artifact.cpp
+                          ggml-gemmini-q8-h1-artifact-reader.cpp
                             quants/act/dispatch.cpp
                             quants/act/quantize.cpp
                             quants/act/exsia/exsia.cpp
-                          quants/act/tensor/tensor.cpp
+                         quants/act/tensor/tensor.cpp
                          quants/weight/quantize_Q8_H1.cpp
-                         quants/weight/unpack_Q8_0.cpp
                          quants/common/fp16_util.cpp
                          quants/common/dequant.cpp
                           quants/dec/dec.cpp

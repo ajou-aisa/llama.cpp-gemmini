@@ -6,15 +6,30 @@
 #include "llama-model-loader.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cerrno>
 #include <cmath>
 #include <cstring>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
-#include <fstream>
 #include <mutex>
 #include <regex>
 #include <thread>
 #include <unordered_map>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <fcntl.h>
+#include <io.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 // Quantization types. Changes to this struct must be replicated in quantize.cpp
 struct tensor_quantization {
@@ -24,11 +39,101 @@ struct tensor_quantization {
 
 static const char * const GEMMINI_Q8_H1_ARTIFACT_ENV = "LLAMA_GEMMINI_Q8_H1_ARTIFACT";
 
-static void zeros(std::ofstream & file, size_t n) {
-    char zero = 0;
-    for (size_t i = 0; i < n; ++i) {
-        file.write(&zero, 1);
+static void write_bytes(FILE * file, const void * data, size_t size) {
+    if (size > 0 && fwrite(data, 1, size, file) != size) {
+        throw std::runtime_error("failed to write quantized output");
     }
+}
+
+static void zeros(FILE * file, size_t n) {
+    static const char zeroes[4096] = {};
+    while (n > 0) {
+        const size_t chunk = std::min(n, sizeof(zeroes));
+        write_bytes(file, zeroes, chunk);
+        n -= chunk;
+    }
+}
+
+struct llama_quantize_temporary_file {
+    std::string name;
+    FILE * file = nullptr;
+    bool owned = true;
+
+    llama_quantize_temporary_file(std::string name, FILE * file) : name(std::move(name)), file(file) {}
+    llama_quantize_temporary_file(const llama_quantize_temporary_file &) = delete;
+    llama_quantize_temporary_file & operator=(const llama_quantize_temporary_file &) = delete;
+    llama_quantize_temporary_file(llama_quantize_temporary_file && other) noexcept
+        : name(std::move(other.name)), file(other.file), owned(other.owned) {
+        other.file = nullptr;
+        other.owned = false;
+    }
+    llama_quantize_temporary_file & operator=(llama_quantize_temporary_file &&) = delete;
+    ~llama_quantize_temporary_file() {
+        close();
+        if (owned && !name.empty()) {
+            std::remove(name.c_str());
+        }
+    }
+
+    bool close() {
+        if (!file) {
+            return true;
+        }
+        FILE * current = file;
+        file = nullptr;
+        return fclose(current) == 0;
+    }
+};
+
+static llama_quantize_temporary_file llama_quantize_create_temporary_file(const std::string & output) {
+    static std::atomic<uint64_t> counter { 0 };
+    const auto timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
+#if defined(_WIN32)
+    const auto pid = GetCurrentProcessId();
+#else
+    const auto pid = getpid();
+#endif
+
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        const std::string temporary = output + ".tmp." + std::to_string(pid) + "." + std::to_string(timestamp) + "." + std::to_string(counter.fetch_add(1));
+#if defined(_WIN32)
+        HANDLE handle = CreateFileA(temporary.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle != INVALID_HANDLE_VALUE) {
+            const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(handle), _O_RDWR | _O_BINARY);
+            if (fd < 0) {
+                CloseHandle(handle);
+                std::remove(temporary.c_str());
+                throw std::runtime_error(format("failed to open temporary output file %s", temporary.c_str()));
+            }
+            FILE * file = _fdopen(fd, "w+b");
+            if (!file) {
+                _close(fd);
+                std::remove(temporary.c_str());
+                throw std::runtime_error(format("failed to open temporary output file %s", temporary.c_str()));
+            }
+            return { temporary, file };
+        }
+        if (GetLastError() != ERROR_FILE_EXISTS) {
+            throw std::runtime_error(format("failed to create temporary output file %s", temporary.c_str()));
+        }
+#else
+        const int fd = open(temporary.c_str(), O_CREAT | O_EXCL | O_RDWR, 0666);
+        if (fd >= 0) {
+            FILE * file = fdopen(fd, "w+b");
+            if (!file) {
+                close(fd);
+                std::remove(temporary.c_str());
+                throw std::runtime_error(format("failed to open temporary output file %s", temporary.c_str()));
+            }
+            return { temporary, file };
+        }
+        if (errno != EEXIST) {
+            throw std::runtime_error(format("failed to create temporary output file %s", temporary.c_str()));
+        }
+#endif
+    }
+
+    throw std::runtime_error(format("failed to create a unique temporary output file for %s", output.c_str()));
 }
 
 struct quantize_state_impl {
@@ -174,7 +279,7 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
                      ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
                 new_type = GGML_TYPE_Q5_K;
             }
-            else if (new_type != GGML_TYPE_Q8_0) {
+            else if (new_type != GGML_TYPE_Q8_0 && new_type != GGML_TYPE_Q8_H1 && new_type != GGML_TYPE_Q8_H2) {
                 new_type = GGML_TYPE_Q6_K;
             }
         }
@@ -479,7 +584,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     llama_ftype ftype = params->ftype;
     const char * gemmini_q8_h1_artifact = std::getenv(GEMMINI_Q8_H1_ARTIFACT_ENV);
     if (gemmini_q8_h1_artifact && params->ftype != LLAMA_FTYPE_MOSTLY_Q8_0) {
-        throw std::runtime_error("--gemmini-q8-0-r-artifact requires Q8_0 output");
+        throw std::runtime_error("--gemmini-q8-h1-artifact requires Q8_0 output");
     }
 
     switch (params->ftype) {
@@ -488,6 +593,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         case LLAMA_FTYPE_MOSTLY_Q5_0: default_type = GGML_TYPE_Q5_0; break;
         case LLAMA_FTYPE_MOSTLY_Q5_1: default_type = GGML_TYPE_Q5_1; break;
         case LLAMA_FTYPE_MOSTLY_Q8_0: default_type = GGML_TYPE_Q8_0; break;
+        case LLAMA_FTYPE_MOSTLY_Q8_H1: default_type = GGML_TYPE_Q8_H1; break;
+        case LLAMA_FTYPE_MOSTLY_Q8_H2: default_type = GGML_TYPE_Q8_H2; break;
         case LLAMA_FTYPE_MOSTLY_F16:  default_type = GGML_TYPE_F16;  break;
         case LLAMA_FTYPE_MOSTLY_BF16: default_type = GGML_TYPE_BF16; break;
         case LLAMA_FTYPE_ALL_F32:     default_type = GGML_TYPE_F32;  break;
@@ -650,6 +757,53 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         GGML_ASSERT((qs.n_attention_wv == n_attn_layer) && "n_attention_wv is unexpected");
     }
 
+    if (default_type == GGML_TYPE_Q8_H1 && !params->only_copy) {
+        const int64_t q8_h1_block_size = ggml_blck_size(GGML_TYPE_Q8_H1);
+        for (const auto * it : tensors) {
+            const ggml_tensor * tensor = it->tensor;
+            const std::string name = ggml_get_name(tensor);
+            bool quantize = name.rfind("weight") == name.size() - 6;
+            quantize &= ggml_n_dims(tensor) >= 2;
+            quantize &= name.find("_norm.weight") == std::string::npos;
+            quantize &= params->quantize_output_tensor || name != "output.weight";
+            quantize &= name.find("ffn_gate_inp.weight") == std::string::npos;
+            quantize &= name != LLM_TN(model.arch)(LLM_TENSOR_POS_EMBD,    "weight");
+            quantize &= name != LLM_TN(model.arch)(LLM_TENSOR_TOKEN_TYPES, "weight");
+            quantize &= name.find("ssm_conv1d.weight") == std::string::npos;
+            quantize &= name.find("time_mix_first.weight") == std::string::npos;
+            quantize &= name.find("time_mix_w0.weight") == std::string::npos;
+            quantize &= name.find("time_mix_w1.weight") == std::string::npos;
+            quantize &= name.find("time_mix_w2.weight") == std::string::npos;
+            quantize &= name.find("time_mix_v0.weight") == std::string::npos;
+            quantize &= name.find("time_mix_v1.weight") == std::string::npos;
+            quantize &= name.find("time_mix_v2.weight") == std::string::npos;
+            quantize &= name.find("time_mix_a0.weight") == std::string::npos;
+            quantize &= name.find("time_mix_a1.weight") == std::string::npos;
+            quantize &= name.find("time_mix_g1.weight") == std::string::npos;
+            quantize &= name.find("time_mix_g2.weight") == std::string::npos;
+            quantize &= name.find("time_mix_decay_w1.weight") == std::string::npos;
+            quantize &= name.find("time_mix_decay_w2.weight") == std::string::npos;
+            quantize &= name.find("time_mix_lerp_fused.weight") == std::string::npos;
+            quantize &= name.find("attn_rel_b.weight") == std::string::npos;
+            if (quantize && tensor->ne[0] % q8_h1_block_size != 0) {
+                throw std::runtime_error(format("Q8_H1 requires tensor %s width %" PRId64 " to be divisible by %" PRId64, tensor->name, tensor->ne[0], q8_h1_block_size));
+            }
+        }
+    }
+    if (default_type == GGML_TYPE_Q8_H2 && !params->only_copy) {
+        const int64_t q8_h2_block_size = ggml_blck_size(GGML_TYPE_Q8_H2);
+        for (const auto * it : tensors) {
+            const ggml_tensor * tensor = it->tensor;
+            bool quantize = std::string(tensor->name).rfind("weight") == std::string(tensor->name).size() - 6;
+            quantize &= ggml_n_dims(tensor) >= 2;
+            quantize &= std::string(tensor->name).find("_norm.weight") == std::string::npos;
+            quantize &= params->quantize_output_tensor || std::string(tensor->name) != "output.weight";
+            if (quantize && tensor->ne[0] % q8_h2_block_size != 0) {
+                throw std::runtime_error(format("Q8_H2 requires tensor %s width %" PRId64 " to be divisible by %" PRId64, tensor->name, tensor->ne[0], q8_h2_block_size));
+            }
+        }
+    }
+
     size_t total_size_org = 0;
     size_t total_size_new = 0;
 
@@ -693,30 +847,43 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
     }
 
+    std::vector<std::string> output_fnames(n_split);
+    std::vector<llama_quantize_temporary_file> temporary_files;
+    temporary_files.reserve(n_split);
+    for (uint16_t i = 0; i < n_split; ++i) {
+        std::string fname = fname_out;
+        if (params->keep_split) {
+            std::vector<char> split_path(llama_path_max(), 0);
+            llama_split_path(split_path.data(), split_path.size(), fname_out.c_str(), i, n_split);
+            fname = std::string(split_path.data());
+        }
+        output_fnames[i] = std::move(fname);
+    }
+    for (uint16_t i = 0; i < n_split; ++i) {
+        temporary_files.push_back(llama_quantize_create_temporary_file(output_fnames[i]));
+    }
+
     int cur_split = -1;
-    std::ofstream fout;
+    FILE * fout = nullptr;
     auto close_ofstream = [&]() {
         // Write metadata and close file handler
-        if (fout.is_open()) {
-            fout.seekp(0);
+        if (fout) {
+            if (fseek(fout, 0, SEEK_SET) != 0) {
+                throw std::runtime_error("failed to seek quantized output");
+            }
             std::vector<uint8_t> data(gguf_get_meta_size(ctx_outs[cur_split].get()));
             gguf_get_meta_data(ctx_outs[cur_split].get(), data.data());
-            fout.write((const char *) data.data(), data.size());
-            fout.close();
+            write_bytes(fout, data.data(), data.size());
+            if (!temporary_files[cur_split].close()) {
+                throw std::runtime_error(format("failed to close temporary output file %s", temporary_files[cur_split].name.c_str()));
+            }
+            fout = nullptr;
         }
     };
     auto new_ofstream = [&](int index) {
         cur_split = index;
         GGML_ASSERT(ctx_outs[cur_split] && "Find uninitialized gguf_context");
-        std::string fname = fname_out;
-        if (params->keep_split) {
-            std::vector<char> split_path(llama_path_max(), 0);
-            llama_split_path(split_path.data(), split_path.size(), fname_out.c_str(), cur_split, n_split);
-            fname = std::string(split_path.data());
-        }
-
-        fout = std::ofstream(fname, std::ios::binary);
-        fout.exceptions(std::ofstream::failbit); // fail fast on write errors
+        fout = temporary_files[cur_split].file;
         const size_t meta_size = gguf_get_meta_size(ctx_outs[cur_split].get());
         // placeholder for the meta data
         ::zeros(fout, meta_size);
@@ -927,11 +1094,26 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
 
         // write tensor data + padding
-        fout.write((const char *) new_data, new_size);
+        write_bytes(fout, new_data, new_size);
         zeros(fout, GGML_PAD(new_size, align) - new_size);
     }
     close_ofstream();
     q8_h1_artifact.finish();
+
+    auto replace_file = [](const std::string & from, const std::string & to) {
+#if defined(_WIN32)
+        return MoveFileExA(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+        return std::rename(from.c_str(), to.c_str()) == 0;
+#endif
+    };
+
+    for (uint16_t i = 0; i < n_split; ++i) {
+        if (!replace_file(temporary_files[i].name, output_fnames[i])) {
+            throw std::runtime_error(format("failed to replace output file %s", output_fnames[i].c_str()));
+        }
+        temporary_files[i].owned = false;
+    }
 
     LLAMA_LOG_INFO("%s: model size  = %8.2f MB\n", __func__, total_size_org/1024.0/1024.0);
     LLAMA_LOG_INFO("%s: quant size  = %8.2f MB\n", __func__, total_size_new/1024.0/1024.0);

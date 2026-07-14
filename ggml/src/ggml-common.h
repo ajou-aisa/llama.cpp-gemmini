@@ -73,6 +73,8 @@ typedef sycl::half2 ggml_half2;
 
 #if defined(GGML_COMMON_DECL)
 
+#include <stddef.h>
+
 #ifndef __cplusplus
 #ifndef static_assert
 #if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201100L)
@@ -212,6 +214,31 @@ typedef struct {
     int8_t  qs[QK8_0]; // quants
 } block_q8_0;
 static_assert(sizeof(block_q8_0) == sizeof(ggml_half) + QK8_0, "wrong q8_0 block size/padding");
+
+// Direct-reader Q8_H1 block: q[i] * s_rf * (c_b + R).
+typedef struct {
+    int8_t   qs[QK8_0];
+    uint8_t  c_b;
+    float    s_rf;
+    uint16_t R;
+} block_q8_h1;
+static_assert(offsetof(block_q8_h1, qs) == 0, "wrong q8_h1 qs offset");
+static_assert(offsetof(block_q8_h1, c_b) == QK8_0, "wrong q8_h1 c_b offset");
+static_assert(offsetof(block_q8_h1, s_rf) == 36, "wrong q8_h1 s_rf offset");
+static_assert(offsetof(block_q8_h1, R) == 40, "wrong q8_h1 R offset");
+static_assert(sizeof(block_q8_h1) == 44, "wrong q8_h1 block size/padding");
+
+#define QK8_H2 32
+typedef struct {
+    int8_t  qs[QK8_H2];
+    uint8_t m;
+    uint8_t padding[3];
+    float   channel_scale;
+} block_q8_h2;
+static_assert(offsetof(block_q8_h2, qs) == 0, "wrong q8_h2 qs offset");
+static_assert(offsetof(block_q8_h2, m) == QK8_H2, "wrong q8_h2 m offset");
+static_assert(offsetof(block_q8_h2, channel_scale) == 36, "wrong q8_h2 channel_scale offset");
+static_assert(sizeof(block_q8_h2) == 40, "wrong q8_h2 block size/padding");
 
 #define QK8_1 32
 typedef struct {

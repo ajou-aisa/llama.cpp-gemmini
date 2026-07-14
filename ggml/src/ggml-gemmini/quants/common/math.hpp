@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cmath>
 #include <limits>
 
 namespace ggml::gemmini {
@@ -13,10 +14,7 @@ inline float apply_activation_exponent(float value, int16_t e_t, int16_t m) {
     if (shift == 0)
         return value;
 
-    if (shift > 0)
-        return value * static_cast<float>(uint64_t(1) << shift);
-
-    return value / static_cast<float>(uint64_t(1) << (-shift));
+    return std::scalbn(value, shift);
 }
 
 }
