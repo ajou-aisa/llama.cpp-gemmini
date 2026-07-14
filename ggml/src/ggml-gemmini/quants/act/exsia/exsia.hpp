@@ -204,7 +204,8 @@ namespace ggml::gemmini::quants::act::exsia
             StripeState &stripe,
             const std::vector<float> &x,
             size_t row,
-            size_t blk_idx);
+            size_t blk_idx,
+            uint64_t &cycle_delta);
 
     private:
         ExpScanner unit_exp_;
@@ -223,7 +224,8 @@ namespace ggml::gemmini::quants::act::exsia
             ggml_gemmini_args_t &args,
             size_t stripe_idx,
             int8_t *dst,
-            int32_t *residual);
+            int32_t *residual,
+            uint64_t &cycle_delta);
 
     private:
         OutlierMarker unit_outlier_;
