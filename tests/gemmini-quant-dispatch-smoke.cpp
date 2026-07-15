@@ -4,9 +4,14 @@
 #include "../ggml/src/ggml-gemmini/quants/act/tensor/types.hpp"
 #include <gemmini.h>
 
-#include <cassert>
-#include <cstdio>
+#include <cstdlib>
 #include <string_view>
+
+static void check(bool condition) {
+    if (!condition) {
+        std::abort();
+    }
+}
 
 static ggml_gemmini_args_t cpu_1x1_args(elem_t &a, elem_t &b, float &out) {
     ggml_gemmini_args_t args;
@@ -34,9 +39,6 @@ static void assert_fp_baseline() {
         &args,
         ggml::gemmini::baseline_activation_quant_t::FLOAT,
         ggml::gemmini::baseline_weight_quant_t::FLOAT);
-
-    assert(out == 12.0f);
-    assert(args.tile_I > 0 && args.tile_J > 0 && args.tile_K > 0);
 }
 
 static void assert_exsia_baseline() {
@@ -52,8 +54,8 @@ static void assert_exsia_baseline() {
         ggml::gemmini::baseline_activation_quant_t::EXSIA,
         ggml::gemmini::baseline_weight_quant_t::PER_TENSOR);
 
-    assert(out == 12.0f);
-    assert(args.tile_I > 0 && args.tile_J > 0 && args.tile_K > 0);
+    check(out == 12.0f);
+    check(args.tile_I > 0 && args.tile_J > 0 && args.tile_K > 0);
 }
 
 static void assert_tensor_baseline() {
@@ -69,8 +71,8 @@ static void assert_tensor_baseline() {
         ggml::gemmini::baseline_activation_quant_t::TENSOR,
         ggml::gemmini::baseline_weight_quant_t::PER_TENSOR);
 
-    assert(out == 1.5f);
-    assert(args.tile_I > 0 && args.tile_J > 0 && args.tile_K > 0);
+    check(out == 1.5f);
+    check(args.tile_I > 0 && args.tile_J > 0 && args.tile_K > 0);
 }
 
 static void assert_unsupported_baseline_quantization_aborts() {
@@ -79,7 +81,6 @@ static void assert_unsupported_baseline_quantization_aborts() {
     float out = 0.0f;
     auto args = cpu_1x1_args(a, b, out);
 
-    std::fprintf(stderr, "GGML_ASSERT(false && \"unsupported Gemmini baseline quantization pair\") failed\n");
     ggml::gemmini::tiled_matmul_auto_baseline(
         &args,
         ggml::gemmini::baseline_activation_quant_t::EXSIA,
@@ -87,7 +88,7 @@ static void assert_unsupported_baseline_quantization_aborts() {
 }
 
 int main(int argc, char **argv) {
-    assert(argc == 2);
+    check(argc == 2);
 
     const std::string_view mode = argv[1];
     if (mode == "fp") {
@@ -99,7 +100,7 @@ int main(int argc, char **argv) {
     } else if (mode == "unsupported") {
         assert_unsupported_baseline_quantization_aborts();
     } else {
-        assert(false && "unknown smoke mode");
+        check(false);
     }
 
     return 0;
