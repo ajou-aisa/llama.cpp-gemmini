@@ -154,6 +154,7 @@ endif()
 # llama_build_and_test(test-opt.cpp) # SLOW
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
+llama_build_and_test(test-gemmini-q8-h1-h2-dequant-fp.cpp NAME gemmini_q8_h1_h2_dequant_fp)
 llama_build_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_build_and_test(test-autorelease.cpp        LABEL "model")
 
