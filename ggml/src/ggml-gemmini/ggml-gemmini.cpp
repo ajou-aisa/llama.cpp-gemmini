@@ -768,15 +768,15 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                     ? ggml::gemmini::baseline_activation_quant_t::EXSIA
                     : ggml::gemmini::baseline_activation_quant_t::TENSOR;
             constexpr auto baseline_weight_quant =
-                ggml::gemmini::config::CURRENT_WEIGHT_QUANT == ggml::gemmini::config::WeightQuantAlgo::PER_TENSOR
-                    ? ggml::gemmini::baseline_weight_quant_t::PER_TENSOR
+                ggml::gemmini::config::CURRENT_WEIGHT_QUANT == ggml::gemmini::config::WeightQuantAlgo::TENSOR
+                    ? ggml::gemmini::baseline_weight_quant_t::TENSOR
                     : ggml::gemmini::baseline_weight_quant_t::FLOAT;
             bool run_baseline = true;
 
             if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA) {
                 if (args.weight_i8_scale_active) {
                     ggml::gemmini::log::debug(layer,
-                        "[baseline] route activation=exsia weight=per_tensor weight_scale=%.9f dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
+                        "[baseline] route activation=exsia weight=tensor weight_scale=%.9f dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
                         static_cast<double>(args.weight_scale), args.I, args.J, args.K, args.sB,
                         static_cast<int>(args.tiled_matmul_type));
                 } else {
@@ -807,9 +807,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                     baseline_weight_quant);
                 end = ggml::gemmini::cycle::read();
                 if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA) {
-                    ggml::gemmini::log::cycle(layer, "gemmini.tiled_matmul_auto_baseline.exsia_per_tensor", start, end);
+                    ggml::gemmini::log::cycle(layer, "gemmini.tiled_matmul_auto_baseline.exsia_tensor", start, end);
                 } else if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TENSOR) {
-                    ggml::gemmini::log::cycle(layer, "gemmini.tiled_matmul_auto_baseline.tensor_per_tensor", start, end);
+                    ggml::gemmini::log::cycle(layer, "gemmini.tiled_matmul_auto_baseline.tensor_tensor", start, end);
                 }
             }
     }

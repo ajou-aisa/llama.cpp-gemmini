@@ -53,7 +53,7 @@ enum class ActivationQuantAlgo : uint8_t {
 };
 
 enum class WeightQuantAlgo : uint8_t {
-    PER_TENSOR = 0,
+    TENSOR = 0,
 };
 
 // Macro → enum mapping (compile-time) ---------------------------------------
@@ -82,7 +82,7 @@ inline constexpr ActivationQuantAlgo CURRENT_ACTIVATION_QUANT =
 
 inline constexpr WeightQuantAlgo CURRENT_WEIGHT_QUANT =
 #if GGML_GEMMINI_WEIGHT_QUANT == 0
-    WeightQuantAlgo::PER_TENSOR;
+    WeightQuantAlgo::TENSOR;
 #else
     #error "Invalid GGML_GEMMINI_WEIGHT_QUANT value"
 #endif
@@ -98,6 +98,6 @@ inline constexpr WeightQuantAlgo CURRENT_WEIGHT_QUANT =
 
 static_assert(static_cast<uint8_t>(CURRENT_COMPUTE_TYPE) <= 2, "CURRENT_COMPUTE_TYPE must be INT, FLOAT, or DEQUANT_FP_TEST");
 static_assert(static_cast<uint8_t>(CURRENT_ACTIVATION_QUANT) <= 1, "CURRENT_ACTIVATION_QUANT must be EXSIA or TENSOR");
-static_assert(static_cast<uint8_t>(CURRENT_WEIGHT_QUANT) <= 0, "CURRENT_WEIGHT_QUANT must be PER_TENSOR");
+static_assert(static_cast<uint8_t>(CURRENT_WEIGHT_QUANT) <= 0, "CURRENT_WEIGHT_QUANT must be TENSOR");
 
 } // namespace

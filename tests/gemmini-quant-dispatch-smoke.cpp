@@ -52,7 +52,7 @@ static void assert_exsia_baseline() {
     ggml::gemmini::tiled_matmul_auto_baseline(
         &args,
         ggml::gemmini::baseline_activation_quant_t::EXSIA,
-        ggml::gemmini::baseline_weight_quant_t::PER_TENSOR);
+        ggml::gemmini::baseline_weight_quant_t::TENSOR);
 
     check(out == 12.0f);
     check(args.tile_I > 0 && args.tile_J > 0 && args.tile_K > 0);
@@ -69,7 +69,7 @@ static void assert_tensor_baseline() {
     ggml::gemmini::tiled_matmul_auto_baseline(
         &args,
         ggml::gemmini::baseline_activation_quant_t::TENSOR,
-        ggml::gemmini::baseline_weight_quant_t::PER_TENSOR);
+        ggml::gemmini::baseline_weight_quant_t::TENSOR);
 
     check(out == 1.5f);
     check(args.tile_I > 0 && args.tile_J > 0 && args.tile_K > 0);
