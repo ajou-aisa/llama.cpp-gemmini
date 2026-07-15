@@ -763,19 +763,22 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     /* __ 5. Gemmini baseline/IM2P dispatch __ */
         if constexpr (ggml::gemmini::config::CURRENT_COMPUTE_TYPE == ggml::gemmini::config::ComputeType::INT) {
+            constexpr auto baseline_activation_quant =
+                ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA
+                    ? ggml::gemmini::baseline_activation_quant_t::EXSIA
+                    : ggml::gemmini::baseline_activation_quant_t::TENSOR;
+            constexpr auto baseline_weight_quant =
+                ggml::gemmini::config::CURRENT_WEIGHT_QUANT == ggml::gemmini::config::WeightQuantAlgo::PER_TENSOR
+                    ? ggml::gemmini::baseline_weight_quant_t::PER_TENSOR
+                    : ggml::gemmini::baseline_weight_quant_t::FLOAT;
+            bool run_baseline = true;
+
             if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA) {
                 if (args.weight_i8_scale_active) {
                     ggml::gemmini::log::debug(layer,
                         "[baseline] route activation=exsia weight=per_tensor weight_scale=%.9f dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
                         static_cast<double>(args.weight_scale), args.I, args.J, args.K, args.sB,
                         static_cast<int>(args.tiled_matmul_type));
-                    start = ggml::gemmini::cycle::read();
-                    ggml::gemmini::tiled_matmul_auto_baseline(
-                        &args,
-                        ggml::gemmini::baseline_activation_quant_t::EXSIA,
-                        ggml::gemmini::baseline_weight_quant_t::PER_TENSOR);
-                    end = ggml::gemmini::cycle::read();
-                    ggml::gemmini::log::cycle(layer, "gemmini.tiled_matmul_auto_baseline.exsia_per_tensor", start, end);
                 } else {
                     const char *weight_route = src0->type == GGML_TYPE_Q8_H1
                         ? "Q8_H1 direct"
@@ -792,16 +795,23 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                     ggml::gemmini::tiled_matmul_auto_im2p(&args);
                     end = ggml::gemmini::cycle::read();
                     ggml::gemmini::log::cycle(layer, cycle_op, start, end);
+                    run_baseline = false;
                 }
-            } else if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TENSOR) {
+            }
+
+            if (run_baseline) {
                 start = ggml::gemmini::cycle::read();
                 ggml::gemmini::tiled_matmul_auto_baseline(
                     &args,
-                    ggml::gemmini::baseline_activation_quant_t::TENSOR,
-                    ggml::gemmini::baseline_weight_quant_t::PER_TENSOR);
+                    baseline_activation_quant,
+                    baseline_weight_quant);
                 end = ggml::gemmini::cycle::read();
-                ggml::gemmini::log::cycle(layer, "gemmini.tiled_matmul_auto_baseline.tensor_per_tensor", start, end);
-        }
+                if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA) {
+                    ggml::gemmini::log::cycle(layer, "gemmini.tiled_matmul_auto_baseline.exsia_per_tensor", start, end);
+                } else if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TENSOR) {
+                    ggml::gemmini::log::cycle(layer, "gemmini.tiled_matmul_auto_baseline.tensor_per_tensor", start, end);
+                }
+            }
     }
     // dst에는 gemmini 커널에서 dequantize한 결과가 들어옴 
 
