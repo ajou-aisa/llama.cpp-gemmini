@@ -766,7 +766,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             constexpr auto baseline_activation_quant =
                 ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA
                     ? ggml::gemmini::baseline_activation_quant_t::EXSIA
-                    : ggml::gemmini::baseline_activation_quant_t::TENSOR;
+                    : ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TENSOR
+                        ? ggml::gemmini::baseline_activation_quant_t::TENSOR
+                        : ggml::gemmini::baseline_activation_quant_t::TOKEN;
             constexpr auto baseline_weight_quant =
                 ggml::gemmini::config::CURRENT_WEIGHT_QUANT == ggml::gemmini::config::WeightQuantAlgo::TENSOR
                     ? ggml::gemmini::baseline_weight_quant_t::TENSOR
@@ -799,6 +801,12 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 }
             }
 
+            if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TOKEN) {
+                if (!args.weight_i8_scale_active) {
+                    GGML_ABORT("Gemmini TOKEN activation requires dense tensor weights; Q8_0/Q8_H1/Q8_H2 are unsupported");
+                }
+            }
+
             if (run_baseline) {
                 start = ggml::gemmini::cycle::read();
                 ggml::gemmini::tiled_matmul_auto_baseline(
@@ -810,6 +818,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                     ggml::gemmini::log::cycle(layer, "gemmini.tiled_matmul_auto_baseline.exsia_tensor", start, end);
                 } else if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TENSOR) {
                     ggml::gemmini::log::cycle(layer, "gemmini.tiled_matmul_auto_baseline.tensor_tensor", start, end);
+                } else if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TOKEN) {
+                    ggml::gemmini::log::cycle(layer, "gemmini.tiled_matmul_auto_baseline.token_tensor", start, end);
                 }
             }
     }

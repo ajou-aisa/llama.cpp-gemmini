@@ -50,6 +50,7 @@ enum class ComputeType : uint8_t {
 enum class ActivationQuantAlgo : uint8_t {
     EXSIA = 0,
     TENSOR = 1,
+    TOKEN = 2,
 };
 
 enum class WeightQuantAlgo : uint8_t {
@@ -76,6 +77,8 @@ inline constexpr ActivationQuantAlgo CURRENT_ACTIVATION_QUANT =
     ActivationQuantAlgo::EXSIA;
 #elif GGML_GEMMINI_ACTIVATION_QUANT == 1
     ActivationQuantAlgo::TENSOR;
+#elif GGML_GEMMINI_ACTIVATION_QUANT == 2
+    ActivationQuantAlgo::TOKEN;
 #else
     #error "Invalid GGML_GEMMINI_ACTIVATION_QUANT value"
 #endif
@@ -89,15 +92,18 @@ inline constexpr WeightQuantAlgo CURRENT_WEIGHT_QUANT =
 
 #define GGML_GEMMINI_ACTIVATION_QUANT_NAMEEXSIA "exsia"
 #define GGML_GEMMINI_ACTIVATION_QUANT_NAMETENSOR "tensor"
+#define GGML_GEMMINI_ACTIVATION_QUANT_NAMETOKEN "token"
 
 #if GGML_GEMMINI_ACTIVATION_QUANT == 0
     #define GGML_GEMMINI_ACTIVATION_QUANT_NAME GGML_GEMMINI_ACTIVATION_QUANT_NAMEEXSIA
 #elif GGML_GEMMINI_ACTIVATION_QUANT == 1
     #define GGML_GEMMINI_ACTIVATION_QUANT_NAME GGML_GEMMINI_ACTIVATION_QUANT_NAMETENSOR
+#elif GGML_GEMMINI_ACTIVATION_QUANT == 2
+    #define GGML_GEMMINI_ACTIVATION_QUANT_NAME GGML_GEMMINI_ACTIVATION_QUANT_NAMETOKEN
 #endif
 
 static_assert(static_cast<uint8_t>(CURRENT_COMPUTE_TYPE) <= 2, "CURRENT_COMPUTE_TYPE must be INT, FLOAT, or DEQUANT_FP_TEST");
-static_assert(static_cast<uint8_t>(CURRENT_ACTIVATION_QUANT) <= 1, "CURRENT_ACTIVATION_QUANT must be EXSIA or TENSOR");
+static_assert(static_cast<uint8_t>(CURRENT_ACTIVATION_QUANT) <= 2, "CURRENT_ACTIVATION_QUANT must be EXSIA, TENSOR, or TOKEN");
 static_assert(static_cast<uint8_t>(CURRENT_WEIGHT_QUANT) <= 0, "CURRENT_WEIGHT_QUANT must be TENSOR");
 
 } // namespace

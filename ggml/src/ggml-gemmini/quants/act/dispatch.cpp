@@ -1,6 +1,7 @@
 #include "dispatch.hpp"
 #include "exsia/exsia.hpp"
 #include "tensor/tensor.hpp"
+#include "token/token.hpp"
 #include "../../ggml-gemmini-args.h"
 #include "../../ggml-gemmini-config.hpp"
 
@@ -44,6 +45,14 @@ void quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
         }
         break;
     }
+    case ggml::gemmini::config::ActivationQuantAlgo::TOKEN:
+    {
+        args.act_quant.storage().emplace<token::Meta>();
+        if (!token::quantize(src, args)) {
+            std::abort();
+        }
+        break;
+    }
     }
 }
 
@@ -60,6 +69,12 @@ bool dequantize_activation(float *dst,
         return exsia::dequantize_activation(dst, dst_row_stride, dst_col_stride, rows, cols, args);
     case ggml::gemmini::config::ActivationQuantAlgo::TENSOR:
         return tensor::dequantize_activation(dst, dst_row_stride, dst_col_stride, rows, cols, args);
+    case ggml::gemmini::config::ActivationQuantAlgo::TOKEN:
+        if (const auto *meta = std::get_if<token::Meta>(&args.act_quant.storage());
+            meta != nullptr && meta->scales.size() != args.I) {
+            return false;
+        }
+        return token::dequantize_activation(dst, dst_row_stride, dst_col_stride, rows, cols, args);
     }
 }
 
@@ -70,6 +85,9 @@ std::vector<QactOutlier> outliers(const ggml_gemmini_args_t &args)
         return meta->outliers;
     }
     if (const auto *meta = std::get_if<tensor::Meta>(&storage)) {
+        return meta->outliers;
+    }
+    if (const auto *meta = std::get_if<token::Meta>(&storage)) {
         return meta->outliers;
     }
 
@@ -101,6 +119,18 @@ std::vector<float> activation_scales(const ggml_gemmini_args_t &args, size_t row
 
     if (const auto *meta = std::get_if<tensor::Meta>(&storage)) {
         std::fill(scales.begin(), scales.end(), meta->scale);
+        return scales;
+    }
+
+    if (const auto *meta = std::get_if<token::Meta>(&storage)) {
+        if (meta->scales.size() != args.I) {
+            GGML_ASSERT(false && "TOKEN activation scale cardinality must equal args.I");
+        }
+        const size_t count = std::min(row_count, meta->scales.size());
+        for (size_t row = 0; row < count; ++row) {
+            const float scale = meta->scales[row];
+            scales[row] = std::isfinite(scale) && scale > 0.0f ? scale : 1.0f;
+        }
     }
 
     return scales;
