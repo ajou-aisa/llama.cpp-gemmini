@@ -533,6 +533,14 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             src0_f32.resize(jk_count);
             dequantize_row_q8_0(reinterpret_cast<const block_q8_0 *>(src0->data), src0_f32.data(), jk_count);
             src0_f = src0_f32.data();
+        } else if (src0->type == GGML_TYPE_Q8_H1) {
+            src0_f32.resize(jk_count);
+            dequantize_row_q8_h1(reinterpret_cast<const block_q8_h1 *>(src0->data), src0_f32.data(), jk_count);
+            src0_f = src0_f32.data();
+        } else if (src0->type == GGML_TYPE_Q8_H2) {
+            src0_f32.resize(jk_count);
+            dequantize_row_q8_h2(reinterpret_cast<const block_q8_h2 *>(src0->data), src0_f32.data(), jk_count);
+            src0_f = src0_f32.data();
         } else if (src0->type == GGML_TYPE_I8) {
             const float *scale = gemmini_i8_supported_scale_data(src0, args.transpose_B);
             if (scale == nullptr) {
