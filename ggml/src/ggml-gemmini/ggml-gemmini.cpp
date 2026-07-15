@@ -1232,8 +1232,80 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
                         op->ne[2] != 1 || op->ne[3] != 1)
                         return false;
 
-                    if (a->type == GGML_TYPE_Q8_H1 || a->type == GGML_TYPE_Q8_H2)
-                        return true;
+                    if (a->type == GGML_TYPE_Q8_H1) {
+                        const int64_t dim_j = a->ne[1] ? a->ne[1] : 1;
+                        const int64_t dim_z = a->ne[2] ? a->ne[2] : 1;
+                        const int64_t dim_w = a->ne[3] ? a->ne[3] : 1;
+
+                        if (a->ne[0] <= 0 || a->ne[0] % QK8_0 != 0)
+                            return false;
+
+                        const size_t blocks_per_row = static_cast<size_t>(a->ne[0]) / QK8_0;
+                        if (blocks_per_row == 0)
+                            return false;
+
+                        const __int128 logical_rows_128 =
+                            static_cast<__int128>(dim_j) * static_cast<__int128>(dim_z) * static_cast<__int128>(dim_w);
+                        if (logical_rows_128 <= 0 || logical_rows_128 > static_cast<__int128>(std::numeric_limits<size_t>::max()))
+                            return false;
+
+                        const size_t logical_rows = static_cast<size_t>(logical_rows_128);
+
+                        size_t row_bytes = 0;
+                        size_t plane_bytes = 0;
+                        size_t storage_bytes = 0;
+                        if (!gemmini_checked_mul(blocks_per_row, sizeof(block_q8_h1), row_bytes) ||
+                            !gemmini_checked_mul(row_bytes, static_cast<size_t>(dim_j), plane_bytes) ||
+                            !gemmini_checked_mul(plane_bytes, static_cast<size_t>(dim_z), storage_bytes) ||
+                            !gemmini_checked_mul(storage_bytes, static_cast<size_t>(dim_w), storage_bytes)) {
+                            return false;
+                        }
+
+                        if (a->nb[0] != sizeof(block_q8_h1) || a->nb[1] != row_bytes ||
+                            a->nb[2] != plane_bytes || a->nb[3] != storage_bytes) {
+                            return false;
+                        }
+
+                        const char * base = reinterpret_cast<const char *>(a->view_src ? a->view_src->data : a->data);
+                        const size_t view_offset = a->view_src ? static_cast<size_t>(a->view_offs) : 0;
+                        if (base == nullptr)
+                            return false;
+                        if (a->view_src != nullptr) {
+                            const size_t source_bytes = ggml_nbytes(a->view_src);
+                            if (view_offset > source_bytes || storage_bytes > source_bytes - view_offset)
+                                return false;
+                        } else if (view_offset != 0) {
+                            return false;
+                        }
+
+                        const char *data = base + view_offset;
+                        if (reinterpret_cast<uintptr_t>(data) % alignof(block_q8_h1) != 0)
+                            return false;
+
+                        const size_t blocks_per_row_contract = static_cast<size_t>(a->ne[0]) / QK8_0;
+                        size_t q8_h1_block_count = 0;
+                        if (!gemmini_checked_mul(logical_rows, blocks_per_row_contract, q8_h1_block_count)) {
+                            return false;
+                        }
+
+                        const block_q8_h1 * blocks = reinterpret_cast<const block_q8_h1 *>(data);
+                        ggml_gemmini_args_t args;
+                        args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1_native;
+                        args.J = logical_rows;
+                        args.K = static_cast<size_t>(a->ne[0]);
+                        args.block_size_k = QK8_0;
+                        args.blocks_per_row = blocks_per_row_contract;
+                        args.q8_h1_native_blocks = blocks;
+                        args.q8_h1_native_block_count = q8_h1_block_count;
+                        args.q8_h1_native_rows = logical_rows;
+                        return args.has_q8_h1_native_im2p_contract();
+                    }
+
+                    if (a->type == GGML_TYPE_Q8_H2) {
+                        ggml_gemmini_args_t args;
+                        args.tiled_matmul_type = CPU;
+                        return gemmini_set_q8_h2_weight_args(a, args);
+                    }
                 }
                 if (a->type == GGML_TYPE_I8) {
                     return gemmini_i8_supported_scale_data(a, TRANSPOSE_B != 0) != nullptr;
