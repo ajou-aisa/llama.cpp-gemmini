@@ -165,11 +165,30 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-rope.cpp)
 endif()
 
-llama_build(gemmini-quant-dispatch-smoke.cpp)
+add_executable(gemmini-quant-dispatch-smoke
+    gemmini-quant-dispatch-smoke.cpp
+    ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
+    ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
+    ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
+    ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp)
+target_link_libraries(gemmini-quant-dispatch-smoke PRIVATE ggml-base ggml-gemmini-utils)
+target_include_directories(gemmini-quant-dispatch-smoke PRIVATE
+    ../ggml/src
+    ../ggml/src/ggml-gemmini
+    ../ggml/src/ggml-gemmini/quants
+    ../ggml/src/ggml-gemmini/quants/act
+    ../ggml/src/ggml-gemmini/quants/act/exsia
+    ../ggml/src/ggml-gemmini/quants/common
+    ../ggml/src/ggml-gemmini/quants/dec)
 llama_test(gemmini-quant-dispatch-smoke NAME gemmini_quant_dispatch_fp          ARGS fp)
 llama_test(gemmini-quant-dispatch-smoke NAME gemmini_quant_dispatch_exsia       ARGS exsia)
 llama_test(gemmini-quant-dispatch-smoke NAME gemmini_quant_dispatch_tensor     ARGS tensor)
-llama_test(gemmini-quant-dispatch-smoke NAME gemmini_quant_dispatch_unsupported ARGS unsupported)
+add_test(
+    NAME gemmini_quant_dispatch_unsupported
+    COMMAND ${CMAKE_COMMAND}
+        -DTEST_BINARY=$<TARGET_FILE:gemmini-quant-dispatch-smoke>
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/gemmini-quant-dispatch-unsupported.cmake)
+set_property(TEST gemmini_quant_dispatch_unsupported PROPERTY LABELS main)
 
 # libmtmd
 set(LLAMA_TEST_NAME test-mtmd-c-api)

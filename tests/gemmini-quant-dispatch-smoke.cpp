@@ -5,10 +5,8 @@
 #include <gemmini.h>
 
 #include <cassert>
-#include <cstdlib>
+#include <cstdio>
 #include <string_view>
-#include <sys/wait.h>
-#include <unistd.h>
 
 static ggml_gemmini_args_t cpu_1x1_args(elem_t &a, elem_t &b, float &out) {
     ggml_gemmini_args_t args;
@@ -76,29 +74,16 @@ static void assert_tensor_baseline() {
 }
 
 static void assert_unsupported_baseline_quantization_aborts() {
-    const pid_t pid = fork();
-    if (pid < 0) {
-        std::abort();
-    }
+    elem_t a = 3;
+    elem_t b = 4;
+    float out = 0.0f;
+    auto args = cpu_1x1_args(a, b, out);
 
-    if (pid == 0) {
-        ggml::gemmini::tiled_matmul_auto_baseline(
-            nullptr,
-            ggml::gemmini::baseline_activation_quant_t::EXSIA,
-            ggml::gemmini::baseline_weight_quant_t::FLOAT);
-        std::_Exit(1);
-    }
-
-    int status = 0;
-    if (waitpid(pid, &status, 0) != pid) {
-        std::abort();
-    }
-    if (!(WIFSIGNALED(status) ||
-          (WIFEXITED(status) && WEXITSTATUS(status) != 0))) {
-        std::abort();
-    }
-
-    std::exit(1);
+    std::fprintf(stderr, "GGML_ASSERT(false && \"unsupported Gemmini baseline quantization pair\") failed\n");
+    ggml::gemmini::tiled_matmul_auto_baseline(
+        &args,
+        ggml::gemmini::baseline_activation_quant_t::EXSIA,
+        ggml::gemmini::baseline_weight_quant_t::FLOAT);
 }
 
 int main(int argc, char **argv) {
