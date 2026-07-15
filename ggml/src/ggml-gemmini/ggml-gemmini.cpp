@@ -1231,6 +1231,9 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
                         b->ne[2] != 1 || b->ne[3] != 1 ||
                         op->ne[2] != 1 || op->ne[3] != 1)
                         return false;
+
+                    if (a->type == GGML_TYPE_Q8_H1 || a->type == GGML_TYPE_Q8_H2)
+                        return true;
                 }
                 if (a->type == GGML_TYPE_I8) {
                     return gemmini_i8_supported_scale_data(a, TRANSPOSE_B != 0) != nullptr;
