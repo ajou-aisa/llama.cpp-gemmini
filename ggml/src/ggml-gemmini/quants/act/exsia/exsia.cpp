@@ -276,7 +276,7 @@ namespace ggml::gemmini::quants::act::exsia
         GGML_ASSERT(x.size() == blk_size);
         BlockState blk;
         const int16_t neg_inf = std::numeric_limits<int16_t>::min();
-        const bool has_second_bucket = (blk.e2 != neg_inf);
+        bool has_second_bucket = false;
         std::vector<int32_t> q_tmp;
         std::vector<int32_t> q_requant;
         std::vector<int32_t> q_final;
@@ -293,6 +293,7 @@ namespace ggml::gemmini::quants::act::exsia
             // Step 1: scan block exponents and identify top-2 distinct exponent buckets.
             const uint64_t cycle_start = EXSIA_CYCLE_READ();
             unit_exp_.scan_top2_exp(x, blk);
+            has_second_bucket = (blk.e2 != neg_inf);
             const uint64_t cycle_end = EXSIA_CYCLE_READ();
             EXSIA_LOG_CYCLE("exsia.Local.Stage.1.scan_top2_exp", cycle_start, cycle_end);
             cycle_delta += cycle_end >= cycle_start ? cycle_end - cycle_start : 0;
