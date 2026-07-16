@@ -7,6 +7,10 @@
 #include <limits>
 #include <vector>
 
+#ifndef GGML_GEMMINI_EXSIA_SIGMA
+#define GGML_GEMMINI_EXSIA_SIGMA 2
+#endif
+
 namespace ggml::gemmini::quants::act::exsia
 {
 
@@ -14,6 +18,7 @@ struct Meta
 {
     int16_t e_s = std::numeric_limits<int16_t>::min();
     int16_t rho = 6;
+    int32_t sigma = GGML_GEMMINI_EXSIA_SIGMA;
     std::vector<int16_t> theta;
     std::vector<ggml_gemmini_qact_outlier> outliers;
 
@@ -21,6 +26,7 @@ struct Meta
     {
         e_s = std::numeric_limits<int16_t>::min();
         rho = 6;
+        sigma = GGML_GEMMINI_EXSIA_SIGMA;
         theta.clear();
         outliers.clear();
     }

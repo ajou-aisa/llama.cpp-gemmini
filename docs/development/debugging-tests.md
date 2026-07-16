@@ -31,6 +31,19 @@ To speed up the testing loop, if you know your test number you can just run it s
 ./scripts/debug-test.sh test 23
 ```
 
+For case-driven focused binaries such as `test-gemmini-exsia`, forward the case
+arguments after `--` so the binary receives them unchanged:
+
+```bash
+./scripts/debug-test.sh test-gemmini-exsia 0 -- --case=all --rows=65 --cols=37 --compiled-tau=2
+./scripts/debug-test.sh test-gemmini-exsia 0 -- --case=shift-extremes --compiled-tau=2
+```
+
+`test-gemmini-exsia` writes `exsia_test_artifact.json` with reproducible tau
+metadata. For Todo 8 QA, the key fields are `compiled_tau`, `meta_sigma`, and
+the `selection_comparison` payload used to confirm deterministic one-sided
+magnitude selection.
+
 For further reference use `debug-test.sh -h` to print help.
 
 &nbsp;

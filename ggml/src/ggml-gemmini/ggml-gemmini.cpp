@@ -495,13 +495,17 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         "[" GGML_GEMMINI_ACTIVATION_QUANT_NAME "] final cfg model_arch=%s",
         args.model_arch ? args.model_arch : "");
 
-    ggml::gemmini::quants::quantize_activation(src1, args);
+    const bool quantize_ok = ggml::gemmini::quants::quantize_activation(src1, args);
 #if GGML_GEMMINI_COMPUTE_TYPE == 0
     static_assert(sizeof(elem_t) == 1, "Q8_0 path assumes elem_t is int8 (1 byte).");
 #endif
 
     end = ggml::gemmini::cycle::read();
     ggml::gemmini::log::cycle(layer, "cpu.Quantize activation", start, end);
+    if (!quantize_ok) {
+        ggml::gemmini::log::debug(layer, "activation quantize failed");
+        return;
+    }
 
     if constexpr (ggml::gemmini::config::CURRENT_COMPUTE_TYPE == ggml::gemmini::config::ComputeType::DEQUANT_FP_TEST) {
         std::vector<float> activation_f32(ik_count);

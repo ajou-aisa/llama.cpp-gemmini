@@ -24,9 +24,24 @@ bool checked_mul_size(size_t lhs, size_t rhs, size_t &out)
     return true;
 }
 
+void reset_quantize_failure(ggml_gemmini_args_t &args)
+{
+    args.act_quant.reset();
+
+    int8_t *dst = reinterpret_cast<int8_t *>(args.A);
+    size_t elem_count = 0;
+    if (dst == nullptr || !checked_mul_size(args.I, args.K, elem_count))
+        return;
+
+    if (elem_count == 0)
+        elem_count = args.sA != 0 ? args.sA : args.K;
+
+    std::fill_n(dst, elem_count, int8_t{0});
 }
 
-void quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
+}
+
+bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
 {
     switch (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT) {
     case ggml::gemmini::config::ActivationQuantAlgo::EXSIA:
@@ -34,24 +49,29 @@ void quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
     {
         auto &meta = args.act_quant.storage().emplace<exsia::Meta>();
         exsia::ExSIA exsia;
-        exsia.run(meta, src, args);
-        break;
+        if (!exsia.run(meta, src, args)) {
+            reset_quantize_failure(args);
+            return false;
+        }
+        return true;
     }
     case ggml::gemmini::config::ActivationQuantAlgo::TENSOR:
     {
         args.act_quant.storage().emplace<tensor::Meta>();
         if (!tensor::quantize(src, args)) {
-            std::abort();
+            reset_quantize_failure(args);
+            return false;
         }
-        break;
+        return true;
     }
     case ggml::gemmini::config::ActivationQuantAlgo::TOKEN:
     {
         args.act_quant.storage().emplace<token::Meta>();
         if (!token::quantize(src, args)) {
-            std::abort();
+            reset_quantize_failure(args);
+            return false;
         }
-        break;
+        return true;
     }
     }
 }

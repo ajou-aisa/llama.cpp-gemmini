@@ -155,6 +155,50 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 llama_build_and_test(test-gemmini-q8-h1-h2-dequant-fp.cpp NAME gemmini_q8_h1_h2_dequant_fp)
+target_sources(gemmini_q8_h1_h2_dequant_fp PRIVATE
+    ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
+    ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
+    ../ggml/src/ggml-gemmini/quants/act/quantize.cpp
+    ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
+    ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
+    ../ggml/src/ggml-gemmini/quants/act/token/token.cpp)
+target_link_libraries(gemmini_q8_h1_h2_dequant_fp PRIVATE ggml-base ggml-gemmini-utils)
+target_include_directories(gemmini_q8_h1_h2_dequant_fp PRIVATE
+    ../ggml/src
+    ../ggml/src/ggml-gemmini
+    ../ggml/src/ggml-gemmini-utils/include)
+
+add_executable(test-gemmini-exsia
+    test-gemmini-exsia.cpp
+    ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
+    ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
+    ../ggml/src/ggml-gemmini/quants/act/quantize.cpp
+    ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
+    ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
+    ../ggml/src/ggml-gemmini/quants/act/token/token.cpp)
+target_link_libraries(test-gemmini-exsia PRIVATE ggml-base ggml-gemmini-utils)
+target_compile_features(test-gemmini-exsia PRIVATE cxx_std_17)
+target_compile_definitions(test-gemmini-exsia PRIVATE
+    GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
+    CYCLE_DETAIL=${CYCLE_DETAIL})
+target_include_directories(test-gemmini-exsia PRIVATE
+    ../ggml/include
+    ../ggml/src
+    ../ggml/src/ggml-gemmini
+    ../ggml/src/ggml-gemmini-utils/include
+    ../ggml/src/ggml-gemmini/quants
+    ../ggml/src/ggml-gemmini/quants/act
+    ../ggml/src/ggml-gemmini/quants/act/exsia
+    ../ggml/src/ggml-gemmini/quants/common)
+add_test(NAME test-gemmini-exsia COMMAND $<TARGET_FILE:test-gemmini-exsia>)
+add_test(NAME test-gemmini-exsia-stream-parity
+    COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=stream-parity --rows=129 --cols=37)
+add_test(NAME test-gemmini-exsia-stream-invalid-shape
+    COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=stream-invalid-shape --rows=0 --cols=37)
+add_test(NAME gemmini_exsia_all
+    COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=all --rows=65 --cols=37 --compiled-tau=${GGML_GEMMINI_EXSIA_SIGMA})
+add_test(NAME gemmini_exsia_shift_extremes
+    COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=shift-extremes --compiled-tau=${GGML_GEMMINI_EXSIA_SIGMA})
 llama_build_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_build_and_test(test-autorelease.cpp        LABEL "model")
 
@@ -171,19 +215,26 @@ add_executable(gemmini-quant-dispatch-smoke
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
     ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
     ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
-    ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp)
+    ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
+    ../ggml/src/ggml-gemmini/quants/act/token/token.cpp)
 target_link_libraries(gemmini-quant-dispatch-smoke PRIVATE ggml-base ggml-gemmini-utils)
+target_compile_features(gemmini-quant-dispatch-smoke PRIVATE cxx_std_17)
+target_compile_definitions(gemmini-quant-dispatch-smoke PRIVATE
+    GGML_GEMMINI_ACTIVATION_QUANT=2
+    GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA})
 target_include_directories(gemmini-quant-dispatch-smoke PRIVATE
     ../ggml/src
     ../ggml/src/ggml-gemmini
     ../ggml/src/ggml-gemmini/quants
     ../ggml/src/ggml-gemmini/quants/act
     ../ggml/src/ggml-gemmini/quants/act/exsia
+    ../ggml/src/ggml-gemmini/quants/act/token
     ../ggml/src/ggml-gemmini/quants/common
     ../ggml/src/ggml-gemmini/quants/dec)
 llama_test(gemmini-quant-dispatch-smoke NAME gemmini_quant_dispatch_fp          ARGS fp)
 llama_test(gemmini-quant-dispatch-smoke NAME gemmini_quant_dispatch_exsia       ARGS exsia)
 llama_test(gemmini-quant-dispatch-smoke NAME gemmini_quant_dispatch_tensor     ARGS tensor)
+llama_test(gemmini-quant-dispatch-smoke NAME gemmini_quant_dispatch_token      ARGS token)
 add_test(
     NAME gemmini_quant_dispatch_unsupported
     COMMAND ${CMAKE_COMMAND}

@@ -2,6 +2,7 @@
 
 #include "types.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -20,7 +21,7 @@
 #endif
 
 #ifndef GGML_GEMMINI_EXSIA_SIGMA
-#define GGML_GEMMINI_EXSIA_SIGMA 3
+#define GGML_GEMMINI_EXSIA_SIGMA 2
 #endif
 
 struct ggml_tensor;
@@ -70,12 +71,48 @@ namespace ggml::gemmini::quants::act::exsia
             return true;
         }
 
+        size_t active_word_count() const
+        {
+            size_t bit_count = 0;
+            size_t rounded_bit_count = 0;
+            return checked_mul(rows, cols, bit_count) &&
+                           checked_add(bit_count, 63, rounded_bit_count)
+                       ? rounded_bit_count / 64
+                       : 0;
+        }
+
+        bool prepare(size_t row_count, size_t col_count)
+        {
+            size_t bit_count = 0;
+            size_t rounded_bit_count = 0;
+            if (!checked_mul(row_count, col_count, bit_count) ||
+                !checked_add(bit_count, 63, rounded_bit_count))
+            {
+                clear();
+                return false;
+            }
+
+            rows = row_count;
+            cols = col_count;
+            const size_t word_count = rounded_bit_count / 64;
+            if (words.size() < word_count)
+                words.resize(word_count);
+
+            std::fill(words.begin(), words.begin() + word_count, 0);
+            return true;
+        }
+
         // clear the bitmask matrix, setting all bits to 0
         void clear()
         {
             words.clear();
             rows = 0;
             cols = 0;
+        }
+
+        void clear_active_bits()
+        {
+            std::fill(words.begin(), words.begin() + active_word_count(), 0);
         }
 
         // set the bit at the specified row and column to 1
@@ -113,6 +150,52 @@ namespace ggml::gemmini::quants::act::exsia
         int16_t theta_b = std::numeric_limits<int16_t>::min(); // final scale exponent of a block
 
         std::vector<float> x; // temporary original activations for a block
+
+        bool prepare(size_t block_size)
+        {
+            blk_size = block_size;
+            if (e.size() < block_size)
+                e.resize(block_size);
+            if (x.size() < block_size)
+                x.resize(block_size);
+            reset();
+            return true;
+        }
+
+        void reset()
+        {
+            e1 = std::numeric_limits<int16_t>::min();
+            e2 = std::numeric_limits<int16_t>::min();
+            e_b = std::numeric_limits<int16_t>::min();
+            theta_b = std::numeric_limits<int16_t>::min();
+        }
+    };
+
+    struct StripeScratch
+    {
+        BlockState block;
+        std::vector<int32_t> q_tmp;
+        std::vector<int32_t> q_final;
+        BitMask top1_exp_mask;
+        BitMask int_outlier_mask;
+        BitMask folding_inlier_mask;
+
+        bool prepare(size_t block_size)
+        {
+            if (!block.prepare(block_size) ||
+                !top1_exp_mask.prepare(1, block_size) ||
+                !int_outlier_mask.prepare(1, block_size) ||
+                !folding_inlier_mask.prepare(1, block_size))
+            {
+                return false;
+            }
+
+            if (q_tmp.size() < block_size)
+                q_tmp.resize(block_size);
+            if (q_final.size() < block_size)
+                q_final.resize(block_size);
+            return true;
+        }
     };
 
     struct StripeState
@@ -128,6 +211,18 @@ namespace ggml::gemmini::quants::act::exsia
         bool promote_top_block = false;                    // set by StripeFolding when e2 != -inf; promotes top-1 exponent blocks to outliers
 
         BitMask outlier_mask; // bitmask indicating outlier positions in a stripe
+        StripeScratch scratch;
+
+        size_t row_count() const
+        {
+            return row_end - row_start;
+        }
+
+        size_t local_row(size_t global_row) const
+        {
+            assert(global_row >= row_start && global_row < row_end);
+            return global_row - row_start;
+        }
     };
 
     struct ExSIAState
@@ -175,17 +270,29 @@ namespace ggml::gemmini::quants::act::exsia
     {
     public:
         std::vector<int32_t> quantize_block(const std::vector<float> &x, int16_t theta_b); //
+        void quantize_block(const std::vector<float> &x,
+                            int16_t theta_b,
+                            std::vector<int32_t> &q) const;
         std::tuple<std::vector<int32_t>, __int128_t, __int128_t>
         quantize_block(const std::vector<float> &x,
                        size_t row,
                        size_t col,
                        const BitMask &mask,
-                       int16_t theta_b);
+                       int16_t theta_b); // returns q, sum(|q|), and sum(|q|^2) for inliers
+        void quantize_block(const std::vector<float> &x,
+                            size_t row,
+                            size_t col,
+                            const BitMask &mask,
+                            int16_t theta_b,
+                            std::vector<int32_t> &q,
+                            __int128_t &S,
+                            __int128_t &SS) const;
     };
 
     class SigmaDetector
     {
     public:
+        // Detect a one-sided upper-tail outlier from magnitude statistics.
         bool detect_sigma(int32_t q, __int128_t S, __int128_t SS, size_t N);
     };
 
@@ -205,6 +312,8 @@ namespace ggml::gemmini::quants::act::exsia
             const std::vector<float> &x,
             size_t row,
             size_t blk_idx,
+            std::vector<int32_t> &stripe_q_wide,
+            std::vector<int16_t> &stripe_block_exp,
             uint64_t &cycle_delta);
 
     private:
@@ -224,7 +333,8 @@ namespace ggml::gemmini::quants::act::exsia
             ggml_gemmini_args_t &args,
             size_t stripe_idx,
             int8_t *dst,
-            int32_t *residual,
+            const std::vector<int32_t> &stripe_q_wide,
+            const std::vector<int16_t> &stripe_block_exp,
             uint64_t &cycle_delta);
 
     private:
@@ -235,7 +345,27 @@ namespace ggml::gemmini::quants::act::exsia
     class ExSIA
     {
     private:
+        struct StreamScratch
+        {
+            std::vector<int32_t> q_wide;
+            std::vector<int16_t> block_exp;
+
+            void prepare(size_t elem_count, size_t block_count)
+            {
+                if (q_wide.size() < elem_count)
+                    q_wide.resize(elem_count);
+                if (block_exp.size() < block_count)
+                    block_exp.resize(block_count);
+
+                std::fill(q_wide.begin(), q_wide.begin() + elem_count, 0);
+                std::fill(block_exp.begin(),
+                          block_exp.begin() + block_count,
+                          std::numeric_limits<int16_t>::min());
+            }
+        };
+
         ExSIAState state_;
+        StreamScratch stream_;
         LocalStage local_;
         StripeFolding folding_;
 

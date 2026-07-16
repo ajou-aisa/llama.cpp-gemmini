@@ -107,7 +107,9 @@ bool dequantize_activations(const ggml_tensor * activation, std::vector<float> &
     args.K = K;
     args.A = reinterpret_cast<elem_t *>(quantized.data());
     args.sA = K;
-    ggml::gemmini::quants::quantize_activation(activation, args);
+    if (!ggml::gemmini::quants::quantize_activation(activation, args)) {
+        return false;
+    }
 
     decoded.resize(I * K);
     return ggml::gemmini::quants::dequantize_activation(
