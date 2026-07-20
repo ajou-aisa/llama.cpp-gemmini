@@ -112,7 +112,7 @@ namespace ggml::gemmini::quants::dec { namespace
                     const int16_t m = qblock->m;
                     const float channel_scale = qblock->channel_scale;
                     weight_scales[row * cols + block] =
-                        m == INT16_MIN ? 0.0f : ldexpf(channel_scale, static_cast<int>(m));
+                        m == INT16_MIN ? 0.0f : gemmini_ldexp_fast_pos(channel_scale, static_cast<int>(m));
                 }
             }
 
@@ -145,7 +145,7 @@ namespace ggml::gemmini::quants::dec { namespace
                     const int16_t m = qblock->m;
                     const float channel_scale = qblock->channel_scale;
                     hp2_weight_scales[row * cols + block] =
-                        m == INT16_MIN ? 0.0f : ldexpf(channel_scale, static_cast<int>(m));
+                        m == INT16_MIN ? 0.0f : gemmini_ldexp_fast_pos(channel_scale, static_cast<int>(m));
                 }
             }
 

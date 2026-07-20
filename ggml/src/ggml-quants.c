@@ -12,6 +12,23 @@
 #include <float.h>
 #include <stdlib.h> // for qsort
 #include <stdio.h>  // for GGML_ASSERT
+#include <stdint.h>
+
+// Mirror of gemmini_ldexp_fast_pos from ggml-gemmini-args.h; duplicated here so
+// ggml-quants.c stays free of Gemmini-backend includes.
+static inline float gemmini_ldexp_fast_pos(float x, int m) {
+    uint32_t u;
+    memcpy(&u, &x, sizeof(u));
+    const int32_t exp = (int32_t)((u >> 23) & 0xFFu);
+    if (exp == 0 || exp == 0xFF) return ldexpf(x, m);
+    const int32_t new_exp = exp + m;
+    if (new_exp <= 0) return 0.0f;
+    if (new_exp >= 0xFF) return INFINITY;
+    const uint32_t out = (u & ~(0xFFu << 23)) | ((uint32_t)new_exp << 23);
+    float r;
+    memcpy(&r, &out, sizeof(r));
+    return r;
+}
 
 #define GROUP_MAX_EPS 1e-15f
 #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
@@ -5290,12 +5307,21 @@ static bool validate_q8_hp_block(
     if (!validate_float(channel_scale, i)) {
         return false;
     }
-
-    int exponent;
-    if (signbit(channel_scale) ||
-        (channel_scale != 0.0f && frexpf(channel_scale, &exponent) != 0.5f)) {
-        fprintf(stderr, "ggml_validate_row_data: invalid channel scale at block %zu\n", i);
-        return false;
+    {
+        // Ponytail: shaved libc call. The contract is "positive exact power-of-two or zero",
+        // matching the previous `frexpf == 0.5` check, expanded to any k (not just [-1, 0)).
+        // Upgrade: switch to libm frexpf if subnormal / negative / non-pow2 channel_scale
+        // becomes legal upstream.
+        uint32_t scale_bits = 0;
+        memcpy(&scale_bits, &channel_scale, sizeof(scale_bits));
+        const uint32_t exp_field = (scale_bits >> 23) & 0xFFu;
+        const uint32_t mantissa = scale_bits & 0x7FFFFFu;
+        const bool is_pos_zero = scale_bits == 0u;
+        const bool is_pos_normal_pow2 = (exp_field >= 1u && exp_field < 0xFFu) && (mantissa == 0u);
+        if (signbit(channel_scale) || (!is_pos_zero && !is_pos_normal_pow2)) {
+            fprintf(stderr, "ggml_validate_row_data: invalid channel scale at block %zu\n", i);
+            return false;
+        }
     }
 
     if (padding[0] != 0 || padding[1] != 0) {
@@ -5303,34 +5329,38 @@ static bool validate_q8_hp_block(
         return false;
     }
 
-    bool all_zero = true;
-    for (int j = 0; j < QK8_HP; ++j) {
-        if (qs[j] == INT8_MIN) {
-            fprintf(stderr, "ggml_validate_row_data: invalid q value at block %zu\n", i);
-            return false;
-        }
-        all_zero = all_zero && qs[j] == 0;
-    }
-
     if (m == INT16_MIN) {
-        if (!all_zero) {
-            fprintf(stderr, "ggml_validate_row_data: invalid zero-block sentinel at block %zu\n", i);
-            return false;
+        // Sentinel: every qs[j] must be 0; channel_scale may be anything (encoder choice).
+        for (int j = 0; j < QK8_HP; ++j) {
+            if (qs[j] != 0) {
+                fprintf(stderr, "ggml_validate_row_data: invalid zero-block sentinel at block %zu\n", i);
+                return false;
+            }
         }
         return true;
     }
 
-    if (channel_scale == 0.0f || all_zero ||
+    if (channel_scale == 0.0f ||
         (type == GGML_TYPE_Q8_HP1 && m > 0) ||
         (type == GGML_TYPE_Q8_HP2 && (m < -6 || m > 8))) {
         fprintf(stderr, "ggml_validate_row_data: invalid signed m at block %zu\n", i);
         return false;
     }
 
-    const float block_scale = ldexpf(channel_scale, m);
-    if (!isfinite(block_scale) || block_scale == 0.0f) {
-        fprintf(stderr, "ggml_validate_row_data: invalid block scale at block %zu\n", i);
-        return false;
+    for (int j = 0; j < QK8_HP; ++j) {
+        if (qs[j] == INT8_MIN) {
+            fprintf(stderr, "ggml_validate_row_data: invalid q value at block %zu\n", i);
+            return false;
+        }
+    }
+
+    // Ponytail: skips ldexpf libc call in the validator loop; same upgrade constraint as above.
+    {
+        const float block_scale = gemmini_ldexp_fast_pos(channel_scale, (int) m);
+        if (!isfinite(block_scale) || block_scale == 0.0f) {
+            fprintf(stderr, "ggml_validate_row_data: invalid block scale at block %zu\n", i);
+            return false;
+        }
     }
 
     return true;

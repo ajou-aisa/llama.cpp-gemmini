@@ -35,6 +35,24 @@ enum class LayerType : uint8_t;
 // Forward declaration to avoid including full gemmini.h (breaks include cycles)
 enum tiled_matmul_type_t : int;
 
+// Bit-level ldexp replacement for the HP1/HP2 hot loop.
+// Valid for positive normalized float x and exp range where the result is also normal.
+// ponytail: skips ldexpf libc call; falls back only on denormal/inf/nan inputs (rejected by contract upstream).
+// Upgrade: if denormals ever become legal upstream, this branch must be revisited.
+static inline float gemmini_ldexp_fast_pos(float x, int m) {
+    uint32_t u;
+    std::memcpy(&u, &x, sizeof(u));
+    const int32_t exp = (int32_t)((u >> 23) & 0xFFu);
+    if (exp == 0 || exp == 0xFF) return std::ldexp(x, m);
+    const int32_t new_exp = exp + m;
+    if (new_exp <= 0) return 0.0f;
+    if (new_exp >= 0xFF) return INFINITY;
+    const uint32_t out = (u & ~(0xFFu << 23)) | ((uint32_t)new_exp << 23);
+    float r;
+    std::memcpy(&r, &out, sizeof(r));
+    return r;
+}
+
 /*  
     Gemmini 호출 인자를 한 데 모은 구조체 + Q8_0 전처리 헬퍼
     기존에는 GemminiTensor가 ggml 텐서를 INT8 버퍼로 변환했으나, 정확도 측정을 위한 Q8_0 지원을 위해
