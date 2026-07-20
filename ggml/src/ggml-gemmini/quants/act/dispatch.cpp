@@ -1,6 +1,7 @@
 #include "dispatch.hpp"
 #include "exsia/exsia.hpp"
 #include "tensor/tensor.hpp"
+#include "token/token.hpp"
 #include "../../ggml-gemmini-args.h"
 #include "../../ggml-gemmini-config.hpp"
 
@@ -23,9 +24,24 @@ bool checked_mul_size(size_t lhs, size_t rhs, size_t &out)
     return true;
 }
 
+void reset_quantize_failure(ggml_gemmini_args_t &args)
+{
+    args.act_quant.reset();
+
+    int8_t *dst = reinterpret_cast<int8_t *>(args.A);
+    size_t elem_count = 0;
+    if (dst == nullptr || !checked_mul_size(args.I, args.K, elem_count))
+        return;
+
+    if (elem_count == 0)
+        elem_count = args.sA != 0 ? args.sA : args.K;
+
+    std::fill_n(dst, elem_count, int8_t{0});
 }
 
-void quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
+}
+
+bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
 {
     switch (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT) {
     case ggml::gemmini::config::ActivationQuantAlgo::EXSIA:
@@ -33,16 +49,29 @@ void quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
     {
         auto &meta = args.act_quant.storage().emplace<exsia::Meta>();
         exsia::ExSIA exsia;
-        exsia.run(meta, src, args);
-        break;
+        if (!exsia.run(meta, src, args)) {
+            reset_quantize_failure(args);
+            return false;
+        }
+        return true;
     }
     case ggml::gemmini::config::ActivationQuantAlgo::TENSOR:
     {
         args.act_quant.storage().emplace<tensor::Meta>();
         if (!tensor::quantize(src, args)) {
-            std::abort();
+            reset_quantize_failure(args);
+            return false;
         }
-        break;
+        return true;
+    }
+    case ggml::gemmini::config::ActivationQuantAlgo::TOKEN:
+    {
+        args.act_quant.storage().emplace<token::Meta>();
+        if (!token::quantize(src, args)) {
+            reset_quantize_failure(args);
+            return false;
+        }
+        return true;
     }
     }
 }
@@ -60,6 +89,12 @@ bool dequantize_activation(float *dst,
         return exsia::dequantize_activation(dst, dst_row_stride, dst_col_stride, rows, cols, args);
     case ggml::gemmini::config::ActivationQuantAlgo::TENSOR:
         return tensor::dequantize_activation(dst, dst_row_stride, dst_col_stride, rows, cols, args);
+    case ggml::gemmini::config::ActivationQuantAlgo::TOKEN:
+        if (const auto *meta = std::get_if<token::Meta>(&args.act_quant.storage());
+            meta != nullptr && meta->scales.size() != args.I) {
+            return false;
+        }
+        return token::dequantize_activation(dst, dst_row_stride, dst_col_stride, rows, cols, args);
     }
 }
 
@@ -70,6 +105,9 @@ std::vector<QactOutlier> outliers(const ggml_gemmini_args_t &args)
         return meta->outliers;
     }
     if (const auto *meta = std::get_if<tensor::Meta>(&storage)) {
+        return meta->outliers;
+    }
+    if (const auto *meta = std::get_if<token::Meta>(&storage)) {
         return meta->outliers;
     }
 
@@ -101,6 +139,18 @@ std::vector<float> activation_scales(const ggml_gemmini_args_t &args, size_t row
 
     if (const auto *meta = std::get_if<tensor::Meta>(&storage)) {
         std::fill(scales.begin(), scales.end(), meta->scale);
+        return scales;
+    }
+
+    if (const auto *meta = std::get_if<token::Meta>(&storage)) {
+        if (meta->scales.size() != args.I) {
+            GGML_ASSERT(false && "TOKEN activation scale cardinality must equal args.I");
+        }
+        const size_t count = std::min(row_count, meta->scales.size());
+        for (size_t row = 0; row < count; ++row) {
+            const float scale = meta->scales[row];
+            scales[row] = std::isfinite(scale) && scale > 0.0f ? scale : 1.0f;
+        }
     }
 
     return scales;

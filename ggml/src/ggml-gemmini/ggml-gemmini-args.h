@@ -35,6 +35,24 @@ enum class LayerType : uint8_t;
 // Forward declaration to avoid including full gemmini.h (breaks include cycles)
 enum tiled_matmul_type_t : int;
 
+// Bit-level ldexp replacement for the HP1/HP2 hot loop.
+// Valid for positive normalized float x and exp range where the result is also normal.
+// ponytail: skips ldexpf libc call; falls back only on denormal/inf/nan inputs (rejected by contract upstream).
+// Upgrade: if denormals ever become legal upstream, this branch must be revisited.
+static inline float gemmini_ldexp_fast_pos(float x, int m) {
+    uint32_t u;
+    std::memcpy(&u, &x, sizeof(u));
+    const int32_t exp = (int32_t)((u >> 23) & 0xFFu);
+    if (exp == 0 || exp == 0xFF) return std::ldexp(x, m);
+    const int32_t new_exp = exp + m;
+    if (new_exp <= 0) return 0.0f;
+    if (new_exp >= 0xFF) return INFINITY;
+    const uint32_t out = (u & ~(0xFFu << 23)) | ((uint32_t)new_exp << 23);
+    float r;
+    std::memcpy(&r, &out, sizeof(r));
+    return r;
+}
+
 /*  
     Gemmini 호출 인자를 한 데 모은 구조체 + Q8_0 전처리 헬퍼
     기존에는 GemminiTensor가 ggml 텐서를 INT8 버퍼로 변환했으나, 정확도 측정을 위한 Q8_0 지원을 위해
@@ -42,9 +60,11 @@ enum tiled_matmul_type_t : int;
 typedef struct ggml_gemmini_args_t {
     enum class im2p_weight_format_t : uint8_t {
         q8_0_unpacked_to_h1 = 0,
-        q8_h1 = 1,
+        q8_h0 = 1,
         q8_h2 = 2,
-        q8_h1_native = 3,
+        q8_h1 = 3,
+        q8_hp1 = 4,
+        q8_hp2 = 5,
     };
 
     // tiled_matmul_auto args
@@ -118,6 +138,8 @@ typedef struct ggml_gemmini_args_t {
 
     };
 
+    unpacked_weight unpacked;
+
     const block_q8_0 *B_blocks = nullptr;
     const float *B_scales = nullptr; // [blocks_J][blocks_K] row-major (row = J*Z*W)
 
@@ -125,13 +147,21 @@ typedef struct ggml_gemmini_args_t {
     float weight_scale = 1.0f;
     im2p_weight_format_t weight_format = im2p_weight_format_t::q8_0_unpacked_to_h1;
 
-    const block_q8_h1 *q8_h1_native_blocks = nullptr;
-    size_t q8_h1_native_block_count = 0;
-    size_t q8_h1_native_rows = 0;
+    const block_q8_h1 *q8_h1_blocks = nullptr;
+    size_t q8_h1_block_count = 0;
+    size_t q8_h1_rows = 0;
 
     const block_q8_h2 *q8_h2_blocks = nullptr;
     size_t q8_h2_block_count = 0;
     size_t q8_h2_blocks_per_row = 0;
+
+    const block_q8_hp1 *q8_hp1_blocks = nullptr;
+    size_t q8_hp1_block_count = 0;
+    size_t q8_hp1_blocks_per_row = 0;
+
+    const block_q8_hp2 *q8_hp2_blocks = nullptr;
+    size_t q8_hp2_block_count = 0;
+    size_t q8_hp2_blocks_per_row = 0;
 
     // Q8_H1 weight fields (default path, no mode flag needed)
     const uint8_t  *c_b = nullptr;       // [J * blocks_per_row] per-block effective code
@@ -209,9 +239,94 @@ typedef struct ggml_gemmini_args_t {
         return true;
     }
 
-    inline const block_q8_h1 *q8_h1_native_block(size_t row, size_t block) const {
-        if (q8_h1_native_blocks == nullptr || blocks_per_row == 0 ||
-            row >= q8_h1_native_rows || block >= blocks_per_row ||
+    inline bool has_no_q8_h1_metadata() const {
+        return B == nullptr && B_blocks == nullptr && B_scales == nullptr &&
+               c_b == nullptr && s_rf == nullptr && R == nullptr &&
+               s_rf_stripe == nullptr && R_stripe == nullptr &&
+               q8_h1_blocks == nullptr && q8_h1_block_count == 0 &&
+               q8_h1_rows == 0 && unpacked.q_qs.empty() && unpacked.c_b.empty() &&
+               unpacked.s_rf.empty() && unpacked.R.empty() && unpacked.s_rf_stripe.empty() &&
+               unpacked.R_stripe.empty() && unpacked.q.empty() && unpacked.scales.empty() &&
+               unpacked.blocks == nullptr;
+    }
+
+    inline const block_q8_hp1 *q8_hp1_block(size_t row, size_t block) const {
+        if (q8_hp1_blocks == nullptr || q8_hp1_blocks_per_row == 0 ||
+            row >= J || block >= q8_hp1_blocks_per_row ||
+            row > std::numeric_limits<size_t>::max() / q8_hp1_blocks_per_row) {
+            return nullptr;
+        }
+
+        const size_t row_offset = row * q8_hp1_blocks_per_row;
+        if (block > std::numeric_limits<size_t>::max() - row_offset) {
+            return nullptr;
+        }
+
+        const size_t offset = row_offset + block;
+        return offset < q8_hp1_block_count ? q8_hp1_blocks + offset : nullptr;
+    }
+
+    inline bool has_q8_hp1_im2p_contract() const {
+        if (weight_format != im2p_weight_format_t::q8_hp1 ||
+            q8_hp1_blocks == nullptr || J == 0 || K == 0 ||
+            K % QK8_HP != 0 || q8_hp1_blocks_per_row != K / QK8_HP ||
+            reinterpret_cast<uintptr_t>(q8_hp1_blocks) % alignof(block_q8_hp1) != 0 ||
+            J > std::numeric_limits<size_t>::max() / q8_hp1_blocks_per_row ||
+            q8_hp1_block_count != J * q8_hp1_blocks_per_row ||
+            q8_hp1_block_count > std::numeric_limits<size_t>::max() / sizeof(block_q8_hp1) ||
+            q8_hp2_blocks != nullptr || q8_hp2_block_count != 0 ||
+            q8_hp2_blocks_per_row != 0 || !has_no_q8_h1_metadata()) {
+            return false;
+        }
+
+        if (!ggml_validate_row_data(
+                GGML_TYPE_Q8_HP1, q8_hp1_blocks, q8_hp1_block_count * sizeof(block_q8_hp1))) {
+            return false;
+        }
+
+        return true;
+    }
+
+    inline const block_q8_hp2 *q8_hp2_block(size_t row, size_t block) const {
+        if (q8_hp2_blocks == nullptr || q8_hp2_blocks_per_row == 0 ||
+            row >= J || block >= q8_hp2_blocks_per_row ||
+            row > std::numeric_limits<size_t>::max() / q8_hp2_blocks_per_row) {
+            return nullptr;
+        }
+
+        const size_t row_offset = row * q8_hp2_blocks_per_row;
+        if (block > std::numeric_limits<size_t>::max() - row_offset) {
+            return nullptr;
+        }
+
+        const size_t offset = row_offset + block;
+        return offset < q8_hp2_block_count ? q8_hp2_blocks + offset : nullptr;
+    }
+
+    inline bool has_q8_hp2_im2p_contract() const {
+        if (weight_format != im2p_weight_format_t::q8_hp2 ||
+            q8_hp2_blocks == nullptr || J == 0 || K == 0 ||
+            K % QK8_HP != 0 || q8_hp2_blocks_per_row != K / QK8_HP ||
+            reinterpret_cast<uintptr_t>(q8_hp2_blocks) % alignof(block_q8_hp2) != 0 ||
+            J > std::numeric_limits<size_t>::max() / q8_hp2_blocks_per_row ||
+            q8_hp2_block_count != J * q8_hp2_blocks_per_row ||
+            q8_hp2_block_count > std::numeric_limits<size_t>::max() / sizeof(block_q8_hp2) ||
+            q8_hp1_blocks != nullptr || q8_hp1_block_count != 0 ||
+            q8_hp1_blocks_per_row != 0 || !has_no_q8_h1_metadata()) {
+            return false;
+        }
+
+        if (!ggml_validate_row_data(
+                GGML_TYPE_Q8_HP2, q8_hp2_blocks, q8_hp2_block_count * sizeof(block_q8_hp2))) {
+            return false;
+        }
+
+        return true;
+    }
+
+    inline const block_q8_h1 *q8_h1_block(size_t row, size_t block) const {
+        if (q8_h1_blocks == nullptr || blocks_per_row == 0 ||
+            row >= q8_h1_rows || block >= blocks_per_row ||
             row > std::numeric_limits<size_t>::max() / blocks_per_row) {
             return nullptr;
         }
@@ -222,37 +337,37 @@ typedef struct ggml_gemmini_args_t {
         }
 
         const size_t offset = row_offset + block;
-        if (offset >= q8_h1_native_block_count) {
+        if (offset >= q8_h1_block_count) {
             return nullptr;
         }
 
-        return q8_h1_native_blocks + offset;
+        return q8_h1_blocks + offset;
     }
 
-    inline bool has_q8_h1_native_im2p_contract() const {
-        if (weight_format != im2p_weight_format_t::q8_h1_native ||
-            q8_h1_native_blocks == nullptr || J == 0 || K == 0 ||
-            blocks_per_row == 0 || q8_h1_native_block_count == 0 || q8_h1_native_rows < J ||
-            reinterpret_cast<uintptr_t>(q8_h1_native_blocks) % alignof(block_q8_h1) != 0 ||
+    inline bool has_q8_h1_im2p_contract() const {
+        if (weight_format != im2p_weight_format_t::q8_h1 ||
+            q8_h1_blocks == nullptr || J == 0 || K == 0 ||
+            blocks_per_row == 0 || q8_h1_block_count == 0 || q8_h1_rows < J ||
+            reinterpret_cast<uintptr_t>(q8_h1_blocks) % alignof(block_q8_h1) != 0 ||
             K > std::numeric_limits<size_t>::max() - (QK8_0 - 1) ||
             blocks_per_row != (K + QK8_0 - 1) / QK8_0 ||
             J > std::numeric_limits<size_t>::max() / blocks_per_row) {
             return false;
         }
 
-        if (q8_h1_native_block_count < J * blocks_per_row) {
+        if (q8_h1_block_count < J * blocks_per_row) {
             return false;
         }
 
         for (size_t row = 0; row < J; ++row) {
-            const block_q8_h1 *first = q8_h1_native_block(row, 0);
+            const block_q8_h1 *first = q8_h1_block(row, 0);
             if (first == nullptr || !std::isfinite(first->s_rf) || first->s_rf < 0.0f ||
                 (first->s_rf == 0.0f && (first->R != 0 || first->c_b != 0))) {
                 return false;
             }
 
             for (size_t block = 1; block < blocks_per_row; ++block) {
-                const block_q8_h1 *current = q8_h1_native_block(row, block);
+                const block_q8_h1 *current = q8_h1_block(row, block);
                 if (current == nullptr || current->s_rf != first->s_rf || current->R != first->R ||
                     (first->s_rf == 0.0f && current->c_b != 0)) {
                     return false;
@@ -264,3 +379,11 @@ typedef struct ggml_gemmini_args_t {
     }
 
 } ggml_gemmini_args_t;
+
+#if defined(GGML_GEMMINI_TEST_OBSERVER)
+namespace ggml::gemmini {
+using test_i_observer_t = void (*)(const char * consumer, size_t I, void * user_data);
+
+GGML_API void set_test_i_observer(test_i_observer_t observer, void * user_data);
+}
+#endif

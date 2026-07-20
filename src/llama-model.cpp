@@ -280,7 +280,8 @@ static buft_list_t make_cpu_buft_list(const std::vector<ggml_backend_dev_t> & de
         if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
             auto * buft = ggml_backend_dev_buffer_type(dev);
             // skip
-            if (buft != ggml_backend_cpu_buffer_type()) {
+            if (buft != ggml_backend_cpu_buffer_type() ||
+                std::strcmp(ggml_backend_dev_name(dev), "GEMMINI") == 0) {
                 buft_list.emplace_back(dev, buft);
             }
         }

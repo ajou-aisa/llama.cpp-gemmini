@@ -12,6 +12,23 @@
 #include <float.h>
 #include <stdlib.h> // for qsort
 #include <stdio.h>  // for GGML_ASSERT
+#include <stdint.h>
+
+// Mirror of gemmini_ldexp_fast_pos from ggml-gemmini-args.h; duplicated here so
+// ggml-quants.c stays free of Gemmini-backend includes.
+static inline float gemmini_ldexp_fast_pos(float x, int m) {
+    uint32_t u;
+    memcpy(&u, &x, sizeof(u));
+    const int32_t exp = (int32_t)((u >> 23) & 0xFFu);
+    if (exp == 0 || exp == 0xFF) return ldexpf(x, m);
+    const int32_t new_exp = exp + m;
+    if (new_exp <= 0) return 0.0f;
+    if (new_exp >= 0xFF) return INFINITY;
+    const uint32_t out = (u & ~(0xFFu << 23)) | ((uint32_t)new_exp << 23);
+    float r;
+    memcpy(&r, &out, sizeof(r));
+    return r;
+}
 
 #define GROUP_MAX_EPS 1e-15f
 #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
@@ -291,6 +308,143 @@ void quantize_row_q8_h2_ref(const float * GGML_RESTRICT x, block_q8_h2 * GGML_RE
         for (int j = 0; j < QK8_H2; ++j) {
             const float u = roundf(x[i*QK8_H2 + j] * i_s_c);
             y[i].qs[j] = a_b > 0.0f ? (int8_t) MIN(127.0f, MAX(-127.0f, roundf(u / a_b))) : 0;
+        }
+    }
+}
+
+static bool quantize_q8_hp1_input_valid(const float * x, int64_t k) {
+    for (int64_t i = 0; i < k; ++i) {
+        if (!isfinite(x[i])) {
+            return false;
+        }
+    }
+
+    const int nb = k / QK8_HP;
+    for (int i = 0; i < nb; ++i) {
+        float amax = 0.0f;
+        for (int j = 0; j < QK8_HP; ++j) {
+            amax = MAX(amax, fabsf(x[i*QK8_HP + j]));
+        }
+        if (amax > 0.0f && ldexpf(1.0f, ilogbf(amax) - 6) == 0.0f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool quantize_q8_hp2_input_valid(const float * x, int64_t k) {
+    for (int64_t i = 0; i < k; ++i) {
+        if (!isfinite(x[i])) {
+            return false;
+        }
+    }
+
+    float amax = 0.0f;
+    for (int64_t i = 0; i < k; ++i) {
+        amax = MAX(amax, fabsf(x[i]));
+    }
+    return amax == 0.0f || ldexpf(1.0f, ilogbf(amax) - 14) != 0.0f;
+}
+
+bool quantize_row_q8_hp1_ref(const float * GGML_RESTRICT x, block_q8_hp1 * GGML_RESTRICT y, int64_t k) {
+    if (x == NULL || y == NULL || k <= 0 || k % QK8_HP != 0 || !quantize_q8_hp1_input_valid(x, k)) {
+        return false;
+    }
+
+    const int nb = k / QK8_HP;
+    float channel_scale = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        float amax = 0.0f;
+        for (int j = 0; j < QK8_HP; ++j) {
+            amax = MAX(amax, fabsf(x[i*QK8_HP + j]));
+        }
+        if (amax > 0.0f) {
+            const float block_scale = ldexpf(1.0f, ilogbf(amax) - 6);
+            channel_scale = MAX(channel_scale, block_scale);
+        }
+    }
+
+    memset(y, 0, (size_t) nb * sizeof(*y));
+    const int channel_exponent = channel_scale > 0.0f ? ilogbf(channel_scale) : 0;
+    for (int i = 0; i < nb; ++i) {
+        float amax = 0.0f;
+        for (int j = 0; j < QK8_HP; ++j) {
+            amax = MAX(amax, fabsf(x[i*QK8_HP + j]));
+        }
+        y[i].channel_scale = channel_scale;
+        if (amax == 0.0f) {
+            y[i].m = INT16_MIN;
+            continue;
+        }
+
+        const int block_exponent = ilogbf(amax) - 6;
+        const float block_scale = ldexpf(1.0f, block_exponent);
+        y[i].m = (int16_t) (block_exponent - channel_exponent);
+        for (int j = 0; j < QK8_HP; ++j) {
+            const int q = (int) roundf(x[i*QK8_HP + j] / block_scale);
+            y[i].qs[j] = (int8_t) MIN(127, MAX(-127, q));
+        }
+    }
+    return true;
+}
+
+bool quantize_row_q8_hp2_ref(const float * GGML_RESTRICT x, block_q8_hp2 * GGML_RESTRICT y, int64_t k) {
+    if (x == NULL || y == NULL || k <= 0 || k % QK8_HP != 0 || !quantize_q8_hp2_input_valid(x, k)) {
+        return false;
+    }
+
+    float amax = 0.0f;
+    for (int64_t i = 0; i < k; ++i) {
+        amax = MAX(amax, fabsf(x[i]));
+    }
+    const float channel_scale = amax > 0.0f ? ldexpf(1.0f, ilogbf(amax) - 14) : 0.0f;
+    const int nb = k / QK8_HP;
+
+    memset(y, 0, (size_t) nb * sizeof(*y));
+    for (int i = 0; i < nb; ++i) {
+        float block_amax = 0.0f;
+        for (int j = 0; j < QK8_HP; ++j) {
+            const float u = channel_scale > 0.0f ? MIN(32767.0f, MAX(-32767.0f, roundf(x[i*QK8_HP + j] / channel_scale))) : 0.0f;
+            block_amax = MAX(block_amax, fabsf(u));
+        }
+        y[i].channel_scale = channel_scale;
+        if (block_amax == 0.0f) {
+            y[i].m = INT16_MIN;
+            continue;
+        }
+
+        const int block_exponent = ilogbf(block_amax) - 6;
+        const float block_scale = ldexpf(1.0f, block_exponent);
+        y[i].m = (int16_t) block_exponent;
+        for (int j = 0; j < QK8_HP; ++j) {
+            const float u = MIN(32767.0f, MAX(-32767.0f, roundf(x[i*QK8_HP + j] / channel_scale)));
+            const int q = (int) roundf(u / block_scale);
+            y[i].qs[j] = (int8_t) MIN(127, MAX(-127, q));
+        }
+    }
+    return true;
+}
+
+void dequantize_row_q8_hp1(const block_q8_hp1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK8_HP == 0);
+    const int nb = k / QK8_HP;
+    for (int i = 0; i < nb; ++i) {
+        const block_q8_hp1 * block = &x[i];
+        const float scale = block->m == INT16_MIN ? 0.0f : ldexpf(block->channel_scale, block->m);
+        for (int j = 0; j < QK8_HP; ++j) {
+            y[i*QK8_HP + j] = block->qs[j] * scale;
+        }
+    }
+}
+
+void dequantize_row_q8_hp2(const block_q8_hp2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK8_HP == 0);
+    const int nb = k / QK8_HP;
+    for (int i = 0; i < nb; ++i) {
+        const block_q8_hp2 * block = &x[i];
+        const float scale = block->m == INT16_MIN ? 0.0f : ldexpf(block->channel_scale, block->m);
+        for (int j = 0; j < QK8_HP; ++j) {
+            y[i*QK8_HP + j] = block->qs[j] * scale;
         }
     }
 }
@@ -2149,6 +2303,50 @@ size_t quantize_q8_h2(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     for (int64_t row = 0; row < nrow; ++row) {
         quantize_row_q8_h2_ref(src, (block_q8_h2 *) qrow, n_per_row);
         src += n_per_row;
+        qrow += row_size;
+    }
+    return nrow * row_size;
+}
+
+size_t quantize_q8_hp1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void) quant_weights;
+    if (src == NULL || dst == NULL || nrow <= 0 || n_per_row <= 0 || n_per_row % QK8_HP != 0) {
+        return 0;
+    }
+    for (int64_t row = 0; row < nrow; ++row) {
+        if (!quantize_q8_hp1_input_valid(src + row*n_per_row, n_per_row)) {
+            return 0;
+        }
+    }
+
+    const size_t row_size = ggml_row_size(GGML_TYPE_Q8_HP1, n_per_row);
+    char * qrow = (char *) dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        if (!quantize_row_q8_hp1_ref(src + row*n_per_row, (block_q8_hp1 *) qrow, n_per_row)) {
+            return 0;
+        }
+        qrow += row_size;
+    }
+    return nrow * row_size;
+}
+
+size_t quantize_q8_hp2(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void) quant_weights;
+    if (src == NULL || dst == NULL || nrow <= 0 || n_per_row <= 0 || n_per_row % QK8_HP != 0) {
+        return 0;
+    }
+    for (int64_t row = 0; row < nrow; ++row) {
+        if (!quantize_q8_hp2_input_valid(src + row*n_per_row, n_per_row)) {
+            return 0;
+        }
+    }
+
+    const size_t row_size = ggml_row_size(GGML_TYPE_Q8_HP2, n_per_row);
+    char * qrow = (char *) dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        if (!quantize_row_q8_hp2_ref(src + row*n_per_row, (block_q8_hp2 *) qrow, n_per_row)) {
+            return 0;
+        }
         qrow += row_size;
     }
     return nrow * row_size;
@@ -5103,6 +5301,71 @@ static bool validate_fp16(ggml_fp16_t f, size_t i) {
     return true;
 }
 
+static bool validate_q8_hp_block(
+        enum ggml_type type, const int8_t qs[QK8_HP], int16_t m,
+        const uint8_t padding[2], float channel_scale, size_t i) {
+    if (!validate_float(channel_scale, i)) {
+        return false;
+    }
+    {
+        // Ponytail: shaved libc call. The contract is "positive exact power-of-two or zero",
+        // matching the previous `frexpf == 0.5` check, expanded to any k (not just [-1, 0)).
+        // Upgrade: switch to libm frexpf if subnormal / negative / non-pow2 channel_scale
+        // becomes legal upstream.
+        uint32_t scale_bits = 0;
+        memcpy(&scale_bits, &channel_scale, sizeof(scale_bits));
+        const uint32_t exp_field = (scale_bits >> 23) & 0xFFu;
+        const uint32_t mantissa = scale_bits & 0x7FFFFFu;
+        const bool is_pos_zero = scale_bits == 0u;
+        const bool is_pos_normal_pow2 = (exp_field >= 1u && exp_field < 0xFFu) && (mantissa == 0u);
+        if (signbit(channel_scale) || (!is_pos_zero && !is_pos_normal_pow2)) {
+            fprintf(stderr, "ggml_validate_row_data: invalid channel scale at block %zu\n", i);
+            return false;
+        }
+    }
+
+    if (padding[0] != 0 || padding[1] != 0) {
+        fprintf(stderr, "ggml_validate_row_data: nonzero padding at block %zu\n", i);
+        return false;
+    }
+
+    if (m == INT16_MIN) {
+        // Sentinel: every qs[j] must be 0; channel_scale may be anything (encoder choice).
+        for (int j = 0; j < QK8_HP; ++j) {
+            if (qs[j] != 0) {
+                fprintf(stderr, "ggml_validate_row_data: invalid zero-block sentinel at block %zu\n", i);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    if (channel_scale == 0.0f ||
+        (type == GGML_TYPE_Q8_HP1 && m > 0) ||
+        (type == GGML_TYPE_Q8_HP2 && (m < -6 || m > 8))) {
+        fprintf(stderr, "ggml_validate_row_data: invalid signed m at block %zu\n", i);
+        return false;
+    }
+
+    for (int j = 0; j < QK8_HP; ++j) {
+        if (qs[j] == INT8_MIN) {
+            fprintf(stderr, "ggml_validate_row_data: invalid q value at block %zu\n", i);
+            return false;
+        }
+    }
+
+    // Ponytail: skips ldexpf libc call in the validator loop; same upgrade constraint as above.
+    {
+        const float block_scale = gemmini_ldexp_fast_pos(channel_scale, (int) m);
+        if (!isfinite(block_scale) || block_scale == 0.0f) {
+            fprintf(stderr, "ggml_validate_row_data: invalid block scale at block %zu\n", i);
+            return false;
+        }
+    }
+
+    return true;
+}
+
 #define VALIDATE_ROW_DATA_D_F16_IMPL(type, data, nb) \
     const type * q = (const type *) (data); \
     for (size_t i = 0; i < (nb); ++i) { \
@@ -5286,6 +5549,24 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 const block_q8_h2 * q = (const block_q8_h2 *) data;
                 for (size_t i = 0; i < nb; ++i) {
                     if (!validate_float(q[i].channel_scale, i)) {
+                        return false;
+                    }
+                }
+            } break;
+        case GGML_TYPE_Q8_HP1:
+            {
+                const block_q8_hp1 * q = (const block_q8_hp1 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_q8_hp_block(type, q[i].qs, q[i].m, q[i].padding, q[i].channel_scale, i)) {
+                        return false;
+                    }
+                }
+            } break;
+        case GGML_TYPE_Q8_HP2:
+            {
+                const block_q8_hp2 * q = (const block_q8_hp2 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_q8_hp_block(type, q[i].qs, q[i].m, q[i].padding, q[i].channel_scale, i)) {
                         return false;
                     }
                 }

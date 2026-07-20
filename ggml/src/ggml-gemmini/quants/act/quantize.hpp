@@ -11,7 +11,7 @@ struct ggml_gemmini_args_t;
 
 namespace ggml::gemmini::quants
 {
-void quantize_activation(const ggml_tensor *src, ggml_gemmini_args_t &args);
+bool quantize_activation(const ggml_tensor *src, ggml_gemmini_args_t &args);
 
 bool dequantize_activation(float *dst,
                            size_t dst_row_stride,

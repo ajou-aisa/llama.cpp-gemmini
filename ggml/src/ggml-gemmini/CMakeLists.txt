@@ -46,6 +46,7 @@ ggml_add_backend_library(ggml-gemmini
                             quants/act/quantize.cpp
                             quants/act/exsia/exsia.cpp
                          quants/act/tensor/tensor.cpp
+                         quants/act/token/token.cpp
                          quants/weight/quantize_Q8_H1.cpp
                          quants/common/fp16_util.cpp
                          quants/common/dequant.cpp
@@ -91,6 +92,7 @@ target_include_directories(ggml-gemmini PRIVATE
   ${CMAKE_CURRENT_LIST_DIR}/quants
   ${CMAKE_CURRENT_LIST_DIR}/quants/act
   ${CMAKE_CURRENT_LIST_DIR}/quants/act/exsia
+  ${CMAKE_CURRENT_LIST_DIR}/quants/act/token
   ${CMAKE_CURRENT_LIST_DIR}/quants/common
   ${CMAKE_CURRENT_LIST_DIR}/quants/dec
   ${CMAKE_CURRENT_LIST_DIR}/quants/view

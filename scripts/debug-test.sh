@@ -28,10 +28,12 @@ Options:
 Arguments:
   <test_regex>     (Mandatory) Supply one regex to the script to filter tests
   (test_number)    (Optional) Test number to run a specific test
+  -- [args...]     (Optional) Forward extra arguments to the selected test binary
 
 Example:
   $PROG test-tokenizer
   $PROG test-tokenizer 3
+  $PROG test-gemmini-exsia 0 -- --case=all --rows=65 --cols=37 --compiled-tau=2
 EOF
 }
 
@@ -87,9 +89,20 @@ if [ -z "${1}" ]; then
 else
     test_suite=${1:-}
 fi
+shift
 
 # Positionial Argument Processing : (test_number)
-test_number=${2:-}
+test_number=
+if [ $# -gt 0 ] && [ "$1" != "--" ]; then
+    test_number=${1:-}
+    shift
+fi
+
+if [ "${1:-}" = "--" ]; then
+    shift
+fi
+
+forwarded_args=("$@")
 
 
 # Step 1: Reset and Setup folder context
@@ -167,6 +180,11 @@ popd > /dev/null || exit 1
 # Grab specific test command
 single_test_name="${tests[test_number]}"
 single_test_command="${test_args[test_number]}"
+if [ ${#forwarded_args[@]} -gt 0 ]; then
+    for arg in "${forwarded_args[@]}"; do
+        single_test_command="${single_test_command} $(printf '%q' "$arg")"
+    done
+fi
 
 
 # Step 5: Execute or GDB Debug
