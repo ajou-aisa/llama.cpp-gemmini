@@ -12,10 +12,10 @@ namespace ggml::gemmini::quants::dec
         JxK_ColMajor,
     };
 
-    inline bool is_q8_h1_native_args(const ggml_gemmini_args_t &args)
+    inline bool is_q8_h1_args(const ggml_gemmini_args_t &args)
     {
-        return args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_h1_native &&
-               args.q8_h1_native_blocks != nullptr;
+        return args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_h1 &&
+               args.q8_h1_blocks != nullptr;
     }
 
     inline bool is_q8_h2_args(const ggml_gemmini_args_t &args)
@@ -25,9 +25,41 @@ namespace ggml::gemmini::quants::dec
                args.q8_h2_blocks_per_row > 0;
     }
 
+    inline bool is_q8_hp1_args(const ggml_gemmini_args_t &args)
+    {
+        return args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1 &&
+               args.q8_hp1_blocks != nullptr &&
+               args.q8_hp1_block_count > 0 &&
+               args.q8_hp1_blocks_per_row > 0;
+    }
+
+    inline bool is_q8_hp2_args(const ggml_gemmini_args_t &args)
+    {
+        return args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_hp2 &&
+               args.q8_hp2_blocks != nullptr &&
+               args.q8_hp2_block_count > 0 &&
+               args.q8_hp2_blocks_per_row > 0;
+    }
+
+    inline bool has_q8_hp1_native_dec_contract(const ggml_gemmini_args_t &args)
+    {
+        return args.B == nullptr &&
+               !args.weight_i8_scale_active &&
+               is_q8_hp1_args(args) &&
+               args.has_q8_hp1_im2p_contract();
+    }
+
+    inline bool has_q8_hp2_native_dec_contract(const ggml_gemmini_args_t &args)
+    {
+        return args.B == nullptr &&
+               !args.weight_i8_scale_active &&
+               is_q8_hp2_args(args) &&
+               args.has_q8_hp2_im2p_contract();
+    }
+
     inline bool is_q8_h1_weight_args(const ggml_gemmini_args_t &args)
     {
-        return is_q8_h1_native_args(args) ||
+        return is_q8_h1_args(args) ||
                (args.B &&
                !args.B_scales &&
                args.c_b &&
@@ -37,7 +69,8 @@ namespace ggml::gemmini::quants::dec
 
     inline WeightLayout resolve_weight_layout(const ggml_gemmini_args_t &args)
     {
-        if (is_q8_h1_weight_args(args) || args.transpose_B)
+        if (is_q8_hp1_args(args) || is_q8_hp2_args(args) ||
+            is_q8_h1_weight_args(args) || args.transpose_B)
             return WeightLayout::JxK_ColMajor;
 
         return WeightLayout::KxJ_RowMajor;
@@ -45,6 +78,9 @@ namespace ggml::gemmini::quants::dec
 
     inline size_t resolve_weight_stride_elems(const ggml_gemmini_args_t &args)
     {
+        if (is_q8_hp1_args(args) || is_q8_hp2_args(args))
+            return args.K;
+
         if (is_q8_h1_weight_args(args))
             return args.K;
 

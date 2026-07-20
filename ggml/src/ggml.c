@@ -839,6 +839,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = QK8_HP,
         .type_size                = sizeof(block_q8_hp1),
         .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q8_hp1,
         .from_float_ref           = quantize_row_q8_hp1_ref_ggml,
     },
     [GGML_TYPE_Q8_HP2] = {
@@ -846,6 +847,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = QK8_HP,
         .type_size                = sizeof(block_q8_hp2),
         .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q8_hp2,
         .from_float_ref           = quantize_row_q8_hp2_ref_ggml,
     },
 };

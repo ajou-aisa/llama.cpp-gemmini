@@ -78,9 +78,32 @@ struct TensorStats
     size_t count = 0;
 };
 
-bool compute_tensor_stats(const float *src_data, const ggml_gemmini_args_t &args, TensorStats &stats)
+bool activation_value(const ggml_tensor *src, const float *src_data, const ggml_gemmini_args_t &args,
+                      size_t row, size_t col, float &value)
 {
-    if (!src_data) {
+    if (!src || !src_data || row >= args.I || col >= args.K) {
+        return false;
+    }
+
+    const size_t ne1 = src->ne[1] > 0 ? static_cast<size_t>(src->ne[1]) : 1;
+    const size_t ne2 = src->ne[2] > 0 ? static_cast<size_t>(src->ne[2]) : 1;
+    const size_t i1 = row % ne1;
+    const size_t row_rem = row / ne1;
+    const size_t i2 = row_rem % ne2;
+    const size_t i3 = row_rem / ne2;
+    if (i3 >= static_cast<size_t>(src->ne[3] > 0 ? src->ne[3] : 1)) {
+        return false;
+    }
+
+    const char *base = reinterpret_cast<const char *>(src_data);
+    const size_t offset = col * src->nb[0] + i1 * src->nb[1] + i2 * src->nb[2] + i3 * src->nb[3];
+    value = *reinterpret_cast<const float *>(base + offset);
+    return true;
+}
+
+bool compute_tensor_stats(const ggml_tensor *src, const float *src_data, const ggml_gemmini_args_t &args, TensorStats &stats)
+{
+    if (!src || !src_data) {
         return false;
     }
 
@@ -89,7 +112,10 @@ bool compute_tensor_stats(const float *src_data, const ggml_gemmini_args_t &args
     size_t t_count = 0;
     for (size_t row = 0; row < args.I; ++row) {
         for (size_t col = 0; col < args.K; ++col) {
-            const float value = src_data[row * args.K + col];
+            float value = 0.0f;
+            if (!activation_value(src, src_data, args, row, col, value)) {
+                return false;
+            }
             if (!std::isfinite(value)) {
                 continue;
             }
@@ -115,19 +141,23 @@ bool compute_tensor_stats(const float *src_data, const ggml_gemmini_args_t &args
 }
 
 bool mark_outliers_3sigma(
+    const ggml_tensor *src,
     const float *src_data,
     const ggml_gemmini_args_t &args,
     const TensorStats &stats,
     BitMask &mask,
     TensorStats &inlier_stats)
 {
-    if (!src_data || !mask.resize(args.I, args.K)) {
+    if (!src || !src_data || !mask.resize(args.I, args.K)) {
         return false;
     }
 
     for (size_t row = 0; row < args.I; ++row) {
         for (size_t col = 0; col < args.K; ++col) {
-            const float value = src_data[row * args.K + col];
+            float value = 0.0f;
+            if (!activation_value(src, src_data, args, row, col, value)) {
+                return false;
+            }
             if (!std::isfinite(value)) {
                 mask.mark_outlier(row, col);
                 continue;
@@ -207,10 +237,10 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
         TensorStats stats;
         TensorStats inlier_stats;
         BitMask outliers;
-        if (!compute_tensor_stats(src_data, args, stats)) {
+        if (!compute_tensor_stats(src, src_data, args, stats)) {
             return false;
         }
-        if (!mark_outliers_3sigma(src_data, args, stats, outliers, inlier_stats)) {
+        if (!mark_outliers_3sigma(src, src_data, args, stats, outliers, inlier_stats)) {
             return false;
         }
         const TensorStats &scale_stats = inlier_stats.count != 0 ? inlier_stats : stats;
@@ -220,7 +250,7 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
         meta->outliers.clear();
     #else
         TensorStats stats;
-        if (!compute_tensor_stats(src_data, args, stats)) {
+        if (!compute_tensor_stats(src, src_data, args, stats)) {
             return false;
         }
         if (!set_scale(stats, *meta)) {
@@ -231,7 +261,11 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
     for (size_t row = 0; row < args.I; ++row) {
         for (size_t col = 0; col < args.K; ++col) {
             const size_t idx = row * args.K + col;
-            const int32_t q32 = quantize_to_i32(src_data[idx], meta->scale);
+            float value = 0.0f;
+            if (!activation_value(src, src_data, args, row, col, value)) {
+                return false;
+            }
+            const int32_t q32 = quantize_to_i32(value, meta->scale);
             const int8_t q8 = clip_to_i8(q32);
             dst[idx] = q8;
 

@@ -396,7 +396,7 @@ bool quantize_row_q8_hp2_ref(const float * GGML_RESTRICT x, block_q8_hp2 * GGML_
             continue;
         }
 
-        const int block_exponent = ilogbf(block_amax) - 7;
+        const int block_exponent = ilogbf(block_amax) - 6;
         const float block_scale = ldexpf(1.0f, block_exponent);
         y[i].m = (int16_t) block_exponent;
         for (int j = 0; j < QK8_HP; ++j) {
@@ -406,6 +406,30 @@ bool quantize_row_q8_hp2_ref(const float * GGML_RESTRICT x, block_q8_hp2 * GGML_
         }
     }
     return true;
+}
+
+void dequantize_row_q8_hp1(const block_q8_hp1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK8_HP == 0);
+    const int nb = k / QK8_HP;
+    for (int i = 0; i < nb; ++i) {
+        const block_q8_hp1 * block = &x[i];
+        const float scale = block->m == INT16_MIN ? 0.0f : ldexpf(block->channel_scale, block->m);
+        for (int j = 0; j < QK8_HP; ++j) {
+            y[i*QK8_HP + j] = block->qs[j] * scale;
+        }
+    }
+}
+
+void dequantize_row_q8_hp2(const block_q8_hp2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK8_HP == 0);
+    const int nb = k / QK8_HP;
+    for (int i = 0; i < nb; ++i) {
+        const block_q8_hp2 * block = &x[i];
+        const float scale = block->m == INT16_MIN ? 0.0f : ldexpf(block->channel_scale, block->m);
+        for (int j = 0; j < QK8_HP; ++j) {
+            y[i*QK8_HP + j] = block->qs[j] * scale;
+        }
+    }
 }
 
 // reference implementation for deterministic creation of model files
@@ -5298,7 +5322,7 @@ static bool validate_q8_hp_block(
 
     if (channel_scale == 0.0f || all_zero ||
         (type == GGML_TYPE_Q8_HP1 && m > 0) ||
-        (type == GGML_TYPE_Q8_HP2 && (m < -7 || m > 7))) {
+        (type == GGML_TYPE_Q8_HP2 && (m < -6 || m > 8))) {
         fprintf(stderr, "ggml_validate_row_data: invalid signed m at block %zu\n", i);
         return false;
     }

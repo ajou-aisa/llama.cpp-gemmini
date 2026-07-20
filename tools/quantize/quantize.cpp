@@ -58,6 +58,8 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "Q8_0",     LLAMA_FTYPE_MOSTLY_Q8_0,     " 7.96G, +0.0026 ppl @ Llama-3-8B",  },
     { "Q8_H1",    LLAMA_FTYPE_MOSTLY_Q8_H1,    " Gemmini row-scale Q8 quantization", },
     { "Q8_H2",    LLAMA_FTYPE_MOSTLY_Q8_H2,    " Gemmini channel-scale Q8 quantization", },
+    { "Q8_HP1",   LLAMA_FTYPE_MOSTLY_Q8_HP1,   " Q8 HP1 quantization",                  },
+    { "Q8_HP2",   LLAMA_FTYPE_MOSTLY_Q8_HP2,   " Q8 HP2 quantization",                  },
     { "F16",      LLAMA_FTYPE_MOSTLY_F16,      "14.00G, +0.0020 ppl @ Mistral-7B",  },
     { "BF16",     LLAMA_FTYPE_MOSTLY_BF16,     "14.00G, -0.0050 ppl @ Mistral-7B",  },
     { "F32",      LLAMA_FTYPE_ALL_F32,         "26.00G              @ 7B",          },
