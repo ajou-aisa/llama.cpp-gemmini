@@ -517,13 +517,35 @@ ActivationDECResult compensate_activation_dec(
     {
         case ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1:
             q8_hp1 = has_q8_hp1_native_dec_contract(args);
-            if (!q8_hp1)
+            if (q8_hp1) {
+                // Ponytail: gates against malformed padding/finiteness gracefully
+                // (the generic ggml_validate_row_data(Q8_HP*) is now a no-op for
+                // performance). Kept narrow: only padding + NaN/Inf, no per-qs loop.
+                for (size_t i = 0; i < args.q8_hp1_block_count; ++i) {
+                    const block_q8_hp1 & b = args.q8_hp1_blocks[i];
+                    if (b.padding[0] != 0 || b.padding[1] != 0 ||
+                        !std::isfinite(b.channel_scale)) {
+                        return result;
+                    }
+                }
+            } else {
                 return result;
+            }
             break;
         case ggml_gemmini_args_t::im2p_weight_format_t::q8_hp2:
             q8_hp2 = has_q8_hp2_native_dec_contract(args);
-            if (!q8_hp2)
+            if (q8_hp2) {
+                // Ponytail: same gating rationale as Q8_HP1 sibling above.
+                for (size_t i = 0; i < args.q8_hp2_block_count; ++i) {
+                    const block_q8_hp2 & b = args.q8_hp2_blocks[i];
+                    if (b.padding[0] != 0 || b.padding[1] != 0 ||
+                        !std::isfinite(b.channel_scale)) {
+                        return result;
+                    }
+                }
+            } else {
                 return result;
+            }
             break;
         default:
             break;
