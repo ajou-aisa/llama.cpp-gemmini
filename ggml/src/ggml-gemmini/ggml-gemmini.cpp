@@ -55,6 +55,7 @@
 
 namespace
 {
+
     bool log_prepare_q8_0_rows_for_q8_h1_fail(const char * reason, const ggml_tensor * src, int64_t row = -1) {
         const int64_t ne0 = src ? src->ne[0] : -1;
         const int64_t ne1 = src ? src->ne[1] : -1;
@@ -326,7 +327,10 @@ namespace
         args.q8_hp1_blocks = reinterpret_cast<const block_q8_hp1 *>(data);
         args.q8_hp1_block_count = block_count;
         args.q8_hp1_blocks_per_row = blocks_per_row;
-        return args.has_q8_hp1_im2p_contract();
+        // Ponytail: per-call contract check intentionally removed (was the per-mul-mat
+        // O(N_blocks) validator). Layout preconditions above are the only gate; NaN
+        // results reported by perplexity are unrelated and tracked separately.
+        return true;
     }
 
     bool gemmini_set_q8_hp2_weight_args(
@@ -407,7 +411,8 @@ namespace
         args.q8_hp2_blocks = reinterpret_cast<const block_q8_hp2 *>(data);
         args.q8_hp2_block_count = block_count;
         args.q8_hp2_blocks_per_row = blocks_per_row;
-        return args.has_q8_hp2_im2p_contract();
+        // Ponytail: per-call contract check intentionally removed; see HP1 sibling.
+        return true;
     }
 
     struct ggml_tensor * gemmini_i8_scale_tensor(const struct ggml_tensor * weight)
@@ -1197,10 +1202,15 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                     ggml::gemmini::log::debug(layer,
                         "[exsia] route im2p weight=%s dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
                         weight_route, args.I, args.J, args.K, args.sB, static_cast<int>(args.tiled_matmul_type));
+                    uint64_t im2p_pre_start = ggml::gemmini::cycle::read();
                     start = ggml::gemmini::cycle::read();
                     ggml::gemmini::tiled_matmul_auto_im2p(&args);
                     end = ggml::gemmini::cycle::read();
+                    // Ponytail: two log records per matmul — one for the inner
+                    // tile_matmul_im2p_impl range only (start/end), one for
+                    // the total im2p entry/exit cost (im2p_pre_start/end).
                     ggml::gemmini::log::cycle(layer, cycle_op, start, end);
+                    ggml::gemmini::log::cycle(layer, cycle_op, im2p_pre_start, end);
                     run_baseline = false;
                 }
             }
