@@ -15,6 +15,13 @@
 #include <utility>
 #include <variant>
 
+// Validation/test builds snapshot each stripe's outlier mask into state_.stripe so the
+// mask-inspection tests keep working. Production builds leave it 0 and keep no per-stripe
+// mask array (the single workspace owns the only live mask).
+#ifndef EXSIA_VALIDATION
+#define EXSIA_VALIDATION 0
+#endif
+
 namespace ggml::gemmini::quants::act::exsia
 {
     static_assert(GGML_GEMMINI_EXSIA_SIGMA > 0, "GGML_GEMMINI_EXSIA_SIGMA must be positive");
@@ -465,6 +472,8 @@ namespace ggml::gemmini::quants::act::exsia
                             int8_t *dst,
                             const std::vector<int32_t> &stripe_q_wide,
                             const std::vector<int16_t> &stripe_block_exp,
+                            std::vector<int32_t> &residual,
+                            std::vector<ggml_gemmini_qact_outlier> &out_outliers,
                             uint64_t &cycle_delta)
     {
         const int16_t neg_inf = std::numeric_limits<int16_t>::min();
@@ -580,13 +589,21 @@ namespace ggml::gemmini::quants::act::exsia
                         if (col < args.K)
                             dst[r * args.K + col] = q8;
 
-                        // Step 4.4: store residual only for marked positions.
+                        // Step 4.4: record residual only for marked positions.
                         const bool outlier = col < args.K && stripe.outlier_mask.is_set(local_row, col);
                         const int32_t residual_i32 = outlier ? res : 0;
 
+                        // Step 4.5: write the dense residual matrix for every padded element.
+                        // Non-marked and padding positions are explicitly recorded as 0.
+                        // Uses the global row range (K_padded stride); stripes own disjoint rows.
+                        const size_t global_idx = r * state.K_padded + col;
+                        GGML_ASSERT(global_idx < residual.size());
+                        residual[global_idx] = residual_i32;
+
+                        // Step 4.6: mirror true nonzero residuals into the stripe-local list.
                         if (outlier && residual_i32 != 0)
                         {
-                            meta.outliers.push_back({
+                            out_outliers.push_back({
                                 static_cast<int>(r),
                                 static_cast<int>(col),
                                 residual_i32,
@@ -665,37 +682,42 @@ namespace ggml::gemmini::quants::act::exsia
         meta.outliers.clear();
         meta.outliers.reserve(logical_elem_count);
 
+        // Dense residual matrix is a global output, sized to the full padded activation.
+        // Each stripe writes its own disjoint global row range (K_padded stride).
+        size_t padded_elem_count = 0;
+        if (!checked_mul_size(args.I, state_.K_padded, padded_elem_count))
+            return fail();
+
         release_vector(state_.x_f32);
         release_vector(state_.q_wide);
         release_vector(state_.block_exp);
-        release_vector(state_.residual);
+        state_.residual.assign(padded_elem_count, 0);
 
-        stream_.prepare(max_stripe_elem_count, max_stripe_block_count);
+        // One workspace, sized to the largest stripe, reused across every stripe.
+        if (!workspace_.prepare(max_stripe_elem_count, max_stripe_block_count,
+                                max_stripe_rows, state_.K_padded, state_.B_size))
+            return fail();
+
+        // state_.stripe carries per-stripe row metadata only; the workspace owns the live
+        // mask/scratch. (Validation builds additionally snapshot each mask below.)
         state_.stripe.assign(num_stripes, StripeState{});
         for (size_t s = 0; s < num_stripes; ++s)
         {
-            StripeState &stripe = state_.stripe[s];
-            stripe.row_start = s * rows_per_stripe;
-            stripe.row_end = std::min((s + 1) * rows_per_stripe, args.I);
-            if (!stripe.outlier_mask.prepare(stripe.row_count(), state_.K_padded) ||
-                !stripe.scratch.prepare(state_.B_size))
-                return fail();
+            StripeState &meta_stripe = state_.stripe[s];
+            meta_stripe.row_start = s * rows_per_stripe;
+            meta_stripe.row_end = std::min((s + 1) * rows_per_stripe, args.I);
         }
 
         uint64_t local_stage_cycle_sum = 0;
         uint64_t stripe_folding_cycle_sum = 0;
         for (size_t s = 0; s < num_stripes; ++s)
         {
-            StripeState &stripe = state_.stripe[s];
-            size_t stripe_elem_count = 0;
-            size_t stripe_block_count = 0;
-            if (!checked_mul_size(stripe.row_count(), state_.K_padded, stripe_elem_count) ||
-                !checked_mul_size(stripe.row_count(), state_.blocks_per_row, stripe_block_count))
-            {
-                return fail();
-            }
+            const size_t row_start = s * rows_per_stripe;
+            const size_t row_end = std::min((s + 1) * rows_per_stripe, args.I);
+            workspace_.reset_for_stripe(s, row_start, row_end,
+                                        state_.K_padded, state_.blocks_per_row);
+            StripeState &stripe = workspace_.stripe;
 
-            stream_.prepare(stripe_elem_count, stripe_block_count);
             for (size_t r = stripe.row_start; r < stripe.row_end; ++r)
             {
                 for (size_t b = 0; b < state_.blocks_per_row; ++b)
@@ -711,17 +733,36 @@ namespace ggml::gemmini::quants::act::exsia
                     }
 
                     if (!local_.run(meta, state_, stripe, block_x, r, b,
-                                    stream_.q_wide, stream_.block_exp, local_cycle_delta))
+                                    workspace_.q_wide, workspace_.block_exp, local_cycle_delta))
                         return fail();
-                    local_stage_cycle_sum += local_cycle_delta;
+                    workspace_.cycle_stats.local_total += local_cycle_delta;
                 }
             }
 
             uint64_t stripe_cycle_delta = 0;
             if (!folding_.run(meta, state_, stripe, args, s, dst,
-                              stream_.q_wide, stream_.block_exp, stripe_cycle_delta))
+                              workspace_.q_wide, workspace_.block_exp,
+                              state_.residual, workspace_.outliers, stripe_cycle_delta))
                 return fail();
-            stripe_folding_cycle_sum += stripe_cycle_delta;
+            workspace_.cycle_stats.folding_total += stripe_cycle_delta;
+
+            // Merge stripe-local outliers into the global list. Sequential, no locking;
+            // this is the same seam a future parallel merge would use. Stripes run in row
+            // order and emit (row, col) ascending, so global ordering is preserved.
+            meta.outliers.insert(meta.outliers.end(),
+                                 workspace_.outliers.begin(),
+                                 workspace_.outliers.end());
+
+#if EXSIA_VALIDATION
+            // Faithful post-folding snapshot for mask-inspection tests (folding sets the
+            // promotion-block bits, so the copy must be taken after folding completes).
+            state_.stripe[s].outlier_mask = workspace_.stripe.outlier_mask;
+#endif
+
+            local_stage_cycle_sum += workspace_.cycle_stats.local_total;
+            stripe_folding_cycle_sum += workspace_.cycle_stats.folding_total;
+            EXSIA_LOG_CYCLE("exsia.stripe.local_total", 0, workspace_.cycle_stats.local_total);
+            EXSIA_LOG_CYCLE("exsia.stripe.folding_total", 0, workspace_.cycle_stats.folding_total);
         }
 
         ggml::gemmini::log::debug(
