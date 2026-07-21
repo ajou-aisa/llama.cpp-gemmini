@@ -279,11 +279,10 @@ typedef struct ggml_gemmini_args_t {
             return false;
         }
 
-        if (!ggml_validate_row_data(
-                GGML_TYPE_Q8_HP1, q8_hp1_blocks, q8_hp1_block_count * sizeof(block_q8_hp1))) {
-            return false;
-        }
-
+        // Payload validity is guaranteed at quantize time (llama-quant.cpp) and, if requested,
+        // once at load (check_tensors). Weights are immutable during inference and the HP kernel
+        // is robust to malformed data (ldexp_fast_pos fallbacks, m==INT16_MIN handled), so we do
+        // not re-scan the whole tensor via ggml_validate_row_data on every matmul call.
         return true;
     }
 
@@ -316,11 +315,7 @@ typedef struct ggml_gemmini_args_t {
             return false;
         }
 
-        if (!ggml_validate_row_data(
-                GGML_TYPE_Q8_HP2, q8_hp2_blocks, q8_hp2_block_count * sizeof(block_q8_hp2))) {
-            return false;
-        }
-
+        // See has_q8_hp1_im2p_contract: payload is validated at quantize/load time, not per matmul.
         return true;
     }
 
