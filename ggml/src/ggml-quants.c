@@ -352,7 +352,11 @@ bool quantize_row_q8_hp1_ref(const float * GGML_RESTRICT x, block_q8_hp1 * GGML_
     }
 
     const int nb = k / QK8_HP;
+    // Min-anchor: channel_scale = smallest per-block power-of-two in the row, so the
+    // per-block exponent offset m = block_exp - channel_exp is >= 0 (a left shift),
+    // mirroring Q8_H1's low-anchored convention.
     float channel_scale = 0.0f;
+    bool channel_set = false;
     for (int i = 0; i < nb; ++i) {
         float amax = 0.0f;
         for (int j = 0; j < QK8_HP; ++j) {
@@ -360,12 +364,13 @@ bool quantize_row_q8_hp1_ref(const float * GGML_RESTRICT x, block_q8_hp1 * GGML_
         }
         if (amax > 0.0f) {
             const float block_scale = ldexpf(1.0f, ilogbf(amax) - 6);
-            channel_scale = MAX(channel_scale, block_scale);
+            channel_scale = channel_set ? MIN(channel_scale, block_scale) : block_scale;
+            channel_set = true;
         }
     }
 
     memset(y, 0, (size_t) nb * sizeof(*y));
-    const int channel_exponent = channel_scale > 0.0f ? ilogbf(channel_scale) : 0;
+    const int channel_exponent = channel_set ? ilogbf(channel_scale) : 0;
     for (int i = 0; i < nb; ++i) {
         float amax = 0.0f;
         for (int j = 0; j < QK8_HP; ++j) {
@@ -5341,7 +5346,7 @@ static bool validate_q8_hp_block(
     }
 
     if (channel_scale == 0.0f ||
-        (type == GGML_TYPE_Q8_HP1 && m > 0) ||
+        (type == GGML_TYPE_Q8_HP1 && m < 0) ||
         (type == GGML_TYPE_Q8_HP2 && (m < -6 || m > 8))) {
         fprintf(stderr, "ggml_validate_row_data: invalid signed m at block %zu\n", i);
         return false;
