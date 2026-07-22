@@ -1,6 +1,7 @@
 #include "../include/gemmini/log.hpp"
 
 #include <cinttypes>
+#include <mutex>
 #include <string>
 
 namespace ggml::gemmini::log
@@ -56,6 +57,12 @@ namespace ggml::gemmini::log
                 }
             }
         }
+
+        std::mutex &write_mutex()
+        {
+            static std::mutex mutex;
+            return mutex;
+        }
     } // namespace
 
     void CycleLog::write(FILE *out, const char *file, int line, const char *func, const char *layer, const char *op,
@@ -104,6 +111,7 @@ namespace ggml::gemmini::log
             std::snprintf(buf, sizeof(buf), "%" PRIu64, v);
             json += buf;
         };
+#if LOG_DETAIL
         auto add_i32 = [&](const char *k, int v)
         {
             add_key(k);
@@ -111,6 +119,7 @@ namespace ggml::gemmini::log
             std::snprintf(buf, sizeof(buf), "%d", v);
             json += buf;
         };
+#endif
 
         json.push_back('{');
         add_str("layer", safe_layer);
@@ -133,8 +142,10 @@ namespace ggml::gemmini::log
 #endif
 
         json.push_back('}');
+        json.push_back('\n');
+
+        std::lock_guard<std::mutex> lock(write_mutex());
         std::fwrite(json.data(), 1, json.size(), out);
-        std::fputc('\n', out);
         std::fflush(out);
 #else
         (void)out;

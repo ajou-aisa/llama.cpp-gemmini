@@ -1203,13 +1203,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                         "[exsia] route im2p weight=%s dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
                         weight_route, args.I, args.J, args.K, args.sB, static_cast<int>(args.tiled_matmul_type));
                     uint64_t im2p_pre_start = ggml::gemmini::cycle::read();
-                    start = ggml::gemmini::cycle::read();
                     ggml::gemmini::tiled_matmul_auto_im2p(&args);
                     end = ggml::gemmini::cycle::read();
-                    // Ponytail: two log records per matmul — one for the inner
-                    // tile_matmul_im2p_impl range only (start/end), one for
-                    // the total im2p entry/exit cost (im2p_pre_start/end).
-                    ggml::gemmini::log::cycle(layer, cycle_op, start, end);
                     ggml::gemmini::log::cycle(layer, cycle_op, im2p_pre_start, end);
                     run_baseline = false;
                 }

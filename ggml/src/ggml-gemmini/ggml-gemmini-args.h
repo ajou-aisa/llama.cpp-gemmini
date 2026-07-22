@@ -279,11 +279,10 @@ typedef struct ggml_gemmini_args_t {
             return false;
         }
 
-        if (!ggml_validate_row_data(
-                GGML_TYPE_Q8_HP1, q8_hp1_blocks, q8_hp1_block_count * sizeof(block_q8_hp1))) {
-            return false;
-        }
-
+        // Payload validity is guaranteed at quantize time (llama-quant.cpp) and, if requested,
+        // once at load (check_tensors). Weights are immutable during inference and the HP kernel
+        // is robust to malformed data (ldexp_fast_pos fallbacks, m==INT16_MIN handled), so we do
+        // not re-scan the whole tensor via ggml_validate_row_data on every matmul call.
         return true;
     }
 
@@ -316,11 +315,7 @@ typedef struct ggml_gemmini_args_t {
             return false;
         }
 
-        if (!ggml_validate_row_data(
-                GGML_TYPE_Q8_HP2, q8_hp2_blocks, q8_hp2_block_count * sizeof(block_q8_hp2))) {
-            return false;
-        }
-
+        // See has_q8_hp1_im2p_contract: payload is validated at quantize/load time, not per matmul.
         return true;
     }
 
@@ -359,22 +354,8 @@ typedef struct ggml_gemmini_args_t {
             return false;
         }
 
-        for (size_t row = 0; row < J; ++row) {
-            const block_q8_h1 *first = q8_h1_block(row, 0);
-            if (first == nullptr || !std::isfinite(first->s_rf) || first->s_rf < 0.0f ||
-                (first->s_rf == 0.0f && (first->R != 0 || first->c_b != 0))) {
-                return false;
-            }
-
-            for (size_t block = 1; block < blocks_per_row; ++block) {
-                const block_q8_h1 *current = q8_h1_block(row, block);
-                if (current == nullptr || current->s_rf != first->s_rf || current->R != first->R ||
-                    (first->s_rf == 0.0f && current->c_b != 0)) {
-                    return false;
-                }
-            }
-        }
-
+        // EXPERIMENT (contract-scan parity with Q8_HP): skip the per-row s_rf/R uniformity
+        // scan so H1 pays the same O(1) per-call contract as HP1, isolating pure format cost.
         return true;
     }
 

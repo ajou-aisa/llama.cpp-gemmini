@@ -225,6 +225,89 @@ namespace ggml::gemmini::quants::act::exsia
         }
     };
 
+    // Per-stripe cycle aggregates. Sequential today; a future pipeline slot keeps its own.
+    struct StripeCycleStats
+    {
+        size_t stripe_idx = 0;
+        uint64_t local_total = 0;
+        uint64_t folding_total = 0;
+
+        void reset()
+        {
+            local_total = 0;
+            folding_total = 0;
+        }
+    };
+
+    // Self-contained owner of one stripe's transient state. This is the unit a future
+    // stripe-level pipeline would replicate into N slots; today exactly one is used.
+    struct StripeWorkspace
+    {
+        size_t stripe_idx = 0;
+        size_t row_start = 0;
+        size_t row_end = 0;
+
+        StripeState stripe; // owns outlier/promotion mask + block scratch
+
+        std::vector<int32_t> q_wide;    // max_stripe_rows * K_padded
+        std::vector<int16_t> block_exp; // max_stripe_rows * blocks_per_row
+
+        std::vector<ggml_gemmini_qact_outlier> outliers; // stripe-local, merged after folding
+
+        StripeCycleStats cycle_stats;
+
+        // One-time capacity allocation sized for the largest stripe. Counts are
+        // overflow-checked by the caller before this is invoked.
+        bool prepare(size_t elem_capacity,
+                     size_t block_capacity,
+                     size_t max_rows,
+                     size_t K_padded,
+                     size_t block_size)
+        {
+            if (q_wide.size() < elem_capacity)
+                q_wide.resize(elem_capacity);
+            if (block_exp.size() < block_capacity)
+                block_exp.resize(block_capacity);
+            if (!stripe.outlier_mask.prepare(max_rows, K_padded) ||
+                !stripe.scratch.prepare(block_size))
+                return false;
+
+            outliers.reserve(elem_capacity);
+            return true;
+        }
+
+        // Active-range reset only: no allocation, resize, reserve, or BitMask alloc.
+        void reset_for_stripe(size_t idx,
+                              size_t r0,
+                              size_t r1,
+                              size_t K_padded,
+                              size_t blocks_per_row)
+        {
+            const int16_t neg_inf = std::numeric_limits<int16_t>::min();
+            stripe_idx = idx;
+            row_start = r0;
+            row_end = r1;
+
+            const size_t rows = r1 - r0;
+            const size_t elem = rows * K_padded;
+            const size_t blocks = rows * blocks_per_row;
+
+            stripe.row_start = r0;
+            stripe.row_end = r1;
+            stripe.e1 = neg_inf;
+            stripe.e2 = neg_inf;
+            stripe.e_s = neg_inf;
+            stripe.promote_top_block = false;
+            stripe.outlier_mask.prepare(rows, K_padded); // reuses capacity, zeroes active words
+
+            std::fill(q_wide.begin(), q_wide.begin() + elem, 0);
+            std::fill(block_exp.begin(), block_exp.begin() + blocks, neg_inf);
+            outliers.clear();
+            cycle_stats.reset();
+            cycle_stats.stripe_idx = idx;
+        }
+    };
+
     struct ExSIAState
     {
         size_t B_size = BLOCK_SIZE;
@@ -335,6 +418,8 @@ namespace ggml::gemmini::quants::act::exsia
             int8_t *dst,
             const std::vector<int32_t> &stripe_q_wide,
             const std::vector<int16_t> &stripe_block_exp,
+            std::vector<int32_t> &residual,                       // dense global output, I * K_padded
+            std::vector<ggml_gemmini_qact_outlier> &out_outliers, // stripe-local, merged by caller
             uint64_t &cycle_delta);
 
     private:
@@ -345,27 +430,10 @@ namespace ggml::gemmini::quants::act::exsia
     class ExSIA
     {
     private:
-        struct StreamScratch
-        {
-            std::vector<int32_t> q_wide;
-            std::vector<int16_t> block_exp;
-
-            void prepare(size_t elem_count, size_t block_count)
-            {
-                if (q_wide.size() < elem_count)
-                    q_wide.resize(elem_count);
-                if (block_exp.size() < block_count)
-                    block_exp.resize(block_count);
-
-                std::fill(q_wide.begin(), q_wide.begin() + elem_count, 0);
-                std::fill(block_exp.begin(),
-                          block_exp.begin() + block_count,
-                          std::numeric_limits<int16_t>::min());
-            }
-        };
-
         ExSIAState state_;
-        StreamScratch stream_;
+        // Exactly one workspace today. To pipeline stripes later this becomes a small
+        // std::vector<StripeWorkspace> of slots; no other data structure has to change.
+        StripeWorkspace workspace_;
         LocalStage local_;
         StripeFolding folding_;
 
