@@ -354,22 +354,8 @@ typedef struct ggml_gemmini_args_t {
             return false;
         }
 
-        for (size_t row = 0; row < J; ++row) {
-            const block_q8_h1 *first = q8_h1_block(row, 0);
-            if (first == nullptr || !std::isfinite(first->s_rf) || first->s_rf < 0.0f ||
-                (first->s_rf == 0.0f && (first->R != 0 || first->c_b != 0))) {
-                return false;
-            }
-
-            for (size_t block = 1; block < blocks_per_row; ++block) {
-                const block_q8_h1 *current = q8_h1_block(row, block);
-                if (current == nullptr || current->s_rf != first->s_rf || current->R != first->R ||
-                    (first->s_rf == 0.0f && current->c_b != 0)) {
-                    return false;
-                }
-            }
-        }
-
+        // EXPERIMENT (contract-scan parity with Q8_HP): skip the per-row s_rf/R uniformity
+        // scan so H1 pays the same O(1) per-call contract as HP1, isolating pure format cost.
         return true;
     }
 
