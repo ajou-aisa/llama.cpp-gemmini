@@ -233,8 +233,6 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
         return false;
     }
 
-    const char *layer = ggml::gemmini::types::to_string(args.layer_type);
-
     //cpu fallback이면 args.I, else determined by gemmini tile
     size_t rows_per_stripe = args.I;
     if (args.tile_I > 0 && !checked_mul_size(args.tile_I, DIM, rows_per_stripe)) {
@@ -302,17 +300,6 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
 
             }
         }
-
-#if ERROR_COMPENSATION
-        ggml::gemmini::log::debug(layer,
-                                "[quantize_stripe] I=%zu K=%zu rows_per_stripe=%zu stripe_scales=%zu residual_outliers=%zu",
-                                args.I, args.K, rows_per_stripe, meta->scales.size(), residual_outlier_count);
-#else
-        ggml::gemmini::log::debug(layer,
-                                "[quantize_stripe] I=%zu K=%zu stripe_scales=%zu",
-                                args.I, args.K, meta->scales.size());
-#endif
-
     }
 
     return true;
@@ -326,13 +313,99 @@ bool dequantize_activation(
     size_t cols,
     const ggml_gemmini_args_t &args)
 {
-    (void)dst;
-    (void)dst_row_stride;
-    (void)dst_col_stride;
-    (void)rows;
-    (void)cols;
-    (void)args;
-    return false;
+    const int8_t *src = reinterpret_cast<const int8_t *>(args.A);
+    if (!src || !dst || args.I == 0 || args.K == 0 || dst_row_stride == 0 || dst_col_stride == 0 || rows == 0 || cols == 0) {
+        return false;
+    }
+
+    const auto *meta_ptr = std::get_if<Meta>(&args.act_quant.storage());
+    if (!meta_ptr) {
+        return false;
+    }
+    const Meta &meta = *meta_ptr;
+
+    if (args.sA != 0 && args.sA != args.K) {
+        return false;
+    }
+
+    size_t rows_per_stripe = args.I;
+    if (args.tile_I > 0 && !checked_mul_size(args.tile_I, DIM, rows_per_stripe)) {
+        return false;
+    }
+    if (rows_per_stripe == 0) {
+        return false;
+    }
+
+    const size_t expected_stripes = (args.I - 1) / rows_per_stripe + 1;
+    if (meta.scales.size() != expected_stripes) {
+        return false;
+    }
+
+    const size_t row_count = std::min(rows, args.I);
+    const size_t col_count = std::min(cols, args.K);
+    const size_t max_size = std::numeric_limits<size_t>::max();
+    const size_t src_row_stride = args.K;
+
+#if ERROR_COMPENSATION
+    size_t residual_count = 0;
+    if (!checked_mul_size(row_count, col_count, residual_count)) {
+        return false;
+    }
+
+    std::vector<int32_t> residuals(residual_count, 0);
+    for (const auto &outlier : meta.outliers)
+    {
+        if (outlier.row < 0 || outlier.col < 0) {
+            continue;
+        }
+
+        const size_t row = static_cast<size_t>(outlier.row);
+        const size_t col = static_cast<size_t>(outlier.col);
+        if (row < row_count && col < col_count) {
+            residuals[row * col_count + col] += outlier.residual;
+        }
+    }
+#endif
+
+    for (size_t row = 0; row < row_count; ++row)
+    {
+        const size_t stripe_idx = row / rows_per_stripe;
+        const float scale = meta.scales[stripe_idx];
+        if (!std::isfinite(scale) || scale <= 0.0f) {
+            return false;
+        }
+
+        for (size_t col = 0; col < col_count; ++col)
+        {
+            if ((row != 0 && src_row_stride > max_size / row) ||
+                (row != 0 && dst_row_stride > max_size / row) ||
+                (col != 0 && dst_col_stride > max_size / col)) {
+                return false;
+            }
+
+            const size_t src_row_offset = row * src_row_stride;
+            if (src_row_offset > max_size - col) {
+                return false;
+            }
+
+            const size_t dst_row_offset = row * dst_row_stride;
+            const size_t dst_col_offset = col * dst_col_stride;
+            if (dst_row_offset > max_size - dst_col_offset) {
+                return false;
+            }
+
+            const size_t src_idx = src_row_offset + col;
+            const size_t dst_idx = dst_row_offset + dst_col_offset;
+
+            int32_t q = static_cast<int32_t>(src[src_idx]);
+#if ERROR_COMPENSATION
+            q += residuals[row * col_count + col];
+#endif
+            dst[dst_idx] = static_cast<float>(q) * scale;
+        }
+    }
+
+    return true;
 }
 
 }
