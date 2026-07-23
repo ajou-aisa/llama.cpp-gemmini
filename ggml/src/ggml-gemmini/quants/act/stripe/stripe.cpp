@@ -27,16 +27,6 @@ bool checked_mul_size(size_t lhs, size_t rhs, size_t &out)
     return true;
 }
 
-bool checked_add_size(size_t lhs, size_t rhs, size_t &out)
-{
-    if (lhs > std::numeric_limits<size_t>::max() - rhs) {
-        return false;
-    }
-
-    out = lhs + rhs;
-    return true;
-}
-
 struct BitMask
 {
     size_t rows = 0;
