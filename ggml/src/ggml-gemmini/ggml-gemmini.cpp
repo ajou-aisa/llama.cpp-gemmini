@@ -1190,22 +1190,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                                 : src0->type == GGML_TYPE_Q8_HP2
                                     ? "Q8_HP2 direct"
                                     : "Q8_0 reprocessed";
-                    const char *cycle_op = src0->type == GGML_TYPE_Q8_H1
-                        ? "gemmini.im2p Q8_H1 direct"
-                        : src0->type == GGML_TYPE_Q8_H2
-                            ? "gemmini.im2p Q8_H2 direct"
-                            : src0->type == GGML_TYPE_Q8_HP1
-                                ? "gemmini.im2p Q8_HP1 direct"
-                                : src0->type == GGML_TYPE_Q8_HP2
-                                    ? "gemmini.im2p Q8_HP2 direct"
-                                    : "gemmini.im2p Q8_0 reprocessed";
                     ggml::gemmini::log::debug(layer,
                         "[exsia] route im2p weight=%s dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
                         weight_route, args.I, args.J, args.K, args.sB, static_cast<int>(args.tiled_matmul_type));
-                    uint64_t im2p_pre_start = ggml::gemmini::cycle::read();
                     ggml::gemmini::tiled_matmul_auto_im2p(&args);
-                    end = ggml::gemmini::cycle::read();
-                    ggml::gemmini::log::cycle(layer, cycle_op, im2p_pre_start, end);
                     run_baseline = false;
                 }
             }
@@ -1217,19 +1205,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             }
 
             if (run_baseline) {
-                start = ggml::gemmini::cycle::read();
                 ggml::gemmini::tiled_matmul_auto_baseline(
                     &args,
                     baseline_activation_quant,
                     baseline_weight_quant);
-                end = ggml::gemmini::cycle::read();
-                if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA) {
-                    ggml::gemmini::log::cycle(layer, "gemmini.tiled_matmul_auto_baseline.exsia_tensor", start, end);
-                } else if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TENSOR) {
-                    ggml::gemmini::log::cycle(layer, "gemmini.tiled_matmul_auto_baseline.tensor_tensor", start, end);
-                } else if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TOKEN) {
-                    ggml::gemmini::log::cycle(layer, "gemmini.tiled_matmul_auto_baseline.token_tensor", start, end);
-                }
             }
     }
     // dst에는 gemmini 커널에서 dequantize한 결과가 들어옴 
