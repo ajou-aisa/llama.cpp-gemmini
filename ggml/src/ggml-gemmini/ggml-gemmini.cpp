@@ -1174,8 +1174,12 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                     : ggml::gemmini::baseline_weight_quant_t::FLOAT;
             bool run_baseline = true;
 
-            if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA) {
+            if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA ||
+                          ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::STRIPE) {
                 if (args.weight_i8_scale_active) {
+                    if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::STRIPE) {
+                        GGML_ABORT("Gemmini STRIPE activation requires IM2P/native Q8 weights; dense tensor weights are unsupported");
+                    }
                     ggml::gemmini::log::debug(layer,
                         "[baseline] route activation=exsia weight=tensor weight_scale=%.9f dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
                         static_cast<double>(args.weight_scale), args.I, args.J, args.K, args.sB,
@@ -1191,7 +1195,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                                     ? "Q8_HP2 direct"
                                     : "Q8_0 reprocessed";
                     ggml::gemmini::log::debug(layer,
-                        "[exsia] route im2p weight=%s dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
+                        "[activation] route im2p weight=%s dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
                         weight_route, args.I, args.J, args.K, args.sB, static_cast<int>(args.tiled_matmul_type));
                     ggml::gemmini::tiled_matmul_auto_im2p(&args);
                     run_baseline = false;

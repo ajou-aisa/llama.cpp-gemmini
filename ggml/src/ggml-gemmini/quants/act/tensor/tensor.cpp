@@ -12,6 +12,10 @@
 #include <gemmini/layer.hpp>
 #include <gemmini/log.hpp>
 
+#ifndef GGML_GEMMINI_EXSIA_SIGMA
+#define GGML_GEMMINI_EXSIA_SIGMA 2
+#endif
+
 namespace ggml::gemmini::quants::act::tensor
 {
 namespace
@@ -106,7 +110,7 @@ namespace
         return true;
     }
 
-    bool mark_outliers_3sigma(
+    bool mark_outliers_sigma(
         const float *src_data,
         const ggml_gemmini_args_t &args,
         const TensorStats &stats,
@@ -129,7 +133,7 @@ namespace
 
                 const double x = static_cast<double>(value);
                 const double z_score = stats.sigma == 0.0 ? 0.0 : (x - stats.mean) / stats.sigma;
-                if (std::fabs(z_score) > 3.0)
+                if (std::fabs(z_score) > GGML_GEMMINI_EXSIA_SIGMA)
                 {
                     mask.mark_outlier(row, col);
                     continue;
@@ -201,7 +205,7 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
     BitMask outliers;
     if (!outliers.resize(args.I, args.K))
         return false;
-    if (!mark_outliers_3sigma(src_data, args, stats, outliers, inlier_stats))
+    if (!mark_outliers_sigma(src_data, args, stats, outliers, inlier_stats))
         return false;
     const TensorStats &scale_stats = inlier_stats.count != 0 ? inlier_stats : stats;
 #else
