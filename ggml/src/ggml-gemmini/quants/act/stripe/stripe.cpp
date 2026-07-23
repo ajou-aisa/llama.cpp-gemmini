@@ -233,23 +233,89 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
         return false;
     }
 
-    size_t rows_per_stripe = 0;
-    size_t num_stripes = 0;
-    if (!resolve_rows_per_stripe(args, rows_per_stripe) ||
-        !resolve_num_stripes(args, rows_per_stripe, num_stripes)) {
+    const char *layer = ggml::gemmini::types::to_string(args.layer_type);
+
+    //cpu fallback이면 args.I, else determined by gemmini tile
+    size_t rows_per_stripe = args.I;
+    if (args.tile_I > 0 && !checked_mul_size(args.tile_I, DIM, rows_per_stripe)) {
         return false;
     }
+    if (rows_per_stripe == 0) {
+        return false;
+    }
+    const size_t num_stripes = (args.I - 1) / rows_per_stripe + 1;
 
     meta->scales.assign(num_stripes, 1.0f);
     meta->outliers.clear();
 
-    (void)clip_to_i8;
-    (void)compute_stripe_stats;
-    (void)mark_outliers_3sigma;
-    (void)quantize_to_i32;
-    (void)set_scale;
+#if ERROR_COMPENSATION
+    BitMask outliers;
+    if (!outliers.resize(args.I, args.K)) {
+        return false;
+    }
+    size_t residual_outlier_count = 0;
+#endif
 
-    return false;
+    for (size_t stripe = 0; stripe < num_stripes; stripe++)
+    {
+        const size_t row_start = stripe * rows_per_stripe;
+        const size_t row_end = std::min(row_start + rows_per_stripe, args.I);
+
+        StripeStats stripe_stats{};
+        if (!compute_stripe_stats(src_data, args, row_start, row_end, stripe_stats)) {
+            return false;
+        }
+
+#if ERROR_COMPENSATION
+        StripeStats inlier_stats{};
+        if (!mark_outliers_3sigma(src_data, args, row_start, row_end, stripe_stats, outliers, inlier_stats)) {
+            return false;
+        }
+        const StripeStats &scale_stats = inlier_stats.count != 0 ? inlier_stats : stripe_stats;
+#else
+        const StripeStats &scale_stats = stripe_stats;
+#endif
+
+        if (!set_scale(stripe, scale_stats, *meta)) {
+            return false;
+        }
+        const float scale = meta->scales[stripe];
+
+        for (size_t row = row_start; row < row_end; ++row) {
+            for (size_t col = 0; col < args.K; ++col) {
+                const size_t idx = row * args.K + col;
+                const int32_t q32 = quantize_to_i32(src_data[idx], scale);
+                const int8_t q8 = clip_to_i8(q32);
+                dst[idx] = q8;
+
+#if ERROR_COMPENSATION
+                const int32_t residual = q32 - static_cast<int32_t>(q8);
+                if (outliers.is_marked(row, col) && residual != 0) {
+                    meta->outliers.push_back({
+                        static_cast<int>(row),
+                        static_cast<int>(col),
+                        residual,
+                    });
+                    ++residual_outlier_count;
+                }
+#endif
+
+            }
+        }
+
+#if ERROR_COMPENSATION
+        ggml::gemmini::log::debug(layer,
+                                "[quantize_stripe] I=%zu K=%zu rows_per_stripe=%zu stripe_scales=%zu residual_outliers=%zu",
+                                args.I, args.K, rows_per_stripe, meta->scales.size(), residual_outlier_count);
+#else
+        ggml::gemmini::log::debug(layer,
+                                "[quantize_stripe] I=%zu K=%zu stripe_scales=%zu",
+                                args.I, args.K, meta->scales.size());
+#endif
+
+    }
+
+    return true;
 }
 
 bool dequantize_activation(
