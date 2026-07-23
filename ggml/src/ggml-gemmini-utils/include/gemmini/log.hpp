@@ -40,6 +40,12 @@
 #ifndef LOG_CYCLE
 #define LOG_CYCLE 1
 #endif
+#ifndef CYCLE_DETAIL
+#define CYCLE_DETAIL 0
+#endif
+#ifndef LOG_DETAIL
+#define LOG_DETAIL CYCLE_DETAIL
+#endif
 
 namespace ggml::gemmini::log
 {
