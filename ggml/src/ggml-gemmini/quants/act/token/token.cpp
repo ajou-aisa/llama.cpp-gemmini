@@ -195,7 +195,6 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
     BitMask outliers;
     if (!outliers.resize(args.I, args.K))
         return false;
-    size_t residual_outlier_count = 0;
 #endif
 
     for (size_t row = 0; row < args.I; ++row)
@@ -233,7 +232,6 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
                     static_cast<int>(col),
                     residual,
                 });
-                ++residual_outlier_count;
             }
 #endif
         }
