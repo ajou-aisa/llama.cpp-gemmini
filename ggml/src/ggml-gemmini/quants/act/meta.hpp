@@ -1,6 +1,7 @@
 #pragma once
 
 #include "exsia/types.hpp"
+#include "stripe/types.hpp"
 #include "tensor/types.hpp"
 #include "token/types.hpp"
 
@@ -13,7 +14,7 @@ namespace ggml::gemmini::quants::act
         void reset() {}
     };
 
-    using MetaStorage = std::variant<NoneMeta, exsia::Meta, tensor::Meta, token::Meta>;
+    using MetaStorage = std::variant<NoneMeta, exsia::Meta, stripe::Meta, tensor::Meta, token::Meta>;
 
     struct Meta
     {
