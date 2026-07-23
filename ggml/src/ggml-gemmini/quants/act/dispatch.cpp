@@ -1,5 +1,6 @@
 #include "dispatch.hpp"
 #include "exsia/exsia.hpp"
+#include "stripe/stripe.hpp"
 #include "tensor/tensor.hpp"
 #include "token/token.hpp"
 #include "../../ggml-gemmini-args.h"
@@ -73,6 +74,15 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
         }
         return true;
     }
+    case ggml::gemmini::config::ActivationQuantAlgo::STRIPE:
+    {
+        args.act_quant.storage().emplace<stripe::Meta>();
+        if (!stripe::quantize(src, args)) {
+            reset_quantize_failure(args);
+            return false;
+        }
+        return true;
+    }
     }
 }
 
@@ -95,6 +105,8 @@ bool dequantize_activation(float *dst,
             return false;
         }
         return token::dequantize_activation(dst, dst_row_stride, dst_col_stride, rows, cols, args);
+    case ggml::gemmini::config::ActivationQuantAlgo::STRIPE:
+        return stripe::dequantize_activation(dst, dst_row_stride, dst_col_stride, rows, cols, args);
     }
 }
 
@@ -108,6 +120,9 @@ std::vector<QactOutlier> outliers(const ggml_gemmini_args_t &args)
         return meta->outliers;
     }
     if (const auto *meta = std::get_if<token::Meta>(&storage)) {
+        return meta->outliers;
+    }
+    if (const auto *meta = std::get_if<stripe::Meta>(&storage)) {
         return meta->outliers;
     }
 
@@ -149,6 +164,33 @@ std::vector<float> activation_scales(const ggml_gemmini_args_t &args, size_t row
         const size_t count = std::min(row_count, meta->scales.size());
         for (size_t row = 0; row < count; ++row) {
             const float scale = meta->scales[row];
+            scales[row] = std::isfinite(scale) && scale > 0.0f ? scale : 1.0f;
+        }
+    }
+
+    if (const auto *meta = std::get_if<stripe::Meta>(&storage)) {
+        size_t rows_per_stripe = args.I;
+        if (args.tile_I > 0 && !checked_mul_size(args.tile_I, DIM, rows_per_stripe)) {
+            return scales;
+        }
+        if (rows_per_stripe == 0) {
+            return scales;
+        }
+
+        size_t stripe_round_input = 0;
+        if (args.I > std::numeric_limits<size_t>::max() - (rows_per_stripe - 1)) {
+            return scales;
+        }
+        stripe_round_input = args.I + rows_per_stripe - 1;
+        const size_t expected_stripes = stripe_round_input / rows_per_stripe;
+        if (meta->scales.size() != expected_stripes) {
+            GGML_ASSERT(false && "STRIPE activation scale cardinality must equal ceil(args.I / rows_per_stripe)");
+            return scales;
+        }
+
+        for (size_t row = 0; row < row_count; ++row) {
+            const size_t stripe_idx = row / rows_per_stripe;
+            const float scale = stripe_idx < meta->scales.size() ? meta->scales[stripe_idx] : 1.0f;
             scales[row] = std::isfinite(scale) && scale > 0.0f ? scale : 1.0f;
         }
     }
