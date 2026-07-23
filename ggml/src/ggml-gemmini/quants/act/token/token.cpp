@@ -105,7 +105,7 @@ namespace
         return true;
     }
 
-    bool mark_row_outliers_3sigma(
+    bool mark_outliers_3sigma(
         const float *src_data,
         const ggml_gemmini_args_t &args,
         size_t row,
@@ -205,7 +205,7 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
 
 #if ERROR_COMPENSATION
         RowStats inlier_stats;
-        if (!mark_row_outliers_3sigma(src_data, args, row, row_stats, outliers, inlier_stats))
+        if (!mark_outliers_3sigma(src_data, args, row, row_stats, outliers, inlier_stats))
             return false;
         const RowStats &scale_stats = inlier_stats.count != 0 ? inlier_stats : row_stats;
 #else
