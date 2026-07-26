@@ -39,6 +39,25 @@ struct tensor_quantization {
 
 static const char * const GEMMINI_Q8_H1_ARTIFACT_ENV = "LLAMA_GEMMINI_Q8_H1_ARTIFACT";
 
+static bool llama_validate_quantized_rows(enum ggml_type type, const void * data, size_t size, int64_t nrows, int64_t n_per_row) {
+    if (type != GGML_TYPE_Q8_CHANNEL) {
+        return ggml_validate_row_data(type, data, size);
+    }
+
+    const size_t row_size = ggml_row_size(type, n_per_row);
+    if (size != (size_t) nrows * row_size) {
+        return false;
+    }
+
+    const char * row = (const char *) data;
+    for (int64_t i = 0; i < nrows; ++i) {
+        if (!ggml_validate_row_data(type, row + (size_t) i * row_size, row_size)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void write_bytes(FILE * file, const void * data, size_t size) {
     if (size > 0 && fwrite(data, 1, size, file) != size) {
         throw std::runtime_error("failed to write quantized output");
@@ -271,7 +290,7 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
             const int64_t nx = tensor->ne[0];
             const int64_t qk_k = ggml_blck_size(new_type);
 
-            if (arch == LLM_ARCH_FALCON || nx % qk_k != 0) {
+            if ((arch == LLM_ARCH_FALCON && new_type != GGML_TYPE_Q8_CHANNEL) || nx % qk_k != 0) {
                 new_type = GGML_TYPE_Q8_0;
             }
             else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS ||
@@ -280,7 +299,7 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
                 new_type = GGML_TYPE_Q5_K;
             }
             else if (new_type != GGML_TYPE_Q8_0 && new_type != GGML_TYPE_Q8_H1 && new_type != GGML_TYPE_Q8_H2 &&
-                     new_type != GGML_TYPE_Q8_HP1 && new_type != GGML_TYPE_Q8_HP2) {
+                     new_type != GGML_TYPE_Q8_HP1 && new_type != GGML_TYPE_Q8_HP2 && new_type != GGML_TYPE_Q8_CHANNEL) {
                 new_type = GGML_TYPE_Q6_K;
             }
         }
@@ -536,7 +555,7 @@ static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * 
         if (is_q8_hp && new_size != expected_size) {
             throw std::runtime_error(format("%s quantization failed", ggml_type_name(new_type)));
         }
-        if (!ggml_validate_row_data(new_type, new_data, new_size)) {
+        if (!llama_validate_quantized_rows(new_type, new_data, new_size, nrows, n_per_row)) {
             throw std::runtime_error("quantized data validation failed");
         }
         return new_size;
@@ -567,7 +586,7 @@ static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * 
             // validate the quantized data
             const size_t row_size  = ggml_row_size(new_type, n_per_row);
             void * this_data = (char *) new_data + first_row * row_size;
-            if (!ggml_validate_row_data(new_type, this_data, this_size)) {
+            if (!llama_validate_quantized_rows(new_type, this_data, this_size, this_nrow, n_per_row)) {
                 std::unique_lock<std::mutex> lock(mutex);
                 valid = false;
                 break;
@@ -607,6 +626,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         case LLAMA_FTYPE_MOSTLY_Q8_H2: default_type = GGML_TYPE_Q8_H2; break;
         case LLAMA_FTYPE_MOSTLY_Q8_HP1: default_type = GGML_TYPE_Q8_HP1; break;
         case LLAMA_FTYPE_MOSTLY_Q8_HP2: default_type = GGML_TYPE_Q8_HP2; break;
+        case LLAMA_FTYPE_MOSTLY_Q8_CHANNEL: default_type = llama_quantize_default_type_for_ftype(ftype); break;
         case LLAMA_FTYPE_MOSTLY_F16:  default_type = GGML_TYPE_F16;  break;
         case LLAMA_FTYPE_MOSTLY_BF16: default_type = GGML_TYPE_BF16; break;
         case LLAMA_FTYPE_ALL_F32:     default_type = GGML_TYPE_F32;  break;
@@ -1100,8 +1120,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             LLAMA_LOG_INFO("converting to %s .. ", ggml_type_name(new_type));
             fflush(stdout);
 
-            if (work.size() < (size_t)nelements * 4) {
-                work.resize(nelements * 4); // upper bound on size
+            const size_t work_size = llama_quantize_work_size(new_type, nelements, n_per_row);
+            if (work.size() < work_size) {
+                work.resize(work_size); // upper bound on size
             }
             new_data = work.data();
 

@@ -431,6 +431,7 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                    src0->type != GGML_TYPE_Q8_H2  &&
                    src0->type != GGML_TYPE_Q8_HP1 &&
                    src0->type != GGML_TYPE_Q8_HP2 &&
+                   src0->type != GGML_TYPE_Q8_CHANNEL &&
                    (src1->type == GGML_TYPE_F32 || src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type);
         case GGML_OP_SOFT_MAX_BACK: {
             if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {

@@ -227,6 +227,22 @@ void quantize_row_q8_0_ref(const float * GGML_RESTRICT x, block_q8_0 * GGML_REST
     }
 }
 
+void quantize_row_q8_channel_ref(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    float amax = 0.0f;
+    for (int64_t i = 0; i < k; ++i) {
+        amax = MAX(amax, fabsf(x[i]));
+    }
+
+    const float scale = amax / 127.0f;
+    const float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+    int8_t * q = (int8_t *) y + sizeof(float);
+    memcpy(y, &scale, sizeof(scale));
+    for (int64_t i = 0; i < k; ++i) {
+        const int value = (int) roundf(x[i] * inv_scale);
+        q[i] = (int8_t) MIN(127, MAX(-127, value));
+    }
+}
+
 void quantize_row_q8_h1_ref(const float * GGML_RESTRICT x, block_q8_h1 * GGML_RESTRICT y, int64_t k) {
     assert(k % QK8_0 == 0);
 
@@ -451,6 +467,15 @@ void dequantize_row_q8_hp2(const block_q8_hp2 * GGML_RESTRICT x, float * GGML_RE
         for (int j = 0; j < QK8_HP; ++j) {
             y[i*QK8_HP + j] = block->qs[j] * scale;
         }
+    }
+}
+
+void dequantize_row_q8_channel(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    float scale;
+    memcpy(&scale, x, sizeof(scale));
+    const int8_t * q = (const int8_t *) x + sizeof(float);
+    for (int64_t i = 0; i < k; ++i) {
+        y[i] = q[i] * scale;
     }
 }
 
@@ -2282,6 +2307,30 @@ size_t quantize_q8_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     (void)quant_weights; // not used
     const size_t row_size = ggml_row_size(GGML_TYPE_Q8_0, n_per_row);
     quantize_row_q8_0_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * row_size;
+}
+
+size_t quantize_q8_channel(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void) quant_weights;
+    if (src == NULL || dst == NULL || nrow <= 0 || n_per_row <= 0) {
+        return 0;
+    }
+    for (int64_t row = 0; row < nrow; ++row) {
+        for (int64_t i = 0; i < n_per_row; ++i) {
+            if (!isfinite(src[row*n_per_row + i])) {
+                fprintf(stderr, "%s: non-finite Q8_CHANNEL source at row %lld index %lld\n",
+                        __func__, (long long) row, (long long) i);
+                return 0;
+            }
+        }
+    }
+
+    const size_t row_size = ggml_row_size(GGML_TYPE_Q8_CHANNEL, n_per_row);
+    char * qrow = (char *) dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_q8_channel_ref(src + row*n_per_row, qrow, n_per_row);
+        qrow += row_size;
+    }
     return nrow * row_size;
 }
 
@@ -5572,6 +5621,28 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 // Ponytail: same as Q8_HP1 — see comment above.
                 (void) data;
                 (void) nb;
+            } break;
+        case GGML_TYPE_Q8_CHANNEL:
+            {
+                if (data == NULL || nbytes < sizeof(float) + 1) {
+                    fprintf(stderr, "%s: invalid Q8_CHANNEL row size %zu (expected at least %zu bytes)\n", __func__, nbytes, sizeof(float) + 1);
+                    return false;
+                }
+
+                float scale;
+                memcpy(&scale, data, sizeof(scale));
+                if (!isfinite(scale) || signbit(scale)) {
+                    fprintf(stderr, "%s: invalid Q8_CHANNEL row scale\n", __func__);
+                    return false;
+                }
+
+                const int8_t * q = (const int8_t *) data + sizeof(float);
+                for (size_t i = 0; i < nbytes - sizeof(float); ++i) {
+                    if (q[i] < -127 || q[i] > 127 || (scale == 0.0f && q[i] != 0)) {
+                        fprintf(stderr, "%s: invalid Q8_CHANNEL row payload at index %zu\n", __func__, i);
+                        return false;
+                    }
+                }
             } break;
         case GGML_TYPE_Q2_K:
             {

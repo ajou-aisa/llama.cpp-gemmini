@@ -12,6 +12,9 @@ import numpy as np
 
 
 def quant_shape_to_byte_shape(shape: Sequence[int], quant_type: GGMLQuantizationType) -> tuple[int, ...]:
+    if quant_type == GGMLQuantizationType.Q8_CHANNEL:
+        return (*shape[:-1], shape[-1] + 4)
+
     block_size, type_size = GGML_QUANT_SIZES[quant_type]
     if shape[-1] % block_size != 0:
         raise ValueError(f"Quantized tensor row size ({shape[-1]}) is not a multiple of {quant_type.name} block size ({block_size})")
@@ -19,6 +22,11 @@ def quant_shape_to_byte_shape(shape: Sequence[int], quant_type: GGMLQuantization
 
 
 def quant_shape_from_byte_shape(shape: Sequence[int], quant_type: GGMLQuantizationType) -> tuple[int, ...]:
+    if quant_type == GGMLQuantizationType.Q8_CHANNEL:
+        if shape[-1] < 4:
+            raise ValueError(f"Quantized tensor bytes per row ({shape[-1]}) are missing the Q8_CHANNEL row header")
+        return (*shape[:-1], shape[-1] - 4)
+
     block_size, type_size = GGML_QUANT_SIZES[quant_type]
     if shape[-1] % type_size != 0:
         raise ValueError(f"Quantized tensor bytes per row ({shape[-1]}) is not a multiple of {quant_type.name} type size ({type_size})")

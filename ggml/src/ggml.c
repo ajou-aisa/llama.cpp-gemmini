@@ -850,6 +850,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q8_hp2,
         .from_float_ref           = quantize_row_q8_hp2_ref_ggml,
     },
+    [GGML_TYPE_Q8_CHANNEL] = {
+        .type_name                = "q8_channel",
+        .blck_size                = 1,
+        .type_size                = 1,
+        .is_quantized             = true,
+        .to_float                 = NULL,
+        .from_float_ref           = NULL,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
@@ -1158,7 +1166,13 @@ size_t ggml_nbytes(const struct ggml_tensor * tensor) {
 
     size_t nbytes;
     const size_t blck_size = ggml_blck_size(tensor->type);
-    if (blck_size == 1) {
+    if (tensor->type == GGML_TYPE_Q8_CHANNEL) {
+        nbytes = ggml_row_size(tensor->type, tensor->ne[0]);
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+            nbytes += (tensor->ne[i] - 1)*tensor->nb[i];
+        }
+    }
+    else if (blck_size == 1) {
         nbytes = ggml_type_size(tensor->type);
         for (int i = 0; i < GGML_MAX_DIMS; ++i) {
             nbytes += (tensor->ne[i] - 1)*tensor->nb[i];
@@ -1187,6 +1201,10 @@ size_t ggml_type_size(enum ggml_type type) {
 }
 
 size_t ggml_row_size(enum ggml_type type, int64_t ne) {
+    if (type == GGML_TYPE_Q8_CHANNEL) {
+        return sizeof(float) + ne;
+    }
+
     assert(ne % ggml_blck_size(type) == 0);
     return ggml_type_size(type)*ne/ggml_blck_size(type);
 }
@@ -1635,7 +1653,9 @@ static struct ggml_tensor * ggml_new_tensor_impl(
     }
 
     result->nb[0] = ggml_type_size(type);
-    result->nb[1] = result->nb[0]*(result->ne[0]/ggml_blck_size(type));
+    result->nb[1] = type == GGML_TYPE_Q8_CHANNEL ?
+        ggml_row_size(type, result->ne[0]) :
+        result->nb[0]*(result->ne[0]/ggml_blck_size(type));
     for (int i = 2; i < GGML_MAX_DIMS; i++) {
         result->nb[i] = result->nb[i - 1]*result->ne[i - 1];
     }
@@ -6470,6 +6490,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_Q5_0:    result = quantize_q5_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_1:    result = quantize_q5_1(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q8_0:    result = quantize_q8_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q8_CHANNEL: result = quantize_q8_channel(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q8_H1:   result = quantize_q8_h1(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q8_H2:   result = quantize_q8_h2(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q8_HP1:  result = quantize_q8_hp1(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
@@ -6512,6 +6533,9 @@ size_t ggml_quantize_chunk(
             assert(false);
     }
 
+    if (type == GGML_TYPE_Q8_CHANNEL && result == 0) {
+        return 0;
+    }
     GGML_ASSERT(result == nrows * row_size);
 
     return result;

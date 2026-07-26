@@ -22,6 +22,7 @@ enum llama_fver {
 };
 
 const char * llama_file_version_name(llama_fver version);
+std::string llama_model_ftype_name(llama_ftype ftype);
 
 struct llama_model_loader {
     // Holds information on a model weight

@@ -4,6 +4,16 @@ from .gguf_reader import *
 from .gguf_writer import *
 from .quants import *
 from .tensor_mapping import *
-from .vocab import *
 from .utility import *
-from .metadata import *
+
+try:
+    from .vocab import *
+except ModuleNotFoundError as error:
+    if error.name != "sentencepiece":
+        raise
+
+try:
+    from .metadata import *
+except ModuleNotFoundError as error:
+    if error.name != "yaml":
+        raise

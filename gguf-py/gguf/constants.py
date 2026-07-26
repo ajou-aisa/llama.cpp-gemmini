@@ -2086,6 +2086,8 @@ class GGMLQuantizationType(IntEnum):
     TQ2_0   = 35
     Q8_H1   = 39
     Q8_H2   = 40
+    Q8_CHANNEL = 43
+    COUNT   = 44
 
 
 class ExpertGatingFuncType(IntEnum):
