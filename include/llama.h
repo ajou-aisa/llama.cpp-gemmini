@@ -192,6 +192,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q8_H2         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q8_HP1        = 40,
         LLAMA_FTYPE_MOSTLY_Q8_HP2        = 41,
+        LLAMA_FTYPE_MOSTLY_Q8_CHANNEL    = 42,
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };

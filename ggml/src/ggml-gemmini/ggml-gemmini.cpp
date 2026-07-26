@@ -5,6 +5,7 @@
 #include <cmath>
 #include <vector>
 #include <string>
+#include <new>
 
 #include <limits>
 
@@ -125,6 +126,91 @@ namespace
         return true;
     }
 
+    bool gemmini_q8_channel_weight_contract(const ggml_tensor * weight)
+    {
+        if (weight == nullptr || weight->type != GGML_TYPE_Q8_CHANNEL || weight->data == nullptr ||
+            weight->view_src != nullptr || weight->view_offs != 0 ||
+            weight->ne[0] <= 0 || weight->ne[1] <= 0 || weight->ne[2] != 1 || weight->ne[3] != 1) {
+            return false;
+        }
+
+        if (static_cast<uintmax_t>(weight->ne[0]) >
+            static_cast<uintmax_t>(std::numeric_limits<size_t>::max()) - sizeof(float)) {
+            return false;
+        }
+
+        const size_t dim_k = static_cast<size_t>(weight->ne[0]);
+        const size_t row_size = ggml_row_size(GGML_TYPE_Q8_CHANNEL, weight->ne[0]);
+        const size_t row_count = static_cast<size_t>(weight->ne[1]);
+        size_t storage_bytes = 0;
+        if (!gemmini_checked_mul(row_size, row_count, storage_bytes) ||
+            row_size != sizeof(float) + dim_k ||
+            weight->nb[0] != 1 || weight->nb[1] != row_size ||
+            weight->nb[2] != storage_bytes || weight->nb[3] != storage_bytes ||
+            ggml_nbytes(weight) != storage_bytes) {
+            return false;
+        }
+
+        const auto * row_base = static_cast<const uint8_t *>(weight->data);
+        for (size_t row = 0; row < row_count; ++row) {
+            float scale = 0.0f;
+            std::memcpy(&scale, row_base + row * row_size, sizeof(scale));
+            if (!std::isfinite(scale)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    enum class gemmini_q8_channel_int_route_t : uint8_t {
+        unsupported,
+        cpu_direct_read,
+        hw_dense_sidecar,
+    };
+
+    static gemmini_q8_channel_int_route_t gemmini_q8_channel_int_route_for(
+        const ggml_tensor * weight)
+    {
+        if (!gemmini_q8_channel_weight_contract(weight)) {
+            return gemmini_q8_channel_int_route_t::unsupported;
+        }
+
+        if constexpr (
+            ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TOKEN &&
+            TRANSPOSE_B == 0
+        ) {
+            return gemmini_q8_channel_int_route_t::unsupported;
+        }
+
+        if constexpr (OPTION == CPU) {
+            if constexpr (
+                ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TENSOR ||
+                ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TOKEN ||
+                ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::STRIPE
+            ) {
+                return gemmini_q8_channel_int_route_t::cpu_direct_read;
+            }
+        } else if constexpr (OPTION == OS || OPTION == WS) {
+            if constexpr (
+                ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA ||
+                ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TENSOR ||
+                ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TOKEN ||
+                ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::STRIPE
+            ) {
+                return gemmini_q8_channel_int_route_t::hw_dense_sidecar;
+            }
+        }
+
+        return gemmini_q8_channel_int_route_t::unsupported;
+    }
+
+    static bool gemmini_q8_channel_int_route_supported(const ggml_tensor * weight)
+    {
+        return gemmini_q8_channel_int_route_for(weight) !=
+            gemmini_q8_channel_int_route_t::unsupported;
+    }
+
     bool gemmini_shared_weight_contract(const ggml_tensor * op)
     {
         if (op == nullptr || op->src[0] == nullptr || op->src[1] == nullptr)
@@ -135,7 +221,8 @@ namespace
         if (weight->ne[2] != 1 || weight->ne[3] != 1 ||
             weight->ne[0] != activation->ne[0] || op->ne[0] != weight->ne[1] ||
             ggml_nrows(activation) != ggml_nrows(op) ||
-            !ggml_is_contiguous(weight) || !ggml_is_contiguous(activation) ||
+            !(ggml_is_contiguous(weight) || gemmini_q8_channel_weight_contract(weight)) ||
+            !ggml_is_contiguous(activation) ||
             !ggml_is_contiguous(op)) {
             return false;
         }
@@ -774,6 +861,17 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                                          (const float *)src1->data, src0_f32.data(), NULL, (float *)dst->data,
                                          K, K, 0, J);
             return;
+        } else if (src0->type == GGML_TYPE_Q8_CHANNEL) {
+            std::vector<float> src0_f32(jk_count);
+            const size_t row_size = ggml_row_size(GGML_TYPE_Q8_CHANNEL, src0->ne[0]);
+            const char * row = static_cast<const char *>(src0->data);
+            for (size_t j = 0; j < J; ++j) {
+                dequantize_row_q8_channel(row + j * row_size, src0_f32.data() + j * K, K);
+            }
+            ggml::gemmini::matmul_cpu_fp(false, true, I, J, K,
+                                         (const float *)src1->data, src0_f32.data(), NULL, (float *)dst->data,
+                                         K, K, 0, J);
+            return;
         } else if (src0->type == GGML_TYPE_Q8_H1) {
             std::vector<float> src0_f32(jk_count);
             dequantize_row_q8_h1((const block_q8_h1 *)src0->data, src0_f32.data(), jk_count);
@@ -809,6 +907,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     }
 
     ggml_gemmini_args_t args; // DEC과 gemmini 호출을 위한 args 
+    std::vector<int8_t> q8_channel_dense;
+    std::vector<float> q8_channel_scales;
 
     // set args
     start = ggml::gemmini::cycle::read();
@@ -895,6 +995,14 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         } else if (src0->type == GGML_TYPE_Q8_0) {
             src0_f32.resize(jk_count);
             dequantize_row_q8_0(reinterpret_cast<const block_q8_0 *>(src0->data), src0_f32.data(), jk_count);
+            src0_f = src0_f32.data();
+        } else if (src0->type == GGML_TYPE_Q8_CHANNEL) {
+            src0_f32.resize(jk_count);
+            const size_t row_size = ggml_row_size(GGML_TYPE_Q8_CHANNEL, src0->ne[0]);
+            const char * row = static_cast<const char *>(src0->data);
+            for (size_t j = 0; j < J; ++j) {
+                dequantize_row_q8_channel(row + j * row_size, src0_f32.data() + j * K, K);
+            }
             src0_f = src0_f32.data();
         } else if (src0->type == GGML_TYPE_Q8_H1) {
             src0_f32.resize(jk_count);
@@ -1077,6 +1185,101 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             ggml::gemmini::log::debug(layer,
                 "[Q8_HP2 direct] blocks=%p blocks_per_row=%zu logical_rows=%zu",
                 (const void *)args.q8_hp2_blocks, args.q8_hp2_blocks_per_row, logical_rows);
+        } else if (src0->type == GGML_TYPE_Q8_CHANNEL) {
+            const size_t row_size = ggml_row_size(GGML_TYPE_Q8_CHANNEL, src0->ne[0]);
+            const auto *row_base = static_cast<const uint8_t *>(src0->data);
+            if (row_base == nullptr) {
+                GGML_ABORT("Gemmini Q8_CHANNEL row base is null");
+            }
+            const auto q8_channel_route = gemmini_q8_channel_int_route_for(src0);
+            if (q8_channel_route == gemmini_q8_channel_int_route_t::unsupported) {
+                GGML_ABORT("Gemmini Q8_CHANNEL route is unsupported for this build/configuration");
+            }
+
+            if (q8_channel_route == gemmini_q8_channel_int_route_t::cpu_direct_read) {
+                args.tiled_matmul_type = CPU;
+                args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_channel;
+                args.B = const_cast<elem_t *>(reinterpret_cast<const elem_t *>(row_base + sizeof(float)));
+                args.B_blocks = nullptr;
+                args.B_scales = nullptr;
+                args.weight_channel_scales = nullptr;
+                args.weight_channel_scale_count = 0;
+                args.weight_i8_scale_active = false;
+                args.weight_scale = 1.0f;
+                args.c_b = nullptr;
+                args.s_rf = nullptr;
+                args.R = nullptr;
+                args.blocks_per_row = 0;
+                args.blocks_K = 0;
+                args.blocks_J = logical_rows;
+                args.blocks_I = logical_rows;
+                args.block_size_k = 1;
+                args.sB = row_size;
+                args.stripe_J = 0;
+                args.s_rf_stripe = nullptr;
+                args.R_stripe = nullptr;
+                args.q8_channel_row_base = row_base;
+                args.q8_channel_row_stride = row_size;
+                args.q8_channel_row_count = logical_rows;
+                if (!args.has_q8_channel_direct_read_contract()) {
+                    GGML_ABORT("Gemmini Q8_CHANNEL direct-read contract failed");
+                }
+
+                ggml::gemmini::log::debug(layer,
+                    "[Q8_CHANNEL direct-read] row_base=%p payload=%p row_stride=%zu logical_rows=%zu",
+                    (const void *)args.q8_channel_row_base, (const void *)args.B, args.q8_channel_row_stride, logical_rows);
+            } else if (q8_channel_route == gemmini_q8_channel_int_route_t::hw_dense_sidecar) {
+                size_t dense_elements = 0;
+                if (!gemmini_checked_mul(J, K, dense_elements)) {
+                    GGML_ABORT("Gemmini Q8_CHANNEL dense repack size overflow");
+                }
+
+                try {
+                    q8_channel_dense.resize(dense_elements);
+                    q8_channel_scales.resize(J);
+                } catch (const std::bad_alloc &) {
+                    GGML_ABORT("Gemmini Q8_CHANNEL dense repack allocation failed");
+                }
+
+                for (size_t j = 0; j < J; ++j) {
+                    const uint8_t * source_row = row_base + j * row_size;
+                    std::memcpy(&q8_channel_scales[j], source_row, sizeof(float));
+                    std::memcpy(q8_channel_dense.data() + j * K, source_row + sizeof(float), K);
+                }
+
+                args.tiled_matmul_type = OPTION;
+                args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar;
+                args.B = reinterpret_cast<elem_t *>(q8_channel_dense.data());
+                args.B_blocks = nullptr;
+                args.B_scales = nullptr;
+                args.weight_channel_scales = q8_channel_scales.data();
+                args.weight_channel_scale_count = J;
+                args.weight_i8_scale_active = false;
+                args.weight_scale = 1.0f;
+                args.c_b = nullptr;
+                args.s_rf = nullptr;
+                args.R = nullptr;
+                args.blocks_per_row = 0;
+                args.blocks_K = 0;
+                args.blocks_J = logical_rows;
+                args.blocks_I = logical_rows;
+                args.block_size_k = 1;
+                args.sB = K;
+                args.stripe_J = 0;
+                args.s_rf_stripe = nullptr;
+                args.R_stripe = nullptr;
+                args.q8_channel_row_base = nullptr;
+                args.q8_channel_row_stride = 0;
+                args.q8_channel_row_count = 0;
+                if (!args.has_q8_channel_dense_sidecar_contract()) {
+                    GGML_ABORT("Gemmini Q8_CHANNEL dense-sidecar contract failed");
+                }
+
+                ggml::gemmini::log::debug(layer,
+                    "[Q8_CHANNEL dense-sidecar] dense=%p scales=%p stride=%zu scale_count=%zu logical_rows=%zu option=%d",
+                    (const void *)args.B, (const void *)args.weight_channel_scales, args.sB,
+                    args.weight_channel_scale_count, logical_rows, static_cast<int>(args.tiled_matmul_type));
+            }
         } else if (src0->type == GGML_TYPE_Q8_0) {
             start = ggml::gemmini::cycle::read();
             size_t q8_0_reprocess_rows = logical_rows;
@@ -1167,11 +1370,16 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                     ? ggml::gemmini::baseline_activation_quant_t::EXSIA
                     : ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TENSOR
                         ? ggml::gemmini::baseline_activation_quant_t::TENSOR
-                        : ggml::gemmini::baseline_activation_quant_t::TOKEN;
+                        : ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::STRIPE
+                            ? ggml::gemmini::baseline_activation_quant_t::BLOCK
+                            : ggml::gemmini::baseline_activation_quant_t::TOKEN;
             constexpr auto baseline_weight_quant =
                 ggml::gemmini::config::CURRENT_WEIGHT_QUANT == ggml::gemmini::config::WeightQuantAlgo::TENSOR
                     ? ggml::gemmini::baseline_weight_quant_t::TENSOR
                     : ggml::gemmini::baseline_weight_quant_t::FLOAT;
+            const auto selected_baseline_weight_quant = src0->type == GGML_TYPE_Q8_CHANNEL
+                ? ggml::gemmini::baseline_weight_quant_t::CHANNEL
+                : baseline_weight_quant;
             bool run_baseline = true;
 
             if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA ||
@@ -1184,6 +1392,17 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                         "[baseline] route activation=exsia weight=tensor weight_scale=%.9f dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
                         static_cast<double>(args.weight_scale), args.I, args.J, args.K, args.sB,
                         static_cast<int>(args.tiled_matmul_type));
+                } else if (args.has_q8_channel_direct_read_contract()) {
+                    if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT != ggml::gemmini::config::ActivationQuantAlgo::STRIPE) {
+                        GGML_ABORT("Gemmini Q8_CHANNEL direct-read is wired only for baseline TENSOR/TOKEN/STRIPE activation routes");
+                    }
+                } else if (args.has_q8_channel_dense_sidecar_contract()) {
+                    ggml::gemmini::log::debug(layer,
+                        "[baseline] route activation=%s weight=q8_channel_dense_sidecar dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
+                        GGML_GEMMINI_ACTIVATION_QUANT_NAME, args.I, args.J, args.K, args.sB,
+                        static_cast<int>(args.tiled_matmul_type));
+                } else if (src0->type == GGML_TYPE_Q8_CHANNEL) {
+                    GGML_ABORT("Gemmini Q8_CHANNEL activation route contract failed");
                 } else {
                     const char *weight_route = src0->type == GGML_TYPE_Q8_H1
                         ? "Q8_H1 direct"
@@ -1193,7 +1412,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                                 ? "Q8_HP1 direct"
                                 : src0->type == GGML_TYPE_Q8_HP2
                                     ? "Q8_HP2 direct"
-                                    : "Q8_0 reprocessed";
+                                    : src0->type == GGML_TYPE_Q8_CHANNEL
+                                        ? "Q8_CHANNEL direct-read"
+                                        : "Q8_0 reprocessed";
                     ggml::gemmini::log::debug(layer,
                         "[activation] route im2p weight=%s dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
                         weight_route, args.I, args.J, args.K, args.sB, static_cast<int>(args.tiled_matmul_type));
@@ -1203,8 +1424,15 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             }
 
                 if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TOKEN) {
-                if (!args.weight_i8_scale_active) {
-                    GGML_ABORT("Gemmini TOKEN activation requires dense tensor weights; Q8_0/Q8_H1/Q8_H2/Q8_HP1/Q8_HP2 are unsupported");
+                const bool q8_channel_route =
+                    args.has_q8_channel_direct_read_contract() ||
+                    args.has_q8_channel_dense_sidecar_contract();
+                if (src0->type == GGML_TYPE_Q8_CHANNEL &&
+                    (!args.transpose_B || !q8_channel_route)) {
+                    GGML_ABORT("Gemmini TOKEN activation requires a transposed valid Q8_CHANNEL route");
+                }
+                if (!args.weight_i8_scale_active && !q8_channel_route) {
+                    GGML_ABORT("Gemmini TOKEN activation requires dense tensor or a valid Q8_CHANNEL route; Q8_0/Q8_H1/Q8_H2/Q8_HP1/Q8_HP2 are unsupported");
                 }
             }
 
@@ -1212,7 +1440,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 ggml::gemmini::tiled_matmul_auto_baseline(
                     &args,
                     baseline_activation_quant,
-                    baseline_weight_quant);
+                    selected_baseline_weight_quant);
             }
     }
     // dst에는 gemmini 커널에서 dequantize한 결과가 들어옴 
@@ -1521,6 +1749,8 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
                     ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
                     ggml::gemmini::config::ActivationQuantAlgo::TOKEN
                 ) {
+                    if (a->type == GGML_TYPE_Q8_CHANNEL)
+                        return gemmini_q8_channel_int_route_supported(a);
                     return a->type == GGML_TYPE_I8 &&
                            gemmini_i8_supported_scale_data(a, TRANSPOSE_B != 0) != nullptr;
                 }
@@ -1528,6 +1758,9 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
                 if (a->type == GGML_TYPE_I8) {
                     return gemmini_i8_supported_scale_data(a, TRANSPOSE_B != 0) != nullptr;
                 }
+
+                if (a->type == GGML_TYPE_Q8_CHANNEL)
+                    return gemmini_q8_channel_int_route_supported(a);
 
                 if (a->type == GGML_TYPE_Q8_HP1) {
                     ggml_gemmini_args_t args;
@@ -1655,6 +1888,10 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
                     ggml_gemmini_args_t args;
                     args.tiled_matmul_type = CPU;
                     return a->data != nullptr && gemmini_set_q8_h2_weight_args(a, args);
+                }
+
+                if (a->type == GGML_TYPE_Q8_CHANNEL) {
+                    return a->data != nullptr && gemmini_q8_channel_weight_contract(a);
                 }
 
                 if constexpr (ggml::gemmini::config::DEQUANT_FP_TEST) {

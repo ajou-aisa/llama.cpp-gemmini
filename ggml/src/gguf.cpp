@@ -566,7 +566,9 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
 
             // calculate byte offsets given the tensor shape and type
             info.t.nb[0] = type_size;
-            info.t.nb[1] = info.t.nb[0]*(info.t.ne[0]/blck_size);
+            info.t.nb[1] = info.t.type == GGML_TYPE_Q8_CHANNEL ?
+                ggml_row_size(info.t.type, info.t.ne[0]) :
+                info.t.nb[0]*(info.t.ne[0]/blck_size);
             for (int j = 2; j < GGML_MAX_DIMS; ++j) {
                 info.t.nb[j] = info.t.nb[j - 1]*info.t.ne[j - 1];
             }
@@ -1117,7 +1119,9 @@ void gguf_set_tensor_type(struct gguf_context * ctx, const char * name, enum ggm
     GGML_ASSERT(tensor->ne[0] % blck_size == 0 && "tensor row size not divisible by block size of new type");
 
     tensor->nb[0] = type_size;
-    tensor->nb[1] = tensor->nb[0]*(tensor->ne[0]/blck_size);
+    tensor->nb[1] = type == GGML_TYPE_Q8_CHANNEL ?
+        ggml_row_size(type, tensor->ne[0]) :
+        tensor->nb[0]*(tensor->ne[0]/blck_size);
     for (int i = 2; i < GGML_MAX_DIMS; i++) {
         tensor->nb[i] = tensor->nb[i - 1]*tensor->ne[i - 1];
     }

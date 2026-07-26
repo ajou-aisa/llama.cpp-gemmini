@@ -29,7 +29,7 @@ from .constants import (
     ExpertGatingFuncType,
 )
 
-from .quants import quant_shape_from_byte_shape
+from .quants import quant_shape_from_byte_shape, quant_shape_to_byte_shape
 
 logger = logging.getLogger(__name__)
 
@@ -352,6 +352,10 @@ class GGUFWriter:
             dtype = raw_dtype
             if tensor_dtype == np.uint8:
                 tensor_shape = quant_shape_from_byte_shape(tensor_shape, raw_dtype)
+                if raw_dtype == GGMLQuantizationType.Q8_CHANNEL:
+                    expected_nbytes = int(np.prod(quant_shape_to_byte_shape(tensor_shape, raw_dtype)))
+                    if tensor_nbytes != expected_nbytes:
+                        raise ValueError(f"Q8_CHANNEL tensor has {tensor_nbytes} bytes, expected {expected_nbytes}")
 
         # make sure there is at least one tensor before splitting
         if len(self.tensors[-1]) > 0:

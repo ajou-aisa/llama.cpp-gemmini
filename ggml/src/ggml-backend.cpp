@@ -1023,7 +1023,7 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                         if (src == NULL) {
                             continue;
                         }
-                        if ((tensor_backend_id(src) != -1 || tensor_backend_id(src->view_src) != -1) && ggml_backend_sched_buffer_supported(sched, src, b)) {
+                        if ((tensor_backend_id(src) != -1 || (src->view_src != NULL && tensor_backend_id(src->view_src) != -1)) && ggml_backend_sched_buffer_supported(sched, src, b)) {
                             n_supported++;
                         }
                     }

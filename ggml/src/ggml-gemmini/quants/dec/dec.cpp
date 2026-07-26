@@ -9,7 +9,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <limits>
 #include <utility>
 #include <vector>
 
@@ -63,196 +62,6 @@ namespace ggml::gemmini::quants::dec { namespace
         return scratch;
     }
 
-    struct WeightScaleInfo
-    {
-        const float *data = nullptr;
-        size_t rows = 0;
-        size_t cols = 0;
-        size_t block_size = 0;
-        float scalar = 1.0f;
-        bool scalar_mode = false;
-        bool supported = true;
-    };
-
-    WeightScaleInfo build_weight_scale_info(const ggml_gemmini_args_t &args)
-    {
-        WeightScaleInfo result{};
-        if (args.weight_i8_scale_active)
-        {
-            if (!args.B)
-                return result;
-
-            result.rows = args.J;
-            result.cols = 1;
-            result.block_size = 1;
-            result.scalar = args.weight_scale;
-            result.scalar_mode = true;
-            return result;
-        }
-
-        if (is_q8_hp1_args(args))
-        {
-            static thread_local std::vector<float> weight_scales;
-            const size_t rows = args.J;
-            const size_t cols = args.q8_hp1_blocks_per_row;
-            if (rows == 0 || cols == 0 || rows > std::numeric_limits<size_t>::max() / cols)
-                return result;
-
-            weight_scales.resize(rows * cols);
-            for (size_t row = 0; row < rows; ++row)
-            {
-                for (size_t block = 0; block < cols; ++block)
-                {
-                    const block_q8_hp1 * qblock = args.q8_hp1_block(row, block);
-                    if (qblock == nullptr)
-                    {
-                        result.supported = false;
-                        return result;
-                    }
-                    const int16_t m = qblock->m;
-                    const float channel_scale = qblock->channel_scale;
-                    weight_scales[row * cols + block] =
-                        m == INT16_MIN ? 0.0f : gemmini_ldexp_fast_pos(channel_scale, static_cast<int>(m));
-                }
-            }
-
-            result.data = weight_scales.data();
-            result.rows = rows;
-            result.cols = cols;
-            result.block_size = QK8_HP;
-            return result;
-        }
-
-        if (is_q8_hp2_args(args))
-        {
-            static thread_local std::vector<float> hp2_weight_scales;
-            const size_t rows = args.J;
-            const size_t cols = args.q8_hp2_blocks_per_row;
-            if (rows == 0 || cols == 0 || rows > std::numeric_limits<size_t>::max() / cols)
-                return result;
-
-            hp2_weight_scales.resize(rows * cols);
-            for (size_t row = 0; row < rows; ++row)
-            {
-                for (size_t block = 0; block < cols; ++block)
-                {
-                    const block_q8_hp2 * qblock = args.q8_hp2_block(row, block);
-                    if (qblock == nullptr)
-                    {
-                        result.supported = false;
-                        return result;
-                    }
-                    const int16_t m = qblock->m;
-                    const float channel_scale = qblock->channel_scale;
-                    hp2_weight_scales[row * cols + block] =
-                        m == INT16_MIN ? 0.0f : gemmini_ldexp_fast_pos(channel_scale, static_cast<int>(m));
-                }
-            }
-
-            result.data = hp2_weight_scales.data();
-            result.rows = rows;
-            result.cols = cols;
-            result.block_size = QK8_HP;
-            return result;
-        }
-
-        if (is_q8_h2_args(args))
-        {
-            static thread_local std::vector<float> weight_scales;
-            const size_t rows = args.J;
-            const size_t cols = args.q8_h2_blocks_per_row;
-            if (rows == 0 || cols == 0 || rows > std::numeric_limits<size_t>::max() / cols)
-                return result;
-
-            weight_scales.resize(rows * cols);
-            for (size_t row = 0; row < rows; ++row)
-            {
-                for (size_t block = 0; block < cols; ++block)
-                {
-                    const block_q8_h2 * qblock = args.q8_h2_block(row, block);
-                    if (qblock == nullptr)
-                    {
-                        result.supported = false;
-                        return result;
-                    }
-                    weight_scales[row * cols + block] = qblock->channel_scale * qblock->m / 255.0f;
-                }
-            }
-
-            result.data = weight_scales.data();
-            result.rows = rows;
-            result.cols = cols;
-            result.block_size = QK8_H2;
-            return result;
-        }
-
-        if (is_q8_h1_weight_args(args))
-        {
-            static thread_local std::vector<float> weight_scales;
-            const size_t rows = args.blocks_J ? args.blocks_J : args.J;
-            const size_t cols = args.blocks_per_row;
-            const size_t block_size = 32;
-            const bool stripe_mode = args.stripe_J > 1;
-
-            if (rows == 0 || cols == 0 ||
-                (args.block_size_k != 0 && args.block_size_k != block_size) ||
-                rows > std::numeric_limits<size_t>::max() / cols)
-            {
-                return result;
-            }
-
-            const bool native_h1 = is_q8_h1_args(args);
-            if (!native_h1 && stripe_mode && (!args.s_rf_stripe || !args.R_stripe))
-            {
-                result.supported = false;
-                return result;
-            }
-
-            if (!native_h1 && !stripe_mode && (!args.s_rf || !args.R))
-                return result;
-
-            weight_scales.resize(rows * cols);
-            for (size_t j = 0; j < rows; ++j)
-            {
-                const size_t stripe_idx = stripe_mode ? (j / args.stripe_J) : 0;
-
-                for (size_t blk = 0; blk < cols; ++blk)
-                {
-                    const size_t idx = j * cols + blk;
-                    const block_q8_h1 *native_block = native_h1 ? args.q8_h1_block(j, blk) : nullptr;
-                    if (native_h1 && native_block == nullptr) {
-                        result.supported = false;
-                        return result;
-                    }
-                    const float s_rf = native_h1 ? native_block->s_rf :
-                        (stripe_mode ? args.s_rf_stripe[stripe_idx] : args.s_rf[j]);
-                    const uint16_t R = native_h1 ? native_block->R :
-                        (stripe_mode ? args.R_stripe[stripe_idx] : args.R[j]);
-                    const uint64_t c_eff =
-                        static_cast<uint64_t>(native_h1 ? native_block->c_b : static_cast<uint16_t>(args.c_b[idx])) +
-                        static_cast<uint64_t>(R);
-                    weight_scales[idx] = static_cast<float>(
-                        static_cast<double>(s_rf) * static_cast<double>(c_eff));
-                }
-            }
-
-            result.data = weight_scales.data();
-            result.rows = rows;
-            result.cols = cols;
-            result.block_size = block_size;
-            return result;
-        }
-
-        if (!args.B_scales)
-            return result;
-
-        result.data = args.B_scales;
-        result.rows = args.blocks_J;
-        result.cols = args.blocks_K;
-        result.block_size = args.block_size_k ? args.block_size_k : QK8_0;
-        return result;
-    }
-
     void load_weight_row_scaled(
         size_t k,
         const ggml_gemmini_args_t &args,
@@ -261,6 +70,7 @@ namespace ggml::gemmini::quants::dec { namespace
         size_t blocks_k,
         size_t block_size_k,
         bool scalar_mode,
+        bool row_header_mode,
         float scalar_weight_scale,
         float *Wk_f)
     {
@@ -317,7 +127,12 @@ namespace ggml::gemmini::quants::dec { namespace
                 Wk_f[j] = static_cast<float>(weights[j * weight_stride + k]);
         }
 
-        if (scalar_mode)
+        if (row_header_mode)
+        {
+            for (size_t j = 0; j < J; ++j)
+                Wk_f[j] *= args.q8_channel_scale(j);
+        }
+        else if (scalar_mode)
         {
             for (size_t j = 0; j < J; ++j)
                 Wk_f[j] *= scalar_weight_scale;
@@ -328,8 +143,9 @@ namespace ggml::gemmini::quants::dec { namespace
 
             for (size_t j = 0; j < J; ++j)
             {
-                if (j < scale_rows && blk < blocks_k)
-                    Wk_f[j] *= weight_scales[j * blocks_k + blk];
+                if (j < scale_rows && (is_q8_channel_dense_sidecar_args(args) || blk < blocks_k))
+                    Wk_f[j] *= is_q8_channel_dense_sidecar_args(args) ? weight_scales[j] :
+                        weight_scales[j * blocks_k + blk];
             }
         }
     }
@@ -547,6 +363,14 @@ ActivationDECResult compensate_activation_dec(
                 return result;
             }
             break;
+        case ggml_gemmini_args_t::im2p_weight_format_t::q8_channel:
+            if (!args.has_q8_channel_direct_read_contract())
+                return result;
+            break;
+        case ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar:
+            if (!args.has_q8_channel_dense_sidecar_contract())
+                return result;
+            break;
         default:
             break;
     }
@@ -569,7 +393,9 @@ ActivationDECResult compensate_activation_dec(
         return result;
 
     const WeightLayout weight_layout = resolve_weight_layout(args);
-    const WeightScaleInfo weight_scales = build_weight_scale_info(args);
+    const WeightScaleInfo weight_scales = build_weight_scale_info(
+        args,
+        WeightScaleInfoMode::Dec);
     auto activation_scales_vec = act::activation_scales(args, I);
     const float *activation_scales = activation_scales_vec.data();
     if (!weight_scales.supported)
@@ -641,7 +467,9 @@ ActivationDECResult compensate_activation_dec(
         !q8_hp1 &&
         !q8_hp2 &&
         !q8_h2 &&
+        !is_q8_channel_dense_sidecar_args(args) &&
         !weight_scales.scalar_mode &&
+        !weight_scales.row_header_mode &&
         weight_layout == WeightLayout::JxK_ColMajor &&
         weight_stride >= K;
 
@@ -677,6 +505,7 @@ ActivationDECResult compensate_activation_dec(
                     weight_scales.cols,
                     weight_scales.block_size,
                     weight_scales.scalar_mode,
+                    weight_scales.row_header_mode,
                     weight_scales.scalar,
                     scr.Wk_f.data());
 
@@ -721,6 +550,7 @@ ActivationDECResult compensate_activation_dec(
                 weight_scales.cols,
                 weight_scales.block_size,
                 weight_scales.scalar_mode,
+                weight_scales.row_header_mode,
                 weight_scales.scalar,
                 scr.Wk_f.data());
 

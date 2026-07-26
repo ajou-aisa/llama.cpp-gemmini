@@ -65,6 +65,8 @@ typedef struct ggml_gemmini_args_t {
         q8_h1 = 3,
         q8_hp1 = 4,
         q8_hp2 = 5,
+        q8_channel = 6,
+        q8_channel_dense_sidecar = 7,
     };
 
     // tiled_matmul_auto args
@@ -145,6 +147,10 @@ typedef struct ggml_gemmini_args_t {
     const float *weight_channel_scales = nullptr;
     size_t weight_channel_scale_count = 0;
 
+    const uint8_t *q8_channel_row_base = nullptr;
+    size_t q8_channel_row_stride = 0;
+    size_t q8_channel_row_count = 0;
+
     bool weight_i8_scale_active = false;
     float weight_scale = 1.0f;
     im2p_weight_format_t weight_format = im2p_weight_format_t::q8_0_unpacked_to_h1;
@@ -203,6 +209,92 @@ typedef struct ggml_gemmini_args_t {
     size_t gemmini_call_k_logical = 0;
     size_t gemmini_call_k_aligned = 0;
     size_t gemmini_call_tile_k_elems = 0;
+
+    inline const uint8_t *q8_channel_row(size_t row) const {
+        if (q8_channel_row_base == nullptr || q8_channel_row_stride == 0 ||
+            row >= q8_channel_row_count ||
+            row > std::numeric_limits<size_t>::max() / q8_channel_row_stride) {
+            return nullptr;
+        }
+
+        return q8_channel_row_base + row * q8_channel_row_stride;
+    }
+
+    inline const elem_t *q8_channel_payload(size_t row) const {
+        const uint8_t *row_base = q8_channel_row(row);
+        return row_base == nullptr ? nullptr :
+            reinterpret_cast<const elem_t *>(row_base + sizeof(float));
+    }
+
+    inline float q8_channel_scale(size_t row) const {
+        const uint8_t *row_base = q8_channel_row(row);
+        if (row_base == nullptr) {
+            return std::numeric_limits<float>::quiet_NaN();
+        }
+
+        float scale = std::numeric_limits<float>::quiet_NaN();
+        std::memcpy(&scale, row_base, sizeof(scale));
+        return scale;
+    }
+
+    inline bool has_q8_channel_row_metadata() const {
+        return q8_channel_row_base != nullptr || q8_channel_row_stride != 0 ||
+               q8_channel_row_count != 0;
+    }
+
+    inline size_t q8_channel_scale_source_count() const {
+        return static_cast<size_t>(has_q8_channel_row_metadata()) +
+               static_cast<size_t>(weight_channel_scales != nullptr) +
+               static_cast<size_t>(B_scales != nullptr) +
+               static_cast<size_t>(weight_i8_scale_active);
+    }
+
+    inline bool has_q8_channel_direct_read_contract() const {
+        static_assert(sizeof(elem_t) == 1, "Q8_CHANNEL INT direct-read requires one-byte elem_t");
+
+        if (weight_format != im2p_weight_format_t::q8_channel ||
+            q8_channel_row_base == nullptr || J == 0 || K == 0 ||
+            q8_channel_row_count != J || q8_channel_row_stride == 0 ||
+            K > std::numeric_limits<size_t>::max() - sizeof(float) ||
+            q8_channel_row_stride != sizeof(float) + K ||
+            sB != q8_channel_row_stride || B == nullptr ||
+            q8_channel_row_count > std::numeric_limits<size_t>::max() / q8_channel_row_stride ||
+            B_scales != nullptr || weight_channel_scales != nullptr ||
+            weight_channel_scale_count != 0 || weight_i8_scale_active ||
+            q8_channel_scale_source_count() != 1 ||
+            q8_channel_payload(0) != B) {
+            return false;
+        }
+
+        for (size_t row = 0; row < q8_channel_row_count; ++row) {
+            if (!std::isfinite(q8_channel_scale(row))) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    inline bool has_q8_channel_dense_sidecar_contract() const {
+        static_assert(sizeof(elem_t) == 1, "Q8_CHANNEL INT dense-sidecar requires one-byte elem_t");
+
+        if (weight_format != im2p_weight_format_t::q8_channel_dense_sidecar ||
+            B == nullptr || J == 0 || K == 0 || sB != K ||
+            J > std::numeric_limits<size_t>::max() / K ||
+            weight_channel_scales == nullptr || weight_channel_scale_count != J ||
+            has_q8_channel_row_metadata() || B_scales != nullptr ||
+            weight_i8_scale_active || q8_channel_scale_source_count() != 1) {
+            return false;
+        }
+
+        for (size_t row = 0; row < J; ++row) {
+            if (!std::isfinite(weight_channel_scales[row])) {
+                return false;
+            }
+        }
+
+        return true;
+    }
 
     inline const block_q8_h2 *q8_h2_block(size_t row, size_t block) const {
         if (q8_h2_blocks == nullptr || q8_h2_blocks_per_row == 0 ||

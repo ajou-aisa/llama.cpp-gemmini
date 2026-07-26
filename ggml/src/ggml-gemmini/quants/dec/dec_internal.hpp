@@ -6,6 +6,29 @@
 
 namespace ggml::gemmini::quants::dec
 {
+    struct WeightScaleInfo
+    {
+        const float *data = nullptr;
+        size_t rows = 0;
+        size_t cols = 0;
+        size_t block_size = 0;
+        float scalar = 1.0f;
+        bool scalar_mode = false;
+        bool row_header_mode = false;
+        bool channel_mode = false;
+        bool supported = true;
+    };
+
+    enum class WeightScaleInfoMode
+    {
+        CommonOutput,
+        Dec,
+    };
+
+    WeightScaleInfo build_weight_scale_info(
+        const ggml_gemmini_args_t &args,
+        WeightScaleInfoMode mode);
+
     enum class WeightLayout
     {
         KxJ_RowMajor,
@@ -41,6 +64,17 @@ namespace ggml::gemmini::quants::dec
                args.q8_hp2_blocks_per_row > 0;
     }
 
+    inline bool is_q8_channel_direct_read_args(const ggml_gemmini_args_t &args)
+    {
+        return args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_channel ||
+               args.has_q8_channel_row_metadata();
+    }
+
+    inline bool is_q8_channel_dense_sidecar_args(const ggml_gemmini_args_t &args)
+    {
+        return args.has_q8_channel_dense_sidecar_contract();
+    }
+
     inline bool has_q8_hp1_native_dec_contract(const ggml_gemmini_args_t &args)
     {
         return args.B == nullptr &&
@@ -69,6 +103,9 @@ namespace ggml::gemmini::quants::dec
 
     inline WeightLayout resolve_weight_layout(const ggml_gemmini_args_t &args)
     {
+        if (is_q8_channel_direct_read_args(args) || is_q8_channel_dense_sidecar_args(args))
+            return WeightLayout::JxK_ColMajor;
+
         if (is_q8_hp1_args(args) || is_q8_hp2_args(args) ||
             is_q8_h1_weight_args(args) || args.transpose_B)
             return WeightLayout::JxK_ColMajor;
