@@ -600,7 +600,7 @@ namespace
                 if (!std::isfinite(hp.channel_scale)) {
                     return false;
                 }
-                const float block_scale = std::ldexpf(hp.channel_scale, static_cast<int>(hp.m));
+                const float block_scale = std::ldexp(hp.channel_scale, static_cast<int>(hp.m));
                 if (!std::isfinite(block_scale)) {
                     return false;
                 }
