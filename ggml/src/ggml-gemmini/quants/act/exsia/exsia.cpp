@@ -122,43 +122,44 @@ namespace ggml::gemmini::quants::act::exsia
 #define EXSIA_CYCLE_READ() static_cast<uint64_t>(0)
 #endif
 
-#if LOG_CYCLE
-#define EXSIA_LOG_CYCLE(op, start, end)                                          \
-    do                                                                          \
-    {                                                                           \
-        ggml::gemmini::log::cycle(                                              \
-            ggml::gemmini::log::file(cycle_detail_log_path()),                  \
-            "exsia",                                                           \
-            op,                                                               \
-            start,                                                             \
-            end);                                                              \
-} while (false)
-#else
-#define EXSIA_LOG_CYCLE(op, start, end)                                          \
-    do                                                                          \
-    {                                                                           \
-        (void)sizeof(op);                                                        \
-        (void)sizeof(start);                                                     \
-        (void)sizeof(end);                                                       \
-    } while (false)
-#endif
-
     namespace
     {
-        static inline void log_cycle_metric(const char *op, uint64_t value)
+        static inline void log_cycle_record(const char *layer,
+                                            const char *op,
+                                            uint64_t start,
+                                            uint64_t end)
         {
-            EXSIA_LOG_CYCLE(op, 0, value);
+#if LOG_CYCLE
+            ggml::gemmini::log::cycle(
+                ggml::gemmini::log::file(cycle_detail_log_path()),
+                layer,
+                op,
+                start,
+                end);
+#else
+            (void)layer;
+            (void)op;
+            (void)start;
+            (void)end;
+#endif
         }
 
-        static inline void log_stage_stats(const char *prefix, const StageCycleStats &stats)
+        static inline void log_cycle_metric(const char *layer, const char *op, uint64_t value)
+        {
+            log_cycle_record(layer, op, 0, value);
+        }
+
+        static inline void log_stage_stats(const char *layer,
+                                           const char *prefix,
+                                           const StageCycleStats &stats)
         {
             char op[160];
             std::snprintf(op, sizeof(op), "%s.sum", prefix);
-            log_cycle_metric(op, stats.sum);
+            log_cycle_metric(layer, op, stats.sum);
             std::snprintf(op, sizeof(op), "%s.count", prefix);
-            log_cycle_metric(op, stats.count);
+            log_cycle_metric(layer, op, stats.count);
             std::snprintf(op, sizeof(op), "%s.max", prefix);
-            log_cycle_metric(op, stats.max);
+            log_cycle_metric(layer, op, stats.max);
         }
 
         static inline uint64_t next_exsia_run_id()
@@ -167,7 +168,9 @@ namespace ggml::gemmini::quants::act::exsia
             return next.fetch_add(1, std::memory_order_relaxed);
         }
 
-        static inline void flush_stripe_profile(uint64_t run_id, const StripeProfileRecord &profile)
+        static inline void flush_stripe_profile(const char *layer,
+                                                uint64_t run_id,
+                                                const StripeProfileRecord &profile)
         {
             const unsigned long long run = static_cast<unsigned long long>(run_id);
             char op[160];
@@ -175,13 +178,13 @@ namespace ggml::gemmini::quants::act::exsia
 
             std::snprintf(op, sizeof(op), "exsia.timeline.run.%llu.stripe.%zu.local_total",
                           run, profile.stripe_idx);
-            EXSIA_LOG_CYCLE(op, profile.local_start, profile.local_end);
+            log_cycle_record(layer, op, profile.local_start, profile.local_end);
             std::snprintf(op, sizeof(op), "exsia.timeline.run.%llu.stripe.%zu.folding_total",
                           run, profile.stripe_idx);
-            EXSIA_LOG_CYCLE(op, profile.folding_start, profile.folding_end);
+            log_cycle_record(layer, op, profile.folding_start, profile.folding_end);
             std::snprintf(op, sizeof(op), "exsia.timeline.run.%llu.stripe.%zu.stripe_total",
                           run, profile.stripe_idx);
-            EXSIA_LOG_CYCLE(op, profile.local_start, profile.folding_end);
+            log_cycle_record(layer, op, profile.local_start, profile.folding_end);
 
             const StageCycleStats *stages[] = {
                 &profile.stats.p0,
@@ -193,17 +196,17 @@ namespace ggml::gemmini::quants::act::exsia
             {
                 std::snprintf(prefix, sizeof(prefix), "exsia.timeline.run.%llu.stripe.%zu.local.p%zu",
                               run, profile.stripe_idx, i);
-                log_stage_stats(prefix, *stages[i]);
+                log_stage_stats(layer, prefix, *stages[i]);
             }
 
             std::snprintf(prefix, sizeof(prefix), "exsia.timeline.run.%llu.stripe.%zu.local.p3",
                           run, profile.stripe_idx);
             std::snprintf(op, sizeof(op), "%s.bypass_no_int.count", prefix);
-            log_cycle_metric(op, profile.stats.p3_bypass_no_int_count);
+            log_cycle_metric(layer, op, profile.stats.p3_bypass_no_int_count);
             std::snprintf(op, sizeof(op), "%s.bypass_same_scale.count", prefix);
-            log_cycle_metric(op, profile.stats.p3_bypass_same_scale_count);
+            log_cycle_metric(layer, op, profile.stats.p3_bypass_same_scale_count);
             std::snprintf(op, sizeof(op), "%s.replay.count", prefix);
-            log_cycle_metric(op, profile.stats.p3_replay_count);
+            log_cycle_metric(layer, op, profile.stats.p3_replay_count);
         }
     }
 
@@ -622,6 +625,7 @@ namespace ggml::gemmini::quants::act::exsia
         const ggml_tensor *A,
         ggml_gemmini_args_t &args)
     {
+        const char *layer = ggml::gemmini::types::to_string(args.layer_type);
         const uint64_t run_id = next_exsia_run_id();
         const uint64_t end_to_end_cycle_start = EXSIA_CYCLE_READ();
         const int16_t invalid_theta = std::numeric_limits<int16_t>::min();
@@ -784,16 +788,16 @@ namespace ggml::gemmini::quants::act::exsia
 
         const uint64_t end_to_end_cycle_end = EXSIA_CYCLE_READ();
         for (const StripeProfileRecord &profile : stripe_profiles)
-            flush_stripe_profile(run_id, profile);
+            flush_stripe_profile(layer, run_id, profile);
         char timeline_op[96];
         std::snprintf(timeline_op, sizeof(timeline_op), "exsia.timeline.run.%llu.end_to_end_total",
                       static_cast<unsigned long long>(run_id));
-        EXSIA_LOG_CYCLE(timeline_op, end_to_end_cycle_start, end_to_end_cycle_end);
-        EXSIA_LOG_CYCLE("exsia.end_to_end", end_to_end_cycle_start, end_to_end_cycle_end);
+        log_cycle_record(layer, timeline_op, end_to_end_cycle_start, end_to_end_cycle_end);
+        log_cycle_record(layer, "exsia.end_to_end", end_to_end_cycle_start, end_to_end_cycle_end);
         release_vector(state_.residual);
 
         ggml::gemmini::log::debug(
-            "exsia",
+            layer,
             "[exsia] I=%zu K=%zu stripes=%zu tau=%d outliers=%zu",
             args.I,
             args.K,
@@ -914,9 +918,10 @@ namespace ggml::gemmini::quants::act::exsia
         };
 
 #if CYCLE_DETAIL
+        const char *layer = ggml::gemmini::types::to_string(args.layer_type);
         const uint64_t cycle_start = EXSIA_CYCLE_READ();
         const bool ok = run();
-        EXSIA_LOG_CYCLE("exsia.dequantize_activation", cycle_start, EXSIA_CYCLE_READ());
+        log_cycle_record(layer, "exsia.dequantize_activation", cycle_start, EXSIA_CYCLE_READ());
         return ok;
 #else
         return run();
