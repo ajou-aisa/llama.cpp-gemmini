@@ -225,18 +225,75 @@ namespace ggml::gemmini::quants::act::exsia
         }
     };
 
-    // Per-stripe cycle aggregates. Sequential today; a future pipeline slot keeps its own.
+    struct StageCycleStats
+    {
+        uint64_t sum = 0;
+        uint64_t max = 0;
+        uint64_t count = 0;
+
+        void add(uint64_t value) noexcept
+        {
+            sum += value;
+            max = std::max(max, value);
+            ++count;
+        }
+
+        void reset() noexcept
+        {
+            sum = 0;
+            max = 0;
+            count = 0;
+        }
+    };
+
     struct StripeCycleStats
     {
-        size_t stripe_idx = 0;
-        uint64_t local_total = 0;
-        uint64_t folding_total = 0;
+        StageCycleStats p0;
+        StageCycleStats p1;
+        StageCycleStats p2;
+        StageCycleStats p3;
+        uint64_t p3_bypass_no_int_count = 0;
+        uint64_t p3_bypass_same_scale_count = 0;
+        uint64_t p3_replay_count = 0;
 
-        void reset()
+        void reset() noexcept
         {
-            local_total = 0;
-            folding_total = 0;
+            p0.reset();
+            p1.reset();
+            p2.reset();
+            p3.reset();
+            p3_bypass_no_int_count = 0;
+            p3_bypass_same_scale_count = 0;
+            p3_replay_count = 0;
         }
+    };
+
+    enum class P3Path
+    {
+        BypassNoIntegerOutlier,
+        BypassSameScale,
+        Replay,
+    };
+
+    struct LocalBlockCycleSample
+    {
+        uint64_t p0 = 0;
+        uint64_t p1 = 0;
+        uint64_t p2 = 0;
+        uint64_t p3 = 0;
+        P3Path p3_path = P3Path::BypassNoIntegerOutlier;
+    };
+
+    struct StripeProfileRecord
+    {
+        size_t stripe_idx = 0;
+        size_t row_start = 0;
+        size_t row_end = 0;
+        uint64_t local_start = 0;
+        uint64_t local_end = 0;
+        uint64_t folding_start = 0;
+        uint64_t folding_end = 0;
+        StripeCycleStats stats;
     };
 
     // Self-contained owner of one stripe's transient state. This is the unit a future
@@ -304,7 +361,6 @@ namespace ggml::gemmini::quants::act::exsia
             std::fill(block_exp.begin(), block_exp.begin() + blocks, neg_inf);
             outliers.clear();
             cycle_stats.reset();
-            cycle_stats.stripe_idx = idx;
         }
     };
 
@@ -397,7 +453,7 @@ namespace ggml::gemmini::quants::act::exsia
             size_t blk_idx,
             std::vector<int32_t> &stripe_q_wide,
             std::vector<int16_t> &stripe_block_exp,
-            uint64_t &cycle_delta);
+            LocalBlockCycleSample &cycle_sample);
 
     private:
         ExpScanner unit_exp_;
@@ -419,8 +475,7 @@ namespace ggml::gemmini::quants::act::exsia
             const std::vector<int32_t> &stripe_q_wide,
             const std::vector<int16_t> &stripe_block_exp,
             std::vector<int32_t> &residual,                       // dense global output, I * K_padded
-            std::vector<ggml_gemmini_qact_outlier> &out_outliers, // stripe-local, merged by caller
-            uint64_t &cycle_delta);
+            std::vector<ggml_gemmini_qact_outlier> &out_outliers); // stripe-local, merged by caller
 
     private:
         OutlierMarker unit_outlier_;

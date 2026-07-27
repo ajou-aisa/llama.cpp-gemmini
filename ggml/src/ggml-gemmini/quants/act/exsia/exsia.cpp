@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <tuple>
 #include <utility>
@@ -105,23 +106,33 @@ namespace ggml::gemmini::quants::act::exsia
             const int64_t widened = static_cast<int64_t>(value);
             return widened < 0 ? -widened : widened;
         }
+
+        static inline const char *cycle_detail_log_path()
+        {
+            const char *path = std::getenv("GGML_GEMMINI_CYCLE_DETAIL_LOG");
+            return path && path[0] ? path : "log/exsia-cycle-detail.jsonl";
+        }
+
     }
 
 #if CYCLE_DETAIL
 #define EXSIA_CYCLE_READ() ggml::gemmini::cycle::read()
+#else
+#define EXSIA_CYCLE_READ() static_cast<uint64_t>(0)
+#endif
+
+#if LOG_CYCLE
 #define EXSIA_LOG_CYCLE(op, start, end)                                          \
     do                                                                          \
     {                                                                           \
-        const char *path = std::getenv("GGML_GEMMINI_CYCLE_DETAIL_LOG");         \
         ggml::gemmini::log::cycle(                                              \
-            ggml::gemmini::log::file(path && path[0] ? path : "log/exsia-cycle-detail.jsonl"), \
+            ggml::gemmini::log::file(cycle_detail_log_path()),                  \
             "exsia",                                                           \
             op,                                                               \
             start,                                                             \
             end);                                                              \
 } while (false)
 #else
-#define EXSIA_CYCLE_READ() static_cast<uint64_t>(0)
 #define EXSIA_LOG_CYCLE(op, start, end)                                          \
     do                                                                          \
     {                                                                           \
@@ -130,6 +141,38 @@ namespace ggml::gemmini::quants::act::exsia
         (void)sizeof(end);                                                       \
     } while (false)
 #endif
+
+    namespace
+    {
+        static inline void log_cycle_metric(const char *op, uint64_t value)
+        {
+            EXSIA_LOG_CYCLE(op, 0, value);
+        }
+
+        static inline void log_stage_stats(const char *prefix, const StageCycleStats &stats)
+        {
+            char op[64];
+            std::snprintf(op, sizeof(op), "%s.sum", prefix);
+            log_cycle_metric(op, stats.sum);
+            std::snprintf(op, sizeof(op), "%s.count", prefix);
+            log_cycle_metric(op, stats.count);
+            std::snprintf(op, sizeof(op), "%s.max", prefix);
+            log_cycle_metric(op, stats.max);
+        }
+
+        static inline void flush_stripe_profile(const StripeProfileRecord &profile)
+        {
+            EXSIA_LOG_CYCLE("exsia.stripe.local_elapsed", profile.local_start, profile.local_end);
+            EXSIA_LOG_CYCLE("exsia.stripe.folding_elapsed", profile.folding_start, profile.folding_end);
+            log_stage_stats("exsia.local.p0", profile.stats.p0);
+            log_stage_stats("exsia.local.p1", profile.stats.p1);
+            log_stage_stats("exsia.local.p2", profile.stats.p2);
+            log_stage_stats("exsia.local.p3", profile.stats.p3);
+            log_cycle_metric("exsia.local.p3.bypass_no_int.count", profile.stats.p3_bypass_no_int_count);
+            log_cycle_metric("exsia.local.p3.bypass_same_scale.count", profile.stats.p3_bypass_same_scale_count);
+            log_cycle_metric("exsia.local.p3.replay.count", profile.stats.p3_replay_count);
+        }
+    }
 
     int16_t ExpScanner::unbiased_exp(const float &x)
     {
@@ -307,12 +350,12 @@ namespace ggml::gemmini::quants::act::exsia
         size_t blk_idx,
         std::vector<int32_t> &stripe_q_wide,
         std::vector<int16_t> &stripe_block_exp,
-        uint64_t &cycle_delta)
+        LocalBlockCycleSample &cycle_sample)
     {
         const size_t blk_size = state.B_size;
         const size_t local_row = stripe.local_row(row);
         const size_t base = local_row * state.K_padded + blk_idx * blk_size;
-        cycle_delta = 0;
+        cycle_sample = LocalBlockCycleSample{};
 
         GGML_ASSERT(x.size() == blk_size);
         StripeScratch &scratch = stripe.scratch;
@@ -329,137 +372,108 @@ namespace ggml::gemmini::quants::act::exsia
         BitMask &int_outlier_mask = scratch.int_outlier_mask;
         int16_t e_pre = neg_inf;
         int16_t theta_pre = neg_inf;
+        uint64_t t0 = EXSIA_CYCLE_READ();
 
-        {
-            // Step 1: scan block exponents and identify top-2 distinct exponent buckets.
-            const uint64_t cycle_start = EXSIA_CYCLE_READ();
-            unit_exp_.scan_top2_exp(x, blk);
-            has_second_bucket = (blk.e2 != neg_inf);
-            const uint64_t cycle_end = EXSIA_CYCLE_READ();
-            EXSIA_LOG_CYCLE("exsia.Local.Stage.1.scan_top2_exp", cycle_start, cycle_end);
-            cycle_delta += cycle_end >= cycle_start ? cycle_end - cycle_start : 0;
-        }
+        unit_exp_.scan_top2_exp(x, blk);
+        has_second_bucket = (blk.e2 != neg_inf);
 
+        if (has_second_bucket)
         {
-            // Step 2: mark the top-1 exponent bucket.
-            // Step 2.1: single-bucket block; disable exponent preselection.
-            // Step 2.2: multi-bucket block; remove the range-dominating bucket.
-            const uint64_t cycle_start = EXSIA_CYCLE_READ();
-            if (has_second_bucket)
+            top1_exp_mask.clear_active_bits();
+
+            for (size_t i = 0; i < blk_size; ++i)
             {
-                top1_exp_mask.clear_active_bits();
-
-                for (size_t i = 0; i < blk_size; ++i)
-                {
-                    const size_t col = blk_idx * blk_size + i;
-                    if (col < state.K_logical && blk.e[i] != neg_inf && blk.e[i] == blk.e1)
-                        top1_exp_mask.set(0, i);
-                }
-                unit_outlier_.mark_outlier(stripe, row, blk_idx, blk_size, top1_exp_mask);
+                const size_t col = blk_idx * blk_size + i;
+                if (col < state.K_logical && blk.e[i] != neg_inf && blk.e[i] == blk.e1)
+                    top1_exp_mask.set(0, i);
             }
-            const uint64_t cycle_end = EXSIA_CYCLE_READ();
-            EXSIA_LOG_CYCLE("exsia.Local.Stage.2.mark_top1_exp_bucket", cycle_start, cycle_end);
-            cycle_delta += cycle_end >= cycle_start ? cycle_end - cycle_start : 0;
+            unit_outlier_.mark_outlier(stripe, row, blk_idx, blk_size, top1_exp_mask);
         }
+
+        e_pre = has_second_bucket ? blk.e2 : blk.e1;
+        uint64_t t1 = EXSIA_CYCLE_READ();
 
         int_outlier_mask.clear_active_bits();
         GGML_ASSERT(stripe.outlier_mask.rows > local_row);
         GGML_ASSERT(stripe.outlier_mask.cols >= state.K_padded);
 
+        theta_pre = exp_to_theta(e_pre, meta.rho);
+        unit_quant_.quantize_block(
+            blk.x,
+            local_row,
+            blk_idx * blk_size,
+            stripe.outlier_mask,
+            theta_pre,
+            q_tmp,
+            S,
+            SS);
+
+        for (size_t i = 0; i < blk_size; ++i)
         {
-            // Step 3: quantize the remaining elements for integer-domain analysis.
-            const uint64_t cycle_start = EXSIA_CYCLE_READ();
-
-            // Step 3.1: set a provisional block scale from the selected inlier exponent.
-            e_pre = has_second_bucket ? blk.e2 : blk.e1;
-            theta_pre = exp_to_theta(e_pre, meta.rho);
-
-            // Step 3.2: wide-quantize without clipping and collect local inlier statistics.
-            unit_quant_.quantize_block(
-                blk.x,
-                local_row,
-                blk_idx * blk_size,
-                stripe.outlier_mask,
-                theta_pre,
-                q_tmp,
-                S,
-                SS);
-
-            // Step 3.3: refine the residual mask using one-sided upper-tail magnitude τ.
-            for (size_t i = 0; i < blk_size; ++i)
-            {
-                const size_t col = blk_idx * blk_size + i;
-                if (col < state.K_logical && !stripe.outlier_mask.is_set(local_row, col))
-                    ++unmasked_count;
-            }
-
-            for (size_t i = 0; i < blk_size; ++i)
-            {
-                const size_t col = blk_idx * blk_size + i;
-                if (col >= state.K_logical || stripe.outlier_mask.is_set(local_row, col))
-                    continue;
-
-                if (unit_sigma_.detect_sigma(q_tmp[i], S, SS, unmasked_count))
-                {
-                    int_outlier_mask.set(0, i);
-                    has_int_outlier = true;
-                }
-            }
-            const uint64_t cycle_end = EXSIA_CYCLE_READ();
-            EXSIA_LOG_CYCLE("exsia.Local.Stage.3.one_sided_magnitude_sigma_selection", cycle_start, cycle_end);
-            cycle_delta += cycle_end >= cycle_start ? cycle_end - cycle_start : 0;
+            const size_t col = blk_idx * blk_size + i;
+            if (col < state.K_logical && !stripe.outlier_mask.is_set(local_row, col))
+                ++unmasked_count;
         }
 
+        uint64_t t2 = EXSIA_CYCLE_READ();
+
+        for (size_t i = 0; i < blk_size; ++i)
         {
-            // Step 4: finalize block exponent and wide-quantized values.
-            const uint64_t cycle_start = EXSIA_CYCLE_READ();
-            if (!has_int_outlier)
+            const size_t col = blk_idx * blk_size + i;
+            if (col >= state.K_logical || stripe.outlier_mask.is_set(local_row, col))
+                continue;
+
+            if (unit_sigma_.detect_sigma(q_tmp[i], S, SS, unmasked_count))
             {
-                // Step 4.1: reuse the pre-quantized block if no extra outlier is found.
-                blk.e_b = e_pre;
-                blk.theta_b = theta_pre;
+                int_outlier_mask.set(0, i);
+                has_int_outlier = true;
+            }
+        }
+
+        uint64_t t3 = EXSIA_CYCLE_READ();
+
+        if (!has_int_outlier)
+        {
+            blk.e_b = e_pre;
+            blk.theta_b = theta_pre;
+            std::copy_n(q_tmp.begin(), blk_size, q_final.begin());
+            cycle_sample.p3_path = P3Path::BypassNoIntegerOutlier;
+        }
+        else
+        {
+            unit_outlier_.mark_outlier(stripe, row, blk_idx, blk_size, int_outlier_mask);
+            unit_exp_.update_block_top2_exp(stripe.outlier_mask, local_row, blk_idx, blk);
+            blk.e_b = blk.e1;
+            blk.theta_b = exp_to_theta(blk.e_b, meta.rho);
+
+            if (blk.theta_b == theta_pre)
+            {
                 std::copy_n(q_tmp.begin(), blk_size, q_final.begin());
+                cycle_sample.p3_path = P3Path::BypassSameScale;
             }
             else
             {
-                // Step 4.2: promote integer outliers and update the inlier exponent.
-                unit_outlier_.mark_outlier(stripe, row, blk_idx, blk_size, int_outlier_mask);
-                unit_exp_.update_block_top2_exp(stripe.outlier_mask, local_row, blk_idx, blk);
-                blk.e_b = blk.e1;
-                blk.theta_b = exp_to_theta(blk.e_b, meta.rho);
-
-                if (blk.theta_b == theta_pre)
-                {
-                    // Step 4.3: the existing wide integers were already computed at the final scale.
-                    std::copy_n(q_tmp.begin(), blk_size, q_final.begin());
-                }
-                else
-                {
-                    // Step 4.4: inlier exponent changed; recompute wide integers at finer scale.
-                    unit_quant_.quantize_block(blk.x, blk.theta_b, q_final);
-                }
+                unit_quant_.quantize_block(blk.x, blk.theta_b, q_final);
+                cycle_sample.p3_path = P3Path::Replay;
             }
-            const uint64_t cycle_end = EXSIA_CYCLE_READ();
-            EXSIA_LOG_CYCLE("exsia.Local.Stage.4.finalize_block_quantization", cycle_start, cycle_end);
-            cycle_delta += cycle_end >= cycle_start ? cycle_end - cycle_start : 0;
         }
 
         GGML_ASSERT(stripe_q_wide.size() >= base + blk_size);
-        {
-            // Step 5: store the local result for stripe folding.
-            const uint64_t cycle_start = EXSIA_CYCLE_READ();
-            for (size_t i = 0; i < blk_size; ++i)
-                stripe_q_wide[base + i] = q_final[i];
+        for (size_t i = 0; i < blk_size; ++i)
+            stripe_q_wide[base + i] = q_final[i];
 
-            const size_t block_exp_idx = local_row * state.blocks_per_row + blk_idx;
-            GGML_ASSERT(stripe_block_exp.size() > block_exp_idx);
-            stripe_block_exp[block_exp_idx] = blk.e_b;
+        const size_t block_exp_idx = local_row * state.blocks_per_row + blk_idx;
+        GGML_ASSERT(stripe_block_exp.size() > block_exp_idx);
+        stripe_block_exp[block_exp_idx] = blk.e_b;
 
-            unit_exp_.update_stripe_top2_exp(stripe, blk.e_b);
-            const uint64_t cycle_end = EXSIA_CYCLE_READ();
-            EXSIA_LOG_CYCLE("exsia.Local.Stage.5.store_result_for_stripe_folding", cycle_start, cycle_end);
-            cycle_delta += cycle_end >= cycle_start ? cycle_end - cycle_start : 0;
-        }
+        unit_exp_.update_stripe_top2_exp(stripe, blk.e_b);
+
+        uint64_t t4 = EXSIA_CYCLE_READ();
+
+        cycle_sample.p0 = t1 >= t0 ? t1 - t0 : 0;
+        cycle_sample.p1 = t2 >= t1 ? t2 - t1 : 0;
+        cycle_sample.p2 = t3 >= t2 ? t3 - t2 : 0;
+        cycle_sample.p3 = t4 >= t3 ? t4 - t3 : 0;
 
         return true;
     }
@@ -473,48 +487,29 @@ namespace ggml::gemmini::quants::act::exsia
                             const std::vector<int32_t> &stripe_q_wide,
                             const std::vector<int16_t> &stripe_block_exp,
                             std::vector<int32_t> &residual,
-                            std::vector<ggml_gemmini_qact_outlier> &out_outliers,
-                            uint64_t &cycle_delta)
+                            std::vector<ggml_gemmini_qact_outlier> &out_outliers)
     {
         const int16_t neg_inf = std::numeric_limits<int16_t>::min();
-        cycle_delta = 0;
 
+        if (stripe.e1 == neg_inf)
         {
-            // Step 1: determine stripe exponent from top-2 distinct block exponents.
-            const uint64_t cycle_start = EXSIA_CYCLE_READ();
-            if (stripe.e1 == neg_inf)
-            {
-                stripe.e_s = 0;
-                // Step 1.1: no valid exponent exists (all zeros or sanitized non-finite inputs); keep promotion off.
-                stripe.promote_top_block = false;
-            }
-            else if (stripe.e2 == neg_inf)
-            {
-                stripe.e_s = stripe.e1;
-                // Step 1.2: only one distinct block exponent; keep promotion off.
-                stripe.promote_top_block = false;
-            }
-            else
-            {
-                stripe.e_s = stripe.e2;
-                // Step 1.3: multiple exponents exist; promote top-exponent blocks.
-                stripe.promote_top_block = true;
-            }
-            const uint64_t cycle_end = EXSIA_CYCLE_READ();
-            EXSIA_LOG_CYCLE("exsia.Stripe.Folding.1.determine_stripe_exp", cycle_start, cycle_end);
-            cycle_delta += cycle_end >= cycle_start ? cycle_end - cycle_start : 0;
+            stripe.e_s = 0;
+            stripe.promote_top_block = false;
+        }
+        else if (stripe.e2 == neg_inf)
+        {
+            stripe.e_s = stripe.e1;
+            stripe.promote_top_block = false;
+        }
+        else
+        {
+            stripe.e_s = stripe.e2;
+            stripe.promote_top_block = true;
         }
 
-        {
-            // Step 2: store the per-stripe dequantization exponent.
-            const uint64_t cycle_start = EXSIA_CYCLE_READ();
-            const int16_t theta_s = exp_to_theta(stripe.e_s, meta.rho);
-            GGML_ASSERT(stripe_idx < meta.theta.size());
-            meta.theta[stripe_idx] = theta_s;
-            const uint64_t cycle_end = EXSIA_CYCLE_READ();
-            EXSIA_LOG_CYCLE("exsia.Stripe.Folding.2.store_stripe_exp", cycle_start, cycle_end);
-            cycle_delta += cycle_end >= cycle_start ? cycle_end - cycle_start : 0;
-        }
+        const int16_t theta_s = exp_to_theta(stripe.e_s, meta.rho);
+        GGML_ASSERT(stripe_idx < meta.theta.size());
+        meta.theta[stripe_idx] = theta_s;
 
         GGML_ASSERT(dst != nullptr);
         GGML_ASSERT(state.B_size > 0);
@@ -541,78 +536,47 @@ namespace ggml::gemmini::quants::act::exsia
                 GGML_ASSERT(block_exp_idx < stripe_block_exp.size());
 
                 const int16_t block_exp = stripe_block_exp[block_exp_idx];
-                int16_t delta_theta_b = 0;
+                const int16_t delta_theta_b = block_exp == neg_inf || stripe.e_s == neg_inf
+                                                  ? 0
+                                                  : static_cast<int16_t>(block_exp - stripe.e_s);
+                if (stripe.promote_top_block && block_exp == stripe.e1)
                 {
-                    // Step 3: fold block-local scales into the stripe scale.
-                    const uint64_t cycle_start = EXSIA_CYCLE_READ();
+                    BitMask &block_inlier_mask = stripe.scratch.folding_inlier_mask;
+                    block_inlier_mask.clear_active_bits();
 
-                    // Step 3.1: compute the block-to-stripe folding shift.
-                    delta_theta_b = block_exp == neg_inf || stripe.e_s == neg_inf
-                                       ? 0
-                                       : static_cast<int16_t>(block_exp - stripe.e_s);
-
-                    // Step 3.2: mark currently unmasked inliers of top-exponent blocks.
-                    if (stripe.promote_top_block && block_exp == stripe.e1)
-                    {
-                        BitMask &block_inlier_mask = stripe.scratch.folding_inlier_mask;
-                        block_inlier_mask.clear_active_bits();
-
-                        for (size_t i = 0; i < state.B_size; ++i)
-                        {
-                            const size_t col = block_offset + i;
-                            if (col < args.K && !stripe.outlier_mask.is_set(local_row, col))
-                                block_inlier_mask.set(0, i);
-                        }
-                        unit_outlier_.mark_outlier(stripe, r, b, state.B_size, block_inlier_mask);
-                    }
-                    const uint64_t cycle_end = EXSIA_CYCLE_READ();
-                    EXSIA_LOG_CYCLE("exsia.Stripe.Folding.3.fold_block_scales_into_stripe_scale", cycle_start, cycle_end);
-                    cycle_delta += cycle_end >= cycle_start ? cycle_end - cycle_start : 0;
-                }
-
-                {
-                    // Step 4: generate dense int8 values and residual error.
-                    const uint64_t cycle_start = EXSIA_CYCLE_READ();
                     for (size_t i = 0; i < state.B_size; ++i)
                     {
                         const size_t col = block_offset + i;
-                        const size_t padded_idx = local_row * state.K_padded + col;
-
-                        // Step 4.1: shift the wide integer to the stripe scale.
-                        // For delta_theta_b < 0, this is a rounded-right-shift.
-                        const int32_t q_shifted = detail::shift_q_i32(stripe_q_wide[padded_idx], delta_theta_b);
-
-                        // Step 4.2: clip once and compute the residual.
-                        const auto [q8, res] = unit_clip_.clip_with_residual(q_shifted);
-
-                        // Step 4.3: store the dense int8 activation.
-                        if (col < args.K)
-                            dst[r * args.K + col] = q8;
-
-                        // Step 4.4: record residual only for marked positions.
-                        const bool outlier = col < args.K && stripe.outlier_mask.is_set(local_row, col);
-                        const int32_t residual_i32 = outlier ? res : 0;
-
-                        // Step 4.5: write the dense residual matrix for every padded element.
-                        // Non-marked and padding positions are explicitly recorded as 0.
-                        // Uses the global row range (K_padded stride); stripes own disjoint rows.
-                        const size_t global_idx = r * state.K_padded + col;
-                        GGML_ASSERT(global_idx < residual.size());
-                        residual[global_idx] = residual_i32;
-
-                        // Step 4.6: mirror true nonzero residuals into the stripe-local list.
-                        if (outlier && residual_i32 != 0)
-                        {
-                            out_outliers.push_back({
-                                static_cast<int>(r),
-                                static_cast<int>(col),
-                                residual_i32,
-                            });
-                        }
+                        if (col < args.K && !stripe.outlier_mask.is_set(local_row, col))
+                            block_inlier_mask.set(0, i);
                     }
-                    const uint64_t cycle_end = EXSIA_CYCLE_READ();
-                    EXSIA_LOG_CYCLE("exsia.Stripe.Folding.4.generate_dense_int8_and_residual", cycle_start, cycle_end);
-                    cycle_delta += cycle_end >= cycle_start ? cycle_end - cycle_start : 0;
+                    unit_outlier_.mark_outlier(stripe, r, b, state.B_size, block_inlier_mask);
+                }
+
+                for (size_t i = 0; i < state.B_size; ++i)
+                {
+                    const size_t col = block_offset + i;
+                    const size_t padded_idx = local_row * state.K_padded + col;
+                    const int32_t q_shifted = detail::shift_q_i32(stripe_q_wide[padded_idx], delta_theta_b);
+                    const auto [q8, res] = unit_clip_.clip_with_residual(q_shifted);
+
+                    if (col < args.K)
+                        dst[r * args.K + col] = q8;
+
+                    const bool outlier = col < args.K && stripe.outlier_mask.is_set(local_row, col);
+                    const int32_t residual_i32 = outlier ? res : 0;
+                    const size_t global_idx = r * state.K_padded + col;
+                    GGML_ASSERT(global_idx < residual.size());
+                    residual[global_idx] = residual_i32;
+
+                    if (outlier && residual_i32 != 0)
+                    {
+                        out_outliers.push_back({
+                            static_cast<int>(r),
+                            static_cast<int>(col),
+                            residual_i32,
+                        });
+                    }
                 }
             }
         }
@@ -708,8 +672,7 @@ namespace ggml::gemmini::quants::act::exsia
             meta_stripe.row_end = std::min((s + 1) * rows_per_stripe, args.I);
         }
 
-        uint64_t local_stage_cycle_sum = 0;
-        uint64_t stripe_folding_cycle_sum = 0;
+        std::vector<StripeProfileRecord> stripe_profiles(num_stripes);
         for (size_t s = 0; s < num_stripes; ++s)
         {
             const size_t row_start = s * rows_per_stripe;
@@ -717,12 +680,17 @@ namespace ggml::gemmini::quants::act::exsia
             workspace_.reset_for_stripe(s, row_start, row_end,
                                         state_.K_padded, state_.blocks_per_row);
             StripeState &stripe = workspace_.stripe;
+            StripeProfileRecord profile;
+            profile.stripe_idx = s;
+            profile.row_start = row_start;
+            profile.row_end = row_end;
 
+            profile.local_start = EXSIA_CYCLE_READ();
             for (size_t r = stripe.row_start; r < stripe.row_end; ++r)
             {
                 for (size_t b = 0; b < state_.blocks_per_row; ++b)
                 {
-                    uint64_t local_cycle_delta = 0;
+                    LocalBlockCycleSample sample;
                     std::vector<float> &block_x = stripe.scratch.block.x;
 
                     const size_t col_offset = b * state_.B_size;
@@ -733,18 +701,34 @@ namespace ggml::gemmini::quants::act::exsia
                     }
 
                     if (!local_.run(meta, state_, stripe, block_x, r, b,
-                                    workspace_.q_wide, workspace_.block_exp, local_cycle_delta))
+                                    workspace_.q_wide, workspace_.block_exp, sample))
                         return fail();
-                    workspace_.cycle_stats.local_total += local_cycle_delta;
+
+                    workspace_.cycle_stats.p0.add(sample.p0);
+                    workspace_.cycle_stats.p1.add(sample.p1);
+                    workspace_.cycle_stats.p2.add(sample.p2);
+                    workspace_.cycle_stats.p3.add(sample.p3);
+                    switch (sample.p3_path)
+                    {
+                    case P3Path::BypassNoIntegerOutlier:
+                        ++workspace_.cycle_stats.p3_bypass_no_int_count;
+                        break;
+                    case P3Path::BypassSameScale:
+                        ++workspace_.cycle_stats.p3_bypass_same_scale_count;
+                        break;
+                    case P3Path::Replay:
+                        ++workspace_.cycle_stats.p3_replay_count;
+                        break;
+                    }
                 }
             }
+            profile.local_end = EXSIA_CYCLE_READ();
+            profile.folding_start = EXSIA_CYCLE_READ();
 
-            uint64_t stripe_cycle_delta = 0;
             if (!folding_.run(meta, state_, stripe, args, s, dst,
-                              workspace_.q_wide, workspace_.block_exp,
-                              state_.residual, workspace_.outliers, stripe_cycle_delta))
+                               workspace_.q_wide, workspace_.block_exp,
+                               state_.residual, workspace_.outliers))
                 return fail();
-            workspace_.cycle_stats.folding_total += stripe_cycle_delta;
 
             // Merge stripe-local outliers into the global list. Sequential, no locking;
             // this is the same seam a future parallel merge would use. Stripes run in row
@@ -752,6 +736,7 @@ namespace ggml::gemmini::quants::act::exsia
             meta.outliers.insert(meta.outliers.end(),
                                  workspace_.outliers.begin(),
                                  workspace_.outliers.end());
+            profile.folding_end = EXSIA_CYCLE_READ();
 
 #if EXSIA_VALIDATION
             // Faithful post-folding snapshot for mask-inspection tests (folding sets the
@@ -759,11 +744,15 @@ namespace ggml::gemmini::quants::act::exsia
             state_.stripe[s].outlier_mask = workspace_.stripe.outlier_mask;
 #endif
 
-            local_stage_cycle_sum += workspace_.cycle_stats.local_total;
-            stripe_folding_cycle_sum += workspace_.cycle_stats.folding_total;
-            EXSIA_LOG_CYCLE("exsia.stripe.local_total", 0, workspace_.cycle_stats.local_total);
-            EXSIA_LOG_CYCLE("exsia.stripe.folding_total", 0, workspace_.cycle_stats.folding_total);
+            profile.stats = workspace_.cycle_stats;
+            stripe_profiles[s] = profile;
         }
+
+        const uint64_t end_to_end_cycle_end = EXSIA_CYCLE_READ();
+        for (const StripeProfileRecord &profile : stripe_profiles)
+            flush_stripe_profile(profile);
+        EXSIA_LOG_CYCLE("exsia.end_to_end", end_to_end_cycle_start, end_to_end_cycle_end);
+        release_vector(state_.residual);
 
         ggml::gemmini::log::debug(
             "exsia",
@@ -773,11 +762,6 @@ namespace ggml::gemmini::quants::act::exsia
             num_stripes,
             meta.sigma,
             meta.outliers.size());
-
-        const uint64_t end_to_end_cycle_end = EXSIA_CYCLE_READ();
-        EXSIA_LOG_CYCLE("exsia.local_stage_total", 0, local_stage_cycle_sum);
-        EXSIA_LOG_CYCLE("exsia.stripe_folding_total", 0, stripe_folding_cycle_sum);
-        EXSIA_LOG_CYCLE("exsia.end_to_end", end_to_end_cycle_start, end_to_end_cycle_end);
 
         return true;
     }
