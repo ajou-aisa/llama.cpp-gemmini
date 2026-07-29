@@ -452,6 +452,9 @@ namespace ggml::gemmini::quants::act::exsia
 
         std::vector<int32_t> q_wide;    // max_stripe_rows * K_padded
         std::vector<int16_t> block_exp; // max_stripe_rows * blocks_per_row
+        std::vector<uint64_t> block_mask_words;
+        size_t block_mask_words_per_block = 0;
+        size_t active_block_count = 0;
         std::vector<ggml_gemmini_qact_outlier> outliers; // stripe-local, merged after folding
 
 #if EXSIA_BRANCH_COUNTS_ENABLED
@@ -461,15 +464,23 @@ namespace ggml::gemmini::quants::act::exsia
         // One-time capacity allocation sized for the largest stripe. Counts are
         // overflow-checked by the caller before this is invoked.
         bool prepare(size_t elem_capacity,
-                     size_t block_capacity,
-                     size_t max_rows,
-                     size_t K_padded,
-                     size_t block_size)
+                      size_t max_block_count,
+                      size_t max_rows,
+                       size_t K_padded,
+                       size_t block_size)
         {
+            const size_t words_per_block = BlockMask::word_count(block_size);
+            size_t block_mask_word_capacity = 0;
+            if (!BitMask::checked_mul(max_block_count, words_per_block, block_mask_word_capacity))
+                return false;
+
             if (q_wide.size() < elem_capacity)
                 q_wide.resize(elem_capacity);
-            if (block_exp.size() < block_capacity)
-                block_exp.resize(block_capacity);
+            if (block_exp.size() < max_block_count)
+                block_exp.resize(max_block_count);
+            if (block_mask_words.size() < block_mask_word_capacity)
+                block_mask_words.resize(block_mask_word_capacity);
+            block_mask_words_per_block = words_per_block;
             if (!stripe.outlier_mask.prepare(max_rows, K_padded) ||
                 !stripe.scratch.prepare(block_size))
                 return false;
@@ -485,6 +496,7 @@ namespace ggml::gemmini::quants::act::exsia
             stripe_idx = 0;
             row_start = 0;
             row_end = 0;
+            active_block_count = 0;
             stripe.row_start = 0;
             stripe.row_end = 0;
             stripe.e1 = neg_inf;
@@ -523,6 +535,7 @@ namespace ggml::gemmini::quants::act::exsia
             const size_t rows = r1 - r0;
             const size_t elem = rows * K_padded;
             const size_t blocks = rows * blocks_per_row;
+            const size_t block_mask_word_count = blocks * block_mask_words_per_block;
 
             stripe.row_start = r0;
             stripe.row_end = r1;
@@ -538,10 +551,22 @@ namespace ggml::gemmini::quants::act::exsia
 
             std::fill(q_wide.begin(), q_wide.begin() + elem, 0);
             std::fill(block_exp.begin(), block_exp.begin() + blocks, neg_inf);
+            assert(block_mask_word_count <= block_mask_words.size());
+            std::fill_n(block_mask_words.begin(), block_mask_word_count, uint64_t{0});
+            active_block_count = blocks;
             outliers.clear();
 #if EXSIA_BRANCH_COUNTS_ENABLED
             cycle_stats.reset();
 #endif
+        }
+
+        BlockMask block_mask(size_t block_idx, size_t block_size)
+        {
+            assert(block_idx < active_block_count);
+            assert(block_mask_words_per_block == BlockMask::word_count(block_size));
+            const size_t offset = block_idx * block_mask_words_per_block;
+            assert(offset + block_mask_words_per_block <= block_mask_words.size());
+            return BlockMask(block_mask_words.data() + offset, block_size);
         }
 
         void mark_local_filled()
@@ -630,20 +655,10 @@ namespace ggml::gemmini::quants::act::exsia
     {
         std::array<LocalWorkerContext, EXSIA_LOCAL_WORKER_COUNT> workers;
         std::array<LocalTaskRuntime, EXSIA_LOCAL_WORKER_COUNT> local_tasks;
-        std::vector<uint64_t> block_mask_words;
-        size_t block_mask_words_per_block = 0;
         size_t active_block_count = 0;
 
-        bool prepare(size_t max_blocks_per_stripe, size_t block_size)
+        bool prepare(size_t, size_t block_size)
         {
-            const size_t words_per_block = BlockMask::word_count(block_size);
-            size_t mask_word_capacity = 0;
-            if (!BitMask::checked_mul(max_blocks_per_stripe, words_per_block, mask_word_capacity))
-                return false;
-            if (block_mask_words.size() < mask_word_capacity)
-                block_mask_words.resize(mask_word_capacity);
-            block_mask_words_per_block = words_per_block;
-
             for (size_t i = 0; i < workers.size(); ++i)
             {
                 workers[i].worker_idx = i;
@@ -669,9 +684,6 @@ namespace ggml::gemmini::quants::act::exsia
         {
             const size_t rows = r1 - r0;
             active_block_count = rows * blocks_per_row;
-            const size_t mask_words = active_block_count * block_mask_words_per_block;
-            assert(mask_words <= block_mask_words.size());
-            std::fill_n(block_mask_words.begin(), mask_words, uint64_t{0});
 
             for (size_t i = 0; i < workers.size(); ++i)
             {
@@ -679,15 +691,6 @@ namespace ggml::gemmini::quants::act::exsia
                 workers[i].reset_for_stripe(stripe_idx, r0, r1, blocks_per_row);
                 local_tasks[i].reset();
             }
-        }
-
-        BlockMask block_mask(size_t block, size_t block_size)
-        {
-            assert(block < active_block_count);
-            assert(block_mask_words_per_block == BlockMask::word_count(block_size));
-            const size_t offset = block * block_mask_words_per_block;
-            assert(offset + block_mask_words_per_block <= block_mask_words.size());
-            return BlockMask(block_mask_words.data() + offset, block_size);
         }
     };
 

@@ -792,15 +792,13 @@ namespace ggml::gemmini::quants::act::exsia
 
     namespace
     {
-        bool assemble_stripe_mask(StripePipelineSlot &slot,
-                                  LocalExecutionWorkspace &local_workspace,
-                                  const ExSIAState &state)
+        bool assemble_stripe_mask(StripePipelineSlot &slot, const ExSIAState &state)
         {
             StripeState &stripe = slot.stripe;
             const size_t active_block_count = stripe.row_count() * state.blocks_per_row;
             if (stripe.outlier_mask.rows != stripe.row_count() ||
                 stripe.outlier_mask.cols != state.K_padded ||
-                local_workspace.active_block_count != active_block_count)
+                slot.active_block_count != active_block_count)
                 return false;
 
             stripe.outlier_mask.clear_active_bits();
@@ -808,7 +806,7 @@ namespace ggml::gemmini::quants::act::exsia
             {
                 const size_t local_row = block / state.blocks_per_row;
                 const size_t blk_idx = block % state.blocks_per_row;
-                const BlockMask block_mask = local_workspace.block_mask(block, state.B_size);
+                const BlockMask block_mask = slot.block_mask(block, state.B_size);
                 for (size_t i = 0; i < block_mask.bit_count; ++i)
                 {
                     const size_t global_col = blk_idx * state.B_size + i;
@@ -1175,7 +1173,7 @@ namespace ggml::gemmini::quants::act::exsia
             }
 
             const size_t local_row = slot.stripe.local_row(row);
-            BlockMask block_mask = local_workspace_.block_mask(
+            BlockMask block_mask = slot.block_mask(
                 local_row * state_.blocks_per_row + block, state_.B_size);
             if (!local_.run(meta, state_, block_x, local_row, block, scratch, block_mask,
                              slot.q_wide, slot.block_exp
@@ -1198,20 +1196,11 @@ namespace ggml::gemmini::quants::act::exsia
         if (state_.mode == ExSIAState::ExecutionMode::LocalFoldingPipeline)
         {
 #if defined(GGML_GEMMINI_HAS_OPENMP)
-            size_t worker_token_count = 0;
-            if (!checked_mul_size(num_stripes, EXSIA_LOCAL_WORKER_COUNT, worker_token_count))
-                return fail(ExSIAState::FailureCode::InvalidInput);
-
-            std::vector<uint8_t> local_prepared(num_stripes);
-            std::vector<uint8_t> local_completed(num_stripes);
-            std::vector<uint8_t> worker_completed(worker_token_count);
+            std::vector<uint8_t> prepared(num_stripes);
+            std::vector<std::array<uint8_t, EXSIA_LOCAL_WORKER_COUNT>> worker_done(num_stripes);
+            std::vector<uint8_t> local_sealed(num_stripes);
             std::vector<uint8_t> slot_released(num_stripes);
-            uint8_t folding_chain = 0;
-            uint8_t *prepared_token = local_prepared.data();
-            uint8_t *completed_token = local_completed.data();
-            uint8_t *worker_token = worker_completed.data();
-            uint8_t *released_token = slot_released.data();
-            uint8_t *folding_token = &folding_chain;
+            uint8_t post_chain = 0;
             std::atomic<bool> pipeline_ok{true};
 #pragma omp parallel num_threads(EXSIA_OMP_THREAD_COUNT)
             {
@@ -1230,11 +1219,9 @@ namespace ggml::gemmini::quants::act::exsia
                         const size_t slot_idx = s % EXSIA_PIPELINE_SLOT_COUNT;
                         const size_t row_start = s * rows_per_stripe;
                         const size_t row_end = std::min((s + 1) * rows_per_stripe, args.I);
-                        const size_t worker_token_offset = s * EXSIA_LOCAL_WORKER_COUNT;
-
                         if (s == 0)
                         {
-#pragma omp task depend(out : prepared_token[s]) firstprivate(s, slot_idx, row_start, row_end, observed_team_size)
+#pragma omp task depend(out : prepared[s]) firstprivate(s, slot_idx, row_start, row_end, observed_team_size)
                             {
                                 try
                                 {
@@ -1297,7 +1284,7 @@ namespace ggml::gemmini::quants::act::exsia
                         }
                         else if (s == 1)
                         {
-#pragma omp task depend(in : completed_token[s - 1]) depend(out : prepared_token[s]) firstprivate(s, slot_idx, row_start, row_end, observed_team_size)
+#pragma omp task depend(in : local_sealed[s - 1]) depend(out : prepared[s]) firstprivate(s, slot_idx, row_start, row_end, observed_team_size)
                             {
                                 try
                                 {
@@ -1360,7 +1347,7 @@ namespace ggml::gemmini::quants::act::exsia
                         }
                         else
                         {
-#pragma omp task depend(in : completed_token[s - 1], released_token[s - 2]) depend(out : prepared_token[s]) firstprivate(s, slot_idx, row_start, row_end, observed_team_size)
+#pragma omp task depend(in : local_sealed[s - 1], slot_released[s - 2]) depend(out : prepared[s]) firstprivate(s, slot_idx, row_start, row_end, observed_team_size)
                             {
                                 try
                                 {
@@ -1424,7 +1411,7 @@ namespace ggml::gemmini::quants::act::exsia
 
                         for (size_t task_id = 0; task_id < EXSIA_LOCAL_WORKER_COUNT; ++task_id)
                         {
-#pragma omp task depend(in : prepared_token[s]) depend(out : worker_token[worker_token_offset + task_id]) firstprivate(s, slot_idx, task_id)
+#pragma omp task depend(in : prepared[s]) depend(out : worker_done[s][task_id]) firstprivate(s, slot_idx, task_id)
                             {
                                 try
                                 {
@@ -1474,7 +1461,7 @@ namespace ggml::gemmini::quants::act::exsia
                             }
                         }
 
-#pragma omp task depend(in : worker_token[worker_token_offset], worker_token[worker_token_offset + 1], worker_token[worker_token_offset + 2], worker_token[worker_token_offset + 3]) depend(out : completed_token[s]) firstprivate(s, slot_idx)
+#pragma omp task depend(in : worker_done[s][0], worker_done[s][1], worker_done[s][2], worker_done[s][3]) depend(out : local_sealed[s]) firstprivate(s, slot_idx)
                         {
                             try
                             {
@@ -1525,14 +1512,46 @@ namespace ggml::gemmini::quants::act::exsia
                             }
                             else
                             {
+#if EXSIA_VALIDATION
+                                state_.validation_p3_branch_counts[0] += slot.cycle_stats.p3_bypass_no_int_count;
+                                state_.validation_p3_branch_counts[1] += slot.cycle_stats.p3_bypass_same_scale_count;
+                                state_.validation_p3_branch_counts[2] += slot.cycle_stats.p3_replay_count;
+#endif
+#if EXSIA_PROFILE_COLLECTION_ENABLED
+                                StripeProfileRecord &profile = stripe_profiles[s];
+#if EXSIA_STAGE_PROFILE_ENABLED
+                                profile.stats = slot.cycle_stats;
+#endif
+                                if (!end_profile_interval(profile.local))
+                                {
+                                    record_failure(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
+                                    pipeline_ok.store(false, std::memory_order_relaxed);
+                                }
+#endif
+                            }
+                            }
+                            }
+                            catch (...)
+                            {
+                                record_failure(ExSIAState::FailureCode::Exception, s);
+                                pipeline_ok.store(false, std::memory_order_relaxed);
+                            }
+                        }
+
+#pragma omp task depend(in : local_sealed[s]) depend(inout : post_chain) depend(out : slot_released[s]) firstprivate(s, slot_idx)
+                        {
+                            try
+                            {
+                            if (pipeline_ok.load(std::memory_order_relaxed))
+                            {
+                                StripePipelineSlot &slot = pipeline_slots_[slot_idx];
                                 const size_t active_block_count =
                                     slot.stripe.row_count() * state_.blocks_per_row;
                                 EXSIA_PROFILE_COLLECT(
                                 StripeProfileRecord &profile = stripe_profiles[s];
                                 start_profile_interval(profile.mask_assembly);
                                 )
-                                const bool assembled = assemble_stripe_mask(
-                                    slot, local_workspace_, state_);
+                                const bool assembled = assemble_stripe_mask(slot, state_);
                                 EXSIA_PROFILE_COLLECT(
                                 if (!end_profile_interval(profile.mask_assembly))
                                 {
@@ -1565,79 +1584,47 @@ namespace ggml::gemmini::quants::act::exsia
                                     }
                                     )
                                     slot.mark_local_filled();
-                                    EXSIA_PROFILE_COLLECT(
-                                    if (!end_profile_interval(profile.local))
+                                    if (pipeline_ok.load(std::memory_order_relaxed))
                                     {
-                                        record_failure(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
-                                        pipeline_ok.store(false, std::memory_order_relaxed);
+                                        EXSIA_PROFILE_COLLECT(start_profile_interval(profile.folding);)
+                                        if (!folding_.run(meta, state_, slot.stripe, args, s, dst,
+                                                          slot.q_wide, slot.block_exp,
+                                                          state_.residual, slot.outliers))
+                                        {
+                                            record_failure(ExSIAState::FailureCode::FoldingFailure, s);
+                                            pipeline_ok.store(false, std::memory_order_relaxed);
+                                        }
+                                        else
+                                        {
+                                            meta.outliers.insert(meta.outliers.end(),
+                                                                 slot.outliers.begin(), slot.outliers.end());
+                                            slot.mark_folding_committed();
+                                            if (!snapshot_validation_mask(s, slot.stripe.outlier_mask))
+                                            {
+                                                record_failure(ExSIAState::FailureCode::ValidationSnapshotFailure, s);
+                                                pipeline_ok.store(false, std::memory_order_relaxed);
+                                            }
+                                            else
+                                            {
+                                                EXSIA_PROFILE_COLLECT(
+                                                if (!end_profile_interval(profile.folding))
+                                                {
+                                                    record_failure(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
+                                                    pipeline_ok.store(false, std::memory_order_relaxed);
+                                                }
+                                                )
+                                                slot.release();
+                                                EXSIA_PROFILE_COLLECT(
+                                                if (!end_profile_interval(profile.stripe_total))
+                                                {
+                                                    record_failure(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
+                                                    pipeline_ok.store(false, std::memory_order_relaxed);
+                                                }
+                                                )
+                                            }
+                                        }
                                     }
-                                    )
-#if EXSIA_STAGE_PROFILE_ENABLED
-                                    profile.stats = slot.cycle_stats;
-#endif
-#if EXSIA_VALIDATION
-                                    state_.validation_p3_branch_counts[0] += slot.cycle_stats.p3_bypass_no_int_count;
-                                    state_.validation_p3_branch_counts[1] += slot.cycle_stats.p3_bypass_same_scale_count;
-                                    state_.validation_p3_branch_counts[2] += slot.cycle_stats.p3_replay_count;
-#endif
                                 }
-                            }
-                            }
-                            }
-                            catch (...)
-                            {
-                                record_failure(ExSIAState::FailureCode::Exception, s);
-                                pipeline_ok.store(false, std::memory_order_relaxed);
-                            }
-                        }
-
-#pragma omp task depend(in : completed_token[s]) depend(inout : folding_token[0]) depend(out : released_token[s]) firstprivate(s, slot_idx)
-                        {
-                            try
-                            {
-                            if (pipeline_ok.load(std::memory_order_relaxed))
-                            {
-                            StripePipelineSlot &slot = pipeline_slots_[slot_idx];
-                            EXSIA_PROFILE_COLLECT(
-                            StripeProfileRecord &profile = stripe_profiles[s];
-                            start_profile_interval(profile.folding);
-                            )
-                            if (!folding_.run(meta, state_, slot.stripe, args, s, dst,
-                                              slot.q_wide, slot.block_exp,
-                                              state_.residual, slot.outliers))
-                            {
-                                record_failure(ExSIAState::FailureCode::FoldingFailure, s);
-                                pipeline_ok.store(false, std::memory_order_relaxed);
-                            }
-                            else
-                            {
-                                meta.outliers.insert(meta.outliers.end(),
-                                                     slot.outliers.begin(), slot.outliers.end());
-                                slot.mark_folding_committed();
-                                if (!snapshot_validation_mask(s, slot.stripe.outlier_mask))
-                                {
-                                    record_failure(ExSIAState::FailureCode::ValidationSnapshotFailure, s);
-                                    pipeline_ok.store(false, std::memory_order_relaxed);
-                                }
-                                else
-                                {
-                                    EXSIA_PROFILE_COLLECT(
-                                    if (!end_profile_interval(profile.folding))
-                                    {
-                                        record_failure(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
-                                        pipeline_ok.store(false, std::memory_order_relaxed);
-                                    }
-                                    )
-                                    slot.release();
-                                    EXSIA_PROFILE_COLLECT(
-                                    if (!end_profile_interval(profile.stripe_total))
-                                    {
-                                        record_failure(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
-                                        pipeline_ok.store(false, std::memory_order_relaxed);
-                                    }
-                                    )
-                                }
-                            }
                             }
                             }
                             catch (...)
@@ -1716,7 +1703,7 @@ namespace ggml::gemmini::quants::act::exsia
                 }
 
                 const size_t local_row = stripe.local_row(r);
-                BlockMask block_mask = local_workspace_.block_mask(
+                BlockMask block_mask = slot.block_mask(
                     local_row * state_.blocks_per_row + b, state_.B_size);
                 if (!local_.run(meta, state_, block_x, local_row, b, scratch, block_mask,
                                  slot.q_wide, slot.block_exp
@@ -1892,7 +1879,7 @@ namespace ggml::gemmini::quants::act::exsia
 #endif
             const size_t active_block_count = stripe.row_count() * state_.blocks_per_row;
             EXSIA_PROFILE_COLLECT(start_profile_interval(profile.mask_assembly);)
-            const bool assembled = assemble_stripe_mask(slot, local_workspace_, state_);
+            const bool assembled = assemble_stripe_mask(slot, state_);
             EXSIA_PROFILE_COLLECT(
             if (!end_profile_interval(profile.mask_assembly))
                 return fail(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
