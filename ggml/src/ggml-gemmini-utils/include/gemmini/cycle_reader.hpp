@@ -4,6 +4,8 @@
 
 #if defined(__APPLE__) && defined(__aarch64__)
 #include <mach/mach_time.h>
+#elif !defined(__riscv)
+#include <chrono>
 #endif
 
 namespace ggml::gemmini::cycle
@@ -25,7 +27,31 @@ namespace ggml::gemmini::cycle
 
     static inline uint64_t read()
     {
-        return 0;
+        return static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
     }
 #endif
+
+    static inline const char * clock_mode()
+    {
+#ifdef __riscv
+        return "CYCLE";
+#else
+        return "TIMER";
+#endif
+    }
+
+    static inline const char * units()
+    {
+#ifdef __riscv
+        return "cycles";
+#else
+        return "ticks";
+#endif
+    }
+
+    static inline uint64_t resolution()
+    {
+        return 1;
+    }
 }

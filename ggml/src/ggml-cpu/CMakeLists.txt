@@ -508,7 +508,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     target_compile_definitions(${GGML_CPU_NAME} PRIVATE ${ARCH_DEFINITIONS})
 
     if (GGML_BACKEND_DL)
-        if (GGML_NATIVE)
+        if (GGML_NATIVE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|i686|AMD64|amd64)$")
             # the feature check relies on ARCH_DEFINITIONS, but it is not set with GGML_NATIVE
             message(FATAL_ERROR "GGML_NATIVE is not compatible with GGML_BACKEND_DL, consider using GGML_CPU_ALL_VARIANTS")
         endif()

@@ -3,10 +3,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <mutex>
 #include <string>
 #include <system_error>
-#include <unordered_set>
 
 namespace ggml::gemmini::log
 {
@@ -95,22 +93,7 @@ namespace ggml::gemmini::log
         FILE *open_output_file(const std::filesystem::path &path)
         {
             const std::string key = path.string();
-            bool truncate = false;
-            static std::mutex opened_mutex;
-            static std::unordered_set<std::string> opened_paths;
-
-            {
-                std::lock_guard<std::mutex> lock(opened_mutex);
-                truncate = opened_paths.insert(key).second;
-            }
-
-            FILE *file = std::fopen(key.c_str(), truncate ? "w" : "a");
-            if (!file && truncate)
-            {
-                std::lock_guard<std::mutex> lock(opened_mutex);
-                opened_paths.erase(key);
-            }
-            return file;
+            return std::fopen(key.c_str(), "a");
         }
 
         void append_json_escaped(std::string &out, const char *s)
@@ -389,6 +372,20 @@ namespace ggml::gemmini::log
 
     DebugLog::DebugLog(FILE *out, bool add_newline)
         : Log(out), add_newline_(add_newline) {}
+
+    bool DebugLog::set_output_path(const char *path, bool truncate)
+    {
+#if LOG_DEBUG
+        if (truncate && path && *path && !truncate_file(path)) {
+            return false;
+        }
+        return Log::set_output_path(path);
+#else
+        (void)path;
+        (void)truncate;
+        return true;
+#endif
+    }
 
     void DebugLog::vwrite(FILE *out, const char *file, int line, const char *func, const char *fmt, va_list ap)
     {

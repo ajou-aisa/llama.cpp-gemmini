@@ -88,6 +88,7 @@ namespace ggml::gemmini::log
     {
     public:
         explicit DebugLog(FILE *out = stderr, bool add_newline = false);
+        bool set_output_path(const char *path, bool truncate = false);
 
         void operator()(const char *fmt, ...);
         void operator()(const char *file, int line, const char *func, const char *fmt, ...);
@@ -115,6 +116,7 @@ namespace ggml::gemmini::log
     {
     public:
         using Log::Log;
+        bool set_output_path(const char *path, bool truncate = false);
 
         void operator()(const char *layer, const char *op,
                         uint64_t start, uint64_t end);
