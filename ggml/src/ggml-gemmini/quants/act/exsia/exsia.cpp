@@ -1196,10 +1196,14 @@ namespace ggml::gemmini::quants::act::exsia
         if (state_.mode == ExSIAState::ExecutionMode::LocalFoldingPipeline)
         {
 #if defined(GGML_GEMMINI_HAS_OPENMP)
-            std::vector<uint8_t> prepared(num_stripes);
-            std::vector<std::array<uint8_t, EXSIA_LOCAL_WORKER_COUNT>> worker_done(num_stripes);
-            std::vector<uint8_t> local_sealed(num_stripes);
-            std::vector<uint8_t> slot_released(num_stripes);
+            std::vector<uint8_t> prepared_storage(num_stripes);
+            std::vector<uint8_t> worker_done_storage(num_stripes * EXSIA_LOCAL_WORKER_COUNT);
+            std::vector<uint8_t> local_sealed_storage(num_stripes);
+            std::vector<uint8_t> slot_released_storage(num_stripes);
+            uint8_t *prepared = prepared_storage.data();
+            uint8_t *worker_done = worker_done_storage.data();
+            uint8_t *local_sealed = local_sealed_storage.data();
+            uint8_t *slot_released = slot_released_storage.data();
             uint8_t post_chain = 0;
             std::atomic<bool> pipeline_ok{true};
 #pragma omp parallel num_threads(EXSIA_OMP_THREAD_COUNT)
@@ -1411,7 +1415,7 @@ namespace ggml::gemmini::quants::act::exsia
 
                         for (size_t task_id = 0; task_id < EXSIA_LOCAL_WORKER_COUNT; ++task_id)
                         {
-#pragma omp task depend(in : prepared[s]) depend(out : worker_done[s][task_id]) firstprivate(s, slot_idx, task_id)
+#pragma omp task depend(in : prepared[s]) depend(out : worker_done[s * EXSIA_LOCAL_WORKER_COUNT + task_id]) firstprivate(s, slot_idx, task_id)
                             {
                                 try
                                 {
@@ -1461,7 +1465,7 @@ namespace ggml::gemmini::quants::act::exsia
                             }
                         }
 
-#pragma omp task depend(in : worker_done[s][0], worker_done[s][1], worker_done[s][2], worker_done[s][3]) depend(out : local_sealed[s]) firstprivate(s, slot_idx)
+#pragma omp task depend(in : worker_done[s * EXSIA_LOCAL_WORKER_COUNT], worker_done[s * EXSIA_LOCAL_WORKER_COUNT + 1], worker_done[s * EXSIA_LOCAL_WORKER_COUNT + 2], worker_done[s * EXSIA_LOCAL_WORKER_COUNT + 3]) depend(out : local_sealed[s]) firstprivate(s, slot_idx)
                         {
                             try
                             {
