@@ -21,8 +21,8 @@
  * - If `GEMMINI_LOG_DIR` is set, all relative paths are resolved under it.
  *   For paths starting with `log/`, the `log/` prefix is stripped
  *   (so `log/out.jsonl` -> `$GEMMINI_LOG_DIR/out.jsonl`).
- * - Otherwise, paths starting with `log/` are resolved under `./log/` (CWD),
- *   and the `log/` directory is created when needed.
+ * - Otherwise, paths starting with `log/` are resolved under
+ *   `./output/log/` (CWD), and the directory is created when needed.
  *
  * Output format:
  * - Logs are emitted as JSON Lines (JSONL): 1 JSON object per line.
