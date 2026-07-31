@@ -830,6 +830,22 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         GGML_ABORT("Gemmini mul_mat size overflow");
     }
 
+#if CYCLE_DETAIL
+    const auto dequantize_weight = [&](auto dequantize, const auto *src, float *dst, size_t count, const char *label) {
+        const uint64_t start = ggml::gemmini::cycle::read();
+        dequantize(src, dst, count);
+        const uint64_t end = ggml::gemmini::cycle::read();
+        ggml::gemmini::log::cycle(
+            ggml::gemmini::log::file("log/wdeq-cycle-detail.jsonl"),
+            layer, label, start, end);
+    };
+#else
+    const auto dequantize_weight = [](auto dequantize, const auto *src, float *dst, size_t count, const char *label) {
+        (void) label;
+        dequantize(src, dst, count);
+    };
+#endif
+
 #if LOG_DUMP
     ggml::gemmini::log::dump(ggml::gemmini::log::file("log/tensor_data/act.jsonl"), layer, src1);
 #endif
@@ -856,7 +872,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             return;
         } else if (src0->type == GGML_TYPE_Q8_0) {
             std::vector<float> src0_f32(jk_count);
-            dequantize_row_q8_0((const block_q8_0 *)src0->data, src0_f32.data(), jk_count);
+            dequantize_weight(dequantize_row_q8_0, (const block_q8_0 *)src0->data, src0_f32.data(), jk_count,
+                              "weight.Dequantize Q8_0");
             ggml::gemmini::matmul_cpu_fp(false, true, I, J, K,
                                          (const float *)src1->data, src0_f32.data(), NULL, (float *)dst->data,
                                          K, K, 0, J);
@@ -874,28 +891,32 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             return;
         } else if (src0->type == GGML_TYPE_Q8_H1) {
             std::vector<float> src0_f32(jk_count);
-            dequantize_row_q8_h1((const block_q8_h1 *)src0->data, src0_f32.data(), jk_count);
+            dequantize_weight(dequantize_row_q8_h1, (const block_q8_h1 *)src0->data, src0_f32.data(), jk_count,
+                              "weight.Dequantize Q8_H1");
             ggml::gemmini::matmul_cpu_fp(false, true, I, J, K,
                                          (const float *)src1->data, src0_f32.data(), NULL, (float *)dst->data,
                                          K, K, 0, J);
             return;
         } else if (src0->type == GGML_TYPE_Q8_H2) {
             std::vector<float> src0_f32(jk_count);
-            dequantize_row_q8_h2((const block_q8_h2 *)src0->data, src0_f32.data(), jk_count);
+            dequantize_weight(dequantize_row_q8_h2, (const block_q8_h2 *)src0->data, src0_f32.data(), jk_count,
+                              "weight.Dequantize Q8_H2");
             ggml::gemmini::matmul_cpu_fp(false, true, I, J, K,
                                          (const float *)src1->data, src0_f32.data(), NULL, (float *)dst->data,
                                          K, K, 0, J);
             return;
         } else if (src0->type == GGML_TYPE_Q8_HP1) {
             std::vector<float> src0_f32(jk_count);
-            dequantize_row_q8_hp1((const block_q8_hp1 *)src0->data, src0_f32.data(), jk_count);
+            dequantize_weight(dequantize_row_q8_hp1, (const block_q8_hp1 *)src0->data, src0_f32.data(), jk_count,
+                              "weight.Dequantize Q8_HP1");
             ggml::gemmini::matmul_cpu_fp(false, true, I, J, K,
                                          (const float *)src1->data, src0_f32.data(), NULL, (float *)dst->data,
                                          K, K, 0, J);
             return;
         } else if (src0->type == GGML_TYPE_Q8_HP2) {
             std::vector<float> src0_f32(jk_count);
-            dequantize_row_q8_hp2((const block_q8_hp2 *)src0->data, src0_f32.data(), jk_count);
+            dequantize_weight(dequantize_row_q8_hp2, (const block_q8_hp2 *)src0->data, src0_f32.data(), jk_count,
+                              "weight.Dequantize Q8_HP2");
             ggml::gemmini::matmul_cpu_fp(false, true, I, J, K,
                                          (const float *)src1->data, src0_f32.data(), NULL, (float *)dst->data,
                                          K, K, 0, J);
@@ -994,7 +1015,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             src0_f = src0_f32.data();
         } else if (src0->type == GGML_TYPE_Q8_0) {
             src0_f32.resize(jk_count);
-            dequantize_row_q8_0(reinterpret_cast<const block_q8_0 *>(src0->data), src0_f32.data(), jk_count);
+            dequantize_weight(dequantize_row_q8_0, reinterpret_cast<const block_q8_0 *>(src0->data), src0_f32.data(), jk_count,
+                              "weight.Dequantize Q8_0");
             src0_f = src0_f32.data();
         } else if (src0->type == GGML_TYPE_Q8_CHANNEL) {
             src0_f32.resize(jk_count);
@@ -1006,19 +1028,23 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             src0_f = src0_f32.data();
         } else if (src0->type == GGML_TYPE_Q8_H1) {
             src0_f32.resize(jk_count);
-            dequantize_row_q8_h1(reinterpret_cast<const block_q8_h1 *>(src0->data), src0_f32.data(), jk_count);
+            dequantize_weight(dequantize_row_q8_h1, reinterpret_cast<const block_q8_h1 *>(src0->data), src0_f32.data(), jk_count,
+                              "weight.Dequantize Q8_H1");
             src0_f = src0_f32.data();
         } else if (src0->type == GGML_TYPE_Q8_H2) {
             src0_f32.resize(jk_count);
-            dequantize_row_q8_h2(reinterpret_cast<const block_q8_h2 *>(src0->data), src0_f32.data(), jk_count);
+            dequantize_weight(dequantize_row_q8_h2, reinterpret_cast<const block_q8_h2 *>(src0->data), src0_f32.data(), jk_count,
+                              "weight.Dequantize Q8_H2");
             src0_f = src0_f32.data();
         } else if (src0->type == GGML_TYPE_Q8_HP1) {
             src0_f32.resize(jk_count);
-            dequantize_row_q8_hp1(reinterpret_cast<const block_q8_hp1 *>(src0->data), src0_f32.data(), jk_count);
+            dequantize_weight(dequantize_row_q8_hp1, reinterpret_cast<const block_q8_hp1 *>(src0->data), src0_f32.data(), jk_count,
+                              "weight.Dequantize Q8_HP1");
             src0_f = src0_f32.data();
         } else if (src0->type == GGML_TYPE_Q8_HP2) {
             src0_f32.resize(jk_count);
-            dequantize_row_q8_hp2(reinterpret_cast<const block_q8_hp2 *>(src0->data), src0_f32.data(), jk_count);
+            dequantize_weight(dequantize_row_q8_hp2, reinterpret_cast<const block_q8_hp2 *>(src0->data), src0_f32.data(), jk_count,
+                              "weight.Dequantize Q8_HP2");
             src0_f = src0_f32.data();
         } else if (src0->type == GGML_TYPE_I8) {
             const float *scale = gemmini_i8_supported_scale_data(src0, args.transpose_B);
@@ -1371,14 +1397,14 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                     : ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TENSOR
                         ? ggml::gemmini::baseline_activation_quant_t::TENSOR
                         : ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::STRIPE
-                            ? ggml::gemmini::baseline_activation_quant_t::BLOCK
+                            ? ggml::gemmini::baseline_activation_quant_t::TENSOR
                             : ggml::gemmini::baseline_activation_quant_t::TOKEN;
             constexpr auto baseline_weight_quant =
                 ggml::gemmini::config::CURRENT_WEIGHT_QUANT == ggml::gemmini::config::WeightQuantAlgo::TENSOR
                     ? ggml::gemmini::baseline_weight_quant_t::TENSOR
                     : ggml::gemmini::baseline_weight_quant_t::FLOAT;
             const auto selected_baseline_weight_quant = src0->type == GGML_TYPE_Q8_CHANNEL
-                ? ggml::gemmini::baseline_weight_quant_t::CHANNEL
+                ? ggml::gemmini::baseline_weight_quant_t::TENSOR
                 : baseline_weight_quant;
             bool run_baseline = true;
 
