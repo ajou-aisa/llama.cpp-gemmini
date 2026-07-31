@@ -154,6 +154,15 @@ endif()
 # llama_build_and_test(test-opt.cpp) # SLOW
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
+add_executable(test-gemmini-log test-gemmini-log.cpp)
+target_link_libraries(test-gemmini-log PRIVATE ggml-gemmini-utils)
+target_compile_features(test-gemmini-log PRIVATE cxx_std_17)
+target_compile_definitions(test-gemmini-log PRIVATE
+    EXPECT_LOG_DEBUG=$<IF:$<BOOL:${LOG_DEBUG}>,1,0>)
+target_include_directories(test-gemmini-log PRIVATE
+    ../ggml/src/ggml-gemmini-utils/include)
+add_test(NAME test-gemmini-log
+    COMMAND $<TARGET_FILE:test-gemmini-log> ${CMAKE_CURRENT_BINARY_DIR}/gemmini-log-regression)
 llama_build_and_test(test-gemmini-q8-h1-h2-dequant-fp.cpp NAME gemmini_q8_h1_h2_dequant_fp)
 target_sources(gemmini_q8_h1_h2_dequant_fp PRIVATE
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
