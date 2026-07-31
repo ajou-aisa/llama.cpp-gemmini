@@ -87,6 +87,20 @@ extern "C"
         va_end(ap);
     }
 
+    void gemmini_log_ws_loop(uint64_t wall, uint64_t load, uint64_t exe, uint64_t store, uint64_t loop,
+                             uint64_t dim_I, uint64_t dim_J, uint64_t dim_K,
+                             uint64_t tile_I, uint64_t tile_J, uint64_t tile_K,
+                             uint64_t I0, uint64_t J0, uint64_t K0,
+                             uint64_t a_reuse, uint64_t b_reuse)
+    {
+        const gemmini_log_target target = gemmini_log_file("log/log-ws-loop.jsonl");
+        ggml::gemmini::log::debug.ws_loop(ggml::gemmini::log::file(target.path),
+                                          wall, load, exe, store, loop,
+                                          dim_I, dim_J, dim_K,
+                                          tile_I, tile_J, tile_K,
+                                          I0, J0, K0, a_reuse, b_reuse);
+    }
+
     void gemmini_log_cycle(const char *layer, const char *op, uint64_t start, uint64_t end)
     {
         ggml::gemmini::log::cycle(layer, op, start, end);
