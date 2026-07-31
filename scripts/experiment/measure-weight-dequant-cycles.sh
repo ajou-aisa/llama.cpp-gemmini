@@ -3,18 +3,19 @@ set -euo pipefail
 
 export LC_ALL=C
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-ROOT_DIR=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+BIN_DIR=${BIN_DIR:-"./build-arm64/bin"}
+OUTPUT_ROOT=${OUTPUT_ROOT:-"./output"}
+LOG_DIR=${LOG_DIR:-"$OUTPUT_ROOT/log"}
+EXPERIMENT_DIR=${EXPERIMENT_DIR:-"$OUTPUT_ROOT/experiment"}
+OUTPUT_DIR=${OUTPUT_DIR:-"$EXPERIMENT_DIR/wdeq-cycle-$(date '+%Y%m%d-%H%M%S')"}
 
-BIN_DIR=${BIN_DIR:-"$ROOT_DIR/build-arm64/bin"}
 RUNS=${RUNS:-10}
 TOKENS=${TOKENS:-15}
 SEED=${SEED:-1}
 PROMPT=${PROMPT:-"How's the weather today?"}
-OUTPUT_DIR=${OUTPUT_DIR:-"$BIN_DIR/log/wdeq-experiment-$(date '+%Y%m%d-%H%M%S')"}
 
 CLI="$BIN_DIR/llama-cli"
-CYCLE_LOG="$BIN_DIR/log/wdeq-cycle-detail.jsonl"
+CYCLE_LOG="$LOG_DIR/wdeq-cycle-detail.jsonl"
 RUNS_CSV="$OUTPUT_DIR/runs.csv"
 SUMMARY_CSV="$OUTPUT_DIR/summary.csv"
 
@@ -38,11 +39,11 @@ if ! command -v jq >/dev/null 2>&1; then
     exit 1
 fi
 
-mkdir -p "$OUTPUT_DIR" "$(dirname -- "$CYCLE_LOG")"
+mkdir -p "$LOG_DIR" "$OUTPUT_DIR"
 printf 'format,run,record_count,total_cycles\n' > "$RUNS_CSV"
 
 for format in "${BASELINES[@]}"; do
-    model="$ROOT_DIR/models/gpt2.$format.gguf"
+    model="./models/gpt2.$format.gguf"
     expected_op="weight.Dequantize $format"
 
     if [[ ! -f "$model" ]]; then
@@ -54,14 +55,12 @@ for format in "${BASELINES[@]}"; do
         printf '[%s] run %d/%d\n' "$format" "$run" "$RUNS"
         : > "$CYCLE_LOG"
 
-        (
-            cd "$BIN_DIR"
-            GEMMINI_LOG_DIR="$BIN_DIR/log" "$CLI" \
-                -m "$model" \
-                -p "$PROMPT" \
-                -n "$TOKENS" \
-                --seed "$SEED"
-        ) >/dev/null 2>&1
+        GEMMINI_LOG_DIR="$LOG_DIR" "$CLI" \
+            -m "$model" \
+            -p "$PROMPT" \
+            -n "$TOKENS" \
+            --seed "$SEED" \
+            >/dev/null 2>&1
 
         metrics=$(jq -ers --arg expected "$expected_op" '
             if length == 0 then

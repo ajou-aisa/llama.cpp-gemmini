@@ -74,7 +74,7 @@ namespace ggml::gemmini::log
                 {
                     cwd = ".";
                 }
-                std::filesystem::path base = cwd / "log";
+                std::filesystem::path base = cwd / "output" / "log";
                 return rel.empty() ? base : (base / rel);
             }
 

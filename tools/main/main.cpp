@@ -49,7 +49,7 @@ static void print_usage(int argc, char ** argv) {
     LOG("\nexample usage:\n");
     LOG("\n  text generation:     %s -m your_model.gguf -p \"I believe the meaning of life is\" -n 128 -no-cnv\n", argv[0]);
     LOG("\n  chat (conversation): %s -m your_model.gguf -sys \"You are a helpful assistant\"\n", argv[0]);
-    LOG("\n  Gemmini debug log:   %s --gemmini-debug-log log/debug-log.jsonl\n", argv[0]);
+    LOG("\n  Gemmini debug log:   %s --gemmini-debug-log PATH (default: ./output/log/debug-log.jsonl)\n", argv[0]);
     LOG("\n");
 }
 
