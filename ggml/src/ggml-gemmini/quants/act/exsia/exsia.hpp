@@ -348,10 +348,30 @@ namespace ggml::gemmini::quants::act::exsia
     };
 #endif
 
+    enum class P3Path
+    {
+        BypassNoIntegerOutlier,
+        BypassSameScale,
+        Replay,
+    };
+
+    struct LocalBlockCycleSample
+    {
+#if EXSIA_STAGE_PROFILE_ENABLED
+        uint64_t p0 = 0;
+        uint64_t p1 = 0;
+        uint64_t p2 = 0;
+        uint64_t p3 = 0;
+#endif
+        P3Path p3_path = P3Path::BypassNoIntegerOutlier;
+    };
+
 #if EXSIA_BRANCH_COUNTS_ENABLED
     struct StripeCycleStats
     {
 #if EXSIA_STAGE_PROFILE_ENABLED
+        // P0: exponent/top-bucket selection; P1: provisional quantization/statistics;
+        // P2: integer-outlier selection; P3: final exponent/replay decision.
         StageCycleStats p0;
         StageCycleStats p1;
         StageCycleStats p2;
@@ -375,23 +395,6 @@ namespace ggml::gemmini::quants::act::exsia
         }
     };
 
-    enum class P3Path
-    {
-        BypassNoIntegerOutlier,
-        BypassSameScale,
-        Replay,
-    };
-
-    struct LocalBlockCycleSample
-    {
-#if EXSIA_STAGE_PROFILE_ENABLED
-        uint64_t p0 = 0;
-        uint64_t p1 = 0;
-        uint64_t p2 = 0;
-        uint64_t p3 = 0;
-#endif
-        P3Path p3_path = P3Path::BypassNoIntegerOutlier;
-    };
 #endif
 
     constexpr size_t EXSIA_PIPELINE_SLOT_COUNT = GGML_GEMMINI_EXSIA_PIPELINE_SLOTS;
@@ -858,7 +861,7 @@ namespace ggml::gemmini::quants::act::exsia
     class LocalStage
     {
     public:
-        bool run(
+        bool run_optimized(
             Meta &meta,
             ExSIAState &state,
             const std::vector<float> &x,
@@ -874,6 +877,19 @@ namespace ggml::gemmini::quants::act::exsia
 #else
             );
 #endif
+
+        // Frozen oracle has a definition only in EXSIA_VALIDATION builds.
+        bool run_reference(
+            Meta &meta,
+            ExSIAState &state,
+            const std::vector<float> &x,
+            size_t local_row,
+            size_t blk_idx,
+            StripeScratch &scratch,
+            BlockMask &block_mask,
+            std::vector<int32_t> &stripe_q_wide,
+            std::vector<int16_t> &stripe_block_exp,
+            LocalBlockCycleSample &cycle_sample);
 
     private:
         ExpScanner unit_exp_;

@@ -645,7 +645,7 @@ namespace ggml::gemmini::quants::act::exsia
     }
 
 
-    bool LocalStage::run(
+    bool LocalStage::run_optimized(
         Meta &meta,
         ExSIAState &state,
         const std::vector<float> &x,
@@ -789,6 +789,134 @@ namespace ggml::gemmini::quants::act::exsia
 
         return true;
     }
+
+#if EXSIA_VALIDATION
+    bool LocalStage::run_reference(
+        Meta &meta,
+        ExSIAState &state,
+        const std::vector<float> &x,
+        size_t local_row,
+        size_t blk_idx,
+        StripeScratch &scratch,
+        BlockMask &block_mask,
+        std::vector<int32_t> &stripe_q_wide,
+        std::vector<int16_t> &stripe_block_exp,
+        LocalBlockCycleSample &cycle_sample)
+    {
+        const size_t blk_size = state.B_size;
+        const size_t base = local_row * state.K_padded + blk_idx * blk_size;
+        cycle_sample = LocalBlockCycleSample{};
+
+        GGML_ASSERT(x.size() == blk_size);
+        BlockState &blk = scratch.block;
+        const int16_t neg_inf = std::numeric_limits<int16_t>::min();
+        bool has_second_bucket = false;
+        std::vector<int32_t> &q_tmp = scratch.q_tmp;
+        std::vector<int32_t> &q_final = scratch.q_final;
+        __int128_t S = 0;
+        __int128_t SS = 0;
+        size_t unmasked_count = 0;
+        bool has_int_outlier = false;
+        int16_t e_pre = neg_inf;
+        int16_t theta_pre = neg_inf;
+#if EXSIA_STAGE_PROFILE_ENABLED
+        const uint64_t t0 = EXSIA_STAGE_CYCLE_READ();
+#endif
+
+        unit_exp_.scan_top2_exp(x, blk);
+        has_second_bucket = (blk.e2 != neg_inf);
+        block_mask.clear();
+
+        if (has_second_bucket)
+        {
+            for (size_t i = 0; i < blk_size; ++i)
+            {
+                const size_t col = blk_idx * blk_size + i;
+                if (col < state.K_logical && blk.e[i] != neg_inf && blk.e[i] == blk.e1)
+                    block_mask.set(i);
+            }
+        }
+
+        e_pre = has_second_bucket ? blk.e2 : blk.e1;
+#if EXSIA_STAGE_PROFILE_ENABLED
+        const uint64_t t1 = EXSIA_STAGE_CYCLE_READ();
+#endif
+
+        theta_pre = exp_to_theta(e_pre, meta.rho);
+        unit_quant_.quantize_block(blk.x, block_mask, theta_pre, q_tmp, S, SS);
+
+        for (size_t i = 0; i < blk_size; ++i)
+        {
+            const size_t col = blk_idx * blk_size + i;
+            if (col < state.K_logical && !block_mask.is_set(i))
+                ++unmasked_count;
+        }
+
+#if EXSIA_STAGE_PROFILE_ENABLED
+        const uint64_t t2 = EXSIA_STAGE_CYCLE_READ();
+#endif
+
+        for (size_t i = 0; i < blk_size; ++i)
+        {
+            const size_t col = blk_idx * blk_size + i;
+            if (col >= state.K_logical || block_mask.is_set(i))
+                continue;
+
+            if (unit_sigma_.detect_sigma(q_tmp[i], S, SS, unmasked_count))
+            {
+                block_mask.set(i);
+                has_int_outlier = true;
+            }
+        }
+
+#if EXSIA_STAGE_PROFILE_ENABLED
+        const uint64_t t3 = EXSIA_STAGE_CYCLE_READ();
+#endif
+
+        if (!has_int_outlier)
+        {
+            blk.e_b = e_pre;
+            blk.theta_b = theta_pre;
+            std::copy_n(q_tmp.begin(), blk_size, q_final.begin());
+            cycle_sample.p3_path = P3Path::BypassNoIntegerOutlier;
+        }
+        else
+        {
+            unit_exp_.update_block_top2_exp(block_mask, blk);
+            blk.e_b = blk.e1;
+            blk.theta_b = exp_to_theta(blk.e_b, meta.rho);
+
+            if (blk.theta_b == theta_pre)
+            {
+                std::copy_n(q_tmp.begin(), blk_size, q_final.begin());
+                cycle_sample.p3_path = P3Path::BypassSameScale;
+            }
+            else
+            {
+                unit_quant_.quantize_block(blk.x, blk.theta_b, q_final);
+                cycle_sample.p3_path = P3Path::Replay;
+            }
+        }
+
+        GGML_ASSERT(stripe_q_wide.size() >= base + blk_size);
+        for (size_t i = 0; i < blk_size; ++i)
+            stripe_q_wide[base + i] = q_final[i];
+
+        const size_t block_exp_idx = local_row * state.blocks_per_row + blk_idx;
+        GGML_ASSERT(stripe_block_exp.size() > block_exp_idx);
+        stripe_block_exp[block_exp_idx] = blk.e_b;
+
+#if EXSIA_STAGE_PROFILE_ENABLED
+        const uint64_t t4 = EXSIA_STAGE_CYCLE_READ();
+        cycle_sample.p0 = t1 >= t0 ? t1 - t0 : 0;
+        cycle_sample.p1 = t2 >= t1 ? t2 - t1 : 0;
+        cycle_sample.p2 = t3 >= t2 ? t3 - t2 : 0;
+        cycle_sample.p3 = t4 >= t3 ? t4 - t3 : 0;
+#endif
+
+        return true;
+    }
+#endif
 
     namespace
     {
@@ -1175,7 +1303,7 @@ namespace ggml::gemmini::quants::act::exsia
             const size_t local_row = slot.stripe.local_row(row);
             BlockMask block_mask = slot.block_mask(
                 local_row * state_.blocks_per_row + block, state_.B_size);
-            if (!local_.run(meta, state_, block_x, local_row, block, scratch, block_mask,
+            if (!local_.run_optimized(meta, state_, block_x, local_row, block, scratch, block_mask,
                              slot.q_wide, slot.block_exp
 #if EXSIA_BRANCH_COUNTS_ENABLED
                              , sample
@@ -1709,7 +1837,7 @@ namespace ggml::gemmini::quants::act::exsia
                 const size_t local_row = stripe.local_row(r);
                 BlockMask block_mask = slot.block_mask(
                     local_row * state_.blocks_per_row + b, state_.B_size);
-                if (!local_.run(meta, state_, block_x, local_row, b, scratch, block_mask,
+                if (!local_.run_optimized(meta, state_, block_x, local_row, b, scratch, block_mask,
                                  slot.q_wide, slot.block_exp
 #if EXSIA_BRANCH_COUNTS_ENABLED
                                  , sample
@@ -1881,6 +2009,11 @@ namespace ggml::gemmini::quants::act::exsia
             state_.validation_p3_branch_counts[1] += slot.cycle_stats.p3_bypass_same_scale_count;
             state_.validation_p3_branch_counts[2] += slot.cycle_stats.p3_replay_count;
 #endif
+            // local_total is intentionally sealed before Mask Assembly in every execution mode.
+            EXSIA_PROFILE_COLLECT(
+            if (!end_profile_interval(profile.local))
+                return fail(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
+            )
             const size_t active_block_count = stripe.row_count() * state_.blocks_per_row;
             EXSIA_PROFILE_COLLECT(start_profile_interval(profile.mask_assembly);)
             const bool assembled = assemble_stripe_mask(slot, state_);
@@ -1896,8 +2029,6 @@ namespace ggml::gemmini::quants::act::exsia
             reduce_stripe_exponents(slot, active_block_count);
             EXSIA_PROFILE_COLLECT(
             if (!end_profile_interval(profile.exponent_reduction))
-                return fail(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
-            if (!end_profile_interval(profile.local))
                 return fail(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
             )
             slot.mark_local_filled();

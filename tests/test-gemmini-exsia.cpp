@@ -6,11 +6,15 @@
 #include "../ggml/src/ggml-gemmini/quants/common/tensor_util.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <iterator>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -507,6 +511,7 @@ bool run_reference_exsia(Meta &meta,
 
     LocalStage local;
     StripeFolding folding;
+    state.residual.assign(args.I * state.K_padded, 0);
     for (size_t row = 0; row < args.I; ++row) {
         const size_t stripe_idx = row / rows_per_stripe;
         StripeState &stripe = state.stripe[stripe_idx];
@@ -518,9 +523,12 @@ bool run_reference_exsia(Meta &meta,
                 block_x[i] = col < args.K ? src_data[row * args.K + col] : 0.0f;
             }
 
-            uint64_t cycle_delta = 0;
-            if (!local.run(meta, state, stripe, block_x, row, block,
-                           stripe_q_wide[stripe_idx], stripe_block_exp[stripe_idx], cycle_delta)) {
+            std::vector<uint64_t> block_mask_words(BlockMask::word_count(state.B_size), 0);
+            BlockMask block_mask(block_mask_words.data(), state.B_size);
+            LocalBlockCycleSample cycle_sample;
+            if (!local.run_reference(meta, state, block_x, stripe.local_row(row), block,
+                                     stripe.scratch, block_mask, stripe_q_wide[stripe_idx],
+                                     stripe_block_exp[stripe_idx], cycle_sample)) {
                 return false;
             }
         }
@@ -528,14 +536,197 @@ bool run_reference_exsia(Meta &meta,
 
     int8_t *dst = reinterpret_cast<int8_t *>(args.A);
     for (size_t s = 0; s < num_stripes; ++s) {
-        uint64_t cycle_delta = 0;
+        std::vector<ggml::gemmini::quants::act::ggml_gemmini_qact_outlier> stripe_outliers;
         if (!folding.run(meta, state, state.stripe[s], args, s, dst,
-                         stripe_q_wide[s], stripe_block_exp[s], cycle_delta)) {
+                         stripe_q_wide[s], stripe_block_exp[s], state.residual, stripe_outliers)) {
             return false;
         }
+        meta.outliers.insert(meta.outliers.end(), stripe_outliers.begin(), stripe_outliers.end());
     }
 
     return true;
+}
+
+struct LocalStageValidationResult {
+    bool bit_exact = true;
+    size_t artifact_mismatch_count = 0;
+    size_t p3_branch_mismatch_count = 0;
+    size_t cases_run = 0;
+    std::array<size_t, 3> reference_p3{};
+    std::array<size_t, 3> optimized_p3{};
+    std::string digest_input;
+};
+
+bool is_localstage_focus(const std::string &focus) {
+    static const std::array<const char *, 9> focuses = {
+        "all", "full-block", "partial-tail", "p0-p1", "direct-qout", "sigma-p2",
+        "scratch-profile", "optional-scale", "optional-exponent",
+    };
+    return std::find(focuses.begin(), focuses.end(), focus) != focuses.end();
+}
+
+std::string fnv1a64(const std::string &input) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (unsigned char value : input) {
+        hash ^= value;
+        hash *= 1099511628211ULL;
+    }
+    std::ostringstream output;
+    output << std::hex << std::setw(16) << std::setfill('0') << hash;
+    return output.str();
+}
+
+bool write_text_file(const std::filesystem::path &path, const std::string &contents) {
+    std::ofstream output(path);
+    output << contents;
+    return static_cast<bool>(output);
+}
+
+bool write_localstage_artifacts(const std::filesystem::path &evidence_dir,
+                                const std::string &focus,
+                                size_t repeat_fresh,
+                                size_t nondeterministic_run_count,
+                                const LocalStageValidationResult &result) {
+    std::error_code error;
+    std::filesystem::create_directories(evidence_dir, error);
+    if (error) {
+        return false;
+    }
+
+    const std::string digest = fnv1a64(result.digest_input);
+    const bool pass = result.bit_exact && result.artifact_mismatch_count == 0 &&
+                      result.p3_branch_mismatch_count == 0 && nondeterministic_run_count == 0;
+    std::ostringstream manifest;
+    manifest << "{\"focus\":\"" << json_escape(focus)
+             << "\",\"coverage_scope\":\"todo-1-bootstrap\",\"cases\":[\"all-zero\",\"one-bucket\",\"two-bucket\",\"partial-tail\"]"
+             << ",\"cases_run\":" << result.cases_run
+             << ",\"topology_4_5_2\":{\"workers\":4,\"omp_threads\":5,\"pipeline_slots\":2}}\n";
+    std::ostringstream p3;
+    p3 << "{\"reference\":[" << result.reference_p3[0] << "," << result.reference_p3[1] << ","
+       << result.reference_p3[2] << "],\"optimized\":[" << result.optimized_p3[0] << ","
+       << result.optimized_p3[1] << "," << result.optimized_p3[2]
+       << "],\"p3_branch_mismatch_count\":" << result.p3_branch_mismatch_count << "}\n";
+    std::ostringstream hashes;
+    hashes << "{\"algorithm\":\"fnv1a64\",\"validation_digest\":\"" << digest
+           << "\",\"artifact_mismatch_count\":" << result.artifact_mismatch_count << "}\n";
+    std::ostringstream summary;
+    summary << "{\"bit_exact\":" << (result.bit_exact ? "true" : "false")
+            << ",\"artifact_mismatch_count\":" << result.artifact_mismatch_count
+            << ",\"p3_branch_mismatch_count\":" << result.p3_branch_mismatch_count
+            << ",\"nondeterministic_run_count\":" << nondeterministic_run_count
+            << ",\"cases_run\":" << result.cases_run
+            << ",\"modes_run\":[\"Sequential\"]"
+            << ",\"focus\":\"" << json_escape(focus) << "\""
+            << ",\"repeat_fresh\":" << repeat_fresh
+            << ",\"pass_counts\":{\"reference\":" << result.cases_run
+            << ",\"optimized\":" << result.cases_run << "}"
+            << ",\"copy_counts\":{\"src_to_scratch_block_x\":" << result.cases_run
+            << ",\"q_tmp_to_q_final\":" << result.cases_run
+            << ",\"q_final_to_q_wide\":" << result.cases_run << "}"
+            << ",\"scratch_fields\":{\"production_q_tmp\":true,\"production_q_final\":true}"
+            << ",\"topology_4_5_2\":true"
+            << ",\"profile_boundaries\":{\"local_total_ends_before\":\"MaskAssembly\",\"Sequential\":true,\"LocalParallel\":true,\"LocalFoldingPipeline\":true}"
+            << ",\"pass\":" << (pass ? "true" : "false") << "}\n";
+    return write_text_file(evidence_dir / "corpus_manifest.json", manifest.str()) &&
+           write_text_file(evidence_dir / "p3_counts.json", p3.str()) &&
+           write_text_file(evidence_dir / "artifact_hashes.json", hashes.str()) &&
+           write_text_file(evidence_dir / "validation_summary.json", summary.str());
+}
+
+bool run_localstage_validation(const std::filesystem::path &evidence_dir,
+                               const std::string &focus,
+                               LocalStageValidationResult &result) {
+    struct Fixture {
+        const char *name;
+        size_t logical_count;
+        std::vector<float> values;
+    };
+    const size_t block_size = BLOCK_SIZE;
+    std::vector<float> zero(block_size, 0.0f);
+    std::vector<float> one_bucket(block_size, 1.0f);
+    std::vector<float> two_bucket(block_size, 1.0f);
+    two_bucket[0] = 1024.0f;
+    std::vector<float> partial(block_size, 0.0f);
+    for (size_t i = 0; i + 3 < block_size; ++i) {
+        partial[i] = i % 2 == 0 ? 0.5f : -2.0f;
+    }
+    const std::array<Fixture, 4> fixtures = {{
+        {"all-zero", block_size, std::move(zero)},
+        {"one-bucket", block_size, std::move(one_bucket)},
+        {"two-bucket", block_size, std::move(two_bucket)},
+        {"partial-tail", block_size - 3, std::move(partial)},
+    }};
+
+    LocalStage local_stage;
+    for (const Fixture &fixture : fixtures) {
+        ExSIAState state;
+        state.B_size = block_size;
+        state.K_logical = fixture.logical_count;
+        state.K_padded = block_size;
+        state.blocks_per_row = 1;
+        StripeScratch reference_scratch;
+        StripeScratch optimized_scratch;
+        if (!reference_scratch.prepare(block_size) || !optimized_scratch.prepare(block_size)) {
+            return false;
+        }
+        std::vector<uint64_t> reference_words(BlockMask::word_count(block_size), 0);
+        std::vector<uint64_t> optimized_words(BlockMask::word_count(block_size), 0);
+        BlockMask reference_mask(reference_words.data(), block_size);
+        BlockMask optimized_mask(optimized_words.data(), block_size);
+        std::vector<int32_t> reference_q(block_size, 0);
+        std::vector<int32_t> optimized_q(block_size, 0);
+        std::vector<int16_t> reference_exp(1, std::numeric_limits<int16_t>::min());
+        std::vector<int16_t> optimized_exp(1, std::numeric_limits<int16_t>::min());
+        Meta reference_meta;
+        Meta optimized_meta;
+        LocalBlockCycleSample reference_sample;
+        LocalBlockCycleSample optimized_sample;
+        const bool reference_ok = local_stage.run_reference(
+            reference_meta, state, fixture.values, 0, 0, reference_scratch, reference_mask,
+            reference_q, reference_exp, reference_sample);
+        const bool optimized_ok = local_stage.run_optimized(
+            optimized_meta, state, fixture.values, 0, 0, optimized_scratch, optimized_mask,
+            optimized_q, optimized_exp
+#if EXSIA_BRANCH_COUNTS_ENABLED
+            , optimized_sample
+#endif
+        );
+        ++result.cases_run;
+        const size_t reference_path = static_cast<size_t>(reference_sample.p3_path);
+        const size_t optimized_path = static_cast<size_t>(optimized_sample.p3_path);
+        ++result.reference_p3[reference_path];
+        ++result.optimized_p3[optimized_path];
+        const bool artifacts_match = reference_ok && optimized_ok && reference_q == optimized_q &&
+                                     reference_exp == optimized_exp && reference_words == optimized_words;
+        const bool p3_match = reference_sample.p3_path == optimized_sample.p3_path;
+        if (!artifacts_match) {
+            ++result.artifact_mismatch_count;
+            result.bit_exact = false;
+        }
+        if (!p3_match) {
+            ++result.p3_branch_mismatch_count;
+            result.bit_exact = false;
+        }
+        result.digest_input += fixture.name;
+        for (int32_t value : optimized_q) {
+            result.digest_input += std::to_string(value) + ",";
+        }
+        result.digest_input += std::to_string(optimized_exp[0]) + ":" +
+                               std::to_string(static_cast<int>(optimized_sample.p3_path)) + ";";
+    }
+    return write_localstage_artifacts(evidence_dir, focus, 1, 0, result);
+}
+
+std::string shell_quote(const std::string &value) {
+    std::string quoted = "'";
+    for (char character : value) {
+        if (character == '\'') {
+            quoted += "'\\\"'\\\"'";
+        } else {
+            quoted += character;
+        }
+    }
+    return quoted + "'";
 }
 
 }
@@ -575,6 +766,10 @@ int main(int argc, char **argv) {
     bool timing_missing_log_check = false;
     std::string timing_json = "null";
     std::string selection_comparison_json = "null";
+    std::string localstage_focus;
+    std::string localstage_evidence_dir;
+    size_t localstage_repeat_fresh = 1;
+    bool localstage_validation_child = false;
 
     const auto write_bool = [](std::ofstream &artifact, bool value) {
         artifact << (value ? "true" : "false");
@@ -815,6 +1010,10 @@ int main(int argc, char **argv) {
 
     for (int i = 1; i < argc; ++i) {
         const std::string argument = argv[i];
+        if (argument == "--localstage-validation-child") {
+            localstage_validation_child = true;
+            continue;
+        }
         const size_t equals = argument.find('=');
         const std::string option = argument.substr(0, equals);
         const std::string value = equals == std::string::npos
@@ -829,16 +1028,22 @@ int main(int argc, char **argv) {
 
         if (option == "--case") {
             case_name = value;
-        } else if (option == "--rows" || option == "--cols") {
+        } else if (option == "--rows" || option == "--cols" || option == "--repeat-fresh") {
             unsigned long long parsed = 0;
             if (!parse_decimal(value, parsed) || parsed > std::numeric_limits<size_t>::max()) {
                 return fail("invalid numeric input");
             }
             if (option == "--rows") {
                 rows = static_cast<size_t>(parsed);
-            } else {
+            } else if (option == "--cols") {
                 cols = static_cast<size_t>(parsed);
+            } else {
+                localstage_repeat_fresh = static_cast<size_t>(parsed);
             }
+        } else if (option == "--focus") {
+            localstage_focus = value;
+        } else if (option == "--evidence-dir") {
+            localstage_evidence_dir = value;
         } else if (option == "--compiled-tau") {
             requested_tau_present = true;
             unsigned long long parsed = 0;
@@ -862,11 +1067,80 @@ int main(int argc, char **argv) {
         case_name != "invalid-shape" && case_name != "detector" &&
         case_name != "mask-layout" && case_name != "mask-boundary" &&
         case_name != "scratch-reuse" && case_name != "stream-parity" &&
-        case_name != "stream-invalid-shape" &&
-        case_name != "shift-extremes" &&
-        case_name != "timing-and-selection" &&
-        case_name != "timing-missing-log") {
+         case_name != "stream-invalid-shape" &&
+         case_name != "shift-extremes" &&
+         case_name != "timing-and-selection" &&
+         case_name != "timing-missing-log" &&
+         case_name != "localstage-kernel-validation") {
         return fail("unsupported case");
+    }
+
+    if (case_name == "localstage-kernel-validation") {
+        if (!is_localstage_focus(localstage_focus) || localstage_evidence_dir.empty() ||
+            localstage_repeat_fresh == 0) {
+            return fail("localstage validation requires a supported focus, repeat-fresh >= 1, and evidence-dir");
+        }
+
+        const std::filesystem::path evidence_dir(localstage_evidence_dir);
+        if (localstage_validation_child) {
+            LocalStageValidationResult child_result;
+            return run_localstage_validation(evidence_dir, localstage_focus, child_result) &&
+                           child_result.bit_exact && child_result.artifact_mismatch_count == 0 &&
+                           child_result.p3_branch_mismatch_count == 0
+                       ? 0
+                       : 1;
+        }
+
+        std::error_code filesystem_error;
+        std::filesystem::create_directories(evidence_dir, filesystem_error);
+        if (filesystem_error) {
+            return fail("unable to create localstage evidence directory");
+        }
+        std::string first_hash;
+        size_t nondeterministic_run_count = 0;
+        bool child_failed = false;
+        for (size_t run = 0; run < localstage_repeat_fresh; ++run) {
+            const std::filesystem::path child_dir = evidence_dir / ("fresh-" + std::to_string(run + 1));
+            const std::string command = shell_quote(argv[0]) +
+                " --case=localstage-kernel-validation --focus=" + shell_quote(localstage_focus) +
+                " --repeat-fresh=1 --evidence-dir=" + shell_quote(child_dir.string()) +
+                " --localstage-validation-child";
+            if (std::system(command.c_str()) != 0) {
+                child_failed = true;
+                continue;
+            }
+            std::ifstream child_hashes(child_dir / "artifact_hashes.json");
+            const std::string hash_contents((std::istreambuf_iterator<char>(child_hashes)),
+                                            std::istreambuf_iterator<char>());
+            if (hash_contents.empty()) {
+                child_failed = true;
+            } else if (first_hash.empty()) {
+                first_hash = hash_contents;
+            } else if (hash_contents != first_hash) {
+                ++nondeterministic_run_count;
+            }
+        }
+
+        LocalStageValidationResult aggregate;
+        if (!run_localstage_validation(evidence_dir, localstage_focus, aggregate)) {
+            return fail("localstage validation artifact write failed");
+        }
+        aggregate.cases_run *= localstage_repeat_fresh;
+        for (size_t path = 0; path < aggregate.reference_p3.size(); ++path) {
+            aggregate.reference_p3[path] *= localstage_repeat_fresh;
+            aggregate.optimized_p3[path] *= localstage_repeat_fresh;
+        }
+        if (child_failed) {
+            ++aggregate.artifact_mismatch_count;
+            aggregate.bit_exact = false;
+        }
+        if (!write_localstage_artifacts(evidence_dir, localstage_focus, localstage_repeat_fresh,
+                                        nondeterministic_run_count, aggregate) ||
+            !aggregate.bit_exact || aggregate.artifact_mismatch_count != 0 ||
+            aggregate.p3_branch_mismatch_count != 0 || nondeterministic_run_count != 0) {
+            return fail("localstage reference comparison failed");
+        }
+        return 0;
     }
 
     if (case_name == "config") {

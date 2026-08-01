@@ -189,7 +189,8 @@ target_link_libraries(test-gemmini-exsia PRIVATE ggml-base ggml-gemmini-utils)
 target_compile_features(test-gemmini-exsia PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-exsia PRIVATE
     GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
-    CYCLE_DETAIL=${CYCLE_DETAIL})
+    CYCLE_DETAIL=${CYCLE_DETAIL}
+    EXSIA_VALIDATION=1)
 target_include_directories(test-gemmini-exsia PRIVATE
     ../ggml/include
     ../ggml/src
@@ -208,6 +209,12 @@ add_test(NAME gemmini_exsia_all
     COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=all --rows=65 --cols=37 --compiled-tau=${GGML_GEMMINI_EXSIA_SIGMA})
 add_test(NAME gemmini_exsia_shift_extremes
     COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=shift-extremes --compiled-tau=${GGML_GEMMINI_EXSIA_SIGMA})
+add_test(NAME gemmini_exsia_localstage_kernel_validation
+    COMMAND $<TARGET_FILE:test-gemmini-exsia>
+        --case=localstage-kernel-validation
+        --focus=all
+        --repeat-fresh=10
+        --evidence-dir=${CMAKE_CURRENT_BINARY_DIR}/exsia-localstage-kernel-validation)
 llama_build_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_build_and_test(test-autorelease.cpp        LABEL "model")
 
