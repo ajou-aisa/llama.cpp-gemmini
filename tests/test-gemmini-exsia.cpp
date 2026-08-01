@@ -560,9 +560,15 @@ bool run_reference_exsia(Meta &meta,
 
 struct LocalStageValidationResult {
     bool bit_exact = true;
+    bool padding_q_out_zero = true;
+    bool padding_mask_clear = true;
+    bool padding_exponent_neg_inf = true;
     size_t artifact_mismatch_count = 0;
     size_t p3_branch_mismatch_count = 0;
+    size_t src_to_scratch_block_x_copy_count = 0;
     size_t cases_run = 0;
+    size_t full_block_case_count = 0;
+    size_t partial_tail_case_count = 0;
     size_t reference_pass_count = 0;
     size_t optimized_pass_count = 0;
     std::array<size_t, 3> reference_p3{};
@@ -630,10 +636,16 @@ bool write_localstage_artifacts(const std::filesystem::path &evidence_dir,
     }
 
     const std::string digest = fnv1a64(focus + "\n" + result.digest_input);
+    const bool full_block_copy_free = result.src_to_scratch_block_x_copy_count == 0;
+    const bool padding_checked = result.partial_tail_case_count != 0;
     const bool pass = result.bit_exact && result.artifact_mismatch_count == 0 &&
-                      result.p3_branch_mismatch_count == 0 && nondeterministic_run_count == 0 &&
-                      EXSIA_LOCAL_WORKER_COUNT == 4 && EXSIA_OMP_THREAD_COUNT == 5 &&
-                      EXSIA_PIPELINE_SLOT_COUNT == 2;
+                       result.p3_branch_mismatch_count == 0 && nondeterministic_run_count == 0 &&
+                       (focus != "full-block" || full_block_copy_free) &&
+                       (focus != "partial-tail" ||
+                        (padding_checked && result.padding_q_out_zero && result.padding_mask_clear &&
+                         result.padding_exponent_neg_inf)) &&
+                       EXSIA_LOCAL_WORKER_COUNT == 4 && EXSIA_OMP_THREAD_COUNT == 5 &&
+                       EXSIA_PIPELINE_SLOT_COUNT == 2;
     std::ostringstream manifest;
     manifest << "{\"focus\":\"" << json_escape(focus)
              << "\",\"coverage_scope\":\"todo-1-bootstrap\",\"cases\":[";
@@ -663,13 +675,21 @@ bool write_localstage_artifacts(const std::filesystem::path &evidence_dir,
              << ",\"modes_run\":[]"
              << ",\"focus\":\"" << json_escape(focus) << "\""
              << ",\"repeat_fresh\":" << repeat_fresh
-             << ",\"pass_counts\":{\"reference\":" << result.reference_pass_count
-             << ",\"optimized\":" << result.optimized_pass_count << "}"
-             << ",\"copy_counts\":{\"status\":\"not-enabled\",\"src_to_scratch_block_x\":null"
-             << ",\"q_tmp_to_q_final\":null,\"q_final_to_q_wide\":null}"
-             << ",\"scratch_fields\":{\"status\":\"not-enabled\",\"production_q_tmp\":null"
-             << ",\"production_q_final\":null}"
-             << ",\"topology_4_5_2\":"
+              << ",\"pass_counts\":{\"reference\":" << result.reference_pass_count
+              << ",\"optimized\":" << result.optimized_pass_count << "}"
+              << ",\"copy_counts\":{\"status\":\"enabled\",\"src_to_scratch_block_x\":"
+              << result.src_to_scratch_block_x_copy_count
+              << ",\"q_tmp_to_q_final\":null,\"q_final_to_q_wide\":null}"
+              << ",\"scratch_fields\":{\"status\":\"not-enabled\",\"production_q_tmp\":null"
+              << ",\"production_q_final\":null}"
+              << ",\"padding_validation_case_count\":" << result.partial_tail_case_count
+              << ",\"padding_q_out_zero\":"
+              << (padding_checked && result.padding_q_out_zero ? "true" : "false")
+              << ",\"padding_mask_clear\":"
+              << (padding_checked && result.padding_mask_clear ? "true" : "false")
+              << ",\"padding_exponent_neg_inf\":"
+              << (padding_checked && result.padding_exponent_neg_inf ? "true" : "false")
+              << ",\"topology_4_5_2\":"
              << ((EXSIA_LOCAL_WORKER_COUNT == 4 && EXSIA_OMP_THREAD_COUNT == 5 &&
                   EXSIA_PIPELINE_SLOT_COUNT == 2) ? "true" : "false")
              << ",\"profile_boundaries\":{\"status\":\"not-enabled\",\"reason\":\"execution-mode profile hook not exercised by direct LocalStage validation\"}"
@@ -732,17 +752,37 @@ bool run_localstage_validation(const std::filesystem::path &evidence_dir,
         Meta optimized_meta;
         LocalBlockCycleSample reference_sample;
         LocalBlockCycleSample optimized_sample;
+        std::copy_n(fixture.values.begin(), block_size, reference_scratch.block.x.begin());
         const bool reference_ok = local_stage.run_reference(
-            reference_meta, state, fixture.values, 0, 0, reference_scratch, reference_mask,
+            reference_meta, state, reference_scratch.block.x, 0, 0, reference_scratch, reference_mask,
             reference_q, reference_exp, reference_sample);
+        std::fill(optimized_scratch.block.x.begin(), optimized_scratch.block.x.end(),
+                  std::numeric_limits<float>::max());
+        const std::vector<float> optimized_input_sentinel = optimized_scratch.block.x;
         const bool optimized_ok = local_stage.run_optimized(
-            optimized_meta, state, fixture.values, 0, 0, optimized_scratch, optimized_mask,
-            optimized_q, optimized_exp
+            optimized_meta, state, fixture.values.data(), fixture.logical_count, block_size, 0, 0,
+            optimized_scratch, optimized_mask, optimized_q.data(), optimized_exp[0]
 #if EXSIA_BRANCH_COUNTS_ENABLED
             , optimized_sample
 #endif
         );
         ++result.cases_run;
+        if (fixture.logical_count == block_size) {
+            ++result.full_block_case_count;
+            if (optimized_scratch.block.x != optimized_input_sentinel) {
+                ++result.src_to_scratch_block_x_copy_count;
+            }
+        } else {
+            ++result.partial_tail_case_count;
+            ++result.src_to_scratch_block_x_copy_count;
+            const int16_t neg_inf = std::numeric_limits<int16_t>::min();
+            for (size_t i = fixture.logical_count; i < block_size; ++i) {
+                result.padding_q_out_zero = result.padding_q_out_zero && optimized_q[i] == 0;
+                result.padding_mask_clear = result.padding_mask_clear && !optimized_mask.is_set(i);
+                result.padding_exponent_neg_inf = result.padding_exponent_neg_inf &&
+                                                  optimized_scratch.block.e[i] == neg_inf;
+            }
+        }
         if (reference_ok) {
             ++result.reference_pass_count;
         }

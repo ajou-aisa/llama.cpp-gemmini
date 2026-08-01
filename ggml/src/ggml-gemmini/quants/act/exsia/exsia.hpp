@@ -801,6 +801,7 @@ namespace ggml::gemmini::quants::act::exsia
         int16_t unbiased_exp(const float &x);
         void scan_top2_exp(const std::vector<float> &x,
                            BlockState &blk); // scan top-2 distinct exponents for a block and store them in the block state
+        void scan_top2_exp(const float *x, size_t count, BlockState &blk);
 
         void update_block_top2_exp(const BlockMask &mask, BlockState &blk);
 
@@ -841,11 +842,22 @@ namespace ggml::gemmini::quants::act::exsia
                              __int128_t &S,
                              __int128_t &SS) const;
         void quantize_block(const std::vector<float> &x,
+                             const BlockMask &mask,
+                             int16_t theta_b,
+                             std::vector<int32_t> &q,
+                             __int128_t &S,
+                             __int128_t &SS) const;
+        void quantize_block(const float *x,
+                            size_t count,
                             const BlockMask &mask,
                             int16_t theta_b,
                             std::vector<int32_t> &q,
                             __int128_t &S,
                             __int128_t &SS) const;
+        void quantize_block(const float *x,
+                            size_t count,
+                            int16_t theta_b,
+                            std::vector<int32_t> &q) const;
     };
 
     class SigmaDetector
@@ -867,13 +879,15 @@ namespace ggml::gemmini::quants::act::exsia
         bool run_optimized(
             Meta &meta,
             ExSIAState &state,
-            const std::vector<float> &x,
+            const float *x,
+            size_t valid_count,
+            size_t block_size,
             size_t local_row,
             size_t blk_idx,
             StripeScratch &scratch,
             BlockMask &block_mask,
-            std::vector<int32_t> &stripe_q_wide,
-            std::vector<int16_t> &stripe_block_exp
+            int32_t *q_out,
+            int16_t &block_exp_out
 #if EXSIA_BRANCH_COUNTS_ENABLED
             ,
             LocalBlockCycleSample &cycle_sample);
@@ -897,6 +911,36 @@ namespace ggml::gemmini::quants::act::exsia
 #endif
 
     private:
+        bool run_optimized_full(
+            Meta &meta,
+            const float *x,
+            size_t block_size,
+            StripeScratch &scratch,
+            BlockMask &block_mask,
+            int32_t *q_out,
+            int16_t &block_exp_out
+#if EXSIA_BRANCH_COUNTS_ENABLED
+            ,
+            LocalBlockCycleSample &cycle_sample);
+#else
+            );
+#endif
+        bool run_optimized_partial(
+            Meta &meta,
+            const float *x,
+            size_t valid_count,
+            size_t block_size,
+            StripeScratch &scratch,
+            BlockMask &block_mask,
+            int32_t *q_out,
+            int16_t &block_exp_out
+#if EXSIA_BRANCH_COUNTS_ENABLED
+            ,
+            LocalBlockCycleSample &cycle_sample);
+#else
+            );
+#endif
+
         ExpScanner unit_exp_;
         WideQuantizer unit_quant_;
         SigmaDetector unit_sigma_;
