@@ -272,17 +272,30 @@ namespace ggml::gemmini::quants::act::exsia
     struct StripeScratch
     {
         BlockState block;
-        std::vector<int32_t> q_tmp;
-        std::vector<int32_t> q_final;
         BitMask folding_inlier_mask;
 #if EXSIA_VALIDATION
-        int16_t p0_e1 = std::numeric_limits<int16_t>::min();
-        int16_t p0_e2 = std::numeric_limits<int16_t>::min();
-        int16_t p0_e_pre = std::numeric_limits<int16_t>::min();
-        std::vector<uint64_t> p0_top_mask_words;
-        __int128_t p1_S = 0;
-        __int128_t p1_SS = 0;
-        size_t p1_N = 0;
+        struct ReferenceScratch
+        {
+            std::vector<int32_t> q_tmp;
+            std::vector<int32_t> q_final;
+            int16_t p0_e1 = std::numeric_limits<int16_t>::min();
+            int16_t p0_e2 = std::numeric_limits<int16_t>::min();
+            int16_t p0_e_pre = std::numeric_limits<int16_t>::min();
+            std::vector<uint64_t> p0_top_mask_words;
+            __int128_t p1_S = 0;
+            __int128_t p1_SS = 0;
+            size_t p1_N = 0;
+
+            void prepare(size_t block_size)
+            {
+                if (q_tmp.size() < block_size)
+                    q_tmp.resize(block_size);
+                if (q_final.size() < block_size)
+                    q_final.resize(block_size);
+                if (p0_top_mask_words.size() < BlockMask::word_count(block_size))
+                    p0_top_mask_words.resize(BlockMask::word_count(block_size));
+            }
+        } reference;
 #endif
 
         bool prepare(size_t block_size)
@@ -293,13 +306,8 @@ namespace ggml::gemmini::quants::act::exsia
                 return false;
             }
 
-            if (q_tmp.size() < block_size)
-                q_tmp.resize(block_size);
-            if (q_final.size() < block_size)
-                q_final.resize(block_size);
 #if EXSIA_VALIDATION
-            if (p0_top_mask_words.size() < BlockMask::word_count(block_size))
-                p0_top_mask_words.resize(BlockMask::word_count(block_size));
+            reference.prepare(block_size);
 #endif
             return true;
         }
@@ -371,9 +379,9 @@ namespace ggml::gemmini::quants::act::exsia
     struct LocalBlockCycleSample
     {
 #if EXSIA_STAGE_PROFILE_ENABLED
-        // Baseline stages: P0 scans exponents and marks the top bucket; P1 quantizes
-        // provisionally and accumulates S/SS; P2 marks integer outliers; P3 selects
-        // the final exponent, copies or replays quantization, then stores block output.
+        // P0 scans exponents and marks top buckets. P1 writes provisional q_out and
+        // accumulates S/SS. P2 marks integer outliers and tracks the final exponent.
+        // P3 commits it, retaining q_out or overwriting it only for changed-scale replay.
         uint64_t p0 = 0;
         uint64_t p1 = 0;
         uint64_t p2 = 0;
@@ -398,8 +406,8 @@ namespace ggml::gemmini::quants::act::exsia
     struct StripeCycleStats
     {
 #if EXSIA_STAGE_PROFILE_ENABLED
-        // P0: exponent/top-bucket selection; P1: provisional quantization/statistics;
-        // P2: integer-outlier selection; P3: final exponent/replay decision.
+        // P0: exponent/top-bucket selection; P1: direct q_out/statistics;
+        // P2: integer-outlier/final-exponent selection; P3: q_out replay decision.
         StageCycleStats p0;
         StageCycleStats p1;
         StageCycleStats p2;
@@ -470,8 +478,8 @@ namespace ggml::gemmini::quants::act::exsia
         FoldingCommitted,
     };
 
-    // Owns every mutable value that belongs to one in-flight stripe. Separate slots
-    // keep Local(s+1) scratch disjoint from Folding(s) scratch and row writes.
+    // Owns every mutable value for one in-flight stripe. Separate slots keep Local(s+1)
+    // q_wide and block masks disjoint from Folding(s) reads and output row writes.
     struct StripePipelineSlot
     {
         size_t stripe_idx = 0;
@@ -481,9 +489,9 @@ namespace ggml::gemmini::quants::act::exsia
 
         StripeState stripe; // canonical stripe state, mask, and folding scratch
 
-        std::vector<int32_t> q_wide;    // max_stripe_rows * K_padded
-        std::vector<int16_t> block_exp; // max_stripe_rows * blocks_per_row
-        std::vector<uint64_t> block_mask_words;
+        std::vector<int32_t> q_wide;    // slot-owned local output, max_stripe_rows * K_padded
+        std::vector<int16_t> block_exp; // slot-owned local exponents, max_stripe_rows * blocks_per_row
+        std::vector<uint64_t> block_mask_words; // slot-owned storage for per-block BlockMask views
         size_t block_mask_words_per_block = 0;
         size_t active_block_count = 0;
         std::vector<ggml_gemmini_qact_outlier> outliers; // stripe-local, merged after folding
@@ -626,7 +634,7 @@ namespace ggml::gemmini::quants::act::exsia
         size_t row_end = 0;
         size_t block_start = 0;
         size_t block_end = 0;
-        StripeScratch scratch; // worker-private block state and masks
+        StripeScratch scratch; // worker-private reusable Local block state
 
         bool prepare(size_t block_size)
         {

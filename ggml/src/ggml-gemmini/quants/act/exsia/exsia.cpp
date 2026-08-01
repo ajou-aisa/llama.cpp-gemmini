@@ -859,13 +859,13 @@ namespace ggml::gemmini::quants::act::exsia
             ++unmasked_count;
         }
 #if EXSIA_VALIDATION
-        scratch.p0_e1 = blk.e1;
-        scratch.p0_e2 = blk.e2;
-        scratch.p0_e_pre = e_pre;
-        std::copy_n(block_mask.words, BlockMask::word_count(block_size), scratch.p0_top_mask_words.begin());
-        scratch.p1_S = S;
-        scratch.p1_SS = SS;
-        scratch.p1_N = unmasked_count;
+        scratch.reference.p0_e1 = blk.e1;
+        scratch.reference.p0_e2 = blk.e2;
+        scratch.reference.p0_e_pre = e_pre;
+        std::copy_n(block_mask.words, BlockMask::word_count(block_size), scratch.reference.p0_top_mask_words.begin());
+        scratch.reference.p1_S = S;
+        scratch.reference.p1_SS = SS;
+        scratch.reference.p1_N = unmasked_count;
 #endif
 
 #if EXSIA_STAGE_PROFILE_ENABLED
@@ -1024,13 +1024,13 @@ namespace ggml::gemmini::quants::act::exsia
             ++unmasked_count;
         }
 #if EXSIA_VALIDATION
-        scratch.p0_e1 = blk.e1;
-        scratch.p0_e2 = blk.e2;
-        scratch.p0_e_pre = e_pre;
-        std::copy_n(block_mask.words, BlockMask::word_count(block_size), scratch.p0_top_mask_words.begin());
-        scratch.p1_S = S;
-        scratch.p1_SS = SS;
-        scratch.p1_N = unmasked_count;
+        scratch.reference.p0_e1 = blk.e1;
+        scratch.reference.p0_e2 = blk.e2;
+        scratch.reference.p0_e_pre = e_pre;
+        std::copy_n(block_mask.words, BlockMask::word_count(block_size), scratch.reference.p0_top_mask_words.begin());
+        scratch.reference.p1_S = S;
+        scratch.reference.p1_SS = SS;
+        scratch.reference.p1_N = unmasked_count;
 #endif
 #if EXSIA_STAGE_PROFILE_ENABLED
         const uint64_t t2 = EXSIA_STAGE_CYCLE_READ();
@@ -1127,8 +1127,8 @@ namespace ggml::gemmini::quants::act::exsia
         BlockState &blk = scratch.block;
         const int16_t neg_inf = std::numeric_limits<int16_t>::min();
         bool has_second_bucket = false;
-        std::vector<int32_t> &q_tmp = scratch.q_tmp;
-        std::vector<int32_t> &q_final = scratch.q_final;
+        std::vector<int32_t> &q_tmp = scratch.reference.q_tmp;
+        std::vector<int32_t> &q_final = scratch.reference.q_final;
         __int128_t S = 0;
         __int128_t SS = 0;
         size_t unmasked_count = 0;
@@ -1970,8 +1970,8 @@ namespace ggml::gemmini::quants::act::exsia
 #if EXSIA_STAGE_PROFILE_ENABLED
                                 profile.stats = slot.cycle_stats;
 #endif
-                                // Seal local_total at the worker join; the next task owns
-                                // Mask Assembly and Exponent Reduction.
+                                // local_total ends at the worker join, before Mask Assembly,
+                                // Exponent Reduction, and Folding.
                                 if (!end_profile_interval(profile.local))
                                 {
                                     record_failure(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
@@ -2327,7 +2327,7 @@ namespace ggml::gemmini::quants::act::exsia
             state_.validation_p3_branch_counts[1] += slot.cycle_stats.p3_bypass_same_scale_count;
             state_.validation_p3_branch_counts[2] += slot.cycle_stats.p3_replay_count;
 #endif
-            // Sequential and LocalParallel seal local_total before stripe-wide work.
+            // local_total ends after Local and before Mask Assembly, Exponent Reduction, and Folding.
             EXSIA_PROFILE_COLLECT(
             if (!end_profile_interval(profile.local))
                 return fail(ExSIAState::FailureCode::ProfileIntervalInvalid, s);

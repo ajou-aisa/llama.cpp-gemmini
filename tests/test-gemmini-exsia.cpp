@@ -1,3 +1,7 @@
+#ifndef EXSIA_VALIDATION
+#define EXSIA_VALIDATION 1
+#endif
+
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
 #include "../ggml/src/ggml-gemmini/quants/act/dispatch.hpp"
 #include "../ggml/src/ggml-gemmini/quants/act/exsia/exsia.hpp"
@@ -30,6 +34,42 @@
 using namespace ggml::gemmini::quants::act::exsia;
 
 namespace {
+
+template <typename T, typename = void>
+struct has_production_q_tmp : std::false_type {
+};
+
+template <typename T>
+struct has_production_q_tmp<T, std::void_t<decltype(std::declval<T &>().q_tmp)>> : std::true_type {
+};
+
+template <typename T, typename = void>
+struct has_production_q_final : std::false_type {
+};
+
+template <typename T>
+struct has_production_q_final<T, std::void_t<decltype(std::declval<T &>().q_final)>> : std::true_type {
+};
+
+template <typename T, typename = void>
+struct has_validation_reference_q_buffers : std::false_type {
+};
+
+template <typename T>
+struct has_validation_reference_q_buffers<
+    T,
+    std::void_t<decltype(std::declval<T &>().reference.q_tmp),
+                decltype(std::declval<T &>().reference.q_final)>> : std::true_type {
+};
+
+template <typename Scratch>
+bool validation_reference_aliases_q_out(Scratch &scratch, const std::vector<int32_t> &q_out) {
+    if constexpr (has_validation_reference_q_buffers<Scratch>::value) {
+        return scratch.reference.q_tmp.data() == q_out.data() ||
+               scratch.reference.q_final.data() == q_out.data();
+    }
+    return false;
+}
 
 bool checked_mul_size(size_t lhs, size_t rhs, size_t &out) {
     if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs) {
@@ -603,6 +643,12 @@ struct LocalStageValidationResult {
     size_t sigma_context_prepare_count = 0;
     size_t reference_final_exponent_rescan_count = 0;
     size_t optimized_final_exponent_rescan_count = 0;
+    bool production_q_tmp = has_production_q_tmp<StripeScratch>::value;
+    bool production_q_final = has_production_q_final<StripeScratch>::value;
+    bool validation_reference_q_buffers = has_validation_reference_q_buffers<StripeScratch>::value;
+    bool validation_reference_aliases_production_qout = false;
+    bool scratch_profile_check = false;
+    size_t compiled_scratch_bytes = sizeof(StripeScratch);
     std::array<size_t, 3> reference_p3{};
     std::array<size_t, 3> optimized_p3{};
     std::vector<std::string> selected_cases;
@@ -757,13 +803,18 @@ bool write_localstage_artifacts(const std::filesystem::path &evidence_dir,
                                    result.sigma_final_exponent_mismatch_count == 0 &&
                                     result.invalid_sigma_context_selected_count == 0 &&
                                     result.sigma_context_prepare_count == result.cases_run &&
-                                    result.reference_final_exponent_rescan_count != 0 &&
-                                    result.optimized_final_exponent_rescan_count == 0);
+                                     result.reference_final_exponent_rescan_count != 0 &&
+                                     result.optimized_final_exponent_rescan_count == 0);
+    const bool scratch_profile_checked = !result.production_q_tmp &&
+                                         !result.production_q_final &&
+                                         result.validation_reference_q_buffers &&
+                                         !result.validation_reference_aliases_production_qout;
     const bool pass = result.bit_exact && result.artifact_mismatch_count == 0 &&
                         result.p3_branch_mismatch_count == 0 && nondeterministic_run_count == 0 &&
                         p0_p1_checked &&
                         direct_qout_checked &&
                         sigma_p2_checked &&
+                        scratch_profile_checked &&
                        (focus != "full-block" || full_block_copy_free) &&
                        (focus != "partial-tail" ||
                         (padding_checked && result.padding_q_out_zero && result.padding_mask_clear &&
@@ -859,8 +910,16 @@ bool write_localstage_artifacts(const std::filesystem::path &evidence_dir,
                << ",\"replay_overwrite_count\":" << result.replay_overwrite_count
                << ",\"non_replay_overwrite_count\":" << result.non_replay_overwrite_count
                << ",\"block_exp_commit_count\":" << result.block_exp_commit_count << "}"
-              << ",\"scratch_fields\":{\"status\":\"not-enabled\",\"production_q_tmp\":null"
-              << ",\"production_q_final\":null}"
+               << ",\"scratch_fields\":{\"status\":\"checked\",\"production_q_tmp\":"
+               << (result.production_q_tmp ? "true" : "false")
+               << ",\"production_q_final\":"
+               << (result.production_q_final ? "true" : "false")
+               << ",\"validation_reference_q_buffers\":"
+               << (result.validation_reference_q_buffers ? "true" : "false")
+               << ",\"validation_reference_aliases_production_qout\":"
+               << (result.validation_reference_aliases_production_qout ? "true" : "false")
+               << ",\"pass\":" << (scratch_profile_checked ? "true" : "false")
+               << ",\"compiled_scratch_bytes\":" << result.compiled_scratch_bytes << "}"
               << ",\"padding_validation_case_count\":" << result.partial_tail_case_count
               << ",\"padding_q_out_zero\":"
               << (padding_checked && result.padding_q_out_zero ? "true" : "false")
@@ -986,6 +1045,10 @@ bool run_localstage_validation(const std::filesystem::path &evidence_dir,
         const bool reference_ok = local_stage.run_reference(
             reference_meta, state, reference_scratch.block.x, 0, 0, reference_scratch, reference_mask,
             reference_q, reference_exp, reference_sample);
+        result.validation_reference_aliases_production_qout =
+            result.validation_reference_aliases_production_qout ||
+            validation_reference_aliases_q_out(reference_scratch, optimized_q) ||
+            validation_reference_aliases_q_out(reference_scratch, reference_q);
         const size_t rescans_before_optimized = validation_block_top2_exp_rescan_count();
         std::fill(optimized_scratch.block.x.begin(), optimized_scratch.block.x.end(),
                   std::numeric_limits<float>::max());
@@ -1021,17 +1084,17 @@ bool run_localstage_validation(const std::filesystem::path &evidence_dir,
             ++result.optimized_pass_count;
         }
         if (focus == "p0-p1") {
-            const bool e1_e2_match = optimized_scratch.p0_e1 == reference_p0_p1.e1 &&
-                                     optimized_scratch.p0_e2 == reference_p0_p1.e2 &&
-                                     optimized_scratch.p0_e_pre == reference_p0_p1.e_pre;
-            const bool top_mask_matches = optimized_scratch.p0_top_mask_words == reference_p0_p1.top_mask_words;
+            const bool e1_e2_match = optimized_scratch.reference.p0_e1 == reference_p0_p1.e1 &&
+                                     optimized_scratch.reference.p0_e2 == reference_p0_p1.e2 &&
+                                     optimized_scratch.reference.p0_e_pre == reference_p0_p1.e_pre;
+            const bool top_mask_matches = optimized_scratch.reference.p0_top_mask_words == reference_p0_p1.top_mask_words;
             const bool exponent_matches = std::equal(reference_p0_p1.exponents.begin(),
                                                       reference_p0_p1.exponents.end(),
                                                       optimized_scratch.block.e.begin());
             const bool p1_q_matches = optimized_q == reference_p0_p1.q;
-            const bool s_ss_n_matches = optimized_scratch.p1_S == reference_p0_p1.S &&
-                                        optimized_scratch.p1_SS == reference_p0_p1.SS &&
-                                        optimized_scratch.p1_N == reference_p0_p1.N;
+            const bool s_ss_n_matches = optimized_scratch.reference.p1_S == reference_p0_p1.S &&
+                                        optimized_scratch.reference.p1_SS == reference_p0_p1.SS &&
+                                        optimized_scratch.reference.p1_N == reference_p0_p1.N;
             result.p0_e1_e2_match = result.p0_e1_e2_match && e1_e2_match;
             result.top_mask_match = result.top_mask_match && top_mask_matches;
             result.exponents_match = result.exponents_match && exponent_matches;
@@ -1074,8 +1137,8 @@ bool run_localstage_validation(const std::filesystem::path &evidence_dir,
         }
         if (focus == "sigma-p2") {
             const SigmaDetector::SigmaContext sigma_context = detector.prepare(
-                optimized_scratch.p1_S, optimized_scratch.p1_SS, optimized_scratch.p1_N);
-            const BlockMask initial_top_mask(optimized_scratch.p0_top_mask_words.data(), block_size);
+                optimized_scratch.reference.p1_S, optimized_scratch.reference.p1_SS, optimized_scratch.reference.p1_N);
+            const BlockMask initial_top_mask(optimized_scratch.reference.p0_top_mask_words.data(), block_size);
             if (!sigma_context.valid) {
                 for (size_t i = 0; i < fixture.logical_count; ++i) {
                     if (!initial_top_mask.is_set(i) && optimized_mask.is_set(i)) {
@@ -1113,11 +1176,11 @@ bool run_localstage_validation(const std::filesystem::path &evidence_dir,
                 result.sigma_all_candidates_selected_p3_replay = true;
             }
             if (fixture_name == "zero-variance" && !sigma_context.valid &&
-                optimized_scratch.p1_N != 0 && !optimized_sample.has_int_outlier) {
+                optimized_scratch.reference.p1_N != 0 && !optimized_sample.has_int_outlier) {
                 ++result.sigma_zero_variance_case_count;
             }
             if (fixture_name == "n-zero" && !sigma_context.valid &&
-                optimized_scratch.p1_N == 0 && !optimized_sample.has_int_outlier &&
+                optimized_scratch.reference.p1_N == 0 && !optimized_sample.has_int_outlier &&
                 optimized_sample.final_remaining_exp == std::numeric_limits<int16_t>::min()) {
                 ++result.sigma_n_zero_case_count;
             }
@@ -1129,7 +1192,11 @@ bool run_localstage_validation(const std::filesystem::path &evidence_dir,
         result.digest_input += std::to_string(optimized_exp[0]) + ":" +
                                std::to_string(static_cast<int>(optimized_sample.p3_path)) + ";";
     }
-    return write_localstage_artifacts(evidence_dir, focus, 1, 0, result);
+    result.scratch_profile_check = !result.production_q_tmp &&
+                                   !result.production_q_final &&
+                                   result.validation_reference_q_buffers &&
+                                   !result.validation_reference_aliases_production_qout;
+    return write_localstage_artifacts(evidence_dir, focus, 1, 0, result) && result.scratch_profile_check;
 }
 
 std::string shell_quote(const std::string &value) {
