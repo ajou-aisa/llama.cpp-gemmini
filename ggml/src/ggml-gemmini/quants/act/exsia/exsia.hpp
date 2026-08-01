@@ -275,6 +275,15 @@ namespace ggml::gemmini::quants::act::exsia
         std::vector<int32_t> q_tmp;
         std::vector<int32_t> q_final;
         BitMask folding_inlier_mask;
+#if EXSIA_VALIDATION
+        int16_t p0_e1 = std::numeric_limits<int16_t>::min();
+        int16_t p0_e2 = std::numeric_limits<int16_t>::min();
+        int16_t p0_e_pre = std::numeric_limits<int16_t>::min();
+        std::vector<uint64_t> p0_top_mask_words;
+        __int128_t p1_S = 0;
+        __int128_t p1_SS = 0;
+        size_t p1_N = 0;
+#endif
 
         bool prepare(size_t block_size)
         {
@@ -288,6 +297,10 @@ namespace ggml::gemmini::quants::act::exsia
                 q_tmp.resize(block_size);
             if (q_final.size() < block_size)
                 q_final.resize(block_size);
+#if EXSIA_VALIDATION
+            if (p0_top_mask_words.size() < BlockMask::word_count(block_size))
+                p0_top_mask_words.resize(BlockMask::word_count(block_size));
+#endif
             return true;
         }
 

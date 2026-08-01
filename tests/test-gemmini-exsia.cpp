@@ -571,11 +571,79 @@ struct LocalStageValidationResult {
     size_t partial_tail_case_count = 0;
     size_t reference_pass_count = 0;
     size_t optimized_pass_count = 0;
+    bool p0_e1_e2_match = true;
+    bool top_mask_match = true;
+    bool exponents_match = true;
+    bool p1_q_match = true;
+    bool s_ss_n_match = true;
+    size_t p0_e1_e2_mismatch_count = 0;
+    size_t top_mask_mismatch_count = 0;
+    size_t exponent_mismatch_count = 0;
+    size_t p1_q_mismatch_count = 0;
+    size_t s_ss_n_mismatch_count = 0;
+    size_t duplicated_top_case_count = 0;
+    size_t no_distinct_e2_case_count = 0;
     std::array<size_t, 3> reference_p3{};
     std::array<size_t, 3> optimized_p3{};
     std::vector<std::string> selected_cases;
     std::string digest_input;
 };
+
+struct P0P1Expected {
+    int16_t e1 = std::numeric_limits<int16_t>::min();
+    int16_t e2 = std::numeric_limits<int16_t>::min();
+    int16_t e_pre = std::numeric_limits<int16_t>::min();
+    std::vector<int16_t> exponents;
+    std::vector<uint64_t> top_mask_words;
+    std::vector<int32_t> q;
+    __int128_t S = 0;
+    __int128_t SS = 0;
+    size_t N = 0;
+};
+
+bool collect_reference_p0_p1(const std::vector<float> &input,
+                             size_t valid_count,
+                             size_t block_size,
+                             int16_t rho,
+                             P0P1Expected &result) {
+    if (input.size() < block_size || valid_count > block_size) {
+        return false;
+    }
+
+    std::vector<float> padded(block_size, 0.0f);
+    std::copy_n(input.begin(), valid_count, padded.begin());
+    BlockState block;
+    if (!block.prepare(block_size)) {
+        return false;
+    }
+    std::vector<uint64_t> mask_words(BlockMask::word_count(block_size), 0);
+    BlockMask mask(mask_words.data(), block_size);
+    ExpScanner scanner;
+    scanner.scan_top2_exp(padded.data(), block_size, block);
+    if (block.e2 != std::numeric_limits<int16_t>::min()) {
+        for (size_t i = 0; i < valid_count; ++i) {
+            if (block.e[i] != std::numeric_limits<int16_t>::min() && block.e[i] == block.e1) {
+                mask.set(i);
+            }
+        }
+    }
+
+    result.e1 = block.e1;
+    result.e2 = block.e2;
+    result.e_pre = block.e2 != std::numeric_limits<int16_t>::min() ? block.e2 : block.e1;
+    result.exponents = block.e;
+    result.top_mask_words = mask_words;
+    result.q.resize(block_size);
+    WideQuantizer quantizer;
+    quantizer.quantize_block(padded, mask, exp_to_theta_for_test(result.e_pre, rho), result.q,
+                             result.S, result.SS);
+    for (size_t i = 0; i < valid_count; ++i) {
+        if (!mask.is_set(i)) {
+            ++result.N;
+        }
+    }
+    return true;
+}
 
 bool is_localstage_focus(const std::string &focus) {
     static const std::array<const char *, 9> focuses = {
@@ -599,7 +667,8 @@ bool localstage_focus_runs_fixture(const std::string &focus, const char *fixture
         return name == "partial-tail";
     }
     if (focus == "p0-p1") {
-        return name == "one-bucket" || name == "two-bucket";
+        return name == "all-zero" || name == "one-bucket" || name == "two-bucket" ||
+               name == "duplicated-top" || name == "no-distinct-e2" || name == "floating-edges";
     }
     if (focus == "sigma-p2") {
         return name == "two-bucket";
@@ -638,8 +707,14 @@ bool write_localstage_artifacts(const std::filesystem::path &evidence_dir,
     const std::string digest = fnv1a64(focus + "\n" + result.digest_input);
     const bool full_block_copy_free = result.src_to_scratch_block_x_copy_count == 0;
     const bool padding_checked = result.partial_tail_case_count != 0;
+    const bool p0_p1_checked = focus != "p0-p1" ||
+                               (result.p0_e1_e2_match && result.top_mask_match &&
+                                result.exponents_match && result.p1_q_match && result.s_ss_n_match &&
+                                result.duplicated_top_case_count != 0 &&
+                                result.no_distinct_e2_case_count != 0);
     const bool pass = result.bit_exact && result.artifact_mismatch_count == 0 &&
-                       result.p3_branch_mismatch_count == 0 && nondeterministic_run_count == 0 &&
+                        result.p3_branch_mismatch_count == 0 && nondeterministic_run_count == 0 &&
+                        p0_p1_checked &&
                        (focus != "full-block" || full_block_copy_free) &&
                        (focus != "partial-tail" ||
                         (padding_checked && result.padding_q_out_zero && result.padding_mask_clear &&
@@ -656,8 +731,10 @@ bool write_localstage_artifacts(const std::filesystem::path &evidence_dir,
         manifest << "\"" << json_escape(result.selected_cases[index]) << "\"";
     }
     manifest << "]"
-             << ",\"cases_run\":" << result.cases_run
-             << ",\"topology_4_5_2\":{\"workers\":4,\"omp_threads\":5,\"pipeline_slots\":2}}\n";
+              << ",\"cases_run\":" << result.cases_run
+              << ",\"duplicated_top_case_count\":" << result.duplicated_top_case_count
+              << ",\"no_distinct_e2_case_count\":" << result.no_distinct_e2_case_count
+              << ",\"topology_4_5_2\":{\"workers\":4,\"omp_threads\":5,\"pipeline_slots\":2}}\n";
     std::ostringstream p3;
     p3 << "{\"reference\":[" << result.reference_p3[0] << "," << result.reference_p3[1] << ","
        << result.reference_p3[2] << "],\"optimized\":[" << result.optimized_p3[0] << ","
@@ -676,7 +753,17 @@ bool write_localstage_artifacts(const std::filesystem::path &evidence_dir,
              << ",\"focus\":\"" << json_escape(focus) << "\""
              << ",\"repeat_fresh\":" << repeat_fresh
               << ",\"pass_counts\":{\"reference\":" << result.reference_pass_count
-              << ",\"optimized\":" << result.optimized_pass_count << "}"
+               << ",\"optimized\":" << result.optimized_pass_count << "}"
+              << ",\"p0_e1_e2_match\":" << (result.p0_e1_e2_match ? "true" : "false")
+              << ",\"top_mask_match\":" << (result.top_mask_match ? "true" : "false")
+              << ",\"exponents_match\":" << (result.exponents_match ? "true" : "false")
+              << ",\"p1_q_match\":" << (result.p1_q_match ? "true" : "false")
+              << ",\"s_ss_n_match\":" << (result.s_ss_n_match ? "true" : "false")
+              << ",\"p0_e1_e2_mismatch_count\":" << result.p0_e1_e2_mismatch_count
+              << ",\"top_mask_mismatch_count\":" << result.top_mask_mismatch_count
+              << ",\"exponent_mismatch_count\":" << result.exponent_mismatch_count
+              << ",\"p1_q_mismatch_count\":" << result.p1_q_mismatch_count
+              << ",\"s_ss_n_mismatch_count\":" << result.s_ss_n_mismatch_count
               << ",\"copy_counts\":{\"status\":\"enabled\",\"src_to_scratch_block_x\":"
               << result.src_to_scratch_block_x_copy_count
               << ",\"q_tmp_to_q_final\":null,\"q_final_to_q_wide\":null}"
@@ -713,14 +800,29 @@ bool run_localstage_validation(const std::filesystem::path &evidence_dir,
     std::vector<float> one_bucket(block_size, 1.0f);
     std::vector<float> two_bucket(block_size, 1.0f);
     two_bucket[0] = 1024.0f;
+    std::vector<float> duplicated_top(block_size, 1.0f);
+    duplicated_top[0] = 1024.0f;
+    duplicated_top[1] = -1024.0f;
+    std::vector<float> no_distinct_e2(block_size, -2.0f);
+    std::vector<float> floating_edges(block_size, 1.0f);
+    floating_edges[0] = 0.0f;
+    floating_edges[1] = std::numeric_limits<float>::quiet_NaN();
+    floating_edges[2] = std::numeric_limits<float>::infinity();
+    floating_edges[3] = -std::numeric_limits<float>::infinity();
+    floating_edges[4] = std::numeric_limits<float>::denorm_min();
+    floating_edges[5] = -std::numeric_limits<float>::denorm_min();
+    floating_edges[6] = -4.0f;
     std::vector<float> partial(block_size, 0.0f);
     for (size_t i = 0; i + 3 < block_size; ++i) {
         partial[i] = i % 2 == 0 ? 0.5f : -2.0f;
     }
-    const std::array<Fixture, 4> fixtures = {{
+    const std::array<Fixture, 7> fixtures = {{
         {"all-zero", block_size, std::move(zero)},
         {"one-bucket", block_size, std::move(one_bucket)},
         {"two-bucket", block_size, std::move(two_bucket)},
+        {"duplicated-top", block_size, std::move(duplicated_top)},
+        {"no-distinct-e2", block_size, std::move(no_distinct_e2)},
+        {"floating-edges", block_size, std::move(floating_edges)},
         {"partial-tail", block_size - 3, std::move(partial)},
     }};
 
@@ -730,6 +832,12 @@ bool run_localstage_validation(const std::filesystem::path &evidence_dir,
             continue;
         }
         result.selected_cases.emplace_back(fixture.name);
+        if (std::string(fixture.name) == "duplicated-top") {
+            ++result.duplicated_top_case_count;
+        }
+        if (std::string(fixture.name) == "no-distinct-e2") {
+            ++result.no_distinct_e2_case_count;
+        }
         ExSIAState state;
         state.B_size = block_size;
         state.K_logical = fixture.logical_count;
@@ -752,6 +860,11 @@ bool run_localstage_validation(const std::filesystem::path &evidence_dir,
         Meta optimized_meta;
         LocalBlockCycleSample reference_sample;
         LocalBlockCycleSample optimized_sample;
+        P0P1Expected reference_p0_p1;
+        if (focus == "p0-p1" && !collect_reference_p0_p1(
+                fixture.values, fixture.logical_count, block_size, reference_meta.rho, reference_p0_p1)) {
+            return false;
+        }
         std::copy_n(fixture.values.begin(), block_size, reference_scratch.block.x.begin());
         const bool reference_ok = local_stage.run_reference(
             reference_meta, state, reference_scratch.block.x, 0, 0, reference_scratch, reference_mask,
@@ -788,6 +901,32 @@ bool run_localstage_validation(const std::filesystem::path &evidence_dir,
         }
         if (optimized_ok) {
             ++result.optimized_pass_count;
+        }
+        if (focus == "p0-p1") {
+            const bool e1_e2_match = optimized_scratch.p0_e1 == reference_p0_p1.e1 &&
+                                     optimized_scratch.p0_e2 == reference_p0_p1.e2 &&
+                                     optimized_scratch.p0_e_pre == reference_p0_p1.e_pre;
+            const bool top_mask_matches = optimized_scratch.p0_top_mask_words == reference_p0_p1.top_mask_words;
+            const bool exponent_matches = std::equal(reference_p0_p1.exponents.begin(),
+                                                      reference_p0_p1.exponents.end(),
+                                                      optimized_scratch.block.e.begin());
+            const bool p1_q_matches = optimized_scratch.q_tmp == reference_p0_p1.q;
+            const bool s_ss_n_matches = optimized_scratch.p1_S == reference_p0_p1.S &&
+                                        optimized_scratch.p1_SS == reference_p0_p1.SS &&
+                                        optimized_scratch.p1_N == reference_p0_p1.N;
+            result.p0_e1_e2_match = result.p0_e1_e2_match && e1_e2_match;
+            result.top_mask_match = result.top_mask_match && top_mask_matches;
+            result.exponents_match = result.exponents_match && exponent_matches;
+            result.p1_q_match = result.p1_q_match && p1_q_matches;
+            result.s_ss_n_match = result.s_ss_n_match && s_ss_n_matches;
+            result.p0_e1_e2_mismatch_count += e1_e2_match ? 0 : 1;
+            result.top_mask_mismatch_count += top_mask_matches ? 0 : 1;
+            result.exponent_mismatch_count += exponent_matches ? 0 : 1;
+            result.p1_q_mismatch_count += p1_q_matches ? 0 : 1;
+            result.s_ss_n_mismatch_count += s_ss_n_matches ? 0 : 1;
+            if (!e1_e2_match || !top_mask_matches || !exponent_matches || !p1_q_matches || !s_ss_n_matches) {
+                result.bit_exact = false;
+            }
         }
         const size_t reference_path = static_cast<size_t>(reference_sample.p3_path);
         const size_t optimized_path = static_cast<size_t>(optimized_sample.p3_path);
@@ -1245,6 +1384,13 @@ int main(int argc, char **argv) {
         aggregate.cases_run *= localstage_repeat_fresh;
         aggregate.reference_pass_count *= localstage_repeat_fresh;
         aggregate.optimized_pass_count *= localstage_repeat_fresh;
+        aggregate.p0_e1_e2_mismatch_count *= localstage_repeat_fresh;
+        aggregate.top_mask_mismatch_count *= localstage_repeat_fresh;
+        aggregate.exponent_mismatch_count *= localstage_repeat_fresh;
+        aggregate.p1_q_mismatch_count *= localstage_repeat_fresh;
+        aggregate.s_ss_n_mismatch_count *= localstage_repeat_fresh;
+        aggregate.duplicated_top_case_count *= localstage_repeat_fresh;
+        aggregate.no_distinct_e2_case_count *= localstage_repeat_fresh;
         for (size_t path = 0; path < aggregate.reference_p3.size(); ++path) {
             aggregate.reference_p3[path] *= localstage_repeat_fresh;
             aggregate.optimized_p3[path] *= localstage_repeat_fresh;

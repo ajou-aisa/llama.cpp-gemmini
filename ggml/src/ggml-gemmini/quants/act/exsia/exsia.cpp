@@ -770,7 +770,6 @@ namespace ggml::gemmini::quants::act::exsia
         GGML_ASSERT(q_out != nullptr);
         BlockState &blk = scratch.block;
         const int16_t neg_inf = std::numeric_limits<int16_t>::min();
-        bool has_second_bucket = false;
         std::vector<int32_t> &q_tmp = scratch.q_tmp;
         std::vector<int32_t> &q_final = scratch.q_final;
         __int128_t S = 0;
@@ -783,32 +782,56 @@ namespace ggml::gemmini::quants::act::exsia
         const uint64_t t0 = EXSIA_STAGE_CYCLE_READ();
 #endif
 
-        unit_exp_.scan_top2_exp(x, block_size, blk);
-        has_second_bucket = (blk.e2 != neg_inf);
+        blk.reset();
+        blk.blk_size = block_size;
         block_mask.clear();
-
-        if (has_second_bucket)
+        for (size_t i = 0; i < block_size; ++i)
         {
-            for (size_t i = 0; i < block_size; ++i)
+            const int16_t exp = unit_exp_.unbiased_exp(x[i]);
+            blk.e[i] = exp;
+            if (exp > blk.e1)
             {
-                if (blk.e[i] != neg_inf && blk.e[i] == blk.e1)
-                    block_mask.set(i);
+                blk.e2 = blk.e1;
+                blk.e1 = exp;
+                block_mask.clear();
+                block_mask.set(i);
             }
+            else if (exp == blk.e1 && exp != neg_inf)
+                block_mask.set(i);
+            else if (exp < blk.e1 && exp > blk.e2)
+                blk.e2 = exp;
         }
-
+        const bool has_second_bucket = blk.e2 != neg_inf;
+        if (!has_second_bucket)
+            block_mask.clear();
         e_pre = has_second_bucket ? blk.e2 : blk.e1;
 #if EXSIA_STAGE_PROFILE_ENABLED
         const uint64_t t1 = EXSIA_STAGE_CYCLE_READ();
 #endif
 
         theta_pre = exp_to_theta(e_pre, meta.rho);
-        unit_quant_.quantize_block(x, block_size, block_mask, theta_pre, q_tmp, S, SS);
-
+        const bool null_theta = theta_pre == neg_inf;
         for (size_t i = 0; i < block_size; ++i)
         {
-            if (!block_mask.is_set(i))
-                ++unmasked_count;
+            const int32_t tmp = null_theta ? 0 : quantize_to_i32(x[i], theta_pre);
+            q_tmp[i] = tmp;
+            if (block_mask.is_set(i))
+                continue;
+
+            const __int128_t magnitude = static_cast<__int128_t>(magnitude_i32(tmp));
+            S += magnitude;
+            SS += magnitude * magnitude;
+            ++unmasked_count;
         }
+#if EXSIA_VALIDATION
+        scratch.p0_e1 = blk.e1;
+        scratch.p0_e2 = blk.e2;
+        scratch.p0_e_pre = e_pre;
+        std::copy_n(block_mask.words, BlockMask::word_count(block_size), scratch.p0_top_mask_words.begin());
+        scratch.p1_S = S;
+        scratch.p1_SS = SS;
+        scratch.p1_N = unmasked_count;
+#endif
 
 #if EXSIA_STAGE_PROFILE_ENABLED
         const uint64_t t2 = EXSIA_STAGE_CYCLE_READ();
@@ -910,30 +933,57 @@ namespace ggml::gemmini::quants::act::exsia
         const uint64_t t0 = EXSIA_STAGE_CYCLE_READ();
 #endif
 
-        unit_exp_.scan_top2_exp(blk.x.data(), block_size, blk);
+        blk.reset();
+        blk.blk_size = block_size;
+        block_mask.clear();
+        for (size_t i = 0; i < valid_count; ++i)
+        {
+            const int16_t exp = unit_exp_.unbiased_exp(blk.x[i]);
+            blk.e[i] = exp;
+            if (exp > blk.e1)
+            {
+                blk.e2 = blk.e1;
+                blk.e1 = exp;
+                block_mask.clear();
+                block_mask.set(i);
+            }
+            else if (exp == blk.e1 && exp != neg_inf)
+                block_mask.set(i);
+            else if (exp < blk.e1 && exp > blk.e2)
+                blk.e2 = exp;
+        }
         std::fill(blk.e.begin() + valid_count, blk.e.begin() + block_size, neg_inf);
         const bool has_second_bucket = blk.e2 != neg_inf;
-        block_mask.clear();
-        if (has_second_bucket)
-        {
-            for (size_t i = 0; i < valid_count; ++i)
-            {
-                if (blk.e[i] != neg_inf && blk.e[i] == blk.e1)
-                    block_mask.set(i);
-            }
-        }
+        if (!has_second_bucket)
+            block_mask.clear();
         e_pre = has_second_bucket ? blk.e2 : blk.e1;
 #if EXSIA_STAGE_PROFILE_ENABLED
         const uint64_t t1 = EXSIA_STAGE_CYCLE_READ();
 #endif
 
         theta_pre = exp_to_theta(e_pre, meta.rho);
-        unit_quant_.quantize_block(blk.x.data(), block_size, block_mask, theta_pre, q_tmp, S, SS);
-        for (size_t i = 0; i < valid_count; ++i)
+        const bool null_theta = theta_pre == neg_inf;
+        for (size_t i = 0; i < block_size; ++i)
         {
-            if (!block_mask.is_set(i))
-                ++unmasked_count;
+            const int32_t tmp = null_theta ? 0 : quantize_to_i32(blk.x[i], theta_pre);
+            q_tmp[i] = tmp;
+            if (i >= valid_count || block_mask.is_set(i))
+                continue;
+
+            const __int128_t magnitude = static_cast<__int128_t>(magnitude_i32(tmp));
+            S += magnitude;
+            SS += magnitude * magnitude;
+            ++unmasked_count;
         }
+#if EXSIA_VALIDATION
+        scratch.p0_e1 = blk.e1;
+        scratch.p0_e2 = blk.e2;
+        scratch.p0_e_pre = e_pre;
+        std::copy_n(block_mask.words, BlockMask::word_count(block_size), scratch.p0_top_mask_words.begin());
+        scratch.p1_S = S;
+        scratch.p1_SS = SS;
+        scratch.p1_N = unmasked_count;
+#endif
 #if EXSIA_STAGE_PROFILE_ENABLED
         const uint64_t t2 = EXSIA_STAGE_CYCLE_READ();
 #endif
