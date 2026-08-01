@@ -66,14 +66,25 @@ bool checked_round_up_multiple(size_t value, size_t multiple, size_t &out) {
 std::string json_escape(const std::string &value) {
     std::string escaped;
     escaped.reserve(value.size());
-    for (const char character : value) {
+    static constexpr char hex_digits[] = "0123456789abcdef";
+    for (const unsigned char character : value) {
         switch (character) {
             case '\\': escaped += "\\\\"; break;
             case '"': escaped += "\\\""; break;
+            case '\b': escaped += "\\b"; break;
+            case '\f': escaped += "\\f"; break;
             case '\n': escaped += "\\n"; break;
             case '\r': escaped += "\\r"; break;
             case '\t': escaped += "\\t"; break;
-            default: escaped += character; break;
+            default:
+                if (character < 0x20) {
+                    escaped += "\\u00";
+                    escaped += hex_digits[character >> 4];
+                    escaped += hex_digits[character & 0x0f];
+                } else {
+                    escaped += static_cast<char>(character);
+                }
+                break;
         }
     }
     return escaped;
@@ -552,8 +563,11 @@ struct LocalStageValidationResult {
     size_t artifact_mismatch_count = 0;
     size_t p3_branch_mismatch_count = 0;
     size_t cases_run = 0;
+    size_t reference_pass_count = 0;
+    size_t optimized_pass_count = 0;
     std::array<size_t, 3> reference_p3{};
     std::array<size_t, 3> optimized_p3{};
+    std::vector<std::string> selected_cases;
     std::string digest_input;
 };
 
@@ -563,6 +577,28 @@ bool is_localstage_focus(const std::string &focus) {
         "scratch-profile", "optional-scale", "optional-exponent",
     };
     return std::find(focuses.begin(), focuses.end(), focus) != focuses.end();
+}
+
+bool localstage_focus_runs_fixture(const std::string &focus, const char *fixture_name) {
+    if (focus == "all" || focus == "direct-qout" || focus == "scratch-profile" ||
+        focus == "optional-scale" || focus == "optional-exponent") {
+        return true;
+    }
+
+    const std::string name(fixture_name);
+    if (focus == "full-block") {
+        return name != "partial-tail";
+    }
+    if (focus == "partial-tail") {
+        return name == "partial-tail";
+    }
+    if (focus == "p0-p1") {
+        return name == "one-bucket" || name == "two-bucket";
+    }
+    if (focus == "sigma-p2") {
+        return name == "two-bucket";
+    }
+    return false;
 }
 
 std::string fnv1a64(const std::string &input) {
@@ -593,12 +629,21 @@ bool write_localstage_artifacts(const std::filesystem::path &evidence_dir,
         return false;
     }
 
-    const std::string digest = fnv1a64(result.digest_input);
+    const std::string digest = fnv1a64(focus + "\n" + result.digest_input);
     const bool pass = result.bit_exact && result.artifact_mismatch_count == 0 &&
-                      result.p3_branch_mismatch_count == 0 && nondeterministic_run_count == 0;
+                      result.p3_branch_mismatch_count == 0 && nondeterministic_run_count == 0 &&
+                      EXSIA_LOCAL_WORKER_COUNT == 4 && EXSIA_OMP_THREAD_COUNT == 5 &&
+                      EXSIA_PIPELINE_SLOT_COUNT == 2;
     std::ostringstream manifest;
     manifest << "{\"focus\":\"" << json_escape(focus)
-             << "\",\"coverage_scope\":\"todo-1-bootstrap\",\"cases\":[\"all-zero\",\"one-bucket\",\"two-bucket\",\"partial-tail\"]"
+             << "\",\"coverage_scope\":\"todo-1-bootstrap\",\"cases\":[";
+    for (size_t index = 0; index < result.selected_cases.size(); ++index) {
+        if (index != 0) {
+            manifest << ",";
+        }
+        manifest << "\"" << json_escape(result.selected_cases[index]) << "\"";
+    }
+    manifest << "]"
              << ",\"cases_run\":" << result.cases_run
              << ",\"topology_4_5_2\":{\"workers\":4,\"omp_threads\":5,\"pipeline_slots\":2}}\n";
     std::ostringstream p3;
@@ -613,20 +658,22 @@ bool write_localstage_artifacts(const std::filesystem::path &evidence_dir,
     summary << "{\"bit_exact\":" << (result.bit_exact ? "true" : "false")
             << ",\"artifact_mismatch_count\":" << result.artifact_mismatch_count
             << ",\"p3_branch_mismatch_count\":" << result.p3_branch_mismatch_count
-            << ",\"nondeterministic_run_count\":" << nondeterministic_run_count
-            << ",\"cases_run\":" << result.cases_run
-            << ",\"modes_run\":[\"Sequential\"]"
-            << ",\"focus\":\"" << json_escape(focus) << "\""
-            << ",\"repeat_fresh\":" << repeat_fresh
-            << ",\"pass_counts\":{\"reference\":" << result.cases_run
-            << ",\"optimized\":" << result.cases_run << "}"
-            << ",\"copy_counts\":{\"src_to_scratch_block_x\":" << result.cases_run
-            << ",\"q_tmp_to_q_final\":" << result.cases_run
-            << ",\"q_final_to_q_wide\":" << result.cases_run << "}"
-            << ",\"scratch_fields\":{\"production_q_tmp\":true,\"production_q_final\":true}"
-            << ",\"topology_4_5_2\":true"
-            << ",\"profile_boundaries\":{\"local_total_ends_before\":\"MaskAssembly\",\"Sequential\":true,\"LocalParallel\":true,\"LocalFoldingPipeline\":true}"
-            << ",\"pass\":" << (pass ? "true" : "false") << "}\n";
+             << ",\"nondeterministic_run_count\":" << nondeterministic_run_count
+             << ",\"cases_run\":" << result.cases_run
+             << ",\"modes_run\":[]"
+             << ",\"focus\":\"" << json_escape(focus) << "\""
+             << ",\"repeat_fresh\":" << repeat_fresh
+             << ",\"pass_counts\":{\"reference\":" << result.reference_pass_count
+             << ",\"optimized\":" << result.optimized_pass_count << "}"
+             << ",\"copy_counts\":{\"status\":\"not-enabled\",\"src_to_scratch_block_x\":null"
+             << ",\"q_tmp_to_q_final\":null,\"q_final_to_q_wide\":null}"
+             << ",\"scratch_fields\":{\"status\":\"not-enabled\",\"production_q_tmp\":null"
+             << ",\"production_q_final\":null}"
+             << ",\"topology_4_5_2\":"
+             << ((EXSIA_LOCAL_WORKER_COUNT == 4 && EXSIA_OMP_THREAD_COUNT == 5 &&
+                  EXSIA_PIPELINE_SLOT_COUNT == 2) ? "true" : "false")
+             << ",\"profile_boundaries\":{\"status\":\"not-enabled\",\"reason\":\"execution-mode profile hook not exercised by direct LocalStage validation\"}"
+             << ",\"pass\":" << (pass ? "true" : "false") << "}\n";
     return write_text_file(evidence_dir / "corpus_manifest.json", manifest.str()) &&
            write_text_file(evidence_dir / "p3_counts.json", p3.str()) &&
            write_text_file(evidence_dir / "artifact_hashes.json", hashes.str()) &&
@@ -659,6 +706,10 @@ bool run_localstage_validation(const std::filesystem::path &evidence_dir,
 
     LocalStage local_stage;
     for (const Fixture &fixture : fixtures) {
+        if (!localstage_focus_runs_fixture(focus, fixture.name)) {
+            continue;
+        }
+        result.selected_cases.emplace_back(fixture.name);
         ExSIAState state;
         state.B_size = block_size;
         state.K_logical = fixture.logical_count;
@@ -692,6 +743,12 @@ bool run_localstage_validation(const std::filesystem::path &evidence_dir,
 #endif
         );
         ++result.cases_run;
+        if (reference_ok) {
+            ++result.reference_pass_count;
+        }
+        if (optimized_ok) {
+            ++result.optimized_pass_count;
+        }
         const size_t reference_path = static_cast<size_t>(reference_sample.p3_path);
         const size_t optimized_path = static_cast<size_t>(optimized_sample.p3_path);
         ++result.reference_p3[reference_path];
@@ -721,7 +778,7 @@ std::string shell_quote(const std::string &value) {
     std::string quoted = "'";
     for (char character : value) {
         if (character == '\'') {
-            quoted += "'\\\"'\\\"'";
+            quoted += "'\\''";
         } else {
             quoted += character;
         }
@@ -1101,6 +1158,12 @@ int main(int argc, char **argv) {
         bool child_failed = false;
         for (size_t run = 0; run < localstage_repeat_fresh; ++run) {
             const std::filesystem::path child_dir = evidence_dir / ("fresh-" + std::to_string(run + 1));
+            std::error_code child_cleanup_error;
+            std::filesystem::remove_all(child_dir, child_cleanup_error);
+            if (child_cleanup_error) {
+                child_failed = true;
+                continue;
+            }
             const std::string command = shell_quote(argv[0]) +
                 " --case=localstage-kernel-validation --focus=" + shell_quote(localstage_focus) +
                 " --repeat-fresh=1 --evidence-dir=" + shell_quote(child_dir.string()) +
@@ -1109,14 +1172,28 @@ int main(int argc, char **argv) {
                 child_failed = true;
                 continue;
             }
-            std::ifstream child_hashes(child_dir / "artifact_hashes.json");
-            const std::string hash_contents((std::istreambuf_iterator<char>(child_hashes)),
-                                            std::istreambuf_iterator<char>());
-            if (hash_contents.empty()) {
+            static constexpr std::array<const char *, 4> artifact_names = {
+                "corpus_manifest.json", "validation_summary.json", "artifact_hashes.json", "p3_counts.json",
+            };
+            std::string artifact_contents;
+            bool artifacts_complete = true;
+            for (const char *artifact_name : artifact_names) {
+                std::ifstream artifact(child_dir / artifact_name);
+                const std::string contents((std::istreambuf_iterator<char>(artifact)),
+                                           std::istreambuf_iterator<char>());
+                if (contents.empty()) {
+                    artifacts_complete = false;
+                    break;
+                }
+                artifact_contents += artifact_name;
+                artifact_contents += '\n';
+                artifact_contents += contents;
+            }
+            if (!artifacts_complete) {
                 child_failed = true;
             } else if (first_hash.empty()) {
-                first_hash = hash_contents;
-            } else if (hash_contents != first_hash) {
+                first_hash = artifact_contents;
+            } else if (artifact_contents != first_hash) {
                 ++nondeterministic_run_count;
             }
         }
@@ -1126,6 +1203,8 @@ int main(int argc, char **argv) {
             return fail("localstage validation artifact write failed");
         }
         aggregate.cases_run *= localstage_repeat_fresh;
+        aggregate.reference_pass_count *= localstage_repeat_fresh;
+        aggregate.optimized_pass_count *= localstage_repeat_fresh;
         for (size_t path = 0; path < aggregate.reference_p3.size(); ++path) {
             aggregate.reference_p3[path] *= localstage_repeat_fresh;
             aggregate.optimized_p3[path] *= localstage_repeat_fresh;

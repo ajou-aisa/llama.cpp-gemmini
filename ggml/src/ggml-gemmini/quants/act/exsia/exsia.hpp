@@ -358,6 +358,9 @@ namespace ggml::gemmini::quants::act::exsia
     struct LocalBlockCycleSample
     {
 #if EXSIA_STAGE_PROFILE_ENABLED
+        // Baseline stages: P0 scans exponents and marks the top bucket; P1 quantizes
+        // provisionally and accumulates S/SS; P2 marks integer outliers; P3 selects
+        // the final exponent, copies or replays quantization, then stores block output.
         uint64_t p0 = 0;
         uint64_t p1 = 0;
         uint64_t p2 = 0;
@@ -878,7 +881,8 @@ namespace ggml::gemmini::quants::act::exsia
             );
 #endif
 
-        // Frozen oracle has a definition only in EXSIA_VALIDATION builds.
+#if EXSIA_VALIDATION
+        // Frozen oracle is validation-only and never enters production builds.
         bool run_reference(
             Meta &meta,
             ExSIAState &state,
@@ -890,6 +894,7 @@ namespace ggml::gemmini::quants::act::exsia
             std::vector<int32_t> &stripe_q_wide,
             std::vector<int16_t> &stripe_block_exp,
             LocalBlockCycleSample &cycle_sample);
+#endif
 
     private:
         ExpScanner unit_exp_;

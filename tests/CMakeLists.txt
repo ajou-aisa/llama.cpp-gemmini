@@ -215,6 +215,9 @@ add_test(NAME gemmini_exsia_localstage_kernel_validation
         --focus=all
         --repeat-fresh=10
         --evidence-dir=${CMAKE_CURRENT_BINARY_DIR}/exsia-localstage-kernel-validation)
+set_tests_properties(gemmini_exsia_localstage_kernel_validation PROPERTIES
+    LABELS "gemmini;exsia;validation"
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 llama_build_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_build_and_test(test-autorelease.cpp        LABEL "model")
 

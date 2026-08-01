@@ -1654,6 +1654,8 @@ namespace ggml::gemmini::quants::act::exsia
 #if EXSIA_STAGE_PROFILE_ENABLED
                                 profile.stats = slot.cycle_stats;
 #endif
+                                // Seal local_total at the worker join; the next task owns
+                                // Mask Assembly and Exponent Reduction.
                                 if (!end_profile_interval(profile.local))
                                 {
                                     record_failure(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
@@ -2009,7 +2011,7 @@ namespace ggml::gemmini::quants::act::exsia
             state_.validation_p3_branch_counts[1] += slot.cycle_stats.p3_bypass_same_scale_count;
             state_.validation_p3_branch_counts[2] += slot.cycle_stats.p3_replay_count;
 #endif
-            // local_total is intentionally sealed before Mask Assembly in every execution mode.
+            // Sequential and LocalParallel seal local_total before stripe-wide work.
             EXSIA_PROFILE_COLLECT(
             if (!end_profile_interval(profile.local))
                 return fail(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
