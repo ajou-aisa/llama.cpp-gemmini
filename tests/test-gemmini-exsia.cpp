@@ -588,6 +588,21 @@ struct LocalStageValidationResult {
     size_t block_exp_commit_count = 0;
     size_t duplicated_top_case_count = 0;
     size_t no_distinct_e2_case_count = 0;
+    size_t sigma_no_outlier_case_count = 0;
+    size_t sigma_same_scale_case_count = 0;
+    size_t sigma_replay_case_count = 0;
+    size_t sigma_all_candidates_case_count = 0;
+    bool sigma_all_candidates_selected_final_exp_neg_inf = false;
+    bool sigma_all_candidates_final_exp_matches_reference = false;
+    bool sigma_all_candidates_selected_p3_replay = false;
+    size_t sigma_zero_variance_case_count = 0;
+    size_t sigma_n_zero_case_count = 0;
+    bool sigma_final_exponent_match = true;
+    size_t sigma_final_exponent_mismatch_count = 0;
+    size_t invalid_sigma_context_selected_count = 0;
+    size_t sigma_context_prepare_count = 0;
+    size_t reference_final_exponent_rescan_count = 0;
+    size_t optimized_final_exponent_rescan_count = 0;
     std::array<size_t, 3> reference_p3{};
     std::array<size_t, 3> optimized_p3{};
     std::vector<std::string> selected_cases;
@@ -676,7 +691,9 @@ bool localstage_focus_runs_fixture(const std::string &focus, const char *fixture
                name == "duplicated-top" || name == "no-distinct-e2" || name == "floating-edges";
     }
     if (focus == "sigma-p2") {
-        return name == "two-bucket";
+        return name == "no-outlier" || name == "same-scale" ||
+               name == "replay-heavy-positive" || name == "all-candidates" ||
+               name == "zero-variance" || name == "n-zero";
     }
     return false;
 }
@@ -724,12 +741,29 @@ bool write_localstage_artifacts(const std::filesystem::path &evidence_dir,
                                       result.q_final_to_q_wide_copy_count == 0 &&
                                       result.replay_overwrite_count == result.optimized_p3[2] &&
                                       result.replay_overwrite_count != 0 &&
-                                      result.non_replay_overwrite_count == 0 &&
-                                      result.block_exp_commit_count == result.cases_run);
+                                       result.non_replay_overwrite_count == 0 &&
+                                       result.block_exp_commit_count == result.cases_run);
+    const bool sigma_p2_checked = focus != "sigma-p2" ||
+                                  (result.sigma_no_outlier_case_count != 0 &&
+                                   result.sigma_same_scale_case_count != 0 &&
+                                    result.sigma_replay_case_count != 0 &&
+                                    result.sigma_all_candidates_case_count != 0 &&
+                                    result.sigma_all_candidates_selected_final_exp_neg_inf &&
+                                    result.sigma_all_candidates_final_exp_matches_reference &&
+                                    result.sigma_all_candidates_selected_p3_replay &&
+                                   result.sigma_zero_variance_case_count != 0 &&
+                                   result.sigma_n_zero_case_count != 0 &&
+                                   result.sigma_final_exponent_match &&
+                                   result.sigma_final_exponent_mismatch_count == 0 &&
+                                    result.invalid_sigma_context_selected_count == 0 &&
+                                    result.sigma_context_prepare_count == result.cases_run &&
+                                    result.reference_final_exponent_rescan_count != 0 &&
+                                    result.optimized_final_exponent_rescan_count == 0);
     const bool pass = result.bit_exact && result.artifact_mismatch_count == 0 &&
                         result.p3_branch_mismatch_count == 0 && nondeterministic_run_count == 0 &&
                         p0_p1_checked &&
                         direct_qout_checked &&
+                        sigma_p2_checked &&
                        (focus != "full-block" || full_block_copy_free) &&
                        (focus != "partial-tail" ||
                         (padding_checked && result.padding_q_out_zero && result.padding_mask_clear &&
@@ -738,7 +772,9 @@ bool write_localstage_artifacts(const std::filesystem::path &evidence_dir,
                        EXSIA_PIPELINE_SLOT_COUNT == 2;
     std::ostringstream manifest;
     manifest << "{\"focus\":\"" << json_escape(focus)
-             << "\",\"coverage_scope\":\"todo-1-bootstrap\",\"cases\":[";
+             << "\",\"coverage_scope\":\""
+             << (focus == "sigma-p2" ? "todo-5-sigma-p2" : "todo-1-bootstrap")
+             << "\",\"cases\":[";
     for (size_t index = 0; index < result.selected_cases.size(); ++index) {
         if (index != 0) {
             manifest << ",";
@@ -746,10 +782,23 @@ bool write_localstage_artifacts(const std::filesystem::path &evidence_dir,
         manifest << "\"" << json_escape(result.selected_cases[index]) << "\"";
     }
     manifest << "]"
-              << ",\"cases_run\":" << result.cases_run
-              << ",\"duplicated_top_case_count\":" << result.duplicated_top_case_count
-              << ",\"no_distinct_e2_case_count\":" << result.no_distinct_e2_case_count
-              << ",\"topology_4_5_2\":{\"workers\":4,\"omp_threads\":5,\"pipeline_slots\":2}}\n";
+               << ",\"cases_run\":" << result.cases_run
+               << ",\"duplicated_top_case_count\":" << result.duplicated_top_case_count
+               << ",\"no_distinct_e2_case_count\":" << result.no_distinct_e2_case_count
+               << ",\"sigma_p2_case_counts\":{\"no_outlier\":"
+               << result.sigma_no_outlier_case_count
+               << ",\"same_scale\":" << result.sigma_same_scale_case_count
+               << ",\"replay\":" << result.sigma_replay_case_count
+               << ",\"all_candidates\":" << result.sigma_all_candidates_case_count
+               << ",\"all_candidates_selected_final_exp_neg_inf\":"
+               << (result.sigma_all_candidates_selected_final_exp_neg_inf ? "true" : "false")
+               << ",\"all_candidates_final_exp_matches_reference\":"
+               << (result.sigma_all_candidates_final_exp_matches_reference ? "true" : "false")
+               << ",\"all_candidates_selected_p3_replay\":"
+               << (result.sigma_all_candidates_selected_p3_replay ? "true" : "false")
+               << ",\"zero_variance\":" << result.sigma_zero_variance_case_count
+               << ",\"n_zero\":" << result.sigma_n_zero_case_count << "}"
+               << ",\"topology_4_5_2\":{\"workers\":4,\"omp_threads\":5,\"pipeline_slots\":2}}\n";
     std::ostringstream p3;
     p3 << "{\"reference\":[" << result.reference_p3[0] << "," << result.reference_p3[1] << ","
        << result.reference_p3[2] << "],\"optimized\":[" << result.optimized_p3[0] << ","
@@ -778,8 +827,32 @@ bool write_localstage_artifacts(const std::filesystem::path &evidence_dir,
               << ",\"top_mask_mismatch_count\":" << result.top_mask_mismatch_count
               << ",\"exponent_mismatch_count\":" << result.exponent_mismatch_count
               << ",\"p1_q_mismatch_count\":" << result.p1_q_mismatch_count
-              << ",\"s_ss_n_mismatch_count\":" << result.s_ss_n_mismatch_count
-               << ",\"copy_counts\":{\"status\":\"enabled\",\"src_to_scratch_block_x\":"
+               << ",\"s_ss_n_mismatch_count\":" << result.s_ss_n_mismatch_count
+               << ",\"sigma_p2\":{\"no_outlier_case_count\":"
+               << result.sigma_no_outlier_case_count
+               << ",\"same_scale_case_count\":" << result.sigma_same_scale_case_count
+               << ",\"replay_case_count\":" << result.sigma_replay_case_count
+               << ",\"all_candidates_case_count\":" << result.sigma_all_candidates_case_count
+               << ",\"all_candidates_selected_final_exp_neg_inf\":"
+               << (result.sigma_all_candidates_selected_final_exp_neg_inf ? "true" : "false")
+               << ",\"all_candidates_final_exp_matches_reference\":"
+               << (result.sigma_all_candidates_final_exp_matches_reference ? "true" : "false")
+               << ",\"all_candidates_selected_p3_replay\":"
+               << (result.sigma_all_candidates_selected_p3_replay ? "true" : "false")
+               << ",\"zero_variance_case_count\":" << result.sigma_zero_variance_case_count
+               << ",\"n_zero_case_count\":" << result.sigma_n_zero_case_count
+               << ",\"final_exponent_match\":"
+               << (result.sigma_final_exponent_match ? "true" : "false")
+               << ",\"final_exponent_mismatch_count\":" << result.sigma_final_exponent_mismatch_count
+               << ",\"invalid_sigma_context_selected_count\":"
+               << result.invalid_sigma_context_selected_count
+               << ",\"context_prepare_count\":" << result.sigma_context_prepare_count
+               << ",\"reference_final_exponent_rescan_count\":"
+               << result.reference_final_exponent_rescan_count
+               << ",\"optimized_final_exponent_rescan_count\":"
+                << result.optimized_final_exponent_rescan_count
+               << ",\"pass\":" << (sigma_p2_checked ? "true" : "false") << "}"
+                << ",\"copy_counts\":{\"status\":\"enabled\",\"src_to_scratch_block_x\":"
                << result.src_to_scratch_block_x_copy_count
                << ",\"q_tmp_to_q_final\":" << result.q_tmp_to_q_final_copy_count
                << ",\"q_final_to_q_wide\":" << result.q_final_to_q_wide_copy_count
@@ -833,6 +906,14 @@ bool run_localstage_validation(const std::filesystem::path &evidence_dir,
     floating_edges[6] = -4.0f;
     std::vector<float> same_scale(block_size, 1.0f);
     same_scale[0] = 1.9f;
+    std::vector<float> no_outlier(block_size, 1.0f);
+    std::fill_n(no_outlier.begin(), 8, 1.9f);
+    std::vector<float> all_candidates(block_size, 1.0f);
+    std::fill(all_candidates.begin(), all_candidates.end(), 0.0f);
+    all_candidates[0] = 1.6f;
+    std::vector<float> zero_variance(block_size, 1.0f);
+    zero_variance[0] = 1024.0f;
+    std::vector<float> n_zero(block_size, 0.0f);
     std::vector<float> replay_heavy_positive(block_size, 0.5f);
     replay_heavy_positive[0] = 1024.0f;
     replay_heavy_positive[1] = 1.9f;
@@ -843,20 +924,25 @@ bool run_localstage_validation(const std::filesystem::path &evidence_dir,
     for (size_t i = 0; i + 3 < block_size; ++i) {
         partial[i] = i % 2 == 0 ? 0.5f : -2.0f;
     }
-    const std::array<Fixture, 10> fixtures = {{
+    const std::array<Fixture, 14> fixtures = {{
         {"all-zero", block_size, std::move(zero)},
         {"one-bucket", block_size, std::move(one_bucket)},
         {"two-bucket", block_size, std::move(two_bucket)},
         {"duplicated-top", block_size, std::move(duplicated_top)},
         {"no-distinct-e2", block_size, std::move(no_distinct_e2)},
         {"floating-edges", block_size, std::move(floating_edges)},
+        {"no-outlier", block_size, std::move(no_outlier)},
         {"same-scale", block_size, std::move(same_scale)},
+        {"all-candidates", block_size, std::move(all_candidates)},
+        {"zero-variance", block_size, std::move(zero_variance)},
+        {"n-zero", 0, std::move(n_zero)},
         {"replay-heavy-positive", block_size, std::move(replay_heavy_positive)},
         {"replay-heavy-negative", block_size, std::move(replay_heavy_negative)},
         {"partial-tail", block_size - 3, std::move(partial)},
     }};
 
     LocalStage local_stage;
+    SigmaDetector detector;
     for (const Fixture &fixture : fixtures) {
         if (!localstage_focus_runs_fixture(focus, fixture.name)) {
             continue;
@@ -895,10 +981,12 @@ bool run_localstage_validation(const std::filesystem::path &evidence_dir,
                 fixture.values, fixture.logical_count, block_size, reference_meta.rho, reference_p0_p1)) {
             return false;
         }
+        reset_validation_block_top2_exp_rescan_count();
         std::copy_n(fixture.values.begin(), block_size, reference_scratch.block.x.begin());
         const bool reference_ok = local_stage.run_reference(
             reference_meta, state, reference_scratch.block.x, 0, 0, reference_scratch, reference_mask,
             reference_q, reference_exp, reference_sample);
+        const size_t rescans_before_optimized = validation_block_top2_exp_rescan_count();
         std::fill(optimized_scratch.block.x.begin(), optimized_scratch.block.x.end(),
                   std::numeric_limits<float>::max());
         const std::vector<float> optimized_input_sentinel = optimized_scratch.block.x;
@@ -968,6 +1056,10 @@ bool run_localstage_validation(const std::filesystem::path &evidence_dir,
         result.replay_overwrite_count += optimized_sample.replay_overwrite_count;
         result.non_replay_overwrite_count += optimized_sample.non_replay_overwrite_count;
         result.block_exp_commit_count += optimized_sample.block_exp_commit_count;
+        result.sigma_context_prepare_count += optimized_sample.sigma_context_prepare_count;
+        result.reference_final_exponent_rescan_count += rescans_before_optimized;
+        result.optimized_final_exponent_rescan_count +=
+            validation_block_top2_exp_rescan_count() - rescans_before_optimized;
 #endif
         const bool artifacts_match = reference_ok && optimized_ok && reference_q == optimized_q &&
                                      reference_exp == optimized_exp && reference_words == optimized_words;
@@ -979,6 +1071,56 @@ bool run_localstage_validation(const std::filesystem::path &evidence_dir,
         if (!p3_match) {
             ++result.p3_branch_mismatch_count;
             result.bit_exact = false;
+        }
+        if (focus == "sigma-p2") {
+            const SigmaDetector::SigmaContext sigma_context = detector.prepare(
+                optimized_scratch.p1_S, optimized_scratch.p1_SS, optimized_scratch.p1_N);
+            const BlockMask initial_top_mask(optimized_scratch.p0_top_mask_words.data(), block_size);
+            if (!sigma_context.valid) {
+                for (size_t i = 0; i < fixture.logical_count; ++i) {
+                    if (!initial_top_mask.is_set(i) && optimized_mask.is_set(i)) {
+                        ++result.invalid_sigma_context_selected_count;
+                    }
+                }
+            }
+            const bool final_exponent_match = reference_exp == optimized_exp;
+            result.sigma_final_exponent_match = result.sigma_final_exponent_match && final_exponent_match;
+            result.sigma_final_exponent_mismatch_count += final_exponent_match ? 0 : 1;
+            const std::string fixture_name(fixture.name);
+            if (fixture_name == "no-outlier" && sigma_context.valid &&
+                !optimized_sample.has_int_outlier &&
+                optimized_sample.p3_path == P3Path::BypassNoIntegerOutlier) {
+                ++result.sigma_no_outlier_case_count;
+            }
+            if (fixture_name == "same-scale" && sigma_context.valid &&
+                optimized_sample.has_int_outlier &&
+                optimized_sample.p3_path == P3Path::BypassSameScale) {
+                ++result.sigma_same_scale_case_count;
+            }
+            if (fixture_name == "replay-heavy-positive" && sigma_context.valid &&
+                optimized_sample.has_int_outlier && optimized_sample.p3_path == P3Path::Replay) {
+                ++result.sigma_replay_case_count;
+            }
+            if (fixture_name == "all-candidates" && sigma_context.valid &&
+                optimized_sample.has_int_outlier &&
+                optimized_sample.final_remaining_exp == std::numeric_limits<int16_t>::min() &&
+                optimized_sample.p3_path == P3Path::Replay &&
+                reference_sample.p3_path == P3Path::Replay) {
+                ++result.sigma_all_candidates_case_count;
+                result.sigma_all_candidates_selected_final_exp_neg_inf = true;
+                result.sigma_all_candidates_final_exp_matches_reference =
+                    optimized_sample.final_remaining_exp == reference_exp[0];
+                result.sigma_all_candidates_selected_p3_replay = true;
+            }
+            if (fixture_name == "zero-variance" && !sigma_context.valid &&
+                optimized_scratch.p1_N != 0 && !optimized_sample.has_int_outlier) {
+                ++result.sigma_zero_variance_case_count;
+            }
+            if (fixture_name == "n-zero" && !sigma_context.valid &&
+                optimized_scratch.p1_N == 0 && !optimized_sample.has_int_outlier &&
+                optimized_sample.final_remaining_exp == std::numeric_limits<int16_t>::min()) {
+                ++result.sigma_n_zero_case_count;
+            }
         }
         result.digest_input += fixture.name;
         for (int32_t value : optimized_q) {
@@ -1433,6 +1575,17 @@ int main(int argc, char **argv) {
         aggregate.block_exp_commit_count *= localstage_repeat_fresh;
         aggregate.duplicated_top_case_count *= localstage_repeat_fresh;
         aggregate.no_distinct_e2_case_count *= localstage_repeat_fresh;
+        aggregate.sigma_no_outlier_case_count *= localstage_repeat_fresh;
+        aggregate.sigma_same_scale_case_count *= localstage_repeat_fresh;
+        aggregate.sigma_replay_case_count *= localstage_repeat_fresh;
+        aggregate.sigma_all_candidates_case_count *= localstage_repeat_fresh;
+        aggregate.sigma_zero_variance_case_count *= localstage_repeat_fresh;
+        aggregate.sigma_n_zero_case_count *= localstage_repeat_fresh;
+        aggregate.sigma_final_exponent_mismatch_count *= localstage_repeat_fresh;
+        aggregate.invalid_sigma_context_selected_count *= localstage_repeat_fresh;
+        aggregate.sigma_context_prepare_count *= localstage_repeat_fresh;
+        aggregate.reference_final_exponent_rescan_count *= localstage_repeat_fresh;
+        aggregate.optimized_final_exponent_rescan_count *= localstage_repeat_fresh;
         for (size_t path = 0; path < aggregate.reference_p3.size(); ++path) {
             aggregate.reference_p3[path] *= localstage_repeat_fresh;
             aggregate.optimized_p3[path] *= localstage_repeat_fresh;
@@ -1488,11 +1641,15 @@ int main(int argc, char **argv) {
         "INT32_MIN magnitude statistics mismatch");
 
     SigmaDetector detector;
-    detector_check = check(!detector.detect_sigma(0, 0, 0, 0), "detector zero-count check failed");
+    const SigmaDetector::SigmaContext zero_count_context = detector.prepare(0, 0, 0);
+    detector_check = check(!zero_count_context.valid && !detector.detect(0, zero_count_context),
+                           "detector zero-count check failed");
     const __int128_t upper_tail_sum = 115;
     const __int128_t upper_tail_sum_squares = 10015;
-    const bool positive_tail = detector.detect_sigma(100, upper_tail_sum, upper_tail_sum_squares, 16);
-    const bool negative_tail = detector.detect_sigma(-100, upper_tail_sum, upper_tail_sum_squares, 16);
+    const SigmaDetector::SigmaContext upper_tail_context = detector.prepare(
+        upper_tail_sum, upper_tail_sum_squares, 16);
+    const bool positive_tail = detector.detect(100, upper_tail_context);
+    const bool negative_tail = detector.detect(-100, upper_tail_context);
     const __int128_t upper_tail_sigma_squared =
         static_cast<__int128_t>(compiled_tau) * compiled_tau;
     const __int128_t upper_tail_centered = static_cast<__int128_t>(16) * 100 - upper_tail_sum;
@@ -1509,7 +1666,7 @@ int main(int argc, char **argv) {
         detector_check && !detector.detect_sigma(1, upper_tail_sum, upper_tail_sum_squares, 16),
         "lower-tail magnitude value was selected");
     detector_check = check(
-        detector_check && !detector.detect_sigma(1, 0, 0, 4),
+        detector_check && !detector.prepare(0, 0, 4).valid,
         "zero variance was selected");
     detector_check = check(
         detector_check && !detector.detect_sigma(7, 28, 196, 4),
@@ -1528,12 +1685,15 @@ int main(int argc, char **argv) {
     const __int128_t int32_max_magnitude = static_cast<__int128_t>(std::numeric_limits<int32_t>::max());
     const size_t large_magnitude_count =
         static_cast<size_t>(compiled_tau) * static_cast<size_t>(compiled_tau) + 1;
+    const SigmaDetector::SigmaContext int32_max_context = detector.prepare(
+        0, int32_max_magnitude * int32_max_magnitude, large_magnitude_count);
+    const SigmaDetector::SigmaContext int32_min_context = detector.prepare(
+        0, int32_min_magnitude * int32_min_magnitude, large_magnitude_count);
     detector_check = check(
         detector_check &&
-            detector.detect_sigma(std::numeric_limits<int32_t>::max(), 0,
-                                  int32_max_magnitude * int32_max_magnitude, large_magnitude_count) &&
-            detector.detect_sigma(std::numeric_limits<int32_t>::min(), 0,
-                                  int32_min_magnitude * int32_min_magnitude, large_magnitude_count),
+            int32_max_context.valid && int32_min_context.valid &&
+            detector.detect(std::numeric_limits<int32_t>::max(), int32_max_context) &&
+            detector.detect(std::numeric_limits<int32_t>::min(), int32_min_context),
         "large signed magnitudes were not detected safely");
     if (case_name == "detector" && !detector_check) {
         return fail("corrected detector expectation failed");

@@ -386,6 +386,11 @@ namespace ggml::gemmini::quants::act::exsia
         size_t replay_overwrite_count = 0;
         size_t non_replay_overwrite_count = 0;
         size_t block_exp_commit_count = 0;
+        size_t sigma_context_prepare_count = 0;
+        bool has_int_outlier = false;
+#endif
+#if EXSIA_VALIDATION
+        int16_t final_remaining_exp = std::numeric_limits<int16_t>::min();
 #endif
     };
 
@@ -829,6 +834,11 @@ namespace ggml::gemmini::quants::act::exsia
         void update_stripe_top2_exp(StripeState &stripe, int16_t e_b);
     };
 
+#if EXSIA_VALIDATION
+    void reset_validation_block_top2_exp_rescan_count();
+    size_t validation_block_top2_exp_rescan_count();
+#endif
+
     class OutlierMarker
     {
     public:
@@ -883,6 +893,17 @@ namespace ggml::gemmini::quants::act::exsia
     class SigmaDetector
     {
     public:
+        struct SigmaContext
+        {
+            __int128_t n = 0;
+            __int128_t S = 0;
+            __int128_t threshold = 0;
+            bool valid = false;
+        };
+
+        SigmaContext prepare(__int128_t S, __int128_t SS, size_t N) const;
+        bool detect(int32_t q, const SigmaContext &context) const;
+
         // Detect a one-sided upper-tail outlier from magnitude statistics.
         bool detect_sigma(int32_t q, __int128_t S, __int128_t SS, size_t N);
     };

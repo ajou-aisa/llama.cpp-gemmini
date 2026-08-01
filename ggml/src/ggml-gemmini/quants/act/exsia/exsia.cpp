@@ -152,6 +152,10 @@ namespace ggml::gemmini::quants::act::exsia
             return widened < 0 ? -widened : widened;
         }
 
+#if EXSIA_VALIDATION
+        std::atomic<size_t> validation_block_top2_exp_rescan_counter{0};
+#endif
+
 #if EXSIA_PROFILE_LOG_ENABLED
         static inline const char *cycle_detail_log_path()
         {
@@ -506,6 +510,9 @@ namespace ggml::gemmini::quants::act::exsia
 
     void ExpScanner::update_block_top2_exp(const BlockMask &mask, BlockState &blk)
     {
+#if EXSIA_VALIDATION
+        validation_block_top2_exp_rescan_counter.fetch_add(1, std::memory_order_relaxed);
+#endif
         blk.e1 = std::numeric_limits<int16_t>::min();
         blk.e2 = std::numeric_limits<int16_t>::min();
 
@@ -525,6 +532,18 @@ namespace ggml::gemmini::quants::act::exsia
                 blk.e2 = exp;
         }
     }
+
+#if EXSIA_VALIDATION
+    void reset_validation_block_top2_exp_rescan_count()
+    {
+        validation_block_top2_exp_rescan_counter.store(0, std::memory_order_relaxed);
+    }
+
+    size_t validation_block_top2_exp_rescan_count()
+    {
+        return validation_block_top2_exp_rescan_counter.load(std::memory_order_relaxed);
+    }
+#endif
 
     void ExpScanner::update_stripe_top2_exp(StripeState &stripe, int16_t exp)
     {
@@ -682,19 +701,36 @@ namespace ggml::gemmini::quants::act::exsia
             q[i] = null_theta ? 0 : quantize_to_i32(x[i], theta_b);
     }
 
+    SigmaDetector::SigmaContext SigmaDetector::prepare(__int128_t S, __int128_t SS, size_t N) const
+    {
+        SigmaContext context;
+        context.n = static_cast<__int128_t>(N);
+        context.S = S;
+        if (N == 0)
+            return context;
+
+        const __int128_t variance_numer = context.n * SS - S * S;
+        if (variance_numer <= 0)
+            return context;
+
+        const __int128_t tau = GGML_GEMMINI_EXSIA_SIGMA;
+        context.threshold = tau * tau * variance_numer;
+        context.valid = true;
+        return context;
+    }
+
+    bool SigmaDetector::detect(int32_t q, const SigmaContext &context) const
+    {
+        if (!context.valid)
+            return false;
+
+        const __int128_t centered = context.n * static_cast<__int128_t>(magnitude_i32(q)) - context.S;
+        return centered > 0 && centered * centered > context.threshold;
+    }
+
     bool SigmaDetector::detect_sigma(int32_t q, __int128_t S, __int128_t SS, size_t N)
     {
-        if (N == 0)
-            return false;
-
-        const __int128_t n = static_cast<__int128_t>(N);
-        const __int128_t sigma = GGML_GEMMINI_EXSIA_SIGMA;
-        const __int128_t centered = n * static_cast<__int128_t>(magnitude_i32(q)) - S;
-        const __int128_t variance_numer = n * SS - S * S;
-        if (centered <= 0 || variance_numer <= 0)
-            return false;
-
-        return centered * centered > sigma * sigma * variance_numer;
+        return detect(q, prepare(S, SS, N));
     }
 
     std::pair<int8_t, int32_t> ResidualClipper::clip_with_residual(int32_t q)
@@ -774,6 +810,7 @@ namespace ggml::gemmini::quants::act::exsia
         __int128_t SS = 0;
         size_t unmasked_count = 0;
         bool has_int_outlier = false;
+        int16_t final_exp = neg_inf;
         int16_t e_pre = neg_inf;
         int16_t theta_pre = neg_inf;
 #if EXSIA_STAGE_PROFILE_ENABLED
@@ -835,17 +872,29 @@ namespace ggml::gemmini::quants::act::exsia
         const uint64_t t2 = EXSIA_STAGE_CYCLE_READ();
 #endif
 
+        const SigmaDetector::SigmaContext sigma_context = unit_sigma_.prepare(S, SS, unmasked_count);
+#if EXSIA_BRANCH_COUNTS_ENABLED
+        ++cycle_sample.sigma_context_prepare_count;
+#endif
         for (size_t i = 0; i < block_size; ++i)
         {
             if (block_mask.is_set(i))
                 continue;
 
-            if (unit_sigma_.detect_sigma(q_out[i], S, SS, unmasked_count))
+            if (unit_sigma_.detect(q_out[i], sigma_context))
             {
                 block_mask.set(i);
                 has_int_outlier = true;
             }
+            else
+                final_exp = std::max(final_exp, blk.e[i]);
         }
+#if EXSIA_BRANCH_COUNTS_ENABLED
+        cycle_sample.has_int_outlier = has_int_outlier;
+#endif
+#if EXSIA_VALIDATION
+        cycle_sample.final_remaining_exp = final_exp;
+#endif
 
 #if EXSIA_STAGE_PROFILE_ENABLED
         const uint64_t t3 = EXSIA_STAGE_CYCLE_READ();
@@ -861,8 +910,7 @@ namespace ggml::gemmini::quants::act::exsia
         }
         else
         {
-            unit_exp_.update_block_top2_exp(block_mask, blk);
-            blk.e_b = blk.e1;
+            blk.e_b = final_exp;
             blk.theta_b = exp_to_theta(blk.e_b, meta.rho);
 
             if (blk.theta_b == theta_pre)
@@ -926,6 +974,7 @@ namespace ggml::gemmini::quants::act::exsia
         __int128_t SS = 0;
         size_t unmasked_count = 0;
         bool has_int_outlier = false;
+        int16_t final_exp = neg_inf;
         int16_t e_pre = neg_inf;
         int16_t theta_pre = neg_inf;
 #if EXSIA_STAGE_PROFILE_ENABLED
@@ -987,16 +1036,28 @@ namespace ggml::gemmini::quants::act::exsia
         const uint64_t t2 = EXSIA_STAGE_CYCLE_READ();
 #endif
 
+        const SigmaDetector::SigmaContext sigma_context = unit_sigma_.prepare(S, SS, unmasked_count);
+#if EXSIA_BRANCH_COUNTS_ENABLED
+        ++cycle_sample.sigma_context_prepare_count;
+#endif
         for (size_t i = 0; i < valid_count; ++i)
         {
             if (block_mask.is_set(i))
                 continue;
-            if (unit_sigma_.detect_sigma(q_out[i], S, SS, unmasked_count))
+            if (unit_sigma_.detect(q_out[i], sigma_context))
             {
                 block_mask.set(i);
                 has_int_outlier = true;
             }
+            else
+                final_exp = std::max(final_exp, blk.e[i]);
         }
+#if EXSIA_BRANCH_COUNTS_ENABLED
+        cycle_sample.has_int_outlier = has_int_outlier;
+#endif
+#if EXSIA_VALIDATION
+        cycle_sample.final_remaining_exp = final_exp;
+#endif
 #if EXSIA_STAGE_PROFILE_ENABLED
         const uint64_t t3 = EXSIA_STAGE_CYCLE_READ();
 #endif
@@ -1011,8 +1072,7 @@ namespace ggml::gemmini::quants::act::exsia
         }
         else
         {
-            unit_exp_.update_block_top2_exp(block_mask, blk);
-            blk.e_b = blk.e1;
+            blk.e_b = final_exp;
             blk.theta_b = exp_to_theta(blk.e_b, meta.rho);
             if (blk.theta_b == theta_pre)
             {
