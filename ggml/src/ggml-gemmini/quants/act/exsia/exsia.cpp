@@ -770,8 +770,6 @@ namespace ggml::gemmini::quants::act::exsia
         GGML_ASSERT(q_out != nullptr);
         BlockState &blk = scratch.block;
         const int16_t neg_inf = std::numeric_limits<int16_t>::min();
-        std::vector<int32_t> &q_tmp = scratch.q_tmp;
-        std::vector<int32_t> &q_final = scratch.q_final;
         __int128_t S = 0;
         __int128_t SS = 0;
         size_t unmasked_count = 0;
@@ -814,7 +812,7 @@ namespace ggml::gemmini::quants::act::exsia
         for (size_t i = 0; i < block_size; ++i)
         {
             const int32_t tmp = null_theta ? 0 : quantize_to_i32(x[i], theta_pre);
-            q_tmp[i] = tmp;
+            q_out[i] = tmp;
             if (block_mask.is_set(i))
                 continue;
 
@@ -842,7 +840,7 @@ namespace ggml::gemmini::quants::act::exsia
             if (block_mask.is_set(i))
                 continue;
 
-            if (unit_sigma_.detect_sigma(q_tmp[i], S, SS, unmasked_count))
+            if (unit_sigma_.detect_sigma(q_out[i], S, SS, unmasked_count))
             {
                 block_mask.set(i);
                 has_int_outlier = true;
@@ -857,7 +855,6 @@ namespace ggml::gemmini::quants::act::exsia
         {
             blk.e_b = e_pre;
             blk.theta_b = theta_pre;
-            std::copy_n(q_tmp.begin(), block_size, q_final.begin());
 #if EXSIA_BRANCH_COUNTS_ENABLED
             cycle_sample.p3_path = P3Path::BypassNoIntegerOutlier;
 #endif
@@ -870,22 +867,26 @@ namespace ggml::gemmini::quants::act::exsia
 
             if (blk.theta_b == theta_pre)
             {
-                std::copy_n(q_tmp.begin(), block_size, q_final.begin());
 #if EXSIA_BRANCH_COUNTS_ENABLED
                 cycle_sample.p3_path = P3Path::BypassSameScale;
 #endif
             }
             else
             {
-                unit_quant_.quantize_block(x, block_size, blk.theta_b, q_final);
+                const bool final_null_theta = blk.theta_b == neg_inf;
+                for (size_t i = 0; i < block_size; ++i)
+                    q_out[i] = final_null_theta ? 0 : quantize_to_i32(x[i], blk.theta_b);
 #if EXSIA_BRANCH_COUNTS_ENABLED
+                ++cycle_sample.replay_overwrite_count;
                 cycle_sample.p3_path = P3Path::Replay;
 #endif
             }
         }
 
-        std::copy_n(q_final.begin(), block_size, q_out);
         block_exp_out = blk.e_b;
+#if EXSIA_BRANCH_COUNTS_ENABLED
+        ++cycle_sample.block_exp_commit_count;
+#endif
 
 #if EXSIA_STAGE_PROFILE_ENABLED
         const uint64_t t4 = EXSIA_STAGE_CYCLE_READ();
@@ -921,8 +922,6 @@ namespace ggml::gemmini::quants::act::exsia
         const int16_t neg_inf = std::numeric_limits<int16_t>::min();
         std::copy_n(x, valid_count, blk.x.begin());
         std::fill(blk.x.begin() + valid_count, blk.x.begin() + block_size, 0.0f);
-        std::vector<int32_t> &q_tmp = scratch.q_tmp;
-        std::vector<int32_t> &q_final = scratch.q_final;
         __int128_t S = 0;
         __int128_t SS = 0;
         size_t unmasked_count = 0;
@@ -966,7 +965,7 @@ namespace ggml::gemmini::quants::act::exsia
         for (size_t i = 0; i < block_size; ++i)
         {
             const int32_t tmp = null_theta ? 0 : quantize_to_i32(blk.x[i], theta_pre);
-            q_tmp[i] = tmp;
+            q_out[i] = tmp;
             if (i >= valid_count || block_mask.is_set(i))
                 continue;
 
@@ -992,7 +991,7 @@ namespace ggml::gemmini::quants::act::exsia
         {
             if (block_mask.is_set(i))
                 continue;
-            if (unit_sigma_.detect_sigma(q_tmp[i], S, SS, unmasked_count))
+            if (unit_sigma_.detect_sigma(q_out[i], S, SS, unmasked_count))
             {
                 block_mask.set(i);
                 has_int_outlier = true;
@@ -1006,7 +1005,6 @@ namespace ggml::gemmini::quants::act::exsia
         {
             blk.e_b = e_pre;
             blk.theta_b = theta_pre;
-            std::copy_n(q_tmp.begin(), block_size, q_final.begin());
 #if EXSIA_BRANCH_COUNTS_ENABLED
             cycle_sample.p3_path = P3Path::BypassNoIntegerOutlier;
 #endif
@@ -1018,23 +1016,26 @@ namespace ggml::gemmini::quants::act::exsia
             blk.theta_b = exp_to_theta(blk.e_b, meta.rho);
             if (blk.theta_b == theta_pre)
             {
-                std::copy_n(q_tmp.begin(), block_size, q_final.begin());
 #if EXSIA_BRANCH_COUNTS_ENABLED
                 cycle_sample.p3_path = P3Path::BypassSameScale;
 #endif
             }
             else
             {
-                unit_quant_.quantize_block(blk.x.data(), block_size, blk.theta_b, q_final);
+                const bool final_null_theta = blk.theta_b == neg_inf;
+                for (size_t i = 0; i < block_size; ++i)
+                    q_out[i] = final_null_theta ? 0 : quantize_to_i32(blk.x[i], blk.theta_b);
 #if EXSIA_BRANCH_COUNTS_ENABLED
+                ++cycle_sample.replay_overwrite_count;
                 cycle_sample.p3_path = P3Path::Replay;
 #endif
             }
         }
 
-        std::copy_n(q_final.begin(), block_size, q_out);
-        std::fill(q_out + valid_count, q_out + block_size, 0);
         block_exp_out = blk.e_b;
+#if EXSIA_BRANCH_COUNTS_ENABLED
+        ++cycle_sample.block_exp_commit_count;
+#endif
 #if EXSIA_STAGE_PROFILE_ENABLED
         const uint64_t t4 = EXSIA_STAGE_CYCLE_READ();
         cycle_sample.p0 = t1 >= t0 ? t1 - t0 : 0;

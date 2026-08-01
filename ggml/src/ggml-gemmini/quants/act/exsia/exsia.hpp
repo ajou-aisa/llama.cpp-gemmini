@@ -380,6 +380,13 @@ namespace ggml::gemmini::quants::act::exsia
         uint64_t p3 = 0;
 #endif
         P3Path p3_path = P3Path::BypassNoIntegerOutlier;
+#if EXSIA_BRANCH_COUNTS_ENABLED
+        size_t q_tmp_to_q_final_copy_count = 0;
+        size_t q_final_to_q_wide_copy_count = 0;
+        size_t replay_overwrite_count = 0;
+        size_t non_replay_overwrite_count = 0;
+        size_t block_exp_commit_count = 0;
+#endif
     };
 
 #if EXSIA_BRANCH_COUNTS_ENABLED
@@ -889,6 +896,7 @@ namespace ggml::gemmini::quants::act::exsia
     class LocalStage
     {
     public:
+        // q_out addresses one caller-owned, block-disjoint slot q_wide range and never aliases x.
         bool run_optimized(
             Meta &meta,
             ExSIAState &state,

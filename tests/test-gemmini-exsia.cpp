@@ -581,6 +581,11 @@ struct LocalStageValidationResult {
     size_t exponent_mismatch_count = 0;
     size_t p1_q_mismatch_count = 0;
     size_t s_ss_n_mismatch_count = 0;
+    size_t q_tmp_to_q_final_copy_count = 0;
+    size_t q_final_to_q_wide_copy_count = 0;
+    size_t replay_overwrite_count = 0;
+    size_t non_replay_overwrite_count = 0;
+    size_t block_exp_commit_count = 0;
     size_t duplicated_top_case_count = 0;
     size_t no_distinct_e2_case_count = 0;
     std::array<size_t, 3> reference_p3{};
@@ -712,9 +717,19 @@ bool write_localstage_artifacts(const std::filesystem::path &evidence_dir,
                                 result.exponents_match && result.p1_q_match && result.s_ss_n_match &&
                                 result.duplicated_top_case_count != 0 &&
                                 result.no_distinct_e2_case_count != 0);
+    const bool direct_qout_checked = focus != "direct-qout" ||
+                                     (result.optimized_p3[0] != 0 && result.optimized_p3[1] != 0 &&
+                                      result.optimized_p3[2] != 0 &&
+                                      result.q_tmp_to_q_final_copy_count == 0 &&
+                                      result.q_final_to_q_wide_copy_count == 0 &&
+                                      result.replay_overwrite_count == result.optimized_p3[2] &&
+                                      result.replay_overwrite_count != 0 &&
+                                      result.non_replay_overwrite_count == 0 &&
+                                      result.block_exp_commit_count == result.cases_run);
     const bool pass = result.bit_exact && result.artifact_mismatch_count == 0 &&
                         result.p3_branch_mismatch_count == 0 && nondeterministic_run_count == 0 &&
                         p0_p1_checked &&
+                        direct_qout_checked &&
                        (focus != "full-block" || full_block_copy_free) &&
                        (focus != "partial-tail" ||
                         (padding_checked && result.padding_q_out_zero && result.padding_mask_clear &&
@@ -764,9 +779,13 @@ bool write_localstage_artifacts(const std::filesystem::path &evidence_dir,
               << ",\"exponent_mismatch_count\":" << result.exponent_mismatch_count
               << ",\"p1_q_mismatch_count\":" << result.p1_q_mismatch_count
               << ",\"s_ss_n_mismatch_count\":" << result.s_ss_n_mismatch_count
-              << ",\"copy_counts\":{\"status\":\"enabled\",\"src_to_scratch_block_x\":"
-              << result.src_to_scratch_block_x_copy_count
-              << ",\"q_tmp_to_q_final\":null,\"q_final_to_q_wide\":null}"
+               << ",\"copy_counts\":{\"status\":\"enabled\",\"src_to_scratch_block_x\":"
+               << result.src_to_scratch_block_x_copy_count
+               << ",\"q_tmp_to_q_final\":" << result.q_tmp_to_q_final_copy_count
+               << ",\"q_final_to_q_wide\":" << result.q_final_to_q_wide_copy_count
+               << ",\"replay_overwrite_count\":" << result.replay_overwrite_count
+               << ",\"non_replay_overwrite_count\":" << result.non_replay_overwrite_count
+               << ",\"block_exp_commit_count\":" << result.block_exp_commit_count << "}"
               << ",\"scratch_fields\":{\"status\":\"not-enabled\",\"production_q_tmp\":null"
               << ",\"production_q_final\":null}"
               << ",\"padding_validation_case_count\":" << result.partial_tail_case_count
@@ -812,17 +831,28 @@ bool run_localstage_validation(const std::filesystem::path &evidence_dir,
     floating_edges[4] = std::numeric_limits<float>::denorm_min();
     floating_edges[5] = -std::numeric_limits<float>::denorm_min();
     floating_edges[6] = -4.0f;
+    std::vector<float> same_scale(block_size, 1.0f);
+    same_scale[0] = 1.9f;
+    std::vector<float> replay_heavy_positive(block_size, 0.5f);
+    replay_heavy_positive[0] = 1024.0f;
+    replay_heavy_positive[1] = 1.9f;
+    std::vector<float> replay_heavy_negative(block_size, -0.5f);
+    replay_heavy_negative[0] = -1024.0f;
+    replay_heavy_negative[1] = -1.9f;
     std::vector<float> partial(block_size, 0.0f);
     for (size_t i = 0; i + 3 < block_size; ++i) {
         partial[i] = i % 2 == 0 ? 0.5f : -2.0f;
     }
-    const std::array<Fixture, 7> fixtures = {{
+    const std::array<Fixture, 10> fixtures = {{
         {"all-zero", block_size, std::move(zero)},
         {"one-bucket", block_size, std::move(one_bucket)},
         {"two-bucket", block_size, std::move(two_bucket)},
         {"duplicated-top", block_size, std::move(duplicated_top)},
         {"no-distinct-e2", block_size, std::move(no_distinct_e2)},
         {"floating-edges", block_size, std::move(floating_edges)},
+        {"same-scale", block_size, std::move(same_scale)},
+        {"replay-heavy-positive", block_size, std::move(replay_heavy_positive)},
+        {"replay-heavy-negative", block_size, std::move(replay_heavy_negative)},
         {"partial-tail", block_size - 3, std::move(partial)},
     }};
 
@@ -853,7 +883,7 @@ bool run_localstage_validation(const std::filesystem::path &evidence_dir,
         BlockMask reference_mask(reference_words.data(), block_size);
         BlockMask optimized_mask(optimized_words.data(), block_size);
         std::vector<int32_t> reference_q(block_size, 0);
-        std::vector<int32_t> optimized_q(block_size, 0);
+        std::vector<int32_t> optimized_q(block_size, std::numeric_limits<int32_t>::min());
         std::vector<int16_t> reference_exp(1, std::numeric_limits<int16_t>::min());
         std::vector<int16_t> optimized_exp(1, std::numeric_limits<int16_t>::min());
         Meta reference_meta;
@@ -910,7 +940,7 @@ bool run_localstage_validation(const std::filesystem::path &evidence_dir,
             const bool exponent_matches = std::equal(reference_p0_p1.exponents.begin(),
                                                       reference_p0_p1.exponents.end(),
                                                       optimized_scratch.block.e.begin());
-            const bool p1_q_matches = optimized_scratch.q_tmp == reference_p0_p1.q;
+            const bool p1_q_matches = optimized_q == reference_p0_p1.q;
             const bool s_ss_n_matches = optimized_scratch.p1_S == reference_p0_p1.S &&
                                         optimized_scratch.p1_SS == reference_p0_p1.SS &&
                                         optimized_scratch.p1_N == reference_p0_p1.N;
@@ -932,6 +962,13 @@ bool run_localstage_validation(const std::filesystem::path &evidence_dir,
         const size_t optimized_path = static_cast<size_t>(optimized_sample.p3_path);
         ++result.reference_p3[reference_path];
         ++result.optimized_p3[optimized_path];
+#if EXSIA_BRANCH_COUNTS_ENABLED
+        result.q_tmp_to_q_final_copy_count += optimized_sample.q_tmp_to_q_final_copy_count;
+        result.q_final_to_q_wide_copy_count += optimized_sample.q_final_to_q_wide_copy_count;
+        result.replay_overwrite_count += optimized_sample.replay_overwrite_count;
+        result.non_replay_overwrite_count += optimized_sample.non_replay_overwrite_count;
+        result.block_exp_commit_count += optimized_sample.block_exp_commit_count;
+#endif
         const bool artifacts_match = reference_ok && optimized_ok && reference_q == optimized_q &&
                                      reference_exp == optimized_exp && reference_words == optimized_words;
         const bool p3_match = reference_sample.p3_path == optimized_sample.p3_path;
@@ -1389,6 +1426,11 @@ int main(int argc, char **argv) {
         aggregate.exponent_mismatch_count *= localstage_repeat_fresh;
         aggregate.p1_q_mismatch_count *= localstage_repeat_fresh;
         aggregate.s_ss_n_mismatch_count *= localstage_repeat_fresh;
+        aggregate.q_tmp_to_q_final_copy_count *= localstage_repeat_fresh;
+        aggregate.q_final_to_q_wide_copy_count *= localstage_repeat_fresh;
+        aggregate.replay_overwrite_count *= localstage_repeat_fresh;
+        aggregate.non_replay_overwrite_count *= localstage_repeat_fresh;
+        aggregate.block_exp_commit_count *= localstage_repeat_fresh;
         aggregate.duplicated_top_case_count *= localstage_repeat_fresh;
         aggregate.no_distinct_e2_case_count *= localstage_repeat_fresh;
         for (size_t path = 0; path < aggregate.reference_p3.size(); ++path) {
