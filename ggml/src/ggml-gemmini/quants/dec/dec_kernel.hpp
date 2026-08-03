@@ -1,8 +1,6 @@
 #pragma once
 
 #include <cstddef>
-#include <cstdint>
-#include <utility>
 #include <vector>
 
 struct ggml_gemmini_args_t;
@@ -10,6 +8,8 @@ struct ggml_gemmini_args_t;
 namespace ggml::gemmini::quants::dec
 {
 struct DecRoutePlan;
+struct ResidualGroupEntry;
+struct ActiveRowGroup;
 
 inline constexpr size_t kDecInt64JTileWidth = 128;
 
@@ -27,18 +27,8 @@ void accumulate_to_ycom_int64_scalar(
     size_t I,
     size_t J,
     const float *activation_scales,
-    const std::vector<int> &unique_k,
-    const std::vector<size_t> &rk_offs,
-    const std::pair<int, int32_t> *rk_pairs,
-    float *Y_com);
-
-void accumulate_single_row_to_ycom_int64_scalar(
-    const ggml_gemmini_args_t &args,
-    const DecRoutePlan &plan,
-    size_t J,
-    const float *activation_scales,
-    const std::vector<int> &unique_k,
-    const std::vector<int64_t> &delta_by_k,
+    const std::vector<ResidualGroupEntry> &entries,
+    const std::vector<ActiveRowGroup> &groups,
     float *Y_com);
 
 void accumulate_to_ycom_int64_channel_direct(
@@ -47,18 +37,8 @@ void accumulate_to_ycom_int64_channel_direct(
     size_t I,
     size_t J,
     const float *activation_scales,
-    const std::vector<int> &unique_k,
-    const std::vector<size_t> &rk_offs,
-    const std::pair<int, int32_t> *rk_pairs,
-    float *Y_com);
-
-void accumulate_single_row_to_ycom_int64_channel_direct(
-    const ggml_gemmini_args_t &args,
-    const DecRoutePlan &plan,
-    size_t J,
-    const float *activation_scales,
-    const std::vector<int> &unique_k,
-    const std::vector<int64_t> &delta_by_k,
+    const std::vector<ResidualGroupEntry> &entries,
+    const std::vector<ActiveRowGroup> &groups,
     float *Y_com);
 
 void accumulate_to_ycom_int64_channel_sidecar(
@@ -67,18 +47,8 @@ void accumulate_to_ycom_int64_channel_sidecar(
     size_t I,
     size_t J,
     const float *activation_scales,
-    const std::vector<int> &unique_k,
-    const std::vector<size_t> &rk_offs,
-    const std::pair<int, int32_t> *rk_pairs,
-    float *Y_com);
-
-void accumulate_single_row_to_ycom_int64_channel_sidecar(
-    const ggml_gemmini_args_t &args,
-    const DecRoutePlan &plan,
-    size_t J,
-    const float *activation_scales,
-    const std::vector<int> &unique_k,
-    const std::vector<int64_t> &delta_by_k,
+    const std::vector<ResidualGroupEntry> &entries,
+    const std::vector<ActiveRowGroup> &groups,
     float *Y_com);
 
 void accumulate_to_ycom_int64_block(
@@ -87,22 +57,11 @@ void accumulate_to_ycom_int64_block(
     size_t I,
     size_t J,
     const float *activation_scales,
-    const std::vector<int> &unique_k,
-    const std::vector<size_t> &rk_offs,
-    const std::pair<int, int32_t> *rk_pairs,
+    const std::vector<ResidualGroupEntry> &entries,
+    const std::vector<ActiveRowGroup> &groups,
     float *Y_com);
 
-void accumulate_single_row_to_ycom_int64_block(
-    const ggml_gemmini_args_t &args,
-    const DecRoutePlan &plan,
-    size_t J,
-    const float *activation_scales,
-    const std::vector<int> &unique_k,
-    const std::vector<int64_t> &delta_by_k,
-    float *Y_com);
-
-void accumulate_to_ycom_int64_h1(const ggml_gemmini_args_t &, const DecRoutePlan &, size_t, size_t, const float *, const std::vector<int> &, const std::vector<size_t> &, const std::pair<int, int32_t> *, float *);
-void accumulate_single_row_to_ycom_int64_h1(const ggml_gemmini_args_t &, const DecRoutePlan &, size_t, const float *, const std::vector<int> &, const std::vector<int64_t> &, float *);
+void accumulate_to_ycom_int64_h1(const ggml_gemmini_args_t &, const DecRoutePlan &, size_t, size_t, const float *, const std::vector<ResidualGroupEntry> &, const std::vector<ActiveRowGroup> &, float *);
 
 void apply_ycom_to_output(
     const float *Y_com,

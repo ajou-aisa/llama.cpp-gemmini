@@ -6,70 +6,45 @@
 #include <gemmini/log.hpp>
 #include <gemmini/cycle_reader.hpp>
 
+#ifndef DEC_VALIDATION
+#define DEC_VALIDATION 0
+#endif
+
 #if LOG_DEBUG
 #include "../../ggml-gemmini-config.hpp"
 #endif
 
 #include <algorithm>
-#include <cmath>
 #include <cstdint>
-#include <utility>
 #include <vector>
 
-#ifndef DEC_VALIDATION
-#define DEC_VALIDATION 0
-#endif
-
-#if DEC_VALIDATION
+#if LOG_DEBUG || DEC_VALIDATION
+#include <cmath>
 #include <limits>
 #endif
 
-namespace ggml::gemmini::quants::dec { namespace
+namespace ggml::gemmini::quants::dec
 {
-    struct RkTriplet
-    {
-        int k;
-        int r;
-        int32_t d;
-    };
+namespace
+{
 
     struct ActivationDECScratch
     {
-        std::vector<size_t> rk_counts;
-        std::vector<size_t> rk_offs;
-        std::vector<size_t> rk_pos;
-        std::vector<std::pair<int, int32_t>> rk_pairs;
-        std::vector<int> unique_k;
-        std::vector<RkTriplet> rk_stage;
-        std::vector<int64_t> i1_delta_by_k;
-        double i1_total_abs_residual = 0.0;
+        std::vector<ResidualGroupEntry> residual_entries;
+        std::vector<ActiveRowGroup> active_row_groups;
+        std::vector<uint32_t> unique_k;
+        std::vector<uint32_t> active_groups_global;
         std::vector<float> Y_com;
 
-        void resize_for_dims(size_t I, size_t K, size_t J)
+        void resize_for_dims(size_t I, size_t J)
         {
-            if (rk_counts.size() != K + 1)
-            {
-                rk_counts.resize(K + 1);
-                rk_offs.resize(K + 1);
-                rk_pos.resize(K);
-                unique_k.reserve(K);
-            }
-            std::fill(rk_counts.begin(), rk_counts.end(), 0);
+            residual_entries.clear();
+            active_row_groups.clear();
             unique_k.clear();
-            rk_stage.clear();
+            active_groups_global.clear();
             if (Y_com.size() != I * J)
                 Y_com.resize(I * J);
             std::fill(Y_com.begin(), Y_com.end(), 0.f);
-        }
-
-        void reset_i1_delta(size_t K)
-        {
-            if (i1_delta_by_k.size() != K)
-                i1_delta_by_k.assign(K, int64_t {0});
-            else
-                std::fill(i1_delta_by_k.begin(), i1_delta_by_k.end(), int64_t {0});
-
-            i1_total_abs_residual = 0.0;
         }
     };
 
@@ -197,11 +172,7 @@ namespace ggml::gemmini::quants::dec { namespace
         const ggml_gemmini_args_t &args,
         const DecRoutePlan &plan,
         const float *activation_scales,
-        const std::vector<int> &unique_k,
-        const std::vector<size_t> &rk_offs,
-        const std::pair<int, int32_t> *rk_pairs,
-        const std::vector<int64_t> &delta_by_k,
-        bool decode,
+        const std::vector<ResidualGroupEntry> &entries,
         float *reference_ycom)
     {
         const bool per_block_scale = !plan.scales.scalar_mode && !plan.scales.row_header_mode &&
@@ -212,12 +183,9 @@ namespace ggml::gemmini::quants::dec { namespace
         for (size_t route = 0; route < route_count; ++route)
         {
             std::fill(accumulator.begin(), accumulator.end(), int64_t {0});
-            for (int k : unique_k)
+            for (const ResidualGroupEntry &entry : entries)
             {
-                if (k < 0)
-                    continue;
-
-                const size_t k_sz = static_cast<size_t>(k);
+                const size_t k_sz = entry.k;
                 if (k_sz >= args.K ||
                     (per_block_scale && k_sz / plan.scales.block_size != route))
                     continue;
@@ -228,37 +196,15 @@ namespace ggml::gemmini::quants::dec { namespace
                     if (!reference_weight_code(k_sz, j, args, plan, weight_code))
                         return false;
 
-                    if (decode)
-                    {
-                        if (k_sz >= delta_by_k.size())
-                            return false;
-
-                        int64_t product = 0;
-                        int64_t updated = 0;
-                        if (!checked_mul_i64(delta_by_k[k_sz], weight_code, product) ||
-                            !checked_add_i64(accumulator[j], product, updated))
-                            return false;
-                        accumulator[j] = updated;
-                        continue;
-                    }
-
-                    if (k_sz + 1 >= rk_offs.size())
+                    if (entry.row >= args.I)
                         return false;
-                    for (size_t p = rk_offs[k_sz]; p < rk_offs[k_sz + 1]; ++p)
-                    {
-                        const int r = rk_pairs[p].first;
-                        if (r < 0 || static_cast<size_t>(r) >= args.I)
-                            return false;
-
-                        int64_t product = 0;
-                        int64_t updated = 0;
-                        const size_t accumulator_index = static_cast<size_t>(r) * args.J + j;
-                        // int32 residual * int8 code is <= 2^38; int64 permits at least 2^25 such terms per route.
-                        if (!checked_mul_i64(rk_pairs[p].second, weight_code, product) ||
-                            !checked_add_i64(accumulator[accumulator_index], product, updated))
-                            return false;
-                        accumulator[accumulator_index] = updated;
-                    }
+                    int64_t product = 0;
+                    int64_t updated = 0;
+                    const size_t accumulator_index = static_cast<size_t>(entry.row) * args.J + j;
+                    if (!checked_mul_i64(entry.residual, weight_code, product) ||
+                        !checked_add_i64(accumulator[accumulator_index], product, updated))
+                        return false;
+                    accumulator[accumulator_index] = updated;
                 }
             }
 
@@ -318,8 +264,8 @@ namespace ggml::gemmini::quants::dec { namespace
         size_t K,
         ActivationDECScratch &scratch)
     {
-        if (scratch.rk_stage.capacity() < outliers.size())
-            scratch.rk_stage.reserve(outliers.size());
+        if (scratch.residual_entries.capacity() < outliers.size())
+            scratch.residual_entries.reserve(outliers.size());
 
         if (outliers.empty() || I == 0 || K == 0)
             return 0;
@@ -337,8 +283,8 @@ namespace ggml::gemmini::quants::dec { namespace
             if (r >= I || k_sz >= K)
                 continue;
 
-            scratch.rk_stage.push_back({k, static_cast<int>(r), outlier.residual});
-            scratch.rk_counts[k_sz + 1]++;
+            scratch.residual_entries.push_back({
+                static_cast<uint32_t>(r), static_cast<uint32_t>(k_sz), outlier.residual});
             ++staged;
         }
 
@@ -348,10 +294,10 @@ namespace ggml::gemmini::quants::dec { namespace
             double residual_sum = 0.0;
             double residual_sq_sum = 0.0;
             double residual_max = 0.0;
-            const size_t start_idx = scratch.rk_stage.size() - staged;
-            for (size_t i = start_idx; i < scratch.rk_stage.size(); ++i)
+            const size_t start_idx = scratch.residual_entries.size() - staged;
+            for (size_t i = start_idx; i < scratch.residual_entries.size(); ++i)
             {
-                const double abs_res = std::fabs(static_cast<double>(scratch.rk_stage[i].d));
+                const double abs_res = std::fabs(static_cast<double>(scratch.residual_entries[i].residual));
                 residual_sum += abs_res;
                 residual_sq_sum += abs_res * abs_res;
                 residual_max = std::max(residual_max, abs_res);
@@ -371,116 +317,6 @@ namespace ggml::gemmini::quants::dec { namespace
 #endif
 
         return staged;
-    }
-
-    size_t stage_from_outliers_i1(
-        const std::vector<QactOutlier> &outliers,
-        size_t K,
-        ActivationDECScratch &scratch)
-    {
-        if (outliers.empty() || K == 0)
-            return 0;
-
-        size_t staged = 0;
-#if LOG_DEBUG
-        double residual_sum = 0.0;
-        double residual_sq_sum = 0.0;
-        double residual_max = 0.0;
-#endif
-
-        for (const auto &outlier : outliers)
-        {
-            const int k = outlier.col;
-            const int r_idx = outlier.row;
-            if (k < 0 || r_idx != 0)
-                continue;
-
-            const size_t k_sz = static_cast<size_t>(k);
-            if (k_sz >= K)
-                continue;
-
-            if (scratch.rk_counts[k_sz + 1] == 0)
-                scratch.unique_k.push_back(k);
-
-            scratch.i1_delta_by_k[k_sz] += static_cast<int64_t>(outlier.residual);
-            const double abs_res = std::fabs(static_cast<double>(outlier.residual));
-            scratch.i1_total_abs_residual += abs_res;
-            scratch.rk_counts[k_sz + 1]++;
-            ++staged;
-
-#if LOG_DEBUG
-            residual_sum += abs_res;
-            residual_sq_sum += abs_res * abs_res;
-            residual_max = std::max(residual_max, abs_res);
-#endif
-        }
-
-#if LOG_DEBUG
-        if (staged > 0)
-        {
-            const double residual_mean = residual_sum / staged;
-            const double residual_std = std::sqrt((residual_sq_sum / staged) - (residual_mean * residual_mean));
-            ggml::gemmini::log::debug(
-                nullptr,
-                "[dec.select.outlier] total_outliers=%zu staged=%zu mean_residual=%.6g std_residual=%.6g max_residual=%.6g",
-                outliers.size(),
-                staged,
-                residual_mean,
-                residual_std,
-                residual_max);
-        }
-#endif
-
-        return staged;
-    }
-
-    size_t build_rk_csc(size_t K, ActivationDECScratch &scratch)
-    {
-        if (K == 0)
-            return 0;
-
-        if (scratch.rk_offs.size() != K + 1)
-            scratch.rk_offs.resize(K + 1);
-
-        for (size_t k = 0; k <= K; ++k)
-            scratch.rk_offs[k] = scratch.rk_counts[k];
-
-        for (size_t k = 1; k <= K; ++k)
-            scratch.rk_offs[k] += scratch.rk_offs[k - 1];
-
-        const size_t nnz = scratch.rk_offs[K];
-        scratch.rk_pairs.resize(nnz);
-
-        if (nnz == 0)
-        {
-            scratch.unique_k.clear();
-            scratch.rk_stage.clear();
-            return nnz;
-        }
-
-        if (scratch.rk_pos.size() != K)
-            scratch.rk_pos.resize(K);
-        std::copy_n(scratch.rk_offs.begin(), K, scratch.rk_pos.begin());
-        for (const auto &t : scratch.rk_stage)
-        {
-            const size_t k = static_cast<size_t>(t.k);
-            if (k >= K)
-                continue;
-
-            const size_t dst = scratch.rk_pos[k]++;
-            if (dst < nnz)
-                scratch.rk_pairs[dst] = {t.r, t.d};
-        }
-
-        scratch.unique_k.clear();
-        for (size_t k = 0; k < K; ++k)
-        {
-            if (scratch.rk_offs[k] != scratch.rk_offs[k + 1])
-                scratch.unique_k.push_back(static_cast<int>(k));
-        }
-
-        scratch.rk_stage.clear();
-        return nnz;
     }
 
 }
@@ -545,11 +381,7 @@ ActivationDECResult compensate_activation_dec(
 
     start = ggml::gemmini::cycle::read();
 
-    const bool decode = I == 1;
-
-    scr.resize_for_dims(I, K, J);
-    if (decode)
-        scr.reset_i1_delta(K);
+    scr.resize_for_dims(I, J);
 
     end = ggml::gemmini::cycle::read();
     ggml::gemmini::log::cycle(layer, "[dec] cpu.Initialize scratch", start, end);
@@ -558,12 +390,7 @@ ActivationDECResult compensate_activation_dec(
 
     size_t total_staged = 0;
     if (!outliers.empty())
-    {
-        if (decode)
-            total_staged += stage_from_outliers_i1(outliers, K, scr);
-        else
-            total_staged += stage_from_outliers(outliers, I, K, scr);
-    }
+        total_staged += stage_from_outliers(outliers, I, K, scr);
 
     result.total_selected = total_staged;
     if (total_staged == 0)
@@ -574,22 +401,28 @@ ActivationDECResult compensate_activation_dec(
 
     start = ggml::gemmini::cycle::read();
 
-    if (decode)
-    {
-        result.nnz = result.total_selected;
-        result.unique_k_count = scr.unique_k.size();
-    }
-    else
-    {
-        result.nnz = build_rk_csc(K, scr);
-        result.unique_k_count = scr.unique_k.size();
-    }
+    build_active_row_groups(scr.residual_entries, scr.active_row_groups);
+    result.nnz = scr.residual_entries.size();
+    scr.unique_k.reserve(result.nnz);
+    for (const ResidualGroupEntry &entry : scr.residual_entries)
+        scr.unique_k.push_back(entry.k);
+    std::sort(scr.unique_k.begin(), scr.unique_k.end());
+    scr.unique_k.erase(std::unique(scr.unique_k.begin(), scr.unique_k.end()), scr.unique_k.end());
+    result.unique_k_count = scr.unique_k.size();
+
+    scr.active_groups_global.reserve(scr.active_row_groups.size());
+    for (const ActiveRowGroup &group : scr.active_row_groups)
+        scr.active_groups_global.push_back(group.k_group);
+    std::sort(scr.active_groups_global.begin(), scr.active_groups_global.end());
+    scr.active_groups_global.erase(
+        std::unique(scr.active_groups_global.begin(), scr.active_groups_global.end()),
+        scr.active_groups_global.end());
 
     if (result.unique_k_count == 0)
         return result;
 
     end = ggml::gemmini::cycle::read();
-    ggml::gemmini::log::cycle(layer, "[dec] cpu.Build R_k CSC structure", start, end);
+    ggml::gemmini::log::cycle(layer, "[dec] cpu.Build active row-group plan", start, end);
 
     start = ggml::gemmini::cycle::read();
 
@@ -604,119 +437,97 @@ ActivationDECResult compensate_activation_dec(
 #if LOG_DEBUG
     const size_t j_tiles = dec_int64_j_tile_count(J);
     const int dec_threads = resolve_dec_threads(j_tiles);
-    const char *kernel = use_int64_scalar ? "int64-scalar" :
-        (use_int64_channel_direct ? "int64-channel-direct" :
-            (use_int64_channel_sidecar ? "int64-channel-sidecar" :
-                (use_int64_h1 ? "int64-h1" : (use_int64_block ? "int64-block" : "unsupported"))));
     const char *layout = plan.layout == WeightLayout::KxJ_RowMajor ? "kxj-row-major" : "jxk-col-major";
-    std::vector<uint8_t> active_row_mask(I, uint8_t {0});
-    if (decode)
-        active_row_mask[0] = 1;
-    else
-        for (const auto &entry : scr.rk_pairs)
-            if (entry.first >= 0 && static_cast<size_t>(entry.first) < I)
-                active_row_mask[static_cast<size_t>(entry.first)] = 1;
-    const size_t active_rows = static_cast<size_t>(
-        std::count(active_row_mask.begin(), active_row_mask.end(), uint8_t {1}));
-    size_t active_blocks = 1;
-    if (!plan.scales.scalar_mode && !plan.scales.row_header_mode && !plan.scales.channel_mode)
+    const char *accessor = use_int64_channel_direct ? "q8-channel-row" :
+        (use_int64_channel_sidecar ? "q8-channel-sidecar" :
+            (plan.native_weight_blocks ? dec_route_name(plan) : "dense-int8"));
+    const char *reducer = use_int64_scalar ? "tensor" :
+        (use_int64_channel_direct || use_int64_channel_sidecar ? "channel" :
+            (use_int64_h1 ? "h1" :
+                (plan.route == DecWeightRoute::Q8H2 ? "h2" :
+                    (plan.route == DecWeightRoute::Q8HP1 ? "hp1" :
+                        (plan.route == DecWeightRoute::Q8HP2 ? "hp2" : "block")))));
+    size_t active_rows = 0;
+    uint32_t previous_row = std::numeric_limits<uint32_t>::max();
+    for (const ActiveRowGroup &group : scr.active_row_groups)
     {
-        active_blocks = 0;
-        for (size_t block = 0; block < plan.scales.cols; ++block)
+        if (group.row != previous_row)
         {
-            const size_t block_begin = block * plan.scales.block_size;
-            const size_t block_end = std::min(K, block_begin + plan.scales.block_size);
-            for (size_t k = block_begin; k < block_end; ++k)
+            ++active_rows;
+            previous_row = group.row;
+        }
+    }
+    const bool scaled_route = !plan.scales.scalar_mode && !plan.scales.row_header_mode && !plan.scales.channel_mode;
+    const size_t scale_group_size = use_int64_h1 ? kDecGroupSizeK : plan.scales.block_size;
+    size_t active_row_scale_groups = 0;
+    if (scaled_route)
+        for (const ActiveRowGroup &group : scr.active_row_groups)
+        {
+            size_t previous_scale_group = std::numeric_limits<size_t>::max();
+            for (size_t p = group.entry_begin; p < group.entry_end; ++p)
             {
-                if (scr.rk_counts[k + 1] != 0)
+                const size_t scale_group = scr.residual_entries[p].k / scale_group_size;
+                if (scale_group != previous_scale_group)
                 {
-                    ++active_blocks;
-                    break;
+                    ++active_row_scale_groups;
+                    previous_scale_group = scale_group;
                 }
             }
         }
-    }
     ggml::gemmini::log::debug(
         layer,
-        "[dec.route] activation=%s weight=%s residual_format=common weight_layout=%s scale_mode=%s kernel=%s block_size_k=%u I=%zu J=%zu K=%zu nnz=%zu unique_k=%zu active_k_blocks=%zu j_tiles=%zu threads=%d",
+        "[dec.route] algorithm=grouped group_size_k=%zu activation=%s weight=%s accessor=%s reducer=%s j_partition=contiguous-range microtile=%zu threads=%d residual_format=common weight_layout=%s scale_mode=%s I=%zu J=%zu K=%zu",
+        kDecGroupSizeK,
         requested_activation_name(),
         dec_route_name(plan),
+        accessor,
+        reducer,
+        kDecInt64JTileWidth,
+        dec_threads,
         layout,
         dec_scale_mode_name(plan),
-        kernel,
-        static_cast<unsigned>(args.block_size_k),
         I,
         J,
-        K,
-        result.nnz,
-        result.unique_k_count,
-        active_blocks,
-        j_tiles,
-        dec_threads);
-    const size_t int_mac_count = (decode ? result.unique_k_count : result.nnz) * J;
-    const size_t scale_apply_count = active_rows * J *
-        ((!plan.scales.scalar_mode && !plan.scales.row_header_mode && !plan.scales.channel_mode) ? active_blocks : 1);
+        K);
+    const size_t int_mac_count = result.nnz * J;
+    const size_t route_accumulate_count =
+        (scaled_route ? active_row_scale_groups : scr.active_row_groups.size()) * J;
+    const size_t scale_apply_count = (scaled_route ? active_row_scale_groups : active_rows) * J;
     ggml::gemmini::log::debug(
         layer,
-        "[dec.work] int_mac_count=%zu scale_apply_count=%zu active_rows=%zu active_k=%zu active_k_blocks=%zu j_tiles=%zu threads=%d",
-        int_mac_count,
-        scale_apply_count,
+        "[dec.work] nnz=%zu active_rows=%zu active_groups_global=%zu active_row_groups=%zu int_mac_count=%zu route_accumulate_count=%zu scale_apply_count=%zu active_k=%zu j_tiles=%zu threads=%d",
+        result.nnz,
         active_rows,
+        scr.active_groups_global.size(),
+        scr.active_row_groups.size(),
+        int_mac_count,
+        route_accumulate_count,
+        scale_apply_count,
         result.unique_k_count,
-        active_blocks,
         j_tiles,
         dec_threads);
 #endif
 
     if (use_int64_scalar)
-    {
-        if (decode)
-            accumulate_single_row_to_ycom_int64_scalar(
-                args, plan, J, activation_scales, scr.unique_k, scr.i1_delta_by_k,
-                scr.Y_com.data());
-        else
-            accumulate_to_ycom_int64_scalar(
-                args, plan, I, J, activation_scales, scr.unique_k, scr.rk_offs, scr.rk_pairs.data(),
-                scr.Y_com.data());
-    }
+        accumulate_to_ycom_int64_scalar(
+            args, plan, I, J, activation_scales, scr.residual_entries, scr.active_row_groups,
+            scr.Y_com.data());
     else if (use_int64_channel_direct)
-    {
-        if (decode)
-            accumulate_single_row_to_ycom_int64_channel_direct(
-                args, plan, J, activation_scales, scr.unique_k, scr.i1_delta_by_k,
-                scr.Y_com.data());
-        else
-            accumulate_to_ycom_int64_channel_direct(
-                args, plan, I, J, activation_scales, scr.unique_k, scr.rk_offs, scr.rk_pairs.data(),
-                scr.Y_com.data());
-    }
+        accumulate_to_ycom_int64_channel_direct(
+            args, plan, I, J, activation_scales, scr.residual_entries, scr.active_row_groups,
+            scr.Y_com.data());
     else if (use_int64_channel_sidecar)
-    {
-        if (decode)
-            accumulate_single_row_to_ycom_int64_channel_sidecar(
-                args, plan, J, activation_scales, scr.unique_k, scr.i1_delta_by_k,
-                scr.Y_com.data());
-        else
-            accumulate_to_ycom_int64_channel_sidecar(
-                args, plan, I, J, activation_scales, scr.unique_k, scr.rk_offs, scr.rk_pairs.data(),
-                scr.Y_com.data());
-    }
+        accumulate_to_ycom_int64_channel_sidecar(
+            args, plan, I, J, activation_scales, scr.residual_entries, scr.active_row_groups,
+            scr.Y_com.data());
     else if (use_int64_h1)
-    {
-        if (decode) accumulate_single_row_to_ycom_int64_h1(args, plan, J, activation_scales, scr.unique_k, scr.i1_delta_by_k, scr.Y_com.data());
-        else accumulate_to_ycom_int64_h1(args, plan, I, J, activation_scales, scr.unique_k, scr.rk_offs, scr.rk_pairs.data(), scr.Y_com.data());
-    }
+        accumulate_to_ycom_int64_h1(
+            args, plan, I, J, activation_scales, scr.residual_entries, scr.active_row_groups,
+            scr.Y_com.data());
     else if (use_int64_block)
-    {
-        if (decode)
-            accumulate_single_row_to_ycom_int64_block(
-                args, plan, J, activation_scales, scr.unique_k, scr.i1_delta_by_k,
-                scr.Y_com.data());
-        else
-            accumulate_to_ycom_int64_block(
-                args, plan, I, J, activation_scales, scr.unique_k, scr.rk_offs, scr.rk_pairs.data(),
-                scr.Y_com.data());
-    }
+        accumulate_to_ycom_int64_block(
+            args, plan, I, J, activation_scales, scr.residual_entries, scr.active_row_groups,
+            scr.Y_com.data());
     else
     {
         log_dec_reject(layer, "valid route has no integer kernel", args);
@@ -734,11 +545,7 @@ ActivationDECResult compensate_activation_dec(
             args,
             plan,
             activation_scales,
-            scr.unique_k,
-            scr.rk_offs,
-            scr.rk_pairs.data(),
-            scr.i1_delta_by_k,
-            decode,
+            scr.residual_entries,
             reference_ycom.data());
 #endif
 
@@ -808,21 +615,8 @@ ActivationDECResult compensate_activation_dec(
         if (result.nnz > 0)
         {
             double total_compensation = 0.0;
-
-            if (decode)
-                total_compensation = scr.i1_total_abs_residual;
-            else
-            {
-                for (int k : scr.unique_k)
-                {
-                    const size_t k_sz = static_cast<size_t>(k);
-                    const size_t beg = scr.rk_offs[k_sz];
-                    const size_t rk_end = scr.rk_offs[k_sz + 1];
-
-                    for (size_t t = beg; t < rk_end; ++t)
-                        total_compensation += std::fabs(static_cast<double>(scr.rk_pairs[t].second));
-                }
-            }
+            for (const ResidualGroupEntry &entry : scr.residual_entries)
+                total_compensation += std::fabs(static_cast<double>(entry.residual));
 
             const double avg_compensation_per_entry = total_compensation / result.nnz;
             const double sparsity = 100.0 * result.nnz / (I * K);

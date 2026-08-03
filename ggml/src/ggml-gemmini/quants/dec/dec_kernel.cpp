@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <limits>
+#include <vector>
 
 #ifndef DEC_VALIDATION
 #define DEC_VALIDATION 0
@@ -59,111 +60,100 @@ namespace
     }
 
     template <typename TileWork>
-    void for_each_int64_j_tile(size_t I, size_t J, TileWork tile_work)
+    void for_each_grouped_j_tile(size_t scratch_rows, size_t J, TileWork tile_work)
     {
-        if (I == 0 || J == 0)
+        if (scratch_rows == 0 || J == 0)
             return;
 
-        const size_t tile_count = dec_int64_j_tile_count(J);
         const size_t tile_capacity = std::min(J, kDecInt64JTileWidth);
-
-        const auto run_serial = [&]()
+        const auto run_range = [&](size_t j_begin, size_t j_end)
         {
-            std::vector<int64_t> accumulator(I * tile_capacity);
-            for (size_t tile_index = 0; tile_index < tile_count; ++tile_index)
-            {
-                const size_t jb = tile_index * kDecInt64JTileWidth;
-                tile_work(jb, std::min(kDecInt64JTileWidth, J - jb), accumulator);
-            }
+            std::vector<int64_t> accumulator(scratch_rows * tile_capacity);
+            for (size_t jb = j_begin; jb < j_end; jb += kDecInt64JTileWidth)
+                tile_work(jb, std::min(kDecInt64JTileWidth, j_end - jb), accumulator);
         };
 
 #if defined(GGML_GEMMINI_HAS_OPENMP)
+        const size_t tile_count = dec_int64_j_tile_count(J);
         const int dec_threads = resolve_dec_threads(tile_count);
         if (dec_threads == 1 || omp_in_parallel() != 0)
         {
-            run_serial();
+            run_range(0, J);
             return;
         }
 #pragma omp parallel num_threads(dec_threads)
         {
-            std::vector<int64_t> accumulator(I * tile_capacity);
-#pragma omp for schedule(static)
-            for (ptrdiff_t tile_index = 0; tile_index < static_cast<ptrdiff_t>(tile_count); ++tile_index)
-            {
-                const size_t jb = static_cast<size_t>(tile_index) * kDecInt64JTileWidth;
-                tile_work(jb, std::min(kDecInt64JTileWidth, J - jb), accumulator);
-            }
+            const size_t tid = static_cast<size_t>(omp_get_thread_num());
+            const size_t threads = static_cast<size_t>(omp_get_num_threads());
+            const size_t first_tile = tile_count * tid / threads;
+            const size_t last_tile = tile_count * (tid + 1) / threads;
+            run_range(first_tile * kDecInt64JTileWidth,
+                      std::min(J, last_tile * kDecInt64JTileWidth));
         }
 #else
-        run_serial();
+        run_range(0, J);
 #endif
     }
 
-    std::vector<size_t> h1_active_blocks(
-        const ggml_gemmini_args_t &args,
-        const DecRoutePlan &plan,
-        const std::vector<int> &unique_k)
+    template <typename CodeFor>
+    void add_group_dot(
+        const std::vector<ResidualGroupEntry> &entries,
+        size_t begin,
+        size_t end,
+        size_t jb,
+        size_t width,
+        CodeFor code_for,
+        int64_t *accumulator)
     {
-        std::vector<size_t> blocks;
-        blocks.reserve(std::min(unique_k.size(), plan.scales.cols));
-        for (int k : unique_k)
+        for (size_t p = begin; p < end; ++p)
         {
-            if (k < 0 || static_cast<size_t>(k) >= args.K)
-                continue;
-            const size_t block = static_cast<size_t>(k) / plan.scales.block_size;
-            if (block < plan.scales.cols)
-                blocks.push_back(block);
+            const ResidualGroupEntry &entry = entries[p];
+            const int64_t residual = entry.residual;
+            for (size_t t = 0; t < width; ++t)
+            {
+                const int64_t term = residual * code_for(jb + t, entry.k);
+#if DEC_VALIDATION
+                const __int128 checked_sum = static_cast<__int128>(accumulator[t]) + term;
+                if (checked_sum < std::numeric_limits<int64_t>::min() ||
+                    checked_sum > std::numeric_limits<int64_t>::max())
+                    std::abort();
+#endif
+                accumulator[t] += term;
+            }
         }
-        std::sort(blocks.begin(), blocks.end());
-        blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
-        return blocks;
     }
 
     template <typename CodeFor, typename ScaleForColumn>
-    void accumulate_to_ycom_int64_impl(
-        const ggml_gemmini_args_t &args,
+    void run_whole_k_grouped_dec(
         size_t I,
         size_t J,
         const float *activation_scales,
-        const std::vector<int> &unique_k,
-        const std::vector<size_t> &rk_offs,
-        const std::pair<int, int32_t> *rk_pairs,
+        const std::vector<ResidualGroupEntry> &entries,
+        const std::vector<ActiveRowGroup> &groups,
         CodeFor code_for,
         ScaleForColumn scale_for_column,
         float *Y_com)
     {
-        if (!rk_pairs || !Y_com || I == 0 || J == 0)
+        if (!Y_com || entries.empty() || groups.empty() || I == 0 || J == 0)
             return;
 
-        for_each_int64_j_tile(I, J, [&](size_t jb, size_t width, std::vector<int64_t> &accumulator)
+        for_each_grouped_j_tile(I, J, [&](size_t jb, size_t width, std::vector<int64_t> &accumulator)
         {
             std::fill(accumulator.begin(), accumulator.begin() + I * width, int64_t {0});
-            for (int k : unique_k)
+            for (const ActiveRowGroup &group : groups)
+                add_group_dot(entries, group.entry_begin, group.entry_end, jb, width, code_for,
+                              accumulator.data() + static_cast<size_t>(group.row) * width);
+
+            uint32_t previous_row = std::numeric_limits<uint32_t>::max();
+            for (const ActiveRowGroup &group : groups)
             {
-                if (k < 0)
+                if (group.row == previous_row)
                     continue;
-                const size_t k_sz = static_cast<size_t>(k);
-                if (k_sz >= args.K || k_sz + 1 >= rk_offs.size())
-                    continue;
-
-                for (size_t p = rk_offs[k_sz]; p < rk_offs[k_sz + 1]; ++p)
-                {
-                    const int r = rk_pairs[p].first;
-                    if (r < 0 || static_cast<size_t>(r) >= I)
-                        continue;
-
-                    int64_t *row = accumulator.data() + static_cast<size_t>(r) * width;
-                    const int64_t residual = rk_pairs[p].second;
-                    for (size_t t = 0; t < width; ++t)
-                        row[t] += residual * code_for(jb + t, k_sz);
-                }
-            }
-
-            for (size_t r = 0; r < I; ++r)
-            {
-                const float activation_scale = activation_scales ? activation_scales[r] : 1.0f;
-                const int64_t *row = accumulator.data() + r * width;
-                float *output = Y_com + r * J + jb;
+                previous_row = group.row;
+                const size_t row_index = group.row;
+                const float activation_scale = activation_scales ? activation_scales[row_index] : 1.0f;
+                const int64_t *row = accumulator.data() + row_index * width;
+                float *output = Y_com + row_index * J + jb;
                 for (size_t t = 0; t < width; ++t)
                     output[t] += static_cast<float>(
                         static_cast<double>(row[t]) * activation_scale * scale_for_column(jb + t));
@@ -171,149 +161,75 @@ namespace
         });
     }
 
-    template <typename CodeFor, typename ScaleForColumn>
-    void accumulate_single_row_to_ycom_int64_impl(
-        const ggml_gemmini_args_t &args,
+    template <typename CodeFor, typename Finalize>
+    void run_scaled_grouped_dec(
+        size_t I,
         size_t J,
+        size_t scale_group_size,
         const float *activation_scales,
-        const std::vector<int> &unique_k,
-        const std::vector<int64_t> &delta_by_k,
+        const std::vector<ResidualGroupEntry> &entries,
+        const std::vector<ActiveRowGroup> &groups,
         CodeFor code_for,
-        ScaleForColumn scale_for_column,
+        Finalize finalize,
         float *Y_com)
     {
-        if (!Y_com || J == 0)
+        if (!Y_com || entries.empty() || groups.empty() || I == 0 || J == 0 || scale_group_size == 0)
             return;
 
-        for_each_int64_j_tile(1, J, [&](size_t jb, size_t width, std::vector<int64_t> &accumulator)
+        for_each_grouped_j_tile(1, J, [&](size_t jb, size_t width, std::vector<int64_t> &accumulator)
         {
-            std::fill(accumulator.begin(), accumulator.begin() + width, int64_t {0});
-            for (int k : unique_k)
+            for (const ActiveRowGroup &group : groups)
             {
-                if (k < 0)
-                    continue;
-                const size_t k_sz = static_cast<size_t>(k);
-                if (k_sz >= args.K || k_sz >= delta_by_k.size())
-                    continue;
-
-                const int64_t residual = delta_by_k[k_sz];
-                for (size_t t = 0; t < width; ++t)
-                    accumulator[t] += residual * code_for(jb + t, k_sz);
-            }
-
-            const float activation_scale = activation_scales ? activation_scales[0] : 1.0f;
-            for (size_t t = 0; t < width; ++t)
-                Y_com[jb + t] += static_cast<float>(
-                    static_cast<double>(accumulator[t]) * activation_scale * scale_for_column(jb + t));
-        });
-    }
-
-    template <typename CodeFor>
-    void accumulate_to_ycom_int64_block_impl(
-        const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
-        const float *activation_scales, const std::vector<int> &unique_k,
-        const std::vector<size_t> &rk_offs, const std::pair<int, int32_t> *rk_pairs,
-        CodeFor code_for, float *Y_com)
-    {
-        if (!rk_pairs || !Y_com || I == 0 || J == 0)
-            return;
-
-        for_each_int64_j_tile(I, J, [&](size_t jb, size_t width, std::vector<int64_t> &accumulator)
-        {
-            for (size_t block = 0; block < plan.scales.cols; ++block)
-            {
-                std::fill(accumulator.begin(), accumulator.begin() + I * width, int64_t {0});
-                for (int k : unique_k)
+                for (size_t begin = group.entry_begin; begin < group.entry_end;)
                 {
-                    if (k < 0)
-                        continue;
-                    const size_t k_sz = static_cast<size_t>(k);
-                    if (k_sz >= args.K || k_sz / plan.scales.block_size != block || k_sz + 1 >= rk_offs.size())
-                        continue;
-                    for (size_t p = rk_offs[k_sz]; p < rk_offs[k_sz + 1]; ++p)
-                    {
-                        const int r = rk_pairs[p].first;
-                        if (r < 0 || static_cast<size_t>(r) >= I)
-                            continue;
-                        int64_t *row = accumulator.data() + static_cast<size_t>(r) * width;
-                        const int64_t residual = rk_pairs[p].second;
-                        for (size_t t = 0; t < width; ++t)
-                            row[t] += residual * code_for(jb + t, k_sz);
-                    }
-                }
-                for (size_t r = 0; r < I; ++r)
-                {
-                    const float activation_scale = activation_scales ? activation_scales[r] : 1.0f;
-                    const int64_t *row = accumulator.data() + r * width;
-                    float *output = Y_com + r * J + jb;
+                    const size_t scale_block = entries[begin].k / scale_group_size;
+                    size_t end = begin + 1;
+                    while (end < group.entry_end && entries[end].k / scale_group_size == scale_block)
+                        ++end;
+
+                    std::fill(accumulator.begin(), accumulator.begin() + width, int64_t {0});
+                    add_group_dot(entries, begin, end, jb, width, code_for, accumulator.data());
+                    const size_t row = group.row;
+                    const float activation_scale = activation_scales ? activation_scales[row] : 1.0f;
+                    float *output = Y_com + row * J + jb;
                     for (size_t t = 0; t < width; ++t)
-                        output[t] += static_cast<float>(static_cast<double>(row[t]) * activation_scale *
-                            dec_route_weight_scale(plan, args, jb + t, block));
+                        output[t] += finalize(accumulator[t], activation_scale, jb + t, scale_block);
+                    begin = end;
                 }
             }
         });
     }
 
     template <typename CodeFor>
-    void accumulate_single_row_to_ycom_int64_block_impl(
-        const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t J,
-        const float *activation_scales, const std::vector<int> &unique_k,
-        const std::vector<int64_t> &delta_by_k,
-        CodeFor code_for, float *Y_com)
+    void run_block_route(
+        const ggml_gemmini_args_t &args,
+        const DecRoutePlan &plan,
+        size_t I,
+        size_t J,
+        const float *activation_scales,
+        const std::vector<ResidualGroupEntry> &entries,
+        const std::vector<ActiveRowGroup> &groups,
+        CodeFor code_for,
+        float *Y_com)
     {
-        if (!Y_com || J == 0)
-            return;
-
-        for_each_int64_j_tile(1, J, [&](size_t jb, size_t width, std::vector<int64_t> &accumulator)
-        {
-            for (size_t block = 0; block < plan.scales.cols; ++block)
-            {
-                std::fill(accumulator.begin(), accumulator.begin() + width, int64_t {0});
-                for (int k : unique_k)
-                {
-                    if (k < 0)
-                        continue;
-                    const size_t k_sz = static_cast<size_t>(k);
-                    if (k_sz >= args.K || k_sz >= delta_by_k.size() || k_sz / plan.scales.block_size != block)
-                        continue;
-                    const int64_t residual = delta_by_k[k_sz];
-                    for (size_t t = 0; t < width; ++t)
-                        accumulator[t] += residual * code_for(jb + t, k_sz);
-                }
-                const float activation_scale = activation_scales ? activation_scales[0] : 1.0f;
-                for (size_t t = 0; t < width; ++t)
-                    Y_com[jb + t] += static_cast<float>(static_cast<double>(accumulator[t]) * activation_scale *
-                        dec_route_weight_scale(plan, args, jb + t, block));
-            }
-        });
+        run_scaled_grouped_dec(I, J, plan.scales.block_size, activation_scales, entries, groups,
+            code_for,
+            [&args, &plan](int64_t accumulator, float activation_scale, size_t j, size_t block) {
+                return static_cast<float>(static_cast<double>(accumulator) * activation_scale *
+                    dec_route_weight_scale(plan, args, j, block));
+            }, Y_com);
     }
 }
 
 void accumulate_to_ycom_int64_scalar(
     const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
-    const float *activation_scales, const std::vector<int> &unique_k,
-    const std::vector<size_t> &rk_offs, const std::pair<int, int32_t> *rk_pairs,
-    float *Y_com)
+    const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
+    const std::vector<ActiveRowGroup> &groups, float *Y_com)
 {
     const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
     if (!weights)
         return;
-    accumulate_to_ycom_int64_impl(args, I, J, activation_scales, unique_k, rk_offs, rk_pairs,
-        [weights, &plan](size_t j, size_t k) {
-            return plan.layout == WeightLayout::KxJ_RowMajor ? weights[k * plan.weight_stride + j] :
-                weights[j * plan.weight_stride + k];
-        }, [scale = plan.scales.scalar](size_t) { return scale; }, Y_com);
-}
-
-void accumulate_single_row_to_ycom_int64_scalar(
-    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t J,
-    const float *activation_scales, const std::vector<int> &unique_k,
-    const std::vector<int64_t> &delta_by_k, float *Y_com)
-{
-    const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
-    if (!weights)
-        return;
-    accumulate_single_row_to_ycom_int64_impl(args, J, activation_scales, unique_k, delta_by_k,
+    run_whole_k_grouped_dec(I, J, activation_scales, entries, groups,
         [weights, &plan](size_t j, size_t k) {
             return plan.layout == WeightLayout::KxJ_RowMajor ? weights[k * plan.weight_stride + j] :
                 weights[j * plan.weight_stride + k];
@@ -322,29 +238,13 @@ void accumulate_single_row_to_ycom_int64_scalar(
 
 void accumulate_to_ycom_int64_channel_direct(
     const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
-    const float *activation_scales, const std::vector<int> &unique_k,
-    const std::vector<size_t> &rk_offs, const std::pair<int, int32_t> *rk_pairs,
-    float *Y_com)
+    const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
+    const std::vector<ActiveRowGroup> &groups, float *Y_com)
 {
     const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
     if (!weights)
         return;
-    accumulate_to_ycom_int64_impl(args, I, J, activation_scales, unique_k, rk_offs, rk_pairs,
-        [weights, &plan](size_t j, size_t k) {
-            return plan.layout == WeightLayout::KxJ_RowMajor ? weights[k * plan.weight_stride + j] :
-                weights[j * plan.weight_stride + k];
-        }, [&args](size_t j) { return args.q8_channel_scale(j); }, Y_com);
-}
-
-void accumulate_single_row_to_ycom_int64_channel_direct(
-    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t J,
-    const float *activation_scales, const std::vector<int> &unique_k,
-    const std::vector<int64_t> &delta_by_k, float *Y_com)
-{
-    const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
-    if (!weights)
-        return;
-    accumulate_single_row_to_ycom_int64_impl(args, J, activation_scales, unique_k, delta_by_k,
+    run_whole_k_grouped_dec(I, J, activation_scales, entries, groups,
         [weights, &plan](size_t j, size_t k) {
             return plan.layout == WeightLayout::KxJ_RowMajor ? weights[k * plan.weight_stride + j] :
                 weights[j * plan.weight_stride + k];
@@ -353,29 +253,13 @@ void accumulate_single_row_to_ycom_int64_channel_direct(
 
 void accumulate_to_ycom_int64_channel_sidecar(
     const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
-    const float *activation_scales, const std::vector<int> &unique_k,
-    const std::vector<size_t> &rk_offs, const std::pair<int, int32_t> *rk_pairs,
-    float *Y_com)
+    const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
+    const std::vector<ActiveRowGroup> &groups, float *Y_com)
 {
     const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
     if (!weights)
         return;
-    accumulate_to_ycom_int64_impl(args, I, J, activation_scales, unique_k, rk_offs, rk_pairs,
-        [weights, &plan](size_t j, size_t k) {
-            return plan.layout == WeightLayout::KxJ_RowMajor ? weights[k * plan.weight_stride + j] :
-                weights[j * plan.weight_stride + k];
-        }, [scales = plan.scales.data](size_t j) { return scales[j]; }, Y_com);
-}
-
-void accumulate_single_row_to_ycom_int64_channel_sidecar(
-    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t J,
-    const float *activation_scales, const std::vector<int> &unique_k,
-    const std::vector<int64_t> &delta_by_k, float *Y_com)
-{
-    const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
-    if (!weights)
-        return;
-    accumulate_single_row_to_ycom_int64_impl(args, J, activation_scales, unique_k, delta_by_k,
+    run_whole_k_grouped_dec(I, J, activation_scales, entries, groups,
         [weights, &plan](size_t j, size_t k) {
             return plan.layout == WeightLayout::KxJ_RowMajor ? weights[k * plan.weight_stride + j] :
                 weights[j * plan.weight_stride + k];
@@ -384,53 +268,23 @@ void accumulate_single_row_to_ycom_int64_channel_sidecar(
 
 void accumulate_to_ycom_int64_block(
     const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
-    const float *activation_scales, const std::vector<int> &unique_k,
-    const std::vector<size_t> &rk_offs, const std::pair<int, int32_t> *rk_pairs,
-    float *Y_com)
+    const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
+    const std::vector<ActiveRowGroup> &groups, float *Y_com)
 {
-    const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
     if (plan.route == DecWeightRoute::Q8HP1)
-        return accumulate_to_ycom_int64_block_impl(args, plan, I, J, activation_scales, unique_k, rk_offs, rk_pairs,
+        return run_block_route(args, plan, I, J, activation_scales, entries, groups,
             [&args](size_t j, size_t k) { return args.q8_hp1_block(j, k / QK8_HP)->qs[k % QK8_HP]; }, Y_com);
     if (plan.route == DecWeightRoute::Q8HP2)
-        return accumulate_to_ycom_int64_block_impl(args, plan, I, J, activation_scales, unique_k, rk_offs, rk_pairs,
+        return run_block_route(args, plan, I, J, activation_scales, entries, groups,
             [&args](size_t j, size_t k) { return args.q8_hp2_block(j, k / QK8_HP)->qs[k % QK8_HP]; }, Y_com);
     if (plan.route == DecWeightRoute::Q8H2)
-        return accumulate_to_ycom_int64_block_impl(args, plan, I, J, activation_scales, unique_k, rk_offs, rk_pairs,
+        return run_block_route(args, plan, I, J, activation_scales, entries, groups,
             [&args](size_t j, size_t k) { return args.q8_h2_block(j, k / QK8_H2)->qs[k % QK8_H2]; }, Y_com);
-    if (plan.route == DecWeightRoute::Q8H1 && plan.native_weight_blocks)
-        return accumulate_to_ycom_int64_block_impl(args, plan, I, J, activation_scales, unique_k, rk_offs, rk_pairs,
-            [&args](size_t j, size_t k) { return args.q8_h1_block(j, k / QK8_0)->qs[k % QK8_0]; }, Y_com);
-    if (!weights)
-        return;
-    accumulate_to_ycom_int64_block_impl(args, plan, I, J, activation_scales, unique_k, rk_offs, rk_pairs,
-        [weights, &plan](size_t j, size_t k) {
-            return plan.layout == WeightLayout::KxJ_RowMajor ? weights[k * plan.weight_stride + j] :
-                weights[j * plan.weight_stride + k];
-        }, Y_com);
-}
 
-void accumulate_single_row_to_ycom_int64_block(
-    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t J,
-    const float *activation_scales, const std::vector<int> &unique_k,
-    const std::vector<int64_t> &delta_by_k, float *Y_com)
-{
     const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
-    if (plan.route == DecWeightRoute::Q8HP1)
-        return accumulate_single_row_to_ycom_int64_block_impl(args, plan, J, activation_scales, unique_k, delta_by_k,
-            [&args](size_t j, size_t k) { return args.q8_hp1_block(j, k / QK8_HP)->qs[k % QK8_HP]; }, Y_com);
-    if (plan.route == DecWeightRoute::Q8HP2)
-        return accumulate_single_row_to_ycom_int64_block_impl(args, plan, J, activation_scales, unique_k, delta_by_k,
-            [&args](size_t j, size_t k) { return args.q8_hp2_block(j, k / QK8_HP)->qs[k % QK8_HP]; }, Y_com);
-    if (plan.route == DecWeightRoute::Q8H2)
-        return accumulate_single_row_to_ycom_int64_block_impl(args, plan, J, activation_scales, unique_k, delta_by_k,
-            [&args](size_t j, size_t k) { return args.q8_h2_block(j, k / QK8_H2)->qs[k % QK8_H2]; }, Y_com);
-    if (plan.route == DecWeightRoute::Q8H1 && plan.native_weight_blocks)
-        return accumulate_single_row_to_ycom_int64_block_impl(args, plan, J, activation_scales, unique_k, delta_by_k,
-            [&args](size_t j, size_t k) { return args.q8_h1_block(j, k / QK8_0)->qs[k % QK8_0]; }, Y_com);
     if (!weights)
         return;
-    accumulate_single_row_to_ycom_int64_block_impl(args, plan, J, activation_scales, unique_k, delta_by_k,
+    run_block_route(args, plan, I, J, activation_scales, entries, groups,
         [weights, &plan](size_t j, size_t k) {
             return plan.layout == WeightLayout::KxJ_RowMajor ? weights[k * plan.weight_stride + j] :
                 weights[j * plan.weight_stride + k];
@@ -439,130 +293,24 @@ void accumulate_single_row_to_ycom_int64_block(
 
 void accumulate_to_ycom_int64_h1(
     const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
-    const float *activation_scales, const std::vector<int> &unique_k,
-    const std::vector<size_t> &rk_offs, const std::pair<int, int32_t> *pairs,
-    float *Y_com)
+    const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
+    const std::vector<ActiveRowGroup> &groups, float *Y_com)
 {
-    if (!pairs || !Y_com || I == 0 || J == 0)
-        return;
-
     const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
-    const std::vector<size_t> active_blocks = h1_active_blocks(args, plan, unique_k);
-    for_each_int64_j_tile(I, J, [&](size_t jb, size_t width, std::vector<int64_t> &accumulator)
-    {
-        for (size_t block : active_blocks)
-        {
-            std::fill(accumulator.begin(), accumulator.begin() + I * width, int64_t {0});
-            for (int k : unique_k)
-            {
-                if (k < 0)
-                    continue;
-                const size_t k_index = static_cast<size_t>(k);
-                if (k_index >= args.K || k_index / QK8_0 != block || k_index + 1 >= rk_offs.size())
-                    continue;
-
-                for (size_t p = rk_offs[k_index]; p < rk_offs[k_index + 1]; ++p)
-                {
-                    const int row = pairs[p].first;
-                    if (row < 0 || static_cast<size_t>(row) >= I)
-                        continue;
-
-                    int64_t *output_acc = accumulator.data() + static_cast<size_t>(row) * width;
-                    for (size_t t = 0; t < width; ++t)
-                    {
-                        const size_t j = jb + t;
-                        const block_q8_h1 *native = plan.native_weight_blocks ? args.q8_h1_block(j, block) : nullptr;
-                        const int8_t code = native ? native->qs[k_index % QK8_0] :
-                            weights[j * plan.weight_stride + k_index];
-                        const int64_t term = static_cast<int64_t>(pairs[p].second) * code;
-#if DEC_VALIDATION
-                        const __int128 checked_sum = static_cast<__int128>(output_acc[t]) + term;
-                        if (checked_sum < std::numeric_limits<int64_t>::min() ||
-                            checked_sum > std::numeric_limits<int64_t>::max())
-                            std::abort();
-#endif
-                        output_acc[t] += term;
-                    }
-                }
-            }
-
-            for (size_t row = 0; row < I; ++row)
-            {
-                const float activation_scale = activation_scales ? activation_scales[row] : 1.0f;
-                const int64_t *row_acc = accumulator.data() + row * width;
-                float *output = Y_com + row * J + jb;
-                for (size_t t = 0; t < width; ++t)
-                {
-                    const size_t j = jb + t;
-                    const block_q8_h1 *native = plan.native_weight_blocks ? args.q8_h1_block(j, block) : nullptr;
-                    const uint64_t offset = native ? native->R :
-                        (args.stripe_J > 1 ? args.R_stripe[j / args.stripe_J] : args.R[j]);
-                    const uint64_t c_eff = (native ? native->c_b : args.c_b[j * args.blocks_per_row + block]) + offset;
-                    const float s_rf = native ? native->s_rf :
-                        (args.stripe_J > 1 ? args.s_rf_stripe[j / args.stripe_J] : args.s_rf[j]);
-                    output[t] += static_cast<float>(static_cast<double>(row_acc[t]) * c_eff * s_rf * activation_scale);
-                }
-            }
-        }
-    });
-}
-
-void accumulate_single_row_to_ycom_int64_h1(
-    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t J,
-    const float *activation_scales, const std::vector<int> &unique_k,
-    const std::vector<int64_t> &delta, float *Y_com)
-{
-    if (!Y_com || J == 0)
-        return;
-
-    const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
-    const std::vector<size_t> active_blocks = h1_active_blocks(args, plan, unique_k);
-    for_each_int64_j_tile(1, J, [&](size_t jb, size_t width, std::vector<int64_t> &accumulator)
-    {
-        for (size_t block : active_blocks)
-        {
-            std::fill(accumulator.begin(), accumulator.begin() + width, int64_t {0});
-            for (int k : unique_k)
-            {
-                if (k < 0)
-                    continue;
-                const size_t k_index = static_cast<size_t>(k);
-                if (k_index >= args.K || k_index >= delta.size() || k_index / QK8_0 != block)
-                    continue;
-
-                for (size_t t = 0; t < width; ++t)
-                {
-                    const size_t j = jb + t;
-                    const block_q8_h1 *native = plan.native_weight_blocks ? args.q8_h1_block(j, block) : nullptr;
-                    const int8_t code = native ? native->qs[k_index % QK8_0] :
-                        weights[j * plan.weight_stride + k_index];
-#if DEC_VALIDATION
-                    const __int128 term = static_cast<__int128>(delta[k_index]) * code;
-                    const __int128 checked_sum = static_cast<__int128>(accumulator[t]) + term;
-                    if (term < std::numeric_limits<int64_t>::min() ||
-                        term > std::numeric_limits<int64_t>::max() ||
-                        checked_sum < std::numeric_limits<int64_t>::min() ||
-                        checked_sum > std::numeric_limits<int64_t>::max())
-                        std::abort();
-#endif
-                    accumulator[t] += delta[k_index] * code;
-                }
-            }
-
-            const float activation_scale = activation_scales ? activation_scales[0] : 1.0f;
-            for (size_t t = 0; t < width; ++t)
-            {
-                const size_t j = jb + t;
-                const block_q8_h1 *native = plan.native_weight_blocks ? args.q8_h1_block(j, block) : nullptr;
-                const uint64_t offset = native ? native->R :
-                    (args.stripe_J > 1 ? args.R_stripe[j / args.stripe_J] : args.R[j]);
-                const uint64_t c_eff = (native ? native->c_b : args.c_b[j * args.blocks_per_row + block]) + offset;
-                const float s_rf = native ? native->s_rf :
-                    (args.stripe_J > 1 ? args.s_rf_stripe[j / args.stripe_J] : args.s_rf[j]);
-                Y_com[j] += static_cast<float>(static_cast<double>(accumulator[t]) * c_eff * s_rf * activation_scale);
-            }
-        }
-    });
+    run_scaled_grouped_dec(I, J, kDecGroupSizeK, activation_scales, entries, groups,
+        [&args, &plan, weights](size_t j, size_t k) {
+            const block_q8_h1 *native = plan.native_weight_blocks ? args.q8_h1_block(j, k / QK8_0) : nullptr;
+            return native ? native->qs[k % QK8_0] : weights[j * plan.weight_stride + k];
+        },
+        [&args, &plan](int64_t accumulator, float activation_scale, size_t j, size_t block) {
+            const block_q8_h1 *native = plan.native_weight_blocks ? args.q8_h1_block(j, block) : nullptr;
+            const uint64_t offset = native ? native->R :
+                (args.stripe_J > 1 ? args.R_stripe[j / args.stripe_J] : args.R[j]);
+            const uint64_t c_eff = (native ? native->c_b : args.c_b[j * args.blocks_per_row + block]) + offset;
+            const float s_rf = native ? native->s_rf :
+                (args.stripe_J > 1 ? args.s_rf_stripe[j / args.stripe_J] : args.s_rf[j]);
+            return static_cast<float>(static_cast<double>(accumulator) * c_eff * s_rf * activation_scale);
+        }, Y_com);
 }
 
 void apply_ycom_to_output(
@@ -577,21 +325,16 @@ void apply_ycom_to_output(
 
     const size_t stride_row = resolve_out_stride_row(args);
     const size_t stride_col = resolve_out_stride_col(args);
-
     for (size_t r = 0; r < I; ++r)
     {
         const float *src = Y_com + r * J;
         float *dst = out_data + r * stride_row;
         if (stride_col == 1)
-        {
             for (size_t j = 0; j < J; ++j)
                 dst[j] += src[j];
-        }
         else
-        {
             for (size_t j = 0; j < J; ++j)
                 dst[j * stride_col] += src[j];
-        }
     }
 }
 } // namespace ggml::gemmini::quants::dec
