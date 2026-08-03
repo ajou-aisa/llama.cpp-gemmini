@@ -2,10 +2,61 @@
 
 #include "../../ggml-gemmini-args.h"
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <vector>
 
 namespace ggml::gemmini::quants::dec
 {
+    inline constexpr size_t kDecGroupSizeK = 32;
+
+    struct ResidualGroupEntry
+    {
+        uint32_t row;
+        uint32_t k;
+        int32_t residual;
+    };
+
+    struct ActiveRowGroup
+    {
+        uint32_t row;
+        uint32_t k_group;
+        size_t entry_begin;
+        size_t entry_end;
+    };
+
+    inline void build_active_row_groups(
+        std::vector<ResidualGroupEntry> &entries,
+        std::vector<ActiveRowGroup> &groups)
+    {
+        std::sort(entries.begin(), entries.end(), [](const ResidualGroupEntry &lhs, const ResidualGroupEntry &rhs)
+        {
+            if (lhs.row != rhs.row)
+                return lhs.row < rhs.row;
+            const uint32_t lhs_group = lhs.k / kDecGroupSizeK;
+            const uint32_t rhs_group = rhs.k / kDecGroupSizeK;
+            if (lhs_group != rhs_group)
+                return lhs_group < rhs_group;
+            if (lhs.k != rhs.k)
+                return lhs.k < rhs.k;
+            return lhs.residual < rhs.residual;
+        });
+
+        groups.clear();
+        for (size_t begin = 0; begin < entries.size();)
+        {
+            const uint32_t row = entries[begin].row;
+            const uint32_t k_group = entries[begin].k / kDecGroupSizeK;
+            size_t end = begin + 1;
+            while (end < entries.size() && entries[end].row == row &&
+                   entries[end].k / kDecGroupSizeK == k_group)
+                ++end;
+            groups.push_back({row, k_group, begin, end});
+            begin = end;
+        }
+    }
+
     struct WeightScaleInfo
     {
         const float *data = nullptr;

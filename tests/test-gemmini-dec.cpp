@@ -137,6 +137,45 @@ bool test_route_plan() {
     return check(!h0_plan.valid && !malformed_channel_plan.valid, "unsupported and malformed route plans") && ok;
 }
 
+bool test_active_row_groups() {
+    using ggml::gemmini::quants::dec::ActiveRowGroup;
+    using ggml::gemmini::quants::dec::ResidualGroupEntry;
+
+    std::vector<ResidualGroupEntry> entries = {
+        { 1, 35, 4 }, { 0, 31, 2 }, { 1, 32, -3 },
+        { 0, 2, 7 }, { 1, 35, -1 }, { 0, 33, 5 },
+    };
+    std::vector<ActiveRowGroup> groups;
+    ggml::gemmini::quants::dec::build_active_row_groups(entries, groups);
+
+    bool ok = check(groups.size() == 3, "one descriptor per active row-group");
+    const std::array<std::pair<uint32_t, uint32_t>, 3> expected_groups = {
+        std::pair<uint32_t, uint32_t>{ 0, 0 }, { 0, 1 }, { 1, 1 },
+    };
+    ok = check(groups[0].row == expected_groups[0].first && groups[0].k_group == expected_groups[0].second,
+               "first active row-group") && ok;
+    ok = check(groups[1].row == expected_groups[1].first && groups[1].k_group == expected_groups[1].second,
+               "second active row-group") && ok;
+    ok = check(groups[2].row == expected_groups[2].first && groups[2].k_group == expected_groups[2].second,
+               "third active row-group") && ok;
+    for (const ActiveRowGroup &group : groups)
+        ok = check(group.entry_begin < group.entry_end && group.entry_end <= entries.size(),
+                   "active row-group entry range") && ok;
+
+    const auto ordered_entries = entries;
+    std::reverse(entries.begin(), entries.end());
+    ggml::gemmini::quants::dec::build_active_row_groups(entries, groups);
+    bool same_entries = entries.size() == ordered_entries.size();
+    for (size_t i = 0; same_entries && i < entries.size(); ++i)
+        same_entries = entries[i].row == ordered_entries[i].row &&
+            entries[i].k == ordered_entries[i].k && entries[i].residual == ordered_entries[i].residual;
+    ok = check(same_entries, "active row-group ordering is deterministic") && ok;
+
+    entries.clear();
+    ggml::gemmini::quants::dec::build_active_row_groups(entries, groups);
+    return check(groups.empty(), "empty residual plan has no active row-groups") && ok;
+}
+
 bool test_route_metadata_rejects() {
     std::array<block_q8_h1, 2> h1_blocks{};
     std::vector<int8_t> mixed_h1_weights(64, 1);
@@ -909,7 +948,7 @@ bool test_inside_existing_openmp_region() {
 }
 
 int main() {
-    const bool ok = test_noop() && test_route_plan() && test_route_metadata_rejects() && test_repeated_residuals() && test_decode_repeated_residuals() && test_integer_routes() && test_block_integer_route() &&
+    const bool ok = test_noop() && test_route_plan() && test_active_row_groups() && test_route_metadata_rejects() && test_repeated_residuals() && test_decode_repeated_residuals() && test_integer_routes() && test_block_integer_route() &&
         test_q8_h1_hierarchical_route() && test_q8_h1_large_effective_scale() && test_q8_h2_hierarchical_route() && test_q8_hp1_hierarchical_route() && test_q8_hp2_hierarchical_route() &&
         test_malformed_hierarchical_reject() && test_output_strides() && test_malformed_reject() && test_thread_clamp() &&
         test_thread_determinism() && test_inside_existing_openmp_region();
