@@ -6,6 +6,10 @@
 #include <gemmini/log.hpp>
 #include <gemmini/cycle_reader.hpp>
 
+#if LOG_DEBUG
+#include "../../ggml-gemmini-config.hpp"
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -33,24 +37,29 @@ namespace ggml::gemmini::quants::dec { namespace
     {
         std::vector<size_t> rk_counts;
         std::vector<size_t> rk_offs;
+        std::vector<size_t> rk_pos;
         std::vector<std::pair<int, int32_t>> rk_pairs;
         std::vector<int> unique_k;
         std::vector<RkTriplet> rk_stage;
         std::vector<int64_t> i1_delta_by_k;
         double i1_total_abs_residual = 0.0;
-        std::vector<float> Wk_f;
         std::vector<float> Y_com;
 
         void resize_for_dims(size_t I, size_t K, size_t J)
         {
-            rk_counts.assign(K + 1, 0);
-            rk_offs.resize(K + 1);
+            if (rk_counts.size() != K + 1)
+            {
+                rk_counts.resize(K + 1);
+                rk_offs.resize(K + 1);
+                rk_pos.resize(K);
+                unique_k.reserve(K);
+            }
+            std::fill(rk_counts.begin(), rk_counts.end(), 0);
             unique_k.clear();
-            unique_k.reserve(K);
             rk_stage.clear();
-            rk_stage.reserve(I);
-            Wk_f.resize(J);
-            Y_com.assign(I * J, 0.f);
+            if (Y_com.size() != I * J)
+                Y_com.resize(I * J);
+            std::fill(Y_com.begin(), Y_com.end(), 0.f);
         }
 
         void reset_i1_delta(size_t K)
@@ -87,6 +96,20 @@ namespace ggml::gemmini::quants::dec { namespace
         (void) args;
 #endif
     }
+
+#if LOG_DEBUG
+    const char *requested_activation_name()
+    {
+        switch (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT)
+        {
+            case ggml::gemmini::config::ActivationQuantAlgo::EXSIA:  return "exsia";
+            case ggml::gemmini::config::ActivationQuantAlgo::TENSOR: return "tensor";
+            case ggml::gemmini::config::ActivationQuantAlgo::TOKEN:  return "token";
+            case ggml::gemmini::config::ActivationQuantAlgo::STRIPE: return "stripe";
+        }
+        return "unsupported";
+    }
+#endif
 
 #if DEC_VALIDATION
     bool checked_add_i64(int64_t lhs, int64_t rhs, int64_t &out)
@@ -289,73 +312,15 @@ namespace ggml::gemmini::quants::dec { namespace
     }
 #endif
 
-    void load_weight_row_scaled(
-        size_t k,
-        const ggml_gemmini_args_t &args,
-        const DecRoutePlan &plan,
-        float *Wk_f)
-    {
-        const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
-        const size_t J = args.J;
-        if ((!weights && !plan.native_weight_blocks) || !Wk_f || J == 0)
-            return;
-
-        if (plan.weight_stride == 0)
-            return;
-
-        if (plan.route == DecWeightRoute::Q8HP1)
-        {
-            const size_t block = k / QK8_HP;
-            const size_t offset = k % QK8_HP;
-            for (size_t j = 0; j < J; ++j)
-                Wk_f[j] = static_cast<float>(args.q8_hp1_block(j, block)->qs[offset]);
-        }
-        else if (plan.route == DecWeightRoute::Q8HP2)
-        {
-            const size_t block = k / QK8_HP;
-            const size_t offset = k % QK8_HP;
-            for (size_t j = 0; j < J; ++j)
-                Wk_f[j] = static_cast<float>(args.q8_hp2_block(j, block)->qs[offset]);
-        }
-        else if (plan.route == DecWeightRoute::Q8H2)
-        {
-            const size_t block = k / QK8_H2;
-            const size_t offset = k % QK8_H2;
-            for (size_t j = 0; j < J; ++j)
-                Wk_f[j] = static_cast<float>(args.q8_h2_block(j, block)->qs[offset]);
-        }
-        else if (plan.route == DecWeightRoute::Q8H1 && plan.native_weight_blocks)
-        {
-            const size_t block = k / QK8_0;
-            const size_t offset = k % QK8_0;
-            for (size_t j = 0; j < J; ++j)
-                Wk_f[j] = static_cast<float>(args.q8_h1_block(j, block)->qs[offset]);
-        }
-        else if (plan.layout == WeightLayout::KxJ_RowMajor)
-        {
-            const int8_t *row = weights + k * plan.weight_stride;
-            for (size_t j = 0; j < J; ++j)
-                Wk_f[j] = static_cast<float>(row[j]);
-        }
-        else
-        {
-            for (size_t j = 0; j < J; ++j)
-                Wk_f[j] = static_cast<float>(weights[j * plan.weight_stride + k]);
-        }
-
-        const size_t block_index = plan.scales.block_size ? k / plan.scales.block_size : 0;
-        for (size_t j = 0; j < J; ++j)
-        {
-            Wk_f[j] *= dec_route_weight_scale(plan, args, j, block_index);
-        }
-    }
-
     size_t stage_from_outliers(
         const std::vector<QactOutlier> &outliers,
         size_t I,
         size_t K,
         ActivationDECScratch &scratch)
     {
+        if (scratch.rk_stage.capacity() < outliers.size())
+            scratch.rk_stage.reserve(outliers.size());
+
         if (outliers.empty() || I == 0 || K == 0)
             return 0;
 
@@ -484,7 +449,7 @@ namespace ggml::gemmini::quants::dec { namespace
             scratch.rk_offs[k] += scratch.rk_offs[k - 1];
 
         const size_t nnz = scratch.rk_offs[K];
-        scratch.rk_pairs.assign(nnz, {0, 0});
+        scratch.rk_pairs.resize(nnz);
 
         if (nnz == 0)
         {
@@ -493,20 +458,21 @@ namespace ggml::gemmini::quants::dec { namespace
             return nnz;
         }
 
-        std::vector<size_t> pos(scratch.rk_offs.begin(), scratch.rk_offs.end() - 1);
+        if (scratch.rk_pos.size() != K)
+            scratch.rk_pos.resize(K);
+        std::copy_n(scratch.rk_offs.begin(), K, scratch.rk_pos.begin());
         for (const auto &t : scratch.rk_stage)
         {
             const size_t k = static_cast<size_t>(t.k);
             if (k >= K)
                 continue;
 
-            const size_t dst = pos[k]++;
+            const size_t dst = scratch.rk_pos[k]++;
             if (dst < nnz)
                 scratch.rk_pairs[dst] = {t.r, t.d};
         }
 
         scratch.unique_k.clear();
-        scratch.unique_k.reserve(K);
         for (size_t k = 0; k < K; ++k)
         {
             if (scratch.rk_offs[k] != scratch.rk_offs[k + 1])
@@ -627,12 +593,6 @@ ActivationDECResult compensate_activation_dec(
 
     start = ggml::gemmini::cycle::read();
 
-    const bool use_jmajor_blocked =
-        plan.route == DecWeightRoute::Dense &&
-        !plan.scales.scalar_mode &&
-        !plan.scales.row_header_mode &&
-        plan.layout == WeightLayout::JxK_ColMajor &&
-        plan.weight_stride >= K;
     const bool use_int64_scalar = plan.route == DecWeightRoute::Dense && plan.scales.scalar_mode;
     const bool use_int64_channel_direct = plan.route == DecWeightRoute::Q8ChannelDirect;
     const bool use_int64_channel_sidecar = plan.route == DecWeightRoute::Q8ChannelSidecar;
@@ -642,38 +602,70 @@ ActivationDECResult compensate_activation_dec(
             plan.route == DecWeightRoute::Q8H1 || plan.route == DecWeightRoute::Q8H2 ||
             plan.route == DecWeightRoute::Q8HP1 || plan.route == DecWeightRoute::Q8HP2);
 #if LOG_DEBUG
-    const bool use_int64_kernel = use_int64_scalar || use_int64_channel_direct ||
-        use_int64_channel_sidecar || use_int64_h1 || use_int64_block;
     const size_t j_tiles = dec_int64_j_tile_count(J);
     const int dec_threads = resolve_dec_threads(j_tiles);
-    const char *route = decode ? (use_jmajor_blocked ? "decode-jmajor-blocked" : "decode-fallback") :
-        (use_jmajor_blocked ? "prefill-jmajor-blocked" : "prefill-fallback");
+    const char *kernel = use_int64_scalar ? "int64-scalar" :
+        (use_int64_channel_direct ? "int64-channel-direct" :
+            (use_int64_channel_sidecar ? "int64-channel-sidecar" :
+                (use_int64_h1 ? "int64-h1" : (use_int64_block ? "int64-block" : "unsupported"))));
+    const char *layout = plan.layout == WeightLayout::KxJ_RowMajor ? "kxj-row-major" : "jxk-col-major";
+    std::vector<uint8_t> active_row_mask(I, uint8_t {0});
+    if (decode)
+        active_row_mask[0] = 1;
+    else
+        for (const auto &entry : scr.rk_pairs)
+            if (entry.first >= 0 && static_cast<size_t>(entry.first) < I)
+                active_row_mask[static_cast<size_t>(entry.first)] = 1;
+    const size_t active_rows = static_cast<size_t>(
+        std::count(active_row_mask.begin(), active_row_mask.end(), uint8_t {1}));
+    size_t active_blocks = 1;
+    if (!plan.scales.scalar_mode && !plan.scales.row_header_mode && !plan.scales.channel_mode)
+    {
+        active_blocks = 0;
+        for (size_t block = 0; block < plan.scales.cols; ++block)
+        {
+            const size_t block_begin = block * plan.scales.block_size;
+            const size_t block_end = std::min(K, block_begin + plan.scales.block_size);
+            for (size_t k = block_begin; k < block_end; ++k)
+            {
+                if (scr.rk_counts[k + 1] != 0)
+                {
+                    ++active_blocks;
+                    break;
+                }
+            }
+        }
+    }
     ggml::gemmini::log::debug(
         layer,
-        "[dec.route] route=%s weight_route=%s kernel=%s I=%zu K=%zu J=%zu scale_mode=%s j_tiles=%zu threads=%d",
-        route,
+        "[dec.route] activation=%s weight=%s residual_format=common weight_layout=%s scale_mode=%s kernel=%s block_size_k=%u I=%zu J=%zu K=%zu nnz=%zu unique_k=%zu active_k_blocks=%zu j_tiles=%zu threads=%d",
+        requested_activation_name(),
         dec_route_name(plan),
-        use_int64_scalar ? "int64-scalar" :
-            (use_int64_channel_direct ? "int64-channel-direct" :
-                (use_int64_channel_sidecar ? "int64-channel-sidecar" :
-                    (use_int64_h1 ? "int64-h1" : (use_int64_block ? "int64-block" :
-                        (use_jmajor_blocked ? "fp-jmajor-blocked" : "fp-fallback"))))),
-        I,
-        K,
-        J,
+        layout,
         dec_scale_mode_name(plan),
-        j_tiles,
-        use_int64_kernel ? dec_threads : 1);
-    ggml::gemmini::log::debug(
-        layer,
-        "[dec.work] selected=%zu nnz=%zu unique_k=%zu j_tiles=%zu threads=%d output_stride_row=%zu output_stride_col=%zu",
-        result.total_selected,
+        kernel,
+        static_cast<unsigned>(args.block_size_k),
+        I,
+        J,
+        K,
         result.nnz,
         result.unique_k_count,
+        active_blocks,
         j_tiles,
-        use_int64_kernel ? dec_threads : 1,
-        args.stride_f_out ? args.stride_f_out : J,
-        args.col_stride_f_out ? args.col_stride_f_out : 1);
+        dec_threads);
+    const size_t int_mac_count = (decode ? result.unique_k_count : result.nnz) * J;
+    const size_t scale_apply_count = active_rows * J *
+        ((!plan.scales.scalar_mode && !plan.scales.row_header_mode && !plan.scales.channel_mode) ? active_blocks : 1);
+    ggml::gemmini::log::debug(
+        layer,
+        "[dec.work] int_mac_count=%zu scale_apply_count=%zu active_rows=%zu active_k=%zu active_k_blocks=%zu j_tiles=%zu threads=%d",
+        int_mac_count,
+        scale_apply_count,
+        active_rows,
+        result.unique_k_count,
+        active_blocks,
+        j_tiles,
+        dec_threads);
 #endif
 
     if (use_int64_scalar)
@@ -725,78 +717,10 @@ ActivationDECResult compensate_activation_dec(
                 args, plan, I, J, activation_scales, scr.unique_k, scr.rk_offs, scr.rk_pairs.data(),
                 scr.Y_com.data());
     }
-    else if (decode)
-    {
-        if (use_jmajor_blocked)
-        {
-            accumulate_single_row_to_ycom_jmajor_blocked(
-                args,
-                plan,
-                J,
-                activation_scales,
-                scr.unique_k,
-                scr.i1_delta_by_k,
-                scr.Y_com.data());
-        }
-        else
-        {
-            for (int k : scr.unique_k)
-            {
-                const size_t k_sz = static_cast<size_t>(k);
-                if (k_sz >= scr.i1_delta_by_k.size())
-                    continue;
-
-                load_weight_row_scaled(
-                    k_sz,
-                    args,
-                    plan,
-                    scr.Wk_f.data());
-
-                accumulate_single_row_delta_to_ycom(
-                    scr.Wk_f.data(),
-                    J,
-                    scr.i1_delta_by_k[k_sz],
-                    activation_scales,
-                    scr.Y_com.data());
-            }
-        }
-    }
-    else if (use_jmajor_blocked)
-    {
-        accumulate_to_ycom_jmajor_blocked(
-            args,
-            plan,
-            I,
-            J,
-            activation_scales,
-            scr.unique_k,
-            scr.rk_offs,
-            scr.rk_pairs.data(),
-            scr.Y_com.data());
-    }
     else
     {
-        for (int k : scr.unique_k)
-        {
-            const size_t k_sz = static_cast<size_t>(k);
-            const size_t beg = scr.rk_offs[k_sz];
-            const size_t rk_end = scr.rk_offs[k_sz + 1];
-
-            load_weight_row_scaled(
-                k_sz,
-                args,
-                plan,
-                scr.Wk_f.data());
-
-            accumulate_to_ycom(
-                scr.Wk_f.data(),
-                J,
-                beg,
-                rk_end,
-                scr.rk_pairs.data(),
-                activation_scales,
-                scr.Y_com.data());
-        }
+        log_dec_reject(layer, "valid route has no integer kernel", args);
+        return result;
     }
 
     end = ggml::gemmini::cycle::read();
