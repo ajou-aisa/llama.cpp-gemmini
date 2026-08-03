@@ -447,7 +447,7 @@ constexpr size_t kHierarchicalDepth = QK8_0 * kHierarchicalBlocksPerRow;
 static_assert(QK8_0 == QK8_H2 && QK8_0 == QK8_HP, "hierarchical block widths must match");
 
 const std::vector<ggml::gemmini::quants::QactOutlier> kHierarchicalPrefillOutliers = {
-    { 0, 2, 3 }, { 0, 2, -1 }, { 0, 31, 2 }, { 1, 32, -2 }, { 1, 63, 4 },
+    { 0, 2, 3 }, { 0, 2, -1 }, { 0, 31, 2 }, { 1, 30, 1 }, { 1, 32, -2 }, { 1, 63, 4 },
 };
 
 const std::vector<ggml::gemmini::quants::QactOutlier> kHierarchicalDecodeOutliers = {

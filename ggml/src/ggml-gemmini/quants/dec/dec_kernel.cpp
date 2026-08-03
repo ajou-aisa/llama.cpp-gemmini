@@ -3,6 +3,7 @@
 #include "../../ggml-gemmini-args.h"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdlib>
 #include <limits>
@@ -130,19 +131,26 @@ namespace
         const float *activation_scales,
         const std::vector<ResidualGroupEntry> &entries,
         const std::vector<ActiveRowGroup> &groups,
+        const std::vector<size_t> &group_offsets,
+        const std::vector<size_t> &group_row_group_indices,
         CodeFor code_for,
         ScaleForColumn scale_for_column,
         float *Y_com)
     {
-        if (!Y_com || entries.empty() || groups.empty() || I == 0 || J == 0)
+        if (!Y_com || entries.empty() || groups.empty() || group_offsets.size() < 2 ||
+            group_row_group_indices.size() != groups.size() || I == 0 || J == 0)
             return;
 
         for_each_grouped_j_tile(I, J, [&](size_t jb, size_t width, std::vector<int64_t> &accumulator)
         {
             std::fill(accumulator.begin(), accumulator.begin() + I * width, int64_t {0});
-            for (const ActiveRowGroup &group : groups)
-                add_group_dot(entries, group.entry_begin, group.entry_end, jb, width, code_for,
-                              accumulator.data() + static_cast<size_t>(group.row) * width);
+            for (size_t k_group = 0; k_group + 1 < group_offsets.size(); ++k_group)
+                for (size_t position = group_offsets[k_group]; position < group_offsets[k_group + 1]; ++position)
+                {
+                    const ActiveRowGroup &group = groups[group_row_group_indices[position]];
+                    add_group_dot(entries, group.entry_begin, group.entry_end, jb, width, code_for,
+                                  accumulator.data() + static_cast<size_t>(group.row) * width);
+                }
 
             uint32_t previous_row = std::numeric_limits<uint32_t>::max();
             for (const ActiveRowGroup &group : groups)
@@ -161,7 +169,7 @@ namespace
         });
     }
 
-    template <typename CodeFor, typename Finalize>
+    template <typename CodeFor, typename ScaleFor>
     void run_scaled_grouped_dec(
         size_t I,
         size_t J,
@@ -169,32 +177,52 @@ namespace
         const float *activation_scales,
         const std::vector<ResidualGroupEntry> &entries,
         const std::vector<ActiveRowGroup> &groups,
+        const std::vector<size_t> &group_offsets,
+        const std::vector<size_t> &group_row_group_indices,
         CodeFor code_for,
-        Finalize finalize,
+        ScaleFor scale_for,
         float *Y_com)
     {
-        if (!Y_com || entries.empty() || groups.empty() || I == 0 || J == 0 || scale_group_size == 0)
+        if (!Y_com || entries.empty() || groups.empty() || group_offsets.size() < 2 ||
+            group_row_group_indices.size() != groups.size() || I == 0 || J == 0 || scale_group_size == 0)
             return;
 
         for_each_grouped_j_tile(1, J, [&](size_t jb, size_t width, std::vector<int64_t> &accumulator)
         {
-            for (const ActiveRowGroup &group : groups)
+            alignas(64) std::array<float, kDecInt64JTileWidth> scale_tile{};
+            for (size_t k_group = 0; k_group + 1 < group_offsets.size(); ++k_group)
             {
-                for (size_t begin = group.entry_begin; begin < group.entry_end;)
-                {
-                    const size_t scale_block = entries[begin].k / scale_group_size;
-                    size_t end = begin + 1;
-                    while (end < group.entry_end && entries[end].k / scale_group_size == scale_block)
-                        ++end;
+                if (group_offsets[k_group] == group_offsets[k_group + 1])
+                    continue;
 
-                    std::fill(accumulator.begin(), accumulator.begin() + width, int64_t {0});
-                    add_group_dot(entries, begin, end, jb, width, code_for, accumulator.data());
-                    const size_t row = group.row;
-                    const float activation_scale = activation_scales ? activation_scales[row] : 1.0f;
-                    float *output = Y_com + row * J + jb;
+                if (scale_group_size == kDecGroupSizeK)
                     for (size_t t = 0; t < width; ++t)
-                        output[t] += finalize(accumulator[t], activation_scale, jb + t, scale_block);
-                    begin = end;
+                        scale_tile[t] = scale_for(jb + t, k_group);
+
+                for (size_t position = group_offsets[k_group]; position < group_offsets[k_group + 1]; ++position)
+                {
+                    const ActiveRowGroup &group = groups[group_row_group_indices[position]];
+                    for (size_t begin = group.entry_begin; begin < group.entry_end;)
+                    {
+                        const size_t scale_block = entries[begin].k / scale_group_size;
+                        size_t end = begin + 1;
+                        while (end < group.entry_end && entries[end].k / scale_group_size == scale_block)
+                            ++end;
+
+                        std::fill(accumulator.begin(), accumulator.begin() + width, int64_t {0});
+                        add_group_dot(entries, begin, end, jb, width, code_for, accumulator.data());
+                        const size_t row = group.row;
+                        const float activation_scale = activation_scales ? activation_scales[row] : 1.0f;
+                        float *output = Y_com + row * J + jb;
+                        for (size_t t = 0; t < width; ++t)
+                        {
+                            const float weight_scale = scale_group_size == kDecGroupSizeK ?
+                                scale_tile[t] : scale_for(jb + t, scale_block);
+                            output[t] += static_cast<float>(
+                                static_cast<double>(accumulator[t]) * activation_scale * weight_scale);
+                        }
+                        begin = end;
+                    }
                 }
             }
         });
@@ -209,14 +237,16 @@ namespace
         const float *activation_scales,
         const std::vector<ResidualGroupEntry> &entries,
         const std::vector<ActiveRowGroup> &groups,
+        const std::vector<size_t> &group_offsets,
+        const std::vector<size_t> &group_row_group_indices,
         CodeFor code_for,
         float *Y_com)
     {
         run_scaled_grouped_dec(I, J, plan.scales.block_size, activation_scales, entries, groups,
+            group_offsets, group_row_group_indices,
             code_for,
-            [&args, &plan](int64_t accumulator, float activation_scale, size_t j, size_t block) {
-                return static_cast<float>(static_cast<double>(accumulator) * activation_scale *
-                    dec_route_weight_scale(plan, args, j, block));
+            [&args, &plan](size_t j, size_t block) {
+                return dec_route_weight_scale(plan, args, j, block);
             }, Y_com);
     }
 }
@@ -224,12 +254,14 @@ namespace
 void accumulate_to_ycom_int64_scalar(
     const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
     const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
-    const std::vector<ActiveRowGroup> &groups, float *Y_com)
+    const std::vector<ActiveRowGroup> &groups, const std::vector<size_t> &group_offsets,
+    const std::vector<size_t> &group_row_group_indices, float *Y_com)
 {
     const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
     if (!weights)
         return;
     run_whole_k_grouped_dec(I, J, activation_scales, entries, groups,
+        group_offsets, group_row_group_indices,
         [weights, &plan](size_t j, size_t k) {
             return plan.layout == WeightLayout::KxJ_RowMajor ? weights[k * plan.weight_stride + j] :
                 weights[j * plan.weight_stride + k];
@@ -239,12 +271,14 @@ void accumulate_to_ycom_int64_scalar(
 void accumulate_to_ycom_int64_channel_direct(
     const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
     const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
-    const std::vector<ActiveRowGroup> &groups, float *Y_com)
+    const std::vector<ActiveRowGroup> &groups, const std::vector<size_t> &group_offsets,
+    const std::vector<size_t> &group_row_group_indices, float *Y_com)
 {
     const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
     if (!weights)
         return;
     run_whole_k_grouped_dec(I, J, activation_scales, entries, groups,
+        group_offsets, group_row_group_indices,
         [weights, &plan](size_t j, size_t k) {
             return plan.layout == WeightLayout::KxJ_RowMajor ? weights[k * plan.weight_stride + j] :
                 weights[j * plan.weight_stride + k];
@@ -254,12 +288,14 @@ void accumulate_to_ycom_int64_channel_direct(
 void accumulate_to_ycom_int64_channel_sidecar(
     const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
     const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
-    const std::vector<ActiveRowGroup> &groups, float *Y_com)
+    const std::vector<ActiveRowGroup> &groups, const std::vector<size_t> &group_offsets,
+    const std::vector<size_t> &group_row_group_indices, float *Y_com)
 {
     const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
     if (!weights)
         return;
     run_whole_k_grouped_dec(I, J, activation_scales, entries, groups,
+        group_offsets, group_row_group_indices,
         [weights, &plan](size_t j, size_t k) {
             return plan.layout == WeightLayout::KxJ_RowMajor ? weights[k * plan.weight_stride + j] :
                 weights[j * plan.weight_stride + k];
@@ -269,22 +305,27 @@ void accumulate_to_ycom_int64_channel_sidecar(
 void accumulate_to_ycom_int64_block(
     const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
     const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
-    const std::vector<ActiveRowGroup> &groups, float *Y_com)
+    const std::vector<ActiveRowGroup> &groups, const std::vector<size_t> &group_offsets,
+    const std::vector<size_t> &group_row_group_indices, float *Y_com)
 {
     if (plan.route == DecWeightRoute::Q8HP1)
         return run_block_route(args, plan, I, J, activation_scales, entries, groups,
+            group_offsets, group_row_group_indices,
             [&args](size_t j, size_t k) { return args.q8_hp1_block(j, k / QK8_HP)->qs[k % QK8_HP]; }, Y_com);
     if (plan.route == DecWeightRoute::Q8HP2)
         return run_block_route(args, plan, I, J, activation_scales, entries, groups,
+            group_offsets, group_row_group_indices,
             [&args](size_t j, size_t k) { return args.q8_hp2_block(j, k / QK8_HP)->qs[k % QK8_HP]; }, Y_com);
     if (plan.route == DecWeightRoute::Q8H2)
         return run_block_route(args, plan, I, J, activation_scales, entries, groups,
+            group_offsets, group_row_group_indices,
             [&args](size_t j, size_t k) { return args.q8_h2_block(j, k / QK8_H2)->qs[k % QK8_H2]; }, Y_com);
 
     const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
     if (!weights)
         return;
     run_block_route(args, plan, I, J, activation_scales, entries, groups,
+        group_offsets, group_row_group_indices,
         [weights, &plan](size_t j, size_t k) {
             return plan.layout == WeightLayout::KxJ_RowMajor ? weights[k * plan.weight_stride + j] :
                 weights[j * plan.weight_stride + k];
@@ -294,22 +335,18 @@ void accumulate_to_ycom_int64_block(
 void accumulate_to_ycom_int64_h1(
     const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
     const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
-    const std::vector<ActiveRowGroup> &groups, float *Y_com)
+    const std::vector<ActiveRowGroup> &groups, const std::vector<size_t> &group_offsets,
+    const std::vector<size_t> &group_row_group_indices, float *Y_com)
 {
     const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
     run_scaled_grouped_dec(I, J, kDecGroupSizeK, activation_scales, entries, groups,
+        group_offsets, group_row_group_indices,
         [&args, &plan, weights](size_t j, size_t k) {
             const block_q8_h1 *native = plan.native_weight_blocks ? args.q8_h1_block(j, k / QK8_0) : nullptr;
             return native ? native->qs[k % QK8_0] : weights[j * plan.weight_stride + k];
         },
-        [&args, &plan](int64_t accumulator, float activation_scale, size_t j, size_t block) {
-            const block_q8_h1 *native = plan.native_weight_blocks ? args.q8_h1_block(j, block) : nullptr;
-            const uint64_t offset = native ? native->R :
-                (args.stripe_J > 1 ? args.R_stripe[j / args.stripe_J] : args.R[j]);
-            const uint64_t c_eff = (native ? native->c_b : args.c_b[j * args.blocks_per_row + block]) + offset;
-            const float s_rf = native ? native->s_rf :
-                (args.stripe_J > 1 ? args.s_rf_stripe[j / args.stripe_J] : args.s_rf[j]);
-            return static_cast<float>(static_cast<double>(accumulator) * c_eff * s_rf * activation_scale);
+        [&args, &plan](size_t j, size_t block) {
+            return dec_route_weight_scale(plan, args, j, block);
         }, Y_com);
 }
 

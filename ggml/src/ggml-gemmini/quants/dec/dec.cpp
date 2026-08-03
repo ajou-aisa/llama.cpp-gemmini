@@ -32,6 +32,8 @@ namespace
     {
         std::vector<ResidualGroupEntry> residual_entries;
         std::vector<ActiveRowGroup> active_row_groups;
+        std::vector<size_t> group_offsets;
+        std::vector<size_t> group_row_group_indices;
         std::vector<uint32_t> unique_k;
         std::vector<uint32_t> active_groups_global;
         std::vector<float> Y_com;
@@ -40,6 +42,8 @@ namespace
         {
             residual_entries.clear();
             active_row_groups.clear();
+            group_offsets.clear();
+            group_row_group_indices.clear();
             unique_k.clear();
             active_groups_global.clear();
             if (Y_com.size() != I * J)
@@ -426,6 +430,15 @@ ActivationDECResult compensate_activation_dec(
 
     start = ggml::gemmini::cycle::read();
 
+    const size_t group_count = K / kDecGroupSizeK + (K % kDecGroupSizeK != 0);
+    build_group_major_index(
+        scr.active_row_groups, group_count, scr.group_offsets, scr.group_row_group_indices);
+
+    end = ggml::gemmini::cycle::read();
+    ggml::gemmini::log::cycle(layer, "[dec] cpu.Build group-major index", start, end);
+
+    start = ggml::gemmini::cycle::read();
+
     const bool use_int64_scalar = plan.route == DecWeightRoute::Dense && plan.scales.scalar_mode;
     const bool use_int64_channel_direct = plan.route == DecWeightRoute::Q8ChannelDirect;
     const bool use_int64_channel_sidecar = plan.route == DecWeightRoute::Q8ChannelSidecar;
@@ -493,16 +506,27 @@ ActivationDECResult compensate_activation_dec(
     const size_t route_accumulate_count =
         (scaled_route ? active_row_scale_groups : scr.active_row_groups.size()) * J;
     const size_t scale_apply_count = (scaled_route ? active_row_scale_groups : active_rows) * J;
+    const size_t scale_eval_count = scaled_route && scale_group_size == kDecGroupSizeK ?
+        scr.active_groups_global.size() * J : scale_apply_count;
+    size_t row_groups_per_group_max = 0;
+    for (size_t group = 0; group < group_count; ++group)
+        row_groups_per_group_max = std::max(
+            row_groups_per_group_max, scr.group_offsets[group + 1] - scr.group_offsets[group]);
+    const double row_groups_per_group_mean = scr.active_groups_global.empty() ? 0.0 :
+        static_cast<double>(scr.active_row_groups.size()) / scr.active_groups_global.size();
     ggml::gemmini::log::debug(
         layer,
-        "[dec.work] nnz=%zu active_rows=%zu active_groups_global=%zu active_row_groups=%zu int_mac_count=%zu route_accumulate_count=%zu scale_apply_count=%zu active_k=%zu j_tiles=%zu threads=%d",
+        "[dec.work] nnz=%zu active_rows=%zu active_groups_global=%zu active_row_groups=%zu row_groups_per_group_mean=%.6g row_groups_per_group_max=%zu int_mac_count=%zu route_accumulate_count=%zu scale_apply_count=%zu scale_eval_count=%zu active_k=%zu j_tiles=%zu threads=%d",
         result.nnz,
         active_rows,
         scr.active_groups_global.size(),
         scr.active_row_groups.size(),
+        row_groups_per_group_mean,
+        row_groups_per_group_max,
         int_mac_count,
         route_accumulate_count,
         scale_apply_count,
+        scale_eval_count,
         result.unique_k_count,
         j_tiles,
         dec_threads);
@@ -511,22 +535,27 @@ ActivationDECResult compensate_activation_dec(
     if (use_int64_scalar)
         accumulate_to_ycom_int64_scalar(
             args, plan, I, J, activation_scales, scr.residual_entries, scr.active_row_groups,
+            scr.group_offsets, scr.group_row_group_indices,
             scr.Y_com.data());
     else if (use_int64_channel_direct)
         accumulate_to_ycom_int64_channel_direct(
             args, plan, I, J, activation_scales, scr.residual_entries, scr.active_row_groups,
+            scr.group_offsets, scr.group_row_group_indices,
             scr.Y_com.data());
     else if (use_int64_channel_sidecar)
         accumulate_to_ycom_int64_channel_sidecar(
             args, plan, I, J, activation_scales, scr.residual_entries, scr.active_row_groups,
+            scr.group_offsets, scr.group_row_group_indices,
             scr.Y_com.data());
     else if (use_int64_h1)
         accumulate_to_ycom_int64_h1(
             args, plan, I, J, activation_scales, scr.residual_entries, scr.active_row_groups,
+            scr.group_offsets, scr.group_row_group_indices,
             scr.Y_com.data());
     else if (use_int64_block)
         accumulate_to_ycom_int64_block(
             args, plan, I, J, activation_scales, scr.residual_entries, scr.active_row_groups,
+            scr.group_offsets, scr.group_row_group_indices,
             scr.Y_com.data());
     else
     {
