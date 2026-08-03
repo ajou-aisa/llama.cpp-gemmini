@@ -35,6 +35,51 @@ namespace ggml::gemmini::quants::dec
         JxK_ColMajor,
     };
 
+    enum class DecWeightRoute
+    {
+        Unsupported,
+        Dense,
+        Q8ChannelDirect,
+        Q8ChannelSidecar,
+        Q8H1,
+        Q8H2,
+        Q8HP1,
+        Q8HP2,
+    };
+
+    struct DecRoutePlan
+    {
+        DecWeightRoute route = DecWeightRoute::Unsupported;
+        WeightLayout layout = WeightLayout::KxJ_RowMajor;
+        WeightScaleInfo scales{};
+        size_t weight_stride = 0;
+        const char *reject_reason = "unsupported weight format";
+        bool native_weight_blocks = false;
+        bool valid = false;
+    };
+
+    DecRoutePlan resolve_dec_route_plan(
+        const ggml_gemmini_args_t &args,
+        WeightScaleInfoMode mode);
+
+    const char *dec_route_name(const DecRoutePlan &plan);
+
+    const char *dec_scale_mode_name(const DecRoutePlan &plan);
+
+    bool dec_route_covers_k(const DecRoutePlan &plan, size_t k_count);
+
+    bool dec_route_block_for_range(
+        const DecRoutePlan &plan,
+        size_t k_offset,
+        size_t block_k,
+        size_t &block_index);
+
+    float dec_route_weight_scale(
+        const DecRoutePlan &plan,
+        const ggml_gemmini_args_t &args,
+        size_t j,
+        size_t block_index);
+
     inline bool is_q8_h1_args(const ggml_gemmini_args_t &args)
     {
         return args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_h1 &&

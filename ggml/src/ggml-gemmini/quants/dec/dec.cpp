@@ -88,26 +88,6 @@ namespace ggml::gemmini::quants::dec { namespace
 #endif
     }
 
-    bool has_required_dec_scale_metadata(
-        const WeightScaleInfo &weight_scales,
-        const ggml_gemmini_args_t &args)
-    {
-        if (!weight_scales.supported)
-            return false;
-
-        if (weight_scales.scalar_mode || weight_scales.row_header_mode || weight_scales.channel_mode)
-            return weight_scales.scalar_mode ? std::isfinite(weight_scales.scalar) :
-                weight_scales.rows >= args.J &&
-                (weight_scales.row_header_mode || weight_scales.data != nullptr);
-
-        if (!weight_scales.data || weight_scales.rows < args.J || weight_scales.cols == 0 ||
-            weight_scales.block_size == 0)
-            return false;
-
-        const size_t required_blocks = 1 + (args.K - 1) / weight_scales.block_size;
-        return weight_scales.cols >= required_blocks;
-    }
-
 #if DEC_VALIDATION
     bool checked_add_i64(int64_t lhs, int64_t rhs, int64_t &out)
     {
@@ -145,9 +125,10 @@ namespace ggml::gemmini::quants::dec { namespace
         size_t k,
         size_t j,
         const ggml_gemmini_args_t &args,
+        const DecRoutePlan &plan,
         int8_t &code)
     {
-        if (is_q8_hp1_args(args))
+        if (plan.route == DecWeightRoute::Q8HP1)
         {
             const block_q8_hp1 *block = args.q8_hp1_block(j, k / QK8_HP);
             if (!block)
@@ -155,7 +136,7 @@ namespace ggml::gemmini::quants::dec { namespace
             code = block->qs[k % QK8_HP];
             return true;
         }
-        if (is_q8_hp2_args(args))
+        if (plan.route == DecWeightRoute::Q8HP2)
         {
             const block_q8_hp2 *block = args.q8_hp2_block(j, k / QK8_HP);
             if (!block)
@@ -163,7 +144,7 @@ namespace ggml::gemmini::quants::dec { namespace
             code = block->qs[k % QK8_HP];
             return true;
         }
-        if (is_q8_h2_args(args))
+        if (plan.route == DecWeightRoute::Q8H2)
         {
             const block_q8_h2 *block = args.q8_h2_block(j, k / QK8_H2);
             if (!block)
@@ -171,7 +152,7 @@ namespace ggml::gemmini::quants::dec { namespace
             code = block->qs[k % QK8_H2];
             return true;
         }
-        if (is_q8_h1_args(args))
+        if (plan.route == DecWeightRoute::Q8H1 && plan.native_weight_blocks)
         {
             const block_q8_h1 *block = args.q8_h1_block(j, k / QK8_0);
             if (!block)
@@ -184,30 +165,14 @@ namespace ggml::gemmini::quants::dec { namespace
         if (!weights)
             return false;
 
-        const size_t stride = resolve_weight_stride_elems(args);
-        code = resolve_weight_layout(args) == WeightLayout::KxJ_RowMajor ?
-            weights[k * stride + j] : weights[j * stride + k];
+        code = plan.layout == WeightLayout::KxJ_RowMajor ?
+            weights[k * plan.weight_stride + j] : weights[j * plan.weight_stride + k];
         return true;
-    }
-
-    float reference_route_scale(
-        const WeightScaleInfo &weight_scales,
-        const ggml_gemmini_args_t &args,
-        size_t j,
-        size_t route)
-    {
-        if (weight_scales.row_header_mode)
-            return args.q8_channel_scale(j);
-        if (weight_scales.scalar_mode)
-            return weight_scales.scalar;
-        if (weight_scales.channel_mode)
-            return weight_scales.data[j];
-        return weight_scales.data[j * weight_scales.cols + route];
     }
 
     bool accumulate_scalar_reference(
         const ggml_gemmini_args_t &args,
-        const WeightScaleInfo &weight_scales,
+        const DecRoutePlan &plan,
         const float *activation_scales,
         const std::vector<int> &unique_k,
         const std::vector<size_t> &rk_offs,
@@ -216,9 +181,9 @@ namespace ggml::gemmini::quants::dec { namespace
         bool decode,
         float *reference_ycom)
     {
-        const bool per_block_scale = !weight_scales.scalar_mode && !weight_scales.row_header_mode &&
-            !weight_scales.channel_mode;
-        const size_t route_count = per_block_scale ? weight_scales.cols : 1;
+        const bool per_block_scale = !plan.scales.scalar_mode && !plan.scales.row_header_mode &&
+            !plan.scales.channel_mode;
+        const size_t route_count = per_block_scale ? plan.scales.cols : 1;
         std::vector<int64_t> accumulator(args.I * args.J, 0);
 
         for (size_t route = 0; route < route_count; ++route)
@@ -231,13 +196,13 @@ namespace ggml::gemmini::quants::dec { namespace
 
                 const size_t k_sz = static_cast<size_t>(k);
                 if (k_sz >= args.K ||
-                    (per_block_scale && k_sz / weight_scales.block_size != route))
+                    (per_block_scale && k_sz / plan.scales.block_size != route))
                     continue;
 
                 for (size_t j = 0; j < args.J; ++j)
                 {
                     int8_t weight_code = 0;
-                    if (!reference_weight_code(k_sz, j, args, weight_code))
+                    if (!reference_weight_code(k_sz, j, args, plan, weight_code))
                         return false;
 
                     if (decode)
@@ -282,7 +247,7 @@ namespace ggml::gemmini::quants::dec { namespace
                     const size_t index = r * args.J + j;
                     reference_ycom[index] += static_cast<float>(
                         static_cast<double>(accumulator[index]) * activation_scale *
-                        reference_route_scale(weight_scales, args, j, route));
+                        dec_route_weight_scale(plan, args, j, route));
                 }
             }
         }
@@ -327,88 +292,61 @@ namespace ggml::gemmini::quants::dec { namespace
     void load_weight_row_scaled(
         size_t k,
         const ggml_gemmini_args_t &args,
-        const float *weight_scales,
-        size_t scale_rows,
-        size_t blocks_k,
-        size_t block_size_k,
-        bool scalar_mode,
-        bool row_header_mode,
-        float scalar_weight_scale,
+        const DecRoutePlan &plan,
         float *Wk_f)
     {
         const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
         const size_t J = args.J;
-        const bool native_h1 = is_q8_h1_args(args);
-        const bool q8_hp1 = is_q8_hp1_args(args);
-        const bool q8_hp2 = is_q8_hp2_args(args);
-        const bool q8_h2 = is_q8_h2_args(args);
-        if ((!weights && !native_h1 && !q8_hp1 && !q8_hp2 && !q8_h2) || !Wk_f || J == 0)
+        if ((!weights && !plan.native_weight_blocks) || !Wk_f || J == 0)
             return;
 
-        const size_t weight_stride = resolve_weight_stride_elems(args);
-        if (weight_stride == 0)
+        if (plan.weight_stride == 0)
             return;
 
-        if (q8_hp1)
+        if (plan.route == DecWeightRoute::Q8HP1)
         {
             const size_t block = k / QK8_HP;
             const size_t offset = k % QK8_HP;
             for (size_t j = 0; j < J; ++j)
                 Wk_f[j] = static_cast<float>(args.q8_hp1_block(j, block)->qs[offset]);
         }
-        else if (q8_hp2)
+        else if (plan.route == DecWeightRoute::Q8HP2)
         {
             const size_t block = k / QK8_HP;
             const size_t offset = k % QK8_HP;
             for (size_t j = 0; j < J; ++j)
                 Wk_f[j] = static_cast<float>(args.q8_hp2_block(j, block)->qs[offset]);
         }
-        else if (q8_h2)
+        else if (plan.route == DecWeightRoute::Q8H2)
         {
             const size_t block = k / QK8_H2;
             const size_t offset = k % QK8_H2;
             for (size_t j = 0; j < J; ++j)
                 Wk_f[j] = static_cast<float>(args.q8_h2_block(j, block)->qs[offset]);
         }
-        else if (native_h1)
+        else if (plan.route == DecWeightRoute::Q8H1 && plan.native_weight_blocks)
         {
             const size_t block = k / QK8_0;
             const size_t offset = k % QK8_0;
             for (size_t j = 0; j < J; ++j)
                 Wk_f[j] = static_cast<float>(args.q8_h1_block(j, block)->qs[offset]);
         }
-        else if (resolve_weight_layout(args) == WeightLayout::KxJ_RowMajor)
+        else if (plan.layout == WeightLayout::KxJ_RowMajor)
         {
-            const int8_t *row = weights + k * weight_stride;
+            const int8_t *row = weights + k * plan.weight_stride;
             for (size_t j = 0; j < J; ++j)
                 Wk_f[j] = static_cast<float>(row[j]);
         }
         else
         {
             for (size_t j = 0; j < J; ++j)
-                Wk_f[j] = static_cast<float>(weights[j * weight_stride + k]);
+                Wk_f[j] = static_cast<float>(weights[j * plan.weight_stride + k]);
         }
 
-        if (row_header_mode)
+        const size_t block_index = plan.scales.block_size ? k / plan.scales.block_size : 0;
+        for (size_t j = 0; j < J; ++j)
         {
-            for (size_t j = 0; j < J; ++j)
-                Wk_f[j] *= args.q8_channel_scale(j);
-        }
-        else if (scalar_mode)
-        {
-            for (size_t j = 0; j < J; ++j)
-                Wk_f[j] *= scalar_weight_scale;
-        }
-        else if (weight_scales && block_size_k > 0 && blocks_k > 0)
-        {
-            const size_t blk = k / block_size_k;
-
-            for (size_t j = 0; j < J; ++j)
-            {
-                if (j < scale_rows && (is_q8_channel_dense_sidecar_args(args) || blk < blocks_k))
-                    Wk_f[j] *= is_q8_channel_dense_sidecar_args(args) ? weight_scales[j] :
-                        weight_scales[j * blocks_k + blk];
-            }
+            Wk_f[j] *= dec_route_weight_scale(plan, args, j, block_index);
         }
     }
 
@@ -589,90 +527,15 @@ ActivationDECResult compensate_activation_dec(
     uint64_t start = ggml::gemmini::cycle::read();
 
     ActivationDECResult result{};
-    bool native_h1 = false;
-    bool q8_h2 = false;
-    bool q8_hp1 = false;
-    bool q8_hp2 = false;
-    switch (args.weight_format)
+    const DecRoutePlan plan = resolve_dec_route_plan(args, WeightScaleInfoMode::Dec);
+    if (!plan.valid)
     {
-        case ggml_gemmini_args_t::im2p_weight_format_t::q8_h0:
-            log_dec_reject(layer, "q8_h0 is unsupported", args);
-            return result;
-        case ggml_gemmini_args_t::im2p_weight_format_t::q8_h1:
-            native_h1 = args.has_q8_h1_im2p_contract();
-            if (!native_h1)
-            {
-                log_dec_reject(layer, "invalid q8_h1 contract", args);
-                return result;
-            }
-            break;
-        case ggml_gemmini_args_t::im2p_weight_format_t::q8_h2:
-            q8_h2 = args.has_q8_h2_im2p_contract();
-            if (!q8_h2)
-            {
-                log_dec_reject(layer, "invalid q8_h2 contract", args);
-                return result;
-            }
-            break;
-        case ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1:
-            q8_hp1 = has_q8_hp1_native_dec_contract(args);
-            if (q8_hp1) {
-                // Ponytail: gates against malformed padding/finiteness gracefully
-                // (the generic ggml_validate_row_data(Q8_HP*) is now a no-op for
-                // performance). Kept narrow: only padding + NaN/Inf, no per-qs loop.
-                for (size_t i = 0; i < args.q8_hp1_block_count; ++i) {
-                    const block_q8_hp1 & b = args.q8_hp1_blocks[i];
-                    if (b.padding[0] != 0 || b.padding[1] != 0 ||
-                        !std::isfinite(b.channel_scale)) {
-                        log_dec_reject(layer, "invalid q8_hp1 block metadata", args);
-                        return result;
-                    }
-                }
-            } else {
-                log_dec_reject(layer, "invalid q8_hp1 contract", args);
-                return result;
-            }
-            break;
-        case ggml_gemmini_args_t::im2p_weight_format_t::q8_hp2:
-            q8_hp2 = has_q8_hp2_native_dec_contract(args);
-            if (q8_hp2) {
-                // Ponytail: same gating rationale as Q8_HP1 sibling above.
-                for (size_t i = 0; i < args.q8_hp2_block_count; ++i) {
-                    const block_q8_hp2 & b = args.q8_hp2_blocks[i];
-                    if (b.padding[0] != 0 || b.padding[1] != 0 ||
-                        !std::isfinite(b.channel_scale)) {
-                        log_dec_reject(layer, "invalid q8_hp2 block metadata", args);
-                        return result;
-                    }
-                }
-            } else {
-                log_dec_reject(layer, "invalid q8_hp2 contract", args);
-                return result;
-            }
-            break;
-        case ggml_gemmini_args_t::im2p_weight_format_t::q8_channel:
-            if (!args.has_q8_channel_direct_read_contract())
-            {
-                log_dec_reject(layer, "invalid q8_channel contract", args);
-                return result;
-            }
-            break;
-        case ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar:
-            if (!args.has_q8_channel_dense_sidecar_contract())
-            {
-                log_dec_reject(layer, "invalid q8_channel_dense_sidecar contract", args);
-                return result;
-            }
-            break;
-        case ggml_gemmini_args_t::im2p_weight_format_t::q8_0_unpacked_to_h1:
-            break;
-        default:
-            log_dec_reject(layer, "unsupported weight format", args);
-            return result;
+        log_dec_reject(layer, plan.reject_reason, args);
+        return result;
     }
 
     const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
-    if ((!weights && !native_h1 && !q8_hp1 && !q8_hp2 && !q8_h2) || !args.f_out)
+    if ((!weights && !plan.native_weight_blocks) || !args.f_out)
     {
         log_dec_reject(layer, "missing weight or output buffer", args);
         return result;
@@ -688,27 +551,22 @@ ActivationDECResult compensate_activation_dec(
         return result;
     }
 
-    const size_t weight_stride = resolve_weight_stride_elems(args);
-    if (weight_stride == 0)
+    if (plan.weight_stride == 0)
     {
         log_dec_reject(layer, "zero weight stride", args);
         return result;
     }
 
-    const WeightLayout weight_layout = resolve_weight_layout(args);
-    const size_t minimum_weight_stride = weight_layout == WeightLayout::KxJ_RowMajor ? J : K;
-    if (weights && weight_stride < minimum_weight_stride)
+    const size_t minimum_weight_stride = plan.layout == WeightLayout::KxJ_RowMajor ? J : K;
+    if (weights && !plan.native_weight_blocks && plan.weight_stride < minimum_weight_stride)
     {
         log_dec_reject(layer, "weight stride is shorter than logical row", args);
         return result;
     }
 
-    const WeightScaleInfo weight_scales = build_weight_scale_info(
-        args,
-        WeightScaleInfoMode::Dec);
     auto activation_scales_vec = act::activation_scales(args, I);
     const float *activation_scales = activation_scales_vec.data();
-    if (!has_required_dec_scale_metadata(weight_scales, args))
+    if (!dec_route_covers_k(plan, K))
     {
         log_dec_reject(layer, "unsupported or incomplete weight scale metadata", args);
         return result;
@@ -770,29 +628,24 @@ ActivationDECResult compensate_activation_dec(
     start = ggml::gemmini::cycle::read();
 
     const bool use_jmajor_blocked =
-        !native_h1 &&
-        !q8_hp1 &&
-        !q8_hp2 &&
-        !q8_h2 &&
-        !is_q8_channel_dense_sidecar_args(args) &&
-        !weight_scales.scalar_mode &&
-        !weight_scales.row_header_mode &&
-        weight_layout == WeightLayout::JxK_ColMajor &&
-        weight_stride >= K;
+        plan.route == DecWeightRoute::Dense &&
+        !plan.scales.scalar_mode &&
+        !plan.scales.row_header_mode &&
+        plan.layout == WeightLayout::JxK_ColMajor &&
+        plan.weight_stride >= K;
 
 #if LOG_DEBUG
     const char *route = decode ? (use_jmajor_blocked ? "decode-jmajor-blocked" : "decode-fallback") :
         (use_jmajor_blocked ? "prefill-jmajor-blocked" : "prefill-fallback");
     ggml::gemmini::log::debug(
         layer,
-        "[dec.route] route=%s I=%zu K=%zu J=%zu scale_mode=%s",
+        "[dec.route] route=%s weight_route=%s I=%zu K=%zu J=%zu scale_mode=%s",
         route,
+        dec_route_name(plan),
         I,
         K,
         J,
-        weight_scales.scalar_mode ? "scalar" :
-            (weight_scales.row_header_mode ? "row-header" :
-                (weight_scales.channel_mode ? "channel" : "block")));
+        dec_scale_mode_name(plan));
     ggml::gemmini::log::debug(
         layer,
         "[dec.work] selected=%zu nnz=%zu unique_k=%zu output_stride_row=%zu output_stride_col=%zu",
@@ -809,10 +662,7 @@ ActivationDECResult compensate_activation_dec(
         {
             accumulate_single_row_to_ycom_jmajor_blocked(
                 args,
-                weight_scales.data,
-                weight_scales.rows,
-                weight_scales.cols,
-                weight_scales.block_size,
+                plan,
                 J,
                 activation_scales,
                 scr.unique_k,
@@ -830,13 +680,7 @@ ActivationDECResult compensate_activation_dec(
                 load_weight_row_scaled(
                     k_sz,
                     args,
-                    weight_scales.data,
-                    weight_scales.rows,
-                    weight_scales.cols,
-                    weight_scales.block_size,
-                    weight_scales.scalar_mode,
-                    weight_scales.row_header_mode,
-                    weight_scales.scalar,
+                    plan,
                     scr.Wk_f.data());
 
                 accumulate_single_row_delta_to_ycom(
@@ -852,10 +696,7 @@ ActivationDECResult compensate_activation_dec(
     {
         accumulate_to_ycom_jmajor_blocked(
             args,
-            weight_scales.data,
-            weight_scales.rows,
-            weight_scales.cols,
-            weight_scales.block_size,
+            plan,
             I,
             J,
             activation_scales,
@@ -875,13 +716,7 @@ ActivationDECResult compensate_activation_dec(
             load_weight_row_scaled(
                 k_sz,
                 args,
-                weight_scales.data,
-                weight_scales.rows,
-                weight_scales.cols,
-                weight_scales.block_size,
-                weight_scales.scalar_mode,
-                weight_scales.row_header_mode,
-                weight_scales.scalar,
+                plan,
                 scr.Wk_f.data());
 
             accumulate_to_ycom(
@@ -904,7 +739,7 @@ ActivationDECResult compensate_activation_dec(
     const bool validation_ready = capture_output(args, validation_output_before) &&
         accumulate_scalar_reference(
             args,
-            weight_scales,
+            plan,
             activation_scales,
             scr.unique_k,
             scr.rk_offs,

@@ -1,5 +1,6 @@
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
 #include "../ggml/src/ggml-gemmini/quants/dec/dec.hpp"
+#include "../ggml/src/ggml-gemmini/quants/dec/dec_internal.hpp"
 #include "../ggml/src/ggml-gemmini/quants/dec/dec_kernel.hpp"
 
 #include <cmath>
@@ -50,6 +51,63 @@ bool test_noop() {
     return check(result.total_selected == 0 && result.nnz == 0 && result.unique_k_count == 0,
                  "no-op result") &&
         check(output == std::vector<float>({ 3.0f, -2.0f, 7.0f, 11.0f }), "no-op output");
+}
+
+bool test_route_plan() {
+    const std::vector<int8_t> weights = { 1, 2, 3, 4, 5, 6 };
+    std::vector<float> output(2, 0.0f);
+    ggml_gemmini_args_t scalar_args = dense_args(1, 2, 3, weights, output, 0.5f);
+    const auto scalar_plan = ggml::gemmini::quants::dec::resolve_dec_route_plan(
+        scalar_args,
+        ggml::gemmini::quants::dec::WeightScaleInfoMode::Dec);
+    bool ok = check(scalar_plan.valid &&
+                        scalar_plan.route == ggml::gemmini::quants::dec::DecWeightRoute::Dense &&
+                        scalar_plan.layout == ggml::gemmini::quants::dec::WeightLayout::KxJ_RowMajor &&
+                        scalar_plan.weight_stride == 2 && scalar_plan.scales.scalar_mode,
+                    "scalar route plan") &&
+        check(std::string(ggml::gemmini::quants::dec::dec_route_name(scalar_plan)) == "tensor-scalar",
+              "scalar route name");
+
+    const std::vector<float> block_scales = { 0.25f, 0.5f };
+    ggml_gemmini_args_t block_args = dense_args(1, 2, 3, weights, output, 1.0f);
+    block_args.weight_i8_scale_active = false;
+    block_args.B_scales = block_scales.data();
+    block_args.blocks_J = 2;
+    block_args.blocks_K = 1;
+    block_args.block_size_k = 3;
+    const auto block_plan = ggml::gemmini::quants::dec::resolve_dec_route_plan(
+        block_args,
+        ggml::gemmini::quants::dec::WeightScaleInfoMode::Dec);
+    ok = check(block_plan.valid && !block_plan.scales.scalar_mode && block_plan.scales.block_size == 3 &&
+                   ggml::gemmini::quants::dec::dec_route_covers_k(block_plan, 3),
+               "block route plan") && ok;
+
+    const std::vector<float> channel_scales = { 0.25f, 0.5f };
+    ggml_gemmini_args_t sidecar_args = dense_args(1, 2, 3, weights, output, 1.0f);
+    sidecar_args.weight_i8_scale_active = false;
+    sidecar_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar;
+    sidecar_args.sB = 3;
+    sidecar_args.weight_channel_scales = channel_scales.data();
+    sidecar_args.weight_channel_scale_count = 2;
+    const auto sidecar_plan = ggml::gemmini::quants::dec::resolve_dec_route_plan(
+        sidecar_args,
+        ggml::gemmini::quants::dec::WeightScaleInfoMode::Dec);
+    ok = check(sidecar_plan.valid &&
+                   sidecar_plan.route == ggml::gemmini::quants::dec::DecWeightRoute::Q8ChannelSidecar &&
+                   sidecar_plan.scales.channel_mode,
+               "channel sidecar route plan") && ok;
+
+    ggml_gemmini_args_t h0_args = scalar_args;
+    h0_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h0;
+    const auto h0_plan = ggml::gemmini::quants::dec::resolve_dec_route_plan(
+        h0_args,
+        ggml::gemmini::quants::dec::WeightScaleInfoMode::Dec);
+    ggml_gemmini_args_t malformed_channel_args = scalar_args;
+    malformed_channel_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_channel;
+    const auto malformed_channel_plan = ggml::gemmini::quants::dec::resolve_dec_route_plan(
+        malformed_channel_args,
+        ggml::gemmini::quants::dec::WeightScaleInfoMode::Dec);
+    return check(!h0_plan.valid && !malformed_channel_plan.valid, "unsupported and malformed route plans") && ok;
 }
 
 bool test_repeated_residuals() {
@@ -176,7 +234,7 @@ bool test_thread_clamp() {
 }
 
 int main() {
-    const bool ok = test_noop() && test_repeated_residuals() && test_decode_repeated_residuals() && test_output_strides() &&
+    const bool ok = test_noop() && test_route_plan() && test_repeated_residuals() && test_decode_repeated_residuals() && test_output_strides() &&
         test_malformed_reject() && test_thread_clamp();
     std::printf("gemmini DEC baseline: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

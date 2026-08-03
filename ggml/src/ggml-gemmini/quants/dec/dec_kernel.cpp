@@ -81,10 +81,7 @@ namespace
     inline void accumulate_j_block(
         size_t jb,
         const ggml_gemmini_args_t &args,
-        const float *scale_base,
-        size_t block_size_k,
-        size_t blocks_k,
-        size_t scale_rows,
+        const DecRoutePlan &plan,
         size_t I,
         size_t J,
         const float *activation_scales,
@@ -98,15 +95,13 @@ namespace
         if (!weights)
             return;
 
-        const size_t weight_stride = resolve_weight_stride_elems(args);
         const size_t block_width = std::min(kBlockedJWidth, J - jb);
         std::fill(y_block.begin(), y_block.begin() + I * block_width, 0.0f);
 
         for (size_t t = 0; t < block_width; ++t)
         {
             const size_t j = jb + t;
-            const int8_t *weight_row = weights + j * weight_stride;
-            const float *scale_row = (scale_base && j < scale_rows) ? scale_base + j * blocks_k : nullptr;
+            const int8_t *weight_row = weights + j * plan.weight_stride;
 
             for (int k : unique_k)
             {
@@ -123,12 +118,7 @@ namespace
                     continue;
 
                 float weight = static_cast<float>(weight_row[k_sz]);
-                if (scale_row && block_size_k > 0)
-                {
-                    const size_t blk = k_sz / block_size_k;
-                    if (blk < blocks_k)
-                        weight *= scale_row[blk];
-                }
+                weight *= dec_route_weight_scale(plan, args, j, k_sz / plan.scales.block_size);
 
                 for (size_t p = beg; p < end; ++p)
                 {
@@ -149,10 +139,7 @@ namespace
     inline void accumulate_single_row_j_block(
         size_t jb,
         const ggml_gemmini_args_t &args,
-        const float *scale_base,
-        size_t block_size_k,
-        size_t blocks_k,
-        size_t scale_rows,
+        const DecRoutePlan &plan,
         size_t J,
         const float *activation_scales,
         const std::vector<int> &unique_k,
@@ -164,15 +151,13 @@ namespace
         if (!weights)
             return;
 
-        const size_t weight_stride = resolve_weight_stride_elems(args);
         const size_t block_width = std::min(kDecodeJWidth, J - jb);
         std::fill(y_block.begin(), y_block.begin() + block_width, 0.0f);
 
         for (size_t t = 0; t < block_width; ++t)
         {
             const size_t j = jb + t;
-            const int8_t *weight_row = weights + j * weight_stride;
-            const float *scale_row = (scale_base && j < scale_rows) ? scale_base + j * blocks_k : nullptr;
+            const int8_t *weight_row = weights + j * plan.weight_stride;
 
             for (int k : unique_k)
             {
@@ -191,12 +176,7 @@ namespace
                 const float delta = static_cast<float>(delta_i64) * activation_scale;
 
                 float weight = static_cast<float>(weight_row[k_sz]);
-                if (scale_row && block_size_k > 0)
-                {
-                    const size_t blk = k_sz / block_size_k;
-                    if (blk < blocks_k)
-                        weight *= scale_row[blk];
-                }
+                weight *= dec_route_weight_scale(plan, args, j, k_sz / plan.scales.block_size);
 
                 y_block[t] += delta * weight;
             }
@@ -210,10 +190,7 @@ namespace
 
 void accumulate_to_ycom_jmajor_blocked(
     const ggml_gemmini_args_t &args,
-    const float *weight_scales,
-    size_t scale_rows,
-    size_t blocks_k,
-    size_t block_size_k,
+    const DecRoutePlan &plan,
     size_t I,
     size_t J,
     const float *activation_scales,
@@ -226,8 +203,7 @@ void accumulate_to_ycom_jmajor_blocked(
     if (!weights || !rk_pairs || !Y_com || I == 0 || J == 0)
         return;
 
-    const size_t weight_stride = resolve_weight_stride_elems(args);
-    if (resolve_weight_layout(args) != WeightLayout::JxK_ColMajor || weight_stride < args.K)
+    if (plan.layout != WeightLayout::JxK_ColMajor || plan.weight_stride < args.K)
         return;
 
     const size_t block_count = (J + kBlockedJWidth - 1) / kBlockedJWidth;
@@ -241,7 +217,7 @@ void accumulate_to_ycom_jmajor_blocked(
         for (ptrdiff_t jb_idx = 0; jb_idx < static_cast<ptrdiff_t>(block_count); ++jb_idx)
         {
             const size_t jb = static_cast<size_t>(jb_idx) * kBlockedJWidth;
-            accumulate_j_block(jb, args, weight_scales, block_size_k, blocks_k, scale_rows, I, J, activation_scales, unique_k, rk_offs, rk_pairs, Y_com, y_block);
+            accumulate_j_block(jb, args, plan, I, J, activation_scales, unique_k, rk_offs, rk_pairs, Y_com, y_block);
         }
     }
 #else
@@ -249,17 +225,14 @@ void accumulate_to_ycom_jmajor_blocked(
     for (size_t jb_idx = 0; jb_idx < block_count; ++jb_idx)
     {
         const size_t jb = jb_idx * kBlockedJWidth;
-        accumulate_j_block(jb, args, weight_scales, block_size_k, blocks_k, scale_rows, I, J, activation_scales, unique_k, rk_offs, rk_pairs, Y_com, y_block);
+        accumulate_j_block(jb, args, plan, I, J, activation_scales, unique_k, rk_offs, rk_pairs, Y_com, y_block);
     }
 #endif
 }
 
 void accumulate_single_row_to_ycom_jmajor_blocked(
     const ggml_gemmini_args_t &args,
-    const float *weight_scales,
-    size_t scale_rows,
-    size_t blocks_k,
-    size_t block_size_k,
+    const DecRoutePlan &plan,
     size_t J,
     const float *activation_scales,
     const std::vector<int> &unique_k,
@@ -270,8 +243,7 @@ void accumulate_single_row_to_ycom_jmajor_blocked(
     if (!weights || !Y_com || J == 0)
         return;
 
-    const size_t weight_stride = resolve_weight_stride_elems(args);
-    if (resolve_weight_layout(args) != WeightLayout::JxK_ColMajor || weight_stride < args.K)
+    if (plan.layout != WeightLayout::JxK_ColMajor || plan.weight_stride < args.K)
         return;
 
     const size_t block_count = (J + kDecodeJWidth - 1) / kDecodeJWidth;
@@ -280,7 +252,7 @@ void accumulate_single_row_to_ycom_jmajor_blocked(
     for (size_t jb_idx = 0; jb_idx < block_count; ++jb_idx)
     {
         const size_t jb = jb_idx * kDecodeJWidth;
-        accumulate_single_row_j_block(jb, args, weight_scales, block_size_k, blocks_k, scale_rows, J, activation_scales, unique_k, delta_by_k, Y_com, y_block);
+        accumulate_single_row_j_block(jb, args, plan, J, activation_scales, unique_k, delta_by_k, Y_com, y_block);
     }
 }
 

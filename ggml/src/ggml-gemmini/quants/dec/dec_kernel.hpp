@@ -9,14 +9,13 @@ struct ggml_gemmini_args_t;
 
 namespace ggml::gemmini::quants::dec
 {
+struct DecRoutePlan;
+
 int resolve_dec_threads(size_t task_count, int omp_max_threads);
 
 void accumulate_to_ycom_jmajor_blocked(
     const ggml_gemmini_args_t &args,
-    const float *weight_scales,
-    size_t scale_rows,
-    size_t blocks_k,
-    size_t block_size_k,
+    const DecRoutePlan &plan,
     size_t I,
     size_t J,
     const float *activation_scales,
@@ -27,10 +26,7 @@ void accumulate_to_ycom_jmajor_blocked(
 
 void accumulate_single_row_to_ycom_jmajor_blocked(
     const ggml_gemmini_args_t &args,
-    const float *weight_scales,
-    size_t scale_rows,
-    size_t blocks_k,
-    size_t block_size_k,
+    const DecRoutePlan &plan,
     size_t J,
     const float *activation_scales,
     const std::vector<int> &unique_k,
