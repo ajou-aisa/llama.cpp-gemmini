@@ -90,6 +90,7 @@ namespace ggml::gemmini::quants::dec
         bool scalar_mode = false;
         bool row_header_mode = false;
         bool channel_mode = false;
+        bool on_demand_mode = false;
         bool supported = true;
     };
 

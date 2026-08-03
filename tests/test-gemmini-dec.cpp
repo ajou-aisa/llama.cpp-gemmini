@@ -578,10 +578,15 @@ bool run_hierarchical_case(
     const auto result = ggml::gemmini::quants::dec::compensate_activation_dec(outliers, args, "test");
 
     bool ok = check(plan.valid && plan.native_weight_blocks &&
-                        std::string(ggml::gemmini::quants::dec::dec_route_name(plan)) == expected_route,
-                    "hierarchical route plan") &&
+                         std::string(ggml::gemmini::quants::dec::dec_route_name(plan)) == expected_route,
+                     "hierarchical route plan") &&
         check(result.total_selected == outliers.size() && result.nnz == outliers.size(),
-              "hierarchical route result");
+               "hierarchical route result");
+    if (plan.route == ggml::gemmini::quants::dec::DecWeightRoute::Q8H1 ||
+        plan.route == ggml::gemmini::quants::dec::DecWeightRoute::Q8HP1) {
+        ok = check(plan.scales.on_demand_mode && plan.scales.data == nullptr,
+                   "H1/HP1 DEC scales stay tile-local") && ok;
+    }
     for (size_t index = 0; index < expected.size(); ++index)
         ok = check(close_enough(args.f_out[index], expected[index]), "hierarchical route output") && ok;
 

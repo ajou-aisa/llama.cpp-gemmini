@@ -78,13 +78,21 @@ quants::dec::WeightScaleInfo build_weight_scale_info_impl(
     }
 
     if (quants::dec::is_q8_hp1_args(args)) {
-        static thread_local std::vector<float> weight_scales;
         const size_t rows = args.J;
         const size_t cols = args.q8_hp1_blocks_per_row;
         size_t scale_count = 0;
         if (rows == 0 || cols == 0 || !checked_mul_size(rows, cols, scale_count))
             return result;
 
+        if (mode == quants::dec::WeightScaleInfoMode::Dec) {
+            result.rows = rows;
+            result.cols = cols;
+            result.block_size = QK8_HP;
+            result.on_demand_mode = true;
+            return result;
+        }
+
+        static thread_local std::vector<float> weight_scales;
         weight_scales.resize(scale_count);
         for (size_t row = 0; row < rows; ++row) {
             for (size_t block = 0; block < cols; ++block) {
@@ -187,6 +195,14 @@ quants::dec::WeightScaleInfo build_weight_scale_info_impl(
         if (!native_h1 && !stripe_mode && (!args.s_rf || !args.R))
             return result;
 
+        if (mode == quants::dec::WeightScaleInfoMode::Dec) {
+            result.rows = rows;
+            result.cols = cols;
+            result.block_size = block_size;
+            result.on_demand_mode = true;
+            return result;
+        }
+
         scratch.weight_scales.resize(scale_count);
         for (size_t j = 0; j < rows; ++j) {
             const size_t stripe_idx = stripe_mode ? (j / args.stripe_J) : 0;
@@ -263,7 +279,7 @@ bool has_complete_scale_metadata(
         return scales.rows >= args.J;
     if (scales.channel_mode)
         return scales.data != nullptr && scales.rows >= args.J;
-    return scales.data != nullptr && scales.rows >= args.J && scales.cols > 0 &&
+    return (scales.data != nullptr || scales.on_demand_mode) && scales.rows >= args.J && scales.cols > 0 &&
         scales.block_size > 0;
 }
 
@@ -480,6 +496,20 @@ float dec_route_weight_scale(
         return plan.scales.scalar;
     if (plan.scales.channel_mode)
         return plan.scales.data[j];
+    if (plan.route == DecWeightRoute::Q8H1) {
+        const block_q8_h1 *native = plan.native_weight_blocks ? args.q8_h1_block(j, block_index) : nullptr;
+        const uint64_t offset = native ? native->R :
+            (args.stripe_J > 1 ? args.R_stripe[j / args.stripe_J] : args.R[j]);
+        const uint64_t c_eff = (native ? native->c_b : args.c_b[j * args.blocks_per_row + block_index]) + offset;
+        const float s_rf = native ? native->s_rf :
+            (args.stripe_J > 1 ? args.s_rf_stripe[j / args.stripe_J] : args.s_rf[j]);
+        return static_cast<float>(static_cast<double>(s_rf) * static_cast<double>(c_eff));
+    }
+    if (plan.route == DecWeightRoute::Q8HP1) {
+        const block_q8_hp1 *block = args.q8_hp1_block(j, block_index);
+        return block->m == INT16_MIN ? 0.0f :
+            gemmini_ldexp_fast_pos(block->channel_scale, static_cast<int>(block->m));
+    }
     return plan.scales.data[j * plan.scales.cols + block_index];
 }
 
