@@ -148,6 +148,11 @@ bool test_active_row_groups() {
     std::vector<ActiveRowGroup> groups;
     ggml::gemmini::quants::dec::build_active_row_groups(entries, groups);
 
+    std::vector<size_t> group_offsets;
+    std::vector<size_t> group_row_group_indices;
+    ggml::gemmini::quants::dec::build_group_major_index(
+        groups, 2, group_offsets, group_row_group_indices);
+
     bool ok = check(groups.size() == 3, "one descriptor per active row-group");
     const std::array<std::pair<uint32_t, uint32_t>, 3> expected_groups = {
         std::pair<uint32_t, uint32_t>{ 0, 0 }, { 0, 1 }, { 1, 1 },
@@ -158,6 +163,9 @@ bool test_active_row_groups() {
                "second active row-group") && ok;
     ok = check(groups[2].row == expected_groups[2].first && groups[2].k_group == expected_groups[2].second,
                "third active row-group") && ok;
+    ok = check(group_offsets == std::vector<size_t>({ 0, 1, 3 }) &&
+                   group_row_group_indices == std::vector<size_t>({ 0, 1, 2 }),
+               "group-major index") && ok;
     for (const ActiveRowGroup &group : groups)
         ok = check(group.entry_begin < group.entry_end && group.entry_end <= entries.size(),
                    "active row-group entry range") && ok;
@@ -165,15 +173,26 @@ bool test_active_row_groups() {
     const auto ordered_entries = entries;
     std::reverse(entries.begin(), entries.end());
     ggml::gemmini::quants::dec::build_active_row_groups(entries, groups);
+    std::vector<size_t> reordered_group_offsets;
+    std::vector<size_t> reordered_group_row_group_indices;
+    ggml::gemmini::quants::dec::build_group_major_index(
+        groups, 2, reordered_group_offsets, reordered_group_row_group_indices);
     bool same_entries = entries.size() == ordered_entries.size();
     for (size_t i = 0; same_entries && i < entries.size(); ++i)
         same_entries = entries[i].row == ordered_entries[i].row &&
             entries[i].k == ordered_entries[i].k && entries[i].residual == ordered_entries[i].residual;
     ok = check(same_entries, "active row-group ordering is deterministic") && ok;
+    ok = check(reordered_group_offsets == group_offsets &&
+                   reordered_group_row_group_indices == group_row_group_indices,
+               "group-major index is deterministic") && ok;
 
     entries.clear();
     ggml::gemmini::quants::dec::build_active_row_groups(entries, groups);
-    return check(groups.empty(), "empty residual plan has no active row-groups") && ok;
+    ggml::gemmini::quants::dec::build_group_major_index(
+        groups, 0, group_offsets, group_row_group_indices);
+    return check(groups.empty() && group_offsets == std::vector<size_t>({ 0 }) &&
+                     group_row_group_indices.empty(),
+                 "empty residual plan has no active row-groups") && ok;
 }
 
 bool test_route_metadata_rejects() {

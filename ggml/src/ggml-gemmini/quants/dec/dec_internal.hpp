@@ -57,6 +57,29 @@ namespace ggml::gemmini::quants::dec
         }
     }
 
+    inline void build_group_major_index(
+        const std::vector<ActiveRowGroup> &groups,
+        size_t group_count,
+        std::vector<size_t> &group_offsets,
+        std::vector<size_t> &group_row_group_indices)
+    {
+        group_offsets.assign(group_count + 1, 0);
+        group_row_group_indices.resize(groups.size());
+
+        for (const ActiveRowGroup &group : groups)
+            ++group_offsets[static_cast<size_t>(group.k_group) + 1];
+        for (size_t group = 1; group < group_offsets.size(); ++group)
+            group_offsets[group] += group_offsets[group - 1];
+        for (size_t index = 0; index < groups.size(); ++index)
+        {
+            const size_t group = groups[index].k_group;
+            group_row_group_indices[group_offsets[group]++] = index;
+        }
+        for (size_t group = group_count; group > 0; --group)
+            group_offsets[group] = group_offsets[group - 1];
+        group_offsets[0] = 0;
+    }
+
     struct WeightScaleInfo
     {
         const float *data = nullptr;
