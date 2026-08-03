@@ -1,4 +1,5 @@
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
+#include "../ggml/src/ggml-gemmini/quants/common/dequant.hpp"
 #include "../ggml/src/ggml-gemmini/quants/dec/dec.hpp"
 #include "../ggml/src/ggml-gemmini/quants/dec/dec_internal.hpp"
 #include "../ggml/src/ggml-gemmini/quants/dec/dec_kernel.hpp"
@@ -13,6 +14,10 @@
 #include <limits>
 #include <string>
 #include <vector>
+
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+#include <omp.h>
+#endif
 
 namespace {
 
@@ -101,8 +106,26 @@ bool test_route_plan() {
                    sidecar_plan.scales.channel_mode,
                "channel sidecar route plan") && ok;
 
-    ggml_gemmini_args_t h0_args = scalar_args;
+    const std::vector<int8_t> h0_weights(10, 1);
+    const std::vector<float> h0_scales = { 0.5f, 0.25f, 1.0f, 2.0f };
+    std::vector<float> h0_output(2, 0.0f);
+    ggml_gemmini_args_t h0_args = dense_args(1, 2, 5, h0_weights, h0_output, 1.0f);
+    h0_args.weight_i8_scale_active = false;
     h0_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h0;
+    h0_args.B_scales = h0_scales.data();
+    h0_args.blocks_J = 2;
+    h0_args.blocks_K = 2;
+    h0_args.block_size_k = 3;
+    const auto h0_common_plan = ggml::gemmini::quants::dec::resolve_dec_route_plan(
+        h0_args,
+        ggml::gemmini::quants::dec::WeightScaleInfoMode::CommonOutput);
+    const std::array<int32_t, 2> h0_accumulator = { 4, -2 };
+    ggml::gemmini::dequantize(h0_args, 3, 2, h0_accumulator.data(), h0_accumulator.size());
+    ok = check(h0_common_plan.valid &&
+                   h0_common_plan.route == ggml::gemmini::quants::dec::DecWeightRoute::Dense &&
+                   close_enough(h0_output[0], 1.0f) && close_enough(h0_output[1], -4.0f),
+               "q8_h0 common-output partial block") && ok;
+
     const auto h0_plan = ggml::gemmini::quants::dec::resolve_dec_route_plan(
         h0_args,
         ggml::gemmini::quants::dec::WeightScaleInfoMode::Dec);
@@ -112,6 +135,57 @@ bool test_route_plan() {
         malformed_channel_args,
         ggml::gemmini::quants::dec::WeightScaleInfoMode::Dec);
     return check(!h0_plan.valid && !malformed_channel_plan.valid, "unsupported and malformed route plans") && ok;
+}
+
+bool test_route_metadata_rejects() {
+    std::array<block_q8_h1, 2> h1_blocks{};
+    std::vector<int8_t> mixed_h1_weights(64, 1);
+    std::vector<float> h1_output(1, 3.0f);
+    ggml_gemmini_args_t h1_args{};
+    h1_args.I = 1;
+    h1_args.J = 1;
+    h1_args.K = 64;
+    h1_args.B = reinterpret_cast<elem_t *>(mixed_h1_weights.data());
+    h1_args.sB = 64;
+    h1_args.f_out = h1_output.data();
+    h1_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1;
+    h1_args.q8_h1_blocks = h1_blocks.data();
+    h1_args.q8_h1_block_count = h1_blocks.size();
+    h1_args.q8_h1_rows = 1;
+    h1_args.blocks_per_row = 2;
+    h1_args.blocks_K = 2;
+    h1_args.block_size_k = QK8_0;
+    h1_args.weight_i8_scale_active = true;
+    h1_args.weight_scale = 0.5f;
+    const auto mixed_h1_plan = ggml::gemmini::quants::dec::resolve_dec_route_plan(
+        h1_args,
+        ggml::gemmini::quants::dec::WeightScaleInfoMode::Dec);
+    const auto mixed_h1_result = ggml::gemmini::quants::dec::compensate_activation_dec(
+        { { 0, 33, 7 } }, h1_args, "test");
+    bool ok = check(!mixed_h1_plan.valid && mixed_h1_result.total_selected == 0 && h1_output[0] == 3.0f,
+                    "q8_h1 rejects scalar scale metadata beyond first block");
+
+    const std::vector<int8_t> weights(10, 1);
+    const std::vector<float> surplus_scales(6, 0.25f);
+    std::vector<float> output(2, 0.0f);
+    ggml_gemmini_args_t surplus_args = dense_args(1, 2, 5, weights, output, 1.0f);
+    surplus_args.weight_i8_scale_active = false;
+    surplus_args.B_scales = surplus_scales.data();
+    surplus_args.blocks_J = 2;
+    surplus_args.blocks_K = 3;
+    surplus_args.block_size_k = 3;
+    const auto surplus_dec_plan = ggml::gemmini::quants::dec::resolve_dec_route_plan(
+        surplus_args,
+        ggml::gemmini::quants::dec::WeightScaleInfoMode::Dec);
+    const auto surplus_common_plan = ggml::gemmini::quants::dec::resolve_dec_route_plan(
+        surplus_args,
+        ggml::gemmini::quants::dec::WeightScaleInfoMode::CommonOutput);
+    size_t partial_block = 0;
+    ok = check(!surplus_dec_plan.valid && surplus_common_plan.valid &&
+                   ggml::gemmini::quants::dec::dec_route_block_for_range(
+                       surplus_common_plan, 3, 2, partial_block) && partial_block == 1,
+               "DEC rejects surplus scales while common output keeps partial blocks") && ok;
+    return ok;
 }
 
 bool test_repeated_residuals() {
@@ -486,6 +560,44 @@ bool test_q8_h1_hierarchical_route() {
     return ok;
 }
 
+bool test_q8_h1_large_effective_scale() {
+    constexpr size_t repeats = 520;
+    std::array<block_q8_h1, kHierarchicalColumns * kHierarchicalBlocksPerRow> blocks{};
+    for (block_q8_h1 &block : blocks) {
+        for (int8_t &code : block.qs)
+            code = 127;
+        block.c_b = 1;
+        block.R = std::numeric_limits<uint16_t>::max();
+        block.s_rf = 1.0f / 65536.0f;
+    }
+
+    std::vector<ggml::gemmini::quants::QactOutlier> prefill_outliers;
+    prefill_outliers.reserve(repeats * 2);
+    for (size_t repeat = 0; repeat < repeats; ++repeat) {
+        prefill_outliers.push_back({ 0, 1, std::numeric_limits<int32_t>::max() });
+        prefill_outliers.push_back({ 1, 33, -std::numeric_limits<int32_t>::max() });
+    }
+
+    std::vector<float> prefill_output(kHierarchicalRows * kHierarchicalColumns, 0.0f);
+    ggml_gemmini_args_t args = hierarchical_args(kHierarchicalRows, prefill_output);
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1;
+    args.q8_h1_blocks = blocks.data();
+    args.q8_h1_block_count = blocks.size();
+    args.q8_h1_rows = kHierarchicalColumns;
+    bool ok = run_hierarchical_case(
+        "q8-h1", args, prefill_outliers,
+        h1_expected(blocks, kHierarchicalRows, prefill_outliers));
+
+    std::vector<ggml::gemmini::quants::QactOutlier> decode_outliers(
+        repeats, { 0, 33, std::numeric_limits<int32_t>::max() });
+    std::vector<float> decode_output(kHierarchicalColumns, 0.0f);
+    args.I = 1;
+    args.f_out = decode_output.data();
+    return run_hierarchical_case(
+               "q8-h1", args, decode_outliers,
+               h1_expected(blocks, 1, decode_outliers)) && ok;
+}
+
 bool test_q8_h2_hierarchical_route() {
     std::array<block_q8_h2, kHierarchicalColumns * kHierarchicalBlocksPerRow> blocks{};
     initialize_hierarchical_qs(blocks);
@@ -765,13 +877,42 @@ bool test_thread_determinism() {
     return ok;
 }
 
+bool test_inside_existing_openmp_region() {
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+    const char *previous = std::getenv("DEC_THREADS");
+    const std::string saved = previous ? previous : "";
+    const bool had_previous = previous != nullptr;
+
+    set_dec_threads("1");
+    const std::vector<float> expected = h1_thread_case(
+        kHierarchicalRows, kHierarchicalPrefillOutliers);
+    set_dec_threads("2");
+    std::vector<float> nested_output;
+    bool entered_parallel_region = false;
+#pragma omp parallel num_threads(2) shared(nested_output, entered_parallel_region)
+    {
+#pragma omp single
+        {
+            entered_parallel_region = omp_in_parallel() != 0;
+            nested_output = h1_thread_case(kHierarchicalRows, kHierarchicalPrefillOutliers);
+        }
+    }
+
+    set_dec_threads(had_previous ? saved.c_str() : nullptr);
+    return check(entered_parallel_region && byte_identical(nested_output, expected),
+                 "DEC invocation inside existing OpenMP region remains serial and correct");
+#else
+    return true;
+#endif
+}
+
 }
 
 int main() {
-    const bool ok = test_noop() && test_route_plan() && test_repeated_residuals() && test_decode_repeated_residuals() && test_integer_routes() && test_block_integer_route() &&
-        test_q8_h1_hierarchical_route() && test_q8_h2_hierarchical_route() && test_q8_hp1_hierarchical_route() && test_q8_hp2_hierarchical_route() &&
+    const bool ok = test_noop() && test_route_plan() && test_route_metadata_rejects() && test_repeated_residuals() && test_decode_repeated_residuals() && test_integer_routes() && test_block_integer_route() &&
+        test_q8_h1_hierarchical_route() && test_q8_h1_large_effective_scale() && test_q8_h2_hierarchical_route() && test_q8_hp1_hierarchical_route() && test_q8_hp2_hierarchical_route() &&
         test_malformed_hierarchical_reject() && test_output_strides() && test_malformed_reject() && test_thread_clamp() &&
-        test_thread_determinism();
+        test_thread_determinism() && test_inside_existing_openmp_region();
     std::printf("gemmini DEC baseline: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

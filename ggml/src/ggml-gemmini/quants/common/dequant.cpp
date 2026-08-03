@@ -269,6 +269,7 @@ bool has_complete_scale_metadata(
 
 quants::dec::DecWeightRoute classify_route(
     const ggml_gemmini_args_t &args,
+    quants::dec::WeightScaleInfoMode mode,
     const char *&reject_reason,
     bool &native_weight_blocks)
 {
@@ -287,6 +288,8 @@ quants::dec::DecWeightRoute classify_route(
     switch (args.weight_format)
     {
         case ggml_gemmini_args_t::im2p_weight_format_t::q8_h0:
+            if (mode == quants::dec::WeightScaleInfoMode::CommonOutput)
+                return Route::Dense;
             reject_reason = "q8_h0 is unsupported";
             return Route::Unsupported;
         case ggml_gemmini_args_t::im2p_weight_format_t::q8_h1:
@@ -377,7 +380,7 @@ DecRoutePlan resolve_dec_route_plan(
     WeightScaleInfoMode mode)
 {
     DecRoutePlan plan{};
-    plan.route = classify_route(args, plan.reject_reason, plan.native_weight_blocks);
+    plan.route = classify_route(args, mode, plan.reject_reason, plan.native_weight_blocks);
     if (plan.route == DecWeightRoute::Unsupported)
         return plan;
 
@@ -391,6 +394,23 @@ DecRoutePlan resolve_dec_route_plan(
     {
         plan.reject_reason = "unsupported or incomplete weight scale metadata";
         return plan;
+    }
+
+    const bool block_scales = !plan.scales.scalar_mode && !plan.scales.row_header_mode &&
+        !plan.scales.channel_mode;
+    if (plan.route == DecWeightRoute::Q8H1 && !block_scales)
+    {
+        plan.reject_reason = "q8_h1 requires hierarchical block scales";
+        return plan;
+    }
+    if (mode == WeightScaleInfoMode::Dec && block_scales)
+    {
+        const size_t required_scale_cols = args.K == 0 ? 0 : 1 + (args.K - 1) / plan.scales.block_size;
+        if (plan.scales.cols != required_scale_cols)
+        {
+            plan.reject_reason = "weight scale metadata must exactly cover K";
+            return plan;
+        }
     }
 
     plan.valid = true;

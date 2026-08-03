@@ -67,8 +67,23 @@ namespace
         const size_t tile_count = dec_int64_j_tile_count(J);
         const size_t tile_capacity = std::min(J, kDecInt64JTileWidth);
 
+        const auto run_serial = [&]()
+        {
+            std::vector<int64_t> accumulator(I * tile_capacity);
+            for (size_t tile_index = 0; tile_index < tile_count; ++tile_index)
+            {
+                const size_t jb = tile_index * kDecInt64JTileWidth;
+                tile_work(jb, std::min(kDecInt64JTileWidth, J - jb), accumulator);
+            }
+        };
+
 #if defined(GGML_GEMMINI_HAS_OPENMP)
         const int dec_threads = resolve_dec_threads(tile_count);
+        if (dec_threads == 1 || omp_in_parallel() != 0)
+        {
+            run_serial();
+            return;
+        }
 #pragma omp parallel num_threads(dec_threads)
         {
             std::vector<int64_t> accumulator(I * tile_capacity);
@@ -80,13 +95,28 @@ namespace
             }
         }
 #else
-        std::vector<int64_t> accumulator(I * tile_capacity);
-        for (size_t tile_index = 0; tile_index < tile_count; ++tile_index)
-        {
-            const size_t jb = tile_index * kDecInt64JTileWidth;
-            tile_work(jb, std::min(kDecInt64JTileWidth, J - jb), accumulator);
-        }
+        run_serial();
 #endif
+    }
+
+    std::vector<size_t> h1_active_blocks(
+        const ggml_gemmini_args_t &args,
+        const DecRoutePlan &plan,
+        const std::vector<int> &unique_k)
+    {
+        std::vector<size_t> blocks;
+        blocks.reserve(std::min(unique_k.size(), plan.scales.cols));
+        for (int k : unique_k)
+        {
+            if (k < 0 || static_cast<size_t>(k) >= args.K)
+                continue;
+            const size_t block = static_cast<size_t>(k) / plan.scales.block_size;
+            if (block < plan.scales.cols)
+                blocks.push_back(block);
+        }
+        std::sort(blocks.begin(), blocks.end());
+        blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
+        return blocks;
     }
 
     template <typename CodeFor, typename ScaleForColumn>
@@ -417,9 +447,10 @@ void accumulate_to_ycom_int64_h1(
         return;
 
     const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
+    const std::vector<size_t> active_blocks = h1_active_blocks(args, plan, unique_k);
     for_each_int64_j_tile(I, J, [&](size_t jb, size_t width, std::vector<int64_t> &accumulator)
     {
-        for (size_t block = 0; block < plan.scales.cols; ++block)
+        for (size_t block : active_blocks)
         {
             std::fill(accumulator.begin(), accumulator.begin() + I * width, int64_t {0});
             for (int k : unique_k)
@@ -443,10 +474,7 @@ void accumulate_to_ycom_int64_h1(
                         const block_q8_h1 *native = plan.native_weight_blocks ? args.q8_h1_block(j, block) : nullptr;
                         const int8_t code = native ? native->qs[k_index % QK8_0] :
                             weights[j * plan.weight_stride + k_index];
-                        const uint64_t offset = native ? native->R :
-                            (args.stripe_J > 1 ? args.R_stripe[j / args.stripe_J] : args.R[j]);
-                        const uint64_t c_eff = (native ? native->c_b : args.c_b[j * args.blocks_per_row + block]) + offset;
-                        const int64_t term = static_cast<int64_t>(pairs[p].second) * code * static_cast<int64_t>(c_eff);
+                        const int64_t term = static_cast<int64_t>(pairs[p].second) * code;
 #if DEC_VALIDATION
                         const __int128 checked_sum = static_cast<__int128>(output_acc[t]) + term;
                         if (checked_sum < std::numeric_limits<int64_t>::min() ||
@@ -467,9 +495,12 @@ void accumulate_to_ycom_int64_h1(
                 {
                     const size_t j = jb + t;
                     const block_q8_h1 *native = plan.native_weight_blocks ? args.q8_h1_block(j, block) : nullptr;
+                    const uint64_t offset = native ? native->R :
+                        (args.stripe_J > 1 ? args.R_stripe[j / args.stripe_J] : args.R[j]);
+                    const uint64_t c_eff = (native ? native->c_b : args.c_b[j * args.blocks_per_row + block]) + offset;
                     const float s_rf = native ? native->s_rf :
                         (args.stripe_J > 1 ? args.s_rf_stripe[j / args.stripe_J] : args.s_rf[j]);
-                    output[t] += static_cast<float>(static_cast<double>(row_acc[t]) * s_rf * activation_scale);
+                    output[t] += static_cast<float>(static_cast<double>(row_acc[t]) * c_eff * s_rf * activation_scale);
                 }
             }
         }
@@ -485,9 +516,10 @@ void accumulate_single_row_to_ycom_int64_h1(
         return;
 
     const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
+    const std::vector<size_t> active_blocks = h1_active_blocks(args, plan, unique_k);
     for_each_int64_j_tile(1, J, [&](size_t jb, size_t width, std::vector<int64_t> &accumulator)
     {
-        for (size_t block = 0; block < plan.scales.cols; ++block)
+        for (size_t block : active_blocks)
         {
             std::fill(accumulator.begin(), accumulator.begin() + width, int64_t {0});
             for (int k : unique_k)
@@ -504,11 +536,8 @@ void accumulate_single_row_to_ycom_int64_h1(
                     const block_q8_h1 *native = plan.native_weight_blocks ? args.q8_h1_block(j, block) : nullptr;
                     const int8_t code = native ? native->qs[k_index % QK8_0] :
                         weights[j * plan.weight_stride + k_index];
-                    const uint64_t offset = native ? native->R :
-                        (args.stripe_J > 1 ? args.R_stripe[j / args.stripe_J] : args.R[j]);
-                    const uint64_t c_eff = (native ? native->c_b : args.c_b[j * args.blocks_per_row + block]) + offset;
-                    const __int128 term = static_cast<__int128>(delta[k_index]) * code * c_eff;
 #if DEC_VALIDATION
+                    const __int128 term = static_cast<__int128>(delta[k_index]) * code;
                     const __int128 checked_sum = static_cast<__int128>(accumulator[t]) + term;
                     if (term < std::numeric_limits<int64_t>::min() ||
                         term > std::numeric_limits<int64_t>::max() ||
@@ -516,7 +545,7 @@ void accumulate_single_row_to_ycom_int64_h1(
                         checked_sum > std::numeric_limits<int64_t>::max())
                         std::abort();
 #endif
-                    accumulator[t] += static_cast<int64_t>(term);
+                    accumulator[t] += delta[k_index] * code;
                 }
             }
 
@@ -525,9 +554,12 @@ void accumulate_single_row_to_ycom_int64_h1(
             {
                 const size_t j = jb + t;
                 const block_q8_h1 *native = plan.native_weight_blocks ? args.q8_h1_block(j, block) : nullptr;
+                const uint64_t offset = native ? native->R :
+                    (args.stripe_J > 1 ? args.R_stripe[j / args.stripe_J] : args.R[j]);
+                const uint64_t c_eff = (native ? native->c_b : args.c_b[j * args.blocks_per_row + block]) + offset;
                 const float s_rf = native ? native->s_rf :
                     (args.stripe_J > 1 ? args.s_rf_stripe[j / args.stripe_J] : args.s_rf[j]);
-                Y_com[j] += static_cast<float>(static_cast<double>(accumulator[t]) * s_rf * activation_scale);
+                Y_com[j] += static_cast<float>(static_cast<double>(accumulator[t]) * c_eff * s_rf * activation_scale);
             }
         }
     });
