@@ -33,6 +33,12 @@ bool check(bool condition, const char *message) {
     return condition;
 }
 
+uint32_t float_bits(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
 ggml_gemmini_args_t dense_args(
     size_t rows,
     size_t cols,
@@ -633,6 +639,174 @@ bool test_q8_h1_hierarchical_route() {
     return ok;
 }
 
+bool test_q8_h1_preserves_ordered_scaling_bits() {
+    constexpr int32_t residual = 548339296;
+    constexpr uint8_t c_b = 86;
+    constexpr uint16_t R = 4095;
+    constexpr uint64_t c_eff = static_cast<uint64_t>(c_b) + R;
+    constexpr float s_rf = 0.00032747327350080013f;
+
+    block_q8_h1 block{};
+    block.qs[0] = 1;
+    block.c_b = c_b;
+    block.R = R;
+    block.s_rf = s_rf;
+
+    std::vector<float> output(1, 0.0f);
+    ggml_gemmini_args_t args{};
+    args.I = 1;
+    args.J = 1;
+    args.K = QK8_0;
+    args.f_out = output.data();
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1;
+    args.q8_h1_blocks = &block;
+    args.q8_h1_block_count = 1;
+    args.q8_h1_rows = 1;
+    args.blocks_per_row = 1;
+    args.blocks_K = 1;
+    args.blocks_J = 1;
+    args.block_size_k = QK8_0;
+
+    ggml::gemmini::quants::dec::compensate_activation_dec(
+        { { 0, 0, residual } }, args, "test");
+
+    const float baseline = static_cast<float>(
+        static_cast<double>(residual) * c_eff * s_rf * 1.0f);
+    const float combined = static_cast<float>(
+        static_cast<double>(residual) * 1.0f *
+        static_cast<float>(static_cast<double>(c_eff) * s_rf));
+    const float ordered = ggml::gemmini::quants::dec::apply_h1_scale_ordered(
+        residual, c_eff, s_rf, 1.0f);
+    return check(float_bits(combined) != float_bits(baseline),
+                 "H1 ordered-scale fixture distinguishes early FP32 combination") &&
+        check(float_bits(ordered) == float_bits(baseline),
+              "H1 ordered helper preserves baseline bits") &&
+        check(float_bits(output[0]) == float_bits(baseline),
+              "H1 grouped DEC preserves ordered scaling bits");
+}
+
+bool run_q8_h1_activation_scale_case(act::Meta meta, float activation_scale, const char *message) {
+    constexpr int32_t residual = 548339296;
+    constexpr uint8_t c_b = 86;
+    constexpr uint16_t R = 4095;
+    constexpr float s_rf = 0.00032747327350080013f;
+
+    block_q8_h1 block{};
+    block.qs[0] = 1;
+    block.c_b = c_b;
+    block.R = R;
+    block.s_rf = s_rf;
+
+    std::vector<float> output(1, 0.0f);
+    ggml_gemmini_args_t args{};
+    args.I = 1;
+    args.J = 1;
+    args.K = QK8_0;
+    args.f_out = output.data();
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1;
+    args.q8_h1_blocks = &block;
+    args.q8_h1_block_count = 1;
+    args.q8_h1_rows = 1;
+    args.blocks_per_row = 1;
+    args.blocks_K = 1;
+    args.blocks_J = 1;
+    args.block_size_k = QK8_0;
+    args.act_quant = std::move(meta);
+
+    ggml::gemmini::quants::dec::compensate_activation_dec(
+        { { 0, 0, residual } }, args, "test");
+    const uint64_t c_eff = static_cast<uint64_t>(c_b) + R;
+    const float expected = static_cast<float>(
+        static_cast<double>(residual) * c_eff * s_rf * activation_scale);
+    return check(float_bits(output[0]) == float_bits(expected), message);
+}
+
+bool test_q8_h1_activation_scale_routes_preserve_bits() {
+    bool ok = run_q8_h1_activation_scale_case({}, 1.0f, "H1 default activation scale bits");
+
+    act::Meta tensor_meta;
+    tensor_meta.storage().emplace<act::tensor::Meta>().scale = 0.5f;
+    ok = run_q8_h1_activation_scale_case(
+             std::move(tensor_meta), 0.5f, "H1 tensor activation scale bits") && ok;
+
+    act::Meta token_meta;
+    token_meta.storage().emplace<act::token::Meta>().scales = {0.5f};
+    ok = run_q8_h1_activation_scale_case(
+             std::move(token_meta), 0.5f, "H1 token activation scale bits") && ok;
+
+    act::Meta stripe_meta;
+    stripe_meta.storage().emplace<act::stripe::Meta>().scales = {0.5f};
+    ok = run_q8_h1_activation_scale_case(
+             std::move(stripe_meta), 0.5f, "H1 stripe activation scale bits") && ok;
+
+    act::Meta exsia_meta;
+    exsia_meta.storage().emplace<act::exsia::Meta>().theta = {-1};
+    return run_q8_h1_activation_scale_case(
+               std::move(exsia_meta), 0.5f, "H1 EXSIA activation scale bits") && ok;
+}
+
+bool run_unpacked_h1_tail_case(bool stripe_mode) {
+    constexpr size_t columns = 129;
+    constexpr size_t depth = 65;
+    constexpr size_t blocks = 3;
+    constexpr float s_rf_value = 0.00032747327350080013f;
+    const std::array<ggml::gemmini::quants::QactOutlier, 3> outliers = {
+        ggml::gemmini::quants::QactOutlier {0, 64, 548339296},
+        ggml::gemmini::quants::QactOutlier {0, 0, 548339296},
+        ggml::gemmini::quants::QactOutlier {0, 32, 548339296},
+    };
+
+    std::vector<int8_t> weights(columns * depth, 1);
+    std::vector<uint8_t> c_b(columns * blocks, 86);
+    std::vector<float> row_s_rf(columns, s_rf_value);
+    std::vector<uint16_t> row_R(columns, 4095);
+    constexpr size_t stripe_width = 17;
+    const size_t stripe_count = (columns + stripe_width - 1) / stripe_width;
+    std::vector<float> stripe_s_rf(stripe_count, s_rf_value);
+    std::vector<uint16_t> stripe_R(stripe_count, 4095);
+    std::vector<float> output(columns, 0.0f);
+
+    ggml_gemmini_args_t args{};
+    args.I = 1;
+    args.J = columns;
+    args.K = depth;
+    args.B = reinterpret_cast<elem_t *>(weights.data());
+    args.sB = depth;
+    args.f_out = output.data();
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_0_unpacked_to_h1;
+    args.c_b = c_b.data();
+    args.blocks_per_row = blocks;
+    args.blocks_K = blocks;
+    args.blocks_J = columns;
+    args.block_size_k = QK8_0;
+    if (stripe_mode) {
+        args.stripe_J = stripe_width;
+        args.s_rf_stripe = stripe_s_rf.data();
+        args.R_stripe = stripe_R.data();
+    } else {
+        args.s_rf = row_s_rf.data();
+        args.R = row_R.data();
+    }
+
+    ggml::gemmini::quants::dec::compensate_activation_dec(
+        {outliers.begin(), outliers.end()}, args, "test");
+    float expected = 0.0f;
+    for (size_t block = 0; block < blocks; ++block) {
+        const uint64_t c_eff = static_cast<uint64_t>(c_b[block]) + 4095;
+        expected += static_cast<float>(
+            static_cast<double>(outliers[block].residual) * c_eff * s_rf_value * 1.0f);
+    }
+    bool ok = true;
+    for (float value : output)
+        ok = check(float_bits(value) == float_bits(expected),
+                   stripe_mode ? "unpacked stripe H1 K/J tail bits" : "unpacked row H1 K/J tail bits") && ok;
+    return ok;
+}
+
+bool test_unpacked_h1_tail_routes_preserve_bits() {
+    return run_unpacked_h1_tail_case(false) && run_unpacked_h1_tail_case(true);
+}
+
 bool test_q8_h1_large_effective_scale() {
     constexpr size_t repeats = 520;
     std::array<block_q8_h1, kHierarchicalColumns * kHierarchicalBlocksPerRow> blocks{};
@@ -1019,7 +1193,7 @@ bool test_inside_existing_openmp_region() {
 
 int main() {
     const bool ok = test_noop() && test_route_plan() && test_active_row_groups() && test_route_metadata_rejects() && test_repeated_residuals() && test_decode_repeated_residuals() && test_integer_routes() && test_block_integer_route() &&
-        test_q8_h1_hierarchical_route() && test_q8_h1_large_effective_scale() && test_q8_h2_hierarchical_route() && test_q8_hp1_hierarchical_route() && test_q8_hp2_hierarchical_route() &&
+        test_q8_h1_hierarchical_route() && test_q8_h1_preserves_ordered_scaling_bits() && test_q8_h1_activation_scale_routes_preserve_bits() && test_unpacked_h1_tail_routes_preserve_bits() && test_q8_h1_large_effective_scale() && test_q8_h2_hierarchical_route() && test_q8_hp1_hierarchical_route() && test_q8_hp2_hierarchical_route() &&
         test_malformed_hierarchical_reject() && test_output_strides() && test_sparse_grouped_tails() && test_malformed_reject() && test_thread_clamp() &&
         test_thread_determinism() && test_inside_existing_openmp_region();
     std::printf("gemmini DEC baseline: %s\n", ok ? "PASS" : "FAIL");

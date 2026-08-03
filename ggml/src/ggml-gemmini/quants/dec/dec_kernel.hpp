@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 struct ggml_gemmini_args_t;
@@ -11,6 +12,12 @@ struct DecRoutePlan;
 struct ResidualGroupEntry;
 struct ActiveRowGroup;
 
+struct H1ScaleParams
+{
+    uint64_t c_eff;
+    float s_rf;
+};
+
 inline constexpr size_t kDecInt64JTileWidth = 128;
 
 inline size_t dec_int64_j_tile_count(size_t columns)
@@ -20,6 +27,18 @@ inline size_t dec_int64_j_tile_count(size_t columns)
 
 int resolve_dec_threads(size_t task_count, int omp_max_threads);
 int resolve_dec_threads(size_t task_count);
+
+float apply_h1_scale_ordered(
+    int64_t accumulator,
+    uint64_t c_eff,
+    float s_rf,
+    float activation_scale);
+
+H1ScaleParams h1_scale_params(
+    const ggml_gemmini_args_t &args,
+    const DecRoutePlan &plan,
+    size_t j,
+    size_t block);
 
 void accumulate_to_ycom_int64_scalar(
     const ggml_gemmini_args_t &args,

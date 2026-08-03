@@ -218,9 +218,18 @@ namespace
                 for (size_t j = 0; j < args.J; ++j)
                 {
                     const size_t index = r * args.J + j;
-                    reference_ycom[index] += static_cast<float>(
-                        static_cast<double>(accumulator[index]) * activation_scale *
-                        dec_route_weight_scale(plan, args, j, route));
+                    if (plan.route == DecWeightRoute::Q8H1)
+                    {
+                        const H1ScaleParams params = h1_scale_params(args, plan, j, route);
+                        reference_ycom[index] += apply_h1_scale_ordered(
+                            accumulator[index], params.c_eff, params.s_rf, activation_scale);
+                    }
+                    else
+                    {
+                        reference_ycom[index] += static_cast<float>(
+                            static_cast<double>(accumulator[index]) * activation_scale *
+                            dec_route_weight_scale(plan, args, j, route));
+                    }
                 }
             }
         }

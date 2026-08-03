@@ -48,8 +48,51 @@ int resolve_dec_threads(size_t task_count)
 #endif
 }
 
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("no-fast-math")))
+#endif
+float apply_h1_scale_ordered(
+    int64_t accumulator,
+    uint64_t c_eff,
+    float s_rf,
+    float activation_scale)
+{
+#if defined(__clang__)
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+#endif
+    double value = static_cast<double>(accumulator);
+    value = value * static_cast<double>(c_eff);
+    value = value * static_cast<double>(s_rf);
+    value = value * static_cast<double>(activation_scale);
+    return static_cast<float>(value);
+}
+
+H1ScaleParams h1_scale_params(
+    const ggml_gemmini_args_t &args,
+    const DecRoutePlan &plan,
+    size_t j,
+    size_t block)
+{
+    const block_q8_h1 *native = plan.native_weight_blocks ? args.q8_h1_block(j, block) : nullptr;
+    const uint64_t offset = native ? native->R :
+        (args.stripe_J > 1 ? args.R_stripe[j / args.stripe_J] : args.R[j]);
+    const uint64_t c_eff = static_cast<uint64_t>(
+        native ? native->c_b : static_cast<uint16_t>(args.c_b[j * args.blocks_per_row + block])) +
+        offset;
+    const float s_rf = native ? native->s_rf :
+        (args.stripe_J > 1 ? args.s_rf_stripe[j / args.stripe_J] : args.s_rf[j]);
+    return {c_eff, s_rf};
+}
+
 namespace
 {
+    struct H1ScaleTile
+    {
+        alignas(64) std::array<uint64_t, kDecInt64JTileWidth> c_eff{};
+        alignas(64) std::array<float, kDecInt64JTileWidth> s_rf{};
+    };
+
     size_t resolve_out_stride_row(const ggml_gemmini_args_t &args)
     {
         return args.stride_f_out ? args.stride_f_out : args.J;
@@ -228,6 +271,55 @@ namespace
         });
     }
 
+    template <typename CodeFor, typename ScaleParamsFor>
+    void run_h1_grouped_dec(
+        size_t I,
+        size_t J,
+        const float *activation_scales,
+        const std::vector<ResidualGroupEntry> &entries,
+        const std::vector<ActiveRowGroup> &groups,
+        const std::vector<size_t> &group_offsets,
+        const std::vector<size_t> &group_row_group_indices,
+        CodeFor code_for,
+        ScaleParamsFor scale_params_for,
+        float *Y_com)
+    {
+        static_assert(kDecGroupSizeK == QK8_0, "H1 scale blocks must match DEC compute groups");
+        if (!Y_com || entries.empty() || groups.empty() || group_offsets.size() < 2 ||
+            group_row_group_indices.size() != groups.size() || I == 0 || J == 0)
+            return;
+
+        for_each_grouped_j_tile(1, J, [&](size_t jb, size_t width, std::vector<int64_t> &accumulator)
+        {
+            H1ScaleTile scale_tile;
+            for (size_t k_group = 0; k_group + 1 < group_offsets.size(); ++k_group)
+            {
+                if (group_offsets[k_group] == group_offsets[k_group + 1])
+                    continue;
+
+                for (size_t t = 0; t < width; ++t)
+                {
+                    const H1ScaleParams params = scale_params_for(jb + t, k_group);
+                    scale_tile.c_eff[t] = params.c_eff;
+                    scale_tile.s_rf[t] = params.s_rf;
+                }
+
+                for (size_t position = group_offsets[k_group]; position < group_offsets[k_group + 1]; ++position)
+                {
+                    const ActiveRowGroup &group = groups[group_row_group_indices[position]];
+                    std::fill(accumulator.begin(), accumulator.begin() + width, int64_t {0});
+                    add_group_dot(entries, group.entry_begin, group.entry_end, jb, width, code_for, accumulator.data());
+                    const size_t row = group.row;
+                    const float activation_scale = activation_scales ? activation_scales[row] : 1.0f;
+                    float *output = Y_com + row * J + jb;
+                    for (size_t t = 0; t < width; ++t)
+                        output[t] += apply_h1_scale_ordered(
+                            accumulator[t], scale_tile.c_eff[t], scale_tile.s_rf[t], activation_scale);
+                }
+            }
+        });
+    }
+
     template <typename CodeFor>
     void run_block_route(
         const ggml_gemmini_args_t &args,
@@ -339,14 +431,14 @@ void accumulate_to_ycom_int64_h1(
     const std::vector<size_t> &group_row_group_indices, float *Y_com)
 {
     const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
-    run_scaled_grouped_dec(I, J, kDecGroupSizeK, activation_scales, entries, groups,
+    run_h1_grouped_dec(I, J, activation_scales, entries, groups,
         group_offsets, group_row_group_indices,
         [&args, &plan, weights](size_t j, size_t k) {
             const block_q8_h1 *native = plan.native_weight_blocks ? args.q8_h1_block(j, k / QK8_0) : nullptr;
             return native ? native->qs[k % QK8_0] : weights[j * plan.weight_stride + k];
         },
         [&args, &plan](size_t j, size_t block) {
-            return dec_route_weight_scale(plan, args, j, block);
+            return h1_scale_params(args, plan, j, block);
         }, Y_com);
 }
 
