@@ -565,6 +565,16 @@ bool run_hierarchical_case(
               "hierarchical route result");
     for (size_t index = 0; index < expected.size(); ++index)
         ok = check(close_enough(args.f_out[index], expected[index]), "hierarchical route output") && ok;
+
+    std::vector<float> reordered_output(args.I * args.J, 0.0f);
+    ggml_gemmini_args_t reordered_args = args;
+    reordered_args.f_out = reordered_output.data();
+    auto reordered_outliers = outliers;
+    std::reverse(reordered_outliers.begin(), reordered_outliers.end());
+    ggml::gemmini::quants::dec::compensate_activation_dec(
+        reordered_outliers, reordered_args, "test");
+    ok = check(std::memcmp(args.f_out, reordered_output.data(), reordered_output.size() * sizeof(float)) == 0,
+               "hierarchical route residual ordering is byte-identical") && ok;
     return ok;
 }
 
@@ -816,6 +826,42 @@ bool test_output_strides() {
     return ok;
 }
 
+bool test_sparse_grouped_tails() {
+    constexpr size_t rows = 8;
+    constexpr size_t cols = 50257;
+    constexpr size_t depth = 65;
+    std::vector<int8_t> weights(depth * cols, 1);
+    std::vector<float> output(rows * cols, 0.0f);
+    ggml_gemmini_args_t args = dense_args(rows, cols, depth, weights, output, 0.5f);
+    const auto result = ggml::gemmini::quants::dec::compensate_activation_dec(
+        { { 6, 64, 3 } }, args, "test");
+
+    double norm_squared = 0.0;
+    bool ok = check(result.nnz == 1 && result.unique_k_count == 1, "single sparse tail residual accounting");
+    for (size_t row = 0; row < rows; ++row) {
+        for (size_t column = 0; column < cols; ++column) {
+            const float value = output[row * cols + column];
+            ok = check(value == (row == 6 ? 1.5f : 0.0f), "sparse grouped tail output") && ok;
+            norm_squared += static_cast<double>(value) * value;
+        }
+    }
+    ok = check(std::sqrt(norm_squared) == std::sqrt(static_cast<double>(cols) * 2.25),
+               "J=50257 result norm") && ok;
+
+    constexpr size_t all_group_cols = 5;
+    std::vector<int8_t> all_group_weights(depth * all_group_cols, 1);
+    std::vector<float> all_group_output(all_group_cols, 0.0f);
+    ggml_gemmini_args_t all_group_args = dense_args(
+        1, all_group_cols, depth, all_group_weights, all_group_output, 0.25f);
+    const auto all_group_result = ggml::gemmini::quants::dec::compensate_activation_dec(
+        { { 0, 0, 1 }, { 0, 32, 2 }, { 0, 64, 3 } }, all_group_args, "test");
+    ok = check(all_group_result.nnz == 3 && all_group_result.unique_k_count == 3,
+               "all compute groups active accounting") && ok;
+    for (float value : all_group_output)
+        ok = check(value == 1.5f, "all compute groups active output") && ok;
+    return ok;
+}
+
 bool test_malformed_reject() {
     const std::vector<int8_t> weights = { 1, 2, 3, 4, 5, 6 };
     const std::vector<ggml::gemmini::quants::QactOutlier> outliers = { { 0, 0, 3 } };
@@ -950,7 +996,7 @@ bool test_inside_existing_openmp_region() {
 int main() {
     const bool ok = test_noop() && test_route_plan() && test_active_row_groups() && test_route_metadata_rejects() && test_repeated_residuals() && test_decode_repeated_residuals() && test_integer_routes() && test_block_integer_route() &&
         test_q8_h1_hierarchical_route() && test_q8_h1_large_effective_scale() && test_q8_h2_hierarchical_route() && test_q8_hp1_hierarchical_route() && test_q8_hp2_hierarchical_route() &&
-        test_malformed_hierarchical_reject() && test_output_strides() && test_malformed_reject() && test_thread_clamp() &&
+        test_malformed_hierarchical_reject() && test_output_strides() && test_sparse_grouped_tails() && test_malformed_reject() && test_thread_clamp() &&
         test_thread_determinism() && test_inside_existing_openmp_region();
     std::printf("gemmini DEC baseline: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
