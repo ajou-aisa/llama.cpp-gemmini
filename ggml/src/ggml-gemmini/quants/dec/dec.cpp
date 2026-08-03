@@ -37,7 +37,6 @@ namespace ggml::gemmini::quants::dec { namespace
         std::vector<int> unique_k;
         std::vector<RkTriplet> rk_stage;
         std::vector<int64_t> i1_delta_by_k;
-        std::vector<int64_t> integer_accumulator;
         double i1_total_abs_residual = 0.0;
         std::vector<float> Wk_f;
         std::vector<float> Y_com;
@@ -642,13 +641,16 @@ ActivationDECResult compensate_activation_dec(
         !plan.scales.channel_mode && (plan.route == DecWeightRoute::Dense ||
             plan.route == DecWeightRoute::Q8H1 || plan.route == DecWeightRoute::Q8H2 ||
             plan.route == DecWeightRoute::Q8HP1 || plan.route == DecWeightRoute::Q8HP2);
-
 #if LOG_DEBUG
+    const bool use_int64_kernel = use_int64_scalar || use_int64_channel_direct ||
+        use_int64_channel_sidecar || use_int64_h1 || use_int64_block;
+    const size_t j_tiles = dec_int64_j_tile_count(J);
+    const int dec_threads = resolve_dec_threads(j_tiles);
     const char *route = decode ? (use_jmajor_blocked ? "decode-jmajor-blocked" : "decode-fallback") :
         (use_jmajor_blocked ? "prefill-jmajor-blocked" : "prefill-fallback");
     ggml::gemmini::log::debug(
         layer,
-        "[dec.route] route=%s weight_route=%s kernel=%s I=%zu K=%zu J=%zu scale_mode=%s",
+        "[dec.route] route=%s weight_route=%s kernel=%s I=%zu K=%zu J=%zu scale_mode=%s j_tiles=%zu threads=%d",
         route,
         dec_route_name(plan),
         use_int64_scalar ? "int64-scalar" :
@@ -659,13 +661,17 @@ ActivationDECResult compensate_activation_dec(
         I,
         K,
         J,
-        dec_scale_mode_name(plan));
+        dec_scale_mode_name(plan),
+        j_tiles,
+        use_int64_kernel ? dec_threads : 1);
     ggml::gemmini::log::debug(
         layer,
-        "[dec.work] selected=%zu nnz=%zu unique_k=%zu output_stride_row=%zu output_stride_col=%zu",
+        "[dec.work] selected=%zu nnz=%zu unique_k=%zu j_tiles=%zu threads=%d output_stride_row=%zu output_stride_col=%zu",
         result.total_selected,
         result.nnz,
         result.unique_k_count,
+        j_tiles,
+        use_int64_kernel ? dec_threads : 1,
         args.stride_f_out ? args.stride_f_out : J,
         args.col_stride_f_out ? args.col_stride_f_out : 1);
 #endif
@@ -675,49 +681,49 @@ ActivationDECResult compensate_activation_dec(
         if (decode)
             accumulate_single_row_to_ycom_int64_scalar(
                 args, plan, J, activation_scales, scr.unique_k, scr.i1_delta_by_k,
-                scr.integer_accumulator, scr.Y_com.data());
+                scr.Y_com.data());
         else
             accumulate_to_ycom_int64_scalar(
                 args, plan, I, J, activation_scales, scr.unique_k, scr.rk_offs, scr.rk_pairs.data(),
-                scr.integer_accumulator, scr.Y_com.data());
+                scr.Y_com.data());
     }
     else if (use_int64_channel_direct)
     {
         if (decode)
             accumulate_single_row_to_ycom_int64_channel_direct(
                 args, plan, J, activation_scales, scr.unique_k, scr.i1_delta_by_k,
-                scr.integer_accumulator, scr.Y_com.data());
+                scr.Y_com.data());
         else
             accumulate_to_ycom_int64_channel_direct(
                 args, plan, I, J, activation_scales, scr.unique_k, scr.rk_offs, scr.rk_pairs.data(),
-                scr.integer_accumulator, scr.Y_com.data());
+                scr.Y_com.data());
     }
     else if (use_int64_channel_sidecar)
     {
         if (decode)
             accumulate_single_row_to_ycom_int64_channel_sidecar(
                 args, plan, J, activation_scales, scr.unique_k, scr.i1_delta_by_k,
-                scr.integer_accumulator, scr.Y_com.data());
+                scr.Y_com.data());
         else
             accumulate_to_ycom_int64_channel_sidecar(
                 args, plan, I, J, activation_scales, scr.unique_k, scr.rk_offs, scr.rk_pairs.data(),
-                scr.integer_accumulator, scr.Y_com.data());
+                scr.Y_com.data());
     }
     else if (use_int64_h1)
     {
-        if (decode) accumulate_single_row_to_ycom_int64_h1(args, plan, J, activation_scales, scr.unique_k, scr.i1_delta_by_k, scr.integer_accumulator, scr.Y_com.data());
-        else accumulate_to_ycom_int64_h1(args, plan, I, J, activation_scales, scr.unique_k, scr.rk_offs, scr.rk_pairs.data(), scr.integer_accumulator, scr.Y_com.data());
+        if (decode) accumulate_single_row_to_ycom_int64_h1(args, plan, J, activation_scales, scr.unique_k, scr.i1_delta_by_k, scr.Y_com.data());
+        else accumulate_to_ycom_int64_h1(args, plan, I, J, activation_scales, scr.unique_k, scr.rk_offs, scr.rk_pairs.data(), scr.Y_com.data());
     }
     else if (use_int64_block)
     {
         if (decode)
             accumulate_single_row_to_ycom_int64_block(
                 args, plan, J, activation_scales, scr.unique_k, scr.i1_delta_by_k,
-                scr.integer_accumulator, scr.Y_com.data());
+                scr.Y_com.data());
         else
             accumulate_to_ycom_int64_block(
                 args, plan, I, J, activation_scales, scr.unique_k, scr.rk_offs, scr.rk_pairs.data(),
-                scr.integer_accumulator, scr.Y_com.data());
+                scr.Y_com.data());
     }
     else if (decode)
     {

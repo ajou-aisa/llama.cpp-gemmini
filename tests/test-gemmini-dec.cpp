@@ -308,7 +308,7 @@ bool test_block_integer_route() {
 }
 
 constexpr size_t kHierarchicalRows = 2;
-constexpr size_t kHierarchicalColumns = 2;
+constexpr size_t kHierarchicalColumns = 257;
 constexpr size_t kHierarchicalBlocksPerRow = 2;
 constexpr size_t kHierarchicalDepth = QK8_0 * kHierarchicalBlocksPerRow;
 
@@ -462,9 +462,9 @@ bool test_q8_h1_hierarchical_route() {
     const std::array<float, 4> s_rf = { 0.125f, 0.25f, 0.0625f, 0.5f };
     const std::array<uint16_t, 4> R = { 7, 11, 13, 1 };
     for (size_t block_index = 0; block_index < blocks.size(); ++block_index) {
-        blocks[block_index].c_b = c_b[block_index];
-        blocks[block_index].s_rf = s_rf[block_index];
-        blocks[block_index].R = R[block_index];
+        blocks[block_index].c_b = c_b[block_index % c_b.size()];
+        blocks[block_index].s_rf = s_rf[block_index % s_rf.size()];
+        blocks[block_index].R = R[block_index % R.size()];
     }
 
     std::vector<float> prefill_output(kHierarchicalRows * kHierarchicalColumns, 0.0f);
@@ -492,8 +492,8 @@ bool test_q8_h2_hierarchical_route() {
     const std::array<uint8_t, 4> m = { 17, 31, 43, 57 };
     const std::array<float, 4> channel_scales = { 0.125f, 0.25f, 0.0625f, 0.375f };
     for (size_t block_index = 0; block_index < blocks.size(); ++block_index) {
-        blocks[block_index].m = m[block_index];
-        blocks[block_index].channel_scale = channel_scales[block_index];
+        blocks[block_index].m = m[block_index % m.size()];
+        blocks[block_index].channel_scale = channel_scales[block_index % channel_scales.size()];
     }
 
     std::vector<float> prefill_output(kHierarchicalRows * kHierarchicalColumns, 0.0f);
@@ -523,10 +523,10 @@ bool test_q8_hp1_hierarchical_route() {
     const std::array<int16_t, 4> m = { 1, -2, 3, std::numeric_limits<int16_t>::min() };
     const std::array<float, 4> channel_scales = { 0.125f, 0.5f, 0.25f, 0.75f };
     for (size_t block_index = 0; block_index < blocks.size(); ++block_index) {
-        blocks[block_index].m = m[block_index];
+        blocks[block_index].m = m[block_index % m.size()];
         blocks[block_index].padding[0] = 0;
         blocks[block_index].padding[1] = 0;
-        blocks[block_index].channel_scale = channel_scales[block_index];
+        blocks[block_index].channel_scale = channel_scales[block_index % channel_scales.size()];
     }
 
     std::vector<float> prefill_output(kHierarchicalRows * kHierarchicalColumns, 0.0f);
@@ -556,10 +556,10 @@ bool test_q8_hp2_hierarchical_route() {
     const std::array<int16_t, 4> m = { 2, -1, -3, std::numeric_limits<int16_t>::min() };
     const std::array<float, 4> channel_scales = { 0.0625f, 0.5f, 0.25f, 0.625f };
     for (size_t block_index = 0; block_index < blocks.size(); ++block_index) {
-        blocks[block_index].m = m[block_index];
+        blocks[block_index].m = m[block_index % m.size()];
         blocks[block_index].padding[0] = 0;
         blocks[block_index].padding[1] = 0;
-        blocks[block_index].channel_scale = channel_scales[block_index];
+        blocks[block_index].channel_scale = channel_scales[block_index % channel_scales.size()];
     }
 
     std::vector<float> prefill_output(kHierarchicalRows * kHierarchicalColumns, 0.0f);
@@ -711,12 +711,67 @@ bool test_thread_clamp() {
     return ok;
 }
 
+std::vector<float> h1_thread_case(
+    size_t rows,
+    const std::vector<ggml::gemmini::quants::QactOutlier> &outliers) {
+    std::array<block_q8_h1, kHierarchicalColumns * kHierarchicalBlocksPerRow> blocks{};
+    initialize_hierarchical_qs(blocks);
+    for (size_t block_index = 0; block_index < blocks.size(); ++block_index) {
+        blocks[block_index].c_b = static_cast<uint8_t>(3 + block_index % 11);
+        blocks[block_index].R = static_cast<uint16_t>(7 + block_index % 17);
+        blocks[block_index].s_rf = 0.0625f * static_cast<float>(1 + block_index % 5);
+    }
+
+    std::vector<float> output(rows * kHierarchicalColumns, 0.0f);
+    ggml_gemmini_args_t args = hierarchical_args(rows, output);
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1;
+    args.q8_h1_blocks = blocks.data();
+    args.q8_h1_block_count = blocks.size();
+    args.q8_h1_rows = kHierarchicalColumns;
+    ggml::gemmini::quants::dec::compensate_activation_dec(outliers, args, "test");
+    return output;
+}
+
+bool byte_identical(const std::vector<float> &lhs, const std::vector<float> &rhs) {
+    return lhs.size() == rhs.size() &&
+        std::memcmp(lhs.data(), rhs.data(), lhs.size() * sizeof(float)) == 0;
+}
+
+bool test_thread_determinism() {
+    const char *previous = std::getenv("DEC_THREADS");
+    const std::string saved = previous ? previous : "";
+    const bool had_previous = previous != nullptr;
+
+    set_dec_threads("1");
+    const std::vector<float> prefill_reference = h1_thread_case(
+        kHierarchicalRows, kHierarchicalPrefillOutliers);
+    const std::vector<float> decode_reference = h1_thread_case(
+        1, kHierarchicalDecodeOutliers);
+
+    bool ok = true;
+    for (const char *thread_count : { "2", "3", "4", "99" }) {
+        set_dec_threads(thread_count);
+        ok = check(byte_identical(
+                       h1_thread_case(kHierarchicalRows, kHierarchicalPrefillOutliers),
+                       prefill_reference),
+                   "INT64 H1 prefill is byte-identical across DEC_THREADS") && ok;
+        ok = check(byte_identical(
+                       h1_thread_case(1, kHierarchicalDecodeOutliers),
+                       decode_reference),
+                   "INT64 H1 decode is byte-identical across DEC_THREADS") && ok;
+    }
+
+    set_dec_threads(had_previous ? saved.c_str() : nullptr);
+    return ok;
+}
+
 }
 
 int main() {
     const bool ok = test_noop() && test_route_plan() && test_repeated_residuals() && test_decode_repeated_residuals() && test_integer_routes() && test_block_integer_route() &&
         test_q8_h1_hierarchical_route() && test_q8_h2_hierarchical_route() && test_q8_hp1_hierarchical_route() && test_q8_hp2_hierarchical_route() &&
-        test_malformed_hierarchical_reject() && test_output_strides() && test_malformed_reject() && test_thread_clamp();
+        test_malformed_hierarchical_reject() && test_output_strides() && test_malformed_reject() && test_thread_clamp() &&
+        test_thread_determinism();
     std::printf("gemmini DEC baseline: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

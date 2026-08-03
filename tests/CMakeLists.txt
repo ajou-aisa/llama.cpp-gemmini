@@ -230,6 +230,11 @@ add_executable(test-gemmini-dec
 target_link_libraries(test-gemmini-dec PRIVATE ggml-base ggml-gemmini-utils)
 target_compile_features(test-gemmini-dec PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-dec PRIVATE DEC_VALIDATION=1)
+if (GGML_GEMMINI_ENABLE_OPENMP)
+    find_package(OpenMP REQUIRED)
+    target_link_libraries(test-gemmini-dec PRIVATE OpenMP::OpenMP_CXX)
+    target_compile_definitions(test-gemmini-dec PRIVATE GGML_GEMMINI_HAS_OPENMP)
+endif()
 target_include_directories(test-gemmini-dec PRIVATE
     ../ggml/include
     ../ggml/src
