@@ -186,6 +186,173 @@ namespace
         for (size_t t = 0; t < block_width; ++t)
             dst[t] += y_block[t];
     }
+
+    template <typename ScaleForColumn>
+    void accumulate_to_ycom_int64_impl(
+        const ggml_gemmini_args_t &args,
+        const DecRoutePlan &plan,
+        size_t I,
+        size_t J,
+        const float *activation_scales,
+        const std::vector<int> &unique_k,
+        const std::vector<size_t> &rk_offs,
+        const std::pair<int, int32_t> *rk_pairs,
+        std::vector<int64_t> &accumulator,
+        ScaleForColumn scale_for_column,
+        float *Y_com)
+    {
+        const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
+        if (!weights || !rk_pairs || !Y_com || I == 0 || J == 0)
+            return;
+
+        accumulator.assign(I * J, int64_t {0});
+        for (int k : unique_k)
+        {
+            if (k < 0)
+                continue;
+            const size_t k_sz = static_cast<size_t>(k);
+            if (k_sz >= args.K || k_sz + 1 >= rk_offs.size())
+                continue;
+
+            const size_t begin = rk_offs[k_sz];
+            const size_t end = rk_offs[k_sz + 1];
+            const int8_t *row = plan.layout == WeightLayout::KxJ_RowMajor ?
+                weights + k_sz * plan.weight_stride : nullptr;
+            for (size_t p = begin; p < end; ++p)
+            {
+                const int r = rk_pairs[p].first;
+                if (r < 0 || static_cast<size_t>(r) >= I)
+                    continue;
+
+                int64_t *accumulator_row = accumulator.data() + static_cast<size_t>(r) * J;
+                const int64_t residual = rk_pairs[p].second;
+                // int32 residual * int8 code is <= 2^38; INT64 supports at least 2^25 terms per output.
+                if (row)
+                {
+                    for (size_t j = 0; j < J; ++j)
+                        accumulator_row[j] += residual * row[j];
+                }
+                else
+                {
+                    for (size_t j = 0; j < J; ++j)
+                        accumulator_row[j] += residual * weights[j * plan.weight_stride + k_sz];
+                }
+            }
+        }
+
+        for (size_t r = 0; r < I; ++r)
+        {
+            const float activation_scale = activation_scales ? activation_scales[r] : 1.0f;
+            const int64_t *accumulator_row = accumulator.data() + r * J;
+            float *output_row = Y_com + r * J;
+            for (size_t j = 0; j < J; ++j)
+                output_row[j] += static_cast<float>(
+                    static_cast<double>(accumulator_row[j]) * activation_scale * scale_for_column(j));
+        }
+    }
+
+    template <typename ScaleForColumn>
+    void accumulate_single_row_to_ycom_int64_impl(
+        const ggml_gemmini_args_t &args,
+        const DecRoutePlan &plan,
+        size_t J,
+        const float *activation_scales,
+        const std::vector<int> &unique_k,
+        const std::vector<int64_t> &delta_by_k,
+        std::vector<int64_t> &accumulator,
+        ScaleForColumn scale_for_column,
+        float *Y_com)
+    {
+        const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
+        if (!weights || !Y_com || J == 0)
+            return;
+
+        accumulator.assign(J, int64_t {0});
+        for (int k : unique_k)
+        {
+            if (k < 0)
+                continue;
+            const size_t k_sz = static_cast<size_t>(k);
+            if (k_sz >= args.K || k_sz >= delta_by_k.size())
+                continue;
+
+            const int64_t residual = delta_by_k[k_sz];
+            const int8_t *row = plan.layout == WeightLayout::KxJ_RowMajor ?
+                weights + k_sz * plan.weight_stride : nullptr;
+            if (row)
+            {
+                for (size_t j = 0; j < J; ++j)
+                    accumulator[j] += residual * row[j];
+            }
+            else
+            {
+                for (size_t j = 0; j < J; ++j)
+                    accumulator[j] += residual * weights[j * plan.weight_stride + k_sz];
+            }
+        }
+
+        const float activation_scale = activation_scales ? activation_scales[0] : 1.0f;
+        for (size_t j = 0; j < J; ++j)
+            Y_com[j] += static_cast<float>(
+                static_cast<double>(accumulator[j]) * activation_scale * scale_for_column(j));
+    }
+}
+
+void accumulate_to_ycom_int64_scalar(
+    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
+    const float *activation_scales, const std::vector<int> &unique_k,
+    const std::vector<size_t> &rk_offs, const std::pair<int, int32_t> *rk_pairs,
+    std::vector<int64_t> &accumulator, float *Y_com)
+{
+    accumulate_to_ycom_int64_impl(args, plan, I, J, activation_scales, unique_k, rk_offs, rk_pairs,
+        accumulator, [scale = plan.scales.scalar](size_t) { return scale; }, Y_com);
+}
+
+void accumulate_single_row_to_ycom_int64_scalar(
+    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t J,
+    const float *activation_scales, const std::vector<int> &unique_k,
+    const std::vector<int64_t> &delta_by_k, std::vector<int64_t> &accumulator, float *Y_com)
+{
+    accumulate_single_row_to_ycom_int64_impl(args, plan, J, activation_scales, unique_k, delta_by_k,
+        accumulator, [scale = plan.scales.scalar](size_t) { return scale; }, Y_com);
+}
+
+void accumulate_to_ycom_int64_channel_direct(
+    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
+    const float *activation_scales, const std::vector<int> &unique_k,
+    const std::vector<size_t> &rk_offs, const std::pair<int, int32_t> *rk_pairs,
+    std::vector<int64_t> &accumulator, float *Y_com)
+{
+    accumulate_to_ycom_int64_impl(args, plan, I, J, activation_scales, unique_k, rk_offs, rk_pairs,
+        accumulator, [&args](size_t j) { return args.q8_channel_scale(j); }, Y_com);
+}
+
+void accumulate_single_row_to_ycom_int64_channel_direct(
+    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t J,
+    const float *activation_scales, const std::vector<int> &unique_k,
+    const std::vector<int64_t> &delta_by_k, std::vector<int64_t> &accumulator, float *Y_com)
+{
+    accumulate_single_row_to_ycom_int64_impl(args, plan, J, activation_scales, unique_k, delta_by_k,
+        accumulator, [&args](size_t j) { return args.q8_channel_scale(j); }, Y_com);
+}
+
+void accumulate_to_ycom_int64_channel_sidecar(
+    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
+    const float *activation_scales, const std::vector<int> &unique_k,
+    const std::vector<size_t> &rk_offs, const std::pair<int, int32_t> *rk_pairs,
+    std::vector<int64_t> &accumulator, float *Y_com)
+{
+    accumulate_to_ycom_int64_impl(args, plan, I, J, activation_scales, unique_k, rk_offs, rk_pairs,
+        accumulator, [scales = plan.scales.data](size_t j) { return scales[j]; }, Y_com);
+}
+
+void accumulate_single_row_to_ycom_int64_channel_sidecar(
+    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t J,
+    const float *activation_scales, const std::vector<int> &unique_k,
+    const std::vector<int64_t> &delta_by_k, std::vector<int64_t> &accumulator, float *Y_com)
+{
+    accumulate_single_row_to_ycom_int64_impl(args, plan, J, activation_scales, unique_k, delta_by_k,
+        accumulator, [scales = plan.scales.data](size_t j) { return scales[j]; }, Y_com);
 }
 
 void accumulate_to_ycom_jmajor_blocked(

@@ -3,8 +3,10 @@
 #include "../ggml/src/ggml-gemmini/quants/dec/dec_internal.hpp"
 #include "../ggml/src/ggml-gemmini/quants/dec/dec_kernel.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -154,6 +156,122 @@ bool test_decode_repeated_residuals() {
     return ok;
 }
 
+std::vector<float> channel_expected(
+    size_t rows,
+    size_t cols,
+    size_t depth,
+    const std::vector<int8_t> &codes,
+    const std::vector<float> &scales,
+    const std::vector<ggml::gemmini::quants::QactOutlier> &outliers) {
+    std::vector<float> expected(rows * cols, 0.0f);
+    for (const auto &outlier : outliers) {
+        if (outlier.row < 0 || outlier.col < 0 || static_cast<size_t>(outlier.row) >= rows ||
+            static_cast<size_t>(outlier.col) >= depth)
+            continue;
+        for (size_t j = 0; j < cols; ++j)
+            expected[static_cast<size_t>(outlier.row) * cols + j] += static_cast<float>(
+                static_cast<double>(outlier.residual) * codes[j * depth + static_cast<size_t>(outlier.col)] * scales[j]);
+    }
+    return expected;
+}
+
+bool test_integer_routes() {
+    constexpr size_t rows = 2;
+    constexpr size_t cols = 3;
+    constexpr size_t depth = 5;
+    const std::vector<int8_t> channel_codes = {
+        1, -2, 3, -4, 5,
+        -3, 2, 1, 4, -2,
+        2, 5, -1, 3, 4,
+    };
+    const std::vector<float> scales = { 0.25f, 0.5f, -0.25f };
+    const std::vector<ggml::gemmini::quants::QactOutlier> outliers = {
+        { 0, 0, 3 }, { 0, 4, -2 }, { 1, 1, 5 }, { 1, 1, -1 },
+    };
+    const std::vector<float> expected = channel_expected(rows, cols, depth, channel_codes, scales, outliers);
+
+    std::vector<int8_t> scalar_codes(depth * cols);
+    for (size_t k = 0; k < depth; ++k)
+        for (size_t j = 0; j < cols; ++j)
+            scalar_codes[k * cols + j] = channel_codes[j * depth + k];
+    std::vector<float> scalar_output(rows * cols, 0.0f);
+    ggml_gemmini_args_t scalar_args = dense_args(rows, cols, depth, scalar_codes, scalar_output, 0.25f);
+    const std::vector<float> scalar_expected = channel_expected(
+        rows, cols, depth, channel_codes, { 0.25f, 0.25f, 0.25f }, outliers);
+    auto reversed_outliers = outliers;
+    std::reverse(reversed_outliers.begin(), reversed_outliers.end());
+    ggml::gemmini::quants::dec::compensate_activation_dec(outliers, scalar_args, "test");
+    std::vector<float> scalar_reordered(rows * cols, 0.0f);
+    ggml_gemmini_args_t scalar_reordered_args = dense_args(rows, cols, depth, scalar_codes, scalar_reordered, 0.25f);
+    ggml::gemmini::quants::dec::compensate_activation_dec(reversed_outliers, scalar_reordered_args, "test");
+    std::vector<float> scalar_transposed(rows * cols, 0.0f);
+    ggml_gemmini_args_t scalar_transposed_args = dense_args(rows, cols, depth, channel_codes, scalar_transposed, 0.25f);
+    scalar_transposed_args.sB = depth;
+    scalar_transposed_args.transpose_B = true;
+    ggml::gemmini::quants::dec::compensate_activation_dec(outliers, scalar_transposed_args, "test");
+
+    std::vector<float> sidecar_output(rows * cols, 0.0f);
+    ggml_gemmini_args_t sidecar_args{};
+    sidecar_args.I = rows;
+    sidecar_args.J = cols;
+    sidecar_args.K = depth;
+    sidecar_args.B = reinterpret_cast<elem_t *>(const_cast<int8_t *>(channel_codes.data()));
+    sidecar_args.sB = depth;
+    sidecar_args.f_out = sidecar_output.data();
+    sidecar_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar;
+    sidecar_args.weight_channel_scales = scales.data();
+    sidecar_args.weight_channel_scale_count = cols;
+    ggml::gemmini::quants::dec::compensate_activation_dec(outliers, sidecar_args, "test");
+    const std::vector<ggml::gemmini::quants::QactOutlier> decode_outliers = {
+        { 0, 2, 4 }, { 0, 2, -1 }, { 0, 4, 3 },
+    };
+    std::vector<float> sidecar_decode_output(cols, 0.0f);
+    sidecar_args.I = 1;
+    sidecar_args.f_out = sidecar_decode_output.data();
+    ggml::gemmini::quants::dec::compensate_activation_dec(decode_outliers, sidecar_args, "test");
+
+    std::vector<uint8_t> direct_rows(cols * (sizeof(float) + depth));
+    for (size_t j = 0; j < cols; ++j) {
+        uint8_t *row = direct_rows.data() + j * (sizeof(float) + depth);
+        std::memcpy(row, &scales[j], sizeof(float));
+        std::memcpy(row + sizeof(float), channel_codes.data() + j * depth, depth);
+    }
+    std::vector<float> direct_output(rows * cols, 0.0f);
+    ggml_gemmini_args_t direct_args{};
+    direct_args.I = rows;
+    direct_args.J = cols;
+    direct_args.K = depth;
+    direct_args.B = reinterpret_cast<elem_t *>(direct_rows.data() + sizeof(float));
+    direct_args.sB = sizeof(float) + depth;
+    direct_args.f_out = direct_output.data();
+    direct_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_channel;
+    direct_args.q8_channel_row_base = direct_rows.data();
+    direct_args.q8_channel_row_stride = sizeof(float) + depth;
+    direct_args.q8_channel_row_count = cols;
+    ggml::gemmini::quants::dec::compensate_activation_dec(outliers, direct_args, "test");
+
+    std::vector<float> direct_decode_output(cols, 0.0f);
+    direct_args.I = 1;
+    direct_args.f_out = direct_decode_output.data();
+    ggml::gemmini::quants::dec::compensate_activation_dec(decode_outliers, direct_args, "test");
+    const std::vector<float> direct_decode_expected = channel_expected(
+        1, cols, depth, channel_codes, scales, decode_outliers);
+
+    bool ok = true;
+    for (size_t index = 0; index < expected.size(); ++index) {
+        ok = check(close_enough(scalar_output[index], scalar_expected[index]), "scalar int64 tail output") && ok;
+        ok = check(close_enough(scalar_reordered[index], scalar_output[index]), "scalar ordering invariance") && ok;
+        ok = check(close_enough(scalar_transposed[index], scalar_expected[index]), "scalar transposed int64 output") && ok;
+        ok = check(close_enough(sidecar_output[index], expected[index]), "sidecar int64 output") && ok;
+        ok = check(close_enough(direct_output[index], expected[index]), "direct int64 output") && ok;
+    }
+    for (size_t j = 0; j < cols; ++j)
+        ok = check(close_enough(direct_decode_output[j], direct_decode_expected[j]), "direct int64 decode output") && ok;
+    for (size_t j = 0; j < cols; ++j)
+        ok = check(close_enough(sidecar_decode_output[j], direct_decode_expected[j]), "sidecar int64 decode output") && ok;
+    return ok;
+}
+
 bool test_output_strides() {
     const std::vector<int8_t> weights = {
         3, -2, 5,
@@ -234,7 +352,7 @@ bool test_thread_clamp() {
 }
 
 int main() {
-    const bool ok = test_noop() && test_route_plan() && test_repeated_residuals() && test_decode_repeated_residuals() && test_output_strides() &&
+    const bool ok = test_noop() && test_route_plan() && test_repeated_residuals() && test_decode_repeated_residuals() && test_integer_routes() && test_output_strides() &&
         test_malformed_reject() && test_thread_clamp();
     std::printf("gemmini DEC baseline: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

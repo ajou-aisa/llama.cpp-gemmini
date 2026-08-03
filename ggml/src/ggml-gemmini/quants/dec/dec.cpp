@@ -37,6 +37,7 @@ namespace ggml::gemmini::quants::dec { namespace
         std::vector<int> unique_k;
         std::vector<RkTriplet> rk_stage;
         std::vector<int64_t> i1_delta_by_k;
+        std::vector<int64_t> integer_accumulator;
         double i1_total_abs_residual = 0.0;
         std::vector<float> Wk_f;
         std::vector<float> Y_com;
@@ -633,15 +634,22 @@ ActivationDECResult compensate_activation_dec(
         !plan.scales.row_header_mode &&
         plan.layout == WeightLayout::JxK_ColMajor &&
         plan.weight_stride >= K;
+    const bool use_int64_scalar = plan.route == DecWeightRoute::Dense && plan.scales.scalar_mode;
+    const bool use_int64_channel_direct = plan.route == DecWeightRoute::Q8ChannelDirect;
+    const bool use_int64_channel_sidecar = plan.route == DecWeightRoute::Q8ChannelSidecar;
 
 #if LOG_DEBUG
     const char *route = decode ? (use_jmajor_blocked ? "decode-jmajor-blocked" : "decode-fallback") :
         (use_jmajor_blocked ? "prefill-jmajor-blocked" : "prefill-fallback");
     ggml::gemmini::log::debug(
         layer,
-        "[dec.route] route=%s weight_route=%s I=%zu K=%zu J=%zu scale_mode=%s",
+        "[dec.route] route=%s weight_route=%s kernel=%s I=%zu K=%zu J=%zu scale_mode=%s",
         route,
         dec_route_name(plan),
+        use_int64_scalar ? "int64-scalar" :
+            (use_int64_channel_direct ? "int64-channel-direct" :
+                (use_int64_channel_sidecar ? "int64-channel-sidecar" :
+                    (use_jmajor_blocked ? "fp-jmajor-blocked" : "fp-fallback"))),
         I,
         K,
         J,
@@ -656,7 +664,40 @@ ActivationDECResult compensate_activation_dec(
         args.col_stride_f_out ? args.col_stride_f_out : 1);
 #endif
 
-    if (decode)
+    if (use_int64_scalar)
+    {
+        if (decode)
+            accumulate_single_row_to_ycom_int64_scalar(
+                args, plan, J, activation_scales, scr.unique_k, scr.i1_delta_by_k,
+                scr.integer_accumulator, scr.Y_com.data());
+        else
+            accumulate_to_ycom_int64_scalar(
+                args, plan, I, J, activation_scales, scr.unique_k, scr.rk_offs, scr.rk_pairs.data(),
+                scr.integer_accumulator, scr.Y_com.data());
+    }
+    else if (use_int64_channel_direct)
+    {
+        if (decode)
+            accumulate_single_row_to_ycom_int64_channel_direct(
+                args, plan, J, activation_scales, scr.unique_k, scr.i1_delta_by_k,
+                scr.integer_accumulator, scr.Y_com.data());
+        else
+            accumulate_to_ycom_int64_channel_direct(
+                args, plan, I, J, activation_scales, scr.unique_k, scr.rk_offs, scr.rk_pairs.data(),
+                scr.integer_accumulator, scr.Y_com.data());
+    }
+    else if (use_int64_channel_sidecar)
+    {
+        if (decode)
+            accumulate_single_row_to_ycom_int64_channel_sidecar(
+                args, plan, J, activation_scales, scr.unique_k, scr.i1_delta_by_k,
+                scr.integer_accumulator, scr.Y_com.data());
+        else
+            accumulate_to_ycom_int64_channel_sidecar(
+                args, plan, I, J, activation_scales, scr.unique_k, scr.rk_offs, scr.rk_pairs.data(),
+                scr.integer_accumulator, scr.Y_com.data());
+    }
+    else if (decode)
     {
         if (use_jmajor_blocked)
         {
