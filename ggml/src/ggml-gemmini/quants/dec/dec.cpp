@@ -637,6 +637,11 @@ ActivationDECResult compensate_activation_dec(
     const bool use_int64_scalar = plan.route == DecWeightRoute::Dense && plan.scales.scalar_mode;
     const bool use_int64_channel_direct = plan.route == DecWeightRoute::Q8ChannelDirect;
     const bool use_int64_channel_sidecar = plan.route == DecWeightRoute::Q8ChannelSidecar;
+    const bool use_int64_h1 = plan.route == DecWeightRoute::Q8H1;
+    const bool use_int64_block = !use_int64_h1 && !plan.scales.scalar_mode && !plan.scales.row_header_mode &&
+        !plan.scales.channel_mode && (plan.route == DecWeightRoute::Dense ||
+            plan.route == DecWeightRoute::Q8H1 || plan.route == DecWeightRoute::Q8H2 ||
+            plan.route == DecWeightRoute::Q8HP1 || plan.route == DecWeightRoute::Q8HP2);
 
 #if LOG_DEBUG
     const char *route = decode ? (use_jmajor_blocked ? "decode-jmajor-blocked" : "decode-fallback") :
@@ -649,7 +654,8 @@ ActivationDECResult compensate_activation_dec(
         use_int64_scalar ? "int64-scalar" :
             (use_int64_channel_direct ? "int64-channel-direct" :
                 (use_int64_channel_sidecar ? "int64-channel-sidecar" :
-                    (use_jmajor_blocked ? "fp-jmajor-blocked" : "fp-fallback"))),
+                    (use_int64_h1 ? "int64-h1" : (use_int64_block ? "int64-block" :
+                        (use_jmajor_blocked ? "fp-jmajor-blocked" : "fp-fallback"))))),
         I,
         K,
         J,
@@ -694,6 +700,22 @@ ActivationDECResult compensate_activation_dec(
                 scr.integer_accumulator, scr.Y_com.data());
         else
             accumulate_to_ycom_int64_channel_sidecar(
+                args, plan, I, J, activation_scales, scr.unique_k, scr.rk_offs, scr.rk_pairs.data(),
+                scr.integer_accumulator, scr.Y_com.data());
+    }
+    else if (use_int64_h1)
+    {
+        if (decode) accumulate_single_row_to_ycom_int64_h1(args, plan, J, activation_scales, scr.unique_k, scr.i1_delta_by_k, scr.integer_accumulator, scr.Y_com.data());
+        else accumulate_to_ycom_int64_h1(args, plan, I, J, activation_scales, scr.unique_k, scr.rk_offs, scr.rk_pairs.data(), scr.integer_accumulator, scr.Y_com.data());
+    }
+    else if (use_int64_block)
+    {
+        if (decode)
+            accumulate_single_row_to_ycom_int64_block(
+                args, plan, J, activation_scales, scr.unique_k, scr.i1_delta_by_k,
+                scr.integer_accumulator, scr.Y_com.data());
+        else
+            accumulate_to_ycom_int64_block(
                 args, plan, I, J, activation_scales, scr.unique_k, scr.rk_offs, scr.rk_pairs.data(),
                 scr.integer_accumulator, scr.Y_com.data());
     }

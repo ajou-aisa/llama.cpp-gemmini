@@ -7,6 +7,10 @@
 #include <cstdlib>
 #include <limits>
 
+#ifndef DEC_VALIDATION
+#define DEC_VALIDATION 0
+#endif
+
 #if defined(GGML_GEMMINI_HAS_OPENMP)
 #include <omp.h>
 #endif
@@ -296,6 +300,80 @@ namespace
             Y_com[j] += static_cast<float>(
                 static_cast<double>(accumulator[j]) * activation_scale * scale_for_column(j));
     }
+
+    template <typename CodeFor>
+    void accumulate_to_ycom_int64_block_impl(
+        const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
+        const float *activation_scales, const std::vector<int> &unique_k,
+        const std::vector<size_t> &rk_offs, const std::pair<int, int32_t> *rk_pairs,
+        std::vector<int64_t> &accumulator, CodeFor code_for, float *Y_com)
+    {
+        if (!rk_pairs || !Y_com || I == 0 || J == 0)
+            return;
+        accumulator.assign(I * J, int64_t {0});
+        for (size_t block = 0; block < plan.scales.cols; ++block)
+        {
+            std::fill(accumulator.begin(), accumulator.end(), int64_t {0});
+            for (int k : unique_k)
+            {
+                if (k < 0)
+                    continue;
+                const size_t k_sz = static_cast<size_t>(k);
+                if (k_sz >= args.K || k_sz / plan.scales.block_size != block || k_sz + 1 >= rk_offs.size())
+                    continue;
+                for (size_t p = rk_offs[k_sz]; p < rk_offs[k_sz + 1]; ++p)
+                {
+                    const int r = rk_pairs[p].first;
+                    if (r < 0 || static_cast<size_t>(r) >= I)
+                        continue;
+                    int64_t *row = accumulator.data() + static_cast<size_t>(r) * J;
+                    const int64_t residual = rk_pairs[p].second;
+                    for (size_t j = 0; j < J; ++j)
+                        row[j] += residual * code_for(j, k_sz);
+                }
+            }
+            for (size_t r = 0; r < I; ++r)
+            {
+                const float activation_scale = activation_scales ? activation_scales[r] : 1.0f;
+                const int64_t *row = accumulator.data() + r * J;
+                float *output = Y_com + r * J;
+                for (size_t j = 0; j < J; ++j)
+                    output[j] += static_cast<float>(static_cast<double>(row[j]) * activation_scale *
+                        dec_route_weight_scale(plan, args, j, block));
+            }
+        }
+    }
+
+    template <typename CodeFor>
+    void accumulate_single_row_to_ycom_int64_block_impl(
+        const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t J,
+        const float *activation_scales, const std::vector<int> &unique_k,
+        const std::vector<int64_t> &delta_by_k, std::vector<int64_t> &accumulator,
+        CodeFor code_for, float *Y_com)
+    {
+        if (!Y_com || J == 0)
+            return;
+        accumulator.assign(J, int64_t {0});
+        for (size_t block = 0; block < plan.scales.cols; ++block)
+        {
+            std::fill(accumulator.begin(), accumulator.end(), int64_t {0});
+            for (int k : unique_k)
+            {
+                if (k < 0)
+                    continue;
+                const size_t k_sz = static_cast<size_t>(k);
+                if (k_sz >= args.K || k_sz >= delta_by_k.size() || k_sz / plan.scales.block_size != block)
+                    continue;
+                const int64_t residual = delta_by_k[k_sz];
+                for (size_t j = 0; j < J; ++j)
+                    accumulator[j] += residual * code_for(j, k_sz);
+            }
+            const float activation_scale = activation_scales ? activation_scales[0] : 1.0f;
+            for (size_t j = 0; j < J; ++j)
+                Y_com[j] += static_cast<float>(static_cast<double>(accumulator[j]) * activation_scale *
+                    dec_route_weight_scale(plan, args, j, block));
+        }
+    }
 }
 
 void accumulate_to_ycom_int64_scalar(
@@ -353,6 +431,179 @@ void accumulate_single_row_to_ycom_int64_channel_sidecar(
 {
     accumulate_single_row_to_ycom_int64_impl(args, plan, J, activation_scales, unique_k, delta_by_k,
         accumulator, [scales = plan.scales.data](size_t j) { return scales[j]; }, Y_com);
+}
+
+void accumulate_to_ycom_int64_block(
+    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
+    const float *activation_scales, const std::vector<int> &unique_k,
+    const std::vector<size_t> &rk_offs, const std::pair<int, int32_t> *rk_pairs,
+    std::vector<int64_t> &accumulator, float *Y_com)
+{
+    const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
+    if (plan.route == DecWeightRoute::Q8HP1)
+        return accumulate_to_ycom_int64_block_impl(args, plan, I, J, activation_scales, unique_k, rk_offs, rk_pairs,
+            accumulator, [&args](size_t j, size_t k) { return args.q8_hp1_block(j, k / QK8_HP)->qs[k % QK8_HP]; }, Y_com);
+    if (plan.route == DecWeightRoute::Q8HP2)
+        return accumulate_to_ycom_int64_block_impl(args, plan, I, J, activation_scales, unique_k, rk_offs, rk_pairs,
+            accumulator, [&args](size_t j, size_t k) { return args.q8_hp2_block(j, k / QK8_HP)->qs[k % QK8_HP]; }, Y_com);
+    if (plan.route == DecWeightRoute::Q8H2)
+        return accumulate_to_ycom_int64_block_impl(args, plan, I, J, activation_scales, unique_k, rk_offs, rk_pairs,
+            accumulator, [&args](size_t j, size_t k) { return args.q8_h2_block(j, k / QK8_H2)->qs[k % QK8_H2]; }, Y_com);
+    if (plan.route == DecWeightRoute::Q8H1 && plan.native_weight_blocks)
+        return accumulate_to_ycom_int64_block_impl(args, plan, I, J, activation_scales, unique_k, rk_offs, rk_pairs,
+            accumulator, [&args](size_t j, size_t k) { return args.q8_h1_block(j, k / QK8_0)->qs[k % QK8_0]; }, Y_com);
+    if (!weights)
+        return;
+    accumulate_to_ycom_int64_block_impl(args, plan, I, J, activation_scales, unique_k, rk_offs, rk_pairs,
+        accumulator, [weights, &plan](size_t j, size_t k) {
+            return plan.layout == WeightLayout::KxJ_RowMajor ? weights[k * plan.weight_stride + j] :
+                weights[j * plan.weight_stride + k];
+        }, Y_com);
+}
+
+void accumulate_single_row_to_ycom_int64_block(
+    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t J,
+    const float *activation_scales, const std::vector<int> &unique_k,
+    const std::vector<int64_t> &delta_by_k, std::vector<int64_t> &accumulator, float *Y_com)
+{
+    const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
+    if (plan.route == DecWeightRoute::Q8HP1)
+        return accumulate_single_row_to_ycom_int64_block_impl(args, plan, J, activation_scales, unique_k, delta_by_k,
+            accumulator, [&args](size_t j, size_t k) { return args.q8_hp1_block(j, k / QK8_HP)->qs[k % QK8_HP]; }, Y_com);
+    if (plan.route == DecWeightRoute::Q8HP2)
+        return accumulate_single_row_to_ycom_int64_block_impl(args, plan, J, activation_scales, unique_k, delta_by_k,
+            accumulator, [&args](size_t j, size_t k) { return args.q8_hp2_block(j, k / QK8_HP)->qs[k % QK8_HP]; }, Y_com);
+    if (plan.route == DecWeightRoute::Q8H2)
+        return accumulate_single_row_to_ycom_int64_block_impl(args, plan, J, activation_scales, unique_k, delta_by_k,
+            accumulator, [&args](size_t j, size_t k) { return args.q8_h2_block(j, k / QK8_H2)->qs[k % QK8_H2]; }, Y_com);
+    if (plan.route == DecWeightRoute::Q8H1 && plan.native_weight_blocks)
+        return accumulate_single_row_to_ycom_int64_block_impl(args, plan, J, activation_scales, unique_k, delta_by_k,
+            accumulator, [&args](size_t j, size_t k) { return args.q8_h1_block(j, k / QK8_0)->qs[k % QK8_0]; }, Y_com);
+    if (!weights)
+        return;
+    accumulate_single_row_to_ycom_int64_block_impl(args, plan, J, activation_scales, unique_k, delta_by_k,
+        accumulator, [weights, &plan](size_t j, size_t k) {
+            return plan.layout == WeightLayout::KxJ_RowMajor ? weights[k * plan.weight_stride + j] :
+                weights[j * plan.weight_stride + k];
+        }, Y_com);
+}
+
+void accumulate_to_ycom_int64_h1(
+    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
+    const float *activation_scales, const std::vector<int> &unique_k,
+    const std::vector<size_t> &rk_offs, const std::pair<int, int32_t> *pairs,
+    std::vector<int64_t> &accumulator, float *Y_com)
+{
+    if (!pairs || !Y_com || I == 0 || J == 0)
+        return;
+
+    const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
+    accumulator.resize(I * J);
+    for (size_t block = 0; block < plan.scales.cols; ++block)
+    {
+        std::fill(accumulator.begin(), accumulator.end(), int64_t {0});
+        for (int k : unique_k)
+        {
+            if (k < 0)
+                continue;
+            const size_t k_index = static_cast<size_t>(k);
+            if (k_index >= args.K || k_index / QK8_0 != block || k_index + 1 >= rk_offs.size())
+                continue;
+
+            for (size_t p = rk_offs[k_index]; p < rk_offs[k_index + 1]; ++p)
+            {
+                const int row = pairs[p].first;
+                if (row < 0 || static_cast<size_t>(row) >= I)
+                    continue;
+
+                int64_t *output_acc = accumulator.data() + static_cast<size_t>(row) * J;
+                for (size_t j = 0; j < J; ++j)
+                {
+                    const block_q8_h1 *native = plan.native_weight_blocks ? args.q8_h1_block(j, block) : nullptr;
+                    const int8_t code = native ? native->qs[k_index % QK8_0] :
+                        weights[j * plan.weight_stride + k_index];
+                    const uint64_t offset = native ? native->R :
+                        (args.stripe_J > 1 ? args.R_stripe[j / args.stripe_J] : args.R[j]);
+                    const uint64_t c_eff = (native ? native->c_b : args.c_b[j * args.blocks_per_row + block]) + offset;
+                    const int64_t term = static_cast<int64_t>(pairs[p].second) * code * static_cast<int64_t>(c_eff);
+#if DEC_VALIDATION
+                    // One term is bounded by |INT32_MIN| * 128 * (UINT16_MAX + UINT8_MAX).
+                    const __int128 checked_sum = static_cast<__int128>(output_acc[j]) + term;
+                    if (checked_sum < std::numeric_limits<int64_t>::min() ||
+                        checked_sum > std::numeric_limits<int64_t>::max())
+                        std::abort();
+#endif
+                    output_acc[j] += term;
+                }
+            }
+        }
+
+        for (size_t row = 0; row < I; ++row)
+        {
+            const float activation_scale = activation_scales ? activation_scales[row] : 1.0f;
+            for (size_t j = 0; j < J; ++j)
+            {
+                const block_q8_h1 *native = plan.native_weight_blocks ? args.q8_h1_block(j, block) : nullptr;
+                const float s_rf = native ? native->s_rf :
+                    (args.stripe_J > 1 ? args.s_rf_stripe[j / args.stripe_J] : args.s_rf[j]);
+                Y_com[row * J + j] += static_cast<float>(
+                    static_cast<double>(accumulator[row * J + j]) * s_rf * activation_scale);
+            }
+        }
+    }
+}
+
+void accumulate_single_row_to_ycom_int64_h1(
+    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t J,
+    const float *activation_scales, const std::vector<int> &unique_k,
+    const std::vector<int64_t> &delta, std::vector<int64_t> &accumulator, float *Y_com)
+{
+    if (!Y_com || J == 0)
+        return;
+
+    const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
+    accumulator.resize(J);
+    for (size_t block = 0; block < plan.scales.cols; ++block)
+    {
+        std::fill(accumulator.begin(), accumulator.end(), int64_t {0});
+        for (int k : unique_k)
+        {
+            if (k < 0)
+                continue;
+            const size_t k_index = static_cast<size_t>(k);
+            if (k_index >= args.K || k_index >= delta.size() || k_index / QK8_0 != block)
+                continue;
+
+            for (size_t j = 0; j < J; ++j)
+            {
+                const block_q8_h1 *native = plan.native_weight_blocks ? args.q8_h1_block(j, block) : nullptr;
+                const int8_t code = native ? native->qs[k_index % QK8_0] :
+                    weights[j * plan.weight_stride + k_index];
+                const uint64_t offset = native ? native->R :
+                    (args.stripe_J > 1 ? args.R_stripe[j / args.stripe_J] : args.R[j]);
+                const uint64_t c_eff = (native ? native->c_b : args.c_b[j * args.blocks_per_row + block]) + offset;
+                const __int128 term = static_cast<__int128>(delta[k_index]) * code * c_eff;
+#if DEC_VALIDATION
+                const __int128 checked_sum = static_cast<__int128>(accumulator[j]) + term;
+                if (term < std::numeric_limits<int64_t>::min() ||
+                    term > std::numeric_limits<int64_t>::max() ||
+                    checked_sum < std::numeric_limits<int64_t>::min() ||
+                    checked_sum > std::numeric_limits<int64_t>::max())
+                    std::abort();
+#endif
+                accumulator[j] += static_cast<int64_t>(term);
+            }
+        }
+
+        const float activation_scale = activation_scales ? activation_scales[0] : 1.0f;
+        for (size_t j = 0; j < J; ++j)
+        {
+            const block_q8_h1 *native = plan.native_weight_blocks ? args.q8_h1_block(j, block) : nullptr;
+            const float s_rf = native ? native->s_rf :
+                (args.stripe_J > 1 ? args.s_rf_stripe[j / args.stripe_J] : args.s_rf[j]);
+            Y_com[j] += static_cast<float>(static_cast<double>(accumulator[j]) * s_rf * activation_scale);
+        }
+    }
 }
 
 void accumulate_to_ycom_jmajor_blocked(

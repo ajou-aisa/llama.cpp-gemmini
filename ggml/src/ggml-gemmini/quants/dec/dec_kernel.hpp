@@ -99,6 +99,31 @@ void accumulate_single_row_to_ycom_int64_channel_sidecar(
     std::vector<int64_t> &accumulator,
     float *Y_com);
 
+void accumulate_to_ycom_int64_block(
+    const ggml_gemmini_args_t &args,
+    const DecRoutePlan &plan,
+    size_t I,
+    size_t J,
+    const float *activation_scales,
+    const std::vector<int> &unique_k,
+    const std::vector<size_t> &rk_offs,
+    const std::pair<int, int32_t> *rk_pairs,
+    std::vector<int64_t> &accumulator,
+    float *Y_com);
+
+void accumulate_single_row_to_ycom_int64_block(
+    const ggml_gemmini_args_t &args,
+    const DecRoutePlan &plan,
+    size_t J,
+    const float *activation_scales,
+    const std::vector<int> &unique_k,
+    const std::vector<int64_t> &delta_by_k,
+    std::vector<int64_t> &accumulator,
+    float *Y_com);
+
+void accumulate_to_ycom_int64_h1(const ggml_gemmini_args_t &, const DecRoutePlan &, size_t, size_t, const float *, const std::vector<int> &, const std::vector<size_t> &, const std::pair<int, int32_t> *, std::vector<int64_t> &, float *);
+void accumulate_single_row_to_ycom_int64_h1(const ggml_gemmini_args_t &, const DecRoutePlan &, size_t, const float *, const std::vector<int> &, const std::vector<int64_t> &, std::vector<int64_t> &, float *);
+
 void accumulate_to_ycom(
     const float *Wk_f,
     size_t J,
