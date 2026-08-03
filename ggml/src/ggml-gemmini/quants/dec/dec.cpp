@@ -12,6 +12,14 @@
 #include <utility>
 #include <vector>
 
+#ifndef DEC_VALIDATION
+#define DEC_VALIDATION 0
+#endif
+
+#if DEC_VALIDATION
+#include <limits>
+#endif
+
 namespace ggml::gemmini::quants::dec { namespace
 {
     struct RkTriplet
@@ -61,6 +69,260 @@ namespace ggml::gemmini::quants::dec { namespace
         static thread_local ActivationDECScratch scratch;
         return scratch;
     }
+
+    void log_dec_reject(const char *layer, const char *reason, const ggml_gemmini_args_t &args)
+    {
+#if LOG_DEBUG
+        ggml::gemmini::log::debug(
+            layer,
+            "[dec.reject] reason=%s I=%zu K=%zu J=%zu format=%u",
+            reason,
+            args.I,
+            args.K,
+            args.J,
+            static_cast<unsigned>(args.weight_format));
+#else
+        (void) layer;
+        (void) reason;
+        (void) args;
+#endif
+    }
+
+    bool has_required_dec_scale_metadata(
+        const WeightScaleInfo &weight_scales,
+        const ggml_gemmini_args_t &args)
+    {
+        if (!weight_scales.supported)
+            return false;
+
+        if (weight_scales.scalar_mode || weight_scales.row_header_mode || weight_scales.channel_mode)
+            return weight_scales.scalar_mode ? std::isfinite(weight_scales.scalar) :
+                weight_scales.rows >= args.J &&
+                (weight_scales.row_header_mode || weight_scales.data != nullptr);
+
+        if (!weight_scales.data || weight_scales.rows < args.J || weight_scales.cols == 0 ||
+            weight_scales.block_size == 0)
+            return false;
+
+        const size_t required_blocks = 1 + (args.K - 1) / weight_scales.block_size;
+        return weight_scales.cols >= required_blocks;
+    }
+
+#if DEC_VALIDATION
+    bool checked_add_i64(int64_t lhs, int64_t rhs, int64_t &out)
+    {
+        if ((rhs > 0 && lhs > std::numeric_limits<int64_t>::max() - rhs) ||
+            (rhs < 0 && lhs < std::numeric_limits<int64_t>::min() - rhs))
+            return false;
+
+        out = lhs + rhs;
+        return true;
+    }
+
+    bool checked_mul_i64(int64_t lhs, int64_t rhs, int64_t &out)
+    {
+        if (lhs == 0 || rhs == 0)
+        {
+            out = 0;
+            return true;
+        }
+
+        if ((lhs == -1 && rhs == std::numeric_limits<int64_t>::min()) ||
+            (rhs == -1 && lhs == std::numeric_limits<int64_t>::min()))
+            return false;
+
+        if ((lhs > 0 && rhs > 0 && lhs > std::numeric_limits<int64_t>::max() / rhs) ||
+            (lhs > 0 && rhs < 0 && rhs < std::numeric_limits<int64_t>::min() / lhs) ||
+            (lhs < 0 && rhs > 0 && lhs < std::numeric_limits<int64_t>::min() / rhs) ||
+            (lhs < 0 && rhs < 0 && lhs < std::numeric_limits<int64_t>::max() / rhs))
+            return false;
+
+        out = lhs * rhs;
+        return true;
+    }
+
+    bool reference_weight_code(
+        size_t k,
+        size_t j,
+        const ggml_gemmini_args_t &args,
+        int8_t &code)
+    {
+        if (is_q8_hp1_args(args))
+        {
+            const block_q8_hp1 *block = args.q8_hp1_block(j, k / QK8_HP);
+            if (!block)
+                return false;
+            code = block->qs[k % QK8_HP];
+            return true;
+        }
+        if (is_q8_hp2_args(args))
+        {
+            const block_q8_hp2 *block = args.q8_hp2_block(j, k / QK8_HP);
+            if (!block)
+                return false;
+            code = block->qs[k % QK8_HP];
+            return true;
+        }
+        if (is_q8_h2_args(args))
+        {
+            const block_q8_h2 *block = args.q8_h2_block(j, k / QK8_H2);
+            if (!block)
+                return false;
+            code = block->qs[k % QK8_H2];
+            return true;
+        }
+        if (is_q8_h1_args(args))
+        {
+            const block_q8_h1 *block = args.q8_h1_block(j, k / QK8_0);
+            if (!block)
+                return false;
+            code = block->qs[k % QK8_0];
+            return true;
+        }
+
+        const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
+        if (!weights)
+            return false;
+
+        const size_t stride = resolve_weight_stride_elems(args);
+        code = resolve_weight_layout(args) == WeightLayout::KxJ_RowMajor ?
+            weights[k * stride + j] : weights[j * stride + k];
+        return true;
+    }
+
+    float reference_route_scale(
+        const WeightScaleInfo &weight_scales,
+        const ggml_gemmini_args_t &args,
+        size_t j,
+        size_t route)
+    {
+        if (weight_scales.row_header_mode)
+            return args.q8_channel_scale(j);
+        if (weight_scales.scalar_mode)
+            return weight_scales.scalar;
+        if (weight_scales.channel_mode)
+            return weight_scales.data[j];
+        return weight_scales.data[j * weight_scales.cols + route];
+    }
+
+    bool accumulate_scalar_reference(
+        const ggml_gemmini_args_t &args,
+        const WeightScaleInfo &weight_scales,
+        const float *activation_scales,
+        const std::vector<int> &unique_k,
+        const std::vector<size_t> &rk_offs,
+        const std::pair<int, int32_t> *rk_pairs,
+        const std::vector<int64_t> &delta_by_k,
+        bool decode,
+        float *reference_ycom)
+    {
+        const bool per_block_scale = !weight_scales.scalar_mode && !weight_scales.row_header_mode &&
+            !weight_scales.channel_mode;
+        const size_t route_count = per_block_scale ? weight_scales.cols : 1;
+        std::vector<int64_t> accumulator(args.I * args.J, 0);
+
+        for (size_t route = 0; route < route_count; ++route)
+        {
+            std::fill(accumulator.begin(), accumulator.end(), int64_t {0});
+            for (int k : unique_k)
+            {
+                if (k < 0)
+                    continue;
+
+                const size_t k_sz = static_cast<size_t>(k);
+                if (k_sz >= args.K ||
+                    (per_block_scale && k_sz / weight_scales.block_size != route))
+                    continue;
+
+                for (size_t j = 0; j < args.J; ++j)
+                {
+                    int8_t weight_code = 0;
+                    if (!reference_weight_code(k_sz, j, args, weight_code))
+                        return false;
+
+                    if (decode)
+                    {
+                        if (k_sz >= delta_by_k.size())
+                            return false;
+
+                        int64_t product = 0;
+                        int64_t updated = 0;
+                        if (!checked_mul_i64(delta_by_k[k_sz], weight_code, product) ||
+                            !checked_add_i64(accumulator[j], product, updated))
+                            return false;
+                        accumulator[j] = updated;
+                        continue;
+                    }
+
+                    if (k_sz + 1 >= rk_offs.size())
+                        return false;
+                    for (size_t p = rk_offs[k_sz]; p < rk_offs[k_sz + 1]; ++p)
+                    {
+                        const int r = rk_pairs[p].first;
+                        if (r < 0 || static_cast<size_t>(r) >= args.I)
+                            return false;
+
+                        int64_t product = 0;
+                        int64_t updated = 0;
+                        const size_t accumulator_index = static_cast<size_t>(r) * args.J + j;
+                        // int32 residual * int8 code is <= 2^38; int64 permits at least 2^25 such terms per route.
+                        if (!checked_mul_i64(rk_pairs[p].second, weight_code, product) ||
+                            !checked_add_i64(accumulator[accumulator_index], product, updated))
+                            return false;
+                        accumulator[accumulator_index] = updated;
+                    }
+                }
+            }
+
+            for (size_t r = 0; r < args.I; ++r)
+            {
+                const float activation_scale = activation_scales ? activation_scales[r] : 1.0f;
+                for (size_t j = 0; j < args.J; ++j)
+                {
+                    const size_t index = r * args.J + j;
+                    reference_ycom[index] += static_cast<float>(
+                        static_cast<double>(accumulator[index]) * activation_scale *
+                        reference_route_scale(weight_scales, args, j, route));
+                }
+            }
+        }
+
+        return true;
+    }
+
+    bool output_offset(const ggml_gemmini_args_t &args, size_t r, size_t j, size_t &offset)
+    {
+        const size_t row_stride = args.stride_f_out ? args.stride_f_out : args.J;
+        const size_t col_stride = args.col_stride_f_out ? args.col_stride_f_out : 1;
+        if ((r != 0 && row_stride > std::numeric_limits<size_t>::max() / r) ||
+            (j != 0 && col_stride > std::numeric_limits<size_t>::max() / j))
+            return false;
+
+        const size_t row_offset = r * row_stride;
+        const size_t col_offset = j * col_stride;
+        if (row_offset > std::numeric_limits<size_t>::max() - col_offset)
+            return false;
+
+        offset = row_offset + col_offset;
+        return true;
+    }
+
+    bool capture_output(const ggml_gemmini_args_t &args, std::vector<float> &output)
+    {
+        output.resize(args.I * args.J);
+        for (size_t r = 0; r < args.I; ++r)
+        {
+            for (size_t j = 0; j < args.J; ++j)
+            {
+                size_t offset = 0;
+                if (!output_offset(args, r, j, offset))
+                    return false;
+                output[r * args.J + j] = args.f_out[offset];
+            }
+        }
+        return true;
+    }
+#endif
 
     void load_weight_row_scaled(
         size_t k,
@@ -327,10 +589,31 @@ ActivationDECResult compensate_activation_dec(
     uint64_t start = ggml::gemmini::cycle::read();
 
     ActivationDECResult result{};
+    bool native_h1 = false;
+    bool q8_h2 = false;
     bool q8_hp1 = false;
     bool q8_hp2 = false;
     switch (args.weight_format)
     {
+        case ggml_gemmini_args_t::im2p_weight_format_t::q8_h0:
+            log_dec_reject(layer, "q8_h0 is unsupported", args);
+            return result;
+        case ggml_gemmini_args_t::im2p_weight_format_t::q8_h1:
+            native_h1 = args.has_q8_h1_im2p_contract();
+            if (!native_h1)
+            {
+                log_dec_reject(layer, "invalid q8_h1 contract", args);
+                return result;
+            }
+            break;
+        case ggml_gemmini_args_t::im2p_weight_format_t::q8_h2:
+            q8_h2 = args.has_q8_h2_im2p_contract();
+            if (!q8_h2)
+            {
+                log_dec_reject(layer, "invalid q8_h2 contract", args);
+                return result;
+            }
+            break;
         case ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1:
             q8_hp1 = has_q8_hp1_native_dec_contract(args);
             if (q8_hp1) {
@@ -341,10 +624,12 @@ ActivationDECResult compensate_activation_dec(
                     const block_q8_hp1 & b = args.q8_hp1_blocks[i];
                     if (b.padding[0] != 0 || b.padding[1] != 0 ||
                         !std::isfinite(b.channel_scale)) {
+                        log_dec_reject(layer, "invalid q8_hp1 block metadata", args);
                         return result;
                     }
                 }
             } else {
+                log_dec_reject(layer, "invalid q8_hp1 contract", args);
                 return result;
             }
             break;
@@ -356,54 +641,76 @@ ActivationDECResult compensate_activation_dec(
                     const block_q8_hp2 & b = args.q8_hp2_blocks[i];
                     if (b.padding[0] != 0 || b.padding[1] != 0 ||
                         !std::isfinite(b.channel_scale)) {
+                        log_dec_reject(layer, "invalid q8_hp2 block metadata", args);
                         return result;
                     }
                 }
             } else {
+                log_dec_reject(layer, "invalid q8_hp2 contract", args);
                 return result;
             }
             break;
         case ggml_gemmini_args_t::im2p_weight_format_t::q8_channel:
             if (!args.has_q8_channel_direct_read_contract())
+            {
+                log_dec_reject(layer, "invalid q8_channel contract", args);
                 return result;
+            }
             break;
         case ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar:
             if (!args.has_q8_channel_dense_sidecar_contract())
+            {
+                log_dec_reject(layer, "invalid q8_channel_dense_sidecar contract", args);
                 return result;
+            }
+            break;
+        case ggml_gemmini_args_t::im2p_weight_format_t::q8_0_unpacked_to_h1:
             break;
         default:
-            break;
+            log_dec_reject(layer, "unsupported weight format", args);
+            return result;
     }
 
     const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
-    const bool native_h1 = args.has_q8_h1_im2p_contract();
-    const bool q8_h2 = is_q8_h2_args(args);
     if ((!weights && !native_h1 && !q8_hp1 && !q8_hp2 && !q8_h2) || !args.f_out)
+    {
+        log_dec_reject(layer, "missing weight or output buffer", args);
         return result;
+    }
 
     const size_t I = args.I;
     const size_t K = args.K;
     const size_t J = args.J;
 
     if (I == 0 || K == 0 || J == 0)
+    {
+        log_dec_reject(layer, "zero dimension", args);
         return result;
+    }
 
     const size_t weight_stride = resolve_weight_stride_elems(args);
     if (weight_stride == 0)
+    {
+        log_dec_reject(layer, "zero weight stride", args);
         return result;
+    }
 
     const WeightLayout weight_layout = resolve_weight_layout(args);
+    const size_t minimum_weight_stride = weight_layout == WeightLayout::KxJ_RowMajor ? J : K;
+    if (weights && weight_stride < minimum_weight_stride)
+    {
+        log_dec_reject(layer, "weight stride is shorter than logical row", args);
+        return result;
+    }
+
     const WeightScaleInfo weight_scales = build_weight_scale_info(
         args,
         WeightScaleInfoMode::Dec);
     auto activation_scales_vec = act::activation_scales(args, I);
     const float *activation_scales = activation_scales_vec.data();
-    if (!weight_scales.supported)
+    if (!has_required_dec_scale_metadata(weight_scales, args))
     {
-        ggml::gemmini::log::debug(
-            layer,
-            "[dec] reject unsupported weight metadata path: stripe_J=%zu",
-            args.stripe_J);
+        log_dec_reject(layer, "unsupported or incomplete weight scale metadata", args);
         return result;
     }
 
@@ -472,6 +779,29 @@ ActivationDECResult compensate_activation_dec(
         !weight_scales.row_header_mode &&
         weight_layout == WeightLayout::JxK_ColMajor &&
         weight_stride >= K;
+
+#if LOG_DEBUG
+    const char *route = decode ? (use_jmajor_blocked ? "decode-jmajor-blocked" : "decode-fallback") :
+        (use_jmajor_blocked ? "prefill-jmajor-blocked" : "prefill-fallback");
+    ggml::gemmini::log::debug(
+        layer,
+        "[dec.route] route=%s I=%zu K=%zu J=%zu scale_mode=%s",
+        route,
+        I,
+        K,
+        J,
+        weight_scales.scalar_mode ? "scalar" :
+            (weight_scales.row_header_mode ? "row-header" :
+                (weight_scales.channel_mode ? "channel" : "block")));
+    ggml::gemmini::log::debug(
+        layer,
+        "[dec.work] selected=%zu nnz=%zu unique_k=%zu output_stride_row=%zu output_stride_col=%zu",
+        result.total_selected,
+        result.nnz,
+        result.unique_k_count,
+        args.stride_f_out ? args.stride_f_out : J,
+        args.col_stride_f_out ? args.col_stride_f_out : 1);
+#endif
 
     if (decode)
     {
@@ -568,8 +898,72 @@ ActivationDECResult compensate_activation_dec(
     end = ggml::gemmini::cycle::read();
     ggml::gemmini::log::cycle(layer, "[dec] cpu.Compute and accumulate compensation", start, end);
 
+#if DEC_VALIDATION
+    std::vector<float> validation_output_before;
+    std::vector<float> reference_ycom(I * J, 0.0f);
+    const bool validation_ready = capture_output(args, validation_output_before) &&
+        accumulate_scalar_reference(
+            args,
+            weight_scales,
+            activation_scales,
+            scr.unique_k,
+            scr.rk_offs,
+            scr.rk_pairs.data(),
+            scr.i1_delta_by_k,
+            decode,
+            reference_ycom.data());
+#endif
+
     start = ggml::gemmini::cycle::read();
     apply_ycom_to_output(scr.Y_com.data(), I, J, args);
+    end = ggml::gemmini::cycle::read();
+    ggml::gemmini::log::cycle(layer, "[dec] cpu.Apply Y_com to output", start, end);
+
+#if DEC_VALIDATION
+    if (!validation_ready)
+    {
+        ggml::gemmini::log::debug(layer, "[dec.validation] skipped: reference setup failed");
+    }
+    else
+    {
+        float max_abs_error = 0.0f;
+        float max_relative_error = 0.0f;
+        bool finite = true;
+        for (size_t r = 0; r < I; ++r)
+        {
+            for (size_t j = 0; j < J; ++j)
+            {
+                size_t offset = 0;
+                if (!output_offset(args, r, j, offset))
+                {
+                    finite = false;
+                    continue;
+                }
+
+                const size_t index = r * J + j;
+                const float expected = validation_output_before[index] + reference_ycom[index];
+                const float observed = args.f_out[offset];
+                if (!std::isfinite(expected) || !std::isfinite(observed))
+                {
+                    finite = false;
+                    continue;
+                }
+
+                const float absolute_error = std::fabs(observed - expected);
+                const float relative_error = absolute_error /
+                    std::max(std::fabs(expected), std::numeric_limits<float>::min());
+                max_abs_error = std::max(max_abs_error, absolute_error);
+                max_relative_error = std::max(max_relative_error, relative_error);
+            }
+        }
+        ggml::gemmini::log::debug(
+            layer,
+            "[dec.validation] finite=%d max_abs_error=%.9g max_relative_error=%.9g",
+            finite ? 1 : 0,
+            max_abs_error,
+            max_relative_error);
+    }
+#endif
 
 #if LOG_DEBUG
     {
@@ -616,9 +1010,6 @@ ActivationDECResult compensate_activation_dec(
         }
     }
 #endif
-
-    end = ggml::gemmini::cycle::read();
-    ggml::gemmini::log::cycle(layer, "[dec] cpu.Apply Y_com to output", start, end);
     return result;
 }
 } // namespace ggml::gemmini::quants::dec

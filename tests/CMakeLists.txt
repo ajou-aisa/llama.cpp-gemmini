@@ -218,6 +218,29 @@ add_test(NAME gemmini_exsia_localstage_kernel_validation
 set_tests_properties(gemmini_exsia_localstage_kernel_validation PROPERTIES
     LABELS "gemmini;exsia;validation"
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+add_executable(test-gemmini-dec
+    test-gemmini-dec.cpp
+    ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
+    ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
+    ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
+    ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
+    ../ggml/src/ggml-gemmini/quants/act/token/token.cpp
+    ../ggml/src/ggml-gemmini/quants/dec/dec.cpp
+    ../ggml/src/ggml-gemmini/quants/dec/dec_kernel.cpp)
+target_link_libraries(test-gemmini-dec PRIVATE ggml-base ggml-gemmini-utils)
+target_compile_features(test-gemmini-dec PRIVATE cxx_std_17)
+target_compile_definitions(test-gemmini-dec PRIVATE DEC_VALIDATION=1)
+target_include_directories(test-gemmini-dec PRIVATE
+    ../ggml/include
+    ../ggml/src
+    ../ggml/src/ggml-gemmini
+    ../ggml/src/ggml-gemmini-utils/include
+    ../ggml/src/ggml-gemmini/quants
+    ../ggml/src/ggml-gemmini/quants/act
+    ../ggml/src/ggml-gemmini/quants/act/exsia
+    ../ggml/src/ggml-gemmini/quants/common
+    ../ggml/src/ggml-gemmini/quants/dec)
+add_test(NAME test-gemmini-dec COMMAND $<TARGET_FILE:test-gemmini-dec>)
 llama_build_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_build_and_test(test-autorelease.cpp        LABEL "model")
 

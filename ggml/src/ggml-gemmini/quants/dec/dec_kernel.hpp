@@ -9,6 +9,8 @@ struct ggml_gemmini_args_t;
 
 namespace ggml::gemmini::quants::dec
 {
+int resolve_dec_threads(size_t task_count, int omp_max_threads);
+
 void accumulate_to_ycom_jmajor_blocked(
     const ggml_gemmini_args_t &args,
     const float *weight_scales,

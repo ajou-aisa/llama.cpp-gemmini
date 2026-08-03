@@ -3,13 +3,37 @@
 #include "../../ggml-gemmini-args.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
+#include <limits>
 
 #if defined(GGML_GEMMINI_HAS_OPENMP)
 #include <omp.h>
 #endif
 
-namespace ggml::gemmini::quants::dec { namespace
+namespace ggml::gemmini::quants::dec
+{
+int resolve_dec_threads(size_t task_count, int omp_max_threads)
+{
+    const int task_limit = task_count > static_cast<size_t>(std::numeric_limits<int>::max()) ?
+        std::numeric_limits<int>::max() : std::max(1, static_cast<int>(task_count));
+    const int worker_limit = std::max(1, omp_max_threads);
+    int dec_threads = std::min(task_limit, worker_limit);
+
+    if (const char *env = std::getenv("DEC_THREADS"))
+    {
+        char *end = nullptr;
+        errno = 0;
+        const long long parsed = std::strtoll(env, &end, 10);
+        if (errno == 0 && end != env && end != nullptr && *end == '\0' &&
+            parsed > 0 && parsed <= std::numeric_limits<int>::max())
+            dec_threads = static_cast<int>(parsed);
+    }
+
+    return std::min(std::max(1, dec_threads), std::min(task_limit, worker_limit));
+}
+
+namespace
 {
     constexpr size_t kBlockedJWidth = 128;
     constexpr size_t kDecodeJWidth = 64;
@@ -22,25 +46,6 @@ namespace ggml::gemmini::quants::dec { namespace
     size_t resolve_out_stride_col(const ggml_gemmini_args_t &args)
     {
         return args.col_stride_f_out ? args.col_stride_f_out : 1;
-    }
-
-    inline int resolve_dec_threads(size_t block_count)
-    {
-        int dec_threads = std::max(1, static_cast<int>(block_count));
-
-#if defined(GGML_GEMMINI_HAS_OPENMP)
-        dec_threads = std::min(dec_threads, omp_get_max_threads());
-#endif
-
-        if (const char *env = std::getenv("DEC_THREADS"))
-        {
-            char *end = nullptr;
-            const long parsed = std::strtol(env, &end, 10);
-            if (end != env && end && *end == '\0' && parsed > 0)
-                dec_threads = static_cast<int>(parsed);
-        }
-
-        return std::max(1, dec_threads);
     }
 
     inline void accumulate_row_unrolled(float *dst, const float *Wk_f, float delta, size_t J)
@@ -228,7 +233,7 @@ void accumulate_to_ycom_jmajor_blocked(
     const size_t block_count = (J + kBlockedJWidth - 1) / kBlockedJWidth;
 
 #if defined(GGML_GEMMINI_HAS_OPENMP)
-    const int dec_threads = resolve_dec_threads(block_count);
+    const int dec_threads = resolve_dec_threads(block_count, omp_get_max_threads());
 #pragma omp parallel num_threads(dec_threads)
     {
         std::vector<float> y_block(I * kBlockedJWidth, 0.0f);
