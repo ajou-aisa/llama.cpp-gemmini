@@ -248,7 +248,7 @@ target_include_directories(test-gemmini-dec PRIVATE
 add_test(NAME test-gemmini-dec COMMAND $<TARGET_FILE:test-gemmini-dec>)
 
 add_executable(test-gemmini-matmul test-gemmini-matmul.cpp)
-target_link_libraries(test-gemmini-matmul PRIVATE ggml-gemmini)
+target_link_libraries(test-gemmini-matmul PRIVATE ggml-gemmini ggml-base)
 target_compile_features(test-gemmini-matmul PRIVATE cxx_std_17)
 add_test(NAME test-gemmini-matmul COMMAND $<TARGET_FILE:test-gemmini-matmul>)
 
