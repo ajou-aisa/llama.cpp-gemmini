@@ -937,6 +937,15 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         return value != nullptr && std::string_view(value) == "1";
     }();
     const bool facade_full_dispatch = !pipeline_enabled && !legacy_full_dispatch;
+    const size_t pipeline_job_capacity = [] {
+        constexpr size_t default_capacity = 2;
+        const char *value = std::getenv("GEMMINI_STRIPE_JOB_SLOTS");
+        if (value == nullptr || *value == '\0') {
+            return default_capacity;
+        }
+        const long requested = std::strtol(value, nullptr, 10);
+        return requested > 0 ? static_cast<size_t>(requested) : default_capacity;
+    }();
     if (pipeline_requested && !pipeline_enabled) {
         ggml::gemmini::log::debug(layer,
             "[matmul.pipeline] stripe-pipeline requires EXSIA activation; keeping full dispatch");
@@ -978,7 +987,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     args.A = reinterpret_cast<elem_t *>(qx);
     if (pipeline_enabled) {
-        pipeline_collector = std::make_unique<ggml::gemmini::MatmulStripeCollector>(args.I);
+        pipeline_collector = std::make_unique<ggml::gemmini::MatmulStripeCollector>(pipeline_job_capacity);
         args.exsia_stripe_ready_sink = pipeline_collector->sink();
     }
     ggml::gemmini::log::debug(
@@ -1402,8 +1411,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     if (pipeline_enabled) {
         ggml::gemmini::MatmulOptions pipeline_options{};
         pipeline_options.mode = ggml::gemmini::MatmulInvocationMode::stripe_pipeline;
-        pipeline_options.job_capacity = args.I;
+        pipeline_options.job_capacity = pipeline_job_capacity;
         pipeline_options.profiling = true;
+        ggml::gemmini::log::debug(layer, "[matmul.pipeline] job_slots=%zu", pipeline_job_capacity);
         if (const char *rc_shards = std::getenv("GEMMINI_RC_SHARDS")) {
             const int requested_shards = std::atoi(rc_shards);
             if (requested_shards > 0)
