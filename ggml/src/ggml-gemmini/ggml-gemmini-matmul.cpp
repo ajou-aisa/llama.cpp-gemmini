@@ -537,6 +537,10 @@ MatmulStatus MatmulStripeCollector::finish() {
     if (compensation_worker_.joinable()) {
         compensation_worker_.join();
     }
+    if (!status_ && execution_ != nullptr) {
+        execution_->status_ = status_;
+        execution_->state_ = MatmulExecutionState::failed;
+    }
     worker_started_ = false;
     return status_;
 }
@@ -904,7 +908,6 @@ MatmulStatus execute_dense_stripe(MatmulStripeJob & job) {
         { job.input_.row_begin(), job.input_.row_end() }, job.input_.stripe_id());
     job.status_ = to_public_status(
         status, status == MatMulStatus::unsupported ? MatMulCapability::unsupported : MatMulCapability::supported);
-    job.execution_->status_ = job.status_;
     if (job.status_) {
         job.state_ = MatmulStripeJob::State::dense_complete;
         record_metric(job.metrics_.ws, job.execution_->options_.profiling, start);
