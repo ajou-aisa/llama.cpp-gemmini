@@ -1428,6 +1428,65 @@ bool byte_identical(const std::vector<float> &lhs, const std::vector<float> &rhs
         std::memcmp(lhs.data(), rhs.data(), lhs.size() * sizeof(float)) == 0;
 }
 
+bool test_q8_h1_group_k_csc_matches_row_direct() {
+    ScopedDecGroupKCscEnv env_guard;
+    bool ok = true;
+    for (const size_t columns : { size_t {4}, size_t {257} }) {
+        constexpr size_t rows = 2;
+        constexpr size_t blocks_per_row = 2;
+        constexpr size_t depth = QK8_0 * blocks_per_row;
+        std::vector<block_q8_h1> blocks(columns * blocks_per_row);
+        for (size_t block_index = 0; block_index < blocks.size(); ++block_index) {
+            for (size_t offset = 0; offset < sizeof(blocks[block_index].qs); ++offset)
+                blocks[block_index].qs[offset] = static_cast<int8_t>(
+                    static_cast<int>((offset * 5 + block_index * 3) % 15) - 7);
+            blocks[block_index].c_b = static_cast<uint8_t>(3 + block_index % 7);
+            blocks[block_index].R = static_cast<uint16_t>(5 + block_index % 11);
+            blocks[block_index].s_rf = 0.0625f * static_cast<float>(1 + block_index % 3);
+        }
+
+        const std::vector<ggml::gemmini::quants::QactOutlier> outliers = {
+            { 0, 0, 3 }, { 0, 33, -1 }, { 1, 2, 2 }, { 1, 63, 4 },
+        };
+        std::vector<float> row_direct_output(rows * columns, 0.0f);
+        ggml_gemmini_args_t args = hierarchical_args(rows, row_direct_output);
+        args.J = columns;
+        args.K = depth;
+        args.sB = depth;
+        args.blocks_per_row = blocks_per_row;
+        args.blocks_K = blocks_per_row;
+        args.blocks_J = columns;
+        args.blocks_I = columns;
+        args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1;
+        args.q8_h1_blocks = blocks.data();
+        args.q8_h1_block_count = blocks.size();
+        args.q8_h1_rows = columns;
+
+        set_dec_group_k_csc_force(nullptr);
+        set_dec_group_k_csc_enable(nullptr);
+        set_dec_group_k_csc_disable("1");
+        const auto row_direct_result = ggml::gemmini::quants::dec::compensate_activation_dec(
+            outliers, args, "test");
+
+        std::vector<float> group_k_csc_output(rows * columns, 0.0f);
+        args.f_out = group_k_csc_output.data();
+        set_dec_group_k_csc_disable(nullptr);
+        set_dec_group_k_csc_enable("1");
+        const auto group_k_csc_result = ggml::gemmini::quants::dec::compensate_activation_dec(
+            outliers, args, "test");
+
+        const bool output_equal = byte_identical(row_direct_output, group_k_csc_output);
+        ok = check(row_direct_result.group_k_csc_plan_bytes == 0 &&
+                       group_k_csc_result.group_k_csc_plan_bytes > 0 &&
+                       group_k_csc_result.weight_vector_load_count > 0 &&
+                       output_equal,
+                   columns < 8 ?
+                       "H1 GroupKCSC NR4 matches RowDirect" :
+                       "H1 GroupKCSC NR8 matches RowDirect") && ok;
+    }
+    return ok;
+}
+
 bool test_group_k_csc_production_dispatch() {
     ScopedDecGroupKCscEnv env_guard;
     set_dec_group_k_csc_force(nullptr);
@@ -2540,7 +2599,7 @@ int main() {
     const bool ok = test_noop() && test_route_plan() && test_active_row_groups() && test_group_k_csc_plan() && test_route_metadata_rejects() && test_repeated_residuals() && test_decode_repeated_residuals() && test_integer_routes() && test_block_integer_route() &&
         test_q8_h1_hierarchical_route() && test_q8_h1_preserves_ordered_scaling_bits() && test_q8_h1_activation_scale_routes_preserve_bits() && test_unpacked_h1_tail_routes_preserve_bits() && test_q8_h1_large_effective_scale() && test_q8_h2_hierarchical_route() && test_q8_hp1_hierarchical_route() && test_q8_hp2_hierarchical_route() &&
         test_malformed_hierarchical_reject() && test_output_strides() && test_sparse_grouped_tails() && test_malformed_reject() && test_thread_clamp() &&
-        test_group_k_csc_production_dispatch() && test_fixed_residual_replay_baseline() &&
+        test_q8_h1_group_k_csc_matches_row_direct() && test_group_k_csc_production_dispatch() && test_fixed_residual_replay_baseline() &&
         test_fixed_residual_replay_high_reuse() && test_group_k_csc_nr4_transposed_j_tile() &&
         test_group_k_csc_mixed_int32_boundaries() &&
         test_group_k_csc_mixed_prefix_and_plan_rejects() &&
