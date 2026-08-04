@@ -5,6 +5,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 namespace ggml::gemmini {
@@ -101,9 +105,14 @@ struct MatmulStatus {
     explicit operator bool() const { return ok(); }
 };
 
+class MatmulExecution;
+
 class MatmulStripeCollector {
 public:
     explicit MatmulStripeCollector(size_t capacity);
+    ~MatmulStripeCollector();
+    bool start(MatmulExecution & execution);
+    MatmulStatus finish();
     const quants::act::exsia::StripeReadySink * sink() const;
     const MatmulStatus & status() const;
     const quants::QactOutlier & captured_outlier(size_t stripe, size_t outlier) const;
@@ -117,6 +126,14 @@ private:
     };
     static bool on_ready(void *, const quants::act::exsia::StripeReadyEvent &);
     friend MatmulStatus execute_post_fold_pipeline(const ggml_gemmini_args_t &, MatmulStripeCollector &);
+    void worker_loop();
+    bool worker_started_ = false;
+    bool stop_requested_ = false;
+    std::thread worker_;
+    MatmulExecution * execution_ = nullptr;
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    std::deque<CapturedStripe> pending_;
     size_t capacity_;
     std::vector<CapturedStripe> stripes_;
     MatmulStatus status_;

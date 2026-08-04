@@ -320,6 +320,70 @@ MatmulStripeCollector::MatmulStripeCollector(size_t capacity)
     }
 }
 
+MatmulStripeCollector::~MatmulStripeCollector() {
+    finish();
+}
+
+bool MatmulStripeCollector::start(MatmulExecution & execution) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!status_ || worker_started_ || execution.mode() != MatmulInvocationMode::stripe_pipeline) {
+        return false;
+    }
+    execution_ = &execution;
+    worker_started_ = true;
+    worker_ = std::thread(&MatmulStripeCollector::worker_loop, this);
+    return true;
+}
+
+MatmulStatus MatmulStripeCollector::finish() {
+    if (!worker_started_) {
+        return status_;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stop_requested_ = true;
+    }
+    condition_.notify_all();
+    if (worker_.joinable()) {
+        worker_.join();
+    }
+    worker_started_ = false;
+    return status_;
+}
+
+void MatmulStripeCollector::worker_loop() {
+    for (;;) {
+        CapturedStripe captured{};
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            condition_.wait(lock, [this] { return stop_requested_ || !pending_.empty(); });
+            if (pending_.empty()) {
+                break;
+            }
+            captured = std::move(pending_.front());
+            pending_.pop_front();
+            condition_.notify_all();
+        }
+
+        MatmulStripeJob job = capture_stripe(
+            *execution_,
+            MatmulStripeInput(captured.row_begin, captured.row_end, captured.stripe_id),
+            std::move(captured.outliers));
+        MatmulStatus status = prepare_compensation(job);
+        if (status) status = execute_dense_stripe(job);
+        if (status) status = execute_compensation_shard(job);
+        if (status) status = finalize_stripe(job);
+        if (!status) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            status_ = status;
+            stop_requested_ = true;
+            pending_.clear();
+            break;
+        }
+    }
+    condition_.notify_all();
+}
+
 const quants::act::exsia::StripeReadySink * MatmulStripeCollector::sink() const {
     return &sink_;
 }
@@ -343,14 +407,29 @@ bool MatmulStripeCollector::on_ready(
         collector.status_ = make_status(MatmulStatusCode::invalid_argument, "invalid stripe event");
         return false;
     }
-    if (collector.stripes_.size() >= collector.capacity_) {
-        collector.status_ = make_status(MatmulStatusCode::out_of_memory, "collector capacity exhausted");
-        return false;
-    }
     try {
         std::vector<quants::QactOutlier> outliers;
         if (event.outlier_count != 0) {
             outliers.assign(event.outliers, event.outliers + event.outlier_count);
+        }
+        if (collector.worker_started_) {
+            std::unique_lock<std::mutex> lock(collector.mutex_);
+            collector.condition_.wait(lock, [&collector] {
+                return collector.stop_requested_ || !collector.status_ ||
+                    collector.pending_.size() < collector.capacity_;
+            });
+            if (collector.stop_requested_ || !collector.status_) {
+                return false;
+            }
+            collector.pending_.push_back(
+                {event.stripe_id, event.row_begin, event.row_end, std::move(outliers)});
+            lock.unlock();
+            collector.condition_.notify_all();
+            return true;
+        }
+        if (collector.stripes_.size() >= collector.capacity_) {
+            collector.status_ = make_status(MatmulStatusCode::out_of_memory, "collector capacity exhausted");
+            return false;
         }
         collector.stripes_.push_back(
             {event.stripe_id, event.row_begin, event.row_end, std::move(outliers)});

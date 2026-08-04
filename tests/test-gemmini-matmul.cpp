@@ -244,12 +244,36 @@ bool test_staged_contract_errors() {
     return passed;
 }
 
+bool test_live_pipeline_worker() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> output(6, 0.0f);
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_pipeline;
+    options.job_capacity = 2;
+    auto execution = prepare_execution(make_args(activation, weights, output), options);
+    MatmulStripeCollector collector(2);
+    if (!check(execution.status().ok() && collector.start(execution), "live worker start")) {
+        return false;
+    }
+    const auto * sink = collector.sink();
+    if (!check(sink->on_ready(sink->user_data, { 0, 0, 2, nullptr, 0 }), "live worker capture") ||
+        !check(sink->on_ready(sink->user_data, { 1, 2, 3, nullptr, 0 }), "live worker tail capture") ||
+        !check(collector.finish().ok(), "live worker finish") ||
+        !check(finish_execution(execution).ok(), "live worker execution finish")) {
+        return false;
+    }
+    std::puts("PASS edge: pipeline=live-worker capture->dense->rc->finish");
+    return true;
+}
+
 }
 
 int main(int argc, char ** argv) {
     const bool edge_only = argc == 2 && std::string_view(argv[1]) == "--edge";
     const bool edge = test_public_contract_shape() && test_bounded_pipeline_slots_and_reuse() &&
-        test_staged_contract_errors();
+        test_live_pipeline_worker() && test_staged_contract_errors();
     if (edge_only) {
         return edge ? 0 : 1;
     }

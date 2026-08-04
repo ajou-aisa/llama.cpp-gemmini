@@ -923,6 +923,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     std::vector<int8_t> q8_channel_dense;
     std::vector<float> q8_channel_scales;
     std::unique_ptr<ggml::gemmini::MatmulStripeCollector> pipeline_collector;
+    std::unique_ptr<ggml::gemmini::MatmulExecution> pipeline_execution;
     const bool pipeline_requested = [] {
         const char *value = std::getenv("GEMMINI_MATMUL_INVOCATION");
         return value != nullptr && std::string_view(value) == "stripe-pipeline";
@@ -1384,6 +1385,18 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.col_stride_f_out = dst->nb[0] / sizeof(float);
     args.stride_f_out = dst->nb[1] / sizeof(float);
 
+    if (pipeline_enabled) {
+        ggml::gemmini::MatmulOptions pipeline_options{};
+        pipeline_options.mode = ggml::gemmini::MatmulInvocationMode::stripe_pipeline;
+        pipeline_options.job_capacity = args.I;
+        pipeline_execution = std::make_unique<ggml::gemmini::MatmulExecution>(
+            ggml::gemmini::prepare_execution(args, pipeline_options));
+        if (!pipeline_execution->status() || !pipeline_collector->start(*pipeline_execution)) {
+            ggml::gemmini::log::debug(layer, "[matmul.pipeline] staged worker start failed");
+            return;
+        }
+    }
+
     end = ggml::gemmini::cycle::read();
     ggml::gemmini::log::cycle(layer, "cpu.Set Args for calling gemmini", start, end);
 
@@ -1483,11 +1496,18 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     }
     }
     if (pipeline_enabled) {
-        const auto pipeline_status = ggml::gemmini::execute_post_fold_pipeline(args, *pipeline_collector);
+        const auto pipeline_status = pipeline_collector->finish();
         ggml::gemmini::log::debug(layer,
-            "[matmul.pipeline] mode=post-fold-staged status=%d message=%s",
+            "[matmul.pipeline] mode=live-staged status=%d message=%s",
             static_cast<int>(pipeline_status.code), pipeline_status.message);
         if (!pipeline_status) {
+            return;
+        }
+        const auto execution_status = ggml::gemmini::finish_execution(*pipeline_execution);
+        if (!execution_status) {
+            ggml::gemmini::log::debug(layer,
+                "[matmul.pipeline] execution status=%d message=%s",
+                static_cast<int>(execution_status.code), execution_status.message);
             return;
         }
     }
