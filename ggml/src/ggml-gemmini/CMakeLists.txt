@@ -55,6 +55,7 @@ set(GEMMINI_RISCV_FLAGS
 
 ggml_add_backend_library(ggml-gemmini
                           ggml-gemmini.cpp
+                          ggml-gemmini-matmul.cpp
                           ggml-gemmini-q8-h1-artifact.cpp
                           ggml-gemmini-q8-h1-artifact-reader.cpp
                             quants/act/dispatch.cpp
