@@ -2043,7 +2043,7 @@ int main(int argc, char **argv) {
         const auto &state = fixture_exsia.state();
         const bool bounded_public_scratch =
             state.x_f32.empty() && state.q_wide.empty() &&
-            state.block_exp.empty() && state.residual.empty();
+            state.block_exp.empty() && state.residual.size() == fixture_args.I * state.K_padded;
         const bool state_ok = run_ok && state.K_logical == fixture_cols &&
                               state.K_padded >= fixture_cols && state.stripe.size() > 1 &&
                               fixture_meta.theta.size() == state.stripe.size() &&
