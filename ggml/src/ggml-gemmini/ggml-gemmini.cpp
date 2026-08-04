@@ -1422,7 +1422,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         ggml::gemmini::MatmulOptions pipeline_options{};
         pipeline_options.mode = ggml::gemmini::MatmulInvocationMode::stripe_pipeline;
         pipeline_options.job_capacity = pipeline_job_capacity;
-        pipeline_options.profiling = true;
+        pipeline_options.profiling = LOG_DEBUG != 0 || LOG_CYCLE != 0;
         ggml::gemmini::log::debug(layer, "[matmul.pipeline] job_slots=%zu", pipeline_job_capacity);
         if (const char *rc_shards = std::getenv("GEMMINI_RC_SHARDS")) {
             const int requested_shards = std::atoi(rc_shards);
