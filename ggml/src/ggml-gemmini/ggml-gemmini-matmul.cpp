@@ -508,6 +508,7 @@ MatmulInvocationMode MatmulExecution::mode() const {
 }
 
 MatmulExecutionState MatmulExecution::state() const {
+    std::lock_guard<std::mutex> lock(*state_mutex_);
     return state_;
 }
 
@@ -814,6 +815,7 @@ MatmulStripeJob::~MatmulStripeJob() {
 
 void MatmulStripeJob::release_slot() {
     if (owns_slot_ && execution_ != nullptr) {
+        std::lock_guard<std::mutex> state_lock(*execution_->state_mutex_);
         --execution_->active_jobs_;
         owns_slot_ = false;
     }
@@ -863,6 +865,7 @@ MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput in
                                std::vector<quants::QactOutlier> outliers) {
     const auto start = Clock::now();
     MatmulStatus status{};
+    std::lock_guard<std::mutex> state_lock(*execution.state_mutex_);
     if (!execution.status_.ok()) {
         status = execution.status_;
     } else if (execution.options_.mode == MatmulInvocationMode::full) {
@@ -1051,7 +1054,10 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
     job.metrics_.row_end = job.input_.row_end();
     job.metrics_.rc_shards = job.expected_shards_;
     job.state_ = MatmulStripeJob::State::finalized;
-    job.execution_->finalized_rows_ += job.input_.row_end() - job.input_.row_begin();
+    {
+        std::lock_guard<std::mutex> state_lock(*job.execution_->state_mutex_);
+        job.execution_->finalized_rows_ += job.input_.row_end() - job.input_.row_begin();
+    }
     record_metric(job.metrics_.rc_finalize, job.execution_->options_.profiling, start);
     job.release_slot();
     job.status_ = {};
@@ -1059,6 +1065,7 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
 }
 
 MatmulStatus finish_execution(MatmulExecution & execution) {
+    std::lock_guard<std::mutex> state_lock(*execution.state_mutex_);
     if (execution.options_.mode == MatmulInvocationMode::full) {
         return execution.facade_.state() == MatMulState::completed ? execution.status_ : invalid_state();
     }

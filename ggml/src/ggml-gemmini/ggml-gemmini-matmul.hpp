@@ -311,6 +311,7 @@ private:
     MatmulOptions options_;
     MatmulStatus status_;
     MatmulExecutionState state_ = MatmulExecutionState::empty;
+    std::shared_ptr<std::mutex> state_mutex_ = std::make_shared<std::mutex>();
     size_t active_jobs_ = 0;
     size_t captured_rows_ = 0;
     size_t finalized_rows_ = 0;
