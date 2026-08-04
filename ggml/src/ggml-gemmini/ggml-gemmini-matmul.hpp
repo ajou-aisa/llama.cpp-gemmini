@@ -430,6 +430,7 @@ private:
     size_t completed_shards_ = 0;
     bool parallel_shards_ = false;
     std::shared_ptr<std::mutex> shard_mutex_ = std::make_shared<std::mutex>();
+    std::shared_ptr<const quants::dec::PreparedDecSlice> prepared_dec_;
     std::condition_variable lifecycle_condition_;
     std::vector<float> compensation_ycom_;
     MatmulDenseState dense_state_ = MatmulDenseState::idle;

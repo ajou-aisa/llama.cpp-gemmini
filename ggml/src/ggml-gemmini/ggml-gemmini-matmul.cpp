@@ -304,6 +304,24 @@ MatmulStatus unsupported_backend(const char * message) {
     return make_status(MatmulStatusCode::unsupported_backend, message, MatMulCapability::unsupported);
 }
 
+MatmulStatus from_dec_status(quants::dec::DecStatus status, const char * message) {
+    switch (status) {
+        case quants::dec::DecStatus::success:
+            return {};
+        case quants::dec::DecStatus::unsupported:
+            return unsupported_backend(message);
+        case quants::dec::DecStatus::invalid_arguments:
+        case quants::dec::DecStatus::invalid_shard:
+            return make_status(MatmulStatusCode::invalid_argument, message,
+                               MatMulCapability::unsupported);
+        case quants::dec::DecStatus::allocation_failure:
+            return make_status(MatmulStatusCode::out_of_memory, message);
+        case quants::dec::DecStatus::execution_failed:
+            return make_status(MatmulStatusCode::execution_failure, message);
+    }
+    return make_status(MatmulStatusCode::execution_failure, message);
+}
+
 using Clock = std::chrono::steady_clock;
 
 void record_metric(MatmulStageMetrics & metric, bool enabled, Clock::time_point start) {
@@ -1056,9 +1074,7 @@ void MatmulStripeCollector::compensation_loop() {
             job->metrics_.rc_start_ns = now_ns();
         }
         job->lifecycle_condition_.notify_all();
-        const size_t shard_count = std::max<size_t>(1, std::min(
-            execution_->options_.rc_shards == 0 ? size_t {1} : execution_->options_.rc_shards,
-            execution_->facade_.args().J));
+        const size_t shard_count = job->prepared_dec_->shard_count();
         const auto rc_start = Clock::now();
         if (status && shard_count == 1) {
             status = execute_compensation_shard(*job, 0, 1);
@@ -1246,6 +1262,7 @@ MatmulStripeJob::MatmulStripeJob(MatmulStripeJob && other) noexcept
       released_(other.released_), collector_slot_released_(other.collector_slot_released_),
       expected_shards_(other.expected_shards_), completed_shards_(other.completed_shards_),
       parallel_shards_(other.parallel_shards_), shard_mutex_(std::move(other.shard_mutex_)),
+      prepared_dec_(std::move(other.prepared_dec_)),
       dense_state_(other.dense_state_), rc_state_(other.rc_state_), captured_(other.captured_),
       finalized_(other.finalized_) {
     other.execution_ = nullptr;
@@ -1272,6 +1289,7 @@ MatmulStripeJob & MatmulStripeJob::operator=(MatmulStripeJob && other) noexcept 
         expected_shards_ = other.expected_shards_;
         completed_shards_ = other.completed_shards_;
         parallel_shards_ = other.parallel_shards_;
+        prepared_dec_ = std::move(other.prepared_dec_);
         dense_state_ = other.dense_state_;
         rc_state_ = other.rc_state_;
         captured_ = other.captured_;
@@ -1509,6 +1527,7 @@ MatmulStatus prepare_compensation(MatmulStripeJob & job) {
     const auto & args = job.execution_->facade_.args();
     std::unique_ptr<quants::act::Meta> staged_activation_meta;
     std::vector<float> compensation_ycom;
+    std::shared_ptr<const quants::dec::PreparedDecSlice> prepared_dec;
     try {
         if (!has_captured_outliers) {
             const auto & all_outliers = quants::activation_outliers_view(args);
@@ -1544,6 +1563,17 @@ MatmulStatus prepare_compensation(MatmulStripeJob & job) {
             }
             compensation_ycom.assign(elements, 0.0f);
         }
+        const size_t requested_shards = job.execution_->options_.rc_shards == 0 ?
+            size_t {1} : job.execution_->options_.rc_shards;
+        const MatmulStatus plan_status = from_dec_status(
+            quants::dec::prepare_activation_dec_slice(
+                outliers, args, job.input_.row_begin(), job.input_.row_end(),
+                requested_shards, job.execution_->dispatch_override_, prepared_dec),
+            "compensation preparation failed");
+        if (!plan_status) {
+            job.record_failure(plan_status, false);
+            return plan_status;
+        }
     } catch (const std::bad_alloc &) {
         const MatmulStatus failure = make_status(
             MatmulStatusCode::out_of_memory, "compensation preparation allocation failed");
@@ -1559,6 +1589,8 @@ MatmulStatus prepare_compensation(MatmulStripeJob & job) {
         job.has_captured_outliers_ = true;
         job.staged_activation_meta_ = std::move(staged_activation_meta);
         job.compensation_ycom_ = std::move(compensation_ycom);
+        job.prepared_dec_ = std::move(prepared_dec);
+        job.expected_shards_ = job.prepared_dec_->shard_count();
         job.rc_state_ = MatmulRcState::prepared;
         record_metric(job.metrics_.rc_prepare, job.execution_->options_.profiling, start);
     }
@@ -1639,7 +1671,7 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job, size_t shard_id, 
         std::lock_guard<std::mutex> lock(*job.shard_mutex_);
         if (job.execution_ == nullptr || !job.captured_ || job.finalized_ ||
             (job.rc_state_ != MatmulRcState::prepared && job.rc_state_ != MatmulRcState::running) ||
-            !job.status_) {
+            !job.status_ || job.prepared_dec_ == nullptr) {
             return invalid_state("compensation execution requires RC prepared state");
         }
         if (shard_count == 0 || shard_id >= shard_count) {
@@ -1666,34 +1698,16 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job, size_t shard_id, 
         }
     }
     const auto start = Clock::now();
-    auto dec_status = quants::dec::ActivationDECRowSliceStatus::success;
     MatmulStatus result{};
-    const size_t col_begin = job.execution_->facade_.args().J * shard_id / shard_count;
-    const size_t col_end = job.execution_->facade_.args().J * (shard_id + 1) / shard_count;
-    char dec_layer[64];
-    std::snprintf(dec_layer, sizeof(dec_layer), "ggml-gemmini-matmul.stripe-%zu",
-                  job.input_.stripe_id());
+    quants::dec::DecShardScratch scratch;
 #if ERROR_COMPENSATION
-    if (!job.compensation_outliers_.empty()) {
-        dec_status = quants::dec::compensate_activation_dec_rows_columns(
-            job.compensation_outliers_, job.execution_->facade_.args(),
-            job.input_.row_begin(), job.input_.row_end(), col_begin, col_end,
-            dec_layer, job.execution_->dispatch_override_,
-            job.compensation_ycom_.data() + col_begin, job.execution_->facade_.args().J);
-    }
-#else
-    (void) col_begin;
-    (void) col_end;
-    (void) dec_layer;
+    result = from_dec_status(
+        quants::dec::execute_prepared_dec_shard(
+            *job.prepared_dec_, shard_id, scratch,
+            job.compensation_ycom_.empty() ? nullptr : job.compensation_ycom_.data(),
+            job.compensation_ycom_.empty() ? 0 : job.execution_->facade_.args().J),
+        "compensation execution failed");
 #endif
-    if (result.ok()) {
-        if (dec_status == quants::dec::ActivationDECRowSliceStatus::unsupported) {
-            result = unsupported_backend("compensation execution is unsupported by backend");
-        } else if (dec_status == quants::dec::ActivationDECRowSliceStatus::invalid_arguments) {
-            result = make_status(
-            MatmulStatusCode::invalid_argument, "invalid compensation shard", MatMulCapability::unsupported);
-        }
-    }
     if (!result.ok()) {
         job.record_failure(result, false);
         return result;
@@ -1817,8 +1831,7 @@ MatmulStatus matmul_impl(MatmulExecution execution, const ggml_gemmini_args_t & 
         if (!status) {
             return status;
         }
-        const size_t shard_count = std::max<size_t>(1, std::min(
-            options.rc_shards == 0 ? size_t {1} : options.rc_shards, args.J));
+        const size_t shard_count = job.snapshot().expected_shards;
         for (size_t shard_id = 0; status && shard_id < shard_count; ++shard_id)
             status = execute_compensation_shard(job, shard_id, shard_count);
         if (!status) {
@@ -1860,8 +1873,7 @@ MatmulStatus execute_post_fold_pipeline(
             std::move(captured.outliers));
         MatmulStatus status = prepare_compensation(job);
         if (status) status = execute_dense_stripe(job);
-        const size_t shard_count = std::max<size_t>(1, std::min(
-            options.rc_shards == 0 ? size_t {1} : options.rc_shards, args.J));
+        const size_t shard_count = job.snapshot().expected_shards;
         for (size_t shard_id = 0; status && shard_id < shard_count; ++shard_id)
             status = execute_compensation_shard(job, shard_id, shard_count);
         if (status) status = finalize_stripe(job);
