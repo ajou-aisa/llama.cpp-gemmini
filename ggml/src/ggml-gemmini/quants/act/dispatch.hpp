@@ -21,6 +21,7 @@ bool dequantize_activation(float *dst,
                            const ggml_gemmini_args_t &args);
 
 std::vector<QactOutlier> outliers(const ggml_gemmini_args_t &args);
+const std::vector<QactOutlier> &outliers_view(const ggml_gemmini_args_t &args);
 
 std::vector<float> activation_scales(const ggml_gemmini_args_t &args, size_t row_count);
 

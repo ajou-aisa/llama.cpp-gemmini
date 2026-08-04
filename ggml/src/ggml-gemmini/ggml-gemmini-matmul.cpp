@@ -1105,7 +1105,16 @@ MatmulStatus prepare_compensation(MatmulStripeJob & job) {
     const auto start = Clock::now();
     const auto & args = job.execution_->facade_.args();
     if (!job.has_captured_outliers_) {
-        job.compensation_outliers_ = quants::activation_outliers(args);
+        const auto &all_outliers = quants::activation_outliers_view(args);
+        job.compensation_outliers_.reserve(all_outliers.size());
+        for (const auto & outlier : all_outliers) {
+            if (outlier.row >= 0 &&
+                static_cast<size_t>(outlier.row) >= job.input_.row_begin() &&
+                static_cast<size_t>(outlier.row) < job.input_.row_end()) {
+                job.compensation_outliers_.push_back(outlier);
+            }
+        }
+        job.has_captured_outliers_ = true;
     }
     job.state_ = MatmulStripeJob::State::compensation_prepared;
     job.status_ = {};

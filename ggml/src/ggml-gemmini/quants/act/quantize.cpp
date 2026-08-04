@@ -102,4 +102,9 @@ std::vector<QactOutlier> activation_outliers(const ggml_gemmini_args_t &args)
 {
     return act::outliers(args);
 }
+
+const std::vector<QactOutlier> &activation_outliers_view(const ggml_gemmini_args_t &args)
+{
+    return act::outliers_view(args);
+}
 } // namespace ggml::gemmini::quants

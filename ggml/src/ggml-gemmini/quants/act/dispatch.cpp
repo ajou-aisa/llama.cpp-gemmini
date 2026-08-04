@@ -129,6 +129,17 @@ std::vector<QactOutlier> outliers(const ggml_gemmini_args_t &args)
     return {};
 }
 
+const std::vector<QactOutlier> &outliers_view(const ggml_gemmini_args_t &args)
+{
+    static const std::vector<QactOutlier> empty;
+    const auto &storage = args.act_quant.storage();
+    if (const auto *meta = std::get_if<exsia::Meta>(&storage)) return meta->outliers;
+    if (const auto *meta = std::get_if<tensor::Meta>(&storage)) return meta->outliers;
+    if (const auto *meta = std::get_if<token::Meta>(&storage)) return meta->outliers;
+    if (const auto *meta = std::get_if<stripe::Meta>(&storage)) return meta->outliers;
+    return empty;
+}
+
 std::vector<float> activation_scales(const ggml_gemmini_args_t &args, size_t row_count)
 {
     std::vector<float> scales(row_count, 1.0f);
