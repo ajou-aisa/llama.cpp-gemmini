@@ -313,8 +313,15 @@ bool test_malformed_route_contract_rejected() {
     args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1;
     ggml::gemmini::MatMul facade(args);
     const auto result = facade.run_full();
-    return check(result.status == ggml::gemmini::MatMulStatus::invalid_contract,
-                 "malformed native weight contract rejected");
+    if (!check(result.status == ggml::gemmini::MatMulStatus::invalid_contract,
+               "malformed native weight contract rejected")) {
+        return false;
+    }
+    auto missing_dense_weight = make_args(activation, weights, output);
+    missing_dense_weight.B = nullptr;
+    ggml::gemmini::MatMul missing_dense_facade(missing_dense_weight);
+    return check(missing_dense_facade.run_full().status == ggml::gemmini::MatMulStatus::invalid_contract,
+                 "missing dense weight contract rejected");
 }
 
 bool test_bounded_pipeline_slots_and_reuse() {

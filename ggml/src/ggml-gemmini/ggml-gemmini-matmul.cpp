@@ -282,6 +282,15 @@ MatMulResult MatMul::run_dense() {
     if (!detail::route_capabilities(args()).full) {
         return { MatMulStatus::unsupported, MatMulCapability::unsupported };
     }
+    const auto format = args().weight_format;
+    const bool metadata_weight =
+        format == ggml_gemmini_args_t::im2p_weight_format_t::q8_h1 ||
+        format == ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1 ||
+        format == ggml_gemmini_args_t::im2p_weight_format_t::q8_h2 ||
+        format == ggml_gemmini_args_t::im2p_weight_format_t::q8_hp2;
+    if (args().B == nullptr && args().B_fp32 == nullptr && !metadata_weight) {
+        return { MatMulStatus::invalid_contract, MatMulCapability::unsupported };
+    }
     switch (args().weight_format) {
         case ggml_gemmini_args_t::im2p_weight_format_t::q8_channel:
             if (!args().has_q8_channel_direct_read_contract()) {
