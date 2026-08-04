@@ -514,6 +514,7 @@ void MatmulStripeCollector::worker_loop() {
             MatmulStripeInput(captured.row_begin, captured.row_end, captured.stripe_id),
             std::move(captured.outliers));
         job.metrics_.la_cycles = captured.la_cycles;
+        job.metrics_.la3_cycles = captured.la3_cycles;
         job.metrics_.sf_cycles = captured.sf_cycles;
         MatmulStatus status = prepare_compensation(job);
         if (status) status = execute_dense_stripe(job);
@@ -660,7 +661,9 @@ bool MatmulStripeCollector::on_ready(
                  event.local_end_cycle >= event.local_start_cycle ?
                      event.local_end_cycle - event.local_start_cycle : 0,
                  event.folding_end_cycle >= event.folding_start_cycle ?
-                     event.folding_end_cycle - event.folding_start_cycle : 0});
+                     event.folding_end_cycle - event.folding_start_cycle : 0,
+                 event.local_group3_end_cycle >= event.local_group3_start_cycle ?
+                     event.local_group3_end_cycle - event.local_group3_start_cycle : 0});
             lock.unlock();
             collector.condition_.notify_all();
             return true;
@@ -674,7 +677,9 @@ bool MatmulStripeCollector::on_ready(
              event.local_end_cycle >= event.local_start_cycle ?
                  event.local_end_cycle - event.local_start_cycle : 0,
              event.folding_end_cycle >= event.folding_start_cycle ?
-                 event.folding_end_cycle - event.folding_start_cycle : 0});
+                 event.folding_end_cycle - event.folding_start_cycle : 0,
+             event.local_group3_end_cycle >= event.local_group3_start_cycle ?
+                 event.local_group3_end_cycle - event.local_group3_start_cycle : 0});
     } catch (const std::bad_alloc &) {
         collector.status_ = make_status(MatmulStatusCode::out_of_memory, "stripe capture allocation failed");
         return false;

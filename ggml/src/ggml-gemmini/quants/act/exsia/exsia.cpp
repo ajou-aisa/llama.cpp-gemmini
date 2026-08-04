@@ -1600,6 +1600,10 @@ namespace ggml::gemmini::quants::act::exsia
             if (profile != nullptr) {
                 event.local_start_cycle = profile->local.start;
                 event.local_end_cycle = profile->local.end;
+                if (profile->local_groups.size() > 3) {
+                    event.local_group3_start_cycle = profile->local_groups[3].start;
+                    event.local_group3_end_cycle = profile->local_groups[3].end;
+                }
                 event.folding_start_cycle = profile->folding.start;
                 event.folding_end_cycle = profile->folding.end;
             }

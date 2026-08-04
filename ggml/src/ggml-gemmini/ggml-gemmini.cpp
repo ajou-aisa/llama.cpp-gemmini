@@ -1559,12 +1559,13 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         for (const auto & profile : pipeline_collector->profiles()) {
             ggml::gemmini::log::debug(layer,
                 "[matmul.stripe] stripe_id=%zu row_begin=%zu row_end=%zu "
-                "la_cycles=%llu sf_cycles=%llu handoff_ns=%llu ws_ns=%llu "
+                "la_cycles=%llu la3_cycles=%llu sf_cycles=%llu handoff_ns=%llu ws_ns=%llu "
                 "rc_prepare_ns=%llu rc_compute_ns=%llu rc_finalize_ns=%llu rc_shards=%zu",
                 profile.stripe_id,
                 profile.row_begin,
                 profile.row_end,
                 static_cast<unsigned long long>(profile.la_cycles),
+                static_cast<unsigned long long>(profile.la3_cycles),
                 static_cast<unsigned long long>(profile.sf_cycles),
                 static_cast<unsigned long long>(profile.handoff.nanoseconds),
                 static_cast<unsigned long long>(profile.ws.nanoseconds),
