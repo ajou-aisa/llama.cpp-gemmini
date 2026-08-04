@@ -106,7 +106,7 @@ bool test_fp32_full_facade_matches_legacy() {
 }
 
 bool test_native_and_channel_full_facade_parity() {
-    constexpr size_t rows = 1;
+    constexpr size_t rows = 2;
     constexpr size_t columns = 2;
     constexpr size_t depth = QK8_0;
     std::vector<elem_t> activation(depth, 3);
@@ -134,6 +134,13 @@ bool test_native_and_channel_full_facade_parity() {
     h1_facade_args.f_out = h1_facade.data();
     ggml::gemmini::tiled_matmul_auto_im2p(&h1_args);
     const auto h1_result = ggml::gemmini::MatMul(h1_facade_args).run_full();
+    std::vector<float> h1_stripe(rows * columns, 0.0f);
+    auto h1_stripe_args = h1_facade_args;
+    h1_stripe_args.f_out = h1_stripe.data();
+    ggml::gemmini::MatmulOptions stripe_options{};
+    stripe_options.mode = ggml::gemmini::MatmulInvocationMode::stripe_sequential;
+    stripe_options.stripe_rows = 1;
+    const auto h1_stripe_result = ggml::gemmini::matmul(h1_stripe_args, stripe_options);
 
     std::array<block_q8_hp1, columns> hp1_blocks{};
     std::vector<float> hp1_legacy(rows * columns, 0.0f);
@@ -229,6 +236,10 @@ bool test_native_and_channel_full_facade_parity() {
         &direct_args, ggml::gemmini::baseline_activation_quant_t::TENSOR,
         ggml::gemmini::baseline_weight_quant_t::CHANNEL);
     const auto direct_result = ggml::gemmini::MatMul(direct_facade_args).run_full();
+    std::vector<float> direct_stripe(rows * columns, 0.0f);
+    auto direct_stripe_args = direct_facade_args;
+    direct_stripe_args.f_out = direct_stripe.data();
+    const auto direct_stripe_result = ggml::gemmini::matmul(direct_stripe_args, stripe_options);
 
     std::vector<float> sidecar_legacy(rows * columns, 0.0f);
     std::vector<float> sidecar_facade(rows * columns, 0.0f);
@@ -250,7 +261,8 @@ bool test_native_and_channel_full_facade_parity() {
     const auto sidecar_result = ggml::gemmini::MatMul(sidecar_facade_args).run_full();
 
     return check(h1_result.status == ggml::gemmini::MatMulStatus::success &&
-                     same_output(h1_facade, h1_legacy),
+                     same_output(h1_facade, h1_legacy) && h1_stripe_result.ok() &&
+                     same_output(h1_stripe, h1_legacy),
                  "Q8_H1 facade parity") &&
         check(hp1_result.status == ggml::gemmini::MatMulStatus::success &&
                      same_output(hp1_facade, hp1_legacy),
@@ -266,7 +278,8 @@ bool test_native_and_channel_full_facade_parity() {
                          ggml::gemmini::MatMulCapability::unsupported,
               "Q8_HP2 full-only facade parity") &&
         check(direct_result.status == ggml::gemmini::MatMulStatus::success &&
-                     same_output(direct_facade, direct_legacy),
+                     same_output(direct_facade, direct_legacy) && direct_stripe_result.ok() &&
+                     same_output(direct_stripe, direct_legacy),
               "Q8_CHANNEL direct facade parity") &&
         check(sidecar_result.status == ggml::gemmini::MatMulStatus::success &&
                      same_output(sidecar_facade, sidecar_legacy),
