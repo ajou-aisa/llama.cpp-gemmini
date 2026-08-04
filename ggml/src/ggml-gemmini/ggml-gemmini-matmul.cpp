@@ -208,6 +208,11 @@ RouteCapabilities route_capabilities(const ggml_gemmini_args_t & args) {
     caps.live_stripe_producer = key.activation == ActivationRoute::exsia && caps.sliced_compensation;
     caps.external_rc_shards = caps.sliced_compensation;
     caps.internal_parallel_dense = caps.full;
+    if (key.activation == ActivationRoute::exsia &&
+        (key.weight == WeightRoute::q8_channel_direct ||
+         key.weight == WeightRoute::q8_channel_sidecar)) {
+        caps = {};
+    }
     if (key.backend == BackendRoute::gemmini_os || key.backend == BackendRoute::ws_sim) {
         caps = {};
         caps.deprecated = key.weight == WeightRoute::q8_h2 || key.weight == WeightRoute::q8_hp2;
