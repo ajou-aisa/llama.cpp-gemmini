@@ -1986,11 +1986,13 @@ int main(int argc, char **argv) {
             selection_comparison_json = build_selection_json(comparison);
             const bool mismatch_count_check = comparison.mismatch_count ==
                 comparison.float_only.size() + comparison.integer_only.size();
-            const bool expected_mismatch_check =
-                comparison.float_only.empty() &&
-                comparison.integer_only.size() == 1 &&
-                comparison.integer_only[0].row == 31 &&
-                comparison.integer_only[0].col == 7;
+            const bool expected_mismatch_check = compiled_tau == 2
+                ? comparison.float_only.empty() &&
+                  comparison.integer_only.size() == 1 &&
+                  comparison.integer_only[0].row == 31 &&
+                  comparison.integer_only[0].col == 7
+                : compiled_tau == 3 && comparison.float_only.empty() &&
+                  comparison.integer_only.empty();
             timing_and_selection_check = check(
                 ((timing_should_be_available &&
                   timing.status == "available" &&
