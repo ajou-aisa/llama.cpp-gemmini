@@ -126,9 +126,9 @@ namespace
         return true;
     }
 
-    bool gemmini_q8_channel_weight_contract(const ggml_tensor * weight)
+    bool gemmini_q8_channel_layout_contract(const ggml_tensor * weight)
     {
-        if (weight == nullptr || weight->type != GGML_TYPE_Q8_CHANNEL || weight->data == nullptr ||
+        if (weight == nullptr || weight->type != GGML_TYPE_Q8_CHANNEL ||
             weight->view_src != nullptr || weight->view_offs != 0 ||
             weight->ne[0] <= 0 || weight->ne[1] <= 0 || weight->ne[2] != 1 || weight->ne[3] != 1) {
             return false;
@@ -143,14 +143,21 @@ namespace
         const size_t row_size = ggml_row_size(GGML_TYPE_Q8_CHANNEL, weight->ne[0]);
         const size_t row_count = static_cast<size_t>(weight->ne[1]);
         size_t storage_bytes = 0;
-        if (!gemmini_checked_mul(row_size, row_count, storage_bytes) ||
-            row_size != sizeof(float) + dim_k ||
-            weight->nb[0] != 1 || weight->nb[1] != row_size ||
-            weight->nb[2] != storage_bytes || weight->nb[3] != storage_bytes ||
-            ggml_nbytes(weight) != storage_bytes) {
+        return gemmini_checked_mul(row_size, row_count, storage_bytes) &&
+            row_size == sizeof(float) + dim_k &&
+            weight->nb[0] == 1 && weight->nb[1] == row_size &&
+            weight->nb[2] == storage_bytes && weight->nb[3] == storage_bytes &&
+            ggml_nbytes(weight) == storage_bytes;
+    }
+
+    bool gemmini_q8_channel_weight_contract(const ggml_tensor * weight)
+    {
+        if (!gemmini_q8_channel_layout_contract(weight) || weight->data == nullptr) {
             return false;
         }
 
+        const size_t row_size = ggml_row_size(GGML_TYPE_Q8_CHANNEL, weight->ne[0]);
+        const size_t row_count = static_cast<size_t>(weight->ne[1]);
         const auto * row_base = static_cast<const uint8_t *>(weight->data);
         for (size_t row = 0; row < row_count; ++row) {
             float scale = 0.0f;
@@ -170,9 +177,11 @@ namespace
     };
 
     static gemmini_q8_channel_int_route_t gemmini_q8_channel_int_route_for(
-        const ggml_tensor * weight)
+        const ggml_tensor * weight,
+        bool validate_payload = true)
     {
-        if (!gemmini_q8_channel_weight_contract(weight)) {
+        if (validate_payload ? !gemmini_q8_channel_weight_contract(weight) :
+                               !gemmini_q8_channel_layout_contract(weight)) {
             return gemmini_q8_channel_int_route_t::unsupported;
         }
 
@@ -193,7 +202,6 @@ namespace
             }
         } else if constexpr (OPTION == OS || OPTION == WS) {
             if constexpr (
-                ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA ||
                 ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TENSOR ||
                 ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TOKEN ||
                 ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::STRIPE
@@ -221,7 +229,9 @@ namespace
         if (weight->ne[2] != 1 || weight->ne[3] != 1 ||
             weight->ne[0] != activation->ne[0] || op->ne[0] != weight->ne[1] ||
             ggml_nrows(activation) != ggml_nrows(op) ||
-            !(ggml_is_contiguous(weight) || gemmini_q8_channel_weight_contract(weight)) ||
+            !(ggml_is_contiguous(weight) ||
+              (weight->data == nullptr ? gemmini_q8_channel_layout_contract(weight) :
+                                         gemmini_q8_channel_weight_contract(weight))) ||
             !ggml_is_contiguous(activation) ||
             !ggml_is_contiguous(op)) {
             return false;
@@ -933,7 +943,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     // set tile size
     start = ggml::gemmini::cycle::read();
-    ggml::gemmini::gemmini_set_tile(&args);
+    ggml::gemmini::gemmini_set_tile_ws(&args);
     end = ggml::gemmini::cycle::read();
     ggml::gemmini::log::cycle(layer, "cpu.Set tile size", start, end);
 
@@ -1719,7 +1729,8 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
             // contract and validates the backing storage.
             if (gemmini_is_loader_metadata(a)) {
                 if (!gemmini_shared_weight_contract(op) || a->ne[0] <= 0 || a->ne[1] <= 0 ||
-                    a->ne[2] != 1 || a->ne[3] != 1 || !ggml_is_contiguous(a)) {
+                    a->ne[2] != 1 || a->ne[3] != 1 ||
+                    !(ggml_is_contiguous(a) || gemmini_q8_channel_layout_contract(a))) {
                     return false;
                 }
 
@@ -1733,6 +1744,16 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
                 if (a->type == GGML_TYPE_Q8_HP2) {
                     ggml_gemmini_args_t args;
                     return gemmini_set_q8_hp2_weight_args(a, args, true);
+                }
+                if (a->type == GGML_TYPE_Q8_CHANNEL) {
+                    if constexpr (
+                        ggml::gemmini::config::CURRENT_COMPUTE_TYPE ==
+                        ggml::gemmini::config::ComputeType::INT
+                    ) {
+                        return gemmini_q8_channel_int_route_for(a, false) !=
+                            gemmini_q8_channel_int_route_t::unsupported;
+                    }
+                    return gemmini_q8_channel_layout_contract(a);
                 }
 
                 return false;
