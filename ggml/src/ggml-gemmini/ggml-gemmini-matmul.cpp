@@ -157,6 +157,11 @@ void record_metric(MatmulStageMetrics & metric, bool enabled, Clock::time_point 
     ++metric.count;
 }
 
+uint64_t now_ns() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        Clock::now().time_since_epoch()).count());
+}
+
 }
 
 namespace detail {
@@ -517,7 +522,9 @@ void MatmulStripeCollector::worker_loop() {
         job.metrics_.la3_cycles = captured.la3_cycles;
         job.metrics_.sf_cycles = captured.sf_cycles;
         MatmulStatus status = prepare_compensation(job);
+        job.metrics_.ws_start_ns = now_ns();
         if (status) status = execute_dense_stripe(job);
+        job.metrics_.ws_end_ns = now_ns();
         if (status) {
             std::lock_guard<std::mutex> lock(mutex_);
             ++in_flight_;
@@ -558,6 +565,7 @@ void MatmulStripeCollector::compensation_loop() {
         }
 
         MatmulStatus status = job->status();
+        job->metrics_.rc_start_ns = now_ns();
         const size_t shard_count = std::max<size_t>(1, std::min(
             execution_->options_.rc_shards == 0 ? size_t {1} : execution_->options_.rc_shards,
             execution_->facade_.args().J));
@@ -596,6 +604,7 @@ void MatmulStripeCollector::compensation_loop() {
             }
         }
         if (status) status = finalize_stripe(*job);
+        job->metrics_.rc_end_ns = now_ns();
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (status) {

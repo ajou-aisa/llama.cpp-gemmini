@@ -1560,7 +1560,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             ggml::gemmini::log::debug(layer,
                 "[matmul.stripe] stripe_id=%zu row_begin=%zu row_end=%zu "
                 "la_cycles=%llu la3_cycles=%llu sf_cycles=%llu handoff_ns=%llu ws_ns=%llu "
-                "rc_prepare_ns=%llu rc_compute_ns=%llu rc_finalize_ns=%llu rc_shards=%zu",
+                "rc_prepare_ns=%llu rc_compute_ns=%llu rc_finalize_ns=%llu "
+                "ws_start_ns=%llu ws_end_ns=%llu rc_start_ns=%llu rc_end_ns=%llu rc_shards=%zu",
                 profile.stripe_id,
                 profile.row_begin,
                 profile.row_end,
@@ -1572,6 +1573,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 static_cast<unsigned long long>(profile.rc_prepare.nanoseconds),
                 static_cast<unsigned long long>(profile.rc_compute.nanoseconds),
                 static_cast<unsigned long long>(profile.rc_finalize.nanoseconds),
+                static_cast<unsigned long long>(profile.ws_start_ns),
+                static_cast<unsigned long long>(profile.ws_end_ns),
+                static_cast<unsigned long long>(profile.rc_start_ns),
+                static_cast<unsigned long long>(profile.rc_end_ns),
                 profile.rc_shards);
         }
     }

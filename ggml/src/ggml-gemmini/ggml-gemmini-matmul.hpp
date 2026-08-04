@@ -170,6 +170,10 @@ struct MatmulJobMetrics {
     MatmulStageMetrics rc_prepare;
     MatmulStageMetrics rc_compute;
     MatmulStageMetrics rc_finalize;
+    uint64_t ws_start_ns = 0;
+    uint64_t ws_end_ns = 0;
+    uint64_t rc_start_ns = 0;
+    uint64_t rc_end_ns = 0;
 };
 
 class MatmulExecution;
