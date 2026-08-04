@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <vector>
 
@@ -470,18 +471,23 @@ ActivationDECResult compensate_activation_dec(
     end = ggml::gemmini::cycle::read();
     ggml::gemmini::log::cycle(layer, "[dec] cpu.Build group-major index", start, end);
 
-    start = ggml::gemmini::cycle::read();
-
-    if (!build_group_k_csc_plan(
-            scr.residual_entries, scr.active_row_groups, scr.group_offsets,
-            scr.group_row_group_indices, group_count, scr.group_k_csc_plan))
+    // Test/replay opt-in; production remains row-direct.
+    const char *force_group_k_csc = std::getenv("DEC_GROUP_K_CSC_FORCE");
+    if (force_group_k_csc && force_group_k_csc[0] == '1' && force_group_k_csc[1] == '\0')
     {
-        log_dec_reject(layer, "unable to represent group-K CSC plan", args);
-        return ActivationDECResult{};
-    }
+        start = ggml::gemmini::cycle::read();
 
-    end = ggml::gemmini::cycle::read();
-    ggml::gemmini::log::cycle(layer, "[dec] cpu.Build group-K CSC plan", start, end);
+        if (!build_group_k_csc_plan(
+                scr.residual_entries, scr.active_row_groups, scr.group_offsets,
+                scr.group_row_group_indices, group_count, scr.group_k_csc_plan))
+        {
+            log_dec_reject(layer, "unable to represent group-K CSC plan", args);
+            return ActivationDECResult{};
+        }
+
+        end = ggml::gemmini::cycle::read();
+        ggml::gemmini::log::cycle(layer, "[dec] cpu.Build group-K CSC plan", start, end);
+    }
 
     start = ggml::gemmini::cycle::read();
 

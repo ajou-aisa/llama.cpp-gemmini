@@ -1189,6 +1189,17 @@ void set_dec_threads(const char *value) {
 #endif
 }
 
+void set_dec_group_k_csc_force(const char *value) {
+#if defined(_WIN32)
+    _putenv_s("DEC_GROUP_K_CSC_FORCE", value ? value : "");
+#else
+    if (value)
+        setenv("DEC_GROUP_K_CSC_FORCE", value, 1);
+    else
+        unsetenv("DEC_GROUP_K_CSC_FORCE");
+#endif
+}
+
 bool test_thread_clamp() {
     const char *previous = std::getenv("DEC_THREADS");
     const std::string saved = previous ? previous : "";
@@ -1258,6 +1269,10 @@ bool test_fixed_residual_replay_baseline() {
     };
     std::vector<float> output(rows * cols, 0.0f);
     ggml_gemmini_args_t args = dense_args(rows, cols, depth, weights, output, 0.25f);
+    const char *previous_force = std::getenv("DEC_GROUP_K_CSC_FORCE");
+    const std::string saved_force = previous_force ? previous_force : "";
+    const bool had_previous_force = previous_force != nullptr;
+    set_dec_group_k_csc_force(nullptr);
     const auto result = ggml::gemmini::quants::dec::compensate_activation_dec(
         shuffled_outliers, args, "test");
     const std::array<uint32_t, rows * cols> expected_bits = {
@@ -1276,6 +1291,12 @@ bool test_fixed_residual_replay_baseline() {
     const size_t expected_group_k_csc_plan_bytes =
         (active_k_groups * (ggml::gemmini::quants::dec::kDecGroupSizeK + 1) +
          shuffled_outliers.size() + (active_k_groups + 1) + active_row_groups) * sizeof(uint32_t);
+
+    std::fill(output.begin(), output.end(), 0.0f);
+    set_dec_group_k_csc_force("1");
+    const auto forced_result = ggml::gemmini::quants::dec::compensate_activation_dec(
+        shuffled_outliers, args, "test");
+    set_dec_group_k_csc_force(had_previous_force ? saved_force.c_str() : nullptr);
 
     std::vector<ResidualGroupEntry> entries = {
         { 2, 34, 2 }, { 0, 0, 4 }, { 1, 33, -3 }, { 0, 0, -1 },
@@ -1323,9 +1344,10 @@ bool test_fixed_residual_replay_baseline() {
                         result.active_row_k_pairs == 5 && result.rows_per_active_k_max == 2 &&
                         result.ycom_global_write_count == rows * cols &&
                         result.current_sparse_plan_bytes == expected_current_sparse_plan_bytes &&
-                        result.group_k_csc_plan_bytes == expected_group_k_csc_plan_bytes &&
+                        result.group_k_csc_plan_bytes == 0 &&
+                        forced_result.group_k_csc_plan_bytes == expected_group_k_csc_plan_bytes &&
                         result.thread_scratch_bytes == rows * cols * sizeof(int64_t),
-                    "fixed replay sparse baseline counters");
+                    "fixed replay defaults to row-direct and force builds GroupKCSC");
     for (size_t index = 0; index < output.size(); ++index)
         ok = check(float_bits(output[index]) == expected_bits[index], "fixed replay baseline output bits") && ok;
     ok = check(group_k_csc_ready && group_k_csc_accumulated && group_k_csc_nr8_accumulated &&
