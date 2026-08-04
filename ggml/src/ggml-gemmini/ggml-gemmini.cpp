@@ -941,18 +941,21 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     std::vector<float> q8_channel_scales;
     std::unique_ptr<ggml::gemmini::MatmulStripeCollector> pipeline_collector;
     std::unique_ptr<ggml::gemmini::MatmulExecution> pipeline_execution;
-    const bool pipeline_requested = [] {
+    const auto requested_invocation = [] {
         const char *value = std::getenv("GEMMINI_MATMUL_INVOCATION");
-        return value != nullptr && std::string_view(value) == "stripe-pipeline";
+        return value != nullptr ? std::string_view(value) : std::string_view("full");
     }();
+    const bool pipeline_requested = requested_invocation == "stripe-pipeline";
+    const bool sequential_requested = requested_invocation == "stripe-sequential";
     constexpr bool exsia_pipeline_supported =
         ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA;
     const bool pipeline_enabled = pipeline_requested && exsia_pipeline_supported && I > 1;
+    const bool sequential_enabled = sequential_requested;
     const bool legacy_full_dispatch = [] {
         const char *value = std::getenv("GEMMINI_LEGACY_FULL_DISPATCH");
         return value != nullptr && std::string_view(value) == "1";
     }();
-    const bool facade_full_dispatch = !pipeline_enabled && !legacy_full_dispatch;
+    const bool facade_full_dispatch = !pipeline_enabled && !sequential_enabled && !legacy_full_dispatch;
     const size_t pipeline_job_capacity = [] {
         constexpr size_t default_capacity = 2;
         const char *value = std::getenv("GEMMINI_STRIPE_JOB_SLOTS");
@@ -965,6 +968,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     if (pipeline_requested && !pipeline_enabled) {
         ggml::gemmini::log::debug(layer,
             "[matmul.pipeline] stripe-pipeline requires EXSIA activation and I>1; keeping full dispatch");
+    }
+    if (sequential_enabled) {
+        ggml::gemmini::log::debug(layer, "[matmul.sequential] enabled");
     }
 
     // set args
@@ -1443,6 +1449,25 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             pipeline_collector->finish();
             ggml::gemmini::log::debug(layer, "activation quantize failed");
             return;
+        }
+    }
+
+    if (sequential_enabled) {
+        ggml::gemmini::MatmulOptions sequential_options{};
+        sequential_options.mode = ggml::gemmini::MatmulInvocationMode::stripe_sequential;
+        sequential_options.stripe_rows = args.tile_I != 0 ? args.tile_I * DIM : args.I;
+        sequential_options.profiling = LOG_DEBUG != 0 || LOG_CYCLE != 0;
+        if (const char *rc_shards = std::getenv("GEMMINI_RC_SHARDS")) {
+            const int requested_shards = std::atoi(rc_shards);
+            if (requested_shards > 0)
+                sequential_options.rc_shards = static_cast<size_t>(requested_shards);
+        }
+        const auto sequential_status = ggml::gemmini::matmul(args, sequential_options);
+        if (!sequential_status) {
+            ggml::gemmini::log::debug(layer,
+                "[matmul.sequential] status=%d message=%s",
+                static_cast<int>(sequential_status.code), sequential_status.message);
+            GGML_ABORT("Gemmini stripe sequential execution failed");
         }
     }
 
