@@ -34,6 +34,7 @@ ggml_gemmini_args_t make_args(std::vector<elem_t> & activation,
     args.stride_f_out = args.J;
     args.weight_i8_scale_active = true;
     args.weight_scale = 1.0f;
+    args.tiled_matmul_type = CPU;
     return args;
 }
 
@@ -239,8 +240,20 @@ bool test_route_capability_table() {
         return false;
     }
     args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar;
-    return check(detail::normalize_route(args).weight == detail::WeightRoute::q8_channel_sidecar,
-                  "Q8_CHANNEL sidecar normalization");
+    if (!check(detail::normalize_route(args).weight == detail::WeightRoute::q8_channel_sidecar,
+               "Q8_CHANNEL sidecar normalization")) {
+        return false;
+    }
+    args.tiled_matmul_type = WS;
+    if (!check(detail::normalize_route(args).backend == detail::BackendRoute::gemmini_ws &&
+                   detail::route_capabilities(args).full,
+               "Gemmini WS backend capability")) {
+        return false;
+    }
+    args.tiled_matmul_type = OS;
+    return check(detail::normalize_route(args).backend == detail::BackendRoute::gemmini_os &&
+                     !detail::route_capabilities(args).full,
+                 "Gemmini OS explicit unsupported capability");
 }
 
 bool test_malformed_route_contract_rejected() {

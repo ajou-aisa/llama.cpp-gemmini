@@ -168,6 +168,12 @@ namespace detail {
 
 RouteKey normalize_route(const ggml_gemmini_args_t & args) {
     RouteKey key{};
+    switch (args.tiled_matmul_type) {
+        case CPU: key.backend = BackendRoute::cpu; break;
+        case WS: key.backend = BackendRoute::gemmini_ws; break;
+        case OS: key.backend = BackendRoute::gemmini_os; break;
+        default: key.backend = BackendRoute::ws_sim; break;
+    }
     const auto & storage = args.act_quant.storage();
     if (std::holds_alternative<quants::act::exsia::Meta>(storage)) key.activation = ActivationRoute::exsia;
     else if (std::holds_alternative<quants::act::tensor::Meta>(storage)) key.activation = ActivationRoute::tensor;
@@ -202,6 +208,10 @@ RouteCapabilities route_capabilities(const ggml_gemmini_args_t & args) {
     caps.live_stripe_producer = key.activation == ActivationRoute::exsia && caps.sliced_compensation;
     caps.external_rc_shards = caps.sliced_compensation;
     caps.internal_parallel_dense = caps.full;
+    if (key.backend == BackendRoute::gemmini_os || key.backend == BackendRoute::ws_sim) {
+        caps = {};
+        caps.deprecated = key.weight == WeightRoute::q8_h2 || key.weight == WeightRoute::q8_hp2;
+    }
     return caps;
 }
 
