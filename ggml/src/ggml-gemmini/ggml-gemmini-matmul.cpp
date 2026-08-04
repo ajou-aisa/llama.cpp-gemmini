@@ -28,9 +28,86 @@ bool row_invariant_activation(const ggml_gemmini_args_t & args) {
         std::holds_alternative<quants::act::tensor::Meta>(storage);
 }
 
+bool supports_row_slice_activation(const ggml_gemmini_args_t & args) {
+    const auto & storage = args.act_quant.storage();
+    return row_invariant_activation(args) ||
+        std::holds_alternative<quants::act::exsia::Meta>(storage) ||
+        std::holds_alternative<quants::act::token::Meta>(storage) ||
+        std::holds_alternative<quants::act::block::Meta>(storage) ||
+        std::holds_alternative<quants::act::stripe::Meta>(storage);
+}
+
 bool uses_baseline_channel_route(const ggml_gemmini_args_t & args) {
     return args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_channel ||
         args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar;
+}
+
+template <typename Vector>
+bool slice_row_vector(Vector & values, size_t row_begin, size_t row_end) {
+    if (row_begin > row_end || row_end > values.size()) {
+        return false;
+    }
+    values = Vector(values.begin() + row_begin, values.begin() + row_end);
+    return true;
+}
+
+template <typename Meta>
+void slice_outliers(Meta & meta, size_t row_begin, size_t row_end) {
+    std::vector<quants::QactOutlier> local;
+    local.reserve(meta.outliers.size());
+    for (const auto & outlier : meta.outliers) {
+        if (outlier.row < 0 || static_cast<size_t>(outlier.row) < row_begin ||
+            static_cast<size_t>(outlier.row) >= row_end) {
+            continue;
+        }
+        local.push_back({ outlier.row - static_cast<int>(row_begin), outlier.col, outlier.residual });
+    }
+    meta.outliers = std::move(local);
+}
+
+bool slice_activation_metadata(ggml_gemmini_args_t & args, size_t row_begin, size_t row_end) {
+    if (args.tile_I != 0 && args.tile_I > std::numeric_limits<size_t>::max() / DIM) {
+        return false;
+    }
+    const size_t rows_per_tile = args.tile_I == 0 ? args.I : args.tile_I * DIM;
+    if (rows_per_tile == 0) {
+        return false;
+    }
+    if (row_end > std::numeric_limits<size_t>::max() - (rows_per_tile - 1)) {
+        return false;
+    }
+
+    auto & storage = args.act_quant.storage();
+    if (auto * meta = std::get_if<quants::act::exsia::Meta>(&storage)) {
+        const size_t first_tile = row_begin / rows_per_tile;
+        const size_t last_tile = (row_end + rows_per_tile - 1) / rows_per_tile;
+        if (!slice_row_vector(meta->theta, first_tile, last_tile)) {
+            return false;
+        }
+        slice_outliers(*meta, row_begin, row_end);
+        args.activation_row_offset = 0;
+    } else if (auto * meta = std::get_if<quants::act::token::Meta>(&storage)) {
+        if (!slice_row_vector(meta->scales, row_begin, row_end)) {
+            return false;
+        }
+        slice_outliers(*meta, row_begin, row_end);
+        args.activation_row_offset = 0;
+    } else if (auto * meta = std::get_if<quants::act::block::Meta>(&storage)) {
+        if (!slice_row_vector(meta->scales, row_begin, row_end)) {
+            return false;
+        }
+        slice_outliers(*meta, row_begin, row_end);
+        args.activation_row_offset = 0;
+    } else if (auto * meta = std::get_if<quants::act::stripe::Meta>(&storage)) {
+        const size_t first_tile = row_begin / rows_per_tile;
+        const size_t last_tile = (row_end + rows_per_tile - 1) / rows_per_tile;
+        if (!slice_row_vector(meta->scales, first_tile, last_tile)) {
+            return false;
+        }
+        slice_outliers(*meta, row_begin, row_end);
+        args.activation_row_offset = 0;
+    }
+    return true;
 }
 
 baseline_activation_quant_t baseline_activation_for(const ggml_gemmini_args_t & args) {
@@ -77,6 +154,13 @@ MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe, size_
         return MatMulStatus::invalid_arguments;
     }
 
+    if (args.tile_I == 0 || args.tile_J == 0 || args.tile_K == 0) {
+        gemmini_set_tile_ws(&args);
+    }
+    if (!slice_activation_metadata(args, stripe.row_begin, stripe.row_end)) {
+        return MatMulStatus::invalid_arguments;
+    }
+
     args.I = stripe.row_end - stripe.row_begin;
     if (args.A != nullptr) {
         args.A += input_offset;
@@ -86,12 +170,7 @@ MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe, size_
     }
     args.f_out += output_offset;
 
-    if (auto * meta = std::get_if<quants::act::exsia::Meta>(&args.act_quant.storage())) {
-        if (stripe_id >= meta->theta.size()) {
-            return MatMulStatus::invalid_arguments;
-        }
-        args.activation_row_offset += stripe.row_begin;
-    }
+    (void) stripe_id;
 
     execute_dense(args);
     return MatMulStatus::success;
@@ -420,8 +499,7 @@ MatMulCapability MatMul::stripe_capability(const ggml_gemmini_args_t & args) {
         format == ggml_gemmini_args_t::im2p_weight_format_t::q8_hp2 ||
         !capabilities.sliced_compensation ||
         args.transpose_A || (args.D != nullptr && !args.repeating_bias) ||
-        (!row_invariant_activation(args) &&
-         !std::holds_alternative<quants::act::exsia::Meta>(args.act_quant.storage()))) {
+        !supports_row_slice_activation(args)) {
         return MatMulCapability::unsupported;
     }
     if (uses_baseline_channel_route(args) &&
@@ -962,13 +1040,6 @@ MatmulStatus prepare_compensation(MatmulStripeJob & job) {
     }
     const auto start = Clock::now();
     const auto & args = job.execution_->facade_.args();
-    const auto & storage = args.act_quant.storage();
-    if (!job.has_captured_outliers_ &&
-        !std::holds_alternative<quants::act::NoneMeta>(storage) &&
-        !std::holds_alternative<quants::act::tensor::Meta>(storage)) {
-        job.status_ = unsupported_backend("compensation preparation is unsupported by backend");
-        return job.status_;
-    }
     if (!job.has_captured_outliers_) {
         job.compensation_outliers_ = quants::activation_outliers(args);
     }

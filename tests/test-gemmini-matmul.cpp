@@ -115,6 +115,7 @@ bool test_baseline_activation_route_facade_parity() {
                          MatMulCapability expected_stripe) {
         std::vector<float> legacy_output(6, 0.0f);
         std::vector<float> facade_output(6, 0.0f);
+        std::vector<float> stripe_output(6, 0.0f);
         auto legacy_args = make_args(activation, weights, legacy_output);
         legacy_args.act_quant.storage() = std::move(meta);
         if (route != Route::TENSOR) {
@@ -126,10 +127,18 @@ bool test_baseline_activation_route_facade_parity() {
 
         tiled_matmul_auto_baseline(&legacy_args, route, baseline_weight_quant_t::TENSOR);
         const auto result = MatMul(facade_args).run_full();
+        auto stripe_args = facade_args;
+        stripe_args.f_out = stripe_output.data();
+        MatmulOptions stripe_options{};
+        stripe_options.mode = MatmulInvocationMode::stripe_sequential;
+        stripe_options.stripe_rows = 1;
+        const auto stripe_result = matmul(stripe_args, stripe_options);
         return check(result.status == MatMulStatus::success, label) &&
             check(same_output(facade_output, legacy_output), "baseline route facade output differs") &&
             check(MatMul::stripe_capability(facade_args) == expected_stripe,
-                  "baseline route stripe capability");
+                  "baseline route stripe capability") &&
+            check(stripe_result.ok(), "baseline route stripe execution") &&
+            check(same_output(stripe_output, legacy_output), "baseline route stripe output differs");
     };
 
     quants::act::tensor::Meta tensor_meta;
@@ -138,10 +147,13 @@ bool test_baseline_activation_route_facade_parity() {
     token_meta.scales = { 1.0f, 1.0f, 1.0f };
     quants::act::block::Meta block_meta;
     block_meta.scales = { 1.0f, 1.0f, 1.0f };
+    quants::act::stripe::Meta stripe_meta;
+    stripe_meta.scales = { 1.0f };
 
     return run(std::move(tensor_meta), Route::TENSOR, "TENSOR baseline facade", MatMulCapability::supported) &&
-        run(std::move(token_meta), Route::TOKEN, "TOKEN baseline facade", MatMulCapability::unsupported) &&
-        run(std::move(block_meta), Route::BLOCK, "BLOCK baseline facade", MatMulCapability::unsupported);
+        run(std::move(token_meta), Route::TOKEN, "TOKEN baseline facade", MatMulCapability::supported) &&
+        run(std::move(block_meta), Route::BLOCK, "BLOCK baseline facade", MatMulCapability::supported) &&
+        run(std::move(stripe_meta), Route::BLOCK, "STRIPE baseline facade", MatMulCapability::supported);
 }
 
 bool test_live_pipeline_multistripe_matches_full() {
