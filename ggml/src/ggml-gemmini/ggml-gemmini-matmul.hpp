@@ -193,6 +193,7 @@ public:
     explicit MatmulStripeCollector(size_t capacity);
     ~MatmulStripeCollector();
     bool start(MatmulExecution & execution);
+    MatmulStatus cancel();
     MatmulStatus finish();
     const quants::act::exsia::StripeReadySink * sink() const;
     const MatmulStatus & status() const;

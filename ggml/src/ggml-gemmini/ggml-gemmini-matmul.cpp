@@ -820,6 +820,21 @@ bool MatmulStripeCollector::start(MatmulExecution & execution) {
     return true;
 }
 
+MatmulStatus MatmulStripeCollector::cancel() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!worker_started_) {
+        return make_status(MatmulStatusCode::invalid_state, "stripe pipeline is not running");
+    }
+    if (status_.ok()) {
+        status_ = make_status(MatmulStatusCode::cancelled, "stripe pipeline cancelled");
+        pending_.clear();
+        compensation_pending_.clear();
+        stop_requested_ = true;
+    }
+    condition_.notify_all();
+    return status_;
+}
+
 MatmulStatus MatmulStripeCollector::finish() {
     if (!worker_started_) {
         return status_;

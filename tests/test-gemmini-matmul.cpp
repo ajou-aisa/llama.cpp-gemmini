@@ -1036,6 +1036,27 @@ bool test_live_worker_parallel_compensation_is_bitwise_stable() {
         check(same_output(one, four), "live parallel compensation output differs");
 }
 
+bool test_pipeline_cancellation() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation(8, 1);
+    std::vector<elem_t> weights(4, 1);
+    std::vector<float> output(8, 0.0f);
+    auto args = make_args(activation, weights, output);
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_pipeline;
+    options.job_capacity = 2;
+    auto execution = prepare_execution(&args, options);
+    MatmulStripeCollector collector(2);
+    if (!check(execution.status().ok() && collector.start(execution), "pipeline cancellation start")) {
+        return false;
+    }
+    const auto cancel_status = collector.cancel();
+    const auto finish_status = collector.finish();
+    return check(cancel_status.code == MatmulStatusCode::cancelled, "pipeline cancellation status") &&
+        check(finish_status.code == MatmulStatusCode::cancelled, "pipeline cancellation finish") &&
+        check(execution.state() == MatmulExecutionState::failed, "pipeline cancellation execution state");
+}
+
 }
 
 int main(int argc, char ** argv) {
@@ -1047,6 +1068,7 @@ int main(int argc, char ** argv) {
         test_bounded_pipeline_slots_and_reuse() &&
         test_live_pipeline_worker() && test_compensation_shard_output_is_bitwise_stable() &&
         test_live_worker_parallel_compensation_is_bitwise_stable() &&
+        test_pipeline_cancellation() &&
         test_staged_contract_errors();
     if (edge_only) {
         return edge ? 0 : 1;
