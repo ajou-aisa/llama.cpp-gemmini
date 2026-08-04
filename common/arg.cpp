@@ -1131,7 +1131,8 @@ static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & val
     } else {
         for (const auto & device : dev_names) {
             auto * dev = ggml_backend_dev_by_name(device.c_str());
-            if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            const auto type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
+            if (!dev || (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_ACCEL)) {
                 throw std::invalid_argument(string_format("invalid device: %s", device.c_str()));
             }
             devices.push_back(dev);
@@ -2293,7 +2294,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             std::vector<ggml_backend_dev_t> all_devices;
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                 auto * dev = ggml_backend_dev_get(i);
-                if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                const auto type = ggml_backend_dev_type(dev);
+                if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
                     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
                     if (ggml_backend_reg_name(reg) == std::string("RPC")) {
                         rpc_devices.push_back(dev);
