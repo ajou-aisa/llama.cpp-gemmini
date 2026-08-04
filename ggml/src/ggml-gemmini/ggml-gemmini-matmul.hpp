@@ -16,7 +16,7 @@ namespace ggml::gemmini {
 
 namespace detail {
 
-enum class ActivationRoute : uint8_t { unknown, fp32, exsia, tensor, token, block };
+enum class ActivationRoute : uint8_t { unknown, fp32, exsia, tensor, token, block, stripe };
 enum class WeightRoute : uint8_t {
     unknown, fp32, tensor_i8, channel_i8, block_i8, q8_h1, q8_hp1, q8_h2, q8_hp2,
     q8_channel_direct, q8_channel_sidecar, q8_h0

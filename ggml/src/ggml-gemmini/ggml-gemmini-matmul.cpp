@@ -192,8 +192,8 @@ RouteKey normalize_route(const ggml_gemmini_args_t & args) {
     if (std::holds_alternative<quants::act::exsia::Meta>(storage)) key.activation = ActivationRoute::exsia;
     else if (std::holds_alternative<quants::act::tensor::Meta>(storage)) key.activation = ActivationRoute::tensor;
     else if (std::holds_alternative<quants::act::token::Meta>(storage)) key.activation = ActivationRoute::token;
-    else if (std::holds_alternative<quants::act::block::Meta>(storage) ||
-             std::holds_alternative<quants::act::stripe::Meta>(storage)) key.activation = ActivationRoute::block;
+    else if (std::holds_alternative<quants::act::block::Meta>(storage)) key.activation = ActivationRoute::block;
+    else if (std::holds_alternative<quants::act::stripe::Meta>(storage)) key.activation = ActivationRoute::stripe;
     else if (std::holds_alternative<quants::act::NoneMeta>(storage)) key.activation = ActivationRoute::fp32;
 
     if (args.A_fp32 != nullptr || args.B_fp32 != nullptr) {

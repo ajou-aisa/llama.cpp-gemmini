@@ -563,6 +563,12 @@ bool test_route_capability_table() {
                "Q8_CHANNEL sidecar normalization")) {
         return false;
     }
+    args.act_quant.storage().emplace<quants::act::stripe::Meta>();
+    if (!check(detail::normalize_route(args).activation == detail::ActivationRoute::stripe,
+               "STRIPE activation normalization")) {
+        return false;
+    }
+    args.act_quant.storage().emplace<quants::act::NoneMeta>();
     args.tiled_matmul_type = WS;
     if (!check(detail::normalize_route(args).backend == detail::BackendRoute::gemmini_ws &&
                    detail::route_capabilities(args).full,
