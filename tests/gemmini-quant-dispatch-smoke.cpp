@@ -75,6 +75,24 @@ static void assert_tensor_baseline() {
     check(args.tile_I > 0 && args.tile_J > 0 && args.tile_K > 0);
 }
 
+static void assert_token_baseline() {
+    elem_t a = 3;
+    elem_t b = 4;
+    float out = 0.0f;
+    auto args = cpu_1x1_args(a, b, out);
+    args.transpose_B = true;
+    auto &meta = args.act_quant.storage().emplace<ggml::gemmini::quants::act::token::Meta>();
+    meta.scales = {0.25f};
+
+    ggml::gemmini::tiled_matmul_auto_baseline(
+        &args,
+        ggml::gemmini::baseline_activation_quant_t::TOKEN,
+        ggml::gemmini::baseline_weight_quant_t::TENSOR);
+
+    check(out == 1.5f);
+    check(args.tile_I > 0 && args.tile_J > 0 && args.tile_K > 0);
+}
+
 static void assert_unsupported_baseline_quantization_aborts() {
     elem_t a = 3;
     elem_t b = 4;
@@ -97,6 +115,8 @@ int main(int argc, char **argv) {
         assert_exsia_baseline();
     } else if (mode == "tensor") {
         assert_tensor_baseline();
+    } else if (mode == "token") {
+        assert_token_baseline();
     } else if (mode == "unsupported") {
         assert_unsupported_baseline_quantization_aborts();
     } else {
