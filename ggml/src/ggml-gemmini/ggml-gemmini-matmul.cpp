@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <new>
 #include <utility>
@@ -1245,11 +1246,14 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job, size_t shard_id, 
     MatmulStatus result{};
     const size_t col_begin = job.execution_->facade_.args().J * shard_id / shard_count;
     const size_t col_end = job.execution_->facade_.args().J * (shard_id + 1) / shard_count;
+    char dec_layer[64];
+    std::snprintf(dec_layer, sizeof(dec_layer), "ggml-gemmini-matmul.stripe-%zu",
+                  job.input_.stripe_id());
     if (!job.compensation_outliers_.empty()) {
         dec_status = quants::dec::compensate_activation_dec_rows_columns(
             job.compensation_outliers_, job.execution_->facade_.args(),
             job.input_.row_begin(), job.input_.row_end(), col_begin, col_end,
-            "ggml-gemmini-matmul", job.execution_->dispatch_override_);
+            dec_layer, job.execution_->dispatch_override_);
     }
     if (result.ok()) {
         if (dec_status == quants::dec::ActivationDECRowSliceStatus::unsupported) {
