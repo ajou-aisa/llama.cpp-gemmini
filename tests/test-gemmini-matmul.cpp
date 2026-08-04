@@ -368,11 +368,11 @@ bool test_live_pipeline_worker() {
         return false;
     }
     const auto * sink = collector.sink();
-    if (!check(sink->on_ready(sink->user_data, { 0, 0, 2, nullptr, 0, 10, 20, 30, 50, 40, 60 }), "live worker capture") ||
-        !check(sink->on_ready(sink->user_data, { 1, 2, 3, nullptr, 0, 11, 21, 31, 51, 41, 61 }), "live worker tail capture") ||
+    if (!check(sink->on_ready(sink->user_data, { 0, 0, 2, nullptr, 0, 10, 20, 30, 50, 40, 70 }), "live worker capture") ||
+        !check(sink->on_ready(sink->user_data, { 1, 2, 3, nullptr, 0, 11, 21, 31, 51, 41, 71 }), "live worker tail capture") ||
         !check(collector.finish().ok(), "live worker finish") ||
         !check(collector.profiles().size() == 2, "live worker stripe profiles") ||
-        !check(collector.profiles()[0].la_cycles == 10 && collector.profiles()[0].la3_cycles == 20 &&
+        !check(collector.profiles()[0].la_cycles == 10 && collector.profiles()[0].la3_cycles == 30 &&
                    collector.profiles()[0].sf_cycles == 20,
                "live worker producer profile") ||
         !check(collector.profiles()[0].ws_start_ns < collector.profiles()[0].ws_end_ns &&
