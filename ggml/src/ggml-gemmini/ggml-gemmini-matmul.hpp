@@ -158,6 +158,8 @@ struct MatmulJobMetrics {
     size_t row_begin = 0;
     size_t row_end = 0;
     size_t rc_shards = 0;
+    uint64_t la_cycles = 0;
+    uint64_t sf_cycles = 0;
     MatmulStageMetrics la;
     MatmulStageMetrics sf;
     MatmulStageMetrics handoff;
@@ -186,6 +188,8 @@ private:
         size_t row_begin;
         size_t row_end;
         std::vector<quants::QactOutlier> outliers;
+        uint64_t la_cycles = 0;
+        uint64_t sf_cycles = 0;
     };
     static bool on_ready(void *, const quants::act::exsia::StripeReadyEvent &);
     friend MatmulStatus execute_post_fold_pipeline(const ggml_gemmini_args_t &, MatmulStripeCollector &);
@@ -266,6 +270,7 @@ private:
     friend MatmulStatus execute_compensation_shard(MatmulStripeJob &, size_t, size_t);
     friend MatmulStatus finalize_stripe(MatmulStripeJob &);
     friend class MatmulStripeCollector;
+    friend class MatmulStripeCollector;
     friend class MatmulStripeJob;
     friend MatmulStatus finish_execution(MatmulExecution &);
 
@@ -304,6 +309,7 @@ private:
     friend MatmulStatus execute_compensation_shard(MatmulStripeJob &);
     friend MatmulStatus execute_compensation_shard(MatmulStripeJob &, size_t, size_t);
     friend MatmulStatus finalize_stripe(MatmulStripeJob &);
+    friend class MatmulStripeCollector;
 
     MatmulStripeJob(MatmulExecution * execution, MatmulStripeInput input, MatmulStatus status,
                     std::vector<quants::QactOutlier> outliers = {});

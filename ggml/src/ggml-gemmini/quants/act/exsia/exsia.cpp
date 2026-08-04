@@ -1586,14 +1586,27 @@ namespace ggml::gemmini::quants::act::exsia
 #endif
             return true;
         };
-        const auto notify_stripe_ready = [&](StripePipelineSlot &slot) {
+        const auto notify_stripe_ready = [&](StripePipelineSlot &slot
+#if EXSIA_PROFILE_COLLECTION_ENABLED
+                                             , const StripeProfileRecord *profile
+#endif
+                                             ) {
             if (sink == nullptr || sink->on_ready == nullptr)
                 return true;
 
+            StripeReadyEvent event{slot.stripe_idx, slot.row_start, slot.row_end,
+                                   slot.outliers.data(), slot.outliers.size()};
+#if EXSIA_PROFILE_COLLECTION_ENABLED
+            if (profile != nullptr) {
+                event.local_start_cycle = profile->local.start;
+                event.local_end_cycle = profile->local.end;
+                event.folding_start_cycle = profile->folding.start;
+                event.folding_end_cycle = profile->folding.end;
+            }
+#endif
             const bool accepted = sink->on_ready(
                 sink->user_data,
-                StripeReadyEvent{slot.stripe_idx, slot.row_start, slot.row_end,
-                                 slot.outliers.data(), slot.outliers.size()});
+                event);
             return accepted;
         };
 #if defined(GGML_GEMMINI_HAS_OPENMP)
@@ -2073,11 +2086,6 @@ namespace ggml::gemmini::quants::act::exsia
                                                 record_failure(ExSIAState::FailureCode::ValidationSnapshotFailure, s);
                                                 pipeline_ok.store(false, std::memory_order_relaxed);
                                             }
-                                            else if (!notify_stripe_ready(slot))
-                                            {
-                                                record_failure(ExSIAState::FailureCode::StripeReadySinkFailure, s);
-                                                pipeline_ok.store(false, std::memory_order_relaxed);
-                                            }
                                             else
                                             {
                                                 EXSIA_PROFILE_COLLECT(
@@ -2087,6 +2095,18 @@ namespace ggml::gemmini::quants::act::exsia
                                                     pipeline_ok.store(false, std::memory_order_relaxed);
                                                 }
                                                 )
+                                                if (pipeline_ok.load(std::memory_order_relaxed) &&
+                                                    !notify_stripe_ready(slot
+#if EXSIA_PROFILE_COLLECTION_ENABLED
+                                                                          , &profile
+#endif
+                                                                          ))
+                                                {
+                                                    record_failure(ExSIAState::FailureCode::StripeReadySinkFailure, s);
+                                                    pipeline_ok.store(false, std::memory_order_relaxed);
+                                                }
+                                                else
+                                                {
                                                 slot.release();
                                                 EXSIA_PROFILE_COLLECT(
                                                 if (!end_profile_interval(profile.stripe_total))
@@ -2095,6 +2115,7 @@ namespace ggml::gemmini::quants::act::exsia
                                                     pipeline_ok.store(false, std::memory_order_relaxed);
                                                 }
                                                 )
+                                                }
                                             }
                                         }
                                     }
@@ -2392,13 +2413,16 @@ namespace ggml::gemmini::quants::act::exsia
             if (!snapshot_validation_mask(s, slot.stripe.outlier_mask))
                 return fail(ExSIAState::FailureCode::ValidationSnapshotFailure, s);
 
-            if (!notify_stripe_ready(slot))
-                return fail(ExSIAState::FailureCode::StripeReadySinkFailure, s);
-
             EXSIA_PROFILE_COLLECT(
             if (!end_profile_interval(profile.folding))
                 return fail(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
             )
+            if (!notify_stripe_ready(slot
+#if EXSIA_PROFILE_COLLECTION_ENABLED
+                                     , &profile
+#endif
+                                     ))
+                return fail(ExSIAState::FailureCode::StripeReadySinkFailure, s);
 #if EXSIA_STAGE_PROFILE_ENABLED
             profile.stats = slot.cycle_stats;
 #endif

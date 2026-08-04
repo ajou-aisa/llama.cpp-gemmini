@@ -461,6 +461,8 @@ void MatmulStripeCollector::worker_loop() {
             *execution_,
             MatmulStripeInput(captured.row_begin, captured.row_end, captured.stripe_id),
             std::move(captured.outliers));
+        job.metrics_.la_cycles = captured.la_cycles;
+        job.metrics_.sf_cycles = captured.sf_cycles;
         MatmulStatus status = prepare_compensation(job);
         if (status) status = execute_dense_stripe(job);
         const size_t shard_count = std::max<size_t>(1, std::min(
@@ -526,7 +528,11 @@ bool MatmulStripeCollector::on_ready(
                 return false;
             }
             collector.pending_.push_back(
-                {event.stripe_id, event.row_begin, event.row_end, std::move(outliers)});
+                {event.stripe_id, event.row_begin, event.row_end, std::move(outliers),
+                 event.local_end_cycle >= event.local_start_cycle ?
+                     event.local_end_cycle - event.local_start_cycle : 0,
+                 event.folding_end_cycle >= event.folding_start_cycle ?
+                     event.folding_end_cycle - event.folding_start_cycle : 0});
             lock.unlock();
             collector.condition_.notify_all();
             return true;
@@ -536,7 +542,11 @@ bool MatmulStripeCollector::on_ready(
             return false;
         }
         collector.stripes_.push_back(
-            {event.stripe_id, event.row_begin, event.row_end, std::move(outliers)});
+            {event.stripe_id, event.row_begin, event.row_end, std::move(outliers),
+             event.local_end_cycle >= event.local_start_cycle ?
+                 event.local_end_cycle - event.local_start_cycle : 0,
+             event.folding_end_cycle >= event.folding_start_cycle ?
+                 event.folding_end_cycle - event.folding_start_cycle : 0});
     } catch (const std::bad_alloc &) {
         collector.status_ = make_status(MatmulStatusCode::out_of_memory, "stripe capture allocation failed");
         return false;
@@ -553,7 +563,8 @@ MatmulStripeJob::MatmulStripeJob(
 MatmulStripeJob::MatmulStripeJob(MatmulStripeJob && other) noexcept
     : execution_(other.execution_), input_(std::move(other.input_)), status_(other.status_),
       metrics_(other.metrics_), compensation_outliers_(std::move(other.compensation_outliers_)),
-      has_captured_outliers_(other.has_captured_outliers_), owns_slot_(other.owns_slot_), state_(other.state_) {
+      has_captured_outliers_(other.has_captured_outliers_), owns_slot_(other.owns_slot_),
+      expected_shards_(other.expected_shards_), completed_shards_(other.completed_shards_), state_(other.state_) {
     other.execution_ = nullptr;
     other.owns_slot_ = false;
 }
@@ -568,6 +579,8 @@ MatmulStripeJob & MatmulStripeJob::operator=(MatmulStripeJob && other) noexcept 
         compensation_outliers_ = std::move(other.compensation_outliers_);
         has_captured_outliers_ = other.has_captured_outliers_;
         owns_slot_ = other.owns_slot_;
+        expected_shards_ = other.expected_shards_;
+        completed_shards_ = other.completed_shards_;
         state_ = other.state_;
         other.execution_ = nullptr;
         other.owns_slot_ = false;

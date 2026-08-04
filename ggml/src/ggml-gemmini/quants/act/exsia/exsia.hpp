@@ -353,6 +353,10 @@ namespace ggml::gemmini::quants::act::exsia
         size_t row_end = 0;
         const ggml_gemmini_qact_outlier *outliers = nullptr;
         size_t outlier_count = 0;
+        uint64_t local_start_cycle = 0;
+        uint64_t local_end_cycle = 0;
+        uint64_t folding_start_cycle = 0;
+        uint64_t folding_end_cycle = 0;
     };
 
     struct StripeReadySink
