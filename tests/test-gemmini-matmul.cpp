@@ -225,11 +225,13 @@ bool test_live_staged_worker() {
     auto execution = prepare_execution(make_args(activation, weights, output), options);
     MatmulStripeCollector collector(options.job_capacity);
     const quants::act::exsia::StripeReadyEvent event{0, 0, 3, nullptr, 0};
-    const bool accepted = collector.start(execution) &&
+    const bool accepted = collector.start(execution);
+    collector.mark_execution_ready();
+    const bool event_accepted = accepted &&
         collector.sink()->on_ready(collector.sink()->user_data, event);
     const MatmulStatus collector_status = collector.finish();
     const MatmulStatus execution_status = finish_execution(execution);
-    const bool passed = accepted && collector_status.ok() && execution_status.ok();
+    const bool passed = event_accepted && collector_status.ok() && execution_status.ok();
     if (!passed) {
         std::fprintf(stderr, "FAIL live worker: accepted=%d collector=%d execution=%d output=%f\n",
                      accepted ? 1 : 0, static_cast<int>(collector_status.code),

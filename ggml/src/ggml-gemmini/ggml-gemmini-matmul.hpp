@@ -143,6 +143,7 @@ public:
     explicit MatmulStripeCollector(size_t capacity);
     ~MatmulStripeCollector();
     bool start(MatmulExecution & execution);
+    void mark_execution_ready();
     MatmulStatus finish();
     const quants::act::exsia::StripeReadySink * sink() const;
     const MatmulStatus & status() const;
@@ -159,6 +160,7 @@ private:
     friend MatmulStatus execute_post_fold_pipeline(const ggml_gemmini_args_t &, MatmulStripeCollector &);
     void worker_loop();
     bool worker_started_ = false;
+    bool execution_ready_ = false;
     bool stop_requested_ = false;
     std::thread worker_;
     MatmulExecution * execution_ = nullptr;

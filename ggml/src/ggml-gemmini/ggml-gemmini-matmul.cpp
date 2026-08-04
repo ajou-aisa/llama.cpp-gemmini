@@ -414,6 +414,14 @@ bool MatmulStripeCollector::start(MatmulExecution & execution) {
     return true;
 }
 
+void MatmulStripeCollector::mark_execution_ready() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        execution_ready_ = true;
+    }
+    condition_.notify_all();
+}
+
 MatmulStatus MatmulStripeCollector::finish() {
     if (!worker_started_) {
         return status_;
@@ -435,7 +443,11 @@ void MatmulStripeCollector::worker_loop() {
         CapturedStripe captured{};
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            condition_.wait(lock, [this] { return stop_requested_ || !pending_.empty(); });
+            condition_.wait(lock, [this] { return stop_requested_ || (execution_ready_ && !pending_.empty()); });
+            if (!execution_ready_ && stop_requested_) {
+                pending_.clear();
+                break;
+            }
             if (pending_.empty()) {
                 break;
             }

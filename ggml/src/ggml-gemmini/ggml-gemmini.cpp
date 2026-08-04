@@ -984,7 +984,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     if (pipeline_enabled) {
         ggml::gemmini::MatmulOptions pipeline_options{};
         pipeline_options.mode = ggml::gemmini::MatmulInvocationMode::stripe_pipeline;
-        pipeline_options.job_capacity = 4;
+        pipeline_options.job_capacity = std::max<size_t>(args.I, 1);
         pipeline_collector = std::make_unique<ggml::gemmini::MatmulStripeCollector>(pipeline_options.job_capacity);
         pipeline_execution = std::make_unique<ggml::gemmini::MatmulExecution>(
             ggml::gemmini::prepare_execution(args, pipeline_options));
@@ -1382,6 +1382,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             GGML_ABORT("Gemmini int mul_mat received unsupported weight type");
         }
 
+    }
+
+    if (pipeline_enabled) {
+        pipeline_collector->mark_execution_ready();
     }
 
     // ggml::gemmini::log::debug("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out(row)=%zu stride_f_out(col)=%zu nb1=%zu nb0=%zu",
