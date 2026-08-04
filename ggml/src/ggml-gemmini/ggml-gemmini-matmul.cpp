@@ -216,6 +216,7 @@ MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe, size_
     }
 
     args.I = stripe.row_end - stripe.row_begin;
+    gemmini_set_tile_ws(&args);
     if (args.A != nullptr) {
         args.A += input_offset;
     }
