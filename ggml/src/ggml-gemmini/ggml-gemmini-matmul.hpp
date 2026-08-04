@@ -108,6 +108,7 @@ private:
     friend class MatmulExecution;
     friend class MatmulStripeCollector;
     friend MatmulStatus execute_full(MatmulExecution &);
+    friend MatmulStatus finish_execution(MatmulExecution &);
     friend MatmulStatus prepare_compensation(MatmulStripeJob &);
     friend MatmulStatus execute_compensation_shard(MatmulStripeJob &);
     friend MatmulStatus execute_compensation_shard(MatmulStripeJob &, size_t, size_t);

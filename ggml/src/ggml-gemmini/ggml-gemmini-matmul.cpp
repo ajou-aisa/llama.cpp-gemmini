@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <limits>
 #include <new>
 #include <utility>
@@ -46,6 +47,19 @@ bool valid_matmul_shape(const ggml_gemmini_args_t & args) {
     return args.I != 0 && args.J != 0 && args.K != 0 && args.f_out != nullptr &&
         (args.A != nullptr || args.A_fp32 != nullptr) &&
         ((args.A_fp32 == nullptr) == (args.B_fp32 == nullptr));
+}
+
+bool finite_output(const ggml_gemmini_args_t & args) {
+    const size_t row_stride = args.stride_f_out != 0 ? args.stride_f_out : args.J;
+    const size_t col_stride = args.col_stride_f_out != 0 ? args.col_stride_f_out : 1;
+    for (size_t row = 0; row < args.I; ++row) {
+        for (size_t col = 0; col < args.J; ++col) {
+            if (!std::isfinite(args.f_out[row * row_stride + col * col_stride])) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 template <typename Vector>
@@ -567,6 +581,12 @@ size_t MatmulStripeInput::outlier_count() const {
 MatmulExecution::MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options)
     : total_rows_(args.I), facade_(std::move(args)), options_(options) {
     state_ = MatmulExecutionState::prepared;
+    if (options_.dense_threads > 1) {
+        status_ = make_status(MatmulStatusCode::unsupported_invocation,
+                              "dense stripe execution has one owner lane");
+        state_ = MatmulExecutionState::failed;
+        return;
+    }
     if (options_.force_row_direct && options_.force_group_k_csc) {
         status_ = make_status(MatmulStatusCode::invalid_argument,
                               "conflicting DEC dispatch overrides");
@@ -602,6 +622,12 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions optio
     state_ = MatmulExecutionState::prepared;
     if (args == nullptr) {
         status_ = make_status(MatmulStatusCode::invalid_argument, "null execution args");
+        state_ = MatmulExecutionState::failed;
+        return;
+    }
+    if (options_.dense_threads > 1) {
+        status_ = make_status(MatmulStatusCode::unsupported_invocation,
+                              "dense stripe execution has one owner lane");
         state_ = MatmulExecutionState::failed;
         return;
     }
@@ -979,6 +1005,11 @@ MatmulStatus execute_full(MatmulExecution & execution) {
     }
     const MatMulResult result = execution.facade_.run_full(execution.dispatch_override_);
     execution.status_ = to_public_status(result.status, result.capability);
+    if (execution.status_ && execution.options_.validation &&
+        !finite_output(execution.facade_.args())) {
+        execution.status_ = make_status(MatmulStatusCode::execution_failure,
+                                        "output validation failed");
+    }
     execution.state_ = execution.status_.ok() ? MatmulExecutionState::completed : MatmulExecutionState::failed;
     return execution.status_;
 }
@@ -1218,6 +1249,11 @@ MatmulStatus finish_execution(MatmulExecution & execution) {
     }
     const MatMulStatus status = execution.facade_.finish_stripes();
     execution.status_ = to_public_status(status, MatMulCapability::supported);
+    if (execution.status_ && execution.options_.validation &&
+        !finite_output(execution.facade_.args())) {
+        execution.status_ = make_status(MatmulStatusCode::execution_failure,
+                                        "output validation failed");
+    }
     execution.state_ = execution.status_.ok() ? MatmulExecutionState::completed : MatmulExecutionState::failed;
     return execution.status_;
 }

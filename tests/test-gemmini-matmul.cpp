@@ -566,6 +566,17 @@ bool test_public_contract_shape() {
     const quants::QactOutlier outlier[] = {{ 1, 2, 3 }};
     MatmulStripeInput outlier_input(1, 3, 7, outlier, 1);
     MatmulJobMetrics metrics{};
+    std::vector<elem_t> validation_activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> validation_weights = { 1, -1, 2, 3 };
+    std::vector<float> validation_output(6, 0.0f);
+    MatmulOptions validation_options{};
+    validation_options.validation = true;
+    const auto validation_status = matmul(
+        make_args(validation_activation, validation_weights, validation_output), validation_options);
+    MatmulOptions too_many_dense_threads{};
+    too_many_dense_threads.dense_threads = 2;
+    auto dense_thread_execution = prepare_execution(
+        make_args(validation_activation, validation_weights, validation_output), too_many_dense_threads);
     return check(defaults.job_capacity == 4, "default job capacity") &&
         check(statuses[0].ok(), "success status ok") &&
         check(!statuses[1].ok(), "failure status not ok") &&
@@ -574,6 +585,9 @@ bool test_public_contract_shape() {
                   options.rc_shards == 3 && options.validation && options.profiling &&
                   options.job_capacity == 2,
               "matmul options") &&
+        check(validation_status.ok(), "validation-enabled full matmul") &&
+        check(dense_thread_execution.status().code == MatmulStatusCode::unsupported_invocation,
+              "multi-owner dense lane rejection") &&
         check(input.row_begin() == 1 && input.row_end() == 3 && input.stripe_id() == 7 &&
                   input.residual() == residual && input.residual_count() == 2,
               "stripe input metadata") &&
