@@ -429,11 +429,15 @@ void accumulate_to_ycom_int64_scalar(
         }, [scale = plan.scales.scalar](size_t) { return scale; }, Y_com);
 }
 
-bool accumulate_to_ycom_int64_scalar_group_k_csc(
+namespace
+{
+template <size_t NR>
+bool accumulate_to_ycom_int64_scalar_group_k_csc_impl(
     const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
     const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
     const GroupKCSCPlan &group_k_csc_plan, float *Y_com, GroupKCSCScalarStats &stats)
 {
+    static_assert(NR > 0, "NR must be positive");
     stats = {};
     const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
     const size_t tile_capacity = std::min(J, kDecInt64JTileWidth);
@@ -475,24 +479,32 @@ bool accumulate_to_ycom_int64_scalar_group_k_csc(
                     continue;
 
                 const size_t k = group * kDecGroupSizeK + k_offset;
-                for (size_t t = 0; t < width; ++t)
+                for (size_t j_offset = 0; j_offset < width; j_offset += NR)
                 {
-                    const int64_t weight = plan.layout == WeightLayout::KxJ_RowMajor ?
-                        weights[k * plan.weight_stride + jb + t] :
-                        weights[(jb + t) * plan.weight_stride + k];
+                    const size_t lane_count = std::min(NR, width - j_offset);
+                    std::array<int64_t, NR> weight_lanes;
+                    for (size_t lane = 0; lane < lane_count; ++lane)
+                        weight_lanes[lane] = plan.layout == WeightLayout::KxJ_RowMajor ?
+                            weights[k * plan.weight_stride + jb + j_offset + lane] :
+                            weights[(jb + j_offset + lane) * plan.weight_stride + k];
                     for (size_t position = entry_begin; position < entry_end; ++position)
                     {
                         const ResidualGroupEntry &entry = entries[group_k_csc_plan.entry_order[position]];
-                        const size_t accumulator_index = static_cast<size_t>(entry.row) * width + t;
-                        const int64_t term = static_cast<int64_t>(entry.residual) * weight;
+                        int64_t *entry_accumulator = accumulator.data() +
+                            static_cast<size_t>(entry.row) * width + j_offset;
+                        const int64_t residual = entry.residual;
+                        for (size_t lane = 0; lane < lane_count; ++lane)
+                        {
+                            const int64_t term = residual * weight_lanes[lane];
 #if DEC_VALIDATION
-                        const __int128 checked_sum =
-                            static_cast<__int128>(accumulator[accumulator_index]) + term;
-                        if (checked_sum < std::numeric_limits<int64_t>::min() ||
-                            checked_sum > std::numeric_limits<int64_t>::max())
-                            std::abort();
+                            const __int128 checked_sum =
+                                static_cast<__int128>(entry_accumulator[lane]) + term;
+                            if (checked_sum < std::numeric_limits<int64_t>::min() ||
+                                checked_sum > std::numeric_limits<int64_t>::max())
+                                std::abort();
 #endif
-                        accumulator[accumulator_index] += term;
+                            entry_accumulator[lane] += term;
+                        }
                     }
                 }
             }
@@ -516,6 +528,25 @@ bool accumulate_to_ycom_int64_scalar_group_k_csc(
     });
 
     return true;
+}
+}
+
+bool accumulate_to_ycom_int64_scalar_group_k_csc(
+    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
+    const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
+    const GroupKCSCPlan &group_k_csc_plan, float *Y_com, GroupKCSCScalarStats &stats)
+{
+    return accumulate_to_ycom_int64_scalar_group_k_csc_impl<1>(
+        args, plan, I, J, activation_scales, entries, group_k_csc_plan, Y_com, stats);
+}
+
+bool accumulate_to_ycom_int64_scalar_group_k_csc_nr8(
+    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
+    const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
+    const GroupKCSCPlan &group_k_csc_plan, float *Y_com, GroupKCSCScalarStats &stats)
+{
+    return accumulate_to_ycom_int64_scalar_group_k_csc_impl<8>(
+        args, plan, I, J, activation_scales, entries, group_k_csc_plan, Y_com, stats);
 }
 
 void accumulate_to_ycom_int64_channel_direct(

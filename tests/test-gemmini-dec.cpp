@@ -1302,6 +1302,12 @@ bool test_fixed_residual_replay_baseline() {
         ggml::gemmini::quants::dec::accumulate_to_ycom_int64_scalar_group_k_csc(
             args, scalar_route_plan, rows, cols, nullptr, entries, group_k_csc_plan,
             group_k_csc_scalar.data(), group_k_csc_stats);
+    std::vector<float> group_k_csc_nr8(rows * cols, 0.0f);
+    GroupKCSCScalarStats group_k_csc_nr8_stats;
+    const bool group_k_csc_nr8_accumulated =
+        ggml::gemmini::quants::dec::accumulate_to_ycom_int64_scalar_group_k_csc_nr8(
+            args, scalar_route_plan, rows, cols, nullptr, entries, group_k_csc_plan,
+            group_k_csc_nr8.data(), group_k_csc_nr8_stats);
 
     bool ok = check(result.total_selected == shuffled_outliers.size() && result.nnz == shuffled_outliers.size() &&
                         result.unique_k_count == 3 && result.int_mac_count == 35 &&
@@ -1316,14 +1322,18 @@ bool test_fixed_residual_replay_baseline() {
                     "fixed replay sparse baseline counters");
     for (size_t index = 0; index < output.size(); ++index)
         ok = check(float_bits(output[index]) == expected_bits[index], "fixed replay baseline output bits") && ok;
-    ok = check(group_k_csc_ready && group_k_csc_accumulated &&
+    ok = check(group_k_csc_ready && group_k_csc_accumulated && group_k_csc_nr8_accumulated &&
                    byte_identical(output, current_row_grouped) &&
-                   byte_identical(current_row_grouped, group_k_csc_scalar),
-               "fixed replay CurrentRowGrouped equals GroupKCSCScalar") && ok;
+                   byte_identical(current_row_grouped, group_k_csc_scalar) &&
+                   byte_identical(current_row_grouped, group_k_csc_nr8),
+               "fixed replay CurrentRowGrouped equals GroupKCSCScalar NR1/8") && ok;
     ok = check(group_k_csc_stats.logical_weight_reference_count == 35 &&
                    group_k_csc_stats.weight_scalar_load_count == 15 &&
-                   group_k_csc_stats.thread_scratch_bytes == rows * cols * sizeof(int64_t),
-               "fixed replay GroupKCSCScalar has 15 loads versus 35 logical refs") && ok;
+                   group_k_csc_stats.thread_scratch_bytes == rows * cols * sizeof(int64_t) &&
+                   group_k_csc_nr8_stats.logical_weight_reference_count == 35 &&
+                   group_k_csc_nr8_stats.weight_scalar_load_count == 15 &&
+                   group_k_csc_nr8_stats.thread_scratch_bytes == rows * cols * sizeof(int64_t),
+               "fixed replay GroupKCSCScalar NR1/8 has 15 loads versus 35 logical refs") && ok;
 
     auto reordered_outliers = shuffled_outliers;
     std::reverse(reordered_outliers.begin(), reordered_outliers.end());
@@ -1343,7 +1353,77 @@ bool test_fixed_residual_replay_baseline() {
                   reordered_result.current_sparse_plan_bytes == result.current_sparse_plan_bytes &&
                   reordered_result.group_k_csc_plan_bytes == result.group_k_csc_plan_bytes &&
                   reordered_result.thread_scratch_bytes == result.thread_scratch_bytes,
-              "fixed replay counters are deterministic") && ok;
+               "fixed replay counters are deterministic") && ok;
+}
+
+bool test_group_k_csc_nr8_transposed_j_tile() {
+    using ggml::gemmini::quants::dec::ActiveRowGroup;
+    using ggml::gemmini::quants::dec::GroupKCSCPlan;
+    using ggml::gemmini::quants::dec::GroupKCSCScalarStats;
+    using ggml::gemmini::quants::dec::ResidualGroupEntry;
+
+    constexpr size_t rows = 3;
+    constexpr size_t cols = 131;
+    constexpr size_t depth = 35;
+    constexpr size_t weight_stride = depth + 7;
+    std::vector<int8_t> transposed_weights(cols * weight_stride, 0);
+    for (size_t column = 0; column < cols; ++column)
+        for (size_t k = 0; k < depth; ++k)
+            transposed_weights[column * weight_stride + k] = static_cast<int8_t>(
+                static_cast<int>((column * 3 + k * 5) % 17) - 8);
+
+    std::vector<float> output(rows * cols, 0.0f);
+    ggml_gemmini_args_t args = dense_args(rows, cols, depth, transposed_weights, output, 0.25f);
+    args.sB = weight_stride;
+    args.transpose_B = true;
+    const auto scalar_route_plan = ggml::gemmini::quants::dec::resolve_dec_route_plan(
+        args, ggml::gemmini::quants::dec::WeightScaleInfoMode::Dec);
+
+    std::vector<ResidualGroupEntry> entries = {
+        { 2, 34, 2 }, { 0, 0, 4 }, { 1, 33, -3 }, { 0, 0, -1 },
+        { 2, 0, -2 }, { 1, 33, 5 }, { 0, 34, 1 },
+    };
+    std::vector<ActiveRowGroup> groups;
+    ggml::gemmini::quants::dec::build_active_row_groups(entries, groups);
+    std::vector<size_t> group_offsets;
+    std::vector<size_t> group_row_group_indices;
+    constexpr size_t active_k_groups = 2;
+    ggml::gemmini::quants::dec::build_group_major_index(
+        groups, active_k_groups, group_offsets, group_row_group_indices);
+    GroupKCSCPlan group_k_csc_plan;
+    const bool group_k_csc_ready = ggml::gemmini::quants::dec::build_group_k_csc_plan(
+        entries, groups, group_offsets, group_row_group_indices, active_k_groups, group_k_csc_plan);
+
+    std::vector<float> scalar_output(rows * cols, 0.0f);
+    GroupKCSCScalarStats scalar_stats;
+    const bool scalar_accumulated =
+        ggml::gemmini::quants::dec::accumulate_to_ycom_int64_scalar_group_k_csc(
+            args, scalar_route_plan, rows, cols, nullptr, entries, group_k_csc_plan,
+            scalar_output.data(), scalar_stats);
+    std::vector<float> nr8_output(rows * cols, 0.0f);
+    GroupKCSCScalarStats nr8_stats;
+    const bool nr8_accumulated =
+        ggml::gemmini::quants::dec::accumulate_to_ycom_int64_scalar_group_k_csc_nr8(
+            args, scalar_route_plan, rows, cols, nullptr, entries, group_k_csc_plan,
+            nr8_output.data(), nr8_stats);
+
+    constexpr size_t expected_logical_refs = 7 * cols;
+    constexpr size_t expected_weight_loads = 3 * cols;
+    constexpr size_t expected_scratch_bytes =
+        rows * ggml::gemmini::quants::dec::kDecInt64JTileWidth * sizeof(int64_t);
+    return check(group_k_csc_ready && scalar_accumulated && nr8_accumulated &&
+                     scalar_route_plan.valid &&
+                     scalar_route_plan.layout == ggml::gemmini::quants::dec::WeightLayout::JxK_ColMajor &&
+                     scalar_route_plan.weight_stride == weight_stride &&
+                     byte_identical(scalar_output, nr8_output),
+                 "GroupKCSC NR8 matches scalar across J tiles with transposed padded weights") &&
+        check(scalar_stats.logical_weight_reference_count == expected_logical_refs &&
+                  scalar_stats.weight_scalar_load_count == expected_weight_loads &&
+                  scalar_stats.thread_scratch_bytes == expected_scratch_bytes &&
+                  nr8_stats.logical_weight_reference_count == expected_logical_refs &&
+                  nr8_stats.weight_scalar_load_count == expected_weight_loads &&
+                  nr8_stats.thread_scratch_bytes == expected_scratch_bytes,
+              "GroupKCSC NR8 transposed J-tile counters");
 }
 
 bool test_thread_determinism() {
@@ -1409,7 +1489,8 @@ int main() {
     const bool ok = test_noop() && test_route_plan() && test_active_row_groups() && test_group_k_csc_plan() && test_route_metadata_rejects() && test_repeated_residuals() && test_decode_repeated_residuals() && test_integer_routes() && test_block_integer_route() &&
         test_q8_h1_hierarchical_route() && test_q8_h1_preserves_ordered_scaling_bits() && test_q8_h1_activation_scale_routes_preserve_bits() && test_unpacked_h1_tail_routes_preserve_bits() && test_q8_h1_large_effective_scale() && test_q8_h2_hierarchical_route() && test_q8_hp1_hierarchical_route() && test_q8_hp2_hierarchical_route() &&
         test_malformed_hierarchical_reject() && test_output_strides() && test_sparse_grouped_tails() && test_malformed_reject() && test_thread_clamp() &&
-        test_fixed_residual_replay_baseline() && test_thread_determinism() && test_inside_existing_openmp_region();
+        test_fixed_residual_replay_baseline() && test_group_k_csc_nr8_transposed_j_tile() &&
+        test_thread_determinism() && test_inside_existing_openmp_region();
     std::printf("gemmini DEC baseline: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
