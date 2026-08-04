@@ -174,6 +174,9 @@ MatMulResult MatMul::run_dense() {
     if (args().I == 0 || args().J == 0 || args().K == 0 || args().A == nullptr || args().f_out == nullptr) {
         return { MatMulStatus::invalid_arguments, MatMulCapability::unsupported };
     }
+    if (args().weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_h0) {
+        return { MatMulStatus::unsupported, MatMulCapability::unsupported };
+    }
 
     execute_dense(args());
     return { MatMulStatus::success, MatMulCapability::supported };
