@@ -1609,6 +1609,51 @@ bool test_group_k_csc_production_dispatch() {
     return ok;
 }
 
+bool test_group_k_csc_k_and_j_tails() {
+    ScopedDecGroupKCscEnv env_guard;
+    bool ok = true;
+    for (const size_t depth : { size_t {31}, size_t {32}, size_t {33},
+                                size_t {63}, size_t {64}, size_t {65},
+                                size_t {767}, size_t {768}, size_t {769} }) {
+        for (const size_t columns : { size_t {1}, size_t {4}, size_t {8}, size_t {131} }) {
+            constexpr size_t rows = 2;
+            std::vector<int8_t> weights(depth * columns, 0);
+            for (size_t k = 0; k < depth; ++k)
+                for (size_t j = 0; j < columns; ++j)
+                    weights[k * columns + j] = static_cast<int8_t>((k + 3 * j) % 13 - 6);
+
+            std::vector<ggml::gemmini::quants::QactOutlier> outliers = {
+                { 0, 0, 3 },
+                { 0, static_cast<int32_t>(depth - 1), -2 },
+                { 1, static_cast<int32_t>(depth / 2), 1 },
+            };
+            std::vector<float> row_direct_output(rows * columns, 0.0f);
+            ggml_gemmini_args_t args = dense_args(
+                rows, columns, depth, weights, row_direct_output, 0.25f);
+            set_dec_group_k_csc_force(nullptr);
+            set_dec_group_k_csc_enable(nullptr);
+            set_dec_group_k_csc_disable("1");
+            const auto row_direct_result = ggml::gemmini::quants::dec::compensate_activation_dec(
+                outliers, args, "test");
+
+            std::vector<float> group_k_csc_output(rows * columns, 0.0f);
+            args.f_out = group_k_csc_output.data();
+            set_dec_group_k_csc_disable(nullptr);
+            set_dec_group_k_csc_enable("1");
+            const auto group_k_csc_result = ggml::gemmini::quants::dec::compensate_activation_dec(
+                outliers, args, "test");
+
+            ok = check(row_direct_result.group_k_csc_plan_bytes == 0 &&
+                           group_k_csc_result.group_k_csc_plan_bytes > 0 &&
+                           group_k_csc_result.weight_vector_load_count > 0 &&
+                           group_k_csc_result.int_mac_count == outliers.size() * columns &&
+                           byte_identical(row_direct_output, group_k_csc_output),
+                       "GroupKCSC preserves K boundaries and NR tails") && ok;
+        }
+    }
+    return ok;
+}
+
 bool test_fixed_residual_replay_baseline() {
     using ggml::gemmini::quants::dec::ActiveRowGroup;
     using ggml::gemmini::quants::dec::GroupKCSCPlan;
@@ -2724,7 +2769,7 @@ int main() {
     const bool ok = test_noop() && test_route_plan() && test_active_row_groups() && test_group_k_csc_plan() && test_route_metadata_rejects() && test_repeated_residuals() && test_decode_repeated_residuals() && test_integer_routes() && test_block_integer_route() &&
         test_q8_h1_hierarchical_route() && test_q8_h1_preserves_ordered_scaling_bits() && test_q8_h1_activation_scale_routes_preserve_bits() && test_unpacked_h1_tail_routes_preserve_bits() && test_q8_h1_large_effective_scale() && test_q8_h2_hierarchical_route() && test_q8_hp1_hierarchical_route() && test_q8_hp2_hierarchical_route() &&
         test_malformed_hierarchical_reject() && test_output_strides() && test_sparse_grouped_tails() && test_malformed_reject() && test_thread_clamp() &&
-        test_q8_h1_group_k_csc_matches_row_direct() && test_q8_h1_group_k_csc_auto_dispatch() && test_group_k_csc_production_dispatch() && test_fixed_residual_replay_baseline() &&
+        test_q8_h1_group_k_csc_matches_row_direct() && test_q8_h1_group_k_csc_auto_dispatch() && test_group_k_csc_production_dispatch() && test_group_k_csc_k_and_j_tails() && test_fixed_residual_replay_baseline() &&
         test_fixed_residual_replay_high_reuse() && test_group_k_csc_nr4_transposed_j_tile() &&
         test_group_k_csc_mixed_int32_boundaries() &&
         test_group_k_csc_mixed_prefix_and_plan_rejects() &&
