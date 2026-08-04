@@ -247,10 +247,14 @@ target_include_directories(test-gemmini-dec PRIVATE
     ../ggml/src/ggml-gemmini/quants/dec)
 add_test(NAME test-gemmini-dec COMMAND $<TARGET_FILE:test-gemmini-dec>)
 
-add_executable(test-gemmini-matmul test-gemmini-matmul.cpp)
-target_link_libraries(test-gemmini-matmul PRIVATE ggml-gemmini ggml-base)
-target_compile_features(test-gemmini-matmul PRIVATE cxx_std_17)
-add_test(NAME test-gemmini-matmul COMMAND $<TARGET_FILE:test-gemmini-matmul>)
+if (NOT GGML_BACKEND_DL)
+    # The façade test uses C++ symbols from the statically linked backend.
+    # Dynamic backends are MODULE libraries and cannot be linked into a test.
+    add_executable(test-gemmini-matmul test-gemmini-matmul.cpp)
+    target_link_libraries(test-gemmini-matmul PRIVATE ggml-gemmini ggml-base)
+    target_compile_features(test-gemmini-matmul PRIVATE cxx_std_17)
+    add_test(NAME test-gemmini-matmul COMMAND $<TARGET_FILE:test-gemmini-matmul>)
+endif()
 
 llama_build_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_build_and_test(test-autorelease.cpp        LABEL "model")
