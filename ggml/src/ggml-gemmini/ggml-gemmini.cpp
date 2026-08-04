@@ -832,6 +832,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     if (dst == nullptr || dst->src[0] == nullptr || dst->src[1] == nullptr) {
         GGML_ABORT("Gemmini mul_mat received null tensor pointers");
     }
+    if (ggml_is_empty(dst)) {
+        return;
+    }
     if (!gemmini_shared_weight_contract(dst)) {
         GGML_ABORT("Gemmini MUL_MAT shared-weight contract failed");
     }
@@ -1963,6 +1966,9 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_MUL_MAT:
         {
+            if (ggml_is_empty(op)) {
+                return true;
+            }
             const struct ggml_tensor *a = op->src[0]; // W
             const struct ggml_tensor *b = op->src[1]; // x
             if (a == nullptr || b == nullptr)
