@@ -1351,12 +1351,18 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job, size_t shard_id, 
     char dec_layer[64];
     std::snprintf(dec_layer, sizeof(dec_layer), "ggml-gemmini-matmul.stripe-%zu",
                   job.input_.stripe_id());
+#if ERROR_COMPENSATION
     if (!job.compensation_outliers_.empty()) {
         dec_status = quants::dec::compensate_activation_dec_rows_columns(
             job.compensation_outliers_, job.execution_->facade_.args(),
             job.input_.row_begin(), job.input_.row_end(), col_begin, col_end,
             dec_layer, job.execution_->dispatch_override_);
     }
+#else
+    (void) col_begin;
+    (void) col_end;
+    (void) dec_layer;
+#endif
     if (result.ok()) {
         if (dec_status == quants::dec::ActivationDECRowSliceStatus::unsupported) {
             result = unsupported_backend("compensation execution is unsupported by backend");

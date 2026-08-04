@@ -499,6 +499,64 @@ bool test_native_exsia_theta_row_slice_parity() {
         check(same_output(stripe_output, full_output), "native EXSIA theta slice differs");
 }
 
+bool test_native_exsia_multistripe_residual_parity() {
+    using namespace ggml::gemmini;
+    constexpr size_t rows = 32;
+    constexpr size_t columns = 4;
+    constexpr size_t depth = QK8_0;
+    std::vector<elem_t> activation(rows * depth, 1);
+    std::vector<block_q8_h1> blocks(columns);
+    for (auto & block : blocks) {
+        std::fill(std::begin(block.qs), std::end(block.qs), elem_t{1});
+        block.c_b = 86;
+        block.R = 4095;
+        block.s_rf = 0.00032747327350080013f;
+    }
+    std::vector<float> full_output(rows * columns, 0.0f);
+    std::vector<float> dense_output(rows * columns, 0.0f);
+    std::vector<float> stripe_output(rows * columns, 0.0f);
+    const quants::QactOutlier outlier{17, 3, 2};
+
+    auto make_args = [&](std::vector<float> & output) {
+        ggml_gemmini_args_t args{};
+        args.I = rows;
+        args.J = columns;
+        args.K = depth;
+        args.A = activation.data();
+        args.sA = depth;
+        args.f_out = output.data();
+        args.stride_f_out = columns;
+        args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1;
+        args.q8_h1_blocks = blocks.data();
+        args.q8_h1_block_count = blocks.size();
+        args.q8_h1_rows = columns;
+        args.blocks_per_row = 1;
+        args.blocks_K = 1;
+        args.blocks_J = columns;
+        args.block_size_k = depth;
+        args.tiled_matmul_type = CPU;
+        auto & meta = args.act_quant.storage().emplace<quants::act::exsia::Meta>();
+        meta.theta = { 0, 1 };
+        meta.outliers = { outlier };
+        return args;
+    };
+
+    auto full_args = make_args(full_output);
+    auto dense_args = make_args(dense_output);
+    auto stripe_args = make_args(stripe_output);
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_sequential;
+    options.stripe_rows = 16;
+    options.rc_shards = 2;
+    const auto full_result = MatMul(full_args).run_full();
+    const auto dense_result = MatMul(dense_args).run_dense();
+    const auto stripe_result = matmul(stripe_args, options);
+    return check(full_result.status == MatMulStatus::success, "native multistripe full status") &&
+        check(dense_result.status == MatMulStatus::success, "native multistripe dense status") &&
+        check(stripe_result.ok(), "native multistripe stripe status") &&
+        check(same_output(stripe_output, full_output), "native multistripe residual differs");
+}
+
 bool test_empty_tail_and_malformed_stripe_status() {
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
@@ -1001,6 +1059,7 @@ int main(int argc, char ** argv) {
             test_full_and_stripe_sequential_outputs_match() &&
             test_block_activation_scale_compensation_parity() &&
             test_native_exsia_theta_row_slice_parity() &&
+            test_native_exsia_multistripe_residual_parity() &&
             test_empty_tail_and_malformed_stripe_status() &&
             test_duplicate_and_overlap_stripe_status() &&
             test_h2_and_hp2_stripe_capability_is_explicitly_unsupported() &&
