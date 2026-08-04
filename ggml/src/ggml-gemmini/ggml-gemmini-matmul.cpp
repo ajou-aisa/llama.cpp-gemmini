@@ -690,12 +690,11 @@ const quants::QactOutlier & MatmulStripeCollector::captured_outlier(size_t strip
 bool MatmulStripeCollector::on_ready(
         void * user_data, const quants::act::exsia::StripeReadyEvent & event) {
     auto & collector = *static_cast<MatmulStripeCollector *>(user_data);
-    if (!collector.status_) {
-        return false;
-    }
     if (event.row_begin >= event.row_end ||
         ((event.outliers == nullptr) != (event.outlier_count == 0))) {
+        std::lock_guard<std::mutex> lock(collector.mutex_);
         collector.status_ = make_status(MatmulStatusCode::invalid_argument, "invalid stripe event");
+        collector.stop_requested_ = true;
         return false;
     }
     try {
@@ -703,8 +702,11 @@ bool MatmulStripeCollector::on_ready(
         if (event.outlier_count != 0) {
             outliers.assign(event.outliers, event.outliers + event.outlier_count);
         }
+        std::unique_lock<std::mutex> lock(collector.mutex_);
+        if (!collector.status_ || collector.stop_requested_) {
+            return false;
+        }
         if (collector.worker_started_) {
-            std::unique_lock<std::mutex> lock(collector.mutex_);
             collector.condition_.wait(lock, [&collector] {
                 return collector.stop_requested_ || !collector.status_ ||
                     collector.pending_.size() < collector.capacity_;
@@ -726,6 +728,7 @@ bool MatmulStripeCollector::on_ready(
         }
         if (collector.stripes_.size() >= collector.capacity_) {
             collector.status_ = make_status(MatmulStatusCode::out_of_memory, "collector capacity exhausted");
+            collector.stop_requested_ = true;
             return false;
         }
         collector.stripes_.push_back(
@@ -737,7 +740,9 @@ bool MatmulStripeCollector::on_ready(
              event.local_group3_end_cycle >= event.local_group3_start_cycle ?
                  event.local_group3_end_cycle - event.local_group3_start_cycle : 0});
     } catch (const std::bad_alloc &) {
+        std::lock_guard<std::mutex> lock(collector.mutex_);
         collector.status_ = make_status(MatmulStatusCode::out_of_memory, "stripe capture allocation failed");
+        collector.stop_requested_ = true;
         return false;
     }
     return true;
