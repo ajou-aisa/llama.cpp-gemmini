@@ -545,14 +545,8 @@ ActivationDECResult compensate_activation_dec(
         J >= 8 &&
         rows_per_active_k_mean >= 16.0 &&
         estimated_group_k_csc_saved_weight_bytes > estimated_group_k_csc_plan_bytes;
-    const bool group_k_csc_common_h1 = use_int64_h1 &&
-        I > 1 &&
-        J >= 8 &&
-        rows_per_active_k_mean >= 16.0 &&
-        estimated_group_k_csc_saved_weight_bytes > estimated_group_k_csc_plan_bytes;
     const bool group_k_csc_supported_route = use_int64_scalar || use_int64_h1;
-    const bool group_k_csc_common =
-        group_k_csc_common_dense || group_k_csc_common_h1;
+    const bool group_k_csc_common = group_k_csc_common_dense;
     const bool group_k_csc_override = (group_k_csc_forced || group_k_csc_enabled) && I > 1;
     bool use_group_k_csc = !group_k_csc_disabled && group_k_csc_supported_route &&
         (group_k_csc_override || group_k_csc_common);

@@ -1521,18 +1521,25 @@ bool test_q8_h1_group_k_csc_auto_dispatch() {
         outliers, args, "test");
 
     set_dec_group_k_csc_disable(nullptr);
-    std::vector<float> auto_output(rows * columns, 0.0f);
-    args.f_out = auto_output.data();
-    const auto auto_result = ggml::gemmini::quants::dec::compensate_activation_dec(
+    std::vector<float> default_output(rows * columns, 0.0f);
+    args.f_out = default_output.data();
+    const auto default_result = ggml::gemmini::quants::dec::compensate_activation_dec(
         outliers, args, "test");
-    const double rows_per_active_k_mean = auto_result.unique_k_count == 0 ? 0.0 :
-        static_cast<double>(auto_result.active_row_k_pairs) / auto_result.unique_k_count;
+    set_dec_group_k_csc_enable("1");
+    std::vector<float> explicit_output(rows * columns, 0.0f);
+    args.f_out = explicit_output.data();
+    const auto explicit_result = ggml::gemmini::quants::dec::compensate_activation_dec(
+        outliers, args, "test");
+    const double rows_per_active_k_mean = explicit_result.unique_k_count == 0 ? 0.0 :
+        static_cast<double>(explicit_result.active_row_k_pairs) / explicit_result.unique_k_count;
     return check(row_direct_result.group_k_csc_plan_bytes == 0 &&
-                     auto_result.group_k_csc_plan_bytes > 0 &&
-                     auto_result.weight_vector_load_count > 0 &&
+                     default_result.group_k_csc_plan_bytes == 0 &&
+                     explicit_result.group_k_csc_plan_bytes > 0 &&
+                     explicit_result.weight_vector_load_count > 0 &&
                      rows_per_active_k_mean == static_cast<double>(rows) &&
-                     byte_identical(row_direct_output, auto_output),
-                 "H1 high-reuse auto dispatch selects GroupKCSC and preserves bits");
+                     byte_identical(row_direct_output, default_output) &&
+                     byte_identical(default_output, explicit_output),
+                 "H1 high-reuse default stays RowDirect and explicit GroupKCSC preserves bits");
 }
 
 bool test_group_k_csc_production_dispatch() {
