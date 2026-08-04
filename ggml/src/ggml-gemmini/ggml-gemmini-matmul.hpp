@@ -245,7 +245,6 @@ struct MatmulOptions {
     size_t rc_shards = 0;
     bool validation = false;
     bool profiling = false;
-    bool force = false;
     bool force_row_direct = false;
     bool force_group_k_csc = false;
     size_t job_capacity = 4;

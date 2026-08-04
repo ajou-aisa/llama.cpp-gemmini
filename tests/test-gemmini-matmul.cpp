@@ -559,7 +559,6 @@ bool test_public_contract_shape() {
     options.rc_shards = 3;
     options.validation = true;
     options.profiling = true;
-    options.force = true;
     options.job_capacity = 2;
 
     const int32_t residual[] = { 4, 5 };
@@ -572,7 +571,7 @@ bool test_public_contract_shape() {
         check(!statuses[1].ok(), "failure status not ok") &&
         check(std::string_view(statuses[2].message) == "invalid contract", "status message") &&
         check(options.mode == MatmulInvocationMode::stripe_pipeline && options.dense_threads == 2 &&
-                  options.rc_shards == 3 && options.validation && options.profiling && options.force &&
+                  options.rc_shards == 3 && options.validation && options.profiling &&
                   options.job_capacity == 2,
               "matmul options") &&
         check(input.row_begin() == 1 && input.row_end() == 3 && input.stripe_id() == 7 &&
