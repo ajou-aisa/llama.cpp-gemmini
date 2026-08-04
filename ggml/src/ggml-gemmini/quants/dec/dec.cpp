@@ -951,8 +951,9 @@ ActivationDECRowSliceStatus compensate_activation_dec_rows_columns(
     local_args.activation_row_offset += row_begin;
 
     const bool channel_direct = args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_channel;
-    const bool channel_sidecar = args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar;
-    const bool jxk_layout = channel_direct || channel_sidecar || args.transpose_B ||
+    const bool jxk_layout = channel_direct ||
+        args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar ||
+        args.transpose_B ||
         args.q8_h1_blocks != nullptr || args.q8_h2_blocks != nullptr ||
         args.q8_hp1_blocks != nullptr || args.q8_hp2_blocks != nullptr || args.c_b != nullptr;
 
