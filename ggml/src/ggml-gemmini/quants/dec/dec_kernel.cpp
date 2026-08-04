@@ -421,6 +421,20 @@ namespace
         return requires_int64 ? RowAccumulationWidth::Int64 : RowAccumulationWidth::Int32;
     }
 
+    size_t count_active_rows(const std::vector<ResidualGroupEntry> &entries)
+    {
+        size_t active_rows = 0;
+        uint32_t previous_row = std::numeric_limits<uint32_t>::max();
+        for (const ResidualGroupEntry &entry : entries)
+        {
+            if (entry.row == previous_row)
+                continue;
+            previous_row = entry.row;
+            ++active_rows;
+        }
+        return active_rows;
+    }
+
     void build_mixed_group_k_csc_entry_plan(
         const GroupKCSCPlan &group_k_csc_plan,
         const std::vector<ResidualGroupEntry> &entries,
@@ -711,6 +725,10 @@ bool accumulate_to_ycom_int64_scalar_group_k_csc_impl(
     stats.logical_weight_reference_count = saturating_mul_size(entries.size(), J);
     stats.weight_scalar_load_count = saturating_mul_size(active_k_count, J);
     stats.weight_vector_load_count = group_k_csc_vector_load_count<NR>(active_k_count, J);
+    stats.scratch_init_count = saturating_mul_size(I, J);
+    stats.sparse_update_count = stats.logical_weight_reference_count;
+    stats.fallback_update_count = stats.logical_weight_reference_count;
+    stats.merge_count = saturating_mul_size(count_active_rows(entries), J);
     stats.thread_scratch_bytes = saturating_mul_size(
         saturating_mul_size(I, tile_capacity), sizeof(int64_t));
 
@@ -859,6 +877,7 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_impl(
         }
         entry_begin = entry_end;
     }
+    stats.classification_work_count = entries.size();
 
     size_t active_k_count = 0;
     for (size_t group = 0; group < group_k_csc_plan.num_groups; ++group)
@@ -878,10 +897,28 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_impl(
         all_int64 ? GroupKCSCWidthPath::AllInt64 : GroupKCSCWidthPath::Mixed;
     MixedGroupKCSCEntryPlan mixed_entry_plan;
     if (!all_int32 && !all_int64)
+    {
         build_mixed_group_k_csc_entry_plan(
             group_k_csc_plan, entries, fallback_slots, no_fallback_slot, mixed_entry_plan);
+        stats.branch_entry_classification_count = entries.size();
+    }
     const size_t int32_scratch_rows = all_int64 ? 0 : I;
     const size_t int64_scratch_rows = all_int32 ? 0 : stats.int64_fallback_row_count;
+    stats.scratch_init_count = saturating_mul_size(
+        saturating_add_size(int32_scratch_rows, int64_scratch_rows), J);
+    if (all_int32)
+        stats.safe_update_count = stats.logical_weight_reference_count;
+    else if (all_int64)
+        stats.fallback_update_count = stats.logical_weight_reference_count;
+    else
+    {
+        stats.safe_update_count = saturating_mul_size(mixed_entry_plan.int32_entry_order.size(), J);
+        stats.fallback_update_count = saturating_mul_size(mixed_entry_plan.int64_entry_order.size(), J);
+    }
+    stats.sparse_update_count = saturating_add_size(
+        stats.safe_update_count, stats.fallback_update_count);
+    stats.merge_count = saturating_mul_size(
+        saturating_add_size(int32_rows.size(), int64_rows.size()), J);
     const size_t int32_scratch_bytes = saturating_mul_size(
         saturating_mul_size(int32_scratch_rows, tile_capacity), sizeof(int32_t));
     const size_t int64_scratch_bytes = saturating_mul_size(

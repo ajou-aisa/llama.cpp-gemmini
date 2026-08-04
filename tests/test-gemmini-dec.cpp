@@ -1270,6 +1270,35 @@ struct ReplayTimingStats {
     ReplayTimingSummary total;
 };
 
+const char *group_k_csc_width_path_name(
+    ggml::gemmini::quants::dec::GroupKCSCWidthPath width_path) {
+    switch (width_path) {
+        case ggml::gemmini::quants::dec::GroupKCSCWidthPath::Mixed:
+            return "mixed";
+        case ggml::gemmini::quants::dec::GroupKCSCWidthPath::AllInt32:
+            return "all-int32";
+        case ggml::gemmini::quants::dec::GroupKCSCWidthPath::AllInt64:
+            return "all-int64";
+    }
+    return "unknown";
+}
+
+void print_group_k_csc_replay_cost(
+    const char *label,
+    const ggml::gemmini::quants::dec::GroupKCSCScalarStats &stats) {
+    std::printf(
+        "replay group_k_csc_cost case=%s width_path=%s classify=%zu scratch_init=%zu sparse_update=%zu merge=%zu safe_updates=%zu fallback_updates=%zu branch_entry_classify=%zu\n",
+        label,
+        group_k_csc_width_path_name(stats.width_path),
+        stats.classification_work_count,
+        stats.scratch_init_count,
+        stats.sparse_update_count,
+        stats.merge_count,
+        stats.safe_update_count,
+        stats.fallback_update_count,
+        stats.branch_entry_classification_count);
+}
+
 bool byte_identical(const std::vector<float> &lhs, const std::vector<float> &rhs);
 
 template <typename Runner>
@@ -1592,18 +1621,46 @@ bool test_fixed_residual_replay_baseline() {
     ok = check(group_k_csc_stats.logical_weight_reference_count == 35 &&
                    group_k_csc_stats.weight_scalar_load_count == 15 &&
                    group_k_csc_stats.weight_vector_load_count == 0 &&
+                   group_k_csc_stats.classification_work_count == 0 &&
+                   group_k_csc_stats.scratch_init_count == rows * cols &&
+                   group_k_csc_stats.sparse_update_count == 35 &&
+                   group_k_csc_stats.merge_count == rows * cols &&
+                   group_k_csc_stats.safe_update_count == 0 &&
+                   group_k_csc_stats.fallback_update_count == 35 &&
+                   group_k_csc_stats.branch_entry_classification_count == 0 &&
                    group_k_csc_stats.thread_scratch_bytes == rows * cols * sizeof(int64_t) &&
                    group_k_csc_nr4_stats.logical_weight_reference_count == 35 &&
                    group_k_csc_nr4_stats.weight_scalar_load_count == 15 &&
                    group_k_csc_nr4_stats.weight_vector_load_count == 6 &&
+                   group_k_csc_nr4_stats.classification_work_count == 0 &&
+                   group_k_csc_nr4_stats.scratch_init_count == rows * cols &&
+                   group_k_csc_nr4_stats.sparse_update_count == 35 &&
+                   group_k_csc_nr4_stats.merge_count == rows * cols &&
+                   group_k_csc_nr4_stats.safe_update_count == 0 &&
+                   group_k_csc_nr4_stats.fallback_update_count == 35 &&
+                   group_k_csc_nr4_stats.branch_entry_classification_count == 0 &&
                    group_k_csc_nr4_stats.thread_scratch_bytes == rows * cols * sizeof(int64_t) &&
                    group_k_csc_nr8_stats.logical_weight_reference_count == 35 &&
                    group_k_csc_nr8_stats.weight_scalar_load_count == 15 &&
                    group_k_csc_nr8_stats.weight_vector_load_count == 3 &&
+                   group_k_csc_nr8_stats.classification_work_count == 0 &&
+                   group_k_csc_nr8_stats.scratch_init_count == rows * cols &&
+                   group_k_csc_nr8_stats.sparse_update_count == 35 &&
+                   group_k_csc_nr8_stats.merge_count == rows * cols &&
+                   group_k_csc_nr8_stats.safe_update_count == 0 &&
+                   group_k_csc_nr8_stats.fallback_update_count == 35 &&
+                   group_k_csc_nr8_stats.branch_entry_classification_count == 0 &&
                    group_k_csc_nr8_stats.thread_scratch_bytes == rows * cols * sizeof(int64_t) &&
                    group_k_csc_mixed_stats.logical_weight_reference_count == 35 &&
                    group_k_csc_mixed_stats.weight_scalar_load_count == 15 &&
                    group_k_csc_mixed_stats.weight_vector_load_count == 3 &&
+                   group_k_csc_mixed_stats.classification_work_count == entries.size() &&
+                   group_k_csc_mixed_stats.scratch_init_count == rows * cols &&
+                   group_k_csc_mixed_stats.sparse_update_count == 35 &&
+                   group_k_csc_mixed_stats.merge_count == rows * cols &&
+                   group_k_csc_mixed_stats.safe_update_count == 35 &&
+                   group_k_csc_mixed_stats.fallback_update_count == 0 &&
+                   group_k_csc_mixed_stats.branch_entry_classification_count == 0 &&
                    group_k_csc_mixed_stats.thread_scratch_bytes == rows * cols * sizeof(int32_t) &&
                    group_k_csc_mixed_stats.int32_row_count == rows &&
                    group_k_csc_mixed_stats.int64_fallback_row_count == 0 &&
@@ -1611,11 +1668,19 @@ bool test_fixed_residual_replay_baseline() {
                    group_k_csc_mixed_nr4_stats.logical_weight_reference_count == 35 &&
                    group_k_csc_mixed_nr4_stats.weight_scalar_load_count == 15 &&
                    group_k_csc_mixed_nr4_stats.weight_vector_load_count == 6 &&
+                   group_k_csc_mixed_nr4_stats.classification_work_count == entries.size() &&
+                   group_k_csc_mixed_nr4_stats.scratch_init_count == rows * cols &&
+                   group_k_csc_mixed_nr4_stats.sparse_update_count == 35 &&
+                   group_k_csc_mixed_nr4_stats.merge_count == rows * cols &&
+                   group_k_csc_mixed_nr4_stats.safe_update_count == 35 &&
+                   group_k_csc_mixed_nr4_stats.fallback_update_count == 0 &&
+                   group_k_csc_mixed_nr4_stats.branch_entry_classification_count == 0 &&
                    group_k_csc_mixed_nr4_stats.thread_scratch_bytes == rows * cols * sizeof(int32_t) &&
                    group_k_csc_mixed_nr4_stats.int32_row_count == rows &&
                    group_k_csc_mixed_nr4_stats.int64_fallback_row_count == 0 &&
                    group_k_csc_mixed_nr4_stats.width_path == GroupKCSCWidthPath::AllInt32,
                "fixed replay GroupKCSC NR4/8 reuse all-safe counters") && ok;
+    print_group_k_csc_replay_cost("all-safe", group_k_csc_mixed_stats);
 
     constexpr size_t warmup_count = 5;
     constexpr size_t measured_count = 25;
@@ -1799,7 +1864,7 @@ bool test_group_k_csc_nr4_transposed_j_tile() {
     constexpr size_t expected_weight_loads = 3 * cols;
     constexpr size_t expected_scratch_bytes =
         rows * ggml::gemmini::quants::dec::kDecInt64JTileWidth * sizeof(int64_t);
-    return check(group_k_csc_ready && scalar_accumulated && nr4_accumulated && nr8_accumulated &&
+    const bool ok = check(group_k_csc_ready && scalar_accumulated && nr4_accumulated && nr8_accumulated &&
                      mixed_accumulated && mixed_nr4_accumulated &&
                      mixed_threads_identical &&
                      scalar_route_plan.valid &&
@@ -1813,18 +1878,46 @@ bool test_group_k_csc_nr4_transposed_j_tile() {
         check(scalar_stats.logical_weight_reference_count == expected_logical_refs &&
                   scalar_stats.weight_scalar_load_count == expected_weight_loads &&
                   scalar_stats.weight_vector_load_count == 0 &&
+                  scalar_stats.classification_work_count == 0 &&
+                  scalar_stats.scratch_init_count == rows * cols &&
+                  scalar_stats.sparse_update_count == expected_logical_refs &&
+                  scalar_stats.merge_count == rows * cols &&
+                  scalar_stats.safe_update_count == 0 &&
+                  scalar_stats.fallback_update_count == expected_logical_refs &&
+                  scalar_stats.branch_entry_classification_count == 0 &&
                   scalar_stats.thread_scratch_bytes == expected_scratch_bytes &&
                   nr4_stats.logical_weight_reference_count == expected_logical_refs &&
                   nr4_stats.weight_scalar_load_count == expected_weight_loads &&
                   nr4_stats.weight_vector_load_count == 99 &&
+                  nr4_stats.classification_work_count == 0 &&
+                  nr4_stats.scratch_init_count == rows * cols &&
+                  nr4_stats.sparse_update_count == expected_logical_refs &&
+                  nr4_stats.merge_count == rows * cols &&
+                  nr4_stats.safe_update_count == 0 &&
+                  nr4_stats.fallback_update_count == expected_logical_refs &&
+                  nr4_stats.branch_entry_classification_count == 0 &&
                   nr4_stats.thread_scratch_bytes == expected_scratch_bytes &&
                   nr8_stats.logical_weight_reference_count == expected_logical_refs &&
                   nr8_stats.weight_scalar_load_count == expected_weight_loads &&
                   nr8_stats.weight_vector_load_count == 51 &&
+                  nr8_stats.classification_work_count == 0 &&
+                  nr8_stats.scratch_init_count == rows * cols &&
+                  nr8_stats.sparse_update_count == expected_logical_refs &&
+                  nr8_stats.merge_count == rows * cols &&
+                  nr8_stats.safe_update_count == 0 &&
+                  nr8_stats.fallback_update_count == expected_logical_refs &&
+                  nr8_stats.branch_entry_classification_count == 0 &&
                   nr8_stats.thread_scratch_bytes == expected_scratch_bytes &&
                   mixed_stats.logical_weight_reference_count == expected_logical_refs &&
                   mixed_stats.weight_scalar_load_count == expected_weight_loads &&
                   mixed_stats.weight_vector_load_count == 51 &&
+                  mixed_stats.classification_work_count == entries.size() &&
+                  mixed_stats.scratch_init_count == 4 * cols &&
+                  mixed_stats.sparse_update_count == expected_logical_refs &&
+                  mixed_stats.merge_count == rows * cols &&
+                  mixed_stats.safe_update_count == 5 * cols &&
+                  mixed_stats.fallback_update_count == 2 * cols &&
+                  mixed_stats.branch_entry_classification_count == entries.size() &&
                   mixed_stats.thread_scratch_bytes ==
                       ggml::gemmini::quants::dec::kDecInt64JTileWidth *
                       (rows * sizeof(int32_t) + sizeof(int64_t)) &&
@@ -1833,12 +1926,21 @@ bool test_group_k_csc_nr4_transposed_j_tile() {
                   mixed_nr4_stats.logical_weight_reference_count == expected_logical_refs &&
                   mixed_nr4_stats.weight_scalar_load_count == expected_weight_loads &&
                   mixed_nr4_stats.weight_vector_load_count == 99 &&
+                  mixed_nr4_stats.classification_work_count == entries.size() &&
+                  mixed_nr4_stats.scratch_init_count == 4 * cols &&
+                  mixed_nr4_stats.sparse_update_count == expected_logical_refs &&
+                  mixed_nr4_stats.merge_count == rows * cols &&
+                  mixed_nr4_stats.safe_update_count == 5 * cols &&
+                  mixed_nr4_stats.fallback_update_count == 2 * cols &&
+                  mixed_nr4_stats.branch_entry_classification_count == entries.size() &&
                   mixed_nr4_stats.thread_scratch_bytes ==
                       ggml::gemmini::quants::dec::kDecInt64JTileWidth *
                       (rows * sizeof(int32_t) + sizeof(int64_t)) &&
                   mixed_nr4_stats.int32_row_count == 2 &&
                   mixed_nr4_stats.int64_fallback_row_count == 1,
               "GroupKCSC NR4/8 transposed J-tile fallback counters");
+    print_group_k_csc_replay_cost("one-fallback", mixed_stats);
+    return ok;
 }
 
 bool test_group_k_csc_mixed_int32_boundaries() {
@@ -1941,7 +2043,7 @@ bool test_group_k_csc_mixed_int32_boundaries() {
             args, scalar_route_plan, rows, cols, nullptr, fallback_entries, fallback_plan,
             fallback_mixed_nr4_output.data(), fallback_mixed_nr4_stats);
 
-    return check(group_k_csc_ready && int64_accumulated && int64_nr4_accumulated &&
+    const bool ok = check(group_k_csc_ready && int64_accumulated && int64_nr4_accumulated &&
                      mixed_accumulated && mixed_nr4_accumulated &&
                      byte_identical(int64_output, int64_nr4_output) &&
                      byte_identical(int64_output, mixed_output) &&
@@ -1950,6 +2052,13 @@ bool test_group_k_csc_mixed_int32_boundaries() {
         check(mixed_stats.logical_weight_reference_count == 7 * cols &&
                   mixed_stats.weight_scalar_load_count == cols &&
                   mixed_stats.weight_vector_load_count == 1 &&
+                  mixed_stats.classification_work_count == entries.size() &&
+                  mixed_stats.scratch_init_count == cols * (rows + 4) &&
+                  mixed_stats.sparse_update_count == 7 * cols &&
+                  mixed_stats.merge_count == cols * 6 &&
+                  mixed_stats.safe_update_count == 2 * cols &&
+                  mixed_stats.fallback_update_count == 5 * cols &&
+                  mixed_stats.branch_entry_classification_count == entries.size() &&
                   mixed_stats.thread_scratch_bytes ==
                       cols * (rows * sizeof(int32_t) + 4 * sizeof(int64_t)) &&
                   mixed_stats.int32_row_count == 2 &&
@@ -1957,6 +2066,13 @@ bool test_group_k_csc_mixed_int32_boundaries() {
                   mixed_nr4_stats.logical_weight_reference_count == 7 * cols &&
                   mixed_nr4_stats.weight_scalar_load_count == cols &&
                   mixed_nr4_stats.weight_vector_load_count == 2 &&
+                  mixed_nr4_stats.classification_work_count == entries.size() &&
+                  mixed_nr4_stats.scratch_init_count == cols * (rows + 4) &&
+                  mixed_nr4_stats.sparse_update_count == 7 * cols &&
+                  mixed_nr4_stats.merge_count == cols * 6 &&
+                  mixed_nr4_stats.safe_update_count == 2 * cols &&
+                  mixed_nr4_stats.fallback_update_count == 5 * cols &&
+                  mixed_nr4_stats.branch_entry_classification_count == entries.size() &&
                   mixed_nr4_stats.thread_scratch_bytes ==
                       cols * (rows * sizeof(int32_t) + 4 * sizeof(int64_t)) &&
                   mixed_nr4_stats.int32_row_count == 2 &&
@@ -1967,11 +2083,27 @@ bool test_group_k_csc_mixed_int32_boundaries() {
                   byte_identical(fallback_int64_output, fallback_int64_nr4_output) &&
                   byte_identical(fallback_int64_output, fallback_mixed_output) &&
                   byte_identical(fallback_int64_output, fallback_mixed_nr4_output) &&
+                  fallback_mixed_stats.classification_work_count == fallback_entries.size() &&
+                  fallback_mixed_stats.scratch_init_count == 4 * cols &&
+                  fallback_mixed_stats.sparse_update_count == fallback_entries.size() * cols &&
+                  fallback_mixed_stats.merge_count == 4 * cols &&
+                  fallback_mixed_stats.safe_update_count == 0 &&
+                  fallback_mixed_stats.fallback_update_count == fallback_entries.size() * cols &&
+                  fallback_mixed_stats.branch_entry_classification_count == 0 &&
                   fallback_mixed_stats.width_path ==
                       ggml::gemmini::quants::dec::GroupKCSCWidthPath::AllInt64 &&
+                  fallback_mixed_nr4_stats.classification_work_count == fallback_entries.size() &&
+                  fallback_mixed_nr4_stats.scratch_init_count == 4 * cols &&
+                  fallback_mixed_nr4_stats.sparse_update_count == fallback_entries.size() * cols &&
+                  fallback_mixed_nr4_stats.merge_count == 4 * cols &&
+                  fallback_mixed_nr4_stats.safe_update_count == 0 &&
+                  fallback_mixed_nr4_stats.fallback_update_count == fallback_entries.size() * cols &&
+                  fallback_mixed_nr4_stats.branch_entry_classification_count == 0 &&
                   fallback_mixed_nr4_stats.width_path ==
                       ggml::gemmini::quants::dec::GroupKCSCWidthPath::AllInt64,
               "GroupKCSC NR4/8 mixed selects AllInt64");
+    print_group_k_csc_replay_cost("all-int64", fallback_mixed_stats);
+    return ok;
 }
 
 bool test_group_k_csc_mixed_prefix_and_plan_rejects() {
@@ -2044,6 +2176,13 @@ bool test_group_k_csc_mixed_prefix_and_plan_rejects() {
                      byte_identical(int64_output, mixed_output) &&
                      mixed_stats.logical_weight_reference_count == entries.size() * cols &&
                      mixed_stats.weight_scalar_load_count == 2 * cols &&
+                     mixed_stats.classification_work_count == entries.size() &&
+                     mixed_stats.scratch_init_count == rows * cols &&
+                     mixed_stats.sparse_update_count == entries.size() * cols &&
+                     mixed_stats.merge_count == rows * cols &&
+                     mixed_stats.safe_update_count == entries.size() * cols &&
+                     mixed_stats.fallback_update_count == 0 &&
+                     mixed_stats.branch_entry_classification_count == 0 &&
                      mixed_stats.thread_scratch_bytes == rows * cols * sizeof(int32_t) &&
                      mixed_stats.int32_row_count == rows && mixed_stats.int64_fallback_row_count == 0,
                  "GroupKCSC mixed NR8 accepts safe same-K cancellation and multi-K prefixes") &&

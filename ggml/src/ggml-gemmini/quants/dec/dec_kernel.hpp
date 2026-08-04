@@ -31,6 +31,13 @@ struct GroupKCSCScalarStats
     size_t logical_weight_reference_count = 0;
     size_t weight_scalar_load_count = 0;
     size_t weight_vector_load_count = 0;
+    size_t classification_work_count = 0;
+    size_t scratch_init_count = 0;
+    size_t sparse_update_count = 0;
+    size_t merge_count = 0;
+    size_t safe_update_count = 0;
+    size_t fallback_update_count = 0;
+    size_t branch_entry_classification_count = 0;
     size_t thread_scratch_bytes = 0;
     size_t int32_row_count = 0;
     size_t int64_fallback_row_count = 0;
