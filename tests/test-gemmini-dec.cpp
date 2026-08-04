@@ -1132,6 +1132,80 @@ bool byte_identical(const std::vector<float> &lhs, const std::vector<float> &rhs
         std::memcmp(lhs.data(), rhs.data(), lhs.size() * sizeof(float)) == 0;
 }
 
+bool test_fixed_residual_replay_baseline() {
+    using ggml::gemmini::quants::dec::ActiveRowGroup;
+    using ggml::gemmini::quants::dec::ResidualGroupEntry;
+
+    constexpr size_t rows = 3;
+    constexpr size_t cols = 5;
+    constexpr size_t depth = 35;
+    const std::array<int8_t, cols> k0_weights = { 1, -2, 3, -4, 5 };
+    const std::array<int8_t, cols> k33_weights = { 2, 1, -3, 4, -2 };
+    const std::array<int8_t, cols> k34_weights = { -1, 3, 2, 0, -4 };
+    std::vector<int8_t> weights(depth * cols, 0);
+    for (size_t column = 0; column < cols; ++column) {
+        weights[column] = k0_weights[column];
+        weights[33 * cols + column] = k33_weights[column];
+        weights[34 * cols + column] = k34_weights[column];
+    }
+
+    const std::vector<ggml::gemmini::quants::QactOutlier> shuffled_outliers = {
+        { 2, 34, 2 }, { 0, 0, 4 }, { 1, 33, -3 }, { 0, 0, -1 },
+        { 2, 0, -2 }, { 1, 33, 5 }, { 0, 34, 1 },
+    };
+    std::vector<float> output(rows * cols, 0.0f);
+    ggml_gemmini_args_t args = dense_args(rows, cols, depth, weights, output, 0.25f);
+    const auto result = ggml::gemmini::quants::dec::compensate_activation_dec(
+        shuffled_outliers, args, "test");
+    const std::array<uint32_t, rows * cols> expected_bits = {
+        0x3f000000, 0xbf400000, 0x40300000, 0xc0400000, 0x40300000,
+        0x3f800000, 0x3f000000, 0xbfc00000, 0x40000000, 0xbf800000,
+        0xbf800000, 0x40200000, 0xbf000000, 0x40000000, 0xc0900000,
+    };
+    constexpr size_t active_row_groups = 5;
+    constexpr size_t active_k_groups = 2;
+    const size_t expected_current_sparse_plan_bytes =
+        shuffled_outliers.size() * sizeof(ResidualGroupEntry) +
+        active_row_groups * sizeof(ActiveRowGroup) +
+        (active_k_groups + 1) * sizeof(size_t) +
+        active_row_groups * sizeof(size_t) +
+        3 * sizeof(uint32_t) + active_k_groups * sizeof(uint32_t);
+
+    bool ok = check(result.total_selected == shuffled_outliers.size() && result.nnz == shuffled_outliers.size() &&
+                        result.unique_k_count == 3 && result.int_mac_count == 35 &&
+                        result.logical_weight_reference_count == 35 &&
+                        result.weight_scalar_load_count == 35 &&
+                        result.weight_vector_load_count == 0 && result.estimated_weight_bytes_read == 35 &&
+                        result.active_row_k_pairs == 5 && result.rows_per_active_k_max == 2 &&
+                        result.ycom_global_write_count == rows * cols &&
+                        result.current_sparse_plan_bytes == expected_current_sparse_plan_bytes &&
+                        result.group_k_csc_plan_bytes == 0 &&
+                        result.thread_scratch_bytes == rows * cols * sizeof(int64_t),
+                    "fixed replay sparse baseline counters");
+    for (size_t index = 0; index < output.size(); ++index)
+        ok = check(float_bits(output[index]) == expected_bits[index], "fixed replay baseline output bits") && ok;
+
+    auto reordered_outliers = shuffled_outliers;
+    std::reverse(reordered_outliers.begin(), reordered_outliers.end());
+    std::vector<float> reordered_output(rows * cols, 0.0f);
+    ggml_gemmini_args_t reordered_args = dense_args(
+        rows, cols, depth, weights, reordered_output, 0.25f);
+    const auto reordered_result = ggml::gemmini::quants::dec::compensate_activation_dec(
+        reordered_outliers, reordered_args, "test");
+    return check(byte_identical(output, reordered_output),
+                 "fixed replay shuffled residual output is byte-identical") &&
+        check(reordered_result.int_mac_count == result.int_mac_count &&
+                  reordered_result.logical_weight_reference_count == result.logical_weight_reference_count &&
+                  reordered_result.weight_scalar_load_count == result.weight_scalar_load_count &&
+                  reordered_result.active_row_k_pairs == result.active_row_k_pairs &&
+                  reordered_result.rows_per_active_k_max == result.rows_per_active_k_max &&
+                  reordered_result.ycom_global_write_count == result.ycom_global_write_count &&
+                  reordered_result.current_sparse_plan_bytes == result.current_sparse_plan_bytes &&
+                  reordered_result.group_k_csc_plan_bytes == result.group_k_csc_plan_bytes &&
+                  reordered_result.thread_scratch_bytes == result.thread_scratch_bytes,
+              "fixed replay counters are deterministic") && ok;
+}
+
 bool test_thread_determinism() {
     const char *previous = std::getenv("DEC_THREADS");
     const std::string saved = previous ? previous : "";
@@ -1195,7 +1269,7 @@ int main() {
     const bool ok = test_noop() && test_route_plan() && test_active_row_groups() && test_route_metadata_rejects() && test_repeated_residuals() && test_decode_repeated_residuals() && test_integer_routes() && test_block_integer_route() &&
         test_q8_h1_hierarchical_route() && test_q8_h1_preserves_ordered_scaling_bits() && test_q8_h1_activation_scale_routes_preserve_bits() && test_unpacked_h1_tail_routes_preserve_bits() && test_q8_h1_large_effective_scale() && test_q8_h2_hierarchical_route() && test_q8_hp1_hierarchical_route() && test_q8_hp2_hierarchical_route() &&
         test_malformed_hierarchical_reject() && test_output_strides() && test_sparse_grouped_tails() && test_malformed_reject() && test_thread_clamp() &&
-        test_thread_determinism() && test_inside_existing_openmp_region();
+        test_fixed_residual_replay_baseline() && test_thread_determinism() && test_inside_existing_openmp_region();
     std::printf("gemmini DEC baseline: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

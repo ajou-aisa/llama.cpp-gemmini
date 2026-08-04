@@ -16,11 +16,11 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #if LOG_DEBUG || DEC_VALIDATION
 #include <cmath>
-#include <limits>
 #endif
 
 namespace ggml::gemmini::quants::dec
@@ -35,6 +35,7 @@ namespace
         std::vector<size_t> group_offsets;
         std::vector<size_t> group_row_group_indices;
         std::vector<uint32_t> unique_k;
+        std::vector<size_t> active_rows_per_k;
         std::vector<uint32_t> active_groups_global;
         std::vector<float> Y_com;
 
@@ -45,6 +46,7 @@ namespace
             group_offsets.clear();
             group_row_group_indices.clear();
             unique_k.clear();
+            active_rows_per_k.clear();
             active_groups_global.clear();
             if (Y_com.size() != I * J)
                 Y_com.resize(I * J);
@@ -56,6 +58,20 @@ namespace
     {
         static thread_local ActivationDECScratch scratch;
         return scratch;
+    }
+
+    size_t saturating_add_size(size_t lhs, size_t rhs)
+    {
+        return rhs > std::numeric_limits<size_t>::max() - lhs ?
+            std::numeric_limits<size_t>::max() : lhs + rhs;
+    }
+
+    size_t saturating_mul_size(size_t lhs, size_t rhs)
+    {
+        if (lhs == 0 || rhs == 0)
+            return 0;
+        return lhs > std::numeric_limits<size_t>::max() / rhs ?
+            std::numeric_limits<size_t>::max() : lhs * rhs;
     }
 
     void log_dec_reject(const char *layer, const char *reason, const ggml_gemmini_args_t &args)
@@ -456,6 +472,75 @@ ActivationDECResult compensate_activation_dec(
         !plan.scales.channel_mode && (plan.route == DecWeightRoute::Dense ||
             plan.route == DecWeightRoute::Q8H1 || plan.route == DecWeightRoute::Q8H2 ||
             plan.route == DecWeightRoute::Q8HP1 || plan.route == DecWeightRoute::Q8HP2);
+    const bool whole_k_grouped = use_int64_scalar || use_int64_channel_direct || use_int64_channel_sidecar;
+    scr.active_rows_per_k.assign(result.unique_k_count, 0);
+    size_t active_rows = 0;
+    bool first_entry = true;
+    uint32_t previous_row = 0;
+    uint32_t previous_k = 0;
+    for (const ResidualGroupEntry &entry : scr.residual_entries)
+    {
+        const bool new_row = first_entry || entry.row != previous_row;
+        if (new_row)
+            active_rows = saturating_add_size(active_rows, 1);
+        if (new_row || entry.k != previous_k)
+        {
+            result.active_row_k_pairs = saturating_add_size(result.active_row_k_pairs, 1);
+            const auto active_k = std::lower_bound(
+                scr.unique_k.begin(), scr.unique_k.end(), entry.k);
+            const size_t active_k_index = static_cast<size_t>(active_k - scr.unique_k.begin());
+            const size_t row_count = saturating_add_size(scr.active_rows_per_k[active_k_index], 1);
+            scr.active_rows_per_k[active_k_index] = row_count;
+            result.rows_per_active_k_max = std::max(result.rows_per_active_k_max, row_count);
+        }
+        first_entry = false;
+        previous_row = entry.row;
+        previous_k = entry.k;
+    }
+
+    result.int_mac_count = saturating_mul_size(result.nnz, J);
+    result.logical_weight_reference_count = result.int_mac_count;
+    result.weight_scalar_load_count = result.int_mac_count;
+    result.estimated_weight_bytes_read = saturating_mul_size(
+        result.weight_scalar_load_count, sizeof(int8_t));
+
+    const bool scaled_route = !plan.scales.scalar_mode && !plan.scales.row_header_mode && !plan.scales.channel_mode;
+    const size_t scale_group_size = use_int64_h1 ? kDecGroupSizeK : plan.scales.block_size;
+    size_t active_row_scale_groups = 0;
+    if (scaled_route)
+        for (const ActiveRowGroup &group : scr.active_row_groups)
+        {
+            size_t previous_scale_group = std::numeric_limits<size_t>::max();
+            for (size_t position = group.entry_begin; position < group.entry_end; ++position)
+            {
+                const size_t scale_group = scr.residual_entries[position].k / scale_group_size;
+                if (scale_group != previous_scale_group)
+                {
+                    active_row_scale_groups = saturating_add_size(active_row_scale_groups, 1);
+                    previous_scale_group = scale_group;
+                }
+            }
+        }
+
+    const size_t y_com_update_groups = scaled_route ? active_row_scale_groups : active_rows;
+    result.ycom_global_write_count = saturating_mul_size(y_com_update_groups, J);
+    size_t plan_bytes = 0;
+    plan_bytes = saturating_add_size(plan_bytes, saturating_mul_size(
+        scr.residual_entries.size(), sizeof(ResidualGroupEntry)));
+    plan_bytes = saturating_add_size(plan_bytes, saturating_mul_size(
+        scr.active_row_groups.size(), sizeof(ActiveRowGroup)));
+    plan_bytes = saturating_add_size(plan_bytes, saturating_mul_size(
+        scr.group_offsets.size(), sizeof(size_t)));
+    plan_bytes = saturating_add_size(plan_bytes, saturating_mul_size(
+        scr.group_row_group_indices.size(), sizeof(size_t)));
+    plan_bytes = saturating_add_size(plan_bytes, saturating_mul_size(
+        scr.unique_k.size(), sizeof(uint32_t)));
+    result.current_sparse_plan_bytes = saturating_add_size(plan_bytes, saturating_mul_size(
+        scr.active_groups_global.size(), sizeof(uint32_t)));
+    const size_t thread_accumulator_rows = whole_k_grouped ? I : 1;
+    result.thread_scratch_bytes = saturating_mul_size(
+        saturating_mul_size(thread_accumulator_rows, std::min(J, kDecInt64JTileWidth)),
+        sizeof(int64_t));
 #if LOG_DEBUG
     const size_t j_tiles = dec_int64_j_tile_count(J);
     const int dec_threads = resolve_dec_threads(j_tiles);
@@ -467,38 +552,11 @@ ActivationDECResult compensate_activation_dec(
         (use_int64_channel_direct || use_int64_channel_sidecar ? "channel" :
             (use_int64_h1 ? "h1" :
                 (plan.route == DecWeightRoute::Q8H2 ? "h2" :
-                    (plan.route == DecWeightRoute::Q8HP1 ? "hp1" :
-                        (plan.route == DecWeightRoute::Q8HP2 ? "hp2" : "block")))));
-    size_t active_rows = 0;
-    uint32_t previous_row = std::numeric_limits<uint32_t>::max();
-    for (const ActiveRowGroup &group : scr.active_row_groups)
-    {
-        if (group.row != previous_row)
-        {
-            ++active_rows;
-            previous_row = group.row;
-        }
-    }
-    const bool scaled_route = !plan.scales.scalar_mode && !plan.scales.row_header_mode && !plan.scales.channel_mode;
-    const size_t scale_group_size = use_int64_h1 ? kDecGroupSizeK : plan.scales.block_size;
-    size_t active_row_scale_groups = 0;
-    if (scaled_route)
-        for (const ActiveRowGroup &group : scr.active_row_groups)
-        {
-            size_t previous_scale_group = std::numeric_limits<size_t>::max();
-            for (size_t p = group.entry_begin; p < group.entry_end; ++p)
-            {
-                const size_t scale_group = scr.residual_entries[p].k / scale_group_size;
-                if (scale_group != previous_scale_group)
-                {
-                    ++active_row_scale_groups;
-                    previous_scale_group = scale_group;
-                }
-            }
-        }
+                (plan.route == DecWeightRoute::Q8HP1 ? "hp1" :
+                    (plan.route == DecWeightRoute::Q8HP2 ? "hp2" : "block")))));
     ggml::gemmini::log::debug(
         layer,
-        "[dec.route] algorithm=grouped group_size_k=%zu activation=%s weight=%s accessor=%s reducer=%s j_partition=contiguous-range microtile=%zu threads=%d residual_format=common weight_layout=%s scale_mode=%s I=%zu J=%zu K=%zu",
+        "[dec.route] algorithm=grouped sparse_kernel=row-direct traversal=row-major j_inner_nr=1 row_panel=full weight_vector=direct accumulator=int64 output_panel=off group_size_k=%zu activation=%s weight=%s accessor=%s reducer=%s j_partition=contiguous-range microtile=%zu threads=%d residual_format=common weight_layout=%s scale_mode=%s I=%zu J=%zu K=%zu",
         kDecGroupSizeK,
         requested_activation_name(),
         dec_route_name(plan),
@@ -511,28 +569,44 @@ ActivationDECResult compensate_activation_dec(
         I,
         J,
         K);
-    const size_t int_mac_count = result.nnz * J;
-    const size_t route_accumulate_count =
-        (scaled_route ? active_row_scale_groups : scr.active_row_groups.size()) * J;
-    const size_t scale_apply_count = (scaled_route ? active_row_scale_groups : active_rows) * J;
+    const size_t route_accumulate_count = saturating_mul_size(
+        scaled_route ? active_row_scale_groups : scr.active_row_groups.size(), J);
+    const size_t scale_apply_count = saturating_mul_size(
+        scaled_route ? active_row_scale_groups : active_rows, J);
     const size_t scale_eval_count = scaled_route && scale_group_size == kDecGroupSizeK ?
-        scr.active_groups_global.size() * J : scale_apply_count;
+        saturating_mul_size(scr.active_groups_global.size(), J) : scale_apply_count;
     size_t row_groups_per_group_max = 0;
     for (size_t group = 0; group < group_count; ++group)
         row_groups_per_group_max = std::max(
             row_groups_per_group_max, scr.group_offsets[group + 1] - scr.group_offsets[group]);
     const double row_groups_per_group_mean = scr.active_groups_global.empty() ? 0.0 :
         static_cast<double>(scr.active_row_groups.size()) / scr.active_groups_global.size();
+    const double rows_per_active_k_mean = result.unique_k_count == 0 ? 0.0 :
+        static_cast<double>(result.active_row_k_pairs) / result.unique_k_count;
+    const double weight_reuse_ratio = result.weight_scalar_load_count == 0 ? 0.0 :
+        static_cast<double>(result.logical_weight_reference_count) / result.weight_scalar_load_count;
     ggml::gemmini::log::debug(
         layer,
-        "[dec.work] nnz=%zu active_rows=%zu active_groups_global=%zu active_row_groups=%zu row_groups_per_group_mean=%.6g row_groups_per_group_max=%zu int_mac_count=%zu route_accumulate_count=%zu scale_apply_count=%zu scale_eval_count=%zu active_k=%zu j_tiles=%zu threads=%d",
+        "[dec.work] nnz=%zu active_rows=%zu active_groups_global=%zu active_row_groups=%zu row_groups_per_group_mean=%.6g row_groups_per_group_max=%zu int_mac_count=%zu logical_weight_reference_count=%zu weight_scalar_load_count=%zu weight_vector_load_count=%zu estimated_weight_bytes_read=%zu weight_reuse_ratio=%.6g active_row_k_pairs=%zu rows_per_active_k_mean=%.6g rows_per_active_k_max=%zu ycom_global_write_count=%zu current_sparse_plan_bytes=%zu group_k_csc_plan_bytes=%zu thread_scratch_bytes=%zu route_accumulate_count=%zu scale_apply_count=%zu scale_eval_count=%zu active_k=%zu j_tiles=%zu threads=%d",
         result.nnz,
         active_rows,
         scr.active_groups_global.size(),
         scr.active_row_groups.size(),
         row_groups_per_group_mean,
         row_groups_per_group_max,
-        int_mac_count,
+        result.int_mac_count,
+        result.logical_weight_reference_count,
+        result.weight_scalar_load_count,
+        result.weight_vector_load_count,
+        result.estimated_weight_bytes_read,
+        weight_reuse_ratio,
+        result.active_row_k_pairs,
+        rows_per_active_k_mean,
+        result.rows_per_active_k_max,
+        result.ycom_global_write_count,
+        result.current_sparse_plan_bytes,
+        result.group_k_csc_plan_bytes,
+        result.thread_scratch_bytes,
         route_accumulate_count,
         scale_apply_count,
         scale_eval_count,
