@@ -623,6 +623,9 @@ bool test_route_capability_table() {
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
     std::vector<float> output(6, 0.0f);
     auto args = make_args(activation, weights, output);
+    if (!check(args.act_quant.kind() == quants::act::MetaKind::none, "empty activation kind")) {
+        return false;
+    }
     const auto key = detail::normalize_route(args);
     const auto caps = detail::route_capabilities(args);
     if (!check(key.activation == detail::ActivationRoute::fp32, "route activation normalization") ||
@@ -674,7 +677,8 @@ bool test_route_capability_table() {
         return false;
     }
     args.act_quant.storage().emplace<quants::act::stripe::Meta>();
-    if (!check(detail::normalize_route(args).activation == detail::ActivationRoute::stripe,
+    if (!check(args.act_quant.kind() == quants::act::MetaKind::stripe, "stripe activation kind") ||
+        !check(detail::normalize_route(args).activation == detail::ActivationRoute::stripe,
                "STRIPE activation normalization")) {
         return false;
     }

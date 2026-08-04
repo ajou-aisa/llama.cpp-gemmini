@@ -267,13 +267,14 @@ RouteKey normalize_route(const ggml_gemmini_args_t & args) {
         case OS: key.backend = BackendRoute::gemmini_os; break;
         default: key.backend = BackendRoute::ws_sim; break;
     }
-    const auto & storage = args.act_quant.storage();
-    if (std::holds_alternative<quants::act::exsia::Meta>(storage)) key.activation = ActivationRoute::exsia;
-    else if (std::holds_alternative<quants::act::tensor::Meta>(storage)) key.activation = ActivationRoute::tensor;
-    else if (std::holds_alternative<quants::act::token::Meta>(storage)) key.activation = ActivationRoute::token;
-    else if (std::holds_alternative<quants::act::block::Meta>(storage)) key.activation = ActivationRoute::block;
-    else if (std::holds_alternative<quants::act::stripe::Meta>(storage)) key.activation = ActivationRoute::stripe;
-    else if (std::holds_alternative<quants::act::NoneMeta>(storage)) key.activation = ActivationRoute::fp32;
+    switch (args.act_quant.kind()) {
+        case quants::act::MetaKind::exsia: key.activation = ActivationRoute::exsia; break;
+        case quants::act::MetaKind::tensor: key.activation = ActivationRoute::tensor; break;
+        case quants::act::MetaKind::token: key.activation = ActivationRoute::token; break;
+        case quants::act::MetaKind::block: key.activation = ActivationRoute::block; break;
+        case quants::act::MetaKind::stripe: key.activation = ActivationRoute::stripe; break;
+        case quants::act::MetaKind::none: key.activation = ActivationRoute::fp32; break;
+    }
 
     if (args.A_fp32 != nullptr || args.B_fp32 != nullptr) {
         key.activation = ActivationRoute::fp32;
