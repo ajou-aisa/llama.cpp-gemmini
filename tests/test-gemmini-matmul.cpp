@@ -191,6 +191,58 @@ bool test_j131_tail_stripe_parity() {
         check(same_output(stripe_output, full_output), "J=131 tail stripe differs from full");
 }
 
+bool test_fp32_shape_and_stride_matrix() {
+    using namespace ggml::gemmini;
+    constexpr size_t row_values[] = { 1, 63, 64, 65, 256 };
+    constexpr size_t column_values[] = { 1, 4, 8, 131 };
+    constexpr size_t depth_values[] = { 31, 32, 33, 63, 64, 65 };
+
+    for (const size_t rows : row_values) {
+        for (const size_t columns : column_values) {
+            for (const size_t depth : depth_values) {
+                const size_t output_stride = columns + 3;
+                std::vector<float> activation(rows * depth);
+                std::vector<float> weights(depth * columns);
+                std::vector<float> full_output(rows * output_stride, -7.0f);
+                std::vector<float> stripe_output(rows * output_stride, -7.0f);
+                for (size_t i = 0; i < activation.size(); ++i) {
+                    activation[i] = static_cast<float>(static_cast<int>(i % 11) - 5);
+                }
+                for (size_t i = 0; i < weights.size(); ++i) {
+                    weights[i] = static_cast<float>(static_cast<int>(i % 7) - 3) * 0.25f;
+                }
+
+                ggml_gemmini_args_t full_args{};
+                full_args.I = rows;
+                full_args.J = columns;
+                full_args.K = depth;
+                full_args.A_fp32 = activation.data();
+                full_args.B_fp32 = weights.data();
+                full_args.sA = depth;
+                full_args.sB = depth;
+                full_args.f_out = full_output.data();
+                full_args.stride_f_out = output_stride;
+                full_args.tiled_matmul_type = CPU;
+
+                auto stripe_args = full_args;
+                stripe_args.f_out = stripe_output.data();
+                const auto full_status = matmul(full_args);
+                MatmulOptions options{};
+                options.mode = MatmulInvocationMode::stripe_sequential;
+                options.stripe_rows = 63;
+                const auto stripe_status = matmul(stripe_args, options);
+                if (!check(full_status.ok() && stripe_status.ok(), "FP32 shape matrix status") ||
+                    !check(same_output(full_output, stripe_output), "FP32 shape matrix parity")) {
+                    std::fprintf(stderr, "shape matrix failed I=%zu J=%zu K=%zu\n",
+                                 rows, columns, depth);
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 bool test_live_pipeline_multistripe_matches_full() {
     using namespace ggml::gemmini;
     constexpr size_t rows = 130;
@@ -1140,6 +1192,7 @@ int main(int argc, char ** argv) {
             test_fp32_full_facade_matches_legacy() &&
             test_baseline_activation_route_facade_parity() &&
             test_j131_tail_stripe_parity() &&
+            test_fp32_shape_and_stride_matrix() &&
             test_live_pipeline_multistripe_matches_full() &&
             test_native_and_channel_full_facade_parity() &&
             test_full_and_stripe_sequential_outputs_match() &&
