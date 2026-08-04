@@ -3,6 +3,7 @@
 
 #include <gemmini.h>
 
+#include <array>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -102,6 +103,122 @@ bool test_fp32_full_facade_matches_legacy() {
         check(same_output(facade_output, legacy_output), "FP32 facade output differs from legacy matmul") &&
         check(stripe_result.ok(), "FP32 stripe facade status") &&
         check(same_output(stripe_output, legacy_output), "FP32 stripe facade output differs from legacy matmul");
+}
+
+bool test_native_and_channel_full_facade_parity() {
+    constexpr size_t rows = 1;
+    constexpr size_t columns = 2;
+    constexpr size_t depth = QK8_0;
+    std::vector<elem_t> activation(depth, 3);
+
+    std::array<block_q8_h1, columns> h1_blocks{};
+    std::vector<float> h1_legacy(rows * columns, 0.0f);
+    std::vector<float> h1_facade(rows * columns, 0.0f);
+    auto h1_args = ggml_gemmini_args_t{};
+    h1_args.I = rows;
+    h1_args.J = columns;
+    h1_args.K = depth;
+    h1_args.A = activation.data();
+    h1_args.sA = depth;
+    h1_args.f_out = h1_legacy.data();
+    h1_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1;
+    h1_args.q8_h1_blocks = h1_blocks.data();
+    h1_args.q8_h1_block_count = h1_blocks.size();
+    h1_args.q8_h1_rows = columns;
+    h1_args.blocks_per_row = 1;
+    h1_args.blocks_K = 1;
+    h1_args.blocks_J = columns;
+    h1_args.block_size_k = QK8_0;
+    h1_args.tiled_matmul_type = CPU;
+    auto h1_facade_args = h1_args;
+    h1_facade_args.f_out = h1_facade.data();
+    ggml::gemmini::tiled_matmul_auto_im2p(&h1_args);
+    const auto h1_result = ggml::gemmini::MatMul(h1_facade_args).run_full();
+
+    std::array<block_q8_hp1, columns> hp1_blocks{};
+    std::vector<float> hp1_legacy(rows * columns, 0.0f);
+    std::vector<float> hp1_facade(rows * columns, 0.0f);
+    auto hp1_args = ggml_gemmini_args_t{};
+    hp1_args.I = rows;
+    hp1_args.J = columns;
+    hp1_args.K = depth;
+    hp1_args.A = activation.data();
+    hp1_args.sA = depth;
+    hp1_args.f_out = hp1_legacy.data();
+    hp1_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1;
+    hp1_args.q8_hp1_blocks = hp1_blocks.data();
+    hp1_args.q8_hp1_block_count = hp1_blocks.size();
+    hp1_args.q8_hp1_blocks_per_row = 1;
+    hp1_args.tiled_matmul_type = CPU;
+    auto hp1_facade_args = hp1_args;
+    hp1_facade_args.f_out = hp1_facade.data();
+    ggml::gemmini::tiled_matmul_auto_im2p(&hp1_args);
+    const auto hp1_result = ggml::gemmini::MatMul(hp1_facade_args).run_full();
+
+    constexpr size_t channel_depth = 4;
+    const std::vector<elem_t> channel_codes = { 1, -2, 3, -4, 2, 1, -1, 2 };
+    const std::array<float, columns> channel_scales = { 0.5f, 0.25f };
+    std::vector<uint8_t> direct_rows(columns * (sizeof(float) + channel_depth));
+    for (size_t column = 0; column < columns; ++column) {
+        uint8_t * row = direct_rows.data() + column * (sizeof(float) + channel_depth);
+        std::memcpy(row, &channel_scales[column], sizeof(float));
+        std::memcpy(row + sizeof(float), channel_codes.data() + column * channel_depth, channel_depth);
+    }
+    std::vector<float> direct_legacy(rows * columns, 0.0f);
+    std::vector<float> direct_facade(rows * columns, 0.0f);
+    auto direct_args = ggml_gemmini_args_t{};
+    direct_args.I = rows;
+    direct_args.J = columns;
+    direct_args.K = channel_depth;
+    direct_args.A = activation.data();
+    direct_args.sA = channel_depth;
+    direct_args.B = reinterpret_cast<elem_t *>(direct_rows.data() + sizeof(float));
+    direct_args.sB = sizeof(float) + channel_depth;
+    direct_args.f_out = direct_legacy.data();
+    direct_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_channel;
+    direct_args.q8_channel_row_base = direct_rows.data();
+    direct_args.q8_channel_row_stride = sizeof(float) + channel_depth;
+    direct_args.q8_channel_row_count = columns;
+    direct_args.act_quant.storage().emplace<ggml::gemmini::quants::act::tensor::Meta>();
+    direct_args.tiled_matmul_type = CPU;
+    auto direct_facade_args = direct_args;
+    direct_facade_args.f_out = direct_facade.data();
+    ggml::gemmini::tiled_matmul_auto_baseline(
+        &direct_args, ggml::gemmini::baseline_activation_quant_t::TENSOR,
+        ggml::gemmini::baseline_weight_quant_t::CHANNEL);
+    const auto direct_result = ggml::gemmini::MatMul(direct_facade_args).run_full();
+
+    std::vector<float> sidecar_legacy(rows * columns, 0.0f);
+    std::vector<float> sidecar_facade(rows * columns, 0.0f);
+    auto sidecar_args = direct_args;
+    sidecar_args.B = const_cast<elem_t *>(channel_codes.data());
+    sidecar_args.sB = channel_depth;
+    sidecar_args.f_out = sidecar_legacy.data();
+    sidecar_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar;
+    sidecar_args.q8_channel_row_base = nullptr;
+    sidecar_args.q8_channel_row_stride = 0;
+    sidecar_args.q8_channel_row_count = 0;
+    sidecar_args.weight_channel_scales = channel_scales.data();
+    sidecar_args.weight_channel_scale_count = columns;
+    auto sidecar_facade_args = sidecar_args;
+    sidecar_facade_args.f_out = sidecar_facade.data();
+    ggml::gemmini::tiled_matmul_auto_baseline(
+        &sidecar_args, ggml::gemmini::baseline_activation_quant_t::TENSOR,
+        ggml::gemmini::baseline_weight_quant_t::CHANNEL);
+    const auto sidecar_result = ggml::gemmini::MatMul(sidecar_facade_args).run_full();
+
+    return check(h1_result.status == ggml::gemmini::MatMulStatus::success &&
+                     same_output(h1_facade, h1_legacy),
+                 "Q8_H1 facade parity") &&
+        check(hp1_result.status == ggml::gemmini::MatMulStatus::success &&
+                     same_output(hp1_facade, hp1_legacy),
+              "Q8_HP1 facade parity") &&
+        check(direct_result.status == ggml::gemmini::MatMulStatus::success &&
+                     same_output(direct_facade, direct_legacy),
+              "Q8_CHANNEL direct facade parity") &&
+        check(sidecar_result.status == ggml::gemmini::MatMulStatus::success &&
+                     same_output(sidecar_facade, sidecar_legacy),
+              "Q8_CHANNEL sidecar facade parity");
 }
 
 bool test_full_and_stripe_sequential_outputs_match() {
@@ -532,6 +649,7 @@ int main(int argc, char ** argv) {
     }
     return edge && test_full_facade_status_and_output_match_legacy() &&
             test_fp32_full_facade_matches_legacy() &&
+            test_native_and_channel_full_facade_parity() &&
             test_full_and_stripe_sequential_outputs_match() &&
             test_empty_tail_and_malformed_stripe_status() &&
             test_duplicate_and_overlap_stripe_status() &&
