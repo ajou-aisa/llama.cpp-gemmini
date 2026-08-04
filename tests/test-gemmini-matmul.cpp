@@ -155,6 +155,48 @@ bool test_native_and_channel_full_facade_parity() {
     ggml::gemmini::tiled_matmul_auto_im2p(&hp1_args);
     const auto hp1_result = ggml::gemmini::MatMul(hp1_facade_args).run_full();
 
+    std::array<block_q8_h2, columns> h2_blocks{};
+    for (size_t column = 0; column < columns; ++column) {
+        h2_blocks[column].m = static_cast<uint8_t>(17 + column);
+        h2_blocks[column].channel_scale = 0.25f;
+    }
+    std::vector<float> h2_legacy(rows * columns, 0.0f);
+    std::vector<float> h2_facade(rows * columns, 0.0f);
+    auto h2_args = h1_args;
+    h2_args.f_out = h2_legacy.data();
+    h2_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h2;
+    h2_args.q8_h1_blocks = nullptr;
+    h2_args.q8_h1_block_count = 0;
+    h2_args.q8_h1_rows = 0;
+    h2_args.q8_h2_blocks = h2_blocks.data();
+    h2_args.q8_h2_block_count = h2_blocks.size();
+    h2_args.q8_h2_blocks_per_row = 1;
+    auto h2_facade_args = h2_args;
+    h2_facade_args.f_out = h2_facade.data();
+    ggml::gemmini::tiled_matmul_auto_im2p(&h2_args);
+    const auto h2_result = ggml::gemmini::MatMul(h2_facade_args).run_full();
+
+    std::array<block_q8_hp2, columns> hp2_blocks{};
+    for (size_t column = 0; column < columns; ++column) {
+        hp2_blocks[column].m = static_cast<int16_t>(column + 1);
+        hp2_blocks[column].channel_scale = 0.5f;
+    }
+    std::vector<float> hp2_legacy(rows * columns, 0.0f);
+    std::vector<float> hp2_facade(rows * columns, 0.0f);
+    auto hp2_args = h1_args;
+    hp2_args.f_out = hp2_legacy.data();
+    hp2_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_hp2;
+    hp2_args.q8_h1_blocks = nullptr;
+    hp2_args.q8_h1_block_count = 0;
+    hp2_args.q8_h1_rows = 0;
+    hp2_args.q8_hp2_blocks = hp2_blocks.data();
+    hp2_args.q8_hp2_block_count = hp2_blocks.size();
+    hp2_args.q8_hp2_blocks_per_row = 1;
+    auto hp2_facade_args = hp2_args;
+    hp2_facade_args.f_out = hp2_facade.data();
+    ggml::gemmini::tiled_matmul_auto_im2p(&hp2_args);
+    const auto hp2_result = ggml::gemmini::MatMul(hp2_facade_args).run_full();
+
     constexpr size_t channel_depth = 4;
     const std::vector<elem_t> channel_codes = { 1, -2, 3, -4, 2, 1, -1, 2 };
     const std::array<float, columns> channel_scales = { 0.5f, 0.25f };
@@ -213,6 +255,16 @@ bool test_native_and_channel_full_facade_parity() {
         check(hp1_result.status == ggml::gemmini::MatMulStatus::success &&
                      same_output(hp1_facade, hp1_legacy),
               "Q8_HP1 facade parity") &&
+        check(h2_result.status == ggml::gemmini::MatMulStatus::success &&
+                     same_output(h2_facade, h2_legacy) &&
+                     ggml::gemmini::MatMul::stripe_capability(h2_facade_args) ==
+                         ggml::gemmini::MatMulCapability::unsupported,
+              "Q8_H2 full-only facade parity") &&
+        check(hp2_result.status == ggml::gemmini::MatMulStatus::success &&
+                     same_output(hp2_facade, hp2_legacy) &&
+                     ggml::gemmini::MatMul::stripe_capability(hp2_facade_args) ==
+                         ggml::gemmini::MatMulCapability::unsupported,
+              "Q8_HP2 full-only facade parity") &&
         check(direct_result.status == ggml::gemmini::MatMulStatus::success &&
                      same_output(direct_facade, direct_legacy),
               "Q8_CHANNEL direct facade parity") &&
