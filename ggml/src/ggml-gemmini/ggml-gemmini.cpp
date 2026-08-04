@@ -8,6 +8,7 @@
 #include <new>
 #include <cstdlib>
 #include <string_view>
+#include <future>
 
 #include <limits>
 
@@ -966,7 +967,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     // quantize activation
     start = ggml::gemmini::cycle::read();
 
-    [[maybe_unused]] static thread_local std::vector<int8_t> activation_q;
+    [[maybe_unused]] std::vector<int8_t> activation_q;
     activation_q.resize(ik_count);
     int8_t *qx = activation_q.data();
 
@@ -983,14 +984,22 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 #if defined(GGML_GEMMINI_TEST_OBSERVER) && GGML_GEMMINI_COMPUTE_TYPE == 0
     ggml::gemmini::observe_test_i("activation", args.I);
 #endif
-    const bool quantize_ok = ggml::gemmini::quants::quantize_activation(src1, args);
+    std::future<bool> quantize_future;
+    bool quantize_ok = false;
+    if (pipeline_enabled) {
+        quantize_future = std::async(std::launch::async, [&] {
+            return ggml::gemmini::quants::quantize_activation(src1, args);
+        });
+    } else {
+        quantize_ok = ggml::gemmini::quants::quantize_activation(src1, args);
+    }
 #if GGML_GEMMINI_COMPUTE_TYPE == 0
     static_assert(sizeof(elem_t) == 1, "Q8_0 path assumes elem_t is int8 (1 byte).");
 #endif
 
     end = ggml::gemmini::cycle::read();
     ggml::gemmini::log::cycle(layer, "cpu.Quantize activation", start, end);
-    if (!quantize_ok) {
+    if (!pipeline_enabled && !quantize_ok) {
         if (pipeline_collector && !pipeline_collector->status()) {
             ggml::gemmini::log::debug(layer, "[matmul.pipeline] capture status=%d message=%s",
                 static_cast<int>(pipeline_collector->status().code), pipeline_collector->status().message);
@@ -1390,9 +1399,18 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         pipeline_options.mode = ggml::gemmini::MatmulInvocationMode::stripe_pipeline;
         pipeline_options.job_capacity = args.I;
         pipeline_execution = std::make_unique<ggml::gemmini::MatmulExecution>(
-            ggml::gemmini::prepare_execution(args, pipeline_options));
+            ggml::gemmini::prepare_execution(&args, pipeline_options));
         if (!pipeline_execution->status() || !pipeline_collector->start(*pipeline_execution)) {
             ggml::gemmini::log::debug(layer, "[matmul.pipeline] staged worker start failed");
+            return;
+        }
+    }
+
+    if (pipeline_enabled) {
+        quantize_ok = quantize_future.get();
+        if (!quantize_ok) {
+            pipeline_collector->finish();
+            ggml::gemmini::log::debug(layer, "activation quantize failed");
             return;
         }
     }

@@ -54,6 +54,11 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob &);
 class MatMul {
 public:
     explicit MatMul(ggml_gemmini_args_t args);
+    explicit MatMul(ggml_gemmini_args_t * args);
+    MatMul(MatMul && other) noexcept;
+    MatMul & operator=(MatMul && other) noexcept;
+    MatMul(const MatMul &) = delete;
+    MatMul & operator=(const MatMul &) = delete;
 
     MatMulResult run_dense();
     MatMulResult run_full();
@@ -65,13 +70,18 @@ public:
     MatMulState state() const;
 
 private:
+    friend class MatmulExecution;
     friend MatmulStatus prepare_compensation(MatmulStripeJob &);
     friend MatmulStatus execute_compensation_shard(MatmulStripeJob &);
     friend MatmulStatus execute_dense_stripe(MatmulStripeJob &);
 
     MatMulStatus run_stripe(MatMulStripe stripe, size_t stripe_id);
 
-    ggml_gemmini_args_t args_;
+    ggml_gemmini_args_t & args();
+    const ggml_gemmini_args_t & args() const;
+
+    ggml_gemmini_args_t owned_args_{};
+    ggml_gemmini_args_t * args_ptr_ = nullptr;
     size_t first_row_ = 0;
     size_t last_row_begin_ = 0;
     size_t last_row_end_ = 0;
@@ -207,6 +217,7 @@ public:
 
 private:
     friend MatmulExecution prepare_execution(const ggml_gemmini_args_t &, MatmulOptions);
+    friend MatmulExecution prepare_execution(ggml_gemmini_args_t *, MatmulOptions);
     friend MatmulStatus execute_full(MatmulExecution &);
     friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput);
     friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput, std::vector<quants::QactOutlier>);
@@ -218,6 +229,7 @@ private:
     friend MatmulStatus finish_execution(MatmulExecution &);
 
     MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options);
+    MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions options);
 
     size_t total_rows_;
     MatMul facade_;
@@ -274,6 +286,7 @@ private:
 };
 
 MatmulExecution prepare_execution(const ggml_gemmini_args_t & args, MatmulOptions options = {});
+MatmulExecution prepare_execution(ggml_gemmini_args_t * args, MatmulOptions options = {});
 MatmulStatus execute_full(MatmulExecution & execution);
 MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput input);
 MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput input,

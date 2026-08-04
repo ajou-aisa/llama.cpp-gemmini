@@ -155,17 +155,43 @@ void record_metric(MatmulStageMetrics & metric, bool enabled, Clock::time_point 
 
 }
 
-MatMul::MatMul(ggml_gemmini_args_t args) : args_(std::move(args)) {}
+MatMul::MatMul(ggml_gemmini_args_t args) : owned_args_(std::move(args)), args_ptr_(&owned_args_) {}
+
+MatMul::MatMul(ggml_gemmini_args_t * args) : args_ptr_(args) {}
+
+MatMul::MatMul(MatMul && other) noexcept
+    : owned_args_(std::move(other.owned_args_)),
+      args_ptr_(other.args_ptr_ == &other.owned_args_ ? &owned_args_ : other.args_ptr_),
+      first_row_(other.first_row_), last_row_begin_(other.last_row_begin_),
+      last_row_end_(other.last_row_end_), covered_rows_(other.covered_rows_),
+      has_stripes_(other.has_stripes_), state_(other.state_) {}
+
+MatMul & MatMul::operator=(MatMul && other) noexcept {
+    if (this != &other) {
+        owned_args_ = std::move(other.owned_args_);
+        args_ptr_ = other.args_ptr_ == &other.owned_args_ ? &owned_args_ : other.args_ptr_;
+        first_row_ = other.first_row_;
+        last_row_begin_ = other.last_row_begin_;
+        last_row_end_ = other.last_row_end_;
+        covered_rows_ = other.covered_rows_;
+        has_stripes_ = other.has_stripes_;
+        state_ = other.state_;
+    }
+    return *this;
+}
+
+ggml_gemmini_args_t & MatMul::args() { return *args_ptr_; }
+const ggml_gemmini_args_t & MatMul::args() const { return *args_ptr_; }
 
 MatMulResult MatMul::run_dense() {
     if (state_ != MatMulState::idle) {
         return { MatMulStatus::invalid_state, MatMulCapability::supported };
     }
-    if (args_.I == 0 || args_.J == 0 || args_.K == 0 || args_.A == nullptr || args_.f_out == nullptr) {
+    if (args().I == 0 || args().J == 0 || args().K == 0 || args().A == nullptr || args().f_out == nullptr) {
         return { MatMulStatus::invalid_arguments, MatMulCapability::unsupported };
     }
 
-    execute_dense(args_);
+    execute_dense(args());
     return { MatMulStatus::success, MatMulCapability::supported };
 }
 
@@ -175,7 +201,7 @@ MatMulResult MatMul::run_full() {
         return dense;
     }
     quants::dec::compensate_activation_dec(
-        quants::activation_outliers(args_), args_, "ggml-gemmini-matmul");
+        quants::activation_outliers(args()), args(), "ggml-gemmini-matmul");
     state_ = MatMulState::completed;
     return { MatMulStatus::success, MatMulCapability::supported };
 }
@@ -184,7 +210,7 @@ MatMulStatus MatMul::begin_stripes() {
     if (state_ != MatMulState::idle) {
         return MatMulStatus::invalid_state;
     }
-    if (stripe_capability(args_) == MatMulCapability::unsupported) {
+    if (stripe_capability(args()) == MatMulCapability::unsupported) {
         return MatMulStatus::unsupported;
     }
     first_row_ = 0;
@@ -204,7 +230,7 @@ MatMulStatus MatMul::run_stripe(MatMulStripe stripe, size_t stripe_id) {
     if (state_ != MatMulState::accepting_stripes) {
         return MatMulStatus::invalid_state;
     }
-    if (stripe.row_begin >= stripe.row_end || stripe.row_end > args_.I) {
+    if (stripe.row_begin >= stripe.row_end || stripe.row_end > args().I) {
         return MatMulStatus::malformed_stripe;
     }
 
@@ -217,7 +243,7 @@ MatMulStatus MatMul::run_stripe(MatMulStripe stripe, size_t stripe_id) {
         }
     }
 
-    const MatMulStatus status = execute_stripe(args_, stripe, stripe_id);
+    const MatMulStatus status = execute_stripe(args(), stripe, stripe_id);
     if (status == MatMulStatus::success) {
         if (!has_stripes_) {
             first_row_ = stripe.row_begin;
@@ -238,7 +264,7 @@ MatMulStatus MatMul::finish_stripes() {
         state_ = MatMulState::idle;
         return MatMulStatus::empty_stripes;
     }
-    if (first_row_ != 0 || last_row_end_ != args_.I || covered_rows_ != args_.I) {
+    if (first_row_ != 0 || last_row_end_ != args().I || covered_rows_ != args().I) {
         state_ = MatMulState::idle;
         return MatMulStatus::missing_stripes;
     }
@@ -293,6 +319,24 @@ size_t MatmulStripeInput::residual_count() const {
 
 MatmulExecution::MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options)
     : total_rows_(args.I), facade_(std::move(args)), options_(options) {
+    if (options_.mode != MatmulInvocationMode::full && options_.job_capacity == 0) {
+        status_ = make_status(MatmulStatusCode::invalid_argument, "job capacity must be nonzero");
+        return;
+    }
+    if (options_.mode == MatmulInvocationMode::stripe_sequential ||
+        options_.mode == MatmulInvocationMode::stripe_pipeline) {
+        const MatMulStatus status = facade_.begin_stripes();
+        status_ = to_public_status(
+            status, status == MatMulStatus::unsupported ? MatMulCapability::unsupported : MatMulCapability::supported);
+    }
+}
+
+MatmulExecution::MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions options)
+    : total_rows_(args != nullptr ? args->I : 0), facade_(args), options_(options) {
+    if (args == nullptr) {
+        status_ = make_status(MatmulStatusCode::invalid_argument, "null execution args");
+        return;
+    }
     if (options_.mode != MatmulInvocationMode::full && options_.job_capacity == 0) {
         status_ = make_status(MatmulStatusCode::invalid_argument, "job capacity must be nonzero");
         return;
@@ -494,6 +538,10 @@ MatmulExecution prepare_execution(const ggml_gemmini_args_t & args, MatmulOption
     return MatmulExecution(args, options);
 }
 
+MatmulExecution prepare_execution(ggml_gemmini_args_t * args, MatmulOptions options) {
+    return MatmulExecution(args, options);
+}
+
 MatmulStatus execute_full(MatmulExecution & execution) {
     if (execution.options_.mode != MatmulInvocationMode::full) {
         execution.status_ = make_status(
@@ -555,7 +603,7 @@ MatmulStatus prepare_compensation(MatmulStripeJob & job) {
         return job.status_;
     }
     const auto start = Clock::now();
-    const auto & args = job.execution_->facade_.args_;
+    const auto & args = job.execution_->facade_.args();
     const auto & storage = args.act_quant.storage();
     if (!job.has_captured_outliers_ &&
         !std::holds_alternative<quants::act::NoneMeta>(storage) &&
@@ -599,7 +647,7 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job) {
     const auto start = Clock::now();
     auto status = quants::dec::ActivationDECRowSliceStatus::success;
     if (job.has_captured_outliers_) {
-        auto local_args = job.execution_->facade_.args_;
+        auto local_args = job.execution_->facade_.args();
         const size_t row_begin = job.input_.row_begin();
         const size_t input_stride = local_args.sA ? local_args.sA : local_args.K;
         const size_t output_stride = local_args.stride_f_out ? local_args.stride_f_out : local_args.J;
@@ -622,7 +670,7 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job) {
         quants::dec::compensate_activation_dec(local_outliers, local_args, "ggml-gemmini-matmul");
     } else {
         status = quants::dec::compensate_activation_dec_rows(
-            job.compensation_outliers_, job.execution_->facade_.args_,
+            job.compensation_outliers_, job.execution_->facade_.args(),
             job.input_.row_begin(), job.input_.row_end(), "ggml-gemmini-matmul");
     }
     if (status == quants::dec::ActivationDECRowSliceStatus::unsupported) {
