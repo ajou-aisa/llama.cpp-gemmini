@@ -1,5 +1,8 @@
 #include "ggml-gemmini-matmul.hpp"
 
+#include "quants/act/quantize.hpp"
+#include "quants/dec/dec.hpp"
+
 #include <gemmini.h>
 
 #include <algorithm>
@@ -28,6 +31,15 @@ bool uses_baseline_channel_route(const ggml_gemmini_args_t & args) {
         args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar;
 }
 
+void execute_dense(ggml_gemmini_args_t &args) {
+    if (uses_baseline_channel_route(args)) {
+        tiled_matmul_auto_baseline(
+            &args, baseline_activation_quant_t::TENSOR, baseline_weight_quant_t::CHANNEL);
+    } else {
+        tiled_matmul_auto_im2p(&args);
+    }
+}
+
 MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe) {
     const size_t input_stride = args.sA ? args.sA : args.K;
     const size_t output_stride = args.stride_f_out ? args.stride_f_out : args.J;
@@ -42,12 +54,7 @@ MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe) {
     args.A += input_offset;
     args.f_out += output_offset;
 
-    if (uses_baseline_channel_route(args)) {
-        tiled_matmul_auto_baseline(
-            &args, baseline_activation_quant_t::TENSOR, baseline_weight_quant_t::CHANNEL);
-    } else {
-        tiled_matmul_auto_im2p(&args);
-    }
+    execute_dense(args);
     return MatMulStatus::success;
 }
 
@@ -86,7 +93,9 @@ MatMulResult MatMul::run_full() {
         return { MatMulStatus::invalid_arguments, MatMulCapability::unsupported };
     }
 
-    tiled_matmul_auto_im2p(&args_);
+    execute_dense(args_);
+    quants::dec::compensate_activation_dec(
+        quants::activation_outliers(args_), args_, "ggml-gemmini-matmul");
     state_ = MatMulState::completed;
     return { MatMulStatus::success, MatMulCapability::supported };
 }
@@ -217,7 +226,21 @@ MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput in
 }
 
 MatmulStatus prepare_compensation(MatmulStripeJob & job) {
-    job.status_ = unsupported();
+    if (job.execution_ == nullptr || job.state_ != MatmulStripeJob::State::captured || !job.status_) {
+        job.status_ = invalid_state();
+        return job.status_;
+    }
+    const auto & args = job.execution_->facade_.args_;
+    const auto & storage = args.act_quant.storage();
+    if (!std::holds_alternative<quants::act::NoneMeta>(storage) &&
+        !std::holds_alternative<quants::act::tensor::Meta>(storage)) {
+        job.status_ = unsupported();
+        job.execution_->status_ = job.status_;
+        return job.status_;
+    }
+    job.compensation_outliers_ = quants::activation_outliers(args);
+    job.compensation_prepared_ = true;
+    job.status_ = {};
     return job.status_;
 }
 
@@ -238,7 +261,22 @@ MatmulStatus execute_dense_stripe(MatmulStripeJob & job) {
 }
 
 MatmulStatus execute_compensation_shard(MatmulStripeJob & job) {
-    job.status_ = unsupported();
+    if (job.execution_ == nullptr || job.state_ != MatmulStripeJob::State::dense_complete ||
+        !job.compensation_prepared_ || !job.status_) {
+        job.status_ = invalid_state();
+        return job.status_;
+    }
+    const auto status = quants::dec::compensate_activation_dec_rows(
+        job.compensation_outliers_, job.execution_->facade_.args_,
+        job.input_.row_begin(), job.input_.row_end(), "ggml-gemmini-matmul");
+    if (status == quants::dec::ActivationDECRowSliceStatus::unsupported) {
+        job.status_ = unsupported();
+    } else if (status == quants::dec::ActivationDECRowSliceStatus::invalid_arguments) {
+        job.status_ = { MatmulStatusCode::invalid_arguments, MatMulCapability::unsupported };
+    } else {
+        job.status_ = {};
+    }
+    job.execution_->status_ = job.status_;
     return job.status_;
 }
 
@@ -277,7 +315,15 @@ MatmulStatus matmul(const ggml_gemmini_args_t & args, MatmulOptions options) {
         const size_t remaining = args.I - row_begin;
         const size_t row_end = row_begin + std::min(options.stripe_rows, remaining);
         MatmulStripeJob job = capture_stripe(execution, MatmulStripeInput(row_begin, row_end));
-        MatmulStatus status = execute_dense_stripe(job);
+        MatmulStatus status = prepare_compensation(job);
+        if (!status) {
+            return status;
+        }
+        status = execute_dense_stripe(job);
+        if (!status) {
+            return status;
+        }
+        status = execute_compensation_shard(job);
         if (!status) {
             return status;
         }

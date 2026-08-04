@@ -877,4 +877,47 @@ ActivationDECResult compensate_activation_dec(
 #endif
     return result;
 }
+
+ActivationDECRowSliceStatus compensate_activation_dec_rows(
+    const std::vector<QactOutlier> &outliers,
+    ggml_gemmini_args_t &args,
+    size_t row_begin,
+    size_t row_end,
+    const char *layer)
+{
+    const auto &storage = args.act_quant.storage();
+    if (!std::holds_alternative<act::NoneMeta>(storage) &&
+        !std::holds_alternative<act::tensor::Meta>(storage)) {
+        return ActivationDECRowSliceStatus::unsupported;
+    }
+    if (row_begin >= row_end || row_end > args.I || args.A == nullptr || args.f_out == nullptr) {
+        return ActivationDECRowSliceStatus::invalid_arguments;
+    }
+
+    const size_t input_stride = args.sA ? args.sA : args.K;
+    const size_t output_stride = args.stride_f_out ? args.stride_f_out : args.J;
+    if ((input_stride != 0 && row_begin > std::numeric_limits<size_t>::max() / input_stride) ||
+        (output_stride != 0 && row_begin > std::numeric_limits<size_t>::max() / output_stride)) {
+        return ActivationDECRowSliceStatus::invalid_arguments;
+    }
+
+    std::vector<QactOutlier> local_outliers;
+    for (const QactOutlier &outlier : outliers) {
+        if (outlier.row >= 0 && static_cast<size_t>(outlier.row) >= row_begin &&
+            static_cast<size_t>(outlier.row) < row_end) {
+            local_outliers.push_back({
+                static_cast<int>(static_cast<size_t>(outlier.row) - row_begin),
+                outlier.col,
+                outlier.residual,
+            });
+        }
+    }
+
+    ggml_gemmini_args_t local_args = args;
+    local_args.I = row_end - row_begin;
+    local_args.A += row_begin * input_stride;
+    local_args.f_out += row_begin * output_stride;
+    compensate_activation_dec(local_outliers, local_args, layer);
+    return ActivationDECRowSliceStatus::success;
+}
 } // namespace ggml::gemmini::quants::dec

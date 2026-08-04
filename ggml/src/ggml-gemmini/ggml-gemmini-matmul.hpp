@@ -39,6 +39,11 @@ struct MatMulResult {
     MatMulCapability capability;
 };
 
+class MatmulStripeJob;
+struct MatmulStatus;
+MatmulStatus prepare_compensation(MatmulStripeJob &);
+MatmulStatus execute_compensation_shard(MatmulStripeJob &);
+
 class MatMul {
 public:
     explicit MatMul(ggml_gemmini_args_t args);
@@ -52,6 +57,9 @@ public:
     MatMulState state() const;
 
 private:
+    friend MatmulStatus prepare_compensation(MatmulStripeJob &);
+    friend MatmulStatus execute_compensation_shard(MatmulStripeJob &);
+
     ggml_gemmini_args_t args_;
     std::vector<MatMulStripe> stripes_;
     MatMulState state_ = MatMulState::idle;
@@ -103,8 +111,6 @@ private:
     size_t row_end_;
 };
 
-class MatmulStripeJob;
-
 class MatmulExecution {
 public:
     MatmulExecution(const MatmulExecution &) = delete;
@@ -119,7 +125,9 @@ private:
     friend MatmulExecution prepare_execution(const ggml_gemmini_args_t &, MatmulOptions);
     friend MatmulStatus execute_full(MatmulExecution &);
     friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput);
+    friend MatmulStatus prepare_compensation(MatmulStripeJob &);
     friend MatmulStatus execute_dense_stripe(MatmulStripeJob &);
+    friend MatmulStatus execute_compensation_shard(MatmulStripeJob &);
     friend class MatmulStripeJob;
     friend MatmulStatus finish_execution(MatmulExecution &);
 
@@ -157,6 +165,8 @@ private:
     MatmulExecution * execution_;
     MatmulStripeInput input_;
     MatmulStatus status_;
+    std::vector<quants::QactOutlier> compensation_outliers_;
+    bool compensation_prepared_ = false;
     State state_ = State::captured;
 };
 

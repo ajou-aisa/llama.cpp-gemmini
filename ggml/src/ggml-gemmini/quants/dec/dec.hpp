@@ -27,8 +27,21 @@ struct ActivationDECResult
     size_t thread_scratch_bytes = 0;
 };
 
+enum class ActivationDECRowSliceStatus {
+    success,
+    unsupported,
+    invalid_arguments,
+};
+
 ActivationDECResult compensate_activation_dec(
     const std::vector<QactOutlier> &outliers,
     ggml_gemmini_args_t &args,
+    const char *layer);
+
+ActivationDECRowSliceStatus compensate_activation_dec_rows(
+    const std::vector<QactOutlier> &outliers,
+    ggml_gemmini_args_t &args,
+    size_t row_begin,
+    size_t row_end,
     const char *layer);
 } // namespace ggml::gemmini::quants::dec
