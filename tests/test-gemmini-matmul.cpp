@@ -105,6 +105,45 @@ bool test_fp32_full_facade_matches_legacy() {
         check(same_output(stripe_output, legacy_output), "FP32 stripe facade output differs from legacy matmul");
 }
 
+bool test_baseline_activation_route_facade_parity() {
+    using namespace ggml::gemmini;
+    using Route = baseline_activation_quant_t;
+
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    const auto run = [&](auto meta, Route route, const char * label,
+                         MatMulCapability expected_stripe) {
+        std::vector<float> legacy_output(6, 0.0f);
+        std::vector<float> facade_output(6, 0.0f);
+        auto legacy_args = make_args(activation, weights, legacy_output);
+        legacy_args.act_quant.storage() = std::move(meta);
+        if (route != Route::TENSOR) {
+            legacy_args.transpose_B = true;
+            legacy_args.sB = legacy_args.K;
+        }
+        auto facade_args = legacy_args;
+        facade_args.f_out = facade_output.data();
+
+        tiled_matmul_auto_baseline(&legacy_args, route, baseline_weight_quant_t::TENSOR);
+        const auto result = MatMul(facade_args).run_full();
+        return check(result.status == MatMulStatus::success, label) &&
+            check(same_output(facade_output, legacy_output), "baseline route facade output differs") &&
+            check(MatMul::stripe_capability(facade_args) == expected_stripe,
+                  "baseline route stripe capability");
+    };
+
+    quants::act::tensor::Meta tensor_meta;
+    tensor_meta.scale = 1.0f;
+    quants::act::token::Meta token_meta;
+    token_meta.scales = { 1.0f, 1.0f, 1.0f };
+    quants::act::block::Meta block_meta;
+    block_meta.scales = { 1.0f, 1.0f, 1.0f };
+
+    return run(std::move(tensor_meta), Route::TENSOR, "TENSOR baseline facade", MatMulCapability::supported) &&
+        run(std::move(token_meta), Route::TOKEN, "TOKEN baseline facade", MatMulCapability::unsupported) &&
+        run(std::move(block_meta), Route::BLOCK, "BLOCK baseline facade", MatMulCapability::unsupported);
+}
+
 bool test_native_and_channel_full_facade_parity() {
     constexpr size_t rows = 2;
     constexpr size_t columns = 2;
@@ -724,6 +763,7 @@ int main(int argc, char ** argv) {
     }
     return edge && test_full_facade_status_and_output_match_legacy() &&
             test_fp32_full_facade_matches_legacy() &&
+            test_baseline_activation_route_facade_parity() &&
             test_native_and_channel_full_facade_parity() &&
             test_full_and_stripe_sequential_outputs_match() &&
             test_empty_tail_and_malformed_stripe_status() &&
