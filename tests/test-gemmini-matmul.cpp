@@ -194,6 +194,18 @@ bool test_route_capability_table() {
                  "Q8_H2 full-only deprecated capability");
 }
 
+bool test_malformed_route_contract_rejected() {
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> output(6, 0.0f);
+    auto args = make_args(activation, weights, output);
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1;
+    ggml::gemmini::MatMul facade(args);
+    const auto result = facade.run_full();
+    return check(result.status == ggml::gemmini::MatMulStatus::invalid_contract,
+                 "malformed native weight contract rejected");
+}
+
 bool test_bounded_pipeline_slots_and_reuse() {
     using namespace ggml::gemmini;
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
@@ -335,6 +347,7 @@ bool test_compensation_shard_output_is_bitwise_stable() {
 int main(int argc, char ** argv) {
     const bool edge_only = argc == 2 && std::string_view(argv[1]) == "--edge";
     const bool edge = test_public_contract_shape() && test_route_capability_table() &&
+        test_malformed_route_contract_rejected() &&
         test_bounded_pipeline_slots_and_reuse() &&
         test_live_pipeline_worker() && test_compensation_shard_output_is_bitwise_stable() &&
         test_staged_contract_errors();

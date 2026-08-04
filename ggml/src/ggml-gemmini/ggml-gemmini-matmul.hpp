@@ -51,6 +51,7 @@ enum class MatMulStatus {
     overlapping_stripe,
     missing_stripes,
     unsupported,
+    invalid_contract,
     invalid_state,
     invalid_arguments,
 };

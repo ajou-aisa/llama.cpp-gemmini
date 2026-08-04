@@ -115,6 +115,10 @@ MatmulStatus to_public_status(MatMulStatus status, MatMulCapability capability) 
             code = MatmulStatusCode::unsupported_route;
             message = "unsupported route";
             break;
+        case MatMulStatus::invalid_contract:
+            code = MatmulStatusCode::invalid_contract;
+            message = "invalid route contract";
+            break;
         case MatMulStatus::invalid_state:
             break;
         case MatMulStatus::invalid_arguments:
@@ -235,6 +239,40 @@ MatMulResult MatMul::run_dense() {
     }
     if (!detail::route_capabilities(args()).full) {
         return { MatMulStatus::unsupported, MatMulCapability::unsupported };
+    }
+    switch (args().weight_format) {
+        case ggml_gemmini_args_t::im2p_weight_format_t::q8_channel:
+            if (!args().has_q8_channel_direct_read_contract()) {
+                return { MatMulStatus::invalid_contract, MatMulCapability::unsupported };
+            }
+            break;
+        case ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar:
+            if (!args().has_q8_channel_dense_sidecar_contract()) {
+                return { MatMulStatus::invalid_contract, MatMulCapability::unsupported };
+            }
+            break;
+        case ggml_gemmini_args_t::im2p_weight_format_t::q8_h1:
+            if (!args().has_q8_h1_im2p_contract()) {
+                return { MatMulStatus::invalid_contract, MatMulCapability::unsupported };
+            }
+            break;
+        case ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1:
+            if (!args().has_q8_hp1_im2p_contract()) {
+                return { MatMulStatus::invalid_contract, MatMulCapability::unsupported };
+            }
+            break;
+        case ggml_gemmini_args_t::im2p_weight_format_t::q8_h2:
+            if (!args().has_q8_h2_im2p_contract()) {
+                return { MatMulStatus::invalid_contract, MatMulCapability::unsupported };
+            }
+            break;
+        case ggml_gemmini_args_t::im2p_weight_format_t::q8_hp2:
+            if (!args().has_q8_hp2_im2p_contract()) {
+                return { MatMulStatus::invalid_contract, MatMulCapability::unsupported };
+            }
+            break;
+        default:
+            break;
     }
 
     execute_dense(args());
