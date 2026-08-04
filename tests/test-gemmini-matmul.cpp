@@ -144,6 +144,45 @@ bool test_baseline_activation_route_facade_parity() {
         run(std::move(block_meta), Route::BLOCK, "BLOCK baseline facade", MatMulCapability::unsupported);
 }
 
+bool test_live_pipeline_multistripe_matches_full() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> full_output(6, 0.0f);
+    std::vector<float> pipeline_output(6, 0.0f);
+
+    auto full_args = make_args(activation, weights, full_output);
+    auto & full_meta = full_args.act_quant.storage().emplace<quants::act::exsia::Meta>();
+    full_meta.theta = { 0 };
+    const auto full_result = MatMul(full_args).run_full();
+
+    auto pipeline_args = make_args(activation, weights, pipeline_output);
+    auto & pipeline_meta = pipeline_args.act_quant.storage().emplace<quants::act::exsia::Meta>();
+    pipeline_meta.theta = { 0, 0 };
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_pipeline;
+    options.job_capacity = 2;
+    options.rc_shards = 2;
+    options.profiling = true;
+    auto execution = prepare_execution(&pipeline_args, options);
+    MatmulStripeCollector collector(2);
+    if (!check(full_result.status == MatMulStatus::success, "multistripe full reference") ||
+        !check(execution.status().ok() && collector.start(execution), "multistripe pipeline start")) {
+        return false;
+    }
+
+    const auto * sink = collector.sink();
+    const bool captured = sink->on_ready(sink->user_data, { 0, 0, 1 }) &&
+        sink->on_ready(sink->user_data, { 1, 1, 3 });
+    const auto collector_status = collector.finish();
+    const auto execution_status = finish_execution(execution);
+    return check(captured, "multistripe ready events") &&
+        check(collector_status.ok(), "multistripe collector finish") &&
+        check(execution_status.ok(), "multistripe execution finish") &&
+        check(same_output(pipeline_output, full_output), "multistripe pipeline differs from full") &&
+        check(collector.profiles().size() == 2, "multistripe profile count");
+}
+
 bool test_native_and_channel_full_facade_parity() {
     constexpr size_t rows = 2;
     constexpr size_t columns = 2;
@@ -764,6 +803,7 @@ int main(int argc, char ** argv) {
     return edge && test_full_facade_status_and_output_match_legacy() &&
             test_fp32_full_facade_matches_legacy() &&
             test_baseline_activation_route_facade_parity() &&
+            test_live_pipeline_multistripe_matches_full() &&
             test_native_and_channel_full_facade_parity() &&
             test_full_and_stripe_sequential_outputs_match() &&
             test_empty_tail_and_malformed_stripe_status() &&
