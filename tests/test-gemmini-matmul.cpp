@@ -170,6 +170,30 @@ bool test_public_contract_shape() {
               "job metric storage");
 }
 
+bool test_route_capability_table() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> output(6, 0.0f);
+    auto args = make_args(activation, weights, output);
+    const auto key = detail::normalize_route(args);
+    const auto caps = detail::route_capabilities(args);
+    if (!check(key.activation == detail::ActivationRoute::fp32, "route activation normalization") ||
+        !check(key.weight == detail::WeightRoute::tensor_i8, "route weight normalization") ||
+        !check(caps.full && caps.sliced_dense && caps.sliced_compensation && caps.external_rc_shards,
+               "route capability support")) {
+        return false;
+    }
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h0;
+    if (!check(!detail::route_capabilities(args).full, "Q8_H0 explicit capability reject")) {
+        return false;
+    }
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h2;
+    const auto deprecated = detail::route_capabilities(args);
+    return check(deprecated.full && !deprecated.sliced_dense && deprecated.deprecated,
+                 "Q8_H2 full-only deprecated capability");
+}
+
 bool test_bounded_pipeline_slots_and_reuse() {
     using namespace ggml::gemmini;
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
@@ -272,7 +296,8 @@ bool test_live_pipeline_worker() {
 
 int main(int argc, char ** argv) {
     const bool edge_only = argc == 2 && std::string_view(argv[1]) == "--edge";
-    const bool edge = test_public_contract_shape() && test_bounded_pipeline_slots_and_reuse() &&
+    const bool edge = test_public_contract_shape() && test_route_capability_table() &&
+        test_bounded_pipeline_slots_and_reuse() &&
         test_live_pipeline_worker() && test_staged_contract_errors();
     if (edge_only) {
         return edge ? 0 : 1;
