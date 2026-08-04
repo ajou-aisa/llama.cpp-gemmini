@@ -188,6 +188,20 @@ bool test_live_pipeline_multistripe_matches_full() {
         sink->on_ready(sink->user_data, { 1, 1, 3 });
     const auto collector_status = collector.finish();
     const auto execution_status = finish_execution(execution);
+    for (const auto & profile : collector.profiles()) {
+        std::printf(
+            "[matmul.stripe.synthetic] stripe_id=%zu row_begin=%zu row_end=%zu "
+            "la3_cycles=%llu sf_cycles=%llu handoff_ns=%llu "
+            "ws_start_ns=%llu ws_end_ns=%llu rc_start_ns=%llu rc_end_ns=%llu rc_shards=%zu\n",
+            profile.stripe_id, profile.row_begin, profile.row_end,
+            static_cast<unsigned long long>(profile.la3_cycles),
+            static_cast<unsigned long long>(profile.sf_cycles),
+            static_cast<unsigned long long>(profile.handoff.nanoseconds),
+            static_cast<unsigned long long>(profile.ws_start_ns),
+            static_cast<unsigned long long>(profile.ws_end_ns),
+            static_cast<unsigned long long>(profile.rc_start_ns),
+            static_cast<unsigned long long>(profile.rc_end_ns), profile.rc_shards);
+    }
     return check(captured, "multistripe ready events") &&
         check(collector_status.ok(), "multistripe collector finish") &&
         check(execution_status.ok(), "multistripe execution finish") &&
