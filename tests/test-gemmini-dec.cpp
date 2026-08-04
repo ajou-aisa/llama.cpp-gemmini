@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -1206,6 +1207,111 @@ void set_dec_group_k_csc_force(const char *value) {
 #endif
 }
 
+void set_dec_group_k_csc_disable(const char *value) {
+#if defined(_WIN32)
+    _putenv_s("DEC_GROUP_K_CSC_DISABLE", value ? value : "");
+#else
+    if (value)
+        setenv("DEC_GROUP_K_CSC_DISABLE", value, 1);
+    else
+        unsetenv("DEC_GROUP_K_CSC_DISABLE");
+#endif
+}
+
+struct ScopedDecGroupKCscEnv {
+    std::string saved_force;
+    std::string saved_disable;
+    bool had_force = false;
+    bool had_disable = false;
+
+    ScopedDecGroupKCscEnv() {
+        if (const char *force = std::getenv("DEC_GROUP_K_CSC_FORCE")) {
+            saved_force = force;
+            had_force = true;
+        }
+        if (const char *disable = std::getenv("DEC_GROUP_K_CSC_DISABLE")) {
+            saved_disable = disable;
+            had_disable = true;
+        }
+    }
+
+    ~ScopedDecGroupKCscEnv() {
+        set_dec_group_k_csc_force(had_force ? saved_force.c_str() : nullptr);
+        set_dec_group_k_csc_disable(had_disable ? saved_disable.c_str() : nullptr);
+    }
+};
+
+struct ReplayTimingSummary {
+    double median_us = 0.0;
+    double p10_us = 0.0;
+    double p90_us = 0.0;
+};
+
+struct ReplayTimingStats {
+    ReplayTimingSummary compute;
+    ReplayTimingSummary total;
+};
+
+bool byte_identical(const std::vector<float> &lhs, const std::vector<float> &rhs);
+
+template <typename Runner>
+ReplayTimingStats benchmark_replay_kernel(
+    std::vector<float> &output,
+    const std::vector<float> &expected,
+    Runner &&runner,
+    size_t warmup_count,
+    size_t measured_count,
+    bool &ok) {
+    using clock = std::chrono::steady_clock;
+    std::vector<double> compute_samples_us;
+    std::vector<double> total_samples_us;
+    compute_samples_us.reserve(measured_count);
+    total_samples_us.reserve(measured_count);
+
+    auto sample_once = [&](bool record) {
+        const auto total_start = clock::now();
+        std::fill(output.begin(), output.end(), 0.0f);
+        const auto compute_start = clock::now();
+        const bool accumulated = runner();
+        const auto compute_end = clock::now();
+        ok = check(accumulated, "replay kernel accumulates") && ok;
+        ok = check(byte_identical(output, expected), "replay kernel preserves expected output") && ok;
+        const auto total_end = clock::now();
+        if (!record)
+            return;
+        const double compute_us = std::chrono::duration<double, std::micro>(
+            compute_end - compute_start).count();
+        const double total_us = std::chrono::duration<double, std::micro>(
+            total_end - total_start).count();
+        compute_samples_us.push_back(compute_us);
+        total_samples_us.push_back(total_us);
+    };
+
+    for (size_t iteration = 0; iteration < warmup_count; ++iteration)
+        sample_once(false);
+    for (size_t iteration = 0; iteration < measured_count; ++iteration)
+        sample_once(true);
+
+    auto summarize = [](std::vector<double> samples) {
+        std::sort(samples.begin(), samples.end());
+        const size_t last = samples.size() - 1;
+        const auto pick = [&](double quantile) {
+            const size_t index = static_cast<size_t>(quantile * static_cast<double>(last));
+            return samples[index];
+        };
+        return ReplayTimingSummary {
+            samples[last / 2],
+            pick(0.10),
+            pick(0.90),
+        };
+    };
+
+    return ReplayTimingStats {
+        summarize(compute_samples_us),
+        summarize(total_samples_us),
+    };
+}
+
 bool test_thread_clamp() {
     const char *previous = std::getenv("DEC_THREADS");
     const std::string saved = previous ? previous : "";
@@ -1251,10 +1357,9 @@ bool byte_identical(const std::vector<float> &lhs, const std::vector<float> &rhs
 }
 
 bool test_group_k_csc_production_dispatch() {
-    const char *previous_force = std::getenv("DEC_GROUP_K_CSC_FORCE");
-    const std::string saved_force = previous_force ? previous_force : "";
-    const bool had_previous_force = previous_force != nullptr;
+    ScopedDecGroupKCscEnv env_guard;
     set_dec_group_k_csc_force(nullptr);
+    set_dec_group_k_csc_disable(nullptr);
 
     bool ok = true;
     for (const size_t cols : { size_t {4}, size_t {8} }) {
@@ -1268,6 +1373,12 @@ bool test_group_k_csc_production_dispatch() {
         const std::vector<ggml::gemmini::quants::QactOutlier> outliers = {
             { 0, 1, 1 }, { 1, 1, 2 }, { 2, 1, 3 }, { 3, 1, 4 },
         };
+        set_dec_group_k_csc_disable("1");
+        const auto baseline_result = ggml::gemmini::quants::dec::compensate_activation_dec(
+            outliers, args, "test");
+        std::vector<float> baseline_output = output;
+        std::fill(output.begin(), output.end(), 0.0f);
+        set_dec_group_k_csc_disable(nullptr);
         const auto result = ggml::gemmini::quants::dec::compensate_activation_dec(
             outliers, args, "test");
         std::vector<float> expected(rows * cols);
@@ -1275,19 +1386,27 @@ bool test_group_k_csc_production_dispatch() {
             for (size_t j = 0; j < cols; ++j)
                 expected[row * cols + j] =
                     -0.25f * static_cast<float>((row + 1) * (j + 1));
+        const bool baseline_output_equal = byte_identical(baseline_output, expected);
         const bool output_equal = byte_identical(output, expected);
         const double reuse = result.weight_scalar_load_count == 0 ? 0.0 :
             static_cast<double>(result.logical_weight_reference_count) /
                 result.weight_scalar_load_count;
         std::printf(
-            "dispatch dense route=%s plan_bytes=%zu nr=%zu vector_loads=%zu reuse=%.1f output_equal=%s\n",
+            "dispatch dense baseline_disable=%s baseline_plan_bytes=%zu baseline_vector_loads=%zu baseline_output_equal=%s route=%s plan_bytes=%zu nr=%zu vector_loads=%zu reuse=%.1f output_equal=%s\n",
+            baseline_result.group_k_csc_plan_bytes == 0 ? "row-direct" : "group-k-csc",
+            baseline_result.group_k_csc_plan_bytes,
+            baseline_result.weight_vector_load_count,
+            baseline_output_equal ? "yes" : "no",
             result.group_k_csc_plan_bytes == 0 ? "row-direct" : "group-k-csc",
             result.group_k_csc_plan_bytes,
             cols < 8 ? size_t {4} : size_t {8},
             result.weight_vector_load_count,
             reuse,
             output_equal ? "yes" : "no");
-        ok = check(result.group_k_csc_plan_bytes > 0 &&
+        ok = check(baseline_result.group_k_csc_plan_bytes == 0 &&
+                       baseline_result.weight_vector_load_count == 0 &&
+                       baseline_output_equal &&
+                       result.group_k_csc_plan_bytes > 0 &&
                        result.logical_weight_reference_count == rows * cols &&
                        result.weight_scalar_load_count == cols &&
                        result.weight_vector_load_count == 1 && reuse == 4.0 && output_equal,
@@ -1295,7 +1414,6 @@ bool test_group_k_csc_production_dispatch() {
                               "dense high-reuse dispatch selects GroupKCSC NR8") && ok;
     }
 
-    set_dec_group_k_csc_force(had_previous_force ? saved_force.c_str() : nullptr);
     return ok;
 }
 
@@ -1325,10 +1443,9 @@ bool test_fixed_residual_replay_baseline() {
     };
     std::vector<float> output(rows * cols, 0.0f);
     ggml_gemmini_args_t args = dense_args(rows, cols, depth, weights, output, 0.25f);
-    const char *previous_force = std::getenv("DEC_GROUP_K_CSC_FORCE");
-    const std::string saved_force = previous_force ? previous_force : "";
-    const bool had_previous_force = previous_force != nullptr;
+    ScopedDecGroupKCscEnv env_guard;
     set_dec_group_k_csc_force(nullptr);
+    set_dec_group_k_csc_disable(nullptr);
     const auto result = ggml::gemmini::quants::dec::compensate_activation_dec(
         shuffled_outliers, args, "test");
     const std::array<uint32_t, rows * cols> expected_bits = {
@@ -1352,15 +1469,25 @@ bool test_fixed_residual_replay_baseline() {
     set_dec_group_k_csc_force("1");
     const auto forced_result = ggml::gemmini::quants::dec::compensate_activation_dec(
         shuffled_outliers, args, "test");
-    set_dec_group_k_csc_force(had_previous_force ? saved_force.c_str() : nullptr);
+    std::vector<float> forced_output = output;
+    std::fill(output.begin(), output.end(), 0.0f);
+    set_dec_group_k_csc_force(nullptr);
+    set_dec_group_k_csc_disable("1");
+    const auto disabled_result = ggml::gemmini::quants::dec::compensate_activation_dec(
+        shuffled_outliers, args, "test");
+    std::vector<float> disabled_output = output;
+    set_dec_group_k_csc_disable(nullptr);
     std::printf(
-        "dispatch low-reuse route=%s plan_bytes=%zu vector_loads=%zu forced_route=%s forced_plan_bytes=%zu forced_vector_loads=%zu\n",
+        "dispatch low-reuse route=%s plan_bytes=%zu vector_loads=%zu forced_route=%s forced_plan_bytes=%zu forced_vector_loads=%zu disabled_route=%s disabled_plan_bytes=%zu disabled_vector_loads=%zu\n",
         result.group_k_csc_plan_bytes == 0 ? "row-direct" : "group-k-csc",
         result.group_k_csc_plan_bytes,
         result.weight_vector_load_count,
         forced_result.group_k_csc_plan_bytes == 0 ? "row-direct" : "group-k-csc",
         forced_result.group_k_csc_plan_bytes,
-        forced_result.weight_vector_load_count);
+        forced_result.weight_vector_load_count,
+        disabled_result.group_k_csc_plan_bytes == 0 ? "row-direct" : "group-k-csc",
+        disabled_result.group_k_csc_plan_bytes,
+        disabled_result.weight_vector_load_count);
 
     std::vector<ResidualGroupEntry> entries = {
         { 2, 34, 2 }, { 0, 0, 4 }, { 1, 33, -3 }, { 0, 0, -1 },
@@ -1423,6 +1550,8 @@ bool test_fixed_residual_replay_baseline() {
                         result.group_k_csc_plan_bytes == 0 &&
                         forced_result.group_k_csc_plan_bytes == expected_group_k_csc_plan_bytes &&
                         forced_result.weight_vector_load_count == 6 &&
+                        disabled_result.group_k_csc_plan_bytes == 0 &&
+                        disabled_result.weight_vector_load_count == 0 &&
                         result.thread_scratch_bytes == rows * cols * sizeof(int64_t),
                     "fixed replay defaults to row-direct and force builds GroupKCSC");
     for (size_t index = 0; index < output.size(); ++index)
@@ -1430,6 +1559,8 @@ bool test_fixed_residual_replay_baseline() {
     ok = check(group_k_csc_ready && group_k_csc_accumulated && group_k_csc_nr4_accumulated &&
                    group_k_csc_nr8_accumulated && group_k_csc_mixed_accumulated &&
                    group_k_csc_mixed_nr4_accumulated &&
+                   byte_identical(output, disabled_output) &&
+                   byte_identical(output, forced_output) &&
                    byte_identical(output, current_row_grouped) &&
                    byte_identical(current_row_grouped, group_k_csc_scalar) &&
                    byte_identical(group_k_csc_scalar, group_k_csc_nr4) &&
@@ -1464,6 +1595,68 @@ bool test_fixed_residual_replay_baseline() {
                    group_k_csc_mixed_nr4_stats.int64_fallback_row_count == 0 &&
                    group_k_csc_mixed_nr4_stats.width_path == GroupKCSCWidthPath::AllInt32,
                "fixed replay GroupKCSC NR4/8 reuse all-safe counters") && ok;
+
+    constexpr size_t warmup_count = 5;
+    constexpr size_t measured_count = 25;
+    std::vector<float> measured_row_direct(rows * cols, 0.0f);
+    const ReplayTimingStats row_direct_timing = benchmark_replay_kernel(
+        measured_row_direct,
+        current_row_grouped,
+        [&]() {
+            ggml::gemmini::quants::dec::accumulate_to_ycom_int64_scalar(
+                args, scalar_route_plan, rows, cols, nullptr, entries, groups, group_offsets,
+                group_row_group_indices, measured_row_direct.data());
+            return true;
+        },
+        warmup_count,
+        measured_count,
+        ok);
+    std::vector<float> measured_nr4(rows * cols, 0.0f);
+    const ReplayTimingStats nr4_timing = benchmark_replay_kernel(
+        measured_nr4,
+        current_row_grouped,
+        [&]() {
+            return ggml::gemmini::quants::dec::accumulate_to_ycom_int32_mixed_group_k_csc_nr4(
+                args, scalar_route_plan, rows, cols, nullptr, entries, group_k_csc_plan,
+                measured_nr4.data(), group_k_csc_mixed_nr4_stats);
+        },
+        warmup_count,
+        measured_count,
+        ok);
+    std::vector<float> measured_nr8(rows * cols, 0.0f);
+    const ReplayTimingStats nr8_timing = benchmark_replay_kernel(
+        measured_nr8,
+        current_row_grouped,
+        [&]() {
+            return ggml::gemmini::quants::dec::accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
+                args, scalar_route_plan, rows, cols, nullptr, entries, group_k_csc_plan,
+                measured_nr8.data(), group_k_csc_mixed_stats);
+        },
+        warmup_count,
+        measured_count,
+        ok);
+    const double best_group_k_csc_compute = std::min(
+        nr4_timing.compute.median_us, nr8_timing.compute.median_us);
+    const char *keep_decision = best_group_k_csc_compute <= row_direct_timing.compute.median_us ?
+        "keep" : "revert";
+    std::printf(
+        "replay benchmark warmup=%zu measured=%zu row_direct compute_us median=%.3f p10=%.3f p90=%.3f total_us median=%.3f p10=%.3f p90=%.3f\n",
+        warmup_count, measured_count,
+        row_direct_timing.compute.median_us, row_direct_timing.compute.p10_us, row_direct_timing.compute.p90_us,
+        row_direct_timing.total.median_us, row_direct_timing.total.p10_us, row_direct_timing.total.p90_us);
+    std::printf(
+        "replay benchmark warmup=%zu measured=%zu group_k_csc_nr4 compute_us median=%.3f p10=%.3f p90=%.3f total_us median=%.3f p10=%.3f p90=%.3f\n",
+        warmup_count, measured_count,
+        nr4_timing.compute.median_us, nr4_timing.compute.p10_us, nr4_timing.compute.p90_us,
+        nr4_timing.total.median_us, nr4_timing.total.p10_us, nr4_timing.total.p90_us);
+    std::printf(
+        "replay benchmark warmup=%zu measured=%zu group_k_csc_nr8 compute_us median=%.3f p10=%.3f p90=%.3f total_us median=%.3f p10=%.3f p90=%.3f\n",
+        warmup_count, measured_count,
+        nr8_timing.compute.median_us, nr8_timing.compute.p10_us, nr8_timing.compute.p90_us,
+        nr8_timing.total.median_us, nr8_timing.total.p10_us, nr8_timing.total.p90_us);
+    std::printf(
+        "replay benchmark decision=%s baseline=row-direct compare=group-k-csc-min-compute\n",
+        keep_decision);
 
     auto reordered_outliers = shuffled_outliers;
     std::reverse(reordered_outliers.begin(), reordered_outliers.end());
