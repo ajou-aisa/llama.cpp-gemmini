@@ -713,6 +713,7 @@ void MatmulStripeCollector::worker_loop() {
             }
             captured = std::move(pending_.front());
             pending_.pop_front();
+            ++in_flight_;
             condition_.notify_all();
         }
 
@@ -729,12 +730,12 @@ void MatmulStripeCollector::worker_loop() {
         job.metrics_.ws_end_ns = now_ns();
         if (status) {
             std::lock_guard<std::mutex> lock(mutex_);
-            ++in_flight_;
             compensation_pending_.push_back(std::make_unique<MatmulStripeJob>(std::move(job)));
             condition_.notify_all();
         }
         if (!status) {
             std::lock_guard<std::mutex> lock(mutex_);
+            --in_flight_;
             status_ = status;
             stop_requested_ = true;
             pending_.clear();
@@ -864,7 +865,7 @@ bool MatmulStripeCollector::on_ready(
         if (collector.worker_started_) {
             collector.condition_.wait(lock, [&collector] {
                 return collector.stop_requested_ || !collector.status_ ||
-                    collector.pending_.size() < collector.capacity_;
+                    collector.pending_.size() + collector.in_flight_ < collector.capacity_;
             });
             if (collector.stop_requested_ || !collector.status_) {
                 return false;

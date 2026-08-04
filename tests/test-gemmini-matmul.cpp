@@ -822,22 +822,28 @@ bool test_staged_contract_errors() {
 
 bool test_live_pipeline_worker() {
     using namespace ggml::gemmini;
-    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
-    std::vector<float> output(6, 0.0f);
+    std::vector<float> output(12, 0.0f);
     MatmulOptions options{};
     options.mode = MatmulInvocationMode::stripe_pipeline;
     options.job_capacity = 2;
-    auto execution = prepare_execution(make_args(activation, weights, output), options);
+    auto args = make_args(activation, weights, output);
+    args.I = 6;
+    auto execution = prepare_execution(args, options);
     MatmulStripeCollector collector(2);
     if (!check(execution.status().ok() && collector.start(execution), "live worker start")) {
         return false;
     }
     const auto * sink = collector.sink();
-    if (!check(sink->on_ready(sink->user_data, { 0, 0, 2, nullptr, 0, 10, 20, 30, 50, 40, 70 }), "live worker capture") ||
-        !check(sink->on_ready(sink->user_data, { 1, 2, 3, nullptr, 0, 11, 21, 31, 51, 41, 71 }), "live worker tail capture") ||
+    if (!check(sink->on_ready(sink->user_data, { 0, 0, 1, nullptr, 0, 10, 20, 30, 50, 40, 70 }), "live worker capture") ||
+        !check(sink->on_ready(sink->user_data, { 1, 1, 2, nullptr, 0, 11, 21, 31, 51, 41, 71 }), "live worker capture") ||
+        !check(sink->on_ready(sink->user_data, { 2, 2, 3, nullptr, 0, 12, 22, 32, 52, 42, 72 }), "live worker capture") ||
+        !check(sink->on_ready(sink->user_data, { 3, 3, 4, nullptr, 0, 13, 23, 33, 53, 43, 73 }), "live worker capture") ||
+        !check(sink->on_ready(sink->user_data, { 4, 4, 5, nullptr, 0, 14, 24, 34, 54, 44, 74 }), "live worker capture") ||
+        !check(sink->on_ready(sink->user_data, { 5, 5, 6, nullptr, 0, 15, 25, 35, 55, 45, 75 }), "live worker tail capture") ||
         !check(collector.finish().ok(), "live worker finish") ||
-        !check(collector.profiles().size() == 2, "live worker stripe profiles") ||
+        !check(collector.profiles().size() == 6, "live worker stripe profiles") ||
         !check(collector.profiles()[0].la_cycles == 10 && collector.profiles()[0].la3_cycles == 30 &&
                    collector.profiles()[0].sf_cycles == 20,
                "live worker producer profile") ||
