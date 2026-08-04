@@ -950,7 +950,8 @@ MatmulStripeJob::MatmulStripeJob(
 
 MatmulStripeJob::MatmulStripeJob(MatmulStripeJob && other) noexcept
     : execution_(other.execution_), input_(std::move(other.input_)), status_(other.status_),
-      metrics_(other.metrics_), compensation_outliers_(std::move(other.compensation_outliers_)),
+      metrics_(other.metrics_), staged_residual_(std::move(other.staged_residual_)),
+      compensation_outliers_(std::move(other.compensation_outliers_)),
       has_captured_outliers_(other.has_captured_outliers_), owns_slot_(other.owns_slot_),
       expected_shards_(other.expected_shards_), completed_shards_(other.completed_shards_),
       parallel_shards_(other.parallel_shards_), shard_mutex_(std::move(other.shard_mutex_)),
@@ -966,6 +967,7 @@ MatmulStripeJob & MatmulStripeJob::operator=(MatmulStripeJob && other) noexcept 
         input_ = std::move(other.input_);
         status_ = other.status_;
         metrics_ = other.metrics_;
+        staged_residual_ = std::move(other.staged_residual_);
         compensation_outliers_ = std::move(other.compensation_outliers_);
         has_captured_outliers_ = other.has_captured_outliers_;
         owns_slot_ = other.owns_slot_;
@@ -1028,12 +1030,17 @@ MatmulStatus execute_full(MatmulExecution & execution) {
 
 MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput input) {
     const bool has_outliers = input.outliers() != nullptr || input.outlier_count() != 0;
+    std::vector<int32_t> staged_residual;
+    if (input.residual_count() != 0) {
+        staged_residual.assign(input.residual(), input.residual() + input.residual_count());
+    }
     std::vector<quants::QactOutlier> outliers;
     if (input.outlier_count() != 0) {
         outliers.assign(input.outliers(), input.outliers() + input.outlier_count());
     }
     MatmulStripeJob job = capture_stripe(execution, std::move(input), std::move(outliers));
     job.has_captured_outliers_ = has_outliers;
+    job.staged_residual_ = std::move(staged_residual);
     return job;
 }
 
@@ -1163,38 +1170,7 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job, size_t shard_id, 
     MatmulStatus result{};
     const size_t col_begin = job.execution_->facade_.args().J * shard_id / shard_count;
     const size_t col_end = job.execution_->facade_.args().J * (shard_id + 1) / shard_count;
-    if (!job.compensation_outliers_.empty() && job.has_captured_outliers_) {
-        auto local_args = job.execution_->facade_.args();
-        const size_t row_begin = job.input_.row_begin();
-        const size_t input_stride = local_args.sA ? local_args.sA : local_args.K;
-        const size_t output_stride = local_args.stride_f_out ? local_args.stride_f_out : local_args.J;
-        local_args.I = job.input_.row_end() - row_begin;
-        local_args.A += row_begin * input_stride;
-        local_args.f_out += row_begin * output_stride;
-        local_args.activation_row_offset += row_begin;
-        if (auto * meta = std::get_if<quants::act::exsia::Meta>(&local_args.act_quant.storage())) {
-            const size_t stripe_id = job.input_.stripe_id();
-            if (stripe_id >= meta->theta.size()) {
-                result = make_status(MatmulStatusCode::invalid_argument, "invalid activation stripe id");
-            } else {
-                std::vector<quants::QactOutlier> local_outliers = job.compensation_outliers_;
-                for (auto & outlier : local_outliers) {
-                    outlier.row -= static_cast<int>(row_begin);
-                }
-                dec_status = quants::dec::compensate_activation_dec_rows_columns(
-                    local_outliers, local_args, 0, local_args.I, col_begin, col_end,
-                    "ggml-gemmini-matmul", job.execution_->dispatch_override_);
-            }
-        } else {
-            std::vector<quants::QactOutlier> local_outliers = job.compensation_outliers_;
-            for (auto & outlier : local_outliers) {
-                outlier.row -= static_cast<int>(row_begin);
-            }
-            dec_status = quants::dec::compensate_activation_dec_rows_columns(
-                local_outliers, local_args, 0, local_args.I, col_begin, col_end,
-                "ggml-gemmini-matmul", job.execution_->dispatch_override_);
-        }
-    } else if (!job.compensation_outliers_.empty()) {
+    if (!job.compensation_outliers_.empty()) {
         dec_status = quants::dec::compensate_activation_dec_rows_columns(
             job.compensation_outliers_, job.execution_->facade_.args(),
             job.input_.row_begin(), job.input_.row_end(), col_begin, col_end,

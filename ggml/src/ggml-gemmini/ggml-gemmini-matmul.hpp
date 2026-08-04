@@ -365,6 +365,7 @@ private:
     MatmulStripeInput input_;
     MatmulStatus status_;
     MatmulJobMetrics metrics_;
+    std::vector<int32_t> staged_residual_;
     std::vector<quants::QactOutlier> compensation_outliers_;
     bool has_captured_outliers_ = false;
     bool owns_slot_ = false;
