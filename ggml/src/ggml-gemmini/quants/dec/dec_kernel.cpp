@@ -609,6 +609,22 @@ void accumulate_to_ycom_int64_scalar(
 namespace
 {
 template <size_t NR>
+size_t group_k_csc_vector_load_count(size_t active_k_count, size_t J)
+{
+    if constexpr (NR == 1)
+        return 0;
+
+    size_t vector_loads_per_k = 0;
+    for (size_t jb = 0; jb < J; jb += kDecInt64JTileWidth)
+    {
+        const size_t width = std::min(kDecInt64JTileWidth, J - jb);
+        vector_loads_per_k = saturating_add_size(
+            vector_loads_per_k, width / NR + (width % NR != 0));
+    }
+    return saturating_mul_size(active_k_count, vector_loads_per_k);
+}
+
+template <size_t NR>
 bool accumulate_to_ycom_int64_scalar_group_k_csc_impl(
     const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
     const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
@@ -639,6 +655,7 @@ bool accumulate_to_ycom_int64_scalar_group_k_csc_impl(
     }
     stats.logical_weight_reference_count = saturating_mul_size(entries.size(), J);
     stats.weight_scalar_load_count = saturating_mul_size(active_k_count, J);
+    stats.weight_vector_load_count = group_k_csc_vector_load_count<NR>(active_k_count, J);
     stats.thread_scratch_bytes = saturating_mul_size(
         saturating_mul_size(I, tile_capacity), sizeof(int64_t));
 
@@ -726,11 +743,24 @@ bool accumulate_to_ycom_int64_scalar_group_k_csc_nr8(
         args, plan, I, J, activation_scales, entries, group_k_csc_plan, Y_com, stats);
 }
 
-bool accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
+bool accumulate_to_ycom_int64_scalar_group_k_csc_nr4(
     const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
     const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
     const GroupKCSCPlan &group_k_csc_plan, float *Y_com, GroupKCSCScalarStats &stats)
 {
+    return accumulate_to_ycom_int64_scalar_group_k_csc_impl<4>(
+        args, plan, I, J, activation_scales, entries, group_k_csc_plan, Y_com, stats);
+}
+
+namespace
+{
+template <size_t NR>
+bool accumulate_to_ycom_int32_mixed_group_k_csc_impl(
+    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
+    const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
+    const GroupKCSCPlan &group_k_csc_plan, float *Y_com, GroupKCSCScalarStats &stats)
+{
+    static_assert(NR > 0, "NR must be positive");
     stats = {};
     const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
     const size_t tile_capacity = std::min(J, kDecInt64JTileWidth);
@@ -785,6 +815,7 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
     }
     stats.logical_weight_reference_count = saturating_mul_size(entries.size(), J);
     stats.weight_scalar_load_count = saturating_mul_size(active_k_count, J);
+    stats.weight_vector_load_count = group_k_csc_vector_load_count<NR>(active_k_count, J);
 
     const bool all_int32 = stats.int64_fallback_row_count == 0;
     const bool all_int64 = stats.int32_row_count == 0;
@@ -811,10 +842,10 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
                 continue;
 
             const size_t k = group * kDecGroupSizeK + k_offset;
-            for (size_t j_offset = 0; j_offset < width; j_offset += 8)
+            for (size_t j_offset = 0; j_offset < width; j_offset += NR)
             {
-                const size_t lane_count = std::min(size_t {8}, width - j_offset);
-                std::array<int64_t, 8> weight_lanes;
+                const size_t lane_count = std::min(NR, width - j_offset);
+                std::array<int64_t, NR> weight_lanes;
                 for (size_t lane = 0; lane < lane_count; ++lane)
                     weight_lanes[lane] = plan.layout == WeightLayout::KxJ_RowMajor ?
                         weights[k * plan.weight_stride + jb + j_offset + lane] :
@@ -861,7 +892,7 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
         {
             std::fill(accumulator.begin(), accumulator.begin() + I * width, int32_t {0});
             const auto update_int32 = [&](const ResidualGroupEntry &entry, size_t j_offset,
-                size_t lane_count, const std::array<int64_t, 8> &weight_lanes)
+                size_t lane_count, const std::array<int64_t, NR> &weight_lanes)
             {
                 int32_t *entry_accumulator = accumulator.data() +
                     static_cast<size_t>(entry.row) * width + j_offset;
@@ -889,7 +920,7 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
     const auto update_int64_for = [&](std::vector<int64_t> &accumulator, size_t width)
     {
         return [&, width](const ResidualGroupEntry &entry, size_t j_offset, size_t lane_count,
-            const std::array<int64_t, 8> &weight_lanes)
+            const std::array<int64_t, NR> &weight_lanes)
         {
             int64_t *entry_accumulator = accumulator.data() +
                 fallback_slots[entry.row] * width + j_offset;
@@ -938,7 +969,7 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
                   int64_accumulator.begin() + stats.int64_fallback_row_count * width,
                   int64_t {0});
         const auto update_int32 = [&](const ResidualGroupEntry &entry, size_t j_offset,
-            size_t lane_count, const std::array<int64_t, 8> &weight_lanes)
+            size_t lane_count, const std::array<int64_t, NR> &weight_lanes)
         {
             int32_t *entry_accumulator = int32_accumulator.data() +
                 static_cast<size_t>(entry.row) * width + j_offset;
@@ -969,10 +1000,10 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
                     continue;
 
                 const size_t k = group * kDecGroupSizeK + k_offset;
-                for (size_t j_offset = 0; j_offset < width; j_offset += 8)
+                for (size_t j_offset = 0; j_offset < width; j_offset += NR)
                 {
-                    const size_t lane_count = std::min(size_t {8}, width - j_offset);
-                    std::array<int64_t, 8> weight_lanes;
+                    const size_t lane_count = std::min(NR, width - j_offset);
+                    std::array<int64_t, NR> weight_lanes;
                     for (size_t lane = 0; lane < lane_count; ++lane)
                         weight_lanes[lane] = plan.layout == WeightLayout::KxJ_RowMajor ?
                             weights[k * plan.weight_stride + jb + j_offset + lane] :
@@ -1019,6 +1050,25 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
     });
 
     return true;
+}
+}
+
+bool accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
+    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
+    const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
+    const GroupKCSCPlan &group_k_csc_plan, float *Y_com, GroupKCSCScalarStats &stats)
+{
+    return accumulate_to_ycom_int32_mixed_group_k_csc_impl<8>(
+        args, plan, I, J, activation_scales, entries, group_k_csc_plan, Y_com, stats);
+}
+
+bool accumulate_to_ycom_int32_mixed_group_k_csc_nr4(
+    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
+    const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
+    const GroupKCSCPlan &group_k_csc_plan, float *Y_com, GroupKCSCScalarStats &stats)
+{
+    return accumulate_to_ycom_int32_mixed_group_k_csc_impl<4>(
+        args, plan, I, J, activation_scales, entries, group_k_csc_plan, Y_com, stats);
 }
 
 void accumulate_to_ycom_int64_channel_direct(
