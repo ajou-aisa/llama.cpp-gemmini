@@ -871,7 +871,14 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     ggml::gemmini::log::dump(ggml::gemmini::log::file("log/tensor_data/act.jsonl"), layer, src1);
 #endif
 
-    ggml::gemmini::log::debug(layer, "I=%zu, J=%zu, K=%zu", I, J, K);
+    ggml::gemmini::log::debug(layer,
+            "I=%zu, J=%zu, K=%zu, src1_ne=(%lld,%lld,%lld,%lld), dst_ne=(%lld,%lld,%lld,%lld), src1_nrows=%lld",
+            I, J, K,
+            (long long) src1->ne[0], (long long) src1->ne[1],
+            (long long) src1->ne[2], (long long) src1->ne[3],
+            (long long) dst->ne[0], (long long) dst->ne[1],
+            (long long) dst->ne[2], (long long) dst->ne[3],
+            (long long) ggml_nrows(src1));
 
     if constexpr (ggml::gemmini::config::CURRENT_COMPUTE_TYPE == ggml::gemmini::config::ComputeType::FLOAT &&
                   !ggml::gemmini::config::DEQUANT_FP_TEST) {
