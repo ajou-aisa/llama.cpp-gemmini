@@ -405,6 +405,11 @@ MatmulStripeInput::MatmulStripeInput(size_t row_begin, size_t row_end, size_t st
     : row_begin_(row_begin), row_end_(row_end), stripe_id_(stripe_id),
       residual_(residual), residual_count_(residual_count) {}
 
+MatmulStripeInput::MatmulStripeInput(size_t row_begin, size_t row_end, size_t stripe_id,
+                                     const quants::QactOutlier * outliers, size_t outlier_count)
+    : row_begin_(row_begin), row_end_(row_end), stripe_id_(stripe_id),
+      residual_(nullptr), residual_count_(0), outliers_(outliers), outlier_count_(outlier_count) {}
+
 size_t MatmulStripeInput::row_begin() const {
     return row_begin_;
 }
@@ -423,6 +428,14 @@ const int32_t * MatmulStripeInput::residual() const {
 
 size_t MatmulStripeInput::residual_count() const {
     return residual_count_;
+}
+
+const quants::QactOutlier * MatmulStripeInput::outliers() const {
+    return outliers_;
+}
+
+size_t MatmulStripeInput::outlier_count() const {
+    return outlier_count_;
 }
 
 MatmulExecution::MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options)
@@ -788,8 +801,13 @@ MatmulStatus execute_full(MatmulExecution & execution) {
 }
 
 MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput input) {
-    MatmulStripeJob job = capture_stripe(execution, std::move(input), {});
-    job.has_captured_outliers_ = false;
+    const bool has_outliers = input.outliers() != nullptr || input.outlier_count() != 0;
+    std::vector<quants::QactOutlier> outliers;
+    if (input.outlier_count() != 0) {
+        outliers.assign(input.outliers(), input.outliers() + input.outlier_count());
+    }
+    MatmulStripeJob job = capture_stripe(execution, std::move(input), std::move(outliers));
+    job.has_captured_outliers_ = has_outliers;
     return job;
 }
 
@@ -804,7 +822,9 @@ MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput in
     } else if (execution.facade_.state() != MatMulState::accepting_stripes) {
         status = invalid_state("execution is not accepting stripes");
     } else if (input.row_begin() >= input.row_end() || input.row_end() > execution.total_rows_ ||
-               ((input.residual() == nullptr) != (input.residual_count() == 0))) {
+               ((input.residual() == nullptr) != (input.residual_count() == 0)) ||
+               ((input.outliers() == nullptr) != (input.outlier_count() == 0)) ||
+               (input.residual() != nullptr && input.outliers() != nullptr)) {
         status = make_status(MatmulStatusCode::invalid_argument, "invalid stripe input");
     } else if (execution.active_jobs_ >= execution.options_.job_capacity) {
         status = make_status(MatmulStatusCode::out_of_memory, "job capacity exhausted");

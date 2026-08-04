@@ -242,6 +242,8 @@ class MatmulStripeInput {
 public:
     MatmulStripeInput(size_t row_begin, size_t row_end, size_t stripe_id = 0,
                       const int32_t * residual = nullptr, size_t residual_count = 0);
+    MatmulStripeInput(size_t row_begin, size_t row_end, size_t stripe_id,
+                      const quants::QactOutlier * outliers, size_t outlier_count);
     MatmulStripeInput(const MatmulStripeInput &) = delete;
     MatmulStripeInput & operator=(const MatmulStripeInput &) = delete;
     MatmulStripeInput(MatmulStripeInput &&) noexcept = default;
@@ -252,6 +254,8 @@ public:
     size_t stripe_id() const;
     const int32_t * residual() const;
     size_t residual_count() const;
+    const quants::QactOutlier * outliers() const;
+    size_t outlier_count() const;
 
 private:
     size_t row_begin_;
@@ -259,6 +263,8 @@ private:
     size_t stripe_id_;
     const int32_t * residual_;
     size_t residual_count_;
+    const quants::QactOutlier * outliers_ = nullptr;
+    size_t outlier_count_ = 0;
 };
 
 class MatmulExecution {

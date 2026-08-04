@@ -170,6 +170,8 @@ bool test_public_contract_shape() {
 
     const int32_t residual[] = { 4, 5 };
     MatmulStripeInput input(1, 3, 7, residual, 2);
+    const quants::QactOutlier outlier[] = {{ 1, 2, 3 }};
+    MatmulStripeInput outlier_input(1, 3, 7, outlier, 1);
     MatmulJobMetrics metrics{};
     return check(defaults.job_capacity == 4, "default job capacity") &&
         check(statuses[0].ok(), "success status ok") &&
@@ -182,6 +184,9 @@ bool test_public_contract_shape() {
         check(input.row_begin() == 1 && input.row_end() == 3 && input.stripe_id() == 7 &&
                   input.residual() == residual && input.residual_count() == 2,
               "stripe input metadata") &&
+        check(outlier_input.outliers() == outlier && outlier_input.outlier_count() == 1 &&
+                  outlier_input.residual() == nullptr,
+              "outlier stripe input metadata") &&
         check(metrics.la.count == 0 && metrics.sf.count == 0 && metrics.handoff.count == 0 &&
                   metrics.ws.count == 0 && metrics.rc_prepare.count == 0 &&
                   metrics.rc_compute.count == 0 && metrics.rc_finalize.count == 0,
@@ -279,7 +284,8 @@ bool test_bounded_pipeline_slots_and_reuse() {
     options.rc_shards = 4;
     options.profiling = true;
     auto execution = prepare_execution(make_args(activation, weights, output), options);
-    auto first = capture_stripe(execution, { 0, 1 });
+    const quants::QactOutlier outlier[] = {{ 0, 0, 2 }};
+    auto first = capture_stripe(execution, MatmulStripeInput(0, 1, 0, outlier, 1));
     auto second = capture_stripe(execution, { 1, 2 });
     auto blocked = capture_stripe(execution, { 2, 3 });
 
