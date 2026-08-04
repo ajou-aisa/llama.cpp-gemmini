@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cassert>
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -188,6 +189,12 @@ namespace ggml::gemmini::quants::act::exsia
             return ggml::gemmini::cycle::read();
         }
 
+        uint64_t profile_now_ns()
+        {
+            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        }
+
         uint64_t profile_thread_id()
         {
 #if defined(GGML_GEMMINI_HAS_OPENMP)
@@ -202,6 +209,7 @@ namespace ggml::gemmini::quants::act::exsia
             interval.valid = true;
             interval.start_thread_id = profile_thread_id();
             interval.start = profile_now();
+            interval.start_ns = profile_now_ns();
         }
 
         bool end_profile_interval(ProfileInterval &interval)
@@ -210,6 +218,7 @@ namespace ggml::gemmini::quants::act::exsia
             if (!interval.valid)
                 return false;
             interval.end = profile_now();
+            interval.end_ns = profile_now_ns();
             interval.end_thread_id = profile_thread_id();
             return interval.end >= interval.start;
         }
@@ -1606,6 +1615,10 @@ namespace ggml::gemmini::quants::act::exsia
                 }
                 event.folding_start_cycle = profile->folding.start;
                 event.folding_end_cycle = profile->folding.end;
+                event.local_start_ns = profile->local.start_ns;
+                event.local_end_ns = profile->local.end_ns;
+                event.folding_start_ns = profile->folding.start_ns;
+                event.folding_end_ns = profile->folding.end_ns;
             }
 #endif
             const bool accepted = sink->on_ready(

@@ -176,6 +176,8 @@ struct MatmulJobMetrics {
     uint64_t la_cycles = 0;
     uint64_t la3_cycles = 0;
     uint64_t sf_cycles = 0;
+    uint64_t la3_ns = 0;
+    uint64_t sf1_ns = 0;
     MatmulStageMetrics la;
     MatmulStageMetrics sf;
     MatmulStageMetrics handoff;
@@ -210,6 +212,8 @@ private:
         uint64_t la_cycles = 0;
         uint64_t la3_cycles = 0;
         uint64_t sf_cycles = 0;
+        uint64_t la3_ns = 0;
+        uint64_t sf1_ns = 0;
     };
     static bool on_ready(void *, const quants::act::exsia::StripeReadyEvent &);
     friend MatmulStatus execute_post_fold_pipeline(const ggml_gemmini_args_t &, MatmulStripeCollector &);

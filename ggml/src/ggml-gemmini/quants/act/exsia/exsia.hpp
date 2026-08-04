@@ -359,6 +359,10 @@ namespace ggml::gemmini::quants::act::exsia
         uint64_t folding_end_cycle = 0;
         uint64_t local_group3_start_cycle = 0;
         uint64_t local_group3_end_cycle = 0;
+        uint64_t local_start_ns = 0;
+        uint64_t local_end_ns = 0;
+        uint64_t folding_start_ns = 0;
+        uint64_t folding_end_ns = 0;
     };
 
     struct StripeReadySink
@@ -467,6 +471,8 @@ namespace ggml::gemmini::quants::act::exsia
     {
         uint64_t start = 0;
         uint64_t end = 0;
+        uint64_t start_ns = 0;
+        uint64_t end_ns = 0;
         uint64_t start_thread_id = 0;
         uint64_t end_thread_id = 0;
         bool valid = false;

@@ -904,6 +904,12 @@ void MatmulStripeCollector::worker_loop() {
         job.metrics_.la_cycles = captured.la_cycles;
         job.metrics_.la3_cycles = captured.la3_cycles;
         job.metrics_.sf_cycles = captured.sf_cycles;
+        job.metrics_.la3_ns = captured.la3_ns;
+        job.metrics_.sf1_ns = captured.sf1_ns;
+        job.metrics_.la.nanoseconds = captured.la3_ns;
+        job.metrics_.la.count = captured.la3_ns != 0 ? 1 : 0;
+        job.metrics_.sf.nanoseconds = captured.sf1_ns;
+        job.metrics_.sf.count = captured.sf1_ns != 0 ? 1 : 0;
         MatmulStatus status = prepare_compensation(job);
         job.metrics_.ws_start_ns = now_ns();
         if (status) status = execute_dense_stripe(job);
@@ -1057,7 +1063,11 @@ bool MatmulStripeCollector::on_ready(
                  event.local_group3_end_cycle >= event.local_group3_start_cycle ?
                      event.local_group3_end_cycle - event.local_group3_start_cycle : 0,
                  event.folding_end_cycle >= event.folding_start_cycle ?
-                     event.folding_end_cycle - event.folding_start_cycle : 0});
+                     event.folding_end_cycle - event.folding_start_cycle : 0,
+                 event.local_end_ns >= event.local_start_ns ?
+                     event.local_end_ns - event.local_start_ns : 0,
+                 event.folding_end_ns >= event.folding_start_ns ?
+                     event.folding_end_ns - event.folding_start_ns : 0});
             lock.unlock();
             collector.condition_.notify_all();
             return true;
@@ -1074,7 +1084,11 @@ bool MatmulStripeCollector::on_ready(
              event.local_group3_end_cycle >= event.local_group3_start_cycle ?
                  event.local_group3_end_cycle - event.local_group3_start_cycle : 0,
              event.folding_end_cycle >= event.folding_start_cycle ?
-                 event.folding_end_cycle - event.folding_start_cycle : 0});
+                 event.folding_end_cycle - event.folding_start_cycle : 0,
+             event.local_end_ns >= event.local_start_ns ?
+                 event.local_end_ns - event.local_start_ns : 0,
+             event.folding_end_ns >= event.folding_start_ns ?
+                 event.folding_end_ns - event.folding_start_ns : 0});
     } catch (const std::bad_alloc &) {
         std::lock_guard<std::mutex> lock(collector.mutex_);
         collector.status_ = make_status(MatmulStatusCode::out_of_memory, "stripe capture allocation failed");
