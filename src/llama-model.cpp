@@ -260,15 +260,6 @@ using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffe
 static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t & buft_list) {
     GGML_ASSERT(!buft_list.empty());
 
-    if (tensor->type == GGML_TYPE_Q8_H1) {
-        for (const auto & cur : buft_list) {
-            if (std::strcmp(ggml_backend_dev_name(cur.first), "GEMMINI") == 0 &&
-                weight_buft_supported(hparams, tensor, op, cur.second, cur.first)) {
-                return cur.second;
-            }
-        }
-    }
-
     for (const auto & cur : buft_list) {
         ggml_backend_dev_t cur_dev = cur.first;
         ggml_backend_buffer_type_t cur_buft = cur.second;

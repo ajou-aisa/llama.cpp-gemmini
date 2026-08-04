@@ -61,92 +61,6 @@
 namespace
 {
 
-    struct gemmini_host_buffer_context {
-        void * data;
-        bool owned;
-    };
-
-    static void gemmini_host_buffer_free(ggml_backend_buffer_t buffer) {
-        auto * ctx = static_cast<gemmini_host_buffer_context *>(buffer->context);
-        if (ctx != nullptr) {
-            if (ctx->owned) {
-                std::free(ctx->data);
-            }
-            delete ctx;
-        }
-    }
-
-    static void * gemmini_host_buffer_base(ggml_backend_buffer_t buffer) {
-        auto * ctx = static_cast<gemmini_host_buffer_context *>(buffer->context);
-        return ctx != nullptr ? ctx->data : nullptr;
-    }
-
-    static void gemmini_host_buffer_memset(ggml_backend_buffer_t buffer, struct ggml_tensor *, uint8_t value, size_t offset, size_t size) {
-        std::memset(static_cast<char *>(gemmini_host_buffer_base(buffer)) + offset, value, size);
-    }
-
-    static void gemmini_host_buffer_set(ggml_backend_buffer_t buffer, struct ggml_tensor *, const void * data, size_t offset, size_t size) {
-        std::memcpy(static_cast<char *>(gemmini_host_buffer_base(buffer)) + offset, data, size);
-    }
-
-    static void gemmini_host_buffer_get(ggml_backend_buffer_t buffer, const struct ggml_tensor *, void * data, size_t offset, size_t size) {
-        std::memcpy(data, static_cast<const char *>(gemmini_host_buffer_base(buffer)) + offset, size);
-    }
-
-    static void gemmini_host_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
-        std::memset(gemmini_host_buffer_base(buffer), value, ggml_backend_buffer_get_size(buffer));
-    }
-
-    static ggml_backend_buffer_i gemmini_host_buffer_i = {
-        gemmini_host_buffer_free,
-        gemmini_host_buffer_base,
-        nullptr,
-        gemmini_host_buffer_memset,
-        gemmini_host_buffer_set,
-        gemmini_host_buffer_get,
-        nullptr,
-        gemmini_host_buffer_clear,
-        nullptr,
-    };
-
-    static ggml_backend_buffer_t gemmini_host_buffer_alloc(ggml_backend_buffer_type_t buft, size_t size) {
-        auto * ctx = new gemmini_host_buffer_context{std::malloc(size), true};
-        if (ctx->data == nullptr) {
-            delete ctx;
-            return nullptr;
-        }
-        return ggml_backend_buffer_init(buft, gemmini_host_buffer_i, ctx, size);
-    }
-
-    static const char * gemmini_host_buffer_name(ggml_backend_buffer_type_t) {
-        return "GEMMINI_HOST";
-    }
-
-    static size_t gemmini_host_buffer_alignment(ggml_backend_buffer_type_t) {
-        return 64;
-    }
-
-    static size_t gemmini_host_buffer_alloc_size(ggml_backend_buffer_type_t, const struct ggml_tensor * tensor) {
-        return ggml_nbytes(tensor);
-    }
-
-    static bool gemmini_host_buffer_is_host(ggml_backend_buffer_type_t) {
-        return false;
-    }
-
-    static ggml_backend_buffer_type gemmini_host_buffer_type = {
-        {
-            gemmini_host_buffer_name,
-            gemmini_host_buffer_alloc,
-            gemmini_host_buffer_alignment,
-            nullptr,
-            gemmini_host_buffer_alloc_size,
-            gemmini_host_buffer_is_host,
-        },
-        nullptr,
-        nullptr,
-    };
-
     void gemmini_matmul_fp_facade(size_t I, size_t J, size_t K,
                                   const float * activation, const float * weights,
                                   float * output) {
@@ -2004,16 +1918,13 @@ static ggml_backend_t ggml_backend_gemmini_device_init_backend(ggml_backend_dev_
 }
 
 static ggml_backend_buffer_type_t ggml_backend_gemmini_device_get_buffer_type(ggml_backend_dev_t dev) {
-    gemmini_host_buffer_type.device = dev;
-    return &gemmini_host_buffer_type;
+    return ggml_backend_cpu_buffer_type();
 
     GGML_UNUSED(dev);
 }
 
 static ggml_backend_buffer_t ggml_backend_gemmini_device_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
-    gemmini_host_buffer_type.device = dev;
-    auto * ctx = new gemmini_host_buffer_context{ptr, false};
-    return ggml_backend_buffer_init(&gemmini_host_buffer_type, gemmini_host_buffer_i, ctx, size);
+    return ggml_backend_cpu_buffer_from_ptr(ptr, size);
 
     GGML_UNUSED(dev);
     GGML_UNUSED(max_tensor_size);
@@ -2351,7 +2262,7 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
 }
 
 static bool ggml_backend_gemmini_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    return buft == &gemmini_host_buffer_type;
+    return ggml_backend_buft_is_host(buft);
 
     GGML_UNUSED(dev);
 }
