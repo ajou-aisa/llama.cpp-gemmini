@@ -5,6 +5,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 namespace ggml::gemmini {
@@ -42,6 +46,7 @@ struct MatMulResult {
     MatMulCapability capability;
 };
 
+class MatmulExecution;
 class MatmulStripeJob;
 struct MatmulStatus;
 MatmulStatus prepare_compensation(MatmulStripeJob &);
@@ -50,6 +55,7 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob &);
 class MatMul {
 public:
     explicit MatMul(ggml_gemmini_args_t args);
+    explicit MatMul(ggml_gemmini_args_t * args);
 
     MatMulResult run_dense();
     MatMulResult run_full();
@@ -59,6 +65,8 @@ public:
 
     static MatMulCapability stripe_capability(const ggml_gemmini_args_t & args);
     MatMulState state() const;
+    ggml_gemmini_args_t & args();
+    const ggml_gemmini_args_t & args() const;
 
 private:
     friend MatmulStatus prepare_compensation(MatmulStripeJob &);
@@ -68,6 +76,7 @@ private:
     MatMulStatus run_stripe(MatMulStripe stripe, size_t stripe_id);
 
     ggml_gemmini_args_t args_;
+    ggml_gemmini_args_t * live_args_ = nullptr;
     size_t first_row_ = 0;
     size_t last_row_begin_ = 0;
     size_t last_row_end_ = 0;
@@ -104,6 +113,9 @@ struct MatmulStatus {
 class MatmulStripeCollector {
 public:
     explicit MatmulStripeCollector(size_t capacity);
+    ~MatmulStripeCollector();
+    bool start(MatmulExecution & execution);
+    MatmulStatus finish();
     const quants::act::exsia::StripeReadySink * sink() const;
     const MatmulStatus & status() const;
     const quants::QactOutlier & captured_outlier(size_t stripe, size_t outlier) const;
@@ -117,6 +129,14 @@ private:
     };
     static bool on_ready(void *, const quants::act::exsia::StripeReadyEvent &);
     friend MatmulStatus execute_post_fold_pipeline(const ggml_gemmini_args_t &, MatmulStripeCollector &);
+    void worker_loop();
+    bool worker_started_ = false;
+    bool stop_requested_ = false;
+    std::thread worker_;
+    MatmulExecution * execution_ = nullptr;
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    std::deque<CapturedStripe> pending_;
     size_t capacity_;
     std::vector<CapturedStripe> stripes_;
     MatmulStatus status_;
@@ -190,6 +210,7 @@ public:
 
 private:
     friend MatmulExecution prepare_execution(const ggml_gemmini_args_t &, MatmulOptions);
+    friend MatmulExecution prepare_execution(ggml_gemmini_args_t &, MatmulOptions);
     friend MatmulStatus execute_full(MatmulExecution &);
     friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput);
     friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput, std::vector<quants::QactOutlier>);
@@ -201,6 +222,7 @@ private:
     friend MatmulStatus finish_execution(MatmulExecution &);
 
     MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options);
+    MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions options);
 
     size_t total_rows_;
     MatMul facade_;
@@ -257,6 +279,7 @@ private:
 };
 
 MatmulExecution prepare_execution(const ggml_gemmini_args_t & args, MatmulOptions options = {});
+MatmulExecution prepare_execution(ggml_gemmini_args_t & args, MatmulOptions options = {});
 MatmulStatus execute_full(MatmulExecution & execution);
 MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput input);
 MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput input,

@@ -203,6 +203,33 @@ bool test_bounded_pipeline_slots_and_reuse() {
     return passed;
 }
 
+bool test_live_staged_worker() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> output(6, 0.0f);
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_pipeline;
+    options.job_capacity = 2;
+    auto execution = prepare_execution(make_args(activation, weights, output), options);
+    MatmulStripeCollector collector(options.job_capacity);
+    const quants::act::exsia::StripeReadyEvent event{0, 0, 3, nullptr, 0};
+    const bool accepted = collector.start(execution) &&
+        collector.sink()->on_ready(collector.sink()->user_data, event);
+    const MatmulStatus collector_status = collector.finish();
+    const MatmulStatus execution_status = finish_execution(execution);
+    const bool passed = accepted && collector_status.ok() && execution_status.ok();
+    if (!passed) {
+        std::fprintf(stderr, "FAIL live worker: accepted=%d collector=%d execution=%d output=%f\n",
+                     accepted ? 1 : 0, static_cast<int>(collector_status.code),
+                     static_cast<int>(execution_status.code), output[0]);
+    }
+    if (passed) {
+        std::puts("PASS live worker: capture=handoff worker=WS+RC bounded=yes");
+    }
+    return passed;
+}
+
 bool test_staged_contract_errors() {
     using namespace ggml::gemmini;
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
@@ -249,6 +276,7 @@ bool test_staged_contract_errors() {
 int main(int argc, char ** argv) {
     const bool edge_only = argc == 2 && std::string_view(argv[1]) == "--edge";
     const bool edge = test_public_contract_shape() && test_bounded_pipeline_slots_and_reuse() &&
+        test_live_staged_worker() &&
         test_staged_contract_errors();
     if (edge_only) {
         return edge ? 0 : 1;

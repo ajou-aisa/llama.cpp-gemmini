@@ -920,8 +920,11 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     }
 
     ggml_gemmini_args_t args; // DEC과 gemmini 호출을 위한 args 
+    std::vector<int32_t> zero_bias(J, 0);
+    [[maybe_unused]] static thread_local std::vector<int8_t> c_i8;
     std::vector<int8_t> q8_channel_dense;
     std::vector<float> q8_channel_scales;
+    std::unique_ptr<ggml::gemmini::MatmulExecution> pipeline_execution;
     std::unique_ptr<ggml::gemmini::MatmulStripeCollector> pipeline_collector;
     const bool pipeline_requested = [] {
         const char *value = std::getenv("GEMMINI_MATMUL_INVOCATION");
@@ -970,8 +973,25 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     int8_t *qx = activation_q.data();
 
     args.A = reinterpret_cast<elem_t *>(qx);
+    args.sD = 0;
+    args.D = zero_bias.data();
+    args.repeating_bias = true;
+    c_i8.resize(ij_count);
+    args.C = c_i8.data();
+    args.f_out = static_cast<float *>(dst->data);
+    args.col_stride_f_out = dst->nb[0] / sizeof(float);
+    args.stride_f_out = dst->nb[1] / sizeof(float);
     if (pipeline_enabled) {
-        pipeline_collector = std::make_unique<ggml::gemmini::MatmulStripeCollector>(args.I);
+        ggml::gemmini::MatmulOptions pipeline_options{};
+        pipeline_options.mode = ggml::gemmini::MatmulInvocationMode::stripe_pipeline;
+        pipeline_options.job_capacity = 4;
+        pipeline_collector = std::make_unique<ggml::gemmini::MatmulStripeCollector>(pipeline_options.job_capacity);
+        pipeline_execution = std::make_unique<ggml::gemmini::MatmulExecution>(
+            ggml::gemmini::prepare_execution(args, pipeline_options));
+        if (!pipeline_execution->status() || !pipeline_collector->start(*pipeline_execution)) {
+            ggml::gemmini::log::debug(layer, "[matmul.pipeline] failed to start staged worker");
+            return;
+        }
         args.exsia_stripe_ready_sink = pipeline_collector->sink();
     }
     ggml::gemmini::log::debug(
@@ -1364,30 +1384,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     }
 
-    start = ggml::gemmini::cycle::read();
-    /* ______________________________ 4. bias 텐서 처리 _________________________________ */
-    std::vector<int32_t> zero_bias(J, 0);
-
-    const int32_t *bias_data = zero_bias.data();
-    const size_t sD = 0;
-
-    args.sD = sD;
-    args.D = bias_data;
-    args.repeating_bias = true;
-
-    
-    // output 버퍼
-    [[maybe_unused]] static thread_local std::vector<int8_t> c_i8;
-    c_i8.resize(ij_count);
-    
-    args.C = c_i8.data();
-    args.f_out = static_cast<float*>(dst->data);
-    args.col_stride_f_out = dst->nb[0] / sizeof(float);
-    args.stride_f_out = dst->nb[1] / sizeof(float);
-
-    end = ggml::gemmini::cycle::read();
-    ggml::gemmini::log::cycle(layer, "cpu.Set Args for calling gemmini", start, end);
-
     // ggml::gemmini::log::debug("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out(row)=%zu stride_f_out(col)=%zu nb1=%zu nb0=%zu",
     //                  layer, args.A, args.B, args.C, args.D,
     //                  args.I, args.J, args.K, args.sA, args.sB, args.sC,
@@ -1484,11 +1480,18 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     }
     }
     if (pipeline_enabled) {
-        const auto pipeline_status = ggml::gemmini::execute_post_fold_pipeline(args, *pipeline_collector);
+        const auto pipeline_status = pipeline_collector->finish();
         ggml::gemmini::log::debug(layer,
-            "[matmul.pipeline] mode=post-fold-staged status=%d message=%s",
+            "[matmul.pipeline] mode=live-staged status=%d message=%s",
             static_cast<int>(pipeline_status.code), pipeline_status.message);
         if (!pipeline_status) {
+            return;
+        }
+        const auto execution_status = ggml::gemmini::finish_execution(*pipeline_execution);
+        if (!execution_status) {
+            ggml::gemmini::log::debug(layer,
+                "[matmul.pipeline] execution status=%d message=%s",
+                static_cast<int>(execution_status.code), execution_status.message);
             return;
         }
     }
