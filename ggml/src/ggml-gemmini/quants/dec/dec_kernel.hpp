@@ -24,6 +24,8 @@ struct GroupKCSCScalarStats
     size_t logical_weight_reference_count = 0;
     size_t weight_scalar_load_count = 0;
     size_t thread_scratch_bytes = 0;
+    size_t int32_row_count = 0;
+    size_t int64_fallback_row_count = 0;
 };
 
 inline constexpr size_t kDecInt64JTileWidth = 128;
@@ -72,6 +74,17 @@ bool accumulate_to_ycom_int64_scalar_group_k_csc(
     GroupKCSCScalarStats &stats);
 
 bool accumulate_to_ycom_int64_scalar_group_k_csc_nr8(
+    const ggml_gemmini_args_t &args,
+    const DecRoutePlan &plan,
+    size_t I,
+    size_t J,
+    const float *activation_scales,
+    const std::vector<ResidualGroupEntry> &entries,
+    const GroupKCSCPlan &group_k_csc_plan,
+    float *Y_com,
+    GroupKCSCScalarStats &stats);
+
+bool accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
     const ggml_gemmini_args_t &args,
     const DecRoutePlan &plan,
     size_t I,

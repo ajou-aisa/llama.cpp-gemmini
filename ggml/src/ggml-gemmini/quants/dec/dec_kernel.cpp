@@ -139,6 +139,48 @@ namespace
 #endif
     }
 
+    template <typename TileWork>
+    void for_each_grouped_j_tile_mixed(
+        size_t I,
+        size_t fallback_rows,
+        size_t J,
+        TileWork tile_work)
+    {
+        if (I == 0 || J == 0)
+            return;
+
+        const size_t tile_capacity = std::min(J, kDecInt64JTileWidth);
+        const auto run_range = [&](size_t j_begin, size_t j_end)
+        {
+            std::vector<int32_t> int32_accumulator(I * tile_capacity);
+            std::vector<int64_t> int64_accumulator(fallback_rows * tile_capacity);
+            for (size_t jb = j_begin; jb < j_end; jb += kDecInt64JTileWidth)
+                tile_work(jb, std::min(kDecInt64JTileWidth, j_end - jb),
+                          int32_accumulator, int64_accumulator);
+        };
+
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+        const size_t tile_count = dec_int64_j_tile_count(J);
+        const int dec_threads = resolve_dec_threads(tile_count);
+        if (dec_threads == 1 || omp_in_parallel() != 0)
+        {
+            run_range(0, J);
+            return;
+        }
+#pragma omp parallel num_threads(dec_threads)
+        {
+            const size_t tid = static_cast<size_t>(omp_get_thread_num());
+            const size_t threads = static_cast<size_t>(omp_get_num_threads());
+            const size_t first_tile = tile_count * tid / threads;
+            const size_t last_tile = tile_count * (tid + 1) / threads;
+            run_range(first_tile * kDecInt64JTileWidth,
+                      std::min(J, last_tile * kDecInt64JTileWidth));
+        }
+#else
+        run_range(0, J);
+#endif
+    }
+
     template <typename CodeFor>
     void add_group_dot(
         const std::vector<ResidualGroupEntry> &entries,
@@ -173,6 +215,12 @@ namespace
             return 0;
         return lhs > std::numeric_limits<size_t>::max() / rhs ?
             std::numeric_limits<size_t>::max() : lhs * rhs;
+    }
+
+    size_t saturating_add_size(size_t lhs, size_t rhs)
+    {
+        return rhs > std::numeric_limits<size_t>::max() - lhs ?
+            std::numeric_limits<size_t>::max() : lhs + rhs;
     }
 
     bool valid_group_k_csc_scalar_plan(
@@ -219,11 +267,14 @@ namespace
                 if (entry_begin > entry_end || entry_end > group_k_csc_plan.entry_order.size())
                     return false;
 
+                size_t previous_entry_index = 0;
                 for (size_t position = entry_begin; position < entry_end; ++position)
                 {
                     const size_t entry_index = group_k_csc_plan.entry_order[position];
-                    if (entry_index >= entries.size())
+                    if (entry_index >= entries.size() ||
+                        (position > entry_begin && entry_index <= previous_entry_index))
                         return false;
+                    previous_entry_index = entry_index;
                     const ResidualGroupEntry &entry = entries[entry_index];
                     if (entry.row >= I || entry.k >= K || entry.k / kDecGroupSizeK != group ||
                         entry.k % kDecGroupSizeK != k_offset)
@@ -234,6 +285,96 @@ namespace
         }
 
         return previous_entry_end == group_k_csc_plan.entry_order.size();
+    }
+
+    bool checked_add_i64(int64_t lhs, int64_t rhs, int64_t &out)
+    {
+        if ((rhs > 0 && lhs > std::numeric_limits<int64_t>::max() - rhs) ||
+            (rhs < 0 && lhs < std::numeric_limits<int64_t>::min() - rhs))
+            return false;
+        out = lhs + rhs;
+        return true;
+    }
+
+    bool checked_mul_i64(int64_t lhs, int64_t rhs, int64_t &out)
+    {
+        if (lhs == 0 || rhs == 0)
+        {
+            out = 0;
+            return true;
+        }
+        if ((lhs == -1 && rhs == std::numeric_limits<int64_t>::min()) ||
+            (rhs == -1 && lhs == std::numeric_limits<int64_t>::min()))
+            return false;
+        if ((lhs > 0 && rhs > 0 && lhs > std::numeric_limits<int64_t>::max() / rhs) ||
+            (lhs > 0 && rhs < 0 && rhs < std::numeric_limits<int64_t>::min() / lhs) ||
+            (lhs < 0 && rhs > 0 && lhs < std::numeric_limits<int64_t>::min() / rhs) ||
+            (lhs < 0 && rhs < 0 && lhs < std::numeric_limits<int64_t>::max() / rhs))
+            return false;
+        out = lhs * rhs;
+        return true;
+    }
+
+    bool coefficient_envelope(int64_t coefficient, int64_t &lower, int64_t &upper)
+    {
+        return coefficient >= 0 ?
+            checked_mul_i64(-128, coefficient, lower) && checked_mul_i64(127, coefficient, upper) :
+            checked_mul_i64(127, coefficient, lower) && checked_mul_i64(-128, coefficient, upper);
+    }
+
+    enum class RowAccumulationWidth
+    {
+        Int32,
+        Int64,
+        Invalid,
+    };
+
+    RowAccumulationWidth classify_row_accumulation_width(
+        const std::vector<ResidualGroupEntry> &entries,
+        size_t entry_begin,
+        size_t entry_end)
+    {
+        int64_t completed_lower = 0;
+        int64_t completed_upper = 0;
+        bool requires_int64 = false;
+        for (size_t position = entry_begin; position < entry_end;)
+        {
+            const uint32_t k = entries[position].k;
+            int64_t partial_coefficient = 0;
+            int64_t partial_lower = 0;
+            int64_t partial_upper = 0;
+            do
+            {
+                int64_t next_coefficient = 0;
+                if (!checked_add_i64(
+                        partial_coefficient,
+                        static_cast<int64_t>(entries[position].residual),
+                        next_coefficient))
+                    return RowAccumulationWidth::Invalid;
+                partial_coefficient = next_coefficient;
+                if (!coefficient_envelope(partial_coefficient, partial_lower, partial_upper))
+                    return RowAccumulationWidth::Invalid;
+
+                int64_t prefix_lower = 0;
+                int64_t prefix_upper = 0;
+                if (!checked_add_i64(completed_lower, partial_lower, prefix_lower) ||
+                    !checked_add_i64(completed_upper, partial_upper, prefix_upper))
+                    return RowAccumulationWidth::Invalid;
+                requires_int64 = requires_int64 ||
+                    prefix_lower < std::numeric_limits<int32_t>::min() ||
+                    prefix_upper > std::numeric_limits<int32_t>::max();
+                ++position;
+            } while (position < entry_end && entries[position].k == k);
+
+            int64_t next_completed_lower = 0;
+            int64_t next_completed_upper = 0;
+            if (!checked_add_i64(completed_lower, partial_lower, next_completed_lower) ||
+                !checked_add_i64(completed_upper, partial_upper, next_completed_upper))
+                return RowAccumulationWidth::Invalid;
+            completed_lower = next_completed_lower;
+            completed_upper = next_completed_upper;
+        }
+        return requires_int64 ? RowAccumulationWidth::Int64 : RowAccumulationWidth::Int32;
     }
 
     template <typename CodeFor, typename ScaleForColumn>
@@ -547,6 +688,170 @@ bool accumulate_to_ycom_int64_scalar_group_k_csc_nr8(
 {
     return accumulate_to_ycom_int64_scalar_group_k_csc_impl<8>(
         args, plan, I, J, activation_scales, entries, group_k_csc_plan, Y_com, stats);
+}
+
+bool accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
+    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
+    const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
+    const GroupKCSCPlan &group_k_csc_plan, float *Y_com, GroupKCSCScalarStats &stats)
+{
+    stats = {};
+    const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
+    const size_t tile_capacity = std::min(J, kDecInt64JTileWidth);
+    const size_t minimum_weight_stride = plan.layout == WeightLayout::KxJ_RowMajor ? J : args.K;
+    if (!weights || !Y_com || !plan.valid || plan.route != DecWeightRoute::Dense ||
+        !plan.scales.scalar_mode || I == 0 || J == 0 || args.K == 0 || I != args.I || J != args.J ||
+        plan.weight_stride < minimum_weight_stride ||
+        I > std::numeric_limits<size_t>::max() / tile_capacity ||
+        !valid_group_k_csc_scalar_plan(group_k_csc_plan, I, args.K, entries))
+        return false;
+    if (entries.empty())
+        return true;
+
+    const size_t no_fallback_slot = std::numeric_limits<size_t>::max();
+    std::vector<size_t> fallback_slots(I, no_fallback_slot);
+    size_t entry_begin = 0;
+    while (entry_begin < entries.size())
+    {
+        const uint32_t row = entries[entry_begin].row;
+        size_t entry_end = entry_begin + 1;
+        while (entry_end < entries.size() && entries[entry_end].row == row)
+            ++entry_end;
+        const RowAccumulationWidth width =
+            classify_row_accumulation_width(entries, entry_begin, entry_end);
+        if (width == RowAccumulationWidth::Invalid)
+            return false;
+        if (width == RowAccumulationWidth::Int32)
+            ++stats.int32_row_count;
+        else
+        {
+            if (stats.int64_fallback_row_count == no_fallback_slot)
+                return false;
+            fallback_slots[row] = stats.int64_fallback_row_count;
+            ++stats.int64_fallback_row_count;
+        }
+        entry_begin = entry_end;
+    }
+
+    size_t active_k_count = 0;
+    for (size_t group = 0; group < group_k_csc_plan.num_groups; ++group)
+    {
+        const size_t group_offset = group * (kDecGroupSizeK + 1);
+        for (size_t k_offset = 0; k_offset < kDecGroupSizeK; ++k_offset)
+            active_k_count += group_k_csc_plan.column_offsets[group_offset + k_offset] !=
+                group_k_csc_plan.column_offsets[group_offset + k_offset + 1];
+    }
+    stats.logical_weight_reference_count = saturating_mul_size(entries.size(), J);
+    stats.weight_scalar_load_count = saturating_mul_size(active_k_count, J);
+    const size_t int32_scratch_bytes = saturating_mul_size(
+        saturating_mul_size(I, tile_capacity), sizeof(int32_t));
+    const size_t int64_scratch_bytes = saturating_mul_size(
+        saturating_mul_size(stats.int64_fallback_row_count, tile_capacity), sizeof(int64_t));
+    stats.thread_scratch_bytes = saturating_add_size(int32_scratch_bytes, int64_scratch_bytes);
+
+    for_each_grouped_j_tile_mixed(
+        I, stats.int64_fallback_row_count, J,
+        [&](size_t jb, size_t width, std::vector<int32_t> &int32_accumulator,
+            std::vector<int64_t> &int64_accumulator)
+    {
+        std::fill(int32_accumulator.begin(), int32_accumulator.begin() + I * width, int32_t {0});
+        std::fill(int64_accumulator.begin(),
+                  int64_accumulator.begin() + stats.int64_fallback_row_count * width,
+                  int64_t {0});
+        for (size_t group = 0; group < group_k_csc_plan.num_groups; ++group)
+        {
+            const size_t group_offset = group * (kDecGroupSizeK + 1);
+            for (size_t k_offset = 0; k_offset < kDecGroupSizeK; ++k_offset)
+            {
+                const size_t column_begin = group_k_csc_plan.column_offsets[group_offset + k_offset];
+                const size_t column_end = group_k_csc_plan.column_offsets[group_offset + k_offset + 1];
+                if (column_begin == column_end)
+                    continue;
+
+                const size_t k = group * kDecGroupSizeK + k_offset;
+                for (size_t j_offset = 0; j_offset < width; j_offset += 8)
+                {
+                    const size_t lane_count = std::min(size_t {8}, width - j_offset);
+                    std::array<int64_t, 8> weight_lanes;
+                    for (size_t lane = 0; lane < lane_count; ++lane)
+                        weight_lanes[lane] = plan.layout == WeightLayout::KxJ_RowMajor ?
+                            weights[k * plan.weight_stride + jb + j_offset + lane] :
+                            weights[(jb + j_offset + lane) * plan.weight_stride + k];
+                    for (size_t position = column_begin; position < column_end; ++position)
+                    {
+                        const ResidualGroupEntry &entry = entries[group_k_csc_plan.entry_order[position]];
+                        const int64_t residual = static_cast<int64_t>(entry.residual);
+                        const size_t fallback_slot = fallback_slots[entry.row];
+                        if (fallback_slot == no_fallback_slot)
+                        {
+                            int32_t *entry_accumulator = int32_accumulator.data() +
+                                static_cast<size_t>(entry.row) * width + j_offset;
+                            for (size_t lane = 0; lane < lane_count; ++lane)
+                            {
+                                const int64_t updated = static_cast<int64_t>(entry_accumulator[lane]) +
+                                    residual * weight_lanes[lane];
+#if DEC_VALIDATION
+                                if (updated < std::numeric_limits<int32_t>::min() ||
+                                    updated > std::numeric_limits<int32_t>::max())
+                                    std::abort();
+#endif
+                                entry_accumulator[lane] = static_cast<int32_t>(updated);
+                            }
+                        }
+                        else
+                        {
+                            int64_t *entry_accumulator = int64_accumulator.data() +
+                                fallback_slot * width + j_offset;
+                            for (size_t lane = 0; lane < lane_count; ++lane)
+                            {
+                                const int64_t term = residual * weight_lanes[lane];
+                                int64_t updated = 0;
+                                if (!checked_add_i64(entry_accumulator[lane], term, updated))
+                                    std::abort();
+#if DEC_VALIDATION
+                                const __int128 checked_sum =
+                                    static_cast<__int128>(entry_accumulator[lane]) + term;
+                                if (checked_sum < std::numeric_limits<int64_t>::min() ||
+                                    checked_sum > std::numeric_limits<int64_t>::max())
+                                    std::abort();
+#endif
+                                entry_accumulator[lane] = updated;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        uint32_t previous_row = std::numeric_limits<uint32_t>::max();
+        for (const ResidualGroupEntry &entry : entries)
+        {
+            if (entry.row == previous_row)
+                continue;
+            previous_row = entry.row;
+
+            const size_t row = entry.row;
+            const float activation_scale = activation_scales ? activation_scales[row] : 1.0f;
+            float *output = Y_com + row * J + jb;
+            const size_t fallback_slot = fallback_slots[row];
+            if (fallback_slot == no_fallback_slot)
+            {
+                const int32_t *row_accumulator = int32_accumulator.data() + row * width;
+                for (size_t t = 0; t < width; ++t)
+                    output[t] += static_cast<float>(
+                        static_cast<double>(row_accumulator[t]) * activation_scale * plan.scales.scalar);
+            }
+            else
+            {
+                const int64_t *row_accumulator = int64_accumulator.data() + fallback_slot * width;
+                for (size_t t = 0; t < width; ++t)
+                    output[t] += static_cast<float>(
+                        static_cast<double>(row_accumulator[t]) * activation_scale * plan.scales.scalar);
+            }
+        }
+    });
+
+    return true;
 }
 
 void accumulate_to_ycom_int64_channel_direct(

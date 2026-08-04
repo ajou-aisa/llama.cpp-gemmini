@@ -1308,6 +1308,12 @@ bool test_fixed_residual_replay_baseline() {
         ggml::gemmini::quants::dec::accumulate_to_ycom_int64_scalar_group_k_csc_nr8(
             args, scalar_route_plan, rows, cols, nullptr, entries, group_k_csc_plan,
             group_k_csc_nr8.data(), group_k_csc_nr8_stats);
+    std::vector<float> group_k_csc_mixed(rows * cols, 0.0f);
+    GroupKCSCScalarStats group_k_csc_mixed_stats;
+    const bool group_k_csc_mixed_accumulated =
+        ggml::gemmini::quants::dec::accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
+            args, scalar_route_plan, rows, cols, nullptr, entries, group_k_csc_plan,
+            group_k_csc_mixed.data(), group_k_csc_mixed_stats);
 
     bool ok = check(result.total_selected == shuffled_outliers.size() && result.nnz == shuffled_outliers.size() &&
                         result.unique_k_count == 3 && result.int_mac_count == 35 &&
@@ -1323,17 +1329,24 @@ bool test_fixed_residual_replay_baseline() {
     for (size_t index = 0; index < output.size(); ++index)
         ok = check(float_bits(output[index]) == expected_bits[index], "fixed replay baseline output bits") && ok;
     ok = check(group_k_csc_ready && group_k_csc_accumulated && group_k_csc_nr8_accumulated &&
+                   group_k_csc_mixed_accumulated &&
                    byte_identical(output, current_row_grouped) &&
                    byte_identical(current_row_grouped, group_k_csc_scalar) &&
-                   byte_identical(current_row_grouped, group_k_csc_nr8),
-               "fixed replay CurrentRowGrouped equals GroupKCSCScalar NR1/8") && ok;
+                   byte_identical(current_row_grouped, group_k_csc_nr8) &&
+                   byte_identical(current_row_grouped, group_k_csc_mixed),
+               "fixed replay CurrentRowGrouped equals GroupKCSC NR1/8 mixed") && ok;
     ok = check(group_k_csc_stats.logical_weight_reference_count == 35 &&
                    group_k_csc_stats.weight_scalar_load_count == 15 &&
                    group_k_csc_stats.thread_scratch_bytes == rows * cols * sizeof(int64_t) &&
                    group_k_csc_nr8_stats.logical_weight_reference_count == 35 &&
                    group_k_csc_nr8_stats.weight_scalar_load_count == 15 &&
-                   group_k_csc_nr8_stats.thread_scratch_bytes == rows * cols * sizeof(int64_t),
-               "fixed replay GroupKCSCScalar NR1/8 has 15 loads versus 35 logical refs") && ok;
+                   group_k_csc_nr8_stats.thread_scratch_bytes == rows * cols * sizeof(int64_t) &&
+                   group_k_csc_mixed_stats.logical_weight_reference_count == 35 &&
+                   group_k_csc_mixed_stats.weight_scalar_load_count == 15 &&
+                   group_k_csc_mixed_stats.thread_scratch_bytes == rows * cols * sizeof(int32_t) &&
+                   group_k_csc_mixed_stats.int32_row_count == rows &&
+                   group_k_csc_mixed_stats.int64_fallback_row_count == 0,
+               "fixed replay GroupKCSC mixed NR8 has 15 loads, 60 bytes, and no fallback") && ok;
 
     auto reordered_outliers = shuffled_outliers;
     std::reverse(reordered_outliers.begin(), reordered_outliers.end());
@@ -1373,14 +1386,16 @@ bool test_group_k_csc_nr8_transposed_j_tile() {
                 static_cast<int>((column * 3 + k * 5) % 17) - 8);
 
     std::vector<float> output(rows * cols, 0.0f);
-    ggml_gemmini_args_t args = dense_args(rows, cols, depth, transposed_weights, output, 0.25f);
+    ggml_gemmini_args_t args = dense_args(rows, cols, depth, transposed_weights, output, 0.3125f);
     args.sB = weight_stride;
     args.transpose_B = true;
     const auto scalar_route_plan = ggml::gemmini::quants::dec::resolve_dec_route_plan(
         args, ggml::gemmini::quants::dec::WeightScaleInfoMode::Dec);
 
+    constexpr int32_t fallback_positive = (1 << 24) + 1;
+    const std::array<float, rows> activation_scales = { 0.5f, -0.75f, 1.25f };
     std::vector<ResidualGroupEntry> entries = {
-        { 2, 34, 2 }, { 0, 0, 4 }, { 1, 33, -3 }, { 0, 0, -1 },
+        { 2, 34, 2 }, { 0, 0, 4 }, { 1, 33, fallback_positive }, { 0, 0, -1 },
         { 2, 0, -2 }, { 1, 33, 5 }, { 0, 34, 1 },
     };
     std::vector<ActiveRowGroup> groups;
@@ -1398,32 +1413,210 @@ bool test_group_k_csc_nr8_transposed_j_tile() {
     GroupKCSCScalarStats scalar_stats;
     const bool scalar_accumulated =
         ggml::gemmini::quants::dec::accumulate_to_ycom_int64_scalar_group_k_csc(
-            args, scalar_route_plan, rows, cols, nullptr, entries, group_k_csc_plan,
+            args, scalar_route_plan, rows, cols, activation_scales.data(), entries, group_k_csc_plan,
             scalar_output.data(), scalar_stats);
     std::vector<float> nr8_output(rows * cols, 0.0f);
     GroupKCSCScalarStats nr8_stats;
     const bool nr8_accumulated =
         ggml::gemmini::quants::dec::accumulate_to_ycom_int64_scalar_group_k_csc_nr8(
-            args, scalar_route_plan, rows, cols, nullptr, entries, group_k_csc_plan,
+            args, scalar_route_plan, rows, cols, activation_scales.data(), entries, group_k_csc_plan,
             nr8_output.data(), nr8_stats);
+    const char *previous_threads = std::getenv("DEC_THREADS");
+    const std::string saved_threads = previous_threads ? previous_threads : "";
+    const bool had_previous_threads = previous_threads != nullptr;
+    set_dec_threads("1");
+    std::vector<float> mixed_output(rows * cols, 0.0f);
+    GroupKCSCScalarStats mixed_stats;
+    const bool mixed_accumulated =
+        ggml::gemmini::quants::dec::accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
+            args, scalar_route_plan, rows, cols, activation_scales.data(), entries, group_k_csc_plan,
+            mixed_output.data(), mixed_stats);
+    bool mixed_threads_identical = true;
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+    for (const char *thread_count : { "2", "3" }) {
+        set_dec_threads(thread_count);
+        std::vector<float> thread_output(rows * cols, 0.0f);
+        GroupKCSCScalarStats thread_stats;
+        mixed_threads_identical =
+            ggml::gemmini::quants::dec::accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
+                args, scalar_route_plan, rows, cols, activation_scales.data(), entries, group_k_csc_plan,
+                thread_output.data(), thread_stats) &&
+            byte_identical(mixed_output, thread_output) &&
+            thread_stats.logical_weight_reference_count == mixed_stats.logical_weight_reference_count &&
+            thread_stats.weight_scalar_load_count == mixed_stats.weight_scalar_load_count &&
+            thread_stats.thread_scratch_bytes == mixed_stats.thread_scratch_bytes &&
+            thread_stats.int32_row_count == mixed_stats.int32_row_count &&
+            thread_stats.int64_fallback_row_count == mixed_stats.int64_fallback_row_count &&
+            mixed_threads_identical;
+    }
+#endif
+    set_dec_threads(had_previous_threads ? saved_threads.c_str() : nullptr);
 
     constexpr size_t expected_logical_refs = 7 * cols;
     constexpr size_t expected_weight_loads = 3 * cols;
     constexpr size_t expected_scratch_bytes =
         rows * ggml::gemmini::quants::dec::kDecInt64JTileWidth * sizeof(int64_t);
-    return check(group_k_csc_ready && scalar_accumulated && nr8_accumulated &&
+    return check(group_k_csc_ready && scalar_accumulated && nr8_accumulated && mixed_accumulated &&
+                     mixed_threads_identical &&
                      scalar_route_plan.valid &&
                      scalar_route_plan.layout == ggml::gemmini::quants::dec::WeightLayout::JxK_ColMajor &&
                      scalar_route_plan.weight_stride == weight_stride &&
-                     byte_identical(scalar_output, nr8_output),
-                 "GroupKCSC NR8 matches scalar across J tiles with transposed padded weights") &&
+                     byte_identical(scalar_output, nr8_output) &&
+                     byte_identical(scalar_output, mixed_output),
+                 "GroupKCSC NR8 mixed matches scalar across J tiles with transposed padded weights") &&
         check(scalar_stats.logical_weight_reference_count == expected_logical_refs &&
                   scalar_stats.weight_scalar_load_count == expected_weight_loads &&
                   scalar_stats.thread_scratch_bytes == expected_scratch_bytes &&
                   nr8_stats.logical_weight_reference_count == expected_logical_refs &&
                   nr8_stats.weight_scalar_load_count == expected_weight_loads &&
-                  nr8_stats.thread_scratch_bytes == expected_scratch_bytes,
-              "GroupKCSC NR8 transposed J-tile counters");
+                  nr8_stats.thread_scratch_bytes == expected_scratch_bytes &&
+                  mixed_stats.logical_weight_reference_count == expected_logical_refs &&
+                  mixed_stats.weight_scalar_load_count == expected_weight_loads &&
+                  mixed_stats.thread_scratch_bytes ==
+                      ggml::gemmini::quants::dec::kDecInt64JTileWidth *
+                      (rows * sizeof(int32_t) + sizeof(int64_t)) &&
+                  mixed_stats.int32_row_count == 2 &&
+                  mixed_stats.int64_fallback_row_count == 1,
+              "GroupKCSC mixed NR8 transposed J-tile fallback counters");
+}
+
+bool test_group_k_csc_mixed_int32_boundaries() {
+    using ggml::gemmini::quants::dec::ActiveRowGroup;
+    using ggml::gemmini::quants::dec::GroupKCSCPlan;
+    using ggml::gemmini::quants::dec::GroupKCSCScalarStats;
+    using ggml::gemmini::quants::dec::ResidualGroupEntry;
+
+    constexpr size_t rows = 6;
+    constexpr size_t cols = 5;
+    constexpr size_t depth = 1;
+    constexpr int32_t safe_positive = 1 << 24;
+    constexpr int32_t fallback_positive = safe_positive + 1;
+    const std::vector<int8_t> weights = { -128, 127, -128, 127, 1 };
+    std::vector<float> output(rows * cols, 0.0f);
+    ggml_gemmini_args_t args = dense_args(rows, cols, depth, weights, output, 0.25f);
+    const auto scalar_route_plan = ggml::gemmini::quants::dec::resolve_dec_route_plan(
+        args, ggml::gemmini::quants::dec::WeightScaleInfoMode::Dec);
+    std::vector<ResidualGroupEntry> entries = {
+        { 0, 0, safe_positive },
+        { 1, 0, fallback_positive },
+        { 2, 0, -(safe_positive - 1) },
+        { 3, 0, -safe_positive },
+        { 4, 0, std::numeric_limits<int32_t>::min() },
+        { 5, 0, fallback_positive },
+        { 5, 0, -fallback_positive },
+    };
+    std::vector<ActiveRowGroup> groups;
+    ggml::gemmini::quants::dec::build_active_row_groups(entries, groups);
+    std::vector<size_t> group_offsets;
+    std::vector<size_t> group_row_group_indices;
+    ggml::gemmini::quants::dec::build_group_major_index(
+        groups, 1, group_offsets, group_row_group_indices);
+    GroupKCSCPlan group_k_csc_plan;
+    const bool group_k_csc_ready = ggml::gemmini::quants::dec::build_group_k_csc_plan(
+        entries, groups, group_offsets, group_row_group_indices, 1, group_k_csc_plan);
+
+    std::vector<float> int64_output(rows * cols, 0.0f);
+    GroupKCSCScalarStats int64_stats;
+    const bool int64_accumulated =
+        ggml::gemmini::quants::dec::accumulate_to_ycom_int64_scalar_group_k_csc_nr8(
+            args, scalar_route_plan, rows, cols, nullptr, entries, group_k_csc_plan,
+            int64_output.data(), int64_stats);
+    std::vector<float> mixed_output(rows * cols, 0.0f);
+    GroupKCSCScalarStats mixed_stats;
+    const bool mixed_accumulated =
+        ggml::gemmini::quants::dec::accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
+            args, scalar_route_plan, rows, cols, nullptr, entries, group_k_csc_plan,
+            mixed_output.data(), mixed_stats);
+
+    return check(group_k_csc_ready && int64_accumulated && mixed_accumulated &&
+                     byte_identical(int64_output, mixed_output),
+                 "GroupKCSC mixed NR8 preserves INT64 boundary outputs") &&
+        check(mixed_stats.logical_weight_reference_count == 7 * cols &&
+                  mixed_stats.weight_scalar_load_count == cols &&
+                  mixed_stats.thread_scratch_bytes ==
+                      cols * (rows * sizeof(int32_t) + 4 * sizeof(int64_t)) &&
+                  mixed_stats.int32_row_count == 2 &&
+                  mixed_stats.int64_fallback_row_count == 4,
+              "GroupKCSC mixed NR8 classifies INT32 boundaries and same-K cancellation");
+}
+
+bool test_group_k_csc_mixed_prefix_and_plan_rejects() {
+    using ggml::gemmini::quants::dec::ActiveRowGroup;
+    using ggml::gemmini::quants::dec::GroupKCSCPlan;
+    using ggml::gemmini::quants::dec::GroupKCSCScalarStats;
+    using ggml::gemmini::quants::dec::ResidualGroupEntry;
+
+    constexpr size_t rows = 2;
+    constexpr size_t cols = 5;
+    constexpr size_t depth = 2;
+    const std::vector<int8_t> weights = {
+        -128, 127, -128, 127, 1,
+        -128, 127, -128, 127, 1,
+    };
+    std::vector<float> output(rows * cols, 0.0f);
+    ggml_gemmini_args_t args = dense_args(rows, cols, depth, weights, output, 0.25f);
+    const auto scalar_route_plan = ggml::gemmini::quants::dec::resolve_dec_route_plan(
+        args, ggml::gemmini::quants::dec::WeightScaleInfoMode::Dec);
+    std::vector<ResidualGroupEntry> entries = {
+        { 0, 0, 10 }, { 0, 0, -10 }, { 1, 0, 8000000 }, { 1, 1, 8000000 },
+    };
+    std::vector<ActiveRowGroup> groups;
+    ggml::gemmini::quants::dec::build_active_row_groups(entries, groups);
+    std::vector<size_t> group_offsets;
+    std::vector<size_t> group_row_group_indices;
+    ggml::gemmini::quants::dec::build_group_major_index(
+        groups, 1, group_offsets, group_row_group_indices);
+    GroupKCSCPlan group_k_csc_plan;
+    const bool group_k_csc_ready = ggml::gemmini::quants::dec::build_group_k_csc_plan(
+        entries, groups, group_offsets, group_row_group_indices, 1, group_k_csc_plan);
+
+    std::vector<float> int64_output(rows * cols, 0.0f);
+    GroupKCSCScalarStats int64_stats;
+    const bool int64_accumulated =
+        ggml::gemmini::quants::dec::accumulate_to_ycom_int64_scalar_group_k_csc_nr8(
+            args, scalar_route_plan, rows, cols, nullptr, entries, group_k_csc_plan,
+            int64_output.data(), int64_stats);
+    std::vector<float> mixed_output(rows * cols, 0.0f);
+    GroupKCSCScalarStats mixed_stats;
+    const bool mixed_accumulated =
+        ggml::gemmini::quants::dec::accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
+            args, scalar_route_plan, rows, cols, nullptr, entries, group_k_csc_plan,
+            mixed_output.data(), mixed_stats);
+
+    GroupKCSCPlan malformed_plan = group_k_csc_plan;
+    const size_t first_column = malformed_plan.column_offsets[0];
+    std::swap(malformed_plan.entry_order[first_column], malformed_plan.entry_order[first_column + 1]);
+    const std::vector<float> untouched(rows * cols, 3.0f);
+    std::vector<float> scalar_reject_output = untouched;
+    std::vector<float> nr8_reject_output = untouched;
+    std::vector<float> mixed_reject_output = untouched;
+    GroupKCSCScalarStats scalar_reject_stats;
+    GroupKCSCScalarStats nr8_reject_stats;
+    GroupKCSCScalarStats mixed_reject_stats;
+    const bool scalar_rejected =
+        !ggml::gemmini::quants::dec::accumulate_to_ycom_int64_scalar_group_k_csc(
+            args, scalar_route_plan, rows, cols, nullptr, entries, malformed_plan,
+            scalar_reject_output.data(), scalar_reject_stats);
+    const bool nr8_rejected =
+        !ggml::gemmini::quants::dec::accumulate_to_ycom_int64_scalar_group_k_csc_nr8(
+            args, scalar_route_plan, rows, cols, nullptr, entries, malformed_plan,
+            nr8_reject_output.data(), nr8_reject_stats);
+    const bool mixed_rejected =
+        !ggml::gemmini::quants::dec::accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
+            args, scalar_route_plan, rows, cols, nullptr, entries, malformed_plan,
+            mixed_reject_output.data(), mixed_reject_stats);
+
+    return check(group_k_csc_ready && int64_accumulated && mixed_accumulated &&
+                     byte_identical(int64_output, mixed_output) &&
+                     mixed_stats.logical_weight_reference_count == entries.size() * cols &&
+                     mixed_stats.weight_scalar_load_count == 2 * cols &&
+                     mixed_stats.thread_scratch_bytes == rows * cols * sizeof(int32_t) &&
+                     mixed_stats.int32_row_count == rows && mixed_stats.int64_fallback_row_count == 0,
+                 "GroupKCSC mixed NR8 accepts safe same-K cancellation and multi-K prefixes") &&
+        check(scalar_rejected && nr8_rejected && mixed_rejected &&
+                  scalar_reject_output == untouched && nr8_reject_output == untouched &&
+                  mixed_reject_output == untouched,
+              "GroupKCSC rejects reordered same-column entry_order");
 }
 
 bool test_thread_determinism() {
@@ -1490,6 +1683,8 @@ int main() {
         test_q8_h1_hierarchical_route() && test_q8_h1_preserves_ordered_scaling_bits() && test_q8_h1_activation_scale_routes_preserve_bits() && test_unpacked_h1_tail_routes_preserve_bits() && test_q8_h1_large_effective_scale() && test_q8_h2_hierarchical_route() && test_q8_hp1_hierarchical_route() && test_q8_hp2_hierarchical_route() &&
         test_malformed_hierarchical_reject() && test_output_strides() && test_sparse_grouped_tails() && test_malformed_reject() && test_thread_clamp() &&
         test_fixed_residual_replay_baseline() && test_group_k_csc_nr8_transposed_j_tile() &&
+        test_group_k_csc_mixed_int32_boundaries() &&
+        test_group_k_csc_mixed_prefix_and_plan_rejects() &&
         test_thread_determinism() && test_inside_existing_openmp_region();
     std::printf("gemmini DEC baseline: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
