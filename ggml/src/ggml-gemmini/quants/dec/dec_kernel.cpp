@@ -140,6 +140,42 @@ namespace
     }
 
     template <typename TileWork>
+    void for_each_grouped_j_tile_int32(size_t scratch_rows, size_t J, TileWork tile_work)
+    {
+        if (scratch_rows == 0 || J == 0)
+            return;
+
+        const size_t tile_capacity = std::min(J, kDecInt64JTileWidth);
+        const auto run_range = [&](size_t j_begin, size_t j_end)
+        {
+            std::vector<int32_t> accumulator(scratch_rows * tile_capacity);
+            for (size_t jb = j_begin; jb < j_end; jb += kDecInt64JTileWidth)
+                tile_work(jb, std::min(kDecInt64JTileWidth, j_end - jb), accumulator);
+        };
+
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+        const size_t tile_count = dec_int64_j_tile_count(J);
+        const int dec_threads = resolve_dec_threads(tile_count);
+        if (dec_threads == 1 || omp_in_parallel() != 0)
+        {
+            run_range(0, J);
+            return;
+        }
+#pragma omp parallel num_threads(dec_threads)
+        {
+            const size_t tid = static_cast<size_t>(omp_get_thread_num());
+            const size_t threads = static_cast<size_t>(omp_get_num_threads());
+            const size_t first_tile = tile_count * tid / threads;
+            const size_t last_tile = tile_count * (tid + 1) / threads;
+            run_range(first_tile * kDecInt64JTileWidth,
+                      std::min(J, last_tile * kDecInt64JTileWidth));
+        }
+#else
+        run_range(0, J);
+#endif
+    }
+
+    template <typename TileWork>
     void for_each_grouped_j_tile_mixed(
         size_t I,
         size_t fallback_rows,
@@ -710,6 +746,8 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
 
     const size_t no_fallback_slot = std::numeric_limits<size_t>::max();
     std::vector<size_t> fallback_slots(I, no_fallback_slot);
+    std::vector<size_t> int32_rows;
+    std::vector<size_t> int64_rows;
     size_t entry_begin = 0;
     while (entry_begin < entries.size())
     {
@@ -722,13 +760,17 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
         if (width == RowAccumulationWidth::Invalid)
             return false;
         if (width == RowAccumulationWidth::Int32)
+        {
             ++stats.int32_row_count;
+            int32_rows.push_back(row);
+        }
         else
         {
             if (stats.int64_fallback_row_count == no_fallback_slot)
                 return false;
             fallback_slots[row] = stats.int64_fallback_row_count;
             ++stats.int64_fallback_row_count;
+            int64_rows.push_back(row);
         }
         entry_begin = entry_end;
     }
@@ -743,11 +785,148 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
     }
     stats.logical_weight_reference_count = saturating_mul_size(entries.size(), J);
     stats.weight_scalar_load_count = saturating_mul_size(active_k_count, J);
+
+    const bool all_int32 = stats.int64_fallback_row_count == 0;
+    const bool all_int64 = stats.int32_row_count == 0;
+    stats.width_path = all_int32 ? GroupKCSCWidthPath::AllInt32 :
+        all_int64 ? GroupKCSCWidthPath::AllInt64 : GroupKCSCWidthPath::Mixed;
+    const size_t int32_scratch_rows = all_int64 ? 0 : I;
+    const size_t int64_scratch_rows = all_int32 ? 0 : stats.int64_fallback_row_count;
     const size_t int32_scratch_bytes = saturating_mul_size(
-        saturating_mul_size(I, tile_capacity), sizeof(int32_t));
+        saturating_mul_size(int32_scratch_rows, tile_capacity), sizeof(int32_t));
     const size_t int64_scratch_bytes = saturating_mul_size(
-        saturating_mul_size(stats.int64_fallback_row_count, tile_capacity), sizeof(int64_t));
+        saturating_mul_size(int64_scratch_rows, tile_capacity), sizeof(int64_t));
     stats.thread_scratch_bytes = saturating_add_size(int32_scratch_bytes, int64_scratch_bytes);
+
+    const auto accumulate_group = [&](size_t group, size_t jb, size_t width,
+        const std::vector<uint32_t> &column_offsets, const auto &entry_order,
+        auto update_entry)
+    {
+        const size_t group_offset = group * (kDecGroupSizeK + 1);
+        for (size_t k_offset = 0; k_offset < kDecGroupSizeK; ++k_offset)
+        {
+            const size_t column_begin = column_offsets[group_offset + k_offset];
+            const size_t column_end = column_offsets[group_offset + k_offset + 1];
+            if (column_begin == column_end)
+                continue;
+
+            const size_t k = group * kDecGroupSizeK + k_offset;
+            for (size_t j_offset = 0; j_offset < width; j_offset += 8)
+            {
+                const size_t lane_count = std::min(size_t {8}, width - j_offset);
+                std::array<int64_t, 8> weight_lanes;
+                for (size_t lane = 0; lane < lane_count; ++lane)
+                    weight_lanes[lane] = plan.layout == WeightLayout::KxJ_RowMajor ?
+                        weights[k * plan.weight_stride + jb + j_offset + lane] :
+                        weights[(jb + j_offset + lane) * plan.weight_stride + k];
+                for (size_t position = column_begin; position < column_end; ++position)
+                {
+                    const ResidualGroupEntry &entry = entries[entry_order[position]];
+                    update_entry(entry, j_offset, lane_count, weight_lanes);
+                }
+            }
+        }
+    };
+
+    const auto merge_int32 = [&](size_t jb, size_t width, const std::vector<int32_t> &accumulator)
+    {
+        for (size_t row : int32_rows)
+        {
+            const float activation_scale = activation_scales ? activation_scales[row] : 1.0f;
+            float *output = Y_com + row * J + jb;
+            const int32_t *row_accumulator = accumulator.data() + row * width;
+            for (size_t t = 0; t < width; ++t)
+                output[t] += static_cast<float>(
+                    static_cast<double>(row_accumulator[t]) * activation_scale * plan.scales.scalar);
+        }
+    };
+
+    const auto merge_int64 = [&](size_t jb, size_t width, const std::vector<int64_t> &accumulator)
+    {
+        for (size_t row : int64_rows)
+        {
+            const float activation_scale = activation_scales ? activation_scales[row] : 1.0f;
+            float *output = Y_com + row * J + jb;
+            const int64_t *row_accumulator = accumulator.data() + fallback_slots[row] * width;
+            for (size_t t = 0; t < width; ++t)
+                output[t] += static_cast<float>(
+                    static_cast<double>(row_accumulator[t]) * activation_scale * plan.scales.scalar);
+        }
+    };
+
+    if (all_int32)
+    {
+        for_each_grouped_j_tile_int32(I, J,
+            [&](size_t jb, size_t width, std::vector<int32_t> &accumulator)
+        {
+            std::fill(accumulator.begin(), accumulator.begin() + I * width, int32_t {0});
+            const auto update_int32 = [&](const ResidualGroupEntry &entry, size_t j_offset,
+                size_t lane_count, const std::array<int64_t, 8> &weight_lanes)
+            {
+                int32_t *entry_accumulator = accumulator.data() +
+                    static_cast<size_t>(entry.row) * width + j_offset;
+                const int64_t residual = static_cast<int64_t>(entry.residual);
+                for (size_t lane = 0; lane < lane_count; ++lane)
+                {
+                    const int64_t updated = static_cast<int64_t>(entry_accumulator[lane]) +
+                        residual * weight_lanes[lane];
+#if DEC_VALIDATION
+                    if (updated < std::numeric_limits<int32_t>::min() ||
+                        updated > std::numeric_limits<int32_t>::max())
+                        std::abort();
+#endif
+                    entry_accumulator[lane] = static_cast<int32_t>(updated);
+                }
+            };
+            for (size_t group = 0; group < group_k_csc_plan.num_groups; ++group)
+                accumulate_group(group, jb, width, group_k_csc_plan.column_offsets,
+                    group_k_csc_plan.entry_order, update_int32);
+            merge_int32(jb, width, accumulator);
+        });
+        return true;
+    }
+
+    const auto update_int64_for = [&](std::vector<int64_t> &accumulator, size_t width)
+    {
+        return [&, width](const ResidualGroupEntry &entry, size_t j_offset, size_t lane_count,
+            const std::array<int64_t, 8> &weight_lanes)
+        {
+            int64_t *entry_accumulator = accumulator.data() +
+                fallback_slots[entry.row] * width + j_offset;
+            const int64_t residual = static_cast<int64_t>(entry.residual);
+            for (size_t lane = 0; lane < lane_count; ++lane)
+            {
+                const int64_t term = residual * weight_lanes[lane];
+                int64_t updated = 0;
+                if (!checked_add_i64(entry_accumulator[lane], term, updated))
+                    std::abort();
+#if DEC_VALIDATION
+                const __int128 checked_sum =
+                    static_cast<__int128>(entry_accumulator[lane]) + term;
+                if (checked_sum < std::numeric_limits<int64_t>::min() ||
+                    checked_sum > std::numeric_limits<int64_t>::max())
+                    std::abort();
+#endif
+                entry_accumulator[lane] = updated;
+            }
+        };
+    };
+
+    if (all_int64)
+    {
+        for_each_grouped_j_tile(stats.int64_fallback_row_count, J,
+            [&](size_t jb, size_t width, std::vector<int64_t> &accumulator)
+        {
+            std::fill(accumulator.begin(),
+                accumulator.begin() + stats.int64_fallback_row_count * width, int64_t {0});
+            const auto update_int64 = update_int64_for(accumulator, width);
+            for (size_t group = 0; group < group_k_csc_plan.num_groups; ++group)
+                accumulate_group(group, jb, width, group_k_csc_plan.column_offsets,
+                    group_k_csc_plan.entry_order, update_int64);
+            merge_int64(jb, width, accumulator);
+        });
+        return true;
+    }
 
     for_each_grouped_j_tile_mixed(
         I, stats.int64_fallback_row_count, J,
@@ -758,13 +937,34 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
         std::fill(int64_accumulator.begin(),
                   int64_accumulator.begin() + stats.int64_fallback_row_count * width,
                   int64_t {0});
+        const auto update_int32 = [&](const ResidualGroupEntry &entry, size_t j_offset,
+            size_t lane_count, const std::array<int64_t, 8> &weight_lanes)
+        {
+            int32_t *entry_accumulator = int32_accumulator.data() +
+                static_cast<size_t>(entry.row) * width + j_offset;
+            const int64_t residual = static_cast<int64_t>(entry.residual);
+            for (size_t lane = 0; lane < lane_count; ++lane)
+            {
+                const int64_t updated = static_cast<int64_t>(entry_accumulator[lane]) +
+                    residual * weight_lanes[lane];
+#if DEC_VALIDATION
+                if (updated < std::numeric_limits<int32_t>::min() ||
+                    updated > std::numeric_limits<int32_t>::max())
+                    std::abort();
+#endif
+                entry_accumulator[lane] = static_cast<int32_t>(updated);
+            }
+        };
+        const auto update_int64 = update_int64_for(int64_accumulator, width);
         for (size_t group = 0; group < group_k_csc_plan.num_groups; ++group)
         {
             const size_t group_offset = group * (kDecGroupSizeK + 1);
             for (size_t k_offset = 0; k_offset < kDecGroupSizeK; ++k_offset)
             {
-                const size_t column_begin = group_k_csc_plan.column_offsets[group_offset + k_offset];
-                const size_t column_end = group_k_csc_plan.column_offsets[group_offset + k_offset + 1];
+                const size_t column_begin =
+                    group_k_csc_plan.column_offsets[group_offset + k_offset];
+                const size_t column_end =
+                    group_k_csc_plan.column_offsets[group_offset + k_offset + 1];
                 if (column_begin == column_end)
                     continue;
 
@@ -779,45 +979,12 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
                             weights[(jb + j_offset + lane) * plan.weight_stride + k];
                     for (size_t position = column_begin; position < column_end; ++position)
                     {
-                        const ResidualGroupEntry &entry = entries[group_k_csc_plan.entry_order[position]];
-                        const int64_t residual = static_cast<int64_t>(entry.residual);
-                        const size_t fallback_slot = fallback_slots[entry.row];
-                        if (fallback_slot == no_fallback_slot)
-                        {
-                            int32_t *entry_accumulator = int32_accumulator.data() +
-                                static_cast<size_t>(entry.row) * width + j_offset;
-                            for (size_t lane = 0; lane < lane_count; ++lane)
-                            {
-                                const int64_t updated = static_cast<int64_t>(entry_accumulator[lane]) +
-                                    residual * weight_lanes[lane];
-#if DEC_VALIDATION
-                                if (updated < std::numeric_limits<int32_t>::min() ||
-                                    updated > std::numeric_limits<int32_t>::max())
-                                    std::abort();
-#endif
-                                entry_accumulator[lane] = static_cast<int32_t>(updated);
-                            }
-                        }
+                        const ResidualGroupEntry &entry =
+                            entries[group_k_csc_plan.entry_order[position]];
+                        if (fallback_slots[entry.row] == no_fallback_slot)
+                            update_int32(entry, j_offset, lane_count, weight_lanes);
                         else
-                        {
-                            int64_t *entry_accumulator = int64_accumulator.data() +
-                                fallback_slot * width + j_offset;
-                            for (size_t lane = 0; lane < lane_count; ++lane)
-                            {
-                                const int64_t term = residual * weight_lanes[lane];
-                                int64_t updated = 0;
-                                if (!checked_add_i64(entry_accumulator[lane], term, updated))
-                                    std::abort();
-#if DEC_VALIDATION
-                                const __int128 checked_sum =
-                                    static_cast<__int128>(entry_accumulator[lane]) + term;
-                                if (checked_sum < std::numeric_limits<int64_t>::min() ||
-                                    checked_sum > std::numeric_limits<int64_t>::max())
-                                    std::abort();
-#endif
-                                entry_accumulator[lane] = updated;
-                            }
-                        }
+                            update_int64(entry, j_offset, lane_count, weight_lanes);
                     }
                 }
             }

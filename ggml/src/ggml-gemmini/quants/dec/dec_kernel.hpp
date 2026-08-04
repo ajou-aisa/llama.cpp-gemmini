@@ -19,6 +19,13 @@ struct H1ScaleParams
     float s_rf;
 };
 
+enum class GroupKCSCWidthPath : uint8_t
+{
+    Mixed,
+    AllInt32,
+    AllInt64,
+};
+
 struct GroupKCSCScalarStats
 {
     size_t logical_weight_reference_count = 0;
@@ -26,6 +33,7 @@ struct GroupKCSCScalarStats
     size_t thread_scratch_bytes = 0;
     size_t int32_row_count = 0;
     size_t int64_fallback_row_count = 0;
+    GroupKCSCWidthPath width_path = GroupKCSCWidthPath::Mixed;
 };
 
 inline constexpr size_t kDecInt64JTileWidth = 128;

@@ -1248,6 +1248,7 @@ bool test_fixed_residual_replay_baseline() {
     using ggml::gemmini::quants::dec::ActiveRowGroup;
     using ggml::gemmini::quants::dec::GroupKCSCPlan;
     using ggml::gemmini::quants::dec::GroupKCSCScalarStats;
+    using ggml::gemmini::quants::dec::GroupKCSCWidthPath;
     using ggml::gemmini::quants::dec::ResidualGroupEntry;
 
     constexpr size_t rows = 3;
@@ -1367,8 +1368,9 @@ bool test_fixed_residual_replay_baseline() {
                    group_k_csc_mixed_stats.weight_scalar_load_count == 15 &&
                    group_k_csc_mixed_stats.thread_scratch_bytes == rows * cols * sizeof(int32_t) &&
                    group_k_csc_mixed_stats.int32_row_count == rows &&
-                   group_k_csc_mixed_stats.int64_fallback_row_count == 0,
-               "fixed replay GroupKCSC mixed NR8 has 15 loads, 60 bytes, and no fallback") && ok;
+                   group_k_csc_mixed_stats.int64_fallback_row_count == 0 &&
+                   group_k_csc_mixed_stats.width_path == GroupKCSCWidthPath::AllInt32,
+               "fixed replay GroupKCSC mixed NR8 selects AllInt32") && ok;
 
     auto reordered_outliers = shuffled_outliers;
     std::reverse(reordered_outliers.begin(), reordered_outliers.end());
@@ -1550,6 +1552,34 @@ bool test_group_k_csc_mixed_int32_boundaries() {
             args, scalar_route_plan, rows, cols, nullptr, entries, group_k_csc_plan,
             mixed_output.data(), mixed_stats);
 
+    std::vector<ResidualGroupEntry> fallback_entries = {
+        { 1, 0, fallback_positive }, { 3, 0, -safe_positive },
+        { 4, 0, std::numeric_limits<int32_t>::min() },
+        { 5, 0, fallback_positive }, { 5, 0, -fallback_positive },
+    };
+    std::vector<ActiveRowGroup> fallback_groups;
+    ggml::gemmini::quants::dec::build_active_row_groups(fallback_entries, fallback_groups);
+    std::vector<size_t> fallback_group_offsets;
+    std::vector<size_t> fallback_group_row_group_indices;
+    ggml::gemmini::quants::dec::build_group_major_index(
+        fallback_groups, 1, fallback_group_offsets, fallback_group_row_group_indices);
+    GroupKCSCPlan fallback_plan;
+    const bool fallback_ready = ggml::gemmini::quants::dec::build_group_k_csc_plan(
+        fallback_entries, fallback_groups, fallback_group_offsets, fallback_group_row_group_indices, 1,
+        fallback_plan);
+    std::vector<float> fallback_int64_output(rows * cols, 0.0f);
+    std::vector<float> fallback_mixed_output(rows * cols, 0.0f);
+    GroupKCSCScalarStats fallback_int64_stats;
+    GroupKCSCScalarStats fallback_mixed_stats;
+    const bool fallback_int64_accumulated =
+        ggml::gemmini::quants::dec::accumulate_to_ycom_int64_scalar_group_k_csc_nr8(
+            args, scalar_route_plan, rows, cols, nullptr, fallback_entries, fallback_plan,
+            fallback_int64_output.data(), fallback_int64_stats);
+    const bool fallback_mixed_accumulated =
+        ggml::gemmini::quants::dec::accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
+            args, scalar_route_plan, rows, cols, nullptr, fallback_entries, fallback_plan,
+            fallback_mixed_output.data(), fallback_mixed_stats);
+
     return check(group_k_csc_ready && int64_accumulated && mixed_accumulated &&
                      byte_identical(int64_output, mixed_output),
                  "GroupKCSC mixed NR8 preserves INT64 boundary outputs") &&
@@ -1559,7 +1589,12 @@ bool test_group_k_csc_mixed_int32_boundaries() {
                       cols * (rows * sizeof(int32_t) + 4 * sizeof(int64_t)) &&
                   mixed_stats.int32_row_count == 2 &&
                   mixed_stats.int64_fallback_row_count == 4,
-              "GroupKCSC mixed NR8 classifies INT32 boundaries and same-K cancellation");
+              "GroupKCSC mixed NR8 classifies INT32 boundaries and same-K cancellation") &&
+        check(fallback_ready && fallback_int64_accumulated && fallback_mixed_accumulated &&
+                  byte_identical(fallback_int64_output, fallback_mixed_output) &&
+                  fallback_mixed_stats.width_path ==
+                      ggml::gemmini::quants::dec::GroupKCSCWidthPath::AllInt64,
+              "GroupKCSC mixed NR8 selects AllInt64");
 }
 
 bool test_group_k_csc_mixed_prefix_and_plan_rejects() {
