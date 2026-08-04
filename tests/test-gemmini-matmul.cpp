@@ -403,6 +403,51 @@ bool test_full_and_stripe_sequential_outputs_match() {
         check(same_output(full_output, stripe_output), "full and stripe sequential output differs");
 }
 
+bool test_native_exsia_theta_row_slice_parity() {
+    using namespace ggml::gemmini;
+    constexpr size_t rows = 32;
+    constexpr size_t columns = 1;
+    constexpr size_t depth = QK8_0;
+    std::vector<elem_t> activation(rows * depth, 1);
+    block_q8_h1 block{};
+    std::fill(std::begin(block.qs), std::end(block.qs), elem_t{1});
+    block.c_b = 86;
+    block.R = 4095;
+    block.s_rf = 0.00032747327350080013f;
+
+    std::vector<float> full_output(rows * columns, 0.0f);
+    std::vector<float> stripe_output(rows * columns, 0.0f);
+    auto full_args = ggml_gemmini_args_t{};
+    full_args.I = rows;
+    full_args.J = columns;
+    full_args.K = depth;
+    full_args.A = activation.data();
+    full_args.sA = depth;
+    full_args.f_out = full_output.data();
+    full_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1;
+    full_args.q8_h1_blocks = &block;
+    full_args.q8_h1_block_count = 1;
+    full_args.q8_h1_rows = 1;
+    full_args.blocks_per_row = 1;
+    full_args.blocks_K = 1;
+    full_args.blocks_J = columns;
+    full_args.block_size_k = depth;
+    full_args.tiled_matmul_type = CPU;
+    full_args.act_quant.storage().emplace<ggml::gemmini::quants::act::exsia::Meta>().theta =
+        { 0, 1, 2, 3 };
+
+    auto stripe_args = full_args;
+    stripe_args.f_out = stripe_output.data();
+    const auto full_result = MatMul(full_args).run_full();
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_sequential;
+    options.stripe_rows = 1;
+    const auto stripe_result = matmul(stripe_args, options);
+    return check(full_result.status == MatMulStatus::success, "native EXSIA full status") &&
+        check(stripe_result.ok(), "native EXSIA stripe status") &&
+        check(same_output(stripe_output, full_output), "native EXSIA theta slice differs");
+}
+
 bool test_empty_tail_and_malformed_stripe_status() {
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
@@ -855,6 +900,7 @@ int main(int argc, char ** argv) {
             test_live_pipeline_multistripe_matches_full() &&
             test_native_and_channel_full_facade_parity() &&
             test_full_and_stripe_sequential_outputs_match() &&
+            test_native_exsia_theta_row_slice_parity() &&
             test_empty_tail_and_malformed_stripe_status() &&
             test_duplicate_and_overlap_stripe_status() &&
             test_h2_and_hp2_stripe_capability_is_explicitly_unsupported() &&
