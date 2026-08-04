@@ -196,7 +196,8 @@ MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe, size_
     return MatMulStatus::success;
 }
 
-MatmulStatus to_public_status(MatMulStatus status, MatMulCapability capability) {
+MatmulStatus to_public_status(MatMulStatus status, MatMulCapability capability,
+                              const ggml_gemmini_args_t * args = nullptr) {
     MatmulStatusCode code = MatmulStatusCode::invalid_state;
     const char * message = "invalid state";
     switch (status) {
@@ -225,6 +226,15 @@ MatmulStatus to_public_status(MatMulStatus status, MatMulCapability capability) 
             message = "missing stripes";
             break;
         case MatMulStatus::unsupported:
+            if (args != nullptr) {
+                const auto backend = detail::normalize_route(*args).backend;
+                if (backend == detail::BackendRoute::gemmini_os ||
+                    backend == detail::BackendRoute::ws_sim) {
+                    code = MatmulStatusCode::unsupported_backend;
+                    message = "unsupported Gemmini backend";
+                    break;
+                }
+            }
             code = MatmulStatusCode::unsupported_route;
             message = "unsupported route";
             break;
@@ -610,7 +620,8 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options
         !defer_pipeline_route_validation) {
         const MatMulStatus status = facade_.begin_stripes();
         status_ = to_public_status(
-            status, status == MatMulStatus::unsupported ? MatMulCapability::unsupported : MatMulCapability::supported);
+            status, status == MatMulStatus::unsupported ? MatMulCapability::unsupported : MatMulCapability::supported,
+            &facade_.args());
         if (!status_.ok()) {
             state_ = MatmulExecutionState::failed;
         }
@@ -654,7 +665,8 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions optio
         !defer_pipeline_route_validation) {
         const MatMulStatus status = facade_.begin_stripes();
         status_ = to_public_status(
-            status, status == MatMulStatus::unsupported ? MatMulCapability::unsupported : MatMulCapability::supported);
+            status, status == MatMulStatus::unsupported ? MatMulCapability::unsupported : MatMulCapability::supported,
+            &facade_.args());
         if (!status_.ok()) {
             state_ = MatmulExecutionState::failed;
         }
@@ -1004,7 +1016,7 @@ MatmulStatus execute_full(MatmulExecution & execution) {
         return execution.status_;
     }
     const MatMulResult result = execution.facade_.run_full(execution.dispatch_override_);
-    execution.status_ = to_public_status(result.status, result.capability);
+    execution.status_ = to_public_status(result.status, result.capability, &execution.facade_.args());
     if (execution.status_ && execution.options_.validation &&
         !finite_output(execution.facade_.args())) {
         execution.status_ = make_status(MatmulStatusCode::execution_failure,
@@ -1103,7 +1115,8 @@ MatmulStatus execute_dense_stripe(MatmulStripeJob & job) {
     const MatMulStatus status = job.execution_->facade_.run_stripe(
         { job.input_.row_begin(), job.input_.row_end() }, job.input_.stripe_id());
     job.status_ = to_public_status(
-        status, status == MatMulStatus::unsupported ? MatMulCapability::unsupported : MatMulCapability::supported);
+        status, status == MatMulStatus::unsupported ? MatMulCapability::unsupported : MatMulCapability::supported,
+        &job.execution_->facade_.args());
     if (job.status_) {
         job.state_ = MatmulStripeJob::State::dense_complete;
         record_metric(job.metrics_.ws, job.execution_->options_.profiling, start);

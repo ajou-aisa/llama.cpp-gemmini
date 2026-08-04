@@ -705,9 +705,14 @@ bool test_route_capability_table() {
         return false;
     }
     args.tiled_matmul_type = OS;
-    return check(detail::normalize_route(args).backend == detail::BackendRoute::gemmini_os &&
-                     !detail::route_capabilities(args).full,
-                 "Gemmini OS explicit unsupported capability");
+    if (!check(detail::normalize_route(args).backend == detail::BackendRoute::gemmini_os &&
+                   !detail::route_capabilities(args).full,
+               "Gemmini OS explicit unsupported capability")) {
+        return false;
+    }
+    const auto os_status = matmul(args);
+    return check(os_status.code == MatmulStatusCode::unsupported_backend,
+                 "Gemmini OS explicit unsupported status");
 }
 
 bool test_explicit_exsia_channel_rejection() {
