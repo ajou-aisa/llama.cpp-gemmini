@@ -947,7 +947,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     }();
     constexpr bool exsia_pipeline_supported =
         ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA;
-    const bool pipeline_enabled = pipeline_requested && exsia_pipeline_supported;
+    const bool pipeline_enabled = pipeline_requested && exsia_pipeline_supported && I > 1;
     const bool legacy_full_dispatch = [] {
         const char *value = std::getenv("GEMMINI_LEGACY_FULL_DISPATCH");
         return value != nullptr && std::string_view(value) == "1";
@@ -964,7 +964,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     }();
     if (pipeline_requested && !pipeline_enabled) {
         ggml::gemmini::log::debug(layer,
-            "[matmul.pipeline] stripe-pipeline requires EXSIA activation; keeping full dispatch");
+            "[matmul.pipeline] stripe-pipeline requires EXSIA activation and I>1; keeping full dispatch");
     }
 
     // set args
