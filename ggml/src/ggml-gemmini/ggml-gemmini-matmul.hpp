@@ -200,9 +200,9 @@ public:
     MatmulStatus cancel();
     MatmulStatus finish();
     const quants::act::exsia::StripeReadySink * sink() const;
-    const MatmulStatus & status() const;
-    const std::vector<MatmulJobMetrics> & profiles() const;
-    const quants::QactOutlier & captured_outlier(size_t stripe, size_t outlier) const;
+    MatmulStatus status() const;
+    std::vector<MatmulJobMetrics> profiles() const;
+    quants::QactOutlier captured_outlier(size_t stripe, size_t outlier) const;
 
 private:
     struct CapturedStripe {
@@ -218,6 +218,7 @@ private:
     };
     static bool on_ready(void *, const quants::act::exsia::StripeReadyEvent &);
     friend MatmulStatus execute_post_fold_pipeline(const ggml_gemmini_args_t &, MatmulStripeCollector &);
+    void fail(MatmulStatus status);
     void worker_loop();
     void compensation_loop();
     bool worker_started_ = false;
@@ -226,10 +227,11 @@ private:
     std::thread worker_;
     std::thread compensation_worker_;
     MatmulExecution * execution_ = nullptr;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::condition_variable condition_;
     std::deque<CapturedStripe> pending_;
     std::deque<std::shared_ptr<MatmulStripeJob>> compensation_pending_;
+    std::vector<std::weak_ptr<MatmulStripeJob>> jobs_;
     size_t capacity_;
     size_t in_flight_ = 0;
     std::vector<CapturedStripe> stripes_;
@@ -305,7 +307,7 @@ public:
 
     MatmulInvocationMode mode() const;
     MatmulExecutionState state() const;
-    const MatmulStatus & status() const;
+    MatmulStatus status() const;
 
 private:
     friend MatmulExecution prepare_execution(const ggml_gemmini_args_t &, MatmulOptions);
@@ -348,6 +350,36 @@ private:
     bool staged_metadata_active_ = false;
 };
 
+enum class MatmulDenseState : uint8_t {
+    idle,
+    running,
+    complete,
+    failed,
+    cancelled,
+};
+
+enum class MatmulRcState : uint8_t {
+    idle,
+    preparing,
+    prepared,
+    running,
+    complete,
+    failed,
+    cancelled,
+};
+
+struct MatmulStripeJobSnapshot {
+    MatmulStatus status;
+    MatmulJobMetrics metrics;
+    MatmulDenseState dense = MatmulDenseState::idle;
+    MatmulRcState rc = MatmulRcState::idle;
+    size_t expected_shards = 1;
+    size_t completed_shards = 0;
+    bool captured = false;
+    bool finalized = false;
+    bool released = false;
+};
+
 class MatmulStripeJob {
 public:
     MatmulStripeJob();
@@ -357,8 +389,9 @@ public:
     MatmulStripeJob & operator=(MatmulStripeJob && other) noexcept;
     ~MatmulStripeJob();
 
-    const MatmulStatus & status() const;
-    const MatmulJobMetrics & metrics() const;
+    MatmulStatus status() const;
+    MatmulJobMetrics metrics() const;
+    MatmulStripeJobSnapshot snapshot() const;
 
 private:
     friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput);
@@ -372,16 +405,9 @@ private:
 
     MatmulStripeJob(MatmulExecution * execution, MatmulStripeInput input, MatmulStatus status,
                     std::vector<quants::QactOutlier> outliers = {});
+    void cancel(MatmulStatus status);
     void release_slot();
-
-    enum class State {
-        captured,
-        compensation_prepared,
-        compensation_running,
-        dense_complete,
-        compensation_complete,
-        finalized,
-    };
+    void record_failure(MatmulStatus status, bool dense_branch);
 
     MatmulExecution * execution_;
     MatmulStripeInput input_;
@@ -392,15 +418,17 @@ private:
     std::unique_ptr<quants::act::Meta> staged_activation_meta_;
     bool has_captured_outliers_ = false;
     bool owns_slot_ = false;
+    bool released_ = false;
     size_t expected_shards_ = 1;
     size_t completed_shards_ = 0;
     bool parallel_shards_ = false;
     std::shared_ptr<std::mutex> shard_mutex_ = std::make_shared<std::mutex>();
-    std::condition_variable dense_condition_;
+    std::condition_variable lifecycle_condition_;
     std::vector<float> compensation_ycom_;
-    bool dense_finished_ = false;
-    bool compensation_finished_ = false;
-    State state_ = State::captured;
+    MatmulDenseState dense_state_ = MatmulDenseState::idle;
+    MatmulRcState rc_state_ = MatmulRcState::idle;
+    bool captured_ = true;
+    bool finalized_ = false;
 };
 
 MatmulExecution prepare_execution(const ggml_gemmini_args_t & args, MatmulOptions options = {});

@@ -4,10 +4,12 @@
 #include <gemmini.h>
 
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -988,6 +990,85 @@ bool test_bounded_pipeline_slots_and_reuse() {
     return passed;
 }
 
+bool test_independent_branch_lifecycle() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_sequential;
+    options.job_capacity = 1;
+
+    const auto run_order = [&](bool dense_first) {
+        std::vector<float> output(6, 0.0f);
+        auto execution = prepare_execution(make_args(activation, weights, output), options);
+        auto job = capture_stripe(execution, { 0, 1 });
+        if (!check(finalize_stripe(job).code == MatmulStatusCode::invalid_state,
+                   "finalize before branch completion")) {
+            return false;
+        }
+        if (dense_first) {
+            if (!check(execute_dense_stripe(job).ok(), "dense-first dense branch") ||
+                !check(prepare_compensation(job).ok(), "dense-first RC prepare") ||
+                !check(execute_compensation_shard(job).ok(), "dense-first RC branch")) {
+                return false;
+            }
+        } else if (!check(prepare_compensation(job).ok(), "RC-first prepare") ||
+                   !check(execute_compensation_shard(job).ok(), "RC-first RC branch") ||
+                   !check(execute_dense_stripe(job).ok(), "RC-first dense branch")) {
+            return false;
+        }
+        if (!check(finalize_stripe(job).ok(), "branch-order finalize") ||
+            !check(finalize_stripe(job).code == MatmulStatusCode::invalid_state,
+                   "duplicate finalize")) {
+            return false;
+        }
+        const auto snapshot = job.snapshot();
+        if (!check(snapshot.status.ok() && snapshot.captured && snapshot.finalized && snapshot.released &&
+                       snapshot.dense == MatmulDenseState::complete &&
+                       snapshot.rc == MatmulRcState::complete &&
+                       snapshot.expected_shards == 1 && snapshot.completed_shards == 1,
+                   "synchronized finalized branch snapshot")) {
+            return false;
+        }
+        auto reused_slot = capture_stripe(execution, { 1, 3, 1 });
+        return check(reused_slot.status().ok(), "finalize releases one capacity slot") &&
+            run_staged_job(reused_slot) &&
+            check(finish_execution(execution).ok(), "branch-order finish");
+    };
+
+    if (!run_order(true) || !run_order(false)) {
+        return false;
+    }
+
+    for (size_t iteration = 0; iteration < 100; ++iteration) {
+        std::vector<float> output(6, 0.0f);
+        auto execution = prepare_execution(make_args(activation, weights, output), options);
+        auto job = capture_stripe(execution, { 0, 3 });
+        MatmulStatus dense_status;
+        MatmulStatus rc_status;
+        std::thread dense([&] {
+            std::this_thread::sleep_for(std::chrono::microseconds((iteration * 17) % 11));
+            dense_status = execute_dense_stripe(job);
+        });
+        std::thread rc([&] {
+            std::this_thread::sleep_for(std::chrono::microseconds((iteration * 31) % 13));
+            rc_status = prepare_compensation(job);
+            if (rc_status) {
+                rc_status = execute_compensation_shard(job);
+            }
+        });
+        dense.join();
+        rc.join();
+        if (!check(dense_status.ok() && rc_status.ok(), "random branch delay status") ||
+            !check(finalize_stripe(job).ok(), "random branch delay finalize") ||
+            !check(finish_execution(execution).ok(), "random branch delay finish")) {
+            return false;
+        }
+    }
+    std::puts("PASS edge: dense-first=yes rc-first=yes random-delays=100 duplicate-finalize=invalid_state");
+    return true;
+}
+
 bool test_staged_contract_errors() {
     using namespace ggml::gemmini;
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
@@ -1200,6 +1281,7 @@ int main(int argc, char ** argv) {
         test_explicit_exsia_channel_rejection() &&
         test_malformed_route_contract_rejected() &&
         test_bounded_pipeline_slots_and_reuse() &&
+        test_independent_branch_lifecycle() &&
         test_live_pipeline_worker() && test_compensation_shard_output_is_bitwise_stable() &&
         test_live_worker_parallel_compensation_is_bitwise_stable() &&
         test_pipeline_cancellation() &&
