@@ -1430,6 +1430,8 @@ bool test_group_k_csc_production_dispatch() {
         const auto result = ggml::gemmini::quants::dec::compensate_activation_dec(
             outliers, args, "test");
         set_dec_group_k_csc_enable(nullptr);
+        const double rows_per_active_k_mean = default_result.unique_k_count == 0 ? 0.0 :
+            static_cast<double>(default_result.active_row_k_pairs) / default_result.unique_k_count;
         std::vector<float> expected(rows * cols);
         for (size_t row = 0; row < rows; ++row)
             for (size_t j = 0; j < cols; ++j)
@@ -1441,7 +1443,7 @@ bool test_group_k_csc_production_dispatch() {
             static_cast<double>(result.logical_weight_reference_count) /
                 result.weight_scalar_load_count;
         std::printf(
-            "dispatch dense default=%s default_plan_bytes=%zu default_vector_loads=%zu default_output_equal=%s enabled=%s plan_bytes=%zu nr=%zu vector_loads=%zu reuse=%.1f output_equal=%s\n",
+            "dispatch dense default=%s default_plan_bytes=%zu default_vector_loads=%zu default_output_equal=%s enabled=%s plan_bytes=%zu nr=%zu vector_loads=%zu reuse=%.1f rows_per_active_k_mean=%.1f output_equal=%s\n",
             default_result.group_k_csc_plan_bytes == 0 ? "row-direct" : "group-k-csc",
             default_result.group_k_csc_plan_bytes,
             default_result.weight_vector_load_count,
@@ -1451,16 +1453,18 @@ bool test_group_k_csc_production_dispatch() {
             cols < 8 ? size_t {4} : size_t {8},
             result.weight_vector_load_count,
             reuse,
+            rows_per_active_k_mean,
             output_equal ? "yes" : "no");
         ok = check(default_result.group_k_csc_plan_bytes == 0 &&
                        default_result.weight_vector_load_count == 0 &&
+                       rows_per_active_k_mean == 4.0 &&
                        default_output_equal &&
                        result.group_k_csc_plan_bytes > 0 &&
                        result.logical_weight_reference_count == rows * cols &&
                        result.weight_scalar_load_count == cols &&
                        result.weight_vector_load_count == 1 && reuse == 4.0 && output_equal,
-                   cols < 8 ? "dense high-reuse opt-in dispatch selects GroupKCSC NR4" :
-                              "dense high-reuse opt-in dispatch selects GroupKCSC NR8") && ok;
+                   cols < 8 ? "dense small-reuse default stays row-direct and ENABLE selects GroupKCSC NR4" :
+                              "dense small-reuse default stays row-direct and ENABLE selects GroupKCSC NR8") && ok;
     }
 
     return ok;
@@ -1816,17 +1820,16 @@ bool test_fixed_residual_replay_high_reuse() {
     ScopedDecGroupKCscEnv env_guard;
     set_dec_group_k_csc_force(nullptr);
     set_dec_group_k_csc_enable(nullptr);
+    set_dec_group_k_csc_disable(nullptr);
+    const auto default_result = ggml::gemmini::quants::dec::compensate_activation_dec(
+        outliers, args, "test");
+    const std::vector<float> default_output = output;
+    std::fill(output.begin(), output.end(), 0.0f);
     set_dec_group_k_csc_disable("1");
     const auto row_direct_result = ggml::gemmini::quants::dec::compensate_activation_dec(
         outliers, args, "test");
     const std::vector<float> row_direct_output = output;
-    std::fill(output.begin(), output.end(), 0.0f);
     set_dec_group_k_csc_disable(nullptr);
-    set_dec_group_k_csc_enable("1");
-    const auto enabled_result = ggml::gemmini::quants::dec::compensate_activation_dec(
-        outliers, args, "test");
-    const std::vector<float> enabled_output = output;
-    set_dec_group_k_csc_enable(nullptr);
 
     std::vector<float> current_row_grouped(rows * cols, 0.0f);
     ggml::gemmini::quants::dec::accumulate_to_ycom_int64_scalar(
@@ -1848,38 +1851,40 @@ bool test_fixed_residual_replay_high_reuse() {
     const double row_direct_reuse = row_direct_result.weight_scalar_load_count == 0 ? 0.0 :
         static_cast<double>(row_direct_result.logical_weight_reference_count) /
             static_cast<double>(row_direct_result.weight_scalar_load_count);
-    const double enabled_reuse = enabled_result.weight_scalar_load_count == 0 ? 0.0 :
-        static_cast<double>(enabled_result.logical_weight_reference_count) /
-            static_cast<double>(enabled_result.weight_scalar_load_count);
+    const double default_reuse = default_result.weight_scalar_load_count == 0 ? 0.0 :
+        static_cast<double>(default_result.logical_weight_reference_count) /
+            static_cast<double>(default_result.weight_scalar_load_count);
     const double nr4_reuse = group_k_csc_nr4_stats.weight_scalar_load_count == 0 ? 0.0 :
         static_cast<double>(group_k_csc_nr4_stats.logical_weight_reference_count) /
             static_cast<double>(group_k_csc_nr4_stats.weight_scalar_load_count);
     const double nr8_reuse = group_k_csc_nr8_stats.weight_scalar_load_count == 0 ? 0.0 :
         static_cast<double>(group_k_csc_nr8_stats.logical_weight_reference_count) /
             static_cast<double>(group_k_csc_nr8_stats.weight_scalar_load_count);
+    const double rows_per_active_k_mean = default_result.unique_k_count == 0 ? 0.0 :
+        static_cast<double>(default_result.active_row_k_pairs) / default_result.unique_k_count;
 
     bool ok = check(group_k_csc_ready && scalar_route_plan.valid,
                     "high-reuse replay prepares row-direct and GroupKCSC plans");
-    ok = check(row_direct_result.group_k_csc_plan_bytes == 0 &&
-                   row_direct_result.total_selected == outliers.size() &&
-                   row_direct_result.nnz == outliers.size() &&
-                   row_direct_result.unique_k_count == active_k_count &&
-                   row_direct_result.logical_weight_reference_count == expected_logical_refs &&
+    ok = check(default_result.group_k_csc_plan_bytes > 0 &&
+                   default_result.total_selected == outliers.size() &&
+                   default_result.nnz == outliers.size() &&
+                   default_result.unique_k_count == active_k_count &&
+                   default_result.logical_weight_reference_count == expected_logical_refs &&
+                   default_result.weight_scalar_load_count == active_k_count * cols &&
+                   default_result.weight_vector_load_count == group_k_csc_nr8_stats.weight_vector_load_count &&
+                   default_result.active_row_k_pairs == expected_row_groups &&
+                   default_result.rows_per_active_k_max == rows &&
+                   rows_per_active_k_mean == static_cast<double>(rows) &&
+                   row_direct_result.group_k_csc_plan_bytes == 0 &&
                    row_direct_result.weight_scalar_load_count == expected_logical_refs &&
                    row_direct_result.weight_vector_load_count == 0 &&
                    row_direct_result.active_row_k_pairs == expected_row_groups &&
                    row_direct_result.rows_per_active_k_max == rows &&
-                   enabled_result.group_k_csc_plan_bytes > 0 &&
-                   enabled_result.logical_weight_reference_count == expected_logical_refs &&
-                   enabled_result.weight_scalar_load_count == active_k_count * cols &&
-                   enabled_result.weight_vector_load_count > 0 &&
-                   enabled_result.active_row_k_pairs == expected_row_groups &&
-                   enabled_result.rows_per_active_k_max == rows &&
-                   row_direct_reuse == 1.0 && enabled_reuse == static_cast<double>(rows),
-               "high-reuse replay route/load counters reflect dense row reuse") && ok;
+                   row_direct_reuse == 1.0 && default_reuse == static_cast<double>(rows),
+               "high-reuse replay default dispatch selects GroupKCSC NR8 and disable stays row-direct") && ok;
     ok = check(group_k_csc_nr4_accumulated && group_k_csc_nr8_accumulated &&
-                   byte_identical(row_direct_output, enabled_output) &&
-                   byte_identical(row_direct_output, current_row_grouped) &&
+                   byte_identical(row_direct_output, default_output) &&
+                   byte_identical(default_output, current_row_grouped) &&
                    byte_identical(current_row_grouped, group_k_csc_nr4) &&
                    byte_identical(current_row_grouped, group_k_csc_nr8),
                "high-reuse replay preserves bitwise output across RowDirect and GroupKCSC NR4/NR8") && ok;
@@ -1904,18 +1909,19 @@ bool test_fixed_residual_replay_high_reuse() {
                "high-reuse replay NR4/NR8 counters stay all-safe") && ok;
 
     std::printf(
-        "high-reuse dispatch rows=%zu cols=%zu depth=%zu disable_route=%s enable_route=%s logical_refs=%zu disable_scalar_loads=%zu disable_vector_loads=%zu disable_reuse=%.1f enable_scalar_loads=%zu enable_vector_loads=%zu enable_reuse=%.1f rows_per_active_k=%zu\n",
+        "high-reuse dispatch rows=%zu cols=%zu depth=%zu disable_route=%s default_route=%s logical_refs=%zu disable_scalar_loads=%zu disable_vector_loads=%zu disable_reuse=%.1f default_scalar_loads=%zu default_vector_loads=%zu default_reuse=%.1f rows_per_active_k_mean=%.1f output_equal=%s\n",
         rows, cols, depth,
         row_direct_result.group_k_csc_plan_bytes == 0 ? "row-direct" : "group-k-csc",
-        enabled_result.group_k_csc_plan_bytes == 0 ? "row-direct" : "group-k-csc",
+        default_result.group_k_csc_plan_bytes == 0 ? "row-direct" : "group-k-csc",
         row_direct_result.logical_weight_reference_count,
         row_direct_result.weight_scalar_load_count,
         row_direct_result.weight_vector_load_count,
         row_direct_reuse,
-        enabled_result.weight_scalar_load_count,
-        enabled_result.weight_vector_load_count,
-        enabled_reuse,
-        enabled_result.rows_per_active_k_max);
+        default_result.weight_scalar_load_count,
+        default_result.weight_vector_load_count,
+        default_reuse,
+        rows_per_active_k_mean,
+        byte_identical(row_direct_output, default_output) ? "yes" : "no");
     std::printf(
         "high-reuse group_k_csc_nr4 logical_refs=%zu scalar_loads=%zu vector_loads=%zu reuse=%.1f\n",
         group_k_csc_nr4_stats.logical_weight_reference_count,

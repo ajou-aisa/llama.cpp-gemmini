@@ -77,6 +77,29 @@ namespace
             std::numeric_limits<size_t>::max() : lhs * rhs;
     }
 
+    size_t estimate_group_k_csc_plan_bytes(size_t group_count, size_t entry_count, size_t active_row_group_count)
+    {
+        size_t bytes = 0;
+        const size_t group_column_offset_count =
+            saturating_mul_size(group_count, kDecGroupSizeK + 1);
+        bytes = saturating_add_size(
+            bytes, saturating_mul_size(group_column_offset_count, sizeof(uint32_t)));
+        bytes = saturating_add_size(bytes, saturating_mul_size(entry_count, sizeof(uint32_t)));
+        bytes = saturating_add_size(
+            bytes, saturating_mul_size(saturating_add_size(group_count, 1), sizeof(uint32_t)));
+        bytes = saturating_add_size(
+            bytes, saturating_mul_size(active_row_group_count, sizeof(uint32_t)));
+        return bytes;
+    }
+
+    size_t estimate_group_k_csc_saved_weight_bytes(
+        size_t logical_weight_reference_count, size_t unique_k_count, size_t J)
+    {
+        const size_t grouped_weight_bytes = saturating_mul_size(unique_k_count, J);
+        return logical_weight_reference_count > grouped_weight_bytes ?
+            logical_weight_reference_count - grouped_weight_bytes : 0;
+    }
+
     void log_dec_reject(const char *layer, const char *reason, const ggml_gemmini_args_t &args)
     {
 #if LOG_DEBUG
@@ -505,14 +528,28 @@ ActivationDECResult compensate_activation_dec(
     const char *force_group_k_csc = std::getenv("DEC_GROUP_K_CSC_FORCE");
     const bool group_k_csc_forced = force_group_k_csc &&
         force_group_k_csc[0] == '1' && force_group_k_csc[1] == '\0';
-    bool use_group_k_csc = !group_k_csc_disabled && use_int64_scalar && (group_k_csc_forced ||
-        (group_k_csc_enabled &&
-        (I > 1 && J >= 4 && result.active_row_k_pairs / result.unique_k_count >= 4)));
+    const size_t group_count = K / kDecGroupSizeK + (K % kDecGroupSizeK != 0);
+    result.int_mac_count = saturating_mul_size(result.nnz, J);
+    result.logical_weight_reference_count = result.int_mac_count;
+    result.weight_scalar_load_count = result.int_mac_count;
+    result.estimated_weight_bytes_read = saturating_mul_size(
+        result.weight_scalar_load_count, sizeof(int8_t));
+    const double rows_per_active_k_mean = result.unique_k_count == 0 ? 0.0 :
+        static_cast<double>(result.active_row_k_pairs) / result.unique_k_count;
+    const size_t estimated_group_k_csc_plan_bytes = estimate_group_k_csc_plan_bytes(
+        group_count, scr.residual_entries.size(), scr.active_row_groups.size());
+    const size_t estimated_group_k_csc_saved_weight_bytes = estimate_group_k_csc_saved_weight_bytes(
+        result.logical_weight_reference_count, result.unique_k_count, J);
+    const bool group_k_csc_common = use_int64_scalar &&
+        I > 1 &&
+        J >= 8 &&
+        rows_per_active_k_mean >= 16.0 &&
+        estimated_group_k_csc_saved_weight_bytes > estimated_group_k_csc_plan_bytes;
+    bool use_group_k_csc = !group_k_csc_disabled && use_int64_scalar &&
+        (group_k_csc_forced || group_k_csc_enabled || group_k_csc_common);
     const size_t group_k_csc_nr = J < 8 ? 4 : 8;
 
     start = ggml::gemmini::cycle::read();
-
-    const size_t group_count = K / kDecGroupSizeK + (K % kDecGroupSizeK != 0);
     build_group_major_index(
         scr.active_row_groups, group_count, scr.group_offsets, scr.group_row_group_indices);
 
@@ -550,11 +587,6 @@ ActivationDECResult compensate_activation_dec(
         use_group_k_csc = accumulated;
     }
 
-    result.int_mac_count = saturating_mul_size(result.nnz, J);
-    result.logical_weight_reference_count = result.int_mac_count;
-    result.weight_scalar_load_count = result.int_mac_count;
-    result.estimated_weight_bytes_read = saturating_mul_size(
-        result.weight_scalar_load_count, sizeof(int8_t));
     if (use_group_k_csc)
     {
         result.logical_weight_reference_count = group_k_csc_stats.logical_weight_reference_count;
@@ -648,8 +680,6 @@ ActivationDECResult compensate_activation_dec(
             row_groups_per_group_max, scr.group_offsets[group + 1] - scr.group_offsets[group]);
     const double row_groups_per_group_mean = scr.active_groups_global.empty() ? 0.0 :
         static_cast<double>(scr.active_row_groups.size()) / scr.active_groups_global.size();
-    const double rows_per_active_k_mean = result.unique_k_count == 0 ? 0.0 :
-        static_cast<double>(result.active_row_k_pairs) / result.unique_k_count;
     const double weight_reuse_ratio = result.weight_scalar_load_count == 0 ? 0.0 :
         static_cast<double>(result.logical_weight_reference_count) / result.weight_scalar_load_count;
     ggml::gemmini::log::debug(
