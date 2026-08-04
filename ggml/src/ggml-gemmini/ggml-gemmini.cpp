@@ -1398,6 +1398,12 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         ggml::gemmini::MatmulOptions pipeline_options{};
         pipeline_options.mode = ggml::gemmini::MatmulInvocationMode::stripe_pipeline;
         pipeline_options.job_capacity = args.I;
+        pipeline_options.profiling = true;
+        if (const char *rc_shards = std::getenv("GEMMINI_RC_SHARDS")) {
+            const int requested_shards = std::atoi(rc_shards);
+            if (requested_shards > 0)
+                pipeline_options.rc_shards = static_cast<size_t>(requested_shards);
+        }
         pipeline_execution = std::make_unique<ggml::gemmini::MatmulExecution>(
             ggml::gemmini::prepare_execution(&args, pipeline_options));
         if (!pipeline_execution->status() || !pipeline_collector->start(*pipeline_execution)) {
@@ -1527,6 +1533,23 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 "[matmul.pipeline] execution status=%d message=%s",
                 static_cast<int>(execution_status.code), execution_status.message);
             return;
+        }
+        for (const auto & profile : pipeline_collector->profiles()) {
+            ggml::gemmini::log::debug(layer,
+                "[matmul.stripe] stripe_id=%zu row_begin=%zu row_end=%zu "
+                "la_cycles=%llu sf_cycles=%llu handoff_ns=%llu ws_ns=%llu "
+                "rc_prepare_ns=%llu rc_compute_ns=%llu rc_finalize_ns=%llu rc_shards=%zu",
+                profile.stripe_id,
+                profile.row_begin,
+                profile.row_end,
+                static_cast<unsigned long long>(profile.la_cycles),
+                static_cast<unsigned long long>(profile.sf_cycles),
+                static_cast<unsigned long long>(profile.handoff.nanoseconds),
+                static_cast<unsigned long long>(profile.ws.nanoseconds),
+                static_cast<unsigned long long>(profile.rc_prepare.nanoseconds),
+                static_cast<unsigned long long>(profile.rc_compute.nanoseconds),
+                static_cast<unsigned long long>(profile.rc_finalize.nanoseconds),
+                profile.rc_shards);
         }
     }
     // dst에는 gemmini 커널에서 dequantize한 결과가 들어옴 
