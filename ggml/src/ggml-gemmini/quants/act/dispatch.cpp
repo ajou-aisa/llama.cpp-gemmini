@@ -145,7 +145,7 @@ std::vector<float> activation_scales(const ggml_gemmini_args_t &args, size_t row
         }
 
         for (size_t row = 0; row < row_count; ++row) {
-            const size_t stripe_idx = row / rows_per_stripe;
+            const size_t stripe_idx = (args.activation_row_offset + row) / rows_per_stripe;
             const int16_t theta = meta->resolve_stripe_theta(static_cast<int>(stripe_idx));
             scales[row] = theta == invalid_theta ? 1.0f : std::ldexp(1.0f, theta);
         }
