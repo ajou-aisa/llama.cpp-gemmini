@@ -285,6 +285,7 @@ bool test_live_pipeline_worker() {
     if (!check(sink->on_ready(sink->user_data, { 0, 0, 2, nullptr, 0 }), "live worker capture") ||
         !check(sink->on_ready(sink->user_data, { 1, 2, 3, nullptr, 0 }), "live worker tail capture") ||
         !check(collector.finish().ok(), "live worker finish") ||
+        !check(collector.profiles().size() == 2, "live worker stripe profiles") ||
         !check(finish_execution(execution).ok(), "live worker execution finish")) {
         return false;
     }

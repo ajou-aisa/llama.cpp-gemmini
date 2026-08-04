@@ -145,6 +145,21 @@ struct MatmulStatus {
     explicit operator bool() const { return ok(); }
 };
 
+struct MatmulStageMetrics {
+    uint64_t nanoseconds = 0;
+    size_t count = 0;
+};
+
+struct MatmulJobMetrics {
+    MatmulStageMetrics la;
+    MatmulStageMetrics sf;
+    MatmulStageMetrics handoff;
+    MatmulStageMetrics ws;
+    MatmulStageMetrics rc_prepare;
+    MatmulStageMetrics rc_compute;
+    MatmulStageMetrics rc_finalize;
+};
+
 class MatmulExecution;
 
 class MatmulStripeCollector {
@@ -155,6 +170,7 @@ public:
     MatmulStatus finish();
     const quants::act::exsia::StripeReadySink * sink() const;
     const MatmulStatus & status() const;
+    const std::vector<MatmulJobMetrics> & profiles() const;
     const quants::QactOutlier & captured_outlier(size_t stripe, size_t outlier) const;
 
 private:
@@ -176,6 +192,7 @@ private:
     std::deque<CapturedStripe> pending_;
     size_t capacity_;
     std::vector<CapturedStripe> stripes_;
+    std::vector<MatmulJobMetrics> profiles_;
     MatmulStatus status_;
     quants::act::exsia::StripeReadySink sink_;
 };
@@ -195,21 +212,6 @@ struct MatmulOptions {
     bool profiling = false;
     bool force = false;
     size_t job_capacity = 4;
-};
-
-struct MatmulStageMetrics {
-    uint64_t nanoseconds = 0;
-    size_t count = 0;
-};
-
-struct MatmulJobMetrics {
-    MatmulStageMetrics la;
-    MatmulStageMetrics sf;
-    MatmulStageMetrics handoff;
-    MatmulStageMetrics ws;
-    MatmulStageMetrics rc_prepare;
-    MatmulStageMetrics rc_compute;
-    MatmulStageMetrics rc_finalize;
 };
 
 class MatmulStripeInput {

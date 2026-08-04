@@ -465,6 +465,10 @@ void MatmulStripeCollector::worker_loop() {
         if (status) status = execute_dense_stripe(job);
         if (status) status = execute_compensation_shard(job);
         if (status) status = finalize_stripe(job);
+        if (status) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            profiles_.push_back(job.metrics());
+        }
         if (!status) {
             std::lock_guard<std::mutex> lock(mutex_);
             status_ = status;
@@ -482,6 +486,10 @@ const quants::act::exsia::StripeReadySink * MatmulStripeCollector::sink() const 
 
 const MatmulStatus & MatmulStripeCollector::status() const {
     return status_;
+}
+
+const std::vector<MatmulJobMetrics> & MatmulStripeCollector::profiles() const {
+    return profiles_;
 }
 
 const quants::QactOutlier & MatmulStripeCollector::captured_outlier(size_t stripe, size_t outlier) const {
