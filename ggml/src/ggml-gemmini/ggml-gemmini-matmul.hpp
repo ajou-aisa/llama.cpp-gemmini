@@ -3,6 +3,7 @@
 #include "ggml-gemmini-args.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace ggml::gemmini {
@@ -13,6 +14,7 @@ enum class MatMulStatus {
     malformed_stripe,
     duplicate_stripe,
     overlapping_stripe,
+    missing_stripes,
     unsupported,
     invalid_state,
     invalid_arguments,
@@ -61,43 +63,75 @@ private:
     friend MatmulStatus execute_compensation_shard(MatmulStripeJob &);
 
     ggml_gemmini_args_t args_;
-    std::vector<MatMulStripe> stripes_;
+    size_t first_row_ = 0;
+    size_t last_row_begin_ = 0;
+    size_t last_row_end_ = 0;
+    size_t covered_rows_ = 0;
+    bool has_stripes_ = false;
     MatMulState state_ = MatMulState::idle;
 };
 
 enum class MatmulStatusCode {
     success,
-    empty_stripes,
-    malformed_stripe,
-    duplicate_stripe,
-    overlapping_stripe,
-    unsupported,
+    invalid_argument,
+    invalid_contract,
+    unsupported_route,
+    unsupported_backend,
+    unsupported_invocation,
     invalid_state,
-    invalid_arguments,
+    out_of_memory,
+    execution_failure,
+    cancelled,
 };
 
 struct MatmulStatus {
     MatmulStatusCode code = MatmulStatusCode::success;
+    const char * message = "success";
     MatMulCapability capability = MatMulCapability::supported;
 
-    explicit operator bool() const {
+    bool ok() const {
         return code == MatmulStatusCode::success;
     }
+
+    explicit operator bool() const { return ok(); }
 };
 
 enum class MatmulInvocationMode {
     full,
     stripe_sequential,
+    stripe_pipeline,
 };
 
 struct MatmulOptions {
     MatmulInvocationMode mode = MatmulInvocationMode::full;
     size_t stripe_rows = 0;
+    size_t dense_threads = 0;
+    size_t rc_shards = 0;
+    bool validation = false;
+    bool profiling = false;
+    bool force = false;
+    size_t job_capacity = 4;
+};
+
+struct MatmulStageMetrics {
+    uint64_t nanoseconds = 0;
+    size_t count = 0;
+};
+
+struct MatmulJobMetrics {
+    MatmulStageMetrics la;
+    MatmulStageMetrics sf;
+    MatmulStageMetrics handoff;
+    MatmulStageMetrics ws;
+    MatmulStageMetrics rc_prepare;
+    MatmulStageMetrics rc_compute;
+    MatmulStageMetrics rc_finalize;
 };
 
 class MatmulStripeInput {
 public:
-    MatmulStripeInput(size_t row_begin, size_t row_end);
+    MatmulStripeInput(size_t row_begin, size_t row_end, size_t stripe_id = 0,
+                      const int32_t * residual = nullptr, size_t residual_count = 0);
     MatmulStripeInput(const MatmulStripeInput &) = delete;
     MatmulStripeInput & operator=(const MatmulStripeInput &) = delete;
     MatmulStripeInput(MatmulStripeInput &&) noexcept = default;
@@ -105,10 +139,16 @@ public:
 
     size_t row_begin() const;
     size_t row_end() const;
+    size_t stripe_id() const;
+    const int32_t * residual() const;
+    size_t residual_count() const;
 
 private:
     size_t row_begin_;
     size_t row_end_;
+    size_t stripe_id_;
+    const int32_t * residual_;
+    size_t residual_count_;
 };
 
 class MatmulExecution {
@@ -128,24 +168,35 @@ private:
     friend MatmulStatus prepare_compensation(MatmulStripeJob &);
     friend MatmulStatus execute_dense_stripe(MatmulStripeJob &);
     friend MatmulStatus execute_compensation_shard(MatmulStripeJob &);
+    friend MatmulStatus finalize_stripe(MatmulStripeJob &);
     friend class MatmulStripeJob;
     friend MatmulStatus finish_execution(MatmulExecution &);
 
     MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options);
 
+    size_t total_rows_;
     MatMul facade_;
     MatmulOptions options_;
     MatmulStatus status_;
+    size_t active_jobs_ = 0;
+    size_t captured_rows_ = 0;
+    size_t finalized_rows_ = 0;
+    size_t first_row_ = 0;
+    size_t last_row_begin_ = 0;
+    size_t last_row_end_ = 0;
+    bool has_captures_ = false;
 };
 
 class MatmulStripeJob {
 public:
     MatmulStripeJob(const MatmulStripeJob &) = delete;
     MatmulStripeJob & operator=(const MatmulStripeJob &) = delete;
-    MatmulStripeJob(MatmulStripeJob &&) noexcept = default;
-    MatmulStripeJob & operator=(MatmulStripeJob &&) noexcept = default;
+    MatmulStripeJob(MatmulStripeJob && other) noexcept;
+    MatmulStripeJob & operator=(MatmulStripeJob && other) noexcept;
+    ~MatmulStripeJob();
 
     const MatmulStatus & status() const;
+    const MatmulJobMetrics & metrics() const;
 
 private:
     friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput);
@@ -155,18 +206,22 @@ private:
     friend MatmulStatus finalize_stripe(MatmulStripeJob &);
 
     MatmulStripeJob(MatmulExecution * execution, MatmulStripeInput input, MatmulStatus status);
+    void release_slot();
 
     enum class State {
         captured,
+        compensation_prepared,
         dense_complete,
+        compensation_complete,
         finalized,
     };
 
     MatmulExecution * execution_;
     MatmulStripeInput input_;
     MatmulStatus status_;
+    MatmulJobMetrics metrics_;
     std::vector<quants::QactOutlier> compensation_outliers_;
-    bool compensation_prepared_ = false;
+    bool owns_slot_ = false;
     State state_ = State::captured;
 };
 
