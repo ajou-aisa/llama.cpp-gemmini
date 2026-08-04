@@ -6,6 +6,8 @@
 #include <vector>
 #include <string>
 #include <new>
+#include <cstdlib>
+#include <string_view>
 
 #include <limits>
 
@@ -920,6 +922,11 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     ggml_gemmini_args_t args; // DEC과 gemmini 호출을 위한 args 
     std::vector<int8_t> q8_channel_dense;
     std::vector<float> q8_channel_scales;
+    std::unique_ptr<ggml::gemmini::MatmulStripeCollector> pipeline_collector;
+    const bool pipeline_requested = [] {
+        const char *value = std::getenv("GEMMINI_MATMUL_INVOCATION");
+        return value != nullptr && std::string_view(value) == "stripe-pipeline";
+    }();
 
     // set args
     start = ggml::gemmini::cycle::read();
@@ -956,6 +963,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     int8_t *qx = activation_q.data();
 
     args.A = reinterpret_cast<elem_t *>(qx);
+    if (pipeline_requested) {
+        pipeline_collector = std::make_unique<ggml::gemmini::MatmulStripeCollector>(args.I);
+        args.exsia_stripe_ready_sink = pipeline_collector->sink();
+    }
     ggml::gemmini::log::debug(
         ggml::gemmini::types::to_string(args.layer_type),
         "[" GGML_GEMMINI_ACTIVATION_QUANT_NAME "] final cfg model_arch=%s",
@@ -972,6 +983,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     end = ggml::gemmini::cycle::read();
     ggml::gemmini::log::cycle(layer, "cpu.Quantize activation", start, end);
     if (!quantize_ok) {
+        if (pipeline_collector && !pipeline_collector->status()) {
+            ggml::gemmini::log::debug(layer, "[matmul.pipeline] capture status=%d message=%s",
+                static_cast<int>(pipeline_collector->status().code), pipeline_collector->status().message);
+        }
         ggml::gemmini::log::debug(layer, "activation quantize failed");
         return;
     }
@@ -1375,6 +1390,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     //                  layer, (void *)args.f_out, args.stride_f_out, args.col_stride_f_out);
 
     /* __ 5. Gemmini baseline/IM2P dispatch __ */
+    if (!pipeline_requested) {
         if constexpr (ggml::gemmini::config::CURRENT_COMPUTE_TYPE == ggml::gemmini::config::ComputeType::INT) {
             constexpr auto baseline_activation_quant =
                 ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA
@@ -1459,9 +1475,19 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 }
             }
     }
+    }
+    if (pipeline_requested) {
+        const auto pipeline_status = ggml::gemmini::execute_post_fold_pipeline(args, *pipeline_collector);
+        ggml::gemmini::log::debug(layer,
+            "[matmul.pipeline] mode=post-fold-staged status=%d message=%s",
+            static_cast<int>(pipeline_status.code), pipeline_status.message);
+        if (!pipeline_status) {
+            return;
+        }
+    }
     // dst에는 gemmini 커널에서 dequantize한 결과가 들어옴 
-
 #if ERROR_COMPENSATION
+    if (!pipeline_requested) {
     uint64_t start_dec = ggml::gemmini::cycle::read();
     auto outliers = ggml::gemmini::quants::activation_outliers(args);
     uint64_t end_dec = ggml::gemmini::cycle::read();
@@ -1477,6 +1503,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                          dec_result.total_selected,
                          dec_result.nnz,
                          dec_result.unique_k_count);
+    }
     }
 #endif
 }

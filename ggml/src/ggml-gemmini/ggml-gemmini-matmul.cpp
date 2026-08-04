@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <new>
 #include <utility>
 
 namespace ggml::gemmini {
@@ -57,7 +58,7 @@ void execute_dense(ggml_gemmini_args_t &args) {
     }
 }
 
-MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe) {
+MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe, size_t stripe_id) {
     const size_t input_stride = args.sA ? args.sA : args.K;
     const size_t output_stride = args.stride_f_out ? args.stride_f_out : args.J;
     size_t input_offset = 0;
@@ -70,6 +71,13 @@ MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe) {
     args.I = stripe.row_end - stripe.row_begin;
     args.A += input_offset;
     args.f_out += output_offset;
+
+    if (auto * meta = std::get_if<quants::act::exsia::Meta>(&args.act_quant.storage())) {
+        if (stripe_id >= meta->theta.size()) {
+            return MatMulStatus::invalid_arguments;
+        }
+        args.activation_row_offset += stripe.row_begin;
+    }
 
     execute_dense(args);
     return MatMulStatus::success;
@@ -189,6 +197,10 @@ MatMulStatus MatMul::begin_stripes() {
 }
 
 MatMulStatus MatMul::run_stripe(MatMulStripe stripe) {
+    return run_stripe(stripe, 0);
+}
+
+MatMulStatus MatMul::run_stripe(MatMulStripe stripe, size_t stripe_id) {
     if (state_ != MatMulState::accepting_stripes) {
         return MatMulStatus::invalid_state;
     }
@@ -205,7 +217,7 @@ MatMulStatus MatMul::run_stripe(MatMulStripe stripe) {
         }
     }
 
-    const MatMulStatus status = execute_stripe(args_, stripe);
+    const MatMulStatus status = execute_stripe(args_, stripe, stripe_id);
     if (status == MatMulStatus::success) {
         if (!has_stripes_) {
             first_row_ = stripe.row_begin;
@@ -239,7 +251,8 @@ MatMulCapability MatMul::stripe_capability(const ggml_gemmini_args_t & args) {
     if (format == ggml_gemmini_args_t::im2p_weight_format_t::q8_h2 ||
         format == ggml_gemmini_args_t::im2p_weight_format_t::q8_hp2 ||
         args.transpose_A || (args.D != nullptr && !args.repeating_bias) ||
-        !row_invariant_activation(args)) {
+        (!row_invariant_activation(args) &&
+         !std::holds_alternative<quants::act::exsia::Meta>(args.act_quant.storage()))) {
         return MatMulCapability::unsupported;
     }
     if (uses_baseline_channel_route(args) &&
@@ -300,14 +313,64 @@ const MatmulStatus & MatmulExecution::status() const {
     return status_;
 }
 
+MatmulStripeCollector::MatmulStripeCollector(size_t capacity)
+    : capacity_(capacity), sink_{this, &MatmulStripeCollector::on_ready} {
+    if (capacity == 0) {
+        status_ = make_status(MatmulStatusCode::invalid_argument, "collector capacity must be nonzero");
+    }
+}
+
+const quants::act::exsia::StripeReadySink * MatmulStripeCollector::sink() const {
+    return &sink_;
+}
+
+const MatmulStatus & MatmulStripeCollector::status() const {
+    return status_;
+}
+
+const quants::QactOutlier & MatmulStripeCollector::captured_outlier(size_t stripe, size_t outlier) const {
+    return stripes_.at(stripe).outliers.at(outlier);
+}
+
+bool MatmulStripeCollector::on_ready(
+        void * user_data, const quants::act::exsia::StripeReadyEvent & event) {
+    auto & collector = *static_cast<MatmulStripeCollector *>(user_data);
+    if (!collector.status_) {
+        return false;
+    }
+    if (event.row_begin >= event.row_end ||
+        ((event.outliers == nullptr) != (event.outlier_count == 0))) {
+        collector.status_ = make_status(MatmulStatusCode::invalid_argument, "invalid stripe event");
+        return false;
+    }
+    if (collector.stripes_.size() >= collector.capacity_) {
+        collector.status_ = make_status(MatmulStatusCode::out_of_memory, "collector capacity exhausted");
+        return false;
+    }
+    try {
+        std::vector<quants::QactOutlier> outliers;
+        if (event.outlier_count != 0) {
+            outliers.assign(event.outliers, event.outliers + event.outlier_count);
+        }
+        collector.stripes_.push_back(
+            {event.stripe_id, event.row_begin, event.row_end, std::move(outliers)});
+    } catch (const std::bad_alloc &) {
+        collector.status_ = make_status(MatmulStatusCode::out_of_memory, "stripe capture allocation failed");
+        return false;
+    }
+    return true;
+}
+
 MatmulStripeJob::MatmulStripeJob(
-        MatmulExecution * execution, MatmulStripeInput input, MatmulStatus status)
-    : execution_(execution), input_(std::move(input)), status_(status) {}
+        MatmulExecution * execution, MatmulStripeInput input, MatmulStatus status,
+        std::vector<quants::QactOutlier> outliers)
+    : execution_(execution), input_(std::move(input)), status_(status),
+      compensation_outliers_(std::move(outliers)), has_captured_outliers_(true) {}
 
 MatmulStripeJob::MatmulStripeJob(MatmulStripeJob && other) noexcept
     : execution_(other.execution_), input_(std::move(other.input_)), status_(other.status_),
       metrics_(other.metrics_), compensation_outliers_(std::move(other.compensation_outliers_)),
-      owns_slot_(other.owns_slot_), state_(other.state_) {
+      has_captured_outliers_(other.has_captured_outliers_), owns_slot_(other.owns_slot_), state_(other.state_) {
     other.execution_ = nullptr;
     other.owns_slot_ = false;
 }
@@ -320,6 +383,7 @@ MatmulStripeJob & MatmulStripeJob::operator=(MatmulStripeJob && other) noexcept 
         status_ = other.status_;
         metrics_ = other.metrics_;
         compensation_outliers_ = std::move(other.compensation_outliers_);
+        has_captured_outliers_ = other.has_captured_outliers_;
         owns_slot_ = other.owns_slot_;
         state_ = other.state_;
         other.execution_ = nullptr;
@@ -363,6 +427,13 @@ MatmulStatus execute_full(MatmulExecution & execution) {
 }
 
 MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput input) {
+    MatmulStripeJob job = capture_stripe(execution, std::move(input), {});
+    job.has_captured_outliers_ = false;
+    return job;
+}
+
+MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput input,
+                               std::vector<quants::QactOutlier> outliers) {
     const auto start = Clock::now();
     MatmulStatus status{};
     if (!execution.status_.ok()) {
@@ -383,7 +454,7 @@ MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput in
         status = invalid_contract("overlapping stripe");
     }
 
-    MatmulStripeJob job(&execution, std::move(input), status);
+    MatmulStripeJob job(&execution, std::move(input), status, std::move(outliers));
     if (status.ok()) {
         if (!execution.has_captures_) {
             execution.first_row_ = job.input_.row_begin();
@@ -407,13 +478,16 @@ MatmulStatus prepare_compensation(MatmulStripeJob & job) {
     const auto start = Clock::now();
     const auto & args = job.execution_->facade_.args_;
     const auto & storage = args.act_quant.storage();
-    if (!std::holds_alternative<quants::act::NoneMeta>(storage) &&
+    if (!job.has_captured_outliers_ &&
+        !std::holds_alternative<quants::act::NoneMeta>(storage) &&
         !std::holds_alternative<quants::act::tensor::Meta>(storage)) {
         job.status_ = unsupported_backend("compensation preparation is unsupported by backend");
         job.execution_->status_ = job.status_;
         return job.status_;
     }
-    job.compensation_outliers_ = quants::activation_outliers(args);
+    if (!job.has_captured_outliers_) {
+        job.compensation_outliers_ = quants::activation_outliers(args);
+    }
     job.state_ = MatmulStripeJob::State::compensation_prepared;
     job.status_ = {};
     record_metric(job.metrics_.rc_prepare, job.execution_->options_.profiling, start);
@@ -427,7 +501,7 @@ MatmulStatus execute_dense_stripe(MatmulStripeJob & job) {
     }
     const auto start = Clock::now();
     const MatMulStatus status = job.execution_->facade_.run_stripe(
-        { job.input_.row_begin(), job.input_.row_end() });
+        { job.input_.row_begin(), job.input_.row_end() }, job.input_.stripe_id());
     job.status_ = to_public_status(
         status, status == MatMulStatus::unsupported ? MatMulCapability::unsupported : MatMulCapability::supported);
     job.execution_->status_ = job.status_;
@@ -444,9 +518,34 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job) {
         return job.status_;
     }
     const auto start = Clock::now();
-    const auto status = quants::dec::compensate_activation_dec_rows(
-        job.compensation_outliers_, job.execution_->facade_.args_,
-        job.input_.row_begin(), job.input_.row_end(), "ggml-gemmini-matmul");
+    auto status = quants::dec::ActivationDECRowSliceStatus::success;
+    if (job.has_captured_outliers_) {
+        auto local_args = job.execution_->facade_.args_;
+        const size_t row_begin = job.input_.row_begin();
+        const size_t input_stride = local_args.sA ? local_args.sA : local_args.K;
+        const size_t output_stride = local_args.stride_f_out ? local_args.stride_f_out : local_args.J;
+        local_args.I = job.input_.row_end() - row_begin;
+        local_args.A += row_begin * input_stride;
+        local_args.f_out += row_begin * output_stride;
+        local_args.activation_row_offset += row_begin;
+        if (auto * meta = std::get_if<quants::act::exsia::Meta>(&local_args.act_quant.storage())) {
+            const size_t stripe_id = job.input_.stripe_id();
+            if (stripe_id >= meta->theta.size()) {
+                job.status_ = make_status(MatmulStatusCode::invalid_argument, "invalid activation stripe id");
+                job.execution_->status_ = job.status_;
+                return job.status_;
+            }
+        }
+        std::vector<quants::QactOutlier> local_outliers = job.compensation_outliers_;
+        for (auto & outlier : local_outliers) {
+            outlier.row -= static_cast<int>(row_begin);
+        }
+        quants::dec::compensate_activation_dec(local_outliers, local_args, "ggml-gemmini-matmul");
+    } else {
+        status = quants::dec::compensate_activation_dec_rows(
+            job.compensation_outliers_, job.execution_->facade_.args_,
+            job.input_.row_begin(), job.input_.row_end(), "ggml-gemmini-matmul");
+    }
     if (status == quants::dec::ActivationDECRowSliceStatus::unsupported) {
         job.status_ = unsupported_backend("compensation execution is unsupported by backend");
     } else if (status == quants::dec::ActivationDECRowSliceStatus::invalid_arguments) {
@@ -530,6 +629,34 @@ MatmulStatus matmul(const ggml_gemmini_args_t & args, MatmulOptions options) {
             return status;
         }
         row_begin = row_end;
+    }
+    return finish_execution(execution);
+}
+
+MatmulStatus execute_post_fold_pipeline(
+        const ggml_gemmini_args_t & args, MatmulStripeCollector & collector) {
+    if (!collector.status_) {
+        return collector.status_;
+    }
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_pipeline;
+    options.job_capacity = 1;
+    MatmulExecution execution = prepare_execution(args, options);
+    if (!execution.status()) {
+        return execution.status();
+    }
+    for (auto & captured : collector.stripes_) {
+        MatmulStripeJob job = capture_stripe(
+            execution,
+            MatmulStripeInput(captured.row_begin, captured.row_end, captured.stripe_id),
+            std::move(captured.outliers));
+        MatmulStatus status = prepare_compensation(job);
+        if (status) status = execute_dense_stripe(job);
+        if (status) status = execute_compensation_shard(job);
+        if (status) status = finalize_stripe(job);
+        if (!status) {
+            return status;
+        }
     }
     return finish_execution(execution);
 }

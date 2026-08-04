@@ -50,7 +50,7 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
     {
         auto &meta = args.act_quant.storage().emplace<exsia::Meta>();
         exsia::ExSIA exsia;
-        if (!exsia.run(meta, src, args)) {
+        if (!exsia.run(meta, src, args, args.exsia_stripe_ready_sink)) {
             reset_quantize_failure(args);
             return false;
         }
@@ -158,12 +158,13 @@ std::vector<float> activation_scales(const ggml_gemmini_args_t &args, size_t row
     }
 
     if (const auto *meta = std::get_if<token::Meta>(&storage)) {
-        if (meta->scales.size() != args.I) {
-            GGML_ASSERT(false && "TOKEN activation scale cardinality must equal args.I");
+        if (args.activation_row_offset > meta->scales.size() ||
+            args.I > meta->scales.size() - args.activation_row_offset) {
+            GGML_ASSERT(false && "TOKEN activation scale cardinality does not cover requested rows");
         }
-        const size_t count = std::min(row_count, meta->scales.size());
+        const size_t count = std::min(row_count, args.I);
         for (size_t row = 0; row < count; ++row) {
-            const float scale = meta->scales[row];
+            const float scale = meta->scales[args.activation_row_offset + row];
             scales[row] = std::isfinite(scale) && scale > 0.0f ? scale : 1.0f;
         }
     }
@@ -189,7 +190,7 @@ std::vector<float> activation_scales(const ggml_gemmini_args_t &args, size_t row
         }
 
         for (size_t row = 0; row < row_count; ++row) {
-            const size_t stripe_idx = row / rows_per_stripe;
+            const size_t stripe_idx = (args.activation_row_offset + row) / rows_per_stripe;
             const float scale = stripe_idx < meta->scales.size() ? meta->scales[stripe_idx] : 1.0f;
             scales[row] = std::isfinite(scale) && scale > 0.0f ? scale : 1.0f;
         }

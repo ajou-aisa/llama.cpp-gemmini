@@ -20,6 +20,10 @@ namespace ggml::gemmini::types {
 enum class LayerType : uint8_t;
 }
 
+namespace ggml::gemmini::quants::act::exsia {
+struct StripeReadySink;
+}
+
 #include <ggml.h>
 #ifndef GGML_COMMON_DECL
 #define GGML_GEMMINI_ARGS_DEFINE_GGML_COMMON
@@ -85,6 +89,8 @@ typedef struct ggml_gemmini_args_t {
     size_t sC = 0;
     size_t sD = 0;
 
+    size_t activation_row_offset = 0;
+
     // scales, gemmini input val.
     scale_t scale_B = 1.f;
     scale_acc_t scale_D = 1;
@@ -101,6 +107,7 @@ typedef struct ggml_gemmini_args_t {
 
     // activation quantization metadata
     act::Meta act_quant{};
+    const ggml::gemmini::quants::act::exsia::StripeReadySink *exsia_stripe_ready_sink = nullptr;
 
     //for weight checking   
     uint8_t weightA = 0;

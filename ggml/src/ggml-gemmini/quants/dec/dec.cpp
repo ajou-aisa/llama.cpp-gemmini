@@ -887,7 +887,8 @@ ActivationDECRowSliceStatus compensate_activation_dec_rows(
 {
     const auto &storage = args.act_quant.storage();
     if (!std::holds_alternative<act::NoneMeta>(storage) &&
-        !std::holds_alternative<act::tensor::Meta>(storage)) {
+        !std::holds_alternative<act::tensor::Meta>(storage) &&
+        !std::holds_alternative<act::exsia::Meta>(storage)) {
         return ActivationDECRowSliceStatus::unsupported;
     }
     if (row_begin >= row_end || row_end > args.I || args.A == nullptr || args.f_out == nullptr) {
@@ -917,6 +918,7 @@ ActivationDECRowSliceStatus compensate_activation_dec_rows(
     local_args.I = row_end - row_begin;
     local_args.A += row_begin * input_stride;
     local_args.f_out += row_begin * output_stride;
+    local_args.activation_row_offset += row_begin;
     compensate_activation_dec(local_outliers, local_args, layer);
     return ActivationDECRowSliceStatus::success;
 }

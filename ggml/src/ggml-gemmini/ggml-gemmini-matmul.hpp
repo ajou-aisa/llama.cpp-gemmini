@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml-gemmini-args.h"
+#include "quants/act/exsia/exsia.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -62,6 +63,9 @@ public:
 private:
     friend MatmulStatus prepare_compensation(MatmulStripeJob &);
     friend MatmulStatus execute_compensation_shard(MatmulStripeJob &);
+    friend MatmulStatus execute_dense_stripe(MatmulStripeJob &);
+
+    MatMulStatus run_stripe(MatMulStripe stripe, size_t stripe_id);
 
     ggml_gemmini_args_t args_;
     size_t first_row_ = 0;
@@ -95,6 +99,28 @@ struct MatmulStatus {
     }
 
     explicit operator bool() const { return ok(); }
+};
+
+class MatmulStripeCollector {
+public:
+    explicit MatmulStripeCollector(size_t capacity);
+    const quants::act::exsia::StripeReadySink * sink() const;
+    const MatmulStatus & status() const;
+    const quants::QactOutlier & captured_outlier(size_t stripe, size_t outlier) const;
+
+private:
+    struct CapturedStripe {
+        size_t stripe_id;
+        size_t row_begin;
+        size_t row_end;
+        std::vector<quants::QactOutlier> outliers;
+    };
+    static bool on_ready(void *, const quants::act::exsia::StripeReadyEvent &);
+    friend MatmulStatus execute_post_fold_pipeline(const ggml_gemmini_args_t &, MatmulStripeCollector &);
+    size_t capacity_;
+    std::vector<CapturedStripe> stripes_;
+    MatmulStatus status_;
+    quants::act::exsia::StripeReadySink sink_;
 };
 
 enum class MatmulInvocationMode {
@@ -166,6 +192,7 @@ private:
     friend MatmulExecution prepare_execution(const ggml_gemmini_args_t &, MatmulOptions);
     friend MatmulStatus execute_full(MatmulExecution &);
     friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput);
+    friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput, std::vector<quants::QactOutlier>);
     friend MatmulStatus prepare_compensation(MatmulStripeJob &);
     friend MatmulStatus execute_dense_stripe(MatmulStripeJob &);
     friend MatmulStatus execute_compensation_shard(MatmulStripeJob &);
@@ -201,12 +228,14 @@ public:
 
 private:
     friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput);
+    friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput, std::vector<quants::QactOutlier>);
     friend MatmulStatus prepare_compensation(MatmulStripeJob &);
     friend MatmulStatus execute_dense_stripe(MatmulStripeJob &);
     friend MatmulStatus execute_compensation_shard(MatmulStripeJob &);
     friend MatmulStatus finalize_stripe(MatmulStripeJob &);
 
-    MatmulStripeJob(MatmulExecution * execution, MatmulStripeInput input, MatmulStatus status);
+    MatmulStripeJob(MatmulExecution * execution, MatmulStripeInput input, MatmulStatus status,
+                    std::vector<quants::QactOutlier> outliers = {});
     void release_slot();
 
     enum class State {
@@ -222,6 +251,7 @@ private:
     MatmulStatus status_;
     MatmulJobMetrics metrics_;
     std::vector<quants::QactOutlier> compensation_outliers_;
+    bool has_captured_outliers_ = false;
     bool owns_slot_ = false;
     State state_ = State::captured;
 };
@@ -229,11 +259,14 @@ private:
 MatmulExecution prepare_execution(const ggml_gemmini_args_t & args, MatmulOptions options = {});
 MatmulStatus execute_full(MatmulExecution & execution);
 MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput input);
+MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput input,
+                               std::vector<quants::QactOutlier> outliers);
 MatmulStatus prepare_compensation(MatmulStripeJob & job);
 MatmulStatus execute_dense_stripe(MatmulStripeJob & job);
 MatmulStatus execute_compensation_shard(MatmulStripeJob & job);
 MatmulStatus finalize_stripe(MatmulStripeJob & job);
 MatmulStatus finish_execution(MatmulExecution & execution);
 MatmulStatus matmul(const ggml_gemmini_args_t & args, MatmulOptions options = {});
+MatmulStatus execute_post_fold_pipeline(const ggml_gemmini_args_t & args, MatmulStripeCollector & collector);
 
 }
