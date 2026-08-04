@@ -727,6 +727,27 @@ ActivationDECResult compensate_activation_dec(
         result.unique_k_count,
         j_tiles,
         dec_threads);
+    if (use_group_k_csc)
+    {
+        const char *width_path = group_k_csc_stats.width_path == GroupKCSCWidthPath::AllInt32 ?
+            "all-int32" : group_k_csc_stats.width_path == GroupKCSCWidthPath::AllInt64 ?
+            "all-int64" : "mixed";
+        ggml::gemmini::log::debug(
+            layer,
+            "[dec.group-k-csc] width_path=%s classify=%zu scratch_init=%zu sparse_update=%zu merge=%zu safe_updates=%zu fallback_updates=%zu branch_entry_classify=%zu classify_cycles=%llu scratch_init_cycles=%llu sparse_update_cycles=%llu merge_cycles=%llu",
+            width_path,
+            group_k_csc_stats.classification_work_count,
+            group_k_csc_stats.scratch_init_count,
+            group_k_csc_stats.sparse_update_count,
+            group_k_csc_stats.merge_count,
+            group_k_csc_stats.safe_update_count,
+            group_k_csc_stats.fallback_update_count,
+            group_k_csc_stats.branch_entry_classification_count,
+            static_cast<unsigned long long>(group_k_csc_stats.classification_cycles),
+            static_cast<unsigned long long>(group_k_csc_stats.scratch_init_cycles),
+            static_cast<unsigned long long>(group_k_csc_stats.sparse_update_cycles),
+            static_cast<unsigned long long>(group_k_csc_stats.merge_cycles));
+    }
 #endif
 
     if (!use_group_k_csc)
