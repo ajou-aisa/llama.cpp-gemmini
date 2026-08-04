@@ -949,6 +949,9 @@ ActivationDECRowSliceStatus compensate_activation_dec_rows_columns(
 
     const size_t width = col_end - col_begin;
     ggml_gemmini_args_t local_args = args;
+    const size_t global_rows_per_tile = args.tile_I != 0 ? args.tile_I * DIM :
+        ((args.I + DIM - 1) / DIM) * DIM;
+    local_args.tile_I = global_rows_per_tile / DIM;
     local_args.I = row_end - row_begin;
     local_args.J = width;
     local_args.A += row_begin * input_stride;
