@@ -713,6 +713,12 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options
         state_ = MatmulExecutionState::failed;
         return;
     }
+    if (options_.mode == MatmulInvocationMode::stripe_pipeline && total_rows_ <= 1) {
+        status_ = make_status(MatmulStatusCode::unsupported_invocation,
+                              "stripe pipeline requires more than one row");
+        state_ = MatmulExecutionState::failed;
+        return;
+    }
     const bool defer_pipeline_route_validation =
         options_.mode == MatmulInvocationMode::stripe_pipeline &&
         std::holds_alternative<quants::act::NoneMeta>(facade_.args().act_quant.storage());
@@ -765,6 +771,12 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions optio
         quants::dec::DispatchOverride::automatic;
     if (options_.mode != MatmulInvocationMode::full && options_.job_capacity == 0) {
         status_ = make_status(MatmulStatusCode::invalid_argument, "job capacity must be nonzero");
+        state_ = MatmulExecutionState::failed;
+        return;
+    }
+    if (options_.mode == MatmulInvocationMode::stripe_pipeline && total_rows_ <= 1) {
+        status_ = make_status(MatmulStatusCode::unsupported_invocation,
+                              "stripe pipeline requires more than one row");
         state_ = MatmulExecutionState::failed;
         return;
     }

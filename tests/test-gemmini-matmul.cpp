@@ -974,6 +974,15 @@ bool test_staged_contract_errors() {
     const bool passed = run_staged_job(tail) &&
         check(finish_execution(contract_execution).code == MatmulStatusCode::invalid_contract,
               "missing stripe at finish") &&
+        check(prepare_execution(
+                  [&] {
+                      auto single_row = make_args(activation, weights, output);
+                      single_row.I = 1;
+                      return single_row;
+                  }(),
+                  { MatmulInvocationMode::stripe_pipeline }).status().code ==
+                  MatmulStatusCode::unsupported_invocation,
+              "single-row pipeline rejected") &&
         check(matmul(make_args(activation, weights, output),
                      { MatmulInvocationMode::stripe_pipeline }).code ==
                   MatmulStatusCode::unsupported_invocation,
