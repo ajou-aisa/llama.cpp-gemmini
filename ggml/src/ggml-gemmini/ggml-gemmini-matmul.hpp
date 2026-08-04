@@ -84,6 +84,7 @@ struct MatMulResult {
 
 class MatmulStripeJob;
 class MatmulExecution;
+class MatmulStripeInput;
 struct MatmulStatus;
 MatmulStatus prepare_compensation(MatmulStripeJob &);
 MatmulStatus execute_compensation_shard(MatmulStripeJob &);
@@ -113,11 +114,14 @@ private:
     friend MatmulStatus execute_full(MatmulExecution &);
     friend MatmulStatus finish_execution(MatmulExecution &);
     friend MatmulStatus prepare_compensation(MatmulStripeJob &);
+    friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput);
+    friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput, std::vector<quants::QactOutlier>);
     friend MatmulStatus execute_compensation_shard(MatmulStripeJob &);
     friend MatmulStatus execute_compensation_shard(MatmulStripeJob &, size_t, size_t);
     friend MatmulStatus execute_dense_stripe(MatmulStripeJob &);
 
     MatMulStatus run_stripe(MatMulStripe stripe, size_t stripe_id);
+    MatMulStatus run_staged_stripe(MatMulStripe stripe, size_t stripe_id);
     MatMulResult run_full(quants::dec::DispatchOverride dispatch_override);
 
     ggml_gemmini_args_t & args();
@@ -331,6 +335,8 @@ private:
     size_t last_row_begin_ = 0;
     size_t last_row_end_ = 0;
     bool has_captures_ = false;
+    std::unique_ptr<MatMul> staged_facade_;
+    bool staged_metadata_active_ = false;
 };
 
 class MatmulStripeJob {
@@ -374,6 +380,7 @@ private:
     MatmulJobMetrics metrics_;
     std::vector<int32_t> staged_residual_;
     std::vector<quants::QactOutlier> compensation_outliers_;
+    std::unique_ptr<quants::act::Meta> staged_activation_meta_;
     bool has_captured_outliers_ = false;
     bool owns_slot_ = false;
     size_t expected_shards_ = 1;

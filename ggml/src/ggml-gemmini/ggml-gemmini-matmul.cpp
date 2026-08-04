@@ -131,6 +131,38 @@ bool slice_activation_metadata(ggml_gemmini_args_t & args, size_t row_begin, siz
     return true;
 }
 
+bool snapshot_exsia_metadata(const ggml_gemmini_args_t & args, size_t row_begin, size_t row_end,
+                             const std::vector<quants::QactOutlier> & outliers,
+                             quants::act::Meta & snapshot) {
+    const auto * source = std::get_if<quants::act::exsia::Meta>(&args.act_quant.storage());
+    if (source == nullptr || row_begin >= row_end) {
+        return false;
+    }
+    const size_t rows_per_tile = args.tile_I == 0 ? args.I : args.tile_I * DIM;
+    if (rows_per_tile == 0 || row_end > std::numeric_limits<size_t>::max() - (rows_per_tile - 1)) {
+        return false;
+    }
+    const size_t first_tile = row_begin / rows_per_tile;
+    const size_t last_tile = (row_end + rows_per_tile - 1) / rows_per_tile;
+    if (last_tile > source->theta.size()) {
+        return false;
+    }
+    quants::act::exsia::Meta local;
+    local.e_s = source->e_s;
+    local.rho = source->rho;
+    local.sigma = source->sigma;
+    local.theta.assign(source->theta.begin() + first_tile, source->theta.begin() + last_tile);
+    local.outliers.reserve(outliers.size());
+    for (const auto & outlier : outliers) {
+        if (outlier.row >= 0 && static_cast<size_t>(outlier.row) >= row_begin &&
+            static_cast<size_t>(outlier.row) < row_end) {
+            local.outliers.push_back({outlier.row - static_cast<int>(row_begin), outlier.col, outlier.residual});
+        }
+    }
+    snapshot.storage_ = std::move(local);
+    return true;
+}
+
 baseline_activation_quant_t baseline_activation_for(const ggml_gemmini_args_t & args) {
     const auto & storage = args.act_quant.storage();
     if (std::holds_alternative<quants::act::tensor::Meta>(storage)) {
@@ -165,7 +197,8 @@ void execute_dense(ggml_gemmini_args_t &args) {
     }
 }
 
-MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe, size_t stripe_id) {
+MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe, size_t stripe_id,
+                            bool metadata_is_local = false) {
     const size_t input_stride = args.sA ? args.sA : args.K;
     const size_t output_stride = args.stride_f_out ? args.stride_f_out : args.J;
     size_t input_offset = 0;
@@ -178,7 +211,7 @@ MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe, size_
     if (args.tile_I == 0 || args.tile_J == 0 || args.tile_K == 0) {
         gemmini_set_tile_ws(&args);
     }
-    if (!slice_activation_metadata(args, stripe.row_begin, stripe.row_end)) {
+    if (!metadata_is_local && !slice_activation_metadata(args, stripe.row_begin, stripe.row_end)) {
         return MatMulStatus::invalid_arguments;
     }
 
@@ -555,6 +588,26 @@ MatMulStatus MatMul::run_stripe(MatMulStripe stripe, size_t stripe_id) {
     return status;
 }
 
+MatMulStatus MatMul::run_staged_stripe(MatMulStripe stripe, size_t stripe_id) {
+    if (state_ != MatMulState::accepting_stripes) {
+        return MatMulStatus::invalid_state;
+    }
+    if (stripe.row_begin >= stripe.row_end || stripe.row_end > args().I) {
+        return MatMulStatus::malformed_stripe;
+    }
+    const MatMulStatus status = execute_stripe(args(), stripe, stripe_id, true);
+    if (status == MatMulStatus::success) {
+        if (!has_stripes_) {
+            first_row_ = stripe.row_begin;
+        }
+        last_row_begin_ = stripe.row_begin;
+        last_row_end_ = stripe.row_end;
+        covered_rows_ += stripe.row_end - stripe.row_begin;
+        has_stripes_ = true;
+    }
+    return status;
+}
+
 MatMulStatus MatMul::finish_stripes() {
     if (state_ != MatMulState::accepting_stripes) {
         return MatMulStatus::invalid_state;
@@ -633,6 +686,11 @@ size_t MatmulStripeInput::outlier_count() const {
 MatmulExecution::MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options)
     : total_rows_(args.I), facade_(std::move(args)), options_(options) {
     state_ = MatmulExecutionState::prepared;
+    if (options_.mode == MatmulInvocationMode::stripe_pipeline) {
+        ggml_gemmini_args_t staged_args = facade_.args();
+        staged_args.act_quant.reset();
+        staged_facade_ = std::make_unique<MatMul>(std::move(staged_args));
+    }
     if (options_.dense_threads > 1) {
         status_ = make_status(MatmulStatusCode::unsupported_invocation,
                               "dense stripe execution has one owner lane");
@@ -682,6 +740,11 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions optio
         status_ = make_status(MatmulStatusCode::invalid_argument, "null execution args");
         state_ = MatmulExecutionState::failed;
         return;
+    }
+    if (options_.mode == MatmulInvocationMode::stripe_pipeline) {
+        ggml_gemmini_args_t staged_args = *args;
+        staged_args.act_quant.reset();
+        staged_facade_ = std::make_unique<MatMul>(std::move(staged_args));
     }
     if (options_.dense_threads > 1) {
         status_ = make_status(MatmulStatusCode::unsupported_invocation,
@@ -1002,6 +1065,7 @@ MatmulStripeJob::MatmulStripeJob(MatmulStripeJob && other) noexcept
     : execution_(other.execution_), input_(std::move(other.input_)), status_(other.status_),
       metrics_(other.metrics_), staged_residual_(std::move(other.staged_residual_)),
       compensation_outliers_(std::move(other.compensation_outliers_)),
+      staged_activation_meta_(std::move(other.staged_activation_meta_)),
       has_captured_outliers_(other.has_captured_outliers_), owns_slot_(other.owns_slot_),
       expected_shards_(other.expected_shards_), completed_shards_(other.completed_shards_),
       parallel_shards_(other.parallel_shards_), shard_mutex_(std::move(other.shard_mutex_)),
@@ -1019,6 +1083,7 @@ MatmulStripeJob & MatmulStripeJob::operator=(MatmulStripeJob && other) noexcept 
         metrics_ = other.metrics_;
         staged_residual_ = std::move(other.staged_residual_);
         compensation_outliers_ = std::move(other.compensation_outliers_);
+        staged_activation_meta_ = std::move(other.staged_activation_meta_);
         has_captured_outliers_ = other.has_captured_outliers_;
         owns_slot_ = other.owns_slot_;
         expected_shards_ = other.expected_shards_;
@@ -1136,6 +1201,22 @@ MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput in
 
     MatmulStripeJob job(&execution, std::move(input), status, std::move(outliers));
     if (status.ok()) {
+        if (execution.options_.mode == MatmulInvocationMode::stripe_pipeline) {
+            if (std::holds_alternative<quants::act::exsia::Meta>(
+                    execution.facade_.args().act_quant.storage())) {
+                job.staged_activation_meta_ = std::make_unique<quants::act::Meta>();
+                if (!snapshot_exsia_metadata(
+                        execution.facade_.args(), job.input_.row_begin(), job.input_.row_end(),
+                        job.compensation_outliers_, *job.staged_activation_meta_)) {
+                    job.status_ = make_status(MatmulStatusCode::invalid_contract,
+                                              "pipeline stripe metadata is not ready");
+                } else {
+                    execution.staged_metadata_active_ = true;
+                }
+            }
+        }
+    }
+    if (job.status_.ok()) {
         if (!execution.has_captures_) {
             execution.first_row_ = job.input_.row_begin();
         }
@@ -1195,8 +1276,29 @@ MatmulStatus execute_dense_stripe(MatmulStripeJob & job) {
         return job.status_;
     }
     const auto start = Clock::now();
-    const MatMulStatus status = job.execution_->facade_.run_stripe(
-        { job.input_.row_begin(), job.input_.row_end() }, job.input_.stripe_id());
+    MatMul * dense_facade = &job.execution_->facade_;
+    if (job.execution_->staged_metadata_active_ && job.execution_->staged_facade_ != nullptr &&
+        job.staged_activation_meta_ != nullptr) {
+        dense_facade = job.execution_->staged_facade_.get();
+        if (dense_facade->state() == MatMulState::idle) {
+            const MatMulStatus begin_status = dense_facade->begin_stripes();
+            if (begin_status != MatMulStatus::success) {
+                job.status_ = to_public_status(
+                    begin_status,
+                    begin_status == MatMulStatus::unsupported ? MatMulCapability::unsupported :
+                        MatMulCapability::supported);
+                return job.status_;
+            }
+        }
+        if (job.staged_activation_meta_ != nullptr) {
+            dense_facade->args().act_quant = *job.staged_activation_meta_;
+        }
+    }
+    const MatMulStatus status = job.staged_activation_meta_ != nullptr ?
+        dense_facade->run_staged_stripe(
+            { job.input_.row_begin(), job.input_.row_end() }, job.input_.stripe_id()) :
+        dense_facade->run_stripe(
+            { job.input_.row_begin(), job.input_.row_end() }, job.input_.stripe_id());
     job.status_ = to_public_status(
         status, status == MatMulStatus::unsupported ? MatMulCapability::unsupported : MatMulCapability::supported,
         &job.execution_->facade_.args());
@@ -1315,7 +1417,9 @@ MatmulStatus finish_execution(MatmulExecution & execution) {
         execution.state_ = MatmulExecutionState::running;
         return invalid_contract("missing stripes");
     }
-    const MatMulStatus status = execution.facade_.finish_stripes();
+    MatMul * dense_facade = execution.staged_metadata_active_ && execution.staged_facade_ != nullptr ?
+        execution.staged_facade_.get() : &execution.facade_;
+    const MatMulStatus status = dense_facade->finish_stripes();
     execution.status_ = to_public_status(status, MatMulCapability::supported);
     if (execution.status_ && execution.options_.validation &&
         !finite_output(execution.facade_.args())) {
