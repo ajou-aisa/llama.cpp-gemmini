@@ -1067,8 +1067,11 @@ bool test_pipeline_cancellation() {
     }
     const auto cancel_status = collector.cancel();
     const auto finish_status = collector.finish();
+    const auto execution_finish_status = finish_execution(execution);
     return check(cancel_status.code == MatmulStatusCode::cancelled, "pipeline cancellation status") &&
         check(finish_status.code == MatmulStatusCode::cancelled, "pipeline cancellation finish") &&
+        check(execution_finish_status.code == MatmulStatusCode::cancelled,
+              "pipeline cancellation execution finish") &&
         check(execution.state() == MatmulExecutionState::failed, "pipeline cancellation execution state");
 }
 

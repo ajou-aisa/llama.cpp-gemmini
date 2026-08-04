@@ -1430,6 +1430,10 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
 
 MatmulStatus finish_execution(MatmulExecution & execution) {
     std::lock_guard<std::mutex> state_lock(*execution.state_mutex_);
+    if (!execution.status_.ok()) {
+        execution.state_ = MatmulExecutionState::failed;
+        return execution.status_;
+    }
     if (execution.options_.mode == MatmulInvocationMode::full) {
         return execution.facade_.state() == MatMulState::completed ? execution.status_ : invalid_state();
     }
