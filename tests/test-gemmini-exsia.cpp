@@ -582,13 +582,26 @@ bool run_reference_exsia(Meta &meta,
                                      stripe_block_exp[stripe_idx], cycle_sample)) {
                 return false;
             }
+            for (size_t i = 0; i < BLOCK_SIZE; ++i) {
+                const size_t col = block * BLOCK_SIZE + i;
+                if (col < args.K && block_mask.is_set(i)) {
+                    stripe.outlier_mask.set(stripe.local_row(row), col);
+                }
+            }
         }
     }
 
     int8_t *dst = reinterpret_cast<int8_t *>(args.A);
     for (size_t s = 0; s < num_stripes; ++s) {
+        StripeState &stripe = state.stripe[s];
+        stripe.e1 = std::numeric_limits<int16_t>::min();
+        stripe.e2 = std::numeric_limits<int16_t>::min();
+        ExpScanner reducer;
+        for (const int16_t exponent : stripe_block_exp[s]) {
+            reducer.update_stripe_top2_exp(stripe, exponent);
+        }
         std::vector<ggml::gemmini::quants::act::ggml_gemmini_qact_outlier> stripe_outliers;
-        if (!folding.run(meta, state, state.stripe[s], args, s, dst,
+        if (!folding.run(meta, state, stripe, args, s, dst,
                          stripe_q_wide[s], stripe_block_exp[s], state.residual, stripe_outliers)) {
             return false;
         }
