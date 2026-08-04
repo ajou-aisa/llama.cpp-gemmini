@@ -491,8 +491,12 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options
         state_ = MatmulExecutionState::failed;
         return;
     }
-    if (options_.mode == MatmulInvocationMode::stripe_sequential ||
-        options_.mode == MatmulInvocationMode::stripe_pipeline) {
+    const bool defer_pipeline_route_validation =
+        options_.mode == MatmulInvocationMode::stripe_pipeline &&
+        std::holds_alternative<quants::act::NoneMeta>(facade_.args().act_quant.storage());
+    if ((options_.mode == MatmulInvocationMode::stripe_sequential ||
+         options_.mode == MatmulInvocationMode::stripe_pipeline) &&
+        !defer_pipeline_route_validation) {
         const MatMulStatus status = facade_.begin_stripes();
         status_ = to_public_status(
             status, status == MatMulStatus::unsupported ? MatMulCapability::unsupported : MatMulCapability::supported);
@@ -525,8 +529,12 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions optio
         state_ = MatmulExecutionState::failed;
         return;
     }
-    if (options_.mode == MatmulInvocationMode::stripe_sequential ||
-        options_.mode == MatmulInvocationMode::stripe_pipeline) {
+    const bool defer_pipeline_route_validation =
+        options_.mode == MatmulInvocationMode::stripe_pipeline &&
+        std::holds_alternative<quants::act::NoneMeta>(facade_.args().act_quant.storage());
+    if ((options_.mode == MatmulInvocationMode::stripe_sequential ||
+         options_.mode == MatmulInvocationMode::stripe_pipeline) &&
+        !defer_pipeline_route_validation) {
         const MatMulStatus status = facade_.begin_stripes();
         status_ = to_public_status(
             status, status == MatMulStatus::unsupported ? MatMulCapability::unsupported : MatMulCapability::supported);
@@ -903,6 +911,15 @@ MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput in
         status = execution.status_;
     } else if (execution.options_.mode == MatmulInvocationMode::full) {
         status = make_status(MatmulStatusCode::unsupported_invocation, "stripe capture requires stripe mode");
+    } else if (execution.options_.mode == MatmulInvocationMode::stripe_pipeline &&
+               execution.facade_.state() == MatMulState::idle) {
+        const MatMulStatus begin_status = execution.facade_.begin_stripes();
+        if (begin_status != MatMulStatus::success) {
+            status = to_public_status(
+                begin_status,
+                begin_status == MatMulStatus::unsupported ? MatMulCapability::unsupported :
+                    MatMulCapability::supported);
+        }
     } else if (execution.facade_.state() != MatMulState::accepting_stripes) {
         status = invalid_state("execution is not accepting stripes");
     } else if (input.row_begin() >= input.row_end() || input.row_end() > execution.total_rows_ ||
