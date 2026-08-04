@@ -195,6 +195,29 @@ bool test_live_pipeline_multistripe_matches_full() {
         check(collector.profiles().size() == 2, "multistripe profile count");
 }
 
+bool test_block_activation_scale_compensation_parity() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> full_output(6, 0.0f);
+    std::vector<float> stripe_output(6, 0.0f);
+    auto full_args = make_args(activation, weights, full_output);
+    auto & full_meta = full_args.act_quant.storage().emplace<quants::act::block::Meta>();
+    full_meta.scales = { 0.5f, 1.25f, 2.0f };
+    full_meta.outliers = { { 0, 0, 4 }, { 1, 1, 3 }, { 2, 0, -2 } };
+    auto stripe_args = full_args;
+    stripe_args.f_out = stripe_output.data();
+
+    const auto full_result = MatMul(full_args).run_full();
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_sequential;
+    options.stripe_rows = 1;
+    const auto stripe_result = matmul(stripe_args, options);
+    return check(full_result.status == MatMulStatus::success, "BLOCK compensation full status") &&
+        check(stripe_result.ok(), "BLOCK compensation stripe status") &&
+        check(same_output(stripe_output, full_output), "BLOCK compensation scale differs");
+}
+
 bool test_native_and_channel_full_facade_parity() {
     constexpr size_t rows = 2;
     constexpr size_t columns = 2;
@@ -900,6 +923,7 @@ int main(int argc, char ** argv) {
             test_live_pipeline_multistripe_matches_full() &&
             test_native_and_channel_full_facade_parity() &&
             test_full_and_stripe_sequential_outputs_match() &&
+            test_block_activation_scale_compensation_parity() &&
             test_native_exsia_theta_row_slice_parity() &&
             test_empty_tail_and_malformed_stripe_status() &&
             test_duplicate_and_overlap_stripe_status() &&

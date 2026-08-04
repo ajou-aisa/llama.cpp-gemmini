@@ -169,6 +169,18 @@ std::vector<float> activation_scales(const ggml_gemmini_args_t &args, size_t row
         }
     }
 
+    if (const auto *meta = std::get_if<block::Meta>(&storage)) {
+        if (args.activation_row_offset > meta->scales.size() ||
+            args.I > meta->scales.size() - args.activation_row_offset) {
+            GGML_ASSERT(false && "BLOCK activation scale cardinality does not cover requested rows");
+        }
+        const size_t count = std::min(row_count, args.I);
+        for (size_t row = 0; row < count; ++row) {
+            const float scale = meta->scales[args.activation_row_offset + row];
+            scales[row] = std::isfinite(scale) && scale > 0.0f ? scale : 1.0f;
+        }
+    }
+
     if (const auto *meta = std::get_if<stripe::Meta>(&storage)) {
         size_t rows_per_stripe = args.I;
         if (args.tile_I > 0 && !checked_mul_size(args.tile_I, DIM, rows_per_stripe)) {

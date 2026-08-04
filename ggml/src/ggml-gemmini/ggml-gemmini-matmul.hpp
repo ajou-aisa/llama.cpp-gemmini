@@ -129,7 +129,7 @@ private:
     MatMulState state_ = MatMulState::idle;
 };
 
-enum class MatmulStatusCode {
+enum class MatmulStatusCode : uint8_t {
     success,
     invalid_argument,
     invalid_contract,
