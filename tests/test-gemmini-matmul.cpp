@@ -59,6 +59,23 @@ bool test_full_facade_status_and_output_match_legacy() {
         check(same_output(facade_output, legacy_output), "full facade output differs from legacy matmul");
 }
 
+bool test_full_and_stripe_sequential_outputs_match() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> full_output(6, 0.0f);
+    std::vector<float> stripe_output(6, 0.0f);
+    auto full_args = make_args(activation, weights, full_output);
+    auto stripe_args = make_args(activation, weights, stripe_output);
+    MatmulOptions stripe_options{};
+    stripe_options.mode = MatmulInvocationMode::stripe_sequential;
+    stripe_options.stripe_rows = 1;
+    stripe_options.rc_shards = 2;
+    return check(matmul(full_args).ok(), "full public matmul") &&
+        check(matmul(stripe_args, stripe_options).ok(), "stripe sequential public matmul") &&
+        check(same_output(full_output, stripe_output), "full and stripe sequential output differs");
+}
+
 bool test_empty_tail_and_malformed_stripe_status() {
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
@@ -422,6 +439,7 @@ int main(int argc, char ** argv) {
         return edge ? 0 : 1;
     }
     return edge && test_full_facade_status_and_output_match_legacy() &&
+            test_full_and_stripe_sequential_outputs_match() &&
             test_empty_tail_and_malformed_stripe_status() &&
             test_duplicate_and_overlap_stripe_status() &&
             test_h2_and_hp2_stripe_capability_is_explicitly_unsupported() &&
