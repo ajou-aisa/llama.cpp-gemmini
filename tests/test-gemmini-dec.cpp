@@ -201,6 +201,107 @@ bool test_active_row_groups() {
                  "empty residual plan has no active row-groups") && ok;
 }
 
+bool test_group_k_csc_plan() {
+    using ggml::gemmini::quants::dec::ActiveRowGroup;
+    using ggml::gemmini::quants::dec::GroupKCSCPlan;
+    using ggml::gemmini::quants::dec::ResidualGroupEntry;
+
+    std::vector<ResidualGroupEntry> entries = {
+        { 1, 35, 4 }, { 0, 33, 5 }, { 1, 2, 9 }, { 0, 31, 2 },
+        { 1, 32, -3 }, { 0, 2, 7 }, { 1, 35, -1 }, { 2, 64, 8 },
+        { 1, 64, 6 }, { 1, 33, -2 },
+    };
+    const auto shuffled_entries = entries;
+    std::vector<ActiveRowGroup> groups;
+    std::vector<size_t> group_offsets;
+    std::vector<size_t> group_row_group_indices;
+    ggml::gemmini::quants::dec::build_active_row_groups(entries, groups);
+    ggml::gemmini::quants::dec::build_group_major_index(
+        groups, 3, group_offsets, group_row_group_indices);
+
+    GroupKCSCPlan plan;
+    bool ok = check(ggml::gemmini::quants::dec::build_group_k_csc_plan(
+                        entries, groups, group_offsets, group_row_group_indices, 3, plan),
+                    "build group-K CSC plan");
+    const std::vector<uint32_t> expected_entry_order = { 0, 3, 1, 4, 2, 5, 6, 7, 8, 9 };
+    const std::vector<uint32_t> expected_active_row_offsets = { 0, 2, 4, 6 };
+    const std::vector<uint32_t> expected_active_rows = { 0, 1, 0, 1, 1, 2 };
+    ok = check(plan.group_size_k == 32 && plan.num_groups == 3 &&
+                   plan.column_offsets.size() == 3 * 33,
+               "group-K CSC dimensions and K tail") && ok;
+    ok = check(plan.entry_order == expected_entry_order,
+               "group-K CSC stable per-column entry order") && ok;
+    ok = check(plan.active_row_offsets == expected_active_row_offsets &&
+                   plan.active_rows == expected_active_rows,
+               "group-K CSC active rows") && ok;
+    ok = check(plan.column_offsets[2] == 0 && plan.column_offsets[3] == 2 &&
+                   plan.column_offsets[31] == 2 && plan.column_offsets[32] == 3 &&
+                   plan.column_offsets[33] == 3 && plan.column_offsets[34] == 4 &&
+                   plan.column_offsets[35] == 6 && plan.column_offsets[37] == 8 &&
+                   plan.column_offsets[65] == 8 && plan.column_offsets[66] == 8 &&
+                   plan.column_offsets[67] == 10 && plan.column_offsets[98] == 10,
+               "group-K CSC column offsets") && ok;
+    const size_t expected_plan_bytes =
+        (3 * 33 + entries.size() + 4 + 6) * sizeof(uint32_t);
+    ok = check(ggml::gemmini::quants::dec::group_k_csc_plan_logical_bytes(plan) ==
+                   expected_plan_bytes,
+               "group-K CSC logical bytes exclude fill cursors") && ok;
+
+    const auto canonical_entries = entries;
+    auto reordered_entries = shuffled_entries;
+    std::reverse(reordered_entries.begin(), reordered_entries.end());
+    std::vector<ActiveRowGroup> reordered_groups;
+    std::vector<size_t> reordered_group_offsets;
+    std::vector<size_t> reordered_group_row_group_indices;
+    ggml::gemmini::quants::dec::build_active_row_groups(reordered_entries, reordered_groups);
+    ggml::gemmini::quants::dec::build_group_major_index(
+        reordered_groups, 3, reordered_group_offsets, reordered_group_row_group_indices);
+    GroupKCSCPlan reordered_plan;
+    ok = check(ggml::gemmini::quants::dec::build_group_k_csc_plan(
+                        reordered_entries, reordered_groups, reordered_group_offsets,
+                        reordered_group_row_group_indices, 3, reordered_plan),
+                    "build shuffled group-K CSC plan") && ok;
+    bool same_entries = canonical_entries.size() == reordered_entries.size();
+    for (size_t index = 0; same_entries && index < canonical_entries.size(); ++index)
+        same_entries = canonical_entries[index].row == reordered_entries[index].row &&
+            canonical_entries[index].k == reordered_entries[index].k &&
+            canonical_entries[index].residual == reordered_entries[index].residual;
+    ok = check(same_entries,
+               "group-K CSC canonicalizes shuffled entries") && ok;
+    ok = check(reordered_plan.column_offsets == plan.column_offsets &&
+                   reordered_plan.entry_order == plan.entry_order &&
+                   reordered_plan.active_row_offsets == plan.active_row_offsets &&
+                   reordered_plan.active_rows == plan.active_rows &&
+                   ggml::gemmini::quants::dec::group_k_csc_plan_logical_bytes(reordered_plan) ==
+                       expected_plan_bytes,
+               "group-K CSC plan and bytes are deterministic") && ok;
+
+    const size_t column_capacity = plan.column_offsets.capacity();
+    const size_t entry_capacity = plan.entry_order.capacity();
+    const size_t active_row_capacity = plan.active_rows.capacity();
+    const size_t cursor_capacity = plan.fill_cursors.capacity();
+    std::vector<ResidualGroupEntry> empty_entries;
+    std::vector<ActiveRowGroup> empty_groups;
+    std::vector<size_t> empty_group_offsets;
+    std::vector<size_t> empty_group_row_group_indices;
+    ggml::gemmini::quants::dec::build_group_major_index(
+        empty_groups, 0, empty_group_offsets, empty_group_row_group_indices);
+    ok = check(ggml::gemmini::quants::dec::build_group_k_csc_plan(
+                        empty_entries, empty_groups, empty_group_offsets,
+                        empty_group_row_group_indices, 0, plan),
+                    "build empty group-K CSC plan") && ok;
+    return check(plan.num_groups == 0 && plan.column_offsets.empty() && plan.entry_order.empty() &&
+                     plan.active_row_offsets == std::vector<uint32_t>({ 0 }) &&
+                     plan.active_rows.empty() &&
+                     ggml::gemmini::quants::dec::group_k_csc_plan_logical_bytes(plan) ==
+                         sizeof(uint32_t) &&
+                     plan.column_offsets.capacity() >= column_capacity &&
+                     plan.entry_order.capacity() >= entry_capacity &&
+                     plan.active_rows.capacity() >= active_row_capacity &&
+                     plan.fill_cursors.capacity() >= cursor_capacity,
+                 "empty group-K CSC plan retains scratch capacity") && ok;
+}
+
 bool test_route_metadata_rejects() {
     std::array<block_q8_h1, 2> h1_blocks{};
     std::vector<int8_t> mixed_h1_weights(64, 1);
@@ -1170,6 +1271,9 @@ bool test_fixed_residual_replay_baseline() {
         (active_k_groups + 1) * sizeof(size_t) +
         active_row_groups * sizeof(size_t) +
         3 * sizeof(uint32_t) + active_k_groups * sizeof(uint32_t);
+    const size_t expected_group_k_csc_plan_bytes =
+        (active_k_groups * (ggml::gemmini::quants::dec::kDecGroupSizeK + 1) +
+         shuffled_outliers.size() + (active_k_groups + 1) + active_row_groups) * sizeof(uint32_t);
 
     bool ok = check(result.total_selected == shuffled_outliers.size() && result.nnz == shuffled_outliers.size() &&
                         result.unique_k_count == 3 && result.int_mac_count == 35 &&
@@ -1179,7 +1283,7 @@ bool test_fixed_residual_replay_baseline() {
                         result.active_row_k_pairs == 5 && result.rows_per_active_k_max == 2 &&
                         result.ycom_global_write_count == rows * cols &&
                         result.current_sparse_plan_bytes == expected_current_sparse_plan_bytes &&
-                        result.group_k_csc_plan_bytes == 0 &&
+                        result.group_k_csc_plan_bytes == expected_group_k_csc_plan_bytes &&
                         result.thread_scratch_bytes == rows * cols * sizeof(int64_t),
                     "fixed replay sparse baseline counters");
     for (size_t index = 0; index < output.size(); ++index)
@@ -1266,7 +1370,7 @@ bool test_inside_existing_openmp_region() {
 }
 
 int main() {
-    const bool ok = test_noop() && test_route_plan() && test_active_row_groups() && test_route_metadata_rejects() && test_repeated_residuals() && test_decode_repeated_residuals() && test_integer_routes() && test_block_integer_route() &&
+    const bool ok = test_noop() && test_route_plan() && test_active_row_groups() && test_group_k_csc_plan() && test_route_metadata_rejects() && test_repeated_residuals() && test_decode_repeated_residuals() && test_integer_routes() && test_block_integer_route() &&
         test_q8_h1_hierarchical_route() && test_q8_h1_preserves_ordered_scaling_bits() && test_q8_h1_activation_scale_routes_preserve_bits() && test_unpacked_h1_tail_routes_preserve_bits() && test_q8_h1_large_effective_scale() && test_q8_h2_hierarchical_route() && test_q8_hp1_hierarchical_route() && test_q8_hp2_hierarchical_route() &&
         test_malformed_hierarchical_reject() && test_output_strides() && test_sparse_grouped_tails() && test_malformed_reject() && test_thread_clamp() &&
         test_fixed_residual_replay_baseline() && test_thread_determinism() && test_inside_existing_openmp_region();

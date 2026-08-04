@@ -34,6 +34,7 @@ namespace
         std::vector<ActiveRowGroup> active_row_groups;
         std::vector<size_t> group_offsets;
         std::vector<size_t> group_row_group_indices;
+        GroupKCSCPlan group_k_csc_plan;
         std::vector<uint32_t> unique_k;
         std::vector<size_t> active_rows_per_k;
         std::vector<uint32_t> active_groups_global;
@@ -45,6 +46,7 @@ namespace
             active_row_groups.clear();
             group_offsets.clear();
             group_row_group_indices.clear();
+            group_k_csc_plan.clear();
             unique_k.clear();
             active_rows_per_k.clear();
             active_groups_global.clear();
@@ -382,6 +384,12 @@ ActivationDECResult compensate_activation_dec(
         return result;
     }
 
+    if (I > std::numeric_limits<uint32_t>::max() || K > std::numeric_limits<uint32_t>::max())
+    {
+        log_dec_reject(layer, "DEC residual dimensions exceed uint32", args);
+        return result;
+    }
+
     if (plan.weight_stride == 0)
     {
         log_dec_reject(layer, "zero weight stride", args);
@@ -464,6 +472,19 @@ ActivationDECResult compensate_activation_dec(
 
     start = ggml::gemmini::cycle::read();
 
+    if (!build_group_k_csc_plan(
+            scr.residual_entries, scr.active_row_groups, scr.group_offsets,
+            scr.group_row_group_indices, group_count, scr.group_k_csc_plan))
+    {
+        log_dec_reject(layer, "unable to represent group-K CSC plan", args);
+        return ActivationDECResult{};
+    }
+
+    end = ggml::gemmini::cycle::read();
+    ggml::gemmini::log::cycle(layer, "[dec] cpu.Build group-K CSC plan", start, end);
+
+    start = ggml::gemmini::cycle::read();
+
     const bool use_int64_scalar = plan.route == DecWeightRoute::Dense && plan.scales.scalar_mode;
     const bool use_int64_channel_direct = plan.route == DecWeightRoute::Q8ChannelDirect;
     const bool use_int64_channel_sidecar = plan.route == DecWeightRoute::Q8ChannelSidecar;
@@ -537,6 +558,7 @@ ActivationDECResult compensate_activation_dec(
         scr.unique_k.size(), sizeof(uint32_t)));
     result.current_sparse_plan_bytes = saturating_add_size(plan_bytes, saturating_mul_size(
         scr.active_groups_global.size(), sizeof(uint32_t)));
+    result.group_k_csc_plan_bytes = group_k_csc_plan_logical_bytes(scr.group_k_csc_plan);
     const size_t thread_accumulator_rows = whole_k_grouped ? I : 1;
     result.thread_scratch_bytes = saturating_mul_size(
         saturating_mul_size(thread_accumulator_rows, std::min(J, kDecInt64JTileWidth)),
