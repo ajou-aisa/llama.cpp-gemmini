@@ -340,6 +340,8 @@ private:
     bool owns_slot_ = false;
     size_t expected_shards_ = 1;
     size_t completed_shards_ = 0;
+    bool parallel_shards_ = false;
+    std::shared_ptr<std::mutex> shard_mutex_ = std::make_shared<std::mutex>();
     State state_ = State::captured;
 };
 

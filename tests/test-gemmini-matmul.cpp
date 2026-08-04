@@ -342,6 +342,36 @@ bool test_compensation_shard_output_is_bitwise_stable() {
         check(same_output(one, four), "compensation shard output differs");
 }
 
+bool run_live_worker_compensation(size_t shard_count, std::vector<float> & output) {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_pipeline;
+    options.job_capacity = 2;
+    options.rc_shards = shard_count;
+    auto execution = prepare_execution(make_args(activation, weights, output), options);
+    MatmulStripeCollector collector(2);
+    if (!execution.status().ok() || !collector.start(execution)) {
+        return false;
+    }
+    quants::QactOutlier outlier{ 0, 0, 2 };
+    const auto * sink = collector.sink();
+    const bool captured = sink->on_ready(
+        sink->user_data, { 0, 0, 3, &outlier, 1, 10, 20, 30, 50 });
+    return captured && collector.finish().ok() && finish_execution(execution).ok();
+}
+
+bool test_live_worker_parallel_compensation_is_bitwise_stable() {
+    std::vector<float> one(6, 0.0f);
+    std::vector<float> four(6, 0.0f);
+    const bool one_ok = run_live_worker_compensation(1, one);
+    const bool four_ok = run_live_worker_compensation(4, four);
+    return check(one_ok, "live single-shard compensation") &&
+        check(four_ok, "live parallel-shard compensation") &&
+        check(same_output(one, four), "live parallel compensation output differs");
+}
+
 }
 
 int main(int argc, char ** argv) {
@@ -350,6 +380,7 @@ int main(int argc, char ** argv) {
         test_malformed_route_contract_rejected() &&
         test_bounded_pipeline_slots_and_reuse() &&
         test_live_pipeline_worker() && test_compensation_shard_output_is_bitwise_stable() &&
+        test_live_worker_parallel_compensation_is_bitwise_stable() &&
         test_staged_contract_errors();
     if (edge_only) {
         return edge ? 0 : 1;

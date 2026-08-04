@@ -560,8 +560,40 @@ void MatmulStripeCollector::compensation_loop() {
         const size_t shard_count = std::max<size_t>(1, std::min(
             execution_->options_.rc_shards == 0 ? size_t {1} : execution_->options_.rc_shards,
             execution_->facade_.args().J));
-        for (size_t shard_id = 0; status && shard_id < shard_count; ++shard_id)
-            status = execute_compensation_shard(*job, shard_id, shard_count);
+        const auto rc_start = Clock::now();
+        if (status && shard_count == 1) {
+            status = execute_compensation_shard(*job, 0, 1);
+        } else if (status) {
+            {
+                std::lock_guard<std::mutex> lock(*job->shard_mutex_);
+                job->parallel_shards_ = true;
+                job->expected_shards_ = shard_count;
+                job->completed_shards_ = 0;
+                job->state_ = MatmulStripeJob::State::compensation_running;
+            }
+            std::vector<MatmulStatus> shard_status(shard_count);
+            std::vector<std::thread> shard_workers;
+            shard_workers.reserve(shard_count);
+            for (size_t shard_id = 0; shard_id < shard_count; ++shard_id) {
+                shard_workers.emplace_back([&job, &shard_status, shard_id, shard_count] {
+                    shard_status[shard_id] = execute_compensation_shard(*job, shard_id, shard_count);
+                });
+            }
+            for (auto & shard_worker : shard_workers) {
+                shard_worker.join();
+            }
+            {
+                std::lock_guard<std::mutex> lock(*job->shard_mutex_);
+                job->metrics_.rc_compute = {};
+                record_metric(job->metrics_.rc_compute, execution_->options_.profiling, rc_start);
+            }
+            for (const auto & shard_result : shard_status) {
+                if (!shard_result.ok()) {
+                    status = shard_result;
+                    break;
+                }
+            }
+        }
         if (status) status = finalize_stripe(*job);
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -660,7 +692,9 @@ MatmulStripeJob::MatmulStripeJob(MatmulStripeJob && other) noexcept
     : execution_(other.execution_), input_(std::move(other.input_)), status_(other.status_),
       metrics_(other.metrics_), compensation_outliers_(std::move(other.compensation_outliers_)),
       has_captured_outliers_(other.has_captured_outliers_), owns_slot_(other.owns_slot_),
-      expected_shards_(other.expected_shards_), completed_shards_(other.completed_shards_), state_(other.state_) {
+      expected_shards_(other.expected_shards_), completed_shards_(other.completed_shards_),
+      parallel_shards_(other.parallel_shards_), shard_mutex_(std::move(other.shard_mutex_)),
+      state_(other.state_) {
     other.execution_ = nullptr;
     other.owns_slot_ = false;
 }
@@ -677,6 +711,8 @@ MatmulStripeJob & MatmulStripeJob::operator=(MatmulStripeJob && other) noexcept 
         owns_slot_ = other.owns_slot_;
         expected_shards_ = other.expected_shards_;
         completed_shards_ = other.completed_shards_;
+        parallel_shards_ = other.parallel_shards_;
+        shard_mutex_ = std::move(other.shard_mutex_);
         state_ = other.state_;
         other.execution_ = nullptr;
         other.owns_slot_ = false;
@@ -812,25 +848,38 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job) {
 }
 
 MatmulStatus execute_compensation_shard(MatmulStripeJob & job, size_t shard_id, size_t shard_count) {
-    if (job.execution_ == nullptr ||
-        (job.state_ != MatmulStripeJob::State::dense_complete &&
-         job.state_ != MatmulStripeJob::State::compensation_running) || !job.status_) {
-        job.status_ = invalid_state("compensation execution requires dense completion");
-        return job.status_;
+    if (job.shard_mutex_ == nullptr) {
+        return invalid_state("compensation shard state unavailable");
     }
-    if (shard_count == 0 || shard_id >= shard_count) {
-        job.status_ = make_status(MatmulStatusCode::invalid_argument, "invalid compensation shard");
-        return job.status_;
-    }
-    if (job.completed_shards_ == 0) {
-        job.expected_shards_ = shard_count;
-        job.state_ = MatmulStripeJob::State::compensation_running;
-    } else if (job.expected_shards_ != shard_count || shard_id != job.completed_shards_) {
-        job.status_ = invalid_state("compensation shards must complete in order");
-        return job.status_;
+    {
+        std::lock_guard<std::mutex> lock(*job.shard_mutex_);
+        if (job.execution_ == nullptr ||
+            (job.state_ != MatmulStripeJob::State::dense_complete &&
+             job.state_ != MatmulStripeJob::State::compensation_running) || !job.status_) {
+            job.status_ = invalid_state("compensation execution requires dense completion");
+            return job.status_;
+        }
+        if (shard_count == 0 || shard_id >= shard_count) {
+            job.status_ = make_status(MatmulStatusCode::invalid_argument, "invalid compensation shard");
+            return job.status_;
+        }
+        if (job.parallel_shards_) {
+            if (job.expected_shards_ != shard_count) {
+                job.status_ = invalid_state("parallel compensation shard count changed");
+                return job.status_;
+            }
+            job.state_ = MatmulStripeJob::State::compensation_running;
+        } else if (job.completed_shards_ == 0) {
+            job.expected_shards_ = shard_count;
+            job.state_ = MatmulStripeJob::State::compensation_running;
+        } else if (job.expected_shards_ != shard_count || shard_id != job.completed_shards_) {
+            job.status_ = invalid_state("compensation shards must complete in order");
+            return job.status_;
+        }
     }
     const auto start = Clock::now();
-    auto status = quants::dec::ActivationDECRowSliceStatus::success;
+    auto dec_status = quants::dec::ActivationDECRowSliceStatus::success;
+    MatmulStatus result{};
     const size_t col_begin = job.execution_->facade_.args().J * shard_id / shard_count;
     const size_t col_end = job.execution_->facade_.args().J * (shard_id + 1) / shard_count;
     if (job.has_captured_outliers_) {
@@ -845,37 +894,51 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job, size_t shard_id, 
         if (auto * meta = std::get_if<quants::act::exsia::Meta>(&local_args.act_quant.storage())) {
             const size_t stripe_id = job.input_.stripe_id();
             if (stripe_id >= meta->theta.size()) {
-                job.status_ = make_status(MatmulStatusCode::invalid_argument, "invalid activation stripe id");
-                job.execution_->status_ = job.status_;
-                return job.status_;
+                result = make_status(MatmulStatusCode::invalid_argument, "invalid activation stripe id");
+            } else {
+                std::vector<quants::QactOutlier> local_outliers = job.compensation_outliers_;
+                for (auto & outlier : local_outliers) {
+                    outlier.row -= static_cast<int>(row_begin);
+                }
+                dec_status = quants::dec::compensate_activation_dec_rows_columns(
+                    local_outliers, local_args, 0, local_args.I, col_begin, col_end,
+                    "ggml-gemmini-matmul");
             }
+        } else {
+            std::vector<quants::QactOutlier> local_outliers = job.compensation_outliers_;
+            for (auto & outlier : local_outliers) {
+                outlier.row -= static_cast<int>(row_begin);
+            }
+            dec_status = quants::dec::compensate_activation_dec_rows_columns(
+                local_outliers, local_args, 0, local_args.I, col_begin, col_end,
+                "ggml-gemmini-matmul");
         }
-        std::vector<quants::QactOutlier> local_outliers = job.compensation_outliers_;
-        for (auto & outlier : local_outliers) {
-            outlier.row -= static_cast<int>(row_begin);
-        }
-        status = quants::dec::compensate_activation_dec_rows_columns(
-            local_outliers, local_args, 0, local_args.I, col_begin, col_end,
-            "ggml-gemmini-matmul");
     } else {
-        status = quants::dec::compensate_activation_dec_rows_columns(
+        dec_status = quants::dec::compensate_activation_dec_rows_columns(
             job.compensation_outliers_, job.execution_->facade_.args(),
             job.input_.row_begin(), job.input_.row_end(), col_begin, col_end,
             "ggml-gemmini-matmul");
     }
-    if (status == quants::dec::ActivationDECRowSliceStatus::unsupported) {
-        job.status_ = unsupported_backend("compensation execution is unsupported by backend");
-    } else if (status == quants::dec::ActivationDECRowSliceStatus::invalid_arguments) {
-        job.status_ = make_status(
+    if (result.ok()) {
+        if (dec_status == quants::dec::ActivationDECRowSliceStatus::unsupported) {
+            result = unsupported_backend("compensation execution is unsupported by backend");
+        } else if (dec_status == quants::dec::ActivationDECRowSliceStatus::invalid_arguments) {
+            result = make_status(
             MatmulStatusCode::invalid_argument, "invalid compensation shard", MatMulCapability::unsupported);
-    } else {
-        job.status_ = {};
-        ++job.completed_shards_;
-        if (job.completed_shards_ == job.expected_shards_)
-            job.state_ = MatmulStripeJob::State::compensation_complete;
-        record_metric(job.metrics_.rc_compute, job.execution_->options_.profiling, start);
+        }
     }
-    return job.status_;
+    {
+        std::lock_guard<std::mutex> lock(*job.shard_mutex_);
+        if (!result.ok()) {
+            job.status_ = result;
+        } else if (job.status_) {
+            ++job.completed_shards_;
+            if (job.completed_shards_ == job.expected_shards_)
+                job.state_ = MatmulStripeJob::State::compensation_complete;
+            record_metric(job.metrics_.rc_compute, job.execution_->options_.profiling, start);
+        }
+    }
+    return result.ok() ? MatmulStatus{} : result;
 }
 
 MatmulStatus finalize_stripe(MatmulStripeJob & job) {
