@@ -897,28 +897,28 @@ void MatmulStripeCollector::worker_loop() {
             condition_.notify_all();
         }
 
-        MatmulStripeJob job = capture_stripe(
+        auto job = std::make_shared<MatmulStripeJob>(capture_stripe(
             *execution_,
             MatmulStripeInput(captured.row_begin, captured.row_end, captured.stripe_id),
-            std::move(captured.outliers));
-        job.metrics_.la_cycles = captured.la_cycles;
-        job.metrics_.la3_cycles = captured.la3_cycles;
-        job.metrics_.sf_cycles = captured.sf_cycles;
-        job.metrics_.la3_ns = captured.la3_ns;
-        job.metrics_.sf1_ns = captured.sf1_ns;
-        job.metrics_.la.nanoseconds = captured.la3_ns;
-        job.metrics_.la.count = captured.la3_ns != 0 ? 1 : 0;
-        job.metrics_.sf.nanoseconds = captured.sf1_ns;
-        job.metrics_.sf.count = captured.sf1_ns != 0 ? 1 : 0;
-        MatmulStatus status = prepare_compensation(job);
-        job.metrics_.ws_start_ns = now_ns();
-        if (status) status = execute_dense_stripe(job);
-        job.metrics_.ws_end_ns = now_ns();
+            std::move(captured.outliers)));
+        job->metrics_.la_cycles = captured.la_cycles;
+        job->metrics_.la3_cycles = captured.la3_cycles;
+        job->metrics_.sf_cycles = captured.sf_cycles;
+        job->metrics_.la3_ns = captured.la3_ns;
+        job->metrics_.sf1_ns = captured.sf1_ns;
+        job->metrics_.la.nanoseconds = captured.la3_ns;
+        job->metrics_.la.count = captured.la3_ns != 0 ? 1 : 0;
+        job->metrics_.sf.nanoseconds = captured.sf1_ns;
+        job->metrics_.sf.count = captured.sf1_ns != 0 ? 1 : 0;
+        MatmulStatus status = prepare_compensation(*job);
         if (status) {
             std::lock_guard<std::mutex> lock(mutex_);
-            compensation_pending_.push_back(std::make_unique<MatmulStripeJob>(std::move(job)));
+            compensation_pending_.push_back(job);
             condition_.notify_all();
         }
+        job->metrics_.ws_start_ns = now_ns();
+        if (status) status = execute_dense_stripe(*job);
+        job->metrics_.ws_end_ns = now_ns();
         if (!status) {
             std::lock_guard<std::mutex> lock(mutex_);
             --in_flight_;
@@ -937,7 +937,7 @@ void MatmulStripeCollector::worker_loop() {
 
 void MatmulStripeCollector::compensation_loop() {
     for (;;) {
-        std::unique_ptr<MatmulStripeJob> job;
+        std::shared_ptr<MatmulStripeJob> job;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             condition_.wait(lock, [this] {
@@ -991,6 +991,13 @@ void MatmulStripeCollector::compensation_loop() {
                     break;
                 }
             }
+        }
+        if (status) {
+            std::unique_lock<std::mutex> lock(*job->shard_mutex_);
+            job->dense_condition_.wait(lock, [&job] {
+                return job->dense_finished_ || !job->status_;
+            });
+            status = job->status();
         }
         if (status) status = finalize_stripe(*job);
         job->metrics_.rc_end_ns = now_ns();
@@ -1111,10 +1118,12 @@ MatmulStripeJob::MatmulStripeJob(MatmulStripeJob && other) noexcept
     : execution_(other.execution_), input_(std::move(other.input_)), status_(other.status_),
       metrics_(other.metrics_), staged_residual_(std::move(other.staged_residual_)),
       compensation_outliers_(std::move(other.compensation_outliers_)),
+      compensation_ycom_(std::move(other.compensation_ycom_)),
       staged_activation_meta_(std::move(other.staged_activation_meta_)),
       has_captured_outliers_(other.has_captured_outliers_), owns_slot_(other.owns_slot_),
       expected_shards_(other.expected_shards_), completed_shards_(other.completed_shards_),
       parallel_shards_(other.parallel_shards_), shard_mutex_(std::move(other.shard_mutex_)),
+      dense_finished_(other.dense_finished_), compensation_finished_(other.compensation_finished_),
       state_(other.state_) {
     other.execution_ = nullptr;
     other.owns_slot_ = false;
@@ -1129,12 +1138,15 @@ MatmulStripeJob & MatmulStripeJob::operator=(MatmulStripeJob && other) noexcept 
         metrics_ = other.metrics_;
         staged_residual_ = std::move(other.staged_residual_);
         compensation_outliers_ = std::move(other.compensation_outliers_);
+        compensation_ycom_ = std::move(other.compensation_ycom_);
         staged_activation_meta_ = std::move(other.staged_activation_meta_);
         has_captured_outliers_ = other.has_captured_outliers_;
         owns_slot_ = other.owns_slot_;
         expected_shards_ = other.expected_shards_;
         completed_shards_ = other.completed_shards_;
         parallel_shards_ = other.parallel_shards_;
+        dense_finished_ = other.dense_finished_;
+        compensation_finished_ = other.compensation_finished_;
         shard_mutex_ = std::move(other.shard_mutex_);
         state_ = other.state_;
         other.execution_ = nullptr;
@@ -1318,6 +1330,22 @@ MatmulStatus prepare_compensation(MatmulStripeJob & job) {
         }
         job.execution_->staged_metadata_active_ = true;
     }
+    if (!job.compensation_outliers_.empty()) {
+        const size_t rows = job.input_.row_end() - job.input_.row_begin();
+        const size_t elements = rows * job.execution_->facade_.args().J;
+        if (rows != 0 && elements / rows != job.execution_->facade_.args().J) {
+            job.status_ = make_status(MatmulStatusCode::out_of_memory,
+                                      "compensation scratch size overflow");
+            return job.status_;
+        }
+        try {
+            job.compensation_ycom_.assign(elements, 0.0f);
+        } catch (const std::bad_alloc &) {
+            job.status_ = make_status(MatmulStatusCode::out_of_memory,
+                                      "compensation scratch allocation failed");
+            return job.status_;
+        }
+    }
     job.state_ = MatmulStripeJob::State::compensation_prepared;
     job.status_ = {};
     record_metric(job.metrics_.rc_prepare, job.execution_->options_.profiling, start);
@@ -1337,11 +1365,16 @@ MatmulStatus execute_dense_stripe(MatmulStripeJob & job) {
         if (dense_facade->state() == MatMulState::idle) {
             const MatMulStatus begin_status = dense_facade->begin_stripes();
             if (begin_status != MatMulStatus::success) {
-                job.status_ = to_public_status(
+                const MatmulStatus failure = to_public_status(
                     begin_status,
                     begin_status == MatMulStatus::unsupported ? MatMulCapability::unsupported :
                         MatMulCapability::supported);
-                return job.status_;
+                {
+                    std::lock_guard<std::mutex> lock(*job.shard_mutex_);
+                    job.status_ = failure;
+                }
+                job.dense_condition_.notify_all();
+                return failure;
             }
         }
         if (job.staged_activation_meta_ != nullptr) {
@@ -1353,14 +1386,21 @@ MatmulStatus execute_dense_stripe(MatmulStripeJob & job) {
             { job.input_.row_begin(), job.input_.row_end() }, job.input_.stripe_id()) :
         dense_facade->run_stripe(
             { job.input_.row_begin(), job.input_.row_end() }, job.input_.stripe_id());
-    job.status_ = to_public_status(
+    const MatmulStatus dense_status = to_public_status(
         status, status == MatMulStatus::unsupported ? MatMulCapability::unsupported : MatMulCapability::supported,
         &job.execution_->facade_.args());
-    if (job.status_) {
-        job.state_ = MatmulStripeJob::State::dense_complete;
-        record_metric(job.metrics_.ws, job.execution_->options_.profiling, start);
+    {
+        std::lock_guard<std::mutex> lock(*job.shard_mutex_);
+        job.status_ = dense_status;
+        job.dense_finished_ = true;
+        if (dense_status) {
+            if (!job.compensation_finished_)
+                job.state_ = MatmulStripeJob::State::dense_complete;
+            record_metric(job.metrics_.ws, job.execution_->options_.profiling, start);
+        }
     }
-    return job.status_;
+    job.dense_condition_.notify_all();
+    return dense_status;
 }
 
 MatmulStatus execute_compensation_shard(MatmulStripeJob & job) {
@@ -1374,7 +1414,8 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job, size_t shard_id, 
     {
         std::lock_guard<std::mutex> lock(*job.shard_mutex_);
         if (job.execution_ == nullptr ||
-            (job.state_ != MatmulStripeJob::State::dense_complete &&
+            (job.state_ != MatmulStripeJob::State::compensation_prepared &&
+             job.state_ != MatmulStripeJob::State::dense_complete &&
              job.state_ != MatmulStripeJob::State::compensation_running) || !job.status_) {
             job.status_ = invalid_state("compensation execution requires dense completion");
             return job.status_;
@@ -1410,7 +1451,8 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job, size_t shard_id, 
         dec_status = quants::dec::compensate_activation_dec_rows_columns(
             job.compensation_outliers_, job.execution_->facade_.args(),
             job.input_.row_begin(), job.input_.row_end(), col_begin, col_end,
-            dec_layer, job.execution_->dispatch_override_);
+            dec_layer, job.execution_->dispatch_override_,
+            job.compensation_ycom_.data() + col_begin, job.execution_->facade_.args().J);
     }
 #else
     (void) col_begin;
@@ -1431,8 +1473,10 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job, size_t shard_id, 
             job.status_ = result;
         } else if (job.status_) {
             ++job.completed_shards_;
-            if (job.completed_shards_ == job.expected_shards_)
+            if (job.completed_shards_ == job.expected_shards_) {
+                job.compensation_finished_ = true;
                 job.state_ = MatmulStripeJob::State::compensation_complete;
+            }
             record_metric(job.metrics_.rc_compute, job.execution_->options_.profiling, start);
         }
     }
@@ -1440,7 +1484,8 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job, size_t shard_id, 
 }
 
 MatmulStatus finalize_stripe(MatmulStripeJob & job) {
-    if (job.execution_ == nullptr || job.state_ != MatmulStripeJob::State::compensation_complete || !job.status_) {
+    if (job.execution_ == nullptr || !job.dense_finished_ ||
+        !job.compensation_finished_ || !job.status_) {
         job.status_ = invalid_state("finalize requires compensation completion");
         return job.status_;
     }
@@ -1449,6 +1494,17 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
     job.metrics_.row_begin = job.input_.row_begin();
     job.metrics_.row_end = job.input_.row_end();
     job.metrics_.rc_shards = job.expected_shards_;
+    if (!job.compensation_ycom_.empty()) {
+        const auto &args = job.execution_->facade_.args();
+        const size_t row_stride = args.stride_f_out ? args.stride_f_out : args.J;
+        const size_t col_stride = args.col_stride_f_out ? args.col_stride_f_out : 1;
+        for (size_t row = 0; row < job.input_.row_end() - job.input_.row_begin(); ++row) {
+            float *dst = args.f_out + (job.input_.row_begin() + row) * row_stride;
+            const float *src = job.compensation_ycom_.data() + row * args.J;
+            for (size_t col = 0; col < args.J; ++col)
+                dst[col * col_stride] += src[col];
+        }
+    }
     job.state_ = MatmulStripeJob::State::finalized;
     {
         std::lock_guard<std::mutex> state_lock(*job.execution_->state_mutex_);

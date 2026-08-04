@@ -1092,7 +1092,8 @@ bool test_live_pipeline_worker() {
                    collector.profiles()[0].sf_cycles == 20,
                "live worker producer profile") ||
         !check(collector.profiles()[0].ws_start_ns < collector.profiles()[0].ws_end_ns &&
-                   collector.profiles()[0].rc_start_ns < collector.profiles()[0].rc_end_ns,
+                   collector.profiles()[0].rc_start_ns < collector.profiles()[0].rc_end_ns &&
+                   collector.profiles()[0].rc_start_ns < collector.profiles()[0].ws_end_ns,
                "live worker stage intervals") ||
         !check(finish_execution(execution).ok(), "live worker execution finish")) {
         return false;

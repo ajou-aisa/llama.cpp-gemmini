@@ -120,6 +120,7 @@ private:
     friend MatmulStatus execute_compensation_shard(MatmulStripeJob &);
     friend MatmulStatus execute_compensation_shard(MatmulStripeJob &, size_t, size_t);
     friend MatmulStatus execute_dense_stripe(MatmulStripeJob &);
+    friend MatmulStatus finalize_stripe(MatmulStripeJob &);
 
     MatMulStatus run_stripe(MatMulStripe stripe, size_t stripe_id);
     MatMulStatus run_staged_stripe(MatMulStripe stripe, size_t stripe_id);
@@ -228,7 +229,7 @@ private:
     std::mutex mutex_;
     std::condition_variable condition_;
     std::deque<CapturedStripe> pending_;
-    std::deque<std::unique_ptr<MatmulStripeJob>> compensation_pending_;
+    std::deque<std::shared_ptr<MatmulStripeJob>> compensation_pending_;
     size_t capacity_;
     size_t in_flight_ = 0;
     std::vector<CapturedStripe> stripes_;
@@ -395,6 +396,10 @@ private:
     size_t completed_shards_ = 0;
     bool parallel_shards_ = false;
     std::shared_ptr<std::mutex> shard_mutex_ = std::make_shared<std::mutex>();
+    std::condition_variable dense_condition_;
+    std::vector<float> compensation_ycom_;
+    bool dense_finished_ = false;
+    bool compensation_finished_ = false;
     State state_ = State::captured;
 };
 

@@ -380,7 +380,9 @@ ActivationDECResult compensate_activation_dec(
     const std::vector<ggml::gemmini::quants::QactOutlier> &outliers,
     ggml_gemmini_args_t &args,
     const char *layer,
-    DispatchOverride dispatch_override)
+    DispatchOverride dispatch_override,
+    float * ycom_output,
+    size_t ycom_stride)
 {
     uint64_t start = ggml::gemmini::cycle::read();
 
@@ -796,7 +798,13 @@ ActivationDECResult compensate_activation_dec(
 #endif
 
     start = ggml::gemmini::cycle::read();
-    apply_ycom_to_output(scr.Y_com.data(), I, J, args);
+    if (ycom_output != nullptr) {
+        const size_t output_stride = ycom_stride == 0 ? J : ycom_stride;
+        for (size_t row = 0; row < I; ++row)
+            std::copy_n(scr.Y_com.data() + row * J, J, ycom_output + row * output_stride);
+    } else {
+        apply_ycom_to_output(scr.Y_com.data(), I, J, args);
+    }
     end = ggml::gemmini::cycle::read();
     ggml::gemmini::log::cycle(layer, "[dec] cpu.Apply Y_com to output", start, end);
 
@@ -933,7 +941,9 @@ ActivationDECRowSliceStatus compensate_activation_dec_rows_columns(
     size_t col_begin,
     size_t col_end,
     const char *layer,
-    DispatchOverride dispatch_override)
+    DispatchOverride dispatch_override,
+    float * ycom_output,
+    size_t ycom_stride)
 {
     if (row_begin >= row_end || row_end > args.I || col_begin >= col_end || col_end > args.J)
         return ActivationDECRowSliceStatus::invalid_arguments;
@@ -1028,7 +1038,11 @@ ActivationDECRowSliceStatus compensate_activation_dec_rows_columns(
             local_outliers.push_back({static_cast<int>(static_cast<size_t>(outlier.row) - row_begin),
                                       outlier.col, outlier.residual});
     }
-    compensate_activation_dec(local_outliers, local_args, layer, dispatch_override);
-    return ActivationDECRowSliceStatus::success;
+    if (local_outliers.empty())
+        return ActivationDECRowSliceStatus::success;
+    const ActivationDECResult result = compensate_activation_dec(
+        local_outliers, local_args, layer, dispatch_override, ycom_output, ycom_stride);
+    return ycom_output != nullptr && result.int_mac_count == 0 ?
+        ActivationDECRowSliceStatus::unsupported : ActivationDECRowSliceStatus::success;
 }
 } // namespace ggml::gemmini::quants::dec

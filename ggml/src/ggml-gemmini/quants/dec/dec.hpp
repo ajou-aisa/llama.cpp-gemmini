@@ -45,7 +45,9 @@ ActivationDECResult compensate_activation_dec(
     const std::vector<QactOutlier> &outliers,
     ggml_gemmini_args_t &args,
     const char *layer,
-    DispatchOverride override = DispatchOverride::automatic);
+    DispatchOverride override = DispatchOverride::automatic,
+    float * ycom_output = nullptr,
+    size_t ycom_stride = 0);
 
 ActivationDECRowSliceStatus compensate_activation_dec_rows(
     const std::vector<QactOutlier> &outliers,
@@ -63,5 +65,7 @@ ActivationDECRowSliceStatus compensate_activation_dec_rows_columns(
     size_t col_begin,
     size_t col_end,
     const char *layer,
-    DispatchOverride override = DispatchOverride::automatic);
+    DispatchOverride override = DispatchOverride::automatic,
+    float * ycom_output = nullptr,
+    size_t ycom_stride = 0);
 } // namespace ggml::gemmini::quants::dec
