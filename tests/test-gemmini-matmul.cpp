@@ -259,6 +259,10 @@ bool test_native_and_channel_full_facade_parity() {
         &sidecar_args, ggml::gemmini::baseline_activation_quant_t::TENSOR,
         ggml::gemmini::baseline_weight_quant_t::CHANNEL);
     const auto sidecar_result = ggml::gemmini::MatMul(sidecar_facade_args).run_full();
+    std::vector<float> sidecar_stripe(rows * columns, 0.0f);
+    auto sidecar_stripe_args = sidecar_facade_args;
+    sidecar_stripe_args.f_out = sidecar_stripe.data();
+    const auto sidecar_stripe_result = ggml::gemmini::matmul(sidecar_stripe_args, stripe_options);
 
     return check(h1_result.status == ggml::gemmini::MatMulStatus::success &&
                      same_output(h1_facade, h1_legacy) && h1_stripe_result.ok() &&
@@ -282,7 +286,8 @@ bool test_native_and_channel_full_facade_parity() {
                      same_output(direct_stripe, direct_legacy),
               "Q8_CHANNEL direct facade parity") &&
         check(sidecar_result.status == ggml::gemmini::MatMulStatus::success &&
-                     same_output(sidecar_facade, sidecar_legacy),
+                     same_output(sidecar_facade, sidecar_legacy) && sidecar_stripe_result.ok() &&
+                     same_output(sidecar_stripe, sidecar_legacy),
               "Q8_CHANNEL sidecar facade parity");
 }
 
