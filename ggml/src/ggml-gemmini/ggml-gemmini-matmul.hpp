@@ -50,6 +50,7 @@ class MatMul {
 public:
     explicit MatMul(ggml_gemmini_args_t args);
 
+    MatMulResult run_dense();
     MatMulResult run_full();
     MatMulStatus begin_stripes();
     MatMulStatus run_stripe(MatMulStripe stripe);

@@ -25,6 +25,7 @@
 // Legacy aisa::ActivationDEC is replaced by ggml::gemmini::quants::dec
 // #include "error_compensation/activation_DEC.h"
 #include "ggml-gemmini-args.h"
+#include "ggml-gemmini-matmul.hpp"
 #include "quants/common/tensor_util.hpp"
 #include "quants/act/quantize.hpp"
 #include "quants/weight/quantize_Q8_H1.hpp"
@@ -1428,7 +1429,11 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                     ggml::gemmini::log::debug(layer,
                         "[activation] route im2p weight=%s dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
                         weight_route, args.I, args.J, args.K, args.sB, static_cast<int>(args.tiled_matmul_type));
-                    ggml::gemmini::tiled_matmul_auto_im2p(&args);
+                    ggml::gemmini::MatMul facade(args);
+                    const auto facade_result = facade.run_dense();
+                    if (facade_result.status != ggml::gemmini::MatMulStatus::success) {
+                        GGML_ABORT("Gemmini facade dense execution failed");
+                    }
                     run_baseline = false;
                 }
             }
@@ -1447,10 +1452,11 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             }
 
             if (run_baseline) {
-                ggml::gemmini::tiled_matmul_auto_baseline(
-                    &args,
-                    baseline_activation_quant,
-                    selected_baseline_weight_quant);
+                ggml::gemmini::MatMul facade(args);
+                const auto facade_result = facade.run_dense();
+                if (facade_result.status != ggml::gemmini::MatMulStatus::success) {
+                    GGML_ABORT("Gemmini facade dense execution failed");
+                }
             }
     }
     // dst에는 gemmini 커널에서 dequantize한 결과가 들어옴 

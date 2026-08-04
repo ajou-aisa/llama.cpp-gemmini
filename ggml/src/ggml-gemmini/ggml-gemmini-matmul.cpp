@@ -36,6 +36,17 @@ void execute_dense(ggml_gemmini_args_t &args) {
     if (uses_baseline_channel_route(args)) {
         tiled_matmul_auto_baseline(
             &args, baseline_activation_quant_t::TENSOR, baseline_weight_quant_t::CHANNEL);
+    } else if (args.weight_i8_scale_active) {
+        baseline_activation_quant_t activation = baseline_activation_quant_t::EXSIA;
+        const auto & storage = args.act_quant.storage();
+        if (std::holds_alternative<quants::act::tensor::Meta>(storage)) {
+            activation = baseline_activation_quant_t::TENSOR;
+        } else if (std::holds_alternative<quants::act::token::Meta>(storage)) {
+            activation = baseline_activation_quant_t::TOKEN;
+        } else if (std::holds_alternative<quants::act::block::Meta>(storage)) {
+            activation = baseline_activation_quant_t::BLOCK;
+        }
+        tiled_matmul_auto_baseline(&args, activation, baseline_weight_quant_t::TENSOR);
     } else {
         tiled_matmul_auto_im2p(&args);
     }
@@ -133,7 +144,7 @@ void record_metric(MatmulStageMetrics & metric, bool enabled, Clock::time_point 
 
 MatMul::MatMul(ggml_gemmini_args_t args) : args_(std::move(args)) {}
 
-MatMulResult MatMul::run_full() {
+MatMulResult MatMul::run_dense() {
     if (state_ != MatMulState::idle) {
         return { MatMulStatus::invalid_state, MatMulCapability::supported };
     }
@@ -142,9 +153,16 @@ MatMulResult MatMul::run_full() {
     }
 
     execute_dense(args_);
+    return { MatMulStatus::success, MatMulCapability::supported };
+}
+
+MatMulResult MatMul::run_full() {
+    const MatMulResult dense = run_dense();
+    if (dense.status != MatMulStatus::success) {
+        return dense;
+    }
     quants::dec::compensate_activation_dec(
         quants::activation_outliers(args_), args_, "ggml-gemmini-matmul");
-    state_ = MatMulState::completed;
     return { MatMulStatus::success, MatMulCapability::supported };
 }
 
