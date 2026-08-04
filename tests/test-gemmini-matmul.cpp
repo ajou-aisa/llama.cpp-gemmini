@@ -158,17 +158,31 @@ bool test_baseline_activation_route_facade_parity() {
 
 bool test_live_pipeline_multistripe_matches_full() {
     using namespace ggml::gemmini;
-    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
-    std::vector<elem_t> weights = { 1, -1, 2, 3 };
-    std::vector<float> full_output(6, 0.0f);
-    std::vector<float> pipeline_output(6, 0.0f);
-
+    constexpr size_t rows = 130;
+    constexpr size_t columns = 128;
+    constexpr size_t depth = 2048;
+    std::vector<elem_t> activation(rows * depth, 1);
+    std::vector<elem_t> weights(columns * depth, 1);
+    std::vector<float> full_output(rows * columns, 0.0f);
+    std::vector<float> pipeline_output(rows * columns, 0.0f);
     auto full_args = make_args(activation, weights, full_output);
+    full_args.I = rows;
+    full_args.J = columns;
+    full_args.K = depth;
+    full_args.sA = depth;
+    full_args.sB = columns;
+    full_args.stride_f_out = columns;
     auto & full_meta = full_args.act_quant.storage().emplace<quants::act::exsia::Meta>();
     full_meta.theta = { 0 };
     const auto full_result = MatMul(full_args).run_full();
 
     auto pipeline_args = make_args(activation, weights, pipeline_output);
+    pipeline_args.I = rows;
+    pipeline_args.J = columns;
+    pipeline_args.K = depth;
+    pipeline_args.sA = depth;
+    pipeline_args.sB = columns;
+    pipeline_args.stride_f_out = columns;
     auto & pipeline_meta = pipeline_args.act_quant.storage().emplace<quants::act::exsia::Meta>();
     pipeline_meta.theta = { 0, 0 };
     MatmulOptions options{};
@@ -184,8 +198,8 @@ bool test_live_pipeline_multistripe_matches_full() {
     }
 
     const auto * sink = collector.sink();
-    const bool captured = sink->on_ready(sink->user_data, { 0, 0, 1 }) &&
-        sink->on_ready(sink->user_data, { 1, 1, 3 });
+    const bool captured = sink->on_ready(sink->user_data, { 0, 0, 80 }) &&
+        sink->on_ready(sink->user_data, { 1, 80, rows });
     const auto collector_status = collector.finish();
     const auto execution_status = finish_execution(execution);
     for (const auto & profile : collector.profiles()) {
