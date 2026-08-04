@@ -1165,6 +1165,13 @@ MatmulStatus execute_full(MatmulExecution & execution) {
 }
 
 MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput input) {
+    if ((input.residual_count() != 0 && input.residual() == nullptr) ||
+        (input.outlier_count() != 0 && input.outliers() == nullptr)) {
+        return MatmulStripeJob(
+            &execution,
+            std::move(input),
+            make_status(MatmulStatusCode::invalid_argument, "null stripe capture payload"));
+    }
     const bool has_outliers = input.outliers() != nullptr || input.outlier_count() != 0;
     std::vector<int32_t> staged_residual;
     if (input.residual_count() != 0) {

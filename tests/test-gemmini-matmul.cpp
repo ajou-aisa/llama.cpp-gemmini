@@ -902,6 +902,21 @@ bool test_staged_contract_errors() {
         return false;
     }
 
+    auto null_residual_execution = prepare_execution(make_args(activation, weights, output), options);
+    auto null_residual = capture_stripe(
+        null_residual_execution,
+        MatmulStripeInput(0, 1, 0, static_cast<const int32_t *>(nullptr), 1));
+    auto null_outlier_execution = prepare_execution(make_args(activation, weights, output), options);
+    auto null_outlier = capture_stripe(
+        null_outlier_execution,
+        MatmulStripeInput(0, 1, 0, static_cast<const quants::QactOutlier *>(nullptr), 1));
+    if (!check(null_residual.status().code == MatmulStatusCode::invalid_argument,
+               "null residual capture rejected before copy") ||
+        !check(null_outlier.status().code == MatmulStatusCode::invalid_argument,
+               "null outlier capture rejected before copy")) {
+        return false;
+    }
+
     auto order_execution = prepare_execution(make_args(activation, weights, output), options);
     auto early = capture_stripe(order_execution, { 0, 1 });
     if (!check(finalize_stripe(early).code == MatmulStatusCode::invalid_state,
