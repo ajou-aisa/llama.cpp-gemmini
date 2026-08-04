@@ -190,8 +190,40 @@ bool test_route_capability_table() {
     }
     args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h2;
     const auto deprecated = detail::route_capabilities(args);
-    return check(deprecated.full && !deprecated.sliced_dense && deprecated.deprecated,
-                 "Q8_H2 full-only deprecated capability");
+    if (!check(detail::normalize_route(args).weight == detail::WeightRoute::q8_h2,
+               "Q8_H2 route normalization") ||
+        !check(deprecated.full && !deprecated.sliced_dense && deprecated.deprecated,
+               "Q8_H2 full-only deprecated capability")) {
+        return false;
+    }
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1;
+    if (!check(detail::normalize_route(args).weight == detail::WeightRoute::q8_h1,
+               "Q8_H1 route normalization") ||
+        !check(detail::route_capabilities(args).full, "Q8_H1 full capability")) {
+        return false;
+    }
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1;
+    if (!check(detail::normalize_route(args).weight == detail::WeightRoute::q8_hp1,
+               "Q8_HP1 route normalization") ||
+        !check(detail::route_capabilities(args).full, "Q8_HP1 full capability")) {
+        return false;
+    }
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_hp2;
+    if (!check(detail::normalize_route(args).weight == detail::WeightRoute::q8_hp2,
+               "Q8_HP2 route normalization") ||
+        !check(detail::route_capabilities(args).deprecated &&
+                   !detail::route_capabilities(args).sliced_compensation,
+               "Q8_HP2 full-only deprecated capability")) {
+        return false;
+    }
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_channel;
+    if (!check(detail::normalize_route(args).weight == detail::WeightRoute::q8_channel_direct,
+               "Q8_CHANNEL direct normalization")) {
+        return false;
+    }
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar;
+    return check(detail::normalize_route(args).weight == detail::WeightRoute::q8_channel_sidecar,
+                  "Q8_CHANNEL sidecar normalization");
 }
 
 bool test_malformed_route_contract_rejected() {
