@@ -1487,6 +1487,54 @@ bool test_q8_h1_group_k_csc_matches_row_direct() {
     return ok;
 }
 
+bool test_q8_h1_group_k_csc_auto_dispatch() {
+    constexpr size_t rows = 32;
+    constexpr size_t columns = kHierarchicalColumns;
+    constexpr size_t blocks_per_row = 2;
+    std::vector<block_q8_h1> blocks(columns * blocks_per_row);
+    for (size_t block_index = 0; block_index < blocks.size(); ++block_index) {
+        for (size_t offset = 0; offset < sizeof(blocks[block_index].qs); ++offset)
+            blocks[block_index].qs[offset] = static_cast<int8_t>(
+                static_cast<int>((offset * 5 + block_index * 3) % 15) - 7);
+        blocks[block_index].c_b = static_cast<uint8_t>(3 + block_index % 7);
+        blocks[block_index].R = static_cast<uint16_t>(5 + block_index % 11);
+        blocks[block_index].s_rf = 0.0625f * static_cast<float>(1 + block_index % 3);
+    }
+    std::vector<ggml::gemmini::quants::QactOutlier> outliers;
+    outliers.reserve(rows * 2);
+    for (size_t row = 0; row < rows; ++row) {
+        outliers.push_back({ static_cast<int32_t>(row), 0, 3 });
+        outliers.push_back({ static_cast<int32_t>(row), 33, -1 });
+    }
+
+    ScopedDecGroupKCscEnv env_guard;
+    set_dec_group_k_csc_force(nullptr);
+    set_dec_group_k_csc_enable(nullptr);
+    set_dec_group_k_csc_disable("1");
+    std::vector<float> row_direct_output(rows * columns, 0.0f);
+    ggml_gemmini_args_t args = hierarchical_args(rows, row_direct_output);
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1;
+    args.q8_h1_blocks = blocks.data();
+    args.q8_h1_block_count = blocks.size();
+    args.q8_h1_rows = columns;
+    const auto row_direct_result = ggml::gemmini::quants::dec::compensate_activation_dec(
+        outliers, args, "test");
+
+    set_dec_group_k_csc_disable(nullptr);
+    std::vector<float> auto_output(rows * columns, 0.0f);
+    args.f_out = auto_output.data();
+    const auto auto_result = ggml::gemmini::quants::dec::compensate_activation_dec(
+        outliers, args, "test");
+    const double rows_per_active_k_mean = auto_result.unique_k_count == 0 ? 0.0 :
+        static_cast<double>(auto_result.active_row_k_pairs) / auto_result.unique_k_count;
+    return check(row_direct_result.group_k_csc_plan_bytes == 0 &&
+                     auto_result.group_k_csc_plan_bytes > 0 &&
+                     auto_result.weight_vector_load_count > 0 &&
+                     rows_per_active_k_mean == static_cast<double>(rows) &&
+                     byte_identical(row_direct_output, auto_output),
+                 "H1 high-reuse auto dispatch selects GroupKCSC and preserves bits");
+}
+
 bool test_group_k_csc_production_dispatch() {
     ScopedDecGroupKCscEnv env_guard;
     set_dec_group_k_csc_force(nullptr);
@@ -2669,7 +2717,7 @@ int main() {
     const bool ok = test_noop() && test_route_plan() && test_active_row_groups() && test_group_k_csc_plan() && test_route_metadata_rejects() && test_repeated_residuals() && test_decode_repeated_residuals() && test_integer_routes() && test_block_integer_route() &&
         test_q8_h1_hierarchical_route() && test_q8_h1_preserves_ordered_scaling_bits() && test_q8_h1_activation_scale_routes_preserve_bits() && test_unpacked_h1_tail_routes_preserve_bits() && test_q8_h1_large_effective_scale() && test_q8_h2_hierarchical_route() && test_q8_hp1_hierarchical_route() && test_q8_hp2_hierarchical_route() &&
         test_malformed_hierarchical_reject() && test_output_strides() && test_sparse_grouped_tails() && test_malformed_reject() && test_thread_clamp() &&
-        test_q8_h1_group_k_csc_matches_row_direct() && test_group_k_csc_production_dispatch() && test_fixed_residual_replay_baseline() &&
+        test_q8_h1_group_k_csc_matches_row_direct() && test_q8_h1_group_k_csc_auto_dispatch() && test_group_k_csc_production_dispatch() && test_fixed_residual_replay_baseline() &&
         test_fixed_residual_replay_high_reuse() && test_group_k_csc_nr4_transposed_j_tile() &&
         test_group_k_csc_mixed_int32_boundaries() &&
         test_group_k_csc_mixed_prefix_and_plan_rejects() &&
