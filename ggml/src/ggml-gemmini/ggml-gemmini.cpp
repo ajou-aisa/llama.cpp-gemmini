@@ -1469,6 +1469,17 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 static_cast<int>(sequential_status.code), sequential_status.message);
             GGML_ABORT("Gemmini stripe sequential execution failed");
         }
+        const auto route = ggml::gemmini::detail::normalize_route(args);
+        const auto capabilities = ggml::gemmini::detail::route_capabilities(args);
+        ggml::gemmini::log::debug(layer,
+            "[matmul.route] invocation=stripe-sequential full_or_slice=slice "
+            "activation_route=%s weight_route=%s backend_route=%s "
+            "supports_live_pipeline=%d deprecated=%d",
+            ggml::gemmini::detail::activation_route_name(route.activation),
+            ggml::gemmini::detail::weight_route_name(route.weight),
+            ggml::gemmini::detail::backend_route_name(route.backend),
+            capabilities.live_stripe_producer ? 1 : 0,
+            capabilities.deprecated ? 1 : 0);
     }
 
     end = ggml::gemmini::cycle::read();
@@ -1591,6 +1602,17 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 static_cast<int>(execution_status.code), execution_status.message);
             return;
         }
+        const auto route = ggml::gemmini::detail::normalize_route(args);
+        const auto capabilities = ggml::gemmini::detail::route_capabilities(args);
+        ggml::gemmini::log::debug(layer,
+            "[matmul.route] invocation=stripe-pipeline full_or_slice=slice "
+            "activation_route=%s weight_route=%s backend_route=%s "
+            "supports_live_pipeline=%d deprecated=%d",
+            ggml::gemmini::detail::activation_route_name(route.activation),
+            ggml::gemmini::detail::weight_route_name(route.weight),
+            ggml::gemmini::detail::backend_route_name(route.backend),
+            capabilities.live_stripe_producer ? 1 : 0,
+            capabilities.deprecated ? 1 : 0);
         for (const auto & profile : pipeline_collector->profiles()) {
             ggml::gemmini::log::debug(layer,
                 "[matmul.stripe] stripe_id=%zu row_begin=%zu row_end=%zu "

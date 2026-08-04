@@ -42,6 +42,9 @@ struct RouteCapabilities {
 
 RouteKey normalize_route(const ggml_gemmini_args_t & args);
 RouteCapabilities route_capabilities(const ggml_gemmini_args_t & args);
+const char * activation_route_name(ActivationRoute route);
+const char * weight_route_name(WeightRoute route);
+const char * backend_route_name(BackendRoute route);
 
 }
 

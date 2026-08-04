@@ -355,6 +355,47 @@ RouteCapabilities route_capabilities(const ggml_gemmini_args_t & args) {
     return caps;
 }
 
+const char * activation_route_name(ActivationRoute route) {
+    switch (route) {
+        case ActivationRoute::fp32: return "fp32";
+        case ActivationRoute::exsia: return "exsia";
+        case ActivationRoute::tensor: return "tensor";
+        case ActivationRoute::token: return "token";
+        case ActivationRoute::block: return "block";
+        case ActivationRoute::stripe: return "stripe";
+        case ActivationRoute::unknown: return "unknown";
+    }
+    return "unknown";
+}
+
+const char * weight_route_name(WeightRoute route) {
+    switch (route) {
+        case WeightRoute::fp32: return "fp32";
+        case WeightRoute::tensor_i8: return "tensor_i8";
+        case WeightRoute::channel_i8: return "channel_i8";
+        case WeightRoute::block_i8: return "block_i8";
+        case WeightRoute::q8_h1: return "q8_h1";
+        case WeightRoute::q8_hp1: return "q8_hp1";
+        case WeightRoute::q8_h2: return "q8_h2";
+        case WeightRoute::q8_hp2: return "q8_hp2";
+        case WeightRoute::q8_channel_direct: return "q8_channel_direct";
+        case WeightRoute::q8_channel_sidecar: return "q8_channel_sidecar";
+        case WeightRoute::q8_h0: return "q8_h0";
+        case WeightRoute::unknown: return "unknown";
+    }
+    return "unknown";
+}
+
+const char * backend_route_name(BackendRoute route) {
+    switch (route) {
+        case BackendRoute::cpu: return "cpu";
+        case BackendRoute::gemmini_ws: return "gemmini_ws";
+        case BackendRoute::gemmini_os: return "gemmini_os";
+        case BackendRoute::ws_sim: return "ws_sim";
+    }
+    return "unknown";
+}
+
 }
 
 MatMul::MatMul(ggml_gemmini_args_t args) : owned_args_(std::move(args)), args_ptr_(&owned_args_) {}
