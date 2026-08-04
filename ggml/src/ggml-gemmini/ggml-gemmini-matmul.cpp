@@ -49,6 +49,15 @@ baseline_activation_quant_t baseline_activation_for(const ggml_gemmini_args_t & 
 }
 
 void execute_dense(ggml_gemmini_args_t &args) {
+    if (args.A_fp32 != nullptr || args.B_fp32 != nullptr) {
+        if (args.A_fp32 == nullptr || args.B_fp32 == nullptr || args.f_out == nullptr) {
+            return;
+        }
+        matmul_cpu_fp(false, true, args.I, args.J, args.K,
+                      args.A_fp32, args.B_fp32, nullptr, args.f_out,
+                      args.sA, args.sB, args.col_stride_f_out, args.stride_f_out);
+        return;
+    }
     if (uses_baseline_channel_route(args)) {
         tiled_matmul_auto_baseline(&args, baseline_activation_for(args), baseline_weight_quant_t::CHANNEL);
     } else if (args.weight_i8_scale_active) {
@@ -69,7 +78,12 @@ MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe, size_
     }
 
     args.I = stripe.row_end - stripe.row_begin;
-    args.A += input_offset;
+    if (args.A != nullptr) {
+        args.A += input_offset;
+    }
+    if (args.A_fp32 != nullptr) {
+        args.A_fp32 += input_offset;
+    }
     args.f_out += output_offset;
 
     if (auto * meta = std::get_if<quants::act::exsia::Meta>(&args.act_quant.storage())) {
@@ -182,6 +196,12 @@ RouteKey normalize_route(const ggml_gemmini_args_t & args) {
              std::holds_alternative<quants::act::stripe::Meta>(storage)) key.activation = ActivationRoute::block;
     else if (std::holds_alternative<quants::act::NoneMeta>(storage)) key.activation = ActivationRoute::fp32;
 
+    if (args.A_fp32 != nullptr || args.B_fp32 != nullptr) {
+        key.activation = ActivationRoute::fp32;
+        key.weight = WeightRoute::fp32;
+        return key;
+    }
+
     using Format = ggml_gemmini_args_t::im2p_weight_format_t;
     switch (args.weight_format) {
         case Format::q8_0_unpacked_to_h1:
@@ -254,7 +274,9 @@ MatMulResult MatMul::run_dense() {
     if (state_ != MatMulState::idle) {
         return { MatMulStatus::invalid_state, MatMulCapability::supported };
     }
-    if (args().I == 0 || args().J == 0 || args().K == 0 || args().A == nullptr || args().f_out == nullptr) {
+    if (args().I == 0 || args().J == 0 || args().K == 0 ||
+        (args().A == nullptr && args().A_fp32 == nullptr) ||
+        (args().B == nullptr && args().B_fp32 == nullptr) || args().f_out == nullptr) {
         return { MatMulStatus::invalid_arguments, MatMulCapability::unsupported };
     }
     if (!detail::route_capabilities(args()).full) {
@@ -959,7 +981,7 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job, size_t shard_id, 
     MatmulStatus result{};
     const size_t col_begin = job.execution_->facade_.args().J * shard_id / shard_count;
     const size_t col_end = job.execution_->facade_.args().J * (shard_id + 1) / shard_count;
-    if (job.has_captured_outliers_) {
+    if (!job.compensation_outliers_.empty() && job.has_captured_outliers_) {
         auto local_args = job.execution_->facade_.args();
         const size_t row_begin = job.input_.row_begin();
         const size_t input_stride = local_args.sA ? local_args.sA : local_args.K;
@@ -990,7 +1012,7 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job, size_t shard_id, 
                 local_outliers, local_args, 0, local_args.I, col_begin, col_end,
                 "ggml-gemmini-matmul");
         }
-    } else {
+    } else if (!job.compensation_outliers_.empty()) {
         dec_status = quants::dec::compensate_activation_dec_rows_columns(
             job.compensation_outliers_, job.execution_->facade_.args(),
             job.input_.row_begin(), job.input_.row_end(), col_begin, col_end,

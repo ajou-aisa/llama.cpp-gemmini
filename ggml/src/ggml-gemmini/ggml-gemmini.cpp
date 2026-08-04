@@ -61,6 +61,29 @@
 namespace
 {
 
+    void gemmini_matmul_fp_facade(size_t I, size_t J, size_t K,
+                                  const float * activation, const float * weights,
+                                  float * output) {
+        ggml_gemmini_args_t args{};
+        args.I = I;
+        args.J = J;
+        args.K = K;
+        args.A_fp32 = activation;
+        args.B_fp32 = weights;
+        args.sA = K;
+        args.sB = K;
+        args.f_out = output;
+        args.col_stride_f_out = 0;
+        args.stride_f_out = J;
+        args.tiled_matmul_type = CPU;
+
+        ggml::gemmini::MatMul facade(args);
+        const auto result = facade.run_full();
+        if (result.status != ggml::gemmini::MatMulStatus::success) {
+            GGML_ABORT("Gemmini FP32 facade execution failed");
+        }
+    }
+
     bool log_prepare_q8_0_rows_for_q8_h1_fail(const char * reason, const ggml_tensor * src, int64_t row = -1) {
         const int64_t ne0 = src ? src->ne[0] : -1;
         const int64_t ne1 = src ? src->ne[1] : -1;
@@ -864,16 +887,14 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 }
                 src0_f = src0_f32.data();
             }
-            ggml::gemmini::matmul_cpu_fp(false, true, I, J, K,
-                                         (const float *)src1->data, src0_f, NULL, (float *)dst->data,
-                                         K, K, 0, J);
+            gemmini_matmul_fp_facade(I, J, K, (const float *)src1->data, src0_f,
+                                     (float *)dst->data);
             return;
         } else if (src0->type == GGML_TYPE_Q8_0) {
             std::vector<float> src0_f32(jk_count);
             dequantize_row_q8_0((const block_q8_0 *)src0->data, src0_f32.data(), jk_count);
-            ggml::gemmini::matmul_cpu_fp(false, true, I, J, K,
-                                         (const float *)src1->data, src0_f32.data(), NULL, (float *)dst->data,
-                                         K, K, 0, J);
+            gemmini_matmul_fp_facade(I, J, K, (const float *)src1->data, src0_f32.data(),
+                                     (float *)dst->data);
             return;
         } else if (src0->type == GGML_TYPE_Q8_CHANNEL) {
             std::vector<float> src0_f32(jk_count);
@@ -882,37 +903,32 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             for (size_t j = 0; j < J; ++j) {
                 dequantize_row_q8_channel(row + j * row_size, src0_f32.data() + j * K, K);
             }
-            ggml::gemmini::matmul_cpu_fp(false, true, I, J, K,
-                                         (const float *)src1->data, src0_f32.data(), NULL, (float *)dst->data,
-                                         K, K, 0, J);
+            gemmini_matmul_fp_facade(I, J, K, (const float *)src1->data, src0_f32.data(),
+                                     (float *)dst->data);
             return;
         } else if (src0->type == GGML_TYPE_Q8_H1) {
             std::vector<float> src0_f32(jk_count);
             dequantize_row_q8_h1((const block_q8_h1 *)src0->data, src0_f32.data(), jk_count);
-            ggml::gemmini::matmul_cpu_fp(false, true, I, J, K,
-                                         (const float *)src1->data, src0_f32.data(), NULL, (float *)dst->data,
-                                         K, K, 0, J);
+            gemmini_matmul_fp_facade(I, J, K, (const float *)src1->data, src0_f32.data(),
+                                     (float *)dst->data);
             return;
         } else if (src0->type == GGML_TYPE_Q8_H2) {
             std::vector<float> src0_f32(jk_count);
             dequantize_row_q8_h2((const block_q8_h2 *)src0->data, src0_f32.data(), jk_count);
-            ggml::gemmini::matmul_cpu_fp(false, true, I, J, K,
-                                         (const float *)src1->data, src0_f32.data(), NULL, (float *)dst->data,
-                                         K, K, 0, J);
+            gemmini_matmul_fp_facade(I, J, K, (const float *)src1->data, src0_f32.data(),
+                                     (float *)dst->data);
             return;
         } else if (src0->type == GGML_TYPE_Q8_HP1) {
             std::vector<float> src0_f32(jk_count);
             dequantize_row_q8_hp1((const block_q8_hp1 *)src0->data, src0_f32.data(), jk_count);
-            ggml::gemmini::matmul_cpu_fp(false, true, I, J, K,
-                                         (const float *)src1->data, src0_f32.data(), NULL, (float *)dst->data,
-                                         K, K, 0, J);
+            gemmini_matmul_fp_facade(I, J, K, (const float *)src1->data, src0_f32.data(),
+                                     (float *)dst->data);
             return;
         } else if (src0->type == GGML_TYPE_Q8_HP2) {
             std::vector<float> src0_f32(jk_count);
             dequantize_row_q8_hp2((const block_q8_hp2 *)src0->data, src0_f32.data(), jk_count);
-            ggml::gemmini::matmul_cpu_fp(false, true, I, J, K,
-                                         (const float *)src1->data, src0_f32.data(), NULL, (float *)dst->data,
-                                         K, K, 0, J);
+            gemmini_matmul_fp_facade(I, J, K, (const float *)src1->data, src0_f32.data(),
+                                     (float *)dst->data);
             return;
         } else {
             ggml::gemmini::log::debug(layer, "FLOAT path unsupported weight type=%d", (int)src0->type);
@@ -1094,9 +1110,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             GGML_ABORT("DEQUANT_FP_TEST compute type: unsupported weight type");
         }
 
-        ggml::gemmini::matmul_cpu_fp(false, true, I, J, K,
-                                     activation_f32.data(), src0_f, NULL, static_cast<float *>(dst->data),
-                                     K, K, 0, J);
+        gemmini_matmul_fp_facade(I, J, K, activation_f32.data(), src0_f,
+                                 static_cast<float *>(dst->data));
         return;
     }
 

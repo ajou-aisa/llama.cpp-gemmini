@@ -81,6 +81,8 @@ typedef struct ggml_gemmini_args_t {
     //elements
     elem_t *A = nullptr;
     elem_t *B = nullptr;
+    const float *A_fp32 = nullptr;
+    const float *B_fp32 = nullptr;
     void *C = nullptr;
     const void *D = nullptr;
 

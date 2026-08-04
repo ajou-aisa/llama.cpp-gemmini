@@ -60,6 +60,50 @@ bool test_full_facade_status_and_output_match_legacy() {
         check(same_output(facade_output, legacy_output), "full facade output differs from legacy matmul");
 }
 
+bool test_fp32_full_facade_matches_legacy() {
+    const std::vector<float> activation = { 1.0f, -2.0f, 0.5f, 3.0f,
+                                            2.0f, 1.5f, -1.0f, 4.0f };
+    const std::vector<float> weights = { 0.25f, 2.0f, -1.0f, 0.5f,
+                                         1.0f, -0.5f, 3.0f, 2.0f,
+                                         -2.0f, 1.0f, 0.25f, -1.5f };
+    std::vector<float> legacy_output(6, 0.0f);
+    std::vector<float> facade_output(6, 0.0f);
+    std::vector<float> stripe_output(6, 0.0f);
+
+    ggml::gemmini::matmul_cpu_fp(false, true, 2, 3, 4, activation.data(), weights.data(), nullptr,
+                                 legacy_output.data(), 4, 4, 0, 3);
+
+    ggml_gemmini_args_t args{};
+    args.I = 2;
+    args.J = 3;
+    args.K = 4;
+    args.A_fp32 = activation.data();
+    args.B_fp32 = weights.data();
+    args.sA = 4;
+    args.sB = 4;
+    args.f_out = facade_output.data();
+    args.stride_f_out = 3;
+    args.tiled_matmul_type = CPU;
+    ggml::gemmini::MatMul facade(args);
+    const auto result = facade.run_full();
+
+    ggml_gemmini_args_t stripe_args = args;
+    stripe_args.f_out = stripe_output.data();
+    ggml::gemmini::MatmulOptions stripe_options{};
+    stripe_options.mode = ggml::gemmini::MatmulInvocationMode::stripe_sequential;
+    stripe_options.stripe_rows = 1;
+    const auto stripe_result = ggml::gemmini::matmul(stripe_args, stripe_options);
+
+    const auto route = ggml::gemmini::detail::normalize_route(args);
+    return check(result.status == ggml::gemmini::MatMulStatus::success, "FP32 facade status") &&
+        check(route.activation == ggml::gemmini::detail::ActivationRoute::fp32 &&
+              route.weight == ggml::gemmini::detail::WeightRoute::fp32,
+              "FP32 route normalization") &&
+        check(same_output(facade_output, legacy_output), "FP32 facade output differs from legacy matmul") &&
+        check(stripe_result.ok(), "FP32 stripe facade status") &&
+        check(same_output(stripe_output, legacy_output), "FP32 stripe facade output differs from legacy matmul");
+}
+
 bool test_full_and_stripe_sequential_outputs_match() {
     using namespace ggml::gemmini;
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
@@ -463,6 +507,7 @@ int main(int argc, char ** argv) {
         return edge ? 0 : 1;
     }
     return edge && test_full_facade_status_and_output_match_legacy() &&
+            test_fp32_full_facade_matches_legacy() &&
             test_full_and_stripe_sequential_outputs_match() &&
             test_empty_tail_and_malformed_stripe_status() &&
             test_duplicate_and_overlap_stripe_status() &&
