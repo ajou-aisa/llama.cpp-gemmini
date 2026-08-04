@@ -161,6 +161,10 @@ bool test_native_and_channel_full_facade_parity() {
     hp1_facade_args.f_out = hp1_facade.data();
     ggml::gemmini::tiled_matmul_auto_im2p(&hp1_args);
     const auto hp1_result = ggml::gemmini::MatMul(hp1_facade_args).run_full();
+    std::vector<float> hp1_stripe(rows * columns, 0.0f);
+    auto hp1_stripe_args = hp1_facade_args;
+    hp1_stripe_args.f_out = hp1_stripe.data();
+    const auto hp1_stripe_result = ggml::gemmini::matmul(hp1_stripe_args, stripe_options);
 
     std::array<block_q8_h2, columns> h2_blocks{};
     for (size_t column = 0; column < columns; ++column) {
@@ -269,7 +273,8 @@ bool test_native_and_channel_full_facade_parity() {
                      same_output(h1_stripe, h1_legacy),
                  "Q8_H1 facade parity") &&
         check(hp1_result.status == ggml::gemmini::MatMulStatus::success &&
-                     same_output(hp1_facade, hp1_legacy),
+                     same_output(hp1_facade, hp1_legacy) && hp1_stripe_result.ok() &&
+                     same_output(hp1_stripe, hp1_legacy),
               "Q8_HP1 facade parity") &&
         check(h2_result.status == ggml::gemmini::MatMulStatus::success &&
                      same_output(h2_facade, h2_legacy) &&
