@@ -246,6 +246,12 @@ target_include_directories(test-gemmini-dec PRIVATE
     ../ggml/src/ggml-gemmini/quants/common
     ../ggml/src/ggml-gemmini/quants/dec)
 add_test(NAME test-gemmini-dec COMMAND $<TARGET_FILE:test-gemmini-dec>)
+
+add_executable(test-gemmini-matmul test-gemmini-matmul.cpp)
+target_link_libraries(test-gemmini-matmul PRIVATE ggml-gemmini)
+target_compile_features(test-gemmini-matmul PRIVATE cxx_std_17)
+add_test(NAME test-gemmini-matmul COMMAND $<TARGET_FILE:test-gemmini-matmul>)
+
 llama_build_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_build_and_test(test-autorelease.cpp        LABEL "model")
 
