@@ -42,6 +42,12 @@ bool uses_baseline_channel_route(const ggml_gemmini_args_t & args) {
         args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar;
 }
 
+bool valid_matmul_shape(const ggml_gemmini_args_t & args) {
+    return args.I != 0 && args.J != 0 && args.K != 0 && args.f_out != nullptr &&
+        (args.A != nullptr || args.A_fp32 != nullptr) &&
+        ((args.A_fp32 == nullptr) == (args.B_fp32 == nullptr));
+}
+
 template <typename Vector>
 bool slice_row_vector(Vector & values, size_t row_begin, size_t row_end) {
     if (row_begin > row_end || row_end > values.size()) {
@@ -313,6 +319,11 @@ RouteCapabilities route_capabilities(const ggml_gemmini_args_t & args) {
          key.weight == WeightRoute::q8_channel_sidecar)) {
         caps = {};
     }
+    if ((key.weight == WeightRoute::q8_channel_direct ||
+         key.weight == WeightRoute::q8_channel_sidecar) &&
+        key.activation == ActivationRoute::fp32) {
+        caps = {};
+    }
     if (key.backend == BackendRoute::gemmini_os || key.backend == BackendRoute::ws_sim) {
         caps = {};
         caps.deprecated = key.weight == WeightRoute::q8_h2 || key.weight == WeightRoute::q8_hp2;
@@ -354,9 +365,7 @@ MatMulResult MatMul::run_dense() {
     if (state_ != MatMulState::idle) {
         return { MatMulStatus::invalid_state, MatMulCapability::supported };
     }
-    if (args().I == 0 || args().J == 0 || args().K == 0 ||
-        (args().A == nullptr && args().A_fp32 == nullptr) ||
-        ((args().A_fp32 == nullptr) != (args().B_fp32 == nullptr)) || args().f_out == nullptr) {
+    if (!valid_matmul_shape(args())) {
         return { MatMulStatus::invalid_arguments, MatMulCapability::unsupported };
     }
     if (!detail::route_capabilities(args()).full) {
@@ -430,6 +439,9 @@ MatMulResult MatMul::run_full(quants::dec::DispatchOverride dispatch_override) {
 MatMulStatus MatMul::begin_stripes() {
     if (state_ != MatMulState::idle) {
         return MatMulStatus::invalid_state;
+    }
+    if (!valid_matmul_shape(args())) {
+        return MatMulStatus::invalid_arguments;
     }
     if (stripe_capability(args()) == MatMulCapability::unsupported) {
         return MatMulStatus::unsupported;

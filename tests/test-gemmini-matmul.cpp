@@ -668,7 +668,9 @@ bool test_route_capability_table() {
     }
     args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_channel;
     if (!check(detail::normalize_route(args).weight == detail::WeightRoute::q8_channel_direct,
-               "Q8_CHANNEL direct normalization")) {
+               "Q8_CHANNEL direct normalization") ||
+        !check(!detail::route_capabilities(args).full,
+               "Q8_CHANNEL without activation metadata rejected")) {
         return false;
     }
     args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar;
@@ -682,7 +684,7 @@ bool test_route_capability_table() {
                "STRIPE activation normalization")) {
         return false;
     }
-    args.act_quant.storage().emplace<quants::act::NoneMeta>();
+    args.act_quant.storage().emplace<quants::act::tensor::Meta>();
     args.tiled_matmul_type = WS;
     if (!check(detail::normalize_route(args).backend == detail::BackendRoute::gemmini_ws &&
                    detail::route_capabilities(args).full,
@@ -777,6 +779,13 @@ bool test_staged_contract_errors() {
     std::vector<float> output(6, 0.0f);
     MatmulOptions options{};
     options.mode = MatmulInvocationMode::stripe_sequential;
+
+    auto invalid_args = make_args(activation, weights, output);
+    invalid_args.I = 0;
+    if (!check(prepare_execution(&invalid_args, options).status().code == MatmulStatusCode::invalid_argument,
+               "invalid stripe shape rejected")) {
+        return false;
+    }
 
     auto order_execution = prepare_execution(make_args(activation, weights, output), options);
     auto early = capture_stripe(order_execution, { 0, 1 });
