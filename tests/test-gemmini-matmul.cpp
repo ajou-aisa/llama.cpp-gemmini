@@ -1125,6 +1125,7 @@ int main(int argc, char ** argv) {
     const bool edge_only = argc == 2 && std::string_view(argv[1]) == "--edge";
     const bool edge = test_public_contract_shape() && test_dispatch_override_contract() &&
         test_route_capability_table() &&
+        test_h2_and_hp2_stripe_capability_is_explicitly_unsupported() &&
         test_explicit_exsia_channel_rejection() &&
         test_malformed_route_contract_rejected() &&
         test_bounded_pipeline_slots_and_reuse() &&
