@@ -349,6 +349,7 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job);
 MatmulStatus execute_compensation_shard(MatmulStripeJob & job, size_t shard_id, size_t shard_count);
 MatmulStatus finalize_stripe(MatmulStripeJob & job);
 MatmulStatus finish_execution(MatmulExecution & execution);
+MatmulStatus matmul(ggml_gemmini_args_t & args, MatmulOptions options = {});
 MatmulStatus matmul(const ggml_gemmini_args_t & args, MatmulOptions options = {});
 MatmulStatus execute_post_fold_pipeline(const ggml_gemmini_args_t & args, MatmulStripeCollector & collector);
 

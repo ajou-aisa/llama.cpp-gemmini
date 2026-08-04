@@ -860,8 +860,8 @@ MatmulStatus finish_execution(MatmulExecution & execution) {
     return execution.status_;
 }
 
-MatmulStatus matmul(const ggml_gemmini_args_t & args, MatmulOptions options) {
-    MatmulExecution execution = prepare_execution(args, options);
+MatmulStatus matmul_impl(MatmulExecution execution, const ggml_gemmini_args_t & args,
+                         MatmulOptions options) {
     if (!execution.status()) {
         return execution.status();
     }
@@ -902,6 +902,14 @@ MatmulStatus matmul(const ggml_gemmini_args_t & args, MatmulOptions options) {
         row_begin = row_end;
     }
     return finish_execution(execution);
+}
+
+MatmulStatus matmul(ggml_gemmini_args_t & args, MatmulOptions options) {
+    return matmul_impl(prepare_execution(&args, options), args, options);
+}
+
+MatmulStatus matmul(const ggml_gemmini_args_t & args, MatmulOptions options) {
+    return matmul_impl(prepare_execution(args, options), args, options);
 }
 
 MatmulStatus execute_post_fold_pipeline(
