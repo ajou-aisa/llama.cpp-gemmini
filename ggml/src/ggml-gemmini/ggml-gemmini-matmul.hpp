@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -195,14 +196,19 @@ private:
     static bool on_ready(void *, const quants::act::exsia::StripeReadyEvent &);
     friend MatmulStatus execute_post_fold_pipeline(const ggml_gemmini_args_t &, MatmulStripeCollector &);
     void worker_loop();
+    void compensation_loop();
     bool worker_started_ = false;
     bool stop_requested_ = false;
+    bool dense_done_ = false;
     std::thread worker_;
+    std::thread compensation_worker_;
     MatmulExecution * execution_ = nullptr;
     std::mutex mutex_;
     std::condition_variable condition_;
     std::deque<CapturedStripe> pending_;
+    std::deque<std::unique_ptr<MatmulStripeJob>> compensation_pending_;
     size_t capacity_;
+    size_t in_flight_ = 0;
     std::vector<CapturedStripe> stripes_;
     std::vector<MatmulJobMetrics> profiles_;
     MatmulStatus status_;

@@ -463,7 +463,9 @@ bool MatmulStripeCollector::start(MatmulExecution & execution) {
     }
     execution_ = &execution;
     worker_started_ = true;
+    dense_done_ = false;
     worker_ = std::thread(&MatmulStripeCollector::worker_loop, this);
+    compensation_worker_ = std::thread(&MatmulStripeCollector::compensation_loop, this);
     return true;
 }
 
@@ -479,6 +481,14 @@ MatmulStatus MatmulStripeCollector::finish() {
     if (worker_.joinable()) {
         worker_.join();
     }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        dense_done_ = true;
+    }
+    condition_.notify_all();
+    if (compensation_worker_.joinable()) {
+        compensation_worker_.join();
+    }
     worker_started_ = false;
     return status_;
 }
@@ -488,7 +498,9 @@ void MatmulStripeCollector::worker_loop() {
         CapturedStripe captured{};
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            condition_.wait(lock, [this] { return stop_requested_ || !pending_.empty(); });
+            condition_.wait(lock, [this] {
+                return stop_requested_ || (!pending_.empty() && in_flight_ < capacity_);
+            });
             if (pending_.empty()) {
                 break;
             }
@@ -505,15 +517,11 @@ void MatmulStripeCollector::worker_loop() {
         job.metrics_.sf_cycles = captured.sf_cycles;
         MatmulStatus status = prepare_compensation(job);
         if (status) status = execute_dense_stripe(job);
-        const size_t shard_count = std::max<size_t>(1, std::min(
-            execution_->options_.rc_shards == 0 ? size_t {1} : execution_->options_.rc_shards,
-            execution_->facade_.args().J));
-        for (size_t shard_id = 0; status && shard_id < shard_count; ++shard_id)
-            status = execute_compensation_shard(job, shard_id, shard_count);
-        if (status) status = finalize_stripe(job);
         if (status) {
             std::lock_guard<std::mutex> lock(mutex_);
-            profiles_.push_back(job.metrics());
+            ++in_flight_;
+            compensation_pending_.push_back(std::make_unique<MatmulStripeJob>(std::move(job)));
+            condition_.notify_all();
         }
         if (!status) {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -523,7 +531,55 @@ void MatmulStripeCollector::worker_loop() {
             break;
         }
     }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        dense_done_ = true;
+    }
     condition_.notify_all();
+}
+
+void MatmulStripeCollector::compensation_loop() {
+    for (;;) {
+        std::unique_ptr<MatmulStripeJob> job;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            condition_.wait(lock, [this] {
+                return dense_done_ || !compensation_pending_.empty();
+            });
+            if (compensation_pending_.empty()) {
+                if (dense_done_) {
+                    break;
+                }
+                continue;
+            }
+            job = std::move(compensation_pending_.front());
+            compensation_pending_.pop_front();
+        }
+
+        MatmulStatus status = job->status();
+        const size_t shard_count = std::max<size_t>(1, std::min(
+            execution_->options_.rc_shards == 0 ? size_t {1} : execution_->options_.rc_shards,
+            execution_->facade_.args().J));
+        for (size_t shard_id = 0; status && shard_id < shard_count; ++shard_id)
+            status = execute_compensation_shard(*job, shard_id, shard_count);
+        if (status) status = finalize_stripe(*job);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (status) {
+                profiles_.push_back(job->metrics());
+                --in_flight_;
+            } else {
+                status_ = status;
+                stop_requested_ = true;
+                compensation_pending_.clear();
+                --in_flight_;
+            }
+        }
+        condition_.notify_all();
+        if (!status) {
+            break;
+        }
+    }
 }
 
 const quants::act::exsia::StripeReadySink * MatmulStripeCollector::sink() const {
@@ -722,7 +778,6 @@ MatmulStatus prepare_compensation(MatmulStripeJob & job) {
         !std::holds_alternative<quants::act::NoneMeta>(storage) &&
         !std::holds_alternative<quants::act::tensor::Meta>(storage)) {
         job.status_ = unsupported_backend("compensation preparation is unsupported by backend");
-        job.execution_->status_ = job.status_;
         return job.status_;
     }
     if (!job.has_captured_outliers_) {
@@ -820,7 +875,6 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job, size_t shard_id, 
             job.state_ = MatmulStripeJob::State::compensation_complete;
         record_metric(job.metrics_.rc_compute, job.execution_->options_.profiling, start);
     }
-    job.execution_->status_ = job.status_;
     return job.status_;
 }
 
