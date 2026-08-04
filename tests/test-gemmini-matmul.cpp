@@ -1,3 +1,5 @@
+#define GGML_GEMMINI_TEST_OBSERVER 1
+
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-matmul.hpp"
 
@@ -1271,6 +1273,56 @@ bool test_pipeline_cancellation() {
         check(execution.state() == MatmulExecutionState::failed, "pipeline cancellation execution state");
 }
 
+bool test_live_worker_rc_failure_releases_collector_slot_once() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1, 2, 3, 4 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> output(4, 0.0f);
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_pipeline;
+    options.job_capacity = 1;
+    auto args = make_args(activation, weights, output);
+    args.I = 2;
+    auto execution = prepare_execution(args, options);
+    MatmulStripeCollector collector(1);
+    collector.test_inject_rc_failure(
+        { MatmulStatusCode::execution_failure, "injected RC worker failure" });
+    if (!check(execution.status().ok() && collector.start(execution), "RC-failure live worker start")) {
+        return false;
+    }
+    const auto * sink = collector.sink();
+    const bool injected_job_admitted = sink->on_ready(
+        sink->user_data, { 0, 0, 2, nullptr, 0, 10, 20, 30, 50 });
+    const auto failure = collector.finish();
+    const auto execution_failure = finish_execution(execution);
+
+    std::vector<float> replacement_output(4, 0.0f);
+    auto replacement_args = make_args(activation, weights, replacement_output);
+    replacement_args.I = 2;
+    auto replacement_execution = prepare_execution(replacement_args, options);
+    MatmulStripeCollector replacement(1);
+    const bool replacement_started = replacement.start(replacement_execution);
+    const auto * replacement_sink = replacement.sink();
+    const bool replacement_admitted = replacement_started && replacement_sink->on_ready(
+        replacement_sink->user_data, { 0, 0, 2, nullptr, 0, 10, 20, 30, 50 });
+    const bool replacement_finished = replacement_admitted && replacement.finish().ok() &&
+        finish_execution(replacement_execution).ok();
+
+    const bool passed =
+        check(injected_job_admitted, "RC-failure job admitted") &&
+        check(failure.code == MatmulStatusCode::execution_failure &&
+                  execution_failure.code == MatmulStatusCode::execution_failure,
+              "RC failure propagates to collector and execution") &&
+        check(collector.test_dense_cancelled(), "RC failure cancels dense branch") &&
+        check(collector.test_in_flight() == 0, "RC failure releases collector slot exactly once") &&
+        check(replacement_finished, "replacement slot admission and capacity recovery");
+    if (passed) {
+        std::puts("PASS edge: RC-failure-injection=yes first-failure/cancel-propagation=yes "
+                  "exactly-once-slot-release=yes slot-reuse/capacity-recovery=yes");
+    }
+    return passed;
+}
+
 }
 
 int main(int argc, char ** argv) {
@@ -1285,6 +1337,7 @@ int main(int argc, char ** argv) {
         test_live_pipeline_worker() && test_compensation_shard_output_is_bitwise_stable() &&
         test_live_worker_parallel_compensation_is_bitwise_stable() &&
         test_pipeline_cancellation() &&
+        test_live_worker_rc_failure_releases_collector_slot_once() &&
         test_staged_contract_errors();
     if (edge_only) {
         return edge ? 0 : 1;

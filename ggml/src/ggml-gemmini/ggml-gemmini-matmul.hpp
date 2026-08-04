@@ -203,6 +203,11 @@ public:
     MatmulStatus status() const;
     std::vector<MatmulJobMetrics> profiles() const;
     quants::QactOutlier captured_outlier(size_t stripe, size_t outlier) const;
+#if defined(GGML_GEMMINI_TEST_OBSERVER)
+    void test_inject_rc_failure(MatmulStatus failure);
+    size_t test_in_flight() const;
+    bool test_dense_cancelled() const;
+#endif
 
 private:
     struct CapturedStripe {
@@ -219,6 +224,7 @@ private:
     static bool on_ready(void *, const quants::act::exsia::StripeReadyEvent &);
     friend MatmulStatus execute_post_fold_pipeline(const ggml_gemmini_args_t &, MatmulStripeCollector &);
     void fail(MatmulStatus status);
+    void release_in_flight_once(const std::shared_ptr<MatmulStripeJob> & job);
     void worker_loop();
     void compensation_loop();
     bool worker_started_ = false;
@@ -419,6 +425,7 @@ private:
     bool has_captured_outliers_ = false;
     bool owns_slot_ = false;
     bool released_ = false;
+    bool collector_slot_released_ = false;
     size_t expected_shards_ = 1;
     size_t completed_shards_ = 0;
     bool parallel_shards_ = false;

@@ -814,6 +814,15 @@ MatmulStatus MatmulExecution::status() const {
     return status_;
 }
 
+#if defined(GGML_GEMMINI_TEST_OBSERVER)
+namespace {
+MatmulStripeCollector * test_rc_failure_collector = nullptr;
+MatmulStatus test_rc_failure;
+MatmulStripeCollector * test_dense_cancelled_collector = nullptr;
+bool test_dense_was_cancelled = false;
+}
+#endif
+
 MatmulStripeCollector::MatmulStripeCollector(size_t capacity)
     : capacity_(capacity), sink_{this, &MatmulStripeCollector::on_ready} {
     if (capacity == 0) {
@@ -823,6 +832,17 @@ MatmulStripeCollector::MatmulStripeCollector(size_t capacity)
 
 MatmulStripeCollector::~MatmulStripeCollector() {
     finish();
+#if defined(GGML_GEMMINI_TEST_OBSERVER)
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (test_rc_failure_collector == this) {
+        test_rc_failure_collector = nullptr;
+        test_rc_failure = {};
+    }
+    if (test_dense_cancelled_collector == this) {
+        test_dense_cancelled_collector = nullptr;
+        test_dense_was_cancelled = false;
+    }
+#endif
 }
 
 bool MatmulStripeCollector::start(MatmulExecution & execution) {
@@ -889,6 +909,24 @@ void MatmulStripeCollector::fail(MatmulStatus failure) {
         job->cancel(failure);
     }
     condition_.notify_all();
+}
+
+void MatmulStripeCollector::release_in_flight_once(
+        const std::shared_ptr<MatmulStripeJob> & job) {
+#if defined(GGML_GEMMINI_TEST_OBSERVER)
+    const bool dense_cancelled = job->snapshot().dense == MatmulDenseState::cancelled;
+#endif
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (job->collector_slot_released_) {
+        return;
+    }
+    job->collector_slot_released_ = true;
+#if defined(GGML_GEMMINI_TEST_OBSERVER)
+    if (test_dense_cancelled_collector == this) {
+        test_dense_was_cancelled = dense_cancelled;
+    }
+#endif
+    --in_flight_;
 }
 
 MatmulStatus MatmulStripeCollector::finish() {
@@ -976,10 +1014,7 @@ void MatmulStripeCollector::worker_loop() {
         }
         if (status) status = execute_dense_stripe(*job);
         if (!status) {
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                --in_flight_;
-            }
+            release_in_flight_once(job);
             fail(status);
             break;
         }
@@ -1010,6 +1045,12 @@ void MatmulStripeCollector::compensation_loop() {
         }
 
         MatmulStatus status = job->status();
+#if defined(GGML_GEMMINI_TEST_OBSERVER)
+        if (status && test_rc_failure_collector == this && !test_rc_failure) {
+            status = test_rc_failure;
+            job->record_failure(status, false);
+        }
+#endif
         {
             std::lock_guard<std::mutex> job_lock(*job->shard_mutex_);
             job->metrics_.rc_start_ns = now_ns();
@@ -1064,15 +1105,11 @@ void MatmulStripeCollector::compensation_loop() {
             std::lock_guard<std::mutex> job_lock(*job->shard_mutex_);
             job->metrics_.rc_end_ns = now_ns();
         }
-        {
+        if (status) {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (status) {
-                profiles_.push_back(job->metrics());
-                --in_flight_;
-            } else {
-                --in_flight_;
-            }
+            profiles_.push_back(job->metrics());
         }
+        release_in_flight_once(job);
         condition_.notify_all();
         if (!status) {
             fail(status);
@@ -1099,6 +1136,26 @@ quants::QactOutlier MatmulStripeCollector::captured_outlier(size_t stripe, size_
     std::lock_guard<std::mutex> lock(mutex_);
     return stripes_.at(stripe).outliers.at(outlier);
 }
+
+#if defined(GGML_GEMMINI_TEST_OBSERVER)
+void MatmulStripeCollector::test_inject_rc_failure(MatmulStatus failure) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    test_rc_failure_collector = this;
+    test_rc_failure = failure;
+    test_dense_cancelled_collector = this;
+    test_dense_was_cancelled = false;
+}
+
+size_t MatmulStripeCollector::test_in_flight() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return in_flight_;
+}
+
+bool MatmulStripeCollector::test_dense_cancelled() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return test_dense_cancelled_collector == this && test_dense_was_cancelled;
+}
+#endif
 
 bool MatmulStripeCollector::on_ready(
         void * user_data, const quants::act::exsia::StripeReadyEvent & event) {
@@ -1186,7 +1243,7 @@ MatmulStripeJob::MatmulStripeJob(MatmulStripeJob && other) noexcept
       compensation_ycom_(std::move(other.compensation_ycom_)),
       staged_activation_meta_(std::move(other.staged_activation_meta_)),
       has_captured_outliers_(other.has_captured_outliers_), owns_slot_(other.owns_slot_),
-      released_(other.released_),
+      released_(other.released_), collector_slot_released_(other.collector_slot_released_),
       expected_shards_(other.expected_shards_), completed_shards_(other.completed_shards_),
       parallel_shards_(other.parallel_shards_), shard_mutex_(std::move(other.shard_mutex_)),
       dense_state_(other.dense_state_), rc_state_(other.rc_state_), captured_(other.captured_),
@@ -1194,6 +1251,7 @@ MatmulStripeJob::MatmulStripeJob(MatmulStripeJob && other) noexcept
     other.execution_ = nullptr;
     other.owns_slot_ = false;
     other.released_ = true;
+    other.collector_slot_released_ = true;
 }
 
 MatmulStripeJob & MatmulStripeJob::operator=(MatmulStripeJob && other) noexcept {
@@ -1210,6 +1268,7 @@ MatmulStripeJob & MatmulStripeJob::operator=(MatmulStripeJob && other) noexcept 
         has_captured_outliers_ = other.has_captured_outliers_;
         owns_slot_ = other.owns_slot_;
         released_ = other.released_;
+        collector_slot_released_ = other.collector_slot_released_;
         expected_shards_ = other.expected_shards_;
         completed_shards_ = other.completed_shards_;
         parallel_shards_ = other.parallel_shards_;
@@ -1221,6 +1280,7 @@ MatmulStripeJob & MatmulStripeJob::operator=(MatmulStripeJob && other) noexcept 
         other.execution_ = nullptr;
         other.owns_slot_ = false;
         other.released_ = true;
+        other.collector_slot_released_ = true;
     }
     return *this;
 }
