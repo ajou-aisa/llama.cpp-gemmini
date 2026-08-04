@@ -13,6 +13,34 @@
 
 namespace ggml::gemmini {
 
+namespace detail {
+
+enum class ActivationRoute : uint8_t { unknown, fp32, exsia, tensor, token, block };
+enum class WeightRoute : uint8_t {
+    unknown, tensor_i8, q8_h1, q8_hp1, q8_h2, q8_hp2,
+    q8_channel_direct, q8_channel_sidecar, q8_h0
+};
+enum class BackendRoute : uint8_t { cpu };
+
+struct RouteKey {
+    ActivationRoute activation = ActivationRoute::unknown;
+    WeightRoute weight = WeightRoute::unknown;
+    BackendRoute backend = BackendRoute::cpu;
+};
+
+struct RouteCapabilities {
+    bool full = false;
+    bool sliced_dense = false;
+    bool sliced_compensation = false;
+    bool live_stripe_producer = false;
+    bool deprecated = false;
+};
+
+RouteKey normalize_route(const ggml_gemmini_args_t & args);
+RouteCapabilities route_capabilities(const ggml_gemmini_args_t & args);
+
+}
+
 enum class MatMulStatus {
     success,
     empty_stripes,

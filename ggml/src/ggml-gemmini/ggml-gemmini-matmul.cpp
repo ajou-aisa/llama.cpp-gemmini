@@ -33,6 +33,49 @@ bool uses_baseline_channel_route(const ggml_gemmini_args_t & args) {
         args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar;
 }
 
+}
+
+namespace detail {
+
+RouteKey normalize_route(const ggml_gemmini_args_t & args) {
+    RouteKey key{};
+    const auto & storage = args.act_quant.storage();
+    if (std::holds_alternative<quants::act::exsia::Meta>(storage)) key.activation = ActivationRoute::exsia;
+    else if (std::holds_alternative<quants::act::tensor::Meta>(storage)) key.activation = ActivationRoute::tensor;
+    else if (std::holds_alternative<quants::act::token::Meta>(storage)) key.activation = ActivationRoute::token;
+    else if (std::holds_alternative<quants::act::block::Meta>(storage) ||
+             std::holds_alternative<quants::act::stripe::Meta>(storage)) key.activation = ActivationRoute::block;
+    else if (std::holds_alternative<quants::act::NoneMeta>(storage)) key.activation = ActivationRoute::fp32;
+
+    using Format = ggml_gemmini_args_t::im2p_weight_format_t;
+    switch (args.weight_format) {
+        case Format::q8_0_unpacked_to_h1: key.weight = args.weight_i8_scale_active ? WeightRoute::tensor_i8 : WeightRoute::q8_h1; break;
+        case Format::q8_h0: key.weight = WeightRoute::q8_h0; break;
+        case Format::q8_h1: key.weight = WeightRoute::q8_h1; break;
+        case Format::q8_hp1: key.weight = WeightRoute::q8_hp1; break;
+        case Format::q8_h2: key.weight = WeightRoute::q8_h2; break;
+        case Format::q8_hp2: key.weight = WeightRoute::q8_hp2; break;
+        case Format::q8_channel: key.weight = WeightRoute::q8_channel_direct; break;
+        case Format::q8_channel_dense_sidecar: key.weight = WeightRoute::q8_channel_sidecar; break;
+    }
+    return key;
+}
+
+RouteCapabilities route_capabilities(const ggml_gemmini_args_t & args) {
+    const RouteKey key = normalize_route(args);
+    RouteCapabilities caps{};
+    caps.deprecated = key.weight == WeightRoute::q8_h2 || key.weight == WeightRoute::q8_hp2;
+    caps.full = key.weight != WeightRoute::unknown && key.weight != WeightRoute::q8_h0;
+    caps.sliced_dense = caps.full && !caps.deprecated;
+    caps.sliced_compensation = caps.sliced_dense;
+    caps.live_stripe_producer = key.activation == ActivationRoute::exsia && caps.sliced_compensation;
+    return caps;
+}
+
+}
+
+namespace {
+
 baseline_activation_quant_t baseline_activation_for(const ggml_gemmini_args_t & args) {
     const auto & storage = args.act_quant.storage();
     if (std::holds_alternative<quants::act::tensor::Meta>(storage)) {
@@ -177,6 +220,9 @@ MatMulResult MatMul::run_dense() {
     if (args().weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_h0) {
         return { MatMulStatus::unsupported, MatMulCapability::unsupported };
     }
+    if (!detail::route_capabilities(args()).full) {
+        return { MatMulStatus::unsupported, MatMulCapability::unsupported };
+    }
 
     execute_dense(args());
     return { MatMulStatus::success, MatMulCapability::supported };
@@ -261,8 +307,10 @@ MatMulStatus MatMul::finish_stripes() {
 
 MatMulCapability MatMul::stripe_capability(const ggml_gemmini_args_t & args) {
     const auto format = args.weight_format;
+    const auto capabilities = detail::route_capabilities(args);
     if (format == ggml_gemmini_args_t::im2p_weight_format_t::q8_h2 ||
         format == ggml_gemmini_args_t::im2p_weight_format_t::q8_hp2 ||
+        !capabilities.sliced_compensation ||
         args.transpose_A || (args.D != nullptr && !args.repeating_bias) ||
         (!row_invariant_activation(args) &&
          !std::holds_alternative<quants::act::exsia::Meta>(args.act_quant.storage()))) {
