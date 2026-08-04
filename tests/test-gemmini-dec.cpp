@@ -1287,7 +1287,7 @@ void print_group_k_csc_replay_cost(
     const char *label,
     const ggml::gemmini::quants::dec::GroupKCSCScalarStats &stats) {
     std::printf(
-        "replay group_k_csc_cost case=%s width_path=%s classify=%zu scratch_init=%zu sparse_update=%zu merge=%zu safe_updates=%zu fallback_updates=%zu branch_entry_classify=%zu\n",
+        "replay group_k_csc_cost case=%s width_path=%s classify=%zu scratch_init=%zu sparse_update=%zu merge=%zu safe_updates=%zu fallback_updates=%zu branch_entry_classify=%zu classify_cycles=%llu scratch_init_cycles=%llu sparse_update_cycles=%llu merge_cycles=%llu\n",
         label,
         group_k_csc_width_path_name(stats.width_path),
         stats.classification_work_count,
@@ -1296,7 +1296,32 @@ void print_group_k_csc_replay_cost(
         stats.merge_count,
         stats.safe_update_count,
         stats.fallback_update_count,
-        stats.branch_entry_classification_count);
+        stats.branch_entry_classification_count,
+        static_cast<unsigned long long>(stats.classification_cycles),
+        static_cast<unsigned long long>(stats.scratch_init_cycles),
+        static_cast<unsigned long long>(stats.sparse_update_cycles),
+        static_cast<unsigned long long>(stats.merge_cycles));
+}
+
+bool check_group_k_csc_stage_cycles(
+    const ggml::gemmini::quants::dec::GroupKCSCScalarStats &stats,
+    bool expect_classification_cycles,
+    const char *message) {
+#if LOG_CYCLE
+    return check((!expect_classification_cycles || stats.classification_cycles > 0) &&
+                     (expect_classification_cycles || stats.classification_cycles == 0) &&
+                     stats.scratch_init_cycles > 0 &&
+                     stats.sparse_update_cycles > 0 &&
+                     stats.merge_cycles > 0,
+                 message);
+#else
+    (void)expect_classification_cycles;
+    return check(stats.classification_cycles == 0 &&
+                     stats.scratch_init_cycles == 0 &&
+                     stats.sparse_update_cycles == 0 &&
+                     stats.merge_cycles == 0,
+                 message);
+#endif
 }
 
 bool byte_identical(const std::vector<float> &lhs, const std::vector<float> &rhs);
@@ -1683,7 +1708,13 @@ bool test_fixed_residual_replay_baseline() {
                    group_k_csc_mixed_nr4_stats.int32_row_count == rows &&
                    group_k_csc_mixed_nr4_stats.int64_fallback_row_count == 0 &&
                    group_k_csc_mixed_nr4_stats.width_path == GroupKCSCWidthPath::AllInt32,
-               "fixed replay GroupKCSC NR4/8 reuse all-safe counters") && ok;
+               "fixed replay GroupKCSC NR4/8 reuse all-safe counters") &&
+        check_group_k_csc_stage_cycles(group_k_csc_stats, false, "fixed replay scalar stage cycles") &&
+        check_group_k_csc_stage_cycles(group_k_csc_nr4_stats, false, "fixed replay nr4 stage cycles") &&
+        check_group_k_csc_stage_cycles(group_k_csc_nr8_stats, false, "fixed replay nr8 stage cycles") &&
+        check_group_k_csc_stage_cycles(group_k_csc_mixed_stats, true, "fixed replay mixed nr8 stage cycles") &&
+        check_group_k_csc_stage_cycles(group_k_csc_mixed_nr4_stats, true, "fixed replay mixed nr4 stage cycles") &&
+        ok;
     print_group_k_csc_replay_cost("all-safe", group_k_csc_mixed_stats);
 
     constexpr size_t warmup_count = 5;
@@ -1906,7 +1937,10 @@ bool test_fixed_residual_replay_high_reuse() {
                    group_k_csc_nr8_stats.fallback_update_count == 0 &&
                    group_k_csc_nr8_stats.branch_entry_classification_count == 0 &&
                    group_k_csc_nr8_stats.width_path == GroupKCSCWidthPath::AllInt32,
-               "high-reuse replay NR4/NR8 counters stay all-safe") && ok;
+               "high-reuse replay NR4/NR8 counters stay all-safe") &&
+        check_group_k_csc_stage_cycles(group_k_csc_nr4_stats, true, "high-reuse nr4 stage cycles") &&
+        check_group_k_csc_stage_cycles(group_k_csc_nr8_stats, true, "high-reuse nr8 stage cycles") &&
+        ok;
 
     std::printf(
         "high-reuse dispatch rows=%zu cols=%zu depth=%zu disable_route=%s default_route=%s logical_refs=%zu disable_scalar_loads=%zu disable_vector_loads=%zu disable_reuse=%.1f default_scalar_loads=%zu default_vector_loads=%zu default_reuse=%.1f rows_per_active_k_mean=%.1f output_equal=%s\n",
@@ -2172,7 +2206,12 @@ bool test_group_k_csc_nr4_transposed_j_tile() {
                       (rows * sizeof(int32_t) + sizeof(int64_t)) &&
                   mixed_nr4_stats.int32_row_count == 2 &&
                   mixed_nr4_stats.int64_fallback_row_count == 1,
-              "GroupKCSC NR4/8 transposed J-tile fallback counters");
+              "GroupKCSC NR4/8 transposed J-tile fallback counters") &&
+        check_group_k_csc_stage_cycles(scalar_stats, false, "transposed scalar stage cycles") &&
+        check_group_k_csc_stage_cycles(nr4_stats, false, "transposed nr4 stage cycles") &&
+        check_group_k_csc_stage_cycles(nr8_stats, false, "transposed nr8 stage cycles") &&
+        check_group_k_csc_stage_cycles(mixed_stats, true, "transposed mixed nr8 stage cycles") &&
+        check_group_k_csc_stage_cycles(mixed_nr4_stats, true, "transposed mixed nr4 stage cycles");
     print_group_k_csc_replay_cost("one-fallback", mixed_stats);
     return ok;
 }
@@ -2335,7 +2374,19 @@ bool test_group_k_csc_mixed_int32_boundaries() {
                   fallback_mixed_nr4_stats.branch_entry_classification_count == 0 &&
                   fallback_mixed_nr4_stats.width_path ==
                       ggml::gemmini::quants::dec::GroupKCSCWidthPath::AllInt64,
-              "GroupKCSC NR4/8 mixed selects AllInt64");
+              "GroupKCSC NR4/8 mixed selects AllInt64") &&
+        check_group_k_csc_stage_cycles(int64_stats, false, "all-int64 scalar stage cycles") &&
+        check_group_k_csc_stage_cycles(int64_nr4_stats, false, "all-int64 nr4 stage cycles") &&
+        check_group_k_csc_stage_cycles(mixed_stats, true, "int32-boundary mixed nr8 stage cycles") &&
+        check_group_k_csc_stage_cycles(mixed_nr4_stats, true, "int32-boundary mixed nr4 stage cycles") &&
+        check_group_k_csc_stage_cycles(
+            fallback_int64_stats, false, "fallback all-int64 scalar stage cycles") &&
+        check_group_k_csc_stage_cycles(
+            fallback_int64_nr4_stats, false, "fallback all-int64 nr4 stage cycles") &&
+        check_group_k_csc_stage_cycles(
+            fallback_mixed_stats, true, "fallback mixed all-int64 nr8 stage cycles") &&
+        check_group_k_csc_stage_cycles(
+            fallback_mixed_nr4_stats, true, "fallback mixed all-int64 nr4 stage cycles");
     print_group_k_csc_replay_cost("all-int64", fallback_mixed_stats);
     return ok;
 }

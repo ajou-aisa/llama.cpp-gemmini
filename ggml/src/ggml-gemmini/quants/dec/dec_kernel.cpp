@@ -2,6 +2,11 @@
 #include "dec_internal.hpp"
 #include "../../ggml-gemmini-args.h"
 
+#if LOG_CYCLE
+#include <gemmini/cycle_reader.hpp>
+#include <atomic>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -87,6 +92,18 @@ H1ScaleParams h1_scale_params(
 
 namespace
 {
+#if LOG_CYCLE
+    static inline uint64_t dec_group_k_csc_stage_cycle_read()
+    {
+        return ggml::gemmini::cycle::read();
+    }
+
+    static inline uint64_t dec_group_k_csc_stage_cycle_span(uint64_t start, uint64_t end)
+    {
+        return end >= start ? end - start : 0;
+    }
+#endif
+
     struct H1ScaleTile
     {
         alignas(64) std::array<uint64_t, kDecInt64JTileWidth> c_eff{};
@@ -731,10 +748,25 @@ bool accumulate_to_ycom_int64_scalar_group_k_csc_impl(
     stats.merge_count = saturating_mul_size(count_active_rows(entries), J);
     stats.thread_scratch_bytes = saturating_mul_size(
         saturating_mul_size(I, tile_capacity), sizeof(int64_t));
+#if LOG_CYCLE
+    std::atomic<uint64_t> scratch_init_cycles {0};
+    std::atomic<uint64_t> sparse_update_cycles {0};
+    std::atomic<uint64_t> merge_cycles {0};
+#endif
 
     for_each_grouped_j_tile(I, J, [&](size_t jb, size_t width, std::vector<int64_t> &accumulator)
     {
+#if LOG_CYCLE
+        const uint64_t scratch_init_start = dec_group_k_csc_stage_cycle_read();
+#endif
         std::fill(accumulator.begin(), accumulator.begin() + I * width, int64_t {0});
+#if LOG_CYCLE
+        scratch_init_cycles.fetch_add(
+            dec_group_k_csc_stage_cycle_span(
+                scratch_init_start, dec_group_k_csc_stage_cycle_read()),
+            std::memory_order_relaxed);
+        const uint64_t sparse_update_start = dec_group_k_csc_stage_cycle_read();
+#endif
         for (size_t group = 0; group < group_k_csc_plan.num_groups; ++group)
         {
             const size_t group_offset = group * (kDecGroupSizeK + 1);
@@ -777,6 +809,13 @@ bool accumulate_to_ycom_int64_scalar_group_k_csc_impl(
             }
         }
 
+#if LOG_CYCLE
+        sparse_update_cycles.fetch_add(
+            dec_group_k_csc_stage_cycle_span(
+                sparse_update_start, dec_group_k_csc_stage_cycle_read()),
+            std::memory_order_relaxed);
+        const uint64_t merge_start = dec_group_k_csc_stage_cycle_read();
+#endif
         uint32_t previous_row = std::numeric_limits<uint32_t>::max();
         for (const ResidualGroupEntry &entry : entries)
         {
@@ -792,8 +831,18 @@ bool accumulate_to_ycom_int64_scalar_group_k_csc_impl(
                 output[t] += static_cast<float>(
                     static_cast<double>(row_accumulator[t]) * activation_scale * plan.scales.scalar);
         }
+#if LOG_CYCLE
+        merge_cycles.fetch_add(
+            dec_group_k_csc_stage_cycle_span(merge_start, dec_group_k_csc_stage_cycle_read()),
+            std::memory_order_relaxed);
+#endif
     });
 
+#if LOG_CYCLE
+    stats.scratch_init_cycles = scratch_init_cycles.load(std::memory_order_relaxed);
+    stats.sparse_update_cycles = sparse_update_cycles.load(std::memory_order_relaxed);
+    stats.merge_cycles = merge_cycles.load(std::memory_order_relaxed);
+#endif
     return true;
 }
 }
@@ -851,6 +900,9 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_impl(
     std::vector<size_t> fallback_slots(I, no_fallback_slot);
     std::vector<size_t> int32_rows;
     std::vector<size_t> int64_rows;
+#if LOG_CYCLE
+    const uint64_t classification_start = dec_group_k_csc_stage_cycle_read();
+#endif
     size_t entry_begin = 0;
     while (entry_begin < entries.size())
     {
@@ -902,6 +954,10 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_impl(
             group_k_csc_plan, entries, fallback_slots, no_fallback_slot, mixed_entry_plan);
         stats.branch_entry_classification_count = entries.size();
     }
+#if LOG_CYCLE
+    stats.classification_cycles = dec_group_k_csc_stage_cycle_span(
+        classification_start, dec_group_k_csc_stage_cycle_read());
+#endif
     const size_t int32_scratch_rows = all_int64 ? 0 : I;
     const size_t int64_scratch_rows = all_int32 ? 0 : stats.int64_fallback_row_count;
     stats.scratch_init_count = saturating_mul_size(
@@ -924,6 +980,11 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_impl(
     const size_t int64_scratch_bytes = saturating_mul_size(
         saturating_mul_size(int64_scratch_rows, tile_capacity), sizeof(int64_t));
     stats.thread_scratch_bytes = saturating_add_size(int32_scratch_bytes, int64_scratch_bytes);
+#if LOG_CYCLE
+    std::atomic<uint64_t> scratch_init_cycles {0};
+    std::atomic<uint64_t> sparse_update_cycles {0};
+    std::atomic<uint64_t> merge_cycles {0};
+#endif
 
     const auto accumulate_group = [&](size_t group, size_t jb, size_t width,
         const std::vector<uint32_t> &column_offsets, const auto &entry_order,
@@ -986,7 +1047,17 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_impl(
         for_each_grouped_j_tile_int32(I, J,
             [&](size_t jb, size_t width, std::vector<int32_t> &accumulator)
         {
+#if LOG_CYCLE
+            const uint64_t scratch_init_start = dec_group_k_csc_stage_cycle_read();
+#endif
             std::fill(accumulator.begin(), accumulator.begin() + I * width, int32_t {0});
+#if LOG_CYCLE
+            scratch_init_cycles.fetch_add(
+                dec_group_k_csc_stage_cycle_span(
+                    scratch_init_start, dec_group_k_csc_stage_cycle_read()),
+                std::memory_order_relaxed);
+            const uint64_t sparse_update_start = dec_group_k_csc_stage_cycle_read();
+#endif
             const auto update_int32 = [&](const ResidualGroupEntry &entry, size_t j_offset,
                 size_t lane_count, const std::array<int64_t, NR> &weight_lanes)
             {
@@ -1008,8 +1079,25 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_impl(
             for (size_t group = 0; group < group_k_csc_plan.num_groups; ++group)
                 accumulate_group(group, jb, width, group_k_csc_plan.column_offsets,
                     group_k_csc_plan.entry_order, update_int32);
+#if LOG_CYCLE
+            sparse_update_cycles.fetch_add(
+                dec_group_k_csc_stage_cycle_span(
+                    sparse_update_start, dec_group_k_csc_stage_cycle_read()),
+                std::memory_order_relaxed);
+            const uint64_t merge_start = dec_group_k_csc_stage_cycle_read();
+#endif
             merge_int32(jb, width, accumulator);
+#if LOG_CYCLE
+            merge_cycles.fetch_add(
+                dec_group_k_csc_stage_cycle_span(merge_start, dec_group_k_csc_stage_cycle_read()),
+                std::memory_order_relaxed);
+#endif
         });
+#if LOG_CYCLE
+        stats.scratch_init_cycles = scratch_init_cycles.load(std::memory_order_relaxed);
+        stats.sparse_update_cycles = sparse_update_cycles.load(std::memory_order_relaxed);
+        stats.merge_cycles = merge_cycles.load(std::memory_order_relaxed);
+#endif
         return true;
     }
 
@@ -1044,14 +1132,41 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_impl(
         for_each_grouped_j_tile(stats.int64_fallback_row_count, J,
             [&](size_t jb, size_t width, std::vector<int64_t> &accumulator)
         {
+#if LOG_CYCLE
+            const uint64_t scratch_init_start = dec_group_k_csc_stage_cycle_read();
+#endif
             std::fill(accumulator.begin(),
                 accumulator.begin() + stats.int64_fallback_row_count * width, int64_t {0});
+#if LOG_CYCLE
+            scratch_init_cycles.fetch_add(
+                dec_group_k_csc_stage_cycle_span(
+                    scratch_init_start, dec_group_k_csc_stage_cycle_read()),
+                std::memory_order_relaxed);
+            const uint64_t sparse_update_start = dec_group_k_csc_stage_cycle_read();
+#endif
             const auto update_int64 = update_int64_for(accumulator, width);
             for (size_t group = 0; group < group_k_csc_plan.num_groups; ++group)
                 accumulate_group(group, jb, width, group_k_csc_plan.column_offsets,
                     group_k_csc_plan.entry_order, update_int64);
+#if LOG_CYCLE
+            sparse_update_cycles.fetch_add(
+                dec_group_k_csc_stage_cycle_span(
+                    sparse_update_start, dec_group_k_csc_stage_cycle_read()),
+                std::memory_order_relaxed);
+            const uint64_t merge_start = dec_group_k_csc_stage_cycle_read();
+#endif
             merge_int64(jb, width, accumulator);
+#if LOG_CYCLE
+            merge_cycles.fetch_add(
+                dec_group_k_csc_stage_cycle_span(merge_start, dec_group_k_csc_stage_cycle_read()),
+                std::memory_order_relaxed);
+#endif
         });
+#if LOG_CYCLE
+        stats.scratch_init_cycles = scratch_init_cycles.load(std::memory_order_relaxed);
+        stats.sparse_update_cycles = sparse_update_cycles.load(std::memory_order_relaxed);
+        stats.merge_cycles = merge_cycles.load(std::memory_order_relaxed);
+#endif
         return true;
     }
 
@@ -1060,10 +1175,20 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_impl(
         [&](size_t jb, size_t width, std::vector<int32_t> &int32_accumulator,
             std::vector<int64_t> &int64_accumulator)
     {
+#if LOG_CYCLE
+        const uint64_t scratch_init_start = dec_group_k_csc_stage_cycle_read();
+#endif
         std::fill(int32_accumulator.begin(), int32_accumulator.begin() + I * width, int32_t {0});
         std::fill(int64_accumulator.begin(),
                   int64_accumulator.begin() + stats.int64_fallback_row_count * width,
                   int64_t {0});
+#if LOG_CYCLE
+        scratch_init_cycles.fetch_add(
+            dec_group_k_csc_stage_cycle_span(
+                scratch_init_start, dec_group_k_csc_stage_cycle_read()),
+            std::memory_order_relaxed);
+        const uint64_t sparse_update_start = dec_group_k_csc_stage_cycle_read();
+#endif
         const auto update_int32 = [&](const ResidualGroupEntry &entry, size_t j_offset,
             size_t lane_count, const std::array<int64_t, NR> &weight_lanes)
         {
@@ -1120,10 +1245,27 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_impl(
             }
         }
 
+#if LOG_CYCLE
+        sparse_update_cycles.fetch_add(
+            dec_group_k_csc_stage_cycle_span(
+                sparse_update_start, dec_group_k_csc_stage_cycle_read()),
+            std::memory_order_relaxed);
+        const uint64_t merge_start = dec_group_k_csc_stage_cycle_read();
+#endif
         merge_int32(jb, width, int32_accumulator);
         merge_int64(jb, width, int64_accumulator);
+#if LOG_CYCLE
+        merge_cycles.fetch_add(
+            dec_group_k_csc_stage_cycle_span(merge_start, dec_group_k_csc_stage_cycle_read()),
+            std::memory_order_relaxed);
+#endif
     });
 
+#if LOG_CYCLE
+    stats.scratch_init_cycles = scratch_init_cycles.load(std::memory_order_relaxed);
+    stats.sparse_update_cycles = sparse_update_cycles.load(std::memory_order_relaxed);
+    stats.merge_cycles = merge_cycles.load(std::memory_order_relaxed);
+#endif
     return true;
 }
 }

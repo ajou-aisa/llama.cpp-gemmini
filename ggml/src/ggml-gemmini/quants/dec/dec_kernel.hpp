@@ -41,6 +41,10 @@ struct GroupKCSCScalarStats
     size_t thread_scratch_bytes = 0;
     size_t int32_row_count = 0;
     size_t int64_fallback_row_count = 0;
+    uint64_t classification_cycles = 0;
+    uint64_t scratch_init_cycles = 0;
+    uint64_t sparse_update_cycles = 0;
+    uint64_t merge_cycles = 0;
     GroupKCSCWidthPath width_path = GroupKCSCWidthPath::Mixed;
 };
 
