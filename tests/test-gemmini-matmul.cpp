@@ -305,6 +305,22 @@ bool test_route_capability_table() {
                  "Gemmini OS explicit unsupported capability");
 }
 
+bool test_explicit_exsia_channel_rejection() {
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> output(6, 0.0f);
+    auto args = make_args(activation, weights, output);
+    args.act_quant.storage().emplace<ggml::gemmini::quants::act::exsia::Meta>();
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_channel;
+    const auto key = ggml::gemmini::detail::normalize_route(args);
+    const auto caps = ggml::gemmini::detail::route_capabilities(args);
+    return check(key.activation == ggml::gemmini::detail::ActivationRoute::exsia &&
+                     key.weight == ggml::gemmini::detail::WeightRoute::q8_channel_direct,
+                 "EXSIA Q8_CHANNEL route normalization") &&
+        check(!caps.full && !caps.sliced_compensation,
+              "EXSIA Q8_CHANNEL explicit unsupported capability");
+}
+
 bool test_malformed_route_contract_rejected() {
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
@@ -505,6 +521,7 @@ bool test_live_worker_parallel_compensation_is_bitwise_stable() {
 int main(int argc, char ** argv) {
     const bool edge_only = argc == 2 && std::string_view(argv[1]) == "--edge";
     const bool edge = test_public_contract_shape() && test_route_capability_table() &&
+        test_explicit_exsia_channel_rejection() &&
         test_malformed_route_contract_rejected() &&
         test_bounded_pipeline_slots_and_reuse() &&
         test_live_pipeline_worker() && test_compensation_shard_output_is_bitwise_stable() &&
