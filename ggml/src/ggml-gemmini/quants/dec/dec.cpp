@@ -379,7 +379,8 @@ namespace
 ActivationDECResult compensate_activation_dec(
     const std::vector<ggml::gemmini::quants::QactOutlier> &outliers,
     ggml_gemmini_args_t &args,
-    const char *layer)
+    const char *layer,
+    DispatchOverride dispatch_override)
 {
     uint64_t start = ggml::gemmini::cycle::read();
 
@@ -520,14 +521,16 @@ ActivationDECResult compensate_activation_dec(
     }
 
     const char *disable_group_k_csc = std::getenv("DEC_GROUP_K_CSC_DISABLE");
-    const bool group_k_csc_disabled = disable_group_k_csc &&
-        disable_group_k_csc[0] == '1' && disable_group_k_csc[1] == '\0';
+    const bool group_k_csc_disabled = dispatch_override == DispatchOverride::row_direct ||
+        (disable_group_k_csc &&
+         disable_group_k_csc[0] == '1' && disable_group_k_csc[1] == '\0');
     const char *enable_group_k_csc = std::getenv("DEC_GROUP_K_CSC_ENABLE");
     const bool group_k_csc_enabled = enable_group_k_csc &&
         enable_group_k_csc[0] == '1' && enable_group_k_csc[1] == '\0';
     const char *force_group_k_csc = std::getenv("DEC_GROUP_K_CSC_FORCE");
-    const bool group_k_csc_forced = force_group_k_csc &&
-        force_group_k_csc[0] == '1' && force_group_k_csc[1] == '\0';
+    const bool group_k_csc_forced = dispatch_override == DispatchOverride::group_k_csc ||
+        (force_group_k_csc &&
+         force_group_k_csc[0] == '1' && force_group_k_csc[1] == '\0');
     const size_t group_count = K / kDecGroupSizeK + (K % kDecGroupSizeK != 0);
     result.int_mac_count = saturating_mul_size(result.nnz, J);
     result.logical_weight_reference_count = result.int_mac_count;
@@ -883,7 +886,8 @@ ActivationDECRowSliceStatus compensate_activation_dec_rows(
     ggml_gemmini_args_t &args,
     size_t row_begin,
     size_t row_end,
-    const char *layer)
+    const char *layer,
+    DispatchOverride dispatch_override)
 {
     const auto &storage = args.act_quant.storage();
     if (!std::holds_alternative<act::NoneMeta>(storage) &&
@@ -917,7 +921,7 @@ ActivationDECRowSliceStatus compensate_activation_dec_rows(
     local_args.I = row_end - row_begin;
     local_args.A += row_begin * input_stride;
     local_args.f_out += row_begin * output_stride;
-    compensate_activation_dec(local_outliers, local_args, layer);
+    compensate_activation_dec(local_outliers, local_args, layer, dispatch_override);
     return ActivationDECRowSliceStatus::success;
 }
 
@@ -928,7 +932,8 @@ ActivationDECRowSliceStatus compensate_activation_dec_rows_columns(
     size_t row_end,
     size_t col_begin,
     size_t col_end,
-    const char *layer)
+    const char *layer,
+    DispatchOverride dispatch_override)
 {
     if (row_begin >= row_end || row_end > args.I || col_begin >= col_end || col_end > args.J)
         return ActivationDECRowSliceStatus::invalid_arguments;
@@ -1020,7 +1025,7 @@ ActivationDECRowSliceStatus compensate_activation_dec_rows_columns(
             local_outliers.push_back({static_cast<int>(static_cast<size_t>(outlier.row) - row_begin),
                                       outlier.col, outlier.residual});
     }
-    compensate_activation_dec(local_outliers, local_args, layer);
+    compensate_activation_dec(local_outliers, local_args, layer, dispatch_override);
     return ActivationDECRowSliceStatus::success;
 }
 } // namespace ggml::gemmini::quants::dec

@@ -3,12 +3,20 @@
 #include "../act/types.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 struct ggml_gemmini_args_t;
 
 namespace ggml::gemmini::quants::dec
 {
+enum class DispatchOverride : uint8_t
+{
+    automatic,
+    row_direct,
+    group_k_csc,
+};
+
 struct ActivationDECResult
 {
     size_t total_selected = 0;
@@ -36,14 +44,16 @@ enum class ActivationDECRowSliceStatus {
 ActivationDECResult compensate_activation_dec(
     const std::vector<QactOutlier> &outliers,
     ggml_gemmini_args_t &args,
-    const char *layer);
+    const char *layer,
+    DispatchOverride override = DispatchOverride::automatic);
 
 ActivationDECRowSliceStatus compensate_activation_dec_rows(
     const std::vector<QactOutlier> &outliers,
     ggml_gemmini_args_t &args,
     size_t row_begin,
     size_t row_end,
-    const char *layer);
+    const char *layer,
+    DispatchOverride override = DispatchOverride::automatic);
 
 ActivationDECRowSliceStatus compensate_activation_dec_rows_columns(
     const std::vector<QactOutlier> &outliers,
@@ -52,5 +62,6 @@ ActivationDECRowSliceStatus compensate_activation_dec_rows_columns(
     size_t row_end,
     size_t col_begin,
     size_t col_end,
-    const char *layer);
+    const char *layer,
+    DispatchOverride override = DispatchOverride::automatic);
 } // namespace ggml::gemmini::quants::dec

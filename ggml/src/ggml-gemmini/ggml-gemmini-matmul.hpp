@@ -2,6 +2,7 @@
 
 #include "ggml-gemmini-args.h"
 #include "quants/act/exsia/exsia.hpp"
+#include "quants/dec/dec.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -79,6 +80,7 @@ struct MatMulResult {
 };
 
 class MatmulStripeJob;
+class MatmulExecution;
 struct MatmulStatus;
 MatmulStatus prepare_compensation(MatmulStripeJob &);
 MatmulStatus execute_compensation_shard(MatmulStripeJob &);
@@ -105,12 +107,14 @@ public:
 private:
     friend class MatmulExecution;
     friend class MatmulStripeCollector;
+    friend MatmulStatus execute_full(MatmulExecution &);
     friend MatmulStatus prepare_compensation(MatmulStripeJob &);
     friend MatmulStatus execute_compensation_shard(MatmulStripeJob &);
     friend MatmulStatus execute_compensation_shard(MatmulStripeJob &, size_t, size_t);
     friend MatmulStatus execute_dense_stripe(MatmulStripeJob &);
 
     MatMulStatus run_stripe(MatMulStripe stripe, size_t stripe_id);
+    MatMulResult run_full(quants::dec::DispatchOverride dispatch_override);
 
     ggml_gemmini_args_t & args();
     const ggml_gemmini_args_t & args() const;
@@ -175,8 +179,6 @@ struct MatmulJobMetrics {
     uint64_t rc_start_ns = 0;
     uint64_t rc_end_ns = 0;
 };
-
-class MatmulExecution;
 
 class MatmulStripeCollector {
 public:
@@ -244,6 +246,8 @@ struct MatmulOptions {
     bool validation = false;
     bool profiling = false;
     bool force = false;
+    bool force_row_direct = false;
+    bool force_group_k_csc = false;
     size_t job_capacity = 4;
 };
 
@@ -310,6 +314,8 @@ private:
     MatMul facade_;
     MatmulOptions options_;
     MatmulStatus status_;
+    quants::dec::DispatchOverride dispatch_override_ =
+        quants::dec::DispatchOverride::automatic;
     MatmulExecutionState state_ = MatmulExecutionState::empty;
     std::shared_ptr<std::mutex> state_mutex_ = std::make_shared<std::mutex>();
     size_t active_jobs_ = 0;

@@ -331,13 +331,17 @@ MatMulResult MatMul::run_dense() {
 }
 
 MatMulResult MatMul::run_full() {
+    return run_full(quants::dec::DispatchOverride::automatic);
+}
+
+MatMulResult MatMul::run_full(quants::dec::DispatchOverride dispatch_override) {
     const MatMulResult dense = run_dense();
     if (dense.status != MatMulStatus::success) {
         return dense;
     }
 #if ERROR_COMPENSATION
     quants::dec::compensate_activation_dec(
-        quants::activation_outliers(args()), args(), "ggml-gemmini-matmul");
+        quants::activation_outliers(args()), args(), "ggml-gemmini-matmul", dispatch_override);
 #endif
     state_ = MatMulState::completed;
     return { MatMulStatus::success, MatMulCapability::supported };
@@ -472,6 +476,16 @@ size_t MatmulStripeInput::outlier_count() const {
 MatmulExecution::MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options)
     : total_rows_(args.I), facade_(std::move(args)), options_(options) {
     state_ = MatmulExecutionState::prepared;
+    if (options_.force_row_direct && options_.force_group_k_csc) {
+        status_ = make_status(MatmulStatusCode::invalid_argument,
+                              "conflicting DEC dispatch overrides");
+        state_ = MatmulExecutionState::failed;
+        return;
+    }
+    dispatch_override_ = options_.force_row_direct ?
+        quants::dec::DispatchOverride::row_direct :
+        options_.force_group_k_csc ? quants::dec::DispatchOverride::group_k_csc :
+        quants::dec::DispatchOverride::automatic;
     if (options_.mode != MatmulInvocationMode::full && options_.job_capacity == 0) {
         status_ = make_status(MatmulStatusCode::invalid_argument, "job capacity must be nonzero");
         state_ = MatmulExecutionState::failed;
@@ -496,6 +510,16 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions optio
         state_ = MatmulExecutionState::failed;
         return;
     }
+    if (options_.force_row_direct && options_.force_group_k_csc) {
+        status_ = make_status(MatmulStatusCode::invalid_argument,
+                              "conflicting DEC dispatch overrides");
+        state_ = MatmulExecutionState::failed;
+        return;
+    }
+    dispatch_override_ = options_.force_row_direct ?
+        quants::dec::DispatchOverride::row_direct :
+        options_.force_group_k_csc ? quants::dec::DispatchOverride::group_k_csc :
+        quants::dec::DispatchOverride::automatic;
     if (options_.mode != MatmulInvocationMode::full && options_.job_capacity == 0) {
         status_ = make_status(MatmulStatusCode::invalid_argument, "job capacity must be nonzero");
         state_ = MatmulExecutionState::failed;
@@ -853,7 +877,7 @@ MatmulStatus execute_full(MatmulExecution & execution) {
         execution.state_ = MatmulExecutionState::failed;
         return execution.status_;
     }
-    const MatMulResult result = execution.facade_.run_full();
+    const MatMulResult result = execution.facade_.run_full(execution.dispatch_override_);
     execution.status_ = to_public_status(result.status, result.capability);
     execution.state_ = execution.status_.ok() ? MatmulExecutionState::completed : MatmulExecutionState::failed;
     return execution.status_;
@@ -1013,7 +1037,7 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job, size_t shard_id, 
                 }
                 dec_status = quants::dec::compensate_activation_dec_rows_columns(
                     local_outliers, local_args, 0, local_args.I, col_begin, col_end,
-                    "ggml-gemmini-matmul");
+                    "ggml-gemmini-matmul", job.execution_->dispatch_override_);
             }
         } else {
             std::vector<quants::QactOutlier> local_outliers = job.compensation_outliers_;
@@ -1022,13 +1046,13 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job, size_t shard_id, 
             }
             dec_status = quants::dec::compensate_activation_dec_rows_columns(
                 local_outliers, local_args, 0, local_args.I, col_begin, col_end,
-                "ggml-gemmini-matmul");
+                "ggml-gemmini-matmul", job.execution_->dispatch_override_);
         }
     } else if (!job.compensation_outliers_.empty()) {
         dec_status = quants::dec::compensate_activation_dec_rows_columns(
             job.compensation_outliers_, job.execution_->facade_.args(),
             job.input_.row_begin(), job.input_.row_end(), col_begin, col_end,
-            "ggml-gemmini-matmul");
+            "ggml-gemmini-matmul", job.execution_->dispatch_override_);
     }
     if (result.ok()) {
         if (dec_status == quants::dec::ActivationDECRowSliceStatus::unsupported) {

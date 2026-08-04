@@ -507,6 +507,36 @@ bool test_public_contract_shape() {
               "job metric storage");
 }
 
+bool test_dispatch_override_contract() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> row_output(6, 0.0f);
+    std::vector<float> group_output(6, 0.0f);
+
+    MatmulOptions row_options{};
+    row_options.force_row_direct = true;
+    auto row_execution = prepare_execution(make_args(activation, weights, row_output), row_options);
+    const MatmulStatus row_status = execute_full(row_execution);
+
+    MatmulOptions group_options{};
+    group_options.force_group_k_csc = true;
+    auto group_execution = prepare_execution(make_args(activation, weights, group_output), group_options);
+    const MatmulStatus group_status = execute_full(group_execution);
+
+    MatmulOptions conflicting_options{};
+    conflicting_options.force_row_direct = true;
+    conflicting_options.force_group_k_csc = true;
+    auto conflicting_execution = prepare_execution(
+        make_args(activation, weights, row_output), conflicting_options);
+
+    return check(row_status.ok(), "row-direct override status") &&
+        check(group_status.ok(), "group-KCSC override status") &&
+        check(same_output(row_output, group_output), "dispatch overrides changed output") &&
+        check(conflicting_execution.status().code == MatmulStatusCode::invalid_argument,
+              "conflicting dispatch overrides rejected");
+}
+
 bool test_route_capability_table() {
     using namespace ggml::gemmini;
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
@@ -796,7 +826,8 @@ bool test_live_worker_parallel_compensation_is_bitwise_stable() {
 
 int main(int argc, char ** argv) {
     const bool edge_only = argc == 2 && std::string_view(argv[1]) == "--edge";
-    const bool edge = test_public_contract_shape() && test_route_capability_table() &&
+    const bool edge = test_public_contract_shape() && test_dispatch_override_contract() &&
+        test_route_capability_table() &&
         test_explicit_exsia_channel_rejection() &&
         test_malformed_route_contract_rejected() &&
         test_bounded_pipeline_slots_and_reuse() &&
