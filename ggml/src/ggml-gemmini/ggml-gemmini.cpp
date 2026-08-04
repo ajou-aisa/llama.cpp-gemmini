@@ -1724,6 +1724,17 @@ static void ggml_backend_gemmini_get_rows_q8_channel(const ggml_tensor * src0,
 static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_gemmini_context * ctx = (ggml_backend_gemmini_context *)backend->context;
 
+    size_t graph_mul_mat_count = 0;
+    size_t graph_max_i = 0;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const struct ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_MUL_MAT) {
+            ++graph_mul_mat_count;
+            graph_max_i = std::max(graph_max_i, static_cast<size_t>(node->ne[1] > 0 ? node->ne[1] : 1));
+        }
+    }
+    ggml::gemmini::log::debug("graph", "nodes=%d mul_mat=%zu max_i=%zu", cgraph->n_nodes, graph_mul_mat_count, graph_max_i);
+
 #if LOG_DUMP
     uint32_t mxI = 0;
     bool decode_start_marker = false;
