@@ -1223,22 +1223,6 @@ MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput in
     }
 
     MatmulStripeJob job(&execution, std::move(input), status, std::move(outliers));
-    if (status.ok()) {
-        if (execution.options_.mode == MatmulInvocationMode::stripe_pipeline) {
-            if (std::holds_alternative<quants::act::exsia::Meta>(
-                    execution.facade_.args().act_quant.storage())) {
-                job.staged_activation_meta_ = std::make_unique<quants::act::Meta>();
-                if (!snapshot_exsia_metadata(
-                        execution.facade_.args(), job.input_.row_begin(), job.input_.row_end(),
-                        job.compensation_outliers_, *job.staged_activation_meta_)) {
-                    job.status_ = make_status(MatmulStatusCode::invalid_contract,
-                                              "pipeline stripe metadata is not ready");
-                } else {
-                    execution.staged_metadata_active_ = true;
-                }
-            }
-        }
-    }
     if (job.status_.ok()) {
         if (!execution.has_captures_) {
             execution.first_row_ = job.input_.row_begin();
@@ -1286,6 +1270,18 @@ MatmulStatus prepare_compensation(MatmulStripeJob & job) {
             }
         }
         job.has_captured_outliers_ = true;
+    }
+    if (job.execution_->options_.mode == MatmulInvocationMode::stripe_pipeline &&
+        std::holds_alternative<quants::act::exsia::Meta>(args.act_quant.storage())) {
+        job.staged_activation_meta_ = std::make_unique<quants::act::Meta>();
+        if (!snapshot_exsia_metadata(
+                args, job.input_.row_begin(), job.input_.row_end(),
+                job.compensation_outliers_, *job.staged_activation_meta_)) {
+            job.status_ = make_status(MatmulStatusCode::invalid_contract,
+                                      "pipeline stripe metadata is not ready");
+            return job.status_;
+        }
+        job.execution_->staged_metadata_active_ = true;
     }
     job.state_ = MatmulStripeJob::State::compensation_prepared;
     job.status_ = {};
