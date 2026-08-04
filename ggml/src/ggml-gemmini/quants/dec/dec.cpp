@@ -462,35 +462,6 @@ ActivationDECResult compensate_activation_dec(
     end = ggml::gemmini::cycle::read();
     ggml::gemmini::log::cycle(layer, "[dec] cpu.Build active row-group plan", start, end);
 
-    start = ggml::gemmini::cycle::read();
-
-    const size_t group_count = K / kDecGroupSizeK + (K % kDecGroupSizeK != 0);
-    build_group_major_index(
-        scr.active_row_groups, group_count, scr.group_offsets, scr.group_row_group_indices);
-
-    end = ggml::gemmini::cycle::read();
-    ggml::gemmini::log::cycle(layer, "[dec] cpu.Build group-major index", start, end);
-
-    // Test/replay opt-in; production remains row-direct.
-    const char *force_group_k_csc = std::getenv("DEC_GROUP_K_CSC_FORCE");
-    if (force_group_k_csc && force_group_k_csc[0] == '1' && force_group_k_csc[1] == '\0')
-    {
-        start = ggml::gemmini::cycle::read();
-
-        if (!build_group_k_csc_plan(
-                scr.residual_entries, scr.active_row_groups, scr.group_offsets,
-                scr.group_row_group_indices, group_count, scr.group_k_csc_plan))
-        {
-            log_dec_reject(layer, "unable to represent group-K CSC plan", args);
-            return ActivationDECResult{};
-        }
-
-        end = ggml::gemmini::cycle::read();
-        ggml::gemmini::log::cycle(layer, "[dec] cpu.Build group-K CSC plan", start, end);
-    }
-
-    start = ggml::gemmini::cycle::read();
-
     const bool use_int64_scalar = plan.route == DecWeightRoute::Dense && plan.scales.scalar_mode;
     const bool use_int64_channel_direct = plan.route == DecWeightRoute::Q8ChannelDirect;
     const bool use_int64_channel_sidecar = plan.route == DecWeightRoute::Q8ChannelSidecar;
@@ -525,11 +496,66 @@ ActivationDECResult compensate_activation_dec(
         previous_k = entry.k;
     }
 
+    const char *force_group_k_csc = std::getenv("DEC_GROUP_K_CSC_FORCE");
+    const bool group_k_csc_forced = force_group_k_csc &&
+        force_group_k_csc[0] == '1' && force_group_k_csc[1] == '\0';
+    bool use_group_k_csc = use_int64_scalar && (group_k_csc_forced ||
+        (I > 1 && J >= 4 && result.active_row_k_pairs / result.unique_k_count >= 4));
+    const size_t group_k_csc_nr = J < 8 ? 4 : 8;
+
+    start = ggml::gemmini::cycle::read();
+
+    const size_t group_count = K / kDecGroupSizeK + (K % kDecGroupSizeK != 0);
+    build_group_major_index(
+        scr.active_row_groups, group_count, scr.group_offsets, scr.group_row_group_indices);
+
+    end = ggml::gemmini::cycle::read();
+    ggml::gemmini::log::cycle(layer, "[dec] cpu.Build group-major index", start, end);
+
+    if (use_group_k_csc)
+    {
+        start = ggml::gemmini::cycle::read();
+
+        if (!build_group_k_csc_plan(
+                scr.residual_entries, scr.active_row_groups, scr.group_offsets,
+                scr.group_row_group_indices, group_count, scr.group_k_csc_plan))
+        {
+            log_dec_reject(layer, "unable to represent group-K CSC plan", args);
+            return ActivationDECResult{};
+        }
+
+        end = ggml::gemmini::cycle::read();
+        ggml::gemmini::log::cycle(layer, "[dec] cpu.Build group-K CSC plan", start, end);
+    }
+
+    start = ggml::gemmini::cycle::read();
+
+    GroupKCSCScalarStats group_k_csc_stats;
+    if (use_group_k_csc)
+    {
+        const bool accumulated = group_k_csc_nr == 4 ?
+            accumulate_to_ycom_int32_mixed_group_k_csc_nr4(
+                args, plan, I, J, activation_scales, scr.residual_entries,
+                scr.group_k_csc_plan, scr.Y_com.data(), group_k_csc_stats) :
+            accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
+                args, plan, I, J, activation_scales, scr.residual_entries,
+                scr.group_k_csc_plan, scr.Y_com.data(), group_k_csc_stats);
+        use_group_k_csc = accumulated;
+    }
+
     result.int_mac_count = saturating_mul_size(result.nnz, J);
     result.logical_weight_reference_count = result.int_mac_count;
     result.weight_scalar_load_count = result.int_mac_count;
     result.estimated_weight_bytes_read = saturating_mul_size(
         result.weight_scalar_load_count, sizeof(int8_t));
+    if (use_group_k_csc)
+    {
+        result.logical_weight_reference_count = group_k_csc_stats.logical_weight_reference_count;
+        result.weight_scalar_load_count = group_k_csc_stats.weight_scalar_load_count;
+        result.weight_vector_load_count = group_k_csc_stats.weight_vector_load_count;
+        result.estimated_weight_bytes_read = saturating_mul_size(
+            result.weight_scalar_load_count, sizeof(int8_t));
+    }
 
     const bool scaled_route = !plan.scales.scalar_mode && !plan.scales.row_header_mode && !plan.scales.channel_mode;
     const size_t scale_group_size = use_int64_h1 ? kDecGroupSizeK : plan.scales.block_size;
@@ -566,9 +592,10 @@ ActivationDECResult compensate_activation_dec(
         scr.active_groups_global.size(), sizeof(uint32_t)));
     result.group_k_csc_plan_bytes = group_k_csc_plan_logical_bytes(scr.group_k_csc_plan);
     const size_t thread_accumulator_rows = whole_k_grouped ? I : 1;
-    result.thread_scratch_bytes = saturating_mul_size(
-        saturating_mul_size(thread_accumulator_rows, std::min(J, kDecInt64JTileWidth)),
-        sizeof(int64_t));
+    result.thread_scratch_bytes = use_group_k_csc ? group_k_csc_stats.thread_scratch_bytes :
+        saturating_mul_size(
+            saturating_mul_size(thread_accumulator_rows, std::min(J, kDecInt64JTileWidth)),
+            sizeof(int64_t));
 #if LOG_DEBUG
     const size_t j_tiles = dec_int64_j_tile_count(J);
     const int dec_threads = resolve_dec_threads(j_tiles);
@@ -584,7 +611,12 @@ ActivationDECResult compensate_activation_dec(
                     (plan.route == DecWeightRoute::Q8HP2 ? "hp2" : "block")))));
     ggml::gemmini::log::debug(
         layer,
-        "[dec.route] algorithm=grouped sparse_kernel=row-direct traversal=row-major j_inner_nr=1 row_panel=full weight_vector=direct accumulator=int64 output_panel=off group_size_k=%zu activation=%s weight=%s accessor=%s reducer=%s j_partition=contiguous-range microtile=%zu threads=%d residual_format=common weight_layout=%s scale_mode=%s I=%zu J=%zu K=%zu",
+        "[dec.route] algorithm=grouped sparse_kernel=%s traversal=%s j_inner_nr=%zu row_panel=full weight_vector=%s accumulator=%s output_panel=off group_size_k=%zu activation=%s weight=%s accessor=%s reducer=%s j_partition=contiguous-range microtile=%zu threads=%d residual_format=common weight_layout=%s scale_mode=%s I=%zu J=%zu K=%zu",
+        use_group_k_csc ? "group-k-csc" : "row-direct",
+        use_group_k_csc ? "group-k-major" : "row-major",
+        use_group_k_csc ? group_k_csc_nr : size_t {1},
+        use_group_k_csc ? "vector" : "direct",
+        use_group_k_csc ? "mixed-int32-int64" : "int64",
         kDecGroupSizeK,
         requested_activation_name(),
         dec_route_name(plan),
@@ -643,35 +675,38 @@ ActivationDECResult compensate_activation_dec(
         dec_threads);
 #endif
 
-    if (use_int64_scalar)
-        accumulate_to_ycom_int64_scalar(
-            args, plan, I, J, activation_scales, scr.residual_entries, scr.active_row_groups,
-            scr.group_offsets, scr.group_row_group_indices,
-            scr.Y_com.data());
-    else if (use_int64_channel_direct)
-        accumulate_to_ycom_int64_channel_direct(
-            args, plan, I, J, activation_scales, scr.residual_entries, scr.active_row_groups,
-            scr.group_offsets, scr.group_row_group_indices,
-            scr.Y_com.data());
-    else if (use_int64_channel_sidecar)
-        accumulate_to_ycom_int64_channel_sidecar(
-            args, plan, I, J, activation_scales, scr.residual_entries, scr.active_row_groups,
-            scr.group_offsets, scr.group_row_group_indices,
-            scr.Y_com.data());
-    else if (use_int64_h1)
-        accumulate_to_ycom_int64_h1(
-            args, plan, I, J, activation_scales, scr.residual_entries, scr.active_row_groups,
-            scr.group_offsets, scr.group_row_group_indices,
-            scr.Y_com.data());
-    else if (use_int64_block)
-        accumulate_to_ycom_int64_block(
-            args, plan, I, J, activation_scales, scr.residual_entries, scr.active_row_groups,
-            scr.group_offsets, scr.group_row_group_indices,
-            scr.Y_com.data());
-    else
+    if (!use_group_k_csc)
     {
-        log_dec_reject(layer, "valid route has no integer kernel", args);
-        return result;
+        if (use_int64_scalar)
+            accumulate_to_ycom_int64_scalar(
+                args, plan, I, J, activation_scales, scr.residual_entries, scr.active_row_groups,
+                scr.group_offsets, scr.group_row_group_indices,
+                scr.Y_com.data());
+        else if (use_int64_channel_direct)
+            accumulate_to_ycom_int64_channel_direct(
+                args, plan, I, J, activation_scales, scr.residual_entries, scr.active_row_groups,
+                scr.group_offsets, scr.group_row_group_indices,
+                scr.Y_com.data());
+        else if (use_int64_channel_sidecar)
+            accumulate_to_ycom_int64_channel_sidecar(
+                args, plan, I, J, activation_scales, scr.residual_entries, scr.active_row_groups,
+                scr.group_offsets, scr.group_row_group_indices,
+                scr.Y_com.data());
+        else if (use_int64_h1)
+            accumulate_to_ycom_int64_h1(
+                args, plan, I, J, activation_scales, scr.residual_entries, scr.active_row_groups,
+                scr.group_offsets, scr.group_row_group_indices,
+                scr.Y_com.data());
+        else if (use_int64_block)
+            accumulate_to_ycom_int64_block(
+                args, plan, I, J, activation_scales, scr.residual_entries, scr.active_row_groups,
+                scr.group_offsets, scr.group_row_group_indices,
+                scr.Y_com.data());
+        else
+        {
+            log_dec_reject(layer, "valid route has no integer kernel", args);
+            return result;
+        }
     }
 
     end = ggml::gemmini::cycle::read();

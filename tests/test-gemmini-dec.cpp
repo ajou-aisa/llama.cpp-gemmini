@@ -390,7 +390,13 @@ bool test_decode_repeated_residuals() {
     const auto result = ggml::gemmini::quants::dec::compensate_activation_dec(outliers, args, "test");
     const std::vector<float> expected = { 0.5f, 2.5f, 4.25f };
 
-    bool ok = check(result.total_selected == 3 && result.nnz == 3 && result.unique_k_count == 2,
+    std::printf(
+        "dispatch decode route=%s plan_bytes=%zu vector_loads=%zu\n",
+        result.group_k_csc_plan_bytes == 0 ? "row-direct" : "group-k-csc",
+        result.group_k_csc_plan_bytes,
+        result.weight_vector_load_count);
+    bool ok = check(result.total_selected == 3 && result.nnz == 3 && result.unique_k_count == 2 &&
+                        result.group_k_csc_plan_bytes == 0 && result.weight_vector_load_count == 0,
                     "decode repeated residual accounting");
     for (size_t index = 0; index < output.size(); ++index)
         ok = check(close_enough(output[index], expected[index]), "decode repeated residual output") && ok;
@@ -1244,6 +1250,55 @@ bool byte_identical(const std::vector<float> &lhs, const std::vector<float> &rhs
         std::memcmp(lhs.data(), rhs.data(), lhs.size() * sizeof(float)) == 0;
 }
 
+bool test_group_k_csc_production_dispatch() {
+    const char *previous_force = std::getenv("DEC_GROUP_K_CSC_FORCE");
+    const std::string saved_force = previous_force ? previous_force : "";
+    const bool had_previous_force = previous_force != nullptr;
+    set_dec_group_k_csc_force(nullptr);
+
+    bool ok = true;
+    for (const size_t cols : { size_t {4}, size_t {8} }) {
+        constexpr size_t rows = 4;
+        constexpr size_t depth = 2;
+        std::vector<int8_t> weights(depth * cols, 0);
+        for (size_t j = 0; j < cols; ++j)
+            weights[cols + j] = -static_cast<int8_t>(j + 1);
+        std::vector<float> output(rows * cols, 0.0f);
+        ggml_gemmini_args_t args = dense_args(rows, cols, depth, weights, output, 0.25f);
+        const std::vector<ggml::gemmini::quants::QactOutlier> outliers = {
+            { 0, 1, 1 }, { 1, 1, 2 }, { 2, 1, 3 }, { 3, 1, 4 },
+        };
+        const auto result = ggml::gemmini::quants::dec::compensate_activation_dec(
+            outliers, args, "test");
+        std::vector<float> expected(rows * cols);
+        for (size_t row = 0; row < rows; ++row)
+            for (size_t j = 0; j < cols; ++j)
+                expected[row * cols + j] =
+                    -0.25f * static_cast<float>((row + 1) * (j + 1));
+        const bool output_equal = byte_identical(output, expected);
+        const double reuse = result.weight_scalar_load_count == 0 ? 0.0 :
+            static_cast<double>(result.logical_weight_reference_count) /
+                result.weight_scalar_load_count;
+        std::printf(
+            "dispatch dense route=%s plan_bytes=%zu nr=%zu vector_loads=%zu reuse=%.1f output_equal=%s\n",
+            result.group_k_csc_plan_bytes == 0 ? "row-direct" : "group-k-csc",
+            result.group_k_csc_plan_bytes,
+            cols < 8 ? size_t {4} : size_t {8},
+            result.weight_vector_load_count,
+            reuse,
+            output_equal ? "yes" : "no");
+        ok = check(result.group_k_csc_plan_bytes > 0 &&
+                       result.logical_weight_reference_count == rows * cols &&
+                       result.weight_scalar_load_count == cols &&
+                       result.weight_vector_load_count == 1 && reuse == 4.0 && output_equal,
+                   cols < 8 ? "dense high-reuse dispatch selects GroupKCSC NR4" :
+                              "dense high-reuse dispatch selects GroupKCSC NR8") && ok;
+    }
+
+    set_dec_group_k_csc_force(had_previous_force ? saved_force.c_str() : nullptr);
+    return ok;
+}
+
 bool test_fixed_residual_replay_baseline() {
     using ggml::gemmini::quants::dec::ActiveRowGroup;
     using ggml::gemmini::quants::dec::GroupKCSCPlan;
@@ -1298,6 +1353,14 @@ bool test_fixed_residual_replay_baseline() {
     const auto forced_result = ggml::gemmini::quants::dec::compensate_activation_dec(
         shuffled_outliers, args, "test");
     set_dec_group_k_csc_force(had_previous_force ? saved_force.c_str() : nullptr);
+    std::printf(
+        "dispatch low-reuse route=%s plan_bytes=%zu vector_loads=%zu forced_route=%s forced_plan_bytes=%zu forced_vector_loads=%zu\n",
+        result.group_k_csc_plan_bytes == 0 ? "row-direct" : "group-k-csc",
+        result.group_k_csc_plan_bytes,
+        result.weight_vector_load_count,
+        forced_result.group_k_csc_plan_bytes == 0 ? "row-direct" : "group-k-csc",
+        forced_result.group_k_csc_plan_bytes,
+        forced_result.weight_vector_load_count);
 
     std::vector<ResidualGroupEntry> entries = {
         { 2, 34, 2 }, { 0, 0, 4 }, { 1, 33, -3 }, { 0, 0, -1 },
@@ -1359,6 +1422,7 @@ bool test_fixed_residual_replay_baseline() {
                         result.current_sparse_plan_bytes == expected_current_sparse_plan_bytes &&
                         result.group_k_csc_plan_bytes == 0 &&
                         forced_result.group_k_csc_plan_bytes == expected_group_k_csc_plan_bytes &&
+                        forced_result.weight_vector_load_count == 6 &&
                         result.thread_scratch_bytes == rows * cols * sizeof(int64_t),
                     "fixed replay defaults to row-direct and force builds GroupKCSC");
     for (size_t index = 0; index < output.size(); ++index)
@@ -1838,7 +1902,7 @@ int main() {
     const bool ok = test_noop() && test_route_plan() && test_active_row_groups() && test_group_k_csc_plan() && test_route_metadata_rejects() && test_repeated_residuals() && test_decode_repeated_residuals() && test_integer_routes() && test_block_integer_route() &&
         test_q8_h1_hierarchical_route() && test_q8_h1_preserves_ordered_scaling_bits() && test_q8_h1_activation_scale_routes_preserve_bits() && test_unpacked_h1_tail_routes_preserve_bits() && test_q8_h1_large_effective_scale() && test_q8_h2_hierarchical_route() && test_q8_hp1_hierarchical_route() && test_q8_hp2_hierarchical_route() &&
         test_malformed_hierarchical_reject() && test_output_strides() && test_sparse_grouped_tails() && test_malformed_reject() && test_thread_clamp() &&
-        test_fixed_residual_replay_baseline() && test_group_k_csc_nr4_transposed_j_tile() &&
+        test_group_k_csc_production_dispatch() && test_fixed_residual_replay_baseline() && test_group_k_csc_nr4_transposed_j_tile() &&
         test_group_k_csc_mixed_int32_boundaries() &&
         test_group_k_csc_mixed_prefix_and_plan_rejects() &&
         test_thread_determinism() && test_inside_existing_openmp_region();
