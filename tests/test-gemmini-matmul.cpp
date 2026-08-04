@@ -284,12 +284,16 @@ bool test_bounded_pipeline_slots_and_reuse() {
     options.rc_shards = 4;
     options.profiling = true;
     auto execution = prepare_execution(make_args(activation, weights, output), options);
+    if (!check(execution.state() == MatmulExecutionState::prepared, "execution prepared state")) {
+        return false;
+    }
     const quants::QactOutlier outlier[] = {{ 0, 0, 2 }};
     auto first = capture_stripe(execution, MatmulStripeInput(0, 1, 0, outlier, 1));
     auto second = capture_stripe(execution, { 1, 2 });
     auto blocked = capture_stripe(execution, { 2, 3 });
 
     if (!check(first.status().ok() && second.status().ok(), "pipeline captures") ||
+        !check(execution.state() == MatmulExecutionState::running, "execution running state") ||
         !check(blocked.status().code == MatmulStatusCode::out_of_memory, "bounded backpressure") ||
         !check(finish_execution(execution).code == MatmulStatusCode::invalid_state, "finish with live jobs") ||
         !run_staged_job(first)) {
@@ -298,6 +302,7 @@ bool test_bounded_pipeline_slots_and_reuse() {
     auto tail = capture_stripe(execution, { 2, 3 });
     const bool passed = run_staged_job(second) && run_staged_job(tail) &&
         check(finish_execution(execution).ok(), "pipeline finish") &&
+        check(execution.state() == MatmulExecutionState::completed, "execution completed state") &&
         check(first.metrics().handoff.count == 1 && first.metrics().ws.count == 1 &&
                   first.metrics().rc_prepare.count == 1 && first.metrics().rc_compute.count == 1 &&
                   first.metrics().rc_finalize.count == 1,

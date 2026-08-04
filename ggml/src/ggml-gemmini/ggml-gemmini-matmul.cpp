@@ -440,8 +440,10 @@ size_t MatmulStripeInput::outlier_count() const {
 
 MatmulExecution::MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options)
     : total_rows_(args.I), facade_(std::move(args)), options_(options) {
+    state_ = MatmulExecutionState::prepared;
     if (options_.mode != MatmulInvocationMode::full && options_.job_capacity == 0) {
         status_ = make_status(MatmulStatusCode::invalid_argument, "job capacity must be nonzero");
+        state_ = MatmulExecutionState::failed;
         return;
     }
     if (options_.mode == MatmulInvocationMode::stripe_sequential ||
@@ -449,17 +451,23 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options
         const MatMulStatus status = facade_.begin_stripes();
         status_ = to_public_status(
             status, status == MatMulStatus::unsupported ? MatMulCapability::unsupported : MatMulCapability::supported);
+        if (!status_.ok()) {
+            state_ = MatmulExecutionState::failed;
+        }
     }
 }
 
 MatmulExecution::MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions options)
     : total_rows_(args != nullptr ? args->I : 0), facade_(args), options_(options) {
+    state_ = MatmulExecutionState::prepared;
     if (args == nullptr) {
         status_ = make_status(MatmulStatusCode::invalid_argument, "null execution args");
+        state_ = MatmulExecutionState::failed;
         return;
     }
     if (options_.mode != MatmulInvocationMode::full && options_.job_capacity == 0) {
         status_ = make_status(MatmulStatusCode::invalid_argument, "job capacity must be nonzero");
+        state_ = MatmulExecutionState::failed;
         return;
     }
     if (options_.mode == MatmulInvocationMode::stripe_sequential ||
@@ -467,11 +475,18 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions optio
         const MatMulStatus status = facade_.begin_stripes();
         status_ = to_public_status(
             status, status == MatMulStatus::unsupported ? MatMulCapability::unsupported : MatMulCapability::supported);
+        if (!status_.ok()) {
+            state_ = MatmulExecutionState::failed;
+        }
     }
 }
 
 MatmulInvocationMode MatmulExecution::mode() const {
     return options_.mode;
+}
+
+MatmulExecutionState MatmulExecution::state() const {
+    return state_;
 }
 
 const MatmulStatus & MatmulExecution::status() const {
@@ -793,10 +808,12 @@ MatmulStatus execute_full(MatmulExecution & execution) {
     if (execution.options_.mode != MatmulInvocationMode::full) {
         execution.status_ = make_status(
             MatmulStatusCode::unsupported_invocation, "full execution requires full mode");
+        execution.state_ = MatmulExecutionState::failed;
         return execution.status_;
     }
     const MatMulResult result = execution.facade_.run_full();
     execution.status_ = to_public_status(result.status, result.capability);
+    execution.state_ = execution.status_.ok() ? MatmulExecutionState::completed : MatmulExecutionState::failed;
     return execution.status_;
 }
 
@@ -846,6 +863,9 @@ MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput in
         execution.has_captures_ = true;
         ++execution.active_jobs_;
         job.owns_slot_ = true;
+        if (execution.state_ == MatmulExecutionState::prepared) {
+            execution.state_ = MatmulExecutionState::running;
+        }
         record_metric(job.metrics_.handoff, execution.options_.profiling, start);
     }
     return job;
@@ -1012,17 +1032,21 @@ MatmulStatus finish_execution(MatmulExecution & execution) {
     if (execution.options_.mode == MatmulInvocationMode::full) {
         return execution.facade_.state() == MatMulState::completed ? execution.status_ : invalid_state();
     }
+    execution.state_ = MatmulExecutionState::finishing;
     if (execution.active_jobs_ != 0) {
+        execution.state_ = MatmulExecutionState::running;
         return invalid_state("cannot finish with live jobs");
     }
     if (!execution.has_captures_ || execution.first_row_ != 0 ||
         execution.last_row_end_ != execution.total_rows_ ||
         execution.captured_rows_ != execution.total_rows_ ||
         execution.finalized_rows_ != execution.total_rows_) {
+        execution.state_ = MatmulExecutionState::running;
         return invalid_contract("missing stripes");
     }
     const MatMulStatus status = execution.facade_.finish_stripes();
     execution.status_ = to_public_status(status, MatMulCapability::supported);
+    execution.state_ = execution.status_.ok() ? MatmulExecutionState::completed : MatmulExecutionState::failed;
     return execution.status_;
 }
 

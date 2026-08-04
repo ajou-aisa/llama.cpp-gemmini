@@ -227,6 +227,15 @@ enum class MatmulInvocationMode {
     stripe_pipeline,
 };
 
+enum class MatmulExecutionState {
+    empty,
+    prepared,
+    running,
+    finishing,
+    completed,
+    failed,
+};
+
 struct MatmulOptions {
     MatmulInvocationMode mode = MatmulInvocationMode::full;
     size_t stripe_rows = 0;
@@ -275,6 +284,7 @@ public:
     MatmulExecution & operator=(MatmulExecution &&) noexcept = default;
 
     MatmulInvocationMode mode() const;
+    MatmulExecutionState state() const;
     const MatmulStatus & status() const;
 
 private:
@@ -300,6 +310,7 @@ private:
     MatMul facade_;
     MatmulOptions options_;
     MatmulStatus status_;
+    MatmulExecutionState state_ = MatmulExecutionState::empty;
     size_t active_jobs_ = 0;
     size_t captured_rows_ = 0;
     size_t finalized_rows_ = 0;
