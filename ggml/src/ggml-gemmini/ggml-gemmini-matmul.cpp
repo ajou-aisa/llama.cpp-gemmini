@@ -246,8 +246,10 @@ MatMulResult MatMul::run_full() {
     if (dense.status != MatMulStatus::success) {
         return dense;
     }
+#if ERROR_COMPENSATION
     quants::dec::compensate_activation_dec(
         quants::activation_outliers(args()), args(), "ggml-gemmini-matmul");
+#endif
     state_ = MatMulState::completed;
     return { MatMulStatus::success, MatMulCapability::supported };
 }

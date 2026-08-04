@@ -932,6 +932,11 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     constexpr bool exsia_pipeline_supported =
         ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA;
     const bool pipeline_enabled = pipeline_requested && exsia_pipeline_supported;
+    const bool legacy_full_dispatch = [] {
+        const char *value = std::getenv("GEMMINI_LEGACY_FULL_DISPATCH");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    const bool facade_full_dispatch = !pipeline_enabled && !legacy_full_dispatch;
     if (pipeline_requested && !pipeline_enabled) {
         ggml::gemmini::log::debug(layer,
             "[matmul.pipeline] stripe-pipeline requires EXSIA activation; keeping full dispatch");
@@ -1432,8 +1437,15 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     // ggml::gemmini::log::debug("[Gemmini addr] layer=%s f_out=%p stride_f_out=%zu col_stride_f_out=%zu",
     //                  layer, (void *)args.f_out, args.stride_f_out, args.col_stride_f_out);
 
-    /* __ 5. Gemmini baseline/IM2P dispatch __ */
-    if (!pipeline_enabled) {
+    if (facade_full_dispatch) {
+        ggml::gemmini::MatMul facade(args);
+        const auto facade_result = facade.run_full();
+        if (facade_result.status != ggml::gemmini::MatMulStatus::success) {
+            GGML_ABORT("Gemmini full facade execution failed");
+        }
+    }
+
+    if (!pipeline_enabled && legacy_full_dispatch) {
         if constexpr (ggml::gemmini::config::CURRENT_COMPUTE_TYPE == ggml::gemmini::config::ComputeType::INT) {
             constexpr auto baseline_activation_quant =
                 ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA
@@ -1554,7 +1566,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     }
     // dst에는 gemmini 커널에서 dequantize한 결과가 들어옴 
 #if ERROR_COMPENSATION
-    if (!pipeline_enabled) {
+    if (!pipeline_enabled && legacy_full_dispatch) {
     uint64_t start_dec = ggml::gemmini::cycle::read();
     auto outliers = ggml::gemmini::quants::activation_outliers(args);
     uint64_t end_dec = ggml::gemmini::cycle::read();
