@@ -954,6 +954,14 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     }();
     const bool pipeline_requested = requested_invocation == "stripe-pipeline";
     const bool sequential_requested = requested_invocation == "stripe-sequential";
+    const bool full_requested = requested_invocation.empty() || requested_invocation == "full";
+    if (!full_requested && !pipeline_requested && !sequential_requested) {
+        ggml::gemmini::log::debug(layer,
+            "[matmul.invocation] status=invalid_invocation value=%.*s",
+            static_cast<int>(requested_invocation.size()), requested_invocation.data());
+        GGML_ABORT("Gemmini invalid_invocation: %.*s",
+            static_cast<int>(requested_invocation.size()), requested_invocation.data());
+    }
     constexpr bool exsia_pipeline_supported =
         ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA;
     const bool pipeline_enabled = pipeline_requested && exsia_pipeline_supported && I > 1;
