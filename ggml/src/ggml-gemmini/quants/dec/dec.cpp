@@ -920,4 +920,106 @@ ActivationDECRowSliceStatus compensate_activation_dec_rows(
     compensate_activation_dec(local_outliers, local_args, layer);
     return ActivationDECRowSliceStatus::success;
 }
+
+ActivationDECRowSliceStatus compensate_activation_dec_rows_columns(
+    const std::vector<QactOutlier> &outliers,
+    ggml_gemmini_args_t &args,
+    size_t row_begin,
+    size_t row_end,
+    size_t col_begin,
+    size_t col_end,
+    const char *layer)
+{
+    if (row_begin >= row_end || row_end > args.I || col_begin >= col_end || col_end > args.J)
+        return ActivationDECRowSliceStatus::invalid_arguments;
+    if (args.A == nullptr || args.f_out == nullptr)
+        return ActivationDECRowSliceStatus::invalid_arguments;
+
+    const size_t input_stride = args.sA ? args.sA : args.K;
+    const size_t output_row_stride = args.stride_f_out ? args.stride_f_out : args.J;
+    const size_t output_col_stride = args.col_stride_f_out ? args.col_stride_f_out : 1;
+    if (row_begin > std::numeric_limits<size_t>::max() / std::max(input_stride, output_row_stride) ||
+        col_begin > std::numeric_limits<size_t>::max() / output_col_stride)
+        return ActivationDECRowSliceStatus::invalid_arguments;
+
+    const size_t width = col_end - col_begin;
+    ggml_gemmini_args_t local_args = args;
+    local_args.I = row_end - row_begin;
+    local_args.J = width;
+    local_args.A += row_begin * input_stride;
+    local_args.f_out += row_begin * output_row_stride + col_begin * output_col_stride;
+    local_args.activation_row_offset += row_begin;
+
+    const bool channel_direct = args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_channel;
+    const bool channel_sidecar = args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar;
+    const bool jxk_layout = channel_direct || channel_sidecar || args.transpose_B ||
+        args.q8_h1_blocks != nullptr || args.q8_h2_blocks != nullptr ||
+        args.q8_hp1_blocks != nullptr || args.q8_hp2_blocks != nullptr || args.c_b != nullptr;
+
+    if (args.B != nullptr) {
+        if (channel_direct)
+            local_args.B = reinterpret_cast<elem_t *>(reinterpret_cast<uint8_t *>(args.B) +
+                col_begin * args.q8_channel_row_stride);
+        else if (jxk_layout)
+            local_args.B = reinterpret_cast<elem_t *>(reinterpret_cast<int8_t *>(args.B) +
+                col_begin * (args.sB ? args.sB : args.K));
+        else
+            local_args.B = reinterpret_cast<elem_t *>(reinterpret_cast<int8_t *>(args.B) + col_begin);
+    }
+    if (args.B_blocks != nullptr && args.blocks_K != 0)
+        local_args.B_blocks = args.B_blocks + col_begin * args.blocks_K;
+    if (args.B_scales != nullptr && args.blocks_K != 0)
+        local_args.B_scales = args.B_scales + col_begin * args.blocks_K;
+    if (args.weight_channel_scales != nullptr)
+        local_args.weight_channel_scales = args.weight_channel_scales + col_begin;
+    local_args.weight_channel_scale_count = width;
+
+    if (args.q8_channel_row_base != nullptr) {
+        local_args.q8_channel_row_base = args.q8_channel_row_base + col_begin * args.q8_channel_row_stride;
+        local_args.q8_channel_row_count = width;
+    }
+    if (args.q8_h1_blocks != nullptr) {
+        local_args.q8_h1_blocks = args.q8_h1_blocks + col_begin * args.blocks_per_row;
+        local_args.q8_h1_rows = width;
+        local_args.q8_h1_block_count = width * args.blocks_per_row;
+    }
+    if (args.q8_h2_blocks != nullptr) {
+        local_args.q8_h2_blocks = args.q8_h2_blocks + col_begin * args.q8_h2_blocks_per_row;
+        local_args.q8_h2_blocks_per_row = args.q8_h2_blocks_per_row;
+        local_args.q8_h2_block_count = width * args.q8_h2_blocks_per_row;
+    }
+    if (args.q8_hp1_blocks != nullptr) {
+        local_args.q8_hp1_blocks = args.q8_hp1_blocks + col_begin * args.q8_hp1_blocks_per_row;
+        local_args.q8_hp1_blocks_per_row = args.q8_hp1_blocks_per_row;
+        local_args.q8_hp1_block_count = width * args.q8_hp1_blocks_per_row;
+    }
+    if (args.q8_hp2_blocks != nullptr) {
+        local_args.q8_hp2_blocks = args.q8_hp2_blocks + col_begin * args.q8_hp2_blocks_per_row;
+        local_args.q8_hp2_blocks_per_row = args.q8_hp2_blocks_per_row;
+        local_args.q8_hp2_block_count = width * args.q8_hp2_blocks_per_row;
+    }
+    if (args.c_b != nullptr && args.blocks_per_row != 0)
+        local_args.c_b = args.c_b + col_begin * args.blocks_per_row;
+    if (args.s_rf != nullptr)
+        local_args.s_rf = args.s_rf + col_begin;
+    if (args.R != nullptr)
+        local_args.R = args.R + col_begin;
+    if (args.stripe_J > 1) {
+        if (args.s_rf_stripe == nullptr || args.R_stripe == nullptr || col_begin % args.stripe_J != 0)
+            return ActivationDECRowSliceStatus::unsupported;
+        local_args.s_rf_stripe = args.s_rf_stripe + col_begin / args.stripe_J;
+        local_args.R_stripe = args.R_stripe + col_begin / args.stripe_J;
+    }
+
+    std::vector<QactOutlier> local_outliers;
+    local_outliers.reserve(outliers.size());
+    for (const QactOutlier &outlier : outliers) {
+        if (outlier.row >= 0 && static_cast<size_t>(outlier.row) >= row_begin &&
+            static_cast<size_t>(outlier.row) < row_end)
+            local_outliers.push_back({static_cast<int>(static_cast<size_t>(outlier.row) - row_begin),
+                                      outlier.col, outlier.residual});
+    }
+    compensate_activation_dec(local_outliers, local_args, layer);
+    return ActivationDECRowSliceStatus::success;
+}
 } // namespace ggml::gemmini::quants::dec

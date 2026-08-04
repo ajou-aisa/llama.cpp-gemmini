@@ -80,6 +80,7 @@ class MatmulStripeJob;
 struct MatmulStatus;
 MatmulStatus prepare_compensation(MatmulStripeJob &);
 MatmulStatus execute_compensation_shard(MatmulStripeJob &);
+MatmulStatus execute_compensation_shard(MatmulStripeJob &, size_t shard_id, size_t shard_count);
 
 class MatMul {
 public:
@@ -101,8 +102,10 @@ public:
 
 private:
     friend class MatmulExecution;
+    friend class MatmulStripeCollector;
     friend MatmulStatus prepare_compensation(MatmulStripeJob &);
     friend MatmulStatus execute_compensation_shard(MatmulStripeJob &);
+    friend MatmulStatus execute_compensation_shard(MatmulStripeJob &, size_t, size_t);
     friend MatmulStatus execute_dense_stripe(MatmulStripeJob &);
 
     MatMulStatus run_stripe(MatMulStripe stripe, size_t stripe_id);
@@ -151,6 +154,10 @@ struct MatmulStageMetrics {
 };
 
 struct MatmulJobMetrics {
+    size_t stripe_id = 0;
+    size_t row_begin = 0;
+    size_t row_end = 0;
+    size_t rc_shards = 0;
     MatmulStageMetrics la;
     MatmulStageMetrics sf;
     MatmulStageMetrics handoff;
@@ -256,7 +263,9 @@ private:
     friend MatmulStatus prepare_compensation(MatmulStripeJob &);
     friend MatmulStatus execute_dense_stripe(MatmulStripeJob &);
     friend MatmulStatus execute_compensation_shard(MatmulStripeJob &);
+    friend MatmulStatus execute_compensation_shard(MatmulStripeJob &, size_t, size_t);
     friend MatmulStatus finalize_stripe(MatmulStripeJob &);
+    friend class MatmulStripeCollector;
     friend class MatmulStripeJob;
     friend MatmulStatus finish_execution(MatmulExecution &);
 
@@ -293,6 +302,7 @@ private:
     friend MatmulStatus prepare_compensation(MatmulStripeJob &);
     friend MatmulStatus execute_dense_stripe(MatmulStripeJob &);
     friend MatmulStatus execute_compensation_shard(MatmulStripeJob &);
+    friend MatmulStatus execute_compensation_shard(MatmulStripeJob &, size_t, size_t);
     friend MatmulStatus finalize_stripe(MatmulStripeJob &);
 
     MatmulStripeJob(MatmulExecution * execution, MatmulStripeInput input, MatmulStatus status,
@@ -302,6 +312,7 @@ private:
     enum class State {
         captured,
         compensation_prepared,
+        compensation_running,
         dense_complete,
         compensation_complete,
         finalized,
@@ -314,6 +325,8 @@ private:
     std::vector<quants::QactOutlier> compensation_outliers_;
     bool has_captured_outliers_ = false;
     bool owns_slot_ = false;
+    size_t expected_shards_ = 1;
+    size_t completed_shards_ = 0;
     State state_ = State::captured;
 };
 
@@ -326,6 +339,7 @@ MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput in
 MatmulStatus prepare_compensation(MatmulStripeJob & job);
 MatmulStatus execute_dense_stripe(MatmulStripeJob & job);
 MatmulStatus execute_compensation_shard(MatmulStripeJob & job);
+MatmulStatus execute_compensation_shard(MatmulStripeJob & job, size_t shard_id, size_t shard_count);
 MatmulStatus finalize_stripe(MatmulStripeJob & job);
 MatmulStatus finish_execution(MatmulExecution & execution);
 MatmulStatus matmul(const ggml_gemmini_args_t & args, MatmulOptions options = {});

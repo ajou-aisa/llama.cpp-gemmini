@@ -463,7 +463,11 @@ void MatmulStripeCollector::worker_loop() {
             std::move(captured.outliers));
         MatmulStatus status = prepare_compensation(job);
         if (status) status = execute_dense_stripe(job);
-        if (status) status = execute_compensation_shard(job);
+        const size_t shard_count = std::max<size_t>(1, std::min(
+            execution_->options_.rc_shards == 0 ? size_t {1} : execution_->options_.rc_shards,
+            execution_->facade_.args().J));
+        for (size_t shard_id = 0; status && shard_id < shard_count; ++shard_id)
+            status = execute_compensation_shard(job, shard_id, shard_count);
         if (status) status = finalize_stripe(job);
         if (status) {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -696,12 +700,31 @@ MatmulStatus execute_dense_stripe(MatmulStripeJob & job) {
 }
 
 MatmulStatus execute_compensation_shard(MatmulStripeJob & job) {
-    if (job.execution_ == nullptr || job.state_ != MatmulStripeJob::State::dense_complete || !job.status_) {
+    return execute_compensation_shard(job, 0, 1);
+}
+
+MatmulStatus execute_compensation_shard(MatmulStripeJob & job, size_t shard_id, size_t shard_count) {
+    if (job.execution_ == nullptr ||
+        (job.state_ != MatmulStripeJob::State::dense_complete &&
+         job.state_ != MatmulStripeJob::State::compensation_running) || !job.status_) {
         job.status_ = invalid_state("compensation execution requires dense completion");
+        return job.status_;
+    }
+    if (shard_count == 0 || shard_id >= shard_count) {
+        job.status_ = make_status(MatmulStatusCode::invalid_argument, "invalid compensation shard");
+        return job.status_;
+    }
+    if (job.completed_shards_ == 0) {
+        job.expected_shards_ = shard_count;
+        job.state_ = MatmulStripeJob::State::compensation_running;
+    } else if (job.expected_shards_ != shard_count || shard_id != job.completed_shards_) {
+        job.status_ = invalid_state("compensation shards must complete in order");
         return job.status_;
     }
     const auto start = Clock::now();
     auto status = quants::dec::ActivationDECRowSliceStatus::success;
+    const size_t col_begin = job.execution_->facade_.args().J * shard_id / shard_count;
+    const size_t col_end = job.execution_->facade_.args().J * (shard_id + 1) / shard_count;
     if (job.has_captured_outliers_) {
         auto local_args = job.execution_->facade_.args();
         const size_t row_begin = job.input_.row_begin();
@@ -723,11 +746,14 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job) {
         for (auto & outlier : local_outliers) {
             outlier.row -= static_cast<int>(row_begin);
         }
-        quants::dec::compensate_activation_dec(local_outliers, local_args, "ggml-gemmini-matmul");
+        status = quants::dec::compensate_activation_dec_rows_columns(
+            local_outliers, local_args, 0, local_args.I, col_begin, col_end,
+            "ggml-gemmini-matmul");
     } else {
-        status = quants::dec::compensate_activation_dec_rows(
+        status = quants::dec::compensate_activation_dec_rows_columns(
             job.compensation_outliers_, job.execution_->facade_.args(),
-            job.input_.row_begin(), job.input_.row_end(), "ggml-gemmini-matmul");
+            job.input_.row_begin(), job.input_.row_end(), col_begin, col_end,
+            "ggml-gemmini-matmul");
     }
     if (status == quants::dec::ActivationDECRowSliceStatus::unsupported) {
         job.status_ = unsupported_backend("compensation execution is unsupported by backend");
@@ -736,7 +762,9 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job) {
             MatmulStatusCode::invalid_argument, "invalid compensation shard", MatMulCapability::unsupported);
     } else {
         job.status_ = {};
-        job.state_ = MatmulStripeJob::State::compensation_complete;
+        ++job.completed_shards_;
+        if (job.completed_shards_ == job.expected_shards_)
+            job.state_ = MatmulStripeJob::State::compensation_complete;
         record_metric(job.metrics_.rc_compute, job.execution_->options_.profiling, start);
     }
     job.execution_->status_ = job.status_;
@@ -749,6 +777,10 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
         return job.status_;
     }
     const auto start = Clock::now();
+    job.metrics_.stripe_id = job.input_.stripe_id();
+    job.metrics_.row_begin = job.input_.row_begin();
+    job.metrics_.row_end = job.input_.row_end();
+    job.metrics_.rc_shards = job.expected_shards_;
     job.state_ = MatmulStripeJob::State::finalized;
     job.execution_->finalized_rows_ += job.input_.row_end() - job.input_.row_begin();
     record_metric(job.metrics_.rc_finalize, job.execution_->options_.profiling, start);
@@ -803,7 +835,10 @@ MatmulStatus matmul(const ggml_gemmini_args_t & args, MatmulOptions options) {
         if (!status) {
             return status;
         }
-        status = execute_compensation_shard(job);
+        const size_t shard_count = std::max<size_t>(1, std::min(
+            options.rc_shards == 0 ? size_t {1} : options.rc_shards, args.J));
+        for (size_t shard_id = 0; status && shard_id < shard_count; ++shard_id)
+            status = execute_compensation_shard(job, shard_id, shard_count);
         if (!status) {
             return status;
         }
@@ -835,7 +870,10 @@ MatmulStatus execute_post_fold_pipeline(
             std::move(captured.outliers));
         MatmulStatus status = prepare_compensation(job);
         if (status) status = execute_dense_stripe(job);
-        if (status) status = execute_compensation_shard(job);
+        const size_t shard_count = std::max<size_t>(1, std::min(
+            options.rc_shards == 0 ? size_t {1} : options.rc_shards, args.J));
+        for (size_t shard_id = 0; status && shard_id < shard_count; ++shard_id)
+            status = execute_compensation_shard(job, shard_id, shard_count);
         if (status) status = finalize_stripe(job);
         if (!status) {
             return status;

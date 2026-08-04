@@ -44,4 +44,13 @@ ActivationDECRowSliceStatus compensate_activation_dec_rows(
     size_t row_begin,
     size_t row_end,
     const char *layer);
+
+ActivationDECRowSliceStatus compensate_activation_dec_rows_columns(
+    const std::vector<QactOutlier> &outliers,
+    ggml_gemmini_args_t &args,
+    size_t row_begin,
+    size_t row_end,
+    size_t col_begin,
+    size_t col_end,
+    const char *layer);
 } // namespace ggml::gemmini::quants::dec

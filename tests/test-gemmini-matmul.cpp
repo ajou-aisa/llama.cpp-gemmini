@@ -202,6 +202,7 @@ bool test_bounded_pipeline_slots_and_reuse() {
     MatmulOptions options{};
     options.mode = MatmulInvocationMode::stripe_pipeline;
     options.job_capacity = 2;
+    options.rc_shards = 4;
     options.profiling = true;
     auto execution = prepare_execution(make_args(activation, weights, output), options);
     auto first = capture_stripe(execution, { 0, 1 });
@@ -293,13 +294,48 @@ bool test_live_pipeline_worker() {
     return true;
 }
 
+bool run_captured_compensation(size_t shard_count, std::vector<float> & output) {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_sequential;
+    options.rc_shards = shard_count;
+    auto execution = prepare_execution(make_args(activation, weights, output), options);
+    auto job = capture_stripe(execution, { 0, 3, 0 }, std::vector<quants::QactOutlier>{{ 0, 0, 2 }});
+    if (!job.status().ok() || !prepare_compensation(job).ok() ||
+        !execute_dense_stripe(job).ok())
+        return false;
+    const size_t actual_shards = std::max<size_t>(1, std::min(shard_count, size_t {2}));
+    for (size_t shard = 0; shard < actual_shards; ++shard)
+        if (!execute_compensation_shard(job, shard, actual_shards).ok())
+            return false;
+    return finalize_stripe(job).ok() && finish_execution(execution).ok();
+}
+
+bool test_compensation_shard_output_is_bitwise_stable() {
+    std::vector<float> one(6, 0.0f);
+    std::vector<float> four(6, 0.0f);
+    const bool one_ok = run_captured_compensation(1, one);
+    const bool four_ok = run_captured_compensation(4, four);
+    if (one_ok && four_ok && !same_output(one, four)) {
+        std::fprintf(stderr, "one=%g,%g,%g,%g,%g,%g four=%g,%g,%g,%g,%g,%g\n",
+                     one[0], one[1], one[2], one[3], one[4], one[5],
+                     four[0], four[1], four[2], four[3], four[4], four[5]);
+    }
+    return check(one_ok, "single compensation shard") &&
+        check(four_ok, "multi compensation shards") &&
+        check(same_output(one, four), "compensation shard output differs");
+}
+
 }
 
 int main(int argc, char ** argv) {
     const bool edge_only = argc == 2 && std::string_view(argv[1]) == "--edge";
     const bool edge = test_public_contract_shape() && test_route_capability_table() &&
         test_bounded_pipeline_slots_and_reuse() &&
-        test_live_pipeline_worker() && test_staged_contract_errors();
+        test_live_pipeline_worker() && test_compensation_shard_output_is_bitwise_stable() &&
+        test_staged_contract_errors();
     if (edge_only) {
         return edge ? 0 : 1;
     }
