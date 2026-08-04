@@ -33,49 +33,6 @@ bool uses_baseline_channel_route(const ggml_gemmini_args_t & args) {
         args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar;
 }
 
-}
-
-namespace detail {
-
-RouteKey normalize_route(const ggml_gemmini_args_t & args) {
-    RouteKey key{};
-    const auto & storage = args.act_quant.storage();
-    if (std::holds_alternative<quants::act::exsia::Meta>(storage)) key.activation = ActivationRoute::exsia;
-    else if (std::holds_alternative<quants::act::tensor::Meta>(storage)) key.activation = ActivationRoute::tensor;
-    else if (std::holds_alternative<quants::act::token::Meta>(storage)) key.activation = ActivationRoute::token;
-    else if (std::holds_alternative<quants::act::block::Meta>(storage) ||
-             std::holds_alternative<quants::act::stripe::Meta>(storage)) key.activation = ActivationRoute::block;
-    else if (std::holds_alternative<quants::act::NoneMeta>(storage)) key.activation = ActivationRoute::fp32;
-
-    using Format = ggml_gemmini_args_t::im2p_weight_format_t;
-    switch (args.weight_format) {
-        case Format::q8_0_unpacked_to_h1: key.weight = args.weight_i8_scale_active ? WeightRoute::tensor_i8 : WeightRoute::q8_h1; break;
-        case Format::q8_h0: key.weight = WeightRoute::q8_h0; break;
-        case Format::q8_h1: key.weight = WeightRoute::q8_h1; break;
-        case Format::q8_hp1: key.weight = WeightRoute::q8_hp1; break;
-        case Format::q8_h2: key.weight = WeightRoute::q8_h2; break;
-        case Format::q8_hp2: key.weight = WeightRoute::q8_hp2; break;
-        case Format::q8_channel: key.weight = WeightRoute::q8_channel_direct; break;
-        case Format::q8_channel_dense_sidecar: key.weight = WeightRoute::q8_channel_sidecar; break;
-    }
-    return key;
-}
-
-RouteCapabilities route_capabilities(const ggml_gemmini_args_t & args) {
-    const RouteKey key = normalize_route(args);
-    RouteCapabilities caps{};
-    caps.deprecated = key.weight == WeightRoute::q8_h2 || key.weight == WeightRoute::q8_hp2;
-    caps.full = key.weight != WeightRoute::unknown && key.weight != WeightRoute::q8_h0;
-    caps.sliced_dense = caps.full && !caps.deprecated;
-    caps.sliced_compensation = caps.sliced_dense;
-    caps.live_stripe_producer = key.activation == ActivationRoute::exsia && caps.sliced_compensation;
-    return caps;
-}
-
-}
-
-namespace {
-
 baseline_activation_quant_t baseline_activation_for(const ggml_gemmini_args_t & args) {
     const auto & storage = args.act_quant.storage();
     if (std::holds_alternative<quants::act::tensor::Meta>(storage)) {
@@ -200,31 +157,15 @@ void record_metric(MatmulStageMetrics & metric, bool enabled, Clock::time_point 
 
 MatMul::MatMul(ggml_gemmini_args_t args) : args_(std::move(args)) {}
 
-MatMul::MatMul(ggml_gemmini_args_t * args) : args_(args != nullptr ? *args : ggml_gemmini_args_t{}), live_args_(args) {}
-
-ggml_gemmini_args_t & MatMul::args() {
-    return live_args_ != nullptr ? *live_args_ : args_;
-}
-
-const ggml_gemmini_args_t & MatMul::args() const {
-    return live_args_ != nullptr ? *live_args_ : args_;
-}
-
 MatMulResult MatMul::run_dense() {
     if (state_ != MatMulState::idle) {
         return { MatMulStatus::invalid_state, MatMulCapability::supported };
     }
-    if (args().I == 0 || args().J == 0 || args().K == 0 || args().A == nullptr || args().f_out == nullptr) {
+    if (args_.I == 0 || args_.J == 0 || args_.K == 0 || args_.A == nullptr || args_.f_out == nullptr) {
         return { MatMulStatus::invalid_arguments, MatMulCapability::unsupported };
     }
-    if (args().weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_h0) {
-        return { MatMulStatus::unsupported, MatMulCapability::unsupported };
-    }
-    if (!detail::route_capabilities(args()).full) {
-        return { MatMulStatus::unsupported, MatMulCapability::unsupported };
-    }
 
-    execute_dense(args());
+    execute_dense(args_);
     return { MatMulStatus::success, MatMulCapability::supported };
 }
 
@@ -234,7 +175,7 @@ MatMulResult MatMul::run_full() {
         return dense;
     }
     quants::dec::compensate_activation_dec(
-        quants::activation_outliers(args()), args(), "ggml-gemmini-matmul");
+        quants::activation_outliers(args_), args_, "ggml-gemmini-matmul");
     state_ = MatMulState::completed;
     return { MatMulStatus::success, MatMulCapability::supported };
 }
@@ -243,7 +184,7 @@ MatMulStatus MatMul::begin_stripes() {
     if (state_ != MatMulState::idle) {
         return MatMulStatus::invalid_state;
     }
-    if (stripe_capability(args()) == MatMulCapability::unsupported) {
+    if (stripe_capability(args_) == MatMulCapability::unsupported) {
         return MatMulStatus::unsupported;
     }
     first_row_ = 0;
@@ -263,7 +204,7 @@ MatMulStatus MatMul::run_stripe(MatMulStripe stripe, size_t stripe_id) {
     if (state_ != MatMulState::accepting_stripes) {
         return MatMulStatus::invalid_state;
     }
-    if (stripe.row_begin >= stripe.row_end || stripe.row_end > args().I) {
+    if (stripe.row_begin >= stripe.row_end || stripe.row_end > args_.I) {
         return MatMulStatus::malformed_stripe;
     }
 
@@ -276,7 +217,7 @@ MatMulStatus MatMul::run_stripe(MatMulStripe stripe, size_t stripe_id) {
         }
     }
 
-    const MatMulStatus status = execute_stripe(args(), stripe, stripe_id);
+    const MatMulStatus status = execute_stripe(args_, stripe, stripe_id);
     if (status == MatMulStatus::success) {
         if (!has_stripes_) {
             first_row_ = stripe.row_begin;
@@ -297,7 +238,7 @@ MatMulStatus MatMul::finish_stripes() {
         state_ = MatMulState::idle;
         return MatMulStatus::empty_stripes;
     }
-    if (first_row_ != 0 || last_row_end_ != args().I || covered_rows_ != args().I) {
+    if (first_row_ != 0 || last_row_end_ != args_.I || covered_rows_ != args_.I) {
         state_ = MatMulState::idle;
         return MatMulStatus::missing_stripes;
     }
@@ -307,10 +248,8 @@ MatMulStatus MatMul::finish_stripes() {
 
 MatMulCapability MatMul::stripe_capability(const ggml_gemmini_args_t & args) {
     const auto format = args.weight_format;
-    const auto capabilities = detail::route_capabilities(args);
     if (format == ggml_gemmini_args_t::im2p_weight_format_t::q8_h2 ||
         format == ggml_gemmini_args_t::im2p_weight_format_t::q8_hp2 ||
-        !capabilities.sliced_compensation ||
         args.transpose_A || (args.D != nullptr && !args.repeating_bias) ||
         (!row_invariant_activation(args) &&
          !std::holds_alternative<quants::act::exsia::Meta>(args.act_quant.storage()))) {
@@ -366,24 +305,6 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options
     }
 }
 
-MatmulExecution::MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions options)
-    : total_rows_(args != nullptr ? args->I : 0), facade_(args), options_(options) {
-    if (args == nullptr) {
-        status_ = make_status(MatmulStatusCode::invalid_argument, "args must be non-null");
-        return;
-    }
-    if (options_.mode != MatmulInvocationMode::full && options_.job_capacity == 0) {
-        status_ = make_status(MatmulStatusCode::invalid_argument, "job capacity must be nonzero");
-        return;
-    }
-    if (options_.mode == MatmulInvocationMode::stripe_sequential ||
-        options_.mode == MatmulInvocationMode::stripe_pipeline) {
-        const MatMulStatus status = facade_.begin_stripes();
-        status_ = to_public_status(
-            status, status == MatMulStatus::unsupported ? MatMulCapability::unsupported : MatMulCapability::supported);
-    }
-}
-
 MatmulInvocationMode MatmulExecution::mode() const {
     return options_.mode;
 }
@@ -397,85 +318,6 @@ MatmulStripeCollector::MatmulStripeCollector(size_t capacity)
     if (capacity == 0) {
         status_ = make_status(MatmulStatusCode::invalid_argument, "collector capacity must be nonzero");
     }
-}
-
-MatmulStripeCollector::~MatmulStripeCollector() {
-    finish();
-}
-
-bool MatmulStripeCollector::start(MatmulExecution & execution) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!status_ || worker_started_ || execution.mode() != MatmulInvocationMode::stripe_pipeline) {
-        return false;
-    }
-    execution_ = &execution;
-    worker_started_ = true;
-    worker_ = std::thread(&MatmulStripeCollector::worker_loop, this);
-    return true;
-}
-
-void MatmulStripeCollector::mark_execution_ready() {
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        execution_ready_ = true;
-    }
-    condition_.notify_all();
-}
-
-MatmulStatus MatmulStripeCollector::finish() {
-    if (!worker_started_) {
-        return status_;
-    }
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        stop_requested_ = true;
-    }
-    condition_.notify_all();
-    if (worker_.joinable()) {
-        worker_.join();
-    }
-    worker_started_ = false;
-    return status_;
-}
-
-void MatmulStripeCollector::worker_loop() {
-    for (;;) {
-        CapturedStripe captured{};
-        {
-            std::unique_lock<std::mutex> lock(mutex_);
-            condition_.wait(lock, [this] { return stop_requested_ || (execution_ready_ && !pending_.empty()); });
-            if (!execution_ready_ && stop_requested_) {
-                pending_.clear();
-                break;
-            }
-            if (pending_.empty()) {
-                break;
-            }
-            captured = std::move(pending_.front());
-            pending_.pop_front();
-            condition_.notify_all();
-        }
-
-        MatmulStripeJob job = capture_stripe(
-            *execution_,
-            MatmulStripeInput(captured.row_begin, captured.row_end, captured.stripe_id),
-            std::move(captured.outliers));
-        MatmulStatus status = prepare_compensation(job);
-        if (status) status = execute_dense_stripe(job);
-        if (status) status = execute_compensation_shard(job);
-        if (status) status = finalize_stripe(job);
-        if (!status) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            status_ = status;
-            stop_requested_ = true;
-            pending_.clear();
-            break;
-        }
-    }
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-    }
-    condition_.notify_all();
 }
 
 const quants::act::exsia::StripeReadySink * MatmulStripeCollector::sink() const {
@@ -501,29 +343,14 @@ bool MatmulStripeCollector::on_ready(
         collector.status_ = make_status(MatmulStatusCode::invalid_argument, "invalid stripe event");
         return false;
     }
+    if (collector.stripes_.size() >= collector.capacity_) {
+        collector.status_ = make_status(MatmulStatusCode::out_of_memory, "collector capacity exhausted");
+        return false;
+    }
     try {
         std::vector<quants::QactOutlier> outliers;
         if (event.outlier_count != 0) {
             outliers.assign(event.outliers, event.outliers + event.outlier_count);
-        }
-        if (collector.worker_started_) {
-            std::unique_lock<std::mutex> lock(collector.mutex_);
-            collector.condition_.wait(lock, [&collector] {
-                return collector.stop_requested_ || !collector.status_ ||
-                    collector.pending_.size() < collector.capacity_;
-            });
-            if (collector.stop_requested_ || !collector.status_) {
-                return false;
-            }
-            collector.pending_.push_back(
-                {event.stripe_id, event.row_begin, event.row_end, std::move(outliers)});
-            lock.unlock();
-            collector.condition_.notify_all();
-            return true;
-        }
-        if (collector.stripes_.size() >= collector.capacity_) {
-            collector.status_ = make_status(MatmulStatusCode::out_of_memory, "collector capacity exhausted");
-            return false;
         }
         collector.stripes_.push_back(
             {event.stripe_id, event.row_begin, event.row_end, std::move(outliers)});
@@ -588,10 +415,6 @@ MatmulExecution prepare_execution(const ggml_gemmini_args_t & args, MatmulOption
     return MatmulExecution(args, options);
 }
 
-MatmulExecution prepare_execution(ggml_gemmini_args_t & args, MatmulOptions options) {
-    return MatmulExecution(&args, options);
-}
-
 MatmulStatus execute_full(MatmulExecution & execution) {
     if (execution.options_.mode != MatmulInvocationMode::full) {
         execution.status_ = make_status(
@@ -653,7 +476,7 @@ MatmulStatus prepare_compensation(MatmulStripeJob & job) {
         return job.status_;
     }
     const auto start = Clock::now();
-    const auto & args = job.execution_->facade_.args();
+    const auto & args = job.execution_->facade_.args_;
     const auto & storage = args.act_quant.storage();
     if (!job.has_captured_outliers_ &&
         !std::holds_alternative<quants::act::NoneMeta>(storage) &&
@@ -697,7 +520,7 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job) {
     const auto start = Clock::now();
     auto status = quants::dec::ActivationDECRowSliceStatus::success;
     if (job.has_captured_outliers_) {
-        auto local_args = job.execution_->facade_.args();
+        auto local_args = job.execution_->facade_.args_;
         const size_t row_begin = job.input_.row_begin();
         const size_t input_stride = local_args.sA ? local_args.sA : local_args.K;
         const size_t output_stride = local_args.stride_f_out ? local_args.stride_f_out : local_args.J;
@@ -720,7 +543,7 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job) {
         quants::dec::compensate_activation_dec(local_outliers, local_args, "ggml-gemmini-matmul");
     } else {
         status = quants::dec::compensate_activation_dec_rows(
-            job.compensation_outliers_, job.execution_->facade_.args(),
+            job.compensation_outliers_, job.execution_->facade_.args_,
             job.input_.row_begin(), job.input_.row_end(), "ggml-gemmini-matmul");
     }
     if (status == quants::dec::ActivationDECRowSliceStatus::unsupported) {

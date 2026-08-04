@@ -102,17 +102,6 @@ bool test_h2_and_hp2_stripe_capability_is_explicitly_unsupported() {
                  "HP2 stripe capability");
 }
 
-bool test_q8_h0_full_capability_is_explicitly_unsupported() {
-    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
-    std::vector<elem_t> weights = { 1, -1, 2, 3 };
-    std::vector<float> output(6, 0.0f);
-    auto args = make_args(activation, weights, output);
-    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h0;
-    const auto result = ggml::gemmini::MatMul(args).run_full();
-    return check(result.status == ggml::gemmini::MatMulStatus::unsupported,
-                 "Q8_H0 full capability");
-}
-
 bool test_stripe_state_lifecycle() {
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
@@ -214,35 +203,6 @@ bool test_bounded_pipeline_slots_and_reuse() {
     return passed;
 }
 
-bool test_live_staged_worker() {
-    using namespace ggml::gemmini;
-    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
-    std::vector<elem_t> weights = { 1, -1, 2, 3 };
-    std::vector<float> output(6, 0.0f);
-    MatmulOptions options{};
-    options.mode = MatmulInvocationMode::stripe_pipeline;
-    options.job_capacity = 2;
-    auto execution = prepare_execution(make_args(activation, weights, output), options);
-    MatmulStripeCollector collector(options.job_capacity);
-    const quants::act::exsia::StripeReadyEvent event{0, 0, 3, nullptr, 0};
-    const bool accepted = collector.start(execution);
-    collector.mark_execution_ready();
-    const bool event_accepted = accepted &&
-        collector.sink()->on_ready(collector.sink()->user_data, event);
-    const MatmulStatus collector_status = collector.finish();
-    const MatmulStatus execution_status = finish_execution(execution);
-    const bool passed = event_accepted && collector_status.ok() && execution_status.ok();
-    if (!passed) {
-        std::fprintf(stderr, "FAIL live worker: accepted=%d collector=%d execution=%d output=%f\n",
-                     accepted ? 1 : 0, static_cast<int>(collector_status.code),
-                     static_cast<int>(execution_status.code), output[0]);
-    }
-    if (passed) {
-        std::puts("PASS live worker: capture=handoff worker=WS+RC bounded=yes");
-    }
-    return passed;
-}
-
 bool test_staged_contract_errors() {
     using namespace ggml::gemmini;
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
@@ -289,7 +249,6 @@ bool test_staged_contract_errors() {
 int main(int argc, char ** argv) {
     const bool edge_only = argc == 2 && std::string_view(argv[1]) == "--edge";
     const bool edge = test_public_contract_shape() && test_bounded_pipeline_slots_and_reuse() &&
-        test_live_staged_worker() &&
         test_staged_contract_errors();
     if (edge_only) {
         return edge ? 0 : 1;
@@ -297,8 +256,7 @@ int main(int argc, char ** argv) {
     return edge && test_full_facade_status_and_output_match_legacy() &&
             test_empty_tail_and_malformed_stripe_status() &&
             test_duplicate_and_overlap_stripe_status() &&
-        test_h2_and_hp2_stripe_capability_is_explicitly_unsupported() &&
-            test_q8_h0_full_capability_is_explicitly_unsupported() &&
+            test_h2_and_hp2_stripe_capability_is_explicitly_unsupported() &&
             test_stripe_state_lifecycle()
         ? 0
         : 1;
