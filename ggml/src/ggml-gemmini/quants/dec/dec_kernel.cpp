@@ -877,6 +877,170 @@ bool accumulate_to_ycom_int64_scalar_group_k_csc_nr4(
 namespace
 {
 template <size_t NR>
+bool accumulate_to_ycom_int64_h1_group_k_csc_impl(
+    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
+    const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
+    const GroupKCSCPlan &group_k_csc_plan, float *Y_com, GroupKCSCScalarStats &stats)
+{
+    static_assert(NR > 0, "NR must be positive");
+    static_assert(kDecGroupSizeK == QK8_0, "H1 GroupKCSC assumes one scale block per K group");
+
+    stats = {};
+    const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
+    const size_t tile_capacity = std::min(J, kDecInt64JTileWidth);
+    const size_t minimum_weight_stride = plan.layout == WeightLayout::KxJ_RowMajor ? J : args.K;
+    if ((!weights && !plan.native_weight_blocks) || !Y_com || !plan.valid ||
+        plan.route != DecWeightRoute::Q8H1 || !plan.scales.on_demand_mode ||
+        plan.scales.scalar_mode || plan.scales.row_header_mode || plan.scales.channel_mode ||
+        I == 0 || J == 0 || args.K == 0 || I != args.I || J != args.J ||
+        (!plan.native_weight_blocks && plan.weight_stride < minimum_weight_stride) ||
+        I > std::numeric_limits<size_t>::max() / tile_capacity ||
+        !valid_group_k_csc_scalar_plan(group_k_csc_plan, I, args.K, entries))
+        return false;
+
+    if (entries.empty())
+        return true;
+
+    size_t active_k_count = 0;
+    for (size_t group = 0; group < group_k_csc_plan.num_groups; ++group)
+    {
+        const size_t group_offset = group * (kDecGroupSizeK + 1);
+        for (size_t k_offset = 0; k_offset < kDecGroupSizeK; ++k_offset)
+            active_k_count += group_k_csc_plan.column_offsets[group_offset + k_offset] !=
+                group_k_csc_plan.column_offsets[group_offset + k_offset + 1];
+    }
+    stats.logical_weight_reference_count = saturating_mul_size(entries.size(), J);
+    stats.weight_scalar_load_count = saturating_mul_size(active_k_count, J);
+    stats.weight_vector_load_count = group_k_csc_vector_load_count<NR>(active_k_count, J);
+    stats.scratch_init_count = saturating_mul_size(group_k_csc_plan.active_rows.size(), J);
+    stats.sparse_update_count = stats.logical_weight_reference_count;
+    stats.merge_count = saturating_mul_size(group_k_csc_plan.active_rows.size(), J);
+    stats.fallback_update_count = stats.logical_weight_reference_count;
+    stats.thread_scratch_bytes = saturating_mul_size(
+        saturating_mul_size(I, tile_capacity), sizeof(int64_t));
+    stats.width_path = GroupKCSCWidthPath::AllInt64;
+#if LOG_CYCLE
+    std::atomic<uint64_t> scratch_init_cycles {0};
+    std::atomic<uint64_t> sparse_update_cycles {0};
+    std::atomic<uint64_t> merge_cycles {0};
+#endif
+
+    for_each_grouped_j_tile(I, J, [&](size_t jb, size_t width, std::vector<int64_t> &accumulator)
+    {
+        H1ScaleTile scale_tile;
+        for (size_t group = 0; group < group_k_csc_plan.num_groups; ++group)
+        {
+            const size_t active_row_begin = group_k_csc_plan.active_row_offsets[group];
+            const size_t active_row_end = group_k_csc_plan.active_row_offsets[group + 1];
+            if (active_row_begin == active_row_end)
+                continue;
+
+#if LOG_CYCLE
+            const uint64_t scratch_init_start = dec_group_k_csc_stage_cycle_read();
+#endif
+            for (size_t row_position = active_row_begin; row_position < active_row_end; ++row_position)
+            {
+                const size_t row = group_k_csc_plan.active_rows[row_position];
+                std::fill(
+                    accumulator.begin() + row * width,
+                    accumulator.begin() + (row + 1) * width,
+                    int64_t {0});
+            }
+#if LOG_CYCLE
+            scratch_init_cycles.fetch_add(
+                dec_group_k_csc_stage_cycle_span(
+                    scratch_init_start, dec_group_k_csc_stage_cycle_read()),
+                std::memory_order_relaxed);
+            const uint64_t sparse_update_start = dec_group_k_csc_stage_cycle_read();
+#endif
+
+            for (size_t t = 0; t < width; ++t)
+            {
+                const H1ScaleParams params = h1_scale_params(args, plan, jb + t, group);
+                scale_tile.c_eff[t] = params.c_eff;
+                scale_tile.s_rf[t] = params.s_rf;
+            }
+
+            const size_t group_offset = group * (kDecGroupSizeK + 1);
+            for (size_t k_offset = 0; k_offset < kDecGroupSizeK; ++k_offset)
+            {
+                const size_t entry_begin = group_k_csc_plan.column_offsets[group_offset + k_offset];
+                const size_t entry_end = group_k_csc_plan.column_offsets[group_offset + k_offset + 1];
+                if (entry_begin == entry_end)
+                    continue;
+
+                for (size_t j_offset = 0; j_offset < width; j_offset += NR)
+                {
+                    const size_t lane_count = std::min(NR, width - j_offset);
+                    std::array<int64_t, NR> weight_lanes;
+                    for (size_t lane = 0; lane < lane_count; ++lane)
+                    {
+                        const size_t j = jb + j_offset + lane;
+                        const block_q8_h1 *native = plan.native_weight_blocks ?
+                            args.q8_h1_block(j, group) : nullptr;
+                        weight_lanes[lane] = native ? native->qs[k_offset] :
+                            (plan.layout == WeightLayout::KxJ_RowMajor ?
+                                weights[(group * kDecGroupSizeK + k_offset) * plan.weight_stride + j] :
+                                weights[j * plan.weight_stride + group * kDecGroupSizeK + k_offset]);
+                    }
+
+                    for (size_t position = entry_begin; position < entry_end; ++position)
+                    {
+                        const ResidualGroupEntry &entry = entries[group_k_csc_plan.entry_order[position]];
+                        int64_t *entry_accumulator = accumulator.data() +
+                            static_cast<size_t>(entry.row) * width + j_offset;
+                        const int64_t residual = entry.residual;
+                        for (size_t lane = 0; lane < lane_count; ++lane)
+                        {
+                            const int64_t term = residual * weight_lanes[lane];
+#if DEC_VALIDATION
+                            const __int128 checked_sum =
+                                static_cast<__int128>(entry_accumulator[lane]) + term;
+                            if (checked_sum < std::numeric_limits<int64_t>::min() ||
+                                checked_sum > std::numeric_limits<int64_t>::max())
+                                std::abort();
+#endif
+                            entry_accumulator[lane] += term;
+                        }
+                    }
+                }
+            }
+
+#if LOG_CYCLE
+            sparse_update_cycles.fetch_add(
+                dec_group_k_csc_stage_cycle_span(
+                    sparse_update_start, dec_group_k_csc_stage_cycle_read()),
+                std::memory_order_relaxed);
+            const uint64_t merge_start = dec_group_k_csc_stage_cycle_read();
+#endif
+            for (size_t row_position = active_row_begin; row_position < active_row_end; ++row_position)
+            {
+                const size_t row = group_k_csc_plan.active_rows[row_position];
+                const float activation_scale = activation_scales ? activation_scales[row] : 1.0f;
+                const int64_t *row_accumulator = accumulator.data() + row * width;
+                float *output = Y_com + row * J + jb;
+                for (size_t t = 0; t < width; ++t)
+                    output[t] += apply_h1_scale_ordered(
+                        row_accumulator[t], scale_tile.c_eff[t], scale_tile.s_rf[t],
+                        activation_scale);
+            }
+#if LOG_CYCLE
+            merge_cycles.fetch_add(
+                dec_group_k_csc_stage_cycle_span(merge_start, dec_group_k_csc_stage_cycle_read()),
+                std::memory_order_relaxed);
+#endif
+        }
+    });
+
+#if LOG_CYCLE
+    stats.scratch_init_cycles = scratch_init_cycles.load(std::memory_order_relaxed);
+    stats.sparse_update_cycles = sparse_update_cycles.load(std::memory_order_relaxed);
+    stats.merge_cycles = merge_cycles.load(std::memory_order_relaxed);
+#endif
+    return true;
+}
+
+template <size_t NR>
 bool accumulate_to_ycom_int32_mixed_group_k_csc_impl(
     const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
     const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
@@ -1268,6 +1432,24 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_impl(
 #endif
     return true;
 }
+}
+
+bool accumulate_to_ycom_int64_h1_group_k_csc_nr8(
+    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
+    const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
+    const GroupKCSCPlan &group_k_csc_plan, float *Y_com, GroupKCSCScalarStats &stats)
+{
+    return accumulate_to_ycom_int64_h1_group_k_csc_impl<8>(
+        args, plan, I, J, activation_scales, entries, group_k_csc_plan, Y_com, stats);
+}
+
+bool accumulate_to_ycom_int64_h1_group_k_csc_nr4(
+    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
+    const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
+    const GroupKCSCPlan &group_k_csc_plan, float *Y_com, GroupKCSCScalarStats &stats)
+{
+    return accumulate_to_ycom_int64_h1_group_k_csc_impl<4>(
+        args, plan, I, J, activation_scales, entries, group_k_csc_plan, Y_com, stats);
 }
 
 bool accumulate_to_ycom_int32_mixed_group_k_csc_nr8(

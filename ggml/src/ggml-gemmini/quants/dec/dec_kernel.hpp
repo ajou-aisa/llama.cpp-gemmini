@@ -115,6 +115,28 @@ bool accumulate_to_ycom_int64_scalar_group_k_csc_nr4(
     float *Y_com,
     GroupKCSCScalarStats &stats);
 
+bool accumulate_to_ycom_int64_h1_group_k_csc_nr8(
+    const ggml_gemmini_args_t &args,
+    const DecRoutePlan &plan,
+    size_t I,
+    size_t J,
+    const float *activation_scales,
+    const std::vector<ResidualGroupEntry> &entries,
+    const GroupKCSCPlan &group_k_csc_plan,
+    float *Y_com,
+    GroupKCSCScalarStats &stats);
+
+bool accumulate_to_ycom_int64_h1_group_k_csc_nr4(
+    const ggml_gemmini_args_t &args,
+    const DecRoutePlan &plan,
+    size_t I,
+    size_t J,
+    const float *activation_scales,
+    const std::vector<ResidualGroupEntry> &entries,
+    const GroupKCSCPlan &group_k_csc_plan,
+    float *Y_com,
+    GroupKCSCScalarStats &stats);
+
 bool accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
     const ggml_gemmini_args_t &args,
     const DecRoutePlan &plan,

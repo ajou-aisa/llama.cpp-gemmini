@@ -540,13 +540,22 @@ ActivationDECResult compensate_activation_dec(
         group_count, scr.residual_entries.size(), scr.active_row_groups.size());
     const size_t estimated_group_k_csc_saved_weight_bytes = estimate_group_k_csc_saved_weight_bytes(
         result.logical_weight_reference_count, result.unique_k_count, J);
-    const bool group_k_csc_common = use_int64_scalar &&
+    const bool group_k_csc_common_dense = use_int64_scalar &&
         I > 1 &&
         J >= 8 &&
         rows_per_active_k_mean >= 16.0 &&
         estimated_group_k_csc_saved_weight_bytes > estimated_group_k_csc_plan_bytes;
-    bool use_group_k_csc = !group_k_csc_disabled && use_int64_scalar &&
-        (group_k_csc_forced || group_k_csc_enabled || group_k_csc_common);
+    const bool group_k_csc_common_h1 = use_int64_h1 &&
+        I > 1 &&
+        J >= 8 &&
+        rows_per_active_k_mean >= 16.0 &&
+        estimated_group_k_csc_saved_weight_bytes > estimated_group_k_csc_plan_bytes;
+    const bool group_k_csc_supported_route = use_int64_scalar || use_int64_h1;
+    const bool group_k_csc_common =
+        group_k_csc_common_dense || group_k_csc_common_h1;
+    const bool group_k_csc_override = (group_k_csc_forced || group_k_csc_enabled) && I > 1;
+    bool use_group_k_csc = !group_k_csc_disabled && group_k_csc_supported_route &&
+        (group_k_csc_override || group_k_csc_common);
     const size_t group_k_csc_nr = J < 8 ? 4 : 8;
 
     start = ggml::gemmini::cycle::read();
@@ -577,13 +586,21 @@ ActivationDECResult compensate_activation_dec(
     GroupKCSCScalarStats group_k_csc_stats;
     if (use_group_k_csc)
     {
-        const bool accumulated = group_k_csc_nr == 4 ?
-            accumulate_to_ycom_int32_mixed_group_k_csc_nr4(
-                args, plan, I, J, activation_scales, scr.residual_entries,
-                scr.group_k_csc_plan, scr.Y_com.data(), group_k_csc_stats) :
-            accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
-                args, plan, I, J, activation_scales, scr.residual_entries,
-                scr.group_k_csc_plan, scr.Y_com.data(), group_k_csc_stats);
+        const bool accumulated = use_int64_h1 ?
+            (group_k_csc_nr == 4 ?
+                accumulate_to_ycom_int64_h1_group_k_csc_nr4(
+                    args, plan, I, J, activation_scales, scr.residual_entries,
+                    scr.group_k_csc_plan, scr.Y_com.data(), group_k_csc_stats) :
+                accumulate_to_ycom_int64_h1_group_k_csc_nr8(
+                    args, plan, I, J, activation_scales, scr.residual_entries,
+                    scr.group_k_csc_plan, scr.Y_com.data(), group_k_csc_stats)) :
+            (group_k_csc_nr == 4 ?
+                accumulate_to_ycom_int32_mixed_group_k_csc_nr4(
+                    args, plan, I, J, activation_scales, scr.residual_entries,
+                    scr.group_k_csc_plan, scr.Y_com.data(), group_k_csc_stats) :
+                accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
+                    args, plan, I, J, activation_scales, scr.residual_entries,
+                    scr.group_k_csc_plan, scr.Y_com.data(), group_k_csc_stats));
         use_group_k_csc = accumulated;
     }
 
@@ -655,7 +672,7 @@ ActivationDECResult compensate_activation_dec(
         use_group_k_csc ? "group-k-major" : "row-major",
         use_group_k_csc ? group_k_csc_nr : size_t {1},
         use_group_k_csc ? "vector" : "direct",
-        use_group_k_csc ? "mixed-int32-int64" : "int64",
+        use_group_k_csc ? (use_int64_h1 ? "int64" : "mixed-int32-int64") : "int64",
         kDecGroupSizeK,
         requested_activation_name(),
         dec_route_name(plan),
