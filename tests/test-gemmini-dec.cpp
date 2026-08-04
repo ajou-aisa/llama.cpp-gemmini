@@ -1765,6 +1765,234 @@ bool test_fixed_residual_replay_baseline() {
                "fixed replay counters are deterministic") && ok;
 }
 
+bool test_fixed_residual_replay_high_reuse() {
+    using ggml::gemmini::quants::dec::ActiveRowGroup;
+    using ggml::gemmini::quants::dec::GroupKCSCPlan;
+    using ggml::gemmini::quants::dec::GroupKCSCScalarStats;
+    using ggml::gemmini::quants::dec::GroupKCSCWidthPath;
+    using ggml::gemmini::quants::dec::ResidualGroupEntry;
+
+    constexpr size_t rows = 256;
+    constexpr size_t cols = 131;
+    constexpr size_t depth = 35;
+    constexpr size_t active_k_count = 2;
+    constexpr size_t expected_logical_refs = rows * cols * active_k_count;
+    constexpr size_t expected_row_groups = rows * active_k_count;
+    constexpr size_t warmup_count = 5;
+    constexpr size_t measured_count = 25;
+    std::vector<int8_t> weights(depth * cols, 0);
+    for (size_t k = 0; k < depth; ++k)
+        for (size_t column = 0; column < cols; ++column)
+            weights[k * cols + column] = static_cast<int8_t>(
+                static_cast<int>((k * 11 + column * 7) % 17) - 8);
+
+    std::vector<ggml::gemmini::quants::QactOutlier> outliers;
+    outliers.reserve(rows * active_k_count);
+    std::vector<ResidualGroupEntry> entries;
+    entries.reserve(rows * active_k_count);
+    for (size_t row = 0; row < rows; ++row) {
+        const int32_t k0_residual = static_cast<int32_t>(row % 7) + 1;
+        const int32_t k33_residual = -static_cast<int32_t>(row % 5) - 2;
+        outliers.push_back({ static_cast<int32_t>(row), 0, k0_residual });
+        outliers.push_back({ static_cast<int32_t>(row), 33, k33_residual });
+        entries.push_back({ static_cast<uint32_t>(row), 0, k0_residual });
+        entries.push_back({ static_cast<uint32_t>(row), 33, k33_residual });
+    }
+
+    std::vector<float> output(rows * cols, 0.0f);
+    ggml_gemmini_args_t args = dense_args(rows, cols, depth, weights, output, 0.125f);
+    const auto scalar_route_plan = ggml::gemmini::quants::dec::resolve_dec_route_plan(
+        args, ggml::gemmini::quants::dec::WeightScaleInfoMode::Dec);
+    std::vector<ActiveRowGroup> groups;
+    ggml::gemmini::quants::dec::build_active_row_groups(entries, groups);
+    std::vector<size_t> group_offsets;
+    std::vector<size_t> group_row_group_indices;
+    ggml::gemmini::quants::dec::build_group_major_index(
+        groups, active_k_count, group_offsets, group_row_group_indices);
+    GroupKCSCPlan group_k_csc_plan;
+    const bool group_k_csc_ready = ggml::gemmini::quants::dec::build_group_k_csc_plan(
+        entries, groups, group_offsets, group_row_group_indices, active_k_count, group_k_csc_plan);
+
+    ScopedDecGroupKCscEnv env_guard;
+    set_dec_group_k_csc_force(nullptr);
+    set_dec_group_k_csc_enable(nullptr);
+    set_dec_group_k_csc_disable("1");
+    const auto row_direct_result = ggml::gemmini::quants::dec::compensate_activation_dec(
+        outliers, args, "test");
+    const std::vector<float> row_direct_output = output;
+    std::fill(output.begin(), output.end(), 0.0f);
+    set_dec_group_k_csc_disable(nullptr);
+    set_dec_group_k_csc_enable("1");
+    const auto enabled_result = ggml::gemmini::quants::dec::compensate_activation_dec(
+        outliers, args, "test");
+    const std::vector<float> enabled_output = output;
+    set_dec_group_k_csc_enable(nullptr);
+
+    std::vector<float> current_row_grouped(rows * cols, 0.0f);
+    ggml::gemmini::quants::dec::accumulate_to_ycom_int64_scalar(
+        args, scalar_route_plan, rows, cols, nullptr, entries, groups, group_offsets,
+        group_row_group_indices, current_row_grouped.data());
+    std::vector<float> group_k_csc_nr4(rows * cols, 0.0f);
+    GroupKCSCScalarStats group_k_csc_nr4_stats;
+    const bool group_k_csc_nr4_accumulated =
+        ggml::gemmini::quants::dec::accumulate_to_ycom_int32_mixed_group_k_csc_nr4(
+            args, scalar_route_plan, rows, cols, nullptr, entries, group_k_csc_plan,
+            group_k_csc_nr4.data(), group_k_csc_nr4_stats);
+    std::vector<float> group_k_csc_nr8(rows * cols, 0.0f);
+    GroupKCSCScalarStats group_k_csc_nr8_stats;
+    const bool group_k_csc_nr8_accumulated =
+        ggml::gemmini::quants::dec::accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
+            args, scalar_route_plan, rows, cols, nullptr, entries, group_k_csc_plan,
+            group_k_csc_nr8.data(), group_k_csc_nr8_stats);
+
+    const double row_direct_reuse = row_direct_result.weight_scalar_load_count == 0 ? 0.0 :
+        static_cast<double>(row_direct_result.logical_weight_reference_count) /
+            static_cast<double>(row_direct_result.weight_scalar_load_count);
+    const double enabled_reuse = enabled_result.weight_scalar_load_count == 0 ? 0.0 :
+        static_cast<double>(enabled_result.logical_weight_reference_count) /
+            static_cast<double>(enabled_result.weight_scalar_load_count);
+    const double nr4_reuse = group_k_csc_nr4_stats.weight_scalar_load_count == 0 ? 0.0 :
+        static_cast<double>(group_k_csc_nr4_stats.logical_weight_reference_count) /
+            static_cast<double>(group_k_csc_nr4_stats.weight_scalar_load_count);
+    const double nr8_reuse = group_k_csc_nr8_stats.weight_scalar_load_count == 0 ? 0.0 :
+        static_cast<double>(group_k_csc_nr8_stats.logical_weight_reference_count) /
+            static_cast<double>(group_k_csc_nr8_stats.weight_scalar_load_count);
+
+    bool ok = check(group_k_csc_ready && scalar_route_plan.valid,
+                    "high-reuse replay prepares row-direct and GroupKCSC plans");
+    ok = check(row_direct_result.group_k_csc_plan_bytes == 0 &&
+                   row_direct_result.total_selected == outliers.size() &&
+                   row_direct_result.nnz == outliers.size() &&
+                   row_direct_result.unique_k_count == active_k_count &&
+                   row_direct_result.logical_weight_reference_count == expected_logical_refs &&
+                   row_direct_result.weight_scalar_load_count == expected_logical_refs &&
+                   row_direct_result.weight_vector_load_count == 0 &&
+                   row_direct_result.active_row_k_pairs == expected_row_groups &&
+                   row_direct_result.rows_per_active_k_max == rows &&
+                   enabled_result.group_k_csc_plan_bytes > 0 &&
+                   enabled_result.logical_weight_reference_count == expected_logical_refs &&
+                   enabled_result.weight_scalar_load_count == active_k_count * cols &&
+                   enabled_result.weight_vector_load_count > 0 &&
+                   enabled_result.active_row_k_pairs == expected_row_groups &&
+                   enabled_result.rows_per_active_k_max == rows &&
+                   row_direct_reuse == 1.0 && enabled_reuse == static_cast<double>(rows),
+               "high-reuse replay route/load counters reflect dense row reuse") && ok;
+    ok = check(group_k_csc_nr4_accumulated && group_k_csc_nr8_accumulated &&
+                   byte_identical(row_direct_output, enabled_output) &&
+                   byte_identical(row_direct_output, current_row_grouped) &&
+                   byte_identical(current_row_grouped, group_k_csc_nr4) &&
+                   byte_identical(current_row_grouped, group_k_csc_nr8),
+               "high-reuse replay preserves bitwise output across RowDirect and GroupKCSC NR4/NR8") && ok;
+    ok = check(group_k_csc_nr4_stats.logical_weight_reference_count == expected_logical_refs &&
+                   group_k_csc_nr4_stats.weight_scalar_load_count == active_k_count * cols &&
+                   group_k_csc_nr4_stats.classification_work_count == entries.size() &&
+                   group_k_csc_nr4_stats.sparse_update_count == expected_logical_refs &&
+                   group_k_csc_nr4_stats.merge_count == rows * cols &&
+                   group_k_csc_nr4_stats.safe_update_count == expected_logical_refs &&
+                   group_k_csc_nr4_stats.fallback_update_count == 0 &&
+                   group_k_csc_nr4_stats.branch_entry_classification_count == 0 &&
+                   group_k_csc_nr4_stats.width_path == GroupKCSCWidthPath::AllInt32 &&
+                   group_k_csc_nr8_stats.logical_weight_reference_count == expected_logical_refs &&
+                   group_k_csc_nr8_stats.weight_scalar_load_count == active_k_count * cols &&
+                   group_k_csc_nr8_stats.classification_work_count == entries.size() &&
+                   group_k_csc_nr8_stats.sparse_update_count == expected_logical_refs &&
+                   group_k_csc_nr8_stats.merge_count == rows * cols &&
+                   group_k_csc_nr8_stats.safe_update_count == expected_logical_refs &&
+                   group_k_csc_nr8_stats.fallback_update_count == 0 &&
+                   group_k_csc_nr8_stats.branch_entry_classification_count == 0 &&
+                   group_k_csc_nr8_stats.width_path == GroupKCSCWidthPath::AllInt32,
+               "high-reuse replay NR4/NR8 counters stay all-safe") && ok;
+
+    std::printf(
+        "high-reuse dispatch rows=%zu cols=%zu depth=%zu disable_route=%s enable_route=%s logical_refs=%zu disable_scalar_loads=%zu disable_vector_loads=%zu disable_reuse=%.1f enable_scalar_loads=%zu enable_vector_loads=%zu enable_reuse=%.1f rows_per_active_k=%zu\n",
+        rows, cols, depth,
+        row_direct_result.group_k_csc_plan_bytes == 0 ? "row-direct" : "group-k-csc",
+        enabled_result.group_k_csc_plan_bytes == 0 ? "row-direct" : "group-k-csc",
+        row_direct_result.logical_weight_reference_count,
+        row_direct_result.weight_scalar_load_count,
+        row_direct_result.weight_vector_load_count,
+        row_direct_reuse,
+        enabled_result.weight_scalar_load_count,
+        enabled_result.weight_vector_load_count,
+        enabled_reuse,
+        enabled_result.rows_per_active_k_max);
+    std::printf(
+        "high-reuse group_k_csc_nr4 logical_refs=%zu scalar_loads=%zu vector_loads=%zu reuse=%.1f\n",
+        group_k_csc_nr4_stats.logical_weight_reference_count,
+        group_k_csc_nr4_stats.weight_scalar_load_count,
+        group_k_csc_nr4_stats.weight_vector_load_count,
+        nr4_reuse);
+    std::printf(
+        "high-reuse group_k_csc_nr8 logical_refs=%zu scalar_loads=%zu vector_loads=%zu reuse=%.1f\n",
+        group_k_csc_nr8_stats.logical_weight_reference_count,
+        group_k_csc_nr8_stats.weight_scalar_load_count,
+        group_k_csc_nr8_stats.weight_vector_load_count,
+        nr8_reuse);
+    print_group_k_csc_replay_cost("high-reuse-nr4", group_k_csc_nr4_stats);
+    print_group_k_csc_replay_cost("high-reuse-nr8", group_k_csc_nr8_stats);
+
+    std::vector<float> measured_row_direct(rows * cols, 0.0f);
+    const ReplayTimingStats row_direct_timing = benchmark_replay_kernel(
+        measured_row_direct,
+        current_row_grouped,
+        [&]() {
+            ggml::gemmini::quants::dec::accumulate_to_ycom_int64_scalar(
+                args, scalar_route_plan, rows, cols, nullptr, entries, groups, group_offsets,
+                group_row_group_indices, measured_row_direct.data());
+            return true;
+        },
+        warmup_count,
+        measured_count,
+        ok);
+    std::vector<float> measured_nr4(rows * cols, 0.0f);
+    const ReplayTimingStats nr4_timing = benchmark_replay_kernel(
+        measured_nr4,
+        current_row_grouped,
+        [&]() {
+            return ggml::gemmini::quants::dec::accumulate_to_ycom_int32_mixed_group_k_csc_nr4(
+                args, scalar_route_plan, rows, cols, nullptr, entries, group_k_csc_plan,
+                measured_nr4.data(), group_k_csc_nr4_stats);
+        },
+        warmup_count,
+        measured_count,
+        ok);
+    std::vector<float> measured_nr8(rows * cols, 0.0f);
+    const ReplayTimingStats nr8_timing = benchmark_replay_kernel(
+        measured_nr8,
+        current_row_grouped,
+        [&]() {
+            return ggml::gemmini::quants::dec::accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
+                args, scalar_route_plan, rows, cols, nullptr, entries, group_k_csc_plan,
+                measured_nr8.data(), group_k_csc_nr8_stats);
+        },
+        warmup_count,
+        measured_count,
+        ok);
+    const double best_group_k_csc_compute = std::min(
+        nr4_timing.compute.median_us, nr8_timing.compute.median_us);
+    const char *keep_decision = best_group_k_csc_compute <= row_direct_timing.compute.median_us ?
+        "keep" : "revert";
+    std::printf(
+        "high-reuse benchmark warmup=%zu measured=%zu row_direct compute_us median=%.3f p10=%.3f p90=%.3f total_us median=%.3f p10=%.3f p90=%.3f\n",
+        warmup_count, measured_count,
+        row_direct_timing.compute.median_us, row_direct_timing.compute.p10_us, row_direct_timing.compute.p90_us,
+        row_direct_timing.total.median_us, row_direct_timing.total.p10_us, row_direct_timing.total.p90_us);
+    std::printf(
+        "high-reuse benchmark warmup=%zu measured=%zu group_k_csc_nr4 compute_us median=%.3f p10=%.3f p90=%.3f total_us median=%.3f p10=%.3f p90=%.3f\n",
+        warmup_count, measured_count,
+        nr4_timing.compute.median_us, nr4_timing.compute.p10_us, nr4_timing.compute.p90_us,
+        nr4_timing.total.median_us, nr4_timing.total.p10_us, nr4_timing.total.p90_us);
+    std::printf(
+        "high-reuse benchmark warmup=%zu measured=%zu group_k_csc_nr8 compute_us median=%.3f p10=%.3f p90=%.3f total_us median=%.3f p10=%.3f p90=%.3f\n",
+        warmup_count, measured_count,
+        nr8_timing.compute.median_us, nr8_timing.compute.p10_us, nr8_timing.compute.p90_us,
+        nr8_timing.total.median_us, nr8_timing.total.p10_us, nr8_timing.total.p90_us);
+    std::printf(
+        "high-reuse benchmark decision=%s baseline=row-direct compare=group-k-csc-min-compute\n",
+        keep_decision);
+    return ok;
+}
+
 bool test_group_k_csc_nr4_transposed_j_tile() {
     using ggml::gemmini::quants::dec::ActiveRowGroup;
     using ggml::gemmini::quants::dec::GroupKCSCPlan;
@@ -2255,7 +2483,8 @@ int main() {
     const bool ok = test_noop() && test_route_plan() && test_active_row_groups() && test_group_k_csc_plan() && test_route_metadata_rejects() && test_repeated_residuals() && test_decode_repeated_residuals() && test_integer_routes() && test_block_integer_route() &&
         test_q8_h1_hierarchical_route() && test_q8_h1_preserves_ordered_scaling_bits() && test_q8_h1_activation_scale_routes_preserve_bits() && test_unpacked_h1_tail_routes_preserve_bits() && test_q8_h1_large_effective_scale() && test_q8_h2_hierarchical_route() && test_q8_hp1_hierarchical_route() && test_q8_hp2_hierarchical_route() &&
         test_malformed_hierarchical_reject() && test_output_strides() && test_sparse_grouped_tails() && test_malformed_reject() && test_thread_clamp() &&
-        test_group_k_csc_production_dispatch() && test_fixed_residual_replay_baseline() && test_group_k_csc_nr4_transposed_j_tile() &&
+        test_group_k_csc_production_dispatch() && test_fixed_residual_replay_baseline() &&
+        test_fixed_residual_replay_high_reuse() && test_group_k_csc_nr4_transposed_j_tile() &&
         test_group_k_csc_mixed_int32_boundaries() &&
         test_group_k_csc_mixed_prefix_and_plan_rejects() &&
         test_thread_determinism() && test_inside_existing_openmp_region();
