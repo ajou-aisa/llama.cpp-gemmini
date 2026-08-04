@@ -646,6 +646,10 @@ MatMulState MatMul::state() const {
     return state_;
 }
 
+MatmulStripeInput::MatmulStripeInput(size_t row_begin, size_t row_end)
+    : row_begin_(row_begin), row_end_(row_end), stripe_id_(row_begin),
+      residual_(nullptr), residual_count_(0) {}
+
 MatmulStripeInput::MatmulStripeInput(size_t row_begin, size_t row_end, size_t stripe_id,
                                     const int32_t * residual, size_t residual_count)
     : row_begin_(row_begin), row_end_(row_end), stripe_id_(stripe_id),
@@ -1221,10 +1225,14 @@ MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput in
     } else if (execution.facade_.state() != MatMulState::accepting_stripes) {
         status = invalid_state("execution is not accepting stripes");
     } else if (input.row_begin() >= input.row_end() || input.row_end() > execution.total_rows_ ||
+               input.stripe_id() >= execution.total_rows_ ||
                ((input.residual() == nullptr) != (input.residual_count() == 0)) ||
                ((input.outliers() == nullptr) != (input.outlier_count() == 0)) ||
                (input.residual() != nullptr && input.outliers() != nullptr)) {
-        status = make_status(MatmulStatusCode::invalid_argument, "invalid stripe input");
+        status = make_status(MatmulStatusCode::invalid_argument, "invalid stripe input or id");
+    } else if (execution.captured_stripe_ids_.find(input.stripe_id()) !=
+               execution.captured_stripe_ids_.end()) {
+        status = invalid_contract("duplicate stripe id");
     } else if (execution.active_jobs_ >= execution.options_.job_capacity) {
         status = make_status(MatmulStatusCode::out_of_memory, "job capacity exhausted");
     } else if (execution.has_captures_ && input.row_begin() == execution.last_row_begin_ &&
@@ -1242,6 +1250,7 @@ MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput in
         execution.last_row_begin_ = job.input_.row_begin();
         execution.last_row_end_ = job.input_.row_end();
         execution.captured_rows_ += job.input_.row_end() - job.input_.row_begin();
+        execution.captured_stripe_ids_.insert(job.input_.stripe_id());
         execution.has_captures_ = true;
         ++execution.active_jobs_;
         job.owns_slot_ = true;

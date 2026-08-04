@@ -11,6 +11,7 @@
 #include <mutex>
 #include <memory>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace ggml::gemmini {
@@ -261,7 +262,8 @@ struct MatmulOptions {
 
 class MatmulStripeInput {
 public:
-    MatmulStripeInput(size_t row_begin, size_t row_end, size_t stripe_id = 0,
+    MatmulStripeInput(size_t row_begin, size_t row_end);
+    MatmulStripeInput(size_t row_begin, size_t row_end, size_t stripe_id,
                       const int32_t * residual = nullptr, size_t residual_count = 0);
     MatmulStripeInput(size_t row_begin, size_t row_end, size_t stripe_id,
                       const quants::QactOutlier * outliers, size_t outlier_count);
@@ -336,6 +338,7 @@ private:
     size_t last_row_begin_ = 0;
     size_t last_row_end_ = 0;
     bool has_captures_ = false;
+    std::unordered_set<size_t> captured_stripe_ids_;
     std::unique_ptr<MatMul> staged_facade_;
     bool staged_metadata_active_ = false;
 };

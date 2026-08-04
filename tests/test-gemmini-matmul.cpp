@@ -1030,9 +1030,13 @@ bool test_staged_contract_errors() {
     auto first = capture_stripe(contract_execution, { 0, 1 });
     auto duplicate = capture_stripe(contract_execution, { 0, 1 });
     auto overlap = capture_stripe(contract_execution, { 0, 2 });
+    auto duplicate_id = capture_stripe(contract_execution, { 2, 3, 0 });
+    auto invalid_id = capture_stripe(contract_execution, { 2, 3, 3 });
     if (!check(malformed.status().code == MatmulStatusCode::invalid_argument, "malformed stripe") ||
         !check(duplicate.status().code == MatmulStatusCode::invalid_contract, "duplicate stripe") ||
         !check(overlap.status().code == MatmulStatusCode::invalid_contract, "overlapping stripe") ||
+        !check(duplicate_id.status().code == MatmulStatusCode::invalid_contract, "duplicate stripe id") ||
+        !check(invalid_id.status().code == MatmulStatusCode::invalid_argument, "invalid stripe id") ||
         !run_staged_job(first)) {
         return false;
     }
