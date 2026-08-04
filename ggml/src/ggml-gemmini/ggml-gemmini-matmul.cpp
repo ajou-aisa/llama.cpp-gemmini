@@ -32,21 +32,26 @@ bool uses_baseline_channel_route(const ggml_gemmini_args_t & args) {
         args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar;
 }
 
+baseline_activation_quant_t baseline_activation_for(const ggml_gemmini_args_t & args) {
+    const auto & storage = args.act_quant.storage();
+    if (std::holds_alternative<quants::act::tensor::Meta>(storage)) {
+        return baseline_activation_quant_t::TENSOR;
+    }
+    if (std::holds_alternative<quants::act::token::Meta>(storage)) {
+        return baseline_activation_quant_t::TOKEN;
+    }
+    if (std::holds_alternative<quants::act::block::Meta>(storage) ||
+        std::holds_alternative<quants::act::stripe::Meta>(storage)) {
+        return baseline_activation_quant_t::BLOCK;
+    }
+    return baseline_activation_quant_t::EXSIA;
+}
+
 void execute_dense(ggml_gemmini_args_t &args) {
     if (uses_baseline_channel_route(args)) {
-        tiled_matmul_auto_baseline(
-            &args, baseline_activation_quant_t::TENSOR, baseline_weight_quant_t::CHANNEL);
+        tiled_matmul_auto_baseline(&args, baseline_activation_for(args), baseline_weight_quant_t::CHANNEL);
     } else if (args.weight_i8_scale_active) {
-        baseline_activation_quant_t activation = baseline_activation_quant_t::EXSIA;
-        const auto & storage = args.act_quant.storage();
-        if (std::holds_alternative<quants::act::tensor::Meta>(storage)) {
-            activation = baseline_activation_quant_t::TENSOR;
-        } else if (std::holds_alternative<quants::act::token::Meta>(storage)) {
-            activation = baseline_activation_quant_t::TOKEN;
-        } else if (std::holds_alternative<quants::act::block::Meta>(storage)) {
-            activation = baseline_activation_quant_t::BLOCK;
-        }
-        tiled_matmul_auto_baseline(&args, activation, baseline_weight_quant_t::TENSOR);
+        tiled_matmul_auto_baseline(&args, baseline_activation_for(args), baseline_weight_quant_t::TENSOR);
     } else {
         tiled_matmul_auto_im2p(&args);
     }
@@ -163,6 +168,7 @@ MatMulResult MatMul::run_full() {
     }
     quants::dec::compensate_activation_dec(
         quants::activation_outliers(args_), args_, "ggml-gemmini-matmul");
+    state_ = MatMulState::completed;
     return { MatMulStatus::success, MatMulCapability::supported };
 }
 
