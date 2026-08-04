@@ -684,7 +684,21 @@ bool test_h2_and_hp2_stripe_capability_is_explicitly_unsupported() {
                  "H2 stripe capability") &&
         check(ggml::gemmini::MatMul::stripe_capability(hp2_args) ==
                      ggml::gemmini::MatMulCapability::unsupported,
-                 "HP2 stripe capability");
+                 "HP2 stripe capability") &&
+        check([&] {
+            auto transpose_args = make_args(activation, weights, output);
+            transpose_args.transpose_A = true;
+            return ggml::gemmini::MatMul::stripe_capability(transpose_args) ==
+                ggml::gemmini::MatMulCapability::unsupported;
+        }(), "transpose-A stripe capability") &&
+        check([&] {
+            auto bias_args = make_args(activation, weights, output);
+            std::vector<int32_t> bias(bias_args.J, 1);
+            bias_args.D = bias.data();
+            bias_args.repeating_bias = false;
+            return ggml::gemmini::MatMul::stripe_capability(bias_args) ==
+                ggml::gemmini::MatMulCapability::unsupported;
+        }(), "non-repeating bias stripe capability");
 }
 
 bool test_stripe_state_lifecycle() {
