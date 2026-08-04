@@ -1235,6 +1235,8 @@ bool byte_identical(const std::vector<float> &lhs, const std::vector<float> &rhs
 
 bool test_fixed_residual_replay_baseline() {
     using ggml::gemmini::quants::dec::ActiveRowGroup;
+    using ggml::gemmini::quants::dec::GroupKCSCPlan;
+    using ggml::gemmini::quants::dec::GroupKCSCScalarStats;
     using ggml::gemmini::quants::dec::ResidualGroupEntry;
 
     constexpr size_t rows = 3;
@@ -1275,6 +1277,32 @@ bool test_fixed_residual_replay_baseline() {
         (active_k_groups * (ggml::gemmini::quants::dec::kDecGroupSizeK + 1) +
          shuffled_outliers.size() + (active_k_groups + 1) + active_row_groups) * sizeof(uint32_t);
 
+    std::vector<ResidualGroupEntry> entries = {
+        { 2, 34, 2 }, { 0, 0, 4 }, { 1, 33, -3 }, { 0, 0, -1 },
+        { 2, 0, -2 }, { 1, 33, 5 }, { 0, 34, 1 },
+    };
+    std::vector<ActiveRowGroup> groups;
+    ggml::gemmini::quants::dec::build_active_row_groups(entries, groups);
+    std::vector<size_t> group_offsets;
+    std::vector<size_t> group_row_group_indices;
+    ggml::gemmini::quants::dec::build_group_major_index(
+        groups, active_k_groups, group_offsets, group_row_group_indices);
+    GroupKCSCPlan group_k_csc_plan;
+    const bool group_k_csc_ready = ggml::gemmini::quants::dec::build_group_k_csc_plan(
+        entries, groups, group_offsets, group_row_group_indices, active_k_groups, group_k_csc_plan);
+    const auto scalar_route_plan = ggml::gemmini::quants::dec::resolve_dec_route_plan(
+        args, ggml::gemmini::quants::dec::WeightScaleInfoMode::Dec);
+    std::vector<float> current_row_grouped(rows * cols, 0.0f);
+    ggml::gemmini::quants::dec::accumulate_to_ycom_int64_scalar(
+        args, scalar_route_plan, rows, cols, nullptr, entries, groups, group_offsets,
+        group_row_group_indices, current_row_grouped.data());
+    std::vector<float> group_k_csc_scalar(rows * cols, 0.0f);
+    GroupKCSCScalarStats group_k_csc_stats;
+    const bool group_k_csc_accumulated =
+        ggml::gemmini::quants::dec::accumulate_to_ycom_int64_scalar_group_k_csc(
+            args, scalar_route_plan, rows, cols, nullptr, entries, group_k_csc_plan,
+            group_k_csc_scalar.data(), group_k_csc_stats);
+
     bool ok = check(result.total_selected == shuffled_outliers.size() && result.nnz == shuffled_outliers.size() &&
                         result.unique_k_count == 3 && result.int_mac_count == 35 &&
                         result.logical_weight_reference_count == 35 &&
@@ -1288,6 +1316,14 @@ bool test_fixed_residual_replay_baseline() {
                     "fixed replay sparse baseline counters");
     for (size_t index = 0; index < output.size(); ++index)
         ok = check(float_bits(output[index]) == expected_bits[index], "fixed replay baseline output bits") && ok;
+    ok = check(group_k_csc_ready && group_k_csc_accumulated &&
+                   byte_identical(output, current_row_grouped) &&
+                   byte_identical(current_row_grouped, group_k_csc_scalar),
+               "fixed replay CurrentRowGrouped equals GroupKCSCScalar") && ok;
+    ok = check(group_k_csc_stats.logical_weight_reference_count == 35 &&
+                   group_k_csc_stats.weight_scalar_load_count == 15 &&
+                   group_k_csc_stats.thread_scratch_bytes == rows * cols * sizeof(int64_t),
+               "fixed replay GroupKCSCScalar has 15 loads versus 35 logical refs") && ok;
 
     auto reordered_outliers = shuffled_outliers;
     std::reverse(reordered_outliers.begin(), reordered_outliers.end());

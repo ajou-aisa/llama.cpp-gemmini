@@ -167,6 +167,75 @@ namespace
         }
     }
 
+    size_t saturating_mul_size(size_t lhs, size_t rhs)
+    {
+        if (lhs == 0 || rhs == 0)
+            return 0;
+        return lhs > std::numeric_limits<size_t>::max() / rhs ?
+            std::numeric_limits<size_t>::max() : lhs * rhs;
+    }
+
+    bool valid_group_k_csc_scalar_plan(
+        const GroupKCSCPlan &group_k_csc_plan,
+        size_t I,
+        size_t K,
+        const std::vector<ResidualGroupEntry> &entries)
+    {
+        constexpr size_t offsets_per_group = kDecGroupSizeK + 1;
+        const size_t group_count = K / kDecGroupSizeK + (K % kDecGroupSizeK != 0);
+        if (group_count != group_k_csc_plan.num_groups ||
+            group_count > std::numeric_limits<size_t>::max() / offsets_per_group ||
+            group_k_csc_plan.column_offsets.size() != group_count * offsets_per_group ||
+            group_k_csc_plan.entry_order.size() != entries.size() ||
+            group_k_csc_plan.active_row_offsets.size() != group_count + 1 ||
+            group_k_csc_plan.active_row_offsets.empty() ||
+            group_k_csc_plan.active_row_offsets.front() != 0)
+            return false;
+
+        size_t previous_active_row_offset = 0;
+        for (const uint32_t offset : group_k_csc_plan.active_row_offsets)
+        {
+            if (offset < previous_active_row_offset || offset > group_k_csc_plan.active_rows.size())
+                return false;
+            previous_active_row_offset = offset;
+        }
+        if (previous_active_row_offset != group_k_csc_plan.active_rows.size())
+            return false;
+        for (const uint32_t row : group_k_csc_plan.active_rows)
+            if (row >= I)
+                return false;
+
+        size_t previous_entry_end = 0;
+        for (size_t group = 0; group < group_count; ++group)
+        {
+            const size_t group_offset = group * offsets_per_group;
+            if (group_k_csc_plan.column_offsets[group_offset] != previous_entry_end)
+                return false;
+
+            for (size_t k_offset = 0; k_offset < kDecGroupSizeK; ++k_offset)
+            {
+                const size_t entry_begin = group_k_csc_plan.column_offsets[group_offset + k_offset];
+                const size_t entry_end = group_k_csc_plan.column_offsets[group_offset + k_offset + 1];
+                if (entry_begin > entry_end || entry_end > group_k_csc_plan.entry_order.size())
+                    return false;
+
+                for (size_t position = entry_begin; position < entry_end; ++position)
+                {
+                    const size_t entry_index = group_k_csc_plan.entry_order[position];
+                    if (entry_index >= entries.size())
+                        return false;
+                    const ResidualGroupEntry &entry = entries[entry_index];
+                    if (entry.row >= I || entry.k >= K || entry.k / kDecGroupSizeK != group ||
+                        entry.k % kDecGroupSizeK != k_offset)
+                        return false;
+                }
+            }
+            previous_entry_end = group_k_csc_plan.column_offsets[group_offset + kDecGroupSizeK];
+        }
+
+        return previous_entry_end == group_k_csc_plan.entry_order.size();
+    }
+
     template <typename CodeFor, typename ScaleForColumn>
     void run_whole_k_grouped_dec(
         size_t I,
@@ -358,6 +427,95 @@ void accumulate_to_ycom_int64_scalar(
             return plan.layout == WeightLayout::KxJ_RowMajor ? weights[k * plan.weight_stride + j] :
                 weights[j * plan.weight_stride + k];
         }, [scale = plan.scales.scalar](size_t) { return scale; }, Y_com);
+}
+
+bool accumulate_to_ycom_int64_scalar_group_k_csc(
+    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
+    const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
+    const GroupKCSCPlan &group_k_csc_plan, float *Y_com, GroupKCSCScalarStats &stats)
+{
+    stats = {};
+    const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
+    const size_t tile_capacity = std::min(J, kDecInt64JTileWidth);
+    const size_t minimum_weight_stride = plan.layout == WeightLayout::KxJ_RowMajor ? J : args.K;
+    if (!weights || !Y_com || !plan.valid || plan.route != DecWeightRoute::Dense ||
+        !plan.scales.scalar_mode || I == 0 || J == 0 || args.K == 0 || I != args.I || J != args.J ||
+        plan.weight_stride < minimum_weight_stride ||
+        I > std::numeric_limits<size_t>::max() / tile_capacity ||
+        !valid_group_k_csc_scalar_plan(group_k_csc_plan, I, args.K, entries))
+        return false;
+
+    if (entries.empty())
+        return true;
+
+    size_t active_k_count = 0;
+    for (size_t group = 0; group < group_k_csc_plan.num_groups; ++group)
+    {
+        const size_t group_offset = group * (kDecGroupSizeK + 1);
+        for (size_t k_offset = 0; k_offset < kDecGroupSizeK; ++k_offset)
+            active_k_count += group_k_csc_plan.column_offsets[group_offset + k_offset] !=
+                group_k_csc_plan.column_offsets[group_offset + k_offset + 1];
+    }
+    stats.logical_weight_reference_count = saturating_mul_size(entries.size(), J);
+    stats.weight_scalar_load_count = saturating_mul_size(active_k_count, J);
+    stats.thread_scratch_bytes = saturating_mul_size(
+        saturating_mul_size(I, tile_capacity), sizeof(int64_t));
+
+    for_each_grouped_j_tile(I, J, [&](size_t jb, size_t width, std::vector<int64_t> &accumulator)
+    {
+        std::fill(accumulator.begin(), accumulator.begin() + I * width, int64_t {0});
+        for (size_t group = 0; group < group_k_csc_plan.num_groups; ++group)
+        {
+            const size_t group_offset = group * (kDecGroupSizeK + 1);
+            for (size_t k_offset = 0; k_offset < kDecGroupSizeK; ++k_offset)
+            {
+                const size_t entry_begin = group_k_csc_plan.column_offsets[group_offset + k_offset];
+                const size_t entry_end = group_k_csc_plan.column_offsets[group_offset + k_offset + 1];
+                if (entry_begin == entry_end)
+                    continue;
+
+                const size_t k = group * kDecGroupSizeK + k_offset;
+                for (size_t t = 0; t < width; ++t)
+                {
+                    const int64_t weight = plan.layout == WeightLayout::KxJ_RowMajor ?
+                        weights[k * plan.weight_stride + jb + t] :
+                        weights[(jb + t) * plan.weight_stride + k];
+                    for (size_t position = entry_begin; position < entry_end; ++position)
+                    {
+                        const ResidualGroupEntry &entry = entries[group_k_csc_plan.entry_order[position]];
+                        const size_t accumulator_index = static_cast<size_t>(entry.row) * width + t;
+                        const int64_t term = static_cast<int64_t>(entry.residual) * weight;
+#if DEC_VALIDATION
+                        const __int128 checked_sum =
+                            static_cast<__int128>(accumulator[accumulator_index]) + term;
+                        if (checked_sum < std::numeric_limits<int64_t>::min() ||
+                            checked_sum > std::numeric_limits<int64_t>::max())
+                            std::abort();
+#endif
+                        accumulator[accumulator_index] += term;
+                    }
+                }
+            }
+        }
+
+        uint32_t previous_row = std::numeric_limits<uint32_t>::max();
+        for (const ResidualGroupEntry &entry : entries)
+        {
+            if (entry.row == previous_row)
+                continue;
+            previous_row = entry.row;
+
+            const size_t row = entry.row;
+            const float activation_scale = activation_scales ? activation_scales[row] : 1.0f;
+            const int64_t *row_accumulator = accumulator.data() + row * width;
+            float *output = Y_com + row * J + jb;
+            for (size_t t = 0; t < width; ++t)
+                output[t] += static_cast<float>(
+                    static_cast<double>(row_accumulator[t]) * activation_scale * plan.scales.scalar);
+        }
+    });
+
+    return true;
 }
 
 void accumulate_to_ycom_int64_channel_direct(

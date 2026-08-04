@@ -9,6 +9,7 @@ struct ggml_gemmini_args_t;
 namespace ggml::gemmini::quants::dec
 {
 struct DecRoutePlan;
+struct GroupKCSCPlan;
 struct ResidualGroupEntry;
 struct ActiveRowGroup;
 
@@ -16,6 +17,13 @@ struct H1ScaleParams
 {
     uint64_t c_eff;
     float s_rf;
+};
+
+struct GroupKCSCScalarStats
+{
+    size_t logical_weight_reference_count = 0;
+    size_t weight_scalar_load_count = 0;
+    size_t thread_scratch_bytes = 0;
 };
 
 inline constexpr size_t kDecInt64JTileWidth = 128;
@@ -51,6 +59,17 @@ void accumulate_to_ycom_int64_scalar(
     const std::vector<size_t> &group_offsets,
     const std::vector<size_t> &group_row_group_indices,
     float *Y_com);
+
+bool accumulate_to_ycom_int64_scalar_group_k_csc(
+    const ggml_gemmini_args_t &args,
+    const DecRoutePlan &plan,
+    size_t I,
+    size_t J,
+    const float *activation_scales,
+    const std::vector<ResidualGroupEntry> &entries,
+    const GroupKCSCPlan &group_k_csc_plan,
+    float *Y_com,
+    GroupKCSCScalarStats &stats);
 
 void accumulate_to_ycom_int64_channel_direct(
     const ggml_gemmini_args_t &args,
