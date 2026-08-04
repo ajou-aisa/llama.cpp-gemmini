@@ -973,8 +973,14 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         return requested > 0 ? static_cast<size_t>(requested) : default_capacity;
     }();
     if (pipeline_requested && !pipeline_enabled) {
-        ggml::gemmini::log::debug(layer,
-            "[matmul.pipeline] stripe-pipeline requires EXSIA activation and I>1; keeping full dispatch");
+        if (I <= 1) {
+            ggml::gemmini::log::debug(layer,
+                "[matmul.pipeline] status=unsupported_invocation dispatch=row-direct/full stripe-pipeline requires I>1");
+        } else {
+            ggml::gemmini::log::debug(layer,
+                "[matmul.pipeline] status=unsupported_invocation dispatch=fatal stripe-pipeline requires EXSIA activation");
+            GGML_ABORT("Gemmini unsupported_invocation: stripe-pipeline requires EXSIA activation");
+        }
     }
     if (sequential_enabled) {
         ggml::gemmini::log::debug(layer, "[matmul.sequential] enabled");
