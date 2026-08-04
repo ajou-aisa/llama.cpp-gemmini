@@ -365,6 +365,14 @@ namespace
         Invalid,
     };
 
+    struct MixedGroupKCSCEntryPlan
+    {
+        std::vector<uint32_t> int32_column_offsets;
+        std::vector<uint32_t> int32_entry_order;
+        std::vector<uint32_t> int64_column_offsets;
+        std::vector<uint32_t> int64_entry_order;
+    };
+
     RowAccumulationWidth classify_row_accumulation_width(
         const std::vector<ResidualGroupEntry> &entries,
         size_t entry_begin,
@@ -411,6 +419,53 @@ namespace
             completed_upper = next_completed_upper;
         }
         return requires_int64 ? RowAccumulationWidth::Int64 : RowAccumulationWidth::Int32;
+    }
+
+    void build_mixed_group_k_csc_entry_plan(
+        const GroupKCSCPlan &group_k_csc_plan,
+        const std::vector<ResidualGroupEntry> &entries,
+        const std::vector<size_t> &fallback_slots,
+        size_t no_fallback_slot,
+        MixedGroupKCSCEntryPlan &mixed_plan)
+    {
+        mixed_plan.int32_column_offsets.resize(group_k_csc_plan.column_offsets.size());
+        mixed_plan.int32_entry_order.clear();
+        mixed_plan.int32_entry_order.reserve(entries.size());
+        mixed_plan.int64_column_offsets.resize(group_k_csc_plan.column_offsets.size());
+        mixed_plan.int64_entry_order.clear();
+        mixed_plan.int64_entry_order.reserve(entries.size());
+
+        constexpr size_t offsets_per_group = kDecGroupSizeK + 1;
+        for (size_t group = 0; group < group_k_csc_plan.num_groups; ++group)
+        {
+            const size_t group_offset = group * offsets_per_group;
+            mixed_plan.int32_column_offsets[group_offset] =
+                static_cast<uint32_t>(mixed_plan.int32_entry_order.size());
+            mixed_plan.int64_column_offsets[group_offset] =
+                static_cast<uint32_t>(mixed_plan.int64_entry_order.size());
+
+            for (size_t k_offset = 0; k_offset < kDecGroupSizeK; ++k_offset)
+            {
+                const size_t column_begin =
+                    group_k_csc_plan.column_offsets[group_offset + k_offset];
+                const size_t column_end =
+                    group_k_csc_plan.column_offsets[group_offset + k_offset + 1];
+                for (size_t position = column_begin; position < column_end; ++position)
+                {
+                    const uint32_t entry_index = group_k_csc_plan.entry_order[position];
+                    const ResidualGroupEntry &entry = entries[entry_index];
+                    if (fallback_slots[entry.row] == no_fallback_slot)
+                        mixed_plan.int32_entry_order.push_back(entry_index);
+                    else
+                        mixed_plan.int64_entry_order.push_back(entry_index);
+                }
+
+                mixed_plan.int32_column_offsets[group_offset + k_offset + 1] =
+                    static_cast<uint32_t>(mixed_plan.int32_entry_order.size());
+                mixed_plan.int64_column_offsets[group_offset + k_offset + 1] =
+                    static_cast<uint32_t>(mixed_plan.int64_entry_order.size());
+            }
+        }
     }
 
     template <typename CodeFor, typename ScaleForColumn>
@@ -821,6 +876,10 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_impl(
     const bool all_int64 = stats.int32_row_count == 0;
     stats.width_path = all_int32 ? GroupKCSCWidthPath::AllInt32 :
         all_int64 ? GroupKCSCWidthPath::AllInt64 : GroupKCSCWidthPath::Mixed;
+    MixedGroupKCSCEntryPlan mixed_entry_plan;
+    if (!all_int32 && !all_int64)
+        build_mixed_group_k_csc_entry_plan(
+            group_k_csc_plan, entries, fallback_slots, no_fallback_slot, mixed_entry_plan);
     const size_t int32_scratch_rows = all_int64 ? 0 : I;
     const size_t int64_scratch_rows = all_int32 ? 0 : stats.int64_fallback_row_count;
     const size_t int32_scratch_bytes = saturating_mul_size(
@@ -992,11 +1051,15 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_impl(
             const size_t group_offset = group * (kDecGroupSizeK + 1);
             for (size_t k_offset = 0; k_offset < kDecGroupSizeK; ++k_offset)
             {
-                const size_t column_begin =
-                    group_k_csc_plan.column_offsets[group_offset + k_offset];
-                const size_t column_end =
-                    group_k_csc_plan.column_offsets[group_offset + k_offset + 1];
-                if (column_begin == column_end)
+                const size_t int32_begin =
+                    mixed_entry_plan.int32_column_offsets[group_offset + k_offset];
+                const size_t int32_end =
+                    mixed_entry_plan.int32_column_offsets[group_offset + k_offset + 1];
+                const size_t int64_begin =
+                    mixed_entry_plan.int64_column_offsets[group_offset + k_offset];
+                const size_t int64_end =
+                    mixed_entry_plan.int64_column_offsets[group_offset + k_offset + 1];
+                if (int32_begin == int32_end && int64_begin == int64_end)
                     continue;
 
                 const size_t k = group * kDecGroupSizeK + k_offset;
@@ -1008,45 +1071,20 @@ bool accumulate_to_ycom_int32_mixed_group_k_csc_impl(
                         weight_lanes[lane] = plan.layout == WeightLayout::KxJ_RowMajor ?
                             weights[k * plan.weight_stride + jb + j_offset + lane] :
                             weights[(jb + j_offset + lane) * plan.weight_stride + k];
-                    for (size_t position = column_begin; position < column_end; ++position)
-                    {
-                        const ResidualGroupEntry &entry =
-                            entries[group_k_csc_plan.entry_order[position]];
-                        if (fallback_slots[entry.row] == no_fallback_slot)
-                            update_int32(entry, j_offset, lane_count, weight_lanes);
-                        else
-                            update_int64(entry, j_offset, lane_count, weight_lanes);
-                    }
+                    for (size_t position = int32_begin; position < int32_end; ++position)
+                        update_int32(
+                            entries[mixed_entry_plan.int32_entry_order[position]],
+                            j_offset, lane_count, weight_lanes);
+                    for (size_t position = int64_begin; position < int64_end; ++position)
+                        update_int64(
+                            entries[mixed_entry_plan.int64_entry_order[position]],
+                            j_offset, lane_count, weight_lanes);
                 }
             }
         }
 
-        uint32_t previous_row = std::numeric_limits<uint32_t>::max();
-        for (const ResidualGroupEntry &entry : entries)
-        {
-            if (entry.row == previous_row)
-                continue;
-            previous_row = entry.row;
-
-            const size_t row = entry.row;
-            const float activation_scale = activation_scales ? activation_scales[row] : 1.0f;
-            float *output = Y_com + row * J + jb;
-            const size_t fallback_slot = fallback_slots[row];
-            if (fallback_slot == no_fallback_slot)
-            {
-                const int32_t *row_accumulator = int32_accumulator.data() + row * width;
-                for (size_t t = 0; t < width; ++t)
-                    output[t] += static_cast<float>(
-                        static_cast<double>(row_accumulator[t]) * activation_scale * plan.scales.scalar);
-            }
-            else
-            {
-                const int64_t *row_accumulator = int64_accumulator.data() + fallback_slot * width;
-                for (size_t t = 0; t < width; ++t)
-                    output[t] += static_cast<float>(
-                        static_cast<double>(row_accumulator[t]) * activation_scale * plan.scales.scalar);
-            }
-        }
+        merge_int32(jb, width, int32_accumulator);
+        merge_int64(jb, width, int64_accumulator);
     });
 
     return true;
