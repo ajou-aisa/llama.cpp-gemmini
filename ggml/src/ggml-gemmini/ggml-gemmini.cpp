@@ -1014,13 +1014,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 #if defined(GGML_GEMMINI_TEST_OBSERVER) && GGML_GEMMINI_COMPUTE_TYPE == 0
     ggml::gemmini::observe_test_i("activation", args.I);
 #endif
-    std::future<bool> quantize_future;
     bool quantize_ok = false;
-    if (pipeline_enabled) {
-        quantize_future = std::async(std::launch::async, [&] {
-            return ggml::gemmini::quants::quantize_activation(src1, args);
-        });
-    } else {
+    if (!pipeline_enabled) {
         quantize_ok = ggml::gemmini::quants::quantize_activation(src1, args);
     }
 #if GGML_GEMMINI_COMPUTE_TYPE == 0
@@ -1443,7 +1438,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     }
 
     if (pipeline_enabled) {
-        quantize_ok = quantize_future.get();
+        quantize_ok = ggml::gemmini::quants::quantize_activation(src1, args);
         if (!quantize_ok) {
             pipeline_collector->finish();
             ggml::gemmini::log::debug(layer, "activation quantize failed");
