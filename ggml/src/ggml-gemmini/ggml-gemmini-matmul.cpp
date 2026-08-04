@@ -628,6 +628,11 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options
     }
 }
 
+MatmulExecution::MatmulExecution()
+    : total_rows_(0), facade_(static_cast<ggml_gemmini_args_t *>(nullptr)) {
+    status_ = invalid_state("execution is not prepared");
+}
+
 MatmulExecution::MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions options)
     : total_rows_(args != nullptr ? args->I : 0), facade_(args), options_(options) {
     state_ = MatmulExecutionState::prepared;
@@ -948,6 +953,9 @@ MatmulStripeJob::MatmulStripeJob(
     : execution_(execution), input_(std::move(input)), status_(status),
       compensation_outliers_(std::move(outliers)), has_captured_outliers_(true) {}
 
+MatmulStripeJob::MatmulStripeJob()
+    : execution_(nullptr), input_(0, 0), status_(invalid_state("job is not captured")) {}
+
 MatmulStripeJob::MatmulStripeJob(MatmulStripeJob && other) noexcept
     : execution_(other.execution_), input_(std::move(other.input_)), status_(other.status_),
       metrics_(other.metrics_), staged_residual_(std::move(other.staged_residual_)),
@@ -1008,6 +1016,12 @@ MatmulExecution prepare_execution(const ggml_gemmini_args_t & args, MatmulOption
 
 MatmulExecution prepare_execution(ggml_gemmini_args_t * args, MatmulOptions options) {
     return MatmulExecution(args, options);
+}
+
+MatmulStatus prepare_execution(ggml_gemmini_args_t & args, const MatmulOptions & options,
+                               MatmulExecution & execution) {
+    execution = MatmulExecution(&args, options);
+    return execution.status();
 }
 
 MatmulStatus execute_full(MatmulExecution & execution) {
@@ -1095,6 +1109,17 @@ MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput in
         record_metric(job.metrics_.handoff, execution.options_.profiling, start);
     }
     return job;
+}
+
+MatmulStatus capture_stripe(MatmulExecution & execution, const MatmulStripeInput & input,
+                            MatmulStripeJob & job) {
+    MatmulStripeJob captured = input.outliers() != nullptr || input.outlier_count() != 0
+        ? capture_stripe(execution, MatmulStripeInput(
+            input.row_begin(), input.row_end(), input.stripe_id(), input.outliers(), input.outlier_count()))
+        : capture_stripe(execution, MatmulStripeInput(
+            input.row_begin(), input.row_end(), input.stripe_id(), input.residual(), input.residual_count()));
+    job = std::move(captured);
+    return job.status();
 }
 
 MatmulStatus prepare_compensation(MatmulStripeJob & job) {

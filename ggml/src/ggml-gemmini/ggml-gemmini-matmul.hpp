@@ -257,8 +257,8 @@ public:
                       const int32_t * residual = nullptr, size_t residual_count = 0);
     MatmulStripeInput(size_t row_begin, size_t row_end, size_t stripe_id,
                       const quants::QactOutlier * outliers, size_t outlier_count);
-    MatmulStripeInput(const MatmulStripeInput &) = delete;
-    MatmulStripeInput & operator=(const MatmulStripeInput &) = delete;
+    MatmulStripeInput(const MatmulStripeInput &) = default;
+    MatmulStripeInput & operator=(const MatmulStripeInput &) = default;
     MatmulStripeInput(MatmulStripeInput &&) noexcept = default;
     MatmulStripeInput & operator=(MatmulStripeInput &&) noexcept = default;
 
@@ -282,6 +282,7 @@ private:
 
 class MatmulExecution {
 public:
+    MatmulExecution();
     MatmulExecution(const MatmulExecution &) = delete;
     MatmulExecution & operator=(const MatmulExecution &) = delete;
     MatmulExecution(MatmulExecution &&) noexcept = default;
@@ -294,9 +295,11 @@ public:
 private:
     friend MatmulExecution prepare_execution(const ggml_gemmini_args_t &, MatmulOptions);
     friend MatmulExecution prepare_execution(ggml_gemmini_args_t *, MatmulOptions);
+    friend MatmulStatus prepare_execution(ggml_gemmini_args_t &, const MatmulOptions &, MatmulExecution &);
     friend MatmulStatus execute_full(MatmulExecution &);
     friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput);
     friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput, std::vector<quants::QactOutlier>);
+    friend MatmulStatus capture_stripe(MatmulExecution &, const MatmulStripeInput &, MatmulStripeJob &);
     friend MatmulStatus prepare_compensation(MatmulStripeJob &);
     friend MatmulStatus execute_dense_stripe(MatmulStripeJob &);
     friend MatmulStatus execute_compensation_shard(MatmulStripeJob &);
@@ -329,6 +332,7 @@ private:
 
 class MatmulStripeJob {
 public:
+    MatmulStripeJob();
     MatmulStripeJob(const MatmulStripeJob &) = delete;
     MatmulStripeJob & operator=(const MatmulStripeJob &) = delete;
     MatmulStripeJob(MatmulStripeJob && other) noexcept;
@@ -378,10 +382,16 @@ private:
 
 MatmulExecution prepare_execution(const ggml_gemmini_args_t & args, MatmulOptions options = {});
 MatmulExecution prepare_execution(ggml_gemmini_args_t * args, MatmulOptions options = {});
+MatmulStatus prepare_execution(ggml_gemmini_args_t & args, const MatmulOptions & options,
+                               MatmulExecution & execution);
 MatmulStatus execute_full(MatmulExecution & execution);
+MatmulStatus capture_stripe(MatmulExecution & execution, const MatmulStripeInput & input,
+                            MatmulStripeJob & job);
 MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput input);
 MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput input,
                                std::vector<quants::QactOutlier> outliers);
+MatmulStatus capture_stripe(MatmulExecution & execution, const MatmulStripeInput & input,
+                            MatmulStripeJob & job);
 MatmulStatus prepare_compensation(MatmulStripeJob & job);
 MatmulStatus execute_dense_stripe(MatmulStripeJob & job);
 MatmulStatus execute_compensation_shard(MatmulStripeJob & job);

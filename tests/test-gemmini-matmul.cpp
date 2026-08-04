@@ -577,6 +577,13 @@ bool test_public_contract_shape() {
     too_many_dense_threads.dense_threads = 2;
     auto dense_thread_execution = prepare_execution(
         make_args(validation_activation, validation_weights, validation_output), too_many_dense_threads);
+    MatmulOptions staged_options{};
+    staged_options.mode = MatmulInvocationMode::stripe_sequential;
+    MatmulExecution staged_execution;
+    auto staged_args = make_args(validation_activation, validation_weights, validation_output);
+    const auto staged_prepare = prepare_execution(staged_args, staged_options, staged_execution);
+    MatmulStripeJob staged_job;
+    const auto staged_capture = capture_stripe(staged_execution, MatmulStripeInput(0, 1), staged_job);
     return check(defaults.job_capacity == 4, "default job capacity") &&
         check(statuses[0].ok(), "success status ok") &&
         check(!statuses[1].ok(), "failure status not ok") &&
@@ -588,6 +595,10 @@ bool test_public_contract_shape() {
         check(validation_status.ok(), "validation-enabled full matmul") &&
         check(dense_thread_execution.status().code == MatmulStatusCode::unsupported_invocation,
               "multi-owner dense lane rejection") &&
+        check(staged_prepare.ok() && staged_execution.state() == MatmulExecutionState::running,
+              "output-parameter prepare execution") &&
+        check(staged_capture.ok() && staged_job.status().ok(),
+              "output-parameter capture stripe") &&
         check(input.row_begin() == 1 && input.row_end() == 3 && input.stripe_id() == 7 &&
                   input.residual() == residual && input.residual_count() == 2,
               "stripe input metadata") &&
