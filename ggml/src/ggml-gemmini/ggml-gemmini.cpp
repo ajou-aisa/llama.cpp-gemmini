@@ -1631,6 +1631,32 @@ static void ggml_backend_gemmini_free(ggml_backend_t backend) {
     delete backend;
 }
 
+static void ggml_backend_gemmini_get_rows_q8_channel(const ggml_tensor * src0,
+                                                      const ggml_tensor * src1,
+                                                      ggml_tensor * dst) {
+    const int64_t nc = src0->ne[0];
+    const int64_t nr = ggml_nelements(src1);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == GGML_TYPE_Q8_CHANNEL);
+    GGML_ASSERT(src1->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->ne[0] == nc);
+    GGML_ASSERT(dst->ne[2] == src1->ne[1]);
+
+    for (int64_t i = 0; i < nr; ++i) {
+        const int64_t i12 = i / (src1->ne[1] * src1->ne[0]);
+        const int64_t i11 = (i - i12 * src1->ne[1] * src1->ne[0]) / src1->ne[0];
+        const int64_t i10 = i - i12 * src1->ne[1] * src1->ne[0] - i11 * src1->ne[0];
+        const int32_t i01 = *reinterpret_cast<const int32_t *>(
+            static_cast<const char *>(src1->data) + i10 * src1->nb[0] + i11 * src1->nb[1] + i12 * src1->nb[2]);
+
+        GGML_ASSERT(i01 >= 0 && i01 < src0->ne[1]);
+        dequantize_row_q8_channel(
+            static_cast<const char *>(src0->data) + i01 * src0->nb[1] + i11 * src0->nb[2] + i12 * src0->nb[3],
+            reinterpret_cast<float *>(static_cast<char *>(dst->data) + i10 * dst->nb[1] + i11 * dst->nb[2] + i12 * dst->nb[3]),
+            nc);
+    }
+}
+
 static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_gemmini_context * ctx = (ggml_backend_gemmini_context *)backend->context;
 
@@ -1690,6 +1716,9 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
 
         switch (node->op)
         {
+        case GGML_OP_GET_ROWS:
+            ggml_backend_gemmini_get_rows_q8_channel(node->src[0], node->src[1], node);
+            break;
         case GGML_OP_MUL_MAT: {
 #if LOG_DUMP
             const int32_t node_idx = node->ne[0] > 0 ? static_cast<int32_t>(node->ne[0]) : 1;
@@ -1837,7 +1866,10 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
             return true;
 
         case GGML_OP_GET_ROWS: {
-            return false;
+            return op->type == GGML_TYPE_F32 &&
+                op->src[0] != nullptr && op->src[1] != nullptr &&
+                op->src[0]->type == GGML_TYPE_Q8_CHANNEL &&
+                op->src[1]->type == GGML_TYPE_I32;
         }
 
         case GGML_OP_MUL_MAT:
