@@ -1207,6 +1207,17 @@ void set_dec_group_k_csc_force(const char *value) {
 #endif
 }
 
+void set_dec_group_k_csc_enable(const char *value) {
+#if defined(_WIN32)
+    _putenv_s("DEC_GROUP_K_CSC_ENABLE", value ? value : "");
+#else
+    if (value)
+        setenv("DEC_GROUP_K_CSC_ENABLE", value, 1);
+    else
+        unsetenv("DEC_GROUP_K_CSC_ENABLE");
+#endif
+}
+
 void set_dec_group_k_csc_disable(const char *value) {
 #if defined(_WIN32)
     _putenv_s("DEC_GROUP_K_CSC_DISABLE", value ? value : "");
@@ -1220,14 +1231,20 @@ void set_dec_group_k_csc_disable(const char *value) {
 
 struct ScopedDecGroupKCscEnv {
     std::string saved_force;
+    std::string saved_enable;
     std::string saved_disable;
     bool had_force = false;
+    bool had_enable = false;
     bool had_disable = false;
 
     ScopedDecGroupKCscEnv() {
         if (const char *force = std::getenv("DEC_GROUP_K_CSC_FORCE")) {
             saved_force = force;
             had_force = true;
+        }
+        if (const char *enable = std::getenv("DEC_GROUP_K_CSC_ENABLE")) {
+            saved_enable = enable;
+            had_enable = true;
         }
         if (const char *disable = std::getenv("DEC_GROUP_K_CSC_DISABLE")) {
             saved_disable = disable;
@@ -1237,6 +1254,7 @@ struct ScopedDecGroupKCscEnv {
 
     ~ScopedDecGroupKCscEnv() {
         set_dec_group_k_csc_force(had_force ? saved_force.c_str() : nullptr);
+        set_dec_group_k_csc_enable(had_enable ? saved_enable.c_str() : nullptr);
         set_dec_group_k_csc_disable(had_disable ? saved_disable.c_str() : nullptr);
     }
 };
@@ -1359,6 +1377,7 @@ bool byte_identical(const std::vector<float> &lhs, const std::vector<float> &rhs
 bool test_group_k_csc_production_dispatch() {
     ScopedDecGroupKCscEnv env_guard;
     set_dec_group_k_csc_force(nullptr);
+    set_dec_group_k_csc_enable(nullptr);
     set_dec_group_k_csc_disable(nullptr);
 
     bool ok = true;
@@ -1373,45 +1392,46 @@ bool test_group_k_csc_production_dispatch() {
         const std::vector<ggml::gemmini::quants::QactOutlier> outliers = {
             { 0, 1, 1 }, { 1, 1, 2 }, { 2, 1, 3 }, { 3, 1, 4 },
         };
-        set_dec_group_k_csc_disable("1");
-        const auto baseline_result = ggml::gemmini::quants::dec::compensate_activation_dec(
+        set_dec_group_k_csc_enable(nullptr);
+        const auto default_result = ggml::gemmini::quants::dec::compensate_activation_dec(
             outliers, args, "test");
-        std::vector<float> baseline_output = output;
+        std::vector<float> default_output = output;
         std::fill(output.begin(), output.end(), 0.0f);
-        set_dec_group_k_csc_disable(nullptr);
+        set_dec_group_k_csc_enable("1");
         const auto result = ggml::gemmini::quants::dec::compensate_activation_dec(
             outliers, args, "test");
+        set_dec_group_k_csc_enable(nullptr);
         std::vector<float> expected(rows * cols);
         for (size_t row = 0; row < rows; ++row)
             for (size_t j = 0; j < cols; ++j)
                 expected[row * cols + j] =
                     -0.25f * static_cast<float>((row + 1) * (j + 1));
-        const bool baseline_output_equal = byte_identical(baseline_output, expected);
+        const bool default_output_equal = byte_identical(default_output, expected);
         const bool output_equal = byte_identical(output, expected);
         const double reuse = result.weight_scalar_load_count == 0 ? 0.0 :
             static_cast<double>(result.logical_weight_reference_count) /
                 result.weight_scalar_load_count;
         std::printf(
-            "dispatch dense baseline_disable=%s baseline_plan_bytes=%zu baseline_vector_loads=%zu baseline_output_equal=%s route=%s plan_bytes=%zu nr=%zu vector_loads=%zu reuse=%.1f output_equal=%s\n",
-            baseline_result.group_k_csc_plan_bytes == 0 ? "row-direct" : "group-k-csc",
-            baseline_result.group_k_csc_plan_bytes,
-            baseline_result.weight_vector_load_count,
-            baseline_output_equal ? "yes" : "no",
+            "dispatch dense default=%s default_plan_bytes=%zu default_vector_loads=%zu default_output_equal=%s enabled=%s plan_bytes=%zu nr=%zu vector_loads=%zu reuse=%.1f output_equal=%s\n",
+            default_result.group_k_csc_plan_bytes == 0 ? "row-direct" : "group-k-csc",
+            default_result.group_k_csc_plan_bytes,
+            default_result.weight_vector_load_count,
+            default_output_equal ? "yes" : "no",
             result.group_k_csc_plan_bytes == 0 ? "row-direct" : "group-k-csc",
             result.group_k_csc_plan_bytes,
             cols < 8 ? size_t {4} : size_t {8},
             result.weight_vector_load_count,
             reuse,
             output_equal ? "yes" : "no");
-        ok = check(baseline_result.group_k_csc_plan_bytes == 0 &&
-                       baseline_result.weight_vector_load_count == 0 &&
-                       baseline_output_equal &&
+        ok = check(default_result.group_k_csc_plan_bytes == 0 &&
+                       default_result.weight_vector_load_count == 0 &&
+                       default_output_equal &&
                        result.group_k_csc_plan_bytes > 0 &&
                        result.logical_weight_reference_count == rows * cols &&
                        result.weight_scalar_load_count == cols &&
                        result.weight_vector_load_count == 1 && reuse == 4.0 && output_equal,
-                   cols < 8 ? "dense high-reuse dispatch selects GroupKCSC NR4" :
-                              "dense high-reuse dispatch selects GroupKCSC NR8") && ok;
+                   cols < 8 ? "dense high-reuse opt-in dispatch selects GroupKCSC NR4" :
+                              "dense high-reuse opt-in dispatch selects GroupKCSC NR8") && ok;
     }
 
     return ok;
@@ -1445,6 +1465,7 @@ bool test_fixed_residual_replay_baseline() {
     ggml_gemmini_args_t args = dense_args(rows, cols, depth, weights, output, 0.25f);
     ScopedDecGroupKCscEnv env_guard;
     set_dec_group_k_csc_force(nullptr);
+    set_dec_group_k_csc_enable(nullptr);
     set_dec_group_k_csc_disable(nullptr);
     const auto result = ggml::gemmini::quants::dec::compensate_activation_dec(
         shuffled_outliers, args, "test");

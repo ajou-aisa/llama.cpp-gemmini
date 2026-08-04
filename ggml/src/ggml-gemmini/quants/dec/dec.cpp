@@ -499,11 +499,15 @@ ActivationDECResult compensate_activation_dec(
     const char *disable_group_k_csc = std::getenv("DEC_GROUP_K_CSC_DISABLE");
     const bool group_k_csc_disabled = disable_group_k_csc &&
         disable_group_k_csc[0] == '1' && disable_group_k_csc[1] == '\0';
+    const char *enable_group_k_csc = std::getenv("DEC_GROUP_K_CSC_ENABLE");
+    const bool group_k_csc_enabled = enable_group_k_csc &&
+        enable_group_k_csc[0] == '1' && enable_group_k_csc[1] == '\0';
     const char *force_group_k_csc = std::getenv("DEC_GROUP_K_CSC_FORCE");
     const bool group_k_csc_forced = force_group_k_csc &&
         force_group_k_csc[0] == '1' && force_group_k_csc[1] == '\0';
     bool use_group_k_csc = !group_k_csc_disabled && use_int64_scalar && (group_k_csc_forced ||
-        (I > 1 && J >= 4 && result.active_row_k_pairs / result.unique_k_count >= 4));
+        (group_k_csc_enabled &&
+        (I > 1 && J >= 4 && result.active_row_k_pairs / result.unique_k_count >= 4)));
     const size_t group_k_csc_nr = J < 8 ? 4 : 8;
 
     start = ggml::gemmini::cycle::read();
