@@ -2536,6 +2536,76 @@ bool test_group_k_csc_mixed_prefix_and_plan_rejects() {
               "GroupKCSC rejects reordered same-column entry_order");
 }
 
+bool test_group_k_csc_fallback_ratio_matrix() {
+    using ggml::gemmini::quants::dec::ActiveRowGroup;
+    using ggml::gemmini::quants::dec::GroupKCSCPlan;
+    using ggml::gemmini::quants::dec::GroupKCSCScalarStats;
+    using ggml::gemmini::quants::dec::GroupKCSCWidthPath;
+    using ggml::gemmini::quants::dec::ResidualGroupEntry;
+
+    constexpr size_t rows = 100;
+    constexpr size_t cols = 8;
+    constexpr size_t depth = 1;
+    const std::vector<int8_t> weights(cols, 1);
+    std::vector<float> scalar_output(rows * cols, 0.0f);
+    const auto scalar_args = dense_args(rows, cols, depth, weights, scalar_output, 0.25f);
+    const auto scalar_route_plan = ggml::gemmini::quants::dec::resolve_dec_route_plan(
+        scalar_args, ggml::gemmini::quants::dec::WeightScaleInfoMode::Dec);
+    bool ok = scalar_route_plan.valid;
+
+    for (const size_t fallback_rows : { size_t {0}, size_t {1}, size_t {10}, size_t {50}, size_t {100} }) {
+        std::vector<ResidualGroupEntry> entries;
+        entries.reserve(rows);
+        std::vector<ggml::gemmini::quants::QactOutlier> outliers;
+        outliers.reserve(rows);
+        for (size_t row = 0; row < rows; ++row) {
+            const int32_t residual = row < fallback_rows ?
+                std::numeric_limits<int32_t>::max() : 1;
+            entries.push_back({ static_cast<uint32_t>(row), 0, residual });
+            outliers.push_back({ static_cast<int32_t>(row), 0, residual });
+        }
+        std::vector<ActiveRowGroup> groups;
+        ggml::gemmini::quants::dec::build_active_row_groups(entries, groups);
+        std::vector<size_t> group_offsets;
+        std::vector<size_t> group_row_group_indices;
+        ggml::gemmini::quants::dec::build_group_major_index(
+            groups, 1, group_offsets, group_row_group_indices);
+        GroupKCSCPlan group_k_csc_plan;
+        const bool plan_ready = ggml::gemmini::quants::dec::build_group_k_csc_plan(
+            entries, groups, group_offsets, group_row_group_indices, 1, group_k_csc_plan);
+
+        std::vector<float> int64_output(rows * cols, 0.0f);
+        std::vector<float> mixed_output(rows * cols, 0.0f);
+        ggml_gemmini_args_t args = scalar_args;
+        args.f_out = int64_output.data();
+        GroupKCSCScalarStats int64_stats;
+        GroupKCSCScalarStats mixed_stats;
+        const bool int64_ready = ggml::gemmini::quants::dec::accumulate_to_ycom_int64_scalar_group_k_csc_nr8(
+            args, scalar_route_plan, rows, cols, nullptr, entries, group_k_csc_plan,
+            int64_output.data(), int64_stats);
+        args.f_out = mixed_output.data();
+        const bool mixed_ready = ggml::gemmini::quants::dec::accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
+            args, scalar_route_plan, rows, cols, nullptr, entries, group_k_csc_plan,
+            mixed_output.data(), mixed_stats);
+        const double ratio = static_cast<double>(fallback_rows) / rows;
+        std::printf(
+            "fallback-ratio=%.2f width_path=%d int32_rows=%zu int64_rows=%zu scratch=%zu safe_updates=%zu fallback_updates=%zu\n",
+            ratio, static_cast<int>(mixed_stats.width_path), mixed_stats.int32_row_count,
+            mixed_stats.int64_fallback_row_count, mixed_stats.thread_scratch_bytes,
+            mixed_stats.safe_update_count, mixed_stats.fallback_update_count);
+        ok = check(plan_ready && int64_ready && mixed_ready &&
+                       byte_identical(int64_output, mixed_output) &&
+                       mixed_stats.int32_row_count == rows - fallback_rows &&
+                       mixed_stats.int64_fallback_row_count == fallback_rows &&
+                       mixed_stats.safe_update_count == (rows - fallback_rows) * cols &&
+                       mixed_stats.fallback_update_count == fallback_rows * cols &&
+                       mixed_stats.branch_entry_classification_count ==
+                           (fallback_rows == 0 || fallback_rows == rows ? 0 : rows),
+                   "fallback ratio matrix preserves output and path counters") && ok;
+    }
+    return ok;
+}
+
 bool test_thread_determinism() {
     const char *previous = std::getenv("DEC_THREADS");
     const std::string saved = previous ? previous : "";
@@ -2603,6 +2673,7 @@ int main() {
         test_fixed_residual_replay_high_reuse() && test_group_k_csc_nr4_transposed_j_tile() &&
         test_group_k_csc_mixed_int32_boundaries() &&
         test_group_k_csc_mixed_prefix_and_plan_rejects() &&
+        test_group_k_csc_fallback_ratio_matrix() &&
         test_thread_determinism() && test_inside_existing_openmp_region();
     std::printf("gemmini DEC baseline: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
