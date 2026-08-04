@@ -1409,6 +1409,15 @@ namespace ggml::gemmini::quants::act::exsia
         const ggml_tensor *A,
         ggml_gemmini_args_t &args)
     {
+        return run(meta, A, args, nullptr);
+    }
+
+    bool ExSIA::run(
+        Meta &meta,
+        const ggml_tensor *A,
+        ggml_gemmini_args_t &args,
+        const StripeReadySink *sink)
+    {
         const char *layer = ggml::gemmini::types::to_string(args.layer_type);
         EXSIA_PROFILE_LOG(
         const ProfileConfig profile_config = compile_profile_config();
@@ -1576,6 +1585,16 @@ namespace ggml::gemmini::quants::act::exsia
             (void) mask;
 #endif
             return true;
+        };
+        const auto notify_stripe_ready = [&](StripePipelineSlot &slot) {
+            if (sink == nullptr || sink->on_ready == nullptr)
+                return true;
+
+            const bool accepted = sink->on_ready(
+                sink->user_data,
+                StripeReadyEvent{slot.stripe_idx, slot.row_start, slot.row_end,
+                                 slot.outliers.data(), slot.outliers.size()});
+            return accepted;
         };
 #if defined(GGML_GEMMINI_HAS_OPENMP)
 #if EXSIA_BRANCH_COUNTS_ENABLED
@@ -2054,6 +2073,11 @@ namespace ggml::gemmini::quants::act::exsia
                                                 record_failure(ExSIAState::FailureCode::ValidationSnapshotFailure, s);
                                                 pipeline_ok.store(false, std::memory_order_relaxed);
                                             }
+                                            else if (!notify_stripe_ready(slot))
+                                            {
+                                                record_failure(ExSIAState::FailureCode::StripeReadySinkFailure, s);
+                                                pipeline_ok.store(false, std::memory_order_relaxed);
+                                            }
                                             else
                                             {
                                                 EXSIA_PROFILE_COLLECT(
@@ -2367,6 +2391,9 @@ namespace ggml::gemmini::quants::act::exsia
 
             if (!snapshot_validation_mask(s, slot.stripe.outlier_mask))
                 return fail(ExSIAState::FailureCode::ValidationSnapshotFailure, s);
+
+            if (!notify_stripe_ready(slot))
+                return fail(ExSIAState::FailureCode::StripeReadySinkFailure, s);
 
             EXSIA_PROFILE_COLLECT(
             if (!end_profile_interval(profile.folding))

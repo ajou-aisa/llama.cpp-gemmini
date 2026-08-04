@@ -346,6 +346,21 @@ namespace ggml::gemmini::quants::act::exsia
         }
     };
 
+    struct StripeReadyEvent
+    {
+        size_t stripe_id = 0;
+        size_t row_begin = 0;
+        size_t row_end = 0;
+        const ggml_gemmini_qact_outlier *outliers = nullptr;
+        size_t outlier_count = 0;
+    };
+
+    struct StripeReadySink
+    {
+        void *user_data = nullptr;
+        bool (*on_ready)(void *, const StripeReadyEvent &) = nullptr;
+    };
+
 #if EXSIA_STAGE_PROFILE_ENABLED
     struct StageCycleStats
     {
@@ -778,6 +793,7 @@ namespace ggml::gemmini::quants::act::exsia
             ExponentReductionFailure,
             FoldingFailure,
             ValidationSnapshotFailure,
+            StripeReadySinkFailure,
             ProfileIntervalInvalid,
             ProfileFlushFailure,
             Exception,
@@ -1049,6 +1065,12 @@ namespace ggml::gemmini::quants::act::exsia
             Meta &meta,
             const ggml_tensor *src,
             ggml_gemmini_args_t &args);
+
+        bool run(
+            Meta &meta,
+            const ggml_tensor *src,
+            ggml_gemmini_args_t &args,
+            const StripeReadySink *sink);
 
         const ExSIAState &state() const
         {
