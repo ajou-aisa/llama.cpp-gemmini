@@ -1958,13 +1958,20 @@ namespace ggml::gemmini::quants::act::exsia
                             }
                         }
 
+#if GGML_GEMMINI_EXSIA_LOCAL_WORKERS == 3
+#pragma omp task depend(in : worker_done[s * EXSIA_LOCAL_WORKER_COUNT], worker_done[s * EXSIA_LOCAL_WORKER_COUNT + 1], worker_done[s * EXSIA_LOCAL_WORKER_COUNT + 2]) depend(out : local_sealed[s]) firstprivate(s, slot_idx)
+#elif GGML_GEMMINI_EXSIA_LOCAL_WORKERS == 4
 #pragma omp task depend(in : worker_done[s * EXSIA_LOCAL_WORKER_COUNT], worker_done[s * EXSIA_LOCAL_WORKER_COUNT + 1], worker_done[s * EXSIA_LOCAL_WORKER_COUNT + 2], worker_done[s * EXSIA_LOCAL_WORKER_COUNT + 3]) depend(out : local_sealed[s]) firstprivate(s, slot_idx)
+#else
+#error "Unsupported ExSIA local worker count"
+#endif
                         {
                             try
                             {
                             if (pipeline_ok.load(std::memory_order_relaxed))
                             {
                             StripePipelineSlot &slot = pipeline_slots_[slot_idx];
+                            (void) slot;
 #if EXSIA_OBSERVATION_ENABLED
                             LocalParallelStripeObservation &observation =
                                 state_.local_parallel_observations[s];

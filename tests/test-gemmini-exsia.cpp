@@ -822,6 +822,10 @@ bool write_localstage_artifacts(const std::filesystem::path &evidence_dir,
                                          !result.production_q_final &&
                                          result.validation_reference_q_buffers &&
                                          !result.validation_reference_aliases_production_qout;
+    const bool supported_topology =
+        (EXSIA_LOCAL_WORKER_COUNT == 3 || EXSIA_LOCAL_WORKER_COUNT == 4) &&
+        EXSIA_OMP_THREAD_COUNT == 5 &&
+        EXSIA_PIPELINE_SLOT_COUNT == 2;
     const bool pass = result.bit_exact && result.artifact_mismatch_count == 0 &&
                         result.p3_branch_mismatch_count == 0 && nondeterministic_run_count == 0 &&
                         p0_p1_checked &&
@@ -832,8 +836,7 @@ bool write_localstage_artifacts(const std::filesystem::path &evidence_dir,
                        (focus != "partial-tail" ||
                         (padding_checked && result.padding_q_out_zero && result.padding_mask_clear &&
                          result.padding_exponent_neg_inf)) &&
-                       EXSIA_LOCAL_WORKER_COUNT == 4 && EXSIA_OMP_THREAD_COUNT == 5 &&
-                       EXSIA_PIPELINE_SLOT_COUNT == 2;
+                       supported_topology;
     std::ostringstream manifest;
     manifest << "{\"focus\":\"" << json_escape(focus)
              << "\",\"coverage_scope\":\""
@@ -862,7 +865,9 @@ bool write_localstage_artifacts(const std::filesystem::path &evidence_dir,
                << (result.sigma_all_candidates_selected_p3_replay ? "true" : "false")
                << ",\"zero_variance\":" << result.sigma_zero_variance_case_count
                << ",\"n_zero\":" << result.sigma_n_zero_case_count << "}"
-               << ",\"topology_4_5_2\":{\"workers\":4,\"omp_threads\":5,\"pipeline_slots\":2}}\n";
+               << ",\"supported_topology\":{\"workers\":" << EXSIA_LOCAL_WORKER_COUNT
+               << ",\"omp_threads\":" << EXSIA_OMP_THREAD_COUNT
+               << ",\"pipeline_slots\":" << EXSIA_PIPELINE_SLOT_COUNT << "}}\n";
     std::ostringstream p3;
     p3 << "{\"reference\":[" << result.reference_p3[0] << "," << result.reference_p3[1] << ","
        << result.reference_p3[2] << "],\"optimized\":[" << result.optimized_p3[0] << ","
@@ -940,9 +945,7 @@ bool write_localstage_artifacts(const std::filesystem::path &evidence_dir,
               << (padding_checked && result.padding_mask_clear ? "true" : "false")
               << ",\"padding_exponent_neg_inf\":"
               << (padding_checked && result.padding_exponent_neg_inf ? "true" : "false")
-              << ",\"topology_4_5_2\":"
-             << ((EXSIA_LOCAL_WORKER_COUNT == 4 && EXSIA_OMP_THREAD_COUNT == 5 &&
-                  EXSIA_PIPELINE_SLOT_COUNT == 2) ? "true" : "false")
+              << ",\"supported_topology\":" << (supported_topology ? "true" : "false")
              << ",\"profile_boundaries\":{\"status\":\"not-enabled\",\"reason\":\"execution-mode profile hook not exercised by direct LocalStage validation\"}"
              << ",\"pass\":" << (pass ? "true" : "false") << "}\n";
     return write_text_file(evidence_dir / "corpus_manifest.json", manifest.str()) &&
