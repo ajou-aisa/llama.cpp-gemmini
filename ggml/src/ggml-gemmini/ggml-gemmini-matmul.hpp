@@ -514,6 +514,12 @@ public:
     MatmulExecution & operator=(MatmulExecution &&) noexcept;
     ~MatmulExecution();
 
+#ifndef GGML_GEMMINI_MATMUL_IMPLEMENTATION
+    explicit MatmulExecution(MatmulStatus status)
+        : total_rows_(0), facade_(static_cast<ggml_gemmini_args_t *>(nullptr)), status_(status),
+          state_(status.ok() ? MatmulExecutionState::prepared : MatmulExecutionState::failed) {}
+#endif
+
     MatmulInvocationMode mode() const;
     MatmulExecutionState state() const;
     MatmulStatus status() const;
@@ -669,28 +675,40 @@ MatmulStatus matmul(const ggml_gemmini_args_t & args, ResolvedMatmulOptions opti
 MatmulStatus execute_post_fold_pipeline(const ggml_gemmini_args_t & args, MatmulStripeCollector & collector);
 
 #ifndef GGML_GEMMINI_MATMUL_IMPLEMENTATION
-inline ResolvedMatmulOptions resolved_or_invalid(const MatmulOptionOverrides & options) {
-    auto resolution = resolve_matmul_options(options);
-    if (!resolution.ok()) {
-        resolution.options.mode = MatmulInvocationMode::stripe_sequential;
-        resolution.options.job_capacity = 0;
+inline MatmulStatus resolution_status(MatmulOptionsError error) {
+    switch (error) {
+        case MatmulOptionsError::disabled_mode:
+            return { MatmulStatusCode::unsupported_invocation,
+                     "requested matmul mode is disabled in this build",
+                     MatMulCapability::unsupported };
+        case MatmulOptionsError::none:
+            return {};
+        case MatmulOptionsError::invalid_mode:
+        case MatmulOptionsError::invalid_stripe_rows:
+        case MatmulOptionsError::invalid_rc_shards:
+        case MatmulOptionsError::invalid_job_capacity:
+            return { MatmulStatusCode::invalid_argument, "invalid matmul options" };
     }
-    return resolution.options;
+    return { MatmulStatusCode::invalid_argument, "invalid matmul options" };
 }
 
 inline MatmulExecution prepare_execution(const ggml_gemmini_args_t & args, MatmulOptions options = {}) {
-    return prepare_execution(args, resolved_or_invalid(options));
+    const auto resolution = resolve_matmul_options(options);
+    return resolution.ok() ? prepare_execution(args, resolution.options)
+                           : MatmulExecution(resolution_status(resolution.error));
 }
 
 inline MatmulExecution prepare_execution(ggml_gemmini_args_t * args, MatmulOptions options = {}) {
-    return prepare_execution(args, resolved_or_invalid(options));
+    const auto resolution = resolve_matmul_options(options);
+    return resolution.ok() ? prepare_execution(args, resolution.options)
+                           : MatmulExecution(resolution_status(resolution.error));
 }
 
 inline MatmulStatus prepare_execution(ggml_gemmini_args_t & args, const MatmulOptions & options,
                                       MatmulExecution & execution) {
     const auto resolution = resolve_matmul_options(options);
     if (!resolution.ok()) {
-        return { MatmulStatusCode::invalid_argument, "invalid matmul options" };
+        return resolution_status(resolution.error);
     }
     return prepare_execution(args, resolution.options, execution);
 }
@@ -698,13 +716,13 @@ inline MatmulStatus prepare_execution(ggml_gemmini_args_t & args, const MatmulOp
 inline MatmulStatus matmul(ggml_gemmini_args_t & args, MatmulOptions options = {}) {
     const auto resolution = resolve_matmul_options(options);
     return resolution.ok() ? matmul(args, resolution.options)
-                           : MatmulStatus{ MatmulStatusCode::invalid_argument, "invalid matmul options" };
+                           : resolution_status(resolution.error);
 }
 
 inline MatmulStatus matmul(const ggml_gemmini_args_t & args, MatmulOptions options = {}) {
     const auto resolution = resolve_matmul_options(options);
     return resolution.ok() ? matmul(args, resolution.options)
-                           : MatmulStatus{ MatmulStatusCode::invalid_argument, "invalid matmul options" };
+                           : resolution_status(resolution.error);
 }
 #endif
 

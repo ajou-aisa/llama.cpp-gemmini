@@ -906,8 +906,8 @@ bool test_public_contract_shape() {
                 "output-parameter prepare execution") &&
               check(staged_capture.ok() && staged_job.status().ok(),
                     "output-parameter capture stripe")
-        : check(staged_prepare.code == MatmulStatusCode::invalid_argument,
-                "disabled stripe prepare rejected as invalid options");
+        : check(staged_prepare.code == MatmulStatusCode::unsupported_invocation,
+                "disabled stripe prepare rejected as unsupported invocation");
     return check(resolve_matmul_options(defaults).options.job_capacity == 2,
                  "configured default job capacity") &&
         check(statuses[0].ok(), "success status ok") &&
@@ -1080,14 +1080,14 @@ bool test_disabled_stripe_modes_are_rejected() {
     if (!ggml::gemmini::config::ENABLE_STRIPE_MATMUL) {
         options.mode = MatmulInvocationMode::stripe_sequential;
         passed = check(prepare_execution(make_args(activation, weights, output), options).status().code ==
-                           MatmulStatusCode::invalid_argument,
-                       "disabled sequential stripe rejected as invalid options");
+                           MatmulStatusCode::unsupported_invocation,
+                       "disabled sequential stripe rejected as unsupported invocation");
     }
     if (!config::ENABLE_STRIPE_PIPELINE) {
         options.mode = MatmulInvocationMode::stripe_pipeline;
         passed = check(prepare_execution(make_args(activation, weights, output), options).status().code ==
-                           MatmulStatusCode::invalid_argument,
-                       "disabled stripe pipeline rejected as invalid options") && passed;
+                           MatmulStatusCode::unsupported_invocation,
+                       "disabled stripe pipeline rejected as unsupported invocation") && passed;
     }
     return passed;
 }
@@ -1483,8 +1483,7 @@ bool test_non_exsia_pipeline_is_explicitly_unsupported() {
     meta.scales.assign(args.I, 1.0f);
     MatmulOptions options{};
     options.mode = MatmulInvocationMode::stripe_pipeline;
-    const auto expected = config::ENABLE_STRIPE_PIPELINE
-        ? MatmulStatusCode::unsupported_invocation : MatmulStatusCode::invalid_argument;
+    const auto expected = MatmulStatusCode::unsupported_invocation;
     return check(prepare_execution(args, options).status().code == expected,
                  "multi-row non-ExSIA strict pipeline unsupported");
 }
@@ -1764,8 +1763,7 @@ bool test_staged_contract_errors() {
         return false;
     }
     auto tail = capture_stripe(contract_execution, { 2, 3 });
-    const auto pipeline_rejection = config::ENABLE_STRIPE_PIPELINE
-        ? MatmulStatusCode::unsupported_invocation : MatmulStatusCode::invalid_argument;
+    const auto pipeline_rejection = MatmulStatusCode::unsupported_invocation;
     const bool passed = run_staged_job(tail) &&
         check(finish_execution(contract_execution).code == MatmulStatusCode::invalid_contract,
               "missing stripe at finish") &&

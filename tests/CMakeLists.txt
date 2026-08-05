@@ -258,6 +258,10 @@ target_include_directories(test-gemmini-matmul-options PRIVATE
     ${GGML_GEMMINI_GENERATED_CONFIG_DIR}
     ${GEMMINI_SW_PATH}
     ${GEMMINI_SW_PATH}/include)
+if (NOT GGML_BACKEND_DL)
+    target_link_libraries(test-gemmini-matmul-options PRIVATE ggml-gemmini ggml-base)
+    target_compile_definitions(test-gemmini-matmul-options PRIVATE GGML_GEMMINI_OPTIONS_TEST_BACKEND=1)
+endif()
 add_test(NAME test-gemmini-matmul-options COMMAND $<TARGET_FILE:test-gemmini-matmul-options>)
 
 if (NOT GGML_BACKEND_DL)

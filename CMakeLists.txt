@@ -302,6 +302,7 @@ else()
 endif()
 
 option(GGML_GEMMINI_ENABLE_OPENMP "Enable OpenMP for Gemmini CPU-side kernels" OFF)
+# Public matmul invocation defaults: FULL / STRIPE_SEQUENTIAL / STRIPE_PIPELINE.
 option(GGML_GEMMINI_ENABLE_STRIPE_MATMUL "Enable strict stripe matmul modes" ON)
 option(GGML_GEMMINI_ENABLE_STRIPE_PIPELINE "Enable strict stripe pipeline mode" ON)
 set(GGML_GEMMINI_DEFAULT_MATMUL_MODE "FULL" CACHE STRING
@@ -315,6 +316,29 @@ set(GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY "2" CACHE STRING
     "Default stripe job capacity")
 option(GGML_GEMMINI_ALLOW_RUNTIME_MATMUL_OVERRIDE
        "Allow GEMMINI_* environment overrides for matmul options" ON)
+
+function(ggml_gemmini_require_bool _var)
+    string(TOUPPER "${${_var}}" _GGML_GEMMINI_BOOL_VALUE)
+    if (NOT _GGML_GEMMINI_BOOL_VALUE STREQUAL "ON" AND
+        NOT _GGML_GEMMINI_BOOL_VALUE STREQUAL "OFF" AND
+        NOT _GGML_GEMMINI_BOOL_VALUE STREQUAL "TRUE" AND
+        NOT _GGML_GEMMINI_BOOL_VALUE STREQUAL "FALSE" AND
+        NOT _GGML_GEMMINI_BOOL_VALUE STREQUAL "YES" AND
+        NOT _GGML_GEMMINI_BOOL_VALUE STREQUAL "NO" AND
+        NOT _GGML_GEMMINI_BOOL_VALUE STREQUAL "Y" AND
+        NOT _GGML_GEMMINI_BOOL_VALUE STREQUAL "N" AND
+        NOT _GGML_GEMMINI_BOOL_VALUE STREQUAL "1" AND
+        NOT _GGML_GEMMINI_BOOL_VALUE STREQUAL "0")
+        message(FATAL_ERROR "${_var} must be a boolean value, got '${${_var}}'")
+    endif()
+endfunction()
+
+foreach(_GGML_GEMMINI_MATMUL_BOOL IN ITEMS
+        GGML_GEMMINI_ENABLE_STRIPE_MATMUL
+        GGML_GEMMINI_ENABLE_STRIPE_PIPELINE
+        GGML_GEMMINI_ALLOW_RUNTIME_MATMUL_OVERRIDE)
+    ggml_gemmini_require_bool(${_GGML_GEMMINI_MATMUL_BOOL})
+endforeach()
 
 set(_GGML_GEMMINI_MATMUL_MODES FULL STRIPE_SEQUENTIAL STRIPE_PIPELINE)
 list(FIND _GGML_GEMMINI_MATMUL_MODES "${GGML_GEMMINI_DEFAULT_MATMUL_MODE}"
@@ -382,6 +406,7 @@ configure_file(
     "${GGML_GEMMINI_GENERATED_CONFIG_DIR}/ggml-gemmini-matmul-config.hpp"
     @ONLY)
 
+# ExSIA default mode configures internal activation staging, not the public matmul mode.
 set(GGML_GEMMINI_EXSIA_DEFAULT_MODE "SEQUENTIAL" CACHE STRING "ExSIA default mode")
 set_property(CACHE GGML_GEMMINI_EXSIA_DEFAULT_MODE PROPERTY STRINGS SEQUENTIAL LOCAL_PARALLEL LOCAL_FOLDING_PIPELINE)
 string(TOUPPER "${GGML_GEMMINI_EXSIA_DEFAULT_MODE}" _GGML_GEMMINI_EXSIA_DEFAULT_MODE_UPPER)
@@ -419,6 +444,16 @@ endif()
 if (NOT GGML_GEMMINI_EXSIA_OMP_THREADS_DEFAULT EQUAL 5)
     message(FATAL_ERROR "GGML_GEMMINI_EXSIA_OMP_THREADS_DEFAULT must be 5")
 endif()
+
+message(STATUS "GGML Gemmini matmul defaults:"
+    "\n  stripe capability: ${GGML_GEMMINI_ENABLE_STRIPE_MATMUL}"
+    "\n  stripe pipeline: ${GGML_GEMMINI_ENABLE_STRIPE_PIPELINE}"
+    "\n  default mode: ${GGML_GEMMINI_DEFAULT_MATMUL_MODE}"
+    "\n  default stripe rows: ${GGML_GEMMINI_DEFAULT_STRIPE_ROWS}"
+    "\n  default RC shards: ${GGML_GEMMINI_DEFAULT_RC_SHARDS}"
+    "\n  default stripe job capacity: ${GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY}"
+    "\n  runtime override: ${GGML_GEMMINI_ALLOW_RUNTIME_MATMUL_OVERRIDE}"
+    "\n  ExSIA internal mode: ${_GGML_GEMMINI_EXSIA_DEFAULT_MODE_UPPER}")
 
 string(TOUPPER "${GGML_GEMMINI_OPTION}" _GGML_GEMMINI_OPTION_UPPER)
 set(_GGML_GEMMINI_OPTION_VALUES CPU OS WS)
