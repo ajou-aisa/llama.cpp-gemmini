@@ -32,6 +32,7 @@ struct RouteKey {
 };
 
 struct RouteCapabilities {
+    bool legacy_full = false;
     bool full = false;
     bool sliced_dense = false;
     bool sliced_compensation = false;
@@ -419,7 +420,6 @@ private:
     MatmulStripeInput input_;
     MatmulStatus status_;
     MatmulJobMetrics metrics_;
-    std::vector<int32_t> staged_residual_;
     std::vector<quants::QactOutlier> compensation_outliers_;
     std::unique_ptr<quants::act::Meta> staged_activation_meta_;
     bool has_captured_outliers_ = false;

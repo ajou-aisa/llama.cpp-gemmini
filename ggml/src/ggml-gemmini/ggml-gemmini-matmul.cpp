@@ -6,6 +6,7 @@
 #include <gemmini.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -50,6 +51,24 @@ bool valid_matmul_shape(const ggml_gemmini_args_t & args) {
         ((args.A_fp32 == nullptr) == (args.B_fp32 == nullptr));
 }
 
+bool valid_activation_metadata(const ggml_gemmini_args_t & args) {
+    if (std::holds_alternative<quants::act::NoneMeta>(args.act_quant.storage())) {
+        return true;
+    }
+    if (args.I > std::numeric_limits<size_t>::max() - args.activation_row_offset) {
+        return false;
+    }
+    const quants::act::ActivationMetadataView metadata(
+        args, args.activation_row_offset, args.activation_row_offset + args.I);
+    float scale = 0.0f;
+    for (size_t row = 0; metadata.valid() && row < args.I; ++row) {
+        if (!metadata.scale(row, scale)) {
+            return false;
+        }
+    }
+    return metadata.valid();
+}
+
 bool finite_output(const ggml_gemmini_args_t & args) {
     const size_t row_stride = args.stride_f_out != 0 ? args.stride_f_out : args.J;
     const size_t col_stride = args.col_stride_f_out != 0 ? args.col_stride_f_out : 1;
@@ -60,106 +79,6 @@ bool finite_output(const ggml_gemmini_args_t & args) {
             }
         }
     }
-    return true;
-}
-
-template <typename Vector>
-bool slice_row_vector(Vector & values, size_t row_begin, size_t row_end) {
-    if (row_begin > row_end || row_end > values.size()) {
-        return false;
-    }
-    values = Vector(values.begin() + row_begin, values.begin() + row_end);
-    return true;
-}
-
-template <typename Meta>
-void slice_outliers(Meta & meta, size_t row_begin, size_t row_end) {
-    std::vector<quants::QactOutlier> local;
-    local.reserve(meta.outliers.size());
-    for (const auto & outlier : meta.outliers) {
-        if (outlier.row < 0 || static_cast<size_t>(outlier.row) < row_begin ||
-            static_cast<size_t>(outlier.row) >= row_end) {
-            continue;
-        }
-        local.push_back({ outlier.row - static_cast<int>(row_begin), outlier.col, outlier.residual });
-    }
-    meta.outliers = std::move(local);
-}
-
-bool slice_activation_metadata(ggml_gemmini_args_t & args, size_t row_begin, size_t row_end) {
-    if (args.tile_I != 0 && args.tile_I > std::numeric_limits<size_t>::max() / DIM) {
-        return false;
-    }
-    const size_t rows_per_tile = args.tile_I == 0 ? args.I : args.tile_I * DIM;
-    if (rows_per_tile == 0) {
-        return false;
-    }
-    if (row_end > std::numeric_limits<size_t>::max() - (rows_per_tile - 1)) {
-        return false;
-    }
-
-    auto & storage = args.act_quant.storage();
-    if (auto * meta = std::get_if<quants::act::exsia::Meta>(&storage)) {
-        const size_t first_tile = row_begin / rows_per_tile;
-        const size_t last_tile = (row_end + rows_per_tile - 1) / rows_per_tile;
-        if (!slice_row_vector(meta->theta, first_tile, last_tile)) {
-            return false;
-        }
-        slice_outliers(*meta, row_begin, row_end);
-        args.activation_row_offset = 0;
-    } else if (auto * meta = std::get_if<quants::act::token::Meta>(&storage)) {
-        if (!slice_row_vector(meta->scales, row_begin, row_end)) {
-            return false;
-        }
-        slice_outliers(*meta, row_begin, row_end);
-        args.activation_row_offset = 0;
-    } else if (auto * meta = std::get_if<quants::act::block::Meta>(&storage)) {
-        if (!slice_row_vector(meta->scales, row_begin, row_end)) {
-            return false;
-        }
-        slice_outliers(*meta, row_begin, row_end);
-        args.activation_row_offset = 0;
-    } else if (auto * meta = std::get_if<quants::act::stripe::Meta>(&storage)) {
-        const size_t first_tile = row_begin / rows_per_tile;
-        const size_t last_tile = (row_end + rows_per_tile - 1) / rows_per_tile;
-        if (!slice_row_vector(meta->scales, first_tile, last_tile)) {
-            return false;
-        }
-        slice_outliers(*meta, row_begin, row_end);
-        args.activation_row_offset = 0;
-    }
-    return true;
-}
-
-bool snapshot_exsia_metadata(const ggml_gemmini_args_t & args, size_t row_begin, size_t row_end,
-                             const std::vector<quants::QactOutlier> & outliers,
-                             quants::act::Meta & snapshot) {
-    const auto * source = std::get_if<quants::act::exsia::Meta>(&args.act_quant.storage());
-    if (source == nullptr || row_begin >= row_end) {
-        return false;
-    }
-    const size_t rows_per_tile = args.tile_I == 0 ? args.I : args.tile_I * DIM;
-    if (rows_per_tile == 0 || row_end > std::numeric_limits<size_t>::max() - (rows_per_tile - 1)) {
-        return false;
-    }
-    const size_t first_tile = row_begin / rows_per_tile;
-    const size_t last_tile = (row_end + rows_per_tile - 1) / rows_per_tile;
-    if (last_tile > source->theta.size()) {
-        return false;
-    }
-    quants::act::exsia::Meta local;
-    local.e_s = source->e_s;
-    local.rho = source->rho;
-    local.sigma = source->sigma;
-    local.theta.assign(source->theta.begin() + first_tile, source->theta.begin() + last_tile);
-    local.outliers.reserve(outliers.size());
-    for (const auto & outlier : outliers) {
-        if (outlier.row >= 0 && static_cast<size_t>(outlier.row) >= row_begin &&
-            static_cast<size_t>(outlier.row) < row_end) {
-            local.outliers.push_back({outlier.row - static_cast<int>(row_begin), outlier.col, outlier.residual});
-        }
-    }
-    snapshot.storage_ = std::move(local);
     return true;
 }
 
@@ -211,12 +130,15 @@ MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe, size_
     if (args.tile_I == 0 || args.tile_J == 0 || args.tile_K == 0) {
         gemmini_set_tile_ws(&args);
     }
-    if (!metadata_is_local && !slice_activation_metadata(args, stripe.row_begin, stripe.row_end)) {
+    const size_t metadata_tile_I = args.tile_I;
+    if (stripe.row_begin > std::numeric_limits<size_t>::max() - args.activation_row_offset) {
         return MatMulStatus::invalid_arguments;
     }
+    args.activation_row_offset += stripe.row_begin;
 
     args.I = stripe.row_end - stripe.row_begin;
     gemmini_set_tile_ws(&args);
+    args.tile_I = metadata_tile_I;
     if (args.A != nullptr) {
         args.A += input_offset;
     }
@@ -226,6 +148,7 @@ MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe, size_
     args.f_out += output_offset;
 
     (void) stripe_id;
+    (void) metadata_is_local;
 
     execute_dense(args);
     return MatMulStatus::success;
@@ -342,6 +265,79 @@ uint64_t now_ns() {
 
 namespace detail {
 
+namespace {
+
+struct RouteDescriptor {
+    bool legacy_full;
+    bool facade_full;
+    bool facade_sequential;
+    bool facade_pipeline;
+    bool deprecated;
+};
+
+struct WeightDescriptor {
+    bool legacy_full;
+    bool facade_full;
+    bool facade_sliced;
+    bool deprecated;
+};
+
+constexpr size_t activation_route_count = static_cast<size_t>(ActivationRoute::stripe) + 1;
+constexpr size_t weight_route_count = static_cast<size_t>(WeightRoute::q8_h0) + 1;
+
+constexpr std::array<WeightDescriptor, weight_route_count> weight_descriptors = {{
+    { false, false, false, false },
+    { true,  true,  true,  false },
+    { true,  true,  true,  false },
+    { true,  false, false, false },
+    { true,  false, false, false },
+    { true,  true,  true,  false },
+    { true,  true,  true,  false },
+    { true,  true,  false, true  },
+    { true,  true,  false, true  },
+    { true,  true,  true,  false },
+    { true,  true,  true,  false },
+    { false, false, false, false },
+}};
+
+constexpr auto make_route_descriptors() {
+    std::array<std::array<RouteDescriptor, weight_route_count>, activation_route_count> matrix{};
+    for (size_t activation = 0; activation < activation_route_count; ++activation) {
+        for (size_t weight = 0; weight < weight_route_count; ++weight) {
+            const auto & base = weight_descriptors[weight];
+            const bool known_activation = activation != static_cast<size_t>(ActivationRoute::unknown);
+            const bool channel = weight == static_cast<size_t>(WeightRoute::q8_channel_direct) ||
+                weight == static_cast<size_t>(WeightRoute::q8_channel_sidecar);
+            const bool exsia_or_fp32_channel = channel &&
+                (activation == static_cast<size_t>(ActivationRoute::exsia) ||
+                 activation == static_cast<size_t>(ActivationRoute::fp32));
+            const bool full = known_activation && base.facade_full && !exsia_or_fp32_channel;
+            const bool activation_is_sliceable =
+                activation == static_cast<size_t>(ActivationRoute::fp32) ||
+                activation == static_cast<size_t>(ActivationRoute::exsia) ||
+                activation == static_cast<size_t>(ActivationRoute::tensor);
+            const bool sequential = full && base.facade_sliced && activation_is_sliceable &&
+                (!channel || activation == static_cast<size_t>(ActivationRoute::tensor));
+            matrix[activation][weight] = {
+                known_activation && base.legacy_full,
+                full,
+                sequential,
+                sequential && activation == static_cast<size_t>(ActivationRoute::exsia),
+                base.deprecated,
+            };
+        }
+    }
+    return matrix;
+}
+
+constexpr auto route_descriptors = make_route_descriptors();
+
+const RouteDescriptor & route_descriptor(const RouteKey & key) {
+    return route_descriptors[static_cast<size_t>(key.activation)][static_cast<size_t>(key.weight)];
+}
+
+}
+
 RouteKey normalize_route(const ggml_gemmini_args_t & args) {
     RouteKey key{};
     switch (args.tiled_matmul_type) {
@@ -383,27 +379,20 @@ RouteKey normalize_route(const ggml_gemmini_args_t & args) {
 
 RouteCapabilities route_capabilities(const ggml_gemmini_args_t & args) {
     const RouteKey key = normalize_route(args);
+    const RouteDescriptor & descriptor = route_descriptor(key);
     RouteCapabilities caps{};
-    caps.deprecated = key.weight == WeightRoute::q8_h2 || key.weight == WeightRoute::q8_hp2;
-    caps.full = key.weight != WeightRoute::unknown && key.weight != WeightRoute::q8_h0;
-    caps.sliced_dense = caps.full && !caps.deprecated;
-    caps.sliced_compensation = caps.sliced_dense;
-    caps.live_stripe_producer = key.activation == ActivationRoute::exsia && caps.sliced_compensation;
+    caps.legacy_full = descriptor.legacy_full;
+    caps.deprecated = descriptor.deprecated;
+    caps.full = descriptor.facade_full;
+    caps.sliced_dense = descriptor.facade_sequential;
+    caps.sliced_compensation = descriptor.facade_sequential;
+    caps.live_stripe_producer = descriptor.facade_pipeline;
     caps.external_rc_shards = caps.sliced_compensation;
     caps.internal_parallel_dense = caps.full;
-    if (key.activation == ActivationRoute::exsia &&
-        (key.weight == WeightRoute::q8_channel_direct ||
-         key.weight == WeightRoute::q8_channel_sidecar)) {
-        caps = {};
-    }
-    if ((key.weight == WeightRoute::q8_channel_direct ||
-         key.weight == WeightRoute::q8_channel_sidecar) &&
-        key.activation == ActivationRoute::fp32) {
-        caps = {};
-    }
     if (key.backend == BackendRoute::gemmini_os || key.backend == BackendRoute::ws_sim) {
         caps = {};
-        caps.deprecated = key.weight == WeightRoute::q8_h2 || key.weight == WeightRoute::q8_hp2;
+        caps.legacy_full = descriptor.legacy_full;
+        caps.deprecated = descriptor.deprecated;
     }
     return caps;
 }
@@ -486,6 +475,9 @@ MatMulResult MatMul::run_dense() {
     if (!valid_matmul_shape(args())) {
         return { MatMulStatus::invalid_arguments, MatMulCapability::unsupported };
     }
+    if (!valid_activation_metadata(args())) {
+        return { MatMulStatus::invalid_contract, MatMulCapability::unsupported };
+    }
     if (!detail::route_capabilities(args()).full) {
         return { MatMulStatus::unsupported, MatMulCapability::unsupported };
     }
@@ -560,6 +552,9 @@ MatMulStatus MatMul::begin_stripes() {
     }
     if (!valid_matmul_shape(args())) {
         return MatMulStatus::invalid_arguments;
+    }
+    if (!valid_activation_metadata(args())) {
+        return MatMulStatus::invalid_contract;
     }
     if (stripe_capability(args()) == MatMulCapability::unsupported) {
         return MatMulStatus::unsupported;
@@ -741,6 +736,14 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options
         state_ = MatmulExecutionState::failed;
         return;
     }
+    if (options_.mode == MatmulInvocationMode::stripe_pipeline &&
+        !std::holds_alternative<quants::act::NoneMeta>(facade_.args().act_quant.storage()) &&
+        !detail::route_capabilities(facade_.args()).live_stripe_producer) {
+        status_ = make_status(MatmulStatusCode::unsupported_invocation,
+                              "stripe pipeline requires an ExSIA live producer route");
+        state_ = MatmulExecutionState::failed;
+        return;
+    }
     const bool defer_pipeline_route_validation =
         options_.mode == MatmulInvocationMode::stripe_pipeline &&
         std::holds_alternative<quants::act::NoneMeta>(facade_.args().act_quant.storage());
@@ -799,6 +802,14 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions optio
     if (options_.mode == MatmulInvocationMode::stripe_pipeline && total_rows_ <= 1) {
         status_ = make_status(MatmulStatusCode::unsupported_invocation,
                               "stripe pipeline requires more than one row");
+        state_ = MatmulExecutionState::failed;
+        return;
+    }
+    if (options_.mode == MatmulInvocationMode::stripe_pipeline &&
+        !std::holds_alternative<quants::act::NoneMeta>(facade_.args().act_quant.storage()) &&
+        !detail::route_capabilities(facade_.args()).live_stripe_producer) {
+        status_ = make_status(MatmulStatusCode::unsupported_invocation,
+                              "stripe pipeline requires an ExSIA live producer route");
         state_ = MatmulExecutionState::failed;
         return;
     }
@@ -1074,11 +1085,12 @@ void MatmulStripeCollector::compensation_loop() {
             job->metrics_.rc_start_ns = now_ns();
         }
         job->lifecycle_condition_.notify_all();
-        const size_t shard_count = job->prepared_dec_->shard_count();
+        const size_t shard_count = job->prepared_dec_ != nullptr ?
+            job->prepared_dec_->shard_count() : 0;
         const auto rc_start = Clock::now();
         if (status && shard_count == 1) {
             status = execute_compensation_shard(*job, 0, 1);
-        } else if (status) {
+        } else if (status && shard_count != 0) {
             {
                 std::lock_guard<std::mutex> lock(*job->shard_mutex_);
                 job->parallel_shards_ = true;
@@ -1254,10 +1266,9 @@ MatmulStripeJob::MatmulStripeJob()
 
 MatmulStripeJob::MatmulStripeJob(MatmulStripeJob && other) noexcept
     : execution_(other.execution_), input_(std::move(other.input_)), status_(other.status_),
-      metrics_(other.metrics_), staged_residual_(std::move(other.staged_residual_)),
-      compensation_outliers_(std::move(other.compensation_outliers_)),
-      compensation_ycom_(std::move(other.compensation_ycom_)),
+      metrics_(other.metrics_), compensation_outliers_(std::move(other.compensation_outliers_)),
       staged_activation_meta_(std::move(other.staged_activation_meta_)),
+      compensation_ycom_(std::move(other.compensation_ycom_)),
       has_captured_outliers_(other.has_captured_outliers_), owns_slot_(other.owns_slot_),
       released_(other.released_), collector_slot_released_(other.collector_slot_released_),
       expected_shards_(other.expected_shards_), completed_shards_(other.completed_shards_),
@@ -1278,10 +1289,9 @@ MatmulStripeJob & MatmulStripeJob::operator=(MatmulStripeJob && other) noexcept 
         input_ = std::move(other.input_);
         status_ = other.status_;
         metrics_ = other.metrics_;
-        staged_residual_ = std::move(other.staged_residual_);
         compensation_outliers_ = std::move(other.compensation_outliers_);
-        compensation_ycom_ = std::move(other.compensation_ycom_);
         staged_activation_meta_ = std::move(other.staged_activation_meta_);
+        compensation_ycom_ = std::move(other.compensation_ycom_);
         has_captured_outliers_ = other.has_captured_outliers_;
         owns_slot_ = other.owns_slot_;
         released_ = other.released_;
@@ -1423,18 +1433,39 @@ MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput in
             std::move(input),
             make_status(MatmulStatusCode::invalid_argument, "null stripe capture payload"));
     }
-    const bool has_outliers = input.outliers() != nullptr || input.outlier_count() != 0;
-    std::vector<int32_t> staged_residual;
     if (input.residual_count() != 0) {
-        staged_residual.assign(input.residual(), input.residual() + input.residual_count());
+        const size_t rows = input.row_end() > input.row_begin() ?
+            input.row_end() - input.row_begin() : 0;
+        if (rows == 0 || execution.facade_.args().K == 0 ||
+            rows > std::numeric_limits<size_t>::max() / execution.facade_.args().K ||
+            input.residual_count() != rows * execution.facade_.args().K) {
+            return MatmulStripeJob(
+                &execution,
+                std::move(input),
+                make_status(MatmulStatusCode::invalid_argument,
+                            "invalid dense residual cardinality"));
+        }
+        return MatmulStripeJob(
+            &execution,
+            std::move(input),
+            make_status(MatmulStatusCode::unsupported_route,
+                        "raw residual stripe payload is unsupported",
+                        MatMulCapability::unsupported));
     }
+    const bool has_outliers = input.residual_count() != 0 ||
+        input.outliers() != nullptr || input.outlier_count() != 0;
     std::vector<quants::QactOutlier> outliers;
-    if (input.outlier_count() != 0) {
-        outliers.assign(input.outliers(), input.outliers() + input.outlier_count());
+    try {
+        if (input.outlier_count() != 0) {
+            outliers.assign(input.outliers(), input.outliers() + input.outlier_count());
+        }
+    } catch (const std::bad_alloc &) {
+        return MatmulStripeJob(
+            &execution, std::move(input),
+            make_status(MatmulStatusCode::out_of_memory, "stripe capture allocation failed"));
     }
     MatmulStripeJob job = capture_stripe(execution, std::move(input), std::move(outliers));
     job.has_captured_outliers_ = has_outliers;
-    job.staged_residual_ = std::move(staged_residual);
     return job;
 }
 
@@ -1525,44 +1556,51 @@ MatmulStatus prepare_compensation(MatmulStripeJob & job) {
     }
     const auto start = Clock::now();
     const auto & args = job.execution_->facade_.args();
-    std::unique_ptr<quants::act::Meta> staged_activation_meta;
     std::vector<float> compensation_ycom;
     std::shared_ptr<const quants::dec::PreparedDecSlice> prepared_dec;
     try {
+        const quants::act::ActivationMetadataView metadata(
+            args, job.input_.row_begin(), job.input_.row_end());
+        if (!metadata.valid()) {
+            const MatmulStatus failure = invalid_contract(
+                "stripe activation metadata does not cover global rows");
+            job.record_failure(failure, false);
+            return failure;
+        }
         if (!has_captured_outliers) {
             const auto & all_outliers = quants::activation_outliers_view(args);
             outliers.reserve(all_outliers.size());
             for (const auto & outlier : all_outliers) {
-                if (outlier.row >= 0 &&
-                    static_cast<size_t>(outlier.row) >= job.input_.row_begin() &&
-                    static_cast<size_t>(outlier.row) < job.input_.row_end()) {
+                if (metadata.contains(outlier)) {
                     outliers.push_back(outlier);
                 }
             }
         }
-        if (job.execution_->options_.mode == MatmulInvocationMode::stripe_pipeline &&
-            std::holds_alternative<quants::act::exsia::Meta>(args.act_quant.storage())) {
-            staged_activation_meta = std::make_unique<quants::act::Meta>();
-            if (!snapshot_exsia_metadata(
-                    args, job.input_.row_begin(), job.input_.row_end(),
-                    outliers, *staged_activation_meta)) {
-                const MatmulStatus failure = make_status(
-                    MatmulStatusCode::invalid_contract, "pipeline stripe metadata is not ready");
-                job.record_failure(failure, false);
-                return failure;
+        if (outliers.empty()) {
+            std::lock_guard<std::mutex> lock(*job.shard_mutex_);
+            if (!job.status_) {
+                return job.status_;
             }
+            job.compensation_outliers_.clear();
+            job.has_captured_outliers_ = true;
+            job.compensation_ycom_.clear();
+            job.prepared_dec_.reset();
+            job.expected_shards_ = 1;
+            job.completed_shards_ = 1;
+            job.rc_state_ = MatmulRcState::complete;
+            record_metric(job.metrics_.rc_prepare, job.execution_->options_.profiling, start);
+            job.lifecycle_condition_.notify_all();
+            return {};
         }
-        if (!outliers.empty()) {
-            const size_t rows = job.input_.row_end() - job.input_.row_begin();
-            const size_t elements = rows * args.J;
-            if (rows != 0 && elements / rows != args.J) {
-                const MatmulStatus failure = make_status(
-                    MatmulStatusCode::out_of_memory, "compensation scratch size overflow");
-                job.record_failure(failure, false);
-                return failure;
-            }
-            compensation_ycom.assign(elements, 0.0f);
+        const size_t rows = job.input_.row_end() - job.input_.row_begin();
+        const size_t elements = rows * args.J;
+        if (rows != 0 && elements / rows != args.J) {
+            const MatmulStatus failure = make_status(
+                MatmulStatusCode::out_of_memory, "compensation scratch size overflow");
+            job.record_failure(failure, false);
+            return failure;
         }
+        compensation_ycom.assign(elements, 0.0f);
         const size_t requested_shards = job.execution_->options_.rc_shards == 0 ?
             size_t {1} : job.execution_->options_.rc_shards;
         const MatmulStatus plan_status = from_dec_status(
@@ -1587,23 +1625,17 @@ MatmulStatus prepare_compensation(MatmulStripeJob & job) {
         }
         job.compensation_outliers_ = std::move(outliers);
         job.has_captured_outliers_ = true;
-        job.staged_activation_meta_ = std::move(staged_activation_meta);
         job.compensation_ycom_ = std::move(compensation_ycom);
         job.prepared_dec_ = std::move(prepared_dec);
         job.expected_shards_ = job.prepared_dec_->shard_count();
         job.rc_state_ = MatmulRcState::prepared;
         record_metric(job.metrics_.rc_prepare, job.execution_->options_.profiling, start);
     }
-    if (job.staged_activation_meta_ != nullptr) {
-        std::lock_guard<std::mutex> execution_lock(*job.execution_->state_mutex_);
-        job.execution_->staged_metadata_active_ = true;
-    }
     job.lifecycle_condition_.notify_all();
     return {};
 }
 
 MatmulStatus execute_dense_stripe(MatmulStripeJob & job) {
-    quants::act::Meta * staged_activation_meta = nullptr;
     {
         std::lock_guard<std::mutex> lock(*job.shard_mutex_);
         if (job.execution_ == nullptr || !job.captured_ || job.finalized_ ||
@@ -1611,30 +1643,10 @@ MatmulStatus execute_dense_stripe(MatmulStripeJob & job) {
             return invalid_state("dense execution requires captured Dense idle state");
         }
         job.dense_state_ = MatmulDenseState::running;
-        staged_activation_meta = job.staged_activation_meta_.get();
     }
     const auto start = Clock::now();
-    MatMul * dense_facade = &job.execution_->facade_;
-    if (staged_activation_meta != nullptr && job.execution_->staged_facade_ != nullptr) {
-        dense_facade = job.execution_->staged_facade_.get();
-        if (dense_facade->state() == MatMulState::idle) {
-            const MatMulStatus begin_status = dense_facade->begin_stripes();
-            if (begin_status != MatMulStatus::success) {
-                const MatmulStatus failure = to_public_status(
-                    begin_status,
-                    begin_status == MatMulStatus::unsupported ? MatMulCapability::unsupported :
-                        MatMulCapability::supported);
-                job.record_failure(failure, true);
-                return failure;
-            }
-        }
-        dense_facade->args().act_quant = *staged_activation_meta;
-    }
-    const MatMulStatus status = staged_activation_meta != nullptr ?
-        dense_facade->run_staged_stripe(
-            { job.input_.row_begin(), job.input_.row_end() }, job.input_.stripe_id()) :
-        dense_facade->run_stripe(
-            { job.input_.row_begin(), job.input_.row_end() }, job.input_.stripe_id());
+    const MatMulStatus status = job.execution_->facade_.run_stripe(
+        { job.input_.row_begin(), job.input_.row_end() }, job.input_.stripe_id());
     const MatmulStatus dense_status = to_public_status(
         status, status == MatMulStatus::unsupported ? MatMulCapability::unsupported : MatMulCapability::supported,
         &job.execution_->facade_.args());
@@ -1669,31 +1681,30 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job, size_t shard_id, 
     }
     {
         std::lock_guard<std::mutex> lock(*job.shard_mutex_);
+        if (job.execution_ != nullptr && job.captured_ && !job.finalized_ && job.status_ &&
+            job.rc_state_ == MatmulRcState::complete && job.prepared_dec_ == nullptr &&
+            job.expected_shards_ == 1 && job.completed_shards_ == 1 &&
+            shard_id == 0 && shard_count == 1) {
+            return {};
+        }
         if (job.execution_ == nullptr || !job.captured_ || job.finalized_ ||
             (job.rc_state_ != MatmulRcState::prepared && job.rc_state_ != MatmulRcState::running) ||
             !job.status_ || job.prepared_dec_ == nullptr) {
             return invalid_state("compensation execution requires RC prepared state");
         }
-        if (shard_count == 0 || shard_id >= shard_count) {
-            const MatmulStatus failure = make_status(
-                MatmulStatusCode::invalid_argument, "invalid compensation shard");
-            job.status_ = failure;
-            job.rc_state_ = MatmulRcState::failed;
-            if (job.dense_state_ != MatmulDenseState::complete) {
-                job.dense_state_ = MatmulDenseState::cancelled;
-            }
-            job.lifecycle_condition_.notify_all();
-            return failure;
+        const size_t prepared_shard_count = job.prepared_dec_->shard_count();
+        if (shard_count == 0 || shard_count != prepared_shard_count || shard_id >= shard_count) {
+            return invalid_state("compensation shards must complete in order");
         }
         if (job.parallel_shards_) {
-            if (job.expected_shards_ != shard_count) {
+            if (job.expected_shards_ != prepared_shard_count) {
                 return invalid_state("parallel compensation shard count changed");
             }
             job.rc_state_ = MatmulRcState::running;
         } else if (job.completed_shards_ == 0) {
-            job.expected_shards_ = shard_count;
+            job.expected_shards_ = prepared_shard_count;
             job.rc_state_ = MatmulRcState::running;
-        } else if (job.expected_shards_ != shard_count || shard_id != job.completed_shards_) {
+        } else if (job.expected_shards_ != prepared_shard_count || shard_id != job.completed_shards_) {
             return invalid_state("compensation shards must complete in order");
         }
     }
@@ -1817,6 +1828,25 @@ MatmulStatus matmul_impl(MatmulExecution execution, const ggml_gemmini_args_t & 
     }
     if (options.stripe_rows == 0) {
         return make_status(MatmulStatusCode::invalid_argument, "stripe rows must be nonzero");
+    }
+
+    const detail::RouteKey route = detail::normalize_route(args);
+    if (route.activation == detail::ActivationRoute::fp32 &&
+        route.weight == detail::WeightRoute::fp32) {
+        MatMul facade(args);
+        const MatMulStatus begin_status = facade.begin_stripes();
+        if (begin_status != MatMulStatus::success) {
+            return to_public_status(begin_status, MatMulCapability::supported, &args);
+        }
+        for (size_t row_begin = 0; row_begin < args.I;) {
+            const size_t row_end = row_begin + std::min(options.stripe_rows, args.I - row_begin);
+            const MatMulStatus status = facade.run_stripe({ row_begin, row_end });
+            if (status != MatMulStatus::success) {
+                return to_public_status(status, MatMulCapability::supported, &args);
+            }
+            row_begin = row_end;
+        }
+        return to_public_status(facade.finish_stripes(), MatMulCapability::supported, &args);
     }
 
     for (size_t row_begin = 0; row_begin < args.I;) {

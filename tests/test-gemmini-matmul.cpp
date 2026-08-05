@@ -2,6 +2,7 @@
 
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-matmul.hpp"
+#include "../ggml/src/ggml-gemmini/quants/act/dispatch.hpp"
 
 #include <gemmini.h>
 
@@ -100,13 +101,48 @@ bool test_fp32_full_facade_matches_legacy() {
     const auto stripe_result = ggml::gemmini::matmul(stripe_args, stripe_options);
 
     const auto route = ggml::gemmini::detail::normalize_route(args);
+    const auto capabilities = ggml::gemmini::detail::route_capabilities(args);
     return check(result.status == ggml::gemmini::MatMulStatus::success, "FP32 facade status") &&
         check(route.activation == ggml::gemmini::detail::ActivationRoute::fp32 &&
               route.weight == ggml::gemmini::detail::WeightRoute::fp32,
               "FP32 route normalization") &&
+        check(capabilities.full && capabilities.sliced_dense && capabilities.sliced_compensation,
+              "FP32 route exposes full and sequential facade contracts") &&
         check(same_output(facade_output, legacy_output), "FP32 facade output differs from legacy matmul") &&
         check(stripe_result.ok(), "FP32 stripe facade status") &&
         check(same_output(stripe_output, legacy_output), "FP32 stripe facade output differs from legacy matmul");
+}
+
+bool test_fp32_stripe_route_skips_quantized_compensation() {
+    using namespace ggml::gemmini;
+    const std::vector<float> activation = { 1.0f, -2.0f, 0.5f, 3.0f,
+                                            2.0f, 1.5f, -1.0f, 4.0f };
+    const std::vector<float> weights = { 0.25f, 2.0f, -1.0f, 0.5f,
+                                         1.0f, -0.5f, 3.0f, 2.0f,
+                                         -2.0f, 1.0f, 0.25f, -1.5f };
+    std::vector<float> expected(6, 0.0f);
+    std::vector<float> output(6, 0.0f);
+    matmul_cpu_fp(false, true, 2, 3, 4, activation.data(), weights.data(), nullptr,
+                  expected.data(), 4, 4, 0, 3);
+
+    ggml_gemmini_args_t args{};
+    args.I = 2;
+    args.J = 3;
+    args.K = 4;
+    args.A_fp32 = activation.data();
+    args.B_fp32 = weights.data();
+    args.sA = 4;
+    args.sB = 4;
+    args.f_out = output.data();
+    args.stride_f_out = 3;
+    args.tiled_matmul_type = CPU;
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_sequential;
+    options.stripe_rows = 1;
+
+    const auto status = matmul(args, options);
+    return check(status.ok(), "FP32 sequential stripe does not enter quantized compensation") &&
+        check(same_output(output, expected), "FP32 sequential stripe output parity");
 }
 
 bool test_baseline_activation_route_facade_parity() {
@@ -137,12 +173,17 @@ bool test_baseline_activation_route_facade_parity() {
         stripe_options.mode = MatmulInvocationMode::stripe_sequential;
         stripe_options.stripe_rows = 1;
         const auto stripe_result = matmul(stripe_args, stripe_options);
+        const bool stripe_contract = expected_stripe == MatMulCapability::supported ?
+            check(stripe_result.ok(), "baseline route stripe execution") :
+            check(stripe_result.code == MatmulStatusCode::unsupported_route,
+                  "baseline route stripe explicitly unsupported");
         return check(result.status == MatMulStatus::success, label) &&
             check(same_output(facade_output, legacy_output), "baseline route facade output differs") &&
             check(MatMul::stripe_capability(facade_args) == expected_stripe,
                   "baseline route stripe capability") &&
-            check(stripe_result.ok(), "baseline route stripe execution") &&
-            check(same_output(stripe_output, legacy_output), "baseline route stripe output differs");
+            stripe_contract &&
+            (expected_stripe == MatMulCapability::unsupported ||
+             check(same_output(stripe_output, legacy_output), "baseline route stripe output differs"));
     };
 
     quants::act::tensor::Meta tensor_meta;
@@ -155,9 +196,9 @@ bool test_baseline_activation_route_facade_parity() {
     stripe_meta.scales = { 1.0f };
 
     return run(std::move(tensor_meta), Route::TENSOR, "TENSOR baseline facade", MatMulCapability::supported) &&
-        run(std::move(token_meta), Route::TOKEN, "TOKEN baseline facade", MatMulCapability::supported) &&
-        run(std::move(block_meta), Route::BLOCK, "BLOCK baseline facade", MatMulCapability::supported) &&
-        run(std::move(stripe_meta), Route::BLOCK, "STRIPE baseline facade", MatMulCapability::supported);
+        run(std::move(token_meta), Route::TOKEN, "TOKEN baseline facade", MatMulCapability::unsupported) &&
+        run(std::move(block_meta), Route::BLOCK, "BLOCK baseline facade", MatMulCapability::unsupported) &&
+        run(std::move(stripe_meta), Route::BLOCK, "STRIPE baseline facade", MatMulCapability::unsupported);
 }
 
 bool test_j131_tail_stripe_parity() {
@@ -333,8 +374,8 @@ bool test_block_activation_scale_compensation_parity() {
     options.stripe_rows = 1;
     const auto stripe_result = matmul(stripe_args, options);
     return check(full_result.status == MatMulStatus::success, "BLOCK compensation full status") &&
-        check(stripe_result.ok(), "BLOCK compensation stripe status") &&
-        check(same_output(stripe_output, full_output), "BLOCK compensation scale differs");
+        check(stripe_result.code == MatmulStatusCode::unsupported_route,
+              "BLOCK compensation stripe explicitly unsupported");
 }
 
 bool test_native_and_channel_full_facade_parity() {
@@ -723,10 +764,17 @@ bool test_stripe_state_lifecycle() {
 
 bool run_staged_job(ggml::gemmini::MatmulStripeJob & job) {
     using namespace ggml::gemmini;
-    return check(prepare_compensation(job).ok(), "prepare compensation") &&
-        check(execute_dense_stripe(job).ok(), "dense stripe") &&
-        check(execute_compensation_shard(job).ok(), "compensation shard") &&
-        check(finalize_stripe(job).ok(), "finalize stripe");
+    if (!check(prepare_compensation(job).ok(), "prepare compensation") ||
+        !check(execute_dense_stripe(job).ok(), "dense stripe")) {
+        return false;
+    }
+    const size_t shards = job.snapshot().expected_shards;
+    for (size_t shard = 0; shard < shards; ++shard) {
+        if (!check(execute_compensation_shard(job, shard, shards).ok(), "compensation shard")) {
+            return false;
+        }
+    }
+    return check(finalize_stripe(job).ok(), "finalize stripe");
 }
 
 bool test_public_contract_shape() {
@@ -926,11 +974,261 @@ bool test_explicit_exsia_channel_rejection() {
     args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_channel;
     const auto key = ggml::gemmini::detail::normalize_route(args);
     const auto caps = ggml::gemmini::detail::route_capabilities(args);
-    return check(key.activation == ggml::gemmini::detail::ActivationRoute::exsia &&
-                     key.weight == ggml::gemmini::detail::WeightRoute::q8_channel_direct,
-                 "EXSIA Q8_CHANNEL route normalization") &&
-        check(!caps.full && !caps.sliced_compensation,
-              "EXSIA Q8_CHANNEL explicit unsupported capability");
+    if (!check(key.activation == ggml::gemmini::detail::ActivationRoute::exsia &&
+                   key.weight == ggml::gemmini::detail::WeightRoute::q8_channel_direct,
+               "EXSIA Q8_CHANNEL route normalization") ||
+        !check(caps.legacy_full && !caps.full && !caps.sliced_compensation,
+               "EXSIA Q8_CHANNEL explicit unsupported capability")) {
+        return false;
+    }
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar;
+    const auto sidecar = ggml::gemmini::detail::route_capabilities(args);
+    return check(ggml::gemmini::detail::normalize_route(args).weight ==
+                     ggml::gemmini::detail::WeightRoute::q8_channel_sidecar,
+                 "EXSIA Q8_CHANNEL sidecar route normalization") &&
+        check(sidecar.legacy_full && !sidecar.full && !sidecar.sliced_compensation,
+              "EXSIA Q8_CHANNEL sidecar explicit unsupported capability");
+}
+
+bool test_global_activation_metadata_view_boundaries() {
+    using namespace ggml::gemmini::quants::act;
+    std::vector<elem_t> activation(130, 1);
+    std::vector<elem_t> weights = { 1 };
+    std::vector<float> output(130, 0.0f);
+    auto args = make_args(activation, weights, output);
+    args.I = 130;
+    args.J = 1;
+    args.K = 1;
+    args.sA = 1;
+    args.sB = 1;
+    args.stride_f_out = 1;
+    args.tile_I = 4;
+
+    auto & meta = args.act_quant.storage().emplace<exsia::Meta>();
+    meta.theta = { -1, 0, 1 };
+    const auto * theta_data = meta.theta.data();
+    const ActivationMetadataView boundary(args, 63, 66);
+    const ActivationMetadataView tail(args, 128, 130);
+    size_t global = 0;
+    int16_t theta = 0;
+    float scale = 0.0f;
+
+    return check(boundary.valid() && boundary.row_count() == 3 && boundary.stripe_count() == 2,
+                 "63/64/65 metadata view bounds") &&
+        check(boundary.global_row(0, global) && global == 63 &&
+                  boundary.global_row(1, global) && global == 64 &&
+                  boundary.global_row(2, global) && global == 65,
+              "local rows map to global 63/64/65") &&
+        check(boundary.global_stripe(0, global) && global == 0 &&
+                  boundary.global_stripe(1, global) && global == 1,
+              "local stripes preserve global boundary") &&
+        check(boundary.scale(0, scale) && scale == 0.5f &&
+                  boundary.scale(1, scale) && scale == 1.0f &&
+                  boundary.scale(2, scale) && scale == 1.0f,
+              "row scales use global stripe metadata") &&
+        check(boundary.theta(0, theta) && theta == -1 &&
+                  boundary.theta(1, theta) && theta == 0,
+              "stripe theta uses global metadata") &&
+        check(tail.valid() && tail.global_stripe(0, global) && global == 2 &&
+                  tail.theta(0, theta) && theta == 1,
+              "tail metadata maps to final global stripe") &&
+        check(meta.theta.data() == theta_data && meta.theta.size() == 3,
+              "metadata storage remains unsliced");
+}
+
+bool test_invalid_activation_scale_is_explicit_contract_error() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> output(6, 0.0f);
+    auto args = make_args(activation, weights, output);
+    args.transpose_B = true;
+    args.sB = args.K;
+    args.act_quant.storage().emplace<quants::act::token::Meta>().scales = { 1.0f, 0.0f, 1.0f };
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_sequential;
+    options.stripe_rows = 1;
+
+    const auto scales = quants::act::activation_scales(args, args.I);
+    if (!check(scales.empty(), "invalid activation metadata has no scale fallback")) {
+        return false;
+    }
+    return check(matmul(args, options).code == MatmulStatusCode::invalid_contract,
+                 "invalid activation metadata propagates invalid_contract");
+}
+
+bool test_missing_activation_metadata_has_no_scale_fallback() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> output(6, 0.0f);
+    auto args = make_args(activation, weights, output);
+    quants::act::ActivationMetadataView metadata(args, 0, args.I);
+    float scale = 0.0f;
+
+    return check(metadata.valid(), "FP32 metadata storage remains a valid route") &&
+        check(!metadata.scale(0, scale), "missing activation metadata has no scale fallback") &&
+        check(quants::act::activation_scales(args, args.I).empty(),
+              "missing activation metadata returns no scales") &&
+        check(matmul(args).ok(), "FP32 route does not require activation metadata");
+}
+
+bool test_copied_args_preserve_exsia_route_metadata() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1 };
+    std::vector<elem_t> weights = { 1 };
+    std::vector<float> output(1, 0.0f);
+    auto args = make_args(activation, weights, output);
+    args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0 };
+
+    auto copied = args;
+    if (!check(std::get_if<quants::act::exsia::Meta>(&copied.act_quant.storage()) != nullptr,
+               "copied args preserve the ExSIA metadata alternative")) {
+        return false;
+    }
+    return check(detail::normalize_route(copied).activation == detail::ActivationRoute::exsia,
+                 "copied args route agrees with the ExSIA metadata alternative");
+}
+
+bool test_pointer_backed_stripes_preserve_global_metadata() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation(130, 1);
+    std::vector<elem_t> weights = { 1 };
+    std::vector<float> stripe_output(130, 0.0f);
+    auto stripe_args = make_args(activation, weights, stripe_output);
+    stripe_args.I = 130;
+    stripe_args.J = 1;
+    stripe_args.K = 1;
+    stripe_args.sA = 1;
+    stripe_args.sB = 1;
+    stripe_args.stride_f_out = 1;
+    stripe_args.tile_I = 4;
+    auto & stripe_meta = stripe_args.act_quant.storage().emplace<quants::act::exsia::Meta>();
+    stripe_meta.theta = { -1, 0, 1 };
+    stripe_meta.outliers = { { 63, 0, 1 }, { 64, 0, 2 }, { 129, 0, 4 } };
+    const size_t original_theta_size = stripe_meta.theta.size();
+    const size_t original_outlier_size = stripe_meta.outliers.size();
+
+    MatMul facade(&stripe_args);
+    return check(facade.begin_stripes() == MatMulStatus::success, "global metadata begin stripes") &&
+        check(facade.run_stripe({ 0, 63 }) == MatMulStatus::success, "global metadata head stripe") &&
+        check(stripe_meta.theta.size() == original_theta_size &&
+                  stripe_meta.outliers.size() == original_outlier_size,
+              "global metadata head preserves source storage") &&
+        check(facade.run_stripe({ 63, 66 }) == MatMulStatus::success, "global metadata 63/64/65 stripe") &&
+        check(stripe_meta.theta.size() == original_theta_size &&
+                  stripe_meta.outliers.size() == original_outlier_size &&
+                  stripe_meta.outliers[0].row == 63 &&
+                  stripe_meta.outliers[1].row == 64 &&
+                  stripe_meta.outliers[2].row == 129,
+              "global metadata stripe preserves source storage and rows") &&
+        check(facade.run_stripe({ 66, 128 }) == MatMulStatus::success, "global metadata middle stripe") &&
+        check(stripe_meta.theta.size() == original_theta_size &&
+                  stripe_meta.outliers.size() == original_outlier_size,
+              "global metadata middle preserves source storage") &&
+        check(facade.run_stripe({ 128, 130 }) == MatMulStatus::success, "global metadata tail stripe") &&
+        check(stripe_meta.theta.size() == original_theta_size &&
+                  stripe_meta.outliers.size() == original_outlier_size,
+              "global metadata tail preserves source storage") &&
+        check(facade.finish_stripes() == MatMulStatus::success, "global metadata finish stripes");
+}
+
+bool test_dense_residual_is_consumed_or_rejected() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> empty_output(6, 0.0f);
+    std::vector<float> output(6, 0.0f);
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_sequential;
+    options.rc_shards = 1;
+
+    auto empty_execution = prepare_execution(make_args(activation, weights, empty_output), options);
+    auto empty = capture_stripe(empty_execution, MatmulStripeInput(0, 1, 0));
+    if (!check(empty.status().ok() && run_staged_job(empty), "empty residual stripe execution")) {
+        return false;
+    }
+
+    auto execution = prepare_execution(make_args(activation, weights, output), options);
+    const int32_t residual[] = { 0, 2 };
+    auto job = capture_stripe(execution, MatmulStripeInput(0, 1, 0, residual, 2));
+    const bool residual_rejected =
+        job.status().code == MatmulStatusCode::unsupported_route ||
+        job.status().code == MatmulStatusCode::invalid_contract;
+    const bool residual_consumed = job.status().ok() && run_staged_job(job) &&
+        output[0] == 9.0f && output[1] == 11.0f;
+    if (!check(residual_rejected || residual_consumed,
+               "dense residual is consumed or rejected explicitly")) {
+        return false;
+    }
+
+    auto malformed_execution = prepare_execution(make_args(activation, weights, output), options);
+    auto malformed = capture_stripe(
+        malformed_execution, MatmulStripeInput(0, 1, 0, residual, 1));
+    auto overflow_execution = prepare_execution(make_args(activation, weights, output), options);
+    auto overflow = capture_stripe(
+        overflow_execution, MatmulStripeInput(0, 1, 0, residual, 3));
+    return check(malformed.status().code == MatmulStatusCode::invalid_argument,
+                 "malformed dense residual cardinality rejected") &&
+        check(overflow.status().code == MatmulStatusCode::invalid_argument,
+              "oversized dense residual cardinality rejected");
+}
+
+bool test_non_exsia_pipeline_is_explicitly_unsupported() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> output(6, 0.0f);
+    auto args = make_args(activation, weights, output);
+    args.I = 65;
+    args.K = 1;
+    args.sA = 1;
+    activation.assign(args.I * args.K, 1);
+    args.A = activation.data();
+    auto & meta = args.act_quant.storage().emplace<quants::act::token::Meta>();
+    meta.scales.assign(args.I, 1.0f);
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_pipeline;
+    return check(prepare_execution(args, options).status().code ==
+                     MatmulStatusCode::unsupported_invocation,
+                 "multi-row non-ExSIA strict pipeline unsupported");
+}
+
+bool test_explicit_unsupported_route_statuses() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation(130, 1);
+    std::vector<elem_t> weights = { 1 };
+    std::vector<float> output(130, 0.0f);
+    auto args = make_args(activation, weights, output);
+    args.I = 130;
+    args.J = 1;
+    args.K = 1;
+    args.sA = 1;
+    args.sB = 1;
+    args.stride_f_out = 1;
+    args.tile_I = 4;
+
+    MatmulOptions stripe_options{};
+    stripe_options.mode = MatmulInvocationMode::stripe_sequential;
+    stripe_options.stripe_rows = 63;
+
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h0;
+    const auto q8_h0_status = matmul(args, stripe_options);
+
+    auto & exsia = args.act_quant.storage().emplace<quants::act::exsia::Meta>();
+    exsia.theta = { -1, 0, 1 };
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_channel;
+    const auto q8_channel_direct = matmul(args, stripe_options);
+
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar;
+    const auto q8_channel_sidecar = matmul(args, stripe_options);
+
+    return check(q8_h0_status.code == MatmulStatusCode::unsupported_route,
+                 "Q8_H0 explicit unsupported_route status") &&
+        check(q8_channel_direct.code == MatmulStatusCode::unsupported_route,
+              "ExSIA Q8_CHANNEL direct explicit unsupported_route status") &&
+        check(q8_channel_sidecar.code == MatmulStatusCode::unsupported_route,
+              "ExSIA Q8_CHANNEL sidecar explicit unsupported_route status");
 }
 
 bool test_malformed_route_contract_rejected() {
@@ -983,7 +1281,8 @@ bool test_bounded_pipeline_slots_and_reuse() {
         check(finish_execution(execution).ok(), "pipeline finish") &&
         check(execution.state() == MatmulExecutionState::completed, "execution completed state") &&
         check(first.metrics().handoff.count == 1 && first.metrics().ws.count == 1 &&
-                  first.metrics().rc_prepare.count == 1 && first.metrics().rc_compute.count == 1 &&
+                  first.metrics().rc_prepare.count == 1 &&
+                  first.metrics().rc_compute.count == first.snapshot().expected_shards &&
                   first.metrics().rc_finalize.count == 1,
               "pipeline metric counters");
     if (passed) {
@@ -1004,6 +1303,15 @@ bool test_independent_branch_lifecycle() {
         std::vector<float> output(6, 0.0f);
         auto execution = prepare_execution(make_args(activation, weights, output), options);
         auto job = capture_stripe(execution, { 0, 1 });
+        const auto run_compensation = [&]() {
+            const size_t shards = job.snapshot().expected_shards;
+            for (size_t shard = 0; shard < shards; ++shard) {
+                if (!execute_compensation_shard(job, shard, shards).ok()) {
+                    return false;
+                }
+            }
+            return true;
+        };
         if (!check(finalize_stripe(job).code == MatmulStatusCode::invalid_state,
                    "finalize before branch completion")) {
             return false;
@@ -1011,11 +1319,11 @@ bool test_independent_branch_lifecycle() {
         if (dense_first) {
             if (!check(execute_dense_stripe(job).ok(), "dense-first dense branch") ||
                 !check(prepare_compensation(job).ok(), "dense-first RC prepare") ||
-                !check(execute_compensation_shard(job).ok(), "dense-first RC branch")) {
+                !check(run_compensation(), "dense-first RC branch")) {
                 return false;
             }
         } else if (!check(prepare_compensation(job).ok(), "RC-first prepare") ||
-                   !check(execute_compensation_shard(job).ok(), "RC-first RC branch") ||
+                   !check(run_compensation(), "RC-first RC branch") ||
                    !check(execute_dense_stripe(job).ok(), "RC-first dense branch")) {
             return false;
         }
@@ -1028,7 +1336,8 @@ bool test_independent_branch_lifecycle() {
         if (!check(snapshot.status.ok() && snapshot.captured && snapshot.finalized && snapshot.released &&
                        snapshot.dense == MatmulDenseState::complete &&
                        snapshot.rc == MatmulRcState::complete &&
-                       snapshot.expected_shards == 1 && snapshot.completed_shards == 1,
+                       snapshot.expected_shards > 0 &&
+                       snapshot.completed_shards == snapshot.expected_shards,
                    "synchronized finalized branch snapshot")) {
             return false;
         }
@@ -1056,7 +1365,10 @@ bool test_independent_branch_lifecycle() {
             std::this_thread::sleep_for(std::chrono::microseconds((iteration * 31) % 13));
             rc_status = prepare_compensation(job);
             if (rc_status) {
-                rc_status = execute_compensation_shard(job);
+                const size_t shards = job.snapshot().expected_shards;
+                for (size_t shard = 0; shard < shards && rc_status; ++shard) {
+                    rc_status = execute_compensation_shard(job, shard, shards);
+                }
             }
         });
         dense.join();
@@ -1197,7 +1509,7 @@ bool run_captured_compensation(size_t shard_count, std::vector<float> & output) 
     if (!job.status().ok() || !prepare_compensation(job).ok() ||
         !execute_dense_stripe(job).ok())
         return false;
-    const size_t actual_shards = std::max<size_t>(1, std::min(shard_count, size_t {2}));
+    const size_t actual_shards = job.snapshot().expected_shards;
     for (size_t shard = 0; shard < actual_shards; ++shard)
         if (!execute_compensation_shard(job, shard, actual_shards).ok())
             return false;
@@ -1331,6 +1643,15 @@ int main(int argc, char ** argv) {
         test_route_capability_table() &&
         test_h2_and_hp2_stripe_capability_is_explicitly_unsupported() &&
         test_explicit_exsia_channel_rejection() &&
+        test_global_activation_metadata_view_boundaries() &&
+        test_invalid_activation_scale_is_explicit_contract_error() &&
+        test_missing_activation_metadata_has_no_scale_fallback() &&
+        test_fp32_stripe_route_skips_quantized_compensation() &&
+        test_copied_args_preserve_exsia_route_metadata() &&
+        test_pointer_backed_stripes_preserve_global_metadata() &&
+        test_dense_residual_is_consumed_or_rejected() &&
+        test_non_exsia_pipeline_is_explicitly_unsupported() &&
+        test_explicit_unsupported_route_statuses() &&
         test_malformed_route_contract_rejected() &&
         test_bounded_pipeline_slots_and_reuse() &&
         test_independent_branch_lifecycle() &&

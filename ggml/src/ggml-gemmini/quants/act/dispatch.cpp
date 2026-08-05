@@ -42,6 +42,112 @@ void reset_quantize_failure(ggml_gemmini_args_t &args)
 
 }
 
+ActivationMetadataView::ActivationMetadataView(const ggml_gemmini_args_t &source,
+                                               size_t global_row_begin,
+                                               size_t global_row_end)
+    : source_(&source), global_row_begin_(global_row_begin), global_row_end_(global_row_end)
+{
+    if (global_row_begin > global_row_end)
+        return;
+
+    rows_per_stripe_ = source.I;
+    if (source.tile_I > 0 && !checked_mul_size(source.tile_I, DIM, rows_per_stripe_))
+        return;
+    if (rows_per_stripe_ == 0 ||
+        global_row_end > std::numeric_limits<size_t>::max() - (rows_per_stripe_ - 1))
+        return;
+
+    global_stripe_begin_ = global_row_begin / rows_per_stripe_;
+    global_stripe_end_ = (global_row_end + rows_per_stripe_ - 1) / rows_per_stripe_;
+    const auto &storage = source.act_quant.storage();
+    if (const auto *meta = std::get_if<exsia::Meta>(&storage))
+        valid_ = global_stripe_end_ <= meta->theta.size();
+    else if (const auto *meta = std::get_if<token::Meta>(&storage))
+        valid_ = global_row_end_ <= meta->scales.size();
+    else if (const auto *meta = std::get_if<block::Meta>(&storage))
+        valid_ = global_row_end_ <= meta->scales.size();
+    else if (const auto *meta = std::get_if<stripe::Meta>(&storage))
+        valid_ = global_stripe_end_ <= meta->scales.size();
+    else
+        valid_ = true;
+}
+
+bool ActivationMetadataView::valid() const
+{
+    return valid_;
+}
+
+size_t ActivationMetadataView::row_count() const
+{
+    return valid_ ? global_row_end_ - global_row_begin_ : 0;
+}
+
+size_t ActivationMetadataView::stripe_count() const
+{
+    return valid_ ? global_stripe_end_ - global_stripe_begin_ : 0;
+}
+
+bool ActivationMetadataView::global_row(size_t local_row, size_t &global_row) const
+{
+    if (!valid_ || local_row >= row_count())
+        return false;
+    global_row = global_row_begin_ + local_row;
+    return true;
+}
+
+bool ActivationMetadataView::global_stripe(size_t local_stripe, size_t &global_stripe) const
+{
+    if (!valid_ || local_stripe >= stripe_count())
+        return false;
+    global_stripe = global_stripe_begin_ + local_stripe;
+    return true;
+}
+
+bool ActivationMetadataView::scale(size_t local_row, float &scale) const
+{
+    size_t row = 0;
+    if (!global_row(local_row, row))
+        return false;
+
+    const auto &storage = source_->act_quant.storage();
+    if (const auto *meta = std::get_if<exsia::Meta>(&storage)) {
+        const int16_t value = meta->resolve_stripe_theta(static_cast<int>(row / rows_per_stripe_));
+        if (value == std::numeric_limits<int16_t>::min())
+            return false;
+        scale = std::ldexp(1.0f, value);
+    } else if (const auto *meta = std::get_if<tensor::Meta>(&storage)) {
+        scale = meta->scale;
+    } else if (const auto *meta = std::get_if<token::Meta>(&storage)) {
+        scale = meta->scales[row];
+    } else if (const auto *meta = std::get_if<block::Meta>(&storage)) {
+        scale = meta->scales[row];
+    } else if (const auto *meta = std::get_if<stripe::Meta>(&storage)) {
+        scale = meta->scales[row / rows_per_stripe_];
+    } else {
+        return false;
+    }
+    return std::isfinite(scale) && scale > 0.0f;
+}
+
+bool ActivationMetadataView::theta(size_t local_stripe, int16_t &theta) const
+{
+    size_t stripe = 0;
+    if (!global_stripe(local_stripe, stripe))
+        return false;
+    const auto *meta = std::get_if<exsia::Meta>(&source_->act_quant.storage());
+    if (meta == nullptr)
+        return false;
+    theta = meta->resolve_stripe_theta(static_cast<int>(stripe));
+    return theta != std::numeric_limits<int16_t>::min();
+}
+
+bool ActivationMetadataView::contains(const QactOutlier &outlier) const
+{
+    return valid_ && outlier.row >= 0 &&
+        static_cast<size_t>(outlier.row) >= global_row_begin_ &&
+        static_cast<size_t>(outlier.row) < global_row_end_;
+}
+
 bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
 {
     switch (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT) {
@@ -142,83 +248,17 @@ const std::vector<QactOutlier> &outliers_view(const ggml_gemmini_args_t &args)
 
 std::vector<float> activation_scales(const ggml_gemmini_args_t &args, size_t row_count)
 {
-    std::vector<float> scales(row_count, 1.0f);
-    const auto &storage = args.act_quant.storage();
-
-    if (const auto *meta = std::get_if<exsia::Meta>(&storage)) {
-        const int16_t invalid_theta = std::numeric_limits<int16_t>::min();
-        size_t rows_per_stripe = args.I;
-        if (args.tile_I > 0 && !checked_mul_size(args.tile_I, DIM, rows_per_stripe)) {
-            return scales;
-        }
-        if (rows_per_stripe == 0) {
-            return scales;
-        }
-
-        for (size_t row = 0; row < row_count; ++row) {
-            const size_t stripe_idx = (args.activation_row_offset + row) / rows_per_stripe;
-            const int16_t theta = meta->resolve_stripe_theta(static_cast<int>(stripe_idx));
-            scales[row] = theta == invalid_theta ? 1.0f : std::ldexp(1.0f, theta);
-        }
-        return scales;
+    std::vector<float> scales(row_count);
+    if (row_count > std::numeric_limits<size_t>::max() - args.activation_row_offset)
+        return {};
+    const ActivationMetadataView view(
+        args, args.activation_row_offset, args.activation_row_offset + row_count);
+    if (!view.valid())
+        return {};
+    for (size_t row = 0; row < row_count; ++row) {
+        if (!view.scale(row, scales[row]))
+            return {};
     }
-
-    if (const auto *meta = std::get_if<tensor::Meta>(&storage)) {
-        std::fill(scales.begin(), scales.end(), meta->scale);
-        return scales;
-    }
-
-    if (const auto *meta = std::get_if<token::Meta>(&storage)) {
-        if (args.activation_row_offset > meta->scales.size() ||
-            args.I > meta->scales.size() - args.activation_row_offset) {
-            GGML_ASSERT(false && "TOKEN activation scale cardinality does not cover requested rows");
-        }
-        const size_t count = std::min(row_count, args.I);
-        for (size_t row = 0; row < count; ++row) {
-            const float scale = meta->scales[args.activation_row_offset + row];
-            scales[row] = std::isfinite(scale) && scale > 0.0f ? scale : 1.0f;
-        }
-    }
-
-    if (const auto *meta = std::get_if<block::Meta>(&storage)) {
-        if (args.activation_row_offset > meta->scales.size() ||
-            args.I > meta->scales.size() - args.activation_row_offset) {
-            GGML_ASSERT(false && "BLOCK activation scale cardinality does not cover requested rows");
-        }
-        const size_t count = std::min(row_count, args.I);
-        for (size_t row = 0; row < count; ++row) {
-            const float scale = meta->scales[args.activation_row_offset + row];
-            scales[row] = std::isfinite(scale) && scale > 0.0f ? scale : 1.0f;
-        }
-    }
-
-    if (const auto *meta = std::get_if<stripe::Meta>(&storage)) {
-        size_t rows_per_stripe = args.I;
-        if (args.tile_I > 0 && !checked_mul_size(args.tile_I, DIM, rows_per_stripe)) {
-            return scales;
-        }
-        if (rows_per_stripe == 0) {
-            return scales;
-        }
-
-        size_t stripe_round_input = 0;
-        if (args.I > std::numeric_limits<size_t>::max() - (rows_per_stripe - 1)) {
-            return scales;
-        }
-        stripe_round_input = args.I + rows_per_stripe - 1;
-        const size_t expected_stripes = stripe_round_input / rows_per_stripe;
-        if (meta->scales.size() != expected_stripes) {
-            GGML_ASSERT(false && "STRIPE activation scale cardinality must equal ceil(args.I / rows_per_stripe)");
-            return scales;
-        }
-
-        for (size_t row = 0; row < row_count; ++row) {
-            const size_t stripe_idx = (args.activation_row_offset + row) / rows_per_stripe;
-            const float scale = stripe_idx < meta->scales.size() ? meta->scales[stripe_idx] : 1.0f;
-            scales[row] = std::isfinite(scale) && scale > 0.0f ? scale : 1.0f;
-        }
-    }
-
     return scales;
 }
 
