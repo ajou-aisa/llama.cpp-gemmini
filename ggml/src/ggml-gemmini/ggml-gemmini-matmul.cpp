@@ -963,9 +963,8 @@ bool MatmulStripeCollector::start(MatmulExecution & execution) {
     {
         std::lock_guard<std::mutex> execution_lock(*execution.state_mutex_);
         if (execution.pipeline_attached_) {
+            std::lock_guard<std::mutex> lock(mutex_);
             status_ = invalid_state("execution already has a live stripe collector");
-            execution.status_ = status_;
-            execution.state_ = MatmulExecutionState::failed;
             return false;
         }
         execution.pipeline_attached_ = true;
@@ -986,13 +985,28 @@ bool MatmulStripeCollector::start(MatmulExecution & execution) {
         test_thread_start_attempts_ = 0;
 #endif
     }
-    const auto fail_start = [&](const char * message) {
+    const auto fail_start = [&](MatmulStatus failure) {
+        std::vector<std::shared_ptr<MatmulStripeJob>> jobs;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            status_ = make_status(MatmulStatusCode::execution_failure, message);
+            status_ = failure;
             stop_requested_ = true;
             dense_done_ = true;
             rc_stop_requested_ = true;
+            pending_.clear();
+            compensation_pending_.clear();
+            rc_pending_.clear();
+            rc_tasks_remaining_ = 0;
+            rc_batch_status_ = failure;
+            for (const auto & weak_job : jobs_) {
+                if (auto job = weak_job.lock()) {
+                    jobs.push_back(std::move(job));
+                }
+            }
+        }
+        for (const auto & job : jobs) {
+            job->cancel(failure);
+            release_in_flight_once(job);
         }
         condition_.notify_all();
         if (worker_.joinable()) {
@@ -1042,8 +1056,12 @@ bool MatmulStripeCollector::start(MatmulExecution & execution) {
         worker_ = std::thread(&MatmulStripeCollector::worker_loop, this);
         maybe_fail_thread_start();
         compensation_worker_ = std::thread(&MatmulStripeCollector::compensation_loop, this);
+    } catch (const std::bad_alloc &) {
+        return fail_start(make_status(
+            MatmulStatusCode::out_of_memory, "collector startup allocation failed"));
     } catch (const std::system_error &) {
-        return fail_start("collector worker thread creation failed");
+        return fail_start(make_status(
+            MatmulStatusCode::execution_failure, "collector worker thread creation failed"));
     }
     return true;
 }
@@ -2082,6 +2100,9 @@ MatmulStatus finish_execution(MatmulExecution & execution) {
     }
     if (execution.options_.mode == MatmulInvocationMode::full) {
         return execution.facade_.state() == MatMulState::completed ? execution.status_ : invalid_state();
+    }
+    if (execution.pipeline_attached_) {
+        return invalid_state("cannot finish while stripe collector is attached");
     }
     execution.state_ = MatmulExecutionState::finishing;
     if (execution.active_jobs_ != 0) {

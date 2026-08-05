@@ -1328,6 +1328,7 @@ bool test_missing_activation_metadata_allows_dense_routes_and_fp32() {
     full_options.mode = MatmulInvocationMode::full;
     const std::vector<float> activation_fp32 = { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f };
     const std::vector<float> weights_fp32 = { 1.0f, -1.0f, 2.0f, 3.0f };
+    std::vector<float> fp32_expected(6, 0.0f);
     std::vector<float> fp32_output(6, 0.0f);
     ggml_gemmini_args_t fp32_args{};
     fp32_args.I = 3;
@@ -1342,6 +1343,10 @@ bool test_missing_activation_metadata_allows_dense_routes_and_fp32() {
     fp32_args.stride_f_out = fp32_args.J;
     fp32_args.tiled_matmul_type = CPU;
     fp32_args.act_quant.storage().emplace<quants::act::NoneMeta>();
+    matmul_cpu_fp(false, true, fp32_args.I, fp32_args.J, fp32_args.K,
+                  activation_fp32.data(), weights_fp32.data(), nullptr,
+                  fp32_expected.data(), fp32_args.sA, fp32_args.sB,
+                  fp32_args.col_stride_f_out, fp32_args.stride_f_out);
 
     return check(metadata.valid(), "FP32 metadata storage remains a valid route") &&
         check(!metadata.scale(0, scale), "missing activation metadata has no scale fallback") &&
@@ -1349,7 +1354,9 @@ bool test_missing_activation_metadata_allows_dense_routes_and_fp32() {
               "missing activation metadata returns no scales") &&
         check(matmul(quantized_args, stripe_options).code == MatmulStatusCode::invalid_contract,
               "quantized stripe route rejects missing activation metadata") &&
-        check(matmul(fp32_args, full_options).ok(), "FP32 route does not require activation metadata");
+        check(matmul(fp32_args, full_options).ok(), "FP32 route does not require activation metadata") &&
+        check(same_output(fp32_output, fp32_expected),
+              "FP32 NoneMeta route matches reference output");
 }
 
 bool test_copied_args_preserve_exsia_route_metadata() {
@@ -2116,47 +2123,67 @@ bool test_compensation_shards_preserve_native_scale_groups() {
                                    0.00032747327350080013f);
     std::vector<uint16_t> stripe_R(stripe_s_rf.size(), 4095);
     std::vector<float> output(columns, 0.0f);
+    std::vector<float> reference_output(columns, 0.0f);
 
-    ggml_gemmini_args_t args{};
-    args.I = 1;
-    args.J = columns;
-    args.K = depth;
-    args.A = activation.data();
-    args.B = reinterpret_cast<elem_t *>(weights.data());
-    args.sA = depth;
-    args.sB = depth;
-    args.f_out = output.data();
-    args.stride_f_out = columns;
-    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_0_unpacked_to_h1;
-    args.c_b = c_b.data();
-    args.blocks_per_row = blocks;
-    args.blocks_K = blocks;
-    args.blocks_J = columns;
-    args.block_size_k = QK8_0;
-    args.stripe_J = stripe_width;
-    args.s_rf_stripe = stripe_s_rf.data();
-    args.R_stripe = stripe_R.data();
-    args.act_quant.storage().emplace<quants::act::tensor::Meta>();
-    args.tiled_matmul_type = CPU;
+    const auto make_native_scale_args = [&](std::vector<float> & target) {
+        ggml_gemmini_args_t args{};
+        args.I = 1;
+        args.J = columns;
+        args.K = depth;
+        args.A = activation.data();
+        args.B = reinterpret_cast<elem_t *>(weights.data());
+        args.sA = depth;
+        args.sB = depth;
+        args.f_out = target.data();
+        args.stride_f_out = columns;
+        args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_0_unpacked_to_h1;
+        args.c_b = c_b.data();
+        args.blocks_per_row = blocks;
+        args.blocks_K = blocks;
+        args.blocks_J = columns;
+        args.block_size_k = QK8_0;
+        args.stripe_J = stripe_width;
+        args.s_rf_stripe = stripe_s_rf.data();
+        args.R_stripe = stripe_R.data();
+        args.act_quant.storage().emplace<quants::act::tensor::Meta>();
+        args.tiled_matmul_type = CPU;
+        return args;
+    };
+
+    auto args = make_native_scale_args(output);
+    auto reference_args = make_native_scale_args(reference_output);
+    const std::vector<quants::QactOutlier> outliers = {{ 0, 64, 548339296 }};
 
     MatmulOptions options{};
     options.mode = MatmulInvocationMode::stripe_sequential;
     options.rc_shards = 3;
     auto execution = prepare_execution(args, options);
-    auto job = capture_stripe(execution, { 0, 1, 0 },
-                              std::vector<quants::QactOutlier>{{ 0, 64, 548339296 }});
+    auto job = capture_stripe(execution, { 0, 1, 0 }, outliers);
     if (!check(job.status().ok() && prepare_compensation(job).ok(),
                "native-scale compensation preparation")) {
         return false;
     }
     const size_t actual_shards = job.snapshot().expected_shards;
+    if (!check(execute_dense_stripe(job).ok(), "native-scale dense stripe")) {
+        return false;
+    }
     for (size_t shard = 0; shard < actual_shards; ++shard) {
         if (!check(execute_compensation_shard(job, shard, actual_shards).ok(),
                    "native-scale compensation shard")) {
             return false;
         }
     }
-    return true;
+    if (!check(finalize_stripe(job).ok(), "native-scale finalize stripe") ||
+        !check(finish_execution(execution).ok(), "native-scale finish execution")) {
+        return false;
+    }
+
+    auto dense_reference = MatMul(reference_args).run_dense();
+    quants::dec::compensate_activation_dec(
+        outliers, reference_args, "test-native-scale-reference");
+    return check(dense_reference.status == MatMulStatus::success, "native-scale dense reference") &&
+        check(same_output(output, reference_output),
+              "native-scale staged compensation matches direct DEC reference");
 }
 
 bool run_live_worker_compensation(size_t shard_count, size_t capacity, std::vector<float> & output) {
@@ -2255,12 +2282,21 @@ bool test_pipeline_execution_attachment_contract() {
         return false;
     }
     const bool attached_while_running = execution.test_pipeline_attached();
+    MatmulStripeCollector duplicate(1);
+    const bool duplicate_started = duplicate.start(execution);
+    const auto duplicate_status = duplicate.status();
+    const auto attached_finish_status = finish_execution(execution);
     const auto cancel_status = collector.cancel();
     const auto finish_status = collector.finish();
     const auto execution_status = finish_execution(execution);
     const bool detached_after_finish = !execution.test_pipeline_attached();
     const bool passed =
         check(attached_while_running, "execution marks live collector attachment") &&
+        check(!duplicate_started &&
+                  duplicate_status.code == MatmulStatusCode::invalid_state,
+              "duplicate collector start rejected") &&
+        check(attached_finish_status.code == MatmulStatusCode::invalid_state,
+              "attached collector blocks finish without mutating execution") &&
         check(detached_after_finish, "execution detaches after collector finish") &&
         check(cancel_status.code == MatmulStatusCode::cancelled &&
                   finish_status.code == MatmulStatusCode::cancelled &&
@@ -2280,17 +2316,23 @@ bool test_pipeline_start_thread_failure_returns_clean_status() {
     MatmulOptions options{};
     options.mode = MatmulInvocationMode::stripe_pipeline;
     options.job_capacity = 1;
+    options.rc_shards = 1;
     auto args = make_args(activation, weights, output);
     args.I = 2;
     args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0 };
     auto execution = prepare_execution(args, options);
     MatmulStripeCollector collector(1);
-    collector.test_inject_thread_start_failure();
-    const bool started = collector.start(execution);
+    collector.test_inject_thread_start_failure(3);
+    auto start = std::async(std::launch::async, [&collector, &execution] {
+        return collector.start(execution);
+    });
+    const bool bounded = start.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    const bool started = bounded && start.get();
     const auto collector_status = collector.status();
     const auto finish_status = collector.finish();
     const auto execution_status = execution.status();
     const bool passed =
+        check(bounded, "thread-start failure start is bounded") &&
         check(!started, "thread-start failure returns false") &&
         check(collector_status.code == MatmulStatusCode::execution_failure,
               "thread-start failure sets collector status") &&
