@@ -1018,19 +1018,27 @@ bool test_default_matmul_mode_executes_configured_backend_path() {
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
     std::vector<float> reference_output(6, 0.0f);
     std::vector<float> default_output(6, 0.0f);
+    const auto expected_mode = static_cast<MatmulInvocationMode>(config::DEFAULT_MATMUL_MODE);
 
     auto reference_args = make_args(activation, weights, reference_output);
-    reference_args.act_quant.storage().emplace<quants::act::tensor::Meta>().scale = 1.0f;
+    if (expected_mode == MatmulInvocationMode::stripe_pipeline) {
+        reference_args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0, 0 };
+    } else {
+        reference_args.act_quant.storage().emplace<quants::act::tensor::Meta>().scale = 1.0f;
+    }
     const auto reference_result = MatMul(reference_args).run_full();
     if (!check(reference_result.status == MatMulStatus::success, "reference full execution")) {
         return false;
     }
 
     auto default_args = make_args(activation, weights, default_output);
-    default_args.act_quant.storage().emplace<quants::act::tensor::Meta>().scale = 1.0f;
+    if (expected_mode == MatmulInvocationMode::stripe_pipeline) {
+        default_args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0, 0 };
+    } else {
+        default_args.act_quant.storage().emplace<quants::act::tensor::Meta>().scale = 1.0f;
+    }
     MatmulOptions default_options{};
     auto execution = prepare_execution(default_args, default_options);
-    const auto expected_mode = static_cast<MatmulInvocationMode>(config::DEFAULT_MATMUL_MODE);
     if (!check(execution.status().ok(), "default-mode execution prepared") ||
         !check(execution.mode() == expected_mode, "default-mode resolution")) {
         return false;
@@ -1806,6 +1814,7 @@ bool test_live_pipeline_worker() {
     auto args = make_args(activation, weights, output);
     args.I = 6;
     args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0, 0, 0, 0, 0 };
+    const bool cpu_serial_route = detail::normalize_route(args).backend == detail::BackendRoute::cpu;
     auto execution = prepare_execution(args, options);
     MatmulStripeCollector collector(2);
     if (!check(execution.status().ok() && collector.start(execution), "live worker start")) {
@@ -1827,8 +1836,11 @@ bool test_live_pipeline_worker() {
                "live worker producer profile") ||
         !check(collector.profiles()[0].ws_start_ns < collector.profiles()[0].ws_end_ns &&
                    collector.profiles()[0].rc_start_ns < collector.profiles()[0].rc_end_ns &&
-                   collector.profiles()[0].rc_start_ns < collector.profiles()[0].ws_end_ns,
-               "live worker stage intervals") ||
+                   (cpu_serial_route
+                        ? collector.profiles()[0].ws_end_ns <= collector.profiles()[0].rc_start_ns
+                        : collector.profiles()[0].rc_start_ns < collector.profiles()[0].ws_end_ns),
+               cpu_serial_route ? "CPU pipeline matmul-then-dec ordering"
+                                : "NPU pipeline matmul-dec-overlap ordering") ||
         !check(collector.snapshot().rc_worker_starts == 2 &&
                    collector.snapshot().rc_tasks_executed > collector.snapshot().rc_worker_starts &&
                    collector.snapshot().max_active_rc_stripes == 1 &&
@@ -2557,6 +2569,7 @@ bool test_rc_failure_external_cancel_while_dense_idle() {
     auto args = make_args(activation, weights, output);
     args.I = 2;
     args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0 };
+    const bool cpu_serial_route = detail::normalize_route(args).backend == detail::BackendRoute::cpu;
     auto execution = prepare_execution(args, options);
     MatmulStripeCollector collector(1);
     collector.test_inject_rc_failure(
@@ -2569,7 +2582,9 @@ bool test_rc_failure_external_cancel_while_dense_idle() {
     const auto * sink = collector.sink();
     const bool admitted = sink->on_ready(
         sink->user_data, { 0, 0, 2, nullptr, 0, 10, 20, 30, 50 });
-    collector.test_wait_for_rc_failure();
+    if (!cpu_serial_route) {
+        collector.test_wait_for_rc_failure();
+    }
     const auto cancel_status = collector.cancel();
     const auto duplicate_cancel_status = collector.cancel();
     auto finish = std::async(std::launch::async, [&collector] { return collector.finish(); });
@@ -2590,6 +2605,7 @@ bool test_rc_failure_external_cancel_while_dense_idle() {
         replacement_sink->user_data, { 0, 0, 2, nullptr, 0, 10, 20, 30, 50 });
     const bool replacement_finished = replacement_admitted && replacement.finish().ok() &&
         finish_execution(replacement_execution).ok();
+    const auto dense_state_at_release = collector.test_dense_state_at_release();
 
     const bool passed =
         check(admitted, "RC-failure/cancel job admitted") &&
@@ -2599,8 +2615,11 @@ bool test_rc_failure_external_cancel_while_dense_idle() {
                   finish_status.code == MatmulStatusCode::cancelled &&
                   execution_status.code == MatmulStatusCode::cancelled,
               "external cancellation propagates after RC failure") &&
-        check(collector.test_dense_state_at_release() == MatmulDenseState::complete ||
-                  collector.test_dense_state_at_release() == MatmulDenseState::cancelled,
+        check(cpu_serial_route
+                  ? (dense_state_at_release == MatmulDenseState::idle ||
+                     dense_state_at_release == MatmulDenseState::cancelled)
+                  : (dense_state_at_release == MatmulDenseState::complete ||
+                     dense_state_at_release == MatmulDenseState::cancelled),
               "external cancel leaves Dense complete or cancelled") &&
         check(collector.test_in_flight() == 0,
               "RC-failure/cancel releases collector slot exactly once") &&

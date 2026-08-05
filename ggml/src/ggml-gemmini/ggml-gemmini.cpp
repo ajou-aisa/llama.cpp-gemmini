@@ -1435,6 +1435,12 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.stride_f_out = dst->nb[1] / sizeof(float);
 
     if (pipeline_enabled) {
+        const auto pipeline_route = ggml::gemmini::detail::normalize_route(args);
+        ggml::gemmini::log::debug(layer,
+            "[matmul.pipeline] schedule=%s",
+            pipeline_route.backend == ggml::gemmini::detail::BackendRoute::cpu
+                ? "matmul-then-dec"
+                : "matmul-dec-overlap");
         ggml::gemmini::log::debug(layer, "[matmul.pipeline] job_slots=%zu", pipeline_job_capacity);
         pipeline_execution = std::make_unique<ggml::gemmini::MatmulExecution>(
             ggml::gemmini::prepare_execution(&args, matmul_options));

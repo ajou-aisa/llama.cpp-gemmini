@@ -983,6 +983,8 @@ bool MatmulStripeCollector::start(MatmulExecution & execution) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         execution_ = &execution;
+        cpu_serial_route_ = detail::normalize_route(execution.facade_.args()).backend ==
+            detail::BackendRoute::cpu;
         dense_done_ = false;
         stop_requested_ = false;
         rc_stop_requested_ = false;
@@ -1324,6 +1326,64 @@ void MatmulStripeCollector::worker_loop() {
                 fail(status);
                 break;
             }
+
+            if (cpu_serial_route_) {
+                {
+                    std::lock_guard<std::mutex> job_lock(*job->shard_mutex_);
+                    job->metrics_.ws_start_ns = now_ns();
+                    if (job->execution_->options_.profiling) {
+                        job->metrics_.ws_queue.nanoseconds =
+                            job->metrics_.ws_start_ns - captured.queued_ns;
+                        job->metrics_.ws_queue.count = 1;
+                    }
+                }
+#if defined(GGML_GEMMINI_TEST_OBSERVER)
+                {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    condition_.wait(lock, [this] { return !test_pause_dense_ || stop_requested_; });
+                }
+#endif
+                MatmulStatus collector_status = this->status();
+                if (!collector_status) {
+                    job->cancel(collector_status);
+                    release_in_flight_once(job);
+                    break;
+                }
+                status = job->status();
+                if (!status) {
+                    release_in_flight_once(job);
+                    fail(status);
+                    break;
+                }
+                const MatmulStatus dense_status = execute_dense_stripe(*job);
+                if (!dense_status) {
+                    release_in_flight_once(job);
+                    fail(dense_status);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> job_lock(*job->shard_mutex_);
+                    job->rc_queued_ns_ = now_ns();
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    compensation_pending_.push_back(job);
+                    condition_.notify_all();
+                }
+                std::unique_lock<std::mutex> job_lock(*job->shard_mutex_);
+                job->lifecycle_condition_.wait(job_lock, [&job] {
+                    return job->finalized_ || !job->status_;
+                });
+                status = job->status_;
+                job_lock.unlock();
+                if (!status) {
+                    release_in_flight_once(job);
+                    fail(status);
+                    break;
+                }
+                continue;
+            }
+
             const uint64_t rc_queued_ns = now_ns();
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -1422,6 +1482,11 @@ void MatmulStripeCollector::compensation_loop() {
             {
                 std::lock_guard<std::mutex> job_lock(*active_job->shard_mutex_);
                 active_job->metrics_.rc_start_ns = now_ns();
+                if (active_job->execution_->options_.profiling && active_job->rc_queued_ns_ != 0) {
+                    active_job->metrics_.rc_queue.nanoseconds =
+                        active_job->metrics_.rc_start_ns - active_job->rc_queued_ns_;
+                    active_job->metrics_.rc_queue.count = 1;
+                }
             }
             active_job->lifecycle_condition_.notify_all();
             if (status) {
@@ -1776,6 +1841,7 @@ MatmulStripeJob::MatmulStripeJob(MatmulStripeJob && other) noexcept
       has_captured_outliers_(other.has_captured_outliers_), owns_slot_(other.owns_slot_),
       released_(other.released_), collector_slot_released_(other.collector_slot_released_),
       expected_shards_(other.expected_shards_), completed_shards_(other.completed_shards_),
+      rc_queued_ns_(other.rc_queued_ns_),
       parallel_shards_(other.parallel_shards_), shard_mutex_(std::move(other.shard_mutex_)),
       prepared_dec_(std::move(other.prepared_dec_)),
       compensation_ycom_(std::move(other.compensation_ycom_)),
@@ -1803,6 +1869,7 @@ MatmulStripeJob & MatmulStripeJob::operator=(MatmulStripeJob && other) noexcept 
         collector_slot_released_ = other.collector_slot_released_;
         expected_shards_ = other.expected_shards_;
         completed_shards_ = other.completed_shards_;
+        rc_queued_ns_ = other.rc_queued_ns_;
         parallel_shards_ = other.parallel_shards_;
         prepared_dec_ = std::move(other.prepared_dec_);
         dense_state_ = other.dense_state_;

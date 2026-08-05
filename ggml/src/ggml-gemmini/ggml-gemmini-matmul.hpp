@@ -309,6 +309,7 @@ private:
     size_t in_flight_ = 0;
     size_t rc_tasks_remaining_ = 0;
     size_t rc_worker_capacity_ = 0;
+    bool cpu_serial_route_ = false;
     size_t rc_worker_starts_ = 0;
     size_t rc_tasks_executed_ = 0;
     size_t active_rc_stripes_ = 0;
@@ -636,6 +637,7 @@ private:
     bool collector_slot_released_ = false;
     size_t expected_shards_ = 1;
     size_t completed_shards_ = 0;
+    uint64_t rc_queued_ns_ = 0;
     bool parallel_shards_ = false;
     std::shared_ptr<std::mutex> shard_mutex_ = std::make_shared<std::mutex>();
     std::shared_ptr<const quants::dec::PreparedDecSlice> prepared_dec_;
