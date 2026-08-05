@@ -169,10 +169,15 @@ namespace ggml::gemmini::quants::act::exsia
             std::string log_path;
         };
 
+        static std::once_flag profile_log_init_once;
+
         ProfileConfig compile_profile_config()
         {
             ProfileConfig config;
             config.log_path = cycle_detail_log_path();
+            std::call_once(profile_log_init_once, [&config] {
+                std::ofstream file(config.log_path, std::ios::out | std::ios::trunc);
+            });
             return config;
         }
 #endif

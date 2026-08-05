@@ -816,11 +816,11 @@ static void setup_gemmini_log_outputs_if_needed(void) {
     }
 
     if (!ggml::gemmini::log::cycle.has_explicit_output() &&
-        !ggml::gemmini::log::cycle.set_output_path("log/cycle-log.jsonl")) {
+        !ggml::gemmini::log::cycle.set_output_path("log/cycle-log.jsonl", true)) {
         GGML_LOG_WARN("%s: failed to set default cycle log path 'log/cycle-log.jsonl'\n", __func__);
     }
     if (!ggml::gemmini::log::debug.has_explicit_output() &&
-        !ggml::gemmini::log::debug.set_output_path("log/debug-log.jsonl")) {
+        !ggml::gemmini::log::debug.set_output_path("log/debug-log.jsonl", true)) {
         GGML_LOG_WARN("%s: failed to set default debug log path 'log/debug-log.jsonl'\n", __func__);
     }
     configured = true;
@@ -971,13 +971,18 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     const bool pipeline_enabled = pipeline_requested && exsia_pipeline_supported && I > 1;
     const bool sequential_enabled = sequential_requested;
     const bool legacy_full_dispatch = false;
-    const bool facade_full_dispatch = full_requested;
+    const bool decode_full_dispatch = pipeline_requested && exsia_pipeline_supported && I <= 1;
+    const bool facade_full_dispatch = full_requested || decode_full_dispatch;
     const size_t pipeline_job_capacity = matmul_options.job_capacity;
-    if (pipeline_requested && !pipeline_enabled) {
+    if (pipeline_requested && !exsia_pipeline_supported) {
         ggml::gemmini::log::debug(layer,
             "[matmul.pipeline] status=unsupported_invocation dispatch=fatal reason=%s",
-            I <= 1 ? "stripe-pipeline requires I>1" : "stripe-pipeline requires EXSIA activation");
-        GGML_ABORT("Gemmini unsupported_invocation: stripe-pipeline requires I>1 and EXSIA activation");
+            "stripe-pipeline requires EXSIA activation");
+        GGML_ABORT("Gemmini unsupported_invocation: stripe-pipeline requires EXSIA activation");
+    }
+    if (decode_full_dispatch) {
+        ggml::gemmini::log::debug(layer,
+            "[matmul.pipeline] dispatch=full reason=single-row decode I=%zu", I);
     }
     if (sequential_enabled) {
         ggml::gemmini::log::debug(layer, "[matmul.sequential] enabled");
@@ -1732,6 +1737,7 @@ static void ggml_backend_gemmini_get_rows_q8_channel(const ggml_tensor * src0,
 
 static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_gemmini_context * ctx = (ggml_backend_gemmini_context *)backend->context;
+    setup_gemmini_log_outputs_if_needed();
 
     size_t graph_mul_mat_count = 0;
     size_t graph_max_i = 0;

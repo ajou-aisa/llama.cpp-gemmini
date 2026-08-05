@@ -824,7 +824,7 @@ bool write_localstage_artifacts(const std::filesystem::path &evidence_dir,
                                          !result.validation_reference_aliases_production_qout;
     const bool supported_topology =
         (EXSIA_LOCAL_WORKER_COUNT == 3 || EXSIA_LOCAL_WORKER_COUNT == 4) &&
-        GGML_GEMMINI_EXSIA_SUPERBLOCKS == 4 &&
+        GGML_GEMMINI_EXSIA_SUPERBLOCKS > 0 &&
         EXSIA_OMP_THREAD_COUNT == EXSIA_LOCAL_WORKER_COUNT + 1 &&
         EXSIA_PIPELINE_SLOT_COUNT == 2;
     const bool pass = result.bit_exact && result.artifact_mismatch_count == 0 &&

@@ -5,6 +5,7 @@
 #include "token/token.hpp"
 #include "../../ggml-gemmini-args.h"
 #include "../../ggml-gemmini-config.hpp"
+#include "gemmini/log.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -157,6 +158,11 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
         auto &meta = args.act_quant.storage().emplace<exsia::Meta>();
         exsia::ExSIA exsia;
         if (!exsia.run(meta, src, args, args.exsia_stripe_ready_sink)) {
+            ggml::gemmini::log::debug(
+                ggml::gemmini::types::to_string(args.layer_type),
+                "[exsia] quantization failed failure_code=%d failure_stripe=%zu",
+                static_cast<int>(exsia.state().failure_code),
+                exsia.state().failure_stripe);
             reset_quantize_failure(args);
             return false;
         }

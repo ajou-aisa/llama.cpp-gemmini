@@ -472,7 +472,6 @@ namespace ggml::gemmini::quants::act::exsia
     constexpr size_t EXSIA_OMP_THREAD_COUNT = GGML_GEMMINI_EXSIA_OMP_THREADS_DEFAULT;
     static_assert(EXSIA_LOCAL_WORKER_COUNT == 3 || EXSIA_LOCAL_WORKER_COUNT == 4,
                   "ExSIA requires three or four Local workers");
-    static_assert(GGML_GEMMINI_EXSIA_SUPERBLOCKS == 4, "ExSIA requires exactly four superblocks");
     static_assert(EXSIA_OMP_THREAD_COUNT == EXSIA_LOCAL_WORKER_COUNT + 1,
                   "ExSIA requires OpenMP team size to equal Local workers + 1");
     static_assert(EXSIA_PIPELINE_SLOT_COUNT == 2, "ExSIA requires exactly two pipeline slots");

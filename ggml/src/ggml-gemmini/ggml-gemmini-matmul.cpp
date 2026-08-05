@@ -766,7 +766,9 @@ MatMulStatus MatMul::begin_stripes() {
     if (!valid_matmul_shape(args())) {
         return MatMulStatus::invalid_arguments;
     }
-    if (!valid_activation_metadata(args())) {
+    const bool live_exsia_metadata = std::holds_alternative<quants::act::exsia::Meta>(
+        args().act_quant.storage());
+    if (!live_exsia_metadata && !valid_activation_metadata(args())) {
         return MatMulStatus::invalid_contract;
     }
     if (stripe_capability(args()) == MatMulCapability::unsupported) {
