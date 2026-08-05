@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 struct ggml_gemmini_args_t;
@@ -34,6 +35,75 @@ struct ActivationDECResult
     size_t group_k_csc_plan_bytes = 0;
     size_t thread_scratch_bytes = 0;
 };
+
+enum class DecStatus : uint8_t
+{
+    success,
+    unsupported,
+    invalid_arguments,
+    allocation_failure,
+    invalid_shard,
+    execution_failed,
+};
+
+struct DecColumnRange
+{
+    size_t begin = 0;
+    size_t end = 0;
+};
+
+struct DecPreparationCounters
+{
+    size_t route_plan_build_count = 0;
+    size_t active_row_plan_build_count = 0;
+    size_t group_k_csc_plan_build_count = 0;
+};
+
+struct DecShardScratch
+{
+    std::vector<float> ycom;
+    ActivationDECResult result{};
+    size_t internal_thread_count = 0;
+};
+
+class PreparedDecSlice
+{
+public:
+    size_t shard_count() const;
+    DecColumnRange shard_range(size_t shard_index) const;
+    size_t nr() const;
+    bool uses_group_k_csc() const;
+    const ActivationDECResult & result() const;
+    DecPreparationCounters preparation_counters() const;
+
+private:
+    struct Data;
+    explicit PreparedDecSlice(std::shared_ptr<const Data> data);
+
+    std::shared_ptr<const Data> data_;
+
+    friend DecStatus prepare_activation_dec_slice(
+        const std::vector<QactOutlier> &, const ggml_gemmini_args_t &, size_t, size_t,
+        size_t, DispatchOverride, std::shared_ptr<const PreparedDecSlice> &);
+    friend DecStatus execute_prepared_dec_shard(
+        const PreparedDecSlice &, size_t, DecShardScratch &, float *, size_t);
+};
+
+DecStatus prepare_activation_dec_slice(
+    const std::vector<QactOutlier> &outliers,
+    const ggml_gemmini_args_t &args,
+    size_t row_begin,
+    size_t row_end,
+    size_t requested_shards,
+    DispatchOverride dispatch_override,
+    std::shared_ptr<const PreparedDecSlice> &prepared);
+
+DecStatus execute_prepared_dec_shard(
+    const PreparedDecSlice &prepared,
+    size_t shard_index,
+    DecShardScratch &scratch,
+    float *ycom_output = nullptr,
+    size_t ycom_stride = 0);
 
 enum class ActivationDECRowSliceStatus {
     success,

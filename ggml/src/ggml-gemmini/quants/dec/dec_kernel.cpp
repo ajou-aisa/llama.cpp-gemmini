@@ -24,8 +24,27 @@
 
 namespace ggml::gemmini::quants::dec
 {
+namespace
+{
+thread_local size_t external_dec_shard_depth = 0;
+}
+
+void enter_external_dec_shard()
+{
+    ++external_dec_shard_depth;
+}
+
+void leave_external_dec_shard()
+{
+    if (external_dec_shard_depth > 0)
+        --external_dec_shard_depth;
+}
+
 int resolve_dec_threads(size_t task_count, int omp_max_threads)
 {
+    if (external_dec_shard_depth > 0)
+        return 1;
+
     const int task_limit = task_count > static_cast<size_t>(std::numeric_limits<int>::max()) ?
         std::numeric_limits<int>::max() : std::max(1, static_cast<int>(task_count));
     const int worker_limit = std::max(1, omp_max_threads);

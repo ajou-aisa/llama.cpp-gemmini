@@ -57,6 +57,8 @@ inline size_t dec_int64_j_tile_count(size_t columns)
 
 int resolve_dec_threads(size_t task_count, int omp_max_threads);
 int resolve_dec_threads(size_t task_count);
+void enter_external_dec_shard();
+void leave_external_dec_shard();
 
 float apply_h1_scale_ordered(
     int64_t accumulator,

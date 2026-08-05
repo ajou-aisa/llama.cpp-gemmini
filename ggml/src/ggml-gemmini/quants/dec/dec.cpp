@@ -18,6 +18,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <memory>
+#include <numeric>
+#include <new>
 #include <vector>
 
 #if LOG_DEBUG || DEC_VALIDATION
@@ -75,6 +78,22 @@ namespace
             return 0;
         return lhs > std::numeric_limits<size_t>::max() / rhs ?
             std::numeric_limits<size_t>::max() : lhs * rhs;
+    }
+
+    bool checked_mul_size(size_t lhs, size_t rhs, size_t &out)
+    {
+        if (rhs != 0 && lhs > std::numeric_limits<size_t>::max() / rhs)
+            return false;
+        out = lhs * rhs;
+        return true;
+    }
+
+    bool checked_add_size(size_t lhs, size_t rhs, size_t &out)
+    {
+        if (lhs > std::numeric_limits<size_t>::max() - rhs)
+            return false;
+        out = lhs + rhs;
+        return true;
     }
 
     size_t estimate_group_k_csc_plan_bytes(size_t group_count, size_t entry_count, size_t active_row_group_count)
@@ -374,6 +393,449 @@ namespace
         return staged;
     }
 
+}
+
+struct PreparedDecSlice::Data
+{
+    ggml_gemmini_args_t args;
+    DecRoutePlan route;
+    std::vector<float> activation_scales;
+    std::vector<ResidualGroupEntry> residual_entries;
+    std::vector<ActiveRowGroup> active_row_groups;
+    std::vector<size_t> group_offsets;
+    std::vector<size_t> group_row_group_indices;
+    GroupKCSCPlan group_k_csc_plan;
+    std::vector<DecColumnRange> ranges;
+    ActivationDECResult result{};
+    DecPreparationCounters counters{};
+    size_t nr = 1;
+    bool use_group_k_csc = false;
+    bool use_int64_scalar = false;
+    bool use_int64_channel_direct = false;
+    bool use_int64_channel_sidecar = false;
+    bool use_int64_h1 = false;
+    bool use_int64_block = false;
+};
+
+PreparedDecSlice::PreparedDecSlice(std::shared_ptr<const Data> data) : data_(std::move(data)) {}
+
+size_t PreparedDecSlice::shard_count() const
+{
+    return data_ ? data_->ranges.size() : 0;
+}
+
+DecColumnRange PreparedDecSlice::shard_range(size_t shard_index) const
+{
+    return data_ && shard_index < data_->ranges.size() ? data_->ranges[shard_index] : DecColumnRange{};
+}
+
+size_t PreparedDecSlice::nr() const
+{
+    return data_ ? data_->nr : 1;
+}
+
+bool PreparedDecSlice::uses_group_k_csc() const
+{
+    return data_ && data_->use_group_k_csc;
+}
+
+const ActivationDECResult & PreparedDecSlice::result() const
+{
+    static const ActivationDECResult empty;
+    return data_ ? data_->result : empty;
+}
+
+DecPreparationCounters PreparedDecSlice::preparation_counters() const
+{
+    return data_ ? data_->counters : DecPreparationCounters{};
+}
+
+namespace
+{
+DecStatus slice_dec_columns(
+    const ggml_gemmini_args_t &source, size_t col_begin, size_t col_end,
+    ggml_gemmini_args_t &local_args)
+{
+    if (col_begin >= col_end || col_end > source.J || source.f_out == nullptr)
+        return DecStatus::invalid_arguments;
+
+    const size_t output_col_stride = source.col_stride_f_out ? source.col_stride_f_out : 1;
+    size_t offset = 0;
+    if (!checked_mul_size(col_begin, output_col_stride, offset))
+        return DecStatus::invalid_arguments;
+
+    const size_t width = col_end - col_begin;
+    local_args = source;
+    local_args.J = width;
+    local_args.f_out += offset;
+
+    const bool channel_direct = source.weight_format ==
+        ggml_gemmini_args_t::im2p_weight_format_t::q8_channel;
+    const bool jxk_layout = channel_direct ||
+        source.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar ||
+        source.transpose_B || source.q8_h1_blocks != nullptr || source.q8_h2_blocks != nullptr ||
+        source.q8_hp1_blocks != nullptr || source.q8_hp2_blocks != nullptr || source.c_b != nullptr;
+
+    if (source.B != nullptr) {
+        const size_t weight_stride = channel_direct ? source.q8_channel_row_stride :
+            (jxk_layout ? (source.sB ? source.sB : source.K) : 1);
+        if (!checked_mul_size(col_begin, weight_stride, offset))
+            return DecStatus::invalid_arguments;
+        if (channel_direct)
+            local_args.B = reinterpret_cast<elem_t *>(reinterpret_cast<uint8_t *>(source.B) +
+                offset);
+        else if (jxk_layout)
+            local_args.B = reinterpret_cast<elem_t *>(reinterpret_cast<int8_t *>(source.B) +
+                offset);
+        else
+            local_args.B = reinterpret_cast<elem_t *>(reinterpret_cast<int8_t *>(source.B) + col_begin);
+    }
+    if (source.B_blocks != nullptr && source.blocks_K != 0) {
+        if (!checked_mul_size(col_begin, source.blocks_K, offset))
+            return DecStatus::invalid_arguments;
+        local_args.B_blocks = source.B_blocks + offset;
+    }
+    if (source.B_scales != nullptr && source.blocks_K != 0) {
+        if (!checked_mul_size(col_begin, source.blocks_K, offset))
+            return DecStatus::invalid_arguments;
+        local_args.B_scales = source.B_scales + offset;
+    }
+    if (source.weight_channel_scales != nullptr)
+        local_args.weight_channel_scales = source.weight_channel_scales + col_begin;
+    local_args.weight_channel_scale_count = width;
+    if (source.q8_channel_row_base != nullptr) {
+        if (!checked_mul_size(col_begin, source.q8_channel_row_stride, offset))
+            return DecStatus::invalid_arguments;
+        local_args.q8_channel_row_base = source.q8_channel_row_base +
+            offset;
+        local_args.q8_channel_row_count = width;
+    }
+    if (source.q8_h1_blocks != nullptr) {
+        if (!checked_mul_size(col_begin, source.blocks_per_row, offset) ||
+            !checked_mul_size(width, source.blocks_per_row, local_args.q8_h1_block_count))
+            return DecStatus::invalid_arguments;
+        local_args.q8_h1_blocks = source.q8_h1_blocks + offset;
+        local_args.q8_h1_rows = width;
+    }
+    if (source.q8_h2_blocks != nullptr) {
+        if (!checked_mul_size(col_begin, source.q8_h2_blocks_per_row, offset) ||
+            !checked_mul_size(width, source.q8_h2_blocks_per_row, local_args.q8_h2_block_count))
+            return DecStatus::invalid_arguments;
+        local_args.q8_h2_blocks = source.q8_h2_blocks + offset;
+    }
+    if (source.q8_hp1_blocks != nullptr) {
+        if (!checked_mul_size(col_begin, source.q8_hp1_blocks_per_row, offset) ||
+            !checked_mul_size(width, source.q8_hp1_blocks_per_row, local_args.q8_hp1_block_count))
+            return DecStatus::invalid_arguments;
+        local_args.q8_hp1_blocks = source.q8_hp1_blocks + offset;
+    }
+    if (source.q8_hp2_blocks != nullptr) {
+        if (!checked_mul_size(col_begin, source.q8_hp2_blocks_per_row, offset) ||
+            !checked_mul_size(width, source.q8_hp2_blocks_per_row, local_args.q8_hp2_block_count))
+            return DecStatus::invalid_arguments;
+        local_args.q8_hp2_blocks = source.q8_hp2_blocks + offset;
+    }
+    if (source.c_b != nullptr && source.blocks_per_row != 0) {
+        if (!checked_mul_size(col_begin, source.blocks_per_row, offset))
+            return DecStatus::invalid_arguments;
+        local_args.c_b = source.c_b + offset;
+    }
+    if (source.s_rf != nullptr)
+        local_args.s_rf = source.s_rf + col_begin;
+    if (source.R != nullptr)
+        local_args.R = source.R + col_begin;
+    if (source.stripe_J > 1) {
+        if (source.s_rf_stripe == nullptr || source.R_stripe == nullptr ||
+            col_begin % source.stripe_J != 0)
+            return DecStatus::unsupported;
+        local_args.s_rf_stripe = source.s_rf_stripe + col_begin / source.stripe_J;
+        local_args.R_stripe = source.R_stripe + col_begin / source.stripe_J;
+    }
+    return DecStatus::success;
+}
+
+class ExternalDecShardGuard
+{
+public:
+    ExternalDecShardGuard() { enter_external_dec_shard(); }
+    ~ExternalDecShardGuard() { leave_external_dec_shard(); }
+};
+}
+
+DecStatus prepare_activation_dec_slice(
+    const std::vector<QactOutlier> &outliers,
+    const ggml_gemmini_args_t &args,
+    size_t row_begin,
+    size_t row_end,
+    size_t requested_shards,
+    DispatchOverride dispatch_override,
+    std::shared_ptr<const PreparedDecSlice> &prepared)
+{
+    prepared.reset();
+    if (requested_shards == 0 || row_begin >= row_end || row_end > args.I ||
+        args.K == 0 || args.J == 0 || args.f_out == nullptr ||
+        row_end - row_begin > std::numeric_limits<uint32_t>::max() ||
+        args.K > std::numeric_limits<uint32_t>::max())
+        return DecStatus::invalid_arguments;
+
+    try {
+        auto data = std::make_shared<PreparedDecSlice::Data>();
+        data->args = args;
+        const size_t input_stride = args.sA ? args.sA : args.K;
+        const size_t output_stride = args.stride_f_out ? args.stride_f_out : args.J;
+        if (row_begin > std::numeric_limits<size_t>::max() / std::max(input_stride, output_stride))
+            return DecStatus::invalid_arguments;
+        if (row_begin > std::numeric_limits<size_t>::max() - data->args.activation_row_offset)
+            return DecStatus::invalid_arguments;
+        data->args.I = row_end - row_begin;
+        if (data->args.A != nullptr)
+            data->args.A += row_begin * input_stride;
+        data->args.f_out += row_begin * output_stride;
+        data->args.activation_row_offset += row_begin;
+
+        data->route = resolve_dec_route_plan(data->args, WeightScaleInfoMode::Dec);
+        data->counters.route_plan_build_count = 1;
+        if (!data->route.valid)
+            return DecStatus::unsupported;
+        const int8_t *weights = reinterpret_cast<const int8_t *>(data->args.B);
+        if ((!weights && !data->route.native_weight_blocks) || data->route.weight_stride == 0 ||
+            !dec_route_covers_k(data->route, data->args.K))
+            return DecStatus::unsupported;
+        const size_t minimum_weight_stride = data->route.layout == WeightLayout::KxJ_RowMajor ?
+            data->args.J : data->args.K;
+        if (weights && !data->route.native_weight_blocks &&
+            data->route.weight_stride < minimum_weight_stride)
+            return DecStatus::invalid_arguments;
+
+        std::vector<float> all_activation_scales = act::activation_scales(args, args.I);
+        if (!all_activation_scales.empty())
+            data->activation_scales.assign(
+                all_activation_scales.begin() + row_begin, all_activation_scales.begin() + row_end);
+        data->residual_entries.reserve(outliers.size());
+        for (const QactOutlier &outlier : outliers) {
+            if (outlier.row < 0 || outlier.col < 0)
+                continue;
+            const size_t row = static_cast<size_t>(outlier.row);
+            const size_t k = static_cast<size_t>(outlier.col);
+            if (row >= row_begin && row < row_end && k < data->args.K)
+                data->residual_entries.push_back({ static_cast<uint32_t>(row - row_begin),
+                                                   static_cast<uint32_t>(k), outlier.residual });
+        }
+        data->result.total_selected = data->residual_entries.size();
+        build_active_row_groups(data->residual_entries, data->active_row_groups);
+        data->counters.active_row_plan_build_count = 1;
+        data->result.nnz = data->residual_entries.size();
+        std::vector<uint32_t> unique_k;
+        unique_k.reserve(data->residual_entries.size());
+        for (const ResidualGroupEntry &entry : data->residual_entries)
+            unique_k.push_back(entry.k);
+        std::sort(unique_k.begin(), unique_k.end());
+        unique_k.erase(std::unique(unique_k.begin(), unique_k.end()), unique_k.end());
+        data->result.unique_k_count = unique_k.size();
+        data->result.int_mac_count = saturating_mul_size(data->result.nnz, data->args.J);
+        data->result.logical_weight_reference_count = data->result.int_mac_count;
+
+        const size_t group_count = data->args.K / kDecGroupSizeK +
+            (data->args.K % kDecGroupSizeK != 0);
+        build_group_major_index(data->active_row_groups, group_count,
+            data->group_offsets, data->group_row_group_indices);
+        data->use_int64_scalar = data->route.route == DecWeightRoute::Dense &&
+            data->route.scales.scalar_mode;
+        data->use_int64_channel_direct = data->route.route == DecWeightRoute::Q8ChannelDirect;
+        data->use_int64_channel_sidecar = data->route.route == DecWeightRoute::Q8ChannelSidecar;
+        data->use_int64_h1 = data->route.route == DecWeightRoute::Q8H1;
+        data->use_int64_block = !data->use_int64_h1 && !data->route.scales.scalar_mode &&
+            !data->route.scales.row_header_mode && !data->route.scales.channel_mode &&
+            (data->route.route == DecWeightRoute::Dense || data->route.route == DecWeightRoute::Q8H2 ||
+             data->route.route == DecWeightRoute::Q8HP1 || data->route.route == DecWeightRoute::Q8HP2);
+        if (!data->use_int64_scalar && !data->use_int64_channel_direct &&
+            !data->use_int64_channel_sidecar && !data->use_int64_h1 && !data->use_int64_block)
+            return DecStatus::unsupported;
+
+        const bool group_supported = data->use_int64_scalar || data->use_int64_h1;
+        size_t active_row_k_pairs = 0;
+        bool first = true;
+        uint32_t previous_row = 0;
+        uint32_t previous_k = 0;
+        for (const ResidualGroupEntry &entry : data->residual_entries) {
+            if (first || entry.row != previous_row || entry.k != previous_k)
+                ++active_row_k_pairs;
+            first = false;
+            previous_row = entry.row;
+            previous_k = entry.k;
+        }
+        data->result.active_row_k_pairs = active_row_k_pairs;
+        const double rows_per_active_k_mean = unique_k.empty() ? 0.0 :
+            static_cast<double>(active_row_k_pairs) / unique_k.size();
+        const size_t estimated_plan_bytes = estimate_group_k_csc_plan_bytes(
+            group_count, data->residual_entries.size(), data->active_row_groups.size());
+        const size_t saved_weight_bytes = estimate_group_k_csc_saved_weight_bytes(
+            data->result.logical_weight_reference_count, unique_k.size(), data->args.J);
+        const bool common = (data->use_int64_scalar || data->use_int64_h1) &&
+            data->args.I > 1 && data->args.J >= 8 && rows_per_active_k_mean >= 16.0 &&
+            saved_weight_bytes > estimated_plan_bytes;
+        const char *disable_group_k_csc = std::getenv("DEC_GROUP_K_CSC_DISABLE");
+        const bool disabled = dispatch_override == DispatchOverride::row_direct ||
+            (disable_group_k_csc && disable_group_k_csc[0] == '1' &&
+             disable_group_k_csc[1] == '\0');
+        const char *enable_group_k_csc = std::getenv("DEC_GROUP_K_CSC_ENABLE");
+        const char *force_group_k_csc = std::getenv("DEC_GROUP_K_CSC_FORCE");
+        const bool overridden = data->args.I > 1 &&
+            (dispatch_override == DispatchOverride::group_k_csc ||
+             (enable_group_k_csc && enable_group_k_csc[0] == '1' &&
+              enable_group_k_csc[1] == '\0') ||
+             (force_group_k_csc && force_group_k_csc[0] == '1' &&
+              force_group_k_csc[1] == '\0'));
+        data->use_group_k_csc = !data->residual_entries.empty() && !disabled &&
+            group_supported && (overridden || common);
+        data->nr = data->use_group_k_csc ? (data->args.J < 8 ? 4 : 8) : 1;
+        if (data->use_group_k_csc) {
+            if (!build_group_k_csc_plan(data->residual_entries, data->active_row_groups,
+                    data->group_offsets, data->group_row_group_indices, group_count,
+                    data->group_k_csc_plan))
+                return DecStatus::unsupported;
+            data->counters.group_k_csc_plan_build_count = 1;
+            data->result.group_k_csc_plan_bytes = group_k_csc_plan_logical_bytes(
+                data->group_k_csc_plan);
+        }
+
+        const size_t native_scale_group = data->use_int64_h1 && !data->route.native_weight_blocks &&
+            data->args.stripe_J > 1 ? data->args.stripe_J : 1;
+        const size_t gcd = std::gcd(data->nr, native_scale_group);
+        if (data->nr > std::numeric_limits<size_t>::max() / (native_scale_group / gcd))
+            return DecStatus::invalid_arguments;
+        const size_t alignment = data->nr * (native_scale_group / gcd);
+        const size_t units = data->args.J / alignment + (data->args.J % alignment != 0);
+        const size_t shard_count = std::min(requested_shards, units);
+        data->ranges.reserve(shard_count);
+        const size_t base_units = units / shard_count;
+        const size_t extra_units = units % shard_count;
+        size_t begin = 0;
+        size_t end_unit = 0;
+        for (size_t shard = 0; shard < shard_count; ++shard) {
+            end_unit += base_units + (shard < extra_units ? 1 : 0);
+            size_t end = data->args.J;
+            if (shard + 1 != shard_count) {
+                if (end_unit > std::numeric_limits<size_t>::max() / alignment)
+                    return DecStatus::invalid_arguments;
+                end = end_unit * alignment;
+            }
+            data->ranges.push_back({ begin, end });
+            begin = end;
+        }
+        prepared = std::shared_ptr<const PreparedDecSlice>(new PreparedDecSlice(std::move(data)));
+        return DecStatus::success;
+    } catch (const std::bad_alloc &) {
+        return DecStatus::allocation_failure;
+    }
+}
+
+DecStatus execute_prepared_dec_shard(
+    const PreparedDecSlice &prepared,
+    size_t shard_index,
+    DecShardScratch &scratch,
+    float *ycom_output,
+    size_t ycom_stride)
+{
+    if (!prepared.data_)
+        return DecStatus::invalid_arguments;
+    const PreparedDecSlice::Data &data = *prepared.data_;
+    if (shard_index >= data.ranges.size())
+        return DecStatus::invalid_shard;
+    const DecColumnRange range = data.ranges[shard_index];
+    const size_t width = range.end - range.begin;
+    if (ycom_output != nullptr && ycom_stride != 0 && ycom_stride < data.args.J)
+        return DecStatus::invalid_arguments;
+
+    try {
+        ggml_gemmini_args_t local_args;
+        const DecStatus slice_status = slice_dec_columns(data.args, range.begin, range.end, local_args);
+        if (slice_status != DecStatus::success)
+            return slice_status;
+        DecRoutePlan local_route = data.route;
+        local_route.scales.rows = width;
+        size_t scale_offset = 0;
+        if (local_route.scales.data != nullptr) {
+            if (!checked_mul_size(range.begin, local_route.scales.cols, scale_offset))
+                return DecStatus::invalid_arguments;
+            local_route.scales.data += scale_offset;
+        }
+        if (data.args.I > std::numeric_limits<size_t>::max() / width)
+            return DecStatus::invalid_arguments;
+        scratch.ycom.assign(data.args.I * width, 0.0f);
+        scratch.result = data.result;
+        scratch.result.int_mac_count = saturating_mul_size(data.result.nnz, width);
+        scratch.result.logical_weight_reference_count = scratch.result.int_mac_count;
+        scratch.internal_thread_count = 1;
+        const float *activation_scales = data.activation_scales.empty() ? nullptr :
+            data.activation_scales.data();
+        GroupKCSCScalarStats group_stats;
+        bool accumulated = true;
+        {
+            ExternalDecShardGuard guard;
+            if (data.use_group_k_csc) {
+                accumulated = data.use_int64_h1 ?
+                    (data.nr == 4 ? accumulate_to_ycom_int64_h1_group_k_csc_nr4(
+                        local_args, local_route, data.args.I, width, activation_scales,
+                        data.residual_entries, data.group_k_csc_plan, scratch.ycom.data(), group_stats) :
+                        accumulate_to_ycom_int64_h1_group_k_csc_nr8(
+                        local_args, local_route, data.args.I, width, activation_scales,
+                        data.residual_entries, data.group_k_csc_plan, scratch.ycom.data(), group_stats)) :
+                    (data.nr == 4 ? accumulate_to_ycom_int32_mixed_group_k_csc_nr4(
+                        local_args, local_route, data.args.I, width, activation_scales,
+                        data.residual_entries, data.group_k_csc_plan, scratch.ycom.data(), group_stats) :
+                        accumulate_to_ycom_int32_mixed_group_k_csc_nr8(
+                        local_args, local_route, data.args.I, width, activation_scales,
+                        data.residual_entries, data.group_k_csc_plan, scratch.ycom.data(), group_stats));
+            } else if (!data.residual_entries.empty()) {
+                if (data.use_int64_scalar)
+                    accumulate_to_ycom_int64_scalar(local_args, local_route, data.args.I, width,
+                        activation_scales, data.residual_entries, data.active_row_groups,
+                        data.group_offsets, data.group_row_group_indices, scratch.ycom.data());
+                else if (data.use_int64_channel_direct)
+                    accumulate_to_ycom_int64_channel_direct(local_args, local_route, data.args.I, width,
+                        activation_scales, data.residual_entries, data.active_row_groups,
+                        data.group_offsets, data.group_row_group_indices, scratch.ycom.data());
+                else if (data.use_int64_channel_sidecar)
+                    accumulate_to_ycom_int64_channel_sidecar(local_args, local_route, data.args.I, width,
+                        activation_scales, data.residual_entries, data.active_row_groups,
+                        data.group_offsets, data.group_row_group_indices, scratch.ycom.data());
+                else if (data.use_int64_h1)
+                    accumulate_to_ycom_int64_h1(local_args, local_route, data.args.I, width,
+                        activation_scales, data.residual_entries, data.active_row_groups,
+                        data.group_offsets, data.group_row_group_indices, scratch.ycom.data());
+                else if (data.use_int64_block)
+                    accumulate_to_ycom_int64_block(local_args, local_route, data.args.I, width,
+                        activation_scales, data.residual_entries, data.active_row_groups,
+                        data.group_offsets, data.group_row_group_indices, scratch.ycom.data());
+            }
+        }
+        if (!accumulated)
+            return DecStatus::execution_failed;
+        if (data.use_group_k_csc) {
+            scratch.result.weight_scalar_load_count = group_stats.weight_scalar_load_count;
+            scratch.result.weight_vector_load_count = group_stats.weight_vector_load_count;
+            scratch.result.thread_scratch_bytes = group_stats.thread_scratch_bytes;
+        }
+        if (ycom_output != nullptr) {
+            const size_t stride = ycom_stride == 0 ? data.args.J : ycom_stride;
+            size_t last_row_offset = 0;
+            size_t output_end = 0;
+            if (data.args.I != 0 &&
+                (!checked_mul_size(data.args.I - 1, stride, last_row_offset) ||
+                 !checked_add_size(last_row_offset, range.begin, output_end) ||
+                 !checked_add_size(output_end, width, output_end)))
+                return DecStatus::invalid_arguments;
+            for (size_t row = 0; row < data.args.I; ++row)
+                std::copy_n(scratch.ycom.data() + row * width, width,
+                    ycom_output + row * stride + range.begin);
+        } else {
+            apply_ycom_to_output(scratch.ycom.data(), data.args.I, width, local_args);
+        }
+        return DecStatus::success;
+    } catch (const std::bad_alloc &) {
+        return DecStatus::allocation_failure;
+    }
 }
 
 ActivationDECResult compensate_activation_dec(
@@ -953,20 +1415,35 @@ ActivationDECRowSliceStatus compensate_activation_dec_rows_columns(
     const size_t input_stride = args.sA ? args.sA : args.K;
     const size_t output_row_stride = args.stride_f_out ? args.stride_f_out : args.J;
     const size_t output_col_stride = args.col_stride_f_out ? args.col_stride_f_out : 1;
-    if (row_begin > std::numeric_limits<size_t>::max() / std::max(input_stride, output_row_stride) ||
-        col_begin > std::numeric_limits<size_t>::max() / output_col_stride)
+    size_t row_offset = 0;
+    size_t col_offset = 0;
+    size_t output_offset = 0;
+    size_t offset = 0;
+    if (!checked_mul_size(row_begin, input_stride, row_offset) ||
+        !checked_mul_size(row_begin, output_row_stride, offset) ||
+        !checked_mul_size(col_begin, output_col_stride, col_offset) ||
+        !checked_add_size(offset, col_offset, output_offset))
         return ActivationDECRowSliceStatus::invalid_arguments;
 
     const size_t width = col_end - col_begin;
     ggml_gemmini_args_t local_args = args;
-    const size_t global_rows_per_tile = args.tile_I != 0 ? args.tile_I * DIM :
-        ((args.I + DIM - 1) / DIM) * DIM;
+    size_t global_rows_per_tile = 0;
+    if (args.tile_I != 0) {
+        if (!checked_mul_size(args.tile_I, DIM, global_rows_per_tile))
+            return ActivationDECRowSliceStatus::invalid_arguments;
+    } else {
+        if (!checked_add_size(args.I, DIM - 1, offset) ||
+            !checked_mul_size(offset / DIM, DIM, global_rows_per_tile))
+            return ActivationDECRowSliceStatus::invalid_arguments;
+    }
+    if (!checked_add_size(args.activation_row_offset, row_begin, offset))
+        return ActivationDECRowSliceStatus::invalid_arguments;
     local_args.tile_I = global_rows_per_tile / DIM;
     local_args.I = row_end - row_begin;
     local_args.J = width;
-    local_args.A += row_begin * input_stride;
-    local_args.f_out += row_begin * output_row_stride + col_begin * output_col_stride;
-    local_args.activation_row_offset += row_begin;
+    local_args.A += row_offset;
+    local_args.f_out += output_offset;
+    local_args.activation_row_offset = offset;
 
     const bool channel_direct = args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_channel;
     const bool jxk_layout = channel_direct ||
@@ -976,49 +1453,72 @@ ActivationDECRowSliceStatus compensate_activation_dec_rows_columns(
         args.q8_hp1_blocks != nullptr || args.q8_hp2_blocks != nullptr || args.c_b != nullptr;
 
     if (args.B != nullptr) {
+        const size_t weight_stride = channel_direct ? args.q8_channel_row_stride :
+            (jxk_layout ? (args.sB ? args.sB : args.K) : 1);
+        if (!checked_mul_size(col_begin, weight_stride, offset))
+            return ActivationDECRowSliceStatus::invalid_arguments;
         if (channel_direct)
             local_args.B = reinterpret_cast<elem_t *>(reinterpret_cast<uint8_t *>(args.B) +
-                col_begin * args.q8_channel_row_stride);
+                offset);
         else if (jxk_layout)
             local_args.B = reinterpret_cast<elem_t *>(reinterpret_cast<int8_t *>(args.B) +
-                col_begin * (args.sB ? args.sB : args.K));
+                offset);
         else
             local_args.B = reinterpret_cast<elem_t *>(reinterpret_cast<int8_t *>(args.B) + col_begin);
     }
-    if (args.B_blocks != nullptr && args.blocks_K != 0)
-        local_args.B_blocks = args.B_blocks + col_begin * args.blocks_K;
-    if (args.B_scales != nullptr && args.blocks_K != 0)
-        local_args.B_scales = args.B_scales + col_begin * args.blocks_K;
+    if (args.B_blocks != nullptr && args.blocks_K != 0) {
+        if (!checked_mul_size(col_begin, args.blocks_K, offset))
+            return ActivationDECRowSliceStatus::invalid_arguments;
+        local_args.B_blocks = args.B_blocks + offset;
+    }
+    if (args.B_scales != nullptr && args.blocks_K != 0) {
+        if (!checked_mul_size(col_begin, args.blocks_K, offset))
+            return ActivationDECRowSliceStatus::invalid_arguments;
+        local_args.B_scales = args.B_scales + offset;
+    }
     if (args.weight_channel_scales != nullptr)
         local_args.weight_channel_scales = args.weight_channel_scales + col_begin;
     local_args.weight_channel_scale_count = width;
 
     if (args.q8_channel_row_base != nullptr) {
-        local_args.q8_channel_row_base = args.q8_channel_row_base + col_begin * args.q8_channel_row_stride;
+        if (!checked_mul_size(col_begin, args.q8_channel_row_stride, offset))
+            return ActivationDECRowSliceStatus::invalid_arguments;
+        local_args.q8_channel_row_base = args.q8_channel_row_base + offset;
         local_args.q8_channel_row_count = width;
     }
     if (args.q8_h1_blocks != nullptr) {
-        local_args.q8_h1_blocks = args.q8_h1_blocks + col_begin * args.blocks_per_row;
+        if (!checked_mul_size(col_begin, args.blocks_per_row, offset) ||
+            !checked_mul_size(width, args.blocks_per_row, local_args.q8_h1_block_count))
+            return ActivationDECRowSliceStatus::invalid_arguments;
+        local_args.q8_h1_blocks = args.q8_h1_blocks + offset;
         local_args.q8_h1_rows = width;
-        local_args.q8_h1_block_count = width * args.blocks_per_row;
     }
     if (args.q8_h2_blocks != nullptr) {
-        local_args.q8_h2_blocks = args.q8_h2_blocks + col_begin * args.q8_h2_blocks_per_row;
+        if (!checked_mul_size(col_begin, args.q8_h2_blocks_per_row, offset) ||
+            !checked_mul_size(width, args.q8_h2_blocks_per_row, local_args.q8_h2_block_count))
+            return ActivationDECRowSliceStatus::invalid_arguments;
+        local_args.q8_h2_blocks = args.q8_h2_blocks + offset;
         local_args.q8_h2_blocks_per_row = args.q8_h2_blocks_per_row;
-        local_args.q8_h2_block_count = width * args.q8_h2_blocks_per_row;
     }
     if (args.q8_hp1_blocks != nullptr) {
-        local_args.q8_hp1_blocks = args.q8_hp1_blocks + col_begin * args.q8_hp1_blocks_per_row;
+        if (!checked_mul_size(col_begin, args.q8_hp1_blocks_per_row, offset) ||
+            !checked_mul_size(width, args.q8_hp1_blocks_per_row, local_args.q8_hp1_block_count))
+            return ActivationDECRowSliceStatus::invalid_arguments;
+        local_args.q8_hp1_blocks = args.q8_hp1_blocks + offset;
         local_args.q8_hp1_blocks_per_row = args.q8_hp1_blocks_per_row;
-        local_args.q8_hp1_block_count = width * args.q8_hp1_blocks_per_row;
     }
     if (args.q8_hp2_blocks != nullptr) {
-        local_args.q8_hp2_blocks = args.q8_hp2_blocks + col_begin * args.q8_hp2_blocks_per_row;
+        if (!checked_mul_size(col_begin, args.q8_hp2_blocks_per_row, offset) ||
+            !checked_mul_size(width, args.q8_hp2_blocks_per_row, local_args.q8_hp2_block_count))
+            return ActivationDECRowSliceStatus::invalid_arguments;
+        local_args.q8_hp2_blocks = args.q8_hp2_blocks + offset;
         local_args.q8_hp2_blocks_per_row = args.q8_hp2_blocks_per_row;
-        local_args.q8_hp2_block_count = width * args.q8_hp2_blocks_per_row;
     }
-    if (args.c_b != nullptr && args.blocks_per_row != 0)
-        local_args.c_b = args.c_b + col_begin * args.blocks_per_row;
+    if (args.c_b != nullptr && args.blocks_per_row != 0) {
+        if (!checked_mul_size(col_begin, args.blocks_per_row, offset))
+            return ActivationDECRowSliceStatus::invalid_arguments;
+        local_args.c_b = args.c_b + offset;
+    }
     if (args.s_rf != nullptr)
         local_args.s_rf = args.s_rf + col_begin;
     if (args.R != nullptr)

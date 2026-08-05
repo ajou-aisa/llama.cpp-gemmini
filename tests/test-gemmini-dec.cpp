@@ -908,6 +908,28 @@ bool run_unpacked_h1_tail_case(bool stripe_mode) {
     for (float value : output)
         ok = check(float_bits(value) == float_bits(expected),
                    stripe_mode ? "unpacked stripe H1 K/J tail bits" : "unpacked row H1 K/J tail bits") && ok;
+    std::fill(output.begin(), output.end(), 0.0f);
+    std::shared_ptr<const ggml::gemmini::quants::dec::PreparedDecSlice> prepared;
+    ok = check(ggml::gemmini::quants::dec::prepare_activation_dec_slice(
+                   {outliers.begin(), outliers.end()}, args, 0, 1, 99,
+                   ggml::gemmini::quants::dec::DispatchOverride::row_direct, prepared) ==
+                   ggml::gemmini::quants::dec::DecStatus::success && prepared != nullptr,
+               "unpacked H1 prepared DEC succeeds") && ok;
+    if (prepared) {
+        for (size_t shard = 0; shard < prepared->shard_count(); ++shard) {
+            const auto range = prepared->shard_range(shard);
+            if (stripe_mode && range.end != columns)
+                ok = check(range.end % stripe_width == 0,
+                           "unpacked H1 shard preserves native scale groups") && ok;
+            ggml::gemmini::quants::dec::DecShardScratch scratch;
+            ok = check(ggml::gemmini::quants::dec::execute_prepared_dec_shard(
+                           *prepared, shard, scratch) == ggml::gemmini::quants::dec::DecStatus::success,
+                       "unpacked H1 prepared shard executes") && ok;
+        }
+    }
+    for (float value : output)
+        ok = check(float_bits(value) == float_bits(expected),
+                   "unpacked H1 prepared shards preserve bits") && ok;
     return ok;
 }
 
@@ -2735,6 +2757,142 @@ bool test_thread_determinism() {
     return ok;
 }
 
+bool test_prepared_dec_shards() {
+    using namespace ggml::gemmini::quants::dec;
+    constexpr size_t rows = 20;
+    constexpr size_t cols = 19;
+    constexpr size_t depth = 33;
+    constexpr size_t output_stride = 43;
+    constexpr size_t output_col_stride = 2;
+
+    std::vector<int8_t> weights(depth * cols);
+    for (size_t k = 0; k < depth; ++k)
+        for (size_t j = 0; j < cols; ++j)
+            weights[k * cols + j] = static_cast<int8_t>((k * 5 + j * 3) % 17 - 8);
+    std::vector<ggml::gemmini::quants::QactOutlier> outliers;
+    for (size_t row = 0; row < rows; ++row) {
+        outliers.push_back({ static_cast<int32_t>(row), 0, static_cast<int32_t>(row + 1) });
+        outliers.push_back({ static_cast<int32_t>(row), 32, -2 });
+    }
+
+    bool ok = true;
+    for (const DispatchOverride dispatch : { DispatchOverride::row_direct,
+                                              DispatchOverride::group_k_csc }) {
+        std::vector<float> reference(rows * cols, 0.0f);
+        ggml_gemmini_args_t reference_args = dense_args(rows, cols, depth, weights, reference, 0.25f);
+        compensate_activation_dec(outliers, reference_args, "test", dispatch);
+
+        for (const size_t requested_shards : { size_t {1}, size_t {2}, size_t {3},
+                                                size_t {4}, size_t {99} }) {
+            std::vector<float> output(rows * output_stride, -99.0f);
+            for (size_t row = 0; row < rows; ++row)
+                for (size_t j = 0; j < cols; ++j)
+                    output[row * output_stride + j * output_col_stride] = 0.0f;
+            ggml_gemmini_args_t args = dense_args(rows, cols, depth, weights, output, 0.25f);
+            args.stride_f_out = output_stride;
+            args.col_stride_f_out = output_col_stride;
+
+            std::shared_ptr<const PreparedDecSlice> prepared;
+            const DecStatus prepare_status = prepare_activation_dec_slice(
+                outliers, args, 0, rows, requested_shards, dispatch, prepared);
+            ok = check(prepare_status == DecStatus::success && prepared != nullptr,
+                       "prepared DEC shard plan succeeds") && ok;
+            if (!prepared)
+                continue;
+            const DecPreparationCounters counters = prepared->preparation_counters();
+            ok = check(counters.route_plan_build_count == 1 &&
+                           counters.active_row_plan_build_count == 1 &&
+                           counters.group_k_csc_plan_build_count ==
+                               (dispatch == DispatchOverride::group_k_csc ? 1u : 0u),
+                       "prepared DEC builds immutable plans once") && ok;
+            const size_t expected_shards = std::min(requested_shards, (cols + prepared->nr() - 1) / prepared->nr());
+            ok = check(prepared->shard_count() == expected_shards,
+                       "prepared DEC shard count matches clamped request") && ok;
+
+            size_t covered = 0;
+            for (size_t shard = 0; shard < prepared->shard_count(); ++shard) {
+                const DecColumnRange range = prepared->shard_range(shard);
+                ok = check(range.begin == covered && range.begin < range.end && range.end <= cols,
+                           "prepared DEC shard ranges are ordered and disjoint") && ok;
+                if (range.end != cols && prepared->nr() > 1)
+                    ok = check(range.end % prepared->nr() == 0,
+                               "prepared DEC shard boundary is NR aligned") && ok;
+                covered = range.end;
+                DecShardScratch scratch;
+                ok = check(execute_prepared_dec_shard(*prepared, shard, scratch) == DecStatus::success &&
+                               scratch.internal_thread_count == 1,
+                           "prepared DEC shard executes without an internal team") && ok;
+            }
+            ok = check(covered == cols, "prepared DEC shards cover global J exactly once") && ok;
+            DecShardScratch invalid_scratch;
+            ok = check(execute_prepared_dec_shard(
+                           *prepared, prepared->shard_count(), invalid_scratch) == DecStatus::invalid_shard,
+                       "prepared DEC rejects an invalid shard explicitly") && ok;
+            for (size_t row = 0; row < rows; ++row) {
+                for (size_t j = 0; j < cols; ++j)
+                    ok = check(float_bits(output[row * output_stride + j * output_col_stride]) ==
+                                   float_bits(reference[row * cols + j]),
+                               "prepared DEC preserves output bits and strides") && ok;
+                for (size_t j = 0; j < output_stride; ++j)
+                    if (j % output_col_stride != 0 || j / output_col_stride >= cols)
+                        ok = check(output[row * output_stride + j] == -99.0f,
+                                   "prepared DEC preserves output padding") && ok;
+            }
+        }
+    }
+
+    std::vector<float> empty_output(rows * cols, 7.0f);
+    ggml_gemmini_args_t empty_args = dense_args(rows, cols, depth, weights, empty_output, 0.25f);
+    std::shared_ptr<const PreparedDecSlice> empty_prepared;
+    ok = check(prepare_activation_dec_slice({}, empty_args, 0, rows, 4,
+                   DispatchOverride::row_direct, empty_prepared) == DecStatus::success &&
+                   empty_prepared != nullptr,
+               "prepared DEC accepts an empty residual set") && ok;
+    if (empty_prepared)
+        for (size_t shard = 0; shard < empty_prepared->shard_count(); ++shard) {
+            DecShardScratch scratch;
+            ok = check(execute_prepared_dec_shard(*empty_prepared, shard, scratch) == DecStatus::success,
+                       "empty prepared DEC shard is a no-op") && ok;
+        }
+    return check(std::all_of(empty_output.begin(), empty_output.end(),
+                             [](float value) { return value == 7.0f; }),
+                 "empty prepared DEC preserves output") && ok;
+}
+
+bool test_global_column_arithmetic_rejects_overflow() {
+    using namespace ggml::gemmini::quants::dec;
+    const size_t max_size = std::numeric_limits<size_t>::max();
+    std::vector<int8_t> activations(32, 0);
+    std::vector<int8_t> weights(32, 1);
+    std::vector<float> output(3, 0.0f);
+    bool ok = true;
+
+    ggml_gemmini_args_t dense = dense_args(1, 3, 32, weights, output, 1.0f);
+    dense.A = reinterpret_cast<elem_t *>(activations.data());
+    dense.transpose_B = true;
+    dense.sB = max_size / 2 + 1;
+    ok = check(compensate_activation_dec_rows_columns({}, dense, 0, 1, 2, 3, "test") ==
+                   ActivationDECRowSliceStatus::invalid_arguments,
+               "DEC rejects overflowing dense global-column offset") && ok;
+
+    block_q8_h1 block{};
+    ggml_gemmini_args_t h1{};
+    h1.I = 1;
+    h1.J = 3;
+    h1.K = 32;
+    h1.A = reinterpret_cast<elem_t *>(activations.data());
+    h1.f_out = output.data();
+    h1.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1;
+    h1.q8_h1_blocks = &block;
+    h1.q8_h1_block_count = 1;
+    h1.q8_h1_rows = 3;
+    h1.blocks_per_row = max_size / 2 + 1;
+    ok = check(compensate_activation_dec_rows_columns({}, h1, 0, 1, 2, 3, "test") ==
+                   ActivationDECRowSliceStatus::invalid_arguments,
+               "DEC rejects overflowing H1 global-column offset/count") && ok;
+    return ok;
+}
+
 bool test_inside_existing_openmp_region() {
 #if defined(GGML_GEMMINI_HAS_OPENMP)
     const char *previous = std::getenv("DEC_THREADS");
@@ -2775,7 +2933,8 @@ int main() {
         test_group_k_csc_mixed_int32_boundaries() &&
         test_group_k_csc_mixed_prefix_and_plan_rejects() &&
         test_group_k_csc_fallback_ratio_matrix() &&
-        test_thread_determinism() && test_inside_existing_openmp_region();
+        test_thread_determinism() && test_prepared_dec_shards() &&
+        test_global_column_arithmetic_rejects_overflow() && test_inside_existing_openmp_region();
     std::printf("gemmini DEC baseline: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
