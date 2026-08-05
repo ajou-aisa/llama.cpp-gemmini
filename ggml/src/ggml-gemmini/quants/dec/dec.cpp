@@ -104,9 +104,10 @@ namespace
         bool native_weight_blocks,
         size_t nnz)
     {
+        (void) native_weight_blocks;
         if (use_group_k_csc)
             return PreparedDecSelectedRoute::group_k_csc;
-        if (kH1SmallGroupFastpathEnabled && use_int64_h1 && native_weight_blocks)
+        if (kH1SmallGroupFastpathEnabled && use_int64_h1)
         {
             if (nnz == 1)
                 return PreparedDecSelectedRoute::h1_small_group_single;

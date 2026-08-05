@@ -18,6 +18,10 @@
 #define DEC_VALIDATION 0
 #endif
 
+#ifndef GGML_GEMMINI_DEC_H1_SMALL_GROUP_FASTPATH
+#define GGML_GEMMINI_DEC_H1_SMALL_GROUP_FASTPATH 1
+#endif
+
 #if defined(GGML_GEMMINI_HAS_OPENMP)
 #include <omp.h>
 #endif
@@ -673,11 +677,61 @@ namespace
                 for (size_t position = group_offsets[k_group]; position < group_offsets[k_group + 1]; ++position)
                 {
                     const ActiveRowGroup &group = groups[group_row_group_indices[position]];
-                    std::fill(accumulator.begin(), accumulator.begin() + width, int64_t {0});
-                    add_group_dot(entries, group.entry_begin, group.entry_end, jb, width, code_for, accumulator.data());
+                    const size_t group_nnz = group.entry_end - group.entry_begin;
+                    if (group_nnz == 0)
+                        continue;
+
                     const size_t row = group.row;
                     const float activation_scale = activation_scales ? activation_scales[row] : 1.0f;
                     float *output = Y_com + row * J + jb;
+#if GGML_GEMMINI_DEC_H1_SMALL_GROUP_FASTPATH
+                    if (group_nnz == 1)
+                    {
+                        const ResidualGroupEntry &entry = entries[group.entry_begin];
+                        for (size_t t = 0; t < width; ++t)
+                            output[t] += apply_h1_scale_ordered(
+                                static_cast<int64_t>(entry.residual) * code_for(jb + t, entry.k),
+                                scale_tile.c_eff[t],
+                                scale_tile.s_rf[t],
+                                activation_scale);
+                        continue;
+                    }
+
+                    if (group_nnz <= 4)
+                    {
+                        const ResidualGroupEntry &entry0 = entries[group.entry_begin];
+                        const ResidualGroupEntry *entry1 =
+                            group_nnz > 1 ? &entries[group.entry_begin + 1] : nullptr;
+                        const ResidualGroupEntry *entry2 =
+                            group_nnz > 2 ? &entries[group.entry_begin + 2] : nullptr;
+                        const ResidualGroupEntry *entry3 =
+                            group_nnz > 3 ? &entries[group.entry_begin + 3] : nullptr;
+                        for (size_t t = 0; t < width; ++t)
+                        {
+                            int64_t value =
+                                static_cast<int64_t>(entry0.residual) * code_for(jb + t, entry0.k);
+                            if (entry1)
+                                value += static_cast<int64_t>(entry1->residual) * code_for(jb + t, entry1->k);
+                            if (entry2)
+                                value += static_cast<int64_t>(entry2->residual) * code_for(jb + t, entry2->k);
+                            if (entry3)
+                                value += static_cast<int64_t>(entry3->residual) * code_for(jb + t, entry3->k);
+                            output[t] += apply_h1_scale_ordered(
+                                value, scale_tile.c_eff[t], scale_tile.s_rf[t], activation_scale);
+                        }
+                        continue;
+                    }
+#endif
+
+                    std::fill(accumulator.begin(), accumulator.begin() + width, int64_t {0});
+                    add_group_dot(
+                        entries,
+                        group.entry_begin,
+                        group.entry_end,
+                        jb,
+                        width,
+                        code_for,
+                        accumulator.data());
                     for (size_t t = 0; t < width; ++t)
                         output[t] += apply_h1_scale_ordered(
                             accumulator[t], scale_tile.c_eff[t], scale_tile.s_rf[t], activation_scale);

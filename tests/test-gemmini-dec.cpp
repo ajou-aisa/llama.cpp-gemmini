@@ -2982,7 +2982,8 @@ bool test_prepared_h1_small_group_fastpath() {
 
     return run_case(single_outlier, expected_single_route,
                     "prepared H1 single-outlier route matches build toggle",
-                    "prepared H1 single-outlier parity matches row-direct reference") &&
+                    "prepared H1 single-outlier parity matches row-direct reference",
+                    true) &&
         run_case(duplicate_tail_outliers, expected_multi_route,
                  "prepared H1 2-to-4 route matches build toggle",
                  "prepared H1 duplicate/tail parity matches row-direct reference",
