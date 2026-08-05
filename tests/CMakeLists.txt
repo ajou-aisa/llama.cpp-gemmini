@@ -247,6 +247,19 @@ target_include_directories(test-gemmini-dec PRIVATE
     ../ggml/src/ggml-gemmini/quants/dec)
 add_test(NAME test-gemmini-dec COMMAND $<TARGET_FILE:test-gemmini-dec>)
 
+add_executable(test-gemmini-matmul-options test-gemmini-matmul-options.cpp)
+target_compile_features(test-gemmini-matmul-options PRIVATE cxx_std_17)
+target_include_directories(test-gemmini-matmul-options PRIVATE
+    ../ggml/include
+    ../ggml/src
+    ../ggml/src/ggml-gemmini
+    ../ggml/src/ggml-gemmini-utils/include
+    ../ggml/src/ggml-gemmini/quants
+    ${GGML_GEMMINI_GENERATED_CONFIG_DIR}
+    ${GEMMINI_SW_PATH}
+    ${GEMMINI_SW_PATH}/include)
+add_test(NAME test-gemmini-matmul-options COMMAND $<TARGET_FILE:test-gemmini-matmul-options>)
+
 if (NOT GGML_BACKEND_DL)
     # The façade test uses C++ symbols from the statically linked backend.
     # Dynamic backends are MODULE libraries and cannot be linked into a test.

@@ -78,6 +78,7 @@ ggml_add_backend_library(ggml-gemmini
 
 target_compile_features(ggml-gemmini PRIVATE cxx_std_17)
 target_compile_definitions(ggml-gemmini PRIVATE
+  GGML_GEMMINI_MATMUL_IMPLEMENTATION
   GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE})
 
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
@@ -101,6 +102,7 @@ else()
 endif()
 
 target_include_directories(ggml-gemmini PUBLIC
+  ${GGML_GEMMINI_GENERATED_CONFIG_DIR}
   ${CMAKE_CURRENT_LIST_DIR}
   ${CMAKE_CURRENT_LIST_DIR}/../../include
   ${CMAKE_CURRENT_LIST_DIR}/../ggml-gemmini-utils/include

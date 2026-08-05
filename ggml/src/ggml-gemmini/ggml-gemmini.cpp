@@ -951,47 +951,33 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     std::vector<float> q8_channel_scales;
     std::unique_ptr<ggml::gemmini::MatmulStripeCollector> pipeline_collector;
     std::unique_ptr<ggml::gemmini::MatmulExecution> pipeline_execution;
-    const auto requested_invocation = [] {
-        const char *value = std::getenv("GEMMINI_MATMUL_INVOCATION");
-        return value != nullptr ? std::string_view(value) : std::string_view("full");
-    }();
-    const bool pipeline_requested = requested_invocation == "stripe-pipeline";
-    const bool sequential_requested = requested_invocation == "stripe-sequential";
-    const bool full_requested = requested_invocation.empty() || requested_invocation == "full";
-    if (!full_requested && !pipeline_requested && !sequential_requested) {
+    const auto matmul_resolution = ggml::gemmini::resolve_matmul_options();
+    if (!matmul_resolution.ok()) {
         ggml::gemmini::log::debug(layer,
-            "[matmul.invocation] status=invalid_invocation value=%.*s",
-            static_cast<int>(requested_invocation.size()), requested_invocation.data());
-        GGML_ABORT("Gemmini invalid_invocation: %.*s",
-            static_cast<int>(requested_invocation.size()), requested_invocation.data());
+            "[matmul.invocation] status=invalid_invocation error=%d",
+            static_cast<int>(matmul_resolution.error));
+        GGML_ABORT("Gemmini invalid matmul options");
     }
+    auto matmul_options = matmul_resolution.options;
+    matmul_options.profiling = LOG_DEBUG != 0 || LOG_CYCLE != 0;
+    const bool pipeline_requested =
+        matmul_options.mode == ggml::gemmini::MatmulInvocationMode::stripe_pipeline;
+    const bool sequential_requested =
+        matmul_options.mode == ggml::gemmini::MatmulInvocationMode::stripe_sequential;
+    const bool full_requested =
+        matmul_options.mode == ggml::gemmini::MatmulInvocationMode::full;
     constexpr bool exsia_pipeline_supported =
         ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA;
     const bool pipeline_enabled = pipeline_requested && exsia_pipeline_supported && I > 1;
     const bool sequential_enabled = sequential_requested;
-    const bool legacy_full_dispatch = [] {
-        const char *value = std::getenv("GEMMINI_LEGACY_FULL_DISPATCH");
-        return value != nullptr && std::string_view(value) == "1";
-    }();
-    const bool facade_full_dispatch = !pipeline_enabled && !sequential_enabled && !legacy_full_dispatch;
-    const size_t pipeline_job_capacity = [] {
-        constexpr size_t default_capacity = 2;
-        const char *value = std::getenv("GEMMINI_STRIPE_JOB_SLOTS");
-        if (value == nullptr || *value == '\0') {
-            return default_capacity;
-        }
-        const long requested = std::strtol(value, nullptr, 10);
-        return requested > 0 ? static_cast<size_t>(requested) : default_capacity;
-    }();
+    const bool legacy_full_dispatch = false;
+    const bool facade_full_dispatch = full_requested;
+    const size_t pipeline_job_capacity = matmul_options.job_capacity;
     if (pipeline_requested && !pipeline_enabled) {
-        if (I <= 1) {
-            ggml::gemmini::log::debug(layer,
-                "[matmul.pipeline] status=unsupported_invocation dispatch=row-direct/full stripe-pipeline requires I>1");
-        } else {
-            ggml::gemmini::log::debug(layer,
-                "[matmul.pipeline] status=unsupported_invocation dispatch=fatal stripe-pipeline requires EXSIA activation");
-            GGML_ABORT("Gemmini unsupported_invocation: stripe-pipeline requires EXSIA activation");
-        }
+        ggml::gemmini::log::debug(layer,
+            "[matmul.pipeline] status=unsupported_invocation dispatch=fatal reason=%s",
+            I <= 1 ? "stripe-pipeline requires I>1" : "stripe-pipeline requires EXSIA activation");
+        GGML_ABORT("Gemmini unsupported_invocation: stripe-pipeline requires I>1 and EXSIA activation");
     }
     if (sequential_enabled) {
         ggml::gemmini::log::debug(layer, "[matmul.sequential] enabled");
@@ -1449,18 +1435,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.stride_f_out = dst->nb[1] / sizeof(float);
 
     if (pipeline_enabled) {
-        ggml::gemmini::MatmulOptions pipeline_options{};
-        pipeline_options.mode = ggml::gemmini::MatmulInvocationMode::stripe_pipeline;
-        pipeline_options.job_capacity = pipeline_job_capacity;
-        pipeline_options.profiling = LOG_DEBUG != 0 || LOG_CYCLE != 0;
         ggml::gemmini::log::debug(layer, "[matmul.pipeline] job_slots=%zu", pipeline_job_capacity);
-        if (const char *rc_shards = std::getenv("GEMMINI_RC_SHARDS")) {
-            const int requested_shards = std::atoi(rc_shards);
-            if (requested_shards > 0)
-                pipeline_options.rc_shards = static_cast<size_t>(requested_shards);
-        }
         pipeline_execution = std::make_unique<ggml::gemmini::MatmulExecution>(
-            ggml::gemmini::prepare_execution(&args, pipeline_options));
+            ggml::gemmini::prepare_execution(&args, matmul_options));
         if (!pipeline_execution->status() || !pipeline_collector->start(*pipeline_execution)) {
             ggml::gemmini::log::debug(layer, "[matmul.pipeline] staged worker start failed");
             return;
@@ -1477,16 +1454,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     }
 
     if (sequential_enabled) {
-        ggml::gemmini::MatmulOptions sequential_options{};
-        sequential_options.mode = ggml::gemmini::MatmulInvocationMode::stripe_sequential;
-        sequential_options.stripe_rows = args.tile_I != 0 ? args.tile_I * DIM : args.I;
-        sequential_options.profiling = LOG_DEBUG != 0 || LOG_CYCLE != 0;
-        if (const char *rc_shards = std::getenv("GEMMINI_RC_SHARDS")) {
-            const int requested_shards = std::atoi(rc_shards);
-            if (requested_shards > 0)
-                sequential_options.rc_shards = static_cast<size_t>(requested_shards);
+        if (matmul_options.stripe_rows_auto) {
+            matmul_options.stripe_rows = args.tile_I != 0 ? args.tile_I * DIM : args.I;
         }
-        const auto sequential_status = ggml::gemmini::matmul(args, sequential_options);
+        const auto sequential_status = ggml::gemmini::matmul(args, matmul_options);
         if (!sequential_status) {
             ggml::gemmini::log::debug(layer,
                 "[matmul.sequential] status=%d message=%s",
