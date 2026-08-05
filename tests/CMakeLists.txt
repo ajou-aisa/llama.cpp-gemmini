@@ -263,6 +263,19 @@ if (NOT GGML_BACKEND_DL)
     target_compile_definitions(test-gemmini-matmul-options PRIVATE GGML_GEMMINI_OPTIONS_TEST_BACKEND=1)
 endif()
 add_test(NAME test-gemmini-matmul-options COMMAND $<TARGET_FILE:test-gemmini-matmul-options>)
+get_filename_component(LLAMA_TEST_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+if (EXISTS "${CMAKE_COMMAND}" AND EXISTS "${LLAMA_TEST_SOURCE_DIR}/CMakeLists.txt")
+    add_test(
+        NAME test-gemmini-build-contract
+        COMMAND ${CMAKE_COMMAND}
+            -DTEST_CMAKE_COMMAND=${CMAKE_COMMAND}
+            -DTEST_SOURCE_DIR=${LLAMA_TEST_SOURCE_DIR}
+            -DTEST_BINARY_ROOT=${CMAKE_CURRENT_BINARY_DIR}/gemmini-build-contract
+            -DTEST_GENERATOR=${CMAKE_GENERATOR}
+            -DTEST_GENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM}
+            -DTEST_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-build-contract.cmake)
+endif()
 
 if (NOT GGML_BACKEND_DL)
     # The façade test uses C++ symbols from the statically linked backend.

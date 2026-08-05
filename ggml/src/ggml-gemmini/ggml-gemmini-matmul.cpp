@@ -777,6 +777,10 @@ MatmulExecution::MatmulExecution()
     status_ = invalid_state("execution is not prepared");
 }
 
+MatmulExecution::MatmulExecution(MatmulStatus status)
+    : total_rows_(0), facade_(static_cast<ggml_gemmini_args_t *>(nullptr)), status_(status),
+      state_(status.ok() ? MatmulExecutionState::prepared : MatmulExecutionState::failed) {}
+
 MatmulExecution::MatmulExecution(MatmulExecution && other) noexcept
     : MatmulExecution() {
     *this = std::move(other);

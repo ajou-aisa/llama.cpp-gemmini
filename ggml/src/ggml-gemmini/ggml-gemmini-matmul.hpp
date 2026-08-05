@@ -508,17 +508,12 @@ private:
 class MatmulExecution {
 public:
     MatmulExecution();
+    explicit MatmulExecution(MatmulStatus status);
     MatmulExecution(const MatmulExecution &) = delete;
     MatmulExecution & operator=(const MatmulExecution &) = delete;
     MatmulExecution(MatmulExecution &&) noexcept;
     MatmulExecution & operator=(MatmulExecution &&) noexcept;
     ~MatmulExecution();
-
-#ifndef GGML_GEMMINI_MATMUL_IMPLEMENTATION
-    explicit MatmulExecution(MatmulStatus status)
-        : total_rows_(0), facade_(static_cast<ggml_gemmini_args_t *>(nullptr)), status_(status),
-          state_(status.ok() ? MatmulExecutionState::prepared : MatmulExecutionState::failed) {}
-#endif
 
     MatmulInvocationMode mode() const;
     MatmulExecutionState state() const;
