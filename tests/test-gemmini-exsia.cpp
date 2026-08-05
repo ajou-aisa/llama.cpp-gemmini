@@ -824,7 +824,8 @@ bool write_localstage_artifacts(const std::filesystem::path &evidence_dir,
                                          !result.validation_reference_aliases_production_qout;
     const bool supported_topology =
         (EXSIA_LOCAL_WORKER_COUNT == 3 || EXSIA_LOCAL_WORKER_COUNT == 4) &&
-        EXSIA_OMP_THREAD_COUNT == 5 &&
+        GGML_GEMMINI_EXSIA_SUPERBLOCKS == 4 &&
+        EXSIA_OMP_THREAD_COUNT == EXSIA_LOCAL_WORKER_COUNT + 1 &&
         EXSIA_PIPELINE_SLOT_COUNT == 2;
     const bool pass = result.bit_exact && result.artifact_mismatch_count == 0 &&
                         result.p3_branch_mismatch_count == 0 && nondeterministic_run_count == 0 &&
@@ -866,6 +867,7 @@ bool write_localstage_artifacts(const std::filesystem::path &evidence_dir,
                << ",\"zero_variance\":" << result.sigma_zero_variance_case_count
                << ",\"n_zero\":" << result.sigma_n_zero_case_count << "}"
                << ",\"supported_topology\":{\"workers\":" << EXSIA_LOCAL_WORKER_COUNT
+               << ",\"superblocks\":" << GGML_GEMMINI_EXSIA_SUPERBLOCKS
                << ",\"omp_threads\":" << EXSIA_OMP_THREAD_COUNT
                << ",\"pipeline_slots\":" << EXSIA_PIPELINE_SLOT_COUNT << "}}\n";
     std::ostringstream p3;

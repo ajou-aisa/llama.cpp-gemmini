@@ -15,7 +15,7 @@ function(mode_index mode out_var)
     set(${out_var} "${index}" PARENT_SCOPE)
 endfunction()
 
-function(run_configure_case name stripe pipeline mode local_workers expect_success)
+function(run_configure_case name stripe pipeline mode local_workers omp_threads expect_success)
     set(build_dir "${TEST_BINARY_ROOT}/${name}")
     file(REMOVE_RECURSE "${build_dir}")
     file(MAKE_DIRECTORY "${build_dir}")
@@ -27,6 +27,7 @@ function(run_configure_case name stripe pipeline mode local_workers expect_succe
         -DGGML_GEMMINI_ENABLE_STRIPE_PIPELINE=${pipeline}
         -DGGML_GEMMINI_DEFAULT_MATMUL_MODE=${mode}
         -DGGML_GEMMINI_EXSIA_LOCAL_WORKERS=${local_workers}
+        -DGGML_GEMMINI_EXSIA_OMP_THREADS_DEFAULT=${omp_threads}
         -DLLAMA_BUILD_TESTS=OFF)
     if (TEST_GENERATOR)
         list(APPEND cmake_args -G "${TEST_GENERATOR}")
@@ -61,6 +62,7 @@ function(run_configure_case name stripe pipeline mode local_workers expect_succe
         expect_contains("${cache_path}" "GGML_GEMMINI_ENABLE_STRIPE_PIPELINE:BOOL=${pipeline}")
         expect_contains("${cache_path}" "GGML_GEMMINI_DEFAULT_MATMUL_MODE:STRING=${mode}")
         expect_contains("${cache_path}" "GGML_GEMMINI_EXSIA_LOCAL_WORKERS:STRING=${local_workers}")
+        expect_contains("${cache_path}" "GGML_GEMMINI_EXSIA_OMP_THREADS_DEFAULT:STRING=${omp_threads}")
         if (stripe STREQUAL "ON")
             set(stripe_value 1)
         else()
@@ -81,6 +83,15 @@ function(run_configure_case name stripe pipeline mode local_workers expect_succe
     if (rc EQUAL 0)
         message(FATAL_ERROR "Expected configure failure for ${name}")
     endif()
+
+    if (ARGC GREATER 7)
+        string(CONCAT output "${stdout}" "\n" "${stderr}")
+        string(FIND "${output}" "${ARGV7}" failure_needle_at)
+        if (failure_needle_at EQUAL -1)
+            message(FATAL_ERROR
+                "Expected configure failure for ${name} to mention '${ARGV7}'\nstdout:\n${stdout}\nstderr:\n${stderr}")
+        endif()
+    endif()
 endfunction()
 
 if (NOT DEFINED TEST_CMAKE_COMMAND OR NOT EXISTS "${TEST_CMAKE_COMMAND}")
@@ -96,10 +107,12 @@ endif()
 file(REMOVE_RECURSE "${TEST_BINARY_ROOT}")
 file(MAKE_DIRECTORY "${TEST_BINARY_ROOT}")
 
-run_configure_case(full_with_features ON ON FULL 4 TRUE)
-run_configure_case(stripe_sequential_without_pipeline ON OFF STRIPE_SEQUENTIAL 4 TRUE)
-run_configure_case(stripe_pipeline_with_features ON ON STRIPE_PIPELINE 4 TRUE)
-run_configure_case(exsia_local_workers_three ON ON FULL 3 TRUE)
-run_configure_case(stripe_sequential_without_stripe OFF OFF STRIPE_SEQUENTIAL 4 FALSE)
-run_configure_case(stripe_pipeline_without_pipeline ON OFF STRIPE_PIPELINE 4 FALSE)
-run_configure_case(exsia_local_workers_two ON ON FULL 2 FALSE)
+run_configure_case(full_with_features ON ON FULL 4 5 TRUE)
+run_configure_case(stripe_sequential_without_pipeline ON OFF STRIPE_SEQUENTIAL 4 5 TRUE)
+run_configure_case(stripe_pipeline_with_features ON ON STRIPE_PIPELINE 4 5 TRUE)
+run_configure_case(exsia_local_workers_three ON ON FULL 3 4 TRUE)
+run_configure_case(stripe_sequential_without_stripe OFF OFF STRIPE_SEQUENTIAL 4 5 FALSE)
+run_configure_case(stripe_pipeline_without_pipeline ON OFF STRIPE_PIPELINE 4 5 FALSE)
+run_configure_case(exsia_local_workers_two ON ON FULL 2 3 FALSE)
+run_configure_case(exsia_omp_threads_mismatch ON ON FULL 3 5 FALSE
+    "GGML_GEMMINI_EXSIA_OMP_THREADS_DEFAULT must equal")
