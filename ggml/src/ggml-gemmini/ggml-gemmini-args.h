@@ -92,6 +92,7 @@ typedef struct ggml_gemmini_args_t {
     size_t sD = 0;
 
     size_t activation_row_offset = 0;
+    size_t activation_rows_per_stripe = 0;
 
     // scales, gemmini input val.
     scale_t scale_B = 1.f;

@@ -7,10 +7,13 @@
 #include <gemmini.h>
 
 #include <array>
+#include <cstdlib>
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <future>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -41,6 +44,7 @@ ggml_gemmini_args_t make_args(std::vector<elem_t> & activation,
     args.weight_i8_scale_active = true;
     args.weight_scale = 1.0f;
     args.tiled_matmul_type = CPU;
+    args.act_quant.storage().emplace<ggml::gemmini::quants::act::tensor::Meta>().scale = 1.0f;
     return args;
 }
 
@@ -48,6 +52,36 @@ bool same_output(const std::vector<float> & actual, const std::vector<float> & e
     return actual.size() == expected.size() &&
         std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)) == 0;
 }
+
+struct ScopedEnvVar {
+    explicit ScopedEnvVar(const char * name) : name_(name) {
+        if (const char * value = std::getenv(name_)) {
+            old_value_ = value;
+            had_value_ = true;
+        }
+    }
+
+    ~ScopedEnvVar() {
+        if (had_value_) {
+            setenv(name_, old_value_.c_str(), 1);
+        } else {
+            unsetenv(name_);
+        }
+    }
+
+    void set(const char * value) const {
+        setenv(name_, value, 1);
+    }
+
+    void clear() const {
+        unsetenv(name_);
+    }
+
+private:
+    const char * name_;
+    std::string old_value_;
+    bool had_value_ = false;
+};
 
 bool test_full_facade_status_and_output_match_legacy() {
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
@@ -57,7 +91,10 @@ bool test_full_facade_status_and_output_match_legacy() {
     ggml_gemmini_args_t legacy_args = make_args(activation, weights, legacy_output);
     ggml_gemmini_args_t facade_args = make_args(activation, weights, facade_output);
 
-    ggml::gemmini::tiled_matmul_auto_im2p(&legacy_args);
+    ggml::gemmini::tiled_matmul_auto_baseline(
+        &legacy_args,
+        ggml::gemmini::baseline_activation_quant_t::TENSOR,
+        ggml::gemmini::baseline_weight_quant_t::TENSOR);
     ggml::gemmini::MatMul facade(facade_args);
     const auto result = facade.run_full();
 
@@ -225,7 +262,12 @@ bool test_j131_tail_stripe_parity() {
 
     auto stripe_args = full_args;
     stripe_args.f_out = stripe_output.data();
-    const auto full_result = matmul(full_args);
+    MatmulOptions stripe_options{};
+    stripe_options.mode = MatmulInvocationMode::stripe_sequential;
+    stripe_options.stripe_rows = 1;
+    MatmulOptions full_options{};
+    full_options.mode = MatmulInvocationMode::full;
+    const auto full_result = matmul(full_args, full_options);
     MatmulOptions options{};
     options.mode = MatmulInvocationMode::stripe_sequential;
     options.stripe_rows = 63;
@@ -271,7 +313,9 @@ bool test_fp32_shape_and_stride_matrix() {
 
                 auto stripe_args = full_args;
                 stripe_args.f_out = stripe_output.data();
-                const auto full_status = matmul(full_args);
+                MatmulOptions full_options{};
+                full_options.mode = MatmulInvocationMode::full;
+                const auto full_status = matmul(full_args, full_options);
                 MatmulOptions options{};
                 options.mode = MatmulInvocationMode::stripe_sequential;
                 options.stripe_rows = 63;
@@ -348,6 +392,15 @@ bool test_live_pipeline_multistripe_matches_full() {
             static_cast<unsigned long long>(profile.rc_start_ns),
             static_cast<unsigned long long>(profile.rc_end_ns), profile.rc_shards);
     }
+    if (!same_output(pipeline_output, full_output)) {
+        for (size_t i = 0; i < pipeline_output.size(); ++i) {
+            if (pipeline_output[i] != full_output[i]) {
+                std::fprintf(stderr, "mismatch i=%zu row=%zu pipeline=%g full=%g\n",
+                             i, i / columns, pipeline_output[i], full_output[i]);
+                break;
+            }
+        }
+    }
     return check(captured, "multistripe ready events") &&
         check(collector_status.ok(), "multistripe collector finish") &&
         check(execution_status.ok(), "multistripe execution finish") &&
@@ -403,6 +456,7 @@ bool test_native_and_channel_full_facade_parity() {
     h1_args.blocks_J = columns;
     h1_args.block_size_k = QK8_0;
     h1_args.tiled_matmul_type = CPU;
+    h1_args.act_quant.storage().emplace<ggml::gemmini::quants::act::tensor::Meta>().scale = 1.0f;
     auto h1_facade_args = h1_args;
     h1_facade_args.f_out = h1_facade.data();
     ggml::gemmini::tiled_matmul_auto_im2p(&h1_args);
@@ -430,6 +484,7 @@ bool test_native_and_channel_full_facade_parity() {
     hp1_args.q8_hp1_block_count = hp1_blocks.size();
     hp1_args.q8_hp1_blocks_per_row = 1;
     hp1_args.tiled_matmul_type = CPU;
+    hp1_args.act_quant.storage().emplace<ggml::gemmini::quants::act::tensor::Meta>().scale = 1.0f;
     auto hp1_facade_args = hp1_args;
     hp1_facade_args.f_out = hp1_facade.data();
     ggml::gemmini::tiled_matmul_auto_im2p(&hp1_args);
@@ -577,11 +632,13 @@ bool test_full_and_stripe_sequential_outputs_match() {
     std::vector<float> stripe_output(6, 0.0f);
     auto full_args = make_args(activation, weights, full_output);
     auto stripe_args = make_args(activation, weights, stripe_output);
+    MatmulOptions full_options{};
+    full_options.mode = MatmulInvocationMode::full;
     MatmulOptions stripe_options{};
     stripe_options.mode = MatmulInvocationMode::stripe_sequential;
     stripe_options.stripe_rows = 1;
     stripe_options.rc_shards = 2;
-    return check(matmul(full_args).ok(), "full public matmul") &&
+    return check(matmul(full_args, full_options).ok(), "full public matmul") &&
         check(matmul(stripe_args, stripe_options).ok(), "stripe sequential public matmul") &&
         check(same_output(full_output, stripe_output), "full and stripe sequential output differs");
 }
@@ -693,7 +750,9 @@ bool test_empty_tail_and_malformed_stripe_status() {
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
     std::vector<float> output(6, 0.0f);
-    ggml::gemmini::MatMul facade(make_args(activation, weights, output));
+    auto args = make_args(activation, weights, output);
+    args.act_quant.storage().emplace<ggml::gemmini::quants::act::tensor::Meta>().scale = 1.0f;
+    ggml::gemmini::MatMul facade(args);
 
     return check(facade.begin_stripes() == ggml::gemmini::MatMulStatus::success, "begin empty stripes") &&
         check(facade.finish_stripes() == ggml::gemmini::MatMulStatus::empty_stripes, "empty stripes") &&
@@ -707,7 +766,9 @@ bool test_duplicate_and_overlap_stripe_status() {
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
     std::vector<float> output(6, 0.0f);
-    ggml::gemmini::MatMul facade(make_args(activation, weights, output));
+    auto args = make_args(activation, weights, output);
+    args.act_quant.storage().emplace<ggml::gemmini::quants::act::tensor::Meta>().scale = 1.0f;
+    ggml::gemmini::MatMul facade(args);
 
     return check(facade.begin_stripes() == ggml::gemmini::MatMulStatus::success, "begin duplicate stripes") &&
         check(facade.run_stripe({ 0, 2 }) == ggml::gemmini::MatMulStatus::success, "first stripe") &&
@@ -750,7 +811,9 @@ bool test_stripe_state_lifecycle() {
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
     std::vector<float> output(6, 0.0f);
-    ggml::gemmini::MatMul facade(make_args(activation, weights, output));
+    auto args = make_args(activation, weights, output);
+    args.act_quant.storage().emplace<ggml::gemmini::quants::act::tensor::Meta>().scale = 1.0f;
+    ggml::gemmini::MatMul facade(args);
 
     return check(facade.state() == ggml::gemmini::MatMulState::idle, "initial stripe state") &&
         check(facade.begin_stripes() == ggml::gemmini::MatMulStatus::success, "begin stripe state") &&
@@ -809,21 +872,33 @@ bool test_public_contract_shape() {
     std::vector<elem_t> validation_weights = { 1, -1, 2, 3 };
     std::vector<float> validation_output(6, 0.0f);
     MatmulOptions validation_options{};
+    validation_options.mode = MatmulInvocationMode::full;
     validation_options.validation = true;
-    const auto validation_status = matmul(
-        make_args(validation_activation, validation_weights, validation_output), validation_options);
+    auto validation_args = make_args(validation_activation, validation_weights, validation_output);
+    validation_args.act_quant.storage().emplace<quants::act::tensor::Meta>().scale = 1.0f;
+    const auto validation_status = matmul(validation_args, validation_options);
     MatmulOptions too_many_dense_threads{};
     too_many_dense_threads.dense_threads = 2;
-    auto dense_thread_execution = prepare_execution(
-        make_args(validation_activation, validation_weights, validation_output), too_many_dense_threads);
+    auto dense_thread_args = make_args(validation_activation, validation_weights, validation_output);
+    dense_thread_args.act_quant.storage().emplace<quants::act::tensor::Meta>().scale = 1.0f;
+    auto dense_thread_execution = prepare_execution(dense_thread_args, too_many_dense_threads);
     MatmulOptions staged_options{};
     staged_options.mode = MatmulInvocationMode::stripe_sequential;
     MatmulExecution staged_execution;
     auto staged_args = make_args(validation_activation, validation_weights, validation_output);
+    staged_args.act_quant.storage().emplace<quants::act::tensor::Meta>().scale = 1.0f;
     const auto staged_prepare = prepare_execution(staged_args, staged_options, staged_execution);
     MatmulStripeJob staged_job;
     const auto staged_capture = capture_stripe(staged_execution, MatmulStripeInput(0, 1), staged_job);
-    return check(defaults.job_capacity == 4, "default job capacity") &&
+    const bool staged_contract = config::ENABLE_STRIPE_MATMUL
+        ? check(staged_prepare.ok() && staged_execution.state() == MatmulExecutionState::running,
+                "output-parameter prepare execution") &&
+              check(staged_capture.ok() && staged_job.status().ok(),
+                    "output-parameter capture stripe")
+        : check(staged_prepare.code == MatmulStatusCode::invalid_argument,
+                "disabled stripe prepare rejected as invalid options");
+    return check(resolve_matmul_options(defaults).options.job_capacity == 2,
+                 "configured default job capacity") &&
         check(statuses[0].ok(), "success status ok") &&
         check(!statuses[1].ok(), "failure status not ok") &&
         check(std::string_view(statuses[2].message) == "invalid contract", "status message") &&
@@ -834,10 +909,7 @@ bool test_public_contract_shape() {
         check(validation_status.ok(), "validation-enabled full matmul") &&
         check(dense_thread_execution.status().code == MatmulStatusCode::unsupported_invocation,
               "multi-owner dense lane rejection") &&
-        check(staged_prepare.ok() && staged_execution.state() == MatmulExecutionState::running,
-              "output-parameter prepare execution") &&
-        check(staged_capture.ok() && staged_job.status().ok(),
-              "output-parameter capture stripe") &&
+        staged_contract &&
         check(input.row_begin() == 1 && input.row_end() == 3 && input.stripe_id() == 7 &&
                   input.residual() == residual && input.residual_count() == 2,
               "stripe input metadata") &&
@@ -850,6 +922,165 @@ bool test_public_contract_shape() {
               "job metric storage");
 }
 
+bool test_matmul_option_resolution_precedence() {
+    using namespace ggml::gemmini;
+    ScopedEnvVar mode_env("GEMMINI_MATMUL_MODE");
+    ScopedEnvVar rows_env("GEMMINI_STRIPE_ROWS");
+    ScopedEnvVar shards_env("GEMMINI_RC_SHARDS");
+    ScopedEnvVar capacity_env("GEMMINI_STRIPE_JOB_CAPACITY");
+
+    const auto defaults = resolve_matmul_options({});
+    if (!check(defaults.ok(), "default matmul options resolve") ||
+        !check(defaults.options.mode == static_cast<MatmulInvocationMode>(config::DEFAULT_MATMUL_MODE),
+               "configured default matmul mode") ||
+        !check(defaults.options.stripe_rows_auto == !config::DEFAULT_STRIPE_ROWS.has_value(),
+               "configured default stripe-row mode") ||
+        !check(defaults.options.stripe_rows == config::DEFAULT_STRIPE_ROWS.value_or(1),
+               "configured default stripe rows") ||
+        !check(defaults.options.rc_shards == config::DEFAULT_RC_SHARDS,
+               "configured default rc shards") ||
+        !check(defaults.options.job_capacity == config::DEFAULT_STRIPE_JOB_CAPACITY,
+               "configured default job capacity")) {
+        return false;
+    }
+
+    constexpr auto environment_mode = config::ENABLE_STRIPE_PIPELINE
+        ? MatmulInvocationMode::stripe_pipeline
+        : config::ENABLE_STRIPE_MATMUL ? MatmulInvocationMode::stripe_sequential
+                                       : MatmulInvocationMode::full;
+    mode_env.set(config::ENABLE_STRIPE_PIPELINE
+                     ? "STRIPE_PIPELINE"
+                     : config::ENABLE_STRIPE_MATMUL ? "STRIPE_SEQUENTIAL" : "FULL");
+    rows_env.set("5");
+    shards_env.set("7");
+    capacity_env.set("9");
+
+    const auto env_resolution = resolve_matmul_options({});
+    if (config::ALLOW_RUNTIME_MATMUL_OVERRIDE) {
+        if (!check(env_resolution.ok(), "environment overrides resolve") ||
+            !check(env_resolution.options.mode == environment_mode,
+                   "environment matmul mode precedence") ||
+            !check(!env_resolution.options.stripe_rows_auto && env_resolution.options.stripe_rows == 5,
+                   "environment stripe rows precedence") ||
+            !check(env_resolution.options.rc_shards == 7, "environment rc shards precedence") ||
+            !check(env_resolution.options.job_capacity == 9, "environment job capacity precedence")) {
+            return false;
+        }
+    } else if (!check(env_resolution.ok(), "runtime-override-off ignores environment")) {
+        return false;
+    }
+
+    MatmulOptionOverrides explicit_options{};
+    explicit_options.mode = config::ENABLE_STRIPE_MATMUL
+        ? MatmulInvocationMode::stripe_sequential : MatmulInvocationMode::full;
+    explicit_options.stripe_rows = 3;
+    explicit_options.rc_shards = 4;
+    explicit_options.job_capacity = 2;
+    explicit_options.validation = true;
+    explicit_options.profiling = true;
+    const auto explicit_resolution = resolve_matmul_options(explicit_options);
+    if (!check(explicit_resolution.ok(), "explicit overrides resolve") ||
+        !check(explicit_resolution.options.mode == *explicit_options.mode,
+               "explicit mode precedence") ||
+        !check(!explicit_resolution.options.stripe_rows_auto &&
+                   explicit_resolution.options.stripe_rows == 3,
+               "explicit stripe-row precedence") ||
+        !check(explicit_resolution.options.rc_shards == 4, "explicit rc shard precedence") ||
+        !check(explicit_resolution.options.job_capacity == 2, "explicit job capacity precedence") ||
+        !check(explicit_resolution.options.validation && explicit_resolution.options.profiling,
+               "explicit flags preserved")) {
+        return false;
+    }
+
+    mode_env.set("NOT_A_VALID_MODE");
+    const auto invalid_env = resolve_matmul_options({});
+    if (config::ALLOW_RUNTIME_MATMUL_OVERRIDE) {
+    return check(invalid_env.error == MatmulOptionsError::invalid_mode,
+                     "invalid environment mode rejected");
+    }
+    return check(invalid_env.ok(), "disabled runtime override ignores invalid environment");
+}
+
+bool test_default_matmul_mode_executes_configured_backend_path() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> reference_output(6, 0.0f);
+    std::vector<float> default_output(6, 0.0f);
+
+    auto reference_args = make_args(activation, weights, reference_output);
+    reference_args.act_quant.storage().emplace<quants::act::tensor::Meta>().scale = 1.0f;
+    const auto reference_result = MatMul(reference_args).run_full();
+    if (!check(reference_result.status == MatMulStatus::success, "reference full execution")) {
+        return false;
+    }
+
+    auto default_args = make_args(activation, weights, default_output);
+    default_args.act_quant.storage().emplace<quants::act::tensor::Meta>().scale = 1.0f;
+    MatmulOptions default_options{};
+    auto execution = prepare_execution(default_args, default_options);
+    const auto expected_mode = static_cast<MatmulInvocationMode>(config::DEFAULT_MATMUL_MODE);
+    if (!check(execution.status().ok(), "default-mode execution prepared") ||
+        !check(execution.mode() == expected_mode, "default-mode resolution")) {
+        return false;
+    }
+
+    switch (execution.mode()) {
+    case MatmulInvocationMode::full: {
+        const auto status = execute_full(execution);
+        return check(status.ok(), "default full execution") &&
+            check(same_output(default_output, reference_output), "default full output parity") &&
+            check(finish_execution(execution).ok(), "default full finish");
+    }
+    case MatmulInvocationMode::stripe_sequential: {
+        auto job = capture_stripe(execution, { 0, default_args.I, 0 });
+        return check(job.status().ok(), "default sequential capture") &&
+            run_staged_job(job) &&
+            check(finish_execution(execution).ok(), "default sequential finish") &&
+            check(same_output(default_output, reference_output), "default sequential output parity");
+    }
+    case MatmulInvocationMode::stripe_pipeline: {
+        MatmulStripeCollector collector(2);
+        if (!check(collector.start(execution), "default pipeline collector start")) {
+            return false;
+        }
+        const auto * sink = collector.sink();
+        const bool captured = sink->on_ready(
+            sink->user_data, { 0, 0, default_args.I, nullptr, 0, 10, 20, 30, 50 });
+        const auto collector_status = collector.finish();
+        const auto execution_status = finish_execution(execution);
+        return check(captured, "default pipeline capture") &&
+            check(collector_status.ok(), "default pipeline collector finish") &&
+            check(execution_status.ok(), "default pipeline execution finish") &&
+            check(same_output(default_output, reference_output), "default pipeline output parity");
+    }
+    default:
+        return check(false, "unexpected configured matmul mode");
+    }
+}
+
+bool test_disabled_stripe_modes_are_rejected() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> output(6, 0.0f);
+    MatmulOptions options{};
+    bool passed = true;
+    if (!ggml::gemmini::config::ENABLE_STRIPE_MATMUL) {
+        options.mode = MatmulInvocationMode::stripe_sequential;
+        passed = check(prepare_execution(make_args(activation, weights, output), options).status().code ==
+                           MatmulStatusCode::invalid_argument,
+                       "disabled sequential stripe rejected as invalid options");
+    }
+    if (!config::ENABLE_STRIPE_PIPELINE) {
+        options.mode = MatmulInvocationMode::stripe_pipeline;
+        passed = check(prepare_execution(make_args(activation, weights, output), options).status().code ==
+                           MatmulStatusCode::invalid_argument,
+                       "disabled stripe pipeline rejected as invalid options") && passed;
+    }
+    return passed;
+}
+
 bool test_dispatch_override_contract() {
     using namespace ggml::gemmini;
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
@@ -858,20 +1089,28 @@ bool test_dispatch_override_contract() {
     std::vector<float> group_output(6, 0.0f);
 
     MatmulOptions row_options{};
+    row_options.mode = MatmulInvocationMode::full;
     row_options.force_row_direct = true;
-    auto row_execution = prepare_execution(make_args(activation, weights, row_output), row_options);
+    auto row_args = make_args(activation, weights, row_output);
+    row_args.act_quant.storage().emplace<quants::act::tensor::Meta>().scale = 1.0f;
+    auto row_execution = prepare_execution(row_args, row_options);
     const MatmulStatus row_status = execute_full(row_execution);
 
     MatmulOptions group_options{};
+    group_options.mode = MatmulInvocationMode::full;
     group_options.force_group_k_csc = true;
-    auto group_execution = prepare_execution(make_args(activation, weights, group_output), group_options);
+    auto group_args = make_args(activation, weights, group_output);
+    group_args.act_quant.storage().emplace<quants::act::tensor::Meta>().scale = 1.0f;
+    auto group_execution = prepare_execution(group_args, group_options);
     const MatmulStatus group_status = execute_full(group_execution);
 
     MatmulOptions conflicting_options{};
+    conflicting_options.mode = MatmulInvocationMode::full;
     conflicting_options.force_row_direct = true;
     conflicting_options.force_group_k_csc = true;
-    auto conflicting_execution = prepare_execution(
-        make_args(activation, weights, row_output), conflicting_options);
+    auto conflicting_args = make_args(activation, weights, row_output);
+    conflicting_args.act_quant.storage().emplace<quants::act::tensor::Meta>().scale = 1.0f;
+    auto conflicting_execution = prepare_execution(conflicting_args, conflicting_options);
 
     return check(row_status.ok(), "row-direct override status") &&
         check(group_status.ok(), "group-KCSC override status") &&
@@ -886,7 +1125,10 @@ bool test_route_capability_table() {
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
     std::vector<float> output(6, 0.0f);
     auto args = make_args(activation, weights, output);
-    if (!check(args.act_quant.kind() == quants::act::MetaKind::none, "empty activation kind")) {
+    args.act_quant.storage().emplace<quants::act::NoneMeta>();
+    if (!check(std::holds_alternative<quants::act::NoneMeta>(args.act_quant.storage()),
+               "NoneMeta storage") ||
+        !check(args.act_quant.kind() == quants::act::MetaKind::none, "NoneMeta activation kind")) {
         return false;
     }
     const auto key = detail::normalize_route(args);
@@ -960,7 +1202,9 @@ bool test_route_capability_table() {
                "Gemmini OS explicit unsupported capability")) {
         return false;
     }
-    const auto os_status = matmul(args);
+    MatmulOptions full_options{};
+    full_options.mode = MatmulInvocationMode::full;
+    const auto os_status = matmul(args, full_options);
     return check(os_status.code == MatmulStatusCode::unsupported_backend,
                  "Gemmini OS explicit unsupported status");
 }
@@ -1057,20 +1301,44 @@ bool test_invalid_activation_scale_is_explicit_contract_error() {
                  "invalid activation metadata propagates invalid_contract");
 }
 
-bool test_missing_activation_metadata_has_no_scale_fallback() {
+bool test_missing_activation_metadata_allows_dense_routes_and_fp32() {
     using namespace ggml::gemmini;
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
     std::vector<float> output(6, 0.0f);
-    auto args = make_args(activation, weights, output);
-    quants::act::ActivationMetadataView metadata(args, 0, args.I);
+    auto quantized_args = make_args(activation, weights, output);
+    quantized_args.act_quant.storage().emplace<quants::act::NoneMeta>();
+    quants::act::ActivationMetadataView metadata(quantized_args, 0, quantized_args.I);
     float scale = 0.0f;
+    MatmulOptions stripe_options{};
+    stripe_options.mode = MatmulInvocationMode::stripe_sequential;
+    stripe_options.stripe_rows = 1;
+    MatmulOptions full_options{};
+    full_options.mode = MatmulInvocationMode::full;
+    const std::vector<float> activation_fp32 = { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f };
+    const std::vector<float> weights_fp32 = { 1.0f, -1.0f, 2.0f, 3.0f };
+    std::vector<float> fp32_output(6, 0.0f);
+    ggml_gemmini_args_t fp32_args{};
+    fp32_args.I = 3;
+    fp32_args.J = 2;
+    fp32_args.K = 2;
+    fp32_args.A_fp32 = activation_fp32.data();
+    fp32_args.B_fp32 = weights_fp32.data();
+    fp32_args.sA = fp32_args.K;
+    fp32_args.sB = fp32_args.J;
+    fp32_args.f_out = fp32_output.data();
+    fp32_args.col_stride_f_out = 1;
+    fp32_args.stride_f_out = fp32_args.J;
+    fp32_args.tiled_matmul_type = CPU;
+    fp32_args.act_quant.storage().emplace<quants::act::NoneMeta>();
 
     return check(metadata.valid(), "FP32 metadata storage remains a valid route") &&
         check(!metadata.scale(0, scale), "missing activation metadata has no scale fallback") &&
-        check(quants::act::activation_scales(args, args.I).empty(),
+        check(quants::act::activation_scales(quantized_args, quantized_args.I).empty(),
               "missing activation metadata returns no scales") &&
-        check(matmul(args).ok(), "FP32 route does not require activation metadata");
+        check(matmul(quantized_args, stripe_options).code == MatmulStatusCode::invalid_contract,
+              "quantized stripe route rejects missing activation metadata") &&
+        check(matmul(fp32_args, full_options).ok(), "FP32 route does not require activation metadata");
 }
 
 bool test_copied_args_preserve_exsia_route_metadata() {
@@ -1143,13 +1411,17 @@ bool test_dense_residual_is_consumed_or_rejected() {
     options.mode = MatmulInvocationMode::stripe_sequential;
     options.rc_shards = 1;
 
-    auto empty_execution = prepare_execution(make_args(activation, weights, empty_output), options);
+    auto empty_args = make_args(activation, weights, empty_output);
+    empty_args.act_quant.storage().emplace<quants::act::tensor::Meta>().scale = 1.0f;
+    auto empty_execution = prepare_execution(empty_args, options);
     auto empty = capture_stripe(empty_execution, MatmulStripeInput(0, 1, 0));
     if (!check(empty.status().ok() && run_staged_job(empty), "empty residual stripe execution")) {
         return false;
     }
 
-    auto execution = prepare_execution(make_args(activation, weights, output), options);
+    auto args = make_args(activation, weights, output);
+    args.act_quant.storage().emplace<quants::act::tensor::Meta>().scale = 1.0f;
+    auto execution = prepare_execution(args, options);
     const int32_t residual[] = { 0, 2 };
     auto job = capture_stripe(execution, MatmulStripeInput(0, 1, 0, residual, 2));
     const bool residual_rejected =
@@ -1162,10 +1434,14 @@ bool test_dense_residual_is_consumed_or_rejected() {
         return false;
     }
 
-    auto malformed_execution = prepare_execution(make_args(activation, weights, output), options);
+    auto malformed_args = make_args(activation, weights, output);
+    malformed_args.act_quant.storage().emplace<quants::act::tensor::Meta>().scale = 1.0f;
+    auto malformed_execution = prepare_execution(malformed_args, options);
     auto malformed = capture_stripe(
         malformed_execution, MatmulStripeInput(0, 1, 0, residual, 1));
-    auto overflow_execution = prepare_execution(make_args(activation, weights, output), options);
+    auto overflow_args = make_args(activation, weights, output);
+    overflow_args.act_quant.storage().emplace<quants::act::tensor::Meta>().scale = 1.0f;
+    auto overflow_execution = prepare_execution(overflow_args, options);
     auto overflow = capture_stripe(
         overflow_execution, MatmulStripeInput(0, 1, 0, residual, 3));
     return check(malformed.status().code == MatmulStatusCode::invalid_argument,
@@ -1189,8 +1465,9 @@ bool test_non_exsia_pipeline_is_explicitly_unsupported() {
     meta.scales.assign(args.I, 1.0f);
     MatmulOptions options{};
     options.mode = MatmulInvocationMode::stripe_pipeline;
-    return check(prepare_execution(args, options).status().code ==
-                     MatmulStatusCode::unsupported_invocation,
+    const auto expected = config::ENABLE_STRIPE_PIPELINE
+        ? MatmulStatusCode::unsupported_invocation : MatmulStatusCode::invalid_argument;
+    return check(prepare_execution(args, options).status().code == expected,
                  "multi-row non-ExSIA strict pipeline unsupported");
 }
 
@@ -1212,11 +1489,11 @@ bool test_explicit_unsupported_route_statuses() {
     stripe_options.mode = MatmulInvocationMode::stripe_sequential;
     stripe_options.stripe_rows = 63;
 
+    auto & exsia = args.act_quant.storage().emplace<quants::act::exsia::Meta>();
+    exsia.theta = { -1, 0, 1 };
     args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h0;
     const auto q8_h0_status = matmul(args, stripe_options);
 
-    auto & exsia = args.act_quant.storage().emplace<quants::act::exsia::Meta>();
-    exsia.theta = { -1, 0, 1 };
     args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_channel;
     const auto q8_channel_direct = matmul(args, stripe_options);
 
@@ -1258,9 +1535,10 @@ bool test_bounded_pipeline_slots_and_reuse() {
     MatmulOptions options{};
     options.mode = MatmulInvocationMode::stripe_pipeline;
     options.job_capacity = 2;
-    options.rc_shards = 4;
     options.profiling = true;
-    auto execution = prepare_execution(make_args(activation, weights, output), options);
+    auto args = make_args(activation, weights, output);
+    args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0, 0 };
+    auto execution = prepare_execution(args, options);
     if (!check(execution.state() == MatmulExecutionState::prepared, "execution prepared state")) {
         return false;
     }
@@ -1277,15 +1555,28 @@ bool test_bounded_pipeline_slots_and_reuse() {
         return false;
     }
     auto tail = capture_stripe(execution, { 2, 3 });
+    const auto first_metrics = first.metrics();
+    const auto first_snapshot = first.snapshot();
+    if (!(first_metrics.handoff.count == 1 && first_metrics.ws.count == 1 &&
+          first_metrics.rc_prepare.count == 1 &&
+          first_metrics.rc_compute.count == first_snapshot.expected_shards &&
+          first_metrics.rc_finalize.count == 1)) {
+        std::fprintf(stderr, "pipeline metrics were handoff=%zu ws=%zu rc_prepare=%zu rc_compute=%zu rc_finalize=%zu\n",
+                     first_metrics.handoff.count, first_metrics.ws.count,
+                     first_metrics.rc_prepare.count, first_metrics.rc_compute.count,
+                     first_metrics.rc_finalize.count);
+    }
     const bool passed = run_staged_job(second) && run_staged_job(tail) &&
         check(finish_execution(execution).ok(), "pipeline finish") &&
         check(execution.state() == MatmulExecutionState::completed, "execution completed state") &&
         check(first.metrics().handoff.count == 1 && first.metrics().ws.count == 1 &&
                   first.metrics().rc_prepare.count == 1 &&
-                  first.metrics().rc_compute.count == first.snapshot().expected_shards &&
+                  first.metrics().rc_compute.count == first_snapshot.expected_shards &&
                   first.metrics().rc_finalize.count == 1,
               "pipeline metric counters");
     if (passed) {
+        std::printf("PASS contract: rc_compute=%zu expected_shards=%zu\n",
+                    first_metrics.rc_compute.count, first_snapshot.expected_shards);
         std::puts("PASS edge: pipeline=externally-staged capacity=2 backpressure=out_of_memory slot_reuse=yes");
     }
     return passed;
@@ -1301,7 +1592,9 @@ bool test_independent_branch_lifecycle() {
 
     const auto run_order = [&](bool dense_first) {
         std::vector<float> output(6, 0.0f);
-        auto execution = prepare_execution(make_args(activation, weights, output), options);
+        auto args = make_args(activation, weights, output);
+        args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0, 0 };
+        auto execution = prepare_execution(args, options);
         auto job = capture_stripe(execution, { 0, 1 });
         const auto run_compensation = [&]() {
             const size_t shards = job.snapshot().expected_shards;
@@ -1333,6 +1626,16 @@ bool test_independent_branch_lifecycle() {
             return false;
         }
         const auto snapshot = job.snapshot();
+        if (!(snapshot.status.ok() && snapshot.captured && snapshot.finalized && snapshot.released &&
+              snapshot.dense == MatmulDenseState::complete && snapshot.rc == MatmulRcState::complete &&
+              snapshot.expected_shards > 0 && snapshot.completed_shards == snapshot.expected_shards)) {
+            std::fprintf(stderr,
+                         "branch snapshot status=%u captured=%d finalized=%d released=%d dense=%u rc=%u expected=%zu completed=%zu\n",
+                         static_cast<unsigned>(snapshot.status.code), snapshot.captured, snapshot.finalized,
+                         snapshot.released, static_cast<unsigned>(snapshot.dense),
+                         static_cast<unsigned>(snapshot.rc), snapshot.expected_shards,
+                         snapshot.completed_shards);
+        }
         if (!check(snapshot.status.ok() && snapshot.captured && snapshot.finalized && snapshot.released &&
                        snapshot.dense == MatmulDenseState::complete &&
                        snapshot.rc == MatmulRcState::complete &&
@@ -1351,9 +1654,11 @@ bool test_independent_branch_lifecycle() {
         return false;
     }
 
-    for (size_t iteration = 0; iteration < 100; ++iteration) {
+    for (size_t iteration = 0; iteration < 1000; ++iteration) {
         std::vector<float> output(6, 0.0f);
-        auto execution = prepare_execution(make_args(activation, weights, output), options);
+        auto args = make_args(activation, weights, output);
+        args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0, 0 };
+        auto execution = prepare_execution(args, options);
         auto job = capture_stripe(execution, { 0, 3 });
         MatmulStatus dense_status;
         MatmulStatus rc_status;
@@ -1379,7 +1684,7 @@ bool test_independent_branch_lifecycle() {
             return false;
         }
     }
-    std::puts("PASS edge: dense-first=yes rc-first=yes random-delays=100 duplicate-finalize=invalid_state");
+    std::puts("PASS edge: dense-first=yes rc-first=yes random-delays=1000 duplicate-finalize=invalid_state");
     return true;
 }
 
@@ -1390,19 +1695,24 @@ bool test_staged_contract_errors() {
     std::vector<float> output(6, 0.0f);
     MatmulOptions options{};
     options.mode = MatmulInvocationMode::stripe_sequential;
+    const auto make_valid_args = [&] {
+        auto args = make_args(activation, weights, output);
+        args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0, 0 };
+        return args;
+    };
 
-    auto invalid_args = make_args(activation, weights, output);
+    auto invalid_args = make_valid_args();
     invalid_args.I = 0;
     if (!check(prepare_execution(&invalid_args, options).status().code == MatmulStatusCode::invalid_argument,
                "invalid stripe shape rejected")) {
         return false;
     }
 
-    auto null_residual_execution = prepare_execution(make_args(activation, weights, output), options);
+    auto null_residual_execution = prepare_execution(make_valid_args(), options);
     auto null_residual = capture_stripe(
         null_residual_execution,
         MatmulStripeInput(0, 1, 0, static_cast<const int32_t *>(nullptr), 1));
-    auto null_outlier_execution = prepare_execution(make_args(activation, weights, output), options);
+    auto null_outlier_execution = prepare_execution(make_valid_args(), options);
     auto null_outlier = capture_stripe(
         null_outlier_execution,
         MatmulStripeInput(0, 1, 0, static_cast<const quants::QactOutlier *>(nullptr), 1));
@@ -1413,14 +1723,14 @@ bool test_staged_contract_errors() {
         return false;
     }
 
-    auto order_execution = prepare_execution(make_args(activation, weights, output), options);
+    auto order_execution = prepare_execution(make_valid_args(), options);
     auto early = capture_stripe(order_execution, { 0, 1 });
     if (!check(finalize_stripe(early).code == MatmulStatusCode::invalid_state,
                "finalize before compensation")) {
         return false;
     }
 
-    auto contract_execution = prepare_execution(make_args(activation, weights, output), options);
+    auto contract_execution = prepare_execution(make_valid_args(), options);
     auto malformed = capture_stripe(contract_execution, { 1, 1 });
     auto first = capture_stripe(contract_execution, { 0, 1 });
     auto duplicate = capture_stripe(contract_execution, { 0, 1 });
@@ -1436,21 +1746,29 @@ bool test_staged_contract_errors() {
         return false;
     }
     auto tail = capture_stripe(contract_execution, { 2, 3 });
+    const auto pipeline_rejection = config::ENABLE_STRIPE_PIPELINE
+        ? MatmulStatusCode::unsupported_invocation : MatmulStatusCode::invalid_argument;
     const bool passed = run_staged_job(tail) &&
         check(finish_execution(contract_execution).code == MatmulStatusCode::invalid_contract,
               "missing stripe at finish") &&
         check(prepare_execution(
                   [&] {
-                      auto single_row = make_args(activation, weights, output);
+                      auto single_row = make_valid_args();
                       single_row.I = 1;
                       return single_row;
                   }(),
-                  { MatmulInvocationMode::stripe_pipeline }).status().code ==
-                  MatmulStatusCode::unsupported_invocation,
+                  [] {
+                      MatmulOptions options{};
+                      options.mode = MatmulInvocationMode::stripe_pipeline;
+                      return options;
+                  }()).status().code == pipeline_rejection,
               "single-row pipeline rejected") &&
-        check(matmul(make_args(activation, weights, output),
-                     { MatmulInvocationMode::stripe_pipeline }).code ==
-                  MatmulStatusCode::unsupported_invocation,
+        check(matmul(make_valid_args(),
+                     [] {
+                         MatmulOptions options{};
+                         options.mode = MatmulInvocationMode::stripe_pipeline;
+                         return options;
+                     }()).code == pipeline_rejection,
               "automatic pipeline is explicit unsupported invocation");
     if (passed) {
         std::puts("PASS edge: duplicate=invalid_contract overlap=invalid_contract missing=invalid_contract "
@@ -1467,20 +1785,25 @@ bool test_live_pipeline_worker() {
     MatmulOptions options{};
     options.mode = MatmulInvocationMode::stripe_pipeline;
     options.job_capacity = 2;
+    options.rc_shards = 4;
+    options.profiling = true;
     auto args = make_args(activation, weights, output);
     args.I = 6;
+    args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0, 0, 0, 0, 0 };
     auto execution = prepare_execution(args, options);
     MatmulStripeCollector collector(2);
     if (!check(execution.status().ok() && collector.start(execution), "live worker start")) {
         return false;
     }
     const auto * sink = collector.sink();
-    if (!check(sink->on_ready(sink->user_data, { 0, 0, 1, nullptr, 0, 10, 20, 30, 50, 40, 70 }), "live worker capture") ||
-        !check(sink->on_ready(sink->user_data, { 1, 1, 2, nullptr, 0, 11, 21, 31, 51, 41, 71 }), "live worker capture") ||
-        !check(sink->on_ready(sink->user_data, { 2, 2, 3, nullptr, 0, 12, 22, 32, 52, 42, 72 }), "live worker capture") ||
-        !check(sink->on_ready(sink->user_data, { 3, 3, 4, nullptr, 0, 13, 23, 33, 53, 43, 73 }), "live worker capture") ||
-        !check(sink->on_ready(sink->user_data, { 4, 4, 5, nullptr, 0, 14, 24, 34, 54, 44, 74 }), "live worker capture") ||
-        !check(sink->on_ready(sink->user_data, { 5, 5, 6, nullptr, 0, 15, 25, 35, 55, 45, 75 }), "live worker tail capture") ||
+    const quants::QactOutlier outliers[] = {
+        {0, 0, 2}, {1, 0, 2}, {2, 0, 2}, {3, 0, 2}, {4, 0, 2}, {5, 0, 2}};
+    if (!check(sink->on_ready(sink->user_data, { 0, 0, 1, &outliers[0], 1, 10, 20, 30, 50, 40, 70 }), "live worker capture") ||
+        !check(sink->on_ready(sink->user_data, { 1, 1, 2, &outliers[1], 1, 11, 21, 31, 51, 41, 71 }), "live worker capture") ||
+        !check(sink->on_ready(sink->user_data, { 2, 2, 3, &outliers[2], 1, 12, 22, 32, 52, 42, 72 }), "live worker capture") ||
+        !check(sink->on_ready(sink->user_data, { 3, 3, 4, &outliers[3], 1, 13, 23, 33, 53, 43, 73 }), "live worker capture") ||
+        !check(sink->on_ready(sink->user_data, { 4, 4, 5, &outliers[4], 1, 14, 24, 34, 54, 44, 74 }), "live worker capture") ||
+        !check(sink->on_ready(sink->user_data, { 5, 5, 6, &outliers[5], 1, 15, 25, 35, 55, 45, 75 }), "live worker tail capture") ||
         !check(collector.finish().ok(), "live worker finish") ||
         !check(collector.profiles().size() == 6, "live worker stripe profiles") ||
         !check(collector.profiles()[0].la_cycles == 10 && collector.profiles()[0].la3_cycles == 30 &&
@@ -1490,12 +1813,184 @@ bool test_live_pipeline_worker() {
                    collector.profiles()[0].rc_start_ns < collector.profiles()[0].rc_end_ns &&
                    collector.profiles()[0].rc_start_ns < collector.profiles()[0].ws_end_ns,
                "live worker stage intervals") ||
+        !check(collector.snapshot().rc_worker_starts == 2 &&
+                   collector.snapshot().rc_tasks_executed > collector.snapshot().rc_worker_starts &&
+                   collector.snapshot().max_active_rc_stripes == 1 &&
+                   collector.snapshot().max_rc_queue_depth > 0 &&
+                   collector.snapshot().max_rc_queue_depth <= collector.snapshot().rc_worker_capacity &&
+                   collector.snapshot().pending == 0 && collector.snapshot().in_flight == 0 &&
+                   collector.snapshot().rc_queue_depth == 0,
+               "RC workers persist across stripes") ||
+        !check(collector.profiles()[0].capture_copy.count == 1 &&
+                   collector.profiles()[0].producer_wait.count == 1 &&
+                   collector.profiles()[0].queue_insert.count == 1 &&
+                   collector.profiles()[0].sf_handoff.count == 1 &&
+                   collector.profiles()[0].ws_queue.count == 1 &&
+                   collector.profiles()[0].ws_service.count == 1 &&
+                   collector.profiles()[0].rc_queue.count == 1 &&
+                   collector.profiles()[0].rc_prepare.count == 1 &&
+                   collector.profiles()[0].rc_compute.count == 2 &&
+                   collector.profiles()[0].rc_finalize.count == 1 &&
+                   collector.profiles()[0].rc_wait.count == 1 &&
+                   collector.profiles()[0].rc_finalize.nanoseconds > 0 &&
+                   collector.profiles()[0].t_RC4.nanoseconds ==
+                       collector.profiles()[0].rc_prepare.nanoseconds +
+                           collector.profiles()[0].rc_compute.nanoseconds +
+                           collector.profiles()[0].rc_finalize.nanoseconds &&
+                   collector.profiles()[0].t_RC4.count == 1,
+               "pipeline stage and backpressure metrics") ||
         !check(finish_execution(execution).ok(), "live worker execution finish")) {
         return false;
     }
+    const auto profile = collector.profiles()[0];
+    std::printf("[matmul.stripe.stages] capture_copy_ns=%llu producer_wait_ns=%llu queue_insert_ns=%llu "
+                "sf_handoff_ns=%llu ws_queue_ns=%llu ws_service_ns=%llu rc_queue_ns=%llu "
+                "rc_prepare_ns=%llu rc_compute_ns=%llu rc_finalize_ns=%llu rc_wait_ns=%llu t_RC4_ns=%llu\n",
+                static_cast<unsigned long long>(profile.capture_copy.nanoseconds),
+                static_cast<unsigned long long>(profile.producer_wait.nanoseconds),
+                static_cast<unsigned long long>(profile.queue_insert.nanoseconds),
+                static_cast<unsigned long long>(profile.sf_handoff.nanoseconds),
+                static_cast<unsigned long long>(profile.ws_queue.nanoseconds),
+                static_cast<unsigned long long>(profile.ws_service.nanoseconds),
+                static_cast<unsigned long long>(profile.rc_queue.nanoseconds),
+                static_cast<unsigned long long>(profile.rc_prepare.nanoseconds),
+                static_cast<unsigned long long>(profile.rc_compute.nanoseconds),
+                static_cast<unsigned long long>(profile.rc_finalize.nanoseconds),
+                static_cast<unsigned long long>(profile.rc_wait.nanoseconds),
+                static_cast<unsigned long long>(profile.t_RC4.nanoseconds));
     std::puts("PASS edge: pipeline=live-worker capture->dense->rc->finish");
     return true;
 }
+
+bool test_live_worker_failed_capture_releases_collector_slot() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1, 2, 3, 4 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> output(4, 0.0f);
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_pipeline;
+    options.job_capacity = 1;
+    auto args = make_args(activation, weights, output);
+    args.I = 2;
+    args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0 };
+    auto execution = prepare_execution(args, options);
+    MatmulStripeCollector collector(1);
+    if (!check(execution.status().ok() && collector.start(execution),
+               "failed-capture live worker start")) {
+        return false;
+    }
+    const auto * sink = collector.sink();
+    const quants::QactOutlier outlier = { 0, 0, 2 };
+    const bool first_admitted = sink->on_ready(
+        sink->user_data, { 0, 0, 1, &outlier, 1 });
+    auto duplicate = std::async(std::launch::async, [sink] {
+        const quants::QactOutlier duplicate_outlier = { 1, 0, 2 };
+        return sink->on_ready(sink->user_data, { 0, 1, 2, &duplicate_outlier, 1 });
+    });
+    const bool duplicate_bounded = duplicate.wait_for(std::chrono::seconds(2)) ==
+        std::future_status::ready;
+    if (!duplicate_bounded) {
+        collector.cancel();
+    }
+    const bool duplicate_admitted = duplicate.get();
+    const auto finish = collector.finish();
+    const auto execution_finish = finish_execution(execution);
+
+    std::vector<float> replacement_output(4, 0.0f);
+    auto replacement_args = make_args(activation, weights, replacement_output);
+    replacement_args.I = 2;
+    replacement_args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0 };
+    auto replacement_execution = prepare_execution(replacement_args, options);
+    MatmulStripeCollector replacement(1);
+    const bool replacement_started = replacement.start(replacement_execution);
+    const auto * replacement_sink = replacement.sink();
+    const quants::QactOutlier replacement_outlier = { 0, 0, 2 };
+    const bool replacement_admitted = replacement_started && replacement_sink->on_ready(
+        replacement_sink->user_data, { 0, 0, 2, &replacement_outlier, 1 });
+    const bool replacement_finished = replacement_admitted && replacement.finish().ok() &&
+        finish_execution(replacement_execution).ok();
+
+    const bool passed =
+        check(first_admitted, "failed-capture first job admitted") &&
+        check(duplicate_bounded && duplicate_admitted, "failed capture admission is bounded") &&
+        check(finish.code == MatmulStatusCode::invalid_contract &&
+                  execution_finish.code == MatmulStatusCode::invalid_contract,
+              "failed capture status propagates") &&
+        check(collector.snapshot().in_flight == 0, "failed capture releases collector slot") &&
+        check(replacement_finished, "failed capture replacement capacity recovery");
+    if (passed) {
+        std::puts("PASS edge: failed-capture=duplicate-id bounded-finish=yes status-propagation=yes "
+                  "in-flight-zero=yes replacement-capacity-recovery=yes");
+    }
+    return passed;
+}
+
+bool test_malformed_event_wakes_blocked_producer() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1, 2, 3, 4 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> output(4, 0.0f);
+    auto args = make_args(activation, weights, output);
+    args.I = 2;
+    args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0 };
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_pipeline;
+    options.job_capacity = 1;
+    auto execution = prepare_execution(args, options);
+    MatmulStripeCollector collector(1);
+    collector.test_pause_dense_before_execute();
+    if (!check(execution.status().ok() && collector.start(execution),
+               "malformed-event blocked-producer start")) {
+        return false;
+    }
+    const auto * sink = collector.sink();
+    const quants::QactOutlier first_outlier = { 0, 0, 2 };
+    const bool first_admitted = sink->on_ready(
+        sink->user_data, { 0, 0, 1, &first_outlier, 1 });
+    const auto in_flight_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (collector.snapshot().in_flight != 1 &&
+           std::chrono::steady_clock::now() < in_flight_deadline) {
+        std::this_thread::yield();
+    }
+    auto blocked = std::async(std::launch::async, [sink] {
+        const quants::QactOutlier second_outlier = { 1, 0, 2 };
+        return sink->on_ready(sink->user_data, { 1, 1, 2, &second_outlier, 1 });
+    });
+    const bool producer_blocked = blocked.wait_for(std::chrono::milliseconds(20)) ==
+        std::future_status::timeout;
+    const bool malformed_rejected = !sink->on_ready(sink->user_data, { 2, 1, 1, nullptr, 0 });
+    const bool producer_woke = blocked.wait_for(std::chrono::seconds(2)) ==
+        std::future_status::ready;
+    if (!producer_woke) {
+        collector.cancel();
+    }
+    const bool blocked_rejected = !blocked.get();
+    const auto finish = collector.finish();
+    const auto execution_finish = finish_execution(execution);
+    const bool passed =
+        check(first_admitted && producer_blocked, "producer blocks at collector capacity") &&
+        check(malformed_rejected, "malformed producer event rejected") &&
+        check(producer_woke && blocked_rejected, "malformed event wakes blocked producer") &&
+        check(finish.code == MatmulStatusCode::invalid_argument &&
+                  execution_finish.code == MatmulStatusCode::invalid_argument,
+              "malformed event status propagates");
+    if (passed) {
+        std::puts("PASS edge: malformed-event=wakes-blocked-producer status-propagation=yes");
+    }
+    return passed;
+}
+
+#if defined(_OPENMP)
+bool test_live_pipeline_worker_from_openmp_region() {
+    bool passed = false;
+#pragma omp parallel num_threads(2) shared(passed)
+    {
+#pragma omp single
+        passed = test_live_pipeline_worker();
+    }
+    return check(passed, "live worker inside existing OpenMP region");
+}
+#endif
 
 bool run_captured_compensation(size_t shard_count, std::vector<float> & output) {
     using namespace ggml::gemmini;
@@ -1504,7 +1999,9 @@ bool run_captured_compensation(size_t shard_count, std::vector<float> & output) 
     MatmulOptions options{};
     options.mode = MatmulInvocationMode::stripe_sequential;
     options.rc_shards = shard_count;
-    auto execution = prepare_execution(make_args(activation, weights, output), options);
+    auto args = make_args(activation, weights, output);
+    args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0, 0 };
+    auto execution = prepare_execution(args, options);
     auto job = capture_stripe(execution, { 0, 3, 0 }, std::vector<quants::QactOutlier>{{ 0, 0, 2 }});
     if (!job.status().ok() || !prepare_compensation(job).ok() ||
         !execute_dense_stripe(job).ok())
@@ -1518,29 +2015,95 @@ bool run_captured_compensation(size_t shard_count, std::vector<float> & output) 
 
 bool test_compensation_shard_output_is_bitwise_stable() {
     std::vector<float> one(6, 0.0f);
-    std::vector<float> four(6, 0.0f);
-    const bool one_ok = run_captured_compensation(1, one);
-    const bool four_ok = run_captured_compensation(4, four);
-    if (one_ok && four_ok && !same_output(one, four)) {
-        std::fprintf(stderr, "one=%g,%g,%g,%g,%g,%g four=%g,%g,%g,%g,%g,%g\n",
-                     one[0], one[1], one[2], one[3], one[4], one[5],
-                     four[0], four[1], four[2], four[3], four[4], four[5]);
+    const std::array<size_t, 5> shard_counts{ 1, 2, 3, 4, 99 };
+    const bool one_ok = run_captured_compensation(shard_counts[0], one);
+    if (!one_ok) {
+        return check(false, "single compensation shard");
     }
-    return check(one_ok, "single compensation shard") &&
-        check(four_ok, "multi compensation shards") &&
-        check(same_output(one, four), "compensation shard output differs");
+    for (size_t i = 1; i < shard_counts.size(); ++i) {
+        std::vector<float> output(6, 0.0f);
+        if (!check(run_captured_compensation(shard_counts[i], output),
+                   "multi compensation shards")) {
+            return false;
+        }
+        if (!check(same_output(one, output), "compensation shard output differs")) {
+            std::fprintf(stderr, "baseline shards=%zu candidate shards=%zu\n",
+                         shard_counts[0], shard_counts[i]);
+            return false;
+        }
+    }
+    std::puts("PASS edge: captured-compensation shard-counts=1/2/3/4/99 stable");
+    return true;
 }
 
-bool run_live_worker_compensation(size_t shard_count, std::vector<float> & output) {
+bool test_compensation_shards_preserve_native_scale_groups() {
+    using namespace ggml::gemmini;
+    constexpr size_t columns = 129;
+    constexpr size_t depth = 65;
+    constexpr size_t blocks = 3;
+    constexpr size_t stripe_width = 17;
+    std::vector<elem_t> activation(depth, 1);
+    std::vector<int8_t> weights(columns * depth, 1);
+    std::vector<uint8_t> c_b(columns * blocks, 86);
+    std::vector<float> stripe_s_rf((columns + stripe_width - 1) / stripe_width,
+                                   0.00032747327350080013f);
+    std::vector<uint16_t> stripe_R(stripe_s_rf.size(), 4095);
+    std::vector<float> output(columns, 0.0f);
+
+    ggml_gemmini_args_t args{};
+    args.I = 1;
+    args.J = columns;
+    args.K = depth;
+    args.A = activation.data();
+    args.B = reinterpret_cast<elem_t *>(weights.data());
+    args.sA = depth;
+    args.sB = depth;
+    args.f_out = output.data();
+    args.stride_f_out = columns;
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_0_unpacked_to_h1;
+    args.c_b = c_b.data();
+    args.blocks_per_row = blocks;
+    args.blocks_K = blocks;
+    args.blocks_J = columns;
+    args.block_size_k = QK8_0;
+    args.stripe_J = stripe_width;
+    args.s_rf_stripe = stripe_s_rf.data();
+    args.R_stripe = stripe_R.data();
+    args.act_quant.storage().emplace<quants::act::tensor::Meta>();
+    args.tiled_matmul_type = CPU;
+
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_sequential;
+    options.rc_shards = 3;
+    auto execution = prepare_execution(args, options);
+    auto job = capture_stripe(execution, { 0, 1, 0 },
+                              std::vector<quants::QactOutlier>{{ 0, 64, 548339296 }});
+    if (!check(job.status().ok() && prepare_compensation(job).ok(),
+               "native-scale compensation preparation")) {
+        return false;
+    }
+    const size_t actual_shards = job.snapshot().expected_shards;
+    for (size_t shard = 0; shard < actual_shards; ++shard) {
+        if (!check(execute_compensation_shard(job, shard, actual_shards).ok(),
+                   "native-scale compensation shard")) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool run_live_worker_compensation(size_t shard_count, size_t capacity, std::vector<float> & output) {
     using namespace ggml::gemmini;
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
     MatmulOptions options{};
     options.mode = MatmulInvocationMode::stripe_pipeline;
-    options.job_capacity = 2;
+    options.job_capacity = capacity;
     options.rc_shards = shard_count;
-    auto execution = prepare_execution(make_args(activation, weights, output), options);
-    MatmulStripeCollector collector(2);
+    auto args = make_args(activation, weights, output);
+    args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0 };
+    auto execution = prepare_execution(args, options);
+    MatmulStripeCollector collector(capacity);
     if (!execution.status().ok() || !collector.start(execution)) {
         return false;
     }
@@ -1551,14 +2114,31 @@ bool run_live_worker_compensation(size_t shard_count, std::vector<float> & outpu
     return captured && collector.finish().ok() && finish_execution(execution).ok();
 }
 
-bool test_live_worker_parallel_compensation_is_bitwise_stable() {
-    std::vector<float> one(6, 0.0f);
-    std::vector<float> four(6, 0.0f);
-    const bool one_ok = run_live_worker_compensation(1, one);
-    const bool four_ok = run_live_worker_compensation(4, four);
-    return check(one_ok, "live single-shard compensation") &&
-        check(four_ok, "live parallel-shard compensation") &&
-        check(same_output(one, four), "live parallel compensation output differs");
+bool test_live_worker_serial_compensation_is_bitwise_stable() {
+    using namespace ggml::gemmini;
+    const std::array<size_t, 4> capacities{ 1, 2, 3, 4 };
+    const std::array<size_t, 5> shard_counts{ 1, 2, 3, 4, 99 };
+    std::vector<float> baseline(6, 0.0f);
+    if (!check(run_live_worker_compensation(shard_counts[0], capacities[0], baseline),
+               "live single-shard compensation")) {
+        return false;
+    }
+    for (size_t capacity : capacities) {
+        for (size_t shard_count : shard_counts) {
+            std::vector<float> output(6, 0.0f);
+            if (!check(run_live_worker_compensation(shard_count, capacity, output),
+                       "live staged compensation run")) {
+                return false;
+            }
+            if (!check(same_output(baseline, output), "live compensation output differs")) {
+                std::fprintf(stderr, "baseline capacity=%zu shards=%zu candidate capacity=%zu shards=%zu\n",
+                             capacities[0], shard_counts[0], capacity, shard_count);
+                return false;
+            }
+        }
+    }
+    std::puts("PASS edge: live-worker compensation capacities=1/2/3/4 shard-counts=1/2/3/4/99");
+    return true;
 }
 
 bool test_pipeline_cancellation() {
@@ -1567,6 +2147,7 @@ bool test_pipeline_cancellation() {
     std::vector<elem_t> weights(4, 1);
     std::vector<float> output(8, 0.0f);
     auto args = make_args(activation, weights, output);
+    args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0, 0 };
     MatmulOptions options{};
     options.mode = MatmulInvocationMode::stripe_pipeline;
     options.job_capacity = 2;
@@ -1578,11 +2159,16 @@ bool test_pipeline_cancellation() {
     const auto cancel_status = collector.cancel();
     const auto finish_status = collector.finish();
     const auto execution_finish_status = finish_execution(execution);
-    return check(cancel_status.code == MatmulStatusCode::cancelled, "pipeline cancellation status") &&
+    const bool passed =
+        check(cancel_status.code == MatmulStatusCode::cancelled, "pipeline cancellation status") &&
         check(finish_status.code == MatmulStatusCode::cancelled, "pipeline cancellation finish") &&
         check(execution_finish_status.code == MatmulStatusCode::cancelled,
               "pipeline cancellation execution finish") &&
         check(execution.state() == MatmulExecutionState::failed, "pipeline cancellation execution state");
+    if (passed) {
+        std::puts("PASS edge: pipeline-cancellation=yes collector/execution-failure-state=yes");
+    }
+    return passed;
 }
 
 bool test_live_worker_rc_failure_releases_collector_slot_once() {
@@ -1595,6 +2181,7 @@ bool test_live_worker_rc_failure_releases_collector_slot_once() {
     options.job_capacity = 1;
     auto args = make_args(activation, weights, output);
     args.I = 2;
+    args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0 };
     auto execution = prepare_execution(args, options);
     MatmulStripeCollector collector(1);
     collector.test_inject_rc_failure(
@@ -1611,6 +2198,7 @@ bool test_live_worker_rc_failure_releases_collector_slot_once() {
     std::vector<float> replacement_output(4, 0.0f);
     auto replacement_args = make_args(activation, weights, replacement_output);
     replacement_args.I = 2;
+    replacement_args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0 };
     auto replacement_execution = prepare_execution(replacement_args, options);
     MatmulStripeCollector replacement(1);
     const bool replacement_started = replacement.start(replacement_execution);
@@ -1625,12 +2213,79 @@ bool test_live_worker_rc_failure_releases_collector_slot_once() {
         check(failure.code == MatmulStatusCode::execution_failure &&
                   execution_failure.code == MatmulStatusCode::execution_failure,
               "RC failure propagates to collector and execution") &&
-        check(collector.test_dense_cancelled(), "RC failure cancels dense branch") &&
+        check(collector.test_dense_state_at_release() == MatmulDenseState::complete,
+              "RC failure preserves independently completed dense branch") &&
         check(collector.test_in_flight() == 0, "RC failure releases collector slot exactly once") &&
         check(replacement_finished, "replacement slot admission and capacity recovery");
     if (passed) {
-        std::puts("PASS edge: RC-failure-injection=yes first-failure/cancel-propagation=yes "
+        std::puts("PASS edge: RC-failure-injection=yes dense-completion-independent=yes "
                   "exactly-once-slot-release=yes slot-reuse/capacity-recovery=yes");
+    }
+    return passed;
+}
+
+bool test_rc_failure_external_cancel_while_dense_idle() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1, 2, 3, 4 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> output(4, 0.0f);
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_pipeline;
+    options.job_capacity = 1;
+    auto args = make_args(activation, weights, output);
+    args.I = 2;
+    args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0 };
+    auto execution = prepare_execution(args, options);
+    MatmulStripeCollector collector(1);
+    collector.test_inject_rc_failure(
+        { MatmulStatusCode::execution_failure, "injected RC worker failure" });
+    collector.test_pause_dense_before_execute();
+    if (!check(execution.status().ok() && collector.start(execution),
+               "RC-failure/cancel live worker start")) {
+        return false;
+    }
+    const auto * sink = collector.sink();
+    const bool admitted = sink->on_ready(
+        sink->user_data, { 0, 0, 2, nullptr, 0, 10, 20, 30, 50 });
+    collector.test_wait_for_rc_failure();
+    const auto cancel_status = collector.cancel();
+    const auto duplicate_cancel_status = collector.cancel();
+    auto finish = std::async(std::launch::async, [&collector] { return collector.finish(); });
+    const bool bounded = finish.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    const auto finish_status = bounded ? finish.get() : MatmulStatus{
+        MatmulStatusCode::execution_failure, "finish timed out" };
+    const auto execution_status = finish_execution(execution);
+
+    std::vector<float> replacement_output(4, 0.0f);
+    auto replacement_args = make_args(activation, weights, replacement_output);
+    replacement_args.I = 2;
+    replacement_args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0 };
+    auto replacement_execution = prepare_execution(replacement_args, options);
+    MatmulStripeCollector replacement(1);
+    const bool replacement_started = replacement.start(replacement_execution);
+    const auto * replacement_sink = replacement.sink();
+    const bool replacement_admitted = replacement_started && replacement_sink->on_ready(
+        replacement_sink->user_data, { 0, 0, 2, nullptr, 0, 10, 20, 30, 50 });
+    const bool replacement_finished = replacement_admitted && replacement.finish().ok() &&
+        finish_execution(replacement_execution).ok();
+
+    const bool passed =
+        check(admitted, "RC-failure/cancel job admitted") &&
+        check(bounded, "RC-failure/cancel finish is bounded") &&
+        check(cancel_status.code == MatmulStatusCode::cancelled &&
+                  duplicate_cancel_status.code == MatmulStatusCode::cancelled &&
+                  finish_status.code == MatmulStatusCode::cancelled &&
+                  execution_status.code == MatmulStatusCode::cancelled,
+              "external cancellation propagates after RC failure") &&
+        check(collector.test_dense_state_at_release() == MatmulDenseState::complete ||
+                  collector.test_dense_state_at_release() == MatmulDenseState::cancelled,
+              "external cancel leaves Dense complete or cancelled") &&
+        check(collector.test_in_flight() == 0,
+              "RC-failure/cancel releases collector slot exactly once") &&
+        check(replacement_finished, "RC-failure/cancel slot recovery");
+    if (passed) {
+        std::puts("PASS edge: RC-failure+external-cancel=yes bounded-finish=yes in-flight-zero=yes "
+                  "no-double-release=yes slot-recovery=yes");
     }
     return passed;
 }
@@ -1639,13 +2294,49 @@ bool test_live_worker_rc_failure_releases_collector_slot_once() {
 
 int main(int argc, char ** argv) {
     const bool edge_only = argc == 2 && std::string_view(argv[1]) == "--edge";
-    const bool edge = test_public_contract_shape() && test_dispatch_override_contract() &&
-        test_route_capability_table() &&
+    const bool stress_only = argc == 2 && std::string_view(argv[1]) == "--stress";
+    if (stress_only) {
+        for (size_t iteration = 0; iteration < 1000; ++iteration) {
+            if (!test_live_pipeline_worker() ||
+                !test_live_worker_failed_capture_releases_collector_slot() ||
+                !test_pipeline_cancellation() ||
+                !test_live_worker_rc_failure_releases_collector_slot_once() ||
+                !test_rc_failure_external_cancel_while_dense_idle()) {
+                std::fprintf(stderr, "stress iteration %zu failed\n", iteration);
+                return 1;
+            }
+        }
+        std::puts("PASS stress: iterations=1000 worker-reuse/cancel/failure=yes");
+        return 0;
+    }
+    const bool configuration = test_public_contract_shape() &&
+        test_matmul_option_resolution_precedence() &&
+        test_default_matmul_mode_executes_configured_backend_path() &&
+        test_dispatch_override_contract() &&
+        test_route_capability_table() && test_disabled_stripe_modes_are_rejected();
+    if (!ggml::gemmini::config::ENABLE_STRIPE_MATMUL) {
+        return configuration && test_full_facade_status_and_output_match_legacy() &&
+                test_malformed_route_contract_rejected()
+            ? 0
+            : 1;
+    }
+    const bool pipeline = !ggml::gemmini::config::ENABLE_STRIPE_PIPELINE ||
+        (test_bounded_pipeline_slots_and_reuse() && test_live_pipeline_worker() &&
+#if defined(_OPENMP)
+         test_live_pipeline_worker_from_openmp_region() &&
+#endif
+         test_live_worker_failed_capture_releases_collector_slot() &&
+         test_malformed_event_wakes_blocked_producer() &&
+         test_live_worker_serial_compensation_is_bitwise_stable() &&
+         test_pipeline_cancellation() &&
+         test_live_worker_rc_failure_releases_collector_slot_once() &&
+         test_rc_failure_external_cancel_while_dense_idle());
+    const bool edge = configuration &&
         test_h2_and_hp2_stripe_capability_is_explicitly_unsupported() &&
         test_explicit_exsia_channel_rejection() &&
         test_global_activation_metadata_view_boundaries() &&
         test_invalid_activation_scale_is_explicit_contract_error() &&
-        test_missing_activation_metadata_has_no_scale_fallback() &&
+        test_missing_activation_metadata_allows_dense_routes_and_fp32() &&
         test_fp32_stripe_route_skips_quantized_compensation() &&
         test_copied_args_preserve_exsia_route_metadata() &&
         test_pointer_backed_stripes_preserve_global_metadata() &&
@@ -1653,13 +2344,10 @@ int main(int argc, char ** argv) {
         test_non_exsia_pipeline_is_explicitly_unsupported() &&
         test_explicit_unsupported_route_statuses() &&
         test_malformed_route_contract_rejected() &&
-        test_bounded_pipeline_slots_and_reuse() &&
         test_independent_branch_lifecycle() &&
-        test_live_pipeline_worker() && test_compensation_shard_output_is_bitwise_stable() &&
-        test_live_worker_parallel_compensation_is_bitwise_stable() &&
-        test_pipeline_cancellation() &&
-        test_live_worker_rc_failure_releases_collector_slot_once() &&
-        test_staged_contract_errors();
+        test_compensation_shard_output_is_bitwise_stable() &&
+        test_compensation_shards_preserve_native_scale_groups() &&
+        test_staged_contract_errors() && pipeline;
     if (edge_only) {
         return edge ? 0 : 1;
     }
@@ -1668,7 +2356,8 @@ int main(int argc, char ** argv) {
             test_baseline_activation_route_facade_parity() &&
             test_j131_tail_stripe_parity() &&
             test_fp32_shape_and_stride_matrix() &&
-            test_live_pipeline_multistripe_matches_full() &&
+            (!ggml::gemmini::config::ENABLE_STRIPE_PIPELINE ||
+             test_live_pipeline_multistripe_matches_full()) &&
             test_native_and_channel_full_facade_parity() &&
             test_full_and_stripe_sequential_outputs_match() &&
             test_block_activation_scale_compensation_parity() &&

@@ -1,15 +1,20 @@
 #pragma once
 
 #include "ggml-gemmini-args.h"
+#include "ggml-gemmini-matmul-config.hpp"
 #include "quants/act/exsia/exsia.hpp"
 #include "quants/dec/dec.hpp"
 
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <mutex>
 #include <memory>
+#include <optional>
+#include <string_view>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -183,15 +188,40 @@ struct MatmulJobMetrics {
     MatmulStageMetrics la;
     MatmulStageMetrics sf;
     MatmulStageMetrics handoff;
+    MatmulStageMetrics capture_copy;
+    MatmulStageMetrics producer_wait;
+    MatmulStageMetrics queue_insert;
+    MatmulStageMetrics sf_handoff;
+    MatmulStageMetrics ws_queue;
+    MatmulStageMetrics ws_service;
     MatmulStageMetrics ws;
+    MatmulStageMetrics rc_queue;
     MatmulStageMetrics rc_prepare;
     MatmulStageMetrics rc_compute;
     MatmulStageMetrics rc_finalize;
+    MatmulStageMetrics rc_wait;
+    MatmulStageMetrics t_RC4;
     uint64_t ws_start_ns = 0;
     uint64_t ws_end_ns = 0;
     uint64_t rc_start_ns = 0;
     uint64_t rc_end_ns = 0;
 };
+
+struct MatmulCollectorSnapshot {
+    MatmulStatus status;
+    size_t capacity = 0;
+    size_t pending = 0;
+    size_t in_flight = 0;
+    size_t rc_queue_depth = 0;
+    size_t rc_worker_capacity = 0;
+    size_t rc_worker_starts = 0;
+    size_t rc_tasks_executed = 0;
+    size_t max_active_rc_stripes = 0;
+    size_t max_rc_queue_depth = 0;
+    bool running = false;
+};
+
+enum class MatmulDenseState : uint8_t;
 
 class MatmulStripeCollector {
 public:
@@ -202,12 +232,15 @@ public:
     MatmulStatus finish();
     const quants::act::exsia::StripeReadySink * sink() const;
     MatmulStatus status() const;
+    MatmulCollectorSnapshot snapshot() const;
     std::vector<MatmulJobMetrics> profiles() const;
     quants::QactOutlier captured_outlier(size_t stripe, size_t outlier) const;
 #if defined(GGML_GEMMINI_TEST_OBSERVER)
     void test_inject_rc_failure(MatmulStatus failure);
+    void test_pause_dense_before_execute();
+    void test_wait_for_rc_failure();
     size_t test_in_flight() const;
-    bool test_dense_cancelled() const;
+    MatmulDenseState test_dense_state_at_release() const;
 #endif
 
 private:
@@ -221,6 +254,15 @@ private:
         uint64_t sf_cycles = 0;
         uint64_t la3_ns = 0;
         uint64_t sf1_ns = 0;
+        MatmulStageMetrics capture_copy;
+        MatmulStageMetrics producer_wait;
+        MatmulStageMetrics queue_insert;
+        uint64_t queued_ns = 0;
+    };
+    struct RcTask {
+        std::shared_ptr<MatmulStripeJob> job;
+        size_t shard_id;
+        size_t shard_count;
     };
     static bool on_ready(void *, const quants::act::exsia::StripeReadyEvent &);
     friend MatmulStatus execute_post_fold_pipeline(const ggml_gemmini_args_t &, MatmulStripeCollector &);
@@ -228,23 +270,40 @@ private:
     void release_in_flight_once(const std::shared_ptr<MatmulStripeJob> & job);
     void worker_loop();
     void compensation_loop();
+    void rc_worker_loop();
     bool worker_started_ = false;
     bool stop_requested_ = false;
     bool dense_done_ = false;
     std::thread worker_;
     std::thread compensation_worker_;
+    std::vector<std::thread> rc_workers_;
+    // Borrowed for the active pipeline; finish the collector before destroying the execution.
     MatmulExecution * execution_ = nullptr;
     mutable std::mutex mutex_;
     std::condition_variable condition_;
     std::deque<CapturedStripe> pending_;
     std::deque<std::shared_ptr<MatmulStripeJob>> compensation_pending_;
+    std::deque<RcTask> rc_pending_;
     std::vector<std::weak_ptr<MatmulStripeJob>> jobs_;
     size_t capacity_;
     size_t in_flight_ = 0;
+    size_t rc_tasks_remaining_ = 0;
+    size_t rc_worker_capacity_ = 0;
+    size_t rc_worker_starts_ = 0;
+    size_t rc_tasks_executed_ = 0;
+    size_t active_rc_stripes_ = 0;
+    size_t max_active_rc_stripes_ = 0;
+    size_t max_rc_queue_depth_ = 0;
+    bool rc_stop_requested_ = false;
+    MatmulStatus rc_batch_status_;
     std::vector<CapturedStripe> stripes_;
     std::vector<MatmulJobMetrics> profiles_;
     MatmulStatus status_;
     quants::act::exsia::StripeReadySink sink_;
+#if defined(GGML_GEMMINI_TEST_OBSERVER)
+    bool test_pause_dense_ = false;
+    bool test_rc_failure_observed_ = false;
+#endif
 };
 
 enum class MatmulInvocationMode {
@@ -262,17 +321,133 @@ enum class MatmulExecutionState {
     failed,
 };
 
-struct MatmulOptions {
-    MatmulInvocationMode mode = MatmulInvocationMode::full;
-    size_t stripe_rows = 0;
+struct ResolvedMatmulOptions {
+    MatmulInvocationMode mode = static_cast<MatmulInvocationMode>(config::DEFAULT_MATMUL_MODE);
+    size_t stripe_rows = config::DEFAULT_STRIPE_ROWS.value_or(1);
+    bool stripe_rows_auto = !config::DEFAULT_STRIPE_ROWS.has_value();
     size_t dense_threads = 0;
-    size_t rc_shards = 0;
+    size_t rc_shards = config::DEFAULT_RC_SHARDS;
     bool validation = false;
     bool profiling = false;
     bool force_row_direct = false;
     bool force_group_k_csc = false;
-    size_t job_capacity = 4;
+    size_t job_capacity = config::DEFAULT_STRIPE_JOB_CAPACITY;
+
+    ResolvedMatmulOptions() {}
 };
+
+struct MatmulOptionOverrides {
+    std::optional<MatmulInvocationMode> mode;
+    std::optional<size_t> stripe_rows;
+    size_t dense_threads = 0;
+    std::optional<size_t> rc_shards;
+    bool validation = false;
+    bool profiling = false;
+    bool force_row_direct = false;
+    bool force_group_k_csc = false;
+    std::optional<size_t> job_capacity;
+};
+
+#ifdef GGML_GEMMINI_MATMUL_IMPLEMENTATION
+using MatmulOptions = ResolvedMatmulOptions;
+#else
+using MatmulOptions = MatmulOptionOverrides;
+#endif
+
+enum class MatmulOptionsError : uint8_t {
+    none,
+    invalid_mode,
+    invalid_stripe_rows,
+    invalid_rc_shards,
+    invalid_job_capacity,
+    disabled_mode,
+};
+
+struct MatmulOptionsResolution {
+    ResolvedMatmulOptions options;
+    MatmulOptionsError error = MatmulOptionsError::none;
+
+    bool ok() const { return error == MatmulOptionsError::none; }
+};
+
+inline bool parse_positive_size(std::string_view text, size_t & value) {
+    if (text.empty()) {
+        return false;
+    }
+    const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+    return result.ec == std::errc{} && result.ptr == text.data() + text.size() && value > 0;
+}
+
+inline MatmulOptionsResolution resolve_matmul_options(const MatmulOptionOverrides & explicit_options = {}) {
+    MatmulOptionsResolution result;
+    if (config::ALLOW_RUNTIME_MATMUL_OVERRIDE) {
+        if (!explicit_options.mode) if (const char * value = std::getenv("GEMMINI_MATMUL_MODE")) {
+            const std::string_view mode(value);
+            if (mode == "FULL") {
+                result.options.mode = MatmulInvocationMode::full;
+            } else if (mode == "STRIPE_SEQUENTIAL") {
+                result.options.mode = MatmulInvocationMode::stripe_sequential;
+            } else if (mode == "STRIPE_PIPELINE") {
+                result.options.mode = MatmulInvocationMode::stripe_pipeline;
+            } else {
+                result.error = MatmulOptionsError::invalid_mode;
+                return result;
+            }
+        }
+        if (!explicit_options.stripe_rows) if (const char * value = std::getenv("GEMMINI_STRIPE_ROWS")) {
+            if (std::string_view(value) == "AUTO") {
+                result.options.stripe_rows_auto = true;
+            } else if (size_t rows; parse_positive_size(value, rows)) {
+                result.options.stripe_rows = rows;
+                result.options.stripe_rows_auto = false;
+            } else {
+                result.error = MatmulOptionsError::invalid_stripe_rows;
+                return result;
+            }
+        }
+        if (!explicit_options.rc_shards) if (const char * value = std::getenv("GEMMINI_RC_SHARDS")) {
+            if (!parse_positive_size(value, result.options.rc_shards)) {
+                result.error = MatmulOptionsError::invalid_rc_shards;
+                return result;
+            }
+        }
+        if (!explicit_options.job_capacity) if (const char * value = std::getenv("GEMMINI_STRIPE_JOB_CAPACITY")) {
+            if (!parse_positive_size(value, result.options.job_capacity)) {
+                result.error = MatmulOptionsError::invalid_job_capacity;
+                return result;
+            }
+        }
+    }
+
+    if (explicit_options.mode) result.options.mode = *explicit_options.mode;
+    if (explicit_options.stripe_rows) {
+        result.options.stripe_rows = *explicit_options.stripe_rows;
+        result.options.stripe_rows_auto = false;
+    }
+    if (explicit_options.rc_shards) result.options.rc_shards = *explicit_options.rc_shards;
+    if (explicit_options.job_capacity) result.options.job_capacity = *explicit_options.job_capacity;
+    result.options.dense_threads = explicit_options.dense_threads;
+    result.options.validation = explicit_options.validation;
+    result.options.profiling = explicit_options.profiling;
+    result.options.force_row_direct = explicit_options.force_row_direct;
+    result.options.force_group_k_csc = explicit_options.force_group_k_csc;
+
+    if ((explicit_options.stripe_rows && *explicit_options.stripe_rows == 0) ||
+        (explicit_options.rc_shards && *explicit_options.rc_shards == 0) ||
+        (explicit_options.job_capacity && *explicit_options.job_capacity == 0)) {
+        result.error = explicit_options.stripe_rows && *explicit_options.stripe_rows == 0
+            ? MatmulOptionsError::invalid_stripe_rows
+            : explicit_options.rc_shards && *explicit_options.rc_shards == 0
+                ? MatmulOptionsError::invalid_rc_shards
+                : MatmulOptionsError::invalid_job_capacity;
+        return result;
+    }
+    if ((result.options.mode != MatmulInvocationMode::full && !config::ENABLE_STRIPE_MATMUL) ||
+        (result.options.mode == MatmulInvocationMode::stripe_pipeline && !config::ENABLE_STRIPE_PIPELINE)) {
+        result.error = MatmulOptionsError::disabled_mode;
+    }
+    return result;
+}
 
 class MatmulStripeInput {
 public:
@@ -317,9 +492,9 @@ public:
     MatmulStatus status() const;
 
 private:
-    friend MatmulExecution prepare_execution(const ggml_gemmini_args_t &, MatmulOptions);
-    friend MatmulExecution prepare_execution(ggml_gemmini_args_t *, MatmulOptions);
-    friend MatmulStatus prepare_execution(ggml_gemmini_args_t &, const MatmulOptions &, MatmulExecution &);
+    friend MatmulExecution prepare_execution(const ggml_gemmini_args_t &, ResolvedMatmulOptions);
+    friend MatmulExecution prepare_execution(ggml_gemmini_args_t *, ResolvedMatmulOptions);
+    friend MatmulStatus prepare_execution(ggml_gemmini_args_t &, const ResolvedMatmulOptions &, MatmulExecution &);
     friend MatmulStatus execute_full(MatmulExecution &);
     friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput);
     friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput, std::vector<quants::QactOutlier>);
@@ -334,12 +509,12 @@ private:
     friend class MatmulStripeJob;
     friend MatmulStatus finish_execution(MatmulExecution &);
 
-    MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options);
-    MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions options);
+    MatmulExecution(ggml_gemmini_args_t args, ResolvedMatmulOptions options);
+    MatmulExecution(ggml_gemmini_args_t * args, ResolvedMatmulOptions options);
 
     size_t total_rows_;
     MatMul facade_;
-    MatmulOptions options_;
+    ResolvedMatmulOptions options_;
     MatmulStatus status_;
     quants::dec::DispatchOverride dispatch_override_ =
         quants::dec::DispatchOverride::automatic;
@@ -439,9 +614,9 @@ private:
     bool finalized_ = false;
 };
 
-MatmulExecution prepare_execution(const ggml_gemmini_args_t & args, MatmulOptions options = {});
-MatmulExecution prepare_execution(ggml_gemmini_args_t * args, MatmulOptions options = {});
-MatmulStatus prepare_execution(ggml_gemmini_args_t & args, const MatmulOptions & options,
+MatmulExecution prepare_execution(const ggml_gemmini_args_t & args, ResolvedMatmulOptions options);
+MatmulExecution prepare_execution(ggml_gemmini_args_t * args, ResolvedMatmulOptions options);
+MatmulStatus prepare_execution(ggml_gemmini_args_t & args, const ResolvedMatmulOptions & options,
                                MatmulExecution & execution);
 MatmulStatus execute_full(MatmulExecution & execution);
 MatmulStatus capture_stripe(MatmulExecution & execution, const MatmulStripeInput & input,
@@ -457,8 +632,48 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job);
 MatmulStatus execute_compensation_shard(MatmulStripeJob & job, size_t shard_id, size_t shard_count);
 MatmulStatus finalize_stripe(MatmulStripeJob & job);
 MatmulStatus finish_execution(MatmulExecution & execution);
-MatmulStatus matmul(ggml_gemmini_args_t & args, MatmulOptions options = {});
-MatmulStatus matmul(const ggml_gemmini_args_t & args, MatmulOptions options = {});
+MatmulStatus matmul(ggml_gemmini_args_t & args, ResolvedMatmulOptions options);
+MatmulStatus matmul(const ggml_gemmini_args_t & args, ResolvedMatmulOptions options);
 MatmulStatus execute_post_fold_pipeline(const ggml_gemmini_args_t & args, MatmulStripeCollector & collector);
+
+#ifndef GGML_GEMMINI_MATMUL_IMPLEMENTATION
+inline ResolvedMatmulOptions resolved_or_invalid(const MatmulOptionOverrides & options) {
+    auto resolution = resolve_matmul_options(options);
+    if (!resolution.ok()) {
+        resolution.options.mode = MatmulInvocationMode::stripe_sequential;
+        resolution.options.job_capacity = 0;
+    }
+    return resolution.options;
+}
+
+inline MatmulExecution prepare_execution(const ggml_gemmini_args_t & args, MatmulOptions options = {}) {
+    return prepare_execution(args, resolved_or_invalid(options));
+}
+
+inline MatmulExecution prepare_execution(ggml_gemmini_args_t * args, MatmulOptions options = {}) {
+    return prepare_execution(args, resolved_or_invalid(options));
+}
+
+inline MatmulStatus prepare_execution(ggml_gemmini_args_t & args, const MatmulOptions & options,
+                                      MatmulExecution & execution) {
+    const auto resolution = resolve_matmul_options(options);
+    if (!resolution.ok()) {
+        return { MatmulStatusCode::invalid_argument, "invalid matmul options" };
+    }
+    return prepare_execution(args, resolution.options, execution);
+}
+
+inline MatmulStatus matmul(ggml_gemmini_args_t & args, MatmulOptions options = {}) {
+    const auto resolution = resolve_matmul_options(options);
+    return resolution.ok() ? matmul(args, resolution.options)
+                           : MatmulStatus{ MatmulStatusCode::invalid_argument, "invalid matmul options" };
+}
+
+inline MatmulStatus matmul(const ggml_gemmini_args_t & args, MatmulOptions options = {}) {
+    const auto resolution = resolve_matmul_options(options);
+    return resolution.ok() ? matmul(args, resolution.options)
+                           : MatmulStatus{ MatmulStatusCode::invalid_argument, "invalid matmul options" };
+}
+#endif
 
 }
