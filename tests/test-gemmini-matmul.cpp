@@ -6,6 +6,7 @@
 
 #include <gemmini.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <chrono>
@@ -51,6 +52,16 @@ ggml_gemmini_args_t make_args(std::vector<elem_t> & activation,
 bool same_output(const std::vector<float> & actual, const std::vector<float> & expected) {
     return actual.size() == expected.size() &&
         std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)) == 0;
+}
+
+size_t expected_persistent_rc_workers(size_t requested_shards, size_t columns) {
+    const size_t hw = std::thread::hardware_concurrency();
+    const size_t budget = hw == 0 ? 1 : (hw > 2 ? hw - 2 : size_t {1});
+    return std::min({
+        std::max(size_t {1}, requested_shards),
+        std::max(size_t {1}, columns),
+        budget,
+    });
 }
 
 struct ScopedEnvVar {
@@ -1925,6 +1936,62 @@ bool test_live_worker_failed_capture_releases_collector_slot() {
     return passed;
 }
 
+bool test_live_rc_workers_are_process_bounded() {
+    using namespace ggml::gemmini;
+    constexpr size_t rows = 2;
+    constexpr size_t columns = 256;
+    constexpr size_t depth = 2;
+    constexpr size_t requested_shards = 99;
+    std::vector<elem_t> activation(rows * depth, 1);
+    std::vector<elem_t> weights(depth * columns, 1);
+    std::vector<float> output(rows * columns, 0.0f);
+    ggml_gemmini_args_t args{};
+    args.I = rows;
+    args.J = columns;
+    args.K = depth;
+    args.A = activation.data();
+    args.B = weights.data();
+    args.sA = depth;
+    args.sB = columns;
+    args.f_out = output.data();
+    args.col_stride_f_out = 1;
+    args.stride_f_out = columns;
+    args.weight_i8_scale_active = true;
+    args.weight_scale = 1.0f;
+    args.tiled_matmul_type = CPU;
+    args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0 };
+
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_pipeline;
+    options.job_capacity = 1;
+    options.rc_shards = requested_shards;
+    auto execution = prepare_execution(args, options);
+    MatmulStripeCollector collector(1);
+    if (!check(execution.status().ok() && collector.start(execution), "bounded RC worker start")) {
+        return false;
+    }
+    const auto running = collector.snapshot();
+    const auto cancel_status = collector.cancel();
+    const auto finish_status = collector.finish();
+    const auto execution_status = finish_execution(execution);
+    const auto stopped = collector.snapshot();
+    const size_t expected_workers = expected_persistent_rc_workers(requested_shards, columns);
+    const bool passed =
+        check(running.rc_worker_capacity == expected_workers,
+              "RC worker capacity clamps to process-safe budget") &&
+        check(stopped.rc_worker_starts == expected_workers,
+              "RC worker start count matches bounded capacity") &&
+        check(cancel_status.code == MatmulStatusCode::cancelled &&
+                  finish_status.code == MatmulStatusCode::cancelled &&
+                  execution_status.code == MatmulStatusCode::cancelled,
+              "bounded RC worker cleanup");
+    if (passed) {
+        std::printf("PASS edge: live-rc-workers requested=%zu bounded=%zu columns=%zu\n",
+                    requested_shards, expected_workers, columns);
+    }
+    return passed;
+}
+
 bool test_malformed_event_wakes_blocked_producer() {
     using namespace ggml::gemmini;
     std::vector<elem_t> activation = { 1, 2, 3, 4 };
@@ -2171,6 +2238,75 @@ bool test_pipeline_cancellation() {
     return passed;
 }
 
+bool test_pipeline_execution_attachment_contract() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1, 2, 3, 4 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> output(4, 0.0f);
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_pipeline;
+    options.job_capacity = 1;
+    auto args = make_args(activation, weights, output);
+    args.I = 2;
+    args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0 };
+    auto execution = prepare_execution(args, options);
+    MatmulStripeCollector collector(1);
+    if (!check(execution.status().ok() && collector.start(execution), "attachment-contract start")) {
+        return false;
+    }
+    const bool attached_while_running = execution.test_pipeline_attached();
+    const auto cancel_status = collector.cancel();
+    const auto finish_status = collector.finish();
+    const auto execution_status = finish_execution(execution);
+    const bool detached_after_finish = !execution.test_pipeline_attached();
+    const bool passed =
+        check(attached_while_running, "execution marks live collector attachment") &&
+        check(detached_after_finish, "execution detaches after collector finish") &&
+        check(cancel_status.code == MatmulStatusCode::cancelled &&
+                  finish_status.code == MatmulStatusCode::cancelled &&
+                  execution_status.code == MatmulStatusCode::cancelled,
+              "attachment-contract cleanup");
+    if (passed) {
+        std::puts("PASS edge: execution-collector-attachment tracked across live worker lifetime");
+    }
+    return passed;
+}
+
+bool test_pipeline_start_thread_failure_returns_clean_status() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1, 2, 3, 4 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> output(4, 0.0f);
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_pipeline;
+    options.job_capacity = 1;
+    auto args = make_args(activation, weights, output);
+    args.I = 2;
+    args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0 };
+    auto execution = prepare_execution(args, options);
+    MatmulStripeCollector collector(1);
+    collector.test_inject_thread_start_failure();
+    const bool started = collector.start(execution);
+    const auto collector_status = collector.status();
+    const auto finish_status = collector.finish();
+    const auto execution_status = execution.status();
+    const bool passed =
+        check(!started, "thread-start failure returns false") &&
+        check(collector_status.code == MatmulStatusCode::execution_failure,
+              "thread-start failure sets collector status") &&
+        check(finish_status.code == MatmulStatusCode::execution_failure,
+              "thread-start failure finish preserves status") &&
+        check(execution_status.code == MatmulStatusCode::execution_failure &&
+                  execution.state() == MatmulExecutionState::failed,
+              "thread-start failure sets execution failed state") &&
+        check(!execution.test_pipeline_attached(),
+              "thread-start failure clears live collector attachment");
+    if (passed) {
+        std::puts("PASS edge: thread-start failure returns clean status without live collector attachment");
+    }
+    return passed;
+}
+
 bool test_live_worker_rc_failure_releases_collector_slot_once() {
     using namespace ggml::gemmini;
     std::vector<elem_t> activation = { 1, 2, 3, 4 };
@@ -2322,6 +2458,7 @@ int main(int argc, char ** argv) {
     }
     const bool pipeline = !ggml::gemmini::config::ENABLE_STRIPE_PIPELINE ||
         (test_bounded_pipeline_slots_and_reuse() && test_live_pipeline_worker() &&
+         test_live_rc_workers_are_process_bounded() &&
 #if defined(_OPENMP)
          test_live_pipeline_worker_from_openmp_region() &&
 #endif
@@ -2329,6 +2466,8 @@ int main(int argc, char ** argv) {
          test_malformed_event_wakes_blocked_producer() &&
          test_live_worker_serial_compensation_is_bitwise_stable() &&
          test_pipeline_cancellation() &&
+         test_pipeline_execution_attachment_contract() &&
+         test_pipeline_start_thread_failure_returns_clean_status() &&
          test_live_worker_rc_failure_releases_collector_slot_once() &&
          test_rc_failure_external_cancel_while_dense_idle());
     const bool edge = configuration &&

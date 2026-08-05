@@ -237,6 +237,7 @@ public:
     quants::QactOutlier captured_outlier(size_t stripe, size_t outlier) const;
 #if defined(GGML_GEMMINI_TEST_OBSERVER)
     void test_inject_rc_failure(MatmulStatus failure);
+    void test_inject_thread_start_failure(size_t attempt = 1);
     void test_pause_dense_before_execute();
     void test_wait_for_rc_failure();
     size_t test_in_flight() const;
@@ -303,6 +304,8 @@ private:
 #if defined(GGML_GEMMINI_TEST_OBSERVER)
     bool test_pause_dense_ = false;
     bool test_rc_failure_observed_ = false;
+    size_t test_fail_thread_start_attempt_ = 0;
+    size_t test_thread_start_attempts_ = 0;
 #endif
 };
 
@@ -484,12 +487,16 @@ public:
     MatmulExecution();
     MatmulExecution(const MatmulExecution &) = delete;
     MatmulExecution & operator=(const MatmulExecution &) = delete;
-    MatmulExecution(MatmulExecution &&) noexcept = default;
-    MatmulExecution & operator=(MatmulExecution &&) noexcept = default;
+    MatmulExecution(MatmulExecution &&) noexcept;
+    MatmulExecution & operator=(MatmulExecution &&) noexcept;
+    ~MatmulExecution();
 
     MatmulInvocationMode mode() const;
     MatmulExecutionState state() const;
     MatmulStatus status() const;
+#if defined(GGML_GEMMINI_TEST_OBSERVER)
+    bool test_pipeline_attached() const;
+#endif
 
 private:
     friend MatmulExecution prepare_execution(const ggml_gemmini_args_t &, ResolvedMatmulOptions);
@@ -511,6 +518,7 @@ private:
 
     MatmulExecution(ggml_gemmini_args_t args, ResolvedMatmulOptions options);
     MatmulExecution(ggml_gemmini_args_t * args, ResolvedMatmulOptions options);
+    void assert_pipeline_detached() const;
 
     size_t total_rows_;
     MatMul facade_;
@@ -530,6 +538,7 @@ private:
     std::unordered_set<size_t> captured_stripe_ids_;
     std::unique_ptr<MatMul> staged_facade_;
     bool staged_metadata_active_ = false;
+    bool pipeline_attached_ = false;
 };
 
 enum class MatmulDenseState : uint8_t {

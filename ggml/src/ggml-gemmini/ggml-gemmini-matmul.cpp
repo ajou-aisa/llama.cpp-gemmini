@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <limits>
 #include <new>
+#include <system_error>
 #include <utility>
 
 namespace ggml::gemmini {
@@ -261,6 +262,14 @@ void record_metric(MatmulStageMetrics & metric, bool enabled, Clock::time_point 
 uint64_t now_ns() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         Clock::now().time_since_epoch()).count());
+}
+
+size_t persistent_rc_worker_budget() {
+    const size_t hw = std::thread::hardware_concurrency();
+    if (hw == 0) {
+        return 1;
+    }
+    return hw > 2 ? hw - 2 : size_t {1};
 }
 
 }
@@ -767,6 +776,11 @@ MatmulExecution::MatmulExecution()
     status_ = invalid_state("execution is not prepared");
 }
 
+MatmulExecution::MatmulExecution(MatmulExecution && other) noexcept
+    : MatmulExecution() {
+    *this = std::move(other);
+}
+
 MatmulExecution::MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions options)
     : total_rows_(args != nullptr ? args->I : 0), facade_(args), options_(options) {
     state_ = MatmulExecutionState::prepared;
@@ -831,6 +845,47 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions optio
     }
 }
 
+MatmulExecution & MatmulExecution::operator=(MatmulExecution && other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    assert_pipeline_detached();
+    other.assert_pipeline_detached();
+    total_rows_ = other.total_rows_;
+    facade_ = std::move(other.facade_);
+    options_ = other.options_;
+    status_ = other.status_;
+    dispatch_override_ = other.dispatch_override_;
+    state_ = other.state_;
+    state_mutex_ = std::move(other.state_mutex_);
+    active_jobs_ = other.active_jobs_;
+    captured_rows_ = other.captured_rows_;
+    finalized_rows_ = other.finalized_rows_;
+    first_row_ = other.first_row_;
+    last_row_begin_ = other.last_row_begin_;
+    last_row_end_ = other.last_row_end_;
+    has_captures_ = other.has_captures_;
+    captured_stripe_ids_ = std::move(other.captured_stripe_ids_);
+    staged_facade_ = std::move(other.staged_facade_);
+    staged_metadata_active_ = other.staged_metadata_active_;
+    pipeline_attached_ = other.pipeline_attached_;
+    other.total_rows_ = 0;
+    other.active_jobs_ = 0;
+    other.captured_rows_ = 0;
+    other.finalized_rows_ = 0;
+    other.first_row_ = 0;
+    other.last_row_begin_ = 0;
+    other.last_row_end_ = 0;
+    other.has_captures_ = false;
+    other.staged_metadata_active_ = false;
+    other.pipeline_attached_ = false;
+    return *this;
+}
+
+MatmulExecution::~MatmulExecution() {
+    assert_pipeline_detached();
+}
+
 MatmulInvocationMode MatmulExecution::mode() const {
     return options_.mode;
 }
@@ -844,6 +899,22 @@ MatmulStatus MatmulExecution::status() const {
     std::lock_guard<std::mutex> lock(*state_mutex_);
     return status_;
 }
+
+void MatmulExecution::assert_pipeline_detached() const {
+    if (!state_mutex_) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(*state_mutex_);
+    GGML_ASSERT(!pipeline_attached_);
+    GGML_ASSERT(active_jobs_ == 0);
+}
+
+#if defined(GGML_GEMMINI_TEST_OBSERVER)
+bool MatmulExecution::test_pipeline_attached() const {
+    std::lock_guard<std::mutex> lock(*state_mutex_);
+    return pipeline_attached_;
+}
+#endif
 
 namespace {
 #if defined(GGML_GEMMINI_TEST_OBSERVER)
@@ -883,22 +954,97 @@ MatmulStripeCollector::~MatmulStripeCollector() {
 }
 
 bool MatmulStripeCollector::start(MatmulExecution & execution) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!status_ || worker_started_ || execution.mode() != MatmulInvocationMode::stripe_pipeline) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!status_ || worker_started_ || execution.mode() != MatmulInvocationMode::stripe_pipeline) {
+            return false;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> execution_lock(*execution.state_mutex_);
+        if (execution.pipeline_attached_) {
+            status_ = invalid_state("execution already has a live stripe collector");
+            execution.status_ = status_;
+            execution.state_ = MatmulExecutionState::failed;
+            return false;
+        }
+        execution.pipeline_attached_ = true;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        execution_ = &execution;
+        worker_started_ = true;
+        dense_done_ = false;
+        stop_requested_ = false;
+        rc_stop_requested_ = false;
+        rc_worker_capacity_ = std::min({
+            std::max(size_t {1}, execution.options_.rc_shards),
+            std::max(size_t {1}, execution.facade_.args().J),
+            persistent_rc_worker_budget(),
+        });
+#if defined(GGML_GEMMINI_TEST_OBSERVER)
+        test_thread_start_attempts_ = 0;
+#endif
+    }
+    const auto fail_start = [&](const char * message) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            status_ = make_status(MatmulStatusCode::execution_failure, message);
+            stop_requested_ = true;
+            dense_done_ = true;
+            rc_stop_requested_ = true;
+        }
+        condition_.notify_all();
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+        if (compensation_worker_.joinable()) {
+            compensation_worker_.join();
+        }
+        for (auto & worker : rc_workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+        rc_workers_.clear();
+        {
+            std::lock_guard<std::mutex> execution_lock(*execution.state_mutex_);
+            execution.status_ = status_;
+            execution.state_ = MatmulExecutionState::failed;
+            execution.pipeline_attached_ = false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            execution_ = nullptr;
+            worker_started_ = false;
+            rc_worker_capacity_ = 0;
+        }
         return false;
+    };
+    try {
+        rc_workers_.reserve(rc_worker_capacity_);
+        const auto maybe_fail_thread_start = [&] {
+#if defined(GGML_GEMMINI_TEST_OBSERVER)
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (test_fail_thread_start_attempt_ != 0 &&
+                ++test_thread_start_attempts_ == test_fail_thread_start_attempt_) {
+                throw std::system_error(
+                    std::make_error_code(std::errc::resource_unavailable_try_again),
+                    "injected thread start failure");
+            }
+#endif
+        };
+        for (size_t worker = 0; worker < rc_worker_capacity_; ++worker) {
+            maybe_fail_thread_start();
+            rc_workers_.emplace_back(&MatmulStripeCollector::rc_worker_loop, this);
+        }
+        maybe_fail_thread_start();
+        worker_ = std::thread(&MatmulStripeCollector::worker_loop, this);
+        maybe_fail_thread_start();
+        compensation_worker_ = std::thread(&MatmulStripeCollector::compensation_loop, this);
+    } catch (const std::system_error &) {
+        return fail_start("collector worker thread creation failed");
     }
-    execution_ = &execution;
-    worker_started_ = true;
-    dense_done_ = false;
-    rc_worker_capacity_ = std::min(
-        std::max(size_t {1}, execution.options_.rc_shards),
-        std::max(size_t {1}, execution.facade_.args().J));
-    rc_workers_.reserve(rc_worker_capacity_);
-    for (size_t worker = 0; worker < rc_worker_capacity_; ++worker) {
-        rc_workers_.emplace_back(&MatmulStripeCollector::rc_worker_loop, this);
-    }
-    worker_ = std::thread(&MatmulStripeCollector::worker_loop, this);
-    compensation_worker_ = std::thread(&MatmulStripeCollector::compensation_loop, this);
     return true;
 }
 
@@ -1011,6 +1157,11 @@ MatmulStatus MatmulStripeCollector::finish() {
         execution_->status_ = status_;
         execution_->state_ = MatmulExecutionState::failed;
     }
+    if (execution_ != nullptr) {
+        std::lock_guard<std::mutex> execution_lock(*execution_->state_mutex_);
+        execution_->pipeline_attached_ = false;
+    }
+    execution_ = nullptr;
     worker_started_ = false;
     return status_;
 }
@@ -1278,6 +1429,11 @@ void MatmulStripeCollector::test_inject_rc_failure(MatmulStatus failure) {
     test_rc_failure = failure;
     test_dense_observer_collector = this;
     observed_dense_state_at_release = MatmulDenseState::idle;
+}
+
+void MatmulStripeCollector::test_inject_thread_start_failure(size_t attempt) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    test_fail_thread_start_attempt_ = attempt;
 }
 
 void MatmulStripeCollector::test_pause_dense_before_execute() {
