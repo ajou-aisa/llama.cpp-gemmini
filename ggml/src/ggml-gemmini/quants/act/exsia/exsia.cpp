@@ -177,13 +177,19 @@ namespace ggml::gemmini::quants::act::exsia
         }
 #endif
 
-#if EXSIA_PROFILE_COLLECTION_ENABLED
         static inline uint64_t next_exsia_run_id()
         {
             static std::atomic<uint64_t> next{0};
             return next.fetch_add(1, std::memory_order_relaxed);
         }
 
+        uint64_t steady_now_ns()
+        {
+            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        }
+
+#if EXSIA_PROFILE_COLLECTION_ENABLED
         uint64_t profile_now()
         {
             return ggml::gemmini::cycle::read();
@@ -191,8 +197,7 @@ namespace ggml::gemmini::quants::act::exsia
 
         uint64_t profile_now_ns()
         {
-            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count());
+            return steady_now_ns();
         }
 
         uint64_t profile_thread_id()
@@ -1428,11 +1433,11 @@ namespace ggml::gemmini::quants::act::exsia
         const StripeReadySink *sink)
     {
         const char *layer = ggml::gemmini::types::to_string(args.layer_type);
+        const uint64_t run_id = next_exsia_run_id();
         EXSIA_PROFILE_LOG(
         const ProfileConfig profile_config = compile_profile_config();
         )
         EXSIA_PROFILE_COLLECT(
-        const uint64_t run_id = next_exsia_run_id();
         ProfileInterval run_profile;
         start_profile_interval(run_profile);
         )
@@ -1595,7 +1600,7 @@ namespace ggml::gemmini::quants::act::exsia
 #endif
             return true;
         };
-        const auto notify_stripe_ready = [&](StripePipelineSlot &slot
+        const auto notify_stripe_ready = [&](StripePipelineSlot &slot, uint64_t run_id
 #if EXSIA_PROFILE_COLLECTION_ENABLED
                                              , const StripeProfileRecord *profile
 #endif
@@ -1603,8 +1608,14 @@ namespace ggml::gemmini::quants::act::exsia
             if (sink == nullptr || sink->on_ready == nullptr)
                 return true;
 
-            StripeReadyEvent event{slot.stripe_idx, slot.row_start, slot.row_end,
-                                   slot.outliers.data(), slot.outliers.size()};
+            StripeReadyEvent event{};
+            event.run_id = run_id;
+            event.stripe_id = slot.stripe_idx;
+            event.slot = slot.stripe_idx % EXSIA_PIPELINE_SLOT_COUNT;
+            event.row_begin = slot.row_start;
+            event.row_end = slot.row_end;
+            event.outliers = slot.outliers.empty() ? nullptr : slot.outliers.data();
+            event.outlier_count = slot.outliers.size();
 #if EXSIA_PROFILE_COLLECTION_ENABLED
             if (profile != nullptr) {
                 event.local_start_cycle = profile->local.start;
@@ -1619,6 +1630,16 @@ namespace ggml::gemmini::quants::act::exsia
                 event.local_end_ns = profile->local.end_ns;
                 event.folding_start_ns = profile->folding.start_ns;
                 event.folding_end_ns = profile->folding.end_ns;
+                for (size_t worker = 0; worker < event.local_worker_start_ns.size() &&
+                                        worker < profile->local_groups.size(); ++worker) {
+                    event.local_worker_start_ns[worker] = profile->local_groups[worker].start_ns;
+                    event.local_worker_end_ns[worker] = profile->local_groups[worker].end_ns;
+                }
+                event.mask_assembly_start_ns = profile->mask_assembly.start_ns;
+                event.mask_assembly_end_ns = profile->mask_assembly.end_ns;
+                event.exponent_reduction_start_ns = profile->exponent_reduction.start_ns;
+                event.exponent_reduction_end_ns = profile->exponent_reduction.end_ns;
+                event.folding_commit_ns = slot.folding_commit_ns;
             }
 #endif
             const bool accepted = sink->on_ready(
@@ -2104,7 +2125,7 @@ namespace ggml::gemmini::quants::act::exsia
                                         {
                                             meta.outliers.insert(meta.outliers.end(),
                                                                  slot.outliers.begin(), slot.outliers.end());
-                                            slot.mark_folding_committed();
+                                            slot.mark_folding_committed(steady_now_ns());
                                             if (!snapshot_validation_mask(s, slot.stripe.outlier_mask))
                                             {
                                                 record_failure(ExSIAState::FailureCode::ValidationSnapshotFailure, s);
@@ -2120,7 +2141,7 @@ namespace ggml::gemmini::quants::act::exsia
                                                 }
                                                 )
                                                 if (pipeline_ok.load(std::memory_order_relaxed) &&
-                                                    !notify_stripe_ready(slot
+                                                    !notify_stripe_ready(slot, run_id
 #if EXSIA_PROFILE_COLLECTION_ENABLED
                                                                           , &profile
 #endif
@@ -2432,7 +2453,7 @@ namespace ggml::gemmini::quants::act::exsia
             meta.outliers.insert(meta.outliers.end(),
                                  slot.outliers.begin(),
                                  slot.outliers.end());
-            slot.mark_folding_committed();
+            slot.mark_folding_committed(steady_now_ns());
 
             if (!snapshot_validation_mask(s, slot.stripe.outlier_mask))
                 return fail(ExSIAState::FailureCode::ValidationSnapshotFailure, s);
@@ -2441,7 +2462,7 @@ namespace ggml::gemmini::quants::act::exsia
             if (!end_profile_interval(profile.folding))
                 return fail(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
             )
-            if (!notify_stripe_ready(slot
+            if (!notify_stripe_ready(slot, run_id
 #if EXSIA_PROFILE_COLLECTION_ENABLED
                                      , &profile
 #endif

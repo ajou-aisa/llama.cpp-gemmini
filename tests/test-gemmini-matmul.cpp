@@ -17,6 +17,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -26,6 +27,90 @@ bool check(bool condition, const char * message) {
         std::fprintf(stderr, "FAIL: %s\n", message);
     }
     return condition;
+}
+
+bool extract_u64_field(const std::string &json, const char *key, uint64_t &value) {
+    const std::string needle = std::string("\"") + key + "\":";
+    const size_t pos = json.find(needle);
+    if (pos == std::string::npos) {
+        return false;
+    }
+    size_t cursor = pos + needle.size();
+    size_t end = cursor;
+    while (end < json.size() && json[end] >= '0' && json[end] <= '9') {
+        ++end;
+    }
+    if (end == cursor) {
+        return false;
+    }
+    value = std::strtoull(json.c_str() + cursor, nullptr, 10);
+    return true;
+}
+
+bool extract_double_field(const std::string &json, const char *key, double &value) {
+    const std::string needle = std::string("\"") + key + "\":";
+    const size_t pos = json.find(needle);
+    if (pos == std::string::npos) {
+        return false;
+    }
+    char * end = nullptr;
+    value = std::strtod(json.c_str() + pos + needle.size(), &end);
+    return end != json.c_str() + pos + needle.size();
+}
+
+bool extract_string_field(const std::string &json, const char *key, std::string &value) {
+    const std::string needle = std::string("\"") + key + "\":\"";
+    const size_t pos = json.find(needle);
+    if (pos == std::string::npos) {
+        return false;
+    }
+    const size_t start = pos + needle.size();
+    const size_t end = json.find('"', start);
+    if (end == std::string::npos) {
+        return false;
+    }
+    value = json.substr(start, end - start);
+    return true;
+}
+
+bool has_array_field(const std::string &json, const char *key) {
+    return json.find(std::string("\"") + key + "\":[") != std::string::npos;
+}
+
+bool has_object_field(const std::string &json, const char *key) {
+    return json.find(std::string("\"") + key + "\":{") != std::string::npos;
+}
+
+bool has_null_field(const std::string &json, const char *key) {
+    return json.find(std::string("\"") + key + "\":null") != std::string::npos;
+}
+
+ggml::gemmini::quants::act::exsia::StripeReadyEvent make_ready_event(
+    size_t stripe_id,
+    size_t row_begin,
+    size_t row_end,
+    const ggml::gemmini::quants::QactOutlier *outliers = nullptr,
+    size_t outlier_count = 0,
+    uint64_t local_start_cycle = 0,
+    uint64_t local_end_cycle = 0,
+    uint64_t folding_start_cycle = 0,
+    uint64_t folding_end_cycle = 0,
+    uint64_t local_group3_start_cycle = 0,
+    uint64_t local_group3_end_cycle = 0) {
+    ggml::gemmini::quants::act::exsia::StripeReadyEvent event{};
+    event.stripe_id = stripe_id;
+    event.slot = stripe_id % 2;
+    event.row_begin = row_begin;
+    event.row_end = row_end;
+    event.outliers = outliers;
+    event.outlier_count = outlier_count;
+    event.local_start_cycle = local_start_cycle;
+    event.local_end_cycle = local_end_cycle;
+    event.folding_start_cycle = folding_start_cycle;
+    event.folding_end_cycle = folding_end_cycle;
+    event.local_group3_start_cycle = local_group3_start_cycle;
+    event.local_group3_end_cycle = local_group3_end_cycle;
+    return event;
 }
 
 ggml_gemmini_args_t make_args(std::vector<elem_t> & activation,
@@ -385,8 +470,8 @@ bool test_live_pipeline_multistripe_matches_full() {
     }
 
     const auto * sink = collector.sink();
-    const bool captured = sink->on_ready(sink->user_data, { 0, 0, 80 }) &&
-        sink->on_ready(sink->user_data, { 1, 80, rows });
+    const bool captured = sink->on_ready(sink->user_data, make_ready_event(0, 0, 80)) &&
+        sink->on_ready(sink->user_data, make_ready_event(1, 80, rows));
     const auto collector_status = collector.finish();
     const auto execution_status = finish_execution(execution);
     for (const auto & profile : collector.profiles()) {
@@ -1065,7 +1150,7 @@ bool test_default_matmul_mode_executes_configured_backend_path() {
         }
         const auto * sink = collector.sink();
         const bool captured = sink->on_ready(
-            sink->user_data, { 0, 0, default_args.I, nullptr, 0, 10, 20, 30, 50 });
+            sink->user_data, make_ready_event(0, 0, default_args.I, nullptr, 0, 10, 20, 30, 50));
         const auto collector_status = collector.finish();
         const auto execution_status = finish_execution(execution);
         return check(captured, "default pipeline capture") &&
@@ -1076,6 +1161,181 @@ bool test_default_matmul_mode_executes_configured_backend_path() {
     default:
         return check(false, "unexpected configured matmul mode");
     }
+}
+
+bool test_pipeline_stripe_summary_contract() {
+    using namespace ggml::gemmini;
+
+    MatmulJobMetrics profile{};
+    profile.run_id = 7;
+    profile.stripe_id = 2;
+    profile.slot = 1;
+    profile.row_begin = 8;
+    profile.row_end = 12;
+    profile.rc_shards = 4;
+    profile.la_worker_start_ns = { 100, 110, 120 };
+    profile.la_worker_end_ns = { 130, 140, 150 };
+    profile.sf_mask_start_ns = 150;
+    profile.sf_mask_end_ns = 160;
+    profile.sf_exponent_start_ns = 160;
+    profile.sf_exponent_end_ns = 170;
+    profile.sf_folding_start_ns = 170;
+    profile.sf_folding_end_ns = 190;
+    profile.sf_commit_ns = 195;
+    profile.producer_wait_start_ns = 90;
+    profile.producer_wait_end_ns = 95;
+    profile.capture_queue_enqueue_ns = 200;
+    profile.ws_start_ns = 210;
+    profile.ws_end_ns = 260;
+    profile.rc_enqueue_ns = 205;
+    profile.rc_prepare_start_ns = 250;
+    profile.rc_prepare_end_ns = 270;
+    profile.rc_shard_start_ns = { 270, 275, 280, 285 };
+    profile.rc_shard_end_ns = { 290, 295, 300, 305 };
+    profile.merge_start_ns = 310;
+    profile.merge_end_ns = 320;
+    profile.rc_prepare.nanoseconds = 20;
+    profile.rc_compute.nanoseconds = 80;
+    profile.rc_finalize.nanoseconds = 10;
+    profile.h1_histogram_available = true;
+    profile.h1_histogram.residual_nnz = 9;
+    profile.h1_histogram.residual_density = 0.125;
+    profile.h1_histogram.active_row_groups = 4;
+    profile.h1_histogram.active_k = 3;
+    profile.h1_histogram.bin_1 = 1;
+    profile.h1_histogram.bin_2_to_4 = 2;
+    profile.h1_histogram.bin_5_to_8 = 1;
+    profile.h1_histogram.bin_over_8 = 0;
+    profile.h1_histogram.rows_per_active_k_mean = 1.5;
+    profile.h1_histogram.rows_per_active_k_max = 2;
+    profile.h1_histogram.estimated_int_mac_count = 288;
+    profile.h1_histogram.ycom_write_count = 96;
+    profile.h1_histogram.weight_scalar_load_count = 144;
+    profile.h1_histogram.weight_vector_load_count = 48;
+    profile.h1_histogram.selected_route =
+        quants::dec::PreparedDecSelectedRoute::h1_small_group_2_to_4;
+
+    const std::string cpu_summary = detail::pipeline_stripe_summary_json(
+        "attn_q", 16, 32, 64, "cpu", "matmul-then-dec", profile);
+    const std::string overlap_summary = detail::pipeline_stripe_summary_json(
+        "attn_q", 16, 32, 64, "gemmini_ws", "matmul-dec-overlap", profile);
+
+    std::string record_type;
+    std::string schedule;
+    std::string backend_route;
+    uint64_t run_id = 0;
+    uint64_t stripe_idx = 0;
+    uint64_t stripe_rows = 0;
+    uint64_t la_workers = 0;
+    uint64_t sf_workers = 0;
+    uint64_t dec_workers = 0;
+    uint64_t ordering_violation = 0;
+    uint64_t overlap_ordering_violation = 1;
+    uint64_t t_la_ns = 0;
+    uint64_t t_sf_ns = 0;
+    uint64_t t_matmul_ns = 0;
+    uint64_t t_merge_ns = 0;
+    uint64_t t_dec_kernel_ns = 0;
+    uint64_t t_dec_premerge_ns = 0;
+    uint64_t la_service_sum_ns = 0;
+    uint64_t dec_kernel_service_sum_ns = 0;
+    uint64_t dec_service_sum_ns = 0;
+    uint64_t residual_nnz = 0;
+    uint64_t active_row_groups = 0;
+    uint64_t weight_vector_load_count = 0;
+    double la_efficiency = 0.0;
+    double dec_kernel_efficiency = 0.0;
+    double dec_service_efficiency = 0.0;
+    std::string selected_route;
+
+    const bool passed =
+        check(extract_string_field(cpu_summary, "record_type", record_type) &&
+                     record_type == "PIPELINE_STRIPE_SUMMARY",
+                 "summary record type") &&
+        check(extract_string_field(cpu_summary, "schedule", schedule) &&
+                  schedule == "matmul-then-dec",
+              "summary CPU schedule label") &&
+        check(extract_string_field(cpu_summary, "backend_route", backend_route) &&
+                  backend_route == "cpu",
+              "summary backend route label") &&
+        check(extract_u64_field(cpu_summary, "run_id", run_id) && run_id == 7,
+              "summary run_id") &&
+        check(extract_u64_field(cpu_summary, "stripe_idx", stripe_idx) && stripe_idx == 2,
+              "summary stripe identity") &&
+        check(extract_u64_field(cpu_summary, "stripe_rows", stripe_rows) && stripe_rows == 4,
+              "summary stripe rows") &&
+        check(extract_u64_field(cpu_summary, "la_workers", la_workers) && la_workers == 3,
+              "summary LA worker count") &&
+        check(extract_u64_field(cpu_summary, "sf_workers", sf_workers) && sf_workers == 1,
+              "summary SF worker count") &&
+        check(extract_u64_field(cpu_summary, "dec_workers", dec_workers) && dec_workers == 4,
+              "summary DEC worker count") &&
+        check(extract_u64_field(cpu_summary, "ordering_violation", ordering_violation) &&
+                  ordering_violation == 1,
+              "summary CPU ordering violation") &&
+        check(extract_u64_field(overlap_summary, "ordering_violation", overlap_ordering_violation) &&
+                  overlap_ordering_violation == 0,
+              "summary overlap ordering violation") &&
+        check(has_array_field(cpu_summary, "la_worker_body_start_ns") &&
+                  has_array_field(cpu_summary, "la_worker_body_end_ns") &&
+                  has_array_field(cpu_summary, "dec_shard_start_ns") &&
+                  has_array_field(cpu_summary, "dec_shard_end_ns"),
+              "summary array schema") &&
+        check(has_object_field(cpu_summary, "h1_histogram") &&
+                  !has_null_field(cpu_summary, "h1_histogram"),
+              "summary H1 histogram object") &&
+        check(extract_u64_field(cpu_summary, "T_LA_ns", t_la_ns) && t_la_ns == 50 &&
+                  extract_u64_field(cpu_summary, "T_SF_ns", t_sf_ns) && t_sf_ns == 45 &&
+                  extract_u64_field(cpu_summary, "T_MatMul_ns", t_matmul_ns) &&
+                  t_matmul_ns == 50 &&
+                  extract_u64_field(cpu_summary, "T_Merge_ns", t_merge_ns) && t_merge_ns == 10 &&
+                  extract_u64_field(cpu_summary, "T_DEC_kernel_ns", t_dec_kernel_ns) &&
+                  t_dec_kernel_ns == 35 &&
+                  extract_u64_field(cpu_summary, "T_DEC_premerge_ns", t_dec_premerge_ns) &&
+                  t_dec_premerge_ns == 55,
+              "summary timing formulas") &&
+        check([&] {
+                  MatmulJobMetrics unavailable = profile;
+                  unavailable.sf_mask_start_ns = 0;
+                  unavailable.sf_commit_ns = 0;
+                  unavailable.merge_start_ns = 0;
+                  unavailable.merge_end_ns = 0;
+                  const std::string summary = detail::pipeline_stripe_summary_json(
+                      "attn_q", 16, 32, 64, "cpu", "matmul-then-dec", unavailable);
+                  uint64_t sf_ns = 1;
+                  uint64_t merge_ns = 1;
+                  return extract_u64_field(summary, "T_SF_ns", sf_ns) && sf_ns == 0 &&
+                      extract_u64_field(summary, "T_Merge_ns", merge_ns) && merge_ns == 0;
+              }(),
+              "summary unavailable timing defaults") &&
+        check(extract_u64_field(cpu_summary, "la_service_sum_ns", la_service_sum_ns) &&
+                  la_service_sum_ns == 90 &&
+                  extract_u64_field(cpu_summary, "dec_kernel_service_sum_ns", dec_kernel_service_sum_ns) &&
+                  dec_kernel_service_sum_ns == 80 &&
+                  extract_u64_field(cpu_summary, "dec_service_sum_ns", dec_service_sum_ns) &&
+                  dec_service_sum_ns == 80,
+              "summary service sums") &&
+        check(extract_double_field(cpu_summary, "la_efficiency", la_efficiency) &&
+                  std::abs(la_efficiency - 0.6) < 1e-9 &&
+                  extract_double_field(cpu_summary, "dec_kernel_efficiency", dec_kernel_efficiency) &&
+                  std::abs(dec_kernel_efficiency - (80.0 / 140.0)) < 1e-9 &&
+                  extract_double_field(cpu_summary, "dec_service_efficiency", dec_service_efficiency) &&
+                  std::abs(dec_service_efficiency - (80.0 / 140.0)) < 1e-9,
+              "summary efficiency formulas") &&
+        check(cpu_summary.find("\"h1_histogram\":{\"available\":true") != std::string::npos &&
+                  extract_string_field(cpu_summary, "selected_route", selected_route) &&
+                  selected_route == "h1_small_group_2_to_4" &&
+                  extract_u64_field(cpu_summary, "residual_nnz", residual_nnz) &&
+                  residual_nnz == 9 &&
+                  extract_u64_field(cpu_summary, "active_row_groups", active_row_groups) &&
+                  active_row_groups == 4 &&
+                  extract_u64_field(cpu_summary, "weight_vector_load_count", weight_vector_load_count) &&
+                  weight_vector_load_count == 48,
+              "summary histogram payload");
+    if (passed) {
+        std::puts("PASS contract: pipeline stripe summary schema/order");
+    }
+    return passed;
 }
 
 bool test_disabled_stripe_modes_are_rejected() {
@@ -1823,12 +2083,12 @@ bool test_live_pipeline_worker() {
     const auto * sink = collector.sink();
     const quants::QactOutlier outliers[] = {
         {0, 0, 2}, {1, 0, 2}, {2, 0, 2}, {3, 0, 2}, {4, 0, 2}, {5, 0, 2}};
-    if (!check(sink->on_ready(sink->user_data, { 0, 0, 1, &outliers[0], 1, 10, 20, 30, 50, 40, 70 }), "live worker capture") ||
-        !check(sink->on_ready(sink->user_data, { 1, 1, 2, &outliers[1], 1, 11, 21, 31, 51, 41, 71 }), "live worker capture") ||
-        !check(sink->on_ready(sink->user_data, { 2, 2, 3, &outliers[2], 1, 12, 22, 32, 52, 42, 72 }), "live worker capture") ||
-        !check(sink->on_ready(sink->user_data, { 3, 3, 4, &outliers[3], 1, 13, 23, 33, 53, 43, 73 }), "live worker capture") ||
-        !check(sink->on_ready(sink->user_data, { 4, 4, 5, &outliers[4], 1, 14, 24, 34, 54, 44, 74 }), "live worker capture") ||
-        !check(sink->on_ready(sink->user_data, { 5, 5, 6, &outliers[5], 1, 15, 25, 35, 55, 45, 75 }), "live worker tail capture") ||
+    if (!check(sink->on_ready(sink->user_data, make_ready_event(0, 0, 1, &outliers[0], 1, 10, 20, 30, 50, 40, 70)), "live worker capture") ||
+        !check(sink->on_ready(sink->user_data, make_ready_event(1, 1, 2, &outliers[1], 1, 11, 21, 31, 51, 41, 71)), "live worker capture") ||
+        !check(sink->on_ready(sink->user_data, make_ready_event(2, 2, 3, &outliers[2], 1, 12, 22, 32, 52, 42, 72)), "live worker capture") ||
+        !check(sink->on_ready(sink->user_data, make_ready_event(3, 3, 4, &outliers[3], 1, 13, 23, 33, 53, 43, 73)), "live worker capture") ||
+        !check(sink->on_ready(sink->user_data, make_ready_event(4, 4, 5, &outliers[4], 1, 14, 24, 34, 54, 44, 74)), "live worker capture") ||
+        !check(sink->on_ready(sink->user_data, make_ready_event(5, 5, 6, &outliers[5], 1, 15, 25, 35, 55, 45, 75)), "live worker tail capture") ||
         !check(collector.finish().ok(), "live worker finish") ||
         !check(collector.profiles().size() == 6, "live worker stripe profiles") ||
         !check(collector.profiles()[0].la_cycles == 10 && collector.profiles()[0].la3_cycles == 30 &&
@@ -1910,10 +2170,10 @@ bool test_live_worker_failed_capture_releases_collector_slot() {
     const auto * sink = collector.sink();
     const quants::QactOutlier outlier = { 0, 0, 2 };
     const bool first_admitted = sink->on_ready(
-        sink->user_data, { 0, 0, 1, &outlier, 1 });
+        sink->user_data, make_ready_event(0, 0, 1, &outlier, 1));
     auto duplicate = std::async(std::launch::async, [sink] {
         const quants::QactOutlier duplicate_outlier = { 1, 0, 2 };
-        return sink->on_ready(sink->user_data, { 0, 1, 2, &duplicate_outlier, 1 });
+        return sink->on_ready(sink->user_data, make_ready_event(0, 1, 2, &duplicate_outlier, 1));
     });
     const bool duplicate_bounded = duplicate.wait_for(std::chrono::seconds(2)) ==
         std::future_status::ready;
@@ -1934,7 +2194,7 @@ bool test_live_worker_failed_capture_releases_collector_slot() {
     const auto * replacement_sink = replacement.sink();
     const quants::QactOutlier replacement_outlier = { 0, 0, 2 };
     const bool replacement_admitted = replacement_started && replacement_sink->on_ready(
-        replacement_sink->user_data, { 0, 0, 2, &replacement_outlier, 1 });
+        replacement_sink->user_data, make_ready_event(0, 0, 2, &replacement_outlier, 1));
     const bool replacement_finished = replacement_admitted && replacement.finish().ok() &&
         finish_execution(replacement_execution).ok();
 
@@ -2030,7 +2290,7 @@ bool test_malformed_event_wakes_blocked_producer() {
     const auto * sink = collector.sink();
     const quants::QactOutlier first_outlier = { 0, 0, 2 };
     const bool first_admitted = sink->on_ready(
-        sink->user_data, { 0, 0, 1, &first_outlier, 1 });
+        sink->user_data, make_ready_event(0, 0, 1, &first_outlier, 1));
     const auto in_flight_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (collector.snapshot().in_flight != 1 &&
            std::chrono::steady_clock::now() < in_flight_deadline) {
@@ -2038,11 +2298,11 @@ bool test_malformed_event_wakes_blocked_producer() {
     }
     auto blocked = std::async(std::launch::async, [sink] {
         const quants::QactOutlier second_outlier = { 1, 0, 2 };
-        return sink->on_ready(sink->user_data, { 1, 1, 2, &second_outlier, 1 });
+        return sink->on_ready(sink->user_data, make_ready_event(1, 1, 2, &second_outlier, 1));
     });
     const bool producer_blocked = blocked.wait_for(std::chrono::milliseconds(20)) ==
         std::future_status::timeout;
-    const bool malformed_rejected = !sink->on_ready(sink->user_data, { 2, 1, 1, nullptr, 0 });
+    const bool malformed_rejected = !sink->on_ready(sink->user_data, make_ready_event(2, 1, 1, nullptr, 0));
     const bool producer_woke = blocked.wait_for(std::chrono::seconds(2)) ==
         std::future_status::ready;
     if (!producer_woke) {
@@ -2214,7 +2474,7 @@ bool run_live_worker_compensation(size_t shard_count, size_t capacity, std::vect
     quants::QactOutlier outlier{ 0, 0, 2 };
     const auto * sink = collector.sink();
     const bool captured = sink->on_ready(
-        sink->user_data, { 0, 0, 3, &outlier, 1, 10, 20, 30, 50 });
+        sink->user_data, make_ready_event(0, 0, 3, &outlier, 1, 10, 20, 30, 50));
     return captured && collector.finish().ok() && finish_execution(execution).ok();
 }
 
@@ -2525,7 +2785,7 @@ bool test_live_worker_rc_failure_releases_collector_slot_once() {
     }
     const auto * sink = collector.sink();
     const bool injected_job_admitted = sink->on_ready(
-        sink->user_data, { 0, 0, 2, nullptr, 0, 10, 20, 30, 50 });
+        sink->user_data, make_ready_event(0, 0, 2, nullptr, 0, 10, 20, 30, 50));
     const auto failure = collector.finish();
     const auto execution_failure = finish_execution(execution);
 
@@ -2538,7 +2798,7 @@ bool test_live_worker_rc_failure_releases_collector_slot_once() {
     const bool replacement_started = replacement.start(replacement_execution);
     const auto * replacement_sink = replacement.sink();
     const bool replacement_admitted = replacement_started && replacement_sink->on_ready(
-        replacement_sink->user_data, { 0, 0, 2, nullptr, 0, 10, 20, 30, 50 });
+        replacement_sink->user_data, make_ready_event(0, 0, 2, nullptr, 0, 10, 20, 30, 50));
     const bool replacement_finished = replacement_admitted && replacement.finish().ok() &&
         finish_execution(replacement_execution).ok();
 
@@ -2581,7 +2841,7 @@ bool test_rc_failure_external_cancel_while_dense_idle() {
     }
     const auto * sink = collector.sink();
     const bool admitted = sink->on_ready(
-        sink->user_data, { 0, 0, 2, nullptr, 0, 10, 20, 30, 50 });
+        sink->user_data, make_ready_event(0, 0, 2, nullptr, 0, 10, 20, 30, 50));
     if (!cpu_serial_route) {
         collector.test_wait_for_rc_failure();
     }
@@ -2602,7 +2862,7 @@ bool test_rc_failure_external_cancel_while_dense_idle() {
     const bool replacement_started = replacement.start(replacement_execution);
     const auto * replacement_sink = replacement.sink();
     const bool replacement_admitted = replacement_started && replacement_sink->on_ready(
-        replacement_sink->user_data, { 0, 0, 2, nullptr, 0, 10, 20, 30, 50 });
+        replacement_sink->user_data, make_ready_event(0, 0, 2, nullptr, 0, 10, 20, 30, 50));
     const bool replacement_finished = replacement_admitted && replacement.finish().ok() &&
         finish_execution(replacement_execution).ok();
     const auto dense_state_at_release = collector.test_dense_state_at_release();
@@ -2651,6 +2911,7 @@ int main(int argc, char ** argv) {
         return 0;
     }
     const bool configuration = test_public_contract_shape() &&
+        test_pipeline_stripe_summary_contract() &&
         test_matmul_option_resolution_precedence() &&
         test_default_matmul_mode_executes_configured_backend_path() &&
         test_dispatch_override_contract() &&

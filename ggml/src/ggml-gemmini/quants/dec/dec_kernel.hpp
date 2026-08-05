@@ -198,6 +198,28 @@ void accumulate_to_ycom_int64_block(
     float *Y_com);
 
 void accumulate_to_ycom_int64_h1(const ggml_gemmini_args_t &, const DecRoutePlan &, size_t, size_t, const float *, const std::vector<ResidualGroupEntry> &, const std::vector<ActiveRowGroup> &, const std::vector<size_t> &, const std::vector<size_t> &, float *);
+void accumulate_to_ycom_int64_h1_small_group_single(
+    const ggml_gemmini_args_t &args,
+    const DecRoutePlan &plan,
+    size_t I,
+    size_t J,
+    const float *activation_scales,
+    const std::vector<ResidualGroupEntry> &entries,
+    const std::vector<ActiveRowGroup> &groups,
+    const std::vector<size_t> &group_offsets,
+    const std::vector<size_t> &group_row_group_indices,
+    float *Y_com);
+void accumulate_to_ycom_int64_h1_small_group_2_to_4(
+    const ggml_gemmini_args_t &args,
+    const DecRoutePlan &plan,
+    size_t I,
+    size_t J,
+    const float *activation_scales,
+    const std::vector<ResidualGroupEntry> &entries,
+    const std::vector<ActiveRowGroup> &groups,
+    const std::vector<size_t> &group_offsets,
+    const std::vector<size_t> &group_row_group_indices,
+    float *Y_com);
 
 void apply_ycom_to_output(
     const float *Y_com,

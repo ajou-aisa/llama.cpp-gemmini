@@ -686,6 +686,115 @@ namespace
         });
     }
 
+    template <typename CodeFor, typename ScaleParamsFor>
+    void run_h1_small_group_single(
+        size_t I,
+        size_t J,
+        const float *activation_scales,
+        const std::vector<ResidualGroupEntry> &entries,
+        const std::vector<ActiveRowGroup> &groups,
+        const std::vector<size_t> &group_offsets,
+        const std::vector<size_t> &group_row_group_indices,
+        CodeFor code_for,
+        ScaleParamsFor scale_params_for,
+        float *Y_com)
+    {
+        static_assert(kDecGroupSizeK == QK8_0, "H1 scale blocks must match DEC compute groups");
+        if (!Y_com || entries.size() != 1 || groups.size() != 1 || group_offsets.size() < 2 ||
+            group_row_group_indices.size() != groups.size() || I == 0 || J == 0)
+            return;
+
+        const ResidualGroupEntry &entry = entries.front();
+        const uint32_t entry_group = entry.k / kDecGroupSizeK;
+        for_each_grouped_j_tile(1, J, [&](size_t jb, size_t width, std::vector<int64_t> &)
+        {
+            H1ScaleTile scale_tile;
+            for (size_t t = 0; t < width; ++t)
+            {
+                const H1ScaleParams params = scale_params_for(jb + t, entry_group);
+                scale_tile.c_eff[t] = params.c_eff;
+                scale_tile.s_rf[t] = params.s_rf;
+            }
+
+            const float activation_scale = activation_scales ? activation_scales[entry.row] : 1.0f;
+            float *output = Y_com + static_cast<size_t>(entry.row) * J + jb;
+            for (size_t t = 0; t < width; ++t)
+                output[t] += apply_h1_scale_ordered(
+                    static_cast<int64_t>(entry.residual) * code_for(jb + t, entry.k),
+                    scale_tile.c_eff[t],
+                    scale_tile.s_rf[t],
+                    activation_scale);
+        });
+    }
+
+    template <typename CodeFor, typename ScaleParamsFor>
+    void run_h1_small_group_2_to_4(
+        size_t I,
+        size_t J,
+        const float *activation_scales,
+        const std::vector<ResidualGroupEntry> &entries,
+        const std::vector<ActiveRowGroup> &groups,
+        const std::vector<size_t> &group_offsets,
+        const std::vector<size_t> &group_row_group_indices,
+        CodeFor code_for,
+        ScaleParamsFor scale_params_for,
+        float *Y_com)
+    {
+        static_assert(kDecGroupSizeK == QK8_0, "H1 scale blocks must match DEC compute groups");
+        if (!Y_com || entries.size() < 2 || entries.size() > 4 || groups.empty() ||
+            group_offsets.size() < 2 || group_row_group_indices.size() != groups.size() ||
+            I == 0 || J == 0)
+            return;
+
+        for_each_grouped_j_tile(1, J, [&](size_t jb, size_t width, std::vector<int64_t> &accumulator)
+        {
+            H1ScaleTile scale_tile;
+            for (size_t k_group = 0; k_group + 1 < group_offsets.size(); ++k_group)
+            {
+                if (group_offsets[k_group] == group_offsets[k_group + 1])
+                    continue;
+
+                for (size_t t = 0; t < width; ++t)
+                {
+                    const H1ScaleParams params = scale_params_for(jb + t, k_group);
+                    scale_tile.c_eff[t] = params.c_eff;
+                    scale_tile.s_rf[t] = params.s_rf;
+                }
+
+                for (size_t position = group_offsets[k_group]; position < group_offsets[k_group + 1]; ++position)
+                {
+                    const ActiveRowGroup &group = groups[group_row_group_indices[position]];
+                    const size_t group_nnz = group.entry_end - group.entry_begin;
+                    if (group_nnz == 0)
+                        continue;
+
+                    std::fill(accumulator.begin(), accumulator.begin() + width, int64_t {0});
+                    const ResidualGroupEntry &entry0 = entries[group.entry_begin];
+                    const ResidualGroupEntry *entry1 = group_nnz > 1 ? &entries[group.entry_begin + 1] : nullptr;
+                    const ResidualGroupEntry *entry2 = group_nnz > 2 ? &entries[group.entry_begin + 2] : nullptr;
+                    const ResidualGroupEntry *entry3 = group_nnz > 3 ? &entries[group.entry_begin + 3] : nullptr;
+                    for (size_t t = 0; t < width; ++t)
+                    {
+                        int64_t value = static_cast<int64_t>(entry0.residual) * code_for(jb + t, entry0.k);
+                        if (entry1)
+                            value += static_cast<int64_t>(entry1->residual) * code_for(jb + t, entry1->k);
+                        if (entry2)
+                            value += static_cast<int64_t>(entry2->residual) * code_for(jb + t, entry2->k);
+                        if (entry3)
+                            value += static_cast<int64_t>(entry3->residual) * code_for(jb + t, entry3->k);
+                        accumulator[t] = value;
+                    }
+
+                    const float activation_scale = activation_scales ? activation_scales[group.row] : 1.0f;
+                    float *output = Y_com + static_cast<size_t>(group.row) * J + jb;
+                    for (size_t t = 0; t < width; ++t)
+                        output[t] += apply_h1_scale_ordered(
+                            accumulator[t], scale_tile.c_eff[t], scale_tile.s_rf[t], activation_scale);
+                }
+            }
+        });
+    }
+
     template <typename CodeFor>
     void run_block_route(
         const ggml_gemmini_args_t &args,
@@ -1565,6 +1674,42 @@ void accumulate_to_ycom_int64_h1(
     const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
     run_h1_grouped_dec(I, J, activation_scales, entries, groups,
         group_offsets, group_row_group_indices,
+        [&args, &plan, weights](size_t j, size_t k) {
+            const block_q8_h1 *native = plan.native_weight_blocks ? args.q8_h1_block(j, k / QK8_0) : nullptr;
+            return native ? native->qs[k % QK8_0] : weights[j * plan.weight_stride + k];
+        },
+        [&args, &plan](size_t j, size_t block) {
+            return h1_scale_params(args, plan, j, block);
+        }, Y_com);
+}
+
+void accumulate_to_ycom_int64_h1_small_group_single(
+    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
+    const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
+    const std::vector<ActiveRowGroup> &groups, const std::vector<size_t> &group_offsets,
+    const std::vector<size_t> &group_row_group_indices, float *Y_com)
+{
+    const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
+    run_h1_small_group_single(I, J, activation_scales, entries, groups, group_offsets,
+        group_row_group_indices,
+        [&args, &plan, weights](size_t j, size_t k) {
+            const block_q8_h1 *native = plan.native_weight_blocks ? args.q8_h1_block(j, k / QK8_0) : nullptr;
+            return native ? native->qs[k % QK8_0] : weights[j * plan.weight_stride + k];
+        },
+        [&args, &plan](size_t j, size_t block) {
+            return h1_scale_params(args, plan, j, block);
+        }, Y_com);
+}
+
+void accumulate_to_ycom_int64_h1_small_group_2_to_4(
+    const ggml_gemmini_args_t &args, const DecRoutePlan &plan, size_t I, size_t J,
+    const float *activation_scales, const std::vector<ResidualGroupEntry> &entries,
+    const std::vector<ActiveRowGroup> &groups, const std::vector<size_t> &group_offsets,
+    const std::vector<size_t> &group_row_group_indices, float *Y_com)
+{
+    const int8_t *weights = reinterpret_cast<const int8_t *>(args.B);
+    run_h1_small_group_2_to_4(I, J, activation_scales, entries, groups, group_offsets,
+        group_row_group_indices,
         [&args, &plan, weights](size_t j, size_t k) {
             const block_q8_h1 *native = plan.native_weight_blocks ? args.q8_h1_block(j, k / QK8_0) : nullptr;
             return native ? native->qs[k % QK8_0] : weights[j * plan.weight_stride + k];

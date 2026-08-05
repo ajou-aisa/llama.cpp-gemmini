@@ -31,6 +31,8 @@ namespace ggml::gemmini::quants::dec
 {
 namespace
 {
+    constexpr bool kH1SmallGroupFastpathEnabled =
+        GGML_GEMMINI_DEC_H1_SMALL_GROUP_FASTPATH != 0;
 
     struct ActivationDECScratch
     {
@@ -94,6 +96,132 @@ namespace
             return false;
         out = lhs + rhs;
         return true;
+    }
+
+    PreparedDecSelectedRoute select_prepared_dec_route(
+        bool use_group_k_csc,
+        bool use_int64_h1,
+        bool native_weight_blocks,
+        size_t nnz)
+    {
+        if (use_group_k_csc)
+            return PreparedDecSelectedRoute::group_k_csc;
+        if (kH1SmallGroupFastpathEnabled && use_int64_h1 && native_weight_blocks)
+        {
+            if (nnz == 1)
+                return PreparedDecSelectedRoute::h1_small_group_single;
+            if (nnz >= 2 && nnz <= 4)
+                return PreparedDecSelectedRoute::h1_small_group_2_to_4;
+        }
+        return PreparedDecSelectedRoute::row_direct;
+    }
+
+    size_t count_active_rows(const std::vector<ActiveRowGroup> &groups)
+    {
+        size_t active_rows = 0;
+        uint32_t previous_row = std::numeric_limits<uint32_t>::max();
+        for (const ActiveRowGroup &group : groups)
+        {
+            if (group.row == previous_row)
+                continue;
+            previous_row = group.row;
+            ++active_rows;
+        }
+        return active_rows;
+    }
+
+    size_t count_active_row_scale_groups(
+        const std::vector<ResidualGroupEntry> &entries,
+        const std::vector<ActiveRowGroup> &groups,
+        size_t scale_group_size)
+    {
+        if (scale_group_size == 0)
+            return 0;
+
+        size_t active_row_scale_groups = 0;
+        for (const ActiveRowGroup &group : groups)
+        {
+            size_t previous_scale_group = std::numeric_limits<size_t>::max();
+            for (size_t position = group.entry_begin; position < group.entry_end; ++position)
+            {
+                const size_t scale_group = entries[position].k / scale_group_size;
+                if (scale_group == previous_scale_group)
+                    continue;
+                ++active_row_scale_groups;
+                previous_scale_group = scale_group;
+            }
+        }
+        return active_row_scale_groups;
+    }
+
+    size_t estimate_group_k_csc_vector_load_count(size_t nr, size_t active_k_count, size_t J)
+    {
+        if (nr <= 1)
+            return 0;
+
+        size_t vector_loads_per_k = 0;
+        for (size_t jb = 0; jb < J; jb += kDecInt64JTileWidth)
+        {
+            const size_t width = std::min(kDecInt64JTileWidth, J - jb);
+            vector_loads_per_k = saturating_add_size(
+                vector_loads_per_k, width / nr + (width % nr != 0));
+        }
+        return saturating_mul_size(active_k_count, vector_loads_per_k);
+    }
+
+    PreparedDecWorkloadHistogram make_prepared_workload_histogram(
+        const std::vector<ResidualGroupEntry> &entries,
+        const std::vector<ActiveRowGroup> &active_row_groups,
+        const DecRoutePlan &route,
+        size_t I,
+        size_t J,
+        size_t K,
+        size_t unique_k_count,
+        size_t active_row_k_pairs,
+        size_t rows_per_active_k_max,
+        bool use_group_k_csc,
+        bool use_int64_h1,
+        size_t nr)
+    {
+        PreparedDecWorkloadHistogram histogram{};
+        histogram.residual_nnz = entries.size();
+        histogram.residual_density =
+            I == 0 || K == 0 ? 0.0 :
+            static_cast<double>(entries.size()) / static_cast<double>(I * K);
+        histogram.active_row_groups = active_row_groups.size();
+        histogram.active_k = unique_k_count;
+        for (const ActiveRowGroup &group : active_row_groups)
+        {
+            const size_t group_nnz = group.entry_end - group.entry_begin;
+            if (group_nnz == 1)
+                ++histogram.bin_1;
+            else if (group_nnz <= 4)
+                ++histogram.bin_2_to_4;
+            else if (group_nnz <= 8)
+                ++histogram.bin_5_to_8;
+            else
+                ++histogram.bin_over_8;
+        }
+        histogram.rows_per_active_k_mean = unique_k_count == 0 ? 0.0 :
+            static_cast<double>(active_row_k_pairs) / static_cast<double>(unique_k_count);
+        histogram.rows_per_active_k_max = rows_per_active_k_max;
+        histogram.estimated_int_mac_count = saturating_mul_size(entries.size(), J);
+        histogram.selected_route = select_prepared_dec_route(
+            use_group_k_csc, use_int64_h1, route.native_weight_blocks, entries.size());
+
+        const bool scaled_route = !route.scales.scalar_mode && !route.scales.row_header_mode &&
+            !route.scales.channel_mode;
+        const size_t active_rows = count_active_rows(active_row_groups);
+        const size_t scale_group_size = use_int64_h1 ? kDecGroupSizeK : route.scales.block_size;
+        const size_t active_row_scale_groups = scaled_route ?
+            count_active_row_scale_groups(entries, active_row_groups, scale_group_size) : 0;
+        histogram.ycom_write_count = saturating_mul_size(
+            scaled_route ? active_row_scale_groups : active_rows, J);
+        histogram.weight_scalar_load_count = use_group_k_csc ?
+            saturating_mul_size(unique_k_count, J) : histogram.estimated_int_mac_count;
+        histogram.weight_vector_load_count = use_group_k_csc ?
+            estimate_group_k_csc_vector_load_count(nr, unique_k_count, J) : 0;
+        return histogram;
     }
 
     size_t estimate_group_k_csc_plan_bytes(size_t group_count, size_t entry_count, size_t active_row_group_count)
@@ -407,6 +535,7 @@ struct PreparedDecSlice::Data
     GroupKCSCPlan group_k_csc_plan;
     std::vector<DecColumnRange> ranges;
     ActivationDECResult result{};
+    PreparedDecWorkloadHistogram histogram{};
     DecPreparationCounters counters{};
     size_t nr = 1;
     bool use_group_k_csc = false;
@@ -445,9 +574,20 @@ const ActivationDECResult & PreparedDecSlice::result() const
     return data_ ? data_->result : empty;
 }
 
+const PreparedDecWorkloadHistogram & PreparedDecSlice::workload_histogram() const
+{
+    static const PreparedDecWorkloadHistogram empty;
+    return data_ ? data_->histogram : empty;
+}
+
 DecPreparationCounters PreparedDecSlice::preparation_counters() const
 {
     return data_ ? data_->counters : DecPreparationCounters{};
+}
+
+bool h1_small_group_fastpath_enabled()
+{
+    return kH1SmallGroupFastpathEnabled;
 }
 
 namespace
@@ -467,6 +607,8 @@ DecStatus slice_dec_columns(
     const size_t width = col_end - col_begin;
     local_args = source;
     local_args.J = width;
+    if (local_args.stride_f_out == 0)
+        local_args.stride_f_out = source.J;
     local_args.f_out += offset;
 
     const bool channel_direct = source.weight_format ==
@@ -632,8 +774,6 @@ DecStatus prepare_activation_dec_slice(
         std::sort(unique_k.begin(), unique_k.end());
         unique_k.erase(std::unique(unique_k.begin(), unique_k.end()), unique_k.end());
         data->result.unique_k_count = unique_k.size();
-        data->result.int_mac_count = saturating_mul_size(data->result.nnz, data->args.J);
-        data->result.logical_weight_reference_count = data->result.int_mac_count;
 
         const size_t group_count = data->args.K / kDecGroupSizeK +
             (data->args.K % kDecGroupSizeK != 0);
@@ -654,17 +794,26 @@ DecStatus prepare_activation_dec_slice(
 
         const bool group_supported = data->use_int64_scalar || data->use_int64_h1;
         size_t active_row_k_pairs = 0;
+        std::vector<size_t> rows_per_k(unique_k.size(), 0);
         bool first = true;
         uint32_t previous_row = 0;
         uint32_t previous_k = 0;
         for (const ResidualGroupEntry &entry : data->residual_entries) {
             if (first || entry.row != previous_row || entry.k != previous_k)
+            {
                 ++active_row_k_pairs;
+                const auto it = std::lower_bound(unique_k.begin(), unique_k.end(), entry.k);
+                if (it != unique_k.end() && *it == entry.k)
+                    ++rows_per_k[static_cast<size_t>(it - unique_k.begin())];
+            }
             first = false;
             previous_row = entry.row;
             previous_k = entry.k;
         }
         data->result.active_row_k_pairs = active_row_k_pairs;
+        for (size_t row_count : rows_per_k)
+            data->result.rows_per_active_k_max =
+                std::max(data->result.rows_per_active_k_max, row_count);
         const double rows_per_active_k_mean = unique_k.empty() ? 0.0 :
             static_cast<double>(active_row_k_pairs) / unique_k.size();
         const size_t estimated_plan_bytes = estimate_group_k_csc_plan_bytes(
@@ -723,6 +872,24 @@ DecStatus prepare_activation_dec_slice(
             data->ranges.push_back({ begin, end });
             begin = end;
         }
+        data->histogram = make_prepared_workload_histogram(
+            data->residual_entries,
+            data->active_row_groups,
+            data->route,
+            data->args.I,
+            data->args.J,
+            data->args.K,
+            data->result.unique_k_count,
+            data->result.active_row_k_pairs,
+            data->result.rows_per_active_k_max,
+            data->use_group_k_csc,
+            data->use_int64_h1,
+            data->nr);
+        data->result.int_mac_count = data->histogram.estimated_int_mac_count;
+        data->result.logical_weight_reference_count = data->result.int_mac_count;
+        data->result.weight_scalar_load_count = data->histogram.weight_scalar_load_count;
+        data->result.weight_vector_load_count = data->histogram.weight_vector_load_count;
+        data->result.ycom_global_write_count = data->histogram.ycom_write_count;
         prepared = std::shared_ptr<const PreparedDecSlice>(new PreparedDecSlice(std::move(data)));
         return DecStatus::success;
     } catch (const std::bad_alloc &) {
@@ -801,9 +968,28 @@ DecStatus execute_prepared_dec_shard(
                         activation_scales, data.residual_entries, data.active_row_groups,
                         data.group_offsets, data.group_row_group_indices, scratch.ycom.data());
                 else if (data.use_int64_h1)
-                    accumulate_to_ycom_int64_h1(local_args, local_route, data.args.I, width,
-                        activation_scales, data.residual_entries, data.active_row_groups,
-                        data.group_offsets, data.group_row_group_indices, scratch.ycom.data());
+                    switch (data.histogram.selected_route)
+                    {
+                        case PreparedDecSelectedRoute::h1_small_group_single:
+                            accumulate_to_ycom_int64_h1_small_group_single(
+                                local_args, local_route, data.args.I, width,
+                                activation_scales, data.residual_entries, data.active_row_groups,
+                                data.group_offsets, data.group_row_group_indices,
+                                scratch.ycom.data());
+                            break;
+                        case PreparedDecSelectedRoute::h1_small_group_2_to_4:
+                            accumulate_to_ycom_int64_h1_small_group_2_to_4(
+                                local_args, local_route, data.args.I, width,
+                                activation_scales, data.residual_entries, data.active_row_groups,
+                                data.group_offsets, data.group_row_group_indices,
+                                scratch.ycom.data());
+                            break;
+                        default:
+                            accumulate_to_ycom_int64_h1(local_args, local_route, data.args.I, width,
+                                activation_scales, data.residual_entries, data.active_row_groups,
+                                data.group_offsets, data.group_row_group_indices, scratch.ycom.data());
+                            break;
+                    }
                 else if (data.use_int64_block)
                     accumulate_to_ycom_int64_block(local_args, local_route, data.args.I, width,
                         activation_scales, data.residual_entries, data.active_row_groups,

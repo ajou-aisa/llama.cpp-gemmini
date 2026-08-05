@@ -2757,6 +2757,198 @@ bool test_thread_determinism() {
     return ok;
 }
 
+bool test_prepared_h1_small_group_fastpath() {
+    using ggml::gemmini::quants::dec::DecColumnRange;
+    using ggml::gemmini::quants::dec::DecShardScratch;
+    using ggml::gemmini::quants::dec::DecStatus;
+    using ggml::gemmini::quants::dec::DispatchOverride;
+    using ggml::gemmini::quants::dec::PreparedDecSelectedRoute;
+    using ggml::gemmini::quants::dec::PreparedDecSlice;
+    using ggml::gemmini::quants::QactOutlier;
+
+    constexpr size_t rows = 2;
+    constexpr size_t columns = 19;
+    constexpr size_t depth = 64;
+    constexpr size_t blocks = depth / QK8_0;
+    constexpr float s_rf_value = 0.00032747327350080013f;
+
+    const auto run_case = [&](const std::vector<QactOutlier> &outliers,
+                              PreparedDecSelectedRoute expected_route,
+                              const char *route_message,
+                              const char *parity_message) {
+        std::vector<ggml::gemmini::quants::dec::ResidualGroupEntry> expected_entries;
+        expected_entries.reserve(outliers.size());
+        for (const QactOutlier &outlier : outliers)
+            expected_entries.push_back({
+                static_cast<uint32_t>(outlier.row),
+                static_cast<uint32_t>(outlier.col),
+                outlier.residual,
+            });
+        std::vector<ggml::gemmini::quants::dec::ActiveRowGroup> expected_groups;
+        ggml::gemmini::quants::dec::build_active_row_groups(expected_entries, expected_groups);
+        size_t expected_bin_1 = 0;
+        size_t expected_bin_2_4 = 0;
+        size_t expected_bin_5_8 = 0;
+        size_t expected_bin_over_8 = 0;
+        for (const auto &group : expected_groups) {
+            const size_t group_nnz = group.entry_end - group.entry_begin;
+            if (group_nnz == 1)
+                ++expected_bin_1;
+            else if (group_nnz <= 4)
+                ++expected_bin_2_4;
+            else if (group_nnz <= 8)
+                ++expected_bin_5_8;
+            else
+                ++expected_bin_over_8;
+        }
+        std::vector<uint32_t> expected_unique_k;
+        expected_unique_k.reserve(expected_entries.size());
+        for (const auto &entry : expected_entries)
+            expected_unique_k.push_back(entry.k);
+        std::sort(expected_unique_k.begin(), expected_unique_k.end());
+        expected_unique_k.erase(
+            std::unique(expected_unique_k.begin(), expected_unique_k.end()),
+            expected_unique_k.end());
+        size_t expected_active_row_k_pairs = 0;
+        size_t expected_rows_per_active_k_max = 0;
+        if (!expected_unique_k.empty()) {
+            std::vector<size_t> rows_per_k(expected_unique_k.size(), 0);
+            bool first = true;
+            uint32_t previous_row = 0;
+            uint32_t previous_k = 0;
+            for (const auto &entry : expected_entries) {
+                if (first || entry.row != previous_row || entry.k != previous_k) {
+                    ++expected_active_row_k_pairs;
+                    const auto it = std::lower_bound(
+                        expected_unique_k.begin(), expected_unique_k.end(), entry.k);
+                    if (it != expected_unique_k.end() && *it == entry.k)
+                        ++rows_per_k[static_cast<size_t>(it - expected_unique_k.begin())];
+                }
+                first = false;
+                previous_row = entry.row;
+                previous_k = entry.k;
+            }
+            for (size_t row_count : rows_per_k)
+                expected_rows_per_active_k_max =
+                    std::max(expected_rows_per_active_k_max, row_count);
+        }
+
+        std::vector<block_q8_h1> blocks_data(columns * blocks);
+        for (size_t column = 0; column < columns; ++column)
+            for (size_t block = 0; block < blocks; ++block) {
+                block_q8_h1 &h1 = blocks_data[column * blocks + block];
+                std::fill(std::begin(h1.qs), std::end(h1.qs), int8_t {1});
+                h1.c_b = static_cast<uint8_t>(86 + (column + block) % 7);
+                h1.s_rf = s_rf_value;
+                h1.R = static_cast<uint16_t>(4095 - (column + block) % 11);
+            }
+        std::vector<float> reference(rows * columns, 0.0f);
+        std::vector<float> output(rows * columns, 0.0f);
+
+        ggml_gemmini_args_t reference_args{};
+        reference_args.I = rows;
+        reference_args.J = columns;
+        reference_args.K = depth;
+        reference_args.f_out = reference.data();
+        reference_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1;
+        reference_args.q8_h1_blocks = blocks_data.data();
+        reference_args.q8_h1_block_count = blocks_data.size();
+        reference_args.q8_h1_rows = columns;
+        reference_args.blocks_per_row = blocks;
+        reference_args.blocks_K = blocks;
+        reference_args.blocks_J = columns;
+        reference_args.block_size_k = QK8_0;
+
+        ggml_gemmini_args_t prepared_args = reference_args;
+        prepared_args.f_out = output.data();
+
+        ggml::gemmini::quants::dec::compensate_activation_dec(
+            outliers, reference_args, "test", DispatchOverride::row_direct);
+
+        std::shared_ptr<const PreparedDecSlice> prepared;
+        bool ok = check(ggml::gemmini::quants::dec::prepare_activation_dec_slice(
+                            outliers, prepared_args, 0, rows, 4,
+                            DispatchOverride::row_direct, prepared) == DecStatus::success &&
+                            prepared != nullptr,
+                        "prepared H1 small-group plan succeeds");
+        if (!prepared)
+            return false;
+
+        const auto histogram = prepared->workload_histogram();
+        ok = check(histogram.residual_nnz == outliers.size(),
+                   "prepared H1 histogram tracks residual nnz") && ok;
+        ok = check(std::fabs(
+                       histogram.residual_density -
+                       static_cast<double>(outliers.size()) /
+                           static_cast<double>(rows * depth)) < 1e-12,
+                   "prepared H1 histogram tracks residual density") && ok;
+        ok = check(histogram.active_row_groups == expected_groups.size(),
+                   "prepared H1 histogram tracks active row groups") && ok;
+        ok = check(histogram.active_k == expected_unique_k.size(),
+                   "prepared H1 histogram tracks active K") && ok;
+        ok = check(histogram.bin_1 == expected_bin_1 &&
+                       histogram.bin_2_to_4 == expected_bin_2_4 &&
+                       histogram.bin_5_to_8 == expected_bin_5_8 &&
+                       histogram.bin_over_8 == expected_bin_over_8,
+                   "prepared H1 histogram bins match grouped nnz") && ok;
+        ok = check(std::fabs(
+                       histogram.rows_per_active_k_mean -
+                       (expected_unique_k.empty() ? 0.0 :
+                            static_cast<double>(expected_active_row_k_pairs) /
+                                static_cast<double>(expected_unique_k.size()))) < 1e-12 &&
+                       histogram.rows_per_active_k_max == expected_rows_per_active_k_max,
+                   "prepared H1 histogram rows-per-active-k stats match") && ok;
+        ok = check(histogram.estimated_int_mac_count == outliers.size() * columns,
+                   "prepared H1 histogram tracks estimated int MACs") && ok;
+        ok = check(histogram.ycom_write_count == histogram.active_row_groups * columns,
+                   "prepared H1 histogram tracks ycom writes") && ok;
+        ok = check(histogram.weight_scalar_load_count == outliers.size() * columns &&
+                       histogram.weight_vector_load_count == 0,
+                   "prepared H1 histogram tracks weight loads") && ok;
+        ok = check(histogram.selected_route == expected_route, route_message) && ok;
+
+        const auto before = prepared->workload_histogram();
+        for (size_t shard = 0; shard < prepared->shard_count(); ++shard) {
+            DecShardScratch scratch;
+            ok = check(ggml::gemmini::quants::dec::execute_prepared_dec_shard(
+                           *prepared, shard, scratch) == DecStatus::success,
+                       "prepared H1 small-group shard executes") && ok;
+        }
+        const auto after = prepared->workload_histogram();
+        ok = check(before.selected_route == after.selected_route &&
+                       before.estimated_int_mac_count == after.estimated_int_mac_count &&
+                       before.ycom_write_count == after.ycom_write_count,
+                   "prepared H1 histogram stays immutable across shard execution") && ok;
+        ok = check(byte_identical(output, reference), parity_message) && ok;
+        return ok;
+    };
+
+    const bool fastpath_enabled = ggml::gemmini::quants::dec::h1_small_group_fastpath_enabled();
+    const PreparedDecSelectedRoute expected_single_route = fastpath_enabled ?
+        PreparedDecSelectedRoute::h1_small_group_single :
+        PreparedDecSelectedRoute::row_direct;
+    const PreparedDecSelectedRoute expected_multi_route = fastpath_enabled ?
+        PreparedDecSelectedRoute::h1_small_group_2_to_4 :
+        PreparedDecSelectedRoute::row_direct;
+
+    const std::vector<QactOutlier> single_outlier = {
+        {1, 63, 548339296},
+    };
+    const std::vector<QactOutlier> duplicate_tail_outliers = {
+        {0, 63, 548339296},
+        {0, 63, -27182818},
+        {1, 32, 1234567},
+        {1, 0, -7654321},
+    };
+
+    return run_case(single_outlier, expected_single_route,
+                    "prepared H1 single-outlier route matches build toggle",
+                    "prepared H1 single-outlier parity matches row-direct reference") &&
+        run_case(duplicate_tail_outliers, expected_multi_route,
+                 "prepared H1 2-to-4 route matches build toggle",
+                 "prepared H1 duplicate/tail parity matches row-direct reference");
+}
+
 bool test_prepared_dec_shards() {
     using namespace ggml::gemmini::quants::dec;
     constexpr size_t rows = 20;
@@ -2933,7 +3125,7 @@ int main() {
         test_group_k_csc_mixed_int32_boundaries() &&
         test_group_k_csc_mixed_prefix_and_plan_rejects() &&
         test_group_k_csc_fallback_ratio_matrix() &&
-        test_thread_determinism() && test_prepared_dec_shards() &&
+        test_thread_determinism() && test_prepared_h1_small_group_fastpath() && test_prepared_dec_shards() &&
         test_global_column_arithmetic_rejects_overflow() && test_inside_existing_openmp_region();
     std::printf("gemmini DEC baseline: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

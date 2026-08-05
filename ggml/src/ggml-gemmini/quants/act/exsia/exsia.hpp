@@ -348,7 +348,9 @@ namespace ggml::gemmini::quants::act::exsia
 
     struct StripeReadyEvent
     {
+        uint64_t run_id = 0;
         size_t stripe_id = 0;
+        size_t slot = 0;
         size_t row_begin = 0;
         size_t row_end = 0;
         const ggml_gemmini_qact_outlier *outliers = nullptr;
@@ -363,6 +365,13 @@ namespace ggml::gemmini::quants::act::exsia
         uint64_t local_end_ns = 0;
         uint64_t folding_start_ns = 0;
         uint64_t folding_end_ns = 0;
+        std::array<uint64_t, 3> local_worker_start_ns{};
+        std::array<uint64_t, 3> local_worker_end_ns{};
+        uint64_t mask_assembly_start_ns = 0;
+        uint64_t mask_assembly_end_ns = 0;
+        uint64_t exponent_reduction_start_ns = 0;
+        uint64_t exponent_reduction_end_ns = 0;
+        uint64_t folding_commit_ns = 0;
     };
 
     struct StripeReadySink
@@ -524,6 +533,7 @@ namespace ggml::gemmini::quants::act::exsia
         size_t block_mask_words_per_block = 0;
         size_t active_block_count = 0;
         std::vector<ggml_gemmini_qact_outlier> outliers; // stripe-local, merged after folding
+        uint64_t folding_commit_ns = 0;
 
 #if EXSIA_BRANCH_COUNTS_ENABLED
         StripeCycleStats cycle_stats;
@@ -575,6 +585,7 @@ namespace ggml::gemmini::quants::act::exsia
             stripe.outlier_mask.cols = 0;
             stripe.scratch.reset();
             outliers.clear();
+            folding_commit_ns = 0;
 #if EXSIA_BRANCH_COUNTS_ENABLED
             cycle_stats.reset();
 #endif
@@ -623,6 +634,7 @@ namespace ggml::gemmini::quants::act::exsia
             std::fill_n(block_mask_words.begin(), block_mask_word_count, uint64_t{0});
             active_block_count = blocks;
             outliers.clear();
+            folding_commit_ns = 0;
 #if EXSIA_BRANCH_COUNTS_ENABLED
             cycle_stats.reset();
 #endif
@@ -643,9 +655,10 @@ namespace ggml::gemmini::quants::act::exsia
             lifecycle = StripePipelineSlotState::LocalFilled;
         }
 
-        void mark_folding_committed()
+        void mark_folding_committed(uint64_t commit_ns = 0)
         {
             assert(lifecycle == StripePipelineSlotState::LocalFilled);
+            folding_commit_ns = commit_ns;
             lifecycle = StripePipelineSlotState::FoldingCommitted;
         }
 

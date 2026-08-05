@@ -9,6 +9,10 @@
 
 struct ggml_gemmini_args_t;
 
+#ifndef GGML_GEMMINI_DEC_H1_SMALL_GROUP_FASTPATH
+#define GGML_GEMMINI_DEC_H1_SMALL_GROUP_FASTPATH 1
+#endif
+
 namespace ggml::gemmini::quants::dec
 {
 enum class DispatchOverride : uint8_t
@@ -59,6 +63,33 @@ struct DecPreparationCounters
     size_t group_k_csc_plan_build_count = 0;
 };
 
+enum class PreparedDecSelectedRoute : uint8_t
+{
+    row_direct,
+    group_k_csc,
+    h1_small_group_single,
+    h1_small_group_2_to_4,
+};
+
+struct PreparedDecWorkloadHistogram
+{
+    size_t residual_nnz = 0;
+    double residual_density = 0.0;
+    size_t active_row_groups = 0;
+    size_t active_k = 0;
+    size_t bin_1 = 0;
+    size_t bin_2_to_4 = 0;
+    size_t bin_5_to_8 = 0;
+    size_t bin_over_8 = 0;
+    double rows_per_active_k_mean = 0.0;
+    size_t rows_per_active_k_max = 0;
+    size_t estimated_int_mac_count = 0;
+    size_t ycom_write_count = 0;
+    size_t weight_scalar_load_count = 0;
+    size_t weight_vector_load_count = 0;
+    PreparedDecSelectedRoute selected_route = PreparedDecSelectedRoute::row_direct;
+};
+
 struct DecShardScratch
 {
     std::vector<float> ycom;
@@ -74,6 +105,7 @@ public:
     size_t nr() const;
     bool uses_group_k_csc() const;
     const ActivationDECResult & result() const;
+    const PreparedDecWorkloadHistogram & workload_histogram() const;
     DecPreparationCounters preparation_counters() const;
 
 private:
@@ -88,6 +120,8 @@ private:
     friend DecStatus execute_prepared_dec_shard(
         const PreparedDecSlice &, size_t, DecShardScratch &, float *, size_t);
 };
+
+bool h1_small_group_fastpath_enabled();
 
 DecStatus prepare_activation_dec_slice(
     const std::vector<QactOutlier> &outliers,

@@ -5,6 +5,7 @@
 #include "quants/act/exsia/exsia.hpp"
 #include "quants/dec/dec.hpp"
 
+#include <array>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
@@ -14,12 +15,15 @@
 #include <mutex>
 #include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <unordered_set>
 #include <vector>
 
 namespace ggml::gemmini {
+
+struct MatmulJobMetrics;
 
 namespace detail {
 
@@ -52,6 +56,14 @@ RouteCapabilities route_capabilities(const ggml_gemmini_args_t & args);
 const char * activation_route_name(ActivationRoute route);
 const char * weight_route_name(WeightRoute route);
 const char * backend_route_name(BackendRoute route);
+std::string pipeline_stripe_summary_json(const char * layer,
+                                         size_t I,
+                                         size_t J,
+                                         size_t K,
+                                         const char * backend_route,
+                                         const char * schedule,
+                                         const MatmulJobMetrics & profile);
+bool append_pipeline_stripe_summary_jsonl(const std::string & json_record);
 
 }
 
@@ -176,15 +188,28 @@ struct MatmulStageMetrics {
 };
 
 struct MatmulJobMetrics {
+    uint64_t run_id = 0;
     size_t stripe_id = 0;
+    size_t slot = 0;
     size_t row_begin = 0;
     size_t row_end = 0;
     size_t rc_shards = 0;
+    quants::dec::PreparedDecWorkloadHistogram h1_histogram{};
+    bool h1_histogram_available = false;
     uint64_t la_cycles = 0;
     uint64_t la3_cycles = 0;
     uint64_t sf_cycles = 0;
     uint64_t la3_ns = 0;
     uint64_t sf1_ns = 0;
+    std::array<uint64_t, 3> la_worker_start_ns{};
+    std::array<uint64_t, 3> la_worker_end_ns{};
+    uint64_t sf_mask_start_ns = 0;
+    uint64_t sf_mask_end_ns = 0;
+    uint64_t sf_exponent_start_ns = 0;
+    uint64_t sf_exponent_end_ns = 0;
+    uint64_t sf_folding_start_ns = 0;
+    uint64_t sf_folding_end_ns = 0;
+    uint64_t sf_commit_ns = 0;
     MatmulStageMetrics la;
     MatmulStageMetrics sf;
     MatmulStageMetrics handoff;
@@ -201,10 +226,20 @@ struct MatmulJobMetrics {
     MatmulStageMetrics rc_finalize;
     MatmulStageMetrics rc_wait;
     MatmulStageMetrics t_RC4;
+    uint64_t producer_wait_start_ns = 0;
+    uint64_t producer_wait_end_ns = 0;
+    uint64_t capture_queue_enqueue_ns = 0;
     uint64_t ws_start_ns = 0;
     uint64_t ws_end_ns = 0;
+    uint64_t rc_enqueue_ns = 0;
     uint64_t rc_start_ns = 0;
     uint64_t rc_end_ns = 0;
+    uint64_t rc_prepare_start_ns = 0;
+    uint64_t rc_prepare_end_ns = 0;
+    std::array<uint64_t, 4> rc_shard_start_ns{};
+    std::array<uint64_t, 4> rc_shard_end_ns{};
+    uint64_t merge_start_ns = 0;
+    uint64_t merge_end_ns = 0;
 };
 
 struct MatmulCollectorSnapshot {
@@ -264,7 +299,9 @@ public:
 
 private:
     struct CapturedStripe {
+        uint64_t run_id = 0;
         size_t stripe_id;
+        size_t slot = 0;
         size_t row_begin;
         size_t row_end;
         std::vector<quants::QactOutlier> outliers;
@@ -273,9 +310,20 @@ private:
         uint64_t sf_cycles = 0;
         uint64_t la3_ns = 0;
         uint64_t sf1_ns = 0;
+        std::array<uint64_t, 3> la_worker_start_ns{};
+        std::array<uint64_t, 3> la_worker_end_ns{};
+        uint64_t sf_mask_start_ns = 0;
+        uint64_t sf_mask_end_ns = 0;
+        uint64_t sf_exponent_start_ns = 0;
+        uint64_t sf_exponent_end_ns = 0;
+        uint64_t sf_folding_start_ns = 0;
+        uint64_t sf_folding_end_ns = 0;
+        uint64_t sf_commit_ns = 0;
         MatmulStageMetrics capture_copy;
         MatmulStageMetrics producer_wait;
         MatmulStageMetrics queue_insert;
+        uint64_t producer_wait_start_ns = 0;
+        uint64_t producer_wait_end_ns = 0;
         uint64_t queued_ns = 0;
     };
     struct RcTask {

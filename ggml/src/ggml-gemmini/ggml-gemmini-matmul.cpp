@@ -10,9 +10,12 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <filesystem>
 #include <cstdio>
+#include <iomanip>
 #include <limits>
 #include <new>
+#include <sstream>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
@@ -448,6 +451,204 @@ const char * backend_route_name(BackendRoute route) {
         case BackendRoute::ws_sim: return "ws_sim";
     }
     return "unknown";
+}
+
+static const char * prepared_dec_route_name(quants::dec::PreparedDecSelectedRoute route) {
+    switch (route) {
+        case quants::dec::PreparedDecSelectedRoute::row_direct: return "row_direct";
+        case quants::dec::PreparedDecSelectedRoute::group_k_csc: return "group_k_csc";
+        case quants::dec::PreparedDecSelectedRoute::h1_small_group_single: return "h1_small_group_single";
+        case quants::dec::PreparedDecSelectedRoute::h1_small_group_2_to_4: return "h1_small_group_2_to_4";
+    }
+    return "unknown";
+}
+
+static std::string resolved_pipeline_summary_log_path() {
+    constexpr const char * default_path = "log/debug-log.jsonl";
+    if (const char * dir = std::getenv("GEMMINI_LOG_DIR")) {
+        const std::filesystem::path base(dir);
+        return (base / "debug-log.jsonl").string();
+    }
+    return std::filesystem::path(default_path).string();
+}
+
+bool append_pipeline_stripe_summary_jsonl(const std::string & json_record) {
+    const std::filesystem::path path(resolved_pipeline_summary_log_path());
+    const auto parent = path.parent_path();
+    if (!parent.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(parent, ec);
+        if (ec) {
+            return false;
+        }
+    }
+    FILE * out = std::fopen(path.string().c_str(), "a");
+    if (out == nullptr) {
+        return false;
+    }
+    const bool wrote = std::fputs(json_record.c_str(), out) >= 0 &&
+        std::fputc('\n', out) != EOF;
+    const bool closed = std::fclose(out) == 0;
+    return wrote && closed;
+}
+
+std::string pipeline_stripe_summary_json(const char * layer,
+                                         size_t I,
+                                         size_t J,
+                                         size_t K,
+                                         const char * backend_route,
+                                         const char * schedule,
+                                         const MatmulJobMetrics & profile) {
+    auto json_string = [](std::ostringstream & out, const char * value) {
+        out << '"';
+        for (const char * p = value != nullptr ? value : ""; *p != '\0'; ++p) {
+            switch (*p) {
+                case '\\': out << "\\\\"; break;
+                case '"': out << "\\\""; break;
+                case '\n': out << "\\n"; break;
+                case '\r': out << "\\r"; break;
+                case '\t': out << "\\t"; break;
+                default: out << *p; break;
+            }
+        }
+        out << '"';
+    };
+    auto append_u64_array = [](std::ostringstream & out, const auto & values) {
+        out << '[';
+        for (size_t i = 0; i < values.size(); ++i) {
+            if (i != 0) out << ',';
+            out << values[i];
+        }
+        out << ']';
+    };
+    auto duration_ns = [](uint64_t start_ns, uint64_t end_ns) {
+        return end_ns >= start_ns ? end_ns - start_ns : uint64_t{0};
+    };
+    auto ratio = [](uint64_t numerator, uint64_t denominator) {
+        return denominator == 0 ? 0.0 : static_cast<double>(numerator) / static_cast<double>(denominator);
+    };
+
+    uint64_t la_service_sum_ns = 0;
+    uint64_t la_window_start_ns = 0;
+    uint64_t la_window_end_ns = 0;
+    for (size_t worker = 0; worker < profile.la_worker_start_ns.size(); ++worker) {
+        la_service_sum_ns += duration_ns(profile.la_worker_start_ns[worker], profile.la_worker_end_ns[worker]);
+        if (profile.la_worker_start_ns[worker] != 0 &&
+            (la_window_start_ns == 0 || profile.la_worker_start_ns[worker] < la_window_start_ns)) {
+            la_window_start_ns = profile.la_worker_start_ns[worker];
+        }
+        la_window_end_ns = std::max(la_window_end_ns, profile.la_worker_end_ns[worker]);
+    }
+    const uint64_t t_la_ns = duration_ns(la_window_start_ns, la_window_end_ns);
+    uint64_t dec_kernel_start_ns = 0;
+    uint64_t dec_kernel_end_ns = 0;
+    for (size_t shard = 0; shard < profile.rc_shard_start_ns.size(); ++shard) {
+        const uint64_t shard_start_ns = profile.rc_shard_start_ns[shard];
+        const uint64_t shard_end_ns = profile.rc_shard_end_ns[shard];
+        if (shard_start_ns == 0 || shard_end_ns == 0) {
+            continue;
+        }
+        if (dec_kernel_start_ns == 0 || shard_start_ns < dec_kernel_start_ns) {
+            dec_kernel_start_ns = shard_start_ns;
+        }
+        dec_kernel_end_ns = std::max(dec_kernel_end_ns, shard_end_ns);
+    }
+    const uint64_t t_dec_kernel_ns = duration_ns(dec_kernel_start_ns, dec_kernel_end_ns);
+    const uint64_t t_dec_premerge_ns =
+        profile.rc_prepare_start_ns == 0 ? 0 : duration_ns(profile.rc_prepare_start_ns, dec_kernel_end_ns);
+    const uint64_t t_sf_ns = profile.sf_mask_start_ns == 0 || profile.sf_commit_ns == 0 ?
+        0 : duration_ns(profile.sf_mask_start_ns, profile.sf_commit_ns);
+    const uint64_t t_merge_ns = profile.merge_start_ns == 0 || profile.merge_end_ns == 0 ?
+        0 : duration_ns(profile.merge_start_ns, profile.merge_end_ns);
+    const uint64_t dec_kernel_service_sum_ns = profile.rc_compute.nanoseconds;
+    const uint64_t dec_service_sum_ns = dec_kernel_service_sum_ns;
+    const double la_efficiency = ratio(la_service_sum_ns, 3 * t_la_ns);
+    const double dec_kernel_efficiency = ratio(dec_kernel_service_sum_ns, 4 * t_dec_kernel_ns);
+    const bool cpu_schedule = schedule != nullptr && std::strcmp(schedule, "matmul-then-dec") == 0;
+    const uint64_t ordering_violation =
+        cpu_schedule && profile.rc_prepare_start_ns != 0 && profile.ws_end_ns > profile.rc_prepare_start_ns ? 1 : 0;
+
+    std::ostringstream out;
+    out << std::setprecision(std::numeric_limits<double>::max_digits10);
+    out << "{\"record_type\":\"PIPELINE_STRIPE_SUMMARY\",\"layer\":";
+    json_string(out, layer);
+    out << ",\"run_id\":" << profile.run_id
+        << ",\"stripe_idx\":" << profile.stripe_id
+        << ",\"I\":" << I
+        << ",\"J\":" << J
+        << ",\"K\":" << K
+        << ",\"stripe_rows\":" << (profile.row_end - profile.row_begin)
+        << ",\"slot\":" << profile.slot
+        << ",\"backend_route\":";
+    json_string(out, backend_route);
+    out << ",\"schedule\":";
+    json_string(out, schedule);
+    out << ",\"la_workers\":3,\"sf_workers\":1,\"dec_workers\":4"
+        << ",\"la_worker_body_start_ns\":";
+    append_u64_array(out, profile.la_worker_start_ns);
+    out << ",\"la_worker_body_end_ns\":";
+    append_u64_array(out, profile.la_worker_end_ns);
+    out << ",\"sf_mask_start_ns\":" << profile.sf_mask_start_ns
+        << ",\"sf_mask_end_ns\":" << profile.sf_mask_end_ns
+        << ",\"sf_exponent_start_ns\":" << profile.sf_exponent_start_ns
+        << ",\"sf_exponent_end_ns\":" << profile.sf_exponent_end_ns
+        << ",\"sf_folding_start_ns\":" << profile.sf_folding_start_ns
+        << ",\"sf_folding_end_ns\":" << profile.sf_folding_end_ns
+        << ",\"sf_commit_ns\":" << profile.sf_commit_ns
+        << ",\"T_SF_ns\":" << t_sf_ns
+        << ",\"producer_wait_start_ns\":" << profile.producer_wait_start_ns
+        << ",\"producer_wait_end_ns\":" << profile.producer_wait_end_ns
+        << ",\"matmul_enqueue_ns\":" << profile.capture_queue_enqueue_ns
+        << ",\"matmul_start_ns\":" << profile.ws_start_ns
+        << ",\"matmul_end_ns\":" << profile.ws_end_ns
+        << ",\"dec_enqueue_ns\":" << profile.rc_enqueue_ns
+        << ",\"dec_prepare_ns\":" << profile.rc_prepare.nanoseconds
+        << ",\"dec_prepare_start_ns\":" << profile.rc_prepare_start_ns
+        << ",\"dec_prepare_end_ns\":" << profile.rc_prepare_end_ns
+        << ",\"dec_shard_start_ns\":";
+    append_u64_array(out, profile.rc_shard_start_ns);
+    out << ",\"dec_shard_end_ns\":";
+    append_u64_array(out, profile.rc_shard_end_ns);
+    out << ",\"dec_finalize_ns\":" << profile.rc_finalize.nanoseconds;
+    out << ",\"merge_start_ns\":" << profile.merge_start_ns
+        << ",\"merge_end_ns\":" << profile.merge_end_ns
+        << ",\"T_Merge_ns\":" << t_merge_ns
+        << ",\"T_LA_ns\":" << t_la_ns
+        << ",\"T_MatMul_ns\":" << duration_ns(profile.ws_start_ns, profile.ws_end_ns)
+        << ",\"T_DEC_kernel_ns\":" << t_dec_kernel_ns
+        << ",\"T_DEC_premerge_ns\":" << t_dec_premerge_ns
+        << ",\"la_service_sum_ns\":" << la_service_sum_ns
+        << ",\"la_efficiency\":" << la_efficiency
+        << ",\"la_service_efficiency\":" << la_efficiency
+        << ",\"dec_kernel_service_sum_ns\":" << dec_kernel_service_sum_ns
+        << ",\"dec_kernel_efficiency\":" << dec_kernel_efficiency
+        << ",\"dec_service_sum_ns\":" << dec_service_sum_ns
+        << ",\"dec_service_efficiency\":" << dec_kernel_efficiency
+        << ",\"ordering_violation\":" << ordering_violation
+        << ",\"h1_histogram\":{\"available\":"
+        << (profile.h1_histogram_available ? "true" : "false")
+        << ",\"selected_route\":";
+    if (profile.h1_histogram_available) {
+        json_string(out, prepared_dec_route_name(profile.h1_histogram.selected_route));
+    } else {
+        out << "null";
+    }
+    out << ",\"residual_nnz\":" << profile.h1_histogram.residual_nnz
+        << ",\"residual_density\":" << profile.h1_histogram.residual_density
+        << ",\"active_row_groups\":" << profile.h1_histogram.active_row_groups
+        << ",\"active_k\":" << profile.h1_histogram.active_k
+        << ",\"bin_1\":" << profile.h1_histogram.bin_1
+        << ",\"bin_2_to_4\":" << profile.h1_histogram.bin_2_to_4
+        << ",\"bin_5_to_8\":" << profile.h1_histogram.bin_5_to_8
+        << ",\"bin_over_8\":" << profile.h1_histogram.bin_over_8
+        << ",\"rows_per_active_k_mean\":" << profile.h1_histogram.rows_per_active_k_mean
+        << ",\"rows_per_active_k_max\":" << profile.h1_histogram.rows_per_active_k_max
+        << ",\"estimated_int_mac_count\":" << profile.h1_histogram.estimated_int_mac_count
+        << ",\"ycom_write_count\":" << profile.h1_histogram.ycom_write_count
+        << ",\"weight_scalar_load_count\":" << profile.h1_histogram.weight_scalar_load_count
+        << ",\"weight_vector_load_count\":" << profile.h1_histogram.weight_vector_load_count
+        << "}}";
+    return out.str();
 }
 
 }
@@ -1300,11 +1501,22 @@ void MatmulStripeCollector::worker_loop() {
             }
             {
                 std::lock_guard<std::mutex> job_lock(*job->shard_mutex_);
+                job->metrics_.run_id = captured.run_id;
+                job->metrics_.slot = captured.slot;
                 job->metrics_.la_cycles = captured.la_cycles;
                 job->metrics_.la3_cycles = captured.la3_cycles;
                 job->metrics_.sf_cycles = captured.sf_cycles;
                 job->metrics_.la3_ns = captured.la3_ns;
                 job->metrics_.sf1_ns = captured.sf1_ns;
+                job->metrics_.la_worker_start_ns = captured.la_worker_start_ns;
+                job->metrics_.la_worker_end_ns = captured.la_worker_end_ns;
+                job->metrics_.sf_mask_start_ns = captured.sf_mask_start_ns;
+                job->metrics_.sf_mask_end_ns = captured.sf_mask_end_ns;
+                job->metrics_.sf_exponent_start_ns = captured.sf_exponent_start_ns;
+                job->metrics_.sf_exponent_end_ns = captured.sf_exponent_end_ns;
+                job->metrics_.sf_folding_start_ns = captured.sf_folding_start_ns;
+                job->metrics_.sf_folding_end_ns = captured.sf_folding_end_ns;
+                job->metrics_.sf_commit_ns = captured.sf_commit_ns;
                 job->metrics_.la.nanoseconds = captured.la3_ns;
                 job->metrics_.la.count = captured.la3_ns != 0 ? 1 : 0;
                 job->metrics_.sf.nanoseconds = captured.sf1_ns;
@@ -1312,6 +1524,9 @@ void MatmulStripeCollector::worker_loop() {
                 job->metrics_.capture_copy = captured.capture_copy;
                 job->metrics_.producer_wait = captured.producer_wait;
                 job->metrics_.queue_insert = captured.queue_insert;
+                job->metrics_.producer_wait_start_ns = captured.producer_wait_start_ns;
+                job->metrics_.producer_wait_end_ns = captured.producer_wait_end_ns;
+                job->metrics_.capture_queue_enqueue_ns = captured.queued_ns;
                 job->metrics_.sf_handoff.nanoseconds =
                     captured.sf1_ns + job->metrics_.handoff.nanoseconds;
                 job->metrics_.sf_handoff.count = 1;
@@ -1363,6 +1578,7 @@ void MatmulStripeCollector::worker_loop() {
                 }
                 {
                     std::lock_guard<std::mutex> job_lock(*job->shard_mutex_);
+                    job->metrics_.rc_enqueue_ns = now_ns();
                     job->rc_queued_ns_ = now_ns();
                 }
                 {
@@ -1389,6 +1605,10 @@ void MatmulStripeCollector::worker_loop() {
                 std::lock_guard<std::mutex> lock(mutex_);
                 compensation_pending_.push_back(job);
                 condition_.notify_all();
+            }
+            {
+                std::lock_guard<std::mutex> job_lock(*job->shard_mutex_);
+                job->metrics_.rc_enqueue_ns = rc_queued_ns;
             }
             std::unique_lock<std::mutex> job_lock(*job->shard_mutex_);
             job->lifecycle_condition_.wait(job_lock, [&job] {
@@ -1757,6 +1977,7 @@ bool MatmulStripeCollector::on_ready(
         }
         if (collector.worker_started_) {
             const auto wait_start = Clock::now();
+            const uint64_t producer_wait_start_ns = now_ns();
             collector.condition_.wait(lock, [&collector] {
                 return collector.stop_requested_ || !collector.status_ ||
                     collector.pending_.size() + collector.in_flight_ < collector.capacity_;
@@ -1767,7 +1988,7 @@ bool MatmulStripeCollector::on_ready(
             MatmulStageMetrics producer_wait;
             record_metric(producer_wait, true, wait_start);
             CapturedStripe captured{
-                 event.stripe_id, event.row_begin, event.row_end, std::move(outliers),
+                 event.run_id, event.stripe_id, event.slot, event.row_begin, event.row_end, std::move(outliers),
                  event.local_end_cycle >= event.local_start_cycle ?
                      event.local_end_cycle - event.local_start_cycle : 0,
                  event.local_group3_end_cycle >= event.local_group3_start_cycle ?
@@ -1777,7 +1998,17 @@ bool MatmulStripeCollector::on_ready(
                  event.local_end_ns >= event.local_start_ns ?
                      event.local_end_ns - event.local_start_ns : 0,
                  event.folding_end_ns >= event.folding_start_ns ?
-                     event.folding_end_ns - event.folding_start_ns : 0, {}, {}, {}, 0};
+                     event.folding_end_ns - event.folding_start_ns : 0,
+                 event.local_worker_start_ns,
+                 event.local_worker_end_ns,
+                 event.mask_assembly_start_ns,
+                 event.mask_assembly_end_ns,
+                 event.exponent_reduction_start_ns,
+                 event.exponent_reduction_end_ns,
+                 event.folding_start_ns,
+                 event.folding_end_ns,
+                 event.folding_commit_ns,
+                 {}, {}, {}, producer_wait_start_ns, now_ns(), 0};
             captured.capture_copy = capture_copy;
             captured.producer_wait = producer_wait;
             const auto insert_start = Clock::now();
@@ -1796,7 +2027,7 @@ bool MatmulStripeCollector::on_ready(
             return false;
         }
         CapturedStripe captured{
-             event.stripe_id, event.row_begin, event.row_end, std::move(outliers),
+             event.run_id, event.stripe_id, event.slot, event.row_begin, event.row_end, std::move(outliers),
              event.local_end_cycle >= event.local_start_cycle ?
                  event.local_end_cycle - event.local_start_cycle : 0,
              event.local_group3_end_cycle >= event.local_group3_start_cycle ?
@@ -1806,7 +2037,17 @@ bool MatmulStripeCollector::on_ready(
              event.local_end_ns >= event.local_start_ns ?
                  event.local_end_ns - event.local_start_ns : 0,
              event.folding_end_ns >= event.folding_start_ns ?
-                 event.folding_end_ns - event.folding_start_ns : 0, {}, {}, {}, 0};
+                 event.folding_end_ns - event.folding_start_ns : 0,
+             event.local_worker_start_ns,
+             event.local_worker_end_ns,
+             event.mask_assembly_start_ns,
+             event.mask_assembly_end_ns,
+             event.exponent_reduction_start_ns,
+             event.exponent_reduction_end_ns,
+             event.folding_start_ns,
+             event.folding_end_ns,
+             event.folding_commit_ns,
+             {}, {}, {}, 0, 0, 0};
         captured.capture_copy = capture_copy;
         const auto insert_start = Clock::now();
         collector.stripes_.push_back(std::move(captured));
@@ -2121,6 +2362,7 @@ MatmulStatus prepare_compensation(MatmulStripeJob & job) {
         has_captured_outliers = job.has_captured_outliers_;
     }
     const auto start = Clock::now();
+    const uint64_t rc_prepare_start_ns = now_ns();
     const auto & args = job.execution_->facade_.args();
     std::vector<float> compensation_ycom;
     std::shared_ptr<const quants::dec::PreparedDecSlice> prepared_dec;
@@ -2147,6 +2389,8 @@ MatmulStatus prepare_compensation(MatmulStripeJob & job) {
             if (!job.status_) {
                 return job.status_;
             }
+            job.metrics_.h1_histogram = {};
+            job.metrics_.h1_histogram_available = false;
             job.compensation_outliers_.clear();
             job.has_captured_outliers_ = true;
             job.compensation_ycom_.clear();
@@ -2155,6 +2399,8 @@ MatmulStatus prepare_compensation(MatmulStripeJob & job) {
             job.completed_shards_ = 1;
             job.rc_state_ = MatmulRcState::complete;
             record_metric(job.metrics_.rc_prepare, job.execution_->options_.profiling, start);
+            job.metrics_.rc_prepare_start_ns = rc_prepare_start_ns;
+            job.metrics_.rc_prepare_end_ns = now_ns();
             job.lifecycle_condition_.notify_all();
             return {};
         }
@@ -2193,9 +2439,13 @@ MatmulStatus prepare_compensation(MatmulStripeJob & job) {
         job.has_captured_outliers_ = true;
         job.compensation_ycom_ = std::move(compensation_ycom);
         job.prepared_dec_ = std::move(prepared_dec);
+        job.metrics_.h1_histogram = job.prepared_dec_->workload_histogram();
+        job.metrics_.h1_histogram_available = true;
         job.expected_shards_ = job.prepared_dec_->shard_count();
         job.rc_state_ = MatmulRcState::prepared;
         record_metric(job.metrics_.rc_prepare, job.execution_->options_.profiling, start);
+        job.metrics_.rc_prepare_start_ns = rc_prepare_start_ns;
+        job.metrics_.rc_prepare_end_ns = now_ns();
     }
     job.lifecycle_condition_.notify_all();
     return {};
@@ -2274,6 +2524,7 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job, size_t shard_id, 
         }
     }
     const auto start = Clock::now();
+    const uint64_t rc_shard_start_ns = now_ns();
     MatmulStatus result{};
     static thread_local quants::dec::DecShardScratch scratch;
     result = from_dec_status(
@@ -2294,6 +2545,10 @@ MatmulStatus execute_compensation_shard(MatmulStripeJob & job, size_t shard_id, 
                 job.rc_state_ = MatmulRcState::complete;
             }
             record_metric(job.metrics_.rc_compute, job.execution_->options_.profiling, start);
+            if (shard_id < job.metrics_.rc_shard_start_ns.size()) {
+                job.metrics_.rc_shard_start_ns[shard_id] = rc_shard_start_ns;
+                job.metrics_.rc_shard_end_ns[shard_id] = now_ns();
+            }
         } else {
             result = job.status_;
         }
@@ -2324,6 +2579,7 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
             const auto & args = job.execution_->facade_.args();
             const size_t row_stride = args.stride_f_out ? args.stride_f_out : args.J;
             const size_t col_stride = args.col_stride_f_out ? args.col_stride_f_out : 1;
+            job.metrics_.merge_start_ns = now_ns();
             for (size_t row = 0; row < job.input_.row_end() - job.input_.row_begin(); ++row) {
                 float * dst = args.f_out + (job.input_.row_begin() + row) * row_stride;
                 const float * src = job.compensation_ycom_.data() + row * args.J;
@@ -2331,6 +2587,7 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
                     dst[col * col_stride] += src[col];
                 }
             }
+            job.metrics_.merge_end_ns = now_ns();
         }
         record_metric(job.metrics_.rc_finalize, job.execution_->options_.profiling, start);
         if (job.execution_->options_.profiling) {

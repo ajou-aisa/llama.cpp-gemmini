@@ -1453,7 +1453,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     if (pipeline_enabled) {
         quantize_ok = ggml::gemmini::quants::quantize_activation(src1, args);
         if (!quantize_ok) {
-            pipeline_collector->finish();
+            const auto pipeline_status = pipeline_collector->finish();
+            ggml::gemmini::log::debug(layer,
+                "[matmul.pipeline] quantization failure collector_status=%d message=%s",
+                static_cast<int>(pipeline_status.code), pipeline_status.message);
             ggml::gemmini::log::debug(layer, "activation quantize failed");
             return;
         }
@@ -1605,13 +1608,19 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         }
         const auto route = ggml::gemmini::detail::normalize_route(args);
         const auto capabilities = ggml::gemmini::detail::route_capabilities(args);
+        const char * const backend_route =
+            ggml::gemmini::detail::backend_route_name(route.backend);
+        const char * const schedule =
+            route.backend == ggml::gemmini::detail::BackendRoute::cpu
+                ? "matmul-then-dec"
+                : "matmul-dec-overlap";
         ggml::gemmini::log::debug(layer,
             "[matmul.route] invocation=stripe-pipeline full_or_slice=slice "
             "activation_route=%s weight_route=%s backend_route=%s "
             "supports_live_pipeline=%d deprecated=%d",
             ggml::gemmini::detail::activation_route_name(route.activation),
             ggml::gemmini::detail::weight_route_name(route.weight),
-            ggml::gemmini::detail::backend_route_name(route.backend),
+            backend_route,
             capabilities.live_stripe_producer ? 1 : 0,
             capabilities.deprecated ? 1 : 0);
         for (const auto & profile : pipeline_collector->profiles()) {
@@ -1638,6 +1647,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 static_cast<unsigned long long>(profile.rc_start_ns),
                 static_cast<unsigned long long>(profile.rc_end_ns),
                 profile.rc_shards);
+            const std::string summary = ggml::gemmini::detail::pipeline_stripe_summary_json(
+                layer, args.I, args.J, args.K, backend_route, schedule, profile);
+            (void) ggml::gemmini::detail::append_pipeline_stripe_summary_jsonl(summary);
+            ggml::gemmini::log::debug(layer, "%s", summary.c_str());
         }
     }
     // dst에는 gemmini 커널에서 dequantize한 결과가 들어옴 
