@@ -2308,6 +2308,152 @@ bool test_pipeline_execution_attachment_contract() {
     return passed;
 }
 
+bool test_pipeline_finish_waits_for_startup_attachment() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1, 2, 3, 4 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> output(4, 0.0f);
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_pipeline;
+    options.job_capacity = 1;
+    auto args = make_args(activation, weights, output);
+    args.I = 2;
+    args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0 };
+    auto execution = prepare_execution(args, options);
+    MatmulStripeCollector collector(1);
+    collector.test_pause_startup_after_attachment();
+    auto start = std::async(std::launch::async, [&collector, &execution] {
+        return collector.start(execution);
+    });
+    const auto attached_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!execution.test_pipeline_attached() &&
+           std::chrono::steady_clock::now() < attached_deadline) {
+        std::this_thread::yield();
+    }
+    const bool attached_while_starting = execution.test_pipeline_attached();
+    auto finish = std::async(std::launch::async, [&collector] { return collector.finish(); });
+    const bool finish_blocked = finish.wait_for(std::chrono::milliseconds(20)) ==
+        std::future_status::timeout;
+    collector.test_resume_startup();
+    const bool start_bounded = start.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    const bool started = start_bounded && start.get();
+    const bool finish_bounded = finish.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    const auto finish_status = finish_bounded ? finish.get() : MatmulStatus{
+        MatmulStatusCode::execution_failure, "finish timed out" };
+    const bool detached_after_finish = !execution.test_pipeline_attached();
+    const auto execution_status = finish_execution(execution);
+    const bool passed =
+        check(attached_while_starting,
+              "startup-attachment collector attaches execution before finish returns") &&
+        check(finish_blocked, "finish waits for collector startup serialization") &&
+        check(start_bounded && started, "startup serialization start completes") &&
+        check(finish_bounded && finish_status.ok(), "startup serialization finish completes") &&
+        check(detached_after_finish, "startup serialization detaches execution") &&
+        check(execution_status.code == MatmulStatusCode::invalid_contract,
+              "startup serialization preserves missing-stripe contract");
+    if (passed) {
+        std::puts("PASS edge: startup-serialization finish waits for attached collector startup");
+    }
+    return passed;
+}
+
+bool test_pipeline_thread_exceptions_fail_cleanly() {
+    using namespace ggml::gemmini;
+    struct Case {
+        MatmulCollectorThread thread;
+        MatmulCollectorThreadFailure failure;
+        MatmulStatusCode expected;
+        const char * label;
+    };
+    const std::array<Case, 4> cases{{
+        { MatmulCollectorThread::worker,
+          MatmulCollectorThreadFailure::exception,
+          MatmulStatusCode::execution_failure,
+          "worker exception" },
+        { MatmulCollectorThread::compensation,
+          MatmulCollectorThreadFailure::exception,
+          MatmulStatusCode::execution_failure,
+          "compensation exception" },
+        { MatmulCollectorThread::rc_worker,
+          MatmulCollectorThreadFailure::exception,
+          MatmulStatusCode::execution_failure,
+          "RC worker exception" },
+        { MatmulCollectorThread::worker,
+          MatmulCollectorThreadFailure::out_of_memory,
+          MatmulStatusCode::out_of_memory,
+          "worker OOM" },
+    }};
+
+    for (const auto & test_case : cases) {
+        std::vector<elem_t> activation = { 1, 2, 3, 4 };
+        std::vector<elem_t> weights = { 1, -1, 2, 3 };
+        std::vector<float> output(4, 0.0f);
+        MatmulOptions options{};
+        options.mode = MatmulInvocationMode::stripe_pipeline;
+        options.job_capacity = 1;
+        auto args = make_args(activation, weights, output);
+        args.I = 2;
+        args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0 };
+        auto execution = prepare_execution(args, options);
+        MatmulStripeCollector collector(1);
+        collector.test_inject_thread_exception(test_case.thread, test_case.failure);
+        if (!check(collector.start(execution), test_case.label)) {
+            return false;
+        }
+        auto finish = std::async(std::launch::async, [&collector] { return collector.finish(); });
+        const bool finish_bounded = finish.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+        const auto finish_status = finish_bounded ? finish.get() : MatmulStatus{
+            MatmulStatusCode::execution_failure, "finish timed out" };
+        const auto execution_status = finish_execution(execution);
+        if (!check(finish_bounded, "thread exception finish is bounded") ||
+            !check(finish_status.code == test_case.expected, "thread exception collector status") ||
+            !check(execution_status.code == test_case.expected &&
+                       execution.state() == MatmulExecutionState::failed,
+                   "thread exception execution failure") ||
+            !check(!execution.test_pipeline_attached(),
+                   "thread exception detaches execution after finish")) {
+            return false;
+        }
+    }
+    std::puts("PASS edge: injected worker/compensation/RC thread exceptions fail cleanly");
+    return true;
+}
+
+bool test_pipeline_cancel_sets_rc_stop_flag() {
+    using namespace ggml::gemmini;
+    std::vector<elem_t> activation = { 1, 2, 3, 4 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> output(8, 0.0f);
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_pipeline;
+    options.job_capacity = 1;
+    options.rc_shards = 4;
+    auto args = make_args(activation, weights, output);
+    args.I = 2;
+    args.J = 4;
+    args.stride_f_out = 4;
+    args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { 0, 0 };
+    auto execution = prepare_execution(args, options);
+    MatmulStripeCollector collector(1);
+    if (!check(execution.status().ok() && collector.start(execution), "cancel RC-stop start")) {
+        return false;
+    }
+    const auto cancel_status = collector.cancel();
+    const bool rc_stop_requested = collector.test_rc_stop_requested();
+    const auto finish_status = collector.finish();
+    const auto execution_status = finish_execution(execution);
+    const bool passed =
+        check(cancel_status.code == MatmulStatusCode::cancelled, "cancel RC-stop status") &&
+        check(rc_stop_requested, "cancel sets RC stop request flag") &&
+        check(finish_status.code == MatmulStatusCode::cancelled &&
+                  execution_status.code == MatmulStatusCode::cancelled,
+              "cancel RC-stop cleanup");
+    if (passed) {
+        std::puts("PASS edge: cancel raises RC stop flag and stops further RC scheduling");
+    }
+    return passed;
+}
+
 bool test_pipeline_start_thread_failure_returns_clean_status() {
     using namespace ggml::gemmini;
     std::vector<elem_t> activation = { 1, 2, 3, 4 };
@@ -2509,6 +2655,9 @@ int main(int argc, char ** argv) {
          test_live_worker_serial_compensation_is_bitwise_stable() &&
          test_pipeline_cancellation() &&
          test_pipeline_execution_attachment_contract() &&
+         test_pipeline_finish_waits_for_startup_attachment() &&
+         test_pipeline_thread_exceptions_fail_cleanly() &&
+         test_pipeline_cancel_sets_rc_stop_flag() &&
          test_pipeline_start_thread_failure_returns_clean_status() &&
          test_live_worker_rc_failure_releases_collector_slot_once() &&
          test_rc_failure_external_cancel_while_dense_idle());

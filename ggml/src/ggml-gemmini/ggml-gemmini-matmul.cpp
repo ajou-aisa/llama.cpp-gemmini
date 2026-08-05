@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <limits>
 #include <new>
+#include <stdexcept>
 #include <system_error>
 #include <utility>
 
@@ -956,15 +957,21 @@ MatmulStripeCollector::~MatmulStripeCollector() {
 bool MatmulStripeCollector::start(MatmulExecution & execution) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!status_ || worker_started_ || execution.mode() != MatmulInvocationMode::stripe_pipeline) {
+        if (!status_ || worker_started_ || startup_in_progress_ ||
+            execution.mode() != MatmulInvocationMode::stripe_pipeline) {
             return false;
         }
+        worker_started_ = true;
+        startup_in_progress_ = true;
     }
     {
         std::lock_guard<std::mutex> execution_lock(*execution.state_mutex_);
         if (execution.pipeline_attached_) {
             std::lock_guard<std::mutex> lock(mutex_);
             status_ = invalid_state("execution already has a live stripe collector");
+            worker_started_ = false;
+            startup_in_progress_ = false;
+            condition_.notify_all();
             return false;
         }
         execution.pipeline_attached_ = true;
@@ -972,7 +979,6 @@ bool MatmulStripeCollector::start(MatmulExecution & execution) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         execution_ = &execution;
-        worker_started_ = true;
         dense_done_ = false;
         stop_requested_ = false;
         rc_stop_requested_ = false;
@@ -985,8 +991,18 @@ bool MatmulStripeCollector::start(MatmulExecution & execution) {
         test_thread_start_attempts_ = 0;
 #endif
     }
+#if defined(GGML_GEMMINI_TEST_OBSERVER)
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (test_pause_startup_) {
+            condition_.notify_all();
+            condition_.wait(lock, [this] { return !test_pause_startup_; });
+        }
+    }
+#endif
     const auto fail_start = [&](MatmulStatus failure) {
         std::vector<std::shared_ptr<MatmulStripeJob>> jobs;
+        MatmulExecution * attached_execution = nullptr;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             status_ = failure;
@@ -998,11 +1014,16 @@ bool MatmulStripeCollector::start(MatmulExecution & execution) {
             rc_pending_.clear();
             rc_tasks_remaining_ = 0;
             rc_batch_status_ = failure;
+            attached_execution = execution_;
             for (const auto & weak_job : jobs_) {
                 if (auto job = weak_job.lock()) {
                     jobs.push_back(std::move(job));
                 }
             }
+            execution_ = nullptr;
+            worker_started_ = false;
+            startup_in_progress_ = false;
+            rc_worker_capacity_ = 0;
         }
         for (const auto & job : jobs) {
             job->cancel(failure);
@@ -1021,18 +1042,13 @@ bool MatmulStripeCollector::start(MatmulExecution & execution) {
             }
         }
         rc_workers_.clear();
-        {
-            std::lock_guard<std::mutex> execution_lock(*execution.state_mutex_);
-            execution.status_ = status_;
-            execution.state_ = MatmulExecutionState::failed;
-            execution.pipeline_attached_ = false;
+        if (attached_execution != nullptr) {
+            std::lock_guard<std::mutex> execution_lock(*attached_execution->state_mutex_);
+            attached_execution->status_ = failure;
+            attached_execution->state_ = MatmulExecutionState::failed;
+            attached_execution->pipeline_attached_ = false;
         }
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            execution_ = nullptr;
-            worker_started_ = false;
-            rc_worker_capacity_ = 0;
-        }
+        condition_.notify_all();
         return false;
     };
     try {
@@ -1063,6 +1079,11 @@ bool MatmulStripeCollector::start(MatmulExecution & execution) {
         return fail_start(make_status(
             MatmulStatusCode::execution_failure, "collector worker thread creation failed"));
     }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        startup_in_progress_ = false;
+    }
+    condition_.notify_all();
     return true;
 }
 
@@ -1070,7 +1091,8 @@ MatmulStatus MatmulStripeCollector::cancel() {
     std::vector<std::shared_ptr<MatmulStripeJob>> jobs;
     MatmulStatus cancelled = make_status(MatmulStatusCode::cancelled, "stripe pipeline cancelled");
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
+        condition_.wait(lock, [this] { return !startup_in_progress_; });
         if (!worker_started_) {
             return make_status(MatmulStatusCode::invalid_state, "stripe pipeline is not running");
         }
@@ -1087,6 +1109,15 @@ MatmulStatus MatmulStripeCollector::cancel() {
             }
         }
         compensation_pending_.clear();
+        const size_t queued_rc = rc_pending_.size();
+        rc_stop_requested_ = true;
+        rc_pending_.clear();
+        if (rc_tasks_remaining_ > queued_rc) {
+            rc_tasks_remaining_ -= queued_rc;
+        } else {
+            rc_tasks_remaining_ = 0;
+        }
+        rc_batch_status_ = cancelled;
     }
     for (const auto & job : jobs) {
         job->cancel(cancelled);
@@ -1098,6 +1129,7 @@ MatmulStatus MatmulStripeCollector::cancel() {
 
 void MatmulStripeCollector::fail(MatmulStatus failure) {
     std::vector<std::shared_ptr<MatmulStripeJob>> jobs;
+    MatmulExecution * execution = nullptr;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (status_.ok()) {
@@ -1113,10 +1145,25 @@ void MatmulStripeCollector::fail(MatmulStatus failure) {
             }
         }
         compensation_pending_.clear();
+        const size_t queued_rc = rc_pending_.size();
+        rc_stop_requested_ = true;
+        rc_pending_.clear();
+        if (rc_tasks_remaining_ > queued_rc) {
+            rc_tasks_remaining_ -= queued_rc;
+        } else {
+            rc_tasks_remaining_ = 0;
+        }
+        rc_batch_status_ = failure;
+        execution = execution_;
     }
     for (const auto & job : jobs) {
         job->cancel(failure);
         release_in_flight_once(job);
+    }
+    if (execution != nullptr) {
+        std::lock_guard<std::mutex> execution_lock(*execution->state_mutex_);
+        execution->status_ = failure;
+        execution->state_ = MatmulExecutionState::failed;
     }
     condition_.notify_all();
 }
@@ -1140,11 +1187,12 @@ void MatmulStripeCollector::release_in_flight_once(
 }
 
 MatmulStatus MatmulStripeCollector::finish() {
-    if (!worker_started_) {
-        return status_;
-    }
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
+        condition_.wait(lock, [this] { return !startup_in_progress_; });
+        if (!worker_started_) {
+            return status_;
+        }
         stop_requested_ = true;
     }
     condition_.notify_all();
@@ -1170,246 +1218,358 @@ MatmulStatus MatmulStripeCollector::finish() {
         }
     }
     rc_workers_.clear();
-    if (!status_ && execution_ != nullptr) {
-        std::lock_guard<std::mutex> execution_lock(*execution_->state_mutex_);
-        execution_->status_ = status_;
-        execution_->state_ = MatmulExecutionState::failed;
+    MatmulExecution * execution = nullptr;
+    MatmulStatus status = {};
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        execution = execution_;
+        status = status_;
+        execution_ = nullptr;
+        worker_started_ = false;
     }
-    if (execution_ != nullptr) {
-        std::lock_guard<std::mutex> execution_lock(*execution_->state_mutex_);
-        execution_->pipeline_attached_ = false;
+    if (execution != nullptr) {
+        std::lock_guard<std::mutex> execution_lock(*execution->state_mutex_);
+        if (!status) {
+            execution->status_ = status;
+            execution->state_ = MatmulExecutionState::failed;
+        }
+        execution->pipeline_attached_ = false;
     }
-    execution_ = nullptr;
-    worker_started_ = false;
-    return status_;
+    return status;
 }
 
 void MatmulStripeCollector::worker_loop() {
-    for (;;) {
-        CapturedStripe captured{};
-        {
-            std::unique_lock<std::mutex> lock(mutex_);
-            condition_.wait(lock, [this] {
-                return stop_requested_ || (!pending_.empty() && in_flight_ < capacity_);
-            });
-            if (pending_.empty()) {
-                break;
-            }
-            captured = std::move(pending_.front());
-            pending_.pop_front();
-            ++in_flight_;
-            condition_.notify_all();
-        }
-
-        auto job = std::make_shared<MatmulStripeJob>(capture_stripe(
-            *execution_,
-            MatmulStripeInput(captured.row_begin, captured.row_end, captured.stripe_id),
-            std::move(captured.outliers)));
-        {
-            std::lock_guard<std::mutex> job_lock(*job->shard_mutex_);
-            job->metrics_.la_cycles = captured.la_cycles;
-            job->metrics_.la3_cycles = captured.la3_cycles;
-            job->metrics_.sf_cycles = captured.sf_cycles;
-            job->metrics_.la3_ns = captured.la3_ns;
-            job->metrics_.sf1_ns = captured.sf1_ns;
-            job->metrics_.la.nanoseconds = captured.la3_ns;
-            job->metrics_.la.count = captured.la3_ns != 0 ? 1 : 0;
-            job->metrics_.sf.nanoseconds = captured.sf1_ns;
-            job->metrics_.sf.count = captured.sf1_ns != 0 ? 1 : 0;
-            job->metrics_.capture_copy = captured.capture_copy;
-            job->metrics_.producer_wait = captured.producer_wait;
-            job->metrics_.queue_insert = captured.queue_insert;
-            job->metrics_.sf_handoff.nanoseconds =
-                captured.sf1_ns + job->metrics_.handoff.nanoseconds;
-            job->metrics_.sf_handoff.count = 1;
-        }
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            jobs_.push_back(job);
-        }
-        MatmulStatus status = job->status();
-        if (!status) {
-            release_in_flight_once(job);
-            fail(status);
-            break;
-        }
-        const uint64_t rc_queued_ns = now_ns();
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            compensation_pending_.push_back(job);
-            condition_.notify_all();
-        }
-        std::unique_lock<std::mutex> job_lock(*job->shard_mutex_);
-        job->lifecycle_condition_.wait(job_lock, [&job] {
-            return job->metrics_.rc_start_ns != 0 || !job->status_;
-        });
-        status = job->status_;
-        job_lock.unlock();
+    try {
 #if defined(GGML_GEMMINI_TEST_OBSERVER)
         {
-            std::unique_lock<std::mutex> lock(mutex_);
-            condition_.wait(lock, [this] { return !test_pause_dense_ || stop_requested_; });
-        }
-#endif
-        {
-            std::lock_guard<std::mutex> job_lock(*job->shard_mutex_);
-            job->metrics_.ws_start_ns = now_ns();
-            if (job->execution_->options_.profiling) {
-                job->metrics_.ws_queue.nanoseconds = job->metrics_.ws_start_ns - captured.queued_ns;
-                job->metrics_.ws_queue.count = 1;
-                job->metrics_.rc_queue.nanoseconds = job->metrics_.rc_start_ns - rc_queued_ns;
-                job->metrics_.rc_queue.count = 1;
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (test_thread_exception_ == MatmulCollectorThread::worker) {
+                const auto failure = test_thread_exception_failure_;
+                test_thread_exception_.reset();
+                if (failure == MatmulCollectorThreadFailure::out_of_memory) {
+                    throw std::bad_alloc();
+                }
+                throw std::runtime_error("injected worker thread failure");
             }
         }
-        const MatmulStatus dense_status = execute_dense_stripe(*job);
-        if (!dense_status) {
-            release_in_flight_once(job);
-            fail(dense_status);
-            break;
+#endif
+        for (;;) {
+            CapturedStripe captured{};
+            MatmulExecution * execution = nullptr;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                condition_.wait(lock, [this] {
+                    return stop_requested_ || (!pending_.empty() && in_flight_ < capacity_);
+                });
+                if (pending_.empty()) {
+                    break;
+                }
+                execution = execution_;
+                captured = std::move(pending_.front());
+                pending_.pop_front();
+                ++in_flight_;
+                condition_.notify_all();
+            }
+
+            std::shared_ptr<MatmulStripeJob> job;
+            try {
+                job = std::make_shared<MatmulStripeJob>(capture_stripe(
+                    *execution,
+                    MatmulStripeInput(captured.row_begin, captured.row_end, captured.stripe_id),
+                    std::move(captured.outliers)));
+            } catch (const std::bad_alloc &) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    --in_flight_;
+                }
+                condition_.notify_all();
+                throw;
+            } catch (const std::exception &) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    --in_flight_;
+                }
+                condition_.notify_all();
+                throw;
+            }
+            {
+                std::lock_guard<std::mutex> job_lock(*job->shard_mutex_);
+                job->metrics_.la_cycles = captured.la_cycles;
+                job->metrics_.la3_cycles = captured.la3_cycles;
+                job->metrics_.sf_cycles = captured.sf_cycles;
+                job->metrics_.la3_ns = captured.la3_ns;
+                job->metrics_.sf1_ns = captured.sf1_ns;
+                job->metrics_.la.nanoseconds = captured.la3_ns;
+                job->metrics_.la.count = captured.la3_ns != 0 ? 1 : 0;
+                job->metrics_.sf.nanoseconds = captured.sf1_ns;
+                job->metrics_.sf.count = captured.sf1_ns != 0 ? 1 : 0;
+                job->metrics_.capture_copy = captured.capture_copy;
+                job->metrics_.producer_wait = captured.producer_wait;
+                job->metrics_.queue_insert = captured.queue_insert;
+                job->metrics_.sf_handoff.nanoseconds =
+                    captured.sf1_ns + job->metrics_.handoff.nanoseconds;
+                job->metrics_.sf_handoff.count = 1;
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                jobs_.push_back(job);
+            }
+            MatmulStatus status = job->status();
+            if (!status) {
+                release_in_flight_once(job);
+                fail(status);
+                break;
+            }
+            const uint64_t rc_queued_ns = now_ns();
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                compensation_pending_.push_back(job);
+                condition_.notify_all();
+            }
+            std::unique_lock<std::mutex> job_lock(*job->shard_mutex_);
+            job->lifecycle_condition_.wait(job_lock, [&job] {
+                return job->metrics_.rc_start_ns != 0 || !job->status_;
+            });
+            status = job->status_;
+            job_lock.unlock();
+#if defined(GGML_GEMMINI_TEST_OBSERVER)
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                condition_.wait(lock, [this] { return !test_pause_dense_ || stop_requested_; });
+            }
+#endif
+            {
+                std::lock_guard<std::mutex> job_lock(*job->shard_mutex_);
+                job->metrics_.ws_start_ns = now_ns();
+                if (job->execution_->options_.profiling) {
+                    job->metrics_.ws_queue.nanoseconds = job->metrics_.ws_start_ns - captured.queued_ns;
+                    job->metrics_.ws_queue.count = 1;
+                    job->metrics_.rc_queue.nanoseconds = job->metrics_.rc_start_ns - rc_queued_ns;
+                    job->metrics_.rc_queue.count = 1;
+                }
+            }
+            const MatmulStatus dense_status = execute_dense_stripe(*job);
+            if (!dense_status) {
+                release_in_flight_once(job);
+                fail(dense_status);
+                break;
+            }
         }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            dense_done_ = true;
+        }
+        condition_.notify_all();
+    } catch (const std::bad_alloc &) {
+        fail(make_status(MatmulStatusCode::out_of_memory, "collector worker thread allocation failed"));
+    } catch (const std::exception &) {
+        fail(make_status(MatmulStatusCode::execution_failure, "collector worker thread failed"));
     }
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        dense_done_ = true;
-    }
-    condition_.notify_all();
 }
 
 void MatmulStripeCollector::compensation_loop() {
-    for (;;) {
-        std::shared_ptr<MatmulStripeJob> job;
-        {
-            std::unique_lock<std::mutex> lock(mutex_);
-            condition_.wait(lock, [this] {
-                return dense_done_ || !compensation_pending_.empty();
-            });
-            if (compensation_pending_.empty()) {
-                if (dense_done_) {
-                    break;
-                }
-                continue;
-            }
-            job = std::move(compensation_pending_.front());
-            compensation_pending_.pop_front();
-            ++active_rc_stripes_;
-            max_active_rc_stripes_ = std::max(max_active_rc_stripes_, active_rc_stripes_);
-        }
-
-        MatmulStatus status = job->status();
+    std::shared_ptr<MatmulStripeJob> active_job;
+    bool active_rc_stripe = false;
+    try {
 #if defined(GGML_GEMMINI_TEST_OBSERVER)
-        if (status && test_rc_failure_collector == this && !test_rc_failure) {
-            status = test_rc_failure;
-            job->record_failure(status, false);
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                test_rc_failure_observed_ = true;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (test_thread_exception_ == MatmulCollectorThread::compensation) {
+                const auto failure = test_thread_exception_failure_;
+                test_thread_exception_.reset();
+                if (failure == MatmulCollectorThreadFailure::out_of_memory) {
+                    throw std::bad_alloc();
+                }
+                throw std::runtime_error("injected compensation thread failure");
             }
-            condition_.notify_all();
         }
 #endif
-        {
-            std::lock_guard<std::mutex> job_lock(*job->shard_mutex_);
-            job->metrics_.rc_start_ns = now_ns();
-        }
-        job->lifecycle_condition_.notify_all();
-        if (status) {
-            status = prepare_compensation(*job);
-        }
-        const size_t shard_count = job->prepared_dec_ != nullptr ?
-            job->prepared_dec_->shard_count() : 0;
-        if (status && shard_count != 0) {
-            {
-                std::lock_guard<std::mutex> lock(*job->shard_mutex_);
-                job->expected_shards_ = shard_count;
-                job->completed_shards_ = 0;
-                job->parallel_shards_ = true;
-                job->rc_state_ = MatmulRcState::running;
-            }
+        for (;;) {
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                rc_tasks_remaining_ = shard_count;
-                rc_batch_status_ = {};
-                for (size_t shard_id = 0; shard_id < shard_count; ++shard_id) {
-                    rc_pending_.push_back({job, shard_id, shard_count});
+                condition_.wait(lock, [this] {
+                    return dense_done_ || !compensation_pending_.empty();
+                });
+                if (compensation_pending_.empty()) {
+                    if (dense_done_) {
+                        break;
+                    }
+                    continue;
                 }
-                max_rc_queue_depth_ = std::max(max_rc_queue_depth_, rc_pending_.size());
+                active_job = std::move(compensation_pending_.front());
+                compensation_pending_.pop_front();
+                ++active_rc_stripes_;
+                active_rc_stripe = true;
+                max_active_rc_stripes_ = std::max(max_active_rc_stripes_, active_rc_stripes_);
+            }
+
+            MatmulStatus status = active_job->status();
+#if defined(GGML_GEMMINI_TEST_OBSERVER)
+            if (status && test_rc_failure_collector == this && !test_rc_failure) {
+                status = test_rc_failure;
+                active_job->record_failure(status, false);
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    test_rc_failure_observed_ = true;
+                }
                 condition_.notify_all();
-                condition_.wait(lock, [this] { return rc_tasks_remaining_ == 0; });
-                status = rc_batch_status_ ? job->status() : rc_batch_status_;
             }
+#endif
             {
-                std::lock_guard<std::mutex> lock(*job->shard_mutex_);
-                job->parallel_shards_ = false;
+                std::lock_guard<std::mutex> job_lock(*active_job->shard_mutex_);
+                active_job->metrics_.rc_start_ns = now_ns();
+            }
+            active_job->lifecycle_condition_.notify_all();
+            if (status) {
+                status = prepare_compensation(*active_job);
+            }
+            const size_t shard_count = active_job->prepared_dec_ != nullptr ?
+                active_job->prepared_dec_->shard_count() : 0;
+            if (status && shard_count != 0) {
+                {
+                    std::lock_guard<std::mutex> lock(*active_job->shard_mutex_);
+                    active_job->expected_shards_ = shard_count;
+                    active_job->completed_shards_ = 0;
+                    active_job->parallel_shards_ = true;
+                    active_job->rc_state_ = MatmulRcState::running;
+                }
+                {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    rc_tasks_remaining_ = shard_count;
+                    rc_batch_status_ = {};
+                    for (size_t shard_id = 0; shard_id < shard_count; ++shard_id) {
+                        rc_pending_.push_back({active_job, shard_id, shard_count});
+                    }
+                    max_rc_queue_depth_ = std::max(max_rc_queue_depth_, rc_pending_.size());
+                    condition_.notify_all();
+                    condition_.wait(lock, [this] { return rc_tasks_remaining_ == 0; });
+                    status = rc_batch_status_ ? active_job->status() : rc_batch_status_;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(*active_job->shard_mutex_);
+                    active_job->parallel_shards_ = false;
+                }
+            }
+            if (status) {
+                const auto wait_start = Clock::now();
+                std::unique_lock<std::mutex> lock(*active_job->shard_mutex_);
+                active_job->lifecycle_condition_.wait(lock, [&active_job] {
+                    return dense_state_is_terminal(active_job->dense_state_);
+                });
+                status = active_job->status_;
+                record_metric(active_job->metrics_.rc_wait, active_job->execution_->options_.profiling,
+                              wait_start);
+            } else {
+                std::unique_lock<std::mutex> lock(*active_job->shard_mutex_);
+                active_job->lifecycle_condition_.wait(lock, [&active_job] {
+                    return dense_state_is_terminal(active_job->dense_state_);
+                });
+            }
+            if (status) status = finalize_stripe(*active_job);
+            {
+                std::lock_guard<std::mutex> job_lock(*active_job->shard_mutex_);
+                active_job->metrics_.rc_end_ns = now_ns();
+            }
+            if (status) {
+                const MatmulJobMetrics profile = active_job->metrics();
+                std::lock_guard<std::mutex> lock(mutex_);
+                profiles_.push_back(profile);
+            }
+            release_in_flight_once(active_job);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                --active_rc_stripes_;
+            }
+            active_rc_stripe = false;
+            active_job.reset();
+            condition_.notify_all();
+            if (!status) {
+                fail(status);
+                break;
             }
         }
-        if (status) {
-            const auto wait_start = Clock::now();
-            std::unique_lock<std::mutex> lock(*job->shard_mutex_);
-            job->lifecycle_condition_.wait(lock, [&job] {
-                return dense_state_is_terminal(job->dense_state_);
-            });
-            status = job->status_;
-            record_metric(job->metrics_.rc_wait, job->execution_->options_.profiling, wait_start);
-        } else {
-            std::unique_lock<std::mutex> lock(*job->shard_mutex_);
-            job->lifecycle_condition_.wait(lock, [&job] {
-                return dense_state_is_terminal(job->dense_state_);
-            });
-        }
-        if (status) status = finalize_stripe(*job);
-        {
-            std::lock_guard<std::mutex> job_lock(*job->shard_mutex_);
-            job->metrics_.rc_end_ns = now_ns();
-        }
-        if (status) {
-            const MatmulJobMetrics profile = job->metrics();
-            std::lock_guard<std::mutex> lock(mutex_);
-            profiles_.push_back(profile);
-        }
-        release_in_flight_once(job);
-        {
+    } catch (const std::bad_alloc &) {
+        if (active_rc_stripe) {
             std::lock_guard<std::mutex> lock(mutex_);
             --active_rc_stripes_;
         }
-        condition_.notify_all();
-        if (!status) {
-            fail(status);
-            break;
+        fail(make_status(MatmulStatusCode::out_of_memory,
+                         "collector compensation thread allocation failed"));
+    } catch (const std::exception &) {
+        if (active_rc_stripe) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            --active_rc_stripes_;
         }
+        fail(make_status(MatmulStatusCode::execution_failure, "collector compensation thread failed"));
     }
 }
 
 void MatmulStripeCollector::rc_worker_loop() {
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        ++rc_worker_starts_;
-    }
-    for (;;) {
-        RcTask task;
+    RcTask task;
+    bool task_active = false;
+    try {
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            condition_.wait(lock, [this] { return rc_stop_requested_ || !rc_pending_.empty(); });
-            if (rc_pending_.empty()) {
-                if (rc_stop_requested_) {
-                    break;
+            ++rc_worker_starts_;
+#if defined(GGML_GEMMINI_TEST_OBSERVER)
+            if (test_thread_exception_ == MatmulCollectorThread::rc_worker) {
+                const auto failure = test_thread_exception_failure_;
+                test_thread_exception_.reset();
+                if (failure == MatmulCollectorThreadFailure::out_of_memory) {
+                    throw std::bad_alloc();
                 }
-                continue;
+                throw std::runtime_error("injected RC worker thread failure");
             }
-            task = std::move(rc_pending_.front());
-            rc_pending_.pop_front();
+#endif
         }
-        MatmulStatus status = task.job->status();
-        if (status) {
-            status = execute_compensation_shard(*task.job, task.shard_id, task.shard_count);
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                condition_.wait(lock, [this] { return rc_stop_requested_ || !rc_pending_.empty(); });
+                if (rc_pending_.empty()) {
+                    if (rc_stop_requested_) {
+                        break;
+                    }
+                    continue;
+                }
+                task = std::move(rc_pending_.front());
+                rc_pending_.pop_front();
+            }
+            task_active = true;
+            MatmulStatus status = task.job->status();
+            if (status) {
+                status = execute_compensation_shard(*task.job, task.shard_id, task.shard_count);
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!status && rc_batch_status_) {
+                    rc_batch_status_ = status;
+                }
+                ++rc_tasks_executed_;
+                if (rc_tasks_remaining_ != 0) {
+                    --rc_tasks_remaining_;
+                }
+            }
+            task_active = false;
+            condition_.notify_all();
         }
+    } catch (const std::bad_alloc &) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (!status && rc_batch_status_) {
-                rc_batch_status_ = status;
+            if (task_active && rc_tasks_remaining_ != 0) {
+                --rc_tasks_remaining_;
             }
-            ++rc_tasks_executed_;
-            --rc_tasks_remaining_;
         }
+        fail(make_status(MatmulStatusCode::out_of_memory, "collector RC worker allocation failed"));
+        condition_.notify_all();
+    } catch (const std::exception &) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (task_active && rc_tasks_remaining_ != 0) {
+                --rc_tasks_remaining_;
+            }
+        }
+        fail(make_status(MatmulStatusCode::execution_failure, "collector RC worker failed"));
         condition_.notify_all();
     }
 }
@@ -1454,9 +1614,29 @@ void MatmulStripeCollector::test_inject_thread_start_failure(size_t attempt) {
     test_fail_thread_start_attempt_ = attempt;
 }
 
+void MatmulStripeCollector::test_inject_thread_exception(
+        MatmulCollectorThread thread, MatmulCollectorThreadFailure failure) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    test_thread_exception_ = thread;
+    test_thread_exception_failure_ = failure;
+}
+
 void MatmulStripeCollector::test_pause_dense_before_execute() {
     std::lock_guard<std::mutex> lock(mutex_);
     test_pause_dense_ = true;
+}
+
+void MatmulStripeCollector::test_pause_startup_after_attachment() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    test_pause_startup_ = true;
+}
+
+void MatmulStripeCollector::test_resume_startup() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        test_pause_startup_ = false;
+    }
+    condition_.notify_all();
 }
 
 void MatmulStripeCollector::test_wait_for_rc_failure() {
@@ -1473,6 +1653,11 @@ MatmulDenseState MatmulStripeCollector::test_dense_state_at_release() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return test_dense_observer_collector == this ?
         observed_dense_state_at_release : MatmulDenseState::idle;
+}
+
+bool MatmulStripeCollector::test_rc_stop_requested() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return rc_stop_requested_;
 }
 #endif
 

@@ -222,6 +222,18 @@ struct MatmulCollectorSnapshot {
 };
 
 enum class MatmulDenseState : uint8_t;
+#if defined(GGML_GEMMINI_TEST_OBSERVER)
+enum class MatmulCollectorThread : uint8_t {
+    worker,
+    compensation,
+    rc_worker,
+};
+
+enum class MatmulCollectorThreadFailure : uint8_t {
+    exception,
+    out_of_memory,
+};
+#endif
 
 class MatmulStripeCollector {
 public:
@@ -238,10 +250,16 @@ public:
 #if defined(GGML_GEMMINI_TEST_OBSERVER)
     void test_inject_rc_failure(MatmulStatus failure);
     void test_inject_thread_start_failure(size_t attempt = 1);
+    void test_inject_thread_exception(
+        MatmulCollectorThread thread,
+        MatmulCollectorThreadFailure failure = MatmulCollectorThreadFailure::exception);
     void test_pause_dense_before_execute();
+    void test_pause_startup_after_attachment();
+    void test_resume_startup();
     void test_wait_for_rc_failure();
     size_t test_in_flight() const;
     MatmulDenseState test_dense_state_at_release() const;
+    bool test_rc_stop_requested() const;
 #endif
 
 private:
@@ -273,6 +291,7 @@ private:
     void compensation_loop();
     void rc_worker_loop();
     bool worker_started_ = false;
+    bool startup_in_progress_ = false;
     bool stop_requested_ = false;
     bool dense_done_ = false;
     std::thread worker_;
@@ -303,9 +322,13 @@ private:
     quants::act::exsia::StripeReadySink sink_;
 #if defined(GGML_GEMMINI_TEST_OBSERVER)
     bool test_pause_dense_ = false;
+    bool test_pause_startup_ = false;
     bool test_rc_failure_observed_ = false;
     size_t test_fail_thread_start_attempt_ = 0;
     size_t test_thread_start_attempts_ = 0;
+    std::optional<MatmulCollectorThread> test_thread_exception_;
+    MatmulCollectorThreadFailure test_thread_exception_failure_ =
+        MatmulCollectorThreadFailure::exception;
 #endif
 };
 
