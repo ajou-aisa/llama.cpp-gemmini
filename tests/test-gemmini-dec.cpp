@@ -2771,11 +2771,23 @@ bool test_prepared_h1_small_group_fastpath() {
     constexpr size_t depth = 64;
     constexpr size_t blocks = depth / QK8_0;
     constexpr float s_rf_value = 0.00032747327350080013f;
+    const bool fastpath_enabled = ggml::gemmini::quants::dec::h1_small_group_fastpath_enabled();
+
+    const auto prepared_route_name = [](PreparedDecSelectedRoute route) {
+        switch (route) {
+            case PreparedDecSelectedRoute::row_direct: return "row_direct";
+            case PreparedDecSelectedRoute::group_k_csc: return "group_k_csc";
+            case PreparedDecSelectedRoute::h1_small_group_single: return "h1_small_group_single";
+            case PreparedDecSelectedRoute::h1_small_group_2_to_4: return "h1_small_group_2_to_4";
+        }
+        return "unknown";
+    };
 
     const auto run_case = [&](const std::vector<QactOutlier> &outliers,
                               PreparedDecSelectedRoute expected_route,
                               const char *route_message,
-                              const char *parity_message) {
+                              const char *parity_message,
+                              bool benchmark_case = false) {
         std::vector<ggml::gemmini::quants::dec::ResidualGroupEntry> expected_entries;
         expected_entries.reserve(outliers.size());
         for (const QactOutlier &outlier : outliers)
@@ -2920,10 +2932,37 @@ bool test_prepared_h1_small_group_fastpath() {
                        before.ycom_write_count == after.ycom_write_count,
                    "prepared H1 histogram stays immutable across shard execution") && ok;
         ok = check(byte_identical(output, reference), parity_message) && ok;
+        if (benchmark_case) {
+            constexpr size_t warmup_count = 5;
+            constexpr size_t measured_count = 25;
+            const ReplayTimingStats timing = benchmark_replay_kernel(
+                output,
+                reference,
+                [&]() {
+                    for (size_t shard = 0; shard < prepared->shard_count(); ++shard) {
+                        DecShardScratch scratch;
+                        if (ggml::gemmini::quants::dec::execute_prepared_dec_shard(
+                                *prepared, shard, scratch) != DecStatus::success)
+                            return false;
+                    }
+                    return true;
+                },
+                warmup_count,
+                measured_count,
+                ok);
+            std::printf(
+                "prepared h1 small-group benchmark fastpath=%s selected_route=%s warmup=%zu measured=%zu compute_us median=%.3f p10=%.3f p90=%.3f\n",
+                fastpath_enabled ? "enabled" : "disabled",
+                prepared_route_name(before.selected_route),
+                warmup_count,
+                measured_count,
+                timing.compute.median_us,
+                timing.compute.p10_us,
+                timing.compute.p90_us);
+        }
         return ok;
     };
 
-    const bool fastpath_enabled = ggml::gemmini::quants::dec::h1_small_group_fastpath_enabled();
     const PreparedDecSelectedRoute expected_single_route = fastpath_enabled ?
         PreparedDecSelectedRoute::h1_small_group_single :
         PreparedDecSelectedRoute::row_direct;
@@ -2946,7 +2985,8 @@ bool test_prepared_h1_small_group_fastpath() {
                     "prepared H1 single-outlier parity matches row-direct reference") &&
         run_case(duplicate_tail_outliers, expected_multi_route,
                  "prepared H1 2-to-4 route matches build toggle",
-                 "prepared H1 duplicate/tail parity matches row-direct reference");
+                 "prepared H1 duplicate/tail parity matches row-direct reference",
+                 true);
 }
 
 bool test_prepared_dec_shards() {
