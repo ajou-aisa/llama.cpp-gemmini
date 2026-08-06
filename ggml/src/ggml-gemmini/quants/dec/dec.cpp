@@ -189,6 +189,7 @@ namespace
         histogram.residual_density =
             I == 0 || K == 0 ? 0.0 :
             static_cast<double>(entries.size()) / static_cast<double>(I * K);
+        histogram.active_rows = count_active_rows(active_row_groups);
         histogram.active_row_groups = active_row_groups.size();
         histogram.active_k = unique_k_count;
         for (const ActiveRowGroup &group : active_row_groups)
@@ -212,7 +213,7 @@ namespace
 
         const bool scaled_route = !route.scales.scalar_mode && !route.scales.row_header_mode &&
             !route.scales.channel_mode;
-        const size_t active_rows = count_active_rows(active_row_groups);
+        const size_t active_rows = histogram.active_rows;
         const size_t scale_group_size = use_int64_h1 ? kDecGroupSizeK : route.scales.block_size;
         const size_t active_row_scale_groups = scaled_route ?
             count_active_row_scale_groups(entries, active_row_groups, scale_group_size) : 0;

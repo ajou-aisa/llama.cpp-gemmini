@@ -75,6 +75,7 @@ struct PreparedDecWorkloadHistogram
 {
     size_t residual_nnz = 0;
     double residual_density = 0.0;
+    size_t active_rows = 0;
     size_t active_row_groups = 0;
     size_t active_k = 0;
     size_t bin_1 = 0;

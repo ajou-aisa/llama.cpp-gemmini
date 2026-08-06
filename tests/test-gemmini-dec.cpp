@@ -2798,6 +2798,13 @@ bool test_prepared_h1_small_group_fastpath() {
             });
         std::vector<ggml::gemmini::quants::dec::ActiveRowGroup> expected_groups;
         ggml::gemmini::quants::dec::build_active_row_groups(expected_entries, expected_groups);
+        size_t expected_active_rows = 0;
+        uint32_t previous_row = std::numeric_limits<uint32_t>::max();
+        for (const auto &group : expected_groups)
+            if (group.row != previous_row) {
+                ++expected_active_rows;
+                previous_row = group.row;
+            }
         size_t expected_bin_1 = 0;
         size_t expected_bin_2_4 = 0;
         size_t expected_bin_5_8 = 0;
@@ -2896,6 +2903,8 @@ bool test_prepared_h1_small_group_fastpath() {
                    "prepared H1 histogram tracks residual density") && ok;
         ok = check(histogram.active_row_groups == expected_groups.size(),
                    "prepared H1 histogram tracks active row groups") && ok;
+        ok = check(histogram.active_rows == expected_active_rows,
+                   "prepared H1 histogram tracks active rows") && ok;
         ok = check(histogram.active_k == expected_unique_k.size(),
                    "prepared H1 histogram tracks active K") && ok;
         ok = check(histogram.bin_1 == expected_bin_1 &&
