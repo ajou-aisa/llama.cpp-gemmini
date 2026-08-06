@@ -247,6 +247,30 @@ target_include_directories(test-gemmini-dec PRIVATE
     ../ggml/src/ggml-gemmini/quants/dec)
 add_test(NAME test-gemmini-dec COMMAND $<TARGET_FILE:test-gemmini-dec>)
 
+add_executable(test-gemmini-dec-jpack
+    test-gemmini-dec-jpack.cpp
+    ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
+    ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
+    ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
+    ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
+    ../ggml/src/ggml-gemmini/quants/act/token/token.cpp
+    ../ggml/src/ggml-gemmini/quants/dec/dec.cpp
+    ../ggml/src/ggml-gemmini/quants/dec/dec_h1_jpack.cpp
+    ../ggml/src/ggml-gemmini/quants/dec/dec_kernel.cpp)
+target_link_libraries(test-gemmini-dec-jpack PRIVATE ggml-base ggml-gemmini-utils)
+target_compile_features(test-gemmini-dec-jpack PRIVATE cxx_std_17)
+target_include_directories(test-gemmini-dec-jpack PRIVATE
+    ../ggml/include
+    ../ggml/src
+    ../ggml/src/ggml-gemmini
+    ../ggml/src/ggml-gemmini-utils/include
+    ../ggml/src/ggml-gemmini/quants
+    ../ggml/src/ggml-gemmini/quants/act
+    ../ggml/src/ggml-gemmini/quants/act/exsia
+    ../ggml/src/ggml-gemmini/quants/common
+    ../ggml/src/ggml-gemmini/quants/dec)
+add_test(NAME test-gemmini-dec-jpack COMMAND $<TARGET_FILE:test-gemmini-dec-jpack>)
+
 add_executable(test-gemmini-matmul-options test-gemmini-matmul-options.cpp)
 target_compile_features(test-gemmini-matmul-options PRIVATE cxx_std_17)
 target_include_directories(test-gemmini-matmul-options PRIVATE
