@@ -470,11 +470,15 @@ bool test_live_pipeline_multistripe_matches_full() {
     }
 
     const auto * sink = collector.sink();
-    const bool captured = sink->on_ready(sink->user_data, make_ready_event(0, 0, 80)) &&
-        sink->on_ready(sink->user_data, make_ready_event(1, 80, rows));
+    const bool captured =
+        sink->on_ready(sink->user_data, make_ready_event(0, 0, 32)) &&
+        sink->on_ready(sink->user_data, make_ready_event(1, 32, 64)) &&
+        sink->on_ready(sink->user_data, make_ready_event(2, 64, 96)) &&
+        sink->on_ready(sink->user_data, make_ready_event(3, 96, rows));
     const auto collector_status = collector.finish();
     const auto execution_status = finish_execution(execution);
-    for (const auto & profile : collector.profiles()) {
+    const auto profiles = collector.profiles();
+    for (const auto & profile : profiles) {
         std::printf(
             "[matmul.stripe.synthetic] stripe_id=%zu row_begin=%zu row_end=%zu "
             "la3_cycles=%llu sf_cycles=%llu handoff_ns=%llu "
@@ -501,7 +505,13 @@ bool test_live_pipeline_multistripe_matches_full() {
         check(collector_status.ok(), "multistripe collector finish") &&
         check(execution_status.ok(), "multistripe execution finish") &&
         check(same_output(pipeline_output, full_output), "multistripe pipeline differs from full") &&
-        check(collector.profiles().size() == 2, "multistripe profile count");
+        check(profiles.size() == 4, "multistripe profile count") &&
+        check(profiles.size() == 4 &&
+                  profiles[0].stripe_id == 0 && profiles[0].row_begin == 0 && profiles[0].row_end == 32 &&
+                  profiles[1].stripe_id == 1 && profiles[1].row_begin == 32 && profiles[1].row_end == 64 &&
+                  profiles[2].stripe_id == 2 && profiles[2].row_begin == 64 && profiles[2].row_end == 96 &&
+                  profiles[3].stripe_id == 3 && profiles[3].row_begin == 96 && profiles[3].row_end == rows,
+              "multistripe profiles are contiguous and ordered");
 }
 
 bool test_block_activation_scale_compensation_parity() {
@@ -2426,7 +2436,7 @@ bool test_compensation_shards_preserve_native_scale_groups() {
 
     MatmulOptions options{};
     options.mode = MatmulInvocationMode::stripe_sequential;
-    options.rc_shards = 3;
+    options.rc_shards = 4;
     auto execution = prepare_execution(args, options);
     auto job = capture_stripe(execution, { 0, 1, 0 }, outliers);
     if (!check(job.status().ok() && prepare_compensation(job).ok(),
@@ -2434,6 +2444,9 @@ bool test_compensation_shards_preserve_native_scale_groups() {
         return false;
     }
     const size_t actual_shards = job.snapshot().expected_shards;
+    if (!check(actual_shards == 4, "native-scale compensation uses four shards")) {
+        return false;
+    }
     if (!check(execute_dense_stripe(job).ok(), "native-scale dense stripe")) {
         return false;
     }
