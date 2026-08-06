@@ -308,6 +308,12 @@ if (NOT GGML_BACKEND_DL)
     target_link_libraries(test-gemmini-matmul PRIVATE ggml-gemmini ggml-base)
     target_compile_features(test-gemmini-matmul PRIVATE cxx_std_17)
     add_test(NAME test-gemmini-matmul COMMAND $<TARGET_FILE:test-gemmini-matmul>)
+
+    find_package(Threads REQUIRED)
+    add_executable(test-gemmini-buffer-artifacts test-gemmini-buffer-artifacts.cpp)
+    target_link_libraries(test-gemmini-buffer-artifacts PRIVATE ggml-gemmini ggml-base Threads::Threads)
+    target_compile_features(test-gemmini-buffer-artifacts PRIVATE cxx_std_17)
+    add_test(NAME test-gemmini-buffer-artifacts COMMAND $<TARGET_FILE:test-gemmini-buffer-artifacts>)
 endif()
 
 llama_build_and_test(test-model-load-cancel.cpp  LABEL "model")

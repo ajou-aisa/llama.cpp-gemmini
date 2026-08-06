@@ -16,6 +16,7 @@
 #include "ggml-impl.h"
 #include "ggml-gemmini.h"
 #include "ggml-gemmini-config.hpp"
+#include "ggml-gemmini-buffer.hpp"
 #include "ggml-gemmini-q8-h1-artifact.hpp"
 #include "ggml-gemmini-q8-h1-reprocess.hpp"
 #include "ggml-backend-impl.h"
@@ -1933,13 +1934,13 @@ static ggml_backend_t ggml_backend_gemmini_device_init_backend(ggml_backend_dev_
 }
 
 static ggml_backend_buffer_type_t ggml_backend_gemmini_device_get_buffer_type(ggml_backend_dev_t dev) {
-    return ggml_backend_cpu_buffer_type();
+    return ggml::gemmini::gemmini_buffer_type(dev);
 
     GGML_UNUSED(dev);
 }
 
 static ggml_backend_buffer_t ggml_backend_gemmini_device_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
-    return ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    return ggml::gemmini::gemmini_buffer_from_host_ptr(dev, ptr, size);
 
     GGML_UNUSED(dev);
     GGML_UNUSED(max_tensor_size);
