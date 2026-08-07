@@ -68,8 +68,10 @@ ggml_add_backend_library(ggml-gemmini
                          quants/weight/quantize_Q8_H1.cpp
                          quants/common/fp16_util.cpp
                          quants/common/dequant.cpp
-                          quants/dec/dec.cpp
-                          quants/dec/dec_kernel.cpp
+                         residual/rmd/rmd-builder.cpp
+                         residual/rmd/rmd-executor.cpp
+                         residual/rmd/rmd-compose.cpp
+                         residual/rmd/rmd-reference.cpp
                          dump/dump_common.cpp
                          dump/dump_tensor.cpp
                          dump/scale/scale_dump_block.cpp
@@ -117,7 +119,7 @@ target_include_directories(ggml-gemmini PRIVATE
   ${CMAKE_CURRENT_LIST_DIR}/quants/act/stripe
   ${CMAKE_CURRENT_LIST_DIR}/quants/act/token
   ${CMAKE_CURRENT_LIST_DIR}/quants/common
-  ${CMAKE_CURRENT_LIST_DIR}/quants/dec
+  ${CMAKE_CURRENT_LIST_DIR}/residual/rmd
   ${CMAKE_CURRENT_LIST_DIR}/quants/view
   ${CMAKE_CURRENT_LIST_DIR}/quants/weight
   ${CMAKE_CURRENT_LIST_DIR}/dump

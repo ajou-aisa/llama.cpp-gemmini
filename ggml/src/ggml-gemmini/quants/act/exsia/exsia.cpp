@@ -1,4 +1,6 @@
 #include "exsia.hpp"
+
+#include "../../../residual/rmd/rmd-compose.hpp"
 #include "exsia_shift.hpp"
 #include "types.hpp"
 
@@ -1306,9 +1308,10 @@ namespace ggml::gemmini::quants::act::exsia
                             const std::vector<int32_t> &stripe_q_wide,
                             const std::vector<int16_t> &stripe_block_exp,
                             std::vector<int32_t> &residual,
-                            std::vector<ggml_gemmini_qact_outlier> &out_outliers)
+                            rmd::RmdStripeBuilder &rmd_builder)
     {
         const int16_t neg_inf = std::numeric_limits<int16_t>::min();
+        rmd_builder.reset(stripe_idx, stripe.row_start, stripe.row_count(), args.K, args.J);
 
         if (stripe.e1 == neg_inf)
         {
@@ -1389,18 +1392,31 @@ namespace ggml::gemmini::quants::act::exsia
                     GGML_ASSERT(global_idx < residual.size());
                     residual[global_idx] = residual_i32;
 
-                    if (outlier && residual_i32 != 0)
+                    // Balanced radix-256 decomposition happens the moment the final
+                    // residual exists; no residual list survives this loop.
+                    if (outlier && residual_i32 != 0 &&
+                        !rmd_builder.add_residual(local_row, col, residual_i32))
                     {
-                        out_outliers.push_back({
-                            static_cast<int>(r),
-                            static_cast<int>(col),
-                            residual_i32,
-                        });
+                        return false;
                     }
                 }
             }
         }
 
+        return true;
+    }
+
+    // Seals the stripe's RMD packet and publishes the shared handle. Called once per
+    // stripe, right after folding commits, by the thread that ran folding.
+    static bool seal_stripe_packet(Meta &meta, StripePipelineSlot &slot)
+    {
+        const uint64_t seal_start_ns = steady_now_ns();
+        slot.rmd_packet = slot.rmd_builder.finish();
+        const uint64_t seal_end_ns = steady_now_ns();
+        slot.rmd_pack_ns = seal_end_ns >= seal_start_ns ? seal_end_ns - seal_start_ns : 0;
+        if (slot.rmd_packet == nullptr)
+            return slot.rmd_builder.status() == rmd::RmdStatus::success;
+        meta.rmd_packets.push_back(slot.rmd_packet);
         return true;
     }
 
@@ -1454,7 +1470,7 @@ namespace ggml::gemmini::quants::act::exsia
                                      : "LocalFoldingPipeline";
         )
         const int16_t invalid_theta = std::numeric_limits<int16_t>::min();
-        // Global outputs are dst (dense int8), state_.residual, meta.theta, and meta.outliers.
+        // Global outputs are dst (dense int8), state_.residual, meta.theta, meta.rmd_packets.
         int8_t *dst = reinterpret_cast<int8_t *>(args.A);
         size_t logical_elem_count = 0;
         const bool logical_elem_count_ok = checked_mul_size(args.I, args.K, logical_elem_count);
@@ -1548,8 +1564,7 @@ namespace ggml::gemmini::quants::act::exsia
         }
 
         meta.theta.assign(num_stripes, invalid_theta);
-        meta.outliers.clear();
-        meta.outliers.reserve(logical_elem_count);
+        meta.rmd_packets.clear();
 
         // Dense residual matrix is a global output, sized to the full padded activation.
         // Each stripe writes its own disjoint global row range (K_padded stride).
@@ -1619,8 +1634,8 @@ namespace ggml::gemmini::quants::act::exsia
             event.slot = slot.stripe_idx % EXSIA_PIPELINE_SLOT_COUNT;
             event.row_begin = slot.row_start;
             event.row_end = slot.row_end;
-            event.outliers = slot.outliers.empty() ? nullptr : slot.outliers.data();
-            event.outlier_count = slot.outliers.size();
+            event.rmd_packet = slot.rmd_packet;
+            event.rmd_pack_ns = slot.rmd_pack_ns;
 #if EXSIA_PROFILE_COLLECTION_ENABLED
             if (profile != nullptr) {
                 event.local_start_cycle = profile->local.start;
@@ -2121,15 +2136,18 @@ namespace ggml::gemmini::quants::act::exsia
                                         EXSIA_PROFILE_COLLECT(start_profile_interval(profile.folding);)
                                         if (!folding_.run(meta, state_, slot.stripe, args, s, dst,
                                                           slot.q_wide, slot.block_exp,
-                                                          state_.residual, slot.outliers))
+                                                          state_.residual, slot.rmd_builder))
+                                        {
+                                            record_failure(ExSIAState::FailureCode::FoldingFailure, s);
+                                            pipeline_ok.store(false, std::memory_order_relaxed);
+                                        }
+                                        else if (!seal_stripe_packet(meta, slot))
                                         {
                                             record_failure(ExSIAState::FailureCode::FoldingFailure, s);
                                             pipeline_ok.store(false, std::memory_order_relaxed);
                                         }
                                         else
                                         {
-                                            meta.outliers.insert(meta.outliers.end(),
-                                                                 slot.outliers.begin(), slot.outliers.end());
                                             slot.mark_folding_committed(steady_now_ns());
                                             if (!snapshot_validation_mask(s, slot.stripe.outlier_mask))
                                             {
@@ -2449,15 +2467,13 @@ namespace ggml::gemmini::quants::act::exsia
 
             if (!folding_.run(meta, state_, stripe, args, s, dst,
                                slot.q_wide, slot.block_exp,
-                               state_.residual, slot.outliers))
+                               state_.residual, slot.rmd_builder))
                 return fail(ExSIAState::FailureCode::FoldingFailure, s);
 
-            // Merge stripe-local outliers into the global list. Sequential, no locking;
-            // this is the same seam a future parallel merge would use. Stripes run in row
-            // order and emit (row, col) ascending, so global ordering is preserved.
-            meta.outliers.insert(meta.outliers.end(),
-                                 slot.outliers.begin(),
-                                 slot.outliers.end());
+            // Seal the stripe packet and hand the shared handle to the metadata. Stripes
+            // run in row order, so meta.rmd_packets stays ordered by row_begin.
+            if (!seal_stripe_packet(meta, slot))
+                return fail(ExSIAState::FailureCode::FoldingFailure, s);
             slot.mark_folding_committed(steady_now_ns());
 
             if (!snapshot_validation_mask(s, slot.stripe.outlier_mask))
@@ -2502,12 +2518,12 @@ namespace ggml::gemmini::quants::act::exsia
         )
         ggml::gemmini::log::debug(
             layer,
-            "[exsia] I=%zu K=%zu stripes=%zu tau=%d outliers=%zu",
+            "[exsia] I=%zu K=%zu stripes=%zu tau=%d rmd_packets=%zu",
             args.I,
             args.K,
             num_stripes,
             meta.sigma,
-            meta.outliers.size());
+            meta.rmd_packets.size());
 
         return true;
     }
@@ -2561,21 +2577,8 @@ namespace ggml::gemmini::quants::act::exsia
                 return false;
             }
 
-            std::vector<int32_t> residuals(row_count * col_count, 0);
-            for (const auto &outlier : meta.outliers)
-            {
-                if (outlier.row < 0 || outlier.col < 0)
-                {
-                    continue;
-                }
-
-                const size_t row = static_cast<size_t>(outlier.row);
-                const size_t col = static_cast<size_t>(outlier.col);
-                if (row < row_count && col < col_count)
-                {
-                    residuals[row * col_count + col] += outlier.residual;
-                }
-            }
+            std::vector<int32_t> residuals;
+            rmd::expand_packets_to_plane(meta.rmd_packets, row_count, col_count, residuals);
 
             const int16_t invalid_theta = std::numeric_limits<int16_t>::min();
             for (size_t row = 0; row < row_count; ++row)

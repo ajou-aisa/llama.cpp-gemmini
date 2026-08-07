@@ -10,11 +10,11 @@ namespace ggml::gemmini::quants::act::token
 struct Meta
 {
     std::vector<float> scales;
-    std::vector<ggml_gemmini_qact_outlier> outliers;
+    RmdPacketList rmd_packets;
 
     inline void reset() {
         scales.clear();
-        outliers.clear();
+        rmd_packets.clear();
     }
 };
 

@@ -24,7 +24,6 @@ public:
     bool global_stripe(size_t local_stripe, size_t &global_stripe) const;
     bool scale(size_t local_row, float &scale) const;
     bool theta(size_t local_stripe, int16_t &theta) const;
-    bool contains(const QactOutlier &outlier) const;
 
 private:
     const ggml_gemmini_args_t *source_ = nullptr;
@@ -45,8 +44,7 @@ bool dequantize_activation(float *dst,
                            size_t cols,
                            const ggml_gemmini_args_t &args);
 
-std::vector<QactOutlier> outliers(const ggml_gemmini_args_t &args);
-const std::vector<QactOutlier> &outliers_view(const ggml_gemmini_args_t &args);
+const RmdPacketList &rmd_packets(const ggml_gemmini_args_t &args);
 
 std::vector<float> activation_scales(const ggml_gemmini_args_t &args, size_t row_count);
 

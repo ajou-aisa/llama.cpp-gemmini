@@ -2,6 +2,8 @@
 
 #include "types.hpp"
 
+#include "../../../residual/rmd/rmd-builder.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <array>
@@ -353,8 +355,10 @@ namespace ggml::gemmini::quants::act::exsia
         size_t slot = 0;
         size_t row_begin = 0;
         size_t row_end = 0;
-        const ggml_gemmini_qact_outlier *outliers = nullptr;
-        size_t outlier_count = 0;
+        // Residual work for this stripe, or nullptr when the stripe has no residual.
+        // The packet owns its buffers, so it stays valid after the ExSIA slot is released.
+        ggml::gemmini::rmd::StripePacketHandle rmd_packet;
+        uint64_t rmd_pack_ns = 0;
         uint64_t local_start_cycle = 0;
         uint64_t local_end_cycle = 0;
         uint64_t folding_start_cycle = 0;
@@ -531,7 +535,9 @@ namespace ggml::gemmini::quants::act::exsia
         std::vector<uint64_t> block_mask_words; // slot-owned storage for per-block BlockMask views
         size_t block_mask_words_per_block = 0;
         size_t active_block_count = 0;
-        std::vector<ggml_gemmini_qact_outlier> outliers; // stripe-local, merged after folding
+        ggml::gemmini::rmd::RmdStripeBuilder rmd_builder; // fed during folding
+        ggml::gemmini::rmd::StripePacketHandle rmd_packet;  // sealed at folding commit
+        uint64_t rmd_pack_ns = 0;                           // packet seal duration
         uint64_t folding_commit_ns = 0;
 
 #if EXSIA_BRANCH_COUNTS_ENABLED
@@ -562,7 +568,6 @@ namespace ggml::gemmini::quants::act::exsia
                 !stripe.scratch.prepare(block_size))
                 return false;
 
-            outliers.reserve(elem_capacity);
             return true;
         }
 
@@ -583,7 +588,8 @@ namespace ggml::gemmini::quants::act::exsia
             stripe.outlier_mask.rows = 0;
             stripe.outlier_mask.cols = 0;
             stripe.scratch.reset();
-            outliers.clear();
+            rmd_packet.reset();
+            rmd_pack_ns = 0;
             folding_commit_ns = 0;
 #if EXSIA_BRANCH_COUNTS_ENABLED
             cycle_stats.reset();
@@ -632,7 +638,8 @@ namespace ggml::gemmini::quants::act::exsia
             assert(block_mask_word_count <= block_mask_words.size());
             std::fill_n(block_mask_words.begin(), block_mask_word_count, uint64_t{0});
             active_block_count = blocks;
-            outliers.clear();
+            rmd_packet.reset();
+            rmd_pack_ns = 0;
             folding_commit_ns = 0;
 #if EXSIA_BRANCH_COUNTS_ENABLED
             cycle_stats.reset();
@@ -1050,8 +1057,8 @@ namespace ggml::gemmini::quants::act::exsia
             int8_t *dst,
             const std::vector<int32_t> &stripe_q_wide,
             const std::vector<int16_t> &stripe_block_exp,
-            std::vector<int32_t> &residual,                       // dense global output, I * K_padded
-            std::vector<ggml_gemmini_qact_outlier> &out_outliers); // stripe-local, merged by caller
+            std::vector<int32_t> &residual,                  // dense global output, I * K_padded
+            ggml::gemmini::rmd::RmdStripeBuilder &rmd_builder); // stripe-local RMD packet builder
 
     private:
         OutlierMarker unit_outlier_;

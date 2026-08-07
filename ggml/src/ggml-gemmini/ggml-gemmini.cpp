@@ -26,8 +26,6 @@
 #include "dump/dump_tensor.hpp"
 
 #include <gemmini.h>
-// Legacy aisa::ActivationDEC is replaced by ggml::gemmini::quants::dec
-// #include "error_compensation/activation_DEC.h"
 #include "ggml-gemmini-args.h"
 #include "ggml-gemmini-matmul.hpp"
 #include "quants/common/tensor_util.hpp"
@@ -49,12 +47,7 @@
 #ifndef LOW_D
 #define LOW_D 0
 #endif
-#ifndef ERROR_COMPENSATION
-#define ERROR_COMPENSATION 0
-#endif 
-#if ERROR_COMPENSATION
-#include "quants/dec/dec.hpp"
-#endif
+#include "residual/rmd/rmd-compose.hpp"
 #ifndef OPTION
 #define OPTION CPU
 #endif
@@ -947,7 +940,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         }
     }
 
-    ggml_gemmini_args_t args; // DEC과 gemmini 호출을 위한 args 
+    ggml_gemmini_args_t args;
     std::vector<int8_t> q8_channel_dense;
     std::vector<float> q8_channel_scales;
     std::unique_ptr<ggml::gemmini::MatmulStripeCollector> pipeline_collector;
@@ -1445,8 +1438,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         ggml::gemmini::log::debug(layer,
             "[matmul.pipeline] schedule=%s",
             pipeline_route.backend == ggml::gemmini::detail::BackendRoute::cpu
-                ? "matmul-then-dec"
-                : "matmul-dec-overlap");
+                ? "matmul-then-rmd"
+                : "matmul-rmd-overlap");
         ggml::gemmini::log::debug(layer, "[matmul.pipeline] job_slots=%zu", pipeline_job_capacity);
         pipeline_execution = std::make_unique<ggml::gemmini::MatmulExecution>(
             ggml::gemmini::prepare_execution(&args, matmul_options));
@@ -1618,8 +1611,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             ggml::gemmini::detail::backend_route_name(route.backend);
         const char * const schedule =
             route.backend == ggml::gemmini::detail::BackendRoute::cpu
-                ? "matmul-then-dec"
-                : "matmul-dec-overlap";
+                ? "matmul-then-rmd"
+                : "matmul-rmd-overlap";
         ggml::gemmini::log::debug(layer,
             "[matmul.route] invocation=stripe-pipeline full_or_slice=slice "
             "activation_route=%s weight_route=%s backend_route=%s "
@@ -1633,8 +1626,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             ggml::gemmini::log::debug(layer,
                 "[matmul.stripe] stripe_id=%zu row_begin=%zu row_end=%zu "
                 "la_cycles=%llu la3_cycles=%llu sf_cycles=%llu la3_ns=%llu sf1_ns=%llu handoff_ns=%llu ws_ns=%llu "
-                "rc_prepare_ns=%llu rc_compute_ns=%llu rc_finalize_ns=%llu "
-                "ws_start_ns=%llu ws_end_ns=%llu rc_start_ns=%llu rc_end_ns=%llu rc_shards=%zu",
+                "rmd_pack_ns=%llu rmd_execute_ns=%llu rmd_compose_ns=%llu rmd_finalize_ns=%llu "
+                "ws_start_ns=%llu ws_end_ns=%llu rmd_start_ns=%llu rmd_end_ns=%llu "
+                "active_blocks=%zu active_lanes=%zu physical_tiles=%zu packet_bytes=%zu",
                 profile.stripe_id,
                 profile.row_begin,
                 profile.row_end,
@@ -1645,41 +1639,24 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 static_cast<unsigned long long>(profile.sf1_ns),
                 static_cast<unsigned long long>(profile.handoff.nanoseconds),
                 static_cast<unsigned long long>(profile.ws.nanoseconds),
-                static_cast<unsigned long long>(profile.rc_prepare.nanoseconds),
-                static_cast<unsigned long long>(profile.rc_compute.nanoseconds),
-                static_cast<unsigned long long>(profile.rc_finalize.nanoseconds),
+                static_cast<unsigned long long>(profile.rmd_pack.nanoseconds),
+                static_cast<unsigned long long>(profile.rmd_execute.nanoseconds),
+                static_cast<unsigned long long>(profile.rmd_compose.nanoseconds),
+                static_cast<unsigned long long>(profile.rmd_finalize.nanoseconds),
                 static_cast<unsigned long long>(profile.ws_start_ns),
                 static_cast<unsigned long long>(profile.ws_end_ns),
-                static_cast<unsigned long long>(profile.rc_start_ns),
-                static_cast<unsigned long long>(profile.rc_end_ns),
-                profile.rc_shards);
+                static_cast<unsigned long long>(profile.rmd_start_ns),
+                static_cast<unsigned long long>(profile.rmd_end_ns),
+                profile.rmd.active_blocks,
+                profile.rmd.active_lanes,
+                profile.rmd.physical_tile_count,
+                profile.rmd.packet_bytes);
             const std::string summary = ggml::gemmini::detail::pipeline_stripe_summary_json(
                 layer, args.I, args.J, args.K, backend_route, schedule, profile);
             (void) ggml::gemmini::detail::append_pipeline_stripe_summary_jsonl(summary);
             ggml::gemmini::log::debug(layer, "%s", summary.c_str());
         }
     }
-    // dst에는 gemmini 커널에서 dequantize한 결과가 들어옴 
-#if ERROR_COMPENSATION
-    if (!pipeline_enabled && legacy_full_dispatch) {
-    uint64_t start_dec = ggml::gemmini::cycle::read();
-    auto outliers = ggml::gemmini::quants::activation_outliers(args);
-    uint64_t end_dec = ggml::gemmini::cycle::read();
-    ggml::gemmini::log::cycle(layer, "[dec] cpu.Create views", start_dec, end_dec);
-
-#if defined(GGML_GEMMINI_TEST_OBSERVER) && GGML_GEMMINI_COMPUTE_TYPE == 0
-    ggml::gemmini::observe_test_i("dec", args.I);
-#endif
-    auto dec_result = ggml::gemmini::quants::dec::compensate_activation_dec(outliers, args, layer);
-    if (dec_result.nnz > 0) {
-        ggml::gemmini::log::debug(layer,
-                         "[dec.summary] staged=%zu nnz=%zu unique_k=%zu",
-                         dec_result.total_selected,
-                         dec_result.nnz,
-                         dec_result.unique_k_count);
-    }
-    }
-#endif
 }
 
 static void ggml_backend_gemmini_add(

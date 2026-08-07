@@ -38,6 +38,12 @@ namespace ggml::gemmini::config
 #define GGML_GEMMINI_BLOCK_SIZE 32
 #endif
 
+// Balanced Radix-256 Residual Matrix Decomposition. OFF is a residual-compensation
+// ablation only: there is no other compensation path.
+#ifndef GGML_GEMMINI_ENABLE_RMD
+#define GGML_GEMMINI_ENABLE_RMD 1
+#endif
+
 // ComputeType ----------------------------------------------------------------
 // 0 = INT              : activation quant + weight unpacking + int matmul
 // 1 = FLOAT            : bypass quant, call matmul_cpu_fp directly

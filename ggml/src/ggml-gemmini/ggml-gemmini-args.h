@@ -14,8 +14,6 @@
 
 namespace act = ggml::gemmini::quants::act;
 
-using ggml_gemmini_qact_outlier = act::ggml_gemmini_qact_outlier;
-
 namespace ggml::gemmini::types {
 enum class LayerType : uint8_t;
 }

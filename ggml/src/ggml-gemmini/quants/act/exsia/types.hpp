@@ -20,7 +20,7 @@ struct Meta
     int16_t rho = 6;
     int32_t sigma = GGML_GEMMINI_EXSIA_SIGMA;
     std::vector<int16_t> theta;
-    std::vector<ggml_gemmini_qact_outlier> outliers;
+    RmdPacketList rmd_packets;
 
     void reset()
     {
@@ -28,7 +28,7 @@ struct Meta
         rho = 6;
         sigma = GGML_GEMMINI_EXSIA_SIGMA;
         theta.clear();
-        outliers.clear();
+        rmd_packets.clear();
     }
 
     int16_t resolve_stripe_theta(int stripe_idx) const

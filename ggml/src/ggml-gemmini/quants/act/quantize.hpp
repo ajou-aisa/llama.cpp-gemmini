@@ -25,7 +25,6 @@ void reset_activation_quant_state(ggml_gemmini_args_t &args);
 void init_exsia_meta(ggml_gemmini_args_t &args);
 const act::exsia::Meta &get_exsia_meta(const ggml_gemmini_args_t &args);
 act::exsia::Meta &get_exsia_meta_mut(ggml_gemmini_args_t &args);
-std::vector<QactOutlier> activation_outliers(const ggml_gemmini_args_t &args);
-const std::vector<QactOutlier> &activation_outliers_view(const ggml_gemmini_args_t &args);
+const act::RmdPacketList &activation_rmd_packets(const ggml_gemmini_args_t &args);
 
 } // namespace ggml::gemmini::quants

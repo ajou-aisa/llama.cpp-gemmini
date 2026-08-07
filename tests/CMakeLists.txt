@@ -180,6 +180,9 @@ target_include_directories(gemmini_q8_h1_h2_dequant_fp PRIVATE
 add_executable(test-gemmini-exsia
     test-gemmini-exsia.cpp
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
     ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
     ../ggml/src/ggml-gemmini/quants/act/quantize.cpp
     ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
@@ -201,6 +204,19 @@ target_include_directories(test-gemmini-exsia PRIVATE
     ../ggml/src/ggml-gemmini/quants/act/exsia
     ../ggml/src/ggml-gemmini/quants/common)
 add_test(NAME test-gemmini-exsia COMMAND $<TARGET_FILE:test-gemmini-exsia>)
+
+add_executable(test-gemmini-rmd
+    test-gemmini-rmd.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp)
+target_link_libraries(test-gemmini-rmd PRIVATE ggml-base ggml-gemmini-utils)
+target_compile_features(test-gemmini-rmd PRIVATE cxx_std_17)
+target_include_directories(test-gemmini-rmd PRIVATE
+    ../ggml/src
+    ../ggml/src/ggml-gemmini
+    ../ggml/src/ggml-gemmini/residual/rmd
+    ${GEMMINI_SW_PATH}
+    ${GEMMINI_SW_PATH}/include)
+add_test(NAME test-gemmini-rmd COMMAND $<TARGET_FILE:test-gemmini-rmd>)
 add_test(NAME test-gemmini-exsia-stream-parity
     COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=stream-parity --rows=129 --cols=37)
 add_test(NAME test-gemmini-exsia-stream-invalid-shape
@@ -218,59 +234,6 @@ add_test(NAME gemmini_exsia_localstage_kernel_validation
 set_tests_properties(gemmini_exsia_localstage_kernel_validation PROPERTIES
     LABELS "gemmini;exsia;validation"
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
-add_executable(test-gemmini-dec
-    test-gemmini-dec.cpp
-    ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
-    ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
-    ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
-    ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
-    ../ggml/src/ggml-gemmini/quants/act/token/token.cpp
-    ../ggml/src/ggml-gemmini/quants/dec/dec.cpp
-    ../ggml/src/ggml-gemmini/quants/dec/dec_kernel.cpp)
-target_link_libraries(test-gemmini-dec PRIVATE ggml-base ggml-gemmini-utils)
-target_compile_features(test-gemmini-dec PRIVATE cxx_std_17)
-target_compile_definitions(test-gemmini-dec PRIVATE DEC_VALIDATION=1)
-if (GGML_GEMMINI_ENABLE_OPENMP)
-    find_package(OpenMP REQUIRED)
-    target_link_libraries(test-gemmini-dec PRIVATE OpenMP::OpenMP_CXX)
-    target_compile_definitions(test-gemmini-dec PRIVATE GGML_GEMMINI_HAS_OPENMP)
-endif()
-target_include_directories(test-gemmini-dec PRIVATE
-    ../ggml/include
-    ../ggml/src
-    ../ggml/src/ggml-gemmini
-    ../ggml/src/ggml-gemmini-utils/include
-    ../ggml/src/ggml-gemmini/quants
-    ../ggml/src/ggml-gemmini/quants/act
-    ../ggml/src/ggml-gemmini/quants/act/exsia
-    ../ggml/src/ggml-gemmini/quants/common
-    ../ggml/src/ggml-gemmini/quants/dec)
-add_test(NAME test-gemmini-dec COMMAND $<TARGET_FILE:test-gemmini-dec>)
-
-add_executable(test-gemmini-dec-jpack
-    test-gemmini-dec-jpack.cpp
-    ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
-    ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
-    ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
-    ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
-    ../ggml/src/ggml-gemmini/quants/act/token/token.cpp
-    ../ggml/src/ggml-gemmini/quants/dec/dec.cpp
-    ../ggml/src/ggml-gemmini/quants/dec/dec_h1_jpack.cpp
-    ../ggml/src/ggml-gemmini/quants/dec/dec_kernel.cpp)
-target_link_libraries(test-gemmini-dec-jpack PRIVATE ggml-base ggml-gemmini-utils)
-target_compile_features(test-gemmini-dec-jpack PRIVATE cxx_std_17)
-target_include_directories(test-gemmini-dec-jpack PRIVATE
-    ../ggml/include
-    ../ggml/src
-    ../ggml/src/ggml-gemmini
-    ../ggml/src/ggml-gemmini-utils/include
-    ../ggml/src/ggml-gemmini/quants
-    ../ggml/src/ggml-gemmini/quants/act
-    ../ggml/src/ggml-gemmini/quants/act/exsia
-    ../ggml/src/ggml-gemmini/quants/common
-    ../ggml/src/ggml-gemmini/quants/dec)
-add_test(NAME test-gemmini-dec-jpack COMMAND $<TARGET_FILE:test-gemmini-dec-jpack>)
-
 add_executable(test-gemmini-matmul-options test-gemmini-matmul-options.cpp)
 target_compile_features(test-gemmini-matmul-options PRIVATE cxx_std_17)
 target_include_directories(test-gemmini-matmul-options PRIVATE
@@ -330,6 +293,9 @@ endif()
 add_executable(gemmini-quant-dispatch-smoke
     gemmini-quant-dispatch-smoke.cpp
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
     ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
     ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
     ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
@@ -346,8 +312,7 @@ target_include_directories(gemmini-quant-dispatch-smoke PRIVATE
     ../ggml/src/ggml-gemmini/quants/act
     ../ggml/src/ggml-gemmini/quants/act/exsia
     ../ggml/src/ggml-gemmini/quants/act/token
-    ../ggml/src/ggml-gemmini/quants/common
-    ../ggml/src/ggml-gemmini/quants/dec)
+    ../ggml/src/ggml-gemmini/quants/common)
 llama_test(gemmini-quant-dispatch-smoke NAME gemmini_quant_dispatch_fp          ARGS fp)
 llama_test(gemmini-quant-dispatch-smoke NAME gemmini_quant_dispatch_exsia       ARGS exsia)
 llama_test(gemmini-quant-dispatch-smoke NAME gemmini_quant_dispatch_tensor     ARGS tensor)

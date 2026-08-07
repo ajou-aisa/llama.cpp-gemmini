@@ -142,13 +142,6 @@ bool ActivationMetadataView::theta(size_t local_stripe, int16_t &theta) const
     return theta != std::numeric_limits<int16_t>::min();
 }
 
-bool ActivationMetadataView::contains(const QactOutlier &outlier) const
-{
-    return valid_ && outlier.row >= 0 &&
-        static_cast<size_t>(outlier.row) >= global_row_begin_ &&
-        static_cast<size_t>(outlier.row) < global_row_end_;
-}
-
 bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
 {
     switch (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT) {
@@ -222,33 +215,15 @@ bool dequantize_activation(float *dst,
     }
 }
 
-std::vector<QactOutlier> outliers(const ggml_gemmini_args_t &args)
+const RmdPacketList &rmd_packets(const ggml_gemmini_args_t &args)
 {
+    static const RmdPacketList empty;
     const auto &storage = args.act_quant.storage();
-    if (const auto *meta = std::get_if<exsia::Meta>(&storage)) {
-        return meta->outliers;
-    }
-    if (const auto *meta = std::get_if<tensor::Meta>(&storage)) {
-        return meta->outliers;
-    }
-    if (const auto *meta = std::get_if<token::Meta>(&storage)) {
-        return meta->outliers;
-    }
-    if (const auto *meta = std::get_if<stripe::Meta>(&storage)) {
-        return meta->outliers;
-    }
-
-    return {};
-}
-
-const std::vector<QactOutlier> &outliers_view(const ggml_gemmini_args_t &args)
-{
-    static const std::vector<QactOutlier> empty;
-    const auto &storage = args.act_quant.storage();
-    if (const auto *meta = std::get_if<exsia::Meta>(&storage)) return meta->outliers;
-    if (const auto *meta = std::get_if<tensor::Meta>(&storage)) return meta->outliers;
-    if (const auto *meta = std::get_if<token::Meta>(&storage)) return meta->outliers;
-    if (const auto *meta = std::get_if<stripe::Meta>(&storage)) return meta->outliers;
+    if (const auto *meta = std::get_if<exsia::Meta>(&storage)) return meta->rmd_packets;
+    if (const auto *meta = std::get_if<tensor::Meta>(&storage)) return meta->rmd_packets;
+    if (const auto *meta = std::get_if<token::Meta>(&storage)) return meta->rmd_packets;
+    if (const auto *meta = std::get_if<stripe::Meta>(&storage)) return meta->rmd_packets;
+    if (const auto *meta = std::get_if<block::Meta>(&storage)) return meta->rmd_packets;
     return empty;
 }
 
