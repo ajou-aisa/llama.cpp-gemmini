@@ -172,6 +172,8 @@ target_sources(gemmini_q8_h1_h2_dequant_fp PRIVATE
     ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
     ../ggml/src/ggml-gemmini/quants/act/token/token.cpp)
 target_link_libraries(gemmini_q8_h1_h2_dequant_fp PRIVATE ggml-base ggml-gemmini-utils)
+target_compile_definitions(gemmini_q8_h1_h2_dequant_fp PRIVATE
+    GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE})
 target_include_directories(gemmini_q8_h1_h2_dequant_fp PRIVATE
     ../ggml/src
     ../ggml/src/ggml-gemmini
@@ -192,6 +194,7 @@ target_link_libraries(test-gemmini-exsia PRIVATE ggml-base ggml-gemmini-utils)
 target_compile_features(test-gemmini-exsia PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-exsia PRIVATE
     GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
+    GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
     CYCLE_DETAIL=${CYCLE_DETAIL}
     EXSIA_VALIDATION=1)
 target_include_directories(test-gemmini-exsia PRIVATE
@@ -304,6 +307,7 @@ target_link_libraries(gemmini-quant-dispatch-smoke PRIVATE ggml-base ggml-gemmin
 target_compile_features(gemmini-quant-dispatch-smoke PRIVATE cxx_std_17)
 target_compile_definitions(gemmini-quant-dispatch-smoke PRIVATE
     GGML_GEMMINI_ACTIVATION_QUANT=2
+    GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
     GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA})
 target_include_directories(gemmini-quant-dispatch-smoke PRIVATE
     ../ggml/src

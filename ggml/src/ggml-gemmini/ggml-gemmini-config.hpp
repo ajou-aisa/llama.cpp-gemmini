@@ -30,10 +30,6 @@ namespace ggml::gemmini::config
 #define GGML_GEMMINI_ACTIVATION_QUANT 0
 #endif
 
-#ifndef GGML_GEMMINI_WEIGHT_QUANT
-#define GGML_GEMMINI_WEIGHT_QUANT 0
-#endif
-
 #ifndef GGML_GEMMINI_BLOCK_SIZE
 #define GGML_GEMMINI_BLOCK_SIZE 32
 #endif
@@ -59,10 +55,6 @@ enum class ActivationQuantAlgo : uint8_t {
     TENSOR = 1,
     TOKEN = 2,
     STRIPE = 4,
-};
-
-enum class WeightQuantAlgo : uint8_t {
-    TENSOR = 0,
 };
 
 // Macro → enum mapping (compile-time) ---------------------------------------
@@ -91,13 +83,6 @@ inline constexpr ActivationQuantAlgo CURRENT_ACTIVATION_QUANT =
     #error "Invalid GGML_GEMMINI_ACTIVATION_QUANT value"
 #endif
 
-inline constexpr WeightQuantAlgo CURRENT_WEIGHT_QUANT =
-#if GGML_GEMMINI_WEIGHT_QUANT == 0
-    WeightQuantAlgo::TENSOR;
-#else
-    #error "Invalid GGML_GEMMINI_WEIGHT_QUANT value"
-#endif
-
 #define GGML_GEMMINI_ACTIVATION_QUANT_NAMEEXSIA "exsia"
 #define GGML_GEMMINI_ACTIVATION_QUANT_NAMETENSOR "tensor"
 #define GGML_GEMMINI_ACTIVATION_QUANT_NAMETOKEN "token"
@@ -117,6 +102,5 @@ inline constexpr bool DEQUANT_FP_TEST = GGML_GEMMINI_DEQUANT_FP_TEST != 0;
 
 static_assert(static_cast<uint8_t>(CURRENT_COMPUTE_TYPE) <= 1, "CURRENT_COMPUTE_TYPE must be INT or FLOAT");
 static_assert(static_cast<uint8_t>(CURRENT_ACTIVATION_QUANT) <= 4, "CURRENT_ACTIVATION_QUANT must be EXSIA, TENSOR, TOKEN, or STRIPE");
-static_assert(static_cast<uint8_t>(CURRENT_WEIGHT_QUANT) <= 0, "CURRENT_WEIGHT_QUANT must be TENSOR");
 
 } // namespace

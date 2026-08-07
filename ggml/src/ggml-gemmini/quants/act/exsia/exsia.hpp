@@ -40,18 +40,6 @@
 #define GGML_GEMMINI_EXSIA_LOCAL_WORKERS 4
 #endif
 
-#ifndef GGML_GEMMINI_EXSIA_SUPERBLOCKS
-#define GGML_GEMMINI_EXSIA_SUPERBLOCKS 4
-#endif
-
-#ifndef GGML_GEMMINI_EXSIA_PIPELINE_SLOTS
-#define GGML_GEMMINI_EXSIA_PIPELINE_SLOTS 2
-#endif
-
-#ifndef GGML_GEMMINI_EXSIA_OMP_THREADS_DEFAULT
-#define GGML_GEMMINI_EXSIA_OMP_THREADS_DEFAULT 5
-#endif
-
 #ifndef EXSIA_VALIDATION
 #define EXSIA_VALIDATION 0
 #endif
@@ -471,14 +459,11 @@ namespace ggml::gemmini::quants::act::exsia
 
 #endif
 
-    constexpr size_t EXSIA_PIPELINE_SLOT_COUNT = GGML_GEMMINI_EXSIA_PIPELINE_SLOTS;
+    constexpr size_t EXSIA_PIPELINE_SLOT_COUNT = 2;
     constexpr size_t EXSIA_LOCAL_WORKER_COUNT = GGML_GEMMINI_EXSIA_LOCAL_WORKERS;
-    constexpr size_t EXSIA_OMP_THREAD_COUNT = GGML_GEMMINI_EXSIA_OMP_THREADS_DEFAULT;
+    constexpr size_t EXSIA_OMP_THREAD_COUNT = EXSIA_LOCAL_WORKER_COUNT + 1;
     static_assert(EXSIA_LOCAL_WORKER_COUNT == 3 || EXSIA_LOCAL_WORKER_COUNT == 4,
                   "ExSIA requires three or four Local workers");
-    static_assert(EXSIA_OMP_THREAD_COUNT == EXSIA_LOCAL_WORKER_COUNT + 1,
-                  "ExSIA requires OpenMP team size to equal Local workers + 1");
-    static_assert(EXSIA_PIPELINE_SLOT_COUNT == 2, "ExSIA requires exactly two pipeline slots");
 
 #if EXSIA_PROFILE_COLLECTION_ENABLED
     struct ProfileInterval

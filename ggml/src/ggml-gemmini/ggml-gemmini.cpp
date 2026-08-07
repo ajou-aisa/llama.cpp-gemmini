@@ -1514,13 +1514,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                         : ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::STRIPE
                             ? ggml::gemmini::baseline_activation_quant_t::BLOCK
                             : ggml::gemmini::baseline_activation_quant_t::TOKEN;
-            constexpr auto baseline_weight_quant =
-                ggml::gemmini::config::CURRENT_WEIGHT_QUANT == ggml::gemmini::config::WeightQuantAlgo::TENSOR
-                    ? ggml::gemmini::baseline_weight_quant_t::TENSOR
-                    : ggml::gemmini::baseline_weight_quant_t::FLOAT;
             const auto selected_baseline_weight_quant = src0->type == GGML_TYPE_Q8_CHANNEL
                 ? ggml::gemmini::baseline_weight_quant_t::CHANNEL
-                : baseline_weight_quant;
+                : ggml::gemmini::baseline_weight_quant_t::TENSOR;
             bool run_baseline = true;
 
             if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA ||
