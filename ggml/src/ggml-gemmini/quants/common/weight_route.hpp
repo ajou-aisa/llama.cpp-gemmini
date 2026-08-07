@@ -3,8 +3,9 @@
 #include "../../ggml-gemmini-args.h"
 
 #include <cstddef>
+#include <cstdint>
 
-namespace ggml::gemmini::quants::dec
+namespace ggml::gemmini::quants::wroute
 {
     struct WeightScaleInfo
     {
@@ -16,13 +17,14 @@ namespace ggml::gemmini::quants::dec
         bool scalar_mode = false;
         bool row_header_mode = false;
         bool channel_mode = false;
+        bool on_demand_mode = false;
         bool supported = true;
     };
 
     enum class WeightScaleInfoMode
     {
         CommonOutput,
-        Dec,
+        Residual,
     };
 
     WeightScaleInfo build_weight_scale_info(
@@ -34,6 +36,74 @@ namespace ggml::gemmini::quants::dec
         KxJ_RowMajor,
         JxK_ColMajor,
     };
+
+    enum class WeightRouteKind
+    {
+        Unsupported,
+        Dense,
+        Q8ChannelDirect,
+        Q8ChannelSidecar,
+        Q8H1,
+        Q8H2,
+        Q8HP1,
+        Q8HP2,
+    };
+
+    struct WeightRoutePlan
+    {
+        WeightRouteKind route = WeightRouteKind::Unsupported;
+        WeightLayout layout = WeightLayout::KxJ_RowMajor;
+        WeightScaleInfo scales{};
+        size_t weight_stride = 0;
+        const char *reject_reason = "unsupported weight format";
+        bool native_weight_blocks = false;
+        bool valid = false;
+    };
+
+    WeightRoutePlan resolve_weight_route_plan(
+        const ggml_gemmini_args_t &args,
+        WeightScaleInfoMode mode);
+
+    const char *weight_route_kind_name(const WeightRoutePlan &plan);
+
+    const char *weight_scale_mode_name(const WeightRoutePlan &plan);
+
+    bool route_covers_k(const WeightRoutePlan &plan, size_t k_count);
+
+    bool route_block_for_range(
+        const WeightRoutePlan &plan,
+        size_t k_offset,
+        size_t block_k,
+        size_t &block_index);
+
+    float route_weight_scale(
+        const WeightRoutePlan &plan,
+        const ggml_gemmini_args_t &args,
+        size_t j,
+        size_t block_index);
+
+    // RMD contract -----------------------------------------------------------
+    // RMD needs the weight scale to factor into an integer per (column, K-block)
+    // term and a float per-column term:
+    //
+    //     weight_scale(j, block) == route_block_scale(j, block) * route_column_scale(j)
+    //
+    // Q8_H1 satisfies this exactly (c_eff is an integer, s_rf is per column).
+    // Scalar/channel/row-header routes satisfy it trivially with block scale 1.
+    // Routes whose per-block factor is genuinely floating point (Q8_HP1/HP2/H2 and
+    // dense per-block scale tables) do not, and are rejected by RMD.
+    bool route_supports_integer_block_scale(const WeightRoutePlan &plan);
+
+    uint64_t route_block_scale(
+        const WeightRoutePlan &plan,
+        const ggml_gemmini_args_t &args,
+        size_t j,
+        size_t block_index);
+
+    float route_column_scale(
+        const WeightRoutePlan &plan,
+        const ggml_gemmini_args_t &args,
+        size_t j);
 
     inline bool is_q8_h1_args(const ggml_gemmini_args_t &args)
     {
@@ -75,7 +145,7 @@ namespace ggml::gemmini::quants::dec
         return args.has_q8_channel_dense_sidecar_contract();
     }
 
-    inline bool has_q8_hp1_native_dec_contract(const ggml_gemmini_args_t &args)
+    inline bool has_q8_hp1_native_contract(const ggml_gemmini_args_t &args)
     {
         return args.B == nullptr &&
                !args.weight_i8_scale_active &&
@@ -83,7 +153,7 @@ namespace ggml::gemmini::quants::dec
                args.has_q8_hp1_im2p_contract();
     }
 
-    inline bool has_q8_hp2_native_dec_contract(const ggml_gemmini_args_t &args)
+    inline bool has_q8_hp2_native_contract(const ggml_gemmini_args_t &args)
     {
         return args.B == nullptr &&
                !args.weight_i8_scale_active &&

@@ -127,13 +127,23 @@ llama_context::llama_context(
             backends.emplace_back(backend);
         }
 
-        // add ACCEL backends (such as BLAS)
-        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+        const char * matmul_invocation = std::getenv("GEMMINI_MATMUL_INVOCATION");
+        const bool prefer_gemmini = matmul_invocation != nullptr &&
+            (std::strcmp(matmul_invocation, "stripe-sequential") == 0 ||
+             std::strcmp(matmul_invocation, "stripe-pipeline") == 0);
+        for (int pass = 0; pass < (prefer_gemmini ? 2 : 1); ++pass) {
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                    continue;
+                }
+                const bool is_gemmini = std::strcmp(ggml_backend_dev_name(dev), "GEMMINI") == 0;
+                if (prefer_gemmini && ((pass == 0) != is_gemmini)) {
+                    continue;
+                }
                 const char * backend_params = nullptr;
                 std::string gemmini_model_arch;
-                if (std::strcmp(ggml_backend_dev_name(dev), "GEMMINI") == 0) {
+                if (is_gemmini) {
                     gemmini_model_arch = model.arch_name();
                     backend_params = gemmini_model_arch.c_str();
                 }

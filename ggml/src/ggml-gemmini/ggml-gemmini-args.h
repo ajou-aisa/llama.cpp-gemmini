@@ -14,10 +14,12 @@
 
 namespace act = ggml::gemmini::quants::act;
 
-using ggml_gemmini_qact_outlier = act::ggml_gemmini_qact_outlier;
-
 namespace ggml::gemmini::types {
 enum class LayerType : uint8_t;
+}
+
+namespace ggml::gemmini::quants::act::exsia {
+struct StripeReadySink;
 }
 
 #include <ggml.h>
@@ -77,6 +79,8 @@ typedef struct ggml_gemmini_args_t {
     //elements
     elem_t *A = nullptr;
     elem_t *B = nullptr;
+    const float *A_fp32 = nullptr;
+    const float *B_fp32 = nullptr;
     void *C = nullptr;
     const void *D = nullptr;
 
@@ -84,6 +88,9 @@ typedef struct ggml_gemmini_args_t {
     size_t sB = 0;
     size_t sC = 0;
     size_t sD = 0;
+
+    size_t activation_row_offset = 0;
+    size_t activation_rows_per_stripe = 0;
 
     // scales, gemmini input val.
     scale_t scale_B = 1.f;
@@ -101,6 +108,7 @@ typedef struct ggml_gemmini_args_t {
 
     // activation quantization metadata
     act::Meta act_quant{};
+    const ggml::gemmini::quants::act::exsia::StripeReadySink *exsia_stripe_ready_sink = nullptr;
 
     //for weight checking   
     uint8_t weightA = 0;

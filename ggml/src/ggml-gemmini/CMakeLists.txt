@@ -1,4 +1,5 @@
 message(STATUS "GEMMINI found")
+include(CheckCXXSourceCompiles)
 
 set(RISCV_TOOL_PATH $ENV{RISCV})
 if (NOT DEFINED GEMMINI_SW_PATH OR GEMMINI_SW_PATH STREQUAL "")
@@ -17,12 +18,23 @@ if (NOT EXISTS "${GEMMINI_SW_PATH}/gemmini.h"
   set(GEMMINI_SW_PATH "${LLAMA_ROOT}/../RISC-V-DynDNN-gemmini-include")
 endif()
 
-option(GGML_GEMMINI_FORCE_GGML_OUTPUT "Force Gemmini backend to produce outputs via GGML CPU path" OFF)
-option(GGML_GEMMINI_FORCE_GGML_ALL "Force all Gemmini layers to GGML CPU fallback when forcing output" OFF)
-option(GGML_GEMMINI_ENABLE_OPENMP "Enable OpenMP for Gemmini CPU-side kernels" OFF)
-
-set(GGML_GEMMINI_FORCE_GGML_OUTPUT_DEF $<IF:$<BOOL:${GGML_GEMMINI_FORCE_GGML_OUTPUT}>,1,0>)
-set(GGML_GEMMINI_FORCE_GGML_ALL_DEF    $<IF:$<BOOL:${GGML_GEMMINI_FORCE_GGML_ALL}>,1,0>)
+if (NOT DEFINED GGML_GEMMINI_ENABLE_OPENMP)
+  set(GGML_GEMMINI_ENABLE_OPENMP OFF)
+endif()
+if (NOT DEFINED GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE)
+  set(GGML_GEMMINI_EXSIA_PROFILE_SCOPE "OFF" CACHE STRING "ExSIA profile scope (OFF, TIMELINE, STAGE)")
+  set_property(CACHE GGML_GEMMINI_EXSIA_PROFILE_SCOPE PROPERTY STRINGS OFF TIMELINE STAGE)
+  string(TOUPPER "${GGML_GEMMINI_EXSIA_PROFILE_SCOPE}" _GGML_GEMMINI_EXSIA_PROFILE_SCOPE_UPPER)
+  if (_GGML_GEMMINI_EXSIA_PROFILE_SCOPE_UPPER STREQUAL "OFF")
+    set(GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE 0)
+  elseif (_GGML_GEMMINI_EXSIA_PROFILE_SCOPE_UPPER STREQUAL "TIMELINE")
+    set(GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE 1)
+  elseif (_GGML_GEMMINI_EXSIA_PROFILE_SCOPE_UPPER STREQUAL "STAGE")
+    set(GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE 2)
+  else()
+    message(FATAL_ERROR "GGML_GEMMINI_EXSIA_PROFILE_SCOPE must be OFF, TIMELINE, or STAGE, got '${GGML_GEMMINI_EXSIA_PROFILE_SCOPE}'")
+  endif()
+endif()
 
 set(GEMMINI_COMMON_FLAGS
   -fno-common
@@ -40,6 +52,8 @@ set(GEMMINI_RISCV_FLAGS
 
 ggml_add_backend_library(ggml-gemmini
                           ggml-gemmini.cpp
+                          ggml-gemmini-buffer.cpp
+                          ggml-gemmini-matmul.cpp
                           ggml-gemmini-q8-h1-artifact.cpp
                           ggml-gemmini-q8-h1-artifact-reader.cpp
                             quants/act/dispatch.cpp
@@ -51,8 +65,10 @@ ggml_add_backend_library(ggml-gemmini
                          quants/weight/quantize_Q8_H1.cpp
                          quants/common/fp16_util.cpp
                          quants/common/dequant.cpp
-                          quants/dec/dec.cpp
-                          quants/dec/dec_kernel.cpp
+                         residual/rmd/rmd-builder.cpp
+                         residual/rmd/rmd-executor.cpp
+                         residual/rmd/rmd-compose.cpp
+                         residual/rmd/rmd-reference.cpp
                          dump/dump_common.cpp
                          dump/dump_tensor.cpp
                          dump/scale/scale_dump_block.cpp
@@ -61,6 +77,9 @@ ggml_add_backend_library(ggml-gemmini
                         )
 
 target_compile_features(ggml-gemmini PRIVATE cxx_std_17)
+target_compile_definitions(ggml-gemmini PRIVATE
+  GGML_GEMMINI_MATMUL_IMPLEMENTATION
+  GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE})
 
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
   target_compile_options(ggml-gemmini PRIVATE ${GEMMINI_COMMON_FLAGS} ${GEMMINI_RISCV_FLAGS})
@@ -83,6 +102,7 @@ else()
 endif()
 
 target_include_directories(ggml-gemmini PUBLIC
+  ${GGML_GEMMINI_GENERATED_CONFIG_DIR}
   ${CMAKE_CURRENT_LIST_DIR}
   ${CMAKE_CURRENT_LIST_DIR}/../../include
   ${CMAKE_CURRENT_LIST_DIR}/../ggml-gemmini-utils/include
@@ -96,7 +116,7 @@ target_include_directories(ggml-gemmini PRIVATE
   ${CMAKE_CURRENT_LIST_DIR}/quants/act/stripe
   ${CMAKE_CURRENT_LIST_DIR}/quants/act/token
   ${CMAKE_CURRENT_LIST_DIR}/quants/common
-  ${CMAKE_CURRENT_LIST_DIR}/quants/dec
+  ${CMAKE_CURRENT_LIST_DIR}/residual/rmd
   ${CMAKE_CURRENT_LIST_DIR}/quants/view
   ${CMAKE_CURRENT_LIST_DIR}/quants/weight
   ${CMAKE_CURRENT_LIST_DIR}/dump
@@ -114,9 +134,35 @@ target_link_libraries(ggml-gemmini PRIVATE
 if (GGML_GEMMINI_ENABLE_OPENMP)
   find_package(OpenMP)
   if (OpenMP_FOUND)
+    set(CMAKE_REQUIRED_FLAGS "${OpenMP_CXX_FLAGS}")
+    set(CMAKE_REQUIRED_LIBRARIES OpenMP::OpenMP_CXX)
+    check_cxx_source_compiles("#include <omp.h>
+int main() {
+  int storage[8] = {0};
+  int * token = storage;
+  #pragma omp parallel num_threads(2)
+  #pragma omp single
+  {
+    #pragma omp taskgroup
+    {
+      #pragma omp task depend(out : token[0])
+      token[0] = 1;
+      #pragma omp task depend(in : token[0]) depend(out : token[1])
+      token[1] = token[0];
+      #pragma omp task depend(in : token[0], token[1]) depend(inout : token[2]) depend(out : token[3])
+      token[2] = token[0] + token[1];
+    }
+  }
+  return token[2] == 2 ? 0 : 1;
+}" GGML_GEMMINI_OPENMP_TASK_DEPEND_COMPILES)
+    unset(CMAKE_REQUIRED_FLAGS)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+    if (NOT GGML_GEMMINI_OPENMP_TASK_DEPEND_COMPILES)
+      message(FATAL_ERROR "GGML_GEMMINI_ENABLE_OPENMP requires OpenMP task depend support")
+    endif()
     target_link_libraries(ggml-gemmini PRIVATE OpenMP::OpenMP_CXX)
     target_compile_definitions(ggml-gemmini PRIVATE GGML_GEMMINI_HAS_OPENMP)
   else()
-    message(WARNING "OpenMP not found for ggml-gemmini")
+    message(FATAL_ERROR "GGML_GEMMINI_ENABLE_OPENMP=ON but OpenMP was not found; ExSIA OpenMP pipeline is BLOCKED")
   endif()
 endif()

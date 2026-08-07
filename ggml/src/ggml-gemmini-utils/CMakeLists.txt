@@ -22,7 +22,6 @@ else()
             LOG_CYCLE=1
             LOG_DUMP=0
             LOG_DUMP_SCALE=0
-            ERROR_COMPENSATION=0
             GEMMINI_VERIFY_DEQ=1
     )
 endif()

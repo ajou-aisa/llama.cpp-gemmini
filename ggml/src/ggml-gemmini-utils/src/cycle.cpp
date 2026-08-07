@@ -159,6 +159,20 @@ namespace ggml::gemmini::log
 #endif
     }
 
+    bool CycleLog::set_output_path(const char *path, bool truncate)
+    {
+#if LOG_CYCLE
+        if (truncate && path && *path && !truncate_file(path)) {
+            return false;
+        }
+        return Log::set_output_path(path);
+#else
+        (void)path;
+        (void)truncate;
+        return true;
+#endif
+    }
+
     void CycleLog::operator()(const char *layer, const char *op, uint64_t start, uint64_t end)
     {
         write(out_, nullptr, 0, nullptr, layer, op, start, end);

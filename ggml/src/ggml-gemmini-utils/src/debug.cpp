@@ -6,7 +6,6 @@
 #include <mutex>
 #include <string>
 #include <system_error>
-#include <unordered_set>
 
 namespace ggml::gemmini::log
 {
@@ -95,22 +94,7 @@ namespace ggml::gemmini::log
         FILE *open_output_file(const std::filesystem::path &path)
         {
             const std::string key = path.string();
-            bool truncate = false;
-            static std::mutex opened_mutex;
-            static std::unordered_set<std::string> opened_paths;
-
-            {
-                std::lock_guard<std::mutex> lock(opened_mutex);
-                truncate = opened_paths.insert(key).second;
-            }
-
-            FILE *file = std::fopen(key.c_str(), truncate ? "w" : "a");
-            if (!file && truncate)
-            {
-                std::lock_guard<std::mutex> lock(opened_mutex);
-                opened_paths.erase(key);
-            }
-            return file;
+            return std::fopen(key.c_str(), "a");
         }
 
         void append_json_escaped(std::string &out, const char *s)
@@ -271,6 +255,66 @@ namespace ggml::gemmini::log
             std::fputc('\n', out);
             std::fflush(out);
         }
+
+        void write_jsonl_ws_loop(FILE *out, uint64_t wall, uint64_t load, uint64_t exe, uint64_t store, uint64_t loop,
+                                 uint64_t dim_I, uint64_t dim_J, uint64_t dim_K,
+                                 uint64_t tile_I, uint64_t tile_J, uint64_t tile_K,
+                                 uint64_t I0, uint64_t J0, uint64_t K0,
+                                 uint64_t a_reuse, uint64_t b_reuse)
+        {
+            if (!out)
+            {
+                return;
+            }
+
+            std::string json;
+            json.reserve(256);
+            bool first = true;
+            auto add_key = [&](const char *key)
+            {
+                if (!first)
+                {
+                    json.push_back(',');
+                }
+                first = false;
+                json.push_back('"');
+                json += key;
+                json += "\":";
+            };
+            auto add_u64 = [&](const char *key, uint64_t value)
+            {
+                add_key(key);
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(value));
+                json += buf;
+            };
+
+            json.push_back('{');
+            add_key("event");
+            json += "\"ws_loop\"";
+            add_u64("wall", wall);
+            add_u64("load", load);
+            add_u64("exe", exe);
+            add_u64("store", store);
+            add_u64("loop", loop);
+            add_u64("dim_I", dim_I);
+            add_u64("dim_J", dim_J);
+            add_u64("dim_K", dim_K);
+            add_u64("tile_I", tile_I);
+            add_u64("tile_J", tile_J);
+            add_u64("tile_K", tile_K);
+            add_u64("I0", I0);
+            add_u64("J0", J0);
+            add_u64("K0", K0);
+            add_u64("a_reuse", a_reuse);
+            add_u64("b_reuse", b_reuse);
+            add_u64("valid", 1);
+            json += "}\n";
+            static std::mutex write_mutex;
+            std::lock_guard<std::mutex> lock(write_mutex);
+            std::fwrite(json.data(), 1, json.size(), out);
+            std::fflush(out);
+        }
     } // namespace
 
     LogTarget file(const char *path)
@@ -389,6 +433,20 @@ namespace ggml::gemmini::log
 
     DebugLog::DebugLog(FILE *out, bool add_newline)
         : Log(out), add_newline_(add_newline) {}
+
+    bool DebugLog::set_output_path(const char *path, bool truncate)
+    {
+#if LOG_DEBUG
+        if (truncate && path && *path && !truncate_file(path)) {
+            return false;
+        }
+        return Log::set_output_path(path);
+#else
+        (void)path;
+        (void)truncate;
+        return true;
+#endif
+    }
 
     void DebugLog::vwrite(FILE *out, const char *file, int line, const char *func, const char *fmt, va_list ap)
     {
@@ -563,6 +621,24 @@ namespace ggml::gemmini::log
         (void)fmt;
         (void)ap;
 #endif
+    }
+
+    void DebugLog::ws_loop(LogTarget target, uint64_t wall, uint64_t load, uint64_t exe, uint64_t store, uint64_t loop,
+                           uint64_t dim_I, uint64_t dim_J, uint64_t dim_K,
+                           uint64_t tile_I, uint64_t tile_J, uint64_t tile_K,
+                           uint64_t I0, uint64_t J0, uint64_t K0,
+                           uint64_t a_reuse, uint64_t b_reuse)
+    {
+        bool owns = false;
+        FILE *out = select_output(target.path, &owns);
+        write_jsonl_ws_loop(out, wall, load, exe, store, loop,
+                            dim_I, dim_J, dim_K,
+                            tile_I, tile_J, tile_K,
+                            I0, J0, K0, a_reuse, b_reuse);
+        if (owns && out)
+        {
+            std::fclose(out);
+        }
     }
 
     void DebugLog::v_target_loc(LogTarget target, const char *file, int line, const char *func,

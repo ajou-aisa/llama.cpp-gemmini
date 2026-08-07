@@ -74,7 +74,7 @@ static bool set_gemmini_debug_log_output(const char * path) {
         ggml::gemmini::log::debug.set_output(stderr);
         return true;
     }
-    return ggml::gemmini::log::debug.set_output_path(path);
+    return ggml::gemmini::log::debug.set_output_path(path, true);
 }
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
@@ -120,7 +120,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "error: failed to open Gemmini debug log output: %s\n", gemmini_debug_log);
         return 1;
     }
-    ggml::gemmini::log::cycle.set_output_path("log/cycle-log.jsonl");
+    ggml::gemmini::log::cycle.set_output_path("log/cycle-log.jsonl", true);
 
     common_params params;
     g_params = &params;

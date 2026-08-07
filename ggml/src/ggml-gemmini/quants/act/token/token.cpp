@@ -6,6 +6,8 @@
 #include <vector>
 
 #include "../../../ggml-gemmini-args.h"
+#include "../../../residual/rmd/rmd-builder.hpp"
+#include "../../../residual/rmd/rmd-compose.hpp"
 #include "../../common/tensor_util.hpp"
 #include "token.hpp"
 
@@ -193,9 +195,11 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
         return false;
 
     meta->scales.assign(args.I, 1.0f);
-    meta->outliers.clear();
+    meta->rmd_packets.clear();
 
-#if ERROR_COMPENSATION
+#if GGML_GEMMINI_ENABLE_RMD
+    ggml::gemmini::rmd::RmdStripeBuilder rmd_builder;
+    rmd_builder.reset(0, 0, args.I, args.K, args.J);
     BitMask outliers;
     if (!outliers.resize(args.I, args.K))
         return false;
@@ -207,7 +211,7 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
         if (!compute_row_stats(src_data, args, row, row_stats))
             return false;
 
-#if ERROR_COMPENSATION
+#if GGML_GEMMINI_ENABLE_RMD
         RowStats inlier_stats;
         if (!mark_outliers_sigma(src_data, args, row, row_stats, outliers, inlier_stats))
             return false;
@@ -227,19 +231,25 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
             const int8_t q8 = clip_to_i8(q32);
             dst[idx] = q8;
 
-#if ERROR_COMPENSATION
-            const int32_t residual = q32 - static_cast<int32_t>(q8);
-            if (outliers.is_marked(row, col) && residual != 0)
-            {
-                meta->outliers.push_back({
-                    static_cast<int>(row),
-                    static_cast<int>(col),
-                    residual,
-                });
-            }
+#if GGML_GEMMINI_ENABLE_RMD
+            const int64_t wide_residual = static_cast<int64_t>(q32) - static_cast<int64_t>(q8);
+            if (wide_residual < std::numeric_limits<int32_t>::min() ||
+                wide_residual > std::numeric_limits<int32_t>::max())
+                return false;
+            const int32_t residual = static_cast<int32_t>(wide_residual);
+            if (outliers.is_marked(row, col) && residual != 0 &&
+                !rmd_builder.add_residual(row, col, residual))
+                return false;
 #endif
         }
     }
+
+#if GGML_GEMMINI_ENABLE_RMD
+    if (auto packet = rmd_builder.finish())
+        meta->rmd_packets.push_back(std::move(packet));
+    else if (rmd_builder.status() != ggml::gemmini::rmd::RmdStatus::success)
+        return false;
+#endif
 
     return true;
 }
@@ -274,22 +284,15 @@ bool dequantize_activation(
     const size_t col_count = std::min(cols, args.K);
     const size_t max_size = std::numeric_limits<size_t>::max();
 
-#if ERROR_COMPENSATION
+#if GGML_GEMMINI_ENABLE_RMD
     size_t residual_count = 0;
     if (!checked_mul_size(row_count, col_count, residual_count))
         return false;
+    (void) residual_count;
 
-    std::vector<int32_t> residuals(residual_count, 0);
-
-    for (const auto &outlier : meta.outliers)
-    {
-        if (outlier.row < 0 || outlier.col < 0) continue;
-
-        const size_t row = static_cast<size_t>(outlier.row);
-        const size_t col = static_cast<size_t>(outlier.col);
-        if (row < row_count && col < col_count)
-            residuals[row * col_count + col] += outlier.residual;
-    }
+    std::vector<int32_t> residuals;
+    ggml::gemmini::rmd::expand_packets_to_plane(
+        meta.rmd_packets, row_count, col_count, residuals);
 #endif
 
     for (size_t row = 0; row < row_count; ++row)
@@ -317,7 +320,7 @@ bool dequantize_activation(
             const size_t dst_idx = dst_row_offset + dst_col_offset;
 
             int32_t q = static_cast<int32_t>(src[src_idx]);
-#if ERROR_COMPENSATION
+#if GGML_GEMMINI_ENABLE_RMD
             q += residuals[row * col_count + col];
 #endif
             dst[dst_idx] = static_cast<float>(q) * scale;

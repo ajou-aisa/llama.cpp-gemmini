@@ -98,8 +98,8 @@ act::exsia::Meta &get_exsia_meta_mut(ggml_gemmini_args_t &args)
     return std::get<act::exsia::Meta>(args.act_quant.storage());
 }
 
-std::vector<QactOutlier> activation_outliers(const ggml_gemmini_args_t &args)
+const act::RmdPacketList &activation_rmd_packets(const ggml_gemmini_args_t &args)
 {
-    return act::outliers(args);
+    return act::rmd_packets(args);
 }
 } // namespace ggml::gemmini::quants

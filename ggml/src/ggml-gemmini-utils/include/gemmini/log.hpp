@@ -88,6 +88,7 @@ namespace ggml::gemmini::log
     {
     public:
         explicit DebugLog(FILE *out = stderr, bool add_newline = false);
+        bool set_output_path(const char *path, bool truncate = false);
 
         void operator()(const char *fmt, ...);
         void operator()(const char *file, int line, const char *func, const char *fmt, ...);
@@ -103,6 +104,11 @@ namespace ggml::gemmini::log
         void v_target_layer(LogTarget target, const char *layer, const char *fmt, va_list ap);
         void v_target_loc(LogTarget target, const char *file, int line, const char *func,
                           const char *fmt, va_list ap);
+        void ws_loop(LogTarget target, uint64_t wall, uint64_t load, uint64_t exe, uint64_t store, uint64_t loop,
+                     uint64_t dim_I, uint64_t dim_J, uint64_t dim_K,
+                     uint64_t tile_I, uint64_t tile_J, uint64_t tile_K,
+                     uint64_t I0, uint64_t J0, uint64_t K0,
+                     uint64_t a_reuse, uint64_t b_reuse);
 
     private:
         void vwrite(FILE *out, const char *file, int line, const char *func, const char *fmt, va_list ap);
@@ -115,6 +121,7 @@ namespace ggml::gemmini::log
     {
     public:
         using Log::Log;
+        bool set_output_path(const char *path, bool truncate = false);
 
         void operator()(const char *layer, const char *op,
                         uint64_t start, uint64_t end);

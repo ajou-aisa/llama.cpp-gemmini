@@ -154,6 +154,15 @@ endif()
 # llama_build_and_test(test-opt.cpp) # SLOW
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
+add_executable(test-gemmini-log test-gemmini-log.cpp)
+target_link_libraries(test-gemmini-log PRIVATE ggml-gemmini-utils)
+target_compile_features(test-gemmini-log PRIVATE cxx_std_17)
+target_compile_definitions(test-gemmini-log PRIVATE
+    EXPECT_LOG_DEBUG=$<IF:$<BOOL:${LOG_DEBUG}>,1,0>)
+target_include_directories(test-gemmini-log PRIVATE
+    ../ggml/src/ggml-gemmini-utils/include)
+add_test(NAME test-gemmini-log
+    COMMAND $<TARGET_FILE:test-gemmini-log> ${CMAKE_CURRENT_BINARY_DIR}/gemmini-log-regression)
 llama_build_and_test(test-gemmini-q8-h1-h2-dequant-fp.cpp NAME gemmini_q8_h1_h2_dequant_fp)
 target_sources(gemmini_q8_h1_h2_dequant_fp PRIVATE
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
@@ -163,6 +172,8 @@ target_sources(gemmini_q8_h1_h2_dequant_fp PRIVATE
     ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
     ../ggml/src/ggml-gemmini/quants/act/token/token.cpp)
 target_link_libraries(gemmini_q8_h1_h2_dequant_fp PRIVATE ggml-base ggml-gemmini-utils)
+target_compile_definitions(gemmini_q8_h1_h2_dequant_fp PRIVATE
+    GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE})
 target_include_directories(gemmini_q8_h1_h2_dequant_fp PRIVATE
     ../ggml/src
     ../ggml/src/ggml-gemmini
@@ -171,6 +182,9 @@ target_include_directories(gemmini_q8_h1_h2_dequant_fp PRIVATE
 add_executable(test-gemmini-exsia
     test-gemmini-exsia.cpp
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
     ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
     ../ggml/src/ggml-gemmini/quants/act/quantize.cpp
     ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
@@ -180,7 +194,9 @@ target_link_libraries(test-gemmini-exsia PRIVATE ggml-base ggml-gemmini-utils)
 target_compile_features(test-gemmini-exsia PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-exsia PRIVATE
     GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
-    CYCLE_DETAIL=${CYCLE_DETAIL})
+    GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
+    CYCLE_DETAIL=${CYCLE_DETAIL}
+    EXSIA_VALIDATION=1)
 target_include_directories(test-gemmini-exsia PRIVATE
     ../ggml/include
     ../ggml/src
@@ -191,6 +207,19 @@ target_include_directories(test-gemmini-exsia PRIVATE
     ../ggml/src/ggml-gemmini/quants/act/exsia
     ../ggml/src/ggml-gemmini/quants/common)
 add_test(NAME test-gemmini-exsia COMMAND $<TARGET_FILE:test-gemmini-exsia>)
+
+add_executable(test-gemmini-rmd
+    test-gemmini-rmd.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp)
+target_link_libraries(test-gemmini-rmd PRIVATE ggml-base ggml-gemmini-utils)
+target_compile_features(test-gemmini-rmd PRIVATE cxx_std_17)
+target_include_directories(test-gemmini-rmd PRIVATE
+    ../ggml/src
+    ../ggml/src/ggml-gemmini
+    ../ggml/src/ggml-gemmini/residual/rmd
+    ${GEMMINI_SW_PATH}
+    ${GEMMINI_SW_PATH}/include)
+add_test(NAME test-gemmini-rmd COMMAND $<TARGET_FILE:test-gemmini-rmd>)
 add_test(NAME test-gemmini-exsia-stream-parity
     COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=stream-parity --rows=129 --cols=37)
 add_test(NAME test-gemmini-exsia-stream-invalid-shape
@@ -199,6 +228,60 @@ add_test(NAME gemmini_exsia_all
     COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=all --rows=65 --cols=37 --compiled-tau=${GGML_GEMMINI_EXSIA_SIGMA})
 add_test(NAME gemmini_exsia_shift_extremes
     COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=shift-extremes --compiled-tau=${GGML_GEMMINI_EXSIA_SIGMA})
+add_test(NAME gemmini_exsia_localstage_kernel_validation
+    COMMAND $<TARGET_FILE:test-gemmini-exsia>
+        --case=localstage-kernel-validation
+        --focus=all
+        --repeat-fresh=10
+        --evidence-dir=${CMAKE_CURRENT_BINARY_DIR}/exsia-localstage-kernel-validation)
+set_tests_properties(gemmini_exsia_localstage_kernel_validation PROPERTIES
+    LABELS "gemmini;exsia;validation"
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+add_executable(test-gemmini-matmul-options test-gemmini-matmul-options.cpp)
+target_compile_features(test-gemmini-matmul-options PRIVATE cxx_std_17)
+target_include_directories(test-gemmini-matmul-options PRIVATE
+    ../ggml/include
+    ../ggml/src
+    ../ggml/src/ggml-gemmini
+    ../ggml/src/ggml-gemmini-utils/include
+    ../ggml/src/ggml-gemmini/quants
+    ${GGML_GEMMINI_GENERATED_CONFIG_DIR}
+    ${GEMMINI_SW_PATH}
+    ${GEMMINI_SW_PATH}/include)
+if (NOT GGML_BACKEND_DL)
+    target_link_libraries(test-gemmini-matmul-options PRIVATE ggml-gemmini ggml-base)
+    target_compile_definitions(test-gemmini-matmul-options PRIVATE GGML_GEMMINI_OPTIONS_TEST_BACKEND=1)
+endif()
+add_test(NAME test-gemmini-matmul-options COMMAND $<TARGET_FILE:test-gemmini-matmul-options>)
+get_filename_component(LLAMA_TEST_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+if (EXISTS "${CMAKE_COMMAND}" AND EXISTS "${LLAMA_TEST_SOURCE_DIR}/CMakeLists.txt")
+    add_test(
+        NAME test-gemmini-build-contract
+        COMMAND ${CMAKE_COMMAND}
+            -DTEST_CMAKE_COMMAND=${CMAKE_COMMAND}
+            -DTEST_SOURCE_DIR=${LLAMA_TEST_SOURCE_DIR}
+            -DTEST_BINARY_ROOT=${CMAKE_CURRENT_BINARY_DIR}/gemmini-build-contract
+            -DTEST_GENERATOR=${CMAKE_GENERATOR}
+            -DTEST_GENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM}
+            -DTEST_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-build-contract.cmake)
+endif()
+
+if (NOT GGML_BACKEND_DL)
+    # The façade test uses C++ symbols from the statically linked backend.
+    # Dynamic backends are MODULE libraries and cannot be linked into a test.
+    add_executable(test-gemmini-matmul test-gemmini-matmul.cpp)
+    target_link_libraries(test-gemmini-matmul PRIVATE ggml-gemmini ggml-base)
+    target_compile_features(test-gemmini-matmul PRIVATE cxx_std_17)
+    add_test(NAME test-gemmini-matmul COMMAND $<TARGET_FILE:test-gemmini-matmul>)
+
+    find_package(Threads REQUIRED)
+    add_executable(test-gemmini-buffer-artifacts test-gemmini-buffer-artifacts.cpp)
+    target_link_libraries(test-gemmini-buffer-artifacts PRIVATE ggml-gemmini ggml-base Threads::Threads)
+    target_compile_features(test-gemmini-buffer-artifacts PRIVATE cxx_std_17)
+    add_test(NAME test-gemmini-buffer-artifacts COMMAND $<TARGET_FILE:test-gemmini-buffer-artifacts>)
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_build_and_test(test-autorelease.cpp        LABEL "model")
 
@@ -213,6 +296,9 @@ endif()
 add_executable(gemmini-quant-dispatch-smoke
     gemmini-quant-dispatch-smoke.cpp
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
     ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
     ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
     ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
@@ -221,6 +307,7 @@ target_link_libraries(gemmini-quant-dispatch-smoke PRIVATE ggml-base ggml-gemmin
 target_compile_features(gemmini-quant-dispatch-smoke PRIVATE cxx_std_17)
 target_compile_definitions(gemmini-quant-dispatch-smoke PRIVATE
     GGML_GEMMINI_ACTIVATION_QUANT=2
+    GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
     GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA})
 target_include_directories(gemmini-quant-dispatch-smoke PRIVATE
     ../ggml/src
@@ -229,8 +316,7 @@ target_include_directories(gemmini-quant-dispatch-smoke PRIVATE
     ../ggml/src/ggml-gemmini/quants/act
     ../ggml/src/ggml-gemmini/quants/act/exsia
     ../ggml/src/ggml-gemmini/quants/act/token
-    ../ggml/src/ggml-gemmini/quants/common
-    ../ggml/src/ggml-gemmini/quants/dec)
+    ../ggml/src/ggml-gemmini/quants/common)
 llama_test(gemmini-quant-dispatch-smoke NAME gemmini_quant_dispatch_fp          ARGS fp)
 llama_test(gemmini-quant-dispatch-smoke NAME gemmini_quant_dispatch_exsia       ARGS exsia)
 llama_test(gemmini-quant-dispatch-smoke NAME gemmini_quant_dispatch_tensor     ARGS tensor)

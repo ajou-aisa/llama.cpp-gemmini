@@ -57,6 +57,11 @@ extern "C"
     void gemmini_log_debug_to(gemmini_log_target target, const char *fmt, ...);
     void gemmini_log_debug_to_layer(gemmini_log_target target, const char *layer, const char *fmt, ...);
     void gemmini_log_debug_to_loc(gemmini_log_target target, const char *file, int line, const char *func, const char *fmt, ...);
+    void gemmini_log_ws_loop(uint64_t wall, uint64_t load, uint64_t exe, uint64_t store, uint64_t loop,
+                             uint64_t dim_I, uint64_t dim_J, uint64_t dim_K,
+                             uint64_t tile_I, uint64_t tile_J, uint64_t tile_K,
+                             uint64_t I0, uint64_t J0, uint64_t K0,
+                             uint64_t a_reuse, uint64_t b_reuse);
 
     void gemmini_log_cycle(const char *layer, const char *op, uint64_t start, uint64_t end);
     void gemmini_log_cycle_loc(const char *file, int line, const char *func,

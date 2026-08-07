@@ -1,0 +1,18 @@
+#pragma once
+
+#include <cstddef>
+#include <optional>
+
+namespace ggml::gemmini::config {
+
+inline constexpr bool ENABLE_STRIPE_MATMUL = @_GGML_GEMMINI_ENABLE_STRIPE_MATMUL_VALUE@;
+inline constexpr bool ENABLE_STRIPE_PIPELINE = @_GGML_GEMMINI_ENABLE_STRIPE_PIPELINE_VALUE@;
+inline constexpr int DEFAULT_MATMUL_MODE = @_GGML_GEMMINI_DEFAULT_MATMUL_MODE_VALUE@;
+inline constexpr std::optional<std::size_t> DEFAULT_STRIPE_ROWS =
+    @_GGML_GEMMINI_DEFAULT_STRIPE_ROWS_VALUE@;
+inline constexpr std::size_t DEFAULT_STRIPE_JOB_CAPACITY =
+    @GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY@;
+inline constexpr bool ALLOW_RUNTIME_MATMUL_OVERRIDE =
+    @_GGML_GEMMINI_ALLOW_RUNTIME_MATMUL_OVERRIDE_VALUE@;
+
+} // namespace ggml::gemmini::config
