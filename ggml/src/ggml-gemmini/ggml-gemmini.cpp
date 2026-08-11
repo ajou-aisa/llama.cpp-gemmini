@@ -804,20 +804,13 @@ static void observe_test_i(const char * consumer, size_t I) {
 extern "C" volatile uint64_t gemmini_tiled_matmul_cycles = 0; // gemmini.h
 
 static void setup_gemmini_log_outputs_if_needed(void) {
-    static thread_local bool configured = false;
-    if (configured) {
-        return;
+    const auto result = ggml::gemmini::log::setup_default_outputs();
+    if (!result.cycle) {
+        GGML_LOG_WARN("%s: failed to set default cycle log path '%s'\n", __func__, GEMMINI_LOG_DEFAULT_CYCLE_PATH);
     }
-
-    if (!ggml::gemmini::log::cycle.has_explicit_output() &&
-        !ggml::gemmini::log::cycle.set_output_path("log/cycle-log.jsonl", true)) {
-        GGML_LOG_WARN("%s: failed to set default cycle log path 'log/cycle-log.jsonl'\n", __func__);
+    if (!result.debug) {
+        GGML_LOG_WARN("%s: failed to set default debug log path '%s'\n", __func__, GEMMINI_LOG_DEFAULT_DEBUG_PATH);
     }
-    if (!ggml::gemmini::log::debug.has_explicit_output() &&
-        !ggml::gemmini::log::debug.set_output_path("log/debug-log.jsonl", true)) {
-        GGML_LOG_WARN("%s: failed to set default debug log path 'log/debug-log.jsonl'\n", __func__);
-    }
-    configured = true;
 }
 
 static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,

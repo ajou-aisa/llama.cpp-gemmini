@@ -1,10 +1,18 @@
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
 #include "../ggml/src/ggml-gemmini/quants/act/dispatch.hpp"
+#include "../ggml/src/ggml-gemmini/quants/act/quantize.hpp"
 #include "../ggml/src/ggml-gemmini/quants/act/exsia/types.hpp"
 
+#include <ggml.h>
+#ifndef GEMMINI_EXSIA_WRITER_TEST_ONLY
 #include <gemmini.h>
+#endif
 
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <vector>
 
 namespace {
 
@@ -16,6 +24,7 @@ bool check(bool value, const char * message) {
     return value;
 }
 
+#ifndef GEMMINI_EXSIA_WRITER_TEST_ONLY
 bool test_exsia_baseline() {
     elem_t activation = 3;
     elem_t weight = 4;
@@ -60,12 +69,57 @@ bool test_dispatch_modes() {
     const auto & packets = quants::act::rmd_packets(args);
     return check(packets.empty(), "dispatch exposes empty RMD packet list");
 }
+#endif
+
+bool profile_output_routing(const std::filesystem::path & expected, bool invalid_parent) {
+    if (invalid_parent) {
+        std::ofstream("blocked") << "not a directory";
+    }
+
+    std::vector<float> source(64);
+    for (size_t index = 0; index < source.size(); ++index) {
+        source[index] = index % 4 == 0 ? -0.5f : 0.5f;
+    }
+    std::vector<elem_t> quantized(64);
+    ggml_tensor tensor{};
+    tensor.type = GGML_TYPE_F32;
+    tensor.data = source.data();
+    ggml_gemmini_args_t args{};
+    args.I = 1;
+    args.J = 1;
+    args.K = source.size();
+    args.A = quantized.data();
+    args.sA = source.size();
+
+    const bool wrote = quants::quantize_activation(&tensor, args);
+    if (invalid_parent) {
+        return check(!wrote, "invalid ExSIA profile parent reports existing writer failure") &&
+            check(!std::filesystem::exists(expected), "invalid ExSIA profile path is absent") &&
+            check(!std::filesystem::exists("log/exsia-cycle-detail.jsonl"), "invalid ExSIA profile does not fall back to legacy log");
+    }
+
+    std::ifstream input(expected);
+    std::string line;
+    const bool parsed = std::getline(input, line) && !line.empty() && line.front() == '{' &&
+        line.back() == '}' && line.find("\"record_type\":\"TIMELINE\"") != std::string::npos;
+    return check(wrote, "ExSIA profile writer succeeds") &&
+        check(parsed, "ExSIA profile writer emits non-empty JSONL") &&
+        check(!std::filesystem::exists("log/exsia-cycle-detail.jsonl"), "ExSIA profile writer does not create legacy log");
+}
 
 }
 
-int main() {
+int main(int argc, char ** argv) {
+    if (argc >= 3 && std::string(argv[1]) == "--profile-output") {
+        const bool invalid_parent = argc == 4 && std::string(argv[3]) == "--invalid-parent";
+        return profile_output_routing(argv[2], invalid_parent) ? 0 : 1;
+    }
+#ifdef GEMMINI_EXSIA_WRITER_TEST_ONLY
+    return 1;
+#else
     const bool ok = test_exsia_baseline() && test_dispatch_modes();
     if (ok)
         std::puts("PASS: ExSIA baseline, RMD packet empty-residual handoff, dispatch capability");
     return ok ? 0 : 1;
+#endif
 }

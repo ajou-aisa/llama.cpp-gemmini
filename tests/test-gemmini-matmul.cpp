@@ -4,6 +4,9 @@
 
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
 #include <vector>
 
 namespace {
@@ -17,6 +20,7 @@ bool expect(bool condition, const char * message) {
     return condition;
 }
 
+#ifndef GGML_GEMMINI_PIPELINE_WRITER_TEST_ONLY
 ggml_gemmini_args_t make_args(
         std::vector<elem_t> & activation,
         std::vector<elem_t> & weights,
@@ -152,13 +156,65 @@ bool test_cancel_and_failure() {
                    failure_execution.status().code == MatmulStatusCode::execution_failure,
                "startup failure propagates");
 }
+#endif
+
+bool test_pipeline_output_routing(const std::filesystem::path & expected, bool invalid_parent) {
+    const std::string record = "{\"record_type\":\"PIPELINE\"}";
+    std::vector<std::string> before;
+    {
+        std::ifstream input(expected);
+        std::string line;
+        while (std::getline(input, line)) {
+            before.push_back(line);
+        }
+    }
+
+    if (invalid_parent) {
+        std::ofstream("blocked") << "not a directory";
+    }
+
+    const bool wrote = detail::append_pipeline_stripe_summary_jsonl(record);
+    if (invalid_parent) {
+        return expect(!wrote, "invalid pipeline parent reports failure") &&
+            expect(!std::filesystem::exists(expected), "invalid pipeline path is absent") &&
+            expect(!std::filesystem::exists("debug-log.jsonl"), "invalid pipeline path does not fall back to CWD") &&
+            expect(!std::filesystem::exists("log/debug-log.jsonl"), "invalid pipeline path does not fall back to legacy log");
+    }
+
+    std::ifstream input(expected);
+    std::vector<std::string> after;
+    std::string line;
+    while (std::getline(input, line)) {
+        after.push_back(line);
+    }
+    bool preserved = after.size() >= before.size();
+    for (std::size_t i = 0; preserved && i < before.size(); ++i) {
+        preserved = after[i] == before[i];
+    }
+    const bool appended_once = after.size() == before.size() + 1;
+    const bool final_record = appended_once && after.back() == record;
+    return expect(wrote, "pipeline writer succeeds") &&
+        expect(appended_once, "pipeline writer appends exactly one JSONL record") &&
+        expect(preserved, "pipeline writer preserves existing JSONL records") &&
+        expect(final_record, "pipeline writer appends the expected final JSONL record") &&
+        expect(!std::filesystem::exists("debug-log.jsonl"), "pipeline writer does not create a CWD log") &&
+        expect(!std::filesystem::exists("log/debug-log.jsonl"), "pipeline writer does not create legacy log");
+}
 
 }
 
-int main() {
+int main(int argc, char ** argv) {
+    if (argc >= 3 && std::string(argv[1]) == "--pipeline-output") {
+        const bool invalid_parent = argc == 4 && std::string(argv[3]) == "--invalid-parent";
+        return test_pipeline_output_routing(argv[2], invalid_parent) ? 0 : 1;
+    }
+#ifdef GGML_GEMMINI_PIPELINE_WRITER_TEST_ONLY
+    return 1;
+#else
     if (!test_output_parity() || !test_bad_routes() || !test_cancel_and_failure()) {
         return 1;
     }
     std::puts("PASS: FULL/STRIPE_SEQUENTIAL/PIPELINE parity; malformed/unsupported/cancel/failure coverage");
     return 0;
+#endif
 }

@@ -49,7 +49,9 @@ static void print_usage(int argc, char ** argv) {
     LOG("\nexample usage:\n");
     LOG("\n  text generation:     %s -m your_model.gguf -p \"I believe the meaning of life is\" -n 128 -no-cnv\n", argv[0]);
     LOG("\n  chat (conversation): %s -m your_model.gguf -sys \"You are a helpful assistant\"\n", argv[0]);
-    LOG("\n  Gemmini debug log:   %s --gemmini-debug-log log/debug-log.jsonl\n", argv[0]);
+#if LOG_DEBUG
+    LOG("\n  Gemmini debug log:   %s --gemmini-debug-log PATH\n", argv[0]);
+#endif
     LOG("\n");
 }
 
@@ -65,6 +67,7 @@ static bool file_is_empty(const std::string & path) {
     return f.tellg() == 0;
 }
 
+#if LOG_DEBUG
 static bool set_gemmini_debug_log_output(const char * path) {
     if (std::strcmp(path, "stdout") == 0 || std::strcmp(path, "-") == 0) {
         ggml::gemmini::log::debug.set_output(stdout);
@@ -76,6 +79,7 @@ static bool set_gemmini_debug_log_output(const char * path) {
     }
     return ggml::gemmini::log::debug.set_output_path(path, true);
 }
+#endif
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
 static void sigint_handler(int signo) {
@@ -103,28 +107,39 @@ int main(int argc, char ** argv) {
     args.reserve(argc);
     args.push_back(argv[0]);
 
-    const char * gemmini_debug_log = "log/debug-log.jsonl";
+    const char * gemmini_debug_log = nullptr;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--gemmini-debug-log") == 0) {
+#if LOG_DEBUG
             if (++i >= argc) {
                 fprintf(stderr, "error: --gemmini-debug-log requires PATH, stdout, stderr, or -\n");
                 return 1;
             }
             gemmini_debug_log = argv[i];
             continue;
+#else
+            fprintf(stderr, "error: --gemmini-debug-log is unavailable because this build has LOG_DEBUG=0\n");
+            return 1;
+#endif
         }
         args.push_back(argv[i]);
     }
 
-    if (!set_gemmini_debug_log_output(gemmini_debug_log)) {
+#if LOG_DEBUG
+    if (gemmini_debug_log != nullptr && !set_gemmini_debug_log_output(gemmini_debug_log)) {
         fprintf(stderr, "error: failed to open Gemmini debug log output: %s\n", gemmini_debug_log);
         return 1;
     }
-    ggml::gemmini::log::cycle.set_output_path("log/cycle-log.jsonl", true);
+#endif
 
     common_params params;
     g_params = &params;
     if (!common_params_parse((int) args.size(), args.data(), params, LLAMA_EXAMPLE_MAIN, print_usage)) {
+        return 1;
+    }
+
+    if (!ggml::gemmini::log::cycle.set_output_path(GEMMINI_LOG_DEFAULT_CYCLE_PATH, true)) {
+        fprintf(stderr, "error: failed to open Gemmini cycle log output: %s\n", GEMMINI_LOG_DEFAULT_CYCLE_PATH);
         return 1;
     }
 

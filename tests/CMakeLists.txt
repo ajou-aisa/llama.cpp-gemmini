@@ -102,6 +102,14 @@ if (LLAMA_LLGUIDANCE)
 endif ()
 
 if (NOT WIN32)
+    if (NOT DEFINED BASH_EXECUTABLE)
+        find_program(BASH_EXECUTABLE NAMES bash)
+    endif()
+    if (BASH_EXECUTABLE AND EXISTS "${BASH_EXECUTABLE}")
+        add_test(NAME test-experiment-output
+            COMMAND ${BASH_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-experiment-output.sh)
+    endif()
+
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API
     llama_build_and_test(test-sampling.cpp)
     llama_build_and_test(test-grammar-parser.cpp)
@@ -158,11 +166,16 @@ add_executable(test-gemmini-log test-gemmini-log.cpp)
 target_link_libraries(test-gemmini-log PRIVATE ggml-gemmini-utils)
 target_compile_features(test-gemmini-log PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-log PRIVATE
-    EXPECT_LOG_DEBUG=$<IF:$<BOOL:${LOG_DEBUG}>,1,0>)
+    EXPECT_LOG_DEBUG=$<IF:$<BOOL:${LOG_DEBUG}>,1,0>
+    EXPECT_LOG_CYCLE=$<IF:$<BOOL:${LOG_CYCLE}>,1,0>)
 target_include_directories(test-gemmini-log PRIVATE
     ../ggml/src/ggml-gemmini-utils/include)
 add_test(NAME test-gemmini-log
     COMMAND $<TARGET_FILE:test-gemmini-log> ${CMAKE_CURRENT_BINARY_DIR}/gemmini-log-regression)
+if (LOG_DEBUG)
+    add_test(NAME test-gemmini-log-explicit-debug-before-default
+        COMMAND $<TARGET_FILE:test-gemmini-log> --explicit-debug-before-default)
+endif()
 llama_build_and_test(test-gemmini-q8-h1-h2-dequant-fp.cpp NAME gemmini_q8_h1_h2_dequant_fp)
 target_sources(gemmini_q8_h1_h2_dequant_fp PRIVATE
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
@@ -194,8 +207,10 @@ target_link_libraries(test-gemmini-exsia PRIVATE ggml-base ggml-gemmini-utils)
 target_compile_features(test-gemmini-exsia PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-exsia PRIVATE
     GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
+    GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE}
     GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
     CYCLE_DETAIL=${CYCLE_DETAIL}
+    LOG_CYCLE=${LOG_CYCLE}
     EXSIA_VALIDATION=1)
 target_include_directories(test-gemmini-exsia PRIVATE
     ../ggml/include
@@ -207,6 +222,63 @@ target_include_directories(test-gemmini-exsia PRIVATE
     ../ggml/src/ggml-gemmini/quants/act/exsia
     ../ggml/src/ggml-gemmini/quants/common)
 add_test(NAME test-gemmini-exsia COMMAND $<TARGET_FILE:test-gemmini-exsia>)
+
+add_executable(test-gemmini-exsia-writer
+    test-gemmini-exsia.cpp
+    ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
+    ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
+    ../ggml/src/ggml-gemmini/quants/act/quantize.cpp
+    ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
+    ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
+    ../ggml/src/ggml-gemmini/quants/act/token/token.cpp)
+target_link_libraries(test-gemmini-exsia-writer PRIVATE ggml-base ggml-gemmini-utils)
+target_compile_features(test-gemmini-exsia-writer PRIVATE cxx_std_17)
+target_compile_definitions(test-gemmini-exsia-writer PRIVATE
+    GEMMINI_EXSIA_WRITER_TEST_ONLY=1
+    GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
+    GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=1
+    GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
+    CYCLE_DETAIL=1
+    LOG_CYCLE=1
+    EXSIA_VALIDATION=1)
+target_include_directories(test-gemmini-exsia-writer PRIVATE
+    ../ggml/include ../ggml/src ../ggml/src/ggml-gemmini
+    ../ggml/src/ggml-gemmini-utils/include ../ggml/src/ggml-gemmini/quants
+    ../ggml/src/ggml-gemmini/quants/act ../ggml/src/ggml-gemmini/quants/act/exsia
+    ../ggml/src/ggml-gemmini/quants/common ${GEMMINI_SW_PATH} ${GEMMINI_SW_PATH}/include)
+
+set(GEMMINI_WRITER_TEST_ROOT "${CMAKE_CURRENT_BINARY_DIR}/gemmini-writer-output")
+foreach(_case IN ITEMS exsia-default exsia-dir exsia-relative exsia-absolute exsia-empty exsia-invalid
+                       pipeline-default pipeline-dir pipeline-empty pipeline-invalid)
+    file(MAKE_DIRECTORY "${GEMMINI_WRITER_TEST_ROOT}/${_case}")
+endforeach()
+add_test(NAME gemmini-exsia-output-default
+    COMMAND ${CMAKE_COMMAND} -E env --unset=GEMMINI_LOG_DIR --unset=GGML_GEMMINI_CYCLE_DETAIL_LOG
+        $<TARGET_FILE:test-gemmini-exsia-writer> --profile-output output/log/exsia-cycle-detail.jsonl)
+set_tests_properties(gemmini-exsia-output-default PROPERTIES WORKING_DIRECTORY "${GEMMINI_WRITER_TEST_ROOT}/exsia-default")
+add_test(NAME gemmini-exsia-output-dir
+    COMMAND ${CMAKE_COMMAND} -E env GEMMINI_LOG_DIR=env-log --unset=GGML_GEMMINI_CYCLE_DETAIL_LOG
+        $<TARGET_FILE:test-gemmini-exsia-writer> --profile-output env-log/exsia-cycle-detail.jsonl)
+set_tests_properties(gemmini-exsia-output-dir PROPERTIES WORKING_DIRECTORY "${GEMMINI_WRITER_TEST_ROOT}/exsia-dir")
+add_test(NAME gemmini-exsia-output-relative
+    COMMAND ${CMAKE_COMMAND} -E env GEMMINI_LOG_DIR=env-log GGML_GEMMINI_CYCLE_DETAIL_LOG=custom/detail.jsonl
+        $<TARGET_FILE:test-gemmini-exsia-writer> --profile-output env-log/custom/detail.jsonl)
+set_tests_properties(gemmini-exsia-output-relative PROPERTIES WORKING_DIRECTORY "${GEMMINI_WRITER_TEST_ROOT}/exsia-relative")
+add_test(NAME gemmini-exsia-output-absolute
+    COMMAND ${CMAKE_COMMAND} -E env GEMMINI_LOG_DIR=env-log GGML_GEMMINI_CYCLE_DETAIL_LOG=${GEMMINI_WRITER_TEST_ROOT}/exsia-absolute/absolute-log/detail.jsonl
+        $<TARGET_FILE:test-gemmini-exsia-writer> --profile-output ${GEMMINI_WRITER_TEST_ROOT}/exsia-absolute/absolute-log/detail.jsonl)
+set_tests_properties(gemmini-exsia-output-absolute PROPERTIES WORKING_DIRECTORY "${GEMMINI_WRITER_TEST_ROOT}/exsia-absolute")
+add_test(NAME gemmini-exsia-output-empty
+    COMMAND ${CMAKE_COMMAND} -E env GEMMINI_LOG_DIR=env-log GGML_GEMMINI_CYCLE_DETAIL_LOG=
+        $<TARGET_FILE:test-gemmini-exsia-writer> --profile-output env-log/exsia-cycle-detail.jsonl)
+set_tests_properties(gemmini-exsia-output-empty PROPERTIES WORKING_DIRECTORY "${GEMMINI_WRITER_TEST_ROOT}/exsia-empty")
+add_test(NAME gemmini-exsia-output-invalid-parent
+    COMMAND ${CMAKE_COMMAND} -E env --unset=GEMMINI_LOG_DIR GGML_GEMMINI_CYCLE_DETAIL_LOG=blocked/detail.jsonl
+        $<TARGET_FILE:test-gemmini-exsia-writer> --profile-output blocked/detail.jsonl --invalid-parent)
+set_tests_properties(gemmini-exsia-output-invalid-parent PROPERTIES WORKING_DIRECTORY "${GEMMINI_WRITER_TEST_ROOT}/exsia-invalid")
 
 add_executable(test-gemmini-rmd
     test-gemmini-rmd.cpp
@@ -274,6 +346,33 @@ if (NOT GGML_BACKEND_DL)
     target_link_libraries(test-gemmini-matmul PRIVATE ggml-gemmini ggml-base)
     target_compile_features(test-gemmini-matmul PRIVATE cxx_std_17)
     add_test(NAME test-gemmini-matmul COMMAND $<TARGET_FILE:test-gemmini-matmul>)
+    add_executable(test-gemmini-pipeline-writer
+        test-gemmini-matmul.cpp
+        ../ggml/src/ggml-gemmini/ggml-gemmini-matmul.cpp)
+    target_link_libraries(test-gemmini-pipeline-writer PRIVATE ggml-gemmini-utils)
+    target_compile_features(test-gemmini-pipeline-writer PRIVATE cxx_std_17)
+    target_compile_definitions(test-gemmini-pipeline-writer PRIVATE
+        GGML_GEMMINI_PIPELINE_WRITER_TEST_ONLY=1)
+    target_include_directories(test-gemmini-pipeline-writer PRIVATE
+        ../ggml/include ../ggml/src ../ggml/src/ggml-gemmini
+        ../ggml/src/ggml-gemmini-utils/include ${GGML_GEMMINI_GENERATED_CONFIG_DIR}
+        ${GEMMINI_SW_PATH} ${GEMMINI_SW_PATH}/include)
+    add_test(NAME gemmini-matmul-output-default
+        COMMAND ${CMAKE_COMMAND} -E env --unset=GEMMINI_LOG_DIR
+            $<TARGET_FILE:test-gemmini-pipeline-writer> --pipeline-output output/log/debug-log.jsonl)
+    set_tests_properties(gemmini-matmul-output-default PROPERTIES WORKING_DIRECTORY "${GEMMINI_WRITER_TEST_ROOT}/pipeline-default")
+    add_test(NAME gemmini-matmul-output-dir
+        COMMAND ${CMAKE_COMMAND} -E env GEMMINI_LOG_DIR=env-log
+            $<TARGET_FILE:test-gemmini-pipeline-writer> --pipeline-output env-log/debug-log.jsonl)
+    set_tests_properties(gemmini-matmul-output-dir PROPERTIES WORKING_DIRECTORY "${GEMMINI_WRITER_TEST_ROOT}/pipeline-dir")
+    add_test(NAME gemmini-matmul-output-empty
+        COMMAND ${CMAKE_COMMAND} -E env GEMMINI_LOG_DIR=
+            $<TARGET_FILE:test-gemmini-pipeline-writer> --pipeline-output output/log/debug-log.jsonl)
+    set_tests_properties(gemmini-matmul-output-empty PROPERTIES WORKING_DIRECTORY "${GEMMINI_WRITER_TEST_ROOT}/pipeline-empty")
+    add_test(NAME gemmini-matmul-output-invalid-parent
+        COMMAND ${CMAKE_COMMAND} -E env GEMMINI_LOG_DIR=blocked
+            $<TARGET_FILE:test-gemmini-pipeline-writer> --pipeline-output blocked/debug-log.jsonl --invalid-parent)
+    set_tests_properties(gemmini-matmul-output-invalid-parent PROPERTIES WORKING_DIRECTORY "${GEMMINI_WRITER_TEST_ROOT}/pipeline-invalid")
 
     find_package(Threads REQUIRED)
     add_executable(test-gemmini-buffer-artifacts test-gemmini-buffer-artifacts.cpp)
