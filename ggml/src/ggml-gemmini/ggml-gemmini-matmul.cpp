@@ -1,5 +1,34 @@
+#ifndef GGML_GEMMINI_PIPELINE_WRITER_TEST_ONLY
 #define GGML_GEMMINI_MATMUL_IMPLEMENTATION 1
+#endif
 #include "ggml-gemmini-matmul.hpp"
+
+#include <gemmini/log.hpp>
+
+#include <cstdio>
+#include <filesystem>
+#include <string>
+
+namespace ggml::gemmini::detail {
+
+bool append_pipeline_stripe_summary_jsonl(const std::string & json_record) {
+    const std::filesystem::path path =
+        log::resolve_output_path(GEMMINI_LOG_DEFAULT_DEBUG_PATH);
+    if (!log::prepare_output_parent(path))
+        return false;
+    FILE * out = std::fopen(path.string().c_str(), "a");
+    if (out == nullptr) {
+        return false;
+    }
+    const bool wrote = std::fputs(json_record.c_str(), out) >= 0 &&
+        std::fputc('\n', out) != EOF;
+    const bool closed = std::fclose(out) == 0;
+    return wrote && closed;
+}
+
+}
+
+#ifndef GGML_GEMMINI_PIPELINE_WRITER_TEST_ONLY
 
 #include "quants/act/quantize.hpp"
 #include "quants/act/dispatch.hpp"
@@ -11,8 +40,6 @@
 #include <array>
 #include <chrono>
 #include <cmath>
-#include <filesystem>
-#include <cstdio>
 #include <iomanip>
 #include <limits>
 #include <new>
@@ -446,35 +473,6 @@ const char * backend_route_name(BackendRoute route) {
         case BackendRoute::ws_sim: return "ws_sim";
     }
     return "unknown";
-}
-
-static std::string resolved_pipeline_summary_log_path() {
-    constexpr const char * default_path = "log/debug-log.jsonl";
-    if (const char * dir = std::getenv("GEMMINI_LOG_DIR")) {
-        const std::filesystem::path base(dir);
-        return (base / "debug-log.jsonl").string();
-    }
-    return std::filesystem::path(default_path).string();
-}
-
-bool append_pipeline_stripe_summary_jsonl(const std::string & json_record) {
-    const std::filesystem::path path(resolved_pipeline_summary_log_path());
-    const auto parent = path.parent_path();
-    if (!parent.empty()) {
-        std::error_code ec;
-        std::filesystem::create_directories(parent, ec);
-        if (ec) {
-            return false;
-        }
-    }
-    FILE * out = std::fopen(path.string().c_str(), "a");
-    if (out == nullptr) {
-        return false;
-    }
-    const bool wrote = std::fputs(json_record.c_str(), out) >= 0 &&
-        std::fputc('\n', out) != EOF;
-    const bool closed = std::fclose(out) == 0;
-    return wrote && closed;
 }
 
 std::string pipeline_stripe_summary_json(const char * layer,
@@ -2239,3 +2237,5 @@ MatmulStatus execute_post_fold_pipeline(
 }
 
 }
+
+#endif

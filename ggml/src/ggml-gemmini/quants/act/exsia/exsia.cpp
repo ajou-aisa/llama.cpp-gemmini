@@ -160,10 +160,11 @@ namespace ggml::gemmini::quants::act::exsia
 #endif
 
 #if EXSIA_PROFILE_LOG_ENABLED
-        static inline const char *cycle_detail_log_path()
+        static inline std::filesystem::path cycle_detail_log_path()
         {
             const char *path = std::getenv("GGML_GEMMINI_CYCLE_DETAIL_LOG");
-            return path && path[0] ? path : "log/exsia-cycle-detail.jsonl";
+            return ggml::gemmini::log::resolve_output_path(
+                path && path[0] ? path : GEMMINI_LOG_DEFAULT_EXSIA_DETAIL_PATH);
         }
 
         struct ProfileConfig
@@ -176,9 +177,11 @@ namespace ggml::gemmini::quants::act::exsia
         ProfileConfig compile_profile_config()
         {
             ProfileConfig config;
-            config.log_path = cycle_detail_log_path();
+            config.log_path = cycle_detail_log_path().string();
             std::call_once(profile_log_init_once, [&config] {
-                std::ofstream file(config.log_path, std::ios::out | std::ios::trunc);
+                const std::filesystem::path path(config.log_path);
+                if (ggml::gemmini::log::prepare_output_parent(path))
+                    std::ofstream file(path, std::ios::out | std::ios::trunc);
             });
             return config;
         }
@@ -443,6 +446,8 @@ namespace ggml::gemmini::quants::act::exsia
             write_timeline_run_event(trace, layer, run_id, mode, run_interval, run_team_size);
 
             std::lock_guard<std::mutex> lock(profile_flush_mutex);
+            if (!ggml::gemmini::log::prepare_output_parent(config.log_path))
+                return ExSIAState::FailureCode::ProfileFlushFailure;
             std::ofstream file(config.log_path, std::ios::app);
             if (!file)
                 return ExSIAState::FailureCode::ProfileFlushFailure;
