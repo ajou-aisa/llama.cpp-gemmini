@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <system_error>
 
 namespace ggml::gemmini::log
@@ -17,80 +18,84 @@ namespace ggml::gemmini::log
             {
                 return false;
             }
-            if (path[0] != 'l' || path[1] != 'o' || path[2] != 'g')
+            const std::string_view value(path);
+            if (value.rfind("log", 0) != 0)
             {
                 return false;
             }
-            const char c = path[3];
-            return c == '/' || c == '\\' || c == '\0';
+            return value.size() == 3 || value[3] == '/' || value[3] == '\\';
+        }
+    }
+
+    std::filesystem::path resolve_output_path(const char *path)
+    {
+        if (!path || *path == '\0')
+        {
+            return {};
         }
 
-        std::filesystem::path resolve_output_path(const char *path)
+        std::filesystem::path p(path);
+        if (p.is_absolute())
         {
-            if (!path || *path == '\0')
-            {
-                return {};
-            }
-
-            std::filesystem::path p(path);
-            if (p.is_absolute())
-            {
-                return p;
-            }
-
-            // Highest priority: force all relative paths under GEMMINI_LOG_DIR.
-            // For callers that use `log/<name>`, strip the leading `log/` so
-            // `log/out.jsonl` becomes `$GEMMINI_LOG_DIR/out.jsonl`.
-            if (const char *env_dir = std::getenv("GEMMINI_LOG_DIR"))
-            {
-                if (*env_dir)
-                {
-                    std::filesystem::path base(env_dir);
-                    std::filesystem::path rel = p;
-                    if (path_starts_with_log_dir(path))
-                    {
-                        rel = p.lexically_relative("log");
-                        if (rel.empty() || rel == ".")
-                        {
-                            rel.clear();
-                        }
-                    }
-                    return rel.empty() ? base : (base / rel);
-                }
-            }
-
-            if (path_starts_with_log_dir(path))
-            {
-                std::filesystem::path rel = p.lexically_relative("log");
-                if (rel.empty() || rel == ".")
-                {
-                    rel.clear();
-                }
-
-                std::error_code ec;
-                std::filesystem::path cwd = std::filesystem::current_path(ec);
-                if (ec || cwd.empty())
-                {
-                    cwd = ".";
-                }
-                std::filesystem::path base = cwd / "log";
-                return rel.empty() ? base : (base / rel);
-            }
-
             return p;
         }
 
-        void ensure_parent_dir_exists(const std::filesystem::path &path)
+        // Highest priority: force all relative paths under GEMMINI_LOG_DIR.
+        // For callers that use `log/<name>`, strip the leading `log/` so
+        // `log/out.jsonl` becomes `$GEMMINI_LOG_DIR/out.jsonl`.
+        if (const char *env_dir = std::getenv("GEMMINI_LOG_DIR"))
         {
-            std::error_code ec;
-            std::filesystem::path parent = path.parent_path();
-            if (parent.empty())
+            if (*env_dir)
             {
-                return;
+                std::filesystem::path base(env_dir);
+                std::filesystem::path rel = p;
+                if (path_starts_with_log_dir(path))
+                {
+                    rel = p.lexically_relative("log");
+                    if (rel.empty() || rel == ".")
+                    {
+                        rel.clear();
+                    }
+                }
+                return rel.empty() ? base : (base / rel);
             }
-            std::filesystem::create_directories(parent, ec);
         }
 
+        if (path_starts_with_log_dir(path))
+        {
+            std::filesystem::path rel = p.lexically_relative("log");
+            if (rel.empty() || rel == ".")
+            {
+                rel.clear();
+            }
+
+            std::error_code ec;
+            std::filesystem::path cwd = std::filesystem::current_path(ec);
+            if (ec || cwd.empty())
+            {
+                cwd = ".";
+            }
+            std::filesystem::path base = cwd / "output" / "log";
+            return rel.empty() ? base : (base / rel);
+        }
+
+        return p;
+    }
+
+    bool prepare_output_parent(const std::filesystem::path &path)
+    {
+        const std::filesystem::path parent = path.parent_path();
+        if (parent.empty())
+        {
+            return true;
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(parent, ec);
+        return !ec;
+    }
+
+    namespace
+    {
         FILE *open_output_file(const std::filesystem::path &path)
         {
             const std::string key = path.string();
@@ -334,7 +339,7 @@ namespace ggml::gemmini::log
         {
             return false;
         }
-        ensure_parent_dir_exists(resolved);
+        prepare_output_parent(resolved);
 
         FILE *file = std::fopen(resolved.string().c_str(), "w");
         if (!file)
@@ -380,7 +385,7 @@ namespace ggml::gemmini::log
         {
             return false;
         }
-        ensure_parent_dir_exists(resolved);
+        prepare_output_parent(resolved);
 
         FILE *file = open_output_file(resolved);
         if (!file)
@@ -400,7 +405,7 @@ namespace ggml::gemmini::log
             std::filesystem::path resolved = resolve_output_path(path);
             if (!resolved.empty())
             {
-                ensure_parent_dir_exists(resolved);
+                prepare_output_parent(resolved);
                 FILE *file = open_output_file(resolved);
                 if (file)
                 {
@@ -430,6 +435,23 @@ namespace ggml::gemmini::log
     }
 
     DebugLog debug;
+
+    DefaultOutputSetupResult setup_default_outputs()
+    {
+        static std::once_flag once;
+        static DefaultOutputSetupResult result{true, true};
+        std::call_once(once, [] {
+            if (!cycle.has_explicit_output())
+            {
+                result.cycle = cycle.set_output_path(GEMMINI_LOG_DEFAULT_CYCLE_PATH, true);
+            }
+            if (!debug.has_explicit_output())
+            {
+                result.debug = debug.set_output_path(GEMMINI_LOG_DEFAULT_DEBUG_PATH, true);
+            }
+        });
+        return result;
+    }
 
     DebugLog::DebugLog(FILE *out, bool add_newline)
         : Log(out), add_newline_(add_newline) {}
@@ -629,6 +651,7 @@ namespace ggml::gemmini::log
                            uint64_t I0, uint64_t J0, uint64_t K0,
                            uint64_t a_reuse, uint64_t b_reuse)
     {
+#if LOG_DEBUG
         bool owns = false;
         FILE *out = select_output(target.path, &owns);
         write_jsonl_ws_loop(out, wall, load, exe, store, loop,
@@ -639,6 +662,25 @@ namespace ggml::gemmini::log
         {
             std::fclose(out);
         }
+#else
+        (void)target;
+        (void)wall;
+        (void)load;
+        (void)exe;
+        (void)store;
+        (void)loop;
+        (void)dim_I;
+        (void)dim_J;
+        (void)dim_K;
+        (void)tile_I;
+        (void)tile_J;
+        (void)tile_K;
+        (void)I0;
+        (void)J0;
+        (void)K0;
+        (void)a_reuse;
+        (void)b_reuse;
+#endif
     }
 
     void DebugLog::v_target_loc(LogTarget target, const char *file, int line, const char *func,

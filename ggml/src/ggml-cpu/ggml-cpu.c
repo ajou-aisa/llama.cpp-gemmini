@@ -1747,7 +1747,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_dup(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.dup", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.dup", start, end);
                 #endif
             } break;
         case GGML_OP_ADD:
@@ -1758,7 +1758,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_add(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.add", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.add", start, end);
                 #endif
             } break;
         case GGML_OP_ADD1:
@@ -1769,7 +1769,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_add1(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.add1", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.add1", start, end);
                 #endif
             } break;
         case GGML_OP_ACC:
@@ -1780,7 +1780,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_acc(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.acc", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.acc", start, end);
                 #endif
             } break;
         case GGML_OP_SUB:
@@ -1791,7 +1791,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_sub(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.sub", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.sub", start, end);
                 #endif
             } break;
         case GGML_OP_MUL:
@@ -1802,7 +1802,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_mul(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.mul", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.mul", start, end);
                 #endif
             } break;
         case GGML_OP_DIV:
@@ -1813,7 +1813,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_div(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.div", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.div", start, end);
                 #endif
             } break;
         case GGML_OP_SQR:
@@ -1824,7 +1824,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_sqr(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.sqr", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.sqr", start, end);
                 #endif
             } break;
         case GGML_OP_SQRT:
@@ -1835,7 +1835,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_sqrt(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.sqrt", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.sqrt", start, end);
                 #endif
             } break;
         case GGML_OP_LOG:
@@ -1846,7 +1846,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_log(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.log", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.log", start, end);
                 #endif
             } break;
         case GGML_OP_SIN:
@@ -1857,7 +1857,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_sin(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.sin", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.sin", start, end);
                 #endif
             } break;
         case GGML_OP_COS:
@@ -1868,7 +1868,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_cos(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.cos", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.cos", start, end);
                 #endif
             } break;
         case GGML_OP_SUM:
@@ -1879,7 +1879,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_sum(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.sum", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.sum", start, end);
                 #endif
             } break;
         case GGML_OP_SUM_ROWS:
@@ -1890,7 +1890,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_sum_rows(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.sum_rows", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.sum_rows", start, end);
                 #endif
             } break;
         case GGML_OP_MEAN:
@@ -1901,7 +1901,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_mean(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.mean", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.mean", start, end);
                 #endif
             } break;
         case GGML_OP_ARGMAX:
@@ -1912,7 +1912,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_argmax(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.argmax", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.argmax", start, end);
                 #endif
             } break;
         case GGML_OP_COUNT_EQUAL:
@@ -1923,7 +1923,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_count_equal(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.count_equal", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.count_equal", start, end);
                 #endif
             } break;
         case GGML_OP_REPEAT:
@@ -1934,7 +1934,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_repeat(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.repeat", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.repeat", start, end);
                 #endif
             } break;
         case GGML_OP_REPEAT_BACK:
@@ -1945,7 +1945,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_repeat_back(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.repeat_back", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.repeat_back", start, end);
                 #endif
             } break;
         case GGML_OP_CONCAT:
@@ -1956,7 +1956,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_concat(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.concat", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.concat", start, end);
                 #endif
             } break;
         case GGML_OP_SILU_BACK:
@@ -1967,7 +1967,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_silu_back(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.silu_back", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.silu_back", start, end);
                 #endif
             } break;
         case GGML_OP_NORM:
@@ -1978,7 +1978,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_norm(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.norm", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.norm", start, end);
                 #endif
             } break;
         case GGML_OP_RMS_NORM:
@@ -1989,7 +1989,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_rms_norm(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.rms_norm", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.rms_norm", start, end);
                 #endif
             } break;
         case GGML_OP_RMS_NORM_BACK:
@@ -2000,7 +2000,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_rms_norm_back(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.rms_norm_back", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.rms_norm_back", start, end);
                 #endif
             } break;
         case GGML_OP_GROUP_NORM:
@@ -2011,7 +2011,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_group_norm(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.group_norm", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.group_norm", start, end);
                 #endif
             } break;
         case GGML_OP_L2_NORM:
@@ -2022,7 +2022,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_l2_norm(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.l2_norm", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.l2_norm", start, end);
                 #endif
             } break;
         case GGML_OP_MUL_MAT:
@@ -2033,7 +2033,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_mul_mat(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.mul_mat", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.mul_mat", start, end);
                 #endif
             } break;
         case GGML_OP_MUL_MAT_ID:
@@ -2044,7 +2044,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_mul_mat_id(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.mul_mat_id", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.mul_mat_id", start, end);
                 #endif
             } break;
         case GGML_OP_OUT_PROD:
@@ -2055,7 +2055,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_out_prod(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.out_prod", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.out_prod", start, end);
                 #endif
             } break;
         case GGML_OP_SCALE:
@@ -2066,7 +2066,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_scale(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.scale", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.scale", start, end);
                 #endif
             } break;
         case GGML_OP_SET:
@@ -2077,7 +2077,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_set(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.set", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.set", start, end);
                 #endif
             } break;
         case GGML_OP_CPY:
@@ -2088,7 +2088,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_cpy(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.cpy", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.cpy", start, end);
                 #endif
             } break;
         case GGML_OP_CONT:
@@ -2099,7 +2099,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_cont(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.cont", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.cont", start, end);
                 #endif
             } break;
         case GGML_OP_RESHAPE:
@@ -2110,7 +2110,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_reshape(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.reshape", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.reshape", start, end);
                 #endif
             } break;
         case GGML_OP_VIEW:
@@ -2121,7 +2121,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_view(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.view", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.view", start, end);
                 #endif
             } break;
         case GGML_OP_PERMUTE:
@@ -2132,7 +2132,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_permute(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.permute", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.permute", start, end);
                 #endif
             } break;
         case GGML_OP_TRANSPOSE:
@@ -2143,7 +2143,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_transpose(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.transpose", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.transpose", start, end);
                 #endif
             } break;
         case GGML_OP_GET_ROWS:
@@ -2154,7 +2154,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_get_rows(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.get_rows", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.get_rows", start, end);
                 #endif
             } break;
         case GGML_OP_GET_ROWS_BACK:
@@ -2165,7 +2165,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_get_rows_back(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.get_rows_back", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.get_rows_back", start, end);
                 #endif
             } break;
         case GGML_OP_DIAG:
@@ -2176,7 +2176,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_diag(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.diag", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.diag", start, end);
                 #endif
             } break;
         case GGML_OP_DIAG_MASK_INF:
@@ -2187,7 +2187,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_diag_mask_inf(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.diag_mask_inf", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.diag_mask_inf", start, end);
                 #endif
             } break;
         case GGML_OP_DIAG_MASK_ZERO:
@@ -2198,7 +2198,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_diag_mask_zero(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.diag_mask_zero", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.diag_mask_zero", start, end);
                 #endif
             } break;
         case GGML_OP_SOFT_MAX:
@@ -2209,7 +2209,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_soft_max(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.softmax", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.softmax", start, end);
                 #endif
             } break;
         case GGML_OP_SOFT_MAX_BACK:
@@ -2220,7 +2220,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_soft_max_ext_back(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.softmax_back", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.softmax_back", start, end);
                 #endif
             } break;
         case GGML_OP_ROPE:
@@ -2231,7 +2231,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_rope(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.rope", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.rope", start, end);
                 #endif
             } break;
         case GGML_OP_ROPE_BACK:
@@ -2242,7 +2242,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_rope_back(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.rope_back", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.rope_back", start, end);
                 #endif
             } break;
         case GGML_OP_CLAMP:
@@ -2253,7 +2253,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_clamp(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.clamp", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.clamp", start, end);
                 #endif
             } break;
         case GGML_OP_CONV_TRANSPOSE_1D:
@@ -2264,7 +2264,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_conv_transpose_1d(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.conv_transpose_1d", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.conv_transpose_1d", start, end);
                 #endif
             } break;
         case GGML_OP_IM2COL:
@@ -2275,7 +2275,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_im2col(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.im2col", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.im2col", start, end);
                 #endif
             } break;
         case GGML_OP_IM2COL_BACK:
@@ -2286,7 +2286,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_im2col_back_f32(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.im2col_back", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.im2col_back", start, end);
                 #endif
             } break;
         case GGML_OP_CONV_2D_DW:
@@ -2297,7 +2297,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_conv_2d_dw(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.conv_2d_dw", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.conv_2d_dw", start, end);
                 #endif
             } break;
         case GGML_OP_CONV_TRANSPOSE_2D:
@@ -2308,7 +2308,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_conv_transpose_2d(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.conv_transpose_2d", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.conv_transpose_2d", start, end);
                 #endif
             } break;
         case GGML_OP_POOL_1D:
@@ -2319,7 +2319,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_pool_1d(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.pool_1d", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.pool_1d", start, end);
                 #endif
             } break;
         case GGML_OP_POOL_2D:
@@ -2330,7 +2330,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_pool_2d(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.pool_2d", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.pool_2d", start, end);
                 #endif
             } break;
         case GGML_OP_POOL_2D_BACK:
@@ -2341,7 +2341,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_pool_2d_back(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.pool_2d_back", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.pool_2d_back", start, end);
                 #endif
             } break;
         case GGML_OP_UPSCALE:
@@ -2352,7 +2352,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_upscale(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.upscale", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.upscale", start, end);
                 #endif
             } break;
         case GGML_OP_PAD:
@@ -2363,7 +2363,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_pad(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.pad", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.pad", start, end);
                 #endif
             } break;
         case GGML_OP_PAD_REFLECT_1D:
@@ -2374,7 +2374,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_pad_reflect_1d(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.pad_reflect_1d", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.pad_reflect_1d", start, end);
                 #endif
             } break;
         case GGML_OP_ARANGE:
@@ -2385,7 +2385,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_arange(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.arange", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.arange", start, end);
                 #endif
             } break;
         case GGML_OP_TIMESTEP_EMBEDDING:
@@ -2396,7 +2396,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_timestep_embedding(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.timestep_embedding", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.timestep_embedding", start, end);
                 #endif
             } break;
         case GGML_OP_ARGSORT:
@@ -2407,7 +2407,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_argsort(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.argsort", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.argsort", start, end);
                 #endif
             } break;
         case GGML_OP_LEAKY_RELU:
@@ -2418,7 +2418,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_leaky_relu(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.leaky_relu", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.leaky_relu", start, end);
                 #endif
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
@@ -2429,7 +2429,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_flash_attn_ext(params, tensor->src[0], tensor->src[1], tensor->src[2], tensor->src[3], tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.flash_attn_ext", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.flash_attn_ext", start, end);
                 #endif
             } break;
         case GGML_OP_FLASH_ATTN_BACK:
@@ -2444,7 +2444,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_flash_attn_back(params, masked, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.flash_attn_back", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.flash_attn_back", start, end);
                 #endif
             } break;
         case GGML_OP_SSM_CONV:
@@ -2455,7 +2455,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_ssm_conv(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.ssm_conv", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.ssm_conv", start, end);
                 #endif
             } break;
         case GGML_OP_SSM_SCAN:
@@ -2466,7 +2466,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_ssm_scan(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.ssm_scan", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.ssm_scan", start, end);
                 #endif
             } break;
         case GGML_OP_WIN_PART:
@@ -2477,7 +2477,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_win_part(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.win_part", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.win_part", start, end);
                 #endif
             } break;
         case GGML_OP_WIN_UNPART:
@@ -2488,7 +2488,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_win_unpart(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.win_unpart", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.win_unpart", start, end);
                 #endif
             } break;
         case GGML_OP_UNARY:
@@ -2499,7 +2499,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_unary(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.unary", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.unary", start, end);
                 #endif
             } break;
         case GGML_OP_GET_REL_POS:
@@ -2510,7 +2510,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_get_rel_pos(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.get_rel_pos", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.get_rel_pos", start, end);
                 #endif
             } break;
         case GGML_OP_ADD_REL_POS:
@@ -2521,7 +2521,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_add_rel_pos(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.add_rel_pos", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.add_rel_pos", start, end);
                 #endif
             } break;
         case GGML_OP_RWKV_WKV6:
@@ -2532,7 +2532,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_rwkv_wkv6(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.rwkv_wkv6", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.rwkv_wkv6", start, end);
                 #endif
             } break;
         case GGML_OP_GATED_LINEAR_ATTN:
@@ -2543,7 +2543,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_gla(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.gated_linear_attn", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.gated_linear_attn", start, end);
                 #endif
             } break;
         case GGML_OP_RWKV_WKV7:
@@ -2554,7 +2554,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_rwkv_wkv7(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.rwkv_wkv7", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.rwkv_wkv7", start, end);
                 #endif
             } break;
         case GGML_OP_MAP_CUSTOM1:
@@ -2565,7 +2565,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_map_custom1(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.map_custom1", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.map_custom1", start, end);
                 #endif
             }
             break;
@@ -2577,7 +2577,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_map_custom2(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.map_custom2", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.map_custom2", start, end);
                 #endif
             }
             break;
@@ -2589,7 +2589,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_map_custom3(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.map_custom3", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.map_custom3", start, end);
                 #endif
             }
             break;
@@ -2601,7 +2601,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_custom(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.custom", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.custom", start, end);
                 #endif
             }
             break;
@@ -2613,7 +2613,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_cross_entropy_loss(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.cross_entropy_loss", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.cross_entropy_loss", start, end);
                 #endif
             }
             break;
@@ -2625,7 +2625,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_cross_entropy_loss_back(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.cross_entropy_loss_back", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.cross_entropy_loss_back", start, end);
                 #endif
             }
             break;
@@ -2637,7 +2637,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_opt_step_adamw(params, tensor);
                 #if CYCLE_LOG
                 end = gemmini_read_cycles();
-                gemmini_log_cycle_to(gemmini_log_file("log/cycle-log.jsonl"), layer, "cpu.opt_step_adamw", start, end);
+                gemmini_log_cycle_to(gemmini_log_file(GEMMINI_LOG_DEFAULT_CYCLE_PATH), layer, "cpu.opt_step_adamw", start, end);
                 #endif
             }
             break;

@@ -16,12 +16,10 @@
  * Path resolution notes:
  * - Absolute paths are used as-is.
  * - Relative paths are normally resolved against the process working directory (CWD).
- * Path resolution notes:
- * - Absolute paths are used as-is.
  * - If `GEMMINI_LOG_DIR` is set, all relative paths are resolved under it.
  *   For paths starting with `log/`, the `log/` prefix is stripped
  *   (so `log/out.jsonl` -> `$GEMMINI_LOG_DIR/out.jsonl`).
- * - Otherwise, paths starting with `log/` are resolved under `./log/` (CWD),
+ * - Otherwise, paths starting with `log/` are resolved under `./output/log/` (CWD),
  *   and the `log/` directory is created when needed.
  *
  * Output format:
@@ -30,9 +28,12 @@
  */
 #pragma once
 
+#include "log.h"
+
 #include <cstdarg>
 #include <cstdio>
 #include <cstdint>
+#include <filesystem>
 
 #ifndef LOG_DEBUG
 #define LOG_DEBUG 1
@@ -56,7 +57,20 @@ namespace ggml::gemmini::log
 
     LogTarget file(const char *path);
 
+    // Resolves null/empty to empty, preserves absolute paths, and routes relative paths by
+    // GEMMINI_LOG_DIR or logical log/... under CWD/output/log; ordinary paths stay relative.
+    std::filesystem::path resolve_output_path(const char *path);
+    bool prepare_output_parent(const std::filesystem::path &path);
+
     bool truncate_file(const char *path);
+
+    struct DefaultOutputSetupResult
+    {
+        bool debug;
+        bool cycle;
+    };
+
+    DefaultOutputSetupResult setup_default_outputs();
 
     class Log
     {
