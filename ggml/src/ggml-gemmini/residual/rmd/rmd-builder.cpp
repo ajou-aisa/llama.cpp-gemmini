@@ -304,6 +304,32 @@ StripePacketHandle slice_packets(const std::vector<StripePacketHandle> & packets
         return nullptr;
     }
 
+    StripePacketHandle exact_match;
+    size_t overlapping_packets = 0;
+    for (const StripePacketHandle & handle : packets) {
+        if (!handle) {
+            continue;
+        }
+        const StripePacket & packet = *handle;
+        if (packet.row_count > std::numeric_limits<size_t>::max() - packet.row_begin) {
+            status = RmdStatus::invalid_packet;
+            return nullptr;
+        }
+        const size_t packet_row_end = packet.row_begin + packet.row_count;
+        if (packet.row_begin >= row_end || packet_row_end <= row_begin) {
+            continue;
+        }
+        ++overlapping_packets;
+        if (packet.row_begin == row_begin && packet_row_end == row_end &&
+            packet.stripe_id == stripe_id) {
+            exact_match = handle;
+        }
+    }
+    if (overlapping_packets == 1 && exact_match) {
+        status = validate_packet(*exact_match);
+        return status == RmdStatus::success ? exact_match : nullptr;
+    }
+
     size_t logical_k = 0;
     size_t logical_j = 0;
     // (local row, original K) -> residual, rebuilt from the balanced digits.

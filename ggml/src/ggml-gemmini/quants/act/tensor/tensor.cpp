@@ -154,7 +154,17 @@ namespace
         if (!std::isfinite(value) || !std::isfinite(scale) || scale <= 0.0f)
             return 0;
 
-        return static_cast<int32_t>(std::round(value / scale));
+        const double scaled =
+            static_cast<double>(value) / static_cast<double>(scale);
+        if (!std::isfinite(scaled))
+            return scaled < 0.0 ? std::numeric_limits<int32_t>::min()
+                                : std::numeric_limits<int32_t>::max();
+        if (scaled <= static_cast<double>(std::numeric_limits<int32_t>::min()))
+            return std::numeric_limits<int32_t>::min();
+        if (scaled >= static_cast<double>(std::numeric_limits<int32_t>::max()))
+            return std::numeric_limits<int32_t>::max();
+
+        return static_cast<int32_t>(std::lrint(scaled));
     }
 
     int8_t clip_to_i8(int32_t value)

@@ -1038,7 +1038,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 static_cast<int>(pipeline_collector->status().code), pipeline_collector->status().message);
         }
         ggml::gemmini::log::debug(layer, "activation quantize failed");
-        return;
+        GGML_ABORT("Gemmini activation quantization failed");
     }
 
     if constexpr (ggml::gemmini::config::CURRENT_COMPUTE_TYPE == ggml::gemmini::config::ComputeType::FLOAT &&
@@ -1450,7 +1450,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 "[matmul.pipeline] quantization failure collector_status=%d message=%s",
                 static_cast<int>(pipeline_status.code), pipeline_status.message);
             ggml::gemmini::log::debug(layer, "activation quantize failed");
-            return;
+            GGML_ABORT("Gemmini activation quantization failed");
         }
     }
 
@@ -1617,7 +1617,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 "la_cycles=%llu la3_cycles=%llu sf_cycles=%llu la3_ns=%llu sf1_ns=%llu handoff_ns=%llu ws_ns=%llu "
                 "rmd_pack_ns=%llu rmd_execute_ns=%llu rmd_compose_ns=%llu rmd_finalize_ns=%llu "
                 "ws_start_ns=%llu ws_end_ns=%llu rmd_start_ns=%llu rmd_end_ns=%llu "
-                "active_blocks=%zu active_lanes=%zu physical_tiles=%zu packet_bytes=%zu",
+                "active_blocks=%zu active_lanes=%zu physical_tiles=%zu "
+                "matmul_calls=%zu stacked_i_tiles=%zu packet_bytes=%zu",
                 profile.stripe_id,
                 profile.row_begin,
                 profile.row_end,
@@ -1639,6 +1640,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 profile.rmd.active_blocks,
                 profile.rmd.active_lanes,
                 profile.rmd.physical_tile_count,
+                profile.rmd.matmul_call_count,
+                profile.rmd.stacked_i_tile_count,
                 profile.rmd.packet_bytes);
             const std::string summary = ggml::gemmini::detail::pipeline_stripe_summary_json(
                 layer, args.I, args.J, args.K, backend_route, schedule, profile);

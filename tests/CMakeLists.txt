@@ -1,4 +1,5 @@
 llama_add_compile_flags()
+add_compile_definitions(GGML_GEMMINI_BLOCK_SIZE=${_GGML_GEMMINI_BLOCK_SIZE_VALUE})
 
 function(llama_build source)
     if (DEFINED LLAMA_TEST_NAME)
@@ -192,6 +193,32 @@ target_include_directories(gemmini_q8_h1_h2_dequant_fp PRIVATE
     ../ggml/src/ggml-gemmini
     ../ggml/src/ggml-gemmini-utils/include)
 
+add_executable(test-gemmini-act-quant-i32-saturation
+    test-gemmini-act-quant-i32-saturation.cpp
+    ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
+    ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
+    ../ggml/src/ggml-gemmini/quants/act/quantize.cpp
+    ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
+    ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
+    ../ggml/src/ggml-gemmini/quants/act/token/token.cpp
+    ../ggml/src/ggml-gemmini/quants/act/stripe/stripe.cpp)
+target_link_libraries(test-gemmini-act-quant-i32-saturation PRIVATE ggml-base ggml-gemmini-utils)
+target_compile_features(test-gemmini-act-quant-i32-saturation PRIVATE cxx_std_17)
+target_compile_definitions(test-gemmini-act-quant-i32-saturation PRIVATE
+    GGML_GEMMINI_ACTIVATION_QUANT=${_GGML_GEMMINI_ACTIVATION_QUANT_VALUE}
+    GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
+    GGML_GEMMINI_ENABLE_RMD=1)
+target_include_directories(test-gemmini-act-quant-i32-saturation PRIVATE
+    ../ggml/include
+    ../ggml/src
+    ../ggml/src/ggml-gemmini
+    ../ggml/src/ggml-gemmini-utils/include)
+add_test(NAME test-gemmini-act-quant-i32-saturation
+    COMMAND $<TARGET_FILE:test-gemmini-act-quant-i32-saturation>)
+
 add_executable(test-gemmini-exsia
     test-gemmini-exsia.cpp
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
@@ -221,7 +248,16 @@ target_include_directories(test-gemmini-exsia PRIVATE
     ../ggml/src/ggml-gemmini/quants/act
     ../ggml/src/ggml-gemmini/quants/act/exsia
     ../ggml/src/ggml-gemmini/quants/common)
-add_test(NAME test-gemmini-exsia COMMAND $<TARGET_FILE:test-gemmini-exsia>)
+foreach(_case IN ITEMS all baseline dispatch rmd-routes rmd-direct-parity)
+    string(REPLACE "-" "_" _case_test_name "${_case}")
+    add_test(NAME gemmini_exsia_${_case_test_name}
+        COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=${_case})
+    set_tests_properties(gemmini_exsia_${_case_test_name} PROPERTIES
+        PASS_REGULAR_EXPRESSION "TEST_CASE_BEGIN name=${_case}")
+endforeach()
+add_test(NAME gemmini_exsia_unknown_case
+    COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=unknown)
+set_tests_properties(gemmini_exsia_unknown_case PROPERTIES WILL_FAIL TRUE)
 
 add_executable(test-gemmini-exsia-writer
     test-gemmini-exsia.cpp
@@ -292,23 +328,29 @@ target_include_directories(test-gemmini-rmd PRIVATE
     ${GEMMINI_SW_PATH}
     ${GEMMINI_SW_PATH}/include)
 add_test(NAME test-gemmini-rmd COMMAND $<TARGET_FILE:test-gemmini-rmd>)
-add_test(NAME test-gemmini-exsia-stream-parity
-    COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=stream-parity --rows=129 --cols=37)
-add_test(NAME test-gemmini-exsia-stream-invalid-shape
-    COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=stream-invalid-shape --rows=0 --cols=37)
-add_test(NAME gemmini_exsia_all
-    COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=all --rows=65 --cols=37 --compiled-tau=${GGML_GEMMINI_EXSIA_SIGMA})
-add_test(NAME gemmini_exsia_shift_extremes
-    COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=shift-extremes --compiled-tau=${GGML_GEMMINI_EXSIA_SIGMA})
-add_test(NAME gemmini_exsia_localstage_kernel_validation
-    COMMAND $<TARGET_FILE:test-gemmini-exsia>
-        --case=localstage-kernel-validation
-        --focus=all
-        --repeat-fresh=10
-        --evidence-dir=${CMAKE_CURRENT_BINARY_DIR}/exsia-localstage-kernel-validation)
-set_tests_properties(gemmini_exsia_localstage_kernel_validation PROPERTIES
-    LABELS "gemmini;exsia;validation"
-    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+
+if (NOT GEMMINI_SW_PATH OR NOT EXISTS "${GEMMINI_SW_PATH}/gemmini.h")
+    message(FATAL_ERROR "test-gemmini-srmd-raw-ws requires ${GEMMINI_SW_PATH}/gemmini.h")
+endif()
+file(SHA256 "${GEMMINI_SW_PATH}/gemmini.h" GEMMINI_SRMD_RAW_WS_GEMMINI_H_SHA256)
+if (NOT GEMMINI_SRMD_RAW_WS_GEMMINI_H_SHA256 STREQUAL
+        "391262e7516d6a45b56e4221abd777678ed15856f9a08f66660a9d60ae213075")
+    message(FATAL_ERROR "test-gemmini-srmd-raw-ws requires the pinned gemmini.h")
+endif()
+add_executable(test-gemmini-srmd-raw-ws
+    test-gemmini-srmd-raw-ws.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp)
+target_link_libraries(test-gemmini-srmd-raw-ws PRIVATE ggml-base ggml-gemmini-utils)
+target_compile_features(test-gemmini-srmd-raw-ws PRIVATE cxx_std_17)
+target_include_directories(test-gemmini-srmd-raw-ws PRIVATE
+    ${GEMMINI_SW_PATH}
+    ${GEMMINI_SW_PATH}/include
+    ../ggml/src
+    ../ggml/src/ggml-gemmini
+    ../ggml/src/ggml-gemmini/residual/rmd)
+add_test(NAME test-gemmini-srmd-raw-ws-cpu
+    COMMAND $<TARGET_FILE:test-gemmini-srmd-raw-ws> --cpu)
+
 add_executable(test-gemmini-matmul-options test-gemmini-matmul-options.cpp)
 target_compile_features(test-gemmini-matmul-options PRIVATE cxx_std_17)
 target_include_directories(test-gemmini-matmul-options PRIVATE

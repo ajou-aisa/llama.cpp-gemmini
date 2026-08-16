@@ -60,35 +60,64 @@ RmdStatus compose_rmd_output(const StripePacket & packet,
         return offsets;
     }
 
+    std::vector<uint8_t> needs_wide;
     try {
-        correction.assign(packet.row_count * packet.logical_j, OutputValue{0});
+        const size_t value_count = packet.row_count * packet.logical_j;
+        correction.assign(value_count, OutputValue{0});
+        needs_wide.assign(packet.logical_j, uint8_t{0});
     } catch (const std::bad_alloc &) {
         return RmdStatus::allocation_failure;
     }
 
-    for (const BlockDescriptor & block : packet.blocks) {
-        for (uint8_t lane_position = 0; lane_position < block.active_lane_count; ++lane_position) {
-            const uint8_t lane_id = block.lane_ids[lane_position];
-            if (lane_id >= kMaxLanes) {
-                return RmdStatus::invalid_packet;
-            }
-            const int64_t place = kRadixPlace[lane_id];
-            const size_t lane_base = block.output_value_offset +
-                static_cast<size_t>(lane_position) * block.lane_stride_values;
-
-            for (size_t row = 0; row < packet.row_count; ++row) {
+    for (size_t row = 0; row < packet.row_count; ++row) {
+        std::fill(needs_wide.begin(), needs_wide.end(), uint8_t{0});
+        OutputValue * destination = correction.data() + row * packet.logical_j;
+        for (const BlockDescriptor & block : packet.blocks) {
+            for (uint8_t lane_position = 0; lane_position < block.active_lane_count; ++lane_position) {
+                const uint8_t lane_id = block.lane_ids[lane_position];
+                if (lane_id >= kMaxLanes) {
+                    return RmdStatus::invalid_packet;
+                }
+                const int64_t place = kRadixPlace[lane_id];
+                const size_t lane_base = block.output_value_offset +
+                    static_cast<size_t>(lane_position) * block.lane_stride_values;
                 const OutputValue * source = output.values.data() + lane_base + row * output.j_padded;
-                OutputValue * destination = correction.data() + row * packet.logical_j;
                 for (size_t j = 0; j < packet.logical_j; ++j) {
-                    const __int128 scaled =
-                        static_cast<__int128>(source[j]) * static_cast<__int128>(place);
-                    const __int128 sum = static_cast<__int128>(destination[j]) + scaled;
-                    if (sum > kInt64Max || sum < kInt64Min) {
-                        return RmdStatus::overflow;
+                    if (needs_wide[j] != 0) {
+                        continue;
                     }
-                    destination[j] = static_cast<int64_t>(sum);
+                    int64_t scaled = 0;
+                    int64_t sum = 0;
+                    if (__builtin_mul_overflow(source[j], place, &scaled) ||
+                        __builtin_add_overflow(destination[j], scaled, &sum)) {
+                        needs_wide[j] = 1;
+                    } else {
+                        destination[j] = sum;
+                    }
                 }
             }
+        }
+
+        for (size_t j = 0; j < packet.logical_j; ++j) {
+            if (needs_wide[j] == 0) {
+                continue;
+            }
+            __int128 wide = 0;
+            for (const BlockDescriptor & block : packet.blocks) {
+                for (uint8_t lane_position = 0; lane_position < block.active_lane_count; ++lane_position) {
+                    const uint8_t lane_id = block.lane_ids[lane_position];
+                    const size_t lane_base = block.output_value_offset +
+                        static_cast<size_t>(lane_position) * block.lane_stride_values;
+                    const OutputValue source = output.values[
+                        lane_base + row * output.j_padded + j];
+                    wide += static_cast<__int128>(source) *
+                        static_cast<__int128>(kRadixPlace[lane_id]);
+                }
+            }
+            if (wide > kInt64Max || wide < kInt64Min) {
+                return RmdStatus::overflow;
+            }
+            destination[j] = static_cast<int64_t>(wide);
         }
     }
     return RmdStatus::success;

@@ -25,7 +25,8 @@
 namespace ggml::gemmini::rmd {
 
 constexpr size_t kArrayDim = DIM;
-constexpr size_t kBlockSize = GGML_GEMMINI_BLOCK_SIZE;
+constexpr size_t kNativeWeightScaleGroup = 32;
+constexpr size_t kBlockSize = kNativeWeightScaleGroup;
 constexpr size_t kMaxLanes = 4;
 
 static_assert(kArrayDim > 0, "Gemmini DIM must be positive");

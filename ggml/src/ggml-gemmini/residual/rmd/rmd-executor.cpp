@@ -5,11 +5,15 @@
 #include "../../ggml-gemmini-args.h"
 #include "../../quants/common/weight_route.hpp"
 
+#include <gemmini.h>
+
 #include <algorithm>
 #include <limits>
 #include <new>
 
 namespace ggml::gemmini::rmd {
+
+static_assert(kNativeWeightScaleGroup == QK8_0);
 
 namespace {
 
@@ -187,6 +191,8 @@ void collect_packet_metrics(const StripePacket & packet, RmdExecutionMetrics & m
     const size_t m_tiles = (packet.row_count + kArrayDim - 1) / kArrayDim;
     const size_t j_tiles = (packet.logical_j + kArrayDim - 1) / kArrayDim;
     metrics.physical_tile_count = 0;
+    metrics.matmul_call_count = 0;
+    metrics.stacked_i_tile_count = 0;
 
     for (const BlockDescriptor & block : packet.blocks) {
         metrics.active_lanes += block.active_lane_count;
@@ -215,6 +221,17 @@ RmdStatus execute_rmd_stripe(const ggml_gemmini_args_t & args,
     if (packet.logical_j != args.J || packet.logical_k != args.K) {
         return RmdStatus::invalid_arguments;
     }
+    if (args.tiled_matmul_type == OS) {
+        return RmdStatus::unsupported_route;
+    }
+#if !defined(__riscv)
+    if (args.tiled_matmul_type == WS) {
+        return RmdStatus::unsupported_route;
+    }
+#endif
+    if (args.tiled_matmul_type != CPU && args.tiled_matmul_type != WS) {
+        return RmdStatus::invalid_arguments;
+    }
 
     const wroute::WeightRoutePlan plan = wroute::resolve_weight_route_plan(
         args, wroute::WeightScaleInfoMode::Residual);
@@ -237,13 +254,32 @@ RmdStatus execute_rmd_stripe(const ggml_gemmini_args_t & args,
 
     const size_t m_tiles = (packet.row_count + kArrayDim - 1) / kArrayDim;
     const size_t j_tiles = (packet.logical_j + kArrayDim - 1) / kArrayDim;
+    size_t matmul_call_count = 0;
+    size_t stacked_i_tile_count = 0;
 
-    std::vector<OutputValue> tile_values;
+    size_t max_stacked_rows = 0;
+    for (const BlockDescriptor & block : packet.blocks) {
+        if (block.active_lane_count != 0 &&
+            block.rows_padded > std::numeric_limits<size_t>::max() / block.active_lane_count) {
+            return RmdStatus::invalid_packet;
+        }
+        max_stacked_rows = std::max(max_stacked_rows,
+            static_cast<size_t>(block.active_lane_count) * block.rows_padded);
+    }
+    if (max_stacked_rows > std::numeric_limits<size_t>::max() / kArrayDim) {
+        return RmdStatus::invalid_packet;
+    }
+
+    std::vector<OutputValue> stacked_values;
     std::vector<int8_t> weight_tile;
+    std::vector<acc_t> ws_values;
     std::vector<uint64_t> block_scales;
     try {
-        tile_values.assign(kArrayDim * kArrayDim, OutputValue{0});
+        stacked_values.assign(max_stacked_rows * kArrayDim, OutputValue{0});
         weight_tile.assign(kArrayDim * kArrayDim, int8_t{0});
+        if (args.tiled_matmul_type == WS) {
+            ws_values.assign(max_stacked_rows * kArrayDim, acc_t{0});
+        }
         block_scales.assign(kArrayDim, uint64_t{0});
     } catch (const std::bad_alloc &) {
         return RmdStatus::allocation_failure;
@@ -252,83 +288,105 @@ RmdStatus execute_rmd_stripe(const ggml_gemmini_args_t & args,
     for (size_t block_index = 0; block_index < packet.blocks.size(); ++block_index) {
         const BlockDescriptor & block = packet.blocks[block_index];
         const size_t k_tiles = block.padded_k_count / kArrayDim;
+        const size_t stacked_rows =
+            static_cast<size_t>(block.active_lane_count) * block.rows_padded;
+        const size_t stacked_value_count = stacked_rows * kArrayDim;
 
         for (size_t j_tile = 0; j_tile < j_tiles; ++j_tile) {
             const size_t col_base = j_tile * kArrayDim;
             const size_t valid_cols = std::min(kArrayDim, packet.logical_j - col_base);
+            std::fill_n(stacked_values.begin(), stacked_value_count, OutputValue{0});
 
             // Integer block scale, resolved once per (block, output column).
             for (size_t col = 0; col < valid_cols; ++col) {
                 block_scales[col] = wroute::route_block_scale(plan, args, col_base + col, block.block_id);
             }
 
-            for (uint8_t lane_position = 0; lane_position < block.active_lane_count; ++lane_position) {
-                const size_t lane_base = block.activation_offset +
-                    static_cast<size_t>(lane_position) * block.rows_padded * block.padded_k_count;
-
-                for (size_t m_tile = 0; m_tile < m_tiles; ++m_tile) {
-                    const size_t row_base = m_tile * kArrayDim;
-                    const size_t valid_rows = std::min(kArrayDim, packet.row_count - row_base);
-                    std::fill(tile_values.begin(), tile_values.end(), OutputValue{0});
-
-                    // Partial accumulation across the K tiles of this original block only.
-                    for (size_t k_tile = 0; k_tile < k_tiles; ++k_tile) {
-                        const size_t k_base = k_tile * kArrayDim;
-                        const size_t valid_k = block.compact_k_count > k_base ?
-                            std::min(kArrayDim, block.compact_k_count - k_base) : 0;
-                        if (valid_k == 0) {
-                            continue;
+            // All lane/M rows are contiguous in the packet. One call per K tile lets
+            // Gemmini keep this B tile resident while its internal i0 loop advances.
+            for (size_t k_tile = 0; k_tile < k_tiles; ++k_tile) {
+                const size_t k_base = k_tile * kArrayDim;
+                const size_t valid_k = block.compact_k_count > k_base ?
+                    std::min(kArrayDim, block.compact_k_count - k_base) : 0;
+                if (valid_k == 0) {
+                    continue;
+                }
+                ++matmul_call_count;
+                stacked_i_tile_count += stacked_rows / kArrayDim;
+                for (size_t k = 0; k < valid_k; ++k) {
+                    const uint16_t local_k =
+                        packet.k_indices[block.k_index_offset + k_base + k];
+                    for (size_t col = 0; col < valid_cols; ++col) {
+                        int8_t code = 0;
+                        if (!weights.code(block.block_id, local_k, col_base + col, code)) {
+                            return RmdStatus::execution_failed;
                         }
-                        for (size_t k = 0; k < valid_k; ++k) {
-                            const uint16_t local_k =
-                                packet.k_indices[block.k_index_offset + k_base + k];
-                            for (size_t col = 0; col < valid_cols; ++col) {
-                                int8_t code = 0;
-                                if (!weights.code(block.block_id, local_k, col_base + col, code)) {
-                                    return RmdStatus::execution_failed;
-                                }
-                                weight_tile[k * kArrayDim + col] = code;
-                            }
-                        }
-                        for (size_t row = 0; row < valid_rows; ++row) {
-                            const int8_t * activation =
-                                packet.stacked_activation.data() + lane_base +
-                                (row_base + row) * block.padded_k_count + k_base;
-                            OutputValue * accumulator = tile_values.data() + row * kArrayDim;
-                            for (size_t k = 0; k < valid_k; ++k) {
-                                const int64_t digit = activation[k];
-                                if (digit == 0) {
-                                    continue;
-                                }
-                                const int8_t * weight_row = weight_tile.data() + k * kArrayDim;
-                                for (size_t col = 0; col < valid_cols; ++col) {
-                                    int64_t product = 0;
-                                    if (!checked_mul_i64(digit, weight_row[col], product) ||
-                                        !checked_add_i64(accumulator[col], product, accumulator[col])) {
-                                        return RmdStatus::overflow;
-                                    }
-                                }
-                            }
-                        }
+                        weight_tile[k * kArrayDim + col] = code;
                     }
-
-                    // Block integer scale is applied exactly once, after the whole block
-                    // has been accumulated and before the canonical store.
-                    for (size_t row = 0; row < valid_rows; ++row) {
-                        OutputValue * accumulator = tile_values.data() + row * kArrayDim;
+                }
+                const int8_t * activation = packet.stacked_activation.data() +
+                    block.activation_offset + k_base;
+                if (args.tiled_matmul_type == WS) {
+                    std::fill_n(ws_values.begin(), stacked_value_count, acc_t{0});
+                    tiled_matmul(stacked_rows, valid_cols, valid_k,
+                        activation, weight_tile.data(), nullptr, ws_values.data(),
+                        block.padded_k_count, kArrayDim, 0, kArrayDim,
+                        1.0f, 1.0f, 1.0f,
+                        NO_ACTIVATION, ACC_SCALE_IDENTITY, ACC_SCALE_IDENTITY, false,
+                        1, 1, 1, false, false, true, false, 0, WS);
+                    for (size_t row = 0; row < stacked_rows; ++row) {
+                        OutputValue * accumulator = stacked_values.data() + row * kArrayDim;
                         for (size_t col = 0; col < valid_cols; ++col) {
-                            if (block_scales[col] > static_cast<uint64_t>(
-                                    std::numeric_limits<int64_t>::max())) {
-                                return RmdStatus::overflow;
-                            }
-                            if (!checked_mul_i64(accumulator[col],
-                                                 static_cast<int64_t>(block_scales[col]),
+                            if (!checked_add_i64(accumulator[col],
+                                                 ws_values[row * kArrayDim + col],
                                                  accumulator[col])) {
                                 return RmdStatus::overflow;
                             }
                         }
                     }
+                } else {
+                    for (size_t row = 0; row < stacked_rows; ++row) {
+                        const int8_t * activation_row =
+                            activation + row * block.padded_k_count;
+                        OutputValue * accumulator = stacked_values.data() + row * kArrayDim;
+                        for (size_t k = 0; k < valid_k; ++k) {
+                            const int64_t digit = activation_row[k];
+                            if (digit == 0) {
+                                continue;
+                            }
+                            const int8_t * weight_row = weight_tile.data() + k * kArrayDim;
+                            for (size_t col = 0; col < valid_cols; ++col) {
+                                int64_t product = 0;
+                                if (!checked_mul_i64(digit, weight_row[col], product) ||
+                                    !checked_add_i64(accumulator[col], product, accumulator[col])) {
+                                    return RmdStatus::overflow;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
+            // Block integer scale is applied exactly once after all compact K tiles.
+            for (size_t row = 0; row < stacked_rows; ++row) {
+                OutputValue * accumulator = stacked_values.data() + row * kArrayDim;
+                for (size_t col = 0; col < valid_cols; ++col) {
+                    if (block_scales[col] > static_cast<uint64_t>(
+                            std::numeric_limits<int64_t>::max()) ||
+                        !checked_mul_i64(accumulator[col],
+                                         static_cast<int64_t>(block_scales[col]),
+                                         accumulator[col])) {
+                        return RmdStatus::overflow;
+                    }
+                }
+            }
+
+            for (uint8_t lane_position = 0; lane_position < block.active_lane_count; ++lane_position) {
+                const size_t lane_row_base =
+                    static_cast<size_t>(lane_position) * block.rows_padded;
+                for (size_t m_tile = 0; m_tile < m_tiles; ++m_tile) {
+                    const size_t row_base = m_tile * kArrayDim;
+                    const size_t valid_rows = std::min(kArrayDim, packet.row_count - row_base);
                     PhysicalTile tile{};
                     tile.packet_block_index = static_cast<uint32_t>(block_index);
                     tile.lane_position = lane_position;
@@ -337,7 +395,8 @@ RmdStatus execute_rmd_stripe(const ggml_gemmini_args_t & args,
                     tile.j_tile = static_cast<uint32_t>(j_tile);
                     tile.valid_rows = static_cast<uint16_t>(valid_rows);
                     tile.valid_cols = static_cast<uint16_t>(valid_cols);
-                    tile.values = tile_values.data();
+                    tile.values = stacked_values.data() +
+                        (lane_row_base + row_base) * kArrayDim;
                     const RmdStatus submit_status = assembler.submit(tile);
                     if (submit_status != RmdStatus::success) {
                         return submit_status;
@@ -353,6 +412,8 @@ RmdStatus execute_rmd_stripe(const ggml_gemmini_args_t & args,
     }
     if (metrics != nullptr) {
         collect_packet_metrics(packet, *metrics);
+        metrics->matmul_call_count = matmul_call_count;
+        metrics->stacked_i_tile_count = stacked_i_tile_count;
     }
     return RmdStatus::success;
 }
