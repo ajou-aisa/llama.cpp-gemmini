@@ -1,4 +1,4 @@
-#include "../../RISC-V-DynDNN-gemmini-include/gemmini_params.h"
+#include <gemmini_params.h>
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.hpp"
 
 #include <array>
