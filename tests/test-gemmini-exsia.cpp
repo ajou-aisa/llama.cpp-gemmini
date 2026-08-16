@@ -101,17 +101,24 @@ bool test_rmd_cpu_ws_routes() {
     }
 
     rmd::CompressedOutput output;
+    output.j_padded = 7;
+    output.values = { 11, 22, 33 };
+    const rmd::CompressedOutput unchanged = output;
     args.tiled_matmul_type = OS;
     const bool os_rejected = rmd::execute_rmd_stripe(args, *packet, output) ==
         rmd::RmdStatus::unsupported_route;
+    const bool os_preserved_output = output.j_padded == unchanged.j_padded &&
+        output.values == unchanged.values;
     args.tiled_matmul_type = WS;
     const rmd::RmdStatus ws = rmd::execute_rmd_stripe(args, *packet, output);
 #if defined(__riscv)
     const bool ws_result = ws == rmd::RmdStatus::success && output.values == cpu_output.values;
 #else
-    const bool ws_result = ws == rmd::RmdStatus::unsupported_route;
+    const bool ws_result = ws == rmd::RmdStatus::unsupported_route &&
+        output.j_padded == unchanged.j_padded && output.values == unchanged.values;
 #endif
     return check(os_rejected, "RMD OS route rejected") &&
+        check(os_preserved_output, "RMD failure preserves caller output") &&
         check(ws_result, "RMD WS route matches CPU on FPGA or rejects unsupported host");
 }
 

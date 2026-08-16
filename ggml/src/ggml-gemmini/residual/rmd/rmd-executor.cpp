@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <limits>
 #include <new>
+#include <utility>
 
 namespace ggml::gemmini::rmd {
 
@@ -246,8 +247,9 @@ RmdStatus execute_rmd_stripe(const ggml_gemmini_args_t & args,
         return RmdStatus::unsupported_route;
     }
 
+    CompressedOutput staged_output;
     RmdOutputAssembler assembler;
-    const RmdStatus begin_status = assembler.begin(packet, output);
+    const RmdStatus begin_status = assembler.begin(packet, staged_output);
     if (begin_status != RmdStatus::success) {
         return begin_status;
     }
@@ -410,6 +412,7 @@ RmdStatus execute_rmd_stripe(const ggml_gemmini_args_t & args,
     if (finish_status != RmdStatus::success) {
         return finish_status;
     }
+    output = std::move(staged_output);
     if (metrics != nullptr) {
         collect_packet_metrics(packet, *metrics);
         metrics->matmul_call_count = matmul_call_count;
