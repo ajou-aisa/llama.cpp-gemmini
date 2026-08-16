@@ -2,6 +2,7 @@
 #include "../ggml/src/ggml-gemmini/quants/act/dispatch.hpp"
 #include "../ggml/src/ggml-gemmini/quants/act/quantize.hpp"
 #include "../ggml/src/ggml-gemmini/quants/act/exsia/types.hpp"
+#include "../ggml/src/ggml-gemmini/quants/act/token/types.hpp"
 
 #include <ggml.h>
 #ifndef GEMMINI_EXSIA_WRITER_TEST_ONLY
@@ -14,6 +15,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -283,6 +285,17 @@ bool test_rmd_cpu_direct_parity() {
                    "merged RMD correction equals direct matmul")) {
             return false;
         }
+    }
+
+    merged.assign(rows * columns, 7.0f);
+    const std::vector<float> unchanged = merged;
+    auto & invalid_meta = args.act_quant.storage().emplace<quants::act::token::Meta>();
+    invalid_meta.scales.assign(rows, 1.0f);
+    invalid_meta.scales[1] = std::numeric_limits<float>::quiet_NaN();
+    if (!check(rmd::merge_rmd_correction(args, *packet, actual) ==
+                   rmd::RmdStatus::invalid_arguments && merged == unchanged,
+               "RMD merge failure preserves caller output")) {
+        return false;
     }
     return true;
 }

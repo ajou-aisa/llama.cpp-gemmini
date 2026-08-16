@@ -10,6 +10,7 @@
 #include <cmath>
 #include <limits>
 #include <new>
+#include <utility>
 
 namespace ggml::gemmini::rmd {
 
@@ -60,10 +61,11 @@ RmdStatus compose_rmd_output(const StripePacket & packet,
         return offsets;
     }
 
+    std::vector<OutputValue> staged_correction;
     std::vector<uint8_t> needs_wide;
     try {
         const size_t value_count = packet.row_count * packet.logical_j;
-        correction.assign(value_count, OutputValue{0});
+        staged_correction.assign(value_count, OutputValue{0});
         needs_wide.assign(packet.logical_j, uint8_t{0});
     } catch (const std::bad_alloc &) {
         return RmdStatus::allocation_failure;
@@ -71,7 +73,7 @@ RmdStatus compose_rmd_output(const StripePacket & packet,
 
     for (size_t row = 0; row < packet.row_count; ++row) {
         std::fill(needs_wide.begin(), needs_wide.end(), uint8_t{0});
-        OutputValue * destination = correction.data() + row * packet.logical_j;
+        OutputValue * destination = staged_correction.data() + row * packet.logical_j;
         for (const BlockDescriptor & block : packet.blocks) {
             for (uint8_t lane_position = 0; lane_position < block.active_lane_count; ++lane_position) {
                 const uint8_t lane_id = block.lane_ids[lane_position];
@@ -120,6 +122,7 @@ RmdStatus compose_rmd_output(const StripePacket & packet,
             destination[j] = static_cast<int64_t>(wide);
         }
     }
+    correction = std::move(staged_correction);
     return RmdStatus::success;
 }
 
@@ -222,8 +225,10 @@ RmdStatus merge_rmd_correction(const ggml_gemmini_args_t & args,
     const size_t col_stride = args.col_stride_f_out != 0 ? args.col_stride_f_out : 1;
 
     std::vector<float> column_scale;
+    std::vector<float> activation_scale;
     try {
         column_scale.resize(args.J);
+        activation_scale.resize(packet.row_count);
     } catch (const std::bad_alloc &) {
         return RmdStatus::allocation_failure;
     }
@@ -233,18 +238,19 @@ RmdStatus merge_rmd_correction(const ggml_gemmini_args_t & args,
             return RmdStatus::unsupported_route;
         }
     }
-
     for (size_t row = 0; row < packet.row_count; ++row) {
-        float activation_scale = 1.0f;
-        if (!metadata.scale(row, activation_scale)) {
+        if (!metadata.scale(row, activation_scale[row])) {
             return RmdStatus::invalid_arguments;
         }
+    }
+
+    for (size_t row = 0; row < packet.row_count; ++row) {
         float * destination = args.f_out + (packet.row_begin + row) * row_stride;
         const OutputValue * source = correction.data() + row * packet.logical_j;
         for (size_t j = 0; j < args.J; ++j) {
             const double value = static_cast<double>(source[j]) *
                 static_cast<double>(column_scale[j]) *
-                static_cast<double>(activation_scale);
+                static_cast<double>(activation_scale[row]);
             destination[j * col_stride] += static_cast<float>(value);
         }
     }

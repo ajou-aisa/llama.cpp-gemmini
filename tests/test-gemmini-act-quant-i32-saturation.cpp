@@ -225,9 +225,11 @@ static bool check_radix_compose_allows_final_int64_cancellation()
             output.values[offset] = 0;
         }
     }
+    correction = {41, 42};
+    const auto unchanged = correction;
     if (ggml::gemmini::rmd::compose_rmd_output(*packet, output, correction) !=
-        ggml::gemmini::rmd::RmdStatus::overflow) {
-        std::fputs("FAIL: radix compose accepted a final value beyond INT64\n", stderr);
+            ggml::gemmini::rmd::RmdStatus::overflow || correction != unchanged) {
+        std::fputs("FAIL: radix compose overflow modified caller output\n", stderr);
         return false;
     }
     return true;
