@@ -1618,7 +1618,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 "rmd_pack_ns=%llu rmd_execute_ns=%llu rmd_compose_ns=%llu rmd_finalize_ns=%llu "
                 "ws_start_ns=%llu ws_end_ns=%llu rmd_start_ns=%llu rmd_end_ns=%llu "
                 "active_blocks=%zu active_lanes=%zu physical_tiles=%zu "
-                "matmul_calls=%zu stacked_i_tiles=%zu packet_bytes=%zu",
+                "matmul_calls=%zu lane_groups=%zu stacked_i_tiles=%zu/%zu packet_bytes=%zu",
                 profile.stripe_id,
                 profile.row_begin,
                 profile.row_end,
@@ -1641,7 +1641,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 profile.rmd.active_lanes,
                 profile.rmd.physical_tile_count,
                 profile.rmd.matmul_call_count,
+                profile.rmd.lane_group_count,
                 profile.rmd.stacked_i_tile_count,
+                profile.rmd.baseline_stacked_i_tile_count,
                 profile.rmd.packet_bytes);
             const std::string summary = ggml::gemmini::detail::pipeline_stripe_summary_json(
                 layer, args.I, args.J, args.K, backend_route, schedule, profile);

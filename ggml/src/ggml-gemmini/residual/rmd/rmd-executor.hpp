@@ -46,6 +46,8 @@ struct RmdExecutionMetrics {
     size_t padded_k_count = 0;
     size_t physical_tile_count = 0;
     size_t matmul_call_count = 0;
+    size_t lane_group_count = 0;
+    size_t baseline_stacked_i_tile_count = 0;
     size_t stacked_i_tile_count = 0;
     size_t packet_bytes = 0;
     size_t compressed_output_values = 0;

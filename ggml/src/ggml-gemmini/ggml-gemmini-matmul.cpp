@@ -599,6 +599,8 @@ std::string pipeline_stripe_summary_json(const char * layer,
         << ",\"padded_k_count\":" << profile.rmd.padded_k_count
         << ",\"physical_tile_count\":" << profile.rmd.physical_tile_count
         << ",\"matmul_call_count\":" << profile.rmd.matmul_call_count
+        << ",\"lane_group_count\":" << profile.rmd.lane_group_count
+        << ",\"baseline_stacked_i_tile_count\":" << profile.rmd.baseline_stacked_i_tile_count
         << ",\"stacked_i_tile_count\":" << profile.rmd.stacked_i_tile_count
         << ",\"packet_bytes\":" << profile.rmd.packet_bytes
         << ",\"compressed_output_values\":" << profile.rmd.compressed_output_values

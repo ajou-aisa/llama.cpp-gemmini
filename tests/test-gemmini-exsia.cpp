@@ -216,12 +216,16 @@ bool test_rmd_cpu_direct_parity() {
                "RMD reuse fixture spans multiple stacked I tiles") ||
         !check(metrics.matmul_call_count == expected_calls,
                "RMD executor coalesces lane/M tiles into one weight-loading call") ||
-        !check(metrics.stacked_i_tile_count == expected_i_tiles,
-               "RMD executor reports every stacked I tile")) {
+        !check(metrics.baseline_stacked_i_tile_count == expected_i_tiles,
+               "RMD executor reports baseline stacked I tiles") ||
+        !check(metrics.stacked_i_tile_count <= expected_i_tiles,
+               "RMD lane partition never increases stacked I tiles")) {
         return false;
     }
-    std::printf("RMD stacked schedule: matmul_calls=%zu stacked_i_tiles=%zu avoided_B_loads=%zu\n",
-                metrics.matmul_call_count, metrics.stacked_i_tile_count,
+    std::printf("RMD stacked schedule: matmul_calls=%zu lane_groups=%zu "
+                "stacked_i_tiles=%zu/%zu avoided_B_loads=%zu\n",
+                metrics.matmul_call_count, metrics.lane_group_count,
+                metrics.stacked_i_tile_count, metrics.baseline_stacked_i_tile_count,
                 metrics.stacked_i_tile_count - metrics.matmul_call_count);
     std::vector<rmd::OutputValue> actual;
     if (!check(rmd::compose_rmd_output(*packet, compressed, actual) == rmd::RmdStatus::success,
@@ -299,6 +303,75 @@ bool test_rmd_cpu_direct_parity() {
     }
     return true;
 }
+
+bool test_rmd_lane_partition() {
+    constexpr size_t logical_k = 32;
+    std::vector<int32_t> residuals(logical_k, 0);
+    for (size_t k = 0; k < 10; ++k) {
+        residuals[k] = 257;
+        residuals[16 + k] = 65536;
+    }
+
+    block_q8_h1 weights{};
+    for (size_t k = 0; k < logical_k; ++k) {
+        weights.qs[k] = static_cast<int8_t>(k + 1);
+    }
+    weights.c_b = 1;
+    weights.s_rf = 1.0f;
+    weights.R = 0;
+
+    ggml_gemmini_args_t args{};
+    args.I = 1;
+    args.J = 1;
+    args.K = logical_k;
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1;
+    args.q8_h1_blocks = &weights;
+    args.q8_h1_block_count = 1;
+    args.q8_h1_rows = 1;
+    args.blocks_per_row = 1;
+    args.block_size_k = logical_k;
+    args.tiled_matmul_type = CPU;
+
+    rmd::RmdStripeBuilder builder;
+    builder.reset(0, 0, 1, logical_k, 1);
+    for (size_t k = 0; k < logical_k; ++k) {
+        if (residuals[k] != 0 && !builder.add_residual(0, k, residuals[k])) {
+            return check(false, "RMD lane-partition residual accepted");
+        }
+    }
+    const rmd::StripePacketHandle packet = builder.finish();
+    if (!check(packet != nullptr, "RMD lane-partition packet built")) {
+        return false;
+    }
+
+    rmd::CompressedOutput compressed;
+    rmd::RmdExecutionMetrics metrics{};
+    if (!check(rmd::execute_rmd_stripe(args, *packet, compressed, &metrics) ==
+                   rmd::RmdStatus::success,
+               "RMD lane-partition execution")) {
+        return false;
+    }
+    std::vector<rmd::OutputValue> actual;
+    if (!check(rmd::compose_rmd_output(*packet, compressed, actual) ==
+                   rmd::RmdStatus::success,
+               "RMD lane-partition composition")) {
+        return false;
+    }
+
+    int64_t expected = 0;
+    for (size_t k = 0; k < logical_k; ++k) {
+        expected += static_cast<int64_t>(residuals[k]) * weights.qs[k];
+    }
+    return check(actual == std::vector<rmd::OutputValue>{expected},
+                 "RMD lane partition preserves exact output") &&
+        check(metrics.matmul_call_count == 2,
+              "RMD lane partition preserves B-load count") &&
+        check(metrics.active_lanes == 3 && metrics.lane_group_count == 2,
+              "RMD lane partition groups overlapping and separates disjoint lanes") &&
+        check(metrics.baseline_stacked_i_tile_count == 6 &&
+                  metrics.stacked_i_tile_count == 3,
+              "RMD lane partition halves padded I-by-K tiles");
+}
 #endif
 
 bool profile_output_routing(const std::filesystem::path & expected, bool invalid_parent) {
@@ -368,11 +441,13 @@ int main(int argc, char ** argv) {
     std::printf("TEST_CASE_BEGIN name=%s\n", case_name.c_str());
     const bool ok =
         (case_name == "all" && test_exsia_baseline() && test_dispatch_modes() &&
-         test_rmd_cpu_ws_routes() && test_rmd_cpu_direct_parity()) ||
+         test_rmd_cpu_ws_routes() && test_rmd_cpu_direct_parity() &&
+         test_rmd_lane_partition()) ||
         (case_name == "baseline" && test_exsia_baseline()) ||
         (case_name == "dispatch" && test_dispatch_modes()) ||
         (case_name == "rmd-routes" && test_rmd_cpu_ws_routes()) ||
-        (case_name == "rmd-direct-parity" && test_rmd_cpu_direct_parity());
+        (case_name == "rmd-direct-parity" && test_rmd_cpu_direct_parity() &&
+         test_rmd_lane_partition());
     if (ok)
         std::printf("PASS: case=%s\n", case_name.c_str());
     return ok ? 0 : 1;
