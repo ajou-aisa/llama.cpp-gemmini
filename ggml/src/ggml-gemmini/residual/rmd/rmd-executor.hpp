@@ -54,6 +54,9 @@ struct RmdExecutionMetrics {
     size_t block_padding_zeros = 0;
     size_t row_padding_zeros = 0;
     size_t j_padding_zeros = 0;
+    size_t weight_values_gathered = 0;
+    size_t weight_baseline_address_resolutions = 0;
+    size_t weight_address_resolutions = 0;
 };
 
 void collect_packet_metrics(const StripePacket & packet, RmdExecutionMetrics & metrics);
@@ -68,5 +71,36 @@ RmdStatus execute_rmd_stripe(const ggml_gemmini_args_t & args,
 // True when the weight route can express its scale as
 // integer_block_scale(j, block) * column_scale(j).
 bool weight_route_supports_rmd(const ggml_gemmini_args_t & args);
+
+#if defined(GGML_GEMMINI_TESTING)
+RmdStatus gather_weight_tile_for_test(const ggml_gemmini_args_t & args,
+                                      uint32_t block_id,
+                                      const uint16_t * local_k,
+                                      size_t valid_k,
+                                      size_t col_base,
+                                      size_t valid_cols,
+                                      int8_t * tile,
+                                      size_t tile_stride,
+                                      RmdExecutionMetrics * metrics = nullptr);
+
+RmdStatus repeat_weight_tile_gather_for_test(const ggml_gemmini_args_t & args,
+                                             uint32_t block_count,
+                                             const uint16_t * local_k,
+                                             size_t valid_k,
+                                             size_t col_base,
+                                             size_t valid_cols,
+                                             size_t iterations,
+                                             uint64_t & checksum,
+                                             RmdExecutionMetrics & metrics);
+
+RmdStatus repeat_scalar_weight_tile_gather_for_test(const ggml_gemmini_args_t & args,
+                                                    uint32_t block_count,
+                                                    const uint16_t * local_k,
+                                                    size_t valid_k,
+                                                    size_t col_base,
+                                                    size_t valid_cols,
+                                                    size_t iterations,
+                                                    uint64_t & checksum);
+#endif
 
 }

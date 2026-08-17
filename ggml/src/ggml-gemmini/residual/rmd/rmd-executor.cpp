@@ -41,7 +41,12 @@ bool checked_add_i64(int64_t lhs, int64_t rhs, int64_t & out) {
     return true;
 }
 
-// Weight code for one (original block, block-local K, output column).
+struct WeightGatherCounts {
+    size_t values = 0;
+    size_t baseline_address_resolutions = 0;
+    size_t address_resolutions = 0;
+};
+
 class WeightGather {
 public:
     WeightGather(const ggml_gemmini_args_t & args, const wroute::WeightRoutePlan & plan)
@@ -53,20 +58,91 @@ public:
 
     bool valid() const { return native_h1_ || dense_ != nullptr; }
 
-    bool code(uint32_t block_id, uint16_t block_local_k, size_t j, int8_t & out) const {
-        if (native_h1_) {
-            const block_q8_h1 * block = args_.q8_h1_block(j, block_id);
-            if (block == nullptr) {
-                return false;
-            }
-            out = static_cast<int8_t>(block->qs[block_local_k]);
-            return true;
-        }
-        const size_t global_k = static_cast<size_t>(block_id) * kBlockSize + block_local_k;
-        if (global_k >= args_.K) {
+    bool fill_tile(uint32_t block_id,
+                   const uint16_t * local_k,
+                   size_t valid_k,
+                   size_t col_base,
+                   size_t valid_cols,
+                   int8_t * tile,
+                   size_t tile_stride,
+                   WeightGatherCounts & counts) const {
+        if (local_k == nullptr || tile == nullptr || valid_k == 0 || valid_k > kArrayDim ||
+            valid_cols == 0 || valid_cols > kArrayDim || tile_stride < valid_cols ||
+            col_base > args_.J || valid_cols > args_.J - col_base ||
+            args_.K == 0 || static_cast<size_t>(block_id) > (args_.K - 1) / kBlockSize) {
             return false;
         }
-        out = column_major_ ? dense_[j * stride_ + global_k] : dense_[global_k * stride_ + j];
+
+        std::array<size_t, kArrayDim> global_k{};
+        for (size_t k = 0; k < valid_k; ++k) {
+            if (local_k[k] >= kBlockSize) {
+                return false;
+            }
+            global_k[k] = static_cast<size_t>(block_id) * kBlockSize + local_k[k];
+            if (global_k[k] >= args_.K) {
+                return false;
+            }
+        }
+
+        if (native_h1_) {
+            std::array<const int8_t *, kArrayDim> row_bases{};
+            for (size_t col = 0; col < valid_cols; ++col) {
+                const block_q8_h1 * block = args_.q8_h1_block(col_base + col, block_id);
+                if (block == nullptr) {
+                    return false;
+                }
+                row_bases[col] = block->qs;
+            }
+            for (size_t k = 0; k < valid_k; ++k) {
+                for (size_t col = 0; col < valid_cols; ++col) {
+                    tile[k * tile_stride + col] = row_bases[col][local_k[k]];
+                }
+            }
+            counts.address_resolutions = valid_cols;
+        } else if (column_major_) {
+            if (stride_ < args_.K) {
+                return false;
+            }
+            std::array<const int8_t *, kArrayDim> row_bases{};
+            const size_t max_global_k = *std::max_element(global_k.begin(),
+                                                           global_k.begin() + valid_k);
+            for (size_t col = 0; col < valid_cols; ++col) {
+                const size_t j = col_base + col;
+                if (j > std::numeric_limits<size_t>::max() / stride_) {
+                    return false;
+                }
+                const size_t row_offset = j * stride_;
+                if (max_global_k > std::numeric_limits<size_t>::max() - row_offset) {
+                    return false;
+                }
+                row_bases[col] = dense_ + row_offset;
+            }
+            for (size_t k = 0; k < valid_k; ++k) {
+                for (size_t col = 0; col < valid_cols; ++col) {
+                    tile[k * tile_stride + col] = row_bases[col][global_k[k]];
+                }
+            }
+            counts.address_resolutions = valid_cols;
+        } else {
+            if (stride_ < args_.J) {
+                return false;
+            }
+            std::array<const int8_t *, kArrayDim> row_bases{};
+            for (size_t k = 0; k < valid_k; ++k) {
+                if (global_k[k] > std::numeric_limits<size_t>::max() / stride_ ||
+                    col_base > std::numeric_limits<size_t>::max() - global_k[k] * stride_) {
+                    return false;
+                }
+                row_bases[k] = dense_ + global_k[k] * stride_ + col_base;
+            }
+            for (size_t k = 0; k < valid_k; ++k) {
+                std::copy_n(row_bases[k], valid_cols, tile + k * tile_stride);
+            }
+            counts.address_resolutions = valid_k;
+        }
+
+        counts.values = valid_k * valid_cols;
+        counts.baseline_address_resolutions = counts.values;
         return true;
     }
 
@@ -204,6 +280,144 @@ bool weight_route_supports_rmd(const ggml_gemmini_args_t & args) {
     return plan.valid && wroute::route_supports_integer_block_scale(plan);
 }
 
+#if defined(GGML_GEMMINI_TESTING)
+RmdStatus gather_weight_tile_for_test(const ggml_gemmini_args_t & args,
+                                      uint32_t block_id,
+                                      const uint16_t * local_k,
+                                      size_t valid_k,
+                                      size_t col_base,
+                                      size_t valid_cols,
+                                      int8_t * tile,
+                                      size_t tile_stride,
+                                      RmdExecutionMetrics * metrics) {
+    const wroute::WeightRoutePlan plan = wroute::resolve_weight_route_plan(
+        args, wroute::WeightScaleInfoMode::Residual);
+    if (!plan.valid || !wroute::route_supports_integer_block_scale(plan)) {
+        return RmdStatus::unsupported_route;
+    }
+    const WeightGather weights(args, plan);
+    if (!weights.valid()) {
+        return RmdStatus::unsupported_route;
+    }
+    WeightGatherCounts counts{};
+    if (!weights.fill_tile(block_id, local_k, valid_k, col_base, valid_cols,
+                           tile, tile_stride, counts)) {
+        return RmdStatus::execution_failed;
+    }
+    if (metrics != nullptr) {
+        metrics->weight_values_gathered += counts.values;
+        metrics->weight_baseline_address_resolutions += counts.baseline_address_resolutions;
+        metrics->weight_address_resolutions += counts.address_resolutions;
+    }
+    return RmdStatus::success;
+}
+
+RmdStatus repeat_weight_tile_gather_for_test(const ggml_gemmini_args_t & args,
+                                             uint32_t block_count,
+                                             const uint16_t * local_k,
+                                             size_t valid_k,
+                                             size_t col_base,
+                                             size_t valid_cols,
+                                             size_t iterations,
+                                             uint64_t & checksum,
+                                             RmdExecutionMetrics & metrics) {
+    const wroute::WeightRoutePlan plan = wroute::resolve_weight_route_plan(
+        args, wroute::WeightScaleInfoMode::Residual);
+    if (!plan.valid || !wroute::route_supports_integer_block_scale(plan)) {
+        return RmdStatus::unsupported_route;
+    }
+    const WeightGather weights(args, plan);
+    if (!weights.valid()) {
+        return RmdStatus::unsupported_route;
+    }
+
+    std::array<int8_t, kArrayDim * kArrayDim> tile{};
+    uint64_t local_checksum = 0;
+    RmdExecutionMetrics local_metrics{};
+    for (size_t iteration = 0; iteration < iterations; ++iteration) {
+        for (uint32_t block_id = 0; block_id < block_count; ++block_id) {
+            WeightGatherCounts counts{};
+            if (!weights.fill_tile(block_id, local_k, valid_k, col_base, valid_cols,
+                                   tile.data(), kArrayDim, counts)) {
+                return RmdStatus::execution_failed;
+            }
+            for (size_t k = 0; k < valid_k; ++k) {
+                for (size_t col = 0; col < valid_cols; ++col) {
+                    local_checksum += static_cast<uint8_t>(tile[k * kArrayDim + col]);
+                }
+            }
+            local_metrics.weight_values_gathered += counts.values;
+            local_metrics.weight_baseline_address_resolutions += counts.baseline_address_resolutions;
+            local_metrics.weight_address_resolutions += counts.address_resolutions;
+        }
+    }
+    checksum = local_checksum;
+    metrics = local_metrics;
+    return RmdStatus::success;
+}
+
+RmdStatus repeat_scalar_weight_tile_gather_for_test(const ggml_gemmini_args_t & args,
+                                                    uint32_t block_count,
+                                                    const uint16_t * local_k,
+                                                    size_t valid_k,
+                                                    size_t col_base,
+                                                    size_t valid_cols,
+                                                    size_t iterations,
+                                                    uint64_t & checksum) {
+    const wroute::WeightRoutePlan plan = wroute::resolve_weight_route_plan(
+        args, wroute::WeightScaleInfoMode::Residual);
+    if (!plan.valid || !wroute::route_supports_integer_block_scale(plan) ||
+        local_k == nullptr || valid_k == 0 || valid_k > kArrayDim ||
+        valid_cols == 0 || valid_cols > kArrayDim ||
+        col_base > args.J || valid_cols > args.J - col_base) {
+        return RmdStatus::unsupported_route;
+    }
+
+    const bool native_h1 = plan.route == wroute::WeightRouteKind::Q8H1 &&
+        plan.native_weight_blocks;
+    const bool column_major = plan.layout == wroute::WeightLayout::JxK_ColMajor;
+    const int8_t * dense = reinterpret_cast<const int8_t *>(args.B);
+    if (!native_h1 && dense == nullptr) {
+        return RmdStatus::unsupported_route;
+    }
+
+    std::array<int8_t, kArrayDim * kArrayDim> tile{};
+    uint64_t local_checksum = 0;
+    for (size_t iteration = 0; iteration < iterations; ++iteration) {
+        for (uint32_t block_id = 0; block_id < block_count; ++block_id) {
+            for (size_t k = 0; k < valid_k; ++k) {
+                const size_t global_k = static_cast<size_t>(block_id) * kBlockSize + local_k[k];
+                if (local_k[k] >= kBlockSize || global_k >= args.K) {
+                    return RmdStatus::execution_failed;
+                }
+                for (size_t col = 0; col < valid_cols; ++col) {
+                    const size_t j = col_base + col;
+                    int8_t value = 0;
+                    if (native_h1) {
+                        const block_q8_h1 * block = args.q8_h1_block(j, block_id);
+                        if (block == nullptr) {
+                            return RmdStatus::execution_failed;
+                        }
+                        value = block->qs[local_k[k]];
+                    } else {
+                        value = column_major ? dense[j * plan.weight_stride + global_k]
+                                             : dense[global_k * plan.weight_stride + j];
+                    }
+                    tile[k * kArrayDim + col] = value;
+                }
+            }
+            for (size_t k = 0; k < valid_k; ++k) {
+                for (size_t col = 0; col < valid_cols; ++col) {
+                    local_checksum += static_cast<uint8_t>(tile[k * kArrayDim + col]);
+                }
+            }
+        }
+    }
+    checksum = local_checksum;
+    return RmdStatus::success;
+}
+#endif
+
 RmdStatus RmdOutputAssembler::begin(const StripePacket & packet, CompressedOutput & output) {
     const RmdStatus validation = validate_packet(packet);
     if (validation != RmdStatus::success) {
@@ -315,6 +529,9 @@ void collect_packet_metrics(const StripePacket & packet, RmdExecutionMetrics & m
     metrics.lane_group_count = 0;
     metrics.baseline_stacked_i_tile_count = 0;
     metrics.stacked_i_tile_count = 0;
+    metrics.weight_values_gathered = 0;
+    metrics.weight_baseline_address_resolutions = 0;
+    metrics.weight_address_resolutions = 0;
 
     for (const BlockDescriptor & block : packet.blocks) {
         metrics.active_lanes += block.active_lane_count;
@@ -382,6 +599,9 @@ RmdStatus execute_rmd_stripe(const ggml_gemmini_args_t & args,
     size_t matmul_call_count = 0;
     size_t lane_group_count = 0;
     size_t stacked_i_tile_count = 0;
+    size_t weight_values_gathered = 0;
+    size_t weight_baseline_address_resolutions = 0;
+    size_t weight_address_resolutions = 0;
 
     size_t max_stacked_rows = 0;
     for (const BlockDescriptor & block : packet.blocks) {
@@ -445,18 +665,21 @@ RmdStatus execute_rmd_stripe(const ggml_gemmini_args_t & args,
                     }
                     ++matmul_call_count;
                     stacked_i_tile_count += stacked_rows / kArrayDim;
+                    std::array<uint16_t, kArrayDim> local_k{};
                     for (size_t k = 0; k < valid_k; ++k) {
-                        const uint16_t local_k =
-                            packet.k_indices[block.k_index_offset +
-                                group.compact_positions[k_base + k]];
-                        for (size_t col = 0; col < valid_cols; ++col) {
-                            int8_t code = 0;
-                            if (!weights.code(block.block_id, local_k, col_base + col, code)) {
-                                return RmdStatus::execution_failed;
-                            }
-                            weight_tile[k * kArrayDim + col] = code;
-                        }
+                        local_k[k] = packet.k_indices[block.k_index_offset +
+                            group.compact_positions[k_base + k]];
                     }
+                    WeightGatherCounts gather_counts{};
+                    if (!weights.fill_tile(block.block_id, local_k.data(), valid_k,
+                                           col_base, valid_cols, weight_tile.data(),
+                                           kArrayDim, gather_counts)) {
+                        return RmdStatus::execution_failed;
+                    }
+                    weight_values_gathered += gather_counts.values;
+                    weight_baseline_address_resolutions +=
+                        gather_counts.baseline_address_resolutions;
+                    weight_address_resolutions += gather_counts.address_resolutions;
                     const int8_t * activation = group.activation.data() + k_base;
                     if (args.tiled_matmul_type == WS) {
                         std::fill_n(ws_values.begin(), stacked_value_count, acc_t{0});
@@ -550,6 +773,10 @@ RmdStatus execute_rmd_stripe(const ggml_gemmini_args_t & args,
         metrics->matmul_call_count = matmul_call_count;
         metrics->lane_group_count = lane_group_count;
         metrics->stacked_i_tile_count = stacked_i_tile_count;
+        metrics->weight_values_gathered = weight_values_gathered;
+        metrics->weight_baseline_address_resolutions =
+            weight_baseline_address_resolutions;
+        metrics->weight_address_resolutions = weight_address_resolutions;
     }
     return RmdStatus::success;
 }

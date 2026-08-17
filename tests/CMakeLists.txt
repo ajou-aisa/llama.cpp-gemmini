@@ -233,6 +233,7 @@ add_executable(test-gemmini-exsia
 target_link_libraries(test-gemmini-exsia PRIVATE ggml-base ggml-gemmini-utils)
 target_compile_features(test-gemmini-exsia PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-exsia PRIVATE
+    GGML_GEMMINI_TESTING=1
     GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
     GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE}
     GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
@@ -248,7 +249,7 @@ target_include_directories(test-gemmini-exsia PRIVATE
     ../ggml/src/ggml-gemmini/quants/act
     ../ggml/src/ggml-gemmini/quants/act/exsia
     ../ggml/src/ggml-gemmini/quants/common)
-foreach(_case IN ITEMS all baseline dispatch rmd-routes rmd-direct-parity)
+foreach(_case IN ITEMS all baseline dispatch rmd-routes rmd-direct-parity rmd-gather)
     string(REPLACE "-" "_" _case_test_name "${_case}")
     add_test(NAME gemmini_exsia_${_case_test_name}
         COMMAND ${CMAKE_COMMAND}

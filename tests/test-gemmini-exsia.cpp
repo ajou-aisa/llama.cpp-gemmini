@@ -13,10 +13,17 @@
 #endif
 
 #include <cstdio>
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -219,7 +226,12 @@ bool test_rmd_cpu_direct_parity() {
         !check(metrics.baseline_stacked_i_tile_count == expected_i_tiles,
                "RMD executor reports baseline stacked I tiles") ||
         !check(metrics.stacked_i_tile_count <= expected_i_tiles,
-               "RMD lane partition never increases stacked I tiles")) {
+               "RMD lane partition never increases stacked I tiles") ||
+        !check(metrics.weight_values_gathered ==
+                   metrics.weight_baseline_address_resolutions &&
+                   metrics.weight_address_resolutions <
+                       metrics.weight_baseline_address_resolutions,
+               "RMD executor reports reduced production weight addressing")) {
         return false;
     }
     std::printf("RMD stacked schedule: matmul_calls=%zu lane_groups=%zu "
@@ -372,6 +384,383 @@ bool test_rmd_lane_partition() {
                   metrics.stacked_i_tile_count == 3,
               "RMD lane partition halves padded I-by-K tiles");
 }
+
+bool test_rmd_weight_gather() {
+    constexpr size_t logical_k = 65;
+    constexpr size_t columns = 3;
+    constexpr size_t blocks_per_row = 3;
+    std::vector<block_q8_h1> h1(columns * blocks_per_row);
+    for (size_t j = 0; j < columns; ++j) {
+        for (size_t block = 0; block < blocks_per_row; ++block) {
+            for (size_t k = 0; k < QK8_0; ++k) {
+                h1[j * blocks_per_row + block].qs[k] =
+                    static_cast<int8_t>(j * 37 + block * 11 + k - 64);
+            }
+        }
+    }
+
+    ggml_gemmini_args_t args{};
+    args.J = columns;
+    args.K = logical_k;
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1;
+    args.q8_h1_blocks = h1.data();
+    args.q8_h1_block_count = h1.size();
+    args.q8_h1_rows = columns;
+    args.blocks_per_row = blocks_per_row;
+    args.block_size_k = QK8_0;
+
+    const std::array<uint16_t, 3> local_k = { 0, 15, 31 };
+    std::array<int8_t, rmd::kArrayDim * rmd::kArrayDim> tile{};
+    tile.fill(0x55);
+    rmd::RmdExecutionMetrics metrics{};
+    if (!check(rmd::gather_weight_tile_for_test(
+                   args, 1, local_k.data(), local_k.size(), 0, columns,
+                   tile.data(), rmd::kArrayDim, &metrics) == rmd::RmdStatus::success,
+               "native H1 gather succeeds")) {
+        return false;
+    }
+    for (size_t k = 0; k < local_k.size(); ++k) {
+        for (size_t j = 0; j < columns; ++j) {
+            const int8_t expected = h1[j * blocks_per_row + 1].qs[local_k[k]];
+            if (!check(tile[k * rmd::kArrayDim + j] == expected,
+                       "native H1 gather matches scalar layout")) {
+                return false;
+            }
+        }
+    }
+    if (!check(metrics.weight_values_gathered == local_k.size() * columns &&
+               metrics.weight_baseline_address_resolutions == local_k.size() * columns &&
+               metrics.weight_address_resolutions == columns,
+               "native H1 gather reports row-base resolution counts")) {
+        return false;
+    }
+
+    const std::array<std::pair<uint32_t, uint16_t>, 3> h1_boundaries = {
+        std::pair<uint32_t, uint16_t>{0, 31},
+        std::pair<uint32_t, uint16_t>{1, 0},
+        std::pair<uint32_t, uint16_t>{2, 0},
+    };
+    for (const auto & [block_id, block_local_k] : h1_boundaries) {
+        tile.fill(0x55);
+        if (!check(rmd::gather_weight_tile_for_test(
+                       args, block_id, &block_local_k, 1, 0, 1,
+                       tile.data(), rmd::kArrayDim) == rmd::RmdStatus::success &&
+                       tile[0] == h1[block_id].qs[block_local_k],
+                   "native H1 gather preserves K=31/32/64 boundaries")) {
+            return false;
+        }
+    }
+
+    const auto unchanged_tile = tile;
+    const auto unchanged_metrics = metrics;
+    if (!check(rmd::gather_weight_tile_for_test(
+                   args, 3, local_k.data(), local_k.size(), 0, columns,
+                   tile.data(), rmd::kArrayDim, &metrics) == rmd::RmdStatus::execution_failed &&
+               tile == unchanged_tile &&
+               metrics.weight_values_gathered == unchanged_metrics.weight_values_gathered &&
+               metrics.weight_baseline_address_resolutions ==
+                   unchanged_metrics.weight_baseline_address_resolutions &&
+               metrics.weight_address_resolutions == unchanged_metrics.weight_address_resolutions,
+               "failed H1 gather preserves destination and metrics")) {
+        return false;
+    }
+
+    constexpr size_t dense_j = 5;
+    constexpr size_t dense_k = 40;
+    constexpr size_t jxk_stride = dense_k + 7;
+    constexpr size_t kxj_stride = dense_j + 9;
+    std::vector<int8_t> dense_jxk(dense_j * jxk_stride, 0);
+    std::vector<int8_t> dense_kxj(dense_k * kxj_stride, 0);
+    for (size_t j = 0; j < dense_j; ++j) {
+        for (size_t k = 0; k < dense_k; ++k) {
+            const int8_t value = static_cast<int8_t>(j * 17 + k - 63);
+            dense_jxk[j * jxk_stride + k] = value;
+            dense_kxj[k * kxj_stride + j] = value;
+        }
+    }
+    const std::array<uint16_t, 3> dense_local_k = { 0, 3, 7 };
+
+    args = {};
+    args.J = dense_j;
+    args.K = dense_k;
+    args.B = dense_jxk.data();
+    args.sB = jxk_stride;
+    args.transpose_B = true;
+    args.weight_i8_scale_active = true;
+    args.weight_scale = 1.0f;
+    tile.fill(0x55);
+    metrics = {};
+    if (!check(rmd::gather_weight_tile_for_test(
+                   args, 1, dense_local_k.data(), dense_local_k.size(), 1, 3,
+                   tile.data(), rmd::kArrayDim, &metrics) == rmd::RmdStatus::success,
+               "dense JxK gather succeeds")) {
+        return false;
+    }
+    for (size_t k = 0; k < dense_local_k.size(); ++k) {
+        const size_t global_k = QK8_0 + dense_local_k[k];
+        for (size_t col = 0; col < 3; ++col) {
+            if (!check(tile[k * rmd::kArrayDim + col] ==
+                           dense_jxk[(1 + col) * jxk_stride + global_k],
+                       "dense JxK gather preserves padded stride")) {
+                return false;
+            }
+        }
+    }
+    if (!check(metrics.weight_address_resolutions == 3,
+               "dense JxK resolves once per valid column")) {
+        return false;
+    }
+
+    const auto valid_jxk_tile = tile;
+    const auto valid_jxk_metrics = metrics;
+    args.sB = dense_k - 1;
+    if (!check(rmd::gather_weight_tile_for_test(
+                   args, 1, dense_local_k.data(), dense_local_k.size(), 1, 3,
+                   tile.data(), rmd::kArrayDim, &metrics) == rmd::RmdStatus::execution_failed &&
+                   tile == valid_jxk_tile &&
+                   metrics.weight_values_gathered == valid_jxk_metrics.weight_values_gathered &&
+                   metrics.weight_address_resolutions == valid_jxk_metrics.weight_address_resolutions,
+               "invalid dense stride preserves destination and metrics")) {
+        return false;
+    }
+
+    args.B = dense_kxj.data();
+    args.sB = kxj_stride;
+    args.transpose_B = false;
+    tile.fill(0x55);
+    metrics = {};
+    if (!check(rmd::gather_weight_tile_for_test(
+                   args, 1, dense_local_k.data(), dense_local_k.size(), 1, 3,
+                   tile.data(), rmd::kArrayDim, &metrics) == rmd::RmdStatus::success,
+               "dense KxJ gather succeeds")) {
+        return false;
+    }
+    for (size_t k = 0; k < dense_local_k.size(); ++k) {
+        const size_t global_k = QK8_0 + dense_local_k[k];
+        for (size_t col = 0; col < 3; ++col) {
+            if (!check(tile[k * rmd::kArrayDim + col] ==
+                           dense_kxj[global_k * kxj_stride + 1 + col],
+                       "dense KxJ gather preserves padded stride")) {
+                return false;
+            }
+        }
+    }
+    return check(metrics.weight_values_gathered == dense_local_k.size() * 3 &&
+                 metrics.weight_baseline_address_resolutions == dense_local_k.size() * 3 &&
+                 metrics.weight_address_resolutions == dense_local_k.size(),
+                 "dense KxJ resolves once per valid K row");
+}
+
+struct GatherBenchResult {
+    std::string layout;
+    size_t iterations = 0;
+    uint64_t scalar_checksum = 0;
+    uint64_t candidate_checksum = 0;
+    double scalar_median_ns_per_tile = 0.0;
+    double candidate_median_ns_per_tile = 0.0;
+    double candidate_ratio = 0.0;
+    double min_batch_ms = 0.0;
+    size_t baseline_resolutions_per_tile = 0;
+    size_t candidate_resolutions_per_tile = 0;
+    bool checksum_match = false;
+};
+
+double median(std::vector<double> values) {
+    std::sort(values.begin(), values.end());
+    return values[values.size() / 2];
+}
+
+GatherBenchResult benchmark_gather_layout(const std::string & layout,
+                                          const ggml_gemmini_args_t & args,
+                                          uint32_t block_count,
+                                          const std::array<uint16_t, 10> & local_k) {
+    using Clock = std::chrono::steady_clock;
+    constexpr double minimum_batch_ns = 100000000.0;
+    auto run = [&](bool scalar, size_t iterations, uint64_t & checksum,
+                   rmd::RmdExecutionMetrics & metrics) {
+        const auto start = Clock::now();
+        const rmd::RmdStatus status = scalar
+            ? rmd::repeat_scalar_weight_tile_gather_for_test(
+                  args, block_count, local_k.data(), local_k.size(), 0, args.J,
+                  iterations, checksum)
+            : rmd::repeat_weight_tile_gather_for_test(
+                  args, block_count, local_k.data(), local_k.size(), 0, args.J,
+                  iterations, checksum, metrics);
+        const auto stop = Clock::now();
+        if (status != rmd::RmdStatus::success) {
+            return -1.0;
+        }
+        return std::chrono::duration<double, std::nano>(stop - start).count();
+    };
+
+    size_t iterations = 1024;
+    for (;;) {
+        uint64_t scalar_checksum = 0;
+        uint64_t candidate_checksum = 0;
+        rmd::RmdExecutionMetrics metrics{};
+        const double scalar_ns = run(true, iterations, scalar_checksum, metrics);
+        const double candidate_ns = run(false, iterations, candidate_checksum, metrics);
+        if (scalar_ns >= minimum_batch_ns && candidate_ns >= minimum_batch_ns) {
+            break;
+        }
+        iterations *= 2;
+    }
+
+    std::vector<double> scalar_batches;
+    std::vector<double> candidate_batches;
+    uint64_t scalar_checksum = 0;
+    uint64_t candidate_checksum = 0;
+    rmd::RmdExecutionMetrics candidate_metrics{};
+    for (size_t batch = 0; batch < 7; ++batch) {
+        uint64_t batch_scalar_checksum = 0;
+        uint64_t batch_candidate_checksum = 0;
+        rmd::RmdExecutionMetrics batch_metrics{};
+        const double scalar_ns = run(true, iterations, batch_scalar_checksum, batch_metrics);
+        const double candidate_ns = run(false, iterations, batch_candidate_checksum, batch_metrics);
+        scalar_batches.push_back(scalar_ns);
+        candidate_batches.push_back(candidate_ns);
+        scalar_checksum = batch_scalar_checksum;
+        candidate_checksum = batch_candidate_checksum;
+        candidate_metrics = batch_metrics;
+    }
+
+    const double tiles_per_batch = static_cast<double>(iterations) * block_count;
+    const double scalar_median = median(scalar_batches) / tiles_per_batch;
+    const double candidate_median = median(candidate_batches) / tiles_per_batch;
+    GatherBenchResult result;
+    result.layout = layout;
+    result.iterations = iterations;
+    result.scalar_checksum = scalar_checksum;
+    result.candidate_checksum = candidate_checksum;
+    result.scalar_median_ns_per_tile = scalar_median;
+    result.candidate_median_ns_per_tile = candidate_median;
+    result.candidate_ratio = candidate_median / scalar_median;
+    result.min_batch_ms = std::min(*std::min_element(scalar_batches.begin(), scalar_batches.end()),
+                                   *std::min_element(candidate_batches.begin(), candidate_batches.end())) /
+        1000000.0;
+    result.baseline_resolutions_per_tile =
+        candidate_metrics.weight_baseline_address_resolutions /
+        (iterations * block_count);
+    result.candidate_resolutions_per_tile =
+        candidate_metrics.weight_address_resolutions /
+        (iterations * block_count);
+    result.checksum_match = scalar_checksum == candidate_checksum;
+    return result;
+}
+
+bool run_rmd_gather_benchmark(const std::filesystem::path & json_path,
+                              double max_h1_ratio) {
+    constexpr size_t columns = 16;
+    constexpr size_t logical_k = 64;
+    constexpr uint32_t block_count = 2;
+    constexpr std::array<uint16_t, 10> local_k = { 0, 3, 7, 9, 12, 16, 21, 24, 27, 31 };
+
+    std::vector<block_q8_h1> h1(columns * block_count);
+    for (size_t j = 0; j < columns; ++j) {
+        for (size_t block = 0; block < block_count; ++block) {
+            for (size_t k = 0; k < QK8_0; ++k) {
+                h1[j * block_count + block].qs[k] =
+                    static_cast<int8_t>(j * 19 + block * 7 + k - 96);
+            }
+        }
+    }
+    ggml_gemmini_args_t args{};
+    args.J = columns;
+    args.K = logical_k;
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1;
+    args.q8_h1_blocks = h1.data();
+    args.q8_h1_block_count = h1.size();
+    args.q8_h1_rows = columns;
+    args.blocks_per_row = block_count;
+    args.block_size_k = QK8_0;
+
+    std::vector<GatherBenchResult> results;
+    results.push_back(benchmark_gather_layout("q8_h1", args, block_count, local_k));
+
+    constexpr size_t jxk_stride = logical_k + 7;
+    constexpr size_t kxj_stride = columns + 9;
+    std::vector<int8_t> dense_jxk(columns * jxk_stride, 0);
+    std::vector<int8_t> dense_kxj(logical_k * kxj_stride, 0);
+    for (size_t j = 0; j < columns; ++j) {
+        for (size_t k = 0; k < logical_k; ++k) {
+            const int8_t value = static_cast<int8_t>(j * 19 + k - 96);
+            dense_jxk[j * jxk_stride + k] = value;
+            dense_kxj[k * kxj_stride + j] = value;
+        }
+    }
+    args = {};
+    args.J = columns;
+    args.K = logical_k;
+    args.B = dense_jxk.data();
+    args.sB = jxk_stride;
+    args.transpose_B = true;
+    args.weight_i8_scale_active = true;
+    args.weight_scale = 1.0f;
+    results.push_back(benchmark_gather_layout("dense_jxk", args, block_count, local_k));
+    args.B = dense_kxj.data();
+    args.sB = kxj_stride;
+    args.transpose_B = false;
+    results.push_back(benchmark_gather_layout("dense_kxj", args, block_count, local_k));
+
+    size_t baseline_resolutions = 0;
+    size_t candidate_resolutions = 0;
+    bool checksums_match = true;
+    bool batches_long_enough = true;
+    for (const GatherBenchResult & result : results) {
+        baseline_resolutions += result.baseline_resolutions_per_tile;
+        candidate_resolutions += result.candidate_resolutions_per_tile;
+        checksums_match = checksums_match && result.checksum_match;
+        batches_long_enough = batches_long_enough && result.min_batch_ms >= 100.0;
+    }
+    const double address_reduction = 1.0 -
+        static_cast<double>(candidate_resolutions) / baseline_resolutions;
+    const bool passed = checksums_match && batches_long_enough &&
+        results.front().candidate_ratio <= max_h1_ratio && address_reduction >= 0.70;
+
+    std::ostringstream json;
+    json << std::fixed << std::setprecision(3)
+         << "{\n  \"record_type\": \"RMD_GATHER_BENCHMARK\",\n"
+         << "  \"fixture\": {\"selected_k_per_block\": 10, \"j\": 16, \"block_count\": 2},\n"
+         << "  \"max_h1_ratio\": " << max_h1_ratio << ",\n"
+         << "  \"address_reduction\": " << address_reduction << ",\n"
+         << "  \"checksums_match\": " << (checksums_match ? "true" : "false") << ",\n"
+         << "  \"batches_long_enough\": " << (batches_long_enough ? "true" : "false") << ",\n"
+         << "  \"passed\": " << (passed ? "true" : "false") << ",\n"
+         << "  \"failed_field\": \""
+         << (!checksums_match ? "checksum" : !batches_long_enough ? "batch_duration" :
+             results.front().candidate_ratio > max_h1_ratio ? "h1_ratio" :
+             address_reduction < 0.70 ? "address_reduction" : "") << "\",\n"
+         << "  \"layouts\": [\n";
+    for (size_t i = 0; i < results.size(); ++i) {
+        const GatherBenchResult & result = results[i];
+        json << "    {\"layout\": \"" << result.layout
+             << "\", \"iterations\": " << result.iterations
+             << ", \"scalar_checksum\": " << result.scalar_checksum
+             << ", \"candidate_checksum\": " << result.candidate_checksum
+             << ", \"checksum_match\": " << (result.checksum_match ? "true" : "false")
+             << ", \"scalar_median_ns_per_tile\": " << result.scalar_median_ns_per_tile
+             << ", \"candidate_median_ns_per_tile\": " << result.candidate_median_ns_per_tile
+             << ", \"candidate_ratio\": " << result.candidate_ratio
+             << ", \"min_batch_ms\": " << result.min_batch_ms
+             << ", \"baseline_address_resolutions_per_tile\": "
+             << result.baseline_resolutions_per_tile
+             << ", \"candidate_address_resolutions_per_tile\": "
+             << result.candidate_resolutions_per_tile << "}"
+             << (i + 1 == results.size() ? "\n" : ",\n");
+    }
+    json << "  ]\n}\n";
+
+    if (!json_path.empty()) {
+        std::ofstream output(json_path);
+        if (!output) {
+            std::fprintf(stderr, "failed to open benchmark JSON: %s\n", json_path.c_str());
+            return false;
+        }
+        output << json.str();
+    }
+    std::printf("%s", json.str().c_str());
+    return passed;
+}
 #endif
 
 bool profile_output_routing(const std::filesystem::path & expected, bool invalid_parent) {
@@ -420,6 +809,28 @@ int main(int argc, char ** argv) {
 #ifdef GEMMINI_EXSIA_WRITER_TEST_ONLY
     return 1;
 #else
+    if (argc >= 2 && std::string(argv[1]) == "--bench-rmd-gather") {
+        std::filesystem::path json_path;
+        double max_h1_ratio = 0.80;
+        for (int i = 2; i < argc; ++i) {
+            if (std::string(argv[i]) == "--json" && i + 1 < argc) {
+                json_path = argv[++i];
+            } else if (std::string(argv[i]) == "--max-h1-ratio" && i + 1 < argc) {
+                char * end = nullptr;
+                max_h1_ratio = std::strtod(argv[++i], &end);
+                if (end == argv[i] || *end != '\0') {
+                    return 2;
+                }
+            } else {
+                std::fprintf(stderr,
+                             "usage: %s --bench-rmd-gather [--json path] [--max-h1-ratio value]\n",
+                             argv[0]);
+                return 2;
+            }
+        }
+        return run_rmd_gather_benchmark(json_path, max_h1_ratio) ? 0 : 1;
+    }
+
     std::string case_name = "all";
     if (argc == 2 && std::string(argv[1]).rfind("--case=", 0) == 0) {
         case_name = std::string(argv[1]).substr(7);
@@ -432,7 +843,7 @@ int main(int argc, char ** argv) {
 
     const bool known = case_name == "all" || case_name == "baseline" ||
         case_name == "dispatch" || case_name == "rmd-routes" ||
-        case_name == "rmd-direct-parity";
+        case_name == "rmd-direct-parity" || case_name == "rmd-gather";
     if (!known) {
         std::fprintf(stderr, "unknown case: %s\n", case_name.c_str());
         return 2;
@@ -442,12 +853,13 @@ int main(int argc, char ** argv) {
     const bool ok =
         (case_name == "all" && test_exsia_baseline() && test_dispatch_modes() &&
          test_rmd_cpu_ws_routes() && test_rmd_cpu_direct_parity() &&
-         test_rmd_lane_partition()) ||
+         test_rmd_lane_partition() && test_rmd_weight_gather()) ||
         (case_name == "baseline" && test_exsia_baseline()) ||
         (case_name == "dispatch" && test_dispatch_modes()) ||
         (case_name == "rmd-routes" && test_rmd_cpu_ws_routes()) ||
         (case_name == "rmd-direct-parity" && test_rmd_cpu_direct_parity() &&
-         test_rmd_lane_partition());
+         test_rmd_lane_partition()) ||
+        (case_name == "rmd-gather" && test_rmd_weight_gather());
     if (ok)
         std::printf("PASS: case=%s\n", case_name.c_str());
     return ok ? 0 : 1;

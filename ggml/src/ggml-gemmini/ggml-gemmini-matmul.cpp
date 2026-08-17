@@ -607,6 +607,10 @@ std::string pipeline_stripe_summary_json(const char * layer,
         << ",\"block_padding_zeros\":" << profile.rmd.block_padding_zeros
         << ",\"row_padding_zeros\":" << profile.rmd.row_padding_zeros
         << ",\"j_padding_zeros\":" << profile.rmd.j_padding_zeros
+        << ",\"weight_values_gathered\":" << profile.rmd.weight_values_gathered
+        << ",\"weight_baseline_address_resolutions\":"
+        << profile.rmd.weight_baseline_address_resolutions
+        << ",\"weight_address_resolutions\":" << profile.rmd.weight_address_resolutions
         << "}}";
     return out.str();
 
