@@ -82,7 +82,6 @@ std::string hash_canonical_residuals(std::vector<CanonicalResidual> events) {
 }
 }
 
-#ifndef GGML_GEMMINI_PIPELINE_WRITER_TEST_ONLY
 std::string rmd_input_hash(const residual::DirectStripePayload & payload) {
     std::vector<CanonicalResidual> events;
     events.reserve(payload.events.size());
@@ -119,6 +118,7 @@ std::string rmd_input_hash(const rmd::StripePacket & packet) {
     return hash_canonical_residuals(std::move(events));
 }
 
+#ifndef GGML_GEMMINI_PIPELINE_WRITER_TEST_ONLY
 std::string rmd_correction_hash(const std::vector<rmd::OutputValue> & correction) {
     ProofHash64 hash;
     for (const rmd::OutputValue value : correction) hash.u64(static_cast<uint64_t>(value));
@@ -216,6 +216,9 @@ RmdTelemetryCheckResult compare_rmd_telemetry_proofs(
             return {RmdTelemetryCheckCode::input_hash_mismatch, "input hashes differ"};
         if (a.correction_hash != b.correction_hash)
             return {RmdTelemetryCheckCode::correction_hash_mismatch, "correction hashes differ"};
+        if (a.correction_nonzero_count != b.correction_nonzero_count)
+            return {RmdTelemetryCheckCode::correction_nonzero_count_mismatch,
+                    "correction nonzero counts differ"};
         if (a.output_hash != b.output_hash)
             return {RmdTelemetryCheckCode::output_hash_mismatch, "output hashes differ"};
     }
@@ -271,7 +274,8 @@ RmdTelemetryRecord make_rmd_telemetry_record(
              profile.telemetry_merge_end, profile.telemetry_residual_end},
             profile.telemetry_input_hash,
             profile.telemetry_correction_hash,
-            profile.telemetry_output_hash});
+            profile.telemetry_output_hash,
+            profile.telemetry_correction_nonzero_count});
 #endif
     }
     record.work = backend == RmdBackend::cpu_direct
@@ -328,6 +332,7 @@ std::string serialize_rmd_telemetry(const RmdTelemetryRecord & record) {
             << ",\"residual_end\":" << stripe.ordered_ticks[7] << '}'
             << ",\"input_hash\":"; telemetry_json_string(out, stripe.input_hash);
         out << ",\"correction_hash\":"; telemetry_json_string(out, stripe.correction_hash);
+        out << ",\"correction_nonzero_count\":" << stripe.correction_nonzero_count;
         out << ",\"output_hash\":"; telemetry_json_string(out, stripe.output_hash); out << '}';
     }
     out << ']';
@@ -2583,6 +2588,9 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
             job.metrics_.telemetry_merge_end = cycle::read();
             job.metrics_.telemetry_residual_end = job.metrics_.telemetry_merge_end;
 #endif
+            job.metrics_.telemetry_correction_nonzero_count = static_cast<uint64_t>(std::count_if(
+                job.rmd_correction_.begin(), job.rmd_correction_.end(),
+                [](rmd::OutputValue value) { return value != 0; }));
 #if CYCLE_DETAIL
             job.metrics_.telemetry_input_hash = job.direct_residual_ != nullptr
                 ? rmd_input_hash(*job.direct_residual_) : rmd_input_hash(*job.rmd_packet_);

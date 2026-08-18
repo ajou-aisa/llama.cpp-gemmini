@@ -43,7 +43,7 @@ run options:
   --run-id ID           safe result identifier (default: UTC timestamp)
   --expected-bundle-id SHA256
                          bundle ID printed by prepare (required)
-  --runs-per-backend N  CPU and NPU runs each (default: 5)
+  --runs-per-backend N  CPU and NPU runs each (default: 1)
   --prompt TEXT         identical prompt for every run
 
 After prepare, launch FireSim normally. Inside the guest run:
@@ -116,6 +116,7 @@ prepare_manager() {
     local update_rootfs
     local compiler
     local libgomp
+    local gemmini_header
     local cache
     local bundle_id
     local caller_directory
@@ -195,8 +196,10 @@ prepare_manager() {
     export CXXFLAGS='-DERROR_COMPENSATION=1 -Dgemmini_set_tile_ws=gemmini_set_tile'
     (
         cd -- "$workspace"
-        ./build-riscv.sh -DLLAMA_BUILD_TESTS=OFF
+        ./build-riscv.sh -DLLAMA_BUILD_TESTS=ON
     )
+    cmake --build "$build_dir" --target test-gemmini-exsia -j
+    [[ -x $build_dir/bin/test-gemmini-exsia ]] || die 'build did not produce test-gemmini-exsia'
 
     cache="$build_dir/CMakeCache.txt"
     [[ -x $build_dir/bin/llama-cli ]] || die 'build did not produce llama-cli'
@@ -214,6 +217,13 @@ prepare_manager() {
     cache_has "$cache" CYCLE_DETAIL 'ON|1|TRUE' ||
         die 'build cache does not enable cycle detail'
 
+    gemmini_header=
+    for candidate in "$GEM_HOME/gemmini.h" "$GEM_HOME/include/gemmini.h" \
+        "$GEM_HOME/gemmini-rocc-tests/include/gemmini.h" \
+        "$GEM_HOME/software/gemmini.h"; do
+        if [[ -f $candidate ]]; then gemmini_header=$candidate; break; fi
+    done
+    [[ -n $gemmini_header ]] || die 'could not resolve gemmini.h from GEM_HOME candidates'
     libgomp=$("$compiler" -print-file-name=libgomp.so.1)
     [[ $libgomp != libgomp.so.1 && -f $libgomp ]] ||
         die 'RISC-V compiler could not resolve libgomp.so.1'
@@ -221,6 +231,13 @@ prepare_manager() {
 
     {
         printf 'git_sha=%s\n' "$(git -C "$workspace" rev-parse HEAD 2>/dev/null || printf unknown)"
+        printf 'source_head=%s\n' "$(git -C "$workspace" rev-parse HEAD 2>/dev/null || printf unknown)"
+        printf 'source_head_tree=%s\n' "$(git -C "$workspace" rev-parse HEAD^{tree} 2>/dev/null || printf unknown)"
+        printf 'source_worktree_status=%s\n' "$(git -C "$workspace" status --porcelain=v1 2>/dev/null | tr '\n' ';')"
+        printf 'source_worktree_diff_sha256=%s\n' "$(git -C "$workspace" diff --binary HEAD 2>/dev/null | sha256sum | awk '{print $1}')"
+        printf 'gemmini_header_path=%s\n' "$gemmini_header"
+        printf 'gemmini_header_sha256=%s\n' "$(hash_value "$gemmini_header")"
+        printf 'rmd_routes_test_sha256=%s\n' "$(hash_value "$build_dir/bin/test-gemmini-exsia")"
         printf 'binary_sha256=%s\n' "$(hash_value "$build_dir/bin/llama-cli")"
         printf 'gemmini_library_sha256=%s\n' \
             "$(hash_value "$build_dir/bin/libggml-gemmini.so")"
@@ -311,7 +328,7 @@ run_guest() {
     local output_root=/root/output
     local run_id
     local expected_bundle_id=
-    local runs_per_backend=5
+    local runs_per_backend=1
     local prompt='The quick brown fox jumps over the lazy dog.'
     local build_dir
     local binary
@@ -327,6 +344,8 @@ run_guest() {
     local library_hash
     local libgomp_hash
     local cache_hash
+    local source_head source_head_tree source_worktree_status source_worktree_diff_hash
+    local gemmini_header_path gemmini_header_hash routes_test_hash
     local recomputed_bundle_id
     local cpu_count=0
     local npu_count=0
@@ -342,6 +361,7 @@ run_guest() {
     local item
     local stdout_reference=
     local proof_reference=
+    local route_test_status=0
 
     run_id=$(date -u +%Y%m%d-%H%M%S)
     while (($# > 0)); do
@@ -430,6 +450,14 @@ run_guest() {
     library_hash=$(hash_value "$build_dir/bin/libggml-gemmini.so")
     libgomp_hash=$(hash_value "$build_dir/bin/libgomp.so.1")
     cache_hash=$(hash_value "$cache")
+    source_head=$(manifest_value "$build_manifest" source_head)
+    source_head_tree=$(manifest_value "$build_manifest" source_head_tree)
+    source_worktree_status=$(manifest_value "$build_manifest" source_worktree_status)
+    source_worktree_diff_hash=$(manifest_value "$build_manifest" source_worktree_diff_sha256)
+    gemmini_header_path=$(manifest_value "$build_manifest" gemmini_header_path)
+    gemmini_header_hash=$(manifest_value "$build_manifest" gemmini_header_sha256)
+    routes_test_hash=$(manifest_value "$build_manifest" rmd_routes_test_sha256)
+    [[ -n $source_head && -n $source_head_tree && -n $source_worktree_diff_hash && -n $gemmini_header_path && -n $gemmini_header_hash && -n $routes_test_hash ]] || die 'build manifest lacks full runtime identity'
     [[ $(manifest_value "$build_manifest" bundle_id) == "$expected_bundle_id" ]] ||
         die 'guest rootfs bundle ID does not match prepare output'
     recomputed_bundle_id=$(manifest_payload_hash "$build_manifest")
@@ -453,6 +481,30 @@ run_guest() {
     mkdir -- "$run_dir"
     mkdir -- "$run_dir/cpu" "$run_dir/npu"
     cp -- "$build_manifest" "$run_dir/experiment-build-manifest.txt"
+    cp -- "$build_dir/bin/test-gemmini-exsia" "$run_dir/test-gemmini-exsia"
+    cp -- "$gemmini_header_path" "$run_dir/gemmini.h"
+    mkdir -- "$run_dir/rmd-routes-test"
+    route_test_command=("$build_dir/bin/test-gemmini-exsia" --case=rmd-routes)
+    printf 'LD_LIBRARY_PATH=%s\n' "$build_dir/bin" >"$run_dir/rmd-routes-test/environment.txt"
+    printf -v route_test_command_escaped '%q ' "${route_test_command[@]}"
+    printf 'LD_LIBRARY_PATH=%q %s\n' "$build_dir/bin" "${route_test_command_escaped% }" >"$run_dir/rmd-routes-test/command.txt"
+    set +e
+    (cd -- "$build_dir" && LD_LIBRARY_PATH="$build_dir/bin" "${route_test_command[@]}") \
+        >"$run_dir/rmd-routes-test/stdout.txt" 2>"$run_dir/rmd-routes-test/stderr.txt"
+    route_test_status=$?
+    set -e
+    printf '%s\n' "$route_test_status" >"$run_dir/rmd-routes-test/exit-status.txt"
+    if ((route_test_status == 0)); then
+        grep -Eq '^RMD_STAGE ' "$run_dir/rmd-routes-test/stdout.txt" &&
+            grep -F --quiet 'RMD_ORACLE ' "$run_dir/rmd-routes-test/stdout.txt" &&
+            grep -F --quiet 'RMD_ORACLE direct' "$run_dir/rmd-routes-test/stdout.txt" &&
+            grep -F --quiet 'RMD_ORACLE radix' "$run_dir/rmd-routes-test/stdout.txt" &&
+            grep -F --quiet 'RMD_ORACLE packet-scalar' "$run_dir/rmd-routes-test/stdout.txt" &&
+            grep -F --quiet 'RMD_ORACLE WS' "$run_dir/rmd-routes-test/stdout.txt" &&
+            grep -F --quiet 'PASS: case=rmd-routes' "$run_dir/rmd-routes-test/stdout.txt" ||
+            route_test_status=1
+    fi
+    printf '%s\n' "$route_test_status" >"$run_dir/rmd-routes-test/validated-status.txt"
     : >"$run_dir/run-order.txt"
 
     temp_root=$(mktemp -d "${TMPDIR:-/tmp}/gemmini-rmd-cpu-npu.XXXXXX")
@@ -508,24 +560,23 @@ run_guest() {
                        $line =~ \"direct_calls\":[1-9][0-9]* &&
                        $line == *'"packet_calls":0'* &&
                        $line == *'"ws_calls":0'* &&
-                       $line == *'"packet_count":0'* ]] || return 1
+                       $line == *'"packet_count":0'* &&
+                       $line =~ \"correction_nonzero_count\":[1-9][0-9]* &&
+                       $line =~ \"residual_total\":[1-9][0-9]* ]] || return 1
                 else
                     [[ $line == *'"backend":"gemmini_ws_compact"'* &&
                        $line == *'"direct_events":0'* &&
                        $line == *'"direct_calls":0'* &&
                        $line =~ \"packet_calls\":[1-9][0-9]* &&
                        $line =~ \"ws_calls\":[1-9][0-9]* &&
-                       $line =~ \"packet_count\":[1-9][0-9]* ]] || return 1
+                       $line =~ \"packet_count\":[1-9][0-9]* &&
+                       $line =~ \"correction_nonzero_count\":[1-9][0-9]* &&
+                       $line =~ \"residual_total\":[1-9][0-9]* ]] || return 1
                 fi
             elif [[ $line == *'"record_type":"PIPELINE_STRIPE_SUMMARY"'* ]]; then
                 pipeline_records=$((pipeline_records + 1))
-                if [[ $variant == cpu ]]; then
-                    [[ $line == *'"backend_route":"cpu"'* &&
-                       $line == *'"schedule":"matmul-then-rmd"'* ]] || return 1
-                else
-                    [[ $line == *'"backend_route":"gemmini_ws"'* &&
-                       $line == *'"schedule":"matmul-rmd-overlap"'* ]] || return 1
-                fi
+                [[ $line == *'"backend_route":"gemmini_ws"'* &&
+                   $line == *'"schedule":"matmul-rmd-overlap"'* ]] || return 1
             fi
         done <"$debug_log"
         ((telemetry_records > 0 && pipeline_records > 0))
@@ -633,6 +684,7 @@ run_guest() {
         fi
     }
 
+    if ((route_test_status == 0)); then
     while ((cpu_count < runs_per_backend || npu_count < runs_per_backend)); do
         for label in cpu npu npu cpu; do
             if [[ $label == cpu ]]; then
@@ -653,6 +705,10 @@ run_guest() {
             run_variant "$label" "$backend" "$run_number"
         done
     done
+    else
+        first_failure=$route_test_status
+        validation_status=invalid_rmd_routes_test
+    fi
 
     if ((first_failure == 0 && artifact_copy_failed == 0)) &&
         [[ $validation_status == valid ]]; then
@@ -690,7 +746,14 @@ run_guest() {
         printf 'libgomp_sha256=%s\n' "$libgomp_hash"
         printf 'cmake_cache_sha256=%s\n' "$cache_hash"
         printf 'expected_bundle_id=%s\n' "$expected_bundle_id"
-        printf 'git_sha=%s\n' "$(git -C "$workspace" rev-parse HEAD 2>/dev/null || printf unknown)"
+        printf 'source_head=%s\n' "$source_head"
+        printf 'source_head_tree=%s\n' "$source_head_tree"
+        printf 'source_worktree_status=%s\n' "$source_worktree_status"
+        printf 'source_worktree_diff_sha256=%s\n' "$source_worktree_diff_hash"
+        printf 'gemmini_header_path=%s\n' "$gemmini_header_path"
+        printf 'gemmini_header_sha256=%s\n' "$gemmini_header_hash"
+        printf 'rmd_routes_test_sha256=%s\n' "$routes_test_hash"
+        printf 'git_sha=%s\n' "$source_head"
         printf 'cpu_selector=CPU\n'
         printf 'npu_selector=WS\n'
         printf 'main_gemmini_option=WS\n'
@@ -698,6 +761,7 @@ run_guest() {
         printf 'schedule=ABBA\n'
         printf 'cpu_runs=%s\n' "$cpu_count"
         printf 'npu_runs=%s\n' "$npu_count"
+        printf 'rmd_routes_test_status=%s\n' "$route_test_status"
         printf 'first_failure=%s\n' "$first_failure"
         printf 'artifact_copy_failed=%s\n' "$artifact_copy_failed"
         printf 'validation_status=%s\n' "$validation_status"
@@ -719,6 +783,7 @@ run_guest() {
     printf 'archive=%s\n' "$archive"
     printf 'cpu_runs=%s\n' "$cpu_count"
     printf 'npu_runs=%s\n' "$npu_count"
+    printf 'rmd_routes_test_status=%s\n' "$route_test_status"
     printf 'comparison_status=%s\n' "$comparison_status"
     if ((first_failure != 0)); then
         exit "$first_failure"

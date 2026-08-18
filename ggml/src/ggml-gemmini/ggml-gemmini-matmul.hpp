@@ -245,6 +245,7 @@ struct MatmulJobMetrics {
     uint64_t telemetry_residual_end = 0;
     std::string telemetry_input_hash;
     std::string telemetry_correction_hash;
+    uint64_t telemetry_correction_nonzero_count = 0;
     std::string telemetry_output_hash;
 };
 
@@ -424,6 +425,7 @@ struct RmdTelemetryStripe {
     std::string input_hash;
     std::string correction_hash;
     std::string output_hash;
+    uint64_t correction_nonzero_count = 0;
 };
 
 struct RmdTelemetryRecord {
@@ -455,6 +457,7 @@ enum class RmdTelemetryCheckCode : uint8_t {
     missing_detail,
     input_hash_mismatch,
     correction_hash_mismatch,
+    correction_nonzero_count_mismatch,
     output_hash_mismatch,
 };
 

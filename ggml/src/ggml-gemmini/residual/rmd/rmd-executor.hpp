@@ -39,6 +39,23 @@ private:
     size_t submitted_ = 0;
 };
 
+#if defined(GGML_GEMMINI_TESTING)
+struct WsCallObservation {
+    size_t rows = 0;
+    size_t cols = 0;
+    size_t k = 0;
+    uint8_t lane_id = 0;
+    int8_t first_activation = 0;
+    int8_t first_weight = 0;
+    int64_t raw_value = 0;
+    size_t raw_nonzero_count = 0;
+    uint64_t block_scale = 0;
+    int64_t scaled_value = 0;
+    int64_t compressed_value = 0;
+    int64_t composed_value = 0;
+};
+#endif
+
 struct RmdExecutionMetrics {
     size_t direct_event_count = 0;
     size_t direct_call_count = 0;
@@ -61,6 +78,10 @@ struct RmdExecutionMetrics {
     size_t weight_values_gathered = 0;
     size_t weight_baseline_address_resolutions = 0;
     size_t weight_address_resolutions = 0;
+#if defined(GGML_GEMMINI_TESTING)
+    std::vector<WsCallObservation> ws_observations;
+    std::vector<int64_t> raw_lane_values;
+#endif
 };
 
 void collect_packet_metrics(const StripePacket & packet, RmdExecutionMetrics & metrics);

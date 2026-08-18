@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <numeric>
 #include <new>
 #include <utility>
 
@@ -654,6 +655,8 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
 
             for (const LaneGroup & group : groups) {
                 const size_t k_tiles = group.padded_k_count / kArrayDim;
+                size_t last_k_base = 0;
+                size_t last_valid_k = 0;
                 const size_t stacked_rows = group.lane_positions.size() * block.rows_padded;
                 const size_t stacked_value_count = stacked_rows * kArrayDim;
                 std::fill_n(stacked_values.begin(), stacked_value_count, OutputValue{0});
@@ -665,6 +668,8 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                     if (valid_k == 0) {
                         continue;
                     }
+                    last_k_base = k_base;
+                    last_valid_k = valid_k;
                     ++matmul_call_count;
                     stacked_i_tile_count += stacked_rows / kArrayDim;
                     std::array<uint16_t, kArrayDim> local_k{};
@@ -727,6 +732,32 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
 #endif
                 }
 
+#if defined(GGML_GEMMINI_TESTING)
+                WsCallObservation observation{};
+                if constexpr (Backend == CompactExecutorBackend::gemmini_ws) {
+                    observation.rows = stacked_rows;
+                    observation.cols = valid_cols;
+                    observation.k = group.compact_positions.size();
+                    observation.lane_id = block.lane_ids[group.lane_positions.front()];
+                    observation.first_activation = group.activation.front();
+                    observation.first_weight = weight_tile.front();
+                    observation.raw_value = stacked_values.front();
+                if (metrics != nullptr) {
+                    for (size_t group_lane = 0; group_lane < group.lane_positions.size(); ++group_lane) {
+                        metrics->raw_lane_values.push_back(
+                            stacked_values[group_lane * block.rows_padded * kArrayDim]);
+                    }
+                }
+                for (size_t row = 0; row < stacked_rows; ++row) {
+                    for (size_t col = 0; col < valid_cols; ++col) {
+                        if (stacked_values[row * kArrayDim + col] != 0) {
+                            ++observation.raw_nonzero_count;
+                        }
+                    }
+                }
+                observation.block_scale = block_scales.front();
+                }
+#endif
                 // Block integer scale is applied exactly once after all compact K tiles.
                 for (size_t row = 0; row < stacked_rows; ++row) {
                     OutputValue * accumulator = stacked_values.data() + row * kArrayDim;
@@ -741,6 +772,17 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                     }
                 }
 
+#if defined(GGML_GEMMINI_TESTING)
+                if constexpr (Backend == CompactExecutorBackend::gemmini_ws) {
+                    observation.scaled_value = stacked_values.front();
+                    observation.compressed_value = observation.scaled_value;
+                    observation.composed_value = observation.scaled_value *
+                        (int64_t{1} << (8 * observation.lane_id));
+                    if (metrics != nullptr) {
+                        metrics->ws_observations.push_back(observation);
+                    }
+                }
+#endif
                 for (size_t group_lane = 0;
                      group_lane < group.lane_positions.size(); ++group_lane) {
                     const uint8_t lane_position = group.lane_positions[group_lane];

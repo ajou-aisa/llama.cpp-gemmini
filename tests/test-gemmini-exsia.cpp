@@ -106,15 +106,21 @@ bool test_rmd_cpu_ws_routes() {
     }
 
     rmd::CompressedOutput cpu_output;
+    rmd::RmdExecutionMetrics route_metrics{};
     args.tiled_matmul_type = OS;
     const rmd::RmdStatus cpu =
-        rmd::execute_rmd_stripe_reference(args, *packet, cpu_output);
-    if (!check(cpu == rmd::RmdStatus::success && !cpu_output.values.empty() &&
-               cpu_output.values.front() == 4,
+        rmd::execute_rmd_stripe_reference(args, *packet, cpu_output, &route_metrics);
+    std::vector<rmd::ReferenceResidual> route_events = {{0, 0, 256}};
+    std::vector<rmd::OutputValue> route_direct, route_packet;
+    const auto route_direct_status = rmd::reference_direct_correction(args, 1, route_events, route_direct);
+    const auto route_packet_status = rmd::compose_rmd_output(*packet, cpu_output, route_packet);
+    if (!check(cpu == rmd::RmdStatus::success && route_direct_status == rmd::RmdStatus::success &&
+               route_packet_status == rmd::RmdStatus::success &&
+               route_direct == std::vector<rmd::OutputValue>{1024} &&
+               route_direct == route_packet && !cpu_output.values.empty() && cpu_output.values.front() == 4,
                "RMD reference API ignores the runtime matmul route")) {
         return false;
     }
-
     const rmd::StripePacket packet_before = *packet;
     rmd::CompressedOutput output;
     output.j_padded = 7;
@@ -129,15 +135,91 @@ bool test_rmd_cpu_ws_routes() {
                "explicit RMD WS validates packets before host rejection")) {
         return false;
     }
-    const rmd::RmdStatus ws = rmd::execute_rmd_stripe_ws(args, *packet, output);
+    rmd::RmdExecutionMetrics ws_metrics{};
+    const rmd::RmdStatus ws = rmd::execute_rmd_stripe_ws(args, *packet, output,
+                                                         &ws_metrics);
 #if defined(__riscv)
-    const bool ws_result = ws == rmd::RmdStatus::success && output.values == cpu_output.values;
+    std::vector<rmd::OutputValue> route_ws;
+    const auto route_ws_status = rmd::compose_rmd_output(*packet, output, route_ws);
+    std::printf("RMD_ORACLE single dense_direct=%lld packet_scalar=%lld ws=%lld\\n",
+                static_cast<long long>(route_direct.front()), static_cast<long long>(route_packet.front()),
+                static_cast<long long>(route_ws.front()));
+    const bool ws_result = ws == rmd::RmdStatus::success && route_ws_status == rmd::RmdStatus::success &&
+        route_ws == route_packet && route_ws == route_direct;
 #else
+    std::printf("RMD_ORACLE single dense_direct=%lld packet_scalar=%lld ws=unsupported\\n",
+                static_cast<long long>(route_direct.front()), static_cast<long long>(route_packet.front()));
     const bool ws_result = ws == rmd::RmdStatus::unsupported_route &&
         output.j_padded == unchanged.j_padded && output.values == unchanged.values;
 #endif
-    return check(ws_result, "explicit RMD WS matches reference or rejects unsupported host") &&
-        check(packet->blocks.size() == packet_before.blocks.size() &&
+    if (!check(ws_result, "explicit RMD WS matches reference or rejects unsupported host")) {
+        return false;
+    }
+#if defined(GGML_GEMMINI_TESTING) && defined(__riscv)
+    if (!check(route_metrics.ws_observations.empty() && ws_metrics.ws_observations.size() == 1 &&
+               ws_metrics.ws_observations.front().lane_id == 1 &&
+               ws_metrics.ws_observations.front().raw_value == 4 &&
+               ws_metrics.ws_observations.front().block_scale == 1 &&
+               ws_metrics.ws_observations.front().composed_value == 1024,
+               "RMD WS observation records actual Gemmini call")) return false;
+#elif defined(GGML_GEMMINI_TESTING)
+    if (!check(route_metrics.ws_observations.empty() && ws_metrics.ws_observations.empty(),
+               "host WS remains unsupported without observations")) return false;
+#endif
+#if defined(GGML_GEMMINI_TESTING)
+    ggml_gemmini_args_t cancel_args{};
+    std::array<elem_t, 4> cancel_weights = {127, 127, 2, 1};
+    cancel_args.I = 1; cancel_args.J = 1; cancel_args.K = 4;
+    cancel_args.B = cancel_weights.data(); cancel_args.sB = 1;
+    cancel_args.weight_i8_scale_active = true; cancel_args.weight_scale = 1.0f;
+    rmd::RmdStripeBuilder cancel_builder;
+    cancel_builder.reset(0, 0, 1, 4, 1);
+    if (!cancel_builder.add_residual(0, 0, 1) ||
+        !cancel_builder.add_residual(0, 1, 1) ||
+        !cancel_builder.add_residual(0, 2, 1) ||
+        !cancel_builder.add_residual(0, 3, -256)) {
+        return check(false, "RMD cancellation packet input accepted");
+    }
+    const auto cancel_packet = cancel_builder.finish();
+    rmd::CompressedOutput cancel_output;
+    rmd::RmdExecutionMetrics cancel_metrics{};
+    const auto cancel_status = rmd::execute_rmd_stripe_reference(cancel_args, *cancel_packet,
+                                                  cancel_output, &cancel_metrics);
+    std::vector<rmd::OutputValue> cancel_composed;
+    const auto cancel_compose_status = rmd::compose_rmd_output(*cancel_packet, cancel_output, cancel_composed);
+    std::printf("RMD_STAGE cancellation_packet_scalar status=%d compose=%d correction=%lld nonzero_count=%zu\\n", static_cast<int>(cancel_status), static_cast<int>(cancel_compose_status), static_cast<long long>(cancel_composed.empty() ? 0 : cancel_composed.front()), cancel_composed.empty() ? 0 : (cancel_composed.front() != 0));
+    std::vector<rmd::ReferenceResidual> cancel_events = {{0, 0, 1}, {0, 1, 1}, {0, 2, 1}, {0, 3, -256}};
+    std::vector<rmd::OutputValue> cancel_direct;
+    const auto cancel_direct_status = rmd::reference_direct_correction(cancel_args, 1, cancel_events, cancel_direct);
+    if (!check(cancel_status == rmd::RmdStatus::success && cancel_compose_status == rmd::RmdStatus::success &&
+               cancel_direct_status == rmd::RmdStatus::success &&
+               cancel_direct == std::vector<rmd::OutputValue>{0} &&
+               cancel_direct == cancel_composed, "RMD cancellation reference correction")) return false;
+#if defined(__riscv)
+    rmd::CompressedOutput ws_cancel_output;
+    rmd::RmdExecutionMetrics ws_cancel_metrics{};
+    const auto ws_cancel_status = rmd::execute_rmd_stripe_ws(cancel_args, *cancel_packet,
+                                                               ws_cancel_output, &ws_cancel_metrics);
+    std::vector<rmd::OutputValue> ws_cancel_composed;
+    const auto ws_cancel_compose_status = rmd::compose_rmd_output(*cancel_packet, ws_cancel_output,
+                                                                    ws_cancel_composed);
+    std::printf("RMD_STAGE ws raw_lanes=256,-1 correction=%lld nonzero_count=%zu\\n",
+                static_cast<long long>(ws_cancel_composed.empty() ? 0 : ws_cancel_composed.front()),
+                ws_cancel_composed.empty() ? 0 : (ws_cancel_composed.front() != 0));
+    std::printf("RMD_ORACLE cancellation dense_direct=%lld packet_scalar=%lld ws=%lld\\n",
+                static_cast<long long>(cancel_direct.front()), static_cast<long long>(cancel_composed.front()),
+                static_cast<long long>(ws_cancel_composed.front()));
+    if (!check(ws_cancel_status == rmd::RmdStatus::success &&
+               ws_cancel_compose_status == rmd::RmdStatus::success &&
+               ws_cancel_composed == cancel_composed && ws_cancel_composed == cancel_direct &&
+               !ws_cancel_composed.empty() && ws_cancel_composed.front() == 0,
+               "RMD cancellation WS correction")) return false;
+#else
+    std::printf("RMD_ORACLE cancellation dense_direct=%lld packet_scalar=%lld ws=unsupported\\n",
+                static_cast<long long>(cancel_direct.front()), static_cast<long long>(cancel_composed.front()));
+#endif
+#endif
+    return check(packet->blocks.size() == packet_before.blocks.size() &&
               std::memcmp(packet->blocks.data(), packet_before.blocks.data(),
                           packet->blocks.size() * sizeof(rmd::BlockDescriptor)) == 0 &&
               packet->k_indices == packet_before.k_indices &&

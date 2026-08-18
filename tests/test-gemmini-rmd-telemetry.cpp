@@ -71,11 +71,15 @@ bool hash_parity_and_mismatch_fixtures() {
     const bool correction = expect(compare_rmd_telemetry_proofs(cpu, mismatch).code ==
                                    RmdTelemetryCheckCode::correction_hash_mismatch,
                                    "correction hash mismatch rejected");
+    mismatch = ws; mismatch.stripes[0].correction_nonzero_count = 1;
+    const bool nonzero = expect(compare_rmd_telemetry_proofs(cpu, mismatch).code ==
+                                  RmdTelemetryCheckCode::correction_nonzero_count_mismatch,
+                                  "correction nonzero count mismatch rejected");
     mismatch = ws; mismatch.stripes[0].output_hash[0] ^= 1;
     const bool output = expect(compare_rmd_telemetry_proofs(cpu, mismatch).code ==
                                RmdTelemetryCheckCode::output_hash_mismatch,
                                "output hash mismatch rejected");
-    return input && correction && output;
+    return input && correction && nonzero && output;
 }
 }
 int main() {
@@ -96,16 +100,18 @@ int main() {
     RmdTelemetryRecord cpu = cpu_record(); RmdTelemetryRecord ws = ws_record();
 #if CYCLE_DETAIL
     cpu.stripes = {
-        {0,0,4,{10,20,20,26,27,31,31,38},"0123456789abcdef","1123456789abcdef","2123456789abcdef"},
-        {1,4,8,{40,50,50,59,60,65,65,72},"3123456789abcdef","4123456789abcdef","5123456789abcdef"},
+        {0,0,4,{10,20,20,26,27,31,31,38},"0123456789abcdef","1123456789abcdef","2123456789abcdef",1},
+        {1,4,8,{40,50,50,59,60,65,65,72},"3123456789abcdef","4123456789abcdef","5123456789abcdef",0},
     };
     ws.stripes = cpu.stripes;
     const std::string json = serialize_rmd_telemetry(cpu);
     const bool detail = expect(json.find("\"stripes\"") != std::string::npos, "DETAIL emits per-stripe attribution") &&
         expect(json.find("input_hash") != std::string::npos &&
                json.find("correction_hash") != std::string::npos &&
+               json.find("\"correction_nonzero_count\":1") != std::string::npos &&
+               json.find("\"correction_nonzero_count\":0") != std::string::npos &&
                json.find("output_hash") != std::string::npos,
-               "DETAIL emits three explicit proof hashes") &&
+               "DETAIL emits exact correction nonzero counts") &&
         expect(check_rmd_telemetry(cpu, cycle::units(), true).ok(), "ordered CPU detail accepted") &&
         expect(check_rmd_telemetry(ws, cycle::units(), true).ok(), "route-exclusive WS detail accepted") &&
         hash_parity_and_mismatch_fixtures();
@@ -114,8 +120,9 @@ int main() {
     const bool detail = expect(json.find("\"stripes\"") == std::string::npos, "SUMMARY has no per-stripe detail") &&
         expect(json.find("input_hash") == std::string::npos &&
                json.find("correction_hash") == std::string::npos &&
-               json.find("output_hash") == std::string::npos,
-               "SUMMARY has no proof hashes") &&
+               json.find("output_hash") == std::string::npos &&
+               json.find("correction_nonzero_count") == std::string::npos,
+               "SUMMARY has no proof hashes or nonzero counts") &&
         expect(check_rmd_telemetry(cpu, cycle::units(), true).ok(), "route-exclusive CPU summary accepted") &&
         expect(check_rmd_telemetry(ws, cycle::units(), true).ok(), "route-exclusive WS summary accepted");
 #endif
