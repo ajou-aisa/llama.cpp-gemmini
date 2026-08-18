@@ -141,13 +141,13 @@ bool test_rmd_cpu_ws_routes() {
 #if defined(__riscv)
     std::vector<rmd::OutputValue> route_ws;
     const auto route_ws_status = rmd::compose_rmd_output(*packet, output, route_ws);
-    std::printf("RMD_ORACLE single dense_direct=%lld packet_scalar=%lld ws=%lld\\n",
+    std::printf("RMD_ORACLE single dense_direct=%lld packet_scalar=%lld ws=%lld\n",
                 static_cast<long long>(route_direct.front()), static_cast<long long>(route_packet.front()),
                 static_cast<long long>(route_ws.front()));
     const bool ws_result = ws == rmd::RmdStatus::success && route_ws_status == rmd::RmdStatus::success &&
         route_ws == route_packet && route_ws == route_direct;
 #else
-    std::printf("RMD_ORACLE single dense_direct=%lld packet_scalar=%lld ws=unsupported\\n",
+    std::printf("RMD_ORACLE single dense_direct=%lld packet_scalar=%lld ws=unsupported\n",
                 static_cast<long long>(route_direct.front()), static_cast<long long>(route_packet.front()));
     const bool ws_result = ws == rmd::RmdStatus::unsupported_route &&
         output.j_padded == unchanged.j_padded && output.values == unchanged.values;
@@ -187,7 +187,7 @@ bool test_rmd_cpu_ws_routes() {
                                                   cancel_output, &cancel_metrics);
     std::vector<rmd::OutputValue> cancel_composed;
     const auto cancel_compose_status = rmd::compose_rmd_output(*cancel_packet, cancel_output, cancel_composed);
-    std::printf("RMD_STAGE cancellation_packet_scalar status=%d compose=%d correction=%lld nonzero_count=%zu\\n", static_cast<int>(cancel_status), static_cast<int>(cancel_compose_status), static_cast<long long>(cancel_composed.empty() ? 0 : cancel_composed.front()), cancel_composed.empty() ? 0 : (cancel_composed.front() != 0));
+    std::printf("RMD_STAGE cancellation_packet_scalar status=%d compose=%d correction=%lld nonzero_count=%zu\n", static_cast<int>(cancel_status), static_cast<int>(cancel_compose_status), static_cast<long long>(cancel_composed.empty() ? 0 : cancel_composed.front()), cancel_composed.empty() ? 0 : (cancel_composed.front() != 0));
     std::vector<rmd::ReferenceResidual> cancel_events = {{0, 0, 1}, {0, 1, 1}, {0, 2, 1}, {0, 3, -256}};
     std::vector<rmd::OutputValue> cancel_direct;
     const auto cancel_direct_status = rmd::reference_direct_correction(cancel_args, 1, cancel_events, cancel_direct);
@@ -203,10 +203,10 @@ bool test_rmd_cpu_ws_routes() {
     std::vector<rmd::OutputValue> ws_cancel_composed;
     const auto ws_cancel_compose_status = rmd::compose_rmd_output(*cancel_packet, ws_cancel_output,
                                                                     ws_cancel_composed);
-    std::printf("RMD_STAGE ws raw_lanes=256,-1 correction=%lld nonzero_count=%zu\\n",
+    std::printf("RMD_STAGE ws raw_lanes=256,-1 correction=%lld nonzero_count=%zu\n",
                 static_cast<long long>(ws_cancel_composed.empty() ? 0 : ws_cancel_composed.front()),
                 ws_cancel_composed.empty() ? 0 : (ws_cancel_composed.front() != 0));
-    std::printf("RMD_ORACLE cancellation dense_direct=%lld packet_scalar=%lld ws=%lld\\n",
+    std::printf("RMD_ORACLE cancellation dense_direct=%lld packet_scalar=%lld ws=%lld\n",
                 static_cast<long long>(cancel_direct.front()), static_cast<long long>(cancel_composed.front()),
                 static_cast<long long>(ws_cancel_composed.front()));
     if (!check(ws_cancel_status == rmd::RmdStatus::success &&
@@ -215,7 +215,7 @@ bool test_rmd_cpu_ws_routes() {
                !ws_cancel_composed.empty() && ws_cancel_composed.front() == 0,
                "RMD cancellation WS correction")) return false;
 #else
-    std::printf("RMD_ORACLE cancellation dense_direct=%lld packet_scalar=%lld ws=unsupported\\n",
+    std::printf("RMD_ORACLE cancellation dense_direct=%lld packet_scalar=%lld ws=unsupported\n",
                 static_cast<long long>(cancel_direct.front()), static_cast<long long>(cancel_composed.front()));
 #endif
 #endif
