@@ -118,6 +118,7 @@ prepare_manager() {
     local libgomp
     local cache
     local bundle_id
+    local caller_directory
 
     script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
     default_workspace=$(cd -- "$script_dir/../.." && pwd -P)
@@ -163,10 +164,13 @@ prepare_manager() {
     [[ -x $compiler ]] || die_usage "missing RISC-V compiler: $compiler"
 
     printf 'manager_step=source_firesim\n'
+    caller_directory=$PWD
+    cd -- "$firesim_root"
     set +u
     # shellcheck disable=SC1090
-    source "$manager_setup" --skip-ssh-setup
+    source ./sourceme-manager.sh --skip-ssh-setup
     set -u
+    cd -- "$caller_directory"
     [[ ${FIRESIM_SOURCED:-0} == 1 ]] || die 'FireSim manager environment was not sourced'
 
     build_dir="$workspace/$build_name"
@@ -246,6 +250,7 @@ prepare_manager() {
 launch_manager() {
     local firesim_root=/home/alveo/firesim
     local manager_setup
+    local caller_directory
 
     while (($# > 0)); do
         case $1 in
@@ -265,10 +270,13 @@ launch_manager() {
     [[ -f $manager_setup ]] || die_usage "missing manager setup: $manager_setup"
 
     printf 'manager_step=source_firesim\n'
+    caller_directory=$PWD
+    cd -- "$firesim_root"
     set +u
     # shellcheck disable=SC1090
-    source "$manager_setup" --skip-ssh-setup
+    source ./sourceme-manager.sh --skip-ssh-setup
     set -u
+    cd -- "$caller_directory"
     [[ ${FIRESIM_SOURCED:-0} == 1 ]] || die 'FireSim manager environment was not sourced'
     export PATH="$firesim_root/.conda-env/bin:$PATH"
     command -v firesim >/dev/null 2>&1 || die 'firesim command is unavailable'

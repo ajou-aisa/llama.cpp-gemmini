@@ -55,6 +55,7 @@ printf 'preserve\n' >"$workspace/build-riscv-rmd-cpu-npu/sentinel.txt"
 cat >"$firesim_root/sourceme-manager.sh" <<'EOF'
 #!/usr/bin/env bash
 [[ ${1:-} == --skip-ssh-setup ]]
+[[ $PWD == "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" ]] || return 1
 export FIRESIM_SOURCED=1
 EOF
 chmod +x "$firesim_root/sourceme-manager.sh"
