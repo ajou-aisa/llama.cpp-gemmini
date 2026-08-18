@@ -21,6 +21,7 @@ struct Meta
     int32_t sigma = GGML_GEMMINI_EXSIA_SIGMA;
     std::vector<int16_t> theta;
     RmdPacketList rmd_packets;
+    DirectResidualList direct_residuals;
 
     void reset()
     {
@@ -29,6 +30,7 @@ struct Meta
         sigma = GGML_GEMMINI_EXSIA_SIGMA;
         theta.clear();
         rmd_packets.clear();
+        direct_residuals.clear();
     }
 
     int16_t resolve_stripe_theta(int stripe_idx) const

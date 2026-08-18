@@ -826,6 +826,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         GGML_ABORT("Gemmini MUL_MAT shared-weight contract failed");
     }
     setup_gemmini_log_outputs_if_needed();
+#if LOG_CYCLE
+    const uint64_t rmd_telemetry_invocation_start = ggml::gemmini::cycle::read();
+#endif
     const auto layer_type = ggml::gemmini::types::parse_layer(dst->src[1]->name);
     const char *layer = ggml::gemmini::types::to_string(layer_type);
     ggml::gemmini::log::debug(layer, "ggml_backend_gemmini_mul_mat called");
@@ -947,6 +950,13 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     }
     auto matmul_options = matmul_resolution.options;
     matmul_options.profiling = LOG_DEBUG != 0 || LOG_CYCLE != 0;
+#if !defined(__riscv)
+    if (matmul_options.rmd_backend == ggml::gemmini::RmdBackend::gemmini_ws_compact) {
+        ggml::gemmini::log::debug(layer,
+            "[matmul.rmd] status=unsupported_backend backend=WS");
+        GGML_ABORT("Gemmini unsupported_backend: RMD WS is unavailable on this host");
+    }
+#endif
     const bool pipeline_requested =
         matmul_options.mode == ggml::gemmini::MatmulInvocationMode::stripe_pipeline;
     const bool sequential_requested =
@@ -988,6 +998,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.J = J;
     args.K = K;
     args.tiled_matmul_type = OPTION;
+    args.residual_route = matmul_options.rmd_backend == ggml::gemmini::RmdBackend::cpu_direct
+        ? ggml::gemmini::residual::ResidualRoute::cpu_direct
+        : ggml::gemmini::residual::ResidualRoute::ws_packet;
 
     /* _____ 3. Gemmini용 stride _____ */
     args.sA = K;
@@ -1611,7 +1624,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             backend_route,
             capabilities.live_stripe_producer ? 1 : 0,
             capabilities.deprecated ? 1 : 0);
-        for (const auto & profile : pipeline_collector->profiles()) {
+        const auto telemetry_profiles = pipeline_collector->profiles();
+        for (const auto & profile : telemetry_profiles) {
             ggml::gemmini::log::debug(layer,
                 "[matmul.stripe] stripe_id=%zu row_begin=%zu row_end=%zu "
                 "la_cycles=%llu la3_cycles=%llu sf_cycles=%llu la3_ns=%llu sf1_ns=%llu handoff_ns=%llu ws_ns=%llu "
@@ -1650,6 +1664,26 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             (void) ggml::gemmini::detail::append_pipeline_stripe_summary_jsonl(summary);
             ggml::gemmini::log::debug(layer, "%s", summary.c_str());
         }
+#if LOG_CYCLE
+        const uint64_t rmd_telemetry_invocation_end = ggml::gemmini::cycle::read();
+        const char * bundle_id = std::getenv("GGML_GEMMINI_RUNTIME_BUNDLE_ID");
+        const char * model_id = std::getenv("GGML_GEMMINI_MODEL_ID");
+        const uint64_t invocation_total =
+            rmd_telemetry_invocation_end >= rmd_telemetry_invocation_start
+                ? rmd_telemetry_invocation_end - rmd_telemetry_invocation_start : 0;
+        const std::string telemetry_run_id = telemetry_profiles.empty()
+            ? "0" : std::to_string(telemetry_profiles.front().run_id);
+        const auto telemetry = ggml::gemmini::make_rmd_telemetry_record(
+            matmul_options.rmd_backend, matmul_resolution.rmd_backend_source,
+            bundle_id != nullptr ? bundle_id : "unbundled",
+            ggml::gemmini::resolve_rmd_model_id(model_id, ctx->model_arch),
+            telemetry_run_id, invocation_total, telemetry_profiles);
+        const std::string telemetry_json = ggml::gemmini::serialize_rmd_telemetry(telemetry);
+        if (!telemetry_json.empty()) {
+            (void) ggml::gemmini::detail::append_pipeline_stripe_summary_jsonl(telemetry_json);
+            ggml::gemmini::log::debug(layer, "%s", telemetry_json.c_str());
+        }
+#endif
     }
 }
 

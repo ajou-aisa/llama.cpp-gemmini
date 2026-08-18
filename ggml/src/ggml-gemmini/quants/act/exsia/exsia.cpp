@@ -1313,7 +1313,7 @@ namespace ggml::gemmini::quants::act::exsia
                             const std::vector<int32_t> &stripe_q_wide,
                             const std::vector<int16_t> &stripe_block_exp,
                             std::vector<int32_t> &residual,
-                            rmd::RmdStripeBuilder &rmd_builder)
+                            residual::TimedResidualCapture &rmd_builder)
     {
         const int16_t neg_inf = std::numeric_limits<int16_t>::min();
         rmd_builder.reset(stripe_idx, stripe.row_start, stripe.row_count(), args.K, args.J);
@@ -1415,13 +1415,16 @@ namespace ggml::gemmini::quants::act::exsia
     // stripe, right after folding commits, by the thread that ran folding.
     static bool seal_stripe_packet(Meta &meta, StripePipelineSlot &slot)
     {
-        const uint64_t seal_start_ns = steady_now_ns();
-        slot.rmd_packet = slot.rmd_builder.finish();
-        const uint64_t seal_end_ns = steady_now_ns();
-        slot.rmd_pack_ns = seal_end_ns >= seal_start_ns ? seal_end_ns - seal_start_ns : 0;
-        if (slot.rmd_packet == nullptr)
-            return slot.rmd_builder.status() == rmd::RmdStatus::success;
-        meta.rmd_packets.push_back(slot.rmd_packet);
+        const residual::ResidualStripePayload payload = slot.rmd_builder.finish();
+        slot.rmd_packet = payload.packet;
+        slot.direct_residual = payload.direct;
+        slot.rmd_pack_ns = payload.capture_ns;
+        if (slot.rmd_builder.status() != rmd::RmdStatus::success)
+            return false;
+        if (slot.rmd_packet)
+            meta.rmd_packets.push_back(slot.rmd_packet);
+        if (slot.direct_residual)
+            meta.direct_residuals.push_back(slot.direct_residual);
         return true;
     }
 
@@ -1570,6 +1573,7 @@ namespace ggml::gemmini::quants::act::exsia
 
         meta.theta.assign(num_stripes, invalid_theta);
         meta.rmd_packets.clear();
+        meta.direct_residuals.clear();
 
         // Dense residual matrix is a global output, sized to the full padded activation.
         // Each stripe writes its own disjoint global row range (K_padded stride).
@@ -1584,6 +1588,7 @@ namespace ggml::gemmini::quants::act::exsia
 
         for (StripePipelineSlot &slot : pipeline_slots_)
         {
+            slot.rmd_builder.select(args.residual_route);
             if (!slot.prepare(max_stripe_elem_count, max_stripe_block_count,
                               max_stripe_rows, state_.K_padded, state_.B_size))
                 return fail(ExSIAState::FailureCode::InvalidInput);
@@ -1640,6 +1645,7 @@ namespace ggml::gemmini::quants::act::exsia
             event.row_begin = slot.row_start;
             event.row_end = slot.row_end;
             event.rmd_packet = slot.rmd_packet;
+            event.direct_residual = slot.direct_residual;
             event.rmd_pack_ns = slot.rmd_pack_ns;
 #if EXSIA_PROFILE_COLLECTION_ENABLED
             if (profile != nullptr) {

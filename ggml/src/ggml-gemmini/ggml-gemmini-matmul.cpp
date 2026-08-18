@@ -4,10 +4,340 @@
 #include "ggml-gemmini-matmul.hpp"
 
 #include <gemmini/log.hpp>
+#include <gemmini/cycle_reader.hpp>
 
 #include <cstdio>
+#include <algorithm>
 #include <filesystem>
 #include <string>
+#include <sstream>
+#include <cstring>
+#include <tuple>
+
+namespace ggml::gemmini {
+namespace {
+void telemetry_json_string(std::ostringstream & out, std::string_view value) {
+    out << '"';
+    for (const char c : value) {
+        switch (c) {
+            case '\\': out << "\\\\"; break;
+            case '"': out << "\\\""; break;
+            case '\n': out << "\\n"; break;
+            case '\r': out << "\\r"; break;
+            case '\t': out << "\\t"; break;
+            default: out << c; break;
+        }
+    }
+    out << '"';
+}
+const char * telemetry_backend_name(RmdBackend backend) {
+    return backend == RmdBackend::cpu_direct ? "cpu_direct" : "gemmini_ws_compact";
+}
+const char * telemetry_source_name(MatmulOptionSource source) {
+    switch (source) {
+        case MatmulOptionSource::build_default: return "build_default";
+        case MatmulOptionSource::environment: return "environment";
+        case MatmulOptionSource::explicit_override: return "explicit_override";
+    }
+    return "invalid";
+}
+}
+
+namespace {
+class ProofHash64 {
+public:
+    void u8(uint8_t value) {
+        value_ ^= value;
+        value_ *= 1099511628211ULL;
+    }
+    void u32(uint32_t value) {
+        for (unsigned shift = 0; shift < 32; shift += 8) u8(static_cast<uint8_t>(value >> shift));
+    }
+    void u64(uint64_t value) {
+        for (unsigned shift = 0; shift < 64; shift += 8) u8(static_cast<uint8_t>(value >> shift));
+    }
+    std::string finish() const {
+        static constexpr char hex[] = "0123456789abcdef";
+        std::string result(16, '0');
+        for (size_t i = 0; i < result.size(); ++i) {
+            result[15 - i] = hex[(value_ >> (i * 4)) & 0x0f];
+        }
+        return result;
+    }
+private:
+    uint64_t value_ = 1469598103934665603ULL;
+};
+
+using CanonicalResidual = std::tuple<size_t, size_t, int32_t>;
+
+std::string hash_canonical_residuals(std::vector<CanonicalResidual> events) {
+    std::sort(events.begin(), events.end());
+    ProofHash64 hash;
+    for (const auto & [row, k, residual] : events) {
+        hash.u64(row);
+        hash.u64(k);
+        hash.u32(static_cast<uint32_t>(residual));
+    }
+    return hash.finish();
+}
+}
+
+#ifndef GGML_GEMMINI_PIPELINE_WRITER_TEST_ONLY
+std::string rmd_input_hash(const residual::DirectStripePayload & payload) {
+    std::vector<CanonicalResidual> events;
+    events.reserve(payload.events.size());
+    for (const residual::ResidualEvent & event : payload.events) {
+        events.emplace_back(payload.row_begin + event.local_row,
+                            event.original_k, event.residual);
+    }
+    return hash_canonical_residuals(std::move(events));
+}
+
+std::string rmd_input_hash(const rmd::StripePacket & packet) {
+    std::vector<CanonicalResidual> events;
+    for (size_t row = 0; row < packet.row_count; ++row) {
+        for (const rmd::BlockDescriptor & block : packet.blocks) {
+            for (size_t compact_k = 0; compact_k < block.compact_k_count; ++compact_k) {
+                rmd::BalancedDigits digits{};
+                for (size_t position = 0; position < block.active_lane_count; ++position) {
+                    const size_t index = block.activation_offset +
+                        position * block.rows_padded * block.padded_k_count +
+                        row * block.padded_k_count + compact_k;
+                    digits.digits[block.lane_ids[position]] =
+                        packet.stacked_activation[index];
+                }
+                const int64_t residual = rmd::compose_balanced_radix256(digits);
+                if (residual != 0) {
+                    const size_t k = block.global_k_begin +
+                        packet.k_indices[block.k_index_offset + compact_k];
+                    events.emplace_back(packet.row_begin + row, k,
+                                        static_cast<int32_t>(residual));
+                }
+            }
+        }
+    }
+    return hash_canonical_residuals(std::move(events));
+}
+
+std::string rmd_correction_hash(const std::vector<rmd::OutputValue> & correction) {
+    ProofHash64 hash;
+    for (const rmd::OutputValue value : correction) hash.u64(static_cast<uint64_t>(value));
+    return hash.finish();
+}
+
+std::string rmd_output_hash(const ggml_gemmini_args_t & args,
+                            size_t row_begin, size_t row_end) {
+    ProofHash64 hash;
+    const size_t row_stride = args.stride_f_out != 0 ? args.stride_f_out : args.J;
+    const size_t col_stride = args.col_stride_f_out != 0 ? args.col_stride_f_out : 1;
+    hash.u64(row_stride);
+    hash.u64(col_stride);
+    for (size_t row = row_begin; row < row_end; ++row) {
+        for (size_t column = 0; column < args.J; ++column) {
+            uint32_t bits = 0;
+            const float value = args.f_out[row * row_stride + column * col_stride];
+            static_assert(sizeof(bits) == sizeof(value), "FP32 proof hash requires 32-bit float");
+            std::memcpy(&bits, &value, sizeof(bits));
+            hash.u32(bits);
+        }
+    }
+    return hash.finish();
+}
+#endif
+
+std::string resolve_rmd_model_id(const char * environment_model_id,
+                                 std::string_view model_arch) {
+    return environment_model_id != nullptr ? std::string(environment_model_id)
+                                           : std::string(model_arch);
+}
+
+RmdTelemetryCheckResult check_rmd_telemetry(const RmdTelemetryRecord & record,
+                                             std::string_view expected_units,
+                                             bool comparison_mode) {
+    if (record.schema != kRmdTelemetrySchema)
+        return {RmdTelemetryCheckCode::malformed_schema, "malformed RMD telemetry schema"};
+    if (record.version != kRmdTelemetryVersion)
+        return {RmdTelemetryCheckCode::unsupported_version, "unsupported RMD telemetry version"};
+    if ((record.units != "ticks" && record.units != "cycles") || record.units != expected_units)
+        return {RmdTelemetryCheckCode::wrong_units, "telemetry timing units differ"};
+    if (!record.work) {
+        return comparison_mode
+            ? RmdTelemetryCheckResult{RmdTelemetryCheckCode::zero_work, "zero-work record is not comparable"}
+            : RmdTelemetryCheckResult{};
+    }
+    const bool cpu = record.backend == RmdBackend::cpu_direct;
+    const bool exclusive = cpu
+        ? record.counters.direct_events != 0 && record.counters.direct_calls != 0 &&
+          record.counters.packet_calls == 0 && record.counters.ws_calls == 0
+        : record.counters.direct_events == 0 && record.counters.direct_calls == 0 &&
+          record.counters.packet_calls != 0 && record.counters.ws_calls != 0 &&
+          record.geometry.packet_count != 0;
+    if (!exclusive)
+        return {RmdTelemetryCheckCode::route_not_exclusive, "backend dispatch counters are not exclusive"};
+    if (record.timing.residual_total < record.timing.backend_service)
+        return {RmdTelemetryCheckCode::invalid_timing, "residual total does not contain backend service"};
+    if (record.timing.dense_end > record.timing.residual_start)
+        return {RmdTelemetryCheckCode::ordering_violation, "dense end follows residual start"};
+#if CYCLE_DETAIL
+    if (record.stripes.empty())
+        return {RmdTelemetryCheckCode::missing_detail, "detail telemetry requires stripes"};
+    for (const RmdTelemetryStripe & stripe : record.stripes) {
+        if (stripe.row_begin >= stripe.row_end || stripe.input_hash.size() != 16 ||
+            stripe.correction_hash.size() != 16 || stripe.output_hash.size() != 16)
+            return {RmdTelemetryCheckCode::missing_detail,
+                    "stripe attribution requires three fixed-width hashes"};
+        for (size_t i = 1; i < stripe.ordered_ticks.size(); ++i) {
+            if (stripe.ordered_ticks[i] < stripe.ordered_ticks[i - 1])
+                return {RmdTelemetryCheckCode::ordering_violation, "stripe stages are not ordered"};
+        }
+    }
+#endif
+    return {};
+}
+
+RmdTelemetryCheckResult compare_rmd_telemetry_proofs(
+        const RmdTelemetryRecord & lhs, const RmdTelemetryRecord & rhs) {
+#if !CYCLE_DETAIL
+    (void) lhs; (void) rhs;
+    return {RmdTelemetryCheckCode::missing_detail, "proof comparison requires DETAIL"};
+#else
+    if (lhs.stripes.size() != rhs.stripes.size())
+        return {RmdTelemetryCheckCode::input_hash_mismatch, "stripe proof cardinality differs"};
+    for (size_t i = 0; i < lhs.stripes.size(); ++i) {
+        const auto & a = lhs.stripes[i];
+        const auto & b = rhs.stripes[i];
+        if (a.input_hash.size() != 16 || a.correction_hash.size() != 16 ||
+            a.output_hash.size() != 16 || b.input_hash.size() != 16 ||
+            b.correction_hash.size() != 16 || b.output_hash.size() != 16)
+            return {RmdTelemetryCheckCode::missing_detail,
+                    "proof comparison requires three fixed-width hashes"};
+        if (a.stripe_id != b.stripe_id || a.row_begin != b.row_begin || a.row_end != b.row_end ||
+            a.input_hash != b.input_hash)
+            return {RmdTelemetryCheckCode::input_hash_mismatch, "input hashes differ"};
+        if (a.correction_hash != b.correction_hash)
+            return {RmdTelemetryCheckCode::correction_hash_mismatch, "correction hashes differ"};
+        if (a.output_hash != b.output_hash)
+            return {RmdTelemetryCheckCode::output_hash_mismatch, "output hashes differ"};
+    }
+    return {};
+#endif
+}
+
+RmdTelemetryRecord make_rmd_telemetry_record(
+        RmdBackend backend, MatmulOptionSource source,
+        std::string runtime_bundle_id, std::string model_id, std::string run_id,
+        uint64_t invocation_total, const std::vector<MatmulJobMetrics> & profiles) {
+    RmdTelemetryRecord record{};
+    record.runtime_bundle_id = std::move(runtime_bundle_id);
+    record.model_id = std::move(model_id);
+    record.run_id = std::move(run_id);
+    record.backend = backend;
+    record.source = source;
+    record.units = cycle::units();
+    record.invocation_total = invocation_total;
+    for (const MatmulJobMetrics & profile : profiles) {
+        record.counters.direct_events += profile.rmd.direct_event_count;
+        record.counters.direct_calls += profile.rmd.direct_call_count;
+        record.counters.packet_calls += profile.rmd.packet_call_count;
+        record.counters.ws_calls += profile.rmd.ws_call_count;
+        record.geometry.packet_count += profile.rmd.packet_call_count;
+        record.geometry.active_blocks += profile.rmd.active_blocks;
+        record.geometry.compact_k_count += profile.rmd.compact_k_count;
+        record.geometry.padded_k_count += profile.rmd.padded_k_count;
+        record.geometry.physical_tile_count += profile.rmd.physical_tile_count;
+        const auto elapsed = [](uint64_t begin, uint64_t end) {
+            return end >= begin ? end - begin : uint64_t{0};
+        };
+        record.timing.prep += elapsed(
+            profile.telemetry_residual_start, profile.telemetry_backend_start);
+        record.timing.backend_service += elapsed(
+            profile.telemetry_backend_start, profile.telemetry_backend_end);
+        record.timing.merge += elapsed(profile.telemetry_merge_start, profile.telemetry_merge_end);
+        if (profile.telemetry_queue_tick != 0) {
+            record.timing.queue += elapsed(
+                profile.telemetry_queue_tick, profile.telemetry_residual_start);
+        }
+        record.timing.residual_total += elapsed(
+            profile.telemetry_residual_start, profile.telemetry_residual_end);
+        if (record.timing.dense_end == 0 || profile.telemetry_dense_end < record.timing.dense_end)
+            record.timing.dense_end = profile.telemetry_dense_end;
+        if (record.timing.residual_start == 0 || profile.telemetry_residual_start < record.timing.residual_start)
+            record.timing.residual_start = profile.telemetry_residual_start;
+#if CYCLE_DETAIL
+        record.stripes.push_back({profile.stripe_id, profile.row_begin, profile.row_end,
+            {profile.telemetry_dense_start, profile.telemetry_dense_end,
+             profile.telemetry_residual_start, profile.telemetry_backend_start,
+             profile.telemetry_backend_end, profile.telemetry_merge_start,
+             profile.telemetry_merge_end, profile.telemetry_residual_end},
+            profile.telemetry_input_hash,
+            profile.telemetry_correction_hash,
+            profile.telemetry_output_hash});
+#endif
+    }
+    record.work = backend == RmdBackend::cpu_direct
+        ? record.counters.direct_calls != 0 : record.counters.packet_calls != 0;
+    return record;
+}
+
+std::string serialize_rmd_telemetry(const RmdTelemetryRecord & record) {
+#if !LOG_CYCLE
+    (void) record;
+    return {};
+#else
+    std::ostringstream out;
+    out << "{\"schema\":"; telemetry_json_string(out, record.schema);
+    out << ",\"version\":" << record.version << ",\"record_type\":\"RMD_BACKEND_TELEMETRY\""
+        << ",\"runtime_bundle_id\":"; telemetry_json_string(out, record.runtime_bundle_id);
+    out << ",\"model_id\":"; telemetry_json_string(out, record.model_id);
+    out << ",\"run_id\":"; telemetry_json_string(out, record.run_id);
+    out << ",\"backend\":"; telemetry_json_string(out, telemetry_backend_name(record.backend));
+    out << ",\"source\":"; telemetry_json_string(out, telemetry_source_name(record.source));
+    out << ",\"units\":"; telemetry_json_string(out, record.units);
+    out << ",\"work\":" << (record.work ? "true" : "false")
+        << ",\"invocation_total\":" << record.invocation_total
+        << ",\"dispatch\":{\"direct_events\":" << record.counters.direct_events
+        << ",\"direct_calls\":" << record.counters.direct_calls
+        << ",\"packet_calls\":" << record.counters.packet_calls
+        << ",\"ws_calls\":" << record.counters.ws_calls << "}"
+        << ",\"timing\":{\"prep\":" << record.timing.prep
+        << ",\"backend_service\":" << record.timing.backend_service
+        << ",\"merge\":" << record.timing.merge
+        << ",\"residual_total\":" << record.timing.residual_total
+        << ",\"queue\":" << record.timing.queue
+        << ",\"dense_end\":" << record.timing.dense_end
+        << ",\"residual_start\":" << record.timing.residual_start << "}"
+        << ",\"geometry\":{\"packet_count\":" << record.geometry.packet_count
+        << ",\"active_blocks\":" << record.geometry.active_blocks
+        << ",\"compact_k_count\":" << record.geometry.compact_k_count
+        << ",\"padded_k_count\":" << record.geometry.padded_k_count
+        << ",\"physical_tile_count\":" << record.geometry.physical_tile_count << "}";
+#if CYCLE_DETAIL
+    out << ",\"stripes\":[";
+    for (size_t i = 0; i < record.stripes.size(); ++i) {
+        const auto & stripe = record.stripes[i];
+        if (i != 0) out << ',';
+        out << "{\"stripe_id\":" << stripe.stripe_id << ",\"row_begin\":" << stripe.row_begin
+            << ",\"row_end\":" << stripe.row_end
+            << ",\"stages\":{\"dense_start\":" << stripe.ordered_ticks[0]
+            << ",\"dense_end\":" << stripe.ordered_ticks[1]
+            << ",\"residual_start\":" << stripe.ordered_ticks[2]
+            << ",\"backend_start\":" << stripe.ordered_ticks[3]
+            << ",\"backend_end\":" << stripe.ordered_ticks[4]
+            << ",\"merge_start\":" << stripe.ordered_ticks[5]
+            << ",\"merge_end\":" << stripe.ordered_ticks[6]
+            << ",\"residual_end\":" << stripe.ordered_ticks[7] << '}'
+            << ",\"input_hash\":"; telemetry_json_string(out, stripe.input_hash);
+        out << ",\"correction_hash\":"; telemetry_json_string(out, stripe.correction_hash);
+        out << ",\"output_hash\":"; telemetry_json_string(out, stripe.output_hash); out << '}';
+    }
+    out << ']';
+#endif
+    out << '}';
+    return out.str();
+#endif
+}
+
+}
 
 namespace ggml::gemmini::detail {
 
@@ -33,6 +363,8 @@ bool append_pipeline_stripe_summary_jsonl(const std::string & json_record) {
 #include "quants/act/quantize.hpp"
 #include "quants/act/dispatch.hpp"
 #include "residual/rmd/rmd-builder.hpp"
+#include "residual/direct/direct-builder.hpp"
+#include "residual/direct/direct-executor.hpp"
 
 #include <gemmini.h>
 
@@ -44,6 +376,8 @@ bool append_pipeline_stripe_summary_jsonl(const std::string & json_record) {
 #include <limits>
 #include <new>
 #include <sstream>
+#include <cstring>
+#include <tuple>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
@@ -259,6 +593,21 @@ MatmulStatus invalid_contract(const char * message) {
 
 MatmulStatus unsupported_backend(const char * message) {
     return make_status(MatmulStatusCode::unsupported_backend, message, MatMulCapability::unsupported);
+}
+
+bool residual_backend_available(RmdBackend backend) {
+#if defined(__riscv)
+    (void) backend;
+    return true;
+#else
+    return backend == RmdBackend::cpu_direct;
+#endif
+}
+
+residual::ResidualRoute residual_route_for(RmdBackend backend) {
+    return backend == RmdBackend::cpu_direct
+        ? residual::ResidualRoute::cpu_direct
+        : residual::ResidualRoute::ws_packet;
 }
 
 MatmulStatus from_rmd_status(rmd::RmdStatus status) {
@@ -713,16 +1062,62 @@ MatMulResult MatMul::run_full() {
         return dense;
     }
 #if GGML_GEMMINI_ENABLE_RMD
-    // FULL mode replays every stripe packet the quantizer produced through the same
-    // executor/composer the stripe pipeline uses.
-    for (const auto & packet : quants::activation_rmd_packets(args())) {
-        if (packet == nullptr) {
-            continue;
+    const size_t row_stride = args().stride_f_out != 0 ? args().stride_f_out : args().J;
+    const size_t col_stride = args().col_stride_f_out != 0 ? args().col_stride_f_out : 1;
+    size_t last_row_offset = 0;
+    size_t last_col_offset = 0;
+    size_t output_span = 0;
+    if (__builtin_mul_overflow(args().I - 1, row_stride, &last_row_offset) ||
+        __builtin_mul_overflow(args().J - 1, col_stride, &last_col_offset) ||
+        __builtin_add_overflow(last_row_offset, last_col_offset, &output_span) ||
+        __builtin_add_overflow(output_span, size_t{1}, &output_span)) {
+        return { MatMulStatus::invalid_arguments, MatMulCapability::unsupported };
+    }
+    std::vector<float> staged_output;
+    try {
+        staged_output.assign(args().f_out, args().f_out + output_span);
+    } catch (const std::bad_alloc &) {
+        return { MatMulStatus::invalid_arguments, MatMulCapability::unsupported };
+    }
+
+    rmd::RmdStatus residual_status = rmd::RmdStatus::success;
+    if (args().residual_route == residual::ResidualRoute::cpu_direct) {
+        for (const auto & payload : quants::activation_direct_residuals(args())) {
+            if (payload == nullptr) continue;
+            size_t row_end = 0;
+            std::vector<rmd::OutputValue> correction;
+            residual_status = __builtin_add_overflow(
+                payload->row_begin, payload->row_count, &row_end)
+                ? rmd::RmdStatus::invalid_arguments
+                : residual::execute_direct_stripe(args(), *payload, correction);
+            if (residual_status == rmd::RmdStatus::success) {
+                residual_status = rmd::merge_rmd_correction_to(
+                    args(), staged_output.data(), payload->row_begin, row_end, correction);
+            }
+            if (residual_status != rmd::RmdStatus::success) break;
         }
-        if (rmd::apply_rmd_packet(args(), *packet) != rmd::RmdStatus::success) {
-            return { MatMulStatus::unsupported, MatMulCapability::unsupported };
+    } else {
+        for (const auto & packet : quants::activation_rmd_packets(args())) {
+            if (packet == nullptr) continue;
+            rmd::CompressedOutput compressed;
+            std::vector<rmd::OutputValue> correction;
+            residual_status = rmd::execute_rmd_stripe_ws(args(), *packet, compressed);
+            if (residual_status == rmd::RmdStatus::success) {
+                residual_status = rmd::compose_rmd_output(*packet, compressed, correction);
+            }
+            if (residual_status == rmd::RmdStatus::success) {
+                residual_status = rmd::merge_rmd_correction_to(
+                    args(), staged_output.data(), *packet, correction);
+            }
+            if (residual_status != rmd::RmdStatus::success) break;
         }
     }
+    if (residual_status != rmd::RmdStatus::success) {
+        return { residual_status == rmd::RmdStatus::unsupported_route
+                     ? MatMulStatus::unsupported : MatMulStatus::invalid_arguments,
+                 MatMulCapability::unsupported };
+    }
+    std::copy(staged_output.begin(), staged_output.end(), args().f_out);
 #endif
     state_ = MatMulState::completed;
     return { MatMulStatus::success, MatMulCapability::supported };
@@ -875,6 +1270,12 @@ size_t MatmulStripeInput::residual_count() const {
 MatmulExecution::MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options)
     : total_rows_(args.I), facade_(std::move(args)), options_(options) {
     state_ = MatmulExecutionState::prepared;
+    facade_.args().residual_route = residual_route_for(options_.rmd_backend);
+    if (!residual_backend_available(options_.rmd_backend)) {
+        status_ = unsupported_backend("RMD WS backend is unavailable on this host");
+        state_ = MatmulExecutionState::failed;
+        return;
+    }
     if (options_.mode == MatmulInvocationMode::stripe_pipeline) {
         ggml_gemmini_args_t staged_args = facade_.args();
         staged_args.act_quant.reset();
@@ -940,6 +1341,12 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions optio
     state_ = MatmulExecutionState::prepared;
     if (args == nullptr) {
         status_ = make_status(MatmulStatusCode::invalid_argument, "null execution args");
+        state_ = MatmulExecutionState::failed;
+        return;
+    }
+    facade_.args().residual_route = residual_route_for(options_.rmd_backend);
+    if (!residual_backend_available(options_.rmd_backend)) {
+        status_ = unsupported_backend("RMD WS backend is unavailable on this host");
         state_ = MatmulExecutionState::failed;
         return;
     }
@@ -1356,7 +1763,7 @@ void MatmulStripeCollector::worker_loop() {
                 job = std::make_shared<MatmulStripeJob>(capture_stripe(
                     *execution,
                     MatmulStripeInput(captured.row_begin, captured.row_end, captured.stripe_id),
-                    std::move(captured.rmd_packet)));
+                    std::move(captured.direct_residual), std::move(captured.rmd_packet)));
             } catch (const std::exception &) {
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
@@ -1393,6 +1800,7 @@ void MatmulStripeCollector::worker_loop() {
                 job->metrics_.producer_wait_start_ns = captured.producer_wait_start_ns;
                 job->metrics_.producer_wait_end_ns = captured.producer_wait_end_ns;
                 job->metrics_.capture_queue_enqueue_ns = captured.queued_ns;
+                job->metrics_.telemetry_queue_tick = captured.telemetry_queued_tick;
                 job->metrics_.rmd_pack = captured.rmd_pack;
                 job->metrics_.sf_handoff.nanoseconds =
                     captured.sf1_ns + job->metrics_.handoff.nanoseconds;
@@ -1577,6 +1985,7 @@ bool MatmulStripeCollector::on_ready(
         captured.row_end = event.row_end;
         // Shared handle only: the packet owns its buffers, so it outlives the ExSIA slot.
         captured.rmd_packet = event.rmd_packet;
+        captured.direct_residual = event.direct_residual;
         captured.la_cycles = event.local_end_cycle >= event.local_start_cycle ?
             event.local_end_cycle - event.local_start_cycle : 0;
         captured.la3_cycles = event.local_group3_end_cycle >= event.local_group3_start_cycle ?
@@ -1600,7 +2009,7 @@ bool MatmulStripeCollector::on_ready(
         captured.producer_wait = producer_wait;
         captured.producer_wait_start_ns = producer_wait_start_ns;
         captured.producer_wait_end_ns = producer_wait_end_ns;
-        if (event.rmd_packet != nullptr) {
+        if (event.rmd_packet != nullptr || event.direct_residual != nullptr) {
             captured.rmd_pack.nanoseconds = event.rmd_pack_ns;
             captured.rmd_pack.count = 1;
         }
@@ -1632,6 +2041,9 @@ bool MatmulStripeCollector::on_ready(
             collector.pending_.push_back(std::move(captured));
             record_metric(collector.pending_.back().queue_insert, true, insert_start);
             collector.pending_.back().queued_ns = now_ns();
+#if LOG_CYCLE
+            collector.pending_.back().telemetry_queued_tick = cycle::read();
+#endif
             lock.unlock();
             collector.condition_.notify_all();
             return true;
@@ -1648,6 +2060,9 @@ bool MatmulStripeCollector::on_ready(
         collector.stripes_.push_back(std::move(captured));
         record_metric(collector.stripes_.back().queue_insert, true, insert_start);
         collector.stripes_.back().queued_ns = now_ns();
+#if LOG_CYCLE
+        collector.stripes_.back().telemetry_queued_tick = cycle::read();
+#endif
     } catch (const std::bad_alloc &) {
         {
             std::lock_guard<std::mutex> lock(collector.mutex_);
@@ -1662,9 +2077,10 @@ bool MatmulStripeCollector::on_ready(
 
 MatmulStripeJob::MatmulStripeJob(
         MatmulExecution * execution, MatmulStripeInput input, MatmulStatus status,
+        residual::DirectStripePayloadHandle direct_residual,
         rmd::StripePacketHandle rmd_packet)
     : execution_(execution), input_(std::move(input)), status_(status),
-      rmd_packet_(std::move(rmd_packet)),
+      direct_residual_(std::move(direct_residual)), rmd_packet_(std::move(rmd_packet)),
       captured_(status.ok()) {}
 
 MatmulStripeJob::MatmulStripeJob()
@@ -1677,6 +2093,7 @@ MatmulStripeJob::MatmulStripeJob(MatmulStripeJob && other) noexcept
       owns_slot_(other.owns_slot_),
       released_(other.released_), collector_slot_released_(other.collector_slot_released_),
       rmd_queued_ns_(other.rmd_queued_ns_), job_mutex_(std::move(other.job_mutex_)),
+      direct_residual_(std::move(other.direct_residual_)),
       rmd_packet_(std::move(other.rmd_packet_)),
       rmd_output_(std::move(other.rmd_output_)),
       rmd_correction_(std::move(other.rmd_correction_)),
@@ -1696,6 +2113,7 @@ MatmulStripeJob & MatmulStripeJob::operator=(MatmulStripeJob && other) noexcept 
         status_ = other.status_;
         metrics_ = other.metrics_;
         staged_activation_meta_ = std::move(other.staged_activation_meta_);
+        direct_residual_ = std::move(other.direct_residual_);
         rmd_packet_ = std::move(other.rmd_packet_);
         rmd_output_ = std::move(other.rmd_output_);
         rmd_correction_ = std::move(other.rmd_correction_);
@@ -1855,11 +2273,18 @@ MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput in
     const size_t row_end = input.row_end();
     const size_t stripe_id = input.stripe_id();
     rmd::RmdStatus slice_status = rmd::RmdStatus::success;
+    residual::DirectStripePayloadHandle direct;
     rmd::StripePacketHandle packet;
     try {
-        packet = rmd::slice_packets(
-            quants::activation_rmd_packets(execution.facade_.args()),
-            row_begin, row_end, stripe_id, slice_status);
+        if (execution.options_.rmd_backend == RmdBackend::cpu_direct) {
+            direct = residual::slice_direct_payloads(
+                quants::activation_direct_residuals(execution.facade_.args()),
+                row_begin, row_end, stripe_id, slice_status);
+        } else {
+            packet = rmd::slice_packets(
+                quants::activation_rmd_packets(execution.facade_.args()),
+                row_begin, row_end, stripe_id, slice_status);
+        }
     } catch (const std::bad_alloc &) {
         return MatmulStripeJob(
             &execution, std::move(input),
@@ -1868,13 +2293,19 @@ MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput in
     if (slice_status != rmd::RmdStatus::success) {
         return MatmulStripeJob(&execution, std::move(input), from_rmd_status(slice_status));
     }
-    return capture_stripe(execution, std::move(input), std::move(packet));
+    return capture_stripe(execution, std::move(input), std::move(direct), std::move(packet));
 #else
     return capture_stripe(execution, std::move(input), nullptr);
 #endif
 }
 
 MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput input,
+                               rmd::StripePacketHandle rmd_packet) {
+    return capture_stripe(execution, std::move(input), nullptr, std::move(rmd_packet));
+}
+
+MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput input,
+                               residual::DirectStripePayloadHandle direct_residual,
                                rmd::StripePacketHandle rmd_packet) {
     const auto start = Clock::now();
     MatmulStatus status{};
@@ -1908,13 +2339,22 @@ MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput in
         status = invalid_contract("duplicate stripe");
     } else if (execution.has_captures_ && input.row_begin() < execution.last_row_end_) {
         status = invalid_contract("overlapping stripe");
+    } else if ((execution.options_.rmd_backend == RmdBackend::cpu_direct && rmd_packet != nullptr) ||
+               (execution.options_.rmd_backend == RmdBackend::gemmini_ws_compact && direct_residual != nullptr) ||
+               (direct_residual != nullptr && rmd_packet != nullptr)) {
+        status = invalid_contract("residual payload does not match selected backend");
+    } else if (direct_residual != nullptr &&
+               (direct_residual->row_begin != input.row_begin() ||
+                direct_residual->row_count != input.row_end() - input.row_begin())) {
+        status = invalid_contract("direct residual does not cover the stripe rows");
     } else if (rmd_packet != nullptr &&
                (rmd_packet->row_begin != input.row_begin() ||
                 rmd_packet->row_count != input.row_end() - input.row_begin())) {
         status = invalid_contract("rmd packet does not cover the stripe rows");
     }
 
-    MatmulStripeJob job(&execution, std::move(input), status, std::move(rmd_packet));
+    MatmulStripeJob job(&execution, std::move(input), status,
+                        std::move(direct_residual), std::move(rmd_packet));
     if (job.status_.ok()) {
         if (!execution.has_captures_) {
             execution.first_row_ = job.input_.row_begin();
@@ -1953,6 +2393,9 @@ MatmulStatus execute_dense_stripe(MatmulStripeJob & job) {
         job.dense_state_ = MatmulDenseState::running;
     }
     const auto start = Clock::now();
+#if CYCLE_DETAIL
+    job.metrics_.telemetry_dense_start = cycle::read();
+#endif
     const MatMulStatus status = job.execution_->facade_.run_stripe(
         { job.input_.row_begin(), job.input_.row_end() }, job.input_.stripe_id());
     const MatmulStatus dense_status = to_public_status(
@@ -1961,6 +2404,9 @@ MatmulStatus execute_dense_stripe(MatmulStripeJob & job) {
     {
         std::lock_guard<std::mutex> lock(*job.job_mutex_);
         job.metrics_.ws_end_ns = now_ns();
+#if LOG_CYCLE
+        job.metrics_.telemetry_dense_end = cycle::read();
+#endif
     }
     if (!dense_status) {
         job.record_failure(dense_status, true);
@@ -1984,6 +2430,7 @@ MatmulStatus execute_rmd_stripe(MatmulStripeJob & job) {
     if (job.job_mutex_ == nullptr) {
         return invalid_state("residual state unavailable");
     }
+    residual::DirectStripePayloadHandle direct;
     rmd::StripePacketHandle packet;
     {
         std::lock_guard<std::mutex> lock(*job.job_mutex_);
@@ -1991,6 +2438,7 @@ MatmulStatus execute_rmd_stripe(MatmulStripeJob & job) {
             job.residual_state_ != MatmulResidualState::idle) {
             return invalid_state("residual execution requires captured idle state");
         }
+        direct = job.direct_residual_;
         packet = job.rmd_packet_;
         job.residual_state_ = MatmulResidualState::running;
         job.metrics_.rmd_start_ns = now_ns();
@@ -1999,8 +2447,7 @@ MatmulStatus execute_rmd_stripe(MatmulStripeJob & job) {
             job.metrics_.rmd_queue.count = 1;
         }
     }
-    if (packet == nullptr) {
-        // Empty residual: nothing to execute, output stays unchanged.
+    if (direct == nullptr && packet == nullptr) {
         std::lock_guard<std::mutex> lock(*job.job_mutex_);
         job.rmd_output_ = {};
         job.rmd_correction_.clear();
@@ -2010,10 +2457,32 @@ MatmulStatus execute_rmd_stripe(MatmulStripeJob & job) {
     }
 
     const auto start = Clock::now();
+#if LOG_CYCLE
+    const uint64_t residual_start_tick = cycle::read();
+#else
+    constexpr uint64_t residual_start_tick = 0;
+#endif
     rmd::CompressedOutput output;
+    std::vector<rmd::OutputValue> direct_correction;
     rmd::RmdExecutionMetrics metrics{};
-    const rmd::RmdStatus status = rmd::execute_rmd_stripe(
-        job.execution_->facade_.args(), *packet, output, &metrics);
+    residual::DirectExecutionMetrics direct_metrics{};
+#if LOG_CYCLE
+    const uint64_t backend_start_tick = cycle::read();
+#else
+    constexpr uint64_t backend_start_tick = 0;
+#endif
+    const rmd::RmdStatus status = direct != nullptr
+        ? residual::execute_direct_stripe(
+              job.execution_->facade_.args(), *direct, direct_correction, &direct_metrics)
+        : rmd::execute_rmd_stripe_ws(
+              job.execution_->facade_.args(), *packet, output, &metrics);
+    metrics.direct_event_count = direct_metrics.event_count;
+    metrics.direct_call_count = direct_metrics.call_count;
+#if LOG_CYCLE
+    const uint64_t backend_end_tick = cycle::read();
+#else
+    constexpr uint64_t backend_end_tick = 0;
+#endif
     if (status != rmd::RmdStatus::success) {
         const MatmulStatus failure = from_rmd_status(status);
         job.record_failure(failure, false);
@@ -2021,10 +2490,12 @@ MatmulStatus execute_rmd_stripe(MatmulStripeJob & job) {
     }
     {
         std::lock_guard<std::mutex> lock(*job.job_mutex_);
-        if (!job.status_) {
-            return job.status_;
-        }
+        if (!job.status_) return job.status_;
         job.rmd_output_ = std::move(output);
+        job.rmd_correction_ = std::move(direct_correction);
+        job.metrics_.telemetry_residual_start = residual_start_tick;
+        job.metrics_.telemetry_backend_start = backend_start_tick;
+        job.metrics_.telemetry_backend_end = backend_end_tick;
         job.metrics_.rmd = metrics;
         record_metric(job.metrics_.rmd_execute, job.execution_->options_.profiling, start);
     }
@@ -2046,8 +2517,9 @@ MatmulStatus compose_rmd_stripe(MatmulStripeJob & job) {
             return invalid_state("compose requires an executed residual stripe");
         }
         packet = job.rmd_packet_;
-        if (packet == nullptr) {
+        if (job.direct_residual_ != nullptr || packet == nullptr) {
             job.residual_state_ = MatmulResidualState::complete;
+            job.metrics_.rmd_end_ns = now_ns();
             return {};
         }
     }
@@ -2094,15 +2566,40 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
         job.metrics_.stripe_id = job.input_.stripe_id();
         job.metrics_.row_begin = job.input_.row_begin();
         job.metrics_.row_end = job.input_.row_end();
-        if (job.rmd_packet_ != nullptr && !job.rmd_correction_.empty()) {
+        if (!job.rmd_correction_.empty()) {
             job.metrics_.merge_start_ns = now_ns();
-            const rmd::RmdStatus status = rmd::merge_rmd_correction(
-                job.execution_->facade_.args(), *job.rmd_packet_, job.rmd_correction_);
+#if LOG_CYCLE
+            job.metrics_.telemetry_merge_start = cycle::read();
+#endif
+            const rmd::RmdStatus status = job.direct_residual_ != nullptr
+                ? rmd::merge_rmd_correction(
+                      job.execution_->facade_.args(), job.input_.row_begin(),
+                      job.input_.row_end(), job.rmd_correction_)
+                : rmd::merge_rmd_correction(
+                      job.execution_->facade_.args(), *job.rmd_packet_,
+                      job.rmd_correction_);
             job.metrics_.merge_end_ns = now_ns();
+#if LOG_CYCLE
+            job.metrics_.telemetry_merge_end = cycle::read();
+            job.metrics_.telemetry_residual_end = job.metrics_.telemetry_merge_end;
+#endif
+#if CYCLE_DETAIL
+            job.metrics_.telemetry_input_hash = job.direct_residual_ != nullptr
+                ? rmd_input_hash(*job.direct_residual_) : rmd_input_hash(*job.rmd_packet_);
+            job.metrics_.telemetry_correction_hash = rmd_correction_hash(job.rmd_correction_);
+            job.metrics_.telemetry_output_hash = rmd_output_hash(
+                job.execution_->facade_.args(), job.input_.row_begin(), job.input_.row_end());
+#endif
             if (status != rmd::RmdStatus::success) {
                 merge_failure = from_rmd_status(status);
             }
         }
+#if LOG_CYCLE
+        if (job.metrics_.telemetry_residual_start != 0 &&
+            job.metrics_.telemetry_residual_end == 0) {
+            job.metrics_.telemetry_residual_end = cycle::read();
+        }
+#endif
         record_metric(job.metrics_.rmd_finalize, job.execution_->options_.profiling, start);
     }
     if (!merge_failure.ok()) {
@@ -2223,6 +2720,8 @@ MatmulStatus execute_post_fold_pipeline(
     MatmulOptions options{};
     options.mode = MatmulInvocationMode::stripe_pipeline;
     options.job_capacity = 1;
+    options.rmd_backend = args.residual_route == residual::ResidualRoute::cpu_direct
+        ? RmdBackend::cpu_direct : RmdBackend::gemmini_ws_compact;
     MatmulExecution execution = prepare_execution(args, options);
     if (!execution.status()) {
         return execution.status();
@@ -2231,7 +2730,7 @@ MatmulStatus execute_post_fold_pipeline(
         MatmulStripeJob job = capture_stripe(
             execution,
             MatmulStripeInput(captured.row_begin, captured.row_end, captured.stripe_id),
-            std::move(captured.rmd_packet));
+            std::move(captured.direct_residual), std::move(captured.rmd_packet));
         MatmulStatus status = job.status();
         if (status) status = execute_dense_stripe(job);
         if (status) status = execute_rmd_stripe(job);

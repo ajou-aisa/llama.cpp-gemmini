@@ -2,7 +2,7 @@
 
 #include "types.hpp"
 
-#include "../../../residual/rmd/rmd-builder.hpp"
+#include "../../../residual/residual-capture.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -346,6 +346,7 @@ namespace ggml::gemmini::quants::act::exsia
         // Residual work for this stripe, or nullptr when the stripe has no residual.
         // The packet owns its buffers, so it stays valid after the ExSIA slot is released.
         ggml::gemmini::rmd::StripePacketHandle rmd_packet;
+        ggml::gemmini::residual::DirectStripePayloadHandle direct_residual;
         uint64_t rmd_pack_ns = 0;
         uint64_t local_start_cycle = 0;
         uint64_t local_end_cycle = 0;
@@ -520,8 +521,9 @@ namespace ggml::gemmini::quants::act::exsia
         std::vector<uint64_t> block_mask_words; // slot-owned storage for per-block BlockMask views
         size_t block_mask_words_per_block = 0;
         size_t active_block_count = 0;
-        ggml::gemmini::rmd::RmdStripeBuilder rmd_builder; // fed during folding
-        ggml::gemmini::rmd::StripePacketHandle rmd_packet;  // sealed at folding commit
+        ggml::gemmini::residual::TimedResidualCapture rmd_builder; // selected once per run
+        ggml::gemmini::rmd::StripePacketHandle rmd_packet;
+        ggml::gemmini::residual::DirectStripePayloadHandle direct_residual;  // sealed at folding commit
         uint64_t rmd_pack_ns = 0;                           // packet seal duration
         uint64_t folding_commit_ns = 0;
 
@@ -574,6 +576,7 @@ namespace ggml::gemmini::quants::act::exsia
             stripe.outlier_mask.cols = 0;
             stripe.scratch.reset();
             rmd_packet.reset();
+            direct_residual.reset();
             rmd_pack_ns = 0;
             folding_commit_ns = 0;
 #if EXSIA_BRANCH_COUNTS_ENABLED
@@ -624,6 +627,7 @@ namespace ggml::gemmini::quants::act::exsia
             std::fill_n(block_mask_words.begin(), block_mask_word_count, uint64_t{0});
             active_block_count = blocks;
             rmd_packet.reset();
+            direct_residual.reset();
             rmd_pack_ns = 0;
             folding_commit_ns = 0;
 #if EXSIA_BRANCH_COUNTS_ENABLED
@@ -1043,7 +1047,7 @@ namespace ggml::gemmini::quants::act::exsia
             const std::vector<int32_t> &stripe_q_wide,
             const std::vector<int16_t> &stripe_block_exp,
             std::vector<int32_t> &residual,                  // dense global output, I * K_padded
-            ggml::gemmini::rmd::RmdStripeBuilder &rmd_builder); // stripe-local RMD packet builder
+            ggml::gemmini::residual::TimedResidualCapture &rmd_builder); // route-specific stripe sink
 
     private:
         OutlierMarker unit_outlier_;

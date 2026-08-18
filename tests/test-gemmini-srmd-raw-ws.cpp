@@ -383,6 +383,10 @@ int main(int argc, char ** argv) {
     if (argc != 2) {
         return usage("expected exactly one mode");
     }
+    if (std::strcmp(argv[1], "--help") == 0) {
+        std::fputs("usage: test-gemmini-srmd-raw-ws --cpu|--bench-layouts|--ws\n", stdout);
+        return 0;
+    }
     if (std::strcmp(argv[1], "--cpu") == 0) {
         return run_cpu() ? 0 : 1;
     }

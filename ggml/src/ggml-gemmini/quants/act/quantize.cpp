@@ -102,4 +102,9 @@ const act::RmdPacketList &activation_rmd_packets(const ggml_gemmini_args_t &args
 {
     return act::rmd_packets(args);
 }
+
+const act::DirectResidualList &activation_direct_residuals(const ggml_gemmini_args_t &args)
+{
+    return act::direct_residuals(args);
+}
 } // namespace ggml::gemmini::quants

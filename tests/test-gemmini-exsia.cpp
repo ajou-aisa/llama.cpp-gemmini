@@ -6,9 +6,12 @@
 
 #include <ggml.h>
 #ifndef GEMMINI_EXSIA_WRITER_TEST_ONLY
+#include "../ggml/src/ggml-gemmini/residual/direct/direct-builder.hpp"
+#include "../ggml/src/ggml-gemmini/residual/direct/direct-executor.hpp"
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.hpp"
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.hpp"
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.hpp"
+#include "../ggml/src/ggml-gemmini/residual/rmd/rmd-reference.hpp"
 #include <gemmini.h>
 #endif
 
@@ -16,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -102,33 +106,43 @@ bool test_rmd_cpu_ws_routes() {
     }
 
     rmd::CompressedOutput cpu_output;
-    args.tiled_matmul_type = CPU;
-    const rmd::RmdStatus cpu = rmd::execute_rmd_stripe(args, *packet, cpu_output);
+    args.tiled_matmul_type = OS;
+    const rmd::RmdStatus cpu =
+        rmd::execute_rmd_stripe_reference(args, *packet, cpu_output);
     if (!check(cpu == rmd::RmdStatus::success && !cpu_output.values.empty() &&
-               cpu_output.values.front() == 4, "RMD CPU compensation")) {
+               cpu_output.values.front() == 4,
+               "RMD reference API ignores the runtime matmul route")) {
         return false;
     }
 
+    const rmd::StripePacket packet_before = *packet;
     rmd::CompressedOutput output;
     output.j_padded = 7;
     output.values = { 11, 22, 33 };
     const rmd::CompressedOutput unchanged = output;
-    args.tiled_matmul_type = OS;
-    const bool os_rejected = rmd::execute_rmd_stripe(args, *packet, output) ==
-        rmd::RmdStatus::unsupported_route;
-    const bool os_preserved_output = output.j_padded == unchanged.j_padded &&
-        output.values == unchanged.values;
-    args.tiled_matmul_type = WS;
-    const rmd::RmdStatus ws = rmd::execute_rmd_stripe(args, *packet, output);
+    rmd::StripePacket malformed = *packet;
+    const rmd::BlockDescriptor & first = malformed.blocks.front();
+    malformed.stacked_activation[first.activation_offset + first.compact_k_count] = 1;
+    if (!check(rmd::execute_rmd_stripe_ws(args, malformed, output) ==
+                   rmd::RmdStatus::invalid_packet &&
+               output.j_padded == unchanged.j_padded && output.values == unchanged.values,
+               "explicit RMD WS validates packets before host rejection")) {
+        return false;
+    }
+    const rmd::RmdStatus ws = rmd::execute_rmd_stripe_ws(args, *packet, output);
 #if defined(__riscv)
     const bool ws_result = ws == rmd::RmdStatus::success && output.values == cpu_output.values;
 #else
     const bool ws_result = ws == rmd::RmdStatus::unsupported_route &&
         output.j_padded == unchanged.j_padded && output.values == unchanged.values;
 #endif
-    return check(os_rejected, "RMD OS route rejected") &&
-        check(os_preserved_output, "RMD failure preserves caller output") &&
-        check(ws_result, "RMD WS route matches CPU on FPGA or rejects unsupported host");
+    return check(ws_result, "explicit RMD WS matches reference or rejects unsupported host") &&
+        check(packet->blocks.size() == packet_before.blocks.size() &&
+              std::memcmp(packet->blocks.data(), packet_before.blocks.data(),
+                          packet->blocks.size() * sizeof(rmd::BlockDescriptor)) == 0 &&
+              packet->k_indices == packet_before.k_indices &&
+              packet->stacked_activation == packet_before.stacked_activation,
+              "compact execution preserves packet bytes");
 }
 
 bool test_rmd_cpu_direct_parity() {
@@ -204,7 +218,7 @@ bool test_rmd_cpu_direct_parity() {
     rmd::CompressedOutput compressed;
     rmd::RmdExecutionMetrics metrics{};
     const rmd::RmdStatus execution_status =
-        rmd::execute_rmd_stripe(args, *packet, compressed, &metrics);
+        rmd::execute_rmd_stripe_reference(args, *packet, compressed, &metrics);
     if (execution_status != rmd::RmdStatus::success) {
         std::fprintf(stderr, "FAIL: RMD direct-parity CPU execution: %s\n",
                      rmd::rmd_status_message(execution_status));
@@ -316,6 +330,145 @@ bool test_rmd_cpu_direct_parity() {
     return true;
 }
 
+bool test_direct_cpu_executor() {
+    using residual::DirectStripeBuilder;
+    using residual::DirectStripePayload;
+    using residual::DirectStripePayloadHandle;
+    using residual::ResidualEvent;
+
+    auto build_payload = [](size_t rows, size_t k_count, size_t j_count,
+                            const std::vector<ResidualEvent> & events) {
+        DirectStripeBuilder builder;
+        builder.reset(3, 7, rows, k_count, j_count);
+        for (const ResidualEvent & event : events) {
+            if (!builder.add_residual(event.local_row, event.original_k, event.residual))
+                return DirectStripePayloadHandle{};
+        }
+        return builder.finish();
+    };
+    auto reference = [](const ggml_gemmini_args_t & args,
+                        const DirectStripePayload & payload,
+                        std::vector<rmd::OutputValue> & output) {
+        std::vector<rmd::ReferenceResidual> events;
+        for (const ResidualEvent & event : payload.events) {
+            events.push_back({static_cast<uint32_t>(event.local_row),
+                              static_cast<uint32_t>(event.original_k), event.residual});
+        }
+        return rmd::reference_direct_correction(args, payload.row_count, events, output);
+    };
+
+    constexpr size_t rows = 4, columns = 19, logical_k = 65, blocks_per_row = 3;
+    std::vector<block_q8_h1> native_weights(columns * blocks_per_row);
+    for (size_t j = 0; j < columns; ++j) {
+        for (size_t block_id = 0; block_id < blocks_per_row; ++block_id) {
+            block_q8_h1 & block = native_weights[j * blocks_per_row + block_id];
+            for (size_t k = 0; k < QK8_0; ++k)
+                block.qs[k] = static_cast<int8_t>((j * 19 + block_id * 31 + k * 7) % 255 - 127);
+            block.qs[1] = block.qs[0];
+            block.c_b = static_cast<uint8_t>(2 + j + block_id);
+            block.R = static_cast<uint16_t>(5 + block_id * 3);
+            block.s_rf = 1.0f;
+        }
+    }
+    const auto native_payload = build_payload(rows, logical_k, columns, {
+        {0, 0, std::numeric_limits<int32_t>::max()},
+        {0, 1, -std::numeric_limits<int32_t>::max()},
+        {0, 31, 129}, {0, 32, -65537}, {0, 64, 16777217},
+        {1, 32, 256}, {2, 32, -257}, {3, 7, -16777217}, {3, 64, 65536},
+    });
+    if (!check(native_payload != nullptr, "direct native sparse payload built")) return false;
+
+    ggml_gemmini_args_t native_args{};
+    native_args.I = rows; native_args.J = columns; native_args.K = logical_k;
+    native_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1;
+    native_args.q8_h1_blocks = native_weights.data();
+    native_args.q8_h1_block_count = native_weights.size();
+    native_args.q8_h1_rows = columns;
+    native_args.blocks_per_row = blocks_per_row;
+    native_args.block_size_k = QK8_0;
+    std::vector<rmd::OutputValue> native_expected;
+    std::vector<rmd::OutputValue> native_actual = {91, 92, 93};
+    if (!check(reference(native_args, *native_payload, native_expected) == rmd::RmdStatus::success,
+               "direct native reference succeeds") ||
+        !check(residual::execute_direct_stripe(native_args, *native_payload, native_actual) ==
+                   rmd::RmdStatus::success,
+               "direct native execution succeeds") ||
+        !check(native_actual == native_expected,
+               "direct sparse/decode/reused-K/multi-block/tail/cancellation parity")) return false;
+
+    constexpr size_t dense_rows = 2, dense_columns = 5, dense_k = 37;
+    std::vector<elem_t> dense_weights(dense_k * dense_columns);
+    for (size_t k = 0; k < dense_k; ++k)
+        for (size_t j = 0; j < dense_columns; ++j)
+            dense_weights[k * dense_columns + j] = static_cast<elem_t>((k * 11 + j * 17) % 255 - 127);
+    const auto dense_payload = build_payload(dense_rows, dense_k, dense_columns,
+        {{0, 0, 128}, {0, 31, -129}, {0, 32, 65536}, {1, 9, -16777217}, {1, 36, 257}});
+    ggml_gemmini_args_t dense_args{};
+    dense_args.I = dense_rows; dense_args.J = dense_columns; dense_args.K = dense_k;
+    dense_args.B = dense_weights.data(); dense_args.sB = dense_columns;
+    dense_args.weight_i8_scale_active = true; dense_args.weight_scale = 0.25f;
+    std::vector<rmd::OutputValue> dense_expected;
+    std::vector<rmd::OutputValue> dense_actual = {-7};
+    if (!check(dense_payload != nullptr, "direct dense payload built") ||
+        !check(reference(dense_args, *dense_payload, dense_expected) == rmd::RmdStatus::success,
+               "direct dense reference succeeds") ||
+        !check(residual::execute_direct_stripe(dense_args, *dense_payload, dense_actual) ==
+                   rmd::RmdStatus::success && dense_actual == dense_expected,
+               "direct dense route parity")) return false;
+
+    const std::vector<rmd::OutputValue> sentinel = {11, 22, 33};
+    std::vector<rmd::OutputValue> failed = sentinel;
+    DirectStripePayload malformed = *dense_payload;
+    std::swap(malformed.events[0], malformed.events[1]);
+    if (!check(residual::execute_direct_stripe(dense_args, malformed, failed) ==
+                   rmd::RmdStatus::invalid_packet && failed == sentinel,
+               "direct invalid payload fails atomically")) return false;
+    ggml_gemmini_args_t unsupported_args = dense_args;
+    unsupported_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h0;
+    if (!check(residual::execute_direct_stripe(unsupported_args, *dense_payload, failed) ==
+                   rmd::RmdStatus::unsupported_route && failed == sentinel,
+               "direct unsupported route fails atomically")) return false;
+
+    DirectStripePayload overflow_shape = *dense_payload;
+    overflow_shape.row_begin = 0;
+    overflow_shape.row_count = std::numeric_limits<size_t>::max() / 2 + 1;
+    overflow_shape.logical_j = 3;
+    ggml_gemmini_args_t overflow_shape_args = dense_args; overflow_shape_args.J = 3;
+    if (!check(residual::execute_direct_stripe(overflow_shape_args, overflow_shape, failed) ==
+                   rmd::RmdStatus::overflow && failed == sentinel,
+               "direct output shape overflow fails atomically")) return false;
+    DirectStripePayload allocation_shape = *dense_payload;
+    allocation_shape.row_count = std::numeric_limits<size_t>::max() / 8;
+    allocation_shape.logical_j = 2;
+    ggml_gemmini_args_t allocation_args = dense_args; allocation_args.J = 2;
+    if (!check(residual::execute_direct_stripe(allocation_args, allocation_shape, failed) ==
+                   rmd::RmdStatus::allocation_failure && failed == sentinel,
+               "direct impossible allocation fails atomically")) return false;
+
+    constexpr size_t overflow_k = 17 * QK8_0;
+    std::vector<block_q8_h1> overflow_weights(17);
+    for (block_q8_h1 & block : overflow_weights) {
+        std::fill(std::begin(block.qs), std::end(block.qs), static_cast<int8_t>(127));
+        block.c_b = std::numeric_limits<uint8_t>::max();
+        block.R = std::numeric_limits<uint16_t>::max(); block.s_rf = 1.0f;
+    }
+    std::vector<ResidualEvent> overflow_events;
+    for (size_t k = 0; k < overflow_k; ++k)
+        overflow_events.push_back({0, k, std::numeric_limits<int32_t>::max()});
+    const auto overflow_payload = build_payload(1, overflow_k, 1, overflow_events);
+    ggml_gemmini_args_t overflow_args{};
+    overflow_args.I = overflow_args.J = 1; overflow_args.K = overflow_k;
+    overflow_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1;
+    overflow_args.q8_h1_blocks = overflow_weights.data();
+    overflow_args.q8_h1_block_count = overflow_weights.size();
+    overflow_args.q8_h1_rows = 1; overflow_args.blocks_per_row = overflow_weights.size();
+    overflow_args.block_size_k = QK8_0;
+    return check(overflow_payload != nullptr, "direct overflow payload built") &&
+        check(residual::execute_direct_stripe(overflow_args, *overflow_payload, failed) ==
+                  rmd::RmdStatus::overflow && failed == sentinel,
+              "direct arithmetic overflow fails atomically");
+}
+
 bool test_rmd_lane_partition() {
     constexpr size_t logical_k = 32;
     std::vector<int32_t> residuals(logical_k, 0);
@@ -358,7 +511,7 @@ bool test_rmd_lane_partition() {
 
     rmd::CompressedOutput compressed;
     rmd::RmdExecutionMetrics metrics{};
-    if (!check(rmd::execute_rmd_stripe(args, *packet, compressed, &metrics) ==
+    if (!check(rmd::execute_rmd_stripe_reference(args, *packet, compressed, &metrics) ==
                    rmd::RmdStatus::success,
                "RMD lane-partition execution")) {
         return false;
@@ -843,7 +996,8 @@ int main(int argc, char ** argv) {
 
     const bool known = case_name == "all" || case_name == "baseline" ||
         case_name == "dispatch" || case_name == "rmd-routes" ||
-        case_name == "rmd-direct-parity" || case_name == "rmd-gather";
+        case_name == "rmd-direct-parity" || case_name == "direct-executor" ||
+        case_name == "rmd-gather";
     if (!known) {
         std::fprintf(stderr, "unknown case: %s\n", case_name.c_str());
         return 2;
@@ -853,12 +1007,13 @@ int main(int argc, char ** argv) {
     const bool ok =
         (case_name == "all" && test_exsia_baseline() && test_dispatch_modes() &&
          test_rmd_cpu_ws_routes() && test_rmd_cpu_direct_parity() &&
-         test_rmd_lane_partition() && test_rmd_weight_gather()) ||
+         test_direct_cpu_executor() && test_rmd_lane_partition() && test_rmd_weight_gather()) ||
         (case_name == "baseline" && test_exsia_baseline()) ||
         (case_name == "dispatch" && test_dispatch_modes()) ||
         (case_name == "rmd-routes" && test_rmd_cpu_ws_routes()) ||
         (case_name == "rmd-direct-parity" && test_rmd_cpu_direct_parity() &&
          test_rmd_lane_partition()) ||
+        (case_name == "direct-executor" && test_direct_cpu_executor()) ||
         (case_name == "rmd-gather" && test_rmd_weight_gather());
     if (ok)
         std::printf("PASS: case=%s\n", case_name.c_str());

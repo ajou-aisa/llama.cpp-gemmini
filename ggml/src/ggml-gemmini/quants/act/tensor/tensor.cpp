@@ -211,10 +211,11 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
         return false;
 
     meta->rmd_packets.clear();
+    meta->direct_residuals.clear();
 
 #if GGML_GEMMINI_ENABLE_RMD
-    ggml::gemmini::rmd::RmdStripeBuilder rmd_builder;
-    rmd_builder.reset(0, 0, args.I, args.K, args.J);
+    ggml::gemmini::residual::TimedResidualCapture residual_capture(args.residual_route);
+    residual_capture.reset(0, 0, args.I, args.K, args.J);
     TensorStats inlier_stats{};
     BitMask outliers;
     if (!outliers.resize(args.I, args.K))
@@ -245,16 +246,19 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
                 return false;
             const int32_t residual = static_cast<int32_t>(wide_residual);
             if (outliers.is_marked(row, col) && residual != 0 &&
-                !rmd_builder.add_residual(row, col, residual))
+                !residual_capture.add_residual(row, col, residual))
                 return false;
 #endif
         }
     }
 
 #if GGML_GEMMINI_ENABLE_RMD
-    if (auto packet = rmd_builder.finish())
-        meta->rmd_packets.push_back(std::move(packet));
-    else if (rmd_builder.status() != ggml::gemmini::rmd::RmdStatus::success)
+    const auto payload = residual_capture.finish();
+    if (payload.packet)
+        meta->rmd_packets.push_back(payload.packet);
+    if (payload.direct)
+        meta->direct_residuals.push_back(payload.direct);
+    if (residual_capture.status() != ggml::gemmini::rmd::RmdStatus::success)
         return false;
 #endif
 

@@ -40,6 +40,10 @@ private:
 };
 
 struct RmdExecutionMetrics {
+    size_t direct_event_count = 0;
+    size_t direct_call_count = 0;
+    size_t packet_call_count = 0;
+    size_t ws_call_count = 0;
     size_t active_blocks = 0;
     size_t active_lanes = 0;
     size_t compact_k_count = 0;
@@ -61,18 +65,25 @@ struct RmdExecutionMetrics {
 
 void collect_packet_metrics(const StripePacket & packet, RmdExecutionMetrics & metrics);
 
-// Runs every block of the packet in ascending original block id, applies the block
-// integer scale exactly once, and writes the canonical block-scaled INT64 output.
-RmdStatus execute_rmd_stripe(const ggml_gemmini_args_t & args,
-                             const StripePacket & packet,
-                             CompressedOutput & output,
-                             RmdExecutionMetrics * metrics = nullptr);
+// Runs every block of the packet on Gemmini in weight-stationary mode, applies the
+// block integer scale exactly once, and writes the canonical block-scaled INT64
+// output. On hosts without Gemmini, returns unsupported_route without changing output.
+RmdStatus execute_rmd_stripe_ws(const ggml_gemmini_args_t & args,
+                                const StripePacket & packet,
+                                CompressedOutput & output,
+                                RmdExecutionMetrics * metrics = nullptr);
 
 // True when the weight route can express its scale as
 // integer_block_scale(j, block) * column_scale(j).
 bool weight_route_supports_rmd(const ggml_gemmini_args_t & args);
 
 #if defined(GGML_GEMMINI_TESTING)
+// Scalar packet oracle for tests only. Production callers cannot select or invoke it.
+RmdStatus execute_rmd_stripe_reference(const ggml_gemmini_args_t & args,
+                                       const StripePacket & packet,
+                                       CompressedOutput & output,
+                                       RmdExecutionMetrics * metrics = nullptr);
+
 RmdStatus gather_weight_tile_for_test(const ggml_gemmini_args_t & args,
                                       uint32_t block_id,
                                       const uint16_t * local_k,

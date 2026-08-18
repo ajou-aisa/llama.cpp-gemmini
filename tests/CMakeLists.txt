@@ -109,6 +109,8 @@ if (NOT WIN32)
     if (BASH_EXECUTABLE AND EXISTS "${BASH_EXECUTABLE}")
         add_test(NAME test-experiment-output
             COMMAND ${BASH_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-experiment-output.sh)
+        add_test(NAME test-gemmini-rmd-on-off-run
+            COMMAND ${BASH_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-rmd-on-off-run.sh)
     endif()
 
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API
@@ -180,6 +182,9 @@ endif()
 llama_build_and_test(test-gemmini-q8-h1-h2-dequant-fp.cpp NAME gemmini_q8_h1_h2_dequant_fp)
 target_sources(gemmini_q8_h1_h2_dequant_fp PRIVATE
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
     ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
     ../ggml/src/ggml-gemmini/quants/act/quantize.cpp
     ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
@@ -222,9 +227,11 @@ add_test(NAME test-gemmini-act-quant-i32-saturation
 add_executable(test-gemmini-exsia
     test-gemmini-exsia.cpp
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
+    ../ggml/src/ggml-gemmini/residual/direct/direct-executor.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-reference.cpp
     ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
     ../ggml/src/ggml-gemmini/quants/act/quantize.cpp
     ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
@@ -249,7 +256,7 @@ target_include_directories(test-gemmini-exsia PRIVATE
     ../ggml/src/ggml-gemmini/quants/act
     ../ggml/src/ggml-gemmini/quants/act/exsia
     ../ggml/src/ggml-gemmini/quants/common)
-foreach(_case IN ITEMS all baseline dispatch rmd-routes rmd-direct-parity rmd-gather)
+foreach(_case IN ITEMS all baseline dispatch rmd-routes rmd-direct-parity direct-executor rmd-gather)
     string(REPLACE "-" "_" _case_test_name "${_case}")
     add_test(NAME gemmini_exsia_${_case_test_name}
         COMMAND ${CMAKE_COMMAND}
@@ -331,6 +338,23 @@ target_include_directories(test-gemmini-rmd PRIVATE
     ${GEMMINI_SW_PATH}/include)
 add_test(NAME test-gemmini-rmd COMMAND $<TARGET_FILE:test-gemmini-rmd>)
 
+add_executable(test-gemmini-rmd-telemetry
+    test-gemmini-rmd-telemetry.cpp
+    ../ggml/src/ggml-gemmini/ggml-gemmini-matmul.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp)
+target_link_libraries(test-gemmini-rmd-telemetry PRIVATE ggml-gemmini-utils)
+target_compile_features(test-gemmini-rmd-telemetry PRIVATE cxx_std_17)
+target_compile_definitions(test-gemmini-rmd-telemetry PRIVATE
+    GGML_GEMMINI_PIPELINE_WRITER_TEST_ONLY=1
+    LOG_CYCLE=${LOG_CYCLE}
+    CYCLE_DETAIL=${CYCLE_DETAIL})
+target_include_directories(test-gemmini-rmd-telemetry PRIVATE
+    ../ggml/include ../ggml/src ../ggml/src/ggml-gemmini
+    ../ggml/src/ggml-gemmini-utils/include ${GGML_GEMMINI_GENERATED_CONFIG_DIR}
+    ${GEMMINI_SW_PATH} ${GEMMINI_SW_PATH}/include)
+add_test(NAME test-gemmini-rmd-telemetry
+    COMMAND $<TARGET_FILE:test-gemmini-rmd-telemetry>)
+
 set(GEMMINI_SRMD_RAW_WS_HEADER "")
 foreach(_header IN ITEMS
         "${GEMMINI_SW_PATH}/gemmini.h"
@@ -407,6 +431,12 @@ if (EXISTS "${CMAKE_COMMAND}" AND EXISTS "${LLAMA_TEST_SOURCE_DIR}/CMakeLists.tx
             -DTEST_GENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM}
             -DTEST_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-build-contract.cmake)
+    add_test(
+        NAME test-gemmini-rmd-backend-denylist
+        COMMAND ${CMAKE_COMMAND}
+            -DTEST_SOURCE_DIR=${LLAMA_TEST_SOURCE_DIR}
+            -DTEST_BINARY_DIR=${CMAKE_BINARY_DIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-rmd-backend-denylist.cmake)
 endif()
 
 if (NOT GGML_BACKEND_DL)

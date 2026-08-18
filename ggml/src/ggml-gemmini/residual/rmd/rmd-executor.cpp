@@ -161,6 +161,13 @@ struct LaneGroup {
     size_t padded_k_count = 0;
 };
 
+enum class CompactExecutorBackend : uint8_t {
+    gemmini_ws,
+#if defined(GGML_GEMMINI_TESTING)
+    scalar_reference,
+#endif
+};
+
 size_t count_bits(uint32_t value) {
     size_t count = 0;
     while (value != 0) {
@@ -551,10 +558,8 @@ void collect_packet_metrics(const StripePacket & packet, RmdExecutionMetrics & m
         metrics.active_lanes;
 }
 
-RmdStatus execute_rmd_stripe(const ggml_gemmini_args_t & args,
-                             const StripePacket & packet,
-                             CompressedOutput & output,
-                             RmdExecutionMetrics * metrics) {
+static RmdStatus validate_execution_request(const ggml_gemmini_args_t & args,
+                                            const StripePacket & packet) {
     const RmdStatus validation = validate_packet(packet);
     if (validation != RmdStatus::success) {
         return validation;
@@ -562,17 +567,14 @@ RmdStatus execute_rmd_stripe(const ggml_gemmini_args_t & args,
     if (packet.logical_j != args.J || packet.logical_k != args.K) {
         return RmdStatus::invalid_arguments;
     }
-    if (args.tiled_matmul_type == OS) {
-        return RmdStatus::unsupported_route;
-    }
-#if !defined(__riscv)
-    if (args.tiled_matmul_type == WS) {
-        return RmdStatus::unsupported_route;
-    }
-#endif
-    if (args.tiled_matmul_type != CPU && args.tiled_matmul_type != WS) {
-        return RmdStatus::invalid_arguments;
-    }
+    return RmdStatus::success;
+}
+
+template<CompactExecutorBackend Backend>
+RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
+                                  const StripePacket & packet,
+                                  CompressedOutput & output,
+                                  RmdExecutionMetrics * metrics) {
 
     const wroute::WeightRoutePlan plan = wroute::resolve_weight_route_plan(
         args, wroute::WeightScaleInfoMode::Residual);
@@ -623,7 +625,7 @@ RmdStatus execute_rmd_stripe(const ggml_gemmini_args_t & args,
     try {
         stacked_values.assign(max_stacked_rows * kArrayDim, OutputValue{0});
         weight_tile.assign(kArrayDim * kArrayDim, int8_t{0});
-        if (args.tiled_matmul_type == WS) {
+        if constexpr (Backend == CompactExecutorBackend::gemmini_ws) {
             ws_values.assign(max_stacked_rows * kArrayDim, acc_t{0});
         }
         block_scales.assign(kArrayDim, uint64_t{0});
@@ -681,7 +683,7 @@ RmdStatus execute_rmd_stripe(const ggml_gemmini_args_t & args,
                         gather_counts.baseline_address_resolutions;
                     weight_address_resolutions += gather_counts.address_resolutions;
                     const int8_t * activation = group.activation.data() + k_base;
-                    if (args.tiled_matmul_type == WS) {
+                    if constexpr (Backend == CompactExecutorBackend::gemmini_ws) {
                         std::fill_n(ws_values.begin(), stacked_value_count, acc_t{0});
                         tiled_matmul(stacked_rows, valid_cols, valid_k,
                             activation, weight_tile.data(), nullptr, ws_values.data(),
@@ -699,7 +701,9 @@ RmdStatus execute_rmd_stripe(const ggml_gemmini_args_t & args,
                                 }
                             }
                         }
-                    } else {
+                    }
+#if defined(GGML_GEMMINI_TESTING)
+                    else {
                         for (size_t row = 0; row < stacked_rows; ++row) {
                             const int8_t * activation_row =
                                 activation + row * group.padded_k_count;
@@ -720,6 +724,7 @@ RmdStatus execute_rmd_stripe(const ggml_gemmini_args_t & args,
                             }
                         }
                     }
+#endif
                 }
 
                 // Block integer scale is applied exactly once after all compact K tiles.
@@ -777,8 +782,44 @@ RmdStatus execute_rmd_stripe(const ggml_gemmini_args_t & args,
         metrics->weight_baseline_address_resolutions =
             weight_baseline_address_resolutions;
         metrics->weight_address_resolutions = weight_address_resolutions;
+        metrics->packet_call_count = 1;
+        if constexpr (Backend == CompactExecutorBackend::gemmini_ws) {
+            metrics->ws_call_count = matmul_call_count;
+        }
     }
     return RmdStatus::success;
 }
+
+RmdStatus execute_rmd_stripe_ws(const ggml_gemmini_args_t & args,
+                                const StripePacket & packet,
+                                CompressedOutput & output,
+                                RmdExecutionMetrics * metrics) {
+    const RmdStatus validation = validate_execution_request(args, packet);
+    if (validation != RmdStatus::success) {
+        return validation;
+    }
+#if !defined(__riscv)
+    (void) output;
+    (void) metrics;
+    return RmdStatus::unsupported_route;
+#else
+    return execute_rmd_stripe_impl<CompactExecutorBackend::gemmini_ws>(
+        args, packet, output, metrics);
+#endif
+}
+
+#if defined(GGML_GEMMINI_TESTING)
+RmdStatus execute_rmd_stripe_reference(const ggml_gemmini_args_t & args,
+                                       const StripePacket & packet,
+                                       CompressedOutput & output,
+                                       RmdExecutionMetrics * metrics) {
+    const RmdStatus validation = validate_execution_request(args, packet);
+    if (validation != RmdStatus::success) {
+        return validation;
+    }
+    return execute_rmd_stripe_impl<CompactExecutorBackend::scalar_reference>(
+        args, packet, output, metrics);
+}
+#endif
 
 }

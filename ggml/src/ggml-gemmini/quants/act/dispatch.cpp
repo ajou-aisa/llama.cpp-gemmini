@@ -227,6 +227,19 @@ const RmdPacketList &rmd_packets(const ggml_gemmini_args_t &args)
     return empty;
 }
 
+
+const DirectResidualList &direct_residuals(const ggml_gemmini_args_t &args)
+{
+    static const DirectResidualList empty;
+    const auto &storage = args.act_quant.storage();
+    if (const auto *meta = std::get_if<exsia::Meta>(&storage)) return meta->direct_residuals;
+    if (const auto *meta = std::get_if<tensor::Meta>(&storage)) return meta->direct_residuals;
+    if (const auto *meta = std::get_if<token::Meta>(&storage)) return meta->direct_residuals;
+    if (const auto *meta = std::get_if<stripe::Meta>(&storage)) return meta->direct_residuals;
+    if (const auto *meta = std::get_if<block::Meta>(&storage)) return meta->direct_residuals;
+    return empty;
+}
+
 std::vector<float> activation_scales(const ggml_gemmini_args_t &args, size_t row_count)
 {
     std::vector<float> scales(row_count);
