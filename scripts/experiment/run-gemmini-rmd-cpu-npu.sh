@@ -12,10 +12,12 @@ cleanup_guest_temp() {
 usage() {
     cat <<EOF
 usage:
+  $program manager [options]
   $program prepare [options]
   $program launch [options]
   $program run [options]
 
+manager: run prepare and launch consecutively with one manager command.
 prepare: source the FireSim manager environment, preserve any old build,
          build one RMD-enabled RISC-V binary, bundle libgomp, and update rootfs.
 launch:  source the FireSim manager environment and launch the workload.
@@ -26,6 +28,9 @@ prepare options:
   --workspace PATH      repository on the Alveo manager
   --firesim-root PATH   FireSim root (default: /home/alveo/firesim)
   --build-dir NAME      build directory name (default: build-riscv-rmd-cpu-npu)
+
+manager options:
+  same options as prepare
 
 launch options:
   --firesim-root PATH   FireSim root (default: /home/alveo/firesim)
@@ -272,6 +277,23 @@ launch_manager() {
         cd -- "$firesim_root/deploy"
         firesim runworkload
     )
+}
+
+run_manager_all() {
+    local firesim_root=/home/alveo/firesim
+    local index
+    local -a prepare_arguments=("$@")
+
+    for ((index = 0; index < ${#prepare_arguments[@]}; ++index)); do
+        if [[ ${prepare_arguments[$index]} == --firesim-root ]]; then
+            (($((index + 1)) < ${#prepare_arguments[@]})) ||
+                die_usage 'missing value for --firesim-root'
+            firesim_root=${prepare_arguments[$((index + 1))]}
+            break
+        fi
+    done
+    prepare_manager "${prepare_arguments[@]}"
+    launch_manager --firesim-root "$firesim_root"
 }
 
 run_guest() {
@@ -697,6 +719,10 @@ run_guest() {
 }
 
 case ${1:-} in
+    manager)
+        shift
+        run_manager_all "$@"
+        ;;
     prepare)
         shift
         prepare_manager "$@"

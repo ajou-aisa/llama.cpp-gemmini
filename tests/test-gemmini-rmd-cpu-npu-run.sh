@@ -199,6 +199,7 @@ EOF
 chmod +x "$mock_bin/cp"
 
 assert_status 0 "$runner" --help
+assert_contains "$test_root/status.stdout" 'manager'
 assert_contains "$test_root/status.stdout" 'prepare'
 assert_contains "$test_root/status.stdout" 'run'
 assert_status 2 "$runner" unknown
@@ -206,7 +207,8 @@ assert_status 2 "$runner" unknown
 prepare_output="$test_root/prepare.stdout"
 ROOTFS_MARKER="$test_root/rootfs-updated" RUNTIME_FIXTURE="$runtime_fixture" \
 LIBGOMP_FIXTURE="$libgomp_fixture" MANAGER_WORKSPACE="$workspace" \
-GUEST_WORKSPACE="$guest_workspace" "$runner" prepare \
+GUEST_WORKSPACE="$guest_workspace" LAUNCH_MARKER="$test_root/launched" \
+"$runner" manager \
     --workspace "$workspace" \
     --firesim-root "$firesim_root" >"$prepare_output"
 
@@ -225,7 +227,6 @@ bundle_id=$(awk -F= '$1 == "bundle_id" { print $2 }' "$prepare_output")
 [[ $bundle_id =~ ^[0-9a-f]{64}$ ]] || fail 'prepare did not print a bundle ID'
 assert_contains "$prepare_output" \
     "guest_command=/root/workspace/3rd_llama.cpp/scripts/experiment/run-gemmini-rmd-cpu-npu.sh run --expected-bundle-id $bundle_id"
-LAUNCH_MARKER="$test_root/launched" "$runner" launch --firesim-root "$firesim_root"
 assert_file "$test_root/launched"
 
 assert_status 1 "$runner" run \
