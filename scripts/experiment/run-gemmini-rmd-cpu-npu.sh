@@ -297,6 +297,11 @@ launch_manager() {
     [[ ${FIRESIM_SOURCED:-0} == 1 ]] || die 'FireSim manager environment was not sourced'
     export PATH="$firesim_root/.conda-env/bin:$PATH"
     command -v firesim >/dev/null 2>&1 || die 'firesim command is unavailable'
+    printf 'manager_step=infrasetup\n'
+    (
+        cd -- "$firesim_root/deploy"
+        firesim infrasetup
+    )
     printf 'manager_step=launch_workload\n'
     (
         cd -- "$firesim_root/deploy"

@@ -80,8 +80,19 @@ cat >"$firesim_root/.conda-env/bin/firesim" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 [[ ${FIRESIM_SOURCED:-0} == 1 ]]
-[[ ${1:-} == runworkload ]]
-printf 'launched\n' >"$LAUNCH_MARKER"
+case ${1:-} in
+    infrasetup)
+        printf 'infrasetup\n' >>"$FIRESIM_ORDER_MARKER"
+        ;;
+    runworkload)
+        printf 'runworkload\n' >>"$FIRESIM_ORDER_MARKER"
+        [[ $(sed -n '1p' "$FIRESIM_ORDER_MARKER") == infrasetup ]]
+        printf 'launched\n' >"$LAUNCH_MARKER"
+        ;;
+    *)
+        exit 1
+        ;;
+esac
 EOF
 chmod +x "$firesim_root/.conda-env/bin/firesim"
 
@@ -234,7 +245,7 @@ prepare_output="$test_root/prepare.stdout"
 ROOTFS_MARKER="$test_root/rootfs-updated" RUNTIME_FIXTURE="$runtime_fixture" \
 LIBGOMP_FIXTURE="$libgomp_fixture" MANAGER_WORKSPACE="$workspace" \
 GUEST_WORKSPACE="$guest_workspace" LAUNCH_MARKER="$test_root/launched" \
-"$runner" manager \
+FIRESIM_ORDER_MARKER="$test_root/firesim-order" "$runner" manager \
     --workspace "$workspace" \
     --firesim-root "$firesim_root" >"$prepare_output"
 
@@ -254,6 +265,9 @@ bundle_id=$(awk -F= '$1 == "bundle_id" { print $2 }' "$prepare_output")
 assert_contains "$prepare_output" \
     "guest_command=/root/workspace/3rd_llama.cpp/scripts/experiment/run-gemmini-rmd-cpu-npu.sh run --expected-bundle-id $bundle_id"
 assert_file "$test_root/launched"
+assert_file "$test_root/firesim-order"
+[[ $(cat "$test_root/firesim-order") == $'infrasetup\nrunworkload' ]] ||
+    fail 'expected infrasetup before runworkload'
 
 assert_status 1 "$runner" run \
     --run-id wrong-bundle \
