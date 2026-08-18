@@ -210,7 +210,7 @@ prepare_manager() {
     export CXXFLAGS='-DERROR_COMPENSATION=1 -Dgemmini_set_tile_ws=gemmini_set_tile'
     (
         cd -- "$workspace"
-        ./build-riscv.sh -DLLAMA_BUILD_TESTS=ON
+        ./build-riscv.sh -DLLAMA_BUILD_TESTS=ON -DGEMMINI_BUILD_SRMD_RAW_WS_TESTS=OFF
     )
     cmake --build "$build_dir" --target test-gemmini-exsia -j
     [[ -x $build_dir/bin/test-gemmini-exsia ]] || die 'build did not produce test-gemmini-exsia'

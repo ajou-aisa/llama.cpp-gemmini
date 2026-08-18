@@ -357,53 +357,58 @@ target_include_directories(test-gemmini-rmd-telemetry PRIVATE
 add_test(NAME test-gemmini-rmd-telemetry
     COMMAND $<TARGET_FILE:test-gemmini-rmd-telemetry>)
 
-set(GEMMINI_SRMD_RAW_WS_HEADER "")
-foreach(_header IN ITEMS
-        "${GEMMINI_SW_PATH}/gemmini.h"
-        "${GEMMINI_SW_PATH}/include/gemmini.h"
-        "${GEMMINI_SW_PATH}/gemmini-rocc-tests/include/gemmini.h")
-    if (NOT GEMMINI_SRMD_RAW_WS_HEADER AND EXISTS "${_header}")
-        set(GEMMINI_SRMD_RAW_WS_HEADER "${_header}")
+option(GEMMINI_BUILD_SRMD_RAW_WS_TESTS
+    "Build the pinned raw-WS SRMD tests"
+    ON)
+if (GEMMINI_BUILD_SRMD_RAW_WS_TESTS)
+    set(GEMMINI_SRMD_RAW_WS_HEADER "")
+    foreach(_header IN ITEMS
+            "${GEMMINI_SW_PATH}/gemmini.h"
+            "${GEMMINI_SW_PATH}/include/gemmini.h"
+            "${GEMMINI_SW_PATH}/gemmini-rocc-tests/include/gemmini.h")
+        if (NOT GEMMINI_SRMD_RAW_WS_HEADER AND EXISTS "${_header}")
+            set(GEMMINI_SRMD_RAW_WS_HEADER "${_header}")
+        endif()
+    endforeach()
+    if (NOT GEMMINI_SRMD_RAW_WS_HEADER)
+        message(FATAL_ERROR "test-gemmini-srmd-raw-ws requires a supported Gemmini header layout")
     endif()
-endforeach()
-if (NOT GEMMINI_SRMD_RAW_WS_HEADER)
-    message(FATAL_ERROR "test-gemmini-srmd-raw-ws requires a supported Gemmini header layout")
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} -C "${GEMMINI_SW_PATH}" rev-parse HEAD
+        RESULT_VARIABLE GEMMINI_SRMD_RAW_WS_GIT_RESULT
+        OUTPUT_VARIABLE GEMMINI_SRMD_RAW_WS_GIT_HEAD
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} -C "${GEMMINI_SW_PATH}" status --porcelain
+        RESULT_VARIABLE GEMMINI_SRMD_RAW_WS_STATUS_RESULT
+        OUTPUT_VARIABLE GEMMINI_SRMD_RAW_WS_GIT_STATUS
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if (NOT GEMMINI_SRMD_RAW_WS_GIT_RESULT EQUAL 0 OR
+        NOT GEMMINI_SRMD_RAW_WS_STATUS_RESULT EQUAL 0 OR
+        NOT GEMMINI_SRMD_RAW_WS_GIT_HEAD STREQUAL
+            "2416775820be7da60a310570964b3c97743b9007" OR
+        GEMMINI_SRMD_RAW_WS_GIT_STATUS)
+        message(FATAL_ERROR "test-gemmini-srmd-raw-ws requires the pinned clean Gemmini checkout")
+    endif()
+    get_filename_component(GEMMINI_SRMD_RAW_WS_INCLUDE_DIR
+        "${GEMMINI_SRMD_RAW_WS_HEADER}" DIRECTORY)
+    add_executable(test-gemmini-srmd-raw-ws
+        test-gemmini-srmd-raw-ws.cpp
+        ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp)
+    target_link_libraries(test-gemmini-srmd-raw-ws PRIVATE ggml-base ggml-gemmini-utils)
+    target_compile_features(test-gemmini-srmd-raw-ws PRIVATE cxx_std_17)
+    target_include_directories(test-gemmini-srmd-raw-ws PRIVATE
+        ${GEMMINI_SRMD_RAW_WS_INCLUDE_DIR}
+        ${GEMMINI_SW_PATH}
+        ${GEMMINI_SW_PATH}/include
+        ../ggml/src
+        ../ggml/src/ggml-gemmini
+        ../ggml/src/ggml-gemmini/residual/rmd)
+    add_test(NAME test-gemmini-srmd-raw-ws-cpu
+        COMMAND $<TARGET_FILE:test-gemmini-srmd-raw-ws> --cpu)
+    add_test(NAME test-gemmini-srmd-layouts-cpu
+        COMMAND $<TARGET_FILE:test-gemmini-srmd-raw-ws> --bench-layouts)
 endif()
-execute_process(
-    COMMAND ${GIT_EXECUTABLE} -C "${GEMMINI_SW_PATH}" rev-parse HEAD
-    RESULT_VARIABLE GEMMINI_SRMD_RAW_WS_GIT_RESULT
-    OUTPUT_VARIABLE GEMMINI_SRMD_RAW_WS_GIT_HEAD
-    OUTPUT_STRIP_TRAILING_WHITESPACE)
-execute_process(
-    COMMAND ${GIT_EXECUTABLE} -C "${GEMMINI_SW_PATH}" status --porcelain
-    RESULT_VARIABLE GEMMINI_SRMD_RAW_WS_STATUS_RESULT
-    OUTPUT_VARIABLE GEMMINI_SRMD_RAW_WS_GIT_STATUS
-    OUTPUT_STRIP_TRAILING_WHITESPACE)
-if (NOT GEMMINI_SRMD_RAW_WS_GIT_RESULT EQUAL 0 OR
-    NOT GEMMINI_SRMD_RAW_WS_STATUS_RESULT EQUAL 0 OR
-    NOT GEMMINI_SRMD_RAW_WS_GIT_HEAD STREQUAL
-        "2416775820be7da60a310570964b3c97743b9007" OR
-    GEMMINI_SRMD_RAW_WS_GIT_STATUS)
-    message(FATAL_ERROR "test-gemmini-srmd-raw-ws requires the pinned clean Gemmini checkout")
-endif()
-get_filename_component(GEMMINI_SRMD_RAW_WS_INCLUDE_DIR
-    "${GEMMINI_SRMD_RAW_WS_HEADER}" DIRECTORY)
-add_executable(test-gemmini-srmd-raw-ws
-    test-gemmini-srmd-raw-ws.cpp
-    ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp)
-target_link_libraries(test-gemmini-srmd-raw-ws PRIVATE ggml-base ggml-gemmini-utils)
-target_compile_features(test-gemmini-srmd-raw-ws PRIVATE cxx_std_17)
-target_include_directories(test-gemmini-srmd-raw-ws PRIVATE
-    ${GEMMINI_SRMD_RAW_WS_INCLUDE_DIR}
-    ${GEMMINI_SW_PATH}
-    ${GEMMINI_SW_PATH}/include
-    ../ggml/src
-    ../ggml/src/ggml-gemmini
-    ../ggml/src/ggml-gemmini/residual/rmd)
-add_test(NAME test-gemmini-srmd-raw-ws-cpu
-    COMMAND $<TARGET_FILE:test-gemmini-srmd-raw-ws> --cpu)
-add_test(NAME test-gemmini-srmd-layouts-cpu
-    COMMAND $<TARGET_FILE:test-gemmini-srmd-raw-ws> --bench-layouts)
 
 add_executable(test-gemmini-matmul-options test-gemmini-matmul-options.cpp)
 target_compile_features(test-gemmini-matmul-options PRIVATE cxx_std_17)

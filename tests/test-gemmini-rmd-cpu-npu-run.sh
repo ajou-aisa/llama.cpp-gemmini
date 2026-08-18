@@ -202,6 +202,7 @@ set -euo pipefail
 [[ ${GGML_GEMMINI_ALLOW_RUNTIME_MATMUL_OVERRIDE:-} == ON ]]
 [[ ${CXXFLAGS:-} == '-DERROR_COMPENSATION=1 -Dgemmini_set_tile_ws=gemmini_set_tile' ]]
 [[ ${1:-} == -DLLAMA_BUILD_TESTS=ON ]]
+[[ ${2:-} == -DGEMMINI_BUILD_SRMD_RAW_WS_TESTS=OFF ]]
 mkdir -p "$BUILD_DIR/bin"
 cp "$RUNTIME_FIXTURE" "$BUILD_DIR/bin/llama-cli"
 printf 'project-library\n' >"$BUILD_DIR/bin/libggml-gemmini.so"
