@@ -49,6 +49,8 @@ printf 'workspace output must survive\n' >"$workspace/output/sentinel.txt"
 printf 'model\n' >"$model"
 printf 'GGML_GEMMINI_ENABLE_RMD:BOOL=ON\n' >"$on_build/CMakeCache.txt"
 printf 'GGML_GEMMINI_ENABLE_RMD:BOOL=OFF\n' >"$off_build/CMakeCache.txt"
+printf 'on-library\n' >"$on_build/bin/libggml-gemmini.so"
+printf 'off-library\n' >"$off_build/bin/libggml-gemmini.so"
 
 cat >"$test_root/mock-llama-cli" <<'EOF'
 #!/usr/bin/env bash
@@ -56,6 +58,8 @@ set -euo pipefail
 
 [[ ${RMD_VARIANT:-} == on || ${RMD_VARIANT:-} == off ]]
 [[ ${GEMMINI_MATMUL_MODE:-} == STRIPE_PIPELINE ]]
+[[ -z ${LD_LIBRARY_PATH+x} ]]
+[[ -z ${LD_PRELOAD+x} ]]
 if [[ $RMD_VARIANT == on ]]; then
     [[ ${GEMMINI_RMD_BACKEND:-} == WS ]]
 else
@@ -63,11 +67,17 @@ else
 fi
 
 mkdir -p output
+mkdir -p output/log
 printf '%s\n' "$RMD_VARIANT" >"output/variant.txt"
 printf '%s\n' "$*" >"output/args.txt"
 printf '%s\n' "$RMD_VARIANT" >"$MARKER_ROOT/$RMD_VARIANT"
 printf 'stdout-%s\n' "$RMD_VARIANT"
 printf 'stderr-%s\n' "$RMD_VARIANT" >&2
+if [[ $RMD_VARIANT == on || ${CONTAMINATE_OFF:-0} == 1 ]]; then
+    printf '%s\n' '{"record_type":"RMD_BACKEND_TELEMETRY"}' >"output/log/debug-log.jsonl"
+else
+    printf '%s\n' '{"layer":"graph","msg":"RMD disabled"}' >"output/log/debug-log.jsonl"
+fi
 
 if [[ $RMD_VARIANT == off && ${FAIL_OFF:-0} == 1 ]]; then
     exit 7
@@ -112,6 +122,17 @@ assert_status 2 "$runner" \
     --on-binary "$on_binary" \
     --off-binary "$on_binary"
 
+printf 'on-library\n' >"$off_build/bin/libggml-gemmini.so"
+assert_status 1 "$runner" \
+    --run-id identical-libraries \
+    --output-root "$output_root" \
+    --workspace "$workspace" \
+    --model "$model" \
+    --on-binary "$on_binary" \
+    --off-binary "$off_binary"
+printf 'off-library\n' >"$off_build/bin/libggml-gemmini.so"
+
+LD_LIBRARY_PATH=/contaminated LD_PRELOAD=/contaminated \
 REAL_TAR="$real_tar" PATH="$mock_bin:$PATH" MARKER_ROOT="$marker_root" "$runner" \
     --run-id happy \
     --output-root "$output_root" \
@@ -126,6 +147,7 @@ assert_file "$run_dir/manifest.txt"
 assert_file "$archive"
 assert_contains "$run_dir/manifest.txt" 'on_exit_status=0'
 assert_contains "$run_dir/manifest.txt" 'off_exit_status=0'
+assert_contains "$run_dir/manifest.txt" 'comparison_status=valid'
 assert_contains "$workspace/output/sentinel.txt" 'must survive'
 
 for variant in on off; do
@@ -136,6 +158,7 @@ for variant in on off; do
     assert_file "$variant_dir/command.txt"
     assert_file "$variant_dir/environment.txt"
     assert_file "$variant_dir/binary.sha256"
+    assert_file "$variant_dir/libraries.sha256"
     assert_file "$variant_dir/output/variant.txt"
     assert_file "$variant_dir/output/args.txt"
     assert_contains "$variant_dir/stdout.txt" "stdout-$variant"
@@ -145,6 +168,8 @@ for variant in on off; do
 done
 assert_contains "$run_dir/on/environment.txt" 'GEMMINI_RMD_BACKEND=WS'
 assert_contains "$run_dir/off/environment.txt" 'GEMMINI_RMD_BACKEND=<unset>'
+assert_contains "$run_dir/on/environment.txt" 'LD_LIBRARY_PATH=<unset>'
+assert_contains "$run_dir/off/environment.txt" 'LD_PRELOAD=<unset>'
 tar -tzf "$archive" | grep -F --quiet 'happy/on/output/variant.txt' ||
     fail 'archive is missing ON output'
 tar -tzf "$archive" | grep -F --quiet 'happy/off/output/variant.txt' ||
@@ -169,6 +194,21 @@ assert_file "$output_root/failure/off/output/variant.txt"
 assert_file "$output_root/failure.tar.gz"
 assert_contains "$output_root/failure/manifest.txt" 'on_exit_status=0'
 assert_contains "$output_root/failure/manifest.txt" 'off_exit_status=7'
+
+set +e
+CONTAMINATE_OFF=1 MARKER_ROOT="$marker_root" "$runner" \
+    --run-id contaminated \
+    --output-root "$output_root" \
+    --workspace "$workspace" \
+    --model "$model" \
+    --on-binary "$on_binary" \
+    --off-binary "$off_binary"
+contaminated_status=$?
+set -e
+[[ $contaminated_status -eq 3 ]] ||
+    fail "expected contaminated OFF telemetry status 3, got $contaminated_status"
+assert_file "$output_root/contaminated.tar.gz"
+assert_contains "$output_root/contaminated/manifest.txt" 'comparison_status=invalid_off_rmd_telemetry'
 
 mkdir "$output_root/collision"
 assert_status 1 env MARKER_ROOT="$marker_root" "$runner" \

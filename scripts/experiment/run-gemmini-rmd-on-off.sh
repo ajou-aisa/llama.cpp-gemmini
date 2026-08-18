@@ -170,6 +170,11 @@ require_rmd_contract() {
 require_rmd_contract ON "$on_binary" ON
 require_rmd_contract OFF "$off_binary" OFF
 
+on_library="$(dirname -- "$on_binary")/libggml-gemmini.so"
+off_library="$(dirname -- "$off_binary")/libggml-gemmini.so"
+[[ -f $on_library ]] || die_usage "ON build has no libggml-gemmini.so: $on_library"
+[[ -f $off_library ]] || die_usage "OFF build has no libggml-gemmini.so: $off_library"
+
 mkdir -p -- "$output_root"
 output_root=$(cd -- "$output_root" && pwd -P)
 run_dir="$output_root/$run_id"
@@ -190,6 +195,11 @@ hash_value() {
         shasum -a 256 -- "$1" | awk '{print $1}'
     fi
 }
+
+on_library_hash=$(hash_value "$on_library")
+off_library_hash=$(hash_value "$off_library")
+[[ $on_library_hash != "$off_library_hash" ]] ||
+    die 'ON and OFF libggml-gemmini.so files are identical'
 
 mkdir -- "$run_dir"
 start_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -217,6 +227,13 @@ run_variant() {
     mkdir -- "$work_dir/output" "$variant_dir/output"
     cp -- "$cache" "$variant_dir/CMakeCache.txt"
     printf '%s  %s\n' "$(hash_value "$binary")" "$binary" >"$variant_dir/binary.sha256"
+    : >"$variant_dir/libraries.sha256"
+    for library in "$(dirname -- "$binary")"/libllama.so* \
+                   "$(dirname -- "$binary")"/libggml*.so* \
+                   "$(dirname -- "$binary")"/libgomp.so*; do
+        [[ -f $library ]] || continue
+        printf '%s  %s\n' "$(hash_value "$library")" "$library" >>"$variant_dir/libraries.sha256"
+    done
 
     command=(
         "$binary"
@@ -239,10 +256,14 @@ run_variant() {
         else
             printf 'GEMMINI_RMD_BACKEND=<unset>\n'
         fi
+        printf 'LD_LIBRARY_PATH=<unset>\n'
+        printf 'LD_PRELOAD=<unset>\n'
     } >"$variant_dir/environment.txt"
 
     if (
         cd -- "$work_dir" || exit
+        unset LD_LIBRARY_PATH
+        unset LD_PRELOAD
         export RMD_VARIANT="$variant"
         export GEMMINI_MATMUL_MODE=STRIPE_PIPELINE
         if [[ -n $backend ]]; then
@@ -262,18 +283,35 @@ run_variant() {
     return "$status"
 }
 
+printf 'starting_variant=on\n' >&2
 if run_variant on "$on_binary" WS; then
     on_status=0
 else
     on_status=$?
 fi
+printf 'completed_variant=on exit_status=%s\n' "$on_status" >&2
+printf 'starting_variant=off\n' >&2
 if run_variant off "$off_binary" ''; then
     off_status=0
 else
     off_status=$?
 fi
+printf 'completed_variant=off exit_status=%s\n' "$off_status" >&2
 
 end_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+comparison_status=valid
+if ((on_status == 0 && off_status == 0)); then
+    telemetry_token='"record_type":"RMD_BACKEND_TELEMETRY"'
+    on_debug="$run_dir/on/output/log/debug-log.jsonl"
+    off_debug="$run_dir/off/output/log/debug-log.jsonl"
+    if [[ ! -f $on_debug ]] || ! grep -Fq -- "$telemetry_token" "$on_debug"; then
+        comparison_status=invalid_on_missing_rmd_telemetry
+    elif [[ -f $off_debug ]] && grep -Fq -- "$telemetry_token" "$off_debug"; then
+        comparison_status=invalid_off_rmd_telemetry
+    fi
+else
+    comparison_status=not_evaluated_variant_failure
+fi
 git_sha=$(git -C "$workspace" rev-parse HEAD 2>/dev/null || printf unknown)
 git_branch=$(git -C "$workspace" symbolic-ref --short -q HEAD 2>/dev/null || printf HEAD)
 if git -C "$workspace" diff --quiet --ignore-submodules HEAD 2>/dev/null &&
@@ -298,6 +336,7 @@ fi
     printf 'off_binary=%s\n' "$off_binary"
     printf 'on_exit_status=%s\n' "$on_status"
     printf 'off_exit_status=%s\n' "$off_status"
+    printf 'comparison_status=%s\n' "$comparison_status"
 } >"$run_dir/manifest.txt"
 
 if tar c -a -f "$archive" -C "$output_root" "$run_id"; then
@@ -314,8 +353,15 @@ printf 'result_dir=%s\n' "$run_dir"
 printf 'archive=%s\n' "$archive"
 printf 'on_exit_status=%s\n' "$on_status"
 printf 'off_exit_status=%s\n' "$off_status"
+printf 'comparison_status=%s\n' "$comparison_status"
 
 if ((on_status != 0)); then
     exit "$on_status"
 fi
-exit "$off_status"
+if ((off_status != 0)); then
+    exit "$off_status"
+fi
+if [[ $comparison_status != valid ]]; then
+    exit 3
+fi
+exit 0
