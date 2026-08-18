@@ -111,6 +111,8 @@ if (NOT WIN32)
             COMMAND ${BASH_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-experiment-output.sh)
         add_test(NAME test-gemmini-rmd-on-off-run
             COMMAND ${BASH_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-rmd-on-off-run.sh)
+        add_test(NAME test-gemmini-rmd-cpu-npu-run
+            COMMAND ${BASH_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-rmd-cpu-npu-run.sh)
     endif()
 
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API
