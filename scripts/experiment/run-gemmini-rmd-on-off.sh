@@ -300,7 +300,7 @@ fi
     printf 'off_exit_status=%s\n' "$off_status"
 } >"$run_dir/manifest.txt"
 
-if tar -C "$output_root" -czf "$archive" "$run_id"; then
+if tar c -a -f "$archive" -C "$output_root" "$run_id"; then
     archive_status=0
 else
     archive_status=$?

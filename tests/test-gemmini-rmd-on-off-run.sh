@@ -13,6 +13,8 @@ off_build="$test_root/build-riscv-rmd-off"
 on_binary="$on_build/bin/llama-cli"
 off_binary="$off_build/bin/llama-cli"
 marker_root="$test_root/markers"
+mock_bin="$test_root/mock-bin"
+real_tar=$(command -v tar)
 
 cleanup() {
     rm -rf "$test_root"
@@ -42,7 +44,7 @@ assert_status() {
     [[ $actual -eq $expected ]] || fail "expected status $expected, got $actual: $*"
 }
 
-mkdir -p "$workspace/output" "$output_root" "$marker_root" "$on_build/bin" "$off_build/bin"
+mkdir -p "$workspace/output" "$output_root" "$marker_root" "$mock_bin" "$on_build/bin" "$off_build/bin"
 printf 'workspace output must survive\n' >"$workspace/output/sentinel.txt"
 printf 'model\n' >"$model"
 printf 'GGML_GEMMINI_ENABLE_RMD:BOOL=ON\n' >"$on_build/CMakeCache.txt"
@@ -75,6 +77,17 @@ chmod +x "$test_root/mock-llama-cli"
 cp "$test_root/mock-llama-cli" "$on_binary"
 cp "$test_root/mock-llama-cli" "$off_binary"
 
+cat >"$mock_bin/tar" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+for argument in "$@"; do
+    [[ $argument != -*z* ]] || exit 64
+done
+exec "$REAL_TAR" "$@"
+EOF
+chmod +x "$mock_bin/tar"
+
 assert_status 0 "$runner" --help
 assert_contains "$test_root/status.stdout" 'usage:'
 assert_status 0 "$runner" --print-build-commands
@@ -99,7 +112,7 @@ assert_status 2 "$runner" \
     --on-binary "$on_binary" \
     --off-binary "$on_binary"
 
-MARKER_ROOT="$marker_root" "$runner" \
+REAL_TAR="$real_tar" PATH="$mock_bin:$PATH" MARKER_ROOT="$marker_root" "$runner" \
     --run-id happy \
     --output-root "$output_root" \
     --workspace "$workspace" \
