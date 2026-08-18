@@ -104,6 +104,19 @@ manifest_payload_hash() {
     fi
 }
 
+initialize_conda_shell() {
+    local conda_base
+    local conda_hook
+    command -v conda >/dev/null 2>&1 || die 'conda executable is unavailable'
+    conda_base=$(conda info --base) || die 'could not determine conda base'
+    [[ $conda_base = /* ]] || die 'conda info --base did not return an absolute path'
+    conda_hook="$conda_base/etc/profile.d/conda.sh"
+    [[ -f $conda_hook ]] || die "missing conda shell hook: $conda_hook"
+    # shellcheck disable=SC1090
+    source "$conda_hook"
+    [[ $(type -t conda) == function ]] || die 'conda shell hook did not define conda'
+}
+
 prepare_manager() {
     local script_dir
     local default_workspace
@@ -167,6 +180,7 @@ prepare_manager() {
     printf 'manager_step=source_firesim\n'
     caller_directory=$PWD
     cd -- "$firesim_root"
+    initialize_conda_shell
     set +u
     # shellcheck disable=SC1090
     source ./sourceme-manager.sh --skip-ssh-setup
@@ -289,6 +303,7 @@ launch_manager() {
     printf 'manager_step=source_firesim\n'
     caller_directory=$PWD
     cd -- "$firesim_root"
+    initialize_conda_shell
     set +u
     # shellcheck disable=SC1090
     source ./sourceme-manager.sh --skip-ssh-setup

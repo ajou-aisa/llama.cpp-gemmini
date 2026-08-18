@@ -7,6 +7,7 @@ test_root=$(mktemp -d "${TMPDIR:-/tmp}/gemmini-rmd-cpu-npu.XXXXXX")
 workspace="$test_root/workspace"
 guest_workspace="$test_root/guest/root/workspace/3rd_llama.cpp"
 firesim_root="$test_root/firesim"
+conda_base="$test_root/conda-base"
 output_root="$test_root/output"
 marker_root="$test_root/markers"
 model="$test_root/model.gguf"
@@ -46,7 +47,30 @@ assert_status() {
 
 mkdir -p "$workspace" "$(dirname "$guest_workspace")" "$firesim_root/deploy" \
     "$firesim_root/.conda-env/riscv-tools/bin" "$firesim_root/.conda-env/bin" \
-    "$output_root" "$marker_root" "$mock_bin"
+    "$output_root" "$marker_root" "$mock_bin" "$conda_base/etc/profile.d"
+export PATH="$test_root:$PATH"
+cat >"$test_root/conda" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${1:-} == info && ${2:-} == --base ]]; then
+    printf '%s\n' "$CONDA_BASE"
+    exit 0
+fi
+printf 'CondaError: Run conda init before conda activate\n' >&2
+exit 1
+EOF
+chmod +x "$test_root/conda"
+cat >"$conda_base/etc/profile.d/conda.sh" <<'EOF'
+conda() {
+    if [[ ${1:-} == activate ]]; then
+        export CONDA_ACTIVE=1
+        return 0
+    fi
+    command conda "$@"
+}
+EOF
+export CONDA_BASE="$conda_base"
+
 printf 'model\n' >"$model"
 printf 'runtime\n' >"$libgomp_fixture"
 mkdir -p "$workspace/build-riscv-rmd-cpu-npu" "$firesim_root/target-design/chipyard/generators/gemmini/software"
@@ -57,6 +81,8 @@ cat >"$firesim_root/sourceme-manager.sh" <<'EOF'
 #!/usr/bin/env bash
 [[ ${1:-} == --skip-ssh-setup ]]
 [[ $PWD == "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" ]] || return 1
+conda activate firesim
+[[ ${CONDA_ACTIVE:-0} == 1 ]]
 export FIRESIM_SOURCED=1
 EOF
 chmod +x "$firesim_root/sourceme-manager.sh"
