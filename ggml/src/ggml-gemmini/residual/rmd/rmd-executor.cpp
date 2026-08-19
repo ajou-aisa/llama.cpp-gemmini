@@ -690,15 +690,12 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                     const int8_t * activation = group.activation.data() + k_base;
                     if constexpr (Backend == CompactExecutorBackend::gemmini_ws) {
                         std::fill_n(ws_values.begin(), stacked_value_count, acc_t{0});
-                        // Compiler barriers preserve accelerator DMA visibility across the call.
-                        asm volatile("" ::: "memory");
                         tiled_matmul(stacked_rows, valid_cols, valid_k,
                             activation, weight_tile.data(), nullptr, ws_values.data(),
                             group.padded_k_count, kArrayDim, 0, kArrayDim,
                             1.0f, 1.0f, 1.0f,
                             NO_ACTIVATION, ACC_SCALE_IDENTITY, ACC_SCALE_IDENTITY, false,
                             1, 1, 1, false, false, true, false, 0, WS);
-                        asm volatile("" ::: "memory");
                         for (size_t row = 0; row < stacked_rows; ++row) {
                             OutputValue * accumulator = stacked_values.data() + row * kArrayDim;
                             for (size_t col = 0; col < valid_cols; ++col) {
