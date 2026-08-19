@@ -229,69 +229,54 @@ bool test_rmd_cpu_ws_routes() {
 
 bool test_rmd_ws_contract_probe() {
 #if !defined(__riscv)
-    std::printf("RMD_PROBE supported=0 status=unsupported\n");
+    std::printf("RMD_RAW_WS supported=0 status=unsupported\n");
     return true;
 #else
-    constexpr size_t I = 16, J = 2, K = 2, stride = 16;
+    constexpr size_t stride = DIM;
     constexpr elem_t sentinel = static_cast<elem_t>(-91);
-    constexpr acc_t bias0 = static_cast<acc_t>(101), bias1 = static_cast<acc_t>(203);
-    struct alignas(64) Fixed {
-        elem_t a[DIM * DIM]; elem_t b[DIM * DIM]; acc_t d[DIM * DIM];
+    struct alignas(64) Physical {
+        elem_t a[32 * DIM];
+        elem_t b[DIM * DIM];
+        alignas(64) acc_t c[32 * DIM];
         acc_t guard_before;
-        alignas(64) acc_t c[DIM * DIM];
         acc_t guard_after;
     };
-    struct Result { acc_t c0; acc_t c1; size_t changed; size_t first; bool guards; };
-    auto run = [sentinel](elem_t * a, elem_t * b, acc_t * d, acc_t * c,
-                          bool transpose_B, tiled_matmul_type_t mode,
-                          acc_t * before, acc_t * after) {
-        std::fill(c, c + DIM * DIM, static_cast<acc_t>(sentinel));
-        if (before) *before = -37;
-        if (after) *after = -73;
+    struct Result { acc_t c0, c1, r16c0, r16c1; size_t changed, first; bool guards; };
+    auto run = [sentinel, stride](Physical & p, size_t I, size_t tile_I, size_t J, size_t K) {
+        std::fill(p.c, p.c + 32 * DIM, sentinel);
+        p.guard_before = -37; p.guard_after = -73;
         asm volatile("" ::: "memory");
-        tiled_matmul(I, J, K, a, b, d, c, stride, stride, stride, stride,
+        tiled_matmul(I, J, K, p.a, p.b, nullptr, p.c, stride, stride, stride, stride,
                      1.0f, 1.0f, 1.0f, NO_ACTIVATION, ACC_SCALE_IDENTITY,
-                     ACC_SCALE_IDENTITY, false, 1, 1, 1,
-                     false, transpose_B, true, false, 0, mode);
+                     ACC_SCALE_IDENTITY, false, tile_I, 1, 1,
+                     false, false, true, false, 0, WS);
         asm volatile("" ::: "memory");
-        Result r{c[0], c[1], 0, DIM * DIM,
-            (!before || *before == -37) && (!after || *after == -73)};
-        for (size_t n = 0; n < DIM * DIM; ++n)
-            if (c[n] != static_cast<acc_t>(sentinel)) { ++r.changed; r.first = std::min(r.first, n); }
+        Result r{p.c[0], p.c[1], 0, 0, 0, 32 * DIM,
+                 p.guard_before == -37 && p.guard_after == -73};
+        if (I > 16) { r.r16c0 = p.c[16 * DIM]; r.r16c1 = p.c[16 * DIM + 1]; }
+        for (size_t n = 0; n < I * DIM; ++n)
+            if (p.c[n] != sentinel) { ++r.changed; r.first = std::min(r.first, n); }
         return r;
     };
-    auto fill = [](elem_t * a, elem_t * b, bool transpose_B) {
-        std::fill(a, a + DIM * DIM, elem_t{0}); std::fill(b, b + DIM * DIM, elem_t{0});
-        a[0] = 1; a[1] = 2;
-        b[0] = 3; b[1] = transpose_B ? 5 : 7;
-        b[stride] = transpose_B ? 7 : 5; b[stride + 1] = 11;
+    auto setup = [](Physical & p, size_t I) {
+        std::fill(std::begin(p.a), std::end(p.a), elem_t{0});
+        std::fill(std::begin(p.b), std::end(p.b), elem_t{0});
+        p.a[0] = 1; p.a[1] = 2;
+        if (I > 16) { p.a[16 * DIM] = 1; p.a[16 * DIM + 1] = 2; }
+        p.b[0] = 3; p.b[1] = 7; p.b[DIM] = 5; p.b[DIM + 1] = 11;
     };
-    Fixed x{}; fill(x.a, x.b, false);
-    const Result r1 = run(x.a, x.b, nullptr, x.c, false, WS, &x.guard_before, &x.guard_after);
-    gemmini_flush(0);
-    const Result r2 = run(x.a, x.b, nullptr, x.c, false, WS, &x.guard_before, &x.guard_after);
-    Fixed y{}; fill(y.a, y.b, true); gemmini_flush(0);
-    const Result r3 = run(y.a, y.b, nullptr, y.c, true, WS, &y.guard_before, &y.guard_after);
-    Fixed z{}; fill(z.a, z.b, false); std::fill(z.d, z.d + DIM * DIM, acc_t{0});
-    z.d[0] = bias0; z.d[1] = bias1; gemmini_flush(0);
-    const Result r4 = run(z.a, z.b, z.d, z.c, false, WS, &z.guard_before, &z.guard_after);
-    std::vector<elem_t> va(DIM * DIM), vb(DIM * DIM);
-    std::vector<acc_t> vc(DIM * DIM);
-    fill(va.data(), vb.data(), false); gemmini_flush(0);
-    const Result r5 = run(va.data(), vb.data(), nullptr, vc.data(), false, WS, nullptr, nullptr);
-    std::fill(vc.begin(), vc.end(), sentinel); gemmini_flush(0);
-    const Result r6 = run(va.data(), vb.data(), nullptr, vc.data(), false, CPU, nullptr, nullptr);
-    const auto emit = [](int n, const Result & r, const void * a, const void * b, const void * c) {
-        std::printf("RMD_PROBE case=%d c0=%lld c1=%lld changed_count=%zu first_changed_index=%zu guards_ok=%d a_mod=%zu b_mod=%zu c_mod=%zu\n",
-            n, (long long) r.c0, (long long) r.c1, r.changed, r.first, r.guards ? 1 : 0,
-            (uintptr_t)a % 64, (uintptr_t)b % 64, (uintptr_t)c % 64);
-    };
-    emit(1,r1,x.a,x.b,x.c); emit(2,r2,x.a,x.b,x.c); emit(3,r3,y.a,y.b,y.c);
-    emit(4,r4,z.a,z.b,z.c); emit(5,r5,va.data(),vb.data(),vc.data());
-    emit(6,r6,va.data(),vb.data(),vc.data());
-    return check(r2.c0 == 13 && r2.c1 == 29 && r3.c0 == 13 && r3.c1 == 29 &&
-                 r4.c0 == bias0 + 13 && r4.c1 == bias1 + 29 &&
-                 r5.c0 == 13 && r5.c1 == 29 && r6.c0 == 13 && r6.c1 == 29, "RMD WS probe contract");
+    bool all_ok = true;
+    for (const auto & spec : {std::array<size_t, 4>{16,1,2,2}, {16,1,DIM,DIM},
+                              {32,1,2,2}, {32,1,DIM,DIM}, {32,2,2,2}, {32,2,DIM,DIM}}) {
+        Physical p{}; setup(p, spec[0]); const Result r = run(p, spec[0], spec[1], spec[2], spec[3]);
+        const bool present = spec[0] > 16;
+        std::printf("RMD_RAW_WS I=%zu tile_I=%zu J=%zu K=%zu row0_c0=%lld row0_c1=%lld row16_c0=%lld row16_c1=%lld row16_present=%d changed_count=%zu first_changed_index=%zu guards_ok=%d a_mod64=%zu b_mod64=%zu c_mod64=%zu\n",
+            spec[0], spec[1], spec[2], spec[3], (long long)r.c0, (long long)r.c1,
+            (long long)r.r16c0, (long long)r.r16c1, present ? 1 : 0, r.changed, r.first,
+            r.guards ? 1 : 0, (uintptr_t)p.a % 64, (uintptr_t)p.b % 64, (uintptr_t)p.c % 64);
+        all_ok = all_ok && r.c0 == 13 && r.c1 == 29 && (!present || (r.r16c0 == 13 && r.r16c1 == 29)) && r.guards;
+    }
+    return check(all_ok, "RMD WS raw I-tile grid");
 #endif
 }
 
