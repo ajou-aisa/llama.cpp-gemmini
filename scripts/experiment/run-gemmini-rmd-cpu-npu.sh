@@ -242,6 +242,7 @@ prepare_manager() {
     [[ $libgomp != libgomp.so.1 && -f $libgomp ]] ||
         die 'RISC-V compiler could not resolve libgomp.so.1'
     cp -L -- "$libgomp" "$build_dir/bin/libgomp.so.1"
+    cp -L -- "$gemmini_header" "$build_dir/bin/gemmini.h"
 
     {
         printf 'git_sha=%s\n' "$(git -C "$workspace" rev-parse HEAD 2>/dev/null || printf unknown)"
@@ -251,6 +252,8 @@ prepare_manager() {
         printf 'source_worktree_diff_sha256=%s\n' "$(git -C "$workspace" diff --binary HEAD 2>/dev/null | sha256sum | awk '{print $1}')"
         printf 'gemmini_header_path=%s\n' "$gemmini_header"
         printf 'gemmini_header_sha256=%s\n' "$(hash_value "$gemmini_header")"
+        printf 'gemmini_header_bundle_path=%s\n' 'bin/gemmini.h'
+        printf 'gemmini_header_bundle_sha256=%s\n' "$(hash_value "$build_dir/bin/gemmini.h")"
         printf 'rmd_routes_test_sha256=%s\n' "$(hash_value "$build_dir/bin/test-gemmini-exsia")"
         printf 'binary_sha256=%s\n' "$(hash_value "$build_dir/bin/llama-cli")"
         printf 'gemmini_library_sha256=%s\n' \
@@ -365,7 +368,7 @@ run_guest() {
     local libgomp_hash
     local cache_hash
     local source_head source_head_tree source_worktree_status source_worktree_diff_hash
-    local gemmini_header_path gemmini_header_hash routes_test_hash
+    local gemmini_header_path gemmini_header_hash gemmini_header_bundle_path gemmini_header_bundle_hash routes_test_hash
     local recomputed_bundle_id
     local cpu_count=0
     local npu_count=0
@@ -476,8 +479,10 @@ run_guest() {
     source_worktree_diff_hash=$(manifest_value "$build_manifest" source_worktree_diff_sha256)
     gemmini_header_path=$(manifest_value "$build_manifest" gemmini_header_path)
     gemmini_header_hash=$(manifest_value "$build_manifest" gemmini_header_sha256)
+    gemmini_header_bundle_path=$(manifest_value "$build_manifest" gemmini_header_bundle_path)
+    gemmini_header_bundle_hash=$(manifest_value "$build_manifest" gemmini_header_bundle_sha256)
     routes_test_hash=$(manifest_value "$build_manifest" rmd_routes_test_sha256)
-    [[ -n $source_head && -n $source_head_tree && -n $source_worktree_diff_hash && -n $gemmini_header_path && -n $gemmini_header_hash && -n $routes_test_hash ]] || die 'build manifest lacks full runtime identity'
+    [[ -n $source_head && -n $source_head_tree && -n $source_worktree_diff_hash && -n $gemmini_header_path && -n $gemmini_header_hash && $gemmini_header_bundle_path == bin/gemmini.h && $gemmini_header_bundle_hash =~ ^[0-9a-f]{64} && -n $routes_test_hash ]] || die 'build manifest lacks full runtime identity'
     [[ $(manifest_value "$build_manifest" bundle_id) == "$expected_bundle_id" ]] ||
         die 'guest rootfs bundle ID does not match prepare output'
     recomputed_bundle_id=$(manifest_payload_hash "$build_manifest")
@@ -491,6 +496,9 @@ run_guest() {
         die 'runtime libgomp does not match the prepared build manifest'
     [[ $(manifest_value "$build_manifest" cmake_cache_sha256) == "$cache_hash" ]] ||
         die 'runtime CMake cache does not match the prepared build manifest'
+    [[ -f $build_dir/$gemmini_header_bundle_path ]] || die 'missing bundled gemmini.h'
+    [[ $(hash_value "$build_dir/$gemmini_header_bundle_path") == "$gemmini_header_bundle_hash" ]] ||
+        die 'bundled gemmini.h does not match the prepared build manifest'
 
     mkdir -p -- "$output_root"
     output_root=$(absolute_dir "$output_root")
@@ -502,7 +510,7 @@ run_guest() {
     mkdir -- "$run_dir/cpu" "$run_dir/npu"
     cp -- "$build_manifest" "$run_dir/experiment-build-manifest.txt"
     cp -- "$build_dir/bin/test-gemmini-exsia" "$run_dir/test-gemmini-exsia"
-    cp -- "$gemmini_header_path" "$run_dir/gemmini.h"
+    cp -- "$build_dir/$gemmini_header_bundle_path" "$run_dir/gemmini.h"
     mkdir -- "$run_dir/rmd-routes-test"
     route_test_command=("$build_dir/bin/test-gemmini-exsia" --case=rmd-routes)
     printf 'LD_LIBRARY_PATH=%s\n' "$build_dir/bin" >"$run_dir/rmd-routes-test/environment.txt"

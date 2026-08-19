@@ -282,6 +282,7 @@ assert_file "$workspace/build-riscv-rmd-cpu-npu/bin/libggml-gemmini.so"
 assert_file "$workspace/build-riscv-rmd-cpu-npu/bin/libgomp.so.1"
 assert_file "$workspace/build-riscv-rmd-cpu-npu/experiment-build-manifest.txt"
 assert_file "$guest_workspace/build-riscv-rmd-cpu-npu/experiment-build-manifest.txt"
+assert_file "$guest_workspace/build-riscv-rmd-cpu-npu/bin/gemmini.h"
 assert_contains "$workspace/build-riscv-rmd-cpu-npu/CMakeCache.txt" \
     'GGML_GEMMINI_ENABLE_RMD:BOOL=ON'
 old_builds=("$workspace"/build-riscv-rmd-cpu-npu.previous-*)
@@ -295,6 +296,19 @@ assert_file "$test_root/launched"
 assert_file "$test_root/firesim-order"
 [[ $(cat "$test_root/firesim-order") == $'infrasetup\nrunworkload' ]] ||
     fail 'expected infrasetup before runworkload'
+
+rm -f "$firesim_root/target-design/chipyard/generators/gemmini/software/gemmini.h"
+bundle_header="$guest_workspace/build-riscv-rmd-cpu-npu/bin/gemmini.h"
+cp "$bundle_header" "$test_root/gemmini.h.saved"
+rm "$bundle_header"
+assert_status 1 "$runner" run --run-id missing-bundled-header --workspace "$guest_workspace" --model "$model" --output-root "$output_root" --expected-bundle-id "$bundle_id"
+[[ ! -e $output_root/missing-bundled-header ]] || fail 'missing bundled header reached workloads'
+mv "$test_root/gemmini.h.saved" "$bundle_header"
+cp "$bundle_header" "$test_root/gemmini.h.saved"
+printf 'tampered\\n' >>"$bundle_header"
+assert_status 1 "$runner" run --run-id altered-bundled-header --workspace "$guest_workspace" --model "$model" --output-root "$output_root" --expected-bundle-id "$bundle_id"
+[[ ! -e $output_root/altered-bundled-header ]] || fail 'altered bundled header reached workloads'
+mv "$test_root/gemmini.h.saved" "$bundle_header" 2>/dev/null || true
 
 assert_status 1 "$runner" run \
     --run-id wrong-bundle \
