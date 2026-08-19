@@ -257,7 +257,12 @@ target_include_directories(test-gemmini-exsia PRIVATE
     ../ggml/src/ggml-gemmini/quants
     ../ggml/src/ggml-gemmini/quants/act
     ../ggml/src/ggml-gemmini/quants/act/exsia
-    ../ggml/src/ggml-gemmini/quants/common)
+    ../ggml/src/ggml-gemmini/quants/common
+    ${GEMMINI_SW_PATH}
+    ${GEMMINI_SW_PATH}/include
+    ${GEMMINI_SW_PATH}/gemmini-rocc-tests
+    ${GEMMINI_SW_PATH}/gemmini-rocc-tests/include
+    ${GEMMINI_SW_PATH}/rocc-software/src)
 foreach(_case IN ITEMS all baseline dispatch rmd-routes rmd-direct-parity direct-executor rmd-gather)
     string(REPLACE "-" "_" _case_test_name "${_case}")
     add_test(NAME gemmini_exsia_${_case_test_name}
