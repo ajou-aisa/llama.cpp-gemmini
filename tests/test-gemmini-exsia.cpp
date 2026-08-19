@@ -256,7 +256,7 @@ bool test_rmd_ws_contract_probe() {
         asm volatile("" ::: "memory");
         tiled_matmul(I, J, K, a, b, d, c, stride, stride, stride, stride,
                      1.0f, 1.0f, 1.0f, NO_ACTIVATION, ACC_SCALE_IDENTITY,
-                     ACC_SCALE_IDENTITY, false, 1, 1, 1, false, false,
+                     ACC_SCALE_IDENTITY, false, 1, 1, 1,
                      false, transpose, true, false, 0, WS);
         asm volatile("" ::: "memory");
         Result r{c[0], c[1], 0, DIM * DIM,
