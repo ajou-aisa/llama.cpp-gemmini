@@ -469,6 +469,52 @@ bool test_rmd_cpu_direct_parity() {
         }
     }
 
+#if defined(__riscv)
+    rmd::CompressedOutput ws_compressed;
+    const rmd::RmdStatus ws_execution_status =
+        rmd::execute_rmd_stripe_ws(args, *packet, ws_compressed);
+    std::vector<rmd::OutputValue> ws_actual;
+    const rmd::RmdStatus ws_compose_status =
+        rmd::compose_rmd_output(*packet, ws_compressed, ws_actual);
+    std::vector<float> ws_merged(rows * columns);
+    for (size_t index = 0; index < ws_merged.size(); ++index) {
+        ws_merged[index] = static_cast<float>(baseline[index]);
+    }
+    args.f_out = ws_merged.data();
+    const rmd::RmdStatus ws_merge_status =
+        rmd::merge_rmd_correction(args, *packet, ws_actual);
+    size_t mismatch_count = 0;
+    size_t first_row = rows, first_column = columns;
+    float first_actual = 0.0f, first_expected = 0.0f;
+    if (ws_execution_status == rmd::RmdStatus::success &&
+        ws_compose_status == rmd::RmdStatus::success &&
+        ws_merge_status == rmd::RmdStatus::success &&
+        ws_actual.size() == expected.size()) {
+        for (size_t row = 0; row < rows; ++row) {
+            for (size_t j = 0; j < columns; ++j) {
+                const size_t index = row * columns + j;
+                const float wanted = static_cast<float>(direct_full[index]);
+                if (ws_merged[index] != wanted) {
+                    ++mismatch_count;
+                    if (first_row == rows) {
+                        first_row = row;
+                        first_column = j;
+                        first_actual = ws_merged[index];
+                        first_expected = wanted;
+                    }
+                }
+            }
+        }
+    } else {
+        mismatch_count = rows * columns;
+    }
+    std::printf("RMD_PLACEMENT mismatch_count=%zu first_row=%zu first_column=%zu first_actual=%g first_expected=%g\n",
+                mismatch_count, first_row, first_column, first_actual, first_expected);
+    if (!check(mismatch_count == 0, "RMD WS full output placement parity")) {
+        return false;
+    }
+#endif
+
     merged.assign(rows * columns, 7.0f);
     const std::vector<float> unchanged = merged;
     auto & invalid_meta = args.act_quant.storage().emplace<quants::act::token::Meta>();
