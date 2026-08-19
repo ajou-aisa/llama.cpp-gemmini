@@ -255,6 +255,9 @@ add_executable(test-gemmini-exsia
     ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
     ../ggml/src/ggml-gemmini/quants/act/token/token.cpp)
 target_link_libraries(test-gemmini-exsia PRIVATE ggml-base ggml-gemmini-utils)
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
+  target_link_libraries(test-gemmini-exsia PRIVATE atomic)
+endif()
 target_compile_features(test-gemmini-exsia PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-exsia PRIVATE
     GGML_GEMMINI_TESTING=1
