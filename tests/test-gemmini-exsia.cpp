@@ -276,7 +276,99 @@ bool test_rmd_ws_contract_probe() {
             r.guards ? 1 : 0, (uintptr_t)p.a % 64, (uintptr_t)p.b % 64, (uintptr_t)p.c % 64);
         all_ok = all_ok && r.c0 == 13 && r.c1 == 29 && (!present || (r.r16c0 == 13 && r.r16c1 == 29)) && r.guards;
     }
-    return check(all_ok, "RMD WS raw I-tile grid");
+    const bool raw_ok = check(all_ok, "RMD WS raw I-tile grid");
+    // Keep this fixture deliberately independent of the raw-grid sentinel probe above:
+    // it mirrors execute_dense's dense WS setup and then calls the resolved Gemmini API.
+    alignas(64) elem_t dense_a[2] = {1, 2};
+    alignas(64) elem_t dense_b[4] = {1, 3, 2, 4}; // physical [J][K]
+    alignas(64) float dense_out[2] = {-99.0f, -99.0f};
+    ggml_gemmini_args_t dense_args{};
+    dense_args.I = 1; dense_args.J = 2; dense_args.K = 2;
+    dense_args.A = dense_a; dense_args.B = dense_b; dense_args.f_out = dense_out;
+    dense_args.sA = 2; dense_args.sB = 2; dense_args.stride_f_out = 2;
+    dense_args.col_stride_f_out = 1; dense_args.weight_i8_scale_active = true;
+    dense_args.weight_scale = 1.0f; dense_args.transpose_B = true;
+    dense_args.tiled_matmul_type = WS;
+    auto & dense_meta = dense_args.act_quant.storage().emplace<quants::act::exsia::Meta>();
+    dense_meta.theta = { 0 };
+    gemmini_set_tile_ws(&dense_args);
+    dense_args.full_C = true; dense_args.low_D = false;
+    tiled_matmul_auto_baseline(&dense_args, baseline_activation_quant_t::EXSIA,
+                               baseline_weight_quant_t::TENSOR);
+    std::printf("DENSE_CLONE helper_out=%g,%g expected=7,10 I=%zu J=%zu K=%zu B_s=%zu transpose_B=%d tile_I=%zu tile_J=%zu tile_K=%zu scale_B=%g scale_D=%g act=%d weightA=%u full_C=%d low_D=%d a_mod64=%zu b_mod64=%zu out_mod64=%zu\n",
+                dense_out[0], dense_out[1], dense_args.I, dense_args.J, dense_args.K,
+                dense_args.sB, dense_args.transpose_B ? 1 : 0, dense_args.tile_I,
+                dense_args.tile_J, dense_args.tile_K, (double)dense_args.scale_B,
+                (double)dense_args.scale_D, dense_args.act, dense_args.weightA,
+                dense_args.full_C ? 1 : 0, dense_args.low_D ? 1 : 0,
+                (uintptr_t)dense_a % 64, (uintptr_t)dense_b % 64, (uintptr_t)dense_out % 64);
+    struct WsCallConfig {
+        size_t I = 1, J = 2, K = 2, stride_A = 2, stride_B = 2, stride_D = 0, stride_C = 2;
+        const void * D = nullptr; scale_t scale_A = 1, scale_B = 1;
+        scale_acc_t scale_D = 1; int act = NO_ACTIVATION;
+        acc_scale_t scale = ACC_SCALE_IDENTITY, bert_scale = ACC_SCALE_IDENTITY;
+        bool repeating_bias = false; size_t tile_I = 1, tile_J = 1, tile_K = 1;
+        bool transpose_A = false, transpose_B = true, full_C = true, low_D = false;
+        uint8_t weightA = 0; tiled_matmul_type_t type = WS;
+    };
+    struct WsCallBuffer {
+        acc_t acc_guard_before;
+        alignas(64) acc_t acc[2];
+        acc_t acc_guard_after;
+        elem_t elem_guard_before;
+        alignas(64) elem_t elem[2];
+        elem_t elem_guard_after;
+    };
+    const acc_t expected0 = 7, expected1 = 10;
+    const WsCallConfig base{1, 2, 2, 2, 2, 0, 2, nullptr, 1.0f,
+        dense_args.scale_B, dense_args.scale_D, dense_args.act, dense_args.scale,
+        dense_args.bert_scale, dense_args.repeating_bias, dense_args.tile_I,
+        dense_args.tile_J, dense_args.tile_K, false, dense_args.transpose_B, true,
+        dense_args.low_D, dense_args.weightA, WS};
+    auto run_ws = [&](const char * name, const WsCallConfig & cfg, const elem_t * b,
+                      WsCallBuffer & buf) {
+        std::fill(std::begin(buf.acc), std::end(buf.acc), static_cast<acc_t>(-91));
+        std::fill(std::begin(buf.elem), std::end(buf.elem), static_cast<elem_t>(-91));
+        buf.acc_guard_before = -37; buf.acc_guard_after = -73;
+        buf.elem_guard_before = -37; buf.elem_guard_after = -73;
+        void * c = cfg.full_C ? static_cast<void *>(buf.acc) : static_cast<void *>(buf.elem);
+        tiled_matmul(cfg.I, cfg.J, cfg.K, dense_a, b, cfg.D, c, cfg.stride_A,
+                     cfg.stride_B, cfg.stride_D, cfg.stride_C, cfg.scale_A,
+                     cfg.scale_B, cfg.scale_D, cfg.act, cfg.scale, cfg.bert_scale,
+                     cfg.repeating_bias, cfg.tile_I, cfg.tile_J, cfg.tile_K,
+                     cfg.transpose_A, cfg.transpose_B, cfg.full_C, cfg.low_D,
+                     cfg.weightA, cfg.type);
+        const acc_t c0 = cfg.full_C ? buf.acc[0] : static_cast<acc_t>(buf.elem[0]);
+        const acc_t c1 = cfg.full_C ? buf.acc[1] : static_cast<acc_t>(buf.elem[1]);
+        const int changed_count = (c0 != -91) + (c1 != -91);
+        const int first_changed_index = c0 != -91 ? 0 : (c1 != -91 ? 1 : 2);
+        std::printf("WS_CALL_DELTA name=%s expected=7,10 c0=%lld c1=%lld changed_count=%d first_changed_index=%d D=%s transpose_B=%d tile_I=%zu tile_J=%zu tile_K=%zu scales=%g,%g,%g act=%d weightA=%u full_C=%d low_D=%d c_mod64=%zu guards=%d\n",
+                    name, (long long)c0, (long long)c1, changed_count, first_changed_index,
+                    cfg.D ? "zero" : "null",
+                    cfg.transpose_B ? 1 : 0, cfg.tile_I, cfg.tile_J, cfg.tile_K,
+                    (double)cfg.scale_A, (double)cfg.scale_B, (double)cfg.scale_D,
+                    cfg.act, cfg.weightA, cfg.full_C ? 1 : 0, cfg.low_D ? 1 : 0,
+                    reinterpret_cast<uintptr_t>(c) % 64,
+                    (cfg.full_C ? buf.acc_guard_before == -37 && buf.acc_guard_after == -73
+                                 : buf.elem_guard_before == -37 && buf.elem_guard_after == -73) ? 1 : 0);
+        return std::array<acc_t, 2>{c0, c1};
+    };
+    WsCallBuffer ws_buf{};
+    const auto exact = run_ws("exact_clone", base, dense_b, ws_buf);
+    WsCallConfig delta = base; alignas(64) acc_t zero_d[2] = {0, 0};
+    delta.D = zero_d; run_ws("explicit_zero_D", delta, dense_b, ws_buf);
+    alignas(64) elem_t kj_b[4] = {1, 2, 3, 4};
+    delta = base; delta.transpose_B = false; run_ws("KJ_representation", delta, kj_b, ws_buf);
+    delta = base; delta.tile_I = delta.tile_J = delta.tile_K = 1;
+    run_ws("fixed_tiles_baseline_equal", delta, dense_b, ws_buf);
+    run_ws("identity_settings_baseline_equal", base, dense_b, ws_buf);
+    run_ws("weightA_zero_baseline_equal", base, dense_b, ws_buf);
+    for (const auto & d : {false, true}) { delta = base; delta.D = d ? static_cast<const void *>(zero_d) : nullptr; delta.full_C = true; run_ws(d ? "zero_D_full_acc_C" : "null_full_acc_C", delta, dense_b, ws_buf); }
+    for (const auto & d : {false, true}) { delta = base; delta.D = d ? static_cast<const void *>(zero_d) : nullptr; delta.full_C = false; run_ws(d ? "zero_D_narrow_elem_C" : "null_narrow_elem_C", delta, dense_b, ws_buf); }
+    const bool dense_ok = check(dense_out[0] == 7.0f && dense_out[1] == 10.0f,
+                                "dense WS clone output") &&
+        check(exact[0] == expected0 && exact[1] == expected1, "exact WS clone output");
+    return raw_ok && dense_ok;
 #endif
 }
 
