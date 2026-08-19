@@ -226,6 +226,21 @@ target_include_directories(test-gemmini-act-quant-i32-saturation PRIVATE
 add_test(NAME test-gemmini-act-quant-i32-saturation
     COMMAND $<TARGET_FILE:test-gemmini-act-quant-i32-saturation>)
 
+set(TEST_GEMMINI_EXSIA_SW_PATH "")
+if (DEFINED GEMMINI_SW_PATH AND NOT GEMMINI_SW_PATH STREQUAL "")
+    set(TEST_GEMMINI_EXSIA_SW_PATH "${GEMMINI_SW_PATH}")
+elseif (DEFINED ENV{GEM_HOME} AND NOT "$ENV{GEM_HOME}" STREQUAL "")
+    set(TEST_GEMMINI_EXSIA_SW_PATH "$ENV{GEM_HOME}")
+else()
+    get_filename_component(_test_gemmini_llama_root "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+    set(TEST_GEMMINI_EXSIA_SW_PATH "${_test_gemmini_llama_root}/../RISC-V-DynDNN-gemmini-include")
+endif()
+if (NOT EXISTS "${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini.h"
+    AND NOT EXISTS "${TEST_GEMMINI_EXSIA_SW_PATH}/include/gemmini.h"
+    AND NOT EXISTS "${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini-rocc-tests/include/gemmini.h")
+    message(FATAL_ERROR "test-gemmini-exsia requires a supported Gemmini header layout under ${TEST_GEMMINI_EXSIA_SW_PATH}")
+endif()
+
 add_executable(test-gemmini-exsia
     test-gemmini-exsia.cpp
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
@@ -258,11 +273,11 @@ target_include_directories(test-gemmini-exsia PRIVATE
     ../ggml/src/ggml-gemmini/quants/act
     ../ggml/src/ggml-gemmini/quants/act/exsia
     ../ggml/src/ggml-gemmini/quants/common
-    ${GEMMINI_SW_PATH}
-    ${GEMMINI_SW_PATH}/include
-    ${GEMMINI_SW_PATH}/gemmini-rocc-tests
-    ${GEMMINI_SW_PATH}/gemmini-rocc-tests/include
-    ${GEMMINI_SW_PATH}/rocc-software/src)
+    ${TEST_GEMMINI_EXSIA_SW_PATH}
+    ${TEST_GEMMINI_EXSIA_SW_PATH}/include
+    ${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini-rocc-tests
+    ${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini-rocc-tests/include
+    ${TEST_GEMMINI_EXSIA_SW_PATH}/rocc-software/src)
 foreach(_case IN ITEMS all baseline dispatch rmd-routes rmd-direct-parity direct-executor rmd-gather)
     string(REPLACE "-" "_" _case_test_name "${_case}")
     add_test(NAME gemmini_exsia_${_case_test_name}
