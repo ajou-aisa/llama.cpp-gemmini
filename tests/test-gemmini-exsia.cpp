@@ -243,27 +243,27 @@ bool test_rmd_ws_contract_probe() {
         elem_t a[DIM * DIM];
         elem_t b[DIM * DIM];
         acc_t d[DIM * DIM];
-        elem_t guard_before;
-        elem_t c[DIM * DIM];
-        elem_t guard_after;
+        acc_t guard_before;
+        acc_t c[DIM * DIM];
+        acc_t guard_after;
     };
-    struct Result { elem_t c0; elem_t c1; size_t changed; size_t first; bool guards; };
-    auto run = [](elem_t * a, elem_t * b, acc_t * d, elem_t * c, bool transpose,
-                  elem_t * before, elem_t * after) {
-        std::fill(c, c + DIM * DIM, sentinel);
-        if (before != nullptr) *before = static_cast<elem_t>(-37);
-        if (after != nullptr) *after = static_cast<elem_t>(-73);
+    struct Result { acc_t c0; acc_t c1; size_t changed; size_t first; bool guards; };
+    auto run = [sentinel](elem_t * a, elem_t * b, acc_t * d, acc_t * c, bool transpose,
+                          acc_t * before, acc_t * after) {
+        std::fill(c, c + DIM * DIM, static_cast<acc_t>(sentinel));
+        if (before != nullptr) *before = static_cast<acc_t>(-37);
+        if (after != nullptr) *after = static_cast<acc_t>(-73);
         asm volatile("" ::: "memory");
         tiled_matmul(I, J, K, a, b, d, c, stride, stride, stride, stride,
                      1.0f, 1.0f, 1.0f, NO_ACTIVATION, ACC_SCALE_IDENTITY,
                      ACC_SCALE_IDENTITY, false, 1, 1, 1, false, false,
-                     transpose, false, 0, WS);
+                     false, transpose, true, false, 0, WS);
         asm volatile("" ::: "memory");
         Result r{c[0], c[1], 0, DIM * DIM,
-                  (before == nullptr || *before == static_cast<elem_t>(-37)) &&
-                  (after == nullptr || *after == static_cast<elem_t>(-73))};
+                  (before == nullptr || *before == static_cast<acc_t>(-37)) &&
+                  (after == nullptr || *after == static_cast<acc_t>(-73))};
         for (size_t n = 0; n < DIM * DIM; ++n) {
-            if (c[n] != sentinel) { ++r.changed; r.first = std::min(r.first, n); }
+            if (c[n] != static_cast<acc_t>(sentinel)) { ++r.changed; r.first = std::min(r.first, n); }
         }
         return r;
     };
@@ -279,12 +279,13 @@ bool test_rmd_ws_contract_probe() {
     Fixed z{}; fill_operands(z.a, z.b, false); std::fill(z.d, z.d + DIM * DIM, acc_t{0});
     z.d[0] = bias0; z.d[1] = bias1;
     const Result r3 = run(z.a, z.b, z.d, z.c, false, &z.guard_before, &z.guard_after);
-    std::vector<elem_t> va(DIM * DIM), vb(DIM * DIM), vc(DIM * DIM);
+    std::vector<elem_t> va(DIM * DIM), vb(DIM * DIM);
+    std::vector<acc_t> vc(DIM * DIM);
     fill_operands(va.data(), vb.data(), false);
     const Result r4 = run(va.data(), vb.data(), nullptr, vc.data(), false, nullptr, nullptr);
     const auto emit = [](int n, const Result & r, const void * a, const void * b, const void * c) {
-        std::printf("RMD_PROBE case=%d c0=%d c1=%d changed_count=%zu first_changed_index=%zu guards_ok=%d a_mod=%zu b_mod=%zu c_mod=%zu\n",
-                    n, static_cast<int>(r.c0), static_cast<int>(r.c1), r.changed, r.first,
+        std::printf("RMD_PROBE case=%d c0=%lld c1=%lld changed_count=%zu first_changed_index=%zu guards_ok=%d a_mod=%zu b_mod=%zu c_mod=%zu\n",
+                    n, static_cast<long long>(r.c0), static_cast<long long>(r.c1), r.changed, r.first,
                     r.guards ? 1 : 0, reinterpret_cast<uintptr_t>(a) % 64,
                     reinterpret_cast<uintptr_t>(b) % 64, reinterpret_cast<uintptr_t>(c) % 64);
     };
