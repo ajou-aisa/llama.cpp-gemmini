@@ -523,12 +523,14 @@ run_guest() {
     set -e
     printf '%s\n' "$route_test_status" >"$run_dir/rmd-routes-test/exit-status.txt"
     if ((route_test_status == 0)); then
-        grep -Eq '^RMD_STAGE ' "$run_dir/rmd-routes-test/stdout.txt" &&
-            grep -F --quiet 'RMD_ORACLE ' "$run_dir/rmd-routes-test/stdout.txt" &&
-            grep -F --quiet 'RMD_ORACLE direct' "$run_dir/rmd-routes-test/stdout.txt" &&
-            grep -F --quiet 'RMD_ORACLE radix' "$run_dir/rmd-routes-test/stdout.txt" &&
-            grep -F --quiet 'RMD_ORACLE packet-scalar' "$run_dir/rmd-routes-test/stdout.txt" &&
-            grep -F --quiet 'RMD_ORACLE WS' "$run_dir/rmd-routes-test/stdout.txt" &&
+        grep -Eq '^RMD_ORACLE single dense_direct=[0-9]+ packet_scalar=[0-9]+ ws=([0-9]+|unsupported)$' \
+            "$run_dir/rmd-routes-test/stdout.txt" &&
+            grep -Eq '^RMD_STAGE cancellation_packet_scalar( |$)' \
+                "$run_dir/rmd-routes-test/stdout.txt" &&
+            grep -Eq '^RMD_STAGE ws raw_lanes=[^ ]+ correction=[^ ]+ nonzero_count=[0-9]+$' \
+                "$run_dir/rmd-routes-test/stdout.txt" &&
+            grep -Eq '^RMD_ORACLE cancellation dense_direct=[0-9]+ packet_scalar=[0-9]+ ws=[0-9]+$' \
+                "$run_dir/rmd-routes-test/stdout.txt" &&
             grep -F --quiet 'PASS: case=rmd-routes' "$run_dir/rmd-routes-test/stdout.txt" ||
             route_test_status=1
     fi

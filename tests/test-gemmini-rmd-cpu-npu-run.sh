@@ -210,15 +210,20 @@ cat >"$BUILD_DIR/bin/test-gemmini-exsia" <<'ROUTES'
 #!/usr/bin/env bash
 set -euo pipefail
 [[ ${1:-} == --case=rmd-routes ]]
-printf 'RMD_STAGE begin case=rmd-routes\\n'
+printf 'RMD_STAGE begin case=rmd-routes\n'
 if [[ ${FAIL_RMD_ROUTES:-0} == 1 ]]; then
-    printf 'FAIL: case=rmd-routes\\n'
+    printf 'FAIL: case=rmd-routes\n'
     exit 19
 fi
-if [[ ${MISSING_RMD_ORACLE:-0} != 1 ]]; then
-    printf 'RMD_ORACLE direct scalar=pass\\nRMD_ORACLE radix scalar=pass\\nRMD_ORACLE packet-scalar scalar=pass\\nRMD_ORACLE WS scalar=pass\\n'
+printf 'RMD_ORACLE single dense_direct=10 packet_scalar=20 ws=30\n'
+if [[ ${MISSING_RMD_STAGE_WS:-0} != 1 ]]; then
+    printf 'RMD_STAGE ws raw_lanes=1,0,1 correction=2,0,2 nonzero_count=2\n'
 fi
-printf 'RMD_STAGE complete case=rmd-routes\\nPASS: case=rmd-routes\\n'
+printf 'RMD_STAGE cancellation_packet_scalar lanes=1,0 correction=2,0 nonzero_count=1\n'
+if [[ ${MISSING_RMD_ORACLE_CANCELLATION:-0} != 1 ]]; then
+    printf 'RMD_ORACLE cancellation dense_direct=11 packet_scalar=21 ws=31\n'
+fi
+printf 'RMD_STAGE complete case=rmd-routes\nPASS: case=rmd-routes\n'
 ROUTES
 chmod +x "$BUILD_DIR/bin/test-gemmini-exsia"
 cat >"$BUILD_DIR/CMakeCache.txt" <<'CACHE'
@@ -418,19 +423,32 @@ assert_contains "$output_root/failed-rmd-routes/manifest.txt" 'rmd_routes_test_s
 [[ $(wc -l <"$marker_root/invocations.txt" | tr -d ' ') == 2 ]] || fail 'workloads started after failed route test'
 
 set +e
-MISSING_RMD_ORACLE=1 MARKER_ROOT="$marker_root" "$runner" run \
-    --run-id missing-rmd-oracle \
+MISSING_RMD_STAGE_WS=1 MARKER_ROOT="$marker_root" "$runner" run \
+    --run-id missing-rmd-stage-ws \
+    --workspace "$guest_workspace" \
+    --model "$model" \
+    --output-root "$output_root" \
+    --expected-bundle-id "$bundle_id"
+missing_stage_status=$?
+set -e
+[[ $missing_stage_status -eq 1 ]] || fail "expected missing WS stage status 1, got $missing_stage_status"
+assert_file "$output_root/missing-rmd-stage-ws.tar.gz"
+assert_contains "$output_root/missing-rmd-stage-ws/manifest.txt" 'rmd_routes_test_status=1'
+[[ $(wc -l <"$marker_root/invocations.txt" | tr -d ' ') == 2 ]] || fail 'workloads started after missing WS stage'
+
+set +e
+MISSING_RMD_ORACLE_CANCELLATION=1 MARKER_ROOT="$marker_root" "$runner" run \
+    --run-id missing-rmd-oracle-cancellation \
     --workspace "$guest_workspace" \
     --model "$model" \
     --output-root "$output_root" \
     --expected-bundle-id "$bundle_id"
 missing_oracle_status=$?
 set -e
-[[ $missing_oracle_status -eq 1 ]] || fail "expected missing oracle status 1, got $missing_oracle_status"
-assert_file "$output_root/missing-rmd-oracle.tar.gz"
-assert_contains "$output_root/missing-rmd-oracle/manifest.txt" 'rmd_routes_test_status=1'
-assert_contains "$output_root/missing-rmd-oracle/rmd-routes-test/stdout.txt" 'PASS: case=rmd-routes'
-[[ $(wc -l <"$marker_root/invocations.txt" | tr -d ' ') == 2 ]] || fail 'workloads started after missing oracle'
+[[ $missing_oracle_status -eq 1 ]] || fail "expected missing cancellation oracle status 1, got $missing_oracle_status"
+assert_file "$output_root/missing-rmd-oracle-cancellation.tar.gz"
+assert_contains "$output_root/missing-rmd-oracle-cancellation/manifest.txt" 'rmd_routes_test_status=1'
+[[ $(wc -l <"$marker_root/invocations.txt" | tr -d ' ') == 2 ]] || fail 'workloads started after missing cancellation oracle'
 
 set +e
 FAIL_CPU_RUN=1 MARKER_ROOT="$marker_root" "$runner" run \
