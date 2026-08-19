@@ -232,68 +232,66 @@ bool test_rmd_ws_contract_probe() {
     std::printf("RMD_PROBE supported=0 status=unsupported\n");
     return true;
 #else
-    constexpr size_t I = 16;
-    constexpr size_t J = 2;
-    constexpr size_t K = 2;
-    constexpr size_t stride = 16;
+    constexpr size_t I = 16, J = 2, K = 2, stride = 16;
     constexpr elem_t sentinel = static_cast<elem_t>(-91);
-    constexpr acc_t bias0 = static_cast<acc_t>(101);
-    constexpr acc_t bias1 = static_cast<acc_t>(203);
+    constexpr acc_t bias0 = static_cast<acc_t>(101), bias1 = static_cast<acc_t>(203);
     struct alignas(64) Fixed {
-        elem_t a[DIM * DIM];
-        elem_t b[DIM * DIM];
-        acc_t d[DIM * DIM];
+        elem_t a[DIM * DIM]; elem_t b[DIM * DIM]; acc_t d[DIM * DIM];
         acc_t guard_before;
-        acc_t c[DIM * DIM];
+        alignas(64) acc_t c[DIM * DIM];
         acc_t guard_after;
     };
     struct Result { acc_t c0; acc_t c1; size_t changed; size_t first; bool guards; };
-    auto run = [sentinel](elem_t * a, elem_t * b, acc_t * d, acc_t * c, bool transpose,
+    auto run = [sentinel](elem_t * a, elem_t * b, acc_t * d, acc_t * c,
+                          bool transpose_B, tiled_matmul_type_t mode,
                           acc_t * before, acc_t * after) {
         std::fill(c, c + DIM * DIM, static_cast<acc_t>(sentinel));
-        if (before != nullptr) *before = static_cast<acc_t>(-37);
-        if (after != nullptr) *after = static_cast<acc_t>(-73);
+        if (before) *before = -37;
+        if (after) *after = -73;
         asm volatile("" ::: "memory");
         tiled_matmul(I, J, K, a, b, d, c, stride, stride, stride, stride,
                      1.0f, 1.0f, 1.0f, NO_ACTIVATION, ACC_SCALE_IDENTITY,
                      ACC_SCALE_IDENTITY, false, 1, 1, 1,
-                     false, transpose, true, false, 0, WS);
+                     false, transpose_B, true, false, 0, mode);
         asm volatile("" ::: "memory");
         Result r{c[0], c[1], 0, DIM * DIM,
-                  (before == nullptr || *before == static_cast<acc_t>(-37)) &&
-                  (after == nullptr || *after == static_cast<acc_t>(-73))};
-        for (size_t n = 0; n < DIM * DIM; ++n) {
+            (!before || *before == -37) && (!after || *after == -73)};
+        for (size_t n = 0; n < DIM * DIM; ++n)
             if (c[n] != static_cast<acc_t>(sentinel)) { ++r.changed; r.first = std::min(r.first, n); }
-        }
         return r;
     };
-    auto fill_operands = [](elem_t * a, elem_t * b, bool transpose) {
+    auto fill = [](elem_t * a, elem_t * b, bool transpose_B) {
+        std::fill(a, a + DIM * DIM, elem_t{0}); std::fill(b, b + DIM * DIM, elem_t{0});
         a[0] = 1; a[1] = 2;
-        if (!transpose) { b[0] = 3; b[1] = 7; b[stride] = 5; b[stride + 1] = 11; }
-        else { b[0] = 3; b[1] = 5; b[stride] = 7; b[stride + 1] = 11; }
+        b[0] = 3; b[1] = transpose_B ? 5 : 7;
+        b[stride] = transpose_B ? 7 : 5; b[stride + 1] = 11;
     };
-    Fixed x{}; fill_operands(x.a, x.b, false);
-    const Result r1 = run(x.a, x.b, nullptr, x.c, false, &x.guard_before, &x.guard_after);
-    Fixed y{}; fill_operands(y.a, y.b, true);
-    const Result r2 = run(y.a, y.b, nullptr, y.c, true, &y.guard_before, &y.guard_after);
-    Fixed z{}; fill_operands(z.a, z.b, false); std::fill(z.d, z.d + DIM * DIM, acc_t{0});
-    z.d[0] = bias0; z.d[1] = bias1;
-    const Result r3 = run(z.a, z.b, z.d, z.c, false, &z.guard_before, &z.guard_after);
+    Fixed x{}; fill(x.a, x.b, false);
+    const Result r1 = run(x.a, x.b, nullptr, x.c, false, WS, &x.guard_before, &x.guard_after);
+    gemmini_flush(0);
+    const Result r2 = run(x.a, x.b, nullptr, x.c, false, WS, &x.guard_before, &x.guard_after);
+    Fixed y{}; fill(y.a, y.b, true); gemmini_flush(0);
+    const Result r3 = run(y.a, y.b, nullptr, y.c, true, WS, &y.guard_before, &y.guard_after);
+    Fixed z{}; fill(z.a, z.b, false); std::fill(z.d, z.d + DIM * DIM, acc_t{0});
+    z.d[0] = bias0; z.d[1] = bias1; gemmini_flush(0);
+    const Result r4 = run(z.a, z.b, z.d, z.c, false, WS, &z.guard_before, &z.guard_after);
     std::vector<elem_t> va(DIM * DIM), vb(DIM * DIM);
     std::vector<acc_t> vc(DIM * DIM);
-    fill_operands(va.data(), vb.data(), false);
-    const Result r4 = run(va.data(), vb.data(), nullptr, vc.data(), false, nullptr, nullptr);
+    fill(va.data(), vb.data(), false); gemmini_flush(0);
+    const Result r5 = run(va.data(), vb.data(), nullptr, vc.data(), false, WS, nullptr, nullptr);
+    std::fill(vc.begin(), vc.end(), sentinel); gemmini_flush(0);
+    const Result r6 = run(va.data(), vb.data(), nullptr, vc.data(), false, CPU, nullptr, nullptr);
     const auto emit = [](int n, const Result & r, const void * a, const void * b, const void * c) {
         std::printf("RMD_PROBE case=%d c0=%lld c1=%lld changed_count=%zu first_changed_index=%zu guards_ok=%d a_mod=%zu b_mod=%zu c_mod=%zu\n",
-                    n, static_cast<long long>(r.c0), static_cast<long long>(r.c1), r.changed, r.first,
-                    r.guards ? 1 : 0, reinterpret_cast<uintptr_t>(a) % 64,
-                    reinterpret_cast<uintptr_t>(b) % 64, reinterpret_cast<uintptr_t>(c) % 64);
+            n, (long long) r.c0, (long long) r.c1, r.changed, r.first, r.guards ? 1 : 0,
+            (uintptr_t)a % 64, (uintptr_t)b % 64, (uintptr_t)c % 64);
     };
-    emit(1, r1, x.a, x.b, x.c); emit(2, r2, y.a, y.b, y.c);
-    emit(3, r3, z.a, z.b, z.c); emit(4, r4, va.data(), vb.data(), vc.data());
-    return check(r1.c0 == 13 && r1.c1 == 29 && r2.c0 == 13 && r2.c1 == 29,
-                 "RMD WS product contract") &&
-        check(r3.c0 == bias0 + 13 && r3.c1 == bias1 + 29, "RMD WS bias contract");
+    emit(1,r1,x.a,x.b,x.c); emit(2,r2,x.a,x.b,x.c); emit(3,r3,y.a,y.b,y.c);
+    emit(4,r4,z.a,z.b,z.c); emit(5,r5,va.data(),vb.data(),vc.data());
+    emit(6,r6,va.data(),vb.data(),vc.data());
+    return check(r2.c0 == 13 && r2.c1 == 29 && r3.c0 == 13 && r3.c1 == 29 &&
+                 r4.c0 == bias0 + 13 && r4.c1 == bias1 + 29 &&
+                 r5.c0 == 13 && r5.c1 == 29 && r6.c0 == 13 && r6.c1 == 29, "RMD WS probe contract");
 #endif
 }
 
