@@ -1,6 +1,9 @@
 # Build artifacts
 build/*
 build-*/
+**/__pycache__/
+*.py[cod]
+**/.omo/
 
 # Generated sources
 common/build-info.cpp
