@@ -131,6 +131,9 @@ private:
     friend MatmulStatus finish_execution(MatmulExecution &);
     friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput);
     friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput, rmd::StripePacketHandle);
+    friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput,
+                                          residual::DirectStripePayloadHandle,
+                                          rmd::StripePacketHandle);
     friend MatmulStatus execute_dense_stripe(MatmulStripeJob &);
     friend MatmulStatus execute_rmd_stripe(MatmulStripeJob &);
     friend MatmulStatus compose_rmd_stripe(MatmulStripeJob &);
@@ -231,6 +234,19 @@ struct MatmulJobMetrics {
     uint64_t rmd_end_ns = 0;
     uint64_t merge_start_ns = 0;
     uint64_t merge_end_ns = 0;
+    uint64_t telemetry_queue_tick = 0;
+    uint64_t telemetry_dense_start = 0;
+    uint64_t telemetry_dense_end = 0;
+    uint64_t telemetry_residual_start = 0;
+    uint64_t telemetry_backend_start = 0;
+    uint64_t telemetry_backend_end = 0;
+    uint64_t telemetry_merge_start = 0;
+    uint64_t telemetry_merge_end = 0;
+    uint64_t telemetry_residual_end = 0;
+    std::string telemetry_input_hash;
+    std::string telemetry_correction_hash;
+    uint64_t telemetry_correction_nonzero_count = 0;
+    std::string telemetry_output_hash;
 };
 
 struct MatmulCollectorSnapshot {
@@ -287,6 +303,7 @@ private:
         size_t row_begin;
         size_t row_end;
         rmd::StripePacketHandle rmd_packet;
+        residual::DirectStripePayloadHandle direct_residual;
         uint64_t la_cycles = 0;
         uint64_t la3_cycles = 0;
         uint64_t sf_cycles = 0;
@@ -308,6 +325,7 @@ private:
         uint64_t producer_wait_start_ns = 0;
         uint64_t producer_wait_end_ns = 0;
         uint64_t queued_ns = 0;
+        uint64_t telemetry_queued_tick = 0;
     };
     static bool on_ready(void *, const quants::act::exsia::StripeReadyEvent &);
     friend MatmulStatus execute_post_fold_pipeline(const ggml_gemmini_args_t &, MatmulStripeCollector &);
@@ -358,6 +376,116 @@ enum class MatmulExecutionState {
     failed,
 };
 
+enum class RmdBackend : uint8_t {
+    cpu_direct,
+    gemmini_ws_compact,
+};
+
+enum class MatmulOptionSource : uint8_t {
+    build_default,
+    environment,
+    explicit_override,
+};
+
+inline constexpr const char * kRmdTelemetrySchema = "gemmini.rmd.telemetry";
+inline constexpr uint32_t kRmdTelemetryVersion = 1;
+
+struct RmdTelemetryCounters {
+    uint64_t direct_events = 0;
+    uint64_t direct_calls = 0;
+    uint64_t packet_calls = 0;
+    uint64_t ws_calls = 0;
+};
+
+struct RmdTelemetryGeometry {
+    uint64_t packet_count = 0;
+    uint64_t active_blocks = 0;
+    uint64_t compact_k_count = 0;
+    uint64_t padded_k_count = 0;
+    uint64_t physical_tile_count = 0;
+};
+
+struct RmdTelemetryTiming {
+    uint64_t prep = 0;
+    uint64_t backend_service = 0;
+    uint64_t merge = 0;
+    uint64_t residual_total = 0;
+    uint64_t queue = 0;
+    uint64_t dense_end = 0;
+    uint64_t residual_start = 0;
+};
+
+struct RmdTelemetryStripe {
+    size_t stripe_id = 0;
+    size_t row_begin = 0;
+    size_t row_end = 0;
+    // prep, backend, merge, and proof start/end. Proof is deliberately last,
+    // outside all measured service regions.
+    std::array<uint64_t, 8> ordered_ticks{};
+    std::string input_hash;
+    std::string correction_hash;
+    std::string output_hash;
+    uint64_t correction_nonzero_count = 0;
+};
+
+struct RmdTelemetryRecord {
+    std::string schema = kRmdTelemetrySchema;
+    uint32_t version = kRmdTelemetryVersion;
+    std::string runtime_bundle_id;
+    std::string model_id;
+    std::string run_id;
+    RmdBackend backend = RmdBackend::cpu_direct;
+    MatmulOptionSource source = MatmulOptionSource::build_default;
+    std::string units;
+    bool work = false;
+    uint64_t invocation_total = 0;
+    RmdTelemetryCounters counters;
+    RmdTelemetryGeometry geometry;
+    RmdTelemetryTiming timing;
+    std::vector<RmdTelemetryStripe> stripes;
+};
+
+enum class RmdTelemetryCheckCode : uint8_t {
+    ok,
+    malformed_schema,
+    unsupported_version,
+    wrong_units,
+    zero_work,
+    route_not_exclusive,
+    invalid_timing,
+    ordering_violation,
+    missing_detail,
+    input_hash_mismatch,
+    correction_hash_mismatch,
+    correction_nonzero_count_mismatch,
+    output_hash_mismatch,
+};
+
+struct RmdTelemetryCheckResult {
+    RmdTelemetryCheckCode code = RmdTelemetryCheckCode::ok;
+    const char * message = "ok";
+    bool ok() const { return code == RmdTelemetryCheckCode::ok; }
+};
+
+// Stable pure seams: Todo 10 can consume records without parsing log prose.
+std::string serialize_rmd_telemetry(const RmdTelemetryRecord & record);
+RmdTelemetryCheckResult check_rmd_telemetry(const RmdTelemetryRecord & record,
+                                             std::string_view expected_units,
+                                             bool comparison_mode);
+RmdTelemetryCheckResult compare_rmd_telemetry_proofs(
+    const RmdTelemetryRecord & lhs, const RmdTelemetryRecord & rhs);
+std::string rmd_input_hash(const residual::DirectStripePayload & payload);
+std::string rmd_input_hash(const rmd::StripePacket & packet);
+std::string rmd_correction_hash(const std::vector<rmd::OutputValue> & correction);
+std::string rmd_output_hash(const ggml_gemmini_args_t & args,
+                            size_t row_begin, size_t row_end);
+std::string resolve_rmd_model_id(const char * environment_model_id,
+                                 std::string_view model_arch);
+RmdTelemetryRecord make_rmd_telemetry_record(
+    RmdBackend backend, MatmulOptionSource source,
+    std::string runtime_bundle_id, std::string model_id, std::string run_id,
+    uint64_t invocation_total, const std::vector<MatmulJobMetrics> & profiles);
+
 struct ResolvedMatmulOptions {
     MatmulInvocationMode mode = static_cast<MatmulInvocationMode>(config::DEFAULT_MATMUL_MODE);
     size_t stripe_rows = config::DEFAULT_STRIPE_ROWS.value_or(1);
@@ -366,6 +494,7 @@ struct ResolvedMatmulOptions {
     bool validation = false;
     bool profiling = false;
     size_t job_capacity = config::DEFAULT_STRIPE_JOB_CAPACITY;
+    RmdBackend rmd_backend = static_cast<RmdBackend>(config::DEFAULT_RMD_BACKEND);
 
     ResolvedMatmulOptions() {}
 };
@@ -377,6 +506,7 @@ struct MatmulOptionOverrides {
     bool validation = false;
     bool profiling = false;
     std::optional<size_t> job_capacity;
+    std::optional<RmdBackend> rmd_backend;
 };
 
 #ifdef GGML_GEMMINI_MATMUL_IMPLEMENTATION
@@ -390,12 +520,15 @@ enum class MatmulOptionsError : uint8_t {
     invalid_mode,
     invalid_stripe_rows,
     invalid_job_capacity,
+    invalid_rmd_backend,
+    runtime_override_disabled,
     disabled_mode,
 };
 
 struct MatmulOptionsResolution {
     ResolvedMatmulOptions options;
     MatmulOptionsError error = MatmulOptionsError::none;
+    MatmulOptionSource rmd_backend_source = MatmulOptionSource::build_default;
 
     bool ok() const { return error == MatmulOptionsError::none; }
 };
@@ -410,6 +543,11 @@ inline bool parse_positive_size(std::string_view text, size_t & value) {
 
 inline MatmulOptionsResolution resolve_matmul_options(const MatmulOptionOverrides & explicit_options = {}) {
     MatmulOptionsResolution result;
+    if (!config::ALLOW_RUNTIME_MATMUL_OVERRIDE && !explicit_options.rmd_backend &&
+        std::getenv("GEMMINI_RMD_BACKEND") != nullptr) {
+        result.error = MatmulOptionsError::runtime_override_disabled;
+        return result;
+    }
     if (config::ALLOW_RUNTIME_MATMUL_OVERRIDE) {
         if (!explicit_options.mode) if (const char * value = std::getenv("GEMMINI_MATMUL_MODE")) {
             const std::string_view mode(value);
@@ -441,6 +579,18 @@ inline MatmulOptionsResolution resolve_matmul_options(const MatmulOptionOverride
                 return result;
             }
         }
+        if (!explicit_options.rmd_backend) if (const char * value = std::getenv("GEMMINI_RMD_BACKEND")) {
+            const std::string_view backend(value);
+            if (backend == "CPU") {
+                result.options.rmd_backend = RmdBackend::cpu_direct;
+            } else if (backend == "WS") {
+                result.options.rmd_backend = RmdBackend::gemmini_ws_compact;
+            } else {
+                result.error = MatmulOptionsError::invalid_rmd_backend;
+                return result;
+            }
+            result.rmd_backend_source = MatmulOptionSource::environment;
+        }
     }
 
     if (explicit_options.mode) result.options.mode = *explicit_options.mode;
@@ -449,6 +599,10 @@ inline MatmulOptionsResolution resolve_matmul_options(const MatmulOptionOverride
         result.options.stripe_rows_auto = false;
     }
     if (explicit_options.job_capacity) result.options.job_capacity = *explicit_options.job_capacity;
+    if (explicit_options.rmd_backend) {
+        result.options.rmd_backend = *explicit_options.rmd_backend;
+        result.rmd_backend_source = MatmulOptionSource::explicit_override;
+    }
     result.options.dense_threads = explicit_options.dense_threads;
     result.options.validation = explicit_options.validation;
     result.options.profiling = explicit_options.profiling;
@@ -458,6 +612,10 @@ inline MatmulOptionsResolution resolve_matmul_options(const MatmulOptionOverride
         result.error = explicit_options.stripe_rows && *explicit_options.stripe_rows == 0
             ? MatmulOptionsError::invalid_stripe_rows
             : MatmulOptionsError::invalid_job_capacity;
+        return result;
+    }
+    if (result.options.rmd_backend != RmdBackend::cpu_direct && result.options.rmd_backend != RmdBackend::gemmini_ws_compact) {
+        result.error = MatmulOptionsError::invalid_rmd_backend;
         return result;
     }
     if ((result.options.mode != MatmulInvocationMode::full && !config::ENABLE_STRIPE_MATMUL) ||
@@ -515,6 +673,9 @@ private:
     friend MatmulStatus execute_full(MatmulExecution &);
     friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput);
     friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput, rmd::StripePacketHandle);
+    friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput,
+                                          residual::DirectStripePayloadHandle,
+                                          rmd::StripePacketHandle);
     friend MatmulStatus capture_stripe(MatmulExecution &, const MatmulStripeInput &, MatmulStripeJob &);
     friend MatmulStatus execute_dense_stripe(MatmulStripeJob &);
     friend MatmulStatus execute_rmd_stripe(MatmulStripeJob &);
@@ -590,6 +751,9 @@ public:
 private:
     friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput);
     friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput, rmd::StripePacketHandle);
+    friend MatmulStripeJob capture_stripe(MatmulExecution &, MatmulStripeInput,
+                                          residual::DirectStripePayloadHandle,
+                                          rmd::StripePacketHandle);
     friend MatmulStatus execute_dense_stripe(MatmulStripeJob &);
     friend MatmulStatus execute_rmd_stripe(MatmulStripeJob &);
     friend MatmulStatus compose_rmd_stripe(MatmulStripeJob &);
@@ -597,6 +761,7 @@ private:
     friend class MatmulStripeCollector;
 
     MatmulStripeJob(MatmulExecution * execution, MatmulStripeInput input, MatmulStatus status,
+                    residual::DirectStripePayloadHandle direct_residual = nullptr,
                     rmd::StripePacketHandle rmd_packet = nullptr);
     void cancel(MatmulStatus status);
     void release_slot();
@@ -613,6 +778,7 @@ private:
     uint64_t rmd_queued_ns_ = 0;
     std::shared_ptr<std::mutex> job_mutex_ = std::make_shared<std::mutex>();
     std::condition_variable lifecycle_condition_;
+    residual::DirectStripePayloadHandle direct_residual_;
     rmd::StripePacketHandle rmd_packet_;
     rmd::CompressedOutput rmd_output_;
     std::vector<rmd::OutputValue> rmd_correction_;
@@ -631,6 +797,9 @@ MatmulStatus capture_stripe(MatmulExecution & execution, const MatmulStripeInput
                             MatmulStripeJob & job);
 MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput input);
 MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput input,
+                               rmd::StripePacketHandle rmd_packet);
+MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput input,
+                               residual::DirectStripePayloadHandle direct_residual,
                                rmd::StripePacketHandle rmd_packet);
 MatmulStatus capture_stripe(MatmulExecution & execution, const MatmulStripeInput & input,
                             MatmulStripeJob & job);
@@ -655,6 +824,8 @@ inline MatmulStatus resolution_status(MatmulOptionsError error) {
         case MatmulOptionsError::invalid_mode:
         case MatmulOptionsError::invalid_stripe_rows:
         case MatmulOptionsError::invalid_job_capacity:
+        case MatmulOptionsError::invalid_rmd_backend:
+        case MatmulOptionsError::runtime_override_disabled:
             return { MatmulStatusCode::invalid_argument, "invalid matmul options" };
     }
     return { MatmulStatusCode::invalid_argument, "invalid matmul options" };

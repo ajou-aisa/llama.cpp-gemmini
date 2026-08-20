@@ -2,7 +2,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "../../residual/rmd/rmd-types.hpp"
+#include "../../residual/residual-capture.hpp"
 
 #ifndef GGML_GEMMINI_BLOCK_SIZE
 #define GGML_GEMMINI_BLOCK_SIZE 32
@@ -17,4 +17,6 @@ namespace ggml::gemmini::quants::act
 // Residual compensation payload produced by the quantizers: one RMD stripe packet per
 // activation stripe. Empty stripes contribute no packet.
 using RmdPacketList = std::vector<ggml::gemmini::rmd::StripePacketHandle>;
+using DirectResidualList = std::vector<ggml::gemmini::residual::DirectStripePayloadHandle>;
+using ResidualRoute = ggml::gemmini::residual::ResidualRoute;
 }

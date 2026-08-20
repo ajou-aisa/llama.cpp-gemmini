@@ -45,6 +45,7 @@ bool dequantize_activation(float *dst,
                            const ggml_gemmini_args_t &args);
 
 const RmdPacketList &rmd_packets(const ggml_gemmini_args_t &args);
+const DirectResidualList &direct_residuals(const ggml_gemmini_args_t &args);
 
 std::vector<float> activation_scales(const ggml_gemmini_args_t &args, size_t row_count);
 

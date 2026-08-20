@@ -65,6 +65,7 @@ ggml_add_backend_library(ggml-gemmini
                          quants/weight/quantize_Q8_H1.cpp
                          quants/common/fp16_util.cpp
                          quants/common/dequant.cpp
+                         residual/direct/direct-executor.cpp
                          residual/rmd/rmd-builder.cpp
                          residual/rmd/rmd-executor.cpp
                          residual/rmd/rmd-compose.cpp

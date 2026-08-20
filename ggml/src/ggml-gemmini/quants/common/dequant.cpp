@@ -519,7 +519,8 @@ bool route_supports_integer_block_scale(const WeightRoutePlan &plan)
         return false;
     if (plan.scales.row_header_mode || plan.scales.scalar_mode || plan.scales.channel_mode)
         return true;
-    return plan.route == WeightRouteKind::Q8H1;
+    return plan.route == WeightRouteKind::Q8H1 ||
+        plan.route == WeightRouteKind::Q8HP1;
 }
 
 uint64_t route_block_scale(
@@ -530,6 +531,14 @@ uint64_t route_block_scale(
 {
     if (plan.scales.row_header_mode || plan.scales.scalar_mode || plan.scales.channel_mode)
         return 1;
+    if (plan.route == WeightRouteKind::Q8HP1) {
+        const block_q8_hp1 *block = args.q8_hp1_block(j, block_index);
+        if (block == nullptr || block->m == INT16_MIN)
+            return 0;
+        if (block->m < 0 || block->m >= 63)
+            return std::numeric_limits<uint64_t>::max();
+        return uint64_t{1} << static_cast<unsigned>(block->m);
+    }
     if (plan.route != WeightRouteKind::Q8H1)
         return 0;
 
@@ -555,6 +564,10 @@ float route_column_scale(
         const block_q8_h1 *native = plan.native_weight_blocks ? args.q8_h1_block(j, 0) : nullptr;
         return native ? native->s_rf :
             (args.stripe_J > 1 ? args.s_rf_stripe[j / args.stripe_J] : args.s_rf[j]);
+    }
+    if (plan.route == WeightRouteKind::Q8HP1) {
+        const block_q8_hp1 *block = args.q8_hp1_block(j, 0);
+        return block != nullptr ? block->channel_scale : 0.0f;
     }
     return 0.0f;
 }

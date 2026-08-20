@@ -1,4 +1,5 @@
 llama_add_compile_flags()
+add_compile_definitions(GGML_GEMMINI_BLOCK_SIZE=${_GGML_GEMMINI_BLOCK_SIZE_VALUE})
 
 function(llama_build source)
     if (DEFINED LLAMA_TEST_NAME)
@@ -179,6 +180,9 @@ endif()
 llama_build_and_test(test-gemmini-q8-h1-h2-dequant-fp.cpp NAME gemmini_q8_h1_h2_dequant_fp)
 target_sources(gemmini_q8_h1_h2_dequant_fp PRIVATE
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
     ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
     ../ggml/src/ggml-gemmini/quants/act/quantize.cpp
     ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
@@ -192,8 +196,8 @@ target_include_directories(gemmini_q8_h1_h2_dequant_fp PRIVATE
     ../ggml/src/ggml-gemmini
     ../ggml/src/ggml-gemmini-utils/include)
 
-add_executable(test-gemmini-exsia
-    test-gemmini-exsia.cpp
+add_executable(test-gemmini-act-quant-i32-saturation
+    test-gemmini-act-quant-i32-saturation.cpp
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
@@ -202,10 +206,57 @@ add_executable(test-gemmini-exsia
     ../ggml/src/ggml-gemmini/quants/act/quantize.cpp
     ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
     ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
+    ../ggml/src/ggml-gemmini/quants/act/token/token.cpp
+    ../ggml/src/ggml-gemmini/quants/act/stripe/stripe.cpp)
+target_link_libraries(test-gemmini-act-quant-i32-saturation PRIVATE ggml-base ggml-gemmini-utils)
+target_compile_features(test-gemmini-act-quant-i32-saturation PRIVATE cxx_std_17)
+target_compile_definitions(test-gemmini-act-quant-i32-saturation PRIVATE
+    GGML_GEMMINI_ACTIVATION_QUANT=${_GGML_GEMMINI_ACTIVATION_QUANT_VALUE}
+    GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
+    GGML_GEMMINI_ENABLE_RMD=1)
+target_include_directories(test-gemmini-act-quant-i32-saturation PRIVATE
+    ../ggml/include
+    ../ggml/src
+    ../ggml/src/ggml-gemmini
+    ../ggml/src/ggml-gemmini-utils/include)
+add_test(NAME test-gemmini-act-quant-i32-saturation
+    COMMAND $<TARGET_FILE:test-gemmini-act-quant-i32-saturation>)
+
+set(TEST_GEMMINI_EXSIA_SW_PATH "")
+if (DEFINED GEMMINI_SW_PATH AND NOT GEMMINI_SW_PATH STREQUAL "")
+    set(TEST_GEMMINI_EXSIA_SW_PATH "${GEMMINI_SW_PATH}")
+elseif (DEFINED ENV{GEM_HOME} AND NOT "$ENV{GEM_HOME}" STREQUAL "")
+    set(TEST_GEMMINI_EXSIA_SW_PATH "$ENV{GEM_HOME}")
+else()
+    get_filename_component(_test_gemmini_llama_root "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+    set(TEST_GEMMINI_EXSIA_SW_PATH "${_test_gemmini_llama_root}/../RISC-V-DynDNN-gemmini-include")
+endif()
+if (NOT EXISTS "${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini.h"
+    AND NOT EXISTS "${TEST_GEMMINI_EXSIA_SW_PATH}/include/gemmini.h"
+    AND NOT EXISTS "${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini-rocc-tests/include/gemmini.h")
+    message(FATAL_ERROR "test-gemmini-exsia requires a supported Gemmini header layout under ${TEST_GEMMINI_EXSIA_SW_PATH}")
+endif()
+
+add_executable(test-gemmini-exsia
+    test-gemmini-exsia.cpp
+    ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
+    ../ggml/src/ggml-gemmini/residual/direct/direct-executor.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-reference.cpp
+    ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
+    ../ggml/src/ggml-gemmini/quants/act/quantize.cpp
+    ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
+    ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
     ../ggml/src/ggml-gemmini/quants/act/token/token.cpp)
 target_link_libraries(test-gemmini-exsia PRIVATE ggml-base ggml-gemmini-utils)
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
+  target_link_libraries(test-gemmini-exsia PRIVATE atomic)
+endif()
 target_compile_features(test-gemmini-exsia PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-exsia PRIVATE
+    GGML_GEMMINI_TESTING=1
     GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
     GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE}
     GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
@@ -220,8 +271,23 @@ target_include_directories(test-gemmini-exsia PRIVATE
     ../ggml/src/ggml-gemmini/quants
     ../ggml/src/ggml-gemmini/quants/act
     ../ggml/src/ggml-gemmini/quants/act/exsia
-    ../ggml/src/ggml-gemmini/quants/common)
-add_test(NAME test-gemmini-exsia COMMAND $<TARGET_FILE:test-gemmini-exsia>)
+    ../ggml/src/ggml-gemmini/quants/common
+    ${TEST_GEMMINI_EXSIA_SW_PATH}
+    ${TEST_GEMMINI_EXSIA_SW_PATH}/include
+    ${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini-rocc-tests
+    ${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini-rocc-tests/include
+    ${TEST_GEMMINI_EXSIA_SW_PATH}/rocc-software/src)
+foreach(_case IN ITEMS all baseline dispatch rmd-routes q8-srmd-software-ws hp1-srmd-software-ws rmd-direct-parity direct-executor rmd-gather)
+    string(REPLACE "-" "_" _case_test_name "${_case}")
+    add_test(NAME gemmini_exsia_${_case_test_name}
+        COMMAND ${CMAKE_COMMAND}
+            -DTEST_EXECUTABLE=$<TARGET_FILE:test-gemmini-exsia>
+            -DEXPECTED_CASE=${_case}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-exsia-case.cmake)
+endforeach()
+add_test(NAME gemmini_exsia_unknown_case
+    COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=unknown)
+set_tests_properties(gemmini_exsia_unknown_case PROPERTIES WILL_FAIL TRUE)
 
 add_executable(test-gemmini-exsia-writer
     test-gemmini-exsia.cpp
@@ -292,23 +358,77 @@ target_include_directories(test-gemmini-rmd PRIVATE
     ${GEMMINI_SW_PATH}
     ${GEMMINI_SW_PATH}/include)
 add_test(NAME test-gemmini-rmd COMMAND $<TARGET_FILE:test-gemmini-rmd>)
-add_test(NAME test-gemmini-exsia-stream-parity
-    COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=stream-parity --rows=129 --cols=37)
-add_test(NAME test-gemmini-exsia-stream-invalid-shape
-    COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=stream-invalid-shape --rows=0 --cols=37)
-add_test(NAME gemmini_exsia_all
-    COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=all --rows=65 --cols=37 --compiled-tau=${GGML_GEMMINI_EXSIA_SIGMA})
-add_test(NAME gemmini_exsia_shift_extremes
-    COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=shift-extremes --compiled-tau=${GGML_GEMMINI_EXSIA_SIGMA})
-add_test(NAME gemmini_exsia_localstage_kernel_validation
-    COMMAND $<TARGET_FILE:test-gemmini-exsia>
-        --case=localstage-kernel-validation
-        --focus=all
-        --repeat-fresh=10
-        --evidence-dir=${CMAKE_CURRENT_BINARY_DIR}/exsia-localstage-kernel-validation)
-set_tests_properties(gemmini_exsia_localstage_kernel_validation PROPERTIES
-    LABELS "gemmini;exsia;validation"
-    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+
+add_executable(test-gemmini-rmd-telemetry
+    test-gemmini-rmd-telemetry.cpp
+    ../ggml/src/ggml-gemmini/ggml-gemmini-matmul.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp)
+target_link_libraries(test-gemmini-rmd-telemetry PRIVATE ggml-gemmini-utils)
+target_compile_features(test-gemmini-rmd-telemetry PRIVATE cxx_std_17)
+target_compile_definitions(test-gemmini-rmd-telemetry PRIVATE
+    GGML_GEMMINI_PIPELINE_WRITER_TEST_ONLY=1
+    LOG_CYCLE=${LOG_CYCLE}
+    CYCLE_DETAIL=${CYCLE_DETAIL})
+target_include_directories(test-gemmini-rmd-telemetry PRIVATE
+    ../ggml/include ../ggml/src ../ggml/src/ggml-gemmini
+    ../ggml/src/ggml-gemmini-utils/include ${GGML_GEMMINI_GENERATED_CONFIG_DIR}
+    ${GEMMINI_SW_PATH} ${GEMMINI_SW_PATH}/include)
+add_test(NAME test-gemmini-rmd-telemetry
+    COMMAND $<TARGET_FILE:test-gemmini-rmd-telemetry>)
+
+option(GEMMINI_BUILD_SRMD_RAW_WS_TESTS
+    "Build the pinned raw-WS SRMD tests"
+    OFF)
+if (GEMMINI_BUILD_SRMD_RAW_WS_TESTS)
+    set(GEMMINI_SRMD_RAW_WS_HEADER "")
+    foreach(_header IN ITEMS
+            "${GEMMINI_SW_PATH}/gemmini.h"
+            "${GEMMINI_SW_PATH}/include/gemmini.h"
+            "${GEMMINI_SW_PATH}/gemmini-rocc-tests/include/gemmini.h")
+        if (NOT GEMMINI_SRMD_RAW_WS_HEADER AND EXISTS "${_header}")
+            set(GEMMINI_SRMD_RAW_WS_HEADER "${_header}")
+        endif()
+    endforeach()
+    if (NOT GEMMINI_SRMD_RAW_WS_HEADER)
+        message(FATAL_ERROR "test-gemmini-srmd-raw-ws requires a supported Gemmini header layout")
+    endif()
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} -C "${GEMMINI_SW_PATH}" rev-parse HEAD
+        RESULT_VARIABLE GEMMINI_SRMD_RAW_WS_GIT_RESULT
+        OUTPUT_VARIABLE GEMMINI_SRMD_RAW_WS_GIT_HEAD
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} -C "${GEMMINI_SW_PATH}" status --porcelain
+        RESULT_VARIABLE GEMMINI_SRMD_RAW_WS_STATUS_RESULT
+        OUTPUT_VARIABLE GEMMINI_SRMD_RAW_WS_GIT_STATUS
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if (NOT GEMMINI_SRMD_RAW_WS_GIT_RESULT EQUAL 0 OR
+        NOT GEMMINI_SRMD_RAW_WS_STATUS_RESULT EQUAL 0 OR
+        NOT GEMMINI_SRMD_RAW_WS_GIT_HEAD STREQUAL
+            "2416775820be7da60a310570964b3c97743b9007" OR
+        GEMMINI_SRMD_RAW_WS_GIT_STATUS)
+        message(FATAL_ERROR "test-gemmini-srmd-raw-ws requires the pinned clean Gemmini checkout")
+    endif()
+    get_filename_component(GEMMINI_SRMD_RAW_WS_INCLUDE_DIR
+        "${GEMMINI_SRMD_RAW_WS_HEADER}" DIRECTORY)
+    add_executable(test-gemmini-srmd-raw-ws
+        test-gemmini-srmd-raw-ws.cpp
+        ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp)
+    target_link_libraries(test-gemmini-srmd-raw-ws PRIVATE ggml-base ggml-gemmini-utils)
+    target_compile_features(test-gemmini-srmd-raw-ws PRIVATE cxx_std_17)
+    target_include_directories(test-gemmini-srmd-raw-ws PRIVATE
+        ${GEMMINI_SRMD_RAW_WS_INCLUDE_DIR}
+        ${GEMMINI_SW_PATH}
+        ${GEMMINI_SW_PATH}/include
+        ../ggml/src
+        ../ggml/src/ggml-gemmini
+        ../ggml/src/ggml-gemmini/residual/rmd)
+    add_test(NAME test-gemmini-srmd-raw-ws-cpu
+        COMMAND $<TARGET_FILE:test-gemmini-srmd-raw-ws> --cpu)
+    add_test(NAME test-gemmini-srmd-layouts-cpu
+        COMMAND $<TARGET_FILE:test-gemmini-srmd-raw-ws> --bench-layouts)
+endif()
+
 add_executable(test-gemmini-matmul-options test-gemmini-matmul-options.cpp)
 target_compile_features(test-gemmini-matmul-options PRIVATE cxx_std_17)
 target_include_directories(test-gemmini-matmul-options PRIVATE
@@ -337,6 +457,12 @@ if (EXISTS "${CMAKE_COMMAND}" AND EXISTS "${LLAMA_TEST_SOURCE_DIR}/CMakeLists.tx
             -DTEST_GENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM}
             -DTEST_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-build-contract.cmake)
+    add_test(
+        NAME test-gemmini-rmd-backend-denylist
+        COMMAND ${CMAKE_COMMAND}
+            -DTEST_SOURCE_DIR=${LLAMA_TEST_SOURCE_DIR}
+            -DTEST_BINARY_DIR=${CMAKE_BINARY_DIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-rmd-backend-denylist.cmake)
 endif()
 
 if (NOT GGML_BACKEND_DL)

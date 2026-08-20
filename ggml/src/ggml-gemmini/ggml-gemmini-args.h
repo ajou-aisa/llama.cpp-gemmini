@@ -108,6 +108,7 @@ typedef struct ggml_gemmini_args_t {
 
     // activation quantization metadata
     act::Meta act_quant{};
+    act::ResidualRoute residual_route = act::ResidualRoute::ws_packet;
     const ggml::gemmini::quants::act::exsia::StripeReadySink *exsia_stripe_ready_sink = nullptr;
 
     //for weight checking   

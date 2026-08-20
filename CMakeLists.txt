@@ -297,6 +297,19 @@ option(GGML_GEMMINI_ENABLE_OPENMP "Enable OpenMP for Gemmini CPU-side kernels" O
 # Balanced Radix-256 Residual Matrix Decomposition. OFF is a residual-compensation
 # ablation only; it does not select any other compensation path.
 option(GGML_GEMMINI_ENABLE_RMD "Enable Balanced Radix-256 residual compensation (RMD)" ON)
+set(GGML_GEMMINI_DEFAULT_RMD_BACKEND "CPU" CACHE STRING
+    "Default RMD backend: CPU or WS")
+set_property(CACHE GGML_GEMMINI_DEFAULT_RMD_BACKEND PROPERTY STRINGS CPU WS)
+if (NOT GGML_GEMMINI_DEFAULT_RMD_BACKEND STREQUAL "CPU" AND
+    NOT GGML_GEMMINI_DEFAULT_RMD_BACKEND STREQUAL "WS")
+    message(FATAL_ERROR
+        "GGML_GEMMINI_DEFAULT_RMD_BACKEND must be exactly CPU or WS, got '${GGML_GEMMINI_DEFAULT_RMD_BACKEND}'")
+endif()
+if (GGML_GEMMINI_DEFAULT_RMD_BACKEND STREQUAL "CPU")
+    set(_GGML_GEMMINI_DEFAULT_RMD_BACKEND_VALUE 0)
+else()
+    set(_GGML_GEMMINI_DEFAULT_RMD_BACKEND_VALUE 1)
+endif()
 # Public matmul invocation defaults: FULL / STRIPE_SEQUENTIAL / STRIPE_PIPELINE.
 option(GGML_GEMMINI_ENABLE_STRIPE_MATMUL "Enable strict stripe matmul modes" ON)
 option(GGML_GEMMINI_ENABLE_STRIPE_PIPELINE "Enable strict stripe pipeline mode" ON)
@@ -435,6 +448,7 @@ message(STATUS "GGML Gemmini matmul defaults:"
     "\n  default mode: ${GGML_GEMMINI_DEFAULT_MATMUL_MODE}"
     "\n  default stripe rows: ${GGML_GEMMINI_DEFAULT_STRIPE_ROWS}"
     "\n  residual compensation: RMD=${GGML_GEMMINI_ENABLE_RMD}"
+    "\n  default RMD backend: ${GGML_GEMMINI_DEFAULT_RMD_BACKEND}"
     "\n  block size: ${GGML_GEMMINI_BLOCK_SIZE}"
     "\n  default stripe job capacity: ${GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY}"
     "\n  runtime override: ${GGML_GEMMINI_ALLOW_RUNTIME_MATMUL_OVERRIDE}"
@@ -481,7 +495,7 @@ foreach(_GGML_GEMMINI_LOG_BOOL IN ITEMS LOG_DEBUG LOG_CYCLE LOG_DUMP LOG_DUMP_SC
 endforeach()
 
 if (CYCLE_DETAIL AND NOT LOG_CYCLE)
-    message(FATAL_ERROR "CYCLE_DETAIL=1 requires LOG_CYCLE=1 for ExSIA cycle logging")
+    message(FATAL_ERROR "CYCLE_DETAIL=1 requires LOG_CYCLE=1")
 endif()
 if (NOT _GGML_GEMMINI_EXSIA_PROFILE_SCOPE_UPPER STREQUAL "OFF" AND NOT CYCLE_DETAIL)
     message(FATAL_ERROR "GGML_GEMMINI_EXSIA_PROFILE_SCOPE requires CYCLE_DETAIL=1")

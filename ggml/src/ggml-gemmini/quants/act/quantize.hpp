@@ -26,5 +26,6 @@ void init_exsia_meta(ggml_gemmini_args_t &args);
 const act::exsia::Meta &get_exsia_meta(const ggml_gemmini_args_t &args);
 act::exsia::Meta &get_exsia_meta_mut(ggml_gemmini_args_t &args);
 const act::RmdPacketList &activation_rmd_packets(const ggml_gemmini_args_t &args);
+const act::DirectResidualList &activation_direct_residuals(const ggml_gemmini_args_t &args);
 
 } // namespace ggml::gemmini::quants

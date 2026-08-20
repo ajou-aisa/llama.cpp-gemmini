@@ -159,7 +159,17 @@ namespace
         if (!std::isfinite(value) || !std::isfinite(scale) || scale <= 0.0f)
             return 0;
 
-        return static_cast<int32_t>(std::round(value / scale));
+        const double scaled =
+            static_cast<double>(value) / static_cast<double>(scale);
+        if (!std::isfinite(scaled))
+            return scaled < 0.0 ? std::numeric_limits<int32_t>::min()
+                                : std::numeric_limits<int32_t>::max();
+        if (scaled <= static_cast<double>(std::numeric_limits<int32_t>::min()))
+            return std::numeric_limits<int32_t>::min();
+        if (scaled >= static_cast<double>(std::numeric_limits<int32_t>::max()))
+            return std::numeric_limits<int32_t>::max();
+
+        return static_cast<int32_t>(std::lrint(scaled));
     }
 
     int8_t clip_to_i8(int32_t value)
@@ -212,10 +222,11 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
 
     meta->scales.assign(num_stripes, 1.0f);
     meta->rmd_packets.clear();
+    meta->direct_residuals.clear();
 
 #if GGML_GEMMINI_ENABLE_RMD
-    ggml::gemmini::rmd::RmdStripeBuilder rmd_builder;
-    rmd_builder.reset(0, 0, args.I, args.K, args.J);
+    ggml::gemmini::residual::TimedResidualCapture residual_capture(args.residual_route);
+    residual_capture.reset(0, 0, args.I, args.K, args.J);
     BitMask outliers;
     if (!outliers.resize(args.I, args.K))
         return false;
@@ -259,7 +270,7 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
                     return false;
                 const int32_t residual = static_cast<int32_t>(wide_residual);
                 if (outliers.is_marked(row, col) && residual != 0 &&
-                    !rmd_builder.add_residual(row, col, residual))
+                    !residual_capture.add_residual(row, col, residual))
                     return false;
 #endif
 
@@ -268,9 +279,12 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
     }
 
 #if GGML_GEMMINI_ENABLE_RMD
-    if (auto packet = rmd_builder.finish())
-        meta->rmd_packets.push_back(std::move(packet));
-    else if (rmd_builder.status() != ggml::gemmini::rmd::RmdStatus::success)
+    const auto payload = residual_capture.finish();
+    if (payload.packet)
+        meta->rmd_packets.push_back(payload.packet);
+    if (payload.direct)
+        meta->direct_residuals.push_back(payload.direct);
+    if (residual_capture.status() != ggml::gemmini::rmd::RmdStatus::success)
         return false;
 #endif
 

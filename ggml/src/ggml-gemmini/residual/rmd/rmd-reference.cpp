@@ -28,6 +28,14 @@ bool weight_code(const ggml_gemmini_args_t & args,
         out = static_cast<int8_t>(block->qs[k % kBlockSize]);
         return true;
     }
+    if (plan.route == wroute::WeightRouteKind::Q8HP1 && plan.native_weight_blocks) {
+        const block_q8_hp1 * block = args.q8_hp1_block(j, k / kBlockSize);
+        if (block == nullptr) {
+            return false;
+        }
+        out = static_cast<int8_t>(block->qs[k % kBlockSize]);
+        return true;
+    }
     const int8_t * dense = reinterpret_cast<const int8_t *>(args.B);
     if (dense == nullptr) {
         return false;

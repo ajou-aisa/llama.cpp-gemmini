@@ -89,8 +89,10 @@ namespace ggml::gemmini::quants::wroute
     //     weight_scale(j, block) == route_block_scale(j, block) * route_column_scale(j)
     //
     // Q8_H1 satisfies this exactly (c_eff is an integer, s_rf is per column).
+    // Q8_HP1 also satisfies it: 2^m is the integer block factor and the
+    // row-constant channel_scale is the per-column factor.
     // Scalar/channel/row-header routes satisfy it trivially with block scale 1.
-    // Routes whose per-block factor is genuinely floating point (Q8_HP1/HP2/H2 and
+    // Routes whose per-block factor is genuinely floating point (Q8_HP2/H2 and
     // dense per-block scale tables) do not, and are rejected by RMD.
     bool route_supports_integer_block_scale(const WeightRoutePlan &plan);
 
