@@ -227,6 +227,349 @@ bool test_rmd_cpu_ws_routes() {
               "compact execution preserves packet bytes");
 }
 
+bool test_q8_srmd_software_ws_routing() {
+    using residual::DirectExecutionMetrics;
+    using residual::DirectStripeBuilder;
+    using residual::ResidualEvent;
+
+    constexpr size_t rows = 1;
+    constexpr size_t columns = 1;
+    constexpr size_t logical_k = 2 * QK8_0;
+    constexpr size_t blocks_per_row = 2;
+    const std::array<ResidualEvent, 4> events = {{
+        {0, 0, 128}, {0, 1, -32768}, {0, QK8_0, -129}, {0, QK8_0 + 1, 32768},
+    }};
+
+    std::array<block_q8_h1, blocks_per_row> native_weights{};
+    native_weights[0].qs[0] = 2;
+    native_weights[0].qs[1] = 1;
+    native_weights[0].c_b = 1;
+    native_weights[0].R = 2;
+    native_weights[0].s_rf = 1.0f;
+    native_weights[1].qs[0] = -4;
+    native_weights[1].qs[1] = -2;
+    native_weights[1].c_b = 3;
+    native_weights[1].R = 4;
+    native_weights[1].s_rf = 1.0f;
+
+    DirectStripeBuilder direct_builder;
+    direct_builder.reset(17, 0, rows, logical_k, columns);
+    rmd::RmdStripeBuilder packet_builder;
+    packet_builder.reset(17, 0, rows, logical_k, columns);
+    for (const ResidualEvent & event : events) {
+        if (!direct_builder.add_residual(event.local_row, event.original_k, event.residual) ||
+            !packet_builder.add_residual(event.local_row, event.original_k, event.residual)) {
+            return check(false, "Q8 SRMD signed multi-block fixture accepted");
+        }
+    }
+    const auto direct_payload = direct_builder.finish();
+    const auto packet = packet_builder.finish();
+    if (!check(direct_payload != nullptr && packet != nullptr && packet->blocks.size() == 2,
+               "Q8 SRMD direct and compact fixtures built") ||
+        !check(direct_payload->events == std::vector<ResidualEvent>(events.begin(), events.end()),
+               "CPU payload preserves original INT32 residuals without radix conversion")) {
+        return false;
+    }
+
+    auto make_native_args = [&] {
+        ggml_gemmini_args_t args{};
+        args.I = rows;
+        args.J = columns;
+        args.K = logical_k;
+        args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1;
+        args.q8_h1_blocks = native_weights.data();
+        args.q8_h1_block_count = native_weights.size();
+        args.q8_h1_rows = columns;
+        args.blocks_per_row = blocks_per_row;
+        args.block_size_k = QK8_0;
+        args.tiled_matmul_type = WS;
+        args.full_C = true;
+        return args;
+    };
+
+    ggml_gemmini_args_t cpu_args = make_native_args();
+    cpu_args.residual_route = residual::ResidualRoute::cpu_direct;
+    std::vector<rmd::OutputValue> direct_correction;
+    DirectExecutionMetrics direct_metrics{};
+    if (!check(residual::execute_direct_stripe(cpu_args, *direct_payload, direct_correction,
+                                                &direct_metrics) == rmd::RmdStatus::success,
+               "CPU Q8_H1 residual uses direct executor") ||
+        !check(direct_metrics.event_count == events.size() && direct_metrics.call_count == 1,
+               "CPU executes original INT32 residual events directly")) {
+        return false;
+    }
+
+    auto verify_software_ws = [&](const char * route, ggml_gemmini_args_t args) {
+        rmd::CompressedOutput compressed;
+        rmd::RmdExecutionMetrics metrics{};
+        const rmd::RmdStatus status = rmd::execute_rmd_stripe_ws(args, *packet, compressed, &metrics);
+        if (status != rmd::RmdStatus::success) {
+            std::fprintf(stderr,
+                         "FAIL: %s WS must select compact SRMD software executor; status=%s\n",
+                         route, rmd::rmd_status_message(status));
+            return false;
+        }
+        if (!check(metrics.ws_call_count == 0,
+                   "Q8 software WS route must not invoke hardware tiled_matmul") ||
+            !check(metrics.packet_call_count == 1,
+                   "Q8 software WS route executes one compact packet")) {
+            return false;
+        }
+
+        for (size_t block_index = 0; block_index < packet->blocks.size(); ++block_index) {
+            const rmd::BlockDescriptor & block = packet->blocks[block_index];
+            const int64_t block_scale = block_index == 0 ? 3 : 7;
+            for (size_t lane_position = 0; lane_position < block.active_lane_count; ++lane_position) {
+                const uint8_t lane_id = block.lane_ids[lane_position];
+                int64_t raw_lane = 0;
+                for (const ResidualEvent & event : events) {
+                    if (event.original_k / QK8_0 != block.block_id) continue;
+                    rmd::BalancedDigits digits{};
+                    if (!rmd::decompose_balanced_radix256(event.residual, digits)) return false;
+                    const int8_t code = native_weights[block_index].qs[event.original_k % QK8_0];
+                    raw_lane += static_cast<int64_t>(digits.digits[lane_id]) * code;
+                }
+                const size_t output_index = block.output_value_offset +
+                    lane_position * block.lane_stride_values;
+                if (!check(compressed.values[output_index] == raw_lane * block_scale,
+                           "integer K-block scale is applied before radix/cross-block composition")) {
+                    return false;
+                }
+            }
+        }
+
+        std::vector<rmd::OutputValue> composed;
+        return check(rmd::compose_rmd_output(*packet, compressed, composed) ==
+                         rmd::RmdStatus::success,
+                     "Q8 software WS compressed output composes") &&
+            check(composed == direct_correction,
+                  "signed radix lanes and 128 carry boundaries match direct INT32 residuals");
+    };
+
+    if (!verify_software_ws("native Q8_H1", make_native_args())) {
+        return false;
+    }
+
+    std::array<elem_t, logical_k> derived_weights{};
+    derived_weights[0] = native_weights[0].qs[0];
+    derived_weights[1] = native_weights[0].qs[1];
+    derived_weights[QK8_0] = native_weights[1].qs[0];
+    derived_weights[QK8_0 + 1] = native_weights[1].qs[1];
+    const std::array<uint8_t, blocks_per_row> derived_codes = {1, 5};
+    const std::array<float, columns> derived_s_rf = {1.0f};
+    const std::array<uint16_t, columns> derived_r = {2};
+    ggml_gemmini_args_t derived_args{};
+    derived_args.I = rows;
+    derived_args.J = columns;
+    derived_args.K = logical_k;
+    derived_args.B = derived_weights.data();
+    derived_args.sB = logical_k;
+    derived_args.transpose_B = true;
+    derived_args.weight_format =
+        ggml_gemmini_args_t::im2p_weight_format_t::q8_0_unpacked_to_h1;
+    derived_args.c_b = derived_codes.data();
+    derived_args.s_rf = derived_s_rf.data();
+    derived_args.R = derived_r.data();
+    derived_args.blocks_per_row = blocks_per_row;
+    derived_args.blocks_J = columns;
+    derived_args.block_size_k = QK8_0;
+    derived_args.tiled_matmul_type = WS;
+    derived_args.full_C = true;
+    if (!verify_software_ws("Q8_0-derived Q8_H1", derived_args)) {
+        return false;
+    }
+
+    elem_t tensor_weight = 5;
+    ggml_gemmini_args_t tensor_args{};
+    tensor_args.I = tensor_args.J = tensor_args.K = 1;
+    tensor_args.B = &tensor_weight;
+    tensor_args.sB = 1;
+    tensor_args.weight_i8_scale_active = true;
+    tensor_args.weight_scale = 1.0f;
+    tensor_args.tiled_matmul_type = WS;
+    rmd::RmdStripeBuilder tensor_builder;
+    tensor_builder.reset(0, 0, 1, 1, 1);
+    tensor_builder.add_residual(0, 0, 128);
+    const auto tensor_packet = tensor_builder.finish();
+    if (!check(tensor_packet != nullptr, "i8_tensor hardware-route packet built")) {
+        return false;
+    }
+    rmd::CompressedOutput tensor_output;
+    rmd::RmdExecutionMetrics tensor_metrics{};
+    const rmd::RmdStatus tensor_status = rmd::execute_rmd_stripe_ws(
+        tensor_args, *tensor_packet, tensor_output, &tensor_metrics);
+#if defined(__riscv)
+    return check(tensor_status == rmd::RmdStatus::success && tensor_metrics.ws_call_count != 0,
+                 "i8_tensor WS residual route remains hardware tiled_matmul");
+#else
+    return check(tensor_status == rmd::RmdStatus::unsupported_route &&
+                     tensor_metrics.packet_call_count == 0 && tensor_metrics.ws_call_count == 0,
+                 "i8_tensor WS residual route remains hardware-only on host");
+#endif
+}
+
+bool test_q8_hp1_srmd_software_ws_routing() {
+    using residual::DirectStripeBuilder;
+    using residual::ResidualEvent;
+
+    constexpr size_t rows = 1;
+    constexpr size_t columns = 1;
+    constexpr size_t logical_k = 2 * QK8_HP;
+    constexpr size_t blocks_per_row = 2;
+    const std::array<ResidualEvent, 4> events = {{
+        {0, 0, 128}, {0, 1, -32768}, {0, QK8_HP, -129}, {0, QK8_HP + 1, 32768},
+    }};
+
+    std::array<block_q8_hp1, blocks_per_row> weights{};
+    weights[0].qs[0] = 2;
+    weights[0].qs[1] = 1;
+    weights[0].m = 1;
+    weights[0].channel_scale = 0.25f;
+    weights[1].qs[0] = -4;
+    weights[1].qs[1] = -2;
+    weights[1].m = 3;
+    weights[1].channel_scale = 0.25f;
+
+    DirectStripeBuilder direct_builder;
+    direct_builder.reset(23, 0, rows, logical_k, columns);
+    rmd::RmdStripeBuilder packet_builder;
+    packet_builder.reset(23, 0, rows, logical_k, columns);
+    for (const ResidualEvent & event : events) {
+        if (!direct_builder.add_residual(event.local_row, event.original_k, event.residual) ||
+            !packet_builder.add_residual(event.local_row, event.original_k, event.residual)) {
+            return check(false, "Q8_HP1 SRMD signed multi-block fixture accepted");
+        }
+    }
+    const auto direct_payload = direct_builder.finish();
+    const auto packet = packet_builder.finish();
+    if (!check(direct_payload != nullptr && packet != nullptr && packet->blocks.size() == 2,
+               "Q8_HP1 direct and compact fixtures built")) {
+        return false;
+    }
+
+    ggml_gemmini_args_t args{};
+    args.I = rows;
+    args.J = columns;
+    args.K = logical_k;
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1;
+    args.q8_hp1_blocks = weights.data();
+    args.q8_hp1_block_count = weights.size();
+    args.q8_hp1_blocks_per_row = blocks_per_row;
+    args.blocks_per_row = blocks_per_row;
+    args.block_size_k = QK8_HP;
+    args.tiled_matmul_type = WS;
+    args.full_C = true;
+
+    std::vector<rmd::OutputValue> direct_correction;
+    if (!check(residual::execute_direct_stripe(args, *direct_payload, direct_correction) ==
+                   rmd::RmdStatus::success,
+               "CPU Q8_HP1 residual uses original INT32 direct executor")) {
+        return false;
+    }
+
+    rmd::CompressedOutput compressed;
+    rmd::RmdExecutionMetrics metrics{};
+    const rmd::RmdStatus status =
+        rmd::execute_rmd_stripe_ws(args, *packet, compressed, &metrics);
+    if (status != rmd::RmdStatus::success) {
+        std::fprintf(stderr,
+                     "FAIL: Q8_HP1 WS must select compact SRMD software executor; status=%s\n",
+                     rmd::rmd_status_message(status));
+        return false;
+    }
+    if (!check(metrics.ws_call_count == 0,
+               "Q8_HP1 software WS route must not invoke hardware tiled_matmul") ||
+        !check(metrics.packet_call_count == 1,
+               "Q8_HP1 software WS route executes one compact packet")) {
+        return false;
+    }
+
+    for (size_t block_index = 0; block_index < packet->blocks.size(); ++block_index) {
+        const rmd::BlockDescriptor & block = packet->blocks[block_index];
+        const int64_t block_scale = int64_t{1} << weights[block_index].m;
+        for (size_t lane_position = 0; lane_position < block.active_lane_count; ++lane_position) {
+            const uint8_t lane_id = block.lane_ids[lane_position];
+            int64_t raw_lane = 0;
+            for (const ResidualEvent & event : events) {
+                if (event.original_k / QK8_HP != block.block_id) continue;
+                rmd::BalancedDigits digits{};
+                if (!rmd::decompose_balanced_radix256(event.residual, digits)) return false;
+                raw_lane += static_cast<int64_t>(digits.digits[lane_id]) *
+                    weights[block_index].qs[event.original_k % QK8_HP];
+            }
+            const size_t output_index = block.output_value_offset +
+                lane_position * block.lane_stride_values;
+            if (!check(compressed.values[output_index] == raw_lane * block_scale,
+                       "Q8_HP1 exponent scale is applied before radix/block composition")) {
+                return false;
+            }
+        }
+    }
+
+    std::vector<rmd::OutputValue> composed;
+    if (!check(rmd::compose_rmd_output(*packet, compressed, composed) ==
+                   rmd::RmdStatus::success,
+               "Q8_HP1 software WS compressed output composes") ||
+        !check(composed == direct_correction,
+               "Q8_HP1 signed radix and integer exponent match direct correction")) {
+        return false;
+    }
+    std::vector<rmd::OutputValue> reference;
+    std::vector<rmd::ReferenceResidual> reference_residuals;
+    reference_residuals.reserve(events.size());
+    for (const ResidualEvent & event : events) {
+        reference_residuals.push_back(
+            { static_cast<uint32_t>(event.local_row),
+              static_cast<uint32_t>(event.original_k),
+              event.residual });
+    }
+    if (!check(rmd::reference_rmd_correction(
+                   args, rows, reference_residuals, reference) == rmd::RmdStatus::success,
+               "Q8_HP1 independent reference accepts native blocks") ||
+        !check(reference == composed,
+               "Q8_HP1 software WS matches independent reference correction")) {
+        return false;
+    }
+
+    std::vector<float> merged(1, 0.0f);
+    args.f_out = merged.data();
+    auto & meta = args.act_quant.storage().emplace<quants::act::exsia::Meta>();
+    meta.theta = { 1 };
+    if (!check(rmd::merge_rmd_correction(args, *packet, composed) ==
+                   rmd::RmdStatus::success,
+               "Q8_HP1 correction merges with shared scales") ||
+        !check(merged[0] == static_cast<float>(direct_correction[0]) * 0.25f * 2.0f,
+               "Q8_HP1 channel and activation scales apply once at FP32 merge")) {
+        return false;
+    }
+
+    auto invalid_weights = weights;
+    invalid_weights[1].channel_scale = 0.5f;
+    args.q8_hp1_blocks = invalid_weights.data();
+    if (!check(rmd::merge_rmd_correction(args, *packet, composed) ==
+                   rmd::RmdStatus::unsupported_route,
+               "Q8_HP1 rejects inconsistent per-column channel scales")) {
+        return false;
+    }
+    invalid_weights = weights;
+    invalid_weights[1].m = 63;
+    args.q8_hp1_blocks = invalid_weights.data();
+    rmd::CompressedOutput invalid_output;
+    if (!check(rmd::execute_rmd_stripe_ws(args, *packet, invalid_output, nullptr) ==
+                   rmd::RmdStatus::overflow,
+               "Q8_HP1 rejects unrepresentable exponent scale")) {
+        return false;
+    }
+    invalid_weights[1].m = INT16_MIN;
+    args.q8_hp1_blocks = invalid_weights.data();
+    if (!check(rmd::execute_rmd_stripe_ws(args, *packet, invalid_output, nullptr) ==
+                   rmd::RmdStatus::success,
+               "Q8_HP1 zero-block sentinel executes safely")) {
+        return false;
+    }
+    return true;
+}
+
 bool test_rmd_ws_contract_probe() {
 #if !defined(__riscv)
     std::printf("RMD_RAW_WS supported=0 status=unsupported\n");
@@ -1269,7 +1612,8 @@ int main(int argc, char ** argv) {
 
     const bool known = case_name == "all" || case_name == "baseline" ||
         case_name == "dispatch" || case_name == "rmd-routes" ||
-        case_name == "rmd-ws-contract-probe" ||
+        case_name == "q8-srmd-software-ws" || case_name == "rmd-ws-contract-probe" ||
+        case_name == "hp1-srmd-software-ws" ||
         case_name == "rmd-direct-parity" || case_name == "direct-executor" ||
         case_name == "rmd-gather";
     if (!known) {
@@ -1280,11 +1624,15 @@ int main(int argc, char ** argv) {
     std::printf("TEST_CASE_BEGIN name=%s\n", case_name.c_str());
     const bool ok =
         (case_name == "all" && test_exsia_baseline() && test_dispatch_modes() &&
-         test_rmd_cpu_ws_routes() && test_rmd_cpu_direct_parity() &&
+         test_rmd_cpu_ws_routes() && test_q8_srmd_software_ws_routing() &&
+         test_q8_hp1_srmd_software_ws_routing() &&
+         test_rmd_cpu_direct_parity() &&
          test_direct_cpu_executor() && test_rmd_lane_partition() && test_rmd_weight_gather()) ||
         (case_name == "baseline" && test_exsia_baseline()) ||
         (case_name == "dispatch" && test_dispatch_modes()) ||
         (case_name == "rmd-routes" && test_rmd_cpu_ws_routes()) ||
+        (case_name == "q8-srmd-software-ws" && test_q8_srmd_software_ws_routing()) ||
+        (case_name == "hp1-srmd-software-ws" && test_q8_hp1_srmd_software_ws_routing()) ||
         (case_name == "rmd-ws-contract-probe" && test_rmd_ws_contract_probe()) ||
         (case_name == "rmd-direct-parity" && test_rmd_cpu_direct_parity() &&
          test_rmd_lane_partition()) ||

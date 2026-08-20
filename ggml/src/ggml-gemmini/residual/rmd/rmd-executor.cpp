@@ -53,11 +53,12 @@ public:
     WeightGather(const ggml_gemmini_args_t & args, const wroute::WeightRoutePlan & plan)
         : args_(args),
           native_h1_(plan.route == wroute::WeightRouteKind::Q8H1 && plan.native_weight_blocks),
+          native_hp1_(plan.route == wroute::WeightRouteKind::Q8HP1 && plan.native_weight_blocks),
           dense_(reinterpret_cast<const int8_t *>(args.B)),
           stride_(plan.weight_stride),
           column_major_(plan.layout == wroute::WeightLayout::JxK_ColMajor) {}
 
-    bool valid() const { return native_h1_ || dense_ != nullptr; }
+    bool valid() const { return native_h1_ || native_hp1_ || dense_ != nullptr; }
 
     bool fill_tile(uint32_t block_id,
                    const uint16_t * local_k,
@@ -89,6 +90,22 @@ public:
             std::array<const int8_t *, kArrayDim> row_bases{};
             for (size_t col = 0; col < valid_cols; ++col) {
                 const block_q8_h1 * block = args_.q8_h1_block(col_base + col, block_id);
+                if (block == nullptr) {
+                    return false;
+                }
+                row_bases[col] = block->qs;
+            }
+            for (size_t k = 0; k < valid_k; ++k) {
+                for (size_t col = 0; col < valid_cols; ++col) {
+                    tile[k * tile_stride + col] = row_bases[col][local_k[k]];
+                }
+            }
+            counts.address_resolutions = valid_cols;
+        } else if (native_hp1_) {
+            std::array<const int8_t *, kArrayDim> row_bases{};
+            for (size_t col = 0; col < valid_cols; ++col) {
+                const block_q8_hp1 * block =
+                    args_.q8_hp1_block(col_base + col, block_id);
                 if (block == nullptr) {
                     return false;
                 }
@@ -150,6 +167,7 @@ public:
 private:
     const ggml_gemmini_args_t & args_;
     bool native_h1_;
+    bool native_hp1_;
     const int8_t * dense_;
     size_t stride_;
     bool column_major_;
@@ -164,9 +182,7 @@ struct LaneGroup {
 
 enum class CompactExecutorBackend : uint8_t {
     gemmini_ws,
-#if defined(GGML_GEMMINI_TESTING)
-    scalar_reference,
-#endif
+    software_ws,
 };
 
 size_t count_bits(uint32_t value) {
@@ -706,9 +722,11 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                                 }
                             }
                         }
-                    }
-#if defined(GGML_GEMMINI_TESTING)
-                    else {
+                    } else {
+                        // Q8_H1 SRMD remains a compact packet route, but its lane dots run
+                        // in Rocket software. This deliberately avoids tiled_matmul/full_C;
+                        // the per-block integer scale below is still applied before radix
+                        // and cross-block composition.
                         for (size_t row = 0; row < stacked_rows; ++row) {
                             const int8_t * activation_row =
                                 activation + row * group.padded_k_count;
@@ -729,7 +747,6 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                             }
                         }
                     }
-#endif
                 }
 
 #if defined(GGML_GEMMINI_TESTING)
@@ -840,6 +857,16 @@ RmdStatus execute_rmd_stripe_ws(const ggml_gemmini_args_t & args,
     if (validation != RmdStatus::success) {
         return validation;
     }
+
+    const wroute::WeightRoutePlan plan = wroute::resolve_weight_route_plan(
+        args, wroute::WeightScaleInfoMode::Residual);
+    if (plan.valid &&
+        (plan.route == wroute::WeightRouteKind::Q8H1 ||
+         plan.route == wroute::WeightRouteKind::Q8HP1)) {
+        return execute_rmd_stripe_impl<CompactExecutorBackend::software_ws>(
+            args, packet, output, metrics);
+    }
+
 #if !defined(__riscv)
     (void) output;
     (void) metrics;
@@ -859,7 +886,7 @@ RmdStatus execute_rmd_stripe_reference(const ggml_gemmini_args_t & args,
     if (validation != RmdStatus::success) {
         return validation;
     }
-    return execute_rmd_stripe_impl<CompactExecutorBackend::scalar_reference>(
+    return execute_rmd_stripe_impl<CompactExecutorBackend::software_ws>(
         args, packet, output, metrics);
 }
 #endif

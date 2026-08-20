@@ -54,6 +54,12 @@ bool read_weight_code(const ggml_gemmini_args_t & args,
         code = static_cast<int8_t>(block->qs[k % rmd::kBlockSize]);
         return true;
     }
+    if (plan.route == wroute::WeightRouteKind::Q8HP1 && plan.native_weight_blocks) {
+        const block_q8_hp1 * block = args.q8_hp1_block(j, k / rmd::kBlockSize);
+        if (block == nullptr) return false;
+        code = static_cast<int8_t>(block->qs[k % rmd::kBlockSize]);
+        return true;
+    }
     const int8_t * dense = reinterpret_cast<const int8_t *>(args.B);
     if (dense == nullptr) return false;
     const size_t offset = plan.layout == wroute::WeightLayout::JxK_ColMajor

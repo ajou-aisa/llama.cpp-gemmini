@@ -86,9 +86,9 @@ struct RmdExecutionMetrics {
 
 void collect_packet_metrics(const StripePacket & packet, RmdExecutionMetrics & metrics);
 
-// Runs every block of the packet on Gemmini in weight-stationary mode, applies the
-// block integer scale exactly once, and writes the canonical block-scaled INT64
-// output. On hosts without Gemmini, returns unsupported_route without changing output.
+// Executes every block of the compact packet, applies the block integer scale exactly
+// once, and writes canonical block-scaled INT64 output. Q8_H1 routes use Rocket C++
+// lane dots; other supported routes use Gemmini WS and are unavailable on host builds.
 RmdStatus execute_rmd_stripe_ws(const ggml_gemmini_args_t & args,
                                 const StripePacket & packet,
                                 CompressedOutput & output,

@@ -252,6 +252,15 @@ bool q8_h1_scale_matches(const ggml_gemmini_args_t & args,
         reference->s_rf == current->s_rf;
 }
 
+bool q8_hp1_scale_matches(const ggml_gemmini_args_t & args,
+                          size_t j,
+                          size_t block_id) {
+    const block_q8_hp1 * reference = args.q8_hp1_block(j, 0);
+    const block_q8_hp1 * current = args.q8_hp1_block(j, block_id);
+    return reference != nullptr && current != nullptr &&
+        reference->channel_scale == current->channel_scale;
+}
+
 RmdStatus merge_rmd_correction_checked(const ggml_gemmini_args_t & args,
                                        const MergeLayout & layout,
                                        const wroute::WeightRoutePlan & plan,
@@ -342,6 +351,15 @@ RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
             }
         }
     }
+    if (plan.route == wroute::WeightRouteKind::Q8HP1 && plan.native_weight_blocks) {
+        for (size_t j = 0; j < args.J; ++j) {
+            for (size_t block = 0; block < args.q8_hp1_blocks_per_row; ++block) {
+                if (!q8_hp1_scale_matches(args, j, block)) {
+                    return RmdStatus::unsupported_route;
+                }
+            }
+        }
+    }
     return merge_rmd_correction_checked(args, layout, plan, correction);
 }
 
@@ -374,6 +392,15 @@ RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
         for (const BlockDescriptor & block : packet.blocks) {
             for (size_t j = 0; j < args.J; ++j) {
                 if (!q8_h1_scale_matches(args, j, block.block_id)) {
+                    return RmdStatus::unsupported_route;
+                }
+            }
+        }
+    }
+    if (plan.route == wroute::WeightRouteKind::Q8HP1 && plan.native_weight_blocks) {
+        for (const BlockDescriptor & block : packet.blocks) {
+            for (size_t j = 0; j < args.J; ++j) {
+                if (!q8_hp1_scale_matches(args, j, block.block_id)) {
                     return RmdStatus::unsupported_route;
                 }
             }

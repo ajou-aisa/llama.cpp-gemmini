@@ -281,7 +281,7 @@ target_include_directories(test-gemmini-exsia PRIVATE
     ${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini-rocc-tests
     ${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini-rocc-tests/include
     ${TEST_GEMMINI_EXSIA_SW_PATH}/rocc-software/src)
-foreach(_case IN ITEMS all baseline dispatch rmd-routes rmd-direct-parity direct-executor rmd-gather)
+foreach(_case IN ITEMS all baseline dispatch rmd-routes q8-srmd-software-ws hp1-srmd-software-ws rmd-direct-parity direct-executor rmd-gather)
     string(REPLACE "-" "_" _case_test_name "${_case}")
     add_test(NAME gemmini_exsia_${_case_test_name}
         COMMAND ${CMAKE_COMMAND}
