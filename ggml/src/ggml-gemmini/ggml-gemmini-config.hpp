@@ -40,6 +40,10 @@ namespace ggml::gemmini::config
 #define GGML_GEMMINI_ENABLE_RMD 1
 #endif
 
+#ifndef GGML_GEMMINI_ACTIVATION_BITS
+#define GGML_GEMMINI_ACTIVATION_BITS 8
+#endif
+
 // ComputeType ----------------------------------------------------------------
 // 0 = INT              : activation quant + weight unpacking + int matmul
 // 1 = FLOAT            : bypass quant, call matmul_cpu_fp directly
@@ -102,5 +106,11 @@ inline constexpr bool DEQUANT_FP_TEST = GGML_GEMMINI_DEQUANT_FP_TEST != 0;
 
 static_assert(static_cast<uint8_t>(CURRENT_COMPUTE_TYPE) <= 1, "CURRENT_COMPUTE_TYPE must be INT or FLOAT");
 static_assert(static_cast<uint8_t>(CURRENT_ACTIVATION_QUANT) <= 4, "CURRENT_ACTIVATION_QUANT must be EXSIA, TENSOR, TOKEN, or STRIPE");
+static_assert(GGML_GEMMINI_ACTIVATION_BITS == 4 || GGML_GEMMINI_ACTIVATION_BITS == 8 || GGML_GEMMINI_ACTIVATION_BITS == 16,
+              "GGML_GEMMINI_ACTIVATION_BITS must be 4, 8, or 16");
+
+inline constexpr int32_t GGML_GEMMINI_ACTIVATION_QMIN = -(int32_t{1} << (GGML_GEMMINI_ACTIVATION_BITS - 1));
+inline constexpr int32_t GGML_GEMMINI_ACTIVATION_QMAX =  (int32_t{1} << (GGML_GEMMINI_ACTIVATION_BITS - 1)) - 1;
+inline constexpr int16_t GGML_GEMMINI_ACTIVATION_RHO   = static_cast<int16_t>(GGML_GEMMINI_ACTIVATION_BITS - 2);
 
 } // namespace

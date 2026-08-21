@@ -536,6 +536,14 @@ static void quantize_row_q8_hp2_ref_ggml(const float * x, void * y, int64_t k) {
     (void) quantize_row_q8_hp2_ref(x, (block_q8_hp2 *) y, k);
 }
 
+static void quantize_row_q4_hp1_ref_ggml(const float * x, void * y, int64_t k) {
+    (void) quantize_row_q4_hp1_ref(x, (block_q4_hp1 *) y, k);
+}
+
+static void quantize_row_q16_hp1_ref_ggml(const float * x, void * y, int64_t k) {
+    (void) quantize_row_q16_hp1_ref(x, (block_q16_hp1 *) y, k);
+}
+
 static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
     [GGML_TYPE_I8] = {
         .type_name                = "i8",
@@ -857,6 +865,46 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .is_quantized             = true,
         .to_float                 = NULL,
         .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_Q4_H1] = {
+        .type_name                = "q4_h1",
+        .blck_size                = QK4_0,
+        .type_size                = sizeof(block_q4_h1),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q4_h1,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q4_h1_ref,
+    },
+    [GGML_TYPE_Q4_HP1] = {
+        .type_name                = "q4_hp1",
+        .blck_size                = QK4_HP,
+        .type_size                = sizeof(block_q4_hp1),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q4_hp1,
+        .from_float_ref           = quantize_row_q4_hp1_ref_ggml,
+    },
+    [GGML_TYPE_Q16_0] = {
+        .type_name                = "q16_0",
+        .blck_size                = QK16_0,
+        .type_size                = sizeof(block_q16_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q16_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q16_0_ref,
+    },
+    [GGML_TYPE_Q16_H1] = {
+        .type_name                = "q16_h1",
+        .blck_size                = QK16_0,
+        .type_size                = sizeof(block_q16_h1),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q16_h1,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q16_h1_ref,
+    },
+    [GGML_TYPE_Q16_HP1] = {
+        .type_name                = "q16_hp1",
+        .blck_size                = QK16_HP,
+        .type_size                = sizeof(block_q16_hp1),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q16_hp1,
+        .from_float_ref           = quantize_row_q16_hp1_ref_ggml,
     },
 };
 
@@ -6486,6 +6534,8 @@ size_t ggml_quantize_chunk(
 
     switch (type) {
         case GGML_TYPE_Q4_0:    result = quantize_q4_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q4_H1:   result = quantize_q4_h1(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q4_HP1:  result = quantize_q4_hp1(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_1:    result = quantize_q4_1(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_0:    result = quantize_q5_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_1:    result = quantize_q5_1(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
@@ -6495,6 +6545,9 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_Q8_H2:   result = quantize_q8_h2(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q8_HP1:  result = quantize_q8_hp1(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q8_HP2:  result = quantize_q8_hp2(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q16_0:   result = quantize_q16_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q16_H1:  result = quantize_q16_h1(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q16_HP1: result = quantize_q16_hp1(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q2_K:    result = quantize_q2_K(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q3_K:    result = quantize_q3_K(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_K:    result = quantize_q4_K(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

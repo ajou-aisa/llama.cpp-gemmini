@@ -30,8 +30,7 @@ ggml_gemmini_args_t make_args(
     args.I = 3;
     args.J = 2;
     args.K = 2;
-    args.A = activation.data();
-    args.B = weights.data();
+        args.B = weights.data();
     args.sA = args.K;
     args.sB = args.J;
     args.f_out = output.data();

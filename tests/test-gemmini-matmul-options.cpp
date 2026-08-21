@@ -33,7 +33,10 @@ ggml_gemmini_args_t make_args(std::vector<elem_t> & activation,
     args.I = 3;
     args.J = 2;
     args.K = 2;
-    args.A = activation.data();
+    args.A.allocate(args.I, args.K, 8);
+    for (size_t i = 0; i < args.I * args.K; ++i) {
+        args.A.set(i / args.K, i % args.K, activation[i]);
+    }
     args.B = weights.data();
     args.sA = args.K;
     args.sB = args.J;
@@ -248,7 +251,10 @@ bool test_disabled_mode_status_contract() {
         args.K = 1;
         args.sA = 1;
         activation.resize(args.I * args.K, 1);
-        args.A = activation.data();
+        args.A.allocate(args.I, args.K, 8);
+        for (size_t i = 0; i < args.I * args.K; ++i) {
+            args.A.set(i / args.K, i % args.K, activation[i]);
+        }
         auto & meta = args.act_quant.storage().emplace<quants::act::exsia::Meta>();
         meta.theta.assign(args.I, 0);
 

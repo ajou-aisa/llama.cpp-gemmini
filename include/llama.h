@@ -193,6 +193,11 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q8_HP1        = 40,
         LLAMA_FTYPE_MOSTLY_Q8_HP2        = 41,
         LLAMA_FTYPE_MOSTLY_Q8_CHANNEL    = 42,
+        LLAMA_FTYPE_MOSTLY_Q4_H1         = 43,
+        LLAMA_FTYPE_MOSTLY_Q4_HP1        = 44,
+        LLAMA_FTYPE_MOSTLY_Q16_0         = 45,
+        LLAMA_FTYPE_MOSTLY_Q16_H1        = 46,
+        LLAMA_FTYPE_MOSTLY_Q16_HP1       = 47,
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };

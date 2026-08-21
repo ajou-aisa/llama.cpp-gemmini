@@ -420,13 +420,13 @@ bool uses_baseline_channel_route(const ggml_gemmini_args_t & args) {
 
 bool valid_matmul_shape(const ggml_gemmini_args_t & args) {
     return args.I != 0 && args.J != 0 && args.K != 0 && args.f_out != nullptr &&
-        (args.A != nullptr || args.A_fp32 != nullptr) &&
+        (args.A.valid() || args.A_fp32 != nullptr) &&
         ((args.A_fp32 == nullptr) == (args.B_fp32 == nullptr));
 }
 
 bool valid_activation_metadata(const ggml_gemmini_args_t & args) {
     if (std::holds_alternative<quants::act::NoneMeta>(args.act_quant.storage())) {
-        return args.A == nullptr && args.A_fp32 != nullptr && args.B_fp32 != nullptr;
+        return !args.A.valid() && args.A_fp32 != nullptr && args.B_fp32 != nullptr;
     }
     if (args.I > std::numeric_limits<size_t>::max() - args.activation_row_offset) {
         return false;
@@ -507,13 +507,14 @@ MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe, size_
     if (stripe.row_begin > std::numeric_limits<size_t>::max() - args.activation_row_offset) {
         return MatMulStatus::invalid_arguments;
     }
+    auto original_A = args.A;
     args.activation_row_offset += stripe.row_begin;
 
     args.I = stripe.row_end - stripe.row_begin;
     gemmini_set_tile_ws(&args);
     args.tile_I = metadata_tile_I;
-    if (args.A != nullptr) {
-        args.A += input_offset;
+    if (args.A.valid()) {
+        args.A = original_A.slice_rows(stripe.row_begin, args.I);
     }
     if (args.A_fp32 != nullptr) {
         args.A_fp32 += input_offset;

@@ -172,6 +172,34 @@ typedef struct {
     uint8_t qs[QK4_0 / 2]; // nibbles / quants
 } block_q4_0;
 static_assert(sizeof(block_q4_0) == sizeof(ggml_half) + QK4_0 / 2, "wrong q4_0 block size/padding");
+typedef block_q4_0 block_q4_h0;
+
+// Direct-reader Q4_H1 block: (q[i] - 8) * s_rf * (c_b + R).
+typedef struct {
+    uint8_t  qs[QK4_0 / 2];
+    uint8_t  c_b;
+    uint8_t  padding[3];
+    float    s_rf;
+    uint16_t R;
+    uint8_t  tail_padding[2];
+} block_q4_h1;
+static_assert(offsetof(block_q4_h1, qs) == 0, "wrong q4_h1 qs offset");
+static_assert(offsetof(block_q4_h1, c_b) == QK4_0 / 2, "wrong q4_h1 c_b offset");
+static_assert(offsetof(block_q4_h1, s_rf) == 20, "wrong q4_h1 s_rf offset");
+static_assert(offsetof(block_q4_h1, R) == 24, "wrong q4_h1 R offset");
+static_assert(sizeof(block_q4_h1) == 28, "wrong q4_h1 block size/padding");
+
+#define QK4_HP QK4_0
+typedef struct {
+    uint8_t  qs[QK4_HP / 2];
+    int16_t  m;
+    uint8_t  padding[2];
+    float    channel_scale;
+} block_q4_hp1;
+static_assert(offsetof(block_q4_hp1, qs) == 0, "wrong q4_hp1 qs offset");
+static_assert(offsetof(block_q4_hp1, m) == QK4_HP / 2, "wrong q4_hp1 m offset");
+static_assert(offsetof(block_q4_hp1, channel_scale) == 20, "wrong q4_hp1 channel_scale offset");
+static_assert(sizeof(block_q4_hp1) == 24, "wrong q4_hp1 block size/padding");
 
 #define QK4_1 32
 typedef struct {
@@ -264,6 +292,41 @@ static_assert(offsetof(block_q8_hp2, m) == 32, "wrong q8_hp2 m offset");
 static_assert(offsetof(block_q8_hp2, padding) == 34, "wrong q8_hp2 padding offset");
 static_assert(offsetof(block_q8_hp2, channel_scale) == 36, "wrong q8_hp2 channel_scale offset");
 static_assert(sizeof(block_q8_hp2) == 40, "wrong q8_hp2 block size/padding");
+
+#define QK16_0 32
+typedef struct {
+    ggml_half d;
+    int16_t qs[QK16_0];
+} block_q16_0;
+static_assert(sizeof(block_q16_0) == sizeof(ggml_half) + QK16_0 * sizeof(int16_t), "wrong q16_0 block size/padding");
+typedef block_q16_0 block_q16_h0;
+
+// Direct-reader Q16_H1 block: q[i] * s_rf * (c_b + R).
+typedef struct {
+    int16_t  qs[QK16_0];
+    uint8_t  c_b;
+    uint8_t  padding[3];
+    float    s_rf;
+    uint16_t R;
+    uint8_t  tail_padding[2];
+} block_q16_h1;
+static_assert(offsetof(block_q16_h1, qs) == 0, "wrong q16_h1 qs offset");
+static_assert(offsetof(block_q16_h1, c_b) == QK16_0 * sizeof(int16_t), "wrong q16_h1 c_b offset");
+static_assert(offsetof(block_q16_h1, s_rf) == 68, "wrong q16_h1 s_rf offset");
+static_assert(offsetof(block_q16_h1, R) == 72, "wrong q16_h1 R offset");
+static_assert(sizeof(block_q16_h1) == 76, "wrong q16_h1 block size/padding");
+
+#define QK16_HP QK16_0
+typedef struct {
+    int16_t qs[QK16_HP];
+    int16_t m;
+    uint8_t padding[2];
+    float   channel_scale;
+} block_q16_hp1;
+static_assert(offsetof(block_q16_hp1, qs) == 0, "wrong q16_hp1 qs offset");
+static_assert(offsetof(block_q16_hp1, m) == QK16_HP * sizeof(int16_t), "wrong q16_hp1 m offset");
+static_assert(offsetof(block_q16_hp1, channel_scale) == 68, "wrong q16_hp1 channel_scale offset");
+static_assert(sizeof(block_q16_hp1) == 72, "wrong q16_hp1 block size/padding");
 
 #define QK8_1 32
 typedef struct {

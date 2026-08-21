@@ -18,7 +18,8 @@ static ggml_gemmini_args_t cpu_1x1_args(elem_t &a, elem_t &b, float &out) {
     args.I = 1;
     args.J = 1;
     args.K = 1;
-    args.A = &a;
+    args.A.allocate(1, 1, 8);
+    args.A.set(0, 0, a);
     args.B = &b;
     args.f_out = &out;
     args.sA = 1;

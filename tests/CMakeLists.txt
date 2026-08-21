@@ -178,6 +178,8 @@ if (LOG_DEBUG)
         COMMAND $<TARGET_FILE:test-gemmini-log> --explicit-debug-before-default)
 endif()
 llama_build_and_test(test-gemmini-q8-h1-h2-dequant-fp.cpp NAME gemmini_q8_h1_h2_dequant_fp)
+llama_build_and_test(test-gemmini-weight-formats.cpp NAME gemmini_weight_formats)
+target_link_libraries(gemmini_weight_formats PRIVATE ggml-base)
 target_sources(gemmini_q8_h1_h2_dequant_fp PRIVATE
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp

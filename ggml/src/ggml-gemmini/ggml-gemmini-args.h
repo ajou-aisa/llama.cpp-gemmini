@@ -14,6 +14,98 @@
 
 namespace act = ggml::gemmini::quants::act;
 
+namespace ggml::gemmini::quants::act {
+
+struct QuantizedActivationBuffer {
+    std::shared_ptr<std::vector<uint8_t>> bytes;
+    uint8_t bits = 8;
+    size_t rows = 0;
+    size_t cols = 0;
+    size_t row_stride_bytes = 0;
+    size_t row_offset = 0;
+
+    bool allocate(size_t r, size_t c, uint8_t b) {
+        if (r == 0 || c == 0 || (b != 4 && b != 8 && b != 16)) return false;
+        bits = b;
+        rows = r;
+        cols = c;
+        row_offset = 0;
+        row_stride_bytes = (bits == 4 || bits == 8) ? c : c * 2;
+        bytes = std::make_shared<std::vector<uint8_t>>(rows * row_stride_bytes, 0);
+        return true;
+    }
+
+    bool valid() const {
+        return bytes != nullptr && !bytes->empty() && bits != 0 && rows != 0 && cols != 0;
+    }
+
+    int32_t get(size_t row, size_t col) const {
+        if (!valid() || row >= rows || col >= cols) return 0;
+        const size_t actual_row = row_offset + row;
+        const size_t byte_offset = actual_row * row_stride_bytes;
+        if (bits == 4 || bits == 8) {
+            const int8_t v = static_cast<int8_t>((*bytes)[byte_offset + col]);
+            return static_cast<int32_t>(v);
+        } else { // 16-bit
+            const size_t idx = byte_offset + col * 2;
+            int16_t v = 0;
+            std::memcpy(&v, &(*bytes)[idx], sizeof(v));
+            return static_cast<int32_t>(v);
+        }
+    }
+
+    bool set(size_t row, size_t col, int32_t value) {
+        if (!valid() || row >= rows || col >= cols) return false;
+        int32_t qmin = -(int32_t{1} << (bits - 1));
+        int32_t qmax = (int32_t{1} << (bits - 1)) - 1;
+        if (value < qmin || value > qmax) return false;
+        const size_t actual_row = row_offset + row;
+        const size_t byte_offset = actual_row * row_stride_bytes;
+        if (bits == 4 || bits == 8) {
+            (*bytes)[byte_offset + col] = static_cast<uint8_t>(value);
+        } else { // 16-bit
+            const size_t idx = byte_offset + col * 2;
+            int16_t v = static_cast<int16_t>(value);
+            std::memcpy(&(*bytes)[idx], &v, sizeof(v));
+        }
+        return true;
+    }
+
+    QuantizedActivationBuffer slice_rows(size_t begin, size_t count) const {
+        QuantizedActivationBuffer s;
+        s.bytes = bytes;
+        s.bits = bits;
+        s.rows = count;
+        s.cols = cols;
+        s.row_stride_bytes = row_stride_bytes;
+        s.row_offset = row_offset + begin;
+        return s;
+    }
+
+    void zero_fill() {
+        if (bytes) std::fill(bytes->begin(), bytes->end(), 0);
+    }
+
+    const uint8_t *raw_data() const {
+        return bytes ? bytes->data() : nullptr;
+    }
+
+    size_t raw_size() const {
+        return bytes ? bytes->size() : 0;
+    }
+
+    // Backward-compatible conversion for 8bit hardware path.
+    // Only valid when bits == 8; returns nullptr otherwise.
+    operator elem_t*() {
+        return (bytes && bits == 8) ? reinterpret_cast<elem_t*>(bytes->data()) : nullptr;
+    }
+    operator const elem_t*() const {
+        return (bytes && bits == 8) ? reinterpret_cast<const elem_t*>(bytes->data()) : nullptr;
+    }
+};
+
+} // namespace ggml::gemmini::quants::act
+
 namespace ggml::gemmini::types {
 enum class LayerType : uint8_t;
 }
@@ -77,7 +169,7 @@ typedef struct ggml_gemmini_args_t {
     size_t K = 0;
 
     //elements
-    elem_t *A = nullptr;
+    act::QuantizedActivationBuffer A;
     elem_t *B = nullptr;
     const float *A_fp32 = nullptr;
     const float *B_fp32 = nullptr;

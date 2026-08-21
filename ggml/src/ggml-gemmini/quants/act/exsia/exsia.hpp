@@ -957,7 +957,7 @@ namespace ggml::gemmini::quants::act::exsia
     class ResidualClipper
     {
     public:
-        std::pair<int8_t, int32_t> clip_with_residual(int32_t q);
+        std::pair<int32_t, int32_t> clip_with_residual(int32_t q);
     };
 
     class LocalStage
@@ -1043,7 +1043,6 @@ namespace ggml::gemmini::quants::act::exsia
             StripeState &stripe,
             ggml_gemmini_args_t &args,
             size_t stripe_idx,
-            int8_t *dst,
             const std::vector<int32_t> &stripe_q_wide,
             const std::vector<int16_t> &stripe_block_exp,
             std::vector<int32_t> &residual,                  // dense global output, I * K_padded

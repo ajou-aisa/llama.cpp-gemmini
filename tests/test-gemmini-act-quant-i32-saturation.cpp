@@ -62,8 +62,8 @@ bool check_quantizer(const char *name, Quantize quantize)
         args.I = 1;
         args.J = 1;
         args.K = source.size();
-        args.A = quantized.data();
-        args.sA = source.size();
+        args.A.allocate(args.I, args.K, 8);
+        args.sA = args.K;
         args.act_quant.storage().template emplace<Meta>();
         return quantize(&tensor, args);
     };
@@ -113,10 +113,10 @@ bool check_quantizer_zeroes_nonfinite(const char *name, Quantize quantize)
         args.I = 1;
         args.J = 1;
         args.K = source.size();
-        args.A = quantized.data();
-        args.sA = source.size();
+        args.A.allocate(args.I, args.K, 8);
+        args.sA = args.K;
         args.act_quant.storage().template emplace<Meta>();
-        if (!quantize(&tensor, args) || quantized[8] != 0) {
+        if (!quantize(&tensor, args) || args.A.get(0, 8) != 0) {
             std::fprintf(stderr, "FAIL: %s did not convert NaN/Inf to zero\n", name);
             return false;
         }
@@ -142,8 +142,8 @@ static bool check_public_quantizer_zeroes_nonfinite()
         args.I = 1;
         args.J = 1;
         args.K = source.size();
-        args.A = quantized.data();
-        args.sA = source.size();
+        args.A.allocate(args.I, args.K, 8);
+        args.sA = args.K;
 
         if (!ggml::gemmini::quants::quantize_activation(&tensor, args)) {
             std::fputs("FAIL: public activation quantizer rejected NaN/Inf instead of zeroing it\n", stderr);
@@ -153,7 +153,7 @@ static bool check_public_quantizer_zeroes_nonfinite()
             std::fputs("FAIL: accepted NaN/Inf did not commit activation metadata\n", stderr);
             return false;
         }
-        if (quantized[8] != 0) {
+        if (args.A.get(0, 8) != 0) {
             std::fputs("FAIL: NaN/Inf was not converted to zero\n", stderr);
             return false;
         }
@@ -173,8 +173,8 @@ static bool check_public_quantizer_rejects_too_wide_without_commit()
     args.I = 1;
     args.J = 1;
     args.K = source.size();
-    args.A = quantized.data();
-    args.sA = source.size();
+        args.A.allocate(args.I, args.K, 8);
+        args.sA = args.K;
 
     if (ggml::gemmini::quants::quantize_activation(&tensor, args)) {
         std::fputs("FAIL: public activation quantizer accepted a residual beyond four lanes\n", stderr);
@@ -184,8 +184,8 @@ static bool check_public_quantizer_rejects_too_wide_without_commit()
         std::fputs("FAIL: failed quantization committed activation metadata\n", stderr);
         return false;
     }
-    for (elem_t value : quantized) {
-        if (value != 0) {
+    for (size_t i = 0; i < args.I * args.K; ++i) {
+        if (args.A.get(i / args.K, i % args.K) != 0) {
             std::fputs("FAIL: failed quantization left partial activation output\n", stderr);
             return false;
         }

@@ -298,8 +298,10 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
                      ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
                 new_type = GGML_TYPE_Q5_K;
             }
-            else if (new_type != GGML_TYPE_Q8_0 && new_type != GGML_TYPE_Q8_H1 && new_type != GGML_TYPE_Q8_H2 &&
-                     new_type != GGML_TYPE_Q8_HP1 && new_type != GGML_TYPE_Q8_HP2 && new_type != GGML_TYPE_Q8_CHANNEL) {
+            else if (new_type != GGML_TYPE_Q4_H1 && new_type != GGML_TYPE_Q4_HP1 &&
+                     new_type != GGML_TYPE_Q8_0 && new_type != GGML_TYPE_Q8_H1 && new_type != GGML_TYPE_Q8_H2 &&
+                     new_type != GGML_TYPE_Q8_HP1 && new_type != GGML_TYPE_Q8_HP2 && new_type != GGML_TYPE_Q8_CHANNEL &&
+                     new_type != GGML_TYPE_Q16_0 && new_type != GGML_TYPE_Q16_H1 && new_type != GGML_TYPE_Q16_HP1) {
                 new_type = GGML_TYPE_Q6_K;
             }
         }
@@ -546,13 +548,16 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
 }
 
 static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t nrows, int64_t n_per_row, const float * imatrix, std::vector<std::thread> & workers, const int nthread) {
-    const bool is_q8_hp = new_type == GGML_TYPE_Q8_HP1 || new_type == GGML_TYPE_Q8_HP2;
+    const bool is_hp = new_type == GGML_TYPE_Q4_HP1 ||
+                       new_type == GGML_TYPE_Q8_HP1 ||
+                       new_type == GGML_TYPE_Q8_HP2 ||
+                       new_type == GGML_TYPE_Q16_HP1;
     const size_t expected_size = (size_t) nrows * ggml_row_size(new_type, n_per_row);
 
     if (nthread < 2) {
         // single-thread
         size_t new_size = ggml_quantize_chunk(new_type, f32_data, new_data, 0, nrows, n_per_row, imatrix);
-        if (is_q8_hp && new_size != expected_size) {
+        if (is_hp && new_size != expected_size) {
             throw std::runtime_error(format("%s quantization failed", ggml_type_name(new_type)));
         }
         if (!llama_validate_quantized_rows(new_type, new_data, new_size, nrows, n_per_row)) {
@@ -602,7 +607,7 @@ static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * 
     if (!valid) {
         throw std::runtime_error("quantized data validation failed");
     }
-    if (is_q8_hp && new_size != expected_size) {
+    if (is_hp && new_size != expected_size) {
         throw std::runtime_error(format("%s quantization failed", ggml_type_name(new_type)));
     }
     return new_size;
@@ -618,6 +623,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     switch (params->ftype) {
         case LLAMA_FTYPE_MOSTLY_Q4_0: default_type = GGML_TYPE_Q4_0; break;
+        case LLAMA_FTYPE_MOSTLY_Q4_H1: default_type = GGML_TYPE_Q4_H1; break;
+        case LLAMA_FTYPE_MOSTLY_Q4_HP1: default_type = GGML_TYPE_Q4_HP1; break;
         case LLAMA_FTYPE_MOSTLY_Q4_1: default_type = GGML_TYPE_Q4_1; break;
         case LLAMA_FTYPE_MOSTLY_Q5_0: default_type = GGML_TYPE_Q5_0; break;
         case LLAMA_FTYPE_MOSTLY_Q5_1: default_type = GGML_TYPE_Q5_1; break;
@@ -627,6 +634,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         case LLAMA_FTYPE_MOSTLY_Q8_HP1: default_type = GGML_TYPE_Q8_HP1; break;
         case LLAMA_FTYPE_MOSTLY_Q8_HP2: default_type = GGML_TYPE_Q8_HP2; break;
         case LLAMA_FTYPE_MOSTLY_Q8_CHANNEL: default_type = llama_quantize_default_type_for_ftype(ftype); break;
+        case LLAMA_FTYPE_MOSTLY_Q16_0: default_type = GGML_TYPE_Q16_0; break;
+        case LLAMA_FTYPE_MOSTLY_Q16_H1: default_type = GGML_TYPE_Q16_H1; break;
+        case LLAMA_FTYPE_MOSTLY_Q16_HP1: default_type = GGML_TYPE_Q16_HP1; break;
         case LLAMA_FTYPE_MOSTLY_F16:  default_type = GGML_TYPE_F16;  break;
         case LLAMA_FTYPE_MOSTLY_BF16: default_type = GGML_TYPE_BF16; break;
         case LLAMA_FTYPE_ALL_F32:     default_type = GGML_TYPE_F32;  break;
@@ -1084,7 +1094,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             }
 
             const int64_t n_per_row = tensor->ne[0];
-            if (new_type == GGML_TYPE_Q8_HP1 || new_type == GGML_TYPE_Q8_HP2) {
+            if (new_type == GGML_TYPE_Q4_HP1 ||
+                new_type == GGML_TYPE_Q8_HP1 ||
+                new_type == GGML_TYPE_Q8_HP2 ||
+                new_type == GGML_TYPE_Q16_HP1) {
                 const int64_t block_size = ggml_blck_size(new_type);
                 if (n_per_row % block_size != 0) {
                     throw std::runtime_error(format("%s requires tensor %s width %" PRId64 " to be divisible by %" PRId64,
@@ -1101,14 +1114,17 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                         }
                         row_amax = std::max(row_amax, std::fabs(value));
                     }
-                    if (new_type == GGML_TYPE_Q8_HP1) {
+                    if (new_type != GGML_TYPE_Q8_HP2) {
+                        const int rho = new_type == GGML_TYPE_Q4_HP1 ? 2 :
+                                        new_type == GGML_TYPE_Q8_HP1 ? 6 : 14;
                         for (int64_t block = 0; block < n_per_row; block += block_size) {
                             float block_amax = 0.0f;
                             for (int64_t column = 0; column < block_size; ++column) {
                                 block_amax = std::max(block_amax, std::fabs(f32_data[row*n_per_row + block + column]));
                             }
-                            if (block_amax > 0.0f && std::ldexp(1.0f, std::ilogb(block_amax) - 6) == 0.0f) {
-                                throw std::runtime_error(format("Q8_HP1 source tensor %s has an underflowing block scale", tensor->name));
+                            if (block_amax > 0.0f && std::ldexp(1.0f, std::ilogb(block_amax) - rho) == 0.0f) {
+                                throw std::runtime_error(format("%s source tensor %s has an underflowing block scale",
+                                            ggml_type_name(new_type), tensor->name));
                             }
                         }
                     } else if (row_amax > 0.0f && std::ldexp(1.0f, std::ilogb(row_amax) - 14) == 0.0f) {

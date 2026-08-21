@@ -49,7 +49,8 @@ bool test_exsia_baseline() {
     args.I = 1;
     args.J = 1;
     args.K = 1;
-    args.A = &activation;
+    args.A.allocate(1, 1, 8);
+    args.A.set(0, 0, activation);
     args.B = &weight;
     args.f_out = &output;
     args.sA = 1;
@@ -73,7 +74,8 @@ bool test_dispatch_modes() {
     float output = 0.0f;
     ggml_gemmini_args_t args{};
     args.I = args.J = args.K = 1;
-    args.A = &activation;
+    args.A.allocate(1, 1, 8);
+    args.A.set(0, 0, activation);
     args.B = &weight;
     args.f_out = &output;
     args.sA = args.sB = args.stride_f_out = args.col_stride_f_out = 1;
@@ -627,7 +629,10 @@ bool test_rmd_ws_contract_probe() {
     alignas(64) float dense_out[2] = {-99.0f, -99.0f};
     ggml_gemmini_args_t dense_args{};
     dense_args.I = 1; dense_args.J = 2; dense_args.K = 2;
-    dense_args.A = dense_a; dense_args.B = dense_b; dense_args.f_out = dense_out;
+    dense_args.A.allocate(1, 2, 8);
+    dense_args.A.set(0, 0, dense_a[0]);
+    dense_args.A.set(0, 1, dense_a[1]);
+    dense_args.B = dense_b; dense_args.f_out = dense_out;
     dense_args.sA = 2; dense_args.sB = 2; dense_args.stride_f_out = 2;
     dense_args.col_stride_f_out = 1; dense_args.weight_i8_scale_active = true;
     dense_args.weight_scale = 1.0f; dense_args.transpose_B = true;
@@ -1549,8 +1554,8 @@ bool profile_output_routing(const std::filesystem::path & expected, bool invalid
     args.I = 1;
     args.J = 1;
     args.K = source.size();
-    args.A = quantized.data();
-    args.sA = source.size();
+        args.A.allocate(args.I, args.K, 8);
+        args.sA = args.K;
 
     const bool wrote = quants::quantize_activation(&tensor, args);
     if (invalid_parent) {

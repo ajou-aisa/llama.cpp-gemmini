@@ -393,7 +393,12 @@ extern "C" {
         GGML_TYPE_Q8_HP1  = 41,
         GGML_TYPE_Q8_HP2  = 42,
         GGML_TYPE_Q8_CHANNEL = 43,
-        GGML_TYPE_COUNT      = 44,
+        GGML_TYPE_Q4_H1      = 44,
+        GGML_TYPE_Q4_HP1     = 45,
+        GGML_TYPE_Q16_0      = 46,
+        GGML_TYPE_Q16_H1     = 47,
+        GGML_TYPE_Q16_HP1    = 48,
+        GGML_TYPE_COUNT      = 49,
     };
 
     // precision

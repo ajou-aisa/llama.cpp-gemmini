@@ -54,6 +54,13 @@
 
 namespace
 {
+    bool gemmini_is_extended_dequant_weight_type(ggml_type type) {
+        return type == GGML_TYPE_Q4_H1 ||
+               type == GGML_TYPE_Q4_HP1 ||
+               type == GGML_TYPE_Q16_0 ||
+               type == GGML_TYPE_Q16_H1 ||
+               type == GGML_TYPE_Q16_HP1;
+    }
 
     void gemmini_matmul_fp_facade(size_t I, size_t J, size_t K,
                                   const float * activation, const float * weights,
@@ -896,6 +903,12 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             gemmini_matmul_fp_facade(I, J, K, (const float *)src1->data, src0_f32.data(),
                                      (float *)dst->data);
             return;
+        } else if (gemmini_is_extended_dequant_weight_type(src0->type)) {
+            std::vector<float> src0_f32(jk_count);
+            ggml_get_type_traits(src0->type)->to_float(src0->data, src0_f32.data(), jk_count);
+            gemmini_matmul_fp_facade(I, J, K, (const float *)src1->data, src0_f32.data(),
+                                     (float *)dst->data);
+            return;
         } else if (src0->type == GGML_TYPE_Q8_CHANNEL) {
             std::vector<float> src0_f32(jk_count);
             const size_t row_size = ggml_row_size(GGML_TYPE_Q8_CHANNEL, src0->ne[0]);
@@ -1018,11 +1031,13 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     // quantize activation
     start = ggml::gemmini::cycle::read();
 
-    [[maybe_unused]] std::vector<int8_t> activation_q;
-    activation_q.resize(ik_count);
-    int8_t *qx = activation_q.data();
-
-    args.A = reinterpret_cast<elem_t *>(qx);
+    if (!args.A.allocate(args.I, args.K, GGML_GEMMINI_ACTIVATION_BITS)) {
+        ggml::gemmini::log::debug(
+            ggml::gemmini::types::to_string(args.layer_type),
+            "failed to allocate activation buffer (I=%zu, K=%zu, bits=%d)",
+            args.I, args.K, GGML_GEMMINI_ACTIVATION_BITS);
+        GGML_ABORT("Gemmini failed to allocate activation buffer");
+    }
     if (pipeline_enabled) {
         pipeline_collector = std::make_unique<ggml::gemmini::MatmulStripeCollector>(pipeline_job_capacity);
         args.exsia_stripe_ready_sink = pipeline_collector->sink();
@@ -1084,6 +1099,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         } else if (src0->type == GGML_TYPE_Q8_0) {
             src0_f32.resize(jk_count);
             dequantize_row_q8_0(reinterpret_cast<const block_q8_0 *>(src0->data), src0_f32.data(), jk_count);
+            src0_f = src0_f32.data();
+        } else if (gemmini_is_extended_dequant_weight_type(src0->type)) {
+            src0_f32.resize(jk_count);
+            ggml_get_type_traits(src0->type)->to_float(src0->data, src0_f32.data(), jk_count);
             src0_f = src0_f32.data();
         } else if (src0->type == GGML_TYPE_Q8_CHANNEL) {
             src0_f32.resize(jk_count);
@@ -1993,6 +2012,17 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
                     return false;
                 }
 
+                if (gemmini_is_extended_dequant_weight_type(a->type)) {
+                    if constexpr (
+                        ggml::gemmini::config::CURRENT_COMPUTE_TYPE ==
+                            ggml::gemmini::config::ComputeType::FLOAT ||
+                        ggml::gemmini::config::DEQUANT_FP_TEST
+                    ) {
+                        return a->ne[0] % ggml_blck_size(a->type) == 0;
+                    }
+                    return false;
+                }
+
                 if (a->type == GGML_TYPE_Q8_H1 || a->type == GGML_TYPE_Q8_H2) {
                     return a->ne[0] % QK8_0 == 0;
                 }
@@ -2157,6 +2187,14 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
                     ggml::gemmini::config::ComputeType::FLOAT ||
                 ggml::gemmini::config::DEQUANT_FP_TEST
             ) {
+                if (gemmini_is_extended_dequant_weight_type(a->type)) {
+                    return a->data != nullptr && a->ne[0] > 0 &&
+                           a->ne[0] % ggml_blck_size(a->type) == 0 &&
+                           ggml_is_contiguous(a) &&
+                           ggml_nbytes(a) == ggml_row_size(a->type, a->ne[0]) *
+                                                static_cast<size_t>(ggml_nrows(a));
+                }
+
                 if (a->type == GGML_TYPE_Q8_H1) {
                     return a->data != nullptr && a->ne[0] > 0 && a->ne[0] % QK8_0 == 0 &&
                            ggml_is_contiguous(a) &&

@@ -172,10 +172,12 @@ namespace
         return static_cast<int32_t>(std::lrint(scaled));
     }
 
-    int8_t clip_to_i8(int32_t value)
+    int32_t clip_quantized(int32_t value)
     {
-        const int32_t clipped = value > 127 ? 127 : (value < -128 ? -128 : value);
-        return static_cast<int8_t>(clipped);
+        const int32_t qmax = ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_QMAX;
+        const int32_t qmin = ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_QMIN;
+        const int32_t clipped = value > qmax ? qmax : (value < qmin ? qmin : value);
+        return clipped;
     }
 
     bool set_scale(size_t stripe, const StripeStats &stats, Meta &meta)
@@ -187,7 +189,7 @@ namespace
             return true;
         }
 
-        const float scale = static_cast<float>(stats.max_abs / 127.0);
+        const float scale = static_cast<float>(stats.max_abs / static_cast<float>(ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_QMAX));
         meta.scales[stripe] = std::isfinite(scale) && scale > 0.0f ? scale : 1.0f;
         return std::isfinite(meta.scales[stripe]) && meta.scales[stripe] > 0.0f;
     }
@@ -200,8 +202,7 @@ void set_config(Meta &meta)
 
 bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
 {
-    int8_t *dst = reinterpret_cast<int8_t *>(args.A);
-    if (!src || src->type != GGML_TYPE_F32 || !dst || args.I == 0 || args.K == 0)
+    if (!src || src->type != GGML_TYPE_F32 || !args.A.valid() || args.I == 0 || args.K == 0)
         return false;
 
     auto *meta = std::get_if<Meta>(&args.act_quant.storage());
@@ -260,11 +261,12 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
             {
                 const size_t idx = row * args.K + col;
                 const int32_t q32 = quantize_to_i32(src_data[idx], scale);
-                const int8_t q8 = clip_to_i8(q32);
-                dst[idx] = q8;
+                const int32_t q = clip_quantized(q32);
+                if (!args.A.set(row, col, q))
+                    return false;
 
 #if GGML_GEMMINI_ENABLE_RMD
-                const int64_t wide_residual = static_cast<int64_t>(q32) - static_cast<int64_t>(q8);
+                const int64_t wide_residual = static_cast<int64_t>(q32) - static_cast<int64_t>(q);
                 if (wide_residual < std::numeric_limits<int32_t>::min() ||
                     wide_residual > std::numeric_limits<int32_t>::max())
                     return false;
@@ -299,8 +301,7 @@ bool dequantize_activation(
     size_t cols,
     const ggml_gemmini_args_t &args)
 {
-    const int8_t *src = reinterpret_cast<const int8_t *>(args.A);
-    if (!src || !dst || args.I == 0 || args.K == 0 || dst_row_stride == 0 || dst_col_stride == 0 || rows == 0 || cols == 0)
+    if (!args.A.valid() || !dst || args.I == 0 || args.K == 0 || dst_row_stride == 0 || dst_col_stride == 0 || rows == 0 || cols == 0)
         return false;
 
     const auto *meta_ptr = std::get_if<Meta>(&args.act_quant.storage());
@@ -362,7 +363,7 @@ bool dequantize_activation(
             const size_t src_idx = src_row_offset + col;
             const size_t dst_idx = dst_row_offset + dst_col_offset;
 
-            int32_t q = static_cast<int32_t>(src[src_idx]);
+            int32_t q = args.A.get(row, col);
 #if GGML_GEMMINI_ENABLE_RMD
             q += residuals[row * col_count + col];
 #endif
