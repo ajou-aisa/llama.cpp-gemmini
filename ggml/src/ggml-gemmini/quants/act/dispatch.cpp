@@ -29,16 +29,7 @@ bool checked_mul_size(size_t lhs, size_t rhs, size_t &out)
 void reset_quantize_failure(ggml_gemmini_args_t &args)
 {
     args.act_quant.reset();
-
-    int8_t *dst = reinterpret_cast<int8_t *>(args.A);
-    size_t elem_count = 0;
-    if (dst == nullptr || !checked_mul_size(args.I, args.K, elem_count))
-        return;
-
-    if (elem_count == 0)
-        elem_count = args.sA != 0 ? args.sA : args.K;
-
-    std::fill_n(dst, elem_count, int8_t{0});
+    args.A.zero_fill();
 }
 
 }

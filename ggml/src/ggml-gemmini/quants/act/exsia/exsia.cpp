@@ -759,11 +759,13 @@ namespace ggml::gemmini::quants::act::exsia
         return detect(q, prepare(S, SS, N));
     }
 
-    std::pair<int8_t, int32_t> ResidualClipper::clip_with_residual(int32_t q)
+    std::pair<int32_t, int32_t> ResidualClipper::clip_with_residual(int32_t q)
     {
-        int32_t q8 = q > 127 ? 127 : (q < -128 ? -128 : q);
-        int32_t res = q - q8;
-        return {static_cast<int8_t>(q8), res};
+        const int32_t qmax = config::GGML_GEMMINI_ACTIVATION_QMAX;
+        const int32_t qmin = config::GGML_GEMMINI_ACTIVATION_QMIN;
+        int32_t clipped = q > qmax ? qmax : (q < qmin ? qmin : q);
+        int32_t res = q - clipped;
+        return {clipped, res};
     }
 
 
@@ -1309,7 +1311,6 @@ namespace ggml::gemmini::quants::act::exsia
                             StripeState &stripe,
                             ggml_gemmini_args_t &args,
                             size_t stripe_idx,
-                            int8_t *dst,
                             const std::vector<int32_t> &stripe_q_wide,
                             const std::vector<int16_t> &stripe_block_exp,
                             std::vector<int32_t> &residual,
@@ -1338,7 +1339,7 @@ namespace ggml::gemmini::quants::act::exsia
         GGML_ASSERT(stripe_idx < meta.theta.size());
         meta.theta[stripe_idx] = theta_s;
 
-        GGML_ASSERT(dst != nullptr);
+        GGML_ASSERT(args.A.valid());
         GGML_ASSERT(state.B_size > 0);
         GGML_ASSERT(state.K_padded >= args.K);
         GGML_ASSERT(state.blocks_per_row == state.K_padded / state.B_size);
@@ -1389,7 +1390,8 @@ namespace ggml::gemmini::quants::act::exsia
                     const auto [q8, res] = unit_clip_.clip_with_residual(q_shifted);
 
                     if (col < args.K)
-                        dst[r * args.K + col] = q8;
+                        if (!args.A.set(r, col, q8))
+                            return false;
 
                     const bool outlier = col < args.K && stripe.outlier_mask.is_set(local_row, col);
                     const int32_t residual_i32 = outlier ? res : 0;
@@ -1478,8 +1480,7 @@ namespace ggml::gemmini::quants::act::exsia
                                      : "LocalFoldingPipeline";
         )
         const int16_t invalid_theta = std::numeric_limits<int16_t>::min();
-        // Global outputs are dst (dense int8), state_.residual, meta.theta, meta.rmd_packets.
-        int8_t *dst = reinterpret_cast<int8_t *>(args.A);
+        // Global outputs are args.A (dense quantized), state_.residual, meta.theta, meta.rmd_packets.
         size_t logical_elem_count = 0;
         const bool logical_elem_count_ok = checked_mul_size(args.I, args.K, logical_elem_count);
         reset_failure_state();
@@ -1489,13 +1490,14 @@ namespace ggml::gemmini::quants::act::exsia
             const ExSIAState::FailureCode failure_code = first_failure_code_.load(
                 std::memory_order_acquire);
             const size_t failure_stripe = first_failure_stripe_.load(std::memory_order_acquire);
-            if (dst != nullptr && logical_elem_count_ok)
-                std::fill_n(dst, logical_elem_count, int8_t{0});
+            if (args.A.valid() && logical_elem_count_ok)
+                args.A.zero_fill();
 
             for (StripePipelineSlot &slot : pipeline_slots_)
                 slot.reset_for_run();
             local_workspace_.reset_for_run();
             meta.reset();
+            meta.rho = config::GGML_GEMMINI_ACTIVATION_RHO;
 #if EXSIA_VALIDATION && EXSIA_PROFILE_COLLECTION_ENABLED
             const ExSIAState::ProfileSnapshot profile_snapshot = state_.profile_snapshot;
 #endif
@@ -1536,7 +1538,7 @@ namespace ggml::gemmini::quants::act::exsia
 #endif
         state_.B_size = BLOCK_SIZE;
         state_.K_logical = args.K;
-        if (dst == nullptr ||
+        if (!args.A.valid() ||
             args.I == 0 || args.K == 0 ||
             !logical_elem_count_ok ||
             !checked_round_up_multiple(args.K, state_.B_size, state_.K_padded))
@@ -2145,7 +2147,7 @@ namespace ggml::gemmini::quants::act::exsia
                                     if (pipeline_ok.load(std::memory_order_relaxed))
                                     {
                                         EXSIA_PROFILE_COLLECT(start_profile_interval(profile.folding);)
-                                        if (!folding_.run(meta, state_, slot.stripe, args, s, dst,
+                                        if (!folding_.run(meta, state_, slot.stripe, args, s,
                                                           slot.q_wide, slot.block_exp,
                                                           state_.residual, slot.rmd_builder))
                                         {
@@ -2476,7 +2478,7 @@ namespace ggml::gemmini::quants::act::exsia
             slot.mark_local_filled();
             EXSIA_PROFILE_COLLECT(start_profile_interval(profile.folding);)
 
-            if (!folding_.run(meta, state_, stripe, args, s, dst,
+            if (!folding_.run(meta, state_, stripe, args, s,
                                slot.q_wide, slot.block_exp,
                                state_.residual, slot.rmd_builder))
                 return fail(ExSIAState::FailureCode::FoldingFailure, s);
@@ -2549,8 +2551,7 @@ namespace ggml::gemmini::quants::act::exsia
     {
         const auto run = [&]() -> bool
         {
-            const int8_t *src = reinterpret_cast<const int8_t *>(args.A);
-            if (!src || !dst || args.I == 0 || args.K == 0 ||
+            if (!args.A.valid() || !dst || args.I == 0 || args.K == 0 ||
                 dst_row_stride == 0 || dst_col_stride == 0 ||
                 rows == 0 || cols == 0)
             {
@@ -2625,7 +2626,7 @@ namespace ggml::gemmini::quants::act::exsia
                     }
 
                     const int32_t q_int =
-                        static_cast<int32_t>(src[src_idx]) +
+                        args.A.get(row, col) +
                         residuals[row * col_count + col];
                     dst[dst_row_offset + dst_col_offset] =
                         std::ldexp(static_cast<float>(q_int), theta);

@@ -36,6 +36,8 @@ std::string llama_model_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_F16:      return "F16";
         case LLAMA_FTYPE_MOSTLY_BF16:     return "BF16";
         case LLAMA_FTYPE_MOSTLY_Q4_0:     return "Q4_0";
+        case LLAMA_FTYPE_MOSTLY_Q4_H1:    return "Q4_H1";
+        case LLAMA_FTYPE_MOSTLY_Q4_HP1:   return "Q4_HP1";
         case LLAMA_FTYPE_MOSTLY_Q4_1:     return "Q4_1";
         case LLAMA_FTYPE_MOSTLY_Q5_0:     return "Q5_0";
         case LLAMA_FTYPE_MOSTLY_Q5_1:     return "Q5_1";
@@ -45,6 +47,9 @@ std::string llama_model_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q8_HP1:   return "Q8_HP1";
         case LLAMA_FTYPE_MOSTLY_Q8_HP2:   return "Q8_HP2";
         case LLAMA_FTYPE_MOSTLY_Q8_CHANNEL: return "Q8_CHANNEL";
+        case LLAMA_FTYPE_MOSTLY_Q16_0:    return "Q16_0";
+        case LLAMA_FTYPE_MOSTLY_Q16_H1:   return "Q16_H1";
+        case LLAMA_FTYPE_MOSTLY_Q16_HP1:  return "Q16_HP1";
         case LLAMA_FTYPE_MOSTLY_Q2_K:     return "Q2_K - Medium";
         case LLAMA_FTYPE_MOSTLY_Q2_K_S:   return "Q2_K - Small";
         case LLAMA_FTYPE_MOSTLY_Q3_K_S:   return "Q3_K - Small";
@@ -624,6 +629,8 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_F16:     ftype = LLAMA_FTYPE_MOSTLY_F16;     break;
             case GGML_TYPE_BF16:    ftype = LLAMA_FTYPE_MOSTLY_BF16;    break;
             case GGML_TYPE_Q4_0:    ftype = LLAMA_FTYPE_MOSTLY_Q4_0;    break;
+            case GGML_TYPE_Q4_H1:   ftype = LLAMA_FTYPE_MOSTLY_Q4_H1;   break;
+            case GGML_TYPE_Q4_HP1:  ftype = LLAMA_FTYPE_MOSTLY_Q4_HP1;  break;
             case GGML_TYPE_Q4_1:    ftype = LLAMA_FTYPE_MOSTLY_Q4_1;    break;
             case GGML_TYPE_Q5_0:    ftype = LLAMA_FTYPE_MOSTLY_Q5_0;    break;
             case GGML_TYPE_Q5_1:    ftype = LLAMA_FTYPE_MOSTLY_Q5_1;    break;
@@ -633,6 +640,9 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_Q8_HP1:  ftype = LLAMA_FTYPE_MOSTLY_Q8_HP1;  break;
             case GGML_TYPE_Q8_HP2:  ftype = LLAMA_FTYPE_MOSTLY_Q8_HP2;  break;
             case GGML_TYPE_Q8_CHANNEL: ftype = LLAMA_FTYPE_MOSTLY_Q8_CHANNEL; break;
+            case GGML_TYPE_Q16_0:   ftype = LLAMA_FTYPE_MOSTLY_Q16_0;   break;
+            case GGML_TYPE_Q16_H1:  ftype = LLAMA_FTYPE_MOSTLY_Q16_H1;  break;
+            case GGML_TYPE_Q16_HP1: ftype = LLAMA_FTYPE_MOSTLY_Q16_HP1; break;
             case GGML_TYPE_Q2_K:    ftype = LLAMA_FTYPE_MOSTLY_Q2_K;    break;
             case GGML_TYPE_Q3_K:    ftype = LLAMA_FTYPE_MOSTLY_Q3_K_M;  break;
             case GGML_TYPE_Q4_K:    ftype = LLAMA_FTYPE_MOSTLY_Q4_K_M;  break;

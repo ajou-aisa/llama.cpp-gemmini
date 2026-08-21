@@ -105,7 +105,7 @@ bool dequantize_activations(const ggml_tensor * activation, std::vector<float> &
     args.I = I;
     args.J = J;
     args.K = K;
-    args.A = reinterpret_cast<elem_t *>(quantized.data());
+    args.A.allocate(I, K, 8);
     args.sA = K;
     if (!ggml::gemmini::quants::quantize_activation(activation, args)) {
         return false;

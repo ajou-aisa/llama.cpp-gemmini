@@ -21,16 +21,10 @@ bool checked_mul_size(size_t lhs, size_t rhs, size_t &out)
 
 void reset_activation_output(ggml_gemmini_args_t &args)
 {
-    int8_t *dst = reinterpret_cast<int8_t *>(args.A);
-    size_t elem_count = 0;
-    if (dst == nullptr || !checked_mul_size(args.I, args.K, elem_count)) {
+    if (!args.A.valid() || args.I == 0 || args.K == 0) {
         return;
     }
-
-    if (elem_count == 0)
-        elem_count = args.sA != 0 ? args.sA : args.K;
-
-    std::fill_n(dst, elem_count, int8_t{0});
+    args.A.zero_fill();
 }
 
 }
@@ -39,8 +33,7 @@ bool quantize_activation(const ggml_tensor *src, ggml_gemmini_args_t &args)
 {
     reset_activation_quant_state(args);
 
-    int8_t *dst = reinterpret_cast<int8_t *>(args.A);
-    if (!src || src->type != GGML_TYPE_F32 || !dst || args.I == 0 || args.K == 0) {
+    if (!src || src->type != GGML_TYPE_F32 || !args.A.valid() || args.I == 0 || args.K == 0) {
         reset_activation_output(args);
         return false;
     }
