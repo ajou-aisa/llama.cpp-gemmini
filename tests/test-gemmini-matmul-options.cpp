@@ -53,7 +53,6 @@ ggml_gemmini_args_t make_args(std::vector<elem_t> & activation,
 bool test_generated_config_contract() {
     const bool valid_default_mode =
         config::DEFAULT_MATMUL_MODE == static_cast<int>(MatmulInvocationMode::full) ||
-        config::DEFAULT_MATMUL_MODE == static_cast<int>(MatmulInvocationMode::stripe_sequential) ||
         config::DEFAULT_MATMUL_MODE == static_cast<int>(MatmulInvocationMode::stripe_pipeline);
     const bool default_rows_valid =
         !config::DEFAULT_STRIPE_ROWS.has_value() || *config::DEFAULT_STRIPE_ROWS > 0;
@@ -112,9 +111,8 @@ bool test_precedence() {
     }
 
     MatmulOptionOverrides explicit_options{};
-    explicit_options.mode = config::ENABLE_STRIPE_MATMUL &&
-            config::ACTIVATION_QUANT != static_cast<int>(config::ActivationQuantAlgo::EXSIA)
-        ? MatmulInvocationMode::stripe_sequential : MatmulInvocationMode::full;
+    explicit_options.mode = config::ENABLE_STRIPE_MATMUL && config::ENABLE_STRIPE_PIPELINE
+        ? MatmulInvocationMode::stripe_pipeline : MatmulInvocationMode::full;
     explicit_options.stripe_rows = 11;
     explicit_options.job_capacity = 6;
     explicit_options.rmd_backend = RmdBackend::cpu_direct;
@@ -138,6 +136,7 @@ bool test_invalid_environment() {
     const InvalidEnvironment cases[] = {
         { "GEMMINI_MATMUL_MODE", "AUTO", MatmulOptionsError::invalid_mode },
         { "GEMMINI_MATMUL_MODE", "full", MatmulOptionsError::invalid_mode },
+        { "GEMMINI_MATMUL_MODE", "STRIPE_SEQUENTIAL", MatmulOptionsError::invalid_mode },
         { "GEMMINI_STRIPE_ROWS", "12x", MatmulOptionsError::invalid_stripe_rows },
         { "GEMMINI_STRIPE_ROWS", "-1", MatmulOptionsError::invalid_stripe_rows },
         { "GEMMINI_STRIPE_JOB_CAPACITY", "+2", MatmulOptionsError::invalid_job_capacity },
@@ -181,38 +180,12 @@ bool test_invalid_explicit_rmd_backend() {
                  "invalid explicit RMD backend rejected");
 }
 
-bool test_exsia_public_mode_contract() {
-    if (config::ACTIVATION_QUANT != static_cast<int>(config::ActivationQuantAlgo::EXSIA)) {
-        return true;
-    }
-
-    clear_environment();
-    setenv("GEMMINI_MATMUL_MODE", "STRIPE_SEQUENTIAL", 1);
-    const auto environment = resolve_matmul_options();
-    clear_environment();
-
-    MatmulOptionOverrides sequential_options{};
-    sequential_options.mode = MatmulInvocationMode::stripe_sequential;
-    const auto explicit_sequential = resolve_matmul_options(sequential_options);
-
-    MatmulOptionOverrides full_options{};
-    full_options.mode = MatmulInvocationMode::full;
-    const auto full = resolve_matmul_options(full_options);
-
-    bool passed = check(!environment.ok() &&
-                            environment.error == MatmulOptionsError::disabled_mode,
-                        "ExSIA environment STRIPE_SEQUENTIAL rejected") &&
-        check(!explicit_sequential.ok() &&
-                  explicit_sequential.error == MatmulOptionsError::disabled_mode,
-              "ExSIA explicit STRIPE_SEQUENTIAL rejected") &&
-        check(full.ok(), "ExSIA FULL accepted");
-    if (config::ENABLE_STRIPE_PIPELINE) {
-        MatmulOptionOverrides pipeline_options{};
-        pipeline_options.mode = MatmulInvocationMode::stripe_pipeline;
-        passed = check(resolve_matmul_options(pipeline_options).ok(),
-                       "ExSIA STRIPE_PIPELINE accepted") && passed;
-    }
-    return passed;
+bool test_invalid_explicit_mode() {
+    MatmulOptionOverrides options{};
+    options.mode = static_cast<MatmulInvocationMode>(2);
+    const auto result = resolve_matmul_options(options);
+    return check(!result.ok() && result.error == MatmulOptionsError::invalid_mode,
+                 "invalid explicit matmul mode rejected");
 }
 
 #if defined(GGML_GEMMINI_OPTIONS_TEST_BACKEND)
@@ -268,19 +241,7 @@ bool test_disabled_mode_status_contract() {
     std::vector<float> output(12, 0.0f);
     bool passed = true;
 
-    if (!config::ENABLE_STRIPE_MATMUL) {
-        auto args = make_args(activation, weights, output);
-        MatmulOptionOverrides options{};
-        options.mode = MatmulInvocationMode::stripe_sequential;
-        const auto resolution = resolve_matmul_options(options);
-        const auto execution = prepare_execution(args, options);
-        passed = check(!resolution.ok() && resolution.error == MatmulOptionsError::disabled_mode,
-                       "disabled sequential stripe resolves as disabled mode") && passed;
-        passed = check(execution.status().code == MatmulStatusCode::unsupported_invocation,
-                       "disabled sequential stripe maps to unsupported invocation") && passed;
-    }
-
-    if (!config::ENABLE_STRIPE_PIPELINE) {
+    if (!config::ENABLE_STRIPE_MATMUL || !config::ENABLE_STRIPE_PIPELINE) {
         auto args = make_args(activation, weights, output);
         args.I = 6;
         args.K = 1;
@@ -314,7 +275,7 @@ int main() {
         test_precedence() &&
         test_invalid_environment() &&
         test_invalid_explicit_rmd_backend() &&
-        test_exsia_public_mode_contract() &&
+        test_invalid_explicit_mode() &&
         test_disabled_runtime_rmd_environment()
 #if defined(GGML_GEMMINI_OPTIONS_TEST_BACKEND)
         && test_execution_route_propagation()

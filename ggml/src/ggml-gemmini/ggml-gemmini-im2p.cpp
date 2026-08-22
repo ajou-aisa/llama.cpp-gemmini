@@ -135,29 +135,33 @@ Completion translate(const ::im2p::gemmini::FenceResult &result) noexcept {
 
 Result gate_route(bool exsia, std::uint8_t activation_bits, bool rmd_enabled,
                   bool cpu_direct_rmd, std::uint8_t weight_bits) noexcept {
-  // Production ExSIA is A8/Q8 only. Matched A4/Q4 and A16/Q16 remain TODO;
-  // mixed precision is unsupported. H0/H1/HP1 retain the existing Q8
-  // direction, while H2/HP2 gain no new route here. This gate runs before
-  // activation allocation, simulator/worker start, fence, RMD, commit, or
-  // fallback.
-  if (weight_bits != 8) {
-    return {Error::unsupported_route, "IM2P only supports Q8 weight routes",
-            false};
-  }
+  // Production ExSIA remains A8/Q8 only. TODO: integrate matched Q4/Q16
+  // scales with RMD before allowing ExSIA at those widths. This gate runs
+  // before activation allocation, simulator/worker start, fence, RMD, commit,
+  // or fallback.
   if (activation_bits != 4 && activation_bits != 8 && activation_bits != 16) {
     return {Error::unsupported_route, "unsupported IM2P activation width",
             false};
   }
+  if (weight_bits != 4 && weight_bits != 8 && weight_bits != 16) {
+    return {Error::unsupported_route, "unsupported IM2P weight width", false};
+  }
   if (exsia) {
-    if (activation_bits == 8 && rmd_enabled && cpu_direct_rmd) {
+    if (activation_bits == 8 && weight_bits == 8 && rmd_enabled &&
+        cpu_direct_rmd) {
       return {};
     }
     return {Error::unsupported_route,
             "ExSIA IM2P requires the production A8/Q8 cpu_direct RMD route",
             false};
   }
-  if (!rmd_enabled) {
+  if (!rmd_enabled &&
+      (weight_bits == 8 || activation_bits == weight_bits)) {
     return {};
+  }
+  if (!rmd_enabled) {
+    return {Error::unsupported_route,
+            "Q4/Q16 IM2P routes require matched activation width", false};
   }
   return {Error::unsupported_route,
           "non-ExSIA IM2P execution does not support RMD", false};
@@ -244,6 +248,113 @@ Completion run_full(const ggml_gemmini_args_t &args) noexcept {
     production_failed = true;
   }
 #endif
+  return completion;
+}
+
+Completion run_stripe_pipeline(const ggml_gemmini_args_t &args) noexcept {
+  ggml_gemmini_args_t runtime_args = args;
+  runtime_args.D = nullptr;
+  runtime_args.repeating_bias = false;
+  if (runtime_args.activation_rows_per_stripe == 0) {
+    runtime_args.activation_rows_per_stripe =
+        std::min<size_t>(::im2p::gemmini::compiled_dim(), runtime_args.I);
+  }
+  if (runtime_args.I == 0 || runtime_args.activation_rows_per_stripe == 0) {
+    return {{Error::invalid_contract,
+             "IM2P stripe pipeline requires nonempty activation rows", false},
+            {}};
+  }
+#if defined(GGML_GEMMINI_TESTING)
+  TestFailure failure = TestFailure::none;
+  {
+    std::lock_guard lock(test_mutex);
+    ++counters.stripe;
+    failure = injected_failure;
+    if (failure == TestFailure::execute) {
+      production_failed = true;
+      return {
+          {Error::execution_failure, "injected IM2P execute failure", false},
+          {}};
+    }
+  }
+  if (failure == TestFailure::malformed_contract) {
+    runtime_args.A = {};
+  }
+#endif
+  auto started = ::im2p::gemmini::execute(
+      &runtime_args, ::im2p::gemmini::Mode::stripe_pipeline,
+      ::im2p::gemmini::Options{65536});
+  if (!started.status.ok()) {
+#if defined(GGML_GEMMINI_TESTING)
+    std::lock_guard lock(test_mutex);
+    production_failed = true;
+#endif
+    return {translate(started.status), {}};
+  }
+  if (!started.run) {
+#if defined(GGML_GEMMINI_TESTING)
+    std::lock_guard lock(test_mutex);
+    production_failed = true;
+#endif
+    return {{Error::invalid_state, "IM2P execute returned no run", false}, {}};
+  }
+  size_t stripe_id = 0;
+  for (size_t row_begin = 0; row_begin < runtime_args.I;
+       row_begin += runtime_args.activation_rows_per_stripe, ++stripe_id) {
+    quants::act::exsia::StripeReadyEvent event{};
+    event.run_id = 1;
+    event.stripe_id = stripe_id;
+    event.slot = stripe_id % 2;
+    event.row_begin = row_begin;
+    event.row_end =
+        std::min(runtime_args.I,
+                 row_begin + runtime_args.activation_rows_per_stripe);
+    const auto status = ::im2p::gemmini::submit_stripe(*started.run, event);
+    if (!status.ok()) {
+#if defined(GGML_GEMMINI_TESTING)
+      std::lock_guard lock(test_mutex);
+      production_failed = true;
+#endif
+      return {translate(status), {}};
+    }
+#if defined(GGML_GEMMINI_TESTING)
+    {
+      std::lock_guard lock(test_mutex);
+      ++counters.accepted_stripes;
+    }
+#endif
+  }
+#if defined(GGML_GEMMINI_TESTING)
+  {
+    std::lock_guard lock(test_mutex);
+    ++counters.fence;
+  }
+#endif
+  Completion completion = translate(::im2p::gemmini::fence(*started.run));
+#if defined(GGML_GEMMINI_TESTING)
+  if (failure == TestFailure::fence) {
+    std::lock_guard lock(test_mutex);
+    production_failed = true;
+    return {{Error::execution_failure, "injected IM2P fence failure", false},
+            completion.stats};
+  }
+#endif
+  if (!completion.result.ok()) {
+#if defined(GGML_GEMMINI_TESTING)
+    std::lock_guard lock(test_mutex);
+    production_failed = true;
+#endif
+    return completion;
+  }
+  const auto committed =
+      ::im2p::gemmini::authorize_output_commit(*started.run, true);
+  if (!committed.ok()) {
+#if defined(GGML_GEMMINI_TESTING)
+    std::lock_guard lock(test_mutex);
+    production_failed = true;
+#endif
+    return {translate(committed), completion.stats};
+  }
   return completion;
 }
 

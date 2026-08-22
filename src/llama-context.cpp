@@ -129,8 +129,7 @@ llama_context::llama_context(
 
         const char * matmul_invocation = std::getenv("GEMMINI_MATMUL_INVOCATION");
         const bool prefer_gemmini = matmul_invocation != nullptr &&
-            (std::strcmp(matmul_invocation, "stripe-sequential") == 0 ||
-             std::strcmp(matmul_invocation, "stripe-pipeline") == 0);
+            std::strcmp(matmul_invocation, "stripe-pipeline") == 0;
         for (int pass = 0; pass < (prefer_gemmini ? 2 : 1); ++pass) {
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                 ggml_backend_dev_t dev = ggml_backend_dev_get(i);

@@ -44,6 +44,10 @@ namespace ggml::gemmini::config
 #define GGML_GEMMINI_ACTIVATION_BITS 8
 #endif
 
+#ifndef GGML_GEMMINI_WEIGHT_BITS
+#define GGML_GEMMINI_WEIGHT_BITS 8
+#endif
+
 // ComputeType ----------------------------------------------------------------
 // 0 = INT              : activation quant + weight unpacking + int matmul
 // 1 = FLOAT            : bypass quant, call matmul_cpu_fp directly
@@ -117,6 +121,8 @@ static_assert(
     "CURRENT_ACTIVATION_QUANT must be EXSIA, TENSOR, TOKEN, BLOCK, or STRIPE");
 static_assert(GGML_GEMMINI_ACTIVATION_BITS == 4 || GGML_GEMMINI_ACTIVATION_BITS == 8 || GGML_GEMMINI_ACTIVATION_BITS == 16,
               "GGML_GEMMINI_ACTIVATION_BITS must be 4, 8, or 16");
+static_assert(GGML_GEMMINI_WEIGHT_BITS == 4 || GGML_GEMMINI_WEIGHT_BITS == 8 || GGML_GEMMINI_WEIGHT_BITS == 16,
+              "GGML_GEMMINI_WEIGHT_BITS must be 4, 8, or 16");
 
 inline constexpr int32_t GGML_GEMMINI_ACTIVATION_QMIN = -(int32_t{1} << (GGML_GEMMINI_ACTIVATION_BITS - 1));
 inline constexpr int32_t GGML_GEMMINI_ACTIVATION_QMAX =  (int32_t{1} << (GGML_GEMMINI_ACTIVATION_BITS - 1)) - 1;

@@ -53,6 +53,8 @@ struct Completion {
 [[nodiscard]] Completion
 translate(const ::im2p::gemmini::FenceResult &result) noexcept;
 [[nodiscard]] Completion run_full(const ggml_gemmini_args_t &args) noexcept;
+[[nodiscard]] Completion
+run_stripe_pipeline(const ggml_gemmini_args_t &args) noexcept;
 [[nodiscard]] Result gate_route(bool exsia, std::uint8_t activation_bits,
                                 bool rmd_enabled, bool cpu_direct_rmd,
                                 std::uint8_t weight_bits = 8) noexcept;

@@ -66,12 +66,7 @@ bool counters_zero(const MatmulTestCounters & counters) {
         counters.hardware_dispatches == 0 && counters.fallback_dispatches == 0;
 }
 
-bool test_exsia_sequential_rejects_before_work() {
-    if (config::ACTIVATION_QUANT !=
-        static_cast<int>(config::ActivationQuantAlgo::EXSIA)) {
-        return true;
-    }
-
+bool test_removed_sequential_rejects_before_work() {
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
     const std::vector<float> environment_sentinel(6, 73.0f);
@@ -85,34 +80,18 @@ bool test_exsia_sequential_rejects_before_work() {
     const MatmulTestCounters environment_counters = test_matmul_counters();
     unsetenv("GEMMINI_MATMUL_MODE");
 
-    const std::vector<float> explicit_sentinel(6, 79.0f);
-    std::vector<float> explicit_output = explicit_sentinel;
-    auto explicit_args = make_args(activation, weights, explicit_output);
-    MatmulOptions explicit_options{};
-    explicit_options.mode = MatmulInvocationMode::stripe_sequential;
-    test_reset_matmul_counters();
-    const MatmulStatus explicit_status = matmul(explicit_args, explicit_options);
-    const MatmulTestCounters explicit_counters = test_matmul_counters();
-
-    return expect(environment_status.code == MatmulStatusCode::unsupported_invocation,
-                  "environment ExSIA sequential has typed rejection") &&
+    return expect(environment_status.code == MatmulStatusCode::invalid_argument,
+                  "removed sequential mode has typed rejection") &&
         expect(environment_output == environment_sentinel,
-               "environment ExSIA sequential preserves nonzero output sentinel") &&
+               "removed sequential mode preserves nonzero output sentinel") &&
         expect(counters_zero(environment_counters),
-               "environment ExSIA sequential performs zero construction/allocation/dispatch") &&
-        expect(explicit_status.code == MatmulStatusCode::unsupported_invocation,
-               "explicit ExSIA sequential has typed rejection") &&
-        expect(explicit_output == explicit_sentinel,
-               "explicit ExSIA sequential preserves nonzero output sentinel") &&
-        expect(counters_zero(explicit_counters),
-               "explicit ExSIA sequential performs zero construction/allocation/dispatch");
+               "removed sequential mode performs zero construction/allocation/dispatch");
 }
 
 bool test_output_parity() {
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
     std::vector<float> full_output(6, 0.0f);
-    std::vector<float> sequential_output(6, 73.0f);
     std::vector<float> pipeline_output(6, 0.0f);
 
     auto full_args = make_args(activation, weights, full_output);
@@ -120,13 +99,6 @@ bool test_output_parity() {
     full_options.mode = MatmulInvocationMode::full;
     full_options.rmd_backend = RmdBackend::cpu_direct;
     const MatmulStatus full = matmul(full_args, full_options);
-
-    auto sequential_args = make_args(activation, weights, sequential_output);
-    MatmulOptions sequential_options{};
-    sequential_options.mode = MatmulInvocationMode::stripe_sequential;
-    sequential_options.stripe_rows = 1;
-    sequential_options.rmd_backend = RmdBackend::cpu_direct;
-    const MatmulStatus sequential = matmul(sequential_args, sequential_options);
 
     auto pipeline_args = make_args(activation, weights, pipeline_output);
     MatmulOptions pipeline_options{};
@@ -152,18 +124,69 @@ bool test_output_parity() {
     const MatmulStatus collected = collector.finish();
     const MatmulStatus pipeline = finish_execution(execution);
 
-    const bool exsia = config::ACTIVATION_QUANT ==
-        static_cast<int>(config::ActivationQuantAlgo::EXSIA);
-    const bool sequential_contract = exsia
-        ? expect(sequential.code == MatmulStatusCode::unsupported_invocation &&
-                     sequential_output == std::vector<float>(6, 73.0f),
-                 "ExSIA STRIPE_SEQUENTIAL rejects before dispatch")
-        : expect(sequential.ok() && same_output(full_output, sequential_output),
-                 "non-ExSIA STRIPE_SEQUENTIAL succeeds with FULL parity");
     return expect(full.ok(), "FULL succeeds") &&
-        sequential_contract &&
         expect(accepted && collected.ok() && pipeline.ok(), "PIPELINE succeeds") &&
         expect(same_output(full_output, pipeline_output), "FULL/PIPELINE parity");
+}
+
+bool test_single_row_pipeline() {
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> full_output(2, 0.0f);
+    std::vector<float> pointer_output(2, 0.0f);
+    std::vector<float> value_output(2, 0.0f);
+
+    auto full_args = make_args(activation, weights, full_output);
+    full_args.I = 1;
+    MatmulOptions full_options{};
+    full_options.mode = MatmulInvocationMode::full;
+    full_options.rmd_backend = RmdBackend::cpu_direct;
+    const MatmulStatus full = matmul(full_args, full_options);
+
+    auto pipeline_args = make_args(activation, weights, pointer_output);
+    pipeline_args.I = 1;
+    MatmulOptions pipeline_options{};
+    pipeline_options.mode = MatmulInvocationMode::stripe_pipeline;
+    pipeline_options.job_capacity = 1;
+    pipeline_options.rmd_backend = RmdBackend::cpu_direct;
+    auto execution = prepare_execution(&pipeline_args, pipeline_options);
+    MatmulStripeCollector collector(1);
+    if (!expect(execution.status().ok() && collector.start(execution),
+                "single-row pipeline starts")) {
+        return false;
+    }
+    quants::act::exsia::StripeReadyEvent only{};
+    only.stripe_id = 0;
+    only.row_end = 1;
+    const auto * sink = collector.sink();
+    const bool accepted = sink->on_ready(sink->user_data, only);
+    const MatmulStatus collected = collector.finish();
+    const MatmulStatus pipeline = finish_execution(execution);
+
+    auto value_args = make_args(activation, weights, value_output);
+    value_args.I = 1;
+    auto value_execution = prepare_execution(
+        static_cast<const ggml_gemmini_args_t &>(value_args), pipeline_options);
+    MatmulStripeCollector value_collector(1);
+    if (!expect(value_execution.status().ok() &&
+                    value_collector.start(value_execution),
+                "single-row by-value pipeline starts")) {
+        return false;
+    }
+    const auto * value_sink = value_collector.sink();
+    const bool value_accepted =
+        value_sink->on_ready(value_sink->user_data, only);
+    const MatmulStatus value_collected = value_collector.finish();
+    const MatmulStatus value_pipeline = finish_execution(value_execution);
+
+    return expect(full.ok(), "single-row FULL succeeds") &&
+        expect(accepted && collected.ok() && pipeline.ok(),
+               "single-row pointer PIPELINE succeeds") &&
+        expect(value_accepted && value_collected.ok() && value_pipeline.ok(),
+               "single-row by-value PIPELINE succeeds") &&
+        expect(same_output(full_output, pointer_output) &&
+                   same_output(full_output, value_output),
+               "single-row FULL/pointer/value PIPELINE parity");
 }
 
 residual::DirectStripePayloadHandle make_direct_payload(
@@ -216,7 +239,7 @@ bool test_counter_hooks_connected() {
 bool test_cpu_direct_lifecycle_parity() {
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
-    std::vector<float> full_output(6, 0.0f), sequential_output(6, 79.0f), pipeline_output(6, 0.0f);
+    std::vector<float> full_output(6, 0.0f), pipeline_output(6, 0.0f);
     MatmulOptions options{};
     options.rmd_backend = RmdBackend::cpu_direct;
 
@@ -228,12 +251,6 @@ bool test_cpu_direct_lifecycle_parity() {
     const std::vector<float> first_full_output = full_output;
     std::fill(full_output.begin(), full_output.end(), 0.0f);
     const MatmulStatus repeated_full = matmul(full_args, options);
-
-    auto sequential_args = make_args(activation, weights, sequential_output);
-    install_direct_payloads(sequential_args);
-    options.mode = MatmulInvocationMode::stripe_sequential;
-    options.stripe_rows = 1;
-    const MatmulStatus sequential = matmul(sequential_args, options);
 
     auto pipeline_args = make_args(activation, weights, pipeline_output);
     options.mode = MatmulInvocationMode::stripe_pipeline;
@@ -252,24 +269,15 @@ bool test_cpu_direct_lifecycle_parity() {
     const MatmulStatus collected = collector.finish();
     const MatmulStatus pipeline = finish_execution(execution);
 
-    const bool exsia = config::ACTIVATION_QUANT ==
-        static_cast<int>(config::ActivationQuantAlgo::EXSIA);
-    const bool sequential_contract = exsia
-        ? expect(sequential.code == MatmulStatusCode::unsupported_invocation &&
-                     sequential_output == std::vector<float>(6, 79.0f),
-                 "ExSIA direct STRIPE_SEQUENTIAL rejects before dispatch")
-        : expect(sequential.ok() && same_output(full_output, sequential_output),
-                 "non-ExSIA direct STRIPE_SEQUENTIAL succeeds with FULL parity");
     return expect(full.ok() && repeated_full.ok() && accepted && collected.ok() && pipeline.ok(),
                   "direct backend succeeds in FULL/pipeline and repeated FULL") &&
-        sequential_contract &&
         expect(same_output(first_full_output, full_output),
                "repeated direct invocation has no stale residual state") &&
         expect(same_output(full_output, pipeline_output),
                "direct backend FULL/pipeline final-output parity") &&
         expect(full_output[0] != 5.0f || full_output[1] != 5.0f,
                "direct residual is merged after dense output") &&
-        expect(full_args.tiled_matmul_type == main_route && sequential_args.tiled_matmul_type == main_route &&
+        expect(full_args.tiled_matmul_type == main_route &&
                    pipeline_args.tiled_matmul_type == main_route,
                "backend selector preserves the main matmul route");
 }
@@ -349,24 +357,16 @@ bool test_bad_routes() {
 
     auto unsupported_args = make_args(activation, weights, output);
     unsupported_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h0;
-    MatmulOptions stripe_options{};
-    stripe_options.mode = MatmulInvocationMode::stripe_sequential;
-    stripe_options.stripe_rows = 1;
-    stripe_options.rmd_backend = RmdBackend::cpu_direct;
-    const MatmulStatus unsupported = matmul(unsupported_args, stripe_options);
+    const MatmulStatus unsupported = matmul(unsupported_args, full_options);
 
     MatmulOptions invalid_options{};
-    invalid_options.mode = MatmulInvocationMode::stripe_sequential;
+    invalid_options.mode = MatmulInvocationMode::stripe_pipeline;
     invalid_options.stripe_rows = 0;
     const MatmulStatus invalid = matmul(unsupported_args, invalid_options);
 
-    const bool exsia = config::ACTIVATION_QUANT ==
-        static_cast<int>(config::ActivationQuantAlgo::EXSIA);
     return expect(malformed.code == MatmulStatusCode::invalid_contract, "malformed route rejected") &&
-        expect(unsupported.code == (exsia ? MatmulStatusCode::unsupported_invocation
-                                         : MatmulStatusCode::unsupported_route),
-               exsia ? "ExSIA sequential route rejected before dispatch"
-                     : "unsupported route rejected") &&
+        expect(unsupported.code == MatmulStatusCode::unsupported_route,
+               "unsupported route rejected") &&
         expect(invalid.code == MatmulStatusCode::invalid_argument,
                "invalid options rejected");
 }
@@ -459,15 +459,16 @@ int main(int argc, char ** argv) {
 #ifdef GGML_GEMMINI_PIPELINE_WRITER_TEST_ONLY
     return 1;
 #else
-    if (argc == 2 && std::string(argv[1]) == "--probe-exsia-sequential") {
-        const bool ok = test_exsia_sequential_rejects_before_work();
+    if (argc == 2 && std::string(argv[1]) == "--probe-removed-sequential") {
+        const bool ok = test_removed_sequential_rejects_before_work();
         if (ok) {
-            std::puts("PASS: environment+explicit typed rejection; observed counters all zero; nonzero sentinels preserved");
+            std::puts("PASS: removed sequential mode rejected; counters zero; sentinel preserved");
         }
         return ok ? 0 : 1;
     }
-    if (!test_exsia_sequential_rejects_before_work() ||
-        !test_output_parity() || !test_counter_hooks_connected() ||
+    if (!test_removed_sequential_rejects_before_work() ||
+        !test_output_parity() || !test_single_row_pipeline() ||
+        !test_counter_hooks_connected() ||
         !test_cpu_direct_lifecycle_parity() ||
         !test_merge_destination_override() ||
         !test_cpu_direct_failure_commits_no_partial_correction() ||

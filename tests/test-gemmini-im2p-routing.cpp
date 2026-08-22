@@ -35,6 +35,7 @@ constexpr int64_t I = 3;
 #endif
 constexpr int64_t J = 2;
 constexpr float sentinel = 12345.0f;
+const char *routing_program = nullptr;
 
 bool check(bool condition, const char *message) {
   if (!condition) {
@@ -142,6 +143,44 @@ const char *compiled_route() {
 #endif
 }
 
+const char *compiled_weight_route() {
+#if GGML_GEMMINI_WEIGHT_BITS == 4
+  return "q4_h1";
+#elif GGML_GEMMINI_WEIGHT_BITS == 16
+  return "q16_h1";
+#else
+  return compiled_exsia ? "q8_0" : "q8_channel";
+#endif
+}
+
+const char *compiled_mismatch_support_result() {
+  return GGML_GEMMINI_WEIGHT_BITS == 4 || GGML_GEMMINI_WEIGHT_BITS == 16
+             ? "no"
+             : "n/a";
+}
+
+bool run_matched_weight_gate_contract() {
+  using ggml::gemmini::im2p_adapter::gate_route;
+
+  const auto q4 = gate_route(false, 4, false, false, 4);
+  const auto q16 = gate_route(false, 16, false, false, 16);
+  const auto legacy_a4_q8 = gate_route(false, 4, false, false, 8);
+  const auto legacy_a16_q8 = gate_route(false, 16, false, false, 8);
+  const auto unsupported_a8_q4 = gate_route(false, 8, false, false, 4);
+  const auto unsupported_a8_q16 = gate_route(false, 8, false, false, 16);
+  const auto exsia_q4 = gate_route(true, 4, true, true, 4);
+  const auto exsia_q16 = gate_route(true, 16, true, true, 16);
+
+  return check(q4.ok(), "non-RMD A4/Q4 matched route is accepted") &&
+         check(q16.ok(), "non-RMD A16/Q16 matched route is accepted") &&
+         check(legacy_a4_q8.ok(), "legacy non-RMD A4/Q8 remains accepted") &&
+         check(legacy_a16_q8.ok(), "legacy non-RMD A16/Q8 remains accepted") &&
+         check(!unsupported_a8_q4.ok(), "A8/Q4 has no native artifact") &&
+         check(!unsupported_a8_q16.ok(), "A8/Q16 has no native artifact") &&
+         check(!exsia_q4.ok(), "ExSIA A4/Q4 remains gated on RMD TODO") &&
+         check(!exsia_q16.ok(), "ExSIA A16/Q16 remains gated on RMD TODO");
+}
+
 std::vector<float> make_activations(int64_t rows = I) {
   std::vector<float> values(rows * K);
   for (int64_t i = 0; i < rows; ++i) {
@@ -160,7 +199,45 @@ std::vector<float> make_activations(int64_t rows = I) {
 }
 
 std::vector<uint8_t> make_weights() {
-#if GGML_GEMMINI_ACTIVATION_QUANT == 0
+#if GGML_GEMMINI_WEIGHT_BITS == 4
+  constexpr size_t blocks_per_row = K / QK4_0;
+  std::vector<uint8_t> encoded(J * blocks_per_row * sizeof(block_q4_h1));
+  auto *blocks = reinterpret_cast<block_q4_h1 *>(encoded.data());
+  for (int64_t j = 0; j < J; ++j) {
+    for (size_t block_index = 0; block_index < blocks_per_row; ++block_index) {
+      block_q4_h1 &block = blocks[j * blocks_per_row + block_index];
+      block.s_rf = 0.125f * static_cast<float>(j + 1);
+      block.c_b = static_cast<uint8_t>(block_index + 1);
+      block.R = 1;
+      for (size_t lane = 0; lane < QK4_0; ++lane) {
+        const int8_t code = static_cast<int8_t>(
+            (5 * j + static_cast<int>(block_index) + static_cast<int>(lane)) % 16 - 8);
+        const uint8_t nibble = static_cast<uint8_t>(code + 8);
+        uint8_t &byte = block.qs[lane % (QK4_0 / 2)];
+        byte = lane < QK4_0 / 2
+                   ? static_cast<uint8_t>((byte & 0xf0) | nibble)
+                   : static_cast<uint8_t>((byte & 0x0f) | (nibble << 4));
+      }
+    }
+  }
+  return encoded;
+#elif GGML_GEMMINI_WEIGHT_BITS == 16
+  constexpr size_t blocks_per_row = K / QK16_0;
+  std::vector<uint8_t> encoded(J * blocks_per_row * sizeof(block_q16_h1));
+  auto *blocks = reinterpret_cast<block_q16_h1 *>(encoded.data());
+  for (int64_t j = 0; j < J; ++j) {
+    for (size_t block_index = 0; block_index < blocks_per_row; ++block_index) {
+      block_q16_h1 &block = blocks[j * blocks_per_row + block_index];
+      block.s_rf = 0.125f * static_cast<float>(j + 1);
+      block.c_b = static_cast<uint8_t>(block_index + 1);
+      block.R = 1;
+      for (size_t lane = 0; lane < QK16_0; ++lane)
+        block.qs[lane] = static_cast<int16_t>(
+            (19 * j + 7 * static_cast<int>(lane) + static_cast<int>(block_index)) % 47 - 23);
+    }
+  }
+  return encoded;
+#elif GGML_GEMMINI_ACTIVATION_QUANT == 0
   constexpr size_t blocks_per_row = K / QK8_0;
   std::vector<uint8_t> encoded(J * blocks_per_row * sizeof(block_q8_0));
   auto *blocks = reinterpret_cast<block_q8_0 *>(encoded.data());
@@ -295,7 +372,37 @@ bool scalar_oracle(const std::vector<float> &activations,
   }
 
   expected.assign(rows * J, 0.0f);
-#if GGML_GEMMINI_ACTIVATION_QUANT == 0
+#if GGML_GEMMINI_WEIGHT_BITS == 4
+  constexpr size_t blocks_per_row = K / QK4_0;
+  const auto *blocks = reinterpret_cast<const block_q4_h1 *>(weights.data());
+  for (int64_t i = 0; i < rows; ++i) {
+    for (int64_t j = 0; j < J; ++j) {
+      for (int64_t k = 0; k < K; ++k) {
+        const block_q4_h1 &block =
+            blocks[j * blocks_per_row + static_cast<size_t>(k) / QK4_0];
+        const size_t lane = static_cast<size_t>(k) % QK4_0;
+        const uint8_t byte = block.qs[lane % (QK4_0 / 2)];
+        const int code = int(lane < QK4_0 / 2 ? byte & 0x0f : byte >> 4) - 8;
+        const float factor = block.s_rf * (block.c_b + block.R);
+        expected[i * J + j] += decoded[i * K + k] * code * factor;
+      }
+    }
+  }
+#elif GGML_GEMMINI_WEIGHT_BITS == 16
+  constexpr size_t blocks_per_row = K / QK16_0;
+  const auto *blocks = reinterpret_cast<const block_q16_h1 *>(weights.data());
+  for (int64_t i = 0; i < rows; ++i) {
+    for (int64_t j = 0; j < J; ++j) {
+      for (int64_t k = 0; k < K; ++k) {
+        const block_q16_h1 &block =
+            blocks[j * blocks_per_row + static_cast<size_t>(k) / QK16_0];
+        const float factor = block.s_rf * (block.c_b + block.R);
+        expected[i * J + j] += decoded[i * K + k] *
+                               block.qs[static_cast<size_t>(k) % QK16_0] * factor;
+      }
+    }
+  }
+#elif GGML_GEMMINI_ACTIVATION_QUANT == 0
   constexpr size_t blocks_per_row = K / QK8_0;
   const auto *blocks = reinterpret_cast<const block_q8_0 *>(weights.data());
   for (int64_t i = 0; i < rows; ++i) {
@@ -356,7 +463,15 @@ struct GraphCase {
     if (context == nullptr) {
       return false;
     }
-#if GGML_GEMMINI_ACTIVATION_QUANT == 0
+#if GGML_GEMMINI_WEIGHT_BITS == 4
+    ggml_tensor *weight = ggml_new_tensor_2d(context, GGML_TYPE_Q4_H1, K, J);
+    ggml_tensor *mismatched_weight =
+        ggml_new_tensor_2d(context, GGML_TYPE_Q16_H1, K, J);
+#elif GGML_GEMMINI_WEIGHT_BITS == 16
+    ggml_tensor *weight = ggml_new_tensor_2d(context, GGML_TYPE_Q16_H1, K, J);
+    ggml_tensor *mismatched_weight =
+        ggml_new_tensor_2d(context, GGML_TYPE_Q4_H1, K, J);
+#elif GGML_GEMMINI_ACTIVATION_QUANT == 0
     ggml_tensor *weight = ggml_new_tensor_2d(context, GGML_TYPE_Q8_0, K, J);
 #else
     ggml_tensor *weight =
@@ -365,6 +480,10 @@ struct GraphCase {
     ggml_tensor *activation =
         ggml_new_tensor_2d(context, GGML_TYPE_F32, K, rows);
     output = ggml_mul_mat(context, weight, activation);
+#if GGML_GEMMINI_WEIGHT_BITS == 4 || GGML_GEMMINI_WEIGHT_BITS == 16
+    ggml_tensor *mismatched_output =
+        ggml_mul_mat(context, mismatched_weight, activation);
+#endif
     buffer = ggml_backend_alloc_ctx_tensors(context, backend);
     if (buffer == nullptr) {
       return false;
@@ -377,7 +496,14 @@ struct GraphCase {
                             initial.size() * sizeof(float));
     graph = ggml_new_graph(context);
     ggml_build_forward_expand(graph, output);
-    return ggml_backend_supports_op(backend, output);
+    const bool selected_supported = ggml_backend_supports_op(backend, output);
+#if GGML_GEMMINI_WEIGHT_BITS == 4 || GGML_GEMMINI_WEIGHT_BITS == 16
+    const bool mismatched_rejected =
+        !ggml_backend_supports_op(backend, mismatched_output);
+    return selected_supported && mismatched_rejected;
+#else
+    return selected_supported;
+#endif
   }
 
   ~GraphCase() {
@@ -1039,8 +1165,6 @@ bool run_exsia_blocked_submit_failure() {
   return ok;
 }
 
-const char *routing_program = nullptr;
-
 bool run_exsia_unsupported_mode() {
   std::string command = "ulimit -c 0; \"";
   command += routing_program;
@@ -1048,7 +1172,7 @@ bool run_exsia_unsupported_mode() {
   const bool ok = check(std::system(command.c_str()) != 0,
                         "unsupported ExSIA mode fails closed before dispatch");
   if (ok) {
-    std::printf("mode=stripe_sequential error=disabled_mode full=0 pipeline=0 "
+    std::printf("removed_mode=STRIPE_SEQUENTIAL error=invalid_mode full=0 pipeline=0 "
                 "stripes=0 commit=0 fallback=0\n");
   }
   return ok;
@@ -1094,6 +1218,12 @@ bool run_exsia_prestart_rejection(bool include_cpu) {
 bool run_success_mode(const char *mode) {
   using namespace ggml::gemmini::im2p_adapter;
   setenv("GEMMINI_MATMUL_MODE", mode, 1);
+  const bool pipeline = std::string_view(mode) == "STRIPE_PIPELINE";
+  if (pipeline) {
+    setenv("GEMMINI_STRIPE_ROWS", "1", 1);
+  } else {
+    unsetenv("GEMMINI_STRIPE_ROWS");
+  }
   GraphCase test_case;
   if (!check(test_case.initialize(), "initialize real Gemmini graph")) {
     return false;
@@ -1112,10 +1242,14 @@ bool run_success_mode(const char *mode) {
   bool ok =
       check(status == GGML_STATUS_SUCCESS,
             "production graph compute succeeds") &&
-      check(counters.full == 1,
-            "production dispatch executes one IM2P full run") &&
+      check(counters.full == (pipeline ? 0u : 1u),
+            "production dispatch selects the requested IM2P execution mode") &&
       check(counters.fence == 1, "production dispatch fences once") &&
-      check(counters.stripe == 0, "production dispatch submits no stripes") &&
+      check(counters.stripe == (pipeline ? 1u : 0u),
+            "production PIPELINE dispatch publishes through the stripe path") &&
+      check(counters.accepted_stripes ==
+                (pipeline ? static_cast<uint64_t>(I) : uint64_t{0}),
+            "production PIPELINE publishes every configured row stripe") &&
       check(counters.hardware == 0,
             "production dispatch enters no hardware path");
   for (size_t index = 0; index < actual.size(); ++index) {
@@ -1125,9 +1259,15 @@ bool run_success_mode(const char *mode) {
          ok;
   }
   if (ok) {
-    std::printf("route=%s mode=%s bits=%d dim=%d full=1 stripe=0 hardware=0\n",
-                compiled_route(), mode, GGML_GEMMINI_ACTIVATION_BITS,
-                GGML_GEMMINI_TEST_IM2P_DIM);
+    std::printf("route=%s weight=%s mode=%s bits=%d weight_bits=%d dim=%d "
+                "full=%llu stripe=%llu hardware=0 supports_selected=yes "
+                "supports_mismatch=%s\n",
+                compiled_route(), compiled_weight_route(), mode,
+                GGML_GEMMINI_ACTIVATION_BITS, GGML_GEMMINI_WEIGHT_BITS,
+                GGML_GEMMINI_TEST_IM2P_DIM,
+                static_cast<unsigned long long>(counters.full),
+                static_cast<unsigned long long>(counters.stripe),
+                compiled_mismatch_support_result());
   }
   return ok;
 }
@@ -1153,9 +1293,10 @@ bool run_malformed_contract() {
                "malformed contract rejects before fence or fallback");
 }
 
-bool run_fence_failure() {
+bool run_fence_failure(const char *mode) {
   using namespace ggml::gemmini::im2p_adapter;
-  setenv("GEMMINI_MATMUL_MODE", "FULL", 1);
+  setenv("GEMMINI_MATMUL_MODE", mode, 1);
+  const bool pipeline = std::string_view(mode) == "STRIPE_PIPELINE";
   GraphCase test_case;
   if (!check(test_case.initialize(), "initialize failure graph")) {
     return false;
@@ -1169,9 +1310,11 @@ bool run_fence_failure() {
                "fence failure reaches graph status") &&
          check(all_sentinel(test_case.read_output()),
                "fence failure preserves destination sentinel") &&
-         check(counters.full == 1 && counters.fence == 1 &&
-                   counters.stripe == 0 && counters.hardware == 0,
-               "fence failure has no stripe, hardware, or fallback dispatch");
+         check(counters.full == (pipeline ? 0u : 1u) &&
+                   counters.fence == 1 &&
+                   counters.stripe == (pipeline ? 1u : 0u) &&
+                   counters.hardware == 0,
+               "fence failure preserves requested dispatch without fallback");
 }
 
 bool run_rmd_rejection() {
@@ -1224,7 +1367,8 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::string_view(argv[1]) == "--invalid-mode-child") {
     return run_invalid_mode_child() ? 0 : 1;
   }
-  if (!run_graph_overhead_regression() || !run_exsia_shift_regression()
+  if (!run_matched_weight_gate_contract() || !run_graph_overhead_regression() ||
+      !run_exsia_shift_regression()
 #if GGML_GEMMINI_ACTIVATION_QUANT == 0
       || !run_exsia_publication_boundary()
 #endif
@@ -1365,6 +1509,7 @@ int main(int argc, char **argv) {
   ok = run_exsia_prestart_rejection(true) && ok;
 #endif
   unsetenv("GEMMINI_MATMUL_MODE");
+  unsetenv("GEMMINI_STRIPE_ROWS");
   unsetenv("GEMMINI_RMD_BACKEND");
   unsetenv("GEMMINI_STRIPE_JOB_CAPACITY");
   return ok ? 0 : 1;
@@ -1374,11 +1519,12 @@ int main(int argc, char **argv) {
 #endif
 
   bool ok = true;
-  for (const char *mode : {"FULL", "STRIPE_SEQUENTIAL", "STRIPE_PIPELINE"}) {
+  for (const char *mode : {"FULL", "STRIPE_PIPELINE"}) {
     ok = run_success_mode(mode) && ok;
   }
   ok = run_malformed_contract() && ok;
-  ok = run_fence_failure() && ok;
+  ok = run_fence_failure("FULL") && ok;
+  ok = run_fence_failure("STRIPE_PIPELINE") && ok;
 
   std::string command = "ulimit -c 0; \"";
   command += argv[0];
@@ -1387,6 +1533,7 @@ int main(int argc, char **argv) {
              "garbage mode is rejected through production dispatch") &&
        ok;
   unsetenv("GEMMINI_MATMUL_MODE");
+  unsetenv("GEMMINI_STRIPE_ROWS");
   return ok ? 0 : 1;
 #endif
 }

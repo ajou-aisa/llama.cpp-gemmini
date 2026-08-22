@@ -1368,12 +1368,6 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options
         state_ = MatmulExecutionState::failed;
         return;
     }
-    if (options_.mode == MatmulInvocationMode::stripe_pipeline && total_rows_ <= 1) {
-        status_ = make_status(MatmulStatusCode::unsupported_invocation,
-                              "stripe pipeline requires more than one row");
-        state_ = MatmulExecutionState::failed;
-        return;
-    }
     if (options_.mode == MatmulInvocationMode::stripe_pipeline &&
         !std::holds_alternative<quants::act::NoneMeta>(facade_.args().act_quant.storage()) &&
         !detail::route_capabilities(facade_.args()).live_stripe_producer) {
@@ -1385,8 +1379,7 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options
     const bool defer_pipeline_route_validation =
         options_.mode == MatmulInvocationMode::stripe_pipeline &&
         std::holds_alternative<quants::act::NoneMeta>(facade_.args().act_quant.storage());
-    if ((options_.mode == MatmulInvocationMode::stripe_sequential ||
-         options_.mode == MatmulInvocationMode::stripe_pipeline) &&
+    if (options_.mode == MatmulInvocationMode::stripe_pipeline &&
         !defer_pipeline_route_validation) {
         const MatMulStatus status = facade_.begin_stripes();
         status_ = to_public_status(
@@ -1444,12 +1437,6 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions optio
         state_ = MatmulExecutionState::failed;
         return;
     }
-    if (options_.mode == MatmulInvocationMode::stripe_pipeline && total_rows_ <= 1) {
-        status_ = make_status(MatmulStatusCode::unsupported_invocation,
-                              "stripe pipeline requires more than one row");
-        state_ = MatmulExecutionState::failed;
-        return;
-    }
     if (options_.mode == MatmulInvocationMode::stripe_pipeline &&
         !std::holds_alternative<quants::act::NoneMeta>(facade_.args().act_quant.storage()) &&
         !detail::route_capabilities(facade_.args()).live_stripe_producer) {
@@ -1461,8 +1448,7 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions optio
     const bool defer_pipeline_route_validation =
         options_.mode == MatmulInvocationMode::stripe_pipeline &&
         std::holds_alternative<quants::act::NoneMeta>(facade_.args().act_quant.storage());
-    if ((options_.mode == MatmulInvocationMode::stripe_sequential ||
-         options_.mode == MatmulInvocationMode::stripe_pipeline) &&
+    if (options_.mode == MatmulInvocationMode::stripe_pipeline &&
         !defer_pipeline_route_validation) {
         const MatMulStatus status = facade_.begin_stripes();
         status_ = to_public_status(

@@ -384,7 +384,6 @@ private:
 
 enum class MatmulInvocationMode {
     full,
-    stripe_sequential,
     stripe_pipeline,
 };
 
@@ -574,8 +573,6 @@ inline MatmulOptionsResolution resolve_matmul_options(const MatmulOptionOverride
             const std::string_view mode(value);
             if (mode == "FULL") {
                 result.options.mode = MatmulInvocationMode::full;
-            } else if (mode == "STRIPE_SEQUENTIAL") {
-                result.options.mode = MatmulInvocationMode::stripe_sequential;
             } else if (mode == "STRIPE_PIPELINE") {
                 result.options.mode = MatmulInvocationMode::stripe_pipeline;
             } else {
@@ -639,13 +636,13 @@ inline MatmulOptionsResolution resolve_matmul_options(const MatmulOptionOverride
         result.error = MatmulOptionsError::invalid_rmd_backend;
         return result;
     }
-    if (config::ACTIVATION_QUANT == static_cast<int>(config::ActivationQuantAlgo::EXSIA) &&
-        result.options.mode == MatmulInvocationMode::stripe_sequential) {
-        result.error = MatmulOptionsError::disabled_mode;
+    if (result.options.mode != MatmulInvocationMode::full &&
+        result.options.mode != MatmulInvocationMode::stripe_pipeline) {
+        result.error = MatmulOptionsError::invalid_mode;
         return result;
     }
-    if ((result.options.mode != MatmulInvocationMode::full && !config::ENABLE_STRIPE_MATMUL) ||
-        (result.options.mode == MatmulInvocationMode::stripe_pipeline && !config::ENABLE_STRIPE_PIPELINE)) {
+    if (result.options.mode == MatmulInvocationMode::stripe_pipeline &&
+        (!config::ENABLE_STRIPE_MATMUL || !config::ENABLE_STRIPE_PIPELINE)) {
         result.error = MatmulOptionsError::disabled_mode;
     }
     return result;
