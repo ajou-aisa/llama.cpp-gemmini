@@ -187,6 +187,7 @@ target_sources(gemmini_q8_h1_h2_dequant_fp PRIVATE
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
     ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
     ../ggml/src/ggml-gemmini/quants/act/quantize.cpp
+    ../ggml/src/ggml-gemmini/quants/act/block/block.cpp
     ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
     ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
     ../ggml/src/ggml-gemmini/quants/act/token/token.cpp)
@@ -206,14 +207,20 @@ add_executable(test-gemmini-act-quant-i32-saturation
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
     ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
     ../ggml/src/ggml-gemmini/quants/act/quantize.cpp
+    ../ggml/src/ggml-gemmini/quants/act/block/block.cpp
     ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
     ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
     ../ggml/src/ggml-gemmini/quants/act/token/token.cpp
     ../ggml/src/ggml-gemmini/quants/act/stripe/stripe.cpp)
 target_link_libraries(test-gemmini-act-quant-i32-saturation PRIVATE ggml-base ggml-gemmini-utils)
 target_compile_features(test-gemmini-act-quant-i32-saturation PRIVATE cxx_std_17)
+set(_GGML_GEMMINI_SATURATION_TEST_ACTIVATION_QUANT ${_GGML_GEMMINI_ACTIVATION_QUANT_VALUE})
+if (_GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "BLOCK")
+    # BLOCK intentionally has no residual/RMD path; keep this RMD saturation test on ExSIA.
+    set(_GGML_GEMMINI_SATURATION_TEST_ACTIVATION_QUANT 0)
+endif()
 target_compile_definitions(test-gemmini-act-quant-i32-saturation PRIVATE
-    GGML_GEMMINI_ACTIVATION_QUANT=${_GGML_GEMMINI_ACTIVATION_QUANT_VALUE}
+    GGML_GEMMINI_ACTIVATION_QUANT=${_GGML_GEMMINI_SATURATION_TEST_ACTIVATION_QUANT}
     GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
     GGML_GEMMINI_ENABLE_RMD=1)
 target_include_directories(test-gemmini-act-quant-i32-saturation PRIVATE
@@ -249,6 +256,7 @@ add_executable(test-gemmini-exsia
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-reference.cpp
     ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
     ../ggml/src/ggml-gemmini/quants/act/quantize.cpp
+    ../ggml/src/ggml-gemmini/quants/act/block/block.cpp
     ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
     ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
     ../ggml/src/ggml-gemmini/quants/act/token/token.cpp)
@@ -299,6 +307,7 @@ add_executable(test-gemmini-exsia-writer
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
     ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
     ../ggml/src/ggml-gemmini/quants/act/quantize.cpp
+    ../ggml/src/ggml-gemmini/quants/act/block/block.cpp
     ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
     ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
     ../ggml/src/ggml-gemmini/quants/act/token/token.cpp)
@@ -453,17 +462,75 @@ if (EXISTS "${CMAKE_COMMAND}" AND EXISTS "${LLAMA_TEST_SOURCE_DIR}/CMakeLists.tx
         NAME test-gemmini-build-contract
         COMMAND ${CMAKE_COMMAND}
             -DTEST_CMAKE_COMMAND=${CMAKE_COMMAND}
+            -DTEST_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+            -DTEST_AR=${CMAKE_AR}
+            -DTEST_REAL_IM2P_ROOT=${LLAMA_TEST_SOURCE_DIR}/../IM2P.sim
             -DTEST_SOURCE_DIR=${LLAMA_TEST_SOURCE_DIR}
             -DTEST_BINARY_ROOT=${CMAKE_CURRENT_BINARY_DIR}/gemmini-build-contract
             -DTEST_GENERATOR=${CMAKE_GENERATOR}
             -DTEST_GENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM}
             -DTEST_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-build-contract.cmake)
+endif()
+
+if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
+    add_executable(test-gemmini-im2p-routing test-gemmini-im2p-routing.cpp)
+    target_link_libraries(test-gemmini-im2p-routing PRIVATE ggml-gemmini ggml-base)
+    target_compile_features(test-gemmini-im2p-routing PRIVATE cxx_std_17)
+    target_compile_definitions(test-gemmini-im2p-routing PRIVATE
+        GGML_GEMMINI_TESTING=1
+        GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+        GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
+        GGML_GEMMINI_ACTIVATION_QUANT=${_GGML_GEMMINI_ACTIVATION_QUANT_VALUE}
+        GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
+        GGML_GEMMINI_TEST_IM2P_DIM=${IM2P_DIM})
+    target_include_directories(test-gemmini-im2p-routing PRIVATE
+        ../ggml/src
+        ../ggml/src/ggml-gemmini
+        ../ggml/src/ggml-gemmini/quants
+        ${GEMMINI_SW_PATH}
+        ${GEMMINI_SW_PATH}/include)
+    add_test(NAME test-gemmini-im2p-routing
+        COMMAND $<TARGET_FILE:test-gemmini-im2p-routing>)
+
+    add_executable(test-gemmini-im2p-lifecycle
+        test-gemmini-im2p-lifecycle.cpp)
+    target_link_libraries(test-gemmini-im2p-lifecycle PRIVATE
+        ggml-gemmini ggml-base)
+    target_compile_features(test-gemmini-im2p-lifecycle PRIVATE cxx_std_17)
+    target_compile_options(test-gemmini-im2p-lifecycle PRIVATE -Werror)
+    add_dependencies(test-gemmini-im2p-lifecycle test-gemmini-im2p-routing)
+    target_compile_definitions(test-gemmini-im2p-lifecycle PRIVATE
+        GGML_GEMMINI_ROUTING_BINARY="$<TARGET_FILE:test-gemmini-im2p-routing>"
+        GGML_GEMMINI_TESTING=1
+        GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+        GGML_GEMMINI_ACTIVATION_QUANT=${_GGML_GEMMINI_ACTIVATION_QUANT_VALUE}
+        GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
+        GGML_GEMMINI_TEST_IM2P_DIM=${IM2P_DIM})
+    target_include_directories(test-gemmini-im2p-lifecycle PRIVATE
+        ../ggml/src
+        ../ggml/src/ggml-gemmini
+        ../ggml/src/ggml-gemmini/quants
+        ${GEMMINI_SW_PATH}
+        ${GEMMINI_SW_PATH}/include)
+    add_test(NAME test-gemmini-im2p-lifecycle
+        COMMAND $<TARGET_FILE:test-gemmini-im2p-lifecycle> --case all)
+    add_test(NAME test-gemmini-im2p-lifecycle-stage-failures
+        COMMAND $<TARGET_FILE:test-gemmini-im2p-lifecycle>
+            --case stage-failures)
+    add_test(NAME test-gemmini-im2p-lifecycle-invalid-reuse
+        COMMAND $<TARGET_FILE:test-gemmini-im2p-lifecycle>
+            --case invalid-reuse)
+
+    add_executable(test-gemmini-rmd-backend-gate
+        test-gemmini-rmd-backend-gate.cpp)
+    target_link_libraries(test-gemmini-rmd-backend-gate PRIVATE
+        ggml-gemmini ggml-base)
+    target_compile_features(test-gemmini-rmd-backend-gate PRIVATE cxx_std_17)
     add_test(
         NAME test-gemmini-rmd-backend-denylist
         COMMAND ${CMAKE_COMMAND}
-            -DTEST_SOURCE_DIR=${LLAMA_TEST_SOURCE_DIR}
-            -DTEST_BINARY_DIR=${CMAKE_BINARY_DIR}
+            -DTEST_GATE_EXECUTABLE=$<TARGET_FILE:test-gemmini-rmd-backend-gate>
             -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-rmd-backend-denylist.cmake)
 endif()
 
@@ -527,6 +594,7 @@ add_executable(gemmini-quant-dispatch-smoke
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
     ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
+    ../ggml/src/ggml-gemmini/quants/act/block/block.cpp
     ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
     ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
     ../ggml/src/ggml-gemmini/quants/act/token/token.cpp)

@@ -87,20 +87,34 @@ struct QuantizedActivationBuffer {
     }
 
     const uint8_t *raw_data() const {
-        return bytes ? bytes->data() : nullptr;
+      if (!bytes || (row_stride_bytes != 0 &&
+                     row_offset > std::numeric_limits<size_t>::max() /
+                                      row_stride_bytes)) {
+        return nullptr;
+      }
+      const size_t offset = row_offset * row_stride_bytes;
+      return offset <= bytes->size() ? bytes->data() + offset : nullptr;
     }
 
     size_t raw_size() const {
-        return bytes ? bytes->size() : 0;
+      if (!bytes || (row_stride_bytes != 0 &&
+                     row_offset > std::numeric_limits<size_t>::max() /
+                                      row_stride_bytes)) {
+        return 0;
+      }
+      const size_t offset = row_offset * row_stride_bytes;
+      return offset <= bytes->size() ? bytes->size() - offset : 0;
     }
 
     // Backward-compatible conversion for 8bit hardware path.
     // Only valid when bits == 8; returns nullptr otherwise.
     operator elem_t*() {
-        return (bytes && bits == 8) ? reinterpret_cast<elem_t*>(bytes->data()) : nullptr;
+      return bits == 8
+                 ? reinterpret_cast<elem_t *>(const_cast<uint8_t *>(raw_data()))
+                 : nullptr;
     }
     operator const elem_t*() const {
-        return (bytes && bits == 8) ? reinterpret_cast<const elem_t*>(bytes->data()) : nullptr;
+      return bits == 8 ? reinterpret_cast<const elem_t *>(raw_data()) : nullptr;
     }
 };
 
@@ -161,6 +175,12 @@ typedef struct ggml_gemmini_args_t {
         q8_hp2 = 5,
         q8_channel = 6,
         q8_channel_dense_sidecar = 7,
+        q4_h0 = 8,
+        q4_h1 = 9,
+        q4_hp1 = 10,
+        q16_h0 = 11,
+        q16_h1 = 12,
+        q16_hp1 = 13,
     };
 
     // tiled_matmul_auto args
@@ -271,6 +291,18 @@ typedef struct ggml_gemmini_args_t {
     const block_q8_hp2 *q8_hp2_blocks = nullptr;
     size_t q8_hp2_block_count = 0;
     size_t q8_hp2_blocks_per_row = 0;
+
+    // Native matched-width FULL-provider formats. Each block spans 32 K
+    // elements; Q4 callbacks unpack signed nibbles and Q16 callbacks preserve
+    // the int16 codes for the canonical typed provider ABI.
+    const block_q4_h0 *q4_h0_blocks = nullptr;
+    const block_q4_h1 *q4_h1_blocks = nullptr;
+    const block_q4_hp1 *q4_hp1_blocks = nullptr;
+    const block_q16_h0 *q16_h0_blocks = nullptr;
+    const block_q16_h1 *q16_h1_blocks = nullptr;
+    const block_q16_hp1 *q16_hp1_blocks = nullptr;
+    size_t native_block_count = 0;
+    size_t native_blocks_per_row = 0;
 
     // Q8_H1 weight fields (default path, no mode flag needed)
     const uint8_t  *c_b = nullptr;       // [J * blocks_per_row] per-block effective code
@@ -532,6 +564,48 @@ typedef struct ggml_gemmini_args_t {
         }
 
         return q8_h1_blocks + offset;
+    }
+
+    inline bool has_native_matched_width_contract() const {
+        if (J == 0 || K == 0 || K % 32 != 0 ||
+            native_blocks_per_row != K / 32 ||
+            J > std::numeric_limits<size_t>::max() / native_blocks_per_row ||
+            native_block_count != J * native_blocks_per_row) {
+            return false;
+        }
+
+        const void *blocks = nullptr;
+        size_t alignment = 1;
+        switch (weight_format) {
+        case im2p_weight_format_t::q4_h0:
+            blocks = q4_h0_blocks;
+            alignment = alignof(block_q4_h0);
+            break;
+        case im2p_weight_format_t::q4_h1:
+            blocks = q4_h1_blocks;
+            alignment = alignof(block_q4_h1);
+            break;
+        case im2p_weight_format_t::q4_hp1:
+            blocks = q4_hp1_blocks;
+            alignment = alignof(block_q4_hp1);
+            break;
+        case im2p_weight_format_t::q16_h0:
+            blocks = q16_h0_blocks;
+            alignment = alignof(block_q16_h0);
+            break;
+        case im2p_weight_format_t::q16_h1:
+            blocks = q16_h1_blocks;
+            alignment = alignof(block_q16_h1);
+            break;
+        case im2p_weight_format_t::q16_hp1:
+            blocks = q16_hp1_blocks;
+            alignment = alignof(block_q16_hp1);
+            break;
+        default:
+            return false;
+        }
+        return blocks != nullptr &&
+               reinterpret_cast<uintptr_t>(blocks) % alignment == 0;
     }
 
     inline bool has_q8_h1_im2p_contract() const {

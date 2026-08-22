@@ -1,11 +1,12 @@
 #include "dispatch.hpp"
+#include "../../ggml-gemmini-args.h"
+#include "../../ggml-gemmini-config.hpp"
+#include "block/block.hpp"
 #include "exsia/exsia.hpp"
+#include "gemmini/log.hpp"
 #include "stripe/stripe.hpp"
 #include "tensor/tensor.hpp"
 #include "token/token.hpp"
-#include "../../ggml-gemmini-args.h"
-#include "../../ggml-gemmini-config.hpp"
-#include "gemmini/log.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -170,6 +171,14 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
         }
         return true;
     }
+    case ggml::gemmini::config::ActivationQuantAlgo::BLOCK: {
+      args.act_quant.storage().emplace<block::Meta>();
+      if (!block::quantize(src, args)) {
+        reset_quantize_failure(args);
+        return false;
+      }
+      return true;
+    }
     case ggml::gemmini::config::ActivationQuantAlgo::STRIPE:
     {
         args.act_quant.storage().emplace<stripe::Meta>();
@@ -201,6 +210,9 @@ bool dequantize_activation(float *dst,
             return false;
         }
         return token::dequantize_activation(dst, dst_row_stride, dst_col_stride, rows, cols, args);
+    case ggml::gemmini::config::ActivationQuantAlgo::BLOCK:
+      return block::dequantize_activation(dst, dst_row_stride, dst_col_stride,
+                                          rows, cols, args);
     case ggml::gemmini::config::ActivationQuantAlgo::STRIPE:
         return stripe::dequantize_activation(dst, dst_row_stride, dst_col_stride, rows, cols, args);
     }

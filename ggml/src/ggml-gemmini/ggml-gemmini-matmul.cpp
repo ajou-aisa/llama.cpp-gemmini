@@ -375,6 +375,7 @@ bool append_pipeline_stripe_summary_jsonl(const std::string & json_record) {
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <iomanip>
@@ -388,6 +389,62 @@ bool append_pipeline_stripe_summary_jsonl(const std::string & json_record) {
 #include <utility>
 
 namespace ggml::gemmini {
+
+namespace test_detail {
+#if defined(GGML_GEMMINI_TESTING)
+struct AtomicMatmulTestCounters {
+    std::atomic<uint64_t> execution_constructions{0};
+    std::atomic<uint64_t> allocation_attempts{0};
+    std::atomic<uint64_t> dense_dispatches{0};
+    std::atomic<uint64_t> residual_dispatches{0};
+    std::atomic<uint64_t> hardware_dispatches{0};
+    std::atomic<uint64_t> fallback_dispatches{0};
+};
+
+AtomicMatmulTestCounters counters;
+
+void increment(std::atomic<uint64_t> & counter) {
+    counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+void observe_execution_construction() { increment(counters.execution_constructions); }
+void observe_allocation_attempt() { increment(counters.allocation_attempts); }
+void observe_dense_dispatch() { increment(counters.dense_dispatches); }
+void observe_residual_dispatch() { increment(counters.residual_dispatches); }
+void observe_backend_dispatch(bool fallback) {
+    increment(fallback ? counters.fallback_dispatches : counters.hardware_dispatches);
+}
+#else
+void observe_execution_construction() {}
+void observe_allocation_attempt() {}
+void observe_dense_dispatch() {}
+void observe_residual_dispatch() {}
+void observe_backend_dispatch(bool) {}
+#endif
+}
+
+#if defined(GGML_GEMMINI_TESTING)
+void test_reset_matmul_counters() {
+    test_detail::counters.execution_constructions.store(0, std::memory_order_relaxed);
+    test_detail::counters.allocation_attempts.store(0, std::memory_order_relaxed);
+    test_detail::counters.dense_dispatches.store(0, std::memory_order_relaxed);
+    test_detail::counters.residual_dispatches.store(0, std::memory_order_relaxed);
+    test_detail::counters.hardware_dispatches.store(0, std::memory_order_relaxed);
+    test_detail::counters.fallback_dispatches.store(0, std::memory_order_relaxed);
+}
+
+MatmulTestCounters test_matmul_counters() {
+    return {
+        test_detail::counters.execution_constructions.load(std::memory_order_relaxed),
+        test_detail::counters.allocation_attempts.load(std::memory_order_relaxed),
+        test_detail::counters.dense_dispatches.load(std::memory_order_relaxed),
+        test_detail::counters.residual_dispatches.load(std::memory_order_relaxed),
+        test_detail::counters.hardware_dispatches.load(std::memory_order_relaxed),
+        test_detail::counters.fallback_dispatches.load(std::memory_order_relaxed),
+    };
+}
+#endif
+
 namespace {
 
 bool checked_offset(size_t row, size_t stride, size_t & offset) {
@@ -475,11 +532,15 @@ void execute_dense(ggml_gemmini_args_t &args) {
         if (args.A_fp32 == nullptr || args.B_fp32 == nullptr || args.f_out == nullptr) {
             return;
         }
+        test_detail::observe_dense_dispatch();
+        test_detail::observe_backend_dispatch(true);
         matmul_cpu_fp(false, true, args.I, args.J, args.K,
                       args.A_fp32, args.B_fp32, nullptr, args.f_out,
                       args.sA, args.sB, args.col_stride_f_out, args.stride_f_out);
         return;
     }
+    test_detail::observe_dense_dispatch();
+    test_detail::observe_backend_dispatch(args.tiled_matmul_type == CPU);
     if (uses_baseline_channel_route(args)) {
         tiled_matmul_auto_baseline(&args, baseline_activation_for(args), baseline_weight_quant_t::CHANNEL);
     } else if (args.weight_i8_scale_active) {
@@ -1081,6 +1142,7 @@ MatMulResult MatMul::run_full() {
     }
     std::vector<float> staged_output;
     try {
+        test_detail::observe_allocation_attempt();
         staged_output.assign(args().f_out, args().f_out + output_span);
     } catch (const std::bad_alloc &) {
         return { MatMulStatus::invalid_arguments, MatMulCapability::unsupported };
@@ -1095,7 +1157,11 @@ MatMulResult MatMul::run_full() {
             residual_status = __builtin_add_overflow(
                 payload->row_begin, payload->row_count, &row_end)
                 ? rmd::RmdStatus::invalid_arguments
-                : residual::execute_direct_stripe(args(), *payload, correction);
+                : ([&] {
+                    test_detail::observe_residual_dispatch();
+                    test_detail::observe_backend_dispatch(true);
+                    return residual::execute_direct_stripe(args(), *payload, correction);
+                })();
             if (residual_status == rmd::RmdStatus::success) {
                 residual_status = rmd::merge_rmd_correction_to(
                     args(), staged_output.data(), payload->row_begin, row_end, correction);
@@ -1107,6 +1173,8 @@ MatMulResult MatMul::run_full() {
             if (packet == nullptr) continue;
             rmd::CompressedOutput compressed;
             std::vector<rmd::OutputValue> correction;
+            test_detail::observe_residual_dispatch();
+            test_detail::observe_backend_dispatch(false);
             residual_status = rmd::execute_rmd_stripe_ws(args(), *packet, compressed);
             if (residual_status == rmd::RmdStatus::success) {
                 residual_status = rmd::compose_rmd_output(*packet, compressed, correction);
@@ -1275,6 +1343,7 @@ size_t MatmulStripeInput::residual_count() const {
 
 MatmulExecution::MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options)
     : total_rows_(args.I), facade_(std::move(args)), options_(options) {
+    test_detail::observe_execution_construction();
     state_ = MatmulExecutionState::prepared;
     facade_.args().residual_route = residual_route_for(options_.rmd_backend);
     if (!residual_backend_available(options_.rmd_backend)) {
@@ -1285,6 +1354,7 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options
     if (options_.mode == MatmulInvocationMode::stripe_pipeline) {
         ggml_gemmini_args_t staged_args = facade_.args();
         staged_args.act_quant.reset();
+        test_detail::observe_allocation_attempt();
         staged_facade_ = std::make_unique<MatMul>(std::move(staged_args));
     }
     if (options_.dense_threads > 1) {
@@ -1295,12 +1365,6 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options
     }
     if (options_.mode != MatmulInvocationMode::full && options_.job_capacity == 0) {
         status_ = make_status(MatmulStatusCode::invalid_argument, "job capacity must be nonzero");
-        state_ = MatmulExecutionState::failed;
-        return;
-    }
-    if (options_.mode == MatmulInvocationMode::stripe_pipeline && total_rows_ <= 1) {
-        status_ = make_status(MatmulStatusCode::unsupported_invocation,
-                              "stripe pipeline requires more than one row");
         state_ = MatmulExecutionState::failed;
         return;
     }
@@ -1315,8 +1379,7 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options
     const bool defer_pipeline_route_validation =
         options_.mode == MatmulInvocationMode::stripe_pipeline &&
         std::holds_alternative<quants::act::NoneMeta>(facade_.args().act_quant.storage());
-    if ((options_.mode == MatmulInvocationMode::stripe_sequential ||
-         options_.mode == MatmulInvocationMode::stripe_pipeline) &&
+    if (options_.mode == MatmulInvocationMode::stripe_pipeline &&
         !defer_pipeline_route_validation) {
         const MatMulStatus status = facade_.begin_stripes();
         status_ = to_public_status(
@@ -1344,6 +1407,7 @@ MatmulExecution::MatmulExecution(MatmulExecution && other) noexcept
 
 MatmulExecution::MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions options)
     : total_rows_(args != nullptr ? args->I : 0), facade_(args), options_(options) {
+    test_detail::observe_execution_construction();
     state_ = MatmulExecutionState::prepared;
     if (args == nullptr) {
         status_ = make_status(MatmulStatusCode::invalid_argument, "null execution args");
@@ -1359,6 +1423,7 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions optio
     if (options_.mode == MatmulInvocationMode::stripe_pipeline) {
         ggml_gemmini_args_t staged_args = *args;
         staged_args.act_quant.reset();
+        test_detail::observe_allocation_attempt();
         staged_facade_ = std::make_unique<MatMul>(std::move(staged_args));
     }
     if (options_.dense_threads > 1) {
@@ -1369,12 +1434,6 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions optio
     }
     if (options_.mode != MatmulInvocationMode::full && options_.job_capacity == 0) {
         status_ = make_status(MatmulStatusCode::invalid_argument, "job capacity must be nonzero");
-        state_ = MatmulExecutionState::failed;
-        return;
-    }
-    if (options_.mode == MatmulInvocationMode::stripe_pipeline && total_rows_ <= 1) {
-        status_ = make_status(MatmulStatusCode::unsupported_invocation,
-                              "stripe pipeline requires more than one row");
         state_ = MatmulExecutionState::failed;
         return;
     }
@@ -1389,8 +1448,7 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions optio
     const bool defer_pipeline_route_validation =
         options_.mode == MatmulInvocationMode::stripe_pipeline &&
         std::holds_alternative<quants::act::NoneMeta>(facade_.args().act_quant.storage());
-    if ((options_.mode == MatmulInvocationMode::stripe_sequential ||
-         options_.mode == MatmulInvocationMode::stripe_pipeline) &&
+    if (options_.mode == MatmulInvocationMode::stripe_pipeline &&
         !defer_pipeline_route_validation) {
         const MatMulStatus status = facade_.begin_stripes();
         status_ = to_public_status(
@@ -2282,6 +2340,7 @@ MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput in
     residual::DirectStripePayloadHandle direct;
     rmd::StripePacketHandle packet;
     try {
+        test_detail::observe_allocation_attempt();
         if (execution.options_.rmd_backend == RmdBackend::cpu_direct) {
             direct = residual::slice_direct_payloads(
                 quants::activation_direct_residuals(execution.facade_.args()),
@@ -2430,6 +2489,53 @@ MatmulStatus execute_dense_stripe(MatmulStripeJob & job) {
     return result;
 }
 
+MatmulStatus accept_external_dense_completion(MatmulStripeJob &job) {
+  if (job.job_mutex_ == nullptr) {
+    return invalid_state("dense state unavailable");
+  }
+  {
+    std::lock_guard<std::mutex> lock(*job.job_mutex_);
+    if (job.execution_ == nullptr || !job.captured_ || job.finalized_ ||
+        !job.status_ || job.dense_state_ != MatmulDenseState::idle) {
+      return invalid_state(
+          "external dense completion requires captured Dense idle state");
+    }
+    MatMul &facade = job.execution_->facade_;
+    const MatMulStripe stripe{job.input_.row_begin(), job.input_.row_end()};
+    MatMulStatus accepted = MatMulStatus::success;
+    if (facade.state_ != MatMulState::accepting_stripes) {
+      accepted = MatMulStatus::invalid_state;
+    } else if (stripe.row_begin >= stripe.row_end ||
+               stripe.row_end > facade.args().I) {
+      accepted = MatMulStatus::malformed_stripe;
+    } else if (facade.has_stripes_ &&
+               facade.last_row_begin_ == stripe.row_begin &&
+               facade.last_row_end_ == stripe.row_end) {
+      accepted = MatMulStatus::duplicate_stripe;
+    } else if (facade.has_stripes_ && stripe.row_begin < facade.last_row_end_) {
+      accepted = MatMulStatus::overlapping_stripe;
+    }
+    if (accepted != MatMulStatus::success) {
+      return to_public_status(accepted, MatMulCapability::supported,
+                              &facade.args());
+    }
+    if (!facade.has_stripes_) {
+      facade.first_row_ = stripe.row_begin;
+    }
+    facade.last_row_begin_ = stripe.row_begin;
+    facade.last_row_end_ = stripe.row_end;
+    facade.covered_rows_ += stripe.row_end - stripe.row_begin;
+    facade.has_stripes_ = true;
+    job.dense_state_ = MatmulDenseState::complete;
+#if LOG_CYCLE
+    job.metrics_.telemetry_dense_start = cycle::read();
+    job.metrics_.telemetry_dense_end = job.metrics_.telemetry_dense_start;
+#endif
+  }
+  job.lifecycle_condition_.notify_all();
+  return {};
+}
+
 // Executes the stripe's RMD packet on the NPU stream and produces the canonical
 // block-scaled INT64 compressed output.
 MatmulStatus execute_rmd_stripe(MatmulStripeJob & job) {
@@ -2477,6 +2583,8 @@ MatmulStatus execute_rmd_stripe(MatmulStripeJob & job) {
 #else
     constexpr uint64_t backend_start_tick = 0;
 #endif
+    test_detail::observe_residual_dispatch();
+    test_detail::observe_backend_dispatch(direct != nullptr);
     const rmd::RmdStatus status = direct != nullptr
         ? residual::execute_direct_stripe(
               job.execution_->facade_.args(), *direct, direct_correction, &direct_metrics)

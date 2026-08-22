@@ -1,9 +1,11 @@
+#define GGML_GEMMINI_TESTING 1
 #define GGML_GEMMINI_TEST_OBSERVER 1
 
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-matmul.hpp"
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -30,7 +32,17 @@ ggml_gemmini_args_t make_args(
     args.I = 3;
     args.J = 2;
     args.K = 2;
-        args.B = weights.data();
+    if (!args.A.allocate(args.I, args.K, 8)) {
+      std::abort();
+    }
+    for (size_t row = 0; row < args.I; ++row) {
+      for (size_t column = 0; column < args.K; ++column) {
+        if (!args.A.set(row, column, activation[row * args.K + column])) {
+          std::abort();
+        }
+      }
+    }
+    args.B = weights.data();
     args.sA = args.K;
     args.sB = args.J;
     args.f_out = output.data();
@@ -48,11 +60,38 @@ bool same_output(const std::vector<float> & left, const std::vector<float> & rig
         std::memcmp(left.data(), right.data(), left.size() * sizeof(float)) == 0;
 }
 
+bool counters_zero(const MatmulTestCounters & counters) {
+    return counters.execution_constructions == 0 && counters.allocation_attempts == 0 &&
+        counters.dense_dispatches == 0 && counters.residual_dispatches == 0 &&
+        counters.hardware_dispatches == 0 && counters.fallback_dispatches == 0;
+}
+
+bool test_removed_sequential_rejects_before_work() {
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    const std::vector<float> environment_sentinel(6, 73.0f);
+    std::vector<float> environment_output = environment_sentinel;
+    auto environment_args = make_args(activation, weights, environment_output);
+
+    unsetenv("GEMMINI_MATMUL_MODE");
+    test_reset_matmul_counters();
+    setenv("GEMMINI_MATMUL_MODE", "STRIPE_SEQUENTIAL", 1);
+    const MatmulStatus environment_status = matmul(environment_args);
+    const MatmulTestCounters environment_counters = test_matmul_counters();
+    unsetenv("GEMMINI_MATMUL_MODE");
+
+    return expect(environment_status.code == MatmulStatusCode::invalid_argument,
+                  "removed sequential mode has typed rejection") &&
+        expect(environment_output == environment_sentinel,
+               "removed sequential mode preserves nonzero output sentinel") &&
+        expect(counters_zero(environment_counters),
+               "removed sequential mode performs zero construction/allocation/dispatch");
+}
+
 bool test_output_parity() {
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
     std::vector<float> full_output(6, 0.0f);
-    std::vector<float> sequential_output(6, 0.0f);
     std::vector<float> pipeline_output(6, 0.0f);
 
     auto full_args = make_args(activation, weights, full_output);
@@ -60,13 +99,6 @@ bool test_output_parity() {
     full_options.mode = MatmulInvocationMode::full;
     full_options.rmd_backend = RmdBackend::cpu_direct;
     const MatmulStatus full = matmul(full_args, full_options);
-
-    auto sequential_args = make_args(activation, weights, sequential_output);
-    MatmulOptions sequential_options{};
-    sequential_options.mode = MatmulInvocationMode::stripe_sequential;
-    sequential_options.stripe_rows = 1;
-    sequential_options.rmd_backend = RmdBackend::cpu_direct;
-    const MatmulStatus sequential = matmul(sequential_args, sequential_options);
 
     auto pipeline_args = make_args(activation, weights, pipeline_output);
     MatmulOptions pipeline_options{};
@@ -93,10 +125,68 @@ bool test_output_parity() {
     const MatmulStatus pipeline = finish_execution(execution);
 
     return expect(full.ok(), "FULL succeeds") &&
-        expect(sequential.ok(), "STRIPE_SEQUENTIAL succeeds") &&
         expect(accepted && collected.ok() && pipeline.ok(), "PIPELINE succeeds") &&
-        expect(same_output(full_output, sequential_output), "FULL/STRIPE_SEQUENTIAL parity") &&
         expect(same_output(full_output, pipeline_output), "FULL/PIPELINE parity");
+}
+
+bool test_single_row_pipeline() {
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> full_output(2, 0.0f);
+    std::vector<float> pointer_output(2, 0.0f);
+    std::vector<float> value_output(2, 0.0f);
+
+    auto full_args = make_args(activation, weights, full_output);
+    full_args.I = 1;
+    MatmulOptions full_options{};
+    full_options.mode = MatmulInvocationMode::full;
+    full_options.rmd_backend = RmdBackend::cpu_direct;
+    const MatmulStatus full = matmul(full_args, full_options);
+
+    auto pipeline_args = make_args(activation, weights, pointer_output);
+    pipeline_args.I = 1;
+    MatmulOptions pipeline_options{};
+    pipeline_options.mode = MatmulInvocationMode::stripe_pipeline;
+    pipeline_options.job_capacity = 1;
+    pipeline_options.rmd_backend = RmdBackend::cpu_direct;
+    auto execution = prepare_execution(&pipeline_args, pipeline_options);
+    MatmulStripeCollector collector(1);
+    if (!expect(execution.status().ok() && collector.start(execution),
+                "single-row pipeline starts")) {
+        return false;
+    }
+    quants::act::exsia::StripeReadyEvent only{};
+    only.stripe_id = 0;
+    only.row_end = 1;
+    const auto * sink = collector.sink();
+    const bool accepted = sink->on_ready(sink->user_data, only);
+    const MatmulStatus collected = collector.finish();
+    const MatmulStatus pipeline = finish_execution(execution);
+
+    auto value_args = make_args(activation, weights, value_output);
+    value_args.I = 1;
+    auto value_execution = prepare_execution(
+        static_cast<const ggml_gemmini_args_t &>(value_args), pipeline_options);
+    MatmulStripeCollector value_collector(1);
+    if (!expect(value_execution.status().ok() &&
+                    value_collector.start(value_execution),
+                "single-row by-value pipeline starts")) {
+        return false;
+    }
+    const auto * value_sink = value_collector.sink();
+    const bool value_accepted =
+        value_sink->on_ready(value_sink->user_data, only);
+    const MatmulStatus value_collected = value_collector.finish();
+    const MatmulStatus value_pipeline = finish_execution(value_execution);
+
+    return expect(full.ok(), "single-row FULL succeeds") &&
+        expect(accepted && collected.ok() && pipeline.ok(),
+               "single-row pointer PIPELINE succeeds") &&
+        expect(value_accepted && value_collected.ok() && value_pipeline.ok(),
+               "single-row by-value PIPELINE succeeds") &&
+        expect(same_output(full_output, pointer_output) &&
+                   same_output(full_output, value_output),
+               "single-row FULL/pointer/value PIPELINE parity");
 }
 
 residual::DirectStripePayloadHandle make_direct_payload(
@@ -115,10 +205,41 @@ void install_direct_payloads(ggml_gemmini_args_t & args) {
     };
 }
 
+bool test_counter_hooks_connected() {
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> fallback_output(6, 0.0f);
+    auto fallback_args = make_args(activation, weights, fallback_output);
+    install_direct_payloads(fallback_args);
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::full;
+    options.rmd_backend = RmdBackend::cpu_direct;
+
+    test_reset_matmul_counters();
+    const MatmulStatus fallback_status = matmul(fallback_args, options);
+    const MatmulTestCounters fallback = test_matmul_counters();
+
+    std::vector<float> hardware_output(6, 0.0f);
+    auto hardware_args = make_args(activation, weights, hardware_output);
+    hardware_args.tiled_matmul_type = static_cast<tiled_matmul_type_t>(1);
+    test_reset_matmul_counters();
+    const MatmulStatus hardware_status = matmul(hardware_args, options);
+    const MatmulTestCounters hardware = test_matmul_counters();
+
+    return expect(fallback_status.ok(), "counter fallback control succeeds") &&
+        expect(fallback.execution_constructions > 0 && fallback.allocation_attempts > 0 &&
+                   fallback.dense_dispatches > 0 && fallback.residual_dispatches > 0 &&
+                   fallback.fallback_dispatches > 0,
+               "construction/allocation/dense/residual/fallback hooks observe real work") &&
+        expect(hardware_status.ok() && hardware.dense_dispatches > 0 &&
+                   hardware.hardware_dispatches > 0,
+               "hardware hook observes real dispatch");
+}
+
 bool test_cpu_direct_lifecycle_parity() {
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
-    std::vector<float> full_output(6, 0.0f), sequential_output(6, 0.0f), pipeline_output(6, 0.0f);
+    std::vector<float> full_output(6, 0.0f), pipeline_output(6, 0.0f);
     MatmulOptions options{};
     options.rmd_backend = RmdBackend::cpu_direct;
 
@@ -130,12 +251,6 @@ bool test_cpu_direct_lifecycle_parity() {
     const std::vector<float> first_full_output = full_output;
     std::fill(full_output.begin(), full_output.end(), 0.0f);
     const MatmulStatus repeated_full = matmul(full_args, options);
-
-    auto sequential_args = make_args(activation, weights, sequential_output);
-    install_direct_payloads(sequential_args);
-    options.mode = MatmulInvocationMode::stripe_sequential;
-    options.stripe_rows = 1;
-    const MatmulStatus sequential = matmul(sequential_args, options);
 
     auto pipeline_args = make_args(activation, weights, pipeline_output);
     options.mode = MatmulInvocationMode::stripe_pipeline;
@@ -154,16 +269,15 @@ bool test_cpu_direct_lifecycle_parity() {
     const MatmulStatus collected = collector.finish();
     const MatmulStatus pipeline = finish_execution(execution);
 
-    return expect(full.ok() && repeated_full.ok() && sequential.ok() && accepted &&
-                      collected.ok() && pipeline.ok(),
-                  "direct backend succeeds in FULL/sequential/pipeline and repeated FULL") &&
+    return expect(full.ok() && repeated_full.ok() && accepted && collected.ok() && pipeline.ok(),
+                  "direct backend succeeds in FULL/pipeline and repeated FULL") &&
         expect(same_output(first_full_output, full_output),
                "repeated direct invocation has no stale residual state") &&
-        expect(same_output(full_output, sequential_output) && same_output(full_output, pipeline_output),
-               "direct backend final-output parity") &&
+        expect(same_output(full_output, pipeline_output),
+               "direct backend FULL/pipeline final-output parity") &&
         expect(full_output[0] != 5.0f || full_output[1] != 5.0f,
                "direct residual is merged after dense output") &&
-        expect(full_args.tiled_matmul_type == main_route && sequential_args.tiled_matmul_type == main_route &&
+        expect(full_args.tiled_matmul_type == main_route &&
                    pipeline_args.tiled_matmul_type == main_route,
                "backend selector preserves the main matmul route");
 }
@@ -243,20 +357,18 @@ bool test_bad_routes() {
 
     auto unsupported_args = make_args(activation, weights, output);
     unsupported_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h0;
-    MatmulOptions stripe_options{};
-    stripe_options.mode = MatmulInvocationMode::stripe_sequential;
-    stripe_options.stripe_rows = 1;
-    stripe_options.rmd_backend = RmdBackend::cpu_direct;
-    const MatmulStatus unsupported = matmul(unsupported_args, stripe_options);
+    const MatmulStatus unsupported = matmul(unsupported_args, full_options);
 
     MatmulOptions invalid_options{};
-    invalid_options.mode = MatmulInvocationMode::stripe_sequential;
+    invalid_options.mode = MatmulInvocationMode::stripe_pipeline;
     invalid_options.stripe_rows = 0;
     const MatmulStatus invalid = matmul(unsupported_args, invalid_options);
 
     return expect(malformed.code == MatmulStatusCode::invalid_contract, "malformed route rejected") &&
-        expect(unsupported.code == MatmulStatusCode::unsupported_route, "unsupported route rejected") &&
-        expect(invalid.code == MatmulStatusCode::invalid_argument, "invalid options rejected");
+        expect(unsupported.code == MatmulStatusCode::unsupported_route,
+               "unsupported route rejected") &&
+        expect(invalid.code == MatmulStatusCode::invalid_argument,
+               "invalid options rejected");
 }
 
 bool test_cancel_and_failure() {
@@ -347,14 +459,24 @@ int main(int argc, char ** argv) {
 #ifdef GGML_GEMMINI_PIPELINE_WRITER_TEST_ONLY
     return 1;
 #else
-    if (!test_output_parity() || !test_cpu_direct_lifecycle_parity() ||
+    if (argc == 2 && std::string(argv[1]) == "--probe-removed-sequential") {
+        const bool ok = test_removed_sequential_rejects_before_work();
+        if (ok) {
+            std::puts("PASS: removed sequential mode rejected; counters zero; sentinel preserved");
+        }
+        return ok ? 0 : 1;
+    }
+    if (!test_removed_sequential_rejects_before_work() ||
+        !test_output_parity() || !test_single_row_pipeline() ||
+        !test_counter_hooks_connected() ||
+        !test_cpu_direct_lifecycle_parity() ||
         !test_merge_destination_override() ||
         !test_cpu_direct_failure_commits_no_partial_correction() ||
         !test_ws_preflight_is_atomic_on_host() ||
         !test_bad_routes() || !test_cancel_and_failure()) {
         return 1;
     }
-    std::puts("PASS: FULL/STRIPE_SEQUENTIAL/PIPELINE parity; malformed/unsupported/cancel/failure coverage");
+    std::puts("PASS: public mode contract/parity; malformed/unsupported/cancel/failure coverage");
     return 0;
 #endif
 }

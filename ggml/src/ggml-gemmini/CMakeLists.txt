@@ -58,6 +58,7 @@ ggml_add_backend_library(ggml-gemmini
                           ggml-gemmini-q8-h1-artifact-reader.cpp
                             quants/act/dispatch.cpp
                             quants/act/quantize.cpp
+                            quants/act/block/block.cpp
                             quants/act/exsia/exsia.cpp
                          quants/act/tensor/tensor.cpp
                          quants/act/stripe/stripe.cpp
@@ -81,6 +82,9 @@ target_compile_features(ggml-gemmini PRIVATE cxx_std_17)
 target_compile_definitions(ggml-gemmini PRIVATE
   GGML_GEMMINI_MATMUL_IMPLEMENTATION
   GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE})
+if (LLAMA_BUILD_TESTS AND NOT GGML_BACKEND_DL)
+  target_compile_definitions(ggml-gemmini PUBLIC GGML_GEMMINI_TESTING=1)
+endif()
 
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
   target_compile_options(ggml-gemmini PRIVATE ${GEMMINI_COMMON_FLAGS} ${GEMMINI_RISCV_FLAGS})
@@ -131,6 +135,54 @@ target_include_directories(ggml-gemmini PRIVATE
 target_link_libraries(ggml-gemmini PRIVATE
   ggml-gemmini-utils
 )
+
+if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
+  foreach(_IM2P_REQUIRED_VAR IN ITEMS
+          IM2P_SIM_ROOT GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE GGML_GEMMINI_IM2P_SIM_ARCHIVE)
+    if (NOT DEFINED ${_IM2P_REQUIRED_VAR} OR "${${_IM2P_REQUIRED_VAR}}" STREQUAL "")
+      message(FATAL_ERROR "Missing validated IM2P build-contract variable ${_IM2P_REQUIRED_VAR}")
+    endif()
+  endforeach()
+
+  set(_GGML_GEMMINI_IM2P_LINK_FRONTEND_ARCHIVE
+    "${GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE}")
+  if (LLAMA_BUILD_TESTS AND NOT GGML_BACKEND_DL)
+    get_filename_component(_GGML_GEMMINI_IM2P_FRONTEND_DIR
+      "${GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE}" DIRECTORY)
+    set(_GGML_GEMMINI_IM2P_TEST_FRONTEND_ARCHIVE
+      "${_GGML_GEMMINI_IM2P_FRONTEND_DIR}/libim2p_gemmini_frontend_testing.a")
+    if (NOT EXISTS "${_GGML_GEMMINI_IM2P_TEST_FRONTEND_ARCHIVE}")
+      message(FATAL_ERROR
+        "Missing IM2P frontend test archive: ${_GGML_GEMMINI_IM2P_TEST_FRONTEND_ARCHIVE}")
+    endif()
+    set(_GGML_GEMMINI_IM2P_LINK_FRONTEND_ARCHIVE
+      "${_GGML_GEMMINI_IM2P_TEST_FRONTEND_ARCHIVE}")
+  endif()
+
+  add_library(ggml-gemmini-im2p-frontend STATIC IMPORTED GLOBAL)
+  set_target_properties(ggml-gemmini-im2p-frontend PROPERTIES
+    IMPORTED_LOCATION "${_GGML_GEMMINI_IM2P_LINK_FRONTEND_ARCHIVE}")
+  add_library(ggml-gemmini-im2p-simulator STATIC IMPORTED GLOBAL)
+  set_target_properties(ggml-gemmini-im2p-simulator PROPERTIES
+    IMPORTED_LOCATION "${GGML_GEMMINI_IM2P_SIM_ARCHIVE}")
+
+  find_package(Threads REQUIRED)
+  target_sources(ggml-gemmini PRIVATE ggml-gemmini-im2p.cpp)
+  if (LLAMA_BUILD_TESTS AND NOT GGML_BACKEND_DL)
+    target_include_directories(ggml-gemmini PRIVATE
+      "${IM2P_SIM_ROOT}/frontend/tests")
+  endif()
+  target_include_directories(ggml-gemmini PRIVATE
+    "${IM2P_SIM_ROOT}/frontend/include"
+    "${IM2P_SIM_ROOT}/sim/include")
+  # Static-library order is intentional: the frontend consumes the C ABI from
+  # the simulator archive, and neither archive is present in HARDWARE builds.
+  target_link_libraries(ggml-gemmini PRIVATE
+    ggml-gemmini-im2p-frontend
+    ggml-gemmini-im2p-simulator
+    Threads::Threads
+    ${CMAKE_DL_LIBS})
+endif()
 
 if (GGML_GEMMINI_ENABLE_OPENMP)
   find_package(OpenMP)

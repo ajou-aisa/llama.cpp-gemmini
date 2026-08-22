@@ -1148,15 +1148,17 @@ bool test_rmd_lane_partition() {
     for (size_t k = 0; k < logical_k; ++k) {
         expected += static_cast<int64_t>(residuals[k]) * weights.qs[k];
     }
+    constexpr size_t expected_k_tiles = (logical_k + DIM - 1) / DIM;
     return check(actual == std::vector<rmd::OutputValue>{expected},
-                 "RMD lane partition preserves exact output") &&
-        check(metrics.matmul_call_count == 2,
-              "RMD lane partition preserves B-load count") &&
-        check(metrics.active_lanes == 3 && metrics.lane_group_count == 2,
-              "RMD lane partition groups overlapping and separates disjoint lanes") &&
-        check(metrics.baseline_stacked_i_tile_count == 6 &&
-                  metrics.stacked_i_tile_count == 3,
-              "RMD lane partition halves padded I-by-K tiles");
+                  "RMD lane partition preserves exact output") &&
+        check(metrics.matmul_call_count == expected_k_tiles,
+               "RMD lane partition preserves DIM-aware B-load count") &&
+        check(metrics.active_lanes == 3 &&
+                  metrics.lane_group_count == expected_k_tiles,
+               "RMD lane partition uses the minimal DIM-aware lane groups") &&
+        check(metrics.baseline_stacked_i_tile_count == 3 * expected_k_tiles &&
+                   metrics.stacked_i_tile_count == 3,
+               "RMD lane partition preserves optimal stacked I-by-K tiles");
 }
 
 bool test_rmd_weight_gather() {

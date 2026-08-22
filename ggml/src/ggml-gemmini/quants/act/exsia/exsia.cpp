@@ -1672,9 +1672,9 @@ namespace ggml::gemmini::quants::act::exsia
                 event.mask_assembly_end_ns = profile->mask_assembly.end_ns;
                 event.exponent_reduction_start_ns = profile->exponent_reduction.start_ns;
                 event.exponent_reduction_end_ns = profile->exponent_reduction.end_ns;
-                event.folding_commit_ns = slot.folding_commit_ns;
             }
 #endif
+            event.folding_commit_ns = slot.folding_commit_ns;
             const bool accepted = sink->on_ready(
                 sink->user_data,
                 event);

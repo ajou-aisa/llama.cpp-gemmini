@@ -30,11 +30,20 @@ namespace ggml::gemmini::quants::act::exsia::detail
         if (delta_theta > 0)
         {
             const int shift = std::min<int>(delta_theta, 31);
-            const int64_t shifted = static_cast<int64_t>(q) << shift;
-            return static_cast<int32_t>(std::clamp<int64_t>(
-                shifted,
-                std::numeric_limits<int32_t>::min(),
-                std::numeric_limits<int32_t>::max()));
+            const bool negative = q < 0;
+            const uint64_t magnitude =
+                negative ? static_cast<uint64_t>(-static_cast<int64_t>(q))
+                         : static_cast<uint64_t>(q);
+            const uint64_t shifted = magnitude << shift;
+            const uint64_t negative_limit = uint64_t{1} << 31;
+            if (!negative)
+              return shifted > static_cast<uint64_t>(
+                                   std::numeric_limits<int32_t>::max())
+                         ? std::numeric_limits<int32_t>::max()
+                         : static_cast<int32_t>(shifted);
+            if (shifted >= negative_limit)
+              return std::numeric_limits<int32_t>::min();
+            return -static_cast<int32_t>(shifted);
         }
 
         if (delta_theta < 0)

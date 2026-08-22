@@ -221,13 +221,14 @@ else()
 endif()
 
 set(GGML_GEMMINI_ACTIVATION_QUANT "EXSIA" CACHE STRING "Gemmini activation quant type")
-set_property(CACHE GGML_GEMMINI_ACTIVATION_QUANT PROPERTY STRINGS EXSIA TENSOR TOKEN STRIPE)
+set_property(CACHE GGML_GEMMINI_ACTIVATION_QUANT PROPERTY STRINGS EXSIA TENSOR TOKEN BLOCK STRIPE)
 string(TOUPPER "${GGML_GEMMINI_ACTIVATION_QUANT}" _GGML_GEMMINI_ACTIVATION_QUANT_UPPER)
 if(NOT _GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "EXSIA" AND
    NOT _GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "TENSOR" AND
    NOT _GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "TOKEN" AND
+   NOT _GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "BLOCK" AND
    NOT _GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "STRIPE")
-    message(FATAL_ERROR "GGML_GEMMINI_ACTIVATION_QUANT must be EXSIA, TENSOR, TOKEN, or STRIPE, got '${GGML_GEMMINI_ACTIVATION_QUANT}'")
+    message(FATAL_ERROR "GGML_GEMMINI_ACTIVATION_QUANT must be EXSIA, TENSOR, TOKEN, BLOCK, or STRIPE, got '${GGML_GEMMINI_ACTIVATION_QUANT}'")
 endif()
 if(_GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "EXSIA")
     set(_GGML_GEMMINI_ACTIVATION_QUANT_VALUE 0)
@@ -235,6 +236,8 @@ elseif(_GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "TENSOR")
     set(_GGML_GEMMINI_ACTIVATION_QUANT_VALUE 1)
 elseif(_GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "TOKEN")
     set(_GGML_GEMMINI_ACTIVATION_QUANT_VALUE 2)
+elseif(_GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "BLOCK")
+    set(_GGML_GEMMINI_ACTIVATION_QUANT_VALUE 3)
 else()
     set(_GGML_GEMMINI_ACTIVATION_QUANT_VALUE 4)
 endif()
@@ -252,6 +255,214 @@ if(NOT GGML_GEMMINI_ACTIVATION_BITS MATCHES "^(4|8|16)$")
     message(FATAL_ERROR "GGML_GEMMINI_ACTIVATION_BITS must be one of: 4, 8, 16; got '${GGML_GEMMINI_ACTIVATION_BITS}'")
 endif()
 set(_GGML_GEMMINI_ACTIVATION_BITS_VALUE "${GGML_GEMMINI_ACTIVATION_BITS}")
+
+set(GGML_GEMMINI_WEIGHT_BITS "8" CACHE STRING "Gemmini native weight bit width")
+set_property(CACHE GGML_GEMMINI_WEIGHT_BITS PROPERTY STRINGS 4 8 16)
+if(NOT GGML_GEMMINI_WEIGHT_BITS MATCHES "^(4|8|16)$")
+    message(FATAL_ERROR "GGML_GEMMINI_WEIGHT_BITS must be one of: 4, 8, 16; got '${GGML_GEMMINI_WEIGHT_BITS}'")
+endif()
+set(_GGML_GEMMINI_WEIGHT_BITS_VALUE "${GGML_GEMMINI_WEIGHT_BITS}")
+
+set(GGML_GEMMINI_EXECUTION_BACKEND "HARDWARE" CACHE STRING
+    "Gemmini execution backend: HARDWARE or IM2P_SIM")
+set_property(CACHE GGML_GEMMINI_EXECUTION_BACKEND PROPERTY STRINGS HARDWARE IM2P_SIM)
+if(NOT GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "HARDWARE" AND
+   NOT GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
+    message(FATAL_ERROR
+        "GGML_GEMMINI_EXECUTION_BACKEND must be exactly HARDWARE or IM2P_SIM, got '${GGML_GEMMINI_EXECUTION_BACKEND}'")
+endif()
+set(IM2P_SIM_ROOT "" CACHE PATH "Path to the IM2P.sim source and isolated build artifacts")
+set(IM2P_DIM "16" CACHE STRING "IM2P simulator array dimension: 16, 32, or 64")
+set_property(CACHE IM2P_DIM PROPERTY STRINGS 16 32 64)
+
+if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
+    if(NOT GGML_GEMMINI)
+        message(FATAL_ERROR "GGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM requires GGML_GEMMINI=ON")
+    endif()
+    if(CMAKE_CROSSCOMPILING OR CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
+        message(FATAL_ERROR "GGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM is unavailable for RISC-V/cross-compiling builds")
+    endif()
+    if(NOT IM2P_DIM MATCHES "^(16|32|64)$")
+        message(FATAL_ERROR "IM2P_DIM must be 16, 32, or 64, got '${IM2P_DIM}'")
+    endif()
+    if(IM2P_DIM STREQUAL "64" AND GGML_GEMMINI_WEIGHT_BITS STREQUAL "8")
+        set(_GGML_GEMMINI_IM2P_BLOCK_SIZE 64)
+    else()
+        set(_GGML_GEMMINI_IM2P_BLOCK_SIZE 32)
+    endif()
+    if(NOT GGML_GEMMINI_BLOCK_SIZE STREQUAL
+       "${_GGML_GEMMINI_IM2P_BLOCK_SIZE}")
+        message(FATAL_ERROR
+            "IM2P_DIM=${IM2P_DIM} requires GGML_GEMMINI_BLOCK_SIZE=${_GGML_GEMMINI_IM2P_BLOCK_SIZE}, got '${GGML_GEMMINI_BLOCK_SIZE}'")
+    endif()
+    if(IM2P_SIM_ROOT STREQUAL "")
+        message(FATAL_ERROR "IM2P_SIM_ROOT is required for GGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM")
+    endif()
+    get_filename_component(IM2P_SIM_ROOT "${IM2P_SIM_ROOT}" ABSOLUTE)
+    if(NOT EXISTS "${IM2P_SIM_ROOT}/sim/include/im2p_sim.h" OR
+       NOT EXISTS "${IM2P_SIM_ROOT}/frontend/include/im2p_gemmini_frontend.hpp")
+        message(FATAL_ERROR
+            "IM2P_SIM_ROOT='${IM2P_SIM_ROOT}' does not contain the IM2P simulator and frontend headers")
+    endif()
+
+    set(GGML_GEMMINI_IM2P_ARTIFACT_ID
+        "a${GGML_GEMMINI_ACTIVATION_BITS}-w${GGML_GEMMINI_WEIGHT_BITS}-d${IM2P_DIM}")
+    set(GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE
+        "${IM2P_SIM_ROOT}/build/lib/${GGML_GEMMINI_IM2P_ARTIFACT_ID}/libim2p_gemmini_frontend.a")
+    set(GGML_GEMMINI_IM2P_SIM_ARCHIVE
+        "${IM2P_SIM_ROOT}/build/cargo/${GGML_GEMMINI_IM2P_ARTIFACT_ID}/release/libim2p_sim.a")
+    foreach(_GGML_GEMMINI_IM2P_ARCHIVE IN ITEMS
+            GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE GGML_GEMMINI_IM2P_SIM_ARCHIVE)
+        if(NOT EXISTS "${${_GGML_GEMMINI_IM2P_ARCHIVE}}")
+            message(FATAL_ERROR
+                "Missing matching IM2P ${GGML_GEMMINI_IM2P_ARTIFACT_ID} archive: ${${_GGML_GEMMINI_IM2P_ARCHIVE}}")
+        endif()
+    endforeach()
+
+    set(_GGML_GEMMINI_IM2P_PROBE_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/im2p-build-contract-probe.cpp")
+    file(WRITE "${_GGML_GEMMINI_IM2P_PROBE_SOURCE}" [=[
+#include <cstdint>
+#include <cstdio>
+extern "C" {
+std::uint32_t im2p_sim_abi_version(void);
+std::uint32_t im2p_sim_activation_bits(void);
+std::uint32_t im2p_sim_activation_storage_bytes(void);
+std::uint32_t im2p_sim_weight_bits(void);
+std::uint32_t im2p_sim_weight_storage_bytes(void);
+std::uint32_t im2p_sim_dim(void);
+}
+int main() {
+    std::printf("%u;%u;%u;%u;%u;%u", im2p_sim_abi_version(),
+                im2p_sim_activation_bits(),
+                im2p_sim_activation_storage_bytes(),
+                im2p_sim_weight_bits(), im2p_sim_weight_storage_bytes(),
+                im2p_sim_dim());
+    return 0;
+}
+]=])
+    unset(_GGML_GEMMINI_IM2P_PROBE_COMPILED CACHE)
+    unset(_GGML_GEMMINI_IM2P_PROBE_RESULT CACHE)
+    try_run(_GGML_GEMMINI_IM2P_PROBE_RESULT _GGML_GEMMINI_IM2P_PROBE_COMPILED
+        "${CMAKE_CURRENT_BINARY_DIR}/im2p-build-contract-probe"
+        "${_GGML_GEMMINI_IM2P_PROBE_SOURCE}"
+        LINK_LIBRARIES "${GGML_GEMMINI_IM2P_SIM_ARCHIVE}"
+        RUN_OUTPUT_VARIABLE _GGML_GEMMINI_IM2P_IDENTITY)
+    if(NOT _GGML_GEMMINI_IM2P_PROBE_COMPILED)
+        message(FATAL_ERROR
+            "Unable to link the selected IM2P simulator archive for identity validation")
+    endif()
+    if(NOT _GGML_GEMMINI_IM2P_PROBE_RESULT EQUAL 0 OR
+       NOT _GGML_GEMMINI_IM2P_IDENTITY MATCHES "^([0-9]+);([0-9]+);([0-9]+);([0-9]+);([0-9]+);([0-9]+)$")
+        message(FATAL_ERROR "Malformed IM2P simulator identity '${_GGML_GEMMINI_IM2P_IDENTITY}'")
+    endif()
+    set(_GGML_GEMMINI_IM2P_ABI "${CMAKE_MATCH_1}")
+    set(_GGML_GEMMINI_IM2P_ACTIVATION_BITS "${CMAKE_MATCH_2}")
+    set(_GGML_GEMMINI_IM2P_ACTIVATION_STORAGE_BYTES "${CMAKE_MATCH_3}")
+    set(_GGML_GEMMINI_IM2P_WEIGHT_BITS "${CMAKE_MATCH_4}")
+    set(_GGML_GEMMINI_IM2P_WEIGHT_STORAGE_BYTES "${CMAKE_MATCH_5}")
+    set(_GGML_GEMMINI_IM2P_DIM "${CMAKE_MATCH_6}")
+    if(NOT _GGML_GEMMINI_IM2P_ABI STREQUAL "4")
+        message(FATAL_ERROR
+            "IM2P simulator ABI mismatch: llama requires 4, archive reports ${_GGML_GEMMINI_IM2P_ABI}")
+    endif()
+    if(NOT _GGML_GEMMINI_IM2P_ACTIVATION_BITS STREQUAL "${GGML_GEMMINI_ACTIVATION_BITS}")
+        message(FATAL_ERROR
+            "IM2P activation width mismatch: llama requests ${GGML_GEMMINI_ACTIVATION_BITS}, archive reports ${_GGML_GEMMINI_IM2P_ACTIVATION_BITS}")
+    endif()
+    if(NOT _GGML_GEMMINI_IM2P_WEIGHT_BITS STREQUAL "${GGML_GEMMINI_WEIGHT_BITS}")
+        message(FATAL_ERROR
+            "IM2P weight width mismatch: llama requests ${GGML_GEMMINI_WEIGHT_BITS}, archive reports ${_GGML_GEMMINI_IM2P_WEIGHT_BITS}")
+    endif()
+    if(GGML_GEMMINI_ACTIVATION_BITS STREQUAL "16")
+        set(_GGML_GEMMINI_EXPECTED_ACTIVATION_STORAGE_BYTES 2)
+    else()
+        set(_GGML_GEMMINI_EXPECTED_ACTIVATION_STORAGE_BYTES 1)
+    endif()
+    if(GGML_GEMMINI_WEIGHT_BITS STREQUAL "16")
+        set(_GGML_GEMMINI_EXPECTED_WEIGHT_STORAGE_BYTES 2)
+    else()
+        set(_GGML_GEMMINI_EXPECTED_WEIGHT_STORAGE_BYTES 1)
+    endif()
+    if(NOT _GGML_GEMMINI_IM2P_ACTIVATION_STORAGE_BYTES STREQUAL
+       "${_GGML_GEMMINI_EXPECTED_ACTIVATION_STORAGE_BYTES}")
+        message(FATAL_ERROR
+            "IM2P activation storage mismatch: llama requires ${_GGML_GEMMINI_EXPECTED_ACTIVATION_STORAGE_BYTES}, archive reports ${_GGML_GEMMINI_IM2P_ACTIVATION_STORAGE_BYTES}")
+    endif()
+    if(NOT _GGML_GEMMINI_IM2P_WEIGHT_STORAGE_BYTES STREQUAL
+       "${_GGML_GEMMINI_EXPECTED_WEIGHT_STORAGE_BYTES}")
+        message(FATAL_ERROR
+            "IM2P weight storage mismatch: llama requires ${_GGML_GEMMINI_EXPECTED_WEIGHT_STORAGE_BYTES}, archive reports ${_GGML_GEMMINI_IM2P_WEIGHT_STORAGE_BYTES}")
+    endif()
+    if(NOT _GGML_GEMMINI_IM2P_DIM STREQUAL "${IM2P_DIM}")
+        message(FATAL_ERROR
+            "IM2P DIM mismatch: llama requests ${IM2P_DIM}, archive reports ${_GGML_GEMMINI_IM2P_DIM}")
+    endif()
+
+    # The simulator queries above validate the Rust/RTL archive itself. Exercise
+    # the public frontend with that same archive to catch a stale frontend copied
+    # into a correctly named pair directory before any project target compiles.
+    find_package(Threads REQUIRED)
+    set(_GGML_GEMMINI_IM2P_PAIR_PROBE_SOURCE
+        "${CMAKE_CURRENT_BINARY_DIR}/im2p-frontend-pair-probe.cpp")
+    file(WRITE "${_GGML_GEMMINI_IM2P_PAIR_PROBE_SOURCE}" [=[
+#include "im2p_gemmini_frontend.hpp"
+int main() {
+    if (im2p_begin_striped_matmul(nullptr, nullptr, nullptr) != IM2P_ERROR)
+        return 10;
+    if (im2p_publish_stripe(nullptr, nullptr) != IM2P_INVALID_LAYOUT)
+        return 11;
+    if (im2p::gemmini::compiled_activation_bits() !=
+        @GGML_GEMMINI_ACTIVATION_BITS@)
+        return 20;
+    if (im2p::gemmini::compiled_weight_bits() !=
+        @GGML_GEMMINI_WEIGHT_BITS@)
+        return 30;
+    return im2p::gemmini::compiled_dim() == @IM2P_DIM@ ? 0 : 40;
+}
+]=])
+    file(READ "${_GGML_GEMMINI_IM2P_PAIR_PROBE_SOURCE}"
+        _GGML_GEMMINI_IM2P_PAIR_PROBE_CONTENT)
+    string(CONFIGURE "${_GGML_GEMMINI_IM2P_PAIR_PROBE_CONTENT}"
+        _GGML_GEMMINI_IM2P_PAIR_PROBE_CONTENT @ONLY)
+    file(WRITE "${_GGML_GEMMINI_IM2P_PAIR_PROBE_SOURCE}"
+        "${_GGML_GEMMINI_IM2P_PAIR_PROBE_CONTENT}")
+    set(_GGML_GEMMINI_IM2P_PAIR_PROBE_INCLUDES
+        "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-gemmini"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ggml/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-gemmini-utils/include"
+        "${GEMMINI_SW_PATH}"
+        "${GEMMINI_SW_PATH}/include"
+        "${IM2P_SIM_ROOT}/frontend/include"
+        "${IM2P_SIM_ROOT}/sim/include")
+    unset(_GGML_GEMMINI_IM2P_PAIR_PROBE_COMPILED CACHE)
+    unset(_GGML_GEMMINI_IM2P_PAIR_PROBE_RESULT CACHE)
+    try_run(_GGML_GEMMINI_IM2P_PAIR_PROBE_RESULT
+        _GGML_GEMMINI_IM2P_PAIR_PROBE_COMPILED
+        "${CMAKE_CURRENT_BINARY_DIR}/im2p-frontend-pair-probe"
+        "${_GGML_GEMMINI_IM2P_PAIR_PROBE_SOURCE}"
+        CMAKE_FLAGS
+            "-DCMAKE_CXX_STANDARD=20"
+            "-DCMAKE_CXX_STANDARD_REQUIRED=ON"
+            "-DINCLUDE_DIRECTORIES=${_GGML_GEMMINI_IM2P_PAIR_PROBE_INCLUDES}"
+        COMPILE_DEFINITIONS
+            "-DGGML_GEMMINI_BLOCK_SIZE=${GGML_GEMMINI_BLOCK_SIZE}"
+        LINK_LIBRARIES
+            "${GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE}"
+            "${GGML_GEMMINI_IM2P_SIM_ARCHIVE}"
+            Threads::Threads
+            ${CMAKE_DL_LIBS})
+    if(NOT _GGML_GEMMINI_IM2P_PAIR_PROBE_COMPILED)
+        message(FATAL_ERROR
+            "IM2P frontend configuration mismatch: unable to link the selected frontend/simulator pair")
+    endif()
+    if(NOT _GGML_GEMMINI_IM2P_PAIR_PROBE_RESULT EQUAL 0)
+        message(FATAL_ERROR
+            "IM2P frontend configuration mismatch for ${GGML_GEMMINI_IM2P_ARTIFACT_ID} (probe result ${_GGML_GEMMINI_IM2P_PAIR_PROBE_RESULT})")
+    endif()
+    message(STATUS "GGML Gemmini IM2P frontend archive: ${GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE}")
+    message(STATUS "GGML Gemmini IM2P simulator archive: ${GGML_GEMMINI_IM2P_SIM_ARCHIVE}")
+endif()
 set(GGML_GEMMINI_EXSIA_SIGMA "2" CACHE STRING "EXSIA outlier sigma threshold")
 if(NOT "${GGML_GEMMINI_EXSIA_SIGMA}" MATCHES "^[1-9][0-9]*$")
     message(FATAL_ERROR "GGML_GEMMINI_EXSIA_SIGMA must be a positive integer, got '${GGML_GEMMINI_EXSIA_SIGMA}'")
@@ -317,13 +528,13 @@ if (GGML_GEMMINI_DEFAULT_RMD_BACKEND STREQUAL "CPU")
 else()
     set(_GGML_GEMMINI_DEFAULT_RMD_BACKEND_VALUE 1)
 endif()
-# Public matmul invocation defaults: FULL / STRIPE_SEQUENTIAL / STRIPE_PIPELINE.
+# Public matmul invocation defaults: FULL / STRIPE_PIPELINE.
 option(GGML_GEMMINI_ENABLE_STRIPE_MATMUL "Enable strict stripe matmul modes" ON)
 option(GGML_GEMMINI_ENABLE_STRIPE_PIPELINE "Enable strict stripe pipeline mode" ON)
 set(GGML_GEMMINI_DEFAULT_MATMUL_MODE "FULL" CACHE STRING
-    "Default Gemmini matmul mode: FULL, STRIPE_SEQUENTIAL, or STRIPE_PIPELINE")
+    "Default Gemmini matmul mode: FULL or STRIPE_PIPELINE")
 set_property(CACHE GGML_GEMMINI_DEFAULT_MATMUL_MODE PROPERTY STRINGS
-    FULL STRIPE_SEQUENTIAL STRIPE_PIPELINE)
+    FULL STRIPE_PIPELINE)
 set(GGML_GEMMINI_DEFAULT_STRIPE_ROWS "AUTO" CACHE STRING
     "Default stripe rows: AUTO or a positive integer")
 set(GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY "2" CACHE STRING
@@ -361,12 +572,12 @@ else()
     set(_GGML_GEMMINI_ENABLE_RMD_VALUE 0)
 endif()
 
-set(_GGML_GEMMINI_MATMUL_MODES FULL STRIPE_SEQUENTIAL STRIPE_PIPELINE)
+set(_GGML_GEMMINI_MATMUL_MODES FULL STRIPE_PIPELINE)
 list(FIND _GGML_GEMMINI_MATMUL_MODES "${GGML_GEMMINI_DEFAULT_MATMUL_MODE}"
      _GGML_GEMMINI_DEFAULT_MATMUL_MODE_VALUE)
 if (_GGML_GEMMINI_DEFAULT_MATMUL_MODE_VALUE EQUAL -1)
     message(FATAL_ERROR
-        "GGML_GEMMINI_DEFAULT_MATMUL_MODE must be FULL, STRIPE_SEQUENTIAL, or STRIPE_PIPELINE, got '${GGML_GEMMINI_DEFAULT_MATMUL_MODE}'")
+        "GGML_GEMMINI_DEFAULT_MATMUL_MODE must be FULL or STRIPE_PIPELINE, got '${GGML_GEMMINI_DEFAULT_MATMUL_MODE}'")
 endif()
 if (GGML_GEMMINI_ENABLE_STRIPE_PIPELINE AND NOT GGML_GEMMINI_ENABLE_STRIPE_MATMUL)
     message(FATAL_ERROR "GGML_GEMMINI_ENABLE_STRIPE_PIPELINE requires GGML_GEMMINI_ENABLE_STRIPE_MATMUL=ON")
@@ -378,6 +589,22 @@ endif()
 if (GGML_GEMMINI_DEFAULT_MATMUL_MODE STREQUAL "STRIPE_PIPELINE" AND
     NOT GGML_GEMMINI_ENABLE_STRIPE_PIPELINE)
     message(FATAL_ERROR "STRIPE_PIPELINE default requires GGML_GEMMINI_ENABLE_STRIPE_PIPELINE=ON")
+endif()
+if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND
+    NOT GGML_GEMMINI_WEIGHT_BITS STREQUAL "8")
+    if (NOT GGML_GEMMINI_ACTIVATION_BITS STREQUAL
+        "${GGML_GEMMINI_WEIGHT_BITS}")
+        message(FATAL_ERROR
+            "Native IM2P W4/W16 requires matched activation and weight widths")
+    endif()
+    if (_GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "EXSIA")
+        message(FATAL_ERROR
+            "ExSIA A4/Q4 and A16/Q16 remain TODO pending RMD scale integration")
+    endif()
+    if (GGML_GEMMINI_ENABLE_RMD)
+        message(FATAL_ERROR
+            "Native IM2P W4/W16 requires GGML_GEMMINI_ENABLE_RMD=OFF")
+    endif()
 endif()
 
 foreach(_GGML_GEMMINI_MATMUL_COUNT IN ITEMS
@@ -411,6 +638,19 @@ endif()
 
 set(GGML_GEMMINI_GENERATED_CONFIG_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${GGML_GEMMINI_GENERATED_CONFIG_DIR}")
+if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
+    set(_GGML_GEMMINI_PARAMS_SOURCE "${GEMMINI_SW_PATH}/gemmini_params.h")
+    if(NOT EXISTS "${_GGML_GEMMINI_PARAMS_SOURCE}")
+        message(FATAL_ERROR "Missing Gemmini parameter header: ${_GGML_GEMMINI_PARAMS_SOURCE}")
+    endif()
+    file(READ "${_GGML_GEMMINI_PARAMS_SOURCE}" _GGML_GEMMINI_PARAMS_CONTENT)
+    string(REGEX REPLACE "#define[ \t]+DIM[ \t]+[0-9]+"
+        "#define DIM ${IM2P_DIM}" _GGML_GEMMINI_PARAMS_CONTENT
+        "${_GGML_GEMMINI_PARAMS_CONTENT}")
+    file(WRITE "${GGML_GEMMINI_GENERATED_CONFIG_DIR}/gemmini_params.h"
+        "${_GGML_GEMMINI_PARAMS_CONTENT}")
+    include_directories(BEFORE "${GGML_GEMMINI_GENERATED_CONFIG_DIR}")
+endif()
 foreach(_GGML_GEMMINI_MATMUL_BOOL IN ITEMS
         GGML_GEMMINI_ENABLE_STRIPE_MATMUL
         GGML_GEMMINI_ENABLE_STRIPE_PIPELINE
@@ -484,7 +724,13 @@ set(GGML_GEMMINI_COMPILE_DEFS
     GGML_GEMMINI_BLOCK_SIZE=${_GGML_GEMMINI_BLOCK_SIZE_VALUE}
     GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
     GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+    GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
 )
+if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
+    list(APPEND GGML_GEMMINI_COMPILE_DEFS GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM=1)
+else()
+    list(APPEND GGML_GEMMINI_COMPILE_DEFS GGML_GEMMINI_EXECUTION_BACKEND_HARDWARE=1)
+endif()
 
 # set log option
 set(LOG_DEBUG "1" CACHE STRING "Enable debug logs (0|1)")
@@ -523,6 +769,7 @@ set(GGML_GEMMINI_RUNTIME_COMPILE_DEFS
     GGML_GEMMINI_EXSIA_LOCAL_WORKERS=${GGML_GEMMINI_EXSIA_LOCAL_WORKERS}
     GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
     GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+    GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
 )
 
 list(APPEND GGML_GEMMINI_COMPILE_DEFS ${GGML_GEMMINI_RUNTIME_COMPILE_DEFS})

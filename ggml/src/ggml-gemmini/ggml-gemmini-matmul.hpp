@@ -22,6 +22,12 @@
 #include <unordered_set>
 #include <vector>
 
+#if !defined(GGML_GEMMINI_CONFIG_HAS_ACTIVATION_QUANT)
+namespace ggml::gemmini::config {
+inline constexpr int ACTIVATION_QUANT = static_cast<int>(CURRENT_ACTIVATION_QUANT);
+}
+#endif
+
 namespace ggml::gemmini {
 
 struct MatmulJobMetrics;
@@ -135,6 +141,7 @@ private:
                                           residual::DirectStripePayloadHandle,
                                           rmd::StripePacketHandle);
     friend MatmulStatus execute_dense_stripe(MatmulStripeJob &);
+    friend MatmulStatus accept_external_dense_completion(MatmulStripeJob &);
     friend MatmulStatus execute_rmd_stripe(MatmulStripeJob &);
     friend MatmulStatus compose_rmd_stripe(MatmulStripeJob &);
     friend MatmulStatus finalize_stripe(MatmulStripeJob &);
@@ -179,6 +186,20 @@ struct MatmulStatus {
 
     explicit operator bool() const { return ok(); }
 };
+
+#if defined(GGML_GEMMINI_TESTING)
+struct MatmulTestCounters {
+    uint64_t execution_constructions = 0;
+    uint64_t allocation_attempts = 0;
+    uint64_t dense_dispatches = 0;
+    uint64_t residual_dispatches = 0;
+    uint64_t hardware_dispatches = 0;
+    uint64_t fallback_dispatches = 0;
+};
+
+void test_reset_matmul_counters();
+MatmulTestCounters test_matmul_counters();
+#endif
 
 struct MatmulStageMetrics {
     uint64_t nanoseconds = 0;
@@ -363,7 +384,6 @@ private:
 
 enum class MatmulInvocationMode {
     full,
-    stripe_sequential,
     stripe_pipeline,
 };
 
@@ -553,8 +573,6 @@ inline MatmulOptionsResolution resolve_matmul_options(const MatmulOptionOverride
             const std::string_view mode(value);
             if (mode == "FULL") {
                 result.options.mode = MatmulInvocationMode::full;
-            } else if (mode == "STRIPE_SEQUENTIAL") {
-                result.options.mode = MatmulInvocationMode::stripe_sequential;
             } else if (mode == "STRIPE_PIPELINE") {
                 result.options.mode = MatmulInvocationMode::stripe_pipeline;
             } else {
@@ -618,8 +636,13 @@ inline MatmulOptionsResolution resolve_matmul_options(const MatmulOptionOverride
         result.error = MatmulOptionsError::invalid_rmd_backend;
         return result;
     }
-    if ((result.options.mode != MatmulInvocationMode::full && !config::ENABLE_STRIPE_MATMUL) ||
-        (result.options.mode == MatmulInvocationMode::stripe_pipeline && !config::ENABLE_STRIPE_PIPELINE)) {
+    if (result.options.mode != MatmulInvocationMode::full &&
+        result.options.mode != MatmulInvocationMode::stripe_pipeline) {
+        result.error = MatmulOptionsError::invalid_mode;
+        return result;
+    }
+    if (result.options.mode == MatmulInvocationMode::stripe_pipeline &&
+        (!config::ENABLE_STRIPE_MATMUL || !config::ENABLE_STRIPE_PIPELINE)) {
         result.error = MatmulOptionsError::disabled_mode;
     }
     return result;
@@ -678,6 +701,7 @@ private:
                                           rmd::StripePacketHandle);
     friend MatmulStatus capture_stripe(MatmulExecution &, const MatmulStripeInput &, MatmulStripeJob &);
     friend MatmulStatus execute_dense_stripe(MatmulStripeJob &);
+    friend MatmulStatus accept_external_dense_completion(MatmulStripeJob &);
     friend MatmulStatus execute_rmd_stripe(MatmulStripeJob &);
     friend MatmulStatus compose_rmd_stripe(MatmulStripeJob &);
     friend MatmulStatus finalize_stripe(MatmulStripeJob &);
@@ -755,6 +779,7 @@ private:
                                           residual::DirectStripePayloadHandle,
                                           rmd::StripePacketHandle);
     friend MatmulStatus execute_dense_stripe(MatmulStripeJob &);
+    friend MatmulStatus accept_external_dense_completion(MatmulStripeJob &);
     friend MatmulStatus execute_rmd_stripe(MatmulStripeJob &);
     friend MatmulStatus compose_rmd_stripe(MatmulStripeJob &);
     friend MatmulStatus finalize_stripe(MatmulStripeJob &);
@@ -804,6 +829,7 @@ MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput in
 MatmulStatus capture_stripe(MatmulExecution & execution, const MatmulStripeInput & input,
                             MatmulStripeJob & job);
 MatmulStatus execute_dense_stripe(MatmulStripeJob & job);
+MatmulStatus accept_external_dense_completion(MatmulStripeJob &job);
 MatmulStatus execute_rmd_stripe(MatmulStripeJob & job);
 MatmulStatus compose_rmd_stripe(MatmulStripeJob & job);
 MatmulStatus finalize_stripe(MatmulStripeJob & job);
