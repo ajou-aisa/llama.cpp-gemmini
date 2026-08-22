@@ -979,9 +979,20 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
         ggml::gemmini::config::ActivationQuantAlgo::EXSIA;
     constexpr bool im2p_non_exsia = !im2p_exsia;
+    const std::uint8_t im2p_weight_bits =
+        src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_1 ||
+                src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q4_H1 ||
+                src0->type == GGML_TYPE_Q4_HP1
+            ? 4
+            : src0->type == GGML_TYPE_Q16_0 ||
+                      src0->type == GGML_TYPE_Q16_H1 ||
+                      src0->type == GGML_TYPE_Q16_HP1
+                  ? 16
+                  : 8;
     const auto route_gate = ggml::gemmini::im2p_adapter::gate_route(
         im2p_exsia, GGML_GEMMINI_ACTIVATION_BITS, GGML_GEMMINI_ENABLE_RMD != 0,
-        matmul_options.rmd_backend == ggml::gemmini::RmdBackend::cpu_direct);
+        matmul_options.rmd_backend == ggml::gemmini::RmdBackend::cpu_direct,
+        im2p_weight_bits);
     if (!route_gate.ok()) {
       ggml::gemmini::im2p_adapter::log_failure("route", route_gate);
 #if defined(GGML_GEMMINI_TESTING)
@@ -1512,6 +1523,70 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
       args.activation_rows_per_stripe = std::min<size_t>(DIM, args.I);
       args.act_quant.storage()
           .emplace<ggml::gemmini::quants::act::exsia::Meta>();
+
+      if (full_requested) {
+        auto full =
+            ggml::gemmini::im2p_adapter::start_exsia_full_execution(args);
+        if (!full.result.ok() || !full.execution) {
+          ggml::gemmini::im2p_adapter::log_failure("ExSIA FULL start",
+                                                   full.result);
+#if defined(GGML_GEMMINI_TESTING)
+          ggml::gemmini::im2p_adapter::test_record_production_failure(
+              full.result.error);
+          return;
+#else
+          GGML_ABORT("Gemmini IM2P ExSIA FULL start failed");
+#endif
+        }
+        const auto sink_status = full.execution->install_sink();
+        if (!sink_status.ok()) {
+          ggml::gemmini::im2p_adapter::log_failure("ExSIA FULL sink install",
+                                                   sink_status);
+#if defined(GGML_GEMMINI_TESTING)
+          ggml::gemmini::im2p_adapter::test_record_production_failure(
+              sink_status.error);
+          return;
+#else
+          GGML_ABORT("Gemmini IM2P ExSIA FULL sink install failed");
+#endif
+        }
+#if defined(GGML_GEMMINI_TESTING)
+        quantize_ok =
+            !ggml::gemmini::im2p_adapter::test_should_fail_quantization() &&
+            ggml::gemmini::quants::quantize_activation(src1, args);
+#else
+        quantize_ok = ggml::gemmini::quants::quantize_activation(src1, args);
+#endif
+        const auto completion = full.execution->finish(quantize_ok);
+        if (!completion.result.ok()) {
+          ggml::gemmini::im2p_adapter::log_failure("ExSIA FULL execution",
+                                                   completion.result);
+#if defined(GGML_GEMMINI_TESTING)
+          ggml::gemmini::im2p_adapter::test_record_production_failure(
+              completion.result.error);
+          return;
+#else
+          GGML_ABORT("Gemmini IM2P ExSIA FULL execution failed");
+#endif
+        }
+        ggml::gemmini::im2p_adapter::log_stats("ExSIA FULL execution",
+                                               completion.stats);
+        return;
+      }
+
+      if (!pipeline_requested) {
+        ggml::gemmini::im2p_adapter::log_failure(
+            "ExSIA mode",
+            {ggml::gemmini::im2p_adapter::Error::unsupported_route,
+             "ExSIA supports FULL or STRIPE_PIPELINE", false});
+#if defined(GGML_GEMMINI_TESTING)
+        ggml::gemmini::im2p_adapter::test_record_production_failure(
+            ggml::gemmini::im2p_adapter::Error::unsupported_route);
+        return;
+#else
+        GGML_ABORT("Gemmini IM2P ExSIA mode is unsupported");
+#endif
+      }
 
       auto started =
           ggml::gemmini::im2p_adapter::start_exsia_stripe_pipeline(args);

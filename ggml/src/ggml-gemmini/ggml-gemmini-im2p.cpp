@@ -134,40 +134,29 @@ Completion translate(const ::im2p::gemmini::FenceResult &result) noexcept {
 }
 
 Result gate_route(bool exsia, std::uint8_t activation_bits, bool rmd_enabled,
-                  bool cpu_direct_rmd) noexcept {
-  struct Capability {
-    std::uint8_t activation_bits;
-    bool non_exsia_without_rmd;
-    bool exsia_cpu_direct_rmd;
-  };
-  // TODO(rmd-team): populate A4/A16 ExSIA entries when their RMD routes are
-  // production-ready.
-  constexpr Capability capabilities[] = {
-      {4, true, false},
-      {8, true, true},
-      {16, true, false},
-  };
-
-  const Capability *capability = nullptr;
-  for (const auto &candidate : capabilities) {
-    if (candidate.activation_bits == activation_bits) {
-      capability = &candidate;
-      break;
-    }
+                  bool cpu_direct_rmd, std::uint8_t weight_bits) noexcept {
+  // Production ExSIA is A8/Q8 only. Matched A4/Q4 and A16/Q16 remain TODO;
+  // mixed precision is unsupported. H0/H1/HP1 retain the existing Q8
+  // direction, while H2/HP2 gain no new route here. This gate runs before
+  // activation allocation, simulator/worker start, fence, RMD, commit, or
+  // fallback.
+  if (weight_bits != 8) {
+    return {Error::unsupported_route, "IM2P only supports Q8 weight routes",
+            false};
   }
-  if (capability == nullptr) {
+  if (activation_bits != 4 && activation_bits != 8 && activation_bits != 16) {
     return {Error::unsupported_route, "unsupported IM2P activation width",
             false};
   }
   if (exsia) {
-    if (capability->exsia_cpu_direct_rmd && rmd_enabled && cpu_direct_rmd) {
+    if (activation_bits == 8 && rmd_enabled && cpu_direct_rmd) {
       return {};
     }
     return {Error::unsupported_route,
-            "ExSIA IM2P requires the production A8 cpu_direct RMD route",
+            "ExSIA IM2P requires the production A8/Q8 cpu_direct RMD route",
             false};
   }
-  if (capability->non_exsia_without_rmd && !rmd_enabled) {
+  if (!rmd_enabled) {
     return {};
   }
   return {Error::unsupported_route,
@@ -258,12 +247,131 @@ Completion run_full(const ggml_gemmini_args_t &args) noexcept {
   return completion;
 }
 
+struct CapturedExsiaStripe {
+  quants::act::exsia::StripeReadyEvent event;
+  std::int16_t theta = 0;
+};
+
+static Result
+apply_captured_rmd(const ggml_gemmini_args_t &runtime_args, float *output_data,
+                   size_t output_elements,
+                   const std::vector<CapturedExsiaStripe> &captured) noexcept {
+  std::unique_ptr<ggml_gemmini_args_t> rmd_args;
+  std::vector<const CapturedExsiaStripe *> ordered;
+  try {
+    rmd_args = std::make_unique<ggml_gemmini_args_t>(runtime_args);
+    rmd_args->f_out = output_data;
+    size_t output_extent = 0;
+    if (!checked_output_extent(*rmd_args, output_extent) ||
+        output_extent > output_elements) {
+      return {Error::invalid_contract,
+              "frontend RMD staging does not cover the output layout", false};
+    }
+    ordered.reserve(captured.size());
+    for (const auto &stripe : captured) {
+      ordered.push_back(&stripe);
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [](const auto *lhs, const auto *rhs) {
+                return lhs->event.row_begin < rhs->event.row_begin;
+              });
+    auto &captured_meta =
+        rmd_args->act_quant.storage().emplace<quants::act::exsia::Meta>();
+    captured_meta.theta.assign(captured.size(),
+                               std::numeric_limits<std::int16_t>::min());
+    size_t next_row = 0;
+    for (size_t index = 0; index < ordered.size(); ++index) {
+      const auto &stripe = *ordered[index];
+      if (stripe.event.stripe_id != index ||
+          stripe.event.row_begin != next_row ||
+          stripe.event.row_begin >= stripe.event.row_end ||
+          stripe.event.row_end > runtime_args.I) {
+        return {Error::invalid_contract,
+                "captured ExSIA stripes are not contiguous in row order",
+                false};
+      }
+      captured_meta.theta[index] = stripe.theta;
+      next_row = stripe.event.row_end;
+    }
+    if (ordered.empty() || next_row != runtime_args.I) {
+      return {Error::invalid_contract,
+              "captured ExSIA stripes do not cover the output rows", false};
+    }
+  } catch (const std::bad_alloc &) {
+    return {Error::out_of_memory, "failed to stage captured ExSIA metadata",
+            false};
+  } catch (...) {
+    return {Error::execution_failure, "failed to stage captured ExSIA metadata",
+            false};
+  }
+
+  ResolvedMatmulOptions options;
+  options.mode = MatmulInvocationMode::stripe_pipeline;
+  options.stripe_rows = runtime_args.activation_rows_per_stripe;
+  options.stripe_rows_auto = false;
+  options.job_capacity = std::max<size_t>(2, ordered.size());
+  options.rmd_backend = RmdBackend::cpu_direct;
+  MatmulExecution execution = prepare_execution(rmd_args.get(), options);
+  if (!execution.status().ok()) {
+    return from_matmul_status(execution.status());
+  }
+
+  std::vector<MatmulStripeJob> jobs;
+  try {
+    jobs.reserve(ordered.size());
+    for (const auto *stripe : ordered) {
+      jobs.push_back(capture_stripe(
+          execution,
+          MatmulStripeInput(stripe->event.row_begin, stripe->event.row_end,
+                            stripe->event.stripe_id),
+          stripe->event.direct_residual, stripe->event.rmd_packet));
+      if (!jobs.back().status().ok()) {
+        return from_matmul_status(jobs.back().status());
+      }
+    }
+  } catch (const std::bad_alloc &) {
+    return {Error::out_of_memory, "failed to stage ExSIA RMD jobs", false};
+  } catch (...) {
+    return {Error::execution_failure, "failed to stage ExSIA RMD jobs", false};
+  }
+
+  for (size_t index = 0; index < jobs.size(); ++index) {
+    MatmulStatus status = accept_external_dense_completion(jobs[index]);
+    if (status.ok())
+      status = execute_rmd_stripe(jobs[index]);
+    if (status.ok())
+      status = compose_rmd_stripe(jobs[index]);
+    if (!status.ok())
+      return from_matmul_status(status);
+#if defined(GGML_GEMMINI_TESTING)
+    {
+      std::lock_guard lock(test_mutex);
+      ++counters.rmd_calls;
+      const auto &direct = ordered[index]->event.direct_residual;
+      if (direct)
+        counters.rmd_events += direct->events.size();
+    }
+#endif
+  }
+#if defined(GGML_GEMMINI_TESTING)
+  {
+    std::lock_guard lock(test_mutex);
+    if (injected_failure == TestFailure::rmd) {
+      return {Error::execution_failure, "injected RMD failure", false};
+    }
+  }
+#endif
+  for (auto &job : jobs) {
+    const MatmulStatus status = finalize_stripe(job);
+    if (!status.ok())
+      return from_matmul_status(status);
+  }
+  return from_matmul_status(finish_execution(execution));
+}
+
 class ExsiaStripePipeline::Impl {
 public:
-  struct PublishedStripe {
-    quants::act::exsia::StripeReadyEvent event;
-    std::int16_t theta = 0;
-  };
+  using PublishedStripe = CapturedExsiaStripe;
 
   explicit Impl(ggml_gemmini_args_t &source)
       : args(source), runtime_args(source), sink{this, &Impl::on_ready} {
@@ -392,6 +500,7 @@ public:
 #if defined(GGML_GEMMINI_TESTING)
     std::lock_guard lock(test_mutex);
     ++counters.commit;
+    counters.commit_event = ++counters.order_event_sequence;
 #endif
   }
 
@@ -435,6 +544,252 @@ public:
   bool registered = false;
 #endif
 };
+
+class ExsiaFullExecution::Impl {
+public:
+  explicit Impl(ggml_gemmini_args_t &source)
+      : args(source), runtime_args(source), sink{this, &Impl::on_ready} {}
+
+  ~Impl() {
+    if (args.exsia_stripe_ready_sink == &sink) {
+      args.exsia_stripe_ready_sink = nullptr;
+    }
+    if (run && !fenced) {
+      (void)::im2p::gemmini::fence(*run);
+    }
+  }
+
+  static bool
+  on_ready(void *opaque,
+           const quants::act::exsia::StripeReadyEvent &event) noexcept {
+    return static_cast<Impl *>(opaque)->collect(event);
+  }
+
+  bool collect(const quants::act::exsia::StripeReadyEvent &event) noexcept {
+    if (!collector_result.ok() || finished || !sink_installed)
+      return false;
+#if defined(GGML_GEMMINI_TESTING)
+    {
+      std::lock_guard lock(test_mutex);
+      if (injected_failure == TestFailure::collector_capture) {
+        collector_result = {Error::invalid_contract,
+                            "injected ExSIA FULL collector capture failure",
+                            false};
+        return false;
+      }
+    }
+#endif
+    const auto *metadata =
+        std::get_if<quants::act::exsia::Meta>(&args.act_quant.storage());
+    const std::int16_t theta =
+        metadata == nullptr
+            ? std::numeric_limits<std::int16_t>::min()
+            : metadata->resolve_stripe_theta(static_cast<int>(event.stripe_id));
+    if (theta == std::numeric_limits<std::int16_t>::min()) {
+      collector_result = {Error::invalid_contract,
+                          "collected ExSIA stripe has no committed theta",
+                          false};
+      return false;
+    }
+    try {
+      captured.push_back({event, theta});
+    } catch (const std::bad_alloc &) {
+      collector_result = {Error::out_of_memory,
+                          "failed to retain collected ExSIA stripe", false};
+      return false;
+    } catch (...) {
+      collector_result = {Error::execution_failure,
+                          "failed to retain collected ExSIA stripe", false};
+      return false;
+    }
+#if defined(GGML_GEMMINI_TESTING)
+    {
+      std::lock_guard lock(test_mutex);
+      const size_t index = counters.collector_events++;
+      if (event.direct_residual || event.rmd_packet)
+        ++counters.collector_handles;
+      if (index < kTestStripeTraceCapacity) {
+        counters.collector_row_begin[index] = event.row_begin;
+        counters.collector_row_end[index] = event.row_end;
+        counters.collector_theta[index] = theta;
+      }
+    }
+#endif
+    return true;
+  }
+
+  void mark_rmd_terminal_success() noexcept {
+#if defined(GGML_GEMMINI_TESTING)
+    std::lock_guard lock(test_mutex);
+    counters.rmd_terminal_event = ++counters.order_event_sequence;
+#endif
+  }
+
+  void copy_staged_output() noexcept {
+    float *destination = args.f_out;
+    const size_t row_stride =
+        args.stride_f_out == 0 ? args.J : args.stride_f_out;
+    const size_t col_stride =
+        args.col_stride_f_out == 0 ? 1 : args.col_stride_f_out;
+    for (size_t row = 0; row < args.I; ++row) {
+      for (size_t col = 0; col < args.J; ++col) {
+        const size_t offset = row * row_stride + col * col_stride;
+        destination[offset] = staged_output[offset];
+      }
+    }
+#if defined(GGML_GEMMINI_TESTING)
+    std::lock_guard lock(test_mutex);
+    ++counters.commit;
+    counters.commit_event = ++counters.order_event_sequence;
+#endif
+  }
+
+  ggml_gemmini_args_t &args;
+  ggml_gemmini_args_t runtime_args;
+  std::vector<float> staged_output;
+  std::vector<CapturedExsiaStripe> captured;
+  std::unique_ptr<::im2p::gemmini::Run> run;
+  quants::act::exsia::StripeReadySink sink;
+  Result collector_result{};
+  bool sink_installed = false;
+  bool fenced = false;
+  bool finished = false;
+};
+
+ExsiaFullExecution::ExsiaFullExecution(std::unique_ptr<Impl> impl) noexcept
+    : impl_(std::move(impl)) {}
+ExsiaFullExecution::ExsiaFullExecution(ExsiaFullExecution &&) noexcept =
+    default;
+ExsiaFullExecution &
+ExsiaFullExecution::operator=(ExsiaFullExecution &&) noexcept = default;
+ExsiaFullExecution::~ExsiaFullExecution() = default;
+
+Result ExsiaFullExecution::install_sink() noexcept {
+  if (!impl_ || impl_->sink_installed || impl_->finished) {
+    return {Error::invalid_state, "IM2P ExSIA FULL sink is not installable",
+            false};
+  }
+  impl_->args.exsia_stripe_ready_sink = &impl_->sink;
+  impl_->sink_installed = true;
+  return {};
+}
+
+ExsiaFullExecutionStart
+start_exsia_full_execution(ggml_gemmini_args_t &args) noexcept {
+  size_t output_extent = 0;
+  if (!checked_output_extent(args, output_extent) ||
+      args.activation_rows_per_stripe == 0) {
+    return {{Error::invalid_contract,
+             "invalid IM2P ExSIA FULL output or stripe layout", false},
+            {}};
+  }
+#if defined(GGML_GEMMINI_TESTING)
+  {
+    std::lock_guard lock(test_mutex);
+    if (injected_failure == TestFailure::collector_allocation) {
+      return {{Error::out_of_memory,
+               "injected ExSIA FULL collector allocation failure", false},
+              {}};
+    }
+  }
+#endif
+  std::unique_ptr<ExsiaFullExecution::Impl> impl;
+  try {
+    impl = std::make_unique<ExsiaFullExecution::Impl>(args);
+    impl->staged_output.assign(output_extent, 0.0f);
+    const size_t stripe_count =
+        (args.I - 1) / args.activation_rows_per_stripe + 1;
+    impl->captured.reserve(stripe_count);
+  } catch (const std::bad_alloc &) {
+    return {{Error::out_of_memory,
+             "failed to allocate IM2P ExSIA FULL transaction", false},
+            {}};
+  } catch (...) {
+    return {{Error::execution_failure,
+             "failed to initialize IM2P ExSIA FULL transaction", false},
+            {}};
+  }
+  std::unique_ptr<ExsiaFullExecution> execution(
+      new (std::nothrow) ExsiaFullExecution(std::move(impl)));
+  if (!execution) {
+    return {{Error::out_of_memory, "failed to allocate IM2P ExSIA FULL handle",
+             false},
+            {}};
+  }
+  return {{}, std::move(execution)};
+}
+
+Completion ExsiaFullExecution::finish(bool quantization_succeeded) noexcept {
+  if (!impl_ || impl_->finished || !impl_->sink_installed) {
+    return {{Error::invalid_state,
+             "IM2P ExSIA FULL transaction is not finishable", false},
+            {}};
+  }
+  impl_->finished = true;
+  if (impl_->args.exsia_stripe_ready_sink == &impl_->sink) {
+    impl_->args.exsia_stripe_ready_sink = nullptr;
+  }
+  if (!impl_->collector_result.ok())
+    return {impl_->collector_result, {}};
+  if (!quantization_succeeded) {
+    return {{Error::execution_failure, "ExSIA quantization failed", false}, {}};
+  }
+
+  impl_->runtime_args = impl_->args;
+  impl_->runtime_args.D = nullptr;
+  impl_->runtime_args.repeating_bias = false;
+  impl_->runtime_args.f_out = impl_->staged_output.data();
+  impl_->runtime_args.exsia_stripe_ready_sink = nullptr;
+#if defined(GGML_GEMMINI_TESTING)
+  TestFailure failure;
+  {
+    std::lock_guard lock(test_mutex);
+    ++counters.full;
+    failure = injected_failure;
+    if (failure == TestFailure::execute) {
+      production_failed = true;
+      return {
+          {Error::execution_failure, "injected IM2P execute failure", false},
+          {}};
+    }
+  }
+#endif
+  auto started = ::im2p::gemmini::execute(&impl_->runtime_args,
+                                          ::im2p::gemmini::Mode::full,
+                                          ::im2p::gemmini::Options{65536});
+  if (!started.status.ok())
+    return {translate(started.status), {}};
+  if (!started.run) {
+    return {{Error::invalid_state, "IM2P execute returned no FULL run", false},
+            {}};
+  }
+  impl_->run = std::move(started.run);
+#if defined(GGML_GEMMINI_TESTING)
+  {
+    std::lock_guard lock(test_mutex);
+    ++counters.fence;
+  }
+#endif
+  Completion completion = translate(::im2p::gemmini::fence(*impl_->run));
+  impl_->fenced = true;
+#if defined(GGML_GEMMINI_TESTING)
+  if (failure == TestFailure::fence) {
+    return {{Error::execution_failure, "injected IM2P fence failure", false},
+            completion.stats};
+  }
+#endif
+  if (!completion.result.ok())
+    return completion;
+
+  const Result rmd =
+      apply_captured_rmd(impl_->runtime_args, impl_->staged_output.data(),
+                         impl_->staged_output.size(), impl_->captured);
+  if (!rmd.ok())
+    return {rmd, completion.stats};
+  impl_->mark_rmd_terminal_success();
+  impl_->copy_staged_output();
+  return completion;
+}
 
 ExsiaStripePipeline::ExsiaStripePipeline(std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}
@@ -600,123 +955,12 @@ Completion ExsiaStripePipeline::finish(bool quantization_succeeded) noexcept {
     return {translate(output_stage.status), completion.stats};
   }
 
-  std::unique_ptr<ggml_gemmini_args_t> rmd_args;
-  try {
-    // Start from the immutable run snapshot, then install only theta values
-    // captured by post-fold publication. No future ExSIA metadata is read here.
-    rmd_args = std::make_unique<ggml_gemmini_args_t>(impl_->runtime_args);
-    rmd_args->f_out = output_stage.data;
-    size_t output_extent = 0;
-    if (!checked_output_extent(*rmd_args, output_extent) ||
-        output_extent > output_stage.element_count) {
-      (void)impl_->authorize(false);
-      return {{Error::invalid_contract,
-               "frontend RMD staging does not cover the output layout", false},
-              completion.stats};
-    }
-    auto &captured_meta =
-        rmd_args->act_quant.storage().emplace<quants::act::exsia::Meta>();
-    captured_meta.theta.assign(impl_->published.size(),
-                               std::numeric_limits<std::int16_t>::min());
-    for (const auto &stripe : impl_->published) {
-      if (stripe.event.stripe_id >= captured_meta.theta.size()) {
-        (void)impl_->authorize(false);
-        return {{Error::invalid_contract,
-                 "published ExSIA stripe id is not contiguous", false},
-                completion.stats};
-      }
-      captured_meta.theta[stripe.event.stripe_id] = stripe.theta;
-    }
-  } catch (const std::bad_alloc &) {
+  const Result rmd =
+      apply_captured_rmd(impl_->runtime_args, output_stage.data,
+                         output_stage.element_count, impl_->published);
+  if (!rmd.ok()) {
     (void)impl_->authorize(false);
-    return {{Error::out_of_memory, "failed to stage published ExSIA metadata",
-             false},
-            completion.stats};
-  } catch (...) {
-    (void)impl_->authorize(false);
-    return {{Error::execution_failure,
-             "failed to stage published ExSIA metadata", false},
-            completion.stats};
-  }
-  ResolvedMatmulOptions options;
-  options.mode = MatmulInvocationMode::stripe_pipeline;
-  options.stripe_rows = impl_->args.activation_rows_per_stripe;
-  options.stripe_rows_auto = false;
-  options.job_capacity = std::max<size_t>(2, impl_->published.size());
-  options.rmd_backend = RmdBackend::cpu_direct;
-  MatmulExecution execution = prepare_execution(rmd_args.get(), options);
-  if (!execution.status().ok()) {
-    (void)impl_->authorize(false);
-    return {from_matmul_status(execution.status()), completion.stats};
-  }
-
-  std::vector<MatmulStripeJob> jobs;
-  try {
-    jobs.reserve(impl_->published.size());
-    for (const auto &stripe : impl_->published) {
-      jobs.push_back(capture_stripe(
-          execution,
-          MatmulStripeInput(stripe.event.row_begin, stripe.event.row_end,
-                            stripe.event.stripe_id),
-          stripe.event.direct_residual, stripe.event.rmd_packet));
-      if (!jobs.back().status().ok()) {
-        (void)impl_->authorize(false);
-        return {from_matmul_status(jobs.back().status()), completion.stats};
-      }
-    }
-  } catch (const std::bad_alloc &) {
-    (void)impl_->authorize(false);
-    return {{Error::out_of_memory, "failed to stage ExSIA RMD jobs", false},
-            completion.stats};
-  } catch (...) {
-    (void)impl_->authorize(false);
-    return {{Error::execution_failure, "failed to stage ExSIA RMD jobs", false},
-            completion.stats};
-  }
-
-  for (size_t index = 0; index < jobs.size(); ++index) {
-    MatmulStatus status = accept_external_dense_completion(jobs[index]);
-    if (status.ok()) {
-      status = execute_rmd_stripe(jobs[index]);
-    }
-    if (status.ok()) {
-      status = compose_rmd_stripe(jobs[index]);
-    }
-    if (!status.ok()) {
-      (void)impl_->authorize(false);
-      return {from_matmul_status(status), completion.stats};
-    }
-#if defined(GGML_GEMMINI_TESTING)
-    {
-      std::lock_guard lock(test_mutex);
-      ++counters.rmd_calls;
-      const auto &direct = impl_->published[index].event.direct_residual;
-      if (direct) {
-        counters.rmd_events += direct->events.size();
-      }
-    }
-#endif
-  }
-
-#if defined(GGML_GEMMINI_TESTING)
-  if (failure == TestFailure::rmd) {
-    (void)impl_->authorize(false);
-    return {{Error::execution_failure, "injected RMD failure", false},
-            completion.stats};
-  }
-#endif
-
-  for (auto &job : jobs) {
-    const MatmulStatus status = finalize_stripe(job);
-    if (!status.ok()) {
-      (void)impl_->authorize(false);
-      return {from_matmul_status(status), completion.stats};
-    }
-  }
-  const MatmulStatus finished = finish_execution(execution);
-  if (!finished.ok()) {
-    (void)impl_->authorize(false);
-    return {from_matmul_status(finished), completion.stats};
+    return {rmd, completion.stats};
   }
   impl_->mark_rmd_terminal_success();
   const Result authorized = impl_->authorize(true);
@@ -805,6 +1049,7 @@ void test_observe_hardware_dispatch() noexcept {
   std::lock_guard lock(test_mutex);
   ++counters.hardware;
 }
+
 #endif
 
 void log_failure(const char *operation, const Result &result) noexcept {

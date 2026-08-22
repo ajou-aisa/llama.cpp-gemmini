@@ -54,7 +54,39 @@ struct Completion {
 translate(const ::im2p::gemmini::FenceResult &result) noexcept;
 [[nodiscard]] Completion run_full(const ggml_gemmini_args_t &args) noexcept;
 [[nodiscard]] Result gate_route(bool exsia, std::uint8_t activation_bits,
-                                bool rmd_enabled, bool cpu_direct_rmd) noexcept;
+                                bool rmd_enabled, bool cpu_direct_rmd,
+                                std::uint8_t weight_bits = 8) noexcept;
+
+struct ExsiaFullExecutionStart;
+
+class ExsiaFullExecution {
+public:
+  ExsiaFullExecution(ExsiaFullExecution &&) noexcept;
+  ExsiaFullExecution &operator=(ExsiaFullExecution &&) noexcept;
+  ~ExsiaFullExecution();
+
+  ExsiaFullExecution(const ExsiaFullExecution &) = delete;
+  ExsiaFullExecution &operator=(const ExsiaFullExecution &) = delete;
+
+  [[nodiscard]] Result install_sink() noexcept;
+  [[nodiscard]] Completion finish(bool quantization_succeeded) noexcept;
+
+private:
+  class Impl;
+  explicit ExsiaFullExecution(std::unique_ptr<Impl>) noexcept;
+  std::unique_ptr<Impl> impl_;
+
+  friend ExsiaFullExecutionStart
+  start_exsia_full_execution(ggml_gemmini_args_t &) noexcept;
+};
+
+struct ExsiaFullExecutionStart {
+  Result result{};
+  std::unique_ptr<ExsiaFullExecution> execution;
+};
+
+[[nodiscard]] ExsiaFullExecutionStart
+start_exsia_full_execution(ggml_gemmini_args_t &args) noexcept;
 
 struct ExsiaStripePipelineStart;
 
@@ -103,6 +135,8 @@ enum class TestFailure : std::uint8_t {
   fence,
   blocked_submit,
   rmd,
+  collector_allocation,
+  collector_capture,
 };
 
 struct TestCounters {
@@ -116,6 +150,9 @@ struct TestCounters {
   std::uint64_t rmd_events = 0;
   std::uint64_t authorize = 0;
   std::uint64_t commit = 0;
+  std::uint64_t commit_event = 0;
+  std::uint64_t collector_events = 0;
+  std::uint64_t collector_handles = 0;
   std::uint64_t hardware = 0;
   std::uint64_t fallback = 0;
   std::uint64_t live_runs = 0;
@@ -134,6 +171,9 @@ struct TestCounters {
   std::size_t stripe_trace_size = 0;
   std::array<int, kTestStripeTraceCapacity> stripe_ids{};
   std::array<int, kTestStripeTraceCapacity> slot_ids{};
+  std::array<std::size_t, kTestStripeTraceCapacity> collector_row_begin{};
+  std::array<std::size_t, kTestStripeTraceCapacity> collector_row_end{};
+  std::array<std::int16_t, kTestStripeTraceCapacity> collector_theta{};
 };
 
 void test_reset() noexcept;

@@ -151,12 +151,109 @@ bool test_stage_state_failures() {
   return ok;
 }
 
+bool test_capability_matrix() {
+  using namespace ggml::gemmini::im2p_adapter;
+  struct CapabilityCase {
+    const char *name;
+    bool exsia;
+    std::uint8_t activation_bits;
+    std::uint8_t weight_bits;
+    bool rmd_enabled;
+    bool cpu_direct_rmd;
+    Error expected;
+  };
+  constexpr CapabilityCase cases[] = {
+      {"a8-q8-exsia", true, 8, 8, true, true, Error::success},
+      {"a4-q8-exsia", true, 4, 8, true, true,
+       Error::unsupported_route},
+      {"a16-q8-exsia", true, 16, 8, true, true,
+       Error::unsupported_route},
+      {"a8-q4-exsia", true, 8, 4, true, true,
+       Error::unsupported_route},
+      {"a8-q16-exsia", true, 8, 16, true, true,
+       Error::unsupported_route},
+      {"a8-q12-exsia", true, 8, 12, true, true,
+       Error::unsupported_route},
+      {"a4-q8-non-exsia", false, 4, 8, false, false, Error::success},
+      {"a16-q8-non-exsia", false, 16, 8, false, false, Error::success},
+      {"a8-q4-non-exsia", false, 8, 4, false, false,
+       Error::unsupported_route},
+      {"a8-q16-non-exsia", false, 8, 16, false, false,
+       Error::unsupported_route},
+  };
+
+  std::vector<float> output(6, 9876.0f);
+  const auto sentinel = output;
+  test_reset();
+  for (const auto &test : cases) {
+    const Result result = gate_route(test.exsia, test.activation_bits,
+                                     test.rmd_enabled, test.cpu_direct_rmd,
+                                     test.weight_bits);
+    if (!lifecycle_check(result.error == test.expected, test.name)) {
+      return false;
+    }
+  }
+  const TestCounters counters = test_counters();
+  return lifecycle_check(
+             output == sentinel,
+             "capability rejections preserve the caller sentinel") &&
+         lifecycle_check(
+             counters.full == 0 && counters.pipeline == 0 &&
+                 counters.fence == 0 && counters.stripe == 0 &&
+                 counters.rmd_calls == 0 && counters.authorize == 0 &&
+                 counters.commit == 0 && counters.hardware == 0 &&
+                 counters.fallback == 0 && counters.live_runs == 0,
+             "capability gate rejects before allocation, execution, RMD, or fallback");
+}
+
+bool test_full_handle_state() {
+  using namespace ggml::gemmini::im2p_adapter;
+  std::vector<elem_t> activation = {1, 2, 3, 4, 5, 6};
+  std::vector<elem_t> weights = {1, -1, 2, 3};
+  std::vector<float> output(6, 9876.0f);
+  const auto sentinel = output;
+  auto args = lifecycle_args(activation, weights, output);
+  args.activation_rows_per_stripe = 1;
+
+  test_reset();
+  auto started = start_exsia_full_execution(args);
+  bool ok = lifecycle_check(started.result.ok() && started.execution,
+                            "FULL transaction allocates without a worker");
+  ok = lifecycle_check(started.execution->install_sink().ok() &&
+                           args.exsia_stripe_ready_sink != nullptr,
+                       "FULL collector installs before quantization") && ok;
+  ok = lifecycle_check(started.execution->install_sink().error ==
+                           Error::invalid_state,
+                       "FULL collector rejects duplicate installation") && ok;
+  ok = lifecycle_check(!started.execution->finish(false).result.ok() &&
+                           args.exsia_stripe_ready_sink == nullptr,
+                       "FULL cancellation clears its borrowed sink") && ok;
+  ok = lifecycle_check(started.execution->finish(false).result.error ==
+                           Error::invalid_state,
+                       "FULL transaction rejects stale repeated finish") && ok;
+  started.execution.reset();
+
+  auto abandoned = start_exsia_full_execution(args);
+  ok = lifecycle_check(abandoned.result.ok() && abandoned.execution &&
+                           abandoned.execution->install_sink().ok(),
+                       "FULL ownership can be reacquired after cancellation") && ok;
+  abandoned.execution.reset();
+  const auto counters = test_counters();
+  return lifecycle_check(args.exsia_stripe_ready_sink == nullptr,
+                         "FULL destructor releases only its sink ownership") &&
+         lifecycle_check(output == sentinel,
+                         "FULL cancellation leaves partial output hidden") &&
+         lifecycle_check(counters.full == 0 && counters.pipeline == 0 &&
+                             counters.fence == 0 && counters.commit == 0,
+                         "FULL cancellation creates no simulator run") && ok;
+}
+
 bool test_invalid_reuse() {
   using namespace ggml::gemmini::im2p_adapter;
   test_reset();
   const size_t before = resident_bytes();
   for (size_t iteration = 0; iteration < 1000; ++iteration) {
-    const Result rejected = gate_route(true, 16, true, true);
+    const Result rejected = gate_route(true, 16, true, true, 8);
     if (!lifecycle_check(
             rejected.error == Error::unsupported_route,
             "invalid backend route returns one stable typed error")) {
@@ -187,8 +284,9 @@ bool run_routing_suite() {
 }
 
 void print_help(const char *program) {
-  std::printf("usage: %s [--case all|routing|stage-failures|invalid-reuse]\n",
-              program);
+  std::printf(
+      "usage: %s [--case all|routing|stage-failures|capabilities|full-state|invalid-reuse]\n",
+      program);
 }
 
 } // namespace
@@ -208,12 +306,16 @@ int main(int argc, char **argv) {
 
   bool ok = false;
   if (selected == "all") {
-    ok = test_stage_state_failures() && test_invalid_reuse() &&
-         run_routing_suite();
+    ok = test_stage_state_failures() && test_capability_matrix() &&
+         test_full_handle_state() && test_invalid_reuse() && run_routing_suite();
   } else if (selected == "routing") {
     ok = run_routing_suite();
   } else if (selected == "stage-failures") {
     ok = test_stage_state_failures();
+  } else if (selected == "capabilities") {
+    ok = test_capability_matrix();
+  } else if (selected == "full-state") {
+    ok = test_full_handle_state();
   } else if (selected == "invalid-reuse") {
     ok = test_invalid_reuse();
   } else {

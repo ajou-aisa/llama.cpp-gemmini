@@ -1,3 +1,4 @@
+#define GGML_GEMMINI_TESTING 1
 #define GGML_GEMMINI_TEST_OBSERVER 1
 
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-matmul.hpp"
@@ -59,11 +60,59 @@ bool same_output(const std::vector<float> & left, const std::vector<float> & rig
         std::memcmp(left.data(), right.data(), left.size() * sizeof(float)) == 0;
 }
 
+bool counters_zero(const MatmulTestCounters & counters) {
+    return counters.execution_constructions == 0 && counters.allocation_attempts == 0 &&
+        counters.dense_dispatches == 0 && counters.residual_dispatches == 0 &&
+        counters.hardware_dispatches == 0 && counters.fallback_dispatches == 0;
+}
+
+bool test_exsia_sequential_rejects_before_work() {
+    if (config::ACTIVATION_QUANT !=
+        static_cast<int>(config::ActivationQuantAlgo::EXSIA)) {
+        return true;
+    }
+
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    const std::vector<float> environment_sentinel(6, 73.0f);
+    std::vector<float> environment_output = environment_sentinel;
+    auto environment_args = make_args(activation, weights, environment_output);
+
+    unsetenv("GEMMINI_MATMUL_MODE");
+    test_reset_matmul_counters();
+    setenv("GEMMINI_MATMUL_MODE", "STRIPE_SEQUENTIAL", 1);
+    const MatmulStatus environment_status = matmul(environment_args);
+    const MatmulTestCounters environment_counters = test_matmul_counters();
+    unsetenv("GEMMINI_MATMUL_MODE");
+
+    const std::vector<float> explicit_sentinel(6, 79.0f);
+    std::vector<float> explicit_output = explicit_sentinel;
+    auto explicit_args = make_args(activation, weights, explicit_output);
+    MatmulOptions explicit_options{};
+    explicit_options.mode = MatmulInvocationMode::stripe_sequential;
+    test_reset_matmul_counters();
+    const MatmulStatus explicit_status = matmul(explicit_args, explicit_options);
+    const MatmulTestCounters explicit_counters = test_matmul_counters();
+
+    return expect(environment_status.code == MatmulStatusCode::unsupported_invocation,
+                  "environment ExSIA sequential has typed rejection") &&
+        expect(environment_output == environment_sentinel,
+               "environment ExSIA sequential preserves nonzero output sentinel") &&
+        expect(counters_zero(environment_counters),
+               "environment ExSIA sequential performs zero construction/allocation/dispatch") &&
+        expect(explicit_status.code == MatmulStatusCode::unsupported_invocation,
+               "explicit ExSIA sequential has typed rejection") &&
+        expect(explicit_output == explicit_sentinel,
+               "explicit ExSIA sequential preserves nonzero output sentinel") &&
+        expect(counters_zero(explicit_counters),
+               "explicit ExSIA sequential performs zero construction/allocation/dispatch");
+}
+
 bool test_output_parity() {
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
     std::vector<float> full_output(6, 0.0f);
-    std::vector<float> sequential_output(6, 0.0f);
+    std::vector<float> sequential_output(6, 73.0f);
     std::vector<float> pipeline_output(6, 0.0f);
 
     auto full_args = make_args(activation, weights, full_output);
@@ -103,10 +152,17 @@ bool test_output_parity() {
     const MatmulStatus collected = collector.finish();
     const MatmulStatus pipeline = finish_execution(execution);
 
+    const bool exsia = config::ACTIVATION_QUANT ==
+        static_cast<int>(config::ActivationQuantAlgo::EXSIA);
+    const bool sequential_contract = exsia
+        ? expect(sequential.code == MatmulStatusCode::unsupported_invocation &&
+                     sequential_output == std::vector<float>(6, 73.0f),
+                 "ExSIA STRIPE_SEQUENTIAL rejects before dispatch")
+        : expect(sequential.ok() && same_output(full_output, sequential_output),
+                 "non-ExSIA STRIPE_SEQUENTIAL succeeds with FULL parity");
     return expect(full.ok(), "FULL succeeds") &&
-        expect(sequential.ok(), "STRIPE_SEQUENTIAL succeeds") &&
+        sequential_contract &&
         expect(accepted && collected.ok() && pipeline.ok(), "PIPELINE succeeds") &&
-        expect(same_output(full_output, sequential_output), "FULL/STRIPE_SEQUENTIAL parity") &&
         expect(same_output(full_output, pipeline_output), "FULL/PIPELINE parity");
 }
 
@@ -126,10 +182,41 @@ void install_direct_payloads(ggml_gemmini_args_t & args) {
     };
 }
 
+bool test_counter_hooks_connected() {
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> fallback_output(6, 0.0f);
+    auto fallback_args = make_args(activation, weights, fallback_output);
+    install_direct_payloads(fallback_args);
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::full;
+    options.rmd_backend = RmdBackend::cpu_direct;
+
+    test_reset_matmul_counters();
+    const MatmulStatus fallback_status = matmul(fallback_args, options);
+    const MatmulTestCounters fallback = test_matmul_counters();
+
+    std::vector<float> hardware_output(6, 0.0f);
+    auto hardware_args = make_args(activation, weights, hardware_output);
+    hardware_args.tiled_matmul_type = static_cast<tiled_matmul_type_t>(1);
+    test_reset_matmul_counters();
+    const MatmulStatus hardware_status = matmul(hardware_args, options);
+    const MatmulTestCounters hardware = test_matmul_counters();
+
+    return expect(fallback_status.ok(), "counter fallback control succeeds") &&
+        expect(fallback.execution_constructions > 0 && fallback.allocation_attempts > 0 &&
+                   fallback.dense_dispatches > 0 && fallback.residual_dispatches > 0 &&
+                   fallback.fallback_dispatches > 0,
+               "construction/allocation/dense/residual/fallback hooks observe real work") &&
+        expect(hardware_status.ok() && hardware.dense_dispatches > 0 &&
+                   hardware.hardware_dispatches > 0,
+               "hardware hook observes real dispatch");
+}
+
 bool test_cpu_direct_lifecycle_parity() {
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
-    std::vector<float> full_output(6, 0.0f), sequential_output(6, 0.0f), pipeline_output(6, 0.0f);
+    std::vector<float> full_output(6, 0.0f), sequential_output(6, 79.0f), pipeline_output(6, 0.0f);
     MatmulOptions options{};
     options.rmd_backend = RmdBackend::cpu_direct;
 
@@ -165,13 +252,21 @@ bool test_cpu_direct_lifecycle_parity() {
     const MatmulStatus collected = collector.finish();
     const MatmulStatus pipeline = finish_execution(execution);
 
-    return expect(full.ok() && repeated_full.ok() && sequential.ok() && accepted &&
-                      collected.ok() && pipeline.ok(),
-                  "direct backend succeeds in FULL/sequential/pipeline and repeated FULL") &&
+    const bool exsia = config::ACTIVATION_QUANT ==
+        static_cast<int>(config::ActivationQuantAlgo::EXSIA);
+    const bool sequential_contract = exsia
+        ? expect(sequential.code == MatmulStatusCode::unsupported_invocation &&
+                     sequential_output == std::vector<float>(6, 79.0f),
+                 "ExSIA direct STRIPE_SEQUENTIAL rejects before dispatch")
+        : expect(sequential.ok() && same_output(full_output, sequential_output),
+                 "non-ExSIA direct STRIPE_SEQUENTIAL succeeds with FULL parity");
+    return expect(full.ok() && repeated_full.ok() && accepted && collected.ok() && pipeline.ok(),
+                  "direct backend succeeds in FULL/pipeline and repeated FULL") &&
+        sequential_contract &&
         expect(same_output(first_full_output, full_output),
                "repeated direct invocation has no stale residual state") &&
-        expect(same_output(full_output, sequential_output) && same_output(full_output, pipeline_output),
-               "direct backend final-output parity") &&
+        expect(same_output(full_output, pipeline_output),
+               "direct backend FULL/pipeline final-output parity") &&
         expect(full_output[0] != 5.0f || full_output[1] != 5.0f,
                "direct residual is merged after dense output") &&
         expect(full_args.tiled_matmul_type == main_route && sequential_args.tiled_matmul_type == main_route &&
@@ -265,9 +360,15 @@ bool test_bad_routes() {
     invalid_options.stripe_rows = 0;
     const MatmulStatus invalid = matmul(unsupported_args, invalid_options);
 
+    const bool exsia = config::ACTIVATION_QUANT ==
+        static_cast<int>(config::ActivationQuantAlgo::EXSIA);
     return expect(malformed.code == MatmulStatusCode::invalid_contract, "malformed route rejected") &&
-        expect(unsupported.code == MatmulStatusCode::unsupported_route, "unsupported route rejected") &&
-        expect(invalid.code == MatmulStatusCode::invalid_argument, "invalid options rejected");
+        expect(unsupported.code == (exsia ? MatmulStatusCode::unsupported_invocation
+                                         : MatmulStatusCode::unsupported_route),
+               exsia ? "ExSIA sequential route rejected before dispatch"
+                     : "unsupported route rejected") &&
+        expect(invalid.code == MatmulStatusCode::invalid_argument,
+               "invalid options rejected");
 }
 
 bool test_cancel_and_failure() {
@@ -358,14 +459,23 @@ int main(int argc, char ** argv) {
 #ifdef GGML_GEMMINI_PIPELINE_WRITER_TEST_ONLY
     return 1;
 #else
-    if (!test_output_parity() || !test_cpu_direct_lifecycle_parity() ||
+    if (argc == 2 && std::string(argv[1]) == "--probe-exsia-sequential") {
+        const bool ok = test_exsia_sequential_rejects_before_work();
+        if (ok) {
+            std::puts("PASS: environment+explicit typed rejection; observed counters all zero; nonzero sentinels preserved");
+        }
+        return ok ? 0 : 1;
+    }
+    if (!test_exsia_sequential_rejects_before_work() ||
+        !test_output_parity() || !test_counter_hooks_connected() ||
+        !test_cpu_direct_lifecycle_parity() ||
         !test_merge_destination_override() ||
         !test_cpu_direct_failure_commits_no_partial_correction() ||
         !test_ws_preflight_is_atomic_on_host() ||
         !test_bad_routes() || !test_cancel_and_failure()) {
         return 1;
     }
-    std::puts("PASS: FULL/STRIPE_SEQUENTIAL/PIPELINE parity; malformed/unsupported/cancel/failure coverage");
+    std::puts("PASS: public mode contract/parity; malformed/unsupported/cancel/failure coverage");
     return 0;
 #endif
 }

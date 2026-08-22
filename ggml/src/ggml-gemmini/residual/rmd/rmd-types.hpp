@@ -30,8 +30,9 @@ constexpr size_t kBlockSize = kNativeWeightScaleGroup;
 constexpr size_t kMaxLanes = 4;
 
 static_assert(kArrayDim > 0, "Gemmini DIM must be positive");
-static_assert(kBlockSize > 0, "GGML_GEMMINI_BLOCK_SIZE must be positive");
-static_assert(kBlockSize % kArrayDim == 0, "GGML_GEMMINI_BLOCK_SIZE must be a multiple of DIM");
+static_assert(kBlockSize > 0, "native Q8 weight group must be positive");
+static_assert(kBlockSize % kArrayDim == 0 || kArrayDim % kBlockSize == 0,
+              "Gemmini DIM and native Q8 weight group must divide one another");
 
 constexpr uint32_t kPacketVersion = 1;
 

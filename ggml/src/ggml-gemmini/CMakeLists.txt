@@ -82,6 +82,9 @@ target_compile_features(ggml-gemmini PRIVATE cxx_std_17)
 target_compile_definitions(ggml-gemmini PRIVATE
   GGML_GEMMINI_MATMUL_IMPLEMENTATION
   GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE})
+if (LLAMA_BUILD_TESTS AND NOT GGML_BACKEND_DL)
+  target_compile_definitions(ggml-gemmini PUBLIC GGML_GEMMINI_TESTING=1)
+endif()
 
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
   target_compile_options(ggml-gemmini PRIVATE ${GEMMINI_COMMON_FLAGS} ${GEMMINI_RISCV_FLAGS})
@@ -166,7 +169,6 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
   find_package(Threads REQUIRED)
   target_sources(ggml-gemmini PRIVATE ggml-gemmini-im2p.cpp)
   if (LLAMA_BUILD_TESTS AND NOT GGML_BACKEND_DL)
-    target_compile_definitions(ggml-gemmini PRIVATE GGML_GEMMINI_TESTING=1)
     target_include_directories(ggml-gemmini PRIVATE
       "${IM2P_SIM_ROOT}/frontend/tests")
   endif()

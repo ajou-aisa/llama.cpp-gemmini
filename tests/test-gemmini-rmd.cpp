@@ -76,7 +76,8 @@ bool test_EXPLICIT_BLOCK_ID_DIM_PADDING() {
                "rows use DIM padding") && ok;
     ok = check(first.padded_k_count == kArrayDim && second.padded_k_count == kArrayDim,
                "each block uses independent DIM padding") && ok;
-    ok = check(packet->j_padded == 2 * kArrayDim, "output columns use DIM padding") && ok;
+    ok = check(packet->j_padded == align_up(packet->logical_j, kArrayDim),
+               "output columns use DIM padding") && ok;
     ok = check(validate_packet(*packet) == RmdStatus::success, "built packet validates") && ok;
 
     StripePacket malformed = *packet;

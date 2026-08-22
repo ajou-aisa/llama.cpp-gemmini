@@ -22,6 +22,12 @@
 #include <unordered_set>
 #include <vector>
 
+#if !defined(GGML_GEMMINI_CONFIG_HAS_ACTIVATION_QUANT)
+namespace ggml::gemmini::config {
+inline constexpr int ACTIVATION_QUANT = static_cast<int>(CURRENT_ACTIVATION_QUANT);
+}
+#endif
+
 namespace ggml::gemmini {
 
 struct MatmulJobMetrics;
@@ -180,6 +186,20 @@ struct MatmulStatus {
 
     explicit operator bool() const { return ok(); }
 };
+
+#if defined(GGML_GEMMINI_TESTING)
+struct MatmulTestCounters {
+    uint64_t execution_constructions = 0;
+    uint64_t allocation_attempts = 0;
+    uint64_t dense_dispatches = 0;
+    uint64_t residual_dispatches = 0;
+    uint64_t hardware_dispatches = 0;
+    uint64_t fallback_dispatches = 0;
+};
+
+void test_reset_matmul_counters();
+MatmulTestCounters test_matmul_counters();
+#endif
 
 struct MatmulStageMetrics {
     uint64_t nanoseconds = 0;
@@ -617,6 +637,11 @@ inline MatmulOptionsResolution resolve_matmul_options(const MatmulOptionOverride
     }
     if (result.options.rmd_backend != RmdBackend::cpu_direct && result.options.rmd_backend != RmdBackend::gemmini_ws_compact) {
         result.error = MatmulOptionsError::invalid_rmd_backend;
+        return result;
+    }
+    if (config::ACTIVATION_QUANT == static_cast<int>(config::ActivationQuantAlgo::EXSIA) &&
+        result.options.mode == MatmulInvocationMode::stripe_sequential) {
+        result.error = MatmulOptionsError::disabled_mode;
         return result;
     }
     if ((result.options.mode != MatmulInvocationMode::full && !config::ENABLE_STRIPE_MATMUL) ||

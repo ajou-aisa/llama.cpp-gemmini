@@ -5,6 +5,7 @@
 
 #include "ggml-gemmini-args.h"
 #include "ggml-gemmini-im2p.hpp"
+#include "quants/act/exsia/exsia.hpp"
 #include "quants/act/exsia/exsia_shift.hpp"
 #include "quants/act/quantize.hpp"
 
@@ -141,9 +142,9 @@ const char *compiled_route() {
 #endif
 }
 
-std::vector<float> make_activations() {
-  std::vector<float> values(I * K);
-  for (int64_t i = 0; i < I; ++i) {
+std::vector<float> make_activations(int64_t rows = I) {
+  std::vector<float> values(rows * K);
+  for (int64_t i = 0; i < rows; ++i) {
     for (int64_t k = 0; k < K; ++k) {
 #if GGML_GEMMINI_ACTIVATION_QUANT == 0
       values[i * K + k] = 0.25f * static_cast<float>((i + 3 * k) % 15 - 7);
@@ -193,9 +194,10 @@ std::vector<uint8_t> make_weights() {
 bool scalar_oracle(const std::vector<float> &activations,
                    const std::vector<uint8_t> &weights,
                    std::vector<float> &expected) {
+  const int64_t rows = static_cast<int64_t>(activations.size()) / K;
   ggml_init_params params = {
-      ggml_tensor_overhead() * 4 + static_cast<size_t>(I * K) * sizeof(float) +
-          1024,
+      ggml_tensor_overhead() * 4 +
+          static_cast<size_t>(rows * K) * sizeof(float) + 1024,
       nullptr,
       false,
   };
@@ -203,12 +205,13 @@ bool scalar_oracle(const std::vector<float> &activations,
   if (context == nullptr) {
     return false;
   }
-  ggml_tensor *activation = ggml_new_tensor_2d(context, GGML_TYPE_F32, K, I);
+  ggml_tensor *activation =
+      ggml_new_tensor_2d(context, GGML_TYPE_F32, K, rows);
   std::memcpy(activation->data, activations.data(),
               activations.size() * sizeof(float));
 
   ggml_gemmini_args_t args{};
-  args.I = I;
+  args.I = rows;
   args.J = J;
   args.K = K;
   args.sA = K;
@@ -217,10 +220,11 @@ bool scalar_oracle(const std::vector<float> &activations,
   args.activation_rows_per_stripe = GGML_GEMMINI_TEST_IM2P_DIM;
   args.residual_route = ggml::gemmini::residual::ResidualRoute::cpu_direct;
 #endif
-  const bool allocated = args.A.allocate(I, K, GGML_GEMMINI_ACTIVATION_BITS);
+  const bool allocated =
+      args.A.allocate(rows, K, GGML_GEMMINI_ACTIVATION_BITS);
   const bool quantized =
       allocated && ggml::gemmini::quants::quantize_activation(activation, args);
-  std::vector<float> decoded(I * K);
+  std::vector<float> decoded(rows * K);
 #if GGML_GEMMINI_ACTIVATION_QUANT == 0
   const auto *exsia_meta = std::get_if<ggml::gemmini::quants::act::exsia::Meta>(
       &args.act_quant.storage());
@@ -234,7 +238,7 @@ bool scalar_oracle(const std::vector<float> &activations,
       residual_event_count += payload->events.size();
       for (const auto &event : payload->events) {
         const size_t row = payload->row_begin + event.local_row;
-        if (row >= static_cast<size_t>(I) ||
+        if (row >= static_cast<size_t>(rows) ||
             event.original_k >= static_cast<size_t>(K)) {
           ggml_free(context);
           return false;
@@ -243,10 +247,14 @@ bool scalar_oracle(const std::vector<float> &activations,
       }
     }
   }
+  const size_t stripe_count =
+      (static_cast<size_t>(rows) + GGML_GEMMINI_TEST_IM2P_DIM - 1) /
+      GGML_GEMMINI_TEST_IM2P_DIM;
   bool decoded_ok = quantized && exsia_meta != nullptr &&
-                    residual_event_count != 0 && exsia_meta->theta.size() == 3;
+                    residual_event_count != 0 &&
+                    exsia_meta->theta.size() == stripe_count;
   if (decoded_ok) {
-    for (int64_t i = 0; i < I; ++i) {
+    for (int64_t i = 0; i < rows; ++i) {
       const int stripe = static_cast<int>(i / GGML_GEMMINI_TEST_IM2P_DIM);
       const int16_t theta = exsia_meta->resolve_stripe_theta(stripe);
       if (theta == std::numeric_limits<int16_t>::min()) {
@@ -262,12 +270,13 @@ bool scalar_oracle(const std::vector<float> &activations,
 #else
   const bool decoded_ok =
       quantized && ggml::gemmini::quants::dequantize_activation(
-                       decoded.data(), K, 1, I, K, args);
+                       decoded.data(), K, 1, rows, K, args);
 #if GGML_GEMMINI_ACTIVATION_QUANT == 3
   const auto *block_meta = std::get_if<ggml::gemmini::quants::act::block::Meta>(
       &args.act_quant.storage());
   const bool valid_block_meta =
-      block_meta != nullptr && block_meta->scales.size() == I &&
+      block_meta != nullptr &&
+      block_meta->scales.size() == static_cast<size_t>(rows) &&
       block_meta->rmd_packets.empty() && block_meta->direct_residuals.empty() &&
       std::all_of(
           block_meta->scales.begin() + 1, block_meta->scales.end(),
@@ -285,11 +294,11 @@ bool scalar_oracle(const std::vector<float> &activations,
     return false;
   }
 
-  expected.assign(I * J, 0.0f);
+  expected.assign(rows * J, 0.0f);
 #if GGML_GEMMINI_ACTIVATION_QUANT == 0
   constexpr size_t blocks_per_row = K / QK8_0;
   const auto *blocks = reinterpret_cast<const block_q8_0 *>(weights.data());
-  for (int64_t i = 0; i < I; ++i) {
+  for (int64_t i = 0; i < rows; ++i) {
     for (int64_t j = 0; j < J; ++j) {
       for (int64_t k = 0; k < K; ++k) {
         const block_q8_0 &block =
@@ -303,7 +312,7 @@ bool scalar_oracle(const std::vector<float> &activations,
   }
 #else
   const size_t row_size = sizeof(float) + K;
-  for (int64_t i = 0; i < I; ++i) {
+  for (int64_t i = 0; i < rows; ++i) {
     for (int64_t j = 0; j < J; ++j) {
       const uint8_t *row = weights.data() + j * row_size;
       float scale = 0.0f;
@@ -321,12 +330,16 @@ bool scalar_oracle(const std::vector<float> &activations,
 }
 
 struct GraphCase {
+  explicit GraphCase(int64_t row_count = I)
+      : rows(row_count), activations(make_activations(row_count)) {}
+
+  int64_t rows = I;
   ggml_backend_t backend = nullptr;
   ggml_context *context = nullptr;
   ggml_backend_buffer_t buffer = nullptr;
   ggml_cgraph *graph = nullptr;
   ggml_tensor *output = nullptr;
-  std::vector<float> activations = make_activations();
+  std::vector<float> activations;
   std::vector<uint8_t> weights = make_weights();
 
   bool initialize() {
@@ -349,7 +362,8 @@ struct GraphCase {
     ggml_tensor *weight =
         ggml_new_tensor_2d(context, GGML_TYPE_Q8_CHANNEL, K, J);
 #endif
-    ggml_tensor *activation = ggml_new_tensor_2d(context, GGML_TYPE_F32, K, I);
+    ggml_tensor *activation =
+        ggml_new_tensor_2d(context, GGML_TYPE_F32, K, rows);
     output = ggml_mul_mat(context, weight, activation);
     buffer = ggml_backend_alloc_ctx_tensors(context, backend);
     if (buffer == nullptr) {
@@ -358,7 +372,7 @@ struct GraphCase {
     ggml_backend_tensor_set(weight, weights.data(), 0, weights.size());
     ggml_backend_tensor_set(activation, activations.data(), 0,
                             activations.size() * sizeof(float));
-    std::vector<float> initial(I * J, sentinel);
+    std::vector<float> initial(rows * J, sentinel);
     ggml_backend_tensor_set(output, initial.data(), 0,
                             initial.size() * sizeof(float));
     graph = ggml_new_graph(context);
@@ -379,7 +393,7 @@ struct GraphCase {
   }
 
   std::vector<float> read_output() const {
-    std::vector<float> values(I * J);
+    std::vector<float> values(rows * J);
     ggml_backend_tensor_get(output, values.data(), 0,
                             values.size() * sizeof(float));
     return values;
@@ -392,6 +406,76 @@ bool all_sentinel(const std::vector<float> &values) {
 }
 
 #if GGML_GEMMINI_ACTIVATION_QUANT == 0
+using TestFailure = ggml::gemmini::im2p_adapter::TestFailure;
+
+struct ExsiaPublicationTrace {
+  const ggml::gemmini::quants::act::exsia::Meta *meta = nullptr;
+  bool quantization_complete = false;
+  bool callback_before_completion = true;
+  std::array<ggml::gemmini::quants::act::exsia::StripeReadyEvent, 3> events{};
+  size_t event_count = 0;
+};
+
+bool trace_exsia_publication(
+    void *opaque,
+    const ggml::gemmini::quants::act::exsia::StripeReadyEvent &event) {
+  auto &trace = *static_cast<ExsiaPublicationTrace *>(opaque);
+  trace.callback_before_completion =
+      trace.callback_before_completion && !trace.quantization_complete;
+  if (trace.event_count >= trace.events.size()) {
+    return false;
+  }
+  trace.events[trace.event_count++] = event;
+  return trace.meta->resolve_stripe_theta(static_cast<int>(event.stripe_id)) !=
+         std::numeric_limits<int16_t>::min();
+}
+
+bool run_exsia_publication_boundary() {
+  using namespace ggml::gemmini::quants::act::exsia;
+  ggml_init_params params{ggml_tensor_overhead() * 2 +
+                               static_cast<size_t>(I * K) * sizeof(float) +
+                               1024,
+                           nullptr, false};
+  ggml_context *context = ggml_init(params);
+  if (!check(context != nullptr, "initialize ExSIA publication boundary input")) {
+    return false;
+  }
+  ggml_tensor *activation = ggml_new_tensor_2d(context, GGML_TYPE_F32, K, I);
+  const auto values = make_activations();
+  std::memcpy(activation->data, values.data(), values.size() * sizeof(float));
+
+  ggml_gemmini_args_t args{};
+  args.I = I;
+  args.J = J;
+  args.K = K;
+  args.sA = K;
+  args.tile_I = 1;
+  args.activation_rows_per_stripe = GGML_GEMMINI_TEST_IM2P_DIM;
+  args.residual_route = ggml::gemmini::residual::ResidualRoute::cpu_direct;
+  const bool allocated = args.A.allocate(I, K, GGML_GEMMINI_ACTIVATION_BITS);
+  Meta meta{};
+  ExsiaPublicationTrace trace{&meta};
+  StripeReadySink sink{&trace, trace_exsia_publication};
+  ExSIA exsia;
+  exsia.set_execution_mode(ExSIAState::ExecutionMode::Sequential);
+  const bool quantized = allocated && exsia.run(meta, activation, args, &sink);
+  trace.quantization_complete = true;
+  ggml_free(context);
+
+  return check(quantized, "three-stripe ExSIA quantization succeeds") &&
+         check(trace.event_count == 3,
+               "one callback is emitted for each sealed stripe") &&
+         check(trace.callback_before_completion,
+               "callback returns before whole ExSIA quantization completes") &&
+         check(trace.events[0].rmd_packet || trace.events[0].direct_residual,
+               "packet sealing precedes the publication callback") &&
+         check(trace.events[0].folding_commit_ns != 0,
+               "folding commit precedes the publication callback") &&
+         check(trace.events[0].slot == 0 && trace.events[1].slot == 1 &&
+                   trace.events[2].slot == 0,
+               "publication boundary retains the two-slot 0,1,0 cycle");
+}
+
 bool check_three_stripe_trace(
     const ggml::gemmini::im2p_adapter::TestCounters &counters) {
   return check(counters.stripe_trace_size == 3,
@@ -404,9 +488,272 @@ bool check_three_stripe_trace(
                "ExSIA slots are reused in order 0,1,0");
 }
 
-bool run_exsia_success() {
+bool run_exsia_full_success() {
   using namespace ggml::gemmini::im2p_adapter;
   setenv("GEMMINI_MATMUL_MODE", "FULL", 1);
+  setenv("GEMMINI_RMD_BACKEND", "CPU", 1);
+  GraphCase test_case;
+  if (!check(test_case.initialize(), "initialize ExSIA FULL adapter graph")) {
+    return false;
+  }
+  std::vector<float> expected;
+  if (!check(scalar_oracle(test_case.activations, test_case.weights, expected),
+             "build FULL ExSIA plus RMD scalar oracle")) {
+    return false;
+  }
+
+  test_reset();
+  const ggml_status status =
+      ggml_backend_graph_compute(test_case.backend, test_case.graph);
+  const auto counters = test_counters();
+  const auto actual = test_case.read_output();
+  bool ok =
+      check(status == GGML_STATUS_SUCCESS, "ExSIA FULL adapter succeeds") &&
+      check(!test_production_failed(), "FULL records no production failure") &&
+      check(counters.full == 1 && counters.pipeline == 0,
+            "FULL executes once without a pipeline run") &&
+      check(counters.fence == 1 && counters.stripe == 0 &&
+                counters.accepted_stripes == 0,
+            "FULL fences once and submits zero RTL stripes") &&
+      check(counters.collector_events == 3 && counters.rmd_calls == 3 &&
+                counters.rmd_events > 0,
+            "FULL collector owns and applies all RMD stripes") &&
+      check(counters.collector_handles == 3 &&
+                counters.collector_theta[0] !=
+                    std::numeric_limits<std::int16_t>::min() &&
+                counters.collector_theta[1] !=
+                    std::numeric_limits<std::int16_t>::min() &&
+                counters.collector_theta[2] !=
+                    std::numeric_limits<std::int16_t>::min(),
+            "FULL collector retains theta and owned RMD handles") &&
+      check(counters.collector_row_begin[0] == 0 &&
+                counters.collector_row_end[0] == GGML_GEMMINI_TEST_IM2P_DIM &&
+                counters.collector_row_begin[1] == GGML_GEMMINI_TEST_IM2P_DIM &&
+                counters.collector_row_end[1] ==
+                    2 * GGML_GEMMINI_TEST_IM2P_DIM &&
+                counters.collector_row_begin[2] ==
+                    2 * GGML_GEMMINI_TEST_IM2P_DIM &&
+                counters.collector_row_end[2] == static_cast<size_t>(I),
+            "FULL collector preserves exact ordered row bounds") &&
+      check(counters.rmd_terminal_event != 0 &&
+                counters.commit_event > counters.rmd_terminal_event &&
+                counters.commit == 1,
+            "FULL reaches terminal RMD before one caller commit") &&
+      check(counters.authorize == 0 && counters.live_runs == 0 &&
+                counters.hardware == 0 && counters.fallback == 0,
+            "FULL uses no pipeline authorization, leaked run, or fallback");
+  for (size_t index = 0; index < actual.size(); ++index) {
+    const float tolerance = 1e-4f * std::max(1.0f, std::fabs(expected[index]));
+    ok = check(std::isfinite(actual[index]) &&
+                   std::fabs(actual[index] - expected[index]) <= tolerance,
+               "FULL output matches scalar ExSIA plus RMD oracle") &&
+         ok;
+  }
+  if (ok) {
+    std::printf(
+        "events=collector[0:%zu-%zu,theta=%d,handle=owned;"
+        "1:%zu-%zu,theta=%d,handle=owned;2:%zu-%zu,theta=%d,handle=owned]>"
+        "full>fence>rmd[0,1,2]>terminal>commit "
+        "mode=full full=1 pipeline=0 stripes=0 fence=1 rmd=3 commit=1\n",
+        counters.collector_row_begin[0], counters.collector_row_end[0],
+        counters.collector_theta[0], counters.collector_row_begin[1],
+        counters.collector_row_end[1], counters.collector_theta[1],
+        counters.collector_row_begin[2], counters.collector_row_end[2],
+        counters.collector_theta[2]);
+  }
+  return ok;
+}
+
+bool run_exsia_cross_mode_parity() {
+  using namespace ggml::gemmini::im2p_adapter;
+  std::vector<float> oracle;
+  std::vector<float> full_output;
+  std::vector<float> pipeline_output;
+  TestCounters full_counters{};
+  TestCounters pipeline_counters{};
+
+  auto execute_mode = [&](const char *mode, std::vector<float> &output,
+                          TestCounters &counters) {
+    setenv("GEMMINI_MATMUL_MODE", mode, 1);
+    setenv("GEMMINI_RMD_BACKEND", "CPU", 1);
+    setenv("GEMMINI_STRIPE_JOB_CAPACITY", "2", 1);
+    GraphCase test_case;
+    if (!test_case.initialize()) {
+      return false;
+    }
+    if (oracle.empty() &&
+        !scalar_oracle(test_case.activations, test_case.weights, oracle)) {
+      return false;
+    }
+    test_reset();
+    const ggml_status status =
+        ggml_backend_graph_compute(test_case.backend, test_case.graph);
+    counters = test_counters();
+    output = test_case.read_output();
+    return status == GGML_STATUS_SUCCESS && !test_production_failed();
+  };
+
+  if (!check(execute_mode("FULL", full_output, full_counters),
+             "cross-mode FULL completes") ||
+      !check(execute_mode("STRIPE_PIPELINE", pipeline_output,
+                          pipeline_counters),
+             "cross-mode PIPELINE completes")) {
+    return false;
+  }
+  bool ok =
+      check(full_counters.full == 1 && full_counters.pipeline == 0 &&
+                full_counters.stripe == 0 && full_counters.commit == 1 &&
+                full_counters.fallback == 0,
+            "cross-mode FULL commits once with zero fallback") &&
+      check(pipeline_counters.full == 0 && pipeline_counters.pipeline == 1 &&
+                pipeline_counters.stripe == 3 &&
+                pipeline_counters.accepted_stripes == 3 &&
+                pipeline_counters.max_outstanding == 2 &&
+                pipeline_counters.rmd_calls == 3 &&
+                pipeline_counters.commit == 1 &&
+                pipeline_counters.fallback == 0,
+            "cross-mode PIPELINE publishes three capacity-two RMD stripes and commits once") &&
+      check(full_counters.rmd_calls == 3 &&
+                full_counters.rmd_terminal_event != 0 &&
+                full_counters.commit_event > full_counters.rmd_terminal_event &&
+                pipeline_counters.rmd_terminal_event != 0 &&
+                pipeline_counters.commit_event >
+                    pipeline_counters.rmd_terminal_event,
+            "both modes reach terminal RMD before commit");
+  float max_oracle_delta = 0.0f;
+  float max_mode_delta = 0.0f;
+  for (size_t index = 0; index < oracle.size(); ++index) {
+    const float tolerance = 1e-4f * std::max(1.0f, std::fabs(oracle[index]));
+    const float full_delta = std::fabs(full_output[index] - oracle[index]);
+    const float pipeline_delta =
+        std::fabs(pipeline_output[index] - oracle[index]);
+    const float mode_delta =
+        std::fabs(full_output[index] - pipeline_output[index]);
+    max_oracle_delta =
+        std::max(max_oracle_delta, std::max(full_delta, pipeline_delta));
+    max_mode_delta = std::max(max_mode_delta, mode_delta);
+    ok = check(full_delta <= tolerance && pipeline_delta <= tolerance &&
+                   mode_delta <= tolerance,
+               "FULL and PIPELINE match the independent ExSIA plus RMD oracle") &&
+         ok;
+  }
+  if (ok) {
+    std::printf("CROSS_MODE_QA full_output=[%.9g,%.9g] "
+                "pipeline_output=[%.9g,%.9g] oracle_delta=%.9g "
+                "mode_delta=%.9g events=terminal_rmd>commit "
+                "full_commit=1 pipeline_commit=1 capacity=2 fallback=0\n",
+                full_output[0], full_output[1], pipeline_output[0],
+                pipeline_output[1], max_oracle_delta, max_mode_delta);
+  }
+  return ok;
+}
+
+bool run_exsia_full_failure(TestFailure failure) {
+  using namespace ggml::gemmini::im2p_adapter;
+  GraphCase test_case;
+  if (!check(test_case.initialize(), "initialize ExSIA FULL failure graph")) {
+    return false;
+  }
+  setenv("GEMMINI_MATMUL_MODE", "FULL", 1);
+  setenv("GEMMINI_RMD_BACKEND", "CPU", 1);
+  test_reset();
+  test_inject_failure(failure);
+  const ggml_status status =
+      ggml_backend_graph_compute(test_case.backend, test_case.graph);
+  const auto counters = test_counters();
+  const bool prequant = failure == TestFailure::collector_allocation;
+  const bool quantization = failure == TestFailure::quantization;
+  const bool execute = failure == TestFailure::execute;
+  const bool fence = failure == TestFailure::fence;
+  const bool rmd = failure == TestFailure::rmd;
+  const bool ok =
+      check(status != GGML_STATUS_SUCCESS, "FULL failure reaches graph status") &&
+      check(all_sentinel(test_case.read_output()),
+            "FULL failure preserves the caller sentinel") &&
+      check(counters.pipeline == 0 && counters.stripe == 0 &&
+                counters.accepted_stripes == 0 && counters.commit == 0,
+            "FULL failure starts no pipeline, submits no stripe, and commits nothing") &&
+      check(counters.full == ((!prequant && !quantization) ? 1U : 0U) &&
+                counters.fence == ((fence || rmd) ? 1U : 0U) &&
+                counters.rmd_calls == (rmd ? 3U : 0U),
+            "FULL failure occurs at its injected lifecycle boundary") &&
+      check(counters.live_runs == 0 && counters.hardware == 0 &&
+                counters.fallback == 0,
+            "FULL failure leaks no run and enters no fallback");
+  if (ok) {
+    const char *name = prequant      ? "collector-allocation"
+                       : quantization ? "quantization"
+                       : execute      ? "execute"
+                       : fence        ? "fence"
+                                      : "rmd";
+    std::printf("full-failure=%s full=%llu fence=%llu rmd=%llu commit=0 "
+                "sentinel=preserved live_runs=0\n",
+                name, static_cast<unsigned long long>(counters.full),
+                static_cast<unsigned long long>(counters.fence),
+                static_cast<unsigned long long>(counters.rmd_calls));
+  }
+  return ok;
+}
+
+bool run_exsia_full_collector_capture_failure() {
+  using namespace ggml::gemmini::im2p_adapter;
+  setenv("GEMMINI_MATMUL_MODE", "FULL", 1);
+  setenv("GEMMINI_RMD_BACKEND", "CPU", 1);
+
+  GraphCase failed_case;
+  if (!check(failed_case.initialize(),
+             "initialize callback-originated collector failure graph")) {
+    return false;
+  }
+  test_reset();
+  test_inject_failure(TestFailure::collector_capture);
+  const ggml_status failed_status =
+      ggml_backend_graph_compute(failed_case.backend, failed_case.graph);
+  const TestCounters failed = test_counters();
+  bool ok =
+      check(failed_status != GGML_STATUS_SUCCESS,
+            "callback-originated collector failure reaches graph status") &&
+      check(failed.production_error == Error::invalid_contract,
+            "callback-originated collector failure preserves its typed result") &&
+      check(all_sentinel(failed_case.read_output()),
+            "callback-originated collector failure preserves caller sentinel") &&
+      check(failed.full == 0 && failed.pipeline == 0 && failed.fence == 0 &&
+                failed.stripe == 0 && failed.accepted_stripes == 0 &&
+                failed.rmd_calls == 0 && failed.authorize == 0 &&
+                failed.commit == 0 && failed.hardware == 0 &&
+                failed.fallback == 0 && failed.live_runs == 0,
+            "callback-originated collector failure starts no execution or fallback") &&
+      check(failed.quantization_failures == 0,
+            "collector callback failure is distinct from injected quantization failure");
+
+  GraphCase reused_case;
+  if (!check(reused_case.initialize(),
+             "initialize FULL transaction after collector failure")) {
+    return false;
+  }
+  test_reset();
+  const ggml_status reused_status =
+      ggml_backend_graph_compute(reused_case.backend, reused_case.graph);
+  const TestCounters reused = test_counters();
+  ok = check(reused_status == GGML_STATUS_SUCCESS &&
+                 !test_production_failed() && reused.full == 1 &&
+                 reused.pipeline == 0 && reused.fence == 1 &&
+                 reused.stripe == 0 && reused.rmd_calls == 3 &&
+                 reused.commit == 1 && reused.fallback == 0 &&
+                 reused.live_runs == 0,
+             "FULL lifecycle is reusable after collector callback failure") &&
+       ok;
+  if (ok) {
+    std::printf("full-failure=collector-capture error=invalid_contract "
+                "full=0 pipeline=0 fence=0 rmd=0 commit=0 fallback=0 "
+                "sentinel=preserved live_runs=0 reuse=pass\n");
+  }
+  return ok;
+}
+
+bool run_exsia_success() {
+  using namespace ggml::gemmini::im2p_adapter;
+  setenv("GEMMINI_MATMUL_MODE", "STRIPE_PIPELINE", 1);
   setenv("GEMMINI_RMD_BACKEND", "CPU", 1);
   setenv("GEMMINI_STRIPE_JOB_CAPACITY", "2", 1);
   GraphCase test_case;
@@ -446,10 +793,10 @@ bool run_exsia_success() {
       check(counters.hardware == 0 && counters.fallback == 0,
             "ExSIA route enters no hardware or fallback path") &&
       check(counters.live_runs == 0, "all frontend workers are joined") &&
-      check(counters.first_activation_read_cycle >=
-                    counters.first_publish_cycle &&
-                counters.first_activation_read_cycle != 0,
-            "activation reads do not precede post-fold publication") &&
+      check(counters.first_publish_cycle != 0 &&
+                counters.first_publish_cycle <
+                    counters.first_activation_read_cycle,
+            "RTL publish strictly precedes the first activation read") &&
       check_three_stripe_trace(counters);
   for (size_t index = 0; index < actual.size(); ++index) {
     const float tolerance = 1e-4f * std::max(1.0f, std::fabs(expected[index]));
@@ -461,19 +808,58 @@ bool run_exsia_success() {
   if (ok) {
     std::printf(
         "route=exsia mode=stripe_pipeline bits=8 dim=%d stripes=3 slots=0,1,0 "
-        "capacity=2 rmd=cpu_direct rmd_terminal_event=%llu "
-        "authorize_event=%llu "
-        "full=0 hardware=0 fallback=0\n",
+        "capacity=2 events=seal>fold_commit>callback>rtl_publish>"
+        "activation_read>quantization_complete rmd=cpu_direct "
+        "publish_cycle=%llu activation_read_cycle=%llu "
+        "rmd_terminal_event=%llu authorize_event=%llu "
+        "full=0 pipeline=1 stripes=3 fence=1 rmd=3 commit=1 "
+        "hardware=0 fallback=0\n",
         GGML_GEMMINI_TEST_IM2P_DIM,
+        static_cast<unsigned long long>(counters.first_publish_cycle),
+        static_cast<unsigned long long>(counters.first_activation_read_cycle),
         static_cast<unsigned long long>(counters.rmd_terminal_event),
         static_cast<unsigned long long>(counters.authorize_success_event));
   }
   return ok;
 }
 
+bool run_exsia_one_row_pipeline() {
+  using namespace ggml::gemmini::im2p_adapter;
+  setenv("GEMMINI_MATMUL_MODE", "STRIPE_PIPELINE", 1);
+  setenv("GEMMINI_RMD_BACKEND", "CPU", 1);
+  GraphCase test_case(1);
+  if (!check(test_case.initialize(), "initialize one-row ExSIA graph")) {
+    return false;
+  }
+
+  test_reset();
+  test_inject_failure(TestFailure::execute);
+  const ggml_status status =
+      ggml_backend_graph_compute(test_case.backend, test_case.graph);
+  const auto counters = test_counters();
+  const bool ok =
+      check(status != GGML_STATUS_SUCCESS,
+            "one-row PIPELINE reaches its injected start failure") &&
+      check(all_sentinel(test_case.read_output()),
+            "one-row PIPELINE failure preserves destination sentinel") &&
+      check(counters.full == 0 && counters.pipeline == 1 &&
+                counters.stripe == 0 && counters.fence == 0 &&
+                counters.rmd_calls == 0 && counters.authorize == 0 &&
+                counters.commit == 0,
+            "one-row request remains pipeline without a full shortcut") &&
+      check(counters.hardware == 0 && counters.fallback == 0 &&
+                counters.live_runs == 0,
+            "one-row PIPELINE has no fallback or leaked run");
+  if (ok) {
+    std::printf("route=exsia mode=stripe_pipeline rows=1 full=0 pipeline=1 "
+                "stripes=0 commit=0 fallback=0 sentinel=preserved\n");
+  }
+  return ok;
+}
+
 bool run_exsia_start_failure() {
   using namespace ggml::gemmini::im2p_adapter;
-  setenv("GEMMINI_MATMUL_MODE", "FULL", 1);
+  setenv("GEMMINI_MATMUL_MODE", "STRIPE_PIPELINE", 1);
   setenv("GEMMINI_RMD_BACKEND", "CPU", 1);
   GraphCase test_case;
   if (!check(test_case.initialize(), "initialize start-failure ExSIA graph")) {
@@ -512,7 +898,7 @@ bool run_exsia_start_failure() {
 bool run_exsia_boundary_failure(
     ggml::gemmini::im2p_adapter::TestFailure failure) {
   using namespace ggml::gemmini::im2p_adapter;
-  setenv("GEMMINI_MATMUL_MODE", "FULL", 1);
+  setenv("GEMMINI_MATMUL_MODE", "STRIPE_PIPELINE", 1);
   setenv("GEMMINI_RMD_BACKEND", "CPU", 1);
   GraphCase test_case;
   if (!check(test_case.initialize(),
@@ -561,7 +947,7 @@ bool run_exsia_boundary_failure(
 bool run_exsia_staged_failure(
     ggml::gemmini::im2p_adapter::TestFailure failure) {
   using namespace ggml::gemmini::im2p_adapter;
-  setenv("GEMMINI_MATMUL_MODE", "FULL", 1);
+  setenv("GEMMINI_MATMUL_MODE", "STRIPE_PIPELINE", 1);
   setenv("GEMMINI_RMD_BACKEND", "CPU", 1);
   GraphCase test_case;
   if (!check(test_case.initialize(), "initialize staged-failure ExSIA graph")) {
@@ -602,7 +988,7 @@ bool run_exsia_staged_failure(
 
 bool run_exsia_blocked_submit_failure() {
   using namespace ggml::gemmini::im2p_adapter;
-  setenv("GEMMINI_MATMUL_MODE", "FULL", 1);
+  setenv("GEMMINI_MATMUL_MODE", "STRIPE_PIPELINE", 1);
   setenv("GEMMINI_RMD_BACKEND", "CPU", 1);
   GraphCase test_case;
   if (!check(test_case.initialize(),
@@ -622,7 +1008,8 @@ bool run_exsia_blocked_submit_failure() {
   compute.join();
 
   const auto counters = test_counters();
-  return check(blocked, "third producer blocks on the capacity-two frontend") &&
+  const bool ok =
+      check(blocked, "third producer blocks on the capacity-two frontend") &&
          check(graph_status.load(std::memory_order_acquire) !=
                    GGML_STATUS_SUCCESS,
                "blocked-producer failure reaches graph status") &&
@@ -645,6 +1032,26 @@ bool run_exsia_blocked_submit_failure() {
                    counters.live_runs == 0,
                "blocked failure has no fallback and joins every worker") &&
          check_three_stripe_trace(counters);
+  if (ok) {
+    std::printf("failure=blocked_submit producer=fence=execution_failure "
+                "sentinel=preserved capacity=2 slots=0,1,0\n");
+  }
+  return ok;
+}
+
+const char *routing_program = nullptr;
+
+bool run_exsia_unsupported_mode() {
+  std::string command = "ulimit -c 0; \"";
+  command += routing_program;
+  command += "\" --unsupported-mode-child >/dev/null 2>&1";
+  const bool ok = check(std::system(command.c_str()) != 0,
+                        "unsupported ExSIA mode fails closed before dispatch");
+  if (ok) {
+    std::printf("mode=stripe_sequential error=disabled_mode full=0 pipeline=0 "
+                "stripes=0 commit=0 fallback=0\n");
+  }
+  return ok;
 }
 
 bool run_exsia_prestart_rejection(bool include_cpu) {
@@ -786,6 +1193,17 @@ bool run_rmd_rejection() {
                "RMD rejects before execute or fallback");
 }
 
+bool run_unsupported_mode_child() {
+  setenv("GEMMINI_MATMUL_MODE", "STRIPE_SEQUENTIAL", 1);
+  setenv("GEMMINI_RMD_BACKEND", "CPU", 1);
+  GraphCase test_case;
+  if (!test_case.initialize()) {
+    return false;
+  }
+  return ggml_backend_graph_compute(test_case.backend, test_case.graph) ==
+         GGML_STATUS_SUCCESS;
+}
+
 bool run_invalid_mode_child() {
   setenv("GEMMINI_MATMUL_MODE", "garbage", 1);
   GraphCase test_case;
@@ -799,10 +1217,18 @@ bool run_invalid_mode_child() {
 } // namespace
 
 int main(int argc, char **argv) {
+  routing_program = argv[0];
+  if (argc == 2 && std::string_view(argv[1]) == "--unsupported-mode-child") {
+    return run_unsupported_mode_child() ? 0 : 1;
+  }
   if (argc == 2 && std::string_view(argv[1]) == "--invalid-mode-child") {
     return run_invalid_mode_child() ? 0 : 1;
   }
-  if (!run_graph_overhead_regression() || !run_exsia_shift_regression()) {
+  if (!run_graph_overhead_regression() || !run_exsia_shift_regression()
+#if GGML_GEMMINI_ACTIVATION_QUANT == 0
+      || !run_exsia_publication_boundary()
+#endif
+  ) {
     return 1;
   }
   if (argc == 3 && std::string_view(argv[1]) == "--case") {
@@ -810,7 +1236,29 @@ int main(int argc, char **argv) {
 #if GGML_GEMMINI_ACTIVATION_QUANT == 0 && GGML_GEMMINI_ACTIVATION_BITS == 8 && \
     GGML_GEMMINI_ENABLE_RMD
     bool selected_ok = false;
-    if (selected == "execute") {
+    if (selected == "full") {
+      selected_ok = run_exsia_full_success();
+    } else if (selected == "cross-mode-oracle") {
+      selected_ok = run_exsia_cross_mode_parity();
+    } else if (selected == "pipeline") {
+      selected_ok = run_exsia_success();
+    } else if (selected == "full-collector-allocation") {
+      selected_ok = run_exsia_full_failure(TestFailure::collector_allocation);
+    } else if (selected == "full-collector-capture") {
+      selected_ok = run_exsia_full_collector_capture_failure();
+    } else if (selected == "full-quantization") {
+      selected_ok = run_exsia_full_failure(TestFailure::quantization);
+    } else if (selected == "full-execute") {
+      selected_ok = run_exsia_full_failure(TestFailure::execute);
+    } else if (selected == "full-fence") {
+      selected_ok = run_exsia_full_failure(TestFailure::fence);
+    } else if (selected == "full-rmd") {
+      selected_ok = run_exsia_full_failure(TestFailure::rmd);
+    } else if (selected == "one-row-pipeline") {
+      selected_ok = run_exsia_one_row_pipeline();
+    } else if (selected == "unsupported-mode") {
+      selected_ok = run_exsia_unsupported_mode();
+    } else if (selected == "execute") {
       selected_ok = run_exsia_start_failure();
     } else if (selected == "quantization") {
       selected_ok = run_exsia_boundary_failure(
@@ -884,7 +1332,17 @@ int main(int argc, char **argv) {
 #if GGML_GEMMINI_ACTIVATION_QUANT == 0
   bool ok = true;
 #if GGML_GEMMINI_ACTIVATION_BITS == 8 && GGML_GEMMINI_ENABLE_RMD
+  ok = run_exsia_full_success() && ok;
+  ok = run_exsia_cross_mode_parity() && ok;
+  ok = run_exsia_full_failure(TestFailure::collector_allocation) && ok;
+  ok = run_exsia_full_collector_capture_failure() && ok;
+  ok = run_exsia_full_failure(TestFailure::quantization) && ok;
+  ok = run_exsia_full_failure(TestFailure::execute) && ok;
+  ok = run_exsia_full_failure(TestFailure::fence) && ok;
+  ok = run_exsia_full_failure(TestFailure::rmd) && ok;
   ok = run_exsia_success() && ok;
+  ok = run_exsia_one_row_pipeline() && ok;
+  ok = run_exsia_unsupported_mode() && ok;
   ok = run_exsia_start_failure() && ok;
   ok = run_exsia_boundary_failure(
            ggml::gemmini::im2p_adapter::TestFailure::quantization) &&

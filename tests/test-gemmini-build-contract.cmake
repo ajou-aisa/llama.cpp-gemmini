@@ -38,6 +38,12 @@ function(run_configure_case name stripe pipeline mode local_workers rmd rmd_back
         -DGGML_GEMMINI_ENABLE_RMD=${rmd}
         -DGGML_GEMMINI_BLOCK_SIZE=${block_size}
         -DLLAMA_BUILD_TESTS=OFF)
+    if (ARGC GREATER 10)
+        set(expected_activation_quant "${ARGV10}")
+        list(APPEND cmake_args "-DGGML_GEMMINI_ACTIVATION_QUANT=${expected_activation_quant}")
+    else()
+        set(expected_activation_quant EXSIA)
+    endif()
     if (rmd_backend STREQUAL "DEFAULT")
         set(expected_rmd_backend CPU)
     else()
@@ -76,6 +82,7 @@ function(run_configure_case name stripe pipeline mode local_workers rmd rmd_back
         expect_contains("${cache_path}" "GGML_GEMMINI_ENABLE_STRIPE_MATMUL:BOOL=${stripe}")
         expect_contains("${cache_path}" "GGML_GEMMINI_ENABLE_STRIPE_PIPELINE:BOOL=${pipeline}")
         expect_contains("${cache_path}" "GGML_GEMMINI_DEFAULT_MATMUL_MODE:STRING=${mode}")
+        expect_contains("${cache_path}" "GGML_GEMMINI_ACTIVATION_QUANT:STRING=${expected_activation_quant}")
         expect_contains("${cache_path}" "GGML_GEMMINI_EXSIA_LOCAL_WORKERS:STRING=${local_workers}")
         expect_contains("${cache_path}" "GGML_GEMMINI_ENABLE_RMD:BOOL=${rmd}")
         expect_contains("${cache_path}" "GGML_GEMMINI_DEFAULT_RMD_BACKEND:STRING=${expected_rmd_backend}")
@@ -110,6 +117,14 @@ function(run_configure_case name stripe pipeline mode local_workers rmd rmd_back
         mode_index("${mode}" mode_value)
         expect_contains("${config_path}" "inline constexpr bool ENABLE_STRIPE_MATMUL = ${stripe_value};")
         expect_contains("${config_path}" "inline constexpr bool ENABLE_STRIPE_PIPELINE = ${pipeline_value};")
+        if (expected_activation_quant STREQUAL "EXSIA")
+            set(activation_quant_value 0)
+        elseif (expected_activation_quant STREQUAL "TENSOR")
+            set(activation_quant_value 1)
+        else()
+            message(FATAL_ERROR "Unsupported test activation quant '${expected_activation_quant}'")
+        endif()
+        expect_contains("${config_path}" "inline constexpr int ACTIVATION_QUANT = ${activation_quant_value};")
         expect_contains("${config_path}" "inline constexpr int DEFAULT_MATMUL_MODE = ${mode_value};")
         if (expected_rmd_backend STREQUAL "CPU")
             set(rmd_backend_value 0)
@@ -177,22 +192,22 @@ endfunction()
 function(make_stale_frontend_root out_var)
     if(NOT DEFINED TEST_REAL_IM2P_ROOT OR
        NOT EXISTS "${TEST_REAL_IM2P_ROOT}/build/lib/a8-w8-d16/libim2p_gemmini_frontend.a" OR
-       NOT EXISTS "${TEST_REAL_IM2P_ROOT}/build/cargo/a16-w8-d32/release/libim2p_sim.a")
-        message(FATAL_ERROR "TEST_REAL_IM2P_ROOT must contain real A8/DIM16 frontend and A16/DIM32 simulator archives")
+       NOT EXISTS "${TEST_REAL_IM2P_ROOT}/build/cargo/a8-w8-d32/release/libim2p_sim.a")
+        message(FATAL_ERROR "TEST_REAL_IM2P_ROOT must contain real A8/DIM16 frontend and A8/DIM32 simulator archives")
     endif()
     set(root "${TEST_BINARY_ROOT}/stale-frontend-root")
     file(MAKE_DIRECTORY
         "${root}/frontend" "${root}/sim"
-        "${root}/build/lib/a16-w8-d32"
-        "${root}/build/cargo/a16-w8-d32/release")
+        "${root}/build/lib/a8-w8-d32"
+        "${root}/build/cargo/a8-w8-d32/release")
     file(COPY "${TEST_REAL_IM2P_ROOT}/frontend/include" DESTINATION "${root}/frontend")
     file(COPY "${TEST_REAL_IM2P_ROOT}/sim/include" DESTINATION "${root}/sim")
     configure_file(
         "${TEST_REAL_IM2P_ROOT}/build/lib/a8-w8-d16/libim2p_gemmini_frontend.a"
-        "${root}/build/lib/a16-w8-d32/libim2p_gemmini_frontend.a" COPYONLY)
+        "${root}/build/lib/a8-w8-d32/libim2p_gemmini_frontend.a" COPYONLY)
     configure_file(
-        "${TEST_REAL_IM2P_ROOT}/build/cargo/a16-w8-d32/release/libim2p_sim.a"
-        "${root}/build/cargo/a16-w8-d32/release/libim2p_sim.a" COPYONLY)
+        "${TEST_REAL_IM2P_ROOT}/build/cargo/a8-w8-d32/release/libim2p_sim.a"
+        "${root}/build/cargo/a8-w8-d32/release/libim2p_sim.a" COPYONLY)
     set(${out_var} "${root}" PARENT_SCOPE)
 endfunction()
 
@@ -212,6 +227,14 @@ function(run_im2p_configure_case name root bits dim backend expect_success failu
         -DLLAMA_BUILD_EXAMPLES=OFF
         -DLLAMA_BUILD_SERVER=OFF
         -DLLAMA_CURL=OFF)
+    if(ARGC GREATER 7)
+        set(block_size "${ARGV7}")
+    elseif(dim STREQUAL "64")
+        set(block_size 64)
+    else()
+        set(block_size 32)
+    endif()
+    list(APPEND cmake_args -DGGML_GEMMINI_BLOCK_SIZE=${block_size})
     if(TEST_GENERATOR)
         list(APPEND cmake_args -G "${TEST_GENERATOR}")
     endif()
@@ -237,6 +260,9 @@ function(run_im2p_configure_case name root bits dim backend expect_success failu
         if(frontend_at EQUAL -1 OR simulator_at EQUAL -1)
             message(FATAL_ERROR "${name} did not report the exact pair archives\n${output}")
         endif()
+        expect_contains("${build_dir}/generated/gemmini_params.h" "#define DIM ${dim}")
+        expect_contains("${build_dir}/CMakeCache.txt"
+            "GGML_GEMMINI_BLOCK_SIZE:STRING=${block_size}")
         return()
     endif()
     if(rc EQUAL 0)
@@ -292,7 +318,9 @@ file(MAKE_DIRECTORY "${TEST_BINARY_ROOT}")
 run_configure_case(default_rmd_backend ON ON FULL 4 ON DEFAULT 32 TRUE)
 run_configure_case(full_with_features ON ON FULL 4 ON CPU 32 TRUE)
 run_configure_case(rmd_ws_default ON ON FULL 4 ON WS 32 TRUE)
-run_configure_case(stripe_sequential_without_pipeline ON OFF STRIPE_SEQUENTIAL 4 ON CPU 32 TRUE)
+run_configure_case(stripe_sequential_without_pipeline ON OFF STRIPE_SEQUENTIAL 4 ON CPU 32 TRUE "" TENSOR)
+run_configure_case(exsia_stripe_sequential_default ON ON STRIPE_SEQUENTIAL 4 ON CPU 32 FALSE
+    "ExSIA supports public matmul modes" EXSIA)
 run_configure_case(stripe_pipeline_with_features ON ON STRIPE_PIPELINE 4 ON CPU 32 TRUE)
 run_configure_case(exsia_local_workers_three ON ON FULL 3 ON CPU 32 TRUE)
 run_configure_case(rmd_ablation ON ON FULL 4 OFF CPU 32 TRUE)
@@ -312,24 +340,20 @@ run_invalid_log_case(invalid_log_dump LOG_DUMP YES)
 run_invalid_log_case(invalid_log_dump_scale LOG_DUMP_SCALE garbage)
 
 set(matching_root "${TEST_REAL_IM2P_ROOT}")
-make_fake_im2p_root(width_mismatch 16 32 2 8 32 width_mismatch_root)
-make_fake_im2p_root(dim_mismatch 16 32 2 16 16 dim_mismatch_root)
-make_fake_im2p_root(abi_mismatch 16 32 1 16 32 abi_mismatch_root)
-set(real_pair_count 0)
-foreach(real_bits IN ITEMS 4 8 16)
-    foreach(real_dim IN ITEMS 16 32)
-        set(real_id "a${real_bits}-w8-d${real_dim}")
-        if(EXISTS "${matching_root}/build/lib/${real_id}/libim2p_gemmini_frontend.a" AND
-           EXISTS "${matching_root}/build/cargo/${real_id}/release/libim2p_sim.a")
-            math(EXPR real_pair_count "${real_pair_count} + 1")
-            run_im2p_configure_case("im2p_matching_a${real_bits}_d${real_dim}"
-                "${matching_root}" "${real_bits}" "${real_dim}" IM2P_SIM TRUE "")
-        endif()
-    endforeach()
+make_fake_im2p_root(width_mismatch 16 32 3 8 32 width_mismatch_root)
+make_fake_im2p_root(dim_mismatch 16 32 3 16 16 dim_mismatch_root)
+make_fake_im2p_root(abi_mismatch 16 32 2 16 32 abi_mismatch_root)
+foreach(real_dim IN ITEMS 16 32 64)
+    set(real_id "a8-w8-d${real_dim}")
+    if(NOT EXISTS "${matching_root}/build/lib/${real_id}/libim2p_gemmini_frontend.a" OR
+       NOT EXISTS "${matching_root}/build/cargo/${real_id}/release/libim2p_sim.a")
+        message(FATAL_ERROR "Expected complete real IM2P ${real_id} frontend/simulator pair")
+    endif()
+    run_im2p_configure_case("im2p_matching_a8_d${real_dim}"
+        "${matching_root}" 8 "${real_dim}" IM2P_SIM TRUE "")
 endforeach()
-if(real_pair_count EQUAL 0)
-    message(FATAL_ERROR "Expected at least one complete real IM2P frontend/simulator pair")
-endif()
+run_im2p_configure_case(im2p_dim64_block32 "${matching_root}" 8 64 IM2P_SIM FALSE
+    "IM2P_DIM=64 requires GGML_GEMMINI_BLOCK_SIZE=64" 32)
 run_im2p_configure_case(im2p_missing_root "" 16 32 IM2P_SIM FALSE "IM2P_SIM_ROOT is required")
 run_im2p_configure_case(im2p_invalid_backend "" 16 32 simulator FALSE
     "GGML_GEMMINI_EXECUTION_BACKEND must be exactly HARDWARE or IM2P_SIM")
@@ -338,17 +362,17 @@ run_im2p_configure_case(im2p_malformed_backend "" 16 32 " IM2P_SIM" FALSE
 run_im2p_configure_case(im2p_invalid_width "${matching_root}" 5 32 IM2P_SIM FALSE
     "GGML_GEMMINI_ACTIVATION_BITS must be one of")
 run_im2p_configure_case(im2p_invalid_dim "${matching_root}" 16 17 IM2P_SIM FALSE
-    "IM2P_DIM must be 16 or 32")
+    "IM2P_DIM must be 16, 32, or 64")
 run_im2p_configure_case(im2p_width_mismatch "${width_mismatch_root}" 16 32 IM2P_SIM FALSE
     "IM2P activation width mismatch: llama requests 16, archive reports 8")
 run_im2p_configure_case(im2p_dim_mismatch "${dim_mismatch_root}" 16 32 IM2P_SIM FALSE
     "IM2P DIM mismatch: llama requests 32, archive reports 16")
 run_im2p_configure_case(im2p_abi_mismatch "${abi_mismatch_root}" 16 32 IM2P_SIM FALSE
-    "IM2P simulator ABI mismatch: llama requires 2, archive reports 1")
-run_im2p_configure_case(im2p_missing_pair "${matching_root}" 8 32 IM2P_SIM FALSE
+    "IM2P simulator ABI mismatch: llama requires 3, archive reports 2")
+run_im2p_configure_case(im2p_missing_pair "${width_mismatch_root}" 8 32 IM2P_SIM FALSE
     "Missing matching IM2P a8-w8-d32 archive")
 make_stale_frontend_root(stale_frontend_root)
-run_im2p_configure_case(im2p_stale_frontend "${stale_frontend_root}" 16 32 IM2P_SIM FALSE
+run_im2p_configure_case(im2p_stale_frontend "${stale_frontend_root}" 8 32 IM2P_SIM FALSE
     "IM2P frontend configuration mismatch")
 
 foreach(build_script IN ITEMS build-arm64.sh build-x86.sh build-riscv.sh)
