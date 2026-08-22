@@ -4,6 +4,7 @@
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -30,7 +31,17 @@ ggml_gemmini_args_t make_args(
     args.I = 3;
     args.J = 2;
     args.K = 2;
-        args.B = weights.data();
+    if (!args.A.allocate(args.I, args.K, 8)) {
+      std::abort();
+    }
+    for (size_t row = 0; row < args.I; ++row) {
+      for (size_t column = 0; column < args.K; ++column) {
+        if (!args.A.set(row, column, activation[row * args.K + column])) {
+          std::abort();
+        }
+      }
+    }
+    args.B = weights.data();
     args.sA = args.K;
     args.sB = args.J;
     args.f_out = output.data();

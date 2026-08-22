@@ -55,10 +55,11 @@ enum class ComputeType : uint8_t {
 // ActivationQuantAlgo --------------------------------------------------------
 // To add: append enum entry with next integer, update CURRENT_ACTIVATION_QUANT.
 enum class ActivationQuantAlgo : uint8_t {
-    EXSIA = 0,
-    TENSOR = 1,
-    TOKEN = 2,
-    STRIPE = 4,
+  EXSIA = 0,
+  TENSOR = 1,
+  TOKEN = 2,
+  BLOCK = 3,
+  STRIPE = 4,
 };
 
 // Macro → enum mapping (compile-time) ---------------------------------------
@@ -81,6 +82,8 @@ inline constexpr ActivationQuantAlgo CURRENT_ACTIVATION_QUANT =
     ActivationQuantAlgo::TENSOR;
 #elif GGML_GEMMINI_ACTIVATION_QUANT == 2
     ActivationQuantAlgo::TOKEN;
+#elif GGML_GEMMINI_ACTIVATION_QUANT == 3
+        ActivationQuantAlgo::BLOCK;
 #elif GGML_GEMMINI_ACTIVATION_QUANT == 4
     ActivationQuantAlgo::STRIPE;
 #else
@@ -90,6 +93,7 @@ inline constexpr ActivationQuantAlgo CURRENT_ACTIVATION_QUANT =
 #define GGML_GEMMINI_ACTIVATION_QUANT_NAMEEXSIA "exsia"
 #define GGML_GEMMINI_ACTIVATION_QUANT_NAMETENSOR "tensor"
 #define GGML_GEMMINI_ACTIVATION_QUANT_NAMETOKEN "token"
+#define GGML_GEMMINI_ACTIVATION_QUANT_NAMEBLOCK "block"
 #define GGML_GEMMINI_ACTIVATION_QUANT_NAMESTRIPE "stripe"
 
 #if GGML_GEMMINI_ACTIVATION_QUANT == 0
@@ -98,6 +102,9 @@ inline constexpr ActivationQuantAlgo CURRENT_ACTIVATION_QUANT =
     #define GGML_GEMMINI_ACTIVATION_QUANT_NAME GGML_GEMMINI_ACTIVATION_QUANT_NAMETENSOR
 #elif GGML_GEMMINI_ACTIVATION_QUANT == 2
     #define GGML_GEMMINI_ACTIVATION_QUANT_NAME GGML_GEMMINI_ACTIVATION_QUANT_NAMETOKEN
+#elif GGML_GEMMINI_ACTIVATION_QUANT == 3
+#define GGML_GEMMINI_ACTIVATION_QUANT_NAME                                     \
+  GGML_GEMMINI_ACTIVATION_QUANT_NAMEBLOCK
 #elif GGML_GEMMINI_ACTIVATION_QUANT == 4
     #define GGML_GEMMINI_ACTIVATION_QUANT_NAME GGML_GEMMINI_ACTIVATION_QUANT_NAMESTRIPE
 #endif
@@ -105,7 +112,9 @@ inline constexpr ActivationQuantAlgo CURRENT_ACTIVATION_QUANT =
 inline constexpr bool DEQUANT_FP_TEST = GGML_GEMMINI_DEQUANT_FP_TEST != 0;
 
 static_assert(static_cast<uint8_t>(CURRENT_COMPUTE_TYPE) <= 1, "CURRENT_COMPUTE_TYPE must be INT or FLOAT");
-static_assert(static_cast<uint8_t>(CURRENT_ACTIVATION_QUANT) <= 4, "CURRENT_ACTIVATION_QUANT must be EXSIA, TENSOR, TOKEN, or STRIPE");
+static_assert(
+    static_cast<uint8_t>(CURRENT_ACTIVATION_QUANT) <= 4,
+    "CURRENT_ACTIVATION_QUANT must be EXSIA, TENSOR, TOKEN, BLOCK, or STRIPE");
 static_assert(GGML_GEMMINI_ACTIVATION_BITS == 4 || GGML_GEMMINI_ACTIVATION_BITS == 8 || GGML_GEMMINI_ACTIVATION_BITS == 16,
               "GGML_GEMMINI_ACTIVATION_BITS must be 4, 8, or 16");
 

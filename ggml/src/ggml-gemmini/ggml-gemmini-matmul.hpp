@@ -135,6 +135,7 @@ private:
                                           residual::DirectStripePayloadHandle,
                                           rmd::StripePacketHandle);
     friend MatmulStatus execute_dense_stripe(MatmulStripeJob &);
+    friend MatmulStatus accept_external_dense_completion(MatmulStripeJob &);
     friend MatmulStatus execute_rmd_stripe(MatmulStripeJob &);
     friend MatmulStatus compose_rmd_stripe(MatmulStripeJob &);
     friend MatmulStatus finalize_stripe(MatmulStripeJob &);
@@ -678,6 +679,7 @@ private:
                                           rmd::StripePacketHandle);
     friend MatmulStatus capture_stripe(MatmulExecution &, const MatmulStripeInput &, MatmulStripeJob &);
     friend MatmulStatus execute_dense_stripe(MatmulStripeJob &);
+    friend MatmulStatus accept_external_dense_completion(MatmulStripeJob &);
     friend MatmulStatus execute_rmd_stripe(MatmulStripeJob &);
     friend MatmulStatus compose_rmd_stripe(MatmulStripeJob &);
     friend MatmulStatus finalize_stripe(MatmulStripeJob &);
@@ -755,6 +757,7 @@ private:
                                           residual::DirectStripePayloadHandle,
                                           rmd::StripePacketHandle);
     friend MatmulStatus execute_dense_stripe(MatmulStripeJob &);
+    friend MatmulStatus accept_external_dense_completion(MatmulStripeJob &);
     friend MatmulStatus execute_rmd_stripe(MatmulStripeJob &);
     friend MatmulStatus compose_rmd_stripe(MatmulStripeJob &);
     friend MatmulStatus finalize_stripe(MatmulStripeJob &);
@@ -804,6 +807,7 @@ MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput in
 MatmulStatus capture_stripe(MatmulExecution & execution, const MatmulStripeInput & input,
                             MatmulStripeJob & job);
 MatmulStatus execute_dense_stripe(MatmulStripeJob & job);
+MatmulStatus accept_external_dense_completion(MatmulStripeJob &job);
 MatmulStatus execute_rmd_stripe(MatmulStripeJob & job);
 MatmulStatus compose_rmd_stripe(MatmulStripeJob & job);
 MatmulStatus finalize_stripe(MatmulStripeJob & job);

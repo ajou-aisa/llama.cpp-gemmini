@@ -28,6 +28,9 @@
 #include <gemmini.h>
 #include "ggml-gemmini-args.h"
 #include "ggml-gemmini-matmul.hpp"
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+#include "ggml-gemmini-im2p.hpp"
+#endif
 #include "quants/common/tensor_util.hpp"
 #include "quants/act/quantize.hpp"
 #include "quants/weight/quantize_Q8_H1.hpp"
@@ -221,21 +224,29 @@ namespace
         }
 
         if constexpr (OPTION == CPU) {
-            if constexpr (
-                ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TENSOR ||
-                ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TOKEN ||
-                ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::STRIPE
-            ) {
-                return gemmini_q8_channel_int_route_t::cpu_direct_read;
-            }
+          if constexpr (
+              ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
+                  ggml::gemmini::config::ActivationQuantAlgo::TENSOR ||
+              ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
+                  ggml::gemmini::config::ActivationQuantAlgo::TOKEN ||
+              ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
+                  ggml::gemmini::config::ActivationQuantAlgo::BLOCK ||
+              ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
+                  ggml::gemmini::config::ActivationQuantAlgo::STRIPE) {
+            return gemmini_q8_channel_int_route_t::cpu_direct_read;
+          }
         } else if constexpr (OPTION == OS || OPTION == WS) {
-            if constexpr (
-                ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TENSOR ||
-                ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TOKEN ||
-                ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::STRIPE
-            ) {
-                return gemmini_q8_channel_int_route_t::hw_dense_sidecar;
-            }
+          if constexpr (
+              ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
+                  ggml::gemmini::config::ActivationQuantAlgo::TENSOR ||
+              ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
+                  ggml::gemmini::config::ActivationQuantAlgo::TOKEN ||
+              ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
+                  ggml::gemmini::config::ActivationQuantAlgo::BLOCK ||
+              ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
+                  ggml::gemmini::config::ActivationQuantAlgo::STRIPE) {
+            return gemmini_q8_channel_int_route_t::hw_dense_sidecar;
+          }
         }
 
         return gemmini_q8_channel_int_route_t::unsupported;
@@ -963,6 +974,28 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     }
     auto matmul_options = matmul_resolution.options;
     matmul_options.profiling = LOG_DEBUG != 0 || LOG_CYCLE != 0;
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    constexpr bool im2p_exsia =
+        ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
+        ggml::gemmini::config::ActivationQuantAlgo::EXSIA;
+    constexpr bool im2p_non_exsia = !im2p_exsia;
+    const auto route_gate = ggml::gemmini::im2p_adapter::gate_route(
+        im2p_exsia, GGML_GEMMINI_ACTIVATION_BITS, GGML_GEMMINI_ENABLE_RMD != 0,
+        matmul_options.rmd_backend == ggml::gemmini::RmdBackend::cpu_direct);
+    if (!route_gate.ok()) {
+      ggml::gemmini::im2p_adapter::log_failure("route", route_gate);
+#if defined(GGML_GEMMINI_TESTING)
+      ggml::gemmini::im2p_adapter::test_record_production_failure(
+          route_gate.error);
+      return;
+#else
+      GGML_ABORT("Gemmini IM2P route is unsupported");
+#endif
+    }
+#else
+    constexpr bool im2p_exsia = false;
+    constexpr bool im2p_non_exsia = false;
+#endif
 #if !defined(__riscv)
     if (matmul_options.rmd_backend == ggml::gemmini::RmdBackend::gemmini_ws_compact) {
         ggml::gemmini::log::debug(layer,
@@ -978,17 +1011,27 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         matmul_options.mode == ggml::gemmini::MatmulInvocationMode::full;
     constexpr bool exsia_pipeline_supported =
         ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA;
-    const bool pipeline_enabled = pipeline_requested && exsia_pipeline_supported && I > 1;
-    const bool sequential_enabled = sequential_requested;
+    const bool pipeline_enabled = pipeline_requested &&
+                                  exsia_pipeline_supported && I > 1 &&
+                                  !im2p_non_exsia && !im2p_exsia;
+    const bool sequential_enabled =
+        sequential_requested && !im2p_non_exsia && !im2p_exsia;
     const bool legacy_full_dispatch = false;
-    const bool decode_full_dispatch = pipeline_requested && exsia_pipeline_supported && I <= 1;
-    const bool facade_full_dispatch = full_requested || decode_full_dispatch;
+    const bool decode_full_dispatch = pipeline_requested &&
+                                      exsia_pipeline_supported && I <= 1 &&
+                                      !im2p_non_exsia && !im2p_exsia;
+    const bool facade_full_dispatch =
+        (full_requested || decode_full_dispatch) && !im2p_non_exsia &&
+        !im2p_exsia;
     const size_t pipeline_job_capacity = matmul_options.job_capacity;
-    if (pipeline_requested && !exsia_pipeline_supported) {
-        ggml::gemmini::log::debug(layer,
-            "[matmul.pipeline] status=unsupported_invocation dispatch=fatal reason=%s",
-            "stripe-pipeline requires EXSIA activation");
-        GGML_ABORT("Gemmini unsupported_invocation: stripe-pipeline requires EXSIA activation");
+    if (pipeline_requested && !exsia_pipeline_supported && !im2p_non_exsia) {
+      ggml::gemmini::log::debug(
+          layer,
+          "[matmul.pipeline] status=unsupported_invocation dispatch=fatal "
+          "reason=%s",
+          "stripe-pipeline requires EXSIA activation");
+      GGML_ABORT("Gemmini unsupported_invocation: stripe-pipeline requires "
+                 "EXSIA activation");
     }
     if (decode_full_dispatch) {
         ggml::gemmini::log::debug(layer,
@@ -1051,8 +1094,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     ggml::gemmini::observe_test_i("activation", args.I);
 #endif
     bool quantize_ok = false;
-    if (!pipeline_enabled) {
-        quantize_ok = ggml::gemmini::quants::quantize_activation(src1, args);
+    const bool deferred_quantization = pipeline_enabled || im2p_exsia;
+    if (!deferred_quantization) {
+      quantize_ok = ggml::gemmini::quants::quantize_activation(src1, args);
     }
 #if GGML_GEMMINI_COMPUTE_TYPE == 0
     static_assert(sizeof(elem_t) == 1, "Q8_0 path assumes elem_t is int8 (1 byte).");
@@ -1060,13 +1104,15 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     end = ggml::gemmini::cycle::read();
     ggml::gemmini::log::cycle(layer, "cpu.Quantize activation", start, end);
-    if (!pipeline_enabled && !quantize_ok) {
-        if (pipeline_collector && !pipeline_collector->status()) {
-            ggml::gemmini::log::debug(layer, "[matmul.pipeline] capture status=%d message=%s",
-                static_cast<int>(pipeline_collector->status().code), pipeline_collector->status().message);
-        }
-        ggml::gemmini::log::debug(layer, "activation quantize failed");
-        GGML_ABORT("Gemmini activation quantization failed");
+    if (!deferred_quantization && !quantize_ok) {
+      if (pipeline_collector && !pipeline_collector->status()) {
+        ggml::gemmini::log::debug(
+            layer, "[matmul.pipeline] capture status=%d message=%s",
+            static_cast<int>(pipeline_collector->status().code),
+            pipeline_collector->status().message);
+      }
+      ggml::gemmini::log::debug(layer, "activation quantize failed");
+      GGML_ABORT("Gemmini activation quantization failed");
     }
 
     if constexpr (ggml::gemmini::config::CURRENT_COMPUTE_TYPE == ggml::gemmini::config::ComputeType::FLOAT &&
@@ -1458,6 +1504,65 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.col_stride_f_out = dst->nb[0] / sizeof(float);
     args.stride_f_out = dst->nb[1] / sizeof(float);
 
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    if constexpr (im2p_exsia) {
+      // The production frontend consumes one DIM-row post-fold stripe at a
+      // time.
+      args.tile_I = 1;
+      args.activation_rows_per_stripe = std::min<size_t>(DIM, args.I);
+      args.act_quant.storage()
+          .emplace<ggml::gemmini::quants::act::exsia::Meta>();
+
+      auto started =
+          ggml::gemmini::im2p_adapter::start_exsia_stripe_pipeline(args);
+      if (!started.result.ok() || !started.pipeline) {
+        ggml::gemmini::im2p_adapter::log_failure("ExSIA pipeline start",
+                                                 started.result);
+#if defined(GGML_GEMMINI_TESTING)
+        ggml::gemmini::im2p_adapter::test_record_production_failure(
+            started.result.error);
+        return;
+#else
+        GGML_ABORT("Gemmini IM2P ExSIA pipeline start failed");
+#endif
+      }
+      const auto sink_status = started.pipeline->install_sink();
+      if (!sink_status.ok()) {
+        ggml::gemmini::im2p_adapter::log_failure("ExSIA sink install",
+                                                 sink_status);
+#if defined(GGML_GEMMINI_TESTING)
+        ggml::gemmini::im2p_adapter::test_record_production_failure(
+            sink_status.error);
+        return;
+#else
+        GGML_ABORT("Gemmini IM2P ExSIA sink install failed");
+#endif
+      }
+#if defined(GGML_GEMMINI_TESTING)
+      quantize_ok =
+          !ggml::gemmini::im2p_adapter::test_should_fail_quantization() &&
+          ggml::gemmini::quants::quantize_activation(src1, args);
+#else
+      quantize_ok = ggml::gemmini::quants::quantize_activation(src1, args);
+#endif
+      const auto completion = started.pipeline->finish(quantize_ok);
+      if (!completion.result.ok()) {
+        ggml::gemmini::im2p_adapter::log_failure("ExSIA stripe execution",
+                                                 completion.result);
+#if defined(GGML_GEMMINI_TESTING)
+        ggml::gemmini::im2p_adapter::test_record_production_failure(
+            completion.result.error);
+        return;
+#else
+        GGML_ABORT("Gemmini IM2P ExSIA stripe execution failed");
+#endif
+      }
+      ggml::gemmini::im2p_adapter::log_stats("ExSIA stripe execution",
+                                             completion.stats);
+      return;
+    }
+#endif
+
     if (pipeline_enabled) {
         const auto pipeline_route = ggml::gemmini::detail::normalize_route(args);
         ggml::gemmini::log::debug(layer,
@@ -1486,28 +1591,54 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         }
     }
 
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    if constexpr (im2p_non_exsia) {
+      const auto completion = ggml::gemmini::im2p_adapter::run_full(args);
+      if (!completion.result.ok()) {
+        ggml::gemmini::im2p_adapter::log_failure("full execution",
+                                                 completion.result);
+#if defined(GGML_GEMMINI_TESTING)
+        return;
+#else
+        GGML_ABORT("Gemmini IM2P full execution failed");
+#endif
+      }
+      ggml::gemmini::im2p_adapter::log_stats("full execution",
+                                             completion.stats);
+    }
+#endif
+
     if (sequential_enabled) {
-        if (matmul_options.stripe_rows_auto) {
-            matmul_options.stripe_rows = args.tile_I != 0 ? args.tile_I * DIM : args.I;
-        }
-        const auto sequential_status = ggml::gemmini::matmul(args, matmul_options);
-        if (!sequential_status) {
-            ggml::gemmini::log::debug(layer,
-                "[matmul.sequential] status=%d message=%s",
-                static_cast<int>(sequential_status.code), sequential_status.message);
-            GGML_ABORT("Gemmini stripe sequential execution failed");
-        }
-        const auto route = ggml::gemmini::detail::normalize_route(args);
-        const auto capabilities = ggml::gemmini::detail::route_capabilities(args);
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) &&                        \
+    defined(GGML_GEMMINI_TESTING)
+      ggml::gemmini::im2p_adapter::test_observe_stripe_dispatch();
+      ggml::gemmini::im2p_adapter::test_observe_hardware_dispatch();
+#endif
+      if (matmul_options.stripe_rows_auto) {
+        matmul_options.stripe_rows =
+            args.tile_I != 0 ? args.tile_I * DIM : args.I;
+      }
+      const auto sequential_status =
+          ggml::gemmini::matmul(args, matmul_options);
+      if (!sequential_status) {
         ggml::gemmini::log::debug(layer,
-            "[matmul.route] invocation=stripe-sequential full_or_slice=slice "
-            "activation_route=%s weight_route=%s backend_route=%s "
-            "supports_live_pipeline=%d deprecated=%d",
-            ggml::gemmini::detail::activation_route_name(route.activation),
-            ggml::gemmini::detail::weight_route_name(route.weight),
-            ggml::gemmini::detail::backend_route_name(route.backend),
-            capabilities.live_stripe_producer ? 1 : 0,
-            capabilities.deprecated ? 1 : 0);
+                                  "[matmul.sequential] status=%d message=%s",
+                                  static_cast<int>(sequential_status.code),
+                                  sequential_status.message);
+        GGML_ABORT("Gemmini stripe sequential execution failed");
+      }
+      const auto route = ggml::gemmini::detail::normalize_route(args);
+      const auto capabilities = ggml::gemmini::detail::route_capabilities(args);
+      ggml::gemmini::log::debug(
+          layer,
+          "[matmul.route] invocation=stripe-sequential full_or_slice=slice "
+          "activation_route=%s weight_route=%s backend_route=%s "
+          "supports_live_pipeline=%d deprecated=%d",
+          ggml::gemmini::detail::activation_route_name(route.activation),
+          ggml::gemmini::detail::weight_route_name(route.weight),
+          ggml::gemmini::detail::backend_route_name(route.backend),
+          capabilities.live_stripe_producer ? 1 : 0,
+          capabilities.deprecated ? 1 : 0);
     }
 
     end = ggml::gemmini::cycle::read();
@@ -1522,72 +1653,97 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     //                  layer, (void *)args.f_out, args.stride_f_out, args.col_stride_f_out);
 
     if (facade_full_dispatch) {
-        ggml::gemmini::MatMul facade(args);
-        const auto facade_result = facade.run_full();
-        if (facade_result.status != ggml::gemmini::MatMulStatus::success) {
-            GGML_ABORT("Gemmini full facade execution failed");
-        }
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) &&                        \
+    defined(GGML_GEMMINI_TESTING)
+      ggml::gemmini::im2p_adapter::test_observe_hardware_dispatch();
+#endif
+      ggml::gemmini::MatMul facade(args);
+      const auto facade_result = facade.run_full();
+      if (facade_result.status != ggml::gemmini::MatMulStatus::success) {
+        GGML_ABORT("Gemmini full facade execution failed");
+      }
     }
 
     if (!pipeline_enabled && legacy_full_dispatch) {
         if constexpr (ggml::gemmini::config::CURRENT_COMPUTE_TYPE == ggml::gemmini::config::ComputeType::INT) {
-            constexpr auto baseline_activation_quant =
-                ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA
-                    ? ggml::gemmini::baseline_activation_quant_t::EXSIA
-                    : ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TENSOR
-                        ? ggml::gemmini::baseline_activation_quant_t::TENSOR
-                        : ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::STRIPE
-                            ? ggml::gemmini::baseline_activation_quant_t::BLOCK
-                            : ggml::gemmini::baseline_activation_quant_t::TOKEN;
-            const auto selected_baseline_weight_quant = src0->type == GGML_TYPE_Q8_CHANNEL
-                ? ggml::gemmini::baseline_weight_quant_t::CHANNEL
-                : ggml::gemmini::baseline_weight_quant_t::TENSOR;
-            bool run_baseline = true;
+          constexpr auto baseline_activation_quant =
+              ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
+                      ggml::gemmini::config::ActivationQuantAlgo::EXSIA
+                  ? ggml::gemmini::baseline_activation_quant_t::EXSIA
+              : ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
+                      ggml::gemmini::config::ActivationQuantAlgo::TENSOR
+                  ? ggml::gemmini::baseline_activation_quant_t::TENSOR
+              : (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
+                     ggml::gemmini::config::ActivationQuantAlgo::BLOCK ||
+                 ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
+                     ggml::gemmini::config::ActivationQuantAlgo::STRIPE)
+                  ? ggml::gemmini::baseline_activation_quant_t::BLOCK
+                  : ggml::gemmini::baseline_activation_quant_t::TOKEN;
+          const auto selected_baseline_weight_quant =
+              src0->type == GGML_TYPE_Q8_CHANNEL
+                  ? ggml::gemmini::baseline_weight_quant_t::CHANNEL
+                  : ggml::gemmini::baseline_weight_quant_t::TENSOR;
+          bool run_baseline = true;
 
-            if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA ||
-                          ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::STRIPE) {
-                if (args.weight_i8_scale_active) {
-                    if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::STRIPE) {
-                        GGML_ABORT("Gemmini STRIPE activation requires IM2P/native Q8 weights; dense tensor weights are unsupported");
-                    }
-                    ggml::gemmini::log::debug(layer,
-                        "[baseline] route activation=exsia weight=tensor weight_scale=%.9f dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
-                        static_cast<double>(args.weight_scale), args.I, args.J, args.K, args.sB,
-                        static_cast<int>(args.tiled_matmul_type));
-                } else if (args.has_q8_channel_direct_read_contract()) {
-                    if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT != ggml::gemmini::config::ActivationQuantAlgo::STRIPE) {
-                        GGML_ABORT("Gemmini Q8_CHANNEL direct-read is wired only for baseline TENSOR/TOKEN/STRIPE activation routes");
-                    }
-                } else if (args.has_q8_channel_dense_sidecar_contract()) {
-                    ggml::gemmini::log::debug(layer,
-                        "[baseline] route activation=%s weight=q8_channel_dense_sidecar dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
-                        GGML_GEMMINI_ACTIVATION_QUANT_NAME, args.I, args.J, args.K, args.sB,
-                        static_cast<int>(args.tiled_matmul_type));
-                } else if (src0->type == GGML_TYPE_Q8_CHANNEL) {
-                    GGML_ABORT("Gemmini Q8_CHANNEL activation route contract failed");
-                } else {
-                    const char *weight_route = src0->type == GGML_TYPE_Q8_H1
-                        ? "Q8_H1 direct"
-                        : src0->type == GGML_TYPE_Q8_H2
-                            ? "Q8_H2 direct"
-                            : src0->type == GGML_TYPE_Q8_HP1
-                                ? "Q8_HP1 direct"
-                                : src0->type == GGML_TYPE_Q8_HP2
-                                    ? "Q8_HP2 direct"
-                                    : src0->type == GGML_TYPE_Q8_CHANNEL
-                                        ? "Q8_CHANNEL direct-read"
-                                        : "Q8_0 reprocessed";
-                    ggml::gemmini::log::debug(layer,
-                        "[activation] route im2p weight=%s dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
-                        weight_route, args.I, args.J, args.K, args.sB, static_cast<int>(args.tiled_matmul_type));
-                    ggml::gemmini::MatMul facade(args);
-                    const auto facade_result = facade.run_dense();
-                    if (facade_result.status != ggml::gemmini::MatMulStatus::success) {
-                        GGML_ABORT("Gemmini facade dense execution failed");
-                    }
-                    run_baseline = false;
-                }
+          if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
+                            ggml::gemmini::config::ActivationQuantAlgo::EXSIA ||
+                        ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
+                            ggml::gemmini::config::ActivationQuantAlgo::
+                                STRIPE) {
+            if (args.weight_i8_scale_active) {
+              if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
+                            ggml::gemmini::config::ActivationQuantAlgo::
+                                STRIPE) {
+                GGML_ABORT("Gemmini STRIPE activation requires IM2P/native Q8 "
+                           "weights; dense tensor weights are unsupported");
+              }
+              ggml::gemmini::log::debug(
+                  layer,
+                  "[baseline] route activation=exsia weight=tensor "
+                  "weight_scale=%.9f dims=(I=%zu,J=%zu,K=%zu) sB=%zu option=%d",
+                  static_cast<double>(args.weight_scale), args.I, args.J,
+                  args.K, args.sB, static_cast<int>(args.tiled_matmul_type));
+            } else if (args.has_q8_channel_direct_read_contract()) {
+              if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT !=
+                            ggml::gemmini::config::ActivationQuantAlgo::
+                                STRIPE) {
+                GGML_ABORT("Gemmini Q8_CHANNEL direct-read is wired only for "
+                           "baseline TENSOR/TOKEN/STRIPE activation routes");
+              }
+            } else if (args.has_q8_channel_dense_sidecar_contract()) {
+              ggml::gemmini::log::debug(
+                  layer,
+                  "[baseline] route activation=%s "
+                  "weight=q8_channel_dense_sidecar dims=(I=%zu,J=%zu,K=%zu) "
+                  "sB=%zu option=%d",
+                  GGML_GEMMINI_ACTIVATION_QUANT_NAME, args.I, args.J, args.K,
+                  args.sB, static_cast<int>(args.tiled_matmul_type));
+            } else if (src0->type == GGML_TYPE_Q8_CHANNEL) {
+              GGML_ABORT("Gemmini Q8_CHANNEL activation route contract failed");
+            } else {
+              const char *weight_route =
+                  src0->type == GGML_TYPE_Q8_H1    ? "Q8_H1 direct"
+                  : src0->type == GGML_TYPE_Q8_H2  ? "Q8_H2 direct"
+                  : src0->type == GGML_TYPE_Q8_HP1 ? "Q8_HP1 direct"
+                  : src0->type == GGML_TYPE_Q8_HP2 ? "Q8_HP2 direct"
+                  : src0->type == GGML_TYPE_Q8_CHANNEL
+                      ? "Q8_CHANNEL direct-read"
+                      : "Q8_0 reprocessed";
+              ggml::gemmini::log::debug(
+                  layer,
+                  "[activation] route im2p weight=%s dims=(I=%zu,J=%zu,K=%zu) "
+                  "sB=%zu option=%d",
+                  weight_route, args.I, args.J, args.K, args.sB,
+                  static_cast<int>(args.tiled_matmul_type));
+              ggml::gemmini::MatMul facade(args);
+              const auto facade_result = facade.run_dense();
+              if (facade_result.status !=
+                  ggml::gemmini::MatMulStatus::success) {
+                GGML_ABORT("Gemmini facade dense execution failed");
+              }
+              run_baseline = false;
             }
+          }
 
                 if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::TOKEN) {
                 const bool q8_channel_route =
@@ -1840,6 +1996,12 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
             ggml::gemmini::log::dump_set_node_idx(node_idx);
 #endif
             ggml_backend_gemmini_mul_mat(ctx, node);
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) &&                        \
+    defined(GGML_GEMMINI_TESTING)
+            if (ggml::gemmini::im2p_adapter::test_production_failed()) {
+              return GGML_STATUS_FAILED;
+            }
+#endif
             break;
         }
         case GGML_OP_NONE:

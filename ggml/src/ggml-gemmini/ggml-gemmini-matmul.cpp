@@ -2430,6 +2430,53 @@ MatmulStatus execute_dense_stripe(MatmulStripeJob & job) {
     return result;
 }
 
+MatmulStatus accept_external_dense_completion(MatmulStripeJob &job) {
+  if (job.job_mutex_ == nullptr) {
+    return invalid_state("dense state unavailable");
+  }
+  {
+    std::lock_guard<std::mutex> lock(*job.job_mutex_);
+    if (job.execution_ == nullptr || !job.captured_ || job.finalized_ ||
+        !job.status_ || job.dense_state_ != MatmulDenseState::idle) {
+      return invalid_state(
+          "external dense completion requires captured Dense idle state");
+    }
+    MatMul &facade = job.execution_->facade_;
+    const MatMulStripe stripe{job.input_.row_begin(), job.input_.row_end()};
+    MatMulStatus accepted = MatMulStatus::success;
+    if (facade.state_ != MatMulState::accepting_stripes) {
+      accepted = MatMulStatus::invalid_state;
+    } else if (stripe.row_begin >= stripe.row_end ||
+               stripe.row_end > facade.args().I) {
+      accepted = MatMulStatus::malformed_stripe;
+    } else if (facade.has_stripes_ &&
+               facade.last_row_begin_ == stripe.row_begin &&
+               facade.last_row_end_ == stripe.row_end) {
+      accepted = MatMulStatus::duplicate_stripe;
+    } else if (facade.has_stripes_ && stripe.row_begin < facade.last_row_end_) {
+      accepted = MatMulStatus::overlapping_stripe;
+    }
+    if (accepted != MatMulStatus::success) {
+      return to_public_status(accepted, MatMulCapability::supported,
+                              &facade.args());
+    }
+    if (!facade.has_stripes_) {
+      facade.first_row_ = stripe.row_begin;
+    }
+    facade.last_row_begin_ = stripe.row_begin;
+    facade.last_row_end_ = stripe.row_end;
+    facade.covered_rows_ += stripe.row_end - stripe.row_begin;
+    facade.has_stripes_ = true;
+    job.dense_state_ = MatmulDenseState::complete;
+#if LOG_CYCLE
+    job.metrics_.telemetry_dense_start = cycle::read();
+    job.metrics_.telemetry_dense_end = job.metrics_.telemetry_dense_start;
+#endif
+  }
+  job.lifecycle_condition_.notify_all();
+  return {};
+}
+
 // Executes the stripe's RMD packet on the NPU stream and produces the canonical
 // block-scaled INT64 compressed output.
 MatmulStatus execute_rmd_stripe(MatmulStripeJob & job) {

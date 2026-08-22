@@ -87,20 +87,34 @@ struct QuantizedActivationBuffer {
     }
 
     const uint8_t *raw_data() const {
-        return bytes ? bytes->data() : nullptr;
+      if (!bytes || (row_stride_bytes != 0 &&
+                     row_offset > std::numeric_limits<size_t>::max() /
+                                      row_stride_bytes)) {
+        return nullptr;
+      }
+      const size_t offset = row_offset * row_stride_bytes;
+      return offset <= bytes->size() ? bytes->data() + offset : nullptr;
     }
 
     size_t raw_size() const {
-        return bytes ? bytes->size() : 0;
+      if (!bytes || (row_stride_bytes != 0 &&
+                     row_offset > std::numeric_limits<size_t>::max() /
+                                      row_stride_bytes)) {
+        return 0;
+      }
+      const size_t offset = row_offset * row_stride_bytes;
+      return offset <= bytes->size() ? bytes->size() - offset : 0;
     }
 
     // Backward-compatible conversion for 8bit hardware path.
     // Only valid when bits == 8; returns nullptr otherwise.
     operator elem_t*() {
-        return (bytes && bits == 8) ? reinterpret_cast<elem_t*>(bytes->data()) : nullptr;
+      return bits == 8
+                 ? reinterpret_cast<elem_t *>(const_cast<uint8_t *>(raw_data()))
+                 : nullptr;
     }
     operator const elem_t*() const {
-        return (bytes && bits == 8) ? reinterpret_cast<const elem_t*>(bytes->data()) : nullptr;
+      return bits == 8 ? reinterpret_cast<const elem_t *>(raw_data()) : nullptr;
     }
 };
 
