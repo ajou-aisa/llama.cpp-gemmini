@@ -163,6 +163,10 @@ struct StripeReadySink;
 #undef GGML_GEMMINI_ARGS_DEFINE_GGML_COMMON
 #endif
 #include <gemmini_params.h>
+#if defined(GGML_GEMMINI_CONFIGURED_DIM)
+static_assert(DIM == GGML_GEMMINI_CONFIGURED_DIM,
+              "Gemmini parameter header DIM does not match configured DIM");
+#endif
 
 // Forward declaration to avoid including full gemmini.h (breaks include cycles)
 enum tiled_matmul_type_t : int;
