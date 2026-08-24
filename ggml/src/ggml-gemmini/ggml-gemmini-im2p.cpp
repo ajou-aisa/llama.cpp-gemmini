@@ -92,7 +92,23 @@ std::condition_variable test_changed;
 TestCounters counters;
 TestFailure injected_failure = TestFailure::none;
 bool production_failed = false;
+TestRuntimeArgsObserver runtime_args_observer = nullptr;
+void *runtime_args_observer_data = nullptr;
 ::im2p::gemmini::Run *active_blocked_run = nullptr;
+
+void observe_runtime_args(TestRuntimeArgsSite site,
+                          const ggml_gemmini_args_t &args) noexcept {
+  TestRuntimeArgsObserver observer = nullptr;
+  void *user_data = nullptr;
+  {
+    std::lock_guard lock(test_mutex);
+    observer = runtime_args_observer;
+    user_data = runtime_args_observer_data;
+  }
+  if (observer != nullptr) {
+    observer(site, args.matmul_layer.c_str(), user_data);
+  }
+}
 #endif
 
 } // namespace
@@ -324,6 +340,10 @@ Completion run_full(const ggml_gemmini_args_t &args) noexcept {
             {}};
   }
   runtime_args.f_out = staged_output.data();
+#if defined(GGML_GEMMINI_TESTING)
+  observe_runtime_args(TestRuntimeArgsSite::simple_full_before_execute,
+                       runtime_args);
+#endif
 
   auto started =
       ::im2p::gemmini::execute(&runtime_args, ::im2p::gemmini::Mode::full,
@@ -395,6 +415,10 @@ Completion run_stripe_pipeline(const ggml_gemmini_args_t &args) noexcept {
   if (failure == TestFailure::malformed_contract) {
     runtime_args.A = {};
   }
+#endif
+#if defined(GGML_GEMMINI_TESTING)
+  observe_runtime_args(TestRuntimeArgsSite::simple_pipeline_before_execute,
+                       runtime_args);
 #endif
   auto started = ::im2p::gemmini::execute(
       &runtime_args, ::im2p::gemmini::Mode::stripe_pipeline,
@@ -1064,6 +1088,8 @@ Completion ExsiaFullExecution::finish(bool quantization_succeeded) noexcept {
   impl_->runtime_args.f_out = impl_->staged_output.data();
   impl_->runtime_args.exsia_stripe_ready_sink = nullptr;
 #if defined(GGML_GEMMINI_TESTING)
+  observe_runtime_args(TestRuntimeArgsSite::exsia_full_before_execute,
+                       impl_->runtime_args);
   TestFailure failure;
   {
     std::lock_guard lock(test_mutex);
@@ -1181,6 +1207,10 @@ start_exsia_stripe_pipeline(ggml_gemmini_args_t &args) noexcept {
 
   impl->runtime_args.f_out = impl->staged_output.data();
   impl->runtime_args.exsia_stripe_ready_sink = nullptr;
+#if defined(GGML_GEMMINI_TESTING)
+  observe_runtime_args(TestRuntimeArgsSite::exsia_pipeline_before_execute,
+                       impl->runtime_args);
+#endif
   auto started = ::im2p::gemmini::execute(
       &impl->runtime_args, ::im2p::gemmini::Mode::stripe_pipeline,
       ::im2p::gemmini::Options{65536});
@@ -1320,6 +1350,13 @@ void test_reset() noexcept {
   production_failed = false;
 }
 
+void test_set_runtime_args_observer(TestRuntimeArgsObserver observer,
+                                    void *user_data) noexcept {
+  std::lock_guard lock(test_mutex);
+  runtime_args_observer = observer;
+  runtime_args_observer_data = user_data;
+}
+
 void test_inject_failure(TestFailure failure) noexcept {
   std::lock_guard lock(test_mutex);
   injected_failure = failure;
@@ -1418,8 +1455,9 @@ void log_failure(const char *operation, const Result &result) noexcept {
 
 void log_stats(const char * mode, const Stats & stats,
                const ggml_gemmini_args_t & args) noexcept {
-#if LOG_CYCLE
+#if LOG_CYCLE || LOG_DEBUG
   Im2pExecutionTelemetry record{};
+  record.layer = args.matmul_layer;
   record.mode = mode ? mode : "unknown";
   record.activation_bits = GGML_GEMMINI_ACTIVATION_BITS;
   record.weight_bits = GGML_GEMMINI_WEIGHT_BITS;

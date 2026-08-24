@@ -55,6 +55,43 @@ bool ordered(std::uint64_t start, std::uint64_t end) {
     return end >= start;
 }
 
+#if LOG_DEBUG
+void debug_field(std::ostringstream & out, const char * name, std::uint64_t value) {
+    out << ' ' << name << '=' << value;
+}
+
+std::string serialize_im2p_debug_detail(const Im2pExecutionTelemetry & record) {
+    std::ostringstream out;
+    out << "IM2P_EXECUTION_TELEMETRY_DETAIL mode=" << record.mode;
+    debug_field(out, "activation_bits", record.activation_bits);
+    debug_field(out, "weight_bits", record.weight_bits);
+    debug_field(out, "dim", record.dim);
+    debug_field(out, "problem_i", record.problem_i);
+    debug_field(out, "problem_j", record.problem_j);
+    debug_field(out, "problem_k", record.problem_k);
+    debug_field(out, "tile_i", record.tile_i);
+    debug_field(out, "tile_j", record.tile_j);
+    debug_field(out, "tile_k", record.tile_k);
+    debug_field(out, "rtl_work_total_cycles", record.rtl_work_total_cycles);
+    debug_field(out, "rtl_compute_cycles", record.rtl_compute_cycles);
+    debug_field(out, "rtl_drain_cycles", record.rtl_drain_cycles);
+    debug_field(out, "rtl_activation_wait_cycles", record.rtl_activation_wait_cycles);
+    debug_field(out, "rtl_weight_wait_cycles", record.rtl_weight_wait_cycles);
+    debug_field(out, "rtl_scale_wait_cycles", record.rtl_scale_wait_cycles);
+    debug_field(out, "rtl_output_wait_cycles", record.rtl_output_wait_cycles);
+    debug_field(out, "rtl_overlap_cycles", record.rtl_overlap_cycles);
+    debug_field(out, "rtl_activation_overlap_cycles", record.rtl_activation_overlap_cycles);
+    debug_field(out, "rtl_weight_overlap_cycles", record.rtl_weight_overlap_cycles);
+    debug_field(out, "rtl_scale_overlap_cycles", record.rtl_scale_overlap_cycles);
+    debug_field(out, "rtl_completed_output_works", record.rtl_completed_output_works);
+    debug_field(out, "rtl_completed_fragments", record.rtl_completed_fragments);
+    debug_field(out, "rtl_scheduler_groups_completed", record.rtl_scheduler_groups_completed);
+    debug_field(out, "rtl_stripes_published", record.rtl_stripes_published);
+    debug_field(out, "rtl_stripe_rows_published", record.rtl_stripe_rows_published);
+    return out.str();
+}
+#endif
+
 } // namespace
 
 std::string serialize_cycle_telemetry(const CycleIntervalTelemetry & record) {
@@ -91,32 +128,8 @@ std::string serialize_cycle_telemetry(const Im2pExecutionTelemetry & record) {
 #else
     std::ostringstream out;
     prefix(out, "IM2P_EXECUTION_TELEMETRY", "im2p_rtl", "rtl_cycle");
-    string_field(out, "mode", record.mode);
-    field(out, "activation_bits", record.activation_bits);
-    field(out, "weight_bits", record.weight_bits);
-    field(out, "dim", record.dim);
-    field(out, "problem_i", record.problem_i);
-    field(out, "problem_j", record.problem_j);
-    field(out, "problem_k", record.problem_k);
-    field(out, "tile_i", record.tile_i);
-    field(out, "tile_j", record.tile_j);
-    field(out, "tile_k", record.tile_k);
+    string_field(out, "layer", record.layer);
     field(out, "rtl_work_total_cycles", record.rtl_work_total_cycles);
-    field(out, "rtl_compute_cycles", record.rtl_compute_cycles);
-    field(out, "rtl_drain_cycles", record.rtl_drain_cycles);
-    field(out, "rtl_activation_wait_cycles", record.rtl_activation_wait_cycles);
-    field(out, "rtl_weight_wait_cycles", record.rtl_weight_wait_cycles);
-    field(out, "rtl_scale_wait_cycles", record.rtl_scale_wait_cycles);
-    field(out, "rtl_output_wait_cycles", record.rtl_output_wait_cycles);
-    field(out, "rtl_overlap_cycles", record.rtl_overlap_cycles);
-    field(out, "rtl_activation_overlap_cycles", record.rtl_activation_overlap_cycles);
-    field(out, "rtl_weight_overlap_cycles", record.rtl_weight_overlap_cycles);
-    field(out, "rtl_scale_overlap_cycles", record.rtl_scale_overlap_cycles);
-    field(out, "rtl_completed_output_works", record.rtl_completed_output_works);
-    field(out, "rtl_completed_fragments", record.rtl_completed_fragments);
-    field(out, "rtl_scheduler_groups_completed", record.rtl_scheduler_groups_completed);
-    field(out, "rtl_stripes_published", record.rtl_stripes_published);
-    field(out, "rtl_stripe_rows_published", record.rtl_stripe_rows_published);
     out << '}';
     return out.str();
 #endif
@@ -168,6 +181,10 @@ void emit_cycle_telemetry(const WsLoopTelemetry & record) {
 }
 void emit_cycle_telemetry(const Im2pExecutionTelemetry & record) {
     log::cycle.write_json(serialize_cycle_telemetry(record));
+#if LOG_DEBUG
+    const std::string detail = serialize_im2p_debug_detail(record);
+    log::debug(record.layer.c_str(), "%s", detail.c_str());
+#endif
 }
 void emit_cycle_telemetry(const PipelineStripeTelemetry & record) {
     log::cycle.write_json(serialize_cycle_telemetry(record));

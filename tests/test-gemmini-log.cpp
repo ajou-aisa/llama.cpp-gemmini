@@ -1,3 +1,4 @@
+#include "gemmini/layer.hpp"
 #include "gemmini/log.hpp"
 #include "../include/llama.h"
 #include "llama-impl.h"
@@ -786,6 +787,142 @@ static bool run_fault_probe(const std::string & name) {
 #endif
 }
 
+static bool test_semantic_matmul_layer_resolver() {
+    using ggml::gemmini::types::resolve_matmul_layer;
+    struct Case {
+        std::string_view model_arch;
+        std::string_view weight_name;
+        std::string_view input_name;
+        std::string_view output_name;
+        std::string_view expected;
+    };
+    const std::vector<Case> cases = {
+        {"gpt2", "blk.0.attn_qkv.weight", "", "", "blk.0.attn.qkv_proj"},
+        {"gpt2", "blk.11.attn_output.weight", "", "", "blk.11.attn.out_proj"},
+        {"gpt2", "blk.42.ffn_up.weight", "", "", "blk.42.mlp.up_proj"},
+        {"gpt2", "blk.123456.ffn_down.weight", "", "", "blk.123456.mlp.down_proj"},
+        {"llama", "blk.15.attn_q.weight", "", "", "blk.15.attn.q_proj"},
+        {"llama", "blk.0.attn_k.weight", "", "", "blk.0.attn.k_proj"},
+        {"llama", "blk.11.attn_v.weight", "", "", "blk.11.attn.v_proj"},
+        {"llama", "blk.12.attn_output.weight", "", "", "blk.12.attn.out_proj"},
+        {"llama", "blk.13.ffn_up.weight", "", "", "blk.13.mlp.up_proj"},
+        {"llama", "blk.14.ffn_gate.weight", "", "", "blk.14.mlp.gate_proj"},
+        {"llama", "blk.15.ffn_down.weight", "", "", "blk.15.mlp.down_proj"},
+        {"gpt2", "output.weight", "ignored/input", "not-a-consumer", "lm_head"},
+        {"llama", "output.weight", "", "result_output-bad", "lm_head"},
+        {"gpt2", "token_embd.weight", "", "result_output", "lm_head"},
+        {"llama", "token_embd.weight", "", "result_output-0", "lm_head"},
+        {"llama", "token_embd.weight", "", "result_output-123456789012345678901234567890", "lm_head"},
+
+        {"llama", "token_embd.weight", "", "result_output--1", "unclassified.token_embd.weight"},
+        {"llama", "token_embd.weight", "", "result_output-x", "unclassified.token_embd.weight"},
+        {"llama", "token_embd.weight", "", "result_output-1-extra", "unclassified.token_embd.weight"},
+        {"llama", "blk..attn_q.weight", "", "", "unclassified.blk..attn_q.weight"},
+        {"llama", "blk.-1.attn_q.weight", "", "", "unclassified.blk.-1.attn_q.weight"},
+        {"llama", "blk.+1.attn_q.weight", "", "", "unclassified.blk._1.attn_q.weight"},
+        {"llama", "blk.one.attn_q.weight", "", "", "unclassified.blk.one.attn_q.weight"},
+        {"llama", "blk.18446744073709551616.attn_q.weight", "", "", "unclassified.blk.18446744073709551616.attn_q.weight"},
+        {"llama", "blk.1.attn_q.weight.extra", "", "", "unclassified.blk.1.attn_q.weight.extra"},
+        {"gpt2", "blk.1.attn_q.weight", "", "", "unclassified.blk.1.attn_q.weight"},
+        {"llama", "blk.1.attn_qkv.weight", "", "", "unclassified.blk.1.attn_qkv.weight"},
+        {"unknown", "output.weight", "", "result_output", "unclassified.output.weight"},
+        {"llama", "blk.1.attn_q.bias", "", "", "unclassified.blk.1.attn_q.bias"},
+        {"llama", "blk.1.attn_q", "", "", "unclassified.blk.1.attn_q"},
+        {"llama", "attn_q.weight", "", "", "unclassified.attn_q.weight"},
+        {"llama", "blk.1.attn_q.weight.lora_a", "", "", "unclassified.blk.1.attn_q.weight.lora_a"},
+        {"llama", "blk.1.attn_q.weight.lora_b", "", "", "unclassified.blk.1.attn_q.weight.lora_b"},
+        {"llama", {}, {}, {}, "unclassified.unknown"},
+        {"llama", "", "", "", "unclassified.unknown"},
+        {"llama", "", "input-priority-sentinel", "output-priority/sentinel", "unclassified.output-priority_sentinel"},
+        {"llama", "", "", "consumer/bad name", "unclassified.consumer_bad_name"},
+        {"llama", "", "input\nname", "", "unclassified.input_name"},
+        {"llama", "bad name/\x01", "ignored", "ignored", "unclassified.bad_name__"},
+    };
+
+    bool ok = true;
+    for (const Case & test : cases) {
+        std::string actual;
+        try {
+            actual = resolve_matmul_layer(
+                test.model_arch, test.weight_name, test.input_name, test.output_name);
+        } catch (...) {
+            std::cerr << "semantic matmul resolver threw for weight " << test.weight_name << '\n';
+            ok = false;
+            continue;
+        }
+        if (actual != test.expected) {
+            std::cerr << "semantic matmul resolver: expected " << test.expected
+                      << ", got " << actual << '\n';
+            ok = false;
+        }
+    }
+
+    struct RoleCase {
+        std::string_view weight_suffix;
+        std::string_view expected_suffix;
+    };
+    const RoleCase gpt2_roles[] = {
+        {".attn_qkv.weight", ".attn.qkv_proj"},
+        {".attn_output.weight", ".attn.out_proj"},
+        {".ffn_up.weight", ".mlp.up_proj"},
+        {".ffn_down.weight", ".mlp.down_proj"},
+    };
+    const RoleCase llama_roles[] = {
+        {".attn_q.weight", ".attn.q_proj"},
+        {".attn_k.weight", ".attn.k_proj"},
+        {".attn_v.weight", ".attn.v_proj"},
+        {".attn_output.weight", ".attn.out_proj"},
+        {".ffn_up.weight", ".mlp.up_proj"},
+        {".ffn_gate.weight", ".mlp.gate_proj"},
+        {".ffn_down.weight", ".mlp.down_proj"},
+    };
+    const auto check_blocks =
+        [&](std::string_view arch, unsigned block_count, const auto & roles) {
+            for (unsigned block = 0; block < block_count; ++block) {
+                const std::string prefix = "blk." + std::to_string(block);
+                for (const RoleCase & role : roles) {
+                    const std::string actual = resolve_matmul_layer(
+                        arch, prefix + std::string(role.weight_suffix), "", "");
+                    const std::string expected =
+                        prefix + std::string(role.expected_suffix);
+                    if (actual != expected) {
+                        std::cerr << "semantic matmul resolver block coverage mismatch: "
+                                  << arch << ' ' << block << ' '
+                                  << role.weight_suffix << " -> " << actual
+                                  << " expected " << expected << '\n';
+                        ok = false;
+                    }
+                }
+            }
+        };
+    check_blocks("gpt2", 12, gpt2_roles);
+    check_blocks("llama", 16, llama_roles);
+
+    const std::string long_weight(120, 'x');
+    const std::string long_expected = "unclassified." + std::string(96, 'x');
+    const std::string long_actual = resolve_matmul_layer("llama", long_weight, "", "");
+    if (long_actual != long_expected || long_actual.size() != 109) {
+        std::cerr << "semantic matmul fallback was not truncated to 96 payload bytes\n";
+        ok = false;
+    }
+    return ok;
+}
+
+static bool test_legacy_layer_parser_contract() {
+    using namespace ggml::gemmini::types;
+    const bool ok = layer_name_view(nullptr).empty() &&
+        layer_name_view("---").empty() &&
+        layer_name_view("--attn_norm-tail") == "attn_norm" &&
+        parse_layer("--attn_norm-tail") == LayerType::attn_norm &&
+        parse_layer(std::string_view("ffn_gate_par")) == LayerType::ffn_gate_par &&
+        parse_layer(std::string_view("not-a-layer")) == LayerType::unknown &&
+        std::string_view(to_string(LayerType::result_norm)) == "result_norm";
+    if (!ok) {
+        std::cerr << "legacy layer parser contract changed\n";
+    }
+    return ok;
+}
+
 int main(int argc, char ** argv) {
     if (argc == 2 && std::string(argv[1]) == "--llama-callback") {
         return test_llama_callback_replacement() ? 0 : 2;
@@ -833,7 +970,8 @@ int main(int argc, char ** argv) {
         }
         return std::nullopt;
     }();
-    bool failed = false;
+    bool failed = !test_legacy_layer_parser_contract() ||
+        !test_semantic_matmul_layer_resolver();
 
     if (!test_default_setup(test_root)) {
         failed = true;

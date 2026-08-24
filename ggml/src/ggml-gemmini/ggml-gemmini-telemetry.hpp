@@ -43,6 +43,7 @@ struct WsLoopTelemetry {
 };
 
 struct Im2pExecutionTelemetry {
+    std::string layer;
     std::string mode;
     std::uint8_t activation_bits = 0;
     std::uint8_t weight_bits = 0;

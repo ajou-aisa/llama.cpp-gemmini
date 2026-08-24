@@ -38,6 +38,11 @@ std::string read_file(const std::filesystem::path & path) {
     std::ifstream input(path, std::ios::binary);
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
+std::size_t count_occurrences(const std::string & value, const std::string & needle) {
+    std::size_t count = 0;
+    for (std::size_t pos = 0; (pos = value.find(needle, pos)) != std::string::npos; pos += needle.size()) ++count;
+    return count;
+}
 
 bool aggregate_serializer_fixtures() {
     static_assert(std::is_same_v<decltype(WsLoopTelemetry::load_occupancy_cycles), std::uint32_t>);
@@ -73,6 +78,7 @@ bool aggregate_serializer_fixtures() {
     wrapped_ws.containing_interval_cycles = static_cast<std::uint64_t>(UINT32_MAX) + 1;
 
     Im2pExecutionTelemetry rtl{};
+    rtl.layer = "blk.15.mlp.down_proj";
     rtl.mode = "stripe_pipeline"; rtl.activation_bits = 8; rtl.weight_bits = 8; rtl.dim = 16;
     rtl.problem_i = 256; rtl.problem_j = 768; rtl.problem_k = 768;
     rtl.tile_i = 5; rtl.tile_j = 3; rtl.tile_k = 6;
@@ -87,13 +93,22 @@ bool aggregate_serializer_fixtures() {
     const std::string rtl_json = serialize_cycle_telemetry(rtl);
     const std::string expected_rtl =
         "{\"schema\":\"gemmini.cycle\",\"version\":1,\"record_type\":\"IM2P_EXECUTION_TELEMETRY\","
-        "\"source\":\"im2p_rtl\",\"unit\":\"rtl_cycle\",\"mode\":\"stripe_pipeline\",\"activation_bits\":8,\"weight_bits\":8,\"dim\":16,"
-        "\"problem_i\":256,\"problem_j\":768,\"problem_k\":768,\"tile_i\":5,\"tile_j\":3,\"tile_k\":6,"
-        "\"rtl_work_total_cycles\":5000,\"rtl_compute_cycles\":3000,\"rtl_drain_cycles\":120,"
-        "\"rtl_activation_wait_cycles\":41,\"rtl_weight_wait_cycles\":42,\"rtl_scale_wait_cycles\":43,\"rtl_output_wait_cycles\":44,"
-        "\"rtl_overlap_cycles\":900,\"rtl_activation_overlap_cycles\":300,\"rtl_weight_overlap_cycles\":400,\"rtl_scale_overlap_cycles\":250,"
-        "\"rtl_completed_output_works\":16,\"rtl_completed_fragments\":48,\"rtl_scheduler_groups_completed\":4,"
-        "\"rtl_stripes_published\":4,\"rtl_stripe_rows_published\":256}";
+        "\"source\":\"im2p_rtl\",\"unit\":\"rtl_cycle\",\"layer\":\"blk.15.mlp.down_proj\","
+        "\"rtl_work_total_cycles\":5000}";
+    Im2pExecutionTelemetry malformed_rtl{};
+    malformed_rtl.layer = "bad\"\\\n";
+    malformed_rtl.layer.push_back('\x01');
+    malformed_rtl.rtl_work_total_cycles = 1;
+    const std::string expected_malformed_rtl =
+        "{\"schema\":\"gemmini.cycle\",\"version\":1,\"record_type\":\"IM2P_EXECUTION_TELEMETRY\","
+        "\"source\":\"im2p_rtl\",\"unit\":\"rtl_cycle\",\"layer\":\"bad\\\"\\\\\\n\\u0001\","
+        "\"rtl_work_total_cycles\":1}";
+    const std::string malformed_rtl_json = serialize_cycle_telemetry(malformed_rtl);
+    Im2pExecutionTelemetry empty_rtl{};
+    const std::string expected_empty_rtl =
+        "{\"schema\":\"gemmini.cycle\",\"version\":1,\"record_type\":\"IM2P_EXECUTION_TELEMETRY\","
+        "\"source\":\"im2p_rtl\",\"unit\":\"rtl_cycle\",\"layer\":\"\",\"rtl_work_total_cycles\":0}";
+    const std::string empty_rtl_json = serialize_cycle_telemetry(empty_rtl);
 
     PipelineStripeTelemetry pipeline{};
     pipeline.layer = "ffn"; pipeline.run_id = 7; pipeline.stripe_id = 2;
@@ -112,8 +127,8 @@ bool aggregate_serializer_fixtures() {
         "\"finalize_start_ns\":44,\"finalize_end_ns\":48,\"valid\":true}";
 
     if (std::getenv("GEMMINI_TELEMETRY_PRINT_ALL") != nullptr) {
-        std::printf("%s\n%s\n%s\n%s\n", interval_json.c_str(), ws_json.c_str(),
-                    rtl_json.c_str(), pipeline_json.c_str());
+        std::printf("%s\n%s\n%s\n%s\n%s\n%s\n", interval_json.c_str(), ws_json.c_str(),
+                    rtl_json.c_str(), malformed_rtl_json.c_str(), empty_rtl_json.c_str(), pipeline_json.c_str());
     }
 #if !LOG_CYCLE
     return expect(interval_json.empty() && ws_json.empty() && rtl_json.empty() && pipeline_json.empty(),
@@ -125,31 +140,37 @@ bool aggregate_serializer_fixtures() {
                "hardware occupancy outside containing interval is invalid") &&
         expect(serialize_cycle_telemetry(wrapped_ws).find("\"valid\":false") != std::string::npos,
                "hardware containing interval wider than occupancy counter is invalid") &&
-        expect(rtl_json == expected_rtl, "RTL exact schema and raw 64-bit counters") &&
-        expect(rtl_json.find("rtl_total") == std::string::npos,
-               "overlapping RTL detail is not summed into an invented total") &&
+        expect(rtl_json == expected_rtl, "RTL cycle schema adds exactly one semantic layer field") &&
+        expect(count_occurrences(rtl_json, "\":") == 7, "RTL cycle schema has exactly seven top-level fields") &&
+        expect(malformed_rtl_json == expected_malformed_rtl,
+               "RTL semantic layer escapes quotes, backslashes, newline, and control bytes") &&
+        expect(empty_rtl_json == expected_empty_rtl,
+               "empty RTL semantic layer remains deterministic valid JSON") &&
         expect(pipeline_json == expected_pipeline, "pipeline exact schema");
 #endif
 }
 
 bool aggregate_cycle_sink_fixtures() {
-#if !LOG_CYCLE
-    return true;
-#else
     const auto root = std::filesystem::temp_directory_path() / "gemmini-aggregate-cycle-sink";
     std::error_code error;
     std::filesystem::remove_all(root, error);
     std::filesystem::create_directory(root, error);
     const auto cycle_path = root / "cycle-log.jsonl";
     const auto debug_path = root / "debug-log.jsonl";
-    std::ofstream(debug_path) << "{\"diagnostic\":true}\n";
+#if LOG_CYCLE
     if (!expect(ggml::gemmini::log::cycle.set_output_path(cycle_path.c_str(), true),
                 "aggregate cycle sink setup")) return false;
+#endif
+#if LOG_DEBUG
+    if (!expect(ggml::gemmini::log::debug.set_output_path(debug_path.c_str(), true),
+                "aggregate debug sink setup")) return false;
+#endif
 
     CycleIntervalTelemetry interval{}; interval.layer = "driver"; interval.name = "interval";
     interval.start = 1; interval.end = 2;
     WsLoopTelemetry ws{}; ws.containing_interval_cycles = 4; ws.loop_occupancy_cycles = 3;
-    Im2pExecutionTelemetry rtl{}; rtl.mode = "full";
+    Im2pExecutionTelemetry rtl{}; rtl.layer = "blk.15.mlp.down_proj"; rtl.mode = "full";
+    rtl.rtl_work_total_cycles = 9; rtl.rtl_compute_cycles = 7;
     PipelineStripeTelemetry pipeline{}; pipeline.layer = "driver"; pipeline.row_end = 1;
     const RmdTelemetryRecord rmd = cpu_record();
     emit_cycle_telemetry(interval);
@@ -158,21 +179,36 @@ bool aggregate_cycle_sink_fixtures() {
     emit_cycle_telemetry(pipeline);
     emit_cycle_telemetry(rmd);
     ggml::gemmini::log::cycle.set_output(stderr);
+    ggml::gemmini::log::debug.set_output(stderr);
 
     const std::string cycle_output = read_file(cycle_path);
     const std::string debug_output = read_file(debug_path);
+    bool ok = true;
+#if LOG_CYCLE
     const char * types[] = {"CYCLE_INTERVAL", "WS_LOOP_TELEMETRY", "IM2P_EXECUTION_TELEMETRY",
                             "PIPELINE_STRIPE_SUMMARY", "RMD_BACKEND_TELEMETRY"};
-    bool ok = true;
     for (const char * type : types) {
         ok &= expect(cycle_output.find(std::string("\"record_type\":\"") + type + "\"") != std::string::npos,
                      "aggregate record reaches cycle sink");
     }
-    ok &= expect(debug_output == "{\"diagnostic\":true}\n", "aggregate records leave debug sink untouched");
-    ok &= expect(!std::filesystem::exists(root / "log-ws-loop.jsonl"), "legacy WS aggregate is absent");
-    std::filesystem::remove_all(root, error);
-    return ok && !error;
+    ok &= expect(count_occurrences(cycle_output, "\"record_type\":") == 5,
+                 "aggregate cycle sink cardinality remains five records");
+#else
+    ok &= expect(cycle_output.empty(), "cycle-off suppresses aggregate records");
 #endif
+#if LOG_DEBUG
+    ok &= expect(debug_output.find("\"layer\":\"blk.15.mlp.down_proj\"") != std::string::npos &&
+                 debug_output.find("\"layer\":\"im2p_rtl\"") == std::string::npos &&
+                 count_occurrences(debug_output, "IM2P_EXECUTION_TELEMETRY_DETAIL") == 1 &&
+                 debug_output.find("rtl_work_total_cycles=9") != std::string::npos &&
+                 debug_output.find("rtl_compute_cycles=7") != std::string::npos,
+                 "IM2P execution detail uses semantic sink layer exactly once");
+#else
+    ok &= expect(debug_output.empty(), "debug-off suppresses IM2P execution detail");
+#endif
+    ok &= expect(!std::filesystem::exists(root / "log-ws-loop.jsonl"), "legacy WS aggregate is absent");
+    if (std::getenv("GEMMINI_TELEMETRY_KEEP_ARTIFACTS") == nullptr) std::filesystem::remove_all(root, error);
+    return ok && !error;
 }
 
 bool run_aggregate_driver(const std::filesystem::path & cycle_path) {
@@ -296,6 +332,13 @@ int main(int argc, char ** argv) {
     const uint64_t first = cycle::read(); const uint64_t second = cycle::read();
     if (!expect(second >= first && cycle::read_count_for_test() == 3, "enabled clock reads are observable")) return 1;
     RmdTelemetryRecord cpu = cpu_record(); RmdTelemetryRecord ws = ws_record();
+    const std::string expected_rmd_summary =
+        "{\"schema\":\"gemmini.cycle\",\"version\":1,\"record_type\":\"RMD_BACKEND_TELEMETRY\","
+        "\"runtime_bundle_id\":\"bundle-7\",\"model_id\":\"model-hash\",\"run_id\":\"run-42\","
+        "\"source\":\"host_tick\",\"unit\":\"tick\",\"backend\":\"cpu_direct\",\"option_source\":\"explicit_override\","
+        "\"work\":true,\"invocation_total\":101,\"dispatch\":{\"direct_events\":9,\"direct_calls\":2,\"packet_calls\":0,\"ws_calls\":0},"
+        "\"timing\":{\"prep\":11,\"backend_service\":31,\"merge\":7,\"residual_total\":47,\"queue\":3,\"dense_end\":120,\"residual_start\":120},"
+        "\"geometry\":{\"packet_count\":0,\"active_blocks\":0,\"compact_k_count\":0,\"padded_k_count\":0,\"physical_tile_count\":0}}";
 #if CYCLE_DETAIL
     cpu.stripes = {
         {0,0,4,{10,20,20,26,27,31,31,38},"0123456789abcdef","1123456789abcdef","2123456789abcdef",1},
@@ -303,7 +346,16 @@ int main(int argc, char ** argv) {
     };
     ws.stripes = cpu.stripes;
     const std::string json = serialize_cycle_telemetry(cpu);
-    const bool detail = expect(json.find("\"stripes\"") != std::string::npos, "DETAIL emits per-stripe attribution") &&
+    const std::string expected_rmd = expected_rmd_summary.substr(0, expected_rmd_summary.size() - 1) +
+        ",\"stripes\":[{\"stripe_id\":0,\"row_begin\":0,\"row_end\":4,\"stages\":{\"dense_start\":10,\"dense_end\":20,"
+        "\"residual_start\":20,\"backend_start\":26,\"backend_end\":27,\"merge_start\":31,\"merge_end\":31,\"residual_end\":38},"
+        "\"input_hash\":\"0123456789abcdef\",\"correction_hash\":\"1123456789abcdef\",\"correction_nonzero_count\":1,"
+        "\"output_hash\":\"2123456789abcdef\"},{\"stripe_id\":1,\"row_begin\":4,\"row_end\":8,\"stages\":{\"dense_start\":40,"
+        "\"dense_end\":50,\"residual_start\":50,\"backend_start\":59,\"backend_end\":60,\"merge_start\":65,\"merge_end\":65,"
+        "\"residual_end\":72},\"input_hash\":\"3123456789abcdef\",\"correction_hash\":\"4123456789abcdef\","
+        "\"correction_nonzero_count\":0,\"output_hash\":\"5123456789abcdef\"}]}";
+    const bool detail = expect(json == expected_rmd, "RMD detail serialized bytes remain exact baseline") &&
+        expect(json.find("\"stripes\"") != std::string::npos, "DETAIL emits per-stripe attribution") &&
         expect(json.find("input_hash") != std::string::npos &&
                json.find("correction_hash") != std::string::npos &&
                json.find("\"correction_nonzero_count\":1") != std::string::npos &&
@@ -315,7 +367,8 @@ int main(int argc, char ** argv) {
         hash_parity_and_mismatch_fixtures();
 #else
     const std::string json = serialize_cycle_telemetry(cpu);
-    const bool detail = expect(json.find("\"stripes\"") == std::string::npos, "SUMMARY has no per-stripe detail") &&
+    const bool detail = expect(json == expected_rmd_summary, "RMD summary serialized bytes remain exact baseline") &&
+        expect(json.find("\"stripes\"") == std::string::npos, "SUMMARY has no per-stripe detail") &&
         expect(json.find("input_hash") == std::string::npos &&
                json.find("correction_hash") == std::string::npos &&
                json.find("output_hash") == std::string::npos &&

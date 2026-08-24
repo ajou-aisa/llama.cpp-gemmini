@@ -1484,7 +1484,7 @@ namespace ggml::gemmini::quants::act::exsia
         ggml_gemmini_args_t &args,
         const StripeReadySink *sink)
     {
-        const char *layer = ggml::gemmini::types::to_string(args.layer_type);
+        const char * layer = args.matmul_layer.c_str();
         const uint64_t run_id = next_exsia_run_id();
         EXSIA_PROFILE_LOG(
         const ProfileConfig profile_config = compile_profile_config();

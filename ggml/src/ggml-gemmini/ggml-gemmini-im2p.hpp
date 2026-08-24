@@ -226,6 +226,17 @@ enum class TestFailure : std::uint8_t {
   collector_capture,
 };
 
+enum class TestRuntimeArgsSite : std::uint8_t {
+  simple_full_before_execute,
+  simple_pipeline_before_execute,
+  exsia_full_before_execute,
+  exsia_pipeline_before_execute,
+};
+
+using TestRuntimeArgsObserver = void (*)(TestRuntimeArgsSite site,
+                                         const char *layer,
+                                         void *user_data);
+
 struct TestCounters {
   std::uint64_t activation_allocations = 0;
   std::uint64_t worker_starts = 0;
@@ -274,6 +285,8 @@ struct TestCounters {
 };
 
 void test_reset() noexcept;
+void test_set_runtime_args_observer(TestRuntimeArgsObserver observer,
+                                    void *user_data) noexcept;
 void test_inject_failure(TestFailure failure) noexcept;
 [[nodiscard]] bool test_wait_for_blocked_producer() noexcept;
 void test_release_blocked_producer_with_error() noexcept;
