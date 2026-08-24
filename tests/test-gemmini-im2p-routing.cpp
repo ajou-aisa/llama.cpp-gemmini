@@ -900,7 +900,8 @@ bool run_simple_runtime_args_observer_contract() {
     args.tile_I = 1;
     args.tile_J = 1;
     args.tile_K = 1;
-    args.activation_rows_per_stripe = pipeline ? 32 : 1;
+    args.activation_rows_per_stripe =
+        pipeline ? GGML_GEMMINI_TEST_IM2P_DIM : 1;
     std::vector<float> output(args.I, sentinel);
     args.f_out = output.data();
     args.stride_f_out = 1;
