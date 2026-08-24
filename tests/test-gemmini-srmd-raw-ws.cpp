@@ -1,5 +1,5 @@
 #include <gemmini_params.h>
-#include "../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.hpp"
+#include "../ggml/src/ggml-gemmini/residual/rmd/rmd-types.hpp"
 
 #include <array>
 #include <chrono>
@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -228,9 +229,55 @@ bool run_cpu_radix_case() {
     return true;
 }
 
+template <typename WeightCode>
+bool run_cpu_matched_width_case(uint8_t bits) {
+    static_assert(std::is_signed_v<WeightCode>, "compact weight codes must be signed");
+    const int32_t qmin = -(int32_t{1} << (bits - 1));
+    const int32_t qmax = (int32_t{1} << (bits - 1)) - 1;
+    const std::array<elem_t, 6> digits = {-128, -17, -1, 1, 63, 127};
+    const std::array<WeightCode, 6> weights = {
+        static_cast<WeightCode>(qmin), static_cast<WeightCode>(qmax),
+        static_cast<WeightCode>(qmin + 1), static_cast<WeightCode>(qmax - 1),
+        static_cast<WeightCode>(-3), static_cast<WeightCode>(5),
+    };
+
+    __int128 sum = 0;
+    for (size_t k = 0; k < digits.size(); ++k) {
+        sum += static_cast<__int128>(digits[k]) * weights[k];
+    }
+    int64_t actual = 0;
+    if (!checked_int64(sum, actual)) {
+        return false;
+    }
+
+    int64_t literal = 0;
+    for (size_t k = 0; k < digits.size(); ++k) {
+        literal += static_cast<int64_t>(digits[k]) * static_cast<int64_t>(weights[k]);
+    }
+    if (actual != literal) {
+        return fail("matched-width compact dot differs from signed int64 oracle");
+    }
+    if (bits == 16) {
+        int64_t narrowed = 0;
+        for (size_t k = 0; k < digits.size(); ++k) {
+            narrowed += static_cast<int64_t>(digits[k]) *
+                static_cast<int8_t>(weights[k]);
+        }
+        if (narrowed == literal) {
+            return fail("Q16 fixture cannot detect accidental int8 narrowing");
+        }
+    }
+    std::printf("CPU matched compact exact: width=%u values=%zu result=%lld\n",
+                static_cast<unsigned>(bits), digits.size(),
+                static_cast<long long>(actual));
+    return true;
+}
+
 bool run_cpu() {
     return run_cpu_case({1, 1, 1}) && run_cpu_case({DIM + 3, DIM + 5, 2 * DIM + 3}) &&
-        run_cpu_radix_case();
+        run_cpu_radix_case() && run_cpu_matched_width_case<int8_t>(4) &&
+        run_cpu_matched_width_case<int8_t>(8) &&
+        run_cpu_matched_width_case<int16_t>(16);
 }
 
 void pack_kj(const std::vector<elem_t> & source_jk, const GemmCase & shape,

@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <variant>
 #include <vector>
 
 namespace ggml::gemmini::rmd {
@@ -37,6 +38,32 @@ static_assert(kBlockSize % kArrayDim == 0 || kArrayDim % kBlockSize == 0,
 constexpr uint32_t kPacketVersion = 1;
 
 using OutputValue = int64_t;
+
+// CPU-direct H1/HP1 corrections have consumed the integer block factor but not
+// the per-column floating factor. H0 corrections have consumed their arbitrary
+// floating block factors in double precision. The variant keeps those domains
+// distinct until the common composition path handles them.
+struct BlockScaledInt64Correction {
+    std::vector<OutputValue> values;
+};
+
+struct PreScaledFloat64Correction {
+    std::vector<double> values;
+};
+
+// The correction remains tagged through execution, radix composition, and the
+// final destination merge. Integer-block-scaled and pre-scaled floating values
+// are intentionally not implicitly convertible to one another.
+using Correction = std::variant<BlockScaledInt64Correction, PreScaledFloat64Correction>;
+using DirectOutput = Correction;
+
+inline size_t correction_size(const Correction & correction) {
+    return std::visit([](const auto & typed) { return typed.values.size(); }, correction);
+}
+
+inline bool correction_empty(const Correction & correction) {
+    return correction_size(correction) == 0;
+}
 
 inline size_t align_up(size_t value, size_t alignment) {
     if (alignment == 0 || value == 0)

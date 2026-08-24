@@ -1,10 +1,15 @@
-add_library(ggml-gemmini-utils STATIC
+# Follow the product linkage topology: shared builds need one process-wide
+# logger/counter state image used by both executables and backend libraries.
+add_library(ggml-gemmini-utils
     src/debug.cpp
     src/cycle.cpp
     src/log-capi.cpp
     src/cycle_reader-capi.cpp
 )
-set_target_properties(ggml-gemmini-utils PROPERTIES POSITION_INDEPENDENT_CODE ON)
+set_target_properties(ggml-gemmini-utils PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    WINDOWS_EXPORT_ALL_SYMBOLS ON)
+install(TARGETS ggml-gemmini-utils LIBRARY ARCHIVE RUNTIME)
 
 target_include_directories(ggml-gemmini-utils
     PUBLIC

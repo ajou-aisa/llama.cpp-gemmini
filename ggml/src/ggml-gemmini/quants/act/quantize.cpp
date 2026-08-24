@@ -31,6 +31,12 @@ void reset_activation_output(ggml_gemmini_args_t &args)
 
 bool quantize_activation(const ggml_tensor *src, ggml_gemmini_args_t &args)
 {
+    ggml::gemmini::GemminiGeometry geometry;
+    if (!args.activation_quant_geometry_matches(geometry)) {
+        reset_activation_quant_state(args);
+        return false;
+    }
+
     reset_activation_quant_state(args);
 
     if (!src || src->type != GGML_TYPE_F32 || !args.A.valid() || args.I == 0 || args.K == 0) {

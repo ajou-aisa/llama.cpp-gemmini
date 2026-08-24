@@ -3,7 +3,6 @@
 #define GGML_GEMMINI_CONFIG_HAS_ACTIVATION_QUANT 1
 
 #include <cstddef>
-#include <optional>
 
 namespace ggml::gemmini::config {
 
@@ -12,8 +11,6 @@ inline constexpr bool ENABLE_STRIPE_PIPELINE = @_GGML_GEMMINI_ENABLE_STRIPE_PIPE
 inline constexpr int ACTIVATION_QUANT = @_GGML_GEMMINI_ACTIVATION_QUANT_VALUE@;
 inline constexpr int DEFAULT_MATMUL_MODE = @_GGML_GEMMINI_DEFAULT_MATMUL_MODE_VALUE@;
 inline constexpr int DEFAULT_RMD_BACKEND = @_GGML_GEMMINI_DEFAULT_RMD_BACKEND_VALUE@;
-inline constexpr std::optional<std::size_t> DEFAULT_STRIPE_ROWS =
-    @_GGML_GEMMINI_DEFAULT_STRIPE_ROWS_VALUE@;
 inline constexpr std::size_t DEFAULT_STRIPE_JOB_CAPACITY =
     @GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY@;
 inline constexpr bool ALLOW_RUNTIME_MATMUL_OVERRIDE =

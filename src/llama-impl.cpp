@@ -7,10 +7,12 @@
 #include <climits>
 #include <cstdarg>
 #include <cstring>
+#include <mutex>
 #include <vector>
 #include <sstream>
 
 struct llama_logger_state {
+    std::mutex mutex;
     ggml_log_callback log_callback = llama_log_callback_default;
     void * log_callback_user_data = nullptr;
 };
@@ -27,8 +29,20 @@ time_meas::~time_meas() {
 
 void llama_log_set(ggml_log_callback log_callback, void * user_data) {
     ggml_log_set(log_callback, user_data);
+    std::lock_guard<std::mutex> lock(g_logger_state.mutex);
     g_logger_state.log_callback = log_callback ? log_callback : llama_log_callback_default;
     g_logger_state.log_callback_user_data = user_data;
+}
+
+static void llama_log_emit(ggml_log_level level, const char * text) {
+    ggml_log_callback callback;
+    void * user_data;
+    {
+        std::lock_guard<std::mutex> lock(g_logger_state.mutex);
+        callback = g_logger_state.log_callback;
+        user_data = g_logger_state.log_callback_user_data;
+    }
+    callback(level, text, user_data);
 }
 
 static void llama_log_internal_v(ggml_log_level level, const char * format, va_list args) {
@@ -37,12 +51,12 @@ static void llama_log_internal_v(ggml_log_level level, const char * format, va_l
     char buffer[128];
     int len = vsnprintf(buffer, 128, format, args);
     if (len < 128) {
-        g_logger_state.log_callback(level, buffer, g_logger_state.log_callback_user_data);
+        llama_log_emit(level, buffer);
     } else {
         char * buffer2 = new char[len + 1];
         vsnprintf(buffer2, len + 1, format, args_copy);
         buffer2[len] = 0;
-        g_logger_state.log_callback(level, buffer2, g_logger_state.log_callback_user_data);
+        llama_log_emit(level, buffer2);
         delete[] buffer2;
     }
     va_end(args_copy);

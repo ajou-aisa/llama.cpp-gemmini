@@ -174,6 +174,16 @@ set(GGML_GEMMINI_PRINT_TILE "0" CACHE STRING "Gemmini PRINT_TILE macro (0|1)")
 set_property(CACHE GGML_GEMMINI_PRINT_TILE PROPERTY STRINGS 0 1)
 set(GGML_GEMMINI_OPTION "CPU" CACHE STRING "Gemmini OPTION macro (CPU|OS|WS)")
 set_property(CACHE GGML_GEMMINI_OPTION PROPERTY STRINGS CPU OS WS)
+string(TOUPPER "${GGML_GEMMINI_OPTION}" _GGML_GEMMINI_OPTION_UPPER)
+set(_GGML_GEMMINI_OPTION_VALUES CPU OS WS)
+list(FIND _GGML_GEMMINI_OPTION_VALUES "${_GGML_GEMMINI_OPTION_UPPER}" _GGML_GEMMINI_OPTION_INDEX)
+if(_GGML_GEMMINI_OPTION_INDEX EQUAL -1)
+    message(FATAL_ERROR
+        "GGML_GEMMINI_OPTION must be one of CPU|OS|WS, got '${GGML_GEMMINI_OPTION}'")
+endif()
+set(GGML_GEMMINI_OPTION "${_GGML_GEMMINI_OPTION_UPPER}" CACHE STRING
+    "Gemmini OPTION macro (CPU|OS|WS)" FORCE)
+set_property(CACHE GGML_GEMMINI_OPTION PROPERTY STRINGS CPU OS WS)
 set(GGML_GEMMINI_FULL_C "1" CACHE STRING "Gemmini FULL_C macro (0|1)")
 set_property(CACHE GGML_GEMMINI_FULL_C PROPERTY STRINGS 0 1)
 set(GGML_GEMMINI_LOW_D "0" CACHE STRING "Gemmini LOW_D macro (0|1)")
@@ -182,8 +192,8 @@ set(GGML_GEMMINI_TRANSPOSE_B "1" CACHE STRING "Gemmini TRANSPOSE_B macro (0|1)")
 set_property(CACHE GGML_GEMMINI_TRANSPOSE_B PROPERTY STRINGS 0 1)
 set(GGML_GEMMINI_WS_DEBUG "0" CACHE STRING "Gemmini WS debug logs (0|1)")
 set_property(CACHE GGML_GEMMINI_WS_DEBUG PROPERTY STRINGS 0 1)
-set(GGML_GEMMINI_WS_LOOP_DEBUG "0" CACHE STRING "Gemmini WS loop debug logs (0|1)")
-set_property(CACHE GGML_GEMMINI_WS_LOOP_DEBUG PROPERTY STRINGS 0 1)
+set(GGML_GEMMINI_WS_LOOP_CYCLE "0" CACHE STRING "Gemmini WS loop hardware cycle profiling (0|1)")
+set_property(CACHE GGML_GEMMINI_WS_LOOP_CYCLE PROPERTY STRINGS 0 1)
 set(GGML_GEMMINI_DISABLE_WS_REUSE "0" CACHE STRING "Disable WS A/B reuse for debugging (0|1)")
 set_property(CACHE GGML_GEMMINI_DISABLE_WS_REUSE PROPERTY STRINGS 0 1)
 
@@ -271,6 +281,17 @@ if(NOT GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "HARDWARE" AND
     message(FATAL_ERROR
         "GGML_GEMMINI_EXECUTION_BACKEND must be exactly HARDWARE or IM2P_SIM, got '${GGML_GEMMINI_EXECUTION_BACKEND}'")
 endif()
+if(_GGML_GEMMINI_OPTION_UPPER STREQUAL "OS" OR
+   (_GGML_GEMMINI_OPTION_UPPER STREQUAL "CPU" AND
+    GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM"))
+    message(FATAL_ERROR
+        "Illegal Gemmini option/backend combination: ${_GGML_GEMMINI_OPTION_UPPER}+${GGML_GEMMINI_EXECUTION_BACKEND}; legal combinations are CPU+HARDWARE, WS+HARDWARE, WS+IM2P_SIM")
+endif()
+if(NOT GGML_GEMMINI_ACTIVATION_BITS STREQUAL
+       "${GGML_GEMMINI_WEIGHT_BITS}")
+    message(FATAL_ERROR
+        "Gemmini requires matched activation and weight widths")
+endif()
 set(IM2P_SIM_ROOT "" CACHE PATH "Path to the IM2P.sim source and isolated build artifacts")
 set(IM2P_DIM "16" CACHE STRING "IM2P simulator array dimension: 16, 32, or 64")
 set_property(CACHE IM2P_DIM PROPERTY STRINGS 16 32 64)
@@ -284,16 +305,6 @@ if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
     endif()
     if(NOT IM2P_DIM MATCHES "^(16|32|64)$")
         message(FATAL_ERROR "IM2P_DIM must be 16, 32, or 64, got '${IM2P_DIM}'")
-    endif()
-    if(IM2P_DIM STREQUAL "64" AND GGML_GEMMINI_WEIGHT_BITS STREQUAL "8")
-        set(_GGML_GEMMINI_IM2P_BLOCK_SIZE 64)
-    else()
-        set(_GGML_GEMMINI_IM2P_BLOCK_SIZE 32)
-    endif()
-    if(NOT GGML_GEMMINI_BLOCK_SIZE STREQUAL
-       "${_GGML_GEMMINI_IM2P_BLOCK_SIZE}")
-        message(FATAL_ERROR
-            "IM2P_DIM=${IM2P_DIM} requires GGML_GEMMINI_BLOCK_SIZE=${_GGML_GEMMINI_IM2P_BLOCK_SIZE}, got '${GGML_GEMMINI_BLOCK_SIZE}'")
     endif()
     if(IM2P_SIM_ROOT STREQUAL "")
         message(FATAL_ERROR "IM2P_SIM_ROOT is required for GGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM")
@@ -406,6 +417,8 @@ int main() {
         "${CMAKE_CURRENT_BINARY_DIR}/im2p-frontend-pair-probe.cpp")
     file(WRITE "${_GGML_GEMMINI_IM2P_PAIR_PROBE_SOURCE}" [=[
 #include "im2p_gemmini_frontend.hpp"
+#include "ggml-gemmini-args.h"
+#include <cstdint>
 int main() {
     if (im2p_begin_striped_matmul(nullptr, nullptr, nullptr) != IM2P_ERROR)
         return 10;
@@ -417,7 +430,22 @@ int main() {
     if (im2p::gemmini::compiled_weight_bits() !=
         @GGML_GEMMINI_WEIGHT_BITS@)
         return 30;
-    return im2p::gemmini::compiled_dim() == @IM2P_DIM@ ? 0 : 40;
+    if (im2p::gemmini::compiled_dim() != @IM2P_DIM@)
+        return 40;
+    ggml_gemmini_args_t args{};
+    const auto *base = reinterpret_cast<const std::uint8_t *>(&args);
+    const auto offset = [base](const auto *member) -> std::uint64_t {
+        return static_cast<std::uint64_t>(
+            reinterpret_cast<const std::uint8_t *>(member) - base);
+    };
+    const auto linked = im2p::gemmini::compiled_args_layout_fingerprint();
+    return linked.size == sizeof(args) &&
+                   linked.native_weight_bytes == offset(&args.native_weight_bytes) &&
+                   linked.col_stride_f_out == offset(&args.col_stride_f_out) &&
+                   linked.stride_f_out == offset(&args.stride_f_out) &&
+                   linked.tile_i == offset(&args.tile_I)
+               ? 0
+               : 50;
 }
 ]=])
     file(READ "${_GGML_GEMMINI_IM2P_PAIR_PROBE_SOURCE}"
@@ -427,6 +455,7 @@ int main() {
     file(WRITE "${_GGML_GEMMINI_IM2P_PAIR_PROBE_SOURCE}"
         "${_GGML_GEMMINI_IM2P_PAIR_PROBE_CONTENT}")
     set(_GGML_GEMMINI_IM2P_PAIR_PROBE_INCLUDES
+        "${CMAKE_CURRENT_BINARY_DIR}/generated"
         "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-gemmini"
         "${CMAKE_CURRENT_SOURCE_DIR}/ggml/include"
         "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src"
@@ -454,9 +483,12 @@ int main() {
             ${CMAKE_DL_LIBS})
     if(NOT _GGML_GEMMINI_IM2P_PAIR_PROBE_COMPILED)
         message(FATAL_ERROR
-            "IM2P frontend configuration mismatch: unable to link the selected frontend/simulator pair")
+            "IM2P frontend args layout mismatch or incompatible pair: unable to link the selected frontend/simulator pair")
     endif()
-    if(NOT _GGML_GEMMINI_IM2P_PAIR_PROBE_RESULT EQUAL 0)
+    if(_GGML_GEMMINI_IM2P_PAIR_PROBE_RESULT EQUAL 50)
+        message(FATAL_ERROR
+            "IM2P frontend args layout mismatch for ${GGML_GEMMINI_IM2P_ARTIFACT_ID}; rebuild the selected frontend archive")
+    elseif(NOT _GGML_GEMMINI_IM2P_PAIR_PROBE_RESULT EQUAL 0)
         message(FATAL_ERROR
             "IM2P frontend configuration mismatch for ${GGML_GEMMINI_IM2P_ARTIFACT_ID} (probe result ${_GGML_GEMMINI_IM2P_PAIR_PROBE_RESULT})")
     endif()
@@ -481,7 +513,7 @@ foreach(_GGML_GEMMINI_BOOL_VAR IN ITEMS
         GGML_GEMMINI_LOW_D
         GGML_GEMMINI_TRANSPOSE_B
         GGML_GEMMINI_WS_DEBUG
-        GGML_GEMMINI_WS_LOOP_DEBUG
+        GGML_GEMMINI_WS_LOOP_CYCLE
         GGML_GEMMINI_DISABLE_WS_REUSE)
     if (NOT ${_GGML_GEMMINI_BOOL_VAR} MATCHES "^[01]$")
         message(FATAL_ERROR
@@ -535,8 +567,6 @@ set(GGML_GEMMINI_DEFAULT_MATMUL_MODE "FULL" CACHE STRING
     "Default Gemmini matmul mode: FULL or STRIPE_PIPELINE")
 set_property(CACHE GGML_GEMMINI_DEFAULT_MATMUL_MODE PROPERTY STRINGS
     FULL STRIPE_PIPELINE)
-set(GGML_GEMMINI_DEFAULT_STRIPE_ROWS "AUTO" CACHE STRING
-    "Default stripe rows: AUTO or a positive integer")
 set(GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY "2" CACHE STRING
     "Default stripe job capacity")
 option(GGML_GEMMINI_ALLOW_RUNTIME_MATMUL_OVERRIDE
@@ -590,23 +620,6 @@ if (GGML_GEMMINI_DEFAULT_MATMUL_MODE STREQUAL "STRIPE_PIPELINE" AND
     NOT GGML_GEMMINI_ENABLE_STRIPE_PIPELINE)
     message(FATAL_ERROR "STRIPE_PIPELINE default requires GGML_GEMMINI_ENABLE_STRIPE_PIPELINE=ON")
 endif()
-if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND
-    NOT GGML_GEMMINI_WEIGHT_BITS STREQUAL "8")
-    if (NOT GGML_GEMMINI_ACTIVATION_BITS STREQUAL
-        "${GGML_GEMMINI_WEIGHT_BITS}")
-        message(FATAL_ERROR
-            "Native IM2P W4/W16 requires matched activation and weight widths")
-    endif()
-    if (_GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "EXSIA")
-        message(FATAL_ERROR
-            "ExSIA A4/Q4 and A16/Q16 remain TODO pending RMD scale integration")
-    endif()
-    if (GGML_GEMMINI_ENABLE_RMD)
-        message(FATAL_ERROR
-            "Native IM2P W4/W16 requires GGML_GEMMINI_ENABLE_RMD=OFF")
-    endif()
-endif()
-
 foreach(_GGML_GEMMINI_MATMUL_COUNT IN ITEMS
         GGML_GEMMINI_DEFAULT_STRIPE_JOB_CAPACITY)
     if (NOT ${_GGML_GEMMINI_MATMUL_COUNT} MATCHES "^[1-9][0-9]*$")
@@ -619,22 +632,6 @@ foreach(_GGML_GEMMINI_MATMUL_COUNT IN ITEMS
         message(FATAL_ERROR "${_GGML_GEMMINI_MATMUL_COUNT} exceeds uint32 range")
     endif()
 endforeach()
-
-if (GGML_GEMMINI_DEFAULT_STRIPE_ROWS STREQUAL "AUTO")
-    set(_GGML_GEMMINI_DEFAULT_STRIPE_ROWS_VALUE "std::nullopt")
-elseif (GGML_GEMMINI_DEFAULT_STRIPE_ROWS MATCHES "^[1-9][0-9]*$")
-    string(LENGTH "${GGML_GEMMINI_DEFAULT_STRIPE_ROWS}" _GGML_GEMMINI_STRIPE_ROWS_LENGTH)
-    if (_GGML_GEMMINI_STRIPE_ROWS_LENGTH GREATER 10 OR
-        (_GGML_GEMMINI_STRIPE_ROWS_LENGTH EQUAL 10 AND
-         "${GGML_GEMMINI_DEFAULT_STRIPE_ROWS}" STRGREATER "4294967295"))
-        message(FATAL_ERROR "GGML_GEMMINI_DEFAULT_STRIPE_ROWS exceeds uint32 range")
-    endif()
-    set(_GGML_GEMMINI_DEFAULT_STRIPE_ROWS_VALUE
-        "std::optional<std::size_t>{${GGML_GEMMINI_DEFAULT_STRIPE_ROWS}}")
-else()
-    message(FATAL_ERROR
-        "GGML_GEMMINI_DEFAULT_STRIPE_ROWS must be AUTO or a positive integer, got '${GGML_GEMMINI_DEFAULT_STRIPE_ROWS}'")
-endif()
 
 set(GGML_GEMMINI_GENERATED_CONFIG_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${GGML_GEMMINI_GENERATED_CONFIG_DIR}")
@@ -693,7 +690,6 @@ message(STATUS "GGML Gemmini matmul defaults:"
     "\n  stripe capability: ${GGML_GEMMINI_ENABLE_STRIPE_MATMUL}"
     "\n  stripe pipeline: ${GGML_GEMMINI_ENABLE_STRIPE_PIPELINE}"
     "\n  default mode: ${GGML_GEMMINI_DEFAULT_MATMUL_MODE}"
-    "\n  default stripe rows: ${GGML_GEMMINI_DEFAULT_STRIPE_ROWS}"
     "\n  residual compensation: RMD=${GGML_GEMMINI_ENABLE_RMD}"
     "\n  default RMD backend: ${GGML_GEMMINI_DEFAULT_RMD_BACKEND}"
     "\n  block size: ${GGML_GEMMINI_BLOCK_SIZE}"
@@ -702,13 +698,6 @@ message(STATUS "GGML Gemmini matmul defaults:"
     "\n  ExSIA internal mode: ${_GGML_GEMMINI_EXSIA_DEFAULT_MODE_UPPER}"
     "\n  ExSIA workers/team: ${GGML_GEMMINI_EXSIA_LOCAL_WORKERS}/${_GGML_GEMMINI_EXSIA_EXPECTED_OMP_THREADS}")
 
-string(TOUPPER "${GGML_GEMMINI_OPTION}" _GGML_GEMMINI_OPTION_UPPER)
-set(_GGML_GEMMINI_OPTION_VALUES CPU OS WS)
-list(FIND _GGML_GEMMINI_OPTION_VALUES "${_GGML_GEMMINI_OPTION_UPPER}" _GGML_GEMMINI_OPTION_INDEX)
-if (_GGML_GEMMINI_OPTION_INDEX EQUAL -1)
-    message(FATAL_ERROR "GGML_GEMMINI_OPTION must be one of CPU|OS|WS, got '${GGML_GEMMINI_OPTION}'")
-endif()
-
 set(GGML_GEMMINI_COMPILE_DEFS
     PRINT_TILE=${GGML_GEMMINI_PRINT_TILE}
     OPTION=${_GGML_GEMMINI_OPTION_UPPER}
@@ -716,7 +705,7 @@ set(GGML_GEMMINI_COMPILE_DEFS
     LOW_D=${GGML_GEMMINI_LOW_D}
     TRANSPOSE_B=${GGML_GEMMINI_TRANSPOSE_B}
     GEMMINI_WS_DEBUG=${GGML_GEMMINI_WS_DEBUG}
-    GEMMINI_WS_LOOP_DEBUG=${GGML_GEMMINI_WS_LOOP_DEBUG}
+    GEMMINI_WS_LOOP_CYCLE=${GGML_GEMMINI_WS_LOOP_CYCLE}
     GEMMINI_DISABLE_WS_REUSE=${GGML_GEMMINI_DISABLE_WS_REUSE}
     GGML_GEMMINI_COMPUTE_TYPE=${_GGML_GEMMINI_COMPUTE_TYPE_VALUE}
     GGML_GEMMINI_DEQUANT_FP_TEST=${_GGML_GEMMINI_DEQUANT_FP_TEST_VALUE}

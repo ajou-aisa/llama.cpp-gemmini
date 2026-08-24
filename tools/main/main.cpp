@@ -14,7 +14,6 @@
 #include <string>
 #include <vector>
 
-#include <gemmini/cycle_reader.hpp>
 #include <gemmini/log.hpp>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
@@ -49,9 +48,6 @@ static void print_usage(int argc, char ** argv) {
     LOG("\nexample usage:\n");
     LOG("\n  text generation:     %s -m your_model.gguf -p \"I believe the meaning of life is\" -n 128 -no-cnv\n", argv[0]);
     LOG("\n  chat (conversation): %s -m your_model.gguf -sys \"You are a helpful assistant\"\n", argv[0]);
-#if LOG_DEBUG
-    LOG("\n  Gemmini debug log:   %s --gemmini-debug-log PATH\n", argv[0]);
-#endif
     LOG("\n");
 }
 
@@ -103,48 +99,38 @@ static void sigint_handler(int signo) {
 #endif
 
 int main(int argc, char ** argv) {
-    std::vector<char *> args;
-    args.reserve(argc);
-    args.push_back(argv[0]);
-
-    const char * gemmini_debug_log = nullptr;
-    for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--gemmini-debug-log") == 0) {
-#if LOG_DEBUG
-            if (++i >= argc) {
-                fprintf(stderr, "error: --gemmini-debug-log requires PATH, stdout, stderr, or -\n");
-                return 1;
-            }
-            gemmini_debug_log = argv[i];
-            continue;
-#else
-            fprintf(stderr, "error: --gemmini-debug-log is unavailable because this build has LOG_DEBUG=0\n");
-            return 1;
-#endif
-        }
-        args.push_back(argv[i]);
-    }
-
-#if LOG_DEBUG
-    if (gemmini_debug_log != nullptr && !set_gemmini_debug_log_output(gemmini_debug_log)) {
-        fprintf(stderr, "error: failed to open Gemmini debug log output: %s\n", gemmini_debug_log);
-        return 1;
-    }
-#endif
-
     common_params params;
     g_params = &params;
-    if (!common_params_parse((int) args.size(), args.data(), params, LLAMA_EXAMPLE_MAIN, print_usage)) {
+    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_MAIN, print_usage)) {
         return 1;
     }
 
-    if (!ggml::gemmini::log::cycle.set_output_path(GEMMINI_LOG_DEFAULT_CYCLE_PATH, true)) {
-        fprintf(stderr, "error: failed to open Gemmini cycle log output: %s\n", GEMMINI_LOG_DEFAULT_CYCLE_PATH);
+#if LOG_DEBUG
+    if (!params.gemmini_debug_log.empty() && !set_gemmini_debug_log_output(params.gemmini_debug_log.c_str())) {
+        fprintf(stderr, "error: failed to open Gemmini debug log output: %s\n", params.gemmini_debug_log.c_str());
         return 1;
     }
+#else
+    if (!params.gemmini_debug_log.empty()) {
+        fprintf(stderr, "error: --gemmini-debug-log is unavailable because this build has LOG_DEBUG=0\n");
+        return 1;
+    }
+#endif
 
-    uint64_t start_cycle = ggml::gemmini::cycle::read();
-    fprintf(stderr, "start cycle : %lu \n", start_cycle);
+#if LOG_CYCLE
+    const char * cycle_log_path = params.gemmini_cycle_log.empty()
+        ? GEMMINI_LOG_DEFAULT_CYCLE_PATH
+        : params.gemmini_cycle_log.c_str();
+    const bool cycle_log_ready = ggml::gemmini::log::cycle.set_output_path(cycle_log_path, true);
+    if (!params.gemmini_cycle_log.empty() && !cycle_log_ready) {
+        return 1;
+    }
+#else
+    if (!params.gemmini_cycle_log.empty()) {
+        fprintf(stderr, "error: --gemmini-cycle-log is unavailable because this build has LOG_CYCLE=0\n");
+        return 1;
+    }
+#endif
 
     common_init();
 
@@ -1028,10 +1014,6 @@ int main(int argc, char ** argv) {
 
     ggml_threadpool_free_fn(threadpool);
     ggml_threadpool_free_fn(threadpool_batch);
-
-    uint64_t end_cycle = ggml::gemmini::cycle::read();
-    fprintf(stderr, "end cycle : %lu \n", end_cycle);
-    fprintf(stderr, "total elapsed cycle : %lu \n", end_cycle - start_cycle);
 
     return 0;
 }

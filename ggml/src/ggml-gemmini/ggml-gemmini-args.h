@@ -7,8 +7,13 @@
 #include <cstdio>
 #include <cmath>
 #include <limits>
+#include <memory>
+#include <new>
+#include <stdexcept>
+#include <utility>
 #include <vector>
 
+#include "ggml-gemmini-geometry.hpp"
 #include "quants/act/meta.hpp"
 #include "quants/act/types.hpp"
 
@@ -26,12 +31,31 @@ struct QuantizedActivationBuffer {
 
     bool allocate(size_t r, size_t c, uint8_t b) {
         if (r == 0 || c == 0 || (b != 4 && b != 8 && b != 16)) return false;
+
+        size_t staged_row_stride = c;
+        if (b == 16) {
+            if (c > std::numeric_limits<size_t>::max() / sizeof(int16_t)) return false;
+            staged_row_stride = c * sizeof(int16_t);
+        }
+        if (r > std::numeric_limits<size_t>::max() / staged_row_stride) return false;
+        const size_t byte_count = r * staged_row_stride;
+        if (byte_count > std::vector<uint8_t>{}.max_size()) return false;
+
+        std::shared_ptr<std::vector<uint8_t>> staged_bytes;
+        try {
+            staged_bytes = std::make_shared<std::vector<uint8_t>>(byte_count, 0);
+        } catch (const std::bad_alloc &) {
+            return false;
+        } catch (const std::length_error &) {
+            return false;
+        }
+
+        bytes = std::move(staged_bytes);
         bits = b;
         rows = r;
         cols = c;
+        row_stride_bytes = staged_row_stride;
         row_offset = 0;
-        row_stride_bytes = (bits == 4 || bits == 8) ? c : c * 2;
-        bytes = std::make_shared<std::vector<uint8_t>>(rows * row_stride_bytes, 0);
         return true;
     }
 
@@ -154,7 +178,7 @@ static inline float gemmini_ldexp_fast_pos(float x, int m) {
     if (exp == 0 || exp == 0xFF) return std::ldexp(x, m);
     const int32_t new_exp = exp + m;
     if (new_exp <= 0) return 0.0f;
-    if (new_exp >= 0xFF) return INFINITY;
+    if (new_exp >= 0xFF) return std::numeric_limits<float>::max();
     const uint32_t out = (u & ~(0xFFu << 23)) | ((uint32_t)new_exp << 23);
     float r;
     std::memcpy(&r, &out, sizeof(r));
@@ -303,6 +327,9 @@ typedef struct ggml_gemmini_args_t {
     const block_q16_hp1 *q16_hp1_blocks = nullptr;
     size_t native_block_count = 0;
     size_t native_blocks_per_row = 0;
+    // Checked available backing extent for native block readers. Native
+    // dispatch requires a nonzero extent covering every declared block.
+    size_t native_weight_bytes = 0;
 
     // Q8_H1 weight fields (default path, no mode flag needed)
     const uint8_t  *c_b = nullptr;       // [J * blocks_per_row] per-block effective code
@@ -333,6 +360,48 @@ typedef struct ggml_gemmini_args_t {
     size_t tile_I = 0;
     size_t tile_J = 0;
     size_t tile_K = 0;
+
+    inline ggml::gemmini::GemminiGeometryResult activation_geometry() const {
+        return ggml::gemmini::make_gemmini_geometry(
+            {{I, J, K}, {tile_I, tile_J, tile_K}, DIM});
+    }
+
+    inline bool activation_geometry_matches(
+        ggml::gemmini::GemminiGeometry &geometry) const {
+        const auto result = activation_geometry();
+        if (!result.ok() || activation_rows_per_stripe != result.geometry.stripe_rows)
+            return false;
+        geometry = result.geometry;
+        return true;
+    }
+
+    inline ggml::gemmini::GemminiGeometryResult activation_quant_geometry() const {
+        const size_t array_dim = DIM;
+        if (array_dim == 0)
+            return activation_geometry();
+        const auto tile_or_full_extent = [](size_t tile, size_t extent, size_t dimension) {
+            if (tile != 0)
+                return tile;
+            return extent / dimension + static_cast<size_t>(extent % dimension != 0);
+        };
+        return ggml::gemmini::make_gemmini_geometry(
+            {{I, J, K},
+             {tile_or_full_extent(tile_I, I, array_dim),
+              tile_or_full_extent(tile_J, J, array_dim),
+              tile_or_full_extent(tile_K, K, array_dim)},
+             array_dim});
+    }
+
+    inline bool activation_quant_geometry_matches(
+        ggml::gemmini::GemminiGeometry &geometry) const {
+        const auto result = activation_quant_geometry();
+        if (!result.ok() ||
+            (activation_rows_per_stripe != 0 &&
+             activation_rows_per_stripe != result.geometry.stripe_rows))
+            return false;
+        geometry = result.geometry;
+        return true;
+    }
 
     inline size_t stripe_J_or_rowwise_elems() const { return stripe_J > 0 ? stripe_J : 1; }
     inline bool stripe_mode_matches_tile_j(size_t tile_J_elems) const {
@@ -501,6 +570,7 @@ typedef struct ggml_gemmini_args_t {
             J > std::numeric_limits<size_t>::max() / q8_hp1_blocks_per_row ||
             q8_hp1_block_count != J * q8_hp1_blocks_per_row ||
             q8_hp1_block_count > std::numeric_limits<size_t>::max() / sizeof(block_q8_hp1) ||
+            native_weight_bytes < q8_hp1_block_count * sizeof(block_q8_hp1) ||
             q8_hp2_blocks != nullptr || q8_hp2_block_count != 0 ||
             q8_hp2_blocks_per_row != 0 || !has_no_q8_h1_metadata()) {
             return false;
@@ -576,35 +646,44 @@ typedef struct ggml_gemmini_args_t {
 
         const void *blocks = nullptr;
         size_t alignment = 1;
+        size_t block_bytes = 0;
         switch (weight_format) {
         case im2p_weight_format_t::q4_h0:
             blocks = q4_h0_blocks;
             alignment = alignof(block_q4_h0);
+            block_bytes = sizeof(block_q4_h0);
             break;
         case im2p_weight_format_t::q4_h1:
             blocks = q4_h1_blocks;
             alignment = alignof(block_q4_h1);
+            block_bytes = sizeof(block_q4_h1);
             break;
         case im2p_weight_format_t::q4_hp1:
             blocks = q4_hp1_blocks;
             alignment = alignof(block_q4_hp1);
+            block_bytes = sizeof(block_q4_hp1);
             break;
         case im2p_weight_format_t::q16_h0:
             blocks = q16_h0_blocks;
             alignment = alignof(block_q16_h0);
+            block_bytes = sizeof(block_q16_h0);
             break;
         case im2p_weight_format_t::q16_h1:
             blocks = q16_h1_blocks;
             alignment = alignof(block_q16_h1);
+            block_bytes = sizeof(block_q16_h1);
             break;
         case im2p_weight_format_t::q16_hp1:
             blocks = q16_hp1_blocks;
             alignment = alignof(block_q16_hp1);
+            block_bytes = sizeof(block_q16_hp1);
             break;
         default:
             return false;
         }
         return blocks != nullptr &&
+               native_block_count <= std::numeric_limits<size_t>::max() / block_bytes &&
+               native_weight_bytes >= native_block_count * block_bytes &&
                reinterpret_cast<uintptr_t>(blocks) % alignment == 0;
     }
 
@@ -615,7 +694,9 @@ typedef struct ggml_gemmini_args_t {
             reinterpret_cast<uintptr_t>(q8_h1_blocks) % alignof(block_q8_h1) != 0 ||
             K > std::numeric_limits<size_t>::max() - (QK8_0 - 1) ||
             blocks_per_row != (K + QK8_0 - 1) / QK8_0 ||
-            J > std::numeric_limits<size_t>::max() / blocks_per_row) {
+            J > std::numeric_limits<size_t>::max() / blocks_per_row ||
+            q8_h1_block_count > std::numeric_limits<size_t>::max() / sizeof(block_q8_h1) ||
+            native_weight_bytes < q8_h1_block_count * sizeof(block_q8_h1)) {
             return false;
         }
 

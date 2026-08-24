@@ -241,10 +241,14 @@ static bool check_radix_compose_allows_final_int64_cancellation()
         default: break;
         }
     }
-    std::vector<ggml::gemmini::rmd::OutputValue> correction;
+    ggml::gemmini::rmd::Correction correction =
+        ggml::gemmini::rmd::BlockScaledInt64Correction{};
     const auto status = ggml::gemmini::rmd::compose_rmd_output(*packet, output, correction);
     const int64_t expected = std::numeric_limits<int64_t>::max() - 65280;
-    if (status != ggml::gemmini::rmd::RmdStatus::success || correction != std::vector<int64_t>{expected}) {
+    const auto * integer =
+        std::get_if<ggml::gemmini::rmd::BlockScaledInt64Correction>(&correction);
+    if (status != ggml::gemmini::rmd::RmdStatus::success || integer == nullptr ||
+        integer->values != std::vector<int64_t>{expected}) {
         std::fputs("FAIL: radix compose rejected an in-range final INT64 after lane cancellation\n", stderr);
         return false;
     }
@@ -255,10 +259,15 @@ static bool check_radix_compose_allows_final_int64_cancellation()
             output.values[offset] = 0;
         }
     }
-    correction = {41, 42};
+    correction = ggml::gemmini::rmd::BlockScaledInt64Correction{{41, 42}};
     const auto unchanged = correction;
+    const auto * unchanged_integer =
+        std::get_if<ggml::gemmini::rmd::BlockScaledInt64Correction>(&unchanged);
     if (ggml::gemmini::rmd::compose_rmd_output(*packet, output, correction) !=
-            ggml::gemmini::rmd::RmdStatus::overflow || correction != unchanged) {
+            ggml::gemmini::rmd::RmdStatus::overflow || unchanged_integer == nullptr ||
+        std::get_if<ggml::gemmini::rmd::BlockScaledInt64Correction>(&correction) == nullptr ||
+        std::get<ggml::gemmini::rmd::BlockScaledInt64Correction>(correction).values !=
+            unchanged_integer->values) {
         std::fputs("FAIL: radix compose overflow modified caller output\n", stderr);
         return false;
     }
@@ -293,6 +302,7 @@ static bool check_backend_neutral_checked_merge()
     args.q8_h1_block_count = weights.size();
     args.q8_h1_rows = columns;
     args.blocks_per_row = 2;
+    args.native_weight_bytes = weights.size() * sizeof(block_q8_h1);
     args.activation_row_offset = 1;
     auto & meta = args.act_quant.storage().emplace<act::token::Meta>();
     meta.scales = { 11.0f, 13.0f, 17.0f, 19.0f, 3.0f, 5.0f, 23.0f };
@@ -311,7 +321,8 @@ static bool check_backend_neutral_checked_merge()
         return false;
     }
 
-    const std::vector<int64_t> correction = { 4, -3, 7, 5 };
+    const ggml::gemmini::rmd::Correction correction =
+        ggml::gemmini::rmd::BlockScaledInt64Correction{{4, -3, 7, 5}};
     const std::vector<float> sentinel(rows * row_stride, -123.0f);
     std::vector<float> direct = sentinel;
     args.f_out = direct.data();
@@ -387,7 +398,7 @@ static bool check_backend_neutral_checked_merge()
     auto fails_without_writing = [&](const char * name,
                                      ggml::gemmini::rmd::RmdStatus expected,
                                      size_t begin, size_t end,
-                                     const std::vector<int64_t> & values) {
+                                     const ggml::gemmini::rmd::Correction & values) {
         direct = sentinel;
         args.f_out = direct.data();
         const auto status = ggml::gemmini::rmd::merge_rmd_correction(args, begin, end, values);
@@ -413,7 +424,8 @@ static bool check_backend_neutral_checked_merge()
             row_begin, rows + 1, correction) ||
         !fails_without_writing("invalid correction dimensions",
             ggml::gemmini::rmd::RmdStatus::invalid_arguments,
-            row_begin, row_end, std::vector<int64_t>{ 1, 2, 3 })) {
+            row_begin, row_end,
+            ggml::gemmini::rmd::BlockScaledInt64Correction{{1, 2, 3}})) {
         return false;
     }
     args.stride_f_out = std::numeric_limits<size_t>::max();
@@ -432,9 +444,10 @@ static bool check_backend_neutral_checked_merge()
     }
     weights[0].s_rf = weights[1].s_rf = 0.5f;
 
-    const std::vector<int64_t> overflowing = {
-        0, 1, std::numeric_limits<int64_t>::max(), 1
-    };
+    const ggml::gemmini::rmd::Correction overflowing =
+        ggml::gemmini::rmd::BlockScaledInt64Correction{{
+            0, 1, std::numeric_limits<int64_t>::max(), 1,
+        }};
     weights[0].s_rf = weights[1].s_rf = std::numeric_limits<float>::max();
     if (!fails_without_writing("late floating merge overflow",
             ggml::gemmini::rmd::RmdStatus::overflow,

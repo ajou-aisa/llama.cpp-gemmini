@@ -14,7 +14,6 @@
 #include <atomic>
 #include <cassert>
 #include <cmath>
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -170,19 +169,38 @@ namespace ggml::gemmini::quants::act::exsia
         struct ProfileConfig
         {
             std::string log_path;
+            std::string requested_path;
+            bool setup_ok = false;
         };
 
         static std::once_flag profile_log_init_once;
+        static bool profile_log_setup_ok = false;
 
         ProfileConfig compile_profile_config()
         {
             ProfileConfig config;
+            if (const char *path = std::getenv("GGML_GEMMINI_CYCLE_DETAIL_LOG"); path && path[0])
+                config.requested_path = path;
             config.log_path = cycle_detail_log_path().string();
             std::call_once(profile_log_init_once, [&config] {
+                const std::filesystem::path requested(config.requested_path);
+                std::error_code ec;
+                if (requested.is_relative() && !requested.parent_path().empty())
+                {
+                    const std::filesystem::file_status status =
+                        std::filesystem::status(requested.parent_path(), ec);
+                    if ((ec && ec != std::errc::no_such_file_or_directory) ||
+                        (std::filesystem::exists(status) &&
+                         !std::filesystem::is_directory(status)))
+                        return;
+                }
                 const std::filesystem::path path(config.log_path);
-                if (ggml::gemmini::log::prepare_output_parent(path))
-                    std::ofstream file(path, std::ios::out | std::ios::trunc);
+                if (!ggml::gemmini::log::prepare_output_parent(path))
+                    return;
+                std::ofstream file(path, std::ios::out | std::ios::trunc);
+                profile_log_setup_ok = file.good();
             });
+            config.setup_ok = profile_log_setup_ok;
             return config;
         }
 #endif
@@ -193,10 +211,13 @@ namespace ggml::gemmini::quants::act::exsia
             return next.fetch_add(1, std::memory_order_relaxed);
         }
 
-        uint64_t steady_now_ns()
+        uint64_t aggregate_now_ns()
         {
-            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count());
+#if LOG_CYCLE
+            return ggml::gemmini::cycle::timestamp_ns();
+#else
+            return 0;
+#endif
         }
 
 #if EXSIA_PROFILE_COLLECTION_ENABLED
@@ -207,7 +228,7 @@ namespace ggml::gemmini::quants::act::exsia
 
         uint64_t profile_now_ns()
         {
-            return steady_now_ns();
+            return aggregate_now_ns();
         }
 
         uint64_t profile_thread_id()
@@ -1484,6 +1505,22 @@ namespace ggml::gemmini::quants::act::exsia
         size_t logical_elem_count = 0;
         const bool logical_elem_count_ok = checked_mul_size(args.I, args.K, logical_elem_count);
         reset_failure_state();
+        ggml::gemmini::GemminiGeometry geometry;
+        if (!args.activation_quant_geometry_matches(geometry))
+        {
+            record_failure(ExSIAState::FailureCode::InvalidInput,
+                           ExSIAState::no_failure_stripe);
+            for (StripePipelineSlot &slot : pipeline_slots_)
+                slot.reset_for_run();
+            local_workspace_.reset_for_run();
+            meta.reset();
+            meta.rho = config::GGML_GEMMINI_ACTIVATION_RHO;
+            state_ = ExSIAState{};
+            state_.mode = requested_mode_;
+            state_.failure_code = ExSIAState::FailureCode::InvalidInput;
+            state_.failure_stripe = ExSIAState::no_failure_stripe;
+            return false;
+        }
         const auto fail = [&](ExSIAState::FailureCode code = ExSIAState::FailureCode::Exception,
                               size_t stripe = ExSIAState::no_failure_stripe) {
             record_failure(code, stripe);
@@ -1510,6 +1547,10 @@ namespace ggml::gemmini::quants::act::exsia
 #endif
             return false;
         };
+        EXSIA_PROFILE_LOG(
+        if (!profile_config.setup_ok)
+            return fail(ExSIAState::FailureCode::ProfileFlushFailure);
+        )
 
         meta.sigma = GGML_GEMMINI_EXSIA_SIGMA;
         for (StripePipelineSlot &slot : pipeline_slots_)
@@ -1548,18 +1589,8 @@ namespace ggml::gemmini::quants::act::exsia
 
         state_.blocks_per_row = state_.K_padded / state_.B_size;
 
-        size_t rows_per_stripe = args.I;
-        if (args.tile_I > 0 && !checked_mul_size(args.tile_I, DIM, rows_per_stripe))
-            return fail(ExSIAState::FailureCode::InvalidInput);
-
-        if (rows_per_stripe == 0)
-            return fail(ExSIAState::FailureCode::InvalidInput);
-
-        size_t stripe_round_input = 0;
-        if (!checked_add_size(args.I, rows_per_stripe - 1, stripe_round_input))
-            return fail(ExSIAState::FailureCode::InvalidInput);
-
-        const size_t num_stripes = stripe_round_input / rows_per_stripe;
+        const size_t rows_per_stripe = geometry.stripe_rows;
+        const size_t num_stripes = geometry.stripe_count;
         const float *src_data = ggml::gemmini::activation_data(A);
         if (!src_data)
             return fail(ExSIAState::FailureCode::InvalidInput);
@@ -2161,7 +2192,7 @@ namespace ggml::gemmini::quants::act::exsia
                                         }
                                         else
                                         {
-                                            slot.mark_folding_committed(steady_now_ns());
+                                            slot.mark_folding_committed(aggregate_now_ns());
                                             if (!snapshot_validation_mask(s, slot.stripe.outlier_mask))
                                             {
                                                 record_failure(ExSIAState::FailureCode::ValidationSnapshotFailure, s);
@@ -2487,7 +2518,7 @@ namespace ggml::gemmini::quants::act::exsia
             // run in row order, so meta.rmd_packets stays ordered by row_begin.
             if (!seal_stripe_packet(meta, slot))
                 return fail(ExSIAState::FailureCode::FoldingFailure, s);
-            slot.mark_folding_committed(steady_now_ns());
+            slot.mark_folding_committed(aggregate_now_ns());
 
             if (!snapshot_validation_mask(s, slot.stripe.outlier_mask))
                 return fail(ExSIAState::FailureCode::ValidationSnapshotFailure, s);
@@ -2565,12 +2596,13 @@ namespace ggml::gemmini::quants::act::exsia
             }
             const Meta &meta = *meta_ptr;
 
-            size_t rows_per_stripe = args.I;
-            if (args.tile_I > 0 && !checked_mul_size(args.tile_I, DIM, rows_per_stripe))
+            ggml::gemmini::GemminiGeometry geometry;
+            if (!args.activation_quant_geometry_matches(geometry))
             {
                 return false;
             }
-            if (rows_per_stripe == 0)
+            const size_t rows_per_stripe = geometry.stripe_rows;
+            if (meta.theta.size() != geometry.stripe_count)
             {
                 return false;
             }
@@ -2617,7 +2649,6 @@ namespace ggml::gemmini::quants::act::exsia
                         return false;
                     }
 
-                    const size_t src_idx = src_row_offset + col;
                     const size_t dst_row_offset = row * dst_row_stride;
                     const size_t dst_col_offset = col * dst_col_stride;
                     if (dst_row_offset > max_size - dst_col_offset)

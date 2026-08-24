@@ -7,6 +7,7 @@
 #include "../../quants/act/dispatch.hpp"
 #include "../../quants/common/weight_route.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <new>
@@ -59,7 +60,7 @@ RmdStatus check_offsets(const StripePacket & packet, const CompressedOutput & ou
 
 RmdStatus compose_rmd_output(const StripePacket & packet,
                              const CompressedOutput & output,
-                             std::vector<OutputValue> & correction) {
+                             Correction & correction) {
     const RmdStatus validation = validate_packet(packet);
     if (validation != RmdStatus::success) {
         return validation;
@@ -130,7 +131,8 @@ RmdStatus compose_rmd_output(const StripePacket & packet,
             destination[j] = static_cast<int64_t>(wide);
         }
     }
-    correction = std::move(staged_correction);
+    Correction staged = BlockScaledInt64Correction{std::move(staged_correction)};
+    correction.swap(staged);
     return RmdStatus::success;
 }
 
@@ -140,7 +142,7 @@ RmdStatus apply_rmd_packet_ws(const ggml_gemmini_args_t & args, const StripePack
     if (status != RmdStatus::success) {
         return status;
     }
-    std::vector<OutputValue> correction;
+    Correction correction = BlockScaledInt64Correction{};
     status = compose_rmd_output(packet, output, correction);
     if (status != RmdStatus::success) {
         return status;
@@ -209,7 +211,7 @@ RmdStatus prepare_merge_layout(const ggml_gemmini_args_t & args,
                                float * destination,
                                size_t global_row_begin,
                                size_t global_row_end,
-                               const std::vector<OutputValue> & correction,
+                               size_t correction_size,
                                MergeLayout & layout) {
     if (destination == nullptr || global_row_begin > global_row_end ||
         global_row_end > args.I) {
@@ -222,7 +224,7 @@ RmdStatus prepare_merge_layout(const ggml_gemmini_args_t & args,
     layout.row_stride = args.stride_f_out != 0 ? args.stride_f_out : args.J;
     layout.col_stride = args.col_stride_f_out != 0 ? args.col_stride_f_out : 1;
     if (!checked_mul_size(layout.row_count, args.J, layout.value_count) ||
-        correction.size() != layout.value_count ||
+        correction_size != layout.value_count ||
         !checked_add_size(args.activation_row_offset, global_row_begin,
                           layout.metadata_row_begin) ||
         !checked_add_size(args.activation_row_offset, global_row_end,
@@ -261,10 +263,36 @@ bool q8_hp1_scale_matches(const ggml_gemmini_args_t & args,
         reference->channel_scale == current->channel_scale;
 }
 
+double saturate_signed_32(int64_t value) {
+    return static_cast<double>(std::clamp(
+        value,
+        static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
+        static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
+}
+
+double saturate_signed_32(double value) {
+    return std::clamp(
+        value,
+        static_cast<double>(std::numeric_limits<int32_t>::min()),
+        static_cast<double>(std::numeric_limits<int32_t>::max()));
+}
+
 RmdStatus merge_rmd_correction_checked(const ggml_gemmini_args_t & args,
                                        const MergeLayout & layout,
                                        const wroute::WeightRoutePlan & plan,
-                                       const std::vector<OutputValue> & correction) {
+                                       const Correction & correction) {
+    const auto * integer = std::get_if<BlockScaledInt64Correction>(&correction);
+    const auto * floating = std::get_if<PreScaledFloat64Correction>(&correction);
+    const bool integer_route =
+        plan.scale_domain == wroute::WeightScaleDomain::IntegerBlockTimesColumn &&
+        wroute::route_supports_integer_block_scale(plan);
+    const bool floating_route =
+        plan.route == wroute::WeightRouteKind::H0 &&
+        plan.scale_domain == wroute::WeightScaleDomain::FloatingBlock;
+    if ((integer != nullptr) != integer_route || (floating != nullptr) != floating_route) {
+        return RmdStatus::unsupported_route;
+    }
+
     const quants::act::ActivationMetadataView metadata(
         args, layout.metadata_row_begin, layout.metadata_row_end);
     if (!metadata.valid()) {
@@ -275,17 +303,19 @@ RmdStatus merge_rmd_correction_checked(const ggml_gemmini_args_t & args,
     std::vector<float> activation_scale;
     std::vector<float> staged_output;
     try {
-        column_scale.resize(args.J);
+        if (integer != nullptr) column_scale.resize(args.J);
         activation_scale.resize(layout.row_count);
         staged_output.resize(layout.value_count);
     } catch (const std::bad_alloc &) {
         return RmdStatus::allocation_failure;
     }
 
-    for (size_t j = 0; j < args.J; ++j) {
-        column_scale[j] = wroute::route_column_scale(plan, args, j);
-        if (!std::isfinite(column_scale[j])) {
-            return RmdStatus::unsupported_route;
+    if (integer != nullptr) {
+        for (size_t j = 0; j < args.J; ++j) {
+            column_scale[j] = wroute::route_column_scale(plan, args, j);
+            if (!std::isfinite(column_scale[j])) {
+                return RmdStatus::unsupported_route;
+            }
         }
     }
     for (size_t row = 0; row < layout.row_count; ++row) {
@@ -299,12 +329,21 @@ RmdStatus merge_rmd_correction_checked(const ggml_gemmini_args_t & args,
             (layout.global_row_begin + row) * layout.row_stride;
         const size_t source_row = row * args.J;
         for (size_t j = 0; j < args.J; ++j) {
-            const double scaled = static_cast<double>(correction[source_row + j]) *
-                static_cast<double>(column_scale[j]) *
+            double domain_value = 0.0;
+            if (integer != nullptr) {
+                domain_value = saturate_signed_32(integer->values[source_row + j]) *
+                    static_cast<double>(column_scale[j]);
+            } else {
+                const double value = floating->values[source_row + j];
+                if (!std::isfinite(value)) return RmdStatus::overflow;
+                domain_value = saturate_signed_32(value);
+            }
+            const double scaled = domain_value *
                 static_cast<double>(activation_scale[row]);
             const float delta = static_cast<float>(scaled);
             const float merged = layout.destination[destination_row + j * layout.col_stride] + delta;
-            if (!std::isfinite(delta) || !std::isfinite(merged)) {
+            if (!std::isfinite(domain_value) || !std::isfinite(scaled) ||
+                !std::isfinite(delta) || !std::isfinite(merged)) {
                 return RmdStatus::overflow;
             }
             staged_output[source_row + j] = merged;
@@ -329,20 +368,22 @@ RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
                                   float * destination,
                                   size_t global_row_begin,
                                   size_t global_row_end,
-                                  const std::vector<OutputValue> & correction) {
+                                  const Correction & correction) {
     MergeLayout layout;
     const RmdStatus dimensions = prepare_merge_layout(
-        args, destination, global_row_begin, global_row_end, correction, layout);
+        args, destination, global_row_begin, global_row_end,
+        correction_size(correction), layout);
     if (dimensions != RmdStatus::success) {
         return dimensions;
     }
 
     const wroute::WeightRoutePlan plan = wroute::resolve_weight_route_plan(
         args, wroute::WeightScaleInfoMode::Residual);
-    if (!plan.valid || !wroute::route_supports_integer_block_scale(plan)) {
+    if (!plan.valid) {
         return RmdStatus::unsupported_route;
     }
-    if (plan.route == wroute::WeightRouteKind::Q8H1 && plan.native_weight_blocks) {
+    if (args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_h1 &&
+        plan.native_weight_blocks) {
         for (size_t j = 0; j < args.J; ++j) {
             for (size_t block = 0; block < args.blocks_per_row; ++block) {
                 if (!q8_h1_scale_matches(args, j, block)) {
@@ -351,7 +392,8 @@ RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
             }
         }
     }
-    if (plan.route == wroute::WeightRouteKind::Q8HP1 && plan.native_weight_blocks) {
+    if (args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1 &&
+        plan.native_weight_blocks) {
         for (size_t j = 0; j < args.J; ++j) {
             for (size_t block = 0; block < args.q8_hp1_blocks_per_row; ++block) {
                 if (!q8_hp1_scale_matches(args, j, block)) {
@@ -366,19 +408,23 @@ RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
 RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
                                   float * destination,
                                   const StripePacket & packet,
-                                  const std::vector<OutputValue> & correction) {
+                                  const Correction & correction) {
+    if (std::get_if<BlockScaledInt64Correction>(&correction) == nullptr) {
+        return RmdStatus::unsupported_route;
+    }
     size_t global_row_end = 0;
     size_t value_count = 0;
     if (packet.logical_j != args.J ||
         !checked_add_size(packet.row_begin, packet.row_count, global_row_end) ||
         !checked_mul_size(packet.row_count, packet.logical_j, value_count) ||
-        correction.size() != value_count) {
+        correction_size(correction) != value_count) {
         return RmdStatus::invalid_arguments;
     }
 
     MergeLayout layout;
     const RmdStatus dimensions = prepare_merge_layout(
-        args, destination, packet.row_begin, global_row_end, correction, layout);
+        args, destination, packet.row_begin, global_row_end,
+        correction_size(correction), layout);
     if (dimensions != RmdStatus::success) {
         return dimensions;
     }
@@ -388,7 +434,8 @@ RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
     if (!plan.valid || !wroute::route_supports_integer_block_scale(plan)) {
         return RmdStatus::unsupported_route;
     }
-    if (plan.route == wroute::WeightRouteKind::Q8H1 && plan.native_weight_blocks) {
+    if (args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_h1 &&
+        plan.native_weight_blocks) {
         for (const BlockDescriptor & block : packet.blocks) {
             for (size_t j = 0; j < args.J; ++j) {
                 if (!q8_h1_scale_matches(args, j, block.block_id)) {
@@ -397,7 +444,8 @@ RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
             }
         }
     }
-    if (plan.route == wroute::WeightRouteKind::Q8HP1 && plan.native_weight_blocks) {
+    if (args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1 &&
+        plan.native_weight_blocks) {
         for (const BlockDescriptor & block : packet.blocks) {
             for (size_t j = 0; j < args.J; ++j) {
                 if (!q8_hp1_scale_matches(args, j, block.block_id)) {
@@ -413,14 +461,14 @@ RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
 RmdStatus merge_rmd_correction(const ggml_gemmini_args_t & args,
                                size_t global_row_begin,
                                size_t global_row_end,
-                               const std::vector<OutputValue> & correction) {
+                               const Correction & correction) {
     return merge_rmd_correction_to(
         args, args.f_out, global_row_begin, global_row_end, correction);
 }
 
 RmdStatus merge_rmd_correction(const ggml_gemmini_args_t & args,
                                const StripePacket & packet,
-                               const std::vector<OutputValue> & correction) {
+                               const Correction & correction) {
     return merge_rmd_correction_to(args, args.f_out, packet, correction);
 }
 

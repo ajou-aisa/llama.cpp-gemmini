@@ -44,6 +44,20 @@ int main(void) {
         }
     }
 
+    {
+        auto ctx_arg = common_params_parser_init(params, LLAMA_EXAMPLE_MAIN);
+        size_t cycle_log_count = 0;
+        size_t debug_log_count = 0;
+        for (const auto & opt : ctx_arg.options) {
+            for (const char * arg : opt.args) {
+                cycle_log_count += std::string(arg) == "--gemmini-cycle-log";
+                debug_log_count += std::string(arg) == "--gemmini-debug-log";
+            }
+        }
+        assert(cycle_log_count == 1);
+        assert(debug_log_count == 1);
+    }
+
     auto list_str_to_char = [](std::vector<std::string> & argv) -> std::vector<char *> {
         std::vector<char *> res;
         for (auto & arg : argv) {
@@ -59,6 +73,14 @@ int main(void) {
     // missing value
     argv = {"binary_name", "-m"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+
+    // missing Gemmini output path
+    argv = {"binary_name", "--gemmini-cycle-log"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_MAIN));
+
+    // empty Gemmini output path
+    argv = {"binary_name", "--gemmini-cycle-log", ""};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_MAIN));
 
     // wrong value (int)
     argv = {"binary_name", "-ngl", "hello"};
@@ -78,6 +100,12 @@ int main(void) {
     argv = {"binary_name", "-m", "model_file.gguf"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.model.path == "model_file.gguf");
+
+    argv = {"binary_name", "--gemmini-debug-log", "/tmp/debug.jsonl",
+            "--gemmini-cycle-log", "/tmp/cycle.jsonl"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_MAIN));
+    assert(params.gemmini_debug_log == "/tmp/debug.jsonl");
+    assert(params.gemmini_cycle_log == "/tmp/cycle.jsonl");
 
     argv = {"binary_name", "-t", "1234"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));

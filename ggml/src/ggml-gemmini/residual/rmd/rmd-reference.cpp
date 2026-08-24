@@ -1,6 +1,7 @@
 #include "rmd-reference.hpp"
 
 #include "../../ggml-gemmini-args.h"
+#include "../../quants/common/weight_reader.hpp"
 #include "../../quants/common/weight_route.hpp"
 
 #include <algorithm>
@@ -12,38 +13,11 @@ namespace ggml::gemmini::rmd {
 
 namespace {
 
+namespace wreader = quants::wreader;
 namespace wroute = quants::wroute;
 
 constexpr __int128 kInt64Max = static_cast<__int128>(std::numeric_limits<int64_t>::max());
 constexpr __int128 kInt64Min = static_cast<__int128>(std::numeric_limits<int64_t>::min());
-
-bool weight_code(const ggml_gemmini_args_t & args,
-                 const wroute::WeightRoutePlan & plan,
-                 size_t k, size_t j, int8_t & out) {
-    if (plan.route == wroute::WeightRouteKind::Q8H1 && plan.native_weight_blocks) {
-        const block_q8_h1 * block = args.q8_h1_block(j, k / kBlockSize);
-        if (block == nullptr) {
-            return false;
-        }
-        out = static_cast<int8_t>(block->qs[k % kBlockSize]);
-        return true;
-    }
-    if (plan.route == wroute::WeightRouteKind::Q8HP1 && plan.native_weight_blocks) {
-        const block_q8_hp1 * block = args.q8_hp1_block(j, k / kBlockSize);
-        if (block == nullptr) {
-            return false;
-        }
-        out = static_cast<int8_t>(block->qs[k % kBlockSize]);
-        return true;
-    }
-    const int8_t * dense = reinterpret_cast<const int8_t *>(args.B);
-    if (dense == nullptr) {
-        return false;
-    }
-    out = plan.layout == wroute::WeightLayout::JxK_ColMajor ?
-        dense[j * plan.weight_stride + k] : dense[k * plan.weight_stride + j];
-    return true;
-}
 
 RmdStatus accumulate(const ggml_gemmini_args_t & args,
                      size_t row_count,
@@ -55,7 +29,14 @@ RmdStatus accumulate(const ggml_gemmini_args_t & args,
     }
     const wroute::WeightRoutePlan plan = wroute::resolve_weight_route_plan(
         args, wroute::WeightScaleInfoMode::Residual);
-    if (!plan.valid || !wroute::route_supports_integer_block_scale(plan)) {
+    if (!plan.valid) {
+        if (plan.route == wroute::WeightRouteKind::HP1 && plan.weight_bits == 8 &&
+            wreader::validate(args, plan) == wreader::WeightReaderStatus::ScaleOverflow) {
+            return RmdStatus::overflow;
+        }
+        return RmdStatus::unsupported_route;
+    }
+    if (!wroute::route_supports_integer_block_scale(plan) || plan.weight_bits != 8) {
         return RmdStatus::unsupported_route;
     }
 
@@ -97,12 +78,13 @@ RmdStatus accumulate(const ggml_gemmini_args_t & args,
         std::fill(accumulator.begin(), accumulator.end(), int64_t{0});
         for (const ReferenceResidual * residual : entries) {
             for (size_t j = 0; j < args.J; ++j) {
-                int8_t code = 0;
-                if (!weight_code(args, plan, residual->k, j, code)) {
+                const wreader::WeightCodeResult code =
+                    wreader::read_code(args, plan, j, residual->k);
+                if (!code.ok()) {
                     return RmdStatus::execution_failed;
                 }
                 const __int128 product =
-                    static_cast<__int128>(residual->residual) * static_cast<__int128>(code);
+                    static_cast<__int128>(residual->residual) * code.value;
                 const size_t index = residual->local_row * args.J + j;
                 const __int128 sum = static_cast<__int128>(accumulator[index]) + product;
                 if (sum > kInt64Max || sum < kInt64Min) {

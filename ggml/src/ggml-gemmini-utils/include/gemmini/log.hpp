@@ -19,8 +19,8 @@
  * - If `GEMMINI_LOG_DIR` is set, all relative paths are resolved under it.
  *   For paths starting with `log/`, the `log/` prefix is stripped
  *   (so `log/out.jsonl` -> `$GEMMINI_LOG_DIR/out.jsonl`).
- * - Otherwise, paths starting with `log/` are resolved under `./output/log/` (CWD),
- *   and the `log/` directory is created when needed.
+ * - Otherwise, relative paths are resolved under `./output/log/` (CWD).
+ * - Relative traversal is rejected.
  *
  * Output format:
  * - Logs are emitted as JSON Lines (JSONL): 1 JSON object per line.
@@ -34,6 +34,9 @@
 #include <cstdio>
 #include <cstdint>
 #include <filesystem>
+#include <mutex>
+#include <string>
+#include <string_view>
 
 #ifndef LOG_DEBUG
 #define LOG_DEBUG 1
@@ -57,8 +60,8 @@ namespace ggml::gemmini::log
 
     LogTarget file(const char *path);
 
-    // Resolves null/empty to empty, preserves absolute paths, and routes relative paths by
-    // GEMMINI_LOG_DIR or logical log/... under CWD/output/log; ordinary paths stay relative.
+    // Resolves null/empty or traversing relative paths to empty, preserves absolute paths,
+    // and confines every accepted relative path below GEMMINI_LOG_DIR or CWD/output/log.
     std::filesystem::path resolve_output_path(const char *path);
     bool prepare_output_parent(const std::filesystem::path &path);
 
@@ -84,24 +87,61 @@ namespace ggml::gemmini::log
 
         bool set_output_path(const char *path);
 
-        bool has_explicit_output() const { return has_explicit_output_; }
+        bool has_explicit_output() const;
 
     protected:
-        FILE *select_output(const char *path, bool *owns) const;
+        void set_output_unlocked(FILE *out);
+        bool set_output_path_unlocked(const char *path, bool truncate, const char **failure = nullptr);
+        FILE *select_output_unlocked(const char *path, bool *owns) const;
+        void close_owned_unlocked();
+        void disable_output_unlocked();
 
         FILE *out_;
 
     private:
-        void close_owned();
-
         bool owns_;
         bool has_explicit_output_ = false;
     };
 
+    struct CycleRecord
+    {
+        const char *layer = nullptr;
+        const char *op = nullptr;
+        uint64_t start = 0;
+        uint64_t end = 0;
+        const char *file = nullptr;
+        int line = 0;
+        const char *func = nullptr;
+        const char *source = nullptr;
+        const char *unit = nullptr;
+    };
+
+    struct WsCycleRecord
+    {
+        uint64_t containing_interval_cycles = 0;
+        uint32_t load_occupancy_cycles = 0;
+        uint32_t execute_occupancy_cycles = 0;
+        uint32_t store_occupancy_cycles = 0;
+        uint32_t loop_occupancy_cycles = 0;
+        uint64_t problem_i = 0;
+        uint64_t problem_j = 0;
+        uint64_t problem_k = 0;
+        uint64_t tile_i = 0;
+        uint64_t tile_j = 0;
+        uint64_t tile_k = 0;
+        uint64_t gemmini_outer_i = 0;
+        uint64_t gemmini_outer_j = 0;
+        uint64_t gemmini_outer_k = 0;
+        uint64_t ws_inner_calls = 0;
+    };
+
+    std::string serialize_cycle_record(const CycleRecord &record);
+    std::string serialize_ws_cycle_record(const WsCycleRecord &record);
+
     class DebugLog : public Log
     {
     public:
-        explicit DebugLog(FILE *out = stderr, bool add_newline = false);
+        explicit DebugLog(FILE *out = stderr);
         bool set_output_path(const char *path, bool truncate = false);
 
         void operator()(const char *fmt, ...);
@@ -118,24 +158,31 @@ namespace ggml::gemmini::log
         void v_target_layer(LogTarget target, const char *layer, const char *fmt, va_list ap);
         void v_target_loc(LogTarget target, const char *file, int line, const char *func,
                           const char *fmt, va_list ap);
-        void ws_loop(LogTarget target, uint64_t wall, uint64_t load, uint64_t exe, uint64_t store, uint64_t loop,
-                     uint64_t dim_I, uint64_t dim_J, uint64_t dim_K,
-                     uint64_t tile_I, uint64_t tile_J, uint64_t tile_K,
-                     uint64_t I0, uint64_t J0, uint64_t K0,
-                     uint64_t a_reuse, uint64_t b_reuse);
 
     private:
         void vwrite(FILE *out, const char *file, int line, const char *func, const char *fmt, va_list ap);
         void vwrite_layer_fmt(FILE *out, const char *file, int line, const char *func, const char *layer, const char *fmt, va_list ap);
+    };
 
-        bool add_newline_;
+    class HardwareCounterLease
+    {
+    public:
+        HardwareCounterLease();
+        ~HardwareCounterLease();
+        HardwareCounterLease(const HardwareCounterLease &) = delete;
+        HardwareCounterLease &operator=(const HardwareCounterLease &) = delete;
     };
 
     class CycleLog : public Log
     {
     public:
-        using Log::Log;
+        explicit CycleLog(FILE *out = stderr) : Log(out) {}
+        void set_output(FILE *out);
         bool set_output_path(const char *path, bool truncate = false);
+
+        void write(const CycleRecord &record);
+        void write_json(std::string_view json_record);
+        void report_failure(const char * operation) noexcept;
 
         void operator()(const char *layer, const char *op,
                         uint64_t start, uint64_t end);
@@ -150,9 +197,48 @@ namespace ggml::gemmini::log
                    uint64_t start, uint64_t end);
 
     private:
-        void write(FILE *out, const char *file, int line, const char *func, const char *layer, const char *op,
-                   uint64_t start, uint64_t end);
+        void emit(const char *path, const std::string &json);
+        void warn_once_unlocked(const char *operation);
+
+        bool disabled_ = false;
+        bool warned_ = false;
     };
+
+    namespace testing
+    {
+        enum class LogFault
+        {
+            none,
+            open,
+            write,
+            flush,
+            replacement,
+            allocation,
+            filesystem,
+            format,
+            mutex,
+        };
+
+        enum class TargetWriteKind
+        {
+            plain,
+            layer,
+            location,
+        };
+
+        using TargetLockHook = void (*)(TargetWriteKind kind, void *user_data);
+        void set_target_lock_hook(TargetLockHook hook, void *user_data);
+        void clear_target_lock_hook();
+        void set_log_fault(LogFault fault);
+        void clear_log_fault();
+    }
+
+    namespace detail
+    {
+        std::mutex &output_mutex();
+        bool consume_fault(testing::LogFault expected);
+        void invoke_target_lock_hook(testing::TargetWriteKind kind);
+    }
 
     extern DebugLog debug;
     extern CycleLog cycle;

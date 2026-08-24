@@ -14,14 +14,16 @@
  *   - gemmini_log_cycle_set_output_path("out.log");
  *   - gemmini_log_debug_set_output(stderr);
  *   - gemmini_log_cycle_set_output(stderr);
+ * - Structured cycle records:
+ *   - gemmini_log_cycle_record(&record);
  *
  * Path resolution notes:
  * - Absolute paths are used as-is.
  * - If `GEMMINI_LOG_DIR` is set, all relative paths are resolved under it.
  *   For paths starting with `log/`, the `log/` prefix is stripped
  *   (so `log/out.jsonl` -> `$GEMMINI_LOG_DIR/out.jsonl`).
- * - Otherwise, paths starting with `log/` are resolved under `./output/log/` (CWD),
- *   and the `log/` directory is created when needed.
+ * - Otherwise, all relative paths are resolved under `./output/log/` (CWD).
+ * - Relative traversal is rejected.
  *
  * Output format:
  * - Logs are emitted as JSON Lines (JSONL): 1 JSON object per line.
@@ -37,45 +39,68 @@
 #define GEMMINI_LOG_DEFAULT_EXSIA_DETAIL_PATH "log/exsia-cycle-detail.jsonl"
 
 #ifdef __cplusplus
+#define GEMMINI_LOG_C_BOUNDARY_NOEXCEPT noexcept
 extern "C"
 {
+#else
+#define GEMMINI_LOG_C_BOUNDARY_NOEXCEPT
 #endif
     typedef struct gemmini_log_target
     {
         const char *path;
     } gemmini_log_target;
 
-    gemmini_log_target gemmini_log_file(const char *path);
-    int gemmini_log_truncate_file(const char *path); // 1: 성공, 0: 실패
+    typedef struct gemmini_cycle_record
+    {
+        const char *layer;
+        const char *op;
+        uint64_t start;
+        uint64_t end;
+        const char *file;
+        int line;
+        const char *func;
+    } gemmini_cycle_record;
 
-    int gemmini_log_debug_set_output_path(const char *path); // 1/0
-    int gemmini_log_cycle_set_output_path(const char *path); // 1/0
-    void gemmini_log_debug_set_output(FILE *out);
-    void gemmini_log_cycle_set_output(FILE *out);
+    gemmini_log_target gemmini_log_file(const char *path) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
+    int gemmini_log_truncate_file(const char *path) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT; // 1: success, 0: failure
 
-    void gemmini_log_debug(const char *fmt, ...);
+    int gemmini_log_debug_set_output_path(const char *path) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT; // 1/0
+    int gemmini_log_cycle_set_output_path(const char *path) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT; // 1/0
+    void gemmini_log_debug_set_output(FILE *out) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
+    void gemmini_log_cycle_set_output(FILE *out) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
 
-    void gemmini_log_debug_layer(const char *layer, const char *fmt, ...);
-    void gemmini_log_debug_loc(const char *file, int line, const char *func, const char *fmt, ...);
+    void gemmini_log_debug(const char *fmt, ...) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
 
-    void gemmini_log_debug_to(gemmini_log_target target, const char *fmt, ...);
-    void gemmini_log_debug_to_layer(gemmini_log_target target, const char *layer, const char *fmt, ...);
-    void gemmini_log_debug_to_loc(gemmini_log_target target, const char *file, int line, const char *func, const char *fmt, ...);
-    void gemmini_log_ws_loop(uint64_t wall, uint64_t load, uint64_t exe, uint64_t store, uint64_t loop,
-                             uint64_t dim_I, uint64_t dim_J, uint64_t dim_K,
-                             uint64_t tile_I, uint64_t tile_J, uint64_t tile_K,
-                             uint64_t I0, uint64_t J0, uint64_t K0,
-                             uint64_t a_reuse, uint64_t b_reuse);
+    void gemmini_log_debug_layer(const char *layer, const char *fmt, ...) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
+    void gemmini_log_debug_loc(const char *file, int line, const char *func, const char *fmt, ...) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
 
-    void gemmini_log_cycle(const char *layer, const char *op, uint64_t start, uint64_t end);
+    void gemmini_log_debug_to(gemmini_log_target target, const char *fmt, ...) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
+    void gemmini_log_debug_to_layer(gemmini_log_target target, const char *layer, const char *fmt, ...) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
+    void gemmini_log_debug_to_loc(gemmini_log_target target, const char *file, int line, const char *func, const char *fmt, ...) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
+    void gemmini_hardware_counter_lease_acquire(void) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
+    void gemmini_hardware_counter_lease_release(void) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
+
+    void gemmini_log_ws_cycle(uint64_t containing_interval_cycles,
+                              uint32_t load_occupancy_cycles,
+                              uint32_t execute_occupancy_cycles,
+                              uint32_t store_occupancy_cycles,
+                              uint32_t loop_occupancy_cycles,
+                              uint64_t dim_I, uint64_t dim_J, uint64_t dim_K,
+                              uint64_t tile_I, uint64_t tile_J, uint64_t tile_K,
+                              uint64_t I0, uint64_t J0, uint64_t K0,
+                              uint64_t a_reuse, uint64_t b_reuse) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
+
+    void gemmini_log_cycle_record(const gemmini_cycle_record *record) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
+    void gemmini_log_cycle(const char *layer, const char *op, uint64_t start, uint64_t end) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
     void gemmini_log_cycle_loc(const char *file, int line, const char *func,
-                               const char *layer, const char *op, uint64_t start, uint64_t end);
+                               const char *layer, const char *op, uint64_t start, uint64_t end) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
 
     void gemmini_log_cycle_to(gemmini_log_target target, const char *layer, const char *op,
-                              uint64_t start, uint64_t end);
+                              uint64_t start, uint64_t end) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
     void gemmini_log_cycle_to_loc(gemmini_log_target target, const char *file, int line, const char *func,
-                                  const char *layer, const char *op, uint64_t start, uint64_t end);
+                                  const char *layer, const char *op, uint64_t start, uint64_t end) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
 
 #ifdef __cplusplus
 }
 #endif
+#undef GEMMINI_LOG_C_BOUNDARY_NOEXCEPT

@@ -1,7 +1,9 @@
 #pragma once
 
 #include "ggml-gemmini-args.h"
+#include "ggml-gemmini-geometry.hpp"
 #include "ggml-gemmini-matmul-config.hpp"
+#include "ggml-gemmini-telemetry.hpp"
 #include "quants/act/exsia/exsia.hpp"
 #include "residual/rmd/rmd-compose.hpp"
 #include "residual/rmd/rmd-executor.hpp"
@@ -62,14 +64,8 @@ RouteCapabilities route_capabilities(const ggml_gemmini_args_t & args);
 const char * activation_route_name(ActivationRoute route);
 const char * weight_route_name(WeightRoute route);
 const char * backend_route_name(BackendRoute route);
-std::string pipeline_stripe_summary_json(const char * layer,
-                                         size_t I,
-                                         size_t J,
-                                         size_t K,
-                                         const char * backend_route,
-                                         const char * schedule,
-                                         const MatmulJobMetrics & profile);
-bool append_pipeline_stripe_summary_jsonl(const std::string & json_record);
+PipelineStripeTelemetry pipeline_stripe_telemetry(
+    const char * layer, const MatmulJobMetrics & profile);
 
 }
 
@@ -118,6 +114,7 @@ public:
     explicit MatMul(ggml_gemmini_args_t * args);
     MatMul(MatMul && other) noexcept;
     MatMul & operator=(MatMul && other) noexcept;
+    ~MatMul();
     MatMul(const MatMul &) = delete;
     MatMul & operator=(const MatMul &) = delete;
 
@@ -146,8 +143,12 @@ private:
     friend MatmulStatus compose_rmd_stripe(MatmulStripeJob &);
     friend MatmulStatus finalize_stripe(MatmulStripeJob &);
 
+    MatMulResult run_dense(bool transactional);
     MatMulStatus run_stripe(MatMulStripe stripe, size_t stripe_id);
     MatMulStatus run_staged_stripe(MatMulStripe stripe, size_t stripe_id);
+    MatMulStatus begin_output_transaction();
+    void commit_output_transaction();
+    void discard_output_transaction();
 
     ggml_gemmini_args_t & args();
     const ggml_gemmini_args_t & args() const;
@@ -160,6 +161,10 @@ private:
     size_t covered_rows_ = 0;
     bool has_stripes_ = false;
     MatMulState state_ = MatMulState::idle;
+    float * output_destination_ = nullptr;
+    size_t output_row_stride_ = 0;
+    size_t output_col_stride_ = 0;
+    std::vector<float> output_stage_;
 };
 
 enum class MatmulStatusCode : uint8_t {
@@ -199,6 +204,7 @@ struct MatmulTestCounters {
 
 void test_reset_matmul_counters();
 MatmulTestCounters test_matmul_counters();
+void test_inject_output_stage_allocation_failure();
 #endif
 
 struct MatmulStageMetrics {
@@ -253,8 +259,12 @@ struct MatmulJobMetrics {
     uint64_t rmd_enqueue_ns = 0;
     uint64_t rmd_start_ns = 0;
     uint64_t rmd_end_ns = 0;
+    uint64_t compose_start_ns = 0;
+    uint64_t compose_end_ns = 0;
     uint64_t merge_start_ns = 0;
     uint64_t merge_end_ns = 0;
+    uint64_t finalize_start_ns = 0;
+    uint64_t finalize_end_ns = 0;
     uint64_t telemetry_queue_tick = 0;
     uint64_t telemetry_dense_start = 0;
     uint64_t telemetry_dense_end = 0;
@@ -407,8 +417,8 @@ enum class MatmulOptionSource : uint8_t {
     explicit_override,
 };
 
-inline constexpr const char * kRmdTelemetrySchema = "gemmini.rmd.telemetry";
-inline constexpr uint32_t kRmdTelemetryVersion = 1;
+inline constexpr const char * kRmdTelemetrySchema = kCycleTelemetrySchema;
+inline constexpr uint32_t kRmdTelemetryVersion = kCycleTelemetryVersion;
 
 struct RmdTelemetryCounters {
     uint64_t direct_events = 0;
@@ -496,7 +506,7 @@ RmdTelemetryCheckResult compare_rmd_telemetry_proofs(
     const RmdTelemetryRecord & lhs, const RmdTelemetryRecord & rhs);
 std::string rmd_input_hash(const residual::DirectStripePayload & payload);
 std::string rmd_input_hash(const rmd::StripePacket & packet);
-std::string rmd_correction_hash(const std::vector<rmd::OutputValue> & correction);
+std::string rmd_correction_hash(const rmd::Correction & correction);
 std::string rmd_output_hash(const ggml_gemmini_args_t & args,
                             size_t row_begin, size_t row_end);
 std::string resolve_rmd_model_id(const char * environment_model_id,
@@ -508,8 +518,6 @@ RmdTelemetryRecord make_rmd_telemetry_record(
 
 struct ResolvedMatmulOptions {
     MatmulInvocationMode mode = static_cast<MatmulInvocationMode>(config::DEFAULT_MATMUL_MODE);
-    size_t stripe_rows = config::DEFAULT_STRIPE_ROWS.value_or(1);
-    bool stripe_rows_auto = !config::DEFAULT_STRIPE_ROWS.has_value();
     size_t dense_threads = 0;
     bool validation = false;
     bool profiling = false;
@@ -521,7 +529,6 @@ struct ResolvedMatmulOptions {
 
 struct MatmulOptionOverrides {
     std::optional<MatmulInvocationMode> mode;
-    std::optional<size_t> stripe_rows;
     size_t dense_threads = 0;
     bool validation = false;
     bool profiling = false;
@@ -538,7 +545,6 @@ using MatmulOptions = MatmulOptionOverrides;
 enum class MatmulOptionsError : uint8_t {
     none,
     invalid_mode,
-    invalid_stripe_rows,
     invalid_job_capacity,
     invalid_rmd_backend,
     runtime_override_disabled,
@@ -580,17 +586,6 @@ inline MatmulOptionsResolution resolve_matmul_options(const MatmulOptionOverride
                 return result;
             }
         }
-        if (!explicit_options.stripe_rows) if (const char * value = std::getenv("GEMMINI_STRIPE_ROWS")) {
-            if (std::string_view(value) == "AUTO") {
-                result.options.stripe_rows_auto = true;
-            } else if (size_t rows; parse_positive_size(value, rows)) {
-                result.options.stripe_rows = rows;
-                result.options.stripe_rows_auto = false;
-            } else {
-                result.error = MatmulOptionsError::invalid_stripe_rows;
-                return result;
-            }
-        }
         if (!explicit_options.job_capacity) if (const char * value = std::getenv("GEMMINI_STRIPE_JOB_CAPACITY")) {
             if (!parse_positive_size(value, result.options.job_capacity)) {
                 result.error = MatmulOptionsError::invalid_job_capacity;
@@ -612,10 +607,6 @@ inline MatmulOptionsResolution resolve_matmul_options(const MatmulOptionOverride
     }
 
     if (explicit_options.mode) result.options.mode = *explicit_options.mode;
-    if (explicit_options.stripe_rows) {
-        result.options.stripe_rows = *explicit_options.stripe_rows;
-        result.options.stripe_rows_auto = false;
-    }
     if (explicit_options.job_capacity) result.options.job_capacity = *explicit_options.job_capacity;
     if (explicit_options.rmd_backend) {
         result.options.rmd_backend = *explicit_options.rmd_backend;
@@ -625,11 +616,8 @@ inline MatmulOptionsResolution resolve_matmul_options(const MatmulOptionOverride
     result.options.validation = explicit_options.validation;
     result.options.profiling = explicit_options.profiling;
 
-    if ((explicit_options.stripe_rows && *explicit_options.stripe_rows == 0) ||
-        (explicit_options.job_capacity && *explicit_options.job_capacity == 0)) {
-        result.error = explicit_options.stripe_rows && *explicit_options.stripe_rows == 0
-            ? MatmulOptionsError::invalid_stripe_rows
-            : MatmulOptionsError::invalid_job_capacity;
+    if (explicit_options.job_capacity && *explicit_options.job_capacity == 0) {
+        result.error = MatmulOptionsError::invalid_job_capacity;
         return result;
     }
     if (result.options.rmd_backend != RmdBackend::cpu_direct && result.options.rmd_backend != RmdBackend::gemmini_ws_compact) {
@@ -806,7 +794,7 @@ private:
     residual::DirectStripePayloadHandle direct_residual_;
     rmd::StripePacketHandle rmd_packet_;
     rmd::CompressedOutput rmd_output_;
-    std::vector<rmd::OutputValue> rmd_correction_;
+    rmd::Correction rmd_correction_ = rmd::BlockScaledInt64Correction{};
     MatmulDenseState dense_state_ = MatmulDenseState::idle;
     MatmulResidualState residual_state_ = MatmulResidualState::idle;
     bool captured_ = true;
@@ -848,7 +836,6 @@ inline MatmulStatus resolution_status(MatmulOptionsError error) {
         case MatmulOptionsError::none:
             return {};
         case MatmulOptionsError::invalid_mode:
-        case MatmulOptionsError::invalid_stripe_rows:
         case MatmulOptionsError::invalid_job_capacity:
         case MatmulOptionsError::invalid_rmd_backend:
         case MatmulOptionsError::runtime_override_disabled:

@@ -45,8 +45,8 @@ struct WsCallObservation {
     size_t cols = 0;
     size_t k = 0;
     uint8_t lane_id = 0;
-    int8_t first_activation = 0;
-    int8_t first_weight = 0;
+    elem_t first_activation = 0;
+    elem_t first_weight = 0;
     int64_t raw_value = 0;
     size_t raw_nonzero_count = 0;
     uint64_t block_scale = 0;
@@ -87,8 +87,9 @@ struct RmdExecutionMetrics {
 void collect_packet_metrics(const StripePacket & packet, RmdExecutionMetrics & metrics);
 
 // Executes every block of the compact packet, applies the block integer scale exactly
-// once, and writes canonical block-scaled INT64 output. Q8_H1 routes use Rocket C++
-// lane dots; other supported routes use Gemmini WS and are unavailable on host builds.
+// once, and writes canonical block-scaled INT64 output. H1/HP1 routes use checked
+// Rocket C++ lane dots for every supported width; other compact routes use Gemmini WS
+// and are unavailable on host builds.
 RmdStatus execute_rmd_stripe_ws(const ggml_gemmini_args_t & args,
                                 const StripePacket & packet,
                                 CompressedOutput & output,
@@ -105,15 +106,34 @@ RmdStatus execute_rmd_stripe_reference(const ggml_gemmini_args_t & args,
                                        CompressedOutput & output,
                                        RmdExecutionMetrics * metrics = nullptr);
 
+// Instantiates the native Gemmini path in host test builds. Widened codes are
+// preflighted against elem_t and fail before tiled_matmul or metric commit.
+RmdStatus execute_rmd_stripe_gemmini_for_test(
+    const ggml_gemmini_args_t & args,
+    const StripePacket & packet,
+    CompressedOutput & output,
+    RmdExecutionMetrics * metrics = nullptr);
+
 RmdStatus gather_weight_tile_for_test(const ggml_gemmini_args_t & args,
                                       uint32_t block_id,
                                       const uint16_t * local_k,
                                       size_t valid_k,
                                       size_t col_base,
                                       size_t valid_cols,
-                                      int8_t * tile,
+                                      elem_t * tile,
                                       size_t tile_stride,
                                       RmdExecutionMetrics * metrics = nullptr);
+
+RmdStatus gather_wide_weight_tile_for_test(
+    const ggml_gemmini_args_t & args,
+    uint32_t block_id,
+    const uint16_t * local_k,
+    size_t valid_k,
+    size_t col_base,
+    size_t valid_cols,
+    int32_t * tile,
+    size_t tile_stride,
+    RmdExecutionMetrics * metrics = nullptr);
 
 RmdStatus repeat_weight_tile_gather_for_test(const ggml_gemmini_args_t & args,
                                              uint32_t block_count,

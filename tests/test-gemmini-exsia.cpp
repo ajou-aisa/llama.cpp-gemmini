@@ -2,6 +2,9 @@
 #include "../ggml/src/ggml-gemmini/quants/act/dispatch.hpp"
 #include "../ggml/src/ggml-gemmini/quants/act/quantize.hpp"
 #include "../ggml/src/ggml-gemmini/quants/act/exsia/types.hpp"
+#include "../ggml/src/ggml-gemmini/quants/act/exsia/exsia.hpp"
+#include "../ggml/src/ggml-gemmini/quants/act/stripe/stripe.hpp"
+#include "../ggml/src/ggml-gemmini/quants/act/stripe/types.hpp"
 #include "../ggml/src/ggml-gemmini/quants/act/token/types.hpp"
 
 #include <ggml.h>
@@ -41,6 +44,150 @@ bool check(bool value, const char * message) {
 }
 
 #ifndef GEMMINI_EXSIA_WRITER_TEST_ONLY
+const std::vector<rmd::OutputValue> * integer_values(const rmd::Correction & correction) {
+    const auto * typed = std::get_if<rmd::BlockScaledInt64Correction>(&correction);
+    return typed == nullptr ? nullptr : &typed->values;
+}
+
+bool integer_values_equal(const rmd::Correction & correction,
+                          const std::vector<rmd::OutputValue> & expected) {
+    const auto * values = integer_values(correction);
+    return values != nullptr && *values == expected;
+}
+
+struct GeometryPublicationTrace {
+    std::array<std::pair<size_t, size_t>, 2> rows{};
+    size_t publications = 0;
+};
+
+bool capture_geometry_publication(
+    void * opaque,
+    const quants::act::exsia::StripeReadyEvent & event) {
+    auto & trace = *static_cast<GeometryPublicationTrace *>(opaque);
+    if (trace.publications >= trace.rows.size()) return false;
+    trace.rows[trace.publications++] = {event.row_begin, event.row_end};
+    return true;
+}
+
+bool test_activation_stripe_geometry_contract() {
+    constexpr size_t rows = 33;
+    constexpr size_t cols = 32;
+    std::vector<float> source(rows * cols, 0.5f);
+    ggml_tensor tensor{};
+    tensor.type = GGML_TYPE_F32;
+    tensor.data = source.data();
+
+    ggml_gemmini_args_t exsia_args{};
+    exsia_args.I = rows; exsia_args.J = 8; exsia_args.K = cols;
+    exsia_args.sA = cols;
+    exsia_args.tile_I = 2; exsia_args.tile_J = 3; exsia_args.tile_K = 4;
+    exsia_args.activation_rows_per_stripe = 32;
+    exsia_args.residual_route = residual::ResidualRoute::cpu_direct;
+    if (!exsia_args.A.allocate(rows, cols, 8)) return false;
+    quants::act::exsia::Meta exsia_meta;
+    GeometryPublicationTrace trace;
+    quants::act::exsia::StripeReadySink sink{&trace, capture_geometry_publication};
+    quants::act::exsia::ExSIA exsia;
+    exsia.set_execution_mode(quants::act::exsia::ExSIAState::ExecutionMode::Sequential);
+    const bool exsia_ok = exsia.run(exsia_meta, &tensor, exsia_args, &sink);
+
+    ggml_gemmini_args_t stripe_args{};
+    stripe_args.I = rows; stripe_args.J = 8; stripe_args.K = cols;
+    stripe_args.sA = cols;
+    stripe_args.tile_I = 2; stripe_args.tile_J = 3; stripe_args.tile_K = 4;
+    stripe_args.activation_rows_per_stripe = 32;
+    stripe_args.residual_route = residual::ResidualRoute::cpu_direct;
+    stripe_args.act_quant.storage().emplace<quants::act::stripe::Meta>();
+    if (!stripe_args.A.allocate(rows, cols, 8)) return false;
+    const bool stripe_ok = quants::act::stripe::quantize(&tensor, stripe_args);
+    const auto * stripe_meta = std::get_if<quants::act::stripe::Meta>(&stripe_args.act_quant.storage());
+
+    ggml_gemmini_args_t bad_exsia_args = exsia_args;
+    bad_exsia_args.activation_rows_per_stripe = 16;
+    for (size_t row = 0; row < rows; ++row)
+        for (size_t col = 0; col < cols; ++col)
+            bad_exsia_args.A.set(row, col, 17);
+    const std::vector<uint8_t> direct_sentinel_before = *bad_exsia_args.A.bytes;
+    quants::act::exsia::Meta bad_exsia_meta;
+    GeometryPublicationTrace bad_trace;
+    quants::act::exsia::StripeReadySink bad_sink{&bad_trace, capture_geometry_publication};
+    quants::act::exsia::ExSIA bad_exsia;
+    const bool bad_exsia_ok = bad_exsia.run(bad_exsia_meta, &tensor, bad_exsia_args, &bad_sink);
+    const bool direct_sentinel_unchanged =
+        *bad_exsia_args.A.bytes == direct_sentinel_before;
+
+    ggml_gemmini_args_t public_bad_args{};
+    public_bad_args.I = rows; public_bad_args.J = 8; public_bad_args.K = cols;
+    public_bad_args.sA = cols;
+    public_bad_args.tile_I = 2; public_bad_args.tile_J = 3; public_bad_args.tile_K = 4;
+    public_bad_args.activation_rows_per_stripe = 16;
+    public_bad_args.residual_route = residual::ResidualRoute::cpu_direct;
+    if (!public_bad_args.A.allocate(rows, cols, 8)) return false;
+    for (size_t row = 0; row < rows; ++row)
+        for (size_t col = 0; col < cols; ++col)
+            public_bad_args.A.set(row, col, 23);
+    const std::vector<uint8_t> public_sentinel_before = *public_bad_args.A.bytes;
+    const bool public_bad_ok = quants::quantize_activation(&tensor, public_bad_args);
+    const bool public_sentinel_unchanged =
+        *public_bad_args.A.bytes == public_sentinel_before;
+
+    ggml_gemmini_args_t bad_stripe_args = stripe_args;
+    bad_stripe_args.activation_rows_per_stripe = 16;
+    bad_stripe_args.act_quant.storage().emplace<quants::act::stripe::Meta>();
+    const bool bad_stripe_ok = quants::act::stripe::quantize(&tensor, bad_stripe_args);
+    const auto * bad_stripe_meta = std::get_if<quants::act::stripe::Meta>(&bad_stripe_args.act_quant.storage());
+
+    std::vector<float> exsia_decoded(rows * cols);
+    ggml_gemmini_args_t exsia_consumer_args = exsia_args;
+    exsia_consumer_args.act_quant.storage().emplace<quants::act::exsia::Meta>(exsia_meta);
+    const bool exsia_dequantized = quants::act::exsia::dequantize_activation(
+        exsia_decoded.data(), cols, 1, rows, cols, exsia_consumer_args);
+    ggml_gemmini_args_t bad_exsia_consumer_args = exsia_consumer_args;
+    bad_exsia_consumer_args.activation_rows_per_stripe = 16;
+    const bool bad_exsia_dequantized = quants::act::exsia::dequantize_activation(
+        exsia_decoded.data(), cols, 1, rows, cols, bad_exsia_consumer_args);
+
+    std::vector<float> stripe_decoded(rows * cols);
+    const bool stripe_dequantized = quants::act::stripe::dequantize_activation(
+        stripe_decoded.data(), cols, 1, rows, cols, stripe_args);
+    ggml_gemmini_args_t bad_stripe_consumer_args = stripe_args;
+    bad_stripe_consumer_args.activation_rows_per_stripe = 16;
+    const bool bad_stripe_dequantized = quants::act::stripe::dequantize_activation(
+        stripe_decoded.data(), cols, 1, rows, cols, bad_stripe_consumer_args);
+
+    const bool direct_atomic_ok =
+        check(!bad_exsia_ok && bad_exsia.state().failure_code ==
+                  quants::act::exsia::ExSIAState::FailureCode::InvalidInput &&
+                  bad_trace.publications == 0 && bad_exsia_meta.theta.empty() &&
+                  bad_exsia.state().stripe.empty() && bad_exsia.state().residual.empty() &&
+                  direct_sentinel_unchanged,
+              "direct ExSIA mismatch is typed, atomic, and has zero side effects");
+    const bool public_atomic_ok =
+        check(!public_bad_ok && public_sentinel_unchanged &&
+                  std::holds_alternative<quants::act::NoneMeta>(public_bad_args.act_quant.storage()),
+              "public ExSIA mismatch preserves the activation sentinel");
+
+    const bool ok =
+        check(exsia_ok && stripe_ok, "ExSIA and STRIPE accept matching geometry") &&
+        check(exsia_args.tile_I == 2 && exsia_args.tile_J == 3 && exsia_args.tile_K == 4 &&
+                  stripe_args.tile_I == 2 && stripe_args.tile_J == 3 && stripe_args.tile_K == 4,
+              "quantization preserves all auto-selected tile factors") &&
+        check(trace.publications == 2 && trace.rows[0] == std::make_pair<size_t, size_t>(0, 32) &&
+                  trace.rows[1] == std::make_pair<size_t, size_t>(32, 33),
+              "ExSIA publishes contiguous 0-32 and final 32-33 rows") &&
+        check(exsia_meta.theta.size() == 2 && stripe_meta != nullptr && stripe_meta->scales.size() == 2,
+              "ExSIA and STRIPE produce two stripes from identical geometry") &&
+        check(exsia_dequantized && stripe_dequantized &&
+                  !bad_exsia_dequantized && !bad_stripe_dequantized,
+              "ExSIA and STRIPE consumers accept only matching geometry") &&
+        direct_atomic_ok && public_atomic_ok &&
+        check(!bad_stripe_ok && bad_stripe_meta != nullptr && bad_stripe_meta->scales.empty() &&
+                  bad_stripe_meta->rmd_packets.empty() && bad_stripe_meta->direct_residuals.empty(),
+              "STRIPE metadata mismatch has zero metadata side effects");
+    if (ok) std::printf("STRIPE_GEOMETRY_QA tile=2/3/4 exsia_rows=0-32,32-33 stripe_rows=0-32,32-33 mismatch=InvalidInput direct_before=17 direct_after=17 public_before=23 public_after=23 publications=0 allocations=0\n");
+    return ok;
+}
+
 bool test_exsia_baseline() {
     elem_t activation = 3;
     elem_t weight = 4;
@@ -113,13 +260,15 @@ bool test_rmd_cpu_ws_routes() {
     const rmd::RmdStatus cpu =
         rmd::execute_rmd_stripe_reference(args, *packet, cpu_output, &route_metrics);
     std::vector<rmd::ReferenceResidual> route_events = {{0, 0, 256}};
-    std::vector<rmd::OutputValue> route_direct, route_packet;
+    std::vector<rmd::OutputValue> route_direct;
+    rmd::Correction route_packet = rmd::BlockScaledInt64Correction{};
     const auto route_direct_status = rmd::reference_direct_correction(args, 1, route_events, route_direct);
     const auto route_packet_status = rmd::compose_rmd_output(*packet, cpu_output, route_packet);
+    const auto * route_packet_values = integer_values(route_packet);
     if (!check(cpu == rmd::RmdStatus::success && route_direct_status == rmd::RmdStatus::success &&
-               route_packet_status == rmd::RmdStatus::success &&
+               route_packet_status == rmd::RmdStatus::success && route_packet_values != nullptr &&
                route_direct == std::vector<rmd::OutputValue>{1024} &&
-               route_direct == route_packet && !cpu_output.values.empty() && cpu_output.values.front() == 4,
+               route_direct == *route_packet_values && !cpu_output.values.empty() && cpu_output.values.front() == 4,
                "RMD reference API ignores the runtime matmul route")) {
         return false;
     }
@@ -141,16 +290,18 @@ bool test_rmd_cpu_ws_routes() {
     const rmd::RmdStatus ws = rmd::execute_rmd_stripe_ws(args, *packet, output,
                                                          &ws_metrics);
 #if defined(__riscv)
-    std::vector<rmd::OutputValue> route_ws;
+    rmd::Correction route_ws = rmd::BlockScaledInt64Correction{};
     const auto route_ws_status = rmd::compose_rmd_output(*packet, output, route_ws);
+    const auto * route_ws_values = integer_values(route_ws);
     std::printf("RMD_ORACLE single dense_direct=%lld packet_scalar=%lld ws=%lld\n",
-                static_cast<long long>(route_direct.front()), static_cast<long long>(route_packet.front()),
-                static_cast<long long>(route_ws.front()));
+                static_cast<long long>(route_direct.front()), static_cast<long long>(route_packet_values->front()),
+                static_cast<long long>(route_ws_values == nullptr ? 0 : route_ws_values->front()));
     const bool ws_result = ws == rmd::RmdStatus::success && route_ws_status == rmd::RmdStatus::success &&
-        route_ws == route_packet && route_ws == route_direct;
+        route_ws_values != nullptr && *route_ws_values == *route_packet_values &&
+        *route_ws_values == route_direct;
 #else
     std::printf("RMD_ORACLE single dense_direct=%lld packet_scalar=%lld ws=unsupported\n",
-                static_cast<long long>(route_direct.front()), static_cast<long long>(route_packet.front()));
+                static_cast<long long>(route_direct.front()), static_cast<long long>(route_packet_values->front()));
     const bool ws_result = ws == rmd::RmdStatus::unsupported_route &&
         output.j_padded == unchanged.j_padded && output.values == unchanged.values;
 #endif
@@ -187,38 +338,41 @@ bool test_rmd_cpu_ws_routes() {
     rmd::RmdExecutionMetrics cancel_metrics{};
     const auto cancel_status = rmd::execute_rmd_stripe_reference(cancel_args, *cancel_packet,
                                                   cancel_output, &cancel_metrics);
-    std::vector<rmd::OutputValue> cancel_composed;
+    rmd::Correction cancel_composed = rmd::BlockScaledInt64Correction{};
     const auto cancel_compose_status = rmd::compose_rmd_output(*cancel_packet, cancel_output, cancel_composed);
-    std::printf("RMD_STAGE cancellation_packet_scalar status=%d compose=%d correction=%lld nonzero_count=%zu\n", static_cast<int>(cancel_status), static_cast<int>(cancel_compose_status), static_cast<long long>(cancel_composed.empty() ? 0 : cancel_composed.front()), cancel_composed.empty() ? 0 : (cancel_composed.front() != 0));
+    const auto * cancel_composed_values = integer_values(cancel_composed);
+    std::printf("RMD_STAGE cancellation_packet_scalar status=%d compose=%d correction=%lld nonzero_count=%zu\n", static_cast<int>(cancel_status), static_cast<int>(cancel_compose_status), static_cast<long long>(cancel_composed_values == nullptr || cancel_composed_values->empty() ? 0 : cancel_composed_values->front()), cancel_composed_values == nullptr || cancel_composed_values->empty() ? size_t{0} : size_t{cancel_composed_values->front() != 0});
     std::vector<rmd::ReferenceResidual> cancel_events = {{0, 0, 1}, {0, 1, 1}, {0, 2, 1}, {0, 3, -256}};
     std::vector<rmd::OutputValue> cancel_direct;
     const auto cancel_direct_status = rmd::reference_direct_correction(cancel_args, 1, cancel_events, cancel_direct);
     if (!check(cancel_status == rmd::RmdStatus::success && cancel_compose_status == rmd::RmdStatus::success &&
                cancel_direct_status == rmd::RmdStatus::success &&
                cancel_direct == std::vector<rmd::OutputValue>{0} &&
-               cancel_direct == cancel_composed, "RMD cancellation reference correction")) return false;
+               cancel_composed_values != nullptr && cancel_direct == *cancel_composed_values,
+               "RMD cancellation reference correction")) return false;
 #if defined(__riscv)
     rmd::CompressedOutput ws_cancel_output;
     rmd::RmdExecutionMetrics ws_cancel_metrics{};
     const auto ws_cancel_status = rmd::execute_rmd_stripe_ws(cancel_args, *cancel_packet,
                                                                ws_cancel_output, &ws_cancel_metrics);
-    std::vector<rmd::OutputValue> ws_cancel_composed;
+    rmd::Correction ws_cancel_composed = rmd::BlockScaledInt64Correction{};
     const auto ws_cancel_compose_status = rmd::compose_rmd_output(*cancel_packet, ws_cancel_output,
                                                                     ws_cancel_composed);
+    const auto * ws_cancel_values = integer_values(ws_cancel_composed);
     std::printf("RMD_STAGE ws raw_lanes=256,-1 correction=%lld nonzero_count=%zu\n",
-                static_cast<long long>(ws_cancel_composed.empty() ? 0 : ws_cancel_composed.front()),
-                ws_cancel_composed.empty() ? 0 : (ws_cancel_composed.front() != 0));
+                static_cast<long long>(ws_cancel_values == nullptr || ws_cancel_values->empty() ? 0 : ws_cancel_values->front()),
+                ws_cancel_values == nullptr || ws_cancel_values->empty() ? size_t{0} : size_t{ws_cancel_values->front() != 0});
     std::printf("RMD_ORACLE cancellation dense_direct=%lld packet_scalar=%lld ws=%lld\n",
-                static_cast<long long>(cancel_direct.front()), static_cast<long long>(cancel_composed.front()),
-                static_cast<long long>(ws_cancel_composed.front()));
+                static_cast<long long>(cancel_direct.front()), static_cast<long long>(cancel_composed_values->front()),
+                static_cast<long long>(ws_cancel_values == nullptr ? 0 : ws_cancel_values->front()));
     if (!check(ws_cancel_status == rmd::RmdStatus::success &&
-               ws_cancel_compose_status == rmd::RmdStatus::success &&
-               ws_cancel_composed == cancel_composed && ws_cancel_composed == cancel_direct &&
-               !ws_cancel_composed.empty() && ws_cancel_composed.front() == 0,
+               ws_cancel_compose_status == rmd::RmdStatus::success && ws_cancel_values != nullptr &&
+               *ws_cancel_values == *cancel_composed_values && *ws_cancel_values == cancel_direct &&
+               !ws_cancel_values->empty() && ws_cancel_values->front() == 0,
                "RMD cancellation WS correction")) return false;
 #else
     std::printf("RMD_ORACLE cancellation dense_direct=%lld packet_scalar=%lld ws=unsupported\n",
-                static_cast<long long>(cancel_direct.front()), static_cast<long long>(cancel_composed.front()));
+                static_cast<long long>(cancel_direct.front()), static_cast<long long>(cancel_composed_values->front()));
 #endif
 #endif
     return check(packet->blocks.size() == packet_before.blocks.size() &&
@@ -283,6 +437,7 @@ bool test_q8_srmd_software_ws_routing() {
         args.q8_h1_block_count = native_weights.size();
         args.q8_h1_rows = columns;
         args.blocks_per_row = blocks_per_row;
+        args.native_weight_bytes = native_weights.size() * sizeof(block_q8_h1);
         args.block_size_k = QK8_0;
         args.tiled_matmul_type = WS;
         args.full_C = true;
@@ -291,15 +446,19 @@ bool test_q8_srmd_software_ws_routing() {
 
     ggml_gemmini_args_t cpu_args = make_native_args();
     cpu_args.residual_route = residual::ResidualRoute::cpu_direct;
-    std::vector<rmd::OutputValue> direct_correction;
+    rmd::Correction direct_output = rmd::BlockScaledInt64Correction{};
     DirectExecutionMetrics direct_metrics{};
-    if (!check(residual::execute_direct_stripe(cpu_args, *direct_payload, direct_correction,
+    if (!check(residual::execute_direct_stripe(cpu_args, *direct_payload, direct_output,
                                                 &direct_metrics) == rmd::RmdStatus::success,
                "CPU Q8_H1 residual uses direct executor") ||
         !check(direct_metrics.event_count == events.size() && direct_metrics.call_count == 1,
                "CPU executes original INT32 residual events directly")) {
         return false;
     }
+    const auto * direct_correction_ptr = integer_values(direct_output);
+    if (!check(direct_correction_ptr != nullptr,
+               "CPU Q8_H1 residual retains its integer correction domain")) return false;
+    const auto & direct_correction = *direct_correction_ptr;
 
     auto verify_software_ws = [&](const char * route, ggml_gemmini_args_t args) {
         rmd::CompressedOutput compressed;
@@ -340,11 +499,11 @@ bool test_q8_srmd_software_ws_routing() {
             }
         }
 
-        std::vector<rmd::OutputValue> composed;
+        rmd::Correction composed = rmd::BlockScaledInt64Correction{};
         return check(rmd::compose_rmd_output(*packet, compressed, composed) ==
                          rmd::RmdStatus::success,
                      "Q8 software WS compressed output composes") &&
-            check(composed == direct_correction,
+            check(integer_values_equal(composed, direct_correction),
                   "signed radix lanes and 128 carry boundaries match direct INT32 residuals");
     };
 
@@ -458,16 +617,21 @@ bool test_q8_hp1_srmd_software_ws_routing() {
     args.q8_hp1_block_count = weights.size();
     args.q8_hp1_blocks_per_row = blocks_per_row;
     args.blocks_per_row = blocks_per_row;
+    args.native_weight_bytes = weights.size() * sizeof(block_q8_hp1);
     args.block_size_k = QK8_HP;
     args.tiled_matmul_type = WS;
     args.full_C = true;
 
-    std::vector<rmd::OutputValue> direct_correction;
-    if (!check(residual::execute_direct_stripe(args, *direct_payload, direct_correction) ==
+    rmd::Correction direct_output = rmd::BlockScaledInt64Correction{};
+    if (!check(residual::execute_direct_stripe(args, *direct_payload, direct_output) ==
                    rmd::RmdStatus::success,
                "CPU Q8_HP1 residual uses original INT32 direct executor")) {
         return false;
     }
+    const auto * direct_correction_ptr = integer_values(direct_output);
+    if (!check(direct_correction_ptr != nullptr,
+               "CPU Q8_HP1 residual retains its integer correction domain")) return false;
+    const auto & direct_correction = *direct_correction_ptr;
 
     rmd::CompressedOutput compressed;
     rmd::RmdExecutionMetrics metrics{};
@@ -508,11 +672,11 @@ bool test_q8_hp1_srmd_software_ws_routing() {
         }
     }
 
-    std::vector<rmd::OutputValue> composed;
+    rmd::Correction composed = rmd::BlockScaledInt64Correction{};
     if (!check(rmd::compose_rmd_output(*packet, compressed, composed) ==
                    rmd::RmdStatus::success,
                "Q8_HP1 software WS compressed output composes") ||
-        !check(composed == direct_correction,
+        !check(integer_values_equal(composed, direct_correction),
                "Q8_HP1 signed radix and integer exponent match direct correction")) {
         return false;
     }
@@ -528,7 +692,7 @@ bool test_q8_hp1_srmd_software_ws_routing() {
     if (!check(rmd::reference_rmd_correction(
                    args, rows, reference_residuals, reference) == rmd::RmdStatus::success,
                "Q8_HP1 independent reference accepts native blocks") ||
-        !check(reference == composed,
+        !check(integer_values_equal(composed, reference),
                "Q8_HP1 software WS matches independent reference correction")) {
         return false;
     }
@@ -770,6 +934,7 @@ bool test_rmd_cpu_direct_parity() {
     args.q8_h1_block_count = weights.size();
     args.q8_h1_rows = columns;
     args.blocks_per_row = native_blocks_per_row;
+    args.native_weight_bytes = weights.size() * sizeof(block_q8_h1);
     args.block_size_k = native_block_size;
     args.tiled_matmul_type = CPU;
     auto & meta = args.act_quant.storage().emplace<quants::act::exsia::Meta>();
@@ -828,11 +993,16 @@ bool test_rmd_cpu_direct_parity() {
                 metrics.matmul_call_count, metrics.lane_group_count,
                 metrics.stacked_i_tile_count, metrics.baseline_stacked_i_tile_count,
                 metrics.stacked_i_tile_count - metrics.matmul_call_count);
-    std::vector<rmd::OutputValue> actual;
-    if (!check(rmd::compose_rmd_output(*packet, compressed, actual) == rmd::RmdStatus::success,
+    rmd::Correction actual_correction = rmd::BlockScaledInt64Correction{};
+    if (!check(rmd::compose_rmd_output(*packet, compressed, actual_correction) == rmd::RmdStatus::success,
                "RMD direct-parity composition")) {
         return false;
     }
+    const auto * actual_values = integer_values(actual_correction);
+    if (!check(actual_values != nullptr, "RMD direct-parity composition retains integer domain")) {
+        return false;
+    }
+    const auto & actual = *actual_values;
 
     std::vector<int64_t> expected(rows * columns, 0);
     std::vector<int64_t> baseline(rows * columns, 0);
@@ -881,13 +1051,17 @@ bool test_rmd_cpu_direct_parity() {
     args.f_out = merged.data();
     args.stride_f_out = columns;
     args.col_stride_f_out = 1;
-    if (!check(rmd::merge_rmd_correction(args, *packet, actual) == rmd::RmdStatus::success,
+    if (!check(rmd::merge_rmd_correction(args, *packet, actual_correction) == rmd::RmdStatus::success,
                "RMD direct-parity merge")) {
         return false;
     }
     for (size_t index = 0; index < expected.size(); ++index) {
-        if (!check(merged[index] == static_cast<float>(expected[index]),
-                   "merged RMD correction equals direct matmul")) {
+        const int64_t saturated = std::clamp(
+            expected[index],
+            static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
+            static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
+        if (!check(merged[index] == static_cast<float>(saturated),
+                   "merged RMD correction saturates after complete composition")) {
             return false;
         }
     }
@@ -896,9 +1070,10 @@ bool test_rmd_cpu_direct_parity() {
     rmd::CompressedOutput ws_compressed;
     const rmd::RmdStatus ws_execution_status =
         rmd::execute_rmd_stripe_ws(args, *packet, ws_compressed);
-    std::vector<rmd::OutputValue> ws_actual;
+    rmd::Correction ws_actual = rmd::BlockScaledInt64Correction{};
     const rmd::RmdStatus ws_compose_status =
         rmd::compose_rmd_output(*packet, ws_compressed, ws_actual);
+    const auto * ws_actual_values = integer_values(ws_actual);
     std::vector<float> ws_merged(rows * columns);
     for (size_t index = 0; index < ws_merged.size(); ++index) {
         ws_merged[index] = static_cast<float>(baseline[index]);
@@ -911,12 +1086,17 @@ bool test_rmd_cpu_direct_parity() {
     float first_actual = 0.0f, first_expected = 0.0f;
     if (ws_execution_status == rmd::RmdStatus::success &&
         ws_compose_status == rmd::RmdStatus::success &&
-        ws_merge_status == rmd::RmdStatus::success &&
-        ws_actual.size() == expected.size()) {
+        ws_merge_status == rmd::RmdStatus::success && ws_actual_values != nullptr &&
+        ws_actual_values->size() == expected.size()) {
         for (size_t row = 0; row < rows; ++row) {
             for (size_t j = 0; j < columns; ++j) {
                 const size_t index = row * columns + j;
-                const float wanted = static_cast<float>(direct_full[index]);
+                const int64_t saturated = std::clamp(
+                    expected[index],
+                    static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
+                    static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
+                const float wanted = static_cast<float>(baseline[index]) +
+                    static_cast<float>(saturated);
                 if (ws_merged[index] != wanted) {
                     ++mismatch_count;
                     if (first_row == rows) {
@@ -943,7 +1123,7 @@ bool test_rmd_cpu_direct_parity() {
     auto & invalid_meta = args.act_quant.storage().emplace<quants::act::token::Meta>();
     invalid_meta.scales.assign(rows, 1.0f);
     invalid_meta.scales[1] = std::numeric_limits<float>::quiet_NaN();
-    if (!check(rmd::merge_rmd_correction(args, *packet, actual) ==
+    if (!check(rmd::merge_rmd_correction(args, *packet, actual_correction) ==
                    rmd::RmdStatus::invalid_arguments && merged == unchanged,
                "RMD merge failure preserves caller output")) {
         return false;
@@ -1006,15 +1186,16 @@ bool test_direct_cpu_executor() {
     native_args.q8_h1_block_count = native_weights.size();
     native_args.q8_h1_rows = columns;
     native_args.blocks_per_row = blocks_per_row;
+    native_args.native_weight_bytes = native_weights.size() * sizeof(block_q8_h1);
     native_args.block_size_k = QK8_0;
     std::vector<rmd::OutputValue> native_expected;
-    std::vector<rmd::OutputValue> native_actual = {91, 92, 93};
+    rmd::Correction native_actual = rmd::BlockScaledInt64Correction{{91, 92, 93}};
     if (!check(reference(native_args, *native_payload, native_expected) == rmd::RmdStatus::success,
                "direct native reference succeeds") ||
         !check(residual::execute_direct_stripe(native_args, *native_payload, native_actual) ==
                    rmd::RmdStatus::success,
                "direct native execution succeeds") ||
-        !check(native_actual == native_expected,
+        !check(integer_values_equal(native_actual, native_expected),
                "direct sparse/decode/reused-K/multi-block/tail/cancellation parity")) return false;
 
     constexpr size_t dense_rows = 2, dense_columns = 5, dense_k = 37;
@@ -1029,25 +1210,25 @@ bool test_direct_cpu_executor() {
     dense_args.B = dense_weights.data(); dense_args.sB = dense_columns;
     dense_args.weight_i8_scale_active = true; dense_args.weight_scale = 0.25f;
     std::vector<rmd::OutputValue> dense_expected;
-    std::vector<rmd::OutputValue> dense_actual = {-7};
+    rmd::Correction dense_actual = rmd::BlockScaledInt64Correction{{-7}};
     if (!check(dense_payload != nullptr, "direct dense payload built") ||
         !check(reference(dense_args, *dense_payload, dense_expected) == rmd::RmdStatus::success,
                "direct dense reference succeeds") ||
         !check(residual::execute_direct_stripe(dense_args, *dense_payload, dense_actual) ==
-                   rmd::RmdStatus::success && dense_actual == dense_expected,
+                   rmd::RmdStatus::success && integer_values_equal(dense_actual, dense_expected),
                "direct dense route parity")) return false;
 
     const std::vector<rmd::OutputValue> sentinel = {11, 22, 33};
-    std::vector<rmd::OutputValue> failed = sentinel;
+    rmd::Correction failed = rmd::BlockScaledInt64Correction{sentinel};
     DirectStripePayload malformed = *dense_payload;
     std::swap(malformed.events[0], malformed.events[1]);
     if (!check(residual::execute_direct_stripe(dense_args, malformed, failed) ==
-                   rmd::RmdStatus::invalid_packet && failed == sentinel,
+                   rmd::RmdStatus::invalid_packet && integer_values_equal(failed, sentinel),
                "direct invalid payload fails atomically")) return false;
     ggml_gemmini_args_t unsupported_args = dense_args;
     unsupported_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h0;
     if (!check(residual::execute_direct_stripe(unsupported_args, *dense_payload, failed) ==
-                   rmd::RmdStatus::unsupported_route && failed == sentinel,
+                   rmd::RmdStatus::unsupported_route && integer_values_equal(failed, sentinel),
                "direct unsupported route fails atomically")) return false;
 
     DirectStripePayload overflow_shape = *dense_payload;
@@ -1056,14 +1237,14 @@ bool test_direct_cpu_executor() {
     overflow_shape.logical_j = 3;
     ggml_gemmini_args_t overflow_shape_args = dense_args; overflow_shape_args.J = 3;
     if (!check(residual::execute_direct_stripe(overflow_shape_args, overflow_shape, failed) ==
-                   rmd::RmdStatus::overflow && failed == sentinel,
+                   rmd::RmdStatus::overflow && integer_values_equal(failed, sentinel),
                "direct output shape overflow fails atomically")) return false;
     DirectStripePayload allocation_shape = *dense_payload;
     allocation_shape.row_count = std::numeric_limits<size_t>::max() / 8;
     allocation_shape.logical_j = 2;
     ggml_gemmini_args_t allocation_args = dense_args; allocation_args.J = 2;
     if (!check(residual::execute_direct_stripe(allocation_args, allocation_shape, failed) ==
-                   rmd::RmdStatus::allocation_failure && failed == sentinel,
+                   rmd::RmdStatus::allocation_failure && integer_values_equal(failed, sentinel),
                "direct impossible allocation fails atomically")) return false;
 
     constexpr size_t overflow_k = 17 * QK8_0;
@@ -1083,10 +1264,11 @@ bool test_direct_cpu_executor() {
     overflow_args.q8_h1_blocks = overflow_weights.data();
     overflow_args.q8_h1_block_count = overflow_weights.size();
     overflow_args.q8_h1_rows = 1; overflow_args.blocks_per_row = overflow_weights.size();
+    overflow_args.native_weight_bytes = overflow_weights.size() * sizeof(block_q8_h1);
     overflow_args.block_size_k = QK8_0;
     return check(overflow_payload != nullptr, "direct overflow payload built") &&
         check(residual::execute_direct_stripe(overflow_args, *overflow_payload, failed) ==
-                  rmd::RmdStatus::overflow && failed == sentinel,
+                  rmd::RmdStatus::overflow && integer_values_equal(failed, sentinel),
               "direct arithmetic overflow fails atomically");
 }
 
@@ -1115,6 +1297,7 @@ bool test_rmd_lane_partition() {
     args.q8_h1_block_count = 1;
     args.q8_h1_rows = 1;
     args.blocks_per_row = 1;
+    args.native_weight_bytes = sizeof(weights);
     args.block_size_k = logical_k;
     args.tiled_matmul_type = CPU;
 
@@ -1137,7 +1320,7 @@ bool test_rmd_lane_partition() {
                "RMD lane-partition execution")) {
         return false;
     }
-    std::vector<rmd::OutputValue> actual;
+    rmd::Correction actual = rmd::BlockScaledInt64Correction{};
     if (!check(rmd::compose_rmd_output(*packet, compressed, actual) ==
                    rmd::RmdStatus::success,
                "RMD lane-partition composition")) {
@@ -1149,7 +1332,7 @@ bool test_rmd_lane_partition() {
         expected += static_cast<int64_t>(residuals[k]) * weights.qs[k];
     }
     constexpr size_t expected_k_tiles = (logical_k + DIM - 1) / DIM;
-    return check(actual == std::vector<rmd::OutputValue>{expected},
+    return check(integer_values_equal(actual, std::vector<rmd::OutputValue>{expected}),
                   "RMD lane partition preserves exact output") &&
         check(metrics.matmul_call_count == expected_k_tiles,
                "RMD lane partition preserves DIM-aware B-load count") &&
@@ -1183,6 +1366,7 @@ bool test_rmd_weight_gather() {
     args.q8_h1_block_count = h1.size();
     args.q8_h1_rows = columns;
     args.blocks_per_row = blocks_per_row;
+    args.native_weight_bytes = h1.size() * sizeof(block_q8_h1);
     args.block_size_k = QK8_0;
 
     const std::array<uint16_t, 3> local_k = { 0, 15, 31 };
@@ -1448,6 +1632,7 @@ bool run_rmd_gather_benchmark(const std::filesystem::path & json_path,
     args.q8_h1_block_count = h1.size();
     args.q8_h1_rows = columns;
     args.blocks_per_row = block_count;
+    args.native_weight_bytes = h1.size() * sizeof(block_q8_h1);
     args.block_size_k = QK8_0;
 
     std::vector<GatherBenchResult> results;
@@ -1622,7 +1807,7 @@ int main(int argc, char ** argv) {
         case_name == "q8-srmd-software-ws" || case_name == "rmd-ws-contract-probe" ||
         case_name == "hp1-srmd-software-ws" ||
         case_name == "rmd-direct-parity" || case_name == "direct-executor" ||
-        case_name == "rmd-gather";
+        case_name == "rmd-gather" || case_name == "stripe-geometry";
     if (!known) {
         std::fprintf(stderr, "unknown case: %s\n", case_name.c_str());
         return 2;
@@ -1644,6 +1829,7 @@ int main(int argc, char ** argv) {
         (case_name == "rmd-direct-parity" && test_rmd_cpu_direct_parity() &&
          test_rmd_lane_partition()) ||
         (case_name == "direct-executor" && test_direct_cpu_executor()) ||
+        (case_name == "stripe-geometry" && test_activation_stripe_geometry_contract()) ||
         (case_name == "rmd-gather" && test_rmd_weight_gather());
     if (ok)
         std::printf("PASS: case=%s\n", case_name.c_str());

@@ -3,8 +3,6 @@
 #include "direct-types.hpp"
 #include "../rmd/rmd-types.hpp"
 
-#include <vector>
-
 struct ggml_gemmini_args_t;
 
 namespace ggml::gemmini::residual {
@@ -15,10 +13,12 @@ struct DirectExecutionMetrics {
 };
 
 // Computes one immutable direct payload into a staged row-major [row_count, J]
-// correction. The caller's correction is replaced only after complete success.
+// correction. H1/HP1 return integer-block-scaled values; H0 returns values with
+// floating block scales already applied in double. The caller's output is
+// replaced only after complete success.
 rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
                                      const DirectStripePayload & payload,
-                                     std::vector<rmd::OutputValue> & correction,
+                                     rmd::DirectOutput & correction,
                                      DirectExecutionMetrics * metrics = nullptr);
 
 }

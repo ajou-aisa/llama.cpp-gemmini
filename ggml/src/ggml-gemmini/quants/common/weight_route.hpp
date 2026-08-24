@@ -43,10 +43,30 @@ namespace ggml::gemmini::quants::wroute
         Dense,
         Q8ChannelDirect,
         Q8ChannelSidecar,
-        Q8H1,
-        Q8H2,
-        Q8HP1,
-        Q8HP2,
+        H0,
+        H1,
+        HP1,
+    };
+
+    enum class WeightScaleDomain
+    {
+        None,
+        FloatingBlock,
+        IntegerBlockTimesColumn,
+    };
+
+    enum class WeightExecutionPath
+    {
+        CpuDirect,
+        Compact,
+    };
+
+    enum class WeightRouteStatus
+    {
+        Success,
+        UnsupportedFormat,
+        InvalidMetadata,
+        UnsupportedExecution,
     };
 
     struct WeightRoutePlan
@@ -54,15 +74,26 @@ namespace ggml::gemmini::quants::wroute
         WeightRouteKind route = WeightRouteKind::Unsupported;
         WeightLayout layout = WeightLayout::KxJ_RowMajor;
         WeightScaleInfo scales{};
+        WeightScaleDomain scale_domain = WeightScaleDomain::None;
+        WeightRouteStatus status = WeightRouteStatus::UnsupportedFormat;
         size_t weight_stride = 0;
         const char *reject_reason = "unsupported weight format";
+        uint8_t weight_bits = 0;
         bool native_weight_blocks = false;
+        bool cpu_direct_capable = false;
+        bool compact_capable = false;
         bool valid = false;
     };
 
     WeightRoutePlan resolve_weight_route_plan(
         const ggml_gemmini_args_t &args,
         WeightScaleInfoMode mode);
+
+    WeightRouteStatus weight_route_status(
+        const WeightRoutePlan &plan,
+        WeightExecutionPath path);
+
+    const char *weight_route_status_name(WeightRouteStatus status);
 
     const char *weight_route_kind_name(const WeightRoutePlan &plan);
 
@@ -82,18 +113,12 @@ namespace ggml::gemmini::quants::wroute
         size_t j,
         size_t block_index);
 
-    // RMD contract -----------------------------------------------------------
-    // RMD needs the weight scale to factor into an integer per (column, K-block)
-    // term and a float per-column term:
+    // Integer-domain residual executors require the scale to factor as:
     //
-    //     weight_scale(j, block) == route_block_scale(j, block) * route_column_scale(j)
+    //     weight_scale(j, block) == integer_block(j, block) * column_float(j)
     //
-    // Q8_H1 satisfies this exactly (c_eff is an integer, s_rf is per column).
-    // Q8_HP1 also satisfies it: 2^m is the integer block factor and the
-    // row-constant channel_scale is the per-column factor.
-    // Scalar/channel/row-header routes satisfy it trivially with block scale 1.
-    // Routes whose per-block factor is genuinely floating point (Q8_HP2/H2 and
-    // dense per-block scale tables) do not, and are rejected by RMD.
+    // H1 and HP1 satisfy this for every supported width. H0 deliberately does
+    // not: its arbitrary floating block scale belongs to the CPU-direct path.
     bool route_supports_integer_block_scale(const WeightRoutePlan &plan);
 
     uint64_t route_block_scale(
@@ -173,13 +198,29 @@ namespace ggml::gemmini::quants::wroute
                args.blocks_per_row > 0);
     }
 
+    inline bool is_native_matched_width_format(const ggml_gemmini_args_t &args)
+    {
+        using Format = ggml_gemmini_args_t::im2p_weight_format_t;
+        switch (args.weight_format) {
+            case Format::q4_h0:
+            case Format::q4_h1:
+            case Format::q4_hp1:
+            case Format::q16_h0:
+            case Format::q16_h1:
+            case Format::q16_hp1:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     inline WeightLayout resolve_weight_layout(const ggml_gemmini_args_t &args)
     {
         if (is_q8_channel_direct_read_args(args) || is_q8_channel_dense_sidecar_args(args))
             return WeightLayout::JxK_ColMajor;
 
-        if (is_q8_hp1_args(args) || is_q8_hp2_args(args) ||
-            is_q8_h1_weight_args(args) || args.transpose_B)
+        if (is_native_matched_width_format(args) || is_q8_hp1_args(args) ||
+            is_q8_hp2_args(args) || is_q8_h1_weight_args(args) || args.transpose_B)
             return WeightLayout::JxK_ColMajor;
 
         return WeightLayout::KxJ_RowMajor;
@@ -187,10 +228,8 @@ namespace ggml::gemmini::quants::wroute
 
     inline size_t resolve_weight_stride_elems(const ggml_gemmini_args_t &args)
     {
-        if (is_q8_hp1_args(args) || is_q8_hp2_args(args))
-            return args.K;
-
-        if (is_q8_h1_weight_args(args))
+        if (is_native_matched_width_format(args) || is_q8_hp1_args(args) ||
+            is_q8_hp2_args(args) || is_q8_h1_weight_args(args))
             return args.K;
 
         const size_t fallback_stride = args.transpose_B ? args.K : args.J;

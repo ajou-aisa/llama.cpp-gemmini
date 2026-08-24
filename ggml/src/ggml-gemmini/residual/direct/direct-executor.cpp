@@ -2,27 +2,38 @@
 
 #include "direct-builder.hpp"
 #include "../../ggml-gemmini-args.h"
+#include "../../quants/common/weight_reader.hpp"
 #include "../../quants/common/weight_route.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <limits>
 #include <new>
+#include <utility>
 
 namespace ggml::gemmini::residual {
 
 namespace {
 
+namespace wreader = quants::wreader;
 namespace wroute = quants::wroute;
 
 constexpr size_t kJTile = 16;
 constexpr __int128 kInt64Min = static_cast<__int128>(std::numeric_limits<int64_t>::min());
 constexpr __int128 kInt64Max = static_cast<__int128>(std::numeric_limits<int64_t>::max());
 
-bool checked_add(int64_t lhs, __int128 rhs, int64_t & result) {
+bool checked_add(int64_t lhs, int64_t rhs, int64_t & result) {
     const __int128 sum = static_cast<__int128>(lhs) + rhs;
     if (sum < kInt64Min || sum > kInt64Max) return false;
     result = static_cast<int64_t>(sum);
+    return true;
+}
+
+bool checked_multiply(int64_t lhs, int64_t rhs, int64_t & result) {
+    const __int128 product = static_cast<__int128>(lhs) * rhs;
+    if (product < kInt64Min || product > kInt64Max) return false;
+    result = static_cast<int64_t>(product);
     return true;
 }
 
@@ -45,35 +56,29 @@ bool dense_route_is_addressable(const wroute::WeightRoutePlan & plan,
         minor_count - 1 <= std::numeric_limits<size_t>::max() - major_offset;
 }
 
-bool read_weight_code(const ggml_gemmini_args_t & args,
-                      const wroute::WeightRoutePlan & plan,
-                      size_t k, size_t j, int8_t & code) {
-    if (plan.route == wroute::WeightRouteKind::Q8H1 && plan.native_weight_blocks) {
-        const block_q8_h1 * block = args.q8_h1_block(j, k / rmd::kBlockSize);
-        if (block == nullptr) return false;
-        code = static_cast<int8_t>(block->qs[k % rmd::kBlockSize]);
-        return true;
-    }
-    if (plan.route == wroute::WeightRouteKind::Q8HP1 && plan.native_weight_blocks) {
-        const block_q8_hp1 * block = args.q8_hp1_block(j, k / rmd::kBlockSize);
-        if (block == nullptr) return false;
-        code = static_cast<int8_t>(block->qs[k % rmd::kBlockSize]);
-        return true;
-    }
-    const int8_t * dense = reinterpret_cast<const int8_t *>(args.B);
-    if (dense == nullptr) return false;
-    const size_t offset = plan.layout == wroute::WeightLayout::JxK_ColMajor
-        ? j * plan.weight_stride + k
-        : k * plan.weight_stride + j;
-    code = dense[offset];
-    return true;
+bool uses_reader_scale(const wroute::WeightRoutePlan & plan) {
+    return plan.route == wroute::WeightRouteKind::H0 ||
+        plan.route == wroute::WeightRouteKind::H1 ||
+        plan.route == wroute::WeightRouteKind::HP1;
+}
+
+bool finite_double(double value) {
+    uint64_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value), "unexpected double representation");
+    std::memcpy(&bits, &value, sizeof(bits));
+    return (bits & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
+}
+
+rmd::RmdStatus reader_failure(wreader::WeightReaderStatus status) {
+    return status == wreader::WeightReaderStatus::ScaleOverflow ?
+        rmd::RmdStatus::overflow : rmd::RmdStatus::execution_failed;
 }
 
 }
 
 rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
                                      const DirectStripePayload & payload,
-                                     std::vector<rmd::OutputValue> & correction,
+                                     rmd::DirectOutput & correction,
                                      DirectExecutionMetrics * metrics) {
     if (validate_direct_payload(payload) != rmd::RmdStatus::success)
         return rmd::RmdStatus::invalid_packet;
@@ -82,26 +87,52 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
 
     const wroute::WeightRoutePlan plan = wroute::resolve_weight_route_plan(
         args, wroute::WeightScaleInfoMode::Residual);
-    if (!plan.valid || !wroute::route_supports_integer_block_scale(plan))
+    if (!plan.valid) {
+        if (wreader::validate(args, plan) == wreader::WeightReaderStatus::ScaleOverflow)
+            return rmd::RmdStatus::overflow;
         return rmd::RmdStatus::unsupported_route;
+    }
+    if (wroute::weight_route_status(plan, wroute::WeightExecutionPath::CpuDirect) !=
+        wroute::WeightRouteStatus::Success) {
+        return rmd::RmdStatus::unsupported_route;
+    }
+
+    const bool floating_block =
+        plan.scale_domain == wroute::WeightScaleDomain::FloatingBlock;
+    const bool integer_block =
+        plan.scale_domain == wroute::WeightScaleDomain::IntegerBlockTimesColumn;
+    if ((floating_block && plan.route != wroute::WeightRouteKind::H0) ||
+        (!floating_block && (!integer_block ||
+         !wroute::route_supports_integer_block_scale(plan)))) {
+        return rmd::RmdStatus::unsupported_route;
+    }
     if (!wroute::route_covers_k(plan, payload.logical_k) ||
-        !dense_route_is_addressable(plan, payload.logical_k, payload.logical_j))
+        !dense_route_is_addressable(plan, payload.logical_k, payload.logical_j)) {
         return rmd::RmdStatus::unsupported_route;
+    }
 
     size_t output_count = 0;
     if (!checked_size_product(payload.row_count, payload.logical_j, output_count))
         return rmd::RmdStatus::overflow;
 
-    std::vector<rmd::OutputValue> staged;
-    if (output_count > staged.max_size()) return rmd::RmdStatus::allocation_failure;
+    std::vector<rmd::OutputValue> staged_integer;
+    std::vector<double> staged_floating;
+    if ((integer_block && output_count > staged_integer.max_size()) ||
+        (floating_block && output_count > staged_floating.max_size())) {
+        return rmd::RmdStatus::allocation_failure;
+    }
     try {
-        staged.assign(output_count, rmd::OutputValue{0});
+        if (floating_block) {
+            staged_floating.assign(output_count, 0.0);
+        } else {
+            staged_integer.assign(output_count, rmd::OutputValue{0});
+        }
     } catch (const std::bad_alloc &) {
         return rmd::RmdStatus::allocation_failure;
     }
 
     // Events are canonical row/K order. For each J tile, consume contiguous
-    // row/block/K spans, then scale the completed K sum once for that block.
+    // row/block/K spans, then apply that block's scale exactly once.
     for (size_t j_begin = 0; j_begin < payload.logical_j; j_begin += kJTile) {
         const size_t tile_j = std::min(kJTile, payload.logical_j - j_begin);
         size_t event_index = 0;
@@ -120,32 +151,63 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
             for (size_t index = event_index; index < span_end; ++index) {
                 const ResidualEvent & event = payload.events[index];
                 for (size_t local_j = 0; local_j < tile_j; ++local_j) {
-                    int8_t code = 0;
-                    if (!read_weight_code(args, plan, event.original_k,
-                                          j_begin + local_j, code))
-                        return rmd::RmdStatus::execution_failed;
-                    const __int128 product = static_cast<__int128>(event.residual) * code;
-                    if (!checked_add(block_sum[local_j], product, block_sum[local_j]))
+                    const wreader::WeightCodeResult code = wreader::read_code(
+                        args, plan, j_begin + local_j, event.original_k);
+                    if (!code.ok()) return reader_failure(code.status);
+                    int64_t product = 0;
+                    if (!checked_multiply(event.residual, code.value, product) ||
+                        !checked_add(block_sum[local_j], product, block_sum[local_j])) {
                         return rmd::RmdStatus::overflow;
+                    }
                 }
             }
 
             for (size_t local_j = 0; local_j < tile_j; ++local_j) {
                 const size_t j = j_begin + local_j;
-                const uint64_t scale = wroute::route_block_scale(plan, args, j, block_id);
-                if (scale > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
-                    return rmd::RmdStatus::overflow;
-                const __int128 scaled = static_cast<__int128>(block_sum[local_j]) *
-                    static_cast<int64_t>(scale);
+                wreader::WeightScaleResult scale{};
+                if (uses_reader_scale(plan)) {
+                    scale = wreader::read_scale(args, plan, j, block_id);
+                    if (!scale.ok()) return reader_failure(scale.status);
+                } else {
+                    scale.status = wreader::WeightReaderStatus::Success;
+                    scale.domain = plan.scale_domain;
+                    scale.integer_block_scale =
+                        wroute::route_block_scale(plan, args, j, block_id);
+                }
+                if (scale.domain != plan.scale_domain)
+                    return rmd::RmdStatus::execution_failed;
+
                 const size_t output_index = row * payload.logical_j + j;
-                if (!checked_add(staged[output_index], scaled, staged[output_index]))
-                    return rmd::RmdStatus::overflow;
+                if (floating_block) {
+                    const double scaled = static_cast<double>(block_sum[local_j]) *
+                        static_cast<double>(scale.floating_block_scale);
+                    const double sum = staged_floating[output_index] + scaled;
+                    if (!finite_double(scaled) || !finite_double(sum))
+                        return rmd::RmdStatus::overflow;
+                    staged_floating[output_index] = sum;
+                } else {
+                    if (scale.integer_block_scale >
+                        static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+                        return rmd::RmdStatus::overflow;
+                    }
+                    int64_t scaled = 0;
+                    if (!checked_multiply(
+                            block_sum[local_j],
+                            static_cast<int64_t>(scale.integer_block_scale), scaled) ||
+                        !checked_add(staged_integer[output_index], scaled,
+                                     staged_integer[output_index])) {
+                        return rmd::RmdStatus::overflow;
+                    }
+                }
             }
             event_index = span_end;
         }
     }
 
-    correction.swap(staged);
+    rmd::DirectOutput staged_output = floating_block ?
+        rmd::DirectOutput(rmd::PreScaledFloat64Correction{std::move(staged_floating)}) :
+        rmd::DirectOutput(rmd::BlockScaledInt64Correction{std::move(staged_integer)});
+    correction.swap(staged_output);
     if (metrics != nullptr) {
         metrics->event_count = payload.events.size();
         metrics->call_count = 1;

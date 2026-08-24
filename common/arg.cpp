@@ -2960,6 +2960,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_BENCH}));
     add_opt(common_arg(
+        {"--gemmini-debug-log"}, "PATH",
+        "write Gemmini debug JSONL to PATH (also accepts stdout, stderr, or -)",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("Gemmini debug log path must not be empty");
+            }
+            params.gemmini_debug_log = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_MAIN}));
+    add_opt(common_arg(
+        {"--gemmini-cycle-log"}, "PATH",
+        "write aggregate Gemmini cycle JSONL to PATH",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("Gemmini cycle log path must not be empty");
+            }
+            params.gemmini_cycle_log = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_MAIN}));
+    add_opt(common_arg(
         {"--log-disable"},
         "Log disable",
         [](common_params &) {
