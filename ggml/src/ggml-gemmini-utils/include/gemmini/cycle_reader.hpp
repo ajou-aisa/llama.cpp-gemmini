@@ -2,25 +2,23 @@
 #pragma once
 #include <stdint.h>
 #include <atomic>
+#include <chrono>
 
 #if defined(__APPLE__) && defined(__aarch64__)
 #include <mach/mach_time.h>
-#elif !defined(__riscv)
-#include <chrono>
 #endif
 
 namespace ggml::gemmini::cycle
 {
-    // This counter is a test seam for proving that disabled instrumentation does
-    // not touch a clock. It is thread-local and is incremented only in enabled builds.
-    inline thread_local uint64_t read_count = 0;
+    // Process-wide test seam covering every native cycle and profiling timestamp read.
+    inline std::atomic<uint64_t> read_count{0};
 
     static inline uint64_t read()
     {
 #if !LOG_CYCLE
         return 0;
 #else
-        ++read_count;
+        read_count.fetch_add(1, std::memory_order_relaxed);
         std::atomic_signal_fence(std::memory_order_seq_cst);
 #ifdef __riscv
         uint64_t value;
@@ -36,8 +34,20 @@ namespace ggml::gemmini::cycle
 #endif
     }
 
-    static inline void reset_read_count_for_test() { read_count = 0; }
-    static inline uint64_t read_count_for_test() { return read_count; }
+    static inline uint64_t timestamp_ns()
+    {
+#if !LOG_CYCLE
+        return 0;
+#else
+        read_count.fetch_add(1, std::memory_order_relaxed);
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+#endif
+    }
+
+    static inline void reset_read_count_for_test() { read_count.store(0, std::memory_order_relaxed); }
+    static inline uint64_t read_count_for_test() { return read_count.load(std::memory_order_relaxed); }
 
     static inline const char * clock_mode()
     {

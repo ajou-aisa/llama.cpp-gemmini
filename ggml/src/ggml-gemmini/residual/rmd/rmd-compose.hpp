@@ -15,32 +15,33 @@ namespace ggml::gemmini::rmd {
 // indices are not used: they only exist for input compaction and weight gather.
 RmdStatus compose_rmd_output(const StripePacket & packet,
                              const CompressedOutput & output,
-                             std::vector<OutputValue> & correction); // row_count * logical_j
+                             Correction & correction); // row_count * logical_j
 
-// Applies the common per-column weight scale and per-row activation scale and adds the
-// staged row-major correction into args.f_out. This backend-neutral overload is the only
-// floating point step of the RMD path. The output is unchanged on every failure.
+// Applies the correction according to its tagged domain and the per-row activation
+// scale, then commits the fully staged result. H1/HP1 consume the column scale here
+// exactly once; H0 values are already weight-scaled and are used directly. The output
+// is unchanged on every failure.
 RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
                                   float * destination,
                                   size_t global_row_begin,
                                   size_t global_row_end,
-                                  const std::vector<OutputValue> & correction);
+                                  const Correction & correction);
 
 RmdStatus merge_rmd_correction(const ggml_gemmini_args_t & args,
                                size_t global_row_begin,
                                size_t global_row_end,
-                               const std::vector<OutputValue> & correction);
+                               const Correction & correction);
 
-// Weight-stationary packet adapter. It preserves packet-scoped weight validation, then
+// The weight-stationary packet path preserves packet-scoped weight validation, then
 // delegates scaling and atomic output update to the common checked implementation.
 RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
                                   float * destination,
                                   const StripePacket & packet,
-                                  const std::vector<OutputValue> & correction);
+                                  const Correction & correction);
 
 RmdStatus merge_rmd_correction(const ggml_gemmini_args_t & args,
                                const StripePacket & packet,
-                               const std::vector<OutputValue> & correction);
+                               const Correction & correction);
 
 // execute -> compose -> common scale / final merge, for callers that do not need to
 // observe the intermediate compressed output.

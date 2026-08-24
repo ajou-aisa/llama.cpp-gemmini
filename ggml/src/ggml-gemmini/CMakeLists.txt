@@ -53,7 +53,9 @@ set(GEMMINI_RISCV_FLAGS
 ggml_add_backend_library(ggml-gemmini
                           ggml-gemmini.cpp
                           ggml-gemmini-buffer.cpp
+                          ggml-gemmini-geometry.hpp
                           ggml-gemmini-matmul.cpp
+                          ggml-gemmini-telemetry.cpp
                           ggml-gemmini-q8-h1-artifact.cpp
                           ggml-gemmini-q8-h1-artifact-reader.cpp
                             quants/act/dispatch.cpp
@@ -66,6 +68,7 @@ ggml_add_backend_library(ggml-gemmini
                          quants/weight/quantize_Q8_H1.cpp
                          quants/common/fp16_util.cpp
                          quants/common/dequant.cpp
+                         quants/common/weight_reader.cpp
                          residual/direct/direct-executor.cpp
                          residual/rmd/rmd-builder.cpp
                          residual/rmd/rmd-executor.cpp

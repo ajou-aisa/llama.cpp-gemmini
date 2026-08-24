@@ -6,7 +6,6 @@
 #include <vector>
 
 #include "../../../ggml-gemmini-args.h"
-#include "../../../residual/rmd/rmd-builder.hpp"
 #include "../../../residual/rmd/rmd-compose.hpp"
 #include "../../common/tensor_util.hpp"
 #include "stripe.hpp"
@@ -209,17 +208,16 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
     if (!meta)
         return false;
 
+    ggml::gemmini::GemminiGeometry geometry;
+    if (!args.activation_quant_geometry_matches(geometry))
+        return false;
+
     const float *src_data = ggml::gemmini::activation_data(src);
     if (!src_data)
         return false;
 
-    //cpu fallback이면 args.I, else determined by gemmini tile
-    size_t rows_per_stripe = args.I;
-    if (args.tile_I > 0 && !checked_mul_size(args.tile_I, DIM, rows_per_stripe))
-        return false;
-    if (rows_per_stripe == 0)
-        return false;
-    const size_t num_stripes = (args.I - 1) / rows_per_stripe + 1;
+    const size_t rows_per_stripe = geometry.stripe_rows;
+    const size_t num_stripes = geometry.stripe_count;
 
     meta->scales.assign(num_stripes, 1.0f);
     meta->rmd_packets.clear();
@@ -312,14 +310,12 @@ bool dequantize_activation(
     if (args.sA != 0 && args.sA != args.K)
         return false;
 
-    size_t rows_per_stripe = args.I;
-    if (args.tile_I > 0 && !checked_mul_size(args.tile_I, DIM, rows_per_stripe))
+    ggml::gemmini::GemminiGeometry geometry;
+    if (!args.activation_quant_geometry_matches(geometry))
         return false;
-    if (rows_per_stripe == 0)
-        return false;
+    const size_t rows_per_stripe = geometry.stripe_rows;
 
-    const size_t expected_stripes = (args.I - 1) / rows_per_stripe + 1;
-    if (meta.scales.size() != expected_stripes)
+    if (meta.scales.size() != geometry.stripe_count)
         return false;
 
     const size_t row_count = std::min(rows, args.I);
@@ -360,7 +356,6 @@ bool dequantize_activation(
             if (dst_row_offset > max_size - dst_col_offset)
                 return false;
 
-            const size_t src_idx = src_row_offset + col;
             const size_t dst_idx = dst_row_offset + dst_col_offset;
 
             int32_t q = args.A.get(row, col);

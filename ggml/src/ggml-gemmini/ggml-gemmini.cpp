@@ -7,8 +7,6 @@
 #include <string>
 #include <new>
 #include <cstdlib>
-#include <string_view>
-#include <future>
 
 #include <limits>
 
@@ -50,7 +48,6 @@
 #ifndef LOW_D
 #define LOW_D 0
 #endif
-#include "residual/rmd/rmd-compose.hpp"
 #ifndef OPTION
 #define OPTION CPU
 #endif
@@ -64,6 +61,41 @@ namespace
                type == GGML_TYPE_Q16_H1 ||
                type == GGML_TYPE_Q16_HP1;
     }
+
+    std::uint8_t gemmini_product_weight_bits(ggml_type type) {
+        switch (type) {
+            case GGML_TYPE_Q4_0:
+            case GGML_TYPE_Q4_1:
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q4_H1:
+            case GGML_TYPE_Q4_HP1: return 4;
+            case GGML_TYPE_Q16_0:
+            case GGML_TYPE_Q16_H1:
+            case GGML_TYPE_Q16_HP1: return 16;
+            default: return 8;
+        }
+    }
+
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    ggml::gemmini::im2p_adapter::WeightFamily gemmini_exsia_weight_family(
+            ggml_type type) {
+        using Family = ggml::gemmini::im2p_adapter::WeightFamily;
+        switch (type) {
+            case GGML_TYPE_Q4_0:
+            case GGML_TYPE_Q8_0:
+            case GGML_TYPE_Q16_0: return Family::h0;
+            case GGML_TYPE_Q4_H1:
+            case GGML_TYPE_Q8_H1:
+            case GGML_TYPE_Q16_H1: return Family::h1;
+            case GGML_TYPE_Q4_HP1:
+            case GGML_TYPE_Q8_HP1:
+            case GGML_TYPE_Q16_HP1: return Family::hp1;
+            case GGML_TYPE_Q8_H2: return Family::h2;
+            case GGML_TYPE_Q8_HP2: return Family::hp2;
+            default: return Family::unsupported;
+        }
+    }
+#endif
 
     bool gemmini_is_native_matched_weight_type(ggml_type type) {
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
@@ -266,6 +298,7 @@ namespace
         args.sB = k;
         args.native_blocks_per_row = blocks_per_row;
         args.native_block_count = block_count;
+        args.native_weight_bytes = total_bytes;
         switch (weight->type) {
         case GGML_TYPE_Q4_0: args.q4_h0_blocks = static_cast<const block_q4_h0 *>(weight->data); break;
         case GGML_TYPE_Q4_H1: args.q4_h1_blocks = static_cast<const block_q4_h1 *>(weight->data); break;
@@ -584,6 +617,7 @@ namespace
         args.q8_hp1_blocks = reinterpret_cast<const block_q8_hp1 *>(data);
         args.q8_hp1_block_count = block_count;
         args.q8_hp1_blocks_per_row = blocks_per_row;
+        args.native_weight_bytes = storage_bytes;
         // Ponytail: per-call contract check intentionally removed (was the per-mul-mat
         // O(N_blocks) validator). Layout preconditions above are the only gate; NaN
         // results reported by perplexity are unrelated and tracked separately.
@@ -1081,6 +1115,24 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         }
     }
 
+    const std::uint8_t product_weight_bits =
+        gemmini_product_weight_bits(src0->type);
+    if (product_weight_bits != GGML_GEMMINI_ACTIVATION_BITS ||
+        product_weight_bits != GGML_GEMMINI_WEIGHT_BITS) {
+        ggml::gemmini::log::debug(
+            layer,
+            "[matmul.route] status=unsupported_route activation_bits=%d "
+            "weight_bits=%u artifact_weight_bits=%d",
+            GGML_GEMMINI_ACTIVATION_BITS,
+            static_cast<unsigned>(product_weight_bits),
+            GGML_GEMMINI_WEIGHT_BITS);
+#if defined(GGML_GEMMINI_TESTING)
+        return;
+#else
+        GGML_ABORT("Gemmini requires matched activation and weight widths");
+#endif
+    }
+
     ggml_gemmini_args_t args;
     std::vector<int8_t> q8_channel_dense;
     std::vector<float> q8_channel_scales;
@@ -1094,34 +1146,35 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         GGML_ABORT("Gemmini invalid matmul options");
     }
     auto matmul_options = matmul_resolution.options;
-    matmul_options.profiling = LOG_DEBUG != 0 || LOG_CYCLE != 0;
+    matmul_options.profiling = LOG_CYCLE != 0;
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
     constexpr bool im2p_exsia =
         ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
         ggml::gemmini::config::ActivationQuantAlgo::EXSIA;
     constexpr bool im2p_non_exsia = !im2p_exsia;
-    const std::uint8_t im2p_weight_bits =
-        src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_1 ||
-                src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q4_H1 ||
-                src0->type == GGML_TYPE_Q4_HP1
-            ? 4
-            : src0->type == GGML_TYPE_Q16_0 ||
-                      src0->type == GGML_TYPE_Q16_H1 ||
-                      src0->type == GGML_TYPE_Q16_HP1
-                  ? 16
-                  : 8;
     const auto route_gate =
-        im2p_weight_bits != GGML_GEMMINI_WEIGHT_BITS
+        product_weight_bits != GGML_GEMMINI_WEIGHT_BITS
             ? ggml::gemmini::im2p_adapter::Result{
                   ggml::gemmini::im2p_adapter::Error::unsupported_route,
                   "tensor weight width does not match the selected IM2P artifact",
                   false}
-            : ggml::gemmini::im2p_adapter::gate_route(
-                  im2p_exsia, GGML_GEMMINI_ACTIVATION_BITS,
+            : ggml::gemmini::im2p_adapter::gate_route({
+                  im2p_exsia,
+                  GGML_GEMMINI_ACTIVATION_BITS,
+                  product_weight_bits,
+                  GGML_GEMMINI_ACTIVATION_BITS,
+                  GGML_GEMMINI_WEIGHT_BITS,
                   GGML_GEMMINI_ENABLE_RMD != 0,
+                  matmul_options.mode ==
+                          ggml::gemmini::MatmulInvocationMode::full
+                      ? ggml::gemmini::im2p_adapter::PublicMode::full
+                      : ggml::gemmini::im2p_adapter::PublicMode::stripe_pipeline,
+                  gemmini_exsia_weight_family(src0->type),
                   matmul_options.rmd_backend ==
-                      ggml::gemmini::RmdBackend::cpu_direct,
-                  im2p_weight_bits);
+                          ggml::gemmini::RmdBackend::cpu_direct
+                      ? ggml::gemmini::im2p_adapter::ResidualBackend::cpu_direct
+                      : ggml::gemmini::im2p_adapter::ResidualBackend::compact_ws,
+                  ggml::gemmini::im2p_adapter::BuildIdentity::im2p_sim_ws});
     if (!route_gate.ok()) {
       ggml::gemmini::im2p_adapter::log_failure("route", route_gate);
 #if defined(GGML_GEMMINI_TESTING)
@@ -1132,6 +1185,12 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
       GGML_ABORT("Gemmini IM2P route is unsupported");
 #endif
     }
+#if defined(GGML_GEMMINI_TESTING)
+    if (im2p_exsia) {
+      ggml::gemmini::im2p_adapter::test_observe_weight_family(
+          gemmini_exsia_weight_family(src0->type));
+    }
+#endif
 #else
     constexpr bool im2p_exsia = false;
     constexpr bool im2p_non_exsia = false;
@@ -1200,12 +1259,22 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     // set tile size
     start = ggml::gemmini::cycle::read();
     ggml::gemmini::gemmini_set_tile_ws(&args);
+    const auto gemmini_geometry = ggml::gemmini::make_gemmini_geometry(
+        {{args.I, args.J, args.K}, {args.tile_I, args.tile_J, args.tile_K}, DIM});
+    if (!gemmini_geometry.ok()) {
+        GGML_ABORT("Gemmini geometry is invalid");
+    }
+    args.activation_rows_per_stripe = gemmini_geometry.geometry.stripe_rows;
     end = ggml::gemmini::cycle::read();
     ggml::gemmini::log::cycle(layer, "cpu.Set tile size", start, end);
 
     // quantize activation
     start = ggml::gemmini::cycle::read();
 
+#if defined(GGML_GEMMINI_TESTING) && \
+    defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    ggml::gemmini::im2p_adapter::test_observe_activation_allocation();
+#endif
     if (!args.A.allocate(args.I, args.K, GGML_GEMMINI_ACTIVATION_BITS)) {
         ggml::gemmini::log::debug(
             ggml::gemmini::types::to_string(args.layer_type),
@@ -1425,6 +1494,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 GGML_ABORT("Gemmini Q8_H1 weight tensor block metadata overflows");
             }
             args.q8_h1_rows = logical_rows;
+            args.native_weight_bytes = args.q8_h1_block_count * sizeof(block_q8_h1);
 
             if (!args.has_q8_h1_im2p_contract()) {
                 ggml_gemmini_log_q8_h1_contract_issue(layer, args);
@@ -1605,6 +1675,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             args.q8_h1_blocks = reprocessed_q8_h1.data();
             args.q8_h1_block_count = reprocessed_q8_h1.size();
             args.q8_h1_rows = q8_0_reprocess_rows;
+            args.native_weight_bytes = reprocessed_q8_h1.size() * sizeof(block_q8_h1);
             if (!args.has_q8_h1_im2p_contract()) {
                 ggml_gemmini_log_q8_h1_contract_issue(layer, args);
                 GGML_ABORT("Gemmini Q8_0 reprocessed im2p contract failed");
@@ -1644,10 +1715,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
     if constexpr (im2p_exsia) {
-      // The production frontend consumes one DIM-row post-fold stripe at a
-      // time.
-      args.tile_I = 1;
-      args.activation_rows_per_stripe = std::min<size_t>(DIM, args.I);
       args.act_quant.storage()
           .emplace<ggml::gemmini::quants::act::exsia::Meta>();
 
@@ -1696,8 +1763,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
           GGML_ABORT("Gemmini IM2P ExSIA FULL execution failed");
 #endif
         }
-        ggml::gemmini::im2p_adapter::log_stats("ExSIA FULL execution",
-                                               completion.stats);
+        ggml::gemmini::im2p_adapter::log_stats(
+            "full", completion.stats, args);
         return;
       }
 
@@ -1759,8 +1826,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         GGML_ABORT("Gemmini IM2P ExSIA stripe execution failed");
 #endif
       }
-      ggml::gemmini::im2p_adapter::log_stats("ExSIA stripe execution",
-                                             completion.stats);
+      ggml::gemmini::im2p_adapter::log_stats(
+          "stripe_pipeline", completion.stats, args);
       return;
     }
 #endif
@@ -1795,12 +1862,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
     if constexpr (im2p_non_exsia) {
-      if (pipeline_requested) {
-        args.activation_rows_per_stripe =
-            matmul_options.stripe_rows_auto
-                ? std::min<size_t>(DIM, args.I)
-                : std::min(matmul_options.stripe_rows, args.I);
-      }
       const auto completion =
           pipeline_requested
               ? ggml::gemmini::im2p_adapter::run_stripe_pipeline(args)
@@ -1816,8 +1877,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 #endif
       }
       ggml::gemmini::im2p_adapter::log_stats(
-          pipeline_requested ? "stripe execution" : "full execution",
-          completion.stats);
+          pipeline_requested ? "stripe_pipeline" : "full",
+          completion.stats, args);
     }
 #endif
 
@@ -1846,23 +1907,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     if (!pipeline_enabled && legacy_full_dispatch) {
         if constexpr (ggml::gemmini::config::CURRENT_COMPUTE_TYPE == ggml::gemmini::config::ComputeType::INT) {
-          constexpr auto baseline_activation_quant =
-              ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
-                      ggml::gemmini::config::ActivationQuantAlgo::EXSIA
-                  ? ggml::gemmini::baseline_activation_quant_t::EXSIA
-              : ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
-                      ggml::gemmini::config::ActivationQuantAlgo::TENSOR
-                  ? ggml::gemmini::baseline_activation_quant_t::TENSOR
-              : (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
-                     ggml::gemmini::config::ActivationQuantAlgo::BLOCK ||
-                 ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
-                     ggml::gemmini::config::ActivationQuantAlgo::STRIPE)
-                  ? ggml::gemmini::baseline_activation_quant_t::BLOCK
-                  : ggml::gemmini::baseline_activation_quant_t::TOKEN;
-          const auto selected_baseline_weight_quant =
-              src0->type == GGML_TYPE_Q8_CHANNEL
-                  ? ggml::gemmini::baseline_weight_quant_t::CHANNEL
-                  : ggml::gemmini::baseline_weight_quant_t::TENSOR;
           bool run_baseline = true;
 
           if constexpr (ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
@@ -1966,10 +2010,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         const auto capabilities = ggml::gemmini::detail::route_capabilities(args);
         const char * const backend_route =
             ggml::gemmini::detail::backend_route_name(route.backend);
-        const char * const schedule =
-            route.backend == ggml::gemmini::detail::BackendRoute::cpu
-                ? "matmul-then-rmd"
-                : "matmul-rmd-overlap";
         ggml::gemmini::log::debug(layer,
             "[matmul.route] invocation=stripe-pipeline full_or_slice=slice "
             "activation_route=%s weight_route=%s backend_route=%s "
@@ -1980,46 +2020,11 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             capabilities.live_stripe_producer ? 1 : 0,
             capabilities.deprecated ? 1 : 0);
         const auto telemetry_profiles = pipeline_collector->profiles();
-        for (const auto & profile : telemetry_profiles) {
-            ggml::gemmini::log::debug(layer,
-                "[matmul.stripe] stripe_id=%zu row_begin=%zu row_end=%zu "
-                "la_cycles=%llu la3_cycles=%llu sf_cycles=%llu la3_ns=%llu sf1_ns=%llu handoff_ns=%llu ws_ns=%llu "
-                "rmd_pack_ns=%llu rmd_execute_ns=%llu rmd_compose_ns=%llu rmd_finalize_ns=%llu "
-                "ws_start_ns=%llu ws_end_ns=%llu rmd_start_ns=%llu rmd_end_ns=%llu "
-                "active_blocks=%zu active_lanes=%zu physical_tiles=%zu "
-                "matmul_calls=%zu lane_groups=%zu stacked_i_tiles=%zu/%zu packet_bytes=%zu",
-                profile.stripe_id,
-                profile.row_begin,
-                profile.row_end,
-                static_cast<unsigned long long>(profile.la_cycles),
-                static_cast<unsigned long long>(profile.la3_cycles),
-                static_cast<unsigned long long>(profile.sf_cycles),
-                static_cast<unsigned long long>(profile.la3_ns),
-                static_cast<unsigned long long>(profile.sf1_ns),
-                static_cast<unsigned long long>(profile.handoff.nanoseconds),
-                static_cast<unsigned long long>(profile.ws.nanoseconds),
-                static_cast<unsigned long long>(profile.rmd_pack.nanoseconds),
-                static_cast<unsigned long long>(profile.rmd_execute.nanoseconds),
-                static_cast<unsigned long long>(profile.rmd_compose.nanoseconds),
-                static_cast<unsigned long long>(profile.rmd_finalize.nanoseconds),
-                static_cast<unsigned long long>(profile.ws_start_ns),
-                static_cast<unsigned long long>(profile.ws_end_ns),
-                static_cast<unsigned long long>(profile.rmd_start_ns),
-                static_cast<unsigned long long>(profile.rmd_end_ns),
-                profile.rmd.active_blocks,
-                profile.rmd.active_lanes,
-                profile.rmd.physical_tile_count,
-                profile.rmd.matmul_call_count,
-                profile.rmd.lane_group_count,
-                profile.rmd.stacked_i_tile_count,
-                profile.rmd.baseline_stacked_i_tile_count,
-                profile.rmd.packet_bytes);
-            const std::string summary = ggml::gemmini::detail::pipeline_stripe_summary_json(
-                layer, args.I, args.J, args.K, backend_route, schedule, profile);
-            (void) ggml::gemmini::detail::append_pipeline_stripe_summary_jsonl(summary);
-            ggml::gemmini::log::debug(layer, "%s", summary.c_str());
-        }
 #if LOG_CYCLE
+        for (const auto & profile : telemetry_profiles) {
+            ggml::gemmini::emit_cycle_telemetry(
+                ggml::gemmini::detail::pipeline_stripe_telemetry(layer, profile));
+        }
         const uint64_t rmd_telemetry_invocation_end = ggml::gemmini::cycle::read();
         const char * bundle_id = std::getenv("GGML_GEMMINI_RUNTIME_BUNDLE_ID");
         const char * model_id = std::getenv("GGML_GEMMINI_MODEL_ID");
@@ -2033,11 +2038,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             bundle_id != nullptr ? bundle_id : "unbundled",
             ggml::gemmini::resolve_rmd_model_id(model_id, ctx->model_arch),
             telemetry_run_id, invocation_total, telemetry_profiles);
-        const std::string telemetry_json = ggml::gemmini::serialize_rmd_telemetry(telemetry);
-        if (!telemetry_json.empty()) {
-            (void) ggml::gemmini::detail::append_pipeline_stripe_summary_jsonl(telemetry_json);
-            ggml::gemmini::log::debug(layer, "%s", telemetry_json.c_str());
-        }
+        ggml::gemmini::emit_cycle_telemetry(telemetry);
 #endif
     }
 }
@@ -2498,6 +2499,7 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
                     args.q8_h1_blocks = blocks;
                     args.q8_h1_block_count = q8_h1_block_count;
                     args.q8_h1_rows = logical_rows;
+                    args.native_weight_bytes = storage_bytes;
                     return args.has_q8_h1_im2p_contract();
                 }
 
@@ -2629,6 +2631,7 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
                         args.q8_h1_blocks = blocks;
                         args.q8_h1_block_count = q8_h1_block_count;
                         args.q8_h1_rows = logical_rows;
+                        args.native_weight_bytes = storage_bytes;
                         return args.has_q8_h1_im2p_contract();
                     }
 

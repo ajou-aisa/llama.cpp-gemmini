@@ -1,14 +1,42 @@
 #include "gemmini/log.hpp"
+#include "../include/llama.h"
+#include "llama-impl.h"
 
+#include <atomic>
+#include <condition_variable>
+#include <chrono>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <system_error>
 #include <thread>
 #include <vector>
+
+static_assert(noexcept(gemmini_log_file(nullptr)));
+static_assert(noexcept(gemmini_log_truncate_file(nullptr)));
+static_assert(noexcept(gemmini_log_debug_set_output_path(nullptr)));
+static_assert(noexcept(gemmini_log_cycle_set_output_path(nullptr)));
+static_assert(noexcept(gemmini_log_debug_set_output(nullptr)));
+static_assert(noexcept(gemmini_log_cycle_set_output(nullptr)));
+static_assert(noexcept(gemmini_hardware_counter_lease_acquire()));
+static_assert(noexcept(gemmini_hardware_counter_lease_release()));
+static_assert(noexcept(gemmini_log_debug("%d", 1)));
+static_assert(noexcept(gemmini_log_debug_layer(nullptr, "%d", 1)));
+static_assert(noexcept(gemmini_log_debug_loc(nullptr, 0, nullptr, "%d", 1)));
+static_assert(noexcept(gemmini_log_debug_to({nullptr}, "%d", 1)));
+static_assert(noexcept(gemmini_log_debug_to_layer({nullptr}, nullptr, "%d", 1)));
+static_assert(noexcept(gemmini_log_debug_to_loc({nullptr}, nullptr, 0, nullptr, "%d", 1)));
+static_assert(noexcept(gemmini_log_ws_cycle(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)));
+static_assert(noexcept(gemmini_log_cycle_record(nullptr)));
+static_assert(noexcept(gemmini_log_cycle(nullptr, nullptr, 0, 0)));
+static_assert(noexcept(gemmini_log_cycle_loc(nullptr, 0, nullptr, nullptr, nullptr, 0, 0)));
+static_assert(noexcept(gemmini_log_cycle_to({nullptr}, nullptr, nullptr, 0, 0)));
+static_assert(noexcept(gemmini_log_cycle_to_loc({nullptr}, nullptr, 0, nullptr, nullptr, nullptr, 0, 0)));
 
 static std::string read_file(const std::filesystem::path & path) {
     std::ifstream input(path, std::ios::binary);
@@ -17,6 +45,170 @@ static std::string read_file(const std::filesystem::path & path) {
 
 static void write_file(const std::filesystem::path & path, const char * content) {
     std::ofstream(path, std::ios::binary) << content;
+}
+
+static bool parse_json_string(const std::string & value, size_t & offset) {
+    if (offset == value.size() || value[offset++] != '"') return false;
+    while (offset != value.size()) {
+        const unsigned char c = static_cast<unsigned char>(value[offset++]);
+        if (c == '"') return true;
+        if (c < 0x20) return false;
+        if (c != '\\') continue;
+        if (offset == value.size()) return false;
+        const char escape = value[offset++];
+        if (std::string("\"\\/bfnrt").find(escape) != std::string::npos) continue;
+        if (escape != 'u' || value.size() - offset < 4) return false;
+        for (int i = 0; i != 4; ++i) {
+            if (!std::isxdigit(static_cast<unsigned char>(value[offset++]))) return false;
+        }
+    }
+    return false;
+}
+
+static bool parse_json_object_line(const std::string & value) {
+    size_t offset = 0;
+    if (value.empty() || value[offset++] != '{') return false;
+    if (offset != value.size() && value[offset] == '}') return ++offset == value.size();
+    for (;;) {
+        if (!parse_json_string(value, offset) || offset == value.size() || value[offset++] != ':') return false;
+        if (offset == value.size()) return false;
+        if (value[offset] == '"') {
+            if (!parse_json_string(value, offset)) return false;
+        } else if (value.compare(offset, 4, "true") == 0 || value.compare(offset, 4, "null") == 0) {
+            offset += 4;
+        } else if (value.compare(offset, 5, "false") == 0) {
+            offset += 5;
+        } else {
+            const size_t start = offset;
+            if (value[offset] == '-') ++offset;
+            while (offset != value.size() && std::isdigit(static_cast<unsigned char>(value[offset]))) ++offset;
+            if (offset == start || (value[start] == '-' && offset == start + 1)) return false;
+        }
+        if (offset == value.size()) return false;
+        if (value[offset] == '}') return ++offset == value.size();
+        if (value[offset++] != ',') return false;
+    }
+}
+
+static bool every_line_is_json(const std::filesystem::path & path, size_t * count = nullptr) {
+    std::ifstream input(path);
+    std::string line;
+    size_t lines = 0;
+    while (std::getline(input, line)) {
+        ++lines;
+        if (!parse_json_object_line(line)) {
+            std::cerr << "invalid JSON line in " << path << ": " << line << '\n';
+            return false;
+        }
+    }
+    if (count) *count = lines;
+    return input.eof();
+}
+
+class StartGate {
+public:
+    explicit StartGate(size_t participants) : participants_(participants) {}
+    void arrive_and_wait() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (++arrived_ == participants_) {
+            released_ = true;
+            ready_.notify_all();
+            return;
+        }
+        ready_.wait(lock, [&] { return released_; });
+    }
+private:
+    const size_t participants_;
+    size_t arrived_ = 0;
+    bool released_ = false;
+    std::mutex mutex_;
+    std::condition_variable ready_;
+};
+
+struct CallbackContext {
+    const uint64_t magic;
+    std::atomic<size_t> calls{0};
+    std::atomic<size_t> mismatches{0};
+};
+
+static CallbackContext callback_a_context{0xa11ca11bu};
+static CallbackContext callback_b_context{0xb22cb22cu};
+
+static void callback_a(ggml_log_level, const char *, void * user_data) {
+    auto * context = static_cast<CallbackContext *>(user_data);
+    if (context != &callback_a_context || context->magic != 0xa11ca11bu) {
+        callback_a_context.mismatches.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    context->calls.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void callback_b(ggml_log_level, const char *, void * user_data) {
+    auto * context = static_cast<CallbackContext *>(user_data);
+    if (context != &callback_b_context || context->magic != 0xb22cb22cu) {
+        callback_b_context.mismatches.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    context->calls.fetch_add(1, std::memory_order_relaxed);
+}
+
+static std::atomic<size_t> reentrant_calls{0};
+
+static void reentrant_callback(ggml_log_level, const char *, void *) {
+    reentrant_calls.fetch_add(1, std::memory_order_relaxed);
+    llama_log_set(callback_b, &callback_b_context);
+    llama_log_internal(GGML_LOG_LEVEL_INFO, "nested callback emission");
+}
+
+static bool test_llama_callback_replacement() {
+    callback_a_context.calls = 0;
+    callback_a_context.mismatches = 0;
+    callback_b_context.calls = 0;
+    callback_b_context.mismatches = 0;
+
+    constexpr size_t iterations = 200000;
+    llama_log_set(callback_a, &callback_a_context);
+    StartGate gate(3);
+    std::thread setter([&] {
+        gate.arrive_and_wait();
+        for (size_t i = 0; i != iterations; ++i) {
+            if ((i & 1) == 0) {
+                llama_log_set(callback_a, &callback_a_context);
+            } else {
+                llama_log_set(callback_b, &callback_b_context);
+            }
+        }
+    });
+    auto emit = [&] {
+        gate.arrive_and_wait();
+        for (size_t i = 0; i != iterations; ++i) {
+            llama_log_internal(GGML_LOG_LEVEL_INFO, "callback replacement %zu", i);
+        }
+    };
+    std::thread first_emitter(emit);
+    std::thread second_emitter(emit);
+    setter.join();
+    first_emitter.join();
+    second_emitter.join();
+
+    const size_t calls = callback_a_context.calls.load() + callback_b_context.calls.load();
+    const size_t mismatches = callback_a_context.mismatches.load() + callback_b_context.mismatches.load();
+    if (calls + mismatches != 2 * iterations || mismatches != 0) {
+        std::cerr << "llama callback pointer/user-data replacement was not atomic: "
+                  << calls << " calls, " << mismatches << " mismatches\n";
+        return false;
+    }
+
+    reentrant_calls = 0;
+    const size_t nested_before = callback_b_context.calls.load();
+    llama_log_set(reentrant_callback, nullptr);
+    llama_log_internal(GGML_LOG_LEVEL_INFO, "outer callback emission");
+    llama_log_set(nullptr, nullptr);
+    if (reentrant_calls.load() != 1 || callback_b_context.calls.load() != nested_before + 1) {
+        std::cerr << "reentrant llama callback replacement/emission failed\n";
+        return false;
+    }
+    return true;
 }
 
 class ScopedCurrentPath {
@@ -128,14 +320,14 @@ static bool test_default_setup(const std::filesystem::path & test_root) {
         std::cerr << "enabled default debug output was not created\n";
         return false;
     }
-    std::ofstream(debug_path, std::ios::app) << "debug-sentinel\n";
+    std::ofstream(debug_path, std::ios::app) << "{\"sentinel\":\"debug\"}\n";
 #endif
 #if EXPECT_LOG_CYCLE
     if (!std::filesystem::exists(cycle_path)) {
         std::cerr << "enabled default cycle output was not created\n";
         return false;
     }
-    std::ofstream(cycle_path, std::ios::app) << "cycle-sentinel\n";
+    std::ofstream(cycle_path, std::ios::app) << "{\"sentinel\":\"cycle\"}\n";
 #endif
 
     threads.clear();
@@ -147,14 +339,15 @@ static bool test_default_setup(const std::filesystem::path & test_root) {
     }
 
 #if EXPECT_LOG_DEBUG
-    if (read_file(debug_path).find("debug-sentinel\n") == std::string::npos) {
+    if (read_file(debug_path).find("{\"sentinel\":\"debug\"}\n") == std::string::npos ||
+        !every_line_is_json(debug_path)) {
         std::cerr << "repeated setup truncated default debug output\n";
         return false;
     }
 #else
     (void)ggml::gemmini::log::debug.set_output_path(GEMMINI_LOG_DEFAULT_DEBUG_PATH, true);
     (void)gemmini_log_debug_set_output_path(GEMMINI_LOG_DEFAULT_DEBUG_PATH);
-    gemmini_log_ws_loop(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
+    gemmini_log_ws_cycle(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
     if (std::filesystem::exists(debug_path) ||
         std::filesystem::exists(test_root / "output/log/log-ws-loop.jsonl")) {
         std::cerr << "disabled debug setup created a default output\n";
@@ -162,8 +355,11 @@ static bool test_default_setup(const std::filesystem::path & test_root) {
     }
 #endif
 #if EXPECT_LOG_CYCLE
-    if (read_file(cycle_path).find("cycle-sentinel\n") == std::string::npos) {
-        std::cerr << "repeated setup truncated default cycle output\n";
+    const std::string repeated_cycle_output = read_file(cycle_path);
+    if (repeated_cycle_output.find("{\"sentinel\":\"cycle\"}\n") == std::string::npos ||
+        !every_line_is_json(cycle_path)) {
+        std::cerr << "repeated setup truncated default cycle output: bytes="
+                  << repeated_cycle_output.size() << " content=" << repeated_cycle_output << '\n';
         return false;
     }
 #else
@@ -209,7 +405,8 @@ static bool test_explicit_debug_before_default_setup() {
 
             const std::string output = read_file(explicit_path);
             if (output.find("explicit-sentinel-before-default") == std::string::npos ||
-                output.find("explicit-sentinel-after-default") == std::string::npos) {
+                output.find("explicit-sentinel-after-default") == std::string::npos ||
+                !every_line_is_json(explicit_path)) {
                 std::cerr << "default setup replaced explicit debug output\n";
                 failed = true;
             }
@@ -231,7 +428,380 @@ static bool test_explicit_debug_before_default_setup() {
     return !failed;
 }
 
+static bool test_hardware_counter_contract(const std::filesystem::path & root) {
+#if !EXPECT_LOG_CYCLE
+    (void)root;
+    return true;
+#else
+    const std::filesystem::path output = root / "hardware-counter.jsonl";
+    if (!ggml::gemmini::log::cycle.set_output_path(output.c_str(), true)) {
+        std::cerr << "could not initialize hardware counter sink\n";
+        return false;
+    }
+
+    gemmini_log_ws_cycle(UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX,
+                         2, 3, 4, 1, 1, 1, 2, 3, 4, 0, 1);
+    gemmini_log_ws_cycle(static_cast<uint64_t>(UINT32_MAX) + 1, 1, 2, 3, 4,
+                         2, 3, 4, 1, 1, 1, 2, 3, 4, 0, 1);
+    gemmini_log_ws_cycle(10, 11, 2, 3, 4,
+                         2, 3, 4, 1, 1, 1, 2, 3, 4, 0, 1);
+    ggml::gemmini::log::cycle.set_output(stderr);
+
+    const std::string json = read_file(output);
+    const auto count = [&json](const std::string & needle) {
+        size_t found = 0;
+        for (size_t at = 0; (at = json.find(needle, at)) != std::string::npos; at += needle.size()) ++found;
+        return found;
+    };
+    if (!every_line_is_json(output) ||
+        count("\"record_type\":\"WS_LOOP_TELEMETRY\"") != 3 ||
+        count("\"containing_interval_counter_bits\":64") != 3 ||
+        count("\"occupancy_counter_bits\":32") != 3 ||
+        count("\"valid\":true") != 1 || count("\"valid\":false") != 2) {
+        std::cerr << "hardware counter width/wrap contract failed: " << json << '\n';
+        return false;
+    }
+
+    constexpr size_t thread_count = 12;
+    constexpr size_t iterations = 2000;
+    StartGate gate(thread_count);
+    std::atomic<unsigned int> owners{0};
+    std::atomic<size_t> overlaps{0};
+    std::vector<std::thread> threads;
+    threads.reserve(thread_count);
+    for (size_t thread = 0; thread != thread_count; ++thread) {
+        threads.emplace_back([&] {
+            gate.arrive_and_wait();
+            for (size_t i = 0; i != iterations; ++i) {
+                ggml::gemmini::log::HardwareCounterLease lease;
+                if (owners.fetch_add(1, std::memory_order_relaxed) != 0) {
+                    overlaps.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (owners.fetch_sub(1, std::memory_order_relaxed) != 1) {
+                    overlaps.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (std::thread & thread : threads) thread.join();
+    if (overlaps.load(std::memory_order_relaxed) != 0 || owners.load(std::memory_order_relaxed) != 0) {
+        std::cerr << "hardware counter leases overlapped ownership\n";
+        return false;
+    }
+    return true;
+#endif
+}
+
+static bool test_atomic_cycle_sink(const std::filesystem::path & root) {
+#if !EXPECT_LOG_CYCLE
+    (void)root;
+    return true;
+#else
+    const std::filesystem::path first = root / "atomic-first.jsonl";
+    const std::filesystem::path second = root / "atomic-second.jsonl";
+    if (!ggml::gemmini::log::truncate_file(first.c_str()) ||
+        !ggml::gemmini::log::truncate_file(second.c_str()) ||
+        !ggml::gemmini::log::cycle.set_output_path(first.c_str())) {
+        std::cerr << "could not initialize atomic cycle sink\n";
+        return false;
+    }
+
+    const gemmini_cycle_record c_record{"c-layer\n", "c-op\"", 1, 4, "c-file", 7, "c-func"};
+    gemmini_log_cycle_record(&c_record);
+    ggml::gemmini::log::cycle.write({"cpp-layer", "cpp-op", 4, 9, "cpp-file", 8, "cpp-func"});
+    ggml::gemmini::log::cycle.write_json(
+        "{\"schema\":\"gemmini.cycle\",\"version\":1,\"record_type\":\"TEST_AGGREGATE\"}");
+    gemmini_log_ws_cycle(100, 10, 20, 30, 40, 2, 3, 4, 1, 1, 1, 2, 3, 4, 0, 1);
+
+    StartGate gate(2);
+    std::atomic<bool> setup_ok{true};
+    std::thread writer([&] {
+        gate.arrive_and_wait();
+        for (uint64_t i = 0; i != 200; ++i) {
+            ggml::gemmini::log::cycle.write({"writer", "record", i, i + 1, nullptr, 0, nullptr});
+        }
+    });
+    std::thread setter([&] {
+        gate.arrive_and_wait();
+        for (int i = 0; i != 80; ++i) {
+            const std::filesystem::path & path = i % 2 == 0 ? second : first;
+            if (!ggml::gemmini::log::cycle.set_output_path(path.c_str())) setup_ok = false;
+        }
+    });
+    writer.join();
+    setter.join();
+    ggml::gemmini::log::cycle.set_output(stderr);
+
+    size_t first_lines = 0;
+    size_t second_lines = 0;
+    if (!setup_ok || !every_line_is_json(first, &first_lines) ||
+        !every_line_is_json(second, &second_lines) || first_lines + second_lines != 204) {
+        std::cerr << "atomic writer/replacement lost or split a structured record: "
+                  << first_lines << '+' << second_lines << " lines\n";
+        return false;
+    }
+    const std::string combined = read_file(first) + read_file(second);
+    if (combined.find("\"layer\":\"c-layer\\n\"") == std::string::npos ||
+        combined.find("\"name\":\"c-op\\\"\"") == std::string::npos ||
+        combined.find("\"delta\":3") == std::string::npos ||
+        combined.find("\"layer\":\"cpp-layer\"") == std::string::npos ||
+        combined.find("\"record_type\":\"TEST_AGGREGATE\"") == std::string::npos ||
+        combined.find("\"record_type\":\"CYCLE_INTERVAL\"") == std::string::npos ||
+        combined.find("\"record_type\":\"WS_LOOP_TELEMETRY\"") == std::string::npos) {
+        std::cerr << "structured C/C++ cycle fields were not preserved\n";
+        return false;
+    }
+    return true;
+#endif
+}
+
+struct TargetLockProbe {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool writer_entered = false;
+    bool release_writer = false;
+    bool replacement_attempting = false;
+    bool replacement_completed = false;
+};
+
+static void target_lock_hook(ggml::gemmini::log::testing::TargetWriteKind, void * user_data) {
+    auto & probe = *static_cast<TargetLockProbe *>(user_data);
+    std::unique_lock<std::mutex> lock(probe.mutex);
+    probe.writer_entered = true;
+    probe.changed.notify_all();
+    probe.changed.wait(lock, [&] { return probe.release_writer; });
+}
+
+static bool test_target_lock_blocks_replacement(const std::filesystem::path & root,
+                                                ggml::gemmini::log::testing::TargetWriteKind kind) {
+#if !EXPECT_LOG_DEBUG
+    (void) root;
+    (void) kind;
+    return true;
+#else
+    using ggml::gemmini::log::testing::TargetWriteKind;
+    const auto persistent = root / "lock-persistent.jsonl";
+    const auto targeted = root / "lock-targeted.jsonl";
+    const auto replacement = root / "lock-replacement.jsonl";
+    if (!gemmini_log_debug_set_output_path(persistent.c_str())) return false;
+    TargetLockProbe probe;
+    ggml::gemmini::log::testing::set_target_lock_hook(target_lock_hook, &probe);
+    std::thread writer([&] {
+        if (kind == TargetWriteKind::plain) {
+            gemmini_log_debug_to(gemmini_log_file(targeted.c_str()), "plain");
+        } else if (kind == TargetWriteKind::layer) {
+            gemmini_log_debug_to_layer(gemmini_log_file(targeted.c_str()), "layer", "layered");
+        } else {
+            gemmini_log_debug_to_loc(gemmini_log_file(targeted.c_str()), "file", 1, "func", "located");
+        }
+    });
+    {
+        std::unique_lock<std::mutex> lock(probe.mutex);
+        probe.changed.wait(lock, [&] { return probe.writer_entered; });
+    }
+    std::thread replacer([&] {
+        {
+            std::lock_guard<std::mutex> lock(probe.mutex);
+            probe.replacement_attempting = true;
+            probe.changed.notify_all();
+        }
+        (void) gemmini_log_debug_set_output_path(replacement.c_str());
+        {
+            std::lock_guard<std::mutex> lock(probe.mutex);
+            probe.replacement_completed = true;
+            probe.changed.notify_all();
+        }
+    });
+    bool replacement_bypassed_lock = false;
+    {
+        std::unique_lock<std::mutex> lock(probe.mutex);
+        probe.changed.wait(lock, [&] { return probe.replacement_attempting; });
+        replacement_bypassed_lock = probe.changed.wait_for(
+            lock, std::chrono::seconds(1), [&] { return probe.replacement_completed; });
+        probe.release_writer = true;
+        probe.changed.notify_all();
+    }
+    writer.join();
+    replacer.join();
+    ggml::gemmini::log::testing::clear_target_lock_hook();
+    gemmini_log_debug_set_output(stderr);
+    return !replacement_bypassed_lock;
+#endif
+}
+
+static bool test_atomic_debug_sink(const std::filesystem::path & root) {
+#if !EXPECT_LOG_DEBUG
+    (void) root;
+    return true;
+#else
+    const std::filesystem::path first = root / "debug-atomic-first.jsonl";
+    const std::filesystem::path second = root / "debug-atomic-second.jsonl";
+    const std::filesystem::path targeted = root / "debug-targeted.jsonl";
+    if (!ggml::gemmini::log::debug.set_output_path(first.c_str(), true)) {
+        std::cerr << "could not initialize atomic debug sink\n";
+        return false;
+    }
+
+    constexpr size_t writer_count = 4;
+    constexpr size_t records_per_writer = 400;
+    StartGate gate(writer_count + 1);
+    std::atomic<bool> setup_ok{true};
+    std::vector<std::thread> threads;
+    for (size_t writer = 0; writer != writer_count; ++writer) {
+        threads.emplace_back([&, writer] {
+            gate.arrive_and_wait();
+            for (size_t record = 0; record != records_per_writer; ++record) {
+                gemmini_log_debug("writer=%zu record=%zu", writer, record);
+                gemmini_log_debug_to(gemmini_log_file(targeted.c_str()),
+                                     "target-writer=%zu record=%zu", writer, record);
+            }
+        });
+    }
+    std::thread setter([&] {
+        gate.arrive_and_wait();
+        for (size_t replacement = 0; replacement != 120; ++replacement) {
+            const std::filesystem::path & path = replacement % 2 == 0 ? second : first;
+            if (!ggml::gemmini::log::debug.set_output_path(path.c_str(), true)) setup_ok = false;
+        }
+    });
+    for (std::thread & thread : threads) thread.join();
+    setter.join();
+    gemmini_log_debug("final-debug-record");
+    ggml::gemmini::log::debug.set_output(stderr);
+
+    size_t first_lines = 0;
+    size_t second_lines = 0;
+    size_t targeted_lines = 0;
+    const bool valid = every_line_is_json(first, &first_lines) &&
+        every_line_is_json(second, &second_lines) && every_line_is_json(targeted, &targeted_lines);
+    if (!setup_ok || !valid || first_lines + second_lines == 0 ||
+        targeted_lines != writer_count * records_per_writer) {
+        std::cerr << "atomic debug replacement produced stale or interleaved output\n";
+        return false;
+    }
+    return true;
+#endif
+}
+
+static bool test_setup_failures(const std::filesystem::path & root) {
+#if !EXPECT_LOG_CYCLE
+    (void)root;
+    return true;
+#else
+    const std::filesystem::path parent_file = root / "not-a-directory";
+    write_file(parent_file, "file\n");
+    const std::filesystem::path child = parent_file / "child.jsonl";
+    bool ok = true;
+    ggml::gemmini::log::cycle.set_output(stderr);
+    if (ggml::gemmini::log::cycle.set_output_path(child.c_str())) {
+        std::cerr << "invalid output parent setup succeeded\n";
+        ok = false;
+    }
+    ggml::gemmini::log::cycle.set_output(stderr);
+    if (ggml::gemmini::log::truncate_file(child.c_str())) {
+        std::cerr << "invalid truncate parent setup succeeded\n";
+        ok = false;
+    }
+    if (ggml::gemmini::log::cycle.set_output_path("../escaped-cycle.jsonl") ||
+        std::filesystem::exists(root.parent_path() / "escaped-cycle.jsonl")) {
+        std::cerr << "cycle setup accepted relative traversal\n";
+        ok = false;
+    }
+    ggml::gemmini::log::cycle.set_output(stderr);
+    return ok;
+#endif
+}
+
+static bool run_fault_probe(const std::string & name) {
+#if !EXPECT_LOG_CYCLE
+    (void)name;
+    return true;
+#else
+    const std::optional<std::filesystem::path> root = create_test_root();
+    if (!root) return false;
+    const std::filesystem::path first = *root / "fault-first.jsonl";
+    const std::filesystem::path second = *root / "fault-second.jsonl";
+    using ggml::gemmini::log::testing::LogFault;
+    ggml::gemmini::log::cycle.set_output(stderr);
+    bool ok = true;
+    if (name == "open") {
+        ggml::gemmini::log::testing::set_log_fault(LogFault::open);
+        ok = !ggml::gemmini::log::cycle.set_output_path(first.c_str());
+    } else {
+        ok = ggml::gemmini::log::cycle.set_output_path(first.c_str(), true);
+        if (name == "write") {
+            ggml::gemmini::log::testing::set_log_fault(LogFault::write);
+            gemmini_log_cycle("fault", "write", 1, 2);
+            gemmini_log_cycle("caller", "continues", 2, 3);
+        } else if (name == "flush") {
+            ggml::gemmini::log::testing::set_log_fault(LogFault::flush);
+            gemmini_log_cycle("fault", "flush", 1, 2);
+            gemmini_log_cycle("caller", "continues", 2, 3);
+        } else if (name == "replacement") {
+            ggml::gemmini::log::testing::set_log_fault(LogFault::replacement);
+            ok = ok && !ggml::gemmini::log::cycle.set_output_path(second.c_str());
+            gemmini_log_cycle("old-sink", "preserved", 1, 2);
+        } else if (name == "allocation") {
+            ggml::gemmini::log::testing::set_log_fault(LogFault::allocation);
+            {
+                ggml::gemmini::log::HardwareCounterLease lease;
+                gemmini_log_ws_cycle(100, 10, 20, 30, 40,
+                                     2, 3, 4, 1, 1, 1, 2, 3, 4, 0, 1);
+            }
+            {
+                ggml::gemmini::log::HardwareCounterLease lease;
+                gemmini_log_ws_cycle(101, 10, 20, 30, 40,
+                                     2, 3, 4, 1, 1, 1, 2, 3, 4, 0, 1);
+            }
+        } else {
+            ok = false;
+        }
+    }
+    ggml::gemmini::log::testing::clear_log_fault();
+    ggml::gemmini::log::cycle.set_output(stderr);
+    if (std::filesystem::exists(first) && !every_line_is_json(first)) ok = false;
+    const std::string first_output = read_file(first);
+    if ((name == "write" || name == "flush") && first_output.find("caller") != std::string::npos) {
+        std::cerr << "disabled sink accepted a later caller record\n";
+        ok = false;
+    }
+    if (name == "replacement" &&
+        (first_output.find("old-sink") == std::string::npos || std::filesystem::exists(second))) {
+        std::cerr << "failed replacement did not preserve the old sink\n";
+        ok = false;
+    }
+    if (name == "allocation" &&
+        (first_output.find("\"containing_interval_cycles\":100,") != std::string::npos ||
+         first_output.find("\"containing_interval_cycles\":101,") == std::string::npos)) {
+        std::cerr << "allocation failure escaped or poisoned subsequent lease/log use\n";
+        ok = false;
+    }
+    if (name == "open" && std::filesystem::exists(first)) {
+        std::cerr << "injected open failure created an output\n";
+        ok = false;
+    }
+    std::error_code error;
+    std::filesystem::remove_all(*root, error);
+    return ok && !error;
+#endif
+}
+
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--llama-callback") {
+        return test_llama_callback_replacement() ? 0 : 2;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--happy") {
+        const std::optional<std::filesystem::path> root = create_test_root();
+        if (!root) return 2;
+        const bool ok = test_atomic_cycle_sink(*root);
+        ggml::gemmini::log::cycle.set_output(stderr);
+        std::error_code error;
+        std::filesystem::remove_all(*root, error);
+        return ok && !error ? 0 : 2;
+    }
+    if (argc == 3 && std::string(argv[1]) == "--fault") {
+        return run_fault_probe(argv[2]) ? 0 : 2;
+    }
     if (argc == 2 && std::string(argv[1]) == "--explicit-debug-before-default") {
         return test_explicit_debug_before_default_setup() ? 0 : 2;
     }
@@ -263,7 +833,6 @@ int main(int argc, char ** argv) {
         }
         return std::nullopt;
     }();
-    const std::string sentinel = "sentinel\n";
     bool failed = false;
 
     if (!test_default_setup(test_root)) {
@@ -283,9 +852,9 @@ int main(int argc, char ** argv) {
                                absolute_path);
         failed |= !expect_path("ordinary relative path",
                                ggml::gemmini::log::resolve_output_path("ordinary/relative.jsonl"),
-                               "ordinary/relative.jsonl");
+                               test_root / "output/log/ordinary/relative.jsonl");
         failed |= !expect_path("short ordinary relative path",
-                               ggml::gemmini::log::resolve_output_path("l"), "l");
+                               ggml::gemmini::log::resolve_output_path("l"), test_root / "output/log/l");
         failed |= !expect_path("logical default path",
                                ggml::gemmini::log::resolve_output_path("log/nested/default.jsonl"),
                                test_root / "output/log/nested/default.jsonl");
@@ -321,6 +890,22 @@ int main(int argc, char ** argv) {
         failed |= !expect_path("override prefix stripping",
                                ggml::gemmini::log::resolve_output_path("log/nested/override.jsonl"),
                                override_root / "nested/override.jsonl");
+        failed |= !expect_path("override traversal rejection",
+                               ggml::gemmini::log::resolve_output_path("../escaped.jsonl"), {});
+        if (ggml::gemmini::log::truncate_file("../escaped.jsonl") ||
+            std::filesystem::exists(test_root / "escaped.jsonl")) {
+            std::cerr << "relative traversal escaped GEMMINI_LOG_DIR\n";
+            failed = true;
+        }
+        std::error_code symlink_error;
+        std::filesystem::create_directories(override_root, symlink_error);
+        const std::filesystem::path outside = test_root / "outside";
+        std::filesystem::create_directories(outside, symlink_error);
+        std::filesystem::create_directory_symlink(outside, override_root / "link", symlink_error);
+        if (!symlink_error && !ggml::gemmini::log::resolve_output_path("link/escaped.jsonl").empty()) {
+            std::cerr << "relative symlink escaped GEMMINI_LOG_DIR\n";
+            failed = true;
+        }
     }
     if (!environment_is_restored(original_cwd, original_env)) {
         std::cerr << "non-empty override case did not restore CWD/environment\n";
@@ -344,9 +929,11 @@ int main(int argc, char ** argv) {
         std::cerr << "parent creation case did not restore CWD/environment\n";
         failed = true;
     }
-    write_file(cycle_path, sentinel.c_str());
+    const std::string json_sentinel = "{\"sentinel\":1}\n";
+    write_file(cycle_path, json_sentinel.c_str());
+    ggml::gemmini::log::cycle.set_output(stderr);
     ggml::gemmini::log::cycle(ggml::gemmini::log::file(cycle_path.c_str()), "test", "append", 1, 2);
-    if (read_file(cycle_path).rfind(sentinel, 0) != 0) {
+    if (read_file(cycle_path).rfind(json_sentinel, 0) != 0 || !every_line_is_json(cycle_path)) {
         std::cerr << "cycle output truncated existing records\n";
         failed = true;
     }
@@ -363,6 +950,16 @@ int main(int argc, char ** argv) {
         failed = true;
     }
 #endif
+
+    using ggml::gemmini::log::testing::TargetWriteKind;
+    if (!test_hardware_counter_contract(test_root) ||
+        !test_atomic_cycle_sink(test_root) || !test_atomic_debug_sink(test_root) ||
+        !test_target_lock_blocks_replacement(test_root, TargetWriteKind::plain) ||
+        !test_target_lock_blocks_replacement(test_root, TargetWriteKind::layer) ||
+        !test_target_lock_blocks_replacement(test_root, TargetWriteKind::location) ||
+        !test_setup_failures(test_root)) {
+        failed = true;
+    }
 
     ggml::gemmini::log::debug.set_output(stderr);
     ggml::gemmini::log::cycle.set_output(stderr);

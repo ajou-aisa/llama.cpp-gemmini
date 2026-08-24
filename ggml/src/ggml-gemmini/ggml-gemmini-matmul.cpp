@@ -1,6 +1,4 @@
-#ifndef GGML_GEMMINI_PIPELINE_WRITER_TEST_ONLY
 #define GGML_GEMMINI_MATMUL_IMPLEMENTATION 1
-#endif
 #include "ggml-gemmini-matmul.hpp"
 
 #include <gemmini/log.hpp>
@@ -8,7 +6,6 @@
 
 #include <cstdio>
 #include <algorithm>
-#include <filesystem>
 #include <string>
 #include <sstream>
 #include <cstring>
@@ -32,6 +29,16 @@ void telemetry_json_string(std::ostringstream & out, std::string_view value) {
 }
 const char * telemetry_backend_name(RmdBackend backend) {
     return backend == RmdBackend::cpu_direct ? "cpu_direct" : "gemmini_ws_compact";
+}
+const char * telemetry_clock_source() {
+#ifdef __riscv
+    return "riscv_cycle";
+#else
+    return "host_tick";
+#endif
+}
+const char * telemetry_unit_name(std::string_view units) {
+    return units == "cycles" ? "cycle" : "tick";
 }
 const char * telemetry_source_name(MatmulOptionSource source) {
     switch (source) {
@@ -118,10 +125,22 @@ std::string rmd_input_hash(const rmd::StripePacket & packet) {
     return hash_canonical_residuals(std::move(events));
 }
 
-#ifndef GGML_GEMMINI_PIPELINE_WRITER_TEST_ONLY
-std::string rmd_correction_hash(const std::vector<rmd::OutputValue> & correction) {
+std::string rmd_correction_hash(const rmd::Correction & correction) {
     ProofHash64 hash;
-    for (const rmd::OutputValue value : correction) hash.u64(static_cast<uint64_t>(value));
+    if (const auto * integer = std::get_if<rmd::BlockScaledInt64Correction>(&correction)) {
+        hash.u8(0);
+        for (const rmd::OutputValue value : integer->values) {
+            hash.u64(static_cast<uint64_t>(value));
+        }
+    } else {
+        hash.u8(1);
+        for (const double value : std::get<rmd::PreScaledFloat64Correction>(correction).values) {
+            uint64_t bits = 0;
+            static_assert(sizeof(bits) == sizeof(value), "FP64 proof hash requires 64-bit double");
+            std::memcpy(&bits, &value, sizeof(bits));
+            hash.u64(bits);
+        }
+    }
     return hash.finish();
 }
 
@@ -143,7 +162,6 @@ std::string rmd_output_hash(const ggml_gemmini_args_t & args,
     }
     return hash.finish();
 }
-#endif
 
 std::string resolve_rmd_model_id(const char * environment_model_id,
                                  std::string_view model_arch) {
@@ -294,9 +312,10 @@ std::string serialize_rmd_telemetry(const RmdTelemetryRecord & record) {
         << ",\"runtime_bundle_id\":"; telemetry_json_string(out, record.runtime_bundle_id);
     out << ",\"model_id\":"; telemetry_json_string(out, record.model_id);
     out << ",\"run_id\":"; telemetry_json_string(out, record.run_id);
+    out << ",\"source\":"; telemetry_json_string(out, telemetry_clock_source());
+    out << ",\"unit\":"; telemetry_json_string(out, telemetry_unit_name(record.units));
     out << ",\"backend\":"; telemetry_json_string(out, telemetry_backend_name(record.backend));
-    out << ",\"source\":"; telemetry_json_string(out, telemetry_source_name(record.source));
-    out << ",\"units\":"; telemetry_json_string(out, record.units);
+    out << ",\"option_source\":"; telemetry_json_string(out, telemetry_source_name(record.source));
     out << ",\"work\":" << (record.work ? "true" : "false")
         << ",\"invocation_total\":" << record.invocation_total
         << ",\"dispatch\":{\"direct_events\":" << record.counters.direct_events
@@ -344,27 +363,6 @@ std::string serialize_rmd_telemetry(const RmdTelemetryRecord & record) {
 
 }
 
-namespace ggml::gemmini::detail {
-
-bool append_pipeline_stripe_summary_jsonl(const std::string & json_record) {
-    const std::filesystem::path path =
-        log::resolve_output_path(GEMMINI_LOG_DEFAULT_DEBUG_PATH);
-    if (!log::prepare_output_parent(path))
-        return false;
-    FILE * out = std::fopen(path.string().c_str(), "a");
-    if (out == nullptr) {
-        return false;
-    }
-    const bool wrote = std::fputs(json_record.c_str(), out) >= 0 &&
-        std::fputc('\n', out) != EOF;
-    const bool closed = std::fclose(out) == 0;
-    return wrote && closed;
-}
-
-}
-
-#ifndef GGML_GEMMINI_PIPELINE_WRITER_TEST_ONLY
-
 #include "quants/act/quantize.hpp"
 #include "quants/act/dispatch.hpp"
 #include "residual/rmd/rmd-builder.hpp"
@@ -378,7 +376,6 @@ bool append_pipeline_stripe_summary_jsonl(const std::string & json_record) {
 #include <atomic>
 #include <chrono>
 #include <cmath>
-#include <iomanip>
 #include <limits>
 #include <new>
 #include <sstream>
@@ -399,27 +396,28 @@ struct AtomicMatmulTestCounters {
     std::atomic<uint64_t> residual_dispatches{0};
     std::atomic<uint64_t> hardware_dispatches{0};
     std::atomic<uint64_t> fallback_dispatches{0};
+    std::atomic<bool> fail_output_stage_allocation{false};
 };
 
 AtomicMatmulTestCounters counters;
 
-void increment(std::atomic<uint64_t> & counter) {
+static void increment(std::atomic<uint64_t> & counter) {
     counter.fetch_add(1, std::memory_order_relaxed);
 }
 
-void observe_execution_construction() { increment(counters.execution_constructions); }
-void observe_allocation_attempt() { increment(counters.allocation_attempts); }
-void observe_dense_dispatch() { increment(counters.dense_dispatches); }
-void observe_residual_dispatch() { increment(counters.residual_dispatches); }
-void observe_backend_dispatch(bool fallback) {
+static void observe_execution_construction() { increment(counters.execution_constructions); }
+static void observe_allocation_attempt() { increment(counters.allocation_attempts); }
+static void observe_dense_dispatch() { increment(counters.dense_dispatches); }
+static void observe_residual_dispatch() { increment(counters.residual_dispatches); }
+static void observe_backend_dispatch(bool fallback) {
     increment(fallback ? counters.fallback_dispatches : counters.hardware_dispatches);
 }
 #else
-void observe_execution_construction() {}
-void observe_allocation_attempt() {}
-void observe_dense_dispatch() {}
-void observe_residual_dispatch() {}
-void observe_backend_dispatch(bool) {}
+static void observe_execution_construction() {}
+static void observe_allocation_attempt() {}
+static void observe_dense_dispatch() {}
+static void observe_residual_dispatch() {}
+static void observe_backend_dispatch(bool) {}
 #endif
 }
 
@@ -431,6 +429,11 @@ void test_reset_matmul_counters() {
     test_detail::counters.residual_dispatches.store(0, std::memory_order_relaxed);
     test_detail::counters.hardware_dispatches.store(0, std::memory_order_relaxed);
     test_detail::counters.fallback_dispatches.store(0, std::memory_order_relaxed);
+    test_detail::counters.fail_output_stage_allocation.store(false, std::memory_order_relaxed);
+}
+
+void test_inject_output_stage_allocation_failure() {
+    test_detail::counters.fail_output_stage_allocation.store(true, std::memory_order_relaxed);
 }
 
 MatmulTestCounters test_matmul_counters() {
@@ -473,6 +476,14 @@ bool supports_row_slice_activation(const ggml_gemmini_args_t & args) {
 bool uses_baseline_channel_route(const ggml_gemmini_args_t & args) {
     return args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_channel ||
         args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar;
+}
+
+GemminiGeometryResult resolve_geometry(ggml_gemmini_args_t & args) {
+    if (args.tile_I == 0 || args.tile_J == 0 || args.tile_K == 0) {
+        gemmini_set_tile_ws(&args);
+    }
+    return make_gemmini_geometry(
+        {{args.I, args.J, args.K}, {args.tile_I, args.tile_J, args.tile_K}, DIM});
 }
 
 bool valid_matmul_shape(const ggml_gemmini_args_t & args) {
@@ -663,7 +674,7 @@ MatmulStatus unsupported_backend(const char * message) {
 }
 
 bool residual_backend_available(RmdBackend backend) {
-#if defined(__riscv)
+#if defined(__riscv) || defined(GGML_GEMMINI_TESTING)
     (void) backend;
     return true;
 #else
@@ -675,6 +686,41 @@ residual::ResidualRoute residual_route_for(RmdBackend backend) {
     return backend == RmdBackend::cpu_direct
         ? residual::ResidualRoute::cpu_direct
         : residual::ResidualRoute::ws_packet;
+}
+
+MatmulStatus validate_exsia_residual_route(
+        const ggml_gemmini_args_t & args, const MatmulOptions & options) {
+    if (detail::normalize_route(args).activation != detail::ActivationRoute::exsia) {
+        return {};
+    }
+    using Format = ggml_gemmini_args_t::im2p_weight_format_t;
+    const auto format = args.weight_format;
+    if (format == Format::q8_h2 || format == Format::q8_hp2) {
+        return make_status(MatmulStatusCode::unsupported_route,
+                           "H2/HP2 ExSIA residual formats are unsupported",
+                           MatMulCapability::unsupported);
+    }
+    const bool h0 = format == Format::q4_h0 || format == Format::q8_h0 ||
+                    format == Format::q16_h0;
+    if (h0 && options.rmd_backend == RmdBackend::gemmini_ws_compact) {
+        return make_status(MatmulStatusCode::unsupported_route,
+                           "H0 ExSIA requires CPU-direct residual execution",
+                           MatMulCapability::unsupported);
+    }
+    const std::uint8_t weight_bits =
+        format == Format::q4_h0 || format == Format::q4_h1 ||
+                format == Format::q4_hp1
+            ? 4
+            : format == Format::q16_h0 || format == Format::q16_h1 ||
+                      format == Format::q16_hp1
+                  ? 16
+                  : 8;
+    if (args.A.valid() && args.A.bits != weight_bits) {
+        return make_status(MatmulStatusCode::unsupported_route,
+                           "ExSIA requires matched activation and weight widths",
+                           MatMulCapability::unsupported);
+    }
+    return {};
 }
 
 MatmulStatus from_rmd_status(rmd::RmdStatus status) {
@@ -698,7 +744,12 @@ MatmulStatus from_rmd_status(rmd::RmdStatus status) {
     return make_status(MatmulStatusCode::execution_failure, "rmd: unknown status");
 }
 
-using Clock = std::chrono::steady_clock;
+struct Clock {
+    using time_point = std::chrono::steady_clock::time_point;
+    static time_point now() {
+        return time_point(std::chrono::nanoseconds(cycle::timestamp_ns()));
+    }
+};
 
 void record_metric(MatmulStageMetrics & metric, bool enabled, Clock::time_point start) {
     if (!enabled) {
@@ -711,8 +762,7 @@ void record_metric(MatmulStageMetrics & metric, bool enabled, Clock::time_point 
 }
 
 uint64_t now_ns() {
-    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        Clock::now().time_since_epoch()).count());
+    return cycle::timestamp_ns();
 }
 
 }
@@ -751,7 +801,7 @@ constexpr std::array<WeightDescriptor, weight_route_count> weight_descriptors = 
     { true,  true,  false, true  },
     { true,  true,  true,  false },
     { true,  true,  true,  false },
-    { false, false, false, false },
+    { true,  true,  true,  false },
 }};
 
 constexpr auto make_route_descriptors() {
@@ -820,9 +870,15 @@ RouteKey normalize_route(const ggml_gemmini_args_t & args) {
         case Format::q8_0_unpacked_to_h1:
             key.weight = args.weight_i8_scale_active ? WeightRoute::tensor_i8 : WeightRoute::q8_h1;
             break;
-        case Format::q8_h0: key.weight = WeightRoute::q8_h0; break;
-        case Format::q8_h1: key.weight = WeightRoute::q8_h1; break;
-        case Format::q8_hp1: key.weight = WeightRoute::q8_hp1; break;
+        case Format::q4_h0:
+        case Format::q8_h0:
+        case Format::q16_h0: key.weight = WeightRoute::q8_h0; break;
+        case Format::q4_h1:
+        case Format::q8_h1:
+        case Format::q16_h1: key.weight = WeightRoute::q8_h1; break;
+        case Format::q4_hp1:
+        case Format::q8_hp1:
+        case Format::q16_hp1: key.weight = WeightRoute::q8_hp1; break;
         case Format::q8_h2: key.weight = WeightRoute::q8_h2; break;
         case Format::q8_hp2: key.weight = WeightRoute::q8_hp2; break;
         case Format::q8_channel: key.weight = WeightRoute::q8_channel_direct; break;
@@ -891,145 +947,26 @@ const char * backend_route_name(BackendRoute route) {
     return "unknown";
 }
 
-std::string pipeline_stripe_summary_json(const char * layer,
-                                         size_t I,
-                                         size_t J,
-                                         size_t K,
-                                         const char * backend_route,
-                                         const char * schedule,
-                                         const MatmulJobMetrics & profile) {
-    auto json_string = [](std::ostringstream & out, const char * value) {
-        out << '"';
-        for (const char * p = value != nullptr ? value : ""; *p != '\0'; ++p) {
-            switch (*p) {
-                case '\\': out << "\\\\"; break;
-                case '"': out << "\\\""; break;
-                case '\n': out << "\\n"; break;
-                case '\r': out << "\\r"; break;
-                case '\t': out << "\\t"; break;
-                default: out << *p; break;
-            }
-        }
-        out << '"';
-    };
-    auto append_u64_array = [](std::ostringstream & out, const auto & values) {
-        out << '[';
-        for (size_t i = 0; i < values.size(); ++i) {
-            if (i != 0) out << ',';
-            out << values[i];
-        }
-        out << ']';
-    };
-    auto duration_ns = [](uint64_t start_ns, uint64_t end_ns) {
-        return end_ns >= start_ns ? end_ns - start_ns : uint64_t{0};
-    };
-    auto ratio = [](uint64_t numerator, uint64_t denominator) {
-        return denominator == 0 ? 0.0 : static_cast<double>(numerator) / static_cast<double>(denominator);
-    };
-
-    uint64_t la_service_sum_ns = 0;
-    uint64_t la_window_start_ns = 0;
-    uint64_t la_window_end_ns = 0;
-    for (size_t worker = 0; worker < profile.la_worker_start_ns.size(); ++worker) {
-        la_service_sum_ns += duration_ns(profile.la_worker_start_ns[worker], profile.la_worker_end_ns[worker]);
-        if (profile.la_worker_start_ns[worker] != 0 &&
-            (la_window_start_ns == 0 || profile.la_worker_start_ns[worker] < la_window_start_ns)) {
-            la_window_start_ns = profile.la_worker_start_ns[worker];
-        }
-        la_window_end_ns = std::max(la_window_end_ns, profile.la_worker_end_ns[worker]);
-    }
-    const uint64_t t_la_ns = duration_ns(la_window_start_ns, la_window_end_ns);
-    const uint64_t t_sf_ns = profile.sf_mask_start_ns == 0 || profile.sf_commit_ns == 0 ?
-        0 : duration_ns(profile.sf_mask_start_ns, profile.sf_commit_ns);
-    const uint64_t t_merge_ns = profile.merge_start_ns == 0 || profile.merge_end_ns == 0 ?
-        0 : duration_ns(profile.merge_start_ns, profile.merge_end_ns);
-    const double la_efficiency = ratio(la_service_sum_ns, 3 * t_la_ns);
-    // A single NPU stream runs dense WS then RMD in the same worker, so the dense stage
-    // must always close before the residual stage opens.
-    const uint64_t ordering_violation =
-        profile.rmd_start_ns != 0 && profile.ws_end_ns > profile.rmd_start_ns ? 1 : 0;
-
-    std::ostringstream out;
-    out << std::setprecision(std::numeric_limits<double>::max_digits10);
-    out << "{\"record_type\":\"PIPELINE_STRIPE_SUMMARY\",\"layer\":";
-    json_string(out, layer);
-    out << ",\"run_id\":" << profile.run_id
-        << ",\"stripe_idx\":" << profile.stripe_id
-        << ",\"I\":" << I
-        << ",\"J\":" << J
-        << ",\"K\":" << K
-        << ",\"stripe_rows\":" << (profile.row_end - profile.row_begin)
-        << ",\"slot\":" << profile.slot
-        << ",\"backend_route\":";
-    json_string(out, backend_route);
-    out << ",\"schedule\":";
-    json_string(out, schedule);
-    out << ",\"la_workers\":3,\"sf_workers\":1,\"rmd_workers\":1"
-        << ",\"la_worker_body_start_ns\":";
-    append_u64_array(out, profile.la_worker_start_ns);
-    out << ",\"la_worker_body_end_ns\":";
-    append_u64_array(out, profile.la_worker_end_ns);
-    out << ",\"sf_mask_start_ns\":" << profile.sf_mask_start_ns
-        << ",\"sf_mask_end_ns\":" << profile.sf_mask_end_ns
-        << ",\"sf_exponent_start_ns\":" << profile.sf_exponent_start_ns
-        << ",\"sf_exponent_end_ns\":" << profile.sf_exponent_end_ns
-        << ",\"sf_folding_start_ns\":" << profile.sf_folding_start_ns
-        << ",\"sf_folding_end_ns\":" << profile.sf_folding_end_ns
-        << ",\"sf_commit_ns\":" << profile.sf_commit_ns
-        << ",\"producer_wait_start_ns\":" << profile.producer_wait_start_ns
-        << ",\"producer_wait_end_ns\":" << profile.producer_wait_end_ns
-        << ",\"matmul_enqueue_ns\":" << profile.capture_queue_enqueue_ns
-        << ",\"matmul_start_ns\":" << profile.ws_start_ns
-        << ",\"matmul_end_ns\":" << profile.ws_end_ns
-        << ",\"rmd_enqueue_ns\":" << profile.rmd_enqueue_ns
-        << ",\"rmd_start_ns\":" << profile.rmd_start_ns
-        << ",\"rmd_end_ns\":" << profile.rmd_end_ns
-        << ",\"merge_start_ns\":" << profile.merge_start_ns
-        << ",\"merge_end_ns\":" << profile.merge_end_ns
-        // Stage timings, separated per the RMD stripe contract.
-        << ",\"T_LA_ns\":" << t_la_ns
-        << ",\"T_SF_ns\":" << t_sf_ns
-        << ",\"T_RMD_PREP_ns\":"
-        << (profile.rmd_decompose.nanoseconds + profile.rmd_index.nanoseconds +
-            profile.rmd_pack.nanoseconds)
-        << ",\"T_WS_ns\":" << duration_ns(profile.ws_start_ns, profile.ws_end_ns)
-        << ",\"T_RMD_NPU_ns\":" << profile.rmd_execute.nanoseconds
-        << ",\"T_RMD_COMPOSE_ns\":" << profile.rmd_compose.nanoseconds
-        << ",\"T_FINALIZE_ns\":" << profile.rmd_finalize.nanoseconds
-        << ",\"T_Merge_ns\":" << t_merge_ns
-        << ",\"rmd_decompose_ns\":" << profile.rmd_decompose.nanoseconds
-        << ",\"rmd_index_ns\":" << profile.rmd_index.nanoseconds
-        << ",\"rmd_pack_ns\":" << profile.rmd_pack.nanoseconds
-        << ",\"rmd_queue_ns\":" << profile.rmd_queue.nanoseconds
-        << ",\"rmd_execute_ns\":" << profile.rmd_execute.nanoseconds
-        << ",\"rmd_output_read_ns\":" << profile.rmd_output_read.nanoseconds
-        << ",\"rmd_compose_ns\":" << profile.rmd_compose.nanoseconds
-        << ",\"rmd_finalize_ns\":" << profile.rmd_finalize.nanoseconds
-        << ",\"la_service_sum_ns\":" << la_service_sum_ns
-        << ",\"la_efficiency\":" << la_efficiency
-        << ",\"la_service_efficiency\":" << la_efficiency
-        << ",\"ordering_violation\":" << ordering_violation
-        << ",\"rmd\":{\"active_blocks\":" << profile.rmd.active_blocks
-        << ",\"active_lanes\":" << profile.rmd.active_lanes
-        << ",\"compact_k_count\":" << profile.rmd.compact_k_count
-        << ",\"padded_k_count\":" << profile.rmd.padded_k_count
-        << ",\"physical_tile_count\":" << profile.rmd.physical_tile_count
-        << ",\"matmul_call_count\":" << profile.rmd.matmul_call_count
-        << ",\"lane_group_count\":" << profile.rmd.lane_group_count
-        << ",\"baseline_stacked_i_tile_count\":" << profile.rmd.baseline_stacked_i_tile_count
-        << ",\"stacked_i_tile_count\":" << profile.rmd.stacked_i_tile_count
-        << ",\"packet_bytes\":" << profile.rmd.packet_bytes
-        << ",\"compressed_output_values\":" << profile.rmd.compressed_output_values
-        << ",\"block_padding_zeros\":" << profile.rmd.block_padding_zeros
-        << ",\"row_padding_zeros\":" << profile.rmd.row_padding_zeros
-        << ",\"j_padding_zeros\":" << profile.rmd.j_padding_zeros
-        << ",\"weight_values_gathered\":" << profile.rmd.weight_values_gathered
-        << ",\"weight_baseline_address_resolutions\":"
-        << profile.rmd.weight_baseline_address_resolutions
-        << ",\"weight_address_resolutions\":" << profile.rmd.weight_address_resolutions
-        << "}}";
-    return out.str();
-
+PipelineStripeTelemetry pipeline_stripe_telemetry(
+        const char * layer, const MatmulJobMetrics & profile) {
+    PipelineStripeTelemetry record{};
+    record.layer = layer != nullptr ? layer : "";
+    record.run_id = profile.run_id;
+    record.stripe_id = profile.stripe_id;
+    record.slot = profile.slot;
+    record.row_begin = profile.row_begin;
+    record.row_end = profile.row_end;
+    record.queue_start_ns = profile.capture_queue_enqueue_ns;
+    record.queue_end_ns = profile.ws_start_ns;
+    record.dense_start_ns = profile.ws_start_ns;
+    record.dense_end_ns = profile.ws_end_ns;
+    record.rmd_start_ns = profile.rmd_start_ns;
+    record.rmd_end_ns = profile.rmd_end_ns;
+    record.compose_start_ns = profile.compose_start_ns;
+    record.compose_end_ns = profile.compose_end_ns;
+    record.finalize_start_ns = profile.finalize_start_ns;
+    record.finalize_end_ns = profile.finalize_end_ns;
+    return record;
 }
 
 }
@@ -1043,10 +980,22 @@ MatMul::MatMul(MatMul && other) noexcept
       args_ptr_(other.args_ptr_ == &other.owned_args_ ? &owned_args_ : other.args_ptr_),
       first_row_(other.first_row_), last_row_begin_(other.last_row_begin_),
       last_row_end_(other.last_row_end_), covered_rows_(other.covered_rows_),
-      has_stripes_(other.has_stripes_), state_(other.state_) {}
+      has_stripes_(other.has_stripes_), state_(other.state_),
+      output_destination_(other.output_destination_),
+      output_row_stride_(other.output_row_stride_),
+      output_col_stride_(other.output_col_stride_),
+      output_stage_(std::move(other.output_stage_)) {
+    if (output_destination_ != nullptr && args_ptr_ != nullptr) {
+        args().f_out = output_stage_.data();
+    }
+    other.output_destination_ = nullptr;
+    other.output_row_stride_ = 0;
+    other.output_col_stride_ = 0;
+}
 
 MatMul & MatMul::operator=(MatMul && other) noexcept {
     if (this != &other) {
+        discard_output_transaction();
         owned_args_ = std::move(other.owned_args_);
         args_ptr_ = other.args_ptr_ == &other.owned_args_ ? &owned_args_ : other.args_ptr_;
         first_row_ = other.first_row_;
@@ -1055,14 +1004,98 @@ MatMul & MatMul::operator=(MatMul && other) noexcept {
         covered_rows_ = other.covered_rows_;
         has_stripes_ = other.has_stripes_;
         state_ = other.state_;
+        output_destination_ = other.output_destination_;
+        output_row_stride_ = other.output_row_stride_;
+        output_col_stride_ = other.output_col_stride_;
+        output_stage_ = std::move(other.output_stage_);
+        if (output_destination_ != nullptr && args_ptr_ != nullptr) {
+            args().f_out = output_stage_.data();
+        }
+        other.output_destination_ = nullptr;
+        other.output_row_stride_ = 0;
+        other.output_col_stride_ = 0;
     }
     return *this;
+}
+
+MatMul::~MatMul() {
+    discard_output_transaction();
 }
 
 ggml_gemmini_args_t & MatMul::args() { return *args_ptr_; }
 const ggml_gemmini_args_t & MatMul::args() const { return *args_ptr_; }
 
+MatMulStatus MatMul::begin_output_transaction() {
+    if (output_destination_ != nullptr || args_ptr_ == nullptr || args().f_out == nullptr ||
+        args().I == 0 || args().J == 0) {
+        return MatMulStatus::invalid_state;
+    }
+    const size_t row_stride = args().stride_f_out != 0 ? args().stride_f_out : args().J;
+    const size_t col_stride = args().col_stride_f_out != 0 ? args().col_stride_f_out : 1;
+    size_t row_offset = 0;
+    size_t column_offset = 0;
+    size_t final_offset = 0;
+    size_t output_span = 0;
+    if (__builtin_mul_overflow(args().I - 1, row_stride, &row_offset) ||
+        __builtin_mul_overflow(args().J - 1, col_stride, &column_offset) ||
+        __builtin_add_overflow(row_offset, column_offset, &final_offset) ||
+        __builtin_add_overflow(final_offset, size_t{1}, &output_span) ||
+        output_span > output_stage_.max_size()) {
+        return MatMulStatus::invalid_arguments;
+    }
+
+    std::vector<float> staged;
+    try {
+        test_detail::observe_allocation_attempt();
+#if defined(GGML_GEMMINI_TESTING)
+        if (test_detail::counters.fail_output_stage_allocation.exchange(
+                false, std::memory_order_relaxed)) {
+            throw std::bad_alloc();
+        }
+#endif
+        staged.assign(args().f_out, args().f_out + output_span);
+    } catch (const std::bad_alloc &) {
+        return MatMulStatus::invalid_arguments;
+    } catch (const std::length_error &) {
+        return MatMulStatus::invalid_arguments;
+    }
+    output_destination_ = args().f_out;
+    output_row_stride_ = row_stride;
+    output_col_stride_ = col_stride;
+    output_stage_ = std::move(staged);
+    args().f_out = output_stage_.data();
+    return MatMulStatus::success;
+}
+
+void MatMul::commit_output_transaction() {
+    if (output_destination_ == nullptr || args_ptr_ == nullptr) return;
+    for (size_t row = 0; row < args().I; ++row) {
+        for (size_t column = 0; column < args().J; ++column) {
+            const size_t offset = row * output_row_stride_ + column * output_col_stride_;
+            output_destination_[offset] = output_stage_[offset];
+        }
+    }
+    args().f_out = output_destination_;
+    output_destination_ = nullptr;
+    output_row_stride_ = 0;
+    output_col_stride_ = 0;
+    output_stage_.clear();
+}
+
+void MatMul::discard_output_transaction() {
+    if (output_destination_ == nullptr) return;
+    if (args_ptr_ != nullptr) args().f_out = output_destination_;
+    output_destination_ = nullptr;
+    output_row_stride_ = 0;
+    output_col_stride_ = 0;
+    output_stage_.clear();
+}
+
 MatMulResult MatMul::run_dense() {
+    return run_dense(false);
+}
+
+MatMulResult MatMul::run_dense(bool transactional) {
     if (state_ != MatMulState::idle) {
         return { MatMulStatus::invalid_state, MatMulCapability::supported };
     }
@@ -1077,10 +1110,17 @@ MatMulResult MatMul::run_dense() {
     }
     const auto format = args().weight_format;
     const bool metadata_weight =
+        format == ggml_gemmini_args_t::im2p_weight_format_t::q4_h0 ||
+        format == ggml_gemmini_args_t::im2p_weight_format_t::q4_h1 ||
+        format == ggml_gemmini_args_t::im2p_weight_format_t::q4_hp1 ||
+        format == ggml_gemmini_args_t::im2p_weight_format_t::q8_h0 ||
         format == ggml_gemmini_args_t::im2p_weight_format_t::q8_h1 ||
         format == ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1 ||
         format == ggml_gemmini_args_t::im2p_weight_format_t::q8_h2 ||
-        format == ggml_gemmini_args_t::im2p_weight_format_t::q8_hp2;
+        format == ggml_gemmini_args_t::im2p_weight_format_t::q8_hp2 ||
+        format == ggml_gemmini_args_t::im2p_weight_format_t::q16_h0 ||
+        format == ggml_gemmini_args_t::im2p_weight_format_t::q16_h1 ||
+        format == ggml_gemmini_args_t::im2p_weight_format_t::q16_hp1;
     if (args().B == nullptr && args().B_fp32 == nullptr && !metadata_weight) {
         return { MatMulStatus::invalid_contract, MatMulCapability::unsupported };
     }
@@ -1092,6 +1132,16 @@ MatMulResult MatMul::run_dense() {
             break;
         case ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar:
             if (!args().has_q8_channel_dense_sidecar_contract()) {
+                return { MatMulStatus::invalid_contract, MatMulCapability::unsupported };
+            }
+            break;
+        case ggml_gemmini_args_t::im2p_weight_format_t::q4_h0:
+        case ggml_gemmini_args_t::im2p_weight_format_t::q4_h1:
+        case ggml_gemmini_args_t::im2p_weight_format_t::q4_hp1:
+        case ggml_gemmini_args_t::im2p_weight_format_t::q16_h0:
+        case ggml_gemmini_args_t::im2p_weight_format_t::q16_h1:
+        case ggml_gemmini_args_t::im2p_weight_format_t::q16_hp1:
+            if (!args().has_native_matched_width_contract()) {
                 return { MatMulStatus::invalid_contract, MatMulCapability::unsupported };
             }
             break;
@@ -1119,41 +1169,29 @@ MatMulResult MatMul::run_dense() {
             break;
     }
 
+    if (transactional) {
+        const MatMulStatus transaction = begin_output_transaction();
+        if (transaction != MatMulStatus::success) {
+            return {transaction, MatMulCapability::unsupported};
+        }
+    }
     execute_dense(args());
     return { MatMulStatus::success, MatMulCapability::supported };
 }
 
 MatMulResult MatMul::run_full() {
-    const MatMulResult dense = run_dense();
+    const MatMulResult dense = run_dense(true);
     if (dense.status != MatMulStatus::success) {
+        discard_output_transaction();
         return dense;
     }
 #if GGML_GEMMINI_ENABLE_RMD
-    const size_t row_stride = args().stride_f_out != 0 ? args().stride_f_out : args().J;
-    const size_t col_stride = args().col_stride_f_out != 0 ? args().col_stride_f_out : 1;
-    size_t last_row_offset = 0;
-    size_t last_col_offset = 0;
-    size_t output_span = 0;
-    if (__builtin_mul_overflow(args().I - 1, row_stride, &last_row_offset) ||
-        __builtin_mul_overflow(args().J - 1, col_stride, &last_col_offset) ||
-        __builtin_add_overflow(last_row_offset, last_col_offset, &output_span) ||
-        __builtin_add_overflow(output_span, size_t{1}, &output_span)) {
-        return { MatMulStatus::invalid_arguments, MatMulCapability::unsupported };
-    }
-    std::vector<float> staged_output;
-    try {
-        test_detail::observe_allocation_attempt();
-        staged_output.assign(args().f_out, args().f_out + output_span);
-    } catch (const std::bad_alloc &) {
-        return { MatMulStatus::invalid_arguments, MatMulCapability::unsupported };
-    }
-
     rmd::RmdStatus residual_status = rmd::RmdStatus::success;
     if (args().residual_route == residual::ResidualRoute::cpu_direct) {
         for (const auto & payload : quants::activation_direct_residuals(args())) {
             if (payload == nullptr) continue;
             size_t row_end = 0;
-            std::vector<rmd::OutputValue> correction;
+            rmd::Correction correction = rmd::BlockScaledInt64Correction{};
             residual_status = __builtin_add_overflow(
                 payload->row_begin, payload->row_count, &row_end)
                 ? rmd::RmdStatus::invalid_arguments
@@ -1163,8 +1201,8 @@ MatMulResult MatMul::run_full() {
                     return residual::execute_direct_stripe(args(), *payload, correction);
                 })();
             if (residual_status == rmd::RmdStatus::success) {
-                residual_status = rmd::merge_rmd_correction_to(
-                    args(), staged_output.data(), payload->row_begin, row_end, correction);
+                residual_status = rmd::merge_rmd_correction(
+                    args(), payload->row_begin, row_end, correction);
             }
             if (residual_status != rmd::RmdStatus::success) break;
         }
@@ -1172,7 +1210,7 @@ MatMulResult MatMul::run_full() {
         for (const auto & packet : quants::activation_rmd_packets(args())) {
             if (packet == nullptr) continue;
             rmd::CompressedOutput compressed;
-            std::vector<rmd::OutputValue> correction;
+            rmd::Correction correction = rmd::BlockScaledInt64Correction{};
             test_detail::observe_residual_dispatch();
             test_detail::observe_backend_dispatch(false);
             residual_status = rmd::execute_rmd_stripe_ws(args(), *packet, compressed);
@@ -1180,19 +1218,24 @@ MatMulResult MatMul::run_full() {
                 residual_status = rmd::compose_rmd_output(*packet, compressed, correction);
             }
             if (residual_status == rmd::RmdStatus::success) {
-                residual_status = rmd::merge_rmd_correction_to(
-                    args(), staged_output.data(), *packet, correction);
+                residual_status = rmd::merge_rmd_correction(
+                    args(), *packet, correction);
             }
             if (residual_status != rmd::RmdStatus::success) break;
         }
     }
     if (residual_status != rmd::RmdStatus::success) {
+        discard_output_transaction();
         return { residual_status == rmd::RmdStatus::unsupported_route
                      ? MatMulStatus::unsupported : MatMulStatus::invalid_arguments,
                  MatMulCapability::unsupported };
     }
-    std::copy(staged_output.begin(), staged_output.end(), args().f_out);
 #endif
+    if (!finite_output(args())) {
+        discard_output_transaction();
+        return {MatMulStatus::invalid_contract, MatMulCapability::unsupported};
+    }
+    commit_output_transaction();
     state_ = MatMulState::completed;
     return { MatMulStatus::success, MatMulCapability::supported };
 }
@@ -1212,6 +1255,10 @@ MatMulStatus MatMul::begin_stripes() {
     if (stripe_capability(args()) == MatMulCapability::unsupported) {
         return MatMulStatus::unsupported;
     }
+    const MatMulStatus transaction = begin_output_transaction();
+    if (transaction != MatMulStatus::success) {
+        return transaction;
+    }
     first_row_ = 0;
     last_row_begin_ = 0;
     last_row_end_ = 0;
@@ -1230,14 +1277,17 @@ MatMulStatus MatMul::run_stripe(MatMulStripe stripe, size_t stripe_id) {
         return MatMulStatus::invalid_state;
     }
     if (stripe.row_begin >= stripe.row_end || stripe.row_end > args().I) {
+        discard_output_transaction();
         return MatMulStatus::malformed_stripe;
     }
 
     if (has_stripes_) {
         if (last_row_begin_ == stripe.row_begin && last_row_end_ == stripe.row_end) {
+            discard_output_transaction();
             return MatMulStatus::duplicate_stripe;
         }
         if (stripe.row_begin < last_row_end_) {
+            discard_output_transaction();
             return MatMulStatus::overlapping_stripe;
         }
     }
@@ -1251,6 +1301,8 @@ MatMulStatus MatMul::run_stripe(MatMulStripe stripe, size_t stripe_id) {
         last_row_end_ = stripe.row_end;
         covered_rows_ += stripe.row_end - stripe.row_begin;
         has_stripes_ = true;
+    } else {
+        discard_output_transaction();
     }
     return status;
 }
@@ -1260,6 +1312,7 @@ MatMulStatus MatMul::run_staged_stripe(MatMulStripe stripe, size_t stripe_id) {
         return MatMulStatus::invalid_state;
     }
     if (stripe.row_begin >= stripe.row_end || stripe.row_end > args().I) {
+        discard_output_transaction();
         return MatMulStatus::malformed_stripe;
     }
     const MatMulStatus status = execute_stripe(args(), stripe, stripe_id, true);
@@ -1271,6 +1324,8 @@ MatMulStatus MatMul::run_staged_stripe(MatMulStripe stripe, size_t stripe_id) {
         last_row_end_ = stripe.row_end;
         covered_rows_ += stripe.row_end - stripe.row_begin;
         has_stripes_ = true;
+    } else {
+        discard_output_transaction();
     }
     return status;
 }
@@ -1280,13 +1335,21 @@ MatMulStatus MatMul::finish_stripes() {
         return MatMulStatus::invalid_state;
     }
     if (!has_stripes_) {
+        discard_output_transaction();
         state_ = MatMulState::idle;
         return MatMulStatus::empty_stripes;
     }
     if (first_row_ != 0 || last_row_end_ != args().I || covered_rows_ != args().I) {
+        discard_output_transaction();
         state_ = MatMulState::idle;
         return MatMulStatus::missing_stripes;
     }
+    if (!finite_output(args())) {
+        discard_output_transaction();
+        state_ = MatMulState::idle;
+        return MatMulStatus::invalid_contract;
+    }
+    commit_output_transaction();
     state_ = MatMulState::completed;
     return MatMulStatus::success;
 }
@@ -1345,6 +1408,16 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options
     : total_rows_(args.I), facade_(std::move(args)), options_(options) {
     test_detail::observe_execution_construction();
     state_ = MatmulExecutionState::prepared;
+    if (!resolve_geometry(facade_.args()).ok()) {
+        status_ = invalid_contract("invalid Gemmini geometry");
+        state_ = MatmulExecutionState::failed;
+        return;
+    }
+    status_ = validate_exsia_residual_route(facade_.args(), options_);
+    if (!status_.ok()) {
+        state_ = MatmulExecutionState::failed;
+        return;
+    }
     facade_.args().residual_route = residual_route_for(options_.rmd_backend);
     if (!residual_backend_available(options_.rmd_backend)) {
         status_ = unsupported_backend("RMD WS backend is unavailable on this host");
@@ -1411,6 +1484,16 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions optio
     state_ = MatmulExecutionState::prepared;
     if (args == nullptr) {
         status_ = make_status(MatmulStatusCode::invalid_argument, "null execution args");
+        state_ = MatmulExecutionState::failed;
+        return;
+    }
+    if (!resolve_geometry(facade_.args()).ok()) {
+        status_ = invalid_contract("invalid Gemmini geometry");
+        state_ = MatmulExecutionState::failed;
+        return;
+    }
+    status_ = validate_exsia_residual_route(facade_.args(), options_);
+    if (!status_.ok()) {
         state_ = MatmulExecutionState::failed;
         return;
     }
@@ -1636,6 +1719,7 @@ bool MatmulStripeCollector::start(MatmulExecution & execution) {
         }
         if (attached_execution != nullptr) {
             std::lock_guard<std::mutex> execution_lock(*attached_execution->state_mutex_);
+            attached_execution->facade_.discard_output_transaction();
             attached_execution->status_ = failure;
             attached_execution->state_ = MatmulExecutionState::failed;
             attached_execution->pipeline_attached_ = false;
@@ -1780,6 +1864,7 @@ MatmulStatus MatmulStripeCollector::finish() {
     if (execution != nullptr) {
         std::lock_guard<std::mutex> execution_lock(*execution->state_mutex_);
         if (!status) {
+            execution->facade_.discard_output_transaction();
             execution->status_ = status;
             execution->state_ = MatmulExecutionState::failed;
         }
@@ -2295,11 +2380,6 @@ MatmulStatus execute_full(MatmulExecution & execution) {
     }
     const MatMulResult result = execution.facade_.run_full();
     execution.status_ = to_public_status(result.status, result.capability, &execution.facade_.args());
-    if (execution.status_ && execution.options_.validation &&
-        !finite_output(execution.facade_.args())) {
-        execution.status_ = make_status(MatmulStatusCode::execution_failure,
-                                        "output validation failed");
-    }
     execution.state_ = execution.status_.ok() ? MatmulExecutionState::completed : MatmulExecutionState::failed;
     return execution.status_;
 }
@@ -2562,7 +2642,7 @@ MatmulStatus execute_rmd_stripe(MatmulStripeJob & job) {
     if (direct == nullptr && packet == nullptr) {
         std::lock_guard<std::mutex> lock(*job.job_mutex_);
         job.rmd_output_ = {};
-        job.rmd_correction_.clear();
+        job.rmd_correction_ = rmd::BlockScaledInt64Correction{};
         job.residual_state_ = MatmulResidualState::complete;
         job.lifecycle_condition_.notify_all();
         return {};
@@ -2575,7 +2655,7 @@ MatmulStatus execute_rmd_stripe(MatmulStripeJob & job) {
     constexpr uint64_t residual_start_tick = 0;
 #endif
     rmd::CompressedOutput output;
-    std::vector<rmd::OutputValue> direct_correction;
+    rmd::Correction direct_correction = rmd::BlockScaledInt64Correction{};
     rmd::RmdExecutionMetrics metrics{};
     residual::DirectExecutionMetrics direct_metrics{};
 #if LOG_CYCLE
@@ -2639,7 +2719,11 @@ MatmulStatus compose_rmd_stripe(MatmulStripeJob & job) {
     }
 
     const auto read_start = Clock::now();
-    std::vector<rmd::OutputValue> correction;
+    {
+        std::lock_guard<std::mutex> lock(*job.job_mutex_);
+        job.metrics_.compose_start_ns = now_ns();
+    }
+    rmd::Correction correction = rmd::BlockScaledInt64Correction{};
     const rmd::RmdStatus status = rmd::compose_rmd_output(*packet, job.rmd_output_, correction);
     if (status != rmd::RmdStatus::success) {
         const MatmulStatus failure = from_rmd_status(status);
@@ -2654,8 +2738,9 @@ MatmulStatus compose_rmd_stripe(MatmulStripeJob & job) {
         job.rmd_correction_ = std::move(correction);
         record_metric(job.metrics_.rmd_compose, job.execution_->options_.profiling, read_start);
         job.metrics_.rmd_output_read = job.metrics_.rmd_compose;
+        job.metrics_.compose_end_ns = now_ns();
         job.residual_state_ = MatmulResidualState::complete;
-        job.metrics_.rmd_end_ns = now_ns();
+        job.metrics_.rmd_end_ns = job.metrics_.compose_end_ns;
     }
     job.lifecycle_condition_.notify_all();
     return {};
@@ -2677,10 +2762,11 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
             return invalid_state("finalize requires dense and residual completion");
         }
         job.finalized_ = true;
+        job.metrics_.finalize_start_ns = now_ns();
         job.metrics_.stripe_id = job.input_.stripe_id();
         job.metrics_.row_begin = job.input_.row_begin();
         job.metrics_.row_end = job.input_.row_end();
-        if (!job.rmd_correction_.empty()) {
+        if (!rmd::correction_empty(job.rmd_correction_)) {
             job.metrics_.merge_start_ns = now_ns();
 #if LOG_CYCLE
             job.metrics_.telemetry_merge_start = cycle::read();
@@ -2697,9 +2783,13 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
             job.metrics_.telemetry_merge_end = cycle::read();
             job.metrics_.telemetry_residual_end = job.metrics_.telemetry_merge_end;
 #endif
-            job.metrics_.telemetry_correction_nonzero_count = static_cast<uint64_t>(std::count_if(
-                job.rmd_correction_.begin(), job.rmd_correction_.end(),
-                [](rmd::OutputValue value) { return value != 0; }));
+            job.metrics_.telemetry_correction_nonzero_count = std::visit(
+                [](const auto & typed) {
+                    return static_cast<uint64_t>(std::count_if(
+                        typed.values.begin(), typed.values.end(),
+                        [](const auto value) { return value != 0; }));
+                },
+                job.rmd_correction_);
 #if CYCLE_DETAIL
             job.metrics_.telemetry_input_hash = job.direct_residual_ != nullptr
                 ? rmd_input_hash(*job.direct_residual_) : rmd_input_hash(*job.rmd_packet_);
@@ -2718,6 +2808,7 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
         }
 #endif
         record_metric(job.metrics_.rmd_finalize, job.execution_->options_.profiling, start);
+        job.metrics_.finalize_end_ns = now_ns();
     }
     if (!merge_failure.ok()) {
         job.record_failure(merge_failure, false);
@@ -2735,6 +2826,7 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
 MatmulStatus finish_execution(MatmulExecution & execution) {
     std::lock_guard<std::mutex> state_lock(*execution.state_mutex_);
     if (!execution.status_.ok()) {
+        execution.facade_.discard_output_transaction();
         execution.state_ = MatmulExecutionState::failed;
         return execution.status_;
     }
@@ -2753,80 +2845,35 @@ MatmulStatus finish_execution(MatmulExecution & execution) {
         execution.last_row_end_ != execution.total_rows_ ||
         execution.captured_rows_ != execution.total_rows_ ||
         execution.finalized_rows_ != execution.total_rows_) {
-        execution.state_ = MatmulExecutionState::running;
+        execution.facade_.discard_output_transaction();
+        execution.state_ = MatmulExecutionState::failed;
         return invalid_contract("missing stripes");
     }
     MatMul * dense_facade = execution.staged_metadata_active_ && execution.staged_facade_ != nullptr ?
         execution.staged_facade_.get() : &execution.facade_;
     const MatMulStatus status = dense_facade->finish_stripes();
     execution.status_ = to_public_status(status, MatMulCapability::supported);
-    if (execution.status_ && execution.options_.validation &&
-        !finite_output(execution.facade_.args())) {
-        execution.status_ = make_status(MatmulStatusCode::execution_failure,
-                                        "output validation failed");
-    }
     execution.state_ = execution.status_.ok() ? MatmulExecutionState::completed : MatmulExecutionState::failed;
     return execution.status_;
 }
 
-static MatmulStatus matmul_impl(MatmulExecution execution, const ggml_gemmini_args_t & args,
-                                MatmulOptions options) {
+static MatmulStatus matmul_impl(MatmulExecution execution, MatmulOptions options) {
     if (!execution.status()) {
         return execution.status();
     }
     if (options.mode == MatmulInvocationMode::full) {
         return execute_full(execution);
     }
-    if (options.mode == MatmulInvocationMode::stripe_pipeline) {
-        return make_status(MatmulStatusCode::unsupported_invocation,
-                           "pipeline mode requires externally staged stripes");
-    }
-    if (options.stripe_rows == 0) {
-        return make_status(MatmulStatusCode::invalid_argument, "stripe rows must be nonzero");
-    }
-
-    const detail::RouteKey route = detail::normalize_route(args);
-    if (route.activation == detail::ActivationRoute::fp32 &&
-        route.weight == detail::WeightRoute::fp32) {
-        MatMul facade(args);
-        const MatMulStatus begin_status = facade.begin_stripes();
-        if (begin_status != MatMulStatus::success) {
-            return to_public_status(begin_status, MatMulCapability::supported, &args);
-        }
-        for (size_t row_begin = 0; row_begin < args.I;) {
-            const size_t row_end = row_begin + std::min(options.stripe_rows, args.I - row_begin);
-            const MatMulStatus status = facade.run_stripe({ row_begin, row_end });
-            if (status != MatMulStatus::success) {
-                return to_public_status(status, MatMulCapability::supported, &args);
-            }
-            row_begin = row_end;
-        }
-        return to_public_status(facade.finish_stripes(), MatMulCapability::supported, &args);
-    }
-
-    for (size_t row_begin = 0; row_begin < args.I;) {
-        const size_t remaining = args.I - row_begin;
-        const size_t row_end = row_begin + std::min(options.stripe_rows, remaining);
-        MatmulStripeJob job = capture_stripe(execution, MatmulStripeInput(row_begin, row_end));
-        MatmulStatus status = job.status();
-        if (status) status = execute_dense_stripe(job);
-        if (status) status = execute_rmd_stripe(job);
-        if (status) status = compose_rmd_stripe(job);
-        if (status) status = finalize_stripe(job);
-        if (!status) {
-            return status;
-        }
-        row_begin = row_end;
-    }
-    return finish_execution(execution);
+    return make_status(MatmulStatusCode::unsupported_invocation,
+                       "pipeline mode requires externally staged stripes");
 }
 
 MatmulStatus matmul(ggml_gemmini_args_t & args, MatmulOptions options) {
-    return matmul_impl(prepare_execution(&args, options), args, options);
+    return matmul_impl(prepare_execution(&args, options), options);
 }
 
 MatmulStatus matmul(const ggml_gemmini_args_t & args, MatmulOptions options) {
-    return matmul_impl(prepare_execution(args, options), args, options);
+    return matmul_impl(prepare_execution(args, options), options);
 }
 
 MatmulStatus execute_post_fold_pipeline(
@@ -2861,5 +2908,3 @@ MatmulStatus execute_post_fold_pipeline(
 }
 
 }
-
-#endif

@@ -7,8 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -23,7 +22,6 @@ bool expect(bool condition, const char * message) {
     return condition;
 }
 
-#ifndef GGML_GEMMINI_PIPELINE_WRITER_TEST_ONLY
 ggml_gemmini_args_t make_args(
         std::vector<elem_t> & activation,
         std::vector<elem_t> & weights,
@@ -86,6 +84,29 @@ bool test_removed_sequential_rejects_before_work() {
                "removed sequential mode preserves nonzero output sentinel") &&
         expect(counters_zero(environment_counters),
                "removed sequential mode performs zero construction/allocation/dispatch");
+}
+
+bool test_invalid_geometry_rejects_before_allocation() {
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> output(6, 79.0f);
+    auto args = make_args(activation, weights, output);
+    args.I = std::numeric_limits<size_t>::max();
+    args.J = std::numeric_limits<size_t>::max();
+    args.K = std::numeric_limits<size_t>::max();
+    args.tile_I = 1;
+    args.tile_J = 1;
+    args.tile_K = 1;
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_pipeline;
+
+    test_reset_matmul_counters();
+    const auto execution = prepare_execution(&args, options);
+    const auto counters = test_matmul_counters();
+    return expect(execution.status().code == MatmulStatusCode::invalid_contract,
+                  "overflowing geometry has typed invalid-contract status") &&
+        expect(counters.execution_constructions == 1 && counters.allocation_attempts == 0,
+               "invalid geometry is rejected before allocation");
 }
 
 bool test_output_parity() {
@@ -282,44 +303,260 @@ bool test_cpu_direct_lifecycle_parity() {
                "backend selector preserves the main matmul route");
 }
 
-bool test_merge_destination_override() {
+bool test_correction_domain_composition() {
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
     std::vector<float> original = { 5, 5, 11, 9, 17, 13 };
-    std::vector<float> destination = original;
     auto args = make_args(activation, weights, original);
-    const std::vector<rmd::OutputValue> correction = { 256, -256 };
-    const rmd::RmdStatus status = rmd::merge_rmd_correction_to(
-        args, destination.data(), 0, 1, correction);
-    return expect(status == rmd::RmdStatus::success,
-                  "destination-override merge succeeds without copying args") &&
-        expect(original == std::vector<float>({ 5, 5, 11, 9, 17, 13 }),
-               "destination-override merge leaves args.f_out unchanged") &&
-        expect(!same_output(destination, original),
-               "destination-override merge updates only the staged destination");
+    args.I = 1;
+    args.K = rmd::kBlockSize;
+
+    block_q8_h1 h1[2]{};
+    for (block_q8_h1 & block : h1) {
+        block.c_b = 1;
+        block.s_rf = 0.25f;
+    }
+    args.weight_i8_scale_active = false;
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1;
+    args.q8_h1_blocks = h1;
+    args.q8_h1_block_count = 2;
+    args.q8_h1_rows = 2;
+    args.blocks_per_row = 1;
+    args.native_weight_bytes = sizeof(h1);
+
+    std::vector<float> full_destination = { 1.0f, 1.0f };
+    const rmd::Correction h1_correction =
+        rmd::BlockScaledInt64Correction{{8, -8}};
+    bool ok = expect(
+        rmd::merge_rmd_correction_to(
+            args, full_destination.data(), 0, 1, h1_correction) ==
+            rmd::RmdStatus::success &&
+            full_destination == std::vector<float>({3.0f, -1.0f}),
+        "FULL H1 correction applies column scale exactly once");
+
+    std::vector<float> saturated = { 0.0f, 0.0f };
+    const rmd::Correction wide = rmd::BlockScaledInt64Correction{{
+        std::numeric_limits<int64_t>::max(), std::numeric_limits<int64_t>::min(),
+    }};
+    ok = expect(
+        rmd::merge_rmd_correction_to(args, saturated.data(), 0, 1, wide) ==
+                rmd::RmdStatus::success &&
+            saturated[0] == static_cast<float>(std::numeric_limits<int32_t>::max()) * 0.25f &&
+            saturated[1] == static_cast<float>(std::numeric_limits<int32_t>::min()) * 0.25f,
+        "signed-32 saturation occurs after complete integer composition") && ok;
+
+    block_q8_0 h0[2]{};
+    h0[0].d = ggml_fp32_to_fp16(0.5f);
+    h0[1].d = ggml_fp32_to_fp16(4.0f);
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h0;
+    args.B_blocks = h0;
+    args.blocks_J = 2;
+    args.blocks_K = 1;
+    args.native_weight_bytes = sizeof(h0);
+    std::vector<float> stripe_destination = { 1.0f, 1.0f };
+    const rmd::Correction h0_correction =
+        rmd::PreScaledFloat64Correction{{2.5, -4.0}};
+    ok = expect(
+        rmd::merge_rmd_correction_to(
+            args, stripe_destination.data(), 0, 1, h0_correction) ==
+                rmd::RmdStatus::success &&
+            stripe_destination == std::vector<float>({3.5f, -3.0f}),
+        "STRIPE H0 applies pre-scaled values directly without column scale") && ok;
+
+    auto remains_unchanged = [&](const rmd::Correction & correction,
+                                 rmd::RmdStatus expected,
+                                 const char * message) {
+        std::vector<float> destination = { 17.0f, -23.0f };
+        const std::vector<float> before = destination;
+        return expect(rmd::merge_rmd_correction_to(
+                          args, destination.data(), 0, 1, correction) == expected &&
+                          same_output(destination, before),
+                      message);
+    };
+    ok = remains_unchanged(h1_correction, rmd::RmdStatus::unsupported_route,
+                           "wrong integer domain for H0 is failure-atomic") && ok;
+    ok = remains_unchanged(
+             rmd::PreScaledFloat64Correction{{
+                 std::numeric_limits<double>::quiet_NaN(), 1.0,
+             }},
+             rmd::RmdStatus::overflow,
+             "NaN H0 correction is failure-atomic") && ok;
+
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h1;
+    args.q8_h1_blocks = h1;
+    args.native_weight_bytes = sizeof(h1);
+    ok = remains_unchanged(h0_correction, rmd::RmdStatus::unsupported_route,
+                           "wrong floating domain for H1 is failure-atomic") && ok;
+    rmd::RmdStripeBuilder builder;
+    builder.reset(9, 0, 1, rmd::kBlockSize, 2);
+    builder.add_residual(0, 0, 257);
+    const rmd::StripePacketHandle packet = builder.finish();
+    rmd::CompressedOutput compressed;
+    compressed.j_padded = packet->j_padded;
+    compressed.values.assign(packet->total_output_values,
+                             std::numeric_limits<int64_t>::max());
+    rmd::Correction compose_sentinel =
+        rmd::PreScaledFloat64Correction{{7.25, -3.5}};
+    const auto * compose_before =
+        std::get_if<rmd::PreScaledFloat64Correction>(&compose_sentinel);
+    const double * const compose_data = compose_before->values.data();
+    ok = expect(
+        rmd::compose_rmd_output(*packet, compressed, compose_sentinel) ==
+                rmd::RmdStatus::overflow &&
+            std::get_if<rmd::PreScaledFloat64Correction>(&compose_sentinel) != nullptr &&
+            std::get<rmd::PreScaledFloat64Correction>(compose_sentinel).values ==
+                std::vector<double>({7.25, -3.5}) &&
+            std::get<rmd::PreScaledFloat64Correction>(compose_sentinel).values.data() ==
+                compose_data,
+        "checked radix add overflow leaves correction variant byte-identical") && ok;
+
+    std::vector<float> compact_destination = { 31.0f, -41.0f };
+    const std::vector<float> compact_before = compact_destination;
+    ok = expect(
+        rmd::merge_rmd_correction_to(
+            args, compact_destination.data(), *packet, h0_correction) ==
+                rmd::RmdStatus::unsupported_route &&
+            same_output(compact_destination, compact_before),
+        "H0 pre-scaled correction never enters compact composition") && ok;
+    return ok;
 }
 
 bool test_cpu_direct_failure_commits_no_partial_correction() {
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
-    std::vector<float> dense(6, 0.0f);
+    auto install_failure = [](ggml_gemmini_args_t & args) {
+        auto & meta = std::get<quants::act::exsia::Meta>(args.act_quant.storage());
+        meta.direct_residuals = {
+            make_direct_payload(0, 0, 1, 256),
+            make_direct_payload(3, 3, 1, -128),
+        };
+    };
+
+    std::vector<float> direct_output(6, 91.0f);
+    const std::vector<float> direct_sentinel = direct_output;
+    auto direct_args = make_args(activation, weights, direct_output);
+    direct_args.residual_route = residual::ResidualRoute::cpu_direct;
+    install_failure(direct_args);
+    MatMul facade(&direct_args);
+    const MatMulResult direct = facade.run_full();
+
+    std::vector<float> execution_output(6, 93.0f);
+    const std::vector<float> execution_sentinel = execution_output;
+    auto execution_args = make_args(activation, weights, execution_output);
+    install_failure(execution_args);
     MatmulOptions options{};
     options.mode = MatmulInvocationMode::full;
     options.rmd_backend = RmdBackend::cpu_direct;
-    auto dense_args = make_args(activation, weights, dense);
-    if (!expect(matmul(dense_args, options).ok(), "dense control succeeds")) return false;
+    const MatmulStatus execution = matmul(execution_args, options);
+    return expect(direct.status != MatMulStatus::success && !execution.ok(),
+                  "direct MatMul and MatmulExecution merge failures propagate") &&
+        expect(same_output(direct_output, direct_sentinel) &&
+                   same_output(execution_output, execution_sentinel) &&
+                   direct_args.f_out == direct_output.data() &&
+                   execution_args.f_out == execution_output.data(),
+               "FULL failures restore destination ownership byte-identically");
+}
 
-    std::vector<float> output(6, 91.0f);
+bool test_stripe_residual_failure_is_transaction_atomic() {
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> output(6, 83.0f);
+    const std::vector<float> sentinel = output;
     auto args = make_args(activation, weights, output);
-    auto & meta = std::get<quants::act::exsia::Meta>(args.act_quant.storage());
-    meta.direct_residuals = {
-        make_direct_payload(0, 0, 1, 256),
-        make_direct_payload(3, 3, 1, -128),
-    };
-    const MatmulStatus status = matmul(args, options);
-    return expect(!status.ok(), "direct merge failure propagates") &&
-        expect(same_output(output, dense),
-               "direct failure commits dense output but no partial correction");
+
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_pipeline;
+    options.job_capacity = 1;
+    options.rmd_backend = RmdBackend::cpu_direct;
+    auto execution = prepare_execution(&args, options);
+    MatmulStripeCollector collector(1);
+    collector.test_inject_residual_failure({
+        MatmulStatusCode::execution_failure,
+        "injected exact-event residual failure",
+    });
+    if (!expect(execution.status().ok() && collector.start(execution),
+                "atomic STRIPE probe starts")) {
+        return false;
+    }
+
+    quants::act::exsia::StripeReadyEvent event{};
+    event.stripe_id = 0;
+    event.row_end = 1;
+    event.direct_residual = make_direct_payload(0, 0, 1, 256);
+    const auto * sink = collector.sink();
+    const bool accepted = sink->on_ready(sink->user_data, event);
+    collector.test_wait_for_residual_failure();
+    const MatmulStatus collected = collector.finish();
+    const MatmulStatus finished = finish_execution(execution);
+    return expect(accepted, "atomic STRIPE probe accepts one partial-row stripe") &&
+        expect(collected.code == MatmulStatusCode::execution_failure &&
+                   finished.code == MatmulStatusCode::execution_failure,
+               "exact-event STRIPE residual failure propagates") &&
+        expect(same_output(output, sentinel) && args.f_out == output.data(),
+               "STRIPE failure restores destination ownership byte-identically");
+}
+
+bool test_output_transaction_strides_overflow_and_cancel() {
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> strided(12, 67.0f);
+    auto args = make_args(activation, weights, strided);
+    args.stride_f_out = 4;
+    MatmulOptions full{};
+    full.mode = MatmulInvocationMode::full;
+    full.rmd_backend = RmdBackend::cpu_direct;
+    const MatmulStatus full_status = matmul(args, full);
+    bool ok = expect(full_status.ok() && args.f_out == strided.data(),
+                     "strided FULL output transaction commits and restores ownership");
+    ok = expect(strided[2] == 67.0f && strided[3] == 67.0f &&
+                    strided[6] == 67.0f && strided[7] == 67.0f &&
+                    strided[10] == 67.0f && strided[11] == 67.0f,
+                "transaction commits logical strided elements only") && ok;
+
+    std::vector<float> overflow_output(6, 71.0f);
+    const std::vector<float> overflow_sentinel = overflow_output;
+    auto overflow_args = make_args(activation, weights, overflow_output);
+    overflow_args.stride_f_out = std::numeric_limits<size_t>::max();
+    const MatmulStatus overflow = matmul(overflow_args, full);
+    ok = expect(!overflow.ok() && same_output(overflow_output, overflow_sentinel),
+                "output transaction layout overflow rejects before dense mutation") && ok;
+
+    std::vector<float> allocation_output(6, 73.0f);
+    const std::vector<float> allocation_sentinel = allocation_output;
+    auto allocation_args = make_args(activation, weights, allocation_output);
+    test_reset_matmul_counters();
+    test_inject_output_stage_allocation_failure();
+    const MatmulStatus allocation = matmul(allocation_args, full);
+    const MatmulTestCounters allocation_counters = test_matmul_counters();
+    ok = expect(!allocation.ok() &&
+                    same_output(allocation_output, allocation_sentinel) &&
+                    allocation_counters.allocation_attempts == 1 &&
+                    allocation_counters.dense_dispatches == 0,
+                "output stage allocation failure rejects before dense dispatch") && ok;
+
+    std::vector<float> cancel_output(6, 79.0f);
+    const std::vector<float> cancel_sentinel = cancel_output;
+    auto cancel_args = make_args(activation, weights, cancel_output);
+    MatmulOptions stripe{};
+    stripe.mode = MatmulInvocationMode::stripe_pipeline;
+    stripe.job_capacity = 1;
+    stripe.rmd_backend = RmdBackend::cpu_direct;
+    auto execution = prepare_execution(&cancel_args, stripe);
+    MatmulStripeCollector collector(1);
+    if (!expect(execution.status().ok() && collector.start(execution),
+                "transaction cancellation probe starts")) {
+        return false;
+    }
+    const MatmulStatus cancelled = collector.cancel();
+    const MatmulStatus collected = collector.finish();
+    const MatmulStatus finished = finish_execution(execution);
+    return expect(cancelled.code == MatmulStatusCode::cancelled &&
+                      collected.code == MatmulStatusCode::cancelled &&
+                      finished.code == MatmulStatusCode::cancelled,
+                  "transaction cancellation propagates") &&
+        expect(same_output(cancel_output, cancel_sentinel) &&
+                   cancel_args.f_out == cancel_output.data(),
+               "cancelled transaction restores destination ownership byte-identically") && ok;
 }
 
 bool test_ws_preflight_is_atomic_on_host() {
@@ -335,11 +572,26 @@ bool test_ws_preflight_is_atomic_on_host() {
     MatmulOptions options{};
     options.mode = MatmulInvocationMode::full;
     options.rmd_backend = RmdBackend::gemmini_ws_compact;
+    test_reset_matmul_counters();
     const MatmulStatus status = matmul(args, options);
+    const MatmulTestCounters counters = test_matmul_counters();
+#if defined(GGML_GEMMINI_TESTING)
+    (void) counters;
+    return expect(status.ok(),
+                  "testing host allows the software compact lifecycle") &&
+        expect(std::all_of(output.begin(), output.end(),
+                           [](float value) { return std::isfinite(value); }),
+               "testing compact output remains finite") &&
+        expect(!same_output(output, before),
+               "testing compact commits only its successful staged output") &&
+        expect(args.tiled_matmul_type == route,
+               "testing compact preserves the main route");
+#else
     return expect(status.code == MatmulStatusCode::unsupported_backend,
-                  "unavailable WS fails with typed unsupported_backend") &&
+                  "non-testing host rejects compact with unsupported_backend") &&
         expect(same_output(output, before), "WS preflight does not mutate output") &&
         expect(args.tiled_matmul_type == route, "WS preflight preserves main route");
+#endif
 #endif
 }
 
@@ -361,12 +613,11 @@ bool test_bad_routes() {
 
     MatmulOptions invalid_options{};
     invalid_options.mode = MatmulInvocationMode::stripe_pipeline;
-    invalid_options.stripe_rows = 0;
+    invalid_options.job_capacity = 0;
     const MatmulStatus invalid = matmul(unsupported_args, invalid_options);
 
     return expect(malformed.code == MatmulStatusCode::invalid_contract, "malformed route rejected") &&
-        expect(unsupported.code == MatmulStatusCode::unsupported_route,
-               "unsupported route rejected") &&
+        expect(unsupported.ok(), "opened H0 route executes") &&
         expect(invalid.code == MatmulStatusCode::invalid_argument,
                "invalid options rejected");
 }
@@ -404,61 +655,19 @@ bool test_cancel_and_failure() {
                    failure_execution.status().code == MatmulStatusCode::execution_failure,
                "startup failure propagates");
 }
-#endif
-
-bool test_pipeline_output_routing(const std::filesystem::path & expected, bool invalid_parent) {
-    const std::string record = "{\"record_type\":\"PIPELINE\"}";
-    std::vector<std::string> before;
-    {
-        std::ifstream input(expected);
-        std::string line;
-        while (std::getline(input, line)) {
-            before.push_back(line);
-        }
-    }
-
-    if (invalid_parent) {
-        std::ofstream("blocked") << "not a directory";
-    }
-
-    const bool wrote = detail::append_pipeline_stripe_summary_jsonl(record);
-    if (invalid_parent) {
-        return expect(!wrote, "invalid pipeline parent reports failure") &&
-            expect(!std::filesystem::exists(expected), "invalid pipeline path is absent") &&
-            expect(!std::filesystem::exists("debug-log.jsonl"), "invalid pipeline path does not fall back to CWD") &&
-            expect(!std::filesystem::exists("log/debug-log.jsonl"), "invalid pipeline path does not fall back to legacy log");
-    }
-
-    std::ifstream input(expected);
-    std::vector<std::string> after;
-    std::string line;
-    while (std::getline(input, line)) {
-        after.push_back(line);
-    }
-    bool preserved = after.size() >= before.size();
-    for (std::size_t i = 0; preserved && i < before.size(); ++i) {
-        preserved = after[i] == before[i];
-    }
-    const bool appended_once = after.size() == before.size() + 1;
-    const bool final_record = appended_once && after.back() == record;
-    return expect(wrote, "pipeline writer succeeds") &&
-        expect(appended_once, "pipeline writer appends exactly one JSONL record") &&
-        expect(preserved, "pipeline writer preserves existing JSONL records") &&
-        expect(final_record, "pipeline writer appends the expected final JSONL record") &&
-        expect(!std::filesystem::exists("debug-log.jsonl"), "pipeline writer does not create a CWD log") &&
-        expect(!std::filesystem::exists("log/debug-log.jsonl"), "pipeline writer does not create legacy log");
-}
 
 }
 
 int main(int argc, char ** argv) {
-    if (argc >= 3 && std::string(argv[1]) == "--pipeline-output") {
-        const bool invalid_parent = argc == 4 && std::string(argv[3]) == "--invalid-parent";
-        return test_pipeline_output_routing(argv[2], invalid_parent) ? 0 : 1;
+    if (argc == 2 && std::string(argv[1]) == "--invalid-geometry-probe") {
+        const bool ok = test_invalid_geometry_rejects_before_allocation();
+        const auto counters = test_matmul_counters();
+        std::printf("INVALID_GEOMETRY status=%d constructions=%llu allocations=%llu\n",
+                    static_cast<int>(MatmulStatusCode::invalid_contract),
+                    static_cast<unsigned long long>(counters.execution_constructions),
+                    static_cast<unsigned long long>(counters.allocation_attempts));
+        return ok ? 0 : 1;
     }
-#ifdef GGML_GEMMINI_PIPELINE_WRITER_TEST_ONLY
-    return 1;
-#else
     if (argc == 2 && std::string(argv[1]) == "--probe-removed-sequential") {
         const bool ok = test_removed_sequential_rejects_before_work();
         if (ok) {
@@ -466,17 +675,35 @@ int main(int argc, char ** argv) {
         }
         return ok ? 0 : 1;
     }
+    if (argc == 2 && std::string(argv[1]) == "--case=correction-domain") {
+        const bool ok = test_correction_domain_composition();
+        if (ok) {
+            std::puts("PASS: FULL/STRIPE correction domains, atomic failures, final saturation");
+        }
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--case=transaction-atomicity") {
+        const bool ok = test_cpu_direct_failure_commits_no_partial_correction() &&
+            test_stripe_residual_failure_is_transaction_atomic() &&
+            test_output_transaction_strides_overflow_and_cancel();
+        if (ok) {
+            std::puts("PASS: FULL/STRIPE output transactions commit once or discard");
+        }
+        return ok ? 0 : 1;
+    }
     if (!test_removed_sequential_rejects_before_work() ||
+        !test_invalid_geometry_rejects_before_allocation() ||
         !test_output_parity() || !test_single_row_pipeline() ||
         !test_counter_hooks_connected() ||
         !test_cpu_direct_lifecycle_parity() ||
-        !test_merge_destination_override() ||
+        !test_correction_domain_composition() ||
         !test_cpu_direct_failure_commits_no_partial_correction() ||
+        !test_stripe_residual_failure_is_transaction_atomic() ||
+        !test_output_transaction_strides_overflow_and_cancel() ||
         !test_ws_preflight_is_atomic_on_host() ||
         !test_bad_routes() || !test_cancel_and_failure()) {
         return 1;
     }
     std::puts("PASS: public mode contract/parity; malformed/unsupported/cancel/failure coverage");
     return 0;
-#endif
 }

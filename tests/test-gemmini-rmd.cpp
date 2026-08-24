@@ -1,12 +1,18 @@
+#include "../ggml/src/ggml-gemmini/residual/direct/direct-executor.hpp"
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.hpp"
+#include "../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.hpp"
 #include "../ggml/src/ggml-gemmini/residual/residual-capture.hpp"
+#include "../ggml/src/ggml-gemmini/quants/common/weight_reader.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <type_traits>
+#include <vector>
 
 namespace {
 
@@ -110,9 +116,971 @@ bool test_padding_overflow_fails() {
         check(builder.status() == RmdStatus::overflow, "padding overflow is explicit");
 }
 
+enum class WeightFamily : uint8_t {
+    H0,
+    H1,
+    HP1,
+};
+
+struct WeightCapabilityFixture {
+    ggml_gemmini_args_t args{};
+    block_q4_h0 q4_h0{};
+    block_q4_h1 q4_h1{};
+    block_q4_hp1 q4_hp1{};
+    block_q8_0 q8_h0{};
+    block_q8_h1 q8_h1{};
+    block_q8_hp1 q8_hp1{};
+    block_q16_h0 q16_h0{};
+    block_q16_h1 q16_h1{};
+    block_q16_hp1 q16_hp1{};
+
+    WeightCapabilityFixture(uint8_t bits, WeightFamily family) {
+        using Format = ggml_gemmini_args_t::im2p_weight_format_t;
+        args.J = 1;
+        args.K = 32;
+        args.block_size_k = 32;
+        args.native_block_count = 1;
+        args.native_blocks_per_row = 1;
+
+        std::fill(std::begin(q4_h0.qs), std::end(q4_h0.qs), uint8_t{0x88});
+        std::fill(std::begin(q4_h1.qs), std::end(q4_h1.qs), uint8_t{0x88});
+        std::fill(std::begin(q4_hp1.qs), std::end(q4_hp1.qs), uint8_t{0x88});
+        q4_h0.d = ggml_fp32_to_fp16(0.5f);
+        q8_h0.d = ggml_fp32_to_fp16(0.5f);
+        q16_h0.d = ggml_fp32_to_fp16(0.5f);
+        q4_h1.c_b = q8_h1.c_b = q16_h1.c_b = 2;
+        q4_h1.R = q8_h1.R = q16_h1.R = 3;
+        q4_h1.s_rf = q8_h1.s_rf = q16_h1.s_rf = 0.25f;
+        q4_hp1.m = q8_hp1.m = q16_hp1.m = 2;
+        q4_hp1.channel_scale = q8_hp1.channel_scale = q16_hp1.channel_scale = 0.25f;
+
+        if (bits == 4) {
+            if (family == WeightFamily::H0) {
+                args.weight_format = Format::q4_h0;
+                args.q4_h0_blocks = &q4_h0;
+                args.native_weight_bytes = sizeof(q4_h0);
+            } else if (family == WeightFamily::H1) {
+                args.weight_format = Format::q4_h1;
+                args.q4_h1_blocks = &q4_h1;
+                args.native_weight_bytes = sizeof(q4_h1);
+            } else {
+                args.weight_format = Format::q4_hp1;
+                args.q4_hp1_blocks = &q4_hp1;
+                args.native_weight_bytes = sizeof(q4_hp1);
+            }
+        } else if (bits == 8) {
+            if (family == WeightFamily::H0) {
+                args.weight_format = Format::q8_h0;
+                args.B_blocks = &q8_h0;
+                args.blocks_J = 1;
+                args.blocks_K = 1;
+                args.native_weight_bytes = sizeof(q8_h0);
+            } else if (family == WeightFamily::H1) {
+                args.weight_format = Format::q8_h1;
+                args.q8_h1_blocks = &q8_h1;
+                args.q8_h1_block_count = 1;
+                args.q8_h1_rows = 1;
+                args.blocks_per_row = 1;
+                args.native_weight_bytes = sizeof(q8_h1);
+            } else {
+                args.weight_format = Format::q8_hp1;
+                args.q8_hp1_blocks = &q8_hp1;
+                args.q8_hp1_block_count = 1;
+                args.q8_hp1_blocks_per_row = 1;
+                args.native_weight_bytes = sizeof(q8_hp1);
+            }
+        } else if (family == WeightFamily::H0) {
+            args.weight_format = Format::q16_h0;
+            args.q16_h0_blocks = &q16_h0;
+            args.native_weight_bytes = sizeof(q16_h0);
+        } else if (family == WeightFamily::H1) {
+            args.weight_format = Format::q16_h1;
+            args.q16_h1_blocks = &q16_h1;
+            args.native_weight_bytes = sizeof(q16_h1);
+        } else {
+            args.weight_format = Format::q16_hp1;
+            args.q16_hp1_blocks = &q16_hp1;
+            args.native_weight_bytes = sizeof(q16_hp1);
+        }
+    }
+};
+
+bool test_weight_capability_happy_table() {
+    namespace wreader = ggml::gemmini::quants::wreader;
+    namespace wroute = ggml::gemmini::quants::wroute;
+    struct CapabilityCase {
+        uint8_t bits;
+        WeightFamily family;
+        wroute::WeightRouteKind route;
+        wroute::WeightScaleDomain domain;
+        bool compact;
+    };
+    constexpr std::array<CapabilityCase, 9> cases = {{
+        {4,  WeightFamily::H0,  wroute::WeightRouteKind::H0,  wroute::WeightScaleDomain::FloatingBlock, false},
+        {4,  WeightFamily::H1,  wroute::WeightRouteKind::H1,  wroute::WeightScaleDomain::IntegerBlockTimesColumn, true},
+        {4,  WeightFamily::HP1, wroute::WeightRouteKind::HP1, wroute::WeightScaleDomain::IntegerBlockTimesColumn, true},
+        {8,  WeightFamily::H0,  wroute::WeightRouteKind::H0,  wroute::WeightScaleDomain::FloatingBlock, false},
+        {8,  WeightFamily::H1,  wroute::WeightRouteKind::H1,  wroute::WeightScaleDomain::IntegerBlockTimesColumn, true},
+        {8,  WeightFamily::HP1, wroute::WeightRouteKind::HP1, wroute::WeightScaleDomain::IntegerBlockTimesColumn, true},
+        {16, WeightFamily::H0,  wroute::WeightRouteKind::H0,  wroute::WeightScaleDomain::FloatingBlock, false},
+        {16, WeightFamily::H1,  wroute::WeightRouteKind::H1,  wroute::WeightScaleDomain::IntegerBlockTimesColumn, true},
+        {16, WeightFamily::HP1, wroute::WeightRouteKind::HP1, wroute::WeightScaleDomain::IntegerBlockTimesColumn, true},
+    }};
+
+    bool ok = true;
+    for (const CapabilityCase & test : cases) {
+        WeightCapabilityFixture fixture(test.bits, test.family);
+        const wroute::WeightRoutePlan plan = wroute::resolve_weight_route_plan(
+            fixture.args, wroute::WeightScaleInfoMode::Residual);
+        const wreader::WeightCodeResult zero = wreader::read_code(fixture.args, plan, 0, 16);
+        ok = check(plan.valid && plan.route == test.route &&
+                       plan.weight_bits == test.bits && plan.scale_domain == test.domain,
+                   "residual route capability resolves by family and width") && ok;
+        ok = check(zero.status == wreader::WeightReaderStatus::Success && zero.value == 0,
+                   "RMD capability uses the shared signed-code reader") && ok;
+        ok = check(wroute::weight_route_status(plan, wroute::WeightExecutionPath::CpuDirect) ==
+                       wroute::WeightRouteStatus::Success,
+                   "all supported residual families allow CPU-direct") && ok;
+        ok = check(
+            wroute::weight_route_status(plan, wroute::WeightExecutionPath::Compact) ==
+                (test.compact ? wroute::WeightRouteStatus::Success :
+                                wroute::WeightRouteStatus::UnsupportedExecution),
+            "compact capability follows the scale domain") && ok;
+    }
+    return ok;
 }
 
-bool test_cpu_capture_is_canonical_and_packet_free() {
+bool test_weight_capability_failure_table() {
+    namespace wroute = ggml::gemmini::quants::wroute;
+    bool ok = true;
+    for (uint8_t bits : {uint8_t{4}, uint8_t{8}, uint8_t{16}}) {
+        WeightCapabilityFixture fixture(bits, WeightFamily::H0);
+        const wroute::WeightRoutePlan plan = wroute::resolve_weight_route_plan(
+            fixture.args, wroute::WeightScaleInfoMode::Residual);
+        ok = check(wroute::weight_route_status(plan, wroute::WeightExecutionPath::Compact) ==
+                       wroute::WeightRouteStatus::UnsupportedExecution,
+                   "H0 compact request is rejected before packet work") && ok;
+    }
+
+    wroute::WeightRoutePlan invalid{};
+    invalid.status = wroute::WeightRouteStatus::InvalidMetadata;
+    ok = check(wroute::weight_route_status(invalid, wroute::WeightExecutionPath::CpuDirect) ==
+                   wroute::WeightRouteStatus::InvalidMetadata,
+               "invalid metadata remains a typed route failure") && ok;
+    return ok;
+}
+
+namespace residual = ggml::gemmini::residual;
+namespace rmd = ggml::gemmini::rmd;
+
+const char * weight_family_name(WeightFamily family) {
+    switch (family) {
+        case WeightFamily::H0:  return "H0";
+        case WeightFamily::H1:  return "H1";
+        case WeightFamily::HP1: return "HP1";
+    }
+    return "unknown";
+}
+
+struct DirectOracleFixture {
+    ggml_gemmini_args_t args{};
+    std::array<block_q4_h0, 4> q4_h0{};
+    std::array<block_q4_h1, 4> q4_h1{};
+    std::array<block_q4_hp1, 4> q4_hp1{};
+    std::array<block_q8_0, 4> q8_h0{};
+    std::array<block_q8_h1, 4> q8_h1{};
+    std::array<block_q8_hp1, 4> q8_hp1{};
+    std::array<block_q16_h0, 4> q16_h0{};
+    std::array<block_q16_h1, 4> q16_h1{};
+    std::array<block_q16_hp1, 4> q16_hp1{};
+    residual::DirectStripePayloadHandle payload;
+
+    DirectOracleFixture(uint8_t bits, WeightFamily family) {
+        using Format = ggml_gemmini_args_t::im2p_weight_format_t;
+        args.I = 3;
+        args.J = 2;
+        args.K = 64;
+        args.block_size_k = 32;
+        args.native_block_count = 4;
+        args.native_blocks_per_row = 2;
+
+        auto populate_q4 = [](auto & blocks) {
+            for (auto & block : blocks) {
+                std::fill(std::begin(block.qs), std::end(block.qs), uint8_t{0x88});
+            }
+            // Block order is [j0b0, j0b1, j1b0, j1b1]. Low nibbles
+            // encode K[0..15], high nibbles K[16..31].
+            blocks[0].qs[0] = 0xf0; blocks[0].qs[15] = 0x78; // [-8, +7, -1]
+            blocks[1].qs[0] = 0x8f; blocks[1].qs[15] = 0xe0; // [+7, -8, +6]
+            blocks[2].qs[0] = 0x0f; blocks[2].qs[15] = 0xb8; // [+7, -8, +3]
+            blocks[3].qs[0] = 0x80; blocks[3].qs[15] = 0x4f; // [-8, +7, -4]
+        };
+        populate_q4(q4_h0);
+        populate_q4(q4_h1);
+        populate_q4(q4_hp1);
+
+        auto populate_q8 = [](auto & blocks) {
+            blocks[0].qs[0] = -128; blocks[0].qs[16] = 127; blocks[0].qs[31] = -17;
+            blocks[1].qs[0] = 127; blocks[1].qs[15] = -128; blocks[1].qs[31] = 99;
+            blocks[2].qs[0] = 127; blocks[2].qs[16] = -128; blocks[2].qs[31] = 31;
+            blocks[3].qs[0] = -128; blocks[3].qs[15] = 127; blocks[3].qs[31] = -64;
+        };
+        populate_q8(q8_h0);
+        populate_q8(q8_h1);
+        populate_q8(q8_hp1);
+
+        auto populate_q16 = [](auto & blocks) {
+            blocks[0].qs[0] = -32768; blocks[0].qs[16] = 32767; blocks[0].qs[31] = -257;
+            blocks[1].qs[0] = 32767; blocks[1].qs[15] = -32768; blocks[1].qs[31] = 12345;
+            blocks[2].qs[0] = 32767; blocks[2].qs[16] = -32768; blocks[2].qs[31] = 511;
+            blocks[3].qs[0] = -32768; blocks[3].qs[15] = 32767; blocks[3].qs[31] = -16384;
+        };
+        populate_q16(q16_h0);
+        populate_q16(q16_h1);
+        populate_q16(q16_hp1);
+
+        constexpr std::array<float, 4> h0_scales = {0.5f, 0.0f, -1.25f, 2.0f};
+        constexpr std::array<uint8_t, 4> h1_codes = {1, 0, 1, 2};
+        constexpr std::array<uint16_t, 4> h1_offsets = {1, 0, 2, 3};
+        constexpr std::array<float, 4> h1_columns = {0.25f, 0.25f, -0.5f, -0.5f};
+        constexpr std::array<int16_t, 4> hp1_exponents = {
+            1, std::numeric_limits<int16_t>::min(), 2, 3,
+        };
+        constexpr std::array<float, 4> hp1_columns = {0.125f, 0.125f, -0.75f, -0.75f};
+        for (size_t i = 0; i < 4; ++i) {
+            q4_h0[i].d = ggml_fp32_to_fp16(h0_scales[i]);
+            q8_h0[i].d = ggml_fp32_to_fp16(h0_scales[i]);
+            q16_h0[i].d = ggml_fp32_to_fp16(h0_scales[i]);
+
+            q4_h1[i].c_b = q8_h1[i].c_b = q16_h1[i].c_b = h1_codes[i];
+            q4_h1[i].R = q8_h1[i].R = q16_h1[i].R = h1_offsets[i];
+            q4_h1[i].s_rf = q8_h1[i].s_rf = q16_h1[i].s_rf = h1_columns[i];
+
+            q4_hp1[i].m = q8_hp1[i].m = q16_hp1[i].m = hp1_exponents[i];
+            q4_hp1[i].channel_scale = q8_hp1[i].channel_scale =
+                q16_hp1[i].channel_scale = hp1_columns[i];
+        }
+
+        if (bits == 4) {
+            if (family == WeightFamily::H0) {
+                args.weight_format = Format::q4_h0;
+                args.q4_h0_blocks = q4_h0.data();
+                args.native_weight_bytes = sizeof(q4_h0);
+            } else if (family == WeightFamily::H1) {
+                args.weight_format = Format::q4_h1;
+                args.q4_h1_blocks = q4_h1.data();
+                args.native_weight_bytes = sizeof(q4_h1);
+            } else {
+                args.weight_format = Format::q4_hp1;
+                args.q4_hp1_blocks = q4_hp1.data();
+                args.native_weight_bytes = sizeof(q4_hp1);
+            }
+        } else if (bits == 8) {
+            if (family == WeightFamily::H0) {
+                args.weight_format = Format::q8_h0;
+                args.B_blocks = q8_h0.data();
+                args.blocks_J = 2;
+                args.blocks_K = 2;
+                args.native_weight_bytes = sizeof(q8_h0);
+            } else if (family == WeightFamily::H1) {
+                args.weight_format = Format::q8_h1;
+                args.q8_h1_blocks = q8_h1.data();
+                args.q8_h1_block_count = q8_h1.size();
+                args.q8_h1_rows = 2;
+                args.blocks_per_row = 2;
+                args.native_weight_bytes = sizeof(q8_h1);
+            } else {
+                args.weight_format = Format::q8_hp1;
+                args.q8_hp1_blocks = q8_hp1.data();
+                args.q8_hp1_block_count = q8_hp1.size();
+                args.q8_hp1_blocks_per_row = 2;
+                args.native_weight_bytes = sizeof(q8_hp1);
+            }
+        } else if (family == WeightFamily::H0) {
+            args.weight_format = Format::q16_h0;
+            args.q16_h0_blocks = q16_h0.data();
+            args.native_weight_bytes = sizeof(q16_h0);
+        } else if (family == WeightFamily::H1) {
+            args.weight_format = Format::q16_h1;
+            args.q16_h1_blocks = q16_h1.data();
+            args.native_weight_bytes = sizeof(q16_h1);
+        } else {
+            args.weight_format = Format::q16_hp1;
+            args.q16_hp1_blocks = q16_hp1.data();
+            args.native_weight_bytes = sizeof(q16_hp1);
+        }
+
+        residual::DirectStripeBuilder builder;
+        builder.reset(19, 7, 3, 64, 2);
+        constexpr std::array<residual::ResidualEvent, 12> events = {{
+            {0, 0, 3}, {0, 16, -2}, {0, 31, 5},
+            {0, 32, -4}, {0, 47, 7}, {0, 63, -6},
+            {2, 0, -9}, {2, 16, 4}, {2, 31, -3},
+            {2, 32, 8}, {2, 47, -5}, {2, 63, 2},
+        }};
+        for (const residual::ResidualEvent & event : events) {
+            if (!builder.add_residual(event.local_row, event.original_k, event.residual)) {
+                return;
+            }
+        }
+        payload = builder.finish();
+    }
+};
+
+struct DirectOracleCase {
+    uint8_t bits;
+    WeightFamily family;
+    std::array<int64_t, 6> integer_expected{};
+    std::array<double, 6> floating_expected{};
+};
+
+constexpr std::array<DirectOracleCase, 9> kDirectOracleCases = {{
+    {4, WeightFamily::H0,  {}, {-21.5, 145.0, 0.0, 0.0, 51.5, -84.0}},
+    {4, WeightFamily::H1,  {-86, 681, 0, 0, 206, -847}, {}},
+    {4, WeightFamily::HP1, {-86, 1048, 0, 0, 206, -1272}, {}},
+    {8, WeightFamily::H0,  {}, {-361.5, 2580.0, 0.0, 0.0, 855.5, -1389.0}},
+    {8, WeightFamily::H1,  {-1446, 11301, 0, 0, 3422, -14179}, {}},
+    {8, WeightFamily::HP1, {-1446, 17448, 0, 0, 3422, -21288}, {}},
+    {16, WeightFamily::H0, {}, {-82561.5, 709500.0, 0.0, 0.0, 213375.5, -383109.0}},
+    {16, WeightFamily::H1, {-330246, 2792901, 0, 0, 853502, -3576259}, {}},
+    {16, WeightFamily::HP1, {-330246, 4335528, 0, 0, 853502, -5380008}, {}},
+}};
+
+template <typename T, size_t N>
+bool values_match(const std::vector<T> & actual, const std::array<T, N> & expected) {
+    return actual.size() == expected.size() &&
+        std::equal(actual.begin(), actual.end(), expected.begin());
+}
+
+bool direct_outputs_match(const rmd::DirectOutput & lhs, const rmd::DirectOutput & rhs) {
+    if (lhs.index() != rhs.index()) return false;
+    if (const auto * left = std::get_if<rmd::BlockScaledInt64Correction>(&lhs)) {
+        const auto * right = std::get_if<rmd::BlockScaledInt64Correction>(&rhs);
+        return right != nullptr && left->values == right->values;
+    }
+    const auto * left = std::get_if<rmd::PreScaledFloat64Correction>(&lhs);
+    const auto * right = std::get_if<rmd::PreScaledFloat64Correction>(&rhs);
+    return left != nullptr && right != nullptr && left->values == right->values;
+}
+
+bool test_direct_oracle_happy_matrix() {
+    bool ok = true;
+    for (const DirectOracleCase & test : kDirectOracleCases) {
+        DirectOracleFixture fixture(test.bits, test.family);
+        rmd::DirectOutput actual = rmd::PreScaledFloat64Correction{{91.5, -27.25}};
+        residual::DirectExecutionMetrics metrics{71, 73};
+        const rmd::RmdStatus status = fixture.payload == nullptr ? rmd::RmdStatus::invalid_packet :
+            residual::execute_direct_stripe(fixture.args, *fixture.payload, actual, &metrics);
+        bool case_ok = check(status == rmd::RmdStatus::success,
+                             "matched-width direct oracle executes");
+        if (test.family == WeightFamily::H0) {
+            const auto * output = std::get_if<rmd::PreScaledFloat64Correction>(&actual);
+            case_ok = check(output != nullptr &&
+                                values_match(output->values, test.floating_expected),
+                            "H0 direct output matches literal pre-scaled oracle") && case_ok;
+        } else {
+            const auto * output = std::get_if<rmd::BlockScaledInt64Correction>(&actual);
+            case_ok = check(output != nullptr &&
+                                values_match(output->values, test.integer_expected),
+                            "H1/HP1 direct output matches literal integer-domain oracle") && case_ok;
+            if (test.bits == 8 && output != nullptr) {
+                rmd::DirectOutput tagged = rmd::BlockScaledInt64Correction{{901, 902}};
+                const rmd::RmdStatus tagged_status = residual::execute_direct_stripe(
+                    fixture.args, *fixture.payload, tagged, nullptr);
+                const auto * tagged_integer =
+                    std::get_if<rmd::BlockScaledInt64Correction>(&tagged);
+                case_ok = check(
+                    tagged_status == rmd::RmdStatus::success && tagged_integer != nullptr &&
+                        values_match(tagged_integer->values, test.integer_expected),
+                    "Q8 integer direct output retains its explicit domain tag") && case_ok;
+            }
+        }
+        case_ok = check(metrics.event_count == fixture.payload->events.size() &&
+                            metrics.call_count == 1,
+                        "direct metrics commit only after complete success") && case_ok;
+        std::printf("DIRECT_ORACLE width=%u family=%s status=%s values=6\n",
+                    static_cast<unsigned>(test.bits), weight_family_name(test.family),
+                    rmd::rmd_status_message(status));
+        ok = case_ok && ok;
+    }
+    return ok;
+}
+
+bool test_a16_allocation_products() {
+    ggml::gemmini::quants::act::QuantizedActivationBuffer buffer;
+    if (!check(buffer.allocate(1, 2, 16), "A16 allocation sentinel initializes")) {
+        return false;
+    }
+    buffer.bytes->at(0) = 0x5a;
+    const auto original_bytes = buffer.bytes;
+    const size_t original_rows = buffer.rows;
+    const size_t original_cols = buffer.cols;
+    const size_t original_stride = buffer.row_stride_bytes;
+    bool ok = check(!buffer.allocate(1, std::numeric_limits<size_t>::max(), 16),
+                    "A16 column byte product overflow rejects before allocation");
+    ok = check(!buffer.allocate(std::numeric_limits<size_t>::max() / 4 + 1, 2, 16),
+               "A16 row byte product overflow rejects before allocation") && ok;
+    return check(buffer.bytes == original_bytes && buffer.bytes->at(0) == 0x5a &&
+                     buffer.rows == original_rows && buffer.cols == original_cols &&
+                     buffer.row_stride_bytes == original_stride,
+                 "failed A16 allocation leaves prior buffer byte-identical") && ok;
+}
+
+bool test_direct_failure_matrix() {
+    const rmd::DirectOutput sentinel = rmd::PreScaledFloat64Correction{{13.25, -9.5, 4.0}};
+    auto fails_atomically = [&](const ggml_gemmini_args_t & args,
+                                const residual::DirectStripePayload & payload,
+                                rmd::RmdStatus expected,
+                                const char * message) {
+        rmd::DirectOutput output = sentinel;
+        const auto * before = std::get_if<rmd::PreScaledFloat64Correction>(&output);
+        const double * const before_data = before->values.data();
+        const size_t before_capacity = before->values.capacity();
+        residual::DirectExecutionMetrics metrics{79, 83};
+        const rmd::RmdStatus status =
+            residual::execute_direct_stripe(args, payload, output, &metrics);
+        const auto * after = std::get_if<rmd::PreScaledFloat64Correction>(&output);
+        return check(status == expected && direct_outputs_match(output, sentinel) &&
+                         after != nullptr && after->values.data() == before_data &&
+                         after->values.capacity() == before_capacity &&
+                         std::memcmp(after->values.data(),
+                                     std::get<rmd::PreScaledFloat64Correction>(sentinel).values.data(),
+                                     after->values.size() * sizeof(double)) == 0 &&
+                         metrics.event_count == 79 && metrics.call_count == 83,
+                     message);
+    };
+
+    bool ok = test_a16_allocation_products();
+
+    DirectOracleFixture malformed_payload_fixture(16, WeightFamily::H1);
+    residual::DirectStripePayload malformed_payload = *malformed_payload_fixture.payload;
+    std::swap(malformed_payload.events[0], malformed_payload.events[1]);
+    ok = fails_atomically(malformed_payload_fixture.args, malformed_payload,
+                          rmd::RmdStatus::invalid_packet,
+                          "malformed payload leaves direct output unchanged") && ok;
+
+    DirectOracleFixture missing_extent(8, WeightFamily::H1);
+    missing_extent.args.native_weight_bytes = 0;
+    ok = fails_atomically(missing_extent.args, *missing_extent.payload,
+                          rmd::RmdStatus::unsupported_route,
+                          "zero native byte extent rejects atomically") && ok;
+
+    DirectOracleFixture malformed_storage(4, WeightFamily::H1);
+    malformed_storage.args.native_weight_bytes = sizeof(malformed_storage.q4_h1) - 1;
+    ok = fails_atomically(malformed_storage.args, *malformed_storage.payload,
+                          rmd::RmdStatus::unsupported_route,
+                          "truncated Q4 storage leaves direct output unchanged") && ok;
+
+    DirectOracleFixture invalid_h0(16, WeightFamily::H0);
+    const uint16_t quiet_nan = 0x7e00u;
+    std::memcpy(&invalid_h0.q16_h0[0].d, &quiet_nan, sizeof(quiet_nan));
+    ok = fails_atomically(invalid_h0.args, *invalid_h0.payload,
+                          rmd::RmdStatus::unsupported_route,
+                          "non-finite H0 block scale leaves direct output unchanged") && ok;
+
+    DirectOracleFixture shape_overflow(16, WeightFamily::H1);
+    residual::DirectStripePayload oversized = *shape_overflow.payload;
+    oversized.row_begin = 0;
+    oversized.row_count = std::numeric_limits<size_t>::max() / 2 + 1;
+    ok = fails_atomically(shape_overflow.args, oversized, rmd::RmdStatus::overflow,
+                          "direct result size overflow leaves output unchanged") && ok;
+
+    DirectOracleFixture scale_overflow(16, WeightFamily::HP1);
+    scale_overflow.q16_hp1[0].m = 62;
+    residual::DirectStripeBuilder scale_builder;
+    scale_builder.reset(23, 0, 1, 64, 2);
+    scale_builder.add_residual(0, 0, std::numeric_limits<int32_t>::max());
+    const auto scale_payload = scale_builder.finish();
+    ok = check(scale_payload != nullptr, "integer scale overflow payload builds") && ok;
+    if (scale_payload != nullptr) {
+        ok = fails_atomically(scale_overflow.args, *scale_payload, rmd::RmdStatus::overflow,
+                              "int64 block-scale product overflow is atomic") && ok;
+    }
+
+    std::array<block_q16_h1, 2> add_weights{};
+    for (block_q16_h1 & block : add_weights) {
+        std::fill(std::begin(block.qs), std::end(block.qs), int16_t{32767});
+        block.c_b = 1;
+        block.R = 2999;
+        block.s_rf = 0.25f;
+    }
+    ggml_gemmini_args_t add_args{};
+    add_args.I = add_args.J = 1;
+    add_args.K = 64;
+    add_args.block_size_k = 32;
+    add_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q16_h1;
+    add_args.q16_h1_blocks = add_weights.data();
+    add_args.native_block_count = add_weights.size();
+    add_args.native_blocks_per_row = add_weights.size();
+    add_args.native_weight_bytes = sizeof(add_weights);
+    residual::DirectStripeBuilder add_builder;
+    add_builder.reset(29, 0, 1, 64, 1);
+    for (size_t k = 0; k < 64; ++k) {
+        add_builder.add_residual(0, k, std::numeric_limits<int32_t>::max());
+    }
+    const auto add_payload = add_builder.finish();
+    ok = check(add_payload != nullptr, "integer add overflow payload builds") && ok;
+    if (add_payload != nullptr) {
+        ok = fails_atomically(add_args, *add_payload, rmd::RmdStatus::overflow,
+                              "int64 cross-block add overflow is atomic") && ok;
+    }
+
+    if (ok) {
+        std::puts("DIRECT_FAILURE_MATRIX malformed=1 storage=1 a16=1 scale=1 add=1 atomic=1");
+    }
+    return ok;
+}
+
+struct CompactOracleResidual {
+    residual::ResidualEvent event{};
+    uint8_t lane_id = 0;
+    int8_t digit = 0;
+};
+
+struct CompactOracleFixture {
+    static constexpr size_t rows = kArrayDim + 1;
+    static constexpr size_t columns = 3;
+    static constexpr size_t logical_k = 2 * kBlockSize;
+    static constexpr size_t blocks_per_row = logical_k / kBlockSize;
+    static constexpr size_t block_count = columns * blocks_per_row;
+
+    ggml_gemmini_args_t args{};
+    std::array<block_q4_h1, block_count> q4_h1{};
+    std::array<block_q4_hp1, block_count> q4_hp1{};
+    std::array<block_q8_h1, block_count> q8_h1{};
+    std::array<block_q8_hp1, block_count> q8_hp1{};
+    std::array<block_q16_h1, block_count> q16_h1{};
+    std::array<block_q16_hp1, block_count> q16_hp1{};
+    std::vector<int32_t> codes;
+    std::array<uint64_t, block_count> integer_scales{};
+    std::vector<CompactOracleResidual> residuals;
+    StripePacketHandle packet;
+    bool valid = false;
+
+    CompactOracleFixture(uint8_t bits, WeightFamily family) {
+        using Format = ggml_gemmini_args_t::im2p_weight_format_t;
+        args.I = rows;
+        args.J = columns;
+        args.K = logical_k;
+        args.block_size_k = kBlockSize;
+        args.native_block_count = block_count;
+        args.native_blocks_per_row = blocks_per_row;
+        if (!args.A.allocate(rows, logical_k, bits)) {
+            return;
+        }
+
+        for (auto & block : q4_h1) {
+            std::fill(std::begin(block.qs), std::end(block.qs), uint8_t{0x88});
+        }
+        for (auto & block : q4_hp1) {
+            std::fill(std::begin(block.qs), std::end(block.qs), uint8_t{0x88});
+        }
+        codes.assign(columns * logical_k, 0);
+
+        auto set_q4 = [](auto & block, size_t local_k, int32_t value) {
+            const size_t byte = local_k % (kBlockSize / 2);
+            const uint8_t nibble = static_cast<uint8_t>(value + 8);
+            if (local_k < kBlockSize / 2) {
+                block.qs[byte] = static_cast<uint8_t>((block.qs[byte] & 0xf0u) | nibble);
+            } else {
+                block.qs[byte] = static_cast<uint8_t>((block.qs[byte] & 0x0fu) |
+                                                      (nibble << 4));
+            }
+        };
+        for (size_t j = 0; j < columns; ++j) {
+            for (size_t block_id = 0; block_id < blocks_per_row; ++block_id) {
+                const size_t block_index = j * blocks_per_row + block_id;
+                for (size_t local_k = 0; local_k < kBlockSize; ++local_k) {
+                    const size_t seed = 1 + j * 97 + block_id * 43 + local_k * 19;
+                    int32_t code = bits == 4 ? static_cast<int32_t>(seed % 16) - 8 :
+                        bits == 8 ? static_cast<int32_t>((seed * 37) % 256) - 128 :
+                                    static_cast<int32_t>((seed * 7919) % 65536) - 32768;
+                    if (local_k == 0) {
+                        code = -(int32_t{1} << (bits - 1));
+                    } else if (local_k == 1) {
+                        code = (int32_t{1} << (bits - 1)) - 1;
+                    } else if (local_k == 2) {
+                        code = 0;
+                    }
+                    codes[j * logical_k + block_id * kBlockSize + local_k] = code;
+                    if (bits == 4) {
+                        set_q4(q4_h1[block_index], local_k, code);
+                        set_q4(q4_hp1[block_index], local_k, code);
+                    } else if (bits == 8) {
+                        q8_h1[block_index].qs[local_k] = static_cast<int8_t>(code);
+                        q8_hp1[block_index].qs[local_k] = static_cast<int8_t>(code);
+                    } else {
+                        q16_h1[block_index].qs[local_k] = static_cast<int16_t>(code);
+                        q16_hp1[block_index].qs[local_k] = static_cast<int16_t>(code);
+                    }
+                }
+            }
+        }
+
+        constexpr std::array<uint64_t, block_count> h1_scales = {
+            0, 1, 257, 65535, 3, 1024,
+        };
+        constexpr std::array<int16_t, block_count> hp1_exponents = {
+            std::numeric_limits<int16_t>::min(), 0, 1, 8, 20, 2,
+        };
+        for (size_t index = 0; index < block_count; ++index) {
+            const size_t column = index / blocks_per_row;
+            const uint64_t h1_scale = h1_scales[index];
+            const uint8_t code = static_cast<uint8_t>(std::min<uint64_t>(h1_scale, 255));
+            const uint16_t offset = static_cast<uint16_t>(h1_scale - code);
+            q4_h1[index].c_b = q8_h1[index].c_b = q16_h1[index].c_b = code;
+            q4_h1[index].R = q8_h1[index].R = q16_h1[index].R = offset;
+            q4_h1[index].s_rf = q8_h1[index].s_rf = q16_h1[index].s_rf =
+                static_cast<float>(column + 1) * 0.125f;
+
+            q4_hp1[index].m = q8_hp1[index].m = q16_hp1[index].m =
+                hp1_exponents[index];
+            q4_hp1[index].channel_scale = q8_hp1[index].channel_scale =
+                q16_hp1[index].channel_scale =
+                    static_cast<float>(column + 1) * 0.0625f;
+            integer_scales[index] = family == WeightFamily::H1 ? h1_scale :
+                hp1_exponents[index] == std::numeric_limits<int16_t>::min() ? 0 :
+                uint64_t{1} << static_cast<unsigned>(hp1_exponents[index]);
+        }
+
+        if (bits == 4) {
+            if (family == WeightFamily::H1) {
+                args.weight_format = Format::q4_h1;
+                args.q4_h1_blocks = q4_h1.data();
+                args.native_weight_bytes = sizeof(q4_h1);
+            } else {
+                args.weight_format = Format::q4_hp1;
+                args.q4_hp1_blocks = q4_hp1.data();
+                args.native_weight_bytes = sizeof(q4_hp1);
+            }
+        } else if (bits == 8) {
+            if (family == WeightFamily::H1) {
+                args.weight_format = Format::q8_h1;
+                args.q8_h1_blocks = q8_h1.data();
+                args.q8_h1_block_count = q8_h1.size();
+                args.q8_h1_rows = columns;
+                args.blocks_per_row = blocks_per_row;
+                args.native_weight_bytes = sizeof(q8_h1);
+            } else {
+                args.weight_format = Format::q8_hp1;
+                args.q8_hp1_blocks = q8_hp1.data();
+                args.q8_hp1_block_count = q8_hp1.size();
+                args.q8_hp1_blocks_per_row = blocks_per_row;
+                args.native_weight_bytes = sizeof(q8_hp1);
+            }
+        } else if (family == WeightFamily::H1) {
+            args.weight_format = Format::q16_h1;
+            args.q16_h1_blocks = q16_h1.data();
+            args.native_weight_bytes = sizeof(q16_h1);
+        } else {
+            args.weight_format = Format::q16_hp1;
+            args.q16_hp1_blocks = q16_hp1.data();
+            args.native_weight_bytes = sizeof(q16_hp1);
+        }
+
+        constexpr std::array<int64_t, kMaxLanes> places = {
+            1, 256, 65536, 16777216,
+        };
+        for (size_t local_k = 0; local_k < 19; ++local_k) {
+            const uint8_t lane = static_cast<uint8_t>(local_k % kMaxLanes);
+            const int8_t digit = local_k % 2 == 0 ? int8_t{1} : int8_t{-1};
+            residuals.push_back({
+                {local_k % rows, local_k, static_cast<int32_t>(digit * places[lane])},
+                lane,
+                digit,
+            });
+        }
+        constexpr std::array<size_t, 6> second_block_k = {0, 1, 2, 15, 16, 31};
+        for (size_t index = 0; index < second_block_k.size(); ++index) {
+            const uint8_t lane = static_cast<uint8_t>((index + 1) % kMaxLanes);
+            const int8_t digit = index % 2 == 0 ? int8_t{1} : int8_t{-1};
+            residuals.push_back({
+                {(index * 5) % rows, kBlockSize + second_block_k[index],
+                 static_cast<int32_t>(digit * places[lane])},
+                lane,
+                digit,
+            });
+        }
+
+        RmdStripeBuilder builder;
+        builder.reset(41, 9, rows, logical_k, columns);
+        for (const CompactOracleResidual & residual : residuals) {
+            if (!builder.add_residual(residual.event.local_row,
+                                      residual.event.original_k,
+                                      residual.event.residual)) {
+                return;
+            }
+        }
+        packet = builder.finish();
+        valid = packet != nullptr && builder.status() == RmdStatus::success;
+    }
+
+    int32_t code(size_t j, size_t k) const {
+        return codes[j * logical_k + k];
+    }
+};
+
+bool compact_oracle_output(const CompactOracleFixture & fixture,
+                           std::vector<OutputValue> & expected) {
+    if (!fixture.valid) {
+        return false;
+    }
+    expected.assign(fixture.packet->total_output_values, OutputValue{0});
+    for (const BlockDescriptor & block : fixture.packet->blocks) {
+        for (size_t lane_position = 0; lane_position < block.active_lane_count;
+             ++lane_position) {
+            const uint8_t lane_id = block.lane_ids[lane_position];
+            const size_t lane_base = block.output_value_offset +
+                lane_position * block.lane_stride_values;
+            for (size_t row = 0; row < CompactOracleFixture::rows; ++row) {
+                for (size_t j = 0; j < CompactOracleFixture::columns; ++j) {
+                    __int128 raw = 0;
+                    for (const CompactOracleResidual & residual : fixture.residuals) {
+                        if (residual.event.local_row != row || residual.lane_id != lane_id ||
+                            residual.event.original_k / kBlockSize != block.block_id) {
+                            continue;
+                        }
+                        raw += static_cast<__int128>(residual.digit) *
+                            fixture.code(j, residual.event.original_k);
+                    }
+                    const size_t scale_index = j * CompactOracleFixture::blocks_per_row +
+                        block.block_id;
+                    const __int128 scaled = raw * fixture.integer_scales[scale_index];
+                    if (scaled < std::numeric_limits<int64_t>::min() ||
+                        scaled > std::numeric_limits<int64_t>::max()) {
+                        return false;
+                    }
+                    expected[lane_base + row * fixture.packet->j_padded + j] =
+                        static_cast<int64_t>(scaled);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+bool compressed_outputs_match(const CompressedOutput & lhs,
+                              const CompressedOutput & rhs) {
+    return lhs.domain == rhs.domain && lhs.j_padded == rhs.j_padded &&
+        lhs.values == rhs.values;
+}
+
+bool test_compact_oracle_happy_matrix() {
+    struct CompactCase {
+        uint8_t bits;
+        WeightFamily family;
+    };
+    constexpr std::array<CompactCase, 6> cases = {{
+        {4, WeightFamily::H1}, {4, WeightFamily::HP1},
+        {8, WeightFamily::H1}, {8, WeightFamily::HP1},
+        {16, WeightFamily::H1}, {16, WeightFamily::HP1},
+    }};
+
+    bool ok = true;
+    bool have_geometry = false;
+    std::array<size_t, 7> invariant_geometry{};
+    for (const CompactCase & test : cases) {
+        CompactOracleFixture fixture(test.bits, test.family);
+#if defined(GGML_GEMMINI_TESTING)
+        constexpr std::array<uint16_t, 3> edge_k = {0, 1, 2};
+        std::array<int32_t, kArrayDim * kArrayDim> wide_tile{};
+        wide_tile.fill(123456789);
+        const RmdStatus gather_status = fixture.valid ?
+            rmd::gather_wide_weight_tile_for_test(
+                fixture.args, 0, edge_k.data(), edge_k.size(), 0,
+                CompactOracleFixture::columns, wide_tile.data(), kArrayDim) :
+            RmdStatus::invalid_packet;
+        bool gather_ok = check(gather_status == RmdStatus::success,
+                               "matched-width WeightGather accepts signed edge codes");
+        for (size_t k = 0; k < edge_k.size(); ++k) {
+            for (size_t j = 0; j < CompactOracleFixture::columns; ++j) {
+                gather_ok = check(wide_tile[k * kArrayDim + j] ==
+                                      fixture.code(j, edge_k[k]),
+                                  "wide WeightGather preserves min/max/zero exactly") &&
+                    gather_ok;
+            }
+        }
+#else
+        bool gather_ok = check(false, "compact oracle requires GGML_GEMMINI_TESTING");
+#endif
+
+        std::vector<OutputValue> expected;
+        CompressedOutput actual;
+        actual.j_padded = 7;
+        actual.values = {91, 92, 93};
+        RmdExecutionMetrics metrics{};
+        const RmdStatus status = fixture.valid && compact_oracle_output(fixture, expected) ?
+            execute_rmd_stripe_ws(fixture.args, *fixture.packet, actual, &metrics) :
+            RmdStatus::invalid_packet;
+        bool case_ok = gather_ok;
+        case_ok = check(status == RmdStatus::success,
+                        "matched-width compact oracle executes") && case_ok;
+        case_ok = check(actual.domain == CompressedOutput::Domain::block_scaled_int64 &&
+                            actual.values == expected,
+                        "compact output matches independent block/lane oracle") && case_ok;
+        case_ok = check(metrics.packet_call_count == 1 && metrics.ws_call_count == 0,
+                        "software compact executes one packet and no hardware dispatch") && case_ok;
+        const size_t packet_block_count =
+            fixture.packet == nullptr ? 0 : fixture.packet->blocks.size();
+        case_ok = check(packet_block_count == 2 &&
+                            fixture.packet->blocks[0].compact_k_count == 19 &&
+                            fixture.packet->blocks[0].padded_k_count ==
+                                align_up(19, kArrayDim) &&
+                            fixture.packet->blocks[1].compact_k_count == 6,
+                        "compact packet preserves K0>1 and final partial K fragment") && case_ok;
+        const bool partition_expected = kArrayDim < kBlockSize;
+        case_ok = check(metrics.active_lanes == 2 * kMaxLanes &&
+                            metrics.lane_group_count >= packet_block_count &&
+                            (!partition_expected ||
+                             metrics.lane_group_count > packet_block_count) &&
+                            metrics.matmul_call_count >= metrics.lane_group_count,
+                        "compact packet exercises DIM-aware lane groups") && case_ok;
+
+        const std::array<size_t, 7> geometry = {
+            metrics.packet_call_count,
+            metrics.active_blocks,
+            metrics.active_lanes,
+            metrics.compact_k_count,
+            metrics.padded_k_count,
+            metrics.matmul_call_count,
+            metrics.lane_group_count,
+        };
+        if (!have_geometry) {
+            invariant_geometry = geometry;
+            have_geometry = true;
+        } else {
+            case_ok = check(geometry == invariant_geometry,
+                            "compact packet counts are independent of weight width and family") &&
+                case_ok;
+        }
+        std::printf(
+            "COMPACT_ORACLE width=%u family=%s domain=block_scaled_int64 "
+            "packets=%zu k_fragments=%zu lane_groups=%zu\n",
+            static_cast<unsigned>(test.bits), weight_family_name(test.family),
+            metrics.packet_call_count, metrics.matmul_call_count,
+            metrics.lane_group_count);
+        ok = case_ok && ok;
+    }
+    return ok;
+}
+
+bool test_compact_failure_matrix() {
+    const CompressedOutput sentinel = {
+        CompressedOutput::Domain::block_scaled_int64, 7, {13, -9, 4},
+    };
+    auto fails_atomically = [&](const ggml_gemmini_args_t & args,
+                                const StripePacket & packet,
+                                RmdStatus expected,
+                                const char * message) {
+        CompressedOutput output = sentinel;
+        RmdExecutionMetrics metrics{};
+        const RmdStatus status = execute_rmd_stripe_ws(args, packet, output, &metrics);
+        return check(status == expected && compressed_outputs_match(output, sentinel) &&
+                         metrics.packet_call_count == 0 && metrics.ws_call_count == 0 &&
+                         metrics.matmul_call_count == 0,
+                     message);
+    };
+
+    RmdStripeBuilder single_builder;
+    single_builder.reset(43, 0, 1, kBlockSize, 1);
+    single_builder.add_residual(0, 0, 1);
+    const StripePacketHandle single_packet = single_builder.finish();
+    bool ok = check(single_packet != nullptr, "compact failure packet builds");
+    if (single_packet == nullptr) {
+        return false;
+    }
+
+    for (uint8_t bits : {uint8_t{4}, uint8_t{8}, uint8_t{16}}) {
+        WeightCapabilityFixture h0(bits, WeightFamily::H0);
+        h0.args.A.allocate(1, kBlockSize, bits);
+        ok = fails_atomically(h0.args, *single_packet, RmdStatus::unsupported_route,
+                              "H0 compact rejects before packet dispatch") && ok;
+    }
+
+    block_q8_h2 h2{};
+    h2.channel_scale = 1.0f;
+    ggml_gemmini_args_t h2_args{};
+    h2_args.I = h2_args.J = 1;
+    h2_args.K = kBlockSize;
+    h2_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h2;
+    h2_args.q8_h2_blocks = &h2;
+    h2_args.q8_h2_block_count = 1;
+    h2_args.q8_h2_blocks_per_row = 1;
+    ok = fails_atomically(h2_args, *single_packet, RmdStatus::unsupported_route,
+                          "H2 compact rejects before packet dispatch") && ok;
+
+    block_q8_hp2 hp2{};
+    hp2.channel_scale = 1.0f;
+    ggml_gemmini_args_t hp2_args{};
+    hp2_args.I = hp2_args.J = 1;
+    hp2_args.K = kBlockSize;
+    hp2_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_hp2;
+    hp2_args.q8_hp2_blocks = &hp2;
+    hp2_args.q8_hp2_block_count = 1;
+    hp2_args.q8_hp2_blocks_per_row = 1;
+    ok = fails_atomically(hp2_args, *single_packet, RmdStatus::unsupported_route,
+                          "HP2 compact rejects before packet dispatch") && ok;
+
+    CompactOracleFixture mixed(16, WeightFamily::H1);
+    mixed.args.A.allocate(CompactOracleFixture::rows,
+                          CompactOracleFixture::logical_k, 8);
+    ok = check(mixed.valid, "mixed artifact compact fixture builds") && ok;
+    if (mixed.valid) {
+        ok = fails_atomically(mixed.args, *mixed.packet, RmdStatus::unsupported_route,
+                              "mixed activation/weight identity rejects before dispatch") && ok;
+    }
+
+#if defined(GGML_GEMMINI_TESTING)
+    CompactOracleFixture widened_code(16, WeightFamily::H1);
+    ok = check(widened_code.valid, "widened native-code compact fixture builds") && ok;
+    if (widened_code.valid) {
+        CompressedOutput output = sentinel;
+        RmdExecutionMetrics metrics{};
+        const RmdStatus status = rmd::execute_rmd_stripe_gemmini_for_test(
+            widened_code.args, *widened_code.packet, output, &metrics);
+        ok = check(status == RmdStatus::overflow &&
+                       compressed_outputs_match(output, sentinel) &&
+                       metrics.packet_call_count == 0 && metrics.ws_call_count == 0 &&
+                       metrics.matmul_call_count == 0,
+                   "widened native code rejects before Gemmini dispatch") && ok;
+    }
+#else
+    ok = check(false, "compact failure matrix requires GGML_GEMMINI_TESTING") && ok;
+#endif
+
+    CompactOracleFixture scale_overflow(16, WeightFamily::HP1);
+    scale_overflow.q16_hp1[0].m = 62;
+    std::fill(std::begin(scale_overflow.q16_hp1[0].qs),
+              std::end(scale_overflow.q16_hp1[0].qs), int16_t{32767});
+    ok = check(scale_overflow.valid, "scale overflow compact fixture builds") && ok;
+    if (scale_overflow.valid) {
+        ok = fails_atomically(scale_overflow.args, *scale_overflow.packet,
+                              RmdStatus::overflow,
+                              "checked int64 block-scale overflow is failure-atomic") && ok;
+    }
+
+    CompactOracleFixture malformed(8, WeightFamily::H1);
+    ok = check(malformed.valid, "malformed compact fixture builds") && ok;
+    if (malformed.valid) {
+        StripePacket packet = *malformed.packet;
+        const BlockDescriptor & block = packet.blocks.front();
+        packet.stacked_activation[block.activation_offset + block.compact_k_count] = 1;
+        ok = fails_atomically(malformed.args, packet, RmdStatus::invalid_packet,
+                              "malformed compact packet is failure-atomic") && ok;
+    }
+
+    if (ok) {
+        std::puts(
+            "COMPACT_FAILURE_MATRIX h0=3 h2=1 hp2=1 mixed_identity=1 "
+            "widened_code=1 scale_overflow=1 malformed=1 dispatches=0 "
+            "output=unchanged");
+    }
+    return ok;
+}
+
+}
+
+static bool test_cpu_capture_is_canonical_and_packet_free() {
     using namespace ggml::gemmini::residual;
     TimedResidualCapture capture(ResidualRoute::cpu_direct);
     capture.reset(3, 7, 2, 64, 17);
@@ -133,7 +1101,7 @@ bool test_cpu_capture_is_canonical_and_packet_free() {
         check(events[2] == ResidualEvent{1, 33, -129}, "CPU event order row 1 k 33");
 }
 
-bool test_ws_capture_preserves_packet_contract() {
+static bool test_ws_capture_preserves_packet_contract() {
     using namespace ggml::gemmini::residual;
     RmdStripeBuilder legacy;
     legacy.reset(3, 7, 2, 64, 17);
@@ -159,7 +1127,7 @@ bool test_ws_capture_preserves_packet_contract() {
               "WS activation packet bytes preserved");
 }
 
-bool test_empty_capture_and_single_sink_selection() {
+static bool test_empty_capture_and_single_sink_selection() {
     using namespace ggml::gemmini::residual;
     TimedResidualCapture cpu(ResidualRoute::cpu_direct);
     cpu.reset(0, 0, 1, 1, 1);
@@ -176,7 +1144,7 @@ bool test_empty_capture_and_single_sink_selection() {
               "empty stripes skip timed finish work");
 }
 
-bool test_direct_payload_slicing_and_ownership() {
+static bool test_direct_payload_slicing_and_ownership() {
     using namespace ggml::gemmini::residual;
     static_assert(std::is_same_v<DirectStripePayloadHandle,
                                 std::shared_ptr<const DirectStripePayload>>,
@@ -213,7 +1181,7 @@ bool test_direct_payload_slicing_and_ownership() {
 }
 
 
-bool test_direct_payload_validation_rejects_malformed_contracts() {
+static bool test_direct_payload_validation_rejects_malformed_contracts() {
     using namespace ggml::gemmini::residual;
     auto valid = [] {
         DirectStripePayload payload;
@@ -256,7 +1224,7 @@ bool test_direct_payload_validation_rejects_malformed_contracts() {
                  "direct validator rejects duplicate keys") && ok;
 }
 
-bool test_exact_slice_validates_payload_and_dimensions() {
+static bool test_exact_slice_validates_payload_and_dimensions() {
     using namespace ggml::gemmini::residual;
     auto malformed = std::make_shared<DirectStripePayload>();
     malformed->stripe_id = 7;
@@ -291,7 +1259,7 @@ bool test_exact_slice_validates_payload_and_dimensions() {
                  "slice rejects overlapping payloads with mixed dimensions");
 }
 
-bool test_direct_builder_rejects_row_interval_overflow() {
+static bool test_direct_builder_rejects_row_interval_overflow() {
     using namespace ggml::gemmini::residual;
     DirectStripeBuilder builder;
     builder.reset(0, std::numeric_limits<size_t>::max(), 2, 8, 3);
@@ -300,21 +1268,87 @@ bool test_direct_builder_rejects_row_interval_overflow() {
         check(builder.finish() == nullptr, "overflow builder cannot finish");
 }
 
-int main() {
-    const bool ok = test_balanced_radix_decomposition() &&
-        test_q4_nonzero_fails_explicitly() &&
-        test_EXPLICIT_BLOCK_ID_DIM_PADDING() &&
-        test_empty_residual_is_empty_success() &&
-        test_padding_overflow_fails() &&
-        test_cpu_capture_is_canonical_and_packet_free() &&
-        test_ws_capture_preserves_packet_contract() &&
-        test_empty_capture_and_single_sink_selection() &&
-        test_direct_payload_slicing_and_ownership() &&
-        test_direct_payload_validation_rejects_malformed_contracts() &&
-        test_exact_slice_validates_payload_and_dimensions() &&
-        test_direct_builder_rejects_row_interval_overflow();
+enum class TestSelection {
+    all,
+    happy_table,
+    failure_table,
+    direct_happy,
+    direct_failure,
+    compact_happy,
+    compact_failure,
+    invalid,
+};
+
+static TestSelection parse_selection(int argc, char ** argv) {
+    if (argc == 1) return TestSelection::all;
+    if (argc != 2) return TestSelection::invalid;
+    if (std::strcmp(argv[1], "--case=happy-table") == 0) return TestSelection::happy_table;
+    if (std::strcmp(argv[1], "--case=failure-table") == 0) return TestSelection::failure_table;
+    if (std::strcmp(argv[1], "--case=direct-happy") == 0) return TestSelection::direct_happy;
+    if (std::strcmp(argv[1], "--case=direct-failure") == 0) return TestSelection::direct_failure;
+    if (std::strcmp(argv[1], "--case=compact-happy") == 0) return TestSelection::compact_happy;
+    if (std::strcmp(argv[1], "--case=compact-failure") == 0) return TestSelection::compact_failure;
+    return TestSelection::invalid;
+}
+
+int main(int argc, char ** argv) {
+    const TestSelection selection = parse_selection(argc, argv);
+    if (selection == TestSelection::invalid) {
+        std::fputs(
+            "usage: test-gemmini-rmd [--case=happy-table|--case=failure-table|"
+            "--case=direct-happy|--case=direct-failure|--case=compact-happy|"
+            "--case=compact-failure]\n",
+            stderr);
+        return 2;
+    }
+
+    bool ok = true;
+    if (selection == TestSelection::all || selection == TestSelection::happy_table) {
+        ok = test_balanced_radix_decomposition() && ok;
+        ok = test_EXPLICIT_BLOCK_ID_DIM_PADDING() && ok;
+        ok = test_empty_residual_is_empty_success() && ok;
+        ok = test_cpu_capture_is_canonical_and_packet_free() && ok;
+        ok = test_ws_capture_preserves_packet_contract() && ok;
+        ok = test_empty_capture_and_single_sink_selection() && ok;
+        ok = test_direct_payload_slicing_and_ownership() && ok;
+        ok = test_weight_capability_happy_table() && ok;
+    }
+    if (selection == TestSelection::all || selection == TestSelection::failure_table) {
+        ok = test_q4_nonzero_fails_explicitly() && ok;
+        ok = test_padding_overflow_fails() && ok;
+        ok = test_direct_payload_validation_rejects_malformed_contracts() && ok;
+        ok = test_exact_slice_validates_payload_and_dimensions() && ok;
+        ok = test_direct_builder_rejects_row_interval_overflow() && ok;
+        ok = test_weight_capability_failure_table() && ok;
+    }
+    if (selection == TestSelection::all || selection == TestSelection::direct_happy) {
+        ok = test_direct_oracle_happy_matrix() && ok;
+    }
+    if (selection == TestSelection::all || selection == TestSelection::direct_failure) {
+        ok = test_direct_failure_matrix() && ok;
+    }
+    if (selection == TestSelection::all || selection == TestSelection::compact_happy) {
+        ok = test_compact_oracle_happy_matrix() && ok;
+    }
+    if (selection == TestSelection::all || selection == TestSelection::compact_failure) {
+        ok = test_compact_failure_matrix() && ok;
+    }
     if (ok) {
-        std::puts("PASS: balanced radix, q4 failure, block boundaries, lane gaps, padding, empty residual, overflow");
+        const char * message =
+            selection == TestSelection::direct_happy ?
+                "PASS: matched-width CPU-direct oracle matrix" :
+            selection == TestSelection::direct_failure ?
+                "PASS: matched-width CPU-direct failure matrix" :
+            selection == TestSelection::compact_happy ?
+                "PASS: matched-width compact software oracle matrix" :
+            selection == TestSelection::compact_failure ?
+                "PASS: matched-width compact failure matrix" :
+            selection == TestSelection::failure_table ?
+                "PASS: RMD residual weight failure table" :
+            selection == TestSelection::happy_table ?
+                "PASS: RMD residual weight happy table" :
+                "PASS: RMD residual weight plus matched-width direct and compact matrices";
+        std::puts(message);
     }
     return ok ? 0 : 1;
 }

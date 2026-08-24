@@ -1,85 +1,141 @@
 #include "../include/gemmini/log.hpp"
 
+#include <atomic>
 #include <cstdlib>
-#include <cstring>
 #include <filesystem>
 #include <mutex>
+#include <new>
 #include <string>
-#include <string_view>
 #include <system_error>
 
 namespace ggml::gemmini::log
 {
-    namespace
+    namespace detail
     {
-        bool path_starts_with_log_dir(const char *path)
+        std::mutex &output_mutex()
         {
-            if (!path || *path == '\0')
+            if (consume_fault(testing::LogFault::mutex))
             {
-                return false;
+                throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
             }
-            const std::string_view value(path);
-            if (value.rfind("log", 0) != 0)
-            {
-                return false;
-            }
-            return value.size() == 3 || value[3] == '/' || value[3] == '\\';
+            static std::mutex *mutex = new std::mutex;
+            return *mutex;
         }
-    }
+
+        static std::atomic<testing::LogFault> injected_fault{testing::LogFault::none};
+        static std::atomic<testing::TargetLockHook> target_lock_hook{nullptr};
+        static std::atomic<void *> target_lock_hook_user_data{nullptr};
+
+        bool consume_fault(testing::LogFault expected)
+        {
+            testing::LogFault value = expected;
+            return injected_fault.compare_exchange_strong(value, testing::LogFault::none);
+        }
+
+        void invoke_target_lock_hook(testing::TargetWriteKind kind)
+        {
+            const testing::TargetLockHook hook = target_lock_hook.load(std::memory_order_acquire);
+            if (hook) hook(kind, target_lock_hook_user_data.load(std::memory_order_relaxed));
+        }
+    } // namespace detail
+
+    namespace testing
+    {
+        void set_target_lock_hook(TargetLockHook hook, void *user_data)
+        {
+            detail::target_lock_hook_user_data.store(user_data, std::memory_order_relaxed);
+            detail::target_lock_hook.store(hook, std::memory_order_release);
+        }
+
+        void clear_target_lock_hook()
+        {
+            detail::target_lock_hook.store(nullptr, std::memory_order_release);
+            detail::target_lock_hook_user_data.store(nullptr, std::memory_order_relaxed);
+        }
+
+        void set_log_fault(LogFault fault)
+        {
+            detail::injected_fault.store(fault);
+        }
+
+        void clear_log_fault()
+        {
+            detail::injected_fault.store(LogFault::none);
+        }
+    } // namespace testing
 
     std::filesystem::path resolve_output_path(const char *path)
     {
+        if (detail::consume_fault(testing::LogFault::filesystem))
+        {
+            throw std::filesystem::filesystem_error("injected logger filesystem failure", std::error_code{});
+        }
         if (!path || *path == '\0')
         {
             return {};
         }
 
-        std::filesystem::path p(path);
-        if (p.is_absolute())
+        const std::filesystem::path requested(path);
+        if (requested.is_absolute())
         {
-            return p;
+            return requested;
         }
 
-        // Highest priority: force all relative paths under GEMMINI_LOG_DIR.
-        // For callers that use `log/<name>`, strip the leading `log/` so
-        // `log/out.jsonl` becomes `$GEMMINI_LOG_DIR/out.jsonl`.
-        if (const char *env_dir = std::getenv("GEMMINI_LOG_DIR"))
+        std::filesystem::path relative;
+        bool first = true;
+        for (const std::filesystem::path &component : requested)
         {
-            if (*env_dir)
+            if (component == "..")
             {
-                std::filesystem::path base(env_dir);
-                std::filesystem::path rel = p;
-                if (path_starts_with_log_dir(path))
-                {
-                    rel = p.lexically_relative("log");
-                    if (rel.empty() || rel == ".")
-                    {
-                        rel.clear();
-                    }
-                }
-                return rel.empty() ? base : (base / rel);
+                return {};
             }
+            if (component.empty() || component == ".")
+            {
+                continue;
+            }
+            if (first && component == "log")
+            {
+                first = false;
+                continue;
+            }
+            first = false;
+            relative /= component;
+        }
+        if (relative.empty())
+        {
+            return {};
         }
 
-        if (path_starts_with_log_dir(path))
+        std::error_code ec;
+        std::filesystem::path base;
+        if (const char *env_dir = std::getenv("GEMMINI_LOG_DIR"); env_dir && *env_dir)
         {
-            std::filesystem::path rel = p.lexically_relative("log");
-            if (rel.empty() || rel == ".")
-            {
-                rel.clear();
-            }
-
-            std::error_code ec;
-            std::filesystem::path cwd = std::filesystem::current_path(ec);
-            if (ec || cwd.empty())
-            {
-                cwd = ".";
-            }
-            std::filesystem::path base = cwd / "output" / "log";
-            return rel.empty() ? base : (base / rel);
+            base = std::filesystem::absolute(env_dir, ec);
+        }
+        else
+        {
+            base = std::filesystem::current_path(ec);
+            if (!ec) base /= "output/log";
+        }
+        if (ec || base.empty())
+        {
+            return {};
         }
 
-        return p;
+        const std::filesystem::path confined_base = std::filesystem::weakly_canonical(base, ec);
+        if (ec) return {};
+        const std::filesystem::path candidate = std::filesystem::weakly_canonical(confined_base / relative, ec);
+        if (ec) return {};
+        auto base_it = confined_base.begin();
+        auto candidate_it = candidate.begin();
+        for (; base_it != confined_base.end(); ++base_it, ++candidate_it)
+        {
+            if (candidate_it == candidate.end() || *candidate_it != *base_it)
+            {
+                return {};
+            }
+        }
+        return candidate;
     }
 
     bool prepare_output_parent(const std::filesystem::path &path)
@@ -96,10 +152,26 @@ namespace ggml::gemmini::log
 
     namespace
     {
-        FILE *open_output_file(const std::filesystem::path &path)
+        class ScopedFile
         {
+        public:
+            explicit ScopedFile(FILE *file) : file_(file) {}
+            ~ScopedFile() { if (file_) std::fclose(file_); }
+            ScopedFile(const ScopedFile &) = delete;
+            ScopedFile &operator=(const ScopedFile &) = delete;
+
+        private:
+            FILE *file_;
+        };
+
+        FILE *open_output_file(const std::filesystem::path &path, const char *mode = "a")
+        {
+            if (detail::consume_fault(testing::LogFault::open))
+            {
+                return nullptr;
+            }
             const std::string key = path.string();
-            return std::fopen(key.c_str(), "a");
+            return std::fopen(key.c_str(), mode);
         }
 
         void append_json_escaped(std::string &out, const char *s)
@@ -152,6 +224,11 @@ namespace ggml::gemmini::log
 
         std::string vformat_printf(const char *fmt, va_list ap)
         {
+            if (detail::consume_fault(testing::LogFault::format) ||
+                detail::consume_fault(testing::LogFault::allocation))
+            {
+                throw std::bad_alloc();
+            }
             const char *safe_fmt = fmt ? fmt : "";
             va_list ap_copy;
             va_copy(ap_copy, ap);
@@ -219,13 +296,7 @@ namespace ggml::gemmini::log
                 append_json_escaped(json, v);
                 json.push_back('"');
             };
-            auto add_u64 = [&](const char *k, unsigned long long v)
-            {
-                add_key(k);
-                char buf[32];
-                std::snprintf(buf, sizeof(buf), "%llu", v);
-                json += buf;
-            };
+#if LOG_DETAIL
             auto add_i32 = [&](const char *k, int v)
             {
                 add_key(k);
@@ -233,6 +304,7 @@ namespace ggml::gemmini::log
                 std::snprintf(buf, sizeof(buf), "%d", v);
                 json += buf;
             };
+#endif
 
             json.push_back('{');
             add_str("layer", layer);
@@ -261,65 +333,6 @@ namespace ggml::gemmini::log
             std::fflush(out);
         }
 
-        void write_jsonl_ws_loop(FILE *out, uint64_t wall, uint64_t load, uint64_t exe, uint64_t store, uint64_t loop,
-                                 uint64_t dim_I, uint64_t dim_J, uint64_t dim_K,
-                                 uint64_t tile_I, uint64_t tile_J, uint64_t tile_K,
-                                 uint64_t I0, uint64_t J0, uint64_t K0,
-                                 uint64_t a_reuse, uint64_t b_reuse)
-        {
-            if (!out)
-            {
-                return;
-            }
-
-            std::string json;
-            json.reserve(256);
-            bool first = true;
-            auto add_key = [&](const char *key)
-            {
-                if (!first)
-                {
-                    json.push_back(',');
-                }
-                first = false;
-                json.push_back('"');
-                json += key;
-                json += "\":";
-            };
-            auto add_u64 = [&](const char *key, uint64_t value)
-            {
-                add_key(key);
-                char buf[32];
-                std::snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(value));
-                json += buf;
-            };
-
-            json.push_back('{');
-            add_key("event");
-            json += "\"ws_loop\"";
-            add_u64("wall", wall);
-            add_u64("load", load);
-            add_u64("exe", exe);
-            add_u64("store", store);
-            add_u64("loop", loop);
-            add_u64("dim_I", dim_I);
-            add_u64("dim_J", dim_J);
-            add_u64("dim_K", dim_K);
-            add_u64("tile_I", tile_I);
-            add_u64("tile_J", tile_J);
-            add_u64("tile_K", tile_K);
-            add_u64("I0", I0);
-            add_u64("J0", J0);
-            add_u64("K0", K0);
-            add_u64("a_reuse", a_reuse);
-            add_u64("b_reuse", b_reuse);
-            add_u64("valid", 1);
-            json += "}\n";
-            static std::mutex write_mutex;
-            std::lock_guard<std::mutex> lock(write_mutex);
-            std::fwrite(json.data(), 1, json.size(), out);
-            std::fflush(out);
-        }
     } // namespace
 
     LogTarget file(const char *path)
@@ -329,109 +342,152 @@ namespace ggml::gemmini::log
 
     bool truncate_file(const char *path)
     {
-        if (path == nullptr || *path == '\0')
+        std::lock_guard<std::mutex> lock(detail::output_mutex());
+        const std::filesystem::path resolved = resolve_output_path(path);
+        if (resolved.empty() || !prepare_output_parent(resolved))
         {
             return false;
         }
-
-        std::filesystem::path resolved = resolve_output_path(path);
-        if (resolved.empty())
-        {
-            return false;
-        }
-        prepare_output_parent(resolved);
-
-        FILE *file = std::fopen(resolved.string().c_str(), "w");
+        FILE *file = open_output_file(resolved, "w");
         if (!file)
         {
             return false;
         }
-        std::fclose(file);
-        return true;
+        return std::fclose(file) == 0;
     }
 
     Log::Log(FILE *out) : out_(out), owns_(false) {}
 
     Log::~Log()
     {
-        close_owned();
+        std::lock_guard<std::mutex> lock(detail::output_mutex());
+        close_owned_unlocked();
     }
 
-    void Log::set_output(FILE *out)
+    void Log::set_output_unlocked(FILE *out)
     {
         has_explicit_output_ = true;
-
         if (out == out_ && !owns_)
         {
             return;
         }
-        close_owned();
+        close_owned_unlocked();
         out_ = out;
         owns_ = false;
     }
 
-    bool Log::set_output_path(const char *path)
+    void Log::set_output(FILE *out)
     {
-        has_explicit_output_ = true;
+        std::lock_guard<std::mutex> lock(detail::output_mutex());
+        set_output_unlocked(out);
+    }
 
+    bool Log::set_output_path_unlocked(const char *path, bool truncate, const char **failure)
+    {
+        if (failure) *failure = nullptr;
+        has_explicit_output_ = true;
         if (path == nullptr || *path == '\0')
         {
-            set_output(stderr);
+            set_output_unlocked(stderr);
             return true;
         }
 
-        std::filesystem::path resolved = resolve_output_path(path);
-        if (resolved.empty())
+        const std::filesystem::path resolved = resolve_output_path(path);
+        if (resolved.empty() || !prepare_output_parent(resolved))
         {
+            if (failure) *failure = "setup";
             return false;
         }
-        prepare_output_parent(resolved);
-
-        FILE *file = open_output_file(resolved);
+        std::error_code exists_error;
+        const bool existed = std::filesystem::exists(resolved, exists_error);
+        if (truncate)
+        {
+            FILE *truncated = open_output_file(resolved, "w");
+            if (!truncated)
+            {
+                if (failure) *failure = "open";
+                return false;
+            }
+            if (std::fclose(truncated) != 0)
+            {
+                if (failure) *failure = "setup";
+                return false;
+            }
+        }
+        FILE *file = open_output_file(resolved, "a");
         if (!file)
         {
+            if (!existed && !exists_error)
+            {
+                std::error_code remove_error;
+                std::filesystem::remove(resolved, remove_error);
+            }
+            if (failure) *failure = "open";
             return false;
         }
-        close_owned();
+        if (detail::consume_fault(testing::LogFault::replacement))
+        {
+            std::fclose(file);
+            if (!existed && !exists_error)
+            {
+                std::error_code remove_error;
+                std::filesystem::remove(resolved, remove_error);
+            }
+            if (failure) *failure = "replacement";
+            return false;
+        }
+        close_owned_unlocked();
         out_ = file;
         owns_ = true;
         return true;
     }
 
-    FILE *Log::select_output(const char *path, bool *owns) const
+    bool Log::set_output_path(const char *path)
+    {
+        std::lock_guard<std::mutex> lock(detail::output_mutex());
+        return set_output_path_unlocked(path, false);
+    }
+
+    bool Log::has_explicit_output() const
+    {
+        std::lock_guard<std::mutex> lock(detail::output_mutex());
+        return has_explicit_output_;
+    }
+
+    FILE *Log::select_output_unlocked(const char *path, bool *owns) const
     {
         if (path && *path)
         {
-            std::filesystem::path resolved = resolve_output_path(path);
-            if (!resolved.empty())
+            const std::filesystem::path resolved = resolve_output_path(path);
+            if (!resolved.empty() && prepare_output_parent(resolved))
             {
-                prepare_output_parent(resolved);
                 FILE *file = open_output_file(resolved);
                 if (file)
                 {
-                    if (owns)
-                    {
-                        *owns = true;
-                    }
+                    if (owns) *owns = true;
                     return file;
                 }
             }
+            if (owns) *owns = false;
+            return nullptr;
         }
-        if (owns)
-        {
-            *owns = false;
-        }
+        if (owns) *owns = false;
         return out_;
     }
 
-    void Log::close_owned()
+    void Log::close_owned_unlocked()
     {
         if (owns_ && out_)
         {
             std::fclose(out_);
-            out_ = nullptr;
-            owns_ = false;
         }
+        out_ = nullptr;
+        owns_ = false;
+    }
+
+    void Log::disable_output_unlocked()
+    {
+        close_owned_unlocked();
     }
 
     DebugLog debug;
@@ -453,16 +509,13 @@ namespace ggml::gemmini::log
         return result;
     }
 
-    DebugLog::DebugLog(FILE *out, bool add_newline)
-        : Log(out), add_newline_(add_newline) {}
+    DebugLog::DebugLog(FILE *out) : Log(out) {}
 
     bool DebugLog::set_output_path(const char *path, bool truncate)
     {
 #if LOG_DEBUG
-        if (truncate && path && *path && !truncate_file(path)) {
-            return false;
-        }
-        return Log::set_output_path(path);
+        std::lock_guard<std::mutex> lock(detail::output_mutex());
+        return set_output_path_unlocked(path, truncate);
 #else
         (void)path;
         (void)truncate;
@@ -481,6 +534,7 @@ namespace ggml::gemmini::log
         trim_trailing_newlines(msg);
         write_jsonl_debug(out, file, line, func, nullptr, msg);
 #else
+        (void)out;
         (void)file;
         (void)line;
         (void)func;
@@ -500,6 +554,7 @@ namespace ggml::gemmini::log
         trim_trailing_newlines(msg);
         write_jsonl_debug(out, file, line, func, layer, msg);
 #else
+        (void)out;
         (void)file;
         (void)line;
         (void)func;
@@ -513,7 +568,7 @@ namespace ggml::gemmini::log
     {
         va_list ap;
         va_start(ap, fmt);
-        vwrite(out_, nullptr, 0, nullptr, fmt, ap);
+        v(fmt, ap);
         va_end(ap);
     }
 
@@ -521,23 +576,17 @@ namespace ggml::gemmini::log
     {
         va_list ap;
         va_start(ap, fmt);
-        vwrite(out_, file, line, func, fmt, ap);
+        v_loc(file, line, func, fmt, ap);
         va_end(ap);
     }
 
     void DebugLog::operator()(LogTarget target, const char *fmt, ...)
     {
 #if LOG_DEBUG
-        bool owns = false;
-        FILE *out = select_output(target.path, &owns);
         va_list ap;
         va_start(ap, fmt);
-        vwrite(out, nullptr, 0, nullptr, fmt, ap);
+        v_target(target, fmt, ap);
         va_end(ap);
-        if (owns && out)
-        {
-            std::fclose(out);
-        }
 #else
         (void)target;
         (void)fmt;
@@ -547,16 +596,10 @@ namespace ggml::gemmini::log
     void DebugLog::operator()(LogTarget target, const char *file, int line, const char *func, const char *fmt, ...)
     {
 #if LOG_DEBUG
-        bool owns = false;
-        FILE *out = select_output(target.path, &owns);
         va_list ap;
         va_start(ap, fmt);
-        vwrite(out, file, line, func, fmt, ap);
+        v_target_loc(target, file, line, func, fmt, ap);
         va_end(ap);
-        if (owns && out)
-        {
-            std::fclose(out);
-        }
 #else
         (void)target;
         (void)file;
@@ -570,24 +613,17 @@ namespace ggml::gemmini::log
     {
         va_list ap;
         va_start(ap, fmt);
-        vwrite_layer_fmt(out_, nullptr, 0, nullptr, layer, fmt, ap);
+        v_layer(layer, fmt, ap);
         va_end(ap);
     }
 
     void DebugLog::operator()(LogTarget target, const char *layer, const char *fmt, ...)
     {
 #if LOG_DEBUG
-
-        bool owns = false;
-        FILE *out = select_output(target.path, &owns);
         va_list ap;
         va_start(ap, fmt);
-        vwrite_layer_fmt(out, nullptr, 0, nullptr, layer, fmt, ap);
+        v_target_layer(target, layer, fmt, ap);
         va_end(ap);
-        if (owns && out)
-        {
-            std::fclose(out);
-        }
 #else
         (void)target;
         (void)layer;
@@ -597,29 +633,31 @@ namespace ggml::gemmini::log
 
     void DebugLog::v(const char *fmt, va_list ap)
     {
+        std::lock_guard<std::mutex> lock(detail::output_mutex());
         vwrite(out_, nullptr, 0, nullptr, fmt, ap);
     }
 
     void DebugLog::v_layer(const char *layer, const char *fmt, va_list ap)
     {
+        std::lock_guard<std::mutex> lock(detail::output_mutex());
         vwrite_layer_fmt(out_, nullptr, 0, nullptr, layer, fmt, ap);
     }
 
     void DebugLog::v_loc(const char *file, int line, const char *func, const char *fmt, va_list ap)
     {
+        std::lock_guard<std::mutex> lock(detail::output_mutex());
         vwrite(out_, file, line, func, fmt, ap);
     }
 
     void DebugLog::v_target(LogTarget target, const char *fmt, va_list ap)
     {
 #if LOG_DEBUG
+        std::lock_guard<std::mutex> lock(detail::output_mutex());
+        detail::invoke_target_lock_hook(testing::TargetWriteKind::plain);
         bool owns = false;
-        FILE *out = select_output(target.path, &owns);
+        FILE *out = select_output_unlocked(target.path, &owns);
+        ScopedFile owned_output(owns ? out : nullptr);
         vwrite(out, nullptr, 0, nullptr, fmt, ap);
-        if (owns && out)
-        {
-            std::fclose(out);
-        }
 #else
         (void)target;
         (void)fmt;
@@ -630,13 +668,12 @@ namespace ggml::gemmini::log
     void DebugLog::v_target_layer(LogTarget target, const char *layer, const char *fmt, va_list ap)
     {
 #if LOG_DEBUG
+        std::lock_guard<std::mutex> lock(detail::output_mutex());
+        detail::invoke_target_lock_hook(testing::TargetWriteKind::layer);
         bool owns = false;
-        FILE *out = select_output(target.path, &owns);
+        FILE *out = select_output_unlocked(target.path, &owns);
+        ScopedFile owned_output(owns ? out : nullptr);
         vwrite_layer_fmt(out, nullptr, 0, nullptr, layer, fmt, ap);
-        if (owns && out)
-        {
-            std::fclose(out);
-        }
 #else
         (void)target;
         (void)layer;
@@ -645,55 +682,16 @@ namespace ggml::gemmini::log
 #endif
     }
 
-    void DebugLog::ws_loop(LogTarget target, uint64_t wall, uint64_t load, uint64_t exe, uint64_t store, uint64_t loop,
-                           uint64_t dim_I, uint64_t dim_J, uint64_t dim_K,
-                           uint64_t tile_I, uint64_t tile_J, uint64_t tile_K,
-                           uint64_t I0, uint64_t J0, uint64_t K0,
-                           uint64_t a_reuse, uint64_t b_reuse)
-    {
-#if LOG_DEBUG
-        bool owns = false;
-        FILE *out = select_output(target.path, &owns);
-        write_jsonl_ws_loop(out, wall, load, exe, store, loop,
-                            dim_I, dim_J, dim_K,
-                            tile_I, tile_J, tile_K,
-                            I0, J0, K0, a_reuse, b_reuse);
-        if (owns && out)
-        {
-            std::fclose(out);
-        }
-#else
-        (void)target;
-        (void)wall;
-        (void)load;
-        (void)exe;
-        (void)store;
-        (void)loop;
-        (void)dim_I;
-        (void)dim_J;
-        (void)dim_K;
-        (void)tile_I;
-        (void)tile_J;
-        (void)tile_K;
-        (void)I0;
-        (void)J0;
-        (void)K0;
-        (void)a_reuse;
-        (void)b_reuse;
-#endif
-    }
-
     void DebugLog::v_target_loc(LogTarget target, const char *file, int line, const char *func,
                                 const char *fmt, va_list ap)
     {
 #if LOG_DEBUG
+        std::lock_guard<std::mutex> lock(detail::output_mutex());
+        detail::invoke_target_lock_hook(testing::TargetWriteKind::location);
         bool owns = false;
-        FILE *out = select_output(target.path, &owns);
+        FILE *out = select_output_unlocked(target.path, &owns);
+        ScopedFile owned_output(owns ? out : nullptr);
         vwrite(out, file, line, func, fmt, ap);
-        if (owns && out)
-        {
-            std::fclose(out);
-        }
 #else
         (void)target;
         (void)file;

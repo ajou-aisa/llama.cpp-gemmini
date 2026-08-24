@@ -4,8 +4,8 @@
 #ifdef __cplusplus
 extern "C"
 {
-#endif
-    uint64_t gemmini_read_cycles(void);
-#ifdef __cplusplus
+    uint64_t gemmini_read_cycles(void) noexcept;
 }
+#else
+    uint64_t gemmini_read_cycles(void);
 #endif

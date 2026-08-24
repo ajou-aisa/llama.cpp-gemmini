@@ -2,8 +2,8 @@
 
 #include "direct/direct-builder.hpp"
 #include "rmd/rmd-builder.hpp"
+#include <gemmini/cycle_reader.hpp>
 
-#include <chrono>
 #include <variant>
 
 namespace ggml::gemmini::residual {
@@ -62,15 +62,18 @@ public:
     ResidualStripePayload finish() {
         ResidualStripePayload result;
         if (empty()) return result;
-        const auto start = std::chrono::steady_clock::now();
+#if LOG_CYCLE
+        const uint64_t start = cycle::timestamp_ns();
+#endif
         if (auto *cpu = std::get_if<DirectStripeBuilder>(&sink_)) {
             result.direct = cpu->finish();
         } else {
             result.packet = std::get<rmd::RmdStripeBuilder>(sink_).finish();
         }
-        const auto end = std::chrono::steady_clock::now();
-        result.capture_ns = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+#if LOG_CYCLE
+        const uint64_t end = cycle::timestamp_ns();
+        result.capture_ns = end >= start ? end - start : 0;
+#endif
         return result;
     }
 
