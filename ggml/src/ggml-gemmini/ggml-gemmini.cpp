@@ -1899,7 +1899,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 #endif
         }
         ggml::gemmini::im2p_adapter::log_stats(
-            "full", completion.stats, args);
+            "full", completion.stats, completion.run_id, args);
         return;
       }
 
@@ -1962,7 +1962,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 #endif
       }
       ggml::gemmini::im2p_adapter::log_stats(
-          "stripe_pipeline", completion.stats, args);
+          "stripe_pipeline", completion.stats, completion.run_id, args);
       return;
     }
 #endif
@@ -2013,7 +2013,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
       }
       ggml::gemmini::im2p_adapter::log_stats(
           pipeline_requested ? "stripe_pipeline" : "full",
-          completion.stats, args);
+          completion.stats, completion.run_id, args);
     }
 #endif
 

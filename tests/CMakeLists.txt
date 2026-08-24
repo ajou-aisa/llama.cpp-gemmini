@@ -572,6 +572,7 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
             COMMAND ${CMAKE_COMMAND}
                 -DTEST_BINARY=$<TARGET_FILE:test-gemmini-im2p-routing>
                 -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/gemmini-im2p-cycle-overlap
+                -DTEST_DIM=${GGML_GEMMINI_DIM}
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-im2p-cycle-overlap.cmake)
     endif()
 

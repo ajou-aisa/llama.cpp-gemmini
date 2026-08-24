@@ -9,6 +9,10 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -89,6 +93,42 @@ ggml_gemmini_args_t lifecycle_args(std::vector<elem_t> &activation,
   args.tiled_matmul_type = static_cast<tiled_matmul_type_t>(2);
   args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = {0};
   return args;
+}
+
+bool test_transactional_stripe_log_failures() {
+#if defined(GGML_GEMMINI_ROUTING_BINARY)
+  constexpr std::array<const char *, 12> selectors{{
+      "full", "quantization", "provider", "progress", "poll", "fence",
+      "rmd", "dense", "output-authorization", "malformed-completion",
+      "incomplete-publication", "output-copy"}};
+  for (const char *selector : selectors) {
+    std::error_code error;
+    std::filesystem::remove_all("output", error);
+    if (error) {
+      return lifecycle_check(false, "clear task-owned cycle log root");
+    }
+    const std::string command = std::string("\"") +
+        GGML_GEMMINI_ROUTING_BINARY + "\" --case " + selector;
+    if (!lifecycle_check(std::system(command.c_str()) == 0,
+                         "production-linked failure selector passes")) {
+      return false;
+    }
+    std::ifstream input("output/log/cycle-log.jsonl", std::ios::binary);
+    const std::string log((std::istreambuf_iterator<char>(input)),
+                          std::istreambuf_iterator<char>());
+    if (!lifecycle_check(
+            log.find("\"record_type\":\"IM2P_STRIPE_TELEMETRY\"") ==
+                std::string::npos,
+            "FULL and failed transactions emit zero stripe rows")) {
+      return false;
+    }
+  }
+  std::error_code error;
+  std::filesystem::remove_all("output", error);
+  return lifecycle_check(!error, "clean task-owned failure cycle logs");
+#else
+  return lifecycle_check(false, "routing binary path is unavailable");
+#endif
 }
 
 bool test_stage_state_failures() {
@@ -186,7 +226,7 @@ bool test_stage_state_failures() {
   ok = lifecycle_check(output == sentinel,
                        "all stage failures preserve the caller sentinel") &&
        ok;
-  return ok;
+  return test_transactional_stripe_log_failures() && ok;
 }
 
 bool test_capability_matrix() {

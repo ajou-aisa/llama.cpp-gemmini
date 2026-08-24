@@ -521,8 +521,14 @@ int main() {
             "${GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE}"
             "${GGML_GEMMINI_IM2P_SIM_ARCHIVE}"
             Threads::Threads
-            ${CMAKE_DL_LIBS})
+            ${CMAKE_DL_LIBS}
+        COMPILE_OUTPUT_VARIABLE _GGML_GEMMINI_IM2P_PAIR_PROBE_BUILD_OUTPUT)
     if(NOT _GGML_GEMMINI_IM2P_PAIR_PROBE_COMPILED)
+        if(_GGML_GEMMINI_IM2P_PAIR_PROBE_BUILD_OUTPUT MATCHES
+           "im2p_poll_completed_extended")
+            message(FATAL_ERROR
+                "Incompatible IM2P pair: simulator archive is missing required symbol im2p_poll_completed_extended")
+        endif()
         message(FATAL_ERROR
             "IM2P frontend args layout mismatch or incompatible pair: unable to link the selected frontend/simulator pair")
     endif()

@@ -962,12 +962,12 @@ bool run_im2p_semantic_logging_contract() {
   close(capture[1]);
   Stats full{};
   full.rtl_work_total_cycles = 117;
-  log_stats("full", full, args);
+  log_stats("full", full, 41, args);
   Stats pipeline{};
   pipeline.rtl_work_total_cycles = 217;
   pipeline.rtl_stripes_published = 3;
   pipeline.rtl_stripe_rows_published = 65;
-  log_stats("stripe_pipeline", pipeline, args);
+  log_stats("stripe_pipeline", pipeline, 42, args);
   std::fflush(stderr);
   dup2(saved_stderr, STDERR_FILENO);
   close(saved_stderr);
@@ -984,14 +984,26 @@ bool run_im2p_semantic_logging_contract() {
   const auto second = first == std::string::npos
                           ? std::string::npos
                           : output.find(layer_json, first + layer_json.size());
-  return check(first != std::string::npos && second != std::string::npos,
-               "FULL and PIPELINE IM2P debug records retain the semantic layer") &&
-         check(output.find("IM2P_EXECUTION_TELEMETRY_DETAIL mode=full") !=
-                       std::string::npos &&
-                   output.find(
-                       "IM2P_EXECUTION_TELEMETRY_DETAIL mode=stripe_pipeline") !=
-                       std::string::npos,
-               "FULL and PIPELINE IM2P debug details preserve completion modes");
+#if LOG_CYCLE
+  const bool cycle_layers = first != std::string::npos &&
+                            second != std::string::npos;
+#else
+  const bool cycle_layers = first == std::string::npos;
+#endif
+#if LOG_DEBUG
+  const bool debug_modes =
+      output.find("IM2P_EXECUTION_TELEMETRY_DETAIL mode=full") !=
+          std::string::npos &&
+      output.find("IM2P_EXECUTION_TELEMETRY_DETAIL mode=stripe_pipeline") !=
+          std::string::npos;
+#else
+  const bool debug_modes =
+      output.find("IM2P_EXECUTION_TELEMETRY_DETAIL") == std::string::npos;
+#endif
+  return check(cycle_layers,
+               "IM2P cycle records follow the configured cycle sink state") &&
+         check(debug_modes,
+               "IM2P debug detail follows the configured debug sink state");
 }
 
 bool check_graph_stripe_trace(
@@ -1615,9 +1627,13 @@ bool run_exsia_boundary_failure(
   const bool quantization = failure == TestFailure::quantization;
   const bool progress = failure == TestFailure::progress;
   const bool poll = failure == TestFailure::poll;
-  const char *failure_name = quantization ? "quantization"
-                             : progress   ? "progress"
-                                          : "poll";
+  const char *failure_name =
+      quantization ? "quantization"
+      : failure == TestFailure::provider ? "provider"
+      : progress ? "progress"
+      : poll ? "poll"
+      : failure == TestFailure::malformed_completion ? "malformed-completion"
+                                                     : "incomplete-publication";
   const bool ok =
       check(status != GGML_STATUS_SUCCESS,
             "production boundary failure reaches graph status") &&
@@ -1692,7 +1708,8 @@ bool run_exsia_staged_failure(
                        : failure == TestFailure::compose ? "compose"
                        : failure == TestFailure::output_authorization
                            ? "output-authorization"
-                           : "rmd";
+                       : failure == TestFailure::output_copy ? "output-copy"
+                                                            : "rmd";
     std::printf("failure=%s error=execution_failure sentinel=preserved full=0 "
                 "hardware=0 fallback=0 live_runs=0\n", name);
   }
@@ -2267,12 +2284,21 @@ int main(int argc, char **argv) {
     } else if (selected == "quantization") {
       selected_ok = run_exsia_boundary_failure(
           ggml::gemmini::im2p_adapter::TestFailure::quantization);
+    } else if (selected == "provider") {
+      selected_ok = run_exsia_boundary_failure(
+          ggml::gemmini::im2p_adapter::TestFailure::provider);
     } else if (selected == "progress") {
       selected_ok = run_exsia_boundary_failure(
           ggml::gemmini::im2p_adapter::TestFailure::progress);
     } else if (selected == "poll") {
       selected_ok = run_exsia_boundary_failure(
           ggml::gemmini::im2p_adapter::TestFailure::poll);
+    } else if (selected == "malformed-completion") {
+      selected_ok = run_exsia_boundary_failure(
+          ggml::gemmini::im2p_adapter::TestFailure::malformed_completion);
+    } else if (selected == "incomplete-publication") {
+      selected_ok = run_exsia_boundary_failure(
+          ggml::gemmini::im2p_adapter::TestFailure::incomplete_publication);
     } else if (selected == "fence") {
       selected_ok = run_exsia_staged_failure(
           ggml::gemmini::im2p_adapter::TestFailure::fence);
@@ -2286,6 +2312,8 @@ int main(int argc, char **argv) {
       selected_ok = run_exsia_staged_failure(TestFailure::compose);
     } else if (selected == "output-authorization") {
       selected_ok = run_exsia_staged_failure(TestFailure::output_authorization);
+    } else if (selected == "output-copy") {
+      selected_ok = run_exsia_staged_failure(TestFailure::output_copy);
     } else if (selected == "blocked-producer-fence-failure") {
       selected_ok = run_exsia_blocked_submit_failure();
     } else {
@@ -2362,10 +2390,19 @@ int main(int argc, char **argv) {
            ggml::gemmini::im2p_adapter::TestFailure::quantization) &&
        ok;
   ok = run_exsia_boundary_failure(
+           ggml::gemmini::im2p_adapter::TestFailure::provider) &&
+       ok;
+  ok = run_exsia_boundary_failure(
            ggml::gemmini::im2p_adapter::TestFailure::progress) &&
        ok;
   ok = run_exsia_boundary_failure(
            ggml::gemmini::im2p_adapter::TestFailure::poll) &&
+       ok;
+  ok = run_exsia_boundary_failure(
+           ggml::gemmini::im2p_adapter::TestFailure::malformed_completion) &&
+       ok;
+  ok = run_exsia_boundary_failure(
+           ggml::gemmini::im2p_adapter::TestFailure::incomplete_publication) &&
        ok;
   ok = run_exsia_staged_failure(
            ggml::gemmini::im2p_adapter::TestFailure::fence) &&
@@ -2375,6 +2412,7 @@ int main(int argc, char **argv) {
   ok = run_exsia_staged_failure(TestFailure::residual_execute) && ok;
   ok = run_exsia_staged_failure(TestFailure::compose) && ok;
   ok = run_exsia_staged_failure(TestFailure::output_authorization) && ok;
+  ok = run_exsia_staged_failure(TestFailure::output_copy) && ok;
 #if GGML_GEMMINI_ACTIVATION_BITS == 8
   ok = run_exsia_prestart_rejection(false) && ok;
 #endif

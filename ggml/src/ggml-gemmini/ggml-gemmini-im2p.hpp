@@ -83,6 +83,7 @@ struct Stats {
 struct Completion {
   Result result{};
   Stats stats{};
+  std::uint64_t run_id = 0;
 };
 
 enum class PublicMode : std::uint8_t {
@@ -203,6 +204,7 @@ start_exsia_stripe_pipeline(ggml_gemmini_args_t &args) noexcept;
 
 void log_failure(const char *operation, const Result &result) noexcept;
 void log_stats(const char * mode, const Stats & stats,
+               std::uint64_t run_id,
                const ggml_gemmini_args_t & args) noexcept;
 
 #if defined(GGML_GEMMINI_TESTING)
@@ -213,15 +215,19 @@ enum class TestFailure : std::uint8_t {
   malformed_contract,
   execute,
   quantization,
+  provider,
   progress,
   poll,
   fence,
+  malformed_completion,
+  incomplete_publication,
   blocked_submit,
   rmd,
   dense,
   residual_execute,
   compose,
   output_authorization,
+  output_copy,
   collector_allocation,
   collector_capture,
 };

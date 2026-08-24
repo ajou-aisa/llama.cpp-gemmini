@@ -396,6 +396,60 @@ function(make_stale_frontend_root out_var)
     set(${out_var} "${root}" PARENT_SCOPE)
 endfunction()
 
+function(make_extended_poll_stale_simulator_root out_var)
+    if(NOT DEFINED TEST_REAL_IM2P_ROOT OR
+       NOT EXISTS "${TEST_REAL_IM2P_ROOT}/build/lib/a8-w8-d16/libim2p_gemmini_frontend.a")
+        message(FATAL_ERROR "TEST_REAL_IM2P_ROOT must contain the fresh A8/W8/DIM16 frontend archive")
+    endif()
+    set(root "${TEST_BINARY_ROOT}/extended-poll-stale-simulator-root")
+    file(MAKE_DIRECTORY
+        "${root}/frontend/include" "${root}/sim/include"
+        "${root}/build/lib/a8-w8-d16"
+        "${root}/build/cargo/a8-w8-d16/release")
+    file(COPY "${TEST_REAL_IM2P_ROOT}/frontend/include/" DESTINATION "${root}/frontend/include")
+    file(COPY "${TEST_REAL_IM2P_ROOT}/sim/include/" DESTINATION "${root}/sim/include")
+    configure_file(
+        "${TEST_REAL_IM2P_ROOT}/build/lib/a8-w8-d16/libim2p_gemmini_frontend.a"
+        "${root}/build/lib/a8-w8-d16/libim2p_gemmini_frontend.a" COPYONLY)
+    set(source "${root}/old-simulator.cpp")
+    set(object "${root}/old-simulator.o")
+    file(WRITE "${source}" [=[
+#include "im2p_sim.h"
+extern "C" {
+im2p_sim_t *im2p_sim_create(void) { return reinterpret_cast<im2p_sim_t *>(1); }
+void im2p_sim_destroy(im2p_sim_t *) {}
+uint32_t im2p_sim_abi_version(void) { return 4; }
+uint32_t im2p_sim_activation_bits(void) { return 8; }
+uint32_t im2p_sim_activation_storage_bytes(void) { return 1; }
+uint32_t im2p_sim_weight_bits(void) { return 8; }
+uint32_t im2p_sim_weight_storage_bytes(void) { return 1; }
+uint32_t im2p_sim_dim(void) { return 16; }
+int im2p_execute_matmul_extended(im2p_sim_t *, const im2p_matmul_desc_t *, im2p_work_stats_extended_t *) { return IM2P_ERROR; }
+int im2p_begin_striped_matmul(im2p_sim_t *, const im2p_stripe_work_desc_t *, im2p_stream_t **) { return IM2P_ERROR; }
+int im2p_publish_stripe(im2p_stream_t *, const im2p_activation_stripe_t *) { return IM2P_INVALID_LAYOUT; }
+int im2p_progress_stream(im2p_stream_t *, uint64_t) { return IM2P_ERROR; }
+uint64_t im2p_stream_progress_count(const im2p_stream_t *) { return 0; }
+int im2p_finish_stream_extended(im2p_stream_t *, im2p_work_stats_extended_t *) { return IM2P_ERROR; }
+void im2p_destroy_stream(im2p_stream_t *) {}
+}
+]=])
+    execute_process(
+        COMMAND "${TEST_CXX_COMPILER}" -std=c++20
+            -I "${root}/sim/include" -c "${source}" -o "${object}"
+        RESULT_VARIABLE compile_rc ERROR_VARIABLE compile_stderr)
+    if(NOT compile_rc EQUAL 0)
+        message(FATAL_ERROR "Failed to compile stale simulator: ${compile_stderr}")
+    endif()
+    execute_process(
+        COMMAND "${TEST_AR}" rcs
+            "${root}/build/cargo/a8-w8-d16/release/libim2p_sim.a" "${object}"
+        RESULT_VARIABLE ar_rc ERROR_VARIABLE ar_stderr)
+    if(NOT ar_rc EQUAL 0)
+        message(FATAL_ERROR "Failed to archive stale simulator: ${ar_stderr}")
+    endif()
+    set(${out_var} "${root}" PARENT_SCOPE)
+endfunction()
+
 function(make_abi_stale_frontend_root out_var)
     if(NOT DEFINED TEST_REAL_IM2P_ROOT OR
        NOT EXISTS "${TEST_REAL_IM2P_ROOT}/build/cargo/a8-w8-d16/release/libim2p_sim.a")
@@ -909,10 +963,14 @@ run_im2p_configure_case(im2p_missing_pair "${width_mismatch_root}" 8 8 32 IM2P_S
     "Missing matching IM2P a8-w8-d32 archive")
 make_stale_frontend_root(stale_frontend_root)
 run_im2p_configure_case(im2p_stale_frontend "${stale_frontend_root}" 8 8 32 IM2P_SIM FALSE
-    "IM2P frontend configuration mismatch")
+    "im2p_poll_completed_extended")
 make_abi_stale_frontend_root(abi_stale_frontend_root)
 run_im2p_configure_case(im2p_abi_stale_frontend "${abi_stale_frontend_root}"
     8 8 16 IM2P_SIM FALSE "IM2P frontend args layout mismatch")
+make_extended_poll_stale_simulator_root(extended_poll_stale_simulator_root)
+run_im2p_configure_case(im2p_extended_poll_stale_simulator
+    "${extended_poll_stale_simulator_root}" 8 8 16 IM2P_SIM FALSE
+    "im2p_poll_completed_extended")
 run_arm64_bootstrap_contract()
 run_host_script_dim_contract(build-x86.sh 64)
 run_host_script_dim_contract(build-riscv.sh 16)
