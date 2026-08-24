@@ -59,6 +59,8 @@ struct ggml_gemmini_args_t;
 
 namespace ggml::gemmini::quants::act::exsia
 {
+    uint64_t next_exsia_run_id();
+
     struct BitMask
     {
         size_t rows = 0;

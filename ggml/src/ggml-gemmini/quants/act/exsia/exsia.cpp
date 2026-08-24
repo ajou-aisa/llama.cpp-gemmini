@@ -205,12 +205,6 @@ namespace ggml::gemmini::quants::act::exsia
         }
 #endif
 
-        static inline uint64_t next_exsia_run_id()
-        {
-            static std::atomic<uint64_t> next{0};
-            return next.fetch_add(1, std::memory_order_relaxed);
-        }
-
         uint64_t aggregate_now_ns()
         {
 #if LOG_CYCLE
@@ -478,6 +472,12 @@ namespace ggml::gemmini::quants::act::exsia
         }
     }
 #endif
+
+    uint64_t next_exsia_run_id()
+    {
+        static std::atomic<uint64_t> next{0};
+        return next.fetch_add(1, std::memory_order_relaxed);
+    }
 
     std::array<ExSIAState::ExecutionModeAvailability, 3> execution_mode_availability()
     {

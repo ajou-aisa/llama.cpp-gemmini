@@ -129,8 +129,30 @@ std::string serialize_cycle_telemetry(const Im2pExecutionTelemetry & record) {
     std::ostringstream out;
     prefix(out, "IM2P_EXECUTION_TELEMETRY", "im2p_rtl", "rtl_cycle");
     string_field(out, "layer", record.layer);
+    field(out, "run_id", record.run_id);
     field(out, "rtl_work_total_cycles", record.rtl_work_total_cycles);
     out << '}';
+    return out.str();
+#endif
+}
+
+std::string serialize_cycle_telemetry(const Im2pStripeTelemetry & record) {
+#if !LOG_CYCLE
+    (void) record;
+    return {};
+#else
+    std::ostringstream out;
+    prefix(out, "IM2P_STRIPE_TELEMETRY", "im2p_rtl", "rtl_cycle");
+    string_field(out, "layer", record.layer);
+    field(out, "run_id", record.run_id);
+    field(out, "stripe_id", record.stripe_id);
+    field(out, "slot", record.slot);
+    field(out, "row_begin", record.row_begin);
+    field(out, "row_end", record.row_end);
+    field(out, "publish_cycle", record.publish_cycle);
+    field(out, "completion_cycle", record.completion_cycle);
+    field(out, "latency_cycles", record.completion_cycle - record.publish_cycle);
+    out << ",\"additive\":false}";
     return out.str();
 #endif
 }
@@ -185,6 +207,9 @@ void emit_cycle_telemetry(const Im2pExecutionTelemetry & record) {
     const std::string detail = serialize_im2p_debug_detail(record);
     log::debug(record.layer.c_str(), "%s", detail.c_str());
 #endif
+}
+void emit_cycle_telemetry(const Im2pStripeTelemetry & record) {
+    log::cycle.write_json(serialize_cycle_telemetry(record));
 }
 void emit_cycle_telemetry(const PipelineStripeTelemetry & record) {
     log::cycle.write_json(serialize_cycle_telemetry(record));

@@ -437,11 +437,12 @@ Completion run_stripe_pipeline(const ggml_gemmini_args_t &args) noexcept {
 #endif
     return {{Error::invalid_state, "IM2P execute returned no run", false}, {}};
   }
+  const uint64_t run_id = quants::act::exsia::next_exsia_run_id();
   size_t stripe_id = 0;
   for (size_t row_begin = 0; row_begin < runtime_args.I;
        row_begin += runtime_args.activation_rows_per_stripe, ++stripe_id) {
     quants::act::exsia::StripeReadyEvent event{};
-    event.run_id = 1;
+    event.run_id = run_id;
     event.stripe_id = stripe_id;
     event.slot = stripe_id % 2;
     event.row_begin = row_begin;
