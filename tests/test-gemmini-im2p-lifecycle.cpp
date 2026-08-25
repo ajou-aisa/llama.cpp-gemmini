@@ -118,8 +118,10 @@ bool test_transactional_stripe_log_failures() {
                           std::istreambuf_iterator<char>());
     if (!lifecycle_check(
             log.find("\"record_type\":\"IM2P_STRIPE_TELEMETRY\"") ==
-                std::string::npos,
-            "FULL and failed transactions emit zero stripe rows")) {
+                    std::string::npos &&
+                log.find("\"record_type\":\"QUANTIZATION_STRIPE_TELEMETRY\"") ==
+                    std::string::npos,
+            "FULL and failed transactions emit zero RTL or quantization stripe rows")) {
       return false;
     }
   }

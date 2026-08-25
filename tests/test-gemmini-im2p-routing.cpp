@@ -633,14 +633,24 @@ bool run_exsia_publication_boundary() {
          check(trace.events[0].folding_commit_ns != 0 &&
                    trace.events[0].folding_commit_ns <= trace.events[1].folding_commit_ns &&
                    trace.events[1].folding_commit_ns <= trace.events[2].folding_commit_ns &&
+                   trace.events[0].quantization_end >= trace.events[0].quantization_start &&
+                   trace.events[1].quantization_end >= trace.events[1].quantization_start &&
+                   trace.events[2].quantization_end >= trace.events[2].quantization_start &&
+                   trace.events[2].quantization_end - trace.events[2].quantization_start > 0 &&
                    ggml::gemmini::cycle::read_count_for_test() != 0,
-               "enabled folding commits are nonzero, ordered, and instrumented") &&
+               "enabled per-stripe quantization intervals and folding commits are instrumented") &&
 #else
          check(trace.events[0].folding_commit_ns == 0 &&
                    trace.events[1].folding_commit_ns == 0 &&
                    trace.events[2].folding_commit_ns == 0 &&
+                   trace.events[0].quantization_start == 0 &&
+                   trace.events[0].quantization_end == 0 &&
+                   trace.events[1].quantization_start == 0 &&
+                   trace.events[1].quantization_end == 0 &&
+                   trace.events[2].quantization_start == 0 &&
+                   trace.events[2].quantization_end == 0 &&
                    ggml::gemmini::cycle::read_count_for_test() == 0,
-               "disabled folding commits are deterministic and read no timer") &&
+               "disabled quantization timing is deterministic and reads no timer") &&
 #endif
          check(trace.events[0].slot == 0 && trace.events[1].slot == 1 &&
                    trace.events[2].slot == 0,
@@ -980,13 +990,16 @@ bool run_im2p_semantic_logging_contract() {
   close(capture[0]);
 
   const std::string layer_json = "\"layer\":\"" + semantic_layer + "\"";
-  const auto first = output.find(layer_json);
+  const std::string cycle_type =
+      "\"record_type\":\"IM2P_EXECUTION_TELEMETRY\"";
+  const auto first = output.find(cycle_type);
+#if LOG_CYCLE
   const auto second = first == std::string::npos
                           ? std::string::npos
-                          : output.find(layer_json, first + layer_json.size());
-#if LOG_CYCLE
+                          : output.find(cycle_type, first + cycle_type.size());
   const bool cycle_layers = first != std::string::npos &&
-                            second != std::string::npos;
+                            second != std::string::npos &&
+                            output.find(layer_json) != std::string::npos;
 #else
   const bool cycle_layers = first == std::string::npos;
 #endif

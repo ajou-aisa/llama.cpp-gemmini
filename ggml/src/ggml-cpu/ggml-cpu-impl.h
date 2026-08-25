@@ -24,6 +24,9 @@ struct ggml_compute_params {
     void * wdata;
 
     struct ggml_threadpool * threadpool;
+
+    uint64_t run_id;
+    uint64_t node_id;
 };
 
 

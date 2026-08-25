@@ -740,10 +740,15 @@ function(run_arm64_bootstrap_contract)
     file(WRITE "${bin}/make" [=[#!/bin/bash
 printf 'make:%s\n' "$*" >> "$CONTRACT_LOG"
 ]=])
+    file(WRITE "${bin}/cargo" [=[#!/bin/bash
+printf 'cargo:repo=%s build=%s a=%s w=%s d=%s target=%s args=%s\n' \
+    "$IM2P_REPO_ROOT" "$IM2P_BUILD_DIR" "$IM2P_ACTIVATION_BITS" \
+    "$IM2P_WEIGHT_BITS" "$IM2P_DIM" "$CARGO_TARGET_DIR" "$*" >> "$CONTRACT_LOG"
+]=])
     file(WRITE "${bin}/cmake" [=[#!/bin/bash
 printf 'cmake:%s\n' "$*" >> "$CONTRACT_LOG"
 ]=])
-    execute_process(COMMAND chmod +x "${bin}/make" "${bin}/cmake")
+    execute_process(COMMAND chmod +x "${bin}/make" "${bin}/cargo" "${bin}/cmake")
     execute_process(
         COMMAND "${TEST_CMAKE_COMMAND}" -E env
             "PATH=${bin}:$ENV{PATH}"
@@ -761,20 +766,21 @@ printf 'cmake:%s\n' "$*" >> "$CONTRACT_LOG"
     file(READ "${log}" commands)
     string(FIND "${commands}"
         "GEMMINI_FRONTEND_BLOCK_SIZE=32" frontend_block_size_at)
-    string(FIND "${commands}"
-        "build/lib/a8-w8-d64/libim2p_gemmini_frontend.a" frontend_at)
+    string(FIND "${commands}" "gemmini-frontend-real-lib" cache_target_at)
+    string(FIND "${commands}" "cargo:" direct_cargo_at)
     string(FIND "${commands}" "cmake:-B" configure_at)
     string(FIND "${commands}" "-DGGML_GEMMINI_OPTION=WS" option_at)
     string(FIND "${commands}" "-DGGML_GEMMINI_DIM=64" dim_at)
     string(FIND "${commands}" "-DGGML_GEMMINI_BLOCK_SIZE=32" cmake_block_size_at)
     string(FIND "${commands}" "cmake:--build" build_at)
-    if(frontend_block_size_at EQUAL -1 OR frontend_at EQUAL -1 OR
+    if(frontend_block_size_at EQUAL -1 OR cache_target_at EQUAL -1 OR
+       NOT direct_cargo_at EQUAL -1 OR
        configure_at EQUAL -1 OR option_at EQUAL -1 OR
        dim_at EQUAL -1 OR
        cmake_block_size_at EQUAL -1 OR build_at EQUAL -1 OR
-       NOT frontend_at LESS configure_at OR NOT configure_at LESS build_at)
+       NOT cache_target_at LESS configure_at OR NOT configure_at LESS build_at)
         message(FATAL_ERROR
-            "build-arm64 defaults must refresh matching B32/DIM64 frontend in legal WS+IM2P mode before configure/build:\n${commands}")
+            "build-arm64 defaults must delegate matching B32/DIM64 cache selection before configure/build without direct Cargo orchestration:\n${commands}")
     endif()
 endfunction()
 

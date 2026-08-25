@@ -50,6 +50,8 @@ extern "C"
         const char *path;
     } gemmini_log_target;
 
+    // Stable v1 ABI. Keep this layout unchanged; use gemmini_cycle_record_v2
+    // for timeline correlation identity.
     typedef struct gemmini_cycle_record
     {
         const char *layer;
@@ -60,6 +62,27 @@ extern "C"
         int line;
         const char *func;
     } gemmini_cycle_record;
+
+    enum gemmini_cycle_identity_field
+    {
+        GEMMINI_CYCLE_HAS_RUN_ID = 1u << 0,
+        GEMMINI_CYCLE_HAS_STRIPE_ID = 1u << 1,
+        GEMMINI_CYCLE_HAS_SLOT = 1u << 2,
+        GEMMINI_CYCLE_HAS_NODE_ID = 1u << 3,
+        GEMMINI_CYCLE_HAS_WORKER_ID = 1u << 4,
+    };
+
+    // Additive v2 ABI for run/node/worker and stripe-pipeline correlation.
+    typedef struct gemmini_cycle_record_v2
+    {
+        gemmini_cycle_record interval;
+        uint32_t identity_mask;
+        uint64_t run_id;
+        uint64_t stripe_id;
+        uint64_t slot;
+        uint64_t node_id;
+        uint64_t worker_id;
+    } gemmini_cycle_record_v2;
 
     gemmini_log_target gemmini_log_file(const char *path) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
     int gemmini_log_truncate_file(const char *path) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT; // 1: success, 0: failure
@@ -91,6 +114,7 @@ extern "C"
                               uint64_t a_reuse, uint64_t b_reuse) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
 
     void gemmini_log_cycle_record(const gemmini_cycle_record *record) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
+    void gemmini_log_cycle_record_v2(const gemmini_cycle_record_v2 *record) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
     void gemmini_log_cycle(const char *layer, const char *op, uint64_t start, uint64_t end) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
     void gemmini_log_cycle_loc(const char *file, int line, const char *func,
                                const char *layer, const char *op, uint64_t start, uint64_t end) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;

@@ -18,14 +18,14 @@ JsonValue: TypeAlias = (
     str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
 )
 
-REQUIRED_FIELDS = frozenset({
-    "event", "layer", "call_id", "stripe_idx", "stripe_count", "slot", "row_start", "row_count",
+COMMON_REQUIRED_FIELDS = frozenset({
+    "layer", "call_id", "stripe_count", "slot", "row_start", "row_count",
     "I", "J", "K", "original_tile_I", "call_tile_I", "tile_J", "tile_K", "submit_start",
     "submit_end", "submit_cycles", "slot_wait_start", "slot_wait_end", "slot_wait_cycles",
     "call_wall", "call_load", "call_exe", "call_store", "counter_width_bits", "units", "valid",
 })
 INTEGER_FIELDS = frozenset({
-    "call_id", "stripe_idx", "stripe_count", "slot", "row_start", "row_count", "I", "J", "K",
+    "call_id", "stripe_count", "slot", "row_start", "row_count", "I", "J", "K",
     "original_tile_I", "call_tile_I", "tile_J", "tile_K", "submit_start", "submit_end",
     "submit_cycles", "slot_wait_start", "slot_wait_end", "slot_wait_cycles", "call_wall",
     "call_load", "call_exe", "call_store", "counter_width_bits",
@@ -111,15 +111,31 @@ def required_boolean(record: dict[str, JsonValue], name: str, line_number: int) 
 
 
 def parse_record(record: dict[str, JsonValue], line_number: int) -> StripeRecord:
-    missing = REQUIRED_FIELDS - record.keys()
+    is_v2 = "op" in record or "stripe_id" in record
+    identity_fields = (
+        frozenset({"schema", "version", "op", "stripe_id"})
+        if is_v2
+        else frozenset({"event", "stripe_idx"})
+    )
+    missing = (COMMON_REQUIRED_FIELDS | identity_fields) - record.keys()
     if missing:
         raise SchemaError(f"line {line_number}: missing fields: {', '.join(sorted(missing))}")
-    event = required_string(record, "event", line_number)
-    if event != "stripe_ws_profile":
-        raise SchemaError(f"line {line_number}: event must be stripe_ws_profile")
+    if is_v2:
+        if required_string(record, "schema", line_number) != "gemmini.cycle":
+            raise SchemaError(f"line {line_number}: schema must be gemmini.cycle")
+        if required_integer(record, "version", line_number) != 2:
+            raise SchemaError(f"line {line_number}: version must be 2")
+        if required_string(record, "op", line_number) != "gemmini.ws_stripe":
+            raise SchemaError(f"line {line_number}: op must be gemmini.ws_stripe")
+        stripe_idx = required_integer(record, "stripe_id", line_number)
+    else:
+        if required_string(record, "event", line_number) != "stripe_ws_profile":
+            raise SchemaError(f"line {line_number}: event must be stripe_ws_profile")
+        stripe_idx = required_integer(record, "stripe_idx", line_number)
     integer_values = {
         name: required_integer(record, name, line_number) for name in INTEGER_FIELDS
     }
+    integer_values["stripe_idx"] = stripe_idx
     if any(value < 0 for value in integer_values.values()):
         raise SchemaError(f"line {line_number}: integer fields must be nonnegative")
     units = required_string(record, "units", line_number)

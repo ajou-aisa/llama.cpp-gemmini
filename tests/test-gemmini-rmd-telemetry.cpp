@@ -19,7 +19,8 @@ bool expect(bool condition, const char * message) {
 }
 RmdTelemetryRecord cpu_record() {
     RmdTelemetryRecord record{};
-    record.runtime_bundle_id = "bundle-7"; record.model_id = "model-hash"; record.run_id = "run-42";
+    record.runtime_bundle_id = "bundle-7"; record.model_id = "model-hash";
+    record.layer = "blk.42.mlp.down_proj"; record.run_id = 42;
     record.backend = RmdBackend::cpu_direct; record.source = MatmulOptionSource::explicit_override;
     record.units = cycle::units(); record.work = true;
     record.counters.direct_events = 9; record.counters.direct_calls = 2;
@@ -51,14 +52,17 @@ bool aggregate_serializer_fixtures() {
     static_assert(std::is_same_v<decltype(Im2pExecutionTelemetry::rtl_work_total_cycles), std::uint64_t>);
     static_assert(std::is_same_v<decltype(Im2pStripeTelemetry::publish_cycle), std::uint64_t>);
     static_assert(std::is_same_v<decltype(Im2pStripeTelemetry::completion_cycle), std::uint64_t>);
+    static_assert(std::is_same_v<decltype(QuantizationStripeTelemetry::start), std::uint64_t>);
+    static_assert(std::is_same_v<decltype(QuantizationStripeTelemetry::end), std::uint64_t>);
     CycleIntervalTelemetry interval{};
-    interval.layer = "ffn\"norm"; interval.name = "dense";
+    interval.layer = "ffn\"norm"; interval.op = "dense";
     interval.start = 10; interval.end = 34;
     const std::string interval_json = serialize_cycle_telemetry(interval);
     const std::string expected_interval =
-        "{\"schema\":\"gemmini.cycle\",\"version\":1,\"record_type\":\"CYCLE_INTERVAL\","
-        "\"source\":\"host_tick\",\"unit\":\"tick\",\"layer\":\"ffn\\\"norm\","
-        "\"name\":\"dense\",\"start\":10,\"end\":34,\"delta\":24,\"valid\":true}";
+        "{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"CYCLE_INTERVAL\","
+        "\"source\":\"host_tick\",\"unit\":\"tick\",\"op\":\"dense\",\"layer\":\"ffn\\\"norm\","
+        "\"run_id\":null,\"stripe_id\":null,\"slot\":null,\"node_id\":null,\"worker_id\":null,"
+        "\"start\":10,\"end\":34,\"delta\":24,\"valid\":true}";
 
     WsLoopTelemetry ws{};
     ws.problem_i = 256; ws.problem_j = 768; ws.problem_k = 768;
@@ -70,8 +74,10 @@ bool aggregate_serializer_fixtures() {
     ws.store_occupancy_cycles = 303; ws.loop_occupancy_cycles = 999;
     const std::string ws_json = serialize_cycle_telemetry(ws);
     const std::string expected_ws =
-        "{\"schema\":\"gemmini.cycle\",\"version\":1,\"record_type\":\"WS_LOOP_TELEMETRY\","
-        "\"source\":\"gemmini_hw_counter\",\"unit\":\"cycle\",\"problem_i\":256,\"problem_j\":768,\"problem_k\":768,"
+        "{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"WS_LOOP_TELEMETRY\","
+        "\"source\":\"gemmini_hw_counter\",\"unit\":\"cycle\",\"op\":\"gemmini.ws_loop\","
+        "\"layer\":null,\"run_id\":null,\"stripe_id\":null,\"slot\":null,\"node_id\":null,\"worker_id\":null,"
+        "\"problem_i\":256,\"problem_j\":768,\"problem_k\":768,"
         "\"tile_i\":5,\"tile_j\":3,\"tile_k\":6,\"gemmini_outer_i\":4,\"gemmini_outer_j\":29,\"gemmini_outer_k\":1,"
         "\"ws_inner_calls\":116,\"containing_interval_cycles\":1000,\"containing_interval_counter_bits\":64,"
         "\"load_occupancy_cycles\":101,\"execute_occupancy_cycles\":202,\"store_occupancy_cycles\":303,"
@@ -96,22 +102,26 @@ bool aggregate_serializer_fixtures() {
     rtl.rtl_stripes_published = 4; rtl.rtl_stripe_rows_published = 256;
     const std::string rtl_json = serialize_cycle_telemetry(rtl);
     const std::string expected_rtl =
-        "{\"schema\":\"gemmini.cycle\",\"version\":1,\"record_type\":\"IM2P_EXECUTION_TELEMETRY\","
-        "\"source\":\"im2p_rtl\",\"unit\":\"rtl_cycle\",\"layer\":\"blk.15.mlp.down_proj\","
-        "\"run_id\":17,\"rtl_work_total_cycles\":5000}";
+        "{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"IM2P_EXECUTION_TELEMETRY\","
+        "\"source\":\"im2p_rtl\",\"unit\":\"rtl_cycle\",\"op\":\"im2p.execute\","
+        "\"layer\":\"blk.15.mlp.down_proj\",\"run_id\":17,\"stripe_id\":null,\"slot\":null,"
+        "\"node_id\":null,\"worker_id\":null,\"rtl_work_total_cycles\":5000}";
     Im2pExecutionTelemetry malformed_rtl{};
     malformed_rtl.layer = "bad\"\\\n";
     malformed_rtl.layer.push_back('\x01');
     malformed_rtl.rtl_work_total_cycles = 1;
     const std::string expected_malformed_rtl =
-        "{\"schema\":\"gemmini.cycle\",\"version\":1,\"record_type\":\"IM2P_EXECUTION_TELEMETRY\","
-        "\"source\":\"im2p_rtl\",\"unit\":\"rtl_cycle\",\"layer\":\"bad\\\"\\\\\\n\\u0001\","
-        "\"run_id\":0,\"rtl_work_total_cycles\":1}";
+        "{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"IM2P_EXECUTION_TELEMETRY\","
+        "\"source\":\"im2p_rtl\",\"unit\":\"rtl_cycle\",\"op\":\"im2p.execute\","
+        "\"layer\":\"bad\\\"\\\\\\n\\u0001\",\"run_id\":0,\"stripe_id\":null,\"slot\":null,"
+        "\"node_id\":null,\"worker_id\":null,\"rtl_work_total_cycles\":1}";
     const std::string malformed_rtl_json = serialize_cycle_telemetry(malformed_rtl);
     Im2pExecutionTelemetry empty_rtl{};
     const std::string expected_empty_rtl =
-        "{\"schema\":\"gemmini.cycle\",\"version\":1,\"record_type\":\"IM2P_EXECUTION_TELEMETRY\","
-        "\"source\":\"im2p_rtl\",\"unit\":\"rtl_cycle\",\"layer\":\"\",\"run_id\":0,\"rtl_work_total_cycles\":0}";
+        "{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"IM2P_EXECUTION_TELEMETRY\","
+        "\"source\":\"im2p_rtl\",\"unit\":\"rtl_cycle\",\"op\":\"im2p.execute\","
+        "\"layer\":null,\"run_id\":0,\"stripe_id\":null,\"slot\":null,\"node_id\":null,"
+        "\"worker_id\":null,\"rtl_work_total_cycles\":0}";
     const std::string empty_rtl_json = serialize_cycle_telemetry(empty_rtl);
 
     Im2pStripeTelemetry stripe{};
@@ -120,34 +130,57 @@ bool aggregate_serializer_fixtures() {
     stripe.publish_cycle = 100; stripe.completion_cycle = 116;
     const std::string stripe_json = serialize_cycle_telemetry(stripe);
     const std::string expected_stripe =
-        "{\"schema\":\"gemmini.cycle\",\"version\":1,\"record_type\":\"IM2P_STRIPE_TELEMETRY\","
-        "\"source\":\"im2p_rtl\",\"unit\":\"rtl_cycle\",\"layer\":\"blk.15.mlp.down_proj\","
-        "\"run_id\":17,\"stripe_id\":2,\"slot\":1,\"row_begin\":80,\"row_end\":160,"
+        "{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"IM2P_STRIPE_TELEMETRY\","
+        "\"source\":\"im2p_rtl\",\"unit\":\"rtl_cycle\",\"op\":\"im2p.execute\","
+        "\"layer\":\"blk.15.mlp.down_proj\",\"run_id\":17,\"stripe_id\":2,\"slot\":1,"
+        "\"node_id\":null,\"worker_id\":null,\"row_begin\":80,\"row_end\":160,"
         "\"publish_cycle\":100,\"completion_cycle\":116,\"latency_cycles\":16,\"additive\":false}";
     Im2pStripeTelemetry overlap_stripe = stripe;
     overlap_stripe.stripe_id = 3; overlap_stripe.slot = 0; overlap_stripe.row_begin = 160;
     overlap_stripe.row_end = 256; overlap_stripe.publish_cycle = 108; overlap_stripe.completion_cycle = 124;
     const std::string expected_overlap_stripe =
-        "{\"schema\":\"gemmini.cycle\",\"version\":1,\"record_type\":\"IM2P_STRIPE_TELEMETRY\","
-        "\"source\":\"im2p_rtl\",\"unit\":\"rtl_cycle\",\"layer\":\"blk.15.mlp.down_proj\","
-        "\"run_id\":17,\"stripe_id\":3,\"slot\":0,\"row_begin\":160,\"row_end\":256,"
+        "{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"IM2P_STRIPE_TELEMETRY\","
+        "\"source\":\"im2p_rtl\",\"unit\":\"rtl_cycle\",\"op\":\"im2p.execute\","
+        "\"layer\":\"blk.15.mlp.down_proj\",\"run_id\":17,\"stripe_id\":3,\"slot\":0,"
+        "\"node_id\":null,\"worker_id\":null,\"row_begin\":160,\"row_end\":256,"
         "\"publish_cycle\":108,\"completion_cycle\":124,\"latency_cycles\":16,\"additive\":false}";
     Im2pStripeTelemetry zero_stripe{};
     const std::string expected_zero_stripe =
-        "{\"schema\":\"gemmini.cycle\",\"version\":1,\"record_type\":\"IM2P_STRIPE_TELEMETRY\","
-        "\"source\":\"im2p_rtl\",\"unit\":\"rtl_cycle\",\"layer\":\"\",\"run_id\":0,\"stripe_id\":0,"
-        "\"slot\":0,\"row_begin\":0,\"row_end\":0,\"publish_cycle\":0,\"completion_cycle\":0,"
+        "{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"IM2P_STRIPE_TELEMETRY\","
+        "\"source\":\"im2p_rtl\",\"unit\":\"rtl_cycle\",\"op\":\"im2p.execute\",\"layer\":null,"
+        "\"run_id\":0,\"stripe_id\":0,\"slot\":0,\"node_id\":null,\"worker_id\":null,"
+        "\"row_begin\":0,\"row_end\":0,\"publish_cycle\":0,\"completion_cycle\":0,"
         "\"latency_cycles\":0,\"additive\":false}";
     Im2pStripeTelemetry wrapped_stripe = stripe;
     wrapped_stripe.publish_cycle = UINT64_MAX - 2; wrapped_stripe.completion_cycle = 3;
     const std::string expected_wrapped_stripe =
-        "{\"schema\":\"gemmini.cycle\",\"version\":1,\"record_type\":\"IM2P_STRIPE_TELEMETRY\","
-        "\"source\":\"im2p_rtl\",\"unit\":\"rtl_cycle\",\"layer\":\"blk.15.mlp.down_proj\","
-        "\"run_id\":17,\"stripe_id\":2,\"slot\":1,\"row_begin\":80,\"row_end\":160,"
+        "{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"IM2P_STRIPE_TELEMETRY\","
+        "\"source\":\"im2p_rtl\",\"unit\":\"rtl_cycle\",\"op\":\"im2p.execute\","
+        "\"layer\":\"blk.15.mlp.down_proj\",\"run_id\":17,\"stripe_id\":2,\"slot\":1,"
+        "\"node_id\":null,\"worker_id\":null,\"row_begin\":80,\"row_end\":160,"
         "\"publish_cycle\":18446744073709551613,\"completion_cycle\":3,\"latency_cycles\":6,\"additive\":false}";
     const std::string overlap_stripe_json = serialize_cycle_telemetry(overlap_stripe);
     const std::string zero_stripe_json = serialize_cycle_telemetry(zero_stripe);
     const std::string wrapped_stripe_json = serialize_cycle_telemetry(wrapped_stripe);
+
+    QuantizationStripeTelemetry quantization{};
+    quantization.layer = "blk.15.mlp.down_proj"; quantization.run_id = 17;
+    quantization.stripe_id = 2; quantization.slot = 1;
+    quantization.row_begin = 80; quantization.row_end = 160;
+    quantization.start = 90; quantization.end = 108;
+    const std::string quantization_json = serialize_cycle_telemetry(quantization);
+    QuantizationStripeTelemetry wrapped_quantization = quantization;
+    wrapped_quantization.start = std::numeric_limits<std::uint64_t>::max() - 2;
+    wrapped_quantization.end = 3;
+    const std::string wrapped_quantization_json =
+        serialize_cycle_telemetry(wrapped_quantization);
+    const std::string expected_quantization =
+        "{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"QUANTIZATION_STRIPE_TELEMETRY\","
+        "\"source\":\"host_tick\",\"unit\":\"tick\",\"op\":\"exsia.quantize\","
+        "\"layer\":\"blk.15.mlp.down_proj\",\"run_id\":17,\"stripe_id\":2,\"slot\":1,"
+        "\"node_id\":null,\"worker_id\":null,\"row_begin\":80,\"row_end\":160,"
+        "\"start\":90,\"end\":108,\"delta\":18,"
+        "\"overlaps_rtl\":true,\"additive\":false}";
 
     PipelineStripeTelemetry pipeline{};
     pipeline.layer = "ffn"; pipeline.run_id = 7; pipeline.stripe_id = 2;
@@ -159,21 +192,23 @@ bool aggregate_serializer_fixtures() {
     pipeline.finalize_start_ns = 44; pipeline.finalize_end_ns = 48;
     const std::string pipeline_json = serialize_cycle_telemetry(pipeline);
     const std::string expected_pipeline =
-        "{\"schema\":\"gemmini.cycle\",\"version\":1,\"record_type\":\"PIPELINE_STRIPE_SUMMARY\","
-        "\"source\":\"steady_clock\",\"unit\":\"nanosecond\",\"layer\":\"ffn\",\"run_id\":7,\"stripe_id\":2,\"slot\":1,"
+        "{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"PIPELINE_STRIPE_SUMMARY\","
+        "\"source\":\"steady_clock\",\"unit\":\"nanosecond\",\"op\":\"matmul.pipeline\","
+        "\"layer\":\"ffn\",\"run_id\":7,\"stripe_id\":2,\"slot\":1,\"node_id\":null,\"worker_id\":null,"
         "\"row_begin\":80,\"row_end\":160,\"queue_start_ns\":10,\"queue_end_ns\":12,\"dense_start_ns\":12,\"dense_end_ns\":30,"
         "\"rmd_start_ns\":30,\"rmd_end_ns\":40,\"compose_start_ns\":40,\"compose_end_ns\":44,"
         "\"finalize_start_ns\":44,\"finalize_end_ns\":48,\"valid\":true}";
 
     if (std::getenv("GEMMINI_TELEMETRY_PRINT_ALL") != nullptr) {
-        std::printf("%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n", interval_json.c_str(), ws_json.c_str(),
+        std::printf("%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n", interval_json.c_str(), ws_json.c_str(),
                     rtl_json.c_str(), malformed_rtl_json.c_str(), empty_rtl_json.c_str(), stripe_json.c_str(),
-                    overlap_stripe_json.c_str(), zero_stripe_json.c_str(), wrapped_stripe_json.c_str(), pipeline_json.c_str());
+                    overlap_stripe_json.c_str(), zero_stripe_json.c_str(), wrapped_stripe_json.c_str(),
+                    quantization_json.c_str(), wrapped_quantization_json.c_str(), pipeline_json.c_str());
     }
 #if !LOG_CYCLE
     return expect(interval_json.empty() && ws_json.empty() && rtl_json.empty() && stripe_json.empty() &&
                       overlap_stripe_json.empty() && zero_stripe_json.empty() && wrapped_stripe_json.empty() &&
-                      pipeline_json.empty(),
+                      quantization_json.empty() && wrapped_quantization_json.empty() && pipeline_json.empty(),
                   "cycle-off suppresses every aggregate serializer");
 #else
     return expect(interval_json == expected_interval, "cycle interval exact schema") &&
@@ -183,7 +218,7 @@ bool aggregate_serializer_fixtures() {
         expect(serialize_cycle_telemetry(wrapped_ws).find("\"valid\":false") != std::string::npos,
                "hardware containing interval wider than occupancy counter is invalid") &&
         expect(rtl_json == expected_rtl, "RTL aggregate has run correlation and exactly one cycle payload") &&
-        expect(count_occurrences(rtl_json, "\":") == 8, "RTL aggregate schema has exactly eight top-level fields") &&
+        expect(count_occurrences(rtl_json, "\":") == 13, "RTL aggregate schema has exactly thirteen top-level fields") &&
         expect(malformed_rtl_json == expected_malformed_rtl,
                "RTL semantic layer escapes quotes, backslashes, newline, and control bytes") &&
         expect(empty_rtl_json == expected_empty_rtl,
@@ -195,6 +230,10 @@ bool aggregate_serializer_fixtures() {
                "RTL stripe zero endpoints are serialized rather than treated as missing") &&
         expect(wrapped_stripe_json == expected_wrapped_stripe,
                "RTL stripe wrapped latency uses unsigned endpoint subtraction") &&
+        expect(quantization_json == expected_quantization,
+               "quantization stripe schema preserves host timing and SIM correlation keys") &&
+        expect(wrapped_quantization_json.find("\"delta\":6") != std::string::npos,
+               "quantization stripe delta uses unsigned endpoint subtraction") &&
         expect(pipeline_json == expected_pipeline, "pipeline exact schema remains host-nanosecond-only") &&
         [&] {
             const std::uint64_t first_generic_run_id = quants::act::exsia::next_exsia_run_id();
@@ -221,19 +260,22 @@ bool aggregate_cycle_sink_fixtures() {
                 "aggregate debug sink setup")) return false;
 #endif
 
-    CycleIntervalTelemetry interval{}; interval.layer = "driver"; interval.name = "interval";
+    CycleIntervalTelemetry interval{}; interval.layer = "driver"; interval.op = "interval";
     interval.start = 1; interval.end = 2;
     WsLoopTelemetry ws{}; ws.containing_interval_cycles = 4; ws.loop_occupancy_cycles = 3;
     Im2pExecutionTelemetry rtl{}; rtl.layer = "blk.15.mlp.down_proj"; rtl.run_id = 17; rtl.mode = "full";
     rtl.rtl_work_total_cycles = 9; rtl.rtl_compute_cycles = 7;
     Im2pStripeTelemetry stripe{}; stripe.layer = "blk.15.mlp.down_proj"; stripe.run_id = 17;
     stripe.row_end = 1; stripe.completion_cycle = 1;
+    QuantizationStripeTelemetry quantization{}; quantization.layer = "blk.15.mlp.down_proj";
+    quantization.run_id = 17; quantization.row_end = 1; quantization.end = 1;
     PipelineStripeTelemetry pipeline{}; pipeline.layer = "driver"; pipeline.row_end = 1;
     const RmdTelemetryRecord rmd = cpu_record();
     emit_cycle_telemetry(interval);
     emit_cycle_telemetry(ws);
     emit_cycle_telemetry(rtl);
     emit_cycle_telemetry(stripe);
+    emit_cycle_telemetry(quantization);
     emit_cycle_telemetry(pipeline);
     emit_cycle_telemetry(rmd);
     ggml::gemmini::log::cycle.set_output(stderr);
@@ -244,14 +286,15 @@ bool aggregate_cycle_sink_fixtures() {
     bool ok = true;
 #if LOG_CYCLE
     const char * types[] = {"CYCLE_INTERVAL", "WS_LOOP_TELEMETRY", "IM2P_EXECUTION_TELEMETRY",
-                            "IM2P_STRIPE_TELEMETRY", "PIPELINE_STRIPE_SUMMARY", "RMD_BACKEND_TELEMETRY"};
+                            "IM2P_STRIPE_TELEMETRY", "QUANTIZATION_STRIPE_TELEMETRY",
+                            "PIPELINE_STRIPE_SUMMARY", "RMD_BACKEND_TELEMETRY"};
     for (const char * type : types) {
         ok &= expect(cycle_output.find(std::string("\"record_type\":\"") + type + "\"") != std::string::npos,
                      "aggregate record reaches cycle sink");
     }
-    ok &= expect(count_occurrences(cycle_output, "\"record_type\":") == 6 &&
-                 cycle_output.find("\"additive\":false") != std::string::npos,
-                 "cycle sink receives one non-additive RTL stripe row");
+    ok &= expect(count_occurrences(cycle_output, "\"record_type\":") == 7 &&
+                 count_occurrences(cycle_output, "\"additive\":false") == 2,
+                 "cycle sink receives non-additive quantization and RTL stripe rows");
 #else
     ok &= expect(cycle_output.empty(), "cycle-off suppresses aggregate records");
 #endif
@@ -261,8 +304,9 @@ bool aggregate_cycle_sink_fixtures() {
                  count_occurrences(debug_output, "IM2P_EXECUTION_TELEMETRY_DETAIL") == 1 &&
                  debug_output.find("rtl_work_total_cycles=9") != std::string::npos &&
                  debug_output.find("rtl_compute_cycles=7") != std::string::npos &&
-                 debug_output.find("IM2P_STRIPE_TELEMETRY") == std::string::npos,
-                 "IM2P stripe telemetry stays out of the debug sink");
+                 debug_output.find("IM2P_STRIPE_TELEMETRY") == std::string::npos &&
+                 debug_output.find("QUANTIZATION_STRIPE_TELEMETRY") == std::string::npos,
+                 "stripe telemetry stays out of the debug sink");
 #else
     ok &= expect(debug_output.empty(), "debug-off suppresses IM2P execution detail");
 #endif
@@ -278,14 +322,16 @@ bool run_aggregate_driver(const std::filesystem::path & cycle_path) {
 #if LOG_CYCLE
     if (!ggml::gemmini::log::cycle.set_output_path(cycle_path.c_str(), true)) return false;
 #endif
-    CycleIntervalTelemetry interval{}; interval.layer = "driver"; interval.name = "interval";
+    CycleIntervalTelemetry interval{}; interval.layer = "driver"; interval.op = "interval";
     interval.start = 10; interval.end = 11;
     WsLoopTelemetry ws{}; ws.containing_interval_cycles = 10; ws.loop_occupancy_cycles = 4;
     Im2pExecutionTelemetry rtl{}; rtl.mode = "full";
     Im2pStripeTelemetry stripe{}; stripe.row_end = 1; stripe.completion_cycle = 1;
+    QuantizationStripeTelemetry quantization{}; quantization.row_end = 1; quantization.end = 1;
     PipelineStripeTelemetry pipeline{}; pipeline.layer = "driver"; pipeline.row_end = 1;
     emit_cycle_telemetry(interval); emit_cycle_telemetry(ws); emit_cycle_telemetry(rtl);
-    emit_cycle_telemetry(stripe); emit_cycle_telemetry(pipeline); emit_cycle_telemetry(cpu_record());
+    emit_cycle_telemetry(stripe); emit_cycle_telemetry(quantization);
+    emit_cycle_telemetry(pipeline); emit_cycle_telemetry(cpu_record());
     ggml::gemmini::log::cycle.set_output(stderr);
 #if LOG_CYCLE
     const std::string output = read_file(cycle_path);
@@ -294,6 +340,7 @@ bool run_aggregate_driver(const std::filesystem::path & cycle_path) {
         output.find("\"record_type\":\"WS_LOOP_TELEMETRY\"") != std::string::npos &&
         output.find("\"record_type\":\"IM2P_EXECUTION_TELEMETRY\"") != std::string::npos &&
         output.find("\"record_type\":\"IM2P_STRIPE_TELEMETRY\"") != std::string::npos &&
+        output.find("\"record_type\":\"QUANTIZATION_STRIPE_TELEMETRY\"") != std::string::npos &&
         output.find("\"record_type\":\"PIPELINE_STRIPE_SUMMARY\"") != std::string::npos &&
         output.find("\"record_type\":\"RMD_BACKEND_TELEMETRY\"") != std::string::npos;
 #else
@@ -395,9 +442,11 @@ int main(int argc, char ** argv) {
     if (!expect(second >= first && cycle::read_count_for_test() == 3, "enabled clock reads are observable")) return 1;
     RmdTelemetryRecord cpu = cpu_record(); RmdTelemetryRecord ws = ws_record();
     const std::string expected_rmd_summary =
-        "{\"schema\":\"gemmini.cycle\",\"version\":1,\"record_type\":\"RMD_BACKEND_TELEMETRY\","
-        "\"runtime_bundle_id\":\"bundle-7\",\"model_id\":\"model-hash\",\"run_id\":\"run-42\","
-        "\"source\":\"host_tick\",\"unit\":\"tick\",\"backend\":\"cpu_direct\",\"option_source\":\"explicit_override\","
+        "{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"RMD_BACKEND_TELEMETRY\","
+        "\"source\":\"host_tick\",\"unit\":\"tick\",\"op\":\"rmd.execute\","
+        "\"layer\":\"blk.42.mlp.down_proj\",\"run_id\":42,\"stripe_id\":null,\"slot\":null,"
+        "\"node_id\":null,\"worker_id\":null,\"runtime_bundle_id\":\"bundle-7\",\"model_id\":\"model-hash\","
+        "\"backend\":\"cpu_direct\",\"option_source\":\"explicit_override\","
         "\"work\":true,\"invocation_total\":101,\"dispatch\":{\"direct_events\":9,\"direct_calls\":2,\"packet_calls\":0,\"ws_calls\":0},"
         "\"timing\":{\"prep\":11,\"backend_service\":31,\"merge\":7,\"residual_total\":47,\"queue\":3,\"dense_end\":120,\"residual_start\":120},"
         "\"geometry\":{\"packet_count\":0,\"active_blocks\":0,\"compact_k_count\":0,\"padded_k_count\":0,\"physical_tile_count\":0}}";

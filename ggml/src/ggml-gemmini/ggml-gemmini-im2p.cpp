@@ -583,6 +583,23 @@ struct CapturedExsiaStripe {
   std::int16_t theta = 0;
 };
 
+static void emit_quantization_timings(
+    const std::vector<CapturedExsiaStripe> &stripes,
+    const ggml_gemmini_args_t &args) noexcept {
+  for (const auto &stripe : stripes) {
+    QuantizationStripeTelemetry record{};
+    record.layer = args.matmul_layer;
+    record.run_id = stripe.event.run_id;
+    record.stripe_id = stripe.event.stripe_id;
+    record.slot = stripe.event.slot;
+    record.row_begin = stripe.event.row_begin;
+    record.row_end = stripe.event.row_end;
+    record.start = stripe.event.quantization_start;
+    record.end = stripe.event.quantization_end;
+    emit_cycle_telemetry(record);
+  }
+}
+
 static bool has_immediate_theta_prefix(
     const quants::act::exsia::Meta &metadata,
     const quants::act::exsia::StripeReadyEvent &event) noexcept {
@@ -1459,6 +1476,7 @@ Completion ExsiaStripePipeline::finish(bool quantization_succeeded) noexcept {
 #endif
   impl_->copy_staged_output();
   completion.run_id = run_id;
+  emit_quantization_timings(impl_->published, impl_->args);
   emit_stripe_timings(fenced.stripe_rtl_timings, impl_->args);
   return completion;
 }

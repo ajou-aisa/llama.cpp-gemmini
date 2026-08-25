@@ -345,6 +345,8 @@ namespace ggml::gemmini::quants::act::exsia
         size_t slot = 0;
         size_t row_begin = 0;
         size_t row_end = 0;
+        uint64_t quantization_start = 0;
+        uint64_t quantization_end = 0;
         // Residual work for this stripe, or nullptr when the stripe has no residual.
         // The packet owns its buffers, so it stays valid after the ExSIA slot is released.
         ggml::gemmini::rmd::StripePacketHandle rmd_packet;
@@ -528,6 +530,8 @@ namespace ggml::gemmini::quants::act::exsia
         ggml::gemmini::residual::DirectStripePayloadHandle direct_residual;  // sealed at folding commit
         uint64_t rmd_pack_ns = 0;                           // packet seal duration
         uint64_t folding_commit_ns = 0;
+        uint64_t quantization_start = 0;
+        uint64_t quantization_end = 0;
 
 #if EXSIA_BRANCH_COUNTS_ENABLED
         StripeCycleStats cycle_stats;
@@ -581,6 +585,8 @@ namespace ggml::gemmini::quants::act::exsia
             direct_residual.reset();
             rmd_pack_ns = 0;
             folding_commit_ns = 0;
+            quantization_start = 0;
+            quantization_end = 0;
 #if EXSIA_BRANCH_COUNTS_ENABLED
             cycle_stats.reset();
 #endif
@@ -632,6 +638,8 @@ namespace ggml::gemmini::quants::act::exsia
             direct_residual.reset();
             rmd_pack_ns = 0;
             folding_commit_ns = 0;
+            quantization_start = 0;
+            quantization_end = 0;
 #if EXSIA_BRANCH_COUNTS_ENABLED
             cycle_stats.reset();
 #endif
@@ -652,10 +660,18 @@ namespace ggml::gemmini::quants::act::exsia
             lifecycle = StripePipelineSlotState::LocalFilled;
         }
 
-        void mark_folding_committed(uint64_t commit_ns = 0)
+        void mark_quantization_started(uint64_t start)
+        {
+            assert(lifecycle == StripePipelineSlotState::Acquired);
+            quantization_start = start;
+        }
+
+        void mark_folding_committed(uint64_t commit_ns = 0,
+                                    uint64_t quantization_end_tick = 0)
         {
             assert(lifecycle == StripePipelineSlotState::LocalFilled);
             folding_commit_ns = commit_ns;
+            quantization_end = quantization_end_tick;
             lifecycle = StripePipelineSlotState::FoldingCommitted;
         }
 

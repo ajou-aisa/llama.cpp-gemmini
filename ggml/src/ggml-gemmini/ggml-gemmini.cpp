@@ -1365,7 +1365,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.sC = J;
 
     end = ggml::gemmini::cycle::read();
-    ggml::gemmini::log::cycle(layer, "cpu.Set Args for calling gemmini", start, end);
+    ggml::gemmini::log::cycle(layer, "gemmini.prepare_args", start, end);
 
     // set tile size
     start = ggml::gemmini::cycle::read();
@@ -1377,7 +1377,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     }
     args.activation_rows_per_stripe = gemmini_geometry.geometry.stripe_rows;
     end = ggml::gemmini::cycle::read();
-    ggml::gemmini::log::cycle(layer, "cpu.Set tile size", start, end);
+    ggml::gemmini::log::cycle(layer, "gemmini.select_tile", start, end);
 
 #if defined(GGML_GEMMINI_TESTING) && \
     defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
@@ -1427,7 +1427,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                     quantize_end - quantize_start));
         } else {
             ggml::gemmini::log::cycle(
-                layer, "cpu.Quantize activation",
+                layer, "gemmini.quantize_activation",
                 quantize_start, quantize_end);
         }
 #endif
@@ -1583,7 +1583,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         args.R_stripe = nullptr;
 
         end = ggml::gemmini::cycle::read();
-        ggml::gemmini::log::cycle(layer, "cpu.Use dense I8 weight", start, end);
+        ggml::gemmini::log::cycle(layer, "gemmini.prepare_dense_i8_weight", start, end);
     } else {
         if (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_H1 ||
             src0->type == GGML_TYPE_Q4_HP1 || src0->type == GGML_TYPE_Q16_0 ||
@@ -1820,7 +1820,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 "[Q8_0 reprocess] blocks=%p sB=%zu blocks_per_row=%zu logical_rows=%zu",
                 (void *)reprocessed_q8_h1.data(), args.sB, args.blocks_per_row, q8_0_reprocess_rows);
             end = ggml::gemmini::cycle::read();
-            ggml::gemmini::log::cycle(layer, "cpu.Reprocess Q8_0 to Q8_H1", start, end);
+            ggml::gemmini::log::cycle(layer, "gemmini.convert_q8_0_to_q8_h1", start, end);
         } else {
             ggml::gemmini::log::debug(layer, "int compute unsupported weight type=%d", (int)src0->type);
             GGML_ABORT("Gemmini int mul_mat received unsupported weight type");
@@ -2018,7 +2018,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 #endif
 
     end = ggml::gemmini::cycle::read();
-    ggml::gemmini::log::cycle(layer, "cpu.Set Args for calling gemmini", start, end);
+    ggml::gemmini::log::cycle(layer, "gemmini.prepare_args", start, end);
 
     // ggml::gemmini::log::debug("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out(row)=%zu stride_f_out(col)=%zu nb1=%zu nb0=%zu",
     //                  layer, args.A, args.B, args.C, args.D,
@@ -2166,12 +2166,13 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         const uint64_t invocation_total =
             rmd_telemetry_invocation_end >= rmd_telemetry_invocation_start
                 ? rmd_telemetry_invocation_end - rmd_telemetry_invocation_start : 0;
-        const std::string telemetry_run_id = telemetry_profiles.empty()
-            ? "0" : std::to_string(telemetry_profiles.front().run_id);
+        const uint64_t telemetry_run_id = telemetry_profiles.empty()
+            ? 0 : telemetry_profiles.front().run_id;
         const auto telemetry = ggml::gemmini::make_rmd_telemetry_record(
             matmul_options.rmd_backend, matmul_resolution.rmd_backend_source,
             bundle_id != nullptr ? bundle_id : "unbundled",
             ggml::gemmini::resolve_rmd_model_id(model_id, ctx->model_arch),
+            layer,
             telemetry_run_id, invocation_total, telemetry_profiles);
         ggml::gemmini::emit_cycle_telemetry(telemetry);
 #endif

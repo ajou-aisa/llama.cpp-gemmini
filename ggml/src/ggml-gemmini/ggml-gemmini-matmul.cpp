@@ -262,12 +262,14 @@ RmdTelemetryCheckResult compare_rmd_telemetry_proofs(
 
 RmdTelemetryRecord make_rmd_telemetry_record(
         RmdBackend backend, MatmulOptionSource source,
-        std::string runtime_bundle_id, std::string model_id, std::string run_id,
+        std::string runtime_bundle_id, std::string model_id, std::string layer,
+        uint64_t run_id,
         uint64_t invocation_total, const std::vector<MatmulJobMetrics> & profiles) {
     RmdTelemetryRecord record{};
     record.runtime_bundle_id = std::move(runtime_bundle_id);
     record.model_id = std::move(model_id);
-    record.run_id = std::move(run_id);
+    record.layer = std::move(layer);
+    record.run_id = run_id;
     record.backend = backend;
     record.source = source;
     record.units = cycle::units();
@@ -324,12 +326,16 @@ std::string serialize_rmd_telemetry(const RmdTelemetryRecord & record) {
 #else
     std::ostringstream out;
     out << "{\"schema\":"; telemetry_json_string(out, record.schema);
-    out << ",\"version\":" << record.version << ",\"record_type\":\"RMD_BACKEND_TELEMETRY\""
-        << ",\"runtime_bundle_id\":"; telemetry_json_string(out, record.runtime_bundle_id);
-    out << ",\"model_id\":"; telemetry_json_string(out, record.model_id);
-    out << ",\"run_id\":"; telemetry_json_string(out, record.run_id);
+    out << ",\"version\":" << record.version << ",\"record_type\":\"RMD_BACKEND_TELEMETRY\"";
     out << ",\"source\":"; telemetry_json_string(out, telemetry_clock_source());
     out << ",\"unit\":"; telemetry_json_string(out, telemetry_unit_name(record.units));
+    out << ",\"op\":\"rmd.execute\",\"layer\":";
+    if (record.layer.empty()) out << "null"; else telemetry_json_string(out, record.layer);
+    out << ",\"run_id\":" << record.run_id
+        << ",\"stripe_id\":null,\"slot\":null,\"node_id\":null,\"worker_id\":null"
+        << ",\"runtime_bundle_id\":";
+    telemetry_json_string(out, record.runtime_bundle_id);
+    out << ",\"model_id\":"; telemetry_json_string(out, record.model_id);
     out << ",\"backend\":"; telemetry_json_string(out, telemetry_backend_name(record.backend));
     out << ",\"option_source\":"; telemetry_json_string(out, telemetry_source_name(record.source));
     out << ",\"work\":" << (record.work ? "true" : "false")

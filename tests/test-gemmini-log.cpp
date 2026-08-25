@@ -34,6 +34,7 @@ static_assert(noexcept(gemmini_log_debug_to_layer({nullptr}, nullptr, "%d", 1)))
 static_assert(noexcept(gemmini_log_debug_to_loc({nullptr}, nullptr, 0, nullptr, "%d", 1)));
 static_assert(noexcept(gemmini_log_ws_cycle(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)));
 static_assert(noexcept(gemmini_log_cycle_record(nullptr)));
+static_assert(noexcept(gemmini_log_cycle_record_v2(nullptr)));
 static_assert(noexcept(gemmini_log_cycle(nullptr, nullptr, 0, 0)));
 static_assert(noexcept(gemmini_log_cycle_loc(nullptr, 0, nullptr, nullptr, nullptr, 0, 0)));
 static_assert(noexcept(gemmini_log_cycle_to({nullptr}, nullptr, nullptr, 0, 0)));
@@ -507,11 +508,18 @@ static bool test_atomic_cycle_sink(const std::filesystem::path & root) {
         return false;
     }
 
-    const gemmini_cycle_record c_record{"c-layer\n", "c-op\"", 1, 4, "c-file", 7, "c-func"};
+    gemmini_cycle_record c_record{};
+    c_record.layer = "c-layer\n";
+    c_record.op = "c-op\"";
+    c_record.start = 1;
+    c_record.end = 4;
+    c_record.file = "c-file";
+    c_record.line = 7;
+    c_record.func = "c-func";
     gemmini_log_cycle_record(&c_record);
     ggml::gemmini::log::cycle.write({"cpp-layer", "cpp-op", 4, 9, "cpp-file", 8, "cpp-func"});
     ggml::gemmini::log::cycle.write_json(
-        "{\"schema\":\"gemmini.cycle\",\"version\":1,\"record_type\":\"TEST_AGGREGATE\"}");
+        "{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"TEST_AGGREGATE\"}");
     gemmini_log_ws_cycle(100, 10, 20, 30, 40, 2, 3, 4, 1, 1, 1, 2, 3, 4, 0, 1);
 
     StartGate gate(2);
@@ -543,7 +551,9 @@ static bool test_atomic_cycle_sink(const std::filesystem::path & root) {
     }
     const std::string combined = read_file(first) + read_file(second);
     if (combined.find("\"layer\":\"c-layer\\n\"") == std::string::npos ||
-        combined.find("\"name\":\"c-op\\\"\"") == std::string::npos ||
+        combined.find("\"op\":\"c-op\\\"\"") == std::string::npos ||
+        combined.find("\"run_id\":null") == std::string::npos ||
+        combined.find("\"stripe_id\":null") == std::string::npos ||
         combined.find("\"delta\":3") == std::string::npos ||
         combined.find("\"layer\":\"cpp-layer\"") == std::string::npos ||
         combined.find("\"record_type\":\"TEST_AGGREGATE\"") == std::string::npos ||

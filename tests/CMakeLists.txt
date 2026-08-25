@@ -375,9 +375,17 @@ target_compile_definitions(test-gemmini-exsia-writer PRIVATE
     GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
     GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=1
     GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
+    GGML_GEMMINI_EXSIA_DEFAULT_MODE_VALUE=${_GGML_GEMMINI_EXSIA_DEFAULT_MODE_VALUE}
+    GGML_GEMMINI_EXSIA_LOCAL_WORKERS=${GGML_GEMMINI_EXSIA_LOCAL_WORKERS}
     CYCLE_DETAIL=1
     LOG_CYCLE=1
     EXSIA_VALIDATION=1)
+if (GGML_GEMMINI_ENABLE_OPENMP)
+    find_package(OpenMP REQUIRED COMPONENTS CXX)
+    target_compile_definitions(test-gemmini-exsia-writer PRIVATE
+        GGML_GEMMINI_HAS_OPENMP)
+    target_link_libraries(test-gemmini-exsia-writer PRIVATE OpenMP::OpenMP_CXX)
+endif()
 target_include_directories(test-gemmini-exsia-writer PRIVATE
     ../ggml/include ../ggml/src ../ggml/src/ggml-gemmini
     ../ggml/src/ggml-gemmini-utils/include ../ggml/src/ggml-gemmini/quants
@@ -567,7 +575,8 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
         GGML_GEMMINI_ACTIVATION_QUANT=${_GGML_GEMMINI_ACTIVATION_QUANT_VALUE}
         GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
         GGML_GEMMINI_TEST_IM2P_DIM=${GGML_GEMMINI_DIM}
-        LOG_CYCLE=${LOG_CYCLE})
+        LOG_CYCLE=${LOG_CYCLE}
+        LOG_DEBUG=${LOG_DEBUG})
     target_include_directories(test-gemmini-im2p-routing PRIVATE
         ../ggml/src
         ../ggml/src/ggml-gemmini

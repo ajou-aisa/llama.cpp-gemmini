@@ -443,6 +443,7 @@ struct ggml_threadpool {
 
     struct ggml_cgraph * cgraph;
     struct ggml_cplan  * cplan;
+    uint64_t cycle_run_id;
 
     // synchronization primitives
     atomic_int n_graph;       // incremented when there is work to be done (i.e each graph)
@@ -524,6 +525,10 @@ struct ggml_state {
 };
 
 static struct ggml_state g_state = {0};
+
+#if CYCLE_LOG
+static atomic_uint_fast64_t ggml_cpu_cycle_run_id = 0;
+#endif
 
 void ggml_barrier(struct ggml_threadpool * tp) {
     int n_threads = atomic_load_explicit(&tp->n_threads_cur, memory_order_relaxed);
@@ -1718,6 +1723,31 @@ static void ggml_compute_forward_mul_mat_id(
 
 /////////////////////////////////
 
+#if CYCLE_LOG
+static inline void ggml_log_cpu_cycle(const struct ggml_compute_params * params,
+                                      const char *layer, const char *op,
+                                      uint64_t start, uint64_t end) {
+    const gemmini_cycle_record_v2 record = {
+        .interval = {
+            .layer = layer,
+            .op = op,
+            .start = start,
+            .end = end,
+        },
+        .identity_mask = GEMMINI_CYCLE_HAS_RUN_ID |
+                         GEMMINI_CYCLE_HAS_NODE_ID |
+                         GEMMINI_CYCLE_HAS_WORKER_ID,
+        .run_id = params->run_id,
+        .node_id = params->node_id,
+        .worker_id = (uint64_t) params->ith,
+    };
+    gemmini_log_cycle_record_v2(&record);
+}
+
+#define gemmini_log_cycle(layer, op, start, end) \
+    ggml_log_cpu_cycle(params, layer, op, start, end)
+#endif
+
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
@@ -1734,7 +1764,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     // cycle var
     uint64_t start, end;
     // layer name
-    char layer[32];
+    char layer[GGML_MAX_NAME];
     gemmini_get_layer(tensor->name, layer, sizeof(layer));
     #endif
     
@@ -2652,6 +2682,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     }
 }
 
+#if CYCLE_LOG
+#undef gemmini_log_cycle
+#endif
+
 // Android's libc implementation "bionic" does not support setting affinity
 #if defined(__gnu_linux__)
 static void set_numa_thread_affinity(int thread_n) {
@@ -3422,11 +3456,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.wsize     =*/ cplan->work_size,
         /*.wdata     =*/ cplan->work_data,
         /*.threadpool=*/ tp,
+        /*.run_id    =*/ tp->cycle_run_id,
+        /*.node_id   =*/ 0,
     };
 
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
+        params.node_id = (uint64_t) node_n;
         ggml_compute_forward(&params, node);
 
         if (state->ith == 0 && cplan->abort_callback &&
@@ -3602,6 +3639,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     {
         threadpool->cgraph           = cgraph;
         threadpool->cplan            = cplan;
+        threadpool->cycle_run_id     = 0;
         threadpool->n_graph          = 0;
         threadpool->n_barrier        = 0;
         threadpool->n_barrier_passed = 0;
@@ -3690,6 +3728,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->abort            = -1;
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
+
+#if CYCLE_LOG
+    threadpool->cycle_run_id = (uint64_t) atomic_fetch_add_explicit(
+        &ggml_cpu_cycle_run_id, 1, memory_order_relaxed) + 1;
+#endif
 
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
