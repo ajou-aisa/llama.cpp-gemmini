@@ -8,9 +8,12 @@ static_assert(noexcept(gemmini_read_cycles()));
 #include <iterator>
 #include <string>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#include <process.h>
+#else
 #include <fcntl.h>
 #include <sys/resource.h>
+#include <unistd.h>
 #endif
 
 extern "C" int gemmini_log_c_boundary_call(int operation, const char * path);
@@ -18,6 +21,14 @@ extern "C" int gemmini_log_c_boundary_call(int operation, const char * path);
 static std::string read_file(const std::filesystem::path & path) {
     std::ifstream input(path, std::ios::binary);
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
+static int current_process_id() {
+#if defined(_WIN32)
+    return _getpid();
+#else
+    return static_cast<int>(getpid());
+#endif
 }
 
 static int open_descriptor_count() {
@@ -37,7 +48,8 @@ static int open_descriptor_count() {
 int main() {
     using ggml::gemmini::log::testing::LogFault;
     const std::filesystem::path root =
-        std::filesystem::temp_directory_path() / "gemmini-log-c-boundary";
+        std::filesystem::temp_directory_path() /
+        ("gemmini-log-c-boundary-" + std::to_string(current_process_id()));
     std::error_code error;
     std::filesystem::remove_all(root, error);
     std::filesystem::create_directory(root, error);

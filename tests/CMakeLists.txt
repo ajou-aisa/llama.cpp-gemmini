@@ -159,7 +159,7 @@ llama_build_and_test(test-regex-partial.cpp)
 if (NOT WIN32)
     llama_build_and_test(test-arg-parser.cpp)
 endif()
-if (LLAMA_BUILD_TOOLS)
+if (LLAMA_BUILD_TOOLS AND LOG_CYCLE)
     add_test(NAME test-gemmini-cycle-cli
         COMMAND ${CMAKE_COMMAND}
             -DTEST_CLI=$<TARGET_FILE:llama-cli>
