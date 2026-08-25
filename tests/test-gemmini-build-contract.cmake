@@ -975,7 +975,7 @@ run_im2p_configure_case(im2p_missing_pair "${width_mismatch_root}" 8 8 32 IM2P_S
     "Missing matching IM2P a8-w8-d32 archive")
 make_stale_frontend_root(stale_frontend_root)
 run_im2p_configure_case(im2p_stale_frontend "${stale_frontend_root}" 8 8 32 IM2P_SIM FALSE
-    "im2p_poll_completed_extended")
+    "IM2P frontend configuration mismatch")
 make_abi_stale_frontend_root(abi_stale_frontend_root)
 run_im2p_configure_case(im2p_abi_stale_frontend "${abi_stale_frontend_root}"
     8 8 16 IM2P_SIM FALSE "IM2P frontend args layout mismatch")
