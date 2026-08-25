@@ -16,6 +16,8 @@ public:
 
     void reset(size_t stripe_id, size_t row_begin, size_t row_count,
                size_t logical_k, size_t logical_j);
+    void reset(size_t stripe_id, size_t row_begin, size_t row_count,
+               size_t logical_k, size_t logical_j, uint8_t digit_bits);
 
     bool add_residual(size_t local_row, size_t original_k, int32_t residual);
 
@@ -31,7 +33,7 @@ private:
         uint32_t local_row;
         uint16_t block_local_k;
         uint8_t lane;
-        int8_t digit;
+        int32_t digit;
     };
 
     struct BlockAccum {
@@ -45,6 +47,8 @@ private:
     size_t row_count_ = 0;
     size_t logical_k_ = 0;
     size_t logical_j_ = 0;
+    uint8_t digit_bits_ = 8;
+    size_t residual_event_count_ = 0;
     std::vector<DigitEntry> entries_;
     std::map<uint32_t, BlockAccum> blocks_;
 };
@@ -52,6 +56,14 @@ private:
 // Validates every structural invariant of a finished packet. Used by finish(), by the
 // executor, and by tests that construct packets by hand.
 RmdStatus validate_packet(const StripePacket & packet);
+
+// Reads one decoded signed digit. On failure, `digit` is unchanged.
+RmdStatus read_packet_digit(const StripePacket & packet,
+                            const BlockDescriptor & block,
+                            uint8_t lane_position,
+                            size_t row,
+                            size_t k,
+                            int32_t & digit);
 
 // Rebuilds a packet restricted to [row_begin, row_end) out of one or more packets that
 // may use a different stripe granularity. Used by the sequential stripe mode, where the

@@ -34,7 +34,7 @@ namespace ggml::gemmini::config
 #define GGML_GEMMINI_BLOCK_SIZE 32
 #endif
 
-// Balanced Radix-256 Residual Matrix Decomposition. OFF is a residual-compensation
+// Width-native Residual Matrix Decomposition. OFF is a residual-compensation
 // ablation only: there is no other compensation path.
 #ifndef GGML_GEMMINI_ENABLE_RMD
 #define GGML_GEMMINI_ENABLE_RMD 1
@@ -46,6 +46,25 @@ namespace ggml::gemmini::config
 
 #ifndef GGML_GEMMINI_WEIGHT_BITS
 #define GGML_GEMMINI_WEIGHT_BITS 8
+#endif
+
+#ifndef GGML_GEMMINI_ACTIVATION_STORAGE_BYTES
+#define GGML_GEMMINI_ACTIVATION_STORAGE_BYTES \
+    (GGML_GEMMINI_ACTIVATION_BITS == 16 ? 2 : 1)
+#endif
+
+#ifndef GGML_GEMMINI_WEIGHT_STORAGE_BYTES
+#define GGML_GEMMINI_WEIGHT_STORAGE_BYTES \
+    (GGML_GEMMINI_WEIGHT_BITS == 16 ? 2 : 1)
+#endif
+
+#define GGML_GEMMINI_Q4_PACKING_NONE 0
+#define GGML_GEMMINI_Q4_PACKING_SIGNED_NIBBLE_LOW_FIRST 1
+#ifndef GGML_GEMMINI_Q4_PACKING_MODE
+#define GGML_GEMMINI_Q4_PACKING_MODE \
+    (GGML_GEMMINI_ACTIVATION_BITS == 4 \
+         ? GGML_GEMMINI_Q4_PACKING_SIGNED_NIBBLE_LOW_FIRST \
+         : GGML_GEMMINI_Q4_PACKING_NONE)
 #endif
 
 // ComputeType ----------------------------------------------------------------
@@ -123,6 +142,17 @@ static_assert(GGML_GEMMINI_ACTIVATION_BITS == 4 || GGML_GEMMINI_ACTIVATION_BITS 
               "GGML_GEMMINI_ACTIVATION_BITS must be 4, 8, or 16");
 static_assert(GGML_GEMMINI_WEIGHT_BITS == 4 || GGML_GEMMINI_WEIGHT_BITS == 8 || GGML_GEMMINI_WEIGHT_BITS == 16,
               "GGML_GEMMINI_WEIGHT_BITS must be 4, 8, or 16");
+static_assert(GGML_GEMMINI_ACTIVATION_BITS == GGML_GEMMINI_WEIGHT_BITS,
+              "Gemmini requires matched activation and weight widths");
+static_assert(GGML_GEMMINI_ACTIVATION_STORAGE_BYTES == (GGML_GEMMINI_ACTIVATION_BITS == 16 ? 2 : 1),
+              "Gemmini activation storage bytes must match the logical width");
+static_assert(GGML_GEMMINI_WEIGHT_STORAGE_BYTES == (GGML_GEMMINI_WEIGHT_BITS == 16 ? 2 : 1),
+              "Gemmini weight storage bytes must match the logical width");
+static_assert(GGML_GEMMINI_Q4_PACKING_MODE ==
+                  (GGML_GEMMINI_ACTIVATION_BITS == 4
+                       ? GGML_GEMMINI_Q4_PACKING_SIGNED_NIBBLE_LOW_FIRST
+                       : GGML_GEMMINI_Q4_PACKING_NONE),
+              "Gemmini Q4 packing mode must match the logical width");
 
 inline constexpr int32_t GGML_GEMMINI_ACTIVATION_QMIN = -(int32_t{1} << (GGML_GEMMINI_ACTIVATION_BITS - 1));
 inline constexpr int32_t GGML_GEMMINI_ACTIVATION_QMAX =  (int32_t{1} << (GGML_GEMMINI_ACTIVATION_BITS - 1)) - 1;

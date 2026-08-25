@@ -1299,7 +1299,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     if (!deferred_quantization) {
       quantize_ok = ggml::gemmini::quants::quantize_activation(src1, args);
     }
-#if GGML_GEMMINI_COMPUTE_TYPE == 0
+#if GGML_GEMMINI_COMPUTE_TYPE == 0 && GGML_GEMMINI_ACTIVATION_BITS == 8
     static_assert(sizeof(elem_t) == 1, "Q8_0 path assumes elem_t is int8 (1 byte).");
 #endif
 

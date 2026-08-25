@@ -10,9 +10,11 @@
 #include <memory>
 #include <new>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
+#include "ggml-gemmini-config.hpp"
 #include "ggml-gemmini-geometry.hpp"
 #include "quants/act/meta.hpp"
 #include "quants/act/types.hpp"
@@ -163,6 +165,15 @@ struct StripeReadySink;
 #undef GGML_GEMMINI_ARGS_DEFINE_GGML_COMMON
 #endif
 #include <gemmini_params.h>
+
+static_assert(sizeof(elem_t) == GGML_GEMMINI_ACTIVATION_STORAGE_BYTES,
+              "elem_t must match configured activation transport storage");
+static_assert(sizeof(elem_t) == GGML_GEMMINI_WEIGHT_STORAGE_BYTES,
+              "elem_t must match configured weight transport storage");
+static_assert(GGML_GEMMINI_ACTIVATION_BITS == 16
+                  ? std::is_same_v<elem_t, int16_t>
+                  : std::is_same_v<elem_t, int8_t>,
+              "elem_t must be int16_t only for A16/W16, otherwise int8_t");
 
 // Forward declaration to avoid including full gemmini.h (breaks include cycles)
 enum tiled_matmul_type_t : int;
@@ -452,7 +463,12 @@ typedef struct ggml_gemmini_args_t {
     }
 
     inline bool has_q8_channel_direct_read_contract() const {
-        static_assert(sizeof(elem_t) == 1, "Q8_CHANNEL INT direct-read requires one-byte elem_t");
+        static_assert(GGML_GEMMINI_WEIGHT_BITS != 8 || sizeof(elem_t) == 1,
+                      "W8 Q8_CHANNEL direct-read requires one-byte elem_t");
+        if constexpr (GGML_GEMMINI_WEIGHT_BITS != 8 ||
+                      GGML_GEMMINI_WEIGHT_STORAGE_BYTES != 1) {
+            return false;
+        }
 
         if (weight_format != im2p_weight_format_t::q8_channel ||
             q8_channel_row_base == nullptr || J == 0 || K == 0 ||
@@ -478,7 +494,12 @@ typedef struct ggml_gemmini_args_t {
     }
 
     inline bool has_q8_channel_dense_sidecar_contract() const {
-        static_assert(sizeof(elem_t) == 1, "Q8_CHANNEL INT dense-sidecar requires one-byte elem_t");
+        static_assert(GGML_GEMMINI_WEIGHT_BITS != 8 || sizeof(elem_t) == 1,
+                      "W8 Q8_CHANNEL dense-sidecar requires one-byte elem_t");
+        if constexpr (GGML_GEMMINI_WEIGHT_BITS != 8 ||
+                      GGML_GEMMINI_WEIGHT_STORAGE_BYTES != 1) {
+            return false;
+        }
 
         if (weight_format != im2p_weight_format_t::q8_channel_dense_sidecar ||
             B == nullptr || J == 0 || K == 0 || sB != K ||
