@@ -231,7 +231,6 @@ if (UNIX AND BUILD_SHARED_LIBS AND LOG_CYCLE AND TARGET ggml-gemmini)
             ${CMAKE_CURRENT_BINARY_DIR}/gemmini-log-cross-image/cycle-log.jsonl
             ${CMAKE_CURRENT_BINARY_DIR}/gemmini-log-cross-image/stderr.txt)
 endif()
-llama_build_and_test(test-gemmini-q8-h1-h2-dequant-fp.cpp NAME gemmini_q8_h1_h2_dequant_fp)
 llama_build_and_test(test-gemmini-weight-formats.cpp NAME gemmini_weight_formats)
 target_link_libraries(gemmini_weight_formats PRIVATE ggml-base ggml-gemmini)
 target_compile_definitions(gemmini_weight_formats PRIVATE
@@ -239,7 +238,22 @@ target_compile_definitions(gemmini_weight_formats PRIVATE
     GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE})
 add_test(NAME test-gemmini-weight-reader-callers
     COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-weight-reader-callers.cmake)
-target_sources(gemmini_q8_h1_h2_dequant_fp PRIVATE
+
+set(_GGML_GEMMINI_BUILD_DEQUANT_FP_TARGET TRUE)
+if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND
+    NOT _GGML_GEMMINI_ENABLE_RMD_VALUE)
+    set(_GGML_GEMMINI_BUILD_DEQUANT_FP_TARGET FALSE)
+endif()
+if (_GGML_GEMMINI_BUILD_DEQUANT_FP_TARGET)
+if (_GGML_GEMMINI_ACTIVATION_BITS_VALUE EQUAL 8)
+    set(_GGML_GEMMINI_DEQUANT_FP_TARGET gemmini_q8_h1_h2_dequant_fp)
+else()
+    set(_GGML_GEMMINI_DEQUANT_FP_TARGET gemmini_width_h1_dequant_fp)
+endif()
+llama_build_and_test(
+    test-gemmini-q8-h1-h2-dequant-fp.cpp
+    NAME ${_GGML_GEMMINI_DEQUANT_FP_TARGET})
+target_sources(${_GGML_GEMMINI_DEQUANT_FP_TARGET} PRIVATE
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
     ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
@@ -249,15 +263,37 @@ target_sources(gemmini_q8_h1_h2_dequant_fp PRIVATE
     ../ggml/src/ggml-gemmini/quants/act/quantize.cpp
     ../ggml/src/ggml-gemmini/quants/act/block/block.cpp
     ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
+    ../ggml/src/ggml-gemmini/quants/act/stripe/stripe.cpp
     ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
     ../ggml/src/ggml-gemmini/quants/act/token/token.cpp)
-target_link_libraries(gemmini_q8_h1_h2_dequant_fp PRIVATE ggml-base ggml-gemmini-utils)
-target_compile_definitions(gemmini_q8_h1_h2_dequant_fp PRIVATE
-    GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE})
-target_include_directories(gemmini_q8_h1_h2_dequant_fp PRIVATE
+target_link_libraries(
+    ${_GGML_GEMMINI_DEQUANT_FP_TARGET}
+    PRIVATE ggml-base ggml-gemmini-utils)
+target_compile_definitions(${_GGML_GEMMINI_DEQUANT_FP_TARGET} PRIVATE
+    ${GGML_GEMMINI_COMPILE_DEFS}
+    GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE})
+target_include_directories(${_GGML_GEMMINI_DEQUANT_FP_TARGET} PRIVATE
     ../ggml/src
     ../ggml/src/ggml-gemmini
     ../ggml/src/ggml-gemmini-utils/include)
+if (GGML_GEMMINI_DEQUANT_FP_TEST)
+    if (_GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "EXSIA")
+        add_test(NAME gemmini_deferred_dequant_fp
+            COMMAND ${CMAKE_COMMAND} -E env
+                GEMMINI_MATMUL_MODE=STRIPE_PIPELINE
+                $<TARGET_FILE:${_GGML_GEMMINI_DEQUANT_FP_TARGET}>
+                --h1-pipeline)
+    else()
+        add_test(NAME gemmini_dequant_fp
+            COMMAND ${CMAKE_COMMAND} -E env
+                GEMMINI_MATMUL_MODE=FULL
+                $<TARGET_FILE:${_GGML_GEMMINI_DEQUANT_FP_TARGET}>
+                --h1-full)
+    endif()
+endif()
+unset(_GGML_GEMMINI_DEQUANT_FP_TARGET)
+endif()
+unset(_GGML_GEMMINI_BUILD_DEQUANT_FP_TARGET)
 
 add_executable(test-gemmini-act-quant-i32-saturation
     test-gemmini-act-quant-i32-saturation.cpp
@@ -754,7 +790,6 @@ set_property(TEST gemmini_quant_dispatch_unsupported PROPERTY LABELS main)
 set(_GEMMINI_REGISTERED_TEST_EXECUTABLES
     test-gemmini-log
     test-gemmini-log-boundary
-    gemmini_q8_h1_h2_dequant_fp
     gemmini_weight_formats
     test-gemmini-act-quant-i32-saturation
     test-gemmini-exsia
@@ -764,6 +799,8 @@ set(_GEMMINI_REGISTERED_TEST_EXECUTABLES
     test-gemmini-rmd-telemetry
     gemmini-quant-dispatch-smoke)
 foreach(_GEMMINI_OPTIONAL_TEST_EXECUTABLE IN ITEMS
+        gemmini_q8_h1_h2_dequant_fp
+        gemmini_width_h1_dequant_fp
         test-gemmini-srmd-raw-ws
         test-gemmini-matmul-options
         test-gemmini-im2p-routing
