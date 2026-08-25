@@ -734,6 +734,9 @@ if (NOT GGML_BACKEND_DL)
         GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
         GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE})
     add_test(NAME test-gemmini-matmul COMMAND $<TARGET_FILE:test-gemmini-matmul>)
+    add_test(
+        NAME test-gemmini-matmul-finite-output
+        COMMAND $<TARGET_FILE:test-gemmini-matmul> --case=finite-output)
     find_package(Threads REQUIRED)
     add_executable(test-gemmini-buffer-artifacts test-gemmini-buffer-artifacts.cpp)
     target_link_libraries(test-gemmini-buffer-artifacts PRIVATE ggml-gemmini ggml-base Threads::Threads)
@@ -767,6 +770,8 @@ add_executable(gemmini-quant-dispatch-smoke
 target_link_libraries(gemmini-quant-dispatch-smoke PRIVATE ggml-base ggml-gemmini-utils)
 target_compile_features(gemmini-quant-dispatch-smoke PRIVATE cxx_std_17)
 target_compile_definitions(gemmini-quant-dispatch-smoke PRIVATE
+    GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+    GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
     GGML_GEMMINI_ACTIVATION_QUANT=2
     GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
     GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA})

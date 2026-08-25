@@ -533,12 +533,22 @@ bool valid_activation_metadata(const ggml_gemmini_args_t & args) {
     return metadata.valid();
 }
 
+bool finite_float_bits(const float * value) {
+    static_assert(sizeof(float) == sizeof(uint32_t));
+    static_assert(std::numeric_limits<float>::is_iec559);
+    uint32_t bits = 0;
+    std::memcpy(&bits, static_cast<const void *>(value), sizeof(bits));
+    constexpr uint32_t exponent_mask = UINT32_C(0x7f800000);
+    return (bits & exponent_mask) != exponent_mask;
+}
+
 bool finite_output(const ggml_gemmini_args_t & args) {
     const size_t row_stride = args.stride_f_out != 0 ? args.stride_f_out : args.J;
     const size_t col_stride = args.col_stride_f_out != 0 ? args.col_stride_f_out : 1;
     for (size_t row = 0; row < args.I; ++row) {
         for (size_t col = 0; col < args.J; ++col) {
-            if (!std::isfinite(args.f_out[row * row_stride + col * col_stride])) {
+            if (!finite_float_bits(
+                    &args.f_out[row * row_stride + col * col_stride])) {
                 return false;
             }
         }
@@ -652,6 +662,43 @@ MatMulStatus execute_native_matched_cpu_dense(ggml_gemmini_args_t & args) {
         }
     }
 
+    std::vector<float> bias;
+    const float * bias_data = nullptr;
+    if (args.D != nullptr) {
+        if (args.I != 0 &&
+            args.J > std::numeric_limits<size_t>::max() / args.I) {
+            return MatMulStatus::invalid_arguments;
+        }
+        const size_t source_stride = args.sD != 0 ? args.sD : args.J;
+        if (!args.repeating_bias && args.I > 1 &&
+            source_stride >
+                (std::numeric_limits<size_t>::max() - (args.J - 1)) /
+                    (args.I - 1)) {
+            return MatMulStatus::invalid_arguments;
+        }
+        try {
+            bias.resize(args.I * args.J);
+        } catch (const std::bad_alloc &) {
+            return MatMulStatus::invalid_arguments;
+        } catch (const std::length_error &) {
+            return MatMulStatus::invalid_arguments;
+        }
+        for (size_t i = 0; i < args.I; ++i) {
+            const size_t source_row = args.repeating_bias ? 0 : i;
+            for (size_t j = 0; j < args.J; ++j) {
+                const size_t source_index = source_row * source_stride + j;
+                bias[i * args.J + j] = args.low_D
+                    ? static_cast<float>(
+                          static_cast<const elem_t *>(args.D)[source_index]) *
+                          static_cast<float>(args.scale_D)
+                    : static_cast<float>(
+                          static_cast<const acc_t *>(args.D)[source_index]) *
+                          static_cast<float>(args.scale_D);
+            }
+        }
+        bias_data = bias.data();
+    }
+
     const size_t output_row_stride =
         args.stride_f_out != 0 ? args.stride_f_out : args.J;
     const size_t output_col_stride =
@@ -659,8 +706,8 @@ MatMulStatus execute_native_matched_cpu_dense(ggml_gemmini_args_t & args) {
 
     if (output_col_stride == 1) {
         matmul_cpu_fp(false, true, args.I, args.J, args.K,
-                      activation.data(), weights.data(), nullptr, args.f_out,
-                      args.K, args.K, 0, output_row_stride);
+                      activation.data(), weights.data(), bias_data, args.f_out,
+                      args.K, args.K, args.J, output_row_stride);
         return MatMulStatus::success;
     }
 
@@ -676,8 +723,8 @@ MatMulStatus execute_native_matched_cpu_dense(ggml_gemmini_args_t & args) {
         return MatMulStatus::invalid_arguments;
     }
     matmul_cpu_fp(false, true, args.I, args.J, args.K,
-                  activation.data(), weights.data(), nullptr,
-                  contiguous_output.data(), args.K, args.K, 0, args.J);
+                  activation.data(), weights.data(), bias_data,
+                  contiguous_output.data(), args.K, args.K, args.J, args.J);
     for (size_t i = 0; i < args.I; ++i) {
         for (size_t j = 0; j < args.J; ++j) {
             args.f_out[i * output_row_stride + j * output_col_stride] =
@@ -685,6 +732,18 @@ MatMulStatus execute_native_matched_cpu_dense(ggml_gemmini_args_t & args) {
         }
     }
     return MatMulStatus::success;
+}
+
+MatMulStatus physical_dense_status(DenseMatmulStatus status) {
+    switch (status) {
+        case DenseMatmulStatus::success:
+            return MatMulStatus::success;
+        case DenseMatmulStatus::invalid_contract:
+            return MatMulStatus::invalid_contract;
+        case DenseMatmulStatus::unsupported:
+            return MatMulStatus::unsupported;
+    }
+    return MatMulStatus::invalid_state;
 }
 
 MatMulStatus execute_dense(ggml_gemmini_args_t &args) {
@@ -707,13 +766,16 @@ MatMulStatus execute_dense(ggml_gemmini_args_t &args) {
         }
         return execute_native_matched_cpu_dense(args);
     } else if (uses_baseline_channel_route(args)) {
-        tiled_matmul_auto_baseline(&args, baseline_activation_for(args), baseline_weight_quant_t::CHANNEL);
+        return physical_dense_status(tiled_matmul_auto_baseline(
+            &args, baseline_activation_for(args),
+            baseline_weight_quant_t::CHANNEL));
     } else if (args.weight_i8_scale_active) {
-        tiled_matmul_auto_baseline(&args, baseline_activation_for(args), baseline_weight_quant_t::TENSOR);
+        return physical_dense_status(tiled_matmul_auto_baseline(
+            &args, baseline_activation_for(args),
+            baseline_weight_quant_t::TENSOR));
     } else {
-        tiled_matmul_auto_im2p(&args);
+        return physical_dense_status(tiled_matmul_auto_im2p(&args));
     }
-    return MatMulStatus::success;
 }
 
 MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe, size_t stripe_id,
