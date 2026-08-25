@@ -757,6 +757,9 @@ printf 'cmake:%s\n' "$*" >> "$CONTRACT_LOG"
             "BUILD_JOBS=1"
             "IM2P_SIM_ROOT=${TEST_REAL_IM2P_ROOT}"
             "LOG_CYCLE=0"
+            "GGML_GEMMINI_OPTION=WS"
+            "GGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM"
+            "GGML_GEMMINI_DIM=64"
             bash "${TEST_SOURCE_DIR}/build-arm64.sh"
         WORKING_DIRECTORY "${TEST_SOURCE_DIR}"
         RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
@@ -770,17 +773,20 @@ printf 'cmake:%s\n' "$*" >> "$CONTRACT_LOG"
     string(FIND "${commands}" "cargo:" direct_cargo_at)
     string(FIND "${commands}" "cmake:-B" configure_at)
     string(FIND "${commands}" "-DGGML_GEMMINI_OPTION=WS" option_at)
+    string(FIND "${commands}"
+        "-DGGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM" backend_at)
     string(FIND "${commands}" "-DGGML_GEMMINI_DIM=64" dim_at)
     string(FIND "${commands}" "-DGGML_GEMMINI_BLOCK_SIZE=32" cmake_block_size_at)
     string(FIND "${commands}" "cmake:--build" build_at)
     if(frontend_block_size_at EQUAL -1 OR cache_target_at EQUAL -1 OR
        NOT direct_cargo_at EQUAL -1 OR
        configure_at EQUAL -1 OR option_at EQUAL -1 OR
+       backend_at EQUAL -1 OR
        dim_at EQUAL -1 OR
        cmake_block_size_at EQUAL -1 OR build_at EQUAL -1 OR
        NOT cache_target_at LESS configure_at OR NOT configure_at LESS build_at)
         message(FATAL_ERROR
-            "build-arm64 defaults must delegate matching B32/DIM64 cache selection before configure/build without direct Cargo orchestration:\n${commands}")
+            "build-arm64 WS/IM2P DIM64 overrides must delegate matching B32/DIM64 cache selection before configure/build without direct Cargo orchestration:\n${commands}")
     endif()
 endfunction()
 
