@@ -1360,7 +1360,11 @@ namespace ggml::gemmini::quants::act::exsia
                             residual::TimedResidualCapture &rmd_builder)
     {
         const int16_t neg_inf = std::numeric_limits<int16_t>::min();
+#if GGML_GEMMINI_ENABLE_RMD
         rmd_builder.reset(stripe_idx, stripe.row_start, stripe.row_count(), args.K, args.J);
+#else
+        (void) rmd_builder;
+#endif
 
         if (stripe.e1 == neg_inf)
         {
@@ -1444,11 +1448,13 @@ namespace ggml::gemmini::quants::act::exsia
 
                     // Balanced radix-256 decomposition happens the moment the final
                     // residual exists; no residual list survives this loop.
+#if GGML_GEMMINI_ENABLE_RMD
                     if (outlier && residual_i32 != 0 &&
                         !rmd_builder.add_residual(local_row, col, residual_i32))
                     {
                         return false;
                     }
+#endif
                 }
             }
         }
@@ -1460,6 +1466,7 @@ namespace ggml::gemmini::quants::act::exsia
     // stripe, right after folding commits, by the thread that ran folding.
     static bool seal_stripe_packet(Meta &meta, StripePipelineSlot &slot)
     {
+#if GGML_GEMMINI_ENABLE_RMD
         const residual::ResidualStripePayload payload = slot.rmd_builder.finish();
         slot.rmd_packet = payload.packet;
         slot.direct_residual = payload.direct;
@@ -1470,6 +1477,12 @@ namespace ggml::gemmini::quants::act::exsia
             meta.rmd_packets.push_back(slot.rmd_packet);
         if (slot.direct_residual)
             meta.direct_residuals.push_back(slot.direct_residual);
+#else
+        (void) meta;
+        slot.rmd_packet.reset();
+        slot.direct_residual.reset();
+        slot.rmd_pack_ns = 0;
+#endif
         return true;
     }
 

@@ -45,6 +45,67 @@ bool check(bool value, const char * message) {
 }
 
 #ifndef GEMMINI_EXSIA_WRITER_TEST_ONLY
+bool test_meta_rho_invariant() {
+    quants::act::exsia::Meta meta;
+    const bool initialized =
+        meta.rho == config::GGML_GEMMINI_ACTIVATION_RHO;
+    meta.rho = std::numeric_limits<int16_t>::max();
+    meta.theta.push_back(1);
+    meta.reset();
+    return check(initialized, "ExSIA metadata initializes width-native rho") &&
+        check(meta.rho == config::GGML_GEMMINI_ACTIVATION_RHO,
+              "ExSIA metadata reset restores width-native rho") &&
+        check(meta.theta.empty(), "ExSIA metadata reset clears theta");
+}
+
+bool test_non_outlier_clipping_policy() {
+#if GGML_GEMMINI_ACTIVATION_BITS == 4
+    constexpr size_t columns = 32;
+    std::array<float, columns> source{};
+    source.fill(1.9f);
+    ggml_tensor tensor{};
+    tensor.type = GGML_TYPE_F32;
+    tensor.data = source.data();
+
+    ggml_gemmini_args_t args{};
+    args.I = 1;
+    args.J = 1;
+    args.K = columns;
+    args.sA = columns;
+    args.tile_I = 1;
+    args.tile_J = 1;
+    args.tile_K = 1;
+    args.activation_rows_per_stripe = DIM;
+    args.residual_route = residual::ResidualRoute::cpu_direct;
+    if (!args.A.allocate(1, columns, 4)) {
+        return false;
+    }
+
+    quants::act::exsia::Meta meta;
+    quants::act::exsia::ExSIA exsia;
+    const bool quantized = exsia.run(meta, &tensor, args);
+    bool clipped_to_qmax = quantized;
+    for (size_t column = 0; column < columns; ++column) {
+        clipped_to_qmax =
+            args.A.get(0, column) == config::GGML_GEMMINI_ACTIVATION_QMAX &&
+            clipped_to_qmax;
+    }
+    const bool residuals_discarded =
+        std::all_of(exsia.state().residual.begin(),
+                    exsia.state().residual.end(),
+                    [](int32_t value) { return value == 0; });
+    return check(quantized && meta.theta == std::vector<int16_t>{-2},
+                 "equal A4 values select the expected ExSIA theta") &&
+        check(clipped_to_qmax,
+              "non-outlier A4 overflow remains clipped to qmax") &&
+        check(residuals_discarded && meta.rmd_packets.empty() &&
+                  meta.direct_residuals.empty(),
+              "non-outlier clipping remains residual-free");
+#else
+    return true;
+#endif
+}
+
 const std::vector<rmd::OutputValue> * integer_values(const rmd::Correction & correction) {
     const auto * typed = std::get_if<rmd::BlockScaledInt64Correction>(&correction);
     return typed == nullptr ? nullptr : &typed->values;
@@ -59,6 +120,8 @@ bool integer_values_equal(const rmd::Correction & correction,
 struct GeometryPublicationTrace {
     std::array<std::pair<size_t, size_t>, 2> rows{};
     size_t publications = 0;
+    size_t direct_handles = 0;
+    size_t packet_handles = 0;
 };
 
 bool capture_geometry_publication(
@@ -67,6 +130,8 @@ bool capture_geometry_publication(
     auto & trace = *static_cast<GeometryPublicationTrace *>(opaque);
     if (trace.publications >= trace.rows.size()) return false;
     trace.rows[trace.publications++] = {event.row_begin, event.row_end};
+    trace.direct_handles += event.direct_residual != nullptr ? 1 : 0;
+    trace.packet_handles += event.rmd_packet != nullptr ? 1 : 0;
     return true;
 }
 
@@ -74,6 +139,7 @@ bool test_activation_stripe_geometry_contract() {
     constexpr size_t rows = 33;
     constexpr size_t cols = 32;
     std::vector<float> source(rows * cols, 0.5f);
+    source[0] = 32.0f;
     ggml_tensor tensor{};
     tensor.type = GGML_TYPE_F32;
     tensor.data = source.data();
@@ -176,6 +242,18 @@ bool test_activation_stripe_geometry_contract() {
         check(!public_bad_ok && public_sentinel_unchanged &&
                   std::holds_alternative<quants::act::NoneMeta>(public_bad_args.act_quant.storage()),
               "public ExSIA mismatch preserves the activation sentinel");
+#if GGML_GEMMINI_ENABLE_RMD
+    const bool residual_producer_ok =
+        check(trace.direct_handles > 0 && trace.packet_handles == 0 &&
+                  !exsia_meta.direct_residuals.empty(),
+              "RMD-enabled ExSIA publishes direct residual payloads");
+#else
+    const bool residual_producer_ok =
+        check(trace.direct_handles == 0 && trace.packet_handles == 0 &&
+                  exsia_meta.direct_residuals.empty() &&
+                  exsia_meta.rmd_packets.empty(),
+              "RMD-disabled ExSIA publishes no residual payloads");
+#endif
 
     const bool ok =
         check(exsia_ok && stripe_ok, "ExSIA and STRIPE accept matching geometry") &&
@@ -192,7 +270,7 @@ bool test_activation_stripe_geometry_contract() {
         check(exsia_dequantized && stripe_dequantized &&
                   !bad_exsia_dequantized && !bad_stripe_dequantized,
               "ExSIA and STRIPE consumers accept only matching geometry") &&
-        direct_atomic_ok && public_atomic_ok &&
+        direct_atomic_ok && public_atomic_ok && residual_producer_ok &&
         check(!bad_stripe_ok && bad_stripe_meta != nullptr && bad_stripe_meta->scales.empty() &&
                   bad_stripe_meta->rmd_packets.empty() && bad_stripe_meta->direct_residuals.empty(),
               "STRIPE metadata mismatch has zero metadata side effects");
@@ -1890,6 +1968,7 @@ bool profile_output_routing(const std::filesystem::path & expected, bool invalid
         check(!std::filesystem::exists("log/exsia-cycle-detail.jsonl"), "ExSIA profile writer does not create legacy log");
 }
 
+#ifndef GEMMINI_EXSIA_WRITER_TEST_ONLY
 bool test_compiled_width_rmd_suite() {
 #if GGML_GEMMINI_ACTIVATION_BITS == 8 && GGML_GEMMINI_WEIGHT_BITS == 8
     return test_rmd_cpu_ws_routes() &&
@@ -1902,6 +1981,7 @@ bool test_compiled_width_rmd_suite() {
     return true;
 #endif
 }
+#endif
 
 }
 
@@ -1950,7 +2030,8 @@ int main(int argc, char ** argv) {
         case_name == "q8-srmd-software-ws" || case_name == "rmd-ws-contract-probe" ||
         case_name == "hp1-srmd-software-ws" ||
         case_name == "rmd-direct-parity" || case_name == "direct-executor" ||
-        case_name == "rmd-gather" || case_name == "stripe-geometry";
+        case_name == "rmd-gather" || case_name == "stripe-geometry" ||
+        case_name == "meta-rho" || case_name == "non-outlier-clipping";
     if (!known) {
         std::fprintf(stderr, "unknown case: %s\n", case_name.c_str());
         return 2;
@@ -1958,7 +2039,9 @@ int main(int argc, char ** argv) {
 
     std::printf("TEST_CASE_BEGIN name=%s\n", case_name.c_str());
     const bool ok =
-        (case_name == "all" && test_exsia_baseline() && test_dispatch_modes() &&
+        (case_name == "all" && test_meta_rho_invariant() &&
+         test_non_outlier_clipping_policy() &&
+         test_exsia_baseline() && test_dispatch_modes() &&
          test_compiled_width_rmd_suite() && test_direct_cpu_executor() &&
          test_activation_stripe_geometry_contract() &&
          test_cpu_direct_residual_dequantization()) ||
@@ -1973,6 +2056,9 @@ int main(int argc, char ** argv) {
         (case_name == "direct-executor" && test_direct_cpu_executor()) ||
         (case_name == "stripe-geometry" && test_activation_stripe_geometry_contract() &&
          test_cpu_direct_residual_dequantization()) ||
+        (case_name == "meta-rho" && test_meta_rho_invariant()) ||
+        (case_name == "non-outlier-clipping" &&
+         test_non_outlier_clipping_policy()) ||
         (case_name == "rmd-gather" && test_rmd_weight_gather());
     if (ok)
         std::printf("PASS: case=%s\n", case_name.c_str());

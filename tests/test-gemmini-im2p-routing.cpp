@@ -619,6 +619,24 @@ bool run_exsia_publication_boundary() {
   trace.quantization_complete = true;
   ggml_free(context);
 
+#if GGML_GEMMINI_ENABLE_RMD
+  const bool residual_handle_contract = std::all_of(
+      trace.events.begin(), trace.events.begin() + trace.event_count,
+      [](const StripeReadyEvent &event) {
+        return event.rmd_packet || event.direct_residual;
+      });
+  const char *residual_handle_message =
+      "residual sealing precedes each publication callback";
+#else
+  const bool residual_handle_contract = std::all_of(
+      trace.events.begin(), trace.events.begin() + trace.event_count,
+      [](const StripeReadyEvent &event) {
+        return !event.rmd_packet && !event.direct_residual;
+      });
+  const char *residual_handle_message =
+      "RMD-disabled publication carries no residual handles";
+#endif
+
   return check(quantized, "three-stripe ExSIA quantization succeeds") &&
          check(trace.event_count == 3,
                "one callback is emitted for each sealed stripe") &&
@@ -627,8 +645,7 @@ bool run_exsia_publication_boundary() {
          check(trace.committed_prefix_exact && trace.next_theta_uncommitted &&
                    trace.nonzero_order_checks == 2,
                "each callback observes only its committed theta prefix and an uncommitted next stripe") &&
-         check(trace.events[0].rmd_packet || trace.events[0].direct_residual,
-               "packet sealing precedes the publication callback") &&
+         check(residual_handle_contract, residual_handle_message) &&
 #if LOG_CYCLE
          check(trace.events[0].folding_commit_ns != 0 &&
                    trace.events[0].folding_commit_ns <= trace.events[1].folding_commit_ns &&

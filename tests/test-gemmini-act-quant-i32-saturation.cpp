@@ -62,14 +62,14 @@ bool check_quantizer(const char *name, Quantize quantize)
         args.I = 1;
         args.J = 1;
         args.K = source.size();
-        args.A.allocate(args.I, args.K, 8);
+        args.A.allocate(args.I, args.K, GGML_GEMMINI_ACTIVATION_BITS);
         args.sA = args.K;
         args.act_quant.storage().template emplace<Meta>();
         return quantize(&tensor, args);
     };
 
-    if (!run(1000000.0f)) {
-        std::fprintf(stderr, "FAIL: %s rejected a representable finite outlier\n", name);
+    if (!run(16.0f)) {
+        std::fprintf(stderr, "FAIL: %s rejected a signed-21 representable finite outlier\n", name);
         return false;
     }
     std::feclearexcept(FE_ALL_EXCEPT);
@@ -83,12 +83,13 @@ bool check_quantizer(const char *name, Quantize quantize)
         return false;
     }
     std::feclearexcept(FE_ALL_EXCEPT);
-    if (!run(-FLT_MAX)) {
-        std::fprintf(stderr, "FAIL: %s rejected a negative finite outlier representable after INT32 clamp\n", name);
-        return false;
-    }
+    const bool accepted_negative_overflow = run(-FLT_MAX);
     if (std::fetestexcept(FE_INVALID | FE_OVERFLOW) != 0) {
         std::fprintf(stderr, "FAIL: %s raised a floating exception while clamping to INT32_MIN\n", name);
+        return false;
+    }
+    if (accepted_negative_overflow) {
+        std::fprintf(stderr, "FAIL: %s accepted a negative finite outlier beyond the signed-21 RMD domain\n", name);
         return false;
     }
     return true;
@@ -113,7 +114,7 @@ bool check_quantizer_zeroes_nonfinite(const char *name, Quantize quantize)
         args.I = 1;
         args.J = 1;
         args.K = source.size();
-        args.A.allocate(args.I, args.K, 8);
+        args.A.allocate(args.I, args.K, GGML_GEMMINI_ACTIVATION_BITS);
         args.sA = args.K;
         args.act_quant.storage().template emplace<Meta>();
         if (!quantize(&tensor, args) || args.A.get(0, 8) != 0) {
@@ -142,7 +143,7 @@ static bool check_public_quantizer_zeroes_nonfinite()
         args.I = 1;
         args.J = 1;
         args.K = source.size();
-        args.A.allocate(args.I, args.K, 8);
+        args.A.allocate(args.I, args.K, GGML_GEMMINI_ACTIVATION_BITS);
         args.sA = args.K;
 
         if (!ggml::gemmini::quants::quantize_activation(&tensor, args)) {
@@ -173,7 +174,7 @@ static bool check_public_quantizer_rejects_too_wide_without_commit()
     args.I = 1;
     args.J = 1;
     args.K = source.size();
-        args.A.allocate(args.I, args.K, 8);
+        args.A.allocate(args.I, args.K, GGML_GEMMINI_ACTIVATION_BITS);
         args.sA = args.K;
 
     if (ggml::gemmini::quants::quantize_activation(&tensor, args)) {
@@ -217,9 +218,13 @@ static bool check_exact_packet_slice_reuses_handle()
 
 static bool check_radix_compose_allows_final_int64_cancellation()
 {
+    const auto contract =
+        ggml::gemmini::rmd::balanced_radix_contract(
+            GGML_GEMMINI_ACTIVATION_BITS);
     ggml::gemmini::rmd::RmdStripeBuilder builder;
     builder.reset(0, 0, 1, 32, 1);
-    if (!builder.add_residual(0, 0, 65793)) {
+    if (contract.radix == 0 ||
+        !builder.add_residual(0, 0, static_cast<int32_t>(contract.radix + 1))) {
         return false;
     }
     const auto packet = builder.finish();
@@ -236,15 +241,15 @@ static bool check_radix_compose_allows_final_int64_cancellation()
             static_cast<size_t>(position) * block.lane_stride_values;
         switch (block.lane_ids[position]) {
         case 0: output.values[offset] = std::numeric_limits<int64_t>::max(); break;
-        case 1: output.values[offset] = 1; break;
-        case 2: output.values[offset] = -1; break;
+        case 1: output.values[offset] = -1; break;
         default: break;
         }
     }
     ggml::gemmini::rmd::Correction correction =
         ggml::gemmini::rmd::BlockScaledInt64Correction{};
     const auto status = ggml::gemmini::rmd::compose_rmd_output(*packet, output, correction);
-    const int64_t expected = std::numeric_limits<int64_t>::max() - 65280;
+    const int64_t expected =
+        std::numeric_limits<int64_t>::max() - contract.radix;
     const auto * integer =
         std::get_if<ggml::gemmini::rmd::BlockScaledInt64Correction>(&correction);
     if (status != ggml::gemmini::rmd::RmdStatus::success || integer == nullptr ||
@@ -253,10 +258,10 @@ static bool check_radix_compose_allows_final_int64_cancellation()
         return false;
     }
     for (uint8_t position = 0; position < block.active_lane_count; ++position) {
-        if (block.lane_ids[position] == 2) {
+        if (block.lane_ids[position] == 1) {
             const size_t offset = block.output_value_offset +
                 static_cast<size_t>(position) * block.lane_stride_values;
-            output.values[offset] = 0;
+            output.values[offset] = 1;
         }
     }
     correction = ggml::gemmini::rmd::BlockScaledInt64Correction{{41, 42}};
