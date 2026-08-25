@@ -18,7 +18,6 @@ namespace {
 
 namespace wreader = quants::wreader;
 namespace wroute = quants::wroute;
-using WeightFormat = ggml_gemmini_args_t::im2p_weight_format_t;
 
 constexpr size_t kJTile = 16;
 constexpr __int128 kInt64Min = static_cast<__int128>(std::numeric_limits<int64_t>::min());
@@ -61,22 +60,6 @@ bool uses_reader_scale(const wroute::WeightRoutePlan & plan) {
     return plan.route == wroute::WeightRouteKind::H0 ||
         plan.route == wroute::WeightRouteKind::H1 ||
         plan.route == wroute::WeightRouteKind::HP1;
-}
-
-const int8_t * native_q8_codes(const ggml_gemmini_args_t & args,
-                               size_t j, size_t block_id) {
-    switch (args.weight_format) {
-        case WeightFormat::q8_h1: {
-            const block_q8_h1 * block = args.q8_h1_block(j, block_id);
-            return block == nullptr ? nullptr : block->qs;
-        }
-        case WeightFormat::q8_hp1: {
-            const block_q8_hp1 * block = args.q8_hp1_block(j, block_id);
-            return block == nullptr ? nullptr : block->qs;
-        }
-        default:
-            return nullptr;
-    }
 }
 
 bool finite_double(double value) {
@@ -127,6 +110,10 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
         !dense_route_is_addressable(plan, payload.logical_k, payload.logical_j)) {
         return rmd::RmdStatus::unsupported_route;
     }
+    const bool native_q8_route = plan.native_weight_blocks &&
+        plan.weight_bits == 8 &&
+        (plan.route == wroute::WeightRouteKind::H1 ||
+         plan.route == wroute::WeightRouteKind::HP1);
 
     size_t output_count = 0;
     if (!checked_size_product(payload.row_count, payload.logical_j, output_count))
@@ -180,17 +167,6 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
             std::array<int64_t, kJTile> block_sum{};
             for (size_t local_j = 0; local_j < tile_j; ++local_j) {
                 const size_t j = j_begin + local_j;
-                const int8_t * codes = native_q8_codes(args, j, block_id);
-                if (codes != nullptr) {
-                    for (size_t index = event_index; index < span_end; ++index) {
-                        const ResidualEvent & event = payload.events[index];
-                        block_sum[local_j] +=
-                            static_cast<int64_t>(event.residual) *
-                            codes[event.original_k % rmd::kBlockSize];
-                    }
-                    native_q8_values += span_end - event_index;
-                    continue;
-                }
                 for (size_t index = event_index; index < span_end; ++index) {
                     const ResidualEvent & event = payload.events[index];
                     const wreader::WeightCodeResult code = wreader::read_code_validated(
@@ -200,6 +176,7 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
                     // residuals, so its complete dot product fits in INT64.
                     block_sum[local_j] +=
                         static_cast<int64_t>(event.residual) * code.value;
+                    if (native_q8_route) ++native_q8_values;
                 }
             }
 

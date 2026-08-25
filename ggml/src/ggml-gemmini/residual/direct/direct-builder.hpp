@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <limits>
 #include <new>
+#include <stdexcept>
 #include <tuple>
 #include <utility>
 
@@ -31,6 +32,86 @@ inline rmd::RmdStatus validate_direct_payload(const DirectStripePayload &payload
             }
         }
     }
+    return rmd::RmdStatus::success;
+}
+
+inline rmd::RmdStatus expand_direct_payloads_to_plane(
+        const std::vector<DirectStripePayloadHandle> & payloads,
+        size_t global_row_begin,
+        size_t global_row_end,
+        size_t logical_k,
+        size_t logical_j,
+        size_t col_count,
+        std::vector<int32_t> & plane) {
+    if (global_row_begin >= global_row_end || logical_k == 0 || logical_j == 0 ||
+        col_count == 0 || col_count > logical_k) {
+        return rmd::RmdStatus::invalid_arguments;
+    }
+    const size_t row_count = global_row_end - global_row_begin;
+    if (row_count > std::numeric_limits<size_t>::max() / col_count) {
+        return rmd::RmdStatus::overflow;
+    }
+    const size_t value_count = row_count * col_count;
+
+    std::vector<DirectStripePayloadHandle> ordered;
+    std::vector<int32_t> staged;
+    std::vector<uint8_t> seen;
+    try {
+        ordered = payloads;
+        staged.assign(value_count, 0);
+        seen.assign(value_count, 0);
+    } catch (const std::bad_alloc &) {
+        return rmd::RmdStatus::allocation_failure;
+    } catch (const std::length_error &) {
+        return rmd::RmdStatus::allocation_failure;
+    }
+
+    for (size_t index = 0; index < ordered.size(); ++index) {
+        const DirectStripePayloadHandle & handle = ordered[index];
+        if (!handle ||
+            validate_direct_payload(*handle) != rmd::RmdStatus::success ||
+            handle->logical_k != logical_k ||
+            handle->logical_j != logical_j) {
+            return rmd::RmdStatus::invalid_packet;
+        }
+        for (size_t previous = 0; previous < index; ++previous) {
+            if (ordered[previous] && ordered[previous]->stripe_id == handle->stripe_id) {
+                return rmd::RmdStatus::invalid_packet;
+            }
+        }
+    }
+    std::sort(
+        ordered.begin(), ordered.end(),
+        [](const DirectStripePayloadHandle & lhs,
+           const DirectStripePayloadHandle & rhs) {
+            return std::tie(lhs->row_begin, lhs->stripe_id) <
+                std::tie(rhs->row_begin, rhs->stripe_id);
+        });
+    for (size_t index = 1; index < ordered.size(); ++index) {
+        const DirectStripePayload & previous = *ordered[index - 1];
+        const DirectStripePayload & current = *ordered[index];
+        if (previous.row_begin + previous.row_count > current.row_begin) {
+            return rmd::RmdStatus::invalid_packet;
+        }
+    }
+
+    for (const DirectStripePayloadHandle & handle : ordered) {
+        for (const ResidualEvent & event : handle->events) {
+            const size_t global_row = handle->row_begin + event.local_row;
+            if (global_row < global_row_begin || global_row >= global_row_end ||
+                event.original_k >= col_count) {
+                continue;
+            }
+            const size_t local_row = global_row - global_row_begin;
+            const size_t offset = local_row * col_count + event.original_k;
+            if (seen[offset] != 0) {
+                return rmd::RmdStatus::invalid_packet;
+            }
+            seen[offset] = 1;
+            staged[offset] = event.residual;
+        }
+    }
+    plane.swap(staged);
     return rmd::RmdStatus::success;
 }
 

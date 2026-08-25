@@ -745,14 +745,17 @@ apply_captured_rmd(const ggml_gemmini_args_t &runtime_args, float *output_data,
     if (status.ok()) {
       std::lock_guard lock(test_mutex);
       ++counters.dense_completions;
+#if GGML_GEMMINI_ENABLE_RMD
       if (injected_failure == TestFailure::residual_execute) {
         return {Error::execution_failure, "injected residual execute failure",
                 false};
       }
+#endif
     }
 #endif
     if (status.ok())
       status = execute_rmd_stripe(jobs[index]);
+#if GGML_GEMMINI_ENABLE_RMD
 #if defined(GGML_GEMMINI_TESTING)
     if (status.ok()) {
       std::lock_guard lock(test_mutex);
@@ -765,8 +768,10 @@ apply_captured_rmd(const ggml_gemmini_args_t &runtime_args, float *output_data,
 #endif
     if (status.ok())
       status = compose_rmd_stripe(jobs[index]);
+#endif
     if (!status.ok())
       return from_matmul_status(status);
+#if GGML_GEMMINI_ENABLE_RMD
 #if defined(GGML_GEMMINI_TESTING)
     {
       std::lock_guard lock(test_mutex);
@@ -779,7 +784,9 @@ apply_captured_rmd(const ggml_gemmini_args_t &runtime_args, float *output_data,
         ++counters.rmd_packets;
     }
 #endif
+#endif
   }
+#if GGML_GEMMINI_ENABLE_RMD
 #if defined(GGML_GEMMINI_TESTING)
   {
     std::lock_guard lock(test_mutex);
@@ -787,6 +794,7 @@ apply_captured_rmd(const ggml_gemmini_args_t &runtime_args, float *output_data,
       return {Error::execution_failure, "injected RMD failure", false};
     }
   }
+#endif
 #endif
   for (auto &job : jobs) {
     const MatmulStatus status = finalize_stripe(job);

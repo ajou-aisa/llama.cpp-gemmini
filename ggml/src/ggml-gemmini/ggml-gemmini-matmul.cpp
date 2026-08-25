@@ -1263,6 +1263,11 @@ MatMulResult MatMul::run_dense(bool transactional) {
     if (!valid_activation_metadata(args())) {
         return { MatMulStatus::invalid_contract, MatMulCapability::unsupported };
     }
+    if (!transactional &&
+        (!quants::activation_rmd_packets(args()).empty() ||
+         !quants::activation_direct_residuals(args()).empty())) {
+        return { MatMulStatus::invalid_contract, MatMulCapability::unsupported };
+    }
     if (!detail::route_capabilities(args()).full) {
         return { MatMulStatus::unsupported, MatMulCapability::unsupported };
     }
@@ -2167,7 +2172,9 @@ void MatmulStripeCollector::worker_loop() {
             }
 #endif
             if (status) status = execute_rmd_stripe(*job);
+#if GGML_GEMMINI_ENABLE_RMD
             if (status) status = compose_rmd_stripe(*job);
+#endif
             if (status) status = finalize_stripe(*job);
             if (status) {
                 const MatmulJobMetrics profile = job->metrics();
@@ -2299,9 +2306,11 @@ bool MatmulStripeCollector::on_ready(
         captured.row_begin = event.row_begin;
         captured.row_end = event.row_end;
         captured.activation_metadata = event.activation_metadata;
+#if GGML_GEMMINI_ENABLE_RMD
         // Shared handle only: the packet owns its buffers, so it outlives the ExSIA slot.
         captured.rmd_packet = event.rmd_packet;
         captured.direct_residual = event.direct_residual;
+#endif
         captured.la_cycles = event.local_end_cycle >= event.local_start_cycle ?
             event.local_end_cycle - event.local_start_cycle : 0;
         captured.la3_cycles = event.local_group3_end_cycle >= event.local_group3_start_cycle ?
@@ -2325,10 +2334,12 @@ bool MatmulStripeCollector::on_ready(
         captured.producer_wait = producer_wait;
         captured.producer_wait_start_ns = producer_wait_start_ns;
         captured.producer_wait_end_ns = producer_wait_end_ns;
+#if GGML_GEMMINI_ENABLE_RMD
         if (event.rmd_packet != nullptr || event.direct_residual != nullptr) {
             captured.rmd_pack.nanoseconds = event.rmd_pack_ns;
             captured.rmd_pack.count = 1;
         }
+#endif
         return captured;
     };
     try {
@@ -2619,6 +2630,10 @@ MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput in
 MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput input,
                                residual::DirectStripePayloadHandle direct_residual,
                                rmd::StripePacketHandle rmd_packet) {
+#if !GGML_GEMMINI_ENABLE_RMD
+    direct_residual.reset();
+    rmd_packet.reset();
+#endif
     const auto start = Clock::now();
     MatmulStatus status{};
     std::lock_guard<std::mutex> state_lock(*execution.state_mutex_);
@@ -3070,7 +3085,9 @@ MatmulStatus execute_post_fold_pipeline(
         MatmulStatus status = job.status();
         if (status) status = execute_dense_stripe(job);
         if (status) status = execute_rmd_stripe(job);
+#if GGML_GEMMINI_ENABLE_RMD
         if (status) status = compose_rmd_stripe(job);
+#endif
         if (status) status = finalize_stripe(job);
         if (!status) {
             return status;

@@ -96,6 +96,9 @@ ggml_gemmini_args_t lifecycle_args(std::vector<elem_t> &activation,
 }
 
 bool test_transactional_stripe_log_failures() {
+#if !GGML_GEMMINI_ENABLE_RMD
+  return true;
+#else
 #if defined(GGML_GEMMINI_ROUTING_BINARY)
   constexpr std::array<const char *, 12> selectors{{
       "full", "quantization", "provider", "progress", "poll", "fence",
@@ -130,6 +133,7 @@ bool test_transactional_stripe_log_failures() {
   return lifecycle_check(!error, "clean task-owned failure cycle logs");
 #else
   return lifecycle_check(false, "routing binary path is unavailable");
+#endif
 #endif
 }
 

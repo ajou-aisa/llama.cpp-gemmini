@@ -13,6 +13,7 @@
 #include <cstring>
 #include <limits>
 #include <new>
+#include <stdexcept>
 #include <utility>
 
 namespace ggml::gemmini::rmd {
@@ -156,27 +157,36 @@ RmdStatus apply_rmd_packet_ws(const ggml_gemmini_args_t & args, const StripePack
     return merge_rmd_correction(args, packet, correction);
 }
 
-void expand_packets_to_plane(const std::vector<StripePacketHandle> & packets,
-                             size_t row_count,
-                             size_t col_count,
-                             std::vector<int32_t> & plane) {
+RmdStatus expand_packets_to_plane(
+        const std::vector<StripePacketHandle> & packets,
+        size_t global_row_begin,
+        size_t global_row_end,
+        size_t col_count,
+        std::vector<int32_t> & plane) {
+    if (global_row_begin >= global_row_end || col_count == 0) {
+        return RmdStatus::invalid_arguments;
+    }
+    const size_t row_count = global_row_end - global_row_begin;
     size_t value_count = 0;
     if (!checked_mul_size(row_count, col_count, value_count)) {
-        return;
+        return RmdStatus::overflow;
     }
     std::vector<int32_t> staged;
     try {
         staged.assign(value_count, 0);
     } catch (const std::bad_alloc &) {
-        return;
+        return RmdStatus::allocation_failure;
+    } catch (const std::length_error &) {
+        return RmdStatus::allocation_failure;
     }
 
     for (const StripePacketHandle & handle : packets) {
         if (!handle) {
-            continue;
+            return RmdStatus::invalid_packet;
         }
-        if (validate_packet(*handle) != RmdStatus::success) {
-            return;
+        const RmdStatus validation = validate_packet(*handle);
+        if (validation != RmdStatus::success) {
+            return validation;
         }
         const StripePacket & packet = *handle;
         const BalancedRadixContract contract =
@@ -184,9 +194,6 @@ void expand_packets_to_plane(const std::vector<StripePacketHandle> & packets,
         for (const BlockDescriptor & block : packet.blocks) {
             for (size_t row = 0; row < packet.row_count; ++row) {
                 const size_t global_row = packet.row_begin + row;
-                if (global_row >= row_count) {
-                    continue;
-                }
                 for (size_t k = 0; k < block.compact_k_count; ++k) {
                     int64_t reconstructed = 0;
                     size_t lane_position = block.active_lane_count;
@@ -194,41 +201,64 @@ void expand_packets_to_plane(const std::vector<StripePacketHandle> & packets,
                         if (__builtin_mul_overflow(
                                 reconstructed, static_cast<int64_t>(contract.radix),
                                 &reconstructed)) {
-                            return;
+                            return RmdStatus::overflow;
                         }
                         if (lane_position != 0 &&
                             block.lane_ids[lane_position - 1] == lane) {
                             --lane_position;
                             int32_t digit = 0;
-                            if (read_packet_digit(packet, block,
-                                                  static_cast<uint8_t>(lane_position),
-                                                  row, k, digit) != RmdStatus::success ||
-                                __builtin_add_overflow(
+                            const RmdStatus read_status =
+                                read_packet_digit(
+                                    packet, block,
+                                    static_cast<uint8_t>(lane_position),
+                                    row, k, digit);
+                            if (read_status != RmdStatus::success) {
+                                return read_status;
+                            }
+                            if (__builtin_add_overflow(
                                     reconstructed, static_cast<int64_t>(digit),
                                     &reconstructed)) {
-                                return;
+                                return RmdStatus::overflow;
                             }
                         }
                     }
-                    const size_t column = static_cast<size_t>(block.global_k_begin) +
-                        packet.k_indices[block.k_index_offset + k];
-                    if (column >= col_count || lane_position != 0 ||
+                    size_t column = 0;
+                    if (!checked_add_size(
+                            static_cast<size_t>(block.global_k_begin),
+                            packet.k_indices[block.k_index_offset + k],
+                            column) ||
+                        lane_position != 0 ||
                         reconstructed < std::numeric_limits<int32_t>::min() ||
                         reconstructed > std::numeric_limits<int32_t>::max()) {
-                        return;
+                        return RmdStatus::invalid_packet;
                     }
+                    if (global_row < global_row_begin ||
+                        global_row >= global_row_end ||
+                        column >= col_count) {
+                        continue;
+                    }
+                    const size_t local_row = global_row - global_row_begin;
                     int32_t sum = 0;
                     if (__builtin_add_overflow(
-                            staged[global_row * col_count + column],
+                            staged[local_row * col_count + column],
                             static_cast<int32_t>(reconstructed), &sum)) {
-                        return;
+                        return RmdStatus::overflow;
                     }
-                    staged[global_row * col_count + column] = sum;
+                    staged[local_row * col_count + column] = sum;
                 }
             }
         }
     }
     plane.swap(staged);
+    return RmdStatus::success;
+}
+
+void expand_packets_to_plane(const std::vector<StripePacketHandle> & packets,
+                             size_t row_count,
+                             size_t col_count,
+                             std::vector<int32_t> & plane) {
+    (void) expand_packets_to_plane(
+        packets, 0, row_count, col_count, plane);
 }
 
 namespace {

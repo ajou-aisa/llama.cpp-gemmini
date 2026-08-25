@@ -113,9 +113,9 @@ struct ReaderFixture {
         q4_h0.qs[0] = 0x80;
         q4_h1.qs[0] = 0x80;
         q4_hp1.qs[0] = 0x80;
-        q4_h0.qs[15] = 0xf8;
-        q4_h1.qs[15] = 0xf8;
-        q4_hp1.qs[15] = 0xf8;
+        q4_h0.qs[15] = 0xf1;
+        q4_h1.qs[15] = 0xf1;
+        q4_hp1.qs[15] = 0xf1;
 
         q8_h0.qs[0] = std::numeric_limits<int8_t>::min();
         q8_h0.qs[16] = 0;
@@ -264,6 +264,14 @@ bool test_reader_happy_table() {
             ok = check(code.status == ReaderStatus::Success && code.value == expected[i],
                        "signed min/zero/max code decodes") && ok;
         }
+        if (test.bits == 4) {
+            const wreader::WeightCodeResult split_half_low =
+                wreader::read_code(fixture.args, plan, 0, 15);
+            ok = check(
+                split_half_low.status == ReaderStatus::Success &&
+                    split_half_low.value == -7,
+                "Q4 split-half low nibble decodes logical K=15") && ok;
+        }
 
         const wreader::WeightScaleResult scale =
             wreader::read_scale(fixture.args, plan, 0, 0);
@@ -411,6 +419,7 @@ bool test_legacy_round_trips() {
 }
 
 bool test_q4_hp1_loader_contract() {
+#if GGML_GEMMINI_ACTIVATION_BITS == 4 && GGML_GEMMINI_WEIGHT_BITS == 4
     ggml_init_params params = {
         /* .mem_size   = */ ggml_tensor_overhead() * 4,
         /* .mem_buffer = */ nullptr,
@@ -435,6 +444,9 @@ bool test_q4_hp1_loader_contract() {
     ggml_free(ctx);
 
     return check(supported, "production GEMMINI rejects Q4_HP1 loader metadata");
+#else
+    return true;
+#endif
 }
 
 enum class Selection {

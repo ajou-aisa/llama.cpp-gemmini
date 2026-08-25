@@ -895,6 +895,33 @@ IntegratedLifecycleResult run_integrated_exsia_lifecycle(
   return result;
 }
 
+#if !GGML_GEMMINI_ENABLE_RMD
+bool run_rmd_disabled_adapter_dense_only() {
+  const size_t rows = GGML_GEMMINI_TEST_IM2P_DIM + 1;
+  const auto full = run_integrated_exsia_lifecycle(
+      rows, 1, LifecycleFamily::hp1, LifecycleBackend::cpu_direct,
+      PublicMode::full);
+  const auto pipeline = run_integrated_exsia_lifecycle(
+      rows, 1, LifecycleFamily::hp1, LifecycleBackend::cpu_direct,
+      PublicMode::stripe_pipeline);
+  const auto no_residual_work = [](const IntegratedLifecycleResult &result) {
+    return result.counters.residual_executions == 0 &&
+        result.counters.compositions == 0 &&
+        result.counters.rmd_calls == 0 &&
+        result.counters.rmd_events == 0 &&
+        result.counters.rmd_packets == 0;
+  };
+  return check(full.ok && pipeline.ok,
+               "RMD-disabled FULL/PIPELINE adapter executions succeed") &&
+      check(full.output == pipeline.output,
+            "RMD-disabled FULL/PIPELINE outputs remain dense-only and equal") &&
+      check(no_residual_work(full) && no_residual_work(pipeline),
+            "RMD-disabled adapters report zero residual work") &&
+      check(full.counters.commit == 1 && pipeline.counters.commit == 1,
+            "RMD-disabled adapters commit dense output exactly once");
+}
+#endif
+
 bool run_simple_runtime_args_observer_contract() {
   const std::string semantic_layer =
       "blk.15.mlp.down_proj.simple-runtime-copy-beyond-sso";
@@ -2430,8 +2457,7 @@ int main(int argc, char **argv) {
   ok = run_exsia_prestart_rejection(false) && ok;
 #endif
 #else
-  // Matched A4/Q4 and A16/Q16 are capability-selected here; their residual
-  // arithmetic is exercised by the width-independent direct/compact oracle.
+  ok = run_rmd_disabled_adapter_dense_only() && ok;
 #endif
   unsetenv("GEMMINI_MATMUL_MODE");
   unsetenv("GEMMINI_RMD_BACKEND");

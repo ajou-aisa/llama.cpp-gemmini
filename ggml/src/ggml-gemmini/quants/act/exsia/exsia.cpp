@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #if EXSIA_PROFILE_LOG_ENABLED
 #include <fstream>
 #include <mutex>
@@ -1573,6 +1574,7 @@ namespace ggml::gemmini::quants::act::exsia
             return fail(ExSIAState::FailureCode::ProfileFlushFailure);
         )
 
+        meta.rho = config::GGML_GEMMINI_ACTIVATION_RHO;
         meta.sigma = GGML_GEMMINI_EXSIA_SIGMA;
         for (StripePipelineSlot &slot : pipeline_slots_)
             slot.reset_for_run();
@@ -2631,17 +2633,6 @@ namespace ggml::gemmini::quants::act::exsia
             }
             const Meta &meta = *meta_ptr;
 
-            ggml::gemmini::GemminiGeometry geometry;
-            if (!args.activation_quant_geometry_matches(geometry))
-            {
-                return false;
-            }
-            const size_t rows_per_stripe = geometry.stripe_rows;
-            if (meta.theta.size() != geometry.stripe_count)
-            {
-                return false;
-            }
-
             if (args.sA != 0 && args.sA != args.K)
             {
                 return false;
@@ -2655,14 +2646,82 @@ namespace ggml::gemmini::quants::act::exsia
             {
                 return false;
             }
+            if (args.activation_row_offset > max_size - row_count)
+            {
+                return false;
+            }
+            const size_t global_row_begin = args.activation_row_offset;
+            const size_t global_row_end = global_row_begin + row_count;
+
+            size_t rows_per_stripe = args.activation_rows_per_stripe;
+            if (rows_per_stripe == 0)
+            {
+                const auto geometry = args.activation_quant_geometry();
+                if (!geometry.ok())
+                {
+                    return false;
+                }
+                rows_per_stripe = geometry.geometry.stripe_rows;
+            }
+            if (rows_per_stripe == 0 || meta.theta.empty())
+            {
+                return false;
+            }
 
             std::vector<int32_t> residuals;
-            rmd::expand_packets_to_plane(meta.rmd_packets, row_count, col_count, residuals);
+            rmd::RmdStatus residual_status = rmd::RmdStatus::success;
+            if (args.residual_route == residual::ResidualRoute::cpu_direct)
+            {
+                if (!meta.rmd_packets.empty())
+                {
+                    return false;
+                }
+                residual_status = residual::expand_direct_payloads_to_plane(
+                    meta.direct_residuals,
+                    global_row_begin,
+                    global_row_end,
+                    args.K,
+                    args.J,
+                    col_count,
+                    residuals);
+            }
+            else
+            {
+                if (!meta.direct_residuals.empty())
+                {
+                    return false;
+                }
+                residual_status = rmd::expand_packets_to_plane(
+                    meta.rmd_packets,
+                    global_row_begin,
+                    global_row_end,
+                    col_count,
+                    residuals);
+            }
+            if (residual_status != rmd::RmdStatus::success ||
+                residuals.size() != row_count * col_count)
+            {
+                return false;
+            }
 
+            std::vector<float> staged;
+            try
+            {
+                staged.resize(row_count * col_count);
+            }
+            catch (const std::bad_alloc &)
+            {
+                return false;
+            }
+            catch (const std::length_error &)
+            {
+                return false;
+            }
             const int16_t invalid_theta = std::numeric_limits<int16_t>::min();
             for (size_t row = 0; row < row_count; ++row)
             {
-                const size_t stripe_idx = row / rows_per_stripe;
+                const size_t global_row = global_row_begin + row;
+                const size_t stripe_idx = global_row / rows_per_stripe;
                 const int16_t theta = meta.resolve_stripe_theta(static_cast<int>(stripe_idx));
                 if (theta == invalid_theta)
                 {
@@ -2684,21 +2743,47 @@ namespace ggml::gemmini::quants::act::exsia
                         return false;
                     }
 
-                    const size_t dst_row_offset = row * dst_row_stride;
-                    const size_t dst_col_offset = col * dst_col_stride;
-                    if (dst_row_offset > max_size - dst_col_offset)
+                    int32_t q_int = 0;
+                    if (__builtin_add_overflow(
+                            args.A.get(row, col),
+                            residuals[row * col_count + col],
+                            &q_int))
                     {
                         return false;
                     }
-
-                    const int32_t q_int =
-                        args.A.get(row, col) +
-                        residuals[row * col_count + col];
-                    dst[dst_row_offset + dst_col_offset] =
+                    const float value =
                         std::ldexp(static_cast<float>(q_int), theta);
+                    if (!std::isfinite(value))
+                    {
+                        return false;
+                    }
+                    staged[row * col_count + col] = value;
                 }
             }
 
+            if ((row_count > 1 &&
+                 dst_row_stride > max_size / (row_count - 1)) ||
+                (col_count > 1 &&
+                 dst_col_stride > max_size / (col_count - 1)))
+            {
+                return false;
+            }
+            const size_t last_row_offset =
+                (row_count - 1) * dst_row_stride;
+            const size_t last_col_offset =
+                (col_count - 1) * dst_col_stride;
+            if (last_row_offset > max_size - last_col_offset)
+            {
+                return false;
+            }
+            for (size_t row = 0; row < row_count; ++row)
+            {
+                for (size_t col = 0; col < col_count; ++col)
+                {
+                    dst[row * dst_row_stride + col * dst_col_stride] =
+                        staged[row * col_count + col];
+                }
+            }
             return true;
         };
 
