@@ -166,6 +166,10 @@ if (LLAMA_BUILD_TOOLS)
             -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/gemmini-cycle-cli
             -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-cycle-cli.cmake)
 endif()
+add_test(NAME test-build-arm64-log-defaults
+    COMMAND ${CMAKE_COMMAND}
+        -DTEST_SCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/../build-arm64.sh
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-build-arm64-log-defaults.cmake)
 
 # llama_build_and_test(test-opt.cpp) # SLOW
 llama_build_and_test(test-gguf.cpp)

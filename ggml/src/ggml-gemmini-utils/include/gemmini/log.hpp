@@ -39,10 +39,10 @@
 #include <string_view>
 
 #ifndef LOG_DEBUG
-#define LOG_DEBUG 1
+#define LOG_DEBUG 0
 #endif
 #ifndef LOG_CYCLE
-#define LOG_CYCLE 1
+#define LOG_CYCLE 0
 #endif
 #ifndef CYCLE_DETAIL
 #define CYCLE_DETAIL 0
