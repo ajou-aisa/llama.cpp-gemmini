@@ -279,7 +279,7 @@ bool test_rmd_cpu_ws_routes() {
     const rmd::CompressedOutput unchanged = output;
     rmd::StripePacket malformed = *packet;
     const rmd::BlockDescriptor & first = malformed.blocks.front();
-    malformed.stacked_activation[first.activation_offset + first.compact_k_count] = 1;
+    malformed.stacked_activation.signed_int8[first.activation_offset + first.compact_k_count] = 1;
     if (!check(rmd::execute_rmd_stripe_ws(args, malformed, output) ==
                    rmd::RmdStatus::invalid_packet &&
                output.j_padded == unchanged.j_padded && output.values == unchanged.values,
@@ -898,10 +898,10 @@ bool test_rmd_cpu_direct_parity() {
     residuals[0 * logical_k + 32] = 65536;
     residuals[0 * logical_k + 64] = 256;
     residuals[1 * logical_k + 15] = -256;
-    residuals[1 * logical_k + 47] = 16777216;
+    residuals[1 * logical_k + 47] = rmd::kSigned21Max;
     residuals[1 * logical_k + 63] = 129;
     residuals[16 * logical_k + 1] = -65536;
-    residuals[16 * logical_k + 33] = 16777217;
+    residuals[16 * logical_k + 33] = rmd::kSigned21Min;
 
     std::vector<int8_t> baseline_activation(rows * logical_k);
     for (size_t row = 0; row < rows; ++row) {

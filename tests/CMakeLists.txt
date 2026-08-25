@@ -434,6 +434,25 @@ add_test(NAME test-gemmini-rmd-compact-happy
     COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=compact-happy)
 add_test(NAME test-gemmini-rmd-compact-failure
     COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=compact-failure)
+add_test(NAME test-gemmini-rmd-radix-happy
+    COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=radix-happy)
+add_test(NAME test-gemmini-rmd-radix-failure
+    COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=radix-failure)
+
+add_executable(test-gemmini-rmd-packet
+    test-gemmini-rmd-packet.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp)
+target_link_libraries(test-gemmini-rmd-packet PRIVATE
+    ggml-base ggml-gemmini ggml-gemmini-utils)
+target_compile_features(test-gemmini-rmd-packet PRIVATE cxx_std_17)
+target_include_directories(test-gemmini-rmd-packet PRIVATE
+    ../ggml/src
+    ../ggml/src/ggml-gemmini
+    ../ggml/src/ggml-gemmini/residual/rmd
+    ${GEMMINI_SW_PATH}
+    ${GEMMINI_SW_PATH}/include)
+add_test(NAME test-gemmini-rmd-packet
+    COMMAND $<TARGET_FILE:test-gemmini-rmd-packet>)
 
 add_executable(test-gemmini-rmd-telemetry
     test-gemmini-rmd-telemetry.cpp)
@@ -696,6 +715,7 @@ set(_GEMMINI_REGISTERED_TEST_EXECUTABLES
     test-gemmini-exsia
     test-gemmini-exsia-writer
     test-gemmini-rmd
+    test-gemmini-rmd-packet
     test-gemmini-rmd-telemetry
     test-gemmini-matmul-options
     gemmini-quant-dispatch-smoke)

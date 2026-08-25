@@ -167,16 +167,18 @@ typedef sycl::half2 ggml_half2;
 #endif // _MSC_VER
 
 #define QK4_0 32
+// GGUF Q4 byte i stores q[i] + 8 in its low nibble and
+// q[i + QK4_0/2] + 8 in its high nibble. Native RTL-port packing is separate.
 typedef struct {
     ggml_half d;           // delta
-    uint8_t qs[QK4_0 / 2]; // nibbles / quants
+    uint8_t qs[QK4_0 / 2]; // offset-binary low-half/high-half nibbles
 } block_q4_0;
 static_assert(sizeof(block_q4_0) == sizeof(ggml_half) + QK4_0 / 2, "wrong q4_0 block size/padding");
 typedef block_q4_0 block_q4_h0;
 
-// Direct-reader Q4_H1 block: (q[i] - 8) * s_rf * (c_b + R).
+// Direct-reader Q4_H1 block: decoded_q[i] * s_rf * (c_b + R).
 typedef struct {
-    uint8_t  qs[QK4_0 / 2];
+    uint8_t  qs[QK4_0 / 2]; // same low-half/high-half mapping as block_q4_0
     uint8_t  c_b;
     uint8_t  padding[3];
     float    s_rf;
@@ -191,7 +193,7 @@ static_assert(sizeof(block_q4_h1) == 28, "wrong q4_h1 block size/padding");
 
 #define QK4_HP QK4_0
 typedef struct {
-    uint8_t  qs[QK4_HP / 2];
+    uint8_t  qs[QK4_HP / 2]; // same low-half/high-half mapping as block_q4_0
     int16_t  m;
     uint8_t  padding[2];
     float    channel_scale;
