@@ -10,6 +10,8 @@
 #include <memory>
 #include <new>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -146,10 +148,6 @@ struct QuantizedActivationBuffer {
 
 } // namespace ggml::gemmini::quants::act
 
-namespace ggml::gemmini::types {
-enum class LayerType : uint8_t;
-}
-
 namespace ggml::gemmini::quants::act::exsia {
 struct StripeReadySink;
 }
@@ -165,6 +163,10 @@ struct StripeReadySink;
 #undef GGML_GEMMINI_ARGS_DEFINE_GGML_COMMON
 #endif
 #include <gemmini_params.h>
+#if defined(GGML_GEMMINI_CONFIGURED_DIM)
+static_assert(DIM == GGML_GEMMINI_CONFIGURED_DIM,
+              "Gemmini parameter header DIM does not match configured DIM");
+#endif
 
 static_assert(sizeof(elem_t) == GGML_GEMMINI_ACTIVATION_STORAGE_BYTES,
               "elem_t must match configured activation transport storage");
@@ -364,7 +366,7 @@ typedef struct ggml_gemmini_args_t {
     size_t stride_f_out = 0;
 
     // layer/model metadata
-    ggml::gemmini::types::LayerType layer_type{};
+    uint8_t reserved_layer_metadata = 0;
     const char *model_arch = nullptr;
 
     // Gemmini auto-tiling counts in DIM units (multiply by DIM to get element counts).
@@ -422,6 +424,8 @@ typedef struct ggml_gemmini_args_t {
     size_t gemmini_call_k_logical = 0;
     size_t gemmini_call_k_aligned = 0;
     size_t gemmini_call_tile_k_elems = 0;
+
+    std::string matmul_layer;
 
     inline const uint8_t *q8_channel_row(size_t row) const {
         if (q8_channel_row_base == nullptr || q8_channel_row_stride == 0 ||
@@ -737,5 +741,38 @@ namespace ggml::gemmini {
 using test_i_observer_t = void (*)(const char * consumer, size_t I, void * user_data);
 
 GGML_API void set_test_i_observer(test_i_observer_t observer, void * user_data);
+}
+#endif
+
+#if defined(GGML_GEMMINI_TESTING) || defined(GGML_GEMMINI_TEST_OBSERVER)
+namespace ggml::gemmini {
+enum class TestSemanticLayerSite : uint8_t {
+    fp_facade,
+    physical_auto_fp,
+    physical_set_tile_ws,
+    physical_im2p_impl,
+    physical_auto_im2p,
+    physical_baseline_dense,
+};
+using test_semantic_layer_observer_t = bool (*)(
+    TestSemanticLayerSite site, const char * layer, void * user_data);
+
+GGML_API void set_test_semantic_layer_observer(
+    test_semantic_layer_observer_t observer, void * user_data);
+GGML_API bool test_observe_semantic_layer(
+    TestSemanticLayerSite site, const char * layer);
+GGML_API bool test_probe_physical_layer_sites(const ggml_gemmini_args_t & args);
+GGML_API bool test_probe_physical_null_args();
+GGML_API bool test_probe_fp_facade_layer(const std::string & layer);
+}
+#endif
+
+#if defined(GGML_GEMMINI_TESTING)
+namespace ggml::gemmini {
+GGML_API std::string test_resolve_backend_matmul_layer(
+    std::string_view model_arch, std::string_view weight_name,
+    std::string_view input_name, std::string_view consumer_name);
+GGML_API void test_reset_unclassified_matmul_diagnostics();
+GGML_API size_t test_unclassified_matmul_diagnostic_count();
 }
 #endif

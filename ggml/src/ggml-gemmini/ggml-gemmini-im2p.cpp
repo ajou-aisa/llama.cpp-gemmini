@@ -92,7 +92,23 @@ std::condition_variable test_changed;
 TestCounters counters;
 TestFailure injected_failure = TestFailure::none;
 bool production_failed = false;
+TestRuntimeArgsObserver runtime_args_observer = nullptr;
+void *runtime_args_observer_data = nullptr;
 ::im2p::gemmini::Run *active_blocked_run = nullptr;
+
+void observe_runtime_args(TestRuntimeArgsSite site,
+                          const ggml_gemmini_args_t &args) noexcept {
+  TestRuntimeArgsObserver observer = nullptr;
+  void *user_data = nullptr;
+  {
+    std::lock_guard lock(test_mutex);
+    observer = runtime_args_observer;
+    user_data = runtime_args_observer_data;
+  }
+  if (observer != nullptr) {
+    observer(site, args.matmul_layer.c_str(), user_data);
+  }
+}
 #endif
 
 } // namespace
@@ -200,6 +216,64 @@ Completion translate(const ::im2p::gemmini::FenceResult &result,
             stats};
   }
   return {translated, stats};
+}
+
+static Result validate_stripe_timings(
+    const ::im2p::gemmini::StripeRtlTimingView &timings,
+    const ggml_gemmini_args_t &args, const Stats &stats,
+    std::uint64_t expected_run_id) noexcept {
+  if (args.activation_rows_per_stripe == 0) {
+    return {Error::invalid_contract,
+            "PIPELINE stripe timing geometry has zero rows per stripe", false};
+  }
+  const std::uint64_t expected_count =
+      1 + (static_cast<std::uint64_t>(args.I) - 1) /
+              static_cast<std::uint64_t>(args.activation_rows_per_stripe);
+  if (timings.data == nullptr || timings.size != expected_count ||
+      stats.rtl_stripes_published != expected_count ||
+      stats.rtl_stripe_rows_published != args.I) {
+    return {Error::invalid_contract,
+            "PIPELINE stripe timing count does not match publication statistics",
+            false};
+  }
+  std::size_t expected_row_begin = 0;
+  for (std::size_t index = 0; index < timings.size; ++index) {
+    const auto &timing = timings[index];
+    const std::size_t expected_row_end =
+        std::min(args.I, expected_row_begin + args.activation_rows_per_stripe);
+    if (timing.run_id != expected_run_id || timing.stripe_id != index ||
+        timing.slot != index % 2 || timing.row_begin != expected_row_begin ||
+        timing.row_end != expected_row_end ||
+        timing.publish_to_completion_cycles !=
+            timing.completion_cycle - timing.publish_cycle) {
+      return {Error::invalid_contract,
+              "PIPELINE stripe timing metadata is malformed or out of order",
+              false};
+    }
+    expected_row_begin = expected_row_end;
+  }
+  if (expected_row_begin != args.I) {
+    return {Error::invalid_contract,
+            "PIPELINE stripe timings do not partition the output rows", false};
+  }
+  return {};
+}
+
+static void emit_stripe_timings(
+    const ::im2p::gemmini::StripeRtlTimingView &timings,
+    const ggml_gemmini_args_t &args) noexcept {
+  for (const auto &timing : timings) {
+    Im2pStripeTelemetry record{};
+    record.layer = args.matmul_layer;
+    record.run_id = timing.run_id;
+    record.stripe_id = timing.stripe_id;
+    record.slot = timing.slot;
+    record.row_begin = timing.row_begin;
+    record.row_end = timing.row_end;
+    record.publish_cycle = timing.publish_cycle;
+    record.completion_cycle = timing.completion_cycle;
+    emit_cycle_telemetry(record);
+  }
 }
 
 Result gate_route(const ExsiaRouteRequest &request) noexcept {
@@ -324,6 +398,10 @@ Completion run_full(const ggml_gemmini_args_t &args) noexcept {
             {}};
   }
   runtime_args.f_out = staged_output.data();
+#if defined(GGML_GEMMINI_TESTING)
+  observe_runtime_args(TestRuntimeArgsSite::simple_full_before_execute,
+                       runtime_args);
+#endif
 
   auto started =
       ::im2p::gemmini::execute(&runtime_args, ::im2p::gemmini::Mode::full,
@@ -396,6 +474,10 @@ Completion run_stripe_pipeline(const ggml_gemmini_args_t &args) noexcept {
     runtime_args.A = {};
   }
 #endif
+#if defined(GGML_GEMMINI_TESTING)
+  observe_runtime_args(TestRuntimeArgsSite::simple_pipeline_before_execute,
+                       runtime_args);
+#endif
   auto started = ::im2p::gemmini::execute(
       &runtime_args, ::im2p::gemmini::Mode::stripe_pipeline,
       ::im2p::gemmini::Options{65536});
@@ -413,11 +495,12 @@ Completion run_stripe_pipeline(const ggml_gemmini_args_t &args) noexcept {
 #endif
     return {{Error::invalid_state, "IM2P execute returned no run", false}, {}};
   }
+  const uint64_t run_id = quants::act::exsia::next_exsia_run_id();
   size_t stripe_id = 0;
   for (size_t row_begin = 0; row_begin < runtime_args.I;
        row_begin += runtime_args.activation_rows_per_stripe, ++stripe_id) {
     quants::act::exsia::StripeReadyEvent event{};
-    event.run_id = 1;
+    event.run_id = run_id;
     event.stripe_id = stripe_id;
     event.slot = stripe_id % 2;
     event.row_begin = row_begin;
@@ -472,6 +555,15 @@ Completion run_stripe_pipeline(const ggml_gemmini_args_t &args) noexcept {
 #endif
     return completion;
   }
+  const Result timing_status = validate_stripe_timings(
+      fenced.stripe_rtl_timings, runtime_args, completion.stats, run_id);
+  if (!timing_status.ok()) {
+#if defined(GGML_GEMMINI_TESTING)
+    std::lock_guard lock(test_mutex);
+    production_failed = true;
+#endif
+    return {timing_status, completion.stats};
+  }
   const auto committed =
       ::im2p::gemmini::authorize_output_commit(*started.run, true);
   if (!committed.ok()) {
@@ -481,6 +573,8 @@ Completion run_stripe_pipeline(const ggml_gemmini_args_t &args) noexcept {
 #endif
     return {translate(committed), completion.stats};
   }
+  completion.run_id = run_id;
+  emit_stripe_timings(fenced.stripe_rtl_timings, args);
   return completion;
 }
 
@@ -488,6 +582,23 @@ struct CapturedExsiaStripe {
   quants::act::exsia::StripeReadyEvent event;
   std::int16_t theta = 0;
 };
+
+static void emit_quantization_timings(
+    const std::vector<CapturedExsiaStripe> &stripes,
+    const ggml_gemmini_args_t &args) noexcept {
+  for (const auto &stripe : stripes) {
+    QuantizationStripeTelemetry record{};
+    record.layer = args.matmul_layer;
+    record.run_id = stripe.event.run_id;
+    record.stripe_id = stripe.event.stripe_id;
+    record.slot = stripe.event.slot;
+    record.row_begin = stripe.event.row_begin;
+    record.row_end = stripe.event.row_end;
+    record.start = stripe.event.quantization_start;
+    record.end = stripe.event.quantization_end;
+    emit_cycle_telemetry(record);
+  }
+}
 
 static bool has_immediate_theta_prefix(
     const quants::act::exsia::Meta &metadata,
@@ -729,6 +840,17 @@ public:
     if (!sink_result.ok() || !run) {
       return false;
     }
+#if defined(GGML_GEMMINI_TESTING)
+    {
+      std::lock_guard lock(test_mutex);
+      if (injected_failure == TestFailure::incomplete_publication &&
+          event.row_end == runtime_args.I) {
+        sink_result = {Error::execution_failure,
+                       "injected incomplete stripe publication", false};
+        return false;
+      }
+    }
+#endif
     const auto *metadata =
         std::get_if<quants::act::exsia::Meta>(&args.act_quant.storage());
     const std::int16_t theta =
@@ -1064,6 +1186,8 @@ Completion ExsiaFullExecution::finish(bool quantization_succeeded) noexcept {
   impl_->runtime_args.f_out = impl_->staged_output.data();
   impl_->runtime_args.exsia_stripe_ready_sink = nullptr;
 #if defined(GGML_GEMMINI_TESTING)
+  observe_runtime_args(TestRuntimeArgsSite::exsia_full_before_execute,
+                       impl_->runtime_args);
   TestFailure failure;
   {
     std::lock_guard lock(test_mutex);
@@ -1181,6 +1305,10 @@ start_exsia_stripe_pipeline(ggml_gemmini_args_t &args) noexcept {
 
   impl->runtime_args.f_out = impl->staged_output.data();
   impl->runtime_args.exsia_stripe_ready_sink = nullptr;
+#if defined(GGML_GEMMINI_TESTING)
+  observe_runtime_args(TestRuntimeArgsSite::exsia_pipeline_before_execute,
+                       impl->runtime_args);
+#endif
   auto started = ::im2p::gemmini::execute(
       &impl->runtime_args, ::im2p::gemmini::Mode::stripe_pipeline,
       ::im2p::gemmini::Options{65536});
@@ -1208,6 +1336,8 @@ start_exsia_stripe_pipeline(ggml_gemmini_args_t &args) noexcept {
     ::im2p::gemmini::RunTestAccess::inject_poll_failure(*impl->run);
     std::lock_guard lock(test_mutex);
     ++counters.poll_failures;
+  } else if (failure == TestFailure::malformed_completion) {
+    ::im2p::gemmini::RunTestAccess::invalidate_timing_capacity(*impl->run);
   }
   impl->register_run();
 #endif
@@ -1288,6 +1418,33 @@ Completion ExsiaStripePipeline::finish(bool quantization_succeeded) noexcept {
     return completion;
   }
 
+  if (impl_->published.empty()) {
+    (void)impl_->authorize(false);
+    return {{Error::invalid_contract,
+             "successful ExSIA pipeline has no published stripe", false},
+            completion.stats};
+  }
+  const std::uint64_t run_id = impl_->published.front().event.run_id;
+  const Result timing_status = validate_stripe_timings(
+      fenced.stripe_rtl_timings, impl_->runtime_args, completion.stats, run_id);
+  if (!timing_status.ok() ||
+      impl_->published.size() != fenced.stripe_rtl_timings.size) {
+    (void)impl_->authorize(false);
+    return {timing_status.ok()
+                ? Result{Error::invalid_contract,
+                         "ExSIA publications do not match stripe timings", false}
+                : timing_status,
+            completion.stats};
+  }
+
+#if defined(GGML_GEMMINI_TESTING)
+  if (failure == TestFailure::provider) {
+    (void)impl_->authorize(false);
+    return {{Error::execution_failure,
+             "injected pipeline output provider failure", false},
+            completion.stats};
+  }
+#endif
   const auto output_stage =
       ::im2p::gemmini::acquire_pipeline_output_stage(*impl_->run);
   if (!output_stage.status.ok() || output_stage.data == nullptr) {
@@ -1307,7 +1464,20 @@ Completion ExsiaStripePipeline::finish(bool quantization_succeeded) noexcept {
   if (!authorized.ok()) {
     return {authorized, completion.stats};
   }
+#if defined(GGML_GEMMINI_TESTING)
+  {
+    std::lock_guard lock(test_mutex);
+    if (failure == TestFailure::output_copy) {
+      return {{Error::execution_failure,
+               "injected staged-output copy failure", false},
+              completion.stats};
+    }
+  }
+#endif
   impl_->copy_staged_output();
+  completion.run_id = run_id;
+  emit_quantization_timings(impl_->published, impl_->args);
+  emit_stripe_timings(fenced.stripe_rtl_timings, impl_->args);
   return completion;
 }
 
@@ -1318,6 +1488,13 @@ void test_reset() noexcept {
   counters = {};
   injected_failure = TestFailure::none;
   production_failed = false;
+}
+
+void test_set_runtime_args_observer(TestRuntimeArgsObserver observer,
+                                    void *user_data) noexcept {
+  std::lock_guard lock(test_mutex);
+  runtime_args_observer = observer;
+  runtime_args_observer_data = user_data;
 }
 
 void test_inject_failure(TestFailure failure) noexcept {
@@ -1417,9 +1594,12 @@ void log_failure(const char *operation, const Result &result) noexcept {
 }
 
 void log_stats(const char * mode, const Stats & stats,
+               std::uint64_t run_id,
                const ggml_gemmini_args_t & args) noexcept {
-#if LOG_CYCLE
+#if LOG_CYCLE || LOG_DEBUG
   Im2pExecutionTelemetry record{};
+  record.layer = args.matmul_layer;
+  record.run_id = run_id;
   record.mode = mode ? mode : "unknown";
   record.activation_bits = GGML_GEMMINI_ACTIVATION_BITS;
   record.weight_bits = GGML_GEMMINI_WEIGHT_BITS;
@@ -1444,7 +1624,7 @@ void log_stats(const char * mode, const Stats & stats,
   record.rtl_stripe_rows_published = stats.rtl_stripe_rows_published;
   emit_cycle_telemetry(record);
 #else
-  (void) mode; (void) stats; (void) args;
+  (void) mode; (void) stats; (void) run_id; (void) args;
 #endif
 }
 

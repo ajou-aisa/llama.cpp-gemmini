@@ -6,7 +6,7 @@
 namespace ggml::gemmini {
 
 inline constexpr const char * kCycleTelemetrySchema = "gemmini.cycle";
-inline constexpr std::uint32_t kCycleTelemetryVersion = 1;
+inline constexpr std::uint32_t kCycleTelemetryVersion = 2;
 #ifdef __riscv
 inline constexpr const char * kNativeCycleSource = "riscv_cycle";
 inline constexpr const char * kNativeCycleUnit = "cycle";
@@ -19,7 +19,7 @@ struct CycleIntervalTelemetry {
     std::string source = kNativeCycleSource;
     std::string unit = kNativeCycleUnit;
     std::string layer;
-    std::string name;
+    std::string op;
     std::uint64_t start = 0;
     std::uint64_t end = 0;
 };
@@ -43,6 +43,8 @@ struct WsLoopTelemetry {
 };
 
 struct Im2pExecutionTelemetry {
+    std::string layer;
+    std::uint64_t run_id = 0;
     std::string mode;
     std::uint8_t activation_bits = 0;
     std::uint8_t weight_bits = 0;
@@ -76,6 +78,28 @@ struct Im2pExecutionTelemetry {
 
 struct RmdTelemetryRecord;
 
+struct Im2pStripeTelemetry {
+    std::string layer;
+    std::uint64_t run_id = 0;
+    std::uint64_t stripe_id = 0;
+    std::uint64_t slot = 0;
+    std::uint64_t row_begin = 0;
+    std::uint64_t row_end = 0;
+    std::uint64_t publish_cycle = 0;
+    std::uint64_t completion_cycle = 0;
+};
+
+struct QuantizationStripeTelemetry {
+    std::string layer;
+    std::uint64_t run_id = 0;
+    std::uint64_t stripe_id = 0;
+    std::uint64_t slot = 0;
+    std::uint64_t row_begin = 0;
+    std::uint64_t row_end = 0;
+    std::uint64_t start = 0;
+    std::uint64_t end = 0;
+};
+
 struct PipelineStripeTelemetry {
     std::string layer;
     std::uint64_t run_id = 0;
@@ -98,12 +122,16 @@ struct PipelineStripeTelemetry {
 std::string serialize_cycle_telemetry(const CycleIntervalTelemetry & record);
 std::string serialize_cycle_telemetry(const WsLoopTelemetry & record);
 std::string serialize_cycle_telemetry(const Im2pExecutionTelemetry & record);
+std::string serialize_cycle_telemetry(const Im2pStripeTelemetry & record);
+std::string serialize_cycle_telemetry(const QuantizationStripeTelemetry & record);
 std::string serialize_cycle_telemetry(const PipelineStripeTelemetry & record);
 std::string serialize_cycle_telemetry(const RmdTelemetryRecord & record);
 
 void emit_cycle_telemetry(const CycleIntervalTelemetry & record);
 void emit_cycle_telemetry(const WsLoopTelemetry & record);
 void emit_cycle_telemetry(const Im2pExecutionTelemetry & record);
+void emit_cycle_telemetry(const Im2pStripeTelemetry & record);
+void emit_cycle_telemetry(const QuantizationStripeTelemetry & record);
 void emit_cycle_telemetry(const PipelineStripeTelemetry & record);
 void emit_cycle_telemetry(const RmdTelemetryRecord & record);
 

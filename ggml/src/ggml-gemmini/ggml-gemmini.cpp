@@ -11,6 +11,9 @@
 #include <limits>
 
 #include <memory>
+#include <mutex>
+#include <set>
+#include <tuple>
 #include "ggml-impl.h"
 #include "ggml-gemmini.h"
 #include "ggml-gemmini-config.hpp"
@@ -119,8 +122,16 @@ namespace
 
     void gemmini_matmul_fp_facade(size_t I, size_t J, size_t K,
                                   const float * activation, const float * weights,
-                                  float * output) {
+                                  float * output, const std::string & matmul_layer) {
         ggml_gemmini_args_t args{};
+        args.matmul_layer = matmul_layer;
+#if defined(GGML_GEMMINI_TEST_OBSERVER)
+        if (ggml::gemmini::test_observe_semantic_layer(
+                ggml::gemmini::TestSemanticLayerSite::fp_facade,
+                args.matmul_layer.c_str())) {
+            return;
+        }
+#endif
         args.I = I;
         args.J = J;
         args.K = K;
@@ -138,6 +149,35 @@ namespace
         if (result.status != ggml::gemmini::MatMulStatus::success) {
             GGML_ABORT("Gemmini FP32 facade execution failed");
         }
+    }
+
+    using unclassified_matmul_diagnostic_key =
+        std::tuple<std::string, std::string, std::string>;
+    std::mutex unclassified_matmul_mutex;
+    std::set<unclassified_matmul_diagnostic_key> unclassified_matmul_diagnostics;
+
+    std::string resolve_backend_matmul_layer(std::string_view model_arch,
+                                             std::string_view weight_name,
+                                             std::string_view input_name,
+                                             std::string_view consumer_name) {
+        std::string layer = ggml::gemmini::types::resolve_matmul_layer(
+            model_arch, weight_name, input_name, consumer_name);
+        if (layer.compare(0, 13, "unclassified.") != 0) {
+            return layer;
+        }
+
+        bool emit_diagnostic = false;
+        {
+            std::lock_guard<std::mutex> lock(unclassified_matmul_mutex);
+            emit_diagnostic = unclassified_matmul_diagnostics.emplace(
+                model_arch, weight_name, consumer_name).second;
+        }
+        if (emit_diagnostic) {
+            GGML_LOG_WARN(
+                "Gemmini semantic matmul classification fallback: layer='%s'\n",
+                layer.c_str());
+        }
+        return layer;
     }
 
     bool log_prepare_q8_0_rows_for_q8_h1_fail(const char * reason, const ggml_tensor * src, int64_t row = -1) {
@@ -840,6 +880,25 @@ namespace
     }
 }
 
+#if defined(GGML_GEMMINI_TESTING)
+std::string ggml::gemmini::test_resolve_backend_matmul_layer(
+    std::string_view model_arch, std::string_view weight_name,
+    std::string_view input_name, std::string_view consumer_name) {
+    return resolve_backend_matmul_layer(
+        model_arch, weight_name, input_name, consumer_name);
+}
+
+void ggml::gemmini::test_reset_unclassified_matmul_diagnostics() {
+    std::lock_guard<std::mutex> lock(unclassified_matmul_mutex);
+    unclassified_matmul_diagnostics.clear();
+}
+
+size_t ggml::gemmini::test_unclassified_matmul_diagnostic_count() {
+    std::lock_guard<std::mutex> lock(unclassified_matmul_mutex);
+    return unclassified_matmul_diagnostics.size();
+}
+#endif
+
 bool ggml::gemmini::prepare_q8_0_rows_for_q8_h1(
     const ggml_tensor * src,
     std::vector<block_q8_h1> & dst,
@@ -958,6 +1017,9 @@ namespace ggml::gemmini {
 namespace {
 test_i_observer_t test_i_observer = nullptr;
 void * test_i_observer_data = nullptr;
+std::mutex test_semantic_layer_observer_mutex;
+test_semantic_layer_observer_t test_semantic_layer_observer = nullptr;
+void * test_semantic_layer_observer_data = nullptr;
 }
 
 void set_test_i_observer(test_i_observer_t observer, void * user_data) {
@@ -969,6 +1031,55 @@ static void observe_test_i(const char * consumer, size_t I) {
     if (test_i_observer != nullptr) {
         test_i_observer(consumer, I, test_i_observer_data);
     }
+}
+
+void set_test_semantic_layer_observer(
+    test_semantic_layer_observer_t observer, void * user_data) {
+    std::lock_guard<std::mutex> lock(test_semantic_layer_observer_mutex);
+    test_semantic_layer_observer = observer;
+    test_semantic_layer_observer_data = user_data;
+}
+
+bool test_observe_semantic_layer(TestSemanticLayerSite site, const char * layer) {
+    test_semantic_layer_observer_t observer = nullptr;
+    void * user_data = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(test_semantic_layer_observer_mutex);
+        observer = test_semantic_layer_observer;
+        user_data = test_semantic_layer_observer_data;
+    }
+    return observer != nullptr && observer(site, layer, user_data);
+}
+
+bool test_probe_physical_layer_sites(const ggml_gemmini_args_t & source) {
+    ggml_gemmini_args_t args = source;
+    tiled_matmul_auto_fp(&args);
+    args = source;
+    gemmini_set_tile_ws(&args);
+    args = source;
+    tiled_matmul_im2p_impl(&args, true, "test semantic layer probe");
+    args = source;
+    tiled_matmul_auto_im2p(&args);
+    args = source;
+    tiled_matmul_auto_baseline_dense(
+        &args, *baseline_route_for(
+            baseline_activation_quant_t::TENSOR,
+            baseline_weight_quant_t::TENSOR));
+    return true;
+}
+
+bool test_probe_physical_null_args() {
+    tiled_matmul_auto_fp(nullptr);
+    gemmini_set_tile_ws(nullptr);
+    return true;
+}
+
+bool test_probe_fp_facade_layer(const std::string & layer) {
+    const float activation = 2.0f;
+    const float weight = 3.0f;
+    float output = 0.0f;
+    gemmini_matmul_fp_facade(1, 1, 1, &activation, &weight, &output, layer);
+    return true;
 }
 }
 #endif
@@ -1002,11 +1113,14 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 #if LOG_CYCLE
     const uint64_t rmd_telemetry_invocation_start = ggml::gemmini::cycle::read();
 #endif
-    const auto layer_type = ggml::gemmini::types::parse_layer(dst->src[1]->name);
-    const char *layer = ggml::gemmini::types::to_string(layer_type);
-    ggml::gemmini::log::debug(layer, "ggml_backend_gemmini_mul_mat called");
     const auto *src0 = dst->src[0]; // src0: weight (J x K), row-major, 전치 상태
     const auto *src1 = dst->src[1]; // src1: activation (I x K) -> 전치 없음 (A)
+    ggml_gemmini_args_t args;
+    args.model_arch = ctx->model_arch.c_str();
+    args.matmul_layer = resolve_backend_matmul_layer(
+        ctx->model_arch, src0->name, src1->name, dst->name);
+    const char * layer = args.matmul_layer.c_str();
+    ggml::gemmini::log::debug(layer, "ggml_backend_gemmini_mul_mat called");
 
     uint64_t start = 0;
     uint64_t end = 0;
@@ -1061,19 +1175,19 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 src0_f = src0_f32.data();
             }
             gemmini_matmul_fp_facade(I, J, K, (const float *)src1->data, src0_f,
-                                     (float *)dst->data);
+                                     (float *)dst->data, args.matmul_layer);
             return;
         } else if (src0->type == GGML_TYPE_Q8_0) {
             std::vector<float> src0_f32(jk_count);
             dequantize_row_q8_0((const block_q8_0 *)src0->data, src0_f32.data(), jk_count);
             gemmini_matmul_fp_facade(I, J, K, (const float *)src1->data, src0_f32.data(),
-                                     (float *)dst->data);
+                                     (float *)dst->data, args.matmul_layer);
             return;
         } else if (gemmini_is_extended_dequant_weight_type(src0->type)) {
             std::vector<float> src0_f32(jk_count);
             ggml_get_type_traits(src0->type)->to_float(src0->data, src0_f32.data(), jk_count);
             gemmini_matmul_fp_facade(I, J, K, (const float *)src1->data, src0_f32.data(),
-                                     (float *)dst->data);
+                                     (float *)dst->data, args.matmul_layer);
             return;
         } else if (src0->type == GGML_TYPE_Q8_CHANNEL) {
             std::vector<float> src0_f32(jk_count);
@@ -1083,31 +1197,31 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 dequantize_row_q8_channel(row + j * row_size, src0_f32.data() + j * K, K);
             }
             gemmini_matmul_fp_facade(I, J, K, (const float *)src1->data, src0_f32.data(),
-                                     (float *)dst->data);
+                                     (float *)dst->data, args.matmul_layer);
             return;
         } else if (src0->type == GGML_TYPE_Q8_H1) {
             std::vector<float> src0_f32(jk_count);
             dequantize_row_q8_h1((const block_q8_h1 *)src0->data, src0_f32.data(), jk_count);
             gemmini_matmul_fp_facade(I, J, K, (const float *)src1->data, src0_f32.data(),
-                                     (float *)dst->data);
+                                     (float *)dst->data, args.matmul_layer);
             return;
         } else if (src0->type == GGML_TYPE_Q8_H2) {
             std::vector<float> src0_f32(jk_count);
             dequantize_row_q8_h2((const block_q8_h2 *)src0->data, src0_f32.data(), jk_count);
             gemmini_matmul_fp_facade(I, J, K, (const float *)src1->data, src0_f32.data(),
-                                     (float *)dst->data);
+                                     (float *)dst->data, args.matmul_layer);
             return;
         } else if (src0->type == GGML_TYPE_Q8_HP1) {
             std::vector<float> src0_f32(jk_count);
             dequantize_row_q8_hp1((const block_q8_hp1 *)src0->data, src0_f32.data(), jk_count);
             gemmini_matmul_fp_facade(I, J, K, (const float *)src1->data, src0_f32.data(),
-                                     (float *)dst->data);
+                                     (float *)dst->data, args.matmul_layer);
             return;
         } else if (src0->type == GGML_TYPE_Q8_HP2) {
             std::vector<float> src0_f32(jk_count);
             dequantize_row_q8_hp2((const block_q8_hp2 *)src0->data, src0_f32.data(), jk_count);
             gemmini_matmul_fp_facade(I, J, K, (const float *)src1->data, src0_f32.data(),
-                                     (float *)dst->data);
+                                     (float *)dst->data, args.matmul_layer);
             return;
         } else {
             ggml::gemmini::log::debug(layer, "FLOAT path unsupported weight type=%d", (int)src0->type);
@@ -1133,7 +1247,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 #endif
     }
 
-    ggml_gemmini_args_t args;
     std::vector<int8_t> q8_channel_dense;
     std::vector<float> q8_channel_scales;
     std::unique_ptr<ggml::gemmini::MatmulStripeCollector> pipeline_collector;
@@ -1235,8 +1348,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     // set args
     start = ggml::gemmini::cycle::read();
     args.transpose_B = (TRANSPOSE_B != 0);
-    args.layer_type = layer_type;
-    args.model_arch = ctx->model_arch.c_str();
     ggml::gemmini::log::debug(layer, "model_arch=%s\n", args.model_arch ? args.model_arch : "");
     args.full_C = FULL_C;
     args.low_D = LOW_D;
@@ -1254,7 +1365,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.sC = J;
 
     end = ggml::gemmini::cycle::read();
-    ggml::gemmini::log::cycle(layer, "cpu.Set Args for calling gemmini", start, end);
+    ggml::gemmini::log::cycle(layer, "gemmini.prepare_args", start, end);
 
     // set tile size
     start = ggml::gemmini::cycle::read();
@@ -1266,10 +1377,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     }
     args.activation_rows_per_stripe = gemmini_geometry.geometry.stripe_rows;
     end = ggml::gemmini::cycle::read();
-    ggml::gemmini::log::cycle(layer, "cpu.Set tile size", start, end);
-
-    // quantize activation
-    start = ggml::gemmini::cycle::read();
+    ggml::gemmini::log::cycle(layer, "gemmini.select_tile", start, end);
 
 #if defined(GGML_GEMMINI_TESTING) && \
     defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
@@ -1277,7 +1385,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 #endif
     if (!args.A.allocate(args.I, args.K, GGML_GEMMINI_ACTIVATION_BITS)) {
         ggml::gemmini::log::debug(
-            ggml::gemmini::types::to_string(args.layer_type),
+            args.matmul_layer.c_str(),
             "failed to allocate activation buffer (I=%zu, K=%zu, bits=%d)",
             args.I, args.K, GGML_GEMMINI_ACTIVATION_BITS);
         GGML_ABORT("Gemmini failed to allocate activation buffer");
@@ -1287,7 +1395,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         args.exsia_stripe_ready_sink = pipeline_collector->sink();
     }
     ggml::gemmini::log::debug(
-        ggml::gemmini::types::to_string(args.layer_type),
+        args.matmul_layer.c_str(),
         "[" GGML_GEMMINI_ACTIVATION_QUANT_NAME "] final cfg model_arch=%s",
         args.model_arch ? args.model_arch : "");
 
@@ -1296,15 +1404,42 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 #endif
     bool quantize_ok = false;
     const bool deferred_quantization = pipeline_enabled || im2p_exsia;
+#if LOG_CYCLE
+    const bool quantization_overlaps_rtl =
+        pipeline_enabled || (im2p_exsia && pipeline_requested);
+#endif
+    const auto quantize_activation = [&]() {
+#if LOG_CYCLE
+        const std::uint64_t quantize_start =
+            ggml::gemmini::cycle::read();
+#endif
+        const bool result =
+            ggml::gemmini::quants::quantize_activation(src1, args);
+#if LOG_CYCLE
+        const std::uint64_t quantize_end =
+            ggml::gemmini::cycle::read();
+        if (quantization_overlaps_rtl) {
+            ggml::gemmini::log::debug(
+                layer,
+                "[matmul.pipeline] cpu_quantization_host_ticks=%llu "
+                "overlaps_rtl=true excluded_from_cycle_sink=true",
+                static_cast<unsigned long long>(
+                    quantize_end - quantize_start));
+        } else {
+            ggml::gemmini::log::cycle(
+                layer, "gemmini.quantize_activation",
+                quantize_start, quantize_end);
+        }
+#endif
+        return result;
+    };
     if (!deferred_quantization) {
-      quantize_ok = ggml::gemmini::quants::quantize_activation(src1, args);
+      quantize_ok = quantize_activation();
     }
 #if GGML_GEMMINI_COMPUTE_TYPE == 0 && GGML_GEMMINI_ACTIVATION_BITS == 8
     static_assert(sizeof(elem_t) == 1, "Q8_0 path assumes elem_t is int8 (1 byte).");
 #endif
 
-    end = ggml::gemmini::cycle::read();
-    ggml::gemmini::log::cycle(layer, "cpu.Quantize activation", start, end);
     if (!deferred_quantization && !quantize_ok) {
       if (pipeline_collector && !pipeline_collector->status()) {
         ggml::gemmini::log::debug(
@@ -1393,7 +1528,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         }
 
         gemmini_matmul_fp_facade(I, J, K, activation_f32.data(), src0_f,
-                                 static_cast<float *>(dst->data));
+                                 static_cast<float *>(dst->data), args.matmul_layer);
         return;
     }
 
@@ -1448,7 +1583,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         args.R_stripe = nullptr;
 
         end = ggml::gemmini::cycle::read();
-        ggml::gemmini::log::cycle(layer, "cpu.Use dense I8 weight", start, end);
+        ggml::gemmini::log::cycle(layer, "gemmini.prepare_dense_i8_weight", start, end);
     } else {
         if (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_H1 ||
             src0->type == GGML_TYPE_Q4_HP1 || src0->type == GGML_TYPE_Q16_0 ||
@@ -1685,7 +1820,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 "[Q8_0 reprocess] blocks=%p sB=%zu blocks_per_row=%zu logical_rows=%zu",
                 (void *)reprocessed_q8_h1.data(), args.sB, args.blocks_per_row, q8_0_reprocess_rows);
             end = ggml::gemmini::cycle::read();
-            ggml::gemmini::log::cycle(layer, "cpu.Reprocess Q8_0 to Q8_H1", start, end);
+            ggml::gemmini::log::cycle(layer, "gemmini.convert_q8_0_to_q8_h1", start, end);
         } else {
             ggml::gemmini::log::debug(layer, "int compute unsupported weight type=%d", (int)src0->type);
             GGML_ABORT("Gemmini int mul_mat received unsupported weight type");
@@ -1747,9 +1882,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 #if defined(GGML_GEMMINI_TESTING)
         quantize_ok =
             !ggml::gemmini::im2p_adapter::test_should_fail_quantization() &&
-            ggml::gemmini::quants::quantize_activation(src1, args);
+            quantize_activation();
 #else
-        quantize_ok = ggml::gemmini::quants::quantize_activation(src1, args);
+        quantize_ok = quantize_activation();
 #endif
         const auto completion = full.execution->finish(quantize_ok);
         if (!completion.result.ok()) {
@@ -1764,7 +1899,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 #endif
         }
         ggml::gemmini::im2p_adapter::log_stats(
-            "full", completion.stats, args);
+            "full", completion.stats, completion.run_id, args);
         return;
       }
 
@@ -1810,9 +1945,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 #if defined(GGML_GEMMINI_TESTING)
       quantize_ok =
           !ggml::gemmini::im2p_adapter::test_should_fail_quantization() &&
-          ggml::gemmini::quants::quantize_activation(src1, args);
+          quantize_activation();
 #else
-      quantize_ok = ggml::gemmini::quants::quantize_activation(src1, args);
+      quantize_ok = quantize_activation();
 #endif
       const auto completion = started.pipeline->finish(quantize_ok);
       if (!completion.result.ok()) {
@@ -1827,7 +1962,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 #endif
       }
       ggml::gemmini::im2p_adapter::log_stats(
-          "stripe_pipeline", completion.stats, args);
+          "stripe_pipeline", completion.stats, completion.run_id, args);
       return;
     }
 #endif
@@ -1849,7 +1984,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     }
 
     if (pipeline_enabled) {
-        quantize_ok = ggml::gemmini::quants::quantize_activation(src1, args);
+        quantize_ok = quantize_activation();
         if (!quantize_ok) {
             const auto pipeline_status = pipeline_collector->finish();
             ggml::gemmini::log::debug(layer,
@@ -1878,12 +2013,12 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
       }
       ggml::gemmini::im2p_adapter::log_stats(
           pipeline_requested ? "stripe_pipeline" : "full",
-          completion.stats, args);
+          completion.stats, completion.run_id, args);
     }
 #endif
 
     end = ggml::gemmini::cycle::read();
-    ggml::gemmini::log::cycle(layer, "cpu.Set Args for calling gemmini", start, end);
+    ggml::gemmini::log::cycle(layer, "gemmini.prepare_args", start, end);
 
     // ggml::gemmini::log::debug("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out(row)=%zu stride_f_out(col)=%zu nb1=%zu nb0=%zu",
     //                  layer, args.A, args.B, args.C, args.D,
@@ -2031,12 +2166,13 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         const uint64_t invocation_total =
             rmd_telemetry_invocation_end >= rmd_telemetry_invocation_start
                 ? rmd_telemetry_invocation_end - rmd_telemetry_invocation_start : 0;
-        const std::string telemetry_run_id = telemetry_profiles.empty()
-            ? "0" : std::to_string(telemetry_profiles.front().run_id);
+        const uint64_t telemetry_run_id = telemetry_profiles.empty()
+            ? 0 : telemetry_profiles.front().run_id;
         const auto telemetry = ggml::gemmini::make_rmd_telemetry_record(
             matmul_options.rmd_backend, matmul_resolution.rmd_backend_source,
             bundle_id != nullptr ? bundle_id : "unbundled",
             ggml::gemmini::resolve_rmd_model_id(model_id, ctx->model_arch),
+            layer,
             telemetry_run_id, invocation_total, telemetry_profiles);
         ggml::gemmini::emit_cycle_telemetry(telemetry);
 #endif

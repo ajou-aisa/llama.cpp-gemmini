@@ -71,6 +71,24 @@ namespace ggml::gemmini::log
             std::snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(value));
             json += buf;
         };
+        auto add_null = [&](const char *key) {
+            add_key(key);
+            json += "null";
+        };
+        auto add_nullable_string = [&](const char *key, const char *value) {
+            if (!value || *value == '\0') {
+                add_null(key);
+                return;
+            }
+            add_string(key, value);
+        };
+        auto add_identity = [&](const char *key, uint32_t flag, uint64_t value) {
+            if ((record.identity_mask & flag) != 0) {
+                add_u64(key, value);
+            } else {
+                add_null(key);
+            }
+        };
 #if LOG_DETAIL
         auto add_i32 = [&](const char *key, int value) {
             add_key(key);
@@ -82,7 +100,7 @@ namespace ggml::gemmini::log
 
         json.push_back('{');
         add_string("schema", "gemmini.cycle");
-        add_u64("version", 1);
+        add_u64("version", 2);
         add_string("record_type", "CYCLE_INTERVAL");
 #ifdef __riscv
         add_string("source", record.source ? record.source : "riscv_cycle");
@@ -91,8 +109,13 @@ namespace ggml::gemmini::log
         add_string("source", record.source ? record.source : "host_tick");
         add_string("unit", record.unit ? record.unit : "tick");
 #endif
-        add_string("layer", record.layer);
-        add_string("name", record.op);
+        add_nullable_string("op", record.op);
+        add_nullable_string("layer", record.layer);
+        add_identity("run_id", GEMMINI_CYCLE_HAS_RUN_ID, record.run_id);
+        add_identity("stripe_id", GEMMINI_CYCLE_HAS_STRIPE_ID, record.stripe_id);
+        add_identity("slot", GEMMINI_CYCLE_HAS_SLOT, record.slot);
+        add_identity("node_id", GEMMINI_CYCLE_HAS_NODE_ID, record.node_id);
+        add_identity("worker_id", GEMMINI_CYCLE_HAS_WORKER_ID, record.worker_id);
         add_u64("start", record.start);
         add_u64("end", record.end);
         add_u64("delta", cycles);
@@ -114,9 +137,11 @@ namespace ggml::gemmini::log
         return {};
 #else
         std::string json =
-            "{\"schema\":\"gemmini.cycle\",\"version\":1,"
+            "{\"schema\":\"gemmini.cycle\",\"version\":2,"
             "\"record_type\":\"WS_LOOP_TELEMETRY\","
-            "\"source\":\"gemmini_hw_counter\",\"unit\":\"cycle\"";
+            "\"source\":\"gemmini_hw_counter\",\"unit\":\"cycle\","
+            "\"op\":\"gemmini.ws_loop\",\"layer\":null,\"run_id\":null,"
+            "\"stripe_id\":null,\"slot\":null,\"node_id\":null,\"worker_id\":null";
         auto add = [&json](const char *name, uint64_t value) {
             json += ",\"";
             json += name;

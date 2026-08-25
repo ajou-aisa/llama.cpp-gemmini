@@ -293,8 +293,52 @@ if(NOT GGML_GEMMINI_ACTIVATION_BITS STREQUAL
         "Gemmini requires matched activation and weight widths")
 endif()
 set(IM2P_SIM_ROOT "" CACHE PATH "Path to the IM2P.sim source and isolated build artifacts")
-set(IM2P_DIM "16" CACHE STRING "IM2P simulator array dimension: 16, 32, or 64")
-set_property(CACHE IM2P_DIM PROPERTY STRINGS 16 32 64)
+if(DEFINED IM2P_DIM AND NOT DEFINED GGML_GEMMINI_DIM)
+    set(GGML_GEMMINI_DIM "${IM2P_DIM}" CACHE STRING
+        "Gemmini array dimension: 16, 32, or 64")
+    message(DEPRECATION "IM2P_DIM is deprecated; use GGML_GEMMINI_DIM")
+endif()
+set(GGML_GEMMINI_DIM "16" CACHE STRING
+    "Gemmini array dimension: 16, 32, or 64")
+set_property(CACHE GGML_GEMMINI_DIM PROPERTY STRINGS 16 32 64)
+if(NOT GGML_GEMMINI_DIM MATCHES "^(16|32|64)$")
+    message(FATAL_ERROR
+        "GGML_GEMMINI_DIM must be 16, 32, or 64, got '${GGML_GEMMINI_DIM}'")
+endif()
+
+set(GGML_GEMMINI_GENERATED_CONFIG_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+file(MAKE_DIRECTORY "${GGML_GEMMINI_GENERATED_CONFIG_DIR}")
+if(GGML_GEMMINI)
+    if(NOT GEMMINI_SW_PATH)
+        message(FATAL_ERROR "GGML_GEMMINI requires the Gemmini include tree")
+    endif()
+    set(_GGML_GEMMINI_PARAMS_SOURCE "${GEMMINI_SW_PATH}/gemmini_params.h")
+    if(NOT EXISTS "${_GGML_GEMMINI_PARAMS_SOURCE}")
+        message(FATAL_ERROR
+            "Missing Gemmini parameter header: ${_GGML_GEMMINI_PARAMS_SOURCE}")
+    endif()
+    file(READ "${_GGML_GEMMINI_PARAMS_SOURCE}" _GGML_GEMMINI_PARAMS_CONTENT)
+    string(REGEX MATCH "#define[ \t]+DIM[ \t]+([0-9]+)"
+        _GGML_GEMMINI_PHYSICAL_DIM_MATCH "${_GGML_GEMMINI_PARAMS_CONTENT}")
+    if(NOT _GGML_GEMMINI_PHYSICAL_DIM_MATCH)
+        message(FATAL_ERROR
+            "Gemmini parameter header does not define a numeric DIM")
+    endif()
+    set(_GGML_GEMMINI_PHYSICAL_DIM "${CMAKE_MATCH_1}")
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
+        if(NOT _GGML_GEMMINI_PHYSICAL_DIM STREQUAL "${GGML_GEMMINI_DIM}")
+            message(FATAL_ERROR
+                "Physical Gemmini DIM mismatch: hardware header reports ${_GGML_GEMMINI_PHYSICAL_DIM}, build requests ${GGML_GEMMINI_DIM}")
+        endif()
+    else()
+        string(REGEX REPLACE "#define[ \t]+DIM[ \t]+[0-9]+"
+            "#define DIM ${GGML_GEMMINI_DIM}" _GGML_GEMMINI_PARAMS_CONTENT
+            "${_GGML_GEMMINI_PARAMS_CONTENT}")
+    endif()
+    file(WRITE "${GGML_GEMMINI_GENERATED_CONFIG_DIR}/gemmini_params.h"
+        "${_GGML_GEMMINI_PARAMS_CONTENT}")
+    include_directories(BEFORE "${GGML_GEMMINI_GENERATED_CONFIG_DIR}")
+endif()
 
 if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
     if(NOT GGML_GEMMINI)
@@ -302,9 +346,6 @@ if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
     endif()
     if(CMAKE_CROSSCOMPILING OR CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
         message(FATAL_ERROR "GGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM is unavailable for RISC-V/cross-compiling builds")
-    endif()
-    if(NOT IM2P_DIM MATCHES "^(16|32|64)$")
-        message(FATAL_ERROR "IM2P_DIM must be 16, 32, or 64, got '${IM2P_DIM}'")
     endif()
     if(IM2P_SIM_ROOT STREQUAL "")
         message(FATAL_ERROR "IM2P_SIM_ROOT is required for GGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM")
@@ -317,7 +358,7 @@ if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
     endif()
 
     set(GGML_GEMMINI_IM2P_ARTIFACT_ID
-        "a${GGML_GEMMINI_ACTIVATION_BITS}-w${GGML_GEMMINI_WEIGHT_BITS}-d${IM2P_DIM}")
+        "a${GGML_GEMMINI_ACTIVATION_BITS}-w${GGML_GEMMINI_WEIGHT_BITS}-d${GGML_GEMMINI_DIM}")
     set(GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE
         "${IM2P_SIM_ROOT}/build/lib/${GGML_GEMMINI_IM2P_ARTIFACT_ID}/libim2p_gemmini_frontend.a")
     set(GGML_GEMMINI_IM2P_SIM_ARCHIVE
@@ -404,9 +445,9 @@ int main() {
         message(FATAL_ERROR
             "IM2P weight storage mismatch: llama requires ${_GGML_GEMMINI_EXPECTED_WEIGHT_STORAGE_BYTES}, archive reports ${_GGML_GEMMINI_IM2P_WEIGHT_STORAGE_BYTES}")
     endif()
-    if(NOT _GGML_GEMMINI_IM2P_DIM STREQUAL "${IM2P_DIM}")
+    if(NOT _GGML_GEMMINI_IM2P_DIM STREQUAL "${GGML_GEMMINI_DIM}")
         message(FATAL_ERROR
-            "IM2P DIM mismatch: llama requests ${IM2P_DIM}, archive reports ${_GGML_GEMMINI_IM2P_DIM}")
+            "IM2P DIM mismatch: llama requests ${GGML_GEMMINI_DIM}, archive reports ${_GGML_GEMMINI_IM2P_DIM}")
     endif()
 
     # The simulator queries above validate the Rust/RTL archive itself. Exercise
@@ -430,7 +471,7 @@ int main() {
     if (im2p::gemmini::compiled_weight_bits() !=
         @GGML_GEMMINI_WEIGHT_BITS@)
         return 30;
-    if (im2p::gemmini::compiled_dim() != @IM2P_DIM@)
+    if (im2p::gemmini::compiled_dim() != @GGML_GEMMINI_DIM@)
         return 40;
     ggml_gemmini_args_t args{};
     const auto *base = reinterpret_cast<const std::uint8_t *>(&args);
@@ -480,8 +521,14 @@ int main() {
             "${GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE}"
             "${GGML_GEMMINI_IM2P_SIM_ARCHIVE}"
             Threads::Threads
-            ${CMAKE_DL_LIBS})
+            ${CMAKE_DL_LIBS}
+        COMPILE_OUTPUT_VARIABLE _GGML_GEMMINI_IM2P_PAIR_PROBE_BUILD_OUTPUT)
     if(NOT _GGML_GEMMINI_IM2P_PAIR_PROBE_COMPILED)
+        if(_GGML_GEMMINI_IM2P_PAIR_PROBE_BUILD_OUTPUT MATCHES
+           "im2p_poll_completed_extended")
+            message(FATAL_ERROR
+                "Incompatible IM2P pair: simulator archive is missing required symbol im2p_poll_completed_extended")
+        endif()
         message(FATAL_ERROR
             "IM2P frontend args layout mismatch or incompatible pair: unable to link the selected frontend/simulator pair")
     endif()
@@ -633,21 +680,6 @@ foreach(_GGML_GEMMINI_MATMUL_COUNT IN ITEMS
     endif()
 endforeach()
 
-set(GGML_GEMMINI_GENERATED_CONFIG_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
-file(MAKE_DIRECTORY "${GGML_GEMMINI_GENERATED_CONFIG_DIR}")
-if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
-    set(_GGML_GEMMINI_PARAMS_SOURCE "${GEMMINI_SW_PATH}/gemmini_params.h")
-    if(NOT EXISTS "${_GGML_GEMMINI_PARAMS_SOURCE}")
-        message(FATAL_ERROR "Missing Gemmini parameter header: ${_GGML_GEMMINI_PARAMS_SOURCE}")
-    endif()
-    file(READ "${_GGML_GEMMINI_PARAMS_SOURCE}" _GGML_GEMMINI_PARAMS_CONTENT)
-    string(REGEX REPLACE "#define[ \t]+DIM[ \t]+[0-9]+"
-        "#define DIM ${IM2P_DIM}" _GGML_GEMMINI_PARAMS_CONTENT
-        "${_GGML_GEMMINI_PARAMS_CONTENT}")
-    file(WRITE "${GGML_GEMMINI_GENERATED_CONFIG_DIR}/gemmini_params.h"
-        "${_GGML_GEMMINI_PARAMS_CONTENT}")
-    include_directories(BEFORE "${GGML_GEMMINI_GENERATED_CONFIG_DIR}")
-endif()
 foreach(_GGML_GEMMINI_MATMUL_BOOL IN ITEMS
         GGML_GEMMINI_ENABLE_STRIPE_MATMUL
         GGML_GEMMINI_ENABLE_STRIPE_PIPELINE
@@ -687,6 +719,7 @@ math(EXPR _GGML_GEMMINI_EXSIA_EXPECTED_OMP_THREADS
     "${GGML_GEMMINI_EXSIA_LOCAL_WORKERS} + 1")
 
 message(STATUS "GGML Gemmini matmul defaults:"
+    "\n  array dimension: ${GGML_GEMMINI_DIM}"
     "\n  stripe capability: ${GGML_GEMMINI_ENABLE_STRIPE_MATMUL}"
     "\n  stripe pipeline: ${GGML_GEMMINI_ENABLE_STRIPE_PIPELINE}"
     "\n  default mode: ${GGML_GEMMINI_DEFAULT_MATMUL_MODE}"
@@ -714,6 +747,7 @@ set(GGML_GEMMINI_COMPILE_DEFS
     GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
     GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
     GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
+    GGML_GEMMINI_CONFIGURED_DIM=${GGML_GEMMINI_DIM}
 )
 if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
     list(APPEND GGML_GEMMINI_COMPILE_DEFS GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM=1)

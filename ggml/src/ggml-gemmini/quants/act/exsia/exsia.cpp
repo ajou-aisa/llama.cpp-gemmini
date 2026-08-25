@@ -205,16 +205,19 @@ namespace ggml::gemmini::quants::act::exsia
         }
 #endif
 
-        static inline uint64_t next_exsia_run_id()
-        {
-            static std::atomic<uint64_t> next{0};
-            return next.fetch_add(1, std::memory_order_relaxed);
-        }
-
         uint64_t aggregate_now_ns()
         {
 #if LOG_CYCLE
             return ggml::gemmini::cycle::timestamp_ns();
+#else
+            return 0;
+#endif
+        }
+
+        uint64_t aggregate_now_tick()
+        {
+#if LOG_CYCLE
+            return ggml::gemmini::cycle::read();
 #else
             return 0;
 #endif
@@ -301,24 +304,35 @@ namespace ggml::gemmini::quants::act::exsia
             return std::strcmp(mode, "Sequential") == 0 ? 1 : EXSIA_OMP_THREAD_COUNT;
         }
 
+        static inline void write_nullable_json_string(std::ostream &out, const char *value)
+        {
+            if (value == nullptr || *value == '\0')
+                out << "null";
+            else
+                write_json_string(out, value);
+        }
+
         static inline void write_timeline_event(std::ostream &out,
                                                 const char *layer,
                                                 uint64_t run_id,
                                                 const char *mode,
                                                 size_t stripe_idx,
-                                                const char *stage,
-                                                const char *suffix,
+                                                const char *op,
                                                 const ProfileInterval &interval,
-                                                size_t team_size)
+                                                size_t team_size,
+                                                const size_t *worker_id)
         {
-            out << "{\"record_type\":\"TIMELINE\",\"layer\":";
-            write_json_string(out, layer);
-            out << ",\"op\":\"exsia.timeline.run." << run_id << ".stripe."
-                << stripe_idx << "." << suffix
-                << "\",\"run_id\":" << run_id << ",\"mode\":";
+            out << "{\"schema\":\"gemmini.cycle\",\"version\":2,"
+                << "\"record_type\":\"TIMELINE\",\"op\":";
+            write_json_string(out, op);
+            out << ",\"layer\":";
+            write_nullable_json_string(out, layer);
+            out << ",\"run_id\":" << run_id << ",\"mode\":";
             write_json_string(out, mode);
-            out << ",\"stripe_id\":" << stripe_idx << ",\"stage\":";
-            write_json_string(out, stage);
+            out << ",\"stripe_id\":" << stripe_idx
+                << ",\"slot\":" << stripe_idx % EXSIA_PIPELINE_SLOT_COUNT
+                << ",\"node_id\":null,\"worker_id\":";
+            if (worker_id == nullptr) out << "null"; else out << *worker_id;
             out << ",\"start\":" << interval.start << ",\"end\":" << interval.end
                 << ",\"start_thread_id\":" << interval.start_thread_id
                 << ",\"end_thread_id\":" << interval.end_thread_id
@@ -338,12 +352,12 @@ namespace ggml::gemmini::quants::act::exsia
                                                      const ProfileInterval &interval,
                                                      size_t team_size)
         {
-            out << "{\"record_type\":\"TIMELINE\",\"layer\":";
-            write_json_string(out, layer);
-            out << ",\"op\":\"exsia.timeline.run." << run_id
-                << ".end_to_end_total\",\"run_id\":" << run_id << ",\"mode\":";
+            out << "{\"schema\":\"gemmini.cycle\",\"version\":2,"
+                << "\"record_type\":\"TIMELINE\",\"op\":\"exsia.run_total\",\"layer\":";
+            write_nullable_json_string(out, layer);
+            out << ",\"run_id\":" << run_id << ",\"mode\":";
             write_json_string(out, mode);
-            out << ",\"stripe_id\":" << ExSIAState::no_failure_stripe << ",\"stage\":\"Run\""
+            out << ",\"stripe_id\":null,\"slot\":null,\"node_id\":null,\"worker_id\":null"
                 << ",\"start\":" << interval.start << ",\"end\":" << interval.end
                 << ",\"start_thread_id\":" << interval.start_thread_id
                 << ",\"end_thread_id\":" << interval.end_thread_id
@@ -367,13 +381,14 @@ namespace ggml::gemmini::quants::act::exsia
                                               const char *value_units,
                                               size_t team_size)
         {
-            out << "{\"record_type\":\"STAGE\",\"layer\":";
-            write_json_string(out, layer);
-            out << ",\"op\":\"exsia.stage.run." << run_id << ".stripe."
-                << stripe_idx << "." << suffix
-                << "\",\"run_id\":" << run_id << ",\"mode\":";
+            out << "{\"schema\":\"gemmini.cycle\",\"version\":2,"
+                << "\"record_type\":\"STAGE\",\"op\":\"exsia.stage_metric\",\"layer\":";
+            write_nullable_json_string(out, layer);
+            out << ",\"run_id\":" << run_id << ",\"mode\":";
             write_json_string(out, mode);
-            out << ",\"stripe_id\":" << stripe_idx << ",\"metric\":";
+            out << ",\"stripe_id\":" << stripe_idx
+                << ",\"slot\":" << stripe_idx % EXSIA_PIPELINE_SLOT_COUNT
+                << ",\"node_id\":null,\"worker_id\":null,\"metric\":";
             write_json_string(out, suffix);
             out << ",\"value\":" << value << ",\"value_units\":";
             write_json_string(out, value_units);
@@ -403,8 +418,8 @@ namespace ggml::gemmini::quants::act::exsia
                     !profile_interval_valid(profile.stripe_total) ||
                     profile.team_size != expected_team_size)
                     return ExSIAState::FailureCode::ProfileIntervalInvalid;
-                write_timeline_event(trace, layer, run_id, mode, profile.stripe_idx, "Local",
-                                     "local_total", profile.local, profile.team_size);
+                write_timeline_event(trace, layer, run_id, mode, profile.stripe_idx,
+                                     "exsia.local", profile.local, profile.team_size, nullptr);
                 if (!sequential)
                 {
                     for (size_t group = 0; group < profile.local_groups.size(); ++group)
@@ -412,22 +427,22 @@ namespace ggml::gemmini::quants::act::exsia
                         const ProfileInterval &interval = profile.local_groups[group];
                         if (!profile_interval_valid(interval))
                             return ExSIAState::FailureCode::ProfileIntervalInvalid;
-                        char suffix[48];
-                        std::snprintf(suffix, sizeof(suffix), "local_group_%zu_total", group);
                         write_timeline_event(trace, layer, run_id, mode, profile.stripe_idx,
-                                             "LocalGroup", suffix, interval, profile.team_size);
+                                             "exsia.local_group", interval, profile.team_size,
+                                             &group);
                     }
                 }
                 write_timeline_event(trace, layer, run_id, mode, profile.stripe_idx,
-                                     "MaskAssembly", "mask_assembly_total",
-                                     profile.mask_assembly, profile.team_size);
+                                     "exsia.mask_assembly",
+                                     profile.mask_assembly, profile.team_size, nullptr);
                 write_timeline_event(trace, layer, run_id, mode, profile.stripe_idx,
-                                     "ExponentReduction", "exponent_reduction_total",
-                                     profile.exponent_reduction, profile.team_size);
+                                     "exsia.exponent_reduction",
+                                     profile.exponent_reduction, profile.team_size, nullptr);
                 write_timeline_event(trace, layer, run_id, mode, profile.stripe_idx,
-                                     "Folding", "folding_total", profile.folding, profile.team_size);
+                                     "exsia.folding", profile.folding, profile.team_size, nullptr);
                 write_timeline_event(trace, layer, run_id, mode, profile.stripe_idx,
-                                     "Stripe", "stripe_total", profile.stripe_total, profile.team_size);
+                                     "exsia.stripe_total", profile.stripe_total, profile.team_size,
+                                     nullptr);
 #if EXSIA_STAGE_PROFILE_ENABLED
                 const StageCycleStats *stages[] = {
                     &profile.stats.p0,
@@ -478,6 +493,12 @@ namespace ggml::gemmini::quants::act::exsia
         }
     }
 #endif
+
+    uint64_t next_exsia_run_id()
+    {
+        static std::atomic<uint64_t> next{0};
+        return next.fetch_add(1, std::memory_order_relaxed);
+    }
 
     std::array<ExSIAState::ExecutionModeAvailability, 3> execution_mode_availability()
     {
@@ -1484,7 +1505,7 @@ namespace ggml::gemmini::quants::act::exsia
         ggml_gemmini_args_t &args,
         const StripeReadySink *sink)
     {
-        const char *layer = ggml::gemmini::types::to_string(args.layer_type);
+        const char * layer = args.matmul_layer.c_str();
         const uint64_t run_id = next_exsia_run_id();
         EXSIA_PROFILE_LOG(
         const ProfileConfig profile_config = compile_profile_config();
@@ -1677,6 +1698,8 @@ namespace ggml::gemmini::quants::act::exsia
             event.slot = slot.stripe_idx % EXSIA_PIPELINE_SLOT_COUNT;
             event.row_begin = slot.row_start;
             event.row_end = slot.row_end;
+            event.quantization_start = slot.quantization_start;
+            event.quantization_end = slot.quantization_end;
             event.rmd_packet = slot.rmd_packet;
             event.direct_residual = slot.direct_residual;
             event.rmd_pack_ns = slot.rmd_pack_ns;
@@ -1815,6 +1838,7 @@ namespace ggml::gemmini::quants::act::exsia
                                                      state_.K_padded, state_.blocks_per_row);
                                 local_workspace_.reset_for_stripe(
                                     s, row_start, row_end, state_.blocks_per_row);
+                                slot.mark_quantization_started(aggregate_now_tick());
 #if EXSIA_OBSERVATION_ENABLED
                                 LocalParallelStripeObservation &observation =
                                     state_.local_parallel_observations[s];
@@ -1878,6 +1902,7 @@ namespace ggml::gemmini::quants::act::exsia
                                                      state_.K_padded, state_.blocks_per_row);
                                 local_workspace_.reset_for_stripe(
                                     s, row_start, row_end, state_.blocks_per_row);
+                                slot.mark_quantization_started(aggregate_now_tick());
 #if EXSIA_OBSERVATION_ENABLED
                                 LocalParallelStripeObservation &observation =
                                     state_.local_parallel_observations[s];
@@ -1941,6 +1966,7 @@ namespace ggml::gemmini::quants::act::exsia
                                                      state_.K_padded, state_.blocks_per_row);
                                 local_workspace_.reset_for_stripe(
                                     s, row_start, row_end, state_.blocks_per_row);
+                                slot.mark_quantization_started(aggregate_now_tick());
 #if EXSIA_OBSERVATION_ENABLED
                                 LocalParallelStripeObservation &observation =
                                     state_.local_parallel_observations[s];
@@ -2192,7 +2218,8 @@ namespace ggml::gemmini::quants::act::exsia
                                         }
                                         else
                                         {
-                                            slot.mark_folding_committed(aggregate_now_ns());
+                                            slot.mark_folding_committed(
+                                                aggregate_now_ns(), aggregate_now_tick());
                                             if (!snapshot_validation_mask(s, slot.stripe.outlier_mask))
                                             {
                                                 record_failure(ExSIAState::FailureCode::ValidationSnapshotFailure, s);
@@ -2261,6 +2288,7 @@ namespace ggml::gemmini::quants::act::exsia
             slot.reset_for_stripe(s, row_start, row_end,
                                   state_.K_padded, state_.blocks_per_row);
             local_workspace_.reset_for_stripe(s, row_start, row_end, state_.blocks_per_row);
+            slot.mark_quantization_started(aggregate_now_tick());
             StripeState &stripe = slot.stripe;
             EXSIA_PROFILE_COLLECT(
             StripeProfileRecord &profile = stripe_profiles[s];
@@ -2518,7 +2546,8 @@ namespace ggml::gemmini::quants::act::exsia
             // run in row order, so meta.rmd_packets stays ordered by row_begin.
             if (!seal_stripe_packet(meta, slot))
                 return fail(ExSIAState::FailureCode::FoldingFailure, s);
-            slot.mark_folding_committed(aggregate_now_ns());
+            slot.mark_folding_committed(
+                aggregate_now_ns(), aggregate_now_tick());
 
             if (!snapshot_validation_mask(s, slot.stripe.outlier_mask))
                 return fail(ExSIAState::FailureCode::ValidationSnapshotFailure, s);

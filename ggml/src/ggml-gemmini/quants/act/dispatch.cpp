@@ -144,7 +144,7 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
         exsia::ExSIA exsia;
         if (!exsia.run(meta, src, args, args.exsia_stripe_ready_sink)) {
             ggml::gemmini::log::debug(
-                ggml::gemmini::types::to_string(args.layer_type),
+                args.matmul_layer.c_str(),
                 "[exsia] quantization failed failure_code=%d failure_stripe=%zu",
                 static_cast<int>(exsia.state().failure_code),
                 exsia.state().failure_stripe);

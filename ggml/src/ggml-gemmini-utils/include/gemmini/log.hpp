@@ -24,7 +24,7 @@
  *
  * Output format:
  * - Logs are emitted as JSON Lines (JSONL): 1 JSON object per line.
- * - JSON fields include only the data that was present in the previous text format.
+ * - Cycle schema v2 always emits op/layer and nullable timeline identity keys.
  */
 #pragma once
 
@@ -114,6 +114,12 @@ namespace ggml::gemmini::log
         const char *func = nullptr;
         const char *source = nullptr;
         const char *unit = nullptr;
+        uint32_t identity_mask = 0;
+        uint64_t run_id = 0;
+        uint64_t stripe_id = 0;
+        uint64_t slot = 0;
+        uint64_t node_id = 0;
+        uint64_t worker_id = 0;
     };
 
     struct WsCycleRecord

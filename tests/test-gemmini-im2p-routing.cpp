@@ -19,11 +19,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <numeric>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <variant>
 #include <vector>
+#include <unistd.h>
 
 namespace {
 
@@ -631,14 +633,24 @@ bool run_exsia_publication_boundary() {
          check(trace.events[0].folding_commit_ns != 0 &&
                    trace.events[0].folding_commit_ns <= trace.events[1].folding_commit_ns &&
                    trace.events[1].folding_commit_ns <= trace.events[2].folding_commit_ns &&
+                   trace.events[0].quantization_end >= trace.events[0].quantization_start &&
+                   trace.events[1].quantization_end >= trace.events[1].quantization_start &&
+                   trace.events[2].quantization_end >= trace.events[2].quantization_start &&
+                   trace.events[2].quantization_end - trace.events[2].quantization_start > 0 &&
                    ggml::gemmini::cycle::read_count_for_test() != 0,
-               "enabled folding commits are nonzero, ordered, and instrumented") &&
+               "enabled per-stripe quantization intervals and folding commits are instrumented") &&
 #else
          check(trace.events[0].folding_commit_ns == 0 &&
                    trace.events[1].folding_commit_ns == 0 &&
                    trace.events[2].folding_commit_ns == 0 &&
+                   trace.events[0].quantization_start == 0 &&
+                   trace.events[0].quantization_end == 0 &&
+                   trace.events[1].quantization_start == 0 &&
+                   trace.events[1].quantization_end == 0 &&
+                   trace.events[2].quantization_start == 0 &&
+                   trace.events[2].quantization_end == 0 &&
                    ggml::gemmini::cycle::read_count_for_test() == 0,
-               "disabled folding commits are deterministic and read no timer") &&
+               "disabled quantization timing is deterministic and reads no timer") &&
 #endif
          check(trace.events[0].slot == 0 && trace.events[1].slot == 1 &&
                    trace.events[2].slot == 0,
@@ -769,7 +781,25 @@ struct IntegratedLifecycleResult {
   Completion completion{};
   TestCounters counters{};
   std::vector<float> output;
+  bool semantic_layer_observed = false;
 };
+
+struct RuntimeArgsObservation {
+  std::string expected;
+  std::array<size_t, 4> counts{};
+  bool exact = true;
+};
+
+void observe_runtime_args(TestRuntimeArgsSite site, const char *layer,
+                          void *opaque) {
+  auto &observation = *static_cast<RuntimeArgsObservation *>(opaque);
+  const size_t index = static_cast<size_t>(site);
+  if (index < observation.counts.size()) {
+    ++observation.counts[index];
+  }
+  observation.exact = observation.exact && layer != nullptr &&
+                      observation.expected == layer;
+}
 
 IntegratedLifecycleResult run_integrated_exsia_lifecycle(
     size_t rows, size_t tile_i, LifecycleFamily family,
@@ -786,6 +816,12 @@ IntegratedLifecycleResult run_integrated_exsia_lifecycle(
   std::memcpy(activation->data, values.data(), values.size() * sizeof(float));
 
   ggml_gemmini_args_t args{};
+  const std::string semantic_layer =
+      "blk.15.mlp.down_proj.im2p-lifetime-sentinel-beyond-sso";
+  {
+    std::string source = semantic_layer;
+    args.matmul_layer = source;
+  }
   args.I = rows;
   args.J = J;
   args.K = K;
@@ -811,11 +847,14 @@ IntegratedLifecycleResult run_integrated_exsia_lifecycle(
   auto &meta = args.act_quant.storage().emplace<Meta>();
   ExSIA exsia;
   exsia.set_execution_mode(ExSIAState::ExecutionMode::Sequential);
+  RuntimeArgsObservation observation{semantic_layer};
   test_reset();
+  test_set_runtime_args_observer(observe_runtime_args, &observation);
   if (mode == PublicMode::full) {
     auto started = start_exsia_full_execution(args);
     if (!started.result.ok() || !started.execution ||
         !started.execution->install_sink().ok()) {
+      test_set_runtime_args_observer(nullptr, nullptr);
       ggml_free(context);
       return result;
     }
@@ -826,6 +865,7 @@ IntegratedLifecycleResult run_integrated_exsia_lifecycle(
     auto started = start_exsia_stripe_pipeline(args);
     if (!started.result.ok() || !started.pipeline ||
         !started.pipeline->install_sink().ok()) {
+      test_set_runtime_args_observer(nullptr, nullptr);
       ggml_free(context);
       return result;
     }
@@ -833,8 +873,17 @@ IntegratedLifecycleResult run_integrated_exsia_lifecycle(
                                     args.exsia_stripe_ready_sink);
     result.completion = started.pipeline->finish(quantized);
   }
+  test_set_runtime_args_observer(nullptr, nullptr);
   result.counters = test_counters();
   result.ok = result.completion.result.ok();
+  const size_t expected_site = static_cast<size_t>(
+      mode == PublicMode::full ? TestRuntimeArgsSite::exsia_full_before_execute
+                               : TestRuntimeArgsSite::exsia_pipeline_before_execute);
+  const size_t observations = std::accumulate(
+      observation.counts.begin(), observation.counts.end(), size_t{0});
+  result.semantic_layer_observed = args.matmul_layer == semantic_layer &&
+      observation.exact && observation.counts[expected_site] == 1 &&
+      observations == 1;
   if (!result.ok) {
     std::fprintf(stderr,
                  "integrated lifecycle failed family=%s backend=%s mode=%s: %s\n",
@@ -844,6 +893,130 @@ IntegratedLifecycleResult run_integrated_exsia_lifecycle(
   }
   ggml_free(context);
   return result;
+}
+
+bool run_simple_runtime_args_observer_contract() {
+  const std::string semantic_layer =
+      "blk.15.mlp.down_proj.simple-runtime-copy-beyond-sso";
+  auto observe_route = [&](bool pipeline) {
+    ggml_gemmini_args_t args{};
+    {
+      std::string source = semantic_layer;
+      args.matmul_layer = source;
+    }
+    args.I = pipeline ? 32 : 1;
+    args.J = 1;
+    args.K = pipeline ? 32 : 1;
+    args.tile_I = 1;
+    args.tile_J = 1;
+    args.tile_K = 1;
+    args.activation_rows_per_stripe =
+        pipeline ? GGML_GEMMINI_TEST_IM2P_DIM : 1;
+    std::vector<float> output(args.I, sentinel);
+    args.f_out = output.data();
+    args.stride_f_out = 1;
+    args.col_stride_f_out = 1;
+    if (!args.A.allocate(args.I, args.K, GGML_GEMMINI_ACTIVATION_BITS)) {
+      return false;
+    }
+    RuntimeArgsObservation observation{semantic_layer};
+    test_set_runtime_args_observer(observe_runtime_args, &observation);
+    const Completion completion = pipeline ? run_stripe_pipeline(args)
+                                           : run_full(args);
+    test_set_runtime_args_observer(nullptr, nullptr);
+    const size_t expected_site = static_cast<size_t>(
+        pipeline ? TestRuntimeArgsSite::simple_pipeline_before_execute
+                 : TestRuntimeArgsSite::simple_full_before_execute);
+    const size_t observations = std::accumulate(
+        observation.counts.begin(), observation.counts.end(), size_t{0});
+    const bool observed = observation.exact &&
+        observation.counts[expected_site] == 1 && observations == 1;
+    const bool exact_contract =
+        completion.result.error == Error::invalid_contract &&
+        std::strcmp(completion.result.message,
+                    "invalid native Gemmini route contract") == 0;
+    return check(observed,
+                 pipeline ? "simple PIPELINE runtime copy is observed exactly once"
+                          : "simple FULL runtime copy is observed exactly once") &&
+           check(exact_contract,
+                 pipeline ? "simple PIPELINE keeps exact invalid native route contract"
+                          : "simple FULL keeps exact invalid native route contract");
+  };
+  return observe_route(false) && observe_route(true);
+}
+
+bool run_im2p_semantic_logging_contract() {
+  const std::string semantic_layer =
+      "blk.15.mlp.down_proj.im2p-lifetime-sentinel-beyond-sso";
+  ggml_gemmini_args_t args{};
+  {
+    std::string source = semantic_layer;
+    args.matmul_layer = source;
+  }
+  args.I = 65;
+  args.J = J;
+  args.K = K;
+  args.tile_I = 1;
+  args.tile_J = 1;
+  args.tile_K = 1;
+
+  int capture[2]{};
+  const int saved_stderr = dup(STDERR_FILENO);
+  if (!check(saved_stderr >= 0 && pipe(capture) == 0,
+             "open IM2P semantic telemetry capture")) {
+    if (saved_stderr >= 0) close(saved_stderr);
+    return false;
+  }
+  std::fflush(stderr);
+  dup2(capture[1], STDERR_FILENO);
+  close(capture[1]);
+  Stats full{};
+  full.rtl_work_total_cycles = 117;
+  log_stats("full", full, 41, args);
+  Stats pipeline{};
+  pipeline.rtl_work_total_cycles = 217;
+  pipeline.rtl_stripes_published = 3;
+  pipeline.rtl_stripe_rows_published = 65;
+  log_stats("stripe_pipeline", pipeline, 42, args);
+  std::fflush(stderr);
+  dup2(saved_stderr, STDERR_FILENO);
+  close(saved_stderr);
+  std::string output;
+  char chunk[1024];
+  ssize_t count = 0;
+  while ((count = read(capture[0], chunk, sizeof(chunk))) > 0) {
+    output.append(chunk, static_cast<size_t>(count));
+  }
+  close(capture[0]);
+
+  const std::string layer_json = "\"layer\":\"" + semantic_layer + "\"";
+  const std::string cycle_type =
+      "\"record_type\":\"IM2P_EXECUTION_TELEMETRY\"";
+  const auto first = output.find(cycle_type);
+#if LOG_CYCLE
+  const auto second = first == std::string::npos
+                          ? std::string::npos
+                          : output.find(cycle_type, first + cycle_type.size());
+  const bool cycle_layers = first != std::string::npos &&
+                            second != std::string::npos &&
+                            output.find(layer_json) != std::string::npos;
+#else
+  const bool cycle_layers = first == std::string::npos;
+#endif
+#if LOG_DEBUG
+  const bool debug_modes =
+      output.find("IM2P_EXECUTION_TELEMETRY_DETAIL mode=full") !=
+          std::string::npos &&
+      output.find("IM2P_EXECUTION_TELEMETRY_DETAIL mode=stripe_pipeline") !=
+          std::string::npos;
+#else
+  const bool debug_modes =
+      output.find("IM2P_EXECUTION_TELEMETRY_DETAIL") == std::string::npos;
+#endif
+  return check(cycle_layers,
+               "IM2P cycle records follow the configured cycle sink state") &&
+         check(debug_modes,
+               "IM2P debug detail follows the configured debug sink state");
 }
 
 bool check_graph_stripe_trace(
@@ -1223,6 +1396,11 @@ bool run_integrated_geometry_oracle() {
   bool ok =
       check(a_full.ok && a_pipeline.ok && b_full.ok && b_pipeline.ok,
             "integrated canonical ExSIA transactions complete") &&
+      check(a_full.semantic_layer_observed &&
+                a_pipeline.semantic_layer_observed &&
+                b_full.semantic_layer_observed &&
+                b_pipeline.semantic_layer_observed,
+            "FULL and PIPELINE runtime copies retain one semantic layer after source destruction") &&
       check(a_full.counters.collector_events == 3 &&
                 a_full.counters.collector_handles == 3 &&
                 a_full.counters.stripe == 0 &&
@@ -1288,6 +1466,7 @@ bool run_route_lifecycle_table() {
   for (const PublicMode mode : modes) {
     for (const Identity identity : identities) {
       bool case_ok = false;
+      bool semantic_layer_observed = true;
       TestCounters counters{};
       Completion completion{};
 #if GGML_GEMMINI_WEIGHT_BITS == 8
@@ -1308,6 +1487,7 @@ bool run_route_lifecycle_table() {
             2 * GGML_GEMMINI_TEST_IM2P_DIM + 1, 1, identity.family,
             identity.backend, mode);
         case_ok = result.ok;
+        semantic_layer_observed = result.semantic_layer_observed;
         counters = result.counters;
         completion = result.completion;
       }
@@ -1341,7 +1521,8 @@ bool run_route_lifecycle_table() {
               ? counters.rmd_events > 0 && counters.rmd_packets == 0
               : counters.rmd_packets == route_stripes &&
                     counters.rmd_events == 0;
-      case_ok = check(case_ok && family_observed && counters.fence == 1 &&
+      case_ok = check(case_ok && semantic_layer_observed && family_observed &&
+                          counters.fence == 1 &&
                           counters.rmd_calls == route_stripes &&
                           counters.commit == 1 && counters.live_runs == 0 &&
                           counters.fallback == 0 && backend_observed &&
@@ -1459,9 +1640,13 @@ bool run_exsia_boundary_failure(
   const bool quantization = failure == TestFailure::quantization;
   const bool progress = failure == TestFailure::progress;
   const bool poll = failure == TestFailure::poll;
-  const char *failure_name = quantization ? "quantization"
-                             : progress   ? "progress"
-                                          : "poll";
+  const char *failure_name =
+      quantization ? "quantization"
+      : failure == TestFailure::provider ? "provider"
+      : progress ? "progress"
+      : poll ? "poll"
+      : failure == TestFailure::malformed_completion ? "malformed-completion"
+                                                     : "incomplete-publication";
   const bool ok =
       check(status != GGML_STATUS_SUCCESS,
             "production boundary failure reaches graph status") &&
@@ -1536,7 +1721,8 @@ bool run_exsia_staged_failure(
                        : failure == TestFailure::compose ? "compose"
                        : failure == TestFailure::output_authorization
                            ? "output-authorization"
-                           : "rmd";
+                       : failure == TestFailure::output_copy ? "output-copy"
+                                                            : "rmd";
     std::printf("failure=%s error=execution_failure sentinel=preserved full=0 "
                 "hardware=0 fallback=0 live_runs=0\n", name);
   }
@@ -2067,7 +2253,9 @@ int main(int argc, char **argv) {
     return run_invalid_mode_child() ? 0 : 1;
   }
   if (!run_matched_weight_gate_contract() || !run_graph_overhead_regression() ||
-      !run_exsia_shift_regression()
+      !run_exsia_shift_regression() ||
+      !run_simple_runtime_args_observer_contract() ||
+      !run_im2p_semantic_logging_contract()
 #if GGML_GEMMINI_ACTIVATION_QUANT == 0
       || !run_exsia_publication_boundary()
 #endif
@@ -2109,12 +2297,21 @@ int main(int argc, char **argv) {
     } else if (selected == "quantization") {
       selected_ok = run_exsia_boundary_failure(
           ggml::gemmini::im2p_adapter::TestFailure::quantization);
+    } else if (selected == "provider") {
+      selected_ok = run_exsia_boundary_failure(
+          ggml::gemmini::im2p_adapter::TestFailure::provider);
     } else if (selected == "progress") {
       selected_ok = run_exsia_boundary_failure(
           ggml::gemmini::im2p_adapter::TestFailure::progress);
     } else if (selected == "poll") {
       selected_ok = run_exsia_boundary_failure(
           ggml::gemmini::im2p_adapter::TestFailure::poll);
+    } else if (selected == "malformed-completion") {
+      selected_ok = run_exsia_boundary_failure(
+          ggml::gemmini::im2p_adapter::TestFailure::malformed_completion);
+    } else if (selected == "incomplete-publication") {
+      selected_ok = run_exsia_boundary_failure(
+          ggml::gemmini::im2p_adapter::TestFailure::incomplete_publication);
     } else if (selected == "fence") {
       selected_ok = run_exsia_staged_failure(
           ggml::gemmini::im2p_adapter::TestFailure::fence);
@@ -2128,6 +2325,8 @@ int main(int argc, char **argv) {
       selected_ok = run_exsia_staged_failure(TestFailure::compose);
     } else if (selected == "output-authorization") {
       selected_ok = run_exsia_staged_failure(TestFailure::output_authorization);
+    } else if (selected == "output-copy") {
+      selected_ok = run_exsia_staged_failure(TestFailure::output_copy);
     } else if (selected == "blocked-producer-fence-failure") {
       selected_ok = run_exsia_blocked_submit_failure();
     } else {
@@ -2204,10 +2403,19 @@ int main(int argc, char **argv) {
            ggml::gemmini::im2p_adapter::TestFailure::quantization) &&
        ok;
   ok = run_exsia_boundary_failure(
+           ggml::gemmini::im2p_adapter::TestFailure::provider) &&
+       ok;
+  ok = run_exsia_boundary_failure(
            ggml::gemmini::im2p_adapter::TestFailure::progress) &&
        ok;
   ok = run_exsia_boundary_failure(
            ggml::gemmini::im2p_adapter::TestFailure::poll) &&
+       ok;
+  ok = run_exsia_boundary_failure(
+           ggml::gemmini::im2p_adapter::TestFailure::malformed_completion) &&
+       ok;
+  ok = run_exsia_boundary_failure(
+           ggml::gemmini::im2p_adapter::TestFailure::incomplete_publication) &&
        ok;
   ok = run_exsia_staged_failure(
            ggml::gemmini::im2p_adapter::TestFailure::fence) &&
@@ -2217,6 +2425,7 @@ int main(int argc, char **argv) {
   ok = run_exsia_staged_failure(TestFailure::residual_execute) && ok;
   ok = run_exsia_staged_failure(TestFailure::compose) && ok;
   ok = run_exsia_staged_failure(TestFailure::output_authorization) && ok;
+  ok = run_exsia_staged_failure(TestFailure::output_copy) && ok;
 #if GGML_GEMMINI_ACTIVATION_BITS == 8
   ok = run_exsia_prestart_rejection(false) && ok;
 #endif

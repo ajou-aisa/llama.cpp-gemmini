@@ -375,9 +375,17 @@ target_compile_definitions(test-gemmini-exsia-writer PRIVATE
     GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
     GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=1
     GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
+    GGML_GEMMINI_EXSIA_DEFAULT_MODE_VALUE=${_GGML_GEMMINI_EXSIA_DEFAULT_MODE_VALUE}
+    GGML_GEMMINI_EXSIA_LOCAL_WORKERS=${GGML_GEMMINI_EXSIA_LOCAL_WORKERS}
     CYCLE_DETAIL=1
     LOG_CYCLE=1
     EXSIA_VALIDATION=1)
+if (GGML_GEMMINI_ENABLE_OPENMP)
+    find_package(OpenMP REQUIRED COMPONENTS CXX)
+    target_compile_definitions(test-gemmini-exsia-writer PRIVATE
+        GGML_GEMMINI_HAS_OPENMP)
+    target_link_libraries(test-gemmini-exsia-writer PRIVATE OpenMP::OpenMP_CXX)
+endif()
 target_include_directories(test-gemmini-exsia-writer PRIVATE
     ../ggml/include ../ggml/src ../ggml/src/ggml-gemmini
     ../ggml/src/ggml-gemmini-utils/include ../ggml/src/ggml-gemmini/quants
@@ -460,6 +468,7 @@ target_link_libraries(test-gemmini-rmd-telemetry PRIVATE
     ggml-gemmini ggml-base ggml-gemmini-utils)
 target_compile_features(test-gemmini-rmd-telemetry PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-rmd-telemetry PRIVATE
+    LOG_DEBUG=${LOG_DEBUG}
     LOG_CYCLE=${LOG_CYCLE}
     CYCLE_DETAIL=${CYCLE_DETAIL})
 target_include_directories(test-gemmini-rmd-telemetry PRIVATE
@@ -565,8 +574,9 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
         GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
         GGML_GEMMINI_ACTIVATION_QUANT=${_GGML_GEMMINI_ACTIVATION_QUANT_VALUE}
         GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
-        GGML_GEMMINI_TEST_IM2P_DIM=${IM2P_DIM}
-        LOG_CYCLE=${LOG_CYCLE})
+        GGML_GEMMINI_TEST_IM2P_DIM=${GGML_GEMMINI_DIM}
+        LOG_CYCLE=${LOG_CYCLE}
+        LOG_DEBUG=${LOG_DEBUG})
     target_include_directories(test-gemmini-im2p-routing PRIVATE
         ../ggml/src
         ../ggml/src/ggml-gemmini
@@ -583,6 +593,16 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
         COMMAND $<TARGET_FILE:test-gemmini-im2p-routing> --geometry-contract)
     add_test(NAME test-gemmini-im2p-routing-stats-translation
         COMMAND $<TARGET_FILE:test-gemmini-im2p-routing> --stats-translation)
+    if (LOG_CYCLE AND
+        GGML_GEMMINI_ACTIVATION_QUANT STREQUAL "EXSIA" AND
+        GGML_GEMMINI_ENABLE_RMD)
+        add_test(NAME test-gemmini-im2p-cycle-overlap
+            COMMAND ${CMAKE_COMMAND}
+                -DTEST_BINARY=$<TARGET_FILE:test-gemmini-im2p-routing>
+                -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/gemmini-im2p-cycle-overlap
+                -DTEST_DIM=${GGML_GEMMINI_DIM}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-im2p-cycle-overlap.cmake)
+    endif()
 
     add_executable(test-gemmini-im2p-lifecycle
         test-gemmini-im2p-lifecycle.cpp)
@@ -598,7 +618,7 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
         GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
         GGML_GEMMINI_ACTIVATION_QUANT=${_GGML_GEMMINI_ACTIVATION_QUANT_VALUE}
         GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
-        GGML_GEMMINI_TEST_IM2P_DIM=${IM2P_DIM})
+        GGML_GEMMINI_TEST_IM2P_DIM=${GGML_GEMMINI_DIM})
     target_include_directories(test-gemmini-im2p-lifecycle PRIVATE
         ../ggml/src
         ../ggml/src/ggml-gemmini

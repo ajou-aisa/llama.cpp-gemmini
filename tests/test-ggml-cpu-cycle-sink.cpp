@@ -1,6 +1,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
+#include <gemmini/layer.h>
 #include <gemmini/log.h>
 
 #include <array>
@@ -16,6 +17,19 @@ static std::string read_file(const std::filesystem::path & path) {
 
 int main(int argc, char ** argv) {
     if (argc != 2 && argc != 3) return 1;
+    std::array<char, 64> layer{};
+    gemmini_get_layer("Qcur-7", layer.data(), layer.size());
+    if (std::string(layer.data()) != "blk.7.qcur") return 11;
+    gemmini_get_layer("Qcur-7 (reshaped)", layer.data(), layer.size());
+    if (std::string(layer.data()) != "blk.7.qcur") return 14;
+    gemmini_get_layer("cache_k_l7 (view) (copy of Kcur-7 (reshaped))",
+                      layer.data(), layer.size());
+    if (std::string(layer.data()) != "blk.7.cache_k_l7") return 15;
+    gemmini_get_layer("blk.3.attn.q_proj", layer.data(), layer.size());
+    if (std::string(layer.data()) != "blk.3.attn.q_proj") return 12;
+    gemmini_get_layer("inp_embd", layer.data(), layer.size());
+    if (std::string(layer.data()) != "inp_embd") return 13;
+
     const bool preserve = argc == 3 && std::string(argv[2]) == "--preserve";
     const std::filesystem::path root = std::filesystem::absolute(argv[1]);
     std::error_code error;
@@ -35,7 +49,7 @@ int main(int argc, char ** argv) {
     ggml_tensor * lhs = ggml_new_tensor_1d(context, GGML_TYPE_F32, 4);
     ggml_tensor * rhs = ggml_new_tensor_1d(context, GGML_TYPE_F32, 4);
     ggml_tensor * sum = ggml_add(context, lhs, rhs);
-    ggml_set_name(sum, "sink_probe");
+    ggml_set_name(sum, "attn_norm-7");
     ggml_cgraph * graph = ggml_new_graph_custom(context, 8, false);
     ggml_build_forward_expand(graph, sum);
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(context, backend);
@@ -53,7 +67,13 @@ int main(int argc, char ** argv) {
 
     const std::string output = read_file(selected);
     const auto default_path = root / "work/output/log/cycle-log.jsonl";
-    if (output.find("\"name\":\"cpu.add\"") == std::string::npos ||
+    if (output.find("\"version\":2") == std::string::npos ||
+        output.find("\"op\":\"cpu.add\"") == std::string::npos ||
+        output.find("\"layer\":\"blk.7.attn_norm\"") == std::string::npos ||
+        output.find("\"run_id\":null") != std::string::npos ||
+        output.find("\"stripe_id\":null") == std::string::npos ||
+        output.find("\"node_id\":0") == std::string::npos ||
+        output.find("\"worker_id\":0") == std::string::npos ||
         std::filesystem::exists(default_path)) return 9;
     if (!preserve) std::filesystem::remove_all(root, error);
     return error ? 10 : 0;

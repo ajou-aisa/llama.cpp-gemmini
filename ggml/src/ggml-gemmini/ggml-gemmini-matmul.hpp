@@ -463,7 +463,8 @@ struct RmdTelemetryRecord {
     uint32_t version = kRmdTelemetryVersion;
     std::string runtime_bundle_id;
     std::string model_id;
-    std::string run_id;
+    std::string layer;
+    uint64_t run_id = 0;
     RmdBackend backend = RmdBackend::cpu_direct;
     MatmulOptionSource source = MatmulOptionSource::build_default;
     std::string units;
@@ -513,7 +514,8 @@ std::string resolve_rmd_model_id(const char * environment_model_id,
                                  std::string_view model_arch);
 RmdTelemetryRecord make_rmd_telemetry_record(
     RmdBackend backend, MatmulOptionSource source,
-    std::string runtime_bundle_id, std::string model_id, std::string run_id,
+    std::string runtime_bundle_id, std::string model_id, std::string layer,
+    uint64_t run_id,
     uint64_t invocation_total, const std::vector<MatmulJobMetrics> & profiles);
 
 struct ResolvedMatmulOptions {

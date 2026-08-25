@@ -396,6 +396,60 @@ function(make_stale_frontend_root out_var)
     set(${out_var} "${root}" PARENT_SCOPE)
 endfunction()
 
+function(make_extended_poll_stale_simulator_root out_var)
+    if(NOT DEFINED TEST_REAL_IM2P_ROOT OR
+       NOT EXISTS "${TEST_REAL_IM2P_ROOT}/build/lib/a8-w8-d16/libim2p_gemmini_frontend.a")
+        message(FATAL_ERROR "TEST_REAL_IM2P_ROOT must contain the fresh A8/W8/DIM16 frontend archive")
+    endif()
+    set(root "${TEST_BINARY_ROOT}/extended-poll-stale-simulator-root")
+    file(MAKE_DIRECTORY
+        "${root}/frontend/include" "${root}/sim/include"
+        "${root}/build/lib/a8-w8-d16"
+        "${root}/build/cargo/a8-w8-d16/release")
+    file(COPY "${TEST_REAL_IM2P_ROOT}/frontend/include/" DESTINATION "${root}/frontend/include")
+    file(COPY "${TEST_REAL_IM2P_ROOT}/sim/include/" DESTINATION "${root}/sim/include")
+    configure_file(
+        "${TEST_REAL_IM2P_ROOT}/build/lib/a8-w8-d16/libim2p_gemmini_frontend.a"
+        "${root}/build/lib/a8-w8-d16/libim2p_gemmini_frontend.a" COPYONLY)
+    set(source "${root}/old-simulator.cpp")
+    set(object "${root}/old-simulator.o")
+    file(WRITE "${source}" [=[
+#include "im2p_sim.h"
+extern "C" {
+im2p_sim_t *im2p_sim_create(void) { return reinterpret_cast<im2p_sim_t *>(1); }
+void im2p_sim_destroy(im2p_sim_t *) {}
+uint32_t im2p_sim_abi_version(void) { return 4; }
+uint32_t im2p_sim_activation_bits(void) { return 8; }
+uint32_t im2p_sim_activation_storage_bytes(void) { return 1; }
+uint32_t im2p_sim_weight_bits(void) { return 8; }
+uint32_t im2p_sim_weight_storage_bytes(void) { return 1; }
+uint32_t im2p_sim_dim(void) { return 16; }
+int im2p_execute_matmul_extended(im2p_sim_t *, const im2p_matmul_desc_t *, im2p_work_stats_extended_t *) { return IM2P_ERROR; }
+int im2p_begin_striped_matmul(im2p_sim_t *, const im2p_stripe_work_desc_t *, im2p_stream_t **) { return IM2P_ERROR; }
+int im2p_publish_stripe(im2p_stream_t *, const im2p_activation_stripe_t *) { return IM2P_INVALID_LAYOUT; }
+int im2p_progress_stream(im2p_stream_t *, uint64_t) { return IM2P_ERROR; }
+uint64_t im2p_stream_progress_count(const im2p_stream_t *) { return 0; }
+int im2p_finish_stream_extended(im2p_stream_t *, im2p_work_stats_extended_t *) { return IM2P_ERROR; }
+void im2p_destroy_stream(im2p_stream_t *) {}
+}
+]=])
+    execute_process(
+        COMMAND "${TEST_CXX_COMPILER}" -std=c++20
+            -I "${root}/sim/include" -c "${source}" -o "${object}"
+        RESULT_VARIABLE compile_rc ERROR_VARIABLE compile_stderr)
+    if(NOT compile_rc EQUAL 0)
+        message(FATAL_ERROR "Failed to compile stale simulator: ${compile_stderr}")
+    endif()
+    execute_process(
+        COMMAND "${TEST_AR}" rcs
+            "${root}/build/cargo/a8-w8-d16/release/libim2p_sim.a" "${object}"
+        RESULT_VARIABLE ar_rc ERROR_VARIABLE ar_stderr)
+    if(NOT ar_rc EQUAL 0)
+        message(FATAL_ERROR "Failed to archive stale simulator: ${ar_stderr}")
+    endif()
+    set(${out_var} "${root}" PARENT_SCOPE)
+endfunction()
+
 function(make_abi_stale_frontend_root out_var)
     if(NOT DEFINED TEST_REAL_IM2P_ROOT OR
        NOT EXISTS "${TEST_REAL_IM2P_ROOT}/build/cargo/a8-w8-d16/release/libim2p_sim.a")
@@ -453,7 +507,7 @@ function(run_im2p_configure_case name root activation_bits weight_bits dim
         -DGGML_GEMMINI_EXECUTION_BACKEND=${backend}
         -DGGML_GEMMINI_ACTIVATION_BITS=${activation_bits}
         -DGGML_GEMMINI_WEIGHT_BITS=${weight_bits}
-        -DIM2P_DIM=${dim}
+        -DGGML_GEMMINI_DIM=${dim}
         -DIM2P_SIM_ROOT=${root}
         -DLLAMA_BUILD_COMMON=OFF
         -DLLAMA_BUILD_TESTS=OFF
@@ -518,7 +572,7 @@ function(run_option_backend_case name option backend root expect_success failure
         -DGGML_GEMMINI_ACTIVATION_BITS=8
         -DGGML_GEMMINI_WEIGHT_BITS=8
         -DGGML_GEMMINI_BLOCK_SIZE=32
-        -DIM2P_DIM=16
+            -DGGML_GEMMINI_DIM=16
         -DIM2P_SIM_ROOT=${root}
         -DLLAMA_BUILD_COMMON=OFF
         -DLLAMA_BUILD_TESTS=OFF
@@ -614,6 +668,70 @@ function(run_hardware_width_case name option activation_bits weight_bits mode ex
     endforeach()
 endfunction()
 
+function(run_host_dim_case name dim)
+    set(build_dir "${TEST_BINARY_ROOT}/${name}")
+    file(REMOVE_RECURSE "${build_dir}")
+    execute_process(
+        COMMAND "${TEST_CMAKE_COMMAND}"
+            -S "${TEST_SOURCE_DIR}" -B "${build_dir}"
+            -DGGML_GEMMINI=ON
+            -DGGML_GEMMINI_OPTION=CPU
+            -DGGML_GEMMINI_EXECUTION_BACKEND=HARDWARE
+            -DGGML_GEMMINI_DIM=${dim}
+            -DGGML_GEMMINI_ACTIVATION_BITS=8
+            -DGGML_GEMMINI_WEIGHT_BITS=8
+            -DLLAMA_BUILD_COMMON=OFF
+            -DLLAMA_BUILD_TESTS=OFF
+            -DLLAMA_BUILD_TOOLS=OFF
+            -DLLAMA_BUILD_EXAMPLES=OFF
+            -DLLAMA_BUILD_SERVER=OFF
+            -DLLAMA_CURL=OFF
+        RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+    if(NOT rc EQUAL 0)
+        message(FATAL_ERROR
+            "Expected host HARDWARE DIM ${dim} to configure\n${stdout}\n${stderr}")
+    endif()
+    expect_contains("${build_dir}/generated/gemmini_params.h"
+        "#define DIM ${dim}")
+endfunction()
+
+function(run_riscv_dim_mismatch_case)
+    set(root "${TEST_BINARY_ROOT}/riscv-dim-mismatch")
+    set(toolchain "${root}/toolchain.cmake")
+    file(MAKE_DIRECTORY "${root}")
+    file(WRITE "${toolchain}"
+        "set(CMAKE_SYSTEM_NAME Linux)\n"
+        "set(CMAKE_SYSTEM_PROCESSOR riscv64)\n")
+    execute_process(
+        COMMAND "${TEST_CMAKE_COMMAND}"
+            -S "${TEST_SOURCE_DIR}" -B "${root}/build"
+            -DCMAKE_TOOLCHAIN_FILE=${toolchain}
+            -DGGML_GEMMINI=ON
+            -DGGML_GEMMINI_OPTION=WS
+            -DGGML_GEMMINI_EXECUTION_BACKEND=HARDWARE
+            -DGGML_GEMMINI_DIM=64
+            -DGGML_GEMMINI_ACTIVATION_BITS=8
+            -DGGML_GEMMINI_WEIGHT_BITS=8
+            -DLLAMA_BUILD_COMMON=OFF
+            -DLLAMA_BUILD_TESTS=OFF
+            -DLLAMA_BUILD_TOOLS=OFF
+            -DLLAMA_BUILD_EXAMPLES=OFF
+            -DLLAMA_BUILD_SERVER=OFF
+            -DLLAMA_CURL=OFF
+        RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+    string(CONCAT output "${stdout}" "\n" "${stderr}")
+    if(rc EQUAL 0)
+        message(FATAL_ERROR
+            "Expected RISC-V physical DIM mismatch to fail configure")
+    endif()
+    string(FIND "${output}" "Physical Gemmini DIM mismatch" mismatch_at)
+    string(FIND "${output}" "hardware header reports 16" hardware_at)
+    if(mismatch_at EQUAL -1 OR hardware_at EQUAL -1)
+        message(FATAL_ERROR
+            "Expected explicit RISC-V physical DIM mismatch\n${output}")
+    endif()
+endfunction()
+
 function(run_arm64_bootstrap_contract)
     set(root "${TEST_BINARY_ROOT}/arm64-bootstrap-contract")
     set(bin "${root}/bin")
@@ -622,10 +740,15 @@ function(run_arm64_bootstrap_contract)
     file(WRITE "${bin}/make" [=[#!/bin/bash
 printf 'make:%s\n' "$*" >> "$CONTRACT_LOG"
 ]=])
+    file(WRITE "${bin}/cargo" [=[#!/bin/bash
+printf 'cargo:repo=%s build=%s a=%s w=%s d=%s target=%s args=%s\n' \
+    "$IM2P_REPO_ROOT" "$IM2P_BUILD_DIR" "$IM2P_ACTIVATION_BITS" \
+    "$IM2P_WEIGHT_BITS" "$IM2P_DIM" "$CARGO_TARGET_DIR" "$*" >> "$CONTRACT_LOG"
+]=])
     file(WRITE "${bin}/cmake" [=[#!/bin/bash
 printf 'cmake:%s\n' "$*" >> "$CONTRACT_LOG"
 ]=])
-    execute_process(COMMAND chmod +x "${bin}/make" "${bin}/cmake")
+    execute_process(COMMAND chmod +x "${bin}/make" "${bin}/cargo" "${bin}/cmake")
     execute_process(
         COMMAND "${TEST_CMAKE_COMMAND}" -E env
             "PATH=${bin}:$ENV{PATH}"
@@ -643,18 +766,52 @@ printf 'cmake:%s\n' "$*" >> "$CONTRACT_LOG"
     file(READ "${log}" commands)
     string(FIND "${commands}"
         "GEMMINI_FRONTEND_BLOCK_SIZE=32" frontend_block_size_at)
-    string(FIND "${commands}"
-        "build/lib/a8-w8-d64/libim2p_gemmini_frontend.a" frontend_at)
+    string(FIND "${commands}" "gemmini-frontend-real-lib" cache_target_at)
+    string(FIND "${commands}" "cargo:" direct_cargo_at)
     string(FIND "${commands}" "cmake:-B" configure_at)
     string(FIND "${commands}" "-DGGML_GEMMINI_OPTION=WS" option_at)
+    string(FIND "${commands}" "-DGGML_GEMMINI_DIM=64" dim_at)
     string(FIND "${commands}" "-DGGML_GEMMINI_BLOCK_SIZE=32" cmake_block_size_at)
     string(FIND "${commands}" "cmake:--build" build_at)
-    if(frontend_block_size_at EQUAL -1 OR frontend_at EQUAL -1 OR
+    if(frontend_block_size_at EQUAL -1 OR cache_target_at EQUAL -1 OR
+       NOT direct_cargo_at EQUAL -1 OR
        configure_at EQUAL -1 OR option_at EQUAL -1 OR
+       dim_at EQUAL -1 OR
        cmake_block_size_at EQUAL -1 OR build_at EQUAL -1 OR
-       NOT frontend_at LESS configure_at OR NOT configure_at LESS build_at)
+       NOT cache_target_at LESS configure_at OR NOT configure_at LESS build_at)
         message(FATAL_ERROR
-            "build-arm64 defaults must refresh matching B32/DIM64 frontend in legal WS+IM2P mode before configure/build:\n${commands}")
+            "build-arm64 defaults must delegate matching B32/DIM64 cache selection before configure/build without direct Cargo orchestration:\n${commands}")
+    endif()
+endfunction()
+
+function(run_host_script_dim_contract script dim)
+    set(root "${TEST_BINARY_ROOT}/${script}-dim-contract")
+    set(bin "${root}/bin")
+    set(log "${root}/commands.log")
+    file(MAKE_DIRECTORY "${bin}")
+    file(WRITE "${bin}/cmake" [=[#!/bin/bash
+printf 'cmake:%s\n' "$*" >> "$CONTRACT_LOG"
+]=])
+    execute_process(COMMAND chmod +x "${bin}/cmake")
+    execute_process(
+        COMMAND "${TEST_CMAKE_COMMAND}" -E env
+            "PATH=${bin}:$ENV{PATH}"
+            "CONTRACT_LOG=${log}"
+            "BUILD_DIR=${root}/build"
+            "BUILD_JOBS=1"
+            "GGML_GEMMINI_DIM=${dim}"
+            bash "${TEST_SOURCE_DIR}/${script}"
+        WORKING_DIRECTORY "${TEST_SOURCE_DIR}"
+        RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+    if(NOT rc EQUAL 0)
+        message(FATAL_ERROR
+            "${script} DIM contract failed: ${stdout}\n${stderr}")
+    endif()
+    file(READ "${log}" commands)
+    string(FIND "${commands}" "-DGGML_GEMMINI_DIM=${dim}" dim_at)
+    if(dim_at EQUAL -1)
+        message(FATAL_ERROR
+            "${script} did not forward GGML_GEMMINI_DIM=${dim}:\n${commands}")
     endif()
 endfunction()
 
@@ -719,6 +876,10 @@ endforeach()
 run_invalid_log_case(invalid_log_debug LOG_DEBUG ON)
 run_invalid_log_case(invalid_log_dump LOG_DUMP YES)
 run_invalid_log_case(invalid_log_dump_scale LOG_DUMP_SCALE garbage)
+foreach(host_dim IN ITEMS 16 32 64)
+    run_host_dim_case("host_hardware_dim${host_dim}" "${host_dim}")
+endforeach()
+run_riscv_dim_mismatch_case()
 
 set(matching_root "${TEST_REAL_IM2P_ROOT}")
 make_matching_fake_im2p_root(option_backend_fake_root)
@@ -791,7 +952,7 @@ run_im2p_configure_case(im2p_invalid_width "${matching_root}" 5 8 32 IM2P_SIM FA
 run_im2p_configure_case(im2p_invalid_weight_width "${matching_root}" 8 5 32 IM2P_SIM FALSE
     "GGML_GEMMINI_WEIGHT_BITS must be one of")
 run_im2p_configure_case(im2p_invalid_dim "${matching_root}" 8 8 17 IM2P_SIM FALSE
-    "IM2P_DIM must be 16, 32, or 64")
+    "GGML_GEMMINI_DIM must be 16, 32, or 64")
 run_im2p_configure_case(im2p_width_mismatch "${width_mismatch_root}" 16 16 32 IM2P_SIM FALSE
     "IM2P activation width mismatch: llama requests 16, archive reports 8")
 run_im2p_configure_case(im2p_mixed_a4_w8 "${matching_root}" 4 8 16 IM2P_SIM FALSE
@@ -808,17 +969,25 @@ run_im2p_configure_case(im2p_missing_pair "${width_mismatch_root}" 8 8 32 IM2P_S
     "Missing matching IM2P a8-w8-d32 archive")
 make_stale_frontend_root(stale_frontend_root)
 run_im2p_configure_case(im2p_stale_frontend "${stale_frontend_root}" 8 8 32 IM2P_SIM FALSE
-    "IM2P frontend configuration mismatch")
+    "im2p_poll_completed_extended")
 make_abi_stale_frontend_root(abi_stale_frontend_root)
 run_im2p_configure_case(im2p_abi_stale_frontend "${abi_stale_frontend_root}"
     8 8 16 IM2P_SIM FALSE "IM2P frontend args layout mismatch")
+make_extended_poll_stale_simulator_root(extended_poll_stale_simulator_root)
+run_im2p_configure_case(im2p_extended_poll_stale_simulator
+    "${extended_poll_stale_simulator_root}" 8 8 16 IM2P_SIM FALSE
+    "im2p_poll_completed_extended")
 run_arm64_bootstrap_contract()
+run_host_script_dim_contract(build-x86.sh 64)
+run_host_script_dim_contract(build-riscv.sh 16)
 
 foreach(build_script IN ITEMS build-arm64.sh build-x86.sh build-riscv.sh)
     expect_contains("${TEST_SOURCE_DIR}/${build_script}"
         "GGML_GEMMINI_EXECUTION_BACKEND_DEFAULT")
     expect_contains("${TEST_SOURCE_DIR}/${build_script}"
         "GGML_GEMMINI_WEIGHT_BITS_DEFAULT")
+    expect_contains("${TEST_SOURCE_DIR}/${build_script}"
+        "GGML_GEMMINI_DIM_DEFAULT")
 endforeach()
 
 expect_contains("${TEST_SOURCE_DIR}/CMakeLists.txt"

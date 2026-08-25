@@ -185,6 +185,21 @@ extern "C"
         catch (...) { report_cycle_boundary_failure(); }
     }
 
+    void gemmini_log_cycle_record_v2(const gemmini_cycle_record_v2 *record) noexcept
+    {
+        if (!record) return;
+        try
+        {
+            const gemmini_cycle_record & interval = record->interval;
+            ggml::gemmini::log::cycle.write({
+                interval.layer, interval.op, interval.start, interval.end,
+                interval.file, interval.line, interval.func, nullptr, nullptr,
+                record->identity_mask, record->run_id, record->stripe_id,
+                record->slot, record->node_id, record->worker_id});
+        }
+        catch (...) { report_cycle_boundary_failure(); }
+    }
+
     void gemmini_log_cycle(const char *layer, const char *op, uint64_t start, uint64_t end) noexcept
     {
         const gemmini_cycle_record record{layer, op, start, end, nullptr, 0, nullptr};

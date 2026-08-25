@@ -898,10 +898,10 @@ bool test_rmd_cpu_direct_parity() {
     residuals[0 * logical_k + 32] = 65536;
     residuals[0 * logical_k + 64] = 256;
     residuals[1 * logical_k + 15] = -256;
-    residuals[1 * logical_k + 47] = 16777216;
+    residuals[1 * logical_k + 47] = rmd::kSigned21Max;
     residuals[1 * logical_k + 63] = 129;
     residuals[16 * logical_k + 1] = -65536;
-    residuals[16 * logical_k + 33] = 16777217;
+    residuals[16 * logical_k + 33] = rmd::kSigned21Min;
 
     std::vector<int8_t> baseline_activation(rows * logical_k);
     for (size_t row = 0; row < rows; ++row) {
@@ -1754,9 +1754,38 @@ bool profile_output_routing(const std::filesystem::path & expected, bool invalid
     std::ifstream input(expected);
     std::string line;
     const bool parsed = std::getline(input, line) && !line.empty() && line.front() == '{' &&
-        line.back() == '}' && line.find("\"record_type\":\"TIMELINE\"") != std::string::npos;
+        line.back() == '}' &&
+        line.find("\"schema\":\"gemmini.cycle\"") != std::string::npos &&
+        line.find("\"version\":2") != std::string::npos &&
+        line.find("\"record_type\":\"TIMELINE\"") != std::string::npos &&
+        line.find("\"op\":\"exsia.local\"") != std::string::npos &&
+        line.find("\"layer\":null") != std::string::npos &&
+        line.find("\"stripe_id\":0") != std::string::npos &&
+        line.find("\"slot\":0") != std::string::npos &&
+        line.find("\"worker_id\":null") != std::string::npos &&
+        line.find("exsia.timeline.run.") == std::string::npos;
+#if defined(GGML_GEMMINI_HAS_OPENMP) && GGML_GEMMINI_EXSIA_DEFAULT_MODE_VALUE > 0
+    std::array<bool, GGML_GEMMINI_EXSIA_LOCAL_WORKERS> workers{};
+    while (std::getline(input, line)) {
+        if (line.find("\"op\":\"exsia.local_group\"") == std::string::npos ||
+            line.find("\"slot\":0") == std::string::npos) {
+            continue;
+        }
+        for (size_t worker = 0; worker < workers.size(); ++worker) {
+            const std::string worker_id =
+                "\"worker_id\":" + std::to_string(worker);
+            workers[worker] = workers[worker] ||
+                line.find(worker_id) != std::string::npos;
+        }
+    }
+    const bool worker_rows =
+        std::all_of(workers.begin(), workers.end(), [](bool seen) { return seen; });
+#else
+    const bool worker_rows = true;
+#endif
     return check(wrote, "ExSIA profile writer succeeds") &&
         check(parsed, "ExSIA profile writer emits non-empty JSONL") &&
+        check(worker_rows, "ExSIA profile writer identifies every local worker") &&
         check(!std::filesystem::exists("log/exsia-cycle-detail.jsonl"), "ExSIA profile writer does not create legacy log");
 }
 
