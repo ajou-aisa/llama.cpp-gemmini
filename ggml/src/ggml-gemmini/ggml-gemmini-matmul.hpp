@@ -145,7 +145,9 @@ private:
 
     MatMulResult run_dense(bool transactional);
     MatMulStatus run_stripe(MatMulStripe stripe, size_t stripe_id);
-    MatMulStatus run_staged_stripe(MatMulStripe stripe, size_t stripe_id);
+    MatMulStatus run_staged_stripe(
+        MatMulStripe stripe, size_t stripe_id,
+        const quants::act::Meta & activation_metadata);
     MatMulStatus begin_output_transaction();
     void commit_output_transaction();
     void discard_output_transaction();
@@ -333,6 +335,7 @@ private:
         size_t slot = 0;
         size_t row_begin;
         size_t row_end;
+        std::optional<quants::act::exsia::StripeMetadataSnapshot> activation_metadata;
         rmd::StripePacketHandle rmd_packet;
         residual::DirectStripePayloadHandle direct_residual;
         uint64_t la_cycles = 0;
@@ -717,8 +720,6 @@ private:
     size_t last_row_end_ = 0;
     bool has_captures_ = false;
     std::unordered_set<size_t> captured_stripe_ids_;
-    std::unique_ptr<MatMul> staged_facade_;
-    bool staged_metadata_active_ = false;
     bool pipeline_attached_ = false;
 };
 

@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <tuple>
 #include <vector>
 
@@ -338,6 +339,14 @@ namespace ggml::gemmini::quants::act::exsia
         }
     };
 
+    struct StripeMetadataSnapshot
+    {
+        int16_t e_s = std::numeric_limits<int16_t>::min();
+        int16_t rho = 6;
+        int32_t sigma = GGML_GEMMINI_EXSIA_SIGMA;
+        int16_t theta = std::numeric_limits<int16_t>::min();
+    };
+
     struct StripeReadyEvent
     {
         uint64_t run_id = 0;
@@ -345,6 +354,7 @@ namespace ggml::gemmini::quants::act::exsia
         size_t slot = 0;
         size_t row_begin = 0;
         size_t row_end = 0;
+        std::optional<StripeMetadataSnapshot> activation_metadata;
         uint64_t quantization_start = 0;
         uint64_t quantization_end = 0;
         // Residual work for this stripe, or nullptr when the stripe has no residual.

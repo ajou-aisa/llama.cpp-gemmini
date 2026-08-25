@@ -355,6 +355,87 @@ bool test_staged_exsia_host_pipeline_semantic_layer() {
               "all three actual host pipeline summaries keep byte-identical layer");
 }
 
+bool test_staged_exsia_by_value_preserves_producer_metadata() {
+    constexpr size_t stripe_rows = DIM;
+    constexpr size_t rows = 2 * stripe_rows + 1;
+
+    std::vector<float> activations(rows);
+    for (size_t row = 0; row < rows; ++row) {
+        activations[row] = row < stripe_rows ? 1.0f
+            : row < 2 * stripe_rows ? 2.0f : 4.0f;
+    }
+    ggml_tensor activation{};
+    activation.type = GGML_TYPE_F32;
+    activation.data = activations.data();
+
+    std::vector<elem_t> weights = {elem_t{1}};
+    std::vector<float> staged_output(rows, 0.0f);
+    ggml_gemmini_args_t args{};
+    args.I = rows;
+    args.J = 1;
+    args.K = 1;
+    args.sA = 1;
+    args.sB = 1;
+    args.B = weights.data();
+    args.f_out = staged_output.data();
+    args.col_stride_f_out = 1;
+    args.stride_f_out = 1;
+    args.tiled_matmul_type = CPU;
+    args.tile_I = 1;
+    args.tile_J = 1;
+    args.tile_K = 1;
+    args.activation_rows_per_stripe = stripe_rows;
+    args.residual_route = residual::ResidualRoute::cpu_direct;
+    args.weight_i8_scale_active = true;
+    args.weight_scale = 1.0f;
+    if (!args.A.allocate(rows, 1, 8)) {
+        return check(false, "staged metadata activation storage allocates");
+    }
+    args.act_quant.storage().emplace<quants::act::exsia::Meta>();
+
+    ResolvedMatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_pipeline;
+    options.job_capacity = 3;
+    options.rmd_backend = RmdBackend::cpu_direct;
+    auto execution = prepare_execution(
+        static_cast<const ggml_gemmini_args_t &>(args), options);
+    MatmulStripeCollector collector(3);
+    if (!check(execution.status().ok() && collector.start(execution),
+               "by-value staged metadata pipeline starts")) {
+        return false;
+    }
+
+    ggml_gemmini_args_t producer_args = args;
+    auto & producer_meta = std::get<quants::act::exsia::Meta>(
+        producer_args.act_quant.storage());
+    quants::act::exsia::ExSIA exsia;
+    exsia.set_execution_mode(
+        quants::act::exsia::ExSIAState::ExecutionMode::Sequential);
+    const bool quantized =
+        exsia.run(producer_meta, &activation, producer_args, collector.sink());
+    const MatmulStatus collected = collector.finish();
+    const MatmulStatus completed = finish_execution(execution);
+
+    std::vector<float> full_output(rows, 0.0f);
+    ggml_gemmini_args_t full_args = producer_args;
+    full_args.f_out = full_output.data();
+    MatMul full_facade(std::move(full_args));
+    const MatMulResult full = full_facade.run_full();
+
+    return check(quantized &&
+                     producer_meta.theta ==
+                         std::vector<int16_t>({-6, -5, -4}),
+                 "producer publishes three distinct stripe theta values") &&
+        check(collected.ok() && completed.ok(),
+              "staged metadata pipeline completes") &&
+        check(full.status == MatMulStatus::success,
+              "FULL metadata reference completes") &&
+        check(full_output == activations,
+              "FULL produces exact power-of-two reference values") &&
+        check(staged_output == full_output,
+              "by-value staged output matches FULL producer metadata");
+}
+
 bool test_non_exsia_pipeline_rejection() {
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
@@ -761,6 +842,11 @@ bool test_disabled_mode_status_contract() {
 }
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--staged-exsia-pipeline") == 0) {
+        const bool passed = test_staged_exsia_host_pipeline_semantic_layer() &&
+            test_staged_exsia_by_value_preserves_producer_metadata();
+        return passed ? 0 : 1;
+    }
     if (argc == 3 && std::strcmp(argv[1], "--semantic-layer-wrong-constant") == 0) {
         char * end = nullptr;
         const long site = std::strtol(argv[2], &end, 10);
@@ -794,6 +880,7 @@ int main(int argc, char ** argv) {
     }
     const bool ok = test_checked_geometry_contract() &&
         test_staged_exsia_host_pipeline_semantic_layer() &&
+        test_staged_exsia_by_value_preserves_producer_metadata() &&
         test_owned_matmul_layer_lifetime() &&
         test_non_exsia_pipeline_rejection() &&
         test_owned_route_object_lifetimes() &&

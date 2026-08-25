@@ -598,11 +598,16 @@ MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe, size_
         gemmini_set_tile_ws(&args);
     }
     const size_t metadata_tile_I = args.tile_I;
-    if (stripe.row_begin > std::numeric_limits<size_t>::max() - args.activation_row_offset) {
+    if (!metadata_is_local &&
+        stripe.row_begin > std::numeric_limits<size_t>::max() - args.activation_row_offset) {
         return MatMulStatus::invalid_arguments;
     }
     auto original_A = args.A;
-    args.activation_row_offset += stripe.row_begin;
+    if (metadata_is_local) {
+        args.activation_row_offset = 0;
+    } else {
+        args.activation_row_offset += stripe.row_begin;
+    }
 
     args.I = stripe.row_end - stripe.row_begin;
     gemmini_set_tile_ws(&args);
@@ -616,7 +621,6 @@ MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe, size_
     args.f_out += output_offset;
 
     (void) stripe_id;
-    (void) metadata_is_local;
 
     execute_dense(args);
     return MatMulStatus::success;
@@ -1329,7 +1333,9 @@ MatMulStatus MatMul::run_stripe(MatMulStripe stripe, size_t stripe_id) {
     return status;
 }
 
-MatMulStatus MatMul::run_staged_stripe(MatMulStripe stripe, size_t stripe_id) {
+MatMulStatus MatMul::run_staged_stripe(
+        MatMulStripe stripe, size_t stripe_id,
+        const quants::act::Meta & activation_metadata) {
     if (state_ != MatMulState::accepting_stripes) {
         return MatMulStatus::invalid_state;
     }
@@ -1337,7 +1343,10 @@ MatMulStatus MatMul::run_staged_stripe(MatMulStripe stripe, size_t stripe_id) {
         discard_output_transaction();
         return MatMulStatus::malformed_stripe;
     }
-    const MatMulStatus status = execute_stripe(args(), stripe, stripe_id, true);
+    ggml_gemmini_args_t staged_args = args();
+    staged_args.act_quant = activation_metadata;
+    const MatMulStatus status =
+        execute_stripe(std::move(staged_args), stripe, stripe_id, true);
     if (status == MatMulStatus::success) {
         if (!has_stripes_) {
             first_row_ = stripe.row_begin;
@@ -1446,12 +1455,6 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t args, MatmulOptions options
         state_ = MatmulExecutionState::failed;
         return;
     }
-    if (options_.mode == MatmulInvocationMode::stripe_pipeline) {
-        ggml_gemmini_args_t staged_args = facade_.args();
-        staged_args.act_quant.reset();
-        test_detail::observe_allocation_attempt();
-        staged_facade_ = std::make_unique<MatMul>(std::move(staged_args));
-    }
     if (options_.dense_threads > 1) {
         status_ = make_status(MatmulStatusCode::unsupported_invocation,
                               "dense stripe execution has one owner lane");
@@ -1525,12 +1528,6 @@ MatmulExecution::MatmulExecution(ggml_gemmini_args_t * args, MatmulOptions optio
         state_ = MatmulExecutionState::failed;
         return;
     }
-    if (options_.mode == MatmulInvocationMode::stripe_pipeline) {
-        ggml_gemmini_args_t staged_args = *args;
-        staged_args.act_quant.reset();
-        test_detail::observe_allocation_attempt();
-        staged_facade_ = std::make_unique<MatMul>(std::move(staged_args));
-    }
     if (options_.dense_threads > 1) {
         status_ = make_status(MatmulStatusCode::unsupported_invocation,
                               "dense stripe execution has one owner lane");
@@ -1585,8 +1582,6 @@ MatmulExecution & MatmulExecution::operator=(MatmulExecution && other) noexcept 
     last_row_end_ = other.last_row_end_;
     has_captures_ = other.has_captures_;
     captured_stripe_ids_ = std::move(other.captured_stripe_ids_);
-    staged_facade_ = std::move(other.staged_facade_);
-    staged_metadata_active_ = other.staged_metadata_active_;
     pipeline_attached_ = other.pipeline_attached_;
     other.total_rows_ = 0;
     other.active_jobs_ = 0;
@@ -1596,7 +1591,6 @@ MatmulExecution & MatmulExecution::operator=(MatmulExecution && other) noexcept 
     other.last_row_begin_ = 0;
     other.last_row_end_ = 0;
     other.has_captures_ = false;
-    other.staged_metadata_active_ = false;
     other.pipeline_attached_ = false;
     return *this;
 }
@@ -1935,6 +1929,16 @@ void MatmulStripeCollector::worker_loop() {
                     *execution,
                     MatmulStripeInput(captured.row_begin, captured.row_end, captured.stripe_id),
                     std::move(captured.direct_residual), std::move(captured.rmd_packet)));
+                if (job->status().ok() && captured.activation_metadata.has_value()) {
+                    job->staged_activation_meta_ =
+                        std::make_unique<quants::act::Meta>();
+                    auto & local = job->staged_activation_meta_->storage()
+                        .emplace<quants::act::exsia::Meta>();
+                    local.e_s = captured.activation_metadata->e_s;
+                    local.rho = captured.activation_metadata->rho;
+                    local.sigma = captured.activation_metadata->sigma;
+                    local.theta = {captured.activation_metadata->theta};
+                }
             } catch (const std::exception &) {
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
@@ -2135,7 +2139,9 @@ MatmulDenseState MatmulStripeCollector::test_dense_state_at_release() const {
 bool MatmulStripeCollector::on_ready(
         void * user_data, const quants::act::exsia::StripeReadyEvent & event) {
     auto & collector = *static_cast<MatmulStripeCollector *>(user_data);
-    if (event.row_begin >= event.row_end) {
+    if (event.row_begin >= event.row_end ||
+        (event.activation_metadata.has_value() &&
+         event.activation_metadata->theta == std::numeric_limits<int16_t>::min())) {
         {
             std::lock_guard<std::mutex> lock(collector.mutex_);
             collector.status_ = make_status(MatmulStatusCode::invalid_argument, "invalid stripe event");
@@ -2154,6 +2160,7 @@ bool MatmulStripeCollector::on_ready(
         captured.slot = event.slot;
         captured.row_begin = event.row_begin;
         captured.row_end = event.row_end;
+        captured.activation_metadata = event.activation_metadata;
         // Shared handle only: the packet owns its buffers, so it outlives the ExSIA slot.
         captured.rmd_packet = event.rmd_packet;
         captured.direct_residual = event.direct_residual;
@@ -2551,6 +2558,7 @@ MatmulStatus capture_stripe(MatmulExecution & execution, const MatmulStripeInput
 }
 
 MatmulStatus execute_dense_stripe(MatmulStripeJob & job) {
+    const quants::act::Meta * staged_activation_meta = nullptr;
     {
         std::lock_guard<std::mutex> lock(*job.job_mutex_);
         if (job.execution_ == nullptr || !job.captured_ || job.finalized_ ||
@@ -2558,13 +2566,19 @@ MatmulStatus execute_dense_stripe(MatmulStripeJob & job) {
             return invalid_state("dense execution requires captured Dense idle state");
         }
         job.dense_state_ = MatmulDenseState::running;
+        staged_activation_meta = job.staged_activation_meta_.get();
     }
     const auto start = Clock::now();
 #if CYCLE_DETAIL
     job.metrics_.telemetry_dense_start = cycle::read();
 #endif
-    const MatMulStatus status = job.execution_->facade_.run_stripe(
-        { job.input_.row_begin(), job.input_.row_end() }, job.input_.stripe_id());
+    const MatMulStatus status = staged_activation_meta != nullptr
+        ? job.execution_->facade_.run_staged_stripe(
+              {job.input_.row_begin(), job.input_.row_end()},
+              job.input_.stripe_id(), *staged_activation_meta)
+        : job.execution_->facade_.run_stripe(
+              {job.input_.row_begin(), job.input_.row_end()},
+              job.input_.stripe_id());
     const MatmulStatus dense_status = to_public_status(
         status, status == MatMulStatus::unsupported ? MatMulCapability::unsupported : MatMulCapability::supported,
         &job.execution_->facade_.args());
@@ -2871,9 +2885,7 @@ MatmulStatus finish_execution(MatmulExecution & execution) {
         execution.state_ = MatmulExecutionState::failed;
         return invalid_contract("missing stripes");
     }
-    MatMul * dense_facade = execution.staged_metadata_active_ && execution.staged_facade_ != nullptr ?
-        execution.staged_facade_.get() : &execution.facade_;
-    const MatMulStatus status = dense_facade->finish_stripes();
+    const MatMulStatus status = execution.facade_.finish_stripes();
     execution.status_ = to_public_status(status, MatMulCapability::supported);
     execution.state_ = execution.status_.ok() ? MatmulExecutionState::completed : MatmulExecutionState::failed;
     return execution.status_;

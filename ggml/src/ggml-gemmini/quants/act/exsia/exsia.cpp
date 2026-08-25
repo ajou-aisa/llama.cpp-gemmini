@@ -1698,6 +1698,12 @@ namespace ggml::gemmini::quants::act::exsia
             event.slot = slot.stripe_idx % EXSIA_PIPELINE_SLOT_COUNT;
             event.row_begin = slot.row_start;
             event.row_end = slot.row_end;
+            const int16_t theta =
+                meta.resolve_stripe_theta(static_cast<int>(slot.stripe_idx));
+            if (theta == std::numeric_limits<int16_t>::min())
+                return false;
+            event.activation_metadata =
+                StripeMetadataSnapshot{meta.e_s, meta.rho, meta.sigma, theta};
             event.quantization_start = slot.quantization_start;
             event.quantization_end = slot.quantization_end;
             event.rmd_packet = slot.rmd_packet;
