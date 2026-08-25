@@ -256,6 +256,8 @@ static void llama_tensor_dequantize_impl(
 
 static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_type, const ggml_tensor * tensor, llama_ftype ftype) {
     const std::string name = ggml_get_name(tensor);
+    const bool gemmini_q4 =
+        ftype == LLAMA_FTYPE_MOSTLY_Q4_H1 || ftype == LLAMA_FTYPE_MOSTLY_Q4_HP1;
 
     // TODO: avoid hardcoded tensor names - use the TN_* constants
     const llm_arch arch = qs.model.arch;
@@ -286,6 +288,8 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
     if (name == tn(LLM_TENSOR_OUTPUT, "weight") || (!qs.has_output && name == tn(LLM_TENSOR_TOKEN_EMBD, "weight"))) {
         if (qs.params->output_tensor_type < GGML_TYPE_COUNT) {
             new_type = qs.params->output_tensor_type;
+        } else if (gemmini_q4) {
+            new_type = GGML_TYPE_F16;
         } else {
             const int64_t nx = tensor->ne[0];
             const int64_t qk_k = ggml_blck_size(new_type);
@@ -308,6 +312,8 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
     } else if (name == "token_embd.weight") {
         if (qs.params->token_embedding_type < GGML_TYPE_COUNT) {
             new_type = qs.params->token_embedding_type;
+        } else if (gemmini_q4) {
+            new_type = GGML_TYPE_F16;
         } else {
             if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS ||
                 ftype == LLAMA_FTYPE_MOSTLY_IQ1_S   || ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {

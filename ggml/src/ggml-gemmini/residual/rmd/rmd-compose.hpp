@@ -52,6 +52,13 @@ RmdStatus apply_rmd_packet_ws(const ggml_gemmini_args_t & args, const StripePack
 // Rebuilds the dense INT32 residual plane carried by valid width-native stripe packets.
 // Only the activation dequantizers (validation / FLOAT parity) need this; the
 // compensation path never materialises a residual plane. Publication is transactional.
+RmdStatus expand_packets_to_plane(
+    const std::vector<StripePacketHandle> & packets,
+    size_t global_row_begin,
+    size_t global_row_end,
+    size_t col_count,
+    std::vector<int32_t> & plane);
+
 void expand_packets_to_plane(const std::vector<StripePacketHandle> & packets,
                              size_t row_count,
                              size_t col_count,

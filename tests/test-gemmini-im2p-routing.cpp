@@ -619,6 +619,24 @@ bool run_exsia_publication_boundary() {
   trace.quantization_complete = true;
   ggml_free(context);
 
+#if GGML_GEMMINI_ENABLE_RMD
+  const bool residual_handle_contract = std::all_of(
+      trace.events.begin(), trace.events.begin() + trace.event_count,
+      [](const StripeReadyEvent &event) {
+        return event.rmd_packet || event.direct_residual;
+      });
+  const char *residual_handle_message =
+      "residual sealing precedes each publication callback";
+#else
+  const bool residual_handle_contract = std::all_of(
+      trace.events.begin(), trace.events.begin() + trace.event_count,
+      [](const StripeReadyEvent &event) {
+        return !event.rmd_packet && !event.direct_residual;
+      });
+  const char *residual_handle_message =
+      "RMD-disabled publication carries no residual handles";
+#endif
+
   return check(quantized, "three-stripe ExSIA quantization succeeds") &&
          check(trace.event_count == 3,
                "one callback is emitted for each sealed stripe") &&
@@ -627,8 +645,7 @@ bool run_exsia_publication_boundary() {
          check(trace.committed_prefix_exact && trace.next_theta_uncommitted &&
                    trace.nonzero_order_checks == 2,
                "each callback observes only its committed theta prefix and an uncommitted next stripe") &&
-         check(trace.events[0].rmd_packet || trace.events[0].direct_residual,
-               "packet sealing precedes the publication callback") &&
+         check(residual_handle_contract, residual_handle_message) &&
 #if LOG_CYCLE
          check(trace.events[0].folding_commit_ns != 0 &&
                    trace.events[0].folding_commit_ns <= trace.events[1].folding_commit_ns &&
@@ -894,6 +911,33 @@ IntegratedLifecycleResult run_integrated_exsia_lifecycle(
   ggml_free(context);
   return result;
 }
+
+#if !GGML_GEMMINI_ENABLE_RMD
+bool run_rmd_disabled_adapter_dense_only() {
+  const size_t rows = GGML_GEMMINI_TEST_IM2P_DIM + 1;
+  const auto full = run_integrated_exsia_lifecycle(
+      rows, 1, LifecycleFamily::hp1, LifecycleBackend::cpu_direct,
+      PublicMode::full);
+  const auto pipeline = run_integrated_exsia_lifecycle(
+      rows, 1, LifecycleFamily::hp1, LifecycleBackend::cpu_direct,
+      PublicMode::stripe_pipeline);
+  const auto no_residual_work = [](const IntegratedLifecycleResult &result) {
+    return result.counters.residual_executions == 0 &&
+        result.counters.compositions == 0 &&
+        result.counters.rmd_calls == 0 &&
+        result.counters.rmd_events == 0 &&
+        result.counters.rmd_packets == 0;
+  };
+  return check(full.ok && pipeline.ok,
+               "RMD-disabled FULL/PIPELINE adapter executions succeed") &&
+      check(full.output == pipeline.output,
+            "RMD-disabled FULL/PIPELINE outputs remain dense-only and equal") &&
+      check(no_residual_work(full) && no_residual_work(pipeline),
+            "RMD-disabled adapters report zero residual work") &&
+      check(full.counters.commit == 1 && pipeline.counters.commit == 1,
+            "RMD-disabled adapters commit dense output exactly once");
+}
+#endif
 
 bool run_simple_runtime_args_observer_contract() {
   const std::string semantic_layer =
@@ -2430,8 +2474,7 @@ int main(int argc, char **argv) {
   ok = run_exsia_prestart_rejection(false) && ok;
 #endif
 #else
-  // Matched A4/Q4 and A16/Q16 are capability-selected here; their residual
-  // arithmetic is exercised by the width-independent direct/compact oracle.
+  ok = run_rmd_disabled_adapter_dense_only() && ok;
 #endif
   unsetenv("GEMMINI_MATMUL_MODE");
   unsetenv("GEMMINI_RMD_BACKEND");

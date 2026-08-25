@@ -2,10 +2,11 @@
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
 
-#include <gemmini.h>
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
+#include "../ggml/src/ggml-gemmini/ggml-gemmini-matmul.hpp"
 #include "../ggml/src/ggml-gemmini/quants/act/quantize.hpp"
 #include "../ggml/src/ggml-quants.h"
+#include <gemmini.h>
 
 #include <algorithm>
 #include <cmath>
@@ -18,9 +19,28 @@ namespace {
 
 constexpr int64_t K = 64;
 constexpr int64_t J = 2;
-constexpr int64_t I = 1;
+constexpr int64_t I = 2;
 constexpr float TOLERANCE = 1e-5f;
-static_assert(K % QK8_0 == 0 && K % QK8_H2 == 0);
+
+#if GGML_GEMMINI_WEIGHT_BITS == 4
+constexpr ggml_type H0_TYPE = GGML_TYPE_Q4_0;
+constexpr ggml_type H1_TYPE = GGML_TYPE_Q4_H1;
+constexpr int64_t H1_BLOCK_SIZE = QK4_0;
+#elif GGML_GEMMINI_WEIGHT_BITS == 8
+constexpr ggml_type H1_TYPE = GGML_TYPE_Q8_H1;
+constexpr ggml_type H2_TYPE = GGML_TYPE_Q8_H2;
+constexpr int64_t H1_BLOCK_SIZE = QK8_0;
+#elif GGML_GEMMINI_WEIGHT_BITS == 16
+constexpr ggml_type H1_TYPE = GGML_TYPE_Q16_H1;
+constexpr int64_t H1_BLOCK_SIZE = QK16_0;
+#else
+#error "Unsupported Gemmini weight width"
+#endif
+
+static_assert(K % H1_BLOCK_SIZE == 0);
+#if GGML_GEMMINI_WEIGHT_BITS == 8
+static_assert(K % QK8_H2 == 0);
+#endif
 
 enum class malformed_case {
     shape,
@@ -57,8 +77,11 @@ std::vector<float> make_weights() {
 
 std::vector<float> make_activations() {
     std::vector<float> values(I * K);
-    for (int64_t k = 0; k < K; ++k) {
-        values[k] = (k % 4 == 0) ? -0.5f : 0.5f;
+    for (int64_t i = 0; i < I; ++i) {
+        for (int64_t k = 0; k < K; ++k) {
+            values[i * K + k] =
+                ((i + k) % 4 == 0) ? -0.5f : 0.5f;
+        }
     }
     return values;
 }
@@ -66,10 +89,23 @@ std::vector<float> make_activations() {
 std::vector<uint8_t> quantize_weights(ggml_type type, const std::vector<float> & values) {
     std::vector<uint8_t> encoded(J * ggml_row_size(type, K));
     size_t written = 0;
-    if (type == GGML_TYPE_Q8_H1) {
+#if GGML_GEMMINI_WEIGHT_BITS == 4
+    if (type == H0_TYPE) {
+        written = quantize_q4_0(values.data(), encoded.data(), J, K, nullptr);
+    } else
+#endif
+    if (type == H1_TYPE) {
+#if GGML_GEMMINI_WEIGHT_BITS == 4
+        written = quantize_q4_h1(values.data(), encoded.data(), J, K, nullptr);
+#elif GGML_GEMMINI_WEIGHT_BITS == 8
         written = quantize_q8_h1(values.data(), encoded.data(), J, K, nullptr);
+#else
+        written = quantize_q16_h1(values.data(), encoded.data(), J, K, nullptr);
+#endif
+#if GGML_GEMMINI_WEIGHT_BITS == 8
     } else {
         written = quantize_q8_h2(values.data(), encoded.data(), J, K, nullptr);
+#endif
     }
 
     if (written != encoded.size()) {
@@ -84,16 +120,38 @@ std::vector<float> scalar_dequantize_weights(ggml_type type, const std::vector<u
     const size_t row_size = ggml_row_size(type, K);
     for (int64_t row = 0; row < J; ++row) {
         const uint8_t * row_data = encoded.data() + row * row_size;
-        if (type == GGML_TYPE_Q8_H1) {
+#if GGML_GEMMINI_WEIGHT_BITS == 4
+        if (type == H0_TYPE) {
+            dequantize_row_q4_0(
+                reinterpret_cast<const block_q4_0 *>(row_data),
+                decoded.data() + row * K,
+                K);
+        } else
+#endif
+        if (type == H1_TYPE) {
+#if GGML_GEMMINI_WEIGHT_BITS == 4
+            dequantize_row_q4_h1(
+                reinterpret_cast<const block_q4_h1 *>(row_data),
+                decoded.data() + row * K,
+                K);
+#elif GGML_GEMMINI_WEIGHT_BITS == 8
             dequantize_row_q8_h1(
                 reinterpret_cast<const block_q8_h1 *>(row_data),
                 decoded.data() + row * K,
                 K);
+#else
+            dequantize_row_q16_h1(
+                reinterpret_cast<const block_q16_h1 *>(row_data),
+                decoded.data() + row * K,
+                K);
+#endif
+#if GGML_GEMMINI_WEIGHT_BITS == 8
         } else {
             dequantize_row_q8_h2(
                 reinterpret_cast<const block_q8_h2 *>(row_data),
                 decoded.data() + row * K,
                 K);
+#endif
         }
     }
     return decoded;
@@ -105,7 +163,7 @@ bool dequantize_activations(const ggml_tensor * activation, std::vector<float> &
     args.I = I;
     args.J = J;
     args.K = K;
-    args.A.allocate(I, K, 8);
+    args.A.allocate(I, K, GGML_GEMMINI_ACTIVATION_BITS);
     args.sA = K;
     if (!ggml::gemmini::quants::quantize_activation(activation, args)) {
         return false;
@@ -263,7 +321,11 @@ bool run_malformed_case(ggml_backend_t backend, ggml_type type, malformed_case k
 
 bool run_malformed_cases(ggml_backend_t backend) {
     bool ok = true;
-    for (ggml_type type : { GGML_TYPE_Q8_H1, GGML_TYPE_Q8_H2 }) {
+#if GGML_GEMMINI_WEIGHT_BITS == 8
+    for (ggml_type type : { H1_TYPE, H2_TYPE }) {
+#else
+    for (ggml_type type : { H1_TYPE }) {
+#endif
         for (malformed_case kind : {
                  malformed_case::shape,
                  malformed_case::stride,
@@ -279,9 +341,42 @@ bool run_malformed_cases(ggml_backend_t backend) {
 }
 
 int main(int argc, char ** argv) {
-    if (argc > 2 || (argc == 2 && std::string_view(argv[1]) != "--malformed")) {
-        std::fprintf(stderr, "usage: %s [--malformed]\n", argv[0]);
+    const std::string_view selection = argc == 2 ? argv[1] : "";
+    if (argc > 2 ||
+        (argc == 2 && selection != "--malformed" &&
+         selection != "--h1" && selection != "--h1-full" &&
+         selection != "--h1-pipeline")) {
+        std::fprintf(
+            stderr,
+            "usage: %s [--malformed|--h1|--h1-full|--h1-pipeline]\n",
+            argv[0]);
         return 2;
+    }
+
+    if (selection == "--h1-full") {
+        const auto resolution =
+            ggml::gemmini::resolve_matmul_options();
+        if (!resolution.ok() ||
+            resolution.options.mode !=
+                ggml::gemmini::MatmulInvocationMode::full) {
+            std::fputs(
+                "dequant test did not resolve FULL\n",
+                stderr);
+            return 1;
+        }
+    }
+
+    if (selection == "--h1-pipeline") {
+        const auto resolution =
+            ggml::gemmini::resolve_matmul_options();
+        if (!resolution.ok() ||
+            resolution.options.mode !=
+                ggml::gemmini::MatmulInvocationMode::stripe_pipeline) {
+            std::fputs(
+                "deferred dequant test did not resolve STRIPE_PIPELINE\n",
+                stderr);
+            return 1;
+        }
     }
 
     ggml_backend_load_all();
@@ -291,13 +386,23 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
-    const bool ok = argc == 2
+    const bool ok = selection == "--malformed"
         ? run_malformed_cases(backend)
-        : [&]() {
-            const bool h1_ok = run_valid_case(backend, GGML_TYPE_Q8_H1);
+        : selection == "--h1" || selection == "--h1-full" ||
+          selection == "--h1-pipeline"
+            ? run_valid_case(backend, H1_TYPE)
+            : [&]() {
+            const bool h1_ok = run_valid_case(backend, H1_TYPE);
+#if GGML_GEMMINI_WEIGHT_BITS == 4
+            const bool h0_ok = run_valid_case(backend, H0_TYPE);
+            return h0_ok && h1_ok;
+#elif GGML_GEMMINI_WEIGHT_BITS == 8
             const bool h2_ok = run_valid_case(backend, GGML_TYPE_Q8_H2);
             return h1_ok && h2_ok;
-        }();
+#else
+            return h1_ok;
+#endif
+          }();
 
     ggml_backend_free(backend);
     return ok ? 0 : 1;

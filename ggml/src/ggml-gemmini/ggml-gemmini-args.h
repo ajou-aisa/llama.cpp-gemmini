@@ -134,15 +134,18 @@ struct QuantizedActivationBuffer {
       return offset <= bytes->size() ? bytes->size() - offset : 0;
     }
 
-    // Backward-compatible conversion for 8bit hardware path.
-    // Only valid when bits == 8; returns nullptr otherwise.
+    // Raw transport conversion accepts the configured width and legacy one-byte tests.
     operator elem_t*() {
-      return bits == 8
+      return (bits == GGML_GEMMINI_ACTIVATION_BITS ||
+              (bits == 8 && sizeof(elem_t) == 1))
                  ? reinterpret_cast<elem_t *>(const_cast<uint8_t *>(raw_data()))
                  : nullptr;
     }
     operator const elem_t*() const {
-      return bits == 8 ? reinterpret_cast<const elem_t *>(raw_data()) : nullptr;
+      return (bits == GGML_GEMMINI_ACTIVATION_BITS ||
+              (bits == 8 && sizeof(elem_t) == 1))
+                 ? reinterpret_cast<const elem_t *>(raw_data())
+                 : nullptr;
     }
 };
 

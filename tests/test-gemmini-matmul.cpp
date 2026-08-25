@@ -4,11 +4,16 @@
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-matmul.hpp"
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.hpp"
 
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
 #include <limits>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -129,6 +134,10 @@ bool test_output_parity() {
     auto execution = prepare_execution(&pipeline_args, pipeline_options);
     MatmulStripeCollector collector(2);
     if (!expect(execution.status().ok() && collector.start(execution), "pipeline starts")) {
+        std::fprintf(
+            stderr, "pipeline status=%u message=%s\n",
+            static_cast<unsigned>(execution.status().code),
+            execution.status().message);
         return false;
     }
     const auto * sink = collector.sink();
@@ -247,9 +256,15 @@ bool test_counter_hooks_connected() {
     const MatmulStatus hardware_status = matmul(hardware_args, options);
     const MatmulTestCounters hardware = test_matmul_counters();
 
+    const bool residual_counter_ok =
+#if GGML_GEMMINI_ENABLE_RMD
+        fallback.residual_dispatches > 0;
+#else
+        fallback.residual_dispatches == 0;
+#endif
     return expect(fallback_status.ok(), "counter fallback control succeeds") &&
         expect(fallback.execution_constructions > 0 && fallback.allocation_attempts > 0 &&
-                   fallback.dense_dispatches > 0 && fallback.residual_dispatches > 0 &&
+                   fallback.dense_dispatches > 0 && residual_counter_ok &&
                    fallback.fallback_dispatches > 0,
                "construction/allocation/dense/residual/fallback hooks observe real work") &&
         expect(hardware_status.ok() && hardware.dense_dispatches > 0 &&
@@ -301,6 +316,76 @@ bool test_cpu_direct_lifecycle_parity() {
         expect(full_args.tiled_matmul_type == main_route &&
                    pipeline_args.tiled_matmul_type == main_route,
                "backend selector preserves the main matmul route");
+}
+
+bool test_rmd_disabled_pipeline_skips_correction() {
+#if !GGML_GEMMINI_ENABLE_RMD
+    std::vector<elem_t> activation = {1, 2, 3, 4, 5, 6};
+    std::vector<elem_t> weights = {1, -1, 2, 3};
+    std::vector<float> output(6, 0.0f);
+    auto args = make_args(activation, weights, output);
+
+    MatmulOptions options{};
+    std::vector<float> dense_output(6, 0.0f);
+    auto dense_args = make_args(activation, weights, dense_output);
+    options.mode = MatmulInvocationMode::full;
+    options.rmd_backend = RmdBackend::cpu_direct;
+    const MatmulStatus dense_status = matmul(dense_args, options);
+
+    options.mode = MatmulInvocationMode::stripe_pipeline;
+    options.rmd_backend = RmdBackend::cpu_direct;
+    options.job_capacity = 2;
+    auto execution = prepare_execution(&args, options);
+    MatmulStripeCollector collector(2);
+    if (!expect(execution.status().ok() && collector.start(execution),
+                "RMD-disabled pipeline starts")) {
+        return false;
+    }
+
+    quants::act::exsia::StripeReadyEvent first{};
+    first.stripe_id = 0;
+    first.row_end = 1;
+    first.direct_residual = make_direct_payload(0, 0, 1, 256);
+    quants::act::exsia::StripeReadyEvent second{};
+    second.stripe_id = 1;
+    second.slot = 1;
+    second.row_begin = 1;
+    second.row_end = 3;
+    second.direct_residual = make_direct_payload(1, 1, 2, -128);
+
+    test_reset_matmul_counters();
+    const auto * sink = collector.sink();
+    const bool accepted =
+        sink->on_ready(sink->user_data, first) &&
+        sink->on_ready(sink->user_data, second);
+    const MatmulStatus collected = collector.finish();
+    const MatmulStatus pipeline = finish_execution(execution);
+    const MatmulTestCounters counters = test_matmul_counters();
+    return expect(dense_status.ok() && accepted && collected.ok() && pipeline.ok(),
+                  "RMD-disabled pipeline completes") &&
+        expect(output == dense_output,
+               "RMD-disabled pipeline preserves dense-only output") &&
+        expect(counters.residual_dispatches == 0,
+               "RMD-disabled pipeline dispatches no residual work");
+#else
+    return true;
+#endif
+}
+
+bool test_dense_rejects_residual_metadata() {
+    std::vector<elem_t> activation = {1, 2, 3, 4, 5, 6};
+    std::vector<elem_t> weights = {1, -1, 2, 3};
+    std::vector<float> output(6, -23.0f);
+    auto args = make_args(activation, weights, output);
+    install_direct_payloads(args);
+    MatMul facade(&args);
+    const MatMulResult result = facade.run_dense();
+    return expect(
+        result.status == MatMulStatus::invalid_contract,
+        "public dense execution rejects uncompensated residual metadata") &&
+        expect(
+            output == std::vector<float>(6, -23.0f),
+            "rejected dense execution preserves destination");
 }
 
 bool test_correction_domain_composition() {
@@ -565,6 +650,16 @@ bool test_output_transaction_strides_overflow_and_cancel() {
                "cancelled transaction restores destination ownership byte-identically") && ok;
 }
 
+bool test_rmd_failure_atomicity_suite() {
+#if GGML_GEMMINI_ENABLE_RMD
+    return test_cpu_direct_failure_commits_no_partial_correction() &&
+        test_stripe_residual_failure_is_transaction_atomic() &&
+        test_output_transaction_strides_overflow_and_cancel();
+#else
+    return true;
+#endif
+}
+
 bool test_ws_preflight_is_atomic_on_host() {
 #if defined(__riscv)
     return true;
@@ -662,6 +757,444 @@ bool test_cancel_and_failure() {
                "startup failure propagates");
 }
 
+bool test_dense_no_output_is_failure() {
+#if GGML_GEMMINI_ACTIVATION_BITS == 8 && GGML_GEMMINI_WEIGHT_BITS == 8
+    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
+    std::vector<elem_t> weights = { 1, -1, 2, 3 };
+    std::vector<float> output(6, 83.0f);
+    const std::vector<float> before = output;
+    auto args = make_args(activation, weights, output);
+    args.B = nullptr;
+    args.weight_i8_scale_active = false;
+    args.weight_format =
+        ggml_gemmini_args_t::im2p_weight_format_t::q8_h0;
+
+    MatMul facade(args);
+    const MatMulResult result = facade.run_full();
+    return expect(result.status != MatMulStatus::success,
+                  "dense no-output path reports failure") &&
+        expect(output == before,
+               "dense no-output path preserves destination transaction");
+#else
+    return true;
+#endif
+}
+
+float float_from_bits(uint32_t bits) {
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+bool test_nonfinite_output_is_atomic() {
+    const std::array<uint32_t, 4> nonfinite = {
+        UINT32_C(0x7f800000),
+        UINT32_C(0xff800000),
+        UINT32_C(0x7fc00000),
+        UINT32_C(0x7f800001),
+    };
+    bool ok = true;
+    for (const uint32_t bits : nonfinite) {
+        const float activation = float_from_bits(bits);
+        const float weight = 1.0f;
+        float output = 89.0f;
+        ggml_gemmini_args_t args{};
+        args.I = 1;
+        args.J = 1;
+        args.K = 1;
+        args.A_fp32 = &activation;
+        args.B_fp32 = &weight;
+        args.f_out = &output;
+        args.sA = 1;
+        args.sB = 1;
+        args.tiled_matmul_type = static_cast<tiled_matmul_type_t>(2);
+
+        MatMul facade(args);
+        const MatMulResult result = facade.run_full();
+        if (result.status != MatMulStatus::invalid_contract || output != 89.0f) {
+            uint32_t output_bits = 0;
+            std::memcpy(&output_bits, &output, sizeof(output_bits));
+            std::fprintf(stderr,
+                         "finite-output input_bits=0x%08x status=%u output_bits=0x%08x\n",
+                         bits, static_cast<unsigned>(result.status), output_bits);
+        }
+        ok = expect(result.status == MatMulStatus::invalid_contract,
+                    "nonfinite dense output has typed rejection") && ok;
+        ok = expect(output == 89.0f,
+                    "nonfinite dense output preserves destination transaction") && ok;
+    }
+    return ok;
+}
+
+bool test_native_q4_hp1_cpu_dense_output() {
+#if GGML_GEMMINI_ACTIVATION_BITS == 4 && GGML_GEMMINI_WEIGHT_BITS == 4
+    ggml_gemmini_args_t args{};
+    args.I = 3;
+    args.J = 2;
+    args.K = 32;
+    args.sA = args.K;
+    args.tiled_matmul_type = static_cast<tiled_matmul_type_t>(2);
+    args.tile_I = 1;
+    args.tile_J = 1;
+    args.tile_K = 1;
+    args.activation_rows_per_stripe = DIM;
+    args.transpose_B = true;
+    if (!args.A.allocate(args.I, args.K, 4)) {
+        return expect(false, "Q4 activation allocation succeeds");
+    }
+    const std::array<size_t, 5> activation_k = {0, 1, 15, 16, 31};
+    const std::array<int32_t, 5> activation_q = {-8, 7, -7, -1, 0};
+    for (size_t index = 0; index < activation_k.size(); ++index) {
+        if (!args.A.set(2, activation_k[index], activation_q[index])) {
+            return expect(false, "asymmetric Q4 activation initialization succeeds");
+        }
+    }
+    auto & meta = args.act_quant.storage().emplace<quants::act::exsia::Meta>();
+    meta.theta = {-1};
+
+    std::array<block_q4_hp1, 2> weights{};
+    for (block_q4_hp1 & weight : weights) {
+        std::memset(weight.qs, 0x88, sizeof(weight.qs));
+        weight.qs[0] = 0xf0;
+        weight.qs[1] = 0x8a;
+        weight.qs[15] = 0x71;
+        weight.m = 2;
+    }
+    weights[0].channel_scale = 0.25f;
+    weights[1].channel_scale = 0.5f;
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q4_hp1;
+    args.q4_hp1_blocks = weights.data();
+    args.native_block_count = weights.size();
+    args.native_blocks_per_row = 1;
+    args.native_weight_bytes = sizeof(weights);
+    args.blocks_per_row = 1;
+    args.blocks_K = 1;
+    args.blocks_J = 2;
+    args.blocks_I = 1;
+    args.block_size_k = 32;
+
+    residual::DirectStripeBuilder residual_builder;
+    residual_builder.reset(0, 2, 1, args.K, args.J);
+    const std::array<size_t, 4> residual_k = {0, 15, 16, 31};
+    const std::array<int32_t, 4> residual_q = {1, -2, 3, 4};
+    for (size_t index = 0; index < residual_k.size(); ++index) {
+        if (!residual_builder.add_residual(0, residual_k[index], residual_q[index])) {
+            return expect(false, "asymmetric Q4 residual initialization succeeds");
+        }
+    }
+    meta.direct_residuals = {residual_builder.finish()};
+
+    constexpr float sentinel = -777.0f;
+    std::vector<float> output(17, sentinel);
+    args.f_out = output.data();
+    args.stride_f_out = 7;
+    args.col_stride_f_out = 2;
+
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::full;
+    options.rmd_backend = RmdBackend::cpu_direct;
+    const MatmulStatus status = matmul(args, options);
+    if (!status.ok()) {
+        std::fprintf(stderr, "native Q4_HP1 status=%u message=%s\n",
+                     static_cast<unsigned>(status.code), status.message);
+    }
+    const float first_expected =
+#if GGML_GEMMINI_ENABLE_RMD
+        71.5f;
+#else
+        60.0f;
+#endif
+    const float second_expected =
+#if GGML_GEMMINI_ENABLE_RMD
+        143.0f;
+#else
+        120.0f;
+#endif
+    bool holes_preserved = true;
+    const std::array<size_t, 6> logical = {0, 2, 7, 9, 14, 16};
+    for (size_t index = 0; index < output.size(); ++index) {
+        if (std::find(logical.begin(), logical.end(), index) == logical.end() &&
+            output[index] != sentinel) {
+            holes_preserved = false;
+        }
+    }
+    return expect(status.ok(), "native Q4_HP1 CPU FULL succeeds") &&
+        expect(output[0] == 0.0f && output[2] == 0.0f &&
+                   output[7] == 0.0f && output[9] == 0.0f,
+               "zero activation rows remain zero") &&
+        expect(output[14] == first_expected && output[16] == second_expected,
+               "raw Q4 split-half dense and final-float RMD oracle matches") &&
+        expect(holes_preserved, "strided Q4 output preserves nonlogical destinations");
+#else
+    return true;
+#endif
+}
+
+bool test_native_q4_repeating_bias() {
+#if GGML_GEMMINI_ACTIVATION_BITS == 4 && GGML_GEMMINI_WEIGHT_BITS == 4
+    ggml_gemmini_args_t args{};
+    args.I = 2;
+    args.J = 2;
+    args.K = 32;
+    args.sA = args.K;
+    args.tiled_matmul_type = static_cast<tiled_matmul_type_t>(2);
+    args.tile_I = 1;
+    args.tile_J = 1;
+    args.tile_K = 1;
+    args.activation_rows_per_stripe = DIM;
+    args.transpose_B = true;
+    if (!args.A.allocate(args.I, args.K, 4)) {
+        return expect(false, "Q4 bias activation allocation succeeds");
+    }
+    args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = {0};
+
+    std::array<block_q4_hp1, 2> weights{};
+    for (block_q4_hp1 & weight : weights) {
+        std::memset(weight.qs, 0x88, sizeof(weight.qs));
+        weight.m = 0;
+        weight.channel_scale = 1.0f;
+    }
+    args.weight_format =
+        ggml_gemmini_args_t::im2p_weight_format_t::q4_hp1;
+    args.q4_hp1_blocks = weights.data();
+    args.native_block_count = weights.size();
+    args.native_blocks_per_row = 1;
+    args.native_weight_bytes = sizeof(weights);
+    args.blocks_per_row = 1;
+    args.blocks_K = 1;
+    args.blocks_J = 2;
+    args.blocks_I = 1;
+    args.block_size_k = 32;
+
+    const std::array<acc_t, 2> bias = {3, -5};
+    args.D = bias.data();
+    args.sD = args.J;
+    args.repeating_bias = true;
+    args.scale_D = 1;
+    std::array<float, 4> output = {-9.0f, -9.0f, -9.0f, -9.0f};
+    args.f_out = output.data();
+    args.stride_f_out = args.J;
+    args.col_stride_f_out = 1;
+
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::full;
+    options.rmd_backend = RmdBackend::cpu_direct;
+    const MatmulStatus status = matmul(args, options);
+    if (!status.ok()) {
+        std::fprintf(stderr, "native Q4 bias status=%u message=%s\n",
+                     static_cast<unsigned>(status.code), status.message);
+    }
+    return expect(status.ok(), "native Q4 repeating bias succeeds") &&
+        expect(output == std::array<float, 4>{3.0f, -5.0f, 3.0f, -5.0f},
+               "native Q4 repeating bias matches Gemmini epilogue");
+#else
+    return true;
+#endif
+}
+
+bool test_native_q4_multiblock_final_float_oracle() {
+#if GGML_GEMMINI_ACTIVATION_BITS == 4 && GGML_GEMMINI_WEIGHT_BITS == 4
+    constexpr size_t rows = 2;
+    constexpr size_t columns = 3;
+    constexpr size_t depth = 64;
+    constexpr size_t blocks_per_row = depth / 32;
+    constexpr int16_t theta = -1;
+
+    ggml_gemmini_args_t args{};
+    args.I = rows;
+    args.J = columns;
+    args.K = depth;
+    args.sA = depth;
+    args.tiled_matmul_type = static_cast<tiled_matmul_type_t>(2);
+    args.tile_I = 1;
+    args.tile_J = 1;
+    args.tile_K = 1;
+    args.activation_rows_per_stripe = DIM;
+    args.transpose_B = true;
+    if (!args.A.allocate(rows, depth, 4)) {
+        return expect(false, "multiblock Q4 activation allocation succeeds");
+    }
+
+    std::array<int32_t, rows * depth> activation_codes{};
+    for (size_t i = 0; i < rows; ++i) {
+        for (size_t k = 0; k < depth; ++k) {
+            const int32_t code =
+                static_cast<int32_t>((i * 5 + k * 3) % 16) - 8;
+            activation_codes[i * depth + k] = code;
+            if (!args.A.set(i, k, code)) {
+                return expect(false, "multiblock Q4 activation initialization succeeds");
+            }
+        }
+    }
+
+    auto & meta =
+        args.act_quant.storage().emplace<quants::act::exsia::Meta>();
+    meta.theta = {theta};
+    std::array<int32_t, rows * depth> residual_codes{};
+    residual::DirectStripeBuilder residual_builder;
+    residual_builder.reset(0, 0, rows, depth, columns);
+    const std::array<std::tuple<size_t, size_t, int32_t>, 5> residuals = {{
+        {0, 0, 2},
+        {0, 32, -3},
+        {1, 15, 4},
+        {1, 31, -2},
+        {1, 63, 3},
+    }};
+    for (const auto & [row, k, value] : residuals) {
+        residual_codes[row * depth + k] = value;
+        if (!residual_builder.add_residual(row, k, value)) {
+            return expect(false, "multiblock Q4 residual initialization succeeds");
+        }
+    }
+    meta.direct_residuals = {residual_builder.finish()};
+
+    std::array<block_q4_hp1, columns * blocks_per_row> weights{};
+    for (size_t j = 0; j < columns; ++j) {
+        for (size_t block = 0; block < blocks_per_row; ++block) {
+            block_q4_hp1 & weight = weights[j * blocks_per_row + block];
+            weight.channel_scale = 0.25f * static_cast<float>(j + 1);
+            weight.m = static_cast<int16_t>(block);
+            for (size_t packed = 0; packed < 16; ++packed) {
+                const int32_t low =
+                    static_cast<int32_t>((j * 7 + block * 5 + packed * 3) % 16) - 8;
+                const int32_t high =
+                    static_cast<int32_t>((j * 11 + block * 3 + packed * 5 + 1) % 16) - 8;
+                weight.qs[packed] = static_cast<uint8_t>(
+                    (low + 8) | ((high + 8) << 4));
+            }
+        }
+    }
+    args.weight_format =
+        ggml_gemmini_args_t::im2p_weight_format_t::q4_hp1;
+    args.q4_hp1_blocks = weights.data();
+    args.native_block_count = weights.size();
+    args.native_blocks_per_row = blocks_per_row;
+    args.native_weight_bytes = sizeof(weights);
+    args.blocks_per_row = blocks_per_row;
+    args.blocks_K = blocks_per_row;
+    args.blocks_J = columns;
+    args.blocks_I = 1;
+    args.block_size_k = 32;
+
+    constexpr float sentinel = -321.0f;
+    std::array<float, 12> output{};
+    output.fill(sentinel);
+    args.f_out = output.data();
+    args.stride_f_out = 5;
+    args.col_stride_f_out = 2;
+
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::full;
+    options.rmd_backend = RmdBackend::cpu_direct;
+    const MatmulStatus status = matmul(args, options);
+    if (!status.ok()) {
+        std::fprintf(stderr, "multiblock Q4 status=%u message=%s\n",
+                     static_cast<unsigned>(status.code), status.message);
+        return false;
+    }
+
+    bool values_match = true;
+    bool holes_preserved = true;
+    for (size_t i = 0; i < rows; ++i) {
+        for (size_t j = 0; j < columns; ++j) {
+            float expected = 0.0f;
+            for (size_t k = 0; k < depth; ++k) {
+                const size_t block = k / 32;
+                const size_t local = k % 32;
+                const block_q4_hp1 & weight =
+                    weights[j * blocks_per_row + block];
+                const uint8_t packed = weight.qs[local % 16];
+                const int32_t weight_code =
+                    static_cast<int32_t>(
+                        local < 16 ? packed & 0x0f : packed >> 4) - 8;
+                const float weight_value =
+                    static_cast<float>(weight_code) *
+                    std::ldexp(weight.channel_scale, weight.m);
+                int32_t activation_code = activation_codes[i * depth + k];
+#if GGML_GEMMINI_ENABLE_RMD
+                activation_code += residual_codes[i * depth + k];
+#endif
+                const float activation_value =
+                    std::ldexp(static_cast<float>(activation_code), theta);
+                expected += activation_value * weight_value;
+            }
+            const float actual = output[i * 5 + j * 2];
+            const float tolerance =
+                1e-5f * std::max(1.0f, std::fabs(expected));
+            values_match =
+                std::fabs(actual - expected) <= tolerance && values_match;
+        }
+    }
+    const std::array<size_t, rows * columns> logical = {0, 2, 4, 5, 7, 9};
+    for (size_t index = 0; index < output.size(); ++index) {
+        if (std::find(logical.begin(), logical.end(), index) == logical.end() &&
+            output[index] != sentinel) {
+            holes_preserved = false;
+        }
+    }
+    return expect(values_match,
+                  "multiblock Q4 final-float scalar oracle matches") &&
+        expect(holes_preserved,
+               "multiblock Q4 oracle preserves strided output holes");
+#else
+    return true;
+#endif
+}
+
+bool test_native_q16_hp1_cpu_dense_output() {
+#if GGML_GEMMINI_ACTIVATION_BITS == 16 && GGML_GEMMINI_WEIGHT_BITS == 16
+    ggml_gemmini_args_t args{};
+    args.I = 1;
+    args.J = 1;
+    args.K = 32;
+    args.sA = args.K;
+    args.tiled_matmul_type = static_cast<tiled_matmul_type_t>(2);
+    args.tile_I = 1;
+    args.tile_J = 1;
+    args.tile_K = 1;
+    args.activation_rows_per_stripe = DIM;
+    args.transpose_B = true;
+    if (!args.A.allocate(args.I, args.K, 16)) {
+        return expect(false, "Q16 activation allocation succeeds");
+    }
+    for (size_t k = 0; k < args.K; ++k) {
+        if (!args.A.set(0, k, 3)) {
+            return expect(false, "Q16 activation initialization succeeds");
+        }
+    }
+    args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = {-1};
+
+    block_q16_hp1 weight{};
+    std::fill(std::begin(weight.qs), std::end(weight.qs), int16_t{1});
+    weight.m = 0;
+    weight.channel_scale = 2.0f;
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q16_hp1;
+    args.q16_hp1_blocks = &weight;
+    args.native_block_count = 1;
+    args.native_blocks_per_row = 1;
+    args.blocks_per_row = 1;
+    args.blocks_K = 1;
+    args.blocks_J = 1;
+    args.blocks_I = 1;
+    args.block_size_k = 32;
+    args.native_weight_bytes = sizeof(weight);
+
+    float output = -7.0f;
+    args.f_out = &output;
+    args.stride_f_out = 1;
+    args.col_stride_f_out = 1;
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::full;
+    options.rmd_backend = RmdBackend::cpu_direct;
+    const MatmulStatus status = matmul(args, options);
+    return expect(status.ok(), "native Q16_HP1 CPU FULL succeeds") &&
+        expect(output == 96.0f,
+               "native Q16_HP1 CPU FULL computes scaled dot product");
+#else
+    return true;
+#endif
+}
+
 }
 
 int main(int argc, char ** argv) {
@@ -689,27 +1222,82 @@ int main(int argc, char ** argv) {
         return ok ? 0 : 1;
     }
     if (argc == 2 && std::string(argv[1]) == "--case=transaction-atomicity") {
-        const bool ok = test_cpu_direct_failure_commits_no_partial_correction() &&
-            test_stripe_residual_failure_is_transaction_atomic() &&
-            test_output_transaction_strides_overflow_and_cancel();
+        const bool ok = test_rmd_failure_atomicity_suite();
         if (ok) {
             std::puts("PASS: FULL/STRIPE output transactions commit once or discard");
         }
         return ok ? 0 : 1;
     }
+    if (argc == 2 && std::string(argv[1]) == "--case=native-q4-cpu") {
+        const bool ok = test_native_q4_hp1_cpu_dense_output() &&
+            test_native_q4_repeating_bias() &&
+            test_native_q4_multiblock_final_float_oracle();
+        if (ok) {
+            std::puts("PASS: native Q4_HP1 CPU dense output");
+        }
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 &&
+        std::string(argv[1]) == "--case=native-q4-multiblock") {
+        const bool ok = test_native_q4_multiblock_final_float_oracle();
+        if (ok) {
+            std::puts("PASS: native Q4 multiblock final-float oracle");
+        }
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--case=native-q16-cpu") {
+        const bool ok = test_native_q16_hp1_cpu_dense_output();
+        if (ok) {
+            std::puts("PASS: native Q16_HP1 CPU dense output");
+        }
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--case=residual-guards") {
+        const bool ok = test_rmd_disabled_pipeline_skips_correction() &&
+            test_dense_rejects_residual_metadata();
+        if (ok) {
+            std::puts("PASS: residual disable and dense-only guards");
+        }
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--case=dense-status") {
+        const bool ok = test_dense_no_output_is_failure();
+        if (ok) {
+            std::puts("PASS: dense no-output path reports failure atomically");
+        }
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--case=finite-output") {
+        const bool ok = test_nonfinite_output_is_atomic();
+        if (ok) {
+            std::puts("PASS: nonfinite dense output rejected atomically");
+        }
+        return ok ? 0 : 1;
+    }
+#if GGML_GEMMINI_ACTIVATION_BITS == 16 && GGML_GEMMINI_WEIGHT_BITS == 16
+    if (!test_native_q16_hp1_cpu_dense_output()) {
+        return 1;
+    }
+#else
     if (!test_removed_sequential_rejects_before_work() ||
         !test_invalid_geometry_rejects_before_allocation() ||
         !test_output_parity() || !test_single_row_pipeline() ||
+        !test_native_q4_hp1_cpu_dense_output() ||
+        !test_native_q4_repeating_bias() ||
+        !test_native_q4_multiblock_final_float_oracle() ||
         !test_counter_hooks_connected() ||
         !test_cpu_direct_lifecycle_parity() ||
+        !test_rmd_disabled_pipeline_skips_correction() ||
+        !test_dense_rejects_residual_metadata() ||
         !test_correction_domain_composition() ||
-        !test_cpu_direct_failure_commits_no_partial_correction() ||
-        !test_stripe_residual_failure_is_transaction_atomic() ||
-        !test_output_transaction_strides_overflow_and_cancel() ||
+        !test_rmd_failure_atomicity_suite() ||
         !test_ws_preflight_is_atomic_on_host() ||
+        !test_dense_no_output_is_failure() ||
+        !test_nonfinite_output_is_atomic() ||
         !test_bad_routes() || !test_cancel_and_failure()) {
         return 1;
     }
+#endif
     std::puts("PASS: public mode contract/parity; malformed/unsupported/cancel/failure coverage");
     return 0;
 }

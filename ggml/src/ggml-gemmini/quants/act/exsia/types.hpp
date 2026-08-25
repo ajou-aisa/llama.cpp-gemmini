@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../types.hpp"
+#include "../../../ggml-gemmini-config.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -17,7 +18,7 @@ namespace ggml::gemmini::quants::act::exsia
 struct Meta
 {
     int16_t e_s = std::numeric_limits<int16_t>::min();
-    int16_t rho = 6;
+    int16_t rho = config::GGML_GEMMINI_ACTIVATION_RHO;
     int32_t sigma = GGML_GEMMINI_EXSIA_SIGMA;
     std::vector<int16_t> theta;
     RmdPacketList rmd_packets;
@@ -26,7 +27,7 @@ struct Meta
     void reset()
     {
         e_s = std::numeric_limits<int16_t>::min();
-        rho = 6;
+        rho = config::GGML_GEMMINI_ACTIVATION_RHO;
         sigma = GGML_GEMMINI_EXSIA_SIGMA;
         theta.clear();
         rmd_packets.clear();

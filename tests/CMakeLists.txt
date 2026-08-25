@@ -159,7 +159,7 @@ llama_build_and_test(test-regex-partial.cpp)
 if (NOT WIN32)
     llama_build_and_test(test-arg-parser.cpp)
 endif()
-if (LLAMA_BUILD_TOOLS)
+if (LLAMA_BUILD_TOOLS AND LOG_CYCLE)
     add_test(NAME test-gemmini-cycle-cli
         COMMAND ${CMAKE_COMMAND}
             -DTEST_CLI=$<TARGET_FILE:llama-cli>
@@ -231,12 +231,29 @@ if (UNIX AND BUILD_SHARED_LIBS AND LOG_CYCLE AND TARGET ggml-gemmini)
             ${CMAKE_CURRENT_BINARY_DIR}/gemmini-log-cross-image/cycle-log.jsonl
             ${CMAKE_CURRENT_BINARY_DIR}/gemmini-log-cross-image/stderr.txt)
 endif()
-llama_build_and_test(test-gemmini-q8-h1-h2-dequant-fp.cpp NAME gemmini_q8_h1_h2_dequant_fp)
 llama_build_and_test(test-gemmini-weight-formats.cpp NAME gemmini_weight_formats)
 target_link_libraries(gemmini_weight_formats PRIVATE ggml-base ggml-gemmini)
+target_compile_definitions(gemmini_weight_formats PRIVATE
+    GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+    GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE})
 add_test(NAME test-gemmini-weight-reader-callers
     COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-weight-reader-callers.cmake)
-target_sources(gemmini_q8_h1_h2_dequant_fp PRIVATE
+
+set(_GGML_GEMMINI_BUILD_DEQUANT_FP_TARGET TRUE)
+if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND
+    NOT _GGML_GEMMINI_ENABLE_RMD_VALUE)
+    set(_GGML_GEMMINI_BUILD_DEQUANT_FP_TARGET FALSE)
+endif()
+if (_GGML_GEMMINI_BUILD_DEQUANT_FP_TARGET)
+if (_GGML_GEMMINI_ACTIVATION_BITS_VALUE EQUAL 8)
+    set(_GGML_GEMMINI_DEQUANT_FP_TARGET gemmini_q8_h1_h2_dequant_fp)
+else()
+    set(_GGML_GEMMINI_DEQUANT_FP_TARGET gemmini_width_h1_dequant_fp)
+endif()
+llama_build_and_test(
+    test-gemmini-q8-h1-h2-dequant-fp.cpp
+    NAME ${_GGML_GEMMINI_DEQUANT_FP_TARGET})
+target_sources(${_GGML_GEMMINI_DEQUANT_FP_TARGET} PRIVATE
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
     ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
@@ -246,15 +263,37 @@ target_sources(gemmini_q8_h1_h2_dequant_fp PRIVATE
     ../ggml/src/ggml-gemmini/quants/act/quantize.cpp
     ../ggml/src/ggml-gemmini/quants/act/block/block.cpp
     ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
+    ../ggml/src/ggml-gemmini/quants/act/stripe/stripe.cpp
     ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
     ../ggml/src/ggml-gemmini/quants/act/token/token.cpp)
-target_link_libraries(gemmini_q8_h1_h2_dequant_fp PRIVATE ggml-base ggml-gemmini-utils)
-target_compile_definitions(gemmini_q8_h1_h2_dequant_fp PRIVATE
-    GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE})
-target_include_directories(gemmini_q8_h1_h2_dequant_fp PRIVATE
+target_link_libraries(
+    ${_GGML_GEMMINI_DEQUANT_FP_TARGET}
+    PRIVATE ggml-base ggml-gemmini-utils)
+target_compile_definitions(${_GGML_GEMMINI_DEQUANT_FP_TARGET} PRIVATE
+    ${GGML_GEMMINI_COMPILE_DEFS}
+    GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE})
+target_include_directories(${_GGML_GEMMINI_DEQUANT_FP_TARGET} PRIVATE
     ../ggml/src
     ../ggml/src/ggml-gemmini
     ../ggml/src/ggml-gemmini-utils/include)
+if (GGML_GEMMINI_DEQUANT_FP_TEST)
+    if (_GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "EXSIA")
+        add_test(NAME gemmini_deferred_dequant_fp
+            COMMAND ${CMAKE_COMMAND} -E env
+                GEMMINI_MATMUL_MODE=STRIPE_PIPELINE
+                $<TARGET_FILE:${_GGML_GEMMINI_DEQUANT_FP_TARGET}>
+                --h1-pipeline)
+    else()
+        add_test(NAME gemmini_dequant_fp
+            COMMAND ${CMAKE_COMMAND} -E env
+                GEMMINI_MATMUL_MODE=FULL
+                $<TARGET_FILE:${_GGML_GEMMINI_DEQUANT_FP_TARGET}>
+                --h1-full)
+    endif()
+endif()
+unset(_GGML_GEMMINI_DEQUANT_FP_TARGET)
+endif()
+unset(_GGML_GEMMINI_BUILD_DEQUANT_FP_TARGET)
 
 add_executable(test-gemmini-act-quant-i32-saturation
     test-gemmini-act-quant-i32-saturation.cpp
@@ -278,6 +317,8 @@ if (_GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "BLOCK")
     set(_GGML_GEMMINI_SATURATION_TEST_ACTIVATION_QUANT 0)
 endif()
 target_compile_definitions(test-gemmini-act-quant-i32-saturation PRIVATE
+    GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+    GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
     GGML_GEMMINI_ACTIVATION_QUANT=${_GGML_GEMMINI_SATURATION_TEST_ACTIVATION_QUANT}
     GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
     GGML_GEMMINI_ENABLE_RMD=1)
@@ -327,6 +368,8 @@ endif()
 target_compile_features(test-gemmini-exsia PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-exsia PRIVATE
     GGML_GEMMINI_TESTING=1
+    GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+    GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
     GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
     GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE}
     GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
@@ -347,7 +390,15 @@ target_include_directories(test-gemmini-exsia PRIVATE
     ${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini-rocc-tests
     ${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini-rocc-tests/include
     ${TEST_GEMMINI_EXSIA_SW_PATH}/rocc-software/src)
-foreach(_case IN ITEMS all baseline dispatch rmd-routes q8-srmd-software-ws hp1-srmd-software-ws rmd-direct-parity direct-executor rmd-gather stripe-geometry)
+set(_GGML_GEMMINI_EXSIA_CASES
+    all baseline dispatch direct-executor stripe-geometry)
+if (_GGML_GEMMINI_ACTIVATION_BITS_VALUE EQUAL 8 AND
+    _GGML_GEMMINI_WEIGHT_BITS_VALUE EQUAL 8)
+    list(APPEND _GGML_GEMMINI_EXSIA_CASES
+        rmd-routes q8-srmd-software-ws hp1-srmd-software-ws
+        rmd-direct-parity rmd-gather)
+endif()
+foreach(_case IN LISTS _GGML_GEMMINI_EXSIA_CASES)
     string(REPLACE "-" "_" _case_test_name "${_case}")
     add_test(NAME gemmini_exsia_${_case_test_name}
         COMMAND ${CMAKE_COMMAND}
@@ -355,6 +406,7 @@ foreach(_case IN ITEMS all baseline dispatch rmd-routes q8-srmd-software-ws hp1-
             -DEXPECTED_CASE=${_case}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-exsia-case.cmake)
 endforeach()
+unset(_GGML_GEMMINI_EXSIA_CASES)
 add_test(NAME gemmini_exsia_unknown_case
     COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=unknown)
 set_tests_properties(gemmini_exsia_unknown_case PROPERTIES WILL_FAIL TRUE)
@@ -376,6 +428,8 @@ target_link_libraries(test-gemmini-exsia-writer PRIVATE ggml-base ggml-gemmini-u
 target_compile_features(test-gemmini-exsia-writer PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-exsia-writer PRIVATE
     GEMMINI_EXSIA_WRITER_TEST_ONLY=1
+    GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+    GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
     GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
     GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=1
     GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
@@ -431,6 +485,9 @@ add_executable(test-gemmini-rmd
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp)
 target_link_libraries(test-gemmini-rmd PRIVATE ggml-base ggml-gemmini ggml-gemmini-utils)
 target_compile_features(test-gemmini-rmd PRIVATE cxx_std_17)
+target_compile_definitions(test-gemmini-rmd PRIVATE
+    GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+    GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE})
 target_include_directories(test-gemmini-rmd PRIVATE
     ../ggml/src
     ../ggml/src/ggml-gemmini
@@ -457,6 +514,9 @@ add_executable(test-gemmini-rmd-packet
 target_link_libraries(test-gemmini-rmd-packet PRIVATE
     ggml-base ggml-gemmini ggml-gemmini-utils)
 target_compile_features(test-gemmini-rmd-packet PRIVATE cxx_std_17)
+target_compile_definitions(test-gemmini-rmd-packet PRIVATE
+    GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+    GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE})
 target_include_directories(test-gemmini-rmd-packet PRIVATE
     ../ggml/src
     ../ggml/src/ggml-gemmini
@@ -472,6 +532,8 @@ target_link_libraries(test-gemmini-rmd-telemetry PRIVATE
     ggml-gemmini ggml-base ggml-gemmini-utils)
 target_compile_features(test-gemmini-rmd-telemetry PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-rmd-telemetry PRIVATE
+    GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+    GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
     LOG_DEBUG=${LOG_DEBUG}
     LOG_CYCLE=${LOG_CYCLE}
     CYCLE_DETAIL=${CYCLE_DETAIL})
@@ -525,22 +587,28 @@ if (GEMMINI_BUILD_SRMD_RAW_WS_TESTS)
         COMMAND $<TARGET_FILE:test-gemmini-srmd-raw-ws> --bench-layouts)
 endif()
 
-add_executable(test-gemmini-matmul-options test-gemmini-matmul-options.cpp)
-target_compile_features(test-gemmini-matmul-options PRIVATE cxx_std_17)
-target_include_directories(test-gemmini-matmul-options PRIVATE
-    ../ggml/include
-    ../ggml/src
-    ../ggml/src/ggml-gemmini
-    ../ggml/src/ggml-gemmini-utils/include
-    ../ggml/src/ggml-gemmini/quants
-    ${GGML_GEMMINI_GENERATED_CONFIG_DIR}
-    ${GEMMINI_SW_PATH}
-    ${GEMMINI_SW_PATH}/include)
-if (NOT GGML_BACKEND_DL)
-    target_link_libraries(test-gemmini-matmul-options PRIVATE ggml-gemmini ggml-base)
-    target_compile_definitions(test-gemmini-matmul-options PRIVATE GGML_GEMMINI_OPTIONS_TEST_BACKEND=1)
+if (_GGML_GEMMINI_ACTIVATION_BITS_VALUE EQUAL 8 AND
+    _GGML_GEMMINI_WEIGHT_BITS_VALUE EQUAL 8)
+    add_executable(test-gemmini-matmul-options test-gemmini-matmul-options.cpp)
+    target_compile_features(test-gemmini-matmul-options PRIVATE cxx_std_17)
+    target_compile_definitions(test-gemmini-matmul-options PRIVATE
+        GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+        GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE})
+    target_include_directories(test-gemmini-matmul-options PRIVATE
+        ../ggml/include
+        ../ggml/src
+        ../ggml/src/ggml-gemmini
+        ../ggml/src/ggml-gemmini-utils/include
+        ../ggml/src/ggml-gemmini/quants
+        ${GGML_GEMMINI_GENERATED_CONFIG_DIR}
+        ${GEMMINI_SW_PATH}
+        ${GEMMINI_SW_PATH}/include)
+    if (NOT GGML_BACKEND_DL)
+        target_link_libraries(test-gemmini-matmul-options PRIVATE ggml-gemmini ggml-base)
+        target_compile_definitions(test-gemmini-matmul-options PRIVATE GGML_GEMMINI_OPTIONS_TEST_BACKEND=1)
+    endif()
+    add_test(NAME test-gemmini-matmul-options COMMAND $<TARGET_FILE:test-gemmini-matmul-options>)
 endif()
-add_test(NAME test-gemmini-matmul-options COMMAND $<TARGET_FILE:test-gemmini-matmul-options>)
 add_test(NAME test-gemmini-geometry-contract
     COMMAND ${CMAKE_COMMAND}
         -DTEST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/..
@@ -661,7 +729,14 @@ if (NOT GGML_BACKEND_DL)
     add_executable(test-gemmini-matmul test-gemmini-matmul.cpp)
     target_link_libraries(test-gemmini-matmul PRIVATE ggml-gemmini ggml-base)
     target_compile_features(test-gemmini-matmul PRIVATE cxx_std_17)
+    target_compile_definitions(test-gemmini-matmul PRIVATE
+        GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+        GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
+        GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE})
     add_test(NAME test-gemmini-matmul COMMAND $<TARGET_FILE:test-gemmini-matmul>)
+    add_test(
+        NAME test-gemmini-matmul-finite-output
+        COMMAND $<TARGET_FILE:test-gemmini-matmul> --case=finite-output)
     find_package(Threads REQUIRED)
     add_executable(test-gemmini-buffer-artifacts test-gemmini-buffer-artifacts.cpp)
     target_link_libraries(test-gemmini-buffer-artifacts PRIVATE ggml-gemmini ggml-base Threads::Threads)
@@ -695,6 +770,8 @@ add_executable(gemmini-quant-dispatch-smoke
 target_link_libraries(gemmini-quant-dispatch-smoke PRIVATE ggml-base ggml-gemmini-utils)
 target_compile_features(gemmini-quant-dispatch-smoke PRIVATE cxx_std_17)
 target_compile_definitions(gemmini-quant-dispatch-smoke PRIVATE
+    GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+    GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
     GGML_GEMMINI_ACTIVATION_QUANT=2
     GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
     GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA})
@@ -722,7 +799,6 @@ set_property(TEST gemmini_quant_dispatch_unsupported PROPERTY LABELS main)
 set(_GEMMINI_REGISTERED_TEST_EXECUTABLES
     test-gemmini-log
     test-gemmini-log-boundary
-    gemmini_q8_h1_h2_dequant_fp
     gemmini_weight_formats
     test-gemmini-act-quant-i32-saturation
     test-gemmini-exsia
@@ -730,10 +806,12 @@ set(_GEMMINI_REGISTERED_TEST_EXECUTABLES
     test-gemmini-rmd
     test-gemmini-rmd-packet
     test-gemmini-rmd-telemetry
-    test-gemmini-matmul-options
     gemmini-quant-dispatch-smoke)
 foreach(_GEMMINI_OPTIONAL_TEST_EXECUTABLE IN ITEMS
+        gemmini_q8_h1_h2_dequant_fp
+        gemmini_width_h1_dequant_fp
         test-gemmini-srmd-raw-ws
+        test-gemmini-matmul-options
         test-gemmini-im2p-routing
         test-gemmini-im2p-lifecycle
         test-gemmini-rmd-backend-gate

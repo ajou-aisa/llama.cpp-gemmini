@@ -58,15 +58,6 @@ namespace ggml::gemmini::config
     (GGML_GEMMINI_WEIGHT_BITS == 16 ? 2 : 1)
 #endif
 
-#define GGML_GEMMINI_Q4_PACKING_NONE 0
-#define GGML_GEMMINI_Q4_PACKING_SIGNED_NIBBLE_LOW_FIRST 1
-#ifndef GGML_GEMMINI_Q4_PACKING_MODE
-#define GGML_GEMMINI_Q4_PACKING_MODE \
-    (GGML_GEMMINI_ACTIVATION_BITS == 4 \
-         ? GGML_GEMMINI_Q4_PACKING_SIGNED_NIBBLE_LOW_FIRST \
-         : GGML_GEMMINI_Q4_PACKING_NONE)
-#endif
-
 // ComputeType ----------------------------------------------------------------
 // 0 = INT              : activation quant + weight unpacking + int matmul
 // 1 = FLOAT            : bypass quant, call matmul_cpu_fp directly
@@ -148,12 +139,6 @@ static_assert(GGML_GEMMINI_ACTIVATION_STORAGE_BYTES == (GGML_GEMMINI_ACTIVATION_
               "Gemmini activation storage bytes must match the logical width");
 static_assert(GGML_GEMMINI_WEIGHT_STORAGE_BYTES == (GGML_GEMMINI_WEIGHT_BITS == 16 ? 2 : 1),
               "Gemmini weight storage bytes must match the logical width");
-static_assert(GGML_GEMMINI_Q4_PACKING_MODE ==
-                  (GGML_GEMMINI_ACTIVATION_BITS == 4
-                       ? GGML_GEMMINI_Q4_PACKING_SIGNED_NIBBLE_LOW_FIRST
-                       : GGML_GEMMINI_Q4_PACKING_NONE),
-              "Gemmini Q4 packing mode must match the logical width");
-
 inline constexpr int32_t GGML_GEMMINI_ACTIVATION_QMIN = -(int32_t{1} << (GGML_GEMMINI_ACTIVATION_BITS - 1));
 inline constexpr int32_t GGML_GEMMINI_ACTIVATION_QMAX =  (int32_t{1} << (GGML_GEMMINI_ACTIVATION_BITS - 1)) - 1;
 inline constexpr int16_t GGML_GEMMINI_ACTIVATION_RHO   = static_cast<int16_t>(GGML_GEMMINI_ACTIVATION_BITS - 2);

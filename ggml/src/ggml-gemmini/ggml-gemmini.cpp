@@ -58,7 +58,8 @@
 namespace
 {
     bool gemmini_is_extended_dequant_weight_type(ggml_type type) {
-        return type == GGML_TYPE_Q4_H1 ||
+        return type == GGML_TYPE_Q4_0 ||
+               type == GGML_TYPE_Q4_H1 ||
                type == GGML_TYPE_Q4_HP1 ||
                type == GGML_TYPE_Q16_0 ||
                type == GGML_TYPE_Q16_H1 ||
@@ -101,7 +102,6 @@ namespace
 #endif
 
     bool gemmini_is_native_matched_weight_type(ggml_type type) {
-#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
         if constexpr (GGML_GEMMINI_ACTIVATION_BITS == 4 &&
                       GGML_GEMMINI_WEIGHT_BITS == 4) {
             return type == GGML_TYPE_Q4_0 ||
@@ -114,9 +114,6 @@ namespace
                    type == GGML_TYPE_Q16_H1 ||
                    type == GGML_TYPE_Q16_HP1;
         }
-#else
-        (void) type;
-#endif
         return false;
     }
 
@@ -1451,8 +1448,11 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
       GGML_ABORT("Gemmini activation quantization failed");
     }
 
-    if constexpr (ggml::gemmini::config::CURRENT_COMPUTE_TYPE == ggml::gemmini::config::ComputeType::FLOAT &&
-                  ggml::gemmini::config::DEQUANT_FP_TEST) {
+    const auto run_dequant_fp_test = [&]() -> bool {
+      if constexpr (
+          ggml::gemmini::config::CURRENT_COMPUTE_TYPE ==
+              ggml::gemmini::config::ComputeType::FLOAT &&
+          ggml::gemmini::config::DEQUANT_FP_TEST) {
         std::vector<float> activation_f32(ik_count);
         const bool dequant_ok = ggml::gemmini::quants::dequantize_activation(
             activation_f32.data(),
@@ -1466,7 +1466,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         }
         GGML_ASSERT(dequant_ok && "DEQUANT_FP_TEST: activation dequantization failed");
         if (!dequant_ok)
-            return;
+            return true;
 
         std::vector<float> src0_f32;
         const float *src0_f = reinterpret_cast<const float *>(src0->data);
@@ -1529,8 +1529,12 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
         gemmini_matmul_fp_facade(I, J, K, activation_f32.data(), src0_f,
                                  static_cast<float *>(dst->data), args.matmul_layer);
-        return;
-    }
+        return true;
+      }
+      return false;
+    };
+    if (!deferred_quantization && run_dequant_fp_test())
+      return;
 
     start = ggml::gemmini::cycle::read();
     const int64_t dim_k = src0->ne[0];
@@ -1898,6 +1902,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
           GGML_ABORT("Gemmini IM2P ExSIA FULL execution failed");
 #endif
         }
+        if (run_dequant_fp_test())
+          return;
         ggml::gemmini::im2p_adapter::log_stats(
             "full", completion.stats, completion.run_id, args);
         return;
@@ -1961,6 +1967,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         GGML_ABORT("Gemmini IM2P ExSIA stripe execution failed");
 #endif
       }
+      if (run_dequant_fp_test())
+        return;
       ggml::gemmini::im2p_adapter::log_stats(
           "stripe_pipeline", completion.stats, completion.run_id, args);
       return;
@@ -2141,6 +2149,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 static_cast<int>(execution_status.code), execution_status.message);
             return;
         }
+        if (run_dequant_fp_test())
+            return;
         const auto route = ggml::gemmini::detail::normalize_route(args);
         const auto capabilities = ggml::gemmini::detail::route_capabilities(args);
         const char * const backend_route =

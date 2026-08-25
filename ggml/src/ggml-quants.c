@@ -38,6 +38,21 @@ static inline float gemmini_ldexp_fast_pos(float x, int m) {
 
 #define UNUSED GGML_UNUSED
 
+static void quantize_h1_scale_range(float min_s, float max_s, float * s_rf, uint16_t * R) {
+    *s_rf = 0.0f;
+    *R = 0;
+    if (max_s > min_s) {
+        const float range_step = (max_s - min_s) / 255.0f;
+        const float offset_step = min_s / 65535.0f;
+        *s_rf = MAX(range_step, offset_step);
+        const double r = round((double) min_s / (double) *s_rf);
+        *R = (uint16_t) MIN(65535.0, MAX(0.0, r));
+    } else if (min_s > 0.0f) {
+        *s_rf = min_s;
+        *R = 1;
+    }
+}
+
 // reference implementation for deterministic creation of model files
 void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK4_0;
@@ -105,16 +120,9 @@ void quantize_row_q4_h1_ref(const float * GGML_RESTRICT x, block_q4_h1 * GGML_RE
         max_s = MAX(max_s, s);
     }
 
-    float s_rf = 0.0f;
-    uint16_t R = 0;
-    if (max_s > min_s) {
-        s_rf = (max_s - min_s) / 255.0f;
-        const double r = round((double) min_s / (double) s_rf);
-        R = (uint16_t) MIN(65535.0, MAX(0.0, r));
-    } else if (min_s > 0.0f) {
-        s_rf = min_s;
-        R = 1;
-    }
+    float s_rf;
+    uint16_t R;
+    quantize_h1_scale_range(min_s, max_s, &s_rf, &R);
 
     for (int i = 0; i < nb; ++i) {
         const float s = y[i].s_rf;
@@ -140,7 +148,7 @@ static bool quantize_q4_hp1_input_valid(const float * x, int64_t k) {
         for (int j = 0; j < QK4_HP; ++j) {
             amax = MAX(amax, fabsf(x[i*QK4_HP + j]));
         }
-        if (amax > 0.0f && ldexpf(1.0f, ilogbf(amax) - 2) == 0.0f) {
+        if (amax > 0.0f && ldexpf(1.0f, (int) roundf(log2f(amax / 7.0f))) == 0.0f) {
             return false;
         }
     }
@@ -161,7 +169,7 @@ bool quantize_row_q4_hp1_ref(const float * GGML_RESTRICT x, block_q4_hp1 * GGML_
             amax = MAX(amax, fabsf(x[i*QK4_HP + j]));
         }
         if (amax > 0.0f) {
-            const float block_scale = ldexpf(1.0f, ilogbf(amax) - 2);
+            const float block_scale = ldexpf(1.0f, (int) roundf(log2f(amax / 7.0f)));
             channel_scale = channel_set ? MIN(channel_scale, block_scale) : block_scale;
             channel_set = true;
         }
@@ -180,7 +188,7 @@ bool quantize_row_q4_hp1_ref(const float * GGML_RESTRICT x, block_q4_hp1 * GGML_
             continue;
         }
 
-        const int block_exponent = ilogbf(amax) - 2;
+        const int block_exponent = (int) roundf(log2f(amax / 7.0f));
         const float block_scale = ldexpf(1.0f, block_exponent);
         y[i].m = (int16_t) (block_exponent - channel_exponent);
         for (int j = 0; j < QK4_HP/2; ++j) {
@@ -406,16 +414,9 @@ void quantize_row_q8_h1_ref(const float * GGML_RESTRICT x, block_q8_h1 * GGML_RE
         max_s = MAX(max_s, s);
     }
 
-    float s_rf = 0.0f;
-    uint16_t R = 0;
-    if (max_s > min_s) {
-        s_rf = (max_s - min_s) / 255.0f;
-        const double r = round((double) min_s / (double) s_rf);
-        R = (uint16_t) MIN(65535.0, MAX(0.0, r));
-    } else if (min_s > 0.0f) {
-        s_rf = min_s;
-        R = 1;
-    }
+    float s_rf;
+    uint16_t R;
+    quantize_h1_scale_range(min_s, max_s, &s_rf, &R);
 
     for (int i = 0; i < nb; ++i) {
         const float s = y[i].s_rf;
@@ -456,16 +457,9 @@ void quantize_row_q16_h1_ref(const float * GGML_RESTRICT x, block_q16_h1 * GGML_
         max_s = MAX(max_s, s);
     }
 
-    float s_rf = 0.0f;
-    uint16_t R = 0;
-    if (max_s > min_s) {
-        s_rf = (max_s - min_s) / 255.0f;
-        const double r = round((double) min_s / (double) s_rf);
-        R = (uint16_t) MIN(65535.0, MAX(0.0, r));
-    } else if (min_s > 0.0f) {
-        s_rf = min_s;
-        R = 1;
-    }
+    float s_rf;
+    uint16_t R;
+    quantize_h1_scale_range(min_s, max_s, &s_rf, &R);
 
     for (int i = 0; i < nb; ++i) {
         const float s = y[i].s_rf;

@@ -6,10 +6,7 @@ execute_process(
 
 set(test_output "${test_stdout}${test_stderr}")
 
-if(test_rc EQUAL 0)
-    message(FATAL_ERROR "Expected unsupported Gemmini baseline quantization pair to fail")
-endif()
-
-if(NOT test_output MATCHES "unsupported Gemmini baseline quantization pair")
-    message(FATAL_ERROR "Expected unsupported baseline assertion, got:\n${test_output}")
+if(NOT test_rc EQUAL 0)
+    message(FATAL_ERROR
+        "Expected typed unsupported baseline status, got rc=${test_rc}:\n${test_output}")
 endif()

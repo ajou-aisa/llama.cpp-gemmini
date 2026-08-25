@@ -334,6 +334,33 @@ if(GGML_GEMMINI)
         string(REGEX REPLACE "#define[ \t]+DIM[ \t]+[0-9]+"
             "#define DIM ${GGML_GEMMINI_DIM}" _GGML_GEMMINI_PARAMS_CONTENT
             "${_GGML_GEMMINI_PARAMS_CONTENT}")
+        if(GGML_GEMMINI_ACTIVATION_BITS EQUAL 16)
+            string(REGEX REPLACE
+                "#define[ \t]+MAX_BLOCK_LEN[ \t]+\\(MAX_BYTES/\\(DIM\\*1\\)\\)"
+                "#define MAX_BLOCK_LEN (MAX_BYTES/(DIM*2))"
+                _GGML_GEMMINI_PARAMS_CONTENT
+                "${_GGML_GEMMINI_PARAMS_CONTENT}")
+            string(REGEX REPLACE "typedef[ \t]+int8_t[ \t]+elem_t;"
+                "typedef int16_t elem_t;"
+                _GGML_GEMMINI_PARAMS_CONTENT
+                "${_GGML_GEMMINI_PARAMS_CONTENT}")
+            string(REGEX REPLACE
+                "static const elem_t elem_t_max = 127;"
+                "static const elem_t elem_t_max = 32767;"
+                _GGML_GEMMINI_PARAMS_CONTENT
+                "${_GGML_GEMMINI_PARAMS_CONTENT}")
+            string(REGEX REPLACE
+                "static const elem_t elem_t_min = -128;"
+                "static const elem_t elem_t_min = -32768;"
+                _GGML_GEMMINI_PARAMS_CONTENT
+                "${_GGML_GEMMINI_PARAMS_CONTENT}")
+            string(REPLACE "INT8_MAX" "INT16_MAX"
+                _GGML_GEMMINI_PARAMS_CONTENT
+                "${_GGML_GEMMINI_PARAMS_CONTENT}")
+            string(REPLACE "INT8_MIN" "INT16_MIN"
+                _GGML_GEMMINI_PARAMS_CONTENT
+                "${_GGML_GEMMINI_PARAMS_CONTENT}")
+        endif()
     endif()
     file(WRITE "${GGML_GEMMINI_GENERATED_CONFIG_DIR}/gemmini_params.h"
         "${_GGML_GEMMINI_PARAMS_CONTENT}")
@@ -517,6 +544,8 @@ int main() {
             "-DINCLUDE_DIRECTORIES=${_GGML_GEMMINI_IM2P_PAIR_PROBE_INCLUDES}"
         COMPILE_DEFINITIONS
             "-DGGML_GEMMINI_BLOCK_SIZE=${GGML_GEMMINI_BLOCK_SIZE}"
+            "-DGGML_GEMMINI_ACTIVATION_BITS=${GGML_GEMMINI_ACTIVATION_BITS}"
+            "-DGGML_GEMMINI_WEIGHT_BITS=${GGML_GEMMINI_WEIGHT_BITS}"
         LINK_LIBRARIES
             "${GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE}"
             "${GGML_GEMMINI_IM2P_SIM_ARCHIVE}"

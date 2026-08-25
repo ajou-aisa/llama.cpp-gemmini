@@ -1,5 +1,8 @@
 #include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-gemmini.h"
 #include "../ggml/src/ggml-gemmini/quants/common/weight_reader.hpp"
+#include "../ggml/src/ggml-quants.h"
 
 #include <algorithm>
 #include <array>
@@ -111,9 +114,9 @@ struct ReaderFixture {
         q4_h0.qs[0] = 0x80;
         q4_h1.qs[0] = 0x80;
         q4_hp1.qs[0] = 0x80;
-        q4_h0.qs[15] = 0xf8;
-        q4_h1.qs[15] = 0xf8;
-        q4_hp1.qs[15] = 0xf8;
+        q4_h0.qs[15] = 0xf1;
+        q4_h1.qs[15] = 0xf1;
+        q4_hp1.qs[15] = 0xf1;
 
         q8_h0.qs[0] = std::numeric_limits<int8_t>::min();
         q8_h0.qs[16] = 0;
@@ -262,6 +265,14 @@ bool test_reader_happy_table() {
             ok = check(code.status == ReaderStatus::Success && code.value == expected[i],
                        "signed min/zero/max code decodes") && ok;
         }
+        if (test.bits == 4) {
+            const wreader::WeightCodeResult split_half_low =
+                wreader::read_code(fixture.args, plan, 0, 15);
+            ok = check(
+                split_half_low.status == ReaderStatus::Success &&
+                    split_half_low.value == -7,
+                "Q4 split-half low nibble decodes logical K=15") && ok;
+        }
 
         const wreader::WeightScaleResult scale =
             wreader::read_scale(fixture.args, plan, 0, 0);
@@ -392,6 +403,71 @@ bool test_reader_failure_table() {
     return ok;
 }
 
+bool test_q4_h1_narrow_scale_range_preserves_magnitude() {
+    constexpr int64_t columns = 64;
+    std::array<float, columns> source{};
+    for (int64_t i = 0; i < columns; ++i) {
+        const float block_max = i < 32 ? 1.0f : 1.001f;
+        source[i] = block_max * static_cast<float>((i % 17) - 8) / 8.0f;
+    }
+
+    std::array<block_q4_h1, 2> quantized{};
+    quantize_row_q4_h1_ref(source.data(), quantized.data(), columns);
+
+    bool ok = true;
+    for (size_t i = 0; i < quantized.size(); ++i) {
+        const float expected = ggml_fp16_to_fp32(
+            ggml_fp32_to_fp16((i == 0 ? 1.0f : 1.001f) / 7.0f));
+        const float actual =
+            quantized[i].s_rf * (static_cast<float>(quantized[i].R) + quantized[i].c_b);
+        if (!(std::fabs(actual - expected) <= expected * 0.01f)) {
+            std::fprintf(
+                stderr,
+                "FAIL: Q4_H1 narrow scale range collapsed: block=%zu expected=%g actual=%g R=%u\n",
+                i,
+                expected,
+                actual,
+                static_cast<unsigned>(quantized[i].R));
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+bool test_q4_hp1_power_of_two_scale_uses_available_codes() {
+    constexpr int64_t columns = 32;
+    std::array<float, columns> source{};
+    for (int64_t i = 0; i < columns; ++i) {
+        source[i] = static_cast<float>(i - 16) / 16.0f;
+    }
+
+    block_q4_hp1 quantized{};
+    if (!check(
+            quantize_row_q4_hp1_ref(source.data(), &quantized, columns),
+            "Q4_HP1 distributed-row quantization failed")) {
+        return false;
+    }
+
+    std::array<float, columns> decoded{};
+    dequantize_row_q4_hp1(&quantized, decoded.data(), columns);
+    double squared_error = 0.0;
+    for (int64_t i = 0; i < columns; ++i) {
+        const double error = static_cast<double>(decoded[i]) - source[i];
+        squared_error += error * error;
+    }
+    const double mean_squared_error = squared_error / columns;
+    if (!(mean_squared_error < 0.002)) {
+        std::fprintf(
+            stderr,
+            "FAIL: Q4_HP1 power-of-two scale wastes code range: mse=%g scale=%g exponent=%d\n",
+            mean_squared_error,
+            quantized.channel_scale,
+            static_cast<int>(quantized.m));
+        return false;
+    }
+    return true;
+}
+
 bool test_legacy_round_trips() {
     bool ok = true;
     ok = check(ggml_blck_size(GGML_TYPE_Q4_H1) == 32, "Q4_H1 block size") && ok;
@@ -402,10 +478,43 @@ bool test_legacy_round_trips() {
 
     ok = round_trip(GGML_TYPE_Q4_H1, 2.5f) && ok;
     ok = round_trip(GGML_TYPE_Q4_HP1, 2.5f) && ok;
+    ok = test_q4_h1_narrow_scale_range_preserves_magnitude() && ok;
+    ok = test_q4_hp1_power_of_two_scale_uses_available_codes() && ok;
     ok = round_trip(GGML_TYPE_Q16_0, 0.01f) && ok;
     ok = round_trip(GGML_TYPE_Q16_H1, 0.02f) && ok;
     ok = round_trip(GGML_TYPE_Q16_HP1, 0.02f) && ok;
     return ok;
+}
+
+bool test_q4_hp1_loader_contract() {
+#if GGML_GEMMINI_ACTIVATION_BITS == 4 && GGML_GEMMINI_WEIGHT_BITS == 4
+    ggml_init_params params = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 4,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!check(ctx != nullptr, "failed to create loader-contract context")) {
+        return false;
+    }
+
+    ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_HP1, 32, 2);
+    ggml_tensor * activation = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 1);
+    ggml_tensor * op = ggml_mul_mat(ctx, weight, activation);
+
+    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(ggml_backend_gemmini_reg(), 0);
+    ggml_backend_buffer_t buffer =
+        ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(dev), 0);
+    weight->buffer = buffer;
+    const bool supported = ggml_backend_dev_supports_op(dev, op);
+    weight->buffer = nullptr;
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+
+    return check(supported, "production GEMMINI rejects Q4_HP1 loader metadata");
+#else
+    return true;
+#endif
 }
 
 enum class Selection {
@@ -443,6 +552,7 @@ int main(int argc, char ** argv) {
     bool ok = true;
     if (selection == Selection::All || selection == Selection::HappyTable) {
         ok = test_legacy_round_trips() && ok;
+        ok = test_q4_hp1_loader_contract() && ok;
         ok = test_reader_happy_table() && ok;
     }
     if (selection == Selection::All || selection == Selection::FailureTable) {

@@ -1,5 +1,6 @@
 #define GGML_GEMMINI_MATMUL_IMPLEMENTATION 1
 #include "ggml-gemmini-matmul.hpp"
+#include "quants/common/weight_reader.hpp"
 
 #include <gemmini/log.hpp>
 #include <gemmini/cycle_reader.hpp>
@@ -532,12 +533,22 @@ bool valid_activation_metadata(const ggml_gemmini_args_t & args) {
     return metadata.valid();
 }
 
+bool finite_float_bits(const float * value) {
+    static_assert(sizeof(float) == sizeof(uint32_t));
+    static_assert(std::numeric_limits<float>::is_iec559);
+    uint32_t bits = 0;
+    std::memcpy(&bits, static_cast<const void *>(value), sizeof(bits));
+    constexpr uint32_t exponent_mask = UINT32_C(0x7f800000);
+    return (bits & exponent_mask) != exponent_mask;
+}
+
 bool finite_output(const ggml_gemmini_args_t & args) {
     const size_t row_stride = args.stride_f_out != 0 ? args.stride_f_out : args.J;
     const size_t col_stride = args.col_stride_f_out != 0 ? args.col_stride_f_out : 1;
     for (size_t row = 0; row < args.I; ++row) {
         for (size_t col = 0; col < args.J; ++col) {
-            if (!std::isfinite(args.f_out[row * row_stride + col * col_stride])) {
+            if (!finite_float_bits(
+                    &args.f_out[row * row_stride + col * col_stride])) {
                 return false;
             }
         }
@@ -560,26 +571,210 @@ baseline_activation_quant_t baseline_activation_for(const ggml_gemmini_args_t & 
     return baseline_activation_quant_t::EXSIA;
 }
 
-void execute_dense(ggml_gemmini_args_t &args) {
+MatMulStatus execute_native_matched_cpu_dense(ggml_gemmini_args_t & args) {
+    using namespace quants::wreader;
+    using namespace quants::wroute;
+
+    const WeightRoutePlan plan =
+        resolve_weight_route_plan(args, WeightScaleInfoMode::CommonOutput);
+    if (!plan.valid ||
+        weight_route_status(plan, WeightExecutionPath::CpuDirect) !=
+            WeightRouteStatus::Success ||
+        validate(args, plan) != WeightReaderStatus::Success ||
+        args.f_out == nullptr || !args.A.valid() ||
+        !route_covers_k(plan, args.K)) {
+        return MatMulStatus::invalid_contract;
+    }
+    if (args.I != 0 && args.K > std::numeric_limits<size_t>::max() / args.I) {
+        return MatMulStatus::invalid_arguments;
+    }
+
+    std::vector<float> activation;
+    try {
+        activation.resize(args.I * args.K);
+    } catch (const std::bad_alloc &) {
+        return MatMulStatus::invalid_arguments;
+    } catch (const std::length_error &) {
+        return MatMulStatus::invalid_arguments;
+    }
+
+    ggml_gemmini_args_t dense_args = args;
+    std::visit([](auto & meta) {
+        using T = std::decay_t<decltype(meta)>;
+        if constexpr (!std::is_same_v<T, quants::act::NoneMeta>) {
+            meta.rmd_packets.clear();
+            meta.direct_residuals.clear();
+        }
+    }, dense_args.act_quant.storage());
+    if (!quants::dequantize_activation(
+            activation.data(), args.K, 1, args.I, args.K, dense_args)) {
+        return MatMulStatus::invalid_contract;
+    }
+
+    const size_t block_size =
+        plan.scales.block_size != 0 ? plan.scales.block_size : args.block_size_k;
+    if (block_size == 0 ||
+        (args.J != 0 && args.K > std::numeric_limits<size_t>::max() / args.J)) {
+        return MatMulStatus::invalid_contract;
+    }
+
+    std::vector<float> weights;
+    try {
+        weights.resize(args.J * args.K);
+    } catch (const std::bad_alloc &) {
+        return MatMulStatus::invalid_arguments;
+    } catch (const std::length_error &) {
+        return MatMulStatus::invalid_arguments;
+    }
+
+    for (size_t j = 0; j < args.J; ++j) {
+        for (size_t block_begin = 0; block_begin < args.K;
+             block_begin += block_size) {
+            const size_t block_index = block_begin / block_size;
+            const WeightScaleResult scale =
+                read_scale_validated(args, plan, j, block_index);
+            if (!scale.ok()) {
+                return MatMulStatus::invalid_contract;
+            }
+            double weight_scale = 0.0;
+            if (scale.domain == WeightScaleDomain::FloatingBlock) {
+                weight_scale = scale.floating_block_scale;
+            } else if (scale.domain ==
+                       WeightScaleDomain::IntegerBlockTimesColumn) {
+                weight_scale =
+                    static_cast<double>(scale.integer_block_scale) *
+                    static_cast<double>(scale.column_scale);
+            } else {
+                return MatMulStatus::invalid_contract;
+            }
+            const size_t block_end =
+                std::min(args.K, block_begin + block_size);
+            for (size_t k = block_begin; k < block_end; ++k) {
+                const WeightCodeResult code =
+                    read_code_validated(args, plan, j, k);
+                if (!code.ok()) {
+                    return MatMulStatus::invalid_contract;
+                }
+                weights[j * args.K + k] =
+                    static_cast<float>(static_cast<double>(code.value) *
+                                       weight_scale);
+            }
+        }
+    }
+
+    std::vector<float> bias;
+    const float * bias_data = nullptr;
+    if (args.D != nullptr) {
+        if (args.I != 0 &&
+            args.J > std::numeric_limits<size_t>::max() / args.I) {
+            return MatMulStatus::invalid_arguments;
+        }
+        const size_t source_stride = args.sD != 0 ? args.sD : args.J;
+        if (!args.repeating_bias && args.I > 1 &&
+            source_stride >
+                (std::numeric_limits<size_t>::max() - (args.J - 1)) /
+                    (args.I - 1)) {
+            return MatMulStatus::invalid_arguments;
+        }
+        try {
+            bias.resize(args.I * args.J);
+        } catch (const std::bad_alloc &) {
+            return MatMulStatus::invalid_arguments;
+        } catch (const std::length_error &) {
+            return MatMulStatus::invalid_arguments;
+        }
+        for (size_t i = 0; i < args.I; ++i) {
+            const size_t source_row = args.repeating_bias ? 0 : i;
+            for (size_t j = 0; j < args.J; ++j) {
+                const size_t source_index = source_row * source_stride + j;
+                bias[i * args.J + j] = args.low_D
+                    ? static_cast<float>(
+                          static_cast<const elem_t *>(args.D)[source_index]) *
+                          static_cast<float>(args.scale_D)
+                    : static_cast<float>(
+                          static_cast<const acc_t *>(args.D)[source_index]) *
+                          static_cast<float>(args.scale_D);
+            }
+        }
+        bias_data = bias.data();
+    }
+
+    const size_t output_row_stride =
+        args.stride_f_out != 0 ? args.stride_f_out : args.J;
+    const size_t output_col_stride =
+        args.col_stride_f_out != 0 ? args.col_stride_f_out : 1;
+
+    if (output_col_stride == 1) {
+        matmul_cpu_fp(false, true, args.I, args.J, args.K,
+                      activation.data(), weights.data(), bias_data, args.f_out,
+                      args.K, args.K, args.J, output_row_stride);
+        return MatMulStatus::success;
+    }
+
+    if (args.I != 0 && args.J > std::numeric_limits<size_t>::max() / args.I) {
+        return MatMulStatus::invalid_arguments;
+    }
+    std::vector<float> contiguous_output;
+    try {
+        contiguous_output.resize(args.I * args.J);
+    } catch (const std::bad_alloc &) {
+        return MatMulStatus::invalid_arguments;
+    } catch (const std::length_error &) {
+        return MatMulStatus::invalid_arguments;
+    }
+    matmul_cpu_fp(false, true, args.I, args.J, args.K,
+                  activation.data(), weights.data(), bias_data,
+                  contiguous_output.data(), args.K, args.K, args.J, args.J);
+    for (size_t i = 0; i < args.I; ++i) {
+        for (size_t j = 0; j < args.J; ++j) {
+            args.f_out[i * output_row_stride + j * output_col_stride] =
+                contiguous_output[i * args.J + j];
+        }
+    }
+    return MatMulStatus::success;
+}
+
+MatMulStatus physical_dense_status(DenseMatmulStatus status) {
+    switch (status) {
+        case DenseMatmulStatus::success:
+            return MatMulStatus::success;
+        case DenseMatmulStatus::invalid_contract:
+            return MatMulStatus::invalid_contract;
+        case DenseMatmulStatus::unsupported:
+            return MatMulStatus::unsupported;
+    }
+    return MatMulStatus::invalid_state;
+}
+
+MatMulStatus execute_dense(ggml_gemmini_args_t &args) {
     if (args.A_fp32 != nullptr || args.B_fp32 != nullptr) {
         if (args.A_fp32 == nullptr || args.B_fp32 == nullptr || args.f_out == nullptr) {
-            return;
+            return MatMulStatus::invalid_contract;
         }
         test_detail::observe_dense_dispatch();
         test_detail::observe_backend_dispatch(true);
         matmul_cpu_fp(false, true, args.I, args.J, args.K,
                       args.A_fp32, args.B_fp32, nullptr, args.f_out,
                       args.sA, args.sB, args.col_stride_f_out, args.stride_f_out);
-        return;
+        return MatMulStatus::success;
     }
     test_detail::observe_dense_dispatch();
     test_detail::observe_backend_dispatch(args.tiled_matmul_type == CPU);
-    if (uses_baseline_channel_route(args)) {
-        tiled_matmul_auto_baseline(&args, baseline_activation_for(args), baseline_weight_quant_t::CHANNEL);
+    if (quants::wroute::is_native_matched_width_format(args)) {
+        if (args.tiled_matmul_type != CPU) {
+            return MatMulStatus::unsupported;
+        }
+        return execute_native_matched_cpu_dense(args);
+    } else if (uses_baseline_channel_route(args)) {
+        return physical_dense_status(tiled_matmul_auto_baseline(
+            &args, baseline_activation_for(args),
+            baseline_weight_quant_t::CHANNEL));
     } else if (args.weight_i8_scale_active) {
-        tiled_matmul_auto_baseline(&args, baseline_activation_for(args), baseline_weight_quant_t::TENSOR);
+        return physical_dense_status(tiled_matmul_auto_baseline(
+            &args, baseline_activation_for(args),
+            baseline_weight_quant_t::TENSOR));
     } else {
-        tiled_matmul_auto_im2p(&args);
+        return physical_dense_status(tiled_matmul_auto_im2p(&args));
     }
 }
 
@@ -622,8 +817,7 @@ MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe, size_
 
     (void) stripe_id;
 
-    execute_dense(args);
-    return MatMulStatus::success;
+    return execute_dense(args);
 }
 
 MatmulStatus to_public_status(MatMulStatus status, MatMulCapability capability,
@@ -1131,6 +1325,11 @@ MatMulResult MatMul::run_dense(bool transactional) {
     if (!valid_activation_metadata(args())) {
         return { MatMulStatus::invalid_contract, MatMulCapability::unsupported };
     }
+    if (!transactional &&
+        (!quants::activation_rmd_packets(args()).empty() ||
+         !quants::activation_direct_residuals(args()).empty())) {
+        return { MatMulStatus::invalid_contract, MatMulCapability::unsupported };
+    }
     if (!detail::route_capabilities(args()).full) {
         return { MatMulStatus::unsupported, MatMulCapability::unsupported };
     }
@@ -1201,7 +1400,13 @@ MatMulResult MatMul::run_dense(bool transactional) {
             return {transaction, MatMulCapability::unsupported};
         }
     }
-    execute_dense(args());
+    const MatMulStatus dense_status = execute_dense(args());
+    if (dense_status != MatMulStatus::success) {
+        if (transactional) {
+            discard_output_transaction();
+        }
+        return {dense_status, MatMulCapability::unsupported};
+    }
     return { MatMulStatus::success, MatMulCapability::supported };
 }
 
@@ -2029,7 +2234,9 @@ void MatmulStripeCollector::worker_loop() {
             }
 #endif
             if (status) status = execute_rmd_stripe(*job);
+#if GGML_GEMMINI_ENABLE_RMD
             if (status) status = compose_rmd_stripe(*job);
+#endif
             if (status) status = finalize_stripe(*job);
             if (status) {
                 const MatmulJobMetrics profile = job->metrics();
@@ -2161,9 +2368,11 @@ bool MatmulStripeCollector::on_ready(
         captured.row_begin = event.row_begin;
         captured.row_end = event.row_end;
         captured.activation_metadata = event.activation_metadata;
+#if GGML_GEMMINI_ENABLE_RMD
         // Shared handle only: the packet owns its buffers, so it outlives the ExSIA slot.
         captured.rmd_packet = event.rmd_packet;
         captured.direct_residual = event.direct_residual;
+#endif
         captured.la_cycles = event.local_end_cycle >= event.local_start_cycle ?
             event.local_end_cycle - event.local_start_cycle : 0;
         captured.la3_cycles = event.local_group3_end_cycle >= event.local_group3_start_cycle ?
@@ -2187,10 +2396,12 @@ bool MatmulStripeCollector::on_ready(
         captured.producer_wait = producer_wait;
         captured.producer_wait_start_ns = producer_wait_start_ns;
         captured.producer_wait_end_ns = producer_wait_end_ns;
+#if GGML_GEMMINI_ENABLE_RMD
         if (event.rmd_packet != nullptr || event.direct_residual != nullptr) {
             captured.rmd_pack.nanoseconds = event.rmd_pack_ns;
             captured.rmd_pack.count = 1;
         }
+#endif
         return captured;
     };
     try {
@@ -2481,6 +2692,10 @@ MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput in
 MatmulStripeJob capture_stripe(MatmulExecution & execution, MatmulStripeInput input,
                                residual::DirectStripePayloadHandle direct_residual,
                                rmd::StripePacketHandle rmd_packet) {
+#if !GGML_GEMMINI_ENABLE_RMD
+    direct_residual.reset();
+    rmd_packet.reset();
+#endif
     const auto start = Clock::now();
     MatmulStatus status{};
     std::lock_guard<std::mutex> state_lock(*execution.state_mutex_);
@@ -2932,7 +3147,9 @@ MatmulStatus execute_post_fold_pipeline(
         MatmulStatus status = job.status();
         if (status) status = execute_dense_stripe(job);
         if (status) status = execute_rmd_stripe(job);
+#if GGML_GEMMINI_ENABLE_RMD
         if (status) status = compose_rmd_stripe(job);
+#endif
         if (status) status = finalize_stripe(job);
         if (!status) {
             return status;
