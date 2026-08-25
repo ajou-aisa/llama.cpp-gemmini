@@ -300,13 +300,6 @@ bool common_column_scale_matches(const ggml_gemmini_args_t & args,
         current.column_scale == reference.column_scale;
 }
 
-double saturate_signed_32(int64_t value) {
-    return static_cast<double>(std::clamp(
-        value,
-        static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
-        static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
-}
-
 double saturate_signed_32(double value) {
     return std::clamp(
         value,
@@ -368,7 +361,7 @@ RmdStatus merge_rmd_correction_checked(const ggml_gemmini_args_t & args,
         for (size_t j = 0; j < args.J; ++j) {
             double domain_value = 0.0;
             if (integer != nullptr) {
-                domain_value = saturate_signed_32(integer->values[source_row + j]) *
+                domain_value = static_cast<double>(integer->values[source_row + j]) *
                     static_cast<double>(column_scale[j]);
             } else {
                 const double value = floating->values[source_row + j];

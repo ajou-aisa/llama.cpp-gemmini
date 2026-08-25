@@ -1,5 +1,6 @@
 #include "weight_reader.hpp"
 
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -47,6 +48,10 @@ using Route = wroute::WeightRouteKind;
 using ScaleDomain = wroute::WeightScaleDomain;
 
 constexpr size_t kBlockSize = 32;
+
+#if defined(GGML_GEMMINI_TESTING)
+std::atomic_size_t storage_validation_count{0};
+#endif
 
 bool checked_mul_size(size_t lhs, size_t rhs, size_t &result)
 {
@@ -165,6 +170,9 @@ WeightReaderStatus validate_storage(
     const ggml_gemmini_args_t &args,
     const wroute::WeightRoutePlan &plan)
 {
+#if defined(GGML_GEMMINI_TESTING)
+    storage_validation_count.fetch_add(1, std::memory_order_relaxed);
+#endif
     if (args.J == 0 || args.K == 0)
         return WeightReaderStatus::InvalidMetadata;
 
@@ -435,18 +443,13 @@ WeightReaderStatus validate(
     return WeightReaderStatus::Success;
 }
 
-WeightCodeResult read_code(
+WeightCodeResult read_code_validated(
     const ggml_gemmini_args_t &args,
     const wroute::WeightRoutePlan &plan,
     size_t j,
     size_t k)
 {
     WeightCodeResult result{};
-    const WeightReaderStatus storage = validate_storage(args, plan);
-    if (storage != WeightReaderStatus::Success) {
-        result.status = storage;
-        return result;
-    }
     if (j >= args.J || k >= args.K) {
         result.status = WeightReaderStatus::InvalidArguments;
         return result;
@@ -555,6 +558,30 @@ WeightCodeResult read_code(
     return result;
 }
 
+WeightCodeResult read_code(
+    const ggml_gemmini_args_t &args,
+    const wroute::WeightRoutePlan &plan,
+    size_t j,
+    size_t k)
+{
+    WeightCodeResult result{};
+    const WeightReaderStatus storage = validate_storage(args, plan);
+    if (storage != WeightReaderStatus::Success) {
+        result.status = storage;
+        return result;
+    }
+    return read_code_validated(args, plan, j, k);
+}
+
+WeightScaleResult read_scale_validated(
+    const ggml_gemmini_args_t &args,
+    const wroute::WeightRoutePlan &plan,
+    size_t j,
+    size_t block_index)
+{
+    return read_scale_unchecked(args, plan, j, block_index);
+}
+
 WeightScaleResult read_scale(
     const ggml_gemmini_args_t &args,
     const wroute::WeightRoutePlan &plan,
@@ -563,7 +590,7 @@ WeightScaleResult read_scale(
 {
     const WeightReaderStatus storage = validate_storage(args, plan);
     return storage == WeightReaderStatus::Success ?
-        read_scale_unchecked(args, plan, j, block_index) : invalid_scale(storage);
+        read_scale_validated(args, plan, j, block_index) : invalid_scale(storage);
 }
 
 const char *weight_reader_status_name(WeightReaderStatus status)
@@ -577,5 +604,17 @@ const char *weight_reader_status_name(WeightReaderStatus status)
     }
     return "unsupported-format";
 }
+
+#if defined(GGML_GEMMINI_TESTING)
+void test_reset_weight_reader_counters()
+{
+    storage_validation_count.store(0, std::memory_order_relaxed);
+}
+
+size_t test_weight_reader_storage_validations()
+{
+    return storage_validation_count.load(std::memory_order_relaxed);
+}
+#endif
 
 }

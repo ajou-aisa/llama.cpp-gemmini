@@ -10,6 +10,8 @@ namespace ggml::gemmini::residual {
 struct DirectExecutionMetrics {
     size_t event_count = 0;
     size_t call_count = 0;
+    size_t native_q8_values = 0;
+    size_t j_tile_count = 0;
 };
 
 // Computes one immutable direct payload into a staged row-major [row_count, J]

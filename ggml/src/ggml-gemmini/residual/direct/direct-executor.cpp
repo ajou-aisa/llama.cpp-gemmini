@@ -18,6 +18,7 @@ namespace {
 
 namespace wreader = quants::wreader;
 namespace wroute = quants::wroute;
+using WeightFormat = ggml_gemmini_args_t::im2p_weight_format_t;
 
 constexpr size_t kJTile = 16;
 constexpr __int128 kInt64Min = static_cast<__int128>(std::numeric_limits<int64_t>::min());
@@ -60,6 +61,22 @@ bool uses_reader_scale(const wroute::WeightRoutePlan & plan) {
     return plan.route == wroute::WeightRouteKind::H0 ||
         plan.route == wroute::WeightRouteKind::H1 ||
         plan.route == wroute::WeightRouteKind::HP1;
+}
+
+const int8_t * native_q8_codes(const ggml_gemmini_args_t & args,
+                               size_t j, size_t block_id) {
+    switch (args.weight_format) {
+        case WeightFormat::q8_h1: {
+            const block_q8_h1 * block = args.q8_h1_block(j, block_id);
+            return block == nullptr ? nullptr : block->qs;
+        }
+        case WeightFormat::q8_hp1: {
+            const block_q8_hp1 * block = args.q8_hp1_block(j, block_id);
+            return block == nullptr ? nullptr : block->qs;
+        }
+        default:
+            return nullptr;
+    }
 }
 
 bool finite_double(double value) {
@@ -131,10 +148,23 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
         return rmd::RmdStatus::allocation_failure;
     }
 
+    const size_t j_tile_count =
+        (payload.logical_j + kJTile - 1) / kJTile;
+    std::vector<rmd::RmdStatus> tile_status;
+    std::vector<size_t> tile_native_q8_values;
+    try {
+        tile_status.assign(j_tile_count, rmd::RmdStatus::success);
+        tile_native_q8_values.assign(j_tile_count, 0);
+    } catch (const std::bad_alloc &) {
+        return rmd::RmdStatus::allocation_failure;
+    }
+
     // Events are canonical row/K order. For each J tile, consume contiguous
     // row/block/K spans, then apply that block's scale exactly once.
-    for (size_t j_begin = 0; j_begin < payload.logical_j; j_begin += kJTile) {
+    auto execute_j_tile = [&](size_t tile_index) {
+        const size_t j_begin = tile_index * kJTile;
         const size_t tile_j = std::min(kJTile, payload.logical_j - j_begin);
+        size_t & native_q8_values = tile_native_q8_values[tile_index];
         size_t event_index = 0;
         while (event_index < payload.events.size()) {
             const ResidualEvent & first = payload.events[event_index];
@@ -148,17 +178,28 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
             }
 
             std::array<int64_t, kJTile> block_sum{};
-            for (size_t index = event_index; index < span_end; ++index) {
-                const ResidualEvent & event = payload.events[index];
-                for (size_t local_j = 0; local_j < tile_j; ++local_j) {
-                    const wreader::WeightCodeResult code = wreader::read_code(
-                        args, plan, j_begin + local_j, event.original_k);
-                    if (!code.ok()) return reader_failure(code.status);
-                    int64_t product = 0;
-                    if (!checked_multiply(event.residual, code.value, product) ||
-                        !checked_add(block_sum[local_j], product, block_sum[local_j])) {
-                        return rmd::RmdStatus::overflow;
+            for (size_t local_j = 0; local_j < tile_j; ++local_j) {
+                const size_t j = j_begin + local_j;
+                const int8_t * codes = native_q8_codes(args, j, block_id);
+                if (codes != nullptr) {
+                    for (size_t index = event_index; index < span_end; ++index) {
+                        const ResidualEvent & event = payload.events[index];
+                        block_sum[local_j] +=
+                            static_cast<int64_t>(event.residual) *
+                            codes[event.original_k % rmd::kBlockSize];
                     }
+                    native_q8_values += span_end - event_index;
+                    continue;
+                }
+                for (size_t index = event_index; index < span_end; ++index) {
+                    const ResidualEvent & event = payload.events[index];
+                    const wreader::WeightCodeResult code = wreader::read_code_validated(
+                        args, plan, j, event.original_k);
+                    if (!code.ok()) return reader_failure(code.status);
+                    // A block has at most 32 signed INT16 codes and INT32
+                    // residuals, so its complete dot product fits in INT64.
+                    block_sum[local_j] +=
+                        static_cast<int64_t>(event.residual) * code.value;
                 }
             }
 
@@ -166,7 +207,7 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
                 const size_t j = j_begin + local_j;
                 wreader::WeightScaleResult scale{};
                 if (uses_reader_scale(plan)) {
-                    scale = wreader::read_scale(args, plan, j, block_id);
+                    scale = wreader::read_scale_validated(args, plan, j, block_id);
                     if (!scale.ok()) return reader_failure(scale.status);
                 } else {
                     scale.status = wreader::WeightReaderStatus::Success;
@@ -202,6 +243,24 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
             }
             event_index = span_end;
         }
+        return rmd::RmdStatus::success;
+    };
+
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+#pragma omp parallel for schedule(static) if(j_tile_count > 1)
+#endif
+    for (std::ptrdiff_t tile_index = 0;
+         tile_index < static_cast<std::ptrdiff_t>(j_tile_count);
+         ++tile_index) {
+        tile_status[static_cast<size_t>(tile_index)] =
+            execute_j_tile(static_cast<size_t>(tile_index));
+    }
+    size_t native_q8_values = 0;
+    for (size_t tile_index = 0; tile_index < j_tile_count; ++tile_index) {
+        if (tile_status[tile_index] != rmd::RmdStatus::success) {
+            return tile_status[tile_index];
+        }
+        native_q8_values += tile_native_q8_values[tile_index];
     }
 
     rmd::DirectOutput staged_output = floating_block ?
@@ -211,6 +270,8 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
     if (metrics != nullptr) {
         metrics->event_count = payload.events.size();
         metrics->call_count = 1;
+        metrics->native_q8_values = native_q8_values;
+        metrics->j_tile_count = j_tile_count;
     }
     return rmd::RmdStatus::success;
 }

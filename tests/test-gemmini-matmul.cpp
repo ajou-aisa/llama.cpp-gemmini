@@ -334,16 +334,22 @@ bool test_correction_domain_composition() {
             full_destination == std::vector<float>({3.0f, -1.0f}),
         "FULL H1 correction applies column scale exactly once");
 
-    std::vector<float> saturated = { 0.0f, 0.0f };
+    constexpr int64_t wide_positive =
+        static_cast<int64_t>(std::numeric_limits<int32_t>::max()) + 4096;
+    constexpr int64_t wide_negative =
+        static_cast<int64_t>(std::numeric_limits<int32_t>::min()) - 4096;
+    std::vector<float> wide_output = { 0.0f, 0.0f };
     const rmd::Correction wide = rmd::BlockScaledInt64Correction{{
-        std::numeric_limits<int64_t>::max(), std::numeric_limits<int64_t>::min(),
+        wide_positive, wide_negative,
     }};
     ok = expect(
-        rmd::merge_rmd_correction_to(args, saturated.data(), 0, 1, wide) ==
+        rmd::merge_rmd_correction_to(args, wide_output.data(), 0, 1, wide) ==
                 rmd::RmdStatus::success &&
-            saturated[0] == static_cast<float>(std::numeric_limits<int32_t>::max()) * 0.25f &&
-            saturated[1] == static_cast<float>(std::numeric_limits<int32_t>::min()) * 0.25f,
-        "signed-32 saturation occurs after complete integer composition") && ok;
+            wide_output[0] == static_cast<float>(
+                static_cast<double>(wide_positive) * 0.25) &&
+            wide_output[1] == static_cast<float>(
+                static_cast<double>(wide_negative) * 0.25),
+        "H1 CPU correction retains int64 domain until column scaling") && ok;
 
     block_q8_0 h0[2]{};
     h0[0].d = ggml_fp32_to_fp16(0.5f);

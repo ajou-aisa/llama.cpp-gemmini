@@ -61,11 +61,30 @@ namespace ggml::gemmini::quants::wreader
         size_t j,
         size_t k);
 
+    // Requires a plan returned by resolve_weight_route_plan. The plan already
+    // validated immutable weight storage, so hot loops must not repeat it.
+    WeightCodeResult read_code_validated(
+        const ggml_gemmini_args_t &args,
+        const wroute::WeightRoutePlan &plan,
+        size_t j,
+        size_t k);
+
     WeightScaleResult read_scale(
         const ggml_gemmini_args_t &args,
         const wroute::WeightRoutePlan &plan,
         size_t j,
         size_t block_index);
 
+    WeightScaleResult read_scale_validated(
+        const ggml_gemmini_args_t &args,
+        const wroute::WeightRoutePlan &plan,
+        size_t j,
+        size_t block_index);
+
     const char *weight_reader_status_name(WeightReaderStatus status);
+
+#if defined(GGML_GEMMINI_TESTING)
+    void test_reset_weight_reader_counters();
+    size_t test_weight_reader_storage_validations();
+#endif
 }

@@ -6,6 +6,7 @@
 #include "../ggml/src/ggml-gemmini/quants/act/stripe/stripe.hpp"
 #include "../ggml/src/ggml-gemmini/quants/act/stripe/types.hpp"
 #include "../ggml/src/ggml-gemmini/quants/act/token/types.hpp"
+#include "../ggml/src/ggml-gemmini/quants/common/weight_reader.hpp"
 
 #include <ggml.h>
 #ifndef GEMMINI_EXSIA_WRITER_TEST_ONLY
@@ -1190,13 +1191,26 @@ bool test_direct_cpu_executor() {
     native_args.block_size_k = QK8_0;
     std::vector<rmd::OutputValue> native_expected;
     rmd::Correction native_actual = rmd::BlockScaledInt64Correction{{91, 92, 93}};
+    residual::DirectExecutionMetrics native_metrics{};
     if (!check(reference(native_args, *native_payload, native_expected) == rmd::RmdStatus::success,
-               "direct native reference succeeds") ||
-        !check(residual::execute_direct_stripe(native_args, *native_payload, native_actual) ==
+               "direct native reference succeeds")) {
+        return false;
+    }
+    quants::wreader::test_reset_weight_reader_counters();
+    if (
+        !check(residual::execute_direct_stripe(
+                   native_args, *native_payload, native_actual, &native_metrics) ==
                    rmd::RmdStatus::success,
                "direct native execution succeeds") ||
         !check(integer_values_equal(native_actual, native_expected),
-               "direct sparse/decode/reused-K/multi-block/tail/cancellation parity")) return false;
+               "direct sparse/decode/reused-K/multi-block/tail/cancellation parity") ||
+        !check(quants::wreader::test_weight_reader_storage_validations() == 1,
+               "direct executor validates immutable weight storage once per call") ||
+        !check(native_metrics.native_q8_values ==
+                   native_payload->events.size() * native_args.J,
+               "direct executor consumes native Q8 values without generic reader calls") ||
+        !check(native_metrics.j_tile_count == (native_args.J + 15) / 16,
+               "direct executor publishes independent J tiles for parallel service")) return false;
 
     constexpr size_t dense_rows = 2, dense_columns = 5, dense_k = 37;
     std::vector<elem_t> dense_weights(dense_k * dense_columns);
