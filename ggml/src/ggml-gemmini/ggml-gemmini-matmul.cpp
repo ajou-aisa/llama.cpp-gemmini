@@ -2,6 +2,7 @@
 #define GGML_GEMMINI_MATMUL_IMPLEMENTATION 1
 #endif
 #include "ggml-gemmini-matmul.hpp"
+#include <gemmini_scheduler.h>
 
 #include <gemmini/log.hpp>
 #include <gemmini/cycle_reader.hpp>
@@ -527,17 +528,18 @@ baseline_activation_quant_t baseline_activation_for(const ggml_gemmini_args_t & 
     return baseline_activation_quant_t::EXSIA;
 }
 
-void execute_dense(ggml_gemmini_args_t &args) {
+int execute_dense_matmul(const gemmini_op_desc_t *, void * context) {
+    auto & args = *static_cast<ggml_gemmini_args_t *>(context);
     if (args.A_fp32 != nullptr || args.B_fp32 != nullptr) {
         if (args.A_fp32 == nullptr || args.B_fp32 == nullptr || args.f_out == nullptr) {
-            return;
+            return -1;
         }
         test_detail::observe_dense_dispatch();
         test_detail::observe_backend_dispatch(true);
         matmul_cpu_fp(false, true, args.I, args.J, args.K,
                       args.A_fp32, args.B_fp32, nullptr, args.f_out,
                       args.sA, args.sB, args.col_stride_f_out, args.stride_f_out);
-        return;
+        return 0;
     }
     test_detail::observe_dense_dispatch();
     test_detail::observe_backend_dispatch(args.tiled_matmul_type == CPU);
@@ -548,6 +550,30 @@ void execute_dense(ggml_gemmini_args_t &args) {
     } else {
         tiled_matmul_auto_im2p(&args);
     }
+    return 0;
+}
+
+void dispatch_dense_matmul(ggml_gemmini_args_t &args) {
+    gemmini_op_desc_t desc{};
+    gemmini_scheduler_init_op(&desc);
+    desc.source = GEMMINI_SOURCE_LLAMA;
+    desc.qos_class = args.I == 1 ? GEMMINI_QOS_LATENCY : GEMMINI_QOS_THROUGHPUT;
+    desc.priority = args.I == 1 ? 80 : 10;
+    desc.M = args.I;
+    desc.N = args.J;
+    desc.K = args.K;
+    desc.A = args.A_fp32 ? static_cast<const void *>(args.A_fp32) : nullptr;
+    desc.B = args.B_fp32 ? static_cast<const void *>(args.B_fp32) : static_cast<const void *>(args.B);
+    desc.C = args.f_out ? static_cast<void *>(args.f_out) : args.C;
+    desc.lda = args.sA;
+    desc.ldb = args.sB;
+    desc.ldc = args.stride_f_out ? args.stride_f_out : args.sC;
+    desc.transpose_A = args.transpose_A;
+    desc.transpose_B = args.transpose_B;
+    gemmini_scheduler_apply_request_context(&desc);
+    desc.executor = execute_dense_matmul;
+    desc.executor_context = &args;
+    (void) gemmini_scheduler_execute(&desc);
 }
 
 MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe, size_t stripe_id,
@@ -562,7 +588,7 @@ MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe, size_
     }
 
     if (args.tile_I == 0 || args.tile_J == 0 || args.tile_K == 0) {
-        gemmini_set_tile_ws(&args);
+        gemmini_set_tile(&args);
     }
     const size_t metadata_tile_I = args.tile_I;
     if (stripe.row_begin > std::numeric_limits<size_t>::max() - args.activation_row_offset) {
@@ -572,7 +598,7 @@ MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe, size_
     args.activation_row_offset += stripe.row_begin;
 
     args.I = stripe.row_end - stripe.row_begin;
-    gemmini_set_tile_ws(&args);
+    gemmini_set_tile(&args);
     args.tile_I = metadata_tile_I;
     if (args.A.valid()) {
         args.A = original_A.slice_rows(stripe.row_begin, args.I);
@@ -585,7 +611,7 @@ MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe, size_
     (void) stripe_id;
     (void) metadata_is_local;
 
-    execute_dense(args);
+    dispatch_dense_matmul(args);
     return MatMulStatus::success;
 }
 
@@ -1119,7 +1145,7 @@ MatMulResult MatMul::run_dense() {
             break;
     }
 
-    execute_dense(args());
+    dispatch_dense_matmul(args());
     return { MatMulStatus::success, MatMulCapability::supported };
 }
 

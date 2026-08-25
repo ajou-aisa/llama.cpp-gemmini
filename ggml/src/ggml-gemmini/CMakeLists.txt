@@ -81,6 +81,7 @@ ggml_add_backend_library(ggml-gemmini
 target_compile_features(ggml-gemmini PRIVATE cxx_std_17)
 target_compile_definitions(ggml-gemmini PRIVATE
   GGML_GEMMINI_MATMUL_IMPLEMENTATION
+  ERROR_COMPENSATION=1
   GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE})
 if (LLAMA_BUILD_TESTS AND NOT GGML_BACKEND_DL)
   target_compile_definitions(ggml-gemmini PUBLIC GGML_GEMMINI_TESTING=1)
@@ -132,8 +133,24 @@ target_include_directories(ggml-gemmini PRIVATE
   ${GEMMINI_SW_PATH}/rocc-software/src
 )
 
+if (NOT TARGET gemmini_scheduler)
+  get_filename_component(LLAMA_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
+  set(GEMMINI_SCHEDULER_DIR "${LLAMA_ROOT}/../gemmini-scheduler" CACHE PATH
+      "Path to the libgemmini_scheduler source tree")
+  if (EXISTS "${GEMMINI_SCHEDULER_DIR}/CMakeLists.txt")
+    set(GEMMINI_SCHEDULER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${GEMMINI_SCHEDULER_DIR}"
+                     "${CMAKE_CURRENT_BINARY_DIR}/gemmini-scheduler-build"
+                     EXCLUDE_FROM_ALL)
+  else()
+    find_package(GemminiScheduler CONFIG REQUIRED)
+    add_library(gemmini_scheduler ALIAS GemminiScheduler::gemmini_scheduler)
+  endif()
+endif()
+
 target_link_libraries(ggml-gemmini PRIVATE
   ggml-gemmini-utils
+  gemmini_scheduler
 )
 
 if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")

@@ -623,7 +623,7 @@ bool test_rmd_ws_contract_probe() {
     }
     const bool raw_ok = check(all_ok, "RMD WS raw I-tile grid");
     // Keep this fixture deliberately independent of the raw-grid sentinel probe above:
-    // it mirrors execute_dense's dense WS setup and then calls the resolved Gemmini API.
+    // It mirrors dispatch_dense_matmul's dense WS setup and then calls the resolved Gemmini API.
     alignas(64) elem_t dense_a[2] = {1, 2};
     alignas(64) elem_t dense_b[4] = {1, 3, 2, 4}; // physical [J][K]
     alignas(64) float dense_out[2] = {-99.0f, -99.0f};

@@ -1199,7 +1199,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     // set tile size
     start = ggml::gemmini::cycle::read();
-    ggml::gemmini::gemmini_set_tile_ws(&args);
+    ggml::gemmini::gemmini_set_tile(&args);
     end = ggml::gemmini::cycle::read();
     ggml::gemmini::log::cycle(layer, "cpu.Set tile size", start, end);
 
