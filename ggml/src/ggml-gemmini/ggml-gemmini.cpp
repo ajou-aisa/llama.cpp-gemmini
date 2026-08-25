@@ -101,7 +101,6 @@ namespace
 #endif
 
     bool gemmini_is_native_matched_weight_type(ggml_type type) {
-#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
         if constexpr (GGML_GEMMINI_ACTIVATION_BITS == 4 &&
                       GGML_GEMMINI_WEIGHT_BITS == 4) {
             return type == GGML_TYPE_Q4_0 ||
@@ -114,9 +113,6 @@ namespace
                    type == GGML_TYPE_Q16_H1 ||
                    type == GGML_TYPE_Q16_HP1;
         }
-#else
-        (void) type;
-#endif
         return false;
     }
 

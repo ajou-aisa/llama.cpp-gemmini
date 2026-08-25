@@ -1,4 +1,6 @@
 #include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-gemmini.h"
 #include "../ggml/src/ggml-gemmini/quants/common/weight_reader.hpp"
 
 #include <algorithm>
@@ -408,6 +410,33 @@ bool test_legacy_round_trips() {
     return ok;
 }
 
+bool test_q4_hp1_loader_contract() {
+    ggml_init_params params = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 4,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!check(ctx != nullptr, "failed to create loader-contract context")) {
+        return false;
+    }
+
+    ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_HP1, 32, 2);
+    ggml_tensor * activation = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 1);
+    ggml_tensor * op = ggml_mul_mat(ctx, weight, activation);
+
+    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(ggml_backend_gemmini_reg(), 0);
+    ggml_backend_buffer_t buffer =
+        ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(dev), 0);
+    weight->buffer = buffer;
+    const bool supported = ggml_backend_dev_supports_op(dev, op);
+    weight->buffer = nullptr;
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+
+    return check(supported, "production GEMMINI rejects Q4_HP1 loader metadata");
+}
+
 enum class Selection {
     All,
     HappyTable,
@@ -443,6 +472,7 @@ int main(int argc, char ** argv) {
     bool ok = true;
     if (selection == Selection::All || selection == Selection::HappyTable) {
         ok = test_legacy_round_trips() && ok;
+        ok = test_q4_hp1_loader_contract() && ok;
         ok = test_reader_happy_table() && ok;
     }
     if (selection == Selection::All || selection == Selection::FailureTable) {

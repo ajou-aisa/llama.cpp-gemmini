@@ -661,6 +661,9 @@ if (NOT GGML_BACKEND_DL)
     add_executable(test-gemmini-matmul test-gemmini-matmul.cpp)
     target_link_libraries(test-gemmini-matmul PRIVATE ggml-gemmini ggml-base)
     target_compile_features(test-gemmini-matmul PRIVATE cxx_std_17)
+    target_compile_definitions(test-gemmini-matmul PRIVATE
+        GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+        GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE})
     add_test(NAME test-gemmini-matmul COMMAND $<TARGET_FILE:test-gemmini-matmul>)
     find_package(Threads REQUIRED)
     add_executable(test-gemmini-buffer-artifacts test-gemmini-buffer-artifacts.cpp)

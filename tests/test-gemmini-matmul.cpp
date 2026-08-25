@@ -662,6 +662,64 @@ bool test_cancel_and_failure() {
                "startup failure propagates");
 }
 
+bool test_native_q4_hp1_cpu_dense_output() {
+#if GGML_GEMMINI_ACTIVATION_BITS == 4 && GGML_GEMMINI_WEIGHT_BITS == 4
+    ggml_gemmini_args_t args{};
+    args.I = 1;
+    args.J = 1;
+    args.K = 32;
+    args.sA = args.K;
+    args.tiled_matmul_type = static_cast<tiled_matmul_type_t>(2);
+    args.tile_I = 1;
+    args.tile_J = 1;
+    args.tile_K = 1;
+    args.activation_rows_per_stripe = DIM;
+    args.transpose_B = true;
+    if (!args.A.allocate(args.I, args.K, 4)) {
+        return expect(false, "Q4 activation allocation succeeds");
+    }
+    for (size_t k = 0; k < args.K; ++k) {
+        if (!args.A.set(0, k, 3)) {
+            return expect(false, "Q4 activation initialization succeeds");
+        }
+    }
+    args.act_quant.storage().emplace<quants::act::exsia::Meta>().theta = { -1 };
+
+    block_q4_hp1 weight{};
+    std::memset(weight.qs, 0x99, sizeof(weight.qs));
+    weight.m = 0;
+    weight.channel_scale = 2.0f;
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q4_hp1;
+    args.q4_hp1_blocks = &weight;
+    args.native_block_count = 1;
+    args.native_blocks_per_row = 1;
+    args.blocks_per_row = 1;
+    args.blocks_K = 1;
+    args.blocks_J = 1;
+    args.blocks_I = 1;
+    args.block_size_k = 32;
+    args.native_weight_bytes = sizeof(weight);
+
+    float output = -7.0f;
+    args.f_out = &output;
+    args.stride_f_out = 1;
+    args.col_stride_f_out = 1;
+
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::full;
+    options.rmd_backend = RmdBackend::cpu_direct;
+    const MatmulStatus status = matmul(args, options);
+    if (!status.ok()) {
+        std::fprintf(stderr, "native Q4_HP1 status=%u message=%s\n",
+                     static_cast<unsigned>(status.code), status.message);
+    }
+    return expect(status.ok(), "native Q4_HP1 CPU FULL succeeds") &&
+        expect(output == 96.0f, "native Q4_HP1 CPU FULL computes scaled dot product");
+#else
+    return true;
+#endif
+}
+
 }
 
 int main(int argc, char ** argv) {
@@ -697,9 +755,17 @@ int main(int argc, char ** argv) {
         }
         return ok ? 0 : 1;
     }
+    if (argc == 2 && std::string(argv[1]) == "--case=native-q4-cpu") {
+        const bool ok = test_native_q4_hp1_cpu_dense_output();
+        if (ok) {
+            std::puts("PASS: native Q4_HP1 CPU dense output");
+        }
+        return ok ? 0 : 1;
+    }
     if (!test_removed_sequential_rejects_before_work() ||
         !test_invalid_geometry_rejects_before_allocation() ||
         !test_output_parity() || !test_single_row_pipeline() ||
+        !test_native_q4_hp1_cpu_dense_output() ||
         !test_counter_hooks_connected() ||
         !test_cpu_direct_lifecycle_parity() ||
         !test_correction_domain_composition() ||
