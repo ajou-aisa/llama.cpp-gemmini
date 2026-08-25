@@ -2,6 +2,7 @@
 #include "ggml-backend.h"
 #include "ggml-gemmini.h"
 #include "../ggml/src/ggml-gemmini/quants/common/weight_reader.hpp"
+#include "../ggml/src/ggml-quants.h"
 
 #include <algorithm>
 #include <array>
@@ -402,6 +403,71 @@ bool test_reader_failure_table() {
     return ok;
 }
 
+bool test_q4_h1_narrow_scale_range_preserves_magnitude() {
+    constexpr int64_t columns = 64;
+    std::array<float, columns> source{};
+    for (int64_t i = 0; i < columns; ++i) {
+        const float block_max = i < 32 ? 1.0f : 1.001f;
+        source[i] = block_max * static_cast<float>((i % 17) - 8) / 8.0f;
+    }
+
+    std::array<block_q4_h1, 2> quantized{};
+    quantize_row_q4_h1_ref(source.data(), quantized.data(), columns);
+
+    bool ok = true;
+    for (size_t i = 0; i < quantized.size(); ++i) {
+        const float expected = ggml_fp16_to_fp32(
+            ggml_fp32_to_fp16((i == 0 ? 1.0f : 1.001f) / 7.0f));
+        const float actual =
+            quantized[i].s_rf * (static_cast<float>(quantized[i].R) + quantized[i].c_b);
+        if (!(std::fabs(actual - expected) <= expected * 0.01f)) {
+            std::fprintf(
+                stderr,
+                "FAIL: Q4_H1 narrow scale range collapsed: block=%zu expected=%g actual=%g R=%u\n",
+                i,
+                expected,
+                actual,
+                static_cast<unsigned>(quantized[i].R));
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+bool test_q4_hp1_power_of_two_scale_uses_available_codes() {
+    constexpr int64_t columns = 32;
+    std::array<float, columns> source{};
+    for (int64_t i = 0; i < columns; ++i) {
+        source[i] = static_cast<float>(i - 16) / 16.0f;
+    }
+
+    block_q4_hp1 quantized{};
+    if (!check(
+            quantize_row_q4_hp1_ref(source.data(), &quantized, columns),
+            "Q4_HP1 distributed-row quantization failed")) {
+        return false;
+    }
+
+    std::array<float, columns> decoded{};
+    dequantize_row_q4_hp1(&quantized, decoded.data(), columns);
+    double squared_error = 0.0;
+    for (int64_t i = 0; i < columns; ++i) {
+        const double error = static_cast<double>(decoded[i]) - source[i];
+        squared_error += error * error;
+    }
+    const double mean_squared_error = squared_error / columns;
+    if (!(mean_squared_error < 0.002)) {
+        std::fprintf(
+            stderr,
+            "FAIL: Q4_HP1 power-of-two scale wastes code range: mse=%g scale=%g exponent=%d\n",
+            mean_squared_error,
+            quantized.channel_scale,
+            static_cast<int>(quantized.m));
+        return false;
+    }
+    return true;
+}
+
 bool test_legacy_round_trips() {
     bool ok = true;
     ok = check(ggml_blck_size(GGML_TYPE_Q4_H1) == 32, "Q4_H1 block size") && ok;
@@ -412,6 +478,8 @@ bool test_legacy_round_trips() {
 
     ok = round_trip(GGML_TYPE_Q4_H1, 2.5f) && ok;
     ok = round_trip(GGML_TYPE_Q4_HP1, 2.5f) && ok;
+    ok = test_q4_h1_narrow_scale_range_preserves_magnitude() && ok;
+    ok = test_q4_hp1_power_of_two_scale_uses_available_codes() && ok;
     ok = round_trip(GGML_TYPE_Q16_0, 0.01f) && ok;
     ok = round_trip(GGML_TYPE_Q16_H1, 0.02f) && ok;
     ok = round_trip(GGML_TYPE_Q16_HP1, 0.02f) && ok;
