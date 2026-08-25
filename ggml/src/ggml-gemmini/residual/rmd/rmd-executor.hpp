@@ -88,8 +88,8 @@ void collect_packet_metrics(const StripePacket & packet, RmdExecutionMetrics & m
 
 // Executes every block of the compact packet, applies the block integer scale exactly
 // once, and writes canonical block-scaled INT64 output. H1/HP1 routes use checked
-// Rocket C++ lane dots for every supported width; other compact routes use Gemmini WS
-// and are unavailable on host builds.
+// checked Rocket C++ lane dots; hardware compact routes use the normal Gemmini WS
+// entry point and are unavailable on host builds.
 RmdStatus execute_rmd_stripe_ws(const ggml_gemmini_args_t & args,
                                 const StripePacket & packet,
                                 CompressedOutput & output,

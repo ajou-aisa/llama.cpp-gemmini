@@ -19,8 +19,8 @@ RmdStatus reference_direct_correction(const ggml_gemmini_args_t & args,
                                       const std::vector<ReferenceResidual> & residuals,
                                       std::vector<OutputValue> & correction);
 
-// Same result, computed through the balanced radix-256 digits. Used to prove the
-// decomposition itself is exact independently of packing and tiling.
+// Same result, reconstructed through the route's balanced radix 16, 256, or 65536
+// digits. Used to prove decomposition is exact independently of packing and tiling.
 RmdStatus reference_rmd_correction(const ggml_gemmini_args_t & args,
                                    size_t row_count,
                                    const std::vector<ReferenceResidual> & residuals,

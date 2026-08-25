@@ -9,7 +9,9 @@ namespace ggml::gemmini::rmd {
 // Radix composition of the canonical block-scaled INT64 output.
 //
 //     correction[row][j] = sum over blocks, lanes of
-//         output[block][lane position][row][j] * 256 ^ lane_id
+//         output[block][lane position][row][j] * radix(digit_bits) ^ lane_id
+//
+// Reconstruction uses checked integer Horner steps for radix 16, 256, or 65536.
 //
 // The block scale is NOT re-applied here; the executor already did it. Original K
 // indices are not used: they only exist for input compaction and weight gather.
@@ -47,9 +49,9 @@ RmdStatus merge_rmd_correction(const ggml_gemmini_args_t & args,
 // observe the intermediate compressed output.
 RmdStatus apply_rmd_packet_ws(const ggml_gemmini_args_t & args, const StripePacket & packet);
 
-// Rebuilds the dense INT32 residual plane carried by a set of stripe packets. Only the
-// activation dequantizers (validation / FLOAT parity) need this; the compensation path
-// never materialises a residual plane.
+// Rebuilds the dense INT32 residual plane carried by valid width-native stripe packets.
+// Only the activation dequantizers (validation / FLOAT parity) need this; the
+// compensation path never materialises a residual plane. Publication is transactional.
 void expand_packets_to_plane(const std::vector<StripePacketHandle> & packets,
                              size_t row_count,
                              size_t col_count,

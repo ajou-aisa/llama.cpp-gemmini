@@ -35,6 +35,22 @@ namespace ggml::gemmini::quants::wreader
         bool ok() const { return status == WeightReaderStatus::Success; }
     };
 
+    // Compact native transport consumes adjacent logical values from each
+    // byte: low nibble first, then high nibble, as signed two's-complement
+    // INT4. This is not the frontend's GGUF split-half model layout.
+    bool native_mvin_q4_position(
+        size_t logical_count,
+        size_t index,
+        size_t &byte_index,
+        uint8_t &shift) noexcept;
+
+    bool decode_native_mvin_q4(
+        const uint8_t *packed,
+        size_t packed_size,
+        size_t logical_count,
+        size_t index,
+        int8_t &value) noexcept;
+
     WeightReaderStatus validate(
         const ggml_gemmini_args_t &args,
         const wroute::WeightRoutePlan &plan);

@@ -100,19 +100,35 @@ std::string rmd_input_hash(const residual::DirectStripePayload & payload) {
 }
 
 std::string rmd_input_hash(const rmd::StripePacket & packet) {
+    if (rmd::validate_packet(packet) != rmd::RmdStatus::success) {
+        return {};
+    }
+    const rmd::BalancedRadixContract contract =
+        rmd::balanced_radix_contract(packet.digit_bits);
     std::vector<CanonicalResidual> events;
     for (size_t row = 0; row < packet.row_count; ++row) {
         for (const rmd::BlockDescriptor & block : packet.blocks) {
             for (size_t compact_k = 0; compact_k < block.compact_k_count; ++compact_k) {
-                rmd::BalancedDigits digits{};
-                for (size_t position = 0; position < block.active_lane_count; ++position) {
-                    const size_t index = block.activation_offset +
-                        position * block.rows_padded * block.padded_k_count +
-                        row * block.padded_k_count + compact_k;
-                    digits.digits[block.lane_ids[position]] =
-                        packet.stacked_activation[index];
+                rmd::NativeBalancedDigits digits{};
+                digits.radix = contract.radix;
+                digits.lane_capacity = contract.lane_capacity;
+                for (uint8_t position = 0; position < block.active_lane_count; ++position) {
+                    const uint8_t lane = block.lane_ids[position];
+                    int32_t digit = 0;
+                    if (lane >= contract.lane_capacity ||
+                        rmd::read_packet_digit(packet, block, position, row,
+                                               compact_k, digit) != rmd::RmdStatus::success) {
+                        return {};
+                    }
+                    digits.digits[lane] = digit;
+                    if (digit != 0) {
+                        digits.active_lane_count = static_cast<uint8_t>(lane + 1);
+                    }
                 }
-                const int64_t residual = rmd::compose_balanced_radix256(digits);
+                int64_t residual = 0;
+                if (rmd::compose_balanced_radix(digits, residual) != rmd::RmdStatus::success) {
+                    return {};
+                }
                 if (residual != 0) {
                     const size_t k = block.global_k_begin +
                         packet.k_indices[block.k_index_offset + compact_k];
