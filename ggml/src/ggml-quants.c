@@ -91,35 +91,11 @@ void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_REST
     }
 }
 
-void quantize_row_q4_h1_ref(const float * GGML_RESTRICT x, block_q4_h1 * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK4_0 == 0);
-
-    const int nb = k / QK4_0;
-    float min_s = FLT_MAX;
-    float max_s = 0.0f;
-
-    for (int i = 0; i < nb; ++i) {
-        float amax = 0.0f;
-        for (int j = 0; j < QK4_0; ++j) {
-            amax = MAX(amax, fabsf(x[i*QK4_0 + j]));
-        }
-
-        const float d = amax / 7.0f;
-        const float id = d ? 1.0f/d : 0.0f;
-        const float s = GGML_FP16_TO_FP32(GGML_FP32_TO_FP16(d));
-
-        memset(&y[i], 0, sizeof(y[i]));
-        for (int j = 0; j < QK4_0/2; ++j) {
-            const int q0 = MIN(7, MAX(-8, (int) roundf(x[i*QK4_0 + j] * id)));
-            const int q1 = MIN(7, MAX(-8, (int) roundf(x[i*QK4_0 + QK4_0/2 + j] * id)));
-            y[i].qs[j] = (uint8_t) ((q0 + 8) | ((q1 + 8) << 4));
-        }
-        y[i].s_rf = s;
-
-        min_s = MIN(min_s, s);
-        max_s = MAX(max_s, s);
-    }
-
+static void finalize_q4_h1_scale_range(
+        block_q4_h1 * GGML_RESTRICT y,
+        int nb,
+        float min_s,
+        float max_s) {
     float s_rf;
     uint16_t R;
     quantize_h1_scale_range(min_s, max_s, &s_rf, &R);
@@ -133,6 +109,79 @@ void quantize_row_q4_h1_ref(const float * GGML_RESTRICT x, block_q4_h1 * GGML_RE
             y[i].c_b = (uint8_t) MIN(255, MAX(0, c_b));
         }
     }
+}
+
+static bool reprocess_q4_0_block_to_q4_h1(
+        const block_q4_0 * GGML_RESTRICT x,
+        block_q4_h1 * GGML_RESTRICT y) {
+    const float source_d = GGML_FP16_TO_FP32(x->d);
+    if (!isfinite(source_d)) {
+        return false;
+    }
+
+    float amax = 0.0f;
+    for (int j = 0; j < QK4_0/2; ++j) {
+        const int source_q0 = (x->qs[j] & 0x0F) - 8;
+        const int source_q1 = (x->qs[j] >> 4) - 8;
+        amax = MAX(amax, fabsf(source_q0 * source_d));
+        amax = MAX(amax, fabsf(source_q1 * source_d));
+    }
+
+    const float d = amax / 7.0f;
+    const float id = d ? 1.0f/d : 0.0f;
+    if (!isfinite(d) || !isfinite(id)) {
+        return false;
+    }
+
+    memset(y, 0, sizeof(*y));
+    for (int j = 0; j < QK4_0/2; ++j) {
+        const int source_q0 = (x->qs[j] & 0x0F) - 8;
+        const int source_q1 = (x->qs[j] >> 4) - 8;
+        const int q0 = MIN(7, MAX(-8, (int) roundf(source_q0 * source_d * id)));
+        const int q1 = MIN(7, MAX(-8, (int) roundf(source_q1 * source_d * id)));
+        y->qs[j] = (uint8_t) ((q0 + 8) | ((q1 + 8) << 4));
+    }
+    y->s_rf = GGML_FP16_TO_FP32(GGML_FP32_TO_FP16(d));
+    return isfinite(y->s_rf);
+}
+
+bool reprocess_row_q4_0_to_q4_h1_ref(
+        const block_q4_0 * GGML_RESTRICT x,
+        block_q4_h1 * GGML_RESTRICT y,
+        int64_t k) {
+    if (x == NULL || y == NULL || k <= 0 || k % QK4_0 != 0) {
+        return false;
+    }
+
+    const int nb = k / QK4_0;
+    float min_s = FLT_MAX;
+    float max_s = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        if (!reprocess_q4_0_block_to_q4_h1(&x[i], &y[i])) {
+            return false;
+        }
+        min_s = MIN(min_s, y[i].s_rf);
+        max_s = MAX(max_s, y[i].s_rf);
+    }
+    finalize_q4_h1_scale_range(y, nb, min_s, max_s);
+    return true;
+}
+
+void quantize_row_q4_h1_ref(const float * GGML_RESTRICT x, block_q4_h1 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK4_0 == 0);
+
+    const int nb = k / QK4_0;
+    float min_s = FLT_MAX;
+    float max_s = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        block_q4_0 source;
+        quantize_row_q4_0_ref(x + i*QK4_0, &source, QK4_0);
+        const bool ok = reprocess_q4_0_block_to_q4_h1(&source, &y[i]);
+        assert(ok);
+        min_s = MIN(min_s, y[i].s_rf);
+        max_s = MAX(max_s, y[i].s_rf);
+    }
+    finalize_q4_h1_scale_range(y, nb, min_s, max_s);
 }
 
 static bool quantize_q4_hp1_input_valid(const float * x, int64_t k) {

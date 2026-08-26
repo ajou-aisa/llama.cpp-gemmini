@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-gemmini.h"
+#include "../ggml/src/ggml-gemmini/ggml-gemmini-q4-h1-reprocess.hpp"
 #include "../ggml/src/ggml-gemmini/quants/common/weight_reader.hpp"
 #include "../ggml/src/ggml-quants.h"
 
@@ -403,6 +404,61 @@ bool test_reader_failure_table() {
     return ok;
 }
 
+bool test_q4_h1_is_canonical_q4_0_reprocessing() {
+    constexpr int64_t columns = 64;
+    std::array<float, columns> source{};
+    for (int64_t i = 0; i < columns; ++i) {
+        source[i] = static_cast<float>((i * 11) % 29 - 14) / 4.0f;
+    }
+    source[0] = 8.0f;
+    source[1] = -6.75f;
+    source[32] = -8.0f;
+    source[33] = 6.75f;
+
+    std::array<block_q4_h1, 2> offline{};
+    quantize_row_q4_h1_ref(source.data(), offline.data(), columns);
+
+    std::array<block_q4_0, 2> q4_0{};
+    quantize_row_q4_0_ref(source.data(), q4_0.data(), columns);
+
+    ggml_tensor tensor{};
+    tensor.type = GGML_TYPE_Q4_0;
+    tensor.data = q4_0.data();
+    tensor.ne[0] = columns;
+    tensor.ne[1] = 1;
+    tensor.ne[2] = 1;
+    tensor.ne[3] = 1;
+    tensor.nb[0] = sizeof(block_q4_0);
+    tensor.nb[1] = sizeof(q4_0);
+    tensor.nb[2] = sizeof(q4_0);
+    tensor.nb[3] = sizeof(q4_0);
+
+    std::vector<block_q4_h1> runtime;
+    size_t blocks_per_row = 0;
+    size_t logical_rows = 0;
+    bool ok = check(
+                  ggml::gemmini::prepare_q4_0_rows_for_q4_h1(
+                      &tensor, runtime, &blocks_per_row, &logical_rows),
+                  "runtime Q4_0 to Q4_H1 reprocessing succeeds") &&
+        check(
+            blocks_per_row == offline.size() && logical_rows == 1 &&
+                runtime.size() == offline.size(),
+            "runtime Q4_H1 geometry matches offline geometry") &&
+        check(
+            std::memcmp(offline.data(), runtime.data(), sizeof(offline)) == 0,
+            "offline Q4_H1 equals runtime reprocessing of canonical Q4_0");
+
+    uint16_t non_finite_bits = 0x7c00;
+    std::memcpy(&q4_0[0].d, &non_finite_bits, sizeof(non_finite_bits));
+    runtime.clear();
+    ok = check(
+             !ggml::gemmini::prepare_q4_0_rows_for_q4_h1(
+                 &tensor, runtime, nullptr, nullptr),
+             "runtime Q4_0 reprocessing rejects non-finite block scale") &&
+        ok;
+    return ok;
+}
+
 bool test_q4_h1_narrow_scale_range_preserves_magnitude() {
     constexpr int64_t columns = 64;
     std::array<float, columns> source{};
@@ -552,6 +608,7 @@ int main(int argc, char ** argv) {
     bool ok = true;
     if (selection == Selection::All || selection == Selection::HappyTable) {
         ok = test_legacy_round_trips() && ok;
+        ok = test_q4_h1_is_canonical_q4_0_reprocessing() && ok;
         ok = test_q4_hp1_loader_contract() && ok;
         ok = test_reader_happy_table() && ok;
     }

@@ -15,6 +15,10 @@ extern "C" {
 
 // Quantization
 GGML_API void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_RESTRICT y, int64_t k);
+GGML_API bool reprocess_row_q4_0_to_q4_h1_ref(
+        const block_q4_0 * GGML_RESTRICT x,
+        block_q4_h1 * GGML_RESTRICT y,
+        int64_t k);
 GGML_API void quantize_row_q4_h1_ref(const float * GGML_RESTRICT x, block_q4_h1 * GGML_RESTRICT y, int64_t k);
 GGML_API bool quantize_row_q4_hp1_ref(const float * GGML_RESTRICT x, block_q4_hp1 * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_q4_1_ref(const float * GGML_RESTRICT x, block_q4_1 * GGML_RESTRICT y, int64_t k);
