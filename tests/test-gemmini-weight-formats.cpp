@@ -299,6 +299,39 @@ bool test_reader_happy_table() {
     return ok;
 }
 
+bool test_q4_h0_matches_canonical_dequantization() {
+    ReaderFixture fixture(4, Family::H0);
+    for (size_t i = 0; i < std::size(fixture.q4_h0.qs); ++i) {
+        fixture.q4_h0.qs[i] =
+            static_cast<uint8_t>(i | ((15 - i) << 4));
+    }
+
+    std::array<float, QK4_0> canonical{};
+    dequantize_row_q4_0(&fixture.q4_h0, canonical.data(), canonical.size());
+
+    const wroute::WeightRoutePlan plan = fixture.resolve();
+    if (!check(plan.valid && plan.status == RouteStatus::Success,
+               "Q4_H0 canonical comparison route resolves")) {
+        return false;
+    }
+
+    bool ok = true;
+    for (size_t k = 0; k < canonical.size(); ++k) {
+        const wreader::WeightCodeResult code =
+            wreader::read_code(fixture.args, plan, 0, k);
+        const wreader::WeightScaleResult scale =
+            wreader::read_scale(fixture.args, plan, 0, 0);
+        const float decoded =
+            static_cast<float>(code.value) * scale.floating_block_scale;
+        ok = check(
+                 code.status == ReaderStatus::Success &&
+                     scale.status == ReaderStatus::Success &&
+                     decoded == canonical[k],
+                 "Q4_H0 reader matches canonical Q4_0 dequantization") && ok;
+    }
+    return ok;
+}
+
 bool test_reader_failure_table() {
     bool ok = true;
 
@@ -643,6 +676,7 @@ int main(int argc, char ** argv) {
         ok = test_q4_h1_is_canonical_q4_0_reprocessing() && ok;
         ok = test_q4_hp1_loader_contract() && ok;
         ok = test_reader_happy_table() && ok;
+        ok = test_q4_h0_matches_canonical_dequantization() && ok;
     }
     if (selection == Selection::All || selection == Selection::FailureTable) {
         ok = test_reader_failure_table() && ok;
