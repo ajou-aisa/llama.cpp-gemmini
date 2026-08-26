@@ -4,6 +4,7 @@
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-q4-h1-reprocess.hpp"
 #include "../ggml/src/ggml-gemmini/quants/common/weight_reader.hpp"
 #include "../ggml/src/ggml-quants.h"
+#include "../src/llama-quant.h"
 
 #include <algorithm>
 #include <array>
@@ -542,6 +543,36 @@ bool test_legacy_round_trips() {
     return ok;
 }
 
+bool test_gemmini_q4_default_output_policy() {
+    bool ok = true;
+    struct Case {
+        llama_ftype ftype;
+        bool pure;
+        bool is_output_weight;
+        bool is_token_embedding_weight;
+        ggml_type expected;
+        const char * message;
+    };
+    const std::array<Case, 9> cases = {{
+        { LLAMA_FTYPE_MOSTLY_Q4_0,  false, true,  false, GGML_TYPE_F16,  "Q4_0 output stays F16" },
+        { LLAMA_FTYPE_MOSTLY_Q4_0,  false, true,  true,  GGML_TYPE_F16,  "Q4_0 tied token/output stays F16" },
+        { LLAMA_FTYPE_MOSTLY_Q4_0,  false, false, true,  GGML_TYPE_F16,  "Q4_0 untied token embedding stays F16" },
+        { LLAMA_FTYPE_MOSTLY_Q4_H1, false, true,  false, GGML_TYPE_F16,  "Q4_H1 output stays F16" },
+        { LLAMA_FTYPE_MOSTLY_Q4_HP1,false, true,  false, GGML_TYPE_F16,  "Q4_HP1 output stays F16" },
+        { LLAMA_FTYPE_MOSTLY_Q4_H1, false, true,  true,  GGML_TYPE_F16,  "Q4_H1 tied token/output stays F16" },
+        { LLAMA_FTYPE_MOSTLY_Q4_H1, false, false, true,  GGML_TYPE_F16,  "Q4_H1 untied token embedding stays F16" },
+        { LLAMA_FTYPE_MOSTLY_Q4_H1, true,  true,  true,  GGML_TYPE_COUNT, "pure Q4_H1 bypasses mixed policy" },
+        { LLAMA_FTYPE_MOSTLY_Q4_H1, false, false, false, GGML_TYPE_COUNT, "ordinary Q4_H1 tensor stays quantized" },
+    }};
+    for (const Case & test : cases) {
+        ok = check(
+                 llama_quantize_gemmini_q4_default_tensor_type(
+                     test.ftype, test.pure, test.is_output_weight, test.is_token_embedding_weight) == test.expected,
+                 test.message) && ok;
+    }
+    return ok;
+}
+
 bool test_q4_hp1_loader_contract() {
 #if GGML_GEMMINI_ACTIVATION_BITS == 4 && GGML_GEMMINI_WEIGHT_BITS == 4
     ggml_init_params params = {
@@ -607,6 +638,7 @@ int main(int argc, char ** argv) {
 
     bool ok = true;
     if (selection == Selection::All || selection == Selection::HappyTable) {
+        ok = test_gemmini_q4_default_output_policy() && ok;
         ok = test_legacy_round_trips() && ok;
         ok = test_q4_h1_is_canonical_q4_0_reprocessing() && ok;
         ok = test_q4_hp1_loader_contract() && ok;
