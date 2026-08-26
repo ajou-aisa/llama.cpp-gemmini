@@ -72,6 +72,7 @@ ggml_add_backend_library(ggml-gemmini
                          residual/direct/direct-executor.cpp
                          residual/rmd/rmd-builder.cpp
                          residual/rmd/rmd-executor.cpp
+                         residual/rmd/rmd-im2p-executor.cpp
                          residual/rmd/rmd-compose.cpp
                          residual/rmd/rmd-reference.cpp
                          dump/dump_common.cpp

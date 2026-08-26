@@ -10,10 +10,10 @@
 #include "quants/act/exsia/exsia.hpp"
 #include "quants/act/exsia/exsia_shift.hpp"
 #include "quants/act/quantize.hpp"
+#include "residual/direct/direct-executor.hpp"
 #include <gemmini/cycle_reader.hpp>
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -194,7 +194,9 @@ std::vector<float> make_activations(int64_t rows = I) {
 #if GGML_GEMMINI_ACTIVATION_QUANT == 0
       values[i * K + k] = 0.25f * static_cast<float>((i + 3 * k) % 15 - 7);
       if (i % GGML_GEMMINI_TEST_IM2P_DIM == 0 && k == 0) {
-        values[i * K + k] = 4096.0f + static_cast<float>(i);
+        values[i * K + k] = GGML_GEMMINI_ACTIVATION_BITS == 16
+                                ? 16.0f
+                                : 4096.0f + static_cast<float>(i);
       }
 #else
       values[i * K + k] = 0.125f * static_cast<float>((i + 2 * k) % 11 - 5);
@@ -698,6 +700,7 @@ struct LifecycleWeightStorage {
   std::vector<block_q4_h0> q4_h0;
   std::vector<block_q4_h1> q4_h1;
   std::vector<block_q4_hp1> q4_hp1;
+  std::vector<block_q8_0> q8_h0;
   std::vector<block_q8_h1> q8_h1;
   std::vector<block_q8_hp1> q8_hp1;
   std::vector<block_q16_h0> q16_h0;
@@ -707,8 +710,9 @@ struct LifecycleWeightStorage {
 
   LifecycleWeightStorage(size_t columns, size_t k)
       : q4_h0(columns * (k / 32)), q4_h1(columns * (k / 32)),
-        q4_hp1(columns * (k / 32)), q8_h1(columns * (k / 32)),
-        q8_hp1(columns * (k / 32)), q16_h0(columns * (k / 32)),
+        q4_hp1(columns * (k / 32)), q8_h0(columns * (k / 32)),
+        q8_h1(columns * (k / 32)), q8_hp1(columns * (k / 32)),
+        q16_h0(columns * (k / 32)),
         q16_h1(columns * (k / 32)), q16_hp1(columns * (k / 32)),
         blocks_per_row(k / 32) {
     for (size_t index = 0; index < columns * blocks_per_row; ++index) {
@@ -718,6 +722,8 @@ struct LifecycleWeightStorage {
                 uint8_t{0x99});
       std::fill(std::begin(q4_hp1[index].qs), std::end(q4_hp1[index].qs),
                 uint8_t{0x99});
+      std::fill(std::begin(q8_h0[index].qs), std::end(q8_h0[index].qs),
+                int8_t{1});
       std::fill(std::begin(q8_h1[index].qs), std::end(q8_h1[index].qs),
                 int8_t{1});
       std::fill(std::begin(q8_hp1[index].qs), std::end(q8_hp1[index].qs),
@@ -728,7 +734,8 @@ struct LifecycleWeightStorage {
                 int16_t{1});
       std::fill(std::begin(q16_hp1[index].qs), std::end(q16_hp1[index].qs),
                 int16_t{1});
-      q4_h0[index].d = q16_h0[index].d = ggml_fp32_to_fp16(0.25f);
+      q4_h0[index].d = q8_h0[index].d = q16_h0[index].d =
+          ggml_fp32_to_fp16(0.25f);
       q4_h1[index].s_rf = q8_h1[index].s_rf = q16_h1[index].s_rf = 0.25f;
       q4_h1[index].c_b = q8_h1[index].c_b = q16_h1[index].c_b = 1;
       q4_h1[index].R = q8_h1[index].R = q16_h1[index].R = 1;
@@ -759,7 +766,11 @@ struct LifecycleWeightStorage {
     }
 #elif GGML_GEMMINI_WEIGHT_BITS == 8
     if (family == LifecycleFamily::h0) {
-      return false;
+      args.weight_format = Format::q8_h0;
+      args.B_blocks = q8_h0.data();
+      args.blocks_J = args.J;
+      args.blocks_K = blocks_per_row;
+      args.native_weight_bytes = q8_h0.size() * sizeof(block_q8_0);
     } else if (family == LifecycleFamily::h1) {
       args.weight_format = Format::q8_h1;
       args.q8_h1_blocks = q8_h1.data();
@@ -820,10 +831,14 @@ void observe_runtime_args(TestRuntimeArgsSite site, const char *layer,
 
 IntegratedLifecycleResult run_integrated_exsia_lifecycle(
     size_t rows, size_t tile_i, LifecycleFamily family,
-    LifecycleBackend backend, PublicMode mode) {
+    LifecycleBackend backend, PublicMode mode,
+    TestFailure failure = TestFailure::none,
+    bool empty_residual = false) {
   using namespace ggml::gemmini::quants::act::exsia;
   IntegratedLifecycleResult result{};
-  const auto values = make_activations(static_cast<int64_t>(rows));
+  auto values = make_activations(static_cast<int64_t>(rows));
+  if (empty_residual)
+    std::fill(values.begin(), values.end(), 0.0f);
   ggml_init_params params{ggml_tensor_overhead() * 2 +
                               values.size() * sizeof(float) + 1024,
                           nullptr, false};
@@ -866,6 +881,7 @@ IntegratedLifecycleResult run_integrated_exsia_lifecycle(
   exsia.set_execution_mode(ExSIAState::ExecutionMode::Sequential);
   RuntimeArgsObservation observation{semantic_layer};
   test_reset();
+  test_inject_failure(failure);
   test_set_runtime_args_observer(observe_runtime_args, &observation);
   if (mode == PublicMode::full) {
     auto started = start_exsia_full_execution(args);
@@ -886,8 +902,24 @@ IntegratedLifecycleResult run_integrated_exsia_lifecycle(
       ggml_free(context);
       return result;
     }
-    const bool quantized = exsia.run(meta, activation, args,
-                                    args.exsia_stripe_ready_sink);
+    bool quantized = false;
+    if (failure == TestFailure::blocked_submit) {
+      std::thread producer([&] {
+        quantized = exsia.run(meta, activation, args,
+                              args.exsia_stripe_ready_sink);
+      });
+      const bool blocked = test_wait_for_blocked_producer();
+      test_release_blocked_producer_with_error();
+      producer.join();
+      if (!blocked) {
+        test_set_runtime_args_observer(nullptr, nullptr);
+        ggml_free(context);
+        return result;
+      }
+    } else {
+      quantized = exsia.run(meta, activation, args,
+                            args.exsia_stripe_ready_sink);
+    }
     result.completion = started.pipeline->finish(quantized);
   }
   test_set_runtime_args_observer(nullptr, nullptr);
@@ -1158,6 +1190,242 @@ bool run_exsia_full_success() {
         "events=collector[0:0-256,theta=committed,handle=owned]>"
         "full>fence>rmd[0]>terminal>commit "
         "mode=full full=1 pipeline=0 stripes=0 fence=1 rmd=1 commit=1\n");
+  }
+  return ok;
+}
+
+bool run_exsia_full_im2p_provider(TestFailure failure = TestFailure::none) {
+  const size_t rows = 2 * GGML_GEMMINI_TEST_IM2P_DIM + 1;
+  const auto checked_oracle = run_integrated_exsia_lifecycle(
+      rows, 1, LifecycleFamily::h1, LifecycleBackend::cpu_direct,
+      PublicMode::full);
+  const auto active = run_integrated_exsia_lifecycle(
+      rows, 1, LifecycleFamily::h1, LifecycleBackend::compact_ws,
+      PublicMode::full, failure);
+  if (failure != TestFailure::none) {
+    const char *name = failure == TestFailure::provider ? "provider"
+                       : failure == TestFailure::simulator_create ? "create"
+                       : failure == TestFailure::malformed_completion ? "order"
+                       : failure == TestFailure::compose ? "compose"
+                                                        : "copy";
+    const bool expected_dots = failure == TestFailure::compose ||
+                               failure == TestFailure::output_copy;
+    const bool expected_create = failure != TestFailure::malformed_completion &&
+                                 failure != TestFailure::simulator_create;
+    const bool ok =
+        check(!active.ok, "FULL IM2P injected failure is sticky") &&
+        check(all_sentinel(active.output),
+              "FULL IM2P injected failure preserves caller output") &&
+        check(active.counters.full == 1 && active.counters.pipeline == 0 &&
+                  active.counters.stripe == 0 && active.counters.commit == 0 &&
+                  (expected_dots ? active.counters.rmd_dot_calls > 0
+                                 : active.counters.rmd_dot_calls == 0) &&
+                  active.counters.residual_simulator_creates ==
+                      (expected_create ? 1U : 0U) &&
+                  active.counters.live_residual_simulators == 0 &&
+                  active.counters.hardware == 0 && active.counters.fallback == 0,
+              "FULL failure destroys its sole simulator without fallback");
+    if (ok) {
+      std::printf("FULL_IM2P_FAILURE failure=%s sentinel=preserved "
+                  "full=1 pipeline=0 dense_stripes=0 dot_calls=%llu commit=0 "
+                  "live_simulators=0 fallback=0\n", name,
+                  static_cast<unsigned long long>(active.counters.rmd_dot_calls));
+    }
+    return ok;
+  }
+
+  const auto empty = run_integrated_exsia_lifecycle(
+      rows, 1, LifecycleFamily::h1, LifecycleBackend::compact_ws,
+      PublicMode::full, TestFailure::none, true);
+  bool ok =
+      check(checked_oracle.ok && active.ok && empty.ok,
+            "FULL checked oracle and IM2P provider executions succeed") &&
+      check(active.output == checked_oracle.output,
+            "FULL IM2P output equals the CPU-direct oracle") &&
+      check(active.counters.full == 1 && active.counters.pipeline == 0 &&
+                active.counters.stripe == 0 && active.counters.fence == 1,
+            "FULL executes one dense run and publishes zero stripes") &&
+      check(active.counters.rmd_dot_calls > 0 &&
+                active.completion.rmd_dot_calls == active.counters.rmd_dot_calls &&
+                active.completion.rmd_stats.rtl_work_total_cycles > 0 &&
+                active.completion.rmd_stats.rtl_output_write_requests > 0 &&
+                active.counters.rmd_packets == 3 &&
+                active.counters.rmd_events == 0,
+            "FULL active H1 packets expose independent IM2P provider stats") &&
+      check(empty.counters.rmd_dot_calls == 0 &&
+                empty.completion.rmd_dot_calls == 0 &&
+                empty.completion.rmd_stats.rtl_work_total_cycles == 0 &&
+                empty.counters.commit == 1 &&
+                empty.counters.residual_simulator_creates == 0 &&
+                empty.counters.live_residual_simulators == 0,
+            "FULL empty H1 residual makes zero dots and commits once") &&
+      check(active.counters.commit == 1 &&
+                active.counters.rmd_terminal_event != 0 &&
+                active.counters.commit_event > active.counters.rmd_terminal_event,
+            "FULL commits once after terminal residual success") &&
+      check(active.counters.residual_simulator_creates == 1 &&
+                active.counters.live_residual_simulators == 0 &&
+                active.counters.hardware == 0 && active.counters.fallback == 0,
+            "FULL destroys its residual simulator without hardware or fallback");
+  if (ok) {
+    std::printf("FULL_IM2P full=1 pipeline=0 dense_stripes=0 dot_calls=%llu "
+                "rmd_cycles=%llu rmd_output_writes=%llu "
+                "packets=3 direct_events=0 simulator_creates=1 commit=1 "
+                "live_simulators=0 oracle=equal fallback=0\n",
+                static_cast<unsigned long long>(active.counters.rmd_dot_calls),
+                static_cast<unsigned long long>(
+                    active.completion.rmd_stats.rtl_work_total_cycles),
+                static_cast<unsigned long long>(
+                    active.completion.rmd_stats.rtl_output_write_requests));
+  }
+  return ok;
+}
+
+bool run_sticky_provider_failure_matrix() {
+  struct FailureCase {
+    TestFailure failure;
+    const char *name;
+    size_t minimum_attempts;
+    size_t maximum_attempts;
+  };
+  constexpr std::array<FailureCase, 6> failures{{
+      {TestFailure::provider_read, "read", 1, 1},
+      {TestFailure::provider, "write", 1, 1},
+      {TestFailure::provider_watchdog, "watchdog", 1, 1},
+      {TestFailure::provider_k_overflow, "k-overflow", 2,
+       std::numeric_limits<size_t>::max()},
+      {TestFailure::provider_block_overflow, "block-overflow", 1,
+       std::numeric_limits<size_t>::max()},
+      {TestFailure::provider_cancel_between_dots, "cancel-between-dots", 1, 1},
+  }};
+  constexpr std::array<PublicMode, 2> modes{{PublicMode::full,
+                                             PublicMode::stripe_pipeline}};
+  const size_t rows = 2 * GGML_GEMMINI_TEST_IM2P_DIM + 1;
+  size_t passed = 0;
+  for (const PublicMode mode : modes) {
+    for (const FailureCase &failure : failures) {
+      const auto result = run_integrated_exsia_lifecycle(
+          rows, 1, LifecycleFamily::h1, LifecycleBackend::compact_ws, mode,
+          failure.failure);
+      const bool pipeline = mode == PublicMode::stripe_pipeline;
+      const bool ok =
+          check(!result.ok, "provider failure reaches typed completion") &&
+          check(result.completion.result.error == Error::execution_failure,
+                "provider root status remains the first execution failure") &&
+          check(all_sentinel(result.output),
+                "provider failure preserves caller output") &&
+          check(result.completion.semantic_completion_count == 0 &&
+                    result.completion.rmd_dot_calls == 0 &&
+                    result.completion.rmd_stats.rtl_work_total_cycles == 0,
+                "failed provider transaction exposes empty semantic and RMD views") &&
+          check(result.counters.provider_dot_attempts >=
+                        failure.minimum_attempts &&
+                    result.counters.provider_dot_attempts <=
+                        failure.maximum_attempts &&
+                    result.counters.rmd_calls == 0 &&
+                    result.counters.compositions == 0 &&
+                    result.counters.commit == 0,
+                "provider failure stops at its selected compact-call boundary") &&
+          check((pipeline ? result.counters.dense_completions == 1 &&
+                                result.counters.authorize == 1 &&
+                                result.counters.live_runs == 0
+                          : result.counters.dense_completions == 0 &&
+                                result.counters.authorize == 0 &&
+                                result.counters.residual_simulator_creates == 1 &&
+                                result.counters.live_residual_simulators == 0),
+                "provider failure stops later dense publication and releases mode resources") &&
+          check(result.counters.hardware == 0 &&
+                    result.counters.fallback == 0,
+                "provider failure enters no physical or checked fallback");
+      if (!ok) return false;
+      ++passed;
+      std::printf(
+          "STICKY_PROVIDER mode=%s failure=%s attempts=%llu dense=%llu "
+          "semantic=0 rmd_views=empty corrections=0 authorize=%llu commit=0 "
+          "sentinel=preserved live_runs=0 live_simulators=0 fallback=0\n",
+          pipeline ? "PIPELINE" : "FULL", failure.name,
+          static_cast<unsigned long long>(result.counters.provider_dot_attempts),
+          static_cast<unsigned long long>(result.counters.dense_completions),
+          static_cast<unsigned long long>(result.counters.authorize));
+    }
+  }
+  return check(passed == failures.size() * modes.size(),
+               "all FULL/PIPELINE provider failures are transactional");
+}
+
+bool run_exsia_pipeline_callback() {
+  const size_t rows = 2 * GGML_GEMMINI_TEST_IM2P_DIM + 1;
+  const auto direct = run_integrated_exsia_lifecycle(
+      rows, 1, LifecycleFamily::h1, LifecycleBackend::cpu_direct,
+      PublicMode::stripe_pipeline);
+  const auto compact = run_integrated_exsia_lifecycle(
+      rows, 1, LifecycleFamily::h1, LifecycleBackend::compact_ws,
+      PublicMode::stripe_pipeline);
+  const auto empty = run_integrated_exsia_lifecycle(
+      rows, 1, LifecycleFamily::h1, LifecycleBackend::compact_ws,
+      PublicMode::stripe_pipeline, TestFailure::none, true);
+  const auto canonical_callbacks = [](const IntegratedLifecycleResult &result) {
+    if (result.counters.rmd_calls != 3 ||
+        result.completion.semantic_completion_count != 3 ||
+        result.counters.dense_completions_at_first_residual != 1)
+      return false;
+    for (size_t stripe = 0; stripe < 3; ++stripe) {
+      const size_t begin = stripe * GGML_GEMMINI_TEST_IM2P_DIM;
+      const size_t end = std::min<size_t>(
+          2 * GGML_GEMMINI_TEST_IM2P_DIM + 1,
+          begin + GGML_GEMMINI_TEST_IM2P_DIM);
+      if (result.counters.pipeline_callback_stripes[stripe] != stripe ||
+          result.counters.pipeline_merge_row_begin[stripe] != begin ||
+          result.counters.pipeline_merge_row_end[stripe] != end)
+        return false;
+    }
+    return true;
+  };
+  const bool ok =
+      check(direct.ok && compact.ok && empty.ok,
+            "PIPELINE direct, compact, and empty callback routes succeed") &&
+      check(direct.output == compact.output,
+            "PIPELINE worker-owned IM2P output equals CPU-direct oracle") &&
+      check(canonical_callbacks(direct) && canonical_callbacks(compact) &&
+                canonical_callbacks(empty),
+            "each dense stripe is immediately executed and merged before the next dense completion") &&
+      check(direct.counters.rmd_events > 0 &&
+                direct.counters.rmd_dot_calls == 0 &&
+                direct.counters.rmd_packets == 0,
+            "PIPELINE CPU-direct route uses null-simulator residual events") &&
+      check(compact.counters.rmd_dot_calls > 0 &&
+                compact.completion.rmd_dot_calls ==
+                    compact.counters.rmd_dot_calls &&
+                compact.completion.rmd_stats.rtl_work_total_cycles > 0 &&
+                compact.completion.rmd_stats.rtl_output_write_requests > 0 &&
+                compact.counters.rmd_packets == 3 &&
+                compact.counters.rmd_events == 0,
+            "PIPELINE H1 packets expose independent IM2P provider stats") &&
+      check(empty.counters.rmd_dot_calls == 0 &&
+                empty.completion.rmd_dot_calls == 0 &&
+                empty.completion.rmd_stats.rtl_work_total_cycles == 0 &&
+                empty.counters.rmd_events == 0 &&
+                empty.counters.rmd_packets == 0,
+            "PIPELINE empty residual callbacks issue zero residual calls") &&
+      check(direct.counters.authorize == 1 && direct.counters.commit == 1 &&
+                compact.counters.authorize == 1 && compact.counters.commit == 1 &&
+                empty.counters.authorize == 1 && empty.counters.commit == 1 &&
+                direct.counters.fallback == 0 && compact.counters.fallback == 0 &&
+                empty.counters.fallback == 0,
+            "successful semantic fences authorize and commit exactly once without fallback");
+  if (ok) {
+    std::printf(
+        "PIPELINE_CALLBACK trace=fold/seal>D0>R0>M0>C0>D1>R1>M1>C1>"
+        "D2>R2>M2>C2 theta=event-frozen rows=[0-16,16-32,32-33] "
+        "direct_events=%llu compact_dot_calls=%llu rmd_cycles=%llu "
+        "rmd_output_writes=%llu packets=3 empty_calls=0 semantic=3 "
+        "authorize=1 commit=1 fallback=0 oracle=equal\n",
+        static_cast<unsigned long long>(direct.counters.rmd_events),
+        static_cast<unsigned long long>(compact.counters.rmd_dot_calls),
+        static_cast<unsigned long long>(
+            compact.completion.rmd_stats.rtl_work_total_cycles),
+        static_cast<unsigned long long>(
+            compact.completion.rmd_stats.rtl_output_write_requests));
   }
   return ok;
 }
@@ -1570,6 +1838,9 @@ bool run_route_lifecycle_table() {
                           counters.rmd_calls == route_stripes &&
                           counters.commit == 1 && counters.live_runs == 0 &&
                           counters.fallback == 0 && backend_observed &&
+                          (identity.backend == LifecycleBackend::compact_ws
+                               ? counters.rmd_dot_calls > 0
+                               : counters.rmd_dot_calls == 0) &&
                           completion.stats.rtl_stripes_published ==
                               expected_publications &&
                           (mode == PublicMode::full ||
@@ -1592,6 +1863,209 @@ bool run_route_lifecycle_table() {
   }
   return check(terminal == 10,
                "each width executes ten legal family/backend/mode identities");
+}
+
+bool run_exsia_one_row_pipeline();
+
+ExsiaRouteRequest matrix_route(PublicMode mode, WeightFamily family,
+                               ResidualBackend backend) {
+  return {true,
+          GGML_GEMMINI_ACTIVATION_BITS,
+          GGML_GEMMINI_WEIGHT_BITS,
+          GGML_GEMMINI_ACTIVATION_BITS,
+          GGML_GEMMINI_WEIGHT_BITS,
+          true,
+          mode,
+          family,
+          backend,
+          BuildIdentity::im2p_sim_ws};
+}
+
+bool run_multiwidth_matrix() {
+  constexpr std::array<LifecycleFamily, 2> families{{
+      LifecycleFamily::h1, LifecycleFamily::hp1}};
+  constexpr std::array<PublicMode, 2> modes{{
+      PublicMode::full, PublicMode::stripe_pipeline}};
+  constexpr std::array<bool, 2> residual_states{{true, false}};
+  const size_t row_count = 2 * GGML_GEMMINI_TEST_IM2P_DIM + 1;
+  size_t compact_cases = 0;
+
+  for (const LifecycleFamily family : families) {
+    for (const PublicMode mode : modes) {
+      for (const bool active : residual_states) {
+        const auto oracle = run_integrated_exsia_lifecycle(
+            row_count, 1, family, LifecycleBackend::cpu_direct, mode,
+            TestFailure::none, !active);
+        const auto compact = run_integrated_exsia_lifecycle(
+            row_count, 1, family, LifecycleBackend::compact_ws, mode,
+            TestFailure::none, !active);
+        const bool case_ok =
+            check(oracle.ok && compact.ok,
+                  "matrix CPU oracle and compact route succeed") &&
+            check(compact.output == oracle.output,
+                  "matrix compact output equals CPU-direct oracle") &&
+            check(compact.semantic_layer_observed &&
+                      compact.counters.commit == 1 &&
+                      compact.counters.hardware == 0 &&
+                      compact.counters.fallback == 0 &&
+                      compact.counters.live_runs == 0 &&
+                      compact.counters.live_residual_simulators == 0,
+                  "matrix route commits once without fallback or leak") &&
+            check(active ? compact.counters.rmd_dot_calls > 0 &&
+                               compact.completion.rmd_dot_calls ==
+                                   compact.counters.rmd_dot_calls &&
+                               compact.completion.rmd_stats.rtl_work_total_cycles > 0 &&
+                               compact.completion.rmd_stats.rtl_output_write_requests > 0
+                         : compact.counters.rmd_dot_calls == 0 &&
+                               compact.completion.rmd_dot_calls == 0 &&
+                               compact.completion.rmd_stats.rtl_work_total_cycles == 0,
+                  "active compact residuals expose stats and empty residuals stay zero") &&
+            check(active ? compact.counters.rmd_packets == 3
+                         : compact.counters.rmd_packets == 0,
+                  "packet count follows active or empty residual state") &&
+            check(oracle.counters.rmd_dot_calls == 0,
+                  "CPU-direct oracle issues zero IM2P calls");
+        if (!case_ok) return false;
+        ++compact_cases;
+        std::printf(
+            "MULTIWIDTH_CASE kind=compact bits=%d family=%s mode=%s "
+            "residual=%s rows=%zu tail=1 route=IM2P dot_calls=%llu "
+            "rmd_cycles=%llu ws_calls=0 fallback=0 oracle=equal "
+            "sentinel=unchanged result=PASS\n",
+            GGML_GEMMINI_ACTIVATION_BITS, lifecycle_family_name(family),
+            mode == PublicMode::full ? "FULL" : "PIPELINE",
+            active ? "active" : "empty", row_count,
+            static_cast<unsigned long long>(compact.counters.rmd_dot_calls),
+            static_cast<unsigned long long>(
+                compact.completion.rmd_stats.rtl_work_total_cycles));
+      }
+    }
+  }
+
+  ggml_gemmini_args_t h0_args{};
+  h0_args.I = 1;
+  h0_args.J = 1;
+  h0_args.K = 32;
+  h0_args.block_size_k = 32;
+  h0_args.native_block_count = 1;
+  h0_args.native_blocks_per_row = 1;
+#if GGML_GEMMINI_WEIGHT_BITS == 4
+  block_q4_h0 h0_weight{};
+  std::fill(std::begin(h0_weight.qs), std::end(h0_weight.qs), uint8_t{0x99});
+  h0_weight.d = ggml_fp32_to_fp16(0.5f);
+  h0_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q4_h0;
+  h0_args.q4_h0_blocks = &h0_weight;
+#elif GGML_GEMMINI_WEIGHT_BITS == 8
+  block_q8_0 h0_weight{};
+  std::fill(std::begin(h0_weight.qs), std::end(h0_weight.qs), int8_t{1});
+  h0_weight.d = ggml_fp32_to_fp16(0.5f);
+  h0_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h0;
+  h0_args.B_blocks = &h0_weight;
+  h0_args.blocks_J = 1;
+  h0_args.blocks_K = 1;
+#else
+  block_q16_h0 h0_weight{};
+  std::fill(std::begin(h0_weight.qs), std::end(h0_weight.qs), int16_t{1});
+  h0_weight.d = ggml_fp32_to_fp16(0.5f);
+  h0_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q16_h0;
+  h0_args.q16_h0_blocks = &h0_weight;
+#endif
+  h0_args.native_weight_bytes = sizeof(h0_weight);
+  ggml::gemmini::residual::DirectStripePayload h0_payload{};
+  h0_payload.row_count = 1;
+  h0_payload.logical_k = 32;
+  h0_payload.logical_j = 1;
+  h0_payload.events = {{0, 0, 3}, {0, 31, -1}};
+
+  std::vector<double> h0_oracle;
+  size_t h0_cases = 0;
+  for (const PublicMode mode : modes) {
+    const Result accepted = gate_route(matrix_route(
+        mode, WeightFamily::h0, ResidualBackend::cpu_direct));
+    const Result rejected = gate_route(matrix_route(
+        mode, WeightFamily::h0, ResidualBackend::compact_ws));
+    ggml::gemmini::rmd::DirectOutput output =
+        ggml::gemmini::rmd::PreScaledFloat64Correction{{sentinel}};
+    ggml::gemmini::residual::DirectExecutionMetrics metrics{};
+    const auto status = ggml::gemmini::residual::execute_direct_stripe(
+        h0_args, h0_payload, output, &metrics);
+    const auto *values = std::get_if<
+        ggml::gemmini::rmd::PreScaledFloat64Correction>(&output);
+    if (!check(accepted.ok() && rejected.error == Error::unsupported_route,
+               "H0 CPU-direct accepts and compact rejects") ||
+        !check(status == ggml::gemmini::rmd::RmdStatus::success &&
+                   values != nullptr && values->values.size() == 1 &&
+                   values->values.front() == 1.0 && metrics.call_count == 1 &&
+                   metrics.event_count == 2,
+               "H0 CPU-direct result matches independent literal oracle") ||
+        !check(h0_cases == 0 || values->values == h0_oracle,
+               "H0 FULL and PIPELINE CPU-direct outputs are equal")) {
+      return false;
+    }
+    h0_oracle = values->values;
+    ++h0_cases;
+    std::printf(
+        "MULTIWIDTH_CASE kind=H0 bits=%d family=H0 mode=%s residual=active "
+        "rows=1 route=CPU_DIRECT compact=rejected dot_calls=0 ws_calls=0 "
+        "fallback=0 oracle=literal-and-cross-mode-equal sentinel=unchanged "
+        "result=PASS\n",
+        GGML_GEMMINI_ACTIVATION_BITS,
+        mode == PublicMode::full ? "FULL" : "PIPELINE");
+  }
+  const bool one_row = run_exsia_one_row_pipeline();
+  const bool ok = check(one_row, "one-row PIPELINE remains fail-closed") &&
+      check(compact_cases == 8 && h0_cases == 2,
+            "each build executes eight compact and two H0 cases");
+  if (ok) {
+    std::printf("MULTIWIDTH_SUMMARY bits=%d compact=8/8 h0=2/2 "
+                "cases=10/10 dim_tail=PASS multi_k=PASS "
+                "one_row_pipeline=PASS fallback=0\n",
+                GGML_GEMMINI_ACTIVATION_BITS);
+  }
+  return ok;
+}
+
+bool run_boundary_rejection(std::string_view selected) {
+  ExsiaRouteRequest request = matrix_route(
+      PublicMode::full, WeightFamily::h1, ResidualBackend::compact_ws);
+  const char *name = nullptr;
+  if (selected == "mismatched-width") {
+    request.artifact_activation_bits =
+        request.activation_bits == 4 ? uint8_t{8} : uint8_t{4};
+    name = "mismatched-width";
+  } else if (selected == "h0-compact-rejection") {
+    request.family = WeightFamily::h0;
+    name = "h0-compact-rejection";
+  } else {
+    request.family = WeightFamily::unsupported;
+    name = "unknown-route";
+  }
+  std::array<float, 2> output{{sentinel, sentinel}};
+  test_reset();
+  const Result result = gate_route(request);
+  const TestCounters counters = test_counters();
+  const bool ok = check(
+      result.error == (selected == "mismatched-width"
+                          ? Error::invalid_contract
+                          : Error::unsupported_route),
+      "boundary route returns the exact typed rejection") &&
+      check(output[0] == sentinel && output[1] == sentinel &&
+                counters.rmd_dot_calls == 0 && counters.hardware == 0 &&
+                counters.fallback == 0,
+            "boundary route rejects before simulator or output mutation");
+  if (ok) {
+    std::printf("ROUTING_REJECTION case=%s status=%s before_execute=1 "
+                "dot_calls=0 ws_calls=0 fallback=0 sentinel=unchanged\n",
+                name, selected == "mismatched-width" ? "invalid_contract"
+                                                     : "unsupported_route");
+  }
+  return ok;
+}
+
+bool run_boundary_rejections() {
+  return run_boundary_rejection("mismatched-width") &&
+      run_boundary_rejection("h0-compact-rejection") &&
+      run_boundary_rejection("unknown-route");
 }
 
 bool run_exsia_one_row_pipeline() {
@@ -1669,6 +2143,9 @@ bool run_exsia_start_failure() {
 bool run_exsia_boundary_failure(
     ggml::gemmini::im2p_adapter::TestFailure failure) {
   using namespace ggml::gemmini::im2p_adapter;
+  if (failure == TestFailure::provider) {
+    return run_sticky_provider_failure_matrix();
+  }
   setenv("GEMMINI_MATMUL_MODE", "STRIPE_PIPELINE", 1);
   setenv("GEMMINI_RMD_BACKEND", "CPU", 1);
   GraphCase test_case;
@@ -1722,6 +2199,50 @@ bool run_exsia_boundary_failure(
 bool run_exsia_staged_failure(
     ggml::gemmini::im2p_adapter::TestFailure failure) {
   using namespace ggml::gemmini::im2p_adapter;
+  if (failure == TestFailure::residual_execute ||
+      failure == TestFailure::compose ||
+      failure == TestFailure::output_authorization) {
+    const auto failed = run_integrated_exsia_lifecycle(
+        2 * GGML_GEMMINI_TEST_IM2P_DIM + 1, 1, LifecycleFamily::h1,
+        LifecycleBackend::cpu_direct, PublicMode::stripe_pipeline, failure);
+    const bool authorization = failure == TestFailure::output_authorization;
+    const bool ok =
+        check(!failed.ok, "callback-stage failure reaches typed completion") &&
+        check(all_sentinel(failed.output),
+              "callback-stage failure preserves caller sentinel") &&
+        check(failed.counters.pipeline == 1 && failed.counters.full == 0 &&
+                  failed.counters.fence == 1 && failed.counters.commit == 0 &&
+                  failed.counters.authorize == 1,
+              "callback-stage failure fences, rejects, and never commits") &&
+        check(authorization
+                  ? failed.counters.dense_completions == 3 &&
+                        failed.counters.rmd_calls == 3 &&
+                        failed.completion.semantic_completion_count == 3
+                  : failed.counters.dense_completions == 1 &&
+                        failed.counters.rmd_calls == 0 &&
+                        failed.completion.semantic_completion_count == 0,
+              "residual failure stops later dense work while authorization follows full semantic coverage") &&
+        check(failed.counters.hardware == 0 && failed.counters.fallback == 0 &&
+                  failed.counters.live_runs == 0,
+              "callback-stage failure wakes and joins workers without fallback");
+    if (ok) {
+      const char *name = failure == TestFailure::residual_execute
+                             ? "residual-execute"
+                             : failure == TestFailure::compose
+                                   ? "compose"
+                                   : "output-authorization";
+      std::printf(
+          "PIPELINE_CALLBACK_FAILURE failure=%s dense=%llu semantic=%llu "
+          "rmd_merges=%llu authorize=1 commit=0 sentinel=preserved "
+          "live_runs=0 fallback=0\n",
+          name,
+          static_cast<unsigned long long>(failed.counters.dense_completions),
+          static_cast<unsigned long long>(
+              failed.completion.semantic_completion_count),
+          static_cast<unsigned long long>(failed.counters.rmd_calls));
+    }
+    return ok;
+  }
   setenv("GEMMINI_MATMUL_MODE", "STRIPE_PIPELINE", 1);
   setenv("GEMMINI_RMD_BACKEND", "CPU", 1);
   GraphCase test_case;
@@ -1735,8 +2256,9 @@ bool run_exsia_staged_failure(
   const auto counters = test_counters();
   const bool fence_failure = failure == TestFailure::fence;
   const bool before_composition =
-      fence_failure || failure == TestFailure::dense ||
-      failure == TestFailure::residual_execute || failure == TestFailure::compose;
+      failure == TestFailure::dense ||
+      failure == TestFailure::residual_execute ||
+      failure == TestFailure::compose || failure == TestFailure::rmd;
   const bool ok =
       check(status != GGML_STATUS_SUCCESS,
             "staged ExSIA failure reaches graph status") &&
@@ -1775,57 +2297,40 @@ bool run_exsia_staged_failure(
 
 bool run_exsia_blocked_submit_failure() {
   using namespace ggml::gemmini::im2p_adapter;
-  setenv("GEMMINI_MATMUL_MODE", "STRIPE_PIPELINE", 1);
-  setenv("GEMMINI_RMD_BACKEND", "CPU", 1);
-  GraphCase test_case;
-  if (!check(test_case.initialize(),
-             "initialize blocked-producer ExSIA graph")) {
-    return false;
-  }
-  test_reset();
-  test_inject_failure(TestFailure::blocked_submit);
-  std::atomic<int> graph_status{-1};
-  std::thread compute([&] {
-    graph_status.store(static_cast<int>(ggml_backend_graph_compute(
-                           test_case.backend, test_case.graph)),
-                       std::memory_order_release);
-  });
-  const bool blocked = test_wait_for_blocked_producer();
-  test_release_blocked_producer_with_error();
-  compute.join();
-
-  const auto counters = test_counters();
+  const auto failed = run_integrated_exsia_lifecycle(
+      2 * GGML_GEMMINI_TEST_IM2P_DIM + 1, 1, LifecycleFamily::h1,
+      LifecycleBackend::cpu_direct, PublicMode::stripe_pipeline,
+      TestFailure::blocked_submit);
+  const auto &counters = failed.counters;
   const bool ok =
-      check(blocked, "third producer blocks on the capacity-two frontend") &&
-         check(graph_status.load(std::memory_order_acquire) !=
-                   GGML_STATUS_SUCCESS,
-               "blocked-producer failure reaches graph status") &&
-         check(all_sentinel(test_case.read_output()),
-               "blocked-producer failure preserves destination sentinel") &&
-         check(counters.pipeline == 1 && counters.fence == 1,
-               "blocked failure still fences its sole pipeline run") &&
-         check(counters.accepted_stripes == 2 &&
-                   counters.max_outstanding == 2 &&
-                   counters.blocked_producers == 1,
-               "capacity-two backpressure blocks exactly the third producer") &&
-         check(counters.blocked_submit_saw_execution_failure &&
-                   counters.fence_saw_execution_failure,
-               "blocked producer and fence observe the same sticky execution "
-               "error") &&
-         check(counters.rmd_calls == 0 && counters.authorize == 1 &&
-                   counters.commit == 0,
-               "blocked failure runs no RMD and commits no output") &&
-         check(counters.hardware == 0 && counters.fallback == 0 &&
-                   counters.live_runs == 0,
-               "blocked failure has no fallback and joins every worker") &&
-         check(counters.stripe_trace_size == 3 &&
-                   counters.stripe_ids[0] == 0 && counters.stripe_ids[1] == 1 &&
-                   counters.stripe_ids[2] == 2 && counters.slot_ids[0] == 0 &&
-                   counters.slot_ids[1] == 1 && counters.slot_ids[2] == 0,
-               "blocked producer observes deterministic first-three order");
+      check(!failed.ok, "blocked-producer failure reaches typed completion") &&
+      check(all_sentinel(failed.output),
+            "blocked-producer failure preserves destination sentinel") &&
+      check(counters.pipeline == 1 && counters.fence == 1,
+            "blocked failure still fences its sole pipeline run") &&
+      check(counters.accepted_stripes == 2 &&
+                counters.max_outstanding == 2 &&
+                counters.blocked_producers == 1,
+            "capacity-two backpressure blocks exactly the third producer") &&
+      check(counters.blocked_submit_saw_execution_failure &&
+                counters.fence_saw_execution_failure,
+            "blocked producer and fence observe the same sticky execution error") &&
+      check(counters.dense_completions == 0 && counters.rmd_calls == 0 &&
+                counters.authorize == 1 && counters.commit == 0,
+            "blocked failure publishes no dense/residual completion or output") &&
+      check(counters.hardware == 0 && counters.fallback == 0 &&
+                counters.live_runs == 0,
+            "blocked failure has no fallback and joins every worker") &&
+      check(counters.stripe_trace_size == 3 &&
+                counters.stripe_ids[0] == 0 && counters.stripe_ids[1] == 1 &&
+                counters.stripe_ids[2] == 2 && counters.slot_ids[0] == 0 &&
+                counters.slot_ids[1] == 1 && counters.slot_ids[2] == 0,
+            "blocked producer observes deterministic first-three order");
   if (ok) {
-    std::printf("failure=blocked_submit producer=fence=execution_failure "
-                "sentinel=preserved capacity=2 slots=0,1,0,1\n");
+    std::printf("PIPELINE_BLOCKED producer=fence=execution_failure "
+                "dense=0 semantic=0 rmd=0 authorize=1 commit=0 "
+                "sentinel=preserved capacity=2 slots=0,1,0 live_runs=0 "
+                "fallback=0\n");
   }
   return ok;
 }
@@ -1930,6 +2435,21 @@ bool run_stats_translation_contract() {
   SET_RAW(lookahead_start_cycle);
 #undef SET_RAW
 
+  ::im2p::gemmini::SemanticStripe semantic{77, 0, 0, 0, 4};
+  ::im2p::gemmini::ResidualStripeTiming rmd_timing{};
+  rmd_timing.run_id = 77;
+  rmd_timing.stripe_id = 0;
+  rmd_timing.slot = 0;
+  rmd_timing.row_begin = 0;
+  rmd_timing.row_end = 4;
+  rmd_timing.rmd_dot_calls = 5;
+  rmd_timing.rmd_stats.base.work_total_cycles = 55;
+  source.semantic_stripes = {&semantic, 1};
+  source.residual_stripe_timings = {&rmd_timing, 1};
+  source.semantic_completion_count = 1;
+  source.rmd_dot_calls = 5;
+  source.rmd_stats.base.work_total_cycles = 55;
+
   const Completion translated = translate(
       source, ::im2p::gemmini::Mode::stripe_pipeline,
       source.stats.base.stripes_published,
@@ -2022,6 +2542,26 @@ bool run_stats_translation_contract() {
   };
   bool ok = check(translated.result.ok(),
                   "sentinel statistics satisfy PIPELINE geometry");
+  ok = check(translated.semantic_completion_count == 1 &&
+                 translated.rmd_dot_calls == 5 &&
+                 translated.rmd_stats.rtl_work_total_cycles == 55 &&
+                 translated.stats.rtl_work_total_cycles == 101,
+             "semantic and RMD aggregates remain independent of dense stats") &&
+       ok;
+  auto failed_source = source;
+  failed_source.status.code =
+      ::im2p::gemmini::StatusCode::execution_failure;
+  const Completion failed_translation = translate(
+      failed_source, ::im2p::gemmini::Mode::stripe_pipeline,
+      source.stats.base.stripes_published,
+      source.stats.base.stripe_rows_published);
+  ok = check(!failed_translation.result.ok() &&
+                 failed_translation.semantic_completion_count == 0 &&
+                 failed_translation.rmd_dot_calls == 0 &&
+                 failed_translation.rmd_stats.rtl_work_total_cycles == 0 &&
+                 failed_translation.stats.rtl_work_total_cycles == 101,
+             "failed translation preserves dense meaning but hides semantic RMD success") &&
+       ok;
   for (std::size_t index = 0; index < actual.size(); ++index) {
     ok = check(actual[index] == 101 + index,
                "each unique raw sentinel maps to its semantic field exactly once") &&
@@ -2311,7 +2851,7 @@ int main(int argc, char **argv) {
 #if GGML_GEMMINI_ACTIVATION_QUANT == 0 && GGML_GEMMINI_ENABLE_RMD
     bool selected_ok = false;
     if (selected == "full") {
-      selected_ok = run_exsia_full_success();
+      selected_ok = run_exsia_full_im2p_provider();
     } else if (selected == "integrated-geometry") {
       selected_ok = run_integrated_geometry_oracle();
     } else if (selected == "route-lifecycle") {
@@ -2319,7 +2859,7 @@ int main(int argc, char **argv) {
     } else if (selected == "cross-mode-oracle") {
       selected_ok = run_exsia_cross_mode_parity();
     } else if (selected == "pipeline") {
-      selected_ok = run_exsia_success();
+      selected_ok = run_exsia_success() && run_exsia_pipeline_callback();
     } else if (selected == "full-collector-allocation") {
       selected_ok = run_exsia_full_failure(TestFailure::collector_allocation);
     } else if (selected == "full-collector-capture") {
@@ -2332,6 +2872,23 @@ int main(int argc, char **argv) {
       selected_ok = run_exsia_full_failure(TestFailure::fence);
     } else if (selected == "full-rmd") {
       selected_ok = run_exsia_full_failure(TestFailure::rmd);
+    } else if (selected == "sticky-provider-matrix") {
+      selected_ok = run_sticky_provider_failure_matrix();
+    } else if (selected == "full-im2p-provider") {
+      selected_ok =
+          run_exsia_full_im2p_provider(TestFailure::malformed_completion) &&
+          run_exsia_full_im2p_provider(TestFailure::simulator_create) &&
+          run_exsia_full_im2p_provider(TestFailure::provider) &&
+          run_exsia_full_im2p_provider(TestFailure::compose) &&
+          run_exsia_full_im2p_provider(TestFailure::output_copy);
+    } else if (selected == "multiwidth-matrix") {
+      selected_ok = run_multiwidth_matrix();
+    } else if (selected == "boundary-rejections") {
+      selected_ok = run_boundary_rejections();
+    } else if (selected == "mismatched-width" ||
+               selected == "h0-compact-rejection" ||
+               selected == "unknown-route") {
+      selected_ok = run_boundary_rejection(selected);
     } else if (selected == "one-row-pipeline") {
       selected_ok = run_exsia_one_row_pipeline();
     } else if (selected == "unsupported-mode") {
@@ -2440,6 +2997,7 @@ int main(int argc, char **argv) {
   ok = run_exsia_full_failure(TestFailure::fence) && ok;
   ok = run_exsia_full_failure(TestFailure::rmd) && ok;
   ok = run_exsia_success() && ok;
+  ok = run_exsia_pipeline_callback() && ok;
   ok = run_exsia_one_row_pipeline() && ok;
   ok = run_exsia_unsupported_mode() && ok;
   ok = run_exsia_start_failure() && ok;

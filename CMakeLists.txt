@@ -488,6 +488,9 @@ int main() {
 #include "ggml-gemmini-args.h"
 #include <cstdint>
 int main() {
+    if (im2p_execute_matmul_extended(nullptr, nullptr, nullptr) !=
+        IM2P_INVALID_LAYOUT)
+        return 9;
     if (im2p_begin_striped_matmul(nullptr, nullptr, nullptr) != IM2P_ERROR)
         return 10;
     if (im2p_publish_stripe(nullptr, nullptr) != IM2P_INVALID_LAYOUT)

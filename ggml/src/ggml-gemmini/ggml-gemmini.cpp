@@ -1305,7 +1305,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     constexpr bool im2p_exsia = false;
     constexpr bool im2p_non_exsia = false;
 #endif
-#if !defined(__riscv)
+#if !defined(__riscv) && !defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
     if (matmul_options.rmd_backend == ggml::gemmini::RmdBackend::gemmini_ws_compact) {
         ggml::gemmini::log::debug(layer,
             "[matmul.rmd] status=unsupported_backend backend=WS");
@@ -1906,6 +1906,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
           return;
         ggml::gemmini::im2p_adapter::log_stats(
             "full", completion.stats, completion.run_id, args);
+        ggml::gemmini::im2p_adapter::log_rmd_stats(completion, args);
         return;
       }
 

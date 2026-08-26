@@ -921,6 +921,8 @@ foreach(hardware_option IN ITEMS CPU WS)
 endforeach()
 make_fake_im2p_root(width_mismatch 16 16 32 4 8 16 32
     width_mismatch_root)
+make_fake_im2p_root(a4_archive_mismatch 4 4 16 4 8 8 16
+    a4_archive_mismatch_root)
 make_fake_im2p_root(weight_mismatch 16 16 32 4 16 8 32
     weight_mismatch_root)
 make_fake_im2p_root(dim_mismatch 16 16 32 4 16 16 16
@@ -961,6 +963,8 @@ run_im2p_configure_case(im2p_invalid_dim "${matching_root}" 8 8 17 IM2P_SIM FALS
     "GGML_GEMMINI_DIM must be 16, 32, or 64")
 run_im2p_configure_case(im2p_width_mismatch "${width_mismatch_root}" 16 16 32 IM2P_SIM FALSE
     "IM2P activation width mismatch: llama requests 16, archive reports 8")
+run_im2p_configure_case(im2p_a4_archive_mismatch "${a4_archive_mismatch_root}" 4 4 16 IM2P_SIM FALSE
+    "IM2P activation width mismatch: llama requests 4, archive reports 8")
 run_im2p_configure_case(im2p_mixed_a4_w8 "${matching_root}" 4 8 16 IM2P_SIM FALSE
     "Gemmini requires matched activation and weight widths")
 run_im2p_configure_case(im2p_mixed_a8_w4 "${matching_root}" 8 4 16 IM2P_SIM FALSE

@@ -898,7 +898,15 @@ bool residual_backend_available(RmdBackend backend) {
     (void) backend;
     return true;
 #else
-    return backend == RmdBackend::cpu_direct;
+    constexpr bool im2p_build =
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+        true;
+#else
+        false;
+#endif
+    return backend == RmdBackend::cpu_direct ||
+           (backend == RmdBackend::gemmini_ws_compact &&
+            rmd::compact_rmd_backend_available(false, im2p_build));
 #endif
 }
 

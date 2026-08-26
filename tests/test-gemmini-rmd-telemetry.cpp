@@ -1,16 +1,20 @@
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-matmul.hpp"
+#include "../ggml/src/ggml-gemmini/ggml-gemmini-im2p.hpp"
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-telemetry.hpp"
+#include "im2p_gemmini_frontend.hpp"
 #include "../ggml/src/ggml-gemmini/quants/act/exsia/exsia.hpp"
 #include <gemmini/cycle_reader.hpp>
 #include <gemmini/log.hpp>
 #include "../ggml/src/ggml-gemmini/residual/residual-capture.hpp"
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.hpp"
+#include <atomic>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
 #include <type_traits>
+#include <unistd.h>
 using namespace ggml::gemmini;
 namespace {
 bool expect(bool condition, const char * message) {
@@ -364,6 +368,131 @@ bool residual_capture_timer_seam() {
 #endif
 }
 
+bool residual_transport_fixtures(bool failure_selector) {
+    Im2pExecutionTelemetry serialized{};
+    serialized.residual_domain = true;
+    serialized.layer = "blk.15.mlp.down_proj";
+    serialized.run_id = 17;
+    serialized.stripe_id = 2;
+    serialized.slot = 1;
+    serialized.row_begin = 80;
+    serialized.row_end = 160;
+    serialized.rmd_dot_calls = 3;
+    serialized.rtl_work_total_cycles = 29;
+    const std::string json = serialize_cycle_telemetry(serialized);
+#if LOG_CYCLE
+    const std::string expected =
+        "{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"IM2P_RMD_STRIPE_TELEMETRY\","
+        "\"source\":\"im2p_rmd_rtl\",\"unit\":\"rtl_cycle\",\"op\":\"rmd.im2p.execute\","
+        "\"layer\":\"blk.15.mlp.down_proj\",\"run_id\":17,\"stripe_id\":2,\"slot\":1,"
+        "\"node_id\":null,\"worker_id\":null,\"row_begin\":80,\"row_end\":160,"
+        "\"rmd_dot_calls\":3,\"rmd_work_total_cycles\":29,"
+        "\"clock_domain\":\"independent_rmd_simulator\",\"additive\":false}";
+    if (!expect(json == expected, "RMD RTL stripe schema and clock domain are exact")) return false;
+    auto aggregate_record = serialized;
+    aggregate_record.residual_aggregate = true;
+    const std::string aggregate_json = serialize_cycle_telemetry(aggregate_record);
+    const std::string expected_aggregate =
+        "{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"IM2P_RMD_EXECUTION_TELEMETRY\","
+        "\"source\":\"im2p_rmd_rtl\",\"unit\":\"rtl_cycle\",\"op\":\"rmd.im2p.execute\","
+        "\"layer\":\"blk.15.mlp.down_proj\",\"run_id\":17,\"stripe_id\":null,\"slot\":null,"
+        "\"node_id\":null,\"worker_id\":null,\"rmd_dot_calls\":3,"
+        "\"rmd_work_total_cycles\":29,\"clock_domain\":\"independent_rmd_simulator\","
+        "\"additive\":false}";
+    if (!expect(aggregate_json == expected_aggregate,
+                "FULL RMD aggregate schema uses the independent clock domain")) return false;
+#else
+    if (!expect(json.empty(), "cycle-off suppresses RMD RTL stripe rows")) return false;
+#endif
+
+    ::im2p::gemmini::SemanticStripe semantic{17, 0, 0, 0, 4};
+    ::im2p::gemmini::ResidualStripeTiming timing{};
+    timing.run_id = 17; timing.stripe_id = 0; timing.slot = 0;
+    timing.row_begin = 0; timing.row_end = 4; timing.rmd_dot_calls = 3;
+    timing.rmd_stats.base.work_total_cycles = 29;
+    ::im2p::gemmini::FenceResult success{};
+    success.stats.base.work_total_cycles = 701;
+    success.semantic_stripes = {&semantic, 1};
+    success.residual_stripe_timings = {&timing, 1};
+    success.semantic_completion_count = 1;
+    success.rmd_dot_calls = 3;
+    success.rmd_stats.base.work_total_cycles = 29;
+    const auto translated = im2p_adapter::translate(
+        success, ::im2p::gemmini::Mode::full, 0, 0);
+    if (!expect(translated.result.ok() && translated.stats.rtl_work_total_cycles == 701 &&
+                translated.semantic_completion_count == 1 && translated.rmd_dot_calls == 3 &&
+                translated.rmd_stats.rtl_work_total_cycles == 29,
+                "dense and RMD aggregates translate independently")) return false;
+    auto zero_timing = timing;
+    zero_timing.rmd_dot_calls = 0;
+    zero_timing.rmd_stats = {};
+    auto zero = success;
+    zero.residual_stripe_timings = {&zero_timing, 1};
+    zero.rmd_dot_calls = 0;
+    zero.rmd_stats = {};
+    const auto zero_translated = im2p_adapter::translate(
+        zero, ::im2p::gemmini::Mode::full, 0, 0);
+    if (!expect(zero_translated.result.ok() && zero_translated.rmd_dot_calls == 0 &&
+                zero_translated.rmd_stats.rtl_work_total_cycles == 0,
+                "H0 or empty residual transport reports zero simulator calls")) return false;
+
+    ggml_gemmini_args_t args{};
+    args.matmul_layer = "blk.15.mlp.down_proj";
+    static std::atomic<std::uint64_t> sink_sequence{0};
+    const auto sink_id = std::to_string(static_cast<unsigned long long>(getpid())) +
+        "-" + std::to_string(sink_sequence.fetch_add(1, std::memory_order_relaxed));
+    const auto root = std::filesystem::temp_directory_path() /
+        ("gemmini-rmd-failure-telemetry-" + sink_id);
+    std::error_code error;
+    std::filesystem::create_directory(root, error);
+    const auto path = root / "cycle.jsonl";
+#if LOG_CYCLE
+    if (!expect(log::cycle.set_output_path(path.c_str(), true), "RMD failure sink setup")) return false;
+#endif
+    const auto emitted = im2p_adapter::emit_residual_stripe_timings(success, args, 17);
+
+    auto failed = success;
+    failed.status.code = ::im2p::gemmini::StatusCode::execution_failure;
+    failed.status.message = "injected residual failure";
+    const auto failed_translation = im2p_adapter::translate(
+        failed, ::im2p::gemmini::Mode::full, 0, 0);
+    const auto failed_emit = im2p_adapter::emit_residual_stripe_timings(failed, args, 17);
+
+    auto malformed = success;
+    malformed.rmd_stats.base.work_total_cycles = 30;
+    const auto malformed_emit =
+        im2p_adapter::emit_residual_stripe_timings(malformed, args, 17);
+    log::cycle.set_output(stderr);
+    const std::string output = read_file(path);
+#if LOG_CYCLE
+    const bool row_count_ok = count_occurrences(output, "IM2P_RMD_STRIPE_TELEMETRY") == 1;
+#else
+    const bool row_count_ok = output.empty();
+#endif
+    const bool ok = expect(emitted.ok(), "successful semantic telemetry emits") &&
+        expect(!failed_emit.ok() && !failed_translation.result.ok() &&
+                   failed_translation.semantic_completion_count == 0 &&
+                   failed_translation.rmd_dot_calls == 0 &&
+                   failed_translation.rmd_stats.rtl_work_total_cycles == 0,
+               "failed residual result exposes no successful semantic aggregate") &&
+        expect(!malformed_emit.ok(), "malformed RMD aggregate fails closed") &&
+        expect(row_count_ok, "failed and malformed residual telemetry emit no rows");
+    if (failure_selector) {
+        if (!json.empty()) std::printf("%s\n", json.c_str());
+        std::printf("RMD_RESIDUAL_FAILURE sink=%s dense_cycles=%llu "
+                    "semantic_count=%llu rmd_calls=%llu rmd_cycles=%llu "
+                    "success_rows=%zu failed_rows=0\n",
+                    root.string().c_str(),
+                    static_cast<unsigned long long>(translated.stats.rtl_work_total_cycles),
+                    static_cast<unsigned long long>(translated.semantic_completion_count),
+                    static_cast<unsigned long long>(translated.rmd_dot_calls),
+                    static_cast<unsigned long long>(translated.rmd_stats.rtl_work_total_cycles),
+                    count_occurrences(output, "IM2P_RMD_STRIPE_TELEMETRY"));
+    }
+    std::filesystem::remove_all(root, error);
+    return ok && !error;
+}
+
 bool negative_fixtures() {
     RmdTelemetryRecord malformed = cpu_record(); malformed.schema = "wrong";
     RmdTelemetryRecord zero = cpu_record(); zero.work = false; zero.counters = {};
@@ -423,9 +552,16 @@ int main(int argc, char ** argv) {
     if (argc == 3 && std::string(argv[1]) == "--aggregate-driver") {
         return run_aggregate_driver(argv[2]) ? 0 : 1;
     }
-    if (argc != 1) return 2;
+    if (argc == 3 && std::string(argv[1]) == "--case" &&
+        std::string(argv[2]) == "residual-failure") {
+        return residual_transport_fixtures(true) ? 0 : 1;
+    }
+    if (argc != 1) {
+        std::fprintf(stderr, "unsupported test case\n");
+        return 2;
+    }
     if (!aggregate_serializer_fixtures() || !aggregate_cycle_sink_fixtures() ||
-        !residual_capture_timer_seam()) return 1;
+        !residual_capture_timer_seam() || !residual_transport_fixtures(false)) return 1;
     if (!expect(resolve_rmd_model_id("model-id-env", "model-arch") == "model-id-env",
                 "model ID environment value wins") ||
         !expect(resolve_rmd_model_id("", "model-arch").empty(),

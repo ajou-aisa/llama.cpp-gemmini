@@ -84,6 +84,10 @@ struct Completion {
   Result result{};
   Stats stats{};
   std::uint64_t run_id = 0;
+  std::uint64_t semantic_completion_count = 0;
+  std::uint64_t rmd_dot_calls = 0;
+  // Independent residual-simulator counters. They are never added to stats.
+  Stats rmd_stats{};
 };
 
 enum class PublicMode : std::uint8_t {
@@ -202,10 +206,19 @@ struct ExsiaStripePipelineStart {
 [[nodiscard]] ExsiaStripePipelineStart
 start_exsia_stripe_pipeline(ggml_gemmini_args_t &args) noexcept;
 
+// Validates and emits successful PIPELINE semantic/RMD rows. Dense raw timing
+// and residual-simulator timing remain separate, non-additive clock domains.
+[[nodiscard]] Result emit_residual_stripe_timings(
+    const ::im2p::gemmini::FenceResult &result,
+    const ggml_gemmini_args_t &args,
+    std::uint64_t expected_run_id) noexcept;
+
 void log_failure(const char *operation, const Result &result) noexcept;
 void log_stats(const char * mode, const Stats & stats,
                std::uint64_t run_id,
                const ggml_gemmini_args_t & args) noexcept;
+void log_rmd_stats(const Completion & completion,
+                   const ggml_gemmini_args_t & args) noexcept;
 
 #if defined(GGML_GEMMINI_TESTING)
 constexpr std::size_t kTestStripeTraceCapacity = 32;
@@ -216,6 +229,11 @@ enum class TestFailure : std::uint8_t {
   execute,
   quantization,
   provider,
+  provider_read,
+  provider_watchdog,
+  provider_k_overflow,
+  provider_block_overflow,
+  provider_cancel_between_dots,
   progress,
   poll,
   fence,
@@ -228,6 +246,7 @@ enum class TestFailure : std::uint8_t {
   compose,
   output_authorization,
   output_copy,
+  simulator_create,
   collector_allocation,
   collector_capture,
 };
@@ -255,7 +274,10 @@ struct TestCounters {
   std::uint64_t rmd_calls = 0;
   std::uint64_t rmd_events = 0;
   std::uint64_t rmd_packets = 0;
+  std::uint64_t rmd_dot_calls = 0;
+  std::uint64_t provider_dot_attempts = 0;
   std::uint64_t dense_completions = 0;
+  std::uint64_t dense_completions_at_first_residual = 0;
   std::uint64_t residual_executions = 0;
   std::uint64_t compositions = 0;
   std::uint64_t authorize = 0;
@@ -266,6 +288,8 @@ struct TestCounters {
   std::uint64_t hardware = 0;
   std::uint64_t fallback = 0;
   std::uint64_t live_runs = 0;
+  std::uint64_t residual_simulator_creates = 0;
+  std::uint64_t live_residual_simulators = 0;
   std::uint64_t blocked_producers = 0;
   std::uint64_t quantization_failures = 0;
   std::uint64_t progress_failures = 0;
@@ -288,6 +312,9 @@ struct TestCounters {
   std::array<std::size_t, kTestStripeTraceCapacity> collector_row_begin{};
   std::array<std::size_t, kTestStripeTraceCapacity> collector_row_end{};
   std::array<std::int16_t, kTestStripeTraceCapacity> collector_theta{};
+  std::array<std::uint8_t, kTestStripeTraceCapacity> pipeline_callback_stripes{};
+  std::array<std::size_t, kTestStripeTraceCapacity> pipeline_merge_row_begin{};
+  std::array<std::size_t, kTestStripeTraceCapacity> pipeline_merge_row_end{};
 };
 
 void test_reset() noexcept;

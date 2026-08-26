@@ -139,6 +139,33 @@ std::string serialize_cycle_telemetry(const Im2pExecutionTelemetry & record) {
     return {};
 #else
     std::ostringstream out;
+    if (record.residual_domain) {
+        prefix(out, record.residual_aggregate
+                        ? "IM2P_RMD_EXECUTION_TELEMETRY"
+                        : "IM2P_RMD_STRIPE_TELEMETRY",
+               "im2p_rmd_rtl", "rtl_cycle");
+        string_field(out, "op", "rmd.im2p.execute");
+        nullable_string_field(out, "layer", record.layer);
+        field(out, "run_id", record.run_id);
+        if (record.residual_aggregate) {
+            null_field(out, "stripe_id");
+            null_field(out, "slot");
+        } else {
+            field(out, "stripe_id", record.stripe_id);
+            field(out, "slot", record.slot);
+        }
+        null_field(out, "node_id");
+        null_field(out, "worker_id");
+        if (!record.residual_aggregate) {
+            field(out, "row_begin", record.row_begin);
+            field(out, "row_end", record.row_end);
+        }
+        field(out, "rmd_dot_calls", record.rmd_dot_calls);
+        field(out, "rmd_work_total_cycles", record.rtl_work_total_cycles);
+        string_field(out, "clock_domain", "independent_rmd_simulator");
+        out << ",\"additive\":false}";
+        return out.str();
+    }
     prefix(out, "IM2P_EXECUTION_TELEMETRY", "im2p_rtl", "rtl_cycle");
     string_field(out, "op", "im2p.execute");
     nullable_string_field(out, "layer", record.layer);
@@ -251,8 +278,10 @@ void emit_cycle_telemetry(const WsLoopTelemetry & record) {
 void emit_cycle_telemetry(const Im2pExecutionTelemetry & record) {
     log::cycle.write_json(serialize_cycle_telemetry(record));
 #if LOG_DEBUG
-    const std::string detail = serialize_im2p_debug_detail(record);
-    log::debug(record.layer.c_str(), "%s", detail.c_str());
+    if (!record.residual_domain) {
+        const std::string detail = serialize_im2p_debug_detail(record);
+        log::debug(record.layer.c_str(), "%s", detail.c_str());
+    }
 #endif
 }
 void emit_cycle_telemetry(const Im2pStripeTelemetry & record) {

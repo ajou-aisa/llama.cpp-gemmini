@@ -74,6 +74,15 @@ struct Im2pExecutionTelemetry {
     std::uint64_t rtl_scheduler_groups_completed = 0;
     std::uint64_t rtl_stripes_published = 0;
     std::uint64_t rtl_stripe_rows_published = 0;
+
+    // Additive RMD projection. False preserves the dense record byte-for-byte.
+    bool residual_domain = false;
+    bool residual_aggregate = false;
+    std::uint64_t stripe_id = 0;
+    std::uint64_t slot = 0;
+    std::uint64_t row_begin = 0;
+    std::uint64_t row_end = 0;
+    std::uint64_t rmd_dot_calls = 0;
 };
 
 struct RmdTelemetryRecord;
