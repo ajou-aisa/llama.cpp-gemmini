@@ -2,9 +2,17 @@
 
 #include "rmd-types.hpp"
 
+#include <array>
+#include <limits>
+
 struct ggml_gemmini_args_t;
 
 namespace ggml::gemmini::rmd {
+
+constexpr bool compact_rmd_backend_available(bool hardware_target,
+                                             bool im2p_build) {
+    return hardware_target || im2p_build;
+}
 
 // Raw NPU tile result. The physical tile order is an executor-internal detail: the
 // assembler below normalises it into the canonical compressed output layout before
@@ -56,11 +64,37 @@ struct WsCallObservation {
 };
 #endif
 
+struct RmdProviderStats {
+    static constexpr size_t field_count = 41;
+    std::array<uint64_t, field_count> fields{};
+
+    [[nodiscard]] uint64_t work_total_cycles() const noexcept {
+        return fields[0];
+    }
+    [[nodiscard]] uint64_t output_write_requests() const noexcept {
+        return fields[4];
+    }
+};
+
+inline RmdStatus checked_accumulate_provider_stats(
+    RmdProviderStats &aggregate, const RmdProviderStats &value) noexcept {
+    auto staged = aggregate;
+    for (size_t index = 0; index < RmdProviderStats::field_count; ++index) {
+        if (staged.fields[index] >
+            std::numeric_limits<uint64_t>::max() - value.fields[index])
+            return RmdStatus::overflow;
+        staged.fields[index] += value.fields[index];
+    }
+    aggregate = staged;
+    return RmdStatus::success;
+}
+
 struct RmdExecutionMetrics {
     size_t direct_event_count = 0;
     size_t direct_call_count = 0;
     size_t packet_call_count = 0;
     size_t ws_call_count = 0;
+    size_t im2p_dot_calls = 0;
     size_t active_blocks = 0;
     size_t active_lanes = 0;
     size_t compact_k_count = 0;
@@ -78,6 +112,8 @@ struct RmdExecutionMetrics {
     size_t weight_values_gathered = 0;
     size_t weight_baseline_address_resolutions = 0;
     size_t weight_address_resolutions = 0;
+    // Transactional aggregate from the independent residual simulator.
+    RmdProviderStats im2p_stats{};
 #if defined(GGML_GEMMINI_TESTING)
     std::vector<WsCallObservation> ws_observations;
     std::vector<int64_t> raw_lane_values;
@@ -87,9 +123,9 @@ struct RmdExecutionMetrics {
 void collect_packet_metrics(const StripePacket & packet, RmdExecutionMetrics & metrics);
 
 // Executes every block of the compact packet, applies the block integer scale exactly
-// once, and writes canonical block-scaled INT64 output. H1/HP1 routes use checked
-// checked Rocket C++ lane dots; hardware compact routes use the normal Gemmini WS
-// entry point and are unavailable on host builds.
+// once, and writes canonical block-scaled INT64 output. Matched IM2P_SIM H1/HP1
+// routes use the typed provider executor; non-IM2P builds retain their existing
+// hardware/host policy. The explicit checked-software oracle remains test-only.
 RmdStatus execute_rmd_stripe_ws(const ggml_gemmini_args_t & args,
                                 const StripePacket & packet,
                                 CompressedOutput & output,

@@ -1,8 +1,13 @@
 #include "rmd-executor.hpp"
 
 #include "rmd-builder.hpp"
+#include "rmd-im2p-executor.hpp"
 
 #include "../../ggml-gemmini-args.h"
+
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+#include <im2p_sim.h>
+#endif
 #include "../../quants/common/weight_reader.hpp"
 #include "../../quants/common/weight_route.hpp"
 
@@ -174,6 +179,7 @@ struct LaneGroup {
 
 enum class CompactExecutorBackend : uint8_t {
     gemmini_ws,
+    im2p_sim,
     checked_software,
 };
 
@@ -731,7 +737,10 @@ template<CompactExecutorBackend Backend>
 RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                                   const StripePacket & packet,
                                   CompressedOutput & output,
-                                  RmdExecutionMetrics * metrics) {
+                                  RmdExecutionMetrics * metrics,
+                                  im2p_sim_t * im2p_sim = nullptr,
+                                  Im2pProviderTestFault im2p_fault =
+                                      Im2pProviderTestFault::none) {
 
     const wroute::WeightRoutePlan plan = wroute::resolve_weight_route_plan(
         args, wroute::WeightScaleInfoMode::Residual);
@@ -791,12 +800,16 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
     std::vector<int32_t> weight_tile;
     NativeOperandBuffer native_weight_tile;
     std::vector<acc_t> ws_values;
+    std::vector<OutputValue> im2p_values;
     std::vector<uint64_t> block_scales;
+    detail::Im2pProviderStatsAggregate im2p_stats{};
     try {
         stacked_values.assign(max_stacked_rows * kArrayDim, OutputValue{0});
         weight_tile.assign(kArrayDim * kArrayDim, int32_t{0});
         if constexpr (Backend == CompactExecutorBackend::gemmini_ws) {
             ws_values.assign(max_stacked_rows * kArrayDim, acc_t{0});
+        } else if constexpr (Backend == CompactExecutorBackend::im2p_sim) {
+            im2p_values.assign(max_stacked_rows * kArrayDim, OutputValue{0});
         }
         block_scales.assign(kArrayDim, uint64_t{0});
     } catch (const std::bad_alloc &) {
@@ -833,7 +846,7 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                 std::fill_n(stacked_values.begin(), stacked_value_count, OutputValue{0});
 
                 NativeOperandBuffer native_activation;
-                if constexpr (Backend != CompactExecutorBackend::checked_software) {
+                if constexpr (Backend == CompactExecutorBackend::gemmini_ws) {
                     const RmdStatus staging_status = native_activation.assign(
                         group.activation.data(), group.activation.size());
                     if (staging_status != RmdStatus::success) {
@@ -867,7 +880,52 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                         gather_counts.baseline_address_resolutions;
                     weight_address_resolutions += gather_counts.address_resolutions;
                     const int32_t * activation = group.activation.data() + k_base;
-                    if constexpr (Backend != CompactExecutorBackend::checked_software) {
+                    if constexpr (Backend == CompactExecutorBackend::im2p_sim) {
+                        std::fill_n(im2p_values.begin(), stacked_value_count,
+                                    OutputValue{0});
+                        const detail::Im2pCompactDot dot{
+                            packet.digit_bits,
+                            activation,
+                            stacked_rows,
+                            group.padded_k_count,
+                            weight_tile.data(),
+                            valid_cols,
+                            kArrayDim,
+                            valid_k,
+                        };
+                        if (im2p_fault ==
+                                Im2pProviderTestFault::cancel_after_first_dot &&
+                            staged_metrics.im2p_dot_calls != 0) {
+                            return RmdStatus::execution_failed;
+                        }
+                        const RmdStatus dot_status = detail::execute_im2p_compact_dot(
+                            im2p_sim, dot, im2p_values.data(), kArrayDim,
+                            im2p_stats, im2p_fault);
+                        if (dot_status != RmdStatus::success) {
+                            return dot_status;
+                        }
+                        if (im2p_fault ==
+                            Im2pProviderTestFault::k_accumulation_overflow) {
+                            std::fill_n(
+                                im2p_values.begin(), stacked_value_count,
+                                staged_metrics.im2p_dot_calls == 0
+                                    ? std::numeric_limits<OutputValue>::max()
+                                    : OutputValue{1});
+                        }
+                        ++staged_metrics.im2p_dot_calls;
+                        for (size_t row = 0; row < stacked_rows; ++row) {
+                            OutputValue * accumulator =
+                                stacked_values.data() + row * kArrayDim;
+                            for (size_t col = 0; col < valid_cols; ++col) {
+                                if (!checked_add_i64(
+                                        accumulator[col],
+                                        im2p_values[row * kArrayDim + col],
+                                        accumulator[col])) {
+                                    return RmdStatus::overflow;
+                                }
+                            }
+                        }
+                    } else if constexpr (Backend == CompactExecutorBackend::gemmini_ws) {
                         const RmdStatus staging_status = native_weight_tile.assign(
                             weight_tile.data(), weight_tile.size());
                         if (staging_status != RmdStatus::success) {
@@ -927,7 +985,7 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
 
 #if defined(GGML_GEMMINI_TESTING)
                 WsCallObservation observation{};
-                if constexpr (Backend != CompactExecutorBackend::checked_software) {
+                if constexpr (Backend == CompactExecutorBackend::gemmini_ws) {
                     observation.rows = stacked_rows;
                     observation.cols = valid_cols;
                     observation.k = group.compact_positions.size();
@@ -954,6 +1012,15 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                 }
 #endif
                 // Block integer scale is applied exactly once after all compact K tiles.
+                if constexpr (Backend == CompactExecutorBackend::im2p_sim) {
+                    if (im2p_fault ==
+                        Im2pProviderTestFault::block_scale_overflow) {
+                        std::fill_n(stacked_values.begin(), stacked_value_count,
+                                    std::numeric_limits<OutputValue>::max());
+                        std::fill_n(block_scales.begin(), valid_cols,
+                                    uint64_t{2});
+                    }
+                }
                 for (size_t row = 0; row < stacked_rows; ++row) {
                     OutputValue * accumulator = stacked_values.data() + row * kArrayDim;
                     for (size_t col = 0; col < valid_cols; ++col) {
@@ -968,7 +1035,7 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                 }
 
 #if defined(GGML_GEMMINI_TESTING)
-                if constexpr (Backend != CompactExecutorBackend::checked_software) {
+                if constexpr (Backend == CompactExecutorBackend::gemmini_ws) {
                     observation.scaled_value = stacked_values.front();
                     observation.compressed_value = observation.scaled_value;
                     const BalancedRadixContract radix =
@@ -1031,12 +1098,53 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
             weight_baseline_address_resolutions;
         staged_metrics.weight_address_resolutions = weight_address_resolutions;
         staged_metrics.packet_call_count = 1;
-        if constexpr (Backend != CompactExecutorBackend::checked_software) {
+        if constexpr (Backend == CompactExecutorBackend::gemmini_ws) {
             staged_metrics.ws_call_count = matmul_call_count;
+        }
+        else if constexpr (Backend == CompactExecutorBackend::im2p_sim) {
+            staged_metrics.im2p_stats = im2p_stats.stats;
         }
         *metrics = std::move(staged_metrics);
     }
     return RmdStatus::success;
+}
+
+RmdStatus execute_rmd_stripe_im2p(im2p_sim_t * sim,
+                                  const ggml_gemmini_args_t & args,
+                                  const StripePacket & packet,
+                                  CompressedOutput & output,
+                                  RmdExecutionMetrics * metrics) {
+#if !defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    (void) sim;
+    (void) args;
+    (void) packet;
+    (void) output;
+    (void) metrics;
+    return RmdStatus::unsupported_route;
+#else
+    if (sim == nullptr) {
+        return RmdStatus::invalid_arguments;
+    }
+    const wroute::WeightRoutePlan plan = wroute::resolve_weight_route_plan(
+        args, wroute::WeightScaleInfoMode::Residual);
+    const RmdStatus plan_status = compact_plan_status(args, plan);
+    if (plan_status != RmdStatus::success) {
+        return plan_status;
+    }
+    const RmdStatus validation = validate_execution_request(args, packet);
+    if (validation != RmdStatus::success) {
+        return validation;
+    }
+    if ((plan.route != wroute::WeightRouteKind::H1 &&
+         plan.route != wroute::WeightRouteKind::HP1) ||
+        packet.digit_bits != GGML_GEMMINI_ACTIVATION_BITS ||
+        plan.weight_bits != GGML_GEMMINI_WEIGHT_BITS ||
+        packet.digit_bits != plan.weight_bits) {
+        return RmdStatus::unsupported_route;
+    }
+    return execute_rmd_stripe_impl<CompactExecutorBackend::im2p_sim>(
+        args, packet, output, metrics, sim);
+#endif
 }
 
 RmdStatus execute_rmd_stripe_ws(const ggml_gemmini_args_t & args,
@@ -1056,8 +1164,19 @@ RmdStatus execute_rmd_stripe_ws(const ggml_gemmini_args_t & args,
 
     if (plan.route == wroute::WeightRouteKind::H1 ||
         plan.route == wroute::WeightRouteKind::HP1) {
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+        im2p_sim_t * sim = im2p_sim_create();
+        if (sim == nullptr) {
+            return RmdStatus::allocation_failure;
+        }
+        const RmdStatus status = execute_rmd_stripe_im2p(
+            sim, args, packet, output, metrics);
+        im2p_sim_destroy(sim);
+        return status;
+#else
         return execute_rmd_stripe_impl<CompactExecutorBackend::checked_software>(
             args, packet, output, metrics);
+#endif
     }
 
 #if !defined(__riscv)
@@ -1087,6 +1206,41 @@ RmdStatus execute_rmd_stripe_reference(const ggml_gemmini_args_t & args,
     }
     return execute_rmd_stripe_impl<CompactExecutorBackend::checked_software>(
         args, packet, output, metrics);
+}
+
+RmdStatus execute_rmd_stripe_im2p_for_test(
+    im2p_sim_t * sim,
+    const ggml_gemmini_args_t & args,
+    const StripePacket & packet,
+    CompressedOutput & output,
+    RmdExecutionMetrics * metrics,
+    Im2pProviderTestFault fault) {
+#if !defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    (void) sim;
+    (void) args;
+    (void) packet;
+    (void) output;
+    (void) metrics;
+    (void) fault;
+    return RmdStatus::unsupported_route;
+#else
+    if (sim == nullptr) return RmdStatus::invalid_arguments;
+    const wroute::WeightRoutePlan plan = wroute::resolve_weight_route_plan(
+        args, wroute::WeightScaleInfoMode::Residual);
+    const RmdStatus plan_status = compact_plan_status(args, plan);
+    if (plan_status != RmdStatus::success) return plan_status;
+    const RmdStatus validation = validate_execution_request(args, packet);
+    if (validation != RmdStatus::success) return validation;
+    if ((plan.route != wroute::WeightRouteKind::H1 &&
+         plan.route != wroute::WeightRouteKind::HP1) ||
+        packet.digit_bits != GGML_GEMMINI_ACTIVATION_BITS ||
+        plan.weight_bits != GGML_GEMMINI_WEIGHT_BITS ||
+        packet.digit_bits != plan.weight_bits) {
+        return RmdStatus::unsupported_route;
+    }
+    return execute_rmd_stripe_impl<CompactExecutorBackend::im2p_sim>(
+        args, packet, output, metrics, sim, fault);
+#endif
 }
 
 RmdStatus execute_rmd_stripe_gemmini_for_test(

@@ -526,6 +526,21 @@ target_include_directories(test-gemmini-rmd-packet PRIVATE
 add_test(NAME test-gemmini-rmd-packet
     COMMAND $<TARGET_FILE:test-gemmini-rmd-packet>)
 
+add_executable(test-gemmini-production-host-backend
+    test-gemmini-production-host-backend.cpp)
+target_compile_features(test-gemmini-production-host-backend PRIVATE cxx_std_17)
+target_compile_definitions(test-gemmini-production-host-backend PRIVATE
+    GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+    GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE})
+target_include_directories(test-gemmini-production-host-backend PRIVATE
+    ../ggml/src
+    ../ggml/src/ggml-gemmini
+    ${GGML_GEMMINI_GENERATED_CONFIG_DIR}
+    ${GEMMINI_SW_PATH}
+    ${GEMMINI_SW_PATH}/include)
+add_test(NAME test-gemmini-production-host
+    COMMAND $<TARGET_FILE:test-gemmini-production-host-backend>)
+
 add_executable(test-gemmini-rmd-telemetry
     test-gemmini-rmd-telemetry.cpp)
 target_link_libraries(test-gemmini-rmd-telemetry PRIVATE
@@ -540,6 +555,7 @@ target_compile_definitions(test-gemmini-rmd-telemetry PRIVATE
 target_include_directories(test-gemmini-rmd-telemetry PRIVATE
     ../ggml/include ../ggml/src ../ggml/src/ggml-gemmini
     ../ggml/src/ggml-gemmini-utils/include ${GGML_GEMMINI_GENERATED_CONFIG_DIR}
+    ${IM2P_SIM_ROOT}/frontend/include ${IM2P_SIM_ROOT}/sim/include
     ${GEMMINI_SW_PATH} ${GEMMINI_SW_PATH}/include)
 add_test(NAME test-gemmini-rmd-telemetry
     COMMAND $<TARGET_FILE:test-gemmini-rmd-telemetry>)
@@ -661,6 +677,10 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
         COMMAND $<TARGET_FILE:test-gemmini-im2p-routing>)
     add_test(NAME test-gemmini-im2p-route-matrix
         COMMAND $<TARGET_FILE:test-gemmini-im2p-routing> --route-matrix)
+    add_test(NAME test-gemmini-im2p-routing-multiwidth-matrix
+        COMMAND $<TARGET_FILE:test-gemmini-im2p-routing> --case multiwidth-matrix)
+    add_test(NAME test-gemmini-im2p-routing-boundary-rejections
+        COMMAND $<TARGET_FILE:test-gemmini-im2p-routing> --case boundary-rejections)
     add_test(NAME test-gemmini-im2p-routing-geometry
         COMMAND $<TARGET_FILE:test-gemmini-im2p-routing> --geometry-contract)
     add_test(NAME test-gemmini-im2p-routing-stats-translation
@@ -710,6 +730,25 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
     add_test(NAME test-gemmini-im2p-lifecycle-stats-invariants
         COMMAND $<TARGET_FILE:test-gemmini-im2p-lifecycle>
             --case stats-invariants)
+
+    add_executable(test-gemmini-rmd-im2p-provider
+        test-gemmini-rmd-im2p-provider.cpp)
+    target_link_libraries(test-gemmini-rmd-im2p-provider PRIVATE
+        ggml-gemmini ggml-base)
+    target_compile_features(test-gemmini-rmd-im2p-provider PRIVATE cxx_std_17)
+    target_compile_definitions(test-gemmini-rmd-im2p-provider PRIVATE
+        GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+        GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE})
+    target_include_directories(test-gemmini-rmd-im2p-provider PRIVATE
+        ../ggml/src
+        ../ggml/src/ggml-gemmini
+        ${IM2P_SIM_ROOT}/sim/include
+        ${GEMMINI_SW_PATH}
+        ${GEMMINI_SW_PATH}/include)
+    add_test(NAME test-gemmini-rmd-im2p-provider
+        COMMAND $<TARGET_FILE:test-gemmini-rmd-im2p-provider> --case success)
+    add_test(NAME test-gemmini-rmd-im2p-provider-failures
+        COMMAND $<TARGET_FILE:test-gemmini-rmd-im2p-provider> --case all)
 
     add_executable(test-gemmini-rmd-backend-gate
         test-gemmini-rmd-backend-gate.cpp)
@@ -805,6 +844,7 @@ set(_GEMMINI_REGISTERED_TEST_EXECUTABLES
     test-gemmini-exsia-writer
     test-gemmini-rmd
     test-gemmini-rmd-packet
+    test-gemmini-production-host-backend
     test-gemmini-rmd-telemetry
     gemmini-quant-dispatch-smoke)
 foreach(_GEMMINI_OPTIONAL_TEST_EXECUTABLE IN ITEMS
@@ -814,6 +854,7 @@ foreach(_GEMMINI_OPTIONAL_TEST_EXECUTABLE IN ITEMS
         test-gemmini-matmul-options
         test-gemmini-im2p-routing
         test-gemmini-im2p-lifecycle
+        test-gemmini-rmd-im2p-provider
         test-gemmini-rmd-backend-gate
         test-gemmini-matmul
         test-gemmini-buffer-artifacts

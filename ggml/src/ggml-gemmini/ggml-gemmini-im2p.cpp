@@ -7,6 +7,10 @@
 #include "im2p_gemmini_frontend.hpp"
 #include "quants/act/exsia/exsia.hpp"
 #include "quants/act/exsia/types.hpp"
+#include "residual/direct/direct-executor.hpp"
+#include "residual/rmd/rmd-compose.hpp"
+#include "residual/rmd/rmd-im2p-executor.hpp"
+#include <im2p_sim.h>
 
 #if defined(GGML_GEMMINI_TESTING)
 #include "im2p_gemmini_frontend_testing.hpp"
@@ -26,6 +30,47 @@
 
 namespace ggml::gemmini::im2p_adapter {
 namespace {
+
+::im2p::gemmini::Status to_frontend_status(const Result &result) noexcept {
+  using Code = ::im2p::gemmini::StatusCode;
+  Code code = Code::execution_failure;
+  switch (result.error) {
+  case Error::success: code = Code::success; break;
+  case Error::invalid_argument: code = Code::invalid_argument; break;
+  case Error::invalid_contract: code = Code::invalid_contract; break;
+  case Error::unsupported_route: code = Code::unsupported_route; break;
+  case Error::invalid_state: code = Code::invalid_state; break;
+  case Error::backpressure: code = Code::backpressure; break;
+  case Error::out_of_memory: code = Code::out_of_memory; break;
+  case Error::execution_failure: break;
+  }
+  return {code, ::im2p::gemmini::Route::unknown, result.native_contract,
+          result.message};
+}
+
+Result from_rmd_status(rmd::RmdStatus status) noexcept {
+  using Source = rmd::RmdStatus;
+  Error error = Error::execution_failure;
+  switch (status) {
+  case Source::success:
+    return {};
+  case Source::invalid_arguments:
+  case Source::invalid_packet:
+    error = Error::invalid_argument;
+    break;
+  case Source::unsupported_route:
+  case Source::residual_too_wide:
+    error = Error::unsupported_route;
+    break;
+  case Source::allocation_failure:
+    error = Error::out_of_memory;
+    break;
+  case Source::overflow:
+  case Source::execution_failed:
+    break;
+  }
+  return {error, rmd::rmd_status_message(status), false};
+}
 
 Result from_matmul_status(const MatmulStatus &status) noexcept {
   if (status.ok()) {
@@ -96,6 +141,25 @@ TestRuntimeArgsObserver runtime_args_observer = nullptr;
 void *runtime_args_observer_data = nullptr;
 ::im2p::gemmini::Run *active_blocked_run = nullptr;
 
+rmd::Im2pProviderTestFault provider_fault(TestFailure failure) noexcept {
+  switch (failure) {
+  case TestFailure::provider:
+    return rmd::Im2pProviderTestFault::write_failure;
+  case TestFailure::provider_read:
+    return rmd::Im2pProviderTestFault::read_failure;
+  case TestFailure::provider_watchdog:
+    return rmd::Im2pProviderTestFault::watchdog;
+  case TestFailure::provider_k_overflow:
+    return rmd::Im2pProviderTestFault::k_accumulation_overflow;
+  case TestFailure::provider_block_overflow:
+    return rmd::Im2pProviderTestFault::block_scale_overflow;
+  case TestFailure::provider_cancel_between_dots:
+    return rmd::Im2pProviderTestFault::cancel_after_first_dot;
+  default:
+    return rmd::Im2pProviderTestFault::none;
+  }
+}
+
 void observe_runtime_args(TestRuntimeArgsSite site,
                           const ggml_gemmini_args_t &args) noexcept {
   TestRuntimeArgsObserver observer = nullptr;
@@ -146,12 +210,10 @@ Result translate(const ::im2p::gemmini::Status &status) noexcept {
   return {error, status.message, status.native_contract};
 }
 
-Completion translate(const ::im2p::gemmini::FenceResult &result,
-                     ::im2p::gemmini::Mode mode,
-                     std::uint64_t expected_publications,
-                     std::uint64_t expected_published_rows) noexcept {
-  const auto &base = result.stats.base;
-  Stats stats{
+static Stats translate_stats(
+    const im2p_work_stats_extended_t &source) noexcept {
+  const auto &base = source.base;
+  return Stats{
       base.work_total_cycles,
       base.activation_read_requests,
       base.weight_read_requests,
@@ -179,21 +241,29 @@ Completion translate(const ::im2p::gemmini::FenceResult &result,
       base.stripes_published,
       base.stripe_rows_published,
       base.weight_bank_activations,
-      result.stats.cross_stripe_overlap_cycles,
-      result.stats.lookahead_prepared,
-      result.stats.lookahead_publish_cycle,
-      result.stats.lookahead_first_activation_cycle,
-      result.stats.lookahead_first_weight_cycle,
-      result.stats.lookahead_weight_preload_cycle,
-      result.stats.lookahead_weight_requests,
-      result.stats.lookahead_weight_reuse_hits,
-      result.stats.lookahead_scale_cycle,
-      result.stats.lookahead_scale_requests,
-      result.stats.lookahead_scale_reuses,
-      result.stats.current_stripe_completion_cycle,
-      result.stats.lookahead_ready_cycle,
-      result.stats.lookahead_start_cycle,
+      source.cross_stripe_overlap_cycles,
+      source.lookahead_prepared,
+      source.lookahead_publish_cycle,
+      source.lookahead_first_activation_cycle,
+      source.lookahead_first_weight_cycle,
+      source.lookahead_weight_preload_cycle,
+      source.lookahead_weight_requests,
+      source.lookahead_weight_reuse_hits,
+      source.lookahead_scale_cycle,
+      source.lookahead_scale_requests,
+      source.lookahead_scale_reuses,
+      source.current_stripe_completion_cycle,
+      source.lookahead_ready_cycle,
+      source.lookahead_start_cycle,
   };
+}
+
+Completion translate(const ::im2p::gemmini::FenceResult &result,
+                     ::im2p::gemmini::Mode mode,
+                     std::uint64_t expected_publications,
+                     std::uint64_t expected_published_rows) noexcept {
+  const auto &base = result.stats.base;
+  Stats stats = translate_stats(result.stats);
   Result translated = translate(result.status);
   if (!translated.ok()) {
     return {translated, stats};
@@ -215,7 +285,11 @@ Completion translate(const ::im2p::gemmini::FenceResult &result,
              false},
             stats};
   }
-  return {translated, stats};
+  Completion completion{translated, stats};
+  completion.semantic_completion_count = result.semantic_completion_count;
+  completion.rmd_dot_calls = result.rmd_dot_calls;
+  completion.rmd_stats = translate_stats(result.rmd_stats);
+  return completion;
 }
 
 static Result validate_stripe_timings(
@@ -274,6 +348,74 @@ static void emit_stripe_timings(
     record.completion_cycle = timing.completion_cycle;
     emit_cycle_telemetry(record);
   }
+}
+
+static Result validate_residual_stripe_timings(
+    const ::im2p::gemmini::FenceResult &result,
+    std::uint64_t expected_run_id) noexcept {
+  const Result status = translate(result.status);
+  if (!status.ok())
+    return status;
+
+  const auto count = result.semantic_completion_count;
+  if (result.semantic_stripes.size != count ||
+      result.residual_stripe_timings.size != count ||
+      (count != 0 && (result.semantic_stripes.data == nullptr ||
+                      result.residual_stripe_timings.data == nullptr))) {
+    return {Error::invalid_contract,
+            "semantic and RMD telemetry counts do not match", false};
+  }
+
+  std::uint64_t summed_calls = 0;
+  std::uint64_t summed_work = 0;
+  for (std::size_t index = 0; index < count; ++index) {
+    const auto &semantic = result.semantic_stripes[index];
+    const auto &timing = result.residual_stripe_timings[index];
+    if (semantic.run_id != expected_run_id || timing.run_id != expected_run_id ||
+        semantic.stripe_id != index || timing.stripe_id != index ||
+        semantic.slot != timing.slot || semantic.row_begin != timing.row_begin ||
+        semantic.row_end != timing.row_end || semantic.row_end < semantic.row_begin ||
+        timing.rmd_dot_calls >
+            std::numeric_limits<std::uint64_t>::max() - summed_calls ||
+        timing.rmd_stats.base.work_total_cycles >
+            std::numeric_limits<std::uint64_t>::max() - summed_work) {
+      return {Error::invalid_contract,
+              "semantic or RMD stripe telemetry is malformed", false};
+    }
+    summed_calls += timing.rmd_dot_calls;
+    summed_work += timing.rmd_stats.base.work_total_cycles;
+  }
+  if (summed_calls != result.rmd_dot_calls ||
+      summed_work != result.rmd_stats.base.work_total_cycles) {
+    return {Error::invalid_contract,
+            "RMD aggregate telemetry does not match stripe durations", false};
+  }
+
+  return {};
+}
+
+Result emit_residual_stripe_timings(
+    const ::im2p::gemmini::FenceResult &result,
+    const ggml_gemmini_args_t &args,
+    std::uint64_t expected_run_id) noexcept {
+  const Result status =
+      validate_residual_stripe_timings(result, expected_run_id);
+  if (!status.ok())
+    return status;
+  for (const auto &timing : result.residual_stripe_timings) {
+    Im2pExecutionTelemetry record{};
+    record.residual_domain = true;
+    record.layer = args.matmul_layer;
+    record.run_id = timing.run_id;
+    record.stripe_id = timing.stripe_id;
+    record.slot = timing.slot;
+    record.row_begin = timing.row_begin;
+    record.row_end = timing.row_end;
+    record.rmd_dot_calls = timing.rmd_dot_calls;
+    record.rtl_work_total_cycles = timing.rmd_stats.base.work_total_cycles;
+    emit_cycle_telemetry(record);
+  }
+  return {};
 }
 
 Result gate_route(const ExsiaRouteRequest &request) noexcept {
@@ -557,12 +699,15 @@ Completion run_stripe_pipeline(const ggml_gemmini_args_t &args) noexcept {
   }
   const Result timing_status = validate_stripe_timings(
       fenced.stripe_rtl_timings, runtime_args, completion.stats, run_id);
-  if (!timing_status.ok()) {
+  const Result residual_timing_status =
+      validate_residual_stripe_timings(fenced, run_id);
+  if (!timing_status.ok() || !residual_timing_status.ok()) {
 #if defined(GGML_GEMMINI_TESTING)
     std::lock_guard lock(test_mutex);
     production_failed = true;
 #endif
-    return {timing_status, completion.stats};
+    return {timing_status.ok() ? residual_timing_status : timing_status,
+            completion.stats};
   }
   const auto committed =
       ::im2p::gemmini::authorize_output_commit(*started.run, true);
@@ -575,7 +720,8 @@ Completion run_stripe_pipeline(const ggml_gemmini_args_t &args) noexcept {
   }
   completion.run_id = run_id;
   emit_stripe_timings(fenced.stripe_rtl_timings, args);
-  return completion;
+  const Result emitted = emit_residual_stripe_timings(fenced, args, run_id);
+  return emitted.ok() ? completion : Completion{emitted, completion.stats};
 }
 
 struct CapturedExsiaStripe {
@@ -641,10 +787,24 @@ static WeightFamily concrete_weight_family(
 }
 #endif
 
-static Result
-apply_captured_rmd(const ggml_gemmini_args_t &runtime_args, float *output_data,
-                   size_t output_elements,
-                   const std::vector<CapturedExsiaStripe> &captured) noexcept {
+// FULL owns this synchronous post-fence path. Unlike the compatibility matmul
+// facade, it keeps one compact simulator alive across every canonical packet.
+static Result apply_captured_rmd_full(
+    const ggml_gemmini_args_t &runtime_args, float *output_data,
+    size_t output_elements,
+    const std::vector<CapturedExsiaStripe> &captured,
+    ::im2p::gemmini::ResidualStripeStats &result_stats) noexcept {
+#if defined(GGML_GEMMINI_TESTING)
+  TestFailure failure;
+  {
+    std::lock_guard lock(test_mutex);
+    failure = injected_failure;
+  }
+  const bool force_malformed_order =
+      failure == TestFailure::malformed_completion;
+#else
+  constexpr bool force_malformed_order = false;
+#endif
   std::unique_ptr<ggml_gemmini_args_t> rmd_args;
   std::vector<const CapturedExsiaStripe *> ordered;
   try {
@@ -654,154 +814,165 @@ apply_captured_rmd(const ggml_gemmini_args_t &runtime_args, float *output_data,
     if (!checked_output_extent(*rmd_args, output_extent) ||
         output_extent > output_elements) {
       return {Error::invalid_contract,
-              "frontend RMD staging does not cover the output layout", false};
+              "FULL RMD staging does not cover the output layout", false};
     }
     ordered.reserve(captured.size());
-    for (const auto &stripe : captured) {
+    for (const auto &stripe : captured)
       ordered.push_back(&stripe);
-    }
-    std::sort(ordered.begin(), ordered.end(),
-              [](const auto *lhs, const auto *rhs) {
-                return lhs->event.row_begin < rhs->event.row_begin;
-              });
-    auto &captured_meta =
+    std::sort(ordered.begin(), ordered.end(), [](const auto *lhs, const auto *rhs) {
+      return lhs->event.row_begin < rhs->event.row_begin;
+    });
+    auto &metadata =
         rmd_args->act_quant.storage().emplace<quants::act::exsia::Meta>();
-    captured_meta.theta.assign(captured.size(),
-                               std::numeric_limits<std::int16_t>::min());
+    metadata.theta.assign(captured.size(),
+                          std::numeric_limits<std::int16_t>::min());
     size_t next_row = 0;
     for (size_t index = 0; index < ordered.size(); ++index) {
       const auto &stripe = *ordered[index];
-      if (stripe.event.stripe_id != index ||
+      if ((force_malformed_order && index == 1) ||
+          stripe.event.stripe_id != index ||
           stripe.event.row_begin != next_row ||
           stripe.event.row_begin >= stripe.event.row_end ||
           stripe.event.row_end > runtime_args.I) {
         return {Error::invalid_contract,
-                "captured ExSIA stripes are not contiguous in row order",
-                false};
+                "captured FULL stripes are not canonical", false};
       }
-      captured_meta.theta[index] = stripe.theta;
+      metadata.theta[index] = stripe.theta;
       next_row = stripe.event.row_end;
     }
     if (ordered.empty() || next_row != runtime_args.I) {
       return {Error::invalid_contract,
-              "captured ExSIA stripes do not cover the output rows", false};
+              "captured FULL stripes do not cover the output rows", false};
     }
   } catch (const std::bad_alloc &) {
-    return {Error::out_of_memory, "failed to stage captured ExSIA metadata",
+    return {Error::out_of_memory, "failed to stage FULL residual metadata",
             false};
   } catch (...) {
-    return {Error::execution_failure, "failed to stage captured ExSIA metadata",
-            false};
+    return {Error::execution_failure,
+            "failed to initialize FULL residual staging", false};
   }
 
 #if defined(GGML_GEMMINI_TESTING)
   test_observe_weight_family(concrete_weight_family(rmd_args->weight_format));
 #endif
-  ResolvedMatmulOptions options;
-  options.mode = MatmulInvocationMode::stripe_pipeline;
-  options.job_capacity = std::max<size_t>(2, ordered.size());
-  options.rmd_backend =
-      runtime_args.residual_route == residual::ResidualRoute::ws_packet
-          ? RmdBackend::gemmini_ws_compact
-          : RmdBackend::cpu_direct;
-  MatmulExecution execution = prepare_execution(rmd_args.get(), options);
-  if (!execution.status().ok()) {
-    return from_matmul_status(execution.status());
-  }
 
-  std::vector<MatmulStripeJob> jobs;
-  try {
-    jobs.reserve(ordered.size());
-    for (const auto *stripe : ordered) {
-      jobs.push_back(capture_stripe(
-          execution,
-          MatmulStripeInput(stripe->event.row_begin, stripe->event.row_end,
-                            stripe->event.stripe_id),
-          stripe->event.direct_residual, stripe->event.rmd_packet));
-      if (!jobs.back().status().ok()) {
-        return from_matmul_status(jobs.back().status());
+  const bool has_packet = std::any_of(
+      ordered.begin(), ordered.end(), [](const CapturedExsiaStripe *stripe) {
+        return stripe->event.rmd_packet != nullptr;
+      });
+  struct SimulatorDeleter {
+    void operator()(im2p_sim_t *sim) const noexcept {
+      if (sim != nullptr)
+        im2p_sim_destroy(sim);
+#if defined(GGML_GEMMINI_TESTING)
+      if (sim != nullptr) {
+        std::lock_guard lock(test_mutex);
+        --counters.live_residual_simulators;
       }
+#endif
     }
-  } catch (const std::bad_alloc &) {
-    return {Error::out_of_memory, "failed to stage ExSIA RMD jobs", false};
-  } catch (...) {
-    return {Error::execution_failure, "failed to stage ExSIA RMD jobs", false};
-  }
-
-  for (size_t index = 0; index < jobs.size(); ++index) {
-    MatmulStatus status;
+  };
+  std::unique_ptr<im2p_sim_t, SimulatorDeleter> simulator;
+  if (has_packet) {
+#if defined(GGML_GEMMINI_TESTING)
+    if (failure == TestFailure::simulator_create) {
+      return {Error::out_of_memory,
+              "injected FULL residual simulator creation failure", false};
+    }
+#endif
+    simulator.reset(im2p_sim_create());
+    if (!simulator) {
+      return {Error::out_of_memory,
+              "failed to create FULL residual simulator", false};
+    }
 #if defined(GGML_GEMMINI_TESTING)
     {
       std::lock_guard lock(test_mutex);
-      if (injected_failure == TestFailure::dense) {
-        return {Error::execution_failure, "injected dense completion failure",
-                false};
-      }
+      ++counters.residual_simulator_creates;
+      ++counters.live_residual_simulators;
     }
 #endif
-    if (status.ok())
-      status = accept_external_dense_completion(jobs[index]);
+  }
+
+  ::im2p::gemmini::ResidualStripeStats staged_stats{};
+  rmd::RmdProviderStats staged_provider_stats{};
+  for (const auto *captured_stripe : ordered) {
+    const auto &event = captured_stripe->event;
+    rmd::Correction correction = rmd::BlockScaledInt64Correction{};
+    rmd::CompressedOutput compressed;
+    rmd::RmdExecutionMetrics metrics{};
+    residual::DirectExecutionMetrics direct_metrics{};
+    rmd::RmdStatus status = rmd::RmdStatus::success;
+    const bool no_residual =
+        event.direct_residual == nullptr && event.rmd_packet == nullptr;
+    if (event.direct_residual != nullptr) {
+      status = residual::execute_direct_stripe(
+          *rmd_args, *event.direct_residual, correction, &direct_metrics);
+    } else if (event.rmd_packet != nullptr) {
 #if defined(GGML_GEMMINI_TESTING)
-    if (status.ok()) {
-      std::lock_guard lock(test_mutex);
-      ++counters.dense_completions;
-#if GGML_GEMMINI_ENABLE_RMD
-      if (injected_failure == TestFailure::residual_execute) {
-        return {Error::execution_failure, "injected residual execute failure",
-                false};
+      if (provider_fault(failure) != rmd::Im2pProviderTestFault::none) {
+        status = rmd::execute_rmd_stripe_im2p_for_test(
+            simulator.get(), *rmd_args, *event.rmd_packet, compressed, &metrics,
+            provider_fault(failure));
+      } else
+#endif
+      {
+        status = rmd::execute_rmd_stripe_im2p(
+            simulator.get(), *rmd_args, *event.rmd_packet, compressed, &metrics);
       }
-#endif
     }
-#endif
-    if (status.ok())
-      status = execute_rmd_stripe(jobs[index]);
-#if GGML_GEMMINI_ENABLE_RMD
+    if (status != rmd::RmdStatus::success)
+      return from_rmd_status(status);
+    if (metrics.im2p_dot_calls >
+            std::numeric_limits<std::uint64_t>::max() -
+                staged_stats.rmd_dot_calls ||
+        rmd::checked_accumulate_provider_stats(
+            staged_provider_stats, metrics.im2p_stats) !=
+            rmd::RmdStatus::success) {
+      return {Error::execution_failure,
+              "FULL RMD provider statistics overflow", false};
+    }
+    staged_stats.rmd_dot_calls += metrics.im2p_dot_calls;
+
 #if defined(GGML_GEMMINI_TESTING)
-    if (status.ok()) {
+    {
       std::lock_guard lock(test_mutex);
       ++counters.residual_executions;
-      if (injected_failure == TestFailure::compose) {
-        return {Error::execution_failure, "injected RMD compose failure",
-                false};
-      }
+      counters.rmd_dot_calls += metrics.im2p_dot_calls;
+    }
+    if (failure == TestFailure::compose) {
+      return {Error::execution_failure,
+              "injected FULL RMD compose failure", false};
     }
 #endif
-    if (status.ok())
-      status = compose_rmd_stripe(jobs[index]);
-#endif
-    if (!status.ok())
-      return from_matmul_status(status);
-#if GGML_GEMMINI_ENABLE_RMD
+    if (event.rmd_packet != nullptr) {
+      status = rmd::compose_rmd_output(*event.rmd_packet, compressed, correction);
+    }
+    if (status == rmd::RmdStatus::success && !no_residual) {
+      status = rmd::merge_rmd_correction_to(
+          *rmd_args, output_data, event.row_begin, event.row_end, correction);
+    }
+    if (status != rmd::RmdStatus::success)
+      return from_rmd_status(status);
 #if defined(GGML_GEMMINI_TESTING)
     {
       std::lock_guard lock(test_mutex);
       ++counters.compositions;
       ++counters.rmd_calls;
-      const auto &direct = ordered[index]->event.direct_residual;
-      if (direct)
-        counters.rmd_events += direct->events.size();
-      if (ordered[index]->event.rmd_packet)
-        ++counters.rmd_packets;
+      counters.rmd_events += direct_metrics.event_count;
+      counters.rmd_packets += event.rmd_packet != nullptr;
     }
 #endif
-#endif
   }
-#if GGML_GEMMINI_ENABLE_RMD
 #if defined(GGML_GEMMINI_TESTING)
-  {
-    std::lock_guard lock(test_mutex);
-    if (injected_failure == TestFailure::rmd) {
-      return {Error::execution_failure, "injected RMD failure", false};
-    }
+  if (failure == TestFailure::rmd) {
+    return {Error::execution_failure, "injected RMD failure", false};
   }
 #endif
-#endif
-  for (auto &job : jobs) {
-    const MatmulStatus status = finalize_stripe(job);
-    if (!status.ok())
-      return from_matmul_status(status);
-  }
-  return from_matmul_status(finish_execution(execution));
+  rmd::detail::expand_im2p_provider_stats(staged_provider_stats,
+                                          staged_stats.rmd_stats);
+  result_stats = staged_stats;
+  return {};
 }
 
 class ExsiaStripePipeline::Impl {
@@ -829,6 +1000,156 @@ public:
   on_ready(void *opaque,
            const quants::act::exsia::StripeReadyEvent &event) noexcept {
     return static_cast<Impl *>(opaque)->publish(event);
+  }
+
+  static ::im2p::gemmini::Status residual_stage(
+      void *opaque, im2p_sim_t *simulator,
+      const quants::act::exsia::StripeReadyEvent &event,
+      ::im2p::gemmini::ResidualStageView stage,
+      ::im2p::gemmini::ResidualStripeStats &stats) noexcept {
+    return static_cast<Impl *>(opaque)->apply_residual(simulator, event, stage,
+                                                       stats);
+  }
+
+  ::im2p::gemmini::Status apply_residual(
+      im2p_sim_t *simulator,
+      const quants::act::exsia::StripeReadyEvent &event,
+      ::im2p::gemmini::ResidualStageView stage,
+      ::im2p::gemmini::ResidualStripeStats &stats) noexcept {
+    if (!event.activation_metadata.has_value() ||
+        event.activation_metadata->theta ==
+            std::numeric_limits<std::int16_t>::min() ||
+        event.row_begin >= event.row_end || event.row_end > runtime_args.I ||
+        stage.data == nullptr ||
+        (event.direct_residual != nullptr && event.rmd_packet != nullptr) ||
+        (residual_mode == ::im2p::gemmini::ResidualStageMode::host_direct
+             ? simulator != nullptr || event.rmd_packet != nullptr
+             : simulator == nullptr || event.direct_residual != nullptr)) {
+      return to_frontend_status(
+          {Error::invalid_contract, "invalid PIPELINE residual callback event",
+           false});
+    }
+    size_t output_extent = 0;
+    if (!checked_output_extent(runtime_args, output_extent) ||
+        output_extent > stage.element_count) {
+      return to_frontend_status(
+          {Error::invalid_contract,
+           "PIPELINE residual stage does not cover the output layout", false});
+    }
+
+    ggml_gemmini_args_t stripe_args;
+    try {
+      stripe_args = runtime_args;
+      auto &metadata = stripe_args.act_quant.storage()
+                           .emplace<quants::act::exsia::Meta>();
+      metadata.e_s = event.activation_metadata->e_s;
+      metadata.rho = event.activation_metadata->rho;
+      metadata.sigma = event.activation_metadata->sigma;
+      metadata.theta.assign(event.stripe_id + 1,
+                            std::numeric_limits<std::int16_t>::min());
+      metadata.theta[event.stripe_id] = event.activation_metadata->theta;
+    } catch (const std::bad_alloc &) {
+      return to_frontend_status(
+          {Error::out_of_memory,
+           "failed to stage PIPELINE residual callback metadata", false});
+    } catch (...) {
+      return to_frontend_status(
+          {Error::execution_failure,
+           "failed to initialize PIPELINE residual callback", false});
+    }
+
+#if defined(GGML_GEMMINI_TESTING)
+    TestFailure failure;
+    {
+      std::lock_guard lock(test_mutex);
+      failure = injected_failure;
+      ++counters.dense_completions;
+      if (counters.residual_executions == 0)
+        counters.dense_completions_at_first_residual =
+            counters.dense_completions;
+    }
+    if (failure == TestFailure::dense ||
+        failure == TestFailure::residual_execute) {
+      const char *message = failure == TestFailure::dense
+                                ? "injected dense completion failure"
+                                : "injected residual execute failure";
+      return to_frontend_status(
+          {Error::execution_failure, message, false});
+    }
+#endif
+
+    rmd::Correction correction = rmd::BlockScaledInt64Correction{};
+    rmd::CompressedOutput compressed;
+    rmd::RmdExecutionMetrics metrics{};
+    residual::DirectExecutionMetrics direct_metrics{};
+    rmd::RmdStatus status = rmd::RmdStatus::success;
+    const bool no_residual =
+        event.direct_residual == nullptr && event.rmd_packet == nullptr;
+    if (event.direct_residual != nullptr) {
+      status = residual::execute_direct_stripe(
+          stripe_args, *event.direct_residual, correction, &direct_metrics);
+    } else if (event.rmd_packet != nullptr) {
+#if defined(GGML_GEMMINI_TESTING)
+      if (provider_fault(failure) != rmd::Im2pProviderTestFault::none) {
+        status = rmd::execute_rmd_stripe_im2p_for_test(
+            simulator, stripe_args, *event.rmd_packet, compressed, &metrics,
+            provider_fault(failure));
+      } else
+#endif
+      {
+        status = rmd::execute_rmd_stripe_im2p(
+            simulator, stripe_args, *event.rmd_packet, compressed, &metrics);
+      }
+    }
+    if (status != rmd::RmdStatus::success)
+      return to_frontend_status(from_rmd_status(status));
+
+#if defined(GGML_GEMMINI_TESTING)
+    {
+      std::lock_guard lock(test_mutex);
+      ++counters.residual_executions;
+      counters.rmd_dot_calls += metrics.im2p_dot_calls;
+    }
+    if (failure == TestFailure::compose) {
+      return to_frontend_status(
+          {Error::execution_failure, "injected RMD compose failure", false});
+    }
+#endif
+    if (event.rmd_packet != nullptr)
+      status = rmd::compose_rmd_output(*event.rmd_packet, compressed, correction);
+    if (status == rmd::RmdStatus::success && !no_residual) {
+      status = rmd::merge_rmd_correction_to(
+          stripe_args, stage.data, event.row_begin, event.row_end, correction);
+    }
+    if (status != rmd::RmdStatus::success)
+      return to_frontend_status(from_rmd_status(status));
+#if defined(GGML_GEMMINI_TESTING)
+    if (failure == TestFailure::rmd) {
+      return to_frontend_status(
+          {Error::execution_failure, "injected RMD failure", false});
+    }
+#endif
+
+    stats.rmd_dot_calls = metrics.im2p_dot_calls;
+    rmd::detail::expand_im2p_provider_stats(metrics.im2p_stats,
+                                            stats.rmd_stats);
+#if defined(GGML_GEMMINI_TESTING)
+    {
+      std::lock_guard lock(test_mutex);
+      const size_t index = static_cast<size_t>(counters.compositions);
+      ++counters.compositions;
+      ++counters.rmd_calls;
+      counters.rmd_events += direct_metrics.event_count;
+      counters.rmd_packets += event.rmd_packet != nullptr;
+      if (index < kTestStripeTraceCapacity) {
+        counters.pipeline_callback_stripes[index] =
+            static_cast<std::uint8_t>(event.stripe_id);
+        counters.pipeline_merge_row_begin[index] = event.row_begin;
+        counters.pipeline_merge_row_end[index] = event.row_end;
+      }
+    }
+#endif
+    return {};
   }
 
   bool publish(const quants::act::exsia::StripeReadyEvent &event) noexcept {
@@ -994,6 +1315,8 @@ public:
   bool fenced = false;
   bool finished = false;
   bool rmd_terminal_succeeded = false;
+  ::im2p::gemmini::ResidualStageMode residual_mode =
+      ::im2p::gemmini::ResidualStageMode::none;
 #if defined(GGML_GEMMINI_TESTING)
   bool registered = false;
 #endif
@@ -1238,12 +1561,28 @@ Completion ExsiaFullExecution::finish(bool quantization_succeeded) noexcept {
   if (!completion.result.ok())
     return completion;
 
-  const Result rmd =
-      apply_captured_rmd(impl_->runtime_args, impl_->staged_output.data(),
-                         impl_->staged_output.size(), impl_->captured);
+  ::im2p::gemmini::ResidualStripeStats full_rmd_stats{};
+  const Result rmd = apply_captured_rmd_full(
+      impl_->runtime_args, impl_->staged_output.data(),
+      impl_->staged_output.size(), impl_->captured, full_rmd_stats);
   if (!rmd.ok())
     return {rmd, completion.stats};
+  completion.rmd_dot_calls = full_rmd_stats.rmd_dot_calls;
+  completion.rmd_stats = translate_stats(full_rmd_stats.rmd_stats);
+  completion.semantic_completion_count = impl_->captured.size();
+  if (!impl_->captured.empty())
+    completion.run_id = impl_->captured.front().event.run_id;
   impl_->mark_rmd_terminal_success();
+#if defined(GGML_GEMMINI_TESTING)
+  {
+    std::lock_guard lock(test_mutex);
+    if (failure == TestFailure::output_copy) {
+      return {{Error::execution_failure,
+               "injected FULL staged-output copy failure", false},
+              completion.stats};
+    }
+  }
+#endif
   impl_->copy_staged_output();
   return completion;
 }
@@ -1313,13 +1652,21 @@ start_exsia_stripe_pipeline(ggml_gemmini_args_t &args) noexcept {
 
   impl->runtime_args.f_out = impl->staged_output.data();
   impl->runtime_args.exsia_stripe_ready_sink = nullptr;
+  impl->residual_mode =
+      args.residual_route == residual::ResidualRoute::ws_packet
+          ? ::im2p::gemmini::ResidualStageMode::im2p_compact
+          : ::im2p::gemmini::ResidualStageMode::host_direct;
 #if defined(GGML_GEMMINI_TESTING)
+  test_observe_weight_family(concrete_weight_family(args.weight_format));
   observe_runtime_args(TestRuntimeArgsSite::exsia_pipeline_before_execute,
                        impl->runtime_args);
 #endif
+  const ::im2p::gemmini::Options frontend_options{
+      65536, impl->residual_mode, impl.get(),
+      &ExsiaStripePipeline::Impl::residual_stage};
   auto started = ::im2p::gemmini::execute(
       &impl->runtime_args, ::im2p::gemmini::Mode::stripe_pipeline,
-      ::im2p::gemmini::Options{65536});
+      frontend_options);
   if (!started.status.ok()) {
     return {translate(started.status), {}};
   }
@@ -1435,42 +1782,26 @@ Completion ExsiaStripePipeline::finish(bool quantization_succeeded) noexcept {
   const std::uint64_t run_id = impl_->published.front().event.run_id;
   const Result timing_status = validate_stripe_timings(
       fenced.stripe_rtl_timings, impl_->runtime_args, completion.stats, run_id);
-  if (!timing_status.ok() ||
+  const Result residual_timing_status =
+      validate_residual_stripe_timings(fenced, run_id);
+  if (!timing_status.ok() || !residual_timing_status.ok() ||
       impl_->published.size() != fenced.stripe_rtl_timings.size) {
     (void)impl_->authorize(false);
-    return {timing_status.ok()
-                ? Result{Error::invalid_contract,
-                         "ExSIA publications do not match stripe timings", false}
-                : timing_status,
+    return {!timing_status.ok()
+                ? timing_status
+                : (!residual_timing_status.ok()
+                       ? residual_timing_status
+                       : Result{Error::invalid_contract,
+                                "ExSIA publications do not match stripe timings",
+                                false}),
             completion.stats};
   }
 
-#if defined(GGML_GEMMINI_TESTING)
-  if (failure == TestFailure::provider) {
-    (void)impl_->authorize(false);
-    return {{Error::execution_failure,
-             "injected pipeline output provider failure", false},
-            completion.stats};
-  }
-#endif
-  const auto output_stage =
-      ::im2p::gemmini::acquire_pipeline_output_stage(*impl_->run);
-  if (!output_stage.status.ok() || output_stage.data == nullptr) {
-    (void)impl_->authorize(false);
-    return {translate(output_stage.status), completion.stats};
-  }
-
-  const Result rmd =
-      apply_captured_rmd(impl_->runtime_args, output_stage.data,
-                         output_stage.element_count, impl_->published);
-  if (!rmd.ok()) {
-    (void)impl_->authorize(false);
-    return {rmd, completion.stats};
-  }
   impl_->mark_rmd_terminal_success();
   const Result authorized = impl_->authorize(true);
   if (!authorized.ok()) {
-    return {authorized, completion.stats};
+    completion.result = authorized;
+    return completion;
   }
 #if defined(GGML_GEMMINI_TESTING)
   {
@@ -1486,7 +1817,9 @@ Completion ExsiaStripePipeline::finish(bool quantization_succeeded) noexcept {
   completion.run_id = run_id;
   emit_quantization_timings(impl_->published, impl_->args);
   emit_stripe_timings(fenced.stripe_rtl_timings, impl_->args);
-  return completion;
+  const Result emitted =
+      emit_residual_stripe_timings(fenced, impl_->args, run_id);
+  return emitted.ok() ? completion : Completion{emitted, completion.stats};
 }
 
 #if defined(GGML_GEMMINI_TESTING)
@@ -1496,6 +1829,7 @@ void test_reset() noexcept {
   counters = {};
   injected_failure = TestFailure::none;
   production_failed = false;
+  rmd::reset_im2p_provider_dot_attempts_for_test();
 }
 
 void test_set_runtime_args_observer(TestRuntimeArgsObserver observer,
@@ -1542,7 +1876,10 @@ void test_release_blocked_producer_with_error() noexcept {
 
 TestCounters test_counters() noexcept {
   std::lock_guard lock(test_mutex);
-  return counters;
+  TestCounters snapshot = counters;
+  snapshot.provider_dot_attempts =
+      rmd::im2p_provider_dot_attempts_for_test();
+  return snapshot;
 }
 
 bool test_production_failed() noexcept {
@@ -1599,6 +1936,27 @@ void log_failure(const char *operation, const Result &result) noexcept {
                  result.message ? result.message : "unknown error",
                  static_cast<unsigned>(result.error),
                  result.native_contract ? 1U : 0U);
+}
+
+void log_rmd_stats(const Completion &completion,
+                   const ggml_gemmini_args_t &args) noexcept {
+#if LOG_CYCLE
+  if (completion.rmd_dot_calls == 0 &&
+      completion.rmd_stats.rtl_work_total_cycles == 0)
+    return;
+  Im2pExecutionTelemetry record{};
+  record.residual_domain = true;
+  record.residual_aggregate = true;
+  record.layer = args.matmul_layer;
+  record.run_id = completion.run_id;
+  record.rmd_dot_calls = completion.rmd_dot_calls;
+  record.rtl_work_total_cycles =
+      completion.rmd_stats.rtl_work_total_cycles;
+  emit_cycle_telemetry(record);
+#else
+  (void)completion;
+  (void)args;
+#endif
 }
 
 void log_stats(const char * mode, const Stats & stats,

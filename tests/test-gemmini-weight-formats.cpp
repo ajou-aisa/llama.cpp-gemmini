@@ -1,8 +1,10 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-gemmini.h"
+#include "../ggml/src/ggml-gemmini/ggml-gemmini-q4-h1-reprocess.hpp"
 #include "../ggml/src/ggml-gemmini/quants/common/weight_reader.hpp"
 #include "../ggml/src/ggml-quants.h"
+#include "../src/llama-quant.h"
 
 #include <algorithm>
 #include <array>
@@ -297,6 +299,39 @@ bool test_reader_happy_table() {
     return ok;
 }
 
+bool test_q4_h0_matches_canonical_dequantization() {
+    ReaderFixture fixture(4, Family::H0);
+    for (size_t i = 0; i < std::size(fixture.q4_h0.qs); ++i) {
+        fixture.q4_h0.qs[i] =
+            static_cast<uint8_t>(i | ((15 - i) << 4));
+    }
+
+    std::array<float, QK4_0> canonical{};
+    dequantize_row_q4_0(&fixture.q4_h0, canonical.data(), canonical.size());
+
+    const wroute::WeightRoutePlan plan = fixture.resolve();
+    if (!check(plan.valid && plan.status == RouteStatus::Success,
+               "Q4_H0 canonical comparison route resolves")) {
+        return false;
+    }
+
+    bool ok = true;
+    for (size_t k = 0; k < canonical.size(); ++k) {
+        const wreader::WeightCodeResult code =
+            wreader::read_code(fixture.args, plan, 0, k);
+        const wreader::WeightScaleResult scale =
+            wreader::read_scale(fixture.args, plan, 0, 0);
+        const float decoded =
+            static_cast<float>(code.value) * scale.floating_block_scale;
+        ok = check(
+                 code.status == ReaderStatus::Success &&
+                     scale.status == ReaderStatus::Success &&
+                     decoded == canonical[k],
+                 "Q4_H0 reader matches canonical Q4_0 dequantization") && ok;
+    }
+    return ok;
+}
+
 bool test_reader_failure_table() {
     bool ok = true;
 
@@ -403,6 +438,115 @@ bool test_reader_failure_table() {
     return ok;
 }
 
+bool test_q4_h1_is_canonical_q4_0_reprocessing() {
+    constexpr int64_t columns = 64;
+    std::array<float, columns> source{};
+    for (int64_t i = 0; i < columns; ++i) {
+        source[i] = static_cast<float>((i * 11) % 29 - 14) / 4.0f;
+    }
+    source[0] = 8.0f;
+    source[1] = -6.75f;
+    source[32] = -8.0f;
+    source[33] = 6.75f;
+
+    std::array<block_q4_h1, 2> offline{};
+    quantize_row_q4_h1_ref(source.data(), offline.data(), columns);
+
+    std::array<block_q4_0, 2> q4_0{};
+    quantize_row_q4_0_ref(source.data(), q4_0.data(), columns);
+
+    ggml_tensor tensor{};
+    tensor.type = GGML_TYPE_Q4_0;
+    tensor.data = q4_0.data();
+    tensor.ne[0] = columns;
+    tensor.ne[1] = 1;
+    tensor.ne[2] = 1;
+    tensor.ne[3] = 1;
+    tensor.nb[0] = sizeof(block_q4_0);
+    tensor.nb[1] = sizeof(q4_0);
+    tensor.nb[2] = sizeof(q4_0);
+    tensor.nb[3] = sizeof(q4_0);
+
+    std::vector<block_q4_h1> runtime;
+    size_t blocks_per_row = 0;
+    size_t logical_rows = 0;
+    bool ok = check(
+                  ggml::gemmini::prepare_q4_0_rows_for_q4_h1(
+                      &tensor, runtime, &blocks_per_row, &logical_rows),
+                  "runtime Q4_0 to Q4_H1 reprocessing succeeds") &&
+        check(
+            blocks_per_row == offline.size() && logical_rows == 1 &&
+                runtime.size() == offline.size(),
+            "runtime Q4_H1 geometry matches offline geometry") &&
+        check(
+            std::memcmp(offline.data(), runtime.data(), sizeof(offline)) == 0,
+            "offline Q4_H1 equals runtime reprocessing of canonical Q4_0");
+
+    uint16_t non_finite_bits = 0x7c00;
+    std::memcpy(&q4_0[0].d, &non_finite_bits, sizeof(non_finite_bits));
+    runtime.clear();
+    ok = check(
+             !ggml::gemmini::prepare_q4_0_rows_for_q4_h1(
+                 &tensor, runtime, nullptr, nullptr),
+             "runtime Q4_0 reprocessing rejects non-finite block scale") &&
+        ok;
+    return ok;
+}
+
+bool test_q4_h1_preserves_positive_q4_0_scale() {
+    block_q4_0 source{};
+    source.d = ggml_fp32_to_fp16(0.25f);
+    for (size_t i = 0; i < std::size(source.qs); ++i) {
+        source.qs[i] = static_cast<uint8_t>(i | ((15 - i) << 4));
+    }
+
+    block_q4_h1 converted{};
+    if (!check(
+            reprocess_row_q4_0_to_q4_h1_ref(&source, &converted, QK4_0),
+            "positive-scale Q4_0 block reprocessing succeeds")) {
+        return false;
+    }
+
+    std::array<float, QK4_0> canonical{};
+    std::array<float, QK4_0> reprocessed{};
+    dequantize_row_q4_0(&source, canonical.data(), QK4_0);
+    dequantize_row_q4_h1(&converted, reprocessed.data(), QK4_0);
+    return check(
+        std::memcmp(canonical.data(), reprocessed.data(), sizeof(canonical)) == 0,
+        "positive-scale Q4_0 values survive Q4_H1 reprocessing exactly");
+}
+
+bool test_q4_h1_flips_negative_q4_0_scale_codes() {
+    block_q4_0 source{};
+    source.d = ggml_fp32_to_fp16(-0.25f);
+    for (size_t i = 0; i < std::size(source.qs); ++i) {
+        source.qs[i] = static_cast<uint8_t>(i | ((15 - i) << 4));
+    }
+
+    block_q4_h1 converted{};
+    if (!check(
+            reprocess_row_q4_0_to_q4_h1_ref(&source, &converted, QK4_0),
+            "negative-scale Q4_0 block reprocessing succeeds")) {
+        return false;
+    }
+
+    std::array<float, QK4_0> canonical{};
+    std::array<float, QK4_0> reprocessed{};
+    dequantize_row_q4_0(&source, canonical.data(), QK4_0);
+    dequantize_row_q4_h1(&converted, reprocessed.data(), QK4_0);
+    bool ok = true;
+    for (size_t i = 0; i < canonical.size(); ++i) {
+        const uint8_t packed = source.qs[i % (QK4_0 / 2)];
+        const uint8_t code = i < QK4_0 / 2 ? packed & 0x0f : packed >> 4;
+        const float expected = code == 0 ? 1.75f : canonical[i];
+        ok = check(
+                 reprocessed[i] == expected,
+                 "negative-scale Q4_0 conversion changes only unrepresentable +8 code") &&
+             ok;
+    }
+    return ok;
+}
+
 bool test_q4_h1_narrow_scale_range_preserves_magnitude() {
     constexpr int64_t columns = 64;
     std::array<float, columns> source{};
@@ -411,13 +555,16 @@ bool test_q4_h1_narrow_scale_range_preserves_magnitude() {
         source[i] = block_max * static_cast<float>((i % 17) - 8) / 8.0f;
     }
 
+    std::array<block_q4_0, 2> canonical{};
+    quantize_row_q4_0_ref(source.data(), canonical.data(), columns);
+
     std::array<block_q4_h1, 2> quantized{};
     quantize_row_q4_h1_ref(source.data(), quantized.data(), columns);
 
     bool ok = true;
     for (size_t i = 0; i < quantized.size(); ++i) {
-        const float expected = ggml_fp16_to_fp32(
-            ggml_fp32_to_fp16((i == 0 ? 1.0f : 1.001f) / 7.0f));
+        const float source_scale = ggml_fp16_to_fp32(canonical[i].d);
+        const float expected = std::fabs(source_scale);
         const float actual =
             quantized[i].s_rf * (static_cast<float>(quantized[i].R) + quantized[i].c_b);
         if (!(std::fabs(actual - expected) <= expected * 0.01f)) {
@@ -486,6 +633,34 @@ bool test_legacy_round_trips() {
     return ok;
 }
 
+bool test_gemmini_q4_default_output_policy() {
+    bool ok = true;
+    struct Case {
+        llama_ftype ftype;
+        bool pure;
+        bool is_output_weight;
+        bool is_token_embedding_weight;
+        ggml_type expected;
+        const char * message;
+    };
+    const std::array<Case, 7> cases = {{
+        { LLAMA_FTYPE_MOSTLY_Q4_0,  false, true,  false, GGML_TYPE_COUNT, "Q4_0 output keeps standard policy" },
+        { LLAMA_FTYPE_MOSTLY_Q4_H1, false, true,  false, GGML_TYPE_F16,  "Q4_H1 output stays F16" },
+        { LLAMA_FTYPE_MOSTLY_Q4_HP1,false, true,  false, GGML_TYPE_F16,  "Q4_HP1 output stays F16" },
+        { LLAMA_FTYPE_MOSTLY_Q4_H1, false, true,  true,  GGML_TYPE_F16,  "Q4_H1 tied token/output stays F16" },
+        { LLAMA_FTYPE_MOSTLY_Q4_H1, false, false, true,  GGML_TYPE_F16,  "Q4_H1 untied token embedding stays F16" },
+        { LLAMA_FTYPE_MOSTLY_Q4_H1, true,  true,  true,  GGML_TYPE_COUNT, "pure Q4_H1 bypasses mixed policy" },
+        { LLAMA_FTYPE_MOSTLY_Q4_H1, false, false, false, GGML_TYPE_COUNT, "ordinary Q4_H1 tensor stays quantized" },
+    }};
+    for (const Case & test : cases) {
+        ok = check(
+                 llama_quantize_gemmini_q4_default_tensor_type(
+                     test.ftype, test.pure, test.is_output_weight, test.is_token_embedding_weight) == test.expected,
+                 test.message) && ok;
+    }
+    return ok;
+}
+
 bool test_q4_hp1_loader_contract() {
 #if GGML_GEMMINI_ACTIVATION_BITS == 4 && GGML_GEMMINI_WEIGHT_BITS == 4
     ggml_init_params params = {
@@ -551,9 +726,14 @@ int main(int argc, char ** argv) {
 
     bool ok = true;
     if (selection == Selection::All || selection == Selection::HappyTable) {
+        ok = test_gemmini_q4_default_output_policy() && ok;
         ok = test_legacy_round_trips() && ok;
+        ok = test_q4_h1_is_canonical_q4_0_reprocessing() && ok;
+        ok = test_q4_h1_preserves_positive_q4_0_scale() && ok;
+        ok = test_q4_h1_flips_negative_q4_0_scale_codes() && ok;
         ok = test_q4_hp1_loader_contract() && ok;
         ok = test_reader_happy_table() && ok;
+        ok = test_q4_h0_matches_canonical_dequantization() && ok;
     }
     if (selection == Selection::All || selection == Selection::FailureTable) {
         ok = test_reader_failure_table() && ok;
