@@ -197,6 +197,21 @@ target_compile_definitions(test-gemmini-log-boundary PRIVATE
     EXPECT_LOG_CYCLE=$<IF:$<BOOL:${LOG_CYCLE}>,1,0>)
 add_test(NAME test-gemmini-log-boundary
     COMMAND $<TARGET_FILE:test-gemmini-log-boundary>)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    find_package(Threads REQUIRED)
+    add_executable(test-gemmini-cycle-reader-aarch64
+        test-gemmini-cycle-reader-aarch64.cpp
+        ../ggml/src/ggml-gemmini-utils/src/cycle_reader_aarch64.cpp
+        ../ggml/src/ggml-gemmini-utils/src/cycle_reader-capi.cpp)
+    target_include_directories(test-gemmini-cycle-reader-aarch64 PRIVATE
+        ../ggml/src/ggml-gemmini-utils/include)
+    target_compile_definitions(test-gemmini-cycle-reader-aarch64 PRIVATE
+        GGML_GEMMINI_TESTING=1 LOG_CYCLE=1)
+    target_compile_features(test-gemmini-cycle-reader-aarch64 PRIVATE cxx_std_17)
+    target_link_libraries(test-gemmini-cycle-reader-aarch64 PRIVATE Threads::Threads)
+    add_test(NAME test-gemmini-cycle-reader-aarch64
+        COMMAND $<TARGET_FILE:test-gemmini-cycle-reader-aarch64>)
+endif()
 if (LOG_CYCLE AND GGML_CPU_CYCLE_LOG AND TARGET ggml-cpu)
     add_executable(test-ggml-cpu-cycle-sink test-ggml-cpu-cycle-sink.cpp)
     target_link_libraries(test-ggml-cpu-cycle-sink PRIVATE ggml-base ggml-cpu ggml-gemmini-utils)

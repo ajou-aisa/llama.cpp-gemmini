@@ -6,6 +6,9 @@ add_library(ggml-gemmini-utils
     src/log-capi.cpp
     src/cycle_reader-capi.cpp
 )
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    target_sources(ggml-gemmini-utils PRIVATE src/cycle_reader_aarch64.cpp)
+endif()
 set_target_properties(ggml-gemmini-utils PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     WINDOWS_EXPORT_ALL_SYMBOLS ON)
