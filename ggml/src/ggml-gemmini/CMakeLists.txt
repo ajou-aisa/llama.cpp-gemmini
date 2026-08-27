@@ -121,6 +121,7 @@ target_include_directories(ggml-gemmini PUBLIC
   ${GEMMINI_SW_PATH}/include
 )
 target_include_directories(ggml-gemmini PRIVATE
+  ${CMAKE_CURRENT_LIST_DIR}/../ggml-gemmini-utils/src
   ${CMAKE_CURRENT_LIST_DIR}/quants
   ${CMAKE_CURRENT_LIST_DIR}/quants/act
   ${CMAKE_CURRENT_LIST_DIR}/quants/act/exsia

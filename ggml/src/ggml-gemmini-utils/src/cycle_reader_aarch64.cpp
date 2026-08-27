@@ -181,60 +181,6 @@ NativeCycleSample read_sample() noexcept
     return invalid_sample(owner, NativeCycleReason::seqlock_exhausted);
 }
 
-NativeCycleDelta evaluate_interval(const NativeCycleSample & start, const NativeCycleSample & end,
-                                   bool structurally_same_owner_eligible) noexcept
-{
-    if (!start.valid)
-    {
-        return {0, false, NativeCycleReason::invalid_start, start.reason};
-    }
-    if (!end.valid)
-    {
-        return {0, false, NativeCycleReason::invalid_end, end.reason};
-    }
-    if (start.source != end.source)
-    {
-        return {0, false, NativeCycleReason::source_mismatch, NativeCycleReason::none};
-    }
-    if (start.owner_event_token != end.owner_event_token)
-    {
-        return {0, false, NativeCycleReason::event_owner_mismatch, NativeCycleReason::none};
-    }
-    if (start.generation != end.generation)
-    {
-        return {0, false, NativeCycleReason::event_generation_mismatch, NativeCycleReason::none};
-    }
-    if (!structurally_same_owner_eligible)
-    {
-        return {0, false, NativeCycleReason::structurally_cross_task, NativeCycleReason::none};
-    }
-    if (end.value < start.value)
-    {
-        return {0, false, NativeCycleReason::counter_regression, NativeCycleReason::none};
-    }
-    return {end.value - start.value, true, NativeCycleReason::none, NativeCycleReason::none};
-}
-
-const char * reason_name(NativeCycleReason reason) noexcept
-{
-    switch (reason)
-    {
-        case NativeCycleReason::none: return "none";
-        case NativeCycleReason::unavailable_event: return "unavailable_event";
-        case NativeCycleReason::unavailable_direct_mapping: return "unavailable_direct_mapping";
-        case NativeCycleReason::multiplexed: return "multiplexed";
-        case NativeCycleReason::seqlock_exhausted: return "seqlock_exhausted";
-        case NativeCycleReason::invalid_start: return "invalid_start";
-        case NativeCycleReason::invalid_end: return "invalid_end";
-        case NativeCycleReason::source_mismatch: return "source_mismatch";
-        case NativeCycleReason::event_owner_mismatch: return "event_owner_mismatch";
-        case NativeCycleReason::event_generation_mismatch: return "event_generation_mismatch";
-        case NativeCycleReason::structurally_cross_task: return "structurally_cross_task";
-        case NativeCycleReason::counter_regression: return "counter_regression";
-    }
-    return "unknown";
-}
-
 #if defined(GGML_GEMMINI_TESTING)
 namespace testing
 {

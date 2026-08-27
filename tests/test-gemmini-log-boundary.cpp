@@ -1,5 +1,6 @@
 #include <gemmini/cycle_reader.h>
 #include <gemmini/log.hpp>
+#include "cycle_reader_internal.h"
 
 static_assert(noexcept(gemmini_read_cycles()));
 
@@ -31,6 +32,55 @@ static int current_process_id() {
 #endif
 }
 
+static bool checked_bridge_matrix(const std::filesystem::path & path) {
+#if !EXPECT_LOG_CYCLE
+    (void) path;
+    return true;
+#else
+    if (!gemmini_log_cycle_set_output_path(path.c_str())) return false;
+    const gemmini_cycle_record_v2 record{{"private", "matrix", 0, 0, nullptr, 0, nullptr}, 0, 0, 0, 0, 0, 0};
+    const gemmini_native_cycle_sample_internal valid_start{10, 1, GEMMINI_NATIVE_CYCLE_REASON_NONE,
+        GEMMINI_NATIVE_CYCLE_SOURCE_LINUX_PERF_CPU_CYCLES, 7, 9};
+    const gemmini_native_cycle_sample_internal valid_end{12, 1, GEMMINI_NATIVE_CYCLE_REASON_NONE,
+        GEMMINI_NATIVE_CYCLE_SOURCE_LINUX_PERF_CPU_CYCLES, 7, 9};
+    auto emit = [&](gemmini_native_cycle_sample_internal start,
+                    gemmini_native_cycle_sample_internal end, int eligible) {
+        gemmini_log_cycle_record_v2_checked_internal(&record, &start, &end, eligible);
+    };
+    emit(valid_start, valid_end, 1);
+    auto invalid_start = valid_start; invalid_start.valid = 0;
+    invalid_start.reason = GEMMINI_NATIVE_CYCLE_REASON_UNAVAILABLE_EVENT;
+    emit(invalid_start, valid_end, 1);
+    auto invalid_end = valid_end; invalid_end.valid = 0;
+    emit(valid_start, invalid_end, 1);
+    auto source_end = valid_end; source_end.source = GEMMINI_NATIVE_CYCLE_SOURCE_APPLE_HOST_TICK;
+    emit(valid_start, source_end, 1);
+    auto owner_end = valid_end; owner_end.owner_event_token = 8;
+    emit(valid_start, owner_end, 1);
+    auto generation_end = valid_end; generation_end.generation = 10;
+    emit(valid_start, generation_end, 1);
+    emit(valid_start, valid_end, 0);
+    auto regression_end = valid_end; regression_end.value = 9;
+    emit(valid_start, regression_end, 1);
+    auto zero_end = valid_end; zero_end.value = valid_start.value;
+    emit(valid_start, zero_end, 1);
+    gemmini_log_cycle_set_output(stderr);
+
+    const std::string output = read_file(path);
+    const char * reasons[] = {"invalid_start", "invalid_end", "source_mismatch",
+        "event_owner_mismatch", "event_generation_mismatch", "structurally_cross_task",
+        "counter_regression"};
+    if (output.find("\"source\":\"linux_perf_cpu_cycles\",\"unit\":\"cycle\"") == std::string::npos ||
+        output.find("\"delta\":2,\"valid\":true") == std::string::npos ||
+        output.find("\"delta\":0,\"valid\":true") == std::string::npos) return false;
+    for (const char * reason : reasons) {
+        if (output.find(std::string("\"delta\":null,\"valid\":false,\"reason\":\"") + reason + "\"") ==
+            std::string::npos) return false;
+    }
+    return true;
+#endif
+}
+
 static int open_descriptor_count() {
 #if defined(_WIN32)
     return 0;
@@ -47,6 +97,14 @@ static int open_descriptor_count() {
 
 int main() {
     using ggml::gemmini::log::testing::LogFault;
+    const std::string jetson_scalar = ggml::gemmini::log::serialize_cycle_record(
+        {"scalar", "public", 10, 12, nullptr, 0, nullptr,
+         "linux_perf_cpu_cycles", "cycle"});
+    if (jetson_scalar.find("\"delta\":null,\"valid\":false,\"reason\":\"scalar_provenance_unavailable\"") ==
+        std::string::npos) {
+        std::fprintf(stderr, "RED: Jetson scalar provenance must fail closed\n");
+        return 16;
+    }
     const std::filesystem::path root =
         std::filesystem::temp_directory_path() /
         ("gemmini-log-c-boundary-" + std::to_string(current_process_id()));
@@ -58,6 +116,8 @@ int main() {
     const auto debug_path = root / "debug.jsonl";
     const auto fault_path = root / "fault.jsonl";
     const auto targeted_path = root / "targeted.jsonl";
+    const auto checked_path = root / "checked.jsonl";
+    if (!checked_bridge_matrix(checked_path)) return 17;
 
     if (!gemmini_log_cycle_set_output_path(cycle_path.c_str()) ||
         !gemmini_log_debug_set_output_path(debug_path.c_str())) return 2;
@@ -131,6 +191,11 @@ int main() {
 #if EXPECT_LOG_CYCLE
     ok = ok && cycle.find("WS_LOOP_TELEMETRY") == std::string::npos &&
         cycle.find("healthy-cycle-boundary") != std::string::npos &&
+#if defined(__linux__) && defined(__aarch64__)
+        cycle.find("\"delta\":null,\"valid\":false,\"reason\":\"scalar_provenance_unavailable\"") != std::string::npos &&
+#else
+        cycle.find("\"start\":10,\"end\":12,\"delta\":2,\"valid\":true") != std::string::npos &&
+#endif
         !std::filesystem::exists(fault_path);
 #else
     ok = ok && !std::filesystem::exists(cycle_path) && !std::filesystem::exists(fault_path);

@@ -1,6 +1,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
+#include <gemmini/cycle_reader.hpp>
 #include <gemmini/layer.h>
 #include <gemmini/log.h>
 
@@ -43,6 +44,7 @@ int main(int argc, char ** argv) {
 
     ggml_backend_t backend = ggml_backend_cpu_init();
     if (!backend) return 5;
+    ggml_backend_cpu_set_n_threads(backend, 1);
     ggml_init_params params{ggml_tensor_overhead() * 8 + ggml_graph_overhead_custom(8, false), nullptr, true};
     ggml_context * context = ggml_init(params);
     if (!context) return 6;
@@ -58,7 +60,9 @@ int main(int argc, char ** argv) {
     const std::array<float, 4> right{5, 6, 7, 8};
     ggml_backend_tensor_set(lhs, left.data(), 0, sizeof(left));
     ggml_backend_tensor_set(rhs, right.data(), 0, sizeof(right));
+    ggml::gemmini::cycle::reset_read_count_for_test();
     const ggml_status status = ggml_backend_graph_compute(backend, graph);
+    const std::uint64_t sample_count = ggml::gemmini::cycle::read_count_for_test();
     gemmini_log_cycle_set_output(stderr);
     ggml_backend_buffer_free(buffer);
     ggml_free(context);
@@ -67,13 +71,20 @@ int main(int argc, char ** argv) {
 
     const std::string output = read_file(selected);
     const auto default_path = root / "work/output/log/cycle-log.jsonl";
-    if (output.find("\"version\":2") == std::string::npos ||
+    if (sample_count != 2 ||
+        output.find("\"version\":2") == std::string::npos ||
         output.find("\"op\":\"cpu.add\"") == std::string::npos ||
         output.find("\"layer\":\"blk.7.attn_norm\"") == std::string::npos ||
         output.find("\"run_id\":null") != std::string::npos ||
         output.find("\"stripe_id\":null") == std::string::npos ||
         output.find("\"node_id\":0") == std::string::npos ||
         output.find("\"worker_id\":0") == std::string::npos ||
+        output.find("\"stripe_id\":0") != std::string::npos ||
+#if defined(__linux__) && defined(__aarch64__)
+        output.find("\"source\":\"linux_perf_cpu_cycles\",\"unit\":\"cycle\"") == std::string::npos ||
+#else
+        output.find("\"source\":\"host_tick\",\"unit\":\"tick\"") == std::string::npos ||
+#endif
         std::filesystem::exists(default_path)) return 9;
     if (!preserve) std::filesystem::remove_all(root, error);
     return error ? 10 : 0;

@@ -65,6 +65,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     target_compile_definitions(${GGML_CPU_NAME} PRIVATE CYCLE_LOG=$<IF:$<BOOL:${GGML_CPU_CYCLE_LOG}>,1,0>)
 
     if (GGML_CPU_CYCLE_LOG)
+        target_include_directories(${GGML_CPU_NAME} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/ggml-gemmini-utils/src)
         target_link_libraries(${GGML_CPU_NAME} PRIVATE ggml-gemmini-utils)
     endif()
 

@@ -473,6 +473,8 @@ struct RmdTelemetryRecord {
     std::string units;
     bool work = false;
     uint64_t invocation_total = 0;
+    bool invocation_valid = true;
+    std::string invocation_reason;
     RmdTelemetryCounters counters;
     RmdTelemetryGeometry geometry;
     RmdTelemetryTiming timing;

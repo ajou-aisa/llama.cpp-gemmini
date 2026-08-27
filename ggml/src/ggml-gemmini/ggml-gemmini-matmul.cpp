@@ -34,6 +34,8 @@ const char * telemetry_backend_name(RmdBackend backend) {
 const char * telemetry_clock_source() {
 #ifdef __riscv
     return "riscv_cycle";
+#elif defined(__linux__) && defined(__aarch64__)
+    return "linux_perf_cpu_cycles";
 #else
     return "host_tick";
 #endif
@@ -293,10 +295,12 @@ RmdTelemetryRecord make_rmd_telemetry_record(
         record.timing.backend_service += elapsed(
             profile.telemetry_backend_start, profile.telemetry_backend_end);
         record.timing.merge += elapsed(profile.telemetry_merge_start, profile.telemetry_merge_end);
+#if !(defined(__linux__) && defined(__aarch64__))
         if (profile.telemetry_queue_tick != 0) {
             record.timing.queue += elapsed(
                 profile.telemetry_queue_tick, profile.telemetry_residual_start);
         }
+#endif
         record.timing.residual_total += elapsed(
             profile.telemetry_residual_start, profile.telemetry_residual_end);
         if (record.timing.dense_end == 0 || profile.telemetry_dense_end < record.timing.dense_end)
@@ -340,8 +344,14 @@ std::string serialize_rmd_telemetry(const RmdTelemetryRecord & record) {
     out << ",\"backend\":"; telemetry_json_string(out, telemetry_backend_name(record.backend));
     out << ",\"option_source\":"; telemetry_json_string(out, telemetry_source_name(record.source));
     out << ",\"work\":" << (record.work ? "true" : "false")
-        << ",\"invocation_total\":" << record.invocation_total
-        << ",\"dispatch\":{\"direct_events\":" << record.counters.direct_events
+        << ",\"invocation_total\":";
+    if (record.invocation_valid) {
+        out << record.invocation_total;
+    } else {
+        out << "null,\"invocation_reason\":";
+        telemetry_json_string(out, record.invocation_reason);
+    }
+    out << ",\"dispatch\":{\"direct_events\":" << record.counters.direct_events
         << ",\"direct_calls\":" << record.counters.direct_calls
         << ",\"packet_calls\":" << record.counters.packet_calls
         << ",\"ws_calls\":" << record.counters.ws_calls << "}"
@@ -349,7 +359,11 @@ std::string serialize_rmd_telemetry(const RmdTelemetryRecord & record) {
         << ",\"backend_service\":" << record.timing.backend_service
         << ",\"merge\":" << record.timing.merge
         << ",\"residual_total\":" << record.timing.residual_total
+#if defined(__linux__) && defined(__aarch64__)
+        << ",\"queue\":null,\"queue_reason\":\"structurally_cross_task\""
+#else
         << ",\"queue\":" << record.timing.queue
+#endif
         << ",\"dense_end\":" << record.timing.dense_end
         << ",\"residual_start\":" << record.timing.residual_start << "}"
         << ",\"geometry\":{\"packet_count\":" << record.geometry.packet_count

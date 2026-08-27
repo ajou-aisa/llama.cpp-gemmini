@@ -25,6 +25,7 @@
 #include "ggml-quants.h"
 
 #include <gemmini/log.hpp>
+#include "cycle_reader_internal.h"
 #include "dump/dump_tensor.hpp"
 
 #include <gemmini.h>
@@ -1241,6 +1242,16 @@ static void setup_gemmini_log_outputs_if_needed(void) {
     }
 }
 
+static void log_native_cycle_interval(
+        const char * layer, const char * op,
+        const gemmini_native_cycle_sample_internal & start,
+        const gemmini_native_cycle_sample_internal & end) {
+    const gemmini_cycle_record_v2 record{{layer, op, start.value, end.value,
+                                          nullptr, 0, nullptr},
+                                         0, 0, 0, 0, 0, 0};
+    gemmini_log_cycle_record_v2_checked_internal(&record, &start, &end, 1);
+}
+
 static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                                          struct ggml_tensor *dst) // FP32 output (I×J)
 {
@@ -1255,7 +1266,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     }
     setup_gemmini_log_outputs_if_needed();
 #if LOG_CYCLE
-    const uint64_t rmd_telemetry_invocation_start = ggml::gemmini::cycle::read();
+    const gemmini_native_cycle_sample_internal rmd_telemetry_invocation_start_sample =
+        gemmini_read_native_cycle_sample_internal();
+    const uint64_t rmd_telemetry_invocation_start = rmd_telemetry_invocation_start_sample.value;
 #endif
     const auto *src0 = dst->src[0]; // src0: weight (J x K), row-major, 전치 상태
     const auto *src1 = dst->src[1]; // src1: activation (I x K) -> 전치 없음 (A)
@@ -1266,8 +1279,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     const char * layer = args.matmul_layer.c_str();
     ggml::gemmini::log::debug(layer, "ggml_backend_gemmini_mul_mat called");
 
-    uint64_t start = 0;
-    uint64_t end = 0;
+#if LOG_CYCLE
+    gemmini_native_cycle_sample_internal start_sample{};
+    gemmini_native_cycle_sample_internal end_sample{};
+#endif
 
     /* _______________________ 2. Gemmini용 dimension _____________________ */
     size_t I = 0;
@@ -1504,7 +1519,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             "[matmul.pipeline] dispatch=full reason=single-row decode I=%zu", I);
     }
     // set args
-    start = ggml::gemmini::cycle::read();
+    start_sample = gemmini_read_native_cycle_sample_internal();
     args.transpose_B = (TRANSPOSE_B != 0);
     ggml::gemmini::log::debug(layer, "model_arch=%s\n", args.model_arch ? args.model_arch : "");
     args.full_C = FULL_C;
@@ -1522,11 +1537,11 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.sA = K;
     args.sC = J;
 
-    end = ggml::gemmini::cycle::read();
-    ggml::gemmini::log::cycle(layer, "gemmini.prepare_args", start, end);
+    end_sample = gemmini_read_native_cycle_sample_internal();
+    log_native_cycle_interval(layer, "gemmini.prepare_args", start_sample, end_sample);
 
     // set tile size
-    start = ggml::gemmini::cycle::read();
+    start_sample = gemmini_read_native_cycle_sample_internal();
     ggml::gemmini::gemmini_set_tile_ws(&args);
     const auto gemmini_geometry = ggml::gemmini::make_gemmini_geometry(
         {{args.I, args.J, args.K}, {args.tile_I, args.tile_J, args.tile_K}, DIM});
@@ -1534,8 +1549,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         GGML_ABORT("Gemmini geometry is invalid");
     }
     args.activation_rows_per_stripe = gemmini_geometry.geometry.stripe_rows;
-    end = ggml::gemmini::cycle::read();
-    ggml::gemmini::log::cycle(layer, "gemmini.select_tile", start, end);
+    end_sample = gemmini_read_native_cycle_sample_internal();
+    log_native_cycle_interval(layer, "gemmini.select_tile", start_sample, end_sample);
 
 #if defined(GGML_GEMMINI_TESTING) && \
     defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
@@ -1568,14 +1583,16 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 #endif
     const auto quantize_activation = [&]() {
 #if LOG_CYCLE
-        const std::uint64_t quantize_start =
-            ggml::gemmini::cycle::read();
+        const gemmini_native_cycle_sample_internal quantize_start_sample =
+            gemmini_read_native_cycle_sample_internal();
+        const std::uint64_t quantize_start = quantize_start_sample.value;
 #endif
         const bool result =
             ggml::gemmini::quants::quantize_activation(src1, args);
 #if LOG_CYCLE
-        const std::uint64_t quantize_end =
-            ggml::gemmini::cycle::read();
+        const gemmini_native_cycle_sample_internal quantize_end_sample =
+            gemmini_read_native_cycle_sample_internal();
+        const std::uint64_t quantize_end = quantize_end_sample.value;
         if (quantization_overlaps_rtl) {
             ggml::gemmini::log::debug(
                 layer,
@@ -1584,9 +1601,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 static_cast<unsigned long long>(
                     quantize_end - quantize_start));
         } else {
-            ggml::gemmini::log::cycle(
+            log_native_cycle_interval(
                 layer, "gemmini.quantize_activation",
-                quantize_start, quantize_end);
+                quantize_start_sample, quantize_end_sample);
         }
 #endif
         return result;
@@ -1707,7 +1724,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     if (!deferred_quantization && run_dequant_fp_test())
       return;
 
-    start = ggml::gemmini::cycle::read();
+    start_sample = gemmini_read_native_cycle_sample_internal();
     const int64_t dim_k = src0->ne[0];
     const int64_t dim_j = src0->ne[1] ? src0->ne[1] : 1;
     const int64_t dim_z = src0->ne[2] ? src0->ne[2] : 1;
@@ -1758,8 +1775,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         args.s_rf_stripe = nullptr;
         args.R_stripe = nullptr;
 
-        end = ggml::gemmini::cycle::read();
-        ggml::gemmini::log::cycle(layer, "gemmini.prepare_dense_i8_weight", start, end);
+        end_sample = gemmini_read_native_cycle_sample_internal();
+            log_native_cycle_interval(layer, "gemmini.prepare_dense_i8_weight", start_sample, end_sample);
     } else {
         if (src0->type == GGML_TYPE_Q4_0) {
             size_t q4_0_blocks_per_row = 0;
@@ -1807,9 +1824,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 (void *)reprocessed_q4_h1.data(),
                 q4_0_blocks_per_row,
                 q4_0_reprocess_rows);
-            end = ggml::gemmini::cycle::read();
-            ggml::gemmini::log::cycle(
-                layer, "gemmini.convert_q4_0_to_q4_h1", start, end);
+            end_sample = gemmini_read_native_cycle_sample_internal();
+                    log_native_cycle_interval(
+                layer, "gemmini.convert_q4_0_to_q4_h1", start_sample, end_sample);
         } else if (src0->type == GGML_TYPE_Q4_H1 ||
             src0->type == GGML_TYPE_Q4_HP1 || src0->type == GGML_TYPE_Q16_0 ||
             src0->type == GGML_TYPE_Q16_H1 || src0->type == GGML_TYPE_Q16_HP1) {
@@ -2002,8 +2019,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                     args.weight_channel_scale_count, logical_rows, static_cast<int>(args.tiled_matmul_type));
             }
         } else if (src0->type == GGML_TYPE_Q8_0) {
-            start = ggml::gemmini::cycle::read();
-            size_t q8_0_reprocess_rows = logical_rows;
+            start_sample = gemmini_read_native_cycle_sample_internal();
+                    size_t q8_0_reprocess_rows = logical_rows;
             const bool ok = ggml::gemmini::prepare_q8_0_rows_for_q8_h1(
                 src0,
                 reprocessed_q8_h1,
@@ -2044,8 +2061,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             ggml::gemmini::log::debug(layer,
                 "[Q8_0 reprocess] blocks=%p sB=%zu blocks_per_row=%zu logical_rows=%zu",
                 (void *)reprocessed_q8_h1.data(), args.sB, args.blocks_per_row, q8_0_reprocess_rows);
-            end = ggml::gemmini::cycle::read();
-            ggml::gemmini::log::cycle(layer, "gemmini.convert_q8_0_to_q8_h1", start, end);
+            end_sample = gemmini_read_native_cycle_sample_internal();
+                    log_native_cycle_interval(layer, "gemmini.convert_q8_0_to_q8_h1", start_sample, end_sample);
         } else {
             ggml::gemmini::log::debug(layer, "int compute unsupported weight type=%d", (int)src0->type);
             GGML_ABORT("Gemmini int mul_mat received unsupported weight type");
@@ -2053,7 +2070,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     }
 
-    start = ggml::gemmini::cycle::read();
+    start_sample = gemmini_read_native_cycle_sample_internal();
     /* ______________________________ 4. bias 텐서 처리 _________________________________ */
     std::vector<int32_t> zero_bias(J, 0);
 
@@ -2247,8 +2264,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     }
 #endif
 
-    end = ggml::gemmini::cycle::read();
-    ggml::gemmini::log::cycle(layer, "gemmini.prepare_args", start, end);
+    end_sample = gemmini_read_native_cycle_sample_internal();
+    log_native_cycle_interval(layer, "gemmini.prepare_args", start_sample, end_sample);
 
     // ggml::gemmini::log::debug("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out(row)=%zu stride_f_out(col)=%zu nb1=%zu nb0=%zu",
     //                  layer, args.A, args.B, args.C, args.D,
@@ -2392,20 +2409,30 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             ggml::gemmini::emit_cycle_telemetry(
                 ggml::gemmini::detail::pipeline_stripe_telemetry(layer, profile));
         }
-        const uint64_t rmd_telemetry_invocation_end = ggml::gemmini::cycle::read();
+        const gemmini_native_cycle_sample_internal rmd_telemetry_invocation_end_sample =
+            gemmini_read_native_cycle_sample_internal();
+        const uint64_t rmd_telemetry_invocation_end = rmd_telemetry_invocation_end_sample.value;
         const char * bundle_id = std::getenv("GGML_GEMMINI_RUNTIME_BUNDLE_ID");
         const char * model_id = std::getenv("GGML_GEMMINI_MODEL_ID");
+        const uint8_t invocation_reason =
+            gemmini_log_cycle_record_v2_checked_internal(
+                nullptr, &rmd_telemetry_invocation_start_sample,
+                &rmd_telemetry_invocation_end_sample, 1);
         const uint64_t invocation_total =
-            rmd_telemetry_invocation_end >= rmd_telemetry_invocation_start
+            invocation_reason == GEMMINI_NATIVE_CYCLE_REASON_NONE
                 ? rmd_telemetry_invocation_end - rmd_telemetry_invocation_start : 0;
         const uint64_t telemetry_run_id = telemetry_profiles.empty()
             ? 0 : telemetry_profiles.front().run_id;
-        const auto telemetry = ggml::gemmini::make_rmd_telemetry_record(
+        auto telemetry = ggml::gemmini::make_rmd_telemetry_record(
             matmul_options.rmd_backend, matmul_resolution.rmd_backend_source,
             bundle_id != nullptr ? bundle_id : "unbundled",
             ggml::gemmini::resolve_rmd_model_id(model_id, ctx->model_arch),
             layer,
             telemetry_run_id, invocation_total, telemetry_profiles);
+        telemetry.invocation_valid =
+            invocation_reason == GEMMINI_NATIVE_CYCLE_REASON_NONE;
+        telemetry.invocation_reason = ggml::gemmini::cycle::reason_name(
+            static_cast<ggml::gemmini::cycle::NativeCycleReason>(invocation_reason));
         ggml::gemmini::emit_cycle_telemetry(telemetry);
 #endif
     }

@@ -222,7 +222,12 @@ std::string serialize_cycle_telemetry(const QuantizationStripeTelemetry & record
     field(out, "row_end", record.row_end);
     field(out, "start", record.start);
     field(out, "end", record.end);
+#if defined(__linux__) && defined(__aarch64__)
+    null_field(out, "delta");
+    out << ",\"valid\":false,\"reason\":\"scalar_provenance_unavailable\"";
+#else
     field(out, "delta", record.end - record.start);
+#endif
     out << ",\"overlaps_rtl\":true,\"additive\":false}";
     return out.str();
 #endif
@@ -269,12 +274,8 @@ std::string serialize_cycle_telemetry(const PipelineStripeTelemetry & record) {
 #endif
 }
 
-void emit_cycle_telemetry(const CycleIntervalTelemetry & record) {
-    log::cycle.write_json(serialize_cycle_telemetry(record));
-}
-void emit_cycle_telemetry(const WsLoopTelemetry & record) {
-    log::cycle.write_json(serialize_cycle_telemetry(record));
-}
+void emit_cycle_telemetry(const CycleIntervalTelemetry & record) { log::cycle.write_json(serialize_cycle_telemetry(record)); }
+void emit_cycle_telemetry(const WsLoopTelemetry & record) { log::cycle.write_json(serialize_cycle_telemetry(record)); }
 void emit_cycle_telemetry(const Im2pExecutionTelemetry & record) {
     log::cycle.write_json(serialize_cycle_telemetry(record));
 #if LOG_DEBUG
@@ -284,17 +285,9 @@ void emit_cycle_telemetry(const Im2pExecutionTelemetry & record) {
     }
 #endif
 }
-void emit_cycle_telemetry(const Im2pStripeTelemetry & record) {
-    log::cycle.write_json(serialize_cycle_telemetry(record));
-}
-void emit_cycle_telemetry(const QuantizationStripeTelemetry & record) {
-    log::cycle.write_json(serialize_cycle_telemetry(record));
-}
-void emit_cycle_telemetry(const PipelineStripeTelemetry & record) {
-    log::cycle.write_json(serialize_cycle_telemetry(record));
-}
-void emit_cycle_telemetry(const RmdTelemetryRecord & record) {
-    log::cycle.write_json(serialize_cycle_telemetry(record));
-}
+void emit_cycle_telemetry(const Im2pStripeTelemetry & record) { log::cycle.write_json(serialize_cycle_telemetry(record)); }
+void emit_cycle_telemetry(const QuantizationStripeTelemetry & record) { log::cycle.write_json(serialize_cycle_telemetry(record)); }
+void emit_cycle_telemetry(const PipelineStripeTelemetry & record) { log::cycle.write_json(serialize_cycle_telemetry(record)); }
+void emit_cycle_telemetry(const RmdTelemetryRecord & record) { log::cycle.write_json(serialize_cycle_telemetry(record)); }
 
 } // namespace ggml::gemmini

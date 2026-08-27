@@ -166,6 +166,15 @@ if (LLAMA_BUILD_TOOLS AND LOG_CYCLE)
             -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/gemmini-cycle-cli
             -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-cycle-cli.cmake)
 endif()
+add_test(NAME test-gemmini-cpu-cycle-validity-contract
+    COMMAND ${CMAKE_COMMAND}
+        -DCPU_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-cpu/ggml-cpu.c
+        -DGEMMINI_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini.cpp
+        -DINTERNAL_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini-utils/src/cycle_reader_internal.h
+        -DTELEMETRY_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini-telemetry.hpp
+        -DTELEMETRY_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini-telemetry.cpp
+        -DMATMUL_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini-matmul.cpp
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-cpu-cycle-validity-contract.cmake)
 add_test(NAME test-build-arm64-log-defaults
     COMMAND ${CMAKE_COMMAND}
         -DTEST_SCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/../build-arm64.sh
@@ -195,6 +204,8 @@ target_compile_features(test-gemmini-log-boundary PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-log-boundary PRIVATE
     EXPECT_LOG_DEBUG=$<IF:$<BOOL:${LOG_DEBUG}>,1,0>
     EXPECT_LOG_CYCLE=$<IF:$<BOOL:${LOG_CYCLE}>,1,0>)
+target_include_directories(test-gemmini-log-boundary PRIVATE
+    ../ggml/src/ggml-gemmini-utils/src)
 add_test(NAME test-gemmini-log-boundary
     COMMAND $<TARGET_FILE:test-gemmini-log-boundary>)
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")

@@ -10,6 +10,9 @@ inline constexpr std::uint32_t kCycleTelemetryVersion = 2;
 #ifdef __riscv
 inline constexpr const char * kNativeCycleSource = "riscv_cycle";
 inline constexpr const char * kNativeCycleUnit = "cycle";
+#elif defined(__linux__) && defined(__aarch64__)
+inline constexpr const char * kNativeCycleSource = "linux_perf_cpu_cycles";
+inline constexpr const char * kNativeCycleUnit = "cycle";
 #else
 inline constexpr const char * kNativeCycleSource = "host_tick";
 inline constexpr const char * kNativeCycleUnit = "tick";
