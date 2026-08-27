@@ -1,10 +1,18 @@
-#include "cycle_reader_internal.h"
-#include <gemmini/layer.h>
-#include <gemmini/log.h>
-
 #ifndef CYCLE_LOG
 #define CYCLE_LOG 0
 #endif
+
+#if CYCLE_LOG
+#if defined(__linux__) && defined(__aarch64__)
+#include "cycle_reader_internal.h"
+#else
+#include <gemmini/cycle_reader.h>
+#endif
+#else
+#include <gemmini/cycle_reader.h>
+#endif
+#include <gemmini/layer.h>
+#include <gemmini/log.h>
 
 #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
 #define _USE_MATH_DEFINES // For M_PI on MSVC
@@ -1726,14 +1734,23 @@ static void ggml_compute_forward_mul_mat_id(
 #if CYCLE_LOG
 static inline void ggml_log_cpu_cycle(const struct ggml_compute_params * params,
                                       const char *layer, const char *op,
+#if defined(__linux__) && defined(__aarch64__)
                                       gemmini_native_cycle_sample_internal start,
                                       gemmini_native_cycle_sample_internal end) {
+#else
+                                      uint64_t start, uint64_t end) {
+#endif
     const gemmini_cycle_record_v2 record = {
         .interval = {
             .layer = layer,
             .op = op,
+#if defined(__linux__) && defined(__aarch64__)
             .start = start.value,
             .end = end.value,
+#else
+            .start = start,
+            .end = end,
+#endif
         },
         .identity_mask = GEMMINI_CYCLE_HAS_RUN_ID |
                          GEMMINI_CYCLE_HAS_NODE_ID |
@@ -1742,7 +1759,11 @@ static inline void ggml_log_cpu_cycle(const struct ggml_compute_params * params,
         .node_id = params->node_id,
         .worker_id = (uint64_t) params->ith,
     };
+#if defined(__linux__) && defined(__aarch64__)
     gemmini_log_cycle_record_v2_checked_internal(&record, &start, &end, 1);
+#else
+    gemmini_log_cycle_record_v2(&record);
+#endif
 }
 
 #define gemmini_log_cycle(layer, op, start, end) \
@@ -1763,7 +1784,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
 
     #if CYCLE_LOG
     // cycle var
+#if defined(__linux__) && defined(__aarch64__)
     gemmini_native_cycle_sample_internal start, end;
+#else
+    uint64_t start, end;
+#endif
     // layer name
     char layer[GGML_MAX_NAME];
     gemmini_get_layer(tensor->name, layer, sizeof(layer));
@@ -1773,693 +1798,1197 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_DUP:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_dup(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.dup", start, end);
                 #endif
             } break;
         case GGML_OP_ADD:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_add(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.add", start, end);
                 #endif
             } break;
         case GGML_OP_ADD1:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_add1(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.add1", start, end);
                 #endif
             } break;
         case GGML_OP_ACC:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_acc(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.acc", start, end);
                 #endif
             } break;
         case GGML_OP_SUB:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_sub(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.sub", start, end);
                 #endif
             } break;
         case GGML_OP_MUL:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_mul(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.mul", start, end);
                 #endif
             } break;
         case GGML_OP_DIV:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_div(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.div", start, end);
                 #endif
             } break;
         case GGML_OP_SQR:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_sqr(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.sqr", start, end);
                 #endif
             } break;
         case GGML_OP_SQRT:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_sqrt(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.sqrt", start, end);
                 #endif
             } break;
         case GGML_OP_LOG:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_log(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.log", start, end);
                 #endif
             } break;
         case GGML_OP_SIN:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_sin(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.sin", start, end);
                 #endif
             } break;
         case GGML_OP_COS:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_cos(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.cos", start, end);
                 #endif
             } break;
         case GGML_OP_SUM:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_sum(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.sum", start, end);
                 #endif
             } break;
         case GGML_OP_SUM_ROWS:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_sum_rows(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.sum_rows", start, end);
                 #endif
             } break;
         case GGML_OP_MEAN:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_mean(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.mean", start, end);
                 #endif
             } break;
         case GGML_OP_ARGMAX:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_argmax(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.argmax", start, end);
                 #endif
             } break;
         case GGML_OP_COUNT_EQUAL:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_count_equal(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.count_equal", start, end);
                 #endif
             } break;
         case GGML_OP_REPEAT:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_repeat(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.repeat", start, end);
                 #endif
             } break;
         case GGML_OP_REPEAT_BACK:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_repeat_back(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.repeat_back", start, end);
                 #endif
             } break;
         case GGML_OP_CONCAT:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_concat(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.concat", start, end);
                 #endif
             } break;
         case GGML_OP_SILU_BACK:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_silu_back(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.silu_back", start, end);
                 #endif
             } break;
         case GGML_OP_NORM:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_norm(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.norm", start, end);
                 #endif
             } break;
         case GGML_OP_RMS_NORM:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_rms_norm(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.rms_norm", start, end);
                 #endif
             } break;
         case GGML_OP_RMS_NORM_BACK:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_rms_norm_back(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.rms_norm_back", start, end);
                 #endif
             } break;
         case GGML_OP_GROUP_NORM:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_group_norm(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.group_norm", start, end);
                 #endif
             } break;
         case GGML_OP_L2_NORM:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_l2_norm(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.l2_norm", start, end);
                 #endif
             } break;
         case GGML_OP_MUL_MAT:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_mul_mat(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.mul_mat", start, end);
                 #endif
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_mul_mat_id(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.mul_mat_id", start, end);
                 #endif
             } break;
         case GGML_OP_OUT_PROD:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_out_prod(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.out_prod", start, end);
                 #endif
             } break;
         case GGML_OP_SCALE:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_scale(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.scale", start, end);
                 #endif
             } break;
         case GGML_OP_SET:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_set(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.set", start, end);
                 #endif
             } break;
         case GGML_OP_CPY:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_cpy(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.cpy", start, end);
                 #endif
             } break;
         case GGML_OP_CONT:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_cont(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.cont", start, end);
                 #endif
             } break;
         case GGML_OP_RESHAPE:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_reshape(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.reshape", start, end);
                 #endif
             } break;
         case GGML_OP_VIEW:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_view(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.view", start, end);
                 #endif
             } break;
         case GGML_OP_PERMUTE:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_permute(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.permute", start, end);
                 #endif
             } break;
         case GGML_OP_TRANSPOSE:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_transpose(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.transpose", start, end);
                 #endif
             } break;
         case GGML_OP_GET_ROWS:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_get_rows(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.get_rows", start, end);
                 #endif
             } break;
         case GGML_OP_GET_ROWS_BACK:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_get_rows_back(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.get_rows_back", start, end);
                 #endif
             } break;
         case GGML_OP_DIAG:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_diag(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.diag", start, end);
                 #endif
             } break;
         case GGML_OP_DIAG_MASK_INF:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_diag_mask_inf(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.diag_mask_inf", start, end);
                 #endif
             } break;
         case GGML_OP_DIAG_MASK_ZERO:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_diag_mask_zero(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.diag_mask_zero", start, end);
                 #endif
             } break;
         case GGML_OP_SOFT_MAX:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_soft_max(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.softmax", start, end);
                 #endif
             } break;
         case GGML_OP_SOFT_MAX_BACK:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_soft_max_ext_back(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.softmax_back", start, end);
                 #endif
             } break;
         case GGML_OP_ROPE:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_rope(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.rope", start, end);
                 #endif
             } break;
         case GGML_OP_ROPE_BACK:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_rope_back(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.rope_back", start, end);
                 #endif
             } break;
         case GGML_OP_CLAMP:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_clamp(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.clamp", start, end);
                 #endif
             } break;
         case GGML_OP_CONV_TRANSPOSE_1D:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_conv_transpose_1d(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.conv_transpose_1d", start, end);
                 #endif
             } break;
         case GGML_OP_IM2COL:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_im2col(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.im2col", start, end);
                 #endif
             } break;
         case GGML_OP_IM2COL_BACK:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_im2col_back_f32(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.im2col_back", start, end);
                 #endif
             } break;
         case GGML_OP_CONV_2D_DW:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_conv_2d_dw(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.conv_2d_dw", start, end);
                 #endif
             } break;
         case GGML_OP_CONV_TRANSPOSE_2D:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_conv_transpose_2d(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.conv_transpose_2d", start, end);
                 #endif
             } break;
         case GGML_OP_POOL_1D:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_pool_1d(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.pool_1d", start, end);
                 #endif
             } break;
         case GGML_OP_POOL_2D:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_pool_2d(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.pool_2d", start, end);
                 #endif
             } break;
         case GGML_OP_POOL_2D_BACK:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_pool_2d_back(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.pool_2d_back", start, end);
                 #endif
             } break;
         case GGML_OP_UPSCALE:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_upscale(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.upscale", start, end);
                 #endif
             } break;
         case GGML_OP_PAD:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_pad(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.pad", start, end);
                 #endif
             } break;
         case GGML_OP_PAD_REFLECT_1D:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_pad_reflect_1d(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.pad_reflect_1d", start, end);
                 #endif
             } break;
         case GGML_OP_ARANGE:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_arange(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.arange", start, end);
                 #endif
             } break;
         case GGML_OP_TIMESTEP_EMBEDDING:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_timestep_embedding(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.timestep_embedding", start, end);
                 #endif
             } break;
         case GGML_OP_ARGSORT:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_argsort(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.argsort", start, end);
                 #endif
             } break;
         case GGML_OP_LEAKY_RELU:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_leaky_relu(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.leaky_relu", start, end);
                 #endif
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_flash_attn_ext(params, tensor->src[0], tensor->src[1], tensor->src[2], tensor->src[3], tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.flash_attn_ext", start, end);
                 #endif
             } break;
@@ -2470,132 +2999,228 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 bool masked = t != 0;
 
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_flash_attn_back(params, masked, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.flash_attn_back", start, end);
                 #endif
             } break;
         case GGML_OP_SSM_CONV:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_ssm_conv(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.ssm_conv", start, end);
                 #endif
             } break;
         case GGML_OP_SSM_SCAN:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_ssm_scan(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.ssm_scan", start, end);
                 #endif
             } break;
         case GGML_OP_WIN_PART:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_win_part(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.win_part", start, end);
                 #endif
             } break;
         case GGML_OP_WIN_UNPART:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_win_unpart(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.win_unpart", start, end);
                 #endif
             } break;
         case GGML_OP_UNARY:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_unary(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.unary", start, end);
                 #endif
             } break;
         case GGML_OP_GET_REL_POS:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_get_rel_pos(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.get_rel_pos", start, end);
                 #endif
             } break;
         case GGML_OP_ADD_REL_POS:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_add_rel_pos(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.add_rel_pos", start, end);
                 #endif
             } break;
         case GGML_OP_RWKV_WKV6:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_rwkv_wkv6(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.rwkv_wkv6", start, end);
                 #endif
             } break;
         case GGML_OP_GATED_LINEAR_ATTN:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_gla(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.gated_linear_attn", start, end);
                 #endif
             } break;
         case GGML_OP_RWKV_WKV7:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_rwkv_wkv7(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.rwkv_wkv7", start, end);
                 #endif
             } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_map_custom1(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.map_custom1", start, end);
                 #endif
             }
@@ -2603,11 +3228,19 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MAP_CUSTOM2:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_map_custom2(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.map_custom2", start, end);
                 #endif
             }
@@ -2615,11 +3248,19 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MAP_CUSTOM3:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_map_custom3(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.map_custom3", start, end);
                 #endif
             }
@@ -2627,11 +3268,19 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_CUSTOM:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_custom(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.custom", start, end);
                 #endif
             }
@@ -2639,11 +3288,19 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_CROSS_ENTROPY_LOSS:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_cross_entropy_loss(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.cross_entropy_loss", start, end);
                 #endif
             }
@@ -2651,11 +3308,19 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_cross_entropy_loss_back(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.cross_entropy_loss_back", start, end);
                 #endif
             }
@@ -2663,11 +3328,19 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_OPT_STEP_ADAMW:
             {
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 start = gemmini_read_native_cycle_sample_internal();
+#else
+                start = gemmini_read_cycles();
+#endif
                 #endif
                 ggml_compute_forward_opt_step_adamw(params, tensor);
                 #if CYCLE_LOG
+                #if defined(__linux__) && defined(__aarch64__)
                 end = gemmini_read_native_cycle_sample_internal();
+#else
+                end = gemmini_read_cycles();
+#endif
                 gemmini_log_cycle(layer, "cpu.opt_step_adamw", start, end);
                 #endif
             }

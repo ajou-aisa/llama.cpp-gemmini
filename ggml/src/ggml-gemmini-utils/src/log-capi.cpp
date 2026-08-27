@@ -1,7 +1,9 @@
-#include "../include/gemmini/cycle_reader.hpp"
 #include "../include/gemmini/log.hpp"
 #include "../include/gemmini/log.h"
+#if defined(__linux__) && defined(__aarch64__)
+#include "../include/gemmini/cycle_reader.hpp"
 #include "cycle_reader_internal.h"
+#endif
 
 #include <cstdarg>
 #include <cstdint>
@@ -23,24 +25,18 @@ void report_cycle_boundary_failure() noexcept
     ggml::gemmini::log::cycle.report_failure("serialization");
 }
 
+#if defined(__linux__) && defined(__aarch64__)
 const char * internal_source_name(uint8_t source) noexcept
 {
-    switch (source)
-    {
-        case GEMMINI_NATIVE_CYCLE_SOURCE_RISCV_CYCLE: return "riscv_cycle";
-        case GEMMINI_NATIVE_CYCLE_SOURCE_APPLE_HOST_TICK:
-        case GEMMINI_NATIVE_CYCLE_SOURCE_STEADY_CLOCK: return "host_tick";
-        case GEMMINI_NATIVE_CYCLE_SOURCE_LINUX_PERF_CPU_CYCLES: return "linux_perf_cpu_cycles";
-        case GEMMINI_NATIVE_CYCLE_SOURCE_NONE: return nullptr;
-    }
-    return nullptr;
+    return source == GEMMINI_NATIVE_CYCLE_SOURCE_LINUX_PERF_CPU_CYCLES
+        ? "linux_perf_cpu_cycles" : nullptr;
 }
 
-const char * internal_unit_name(uint8_t source) noexcept
+const char * internal_unit_name(uint8_t) noexcept
 {
-    return source == GEMMINI_NATIVE_CYCLE_SOURCE_LINUX_PERF_CPU_CYCLES ||
-           source == GEMMINI_NATIVE_CYCLE_SOURCE_RISCV_CYCLE ? "cycle" : "tick";
+    return "cycle";
 }
+#endif
 } // namespace
 
 namespace ggml::gemmini::log
@@ -221,6 +217,7 @@ extern "C"
         catch (...) { report_cycle_boundary_failure(); }
     }
 
+#if defined(__linux__) && defined(__aarch64__)
     uint8_t gemmini_log_cycle_record_v2_checked_internal(
             const gemmini_cycle_record_v2 * record,
             const gemmini_native_cycle_sample_internal * start,
@@ -262,6 +259,8 @@ extern "C"
         catch (...) { report_cycle_boundary_failure(); return static_cast<uint8_t>(
             GEMMINI_NATIVE_CYCLE_REASON_UNAVAILABLE_EVENT); }
     }
+
+#endif
 
     void gemmini_log_cycle(const char *layer, const char *op, uint64_t start, uint64_t end) noexcept
     {

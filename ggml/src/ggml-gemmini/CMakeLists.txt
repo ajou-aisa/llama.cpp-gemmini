@@ -121,7 +121,6 @@ target_include_directories(ggml-gemmini PUBLIC
   ${GEMMINI_SW_PATH}/include
 )
 target_include_directories(ggml-gemmini PRIVATE
-  ${CMAKE_CURRENT_LIST_DIR}/../ggml-gemmini-utils/src
   ${CMAKE_CURRENT_LIST_DIR}/quants
   ${CMAKE_CURRENT_LIST_DIR}/quants/act
   ${CMAKE_CURRENT_LIST_DIR}/quants/act/exsia
@@ -138,6 +137,11 @@ target_include_directories(ggml-gemmini PRIVATE
   ${GEMMINI_SW_PATH}/gemmini-rocc-tests/include
   ${GEMMINI_SW_PATH}/rocc-software/src
 )
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+    CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+  target_include_directories(ggml-gemmini PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/../ggml-gemmini-utils/src)
+endif()
 
 target_link_libraries(ggml-gemmini PRIVATE
   ggml-gemmini-utils

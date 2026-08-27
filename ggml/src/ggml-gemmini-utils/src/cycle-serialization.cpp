@@ -1,7 +1,9 @@
 #include "../include/gemmini/log.hpp"
+#if defined(__linux__) && defined(__aarch64__)
 #include "cycle_reader_internal.h"
-
 #include <cstring>
+#endif
+
 #include <limits>
 #include <string>
 
@@ -44,11 +46,12 @@ namespace ggml::gemmini::log
         }
     } // namespace
 
-    static std::string serialize_cycle_record_impl(const CycleRecord &record,
-                                                   bool provenance_available,
-                                                   bool checked_valid,
-                                                   const char * checked_reason)
-    {
+    static std::string serialize_cycle_record_impl(
+            const CycleRecord & record
+#if defined(__linux__) && defined(__aarch64__)
+            , bool provenance_available, bool checked_valid, const char * checked_reason
+#endif
+    ) {
 #if defined(__riscv)
         const char * const default_source = "riscv_cycle";
         const char * const default_unit = "cycle";
@@ -61,12 +64,17 @@ namespace ggml::gemmini::log
 #endif
         const char * const source = record.source ? record.source : default_source;
         const char * const unit = record.unit ? record.unit : default_unit;
+#if defined(__linux__) && defined(__aarch64__)
         const bool scalar_jetson = !provenance_available &&
             std::strcmp(source, "linux_perf_cpu_cycles") == 0;
         const bool valid = provenance_available ? checked_valid :
             (!scalar_jetson && record.end >= record.start);
         const char * const reason = scalar_jetson ? "scalar_provenance_unavailable" : checked_reason;
         const uint64_t cycles = valid ? record.end - record.start : 0;
+#else
+        const bool valid = record.end >= record.start;
+        const uint64_t cycles = valid ? record.end - record.start : 0;
+#endif
         std::string json;
         json.reserve(192);
         bool first = true;
@@ -132,10 +140,16 @@ namespace ggml::gemmini::log
         add_identity("worker_id", GEMMINI_CYCLE_HAS_WORKER_ID, record.worker_id);
         add_u64("start", record.start);
         add_u64("end", record.end);
+#if defined(__linux__) && defined(__aarch64__)
         if (valid) add_u64("delta", cycles); else add_null("delta");
+#else
+        add_u64("delta", cycles);
+#endif
         add_key("valid");
         json += valid ? "true" : "false";
+#if defined(__linux__) && defined(__aarch64__)
         if (!valid) add_string("reason", reason ? reason : "counter_regression");
+#endif
 #if LOG_DETAIL
         add_string("file", record.file);
         if (record.file) add_i32("line", record.line);
@@ -147,14 +161,20 @@ namespace ggml::gemmini::log
 
     std::string serialize_cycle_record(const CycleRecord & record)
     {
+#if defined(__linux__) && defined(__aarch64__)
         return serialize_cycle_record_impl(record, false, false, nullptr);
+#else
+        return serialize_cycle_record_impl(record);
+#endif
     }
 
+#if defined(__linux__) && defined(__aarch64__)
     std::string serialize_checked_cycle_record(const CycleRecord & record, bool valid,
                                                const char * reason)
     {
         return serialize_cycle_record_impl(record, true, valid, reason);
     }
+#endif
 
     std::string serialize_ws_cycle_record(const WsCycleRecord &record)
     {

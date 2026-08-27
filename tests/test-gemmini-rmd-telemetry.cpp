@@ -516,13 +516,15 @@ bool negative_fixtures() {
     RmdTelemetryRecord wrong_unit = cpu_record(); wrong_unit.units = wrong_unit.units == "ticks" ? "cycles" : "ticks";
     RmdTelemetryRecord ordering = cpu_record(); ordering.timing.dense_end = ordering.timing.residual_start + 1;
     RmdTelemetryRecord containment = cpu_record(); containment.timing.residual_total = containment.timing.backend_service - 1;
+#if defined(__linux__) && defined(__aarch64__)
     RmdTelemetryRecord invalid_invocation = cpu_record();
     invalid_invocation.invocation_valid = false;
     invalid_invocation.invocation_reason = "invalid_start";
-    return expect(serialize_cycle_telemetry(invalid_invocation).find(
-                      "\"invocation_total\":null,\"invocation_reason\":\"invalid_start\"") != std::string::npos,
-                  "invalid top-level invocation fails closed") &&
-        expect(!check_rmd_telemetry(malformed, cycle::units(), true).ok(), "malformed schema rejected") &&
+    if (!expect(serialize_cycle_telemetry(invalid_invocation).find(
+                    "\"invocation_total\":null,\"invocation_reason\":\"invalid_start\"") != std::string::npos,
+                "invalid top-level invocation fails closed")) return false;
+#endif
+    return expect(!check_rmd_telemetry(malformed, cycle::units(), true).ok(), "malformed schema rejected") &&
         expect(!check_rmd_telemetry(zero, cycle::units(), true).ok(), "zero work rejected for comparison") &&
         expect(check_rmd_telemetry(zero, cycle::units(), false).ok(), "zero work explicit outside comparison") &&
         expect(!check_rmd_telemetry(wrong_unit, cycle::units(), true).ok(), "wrong units rejected") &&

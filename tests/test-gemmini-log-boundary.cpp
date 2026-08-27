@@ -1,6 +1,8 @@
 #include <gemmini/cycle_reader.h>
 #include <gemmini/log.hpp>
+#if defined(__linux__) && defined(__aarch64__)
 #include "cycle_reader_internal.h"
+#endif
 
 static_assert(noexcept(gemmini_read_cycles()));
 
@@ -32,6 +34,7 @@ static int current_process_id() {
 #endif
 }
 
+#if defined(__linux__) && defined(__aarch64__)
 static bool checked_bridge_matrix(const std::filesystem::path & path) {
 #if !EXPECT_LOG_CYCLE
     (void) path;
@@ -80,6 +83,7 @@ static bool checked_bridge_matrix(const std::filesystem::path & path) {
     return true;
 #endif
 }
+#endif
 
 static int open_descriptor_count() {
 #if defined(_WIN32)
@@ -97,6 +101,7 @@ static int open_descriptor_count() {
 
 int main() {
     using ggml::gemmini::log::testing::LogFault;
+#if defined(__linux__) && defined(__aarch64__)
     const std::string jetson_scalar = ggml::gemmini::log::serialize_cycle_record(
         {"scalar", "public", 10, 12, nullptr, 0, nullptr,
          "linux_perf_cpu_cycles", "cycle"});
@@ -105,6 +110,14 @@ int main() {
         std::fprintf(stderr, "RED: Jetson scalar provenance must fail closed\n");
         return 16;
     }
+#else
+    const std::string legacy_regression = ggml::gemmini::log::serialize_cycle_record(
+        {"scalar", "public", 12, 10, nullptr, 0, nullptr});
+    if (legacy_regression.find("\"start\":12,\"end\":10,\"delta\":0,\"valid\":false") ==
+            std::string::npos || legacy_regression.find("\"reason\"") != std::string::npos) {
+        return 16;
+    }
+#endif
     const std::filesystem::path root =
         std::filesystem::temp_directory_path() /
         ("gemmini-log-c-boundary-" + std::to_string(current_process_id()));
@@ -116,8 +129,10 @@ int main() {
     const auto debug_path = root / "debug.jsonl";
     const auto fault_path = root / "fault.jsonl";
     const auto targeted_path = root / "targeted.jsonl";
+#if defined(__linux__) && defined(__aarch64__)
     const auto checked_path = root / "checked.jsonl";
     if (!checked_bridge_matrix(checked_path)) return 17;
+#endif
 
     if (!gemmini_log_cycle_set_output_path(cycle_path.c_str()) ||
         !gemmini_log_debug_set_output_path(debug_path.c_str())) return 2;

@@ -345,12 +345,16 @@ std::string serialize_rmd_telemetry(const RmdTelemetryRecord & record) {
     out << ",\"option_source\":"; telemetry_json_string(out, telemetry_source_name(record.source));
     out << ",\"work\":" << (record.work ? "true" : "false")
         << ",\"invocation_total\":";
+#if defined(__linux__) && defined(__aarch64__)
     if (record.invocation_valid) {
         out << record.invocation_total;
     } else {
         out << "null,\"invocation_reason\":";
         telemetry_json_string(out, record.invocation_reason);
     }
+#else
+    out << record.invocation_total;
+#endif
     out << ",\"dispatch\":{\"direct_events\":" << record.counters.direct_events
         << ",\"direct_calls\":" << record.counters.direct_calls
         << ",\"packet_calls\":" << record.counters.packet_calls

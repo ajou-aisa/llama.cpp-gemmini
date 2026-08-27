@@ -171,9 +171,16 @@ add_test(NAME test-gemmini-cpu-cycle-validity-contract
         -DCPU_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-cpu/ggml-cpu.c
         -DGEMMINI_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini.cpp
         -DINTERNAL_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini-utils/src/cycle_reader_internal.h
+        -DCYCLE_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini-utils/include/gemmini/cycle_reader.hpp
+        -DCYCLE_CAPI=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini-utils/src/cycle_reader-capi.cpp
+        -DLOG_CAPI=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini-utils/src/log-capi.cpp
+        -DSERIALIZATION_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini-utils/src/cycle-serialization.cpp
+        -DCPU_CMAKE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-cpu/CMakeLists.txt
+        -DGEMMINI_CMAKE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/CMakeLists.txt
         -DTELEMETRY_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini-telemetry.hpp
         -DTELEMETRY_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini-telemetry.cpp
         -DMATMUL_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini-matmul.cpp
+        -DMATMUL_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini-matmul.hpp
         -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-cpu-cycle-validity-contract.cmake)
 add_test(NAME test-build-arm64-log-defaults
     COMMAND ${CMAKE_COMMAND}
@@ -204,8 +211,11 @@ target_compile_features(test-gemmini-log-boundary PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-log-boundary PRIVATE
     EXPECT_LOG_DEBUG=$<IF:$<BOOL:${LOG_DEBUG}>,1,0>
     EXPECT_LOG_CYCLE=$<IF:$<BOOL:${LOG_CYCLE}>,1,0>)
-target_include_directories(test-gemmini-log-boundary PRIVATE
-    ../ggml/src/ggml-gemmini-utils/src)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+    CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    target_include_directories(test-gemmini-log-boundary PRIVATE
+        ../ggml/src/ggml-gemmini-utils/src)
+endif()
 add_test(NAME test-gemmini-log-boundary
     COMMAND $<TARGET_FILE:test-gemmini-log-boundary>)
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
