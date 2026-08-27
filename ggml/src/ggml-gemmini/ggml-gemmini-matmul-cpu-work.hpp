@@ -51,28 +51,6 @@ struct RmdCpuWorkInput {
 
 CpuWorkComponent select_rmd_cpu_work(const RmdCpuWorkInput & input);
 
-struct RmdPostCpuWorkInput {
-    CpuWorkComponent rmd;
-    CpuWorkComponent compose;
-    CpuWorkComponent finalize;
-    CpuWorkComponent merge;
-    bool packet = false;
-    bool merge_succeeded = true;
-};
-
-struct RmdPostCpuWorkSelection {
-    CpuWorkComponent rmd;
-    CpuWorkComponent compose;
-    CpuWorkComponent finalize;
-    CpuWorkComponent merge;
-    std::optional<uint64_t> finalize_canonical_cycles;
-    std::optional<uint64_t> canonical_cycles;
-    std::string reason;
-};
-
-RmdPostCpuWorkSelection select_rmd_post_cpu_work(
-    const RmdPostCpuWorkInput & input);
-
 struct MatmulCpuWorkMetrics {
     CpuWorkComponent dense;
     CpuWorkComponent rmd;

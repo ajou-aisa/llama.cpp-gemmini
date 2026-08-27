@@ -67,43 +67,4 @@ CpuWorkComponent select_rmd_cpu_work(const RmdCpuWorkInput & input) {
     return invalid_component("invalid_route");
 }
 
-RmdPostCpuWorkSelection select_rmd_post_cpu_work(
-        const RmdPostCpuWorkInput & input) {
-    RmdPostCpuWorkSelection result{};
-    result.rmd = input.rmd;
-    result.compose = input.packet ? input.compose : absent_component();
-    result.finalize = input.finalize;
-    result.merge = input.merge;
-    result.merge.additive = false;
-    if (result.finalize.cycles.has_value()) {
-        result.finalize_canonical_cycles = result.finalize.cycles;
-    }
-    if (!input.merge_succeeded) {
-        result.finalize_canonical_cycles.reset();
-        result.reason = "failed_operation";
-        return result;
-    }
-
-    uint64_t total = 0;
-    const CpuWorkComponent * required[] = {
-        &result.rmd,
-        input.packet ? &result.compose : nullptr,
-        &result.finalize,
-    };
-    for (const CpuWorkComponent * component : required) {
-        if (component == nullptr || component->coverage == CpuWorkCoverage::absent) continue;
-        if (!component->cycles.has_value()) {
-            result.reason = component->reason;
-            return result;
-        }
-        if (!checked_add(*component->cycles, total)) {
-            result.reason = "overflow";
-            return result;
-        }
-    }
-    result.canonical_cycles = total;
-    result.reason = "complete";
-    return result;
-}
-
 } // namespace ggml::gemmini

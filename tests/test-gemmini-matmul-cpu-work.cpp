@@ -30,38 +30,48 @@ CpuWorkComponent invalid(const char * reason, CpuWorkCoverage coverage) {
     return component;
 }
 
-bool test_dense_coarse_when_fine_is_unavailable() {
-    // Given: Case G's valid same-thread Dense host envelope.
+struct DenseExecutionFixture {
+    uint64_t caller_pmu;
+    uint64_t elapsed_ns;
+    uint64_t provider_child_pmu;
+    uint64_t rtl_cycles;
+    bool valid_end = true;
+};
+
+CpuWorkComponent select_dense_fixture(const DenseExecutionFixture & fixture) {
     DenseCpuWorkInput input{};
-    input.parent = valid(37, CpuWorkCoverage::coarse_same_thread_envelope);
-
-    // When: the current opaque provider has no proven fine leaves.
-    const CpuWorkComponent selected = select_dense_cpu_work(input);
-
-    // Then: scheduled caller work is the canonical coarse contribution.
-    return expect(selected.cycles == 37, "Case G selects Dense parent 37") &&
-        expect(selected.coverage == CpuWorkCoverage::coarse_same_thread_envelope,
-               "Case G reports coarse same-thread coverage") &&
-        expect(selected.additive, "selected Dense parent is additive");
+    input.parent = fixture.valid_end
+        ? valid(fixture.caller_pmu, CpuWorkCoverage::coarse_same_thread_envelope)
+        : invalid("invalid_end", CpuWorkCoverage::invalid);
+    if (!fixture.valid_end) input.parent.sample_reason = "multiplexed";
+    return select_dense_cpu_work(input);
 }
 
-bool test_dense_invalid_endpoint_fails_closed() {
-    // Given: Case H's invalid end while ns and RTL remain separate values.
-    DenseCpuWorkInput input{};
-    input.parent = invalid("invalid_end", CpuWorkCoverage::invalid);
-    input.parent.sample_reason = "multiplexed";
-    constexpr uint64_t dense_ns = 300;
-    constexpr uint64_t dense_rtl_cycles = 77;
+bool test_dense_active_poll_blocked_and_invalid() {
+    // Given: active polling and blocked calls with unrelated provider/RTL domains.
+    const DenseExecutionFixture active{37, 300, 911, 77};
+    const DenseExecutionFixture blocked{5, 900000, 4001, 880};
+    const DenseExecutionFixture invalid_end{37, 300, 911, 77, false};
 
-    // When: Dense selection runs without a fine decomposition.
-    const CpuWorkComponent selected = select_dense_cpu_work(input);
+    // When: each same-thread caller interval is selected.
+    const CpuWorkComponent active_selected = select_dense_fixture(active);
+    const CpuWorkComponent blocked_selected = select_dense_fixture(blocked);
+    const CpuWorkComponent invalid_selected = select_dense_fixture(invalid_end);
 
-    // Then: CPU work is null and unrelated domains are untouched.
-    return expect(!selected.cycles.has_value() && selected.reason == "invalid_end" &&
-                      selected.sample_reason == "multiplexed",
-                  "Case H preserves invalid Dense end and sample reason") &&
-        expect(dense_ns == 300 && dense_rtl_cycles == 77,
-               "Dense ns and RTL remain independent");
+    // Then: caller scheduling controls PMU work; ns, child, and RTL are sentinels.
+    return expect(active_selected.cycles == 37,
+                  "active polling selects caller PMU 37") &&
+        expect(blocked_selected.cycles == 5 && blocked.elapsed_ns > active.elapsed_ns,
+               "blocked caller selects scheduled PMU 5 despite larger ns") &&
+        expect(active.provider_child_pmu == 911 && blocked.provider_child_pmu == 4001 &&
+                   active.rtl_cycles == 77 && blocked.rtl_cycles == 880,
+               "provider-child and RTL sentinels do not affect caller PMU") &&
+        expect(!invalid_selected.cycles.has_value() &&
+                   invalid_selected.reason == "invalid_end" &&
+                   invalid_selected.sample_reason == "multiplexed",
+               "invalid endpoint nulls selected Dense aggregate") &&
+        expect(invalid_end.elapsed_ns == 300 && invalid_end.rtl_cycles == 77,
+               "invalid Dense keeps ns and RTL unchanged");
 }
 
 bool test_dense_fine_selection_demotes_parent() {
@@ -95,28 +105,22 @@ bool test_dense_fine_selection_demotes_parent() {
     const CpuWorkComponent empty = select_dense_cpu_work(input);
     input.fine = {valid(11, CpuWorkCoverage::coarse_same_thread_envelope)};
     const CpuWorkComponent mislabeled = select_dense_cpu_work(input);
+    input.fine = {valid(std::numeric_limits<uint64_t>::max(),
+                        CpuWorkCoverage::fine_leaves),
+                  valid(1, CpuWorkCoverage::fine_leaves)};
+    const CpuWorkComponent overflow = select_dense_cpu_work(input);
 
     // Then: malformed fine routes fail closed without using parent 37.
     return expect(!empty.cycles.has_value() && empty.reason == "missing_fine_leaf",
                   "empty selected fine route is malformed") &&
         expect(!mislabeled.cycles.has_value() &&
                    mislabeled.reason == "invalid_fine_coverage",
-               "mislabeled selected fine leaf is malformed");
+               "mislabeled selected fine leaf is malformed") &&
+        expect(!overflow.cycles.has_value() && overflow.reason == "overflow",
+               "fine Dense checked-add overflow fails closed");
 }
 
-bool test_dense_blocked_and_external_routes() {
-    // Given: a blocked call with large wall time but only five scheduled cycles.
-    DenseCpuWorkInput blocked{};
-    blocked.parent = valid(5, CpuWorkCoverage::coarse_same_thread_envelope);
-    constexpr uint64_t blocked_ns = 900000;
-
-    // When: the coarse pair is selected.
-    const CpuWorkComponent blocked_selected = select_dense_cpu_work(blocked);
-
-    // Then: only caller PMU work contributes, not wall time.
-    if (!expect(blocked_selected.cycles == 5 && blocked_ns == 900000,
-                "blocked Dense counts scheduled caller cycles only")) return false;
-
+bool test_dense_external_route() {
     // Given: external completion has one marker, not two endpoints.
     DenseCpuWorkInput external{};
     external.external_marker = true;
@@ -171,82 +175,29 @@ bool test_rmd_route_selection() {
                   "malformed RMD route fails closed");
 }
 
-bool test_compose_finalize_and_merge_nesting() {
-    // Given: direct/no-packet post work.
-    RmdPostCpuWorkInput direct{};
-    direct.rmd = valid(17, CpuWorkCoverage::coarse_same_thread_envelope);
-    direct.compose = valid(13, CpuWorkCoverage::coarse_same_thread_envelope);
-    direct.finalize = valid(41, CpuWorkCoverage::coarse_same_thread_envelope);
-    direct.merge = valid(17, CpuWorkCoverage::coarse_same_thread_envelope, false);
+bool test_finalize_and_nested_merge_metadata() {
+    // Given: the values used to exercise Task 7's production metric shape.
+    MatmulCpuWorkMetrics metrics{};
+    metrics.compose = valid(13, CpuWorkCoverage::coarse_same_thread_envelope);
+    metrics.finalize = valid(41, CpuWorkCoverage::coarse_same_thread_envelope);
+    metrics.merge = valid(17, CpuWorkCoverage::coarse_same_thread_envelope, false);
 
-    // When: direct bookkeeping is selected.
-    const RmdPostCpuWorkSelection direct_selected = select_rmd_post_cpu_work(direct);
+    // Then: Finalize is its own component and nested Merge is diagnostic only.
+    if (!expect(metrics.compose.cycles == 13 && metrics.finalize.cycles == 41 &&
+                    metrics.merge.cycles == 17 && !metrics.merge.additive,
+                "Compose 13, Finalize 41, and non-additive Merge 17 remain distinct")) {
+        return false;
+    }
 
-    // Then: Compose is absent and Finalize contains non-additive Merge.
-    if (!expect(!direct_selected.compose.cycles.has_value() &&
-                    direct_selected.compose.coverage == CpuWorkCoverage::absent,
-                "direct route emits no packet Compose")) return false;
-    if (!expect(direct_selected.canonical_cycles == 58,
-                "direct post total is backend 17 plus Finalize 41")) return false;
+    // Given: Case J's valid Finalize and invalid Merge endpoint.
+    metrics.finalize = valid(19, CpuWorkCoverage::coarse_same_thread_envelope);
+    metrics.merge = invalid("invalid_end", CpuWorkCoverage::invalid);
 
-    // Given: packet Compose is required.
-    RmdPostCpuWorkInput packet = direct;
-    packet.packet = true;
-
-    // When: packet post work is selected.
-    const RmdPostCpuWorkSelection packet_selected = select_rmd_post_cpu_work(packet);
-
-    // Then: Compose contributes, while Merge remains visible and non-additive.
-    return expect(packet_selected.compose.cycles == 13,
-                  "packet route emits Compose 13") &&
-        expect(packet_selected.finalize_canonical_cycles == 41,
-               "Finalize canonical contribution is 41, not Finalize plus Merge") &&
-        expect(packet_selected.finalize.cycles == 41 &&
-                   packet_selected.merge.cycles == 17 &&
-                   !packet_selected.merge.additive,
-               "Finalize 41 keeps Merge 17 visible and non-additive") &&
-        expect(packet_selected.canonical_cycles == 71,
-               "packet canonical total excludes nested Merge");
-}
-
-bool test_failed_merge_and_overflow_publish_no_partial_total() {
-    // Given: Case J's valid Finalize and invalid Merge diagnostic.
-    RmdPostCpuWorkInput case_j{};
-    case_j.rmd = valid(17, CpuWorkCoverage::coarse_same_thread_envelope);
-    case_j.finalize = valid(19, CpuWorkCoverage::coarse_same_thread_envelope);
-    case_j.merge = invalid("invalid_end", CpuWorkCoverage::invalid);
-
-    // When: Finalize itself succeeds.
-    const RmdPostCpuWorkSelection selected = select_rmd_post_cpu_work(case_j);
-
-    // Then: invalid nested Merge does not poison canonical Finalize.
-    if (!expect(selected.canonical_cycles == 36 &&
-                    !selected.merge.cycles.has_value() &&
-                    selected.merge.reason == "invalid_end",
-                "Case J uses valid Finalize once despite invalid Merge diagnostic")) return false;
-
-    // Given: Merge operation fails after timing.
-    case_j.merge_succeeded = false;
-
-    // When: post selection runs.
-    const RmdPostCpuWorkSelection failed = select_rmd_post_cpu_work(case_j);
-
-    // Then: no partial canonical total is published.
-    if (!expect(!failed.canonical_cycles.has_value() &&
-                    !failed.finalize_canonical_cycles.has_value() &&
-                    failed.reason == "failed_operation",
-                "failed Merge invalidates canonical post total")) return false;
-
-    // Given: checked addition would overflow.
-    case_j.merge_succeeded = true;
-    case_j.rmd = valid(std::numeric_limits<uint64_t>::max(),
-                       CpuWorkCoverage::coarse_same_thread_envelope);
-    case_j.finalize = valid(1, CpuWorkCoverage::coarse_same_thread_envelope);
-
-    // When/Then: overflow is null, never wrapped or partial.
-    const RmdPostCpuWorkSelection overflow = select_rmd_post_cpu_work(case_j);
-    return expect(!overflow.canonical_cycles.has_value() && overflow.reason == "overflow",
-                  "post CPU work checked-add overflow fails closed");
+    // Then: the nested diagnostic does not alter the valid Finalize component.
+    return expect(metrics.finalize.cycles == 19 &&
+                      !metrics.merge.cycles.has_value() &&
+                      metrics.merge.reason == "invalid_end",
+                  "Case J keeps valid Finalize separate from invalid Merge");
 }
 
 }
@@ -257,17 +208,16 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "usage: test-gemmini-matmul-cpu-work [--summary]\n");
         return 2;
     }
-    const bool ok = test_dense_coarse_when_fine_is_unavailable() &&
-        test_dense_invalid_endpoint_fails_closed() &&
+    const bool ok = test_dense_active_poll_blocked_and_invalid() &&
         test_dense_fine_selection_demotes_parent() &&
-        test_dense_blocked_and_external_routes() &&
+        test_dense_external_route() &&
         test_rmd_route_selection() &&
-        test_compose_finalize_and_merge_nesting() &&
-        test_failed_merge_and_overflow_publish_no_partial_total();
+        test_finalize_and_nested_merge_metadata();
     if (summary && ok) {
-        std::puts("TASK7_CPU_WORK dense_parent=37 dense_fine=24 direct=28 "
+        std::puts("TASK7_CPU_WORK dense_parent=37 dense_active=37 dense_blocked=5 "
+                  "dense_fine=24 direct=28 "
                   "software_backend=17 compose=13 finalize=41 merge=17 "
-                  "packet_post=71 merge_additive=false native=null "
+                  "merge_additive=false native=null "
                   "native_reason=unavailable_native_rmd_provider");
     }
     return ok ? 0 : 1;

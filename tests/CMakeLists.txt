@@ -951,6 +951,20 @@ add_test(
         -P ${CMAKE_CURRENT_SOURCE_DIR}/gemmini-quant-dispatch-unsupported.cmake)
 set_property(TEST gemmini_quant_dispatch_unsupported PROPERTY LABELS main)
 
+# Task 7: provider-free actual-production-source CPU-work coverage.
+add_executable(test-gemmini-matmul-cpu-work
+    test-gemmini-matmul-cpu-work.cpp
+    ../ggml/src/ggml-gemmini/ggml-gemmini-matmul-cpu-work.cpp)
+target_compile_features(test-gemmini-matmul-cpu-work PRIVATE cxx_std_17)
+target_include_directories(test-gemmini-matmul-cpu-work PRIVATE
+    ../ggml/src/ggml-gemmini)
+add_test(NAME test-gemmini-matmul-cpu-work
+    COMMAND $<TARGET_FILE:test-gemmini-matmul-cpu-work>)
+add_test(NAME test-gemmini-matmul-cpu-boundaries
+    COMMAND ${CMAKE_COMMAND}
+        -DMATMUL_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini-matmul.cpp
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-matmul-cpu-boundaries.cmake)
+
 # Keep the executable side of Gemmini's CTest registration explicit. Building
 # this target before CTest prevents a stale tree from hiding missing artifacts.
 set(_GEMMINI_REGISTERED_TEST_EXECUTABLES
@@ -964,6 +978,7 @@ set(_GEMMINI_REGISTERED_TEST_EXECUTABLES
     test-gemmini-rmd-packet
     test-gemmini-production-host-backend
     test-gemmini-rmd-telemetry
+    test-gemmini-matmul-cpu-work
     gemmini-quant-dispatch-smoke)
 foreach(_GEMMINI_OPTIONAL_TEST_EXECUTABLE IN ITEMS
         gemmini_q8_h1_h2_dequant_fp

@@ -3101,11 +3101,11 @@ MatmulStatus compose_rmd_stripe(MatmulStripeJob & job) {
     }
 
     const auto read_start = Clock::now();
-#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
-    const cycle::NativeCycleSample compose_start_sample = cycle::read_sample();
-#endif
     {
         std::lock_guard<std::mutex> lock(*job.job_mutex_);
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+        job.metrics_.telemetry_compose_start_sample = cycle::read_sample();
+#endif
         job.metrics_.compose_start_ns = now_ns();
     }
     rmd::Correction correction = rmd::BlockScaledInt64Correction{};
@@ -3125,7 +3125,6 @@ MatmulStatus compose_rmd_stripe(MatmulStripeJob & job) {
         job.metrics_.rmd_output_read = job.metrics_.rmd_compose;
         job.metrics_.compose_end_ns = now_ns();
 #if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
-        job.metrics_.telemetry_compose_start_sample = compose_start_sample;
         job.metrics_.telemetry_compose_end_sample = cycle::read_sample();
         job.metrics_.cpu_work.compose = cpu_work_interval(
             job.metrics_.telemetry_compose_start_sample,
