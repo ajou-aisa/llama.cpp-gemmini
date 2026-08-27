@@ -493,6 +493,60 @@ bool test_q4_h1_is_canonical_q4_0_reprocessing() {
     return ok;
 }
 
+bool test_q4_h1_preserves_positive_q4_0_scale() {
+    block_q4_0 source{};
+    source.d = ggml_fp32_to_fp16(0.25f);
+    for (size_t i = 0; i < std::size(source.qs); ++i) {
+        source.qs[i] = static_cast<uint8_t>(i | ((15 - i) << 4));
+    }
+
+    block_q4_h1 converted{};
+    if (!check(
+            reprocess_row_q4_0_to_q4_h1_ref(&source, &converted, QK4_0),
+            "positive-scale Q4_0 block reprocessing succeeds")) {
+        return false;
+    }
+
+    std::array<float, QK4_0> canonical{};
+    std::array<float, QK4_0> reprocessed{};
+    dequantize_row_q4_0(&source, canonical.data(), QK4_0);
+    dequantize_row_q4_h1(&converted, reprocessed.data(), QK4_0);
+    return check(
+        std::memcmp(canonical.data(), reprocessed.data(), sizeof(canonical)) == 0,
+        "positive-scale Q4_0 values survive Q4_H1 reprocessing exactly");
+}
+
+bool test_q4_h1_flips_negative_q4_0_scale_codes() {
+    block_q4_0 source{};
+    source.d = ggml_fp32_to_fp16(-0.25f);
+    for (size_t i = 0; i < std::size(source.qs); ++i) {
+        source.qs[i] = static_cast<uint8_t>(i | ((15 - i) << 4));
+    }
+
+    block_q4_h1 converted{};
+    if (!check(
+            reprocess_row_q4_0_to_q4_h1_ref(&source, &converted, QK4_0),
+            "negative-scale Q4_0 block reprocessing succeeds")) {
+        return false;
+    }
+
+    std::array<float, QK4_0> canonical{};
+    std::array<float, QK4_0> reprocessed{};
+    dequantize_row_q4_0(&source, canonical.data(), QK4_0);
+    dequantize_row_q4_h1(&converted, reprocessed.data(), QK4_0);
+    bool ok = true;
+    for (size_t i = 0; i < canonical.size(); ++i) {
+        const uint8_t packed = source.qs[i % (QK4_0 / 2)];
+        const uint8_t code = i < QK4_0 / 2 ? packed & 0x0f : packed >> 4;
+        const float expected = code == 0 ? 1.75f : canonical[i];
+        ok = check(
+                 reprocessed[i] == expected,
+                 "negative-scale Q4_0 conversion changes only unrepresentable +8 code") &&
+             ok;
+    }
+    return ok;
+}
+
 bool test_q4_h1_narrow_scale_range_preserves_magnitude() {
     constexpr int64_t columns = 64;
     std::array<float, columns> source{};
@@ -501,13 +555,16 @@ bool test_q4_h1_narrow_scale_range_preserves_magnitude() {
         source[i] = block_max * static_cast<float>((i % 17) - 8) / 8.0f;
     }
 
+    std::array<block_q4_0, 2> canonical{};
+    quantize_row_q4_0_ref(source.data(), canonical.data(), columns);
+
     std::array<block_q4_h1, 2> quantized{};
     quantize_row_q4_h1_ref(source.data(), quantized.data(), columns);
 
     bool ok = true;
     for (size_t i = 0; i < quantized.size(); ++i) {
-        const float expected = ggml_fp16_to_fp32(
-            ggml_fp32_to_fp16((i == 0 ? 1.0f : 1.001f) / 7.0f));
+        const float source_scale = ggml_fp16_to_fp32(canonical[i].d);
+        const float expected = std::fabs(source_scale);
         const float actual =
             quantized[i].s_rf * (static_cast<float>(quantized[i].R) + quantized[i].c_b);
         if (!(std::fabs(actual - expected) <= expected * 0.01f)) {
@@ -672,6 +729,8 @@ int main(int argc, char ** argv) {
         ok = test_gemmini_q4_default_output_policy() && ok;
         ok = test_legacy_round_trips() && ok;
         ok = test_q4_h1_is_canonical_q4_0_reprocessing() && ok;
+        ok = test_q4_h1_preserves_positive_q4_0_scale() && ok;
+        ok = test_q4_h1_flips_negative_q4_0_scale_codes() && ok;
         ok = test_q4_hp1_loader_contract() && ok;
         ok = test_reader_happy_table() && ok;
         ok = test_q4_h0_matches_canonical_dequantization() && ok;

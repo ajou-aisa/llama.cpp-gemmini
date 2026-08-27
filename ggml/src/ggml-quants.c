@@ -119,29 +119,20 @@ static bool reprocess_q4_0_block_to_q4_h1(
         return false;
     }
 
-    float amax = 0.0f;
-    for (int j = 0; j < QK4_0/2; ++j) {
-        const int source_q0 = (x->qs[j] & 0x0F) - 8;
-        const int source_q1 = (x->qs[j] >> 4) - 8;
-        amax = MAX(amax, fabsf(source_q0 * source_d));
-        amax = MAX(amax, fabsf(source_q1 * source_d));
-    }
-
-    const float d = amax / 7.0f;
-    const float id = d ? 1.0f/d : 0.0f;
-    if (!isfinite(d) || !isfinite(id)) {
-        return false;
-    }
-
     memset(y, 0, sizeof(*y));
-    for (int j = 0; j < QK4_0/2; ++j) {
-        const int source_q0 = (x->qs[j] & 0x0F) - 8;
-        const int source_q1 = (x->qs[j] >> 4) - 8;
-        const int q0 = MIN(7, MAX(-8, (int) roundf(source_q0 * source_d * id)));
-        const int q1 = MIN(7, MAX(-8, (int) roundf(source_q1 * source_d * id)));
-        y->qs[j] = (uint8_t) ((q0 + 8) | ((q1 + 8) << 4));
+    if (source_d >= 0.0f) {
+        memcpy(y->qs, x->qs, sizeof(y->qs));
+        y->s_rf = source_d;
+    } else {
+        for (int j = 0; j < QK4_0/2; ++j) {
+            const int source_q0 = (x->qs[j] & 0x0F) - 8;
+            const int source_q1 = (x->qs[j] >> 4) - 8;
+            const int q0 = MIN(7, -source_q0);
+            const int q1 = MIN(7, -source_q1);
+            y->qs[j] = (uint8_t) ((q0 + 8) | ((q1 + 8) << 4));
+        }
+        y->s_rf = -source_d;
     }
-    y->s_rf = GGML_FP16_TO_FP32(GGML_FP32_TO_FP16(d));
     return isfinite(y->s_rf);
 }
 
