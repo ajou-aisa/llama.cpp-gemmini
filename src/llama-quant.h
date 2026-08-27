@@ -16,8 +16,7 @@ static inline ggml_type llama_quantize_gemmini_q4_default_tensor_type(
     if (pure || (!is_output_weight && !is_token_embedding_weight)) {
         return GGML_TYPE_COUNT;
     }
-    return ftype == LLAMA_FTYPE_MOSTLY_Q4_0 ||
-                   ftype == LLAMA_FTYPE_MOSTLY_Q4_H1 ||
+    return ftype == LLAMA_FTYPE_MOSTLY_Q4_H1 ||
                    ftype == LLAMA_FTYPE_MOSTLY_Q4_HP1
         ? GGML_TYPE_F16
         : GGML_TYPE_COUNT;

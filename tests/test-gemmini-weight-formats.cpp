@@ -586,10 +586,8 @@ bool test_gemmini_q4_default_output_policy() {
         ggml_type expected;
         const char * message;
     };
-    const std::array<Case, 9> cases = {{
-        { LLAMA_FTYPE_MOSTLY_Q4_0,  false, true,  false, GGML_TYPE_F16,  "Q4_0 output stays F16" },
-        { LLAMA_FTYPE_MOSTLY_Q4_0,  false, true,  true,  GGML_TYPE_F16,  "Q4_0 tied token/output stays F16" },
-        { LLAMA_FTYPE_MOSTLY_Q4_0,  false, false, true,  GGML_TYPE_F16,  "Q4_0 untied token embedding stays F16" },
+    const std::array<Case, 7> cases = {{
+        { LLAMA_FTYPE_MOSTLY_Q4_0,  false, true,  false, GGML_TYPE_COUNT, "Q4_0 output keeps standard policy" },
         { LLAMA_FTYPE_MOSTLY_Q4_H1, false, true,  false, GGML_TYPE_F16,  "Q4_H1 output stays F16" },
         { LLAMA_FTYPE_MOSTLY_Q4_HP1,false, true,  false, GGML_TYPE_F16,  "Q4_HP1 output stays F16" },
         { LLAMA_FTYPE_MOSTLY_Q4_H1, false, true,  true,  GGML_TYPE_F16,  "Q4_H1 tied token/output stays F16" },
