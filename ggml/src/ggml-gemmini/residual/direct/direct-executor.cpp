@@ -4,6 +4,9 @@
 #include "../../ggml-gemmini-args.h"
 #include "../../quants/common/weight_reader.hpp"
 #include "../../quants/common/weight_route.hpp"
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+#include <gemmini/cycle_reader.hpp>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -14,26 +17,92 @@
 
 namespace ggml::gemmini::residual {
 
+// allow: SIZE_OK — one staged execution state machine owns failure atomicity and leaf boundaries.
 namespace {
 
 namespace wreader = quants::wreader;
 namespace wroute = quants::wroute;
 
 constexpr size_t kJTile = 16;
-constexpr __int128 kInt64Min = static_cast<__int128>(std::numeric_limits<int64_t>::min());
-constexpr __int128 kInt64Max = static_cast<__int128>(std::numeric_limits<int64_t>::max());
+
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
+    (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
+struct CpuSample {
+    uint64_t value = 0;
+    bool valid = false;
+    uint64_t owner = 0;
+    uint64_t generation = 0;
+};
+
+struct CpuInterval {
+    uint64_t value = 0;
+    bool valid = false;
+};
+
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
+CpuSample read_cpu_sample(const testing::DirectExecutionTestHooks & hooks,
+                          testing::DirectCpuSamplePoint point,
+                          size_t tile_index) {
+    const auto sample = hooks.sample_reader(point, tile_index, hooks.context);
+    return {sample.value, sample.valid, sample.owner, sample.generation};
+}
+#else
+CpuSample read_cpu_sample() {
+    const auto sample = cycle::read_sample();
+    return {sample.value, sample.valid, sample.owner_event_token, sample.generation};
+}
+#endif
+
+CpuInterval cpu_interval(const CpuSample & start, const CpuSample & end) {
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+    const cycle::NativeCycleSample native_start{
+        start.value, start.valid,
+        start.valid ? cycle::NativeCycleReason::none : cycle::NativeCycleReason::unavailable_event,
+        cycle::NativeCycleSource::perf_cpu_cycles, start.owner, start.generation};
+    const cycle::NativeCycleSample native_end{
+        end.value, end.valid,
+        end.valid ? cycle::NativeCycleReason::none : cycle::NativeCycleReason::unavailable_event,
+        cycle::NativeCycleSource::perf_cpu_cycles, end.owner, end.generation};
+    const auto delta = cycle::evaluate_interval(native_start, native_end);
+    return {delta.value, delta.valid};
+#else
+    if (!start.valid || !end.valid || start.owner != end.owner ||
+        start.generation != end.generation || end.value < start.value) {
+        return {};
+    }
+    return {end.value - start.value, true};
+#endif
+}
+
+bool checked_add_u64(uint64_t lhs, uint64_t rhs, uint64_t & result) {
+    if (rhs > std::numeric_limits<uint64_t>::max() - lhs) return false;
+    result = lhs + rhs;
+    return true;
+}
+#endif
 
 bool checked_add(int64_t lhs, int64_t rhs, int64_t & result) {
-    const __int128 sum = static_cast<__int128>(lhs) + rhs;
-    if (sum < kInt64Min || sum > kInt64Max) return false;
-    result = static_cast<int64_t>(sum);
+    if ((rhs > 0 && lhs > std::numeric_limits<int64_t>::max() - rhs) ||
+        (rhs < 0 && lhs < std::numeric_limits<int64_t>::min() - rhs)) {
+        return false;
+    }
+    result = lhs + rhs;
     return true;
 }
 
 bool checked_multiply(int64_t lhs, int64_t rhs, int64_t & result) {
-    const __int128 product = static_cast<__int128>(lhs) * rhs;
-    if (product < kInt64Min || product > kInt64Max) return false;
-    result = static_cast<int64_t>(product);
+    if (lhs > 0) {
+        if ((rhs > 0 && lhs > std::numeric_limits<int64_t>::max() / rhs) ||
+            (rhs < 0 && rhs < std::numeric_limits<int64_t>::min() / lhs)) {
+            return false;
+        }
+    } else if (lhs < 0) {
+        if ((rhs > 0 && lhs < std::numeric_limits<int64_t>::min() / rhs) ||
+            (rhs < 0 && lhs < std::numeric_limits<int64_t>::max() / rhs)) {
+            return false;
+        }
+    }
+    result = lhs * rhs;
     return true;
 }
 
@@ -76,10 +145,19 @@ rmd::RmdStatus reader_failure(wreader::WeightReaderStatus status) {
 
 }
 
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
+static rmd::RmdStatus execute_direct_stripe_impl(
+    const ggml_gemmini_args_t & args,
+    const DirectStripePayload & payload,
+    rmd::DirectOutput & correction,
+    DirectExecutionMetrics * metrics,
+    const testing::DirectExecutionTestHooks * hooks) {
+#else
 rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
                                      const DirectStripePayload & payload,
                                      rmd::DirectOutput & correction,
                                      DirectExecutionMetrics * metrics) {
+#endif
     if (validate_direct_payload(payload) != rmd::RmdStatus::success)
         return rmd::RmdStatus::invalid_packet;
     if (args.K != payload.logical_k || args.J != payload.logical_j)
@@ -119,6 +197,22 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
     if (!checked_size_product(payload.row_count, payload.logical_j, output_count))
         return rmd::RmdStatus::overflow;
 
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
+    const bool sample_cpu = hooks != nullptr && hooks->sample_reader != nullptr;
+#elif CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+    const bool sample_cpu = metrics != nullptr;
+#endif
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
+    (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
+    const CpuSample serial_pre_start = sample_cpu ?
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
+        read_cpu_sample(*hooks, testing::DirectCpuSamplePoint::serial_pre_start, 0) :
+#else
+        read_cpu_sample() :
+#endif
+        CpuSample{};
+#endif
+
     std::vector<rmd::OutputValue> staged_integer;
     std::vector<double> staged_floating;
     if ((integer_block && output_count > staged_integer.max_size()) ||
@@ -139,9 +233,17 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
         (payload.logical_j + kJTile - 1) / kJTile;
     std::vector<rmd::RmdStatus> tile_status;
     std::vector<size_t> tile_native_q8_values;
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
+    (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
+    std::vector<CpuInterval> tile_cpu_intervals;
+#endif
     try {
         tile_status.assign(j_tile_count, rmd::RmdStatus::success);
         tile_native_q8_values.assign(j_tile_count, 0);
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
+    (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
+        if (sample_cpu) tile_cpu_intervals.assign(j_tile_count, CpuInterval{});
+#endif
     } catch (const std::bad_alloc &) {
         return rmd::RmdStatus::allocation_failure;
     }
@@ -149,80 +251,115 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
     // Events are canonical row/K order. For each J tile, consume contiguous
     // row/block/K spans, then apply that block's scale exactly once.
     auto execute_j_tile = [&](size_t tile_index) {
-        const size_t j_begin = tile_index * kJTile;
-        const size_t tile_j = std::min(kJTile, payload.logical_j - j_begin);
-        size_t & native_q8_values = tile_native_q8_values[tile_index];
-        size_t event_index = 0;
-        while (event_index < payload.events.size()) {
-            const ResidualEvent & first = payload.events[event_index];
-            const size_t row = first.local_row;
-            const size_t block_id = first.original_k / rmd::kBlockSize;
-            size_t span_end = event_index + 1;
-            while (span_end < payload.events.size() &&
-                   payload.events[span_end].local_row == row &&
-                   payload.events[span_end].original_k / rmd::kBlockSize == block_id) {
-                ++span_end;
-            }
-
-            std::array<int64_t, kJTile> block_sum{};
-            for (size_t local_j = 0; local_j < tile_j; ++local_j) {
-                const size_t j = j_begin + local_j;
-                for (size_t index = event_index; index < span_end; ++index) {
-                    const ResidualEvent & event = payload.events[index];
-                    const wreader::WeightCodeResult code = wreader::read_code_validated(
-                        args, plan, j, event.original_k);
-                    if (!code.ok()) return reader_failure(code.status);
-                    // A block has at most 32 signed INT16 codes and INT32
-                    // residuals, so its complete dot product fits in INT64.
-                    block_sum[local_j] +=
-                        static_cast<int64_t>(event.residual) * code.value;
-                    if (native_q8_route) ++native_q8_values;
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
+    (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
+        const CpuSample tile_start = sample_cpu ?
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
+            read_cpu_sample(*hooks, testing::DirectCpuSamplePoint::tile_start, tile_index) :
+#else
+            read_cpu_sample() :
+#endif
+            CpuSample{};
+#endif
+        const rmd::RmdStatus status = [&] {
+            const size_t j_begin = tile_index * kJTile;
+            const size_t tile_j = std::min(kJTile, payload.logical_j - j_begin);
+            size_t & native_q8_values = tile_native_q8_values[tile_index];
+            size_t event_index = 0;
+            while (event_index < payload.events.size()) {
+                const ResidualEvent & first = payload.events[event_index];
+                const size_t row = first.local_row;
+                const size_t block_id = first.original_k / rmd::kBlockSize;
+                size_t span_end = event_index + 1;
+                while (span_end < payload.events.size() &&
+                       payload.events[span_end].local_row == row &&
+                       payload.events[span_end].original_k / rmd::kBlockSize == block_id) {
+                    ++span_end;
                 }
-            }
 
-            for (size_t local_j = 0; local_j < tile_j; ++local_j) {
-                const size_t j = j_begin + local_j;
-                wreader::WeightScaleResult scale{};
-                if (uses_reader_scale(plan)) {
-                    scale = wreader::read_scale_validated(args, plan, j, block_id);
-                    if (!scale.ok()) return reader_failure(scale.status);
-                } else {
-                    scale.status = wreader::WeightReaderStatus::Success;
-                    scale.domain = plan.scale_domain;
-                    scale.integer_block_scale =
-                        wroute::route_block_scale(plan, args, j, block_id);
-                }
-                if (scale.domain != plan.scale_domain)
-                    return rmd::RmdStatus::execution_failed;
-
-                const size_t output_index = row * payload.logical_j + j;
-                if (floating_block) {
-                    const double scaled = static_cast<double>(block_sum[local_j]) *
-                        static_cast<double>(scale.floating_block_scale);
-                    const double sum = staged_floating[output_index] + scaled;
-                    if (!finite_double(scaled) || !finite_double(sum))
-                        return rmd::RmdStatus::overflow;
-                    staged_floating[output_index] = sum;
-                } else {
-                    if (scale.integer_block_scale >
-                        static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
-                        return rmd::RmdStatus::overflow;
-                    }
-                    int64_t scaled = 0;
-                    if (!checked_multiply(
-                            block_sum[local_j],
-                            static_cast<int64_t>(scale.integer_block_scale), scaled) ||
-                        !checked_add(staged_integer[output_index], scaled,
-                                     staged_integer[output_index])) {
-                        return rmd::RmdStatus::overflow;
+                std::array<int64_t, kJTile> block_sum{};
+                for (size_t local_j = 0; local_j < tile_j; ++local_j) {
+                    const size_t j = j_begin + local_j;
+                    for (size_t index = event_index; index < span_end; ++index) {
+                        const ResidualEvent & event = payload.events[index];
+                        const wreader::WeightCodeResult code = wreader::read_code_validated(
+                            args, plan, j, event.original_k);
+                        if (!code.ok()) return reader_failure(code.status);
+                        // A block has at most 32 signed INT16 codes and INT32
+                        // residuals, so its complete dot product fits in INT64.
+                        block_sum[local_j] +=
+                            static_cast<int64_t>(event.residual) * code.value;
+                        if (native_q8_route) ++native_q8_values;
                     }
                 }
+
+                for (size_t local_j = 0; local_j < tile_j; ++local_j) {
+                    const size_t j = j_begin + local_j;
+                    wreader::WeightScaleResult scale{};
+                    if (uses_reader_scale(plan)) {
+                        scale = wreader::read_scale_validated(args, plan, j, block_id);
+                        if (!scale.ok()) return reader_failure(scale.status);
+                    } else {
+                        scale.status = wreader::WeightReaderStatus::Success;
+                        scale.domain = plan.scale_domain;
+                        scale.integer_block_scale =
+                            wroute::route_block_scale(plan, args, j, block_id);
+                    }
+                    if (scale.domain != plan.scale_domain)
+                        return rmd::RmdStatus::execution_failed;
+
+                    const size_t output_index = row * payload.logical_j + j;
+                    if (floating_block) {
+                        const double scaled = static_cast<double>(block_sum[local_j]) *
+                            static_cast<double>(scale.floating_block_scale);
+                        const double sum = staged_floating[output_index] + scaled;
+                        if (!finite_double(scaled) || !finite_double(sum))
+                            return rmd::RmdStatus::overflow;
+                        staged_floating[output_index] = sum;
+                    } else {
+                        if (scale.integer_block_scale >
+                            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+                            return rmd::RmdStatus::overflow;
+                        }
+                        int64_t scaled = 0;
+                        if (!checked_multiply(
+                                block_sum[local_j],
+                                static_cast<int64_t>(scale.integer_block_scale), scaled) ||
+                            !checked_add(staged_integer[output_index], scaled,
+                                         staged_integer[output_index])) {
+                            return rmd::RmdStatus::overflow;
+                        }
+                    }
+                }
+                event_index = span_end;
             }
-            event_index = span_end;
+            return rmd::RmdStatus::success;
+        }();
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
+    (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
+        if (sample_cpu) {
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
+            const CpuSample tile_end = read_cpu_sample(*hooks,
+                testing::DirectCpuSamplePoint::tile_end, tile_index);
+#else
+            const CpuSample tile_end = read_cpu_sample();
+#endif
+            tile_cpu_intervals[tile_index] = cpu_interval(tile_start, tile_end);
         }
-        return rmd::RmdStatus::success;
+#endif
+        return status;
     };
 
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
+    (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
+    const CpuSample serial_pre_end = sample_cpu ?
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
+        read_cpu_sample(*hooks, testing::DirectCpuSamplePoint::serial_pre_end, 0) :
+#else
+        read_cpu_sample() :
+#endif
+        CpuSample{};
+#endif
 #if defined(GGML_GEMMINI_HAS_OPENMP)
 #pragma omp parallel for schedule(static) if(j_tile_count > 1)
 #endif
@@ -232,6 +369,16 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
         tile_status[static_cast<size_t>(tile_index)] =
             execute_j_tile(static_cast<size_t>(tile_index));
     }
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
+    (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
+    const CpuSample serial_post_start = sample_cpu ?
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
+        read_cpu_sample(*hooks, testing::DirectCpuSamplePoint::serial_post_start, 0) :
+#else
+        read_cpu_sample() :
+#endif
+        CpuSample{};
+#endif
     size_t native_q8_values = 0;
     for (size_t tile_index = 0; tile_index < j_tile_count; ++tile_index) {
         if (tile_status[tile_index] != rmd::RmdStatus::success) {
@@ -244,13 +391,68 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
         rmd::DirectOutput(rmd::PreScaledFloat64Correction{std::move(staged_floating)}) :
         rmd::DirectOutput(rmd::BlockScaledInt64Correction{std::move(staged_integer)});
     correction.swap(staged_output);
+
+    std::optional<DirectCpuDetailMetrics> cpu_detail;
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
+    (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
+    if (sample_cpu) {
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
+        const CpuSample serial_post_end = read_cpu_sample(*hooks,
+            testing::DirectCpuSamplePoint::serial_post_end, 0);
+#else
+        const CpuSample serial_post_end = read_cpu_sample();
+#endif
+        const CpuInterval serial_pre = cpu_interval(serial_pre_start, serial_pre_end);
+        const CpuInterval serial_post = cpu_interval(serial_post_start, serial_post_end);
+        DirectCpuDetailMetrics detail{};
+        if (serial_pre.valid) detail.serial_pre_cycles = serial_pre.value;
+        if (serial_post.valid) detail.serial_post_cycles = serial_post.value;
+
+        bool tiles_valid = true;
+        uint64_t tile_cycles = 0;
+        for (const CpuInterval & interval : tile_cpu_intervals) {
+            if (!interval.valid || !checked_add_u64(tile_cycles, interval.value, tile_cycles)) {
+                tiles_valid = false;
+                break;
+            }
+        }
+        if (tiles_valid) detail.tile_cycles = tile_cycles;
+
+        uint64_t total = 0;
+        detail.valid = serial_pre.valid && tiles_valid && serial_post.valid &&
+            checked_add_u64(total, serial_pre.value, total) &&
+            checked_add_u64(total, tile_cycles, total) &&
+            checked_add_u64(total, serial_post.value, total);
+        if (detail.valid) detail.total_cycles = total;
+        cpu_detail = detail;
+    }
+#endif
     if (metrics != nullptr) {
         metrics->event_count = payload.events.size();
         metrics->call_count = 1;
         metrics->native_q8_values = native_q8_values;
         metrics->j_tile_count = j_tile_count;
+        metrics->cpu_detail = cpu_detail;
     }
     return rmd::RmdStatus::success;
 }
+
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
+rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
+                                     const DirectStripePayload & payload,
+                                     rmd::DirectOutput & correction,
+                                     DirectExecutionMetrics * metrics) {
+    return execute_direct_stripe_impl(args, payload, correction, metrics, nullptr);
+}
+
+rmd::RmdStatus execute_direct_stripe(
+    const ggml_gemmini_args_t & args,
+    const DirectStripePayload & payload,
+    rmd::DirectOutput & correction,
+    DirectExecutionMetrics * metrics,
+    const testing::DirectExecutionTestHooks & hooks) {
+    return execute_direct_stripe_impl(args, payload, correction, metrics, &hooks);
+}
+#endif
 
 }

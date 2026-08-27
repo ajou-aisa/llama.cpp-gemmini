@@ -404,6 +404,7 @@ endif()
 target_compile_features(test-gemmini-exsia PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-exsia PRIVATE
     GGML_GEMMINI_TESTING=1
+    GGML_GEMMINI_DIRECT_METRICS_TESTING=1
     GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
     GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
     GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
@@ -412,6 +413,11 @@ target_compile_definitions(test-gemmini-exsia PRIVATE
     CYCLE_DETAIL=${CYCLE_DETAIL}
     LOG_CYCLE=${LOG_CYCLE}
     EXSIA_VALIDATION=1)
+if (GGML_GEMMINI_ENABLE_OPENMP)
+    find_package(OpenMP REQUIRED COMPONENTS CXX)
+    target_compile_definitions(test-gemmini-exsia PRIVATE GGML_GEMMINI_HAS_OPENMP)
+    target_link_libraries(test-gemmini-exsia PRIVATE OpenMP::OpenMP_CXX)
+endif()
 target_include_directories(test-gemmini-exsia PRIVATE
     ../ggml/include
     ../ggml/src
@@ -426,6 +432,53 @@ target_include_directories(test-gemmini-exsia PRIVATE
     ${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini-rocc-tests
     ${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini-rocc-tests/include
     ${TEST_GEMMINI_EXSIA_SW_PATH}/rocc-software/src)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+    CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    add_library(test-gemmini-direct-linux-aarch64-strict OBJECT
+        ../ggml/src/ggml-gemmini/residual/direct/direct-executor.cpp)
+    set_target_properties(test-gemmini-direct-linux-aarch64-strict PROPERTIES COMPILE_OPTIONS "")
+    target_compile_features(test-gemmini-direct-linux-aarch64-strict PRIVATE cxx_std_17)
+    target_compile_definitions(test-gemmini-direct-linux-aarch64-strict PRIVATE
+        CYCLE_DETAIL=1
+        LOG_CYCLE=1
+        GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+        GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE})
+    target_compile_options(test-gemmini-direct-linux-aarch64-strict PRIVATE
+        -Wmissing-declarations
+        -Wmissing-noreturn
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Wcast-qual
+        -Wextra-semi
+        -Wunused-parameter
+        -Werror)
+    target_include_directories(test-gemmini-direct-linux-aarch64-strict PRIVATE
+        ../ggml/include
+        ../ggml/src
+        ../ggml/src/ggml-gemmini
+        ../ggml/src/ggml-gemmini-utils/include
+        ${TEST_GEMMINI_EXSIA_SW_PATH}
+        ${TEST_GEMMINI_EXSIA_SW_PATH}/include)
+    add_dependencies(test-gemmini-exsia test-gemmini-direct-linux-aarch64-strict)
+endif()
+add_test(NAME gemmini_direct_metrics_source_contract
+    COMMAND ${CMAKE_COMMAND}
+        -DDIRECT_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/residual/direct/direct-executor.cpp
+        -DDIRECT_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/residual/direct/direct-executor.hpp
+        -DTEST_CMAKE=${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
+        -DCXX_COMPILER=${CMAKE_CXX_COMPILER}
+        -DGENERATED_DIR=${CMAKE_BINARY_DIR}/generated
+        -DPROJECT_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/..
+        -DGEMMINI_SW_PATH=${TEST_GEMMINI_EXSIA_SW_PATH}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-direct-metrics-source-contract.cmake)
+add_test(NAME gemmini_direct_metrics_adversarial_contract
+    COMMAND ${CMAKE_COMMAND}
+        -DDIRECT_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/residual/direct/direct-executor.cpp
+        -DDIRECT_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/residual/direct/direct-executor.hpp
+        -DTEST_CMAKE=${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
+        -DCONTRACT_SCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-direct-metrics-source-contract.cmake
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-direct-metrics-adversarial.cmake)
 set(_GGML_GEMMINI_EXSIA_CASES
     all baseline dispatch direct-executor stripe-geometry)
 if (_GGML_GEMMINI_ACTIVATION_BITS_VALUE EQUAL 8 AND
@@ -442,6 +495,9 @@ foreach(_case IN LISTS _GGML_GEMMINI_EXSIA_CASES)
             -DEXPECTED_CASE=${_case}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-exsia-case.cmake)
 endforeach()
+set_tests_properties(gemmini_exsia_all gemmini_exsia_direct_executor PROPERTIES
+    ENVIRONMENT "OMP_DYNAMIC=FALSE;OMP_NUM_THREADS=3;OMP_THREAD_LIMIT=3"
+    TIMEOUT 30)
 unset(_GGML_GEMMINI_EXSIA_CASES)
 add_test(NAME gemmini_exsia_unknown_case
     COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=unknown)
