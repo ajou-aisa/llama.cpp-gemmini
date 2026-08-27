@@ -546,9 +546,10 @@ add_test(NAME test-gemmini-rmd-radix-failure
 
 add_executable(test-gemmini-rmd-packet
     test-gemmini-rmd-packet.cpp
+    ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp)
 target_link_libraries(test-gemmini-rmd-packet PRIVATE
-    ggml-base ggml-gemmini ggml-gemmini-utils)
+    ggml-base ggml-gemmini-utils)
 target_compile_features(test-gemmini-rmd-packet PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-rmd-packet PRIVATE
     GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
@@ -561,6 +562,31 @@ target_include_directories(test-gemmini-rmd-packet PRIVATE
     ${GEMMINI_SW_PATH}/include)
 add_test(NAME test-gemmini-rmd-packet
     COMMAND $<TARGET_FILE:test-gemmini-rmd-packet>)
+
+add_executable(test-gemmini-rmd-capture
+    test-gemmini-rmd-capture.cpp
+    ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp)
+target_link_libraries(test-gemmini-rmd-capture PRIVATE
+    ggml-base ggml-gemmini-utils)
+target_compile_features(test-gemmini-rmd-capture PRIVATE cxx_std_17)
+target_compile_definitions(test-gemmini-rmd-capture PRIVATE
+    GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+    GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
+    LOG_CYCLE=${LOG_CYCLE}
+    CYCLE_DETAIL=${CYCLE_DETAIL})
+target_include_directories(test-gemmini-rmd-capture PRIVATE
+    ../ggml/src
+    ../ggml/src/ggml-gemmini
+    ../ggml/src/ggml-gemmini/residual/rmd
+    ${GEMMINI_SW_PATH}
+    ${GEMMINI_SW_PATH}/include)
+add_test(NAME test-gemmini-rmd-capture
+    COMMAND $<TARGET_FILE:test-gemmini-rmd-capture>)
+add_test(NAME test-gemmini-rmd-capture-finish-boundary
+    COMMAND ${CMAKE_COMMAND}
+        -DTEST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/..
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-rmd-capture-finish-boundary.cmake)
 
 add_executable(test-gemmini-production-host-backend
     test-gemmini-production-host-backend.cpp)
