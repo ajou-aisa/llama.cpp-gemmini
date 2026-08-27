@@ -479,6 +479,88 @@ add_test(NAME gemmini_direct_metrics_adversarial_contract
         -DTEST_CMAKE=${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
         -DCONTRACT_SCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-direct-metrics-source-contract.cmake
         -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-direct-metrics-adversarial.cmake)
+foreach(_worker_count IN ITEMS 3 4)
+    add_executable(test-gemmini-exsia-workers${_worker_count}
+        test-gemmini-exsia-profile.cpp
+        ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
+        ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
+        ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+        ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
+        ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
+        ../ggml/src/ggml-gemmini/residual/rmd/rmd-reference.cpp
+        ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
+        ../ggml/src/ggml-gemmini/quants/act/quantize.cpp
+        ../ggml/src/ggml-gemmini/quants/act/block/block.cpp
+        ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
+        ../ggml/src/ggml-gemmini/quants/act/stripe/stripe.cpp
+        ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
+        ../ggml/src/ggml-gemmini/quants/act/token/token.cpp)
+    target_link_libraries(test-gemmini-exsia-workers${_worker_count} PRIVATE
+        ggml-base ggml-gemmini-utils)
+    target_compile_features(test-gemmini-exsia-workers${_worker_count} PRIVATE cxx_std_17)
+    target_compile_definitions(test-gemmini-exsia-workers${_worker_count} PRIVATE
+        GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+        GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
+        GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
+        GGML_GEMMINI_EXSIA_LOCAL_WORKERS=${_worker_count}
+        GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=2
+        GGML_GEMMINI_ENABLE_RMD=0
+        CYCLE_DETAIL=1
+        LOG_CYCLE=1
+        EXSIA_VALIDATION=1)
+    target_include_directories(test-gemmini-exsia-workers${_worker_count} PRIVATE
+        ../ggml/include ../ggml/src ../ggml/src/ggml-gemmini
+        ../ggml/src/ggml-gemmini-utils/include ../ggml/src/ggml-gemmini/quants
+        ../ggml/src/ggml-gemmini/quants/act ../ggml/src/ggml-gemmini/quants/act/exsia
+        ../ggml/src/ggml-gemmini/quants/common ${TEST_GEMMINI_EXSIA_SW_PATH}
+        ${TEST_GEMMINI_EXSIA_SW_PATH}/include)
+    if (GGML_GEMMINI_ENABLE_OPENMP)
+        target_compile_definitions(test-gemmini-exsia-workers${_worker_count} PRIVATE
+            GGML_GEMMINI_HAS_OPENMP)
+        target_link_libraries(test-gemmini-exsia-workers${_worker_count} PRIVATE
+            OpenMP::OpenMP_CXX)
+    endif()
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+        CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+        add_library(test-gemmini-exsia-workers${_worker_count}-strict OBJECT
+            ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp)
+        set_target_properties(test-gemmini-exsia-workers${_worker_count}-strict
+            PROPERTIES COMPILE_OPTIONS "")
+        target_compile_features(test-gemmini-exsia-workers${_worker_count}-strict PRIVATE cxx_std_17)
+        target_compile_definitions(test-gemmini-exsia-workers${_worker_count}-strict PRIVATE
+            GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+            GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
+            GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
+            GGML_GEMMINI_EXSIA_LOCAL_WORKERS=${_worker_count}
+            GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=2
+            GGML_GEMMINI_ENABLE_RMD=0 CYCLE_DETAIL=1 LOG_CYCLE=1 EXSIA_VALIDATION=1)
+        target_compile_options(test-gemmini-exsia-workers${_worker_count}-strict PRIVATE
+            -Wall -Wextra -Wcast-qual -Wextra-semi -Wunused-parameter -Werror)
+        target_include_directories(test-gemmini-exsia-workers${_worker_count}-strict PRIVATE
+            ../ggml/include ../ggml/src ../ggml/src/ggml-gemmini
+            ../ggml/src/ggml-gemmini-utils/include ../ggml/src/ggml-gemmini/quants
+            ../ggml/src/ggml-gemmini/quants/act ../ggml/src/ggml-gemmini/quants/act/exsia
+            ../ggml/src/ggml-gemmini/quants/common)
+        target_include_directories(test-gemmini-exsia-workers${_worker_count}-strict SYSTEM PRIVATE
+            ${TEST_GEMMINI_EXSIA_SW_PATH} ${TEST_GEMMINI_EXSIA_SW_PATH}/include)
+        if (GGML_GEMMINI_ENABLE_OPENMP)
+            target_compile_definitions(test-gemmini-exsia-workers${_worker_count}-strict PRIVATE
+                GGML_GEMMINI_HAS_OPENMP)
+            target_link_libraries(test-gemmini-exsia-workers${_worker_count}-strict PRIVATE
+                OpenMP::OpenMP_CXX)
+        endif()
+        add_dependencies(test-gemmini-exsia-workers${_worker_count}
+            test-gemmini-exsia-workers${_worker_count}-strict)
+    endif()
+    add_test(NAME test-gemmini-exsia-workers${_worker_count}
+        COMMAND $<TARGET_FILE:test-gemmini-exsia-workers${_worker_count}>)
+endforeach()
+add_test(NAME test-gemmini-exsia-profile-contract
+    COMMAND ${CMAKE_COMMAND}
+        -DEXSIA_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
+        -DEXSIA_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/quants/act/exsia/exsia.hpp
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-exsia-profile-contract.cmake)
+
 set(_GGML_GEMMINI_EXSIA_CASES
     all baseline dispatch direct-executor stripe-geometry)
 if (_GGML_GEMMINI_ACTIVATION_BITS_VALUE EQUAL 8 AND
