@@ -3,6 +3,7 @@
 #include "ggml-gemmini-args.h"
 #include "ggml-gemmini-geometry.hpp"
 #include "ggml-gemmini-matmul-config.hpp"
+#include "ggml-gemmini-matmul-cpu-work.hpp"
 #include "ggml-gemmini-telemetry.hpp"
 #include "quants/act/exsia/exsia.hpp"
 #include "residual/rmd/rmd-compose.hpp"
@@ -23,6 +24,10 @@
 #include <thread>
 #include <unordered_set>
 #include <vector>
+
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+#include <gemmini/cycle_reader.hpp>
+#endif
 
 #if !defined(GGML_GEMMINI_CONFIG_HAS_ACTIVATION_QUANT)
 namespace ggml::gemmini::config {
@@ -276,6 +281,24 @@ struct MatmulJobMetrics {
     uint64_t telemetry_merge_start = 0;
     uint64_t telemetry_merge_end = 0;
     uint64_t telemetry_residual_end = 0;
+    MatmulCpuWorkMetrics cpu_work;
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+    cycle::NativeCycleSample telemetry_dense_start_sample;
+    cycle::NativeCycleSample telemetry_dense_end_sample;
+    cycle::NativeCycleSample telemetry_residual_start_sample;
+    cycle::NativeCycleSample telemetry_backend_start_sample;
+    cycle::NativeCycleSample telemetry_backend_end_sample;
+    cycle::NativeCycleSample telemetry_compose_start_sample;
+    cycle::NativeCycleSample telemetry_compose_end_sample;
+    cycle::NativeCycleSample telemetry_finalize_start_sample;
+    cycle::NativeCycleSample telemetry_finalize_end_sample;
+    cycle::NativeCycleSample telemetry_merge_start_sample;
+    cycle::NativeCycleSample telemetry_merge_end_sample;
+    cycle::NativeCycleSample telemetry_residual_end_sample;
+    bool telemetry_dense_marker_only = false;
+    bool telemetry_residual_sampled = false;
+    bool telemetry_residual_end_sampled = false;
+#endif
     std::string telemetry_input_hash;
     std::string telemetry_correction_hash;
     uint64_t telemetry_correction_nonzero_count = 0;
