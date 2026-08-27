@@ -13,6 +13,7 @@ log/
 
 # model source
 gpt2/*
+models/gpt2/*.gguf
 
 #venv files
 
