@@ -2610,12 +2610,19 @@ MatmulExecution prepare_execution(const ggml_gemmini_args_t & args, MatmulOption
 }
 
 MatmulExecution prepare_execution(ggml_gemmini_args_t * args, MatmulOptions options) {
+    if (args != nullptr && options.mode == MatmulInvocationMode::stripe_pipeline) {
+        ggml_gemmini_args_t snapshot = *args;
+        if (std::holds_alternative<quants::act::NoneMeta>(snapshot.act_quant.storage())) {
+            snapshot.act_quant.storage().emplace<quants::act::exsia::Meta>();
+        }
+        return MatmulExecution(std::move(snapshot), options);
+    }
     return MatmulExecution(args, options);
 }
 
 MatmulStatus prepare_execution(ggml_gemmini_args_t & args, const MatmulOptions & options,
                                MatmulExecution & execution) {
-    execution = MatmulExecution(&args, options);
+    execution = prepare_execution(&args, options);
     return execution.status();
 }
 
@@ -3030,13 +3037,58 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
 #if LOG_CYCLE
             job.metrics_.telemetry_merge_start = cycle::read();
 #endif
-            const rmd::RmdStatus status = job.direct_residual_ != nullptr
-                ? rmd::merge_rmd_correction(
-                      job.execution_->facade_.args(), job.input_.row_begin(),
-                      job.input_.row_end(), job.rmd_correction_)
-                : rmd::merge_rmd_correction(
-                      job.execution_->facade_.args(), *job.rmd_packet_,
-                      job.rmd_correction_);
+            ggml_gemmini_args_t merge_args = job.execution_->facade_.args();
+            rmd::RmdStatus status = rmd::RmdStatus::success;
+            if (job.staged_activation_meta_ != nullptr) {
+                merge_args.act_quant = *job.staged_activation_meta_;
+                auto * metadata =
+                    std::get_if<quants::act::exsia::Meta>(&merge_args.act_quant.storage());
+                size_t rows_per_stripe = merge_args.I;
+                size_t metadata_row_begin = 0;
+                size_t metadata_row_end = 0;
+                const size_t max_size = std::numeric_limits<size_t>::max();
+                if (merge_args.tile_I == 0 ||
+                    merge_args.tile_I <= max_size / static_cast<size_t>(DIM)) {
+                    if (merge_args.tile_I != 0) {
+                        rows_per_stripe =
+                            merge_args.tile_I * static_cast<size_t>(DIM);
+                    }
+                    const bool valid_rows =
+                        rows_per_stripe != 0 &&
+                        job.input_.row_begin() <=
+                            max_size - merge_args.activation_row_offset &&
+                        job.input_.row_end() <=
+                            max_size - merge_args.activation_row_offset;
+                    if (valid_rows) {
+                        metadata_row_begin =
+                            merge_args.activation_row_offset + job.input_.row_begin();
+                        metadata_row_end =
+                            merge_args.activation_row_offset + job.input_.row_end();
+                    }
+                    if (metadata == nullptr || metadata->theta.size() != 1 ||
+                        !valid_rows || metadata_row_begin >= metadata_row_end ||
+                        metadata_row_begin / rows_per_stripe !=
+                            (metadata_row_end - 1) / rows_per_stripe) {
+                        status = rmd::RmdStatus::invalid_arguments;
+                    } else {
+                        const int16_t theta = metadata->theta.front();
+                        const size_t stripe = metadata_row_begin / rows_per_stripe;
+                        metadata->theta.assign(
+                            stripe + 1, std::numeric_limits<int16_t>::min());
+                        metadata->theta[stripe] = theta;
+                    }
+                } else {
+                    status = rmd::RmdStatus::invalid_arguments;
+                }
+            }
+            if (status == rmd::RmdStatus::success) {
+                status = job.direct_residual_ != nullptr
+                    ? rmd::merge_rmd_correction(
+                          merge_args, job.input_.row_begin(),
+                          job.input_.row_end(), job.rmd_correction_)
+                    : rmd::merge_rmd_correction(
+                          merge_args, *job.rmd_packet_, job.rmd_correction_);
+            }
             job.metrics_.merge_end_ns = now_ns();
 #if LOG_CYCLE
             job.metrics_.telemetry_merge_end = cycle::read();
