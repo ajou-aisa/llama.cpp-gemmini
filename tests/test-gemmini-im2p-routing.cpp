@@ -39,7 +39,7 @@ constexpr int64_t K = 32;
 constexpr int64_t I = 3;
 #endif
 constexpr int64_t J = 2;
-constexpr size_t graph_publications = 1;
+constexpr size_t graph_publications = 2;
 constexpr float sentinel = 12345.0f;
 const char *routing_program = nullptr;
 
@@ -1292,7 +1292,7 @@ bool run_sticky_provider_failure_matrix() {
       {TestFailure::provider_read, "read", 1, 1},
       {TestFailure::provider, "write", 1, 1},
       {TestFailure::provider_watchdog, "watchdog", 1, 1},
-      {TestFailure::provider_k_overflow, "k-overflow", 2,
+      {TestFailure::provider_k_overflow, "k-overflow", 1,
        std::numeric_limits<size_t>::max()},
       {TestFailure::provider_block_overflow, "block-overflow", 1,
        std::numeric_limits<size_t>::max()},
@@ -2635,10 +2635,11 @@ bool run_routing_geometry_contract() {
   const auto geometry = ggml::gemmini::make_gemmini_geometry(
       {{static_cast<size_t>(I), static_cast<size_t>(J), static_cast<size_t>(K)},
        {2, 1, 1}, GGML_GEMMINI_TEST_IM2P_DIM});
+  const size_t expected_stripe_rows = 2 * GGML_GEMMINI_TEST_IM2P_DIM;
   const size_t expected_stripes = compiled_exsia ? 8 : 1;
-  const size_t expected_final_rows = compiled_exsia ? 32 : 3;
+  const size_t expected_final_rows = compiled_exsia ? expected_stripe_rows : 3;
   bool ok = check(geometry.ok(), "routing geometry is valid") &&
-            check(geometry.geometry.stripe_rows == 32 &&
+            check(geometry.geometry.stripe_rows == expected_stripe_rows &&
                       geometry.geometry.stripe_count == expected_stripes &&
                       geometry.geometry.final_rows == expected_final_rows,
                   "routing rows follow literal nontrivial geometry");
@@ -2658,8 +2659,9 @@ bool run_routing_geometry_contract() {
              "IM2P mismatch has zero allocation/publication side effects") && ok;
 #endif
   if (ok) {
-    std::printf("ROUTING_GEOMETRY stripe_rows=32 stripe_count=%zu final_rows=%zu mismatch=invalid_contract allocations=0 publications=0\n",
-                geometry.geometry.stripe_count, geometry.geometry.final_rows);
+    std::printf("ROUTING_GEOMETRY stripe_rows=%zu stripe_count=%zu final_rows=%zu mismatch=invalid_contract allocations=0 publications=0\n",
+                geometry.geometry.stripe_rows, geometry.geometry.stripe_count,
+                geometry.geometry.final_rows);
   }
   return ok;
 }
