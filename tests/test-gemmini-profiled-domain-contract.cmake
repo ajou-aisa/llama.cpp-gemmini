@@ -78,6 +78,53 @@ if(NOT DEFINED SEMANTIC_CASE OR SEMANTIC_CASE STREQUAL "F2")
     endforeach()
 endif()
 
+# F4: the LocalFoldingPipeline quantization envelope begins in a prepare task
+# and ends in its dependent post task. It retains only the monotonic ns timeline;
+# no scalar or native cycle endpoints may cross that structural task boundary.
+if(NOT DEFINED SEMANTIC_CASE OR SEMANTIC_CASE STREQUAL "F4")
+    string(FIND "${telemetry_source}"
+        "std::string serialize_cycle_telemetry(const QuantizationStripeTelemetry & record)"
+        quant_begin)
+    string(FIND "${telemetry_source}"
+        "std::string serialize_cycle_telemetry(const RmdTelemetryRecord & record)"
+        quant_end)
+    if(quant_begin EQUAL -1 OR quant_end EQUAL -1 OR quant_end LESS quant_begin)
+        message(FATAL_ERROR "F4: quantization scalar serializer is unavailable")
+    endif()
+    math(EXPR quant_length "${quant_end} - ${quant_begin}")
+    string(SUBSTRING "${telemetry_source}" ${quant_begin} ${quant_length} quant_serializer)
+    foreach(required IN ITEMS
+            "detail::null_field(out, \"start\")"
+            "detail::null_field(out, \"end\")"
+            "detail::null_field(out, \"delta\")"
+            "detail::field(out, \"start_ns\", record.start_ns)"
+            "detail::field(out, \"end_ns\", record.end_ns)"
+            "detail::field(out, \"duration_ns\", record.end_ns - record.start_ns)"
+            "detail::string_field(out, \"reason\", \"structurally_cross_task\")")
+        require_present("${quant_serializer}" "${required}"
+            "F4: structural cross-task quantization telemetry")
+    endforeach()
+    foreach(forbidden IN ITEMS
+            "record.end - record.start"
+            "NativeCycleSample"
+            "scalar_provenance_unavailable")
+        require_absent("${quant_serializer}" "${forbidden}"
+            "F4: cross-task cycle arithmetic or provenance")
+    endforeach()
+    require_count("${exsia_source}"
+        "slot\\.mark_quantization_started\\(0, aggregate_now_ns\\(\\)\\)" 3
+        "F4: each pipeline prepare task retains only its ns boundary")
+    require_count("${exsia_source}"
+        "slot\\.mark_quantization_started\\(aggregate_now_tick\\(\\), aggregate_now_ns\\(\\)\\)" 1
+        "F4: non-pipeline scalar-start behavior retains both domains")
+    require_count("${exsia_source}"
+        "aggregate_now_ns\\(\\), aggregate_now_tick\\(\\)" 1
+        "F4: only the non-pipeline end boundary retains its scalar read")
+    require_count("${exsia_source}"
+        "slot\\.mark_folding_committed\\(aggregate_now_ns\\(\\)\\)" 1
+        "F4: pipeline post task retains only its ns boundary")
+endif()
+
 # The canonical pipeline record is the origin/develop nanosecond schema. These
 # names are forbidden there; standalone J-tile, Compose, Finalize, and
 # capture_finish records are deliberately not matched by this list.

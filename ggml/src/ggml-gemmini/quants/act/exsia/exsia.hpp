@@ -380,6 +380,8 @@ namespace ggml::gemmini::quants::act::exsia
         std::optional<StripeMetadataSnapshot> activation_metadata;
         uint64_t quantization_start = 0;
         uint64_t quantization_end = 0;
+        uint64_t quantization_start_ns = 0;
+        uint64_t quantization_end_ns = 0;
         // Residual work for this stripe, or nullptr when the stripe has no residual.
         // The packet owns its buffers, so it stays valid after the ExSIA slot is released.
         ggml::gemmini::rmd::StripePacketHandle rmd_packet;
@@ -583,6 +585,8 @@ namespace ggml::gemmini::quants::act::exsia
         uint64_t folding_commit_ns = 0;
         uint64_t quantization_start = 0;
         uint64_t quantization_end = 0;
+        uint64_t quantization_start_ns = 0;
+        uint64_t quantization_end_ns = 0;
 
 #if EXSIA_BRANCH_COUNTS_ENABLED
         StripeCycleStats cycle_stats;
@@ -638,6 +642,8 @@ namespace ggml::gemmini::quants::act::exsia
             folding_commit_ns = 0;
             quantization_start = 0;
             quantization_end = 0;
+            quantization_start_ns = 0;
+            quantization_end_ns = 0;
 #if EXSIA_BRANCH_COUNTS_ENABLED
             cycle_stats.reset();
 #endif
@@ -691,6 +697,8 @@ namespace ggml::gemmini::quants::act::exsia
             folding_commit_ns = 0;
             quantization_start = 0;
             quantization_end = 0;
+            quantization_start_ns = 0;
+            quantization_end_ns = 0;
 #if EXSIA_BRANCH_COUNTS_ENABLED
             cycle_stats.reset();
 #endif
@@ -711,10 +719,12 @@ namespace ggml::gemmini::quants::act::exsia
             lifecycle = StripePipelineSlotState::LocalFilled;
         }
 
-        void mark_quantization_started(uint64_t start)
+        void mark_quantization_started(uint64_t start,
+                                       uint64_t start_ns = 0)
         {
             assert(lifecycle == StripePipelineSlotState::Acquired);
             quantization_start = start;
+            quantization_start_ns = start_ns;
         }
 
         void mark_folding_committed(uint64_t commit_ns = 0,
@@ -723,6 +733,7 @@ namespace ggml::gemmini::quants::act::exsia
             assert(lifecycle == StripePipelineSlotState::LocalFilled);
             folding_commit_ns = commit_ns;
             quantization_end = quantization_end_tick;
+            quantization_end_ns = commit_ns;
             lifecycle = StripePipelineSlotState::FoldingCommitted;
         }
 

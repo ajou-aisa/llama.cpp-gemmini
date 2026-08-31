@@ -1948,6 +1948,8 @@ namespace ggml::gemmini::quants::act::exsia
                 StripeMetadataSnapshot{meta.e_s, meta.rho, meta.sigma, theta};
             event.quantization_start = slot.quantization_start;
             event.quantization_end = slot.quantization_end;
+            event.quantization_start_ns = slot.quantization_start_ns;
+            event.quantization_end_ns = slot.quantization_end_ns;
             event.rmd_packet = slot.rmd_packet;
             event.direct_residual = slot.direct_residual;
             event.rmd_pack_ns = slot.rmd_pack_ns;
@@ -2080,7 +2082,7 @@ namespace ggml::gemmini::quants::act::exsia
                                                      state_.K_padded, state_.blocks_per_row);
                                 local_workspace_.reset_for_stripe(
                                     s, row_start, row_end, state_.blocks_per_row);
-                                slot.mark_quantization_started(aggregate_now_tick());
+                                slot.mark_quantization_started(0, aggregate_now_ns());
 #if EXSIA_OBSERVATION_ENABLED
                                 LocalParallelStripeObservation &observation =
                                     state_.local_parallel_observations[s];
@@ -2144,7 +2146,7 @@ namespace ggml::gemmini::quants::act::exsia
                                                      state_.K_padded, state_.blocks_per_row);
                                 local_workspace_.reset_for_stripe(
                                     s, row_start, row_end, state_.blocks_per_row);
-                                slot.mark_quantization_started(aggregate_now_tick());
+                                slot.mark_quantization_started(0, aggregate_now_ns());
 #if EXSIA_OBSERVATION_ENABLED
                                 LocalParallelStripeObservation &observation =
                                     state_.local_parallel_observations[s];
@@ -2208,7 +2210,7 @@ namespace ggml::gemmini::quants::act::exsia
                                                      state_.K_padded, state_.blocks_per_row);
                                 local_workspace_.reset_for_stripe(
                                     s, row_start, row_end, state_.blocks_per_row);
-                                slot.mark_quantization_started(aggregate_now_tick());
+                                slot.mark_quantization_started(0, aggregate_now_ns());
 #if EXSIA_OBSERVATION_ENABLED
                                 LocalParallelStripeObservation &observation =
                                     state_.local_parallel_observations[s];
@@ -2467,8 +2469,7 @@ namespace ggml::gemmini::quants::act::exsia
                                         }
                                         else
                                         {
-                                            slot.mark_folding_committed(
-                                                aggregate_now_ns(), aggregate_now_tick());
+                                            slot.mark_folding_committed(aggregate_now_ns());
                                             if (!snapshot_validation_mask(s, slot.stripe.outlier_mask))
                                             {
                                                 record_failure(ExSIAState::FailureCode::ValidationSnapshotFailure, s);
@@ -2537,7 +2538,7 @@ namespace ggml::gemmini::quants::act::exsia
             slot.reset_for_stripe(s, row_start, row_end,
                                   state_.K_padded, state_.blocks_per_row);
             local_workspace_.reset_for_stripe(s, row_start, row_end, state_.blocks_per_row);
-            slot.mark_quantization_started(aggregate_now_tick());
+            slot.mark_quantization_started(aggregate_now_tick(), aggregate_now_ns());
             StripeState &stripe = slot.stripe;
             EXSIA_PROFILE_COLLECT(
             StripeProfileRecord &profile = stripe_profiles[s];

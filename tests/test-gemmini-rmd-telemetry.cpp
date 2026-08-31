@@ -171,25 +171,24 @@ bool aggregate_serializer_fixtures() {
     quantization.layer = "blk.15.mlp.down_proj"; quantization.run_id = 17;
     quantization.stripe_id = 2; quantization.slot = 1;
     quantization.row_begin = 80; quantization.row_end = 160;
-    quantization.start = 90; quantization.end = 108;
+    quantization.start_ns = 90; quantization.end_ns = 108;
+    cycle::reset_read_count_for_test();
     const std::string quantization_json = serialize_cycle_telemetry(quantization);
-    QuantizationStripeTelemetry wrapped_quantization = quantization;
-    wrapped_quantization.start = std::numeric_limits<std::uint64_t>::max() - 2;
-    wrapped_quantization.end = 3;
-    const std::string wrapped_quantization_json =
-        serialize_cycle_telemetry(wrapped_quantization);
+    const std::uint64_t quantization_cycle_reads = cycle::read_count_for_test();
+    QuantizationStripeTelemetry second_quantization = quantization;
+    second_quantization.start_ns = 190;
+    second_quantization.end_ns = 208;
+    const std::string second_quantization_json =
+        serialize_cycle_telemetry(second_quantization);
     const std::string expected_quantization =
         std::string("{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"QUANTIZATION_STRIPE_TELEMETRY\",") +
-        expected_native_fields + ",\"op\":\"exsia.quantize\","
+        "\"source\":\"" + kNativeCycleSource + "\",\"unit\":\"" + kNativeCycleUnit +
+        "\",\"op\":\"exsia.quantize\","
         "\"layer\":\"blk.15.mlp.down_proj\",\"run_id\":17,\"stripe_id\":2,\"slot\":1,"
         "\"node_id\":null,\"worker_id\":null,\"row_begin\":80,\"row_end\":160,"
-#if defined(__linux__) && defined(__aarch64__)
-        "\"start\":90,\"end\":108,\"delta\":null,\"valid\":false,"
-        "\"reason\":\"scalar_provenance_unavailable\","
-#else
-        "\"start\":90,\"end\":108,\"delta\":18,"
-#endif
-        "\"overlaps_rtl\":true,\"additive\":false}";
+        "\"start\":null,\"end\":null,\"delta\":null,\"valid\":false,"
+        "\"reason\":\"structurally_cross_task\",\"start_ns\":90,\"end_ns\":108,"
+        "\"duration_ns\":18,\"overlaps_rtl\":true,\"additive\":false}";
 
     PipelineStripeTelemetry pipeline{};
     pipeline.layer = "ffn"; pipeline.run_id = 7; pipeline.stripe_id = 2;
@@ -212,12 +211,12 @@ bool aggregate_serializer_fixtures() {
         std::printf("%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n", interval_json.c_str(), ws_json.c_str(),
                     rtl_json.c_str(), malformed_rtl_json.c_str(), empty_rtl_json.c_str(), stripe_json.c_str(),
                     overlap_stripe_json.c_str(), zero_stripe_json.c_str(), wrapped_stripe_json.c_str(),
-                    quantization_json.c_str(), wrapped_quantization_json.c_str(), pipeline_json.c_str());
+                    quantization_json.c_str(), second_quantization_json.c_str(), pipeline_json.c_str());
     }
 #if !LOG_CYCLE
     return expect(interval_json.empty() && ws_json.empty() && rtl_json.empty() && stripe_json.empty() &&
                       overlap_stripe_json.empty() && zero_stripe_json.empty() && wrapped_stripe_json.empty() &&
-                      quantization_json.empty() && wrapped_quantization_json.empty() && pipeline_json.empty(),
+                      quantization_json.empty() && second_quantization_json.empty() && pipeline_json.empty(),
                   "cycle-off suppresses every aggregate serializer");
 #else
     return expect(interval_json == expected_interval, "cycle interval exact schema") &&
@@ -240,14 +239,13 @@ bool aggregate_serializer_fixtures() {
         expect(wrapped_stripe_json == expected_wrapped_stripe,
                "RTL stripe wrapped latency uses unsigned endpoint subtraction") &&
         expect(quantization_json == expected_quantization,
-               "quantization stripe schema preserves host timing and SIM correlation keys") &&
-#if defined(__linux__) && defined(__aarch64__)
-        expect(wrapped_quantization_json.find("\"delta\":null,\"valid\":false") != std::string::npos,
-               "Jetson scalar-only quantization stripe fails closed") &&
-#else
-        expect(wrapped_quantization_json.find("\"delta\":6") != std::string::npos,
-               "quantization stripe delta uses unsigned endpoint subtraction") &&
-#endif
+               "cross-task quantization cycles are unavailable while ns stays exact") &&
+        expect(quantization_cycle_reads == 0,
+               "quantization serialization performs zero cross-task cycle reads") &&
+        expect(second_quantization_json.find("\"delta\":null") != std::string::npos &&
+                   second_quantization_json.find("\"duration_ns\":18") != std::string::npos &&
+                   second_quantization_json.find("quantize_total") == std::string::npos,
+               "each stripe retains ns without manufacturing a canonical cycle total") &&
         expect(pipeline_json == expected_pipeline, "pipeline exact schema remains host-nanosecond-only") &&
         [&] {
             const std::uint64_t first_generic_run_id = quants::act::exsia::next_exsia_run_id();
@@ -282,7 +280,7 @@ bool aggregate_cycle_sink_fixtures() {
     Im2pStripeTelemetry stripe{}; stripe.layer = "blk.15.mlp.down_proj"; stripe.run_id = 17;
     stripe.row_end = 1; stripe.completion_cycle = 1;
     QuantizationStripeTelemetry quantization{}; quantization.layer = "blk.15.mlp.down_proj";
-    quantization.run_id = 17; quantization.row_end = 1; quantization.end = 1;
+    quantization.run_id = 17; quantization.row_end = 1; quantization.end_ns = 1;
     PipelineStripeTelemetry pipeline{}; pipeline.layer = "driver"; pipeline.row_end = 1;
     const RmdTelemetryRecord rmd = cpu_record();
     emit_cycle_telemetry(interval);
@@ -341,7 +339,7 @@ bool run_aggregate_driver(const std::filesystem::path & cycle_path) {
     WsLoopTelemetry ws{}; ws.containing_interval_cycles = 10; ws.loop_occupancy_cycles = 4;
     Im2pExecutionTelemetry rtl{}; rtl.mode = "full";
     Im2pStripeTelemetry stripe{}; stripe.row_end = 1; stripe.completion_cycle = 1;
-    QuantizationStripeTelemetry quantization{}; quantization.row_end = 1; quantization.end = 1;
+    QuantizationStripeTelemetry quantization{}; quantization.row_end = 1; quantization.end_ns = 1;
     PipelineStripeTelemetry pipeline{}; pipeline.layer = "driver"; pipeline.row_end = 1;
     emit_cycle_telemetry(interval); emit_cycle_telemetry(ws); emit_cycle_telemetry(rtl);
     emit_cycle_telemetry(stripe); emit_cycle_telemetry(quantization);

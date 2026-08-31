@@ -119,8 +119,8 @@ struct QuantizationStripeTelemetry {
     std::uint64_t slot = 0;
     std::uint64_t row_begin = 0;
     std::uint64_t row_end = 0;
-    std::uint64_t start = 0;
-    std::uint64_t end = 0;
+    std::uint64_t start_ns = 0;
+    std::uint64_t end_ns = 0;
 };
 
 struct PipelineStripeTelemetry {

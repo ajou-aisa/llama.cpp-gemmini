@@ -171,14 +171,14 @@ std::string serialize_cycle_telemetry(const QuantizationStripeTelemetry & record
     detail::null_field(out, "worker_id");
     detail::field(out, "row_begin", record.row_begin);
     detail::field(out, "row_end", record.row_end);
-    detail::field(out, "start", record.start);
-    detail::field(out, "end", record.end);
-#if defined(__linux__) && defined(__aarch64__)
+    detail::null_field(out, "start");
+    detail::null_field(out, "end");
     detail::null_field(out, "delta");
-    out << ",\"valid\":false,\"reason\":\"scalar_provenance_unavailable\"";
-#else
-    detail::field(out, "delta", record.end - record.start);
-#endif
+    out << ",\"valid\":false";
+    detail::string_field(out, "reason", "structurally_cross_task");
+    detail::field(out, "start_ns", record.start_ns);
+    detail::field(out, "end_ns", record.end_ns);
+    detail::field(out, "duration_ns", record.end_ns - record.start_ns);
     out << ",\"overlaps_rtl\":true,\"additive\":false}";
     return out.str();
 #endif
