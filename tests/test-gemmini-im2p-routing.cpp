@@ -12,6 +12,10 @@
 #include "quants/act/quantize.hpp"
 #include "residual/direct/direct-executor.hpp"
 #include <gemmini/cycle_reader.hpp>
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+#include <gemmini/log.h>
+#include "../ggml/src/ggml-gemmini-utils/src/cycle_reader_internal.h"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -48,6 +52,29 @@ bool check(bool condition, const char *message) {
     std::fprintf(stderr, "FAIL: %s\n", message);
   }
   return condition;
+}
+
+bool run_cpu_cycle_invalid_reason_probe() {
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+  const gemmini_native_cycle_sample_internal start{
+      100, 1, GEMMINI_NATIVE_CYCLE_REASON_NONE,
+      GEMMINI_NATIVE_CYCLE_SOURCE_LINUX_PERF_CPU_CYCLES, 41, 7};
+  const gemmini_native_cycle_sample_internal end{
+      120, 1, GEMMINI_NATIVE_CYCLE_REASON_NONE,
+      GEMMINI_NATIVE_CYCLE_SOURCE_LINUX_PERF_CPU_CYCLES, 42, 7};
+  const gemmini_cycle_record_v2 record{
+      {"im2p-cycle-invalid-probe", "im2p_cycle_invalid_reason_probe",
+       start.value, end.value, nullptr, 0, nullptr},
+      GEMMINI_CYCLE_HAS_RUN_ID | GEMMINI_CYCLE_HAS_STRIPE_ID |
+          GEMMINI_CYCLE_HAS_SLOT,
+      71, 2, 0, 0, 0};
+  const auto reason = gemmini_log_cycle_record_v2_checked_internal(
+      &record, &start, &end, 1);
+  return check(reason == GEMMINI_NATIVE_CYCLE_REASON_EVENT_OWNER_MISMATCH,
+               "checked cycle probe preserves an injected owner mismatch");
+#else
+  return true;
+#endif
 }
 
 bool run_graph_overhead_regression() {
@@ -942,6 +969,51 @@ IntegratedLifecycleResult run_integrated_exsia_lifecycle(
   }
   ggml_free(context);
   return result;
+}
+
+bool run_cpu_cycle_route_case(std::string_view selected) {
+  const bool full = selected.find("cycle-full-") == 0;
+  const bool empty = selected.find("empty") != std::string_view::npos;
+  const bool packet = empty ||
+      selected.find("packet") != std::string_view::npos;
+  const TestFailure failure =
+      selected.find("compose-failure") != std::string_view::npos
+          ? TestFailure::compose
+          : selected.find("output-failure") != std::string_view::npos
+                ? TestFailure::output_copy
+                : TestFailure::none;
+  const auto result = run_integrated_exsia_lifecycle(
+      2 * GGML_GEMMINI_TEST_IM2P_DIM + 1, 1, LifecycleFamily::h1,
+      packet ? LifecycleBackend::compact_ws : LifecycleBackend::cpu_direct,
+      full ? PublicMode::full : PublicMode::stripe_pipeline, failure, empty);
+  const bool expected_success = failure == TestFailure::none;
+  const bool ok =
+      check(result.ok == expected_success,
+            "cycle route reaches its expected terminal result") &&
+      check(result.semantic_layer_observed,
+            "cycle route preserves the real semantic layer") &&
+      check(result.counters.full == (full ? 1U : 0U) &&
+                result.counters.pipeline == (full ? 0U : 1U),
+            "cycle route selects exactly one public mode") &&
+      check(result.counters.commit == (expected_success ? 1U : 0U),
+            "cycle route commits exactly once only on success") &&
+      check(expected_success || all_sentinel(result.output),
+            "cycle route failure preserves the output sentinel") &&
+      check(result.counters.hardware == 0 && result.counters.fallback == 0 &&
+                result.counters.live_runs == 0 &&
+                result.counters.live_residual_simulators == 0,
+            "cycle route has no fallback or leaked run");
+  if (ok) {
+    std::printf(
+        "IM2P_CPU_CYCLE_ROUTE selector=%.*s mode=%s backend=%s empty=%u "
+        "failure=%u stripes=3 commit=%llu result=PASS\n",
+        static_cast<int>(selected.size()), selected.data(),
+        full ? "FULL" : "STRIPE_PIPELINE",
+        packet ? "compact_ws" : "cpu_direct", empty ? 1U : 0U,
+        static_cast<unsigned>(failure),
+        static_cast<unsigned long long>(result.counters.commit));
+  }
+  return ok;
 }
 
 #if !GGML_GEMMINI_ENABLE_RMD
@@ -2827,6 +2899,10 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::string_view(argv[1]) == "--stats-translation") {
     return run_stats_translation_contract() ? 0 : 1;
   }
+  if (argc == 3 && std::string_view(argv[1]) == "--case" &&
+      std::string_view(argv[2]) == "cycle-invalid-reason") {
+    return run_cpu_cycle_invalid_reason_probe() ? 0 : 1;
+  }
 #if GGML_GEMMINI_ACTIVATION_QUANT == 0
   if (argc == 2 && std::string_view(argv[1]) == "--publication-boundary") {
     return run_exsia_publication_boundary() ? 0 : 1;
@@ -2932,6 +3008,9 @@ int main(int argc, char **argv) {
       selected_ok = run_exsia_staged_failure(TestFailure::output_copy);
     } else if (selected == "blocked-producer-fence-failure") {
       selected_ok = run_exsia_blocked_submit_failure();
+    } else if (selected.find("cycle-full-") == 0 ||
+               selected.find("cycle-pipeline-") == 0) {
+      selected_ok = run_cpu_cycle_route_case(selected);
     } else {
       std::fprintf(stderr, "unsupported test case: %s\n", argv[2]);
       return 2;
@@ -2941,6 +3020,13 @@ int main(int argc, char **argv) {
     unsetenv("GEMMINI_STRIPE_JOB_CAPACITY");
     return selected_ok ? 0 : 1;
 #else
+    const std::string_view selected(argv[2]);
+    if (selected == "cycle-simple-full") {
+      return run_success_mode("FULL") ? 0 : 1;
+    }
+    if (selected == "cycle-simple-full-fence-failure") {
+      return run_fence_failure("FULL") ? 0 : 1;
+    }
     std::fprintf(stderr, "unsupported test case: %s\n", argv[2]);
     return 2;
 #endif

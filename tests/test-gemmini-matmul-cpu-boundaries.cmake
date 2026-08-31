@@ -93,6 +93,26 @@ function(require_checked_publication value operation eligibility label)
         "${label} publication must remain outside the canonical summary")
 endfunction()
 
+function(require_unidentified_checked_pair value operation target label)
+    require_count("${value}" "cycle::read_sample()" 2 "${label} native endpoints")
+    require_count("${value}" "gemmini_log_cycle_record_v2_checked_internal" 1
+        "${label} checked publication")
+    require_count("${value}" "\"${operation}\"" 1 "${label} operation label")
+    require_order("${value}" "${label} exact boundary"
+        "cycle::read_sample()" "${target}" "const gemmini_cycle_record_v2"
+        "gemmini_log_cycle_record_v2_checked_internal")
+    foreach(token IN ITEMS "args().matmul_layer.empty()" "args().matmul_layer.c_str()"
+                           "}, 0, 0, 0, 0, 0, 0}" ", true);")
+        require_token("${value}" "${token}" "${label} publication contract")
+    endforeach()
+    foreach(token IN ITEMS GEMMINI_CYCLE_HAS_RUN_ID GEMMINI_CYCLE_HAS_STRIPE_ID
+                           GEMMINI_CYCLE_HAS_SLOT GEMMINI_CYCLE_HAS_NODE_ID
+                           GEMMINI_CYCLE_HAS_WORKER_ID run_id stripe_id worker_id
+                           "cycle::read()" now_ns timestamp_ns)
+        require_absent("${value}" "${token}" "${label} synthetic identity/domain")
+    endforeach()
+endfunction()
+
 function(require_cycle_only_detail_blocks value label)
     set(rest "${value}")
     while(1)
@@ -114,7 +134,9 @@ function(require_cycle_only_detail_blocks value label)
     endwhile()
 endfunction()
 
+extract_between(commit "void MatMul::commit_output_transaction" "void MatMul::discard_output_transaction")
 extract_between(run_full "MatMulResult MatMul::run_full" "MatMulStatus MatMul::begin_stripes")
+extract_between(finish_stripes "MatMulStatus MatMul::finish_stripes" "MatMulCapability MatMul::stripe_capability")
 extract_between(compose "MatmulStatus compose_rmd_stripe" "MatmulStatus finalize_stripe")
 extract_between(finalize "MatmulStatus finalize_stripe" "MatmulStatus finish_execution")
 
@@ -128,6 +150,72 @@ foreach(token IN ITEMS "add_nullable_string(\"op\"" "add_identity(\"run_id\""
     require_token("${cycle_serialization}" "${token}"
         "checked sink machine-consumed nullable fields contract")
 endforeach()
+
+# U12 is only the normal FULL/decode CPU_DIRECT Merge callsite. The stripe
+# finalizer's compatibility scalar Merge remains separate and must not acquire
+# this checked label.
+string(FIND "${run_full}" "if (args().residual_route == residual::ResidualRoute::cpu_direct)" direct_begin)
+string(FIND "${run_full}" "    } else {" packet_begin)
+if(direct_begin EQUAL -1 OR packet_begin EQUAL -1 OR packet_begin LESS_EQUAL direct_begin)
+    message(FATAL_ERROR "cannot isolate normal FULL CPU_DIRECT route")
+endif()
+math(EXPR direct_length "${packet_begin} - ${direct_begin}")
+string(SUBSTRING "${run_full}" ${direct_begin} ${direct_length} direct_full)
+require_unidentified_checked_pair("${direct_full}" "rmd_merge_cycles"
+    "rmd::merge_rmd_correction" "U12 normal FULL CPU_DIRECT Merge")
+require_order("${direct_full}" "U12 success-only callsite guard"
+    "if (residual_status == rmd::RmdStatus::success)"
+    "merge_start_sample = cycle::read_sample()" "rmd::merge_rmd_correction"
+    "merge_end_sample = cycle::read_sample()"
+    "gemmini_log_cycle_record_v2_checked_internal"
+    "if (residual_status != rmd::RmdStatus::success)")
+require_absent("${finalize}" "\"rmd_merge_cycles\""
+    "U12 must not duplicate stripe finalize Merge")
+
+# U14 and U15 each wrap only their route-local O(I*J) finite scan. A false
+# validation result still publishes the structurally executed interval.
+string(FIND "${run_full}" "finite_start_sample = cycle::read_sample()" full_validate)
+if(full_validate EQUAL -1)
+    message(FATAL_ERROR "U14 FULL finite validation is missing")
+endif()
+string(SUBSTRING "${run_full}" ${full_validate} -1 full_epilogue)
+require_unidentified_checked_pair("${full_epilogue}"
+    "matmul_finite_output_validate_cycles" "finite_output(args())"
+    "U14 normal FULL finite validation")
+require_order("${full_epilogue}" "U14 validation result after publication"
+    "finite_start_sample = cycle::read_sample()" "finite_output(args())"
+    "finite_end_sample = cycle::read_sample()"
+    "gemmini_log_cycle_record_v2_checked_internal" "if (!finite)")
+
+string(FIND "${finish_stripes}" "finite_start_sample = cycle::read_sample()" stripe_validate)
+if(stripe_validate EQUAL -1)
+    message(FATAL_ERROR "U15 stripe finite validation is missing")
+endif()
+string(SUBSTRING "${finish_stripes}" ${stripe_validate} -1 stripe_epilogue)
+require_unidentified_checked_pair("${stripe_epilogue}"
+    "matmul_finite_output_validate_cycles" "finite_output(args())"
+    "U15 finish-stripes finite validation")
+require_order("${stripe_epilogue}" "U15 validation result after publication"
+    "finite_start_sample = cycle::read_sample()" "finite_output(args())"
+    "finite_end_sample = cycle::read_sample()"
+    "gemmini_log_cycle_record_v2_checked_internal" "if (!finite)")
+
+# U16 wraps only the normal facade's logical transaction copy. Early bypass
+# returns before the first endpoint; state cleanup remains after publication.
+require_unidentified_checked_pair("${commit}" "matmul_output_commit_cycles"
+    "for (size_t row = 0; row < args().I; ++row)" "U16 output commit copy")
+require_order("${commit}" "U16 success-only commit boundary"
+    "if (output_destination_ == nullptr || args_ptr_ == nullptr) return"
+    "commit_start_sample = cycle::read_sample()"
+    "for (size_t row = 0; row < args().I; ++row)"
+    "commit_end_sample = cycle::read_sample()"
+    "gemmini_log_cycle_record_v2_checked_internal"
+    "args().f_out = output_destination_")
+require_count("${source}" "\"rmd_merge_cycles\"" 1 "exact U12 label/site count")
+require_count("${source}" "\"matmul_finite_output_validate_cycles\"" 2
+    "exact U14/U15 label/site count")
+require_count("${source}" "\"matmul_output_commit_cycles\"" 1
+    "exact U16 label/site count")
 
 # One full packet Compose pair. Direct/no-packet Compose exits structurally
 # before the start sample; operation failures still close the pair before they

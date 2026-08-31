@@ -1302,12 +1302,28 @@ MatMulStatus MatMul::begin_output_transaction() {
 
 void MatMul::commit_output_transaction() {
     if (output_destination_ == nullptr || args_ptr_ == nullptr) return;
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+    const cycle::NativeCycleSample commit_start_sample = cycle::read_sample();
+#endif
     for (size_t row = 0; row < args().I; ++row) {
         for (size_t column = 0; column < args().J; ++column) {
             const size_t offset = row * output_row_stride_ + column * output_col_stride_;
             output_destination_[offset] = output_stage_[offset];
         }
     }
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+    const cycle::NativeCycleSample commit_end_sample = cycle::read_sample();
+    const gemmini_native_cycle_sample_internal commit_start =
+        project_native_sample(commit_start_sample);
+    const gemmini_native_cycle_sample_internal commit_end =
+        project_native_sample(commit_end_sample);
+    const gemmini_cycle_record_v2 commit_detail{{
+        args().matmul_layer.empty() ? nullptr : args().matmul_layer.c_str(),
+        "matmul_output_commit_cycles", commit_start.value, commit_end.value,
+        nullptr, 0, nullptr}, 0, 0, 0, 0, 0, 0};
+    gemmini_log_cycle_record_v2_checked_internal(
+        &commit_detail, &commit_start, &commit_end, true);
+#endif
     args().f_out = output_destination_;
     output_destination_ = nullptr;
     output_row_stride_ = 0;
@@ -1445,8 +1461,24 @@ MatMulResult MatMul::run_full() {
                     return residual::execute_direct_stripe(args(), *payload, correction);
                 })();
             if (residual_status == rmd::RmdStatus::success) {
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+                const cycle::NativeCycleSample merge_start_sample = cycle::read_sample();
+#endif
                 residual_status = rmd::merge_rmd_correction(
                     args(), payload->row_begin, row_end, correction);
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+                const cycle::NativeCycleSample merge_end_sample = cycle::read_sample();
+                const gemmini_native_cycle_sample_internal merge_start =
+                    project_native_sample(merge_start_sample);
+                const gemmini_native_cycle_sample_internal merge_end =
+                    project_native_sample(merge_end_sample);
+                const gemmini_cycle_record_v2 merge_detail{{
+                    args().matmul_layer.empty() ? nullptr : args().matmul_layer.c_str(),
+                    "rmd_merge_cycles", merge_start.value, merge_end.value,
+                    nullptr, 0, nullptr}, 0, 0, 0, 0, 0, 0};
+                gemmini_log_cycle_record_v2_checked_internal(
+                    &merge_detail, &merge_start, &merge_end, true);
+#endif
             }
             if (residual_status != rmd::RmdStatus::success) break;
         }
@@ -1475,7 +1507,24 @@ MatMulResult MatMul::run_full() {
                  MatMulCapability::unsupported };
     }
 #endif
-    if (!finite_output(args())) {
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+    const cycle::NativeCycleSample finite_start_sample = cycle::read_sample();
+#endif
+    const bool finite = finite_output(args());
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+    const cycle::NativeCycleSample finite_end_sample = cycle::read_sample();
+    const gemmini_native_cycle_sample_internal finite_start =
+        project_native_sample(finite_start_sample);
+    const gemmini_native_cycle_sample_internal finite_end =
+        project_native_sample(finite_end_sample);
+    const gemmini_cycle_record_v2 finite_detail{{
+        args().matmul_layer.empty() ? nullptr : args().matmul_layer.c_str(),
+        "matmul_finite_output_validate_cycles", finite_start.value, finite_end.value,
+        nullptr, 0, nullptr}, 0, 0, 0, 0, 0, 0};
+    gemmini_log_cycle_record_v2_checked_internal(
+        &finite_detail, &finite_start, &finite_end, true);
+#endif
+    if (!finite) {
         discard_output_transaction();
         return {MatMulStatus::invalid_contract, MatMulCapability::unsupported};
     }
@@ -1593,7 +1642,24 @@ MatMulStatus MatMul::finish_stripes() {
         state_ = MatMulState::idle;
         return MatMulStatus::missing_stripes;
     }
-    if (!finite_output(args())) {
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+    const cycle::NativeCycleSample finite_start_sample = cycle::read_sample();
+#endif
+    const bool finite = finite_output(args());
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+    const cycle::NativeCycleSample finite_end_sample = cycle::read_sample();
+    const gemmini_native_cycle_sample_internal finite_start =
+        project_native_sample(finite_start_sample);
+    const gemmini_native_cycle_sample_internal finite_end =
+        project_native_sample(finite_end_sample);
+    const gemmini_cycle_record_v2 finite_detail{{
+        args().matmul_layer.empty() ? nullptr : args().matmul_layer.c_str(),
+        "matmul_finite_output_validate_cycles", finite_start.value, finite_end.value,
+        nullptr, 0, nullptr}, 0, 0, 0, 0, 0, 0};
+    gemmini_log_cycle_record_v2_checked_internal(
+        &finite_detail, &finite_start, &finite_end, true);
+#endif
+    if (!finite) {
         discard_output_transaction();
         state_ = MatMulState::idle;
         return MatMulStatus::invalid_contract;
