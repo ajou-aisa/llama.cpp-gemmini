@@ -9,6 +9,10 @@
 
 #include <gemmini/cycle_reader.hpp>
 #include <gemmini/log.hpp>
+#if defined(__linux__) && defined(__aarch64__) && CYCLE_DETAIL
+#include <gemmini/log.h>
+#include "../../../../ggml-gemmini-utils/src/cycle_reader_internal.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -1926,11 +1930,13 @@ namespace ggml::gemmini::quants::act::exsia
 #endif
             return true;
         };
-        const auto notify_stripe_ready = [&](StripePipelineSlot &slot, uint64_t run_id
+        const auto notify_stripe_ready = [&](StripePipelineSlot &slot, uint64_t run_id,
+                                             bool measure_stripe_ready_handoff
 #if EXSIA_PROFILE_COLLECTION_ENABLED
                                              , const StripeProfileRecord *profile
 #endif
                                              ) {
+            (void) measure_stripe_ready_handoff;
             if (sink == nullptr || sink->on_ready == nullptr)
                 return true;
 
@@ -1966,9 +1972,45 @@ namespace ggml::gemmini::quants::act::exsia
             }
 #endif
             event.folding_commit_ns = slot.folding_commit_ns;
+#if defined(__linux__) && defined(__aarch64__) && CYCLE_DETAIL
+            ggml::gemmini::cycle::NativeCycleSample stripe_ready_handoff_start{};
+            if (measure_stripe_ready_handoff)
+                stripe_ready_handoff_start = ggml::gemmini::cycle::read_sample();
+#endif
             const bool accepted = sink->on_ready(
                 sink->user_data,
                 event);
+#if defined(__linux__) && defined(__aarch64__) && CYCLE_DETAIL
+            if (measure_stripe_ready_handoff)
+            {
+                const auto stripe_ready_handoff_end = ggml::gemmini::cycle::read_sample();
+                const gemmini_native_cycle_sample_internal stripe_ready_handoff_start_sample{
+                    stripe_ready_handoff_start.value,
+                    static_cast<uint8_t>(stripe_ready_handoff_start.valid),
+                    static_cast<uint8_t>(stripe_ready_handoff_start.reason),
+                    GEMMINI_NATIVE_CYCLE_SOURCE_LINUX_PERF_CPU_CYCLES,
+                    stripe_ready_handoff_start.owner_event_token,
+                    stripe_ready_handoff_start.generation};
+                const gemmini_native_cycle_sample_internal stripe_ready_handoff_end_sample{
+                    stripe_ready_handoff_end.value,
+                    static_cast<uint8_t>(stripe_ready_handoff_end.valid),
+                    static_cast<uint8_t>(stripe_ready_handoff_end.reason),
+                    GEMMINI_NATIVE_CYCLE_SOURCE_LINUX_PERF_CPU_CYCLES,
+                    stripe_ready_handoff_end.owner_event_token,
+                    stripe_ready_handoff_end.generation};
+                const gemmini_cycle_record_v2 stripe_ready_handoff_record{
+                    {layer, "exsia.stripe_ready_handoff",
+                     stripe_ready_handoff_start.value,
+                     stripe_ready_handoff_end.value,
+                     nullptr, 0, nullptr},
+                    GEMMINI_CYCLE_HAS_RUN_ID | GEMMINI_CYCLE_HAS_STRIPE_ID |
+                        GEMMINI_CYCLE_HAS_SLOT,
+                    event.run_id, event.stripe_id, event.slot, 0, 0};
+                gemmini_log_cycle_record_v2_checked_internal(
+                    &stripe_ready_handoff_record, &stripe_ready_handoff_start_sample,
+                    &stripe_ready_handoff_end_sample, 1);
+            }
+#endif
             return accepted;
         };
 #if defined(GGML_GEMMINI_HAS_OPENMP)
@@ -2484,12 +2526,16 @@ namespace ggml::gemmini::quants::act::exsia
                                                     pipeline_ok.store(false, std::memory_order_relaxed);
                                                 }
                                                 )
-                                                if (pipeline_ok.load(std::memory_order_relaxed) &&
-                                                    !notify_stripe_ready(slot, run_id
+                                                bool stripe_ready_accepted = true;
+                                                if (pipeline_ok.load(std::memory_order_relaxed))
+                                                {
+                                                    stripe_ready_accepted = notify_stripe_ready(slot, run_id, true
 #if EXSIA_PROFILE_COLLECTION_ENABLED
-                                                                          , &profile
+                                                                                               , &profile
 #endif
-                                                                          ))
+                                                                                               );
+                                                }
+                                                if (!stripe_ready_accepted)
                                                 {
                                                     record_failure(ExSIAState::FailureCode::StripeReadySinkFailure, s);
                                                     pipeline_ok.store(false, std::memory_order_relaxed);
@@ -2823,7 +2869,7 @@ namespace ggml::gemmini::quants::act::exsia
 #if EXSIA_STAGE_PROFILE_ENABLED
             profile.stats = slot.cycle_stats;
 #endif
-            if (!notify_stripe_ready(slot, run_id
+            if (!notify_stripe_ready(slot, run_id, false
 #if EXSIA_PROFILE_COLLECTION_ENABLED
                                      , &profile
 #endif

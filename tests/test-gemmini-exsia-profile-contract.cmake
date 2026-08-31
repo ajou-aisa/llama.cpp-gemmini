@@ -73,4 +73,57 @@ if(NOT source MATCHES "checked_profile_interval[\n\r ]*\\([\n\r ]*const ProfileI
     message(FATAL_ERROR "individual ExSIA provenance validator is unavailable")
 endif()
 
-message(STATUS "ExSIA individual profile source contract passed")
+# The pipeline stripe-ready callback is a same-task handoff leaf. Its checked
+# pair must remain adjacent to only the callback, carry real identity, and stay
+# independent from callback acceptance. The non-pipeline callback is excluded.
+require_count("${source}"
+    "stripe_ready_handoff_start = ggml::gemmini::cycle::read_sample\\(\\)"
+    1 "pipeline stripe-ready handoff performs one native start read")
+require_count("${source}"
+    "stripe_ready_handoff_end = ggml::gemmini::cycle::read_sample\\(\\)"
+    1 "pipeline stripe-ready handoff performs one native end read")
+require_count("${source}" "exsia\\.stripe_ready_handoff" 1
+    "pipeline stripe-ready handoff has one detail label")
+require_count("${source}"
+    "GEMMINI_CYCLE_HAS_RUN_ID[ ]*[|][ ]*GEMMINI_CYCLE_HAS_STRIPE_ID[ ]*[|][\n\r ]*[ ]*GEMMINI_CYCLE_HAS_SLOT"
+    1 "pipeline stripe-ready handoff carries run stripe and slot identity")
+require_count("${source}"
+    "gemmini_log_cycle_record_v2_checked_internal\\([\n\r ]*[ ]*&stripe_ready_handoff_record,[ ]*&stripe_ready_handoff_start_sample,[\n\r ]*[ ]*&stripe_ready_handoff_end_sample,[ ]*1\\)"
+    1 "pipeline stripe-ready handoff is structurally same-owner checked")
+string(FIND "${source}"
+    "if (sink == nullptr || sink->on_ready == nullptr)\n                return true;"
+    absent_callback_return)
+if(absent_callback_return EQUAL -1)
+    message(FATAL_ERROR "absent stripe-ready callback must return before the handoff pair")
+endif()
+require_count("${source}" "notify_stripe_ready\\(slot, run_id, true" 1
+    "pipeline notify enables one handoff pair")
+require_count("${source}" "notify_stripe_ready\\(slot, run_id, false" 1
+    "non-pipeline notify disables the handoff pair")
+string(FIND "${source}" "if (theta == std::numeric_limits<int16_t>::min())" theta_guard)
+string(FIND "${source}" "stripe_ready_handoff_start = ggml::gemmini::cycle::read_sample()" handoff_start)
+string(FIND "${source}" "const bool accepted = sink->on_ready(" handoff_callback)
+string(FIND "${source}" "stripe_ready_handoff_end = ggml::gemmini::cycle::read_sample()" handoff_end)
+string(FIND "${source}" "slot.release();" slot_release)
+if(theta_guard EQUAL -1 OR handoff_start EQUAL -1 OR handoff_callback EQUAL -1 OR
+   handoff_end EQUAL -1 OR slot_release EQUAL -1 OR
+   NOT (theta_guard LESS handoff_start AND handoff_start LESS handoff_callback AND
+   handoff_callback LESS handoff_end AND handoff_end LESS slot_release))
+    message(FATAL_ERROR "stripe-ready native pair must follow validation and wrap only sink->on_ready")
+endif()
+math(EXPR pre_callback_length "${handoff_callback} - ${handoff_start}")
+string(SUBSTRING "${source}" ${handoff_start} ${pre_callback_length} pre_callback_body)
+if(pre_callback_body MATCHES "return")
+    message(FATAL_ERROR "stripe-ready pair permits a no-invocation early return")
+endif()
+math(EXPR handoff_length "${handoff_end} - ${handoff_start}")
+string(SUBSTRING "${source}" ${handoff_start} ${handoff_length} handoff_body)
+foreach(forbidden IN ITEMS "slot.release" "stripe_total" "aggregate_now" "notify_stripe_ready")
+    if(handoff_body MATCHES "${forbidden}")
+        message(FATAL_ERROR "stripe-ready checked pair contains forbidden ${forbidden}")
+    endif()
+endforeach()
+if(source MATCHES "exsia\\.slot_release" OR source MATCHES "stripe_ready_handoff_total")
+    message(FATAL_ERROR "stripe-ready handoff must not add release or total records")
+endif()
+message(STATUS "ExSIA individual profile and stripe-ready handoff source contract passed")
