@@ -452,6 +452,16 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
         ${TEST_GEMMINI_EXSIA_SW_PATH}/include)
     add_dependencies(test-gemmini-exsia test-gemmini-direct-linux-aarch64-strict)
 endif()
+add_test(NAME gemmini_direct_metrics_source_contract
+    COMMAND ${CMAKE_COMMAND}
+        -DDIRECT_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/residual/direct/direct-executor.cpp
+        -DDIRECT_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/residual/direct/direct-executor.hpp
+        -DTEST_CMAKE=${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
+        -DCXX_COMPILER=${CMAKE_CXX_COMPILER}
+        -DGENERATED_DIR=${CMAKE_BINARY_DIR}/generated
+        -DPROJECT_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/..
+        -DGEMMINI_SW_PATH=${TEST_GEMMINI_EXSIA_SW_PATH}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-direct-metrics-source-contract.cmake)
 add_test(NAME gemmini_direct_metrics_adversarial_contract
     COMMAND ${CMAKE_COMMAND}
         -DDIRECT_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/residual/direct/direct-executor.cpp
