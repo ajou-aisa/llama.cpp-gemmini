@@ -815,18 +815,6 @@ MatMulStatus execute_native_matched_cpu_dense(ggml_gemmini_args_t & args) {
     return MatMulStatus::success;
 }
 
-MatMulStatus physical_dense_status(DenseMatmulStatus status) {
-    switch (status) {
-        case DenseMatmulStatus::success:
-            return MatMulStatus::success;
-        case DenseMatmulStatus::invalid_contract:
-            return MatMulStatus::invalid_contract;
-        case DenseMatmulStatus::unsupported:
-            return MatMulStatus::unsupported;
-    }
-    return MatMulStatus::invalid_state;
-}
-
 MatMulStatus execute_dense(ggml_gemmini_args_t &args) {
     if (args.A_fp32 != nullptr || args.B_fp32 != nullptr) {
         if (args.A_fp32 == nullptr || args.B_fp32 == nullptr || args.f_out == nullptr) {
@@ -847,16 +835,31 @@ MatMulStatus execute_dense(ggml_gemmini_args_t &args) {
         }
         return execute_native_matched_cpu_dense(args);
     } else if (uses_baseline_channel_route(args)) {
-        return physical_dense_status(tiled_matmul_auto_baseline(
-            &args, baseline_activation_for(args),
-            baseline_weight_quant_t::CHANNEL));
+        tiled_matmul_auto_baseline(&args, baseline_activation_for(args),
+                                   baseline_weight_quant_t::CHANNEL);
     } else if (args.weight_i8_scale_active) {
-        return physical_dense_status(tiled_matmul_auto_baseline(
-            &args, baseline_activation_for(args),
-            baseline_weight_quant_t::TENSOR));
+        tiled_matmul_auto_baseline(&args, baseline_activation_for(args),
+                                   baseline_weight_quant_t::TENSOR);
     } else {
-        return physical_dense_status(tiled_matmul_auto_im2p(&args));
+        using Format = ggml_gemmini_args_t::im2p_weight_format_t;
+        switch (args.weight_format) {
+            case Format::q8_h1:
+            case Format::q8_h2:
+            case Format::q8_hp1:
+            case Format::q8_hp2:
+                break;
+            case Format::q8_h0:
+            case Format::q8_channel:
+            case Format::q8_channel_dense_sidecar:
+            default:
+                return MatMulStatus::unsupported;
+        }
+        if (args.tiled_matmul_type != CPU && args.tiled_matmul_type != WS) {
+            return MatMulStatus::unsupported;
+        }
+        tiled_matmul_auto_im2p(&args);
     }
+    return MatMulStatus::success;
 }
 
 MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe, size_t stripe_id,
@@ -2462,18 +2465,10 @@ bool MatmulStripeCollector::on_ready(
         captured.rmd_packet = event.rmd_packet;
         captured.direct_residual = event.direct_residual;
 #endif
-        captured.la_cycles = event.local_end_cycle >= event.local_start_cycle ?
-            event.local_end_cycle - event.local_start_cycle : 0;
-        captured.la3_cycles = event.local_group3_end_cycle >= event.local_group3_start_cycle ?
-            event.local_group3_end_cycle - event.local_group3_start_cycle : 0;
-        captured.sf_cycles = event.folding_end_cycle >= event.folding_start_cycle ?
-            event.folding_end_cycle - event.folding_start_cycle : 0;
         captured.la3_ns = event.local_end_ns >= event.local_start_ns ?
             event.local_end_ns - event.local_start_ns : 0;
         captured.sf1_ns = event.folding_end_ns >= event.folding_start_ns ?
             event.folding_end_ns - event.folding_start_ns : 0;
-        captured.la_worker_start_ns = event.local_worker_start_ns;
-        captured.la_worker_end_ns = event.local_worker_end_ns;
         captured.sf_mask_start_ns = event.mask_assembly_start_ns;
         captured.sf_mask_end_ns = event.mask_assembly_end_ns;
         captured.sf_exponent_start_ns = event.exponent_reduction_start_ns;
