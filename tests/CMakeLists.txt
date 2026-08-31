@@ -1013,7 +1013,8 @@ target_include_directories(gemmini-quant-dispatch-smoke PRIVATE
     ../ggml/src/ggml-gemmini/quants/act
     ../ggml/src/ggml-gemmini/quants/act/exsia
     ../ggml/src/ggml-gemmini/quants/act/token
-    ../ggml/src/ggml-gemmini/quants/common)
+    ../ggml/src/ggml-gemmini/quants/common
+    ${GEMMINI_SW_PATH} ${GEMMINI_SW_PATH}/include)
 llama_test(gemmini-quant-dispatch-smoke NAME gemmini_quant_dispatch_fp          ARGS fp)
 llama_test(gemmini-quant-dispatch-smoke NAME gemmini_quant_dispatch_exsia       ARGS exsia)
 llama_test(gemmini-quant-dispatch-smoke NAME gemmini_quant_dispatch_tensor     ARGS tensor)
