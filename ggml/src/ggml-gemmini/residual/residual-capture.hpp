@@ -49,6 +49,7 @@ public:
 
     void reset(size_t stripe_id, size_t row_begin, size_t row_count,
                size_t logical_k, size_t logical_j) {
+        stripe_id_ = stripe_id;
         std::visit([&](auto &sink) {
             sink.reset(stripe_id, row_begin, row_count, logical_k, logical_j);
         }, sink_);
@@ -71,6 +72,9 @@ public:
     ResidualStripePayload finish() {
         ResidualStripePayload result;
         if (empty()) return result;
+#if LOG_CYCLE
+        const uint64_t start = cycle::timestamp_ns();
+#endif
 #if defined(__linux__) && defined(__aarch64__) && CYCLE_DETAIL
         cycle::NativeCycleSample finish_start{};
         cycle::NativeCycleSample finish_end{};
@@ -84,18 +88,11 @@ public:
         }
         finish_start = cycle::read_sample();
 #endif
-#if LOG_CYCLE
-        const uint64_t start = cycle::timestamp_ns();
-#endif
         if (auto *cpu = std::get_if<DirectStripeBuilder>(&sink_)) {
             result.direct = cpu->finish();
         } else {
             result.packet = std::get<rmd::RmdStripeBuilder>(sink_).finish();
         }
-#if LOG_CYCLE
-        const uint64_t end = cycle::timestamp_ns();
-        result.capture_ns = end >= start ? end - start : 0;
-#endif
 #if defined(__linux__) && defined(__aarch64__) && CYCLE_DETAIL
         finish_end = cycle::read_sample();
         const cycle::NativeCycleDelta finish_delta =
@@ -111,8 +108,14 @@ public:
             static_cast<uint8_t>(finish_end.reason), GEMMINI_NATIVE_CYCLE_SOURCE_LINUX_PERF_CPU_CYCLES,
             finish_end.owner_event_token, finish_end.generation};
         const gemmini_cycle_record_v2 record{{nullptr, finish_op, finish_start.value, finish_end.value,
-                                               nullptr, 0, nullptr}, 0, 0, 0, 0, 0, 0};
+                                               nullptr, 0, nullptr},
+                                              GEMMINI_CYCLE_HAS_STRIPE_ID,
+                                              0, stripe_id_, 0, 0, 0};
         gemmini_log_cycle_record_v2_checked_internal(&record, &start_sample, &end_sample, 1);
+#endif
+#if LOG_CYCLE
+        const uint64_t end = cycle::timestamp_ns();
+        result.capture_ns = end >= start ? end - start : 0;
 #endif
         return result;
     }
@@ -123,6 +126,7 @@ public:
 private:
     using Sink = std::variant<DirectStripeBuilder, rmd::RmdStripeBuilder>;
     Sink sink_;
+    size_t stripe_id_ = 0;
 };
 
 }

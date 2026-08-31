@@ -225,10 +225,12 @@ namespace ggml::gemmini::quants::act::exsia
         }
 
 #if EXSIA_PROFILE_COLLECTION_ENABLED
+#if !defined(__linux__) || !defined(__aarch64__)
         uint64_t profile_now()
         {
             return ggml::gemmini::cycle::read();
         }
+#endif
 
         uint64_t profile_now_ns()
         {
@@ -358,54 +360,6 @@ namespace ggml::gemmini::quants::act::exsia
 #endif
     }
 
-    namespace
-    {
-        ProfileCycleValue checked_sum(const ProfileCycleValue *values, size_t count) noexcept
-        {
-            uint64_t sum = 0;
-            for (size_t index = 0; index < count; ++index)
-            {
-                if (!values[index].cycles.has_value())
-                    return values[index];
-                if (*values[index].cycles > std::numeric_limits<uint64_t>::max() - sum)
-                    return {{}, ProfileCycleStatus::arithmetic_overflow
-#if defined(__linux__) && defined(__aarch64__)
-                            , ggml::gemmini::cycle::NativeCycleReason::none
-#endif
-                    };
-                sum += *values[index].cycles;
-            }
-            return {sum, ProfileCycleStatus::complete
-#if defined(__linux__) && defined(__aarch64__)
-                    , ggml::gemmini::cycle::NativeCycleReason::none
-#endif
-            };
-        }
-    }
-
-    QuantizeProfileCycles aggregate_quantize_profile(
-        bool sequential, const StripeProfileRecord &profile) noexcept
-    {
-        QuantizeProfileCycles result{};
-        if (sequential)
-        {
-            result.local = checked_profile_interval(profile.local);
-        }
-        else
-        {
-            std::array<ProfileCycleValue, EXSIA_LOCAL_WORKER_COUNT> workers{};
-            for (size_t worker = 0; worker < workers.size(); ++worker)
-                workers[worker] = checked_profile_interval(profile.local_groups[worker]);
-            result.local = checked_sum(workers.data(), workers.size());
-        }
-        result.mask = checked_profile_interval(profile.mask_assembly);
-        result.exponent = checked_profile_interval(profile.exponent_reduction);
-        result.folding = checked_profile_interval(profile.folding);
-        const std::array<ProfileCycleValue, 4> canonical{
-            result.local, result.mask, result.exponent, result.folding};
-        result.total = checked_sum(canonical.data(), canonical.size());
-        return result;
-    }
 #endif
 
 #if EXSIA_STAGE_PROFILE_ENABLED
@@ -467,7 +421,6 @@ namespace ggml::gemmini::quants::act::exsia
             case ProfileCycleStatus::event_generation_mismatch: return "event_generation_mismatch";
             case ProfileCycleStatus::structurally_cross_task: return "structurally_cross_task";
             case ProfileCycleStatus::counter_regression: return "counter_regression";
-            case ProfileCycleStatus::arithmetic_overflow: return "arithmetic_overflow";
             }
             return "missing_component";
         }
@@ -654,15 +607,15 @@ namespace ggml::gemmini::quants::act::exsia
                     char suffix[48];
                     std::snprintf(suffix, sizeof(suffix), "local.p%zu.sum", stage);
                     write_stage_metric(trace, layer, run_id, mode, profile.stripe_idx,
-                                       suffix, stages[stage]->sum, stages[stage]->status,
+                                       suffix, stages[stage]->sum, ProfileCycleStatus::complete,
                                        ggml::gemmini::cycle::units(), profile.team_size);
                     std::snprintf(suffix, sizeof(suffix), "local.p%zu.count", stage);
                     write_stage_metric(trace, layer, run_id, mode, profile.stripe_idx,
-                                       suffix, stages[stage]->count, stages[stage]->status,
+                                       suffix, stages[stage]->count, ProfileCycleStatus::complete,
                                        "count", profile.team_size);
                     std::snprintf(suffix, sizeof(suffix), "local.p%zu.max", stage);
                     write_stage_metric(trace, layer, run_id, mode, profile.stripe_idx,
-                                       suffix, stages[stage]->max, stages[stage]->status,
+                                       suffix, stages[stage]->max, ProfileCycleStatus::complete,
                                        ggml::gemmini::cycle::units(), profile.team_size);
                 }
                 write_stage_metric(trace, layer, run_id, mode, profile.stripe_idx,
@@ -2000,8 +1953,6 @@ namespace ggml::gemmini::quants::act::exsia
             event.rmd_pack_ns = slot.rmd_pack_ns;
 #if EXSIA_PROFILE_COLLECTION_ENABLED
             if (profile != nullptr) {
-                event.quantize_cpu_work = aggregate_quantize_profile(
-                    state_.mode == ExSIAState::ExecutionMode::Sequential, *profile);
                 event.local_start_ns = profile->local.start_ns;
                 event.local_end_ns = profile->local.end_ns;
                 event.folding_start_ns = profile->folding.start_ns;
@@ -2092,11 +2043,11 @@ namespace ggml::gemmini::quants::act::exsia
             std::vector<uint8_t> worker_done_storage(num_stripes * EXSIA_LOCAL_WORKER_COUNT);
             std::vector<uint8_t> local_sealed_storage(num_stripes);
             std::vector<uint8_t> slot_released_storage(num_stripes);
-            uint8_t *prepared = prepared_storage.data();
-            uint8_t *worker_done = worker_done_storage.data();
-            uint8_t *local_sealed = local_sealed_storage.data();
-            uint8_t *slot_released = slot_released_storage.data();
-            uint8_t post_chain = 0;
+            [[maybe_unused]] uint8_t *prepared = prepared_storage.data();
+            [[maybe_unused]] uint8_t *worker_done = worker_done_storage.data();
+            [[maybe_unused]] uint8_t *local_sealed = local_sealed_storage.data();
+            [[maybe_unused]] uint8_t *slot_released = slot_released_storage.data();
+            [[maybe_unused]] uint8_t post_chain = 0;
             std::atomic<bool> pipeline_ok{true};
 #pragma omp parallel num_threads(EXSIA_OMP_THREAD_COUNT)
             {

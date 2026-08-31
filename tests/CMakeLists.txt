@@ -852,9 +852,11 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
         GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
         GGML_GEMMINI_ACTIVATION_QUANT=${_GGML_GEMMINI_ACTIVATION_QUANT_VALUE}
         GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
+        GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE}
         GGML_GEMMINI_TEST_IM2P_DIM=${GGML_GEMMINI_DIM}
-        LOG_CYCLE=${LOG_CYCLE}
         LOG_DEBUG=${LOG_DEBUG})
+    ggml_gemmini_apply_profile_compile_definitions(test-gemmini-im2p-routing)
+    ggml_gemmini_assert_profile_compile_definitions(test-gemmini-im2p-routing)
     target_include_directories(test-gemmini-im2p-routing PRIVATE
         ../ggml/src
         ../ggml/src/ggml-gemmini
@@ -1023,19 +1025,19 @@ add_test(
         -P ${CMAKE_CURRENT_SOURCE_DIR}/gemmini-quant-dispatch-unsupported.cmake)
 set_property(TEST gemmini_quant_dispatch_unsupported PROPERTY LABELS main)
 
-# Task 7: provider-free actual-production-source CPU-work coverage.
-add_executable(test-gemmini-matmul-cpu-work
-    test-gemmini-matmul-cpu-work.cpp
-    ../ggml/src/ggml-gemmini/ggml-gemmini-matmul-cpu-work.cpp)
-target_compile_features(test-gemmini-matmul-cpu-work PRIVATE cxx_std_17)
-target_include_directories(test-gemmini-matmul-cpu-work PRIVATE
-    ../ggml/src/ggml-gemmini)
-add_test(NAME test-gemmini-matmul-cpu-work
-    COMMAND $<TARGET_FILE:test-gemmini-matmul-cpu-work>)
 add_test(NAME test-gemmini-matmul-cpu-boundaries
     COMMAND ${CMAKE_COMMAND}
         -DMATMUL_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini-matmul.cpp
         -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-matmul-cpu-boundaries.cmake)
+
+add_test(NAME test-gemmini-profiled-domain-contract
+    COMMAND ${CMAKE_COMMAND}
+        -DMATMUL_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini-matmul.cpp
+        -DMATMUL_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini-matmul.hpp
+        -DMATMUL_TELEMETRY=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini-matmul-telemetry.cpp
+        -DGEMMINI_ENTRY_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini.cpp
+        -DGEMMINI_SOURCE_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-profiled-domain-contract.cmake)
 
 # Keep the executable side of Gemmini's CTest registration explicit. Building
 # this target before CTest prevents a stale tree from hiding missing artifacts.
@@ -1050,7 +1052,6 @@ set(_GEMMINI_REGISTERED_TEST_EXECUTABLES
     test-gemmini-rmd-packet
     test-gemmini-production-host-backend
     test-gemmini-rmd-telemetry
-    test-gemmini-matmul-cpu-work
     gemmini-quant-dispatch-smoke)
 foreach(_GEMMINI_OPTIONAL_TEST_EXECUTABLE IN ITEMS
         gemmini_q8_h1_h2_dequant_fp

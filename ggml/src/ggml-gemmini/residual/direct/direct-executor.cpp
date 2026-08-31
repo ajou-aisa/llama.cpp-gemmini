@@ -6,12 +6,17 @@
 #include "../../quants/common/weight_route.hpp"
 #if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
 #include <gemmini/cycle_reader.hpp>
+#include <gemmini/log.h>
+#include "../../ggml-gemmini-utils/src/cycle_reader_internal.h"
 #endif
 
 #include <algorithm>
 #include <array>
 #include <cstring>
 #include <limits>
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+#include <omp.h>
+#endif
 #include <new>
 #include <utility>
 
@@ -32,53 +37,79 @@ struct CpuSample {
     bool valid = false;
     uint64_t owner = 0;
     uint64_t generation = 0;
+    DirectCpuTileReason reason = DirectCpuTileReason::unavailable_event;
+    DirectCpuTileSource source = DirectCpuTileSource::perf_cpu_cycles;
 };
 
 struct CpuInterval {
     uint64_t value = 0;
     bool valid = false;
+    DirectCpuTileReason reason = DirectCpuTileReason::invalid_start;
+    DirectCpuTileReason sample_reason = DirectCpuTileReason::none;
 };
 
 #if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
-CpuSample read_cpu_sample(const testing::DirectExecutionTestHooks & hooks,
+CpuSample read_cpu_sample(const testing::DirectExecutionTestHooks * hooks,
                           testing::DirectCpuSamplePoint point,
                           size_t tile_index) {
-    const auto sample = hooks.sample_reader(point, tile_index, hooks.context);
-    return {sample.value, sample.valid, sample.owner, sample.generation};
+    if (hooks != nullptr && hooks->sample_reader != nullptr) {
+        const auto sample = hooks->sample_reader(point, tile_index, hooks->context);
+        return {sample.value, sample.valid, sample.owner, sample.generation,
+                sample.reason, sample.source};
+    }
+    return {};
 }
 #else
 CpuSample read_cpu_sample() {
     const auto sample = cycle::read_sample();
-    return {sample.value, sample.valid, sample.owner_event_token, sample.generation};
+    return {sample.value, sample.valid, sample.owner_event_token, sample.generation,
+            static_cast<DirectCpuTileReason>(sample.reason),
+            DirectCpuTileSource::perf_cpu_cycles};
 }
 #endif
 
 CpuInterval cpu_interval(const CpuSample & start, const CpuSample & end) {
 #if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
     const cycle::NativeCycleSample native_start{
-        start.value, start.valid,
-        start.valid ? cycle::NativeCycleReason::none : cycle::NativeCycleReason::unavailable_event,
+        start.value, start.valid, static_cast<cycle::NativeCycleReason>(start.reason),
         cycle::NativeCycleSource::perf_cpu_cycles, start.owner, start.generation};
     const cycle::NativeCycleSample native_end{
-        end.value, end.valid,
-        end.valid ? cycle::NativeCycleReason::none : cycle::NativeCycleReason::unavailable_event,
+        end.value, end.valid, static_cast<cycle::NativeCycleReason>(end.reason),
         cycle::NativeCycleSource::perf_cpu_cycles, end.owner, end.generation};
-    const auto delta = cycle::evaluate_interval(native_start, native_end);
-    return {delta.value, delta.valid};
+    const cycle::NativeCycleDelta delta = cycle::evaluate_interval(native_start, native_end);
+    return {delta.value, delta.valid,
+            static_cast<DirectCpuTileReason>(delta.reason),
+            static_cast<DirectCpuTileReason>(delta.sample_reason)};
 #else
-    if (!start.valid || !end.valid || start.owner != end.owner ||
-        start.generation != end.generation || end.value < start.value) {
-        return {};
-    }
-    return {end.value - start.value, true};
+    if (!start.valid)
+        return {0, false, DirectCpuTileReason::invalid_start, start.reason};
+    if (!end.valid)
+        return {0, false, DirectCpuTileReason::invalid_end, end.reason};
+    if (start.source != end.source)
+        return {0, false, DirectCpuTileReason::source_mismatch,
+                DirectCpuTileReason::none};
+    if (start.owner != end.owner)
+        return {0, false, DirectCpuTileReason::event_owner_mismatch,
+                DirectCpuTileReason::none};
+    if (start.generation != end.generation)
+        return {0, false, DirectCpuTileReason::event_generation_mismatch,
+                DirectCpuTileReason::none};
+    if (end.value < start.value)
+        return {0, false, DirectCpuTileReason::counter_regression,
+                DirectCpuTileReason::none};
+    return {end.value - start.value, true, DirectCpuTileReason::none,
+            DirectCpuTileReason::none};
 #endif
 }
 
-bool checked_add_u64(uint64_t lhs, uint64_t rhs, uint64_t & result) {
-    if (rhs > std::numeric_limits<uint64_t>::max() - lhs) return false;
-    result = lhs + rhs;
-    return true;
+size_t direct_worker_id() {
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+    return static_cast<size_t>(omp_get_thread_num());
+#else
+    return 0;
+#endif
 }
+
 #endif
 
 bool checked_add(int64_t lhs, int64_t rhs, int64_t & result) {
@@ -197,22 +228,6 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
     if (!checked_size_product(payload.row_count, payload.logical_j, output_count))
         return rmd::RmdStatus::overflow;
 
-#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
-    const bool sample_cpu = hooks != nullptr && hooks->sample_reader != nullptr;
-#elif CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
-    const bool sample_cpu = metrics != nullptr;
-#endif
-#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
-    (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
-    const CpuSample serial_pre_start = sample_cpu ?
-#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
-        read_cpu_sample(*hooks, testing::DirectCpuSamplePoint::serial_pre_start, 0) :
-#else
-        read_cpu_sample() :
-#endif
-        CpuSample{};
-#endif
-
     std::vector<rmd::OutputValue> staged_integer;
     std::vector<double> staged_floating;
     if ((integer_block && output_count > staged_integer.max_size()) ||
@@ -235,14 +250,15 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
     std::vector<size_t> tile_native_q8_values;
 #if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
     (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
-    std::vector<CpuInterval> tile_cpu_intervals;
+    std::vector<DirectCpuTileRecord> tile_cpu_records;
+    const uint64_t direct_run_id = metrics != nullptr ? metrics->run_id : 0;
 #endif
     try {
         tile_status.assign(j_tile_count, rmd::RmdStatus::success);
         tile_native_q8_values.assign(j_tile_count, 0);
 #if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
     (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
-        if (sample_cpu) tile_cpu_intervals.assign(j_tile_count, CpuInterval{});
+        tile_cpu_records.assign(j_tile_count, DirectCpuTileRecord{});
 #endif
     } catch (const std::bad_alloc &) {
         return rmd::RmdStatus::allocation_failure;
@@ -253,13 +269,12 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
     auto execute_j_tile = [&](size_t tile_index) {
 #if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
     (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
-        const CpuSample tile_start = sample_cpu ?
+        const CpuSample tile_start =
 #if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
-            read_cpu_sample(*hooks, testing::DirectCpuSamplePoint::tile_start, tile_index) :
+            read_cpu_sample(hooks, testing::DirectCpuSamplePoint::tile_start, tile_index);
 #else
-            read_cpu_sample() :
+            read_cpu_sample();
 #endif
-            CpuSample{};
 #endif
         const rmd::RmdStatus status = [&] {
             const size_t j_begin = tile_index * kJTile;
@@ -337,29 +352,58 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
         }();
 #if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
     (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
-        if (sample_cpu) {
 #if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
-            const CpuSample tile_end = read_cpu_sample(*hooks,
+            const CpuSample tile_end = read_cpu_sample(hooks,
                 testing::DirectCpuSamplePoint::tile_end, tile_index);
 #else
             const CpuSample tile_end = read_cpu_sample();
 #endif
-            tile_cpu_intervals[tile_index] = cpu_interval(tile_start, tile_end);
-        }
+            const CpuInterval interval = cpu_interval(tile_start, tile_end);
+            DirectCpuTileRecord & record = tile_cpu_records[tile_index];
+            record.run_id = direct_run_id;
+            record.stripe_id = payload.stripe_id;
+            record.worker_id = direct_worker_id();
+            record.tile_index = tile_index;
+            record.j_begin = tile_index * kJTile;
+            record.j_end = std::min(payload.logical_j, record.j_begin + kJTile);
+            record.start_cycle = tile_start.value;
+            record.end_cycle = tile_end.value;
+            if (interval.valid) record.delta_cycles = interval.value;
+            record.valid = interval.valid;
+            record.reason = interval.reason;
+            record.sample_reason = interval.sample_reason;
+            record.source = tile_start.source;
+            record.owner_event_token = tile_start.owner;
+            record.generation = tile_start.generation;
+#if !defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
+            const gemmini_native_cycle_sample_internal start_sample{
+                tile_start.value, static_cast<uint8_t>(tile_start.valid),
+                static_cast<uint8_t>(tile_start.reason),
+                GEMMINI_NATIVE_CYCLE_SOURCE_LINUX_PERF_CPU_CYCLES,
+                tile_start.owner, tile_start.generation};
+            const gemmini_native_cycle_sample_internal end_sample{
+                tile_end.value, static_cast<uint8_t>(tile_end.valid),
+                static_cast<uint8_t>(tile_end.reason),
+                GEMMINI_NATIVE_CYCLE_SOURCE_LINUX_PERF_CPU_CYCLES,
+                tile_end.owner, tile_end.generation};
+            uint32_t identity_mask =
+                static_cast<uint32_t>(GEMMINI_CYCLE_HAS_STRIPE_ID) |
+                static_cast<uint32_t>(GEMMINI_CYCLE_HAS_NODE_ID) |
+                static_cast<uint32_t>(GEMMINI_CYCLE_HAS_WORKER_ID);
+            if (direct_run_id != 0) {
+                identity_mask |= static_cast<uint32_t>(GEMMINI_CYCLE_HAS_RUN_ID);
+            }
+            const gemmini_cycle_record_v2 detail{{nullptr, "rmd_direct_j_tile_interval",
+                tile_start.value, tile_end.value, nullptr, 0, nullptr},
+                identity_mask, direct_run_id, payload.stripe_id, 0, tile_index,
+                record.worker_id};
+            gemmini_log_cycle_record_v2_checked_internal(
+                &detail, &start_sample, &end_sample, 1);
+#endif
 #endif
         return status;
     };
 
-#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
-    (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
-    const CpuSample serial_pre_end = sample_cpu ?
-#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
-        read_cpu_sample(*hooks, testing::DirectCpuSamplePoint::serial_pre_end, 0) :
-#else
-        read_cpu_sample() :
-#endif
-        CpuSample{};
-#endif
 #if defined(GGML_GEMMINI_HAS_OPENMP)
 #pragma omp parallel for schedule(static) if(j_tile_count > 1)
 #endif
@@ -369,16 +413,6 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
         tile_status[static_cast<size_t>(tile_index)] =
             execute_j_tile(static_cast<size_t>(tile_index));
     }
-#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
-    (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
-    const CpuSample serial_post_start = sample_cpu ?
-#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
-        read_cpu_sample(*hooks, testing::DirectCpuSamplePoint::serial_post_start, 0) :
-#else
-        read_cpu_sample() :
-#endif
-        CpuSample{};
-#endif
     size_t native_q8_values = 0;
     for (size_t tile_index = 0; tile_index < j_tile_count; ++tile_index) {
         if (tile_status[tile_index] != rmd::RmdStatus::success) {
@@ -392,47 +426,15 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
         rmd::DirectOutput(rmd::BlockScaledInt64Correction{std::move(staged_integer)});
     correction.swap(staged_output);
 
-    std::optional<DirectCpuDetailMetrics> cpu_detail;
-#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
-    (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
-    if (sample_cpu) {
-#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
-        const CpuSample serial_post_end = read_cpu_sample(*hooks,
-            testing::DirectCpuSamplePoint::serial_post_end, 0);
-#else
-        const CpuSample serial_post_end = read_cpu_sample();
-#endif
-        const CpuInterval serial_pre = cpu_interval(serial_pre_start, serial_pre_end);
-        const CpuInterval serial_post = cpu_interval(serial_post_start, serial_post_end);
-        DirectCpuDetailMetrics detail{};
-        if (serial_pre.valid) detail.serial_pre_cycles = serial_pre.value;
-        if (serial_post.valid) detail.serial_post_cycles = serial_post.value;
-
-        bool tiles_valid = true;
-        uint64_t tile_cycles = 0;
-        for (const CpuInterval & interval : tile_cpu_intervals) {
-            if (!interval.valid || !checked_add_u64(tile_cycles, interval.value, tile_cycles)) {
-                tiles_valid = false;
-                break;
-            }
-        }
-        if (tiles_valid) detail.tile_cycles = tile_cycles;
-
-        uint64_t total = 0;
-        detail.valid = serial_pre.valid && tiles_valid && serial_post.valid &&
-            checked_add_u64(total, serial_pre.value, total) &&
-            checked_add_u64(total, tile_cycles, total) &&
-            checked_add_u64(total, serial_post.value, total);
-        if (detail.valid) detail.total_cycles = total;
-        cpu_detail = detail;
-    }
-#endif
     if (metrics != nullptr) {
         metrics->event_count = payload.events.size();
         metrics->call_count = 1;
         metrics->native_q8_values = native_q8_values;
         metrics->j_tile_count = j_tile_count;
-        metrics->cpu_detail = cpu_detail;
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
+    (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
+        metrics->cpu_tiles = std::move(tile_cpu_records);
+#endif
     }
     return rmd::RmdStatus::success;
 }

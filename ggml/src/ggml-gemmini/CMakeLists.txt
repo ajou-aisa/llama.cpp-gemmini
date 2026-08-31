@@ -50,12 +50,43 @@ set(GEMMINI_RISCV_FLAGS
   -Wa,-march=rv64gc
 )
 
+function(ggml_gemmini_apply_profile_compile_definitions target)
+  target_compile_definitions(${target} PRIVATE
+    EXSIA_VALIDATION=0
+    GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE}
+    CYCLE_DETAIL=${CYCLE_DETAIL}
+    LOG_CYCLE=${LOG_CYCLE})
+endfunction()
+
+function(ggml_gemmini_assert_profile_compile_definitions target)
+  get_target_property(_definitions ${target} COMPILE_DEFINITIONS)
+  foreach(_expected IN ITEMS
+      EXSIA_VALIDATION=0
+      GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE}
+      CYCLE_DETAIL=${CYCLE_DETAIL}
+      LOG_CYCLE=${LOG_CYCLE})
+    string(REGEX REPLACE "=.*$" "" _key "${_expected}")
+    set(_actual)
+    foreach(_definition IN LISTS _definitions)
+      if(_definition MATCHES "^${_key}(=|$)")
+        list(APPEND _actual "${_definition}")
+      endif()
+    endforeach()
+    list(REMOVE_DUPLICATES _actual)
+    if(NOT _actual STREQUAL _expected)
+      string(JOIN "," _actual_text ${_actual})
+      message(FATAL_ERROR
+        "GEMMINI_PROFILE_CONTRACT target=${target} definition=${_key} expected=${_expected} actual=${_actual_text}")
+    endif()
+  endforeach()
+endfunction()
+
 ggml_add_backend_library(ggml-gemmini
                           ggml-gemmini.cpp
                           ggml-gemmini-buffer.cpp
                           ggml-gemmini-geometry.hpp
                           ggml-gemmini-matmul.cpp
-                          ggml-gemmini-matmul-cpu-work.cpp
+                          ggml-gemmini-matmul-telemetry.cpp
                           ggml-gemmini-telemetry.cpp
                           ggml-gemmini-q8-h1-artifact.cpp
                           ggml-gemmini-q8-h1-artifact-reader.cpp
@@ -85,8 +116,9 @@ ggml_add_backend_library(ggml-gemmini
 
 target_compile_features(ggml-gemmini PRIVATE cxx_std_17)
 target_compile_definitions(ggml-gemmini PRIVATE
-  GGML_GEMMINI_MATMUL_IMPLEMENTATION
-  GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE})
+  GGML_GEMMINI_MATMUL_IMPLEMENTATION)
+ggml_gemmini_apply_profile_compile_definitions(ggml-gemmini)
+ggml_gemmini_assert_profile_compile_definitions(ggml-gemmini)
 if (LLAMA_BUILD_TESTS AND NOT GGML_BACKEND_DL)
   target_compile_definitions(ggml-gemmini PUBLIC
     GGML_GEMMINI_TESTING=1

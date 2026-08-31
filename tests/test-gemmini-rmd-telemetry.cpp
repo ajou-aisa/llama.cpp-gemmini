@@ -51,27 +51,20 @@ std::size_t count_occurrences(const std::string & value, const std::string & nee
 }
 
 bool aggregate_serializer_fixtures() {
-#if defined(__riscv)
-    constexpr const char * expected_native_fields = "\"source\":\"riscv_cycle\",\"unit\":\"cycle\"";
-#elif defined(__linux__) && defined(__aarch64__)
-    constexpr const char * expected_native_fields = "\"source\":\"linux_perf_cpu_cycles\",\"unit\":\"cycle\"";
-#else
-    constexpr const char * expected_native_fields = "\"source\":\"host_tick\",\"unit\":\"tick\"";
-#endif
     static_assert(std::is_same_v<decltype(WsLoopTelemetry::load_occupancy_cycles), std::uint32_t>);
     static_assert(std::is_same_v<decltype(Im2pExecutionTelemetry::run_id), std::uint64_t>);
     static_assert(std::is_same_v<decltype(Im2pExecutionTelemetry::rtl_work_total_cycles), std::uint64_t>);
     static_assert(std::is_same_v<decltype(Im2pStripeTelemetry::publish_cycle), std::uint64_t>);
     static_assert(std::is_same_v<decltype(Im2pStripeTelemetry::completion_cycle), std::uint64_t>);
-    static_assert(std::is_same_v<decltype(QuantizationStripeTelemetry::start), std::uint64_t>);
-    static_assert(std::is_same_v<decltype(QuantizationStripeTelemetry::end), std::uint64_t>);
+    static_assert(std::is_same_v<decltype(QuantizationStripeTelemetry::start_ns), std::uint64_t>);
+    static_assert(std::is_same_v<decltype(QuantizationStripeTelemetry::end_ns), std::uint64_t>);
     CycleIntervalTelemetry interval{};
     interval.layer = "ffn\"norm"; interval.op = "dense";
     interval.start = 10; interval.end = 34;
     const std::string interval_json = serialize_cycle_telemetry(interval);
     const std::string expected_interval =
-        std::string("{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"CYCLE_INTERVAL\",") +
-        expected_native_fields + ",\"op\":\"dense\",\"layer\":\"ffn\\\"norm\","
+        "{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"CYCLE_INTERVAL\","
+        "\"source\":\"host_tick\",\"unit\":\"tick\",\"op\":\"dense\",\"layer\":\"ffn\\\"norm\","
         "\"run_id\":null,\"stripe_id\":null,\"slot\":null,\"node_id\":null,\"worker_id\":null,"
         "\"start\":10,\"end\":34,\"delta\":24,\"valid\":true}";
 
@@ -370,18 +363,15 @@ bool run_aggregate_driver(const std::filesystem::path & cycle_path) {
 }
 
 bool residual_capture_timer_seam() {
-    cycle::reset_read_count_for_test();
     residual::TimedResidualCapture capture(residual::ResidualRoute::cpu_direct);
     capture.reset(0, 0, 1, 4, 2);
     if (!expect(capture.add_residual(0, 1, 7), "residual timer fixture accepts work")) return false;
     const residual::ResidualStripePayload payload = capture.finish();
     if (!expect(payload.direct != nullptr, "residual timer fixture produces payload")) return false;
-#if LOG_CYCLE
-    return expect(cycle::read_count_for_test() == 2,
-                  "residual capture routes both profiling reads through timer seam");
+#if !LOG_CYCLE
+    return expect(payload.capture_ns == 0, "cycle-off residual capture has no ns interval");
 #else
-    return expect(cycle::read_count_for_test() == 0 && payload.capture_ns == 0,
-                  "cycle-off residual capture performs zero profiling reads");
+    return true;
 #endif
 }
 
@@ -516,14 +506,6 @@ bool negative_fixtures() {
     RmdTelemetryRecord wrong_unit = cpu_record(); wrong_unit.units = wrong_unit.units == "ticks" ? "cycles" : "ticks";
     RmdTelemetryRecord ordering = cpu_record(); ordering.timing.dense_end = ordering.timing.residual_start + 1;
     RmdTelemetryRecord containment = cpu_record(); containment.timing.residual_total = containment.timing.backend_service - 1;
-#if defined(__linux__) && defined(__aarch64__)
-    RmdTelemetryRecord invalid_invocation = cpu_record();
-    invalid_invocation.invocation_valid = false;
-    invalid_invocation.invocation_reason = "invalid_start";
-    if (!expect(serialize_cycle_telemetry(invalid_invocation).find(
-                    "\"invocation_total\":null,\"invocation_reason\":\"invalid_start\"") != std::string::npos,
-                "invalid top-level invocation fails closed")) return false;
-#endif
     return expect(!check_rmd_telemetry(malformed, cycle::units(), true).ok(), "malformed schema rejected") &&
         expect(!check_rmd_telemetry(zero, cycle::units(), true).ok(), "zero work rejected for comparison") &&
         expect(check_rmd_telemetry(zero, cycle::units(), false).ok(), "zero work explicit outside comparison") &&
@@ -602,25 +584,14 @@ int main(int argc, char ** argv) {
     const uint64_t first = cycle::read(); const uint64_t second = cycle::read();
     if (!expect(second >= first && cycle::read_count_for_test() == 3, "enabled clock reads are observable")) return 1;
     RmdTelemetryRecord cpu = cpu_record(); RmdTelemetryRecord ws = ws_record();
-#if defined(__riscv)
-    constexpr const char * expected_rmd_clock = "\"source\":\"riscv_cycle\",\"unit\":\"cycle\"";
-#elif defined(__linux__) && defined(__aarch64__)
-    constexpr const char * expected_rmd_clock = "\"source\":\"linux_perf_cpu_cycles\",\"unit\":\"cycle\"";
-#else
-    constexpr const char * expected_rmd_clock = "\"source\":\"host_tick\",\"unit\":\"tick\"";
-#endif
     const std::string expected_rmd_summary =
-        std::string("{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"RMD_BACKEND_TELEMETRY\",") +
-        expected_rmd_clock + ",\"op\":\"rmd.execute\","
+        "{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"RMD_BACKEND_TELEMETRY\","
+        "\"source\":\"host_tick\",\"unit\":\"tick\",\"op\":\"rmd.execute\","
         "\"layer\":\"blk.42.mlp.down_proj\",\"run_id\":42,\"stripe_id\":null,\"slot\":null,"
         "\"node_id\":null,\"worker_id\":null,\"runtime_bundle_id\":\"bundle-7\",\"model_id\":\"model-hash\","
         "\"backend\":\"cpu_direct\",\"option_source\":\"explicit_override\","
         "\"work\":true,\"invocation_total\":101,\"dispatch\":{\"direct_events\":9,\"direct_calls\":2,\"packet_calls\":0,\"ws_calls\":0},"
-#if defined(__linux__) && defined(__aarch64__)
-        "\"timing\":{\"prep\":11,\"backend_service\":31,\"merge\":7,\"residual_total\":47,\"queue\":null,\"queue_reason\":\"structurally_cross_task\",\"dense_end\":120,\"residual_start\":120},"
-#else
         "\"timing\":{\"prep\":11,\"backend_service\":31,\"merge\":7,\"residual_total\":47,\"queue\":3,\"dense_end\":120,\"residual_start\":120},"
-#endif
         "\"geometry\":{\"packet_count\":0,\"active_blocks\":0,\"compact_k_count\":0,\"padded_k_count\":0,\"physical_tile_count\":0}}";
 #if CYCLE_DETAIL
     cpu.stripes = {

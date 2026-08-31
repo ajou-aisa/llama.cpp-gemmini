@@ -8,63 +8,14 @@
 namespace ggml::gemmini {
 namespace {
 
-void json_string(std::ostringstream & out, std::string_view value) {
-    out << '"';
-    for (const char c : value) {
-        switch (c) {
-            case '\\': out << "\\\\"; break;
-            case '"': out << "\\\""; break;
-            case '\b': out << "\\b"; break;
-            case '\f': out << "\\f"; break;
-            case '\n': out << "\\n"; break;
-            case '\r': out << "\\r"; break;
-            case '\t': out << "\\t"; break;
-            default:
-                if (static_cast<unsigned char>(c) < 0x20) {
-                    static constexpr char hex[] = "0123456789abcdef";
-                    out << "\\u00" << hex[(static_cast<unsigned char>(c) >> 4) & 0xf]
-                        << hex[static_cast<unsigned char>(c) & 0xf];
-                } else {
-                    out << c;
-                }
-        }
-    }
-    out << '"';
-}
-
 void prefix(std::ostringstream & out, const char * type,
             std::string_view source, std::string_view unit) {
     out << "{\"schema\":\"" << kCycleTelemetrySchema
         << "\",\"version\":" << kCycleTelemetryVersion
         << ",\"record_type\":\"" << type << "\",\"source\":";
-    json_string(out, source);
+    detail::json_string(out, source);
     out << ",\"unit\":";
-    json_string(out, unit);
-}
-
-void field(std::ostringstream & out, const char * name, std::uint64_t value) {
-    out << ",\"" << name << "\":" << value;
-}
-
-void string_field(std::ostringstream & out, const char * name, std::string_view value) {
-    out << ",\"" << name << "\":";
-    json_string(out, value);
-}
-
-void nullable_string_field(std::ostringstream & out, const char * name, std::string_view value) {
-    if (value.empty()) {
-        out << ",\"" << name << "\":null";
-    } else {
-        string_field(out, name, value);
-    }
-}
-
-void null_field(std::ostringstream & out, const char * name) {
-    out << ",\"" << name << "\":null";
-}
-
-bool ordered(std::uint64_t start, std::uint64_t end) {
-    return end >= start;
+    detail::json_string(out, unit);
 }
 
 #if LOG_DEBUG
@@ -144,37 +95,37 @@ std::string serialize_cycle_telemetry(const Im2pExecutionTelemetry & record) {
                         ? "IM2P_RMD_EXECUTION_TELEMETRY"
                         : "IM2P_RMD_STRIPE_TELEMETRY",
                "im2p_rmd_rtl", "rtl_cycle");
-        string_field(out, "op", "rmd.im2p.execute");
-        nullable_string_field(out, "layer", record.layer);
-        field(out, "run_id", record.run_id);
+        detail::string_field(out, "op", "rmd.im2p.execute");
+        detail::nullable_string_field(out, "layer", record.layer);
+        detail::field(out, "run_id", record.run_id);
         if (record.residual_aggregate) {
-            null_field(out, "stripe_id");
-            null_field(out, "slot");
+            detail::null_field(out, "stripe_id");
+            detail::null_field(out, "slot");
         } else {
-            field(out, "stripe_id", record.stripe_id);
-            field(out, "slot", record.slot);
+            detail::field(out, "stripe_id", record.stripe_id);
+            detail::field(out, "slot", record.slot);
         }
-        null_field(out, "node_id");
-        null_field(out, "worker_id");
+        detail::null_field(out, "node_id");
+        detail::null_field(out, "worker_id");
         if (!record.residual_aggregate) {
-            field(out, "row_begin", record.row_begin);
-            field(out, "row_end", record.row_end);
+            detail::field(out, "row_begin", record.row_begin);
+            detail::field(out, "row_end", record.row_end);
         }
-        field(out, "rmd_dot_calls", record.rmd_dot_calls);
-        field(out, "rmd_work_total_cycles", record.rtl_work_total_cycles);
-        string_field(out, "clock_domain", "independent_rmd_simulator");
+        detail::field(out, "rmd_dot_calls", record.rmd_dot_calls);
+        detail::field(out, "rmd_work_total_cycles", record.rtl_work_total_cycles);
+        detail::string_field(out, "clock_domain", "independent_rmd_simulator");
         out << ",\"additive\":false}";
         return out.str();
     }
     prefix(out, "IM2P_EXECUTION_TELEMETRY", "im2p_rtl", "rtl_cycle");
-    string_field(out, "op", "im2p.execute");
-    nullable_string_field(out, "layer", record.layer);
-    field(out, "run_id", record.run_id);
-    null_field(out, "stripe_id");
-    null_field(out, "slot");
-    null_field(out, "node_id");
-    null_field(out, "worker_id");
-    field(out, "rtl_work_total_cycles", record.rtl_work_total_cycles);
+    detail::string_field(out, "op", "im2p.execute");
+    detail::nullable_string_field(out, "layer", record.layer);
+    detail::field(out, "run_id", record.run_id);
+    detail::null_field(out, "stripe_id");
+    detail::null_field(out, "slot");
+    detail::null_field(out, "node_id");
+    detail::null_field(out, "worker_id");
+    detail::field(out, "rtl_work_total_cycles", record.rtl_work_total_cycles);
     out << '}';
     return out.str();
 #endif
@@ -187,18 +138,18 @@ std::string serialize_cycle_telemetry(const Im2pStripeTelemetry & record) {
 #else
     std::ostringstream out;
     prefix(out, "IM2P_STRIPE_TELEMETRY", "im2p_rtl", "rtl_cycle");
-    string_field(out, "op", "im2p.execute");
-    nullable_string_field(out, "layer", record.layer);
-    field(out, "run_id", record.run_id);
-    field(out, "stripe_id", record.stripe_id);
-    field(out, "slot", record.slot);
-    null_field(out, "node_id");
-    null_field(out, "worker_id");
-    field(out, "row_begin", record.row_begin);
-    field(out, "row_end", record.row_end);
-    field(out, "publish_cycle", record.publish_cycle);
-    field(out, "completion_cycle", record.completion_cycle);
-    field(out, "latency_cycles", record.completion_cycle - record.publish_cycle);
+    detail::string_field(out, "op", "im2p.execute");
+    detail::nullable_string_field(out, "layer", record.layer);
+    detail::field(out, "run_id", record.run_id);
+    detail::field(out, "stripe_id", record.stripe_id);
+    detail::field(out, "slot", record.slot);
+    detail::null_field(out, "node_id");
+    detail::null_field(out, "worker_id");
+    detail::field(out, "row_begin", record.row_begin);
+    detail::field(out, "row_end", record.row_end);
+    detail::field(out, "publish_cycle", record.publish_cycle);
+    detail::field(out, "completion_cycle", record.completion_cycle);
+    detail::field(out, "latency_cycles", record.completion_cycle - record.publish_cycle);
     out << ",\"additive\":false}";
     return out.str();
 #endif
@@ -211,22 +162,22 @@ std::string serialize_cycle_telemetry(const QuantizationStripeTelemetry & record
 #else
     std::ostringstream out;
     prefix(out, "QUANTIZATION_STRIPE_TELEMETRY", kNativeCycleSource, kNativeCycleUnit);
-    string_field(out, "op", "exsia.quantize");
-    nullable_string_field(out, "layer", record.layer);
-    field(out, "run_id", record.run_id);
-    field(out, "stripe_id", record.stripe_id);
-    field(out, "slot", record.slot);
-    null_field(out, "node_id");
-    null_field(out, "worker_id");
-    field(out, "row_begin", record.row_begin);
-    field(out, "row_end", record.row_end);
-    field(out, "start", record.start);
-    field(out, "end", record.end);
+    detail::string_field(out, "op", "exsia.quantize");
+    detail::nullable_string_field(out, "layer", record.layer);
+    detail::field(out, "run_id", record.run_id);
+    detail::field(out, "stripe_id", record.stripe_id);
+    detail::field(out, "slot", record.slot);
+    detail::null_field(out, "node_id");
+    detail::null_field(out, "worker_id");
+    detail::field(out, "row_begin", record.row_begin);
+    detail::field(out, "row_end", record.row_end);
+    detail::field(out, "start", record.start);
+    detail::field(out, "end", record.end);
 #if defined(__linux__) && defined(__aarch64__)
-    null_field(out, "delta");
+    detail::null_field(out, "delta");
     out << ",\"valid\":false,\"reason\":\"scalar_provenance_unavailable\"";
 #else
-    field(out, "delta", record.end - record.start);
+    detail::field(out, "delta", record.end - record.start);
 #endif
     out << ",\"overlaps_rtl\":true,\"additive\":false}";
     return out.str();
@@ -235,43 +186,6 @@ std::string serialize_cycle_telemetry(const QuantizationStripeTelemetry & record
 
 std::string serialize_cycle_telemetry(const RmdTelemetryRecord & record) {
     return serialize_rmd_telemetry(record);
-}
-
-std::string serialize_cycle_telemetry(const PipelineStripeTelemetry & record) {
-#if !LOG_CYCLE
-    (void) record;
-    return {};
-#else
-    const bool valid = record.row_end >= record.row_begin &&
-        ordered(record.queue_start_ns, record.queue_end_ns) &&
-        ordered(record.dense_start_ns, record.dense_end_ns) &&
-        ordered(record.rmd_start_ns, record.rmd_end_ns) &&
-        ordered(record.compose_start_ns, record.compose_end_ns) &&
-        ordered(record.finalize_start_ns, record.finalize_end_ns);
-    std::ostringstream out;
-    prefix(out, "PIPELINE_STRIPE_SUMMARY", "steady_clock", "nanosecond");
-    string_field(out, "op", "matmul.pipeline");
-    nullable_string_field(out, "layer", record.layer);
-    field(out, "run_id", record.run_id);
-    field(out, "stripe_id", record.stripe_id);
-    field(out, "slot", record.slot);
-    null_field(out, "node_id");
-    null_field(out, "worker_id");
-    field(out, "row_begin", record.row_begin);
-    field(out, "row_end", record.row_end);
-    field(out, "queue_start_ns", record.queue_start_ns);
-    field(out, "queue_end_ns", record.queue_end_ns);
-    field(out, "dense_start_ns", record.dense_start_ns);
-    field(out, "dense_end_ns", record.dense_end_ns);
-    field(out, "rmd_start_ns", record.rmd_start_ns);
-    field(out, "rmd_end_ns", record.rmd_end_ns);
-    field(out, "compose_start_ns", record.compose_start_ns);
-    field(out, "compose_end_ns", record.compose_end_ns);
-    field(out, "finalize_start_ns", record.finalize_start_ns);
-    field(out, "finalize_end_ns", record.finalize_end_ns);
-    out << ",\"valid\":" << (valid ? "true" : "false") << '}';
-    return out.str();
-#endif
 }
 
 void emit_cycle_telemetry(const CycleIntervalTelemetry & record) { log::cycle.write_json(serialize_cycle_telemetry(record)); }
