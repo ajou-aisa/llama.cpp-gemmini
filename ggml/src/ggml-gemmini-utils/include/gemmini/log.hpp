@@ -237,6 +237,7 @@ namespace ggml::gemmini::log
         void clear_target_lock_hook();
         void set_log_fault(LogFault fault);
         void clear_log_fault();
+        std::string serialize_linux_aarch64_scalar_cycle_record_for_test(const CycleRecord & record);
     }
 
     namespace detail

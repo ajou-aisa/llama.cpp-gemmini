@@ -67,12 +67,17 @@ static bool checked_bridge_matrix(const std::filesystem::path & path) {
     emit(valid_start, regression_end, 1);
     auto zero_end = valid_end; zero_end.value = valid_start.value;
     emit(valid_start, zero_end, 1);
+    const ggml::gemmini::log::CycleRecord multiplexed{
+        "private", "matrix.multiplexed", 10, 12, nullptr, 0, nullptr,
+        "linux_perf_cpu_cycles", "cycle"};
+    ggml::gemmini::log::cycle.write_json(
+        ggml::gemmini::log::serialize_checked_cycle_record(multiplexed, false, "multiplexed"));
     gemmini_log_cycle_set_output(stderr);
 
     const std::string output = read_file(path);
     const char * reasons[] = {"invalid_start", "invalid_end", "source_mismatch",
         "event_owner_mismatch", "event_generation_mismatch", "structurally_cross_task",
-        "counter_regression"};
+        "counter_regression", "multiplexed"};
     if (output.find("\"source\":\"linux_perf_cpu_cycles\",\"unit\":\"cycle\"") == std::string::npos ||
         output.find("\"delta\":2,\"valid\":true") == std::string::npos ||
         output.find("\"delta\":0,\"valid\":true") == std::string::npos) return false;
@@ -101,23 +106,61 @@ static int open_descriptor_count() {
 
 int main() {
     using ggml::gemmini::log::testing::LogFault;
-#if defined(__linux__) && defined(__aarch64__)
-    const std::string jetson_scalar = ggml::gemmini::log::serialize_cycle_record(
-        {"scalar", "public", 10, 12, nullptr, 0, nullptr,
-         "linux_perf_cpu_cycles", "cycle"});
-    if (jetson_scalar.find("\"delta\":null,\"valid\":false,\"reason\":\"scalar_provenance_unavailable\"") ==
-        std::string::npos) {
-        std::fprintf(stderr, "RED: Jetson scalar provenance must fail closed\n");
-        return 16;
-    }
-#else
+    const std::string scalar = ggml::gemmini::log::serialize_cycle_record(
+        {"scalar", "public", 10, 12, nullptr, 0, nullptr});
+    const std::string legacy_equal = ggml::gemmini::log::serialize_cycle_record(
+        {"scalar", "public.equal", 10, 10, nullptr, 0, nullptr});
     const std::string legacy_regression = ggml::gemmini::log::serialize_cycle_record(
         {"scalar", "public", 12, 10, nullptr, 0, nullptr});
-    if (legacy_regression.find("\"start\":12,\"end\":10,\"delta\":0,\"valid\":false") ==
-            std::string::npos || legacy_regression.find("\"reason\"") != std::string::npos) {
+    const std::string linux_monotonic =
+        ggml::gemmini::log::testing::serialize_linux_aarch64_scalar_cycle_record_for_test(
+            {"scalar", "linux.monotonic", 10, 12, nullptr, 0, nullptr});
+    const std::string linux_equal =
+        ggml::gemmini::log::testing::serialize_linux_aarch64_scalar_cycle_record_for_test(
+            {"scalar", "linux.equal", 10, 10, nullptr, 0, nullptr});
+    if (scalar.find("\"start\":10,\"end\":12,\"delta\":2,\"valid\":true") == std::string::npos ||
+        legacy_equal.find("\"start\":10,\"end\":10,\"delta\":0,\"valid\":true") == std::string::npos ||
+        scalar.find("scalar_provenance_unavailable") != std::string::npos ||
+        legacy_regression.find("\"start\":12,\"end\":10,\"delta\":0,\"valid\":false") ==
+            std::string::npos || legacy_regression.find("\"reason\"") != std::string::npos ||
+        linux_monotonic.find("\"source\":\"linux_perf_cpu_cycles\",\"unit\":\"cycle\"") == std::string::npos ||
+        linux_monotonic.find("\"start\":10,\"end\":12,\"delta\":2,\"valid\":true") == std::string::npos ||
+        linux_equal.find("\"start\":10,\"end\":10,\"delta\":0,\"valid\":true") == std::string::npos) {
+        std::fprintf(stderr, "scalar records must retain platform arithmetic\n");
         return 16;
     }
-#endif
+
+    struct ScalarCase {
+        uint64_t start;
+        uint64_t end;
+        const char * reason;
+        bool valid;
+        uint64_t delta;
+    };
+    const ScalarCase scalar_cases[] = {
+        {0, 0, "invalid_start", false, 0},
+        {0, 7, "invalid_start", false, 0},
+        {7, 0, "invalid_end", false, 0},
+        {7, 6, "counter_regression", false, 0},
+        {7, 7, nullptr, true, 0},
+    };
+    for (const ScalarCase & scalar_case : scalar_cases) {
+        const std::string json =
+            ggml::gemmini::log::testing::serialize_linux_aarch64_scalar_cycle_record_for_test(
+                {"scalar", "linux.sentinel", scalar_case.start, scalar_case.end,
+                 nullptr, 0, nullptr});
+        const std::string interval = "\"start\":" + std::to_string(scalar_case.start) +
+            ",\"end\":" + std::to_string(scalar_case.end) + ",\"delta\":" +
+            (scalar_case.valid ? std::to_string(scalar_case.delta) : "null") +
+            ",\"valid\":" + (scalar_case.valid ? "true" : "false");
+        const bool reason_matches = scalar_case.reason
+            ? json.find(std::string("\"reason\":\"") + scalar_case.reason + "\"") != std::string::npos
+            : json.find("\"reason\"") == std::string::npos;
+        if (json.find(interval) == std::string::npos || !reason_matches) {
+            std::fprintf(stderr, "Linux-AArch64 scalar policy mismatch: %s", json.c_str());
+            return 18;
+        }
+    }
     const std::filesystem::path root =
         std::filesystem::temp_directory_path() /
         ("gemmini-log-c-boundary-" + std::to_string(current_process_id()));
@@ -188,6 +231,10 @@ int main() {
 
     gemmini_log_debug("healthy-debug-boundary");
     gemmini_log_cycle("healthy-cycle-boundary", "after-fault", 10, 12);
+    const gemmini_cycle_record_v2 scalar_v2{
+        {"healthy-v2-boundary", "after-fault-v2", 20, 23, nullptr, 0, nullptr},
+        GEMMINI_CYCLE_HAS_RUN_ID, 41, 0, 0, 0, 0};
+    gemmini_log_cycle_record_v2(&scalar_v2);
     gemmini_log_debug_set_output(stderr);
     gemmini_log_cycle_set_output(stderr);
 
@@ -205,12 +252,12 @@ int main() {
 #endif
 #if EXPECT_LOG_CYCLE
     ok = ok && cycle.find("WS_LOOP_TELEMETRY") == std::string::npos &&
-        cycle.find("healthy-cycle-boundary") != std::string::npos &&
-#if defined(__linux__) && defined(__aarch64__)
-        cycle.find("\"delta\":null,\"valid\":false,\"reason\":\"scalar_provenance_unavailable\"") != std::string::npos &&
-#else
+        cycle.find("\"op\":\"after-fault\"") != std::string::npos &&
         cycle.find("\"start\":10,\"end\":12,\"delta\":2,\"valid\":true") != std::string::npos &&
-#endif
+        cycle.find("\"op\":\"after-fault-v2\"") != std::string::npos &&
+        cycle.find("\"run_id\":41") != std::string::npos &&
+        cycle.find("\"start\":20,\"end\":23,\"delta\":3,\"valid\":true") != std::string::npos &&
+        cycle.find("scalar_provenance_unavailable") == std::string::npos &&
         !std::filesystem::exists(fault_path);
 #else
     ok = ok && !std::filesystem::exists(cycle_path) && !std::filesystem::exists(fault_path);

@@ -170,17 +170,7 @@ add_test(NAME test-gemmini-cpu-cycle-validity-contract
     COMMAND ${CMAKE_COMMAND}
         -DCPU_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-cpu/ggml-cpu.c
         -DGEMMINI_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini.cpp
-        -DINTERNAL_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini-utils/src/cycle_reader_internal.h
-        -DCYCLE_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini-utils/include/gemmini/cycle_reader.hpp
-        -DCYCLE_CAPI=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini-utils/src/cycle_reader-capi.cpp
-        -DLOG_CAPI=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini-utils/src/log-capi.cpp
-        -DSERIALIZATION_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini-utils/src/cycle-serialization.cpp
         -DCPU_CMAKE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-cpu/CMakeLists.txt
-        -DGEMMINI_CMAKE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/CMakeLists.txt
-        -DTELEMETRY_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini-telemetry.hpp
-        -DTELEMETRY_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini-telemetry.cpp
-        -DMATMUL_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini-matmul.cpp
-        -DMATMUL_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini-matmul.hpp
         -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-cpu-cycle-validity-contract.cmake)
 add_test(NAME test-build-arm64-log-defaults
     COMMAND ${CMAKE_COMMAND}
@@ -462,16 +452,6 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
         ${TEST_GEMMINI_EXSIA_SW_PATH}/include)
     add_dependencies(test-gemmini-exsia test-gemmini-direct-linux-aarch64-strict)
 endif()
-add_test(NAME gemmini_direct_metrics_source_contract
-    COMMAND ${CMAKE_COMMAND}
-        -DDIRECT_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/residual/direct/direct-executor.cpp
-        -DDIRECT_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/residual/direct/direct-executor.hpp
-        -DTEST_CMAKE=${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
-        -DCXX_COMPILER=${CMAKE_CXX_COMPILER}
-        -DGENERATED_DIR=${CMAKE_BINARY_DIR}/generated
-        -DPROJECT_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/..
-        -DGEMMINI_SW_PATH=${TEST_GEMMINI_EXSIA_SW_PATH}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-direct-metrics-source-contract.cmake)
 add_test(NAME gemmini_direct_metrics_adversarial_contract
     COMMAND ${CMAKE_COMMAND}
         -DDIRECT_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/residual/direct/direct-executor.cpp

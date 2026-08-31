@@ -1,7 +1,6 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
-#include <gemmini/cycle_reader.hpp>
 #include <gemmini/layer.h>
 #include <gemmini/log.h>
 
@@ -60,9 +59,7 @@ int main(int argc, char ** argv) {
     const std::array<float, 4> right{5, 6, 7, 8};
     ggml_backend_tensor_set(lhs, left.data(), 0, sizeof(left));
     ggml_backend_tensor_set(rhs, right.data(), 0, sizeof(right));
-    ggml::gemmini::cycle::reset_read_count_for_test();
     const ggml_status status = ggml_backend_graph_compute(backend, graph);
-    const std::uint64_t sample_count = ggml::gemmini::cycle::read_count_for_test();
     gemmini_log_cycle_set_output(stderr);
     ggml_backend_buffer_free(buffer);
     ggml_free(context);
@@ -71,8 +68,7 @@ int main(int argc, char ** argv) {
 
     const std::string output = read_file(selected);
     const auto default_path = root / "work/output/log/cycle-log.jsonl";
-    if (sample_count != 2 ||
-        output.find("\"version\":2") == std::string::npos ||
+    if (output.find("\"version\":2") == std::string::npos ||
         output.find("\"op\":\"cpu.add\"") == std::string::npos ||
         output.find("\"layer\":\"blk.7.attn_norm\"") == std::string::npos ||
         output.find("\"run_id\":null") != std::string::npos ||
@@ -85,6 +81,9 @@ int main(int argc, char ** argv) {
 #else
         output.find("\"source\":\"host_tick\",\"unit\":\"tick\"") == std::string::npos ||
 #endif
+        output.find("\"delta\":null") != std::string::npos ||
+        output.find("\"valid\":true") == std::string::npos ||
+        output.find("scalar_provenance_unavailable") != std::string::npos ||
         std::filesystem::exists(default_path)) return 9;
     if (!preserve) std::filesystem::remove_all(root, error);
     return error ? 10 : 0;

@@ -172,6 +172,7 @@ NativeCycleSample read_sample() noexcept
         {
             asm volatile("mrs %0, pmccntr_el0" : "=r"(snapshot.raw));
         }
+        std::atomic_signal_fence(std::memory_order_acq_rel);
         const uint32_t final_sequence = __atomic_load_n(&owner.page->lock, __ATOMIC_ACQUIRE);
         if (sequence == final_sequence)
         {
