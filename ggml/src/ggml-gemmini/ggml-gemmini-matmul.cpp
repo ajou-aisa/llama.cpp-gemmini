@@ -911,6 +911,18 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
         : MatMulStatus::invalid_contract;
 }
 
+MatMulStatus physical_dense_status(DenseMatmulStatus status) {
+    switch (status) {
+        case DenseMatmulStatus::success:
+            return MatMulStatus::success;
+        case DenseMatmulStatus::invalid_contract:
+            return MatMulStatus::invalid_contract;
+        case DenseMatmulStatus::unsupported:
+            return MatMulStatus::unsupported;
+    }
+    return MatMulStatus::invalid_state;
+}
+
 MatMulStatus execute_dense(ggml_gemmini_args_t &args) {
     if (args.A_fp32 != nullptr || args.B_fp32 != nullptr) {
         if (args.A_fp32 == nullptr || args.B_fp32 == nullptr || args.f_out == nullptr) {
@@ -933,31 +945,16 @@ MatMulStatus execute_dense(ggml_gemmini_args_t &args) {
     }
     test_detail::observe_backend_dispatch(args.tiled_matmul_type == CPU);
     if (uses_baseline_channel_route(args)) {
-        tiled_matmul_auto_baseline(&args, baseline_activation_for(args),
-                                   baseline_weight_quant_t::CHANNEL);
+        return physical_dense_status(tiled_matmul_auto_baseline(
+            &args, baseline_activation_for(args),
+            baseline_weight_quant_t::CHANNEL));
     } else if (args.weight_i8_scale_active) {
-        tiled_matmul_auto_baseline(&args, baseline_activation_for(args),
-                                   baseline_weight_quant_t::TENSOR);
+        return physical_dense_status(tiled_matmul_auto_baseline(
+            &args, baseline_activation_for(args),
+            baseline_weight_quant_t::TENSOR));
     } else {
-        using Format = ggml_gemmini_args_t::im2p_weight_format_t;
-        switch (args.weight_format) {
-            case Format::q8_h1:
-            case Format::q8_h2:
-            case Format::q8_hp1:
-            case Format::q8_hp2:
-                break;
-            case Format::q8_h0:
-            case Format::q8_channel:
-            case Format::q8_channel_dense_sidecar:
-            default:
-                return MatMulStatus::unsupported;
-        }
-        if (args.tiled_matmul_type != CPU && args.tiled_matmul_type != WS) {
-            return MatMulStatus::unsupported;
-        }
-        tiled_matmul_auto_im2p(&args);
+        return physical_dense_status(tiled_matmul_auto_im2p(&args));
     }
-    return MatMulStatus::success;
 }
 
 MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe, size_t stripe_id,
