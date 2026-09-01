@@ -172,33 +172,38 @@ require_order("${direct_full}" "U12 success-only callsite guard"
 require_absent("${finalize}" "\"rmd_merge_cycles\""
     "U12 must not duplicate stripe finalize Merge")
 
-# U14 and U15 each wrap only their route-local O(I*J) finite scan. A false
-# validation result still publishes the structurally executed interval.
-string(FIND "${run_full}" "finite_start_sample = cycle::read_sample()" full_validate)
+# U14 and U15 retain the origin/develop direct finite checks. Only U12 owns
+# native sample endpoints in run_full; finish_stripes owns none.
+require_count("${source}" "\"matmul_finite_output_validate_cycles\"" 0
+    "U14/U15 finite validation label/site count")
+require_count("${source}" "if (!finite_output(args()))" 2
+    "U14/U15 direct finite validation count")
+require_count("${run_full}" "cycle::read_sample()" 2
+    "run_full U12-only native endpoints")
+require_count("${finish_stripes}" "cycle::read_sample()" 0
+    "finish-stripes native endpoints")
+
+string(FIND "${run_full}" "if (!finite_output(args()))" full_validate)
 if(full_validate EQUAL -1)
-    message(FATAL_ERROR "U14 FULL finite validation is missing")
+    message(FATAL_ERROR "U14 FULL direct finite validation is missing")
 endif()
 string(SUBSTRING "${run_full}" ${full_validate} -1 full_epilogue)
-require_unidentified_checked_pair("${full_epilogue}"
-    "matmul_finite_output_validate_cycles" "finite_output(args())"
-    "U14 normal FULL finite validation")
-require_order("${full_epilogue}" "U14 validation result after publication"
-    "finite_start_sample = cycle::read_sample()" "finite_output(args())"
-    "finite_end_sample = cycle::read_sample()"
-    "gemmini_log_cycle_record_v2_checked_internal" "if (!finite)")
+require_order("${full_epilogue}" "U14 FULL failure/commit/state ordering"
+    "if (!finite_output(args()))" "discard_output_transaction()"
+    "return {MatMulStatus::invalid_contract, MatMulCapability::unsupported}"
+    "commit_output_transaction()" "state_ = MatMulState::completed"
+    "return { MatMulStatus::success, MatMulCapability::supported }")
 
-string(FIND "${finish_stripes}" "finite_start_sample = cycle::read_sample()" stripe_validate)
+string(FIND "${finish_stripes}" "if (!finite_output(args()))" stripe_validate)
 if(stripe_validate EQUAL -1)
-    message(FATAL_ERROR "U15 stripe finite validation is missing")
+    message(FATAL_ERROR "U15 stripe direct finite validation is missing")
 endif()
 string(SUBSTRING "${finish_stripes}" ${stripe_validate} -1 stripe_epilogue)
-require_unidentified_checked_pair("${stripe_epilogue}"
-    "matmul_finite_output_validate_cycles" "finite_output(args())"
-    "U15 finish-stripes finite validation")
-require_order("${stripe_epilogue}" "U15 validation result after publication"
-    "finite_start_sample = cycle::read_sample()" "finite_output(args())"
-    "finite_end_sample = cycle::read_sample()"
-    "gemmini_log_cycle_record_v2_checked_internal" "if (!finite)")
+require_order("${stripe_epilogue}" "U15 stripe failure/commit/state ordering"
+    "if (!finite_output(args()))" "discard_output_transaction()"
+    "state_ = MatMulState::idle" "return MatMulStatus::invalid_contract"
+    "commit_output_transaction()" "state_ = MatMulState::completed"
+    "return MatMulStatus::success")
 
 # U16 wraps only the normal facade's logical transaction copy. Early bypass
 # returns before the first endpoint; state cleanup remains after publication.
@@ -212,8 +217,6 @@ require_order("${commit}" "U16 success-only commit boundary"
     "gemmini_log_cycle_record_v2_checked_internal"
     "args().f_out = output_destination_")
 require_count("${source}" "\"rmd_merge_cycles\"" 1 "exact U12 label/site count")
-require_count("${source}" "\"matmul_finite_output_validate_cycles\"" 2
-    "exact U14/U15 label/site count")
 require_count("${source}" "\"matmul_output_commit_cycles\"" 1
     "exact U16 label/site count")
 

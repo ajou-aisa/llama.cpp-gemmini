@@ -1592,24 +1592,7 @@ MatMulResult MatMul::run_full() {
                  MatMulCapability::unsupported };
     }
 #endif
-#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
-    const cycle::NativeCycleSample finite_start_sample = cycle::read_sample();
-#endif
-    const bool finite = finite_output(args());
-#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
-    const cycle::NativeCycleSample finite_end_sample = cycle::read_sample();
-    const gemmini_native_cycle_sample_internal finite_start =
-        project_native_sample(finite_start_sample);
-    const gemmini_native_cycle_sample_internal finite_end =
-        project_native_sample(finite_end_sample);
-    const gemmini_cycle_record_v2 finite_detail{{
-        args().matmul_layer.empty() ? nullptr : args().matmul_layer.c_str(),
-        "matmul_finite_output_validate_cycles", finite_start.value, finite_end.value,
-        nullptr, 0, nullptr}, 0, 0, 0, 0, 0, 0};
-    gemmini_log_cycle_record_v2_checked_internal(
-        &finite_detail, &finite_start, &finite_end, true);
-#endif
-    if (!finite) {
+    if (!finite_output(args())) {
         discard_output_transaction();
         return {MatMulStatus::invalid_contract, MatMulCapability::unsupported};
     }
@@ -1727,24 +1710,7 @@ MatMulStatus MatMul::finish_stripes() {
         state_ = MatMulState::idle;
         return MatMulStatus::missing_stripes;
     }
-#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
-    const cycle::NativeCycleSample finite_start_sample = cycle::read_sample();
-#endif
-    const bool finite = finite_output(args());
-#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
-    const cycle::NativeCycleSample finite_end_sample = cycle::read_sample();
-    const gemmini_native_cycle_sample_internal finite_start =
-        project_native_sample(finite_start_sample);
-    const gemmini_native_cycle_sample_internal finite_end =
-        project_native_sample(finite_end_sample);
-    const gemmini_cycle_record_v2 finite_detail{{
-        args().matmul_layer.empty() ? nullptr : args().matmul_layer.c_str(),
-        "matmul_finite_output_validate_cycles", finite_start.value, finite_end.value,
-        nullptr, 0, nullptr}, 0, 0, 0, 0, 0, 0};
-    gemmini_log_cycle_record_v2_checked_internal(
-        &finite_detail, &finite_start, &finite_end, true);
-#endif
-    if (!finite) {
+    if (!finite_output(args())) {
         discard_output_transaction();
         state_ = MatMulState::idle;
         return MatMulStatus::invalid_contract;
