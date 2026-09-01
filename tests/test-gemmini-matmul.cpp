@@ -1086,12 +1086,20 @@ bool test_native_q4_multiblock_final_float_oracle() {
     MatmulOptions options{};
     options.mode = MatmulInvocationMode::full;
     options.rmd_backend = RmdBackend::cpu_direct;
+    test_reset_matmul_counters();
     const MatmulStatus status = matmul(args, options);
+    const MatmulTestCounters counters = test_matmul_counters();
     if (!status.ok()) {
         std::fprintf(stderr, "multiblock Q4 status=%u message=%s\n",
                      static_cast<unsigned>(status.code), status.message);
         return false;
     }
+    const bool uses_integer_blocks = expect(
+        counters.native_integer_block_dots ==
+                rows * columns * blocks_per_row &&
+            counters.native_post_dot_scales ==
+                rows * columns * blocks_per_row,
+        "INT A4/Q4 uses integer block-dot then block-scale execution");
 
     bool values_match = true;
     bool holes_preserved = true;
@@ -1132,7 +1140,7 @@ bool test_native_q4_multiblock_final_float_oracle() {
             holes_preserved = false;
         }
     }
-    return expect(values_match,
+    return uses_integer_blocks && expect(values_match,
                   "multiblock Q4 final-float scalar oracle matches") &&
         expect(holes_preserved,
                "multiblock Q4 oracle preserves strided output holes");
@@ -1186,10 +1194,123 @@ bool test_native_q16_hp1_cpu_dense_output() {
     MatmulOptions options{};
     options.mode = MatmulInvocationMode::full;
     options.rmd_backend = RmdBackend::cpu_direct;
+    test_reset_matmul_counters();
     const MatmulStatus status = matmul(args, options);
-    return expect(status.ok(), "native Q16_HP1 CPU FULL succeeds") &&
+    const MatmulTestCounters counters = test_matmul_counters();
+    return expect(status.ok(), "native Q16_HP1 INT FULL succeeds") &&
+        expect(counters.native_integer_block_dots == 1 &&
+                   counters.native_post_dot_scales == 1,
+               "INT A16/Q16 uses integer block-dot then block-scale execution") &&
         expect(output == 96.0f,
-               "native Q16_HP1 CPU FULL computes scaled dot product");
+               "native Q16_HP1 INT FULL computes scaled dot product");
+#else
+    return true;
+#endif
+}
+
+bool test_q16_pipeline_owns_args_snapshot() {
+#if GGML_GEMMINI_ACTIVATION_BITS == 16 && GGML_GEMMINI_WEIGHT_BITS == 16
+    constexpr size_t rows = DIM + 1;
+    ggml_gemmini_args_t args{};
+    args.I = rows;
+    args.J = 1;
+    args.K = 32;
+    args.sA = args.K;
+    args.sB = args.K;
+    args.tiled_matmul_type = static_cast<tiled_matmul_type_t>(2);
+    args.tile_I = 1;
+    args.tile_J = 1;
+    args.tile_K = 1;
+    args.activation_rows_per_stripe = DIM;
+    args.transpose_B = true;
+    args.residual_route = residual::ResidualRoute::cpu_direct;
+    if (!args.A.allocate(args.I, args.K, 16)) {
+        return expect(false, "Q16 pipeline activation allocation succeeds");
+    }
+    for (size_t row = 0; row < args.I; ++row) {
+        for (size_t k = 0; k < args.K; ++k) {
+            if (!args.A.set(row, k, 3)) {
+                return expect(false, "Q16 pipeline activation initialization succeeds");
+            }
+        }
+    }
+
+    block_q16_hp1 weight{};
+    std::fill(std::begin(weight.qs), std::end(weight.qs), int16_t{1});
+    weight.m = 0;
+    weight.channel_scale = 1.0f;
+    args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q16_hp1;
+    args.q16_hp1_blocks = &weight;
+    args.native_block_count = 1;
+    args.native_blocks_per_row = 1;
+    args.blocks_per_row = 1;
+    args.blocks_K = 1;
+    args.blocks_J = 1;
+    args.blocks_I = 1;
+    args.block_size_k = 32;
+    args.native_weight_bytes = sizeof(weight);
+
+    std::vector<float> output(rows, 0.0f);
+    std::vector<float> decoy(rows, -91.0f);
+    args.f_out = output.data();
+    args.stride_f_out = 1;
+    args.col_stride_f_out = 1;
+
+    MatmulOptions options{};
+    options.mode = MatmulInvocationMode::stripe_pipeline;
+    options.job_capacity = 2;
+    options.rmd_backend = RmdBackend::cpu_direct;
+    auto execution = prepare_execution(&args, options);
+    MatmulStripeCollector collector(2);
+    if (!expect(execution.status().ok() && collector.start(execution),
+                "Q16 pointer pipeline starts before producer metadata exists")) {
+        return false;
+    }
+
+    args.act_quant.storage().emplace<quants::act::exsia::Meta>();
+    args.f_out = decoy.data();
+
+    quants::act::exsia::StripeReadyEvent first{};
+    first.stripe_id = 0;
+    first.row_begin = 0;
+    first.row_end = DIM;
+    first.activation_metadata = quants::act::exsia::StripeMetadataSnapshot{
+        0,
+        config::GGML_GEMMINI_ACTIVATION_RHO,
+        GGML_GEMMINI_EXSIA_SIGMA,
+        0,
+    };
+    quants::act::exsia::StripeReadyEvent second{};
+    second.stripe_id = 1;
+    second.slot = 1;
+    second.row_begin = DIM;
+    second.row_end = rows;
+    second.activation_metadata = quants::act::exsia::StripeMetadataSnapshot{
+        0,
+        config::GGML_GEMMINI_ACTIVATION_RHO,
+        GGML_GEMMINI_EXSIA_SIGMA,
+        1,
+    };
+    residual::DirectStripeBuilder residual_builder;
+    residual_builder.reset(1, DIM, 1, args.K, args.J);
+    if (!residual_builder.add_residual(0, 0, 1)) {
+        return expect(false, "Q16 pipeline residual fixture initializes");
+    }
+    second.direct_residual = residual_builder.finish();
+    const auto * sink = collector.sink();
+    const bool accepted =
+        sink->on_ready(sink->user_data, first) &&
+        sink->on_ready(sink->user_data, second);
+    const MatmulStatus collected = collector.finish();
+    const MatmulStatus completed = finish_execution(execution);
+
+    return expect(accepted && collected.ok() && completed.ok(),
+                  "Q16 pointer pipeline completes from staged metadata") &&
+        expect(output.front() == 96.0f && output.back() == 194.0f,
+               "Q16 pipeline merges each stripe with its staged activation metadata") &&
+        expect(std::all_of(decoy.begin(), decoy.end(),
+                           [](float value) { return value == -91.0f; }),
+               "producer args mutation cannot redirect Q16 worker output");
 #else
     return true;
 #endif
@@ -1233,7 +1354,7 @@ int main(int argc, char ** argv) {
             test_native_q4_repeating_bias() &&
             test_native_q4_multiblock_final_float_oracle();
         if (ok) {
-            std::puts("PASS: native Q4_HP1 CPU dense output");
+            std::puts("PASS: native Q4_HP1 INT dense output");
         }
         return ok ? 0 : 1;
     }
@@ -1248,7 +1369,15 @@ int main(int argc, char ** argv) {
     if (argc == 2 && std::string(argv[1]) == "--case=native-q16-cpu") {
         const bool ok = test_native_q16_hp1_cpu_dense_output();
         if (ok) {
-            std::puts("PASS: native Q16_HP1 CPU dense output");
+            std::puts("PASS: native Q16_HP1 INT dense output");
+        }
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 &&
+        std::string(argv[1]) == "--case=q16-pipeline-args-ownership") {
+        const bool ok = test_q16_pipeline_owns_args_snapshot();
+        if (ok) {
+            std::puts("PASS: Q16 pipeline owns immutable execution args");
         }
         return ok ? 0 : 1;
     }
@@ -1275,7 +1404,8 @@ int main(int argc, char ** argv) {
         return ok ? 0 : 1;
     }
 #if GGML_GEMMINI_ACTIVATION_BITS == 16 && GGML_GEMMINI_WEIGHT_BITS == 16
-    if (!test_native_q16_hp1_cpu_dense_output()) {
+    if (!test_native_q16_hp1_cpu_dense_output() ||
+        !test_q16_pipeline_owns_args_snapshot()) {
         return 1;
     }
 #else

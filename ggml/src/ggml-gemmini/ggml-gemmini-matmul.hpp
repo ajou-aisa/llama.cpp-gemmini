@@ -202,6 +202,8 @@ struct MatmulTestCounters {
     uint64_t residual_dispatches = 0;
     uint64_t hardware_dispatches = 0;
     uint64_t fallback_dispatches = 0;
+    uint64_t native_integer_block_dots = 0;
+    uint64_t native_post_dot_scales = 0;
 };
 
 void test_reset_matmul_counters();
