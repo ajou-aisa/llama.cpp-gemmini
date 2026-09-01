@@ -1086,12 +1086,20 @@ bool test_native_q4_multiblock_final_float_oracle() {
     MatmulOptions options{};
     options.mode = MatmulInvocationMode::full;
     options.rmd_backend = RmdBackend::cpu_direct;
+    test_reset_matmul_counters();
     const MatmulStatus status = matmul(args, options);
+    const MatmulTestCounters counters = test_matmul_counters();
     if (!status.ok()) {
         std::fprintf(stderr, "multiblock Q4 status=%u message=%s\n",
                      static_cast<unsigned>(status.code), status.message);
         return false;
     }
+    const bool uses_integer_blocks = expect(
+        counters.native_integer_block_dots ==
+                rows * columns * blocks_per_row &&
+            counters.native_post_dot_scales ==
+                rows * columns * blocks_per_row,
+        "INT A4/Q4 uses integer block-dot then block-scale execution");
 
     bool values_match = true;
     bool holes_preserved = true;
@@ -1132,7 +1140,7 @@ bool test_native_q4_multiblock_final_float_oracle() {
             holes_preserved = false;
         }
     }
-    return expect(values_match,
+    return uses_integer_blocks && expect(values_match,
                   "multiblock Q4 final-float scalar oracle matches") &&
         expect(holes_preserved,
                "multiblock Q4 oracle preserves strided output holes");
@@ -1186,10 +1194,15 @@ bool test_native_q16_hp1_cpu_dense_output() {
     MatmulOptions options{};
     options.mode = MatmulInvocationMode::full;
     options.rmd_backend = RmdBackend::cpu_direct;
+    test_reset_matmul_counters();
     const MatmulStatus status = matmul(args, options);
-    return expect(status.ok(), "native Q16_HP1 CPU FULL succeeds") &&
+    const MatmulTestCounters counters = test_matmul_counters();
+    return expect(status.ok(), "native Q16_HP1 INT FULL succeeds") &&
+        expect(counters.native_integer_block_dots == 1 &&
+                   counters.native_post_dot_scales == 1,
+               "INT A16/Q16 uses integer block-dot then block-scale execution") &&
         expect(output == 96.0f,
-               "native Q16_HP1 CPU FULL computes scaled dot product");
+               "native Q16_HP1 INT FULL computes scaled dot product");
 #else
     return true;
 #endif
@@ -1341,7 +1354,7 @@ int main(int argc, char ** argv) {
             test_native_q4_repeating_bias() &&
             test_native_q4_multiblock_final_float_oracle();
         if (ok) {
-            std::puts("PASS: native Q4_HP1 CPU dense output");
+            std::puts("PASS: native Q4_HP1 INT dense output");
         }
         return ok ? 0 : 1;
     }
@@ -1356,7 +1369,7 @@ int main(int argc, char ** argv) {
     if (argc == 2 && std::string(argv[1]) == "--case=native-q16-cpu") {
         const bool ok = test_native_q16_hp1_cpu_dense_output();
         if (ok) {
-            std::puts("PASS: native Q16_HP1 CPU dense output");
+            std::puts("PASS: native Q16_HP1 INT dense output");
         }
         return ok ? 0 : 1;
     }
