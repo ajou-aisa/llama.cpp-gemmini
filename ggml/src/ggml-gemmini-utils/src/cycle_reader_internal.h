@@ -44,7 +44,6 @@ typedef struct gemmini_native_cycle_sample_internal {
 
 struct gemmini_cycle_record_v2;
 
-gemmini_native_cycle_sample_internal gemmini_read_native_cycle_sample_internal(void) GEMMINI_INTERNAL_NOEXCEPT;
 uint8_t gemmini_log_cycle_record_v2_checked_internal(
     const struct gemmini_cycle_record_v2 * record,
     const gemmini_native_cycle_sample_internal * start,

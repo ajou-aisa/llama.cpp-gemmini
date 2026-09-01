@@ -3,7 +3,6 @@
 add_library(ggml-gemmini-utils
     src/debug.cpp
     src/cycle.cpp
-    src/cycle-serialization.cpp
     src/log-capi.cpp
     src/cycle_reader-capi.cpp
 )

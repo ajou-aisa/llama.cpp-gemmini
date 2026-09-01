@@ -4,10 +4,10 @@ endif()
 file(READ "${MATMUL_SOURCE}" source)
 get_filename_component(gemmini_source_dir "${MATMUL_SOURCE}" DIRECTORY)
 set(log_capi_source "${gemmini_source_dir}/../ggml-gemmini-utils/src/log-capi.cpp")
-set(cycle_serialization_source
-    "${gemmini_source_dir}/../ggml-gemmini-utils/src/cycle-serialization.cpp")
+set(cycle_source
+    "${gemmini_source_dir}/../ggml-gemmini-utils/src/cycle.cpp")
 file(READ "${log_capi_source}" log_capi)
-file(READ "${cycle_serialization_source}" cycle_serialization)
+file(READ "${cycle_source}" cycle_source_text)
 
 function(extract_between output begin_marker end_marker)
     string(FIND "${source}" "${begin_marker}" begin)
@@ -147,7 +147,7 @@ endforeach()
 foreach(token IN ITEMS "add_nullable_string(\"op\"" "add_identity(\"run_id\""
                        "add_identity(\"stripe_id\"" "add_null(\"delta\")"
                        "add_key(\"valid\")" "add_string(\"reason\"")
-    require_token("${cycle_serialization}" "${token}"
+    require_token("${cycle_source_text}" "${token}"
         "checked sink machine-consumed nullable fields contract")
 endforeach()
 

@@ -62,14 +62,14 @@ if(NOT DEFINED SEMANTIC_CASE OR SEMANTIC_CASE STREQUAL "F2")
                               folding_start_cycle folding_end_cycle)
         require_absent("${ready_event}" "${endpoint}"
             "F2: cross-task native endpoint transport")
-        require_absent("${transport}" "event.${endpoint}"
+        require_absent("${matmul}" "event.${endpoint}"
             "F2: unchecked cross-task collector arithmetic")
         require_absent("${exsia_source}" "event.${endpoint} ="
             "F2: duplicate raw native consumer")
     endforeach()
     foreach(legacy IN ITEMS local_start_ns local_end_ns folding_start_ns folding_end_ns)
         require_present("${ready_event}" "${legacy}" "F2: legacy ns transport")
-        require_present("${transport}" "event.${legacy}" "F2: legacy ns collector")
+        require_present("${matmul}" "event.${legacy}" "F2: legacy ns collector")
     endforeach()
     foreach(structural_token IN ITEMS "exsia.local" "exsia.stripe_total"
                                       "checked_profile_interval(interval, !pipeline_cross_task)")
@@ -94,13 +94,13 @@ if(NOT DEFINED SEMANTIC_CASE OR SEMANTIC_CASE STREQUAL "F4")
     math(EXPR quant_length "${quant_end} - ${quant_begin}")
     string(SUBSTRING "${telemetry_source}" ${quant_begin} ${quant_length} quant_serializer)
     foreach(required IN ITEMS
-            "detail::null_field(out, \"start\")"
-            "detail::null_field(out, \"end\")"
-            "detail::null_field(out, \"delta\")"
-            "detail::field(out, \"start_ns\", record.start_ns)"
-            "detail::field(out, \"end_ns\", record.end_ns)"
-            "detail::field(out, \"duration_ns\", record.end_ns - record.start_ns)"
-            "detail::string_field(out, \"reason\", \"structurally_cross_task\")")
+            "null_field(out, \"start\")"
+            "null_field(out, \"end\")"
+            "null_field(out, \"delta\")"
+            "field(out, \"start_ns\", record.start_ns)"
+            "field(out, \"end_ns\", record.end_ns)"
+            "field(out, \"duration_ns\", record.end_ns - record.start_ns)"
+            "string_field(out, \"reason\", \"structurally_cross_task\")")
         require_present("${quant_serializer}" "${required}"
             "F4: structural cross-task quantization telemetry")
     endforeach()

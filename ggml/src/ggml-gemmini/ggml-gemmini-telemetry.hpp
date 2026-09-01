@@ -1,20 +1,9 @@
 #pragma once
 
 #include <cstdint>
-#include <iosfwd>
 #include <string>
-#include <string_view>
 
 namespace ggml::gemmini {
-
-namespace detail {
-void json_string(std::ostringstream & out, std::string_view value);
-void field(std::ostringstream & out, const char * name, std::uint64_t value);
-void string_field(std::ostringstream & out, const char * name, std::string_view value);
-void nullable_string_field(
-    std::ostringstream & out, const char * name, std::string_view value);
-void null_field(std::ostringstream & out, const char * name);
-} // namespace detail
 
 inline constexpr const char * kCycleTelemetrySchema = "gemmini.cycle";
 inline constexpr std::uint32_t kCycleTelemetryVersion = 2;

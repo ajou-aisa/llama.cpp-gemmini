@@ -86,7 +86,6 @@ ggml_add_backend_library(ggml-gemmini
                           ggml-gemmini-buffer.cpp
                           ggml-gemmini-geometry.hpp
                           ggml-gemmini-matmul.cpp
-                          ggml-gemmini-matmul-telemetry.cpp
                           ggml-gemmini-telemetry.cpp
                           ggml-gemmini-q8-h1-artifact.cpp
                           ggml-gemmini-q8-h1-artifact-reader.cpp

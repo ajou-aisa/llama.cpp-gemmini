@@ -321,12 +321,6 @@ struct MatmulCapturedStripe {
     MatmulCaptureTiming timing;
 };
 
-MatmulCapturedStripe capture_collector_event(
-    const quants::act::exsia::StripeReadyEvent & event,
-    MatmulCaptureTiming timing);
-void apply_captured_stripe(
-    const MatmulCapturedStripe & captured, MatmulJobMetrics & profile);
-
 } // namespace detail
 
 struct MatmulCollectorSnapshot {

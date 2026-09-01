@@ -1035,7 +1035,7 @@ add_test(NAME test-gemmini-profiled-domain-contract
     COMMAND ${CMAKE_COMMAND}
         -DMATMUL_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini-matmul.cpp
         -DMATMUL_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini-matmul.hpp
-        -DMATMUL_TELEMETRY=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini-matmul-telemetry.cpp
+        -DMATMUL_TELEMETRY=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini-telemetry.cpp
         -DGEMMINI_ENTRY_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini.cpp
         -DGEMMINI_SOURCE_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini
         -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-profiled-domain-contract.cmake)
