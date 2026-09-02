@@ -501,8 +501,8 @@ bool test_publication_geometry() {
                           b_k3.pipeline.stats.rtl_stripes_published == 4 &&
                           a_k3.pipeline.stats.rtl_completed_output_works == 3 &&
                           b_k3.pipeline.stats.rtl_completed_output_works == 16 &&
-                          a_k3.pipeline.stats.rtl_completed_fragments == 12 &&
-                          b_k3.pipeline.stats.rtl_completed_fragments == 64 &&
+                          a_k3.pipeline.stats.rtl_completed_fragments == 24 &&
+                          b_k3.pipeline.stats.rtl_completed_fragments == 128 &&
                           a_k3.pipeline.stats.rtl_scheduler_groups_completed == 3 &&
                           b_k3.pipeline.stats.rtl_scheduler_groups_completed == 4,
                       "works, scheduler groups, fragments, and publications remain distinct") &&
@@ -513,8 +513,8 @@ bool test_publication_geometry() {
                       "K fragments change fragment stats but never publication count");
   if (ok) {
     std::printf("PUBLICATION_GEOMETRY A_rows=[%d,%d,1] B_rows=[%d,%d,%d,%d] "
-                "A_works/groups/fragments=3/3/12 "
-                "B_works/groups/fragments=16/4/64 full_publications=0 "
+                "A_works/groups/fragments=3/3/24 "
+                "B_works/groups/fragments=16/4/128 full_publications=0 "
                 "slots=A[0,1,0],B[0,1,0,1]\n",
                 DIM, DIM, 5 * DIM, 5 * DIM, 5 * DIM, DIM);
   }

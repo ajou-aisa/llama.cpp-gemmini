@@ -43,6 +43,7 @@ int main(int argc, char ** argv) {
 
     ggml_backend_t backend = ggml_backend_cpu_init();
     if (!backend) return 5;
+    ggml_backend_cpu_set_n_threads(backend, 1);
     ggml_init_params params{ggml_tensor_overhead() * 8 + ggml_graph_overhead_custom(8, false), nullptr, true};
     ggml_context * context = ggml_init(params);
     if (!context) return 6;
@@ -74,6 +75,15 @@ int main(int argc, char ** argv) {
         output.find("\"stripe_id\":null") == std::string::npos ||
         output.find("\"node_id\":0") == std::string::npos ||
         output.find("\"worker_id\":0") == std::string::npos ||
+        output.find("\"stripe_id\":0") != std::string::npos ||
+#if defined(__linux__) && defined(__aarch64__)
+        output.find("\"source\":\"linux_perf_cpu_cycles\",\"unit\":\"cycle\"") == std::string::npos ||
+#else
+        output.find("\"source\":\"host_tick\",\"unit\":\"tick\"") == std::string::npos ||
+#endif
+        output.find("\"delta\":null") != std::string::npos ||
+        output.find("\"valid\":true") == std::string::npos ||
+        output.find("scalar_provenance_unavailable") != std::string::npos ||
         std::filesystem::exists(default_path)) return 9;
     if (!preserve) std::filesystem::remove_all(root, error);
     return error ? 10 : 0;

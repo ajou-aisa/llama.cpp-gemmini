@@ -347,6 +347,29 @@ namespace ggml::gemmini::quants::act::exsia
         int16_t theta = std::numeric_limits<int16_t>::min();
     };
 
+    enum class ProfileCycleStatus : uint8_t
+    {
+        complete,
+        missing_component,
+        invalid_start,
+        invalid_end,
+        source_mismatch,
+        event_owner_mismatch,
+        event_generation_mismatch,
+        structurally_cross_task,
+        counter_regression,
+    };
+
+    struct ProfileCycleValue
+    {
+        std::optional<uint64_t> cycles;
+        ProfileCycleStatus status = ProfileCycleStatus::missing_component;
+#if defined(__linux__) && defined(__aarch64__)
+        ggml::gemmini::cycle::NativeCycleReason sample_reason =
+            ggml::gemmini::cycle::NativeCycleReason::none;
+#endif
+    };
+
     struct StripeReadyEvent
     {
         uint64_t run_id = 0;
@@ -357,23 +380,17 @@ namespace ggml::gemmini::quants::act::exsia
         std::optional<StripeMetadataSnapshot> activation_metadata;
         uint64_t quantization_start = 0;
         uint64_t quantization_end = 0;
+        uint64_t quantization_start_ns = 0;
+        uint64_t quantization_end_ns = 0;
         // Residual work for this stripe, or nullptr when the stripe has no residual.
         // The packet owns its buffers, so it stays valid after the ExSIA slot is released.
         ggml::gemmini::rmd::StripePacketHandle rmd_packet;
         ggml::gemmini::residual::DirectStripePayloadHandle direct_residual;
         uint64_t rmd_pack_ns = 0;
-        uint64_t local_start_cycle = 0;
-        uint64_t local_end_cycle = 0;
-        uint64_t folding_start_cycle = 0;
-        uint64_t folding_end_cycle = 0;
-        uint64_t local_group3_start_cycle = 0;
-        uint64_t local_group3_end_cycle = 0;
         uint64_t local_start_ns = 0;
         uint64_t local_end_ns = 0;
         uint64_t folding_start_ns = 0;
         uint64_t folding_end_ns = 0;
-        std::array<uint64_t, 3> local_worker_start_ns{};
-        std::array<uint64_t, 3> local_worker_end_ns{};
         uint64_t mask_assembly_start_ns = 0;
         uint64_t mask_assembly_end_ns = 0;
         uint64_t exponent_reduction_start_ns = 0;
@@ -401,6 +418,20 @@ namespace ggml::gemmini::quants::act::exsia
             ++count;
         }
 
+#if defined(__linux__) && defined(__aarch64__)
+        void add(const ProfileCycleValue &value) noexcept
+        {
+            if (value.cycles.has_value()) add(*value.cycles);
+        }
+
+        void merge(const StageCycleStats &other) noexcept
+        {
+            sum += other.sum;
+            max = std::max(max, other.max);
+            count += other.count;
+        }
+#endif
+
         void reset() noexcept
         {
             sum = 0;
@@ -427,6 +458,10 @@ namespace ggml::gemmini::quants::act::exsia
         uint64_t p1 = 0;
         uint64_t p2 = 0;
         uint64_t p3 = 0;
+#if defined(__linux__) && defined(__aarch64__)
+        std::array<ggml::gemmini::cycle::NativeCycleSample, 5> stage_endpoints{};
+        std::array<ProfileCycleValue, 4> stage_intervals{};
+#endif
 #endif
         P3Path p3_path = P3Path::BypassNoIntegerOutlier;
 #if EXSIA_BRANCH_COUNTS_ENABLED
@@ -489,6 +524,10 @@ namespace ggml::gemmini::quants::act::exsia
         uint64_t end_ns = 0;
         uint64_t start_thread_id = 0;
         uint64_t end_thread_id = 0;
+#if defined(__linux__) && defined(__aarch64__)
+        ggml::gemmini::cycle::NativeCycleSample start_sample{};
+        ggml::gemmini::cycle::NativeCycleSample end_sample{};
+#endif
         bool valid = false;
     };
 
@@ -508,6 +547,10 @@ namespace ggml::gemmini::quants::act::exsia
         StripeCycleStats stats;
 #endif
     };
+
+    ProfileCycleValue checked_profile_interval(
+        const ProfileInterval &interval,
+        bool structurally_same_owner_eligible = true) noexcept;
 
 #endif
 
@@ -542,6 +585,8 @@ namespace ggml::gemmini::quants::act::exsia
         uint64_t folding_commit_ns = 0;
         uint64_t quantization_start = 0;
         uint64_t quantization_end = 0;
+        uint64_t quantization_start_ns = 0;
+        uint64_t quantization_end_ns = 0;
 
 #if EXSIA_BRANCH_COUNTS_ENABLED
         StripeCycleStats cycle_stats;
@@ -597,6 +642,8 @@ namespace ggml::gemmini::quants::act::exsia
             folding_commit_ns = 0;
             quantization_start = 0;
             quantization_end = 0;
+            quantization_start_ns = 0;
+            quantization_end_ns = 0;
 #if EXSIA_BRANCH_COUNTS_ENABLED
             cycle_stats.reset();
 #endif
@@ -650,6 +697,8 @@ namespace ggml::gemmini::quants::act::exsia
             folding_commit_ns = 0;
             quantization_start = 0;
             quantization_end = 0;
+            quantization_start_ns = 0;
+            quantization_end_ns = 0;
 #if EXSIA_BRANCH_COUNTS_ENABLED
             cycle_stats.reset();
 #endif
@@ -670,10 +719,12 @@ namespace ggml::gemmini::quants::act::exsia
             lifecycle = StripePipelineSlotState::LocalFilled;
         }
 
-        void mark_quantization_started(uint64_t start)
+        void mark_quantization_started(uint64_t start,
+                                       uint64_t start_ns = 0)
         {
             assert(lifecycle == StripePipelineSlotState::Acquired);
             quantization_start = start;
+            quantization_start_ns = start_ns;
         }
 
         void mark_folding_committed(uint64_t commit_ns = 0,
@@ -682,6 +733,7 @@ namespace ggml::gemmini::quants::act::exsia
             assert(lifecycle == StripePipelineSlotState::LocalFilled);
             folding_commit_ns = commit_ns;
             quantization_end = quantization_end_tick;
+            quantization_end_ns = commit_ns;
             lifecycle = StripePipelineSlotState::FoldingCommitted;
         }
 

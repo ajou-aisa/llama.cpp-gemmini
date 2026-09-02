@@ -740,8 +740,8 @@ static void emit_quantization_timings(
     record.slot = stripe.event.slot;
     record.row_begin = stripe.event.row_begin;
     record.row_end = stripe.event.row_end;
-    record.start = stripe.event.quantization_start;
-    record.end = stripe.event.quantization_end;
+    record.start_ns = stripe.event.quantization_start_ns;
+    record.end_ns = stripe.event.quantization_end_ns;
     emit_cycle_telemetry(record);
   }
 }

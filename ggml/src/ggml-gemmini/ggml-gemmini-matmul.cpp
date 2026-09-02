@@ -4,6 +4,10 @@
 
 #include <gemmini/log.hpp>
 #include <gemmini/cycle_reader.hpp>
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+#include <gemmini/log.h>
+#include "../ggml-gemmini-utils/src/cycle_reader_internal.h"
+#endif
 
 #include <cstdio>
 #include <algorithm>
@@ -34,6 +38,8 @@ const char * telemetry_backend_name(RmdBackend backend) {
 const char * telemetry_clock_source() {
 #ifdef __riscv
     return "riscv_cycle";
+#elif defined(__linux__) && defined(__aarch64__)
+    return "linux_perf_cpu_cycles";
 #else
     return "host_tick";
 #endif
@@ -293,10 +299,12 @@ RmdTelemetryRecord make_rmd_telemetry_record(
         record.timing.backend_service += elapsed(
             profile.telemetry_backend_start, profile.telemetry_backend_end);
         record.timing.merge += elapsed(profile.telemetry_merge_start, profile.telemetry_merge_end);
+#if !(defined(__linux__) && defined(__aarch64__))
         if (profile.telemetry_queue_tick != 0) {
             record.timing.queue += elapsed(
                 profile.telemetry_queue_tick, profile.telemetry_residual_start);
         }
+#endif
         record.timing.residual_total += elapsed(
             profile.telemetry_residual_start, profile.telemetry_residual_end);
         if (record.timing.dense_end == 0 || profile.telemetry_dense_end < record.timing.dense_end)
@@ -349,7 +357,11 @@ std::string serialize_rmd_telemetry(const RmdTelemetryRecord & record) {
         << ",\"backend_service\":" << record.timing.backend_service
         << ",\"merge\":" << record.timing.merge
         << ",\"residual_total\":" << record.timing.residual_total
+#if defined(__linux__) && defined(__aarch64__)
+        << ",\"queue\":null,\"queue_reason\":\"structurally_cross_task\""
+#else
         << ",\"queue\":" << record.timing.queue
+#endif
         << ",\"dense_end\":" << record.timing.dense_end
         << ",\"residual_start\":" << record.timing.residual_start << "}"
         << ",\"geometry\":{\"packet_count\":" << record.geometry.packet_count
@@ -408,6 +420,18 @@ std::string serialize_rmd_telemetry(const RmdTelemetryRecord & record) {
 #include <utility>
 
 namespace ggml::gemmini {
+
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+namespace {
+gemmini_native_cycle_sample_internal project_native_sample(
+        const cycle::NativeCycleSample & sample) {
+    return {sample.value, static_cast<uint8_t>(sample.valid),
+            static_cast<uint8_t>(sample.reason),
+            GEMMINI_NATIVE_CYCLE_SOURCE_LINUX_PERF_CPU_CYCLES,
+            sample.owner_event_token, sample.generation};
+}
+}
+#endif
 
 namespace test_detail {
 #if defined(GGML_GEMMINI_TESTING)
@@ -1330,6 +1354,69 @@ const char * backend_route_name(BackendRoute route) {
     return "unknown";
 }
 
+MatmulCapturedStripe capture_collector_event(
+        const quants::act::exsia::StripeReadyEvent & event,
+        MatmulCaptureTiming timing) {
+    MatmulCapturedStripe captured{};
+    captured.run_id = event.run_id;
+    captured.stripe_id = event.stripe_id;
+    captured.slot = event.slot;
+    captured.row_begin = event.row_begin;
+    captured.row_end = event.row_end;
+    captured.activation_metadata = event.activation_metadata;
+#if GGML_GEMMINI_ENABLE_RMD
+    captured.rmd_packet = event.rmd_packet;
+    captured.direct_residual = event.direct_residual;
+    if (event.rmd_packet != nullptr || event.direct_residual != nullptr) {
+        timing.rmd_pack.nanoseconds = event.rmd_pack_ns;
+        timing.rmd_pack.count = 1;
+    }
+#endif
+    captured.la3_ns = event.local_end_ns >= event.local_start_ns ?
+        event.local_end_ns - event.local_start_ns : 0;
+    captured.sf1_ns = event.folding_end_ns >= event.folding_start_ns ?
+        event.folding_end_ns - event.folding_start_ns : 0;
+    captured.sf_mask_start_ns = event.mask_assembly_start_ns;
+    captured.sf_mask_end_ns = event.mask_assembly_end_ns;
+    captured.sf_exponent_start_ns = event.exponent_reduction_start_ns;
+    captured.sf_exponent_end_ns = event.exponent_reduction_end_ns;
+    captured.sf_folding_start_ns = event.folding_start_ns;
+    captured.sf_folding_end_ns = event.folding_end_ns;
+    captured.sf_commit_ns = event.folding_commit_ns;
+    captured.timing = std::move(timing);
+    return captured;
+}
+
+void apply_captured_stripe(
+        const MatmulCapturedStripe & captured, MatmulJobMetrics & profile) {
+    profile.run_id = captured.run_id;
+    profile.stripe_id = captured.stripe_id;
+    profile.slot = captured.slot;
+    profile.row_begin = captured.row_begin;
+    profile.row_end = captured.row_end;
+    profile.la3_ns = captured.la3_ns;
+    profile.sf1_ns = captured.sf1_ns;
+    profile.sf_mask_start_ns = captured.sf_mask_start_ns;
+    profile.sf_mask_end_ns = captured.sf_mask_end_ns;
+    profile.sf_exponent_start_ns = captured.sf_exponent_start_ns;
+    profile.sf_exponent_end_ns = captured.sf_exponent_end_ns;
+    profile.sf_folding_start_ns = captured.sf_folding_start_ns;
+    profile.sf_folding_end_ns = captured.sf_folding_end_ns;
+    profile.sf_commit_ns = captured.sf_commit_ns;
+    profile.la = {captured.la3_ns, captured.la3_ns != 0 ? 1U : 0U};
+    profile.sf = {captured.sf1_ns, captured.sf1_ns != 0 ? 1U : 0U};
+    profile.capture_copy = captured.timing.capture_copy;
+    profile.producer_wait = captured.timing.producer_wait;
+    profile.queue_insert = captured.timing.queue_insert;
+    profile.rmd_pack = captured.timing.rmd_pack;
+    profile.producer_wait_start_ns = captured.timing.producer_wait_start_ns;
+    profile.producer_wait_end_ns = captured.timing.producer_wait_end_ns;
+    profile.capture_queue_enqueue_ns = captured.timing.queued_ns;
+    profile.telemetry_queue_tick = captured.timing.telemetry_queued_tick;
+    profile.sf_handoff.nanoseconds = captured.sf1_ns + profile.handoff.nanoseconds;
+    profile.sf_handoff.count = 1;
+}
+
 PipelineStripeTelemetry pipeline_stripe_telemetry(
         const char * layer, const MatmulJobMetrics & profile) {
     PipelineStripeTelemetry record{};
@@ -1452,12 +1539,28 @@ MatMulStatus MatMul::begin_output_transaction() {
 
 void MatMul::commit_output_transaction() {
     if (output_destination_ == nullptr || args_ptr_ == nullptr) return;
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+    const cycle::NativeCycleSample commit_start_sample = cycle::read_sample();
+#endif
     for (size_t row = 0; row < args().I; ++row) {
         for (size_t column = 0; column < args().J; ++column) {
             const size_t offset = row * output_row_stride_ + column * output_col_stride_;
             output_destination_[offset] = output_stage_[offset];
         }
     }
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+    const cycle::NativeCycleSample commit_end_sample = cycle::read_sample();
+    const gemmini_native_cycle_sample_internal commit_start =
+        project_native_sample(commit_start_sample);
+    const gemmini_native_cycle_sample_internal commit_end =
+        project_native_sample(commit_end_sample);
+    const gemmini_cycle_record_v2 commit_detail{{
+        args().matmul_layer.empty() ? nullptr : args().matmul_layer.c_str(),
+        "matmul_output_commit_cycles", commit_start.value, commit_end.value,
+        nullptr, 0, nullptr}, 0, 0, 0, 0, 0, 0};
+    gemmini_log_cycle_record_v2_checked_internal(
+        &commit_detail, &commit_start, &commit_end, true);
+#endif
     args().f_out = output_destination_;
     output_destination_ = nullptr;
     output_row_stride_ = 0;
@@ -1595,8 +1698,24 @@ MatMulResult MatMul::run_full() {
                     return residual::execute_direct_stripe(args(), *payload, correction);
                 })();
             if (residual_status == rmd::RmdStatus::success) {
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+                const cycle::NativeCycleSample merge_start_sample = cycle::read_sample();
+#endif
                 residual_status = rmd::merge_rmd_correction(
                     args(), payload->row_begin, row_end, correction);
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+                const cycle::NativeCycleSample merge_end_sample = cycle::read_sample();
+                const gemmini_native_cycle_sample_internal merge_start =
+                    project_native_sample(merge_start_sample);
+                const gemmini_native_cycle_sample_internal merge_end =
+                    project_native_sample(merge_end_sample);
+                const gemmini_cycle_record_v2 merge_detail{{
+                    args().matmul_layer.empty() ? nullptr : args().matmul_layer.c_str(),
+                    "rmd_merge_cycles", merge_start.value, merge_end.value,
+                    nullptr, 0, nullptr}, 0, 0, 0, 0, 0, 0};
+                gemmini_log_cycle_record_v2_checked_internal(
+                    &merge_detail, &merge_start, &merge_end, true);
+#endif
             }
             if (residual_status != rmd::RmdStatus::success) break;
         }
@@ -2317,37 +2436,7 @@ void MatmulStripeCollector::worker_loop() {
             }
             {
                 std::lock_guard<std::mutex> job_lock(*job->job_mutex_);
-                job->metrics_.run_id = captured.run_id;
-                job->metrics_.slot = captured.slot;
-                job->metrics_.la_cycles = captured.la_cycles;
-                job->metrics_.la3_cycles = captured.la3_cycles;
-                job->metrics_.sf_cycles = captured.sf_cycles;
-                job->metrics_.la3_ns = captured.la3_ns;
-                job->metrics_.sf1_ns = captured.sf1_ns;
-                job->metrics_.la_worker_start_ns = captured.la_worker_start_ns;
-                job->metrics_.la_worker_end_ns = captured.la_worker_end_ns;
-                job->metrics_.sf_mask_start_ns = captured.sf_mask_start_ns;
-                job->metrics_.sf_mask_end_ns = captured.sf_mask_end_ns;
-                job->metrics_.sf_exponent_start_ns = captured.sf_exponent_start_ns;
-                job->metrics_.sf_exponent_end_ns = captured.sf_exponent_end_ns;
-                job->metrics_.sf_folding_start_ns = captured.sf_folding_start_ns;
-                job->metrics_.sf_folding_end_ns = captured.sf_folding_end_ns;
-                job->metrics_.sf_commit_ns = captured.sf_commit_ns;
-                job->metrics_.la.nanoseconds = captured.la3_ns;
-                job->metrics_.la.count = captured.la3_ns != 0 ? 1 : 0;
-                job->metrics_.sf.nanoseconds = captured.sf1_ns;
-                job->metrics_.sf.count = captured.sf1_ns != 0 ? 1 : 0;
-                job->metrics_.capture_copy = captured.capture_copy;
-                job->metrics_.producer_wait = captured.producer_wait;
-                job->metrics_.queue_insert = captured.queue_insert;
-                job->metrics_.producer_wait_start_ns = captured.producer_wait_start_ns;
-                job->metrics_.producer_wait_end_ns = captured.producer_wait_end_ns;
-                job->metrics_.capture_queue_enqueue_ns = captured.queued_ns;
-                job->metrics_.telemetry_queue_tick = captured.telemetry_queued_tick;
-                job->metrics_.rmd_pack = captured.rmd_pack;
-                job->metrics_.sf_handoff.nanoseconds =
-                    captured.sf1_ns + job->metrics_.handoff.nanoseconds;
-                job->metrics_.sf_handoff.count = 1;
+                detail::apply_captured_stripe(captured, job->metrics_);
             }
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -2363,11 +2452,11 @@ void MatmulStripeCollector::worker_loop() {
             {
                 std::lock_guard<std::mutex> job_lock(*job->job_mutex_);
                 job->metrics_.ws_start_ns = now_ns();
-                job->rmd_queued_ns_ = captured.queued_ns;
-                job->metrics_.rmd_enqueue_ns = captured.queued_ns;
+                job->rmd_queued_ns_ = captured.timing.queued_ns;
+                job->metrics_.rmd_enqueue_ns = captured.timing.queued_ns;
                 if (job->execution_->options_.profiling) {
                     job->metrics_.ws_queue.nanoseconds =
-                        job->metrics_.ws_start_ns - captured.queued_ns;
+                        job->metrics_.ws_start_ns - captured.timing.queued_ns;
                     job->metrics_.ws_queue.count = 1;
                 }
             }
@@ -2524,48 +2613,12 @@ bool MatmulStripeCollector::on_ready(
                                         MatmulStageMetrics producer_wait,
                                         uint64_t producer_wait_start_ns,
                                         uint64_t producer_wait_end_ns) {
-        CapturedStripe captured{};
-        captured.run_id = event.run_id;
-        captured.stripe_id = event.stripe_id;
-        captured.slot = event.slot;
-        captured.row_begin = event.row_begin;
-        captured.row_end = event.row_end;
-        captured.activation_metadata = event.activation_metadata;
-#if GGML_GEMMINI_ENABLE_RMD
-        // Shared handle only: the packet owns its buffers, so it outlives the ExSIA slot.
-        captured.rmd_packet = event.rmd_packet;
-        captured.direct_residual = event.direct_residual;
-#endif
-        captured.la_cycles = event.local_end_cycle >= event.local_start_cycle ?
-            event.local_end_cycle - event.local_start_cycle : 0;
-        captured.la3_cycles = event.local_group3_end_cycle >= event.local_group3_start_cycle ?
-            event.local_group3_end_cycle - event.local_group3_start_cycle : 0;
-        captured.sf_cycles = event.folding_end_cycle >= event.folding_start_cycle ?
-            event.folding_end_cycle - event.folding_start_cycle : 0;
-        captured.la3_ns = event.local_end_ns >= event.local_start_ns ?
-            event.local_end_ns - event.local_start_ns : 0;
-        captured.sf1_ns = event.folding_end_ns >= event.folding_start_ns ?
-            event.folding_end_ns - event.folding_start_ns : 0;
-        captured.la_worker_start_ns = event.local_worker_start_ns;
-        captured.la_worker_end_ns = event.local_worker_end_ns;
-        captured.sf_mask_start_ns = event.mask_assembly_start_ns;
-        captured.sf_mask_end_ns = event.mask_assembly_end_ns;
-        captured.sf_exponent_start_ns = event.exponent_reduction_start_ns;
-        captured.sf_exponent_end_ns = event.exponent_reduction_end_ns;
-        captured.sf_folding_start_ns = event.folding_start_ns;
-        captured.sf_folding_end_ns = event.folding_end_ns;
-        captured.sf_commit_ns = event.folding_commit_ns;
-        captured.capture_copy = capture_copy;
-        captured.producer_wait = producer_wait;
-        captured.producer_wait_start_ns = producer_wait_start_ns;
-        captured.producer_wait_end_ns = producer_wait_end_ns;
-#if GGML_GEMMINI_ENABLE_RMD
-        if (event.rmd_packet != nullptr || event.direct_residual != nullptr) {
-            captured.rmd_pack.nanoseconds = event.rmd_pack_ns;
-            captured.rmd_pack.count = 1;
-        }
-#endif
-        return captured;
+        detail::MatmulCaptureTiming timing{};
+        timing.capture_copy = capture_copy;
+        timing.producer_wait = producer_wait;
+        timing.producer_wait_start_ns = producer_wait_start_ns;
+        timing.producer_wait_end_ns = producer_wait_end_ns;
+        return detail::capture_collector_event(event, std::move(timing));
     };
     try {
         const auto copy_start = Clock::now();
@@ -2591,10 +2644,10 @@ bool MatmulStripeCollector::on_ready(
                 capture_copy, producer_wait, producer_wait_start_ns, now_ns());
             const auto insert_start = Clock::now();
             collector.pending_.push_back(std::move(captured));
-            record_metric(collector.pending_.back().queue_insert, true, insert_start);
-            collector.pending_.back().queued_ns = now_ns();
+            record_metric(collector.pending_.back().timing.queue_insert, true, insert_start);
+            collector.pending_.back().timing.queued_ns = now_ns();
 #if LOG_CYCLE
-            collector.pending_.back().telemetry_queued_tick = cycle::read();
+            collector.pending_.back().timing.telemetry_queued_tick = cycle::read();
 #endif
             lock.unlock();
             collector.condition_.notify_all();
@@ -2610,10 +2663,10 @@ bool MatmulStripeCollector::on_ready(
         CapturedStripe captured = make_captured(capture_copy, {}, 0, 0);
         const auto insert_start = Clock::now();
         collector.stripes_.push_back(std::move(captured));
-        record_metric(collector.stripes_.back().queue_insert, true, insert_start);
-        collector.stripes_.back().queued_ns = now_ns();
+        record_metric(collector.stripes_.back().timing.queue_insert, true, insert_start);
+        collector.stripes_.back().timing.queued_ns = now_ns();
 #if LOG_CYCLE
-        collector.stripes_.back().telemetry_queued_tick = cycle::read();
+        collector.stripes_.back().timing.telemetry_queued_tick = cycle::read();
 #endif
     } catch (const std::bad_alloc &) {
         {
@@ -2765,19 +2818,12 @@ MatmulExecution prepare_execution(const ggml_gemmini_args_t & args, MatmulOption
 }
 
 MatmulExecution prepare_execution(ggml_gemmini_args_t * args, MatmulOptions options) {
-    if (args != nullptr && options.mode == MatmulInvocationMode::stripe_pipeline) {
-        ggml_gemmini_args_t snapshot = *args;
-        if (std::holds_alternative<quants::act::NoneMeta>(snapshot.act_quant.storage())) {
-            snapshot.act_quant.storage().emplace<quants::act::exsia::Meta>();
-        }
-        return MatmulExecution(std::move(snapshot), options);
-    }
     return MatmulExecution(args, options);
 }
 
 MatmulStatus prepare_execution(ggml_gemmini_args_t & args, const MatmulOptions & options,
                                MatmulExecution & execution) {
-    execution = prepare_execution(&args, options);
+    execution = MatmulExecution(&args, options);
     return execution.status();
 }
 
@@ -3079,6 +3125,7 @@ MatmulStatus execute_rmd_stripe(MatmulStripeJob & job) {
     rmd::Correction direct_correction = rmd::BlockScaledInt64Correction{};
     rmd::RmdExecutionMetrics metrics{};
     residual::DirectExecutionMetrics direct_metrics{};
+    direct_metrics.run_id = job.metrics_.run_id;
 #if LOG_CYCLE
     const uint64_t backend_start_tick = cycle::read();
 #else
@@ -3142,10 +3189,27 @@ MatmulStatus compose_rmd_stripe(MatmulStripeJob & job) {
     const auto read_start = Clock::now();
     {
         std::lock_guard<std::mutex> lock(*job.job_mutex_);
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+        job.metrics_.telemetry_compose_start_sample = cycle::read_sample();
+#endif
         job.metrics_.compose_start_ns = now_ns();
     }
     rmd::Correction correction = rmd::BlockScaledInt64Correction{};
     const rmd::RmdStatus status = rmd::compose_rmd_output(*packet, job.rmd_output_, correction);
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+    job.metrics_.telemetry_compose_end_sample = cycle::read_sample();
+    const gemmini_native_cycle_sample_internal compose_start =
+        project_native_sample(job.metrics_.telemetry_compose_start_sample);
+    const gemmini_native_cycle_sample_internal compose_end =
+        project_native_sample(job.metrics_.telemetry_compose_end_sample);
+    const gemmini_cycle_record_v2 compose_detail{{nullptr, "rmd_packet_compose_cycles",
+        compose_start.value, compose_end.value, nullptr, 0, nullptr},
+        GEMMINI_CYCLE_HAS_RUN_ID | GEMMINI_CYCLE_HAS_STRIPE_ID,
+        job.metrics_.run_id, job.metrics_.stripe_id, 0, 0, 0};
+    gemmini_log_cycle_record_v2_checked_internal(
+        &compose_detail, &compose_start, &compose_end,
+        status == rmd::RmdStatus::success);
+#endif
     if (status != rmd::RmdStatus::success) {
         const MatmulStatus failure = from_rmd_status(status);
         job.record_failure(failure, false);
@@ -3183,6 +3247,9 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
             return invalid_state("finalize requires dense and residual completion");
         }
         job.finalized_ = true;
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+        job.metrics_.telemetry_finalize_start_sample = cycle::read_sample();
+#endif
         job.metrics_.finalize_start_ns = now_ns();
         job.metrics_.stripe_id = job.input_.stripe_id();
         job.metrics_.row_begin = job.input_.row_begin();
@@ -3192,58 +3259,13 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
 #if LOG_CYCLE
             job.metrics_.telemetry_merge_start = cycle::read();
 #endif
-            ggml_gemmini_args_t merge_args = job.execution_->facade_.args();
-            rmd::RmdStatus status = rmd::RmdStatus::success;
-            if (job.staged_activation_meta_ != nullptr) {
-                merge_args.act_quant = *job.staged_activation_meta_;
-                auto * metadata =
-                    std::get_if<quants::act::exsia::Meta>(&merge_args.act_quant.storage());
-                size_t rows_per_stripe = merge_args.I;
-                size_t metadata_row_begin = 0;
-                size_t metadata_row_end = 0;
-                const size_t max_size = std::numeric_limits<size_t>::max();
-                if (merge_args.tile_I == 0 ||
-                    merge_args.tile_I <= max_size / static_cast<size_t>(DIM)) {
-                    if (merge_args.tile_I != 0) {
-                        rows_per_stripe =
-                            merge_args.tile_I * static_cast<size_t>(DIM);
-                    }
-                    const bool valid_rows =
-                        rows_per_stripe != 0 &&
-                        job.input_.row_begin() <=
-                            max_size - merge_args.activation_row_offset &&
-                        job.input_.row_end() <=
-                            max_size - merge_args.activation_row_offset;
-                    if (valid_rows) {
-                        metadata_row_begin =
-                            merge_args.activation_row_offset + job.input_.row_begin();
-                        metadata_row_end =
-                            merge_args.activation_row_offset + job.input_.row_end();
-                    }
-                    if (metadata == nullptr || metadata->theta.size() != 1 ||
-                        !valid_rows || metadata_row_begin >= metadata_row_end ||
-                        metadata_row_begin / rows_per_stripe !=
-                            (metadata_row_end - 1) / rows_per_stripe) {
-                        status = rmd::RmdStatus::invalid_arguments;
-                    } else {
-                        const int16_t theta = metadata->theta.front();
-                        const size_t stripe = metadata_row_begin / rows_per_stripe;
-                        metadata->theta.assign(
-                            stripe + 1, std::numeric_limits<int16_t>::min());
-                        metadata->theta[stripe] = theta;
-                    }
-                } else {
-                    status = rmd::RmdStatus::invalid_arguments;
-                }
-            }
-            if (status == rmd::RmdStatus::success) {
-                status = job.direct_residual_ != nullptr
-                    ? rmd::merge_rmd_correction(
-                          merge_args, job.input_.row_begin(),
-                          job.input_.row_end(), job.rmd_correction_)
-                    : rmd::merge_rmd_correction(
-                          merge_args, *job.rmd_packet_, job.rmd_correction_);
-            }
+            const rmd::RmdStatus status = job.direct_residual_ != nullptr
+                ? rmd::merge_rmd_correction(
+                      job.execution_->facade_.args(), job.input_.row_begin(),
+                      job.input_.row_end(), job.rmd_correction_)
+                : rmd::merge_rmd_correction(
+                      job.execution_->facade_.args(), *job.rmd_packet_,
+                      job.rmd_correction_);
             job.metrics_.merge_end_ns = now_ns();
 #if LOG_CYCLE
             job.metrics_.telemetry_merge_end = cycle::read();
@@ -3275,6 +3297,22 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
 #endif
         record_metric(job.metrics_.rmd_finalize, job.execution_->options_.profiling, start);
         job.metrics_.finalize_end_ns = now_ns();
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+        job.metrics_.telemetry_finalize_end_sample = cycle::read_sample();
+        const gemmini_native_cycle_sample_internal finalize_start =
+            project_native_sample(job.metrics_.telemetry_finalize_start_sample);
+        const gemmini_native_cycle_sample_internal finalize_end =
+            project_native_sample(job.metrics_.telemetry_finalize_end_sample);
+        const gemmini_cycle_record_v2 finalize_detail{{nullptr,
+            job.direct_residual_ != nullptr ? "rmd_cpu_direct_finalize_cycles" :
+                (job.rmd_packet_ != nullptr ? "rmd_packet_finalize_cycles" :
+                                              "dense_finalize_cycles"),
+            finalize_start.value, finalize_end.value, nullptr, 0, nullptr},
+            GEMMINI_CYCLE_HAS_RUN_ID | GEMMINI_CYCLE_HAS_STRIPE_ID,
+            job.metrics_.run_id, job.metrics_.stripe_id, 0, 0, 0};
+        gemmini_log_cycle_record_v2_checked_internal(
+            &finalize_detail, &finalize_start, &finalize_end, merge_failure.ok());
+#endif
     }
     if (!merge_failure.ok()) {
         job.record_failure(merge_failure, false);
@@ -3359,6 +3397,7 @@ MatmulStatus execute_post_fold_pipeline(
             execution,
             MatmulStripeInput(captured.row_begin, captured.row_end, captured.stripe_id),
             std::move(captured.direct_residual), std::move(captured.rmd_packet));
+        detail::apply_captured_stripe(captured, job.metrics_);
         MatmulStatus status = job.status();
         if (status) status = execute_dense_stripe(job);
         if (status) status = execute_rmd_stripe(job);

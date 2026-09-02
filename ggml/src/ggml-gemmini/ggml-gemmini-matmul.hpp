@@ -24,6 +24,10 @@
 #include <unordered_set>
 #include <vector>
 
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+#include <gemmini/cycle_reader.hpp>
+#endif
+
 #if !defined(GGML_GEMMINI_CONFIG_HAS_ACTIVATION_QUANT)
 namespace ggml::gemmini::config {
 inline constexpr int ACTIVATION_QUANT = static_cast<int>(CURRENT_ACTIVATION_QUANT);
@@ -223,13 +227,8 @@ struct MatmulJobMetrics {
     size_t row_begin = 0;
     size_t row_end = 0;
     rmd::RmdExecutionMetrics rmd{};
-    uint64_t la_cycles = 0;
-    uint64_t la3_cycles = 0;
-    uint64_t sf_cycles = 0;
     uint64_t la3_ns = 0;
     uint64_t sf1_ns = 0;
-    std::array<uint64_t, 3> la_worker_start_ns{};
-    std::array<uint64_t, 3> la_worker_end_ns{};
     uint64_t sf_mask_start_ns = 0;
     uint64_t sf_mask_end_ns = 0;
     uint64_t sf_exponent_start_ns = 0;
@@ -278,11 +277,53 @@ struct MatmulJobMetrics {
     uint64_t telemetry_merge_start = 0;
     uint64_t telemetry_merge_end = 0;
     uint64_t telemetry_residual_end = 0;
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+    cycle::NativeCycleSample telemetry_compose_start_sample;
+    cycle::NativeCycleSample telemetry_compose_end_sample;
+    cycle::NativeCycleSample telemetry_finalize_start_sample;
+    cycle::NativeCycleSample telemetry_finalize_end_sample;
+#endif
     std::string telemetry_input_hash;
     std::string telemetry_correction_hash;
     uint64_t telemetry_correction_nonzero_count = 0;
     std::string telemetry_output_hash;
 };
+
+namespace detail {
+
+struct MatmulCaptureTiming {
+    MatmulStageMetrics capture_copy;
+    MatmulStageMetrics producer_wait;
+    MatmulStageMetrics queue_insert;
+    MatmulStageMetrics rmd_pack;
+    uint64_t producer_wait_start_ns = 0;
+    uint64_t producer_wait_end_ns = 0;
+    uint64_t queued_ns = 0;
+    uint64_t telemetry_queued_tick = 0;
+};
+
+struct MatmulCapturedStripe {
+    uint64_t run_id = 0;
+    size_t stripe_id = 0;
+    size_t slot = 0;
+    size_t row_begin = 0;
+    size_t row_end = 0;
+    std::optional<quants::act::exsia::StripeMetadataSnapshot> activation_metadata;
+    rmd::StripePacketHandle rmd_packet;
+    residual::DirectStripePayloadHandle direct_residual;
+    uint64_t la3_ns = 0;
+    uint64_t sf1_ns = 0;
+    uint64_t sf_mask_start_ns = 0;
+    uint64_t sf_mask_end_ns = 0;
+    uint64_t sf_exponent_start_ns = 0;
+    uint64_t sf_exponent_end_ns = 0;
+    uint64_t sf_folding_start_ns = 0;
+    uint64_t sf_folding_end_ns = 0;
+    uint64_t sf_commit_ns = 0;
+    MatmulCaptureTiming timing;
+};
+
+} // namespace detail
 
 struct MatmulCollectorSnapshot {
     MatmulStatus status;
@@ -331,38 +372,7 @@ public:
 #endif
 
 private:
-    struct CapturedStripe {
-        uint64_t run_id = 0;
-        size_t stripe_id;
-        size_t slot = 0;
-        size_t row_begin;
-        size_t row_end;
-        std::optional<quants::act::exsia::StripeMetadataSnapshot> activation_metadata;
-        rmd::StripePacketHandle rmd_packet;
-        residual::DirectStripePayloadHandle direct_residual;
-        uint64_t la_cycles = 0;
-        uint64_t la3_cycles = 0;
-        uint64_t sf_cycles = 0;
-        uint64_t la3_ns = 0;
-        uint64_t sf1_ns = 0;
-        std::array<uint64_t, 3> la_worker_start_ns{};
-        std::array<uint64_t, 3> la_worker_end_ns{};
-        uint64_t sf_mask_start_ns = 0;
-        uint64_t sf_mask_end_ns = 0;
-        uint64_t sf_exponent_start_ns = 0;
-        uint64_t sf_exponent_end_ns = 0;
-        uint64_t sf_folding_start_ns = 0;
-        uint64_t sf_folding_end_ns = 0;
-        uint64_t sf_commit_ns = 0;
-        MatmulStageMetrics capture_copy;
-        MatmulStageMetrics producer_wait;
-        MatmulStageMetrics queue_insert;
-        MatmulStageMetrics rmd_pack;
-        uint64_t producer_wait_start_ns = 0;
-        uint64_t producer_wait_end_ns = 0;
-        uint64_t queued_ns = 0;
-        uint64_t telemetry_queued_tick = 0;
-    };
+    using CapturedStripe = detail::MatmulCapturedStripe;
     static bool on_ready(void *, const quants::act::exsia::StripeReadyEvent &);
     friend MatmulStatus execute_post_fold_pipeline(const ggml_gemmini_args_t &, MatmulStripeCollector &);
     void fail(MatmulStatus status);
@@ -776,6 +786,8 @@ private:
     friend MatmulStatus execute_rmd_stripe(MatmulStripeJob &);
     friend MatmulStatus compose_rmd_stripe(MatmulStripeJob &);
     friend MatmulStatus finalize_stripe(MatmulStripeJob &);
+    friend MatmulStatus execute_post_fold_pipeline(
+        const ggml_gemmini_args_t &, MatmulStripeCollector &);
     friend class MatmulStripeCollector;
 
     MatmulStripeJob(MatmulExecution * execution, MatmulStripeInput input, MatmulStatus status,

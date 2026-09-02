@@ -1,5 +1,9 @@
 #include "../include/gemmini/log.hpp"
 #include "../include/gemmini/log.h"
+#if defined(__linux__) && defined(__aarch64__)
+#include "../include/gemmini/cycle_reader.hpp"
+#include "cycle_reader_internal.h"
+#endif
 
 #include <cstdarg>
 #include <cstdint>
@@ -20,6 +24,19 @@ void report_cycle_boundary_failure() noexcept
 {
     ggml::gemmini::log::cycle.report_failure("serialization");
 }
+
+#if defined(__linux__) && defined(__aarch64__)
+const char * internal_source_name(uint8_t source) noexcept
+{
+    return source == GEMMINI_NATIVE_CYCLE_SOURCE_LINUX_PERF_CPU_CYCLES
+        ? "linux_perf_cpu_cycles" : nullptr;
+}
+
+const char * internal_unit_name(uint8_t) noexcept
+{
+    return "cycle";
+}
+#endif
 } // namespace
 
 namespace ggml::gemmini::log
@@ -199,6 +216,51 @@ extern "C"
         }
         catch (...) { report_cycle_boundary_failure(); }
     }
+
+#if defined(__linux__) && defined(__aarch64__)
+    uint8_t gemmini_log_cycle_record_v2_checked_internal(
+            const gemmini_cycle_record_v2 * record,
+            const gemmini_native_cycle_sample_internal * start,
+            const gemmini_native_cycle_sample_internal * end,
+            int structurally_same_owner_eligible) noexcept
+    {
+        try
+        {
+            using ggml::gemmini::cycle::NativeCycleReason;
+            using ggml::gemmini::cycle::NativeCycleSample;
+            using ggml::gemmini::cycle::NativeCycleSource;
+            const auto project = [](const gemmini_native_cycle_sample_internal * sample) {
+                return sample ? NativeCycleSample{
+                    sample->value, sample->valid != 0,
+                    static_cast<NativeCycleReason>(sample->reason),
+                    static_cast<NativeCycleSource>(sample->source),
+                    sample->owner_event_token, sample->generation} : NativeCycleSample{};
+            };
+            const NativeCycleSample start_sample = project(start);
+            const NativeCycleSample end_sample = project(end);
+            const auto delta = ggml::gemmini::cycle::evaluate_interval(
+                start_sample, end_sample, structurally_same_owner_eligible != 0);
+
+            if (!record) return static_cast<uint8_t>(delta.reason);
+            const gemmini_cycle_record & interval = record->interval;
+            const uint8_t source = start ? start->source :
+                static_cast<uint8_t>(GEMMINI_NATIVE_CYCLE_SOURCE_NONE);
+            const ggml::gemmini::log::CycleRecord checked{
+                interval.layer, interval.op, start ? start->value : interval.start,
+                end ? end->value : interval.end, interval.file, interval.line, interval.func,
+                internal_source_name(source), internal_unit_name(source), record->identity_mask,
+                record->run_id, record->stripe_id, record->slot, record->node_id, record->worker_id};
+            ggml::gemmini::log::cycle.write_json(
+                ggml::gemmini::log::serialize_checked_cycle_record(
+                    checked, delta.valid,
+                    ggml::gemmini::cycle::reason_name(delta.reason)));
+            return static_cast<uint8_t>(delta.reason);
+        }
+        catch (...) { report_cycle_boundary_failure(); return static_cast<uint8_t>(
+            GEMMINI_NATIVE_CYCLE_REASON_UNAVAILABLE_EVENT); }
+    }
+
+#endif
 
     void gemmini_log_cycle(const char *layer, const char *op, uint64_t start, uint64_t end) noexcept
     {

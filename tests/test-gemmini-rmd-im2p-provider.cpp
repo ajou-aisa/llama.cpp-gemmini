@@ -112,12 +112,12 @@ struct Fixture {
 
         RmdStripeBuilder builder;
         builder.reset(19, 7, rows, logical_k, columns, GGML_GEMMINI_ACTIVATION_BITS);
-        // Keep more than DIM compact positions in one radix lane so the
-        // cancellation and checked K-accumulation probes cross a real dot boundary.
-        for (size_t k = 0; k < DIM + 3; ++k) {
+        // Populate both K blocks so cancellation and checked K-accumulation
+        // probes cross a real dot boundary without exceeding logical K.
+        for (size_t k = 0; k < kBlockSize; ++k) {
             builder.add_residual(k % rows, k, 1);
         }
-        for (size_t k : {size_t{0}, size_t{1}, size_t{DIM}, size_t{31}}) {
+        for (size_t k : {size_t{0}, size_t{1}, kBlockSize - 2, kBlockSize - 1}) {
             builder.add_residual((k + 3) % rows, kBlockSize + k, -1);
         }
         packet = builder.finish();
@@ -360,7 +360,7 @@ int main(int argc, char ** argv) {
     if (selected == "all" || selected == "provider-read-failure") ok = run_fault(Im2pProviderTestFault::read_failure, RmdStatus::execution_failed, "provider-read-failure", 1, 1) && ok;
     if (selected == "all" || selected == "provider-write-failure") ok = run_fault(Im2pProviderTestFault::write_failure, RmdStatus::execution_failed, "provider-write-failure", 1, 1) && ok;
     if (selected == "all" || selected == "provider-watchdog") ok = run_fault(Im2pProviderTestFault::watchdog, RmdStatus::execution_failed, "provider-watchdog", 1, 1) && ok;
-    if (selected == "all" || selected == "k-accumulation-overflow") ok = run_fault(Im2pProviderTestFault::k_accumulation_overflow, RmdStatus::overflow, "k-accumulation-overflow", 2) && ok;
+    if (selected == "all" || selected == "k-accumulation-overflow") ok = run_fault(Im2pProviderTestFault::k_accumulation_overflow, RmdStatus::overflow, "k-accumulation-overflow", 1) && ok;
     if (selected == "all" || selected == "block-scale-overflow") ok = run_fault(Im2pProviderTestFault::block_scale_overflow, RmdStatus::overflow, "block-scale-overflow", 1) && ok;
     if (selected == "all" || selected == "cancel-between-dots") ok = run_fault(Im2pProviderTestFault::cancel_after_first_dot, RmdStatus::execution_failed, "cancel-between-dots", 1, 1) && ok;
     if (selected == "all" || selected == "duplicate-output") ok = run_fault(Im2pProviderTestFault::duplicate_output, RmdStatus::execution_failed, "duplicate-output", 1, 1) && ok;

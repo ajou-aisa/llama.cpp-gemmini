@@ -24,12 +24,25 @@ void json_string(std::ostringstream & out, std::string_view value) {
                     static constexpr char hex[] = "0123456789abcdef";
                     out << "\\u00" << hex[(static_cast<unsigned char>(c) >> 4) & 0xf]
                         << hex[static_cast<unsigned char>(c) & 0xf];
-                } else {
-                    out << c;
-                }
+                } else out << c;
         }
     }
     out << '"';
+}
+
+void field(std::ostringstream & out, const char * name, uint64_t value) {
+    out << ",\"" << name << "\":" << value;
+}
+void string_field(std::ostringstream & out, const char * name, std::string_view value) {
+    out << ",\"" << name << "\":";
+    json_string(out, value);
+}
+void nullable_string_field(std::ostringstream & out, const char * name, std::string_view value) {
+    if (value.empty()) out << ",\"" << name << "\":null";
+    else string_field(out, name, value);
+}
+void null_field(std::ostringstream & out, const char * name) {
+    out << ",\"" << name << "\":null";
 }
 
 void prefix(std::ostringstream & out, const char * type,
@@ -40,31 +53,6 @@ void prefix(std::ostringstream & out, const char * type,
     json_string(out, source);
     out << ",\"unit\":";
     json_string(out, unit);
-}
-
-void field(std::ostringstream & out, const char * name, std::uint64_t value) {
-    out << ",\"" << name << "\":" << value;
-}
-
-void string_field(std::ostringstream & out, const char * name, std::string_view value) {
-    out << ",\"" << name << "\":";
-    json_string(out, value);
-}
-
-void nullable_string_field(std::ostringstream & out, const char * name, std::string_view value) {
-    if (value.empty()) {
-        out << ",\"" << name << "\":null";
-    } else {
-        string_field(out, name, value);
-    }
-}
-
-void null_field(std::ostringstream & out, const char * name) {
-    out << ",\"" << name << "\":null";
-}
-
-bool ordered(std::uint64_t start, std::uint64_t end) {
-    return end >= start;
 }
 
 #if LOG_DEBUG
@@ -220,9 +208,14 @@ std::string serialize_cycle_telemetry(const QuantizationStripeTelemetry & record
     null_field(out, "worker_id");
     field(out, "row_begin", record.row_begin);
     field(out, "row_end", record.row_end);
-    field(out, "start", record.start);
-    field(out, "end", record.end);
-    field(out, "delta", record.end - record.start);
+    null_field(out, "start");
+    null_field(out, "end");
+    null_field(out, "delta");
+    out << ",\"valid\":false";
+    string_field(out, "reason", "structurally_cross_task");
+    field(out, "start_ns", record.start_ns);
+    field(out, "end_ns", record.end_ns);
+    field(out, "duration_ns", record.end_ns - record.start_ns);
     out << ",\"overlaps_rtl\":true,\"additive\":false}";
     return out.str();
 #endif
@@ -238,13 +231,15 @@ std::string serialize_cycle_telemetry(const PipelineStripeTelemetry & record) {
     return {};
 #else
     const bool valid = record.row_end >= record.row_begin &&
-        ordered(record.queue_start_ns, record.queue_end_ns) &&
-        ordered(record.dense_start_ns, record.dense_end_ns) &&
-        ordered(record.rmd_start_ns, record.rmd_end_ns) &&
-        ordered(record.compose_start_ns, record.compose_end_ns) &&
-        ordered(record.finalize_start_ns, record.finalize_end_ns);
+        record.queue_end_ns >= record.queue_start_ns &&
+        record.dense_end_ns >= record.dense_start_ns &&
+        record.rmd_end_ns >= record.rmd_start_ns &&
+        record.compose_end_ns >= record.compose_start_ns &&
+        record.finalize_end_ns >= record.finalize_start_ns;
     std::ostringstream out;
-    prefix(out, "PIPELINE_STRIPE_SUMMARY", "steady_clock", "nanosecond");
+    out << "{\"schema\":\"" << kCycleTelemetrySchema
+        << "\",\"version\":" << kCycleTelemetryVersion
+        << ",\"record_type\":\"PIPELINE_STRIPE_SUMMARY\",\"source\":\"steady_clock\",\"unit\":\"nanosecond\"";
     string_field(out, "op", "matmul.pipeline");
     nullable_string_field(out, "layer", record.layer);
     field(out, "run_id", record.run_id);
@@ -269,12 +264,8 @@ std::string serialize_cycle_telemetry(const PipelineStripeTelemetry & record) {
 #endif
 }
 
-void emit_cycle_telemetry(const CycleIntervalTelemetry & record) {
-    log::cycle.write_json(serialize_cycle_telemetry(record));
-}
-void emit_cycle_telemetry(const WsLoopTelemetry & record) {
-    log::cycle.write_json(serialize_cycle_telemetry(record));
-}
+void emit_cycle_telemetry(const CycleIntervalTelemetry & record) { log::cycle.write_json(serialize_cycle_telemetry(record)); }
+void emit_cycle_telemetry(const WsLoopTelemetry & record) { log::cycle.write_json(serialize_cycle_telemetry(record)); }
 void emit_cycle_telemetry(const Im2pExecutionTelemetry & record) {
     log::cycle.write_json(serialize_cycle_telemetry(record));
 #if LOG_DEBUG
@@ -284,17 +275,9 @@ void emit_cycle_telemetry(const Im2pExecutionTelemetry & record) {
     }
 #endif
 }
-void emit_cycle_telemetry(const Im2pStripeTelemetry & record) {
-    log::cycle.write_json(serialize_cycle_telemetry(record));
-}
-void emit_cycle_telemetry(const QuantizationStripeTelemetry & record) {
-    log::cycle.write_json(serialize_cycle_telemetry(record));
-}
-void emit_cycle_telemetry(const PipelineStripeTelemetry & record) {
-    log::cycle.write_json(serialize_cycle_telemetry(record));
-}
-void emit_cycle_telemetry(const RmdTelemetryRecord & record) {
-    log::cycle.write_json(serialize_cycle_telemetry(record));
-}
+void emit_cycle_telemetry(const Im2pStripeTelemetry & record) { log::cycle.write_json(serialize_cycle_telemetry(record)); }
+void emit_cycle_telemetry(const QuantizationStripeTelemetry & record) { log::cycle.write_json(serialize_cycle_telemetry(record)); }
+void emit_cycle_telemetry(const PipelineStripeTelemetry & record) { log::cycle.write_json(serialize_cycle_telemetry(record)); }
+void emit_cycle_telemetry(const RmdTelemetryRecord & record) { log::cycle.write_json(serialize_cycle_telemetry(record)); }
 
 } // namespace ggml::gemmini

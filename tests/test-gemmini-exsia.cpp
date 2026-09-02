@@ -29,9 +29,14 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+#include <omp.h>
+#endif
 #include <vector>
 
 namespace {
@@ -136,7 +141,9 @@ bool capture_geometry_publication(
 }
 
 bool test_activation_stripe_geometry_contract() {
-    constexpr size_t rows = 33;
+    constexpr size_t stripe_rows = 2 * DIM;
+    constexpr size_t rows = stripe_rows + 1;
+    constexpr size_t mismatch_rows = DIM;
     constexpr size_t cols = 32;
     std::vector<float> source(rows * cols, 0.5f);
     source[0] = 32.0f;
@@ -148,7 +155,7 @@ bool test_activation_stripe_geometry_contract() {
     exsia_args.I = rows; exsia_args.J = 8; exsia_args.K = cols;
     exsia_args.sA = cols;
     exsia_args.tile_I = 2; exsia_args.tile_J = 3; exsia_args.tile_K = 4;
-    exsia_args.activation_rows_per_stripe = 32;
+    exsia_args.activation_rows_per_stripe = stripe_rows;
     exsia_args.residual_route = residual::ResidualRoute::cpu_direct;
     if (!exsia_args.A.allocate(
             rows, cols, static_cast<uint8_t>(GGML_GEMMINI_ACTIVATION_BITS))) {
@@ -165,7 +172,7 @@ bool test_activation_stripe_geometry_contract() {
     stripe_args.I = rows; stripe_args.J = 8; stripe_args.K = cols;
     stripe_args.sA = cols;
     stripe_args.tile_I = 2; stripe_args.tile_J = 3; stripe_args.tile_K = 4;
-    stripe_args.activation_rows_per_stripe = 32;
+    stripe_args.activation_rows_per_stripe = stripe_rows;
     stripe_args.residual_route = residual::ResidualRoute::cpu_direct;
     stripe_args.act_quant.storage().emplace<quants::act::stripe::Meta>();
     if (!stripe_args.A.allocate(
@@ -176,7 +183,7 @@ bool test_activation_stripe_geometry_contract() {
     const auto * stripe_meta = std::get_if<quants::act::stripe::Meta>(&stripe_args.act_quant.storage());
 
     ggml_gemmini_args_t bad_exsia_args = exsia_args;
-    bad_exsia_args.activation_rows_per_stripe = 16;
+    bad_exsia_args.activation_rows_per_stripe = mismatch_rows;
     for (size_t row = 0; row < rows; ++row)
         for (size_t col = 0; col < cols; ++col)
             bad_exsia_args.A.set(row, col, 17);
@@ -193,7 +200,7 @@ bool test_activation_stripe_geometry_contract() {
     public_bad_args.I = rows; public_bad_args.J = 8; public_bad_args.K = cols;
     public_bad_args.sA = cols;
     public_bad_args.tile_I = 2; public_bad_args.tile_J = 3; public_bad_args.tile_K = 4;
-    public_bad_args.activation_rows_per_stripe = 16;
+    public_bad_args.activation_rows_per_stripe = mismatch_rows;
     public_bad_args.residual_route = residual::ResidualRoute::cpu_direct;
     if (!public_bad_args.A.allocate(
             rows, cols, static_cast<uint8_t>(GGML_GEMMINI_ACTIVATION_BITS))) {
@@ -208,7 +215,7 @@ bool test_activation_stripe_geometry_contract() {
         *public_bad_args.A.bytes == public_sentinel_before;
 
     ggml_gemmini_args_t bad_stripe_args = stripe_args;
-    bad_stripe_args.activation_rows_per_stripe = 16;
+    bad_stripe_args.activation_rows_per_stripe = mismatch_rows;
     bad_stripe_args.act_quant.storage().emplace<quants::act::stripe::Meta>();
     const bool bad_stripe_ok = quants::act::stripe::quantize(&tensor, bad_stripe_args);
     const auto * bad_stripe_meta = std::get_if<quants::act::stripe::Meta>(&bad_stripe_args.act_quant.storage());
@@ -219,7 +226,7 @@ bool test_activation_stripe_geometry_contract() {
     const bool exsia_dequantized = quants::act::exsia::dequantize_activation(
         exsia_decoded.data(), cols, 1, rows, cols, exsia_consumer_args);
     ggml_gemmini_args_t bad_exsia_consumer_args = exsia_consumer_args;
-    bad_exsia_consumer_args.activation_rows_per_stripe = 16;
+    bad_exsia_consumer_args.activation_rows_per_stripe = mismatch_rows;
     const bool bad_exsia_dequantized = quants::act::exsia::dequantize_activation(
         exsia_decoded.data(), cols, 1, rows, cols, bad_exsia_consumer_args);
 
@@ -227,7 +234,7 @@ bool test_activation_stripe_geometry_contract() {
     const bool stripe_dequantized = quants::act::stripe::dequantize_activation(
         stripe_decoded.data(), cols, 1, rows, cols, stripe_args);
     ggml_gemmini_args_t bad_stripe_consumer_args = stripe_args;
-    bad_stripe_consumer_args.activation_rows_per_stripe = 16;
+    bad_stripe_consumer_args.activation_rows_per_stripe = mismatch_rows;
     const bool bad_stripe_dequantized = quants::act::stripe::dequantize_activation(
         stripe_decoded.data(), cols, 1, rows, cols, bad_stripe_consumer_args);
 
@@ -260,9 +267,10 @@ bool test_activation_stripe_geometry_contract() {
         check(exsia_args.tile_I == 2 && exsia_args.tile_J == 3 && exsia_args.tile_K == 4 &&
                   stripe_args.tile_I == 2 && stripe_args.tile_J == 3 && stripe_args.tile_K == 4,
               "quantization preserves all auto-selected tile factors") &&
-        check(trace.publications == 2 && trace.rows[0] == std::make_pair<size_t, size_t>(0, 32) &&
-                  trace.rows[1] == std::make_pair<size_t, size_t>(32, 33),
-              "ExSIA publishes contiguous 0-32 and final 32-33 rows") &&
+        check(trace.publications == 2 &&
+                  trace.rows[0] == std::make_pair(size_t{0}, stripe_rows) &&
+                  trace.rows[1] == std::make_pair(stripe_rows, rows),
+              "ExSIA publishes contiguous full and final partial stripes") &&
         check(exsia_meta.rho == config::GGML_GEMMINI_ACTIVATION_RHO,
               "successful ExSIA publishes width-aware rho") &&
         check(exsia_meta.theta.size() == 2 && stripe_meta != nullptr && stripe_meta->scales.size() == 2,
@@ -274,7 +282,9 @@ bool test_activation_stripe_geometry_contract() {
         check(!bad_stripe_ok && bad_stripe_meta != nullptr && bad_stripe_meta->scales.empty() &&
                   bad_stripe_meta->rmd_packets.empty() && bad_stripe_meta->direct_residuals.empty(),
               "STRIPE metadata mismatch has zero metadata side effects");
-    if (ok) std::printf("STRIPE_GEOMETRY_QA tile=2/3/4 exsia_rows=0-32,32-33 stripe_rows=0-32,32-33 mismatch=InvalidInput direct_before=17 direct_after=17 public_before=23 public_after=23 publications=0 allocations=0\n");
+    if (ok) std::printf("STRIPE_GEOMETRY_QA tile=2/3/4 exsia_rows=0-%zu,%zu-%zu stripe_rows=0-%zu,%zu-%zu mismatch_rows=%zu mismatch=InvalidInput direct_before=17 direct_after=17 public_before=23 public_after=23 publications=0 allocations=0\n",
+                        stripe_rows, stripe_rows, rows, stripe_rows, stripe_rows, rows,
+                        mismatch_rows);
     return ok;
 }
 
@@ -1302,6 +1312,61 @@ bool test_direct_cpu_executor() {
     using residual::DirectStripePayload;
     using residual::DirectStripePayloadHandle;
     using residual::ResidualEvent;
+    using CpuPoint = residual::testing::DirectCpuSamplePoint;
+    using CpuSample = residual::testing::DirectCpuSample;
+
+    struct CpuScript {
+        explicit CpuScript(size_t tile_count) :
+            tile_starts(tile_count), tile_ends(tile_count),
+            start_threads(tile_count), end_threads(tile_count),
+            start_worker_ids(tile_count, std::numeric_limits<size_t>::max()),
+            end_worker_ids(tile_count, std::numeric_limits<size_t>::max()),
+            tile_start_indices(tile_count), tile_end_indices(tile_count) {
+            for (size_t tile = 0; tile < tile_count; ++tile) {
+                const uint64_t owner = 10 + static_cast<uint64_t>(tile) * 10;
+                const uint64_t start = 200 + static_cast<uint64_t>(tile) * 100;
+                tile_starts[tile] = {start, true, owner, 1};
+                tile_ends[tile] = {start + 3 + static_cast<uint64_t>(tile) * 2,
+                                   true, owner, 1};
+            }
+        }
+
+        std::vector<CpuSample> tile_starts;
+        std::vector<CpuSample> tile_ends;
+        std::vector<std::thread::id> start_threads;
+        std::vector<std::thread::id> end_threads;
+        std::vector<size_t> start_worker_ids;
+        std::vector<size_t> end_worker_ids;
+        size_t available_tile_samples = std::numeric_limits<size_t>::max();
+        std::vector<size_t> tile_start_indices;
+        std::vector<size_t> tile_end_indices;
+        std::mutex mutex;
+
+        static size_t executing_worker_id() {
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+            return omp_in_parallel() ? static_cast<size_t>(omp_get_thread_num()) : 0;
+#else
+            return 0;
+#endif
+        }
+
+        static CpuSample read(CpuPoint point, size_t tile_index, void * context) {
+            auto & script = *static_cast<CpuScript *>(context);
+            if (tile_index >= script.tile_starts.size() ||
+                tile_index >= script.available_tile_samples) return {};
+            std::lock_guard<std::mutex> lock(script.mutex);
+            if (point == CpuPoint::tile_start) {
+                ++script.tile_start_indices[tile_index];
+                script.start_threads[tile_index] = std::this_thread::get_id();
+                script.start_worker_ids[tile_index] = executing_worker_id();
+                return script.tile_starts[tile_index];
+            }
+            ++script.tile_end_indices[tile_index];
+            script.end_threads[tile_index] = std::this_thread::get_id();
+            script.end_worker_ids[tile_index] = executing_worker_id();
+            return script.tile_ends[tile_index];
+        }
+    };
 
     auto build_payload = [](size_t rows, size_t k_count, size_t j_count,
                             const std::vector<ResidualEvent> & events) {
@@ -1324,7 +1389,7 @@ bool test_direct_cpu_executor() {
         return rmd::reference_direct_correction(args, payload.row_count, events, output);
     };
 
-    constexpr size_t rows = 4, columns = 19, logical_k = 65, blocks_per_row = 3;
+    constexpr size_t rows = 4, columns = 48, logical_k = 65, blocks_per_row = 3;
     std::vector<block_q8_h1> native_weights(columns * blocks_per_row);
     for (size_t j = 0; j < columns; ++j) {
         for (size_t block_id = 0; block_id < blocks_per_row; ++block_id) {
@@ -1377,6 +1442,186 @@ bool test_direct_cpu_executor() {
         !check(native_metrics.j_tile_count == (native_args.J + 15) / 16,
                "direct executor publishes independent J tiles for parallel service")) return false;
 
+    const size_t expected_tile_count = (native_args.J + 15) / 16;
+#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+    if (!check(native_metrics.cpu_tiles.size() == expected_tile_count,
+               "normal Linux-AArch64 detail execution publishes every dynamic J tile")) {
+        return false;
+    }
+    for (size_t tile = 0; tile < native_metrics.cpu_tiles.size(); ++tile) {
+        const residual::DirectCpuTileRecord & record = native_metrics.cpu_tiles[tile];
+        if (!check(record.stripe_id == native_payload->stripe_id &&
+                       record.tile_index == tile && record.j_begin == tile * 16 &&
+                       record.j_end == std::min(native_args.J, (tile + 1) * size_t{16}),
+                   "normal no-hook record retains dynamic tile identity")) return false;
+    }
+#endif
+    CpuScript exact_script(expected_tile_count);
+    const residual::testing::DirectExecutionTestHooks exact_hooks{
+        &CpuScript::read, &exact_script};
+    residual::DirectExecutionMetrics exact_metrics{};
+    rmd::Correction exact_output = rmd::BlockScaledInt64Correction{{101}};
+    if (!check(residual::execute_direct_stripe(
+                   native_args, *native_payload, exact_output, &exact_metrics, exact_hooks) ==
+                   rmd::RmdStatus::success && integer_values_equal(exact_output, native_expected),
+               "J-tile sampling preserves exact numerical output") ||
+        !check(exact_metrics.event_count == native_payload->events.size() &&
+                   exact_metrics.call_count == 1 &&
+                   exact_metrics.j_tile_count == expected_tile_count,
+               "J-tile sampling preserves event, call, and dynamic tile counters") ||
+        !check(exact_metrics.cpu_tiles.size() == expected_tile_count,
+               "every actual execute_j_tile invocation publishes one record")) {
+        return false;
+    }
+
+    CpuScript null_metrics_script(expected_tile_count);
+    const residual::testing::DirectExecutionTestHooks null_metrics_hooks{
+        &CpuScript::read, &null_metrics_script};
+    rmd::Correction null_metrics_output = rmd::BlockScaledInt64Correction{{102}};
+    if (!check(residual::execute_direct_stripe(
+                   native_args, *native_payload, null_metrics_output, nullptr,
+                   null_metrics_hooks) == rmd::RmdStatus::success &&
+                   integer_values_equal(null_metrics_output, native_expected),
+               "null-metrics direct execution preserves exact numerical output")) {
+        return false;
+    }
+    for (size_t tile = 0; tile < expected_tile_count; ++tile) {
+        if (!check(null_metrics_script.tile_start_indices[tile] == 1 &&
+                       null_metrics_script.tile_end_indices[tile] == 1 &&
+                       null_metrics_script.start_threads[tile] ==
+                           null_metrics_script.end_threads[tile],
+                   "hooks substitute one local sample pair for every null-metrics J tile")) {
+            return false;
+        }
+    }
+
+    const uint64_t unavailable_run_id = exact_metrics.cpu_tiles.front().run_id;
+    for (size_t tile = 0; tile < expected_tile_count; ++tile) {
+        const residual::DirectCpuTileRecord & record = exact_metrics.cpu_tiles[tile];
+        const uint64_t expected_delta = 3 + static_cast<uint64_t>(tile) * 2;
+        if (!check(record.run_id == unavailable_run_id && unavailable_run_id == 0 &&
+                       record.stripe_id == native_payload->stripe_id &&
+                       record.tile_index == tile && record.j_begin == tile * 16 &&
+                       record.j_end == std::min(native_args.J, (tile + 1) * size_t{16}),
+                   "standalone tile record omits unavailable run ID and retains stripe/J identity") ||
+            !check(record.valid && record.reason == residual::DirectCpuTileReason::none &&
+                       record.delta_cycles == expected_delta &&
+                       record.owner_event_token == 10 + static_cast<uint64_t>(tile) * 10 &&
+                       record.generation == 1,
+                   "standalone tile record retains delta and PMU provenance") ||
+            !check(exact_script.tile_start_indices[tile] == 1 &&
+                       exact_script.tile_end_indices[tile] == 1 &&
+                       exact_script.start_threads[tile] == exact_script.end_threads[tile],
+                   "each dynamic J tile has one local start/end on its OS thread") ||
+            !check(record.worker_id == exact_script.start_worker_ids[tile] &&
+                       record.worker_id == exact_script.end_worker_ids[tile],
+                   "published worker identity matches the executing dynamic worker")) {
+            return false;
+        }
+    }
+
+    CpuScript propagated_script(expected_tile_count);
+    const residual::testing::DirectExecutionTestHooks propagated_hooks{
+        &CpuScript::read, &propagated_script};
+    constexpr uint64_t supplied_run_id = UINT64_C(0x6a17);
+    residual::DirectExecutionMetrics propagated_metrics{};
+    propagated_metrics.run_id = supplied_run_id;
+    rmd::Correction propagated_output = rmd::BlockScaledInt64Correction{{104}};
+    if (!check(residual::execute_direct_stripe(
+                   native_args, *native_payload, propagated_output, &propagated_metrics,
+                   propagated_hooks) == rmd::RmdStatus::success &&
+                   integer_values_equal(propagated_output, native_expected) &&
+                   propagated_metrics.cpu_tiles.size() == expected_tile_count,
+               "supplied run-ID execution preserves output and dynamic tile records")) {
+        return false;
+    }
+    for (size_t tile = 0; tile < expected_tile_count; ++tile) {
+        const residual::DirectCpuTileRecord & record = propagated_metrics.cpu_tiles[tile];
+        if (!check(record.run_id == supplied_run_id &&
+                       record.stripe_id == native_payload->stripe_id &&
+                       record.tile_index == tile && record.j_begin == tile * 16 &&
+                       record.j_end == std::min(native_args.J, (tile + 1) * size_t{16}) &&
+                       record.worker_id == propagated_script.start_worker_ids[tile] &&
+                       propagated_script.tile_start_indices[tile] == 1 &&
+                       propagated_script.tile_end_indices[tile] == 1,
+                   "supplied event/job run ID propagates exactly to every dynamic tile")) {
+            return false;
+        }
+    }
+
+    auto execute_with_script = [&](CpuScript & script,
+                                   residual::DirectExecutionMetrics & metrics,
+                                   rmd::Correction & output) {
+        const residual::testing::DirectExecutionTestHooks hooks{
+            &CpuScript::read, &script};
+        return residual::execute_direct_stripe(
+            native_args, *native_payload, output, &metrics, hooks);
+    };
+    auto other_tiles_valid = [&](const residual::DirectExecutionMetrics & metrics,
+                                 size_t invalid_tile) {
+        if (metrics.cpu_tiles.size() != expected_tile_count) return false;
+        for (size_t tile = 0; tile < metrics.cpu_tiles.size(); ++tile) {
+            if (tile != invalid_tile && (!metrics.cpu_tiles[tile].valid ||
+                    !metrics.cpu_tiles[tile].delta_cycles.has_value())) return false;
+        }
+        return true;
+    };
+
+    CpuScript invalid_end_script(expected_tile_count);
+    invalid_end_script.tile_ends[1].valid = false;
+    residual::DirectExecutionMetrics invalid_end_metrics{};
+    rmd::Correction invalid_end_output = rmd::BlockScaledInt64Correction{{103}};
+    if (!check(execute_with_script(invalid_end_script, invalid_end_metrics,
+                                   invalid_end_output) == rmd::RmdStatus::success &&
+                   integer_values_equal(invalid_end_output, native_expected) &&
+                   !invalid_end_metrics.cpu_tiles[1].valid &&
+                   !invalid_end_metrics.cpu_tiles[1].delta_cycles.has_value() &&
+                   invalid_end_metrics.cpu_tiles[1].reason ==
+                       residual::DirectCpuTileReason::invalid_end &&
+                   other_tiles_valid(invalid_end_metrics, 1),
+               "invalid end invalidates only its standalone tile")) return false;
+
+    CpuScript owner_script(expected_tile_count);
+    owner_script.tile_ends[1].owner += 1;
+    residual::DirectExecutionMetrics owner_metrics{};
+    rmd::Correction owner_output = rmd::BlockScaledInt64Correction{{105}};
+    if (!check(execute_with_script(owner_script, owner_metrics, owner_output) ==
+                   rmd::RmdStatus::success && integer_values_equal(owner_output, native_expected) &&
+                   !owner_metrics.cpu_tiles[1].valid &&
+                   owner_metrics.cpu_tiles[1].reason ==
+                       residual::DirectCpuTileReason::event_owner_mismatch &&
+                   other_tiles_valid(owner_metrics, 1),
+               "owner mismatch invalidates only its standalone tile")) return false;
+
+    CpuScript generation_script(expected_tile_count);
+    generation_script.tile_ends[2].generation += 1;
+    residual::DirectExecutionMetrics generation_metrics{};
+    rmd::Correction generation_output = rmd::BlockScaledInt64Correction{{117}};
+    if (!check(execute_with_script(generation_script, generation_metrics,
+                                   generation_output) == rmd::RmdStatus::success &&
+                   integer_values_equal(generation_output, native_expected) &&
+                   !generation_metrics.cpu_tiles[2].valid &&
+                   generation_metrics.cpu_tiles[2].reason ==
+                       residual::DirectCpuTileReason::event_generation_mismatch &&
+                   other_tiles_valid(generation_metrics, 2),
+               "generation mismatch invalidates only its standalone tile")) return false;
+
+    CpuScript missing_script(expected_tile_count);
+    missing_script.available_tile_samples = expected_tile_count - 1;
+    residual::DirectExecutionMetrics missing_metrics{};
+    rmd::Correction missing_output = rmd::BlockScaledInt64Correction{{113}};
+    if (!check(execute_with_script(missing_script, missing_metrics, missing_output) ==
+                   rmd::RmdStatus::success && integer_values_equal(missing_output, native_expected) &&
+                   !missing_metrics.cpu_tiles.back().valid &&
+                   !missing_metrics.cpu_tiles.back().delta_cycles.has_value() &&
+                   other_tiles_valid(missing_metrics, expected_tile_count - 1),
+               "missing samples invalidate only their tile without an aggregate")) return false;
+
+    std::printf("DIRECT_J_TILES records=%zu pairs=%zu run_id=%llu stripe_id=%zu "
+                "numerics=reference_equal invalid_end=local owner=local generation=local\n",
+                exact_metrics.cpu_tiles.size(), expected_tile_count,
+                static_cast<unsigned long long>(unavailable_run_id), native_payload->stripe_id);
+
     constexpr size_t dense_rows = 2, dense_columns = 5, dense_k = 37;
     std::vector<elem_t> dense_weights(dense_k * dense_columns);
     for (size_t k = 0; k < dense_k; ++k)
@@ -1401,9 +1646,23 @@ bool test_direct_cpu_executor() {
     rmd::Correction failed = rmd::BlockScaledInt64Correction{sentinel};
     DirectStripePayload malformed = *dense_payload;
     std::swap(malformed.events[0], malformed.events[1]);
-    if (!check(residual::execute_direct_stripe(dense_args, malformed, failed) ==
-                   rmd::RmdStatus::invalid_packet && integer_values_equal(failed, sentinel),
-               "direct invalid payload fails atomically")) return false;
+    CpuScript failure_script(1);
+    residual::DirectExecutionMetrics failure_metrics{};
+    failure_metrics.event_count = 71;
+    failure_metrics.call_count = 73;
+    failure_metrics.cpu_tiles.resize(1);
+    failure_metrics.cpu_tiles.front().run_id = 127;
+    const residual::testing::DirectExecutionTestHooks failure_hooks{
+        &CpuScript::read, &failure_script};
+    if (!check(residual::execute_direct_stripe(
+                   dense_args, malformed, failed, &failure_metrics, failure_hooks) ==
+                   rmd::RmdStatus::invalid_packet && integer_values_equal(failed, sentinel) &&
+                   failure_metrics.event_count == 71 && failure_metrics.call_count == 73 &&
+                   failure_metrics.cpu_tiles.size() == 1 &&
+                   failure_metrics.cpu_tiles.front().run_id == 127 &&
+                   failure_script.tile_start_indices.front() == 0 &&
+                   failure_script.tile_end_indices.front() == 0,
+               "direct invalid payload leaves output, metrics, and local tile endpoints unchanged")) return false;
     ggml_gemmini_args_t unsupported_args = dense_args;
     unsupported_args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_h0;
     if (!check(residual::execute_direct_stripe(unsupported_args, *dense_payload, failed) ==
@@ -1426,6 +1685,90 @@ bool test_direct_cpu_executor() {
                    rmd::RmdStatus::allocation_failure && integer_values_equal(failed, sentinel),
                "direct impossible allocation fails atomically")) return false;
 
+    auto execute_q16_h1 = [&](std::vector<block_q16_h1> & blocks,
+                              const std::vector<ResidualEvent> & events,
+                              rmd::Correction & output) {
+        const size_t logical_k = blocks.size() * QK16_0;
+        const auto payload = build_payload(1, logical_k, 1, events);
+        if (payload == nullptr) return rmd::RmdStatus::invalid_packet;
+        ggml_gemmini_args_t args{};
+        args.I = args.J = 1; args.K = logical_k;
+        args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q16_h1;
+        args.q16_h1_blocks = blocks.data();
+        args.native_block_count = blocks.size();
+        args.native_blocks_per_row = blocks.size();
+        args.native_weight_bytes = blocks.size() * sizeof(block_q16_h1);
+        args.block_size_k = QK16_0;
+        return residual::execute_direct_stripe(args, *payload, output);
+    };
+    auto maximum_scale_block = [] {
+        block_q16_h1 block{};
+        block.c_b = std::numeric_limits<uint8_t>::max();
+        block.R = std::numeric_limits<uint16_t>::max();
+        block.s_rf = 1.0f;
+        return block;
+    };
+    auto expect_q16_overflow = [&](std::vector<block_q16_h1> & blocks,
+                                   const std::vector<ResidualEvent> & events,
+                                   const char * message) {
+        const std::vector<rmd::OutputValue> unchanged = {211};
+        rmd::Correction output = rmd::BlockScaledInt64Correction{unchanged};
+        return check(execute_q16_h1(blocks, events, output) == rmd::RmdStatus::overflow &&
+                         integer_values_equal(output, unchanged), message);
+    };
+
+    std::vector<block_q16_h1> signed_result_blocks(1);
+    signed_result_blocks[0].qs[0] = 3;
+    signed_result_blocks[0].c_b = 2;
+    signed_result_blocks[0].R = 3;
+    signed_result_blocks[0].s_rf = 1.0f;
+    rmd::Correction signed_result = rmd::BlockScaledInt64Correction{{211}};
+    if (!check(execute_q16_h1(signed_result_blocks, {{0, 0, -2}}, signed_result) ==
+                   rmd::RmdStatus::success &&
+                   integer_values_equal(signed_result, std::vector<rmd::OutputValue>{-30}),
+               "portable signed multiply and add produce the expected negative result")) {
+        return false;
+    }
+
+    std::vector<block_q16_h1> positive_multiply_blocks(1, maximum_scale_block());
+    positive_multiply_blocks[0].qs[0] = std::numeric_limits<int16_t>::max();
+    positive_multiply_blocks[0].qs[1] = std::numeric_limits<int16_t>::max();
+    if (!expect_q16_overflow(positive_multiply_blocks,
+                            {{0, 0, std::numeric_limits<int32_t>::max()},
+                             {0, 1, std::numeric_limits<int32_t>::max()}},
+                            "positive signed multiplication overflow is rejected atomically")) {
+        return false;
+    }
+
+    std::vector<block_q16_h1> negative_multiply_blocks = positive_multiply_blocks;
+    if (!expect_q16_overflow(negative_multiply_blocks,
+                            {{0, 0, std::numeric_limits<int32_t>::min()},
+                             {0, 1, std::numeric_limits<int32_t>::min()}},
+                            "negative signed multiplication overflow is rejected atomically")) {
+        return false;
+    }
+
+    std::vector<block_q16_h1> positive_add_blocks(
+        2, maximum_scale_block());
+    positive_add_blocks[0].qs[0] = std::numeric_limits<int16_t>::max();
+    positive_add_blocks[1].qs[0] = std::numeric_limits<int16_t>::max();
+    if (!expect_q16_overflow(positive_add_blocks,
+                            {{0, 0, std::numeric_limits<int32_t>::max()},
+                             {0, QK16_0, std::numeric_limits<int32_t>::max()}},
+                            "positive signed addition overflow is rejected atomically")) {
+        return false;
+    }
+
+    std::vector<block_q16_h1> negative_add_blocks = positive_add_blocks;
+    if (!expect_q16_overflow(negative_add_blocks,
+                            {{0, 0, std::numeric_limits<int32_t>::min()},
+                             {0, QK16_0, std::numeric_limits<int32_t>::min()}},
+                            "negative signed addition overflow is rejected atomically")) {
+        return false;
+    }
+    std::puts("DIRECT_SIGNED_ARITHMETIC normal=-30 positive_multiply=overflow "
+              "negative_multiply=overflow positive_add=overflow negative_add=overflow");
+
     constexpr size_t overflow_k = 17 * QK8_0;
     std::vector<block_q8_h1> overflow_weights(17);
     for (block_q8_h1 & block : overflow_weights) {
@@ -1445,10 +1788,13 @@ bool test_direct_cpu_executor() {
     overflow_args.q8_h1_rows = 1; overflow_args.blocks_per_row = overflow_weights.size();
     overflow_args.native_weight_bytes = overflow_weights.size() * sizeof(block_q8_h1);
     overflow_args.block_size_k = QK8_0;
-    return check(overflow_payload != nullptr, "direct overflow payload built") &&
-        check(residual::execute_direct_stripe(overflow_args, *overflow_payload, failed) ==
-                  rmd::RmdStatus::overflow && integer_values_equal(failed, sentinel),
-              "direct arithmetic overflow fails atomically");
+    if (!check(overflow_payload != nullptr, "direct overflow payload built") ||
+        !check(residual::execute_direct_stripe(overflow_args, *overflow_payload, failed) ==
+                   rmd::RmdStatus::overflow && integer_values_equal(failed, sentinel),
+               "direct arithmetic overflow fails atomically")) return false;
+    std::puts("DIRECT_J_TILE_FAILURES invalid_end=local owner=local generation=local "
+              "missing_sample=local output_atomic=true metrics_atomic=true");
+    return true;
 }
 
 bool test_rmd_lane_partition() {

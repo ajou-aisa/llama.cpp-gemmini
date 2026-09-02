@@ -166,6 +166,12 @@ if (LLAMA_BUILD_TOOLS AND LOG_CYCLE)
             -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/gemmini-cycle-cli
             -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-cycle-cli.cmake)
 endif()
+add_test(NAME test-gemmini-cpu-cycle-validity-contract
+    COMMAND ${CMAKE_COMMAND}
+        -DCPU_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-cpu/ggml-cpu.c
+        -DGEMMINI_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini.cpp
+        -DCPU_CMAKE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-cpu/CMakeLists.txt
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-cpu-cycle-validity-contract.cmake)
 add_test(NAME test-build-arm64-log-defaults
     COMMAND ${CMAKE_COMMAND}
         -DTEST_SCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/../build-arm64.sh
@@ -200,8 +206,28 @@ target_compile_features(test-gemmini-log-boundary PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-log-boundary PRIVATE
     EXPECT_LOG_DEBUG=$<IF:$<BOOL:${LOG_DEBUG}>,1,0>
     EXPECT_LOG_CYCLE=$<IF:$<BOOL:${LOG_CYCLE}>,1,0>)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+    CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    target_include_directories(test-gemmini-log-boundary PRIVATE
+        ../ggml/src/ggml-gemmini-utils/src)
+endif()
 add_test(NAME test-gemmini-log-boundary
     COMMAND $<TARGET_FILE:test-gemmini-log-boundary>)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    find_package(Threads REQUIRED)
+    add_executable(test-gemmini-cycle-reader-aarch64
+        test-gemmini-cycle-reader-aarch64.cpp
+        ../ggml/src/ggml-gemmini-utils/src/cycle_reader_aarch64.cpp
+        ../ggml/src/ggml-gemmini-utils/src/cycle_reader-capi.cpp)
+    target_include_directories(test-gemmini-cycle-reader-aarch64 PRIVATE
+        ../ggml/src/ggml-gemmini-utils/include)
+    target_compile_definitions(test-gemmini-cycle-reader-aarch64 PRIVATE
+        GGML_GEMMINI_TESTING=1 LOG_CYCLE=1)
+    target_compile_features(test-gemmini-cycle-reader-aarch64 PRIVATE cxx_std_17)
+    target_link_libraries(test-gemmini-cycle-reader-aarch64 PRIVATE Threads::Threads)
+    add_test(NAME test-gemmini-cycle-reader-aarch64
+        COMMAND $<TARGET_FILE:test-gemmini-cycle-reader-aarch64>)
+endif()
 if (LOG_CYCLE AND GGML_CPU_CYCLE_LOG AND TARGET ggml-cpu)
     add_executable(test-ggml-cpu-cycle-sink test-ggml-cpu-cycle-sink.cpp)
     target_link_libraries(test-ggml-cpu-cycle-sink PRIVATE ggml-base ggml-cpu ggml-gemmini-utils)
@@ -373,6 +399,7 @@ endif()
 target_compile_features(test-gemmini-exsia PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-exsia PRIVATE
     GGML_GEMMINI_TESTING=1
+    GGML_GEMMINI_DIRECT_METRICS_TESTING=1
     GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
     GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
     GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
@@ -381,6 +408,11 @@ target_compile_definitions(test-gemmini-exsia PRIVATE
     CYCLE_DETAIL=${CYCLE_DETAIL}
     LOG_CYCLE=${LOG_CYCLE}
     EXSIA_VALIDATION=1)
+if (GGML_GEMMINI_ENABLE_OPENMP)
+    find_package(OpenMP REQUIRED COMPONENTS CXX)
+    target_compile_definitions(test-gemmini-exsia PRIVATE GGML_GEMMINI_HAS_OPENMP)
+    target_link_libraries(test-gemmini-exsia PRIVATE OpenMP::OpenMP_CXX)
+endif()
 target_include_directories(test-gemmini-exsia PRIVATE
     ../ggml/include
     ../ggml/src
@@ -395,6 +427,135 @@ target_include_directories(test-gemmini-exsia PRIVATE
     ${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini-rocc-tests
     ${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini-rocc-tests/include
     ${TEST_GEMMINI_EXSIA_SW_PATH}/rocc-software/src)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+    CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    add_library(test-gemmini-direct-linux-aarch64-strict OBJECT
+        ../ggml/src/ggml-gemmini/residual/direct/direct-executor.cpp)
+    set_target_properties(test-gemmini-direct-linux-aarch64-strict PROPERTIES COMPILE_OPTIONS "")
+    target_compile_features(test-gemmini-direct-linux-aarch64-strict PRIVATE cxx_std_17)
+    target_compile_definitions(test-gemmini-direct-linux-aarch64-strict PRIVATE
+        CYCLE_DETAIL=1
+        LOG_CYCLE=1
+        GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+        GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE})
+    target_compile_options(test-gemmini-direct-linux-aarch64-strict PRIVATE
+        -Wmissing-declarations
+        -Wmissing-noreturn
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Wcast-qual
+        -Wextra-semi
+        -Wunused-parameter
+        -Werror)
+    target_include_directories(test-gemmini-direct-linux-aarch64-strict PRIVATE
+        ../ggml/include
+        ../ggml/src
+        ../ggml/src/ggml-gemmini
+        ../ggml/src/ggml-gemmini-utils/include
+        ${TEST_GEMMINI_EXSIA_SW_PATH}
+        ${TEST_GEMMINI_EXSIA_SW_PATH}/include)
+    add_dependencies(test-gemmini-exsia test-gemmini-direct-linux-aarch64-strict)
+endif()
+add_test(NAME gemmini_direct_metrics_source_contract
+    COMMAND ${CMAKE_COMMAND}
+        -DDIRECT_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/residual/direct/direct-executor.cpp
+        -DDIRECT_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/residual/direct/direct-executor.hpp
+        -DTEST_CMAKE=${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
+        -DCXX_COMPILER=${CMAKE_CXX_COMPILER}
+        -DGENERATED_DIR=${CMAKE_BINARY_DIR}/generated
+        -DPROJECT_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/..
+        -DGEMMINI_SW_PATH=${TEST_GEMMINI_EXSIA_SW_PATH}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-direct-metrics-source-contract.cmake)
+add_test(NAME gemmini_direct_metrics_adversarial_contract
+    COMMAND ${CMAKE_COMMAND}
+        -DDIRECT_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/residual/direct/direct-executor.cpp
+        -DDIRECT_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/residual/direct/direct-executor.hpp
+        -DTEST_CMAKE=${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
+        -DCONTRACT_SCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-direct-metrics-source-contract.cmake
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-direct-metrics-adversarial.cmake)
+foreach(_worker_count IN ITEMS 3 4)
+    add_executable(test-gemmini-exsia-workers${_worker_count}
+        test-gemmini-exsia-profile.cpp
+        ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
+        ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
+        ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+        ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
+        ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
+        ../ggml/src/ggml-gemmini/residual/rmd/rmd-reference.cpp
+        ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
+        ../ggml/src/ggml-gemmini/quants/act/quantize.cpp
+        ../ggml/src/ggml-gemmini/quants/act/block/block.cpp
+        ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
+        ../ggml/src/ggml-gemmini/quants/act/stripe/stripe.cpp
+        ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
+        ../ggml/src/ggml-gemmini/quants/act/token/token.cpp)
+    target_link_libraries(test-gemmini-exsia-workers${_worker_count} PRIVATE
+        ggml-base ggml-gemmini-utils)
+    target_compile_features(test-gemmini-exsia-workers${_worker_count} PRIVATE cxx_std_17)
+    target_compile_definitions(test-gemmini-exsia-workers${_worker_count} PRIVATE
+        GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+        GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
+        GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
+        GGML_GEMMINI_EXSIA_LOCAL_WORKERS=${_worker_count}
+        GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=2
+        GGML_GEMMINI_ENABLE_RMD=0
+        CYCLE_DETAIL=1
+        LOG_CYCLE=1
+        EXSIA_VALIDATION=1)
+    target_include_directories(test-gemmini-exsia-workers${_worker_count} PRIVATE
+        ../ggml/include ../ggml/src ../ggml/src/ggml-gemmini
+        ../ggml/src/ggml-gemmini-utils/include ../ggml/src/ggml-gemmini/quants
+        ../ggml/src/ggml-gemmini/quants/act ../ggml/src/ggml-gemmini/quants/act/exsia
+        ../ggml/src/ggml-gemmini/quants/common ${TEST_GEMMINI_EXSIA_SW_PATH}
+        ${TEST_GEMMINI_EXSIA_SW_PATH}/include)
+    if (GGML_GEMMINI_ENABLE_OPENMP)
+        target_compile_definitions(test-gemmini-exsia-workers${_worker_count} PRIVATE
+            GGML_GEMMINI_HAS_OPENMP)
+        target_link_libraries(test-gemmini-exsia-workers${_worker_count} PRIVATE
+            OpenMP::OpenMP_CXX)
+    endif()
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+        CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+        add_library(test-gemmini-exsia-workers${_worker_count}-strict OBJECT
+            ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp)
+        set_target_properties(test-gemmini-exsia-workers${_worker_count}-strict
+            PROPERTIES COMPILE_OPTIONS "")
+        target_compile_features(test-gemmini-exsia-workers${_worker_count}-strict PRIVATE cxx_std_17)
+        target_compile_definitions(test-gemmini-exsia-workers${_worker_count}-strict PRIVATE
+            GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+            GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
+            GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
+            GGML_GEMMINI_EXSIA_LOCAL_WORKERS=${_worker_count}
+            GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=2
+            GGML_GEMMINI_ENABLE_RMD=0 CYCLE_DETAIL=1 LOG_CYCLE=1 EXSIA_VALIDATION=1)
+        target_compile_options(test-gemmini-exsia-workers${_worker_count}-strict PRIVATE
+            -Wall -Wextra -Wcast-qual -Wextra-semi -Wunused-parameter -Werror)
+        target_include_directories(test-gemmini-exsia-workers${_worker_count}-strict PRIVATE
+            ../ggml/include ../ggml/src ../ggml/src/ggml-gemmini
+            ../ggml/src/ggml-gemmini-utils/include ../ggml/src/ggml-gemmini/quants
+            ../ggml/src/ggml-gemmini/quants/act ../ggml/src/ggml-gemmini/quants/act/exsia
+            ../ggml/src/ggml-gemmini/quants/common)
+        target_include_directories(test-gemmini-exsia-workers${_worker_count}-strict SYSTEM PRIVATE
+            ${TEST_GEMMINI_EXSIA_SW_PATH} ${TEST_GEMMINI_EXSIA_SW_PATH}/include)
+        if (GGML_GEMMINI_ENABLE_OPENMP)
+            target_compile_definitions(test-gemmini-exsia-workers${_worker_count}-strict PRIVATE
+                GGML_GEMMINI_HAS_OPENMP)
+            target_link_libraries(test-gemmini-exsia-workers${_worker_count}-strict PRIVATE
+                OpenMP::OpenMP_CXX)
+        endif()
+        add_dependencies(test-gemmini-exsia-workers${_worker_count}
+            test-gemmini-exsia-workers${_worker_count}-strict)
+    endif()
+    add_test(NAME test-gemmini-exsia-workers${_worker_count}
+        COMMAND $<TARGET_FILE:test-gemmini-exsia-workers${_worker_count}>)
+endforeach()
+add_test(NAME test-gemmini-exsia-profile-contract
+    COMMAND ${CMAKE_COMMAND}
+        -DEXSIA_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
+        -DEXSIA_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/quants/act/exsia/exsia.hpp
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-exsia-profile-contract.cmake)
+
 set(_GGML_GEMMINI_EXSIA_CASES
     all baseline dispatch direct-executor stripe-geometry)
 if (_GGML_GEMMINI_ACTIVATION_BITS_VALUE EQUAL 8 AND
@@ -411,6 +572,9 @@ foreach(_case IN LISTS _GGML_GEMMINI_EXSIA_CASES)
             -DEXPECTED_CASE=${_case}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-exsia-case.cmake)
 endforeach()
+set_tests_properties(gemmini_exsia_all gemmini_exsia_direct_executor PROPERTIES
+    ENVIRONMENT "OMP_DYNAMIC=FALSE;OMP_NUM_THREADS=3;OMP_THREAD_LIMIT=3"
+    TIMEOUT 30)
 unset(_GGML_GEMMINI_EXSIA_CASES)
 add_test(NAME gemmini_exsia_unknown_case
     COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=unknown)
@@ -515,9 +679,10 @@ add_test(NAME test-gemmini-rmd-radix-failure
 
 add_executable(test-gemmini-rmd-packet
     test-gemmini-rmd-packet.cpp
+    ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp)
 target_link_libraries(test-gemmini-rmd-packet PRIVATE
-    ggml-base ggml-gemmini ggml-gemmini-utils)
+    ggml-base ggml-gemmini-utils)
 target_compile_features(test-gemmini-rmd-packet PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-rmd-packet PRIVATE
     GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
@@ -530,6 +695,31 @@ target_include_directories(test-gemmini-rmd-packet PRIVATE
     ${GEMMINI_SW_PATH}/include)
 add_test(NAME test-gemmini-rmd-packet
     COMMAND $<TARGET_FILE:test-gemmini-rmd-packet>)
+
+add_executable(test-gemmini-rmd-capture
+    test-gemmini-rmd-capture.cpp
+    ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp)
+target_link_libraries(test-gemmini-rmd-capture PRIVATE
+    ggml-base ggml-gemmini-utils)
+target_compile_features(test-gemmini-rmd-capture PRIVATE cxx_std_17)
+target_compile_definitions(test-gemmini-rmd-capture PRIVATE
+    GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+    GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
+    LOG_CYCLE=${LOG_CYCLE}
+    CYCLE_DETAIL=${CYCLE_DETAIL})
+target_include_directories(test-gemmini-rmd-capture PRIVATE
+    ../ggml/src
+    ../ggml/src/ggml-gemmini
+    ../ggml/src/ggml-gemmini/residual/rmd
+    ${GEMMINI_SW_PATH}
+    ${GEMMINI_SW_PATH}/include)
+add_test(NAME test-gemmini-rmd-capture
+    COMMAND $<TARGET_FILE:test-gemmini-rmd-capture>)
+add_test(NAME test-gemmini-rmd-capture-finish-boundary
+    COMMAND ${CMAKE_COMMAND}
+        -DTEST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/..
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-rmd-capture-finish-boundary.cmake)
 
 add_executable(test-gemmini-production-host-backend
     test-gemmini-production-host-backend.cpp)
@@ -667,9 +857,11 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
         GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
         GGML_GEMMINI_ACTIVATION_QUANT=${_GGML_GEMMINI_ACTIVATION_QUANT_VALUE}
         GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
+        GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE}
         GGML_GEMMINI_TEST_IM2P_DIM=${GGML_GEMMINI_DIM}
-        LOG_CYCLE=${LOG_CYCLE}
         LOG_DEBUG=${LOG_DEBUG})
+    ggml_gemmini_apply_profile_compile_definitions(test-gemmini-im2p-routing)
+    ggml_gemmini_assert_profile_compile_definitions(test-gemmini-im2p-routing)
     target_include_directories(test-gemmini-im2p-routing PRIVATE
         ../ggml/src
         ../ggml/src/ggml-gemmini
@@ -826,7 +1018,8 @@ target_include_directories(gemmini-quant-dispatch-smoke PRIVATE
     ../ggml/src/ggml-gemmini/quants/act
     ../ggml/src/ggml-gemmini/quants/act/exsia
     ../ggml/src/ggml-gemmini/quants/act/token
-    ../ggml/src/ggml-gemmini/quants/common)
+    ../ggml/src/ggml-gemmini/quants/common
+    ${GEMMINI_SW_PATH} ${GEMMINI_SW_PATH}/include)
 llama_test(gemmini-quant-dispatch-smoke NAME gemmini_quant_dispatch_fp          ARGS fp)
 llama_test(gemmini-quant-dispatch-smoke NAME gemmini_quant_dispatch_exsia       ARGS exsia)
 llama_test(gemmini-quant-dispatch-smoke NAME gemmini_quant_dispatch_tensor     ARGS tensor)
@@ -837,6 +1030,20 @@ add_test(
         -DTEST_BINARY=$<TARGET_FILE:gemmini-quant-dispatch-smoke>
         -P ${CMAKE_CURRENT_SOURCE_DIR}/gemmini-quant-dispatch-unsupported.cmake)
 set_property(TEST gemmini_quant_dispatch_unsupported PROPERTY LABELS main)
+
+add_test(NAME test-gemmini-matmul-cpu-boundaries
+    COMMAND ${CMAKE_COMMAND}
+        -DMATMUL_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini-matmul.cpp
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-matmul-cpu-boundaries.cmake)
+
+add_test(NAME test-gemmini-profiled-domain-contract
+    COMMAND ${CMAKE_COMMAND}
+        -DMATMUL_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini-matmul.cpp
+        -DMATMUL_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini-matmul.hpp
+        -DMATMUL_TELEMETRY=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini-telemetry.cpp
+        -DGEMMINI_ENTRY_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/ggml-gemmini.cpp
+        -DGEMMINI_SOURCE_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-profiled-domain-contract.cmake)
 
 # Keep the executable side of Gemmini's CTest registration explicit. Building
 # this target before CTest prevents a stale tree from hiding missing artifacts.

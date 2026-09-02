@@ -1,4 +1,7 @@
 #include "../include/gemmini/log.hpp"
+#if defined(__linux__) && defined(__aarch64__)
+#include "cycle_reader_internal.h"
+#endif
 
 #include <limits>
 #include <mutex>
@@ -45,9 +48,42 @@ namespace ggml::gemmini::log
         }
     } // namespace
 
-    std::string serialize_cycle_record(const CycleRecord &record)
-    {
-        const uint64_t cycles = record.end >= record.start ? record.end - record.start : 0;
+    static std::string serialize_cycle_record_impl(
+            const CycleRecord & record, bool linux_aarch64
+#if defined(__linux__) && defined(__aarch64__)
+            , bool provenance_available, bool checked_valid, const char * checked_reason
+#endif
+    ) {
+#if defined(__riscv)
+        const char * const default_source = linux_aarch64 ? "linux_perf_cpu_cycles" : "riscv_cycle";
+        const char * const default_unit = "cycle";
+#else
+        const char * const default_source = linux_aarch64 ? "linux_perf_cpu_cycles" : "host_tick";
+        const char * const default_unit = linux_aarch64 ? "cycle" : "tick";
+#endif
+        const char * const source = record.source ? record.source : default_source;
+        const char * const unit = record.unit ? record.unit : default_unit;
+        bool valid = record.end >= record.start;
+        const char * reason = nullptr;
+#if defined(__linux__) && defined(__aarch64__)
+        if (provenance_available) {
+            valid = checked_valid;
+            reason = checked_reason;
+        } else
+#endif
+        if (linux_aarch64) {
+            if (record.start == 0) {
+                valid = false;
+                reason = "invalid_start";
+            } else if (record.end == 0) {
+                valid = false;
+                reason = "invalid_end";
+            } else if (record.end < record.start) {
+                valid = false;
+                reason = "counter_regression";
+            }
+        }
+        const uint64_t cycles = valid ? record.end - record.start : 0;
         std::string json;
         json.reserve(192);
         bool first = true;
@@ -102,13 +138,8 @@ namespace ggml::gemmini::log
         add_string("schema", "gemmini.cycle");
         add_u64("version", 2);
         add_string("record_type", "CYCLE_INTERVAL");
-#ifdef __riscv
-        add_string("source", record.source ? record.source : "riscv_cycle");
-        add_string("unit", record.unit ? record.unit : "cycle");
-#else
-        add_string("source", record.source ? record.source : "host_tick");
-        add_string("unit", record.unit ? record.unit : "tick");
-#endif
+        add_string("source", source);
+        add_string("unit", unit);
         add_nullable_string("op", record.op);
         add_nullable_string("layer", record.layer);
         add_identity("run_id", GEMMINI_CYCLE_HAS_RUN_ID, record.run_id);
@@ -118,9 +149,12 @@ namespace ggml::gemmini::log
         add_identity("worker_id", GEMMINI_CYCLE_HAS_WORKER_ID, record.worker_id);
         add_u64("start", record.start);
         add_u64("end", record.end);
-        add_u64("delta", cycles);
+        if (linux_aarch64 && !valid) add_null("delta"); else add_u64("delta", cycles);
         add_key("valid");
-        json += record.end >= record.start ? "true" : "false";
+        json += valid ? "true" : "false";
+        if (linux_aarch64 && !valid) {
+            add_string("reason", reason ? reason : "counter_regression");
+        }
 #if LOG_DETAIL
         add_string("file", record.file);
         if (record.file) add_i32("line", record.line);
@@ -128,6 +162,35 @@ namespace ggml::gemmini::log
 #endif
         json += "}\n";
         return json;
+    }
+
+    std::string serialize_cycle_record(const CycleRecord & record)
+    {
+#if defined(__linux__) && defined(__aarch64__)
+        return serialize_cycle_record_impl(record, true, false, false, nullptr);
+#else
+        return serialize_cycle_record_impl(record, false);
+#endif
+    }
+
+#if defined(__linux__) && defined(__aarch64__)
+    std::string serialize_checked_cycle_record(const CycleRecord & record, bool valid,
+                                               const char * reason)
+    {
+        return serialize_cycle_record_impl(record, true, true, valid, reason);
+    }
+#endif
+
+    namespace testing
+    {
+        std::string serialize_linux_aarch64_scalar_cycle_record_for_test(const CycleRecord & record)
+        {
+#if defined(__linux__) && defined(__aarch64__)
+            return serialize_cycle_record_impl(record, true, false, false, nullptr);
+#else
+            return serialize_cycle_record_impl(record, true);
+#endif
+        }
     }
 
     std::string serialize_ws_cycle_record(const WsCycleRecord &record)

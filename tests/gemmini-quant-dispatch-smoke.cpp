@@ -36,11 +36,10 @@ static void assert_fp_baseline() {
     float out = 0.0f;
     auto args = cpu_1x1_args(a, b, out);
 
-    check(ggml::gemmini::tiled_matmul_auto_baseline(
+    ggml::gemmini::tiled_matmul_auto_baseline(
         &args,
         ggml::gemmini::baseline_activation_quant_t::FLOAT,
-        ggml::gemmini::baseline_weight_quant_t::FLOAT) ==
-        ggml::gemmini::DenseMatmulStatus::success);
+        ggml::gemmini::baseline_weight_quant_t::FLOAT);
 }
 
 static void assert_exsia_baseline() {
@@ -51,11 +50,10 @@ static void assert_exsia_baseline() {
     auto &meta = args.act_quant.storage().emplace<ggml::gemmini::quants::act::exsia::Meta>();
     meta.theta = {1};
 
-    check(ggml::gemmini::tiled_matmul_auto_baseline(
+    ggml::gemmini::tiled_matmul_auto_baseline(
         &args,
         ggml::gemmini::baseline_activation_quant_t::EXSIA,
-        ggml::gemmini::baseline_weight_quant_t::TENSOR) ==
-        ggml::gemmini::DenseMatmulStatus::success);
+        ggml::gemmini::baseline_weight_quant_t::TENSOR);
 
     check(out == 12.0f);
     check(args.tile_I > 0 && args.tile_J > 0 && args.tile_K > 0);
@@ -69,11 +67,10 @@ static void assert_tensor_baseline() {
     auto &meta = args.act_quant.storage().emplace<ggml::gemmini::quants::act::tensor::Meta>();
     meta.scale = 0.25f;
 
-    check(ggml::gemmini::tiled_matmul_auto_baseline(
+    ggml::gemmini::tiled_matmul_auto_baseline(
         &args,
         ggml::gemmini::baseline_activation_quant_t::TENSOR,
-        ggml::gemmini::baseline_weight_quant_t::TENSOR) ==
-        ggml::gemmini::DenseMatmulStatus::success);
+        ggml::gemmini::baseline_weight_quant_t::TENSOR);
 
     check(out == 1.5f);
     check(args.tile_I > 0 && args.tile_J > 0 && args.tile_K > 0);
@@ -88,27 +85,19 @@ static void assert_token_baseline() {
     auto &meta = args.act_quant.storage().emplace<ggml::gemmini::quants::act::token::Meta>();
     meta.scales = {0.25f};
 
-    check(ggml::gemmini::tiled_matmul_auto_baseline(
+    ggml::gemmini::tiled_matmul_auto_baseline(
         &args,
         ggml::gemmini::baseline_activation_quant_t::TOKEN,
-        ggml::gemmini::baseline_weight_quant_t::TENSOR) ==
-        ggml::gemmini::DenseMatmulStatus::success);
+        ggml::gemmini::baseline_weight_quant_t::TENSOR);
 
     check(out == 1.5f);
     check(args.tile_I > 0 && args.tile_J > 0 && args.tile_K > 0);
 }
 
-static void assert_unsupported_baseline_quantization_is_typed() {
-    elem_t a = 3;
-    elem_t b = 4;
-    float out = 0.0f;
-    auto args = cpu_1x1_args(a, b, out);
-
-    check(ggml::gemmini::tiled_matmul_auto_baseline(
-        &args,
+static void assert_unsupported_baseline_quantization_is_unavailable() {
+    check(ggml::gemmini::baseline_route_for(
         ggml::gemmini::baseline_activation_quant_t::EXSIA,
-        ggml::gemmini::baseline_weight_quant_t::FLOAT) ==
-        ggml::gemmini::DenseMatmulStatus::unsupported);
+        ggml::gemmini::baseline_weight_quant_t::FLOAT) == nullptr);
 }
 
 int main(int argc, char **argv) {
@@ -124,7 +113,7 @@ int main(int argc, char **argv) {
     } else if (mode == "token") {
         assert_token_baseline();
     } else if (mode == "unsupported") {
-        assert_unsupported_baseline_quantization_is_typed();
+        assert_unsupported_baseline_quantization_is_unavailable();
     } else {
         check(false);
     }
