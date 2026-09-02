@@ -1,6 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
+SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/im2p-host-provision.sh
+source "$SCRIPT_ROOT/scripts/im2p-host-provision.sh"
+
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   printf 'Usage: %s [CMake configure arguments...]\n' "${0##*/}"
   printf '%s\n' 'Environment overrides: BUILD_DIR, BUILD_JOBS, GGML_*, IM2P_*.'
@@ -85,17 +89,11 @@ fi
 CMAKE_PREFIX_PATH_DEFAULT="${CMAKE_PREFIX_PATH:-}"
 
 if [[ "$GGML_GEMMINI_EXECUTION_BACKEND_DEFAULT" == "IM2P_SIM" ]]; then
-  IM2P_SIM_ROOT_ABS="$(cd "$IM2P_SIM_ROOT_DEFAULT" && pwd)"
-  make -C "$IM2P_SIM_ROOT_ABS" -j"${BUILD_JOBS_DEFAULT}" \
-    GEMMINI_ROOT="$PWD" \
-    IM2P_ACTIVATION_BITS="$GGML_GEMMINI_ACTIVATION_BITS_DEFAULT" \
-    IM2P_WEIGHT_BITS="$GGML_GEMMINI_WEIGHT_BITS_DEFAULT" \
-    IM2P_DIM="$GGML_GEMMINI_DIM_DEFAULT" \
-    GEMMINI_FRONTEND_ACTIVATION_BITS="$GGML_GEMMINI_ACTIVATION_BITS_DEFAULT" \
-    GEMMINI_FRONTEND_WEIGHT_BITS="$GGML_GEMMINI_WEIGHT_BITS_DEFAULT" \
-    GEMMINI_FRONTEND_DIM="$GGML_GEMMINI_DIM_DEFAULT" \
-    GEMMINI_FRONTEND_BLOCK_SIZE="$GGML_GEMMINI_BLOCK_SIZE_DEFAULT" \
-    gemmini-frontend-real-lib
+  im2p_provision_host_artifacts \
+    "$IM2P_SIM_ROOT_DEFAULT" "$SCRIPT_ROOT" "$BUILD_JOBS_DEFAULT" \
+    "$GGML_GEMMINI_ACTIVATION_BITS_DEFAULT" \
+    "$GGML_GEMMINI_WEIGHT_BITS_DEFAULT" \
+    "$GGML_GEMMINI_DIM_DEFAULT" "$GGML_GEMMINI_BLOCK_SIZE_DEFAULT"
 fi
 
 cmake -B "$BUILD_DIR" -S . \

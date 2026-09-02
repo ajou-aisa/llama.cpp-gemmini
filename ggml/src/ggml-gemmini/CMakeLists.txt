@@ -150,24 +150,22 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
     endif()
   endforeach()
 
-  set(_GGML_GEMMINI_IM2P_LINK_FRONTEND_ARCHIVE
-    "${GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE}")
-  if (LLAMA_BUILD_TESTS AND NOT GGML_BACKEND_DL)
-    get_filename_component(_GGML_GEMMINI_IM2P_FRONTEND_DIR
-      "${GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE}" DIRECTORY)
-    set(_GGML_GEMMINI_IM2P_TEST_FRONTEND_ARCHIVE
-      "${_GGML_GEMMINI_IM2P_FRONTEND_DIR}/libim2p_gemmini_frontend_testing.a")
-    if (NOT EXISTS "${_GGML_GEMMINI_IM2P_TEST_FRONTEND_ARCHIVE}")
-      message(FATAL_ERROR
-        "Missing IM2P frontend test archive: ${_GGML_GEMMINI_IM2P_TEST_FRONTEND_ARCHIVE}")
-    endif()
-    set(_GGML_GEMMINI_IM2P_LINK_FRONTEND_ARCHIVE
-      "${_GGML_GEMMINI_IM2P_TEST_FRONTEND_ARCHIVE}")
-  endif()
+  add_custom_target(ggml-gemmini-im2p-verify
+    COMMAND "${Python3_EXECUTABLE}"
+      "${_GGML_GEMMINI_IM2P_CACHE_VERIFIER}" verify
+      --manifest "${GGML_GEMMINI_IM2P_MANIFEST}"
+      --expected-identity "${GGML_GEMMINI_IM2P_ARTIFACT_ID}"
+      --expected-block-size "${GGML_GEMMINI_BLOCK_SIZE}"
+      --expected-platform "${CMAKE_SYSTEM_NAME}"
+      --expected-platform-release "${CMAKE_SYSTEM_VERSION}"
+      --expected-arch "${CMAKE_SYSTEM_PROCESSOR}"
+      --artifact-kind selected
+    VERBATIM)
+  add_dependencies(ggml-gemmini ggml-gemmini-im2p-verify)
 
   add_library(ggml-gemmini-im2p-frontend STATIC IMPORTED GLOBAL)
   set_target_properties(ggml-gemmini-im2p-frontend PROPERTIES
-    IMPORTED_LOCATION "${_GGML_GEMMINI_IM2P_LINK_FRONTEND_ARCHIVE}")
+    IMPORTED_LOCATION "${GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE}")
   add_library(ggml-gemmini-im2p-simulator STATIC IMPORTED GLOBAL)
   set_target_properties(ggml-gemmini-im2p-simulator PROPERTIES
     IMPORTED_LOCATION "${GGML_GEMMINI_IM2P_SIM_ARCHIVE}")

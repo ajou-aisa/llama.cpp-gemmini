@@ -386,10 +386,54 @@ if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
 
     set(GGML_GEMMINI_IM2P_ARTIFACT_ID
         "a${GGML_GEMMINI_ACTIVATION_BITS}-w${GGML_GEMMINI_WEIGHT_BITS}-d${GGML_GEMMINI_DIM}")
+    set(_GGML_GEMMINI_IM2P_CURRENT
+        "${IM2P_SIM_ROOT}/build/selected/${GGML_GEMMINI_IM2P_ARTIFACT_ID}/current")
+    if(NOT IS_SYMLINK "${_GGML_GEMMINI_IM2P_CURRENT}")
+        message(FATAL_ERROR
+            "Missing atomic IM2P selected generation: ${_GGML_GEMMINI_IM2P_CURRENT}")
+    endif()
+    get_filename_component(GGML_GEMMINI_IM2P_GENERATION
+        "${_GGML_GEMMINI_IM2P_CURRENT}" REALPATH)
+    get_filename_component(_GGML_GEMMINI_IM2P_GENERATION_ROOT
+        "${IM2P_SIM_ROOT}/build/selected/${GGML_GEMMINI_IM2P_ARTIFACT_ID}/generations"
+        REALPATH)
+    string(FIND "${GGML_GEMMINI_IM2P_GENERATION}/"
+        "${_GGML_GEMMINI_IM2P_GENERATION_ROOT}/"
+        _GGML_GEMMINI_IM2P_GENERATION_PREFIX)
+    if(NOT _GGML_GEMMINI_IM2P_GENERATION_PREFIX EQUAL 0)
+        message(FATAL_ERROR
+            "IM2P selected generation escapes its private root: ${GGML_GEMMINI_IM2P_GENERATION}")
+    endif()
+    set(GGML_GEMMINI_IM2P_MANIFEST
+        "${GGML_GEMMINI_IM2P_GENERATION}/real-lib.json")
+    set(_GGML_GEMMINI_IM2P_CACHE_VERIFIER
+        "${IM2P_SIM_ROOT}/scripts/real_lib_cache.py")
+    if(NOT EXISTS "${_GGML_GEMMINI_IM2P_CACHE_VERIFIER}")
+        message(FATAL_ERROR
+            "Missing IM2P cache verifier: ${_GGML_GEMMINI_IM2P_CACHE_VERIFIER}")
+    endif()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}"
+            "${_GGML_GEMMINI_IM2P_CACHE_VERIFIER}" verify
+            --manifest "${GGML_GEMMINI_IM2P_MANIFEST}"
+            --expected-identity "${GGML_GEMMINI_IM2P_ARTIFACT_ID}"
+            --expected-block-size "${GGML_GEMMINI_BLOCK_SIZE}"
+            --expected-platform "${CMAKE_SYSTEM_NAME}"
+            --expected-platform-release "${CMAKE_SYSTEM_VERSION}"
+            --expected-arch "${CMAKE_SYSTEM_PROCESSOR}"
+            --artifact-kind selected
+        RESULT_VARIABLE _GGML_GEMMINI_IM2P_MANIFEST_RESULT
+        OUTPUT_VARIABLE _GGML_GEMMINI_IM2P_MANIFEST_OUTPUT
+        ERROR_VARIABLE _GGML_GEMMINI_IM2P_MANIFEST_ERROR)
+    if(NOT _GGML_GEMMINI_IM2P_MANIFEST_RESULT EQUAL 0)
+        message(FATAL_ERROR
+            "IM2P cache manifest verification failed for ${GGML_GEMMINI_IM2P_ARTIFACT_ID}:\n${_GGML_GEMMINI_IM2P_MANIFEST_OUTPUT}${_GGML_GEMMINI_IM2P_MANIFEST_ERROR}")
+    endif()
     set(GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE
-        "${IM2P_SIM_ROOT}/build/lib/${GGML_GEMMINI_IM2P_ARTIFACT_ID}/libim2p_gemmini_frontend.a")
+        "${GGML_GEMMINI_IM2P_GENERATION}/libim2p_gemmini_frontend.a")
     set(GGML_GEMMINI_IM2P_SIM_ARCHIVE
-        "${IM2P_SIM_ROOT}/build/cargo/${GGML_GEMMINI_IM2P_ARTIFACT_ID}/release/libim2p_sim.a")
+        "${GGML_GEMMINI_IM2P_GENERATION}/libim2p_sim.a")
     foreach(_GGML_GEMMINI_IM2P_ARCHIVE IN ITEMS
             GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE GGML_GEMMINI_IM2P_SIM_ARCHIVE)
         if(NOT EXISTS "${${_GGML_GEMMINI_IM2P_ARCHIVE}}")

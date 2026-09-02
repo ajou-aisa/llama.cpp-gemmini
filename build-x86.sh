@@ -1,6 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
+SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/im2p-host-provision.sh
+source "$SCRIPT_ROOT/scripts/im2p-host-provision.sh"
+
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   printf 'Usage: %s [CMake configure arguments...]\n' "${0##*/}"
   printf '%s\n' 'Environment overrides: BUILD_DIR, BUILD_JOBS, GGML_*, IM2P_*.'
@@ -63,6 +67,14 @@ fi
 if [[ "$GGML_GEMMINI_EXSIA_PROFILE_SCOPE_DEFAULT" != "OFF" && "$CYCLE_DETAIL_DEFAULT" != "1" ]]; then
   printf '%s\n' "ExSIA profiling requires CYCLE_DETAIL=1" >&2
   exit 2
+fi
+
+if [[ "$GGML_GEMMINI_EXECUTION_BACKEND_DEFAULT" == "IM2P_SIM" ]]; then
+  im2p_provision_host_artifacts \
+    "$IM2P_SIM_ROOT_DEFAULT" "$SCRIPT_ROOT" "$BUILD_JOBS_DEFAULT" \
+    "$GGML_GEMMINI_ACTIVATION_BITS_DEFAULT" \
+    "$GGML_GEMMINI_WEIGHT_BITS_DEFAULT" \
+    "$GGML_GEMMINI_DIM_DEFAULT" "$GGML_GEMMINI_BLOCK_SIZE_DEFAULT"
 fi
 
 cmake -B "$BUILD_DIR" -S . \

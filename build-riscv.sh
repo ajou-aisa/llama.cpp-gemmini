@@ -2,6 +2,12 @@
 
 set -euo pipefail
 
+if [[ "${IM2P_ARTIFACT_SET:-SELECTED}" == "ALL_MATCHED" ]]; then
+  printf '%s\n' \
+    'IM2P_ARTIFACT_SET=ALL_MATCHED is host-only; build-riscv.sh is hardware-only' >&2
+  exit 2
+fi
+
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ||
       "${2:-}" == "-h" || "${2:-}" == "--help" ]]; then
   printf 'Usage: %s [static] [CMake configure arguments...]\n' "${0##*/}"
