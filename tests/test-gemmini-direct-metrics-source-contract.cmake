@@ -90,7 +90,7 @@ if(NOT DEFINED SEMANTIC_CASE OR SEMANTIC_CASE STREQUAL "F1a")
     math(EXPR run_full_length "${run_full_end} - ${run_full_begin}")
     string(SUBSTRING "${matmul_source}" ${run_full_begin} ${run_full_length} run_full_body)
     string(FIND "${run_full_body}"
-        "residual::execute_direct_stripe(args(), *payload, correction)"
+        "residual::execute_direct_stripe(args(), *payload, correction"
         run_full_direct_call)
     if(run_full_direct_call EQUAL -1)
         message(FATAL_ERROR
@@ -116,10 +116,11 @@ if(NOT DEFINED SEMANTIC_CASE OR SEMANTIC_CASE STREQUAL "F1a")
     string(FIND "${identity_block}" "GEMMINI_CYCLE_HAS_STRIPE_ID" stripe_identity)
     string(FIND "${identity_block}" "GEMMINI_CYCLE_HAS_NODE_ID" node_identity)
     string(FIND "${identity_block}" "GEMMINI_CYCLE_HAS_WORKER_ID" worker_identity)
-    string(FIND "${identity_block}" "if (direct_run_id != 0)" conditional_run)
+    string(FIND "${identity_block}" "if (direct_run_id.has_value())" conditional_run)
     string(FIND "${identity_block}" "GEMMINI_CYCLE_HAS_RUN_ID" run_identity)
-    string(FIND "${identity_block}" "identity_mask, direct_run_id" direct_identity_use)
-    if(stripe_identity EQUAL -1 OR node_identity EQUAL -1 OR worker_identity EQUAL -1 OR
+    string(FIND "${identity_block}" "identity_mask, direct_run_id.value_or(0)" direct_identity_use)
+    string(FIND "${identity_block}" "args.matmul_layer.c_str()" layer_identity)
+    if(layer_identity EQUAL -1 OR stripe_identity EQUAL -1 OR node_identity EQUAL -1 OR worker_identity EQUAL -1 OR
        conditional_run EQUAL -1 OR run_identity EQUAL -1 OR direct_identity_use EQUAL -1 OR
        NOT conditional_run LESS run_identity)
         message(FATAL_ERROR

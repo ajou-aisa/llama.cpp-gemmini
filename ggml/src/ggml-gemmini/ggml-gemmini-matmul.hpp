@@ -24,9 +24,7 @@
 #include <unordered_set>
 #include <vector>
 
-#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
 #include <gemmini/cycle_reader.hpp>
-#endif
 
 #if !defined(GGML_GEMMINI_CONFIG_HAS_ACTIVATION_QUANT)
 namespace ggml::gemmini::config {
@@ -37,6 +35,9 @@ inline constexpr int ACTIVATION_QUANT = static_cast<int>(CURRENT_ACTIVATION_QUAN
 namespace ggml::gemmini {
 
 struct MatmulJobMetrics;
+namespace log { struct CycleRecord; }
+void project_matmul_cpu_identity(log::CycleRecord & record,
+    const MatmulJobMetrics * profile, std::optional<uint64_t> invocation_run_id = {});
 
 namespace detail {
 
@@ -220,7 +221,96 @@ struct MatmulStageMetrics {
     size_t count = 0;
 };
 
+// Scoped CPU transport: absent collection is not a measured zero. Identity and
+// algorithm success belong to the caller's record, not to PMU validity.
+struct MatmulCpuInterval {
+    std::optional<uint64_t> cycles;
+    std::string reason = "not_collected";
+    std::string sample_reason;
+    uint64_t count = 1;
+    uint64_t valid_count = 0;
+    uint64_t not_applicable_count = 0;
+
+    static MatmulCpuInterval measured(uint64_t value) {
+        return {value, {}, {}, 1, 1, 0};
+    }
+    static MatmulCpuInterval unavailable(const char * reason) {
+        return {{}, reason, {}, 1, 0,
+                std::string_view(reason) == "not_applicable" ? 1U : 0U};
+    }
+};
+
+struct MatmulCpuSample {
+    uint64_t value = 0;
+    bool collected = false;
+#if defined(__linux__) && defined(__aarch64__)
+    cycle::NativeCycleSample native;
+#endif
+};
+
+inline MatmulCpuSample read_matmul_cpu_sample() {
+    MatmulCpuSample result;
+#if LOG_CYCLE
+    result.collected = true;
+#if defined(__linux__) && defined(__aarch64__)
+    result.native = cycle::read_sample();
+    result.value = result.native.value;
+#else
+    result.value = cycle::read();
+#endif
+#endif
+    return result;
+}
+
+inline MatmulCpuInterval evaluate_matmul_cpu_interval(
+        const MatmulCpuSample & start, const MatmulCpuSample & end,
+        bool same_task = true) {
+    if (!start.collected || !end.collected) return {};
+#if defined(__linux__) && defined(__aarch64__)
+    const auto delta = cycle::evaluate_interval(start.native, end.native, same_task);
+    if (!delta.valid) {
+        auto result = MatmulCpuInterval::unavailable(cycle::reason_name(delta.reason));
+        if (delta.sample_reason != cycle::NativeCycleReason::none)
+            result.sample_reason = cycle::reason_name(delta.sample_reason);
+        return result;
+    }
+    return MatmulCpuInterval::measured(delta.value);
+#else
+    if (!same_task) return MatmulCpuInterval::unavailable("structurally_cross_task");
+    if (end.value < start.value)
+        return MatmulCpuInterval::unavailable("counter_regression");
+    return MatmulCpuInterval::measured(end.value - start.value);
+#endif
+}
+
+inline std::optional<uint64_t> matmul_cpu_run_id(const ggml_gemmini_args_t & args) {
+    const auto * meta = std::get_if<quants::act::exsia::Meta>(&args.act_quant.storage());
+    return meta != nullptr ? meta->run_id : std::nullopt;
+}
+
+// ExSIA publishes run/slot identity with its optional metadata snapshot. This
+// also covers by-value executions whose metadata predates the producer run.
+inline std::optional<uint64_t> matmul_cpu_run_id(
+        const quants::act::exsia::StripeReadyEvent & event,
+        std::optional<uint64_t> invocation_run_id = {}) {
+    return event.activation_metadata.has_value()
+        ? std::optional<uint64_t>(event.run_id) : invocation_run_id;
+}
+
+inline bool matmul_telemetry_hash_enabled() {
+    const char * value = std::getenv("GGML_GEMMINI_TELEMETRY_HASH");
+    return value != nullptr && std::string_view(value) == "1";
+}
+
 struct MatmulJobMetrics {
+    uint32_t cpu_identity_mask = 0;
+    MatmulCpuInterval cpu_dense;
+    MatmulCpuInterval cpu_prep;
+    MatmulCpuInterval cpu_backend;
+    MatmulCpuInterval cpu_merge;
+    MatmulCpuInterval cpu_residual_total;
+    MatmulCpuSample cpu_residual_start;
+    bool telemetry_hash_enabled = false;
     uint64_t run_id = 0;
     size_t stripe_id = 0;
     size_t slot = 0;
@@ -303,6 +393,7 @@ struct MatmulCaptureTiming {
 };
 
 struct MatmulCapturedStripe {
+    uint32_t cpu_identity_mask = 0;
     uint64_t run_id = 0;
     size_t stripe_id = 0;
     size_t slot = 0;
@@ -451,11 +542,11 @@ struct RmdTelemetryGeometry {
 };
 
 struct RmdTelemetryTiming {
-    uint64_t prep = 0;
-    uint64_t backend_service = 0;
-    uint64_t merge = 0;
-    uint64_t residual_total = 0;
-    uint64_t queue = 0;
+    MatmulCpuInterval prep;
+    MatmulCpuInterval backend_service;
+    MatmulCpuInterval merge;
+    MatmulCpuInterval residual_total;
+    MatmulCpuInterval queue;
     uint64_t dense_end = 0;
     uint64_t residual_start = 0;
 };
@@ -471,6 +562,8 @@ struct RmdTelemetryStripe {
     std::string correction_hash;
     std::string output_hash;
     uint64_t correction_nonzero_count = 0;
+    bool hash_enabled = false;
+    MatmulCpuInterval dense{};
 };
 
 struct RmdTelemetryRecord {
@@ -484,7 +577,7 @@ struct RmdTelemetryRecord {
     MatmulOptionSource source = MatmulOptionSource::build_default;
     std::string units;
     bool work = false;
-    uint64_t invocation_total = 0;
+    MatmulCpuInterval invocation_total;
     RmdTelemetryCounters counters;
     RmdTelemetryGeometry geometry;
     RmdTelemetryTiming timing;
@@ -531,7 +624,8 @@ RmdTelemetryRecord make_rmd_telemetry_record(
     RmdBackend backend, MatmulOptionSource source,
     std::string runtime_bundle_id, std::string model_id, std::string layer,
     uint64_t run_id,
-    uint64_t invocation_total, const std::vector<MatmulJobMetrics> & profiles);
+    const MatmulCpuInterval & invocation_total,
+    const std::vector<MatmulJobMetrics> & profiles);
 
 struct ResolvedMatmulOptions {
     MatmulInvocationMode mode = static_cast<MatmulInvocationMode>(config::DEFAULT_MATMUL_MODE);

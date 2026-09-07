@@ -1,5 +1,6 @@
 #include "exsia.hpp"
 
+#include "../../../ggml-gemmini-telemetry.hpp"
 #include "../../../residual/rmd/rmd-compose.hpp"
 #include "exsia_shift.hpp"
 #include "types.hpp"
@@ -425,6 +426,7 @@ namespace ggml::gemmini::quants::act::exsia
             case ProfileCycleStatus::event_generation_mismatch: return "event_generation_mismatch";
             case ProfileCycleStatus::structurally_cross_task: return "structurally_cross_task";
             case ProfileCycleStatus::counter_regression: return "counter_regression";
+            case ProfileCycleStatus::sum_overflow: return "sum_overflow";
             }
             return "missing_component";
         }
@@ -476,6 +478,10 @@ namespace ggml::gemmini::quants::act::exsia
             write_json_string(out, ggml::gemmini::cycle::clock_mode());
             out << ",\"units\":";
             write_json_string(out, ggml::gemmini::cycle::units());
+            out << ",\"source\":";
+            write_json_string(out, kNativeCycleSource);
+            out << ",\"unit\":";
+            write_json_string(out, kNativeCycleUnit);
             out << ",\"timer_resolution\":" << ggml::gemmini::cycle::resolution()
                 << ",\"team_size\":" << team_size << ",\"elapsed\":";
             if (checked.cycles.has_value()) out << *checked.cycles; else out << "null";
@@ -509,6 +515,10 @@ namespace ggml::gemmini::quants::act::exsia
             write_json_string(out, ggml::gemmini::cycle::clock_mode());
             out << ",\"units\":";
             write_json_string(out, ggml::gemmini::cycle::units());
+            out << ",\"source\":";
+            write_json_string(out, kNativeCycleSource);
+            out << ",\"unit\":";
+            write_json_string(out, kNativeCycleUnit);
             out << ",\"timer_resolution\":" << ggml::gemmini::cycle::resolution()
                 << ",\"team_size\":" << team_size << ",\"elapsed\":";
             if (checked.cycles.has_value()) out << *checked.cycles; else out << "null";
@@ -531,8 +541,11 @@ namespace ggml::gemmini::quants::act::exsia
                                               uint64_t value,
                                               ProfileCycleStatus status,
                                               const char *value_units,
-                                              size_t team_size)
+                                              size_t team_size,
+                                              const StageCycleStats *stats = nullptr)
         {
+            if (stats != nullptr && std::strcmp(value_units, "count") != 0)
+                status = stats->cycle_status();
             out << "{\"schema\":\"gemmini.cycle\",\"version\":2,"
                 << "\"record_type\":\"STAGE\",\"op\":\"exsia.stage_metric\",\"layer\":";
             write_nullable_json_string(out, layer);
@@ -546,8 +559,22 @@ namespace ggml::gemmini::quants::act::exsia
             if (status == ProfileCycleStatus::complete) out << value; else out << "null";
             out << ",\"value_units\":";
             write_json_string(out, value_units);
+            out << ",\"source\":";
+            write_json_string(out, kNativeCycleSource);
+            out << ",\"unit\":";
+            write_json_string(out, std::strcmp(value_units, "count") == 0 ? "count" : kNativeCycleUnit);
             out << ",\"team_size\":" << team_size << ",\"cycle_status\":";
             write_json_string(out, profile_cycle_status_name(status));
+            if (stats != nullptr)
+            {
+                out << ",\"total_count\":" << stats->total_count
+                    << ",\"valid_count\":" << stats->count
+                    << ",\"invalid_count\":" << stats->total_count - stats->count;
+#if defined(__linux__) && defined(__aarch64__)
+                out << ",\"sample_reason\":";
+                write_json_string(out, ggml::gemmini::cycle::reason_name(stats->sample_reason));
+#endif
+            }
             out << "}\n";
         }
 #endif
@@ -608,19 +635,24 @@ namespace ggml::gemmini::quants::act::exsia
                 };
                 for (size_t stage = 0; stage < 4; ++stage)
                 {
+#if defined(__linux__) && defined(__aarch64__)
+                    const StageCycleStats *checked_stats = stages[stage];
+#else
+                    const StageCycleStats *checked_stats = nullptr;
+#endif
                     char suffix[48];
                     std::snprintf(suffix, sizeof(suffix), "local.p%zu.sum", stage);
                     write_stage_metric(trace, layer, run_id, mode, profile.stripe_idx,
                                        suffix, stages[stage]->sum, ProfileCycleStatus::complete,
-                                       ggml::gemmini::cycle::units(), profile.team_size);
+                                       ggml::gemmini::cycle::units(), profile.team_size, checked_stats);
                     std::snprintf(suffix, sizeof(suffix), "local.p%zu.count", stage);
                     write_stage_metric(trace, layer, run_id, mode, profile.stripe_idx,
                                        suffix, stages[stage]->count, ProfileCycleStatus::complete,
-                                       "count", profile.team_size);
+                                       "count", profile.team_size, checked_stats);
                     std::snprintf(suffix, sizeof(suffix), "local.p%zu.max", stage);
                     write_stage_metric(trace, layer, run_id, mode, profile.stripe_idx,
                                        suffix, stages[stage]->max, ProfileCycleStatus::complete,
-                                       ggml::gemmini::cycle::units(), profile.team_size);
+                                       ggml::gemmini::cycle::units(), profile.team_size, checked_stats);
                 }
                 write_stage_metric(trace, layer, run_id, mode, profile.stripe_idx,
                                     "local.p3.bypass_no_int.count",
@@ -651,6 +683,17 @@ namespace ggml::gemmini::quants::act::exsia
             file.flush();
             return file ? ExSIAState::FailureCode::None : ExSIAState::FailureCode::ProfileFlushFailure;
         }
+    }
+#endif
+
+#if EXSIA_VALIDATION && EXSIA_STAGE_PROFILE_ENABLED && EXSIA_PROFILE_LOG_ENABLED
+    std::string serialize_stage_sum_for_test(const StageCycleStats &stats)
+    {
+        std::ostringstream out;
+        write_stage_metric(out, "test-layer", 0, "Sequential", 0, "local.p0.sum",
+                           stats.sum, ProfileCycleStatus::complete,
+                           ggml::gemmini::cycle::units(), 1, &stats);
+        return out.str();
     }
 #endif
 
@@ -1752,6 +1795,7 @@ namespace ggml::gemmini::quants::act::exsia
     {
         const char * layer = args.matmul_layer.c_str();
         const uint64_t run_id = next_exsia_run_id();
+        meta.run_id = run_id;
         EXSIA_PROFILE_LOG(
         const ProfileConfig profile_config = compile_profile_config();
         )
@@ -1889,6 +1933,7 @@ namespace ggml::gemmini::quants::act::exsia
         for (StripePipelineSlot &slot : pipeline_slots_)
         {
             slot.rmd_builder.select(args.residual_route);
+            slot.rmd_builder.set_context(run_id, layer);
             if (!slot.prepare(max_stripe_elem_count, max_stripe_block_count,
                               max_stripe_rows, state_.K_padded, state_.B_size))
                 return fail(ExSIAState::FailureCode::InvalidInput);
@@ -2869,7 +2914,7 @@ namespace ggml::gemmini::quants::act::exsia
 #if EXSIA_STAGE_PROFILE_ENABLED
             profile.stats = slot.cycle_stats;
 #endif
-            if (!notify_stripe_ready(slot, run_id, false
+            if (!notify_stripe_ready(slot, run_id, true
 #if EXSIA_PROFILE_COLLECTION_ENABLED
                                      , &profile
 #endif

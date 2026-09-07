@@ -123,6 +123,7 @@ bool integer_values_equal(const rmd::Correction & correction,
 }
 
 struct GeometryPublicationTrace {
+    std::optional<uint64_t> run_id;
     std::array<std::pair<size_t, size_t>, 2> rows{};
     size_t publications = 0;
     size_t direct_handles = 0;
@@ -134,6 +135,8 @@ bool capture_geometry_publication(
     const quants::act::exsia::StripeReadyEvent & event) {
     auto & trace = *static_cast<GeometryPublicationTrace *>(opaque);
     if (trace.publications >= trace.rows.size()) return false;
+    if (trace.run_id.has_value() && *trace.run_id != event.run_id) return false;
+    trace.run_id = event.run_id;
     trace.rows[trace.publications++] = {event.row_begin, event.row_end};
     trace.direct_handles += event.direct_residual != nullptr ? 1 : 0;
     trace.packet_handles += event.rmd_packet != nullptr ? 1 : 0;
@@ -241,7 +244,8 @@ bool test_activation_stripe_geometry_contract() {
     const bool direct_atomic_ok =
         check(!bad_exsia_ok && bad_exsia.state().failure_code ==
                   quants::act::exsia::ExSIAState::FailureCode::InvalidInput &&
-                  bad_trace.publications == 0 && bad_exsia_meta.theta.empty() &&
+                  bad_trace.publications == 0 && !bad_exsia_meta.run_id.has_value() &&
+                  bad_exsia_meta.theta.empty() &&
                   bad_exsia.state().stripe.empty() && bad_exsia.state().residual.empty() &&
                   direct_sentinel_unchanged,
               "direct ExSIA mismatch is typed, atomic, and has zero side effects");
@@ -267,7 +271,8 @@ bool test_activation_stripe_geometry_contract() {
         check(exsia_args.tile_I == 2 && exsia_args.tile_J == 3 && exsia_args.tile_K == 4 &&
                   stripe_args.tile_I == 2 && stripe_args.tile_J == 3 && stripe_args.tile_K == 4,
               "quantization preserves all auto-selected tile factors") &&
-        check(trace.publications == 2 &&
+        check(trace.publications == 2 && trace.run_id.has_value() &&
+                  exsia_meta.run_id == trace.run_id &&
                   trace.rows[0] == std::make_pair(size_t{0}, stripe_rows) &&
                   trace.rows[1] == std::make_pair(stripe_rows, rows),
               "ExSIA publishes contiguous full and final partial stripes") &&
@@ -1495,11 +1500,11 @@ bool test_direct_cpu_executor() {
         }
     }
 
-    const uint64_t unavailable_run_id = exact_metrics.cpu_tiles.front().run_id;
+    const std::optional<uint64_t> unavailable_run_id = exact_metrics.cpu_tiles.front().run_id;
     for (size_t tile = 0; tile < expected_tile_count; ++tile) {
         const residual::DirectCpuTileRecord & record = exact_metrics.cpu_tiles[tile];
         const uint64_t expected_delta = 3 + static_cast<uint64_t>(tile) * 2;
-        if (!check(record.run_id == unavailable_run_id && unavailable_run_id == 0 &&
+        if (!check(record.run_id == unavailable_run_id && !unavailable_run_id.has_value() &&
                        record.stripe_id == native_payload->stripe_id &&
                        record.tile_index == tile && record.j_begin == tile * 16 &&
                        record.j_end == std::min(native_args.J, (tile + 1) * size_t{16}),
@@ -1520,32 +1525,33 @@ bool test_direct_cpu_executor() {
         }
     }
 
-    CpuScript propagated_script(expected_tile_count);
-    const residual::testing::DirectExecutionTestHooks propagated_hooks{
-        &CpuScript::read, &propagated_script};
-    constexpr uint64_t supplied_run_id = UINT64_C(0x6a17);
-    residual::DirectExecutionMetrics propagated_metrics{};
-    propagated_metrics.run_id = supplied_run_id;
-    rmd::Correction propagated_output = rmd::BlockScaledInt64Correction{{104}};
-    if (!check(residual::execute_direct_stripe(
-                   native_args, *native_payload, propagated_output, &propagated_metrics,
-                   propagated_hooks) == rmd::RmdStatus::success &&
-                   integer_values_equal(propagated_output, native_expected) &&
-                   propagated_metrics.cpu_tiles.size() == expected_tile_count,
-               "supplied run-ID execution preserves output and dynamic tile records")) {
-        return false;
-    }
-    for (size_t tile = 0; tile < expected_tile_count; ++tile) {
-        const residual::DirectCpuTileRecord & record = propagated_metrics.cpu_tiles[tile];
-        if (!check(record.run_id == supplied_run_id &&
-                       record.stripe_id == native_payload->stripe_id &&
-                       record.tile_index == tile && record.j_begin == tile * 16 &&
-                       record.j_end == std::min(native_args.J, (tile + 1) * size_t{16}) &&
-                       record.worker_id == propagated_script.start_worker_ids[tile] &&
-                       propagated_script.tile_start_indices[tile] == 1 &&
-                       propagated_script.tile_end_indices[tile] == 1,
-                   "supplied event/job run ID propagates exactly to every dynamic tile")) {
+    for (const uint64_t supplied_run_id : {UINT64_C(0), UINT64_C(0x6a17)}) {
+        CpuScript propagated_script(expected_tile_count);
+        const residual::testing::DirectExecutionTestHooks propagated_hooks{
+            &CpuScript::read, &propagated_script};
+        residual::DirectExecutionMetrics propagated_metrics{};
+        propagated_metrics.run_id = supplied_run_id;
+        rmd::Correction propagated_output = rmd::BlockScaledInt64Correction{{104}};
+        if (!check(residual::execute_direct_stripe(
+                       native_args, *native_payload, propagated_output, &propagated_metrics,
+                       propagated_hooks) == rmd::RmdStatus::success &&
+                       integer_values_equal(propagated_output, native_expected) &&
+                       propagated_metrics.cpu_tiles.size() == expected_tile_count,
+                   "supplied run-ID execution preserves output and dynamic tile records")) {
             return false;
+        }
+        for (size_t tile = 0; tile < expected_tile_count; ++tile) {
+            const residual::DirectCpuTileRecord & record = propagated_metrics.cpu_tiles[tile];
+            if (!check(record.run_id.has_value() && *record.run_id == supplied_run_id &&
+                           record.stripe_id == native_payload->stripe_id &&
+                           record.tile_index == tile && record.j_begin == tile * 16 &&
+                           record.j_end == std::min(native_args.J, (tile + 1) * size_t{16}) &&
+                           record.worker_id == propagated_script.start_worker_ids[tile] &&
+                           propagated_script.tile_start_indices[tile] == 1 &&
+                           propagated_script.tile_end_indices[tile] == 1,
+                       "supplied event/job run ID propagates exactly to every dynamic tile")) {
+                return false;
+            }
         }
     }
 
@@ -1620,7 +1626,7 @@ bool test_direct_cpu_executor() {
     std::printf("DIRECT_J_TILES records=%zu pairs=%zu run_id=%llu stripe_id=%zu "
                 "numerics=reference_equal invalid_end=local owner=local generation=local\n",
                 exact_metrics.cpu_tiles.size(), expected_tile_count,
-                static_cast<unsigned long long>(unavailable_run_id), native_payload->stripe_id);
+                static_cast<unsigned long long>(unavailable_run_id.value_or(0)), native_payload->stripe_id);
 
     constexpr size_t dense_rows = 2, dense_columns = 5, dense_k = 37;
     std::vector<elem_t> dense_weights(dense_k * dense_columns);

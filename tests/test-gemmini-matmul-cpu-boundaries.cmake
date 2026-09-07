@@ -63,37 +63,15 @@ function(require_token value token label)
     endif()
 endfunction()
 
-function(require_checked_publication value operation eligibility label)
-    require_count("${value}" "gemmini_log_cycle_record_v2_checked_internal" 1
-        "${label} checked publication")
-    string(FIND "${value}" "const gemmini_cycle_record_v2" record_begin)
-    if(record_begin EQUAL -1)
-        message(FATAL_ERROR "${label}: standalone v2 record is missing")
-    endif()
-    string(SUBSTRING "${value}" ${record_begin} -1 publication_tail)
-    string(FIND "${publication_tail}" "gemmini_log_cycle_record_v2_checked_internal" sink)
-    if(sink EQUAL -1)
-        message(FATAL_ERROR "${label}: standalone checked sink is missing")
-    endif()
-    math(EXPR publication_length "${sink} + 256")
-    string(LENGTH "${publication_tail}" tail_length)
-    if(publication_length GREATER tail_length)
-        set(publication_length ${tail_length})
-    endif()
-    string(SUBSTRING "${publication_tail}" 0 ${publication_length} publication)
-    if(NOT value MATCHES "\"[^\"]*${operation}[^\"]*\"" OR
-       NOT publication MATCHES "${operation}")
-        message(FATAL_ERROR "${label}: standalone op must identify ${operation}")
-    endif()
-    foreach(token IN ITEMS GEMMINI_CYCLE_HAS_RUN_ID GEMMINI_CYCLE_HAS_STRIPE_ID
-                           job.metrics_.run_id job.metrics_.stripe_id "${eligibility}")
-        require_token("${publication}" "${token}" "${label} standalone publication")
-    endforeach()
-    require_absent("${publication}" "PIPELINE_STRIPE_SUMMARY"
-        "${label} publication must remain outside the canonical summary")
+function(require_checked_publication value operation operation_success label)
+    require_count("${value}" "emit_matmul_native_interval" 1 "${label} one publication")
+    require_token("${value}" "${operation}" "${label} operation ID")
+    require_token("${value}" "${operation_success}" "${label} separate algorithm result")
+    require_absent("${value}" "gemmini_log_cycle_record_v2_checked_internal"
+        "${label} algorithm status must not become structural eligibility")
 endfunction()
 
-function(require_unidentified_checked_pair value operation target label)
+function(require_run_only_checked_pair value operation target label)
     require_count("${value}" "cycle::read_sample()" 2 "${label} native endpoints")
     require_count("${value}" "gemmini_log_cycle_record_v2_checked_internal" 1
         "${label} checked publication")
@@ -102,12 +80,13 @@ function(require_unidentified_checked_pair value operation target label)
         "cycle::read_sample()" "${target}" "const gemmini_cycle_record_v2"
         "gemmini_log_cycle_record_v2_checked_internal")
     foreach(token IN ITEMS "args().matmul_layer.empty()" "args().matmul_layer.c_str()"
-                           "}, 0, 0, 0, 0, 0, 0}" ", true);")
+                           "matmul_cpu_run_id(args())" "run_id.has_value()"
+                           "run_id.value_or(0), 0, 0, 0, 0}" ", true);")
         require_token("${value}" "${token}" "${label} publication contract")
     endforeach()
-    foreach(token IN ITEMS GEMMINI_CYCLE_HAS_RUN_ID GEMMINI_CYCLE_HAS_STRIPE_ID
+    foreach(token IN ITEMS GEMMINI_CYCLE_HAS_STRIPE_ID
                            GEMMINI_CYCLE_HAS_SLOT GEMMINI_CYCLE_HAS_NODE_ID
-                           GEMMINI_CYCLE_HAS_WORKER_ID run_id stripe_id worker_id
+                           GEMMINI_CYCLE_HAS_WORKER_ID stripe_id worker_id
                            "cycle::read()" now_ns timestamp_ns)
         require_absent("${value}" "${token}" "${label} synthetic identity/domain")
     endforeach()
@@ -151,9 +130,8 @@ foreach(token IN ITEMS "add_nullable_string(\"op\"" "add_identity(\"run_id\""
         "checked sink machine-consumed nullable fields contract")
 endforeach()
 
-# U12 is only the normal FULL/decode CPU_DIRECT Merge callsite. The stripe
-# finalizer's compatibility scalar Merge remains separate and must not acquire
-# this checked label.
+# Preserve the single legacy FULL CPU_DIRECT Merge pair and label. New packet
+# and stripe correction intervals identify their own actual boundaries.
 string(FIND "${run_full}" "if (args().residual_route == residual::ResidualRoute::cpu_direct)" direct_begin)
 string(FIND "${run_full}" "    } else {" packet_begin)
 if(direct_begin EQUAL -1 OR packet_begin EQUAL -1 OR packet_begin LESS_EQUAL direct_begin)
@@ -161,13 +139,13 @@ if(direct_begin EQUAL -1 OR packet_begin EQUAL -1 OR packet_begin LESS_EQUAL dir
 endif()
 math(EXPR direct_length "${packet_begin} - ${direct_begin}")
 string(SUBSTRING "${run_full}" ${direct_begin} ${direct_length} direct_full)
-require_unidentified_checked_pair("${direct_full}" "rmd_merge_cycles"
-    "rmd::merge_rmd_correction" "U12 normal FULL CPU_DIRECT Merge")
+require_count("${direct_full}" "cycle::read_sample()" 2 "one legacy FULL Merge pair")
+require_count("${direct_full}" "\"rmd_merge_cycles\"" 1 "one legacy FULL Merge label")
 require_order("${direct_full}" "U12 success-only callsite guard"
     "if (residual_status == rmd::RmdStatus::success)"
     "merge_start_sample = cycle::read_sample()" "rmd::merge_rmd_correction"
     "merge_end_sample = cycle::read_sample()"
-    "gemmini_log_cycle_record_v2_checked_internal"
+    "emit_matmul_native_interval"
     "if (residual_status != rmd::RmdStatus::success)")
 require_absent("${finalize}" "\"rmd_merge_cycles\""
     "U12 must not duplicate stripe finalize Merge")
@@ -207,7 +185,7 @@ require_order("${stripe_epilogue}" "U15 stripe failure/commit/state ordering"
 
 # U16 wraps only the normal facade's logical transaction copy. Early bypass
 # returns before the first endpoint; state cleanup remains after publication.
-require_unidentified_checked_pair("${commit}" "matmul_output_commit_cycles"
+require_run_only_checked_pair("${commit}" "matmul_output_commit_cycles"
     "for (size_t row = 0; row < args().I; ++row)" "U16 output commit copy")
 require_order("${commit}" "U16 success-only commit boundary"
     "if (output_destination_ == nullptr || args_ptr_ == nullptr) return"
@@ -237,20 +215,24 @@ require_absent("${compose}" "CpuWorkCoverage" "Compose has no coverage framework
 require_checked_publication("${compose}" "compose" "status == rmd::RmdStatus::success" "Compose")
 require_cycle_only_detail_blocks("${compose}" "Compose")
 
-# Finalize owns exactly one native pair. The nested Merge remains the exact
-# origin/develop scalar pair and is never selected into or arithmetically
-# combined with Finalize.
+# Keep one legacy inclusive Finalize pair. Its checked children are never
+# added to or subtracted from their inclusive parent.
 require_count("${finalize}" "cycle::read_sample()" 2 "one full Finalize native pair")
 require_count("${finalize}" "telemetry_finalize_start_sample = cycle::read_sample()" 1 "Finalize start")
 require_count("${finalize}" "telemetry_finalize_end_sample = cycle::read_sample()" 1 "Finalize end")
-require_count("${finalize}" "telemetry_merge_start = cycle::read()" 1 "scalar Merge start")
-require_count("${finalize}" "telemetry_merge_end = cycle::read()" 1 "scalar Merge end")
-require_order("${finalize}" "Finalize and scalar Merge boundary"
+require_count("${finalize}" "merge_start = read_matmul_cpu_sample()" 1 "checked Merge start")
+require_count("${finalize}" "merge_end = read_matmul_cpu_sample()" 1 "checked Merge end")
+require_order("${finalize}" "Finalize contains Merge/diagnostics, not completion"
     "telemetry_finalize_start_sample = cycle::read_sample()"
-    "telemetry_merge_start = cycle::read()"
-    "rmd::merge_rmd_correction"
-    "telemetry_merge_end = cycle::read()"
-    "telemetry_finalize_end_sample = cycle::read_sample()")
+    "merge_start = read_matmul_cpu_sample()" "rmd::merge_rmd_correction"
+    "merge_end = read_matmul_cpu_sample()"
+    "stats_start = read_matmul_cpu_sample()" "std::count_if"
+    "stats_end = read_matmul_cpu_sample()"
+    "matmul_telemetry_hash_enabled()" "hash_start = read_matmul_cpu_sample()"
+    "rmd_input_hash" "hash_end = read_matmul_cpu_sample()"
+    "telemetry_finalize_end_sample = cycle::read_sample()"
+    "completion_start = read_matmul_cpu_sample()" "finalized_rows_ +="
+    "job.release_slot()" "completion_end = read_matmul_cpu_sample()")
 foreach(token IN ITEMS cpu_work CpuWorkCoverage additive profiled_stripe checked_sum
                        telemetry_merge_start_sample telemetry_merge_end_sample)
     require_absent("${finalize}" "${token}" "Finalize/Merge never enters canonical totals or native Merge detail")
@@ -264,4 +246,59 @@ require_absent("${finalize}" "telemetry_residual_end_sample = cycle::read_sample
 require_checked_publication("${finalize}" "finalize" "merge_failure.ok()" "Finalize")
 require_cycle_only_detail_blocks("${finalize}" "Finalize")
 
-message(STATUS "approved Compose/Finalize/Merge boundary contract passed")
+extract_between(dense "MatmulStatus execute_dense_stripe" "MatmulStatus accept_external_dense_completion")
+extract_between(external "MatmulStatus accept_external_dense_completion" "MatmulStatus execute_rmd_stripe")
+extract_between(residual "MatmulStatus execute_rmd_stripe" "MatmulStatus compose_rmd_stripe")
+extract_between(capture "bool MatmulStripeCollector::on_ready" "MatmulStripeJob::MatmulStripeJob")
+extract_between(worker "void MatmulStripeCollector::worker_loop" "const quants::act::exsia::StripeReadySink * MatmulStripeCollector::sink")
+require_order("${dense}" "Dense samples exactly its facade host call"
+    "dense_start = read_matmul_cpu_sample()" "facade_.run_staged_stripe"
+    "dense_end = read_matmul_cpu_sample()" "to_public_status")
+require_count("${dense}" "read_matmul_cpu_sample()" 2 "matching Dense gates")
+require_absent("${dense}" "#if CYCLE_DETAIL" "Dense SUMMARY collects both endpoints")
+require_absent("${external}" "cycle::read()" "external completion is unmeasured")
+require_token("${external}" "unavailable(\"external_completion\")" "external marker status")
+require_order("${residual}" "observer and metrics are outside executor pair"
+    "observe_backend_dispatch" "backend_start = read_matmul_cpu_sample()"
+    "residual::execute_direct_stripe" "backend_end = read_matmul_cpu_sample()"
+    "metrics.direct_event_count")
+require_order("${capture}" "input capture samples metadata/handle acquisition"
+    "capture_start = read_matmul_cpu_sample()" "detail::capture_collector_event"
+    "capture_end = read_matmul_cpu_sample()" "record_metric(captured.timing.capture_copy")
+require_order("${worker}" "worker job preparation has its own same-thread pair"
+    "preparation_start = read_matmul_cpu_sample()" "std::make_shared<MatmulStripeJob>"
+    "std::make_unique<quants::act::Meta>" "preparation_end = read_matmul_cpu_sample()")
+foreach(pair IN ITEMS compose merge)
+    require_token("${run_full}" "${pair}_start = read_matmul_cpu_sample()" "FULL packet ${pair} start")
+    require_token("${run_full}" "${pair}_end = read_matmul_cpu_sample()" "FULL packet ${pair} end")
+endforeach()
+foreach(op IN ITEMS pipeline_drain_and_join matmul_output_validation_and_publish
+                    stripe_completion_bookkeeping collector_capacity_release)
+    require_token("${source}" "\"${op}\"" "lifecycle interval")
+endforeach()
+require_token("${source}" "kNativeCycleSource, kNativeCycleUnit" "portable records retain native domain")
+require_token("${source}" "evaluate_matmul_cpu_interval(start, end)" "algorithm result is not eligibility")
+require_token("${source}" "interval.sample_reason" "underlying PMU failure survives")
+file(READ "${gemmini_source_dir}/ggml-gemmini-matmul.hpp" header)
+require_order("${header}" "reader collection gate"
+    "inline MatmulCpuSample read_matmul_cpu_sample()" "#if LOG_CYCLE"
+    "result.collected = true" "result.native = cycle::read_sample()")
+# Presence is independent of scalar zero; the actual production projection is
+# exercised through the provider-free reducer target as well.
+file(READ "${gemmini_source_dir}/ggml-gemmini-telemetry.cpp" telemetry)
+require_absent("${source}" "run_id != 0" "no run-zero sentinel in lifecycle/context propagation")
+require_absent("${telemetry}" "run_id != 0" "no run-zero sentinel in CPU projection")
+require_token("${telemetry}" "record.identity_mask = profile->cpu_identity_mask" "profile presence projection")
+require_token("${telemetry}" "invocation_run_id.has_value()" "run-only FULL presence")
+require_token("${source}" "run_id = matmul_cpu_run_id(event, run_id)" "published snapshot supplies by-value run identity")
+require_token("${worker}" "captured.cpu_identity_mask & GEMMINI_CYCLE_HAS_RUN_ID" "staged run-zero context")
+require_token("${residual}" "job.metrics_.cpu_identity_mask & GEMMINI_CYCLE_HAS_RUN_ID" "direct metric run-zero context")
+require_count("${run_full}" "nullptr, nullptr, run_id" 6 "FULL wrappers all receive run-only context")
+require_token("${run_full}" "nullptr, run_id" "legacy FULL native Merge receives run-only context")
+require_token("${finish_stripes}" "matmul_cpu_run_id(args())" "output finish metadata identity")
+extract_between(emitter "void emit_matmul_cpu_interval" "void emit_matmul_native_interval")
+require_order("${emitter}" "nonthrowing CPU telemetry boundary"
+    "noexcept" "try {" "project_matmul_cpu_identity"
+    "serialize_checked_cycle_record" "log::cycle.write_json" "catch (...)"
+    "log::cycle.report_failure")
+message(STATUS "checked CPU validity, identity presence, and lifecycle boundaries passed")

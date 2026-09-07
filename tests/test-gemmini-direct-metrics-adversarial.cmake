@@ -18,14 +18,14 @@ endif()
 file(READ "${im2p_source_path}" im2p_source)
 file(READ "${matmul_source_path}" matmul_source)
 
-# IM2P is protected origin/develop surface and must not inject event.run_id into
-# direct metrics. Those two historical assignments were unauthorized. The
-# matmul job pipeline separately retains its real, authorized job run ID.
-string(FIND "${im2p_source}" "direct_metrics.run_id" forbidden_im2p_run_id)
-if(NOT forbidden_im2p_run_id EQUAL -1)
-    message(FATAL_ERROR
-        "F1b: ggml-gemmini-im2p must contain zero direct_metrics.run_id uses")
-endif()
+# Adapter changes may supply the real event ID, including zero. Never permit a
+# generated or constant ID to stand in for the originating event.
+string(REGEX MATCHALL "direct_metrics[.]run_id[ ]*=[^;]*" im2p_run_assignments "${im2p_source}")
+foreach(assignment IN LISTS im2p_run_assignments)
+    if(NOT assignment STREQUAL "direct_metrics.run_id = event.run_id")
+        message(FATAL_ERROR "F1b: IM2P direct run identity must come from event.run_id")
+    endif()
+endforeach()
 set(im2p_remainder "${im2p_source}")
 foreach(path_index RANGE 1 2)
     string(FIND "${im2p_remainder}"
@@ -40,13 +40,8 @@ foreach(path_index RANGE 1 2)
     endif()
     string(SUBSTRING "${metrics_tail}" 0 ${metrics_end} metrics_block)
     string(FIND "${metrics_block}" "status = residual::execute_direct_stripe(" direct_call)
-    string(FIND "${metrics_block}" "direct_metrics.run_id" forbidden_path_run_id)
     if(direct_call EQUAL -1)
         message(FATAL_ERROR "F1b: IM2P direct path ${path_index} dispatch is unavailable")
-    endif()
-    if(NOT forbidden_path_run_id EQUAL -1)
-        message(FATAL_ERROR
-            "F1b: IM2P direct path ${path_index} must not fabricate direct run identity")
     endif()
     math(EXPR remainder_begin "${metrics_end} + 1")
     string(SUBSTRING "${metrics_tail}" ${remainder_begin} -1 im2p_remainder)
@@ -57,12 +52,17 @@ if(NOT extra_im2p_metrics EQUAL -1)
     message(FATAL_ERROR "F1b: unexpected third IM2P direct metrics path")
 endif()
 
-string(FIND "${matmul_source}"
+string(FIND "${matmul_source}" "MatmulStatus execute_rmd_stripe(" matmul_dispatch_begin)
+if(matmul_dispatch_begin EQUAL -1)
+    message(FATAL_ERROR "F1b: native pipeline residual dispatch is unavailable")
+endif()
+string(SUBSTRING "${matmul_source}" ${matmul_dispatch_begin} -1 matmul_dispatch_body)
+string(FIND "${matmul_dispatch_body}"
     "residual::DirectExecutionMetrics direct_metrics{};" matmul_metrics_begin)
 if(matmul_metrics_begin EQUAL -1)
     message(FATAL_ERROR "F1b: matmul direct metrics block is unavailable")
 endif()
-string(SUBSTRING "${matmul_source}" ${matmul_metrics_begin} -1 matmul_metrics_tail)
+string(SUBSTRING "${matmul_dispatch_body}" ${matmul_metrics_begin} -1 matmul_metrics_tail)
 string(FIND "${matmul_metrics_tail}"
     "metrics.direct_event_count = direct_metrics.event_count;" matmul_metrics_end)
 if(matmul_metrics_end EQUAL -1)
@@ -143,9 +143,13 @@ string(REPLACE "std::optional<uint64_t> delta_cycles;"
 expect_rejected(tile_sum "${base_source}" "${mutated_header}")
 
 set(mutated_header "${base_header}")
-string(REPLACE "uint64_t run_id" "uint64_t omitted_identity"
+string(REPLACE "std::optional<uint64_t> run_id" "std::optional<uint64_t> omitted_identity"
     mutated_header "${mutated_header}")
 expect_rejected(missing_run_identity "${base_source}" "${mutated_header}")
+
+string(REPLACE "if (direct_run_id.has_value())" "if (direct_run_id != 0)"
+    mutated_source "${base_source}")
+expect_rejected(zero_run_dropped "${mutated_source}" "${base_header}")
 
 set(mutated_header "${base_header}")
 string(REPLACE "uint64_t owner_event_token" "uint64_t omitted_owner_token"

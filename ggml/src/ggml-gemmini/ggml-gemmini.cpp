@@ -1255,7 +1255,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     }
     setup_gemmini_log_outputs_if_needed();
 #if LOG_CYCLE
-    const uint64_t rmd_telemetry_invocation_start = ggml::gemmini::cycle::read();
+    const auto rmd_telemetry_invocation_start = ggml::gemmini::read_matmul_cpu_sample();
 #endif
     const auto *src0 = dst->src[0]; // src0: weight (J x K), row-major, 전치 상태
     const auto *src1 = dst->src[1]; // src1: activation (I x K) -> 전치 없음 (A)
@@ -2072,6 +2072,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.f_out = static_cast<float*>(dst->data);
     args.col_stride_f_out = dst->nb[0] / sizeof(float);
     args.stride_f_out = dst->nb[1] / sizeof(float);
+    end = ggml::gemmini::cycle::read();
+    // This preparation ends before any quantization, submission or execution.
+    ggml::gemmini::log::cycle(layer, "gemmini.output_preparation", start, end);
 
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
     if constexpr (im2p_exsia) {
@@ -2247,9 +2250,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     }
 #endif
 
-    end = ggml::gemmini::cycle::read();
-    ggml::gemmini::log::cycle(layer, "gemmini.prepare_args", start, end);
-
     // ggml::gemmini::log::debug("[Gemmini debug] layer=%s A=%p B=%p C=%p D=%p I=%zu J=%zu K=%zu sA=%zu sB=%zu sC=%zu stride_f_out(row)=%zu stride_f_out(col)=%zu nb1=%zu nb0=%zu",
     //                  layer, args.A, args.B, args.C, args.D,
     //                  args.I, args.J, args.K, args.sA, args.sB, args.sC,
@@ -2392,12 +2392,11 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             ggml::gemmini::emit_cycle_telemetry(
                 ggml::gemmini::detail::pipeline_stripe_telemetry(layer, profile));
         }
-        const uint64_t rmd_telemetry_invocation_end = ggml::gemmini::cycle::read();
+        const auto rmd_telemetry_invocation_end = ggml::gemmini::read_matmul_cpu_sample();
         const char * bundle_id = std::getenv("GGML_GEMMINI_RUNTIME_BUNDLE_ID");
         const char * model_id = std::getenv("GGML_GEMMINI_MODEL_ID");
-        const uint64_t invocation_total =
-            rmd_telemetry_invocation_end >= rmd_telemetry_invocation_start
-                ? rmd_telemetry_invocation_end - rmd_telemetry_invocation_start : 0;
+        const auto invocation_total = ggml::gemmini::evaluate_matmul_cpu_interval(
+            rmd_telemetry_invocation_start, rmd_telemetry_invocation_end);
         const uint64_t telemetry_run_id = telemetry_profiles.empty()
             ? 0 : telemetry_profiles.front().run_id;
         const auto telemetry = ggml::gemmini::make_rmd_telemetry_record(

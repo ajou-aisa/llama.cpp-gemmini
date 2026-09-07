@@ -757,6 +757,45 @@ add_test(NAME test-gemmini-rmd-telemetry
 add_test(NAME test-gemmini-aggregate-cycle-driver
     COMMAND $<TARGET_FILE:test-gemmini-rmd-telemetry> --aggregate-driver
             ${CMAKE_CURRENT_BINARY_DIR}/gemmini-aggregate-driver/cycle-log.jsonl)
+add_executable(test-gemmini-rmd-reducer
+    test-gemmini-rmd-telemetry.cpp
+    ../ggml/src/ggml-gemmini/ggml-gemmini-telemetry.cpp)
+target_link_libraries(test-gemmini-rmd-reducer PRIVATE ggml-gemmini-utils)
+target_compile_features(test-gemmini-rmd-reducer PRIVATE cxx_std_17)
+target_compile_definitions(test-gemmini-rmd-reducer PRIVATE
+    GGML_GEMMINI_REDUCER_TEST_ONLY=1
+    GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+    GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
+    LOG_DEBUG=${LOG_DEBUG} LOG_CYCLE=${LOG_CYCLE} CYCLE_DETAIL=${CYCLE_DETAIL})
+target_include_directories(test-gemmini-rmd-reducer PRIVATE
+    ../ggml/include ../ggml/src ../ggml/src/ggml-gemmini
+    ../ggml/src/ggml-gemmini-utils/include ${GGML_GEMMINI_GENERATED_CONFIG_DIR}
+    ${GEMMINI_SW_PATH} ${GEMMINI_SW_PATH}/include)
+add_test(NAME test-gemmini-rmd-reducer
+    COMMAND $<TARGET_FILE:test-gemmini-rmd-reducer>)
+if (UNIX AND EXISTS "${IM2P_SIM_ROOT}/frontend/include/im2p_gemmini_frontend.hpp")
+    add_executable(test-gemmini-im2p-host-cycle test-gemmini-im2p-routing.cpp)
+    target_link_libraries(test-gemmini-im2p-host-cycle PRIVATE ggml-base ggml-gemmini-utils)
+    target_compile_features(test-gemmini-im2p-host-cycle PRIVATE cxx_std_17)
+    target_compile_definitions(test-gemmini-im2p-host-cycle PRIVATE
+        GGML_GEMMINI_IM2P_HOST_CYCLE_TEST=1
+        GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM=1
+        GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+        GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
+        LOG_CYCLE=${LOG_CYCLE} CYCLE_DETAIL=${CYCLE_DETAIL})
+    target_include_directories(test-gemmini-im2p-host-cycle PRIVATE
+        ../ggml/include ../ggml/src ../ggml/src/ggml-gemmini
+        ${GGML_GEMMINI_GENERATED_CONFIG_DIR}
+        ${GEMMINI_SW_PATH} ${GEMMINI_SW_PATH}/include
+        ${IM2P_SIM_ROOT}/frontend/include ${IM2P_SIM_ROOT}/sim/include)
+    target_compile_options(test-gemmini-im2p-host-cycle PRIVATE -ffunction-sections -fdata-sections)
+    if (APPLE)
+        target_link_options(test-gemmini-im2p-host-cycle PRIVATE -Wl,-dead_strip)
+    else()
+        target_link_options(test-gemmini-im2p-host-cycle PRIVATE -Wl,--gc-sections)
+    endif()
+    add_test(NAME test-gemmini-im2p-host-cycle COMMAND $<TARGET_FILE:test-gemmini-im2p-host-cycle>)
+endif()
 add_test(NAME test-gemmini-telemetry-clock-gate
     COMMAND ${CMAKE_COMMAND}
             -DTEST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/..
@@ -968,7 +1007,8 @@ if (NOT GGML_BACKEND_DL)
     target_compile_definitions(test-gemmini-matmul PRIVATE
         GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
         GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
-        GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE})
+        GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
+        LOG_CYCLE=${LOG_CYCLE} CYCLE_DETAIL=${CYCLE_DETAIL})
     add_test(NAME test-gemmini-matmul COMMAND $<TARGET_FILE:test-gemmini-matmul>)
     add_test(
         NAME test-gemmini-matmul-finite-output
@@ -1058,6 +1098,7 @@ set(_GEMMINI_REGISTERED_TEST_EXECUTABLES
     test-gemmini-rmd-packet
     test-gemmini-production-host-backend
     test-gemmini-rmd-telemetry
+    test-gemmini-rmd-reducer
     gemmini-quant-dispatch-smoke)
 foreach(_GEMMINI_OPTIONAL_TEST_EXECUTABLE IN ITEMS
         gemmini_q8_h1_h2_dequant_fp
@@ -1065,6 +1106,7 @@ foreach(_GEMMINI_OPTIONAL_TEST_EXECUTABLE IN ITEMS
         test-gemmini-srmd-raw-ws
         test-gemmini-matmul-options
         test-gemmini-im2p-routing
+        test-gemmini-im2p-host-cycle
         test-gemmini-im2p-lifecycle
         test-gemmini-rmd-im2p-provider
         test-gemmini-rmd-backend-gate

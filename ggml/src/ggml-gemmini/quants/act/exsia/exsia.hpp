@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -358,6 +359,7 @@ namespace ggml::gemmini::quants::act::exsia
         event_generation_mismatch,
         structurally_cross_task,
         counter_regression,
+        sum_overflow,
     };
 
     struct ProfileCycleValue
@@ -409,7 +411,13 @@ namespace ggml::gemmini::quants::act::exsia
     {
         uint64_t sum = 0;
         uint64_t max = 0;
-        uint64_t count = 0;
+        uint64_t count = 0; // valid samples; sum/max are partial when count < total_count
+        uint64_t total_count = 0;
+        ProfileCycleStatus first_invalid = ProfileCycleStatus::complete;
+#if defined(__linux__) && defined(__aarch64__)
+        ggml::gemmini::cycle::NativeCycleReason sample_reason =
+            ggml::gemmini::cycle::NativeCycleReason::none;
+#endif
 
         void add(uint64_t value) noexcept
         {
@@ -418,27 +426,64 @@ namespace ggml::gemmini::quants::act::exsia
             ++count;
         }
 
-#if defined(__linux__) && defined(__aarch64__)
         void add(const ProfileCycleValue &value) noexcept
         {
-            if (value.cycles.has_value()) add(*value.cycles);
+            ++total_count;
+            if (value.cycles.has_value())
+            {
+                const uint64_t previous = sum;
+                add(*value.cycles);
+                if (sum < previous && first_invalid == ProfileCycleStatus::complete)
+                    first_invalid = ProfileCycleStatus::sum_overflow;
+            }
+            else if (first_invalid == ProfileCycleStatus::complete)
+            {
+                first_invalid = value.status;
+#if defined(__linux__) && defined(__aarch64__)
+                sample_reason = value.sample_reason;
+#endif
+            }
         }
 
         void merge(const StageCycleStats &other) noexcept
         {
+            const uint64_t previous = sum;
             sum += other.sum;
             max = std::max(max, other.max);
             count += other.count;
-        }
+            total_count += other.total_count;
+            if (first_invalid == ProfileCycleStatus::complete)
+            {
+                first_invalid = other.first_invalid;
+#if defined(__linux__) && defined(__aarch64__)
+                sample_reason = other.sample_reason;
 #endif
+            }
+            if (sum < previous && first_invalid == ProfileCycleStatus::complete)
+                first_invalid = ProfileCycleStatus::sum_overflow;
+        }
+
+        ProfileCycleStatus cycle_status() const noexcept
+        {
+            return total_count == 0 ? ProfileCycleStatus::missing_component : first_invalid;
+        }
 
         void reset() noexcept
         {
             sum = 0;
             max = 0;
             count = 0;
+            total_count = 0;
+            first_invalid = ProfileCycleStatus::complete;
+#if defined(__linux__) && defined(__aarch64__)
+            sample_reason = ggml::gemmini::cycle::NativeCycleReason::none;
+#endif
         }
     };
+#endif
+
+#if EXSIA_VALIDATION && EXSIA_STAGE_PROFILE_ENABLED && EXSIA_PROFILE_LOG_ENABLED
+    std::string serialize_stage_sum_for_test(const StageCycleStats &stats);
 #endif
 
     enum class P3Path

@@ -1,3 +1,77 @@
+#if defined(GGML_GEMMINI_IM2P_HOST_CYCLE_TEST)
+// Compile the real adapter translation unit against real dependency headers.
+// Dead stripping permits this host-only seam without linking simulator/model
+// execution; no provider implementation or API is replaced.
+#include "../ggml/src/ggml-gemmini/ggml-gemmini-im2p.cpp"
+#include <cstdio>
+#include <string>
+
+int main() {
+  using namespace ggml::gemmini;
+  FILE *output = std::tmpfile();
+  if (output == nullptr) return 1;
+  log::cycle.set_output(output);
+  ggml_gemmini_args_t args;
+  args.I = 2;
+  args.J = 2;
+  args.stride_f_out = 5;
+  args.col_stride_f_out = 2;
+  args.matmul_layer = "test.host.copy";
+  args.act_quant.storage().emplace<quants::act::exsia::Meta>().run_id = 0;
+  std::vector<float> destination(8, -1.0f);
+  const std::vector<float> source{1, 90, 2, 90, 90, 3, 90, 4};
+  args.f_out = destination.data();
+  cycle::reset_read_count_for_test();
+  im2p_adapter::copy_staged_output(args, source);
+  const auto copy_reads = cycle::read_count_for_test();
+  bool ok = destination == std::vector<float>({1, -1, 2, -1, -1, 3, -1, 4});
+  quants::act::exsia::StripeReadyEvent event{};
+  event.run_id = 0;
+  event.stripe_id = 3;
+  event.slot = 1;
+  {
+    im2p_adapter::HostCpuInterval interval(args, "test.explicit_finish", &event);
+    interval.finish();
+    interval.finish();
+  }
+  {
+    im2p_adapter::HostCpuInterval interval(args, "test.partial_return", &event);
+    // A return before the success boundary must not claim operation success.
+  }
+  std::fflush(output);
+  std::rewind(output);
+  std::string json;
+  char buffer[1024];
+  while (const size_t count = std::fread(buffer, 1, sizeof(buffer), output))
+    json.append(buffer, count);
+  log::cycle.set_output(stderr);
+  std::fclose(output);
+#if LOG_CYCLE && CYCLE_DETAIL
+  const auto occurrences = [&](const std::string &token) {
+    size_t count = 0;
+    for (size_t pos = 0; (pos = json.find(token, pos)) != std::string::npos;
+         pos += token.size()) ++count;
+    return count;
+  };
+  ok = ok && occurrences("\"op\":\"im2p.output_buffer_copy\"") == 1 &&
+       occurrences("\"op\":\"test.explicit_finish\"") == 1 &&
+       occurrences("\"op\":\"test.partial_return\"") == 1 &&
+       occurrences("\"run_id\":0") == 3 &&
+       occurrences("\"stripe_id\":3") == 2 &&
+       occurrences("\"slot\":1") == 2 &&
+       occurrences("\"operation_success\":true") == 2 &&
+       occurrences("\"operation_success\":false") == 1 &&
+       occurrences("\"additive\":false") == 3;
+#if !defined(__linux__) || !defined(__aarch64__)
+  ok = ok && copy_reads == 2;
+#endif
+#else
+  ok = ok && json.empty() && copy_reads == 0;
+#endif
+  if (!ok) std::fprintf(stderr, "FAIL: real adapter host copy/identity/completion seam\n%s", json.c_str());
+  return ok ? 0 : 1;
+}
+#else
 #include <ggml-backend.h>
 #include <ggml-gemmini.h>
 #include <ggml-quants.h>
@@ -3149,3 +3223,4 @@ int main(int argc, char **argv) {
   return ok ? 0 : 1;
 #endif
 }
+#endif // GGML_GEMMINI_IM2P_HOST_CYCLE_TEST

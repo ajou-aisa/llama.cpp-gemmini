@@ -147,12 +147,149 @@ bool test_structural_eligibility_is_individual() {
                  "cross-task parent does not poison an individual worker interval");
 }
 
+bool test_stage_aggregation_preserves_missing_and_invalid_samples() {
+    StageCycleStats stats;
+    if (!check(stats.cycle_status() == ProfileCycleStatus::missing_component,
+               "unexecuted stage has no measured total")) return false;
+    stats.add(ProfileCycleValue{0, ProfileCycleStatus::complete});
+    stats.add(ProfileCycleValue{17, ProfileCycleStatus::complete});
+    if (!check(stats.sum == 17 && stats.count == 2 && stats.total_count == 2 &&
+                   stats.cycle_status() == ProfileCycleStatus::complete,
+               "valid zero contributes a valid measurement")) return false;
+    stats.add(ProfileCycleValue{{}, ProfileCycleStatus::invalid_end});
+    StageCycleStats other;
+    other.add(ProfileCycleValue{{}, ProfileCycleStatus::event_owner_mismatch});
+    other.add(ProfileCycleValue{23, ProfileCycleStatus::complete});
+    stats.merge(other);
+    if (!check(stats.sum == 40 && stats.max == 23 && stats.count == 3 &&
+                   stats.total_count == 5 &&
+                   stats.cycle_status() == ProfileCycleStatus::invalid_end,
+               "partial sum keeps first invalid reason and all sample counts")) return false;
+#if defined(__linux__) && defined(__aarch64__)
+    StageCycleStats failed;
+    failed.add(ProfileCycleValue{{}, ProfileCycleStatus::invalid_start,
+        ggml::gemmini::cycle::NativeCycleReason::multiplexed});
+    StageCycleStats merged;
+    merged.merge(failed);
+    if (!check(merged.count == 0 && merged.total_count == 1 &&
+                   merged.sample_reason == ggml::gemmini::cycle::NativeCycleReason::multiplexed,
+               "aggregate retains the endpoint failure reason")) return false;
+#endif
+    const std::string invalid_json = serialize_stage_sum_for_test(stats);
+    if (!check(invalid_json.find("\"value\":null") != std::string::npos &&
+                   invalid_json.find("\"cycle_status\":\"invalid_end\"") != std::string::npos &&
+                   invalid_json.find("\"total_count\":5") != std::string::npos &&
+                   invalid_json.find("\"valid_count\":3") != std::string::npos &&
+                   invalid_json.find("\"invalid_count\":2") != std::string::npos,
+               "serialized partial aggregate is null with reason and complete counts")) return false;
+    StageCycleStats zero;
+    zero.add(ProfileCycleValue{0, ProfileCycleStatus::complete});
+    const std::string zero_json = serialize_stage_sum_for_test(zero);
+    if (!check(zero_json.find("\"source\":") != std::string::npos &&
+                   zero_json.find("\"unit\":") != std::string::npos,
+               "detail output identifies its counter source and unit")) return false;
+    if (!check(zero_json.find("\"value\":0") != std::string::npos &&
+                   zero_json.find("\"cycle_status\":\"complete\"") != std::string::npos &&
+                   zero_json.find("\"run_id\":0") != std::string::npos,
+               "serialized valid zero and real run zero survive")) return false;
+    stats.reset();
+    return check(stats.count == 0 && stats.total_count == 0 && stats.sum == 0 &&
+                     stats.cycle_status() == ProfileCycleStatus::missing_component,
+                 "reused stage statistics clear validity and counts");
+}
+
+bool test_full_origin_context_reset() {
+    Meta meta;
+    if (!check(!meta.run_id.has_value(), "unassigned quantization run is absent")) return false;
+    meta.run_id = 0;
+    if (!check(meta.run_id.has_value() && *meta.run_id == 0,
+               "first quantization run is a real zero ID")) return false;
+    meta.reset();
+    return check(!meta.run_id.has_value(), "reset clears retained FULL run context");
+}
+
+bool test_stage_sum_overflow_is_not_complete() {
+    StageCycleStats accumulated;
+    accumulated.add(ProfileCycleValue{UINT64_MAX, ProfileCycleStatus::complete});
+    accumulated.add(ProfileCycleValue{1, ProfileCycleStatus::complete});
+    StageCycleStats merged;
+    merged.add(ProfileCycleValue{UINT64_MAX, ProfileCycleStatus::complete});
+    StageCycleStats child;
+    child.add(ProfileCycleValue{1, ProfileCycleStatus::complete});
+    merged.merge(child);
+    for (const auto *stats : {&accumulated, &merged}) {
+        const std::string json = serialize_stage_sum_for_test(*stats);
+        if (!check(stats->cycle_status() != ProfileCycleStatus::complete &&
+                       json.find("\"value\":null") != std::string::npos &&
+                       json.find("\"cycle_status\":\"sum_overflow\"") != std::string::npos,
+                   "overflowed stage sum is unavailable, not a wrapped valid number"))
+            return false;
+    }
+    return true;
+}
+
+bool test_three_stripe_publication_and_worker_profiles() {
+    constexpr size_t rows = 2 * DIM + 1;
+    constexpr size_t columns = 32;
+    std::vector<float> source(rows * columns, 0.5f);
+    ggml_tensor tensor{};
+    tensor.type = GGML_TYPE_F32;
+    tensor.data = source.data();
+    const ExSIAState::ExecutionMode modes[] = {
+        ExSIAState::ExecutionMode::Sequential,
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+        ExSIAState::ExecutionMode::LocalParallel,
+        ExSIAState::ExecutionMode::LocalFoldingPipeline,
+#endif
+    };
+    for (const auto mode : modes) {
+        ggml_gemmini_args_t args{};
+        args.I = rows; args.J = 1; args.K = columns; args.sA = columns;
+        args.tile_I = 1; args.activation_rows_per_stripe = DIM;
+        args.matmul_layer = "worker-profile-test";
+        if (!args.A.allocate(rows, columns, GGML_GEMMINI_ACTIVATION_BITS)) return false;
+        struct Trace { size_t count = 0; std::optional<uint64_t> run_id; } trace;
+        const StripeReadySink sink{&trace, [](void *opaque, const StripeReadyEvent &event) {
+            auto &trace = *static_cast<Trace *>(opaque);
+            if (event.stripe_id != trace.count || event.slot != trace.count % 2 ||
+                (trace.run_id.has_value() && trace.run_id != event.run_id)) return false;
+            trace.run_id = event.run_id;
+            ++trace.count;
+            return true;
+        }};
+        Meta meta;
+        ExSIA quantizer;
+        quantizer.set_execution_mode(mode);
+        if (!check(quantizer.run(meta, &tensor, args, &sink) && trace.count == 3 &&
+                       trace.run_id.has_value() && meta.run_id == trace.run_id,
+                   "all supported modes publish real context across slot reuse")) return false;
+        const auto &profiles = quantizer.state().profile_snapshot.stripes;
+        if (!check(profiles.size() == 3, "all three stripe profiles survive publication")) return false;
+        for (const auto &profile : profiles) {
+            if (mode == ExSIAState::ExecutionMode::Sequential) continue;
+            for (const auto &worker : profile.local_groups) {
+                if (!check(worker.valid && worker.start_thread_id == worker.end_thread_id,
+                           "each actual local task keeps a same-thread sample pair")) return false;
+            }
+            if (mode == ExSIAState::ExecutionMode::LocalFoldingPipeline &&
+                !check(!checked_profile_interval(profile.local, false).cycles.has_value() &&
+                           !checked_profile_interval(profile.stripe_total, false).cycles.has_value(),
+                       "real pipeline parent remains nonnumeric across task boundaries")) return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 int main() {
     const bool ok = test_each_configured_worker_keeps_individual_provenance() &&
                     test_worker_failure_is_local_to_that_worker() &&
-                    test_structural_eligibility_is_individual();
+                    test_structural_eligibility_is_individual() &&
+                    test_stage_aggregation_preserves_missing_and_invalid_samples() &&
+                    test_stage_sum_overflow_is_not_complete() &&
+                    test_full_origin_context_reset() &&
+                    test_three_stripe_publication_and_worker_profiles();
     if (ok) std::printf("PASS: ExSIA individual worker provenance workers=%zu\n",
                         EXSIA_LOCAL_WORKER_COUNT);
     return ok ? 0 : 1;

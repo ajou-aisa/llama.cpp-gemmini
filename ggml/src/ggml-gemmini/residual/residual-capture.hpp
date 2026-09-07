@@ -7,6 +7,9 @@
 #if defined(__linux__) && defined(__aarch64__) && CYCLE_DETAIL
 #include <gemmini/log.h>
 #include "../ggml-gemmini-utils/src/cycle_reader_internal.h"
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+#include <omp.h>
+#endif
 #endif
 
 #include <optional>
@@ -45,6 +48,12 @@ public:
         } else {
             sink_.emplace<rmd::RmdStripeBuilder>();
         }
+    }
+
+    // The caller retains layer storage through finish(); reset preserves invocation context.
+    void set_context(std::optional<uint64_t> run_id, const char *layer) {
+        run_id_ = run_id;
+        layer_ = layer;
     }
 
     void reset(size_t stripe_id, size_t row_begin, size_t row_count,
@@ -107,10 +116,17 @@ public:
             finish_end.value, static_cast<uint8_t>(finish_end.valid),
             static_cast<uint8_t>(finish_end.reason), GEMMINI_NATIVE_CYCLE_SOURCE_LINUX_PERF_CPU_CYCLES,
             finish_end.owner_event_token, finish_end.generation};
-        const gemmini_cycle_record_v2 record{{nullptr, finish_op, finish_start.value, finish_end.value,
+        uint32_t identity_mask = GEMMINI_CYCLE_HAS_STRIPE_ID | GEMMINI_CYCLE_HAS_WORKER_ID;
+        if (run_id_.has_value()) identity_mask |= GEMMINI_CYCLE_HAS_RUN_ID;
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+        const uint64_t worker_id = static_cast<uint64_t>(omp_get_thread_num());
+#else
+        const uint64_t worker_id = 0;
+#endif
+        const gemmini_cycle_record_v2 record{{layer_, finish_op, finish_start.value, finish_end.value,
                                                nullptr, 0, nullptr},
-                                              GEMMINI_CYCLE_HAS_STRIPE_ID,
-                                              0, stripe_id_, 0, 0, 0};
+                                              identity_mask,
+                                              run_id_.value_or(0), stripe_id_, 0, 0, worker_id};
         gemmini_log_cycle_record_v2_checked_internal(&record, &start_sample, &end_sample, 1);
 #endif
 #if LOG_CYCLE
@@ -127,6 +143,8 @@ private:
     using Sink = std::variant<DirectStripeBuilder, rmd::RmdStripeBuilder>;
     Sink sink_;
     size_t stripe_id_ = 0;
+    std::optional<uint64_t> run_id_;
+    const char *layer_ = nullptr;
 };
 
 }

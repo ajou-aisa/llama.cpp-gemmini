@@ -3,9 +3,253 @@
 #include <gemmini/log.hpp>
 
 #include <sstream>
+#include <limits>
 #include <string_view>
 
 namespace ggml::gemmini {
+
+void project_matmul_cpu_identity(log::CycleRecord & record,
+        const MatmulJobMetrics * profile, std::optional<uint64_t> invocation_run_id) {
+    if (profile != nullptr) {
+        record.identity_mask = profile->cpu_identity_mask;
+        record.stripe_id = profile->stripe_id;
+        record.run_id = profile->run_id;
+        record.slot = profile->slot;
+    } else if (invocation_run_id.has_value()) {
+        record.identity_mask = GEMMINI_CYCLE_HAS_RUN_ID;
+        record.run_id = *invocation_run_id;
+    }
+}
+
+namespace {
+void telemetry_json_string(std::ostringstream & out, std::string_view value) {
+    out << '"';
+    for (const char c : value) {
+        switch (c) {
+            case '\\': out << "\\\\"; break;
+            case '"': out << "\\\""; break;
+            case '\n': out << "\\n"; break;
+            case '\r': out << "\\r"; break;
+            case '\t': out << "\\t"; break;
+            default: out << c; break;
+        }
+    }
+    out << '"';
+}
+const char * telemetry_backend_name(RmdBackend backend) {
+    return backend == RmdBackend::cpu_direct ? "cpu_direct" : "gemmini_ws_compact";
+}
+const char * telemetry_clock_source() {
+#ifdef __riscv
+    return "riscv_cycle";
+#elif defined(__linux__) && defined(__aarch64__)
+    return "linux_perf_cpu_cycles";
+#else
+    return "host_tick";
+#endif
+}
+const char * telemetry_unit_name(std::string_view units) {
+    return units == "cycles" ? "cycle" : "tick";
+}
+const char * telemetry_source_name(MatmulOptionSource source) {
+    switch (source) {
+        case MatmulOptionSource::build_default: return "build_default";
+        case MatmulOptionSource::environment: return "environment";
+        case MatmulOptionSource::explicit_override: return "explicit_override";
+    }
+    return "invalid";
+}
+
+MatmulCpuInterval aggregate_cpu_intervals(
+        const std::vector<MatmulJobMetrics> & profiles,
+        MatmulCpuInterval MatmulJobMetrics::* member) {
+    MatmulCpuInterval result{{}, {}, {}, 0, 0, 0};
+    uint64_t sum = 0;
+    for (const auto & profile : profiles) {
+        const auto & item = profile.*member;
+        ++result.count;
+        if (item.reason == "not_applicable") {
+            ++result.not_applicable_count;
+        } else if (!item.cycles.has_value()) {
+            if (result.reason.empty()) {
+                result.reason = item.reason;
+                result.sample_reason = item.sample_reason;
+            }
+        } else {
+            ++result.valid_count;
+            if (*item.cycles > std::numeric_limits<uint64_t>::max() - sum) {
+                result.reason = "aggregate_overflow";
+            } else {
+                sum += *item.cycles;
+            }
+        }
+    }
+    if (result.reason.empty()) {
+        if (result.valid_count != 0) result.cycles = sum;
+        else result.reason = "not_applicable";
+    }
+    return result;
+}
+
+void cpu_interval_json(std::ostringstream & out, const char * key,
+                       const MatmulCpuInterval & interval, bool comma = true) {
+    if (comma) out << ',';
+    out << '"' << key << "\":";
+    if (interval.cycles) out << *interval.cycles; else out << "null";
+    out << ",\"" << key << "_valid\":" << (interval.cycles ? "true" : "false")
+        << ",\"" << key << "_reason\":";
+    if (interval.reason.empty()) out << "null";
+    else telemetry_json_string(out, interval.reason);
+    out << ",\"" << key << "_sample_reason\":";
+    if (interval.sample_reason.empty()) out << "null";
+    else telemetry_json_string(out, interval.sample_reason);
+    out << ",\"" << key << "_count\":" << interval.count
+        << ",\"" << key << "_valid_count\":" << interval.valid_count
+        << ",\"" << key << "_not_applicable_count\":" << interval.not_applicable_count;
+}
+}
+
+RmdTelemetryRecord make_rmd_telemetry_record(
+        RmdBackend backend, MatmulOptionSource source,
+        std::string runtime_bundle_id, std::string model_id, std::string layer,
+        uint64_t run_id,
+        const MatmulCpuInterval & invocation_total,
+        const std::vector<MatmulJobMetrics> & profiles) {
+    RmdTelemetryRecord record{};
+    record.runtime_bundle_id = std::move(runtime_bundle_id);
+    record.model_id = std::move(model_id);
+    record.layer = std::move(layer);
+    record.run_id = run_id;
+    record.backend = backend;
+    record.source = source;
+    record.units = cycle::units();
+    record.invocation_total = invocation_total;
+    record.timing.prep = aggregate_cpu_intervals(profiles, &MatmulJobMetrics::cpu_prep);
+    record.timing.backend_service = aggregate_cpu_intervals(profiles, &MatmulJobMetrics::cpu_backend);
+    record.timing.merge = aggregate_cpu_intervals(profiles, &MatmulJobMetrics::cpu_merge);
+    record.timing.residual_total = aggregate_cpu_intervals(profiles, &MatmulJobMetrics::cpu_residual_total);
+#if defined(__linux__) && defined(__aarch64__)
+    record.timing.queue = MatmulCpuInterval::unavailable("structurally_cross_task");
+#else
+    record.timing.queue = MatmulCpuInterval::measured(0);
+#endif
+    for (const MatmulJobMetrics & profile : profiles) {
+        record.counters.direct_events += profile.rmd.direct_event_count;
+        record.counters.direct_calls += profile.rmd.direct_call_count;
+        record.counters.packet_calls += profile.rmd.packet_call_count;
+        record.counters.ws_calls += profile.rmd.ws_call_count;
+        record.geometry.packet_count += profile.rmd.packet_call_count;
+        record.geometry.active_blocks += profile.rmd.active_blocks;
+        record.geometry.compact_k_count += profile.rmd.compact_k_count;
+        record.geometry.padded_k_count += profile.rmd.padded_k_count;
+        record.geometry.physical_tile_count += profile.rmd.physical_tile_count;
+#if !(defined(__linux__) && defined(__aarch64__))
+        // Preserve the legacy auxiliary host-tick queue, never a PMU interval.
+        if (profile.telemetry_queue_tick != 0 &&
+            profile.telemetry_residual_start >= profile.telemetry_queue_tick) {
+            const uint64_t elapsed = profile.telemetry_residual_start - profile.telemetry_queue_tick;
+            if (record.timing.queue.cycles &&
+                elapsed <= std::numeric_limits<uint64_t>::max() - *record.timing.queue.cycles) {
+                *record.timing.queue.cycles += elapsed;
+            } else {
+                record.timing.queue = MatmulCpuInterval::unavailable("aggregate_overflow");
+            }
+        }
+#endif
+        if (record.timing.dense_end == 0 || profile.telemetry_dense_end < record.timing.dense_end)
+            record.timing.dense_end = profile.telemetry_dense_end;
+        if (record.timing.residual_start == 0 || profile.telemetry_residual_start < record.timing.residual_start)
+            record.timing.residual_start = profile.telemetry_residual_start;
+#if CYCLE_DETAIL
+        record.stripes.push_back({profile.stripe_id, profile.row_begin, profile.row_end,
+            {profile.telemetry_dense_start, profile.telemetry_dense_end,
+             profile.telemetry_residual_start, profile.telemetry_backend_start,
+             profile.telemetry_backend_end, profile.telemetry_merge_start,
+             profile.telemetry_merge_end, profile.telemetry_residual_end},
+            profile.telemetry_input_hash,
+            profile.telemetry_correction_hash,
+            profile.telemetry_output_hash,
+            profile.telemetry_correction_nonzero_count,
+            profile.telemetry_hash_enabled, profile.cpu_dense});
+#endif
+    }
+    record.work = backend == RmdBackend::cpu_direct
+        ? record.counters.direct_calls != 0 : record.counters.packet_calls != 0;
+    return record;
+}
+
+std::string serialize_rmd_telemetry(const RmdTelemetryRecord & record) {
+#if !LOG_CYCLE
+    (void) record;
+    return {};
+#else
+    std::ostringstream out;
+    out << "{\"schema\":"; telemetry_json_string(out, record.schema);
+    out << ",\"version\":" << record.version << ",\"record_type\":\"RMD_BACKEND_TELEMETRY\"";
+    out << ",\"source\":"; telemetry_json_string(out, telemetry_clock_source());
+    out << ",\"unit\":"; telemetry_json_string(out, telemetry_unit_name(record.units));
+    out << ",\"op\":\"rmd.execute\",\"layer\":";
+    if (record.layer.empty()) out << "null"; else telemetry_json_string(out, record.layer);
+    out << ",\"run_id\":" << record.run_id
+        << ",\"stripe_id\":null,\"slot\":null,\"node_id\":null,\"worker_id\":null"
+        << ",\"runtime_bundle_id\":";
+    telemetry_json_string(out, record.runtime_bundle_id);
+    out << ",\"model_id\":"; telemetry_json_string(out, record.model_id);
+    out << ",\"backend\":"; telemetry_json_string(out, telemetry_backend_name(record.backend));
+    out << ",\"option_source\":"; telemetry_json_string(out, telemetry_source_name(record.source));
+    out << ",\"cpu_measurement_version\":1,\"work\":" << (record.work ? "true" : "false");
+    cpu_interval_json(out, "invocation_total", record.invocation_total);
+    out << ",\"dispatch\":{\"direct_events\":" << record.counters.direct_events
+        << ",\"direct_calls\":" << record.counters.direct_calls
+        << ",\"packet_calls\":" << record.counters.packet_calls
+        << ",\"ws_calls\":" << record.counters.ws_calls << "}"
+        << ",\"timing\":{";
+    cpu_interval_json(out, "prep", record.timing.prep, false);
+    cpu_interval_json(out, "backend_service", record.timing.backend_service);
+    cpu_interval_json(out, "merge", record.timing.merge);
+    cpu_interval_json(out, "residual_total", record.timing.residual_total);
+    cpu_interval_json(out, "queue", record.timing.queue);
+#if defined(__linux__) && defined(__aarch64__)
+    out << ",\"dense_end\":null,\"residual_start\":null";
+#else
+    out << ",\"dense_end\":" << record.timing.dense_end
+        << ",\"residual_start\":" << record.timing.residual_start;
+#endif
+    out << "},\"geometry\":{\"packet_count\":" << record.geometry.packet_count
+        << ",\"active_blocks\":" << record.geometry.active_blocks
+        << ",\"compact_k_count\":" << record.geometry.compact_k_count
+        << ",\"padded_k_count\":" << record.geometry.padded_k_count
+        << ",\"physical_tile_count\":" << record.geometry.physical_tile_count << "}";
+#if CYCLE_DETAIL
+    out << ",\"stripes\":[";
+    for (size_t i = 0; i < record.stripes.size(); ++i) {
+        const auto & stripe = record.stripes[i];
+        if (i != 0) out << ',';
+        out << "{\"stripe_id\":" << stripe.stripe_id << ",\"row_begin\":" << stripe.row_begin
+            << ",\"row_end\":" << stripe.row_end
+            << ",\"stages\":{\"dense_start\":" << stripe.ordered_ticks[0]
+            << ",\"dense_end\":" << stripe.ordered_ticks[1]
+            << ",\"residual_start\":" << stripe.ordered_ticks[2]
+            << ",\"backend_start\":" << stripe.ordered_ticks[3]
+            << ",\"backend_end\":" << stripe.ordered_ticks[4]
+            << ",\"merge_start\":" << stripe.ordered_ticks[5]
+            << ",\"merge_end\":" << stripe.ordered_ticks[6]
+            << ",\"residual_end\":" << stripe.ordered_ticks[7] << '}'
+            << ",\"input_hash\":"; telemetry_json_string(out, stripe.input_hash);
+        out << ",\"correction_hash\":"; telemetry_json_string(out, stripe.correction_hash);
+        out << ",\"correction_nonzero_count\":" << stripe.correction_nonzero_count;
+        out << ",\"output_hash\":"; telemetry_json_string(out, stripe.output_hash);
+        out << ",\"hash_enabled\":" << (stripe.hash_enabled ? "true" : "false");
+        cpu_interval_json(out, "dense", stripe.dense);
+        out << '}';
+    }
+    out << ']';
+#endif
+    out << '}';
+    return out.str();
+#endif
+}
+
 namespace {
 
 void json_string(std::ostringstream & out, std::string_view value) {

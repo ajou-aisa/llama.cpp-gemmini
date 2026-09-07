@@ -251,7 +251,7 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
 #if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
     (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
     std::vector<DirectCpuTileRecord> tile_cpu_records;
-    const uint64_t direct_run_id = metrics != nullptr ? metrics->run_id : 0;
+    const std::optional<uint64_t> direct_run_id = metrics != nullptr ? metrics->run_id : std::nullopt;
 #endif
     try {
         tile_status.assign(j_tile_count, rmd::RmdStatus::success);
@@ -390,12 +390,14 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
                 static_cast<uint32_t>(GEMMINI_CYCLE_HAS_STRIPE_ID) |
                 static_cast<uint32_t>(GEMMINI_CYCLE_HAS_NODE_ID) |
                 static_cast<uint32_t>(GEMMINI_CYCLE_HAS_WORKER_ID);
-            if (direct_run_id != 0) {
+            if (direct_run_id.has_value()) {
                 identity_mask |= static_cast<uint32_t>(GEMMINI_CYCLE_HAS_RUN_ID);
             }
-            const gemmini_cycle_record_v2 detail{{nullptr, "rmd_direct_j_tile_interval",
+            const gemmini_cycle_record_v2 detail{{
+                args.matmul_layer.empty() ? nullptr : args.matmul_layer.c_str(),
+                "rmd_direct_j_tile_interval",
                 tile_start.value, tile_end.value, nullptr, 0, nullptr},
-                identity_mask, direct_run_id, payload.stripe_id, 0, tile_index,
+                identity_mask, direct_run_id.value_or(0), payload.stripe_id, 0, tile_index,
                 record.worker_id};
             gemmini_log_cycle_record_v2_checked_internal(
                 &detail, &start_sample, &end_sample, 1);

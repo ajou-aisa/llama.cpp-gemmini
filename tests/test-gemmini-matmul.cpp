@@ -15,6 +15,7 @@
 #include <string>
 #include <tuple>
 #include <vector>
+#include <gemmini/log.hpp>
 
 namespace {
 
@@ -316,6 +317,91 @@ bool test_cpu_direct_lifecycle_parity() {
         expect(full_args.tiled_matmul_type == main_route &&
                    pipeline_args.tiled_matmul_type == main_route,
                "backend selector preserves the main matmul route");
+}
+
+bool test_cpu_cycle_lifecycle() {
+#if LOG_CYCLE && GGML_GEMMINI_ENABLE_RMD
+    const char * previous = std::getenv("GGML_GEMMINI_TELEMETRY_HASH");
+    const std::optional<std::string> saved = previous != nullptr
+        ? std::optional<std::string>(previous) : std::nullopt;
+    const auto run = [&]() {
+        std::vector<float> reference;
+        for (int hash = 0; hash != 2; ++hash) {
+            if (setenv("GGML_GEMMINI_TELEMETRY_HASH", hash ? "1" : "0", 1) != 0) return false;
+            std::vector<elem_t> activation = {1, 2, 3, 4, 5, 6};
+            std::vector<elem_t> weights = {1, -1, 2, 3};
+            std::vector<float> output(6, 0.0f);
+            auto args = make_args(activation, weights, output);
+            args.matmul_layer = "test.cpu.lifecycle";
+            const uint64_t run_id = hash == 0 ? 0 : 91;
+            std::get<quants::act::exsia::Meta>(args.act_quant.storage()).run_id = run_id;
+            MatmulOptions options{};
+            options.mode = MatmulInvocationMode::stripe_pipeline;
+            options.job_capacity = 2;
+            options.rmd_backend = RmdBackend::cpu_direct;
+            options.profiling = true;
+            auto execution = prepare_execution(&args, options);
+            MatmulStripeCollector collector(2);
+            FILE * sink = std::tmpfile();
+            if (!sink) return false;
+            log::cycle.set_output(sink);
+            bool ok = execution.status().ok() && collector.start(execution);
+            for (size_t stripe = 0; ok && stripe != 3; ++stripe) {
+                quants::act::exsia::StripeReadyEvent event{};
+                event.run_id = run_id;
+                event.stripe_id = stripe;
+                event.slot = stripe % 2;
+                event.row_begin = stripe;
+                event.row_end = stripe + 1;
+                event.direct_residual = make_direct_payload(stripe, stripe, 1, 128);
+                ok = collector.sink()->on_ready(collector.sink()->user_data, event);
+            }
+            ok = collector.finish().ok() && ok;
+            ok = finish_execution(execution).ok() && ok;
+            const auto profiles = collector.profiles();
+            log::cycle.set_output(stderr);
+            std::rewind(sink);
+            std::string emitted;
+            char buffer[4096];
+            for (size_t n; (n = std::fread(buffer, 1, sizeof(buffer), sink)) != 0;)
+                emitted.append(buffer, n);
+            ok = !std::ferror(sink) && ok;
+            std::fclose(sink);
+            if (!expect(ok && profiles.size() == 3, "three stripes complete with capacity-two reuse")) return false;
+            for (size_t stripe = 0; stripe != profiles.size(); ++stripe) {
+                const auto & profile = profiles[stripe];
+                if (!expect(profile.run_id == run_id && profile.stripe_id == stripe &&
+                            (profile.cpu_identity_mask & GEMMINI_CYCLE_HAS_RUN_ID) != 0 &&
+                            (profile.cpu_identity_mask & GEMMINI_CYCLE_HAS_SLOT) != 0 &&
+                            profile.slot == stripe % 2 && profile.cpu_dense.reason != "not_collected" &&
+                            profile.cpu_backend.reason != "not_collected",
+                            "worker CPU collection and identity survive slot reuse")) return false;
+#if CYCLE_DETAIL
+                if (!expect(profile.telemetry_hash_enabled == (hash != 0) &&
+                            profile.telemetry_output_hash.empty() == (hash == 0),
+                            "hash work is explicitly opt-in")) return false;
+#endif
+            }
+            for (const char * op : {"stripe_input_capture", "stripe_job_preparation",
+                    "dense_backend_host_call", "residual_backend_host_call",
+                    "output_correction_apply", "telemetry_stats_compute",
+                    "stripe_completion_bookkeeping", "collector_capacity_release",
+                    "pipeline_drain_and_join", "matmul_output_validation_and_publish"}) {
+                if (!expect(emitted.find(std::string("\"op\":\"") + op + "\"") != std::string::npos,
+                            "actual lifecycle work emits its CPU interval")) return false;
+            }
+            if (hash == 0) reference = output;
+            else if (!expect(same_output(reference, output), "hash opt-in preserves output exactly")) return false;
+        }
+        return true;
+    };
+    const bool ok = run();
+    const int restored = saved ? setenv("GGML_GEMMINI_TELEMETRY_HASH", saved->c_str(), 1)
+                               : unsetenv("GGML_GEMMINI_TELEMETRY_HASH");
+    return ok && expect(restored == 0, "restore hash environment");
+#else
+    return true;
+#endif
 }
 
 bool test_rmd_disabled_pipeline_skips_correction() {
@@ -1417,6 +1503,7 @@ int main(int argc, char ** argv) {
         !test_native_q4_multiblock_final_float_oracle() ||
         !test_counter_hooks_connected() ||
         !test_cpu_direct_lifecycle_parity() ||
+        !test_cpu_cycle_lifecycle() ||
         !test_rmd_disabled_pipeline_skips_correction() ||
         !test_dense_rejects_residual_metadata() ||
         !test_correction_domain_composition() ||
