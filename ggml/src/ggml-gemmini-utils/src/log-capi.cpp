@@ -253,7 +253,9 @@ extern "C"
             ggml::gemmini::log::cycle.write_json(
                 ggml::gemmini::log::serialize_checked_cycle_record(
                     checked, delta.valid,
-                    ggml::gemmini::cycle::reason_name(delta.reason)));
+                    ggml::gemmini::cycle::reason_name(delta.reason),
+                    delta.sample_reason == NativeCycleReason::none ? nullptr :
+                        ggml::gemmini::cycle::reason_name(delta.sample_reason)));
             return static_cast<uint8_t>(delta.reason);
         }
         catch (...) { report_cycle_boundary_failure(); return static_cast<uint8_t>(

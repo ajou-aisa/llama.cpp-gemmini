@@ -85,6 +85,8 @@ static bool checked_bridge_matrix(const std::filesystem::path & path) {
         if (output.find(std::string("\"delta\":null,\"valid\":false,\"reason\":\"") + reason + "\"") ==
             std::string::npos) return false;
     }
+    if (output.find("\"reason\":\"invalid_start\",\"sample_reason\":\"unavailable_event\"") ==
+            std::string::npos) return false;
     return true;
 #endif
 }
@@ -106,6 +108,23 @@ static int open_descriptor_count() {
 
 int main() {
     using ggml::gemmini::log::testing::LogFault;
+    // Synthetic checked output, not a physical PMU reading on this host.
+    const ggml::gemmini::log::CycleRecord checked_fixture{
+        "fixture", "sample_failure", 0, 5000, nullptr, 0, nullptr,
+        "linux_perf_cpu_cycles", "cycle"};
+    const std::string checked_failure = ggml::gemmini::log::serialize_checked_cycle_record(
+        checked_fixture, false, "invalid_start", "unavailable_event");
+    const std::string checked_zero = ggml::gemmini::log::serialize_checked_cycle_record(
+        {"fixture", "valid_zero", 0, 0, nullptr, 0, nullptr,
+         "linux_perf_cpu_cycles", "cycle"}, true, nullptr);
+    if (checked_failure.find(
+            "\"delta\":null,\"valid\":false,\"reason\":\"invalid_start\","
+            "\"sample_reason\":\"unavailable_event\"") == std::string::npos ||
+        checked_zero.find("\"delta\":0,\"valid\":true") == std::string::npos ||
+        checked_zero.find("\"sample_reason\"") != std::string::npos) {
+        std::fprintf(stderr, "checked output must preserve sample failure and valid zero\n");
+        return 19;
+    }
     const std::string scalar = ggml::gemmini::log::serialize_cycle_record(
         {"scalar", "public", 10, 12, nullptr, 0, nullptr});
     const std::string legacy_equal = ggml::gemmini::log::serialize_cycle_record(

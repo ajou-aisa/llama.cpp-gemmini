@@ -49,10 +49,9 @@ namespace ggml::gemmini::log
     } // namespace
 
     static std::string serialize_cycle_record_impl(
-            const CycleRecord & record, bool linux_aarch64
-#if defined(__linux__) && defined(__aarch64__)
-            , bool provenance_available, bool checked_valid, const char * checked_reason
-#endif
+            const CycleRecord & record, bool linux_aarch64,
+            bool provenance_available = false, bool checked_valid = false,
+            const char * checked_reason = nullptr, const char * sample_reason = nullptr
     ) {
 #if defined(__riscv)
         const char * const default_source = linux_aarch64 ? "linux_perf_cpu_cycles" : "riscv_cycle";
@@ -65,12 +64,10 @@ namespace ggml::gemmini::log
         const char * const unit = record.unit ? record.unit : default_unit;
         bool valid = record.end >= record.start;
         const char * reason = nullptr;
-#if defined(__linux__) && defined(__aarch64__)
         if (provenance_available) {
             valid = checked_valid;
             reason = checked_reason;
         } else
-#endif
         if (linux_aarch64) {
             if (record.start == 0) {
                 valid = false;
@@ -154,6 +151,7 @@ namespace ggml::gemmini::log
         json += valid ? "true" : "false";
         if (linux_aarch64 && !valid) {
             add_string("reason", reason ? reason : "counter_regression");
+            add_string("sample_reason", sample_reason);
         }
 #if LOG_DETAIL
         add_string("file", record.file);
@@ -173,13 +171,11 @@ namespace ggml::gemmini::log
 #endif
     }
 
-#if defined(__linux__) && defined(__aarch64__)
     std::string serialize_checked_cycle_record(const CycleRecord & record, bool valid,
-                                               const char * reason)
+                                               const char * reason, const char * sample_reason)
     {
-        return serialize_cycle_record_impl(record, true, true, valid, reason);
+        return serialize_cycle_record_impl(record, true, true, valid, reason, sample_reason);
     }
-#endif
 
     namespace testing
     {

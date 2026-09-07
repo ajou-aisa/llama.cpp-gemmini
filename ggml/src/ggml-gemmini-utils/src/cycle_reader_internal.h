@@ -57,7 +57,7 @@ uint8_t gemmini_log_cycle_record_v2_checked_internal(
 namespace ggml::gemmini::log {
 struct CycleRecord;
 std::string serialize_checked_cycle_record(const CycleRecord & record, bool valid,
-                                           const char * reason);
+                                           const char * reason, const char * sample_reason);
 }
 #endif
 #undef GEMMINI_INTERNAL_NOEXCEPT

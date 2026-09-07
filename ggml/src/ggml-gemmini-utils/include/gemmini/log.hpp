@@ -142,6 +142,9 @@ namespace ggml::gemmini::log
     };
 
     std::string serialize_cycle_record(const CycleRecord &record);
+    std::string serialize_checked_cycle_record(const CycleRecord &record, bool valid,
+                                               const char *reason,
+                                               const char *sample_reason = nullptr);
     std::string serialize_ws_cycle_record(const WsCycleRecord &record);
 
     class DebugLog : public Log
