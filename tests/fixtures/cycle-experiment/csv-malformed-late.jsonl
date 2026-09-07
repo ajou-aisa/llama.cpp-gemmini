@@ -1,0 +1,2 @@
+{"schema":"gemmini.cycle","version":2,"record_type":"CYCLE_INTERVAL","source":"cpu","unit":"cycle","op":"x","layer":null,"run_id":1,"stripe_id":null,"slot":null,"node_id":null,"worker_id":null,"start":1,"end":2,"delta":1,"valid":true}
+not-json

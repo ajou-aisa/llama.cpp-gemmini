@@ -1,0 +1,2 @@
+{"schema":"gemmini.cycle","version":2,"record_type":"CYCLE_INTERVAL","source":"host_tick","unit":"tick","op":"ok","layer":null,"run_id":null,"stripe_id":null,"slot":null,"node_id":null,"worker_id":null,"start":1,"end":2,"delta":1,"valid":true}
+{"schema":"gemmini.cycle","version":2,"record_type":"CYCLE_INTERVAL","source":"host_tick","unit":"tick","op":"one","op":"two","layer":null,"run_id":null,"stripe_id":null,"slot":null,"node_id":null,"worker_id":null,"start":1,"end":2,"delta":1,"valid":true}
