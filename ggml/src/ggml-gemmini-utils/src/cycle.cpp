@@ -7,6 +7,8 @@
 #include <limits>
 #include <atomic>
 #include <chrono>
+#include <ctime>
+#include <exception>
 #include <mutex>
 #include <string>
 
@@ -38,6 +40,34 @@ uint64_t host_thread_id() noexcept {
     thread_local const uint64_t tid = next_id.fetch_add(1, std::memory_order_relaxed);
     return tid;
 #endif
+}
+
+HostSample read_host_sample() noexcept {
+    HostSample sample;
+    sample.ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    sample.tid = host_thread_id();
+#if (defined(__linux__) || defined(__APPLE__)) && defined(CLOCK_THREAD_CPUTIME_ID)
+    timespec cpu_time{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_time) == 0) {
+        sample.thread_cpu_ns = static_cast<uint64_t>(cpu_time.tv_sec) * 1000000000ULL +
+            static_cast<uint64_t>(cpu_time.tv_nsec);
+        sample.thread_cpu_valid = true;
+    }
+#endif
+    return sample;
+}
+
+std::string serialize_thread_cpu_timing(const HostSample &start, const HostSample &end) {
+    const bool start_valid = start.thread_cpu_valid && start.tid != 0;
+    const bool end_valid = end.thread_cpu_valid && end.tid != 0;
+    const bool valid = start_valid && end_valid && start.tid == end.tid &&
+        end.thread_cpu_ns >= start.thread_cpu_ns;
+    return std::string("{\"clock\":\"thread_cpu\",\"unit\":\"nanosecond\",\"start_ns\":") +
+        (start_valid ? std::to_string(start.thread_cpu_ns) : "null") +
+        ",\"end_ns\":" + (end_valid ? std::to_string(end.thread_cpu_ns) : "null") +
+        ",\"duration_ns\":" + (valid ? std::to_string(end.thread_cpu_ns - start.thread_cpu_ns) : "null") +
+        ",\"valid\":" + (valid ? "true}" : "false}");
 }
 
 std::string serialize_host_timing(uint64_t start_ns, uint64_t end_ns,
@@ -74,6 +104,8 @@ namespace ggml::gemmini::log
 
     namespace
     {
+        thread_local CycleWriteTiming *active_cycle_write_timing = nullptr;
+
         void append_json_escaped(std::string &out, const char *s)
         {
             if (!s)
@@ -108,6 +140,25 @@ namespace ggml::gemmini::log
             }
         }
     } // namespace
+
+    ScopedCycleWriteTiming::ScopedCycleWriteTiming(CycleWriteTiming &timing) noexcept
+        : timing_(timing), previous_(active_cycle_write_timing), initial_calls_(timing.calls),
+          initial_exceptions_(std::uncaught_exceptions())
+    {
+        active_cycle_write_timing = &timing;
+#if !LOG_CYCLE
+        timing.valid = false;
+#endif
+    }
+
+    ScopedCycleWriteTiming::~ScopedCycleWriteTiming() noexcept
+    {
+        if (timing_.calls == initial_calls_ || std::uncaught_exceptions() > initial_exceptions_)
+        {
+            timing_.valid = false;
+        }
+        active_cycle_write_timing = previous_;
+    }
 
     static std::string serialize_cycle_record_impl(
             const CycleRecord & record, bool linux_aarch64,
@@ -305,7 +356,22 @@ namespace ggml::gemmini::log
     void CycleLog::emit(const char *path, const std::string &json)
     {
 #if LOG_CYCLE
+        CycleWriteTiming * const timing = active_cycle_write_timing;
+        const bool previously_valid = timing && timing->valid;
+        if (timing)
+        {
+            ++timing->calls;
+            timing->valid = false;
+        }
+        const auto wait_start = timing ? std::chrono::steady_clock::now() :
+            std::chrono::steady_clock::time_point{};
         std::lock_guard<std::mutex> lock(detail::output_mutex());
+        if (timing)
+        {
+            timing->mutex_wait_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - wait_start).count());
+        }
         if (disabled_)
         {
             return;
@@ -340,12 +406,22 @@ namespace ggml::gemmini::log
         }
 
         const bool write_fault = detail::consume_fault(testing::LogFault::write);
+        const auto io_start = timing ? std::chrono::steady_clock::now() :
+            std::chrono::steady_clock::time_point{};
         const std::size_t written = write_fault ? 0 : std::fwrite(json.data(), 1, json.size(), output);
         const bool flush_fault = detail::consume_fault(testing::LogFault::flush);
         const int flushed = flush_fault ? EOF : std::fflush(output);
+        if (timing)
+        {
+            timing->io_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - io_start).count());
+            timing->valid = previously_valid && written == json.size() && flushed == 0;
+        }
         if (owns_call_output)
         {
-            std::fclose(output);
+            const int closed = std::fclose(output);
+            if (timing && closed != 0) timing->valid = false;
         }
         if (written != json.size() || flushed != 0)
         {
@@ -390,6 +466,7 @@ namespace ggml::gemmini::log
     void CycleLog::report_failure(const char * operation) noexcept
     {
 #if LOG_CYCLE
+        if (active_cycle_write_timing) active_cycle_write_timing->valid = false;
         try
         {
             std::lock_guard<std::mutex> lock(detail::output_mutex());

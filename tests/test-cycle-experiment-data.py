@@ -26,7 +26,7 @@ class CycleSchemaTests(unittest.TestCase):
         records = tuple(parse_cycle_jsonl(fixture))
 
         self.assertEqual({record.record_type for record in records}, set(RecordType))
-        self.assertEqual(len(records), 11)
+        self.assertEqual(len(records), 12)
         interval = records[0]
         self.assertEqual(interval.worker_id, 0)
         self.assertIsNone(interval.stripe_id)

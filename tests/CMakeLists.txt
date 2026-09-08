@@ -226,11 +226,15 @@ add_executable(test-gemmini-host-timing test-gemmini-host-timing.cpp)
 find_package(Threads REQUIRED)
 target_link_libraries(test-gemmini-host-timing PRIVATE ggml-gemmini-utils Threads::Threads)
 target_compile_features(test-gemmini-host-timing PRIVATE cxx_std_17)
+target_compile_definitions(test-gemmini-host-timing PRIVATE
+    EXPECT_LOG_CYCLE=$<IF:$<BOOL:${LOG_CYCLE}>,1,0>)
 add_test(NAME test-gemmini-host-timing COMMAND $<TARGET_FILE:test-gemmini-host-timing>)
 find_package(Python3 3.9 COMPONENTS Interpreter QUIET)
 if (Python3_Interpreter_FOUND)
     add_test(NAME test-host-overlap
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-host-overlap.py)
+    add_test(NAME test-residual-profile
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-residual-profile.py)
 endif()
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
     find_package(Threads REQUIRED)
@@ -475,6 +479,11 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
         ${TEST_GEMMINI_EXSIA_SW_PATH}
         ${TEST_GEMMINI_EXSIA_SW_PATH}/include)
     add_dependencies(test-gemmini-exsia test-gemmini-direct-linux-aarch64-strict)
+endif()
+if (LOG_CYCLE AND CYCLE_DETAIL)
+    add_test(NAME test-gemmini-residual-host-profile
+        COMMAND $<TARGET_FILE:test-gemmini-exsia> --direct-host-profile-output
+            ${CMAKE_CURRENT_BINARY_DIR}/residual-host-profile.jsonl)
 endif()
 add_test(NAME gemmini_direct_metrics_source_contract
     COMMAND ${CMAKE_COMMAND}

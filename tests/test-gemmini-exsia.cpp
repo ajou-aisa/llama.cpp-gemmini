@@ -13,6 +13,7 @@
 #include <ggml.h>
 #include <gemmini/log.hpp>
 #ifndef GEMMINI_EXSIA_WRITER_TEST_ONLY
+#include "../common/json.hpp"
 #include "../ggml/src/ggml-gemmini/residual/direct/direct-builder.hpp"
 #include "../ggml/src/ggml-gemmini/residual/direct/direct-executor.hpp"
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.hpp"
@@ -1385,6 +1386,229 @@ bool test_rmd_cpu_direct_parity() {
     return true;
 }
 
+bool direct_host_profile_output(const std::filesystem::path & output_path) {
+#if LOG_CYCLE && CYCLE_DETAIL
+    using Json = nlohmann::ordered_json;
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+    struct RestoreOpenmp {
+        int threads = omp_get_max_threads();
+        int dynamic = omp_get_dynamic();
+        ~RestoreOpenmp() { omp_set_num_threads(threads); omp_set_dynamic(dynamic); }
+    } restore_openmp;
+    omp_set_dynamic(0);
+    omp_set_num_threads(3);
+#endif
+    for (size_t fixture = 0; fixture < 2; ++fixture) {
+        constexpr size_t rows = 4, columns = 35, logical_k = 65;
+        constexpr uint64_t run_id = 0x6a17;
+        const size_t stripe_id = 3 + fixture, row_begin = 7 + fixture * rows;
+        const std::string layer = "direct.profile.\"tail\"\\fixture\n";
+        const std::vector<residual::ResidualEvent> events = fixture == 0
+            ? std::vector<residual::ResidualEvent>{
+                {0, 0, 3}, {0, 7, -2}, {0, 32, 5},
+                {1, 64, -7}, {3, 1, 11}, {3, 64, 13}}
+            : std::vector<residual::ResidualEvent>{
+                {0, 0, 3}, {0, 64, -5}, {2, 32, 7}, {2, 33, -11}};
+        const size_t active_rows = fixture == 0 ? 3 : 2;
+        const size_t active_row_blocks = fixture == 0 ? 5 : 3;
+        residual::DirectStripeBuilder builder;
+        builder.reset(stripe_id, row_begin, rows, logical_k, columns);
+        for (const auto & event : events) {
+            if (!builder.add_residual(event.local_row, event.original_k, event.residual))
+                return false;
+        }
+        const auto payload = builder.finish();
+        if (!check(payload != nullptr, "direct host profile sparse payload builds")) return false;
+
+        std::vector<elem_t> weights(logical_k * columns);
+        for (size_t k = 0; k < logical_k; ++k)
+            for (size_t j = 0; j < columns; ++j)
+                weights[k * columns + j] = static_cast<elem_t>(
+                    static_cast<int>((k * 11 + j * 17) % 251) - 125);
+        std::vector<rmd::OutputValue> expected(rows * columns, 0);
+        for (const auto & event : events)
+            for (size_t j = 0; j < columns; ++j)
+                expected[event.local_row * columns + j] +=
+                    static_cast<int64_t>(event.residual) * weights[event.original_k * columns + j];
+
+        ggml_gemmini_args_t args{};
+        args.I = rows; args.J = columns; args.K = logical_k;
+        args.B = weights.data(); args.sB = columns;
+        args.weight_i8_scale_active = true; args.weight_scale = 1.0f;
+        args.matmul_layer = layer;
+        const auto path = std::filesystem::absolute(output_path);
+        if (!check(log::cycle.set_output_path(path.c_str(), fixture == 0),
+                   "direct host profile output opens")) return false;
+        residual::DirectExecutionMetrics metrics{};
+        metrics.run_id = run_id;
+        rmd::DirectOutput output = rmd::BlockScaledInt64Correction{};
+        const auto status = residual::execute_direct_stripe(args, *payload, output, &metrics);
+        const auto profiled_size = std::filesystem::file_size(path);
+        residual::testing::DirectExecutionTestHooks disabled_hooks{};
+        disabled_hooks.disable_host_profile = true;
+        residual::DirectExecutionMetrics disabled_metrics{};
+        disabled_metrics.run_id = run_id + 1;
+        rmd::DirectOutput disabled_output = rmd::BlockScaledInt64Correction{};
+        const auto disabled_status = residual::execute_direct_stripe(
+            args, *payload, disabled_output, &disabled_metrics, disabled_hooks);
+        log::cycle.set_output(stderr);
+        if (!check(status == rmd::RmdStatus::success &&
+                       disabled_status == rmd::RmdStatus::success &&
+                       integer_values_equal(output, expected) &&
+                       integer_values_equal(disabled_output, expected),
+                   "direct host profiling preserves independent reference output") ||
+            !check(profiled_size > 0 && std::filesystem::file_size(path) == profiled_size,
+                   "disabled direct host profiling emits no record") ||
+            !check(metrics.event_count == events.size() && metrics.call_count == 1 &&
+                       metrics.j_tile_count == 3 && metrics.native_q8_values == 0 &&
+                       disabled_metrics.event_count == metrics.event_count &&
+                       disabled_metrics.j_tile_count == metrics.j_tile_count,
+                   "direct host profiling preserves workload metrics")) return false;
+
+        std::ifstream input(path);
+        std::string line, extra;
+        for (size_t previous = 0; previous < fixture; ++previous)
+            if (!check(static_cast<bool>(std::getline(input, line)),
+                       "previous direct host profile remains in JSONL output")) return false;
+        if (!check(static_cast<bool>(std::getline(input, line)) && !std::getline(input, extra),
+                   "each direct execution emits exactly one JSONL profile")) return false;
+        try {
+            const Json profile = Json::parse(line);
+            const auto valid_host = [](const Json & timing) {
+                return timing.at("valid") == true && timing.at("clock") == "steady_clock" &&
+                    timing.at("unit") == "nanosecond" &&
+                    timing.at("start_ns").is_number_unsigned() &&
+                    timing.at("end_ns").is_number_unsigned() &&
+                    timing.at("start_tid").is_number_unsigned() &&
+                    timing.at("end_tid") == timing.at("start_tid") &&
+                    timing.at("start_tid").get<uint64_t>() > 0 &&
+                    timing.at("end_ns").get<uint64_t>() >= timing.at("start_ns").get<uint64_t>() &&
+                    timing.at("duration_ns").get<uint64_t>() ==
+                        timing.at("end_ns").get<uint64_t>() - timing.at("start_ns").get<uint64_t>();
+            };
+            const auto unavailable_host = [](const Json & timing) {
+                return timing.at("valid") == false && timing.at("start_ns").is_null() &&
+                    timing.at("end_ns").is_null() && timing.at("duration_ns").is_null() &&
+                    timing.at("start_tid").is_null() && timing.at("end_tid").is_null();
+            };
+            const auto valid_cpu_or_unavailable = [](const Json & timing) {
+                if (timing.at("clock") != "thread_cpu" || timing.at("unit") != "nanosecond")
+                    return false;
+                if (timing.at("valid") == false)
+                    return timing.at("duration_ns").is_null();
+                return timing.at("valid") == true &&
+                    timing.at("start_ns").is_number_unsigned() &&
+                    timing.at("end_ns").is_number_unsigned() &&
+                    timing.at("end_ns").get<uint64_t>() >= timing.at("start_ns").get<uint64_t>() &&
+                    timing.at("duration_ns").get<uint64_t>() ==
+                        timing.at("end_ns").get<uint64_t>() - timing.at("start_ns").get<uint64_t>();
+            };
+            const auto enclosed = [](const Json & outer, const Json & inner) {
+                return outer.at("start_ns").get<uint64_t>() <= inner.at("start_ns").get<uint64_t>() &&
+                    inner.at("end_ns").get<uint64_t>() <= outer.at("end_ns").get<uint64_t>() &&
+                    outer.at("execution_id") == inner.at("execution_id");
+            };
+            const auto & total = profile.at("host_timing");
+            const auto & workload = profile.at("workload");
+            if (!check(profile.at("schema") == "gemmini.cycle" && profile.at("version") == 2 &&
+                           profile.at("record_type") == "RESIDUAL_HOST_PROFILE" &&
+                           profile.at("source") == "steady_clock" && profile.at("unit") == "nanosecond" &&
+                           profile.at("op") == "rmd.cpu_direct.profile" && profile.at("layer") == layer &&
+                           profile.at("run_id") == run_id && profile.at("stripe_id") == stripe_id &&
+                           profile.at("slot").is_null() && profile.at("node_id").is_null() &&
+                           profile.at("worker_id").is_null() && profile.at("valid") == true && valid_host(total),
+                       "direct host profile retains identity and valid monotonic host timing") ||
+                !check(workload.at("event_count") == events.size() && workload.at("active_rows") == active_rows &&
+                           workload.at("active_row_blocks") == active_row_blocks && workload.at("row_begin") == row_begin &&
+                           workload.at("row_count") == rows && workload.at("logical_j") == columns &&
+                           workload.at("logical_k") == logical_k && workload.at("j_tile_count") == 3,
+                       "direct host profile counts sparse row/block work and the J tail")) return false;
+
+            const auto & phases = profile.at("phases");
+            uint64_t previous_end = total.at("start_ns").get<uint64_t>();
+            for (const char * name : {"validation", "preparation", "parallel", "finalization"}) {
+                const auto & phase = phases.at(name);
+                const auto & host = phase.at("host_timing");
+                if (!check(valid_host(host) && valid_cpu_or_unavailable(phase.at("thread_cpu_timing")) &&
+                               enclosed(total, host) && host.at("start_tid") == total.at("start_tid") &&
+                               previous_end <= host.at("start_ns").get<uint64_t>(),
+                           "direct host phases are ordered on the coordinator thread")) return false;
+                previous_end = host.at("end_ns").get<uint64_t>();
+            }
+            const auto & parallel = phases.at("parallel").at("host_timing");
+            const auto & workers = profile.at("workers");
+            if (!check(workers.is_array() && !workers.empty(),
+                       "direct host profile records executing workers")) return false;
+            for (size_t index = 0; index < workers.size(); ++index) {
+                const auto & worker = workers.at(index);
+                const auto & host = worker.at("host_timing");
+                const auto & barrier = worker.at("barrier_host_timing");
+                if (!check(worker.at("worker_id") == index && valid_host(host) &&
+                               worker.at("tid") == host.at("start_tid") && enclosed(parallel, host) &&
+                               valid_cpu_or_unavailable(worker.at("thread_cpu_timing")) &&
+                               valid_cpu_or_unavailable(worker.at("barrier_thread_cpu_timing")),
+                           "direct worker timing retains its executing OS thread")) return false;
+                for (size_t previous = 0; previous < index; ++previous)
+                    if (!check(workers.at(previous).at("tid") != worker.at("tid"),
+                               "direct workers have distinct OS thread IDs")) return false;
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+                if (!check(valid_host(barrier) && enclosed(parallel, barrier) &&
+                               barrier.at("start_tid") == worker.at("tid") &&
+                               barrier.at("start_ns") == host.at("end_ns"),
+                           "OpenMP worker service ends at its separate barrier interval")) return false;
+#else
+                if (!check(workers.size() == 1 && unavailable_host(barrier) &&
+                               worker.at("barrier_thread_cpu_timing").at("valid") == false &&
+                               worker.at("barrier_thread_cpu_timing").at("start_ns").is_null() &&
+                               worker.at("barrier_thread_cpu_timing").at("end_ns").is_null(),
+                           "serial direct execution marks the unavailable barrier null")) return false;
+#endif
+            }
+            const auto & tiles = profile.at("tiles");
+            if (!check(tiles.is_array() && tiles.size() == 3,
+                       "direct host profile records every J tile")) return false;
+            for (size_t index = 0; index < tiles.size(); ++index) {
+                const auto & tile = tiles.at(index);
+                const auto & host = tile.at("host_timing");
+                const auto & worker = workers.at(tile.at("worker_id").get<size_t>());
+                if (!check(tile.at("node_id") == index && tile.at("j_begin") == index * 16 &&
+                               tile.at("j_end") == std::min(columns, (index + 1) * size_t{16}) &&
+                               valid_host(host) && enclosed(worker.at("host_timing"), host) &&
+                               host.at("start_tid") == worker.at("tid") &&
+                               valid_cpu_or_unavailable(tile.at("thread_cpu_timing")),
+                           "direct J tiles cover the tail on their recorded worker") ||
+                    !check(tile.at("log_valid") == false && tile.at("log_calls").is_null() &&
+                               tile.at("log_mutex_wait_ns").is_null() && tile.at("log_io_ns").is_null() &&
+                               unavailable_host(tile.at("log_host_timing")) &&
+                               tile.at("log_thread_cpu_timing").at("valid") == false &&
+                               tile.at("log_thread_cpu_timing").at("duration_ns").is_null() &&
+                               tile.at("log_thread_cpu_timing").at("start_ns").is_null() &&
+                               tile.at("log_thread_cpu_timing").at("end_ns").is_null(),
+                           "testing executor leaves unavailable legacy logger measurements null")) return false;
+            }
+            if (!check(metrics.cpu_tiles.size() == 3,
+                       "direct host profile retains every PMU tile record")) return false;
+            for (const auto & tile : metrics.cpu_tiles)
+                if (!check(!tile.valid && !tile.delta_cycles.has_value() &&
+                               tile.sample_reason == residual::DirectCpuTileReason::unavailable_event,
+                           "unavailable PMU cycles stay invalid beside valid host timing")) return false;
+            std::printf("DIRECT_HOST_PROFILE records=1 run_id=%llu stripe_id=%zu rows=4 active_rows=%zu "
+                        "active_row_blocks=%zu j=35 k=65 tiles=3 workers=%zu reference_equal=1 profile_off_equal=1\n",
+                        static_cast<unsigned long long>(run_id), stripe_id, active_rows,
+                        active_row_blocks, workers.size());
+        } catch (const Json::exception & error) {
+            std::fprintf(stderr, "FAIL: direct host profile JSON: %s\n", error.what());
+            return false;
+        }
+    }
+    return true;
+#else
+    (void) output_path;
+    std::fprintf(stderr, "direct host profile fixture requires LOG_CYCLE=1 and CYCLE_DETAIL=1\n");
+    return false;
+#endif
+}
+
 bool test_direct_cpu_executor() {
     using residual::DirectStripeBuilder;
     using residual::DirectStripePayload;
@@ -2418,6 +2642,13 @@ int main(int argc, char ** argv) {
 #ifdef GEMMINI_EXSIA_WRITER_TEST_ONLY
     return 1;
 #else
+    if (argc >= 2 && std::string(argv[1]) == "--direct-host-profile-output") {
+        if (argc != 3) {
+            std::fprintf(stderr, "usage: %s --direct-host-profile-output PATH\n", argv[0]);
+            return 2;
+        }
+        return direct_host_profile_output(argv[2]) ? 0 : 1;
+    }
     if (argc >= 2 && std::string(argv[1]) == "--bench-rmd-gather") {
         std::filesystem::path json_path;
         double max_h1_ratio = 0.80;
@@ -2446,8 +2677,14 @@ int main(int argc, char ** argv) {
     } else if (argc == 3 && std::string(argv[1]) == "--case") {
         case_name = argv[2];
     } else if (argc != 1) {
-        std::fprintf(stderr, "usage: %s [--case=<name>|--case <name>]\n", argv[0]);
-        return 2;
+        const bool help = argc == 2 && std::string(argv[1]) == "--help";
+        std::fprintf(help ? stdout : stderr,
+                     "usage: %s [--case=<name>|--case <name>]\n"
+                     "       %s --direct-host-profile-output PATH\n"
+                     "       %s --profile-output PATH [--invalid-parent]\n"
+                     "       %s --bench-rmd-gather [--json PATH] [--max-h1-ratio VALUE]\n",
+                     argv[0], argv[0], argv[0], argv[0]);
+        return help ? 0 : 2;
     }
 
     const bool known = case_name == "all" || case_name == "baseline" ||

@@ -27,6 +27,7 @@ class RecordType(str, Enum):
     QUANTIZATION_STRIPE_TELEMETRY = "QUANTIZATION_STRIPE_TELEMETRY"
     PIPELINE_STRIPE_SUMMARY = "PIPELINE_STRIPE_SUMMARY"
     RMD_BACKEND_TELEMETRY = "RMD_BACKEND_TELEMETRY"
+    RESIDUAL_HOST_PROFILE = "RESIDUAL_HOST_PROFILE"
     IM2P_RMD_STRIPE_TELEMETRY = "IM2P_RMD_STRIPE_TELEMETRY"
     IM2P_RMD_EXECUTION_TELEMETRY = "IM2P_RMD_EXECUTION_TELEMETRY"
     TIMELINE = "TIMELINE"
@@ -107,6 +108,7 @@ _FAMILY_FIELDS = {
         "rmd_start_ns rmd_end_ns compose_start_ns compose_end_ns finalize_start_ns finalize_end_ns valid").split(),
     RecordType.RMD_BACKEND_TELEMETRY: ("runtime_bundle_id model_id backend option_source work invocation_total "
         "dispatch timing geometry").split(),
+    RecordType.RESIDUAL_HOST_PROFILE: "valid host_timing workload phases tiles workers".split(),
     RecordType.IM2P_RMD_STRIPE_TELEMETRY: "row_begin row_end rmd_dot_calls rmd_work_total_cycles clock_domain additive".split(),
     RecordType.IM2P_RMD_EXECUTION_TELEMETRY: "rmd_dot_calls rmd_work_total_cycles clock_domain additive".split(),
     RecordType.TIMELINE: ("mode start end start_thread_id end_thread_id clock_mode units timer_resolution team_size "
@@ -161,9 +163,12 @@ def _validate_required_types(record: Mapping[str, JsonValue], names: List[str], 
         elif name in {"valid", "work", "additive", "overlaps_rtl"}:
             if type(value) is not bool:
                 raise CycleSchemaError(line_number, f"field {name!r} must be boolean")
-        elif name in {"dispatch", "timing", "geometry"}:
+        elif name in {"dispatch", "timing", "geometry", "host_timing", "workload", "phases"}:
             if not isinstance(value, dict):
                 raise CycleSchemaError(line_number, f"field {name!r} must be an object")
+        elif name in {"tiles", "workers"}:
+            if not isinstance(value, list):
+                raise CycleSchemaError(line_number, f"field {name!r} must be an array")
         elif name in {"schema", "record_type", "source", "unit", "runtime_bundle_id", "model_id", "backend", "option_source",
                       "clock_domain", "mode", "metric", "value_units", "cycle_status",
                       "clock_mode", "units", "reason"}:

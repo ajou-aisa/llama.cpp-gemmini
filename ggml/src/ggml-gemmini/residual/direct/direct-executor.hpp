@@ -71,6 +71,7 @@ using DirectCpuSampleReader = DirectCpuSample (*)(
 struct DirectExecutionTestHooks {
     DirectCpuSampleReader sample_reader = nullptr;
     void * context = nullptr;
+    bool disable_host_profile = false;
 };
 
 }

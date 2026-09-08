@@ -64,3 +64,61 @@ timestamp와 TID 수집, 로그 출력 자체에도 비용이 있으므로 상�
 기본 성능 실행을 구별한다.
 
 회귀 확인: `python3 tests/test-host-overlap.py`.
+
+## CPU_DIRECT residual 내부 시간
+
+`LOG_CYCLE=1`, `CYCLE_DETAIL=1` 빌드에서는 CPU_DIRECT 실행 뒤 main cycle 파일에
+`RESIDUAL_HOST_PROFILE`이 추가된다. 기존 빌드를 다시 빌드하고 같은 모델·입력·thread
+설정으로 실행해야 새 항목이 생긴다. 이전 로그에서 세부 시간을 복원할 수는 없다.
+ExSIA의 STAGE 설정은 LA/SF 관측용이며 이 residual 계측 자체는 PMU 지원과 독립적이다.
+
+```bash
+python3 scripts/utils/render_residual_profile.py "$RUN/cycles.jsonl" \
+  --output-dir "$RUN/residual-profile" \
+  --run-id 83 --layer blk.8.mlp.up_proj
+```
+
+`run-id`와 `layer`는 새 실행에서 비교할 호출로 바꾼다. 필터를 생략하면 파일의
+모든 residual profile을 출력하며, `--stripe-id`로 한 stripe만 선택할 수 있다.
+`summary.md`에 처리량·단계별 시간, `workers.csv`와 `tiles.csv`에 정수 ns,
+`worker-timeline.svg`에 worker별 계산·기존 tile 로그·barrier 구간이 나온다.
+SVG는 브라우저에서 열어 확대할 수 있다.
+
+한 profile은 다음을 담는다.
+
+- `workload`: stripe 행 범위, J/K, residual `event_count`, `active_rows`,
+  `active_row_blocks`, `j_tile_count`. 활성 block은 event가 있는 `(local_row, K/32)` 쌍이다.
+- `phases`: 검증, 준비·버퍼 초기화, 병렬 실행, 결과 마무리의 host/스레드 CPU 시간.
+- `tiles`: 실제 실행 worker와 출력 열 범위, tile 본체의 host/스레드 CPU 시간,
+  기존 tile 로그 호출의 시간 및 로거 mutex 대기·write/flush 누계.
+- `workers`: 각 worker의 작업 구간과 barrier 도착부터 통과까지의 별도 구간.
+
+`host_timing`은 기존과 같은 execution ID와 `steady_clock` 시간축을 쓴다.
+`thread_cpu_timing`은 같은 OS 스레드의 CPU 사용시간 차이이며,
+`CLOCK_THREAD_CPUTIME_ID`를 사용할 수 없거나 endpoint가 유효하지 않으면 null/invalid다.
+스레드 CPU 시간은 공통 시간축이 아니므로 그래프 정렬이나 worker 간 overlap 계산에 쓰지 않는다.
+host 경과시간과 CPU 사용시간의 차이만으로 mutex 대기와 OS 실행 대기를 구분할 수는 없다.
+barrier에서 spin하는 시간은 CPU 사용시간에도 포함될 수 있다.
+
+기존 Linux/AArch64의 tile cycle 로그는 원래 위치에서 출력하여 그 영향을 측정한다.
+`log_mutex_wait_ns`는 로거 잠금 획득 구간, `log_io_ns`는 `fwrite`와 `fflush` 구간이다.
+JSON 생성 등은 전체 `log_host_timing`에는 들어갈 수 있지만 이 두 누계에는 들어가지 않는다.
+로그가 실행되지 않았거나 실패한 측정은 `log_valid=false`이며 0ns 관측으로 해석하지 않는다.
+
+새 profile은 worker별 메모리에 모았다가 병렬 실행이 끝난 뒤 한 번 출력한다.
+profile 자체의 JSON 생성·출력은 자신의 최상위 `host_timing`에서 제외되지만,
+호출자를 감싼 기존 `residual_backend_host_call`에는 포함된다.
+새 기록의 총시간을 이전 실행의 458.6ms와 같은 계측 비용이라고 가정하지 않는다.
+worker들의 시간 합계도 병렬 구간의 경과시간과 직접 더하거나 빼지 않는다.
+
+로컬에서 실제 executor의 출력과 분석 연결을 확인하려면 tests를 켠 빌드로 다음을 실행한다.
+
+```bash
+"$TEST_BUILD/bin/test-gemmini-exsia" \
+  --direct-host-profile-output "$RUN/residual-fixture.jsonl"
+python3 scripts/utils/render_residual_profile.py "$RUN/residual-fixture.jsonl" \
+  --output-dir "$RUN/residual-fixture-report"
+```
+
+이 작은 fixture의 시간은 Nano 모델 실행 성능을 대신하지 않는다.
+회귀 확인: `python3 tests/test-residual-profile.py`.
