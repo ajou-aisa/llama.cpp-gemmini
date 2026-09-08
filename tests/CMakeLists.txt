@@ -215,6 +215,8 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
 endif()
 add_test(NAME test-gemmini-log-boundary
     COMMAND $<TARGET_FILE:test-gemmini-log-boundary>)
+add_test(NAME test-gemmini-log-boundary-linux-scalar
+    COMMAND $<TARGET_FILE:test-gemmini-log-boundary> --linux-aarch64-scalar)
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
     find_package(Threads REQUIRED)
     add_executable(test-gemmini-cycle-reader-aarch64
