@@ -10,11 +10,13 @@ from types import MappingProxyType
 from typing import Final, Optional
 
 try:
+    from .residual_stages import Stage, read_stages
     from .cycle_schema import (
         CycleSchemaError, JsonValue, _DuplicateKeyError, _InvalidConstantError,
         _optional_integer, _optional_string, _pairs_to_mapping, _reject_constant,
     )
 except ImportError:
+    from residual_stages import Stage, read_stages
     from cycle_schema import (
         CycleSchemaError, JsonValue, _DuplicateKeyError, _InvalidConstantError,
         _optional_integer, _optional_string, _pairs_to_mapping, _reject_constant,
@@ -65,6 +67,7 @@ class Tile:
     log_calls: Optional[int]
     log_mutex_wait_ns: Optional[int]
     log_io_ns: Optional[int]
+    stages: Mapping[str, Stage]
 
 
 @dataclass(frozen=True)
@@ -208,7 +211,8 @@ def _profile(record: Mapping[str, JsonValue], line: int) -> Profile:
         tile = Tile(_integer(raw, "node_id", line), _integer(raw, "worker_id", line),
                     _integer(raw, "j_begin", line), _integer(raw, "j_end", line),
                     _required_timing(raw, line), _timing(raw, line, "log_"),
-                    *(_optional_integer(raw, key, line) for key in ("log_calls", "log_mutex_wait_ns", "log_io_ns")))
+                    *(_optional_integer(raw, key, line) for key in ("log_calls", "log_mutex_wait_ns", "log_io_ns")),
+                    read_stages(raw, record.get("deep_profile", False), line))
         worker = workers.get(tile.worker_id)
         if (tile.node_id in tiles or worker is None or tile.j_begin != tile.node_id * 16
                 or tile.j_end != min(tile.j_begin + 16, workload["logical_j"]) or tile.j_end <= tile.j_begin):

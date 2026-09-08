@@ -317,6 +317,10 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
             size_t & native_q8_values = tile_native_q8_values[tile_index];
             size_t event_index = 0;
             while (event_index < payload.events.size()) {
+#if LOG_CYCLE && CYCLE_DETAIL
+                detail::DirectStageProbe stage_probe(profile.ready && profile.deep_profile ?
+                    &profile.tiles[tile_index].stages : nullptr);
+#endif
                 const ResidualEvent & first = payload.events[event_index];
                 const size_t row = first.local_row;
                 const size_t block_id = first.original_k / rmd::kBlockSize;
@@ -327,6 +331,9 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
                     ++span_end;
                 }
 
+#if LOG_CYCLE && CYCLE_DETAIL
+                stage_probe.next(1);
+#endif
                 std::array<int64_t, kJTile> block_sum{};
                 for (size_t local_j = 0; local_j < tile_j; ++local_j) {
                     const size_t j = j_begin + local_j;
@@ -343,6 +350,9 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
                     }
                 }
 
+#if LOG_CYCLE && CYCLE_DETAIL
+                stage_probe.next(2);
+#endif
                 for (size_t local_j = 0; local_j < tile_j; ++local_j) {
                     const size_t j = j_begin + local_j;
                     wreader::WeightScaleResult scale{};

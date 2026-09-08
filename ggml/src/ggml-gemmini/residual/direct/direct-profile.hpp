@@ -1,6 +1,7 @@
 #pragma once
 
 #include "direct-types.hpp"
+#include "direct-stage-profile.hpp"
 #include "../rmd/rmd-types.hpp"
 
 #include <gemmini/host-timing.hpp>
@@ -8,6 +9,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -35,6 +38,7 @@ struct DirectHostTile {
     DirectHostSpan compute;
     DirectHostSpan logging;
     log::CycleWriteTiming writes{};
+    std::array<DirectStageTotals, 3> stages{};
 };
 
 struct DirectHostWorker {
@@ -49,6 +53,8 @@ public:
                       std::optional<uint64_t> run_id, bool enabled = true) noexcept :
         payload_(payload), layer_(layer), run_id_(run_id), enabled_(enabled) {
         if (enabled_) phases_[0].start = cycle::read_host_sample();
+        const char * deep = std::getenv("GGML_GEMMINI_RESIDUAL_DEEP_PROFILE");
+        deep_profile = enabled_ && deep != nullptr && std::strcmp(deep, "1") == 0;
     }
 
     ~DirectHostProfile() noexcept {
@@ -98,6 +104,7 @@ public:
 
     bool ready = false;
     bool success = false;
+    bool deep_profile = false;
     std::vector<DirectHostTile> tiles;
     std::vector<DirectHostWorker> workers;
 
@@ -130,6 +137,7 @@ private:
             << ",\"stripe_id\":" << payload_.stripe_id
             << ",\"slot\":null,\"node_id\":null,\"worker_id\":null,\"valid\":"
             << (valid ? "true" : "false")
+            << ",\"deep_profile\":" << (deep_profile ? "true" : "false")
             << ",\"host_timing\":" << total.host_json()
             << ",\"workload\":{\"event_count\":" << payload_.events.size()
             << ",\"active_rows\":" << (workload_valid_ ? std::to_string(active_rows_) : "null")
@@ -165,7 +173,19 @@ private:
                 << ",\"log_mutex_wait_ns\":"
                 << (log_valid ? std::to_string(tile.writes.mutex_wait_ns) : "null")
                 << ",\"log_io_ns\":" << (log_valid ? std::to_string(tile.writes.io_ns) : "null")
-                << ",\"log_valid\":" << (log_valid ? "true" : "false") << '}';
+                << ",\"log_valid\":" << (log_valid ? "true" : "false");
+            if (deep_profile) {
+                constexpr std::array<const char *, 3> stage_names{
+                    "event_scan", "weight_dot", "scale_apply"};
+                out << ",\"stages\":{";
+                for (size_t stage = 0; stage < stage_names.size(); ++stage) {
+                    if (stage != 0) out << ',';
+                    out << '"' << stage_names[stage] << "\":";
+                    tile.stages[stage].write_json(out);
+                }
+                out << '}';
+            }
+            out << '}';
         }
         out << "],\"workers\":[";
         bool first = true;

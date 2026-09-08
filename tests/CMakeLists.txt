@@ -484,6 +484,11 @@ if (LOG_CYCLE AND CYCLE_DETAIL)
     add_test(NAME test-gemmini-residual-host-profile
         COMMAND $<TARGET_FILE:test-gemmini-exsia> --direct-host-profile-output
             ${CMAKE_CURRENT_BINARY_DIR}/residual-host-profile.jsonl)
+    if (Python3_Interpreter_FOUND)
+        add_test(NAME test-residual-profile-runtime
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-residual-profile.py
+                --runtime-fixture $<TARGET_FILE:test-gemmini-exsia>)
+    endif()
 endif()
 add_test(NAME gemmini_direct_metrics_source_contract
     COMMAND ${CMAKE_COMMAND}

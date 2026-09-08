@@ -16,6 +16,9 @@
 #include "../common/json.hpp"
 #include "../ggml/src/ggml-gemmini/residual/direct/direct-builder.hpp"
 #include "../ggml/src/ggml-gemmini/residual/direct/direct-executor.hpp"
+#if LOG_CYCLE && CYCLE_DETAIL
+#include "../ggml/src/ggml-gemmini/residual/direct/direct-stage-profile.hpp"
+#endif
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.hpp"
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.hpp"
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.hpp"
@@ -27,6 +30,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <charconv>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
@@ -1386,9 +1390,18 @@ bool test_rmd_cpu_direct_parity() {
     return true;
 }
 
-bool direct_host_profile_output(const std::filesystem::path & output_path) {
+bool direct_host_profile_output(const std::filesystem::path & output_path, size_t repeat_count) {
 #if LOG_CYCLE && CYCLE_DETAIL
     using Json = nlohmann::ordered_json;
+    std::array<residual::detail::DirectStageTotals, 3> early_return_stages{};
+    [&] {
+        residual::detail::DirectStageProbe probe(&early_return_stages);
+        probe.next(1);
+        return;
+    }();
+    if (!check(early_return_stages[0].calls == 1 && early_return_stages[1].calls == 1 &&
+                   early_return_stages[2].calls == 0,
+               "deep stage scope records early returns without inventing unexecuted work")) return false;
 #if defined(GGML_GEMMINI_HAS_OPENMP)
     struct RestoreOpenmp {
         int threads = omp_get_max_threads();
@@ -1398,9 +1411,12 @@ bool direct_host_profile_output(const std::filesystem::path & output_path) {
     omp_set_dynamic(0);
     omp_set_num_threads(3);
 #endif
-    for (size_t fixture = 0; fixture < 2; ++fixture) {
+    const char * deep_env = std::getenv("GGML_GEMMINI_RESIDUAL_DEEP_PROFILE");
+    const bool deep_profile = deep_env != nullptr && std::strcmp(deep_env, "1") == 0;
+    for (size_t iteration = 0; iteration < repeat_count * 2; ++iteration) {
+        const size_t fixture = iteration % 2;
         constexpr size_t rows = 4, columns = 35, logical_k = 65;
-        constexpr uint64_t run_id = 0x6a17;
+        const uint64_t run_id = 0x6a17 + iteration / 2;
         const size_t stripe_id = 3 + fixture, row_begin = 7 + fixture * rows;
         const std::string layer = "direct.profile.\"tail\"\\fixture\n";
         const std::vector<residual::ResidualEvent> events = fixture == 0
@@ -1437,7 +1453,8 @@ bool direct_host_profile_output(const std::filesystem::path & output_path) {
         args.weight_i8_scale_active = true; args.weight_scale = 1.0f;
         args.matmul_layer = layer;
         const auto path = std::filesystem::absolute(output_path);
-        if (!check(log::cycle.set_output_path(path.c_str(), fixture == 0),
+        const auto profile_offset = iteration == 0 ? 0 : std::filesystem::file_size(path);
+        if (!check(log::cycle.set_output_path(path.c_str(), iteration == 0),
                    "direct host profile output opens")) return false;
         residual::DirectExecutionMetrics metrics{};
         metrics.run_id = run_id;
@@ -1466,10 +1483,8 @@ bool direct_host_profile_output(const std::filesystem::path & output_path) {
                    "direct host profiling preserves workload metrics")) return false;
 
         std::ifstream input(path);
+        input.seekg(static_cast<std::streamoff>(profile_offset));
         std::string line, extra;
-        for (size_t previous = 0; previous < fixture; ++previous)
-            if (!check(static_cast<bool>(std::getline(input, line)),
-                       "previous direct host profile remains in JSONL output")) return false;
         if (!check(static_cast<bool>(std::getline(input, line)) && !std::getline(input, extra),
                    "each direct execution emits exactly one JSONL profile")) return false;
         try {
@@ -1516,6 +1531,7 @@ bool direct_host_profile_output(const std::filesystem::path & output_path) {
                            profile.at("op") == "rmd.cpu_direct.profile" && profile.at("layer") == layer &&
                            profile.at("run_id") == run_id && profile.at("stripe_id") == stripe_id &&
                            profile.at("slot").is_null() && profile.at("node_id").is_null() &&
+                           profile.at("deep_profile") == deep_profile &&
                            profile.at("worker_id").is_null() && profile.at("valid") == true && valid_host(total),
                        "direct host profile retains identity and valid monotonic host timing") ||
                 !check(workload.at("event_count") == events.size() && workload.at("active_rows") == active_rows &&
@@ -1585,6 +1601,38 @@ bool direct_host_profile_output(const std::filesystem::path & output_path) {
                                tile.at("log_thread_cpu_timing").at("start_ns").is_null() &&
                                tile.at("log_thread_cpu_timing").at("end_ns").is_null(),
                            "testing executor leaves unavailable legacy logger measurements null")) return false;
+                if (!check(tile.contains("stages") == deep_profile,
+                           "deep stages are emitted only when enabled")) return false;
+                if (deep_profile) {
+                    uint64_t stage_wall_ns = 0;
+                    uint64_t stage_cpu_ns = 0;
+                    for (const char * name : {"event_scan", "weight_dot", "scale_apply"}) {
+                        const auto & stage = tile.at("stages").at(name);
+                        if (!check(stage.at("calls") == active_row_blocks &&
+                                       stage.at("wall_ns").is_number_unsigned() &&
+                                       (stage.at("thread_cpu_ns").is_null() ||
+                                        stage.at("thread_cpu_ns").is_number_unsigned()) &&
+                                       stage.at("cycles_reason").is_string() &&
+                                       (stage.at("cycles_valid") == true ?
+                                            stage.at("cycles").is_number_unsigned() &&
+                                                stage.at("cycles_reason") == "none" :
+                                            stage.at("cycles").is_null() &&
+                                                stage.at("cycles_reason") != "none"),
+                                   "deep stages count each row/block and preserve counter validity")) return false;
+#if !defined(__linux__) || !defined(__aarch64__)
+                        if (!check(stage.at("cycles_valid") == false &&
+                                       stage.at("cycles_reason") == "unsupported_platform",
+                                   "non-PMU clocks are never reported as deep CPU cycles")) return false;
+#endif
+                        stage_wall_ns += stage.at("wall_ns").get<uint64_t>();
+                        if (!stage.at("thread_cpu_ns").is_null())
+                            stage_cpu_ns += stage.at("thread_cpu_ns").get<uint64_t>();
+                    }
+                    if (!check(stage_wall_ns <= host.at("duration_ns").get<uint64_t>() &&
+                                   (tile.at("thread_cpu_timing").at("valid") == false ||
+                                    stage_cpu_ns <= tile.at("thread_cpu_timing").at("duration_ns").get<uint64_t>()),
+                               "disjoint deep spans fit within their enclosing tile")) return false;
+                }
             }
             if (!check(metrics.cpu_tiles.size() == 3,
                        "direct host profile retains every PMU tile record")) return false;
@@ -1592,7 +1640,8 @@ bool direct_host_profile_output(const std::filesystem::path & output_path) {
                 if (!check(!tile.valid && !tile.delta_cycles.has_value() &&
                                tile.sample_reason == residual::DirectCpuTileReason::unavailable_event,
                            "unavailable PMU cycles stay invalid beside valid host timing")) return false;
-            std::printf("DIRECT_HOST_PROFILE records=1 run_id=%llu stripe_id=%zu rows=4 active_rows=%zu "
+            if (iteration < 2 || iteration + 2 >= repeat_count * 2)
+                std::printf("DIRECT_HOST_PROFILE records=1 run_id=%llu stripe_id=%zu rows=4 active_rows=%zu "
                         "active_row_blocks=%zu j=35 k=65 tiles=3 workers=%zu reference_equal=1 profile_off_equal=1\n",
                         static_cast<unsigned long long>(run_id), stripe_id, active_rows,
                         active_row_blocks, workers.size());
@@ -1601,9 +1650,12 @@ bool direct_host_profile_output(const std::filesystem::path & output_path) {
             return false;
         }
     }
+    std::printf("DIRECT_HOST_PROFILE_COMPLETE records=%zu deep_profile=%d\n", repeat_count * 2,
+                deep_profile ? 1 : 0);
     return true;
 #else
     (void) output_path;
+    (void) repeat_count;
     std::fprintf(stderr, "direct host profile fixture requires LOG_CYCLE=1 and CYCLE_DETAIL=1\n");
     return false;
 #endif
@@ -2643,11 +2695,19 @@ int main(int argc, char ** argv) {
     return 1;
 #else
     if (argc >= 2 && std::string(argv[1]) == "--direct-host-profile-output") {
-        if (argc != 3) {
-            std::fprintf(stderr, "usage: %s --direct-host-profile-output PATH\n", argv[0]);
+        size_t repeat_count = 1;
+        bool valid_repeat = argc == 3;
+        if (argc == 5 && std::string(argv[3]) == "--direct-host-profile-repeat") {
+            const char * end = argv[4] + std::strlen(argv[4]);
+            const auto result = std::from_chars(argv[4], end, repeat_count);
+            valid_repeat = result.ec == std::errc{} && result.ptr == end && repeat_count > 0 &&
+                repeat_count <= std::numeric_limits<size_t>::max() / 2;
+        }
+        if (!valid_repeat) {
+            std::fprintf(stderr, "usage: %s --direct-host-profile-output PATH [--direct-host-profile-repeat N]\n", argv[0]);
             return 2;
         }
-        return direct_host_profile_output(argv[2]) ? 0 : 1;
+        return direct_host_profile_output(argv[2], repeat_count) ? 0 : 1;
     }
     if (argc >= 2 && std::string(argv[1]) == "--bench-rmd-gather") {
         std::filesystem::path json_path;
@@ -2680,7 +2740,7 @@ int main(int argc, char ** argv) {
         const bool help = argc == 2 && std::string(argv[1]) == "--help";
         std::fprintf(help ? stdout : stderr,
                      "usage: %s [--case=<name>|--case <name>]\n"
-                     "       %s --direct-host-profile-output PATH\n"
+                     "       %s --direct-host-profile-output PATH [--direct-host-profile-repeat N]\n"
                      "       %s --profile-output PATH [--invalid-parent]\n"
                      "       %s --bench-rmd-gather [--json PATH] [--max-h1-ratio VALUE]\n",
                      argv[0], argv[0], argv[0], argv[0]);

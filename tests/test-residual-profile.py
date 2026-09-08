@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""CLI regression checks using synthetic telemetry, never hardware measurements."""
+"""CLI regression checks with synthetic telemetry and an optional live CPU fixture."""
 
 from __future__ import annotations
 
 import copy
 import csv
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -57,6 +58,16 @@ def fixture(stripe: int = 0, offset: int = 0) -> dict:
             "workload": {"row_begin": stripe * 4, "row_count": 4, "logical_j": 32, "logical_k": 16,
                          "event_count": 3, "active_rows": 2, "active_row_blocks": 2, "j_tile_count": 2},
             "phases": phases, "tiles": tiles, "workers": workers}
+
+
+def deep_fixture() -> dict:
+    record = dict(fixture(), deep_profile=True)
+    for index, tile in enumerate(record["tiles"]):
+        tile["stages"] = {
+            name: {"calls": index + 1, "wall_ns": wall, "thread_cpu_ns": wall - 1,
+                   "cycles": (1 << 54) + index + 1, "cycles_valid": True, "cycles_reason": "none"}
+            for name, wall in (("event_scan", 3), ("weight_dot", 11), ("scale_apply", 5))}
+    return record
 
 
 class ResidualProfileTests(unittest.TestCase):
@@ -117,6 +128,69 @@ class ResidualProfileTests(unittest.TestCase):
         row = self.csv_rows("tiles.csv")[0]
         for column in ("compute_thread_cpu_ns", "log_wall_ns", "log_thread_cpu_ns", "log_calls", "log_io_ns"):
             self.assertEqual(row[column], "")
+
+    def test_deep_stage_totals_preserve_cycles_and_unavailable_measurements(self) -> None:
+        # Given exact large cycle values and one unavailable PMU stage.
+        record = deep_fixture()
+        record["tiles"][1]["stages"]["scale_apply"].update(
+            cycles=None, cycles_valid=False, cycles_reason="unsupported_platform", thread_cpu_ns=None)
+        # When rendered through the CLI.
+        result = self.run_cli([record])
+        # Then tile, worker and stripe totals retain integers and propagate invalid measurements.
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = self.csv_rows("stages.csv")
+        stripe = {row["stage"]: row for row in rows if row["scope"] == "stripe"}
+        self.assertEqual(stripe["weight_dot"]["cycles"], str((1 << 55) + 3))
+        self.assertEqual(stripe["weight_dot"]["calls"], "3")
+        self.assertEqual(stripe["weight_dot"]["wall_ns"], "22")
+        self.assertEqual(stripe["scale_apply"]["cycles"], "")
+        self.assertEqual(stripe["scale_apply"]["thread_cpu_ns"], "")
+        self.assertEqual(stripe["scale_apply"]["cycles_reason"], "unsupported_platform")
+        self.assertEqual(len([row for row in rows if row["scope"] == "worker"]), 6)
+        tile = next(row for row in rows if row["scope"] == "tile" and row["stage"] == "weight_dot")
+        self.assertEqual(tile["cycles"], str((1 << 54) + 1))
+
+    def test_trace_exports_measured_spans_without_inventing_stage_timestamps(self) -> None:
+        # Given two executions with unrelated host epochs and aggregate-only stages.
+        other = json.loads(json.dumps(fixture(0, 10000)).replace("synthetic-test-only", "synthetic-second-execution"))
+        # When the CLI exports Chrome trace JSON.
+        result = self.run_cli([deep_fixture(), other])
+        # Then each execution has its own process identity and exact small relative timestamps.
+        self.assertEqual(result.returncode, 0, result.stderr)
+        trace = json.loads((self.output / "trace.json").read_text(encoding="utf-8"))
+        self.assertEqual(trace["displayTimeUnit"], "ns")
+        events = [event for event in trace["traceEvents"] if event["ph"] == "X"]
+        tiles = [event for event in events if event["name"] == "J-tile compute"]
+        self.assertEqual([(event["ts"], event["dur"]) for event in tiles],
+                         [(0.020, 0.030), (0.025, 0.050), (0.020, 0.030), (0.025, 0.050)])
+        self.assertEqual([event["tid"] for event in tiles], [101, 102, 101, 102])
+        self.assertNotEqual(tiles[0]["pid"], tiles[2]["pid"])
+        self.assertEqual(tiles[0]["args"]["start_ns"], str(EPOCH + 20))
+        self.assertEqual({event["name"] for event in events},
+                         {"CPU_DIRECT", "validation", "preparation", "parallel", "finalization",
+                          "worker work", "J-tile compute", "legacy logging", "barrier"})
+
+    def test_corrupt_deep_stage_data_fails_before_publication(self) -> None:
+        mutations = (
+            lambda row: row.update(deep_profile=1),
+            lambda row: row.update(deep_profile=False),
+            lambda row: row["tiles"][0]["stages"].pop("weight_dot"),
+            lambda row: row["tiles"][0]["stages"]["weight_dot"].update(calls=-1),
+            lambda row: row["tiles"][0]["stages"]["weight_dot"].update(cycles_valid=False),
+            lambda row: row["tiles"][0]["stages"]["weight_dot"].update(cycles=None),
+            lambda row: row["tiles"][0]["stages"]["weight_dot"].update(wall_ns=-1),
+            lambda row: row["tiles"][0]["stages"]["weight_dot"].update(calls=0),
+        )
+        for mutate in mutations:
+            with self.subTest(mutation=mutate):
+                # Given contradictory deep measurements.
+                record = deep_fixture()
+                mutate(record)
+                # When parsed.
+                result = self.run_cli([record])
+                # Then no partial output is published.
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.output.exists())
 
     def test_filters_select_identity_before_deep_validation(self) -> None:
         # Given one selected profile and a malformed profile from another run.
@@ -219,5 +293,37 @@ class ResidualProfileTests(unittest.TestCase):
         self.assertEqual(segments[0].get("x"), segments[2].get("x"))
 
 
+def test_runtime_fixture(executable: Path) -> None:
+    # Given the compiled sparse CPU_DIRECT fixture with deep profiling enabled.
+    with tempfile.TemporaryDirectory(prefix="residual-profile-runtime-") as temporary:
+        directory = Path(temporary)
+        capture, output = directory / "capture.jsonl", directory / "rendered"
+        emitted = subprocess.run(
+            [str(executable.resolve()), "--direct-host-profile-output", str(capture),
+             "--direct-host-profile-repeat", "2"],
+            env={**os.environ, "GGML_GEMMINI_RESIDUAL_DEEP_PROFILE": "1"},
+            capture_output=True, text=True, check=False)
+        assert emitted.returncode == 0, emitted.stderr
+        # When the production renderer consumes the real execution's JSONL.
+        rendered = subprocess.run([sys.executable, str(SCRIPT), str(capture),
+                                   "--output-dir", str(output)],
+                                  capture_output=True, text=True, check=False)
+        assert rendered.returncode == 0, rendered.stderr
+        # Then every repeated stripe exposes measured stages and a real tile trace.
+        with (output / "stages.csv").open(encoding="utf-8", newline="") as stream:
+            stripes = [row for row in csv.DictReader(stream) if row["scope"] == "stripe"]
+        assert len(stripes) == 12
+        assert {row["stage"] for row in stripes} == {"event_scan", "weight_dot", "scale_apply"}
+        assert {row["run_id"] for row in stripes} == {"27159", "27160"}
+        assert all(int(row["calls"]) == (15 if row["stripe_id"] == "3" else 9)
+                   and row["wall_ns"] != "" for row in stripes)
+        trace = json.loads((output / "trace.json").read_text(encoding="utf-8"))
+        assert sum(event["ph"] == "X" and event["name"] == "J-tile compute"
+                   for event in trace["traceEvents"]) == 12
+
+
 if __name__ == "__main__":
-    unittest.main()
+    if len(sys.argv) == 3 and sys.argv[1] == "--runtime-fixture":
+        test_runtime_fixture(Path(sys.argv[2]))
+    else:
+        unittest.main()

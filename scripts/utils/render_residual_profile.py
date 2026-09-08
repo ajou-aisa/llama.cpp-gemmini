@@ -16,16 +16,20 @@ from typing import Final, Optional, Sequence
 
 try:
     from .cycle_schema import CycleSchemaError
-    from .residual_profile import HostTiming, Profile, Timing, read_profiles
+    from .residual_profile import HostTiming, Profile, Tile, Timing, read_profiles
+    from .residual_trace import trace
     from .table_output import TableRow, render_markdown
 except ImportError:
     from cycle_schema import CycleSchemaError
-    from residual_profile import HostTiming, Profile, Timing, read_profiles
+    from residual_profile import HostTiming, Profile, Tile, Timing, read_profiles
+    from residual_trace import trace
     from table_output import TableRow, render_markdown
 
 IDENTITY: Final = ("execution_id", "run_id", "layer", "stripe_id")
 PHASES: Final = ("validation", "preparation", "parallel", "finalization")
 COLORS: Final = {"compute": "#217c5b", "legacy logging": "#c97818", "barrier": "#7854a8"}
+STAGE_COLUMNS: Final = IDENTITY + ("scope", "worker_id", "node_id", "stage", "calls", "wall_ns",
+                                  "thread_cpu_ns", "cycles", "cycles_valid", "cycles_reason")
 
 
 def cell(value: Optional[int | str]) -> str:
@@ -81,6 +85,32 @@ def tile_rows(profiles: Sequence[Profile]) -> tuple[TableRow, ...]:
     ))) for profile in profiles for tile in profile.tiles)
 
 
+def stage_rows(profiles: Sequence[Profile]) -> tuple[TableRow, ...]:
+    rows = []
+    for profile in profiles:
+        if not profile.tiles[0].stages:
+            continue
+        groups: list[tuple[str, Optional[int], Optional[int], tuple[Tile, ...]]] = [("stripe", None, None, profile.tiles)]
+        groups.extend(("worker", worker.worker_id, None,
+                       tuple(tile for tile in profile.tiles if tile.worker_id == worker.worker_id))
+                      for worker in profile.workers)
+        groups.extend(("tile", tile.worker_id, tile.node_id, (tile,)) for tile in profile.tiles)
+        for scope, worker_id, node_id, tiles in groups:
+            if not tiles:
+                continue
+            for name in tiles[0].stages:
+                stages = [tile.stages[name] for tile in tiles]
+                cycles = complete_sum([stage.cycles for stage in stages])
+                reason = "none" if cycles is not None else ";".join(dict.fromkeys(
+                    stage.cycles_reason for stage in stages if stage.cycles is None))
+                rows.append(TableRow(identity(profile) + tuple(cell(value) for value in (
+                    scope, worker_id, node_id, name, sum(stage.calls for stage in stages),
+                    complete_sum([stage.wall_ns for stage in stages]),
+                    complete_sum([stage.thread_cpu_ns for stage in stages]), cycles,
+                    str(cycles is not None).lower(), reason))))
+    return tuple(rows)
+
+
 def summary(profiles: Sequence[Profile]) -> str:
     lines = ["# CPU_DIRECT residual host profile\n",
              "Wall time is measured by steady_clock in nanoseconds. Thread CPU time is a separate measurement; "
@@ -129,6 +159,21 @@ def summary(profiles: Sequence[Profile]) -> str:
     lines.append("The timeline shares a host axis only within one execution_id. Separate execution panels have independent "
                  "origins and scales. Gaps within the gray worker span are unclassified worker overhead. "
                  "Missing logging or barrier measurements have no colored segment.\n")
+    lines.append("## Inner J-tile stages\n")
+    stages = stage_rows(profiles)
+    if stages:
+        lines.append("These are measured interval sums, not contiguous timeline spans. event_scan locates each row/block's "
+                     "events; weight_dot includes weight reading and integer multiply/accumulate; scale_apply reads scales "
+                     "and applies the block result. Deep probes add overhead. Worker and stripe totals aggregate the same "
+                     "tile data; do not add scopes together. PMU cycles are independent of wall/thread CPU nanoseconds.\n")
+        lines.append(render_markdown(STAGE_COLUMNS, tuple(row for row in stages if row.cells[4] != "tile")))
+    missing = [profile for profile in profiles if not profile.tiles[0].stages]
+    if missing:
+        lines.append(f"{len(missing)} selected stripe(s) have no inner-stage measurements. "
+                     "Collect a new capture with GGML_GEMMINI_RESIDUAL_DEEP_PROFILE=1; absent stages are not zero.\n")
+    lines.append("Open trace.json using **Open trace file** at https://ui.perfetto.dev. "
+                 "It contains measured host spans on OS-thread tracks; aggregate-only stages have no invented timestamps. "
+                 "Each execution has an independent zero origin, so cross-execution alignment does not establish overlap.\n")
     lines.append("![Worker wall-time timeline](worker-timeline.svg)\n")
     return "\n".join(lines)
 
@@ -202,7 +247,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         profiles = read_profiles(args.input, run_id=args.run_id, layer=args.layer, stripe_id=args.stripe_id)
-        targets = [args.output_dir / name for name in ("summary.md", "workers.csv", "tiles.csv", "worker-timeline.svg")]
+        targets = [args.output_dir / name for name in
+                   ("summary.md", "workers.csv", "tiles.csv", "worker-timeline.svg", "stages.csv", "trace.json")]
         for target in targets:
             if target.exists():
                 raise FileExistsError(f"output target already exists: {target}")
@@ -216,6 +262,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "log_calls", "log_mutex_wait_ns", "log_io_ns"), tile_rows(profiles))
         targets[0].write_text(report, encoding="utf-8")
         targets[3].write_text(svg, encoding="utf-8")
+        export_csv(targets[4], STAGE_COLUMNS, stage_rows(profiles))
+        targets[5].write_text(trace(profiles), encoding="utf-8")
     except (CycleSchemaError, OSError) as error:
         print(error, file=sys.stderr)
         return 1

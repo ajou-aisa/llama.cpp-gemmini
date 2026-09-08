@@ -122,3 +122,101 @@ python3 scripts/utils/render_residual_profile.py "$RUN/residual-fixture.jsonl" \
 
 이 작은 fixture의 시간은 Nano 모델 실행 성능을 대신하지 않는다.
 회귀 확인: `python3 tests/test-residual-profile.py`.
+
+## J-tile 내부 세부 계측과 다른 출력
+
+위 상세 빌드에서 실행할 때 `GGML_GEMMINI_RESIDUAL_DEEP_PROFILE=1`을 추가한다.
+기존 모델·prompt·thread·backend 설정은 그대로 둔다.
+
+```bash
+export GGML_GEMMINI_RESIDUAL_DEEP_PROFILE=1
+# 위의 실제 모델 실행 명령으로 새 cycles.jsonl을 수집한 뒤:
+python3 scripts/utils/render_residual_profile.py "$RUN/cycles.jsonl" \
+  --output-dir "$RUN/residual-profile"
+```
+
+새 profile의 `deep_profile=true`, 각 tile의 `stages`에서 다음 누계를 읽는다.
+각 단계는 `(row, K/32 block)`마다 측정하고 J-tile별로 합쳐 저장한다.
+
+| 단계 | 실제 측정하는 작업 |
+| --- | --- |
+| `event_scan` | 같은 row/block에 속하는 residual event 구간 탐색 |
+| `weight_dot` | weight code 읽기·검사와 residual 곱셈·누적 |
+| `scale_apply` | block scale 읽기·검사, scale 곱셈, overflow 검사, 출력 버퍼 누적 |
+
+각 단계에 `calls`, `wall_ns`, `thread_cpu_ns`, `cycles`, `cycles_valid`,
+`cycles_reason`이 나온다. cycles는 Linux/AArch64의 기존 native PMU reader로
+같은 event owner/generation인지 검사한 값이다. 지원하지 않는 플랫폼이나 실패한
+측정은 null과 사유를 기록한다. Mac timer tick을 CPU cycle로 대신 넣지 않는다.
+ns와 cycles의 읽기 경계는 완전히 같은 시점이 아니며 서로 환산하지 않는다.
+
+weight 읽기와 곱셈은 원래 한 루프에 붙어 있으므로 `weight_dot`으로 함께 측정한다.
+명령 하나마다 타이머를 넣거나 weight를 따로 버퍼링하여 원래 계산 순서를 바꾸지 않는다.
+각 span의 probe 비용과 span 사이의 제어·집계 비용 때문에 단계 합계가 tile 전체와
+같지는 않다. worker들의 누적 시간은 병렬 실행의 경과시간과 구별한다.
+추가 계측이 부담을 주므로 기본값은 OFF이며, 같은 조건에서 OFF/ON 반복 실행을 비교한다.
+
+분석기는 다음 파일도 출력한다.
+
+- `stages.csv`: run/stripe/worker/J-tile별 내부 단계의 정수 ns·cycles와 유효성.
+- `summary.md`: stripe·worker별 내부 단계 누계. 미수집 값은 0으로 채우지 않는다.
+- `trace.json`: [Perfetto UI](https://ui.perfetto.dev/)에서 Open trace file로 여는
+  타임라인. 부모 단계·worker 계산·로그·barrier의 실제 host endpoint를 사용한다.
+  내부 단계 누계에는 개별 endpoint가 없으므로 타임라인 위치를 추정해 넣지 않는다.
+
+Chrome JSON의 `ts/dur` 단위는 microsecond이며 실행별 공통 ns 원점을 뺀 뒤 변환한다.
+원래 정수 ns는 CSV에 보존한다. 서로 다른 execution ID의 시작점은 별도 기준이므로
+그 사이의 overlap을 해석하지 않는다.
+[Perfetto 외부 trace 형식 설명](https://perfetto.dev/docs/getting-started/other-formats).
+
+기존 cycle 로그 전체의 단계와 worker별 cycles는 원래 도구로도 볼 수 있다.
+중첩된 부모·자식 op의 cycles를 합쳐 총시간으로 해석하지 않는다.
+
+```bash
+python3 scripts/utils/render_operation_cycles.py "$RUN/cycles.jsonl" "$RUN/operations"
+python3 scripts/utils/render_worker_cycles.py "$RUN/cycles.jsonl" "$RUN/workers" \
+  --op rmd_direct_j_tile_interval
+python3 scripts/utils/cycle_log_to_csv.py "$RUN/cycles.jsonl" "$RUN/csv"
+```
+
+## OS에서 독립적으로 측정하기
+
+Linux에서는 같은 모델 명령을 `perf` 뒤에 두면 새 OpenMP worker도 수집한다.
+아래 `PROGRAM ARGS`를 실제 실행 파일과 인자로 바꾼다. 각 명령은 별도 실행이므로
+cycle 로그 경로도 실행마다 새로 지정한다. baseline 비교는 deep profile을 끄고 한다.
+
+```bash
+perf stat -o "$RUN/perf-stat.txt" \
+  -e task-clock,context-switches,cpu-migrations,page-faults,cycles:u,instructions:u \
+  -- PROGRAM ARGS
+
+perf record -o "$RUN/perf.data" -F 99 -e cycles:u \
+  --call-graph dwarf -- PROGRAM ARGS
+perf report --stdio --no-children --sort pid,dso,symbol -i "$RUN/perf.data" \
+  > "$RUN/perf-report.txt"
+perf script -i "$RUN/perf.data" -F comm,pid,tid,time,event,ip,sym,dso \
+  > "$RUN/perf-stacks.txt"
+```
+
+`perf stat`은 전체 실행의 CPU 사용량·문맥 전환·migration·page fault를 보여주고,
+`perf record/report`는 어느 TID·함수의 스택이 자주 관측됐는지 보여준다.
+stripe별 구분은 프로그램의 profile을 사용한다. `cycles:u`와 `instructions:u`는
+user-space이며, PMU 권한 실패나 multiplexing의 실행 비율을 먼저 확인한다.
+PMU를 쓸 수 없으면 별도 실행에서 software event만 선택할 수 있다.
+이 경우 cycles를 측정했다고 표시하지 않는다. 함수·소스 줄을 자세히 보려면
+debug symbol과 unwind 정보가 있는 빌드가 필요하다.
+[perf stat](https://raw.githubusercontent.com/torvalds/linux/master/tools/perf/Documentation/perf-stat.txt),
+[perf record](https://raw.githubusercontent.com/torvalds/linux/master/tools/perf/Documentation/perf-record.txt).
+
+Mac에서는 모델 실행이 시작되어 첫 profile이 기록된 것을 확인한 뒤
+실행 중인 프로세스의 PID로 `sample`을 사용한다.
+
+```bash
+/usr/bin/sample "$PID" 2 1 -file "$RUN/sample.txt"
+```
+
+이것은 전체 스레드의 스택을 대기 상태까지 포함하여 샘플링한 결과다.
+샘플 수를 정확한 CPU ns나 cycles로 읽지 않는다. 종료 코드뿐 아니라 보고서의
+`Call graph`에 실제 Thread 항목과 스택이 있는지 확인한다. 짧은 fixture를 관찰할 때는
+`--direct-host-profile-repeat N`으로 동일 executor를 반복 실행할 수 있다.
+반복 fixture의 JSON 출력 비용이나 Mac 결과를 Nano 모델의 병목으로 결론내리지 않는다.
