@@ -25,6 +25,7 @@
 #include <vector>
 
 #include <gemmini/cycle_reader.hpp>
+#include <gemmini/host-timing.hpp>
 
 #if !defined(GGML_GEMMINI_CONFIG_HAS_ACTIVATION_QUANT)
 namespace ggml::gemmini::config {
@@ -246,6 +247,8 @@ struct MatmulCpuSample {
 #if defined(__linux__) && defined(__aarch64__)
     cycle::NativeCycleSample native;
 #endif
+    uint64_t ns = 0;
+    uint64_t tid = 0;
 };
 
 inline MatmulCpuSample read_matmul_cpu_sample() {
@@ -258,6 +261,8 @@ inline MatmulCpuSample read_matmul_cpu_sample() {
 #else
     result.value = cycle::read();
 #endif
+    result.ns = cycle::timestamp_ns();
+    result.tid = cycle::host_thread_id();
 #endif
     return result;
 }
@@ -347,17 +352,30 @@ struct MatmulJobMetrics {
     uint64_t producer_wait_start_ns = 0;
     uint64_t producer_wait_end_ns = 0;
     uint64_t capture_queue_enqueue_ns = 0;
+    uint64_t capture_queue_dequeue_ns = 0;
+    uint64_t queue_enqueue_tid = 0;
+    uint64_t queue_dequeue_tid = 0;
     uint64_t ws_start_ns = 0;
     uint64_t ws_end_ns = 0;
+    uint64_t ws_start_tid = 0;
+    uint64_t ws_end_tid = 0;
     uint64_t rmd_enqueue_ns = 0;
     uint64_t rmd_start_ns = 0;
     uint64_t rmd_end_ns = 0;
+    uint64_t backend_start_ns = 0;
+    uint64_t backend_end_ns = 0;
+    uint64_t backend_start_tid = 0;
+    uint64_t backend_end_tid = 0;
     uint64_t compose_start_ns = 0;
     uint64_t compose_end_ns = 0;
+    uint64_t compose_start_tid = 0;
+    uint64_t compose_end_tid = 0;
     uint64_t merge_start_ns = 0;
     uint64_t merge_end_ns = 0;
     uint64_t finalize_start_ns = 0;
     uint64_t finalize_end_ns = 0;
+    uint64_t finalize_start_tid = 0;
+    uint64_t finalize_end_tid = 0;
     uint64_t telemetry_queue_tick = 0;
     uint64_t telemetry_dense_start = 0;
     uint64_t telemetry_dense_end = 0;
@@ -367,7 +385,7 @@ struct MatmulJobMetrics {
     uint64_t telemetry_merge_start = 0;
     uint64_t telemetry_merge_end = 0;
     uint64_t telemetry_residual_end = 0;
-#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
     cycle::NativeCycleSample telemetry_compose_start_sample;
     cycle::NativeCycleSample telemetry_compose_end_sample;
     cycle::NativeCycleSample telemetry_finalize_start_sample;
@@ -389,6 +407,9 @@ struct MatmulCaptureTiming {
     uint64_t producer_wait_start_ns = 0;
     uint64_t producer_wait_end_ns = 0;
     uint64_t queued_ns = 0;
+    uint64_t dequeued_ns = 0;
+    uint64_t enqueue_tid = 0;
+    uint64_t dequeue_tid = 0;
     uint64_t telemetry_queued_tick = 0;
 };
 

@@ -79,7 +79,8 @@ public:
           interval.sample_reason.empty() ? nullptr : interval.sample_reason.c_str());
       json.insert(json.rfind('}'),
           std::string(",\"cpu_measurement_version\":1,\"operation_success\":") +
-          (operation_success ? "true" : "false") + ",\"additive\":false");
+          (operation_success ? "true" : "false") + ",\"additive\":false,\"host_timing\":" +
+          cycle::serialize_host_timing(start_.ns, end.ns, start_.tid, end.tid));
       log::cycle.write_json(json);
     } catch (...) {
       log::cycle.report_failure("IM2P host CPU interval");

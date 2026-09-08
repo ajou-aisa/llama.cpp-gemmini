@@ -9,6 +9,7 @@
 #include "../../common/tensor_util.hpp"
 
 #include <gemmini/cycle_reader.hpp>
+#include <gemmini/host-timing.hpp>
 #include <gemmini/log.hpp>
 #if defined(__linux__) && defined(__aarch64__) && CYCLE_DETAIL
 #include <gemmini/log.h>
@@ -255,6 +256,7 @@ namespace ggml::gemmini::quants::act::exsia
         {
             interval.valid = true;
             interval.start_thread_id = profile_thread_id();
+            interval.start_tid = ggml::gemmini::cycle::host_thread_id();
 #if defined(__linux__) && defined(__aarch64__)
             interval.start_sample = ggml::gemmini::cycle::read_sample();
             interval.start = interval.start_sample.value;
@@ -276,6 +278,7 @@ namespace ggml::gemmini::quants::act::exsia
             interval.end = profile_now();
 #endif
             interval.end_ns = profile_now_ns();
+            interval.end_tid = ggml::gemmini::cycle::host_thread_id();
             interval.end_thread_id = profile_thread_id();
 #if defined(__linux__) && defined(__aarch64__)
             return true;
@@ -474,6 +477,8 @@ namespace ggml::gemmini::quants::act::exsia
             out << ",\"start\":" << interval.start << ",\"end\":" << interval.end
                 << ",\"start_thread_id\":" << interval.start_thread_id
                 << ",\"end_thread_id\":" << interval.end_thread_id
+                << ",\"host_timing\":" << ggml::gemmini::cycle::serialize_host_timing(
+                    interval.start_ns, interval.end_ns, interval.start_tid, interval.end_tid)
                 << ",\"clock_mode\":";
             write_json_string(out, ggml::gemmini::cycle::clock_mode());
             out << ",\"units\":";
@@ -511,6 +516,8 @@ namespace ggml::gemmini::quants::act::exsia
                 << ",\"start\":" << interval.start << ",\"end\":" << interval.end
                 << ",\"start_thread_id\":" << interval.start_thread_id
                 << ",\"end_thread_id\":" << interval.end_thread_id
+                << ",\"host_timing\":" << ggml::gemmini::cycle::serialize_host_timing(
+                    interval.start_ns, interval.end_ns, interval.start_tid, interval.end_tid)
                 << ",\"clock_mode\":";
             write_json_string(out, ggml::gemmini::cycle::clock_mode());
             out << ",\"units\":";

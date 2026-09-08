@@ -217,6 +217,16 @@ add_test(NAME test-gemmini-log-boundary
     COMMAND $<TARGET_FILE:test-gemmini-log-boundary>)
 add_test(NAME test-gemmini-log-boundary-linux-scalar
     COMMAND $<TARGET_FILE:test-gemmini-log-boundary> --linux-aarch64-scalar)
+add_executable(test-gemmini-host-timing test-gemmini-host-timing.cpp)
+find_package(Threads REQUIRED)
+target_link_libraries(test-gemmini-host-timing PRIVATE ggml-gemmini-utils Threads::Threads)
+target_compile_features(test-gemmini-host-timing PRIVATE cxx_std_17)
+add_test(NAME test-gemmini-host-timing COMMAND $<TARGET_FILE:test-gemmini-host-timing>)
+find_package(Python3 3.9 COMPONENTS Interpreter QUIET)
+if (Python3_Interpreter_FOUND)
+    add_test(NAME test-host-overlap
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-host-overlap.py)
+endif()
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
     find_package(Threads REQUIRED)
     add_executable(test-gemmini-cycle-reader-aarch64
@@ -847,7 +857,12 @@ if (_GGML_GEMMINI_ACTIVATION_BITS_VALUE EQUAL 8 AND
     target_compile_features(test-gemmini-matmul-options PRIVATE cxx_std_17)
     target_compile_definitions(test-gemmini-matmul-options PRIVATE
         GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
-        GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE})
+        GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
+        GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
+        GGML_GEMMINI_EXSIA_DEFAULT_MODE_VALUE=${_GGML_GEMMINI_EXSIA_DEFAULT_MODE_VALUE}
+        GGML_GEMMINI_EXSIA_LOCAL_WORKERS=${GGML_GEMMINI_EXSIA_LOCAL_WORKERS})
+    ggml_gemmini_apply_profile_compile_definitions(test-gemmini-matmul-options)
+    ggml_gemmini_assert_profile_compile_definitions(test-gemmini-matmul-options)
     target_include_directories(test-gemmini-matmul-options PRIVATE
         ../ggml/include
         ../ggml/src
@@ -858,7 +873,7 @@ if (_GGML_GEMMINI_ACTIVATION_BITS_VALUE EQUAL 8 AND
         ${GEMMINI_SW_PATH}
         ${GEMMINI_SW_PATH}/include)
     if (NOT GGML_BACKEND_DL)
-        target_link_libraries(test-gemmini-matmul-options PRIVATE ggml-gemmini ggml-base)
+        target_link_libraries(test-gemmini-matmul-options PRIVATE ggml-gemmini ggml-base ggml-gemmini-utils)
         target_compile_definitions(test-gemmini-matmul-options PRIVATE GGML_GEMMINI_OPTIONS_TEST_BACKEND=1)
     endif()
     add_test(NAME test-gemmini-matmul-options COMMAND $<TARGET_FILE:test-gemmini-matmul-options>)
@@ -1006,7 +1021,7 @@ if (NOT GGML_BACKEND_DL)
     # The façade test uses C++ symbols from the statically linked backend.
     # Dynamic backends are MODULE libraries and cannot be linked into a test.
     add_executable(test-gemmini-matmul test-gemmini-matmul.cpp)
-    target_link_libraries(test-gemmini-matmul PRIVATE ggml-gemmini ggml-base)
+    target_link_libraries(test-gemmini-matmul PRIVATE ggml-gemmini ggml-base ggml-gemmini-utils)
     target_compile_features(test-gemmini-matmul PRIVATE cxx_std_17)
     target_compile_definitions(test-gemmini-matmul PRIVATE
         GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}

@@ -478,6 +478,7 @@ std::string serialize_cycle_telemetry(const PipelineStripeTelemetry & record) {
         record.queue_end_ns >= record.queue_start_ns &&
         record.dense_end_ns >= record.dense_start_ns &&
         record.rmd_end_ns >= record.rmd_start_ns &&
+        record.residual_backend_end_ns >= record.residual_backend_start_ns &&
         record.compose_end_ns >= record.compose_start_ns &&
         record.finalize_end_ns >= record.finalize_start_ns;
     std::ostringstream out;
@@ -499,10 +500,27 @@ std::string serialize_cycle_telemetry(const PipelineStripeTelemetry & record) {
     field(out, "dense_end_ns", record.dense_end_ns);
     field(out, "rmd_start_ns", record.rmd_start_ns);
     field(out, "rmd_end_ns", record.rmd_end_ns);
+    field(out, "residual_backend_start_ns", record.residual_backend_start_ns);
+    field(out, "residual_backend_end_ns", record.residual_backend_end_ns);
     field(out, "compose_start_ns", record.compose_start_ns);
     field(out, "compose_end_ns", record.compose_end_ns);
     field(out, "finalize_start_ns", record.finalize_start_ns);
     field(out, "finalize_end_ns", record.finalize_end_ns);
+    out << ",\"host_stages\":{\"queue\":"
+        << cycle::serialize_host_timing(record.queue_start_ns, record.queue_end_ns,
+                                       record.queue_start_tid, record.queue_end_tid)
+        << ",\"dense\":"
+        << cycle::serialize_host_timing(record.dense_start_ns, record.dense_end_ns,
+                                       record.dense_start_tid, record.dense_end_tid)
+        << ",\"residual_backend\":"
+        << cycle::serialize_host_timing(record.residual_backend_start_ns, record.residual_backend_end_ns,
+                                       record.residual_backend_start_tid, record.residual_backend_end_tid)
+        << ",\"compose\":"
+        << cycle::serialize_host_timing(record.compose_start_ns, record.compose_end_ns,
+                                       record.compose_start_tid, record.compose_end_tid)
+        << ",\"finalize\":"
+        << cycle::serialize_host_timing(record.finalize_start_ns, record.finalize_end_ns,
+                                       record.finalize_start_tid, record.finalize_end_tid) << '}';
     out << ",\"valid\":" << (valid ? "true" : "false") << '}';
     return out.str();
 #endif

@@ -1,11 +1,72 @@
 #include "../include/gemmini/log.hpp"
+#include "../include/gemmini/host-timing.hpp"
 #if defined(__linux__) && defined(__aarch64__)
 #include "cycle_reader_internal.h"
 #endif
 
 #include <limits>
+#include <atomic>
+#include <chrono>
 #include <mutex>
 #include <string>
+
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#elif defined(__APPLE__)
+#include <pthread.h>
+#include <unistd.h>
+#elif defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+namespace ggml::gemmini::cycle {
+
+uint64_t host_thread_id() noexcept {
+#if defined(__linux__)
+    return static_cast<uint64_t>(syscall(SYS_gettid));
+#elif defined(__APPLE__)
+    uint64_t tid = 0;
+    return pthread_threadid_np(nullptr, &tid) == 0 ? tid : 0;
+#elif defined(_WIN32)
+    return static_cast<uint64_t>(GetCurrentThreadId());
+#else
+    static std::atomic<uint64_t> next_id{1};
+    thread_local const uint64_t tid = next_id.fetch_add(1, std::memory_order_relaxed);
+    return tid;
+#endif
+}
+
+std::string serialize_host_timing(uint64_t start_ns, uint64_t end_ns,
+                                  uint64_t start_tid, uint64_t end_tid) {
+    static const std::string epoch = std::to_string(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+#if defined(__linux__) || defined(__APPLE__)
+    const uint64_t pid = static_cast<uint64_t>(getpid());
+    const char * const thread_kind = "os_tid";
+#elif defined(_WIN32)
+    const uint64_t pid = static_cast<uint64_t>(GetCurrentProcessId());
+    const char * const thread_kind = "os_tid";
+#else
+    const uint64_t pid = 0;
+    const char * const thread_kind = "process_thread_token";
+#endif
+    const bool valid = start_tid != 0 && end_tid != 0 && end_ns >= start_ns;
+    return std::string("{\"execution_id\":\"") + std::to_string(pid) + "-" + epoch +
+        "\",\"clock\":\"steady_clock\",\"unit\":\"nanosecond\",\"thread_id_kind\":\"" +
+        thread_kind + "\",\"start_ns\":" + (start_tid != 0 ? std::to_string(start_ns) : "null") +
+        ",\"end_ns\":" + (end_tid != 0 ? std::to_string(end_ns) : "null") +
+        ",\"start_tid\":" + (start_tid != 0 ? std::to_string(start_tid) : "null") +
+        ",\"end_tid\":" + (end_tid != 0 ? std::to_string(end_tid) : "null") +
+        ",\"duration_ns\":" + (valid ? std::to_string(end_ns - start_ns) : "null") +
+        ",\"valid\":" + (valid ? "true}" : "false}");
+}
+
+}
 
 namespace ggml::gemmini::log
 {

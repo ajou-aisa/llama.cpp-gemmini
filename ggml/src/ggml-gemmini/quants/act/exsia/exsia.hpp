@@ -567,6 +567,8 @@ namespace ggml::gemmini::quants::act::exsia
         uint64_t end = 0;
         uint64_t start_ns = 0;
         uint64_t end_ns = 0;
+        uint64_t start_tid = 0;
+        uint64_t end_tid = 0;
         uint64_t start_thread_id = 0;
         uint64_t end_thread_id = 0;
 #if defined(__linux__) && defined(__aarch64__)

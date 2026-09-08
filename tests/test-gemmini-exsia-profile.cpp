@@ -1,11 +1,16 @@
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
 #include "../ggml/src/ggml-gemmini/quants/act/exsia/exsia.hpp"
+#include "../common/json.hpp"
 
 #include <ggml.h>
+#include <gemmini/host-timing.hpp>
 
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 
 namespace {
 
@@ -228,7 +233,7 @@ bool test_stage_sum_overflow_is_not_complete() {
     return true;
 }
 
-bool test_three_stripe_publication_and_worker_profiles() {
+bool test_three_stripe_publication_and_worker_profiles(const std::filesystem::path &detail_path) {
     constexpr size_t rows = 2 * DIM + 1;
     constexpr size_t columns = 32;
     std::vector<float> source(rows * columns, 0.5f);
@@ -265,11 +270,58 @@ bool test_three_stripe_publication_and_worker_profiles() {
                    "all supported modes publish real context across slot reuse")) return false;
         const auto &profiles = quantizer.state().profile_snapshot.stripes;
         if (!check(profiles.size() == 3, "all three stripe profiles survive publication")) return false;
+        std::ifstream input(detail_path);
+        std::vector<nlohmann::json> events;
+        for (std::string line; std::getline(input, line);) {
+            const auto event = nlohmann::json::parse(line);
+            if (event.at("record_type") == "TIMELINE" && event.at("run_id") == *meta.run_id)
+                events.push_back(event);
+        }
+        const auto &run = quantizer.state().profile_snapshot.run;
+        const auto check_timeline = [&](const ProfileInterval &interval, const char *op,
+                                        std::optional<size_t> stripe, std::optional<size_t> worker,
+                                        bool cross_task = false) {
+            const auto event = std::find_if(events.begin(), events.end(), [&](const auto &row) {
+                return row.at("op") == op &&
+                    (stripe ? row.at("stripe_id") == *stripe : row.at("stripe_id").is_null()) &&
+                    (worker ? row.at("worker_id") == *worker : row.at("worker_id").is_null());
+            });
+            if (!check(event != events.end() && event->contains("host_timing"),
+                       "each actual timeline event carries host timing")) return false;
+            const auto &host = event->at("host_timing");
+            return check(interval.start_ns >= run.start_ns && interval.end_ns <= run.end_ns &&
+                             interval.end_ns >= interval.start_ns &&
+                             interval.start_tid != 0 && interval.end_tid != 0,
+                         "captured host interval stays inside the run time axis") &&
+                check(host.at("start_ns") == interval.start_ns &&
+                          host.at("end_ns") == interval.end_ns &&
+                          host.at("start_tid") == interval.start_tid &&
+                          host.at("end_tid") == interval.end_tid &&
+                          host.at("duration_ns") == interval.end_ns - interval.start_ns &&
+                          host.at("valid") == true &&
+                          host.at("clock") == "steady_clock" && host.at("unit") == "nanosecond" &&
+                          host.contains("execution_id") && host.contains("thread_id_kind"),
+                      "delayed output preserves actual endpoint timestamps and worker identities") &&
+                check(!cross_task || (event->at("elapsed").is_null() &&
+                          event->at("cycle_status") == "structurally_cross_task"),
+                      "cross-task parent keeps valid host time without a numeric cycle delta");
+        };
+        if (!check_timeline(run, "exsia.run_total", {}, {})) return false;
         for (const auto &profile : profiles) {
+            const bool pipeline = mode == ExSIAState::ExecutionMode::LocalFoldingPipeline;
+            if (!check_timeline(profile.local, "exsia.local", profile.stripe_idx, {}, pipeline) ||
+                !check_timeline(profile.stripe_total, "exsia.stripe_total", profile.stripe_idx, {}, pipeline) ||
+                !check_timeline(profile.mask_assembly, "exsia.mask_assembly", profile.stripe_idx, {}) ||
+                !check_timeline(profile.exponent_reduction, "exsia.exponent_reduction", profile.stripe_idx, {}) ||
+                !check_timeline(profile.folding, "exsia.folding", profile.stripe_idx, {})) return false;
             if (mode == ExSIAState::ExecutionMode::Sequential) continue;
-            for (const auto &worker : profile.local_groups) {
-                if (!check(worker.valid && worker.start_thread_id == worker.end_thread_id,
-                           "each actual local task keeps a same-thread sample pair")) return false;
+            for (size_t index = 0; index < profile.local_groups.size(); ++index) {
+                const auto &worker = profile.local_groups[index];
+                if (!check(worker.valid && worker.start_thread_id == worker.end_thread_id &&
+                               worker.start_tid == worker.end_tid &&
+                               (worker.start_thread_id == 0 || worker.start_tid != run.start_tid),
+                           "local task records its executing thread, independent of the output thread") ||
+                    !check_timeline(worker, "exsia.local_group", profile.stripe_idx, index)) return false;
             }
             if (mode == ExSIAState::ExecutionMode::LocalFoldingPipeline &&
                 !check(!checked_profile_interval(profile.local, false).cycles.has_value() &&
@@ -282,14 +334,24 @@ bool test_three_stripe_publication_and_worker_profiles() {
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+    const std::filesystem::path detail_path = argc > 1 ? std::filesystem::path(argv[1]) :
+        std::filesystem::temp_directory_path() / ("gemmini-exsia-host-" +
+            std::to_string(ggml::gemmini::cycle::host_thread_id()) + "-" +
+            std::to_string(ggml::gemmini::cycle::timestamp_ns()) + ".jsonl");
+#if defined(_WIN32)
+    if (_putenv_s("GGML_GEMMINI_CYCLE_DETAIL_LOG", detail_path.string().c_str()) != 0) return 1;
+#else
+    if (setenv("GGML_GEMMINI_CYCLE_DETAIL_LOG", detail_path.string().c_str(), 1) != 0) return 1;
+#endif
     const bool ok = test_each_configured_worker_keeps_individual_provenance() &&
                     test_worker_failure_is_local_to_that_worker() &&
                     test_structural_eligibility_is_individual() &&
                     test_stage_aggregation_preserves_missing_and_invalid_samples() &&
                     test_stage_sum_overflow_is_not_complete() &&
                     test_full_origin_context_reset() &&
-                    test_three_stripe_publication_and_worker_profiles();
+                    test_three_stripe_publication_and_worker_profiles(detail_path);
+    if (ok && argc == 1) std::filesystem::remove(detail_path);
     if (ok) std::printf("PASS: ExSIA individual worker provenance workers=%zu\n",
                         EXSIA_LOCAL_WORKER_COUNT);
     return ok ? 0 : 1;

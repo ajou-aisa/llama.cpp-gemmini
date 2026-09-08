@@ -4,10 +4,6 @@
 
 #include <gemmini/log.hpp>
 #include <gemmini/cycle_reader.hpp>
-#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
-#include <gemmini/log.h>
-#include "../ggml-gemmini-utils/src/cycle_reader_internal.h"
-#endif
 
 #include <cstdio>
 #include <algorithm>
@@ -35,7 +31,8 @@ void emit_matmul_cpu_interval(const char * layer, const char * op,
             interval.reason.empty() ? nullptr : interval.reason.c_str(),
             interval.sample_reason.empty() ? nullptr : interval.sample_reason.c_str());
         const std::string metadata = std::string(",\"cpu_measurement_version\":1,\"operation_success\":") +
-            (operation_success ? "true" : "false") + ",\"additive\":false";
+            (operation_success ? "true" : "false") + ",\"additive\":false,\"host_timing\":" +
+            cycle::serialize_host_timing(start.ns, end.ns, start.tid, end.tid);
         json.insert(json.rfind('}'), metadata);
         log::cycle.write_json(json);
     } catch (...) {
@@ -47,12 +44,15 @@ void emit_matmul_cpu_interval(const char * layer, const char * op,
 #endif
 }
 
-#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
 void emit_matmul_native_interval(const char * layer, const char * op,
         const cycle::NativeCycleSample & start, const cycle::NativeCycleSample & end,
+        uint64_t start_ns, uint64_t end_ns, uint64_t start_tid, uint64_t end_tid,
         bool operation_success, const MatmulJobMetrics * profile = nullptr,
         std::optional<uint64_t> invocation_run_id = {}) noexcept {
-    emit_matmul_cpu_interval(layer, op, {start.value, true, start}, {end.value, true, end},
+    emit_matmul_cpu_interval(layer, op,
+                             {start.value, true, start, start_ns, start_tid},
+                             {end.value, true, end, end_ns, end_tid},
                              operation_success, profile, nullptr, invocation_run_id);
 }
 #endif
@@ -290,18 +290,6 @@ RmdTelemetryCheckResult compare_rmd_telemetry_proofs(
 #include <utility>
 
 namespace ggml::gemmini {
-
-#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
-namespace {
-gemmini_native_cycle_sample_internal project_native_sample(
-        const cycle::NativeCycleSample & sample) {
-    return {sample.value, static_cast<uint8_t>(sample.valid),
-            static_cast<uint8_t>(sample.reason),
-            GEMMINI_NATIVE_CYCLE_SOURCE_LINUX_PERF_CPU_CYCLES,
-            sample.owner_event_token, sample.generation};
-}
-}
-#endif
 
 namespace test_detail {
 #if defined(GGML_GEMMINI_TESTING)
@@ -1287,6 +1275,9 @@ void apply_captured_stripe(
     profile.producer_wait_start_ns = captured.timing.producer_wait_start_ns;
     profile.producer_wait_end_ns = captured.timing.producer_wait_end_ns;
     profile.capture_queue_enqueue_ns = captured.timing.queued_ns;
+    profile.capture_queue_dequeue_ns = captured.timing.dequeued_ns;
+    profile.queue_enqueue_tid = captured.timing.enqueue_tid;
+    profile.queue_dequeue_tid = captured.timing.dequeue_tid;
     profile.telemetry_queue_tick = captured.timing.telemetry_queued_tick;
     profile.sf_handoff.nanoseconds = captured.sf1_ns + profile.handoff.nanoseconds;
     profile.sf_handoff.count = 1;
@@ -1302,15 +1293,27 @@ PipelineStripeTelemetry pipeline_stripe_telemetry(
     record.row_begin = profile.row_begin;
     record.row_end = profile.row_end;
     record.queue_start_ns = profile.capture_queue_enqueue_ns;
-    record.queue_end_ns = profile.ws_start_ns;
+    record.queue_end_ns = profile.capture_queue_dequeue_ns;
+    record.queue_start_tid = profile.queue_enqueue_tid;
+    record.queue_end_tid = profile.queue_dequeue_tid;
     record.dense_start_ns = profile.ws_start_ns;
     record.dense_end_ns = profile.ws_end_ns;
+    record.dense_start_tid = profile.ws_start_tid;
+    record.dense_end_tid = profile.ws_end_tid;
     record.rmd_start_ns = profile.rmd_start_ns;
     record.rmd_end_ns = profile.rmd_end_ns;
+    record.residual_backend_start_ns = profile.backend_start_ns;
+    record.residual_backend_end_ns = profile.backend_end_ns;
+    record.residual_backend_start_tid = profile.backend_start_tid;
+    record.residual_backend_end_tid = profile.backend_end_tid;
     record.compose_start_ns = profile.compose_start_ns;
     record.compose_end_ns = profile.compose_end_ns;
+    record.compose_start_tid = profile.compose_start_tid;
+    record.compose_end_tid = profile.compose_end_tid;
     record.finalize_start_ns = profile.finalize_start_ns;
     record.finalize_end_ns = profile.finalize_end_ns;
+    record.finalize_start_tid = profile.finalize_start_tid;
+    record.finalize_end_tid = profile.finalize_end_tid;
     return record;
 }
 
@@ -1414,8 +1417,10 @@ MatMulStatus MatMul::begin_output_transaction() {
 
 void MatMul::commit_output_transaction() {
     if (output_destination_ == nullptr || args_ptr_ == nullptr) return;
-#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
     const cycle::NativeCycleSample commit_start_sample = cycle::read_sample();
+    const uint64_t commit_start_ns = cycle::timestamp_ns();
+    const uint64_t commit_start_tid = cycle::host_thread_id();
 #endif
     for (size_t row = 0; row < args().I; ++row) {
         for (size_t column = 0; column < args().J; ++column) {
@@ -1423,20 +1428,14 @@ void MatMul::commit_output_transaction() {
             output_destination_[offset] = output_stage_[offset];
         }
     }
-#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
     const cycle::NativeCycleSample commit_end_sample = cycle::read_sample();
-    const gemmini_native_cycle_sample_internal commit_start =
-        project_native_sample(commit_start_sample);
-    const gemmini_native_cycle_sample_internal commit_end =
-        project_native_sample(commit_end_sample);
-    const auto run_id = matmul_cpu_run_id(args());
-    const gemmini_cycle_record_v2 commit_detail{{
-        args().matmul_layer.empty() ? nullptr : args().matmul_layer.c_str(),
-        "matmul_output_commit_cycles", commit_start.value, commit_end.value,
-        nullptr, 0, nullptr}, static_cast<uint32_t>(run_id.has_value() ? GEMMINI_CYCLE_HAS_RUN_ID : 0),
-        run_id.value_or(0), 0, 0, 0, 0};
-    gemmini_log_cycle_record_v2_checked_internal(
-        &commit_detail, &commit_start, &commit_end, true);
+    const uint64_t commit_end_ns = cycle::timestamp_ns();
+    const uint64_t commit_end_tid = cycle::host_thread_id();
+    emit_matmul_native_interval(args().matmul_layer.c_str(), "matmul_output_commit_cycles",
+        commit_start_sample, commit_end_sample,
+        commit_start_ns, commit_end_ns, commit_start_tid, commit_end_tid,
+        true, nullptr, matmul_cpu_run_id(args()));
 #endif
     args().f_out = output_destination_;
     output_destination_ = nullptr;
@@ -1589,15 +1588,21 @@ MatMulResult MatMul::run_full() {
                     return status;
                 })();
             if (residual_status == rmd::RmdStatus::success) {
-#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
                 const cycle::NativeCycleSample merge_start_sample = cycle::read_sample();
+                const uint64_t merge_start_ns = cycle::timestamp_ns();
+                const uint64_t merge_start_tid = cycle::host_thread_id();
 #endif
                 residual_status = rmd::merge_rmd_correction(
                     args(), payload->row_begin, row_end, correction);
-#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
                 const cycle::NativeCycleSample merge_end_sample = cycle::read_sample();
+                const uint64_t merge_end_ns = cycle::timestamp_ns();
+                const uint64_t merge_end_tid = cycle::host_thread_id();
                 emit_matmul_native_interval(args().matmul_layer.c_str(), "rmd_merge_cycles",
-                    merge_start_sample, merge_end_sample, residual_status == rmd::RmdStatus::success,
+                    merge_start_sample, merge_end_sample,
+                    merge_start_ns, merge_end_ns, merge_start_tid, merge_end_tid,
+                    residual_status == rmd::RmdStatus::success,
                     nullptr, run_id);
 #endif
             }
@@ -2349,6 +2354,10 @@ void MatmulStripeCollector::worker_loop() {
                 execution = execution_;
                 captured = std::move(pending_.front());
                 pending_.pop_front();
+                captured.timing.dequeued_ns = now_ns();
+#if LOG_CYCLE
+                captured.timing.dequeue_tid = cycle::host_thread_id();
+#endif
                 ++in_flight_;
                 condition_.notify_all();
             }
@@ -2401,12 +2410,11 @@ void MatmulStripeCollector::worker_loop() {
 
             {
                 std::lock_guard<std::mutex> job_lock(*job->job_mutex_);
-                job->metrics_.ws_start_ns = now_ns();
                 job->rmd_queued_ns_ = captured.timing.queued_ns;
                 job->metrics_.rmd_enqueue_ns = captured.timing.queued_ns;
                 if (job->execution_->options_.profiling) {
                     job->metrics_.ws_queue.nanoseconds =
-                        job->metrics_.ws_start_ns - captured.timing.queued_ns;
+                        captured.timing.dequeued_ns - captured.timing.queued_ns;
                     job->metrics_.ws_queue.count = 1;
                 }
             }
@@ -2610,6 +2618,7 @@ bool MatmulStripeCollector::on_ready(
             record_metric(collector.pending_.back().timing.queue_insert, true, insert_start);
             collector.pending_.back().timing.queued_ns = now_ns();
 #if LOG_CYCLE
+            collector.pending_.back().timing.enqueue_tid = cycle::host_thread_id();
             collector.pending_.back().timing.telemetry_queued_tick = cycle::read();
 #endif
             lock.unlock();
@@ -2629,6 +2638,7 @@ bool MatmulStripeCollector::on_ready(
         record_metric(collector.stripes_.back().timing.queue_insert, true, insert_start);
         collector.stripes_.back().timing.queued_ns = now_ns();
 #if LOG_CYCLE
+        collector.stripes_.back().timing.enqueue_tid = cycle::host_thread_id();
         collector.stripes_.back().timing.telemetry_queued_tick = cycle::read();
 #endif
     } catch (const std::bad_alloc &) {
@@ -2981,19 +2991,22 @@ MatmulStatus execute_dense_stripe(MatmulStripeJob & job) {
               {job.input_.row_begin(), job.input_.row_end()},
               job.input_.stripe_id());
     const auto dense_end = read_matmul_cpu_sample();
+    {
+        std::lock_guard<std::mutex> lock(*job.job_mutex_);
+        job.metrics_.ws_start_ns = dense_start.ns;
+        job.metrics_.ws_end_ns = dense_end.ns;
+        job.metrics_.ws_start_tid = dense_start.tid;
+        job.metrics_.ws_end_tid = dense_end.tid;
+        job.metrics_.telemetry_dense_start = dense_start.value;
+        job.metrics_.telemetry_dense_end = dense_end.value;
+        job.metrics_.cpu_dense = evaluate_matmul_cpu_interval(dense_start, dense_end);
+    }
     emit_matmul_cpu_interval(job.execution_->facade_.args().matmul_layer.c_str(),
         "dense_backend_host_call", dense_start, dense_end,
         status == MatMulStatus::success, &job.metrics_);
     const MatmulStatus dense_status = to_public_status(
         status, status == MatMulStatus::unsupported ? MatMulCapability::unsupported : MatMulCapability::supported,
         &job.execution_->facade_.args());
-    {
-        std::lock_guard<std::mutex> lock(*job.job_mutex_);
-        job.metrics_.ws_end_ns = now_ns();
-        job.metrics_.telemetry_dense_start = dense_start.value;
-        job.metrics_.telemetry_dense_end = dense_end.value;
-        job.metrics_.cpu_dense = evaluate_matmul_cpu_interval(dense_start, dense_end);
-    }
     if (!dense_status) {
         job.record_failure(dense_status, true);
         return dense_status;
@@ -3119,6 +3132,10 @@ MatmulStatus execute_rmd_stripe(MatmulStripeJob & job) {
         job.metrics_.telemetry_residual_start = residual_start.value;
         job.metrics_.telemetry_backend_start = backend_start.value;
         job.metrics_.telemetry_backend_end = backend_end.value;
+        job.metrics_.backend_start_ns = backend_start.ns;
+        job.metrics_.backend_end_ns = backend_end.ns;
+        job.metrics_.backend_start_tid = backend_start.tid;
+        job.metrics_.backend_end_tid = backend_end.tid;
     }
     emit_matmul_cpu_interval(job.execution_->facade_.args().matmul_layer.c_str(),
         "residual_backend_host_call", backend_start, backend_end,
@@ -3164,18 +3181,30 @@ MatmulStatus compose_rmd_stripe(MatmulStripeJob & job) {
     const auto read_start = Clock::now();
     {
         std::lock_guard<std::mutex> lock(*job.job_mutex_);
-#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
         job.metrics_.telemetry_compose_start_sample = cycle::read_sample();
 #endif
         job.metrics_.compose_start_ns = now_ns();
+#if LOG_CYCLE
+        job.metrics_.compose_start_tid = cycle::host_thread_id();
+#endif
     }
     rmd::Correction correction = rmd::BlockScaledInt64Correction{};
     const rmd::RmdStatus status = rmd::compose_rmd_output(*packet, job.rmd_output_, correction);
-#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
     job.metrics_.telemetry_compose_end_sample = cycle::read_sample();
+#endif
+    const uint64_t compose_end_ns = now_ns();
+#if LOG_CYCLE
+    const uint64_t compose_end_tid = cycle::host_thread_id();
+#endif
+#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
     emit_matmul_native_interval(job.execution_->facade_.args().matmul_layer.c_str(),
         "rmd_packet_compose_cycles", job.metrics_.telemetry_compose_start_sample,
-        job.metrics_.telemetry_compose_end_sample, status == rmd::RmdStatus::success,
+        job.metrics_.telemetry_compose_end_sample,
+        job.metrics_.compose_start_ns, compose_end_ns,
+        job.metrics_.compose_start_tid, compose_end_tid,
+        status == rmd::RmdStatus::success,
         &job.metrics_);
 #endif
     if (status != rmd::RmdStatus::success) {
@@ -3191,9 +3220,12 @@ MatmulStatus compose_rmd_stripe(MatmulStripeJob & job) {
         job.rmd_correction_ = std::move(correction);
         record_metric(job.metrics_.rmd_compose, job.execution_->options_.profiling, read_start);
         job.metrics_.rmd_output_read = job.metrics_.rmd_compose;
-        job.metrics_.compose_end_ns = now_ns();
+        job.metrics_.compose_end_ns = compose_end_ns;
+#if LOG_CYCLE
+        job.metrics_.compose_end_tid = compose_end_tid;
+#endif
         job.residual_state_ = MatmulResidualState::complete;
-        job.metrics_.rmd_end_ns = job.metrics_.compose_end_ns;
+        job.metrics_.rmd_end_ns = now_ns();
     }
     job.lifecycle_condition_.notify_all();
     return {};
@@ -3224,15 +3256,17 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
         completion_context.slot = job.metrics_.slot;
         layer = job.execution_->facade_.args().matmul_layer;
         job.finalized_ = true;
-#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
         job.metrics_.telemetry_finalize_start_sample = cycle::read_sample();
 #endif
         job.metrics_.finalize_start_ns = now_ns();
+#if LOG_CYCLE
+        job.metrics_.finalize_start_tid = cycle::host_thread_id();
+#endif
         job.metrics_.stripe_id = job.input_.stripe_id();
         job.metrics_.row_begin = job.input_.row_begin();
         job.metrics_.row_end = job.input_.row_end();
         if (!rmd::correction_empty(job.rmd_correction_)) {
-            job.metrics_.merge_start_ns = now_ns();
             merged = true;
             merge_start = read_matmul_cpu_sample();
             const rmd::RmdStatus status = job.direct_residual_ != nullptr
@@ -3243,7 +3277,8 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
                       job.execution_->facade_.args(), *job.rmd_packet_,
                       job.rmd_correction_);
             merge_end = read_matmul_cpu_sample();
-            job.metrics_.merge_end_ns = now_ns();
+            job.metrics_.merge_start_ns = merge_start.ns;
+            job.metrics_.merge_end_ns = merge_end.ns;
             job.metrics_.telemetry_merge_start = merge_start.value;
             job.metrics_.telemetry_merge_end = merge_end.value;
             job.metrics_.telemetry_residual_end = merge_end.value;
@@ -3284,13 +3319,21 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
         }
         record_metric(job.metrics_.rmd_finalize, job.execution_->options_.profiling, start);
         job.metrics_.finalize_end_ns = now_ns();
-#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
         job.metrics_.telemetry_finalize_end_sample = cycle::read_sample();
+#endif
+#if LOG_CYCLE
+        job.metrics_.finalize_end_tid = cycle::host_thread_id();
+#endif
+#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
         emit_matmul_native_interval(layer.c_str(),
             job.direct_residual_ != nullptr ? "rmd_cpu_direct_finalize_cycles" :
                 (job.rmd_packet_ != nullptr ? "rmd_packet_finalize_cycles" : "dense_finalize_cycles"),
             job.metrics_.telemetry_finalize_start_sample,
-            job.metrics_.telemetry_finalize_end_sample, merge_failure.ok(), &completion_context);
+            job.metrics_.telemetry_finalize_end_sample,
+            job.metrics_.finalize_start_ns, job.metrics_.finalize_end_ns,
+            job.metrics_.finalize_start_tid, job.metrics_.finalize_end_tid,
+            merge_failure.ok(), &completion_context);
 #endif
     }
     // Publish children after the legacy inclusive end, without summing nested work.

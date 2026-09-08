@@ -120,7 +120,10 @@ bool reducer_validity_regression() {
         "fixture", "fixture", "test.layer", 17, {}, {profile});
     const auto json = serialize_rmd_telemetry(record);
 #if LOG_CYCLE
-    bool ok = expect(json.find("\"backend_service\":null") != std::string::npos &&
+    const auto host_sample = read_matmul_cpu_sample();
+    bool ok = expect(host_sample.collected && host_sample.ns > 0 && host_sample.tid > 0,
+                     "host time and executing thread are collected independently of PMU validity") &&
+              expect(json.find("\"backend_service\":null") != std::string::npos &&
                      json.find("\"backend_service_reason\":\"not_collected\"") != std::string::npos,
                      "reducer must not turn missing CPU samples into measured cycles");
     auto reduce = [&](const std::vector<MatmulJobMetrics> & profiles) {
@@ -223,7 +226,8 @@ bool reducer_validity_regression() {
 #else
     cycle::reset_read_count_for_test();
     const auto disabled = read_matmul_cpu_sample();
-    return expect(json.empty() && !disabled.collected && cycle::read_count_for_test() == 0,
+    return expect(json.empty() && !disabled.collected && disabled.ns == 0 && disabled.tid == 0 &&
+                  cycle::read_count_for_test() == 0,
                   "OFF suppresses CPU sampling and reducer serialization");
 #endif
 }
@@ -376,18 +380,31 @@ bool aggregate_serializer_fixtures() {
     pipeline.layer = "ffn"; pipeline.run_id = 7; pipeline.stripe_id = 2;
     pipeline.slot = 1; pipeline.row_begin = 80; pipeline.row_end = 160;
     pipeline.queue_start_ns = 10; pipeline.queue_end_ns = 12;
+    pipeline.queue_start_tid = 51; pipeline.queue_end_tid = 61;
     pipeline.dense_start_ns = 12; pipeline.dense_end_ns = 30;
+    pipeline.dense_start_tid = 61; pipeline.dense_end_tid = 61;
     pipeline.rmd_start_ns = 30; pipeline.rmd_end_ns = 40;
+    pipeline.residual_backend_start_ns = 32; pipeline.residual_backend_end_ns = 38;
+    pipeline.residual_backend_start_tid = 61; pipeline.residual_backend_end_tid = 61;
     pipeline.compose_start_ns = 40; pipeline.compose_end_ns = 44;
+    pipeline.compose_start_tid = 61; pipeline.compose_end_tid = 61;
     pipeline.finalize_start_ns = 44; pipeline.finalize_end_ns = 48;
+    pipeline.finalize_start_tid = 61; pipeline.finalize_end_tid = 61;
     const std::string pipeline_json = serialize_cycle_telemetry(pipeline);
     const std::string expected_pipeline =
         "{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"PIPELINE_STRIPE_SUMMARY\","
         "\"source\":\"steady_clock\",\"unit\":\"nanosecond\",\"op\":\"matmul.pipeline\","
         "\"layer\":\"ffn\",\"run_id\":7,\"stripe_id\":2,\"slot\":1,\"node_id\":null,\"worker_id\":null,"
         "\"row_begin\":80,\"row_end\":160,\"queue_start_ns\":10,\"queue_end_ns\":12,\"dense_start_ns\":12,\"dense_end_ns\":30,"
-        "\"rmd_start_ns\":30,\"rmd_end_ns\":40,\"compose_start_ns\":40,\"compose_end_ns\":44,"
-        "\"finalize_start_ns\":44,\"finalize_end_ns\":48,\"valid\":true}";
+        "\"rmd_start_ns\":30,\"rmd_end_ns\":40,"
+        "\"residual_backend_start_ns\":32,\"residual_backend_end_ns\":38,"
+        "\"compose_start_ns\":40,\"compose_end_ns\":44,"
+        "\"finalize_start_ns\":44,\"finalize_end_ns\":48,\"host_stages\":{\"queue\":" +
+        cycle::serialize_host_timing(10, 12, 51, 61) + ",\"dense\":" +
+        cycle::serialize_host_timing(12, 30, 61, 61) + ",\"residual_backend\":" +
+        cycle::serialize_host_timing(32, 38, 61, 61) + ",\"compose\":" +
+        cycle::serialize_host_timing(40, 44, 61, 61) + ",\"finalize\":" +
+        cycle::serialize_host_timing(44, 48, 61, 61) + "},\"valid\":true}";
 
     if (std::getenv("GEMMINI_TELEMETRY_PRINT_ALL") != nullptr) {
         std::printf("%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n", interval_json.c_str(), ws_json.c_str(),

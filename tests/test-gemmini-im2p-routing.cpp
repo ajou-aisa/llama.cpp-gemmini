@@ -61,9 +61,12 @@ int main() {
        occurrences("\"slot\":1") == 2 &&
        occurrences("\"operation_success\":true") == 2 &&
        occurrences("\"operation_success\":false") == 1 &&
-       occurrences("\"additive\":false") == 3;
+       occurrences("\"additive\":false") == 3 &&
+       occurrences("\"host_timing\":{") == 3 &&
+       occurrences("\"start_tid\":" + std::to_string(cycle::host_thread_id())) == 3 &&
+       occurrences("\"end_tid\":" + std::to_string(cycle::host_thread_id())) == 3;
 #if !defined(__linux__) || !defined(__aarch64__)
-  ok = ok && copy_reads == 2;
+  ok = ok && copy_reads == 4;
 #endif
 #else
   ok = ok && json.empty() && copy_reads == 0;

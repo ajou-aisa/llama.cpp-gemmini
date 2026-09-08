@@ -73,44 +73,33 @@ endfunction()
 
 function(require_run_only_checked_pair value operation target label)
     require_count("${value}" "cycle::read_sample()" 2 "${label} native endpoints")
-    require_count("${value}" "gemmini_log_cycle_record_v2_checked_internal" 1
+    require_count("${value}" "emit_matmul_native_interval" 1
         "${label} checked publication")
     require_count("${value}" "\"${operation}\"" 1 "${label} operation label")
     require_order("${value}" "${label} exact boundary"
-        "cycle::read_sample()" "${target}" "const gemmini_cycle_record_v2"
-        "gemmini_log_cycle_record_v2_checked_internal")
-    foreach(token IN ITEMS "args().matmul_layer.empty()" "args().matmul_layer.c_str()"
-                           "matmul_cpu_run_id(args())" "run_id.has_value()"
-                           "run_id.value_or(0), 0, 0, 0, 0}" ", true);")
+        "cycle::read_sample()" "${target}" "commit_end_sample = cycle::read_sample()"
+        "emit_matmul_native_interval")
+    foreach(token IN ITEMS "args().matmul_layer.c_str()" "matmul_cpu_run_id(args())"
+                           "commit_start_sample, commit_end_sample"
+                           "commit_start_ns, commit_end_ns, commit_start_tid, commit_end_tid"
+                           "true, nullptr, matmul_cpu_run_id(args())")
         require_token("${value}" "${token}" "${label} publication contract")
     endforeach()
     foreach(token IN ITEMS GEMMINI_CYCLE_HAS_STRIPE_ID
                            GEMMINI_CYCLE_HAS_SLOT GEMMINI_CYCLE_HAS_NODE_ID
                            GEMMINI_CYCLE_HAS_WORKER_ID stripe_id worker_id
-                           "cycle::read()" now_ns timestamp_ns)
+                           "cycle::read()" "gemmini_log_cycle_record_v2_checked_internal")
         require_absent("${value}" "${token}" "${label} synthetic identity/domain")
     endforeach()
 endfunction()
 
-function(require_cycle_only_detail_blocks value label)
-    set(rest "${value}")
-    while(1)
-        string(FIND "${rest}" "#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)" begin)
-        if(begin EQUAL -1)
-            break()
-        endif()
-        string(SUBSTRING "${rest}" ${begin} -1 tail)
-        string(FIND "${tail}" "#endif" end)
-        if(end EQUAL -1)
-            message(FATAL_ERROR "${label}: unterminated Linux-AArch64 detail block")
-        endif()
-        string(SUBSTRING "${tail}" 0 ${end} block)
-        if(block MATCHES "now_ns\\(|timestamp_ns\\(")
-            message(FATAL_ERROR "${label}: Linux-AArch64 detail block must be cycle-only")
-        endif()
-        math(EXPR next "${end} + 6")
-        string(SUBSTRING "${tail}" ${next} -1 rest)
-    endwhile()
+function(require_native_detail_gate value label)
+    require_token("${value}"
+        "#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)"
+        "${label} native reads require enabled detail collection")
+    require_absent("${value}"
+        "#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)"
+        "${label} OFF cannot bypass the collection gate")
 endfunction()
 
 extract_between(commit "void MatMul::commit_output_transaction" "void MatMul::discard_output_transaction")
@@ -190,10 +179,13 @@ require_run_only_checked_pair("${commit}" "matmul_output_commit_cycles"
 require_order("${commit}" "U16 success-only commit boundary"
     "if (output_destination_ == nullptr || args_ptr_ == nullptr) return"
     "commit_start_sample = cycle::read_sample()"
+    "commit_start_ns = cycle::timestamp_ns()" "commit_start_tid = cycle::host_thread_id()"
     "for (size_t row = 0; row < args().I; ++row)"
     "commit_end_sample = cycle::read_sample()"
-    "gemmini_log_cycle_record_v2_checked_internal"
+    "commit_end_ns = cycle::timestamp_ns()" "commit_end_tid = cycle::host_thread_id()"
+    "emit_matmul_native_interval"
     "args().f_out = output_destination_")
+require_native_detail_gate("${commit}" "U16")
 require_count("${source}" "\"rmd_merge_cycles\"" 1 "exact U12 label/site count")
 require_count("${source}" "\"matmul_output_commit_cycles\"" 1
     "exact U16 label/site count")
@@ -213,7 +205,16 @@ require_order("${compose}" "Compose detail boundary"
 require_absent("${compose}" "compose_cpu_work" "Compose is standalone, not canonical CPU work")
 require_absent("${compose}" "CpuWorkCoverage" "Compose has no coverage framework")
 require_checked_publication("${compose}" "compose" "status == rmd::RmdStatus::success" "Compose")
-require_cycle_only_detail_blocks("${compose}" "Compose")
+require_order("${compose}" "Compose captures host endpoints before publication"
+    "compose_start_ns = now_ns()" "compose_start_tid = cycle::host_thread_id()"
+    "rmd::compose_rmd_output" "compose_end_ns = now_ns()"
+    "compose_end_tid = cycle::host_thread_id()" "emit_matmul_native_interval"
+    "job.metrics_.compose_end_ns = compose_end_ns")
+require_token("${compose}" "job.metrics_.compose_start_ns, compose_end_ns"
+    "Compose publishes captured host ns")
+require_token("${compose}" "job.metrics_.compose_start_tid, compose_end_tid"
+    "Compose publishes executing thread identity")
+require_native_detail_gate("${compose}" "Compose")
 
 # Keep one legacy inclusive Finalize pair. Its checked children are never
 # added to or subtracted from their inclusive parent.
@@ -244,7 +245,15 @@ endif()
 require_absent("${finalize}" "telemetry_residual_end_sample = cycle::read_sample()"
     "Finalize has no third residual-total endpoint")
 require_checked_publication("${finalize}" "finalize" "merge_failure.ok()" "Finalize")
-require_cycle_only_detail_blocks("${finalize}" "Finalize")
+require_order("${finalize}" "Finalize captures host endpoints before publication"
+    "finalize_start_ns = now_ns()" "finalize_start_tid = cycle::host_thread_id()"
+    "merge_start = read_matmul_cpu_sample()" "finalize_end_ns = now_ns()"
+    "finalize_end_tid = cycle::host_thread_id()" "emit_matmul_native_interval")
+require_token("${finalize}" "job.metrics_.finalize_start_ns, job.metrics_.finalize_end_ns"
+    "Finalize publishes captured host ns")
+require_token("${finalize}" "job.metrics_.finalize_start_tid, job.metrics_.finalize_end_tid"
+    "Finalize publishes executing thread identity")
+require_native_detail_gate("${finalize}" "Finalize")
 
 extract_between(dense "MatmulStatus execute_dense_stripe" "MatmulStatus accept_external_dense_completion")
 extract_between(external "MatmulStatus accept_external_dense_completion" "MatmulStatus execute_rmd_stripe")
@@ -255,6 +264,16 @@ require_order("${dense}" "Dense samples exactly its facade host call"
     "dense_start = read_matmul_cpu_sample()" "facade_.run_staged_stripe"
     "dense_end = read_matmul_cpu_sample()" "to_public_status")
 require_count("${dense}" "read_matmul_cpu_sample()" 2 "matching Dense gates")
+foreach(endpoint IN ITEMS start end)
+    require_token("${dense}" "job.metrics_.ws_${endpoint}_ns = dense_${endpoint}.ns"
+        "Dense summary reuses exact host call ${endpoint}")
+    require_token("${dense}" "job.metrics_.ws_${endpoint}_tid = dense_${endpoint}.tid"
+        "Dense summary reuses executing thread ${endpoint}")
+    require_token("${residual}" "job.metrics_.backend_${endpoint}_ns = backend_${endpoint}.ns"
+        "Residual summary reuses exact backend ${endpoint}")
+    require_token("${residual}" "job.metrics_.backend_${endpoint}_tid = backend_${endpoint}.tid"
+        "Residual summary reuses executing thread ${endpoint}")
+endforeach()
 require_absent("${dense}" "#if CYCLE_DETAIL" "Dense SUMMARY collects both endpoints")
 require_absent("${external}" "cycle::read()" "external completion is unmeasured")
 require_token("${external}" "unavailable(\"external_completion\")" "external marker status")
@@ -266,8 +285,12 @@ require_order("${capture}" "input capture samples metadata/handle acquisition"
     "capture_start = read_matmul_cpu_sample()" "detail::capture_collector_event"
     "capture_end = read_matmul_cpu_sample()" "record_metric(captured.timing.capture_copy")
 require_order("${worker}" "worker job preparation has its own same-thread pair"
+    "pending_.pop_front()" "captured.timing.dequeued_ns = now_ns()"
+    "captured.timing.dequeue_tid = cycle::host_thread_id()"
     "preparation_start = read_matmul_cpu_sample()" "std::make_shared<MatmulStripeJob>"
     "std::make_unique<quants::act::Meta>" "preparation_end = read_matmul_cpu_sample()")
+require_token("${source}" "record.queue_end_ns = profile.capture_queue_dequeue_ns"
+    "queue summary ends at actual dequeue")
 foreach(pair IN ITEMS compose merge)
     require_token("${run_full}" "${pair}_start = read_matmul_cpu_sample()" "FULL packet ${pair} start")
     require_token("${run_full}" "${pair}_end = read_matmul_cpu_sample()" "FULL packet ${pair} end")
@@ -283,6 +306,10 @@ file(READ "${gemmini_source_dir}/ggml-gemmini-matmul.hpp" header)
 require_order("${header}" "reader collection gate"
     "inline MatmulCpuSample read_matmul_cpu_sample()" "#if LOG_CYCLE"
     "result.collected = true" "result.native = cycle::read_sample()")
+require_order("${header}" "host reader is independent of native validity"
+    "inline MatmulCpuSample read_matmul_cpu_sample()" "#if LOG_CYCLE"
+    "result.ns = cycle::timestamp_ns()" "result.tid = cycle::host_thread_id()"
+    "return result")
 # Presence is independent of scalar zero; the actual production projection is
 # exercised through the provider-free reducer target as well.
 file(READ "${gemmini_source_dir}/ggml-gemmini-telemetry.cpp" telemetry)
@@ -299,6 +326,12 @@ require_token("${finish_stripes}" "matmul_cpu_run_id(args())" "output finish met
 extract_between(emitter "void emit_matmul_cpu_interval" "void emit_matmul_native_interval")
 require_order("${emitter}" "nonthrowing CPU telemetry boundary"
     "noexcept" "try {" "project_matmul_cpu_identity"
-    "serialize_checked_cycle_record" "log::cycle.write_json" "catch (...)"
+    "serialize_checked_cycle_record" "cycle::serialize_host_timing(start.ns, end.ns, start.tid, end.tid)"
+    "log::cycle.write_json" "catch (...)"
     "log::cycle.report_failure")
+extract_between(native_adapter "void emit_matmul_native_interval" "class ProofHash64")
+require_token("${native_adapter}" "{start.value, true, start, start_ns, start_tid}"
+    "native adapter preserves CPU sample and host start independently")
+require_token("${native_adapter}" "{end.value, true, end, end_ns, end_tid}"
+    "native adapter preserves CPU sample and host end independently")
 message(STATUS "checked CPU validity, identity presence, and lifecycle boundaries passed")
