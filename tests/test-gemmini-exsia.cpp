@@ -6,9 +6,12 @@
 #include "../ggml/src/ggml-gemmini/quants/act/stripe/stripe.hpp"
 #include "../ggml/src/ggml-gemmini/quants/act/stripe/types.hpp"
 #include "../ggml/src/ggml-gemmini/quants/act/token/types.hpp"
+#include "../ggml/src/ggml-gemmini/quants/act/tensor/tensor.hpp"
+#include "../ggml/src/ggml-gemmini/quants/act/token/token.hpp"
 #include "../ggml/src/ggml-gemmini/quants/common/weight_reader.hpp"
 
 #include <ggml.h>
+#include <gemmini/log.hpp>
 #ifndef GEMMINI_EXSIA_WRITER_TEST_ONLY
 #include "../ggml/src/ggml-gemmini/residual/direct/direct-builder.hpp"
 #include "../ggml/src/ggml-gemmini/residual/direct/direct-executor.hpp"
@@ -61,6 +64,76 @@ bool test_meta_rho_invariant() {
         check(meta.rho == config::GGML_GEMMINI_ACTIVATION_RHO,
               "ExSIA metadata reset restores width-native rho") &&
         check(meta.theta.empty(), "ExSIA metadata reset clears theta");
+}
+
+bool test_non_exsia_capture_context() {
+#if GGML_GEMMINI_ENABLE_RMD
+    struct Quantizer {
+        const char * layer;
+        bool (*run)(const ggml_tensor *, ggml_gemmini_args_t &);
+    };
+    const Quantizer quantizers[] = {
+        {"capture.tensor", [](const ggml_tensor *src, ggml_gemmini_args_t &args) {
+            args.act_quant.storage().emplace<quants::act::tensor::Meta>();
+            return quants::act::tensor::quantize(src, args);
+        }},
+        {"capture.token", [](const ggml_tensor *src, ggml_gemmini_args_t &args) {
+            args.act_quant.storage().emplace<quants::act::token::Meta>();
+            return quants::act::token::quantize(src, args);
+        }},
+        {"capture.stripe", [](const ggml_tensor *src, ggml_gemmini_args_t &args) {
+            args.act_quant.storage().emplace<quants::act::stripe::Meta>();
+            return quants::act::stripe::quantize(src, args);
+        }},
+    };
+    std::array<float, 32> values;
+    values.fill(1.0f);
+    values[0] = 8.0f;
+    ggml_tensor tensor{};
+    tensor.type = GGML_TYPE_F32;
+    tensor.data = values.data();
+    for (const auto &quantizer : quantizers) {
+        for (const auto route : {residual::ResidualRoute::cpu_direct,
+                                 residual::ResidualRoute::ws_packet}) {
+            ggml_gemmini_args_t args{};
+            args.I = 1; args.J = 17; args.K = values.size(); args.sA = values.size();
+            args.tile_I = 1; args.tile_J = 1; args.tile_K = 1;
+            args.activation_rows_per_stripe = DIM;
+            args.matmul_layer = quantizer.layer;
+            args.residual_route = route;
+            if (!args.A.allocate(args.I, args.K, GGML_GEMMINI_ACTIVATION_BITS))
+                return false;
+#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+            FILE *output = std::tmpfile();
+            if (!check(output != nullptr, "quantizer capture sink opens")) return false;
+            log::cycle.set_output(output);
+#endif
+            const bool quantized = quantizer.run(&tensor, args);
+            const bool direct = route == residual::ResidualRoute::cpu_direct;
+            bool ok = check(quantized &&
+                quants::act::direct_residuals(args).size() == (direct ? 1U : 0U) &&
+                quants::act::rmd_packets(args).size() == (direct ? 0U : 1U),
+                "real quantizer reaches exactly one nonempty builder finish");
+#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+            log::cycle.set_output(stderr);
+            std::rewind(output);
+            char buffer[4096];
+            const bool read = std::fgets(buffer, sizeof(buffer), output) != nullptr;
+            const std::string record = read ? buffer : "";
+            const bool extra = std::fgets(buffer, sizeof(buffer), output) != nullptr;
+            std::fclose(output);
+            const char *op = direct ? "rmd_direct_finish_cycles" : "rmd_packet_finish_cycles";
+            ok = check(read && !extra &&
+                record.find(std::string("\"op\":\"") + op + "\"") != std::string::npos &&
+                record.find(std::string("\"layer\":\"") + quantizer.layer + "\"") != std::string::npos &&
+                record.find("\"run_id\":null") != std::string::npos,
+                "actual quantizer finish preserves layer without inventing a run") && ok;
+#endif
+            if (!ok) return false;
+        }
+    }
+#endif
+    return true;
 }
 
 bool test_non_outlier_clipping_policy() {
@@ -2383,7 +2456,8 @@ int main(int argc, char ** argv) {
         case_name == "hp1-srmd-software-ws" ||
         case_name == "rmd-direct-parity" || case_name == "direct-executor" ||
         case_name == "rmd-gather" || case_name == "stripe-geometry" ||
-        case_name == "meta-rho" || case_name == "non-outlier-clipping";
+        case_name == "meta-rho" || case_name == "non-outlier-clipping" ||
+        case_name == "non-exsia-capture-context";
     if (!known) {
         std::fprintf(stderr, "unknown case: %s\n", case_name.c_str());
         return 2;
@@ -2391,7 +2465,7 @@ int main(int argc, char ** argv) {
 
     std::printf("TEST_CASE_BEGIN name=%s\n", case_name.c_str());
     const bool ok =
-        (case_name == "all" && test_meta_rho_invariant() &&
+        (case_name == "all" && test_meta_rho_invariant() && test_non_exsia_capture_context() &&
          test_non_outlier_clipping_policy() &&
          test_exsia_baseline() && test_dispatch_modes() &&
          test_compiled_width_rmd_suite() && test_direct_cpu_executor() &&
@@ -2409,6 +2483,7 @@ int main(int argc, char ** argv) {
         (case_name == "stripe-geometry" && test_activation_stripe_geometry_contract() &&
          test_cpu_direct_residual_dequantization()) ||
         (case_name == "meta-rho" && test_meta_rho_invariant()) ||
+        (case_name == "non-exsia-capture-context" && test_non_exsia_capture_context()) ||
         (case_name == "non-outlier-clipping" &&
          test_non_outlier_clipping_policy()) ||
         (case_name == "rmd-gather" && test_rmd_weight_gather());

@@ -49,6 +49,25 @@ if(caller_context EQUAL -1)
     message(FATAL_ERROR "F3: ExSIA must supply its existing run and layer to the timed builder")
 endif()
 
+foreach(quantizer IN ITEMS tensor token stripe)
+    file(READ "${TEST_SOURCE_DIR}/ggml/src/ggml-gemmini/quants/act/${quantizer}/${quantizer}.cpp" quantizer_source)
+    string(FIND "${quantizer_source}" "TimedResidualCapture residual_capture(" capture_begin)
+    string(FIND "${quantizer_source}" "residual_capture.set_context(" context_begin)
+    string(FIND "${quantizer_source}" "residual_capture.reset(" capture_reset)
+    string(FIND "${quantizer_source}" "residual_capture.finish()" capture_finish)
+    if(capture_begin EQUAL -1 OR context_begin EQUAL -1 OR capture_reset EQUAL -1 OR
+       capture_finish EQUAL -1 OR NOT capture_begin LESS context_begin OR
+       NOT context_begin LESS capture_reset OR NOT capture_reset LESS capture_finish)
+        message(FATAL_ERROR "${quantizer} builder must receive context before reset and finish")
+    endif()
+    math(EXPR context_length "${capture_reset} - ${context_begin}")
+    string(SUBSTRING "${quantizer_source}" ${context_begin} ${context_length} context_call)
+    if(NOT context_call MATCHES "std::nullopt" OR
+       NOT context_call MATCHES "args[.]matmul_layer[.]c_str\\(\\)")
+        message(FATAL_ERROR "${quantizer} builder must keep its real layer and absent run")
+    endif()
+endforeach()
+
 string(REGEX MATCHALL "cycle::read_sample\\(\\)" finish_samples "${finish_body}")
 list(LENGTH finish_samples finish_sample_count)
 if(NOT finish_sample_count EQUAL 2)

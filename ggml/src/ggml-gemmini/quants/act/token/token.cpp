@@ -211,6 +211,8 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
 
 #if GGML_GEMMINI_ENABLE_RMD
     ggml::gemmini::residual::TimedResidualCapture residual_capture(args.residual_route);
+    residual_capture.set_context(
+        std::nullopt, args.matmul_layer.empty() ? nullptr : args.matmul_layer.c_str());
     residual_capture.reset(0, 0, args.I, args.K, args.J);
     BitMask outliers;
     if (!outliers.resize(args.I, args.K))
