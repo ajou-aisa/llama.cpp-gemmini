@@ -176,6 +176,11 @@ add_test(NAME test-build-arm64-log-defaults
     COMMAND ${CMAKE_COMMAND}
         -DTEST_SCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/../build-arm64.sh
         -P ${CMAKE_CURRENT_SOURCE_DIR}/test-build-arm64-log-defaults.cmake)
+add_test(NAME test-build-arm64-cpu-detection
+    COMMAND ${CMAKE_COMMAND}
+        -DTEST_SCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/../build-arm64.sh
+        -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/build-arm64-cpu-detection
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-build-arm64-cpu-detection.cmake)
 add_test(NAME test-im2p-cache-build-scripts
     COMMAND ${CMAKE_COMMAND}
         -DTEST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/..
