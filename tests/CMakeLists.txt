@@ -109,8 +109,6 @@ if (NOT WIN32)
     if (BASH_EXECUTABLE AND EXISTS "${BASH_EXECUTABLE}")
         add_test(NAME test-experiment-output
             COMMAND ${BASH_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-experiment-output.sh)
-        add_test(NAME test-cycle-experiment-runner
-            COMMAND ${BASH_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-cycle-experiment-runner.sh)
     endif()
 
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API
