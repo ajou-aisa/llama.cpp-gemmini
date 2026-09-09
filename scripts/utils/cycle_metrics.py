@@ -20,17 +20,6 @@ except ImportError:
 class CycleMetricsError(Exception):
     """A metric input cannot be interpreted without unsafe arithmetic."""
 
-    __slots__ = ("detail",)
-
-    detail: str
-
-    def __init__(self, detail: str) -> None:
-        self.detail = detail
-        super().__init__(detail)
-
-    def __str__(self) -> str:
-        return self.detail
-
 
 @dataclass(frozen=True)
 class MetricSummary:
@@ -244,26 +233,6 @@ def format_number(value: Optional[Fraction]) -> str:
     return f"{value.numerator // value.denominator}.5"
 
 
-def _field(record: CycleRecord, name: str) -> str:
-    for field in record.fields:
-        if field.name == name:
-            return field.canonical_value
-    raise CycleMetricsError(f"line {record.line_number}: missing metric field {name!r}")
-
-
-def _integer_field(record: CycleRecord, name: str) -> int:
-    value = _field(record, name)
-    if not value.isdigit():
-        raise CycleMetricsError(f"line {record.line_number}: field {name!r} is not an integer")
-    return int(value)
-
-
-def _domain(current: Optional[Tuple[str, str]], candidate: Tuple[str, str]) -> Tuple[str, str]:
-    if current is not None and current != candidate:
-        raise CycleMetricsError("records contain mixed source/unit domains")
-    return candidate
-
-
 def operation_metrics(path: Path) -> Tuple[OperationMetric, ...]:
     """Keep raw operations and domains separate; never sum parents with children."""
     grouped: Dict[Tuple[str, str, str], List[Tuple[Optional[int], str, str]]] = defaultdict(list)
@@ -308,23 +277,21 @@ def _invocation_key(record: CycleRecord) -> InvocationKey:
 
 def e2e_metrics(path: Path) -> E2EMetrics:
     """Summarize caller envelopes and separate steady-clock pipeline envelopes."""
-    callers: Dict[InvocationKey, Optional[int]] = {}
-    caller_states: Dict[InvocationKey, Tuple[str, str]] = {}
+    callers: Dict[InvocationKey, Tuple[Optional[int], str, str]] = {}
     endpoints: Dict[InvocationKey, Tuple[int, int]] = {}
     stripes = set()
     caller_domain: Optional[Tuple[str, str]] = None
-    pipeline_domain: Optional[Tuple[str, str]] = None
     for record in parse_cycle_jsonl(path):
         if record.record_type == RecordType.RMD_BACKEND_TELEMETRY:
             if record.source is None or record.unit != "cycle" or record.op != "rmd.execute":
                 raise CycleMetricsError(f"line {record.line_number}: invalid caller envelope domain or operation")
-            caller_domain = _domain(caller_domain, (record.source, record.unit))
+            if caller_domain is not None and caller_domain != (record.source, record.unit):
+                raise CycleMetricsError("records contain mixed source/unit domains")
+            caller_domain = (record.source, record.unit)
             key = _invocation_key(record)
             if key in callers:
                 raise CycleMetricsError(f"line {record.line_number}: duplicate invocation identity {key!r}")
-            value, status, reason = rmd_value_status(json.loads(record.canonical_json), "invocation_total", record.line_number)
-            callers[key] = value
-            caller_states[key] = (status, reason)
+            callers[key] = rmd_value_status(json.loads(record.canonical_json), "invocation_total", record.line_number)
             continue
         if record.record_type != RecordType.PIPELINE_STRIPE_SUMMARY:
             continue
@@ -332,7 +299,6 @@ def e2e_metrics(path: Path) -> E2EMetrics:
             raise CycleMetricsError(f"line {record.line_number}: invalid pipeline domain or operation")
         if record.valid is not True:
             raise CycleMetricsError(f"line {record.line_number}: invalid pipeline summary")
-        pipeline_domain = _domain(pipeline_domain, ("steady_clock", "nanosecond"))
         key = _invocation_key(record)
         if record.stripe_id is None or record.slot is None:
             raise CycleMetricsError(f"line {record.line_number}: pipeline stripe/slot identity is required")
@@ -340,8 +306,8 @@ def e2e_metrics(path: Path) -> E2EMetrics:
         if stripe in stripes:
             raise CycleMetricsError(f"line {record.line_number}: duplicate pipeline stripe identity")
         stripes.add(stripe)
-        start = _integer_field(record, "queue_start_ns")
-        end = _integer_field(record, "finalize_end_ns")
+        raw = json.loads(record.canonical_json)
+        start, end = raw["queue_start_ns"], raw["finalize_end_ns"]
         prior = endpoints.get(key)
         endpoints[key] = (start, end) if prior is None else (min(prior[0], start), max(prior[1], end))
     if not callers:
@@ -350,18 +316,17 @@ def e2e_metrics(path: Path) -> E2EMetrics:
         raise CycleMetricsError("PIPELINE_STRIPE_SUMMARY records are required")
     if set(callers) != set(endpoints):
         raise CycleMetricsError("caller and pipeline invocation identities do not match")
-    if caller_domain is None or pipeline_domain is None:
+    if caller_domain is None:
         raise CycleMetricsError("E2E metric domains are unavailable")
     caller_source, caller_unit = caller_domain
-    pipeline_source, pipeline_unit = pipeline_domain
     pipeline_values = tuple(endpoints[key][1] - endpoints[key][0] for key in sorted(endpoints))
-    values = tuple(value for value in callers.values() if value is not None)
+    values = tuple(value for value, _, _ in callers.values() if value is not None)
     caller = summarize(values) if len(values) == len(callers) else MetricSummary(len(callers), None, None, None)
-    statuses = {status for status, _ in caller_states.values()}
+    statuses = {status for _, status, _ in callers.values()}
     status = next(iter(statuses)) if len(statuses) == 1 else "partial"
-    reason = ";".join(sorted({reason for _, reason in caller_states.values() if reason}))
+    reason = ";".join(sorted({reason for _, _, reason in callers.values() if reason}))
     return E2EMetrics(
         caller_source, caller_unit, caller,
-        pipeline_source, pipeline_unit, summarize(pipeline_values), status, reason,
+        "steady_clock", "nanosecond", summarize(pipeline_values), status, reason,
         caller.total if status == "complete" else None,
     )

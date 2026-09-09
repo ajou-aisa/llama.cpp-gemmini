@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,14 +11,12 @@ from typing import Final, Optional
 try:
     from .residual_stages import Stage, read_stages
     from .cycle_schema import (
-        CycleSchemaError, JsonValue, _DuplicateKeyError, _InvalidConstantError,
-        _optional_integer, _optional_string, _pairs_to_mapping, _reject_constant,
+        CycleSchemaError, JsonValue, _optional_integer, _optional_string, parse_json_line,
     )
 except ImportError:
     from residual_stages import Stage, read_stages
     from cycle_schema import (
-        CycleSchemaError, JsonValue, _DuplicateKeyError, _InvalidConstantError,
-        _optional_integer, _optional_string, _pairs_to_mapping, _reject_constant,
+        CycleSchemaError, JsonValue, _optional_integer, _optional_string, parse_json_line,
     )
 
 PHASES: Final = ("validation", "preparation", "parallel", "finalization")
@@ -258,15 +255,7 @@ def read_profiles(path: Path, run_id: Optional[int] = None, layer: Optional[str]
     filters = (("run_id", run_id), ("layer", layer), ("stripe_id", stripe_id))
     with path.open(encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, 1):
-            try:
-                decoded: JsonValue = json.loads(line, object_pairs_hook=_pairs_to_mapping, parse_constant=_reject_constant)
-            except json.JSONDecodeError as error:
-                raise CycleSchemaError(line_number, f"malformed JSON at column {error.colno}") from None
-            except _DuplicateKeyError as error:
-                raise CycleSchemaError(line_number, f"duplicate key {error.args[0]!r}") from None
-            except _InvalidConstantError as error:
-                raise CycleSchemaError(line_number, f"invalid JSON constant {error.args[0]!r}") from None
-            record = _mapping(decoded, line_number)
+            record = _mapping(parse_json_line(line, line_number), line_number)
             if record.get("record_type") != "RESIDUAL_HOST_PROFILE":
                 continue
             seen = True

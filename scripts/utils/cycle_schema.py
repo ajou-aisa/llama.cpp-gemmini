@@ -34,11 +34,6 @@ class RecordType(str, Enum):
     STAGE = "STAGE"
 
 
-class JsonField(NamedTuple):
-    name: str
-    canonical_value: str
-
-
 class CycleRecord(NamedTuple):
     line_number: int
     record_type: RecordType
@@ -56,15 +51,7 @@ class CycleRecord(NamedTuple):
     delta: Optional[int]
     valid: Optional[bool]
     reason: Optional[str]
-    fields: Tuple[JsonField, ...]
     canonical_json: str
-
-    def nested_json(self, name: str) -> Optional[str]:
-        """Return a canonical JSON field value without flattening it."""
-        for field in self.fields:
-            if field.name == name:
-                return field.canonical_value
-        return None
 
 
 class CycleSchemaError(Exception):
@@ -181,8 +168,8 @@ def _validate_required_types(record: Mapping[str, JsonValue], names: List[str], 
 def rmd_value_status(record: Mapping[str, JsonValue], key: str, line_number: int) -> Tuple[Optional[int], str, str]:
     """Read the producer's flat nullable interval contract; old scalars stay unverified."""
     value = _optional_integer(record, key, line_number)
-    suffixes = ("_valid", "_reason", "_sample_reason", "_count", "_valid_count", "_not_applicable_count")
-    if not any(key + suffix in record for suffix in suffixes if suffix != "_reason"):
+    suffixes = ("_valid", "_sample_reason", "_count", "_valid_count", "_not_applicable_count")
+    if not any(key + suffix in record for suffix in suffixes):
         return value, "unknown", "legacy_validity_unknown"
     valid = _require(record, key + "_valid", line_number)
     reason = _optional_string(record, key + "_reason", line_number)
@@ -253,16 +240,21 @@ def _validate_arithmetic(record: Mapping[str, JsonValue], record_type: RecordTyp
             raise CycleSchemaError(line_number, f"field {delta_name!r} is inconsistent with its interval")
 
 
-def parse_cycle_line(line: str, line_number: int) -> CycleRecord:
-    """Parse one physical JSONL line into a typed immutable record."""
+def parse_json_line(line: str, line_number: int) -> JsonValue:
+    """Decode JSON while rejecting duplicate keys and non-JSON constants."""
     try:
-        decoded = json.loads(line, object_pairs_hook=_pairs_to_mapping, parse_constant=_reject_constant)
+        return json.loads(line, object_pairs_hook=_pairs_to_mapping, parse_constant=_reject_constant)
     except json.JSONDecodeError as error:
         raise CycleSchemaError(line_number, f"malformed JSON at column {error.colno}") from None
     except _DuplicateKeyError as error:
         raise CycleSchemaError(line_number, f"duplicate key {error.args[0]!r}") from None
     except _InvalidConstantError as error:
         raise CycleSchemaError(line_number, f"invalid JSON constant {error.args[0]!r}") from None
+
+
+def parse_cycle_line(line: str, line_number: int) -> CycleRecord:
+    """Parse one physical JSONL line into a typed immutable record."""
+    decoded = parse_json_line(line, line_number)
     if not isinstance(decoded, dict):
         raise CycleSchemaError(line_number, "record must be a JSON object")
     if decoded.get("schema") != "gemmini.cycle" or decoded.get("version") != 2:
@@ -276,12 +268,8 @@ def parse_cycle_line(line: str, line_number: int) -> CycleRecord:
     if record_type not in {RecordType.TIMELINE, RecordType.STAGE}:
         required += _SOURCED
     _validate_required_types(decoded, required, line_number)
-    for identity in ("run_id", "stripe_id", "slot", "node_id", "worker_id"):
-        _optional_integer(decoded, identity, line_number)
     _validate_arithmetic(decoded, record_type, line_number)
     valid_value = decoded.get("valid")
-    fields = tuple(JsonField(key, json.dumps(value, sort_keys=True, separators=(",", ":")))
-                   for key, value in decoded.items())
     source = decoded.get("source")
     unit = decoded.get("unit")
     reason = decoded.get("reason")
@@ -302,7 +290,6 @@ def parse_cycle_line(line: str, line_number: int) -> CycleRecord:
         delta=_optional_integer(decoded, "delta", line_number) if "delta" in decoded else None,
         valid=valid_value if type(valid_value) is bool else None,
         reason=reason if type(reason) is str else None,
-        fields=fields,
         canonical_json=json.dumps(decoded, sort_keys=True, separators=(",", ":")),
     )
 

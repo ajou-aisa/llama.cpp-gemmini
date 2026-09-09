@@ -60,8 +60,6 @@ class GroupSummary(TypedDict):
 
 class InputError(Exception):
     def __init__(self, location: str, detail: str) -> None:
-        self.location = location
-        self.detail = detail
         super().__init__(f"{location}: {detail}")
 
 

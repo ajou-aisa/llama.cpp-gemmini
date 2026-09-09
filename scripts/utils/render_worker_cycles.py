@@ -8,7 +8,6 @@ Requires Python 3.9+ and the standard library only.
 from __future__ import annotations
 
 import argparse
-import csv
 import sys
 from pathlib import Path
 from typing import Optional, Sequence
@@ -17,12 +16,12 @@ try:
     from .cycle_metrics import (CycleMetricsError, format_number, worker_metrics, operation_definition,
                                 cpu_measurements, measurement_cells, MEASUREMENT_HEADERS)
     from .cycle_schema import CycleSchemaError
-    from .table_output import BarValue, TableRow, render_markdown, render_svg
+    from .table_output import BarValue, export_csv, render_markdown, render_svg
 except ImportError:
     from cycle_metrics import (CycleMetricsError, format_number, worker_metrics, operation_definition,
                               cpu_measurements, measurement_cells, MEASUREMENT_HEADERS)
     from cycle_schema import CycleSchemaError
-    from table_output import BarValue, TableRow, render_markdown, render_svg
+    from table_output import BarValue, export_csv, render_markdown, render_svg
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -45,19 +44,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "worker_work_cycles", "median_interval_cycles", "p95_interval_cycles",
             "valid_count", "valid_value_sum", "status", "reason", "sum_semantics",
         )
-        rows = tuple(TableRow((
+        rows = tuple((
             metric.source, metric.unit, metric.operation, str(metric.worker_id),
             str(metric.summary.count), "" if metric.summary.total is None else str(metric.summary.total),
             format_number(metric.summary.median), "" if metric.summary.p95 is None else str(metric.summary.p95),
             str(metric.summary.valid_count), str(metric.summary.valid_total), metric.summary.status, metric.summary.reason,
             "per_worker_label_not_elapsed_cycles",
-        )) for metric in metrics)
-        with targets[0].open(
-            "w", encoding="utf-8", newline="",
-        ) as stream:
-            writer = csv.writer(stream, lineterminator="\n")
-            writer.writerow(headers)
-            writer.writerows(row.cells for row in rows)
+        ) for metric in metrics)
+        export_csv(targets[0], headers, rows)
         targets[1].write_text(
             render_markdown(headers, rows), encoding="utf-8",
         )
@@ -69,11 +63,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )),
             encoding="utf-8",
         )
-        with targets[3].open("w", encoding="utf-8", newline="") as stream:
-            writer = csv.writer(stream, lineterminator="\n")
-            writer.writerow(MEASUREMENT_HEADERS)
-            writer.writerows(measurement_cells(arguments.input, item) for item in cpu_measurements(arguments.input)
-                             if item.operation == arguments.op or operation_definition(item.operation).canonical_id == arguments.op)
+        export_csv(targets[3], MEASUREMENT_HEADERS,
+                   (measurement_cells(arguments.input, item) for item in cpu_measurements(arguments.input)
+                    if item.operation == arguments.op or operation_definition(item.operation).canonical_id == arguments.op))
     except (CycleMetricsError, CycleSchemaError, OSError) as error:
         print(error, file=sys.stderr)
         return 1
