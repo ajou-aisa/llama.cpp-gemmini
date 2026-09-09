@@ -39,20 +39,7 @@ void project_matmul_cpu_identity(log::CycleRecord & record,
 }
 
 namespace {
-void telemetry_json_string(std::ostringstream & out, std::string_view value) {
-    out << '"';
-    for (const char c : value) {
-        switch (c) {
-            case '\\': out << "\\\\"; break;
-            case '"': out << "\\\""; break;
-            case '\n': out << "\\n"; break;
-            case '\r': out << "\\r"; break;
-            case '\t': out << "\\t"; break;
-            default: out << c; break;
-        }
-    }
-    out << '"';
-}
+void json_string(std::ostringstream & out, std::string_view value);
 const char * telemetry_backend_name(RmdBackend backend) {
     return backend == RmdBackend::cpu_direct ? "cpu_direct" : "gemmini_ws_compact";
 }
@@ -116,10 +103,10 @@ void cpu_interval_json(std::ostringstream & out, const char * key,
     out << ",\"" << key << "_valid\":" << (interval.cycles ? "true" : "false")
         << ",\"" << key << "_reason\":";
     if (interval.reason.empty()) out << "null";
-    else telemetry_json_string(out, interval.reason);
+    else json_string(out, interval.reason);
     out << ",\"" << key << "_sample_reason\":";
     if (interval.sample_reason.empty()) out << "null";
-    else telemetry_json_string(out, interval.sample_reason);
+    else json_string(out, interval.sample_reason);
     out << ",\"" << key << "_count\":" << interval.count
         << ",\"" << key << "_valid_count\":" << interval.valid_count
         << ",\"" << key << "_not_applicable_count\":" << interval.not_applicable_count;
@@ -201,19 +188,19 @@ std::string serialize_rmd_telemetry(const RmdTelemetryRecord & record) {
     return {};
 #else
     std::ostringstream out;
-    out << "{\"schema\":"; telemetry_json_string(out, record.schema);
+    out << "{\"schema\":"; json_string(out, record.schema);
     out << ",\"version\":" << record.version << ",\"record_type\":\"RMD_BACKEND_TELEMETRY\"";
-    out << ",\"source\":"; telemetry_json_string(out, telemetry_clock_source());
-    out << ",\"unit\":"; telemetry_json_string(out, telemetry_unit_name(record.units));
+    out << ",\"source\":"; json_string(out, telemetry_clock_source());
+    out << ",\"unit\":"; json_string(out, telemetry_unit_name(record.units));
     out << ",\"op\":\"rmd.execute\",\"layer\":";
-    if (record.layer.empty()) out << "null"; else telemetry_json_string(out, record.layer);
+    if (record.layer.empty()) out << "null"; else json_string(out, record.layer);
     out << ",\"run_id\":" << record.run_id
         << ",\"stripe_id\":null,\"slot\":null,\"node_id\":null,\"worker_id\":null"
         << ",\"runtime_bundle_id\":";
-    telemetry_json_string(out, record.runtime_bundle_id);
-    out << ",\"model_id\":"; telemetry_json_string(out, record.model_id);
-    out << ",\"backend\":"; telemetry_json_string(out, telemetry_backend_name(record.backend));
-    out << ",\"option_source\":"; telemetry_json_string(out, telemetry_source_name(record.source));
+    json_string(out, record.runtime_bundle_id);
+    out << ",\"model_id\":"; json_string(out, record.model_id);
+    out << ",\"backend\":"; json_string(out, telemetry_backend_name(record.backend));
+    out << ",\"option_source\":"; json_string(out, telemetry_source_name(record.source));
     out << ",\"cpu_measurement_version\":1,\"work\":" << (record.work ? "true" : "false");
     cpu_interval_json(out, "invocation_total", record.invocation_total);
     out << ",\"dispatch\":{\"direct_events\":" << record.counters.direct_events
@@ -252,10 +239,10 @@ std::string serialize_rmd_telemetry(const RmdTelemetryRecord & record) {
             << ",\"merge_start\":" << stripe.ordered_ticks[5]
             << ",\"merge_end\":" << stripe.ordered_ticks[6]
             << ",\"residual_end\":" << stripe.ordered_ticks[7] << '}'
-            << ",\"input_hash\":"; telemetry_json_string(out, stripe.input_hash);
-        out << ",\"correction_hash\":"; telemetry_json_string(out, stripe.correction_hash);
+            << ",\"input_hash\":"; json_string(out, stripe.input_hash);
+        out << ",\"correction_hash\":"; json_string(out, stripe.correction_hash);
         out << ",\"correction_nonzero_count\":" << stripe.correction_nonzero_count;
-        out << ",\"output_hash\":"; telemetry_json_string(out, stripe.output_hash);
+        out << ",\"output_hash\":"; json_string(out, stripe.output_hash);
         out << ",\"hash_enabled\":" << (stripe.hash_enabled ? "true" : "false");
         cpu_interval_json(out, "dense", stripe.dense);
         out << '}';
