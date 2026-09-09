@@ -6,12 +6,19 @@
 #include "../ggml/src/ggml-gemmini/quants/act/stripe/stripe.hpp"
 #include "../ggml/src/ggml-gemmini/quants/act/stripe/types.hpp"
 #include "../ggml/src/ggml-gemmini/quants/act/token/types.hpp"
+#include "../ggml/src/ggml-gemmini/quants/act/tensor/tensor.hpp"
+#include "../ggml/src/ggml-gemmini/quants/act/token/token.hpp"
 #include "../ggml/src/ggml-gemmini/quants/common/weight_reader.hpp"
 
 #include <ggml.h>
+#include <gemmini/log.hpp>
 #ifndef GEMMINI_EXSIA_WRITER_TEST_ONLY
+#include "../common/json.hpp"
 #include "../ggml/src/ggml-gemmini/residual/direct/direct-builder.hpp"
 #include "../ggml/src/ggml-gemmini/residual/direct/direct-executor.hpp"
+#if LOG_CYCLE && CYCLE_DETAIL
+#include "../ggml/src/ggml-gemmini/residual/direct/direct-stage-profile.hpp"
+#endif
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.hpp"
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.hpp"
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.hpp"
@@ -23,6 +30,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <charconv>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
@@ -61,6 +69,76 @@ bool test_meta_rho_invariant() {
         check(meta.rho == config::GGML_GEMMINI_ACTIVATION_RHO,
               "ExSIA metadata reset restores width-native rho") &&
         check(meta.theta.empty(), "ExSIA metadata reset clears theta");
+}
+
+bool test_non_exsia_capture_context() {
+#if GGML_GEMMINI_ENABLE_RMD
+    struct Quantizer {
+        const char * layer;
+        bool (*run)(const ggml_tensor *, ggml_gemmini_args_t &);
+    };
+    const Quantizer quantizers[] = {
+        {"capture.tensor", [](const ggml_tensor *src, ggml_gemmini_args_t &args) {
+            args.act_quant.storage().emplace<quants::act::tensor::Meta>();
+            return quants::act::tensor::quantize(src, args);
+        }},
+        {"capture.token", [](const ggml_tensor *src, ggml_gemmini_args_t &args) {
+            args.act_quant.storage().emplace<quants::act::token::Meta>();
+            return quants::act::token::quantize(src, args);
+        }},
+        {"capture.stripe", [](const ggml_tensor *src, ggml_gemmini_args_t &args) {
+            args.act_quant.storage().emplace<quants::act::stripe::Meta>();
+            return quants::act::stripe::quantize(src, args);
+        }},
+    };
+    std::array<float, 32> values;
+    values.fill(1.0f);
+    values[0] = 8.0f;
+    ggml_tensor tensor{};
+    tensor.type = GGML_TYPE_F32;
+    tensor.data = values.data();
+    for (const auto &quantizer : quantizers) {
+        for (const auto route : {residual::ResidualRoute::cpu_direct,
+                                 residual::ResidualRoute::ws_packet}) {
+            ggml_gemmini_args_t args{};
+            args.I = 1; args.J = 17; args.K = values.size(); args.sA = values.size();
+            args.tile_I = 1; args.tile_J = 1; args.tile_K = 1;
+            args.activation_rows_per_stripe = DIM;
+            args.matmul_layer = quantizer.layer;
+            args.residual_route = route;
+            if (!args.A.allocate(args.I, args.K, GGML_GEMMINI_ACTIVATION_BITS))
+                return false;
+#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+            FILE *output = std::tmpfile();
+            if (!check(output != nullptr, "quantizer capture sink opens")) return false;
+            log::cycle.set_output(output);
+#endif
+            const bool quantized = quantizer.run(&tensor, args);
+            const bool direct = route == residual::ResidualRoute::cpu_direct;
+            bool ok = check(quantized &&
+                quants::act::direct_residuals(args).size() == (direct ? 1U : 0U) &&
+                quants::act::rmd_packets(args).size() == (direct ? 0U : 1U),
+                "real quantizer reaches exactly one nonempty builder finish");
+#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
+            log::cycle.set_output(stderr);
+            std::rewind(output);
+            char buffer[4096];
+            const bool read = std::fgets(buffer, sizeof(buffer), output) != nullptr;
+            const std::string record = read ? buffer : "";
+            const bool extra = std::fgets(buffer, sizeof(buffer), output) != nullptr;
+            std::fclose(output);
+            const char *op = direct ? "rmd_direct_finish_cycles" : "rmd_packet_finish_cycles";
+            ok = check(read && !extra &&
+                record.find(std::string("\"op\":\"") + op + "\"") != std::string::npos &&
+                record.find(std::string("\"layer\":\"") + quantizer.layer + "\"") != std::string::npos &&
+                record.find("\"run_id\":null") != std::string::npos,
+                "actual quantizer finish preserves layer without inventing a run") && ok;
+#endif
+            if (!ok) return false;
+        }
+    }
+#endif
+    return true;
 }
 
 bool test_non_outlier_clipping_policy() {
@@ -123,6 +201,7 @@ bool integer_values_equal(const rmd::Correction & correction,
 }
 
 struct GeometryPublicationTrace {
+    std::optional<uint64_t> run_id;
     std::array<std::pair<size_t, size_t>, 2> rows{};
     size_t publications = 0;
     size_t direct_handles = 0;
@@ -134,6 +213,8 @@ bool capture_geometry_publication(
     const quants::act::exsia::StripeReadyEvent & event) {
     auto & trace = *static_cast<GeometryPublicationTrace *>(opaque);
     if (trace.publications >= trace.rows.size()) return false;
+    if (trace.run_id.has_value() && *trace.run_id != event.run_id) return false;
+    trace.run_id = event.run_id;
     trace.rows[trace.publications++] = {event.row_begin, event.row_end};
     trace.direct_handles += event.direct_residual != nullptr ? 1 : 0;
     trace.packet_handles += event.rmd_packet != nullptr ? 1 : 0;
@@ -241,7 +322,8 @@ bool test_activation_stripe_geometry_contract() {
     const bool direct_atomic_ok =
         check(!bad_exsia_ok && bad_exsia.state().failure_code ==
                   quants::act::exsia::ExSIAState::FailureCode::InvalidInput &&
-                  bad_trace.publications == 0 && bad_exsia_meta.theta.empty() &&
+                  bad_trace.publications == 0 && !bad_exsia_meta.run_id.has_value() &&
+                  bad_exsia_meta.theta.empty() &&
                   bad_exsia.state().stripe.empty() && bad_exsia.state().residual.empty() &&
                   direct_sentinel_unchanged,
               "direct ExSIA mismatch is typed, atomic, and has zero side effects");
@@ -267,7 +349,8 @@ bool test_activation_stripe_geometry_contract() {
         check(exsia_args.tile_I == 2 && exsia_args.tile_J == 3 && exsia_args.tile_K == 4 &&
                   stripe_args.tile_I == 2 && stripe_args.tile_J == 3 && stripe_args.tile_K == 4,
               "quantization preserves all auto-selected tile factors") &&
-        check(trace.publications == 2 &&
+        check(trace.publications == 2 && trace.run_id.has_value() &&
+                  exsia_meta.run_id == trace.run_id &&
                   trace.rows[0] == std::make_pair(size_t{0}, stripe_rows) &&
                   trace.rows[1] == std::make_pair(stripe_rows, rows),
               "ExSIA publishes contiguous full and final partial stripes") &&
@@ -1307,6 +1390,194 @@ bool test_rmd_cpu_direct_parity() {
     return true;
 }
 
+bool direct_host_profile_output(const std::filesystem::path & output_path, size_t repeat_count) {
+#if LOG_CYCLE && CYCLE_DETAIL
+    using Json = nlohmann::ordered_json;
+    std::array<residual::detail::DirectStageTotals, 3> early_return_stages{};
+    [&] {
+        residual::detail::DirectStageProbe probe(&early_return_stages);
+        probe.next(1);
+        return;
+    }();
+    if (!check(early_return_stages[0].calls == 1 && early_return_stages[1].calls == 1 &&
+                   early_return_stages[2].calls == 0,
+               "deep stage scope records early returns without inventing unexecuted work")) return false;
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+    struct RestoreOpenmp {
+        int threads = omp_get_max_threads();
+        int dynamic = omp_get_dynamic();
+        ~RestoreOpenmp() { omp_set_num_threads(threads); omp_set_dynamic(dynamic); }
+    } restore_openmp;
+    omp_set_dynamic(0);
+    omp_set_num_threads(3);
+#endif
+    const char * deep_env = std::getenv("GGML_GEMMINI_RESIDUAL_DEEP_PROFILE");
+    const bool deep_profile = deep_env != nullptr && std::strcmp(deep_env, "1") == 0;
+    for (size_t iteration = 0; iteration < repeat_count * 2; ++iteration) {
+        const size_t fixture = iteration % 2;
+        constexpr size_t rows = 4, columns = 35, logical_k = 65;
+        const uint64_t run_id = 0x6a17 + iteration / 2;
+        const size_t stripe_id = 3 + fixture, row_begin = 7 + fixture * rows;
+        const std::string layer = "direct.profile.\"tail\"\\fixture\n";
+        const std::vector<residual::ResidualEvent> events = fixture == 0
+            ? std::vector<residual::ResidualEvent>{
+                {0, 0, 3}, {0, 7, -2}, {0, 32, 5},
+                {1, 64, -7}, {3, 1, 11}, {3, 64, 13}}
+            : std::vector<residual::ResidualEvent>{
+                {0, 0, 3}, {0, 64, -5}, {2, 32, 7}, {2, 33, -11}};
+        const size_t active_rows = fixture == 0 ? 3 : 2;
+        const size_t active_row_blocks = fixture == 0 ? 5 : 3;
+        residual::DirectStripeBuilder builder;
+        builder.reset(stripe_id, row_begin, rows, logical_k, columns);
+        for (const auto & event : events) {
+            if (!builder.add_residual(event.local_row, event.original_k, event.residual))
+                return false;
+        }
+        const auto payload = builder.finish();
+        if (!check(payload != nullptr, "direct host profile sparse payload builds")) return false;
+
+        std::vector<elem_t> weights(logical_k * columns);
+        for (size_t k = 0; k < logical_k; ++k)
+            for (size_t j = 0; j < columns; ++j)
+                weights[k * columns + j] = static_cast<elem_t>(
+                    static_cast<int>((k * 11 + j * 17) % 251) - 125);
+        std::vector<rmd::OutputValue> expected(rows * columns, 0);
+        for (const auto & event : events)
+            for (size_t j = 0; j < columns; ++j)
+                expected[event.local_row * columns + j] +=
+                    static_cast<int64_t>(event.residual) * weights[event.original_k * columns + j];
+
+        ggml_gemmini_args_t args{};
+        args.I = rows; args.J = columns; args.K = logical_k;
+        args.B = weights.data(); args.sB = columns;
+        args.weight_i8_scale_active = true; args.weight_scale = 1.0f;
+        args.matmul_layer = layer;
+        const auto path = std::filesystem::absolute(output_path);
+        const auto profile_offset = iteration == 0 ? 0 : std::filesystem::file_size(path);
+        if (!check(log::cycle.set_output_path(path.c_str(), iteration == 0),
+                   "direct host profile output opens")) return false;
+        residual::DirectExecutionMetrics metrics{};
+        metrics.run_id = run_id;
+        rmd::DirectOutput output = rmd::BlockScaledInt64Correction{};
+        const auto status = residual::execute_direct_stripe(args, *payload, output, &metrics);
+        const auto profiled_size = std::filesystem::file_size(path);
+        residual::testing::DirectExecutionTestHooks disabled_hooks{};
+        disabled_hooks.disable_host_profile = true;
+        residual::DirectExecutionMetrics disabled_metrics{};
+        disabled_metrics.run_id = run_id + 1;
+        rmd::DirectOutput disabled_output = rmd::BlockScaledInt64Correction{};
+        const auto disabled_status = residual::execute_direct_stripe(
+            args, *payload, disabled_output, &disabled_metrics, disabled_hooks);
+        log::cycle.set_output(stderr);
+        if (!check(status == rmd::RmdStatus::success &&
+                       disabled_status == rmd::RmdStatus::success &&
+                       integer_values_equal(output, expected) &&
+                       integer_values_equal(disabled_output, expected),
+                   "direct host profiling preserves independent reference output") ||
+            !check(profiled_size > 0 && std::filesystem::file_size(path) == profiled_size,
+                   "disabled direct host profiling emits no record") ||
+            !check(metrics.event_count == events.size() && metrics.call_count == 1 &&
+                       metrics.j_tile_count == 3 && metrics.native_q8_values == 0 &&
+                       disabled_metrics.event_count == metrics.event_count &&
+                       disabled_metrics.j_tile_count == metrics.j_tile_count,
+                   "direct host profiling preserves workload metrics")) return false;
+
+        std::ifstream input(path);
+        input.seekg(static_cast<std::streamoff>(profile_offset));
+        std::string line, extra;
+        if (!check(static_cast<bool>(std::getline(input, line)) && !std::getline(input, extra),
+                   "each direct execution emits exactly one JSONL profile")) return false;
+        try {
+            const Json profile = Json::parse(line);
+            const auto & workload = profile.at("workload");
+            if (!check(profile.at("record_type") == "RESIDUAL_HOST_PROFILE" &&
+                           profile.at("layer") == layer &&
+                           profile.at("run_id") == run_id && profile.at("stripe_id") == stripe_id &&
+                           profile.at("slot").is_null() && profile.at("node_id").is_null() &&
+                           profile.at("deep_profile") == deep_profile &&
+                           profile.at("worker_id").is_null(),
+                       "direct host profile retains fixture identity") ||
+                !check(workload.at("event_count") == events.size() && workload.at("active_rows") == active_rows &&
+                           workload.at("active_row_blocks") == active_row_blocks && workload.at("row_begin") == row_begin &&
+                           workload.at("row_count") == rows && workload.at("logical_j") == columns &&
+                           workload.at("logical_k") == logical_k && workload.at("j_tile_count") == 3,
+                       "direct host profile counts sparse row/block work and the J tail")) return false;
+
+            const auto & workers = profile.at("workers");
+            for (const auto & worker : workers) {
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+                if (!check(worker.at("barrier_host_timing").at("valid") == true,
+                           "OpenMP workers collect a separate barrier interval")) return false;
+#else
+                if (!check(workers.size() == 1 && worker.at("barrier_host_timing").at("valid") == false &&
+                               worker.at("barrier_thread_cpu_timing").at("valid") == false &&
+                               worker.at("barrier_thread_cpu_timing").at("start_ns").is_null() &&
+                               worker.at("barrier_thread_cpu_timing").at("end_ns").is_null(),
+                           "serial direct execution marks the unavailable barrier null")) return false;
+#endif
+            }
+            const auto & tiles = profile.at("tiles");
+            for (const auto & tile : tiles) {
+                const auto & host = tile.at("host_timing");
+                if (!check(tile.at("log_valid") == false &&
+                               tile.at("log_host_timing").at("valid") == false &&
+                               tile.at("log_thread_cpu_timing").at("valid") == false &&
+                               tile.at("log_thread_cpu_timing").at("start_ns").is_null() &&
+                               tile.at("log_thread_cpu_timing").at("end_ns").is_null(),
+                           "testing executor leaves unavailable legacy logger measurements null")) return false;
+                if (!check(tile.contains("stages") == deep_profile,
+                           "deep stages are emitted only when enabled")) return false;
+                if (deep_profile) {
+                    uint64_t stage_wall_ns = 0;
+                    uint64_t stage_cpu_ns = 0;
+                    for (const char * name : {"event_scan", "weight_dot", "scale_apply"}) {
+                        const auto & stage = tile.at("stages").at(name);
+                        if (!check(stage.at("calls") == active_row_blocks &&
+                                       stage.at("wall_ns").is_number_unsigned() &&
+                                       (stage.at("thread_cpu_ns").is_null() ||
+                                        stage.at("thread_cpu_ns").is_number_unsigned()) &&
+                                       stage.at("cycles_reason").is_string() &&
+                                       (stage.at("cycles_valid") == true ?
+                                            stage.at("cycles").is_number_unsigned() &&
+                                                stage.at("cycles_reason") == "none" :
+                                            stage.at("cycles").is_null() &&
+                                                stage.at("cycles_reason") != "none"),
+                                   "deep stages count each row/block and preserve counter validity")) return false;
+#if !defined(__linux__) || !defined(__aarch64__)
+                        if (!check(stage.at("cycles_valid") == false &&
+                                       stage.at("cycles_reason") == "unsupported_platform",
+                                   "non-PMU clocks are never reported as deep CPU cycles")) return false;
+#endif
+                        stage_wall_ns += stage.at("wall_ns").get<uint64_t>();
+                        if (!stage.at("thread_cpu_ns").is_null())
+                            stage_cpu_ns += stage.at("thread_cpu_ns").get<uint64_t>();
+                    }
+                    if (!check(stage_wall_ns <= host.at("duration_ns").get<uint64_t>() &&
+                                   (tile.at("thread_cpu_timing").at("valid") == false ||
+                                    stage_cpu_ns <= tile.at("thread_cpu_timing").at("duration_ns").get<uint64_t>()),
+                               "disjoint deep spans fit within their enclosing tile")) return false;
+                }
+            }
+            if (!check(metrics.cpu_tiles.size() == 3,
+                       "direct host profile retains every PMU tile record")) return false;
+            for (const auto & tile : metrics.cpu_tiles)
+                if (!check(!tile.valid && !tile.delta_cycles.has_value() &&
+                               tile.sample_reason == residual::DirectCpuTileReason::unavailable_event,
+                           "unavailable PMU cycles stay invalid beside valid host timing")) return false;
+        } catch (const Json::exception & error) {
+            std::fprintf(stderr, "FAIL: direct host profile JSON: %s\n", error.what());
+            return false;
+        }
+    }
+    return true;
+#else
+    (void) output_path;
+    (void) repeat_count;
+    std::fprintf(stderr, "direct host profile fixture requires LOG_CYCLE=1 and CYCLE_DETAIL=1\n");
+    return false;
+#endif
+}
+
 bool test_direct_cpu_executor() {
     using residual::DirectStripeBuilder;
     using residual::DirectStripePayload;
@@ -1495,11 +1766,11 @@ bool test_direct_cpu_executor() {
         }
     }
 
-    const uint64_t unavailable_run_id = exact_metrics.cpu_tiles.front().run_id;
+    const std::optional<uint64_t> unavailable_run_id = exact_metrics.cpu_tiles.front().run_id;
     for (size_t tile = 0; tile < expected_tile_count; ++tile) {
         const residual::DirectCpuTileRecord & record = exact_metrics.cpu_tiles[tile];
         const uint64_t expected_delta = 3 + static_cast<uint64_t>(tile) * 2;
-        if (!check(record.run_id == unavailable_run_id && unavailable_run_id == 0 &&
+        if (!check(record.run_id == unavailable_run_id && !unavailable_run_id.has_value() &&
                        record.stripe_id == native_payload->stripe_id &&
                        record.tile_index == tile && record.j_begin == tile * 16 &&
                        record.j_end == std::min(native_args.J, (tile + 1) * size_t{16}),
@@ -1520,32 +1791,33 @@ bool test_direct_cpu_executor() {
         }
     }
 
-    CpuScript propagated_script(expected_tile_count);
-    const residual::testing::DirectExecutionTestHooks propagated_hooks{
-        &CpuScript::read, &propagated_script};
-    constexpr uint64_t supplied_run_id = UINT64_C(0x6a17);
-    residual::DirectExecutionMetrics propagated_metrics{};
-    propagated_metrics.run_id = supplied_run_id;
-    rmd::Correction propagated_output = rmd::BlockScaledInt64Correction{{104}};
-    if (!check(residual::execute_direct_stripe(
-                   native_args, *native_payload, propagated_output, &propagated_metrics,
-                   propagated_hooks) == rmd::RmdStatus::success &&
-                   integer_values_equal(propagated_output, native_expected) &&
-                   propagated_metrics.cpu_tiles.size() == expected_tile_count,
-               "supplied run-ID execution preserves output and dynamic tile records")) {
-        return false;
-    }
-    for (size_t tile = 0; tile < expected_tile_count; ++tile) {
-        const residual::DirectCpuTileRecord & record = propagated_metrics.cpu_tiles[tile];
-        if (!check(record.run_id == supplied_run_id &&
-                       record.stripe_id == native_payload->stripe_id &&
-                       record.tile_index == tile && record.j_begin == tile * 16 &&
-                       record.j_end == std::min(native_args.J, (tile + 1) * size_t{16}) &&
-                       record.worker_id == propagated_script.start_worker_ids[tile] &&
-                       propagated_script.tile_start_indices[tile] == 1 &&
-                       propagated_script.tile_end_indices[tile] == 1,
-                   "supplied event/job run ID propagates exactly to every dynamic tile")) {
+    for (const uint64_t supplied_run_id : {UINT64_C(0), UINT64_C(0x6a17)}) {
+        CpuScript propagated_script(expected_tile_count);
+        const residual::testing::DirectExecutionTestHooks propagated_hooks{
+            &CpuScript::read, &propagated_script};
+        residual::DirectExecutionMetrics propagated_metrics{};
+        propagated_metrics.run_id = supplied_run_id;
+        rmd::Correction propagated_output = rmd::BlockScaledInt64Correction{{104}};
+        if (!check(residual::execute_direct_stripe(
+                       native_args, *native_payload, propagated_output, &propagated_metrics,
+                       propagated_hooks) == rmd::RmdStatus::success &&
+                       integer_values_equal(propagated_output, native_expected) &&
+                       propagated_metrics.cpu_tiles.size() == expected_tile_count,
+                   "supplied run-ID execution preserves output and dynamic tile records")) {
             return false;
+        }
+        for (size_t tile = 0; tile < expected_tile_count; ++tile) {
+            const residual::DirectCpuTileRecord & record = propagated_metrics.cpu_tiles[tile];
+            if (!check(record.run_id.has_value() && *record.run_id == supplied_run_id &&
+                           record.stripe_id == native_payload->stripe_id &&
+                           record.tile_index == tile && record.j_begin == tile * 16 &&
+                           record.j_end == std::min(native_args.J, (tile + 1) * size_t{16}) &&
+                           record.worker_id == propagated_script.start_worker_ids[tile] &&
+                           propagated_script.tile_start_indices[tile] == 1 &&
+                           propagated_script.tile_end_indices[tile] == 1,
+                       "supplied event/job run ID propagates exactly to every dynamic tile")) {
+                return false;
+            }
         }
     }
 
@@ -1620,7 +1892,7 @@ bool test_direct_cpu_executor() {
     std::printf("DIRECT_J_TILES records=%zu pairs=%zu run_id=%llu stripe_id=%zu "
                 "numerics=reference_equal invalid_end=local owner=local generation=local\n",
                 exact_metrics.cpu_tiles.size(), expected_tile_count,
-                static_cast<unsigned long long>(unavailable_run_id), native_payload->stripe_id);
+                static_cast<unsigned long long>(unavailable_run_id.value_or(0)), native_payload->stripe_id);
 
     constexpr size_t dense_rows = 2, dense_columns = 5, dense_k = 37;
     std::vector<elem_t> dense_weights(dense_k * dense_columns);
@@ -2339,6 +2611,21 @@ int main(int argc, char ** argv) {
 #ifdef GEMMINI_EXSIA_WRITER_TEST_ONLY
     return 1;
 #else
+    if (argc >= 2 && std::string(argv[1]) == "--direct-host-profile-output") {
+        size_t repeat_count = 1;
+        bool valid_repeat = argc == 3;
+        if (argc == 5 && std::string(argv[3]) == "--direct-host-profile-repeat") {
+            const char * end = argv[4] + std::strlen(argv[4]);
+            const auto result = std::from_chars(argv[4], end, repeat_count);
+            valid_repeat = result.ec == std::errc{} && result.ptr == end && repeat_count > 0 &&
+                repeat_count <= std::numeric_limits<size_t>::max() / 2;
+        }
+        if (!valid_repeat) {
+            std::fprintf(stderr, "usage: %s --direct-host-profile-output PATH [--direct-host-profile-repeat N]\n", argv[0]);
+            return 2;
+        }
+        return direct_host_profile_output(argv[2], repeat_count) ? 0 : 1;
+    }
     if (argc >= 2 && std::string(argv[1]) == "--bench-rmd-gather") {
         std::filesystem::path json_path;
         double max_h1_ratio = 0.80;
@@ -2367,8 +2654,14 @@ int main(int argc, char ** argv) {
     } else if (argc == 3 && std::string(argv[1]) == "--case") {
         case_name = argv[2];
     } else if (argc != 1) {
-        std::fprintf(stderr, "usage: %s [--case=<name>|--case <name>]\n", argv[0]);
-        return 2;
+        const bool help = argc == 2 && std::string(argv[1]) == "--help";
+        std::fprintf(help ? stdout : stderr,
+                     "usage: %s [--case=<name>|--case <name>]\n"
+                     "       %s --direct-host-profile-output PATH [--direct-host-profile-repeat N]\n"
+                     "       %s --profile-output PATH [--invalid-parent]\n"
+                     "       %s --bench-rmd-gather [--json PATH] [--max-h1-ratio VALUE]\n",
+                     argv[0], argv[0], argv[0], argv[0]);
+        return help ? 0 : 2;
     }
 
     const bool known = case_name == "all" || case_name == "baseline" ||
@@ -2377,7 +2670,8 @@ int main(int argc, char ** argv) {
         case_name == "hp1-srmd-software-ws" ||
         case_name == "rmd-direct-parity" || case_name == "direct-executor" ||
         case_name == "rmd-gather" || case_name == "stripe-geometry" ||
-        case_name == "meta-rho" || case_name == "non-outlier-clipping";
+        case_name == "meta-rho" || case_name == "non-outlier-clipping" ||
+        case_name == "non-exsia-capture-context";
     if (!known) {
         std::fprintf(stderr, "unknown case: %s\n", case_name.c_str());
         return 2;
@@ -2385,7 +2679,7 @@ int main(int argc, char ** argv) {
 
     std::printf("TEST_CASE_BEGIN name=%s\n", case_name.c_str());
     const bool ok =
-        (case_name == "all" && test_meta_rho_invariant() &&
+        (case_name == "all" && test_meta_rho_invariant() && test_non_exsia_capture_context() &&
          test_non_outlier_clipping_policy() &&
          test_exsia_baseline() && test_dispatch_modes() &&
          test_compiled_width_rmd_suite() && test_direct_cpu_executor() &&
@@ -2403,6 +2697,7 @@ int main(int argc, char ** argv) {
         (case_name == "stripe-geometry" && test_activation_stripe_geometry_contract() &&
          test_cpu_direct_residual_dequantization()) ||
         (case_name == "meta-rho" && test_meta_rho_invariant()) ||
+        (case_name == "non-exsia-capture-context" && test_non_exsia_capture_context()) ||
         (case_name == "non-outlier-clipping" &&
          test_non_outlier_clipping_policy()) ||
         (case_name == "rmd-gather" && test_rmd_weight_gather());

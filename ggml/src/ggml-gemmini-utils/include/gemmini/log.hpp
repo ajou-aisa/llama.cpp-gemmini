@@ -142,7 +142,34 @@ namespace ggml::gemmini::log
     };
 
     std::string serialize_cycle_record(const CycleRecord &record);
+    std::string serialize_checked_cycle_record(const CycleRecord &record, bool valid,
+                                               const char *reason,
+                                               const char *sample_reason = nullptr);
     std::string serialize_ws_cycle_record(const WsCycleRecord &record);
+
+    struct CycleWriteTiming
+    {
+        uint64_t calls = 0;
+        uint64_t mutex_wait_ns = 0;
+        uint64_t io_ns = 0;
+        bool valid = true;
+    };
+
+    // Measures emit attempts in the innermost scope; missing or failed output is invalid.
+    class ScopedCycleWriteTiming
+    {
+    public:
+        explicit ScopedCycleWriteTiming(CycleWriteTiming &timing) noexcept;
+        ~ScopedCycleWriteTiming() noexcept;
+        ScopedCycleWriteTiming(const ScopedCycleWriteTiming &) = delete;
+        ScopedCycleWriteTiming &operator=(const ScopedCycleWriteTiming &) = delete;
+
+    private:
+        CycleWriteTiming &timing_;
+        CycleWriteTiming *previous_;
+        uint64_t initial_calls_;
+        int initial_exceptions_;
+    };
 
     class DebugLog : public Log
     {

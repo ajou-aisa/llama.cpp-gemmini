@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -13,8 +14,10 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <vector>
+#include <gemmini/log.hpp>
 
 namespace {
 
@@ -316,6 +319,156 @@ bool test_cpu_direct_lifecycle_parity() {
         expect(full_args.tiled_matmul_type == main_route &&
                    pipeline_args.tiled_matmul_type == main_route,
                "backend selector preserves the main matmul route");
+}
+
+bool test_cpu_cycle_lifecycle() {
+#if LOG_CYCLE && GGML_GEMMINI_ENABLE_RMD
+    const char * previous = std::getenv("GGML_GEMMINI_TELEMETRY_HASH");
+    const std::optional<std::string> saved = previous != nullptr
+        ? std::optional<std::string>(previous) : std::nullopt;
+    const auto run = [&]() {
+        std::vector<float> reference;
+        for (int hash = 0; hash != 2; ++hash) {
+            if (setenv("GGML_GEMMINI_TELEMETRY_HASH", hash ? "1" : "0", 1) != 0) return false;
+            std::vector<elem_t> activation = {1, 2, 3, 4, 5, 6};
+            std::vector<elem_t> weights = {1, -1, 2, 3};
+            std::vector<float> output(6, 0.0f);
+            auto args = make_args(activation, weights, output);
+            args.matmul_layer = "test.cpu.lifecycle";
+            const uint64_t run_id = hash == 0 ? 0 : 91;
+            std::get<quants::act::exsia::Meta>(args.act_quant.storage()).run_id = run_id;
+            MatmulOptions options{};
+            options.mode = MatmulInvocationMode::stripe_pipeline;
+            options.job_capacity = 2;
+            options.rmd_backend = RmdBackend::cpu_direct;
+            options.profiling = true;
+            auto execution = prepare_execution(&args, options);
+            MatmulStripeCollector collector(2);
+            FILE * sink = std::tmpfile();
+            if (!sink) return false;
+            const uint64_t producer_tid = cycle::host_thread_id();
+            log::cycle.set_output(sink);
+            bool ok = execution.status().ok() && collector.start(execution);
+            for (size_t stripe = 0; ok && stripe != 3; ++stripe) {
+                quants::act::exsia::StripeReadyEvent event{};
+                event.run_id = run_id;
+                event.stripe_id = stripe;
+                event.slot = stripe % 2;
+                event.row_begin = stripe;
+                event.row_end = stripe + 1;
+                event.direct_residual = make_direct_payload(stripe, stripe, 1, 128);
+                ok = collector.sink()->on_ready(collector.sink()->user_data, event);
+            }
+            ok = collector.finish().ok() && ok;
+            ok = finish_execution(execution).ok() && ok;
+            const auto profiles = collector.profiles();
+            log::cycle.set_output(stderr);
+            std::rewind(sink);
+            std::string emitted;
+            char buffer[4096];
+            for (size_t n; (n = std::fread(buffer, 1, sizeof(buffer), sink)) != 0;)
+                emitted.append(buffer, n);
+            ok = !std::ferror(sink) && ok;
+            std::fclose(sink);
+            if (!expect(ok && profiles.size() == 3, "three stripes complete with capacity-two reuse")) return false;
+            const auto cpu_row = [&](const char * op, size_t stripe) {
+                const std::string operation = std::string("\"op\":\"") + op + "\"";
+                const std::string identity = "\"stripe_id\":" + std::to_string(stripe) + ",";
+                for (size_t pos = 0; pos < emitted.size();) {
+                    const auto end = emitted.find('\n', pos);
+                    const std::string_view row(emitted.data() + pos,
+                        (end == std::string::npos ? emitted.size() : end) - pos);
+                    if (row.find(operation) != std::string_view::npos &&
+                        row.find(identity) != std::string_view::npos) return row;
+                    if (end == std::string::npos) break;
+                    pos = end + 1;
+                }
+                return std::string_view{};
+            };
+            const auto ns_field = [](std::string_view row, const char * key) {
+                const std::string needle = std::string("\"") + key + "\":";
+                const auto pos = row.find(needle);
+                uint64_t value = 0;
+                if (pos == std::string_view::npos) return value;
+                const auto parsed = std::from_chars(row.data() + pos + needle.size(),
+                                                     row.data() + row.size(), value);
+                return parsed.ec == std::errc{} ? value : uint64_t{0};
+            };
+            for (size_t stripe = 0; stripe != profiles.size(); ++stripe) {
+                const auto & profile = profiles[stripe];
+                if (!expect(profile.run_id == run_id && profile.stripe_id == stripe &&
+                            (profile.cpu_identity_mask & GEMMINI_CYCLE_HAS_RUN_ID) != 0 &&
+                            (profile.cpu_identity_mask & GEMMINI_CYCLE_HAS_SLOT) != 0 &&
+                            profile.slot == stripe % 2 && profile.cpu_dense.reason != "not_collected" &&
+                            profile.cpu_backend.reason != "not_collected",
+                            "worker CPU collection and identity survive slot reuse")) return false;
+                const auto preparation = cpu_row("stripe_job_preparation", stripe);
+                const auto dense = cpu_row("dense_backend_host_call", stripe);
+                const auto residual = cpu_row("residual_backend_host_call", stripe);
+                const auto summary = detail::pipeline_stripe_telemetry(args.matmul_layer.c_str(), profile);
+                if (!expect(profile.capture_queue_enqueue_ns > 0 &&
+                            profile.capture_queue_enqueue_ns <= profile.capture_queue_dequeue_ns &&
+                            profile.capture_queue_dequeue_ns <= ns_field(preparation, "start_ns") &&
+                            ns_field(preparation, "start_ns") <= ns_field(preparation, "end_ns") &&
+                            ns_field(preparation, "end_ns") <= profile.ws_start_ns &&
+                            summary.queue_end_ns == profile.capture_queue_dequeue_ns,
+                            "queue ends at actual dequeue before preparation and dense work")) return false;
+                if (!expect(profile.queue_enqueue_tid == producer_tid &&
+                            profile.queue_dequeue_tid != 0 && profile.queue_dequeue_tid != producer_tid &&
+                            profile.ws_start_tid == profile.queue_dequeue_tid &&
+                            profile.ws_end_tid == profile.ws_start_tid &&
+                            profile.backend_start_tid == profile.ws_end_tid &&
+                            profile.backend_end_tid == profile.backend_start_tid &&
+                            profile.finalize_start_tid == profile.backend_end_tid &&
+                            profile.finalize_end_tid == profile.finalize_start_tid,
+                            "producer and execution worker identities survive deferred serialization")) return false;
+                if (!expect(profile.ws_end_ns >= profile.ws_start_ns &&
+                            profile.rmd_start_ns >= profile.ws_end_ns &&
+                            profile.backend_start_ns >= profile.rmd_start_ns &&
+                            profile.backend_end_ns >= profile.backend_start_ns &&
+                            profile.rmd_end_ns >= profile.backend_end_ns &&
+                            (stripe == 0 || profiles[stripe - 1].finalize_end_ns <=
+                                             profile.capture_queue_dequeue_ns),
+                            "host intervals preserve actual dense/residual and stripe ordering")) return false;
+                const auto dense_host = cycle::serialize_host_timing(
+                    profile.ws_start_ns, profile.ws_end_ns, profile.ws_start_tid, profile.ws_end_tid);
+                const auto residual_host = cycle::serialize_host_timing(
+                    profile.backend_start_ns, profile.backend_end_ns,
+                    profile.backend_start_tid, profile.backend_end_tid);
+                const auto summary_json = serialize_cycle_telemetry(summary);
+                if (!expect(dense.find("\"host_timing\":" + dense_host) != std::string_view::npos &&
+                            residual.find("\"host_timing\":" + residual_host) != std::string_view::npos &&
+                            summary_json.find("\"dense\":" + dense_host) != std::string::npos &&
+                            summary_json.find("\"residual_backend\":" + residual_host) != std::string::npos &&
+                            summary_json.find("\"host_stages\":{") != std::string::npos &&
+                            summary_json.find("\"host_timing\":") == std::string::npos,
+                            "pipeline summaries reuse exact backend call boundaries excluding log output")) return false;
+#if CYCLE_DETAIL
+                if (!expect(profile.telemetry_hash_enabled == (hash != 0) &&
+                            profile.telemetry_output_hash.empty() == (hash == 0),
+                            "hash work is explicitly opt-in")) return false;
+#endif
+            }
+            for (const char * op : {"stripe_input_capture", "stripe_job_preparation",
+                    "dense_backend_host_call", "residual_backend_host_call",
+                    "output_correction_apply", "telemetry_stats_compute",
+                    "stripe_completion_bookkeeping", "collector_capacity_release",
+                    "pipeline_drain_and_join", "matmul_output_validation_and_publish"}) {
+                if (!expect(emitted.find(std::string("\"op\":\"") + op + "\"") != std::string::npos,
+                            "actual lifecycle work emits its CPU interval")) return false;
+            }
+            if (hash == 0) reference = output;
+            else if (!expect(same_output(reference, output), "hash opt-in preserves output exactly")) return false;
+        }
+        return true;
+    };
+    const bool ok = run();
+    const int restored = saved ? setenv("GGML_GEMMINI_TELEMETRY_HASH", saved->c_str(), 1)
+                               : unsetenv("GGML_GEMMINI_TELEMETRY_HASH");
+    return ok && expect(restored == 0, "restore hash environment");
+#else
+    return true;
+#endif
 }
 
 bool test_rmd_disabled_pipeline_skips_correction() {
@@ -1417,6 +1570,7 @@ int main(int argc, char ** argv) {
         !test_native_q4_multiblock_final_float_oracle() ||
         !test_counter_hooks_connected() ||
         !test_cpu_direct_lifecycle_parity() ||
+        !test_cpu_cycle_lifecycle() ||
         !test_rmd_disabled_pipeline_skips_correction() ||
         !test_dense_rejects_residual_metadata() ||
         !test_correction_domain_composition() ||

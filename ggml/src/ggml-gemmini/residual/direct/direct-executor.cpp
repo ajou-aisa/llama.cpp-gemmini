@@ -4,6 +4,9 @@
 #include "../../ggml-gemmini-args.h"
 #include "../../quants/common/weight_reader.hpp"
 #include "../../quants/common/weight_route.hpp"
+#if LOG_CYCLE && CYCLE_DETAIL
+#include "direct-profile.hpp"
+#endif
 #if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
 #include <gemmini/cycle_reader.hpp>
 #include <gemmini/log.h>
@@ -102,6 +105,10 @@ CpuInterval cpu_interval(const CpuSample & start, const CpuSample & end) {
 #endif
 }
 
+#endif
+
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
+    (CYCLE_DETAIL && (LOG_CYCLE || (defined(__linux__) && defined(__aarch64__))))
 size_t direct_worker_id() {
 #if defined(GGML_GEMMINI_HAS_OPENMP)
     return static_cast<size_t>(omp_get_thread_num());
@@ -189,6 +196,14 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
                                      rmd::DirectOutput & correction,
                                      DirectExecutionMetrics * metrics) {
 #endif
+#if LOG_CYCLE && CYCLE_DETAIL
+    detail::DirectHostProfile profile(payload, args.matmul_layer,
+        metrics != nullptr ? metrics->run_id : std::nullopt
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
+        , hooks == nullptr || !hooks->disable_host_profile
+#endif
+    );
+#endif
     if (validate_direct_payload(payload) != rmd::RmdStatus::success)
         return rmd::RmdStatus::invalid_packet;
     if (args.K != payload.logical_k || args.J != payload.logical_j)
@@ -228,6 +243,9 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
     if (!checked_size_product(payload.row_count, payload.logical_j, output_count))
         return rmd::RmdStatus::overflow;
 
+#if LOG_CYCLE && CYCLE_DETAIL
+    profile.next_phase(1);
+#endif
     std::vector<rmd::OutputValue> staged_integer;
     std::vector<double> staged_floating;
     if ((integer_block && output_count > staged_integer.max_size()) ||
@@ -246,12 +264,21 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
 
     const size_t j_tile_count =
         (payload.logical_j + kJTile - 1) / kJTile;
+#if LOG_CYCLE && CYCLE_DETAIL
+    profile.prepare(j_tile_count,
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+        j_tile_count > 1 ? static_cast<size_t>(omp_get_max_threads()) : 1
+#else
+        1
+#endif
+    );
+#endif
     std::vector<rmd::RmdStatus> tile_status;
     std::vector<size_t> tile_native_q8_values;
 #if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
     (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
     std::vector<DirectCpuTileRecord> tile_cpu_records;
-    const uint64_t direct_run_id = metrics != nullptr ? metrics->run_id : 0;
+    const std::optional<uint64_t> direct_run_id = metrics != nullptr ? metrics->run_id : std::nullopt;
 #endif
     try {
         tile_status.assign(j_tile_count, rmd::RmdStatus::success);
@@ -276,12 +303,24 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
             read_cpu_sample();
 #endif
 #endif
+#if LOG_CYCLE && CYCLE_DETAIL
+        if (profile.ready) {
+            profile.tiles[tile_index].worker_id = direct_worker_id();
+            profile.tiles[tile_index].j_begin = tile_index * kJTile;
+            profile.tiles[tile_index].j_end = std::min(payload.logical_j, (tile_index + 1) * kJTile);
+            profile.tiles[tile_index].compute.start = cycle::read_host_sample();
+        }
+#endif
         const rmd::RmdStatus status = [&] {
             const size_t j_begin = tile_index * kJTile;
             const size_t tile_j = std::min(kJTile, payload.logical_j - j_begin);
             size_t & native_q8_values = tile_native_q8_values[tile_index];
             size_t event_index = 0;
             while (event_index < payload.events.size()) {
+#if LOG_CYCLE && CYCLE_DETAIL
+                detail::DirectStageProbe stage_probe(profile.ready && profile.deep_profile ?
+                    &profile.tiles[tile_index].stages : nullptr);
+#endif
                 const ResidualEvent & first = payload.events[event_index];
                 const size_t row = first.local_row;
                 const size_t block_id = first.original_k / rmd::kBlockSize;
@@ -292,6 +331,9 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
                     ++span_end;
                 }
 
+#if LOG_CYCLE && CYCLE_DETAIL
+                stage_probe.next(1);
+#endif
                 std::array<int64_t, kJTile> block_sum{};
                 for (size_t local_j = 0; local_j < tile_j; ++local_j) {
                     const size_t j = j_begin + local_j;
@@ -308,6 +350,9 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
                     }
                 }
 
+#if LOG_CYCLE && CYCLE_DETAIL
+                stage_probe.next(2);
+#endif
                 for (size_t local_j = 0; local_j < tile_j; ++local_j) {
                     const size_t j = j_begin + local_j;
                     wreader::WeightScaleResult scale{};
@@ -350,6 +395,9 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
             }
             return rmd::RmdStatus::success;
         }();
+#if LOG_CYCLE && CYCLE_DETAIL
+        if (profile.ready) profile.tiles[tile_index].compute.end = cycle::read_host_sample();
+#endif
 #if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
     (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
 #if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
@@ -390,20 +438,70 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
                 static_cast<uint32_t>(GEMMINI_CYCLE_HAS_STRIPE_ID) |
                 static_cast<uint32_t>(GEMMINI_CYCLE_HAS_NODE_ID) |
                 static_cast<uint32_t>(GEMMINI_CYCLE_HAS_WORKER_ID);
-            if (direct_run_id != 0) {
+            if (direct_run_id.has_value()) {
                 identity_mask |= static_cast<uint32_t>(GEMMINI_CYCLE_HAS_RUN_ID);
             }
-            const gemmini_cycle_record_v2 detail{{nullptr, "rmd_direct_j_tile_interval",
+            const gemmini_cycle_record_v2 detail{{
+                args.matmul_layer.empty() ? nullptr : args.matmul_layer.c_str(),
+                "rmd_direct_j_tile_interval",
                 tile_start.value, tile_end.value, nullptr, 0, nullptr},
-                identity_mask, direct_run_id, payload.stripe_id, 0, tile_index,
+                identity_mask, direct_run_id.value_or(0), payload.stripe_id, 0, tile_index,
                 record.worker_id};
-            gemmini_log_cycle_record_v2_checked_internal(
-                &detail, &start_sample, &end_sample, 1);
+#if LOG_CYCLE && CYCLE_DETAIL
+            auto * host_tile = profile.ready ? &profile.tiles[tile_index] : nullptr;
+            if (host_tile != nullptr) host_tile->logging.start = cycle::read_host_sample();
+            {
+                std::optional<log::ScopedCycleWriteTiming> write_timing;
+                if (host_tile != nullptr) write_timing.emplace(host_tile->writes);
+#endif
+                gemmini_log_cycle_record_v2_checked_internal(
+                    &detail, &start_sample, &end_sample, 1);
+#if LOG_CYCLE && CYCLE_DETAIL
+            }
+            if (host_tile != nullptr) host_tile->logging.end = cycle::read_host_sample();
+#endif
 #endif
 #endif
         return status;
     };
 
+#if LOG_CYCLE && CYCLE_DETAIL
+    profile.next_phase(2);
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+#pragma omp parallel if(j_tile_count > 1)
+    {
+        const size_t worker_id = direct_worker_id();
+        if (profile.ready) {
+            profile.workers[worker_id].active = true;
+            profile.workers[worker_id].work.start = cycle::read_host_sample();
+        }
+#pragma omp for schedule(static) nowait
+        for (std::ptrdiff_t tile_index = 0;
+             tile_index < static_cast<std::ptrdiff_t>(j_tile_count);
+             ++tile_index) {
+            tile_status[static_cast<size_t>(tile_index)] =
+                execute_j_tile(static_cast<size_t>(tile_index));
+        }
+        if (profile.ready) {
+            auto & worker = profile.workers[worker_id];
+            worker.work.end = cycle::read_host_sample();
+            worker.barrier.start = worker.work.end;
+        }
+#pragma omp barrier
+        if (profile.ready) profile.workers[worker_id].barrier.end = cycle::read_host_sample();
+    }
+#else
+    if (profile.ready) {
+        profile.workers[0].active = true;
+        profile.workers[0].work.start = cycle::read_host_sample();
+    }
+    for (size_t tile_index = 0; tile_index < j_tile_count; ++tile_index) {
+        tile_status[tile_index] = execute_j_tile(tile_index);
+    }
+    if (profile.ready) profile.workers[0].work.end = cycle::read_host_sample();
+#endif
+    profile.next_phase(3);
+#else
 #if defined(GGML_GEMMINI_HAS_OPENMP)
 #pragma omp parallel for schedule(static) if(j_tile_count > 1)
 #endif
@@ -413,6 +511,7 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
         tile_status[static_cast<size_t>(tile_index)] =
             execute_j_tile(static_cast<size_t>(tile_index));
     }
+#endif
     size_t native_q8_values = 0;
     for (size_t tile_index = 0; tile_index < j_tile_count; ++tile_index) {
         if (tile_status[tile_index] != rmd::RmdStatus::success) {
@@ -436,6 +535,9 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
         metrics->cpu_tiles = std::move(tile_cpu_records);
 #endif
     }
+#if LOG_CYCLE && CYCLE_DETAIL
+    profile.success = true;
+#endif
     return rmd::RmdStatus::success;
 }
 

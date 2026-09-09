@@ -75,7 +75,7 @@ endif()
 
 # The pipeline stripe-ready callback is a same-task handoff leaf. Its checked
 # pair must remain adjacent to only the callback, carry real identity, and stay
-# independent from callback acceptance. The non-pipeline callback is excluded.
+# independent from callback acceptance. Both supported callback callsites use it.
 require_count("${source}"
     "stripe_ready_handoff_start = ggml::gemmini::cycle::read_sample\\(\\)"
     1 "pipeline stripe-ready handoff performs one native start read")
@@ -96,10 +96,10 @@ string(FIND "${source}"
 if(absent_callback_return EQUAL -1)
     message(FATAL_ERROR "absent stripe-ready callback must return before the handoff pair")
 endif()
-require_count("${source}" "notify_stripe_ready\\(slot, run_id, true" 1
-    "pipeline notify enables one handoff pair")
-require_count("${source}" "notify_stripe_ready\\(slot, run_id, false" 1
-    "non-pipeline notify disables the handoff pair")
+require_count("${source}" "notify_stripe_ready\\(slot, run_id, true" 2
+    "pipeline and non-pipeline notify reuse one handoff sampling site")
+require_count("${source}" "notify_stripe_ready\\(slot, run_id, false" 0
+    "supported callbacks do not disable the existing handoff pair")
 string(FIND "${source}" "if (theta == std::numeric_limits<int16_t>::min())" theta_guard)
 string(FIND "${source}" "stripe_ready_handoff_start = ggml::gemmini::cycle::read_sample()" handoff_start)
 string(FIND "${source}" "const bool accepted = sink->on_ready(" handoff_callback)

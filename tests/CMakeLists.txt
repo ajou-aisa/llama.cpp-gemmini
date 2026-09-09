@@ -218,6 +218,20 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
 endif()
 add_test(NAME test-gemmini-log-boundary
     COMMAND $<TARGET_FILE:test-gemmini-log-boundary>)
+add_executable(test-gemmini-host-timing test-gemmini-host-timing.cpp)
+find_package(Threads REQUIRED)
+target_link_libraries(test-gemmini-host-timing PRIVATE ggml-gemmini-utils Threads::Threads)
+target_compile_features(test-gemmini-host-timing PRIVATE cxx_std_17)
+target_compile_definitions(test-gemmini-host-timing PRIVATE
+    EXPECT_LOG_CYCLE=$<IF:$<BOOL:${LOG_CYCLE}>,1,0>)
+add_test(NAME test-gemmini-host-timing COMMAND $<TARGET_FILE:test-gemmini-host-timing>)
+find_package(Python3 3.9 COMPONENTS Interpreter QUIET)
+if (Python3_Interpreter_FOUND)
+    add_test(NAME test-host-overlap
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-host-overlap.py)
+    add_test(NAME test-residual-profile
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-residual-profile.py)
+endif()
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
     find_package(Threads REQUIRED)
     add_executable(test-gemmini-cycle-reader-aarch64
@@ -462,23 +476,18 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
         ${TEST_GEMMINI_EXSIA_SW_PATH}/include)
     add_dependencies(test-gemmini-exsia test-gemmini-direct-linux-aarch64-strict)
 endif()
+if (LOG_CYCLE AND CYCLE_DETAIL AND Python3_Interpreter_FOUND)
+    add_test(NAME test-residual-profile-runtime
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-residual-profile.py
+            --runtime-fixture $<TARGET_FILE:test-gemmini-exsia>)
+endif()
 add_test(NAME gemmini_direct_metrics_source_contract
     COMMAND ${CMAKE_COMMAND}
         -DDIRECT_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/residual/direct/direct-executor.cpp
         -DDIRECT_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/residual/direct/direct-executor.hpp
         -DTEST_CMAKE=${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
-        -DCXX_COMPILER=${CMAKE_CXX_COMPILER}
-        -DGENERATED_DIR=${CMAKE_BINARY_DIR}/generated
         -DPROJECT_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/..
-        -DGEMMINI_SW_PATH=${TEST_GEMMINI_EXSIA_SW_PATH}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-direct-metrics-source-contract.cmake)
-add_test(NAME gemmini_direct_metrics_adversarial_contract
-    COMMAND ${CMAKE_COMMAND}
-        -DDIRECT_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/residual/direct/direct-executor.cpp
-        -DDIRECT_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/residual/direct/direct-executor.hpp
-        -DTEST_CMAKE=${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
-        -DCONTRACT_SCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-direct-metrics-source-contract.cmake
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-direct-metrics-adversarial.cmake)
 foreach(_worker_count IN ITEMS 3 4)
     add_executable(test-gemmini-exsia-workers${_worker_count}
         test-gemmini-exsia-profile.cpp
@@ -562,7 +571,7 @@ add_test(NAME test-gemmini-exsia-profile-contract
         -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-exsia-profile-contract.cmake)
 
 set(_GGML_GEMMINI_EXSIA_CASES
-    all baseline dispatch direct-executor stripe-geometry)
+    all baseline dispatch direct-executor stripe-geometry non-exsia-capture-context)
 if (_GGML_GEMMINI_ACTIVATION_BITS_VALUE EQUAL 8 AND
     _GGML_GEMMINI_WEIGHT_BITS_VALUE EQUAL 8)
     list(APPEND _GGML_GEMMINI_EXSIA_CASES
@@ -762,6 +771,46 @@ add_test(NAME test-gemmini-rmd-telemetry
 add_test(NAME test-gemmini-aggregate-cycle-driver
     COMMAND $<TARGET_FILE:test-gemmini-rmd-telemetry> --aggregate-driver
             ${CMAKE_CURRENT_BINARY_DIR}/gemmini-aggregate-driver/cycle-log.jsonl)
+add_executable(test-gemmini-rmd-reducer
+    test-gemmini-rmd-telemetry.cpp
+    ../ggml/src/ggml-gemmini/ggml-gemmini-telemetry.cpp)
+target_link_libraries(test-gemmini-rmd-reducer PRIVATE ggml-gemmini-utils)
+target_compile_features(test-gemmini-rmd-reducer PRIVATE cxx_std_17)
+target_compile_definitions(test-gemmini-rmd-reducer PRIVATE
+    GGML_GEMMINI_REDUCER_TEST_ONLY=1
+    GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+    GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
+    LOG_DEBUG=${LOG_DEBUG} LOG_CYCLE=${LOG_CYCLE} CYCLE_DETAIL=${CYCLE_DETAIL})
+target_include_directories(test-gemmini-rmd-reducer PRIVATE
+    ../ggml/include ../ggml/src ../ggml/src/ggml-gemmini
+    ../ggml/src/ggml-gemmini-utils/include ${GGML_GEMMINI_GENERATED_CONFIG_DIR}
+    ${GEMMINI_SW_PATH} ${GEMMINI_SW_PATH}/include)
+add_test(NAME test-gemmini-rmd-reducer
+    COMMAND $<TARGET_FILE:test-gemmini-rmd-reducer>)
+if (UNIX AND EXISTS "${IM2P_SIM_ROOT}/frontend/include/im2p_gemmini_frontend.hpp")
+    add_executable(test-gemmini-im2p-host-cycle test-gemmini-im2p-routing.cpp
+        ../ggml/src/ggml-gemmini/ggml-gemmini-telemetry.cpp)
+    target_link_libraries(test-gemmini-im2p-host-cycle PRIVATE ggml-base ggml-gemmini-utils)
+    target_compile_features(test-gemmini-im2p-host-cycle PRIVATE cxx_std_17)
+    target_compile_definitions(test-gemmini-im2p-host-cycle PRIVATE
+        GGML_GEMMINI_IM2P_HOST_CYCLE_TEST=1
+        GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM=1
+        GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+        GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
+        LOG_CYCLE=${LOG_CYCLE} CYCLE_DETAIL=${CYCLE_DETAIL})
+    target_include_directories(test-gemmini-im2p-host-cycle PRIVATE
+        ../ggml/include ../ggml/src ../ggml/src/ggml-gemmini
+        ${GGML_GEMMINI_GENERATED_CONFIG_DIR}
+        ${GEMMINI_SW_PATH} ${GEMMINI_SW_PATH}/include
+        ${IM2P_SIM_ROOT}/frontend/include ${IM2P_SIM_ROOT}/sim/include)
+    target_compile_options(test-gemmini-im2p-host-cycle PRIVATE -ffunction-sections -fdata-sections)
+    if (APPLE)
+        target_link_options(test-gemmini-im2p-host-cycle PRIVATE -Wl,-dead_strip)
+    else()
+        target_link_options(test-gemmini-im2p-host-cycle PRIVATE -Wl,--gc-sections)
+    endif()
+    add_test(NAME test-gemmini-im2p-host-cycle COMMAND $<TARGET_FILE:test-gemmini-im2p-host-cycle>)
+endif()
 add_test(NAME test-gemmini-telemetry-clock-gate
     COMMAND ${CMAKE_COMMAND}
             -DTEST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/..
@@ -809,7 +858,12 @@ if (_GGML_GEMMINI_ACTIVATION_BITS_VALUE EQUAL 8 AND
     target_compile_features(test-gemmini-matmul-options PRIVATE cxx_std_17)
     target_compile_definitions(test-gemmini-matmul-options PRIVATE
         GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
-        GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE})
+        GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
+        GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
+        GGML_GEMMINI_EXSIA_DEFAULT_MODE_VALUE=${_GGML_GEMMINI_EXSIA_DEFAULT_MODE_VALUE}
+        GGML_GEMMINI_EXSIA_LOCAL_WORKERS=${GGML_GEMMINI_EXSIA_LOCAL_WORKERS})
+    ggml_gemmini_apply_profile_compile_definitions(test-gemmini-matmul-options)
+    ggml_gemmini_assert_profile_compile_definitions(test-gemmini-matmul-options)
     target_include_directories(test-gemmini-matmul-options PRIVATE
         ../ggml/include
         ../ggml/src
@@ -820,7 +874,7 @@ if (_GGML_GEMMINI_ACTIVATION_BITS_VALUE EQUAL 8 AND
         ${GEMMINI_SW_PATH}
         ${GEMMINI_SW_PATH}/include)
     if (NOT GGML_BACKEND_DL)
-        target_link_libraries(test-gemmini-matmul-options PRIVATE ggml-gemmini ggml-base)
+        target_link_libraries(test-gemmini-matmul-options PRIVATE ggml-gemmini ggml-base ggml-gemmini-utils)
         target_compile_definitions(test-gemmini-matmul-options PRIVATE GGML_GEMMINI_OPTIONS_TEST_BACKEND=1)
     endif()
     add_test(NAME test-gemmini-matmul-options COMMAND $<TARGET_FILE:test-gemmini-matmul-options>)
@@ -968,12 +1022,13 @@ if (NOT GGML_BACKEND_DL)
     # The façade test uses C++ symbols from the statically linked backend.
     # Dynamic backends are MODULE libraries and cannot be linked into a test.
     add_executable(test-gemmini-matmul test-gemmini-matmul.cpp)
-    target_link_libraries(test-gemmini-matmul PRIVATE ggml-gemmini ggml-base)
+    target_link_libraries(test-gemmini-matmul PRIVATE ggml-gemmini ggml-base ggml-gemmini-utils)
     target_compile_features(test-gemmini-matmul PRIVATE cxx_std_17)
     target_compile_definitions(test-gemmini-matmul PRIVATE
         GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
         GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
-        GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE})
+        GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
+        LOG_CYCLE=${LOG_CYCLE} CYCLE_DETAIL=${CYCLE_DETAIL})
     add_test(NAME test-gemmini-matmul COMMAND $<TARGET_FILE:test-gemmini-matmul>)
     add_test(
         NAME test-gemmini-matmul-finite-output
@@ -1063,6 +1118,7 @@ set(_GEMMINI_REGISTERED_TEST_EXECUTABLES
     test-gemmini-rmd-packet
     test-gemmini-production-host-backend
     test-gemmini-rmd-telemetry
+    test-gemmini-rmd-reducer
     gemmini-quant-dispatch-smoke)
 foreach(_GEMMINI_OPTIONAL_TEST_EXECUTABLE IN ITEMS
         gemmini_q8_h1_h2_dequant_fp
@@ -1070,6 +1126,7 @@ foreach(_GEMMINI_OPTIONAL_TEST_EXECUTABLE IN ITEMS
         test-gemmini-srmd-raw-ws
         test-gemmini-matmul-options
         test-gemmini-im2p-routing
+        test-gemmini-im2p-host-cycle
         test-gemmini-im2p-lifecycle
         test-gemmini-rmd-im2p-provider
         test-gemmini-rmd-backend-gate

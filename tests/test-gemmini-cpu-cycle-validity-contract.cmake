@@ -128,15 +128,15 @@ foreach(token IN ITEMS "ggml-gemmini-utils/src" "cycle_reader_internal.h")
     endif()
 endforeach()
 
-require_gemmini_count("ggml::gemmini::cycle::read\\(\\)" 15
+require_gemmini_count("ggml::gemmini::cycle::read\\(\\)" 13
     "Gemmini public scalar cycle endpoints")
 require_gemmini_count("uint64_t start = 0" 1 "Gemmini shared scalar start endpoint")
 require_gemmini_count("uint64_t end = 0" 1 "Gemmini shared scalar end endpoint")
 require_gemmini_count(
-    "rmd_telemetry_invocation_start = ggml::gemmini::cycle::read\\(\\)" 1
+    "rmd_telemetry_invocation_start = ggml::gemmini::read_matmul_cpu_sample\\(\\)" 1
     "Gemmini invocation start boundary")
 require_gemmini_count(
-    "rmd_telemetry_invocation_end = ggml::gemmini::cycle::read\\(\\)" 1
+    "rmd_telemetry_invocation_end = ggml::gemmini::read_matmul_cpu_sample\\(\\)" 1
     "Gemmini invocation end boundary")
 require_gemmini_count(
     "quantize_start =[
@@ -154,7 +154,7 @@ set(expected_gemmini_labels
     gemmini.prepare_dense_i8_weight
     gemmini.convert_q4_0_to_q4_h1
     gemmini.convert_q8_0_to_q8_h1
-    gemmini.prepare_args)
+    gemmini.output_preparation)
 string(REGEX MATCHALL
     "ggml::gemmini::log::cycle\\([^;]*\"gemmini\\.[a-zA-Z0-9_]+\"[^;]*\\)"
     gemmini_records "${gemmini_source}")
@@ -180,7 +180,8 @@ set(required_gemmini_operations
     "ggml::gemmini::prepare_q4_0_rows_for_q4_h1("
     "ggml::gemmini::prepare_q8_0_rows_for_q8_h1("
     "pipeline_stripe_telemetry(layer, profile)"
-    "rmd_telemetry_invocation_end >= rmd_telemetry_invocation_start")
+    "ggml::gemmini::evaluate_matmul_cpu_interval("
+    "rmd_telemetry_invocation_start, rmd_telemetry_invocation_end)")
 foreach(operation IN LISTS required_gemmini_operations)
     string(FIND "${gemmini_source}" "${operation}" operation_pos)
     if(operation_pos EQUAL -1)
@@ -211,5 +212,38 @@ foreach(token IN LISTS forbidden_gemmini_tokens)
     endif()
 endforeach()
 
+# Adapter boundaries must exist at the real callsites, not only in a name table.
+get_filename_component(gemmini_source_dir "${GEMMINI_SOURCE}" DIRECTORY)
+file(READ "${gemmini_source_dir}/ggml-gemmini-im2p.cpp" im2p_source)
+foreach(operation IN ITEMS
+        im2p.host_input_preparation
+        im2p.stripe_input_capture
+        im2p.stripe_submit_host_call
+        im2p.frontend_start_host_call
+        im2p.fence_host_call
+        im2p.residual_metadata_preparation
+        im2p.residual_backend_host_call
+        im2p.residual_result_reconstruction
+        im2p.output_correction_apply
+        im2p.post_fence_validation
+        im2p.output_authorize_host_call
+        im2p.output_buffer_copy)
+    string(FIND "${im2p_source}" "\"${operation}\"" operation_pos)
+    if(operation_pos EQUAL -1)
+        message(FATAL_ERROR "Missing real IM2P host CPU boundary: ${operation}")
+    endif()
+endforeach()
+# Both callback and FULL must connect the actual event to the direct worker metrics.
+string(REGEX MATCHALL "direct_metrics[.]run_id[ ]*=[^;]*" direct_run_bindings "${im2p_source}")
+list(LENGTH direct_run_bindings direct_run_count)
+if(NOT direct_run_count EQUAL 2)
+    message(FATAL_ERROR "FULL and PIPELINE must preserve direct worker run identity, including zero")
+endif()
+foreach(binding IN LISTS direct_run_bindings)
+    if(NOT binding STREQUAL "direct_metrics.run_id = event.run_id")
+        message(FATAL_ERROR "Direct worker identity must come from the actual event")
+    endif()
+endforeach()
+
 message(STATUS
-    "scalar cycle contract passed: 81 CPU records, 15 Gemmini endpoints, zero forbidden consumers")
+    "CPU operation coverage and IM2P host boundary contract passed")

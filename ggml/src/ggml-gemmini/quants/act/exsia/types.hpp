@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <vector>
 
 #ifndef GGML_GEMMINI_EXSIA_SIGMA
@@ -17,6 +18,7 @@ namespace ggml::gemmini::quants::act::exsia
 
 struct Meta
 {
+    std::optional<uint64_t> run_id; // originating quantization invocation, including run zero
     int16_t e_s = std::numeric_limits<int16_t>::min();
     int16_t rho = config::GGML_GEMMINI_ACTIVATION_RHO;
     int32_t sigma = GGML_GEMMINI_EXSIA_SIGMA;
@@ -26,6 +28,7 @@ struct Meta
 
     void reset()
     {
+        run_id.reset();
         e_s = std::numeric_limits<int16_t>::min();
         rho = config::GGML_GEMMINI_ACTIVATION_RHO;
         sigma = GGML_GEMMINI_EXSIA_SIGMA;

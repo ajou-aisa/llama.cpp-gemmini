@@ -14,14 +14,13 @@ if(finish_begin EQUAL -1 OR finish_end EQUAL -1 OR finish_end LESS finish_begin)
 endif()
 string(SUBSTRING "${source}" ${finish_begin} ${finish_end} finish_body)
 
-# reset() receives the real stripe identity. The capture object must retain it
-# and the standalone finish record must advertise stripe_id only; this boundary
-# has no real run_id and must not invent one.
+# Preserve the real stripe identity and optional caller context. Run zero is
+# valid; an absent run is never replaced by a generated identity.
 string(FIND "${source}" "stripe_id_ = stripe_id;" reset_stripe_assignment)
 if(reset_stripe_assignment EQUAL -1)
     message(FATAL_ERROR "F3: TimedResidualCapture::reset must retain its real stripe_id")
 endif()
-string(FIND "${finish_body}" "const gemmini_cycle_record_v2 record" record_begin)
+string(FIND "${finish_body}" "uint32_t identity_mask" record_begin)
 string(FIND "${finish_body}"
     "gemmini_log_cycle_record_v2_checked_internal" record_end)
 if(record_begin EQUAL -1 OR record_end EQUAL -1 OR record_end LESS record_begin)
@@ -30,16 +29,44 @@ endif()
 math(EXPR record_length "${record_end} - ${record_begin}")
 string(SUBSTRING "${finish_body}" ${record_begin} ${record_length} record_block)
 string(FIND "${record_block}" "GEMMINI_CYCLE_HAS_STRIPE_ID" stripe_mask)
-string(FIND "${record_block}" "0, stripe_id_, 0, 0, 0" stripe_value)
+string(FIND "${record_block}" "run_id_.value_or(0), stripe_id_, 0, 0, worker_id" stripe_value)
+string(FIND "${record_block}" "if (run_id_.has_value())" run_presence)
 string(FIND "${record_block}" "GEMMINI_CYCLE_HAS_RUN_ID" run_mask)
+string(FIND "${record_block}" "GEMMINI_CYCLE_HAS_WORKER_ID" worker_mask)
+string(FIND "${record_block}" "{{layer_, finish_op" layer_value)
 string(FIND "${record_block}" "next_" generated_identity)
-if(stripe_mask EQUAL -1 OR stripe_value EQUAL -1)
-    message(FATAL_ERROR
-        "F3: capture_finish identity mask/value must contain the retained stripe_id only")
+if(stripe_mask EQUAL -1 OR stripe_value EQUAL -1 OR run_presence EQUAL -1 OR
+   run_mask EQUAL -1 OR worker_mask EQUAL -1 OR layer_value EQUAL -1 OR
+   NOT run_presence LESS run_mask)
+    message(FATAL_ERROR "F3: capture_finish must preserve optional run, layer, stripe and actual worker context")
 endif()
-if(NOT run_mask EQUAL -1 OR NOT generated_identity EQUAL -1)
+if(NOT generated_identity EQUAL -1)
     message(FATAL_ERROR "F3: capture_finish must not invent run_id")
 endif()
+file(READ "${TEST_SOURCE_DIR}/ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp" exsia_source)
+string(FIND "${exsia_source}" "slot.rmd_builder.set_context(run_id, layer);" caller_context)
+if(caller_context EQUAL -1)
+    message(FATAL_ERROR "F3: ExSIA must supply its existing run and layer to the timed builder")
+endif()
+
+foreach(quantizer IN ITEMS tensor token stripe)
+    file(READ "${TEST_SOURCE_DIR}/ggml/src/ggml-gemmini/quants/act/${quantizer}/${quantizer}.cpp" quantizer_source)
+    string(FIND "${quantizer_source}" "TimedResidualCapture residual_capture(" capture_begin)
+    string(FIND "${quantizer_source}" "residual_capture.set_context(" context_begin)
+    string(FIND "${quantizer_source}" "residual_capture.reset(" capture_reset)
+    string(FIND "${quantizer_source}" "residual_capture.finish()" capture_finish)
+    if(capture_begin EQUAL -1 OR context_begin EQUAL -1 OR capture_reset EQUAL -1 OR
+       capture_finish EQUAL -1 OR NOT capture_begin LESS context_begin OR
+       NOT context_begin LESS capture_reset OR NOT capture_reset LESS capture_finish)
+        message(FATAL_ERROR "${quantizer} builder must receive context before reset and finish")
+    endif()
+    math(EXPR context_length "${capture_reset} - ${context_begin}")
+    string(SUBSTRING "${quantizer_source}" ${context_begin} ${context_length} context_call)
+    if(NOT context_call MATCHES "std::nullopt" OR
+       NOT context_call MATCHES "args[.]matmul_layer[.]c_str\\(\\)")
+        message(FATAL_ERROR "${quantizer} builder must keep its real layer and absent run")
+    endif()
+endforeach()
 
 string(REGEX MATCHALL "cycle::read_sample\\(\\)" finish_samples "${finish_body}")
 list(LENGTH finish_samples finish_sample_count)

@@ -121,14 +121,26 @@ struct PipelineStripeTelemetry {
     std::uint64_t row_end = 0;
     std::uint64_t queue_start_ns = 0;
     std::uint64_t queue_end_ns = 0;
+    std::uint64_t queue_start_tid = 0;
+    std::uint64_t queue_end_tid = 0;
     std::uint64_t dense_start_ns = 0;
     std::uint64_t dense_end_ns = 0;
+    std::uint64_t dense_start_tid = 0;
+    std::uint64_t dense_end_tid = 0;
     std::uint64_t rmd_start_ns = 0;
     std::uint64_t rmd_end_ns = 0;
+    std::uint64_t residual_backend_start_ns = 0;
+    std::uint64_t residual_backend_end_ns = 0;
+    std::uint64_t residual_backend_start_tid = 0;
+    std::uint64_t residual_backend_end_tid = 0;
     std::uint64_t compose_start_ns = 0;
     std::uint64_t compose_end_ns = 0;
+    std::uint64_t compose_start_tid = 0;
+    std::uint64_t compose_end_tid = 0;
     std::uint64_t finalize_start_ns = 0;
     std::uint64_t finalize_end_ns = 0;
+    std::uint64_t finalize_start_tid = 0;
+    std::uint64_t finalize_end_tid = 0;
 };
 
 std::string serialize_cycle_telemetry(const CycleIntervalTelemetry & record);

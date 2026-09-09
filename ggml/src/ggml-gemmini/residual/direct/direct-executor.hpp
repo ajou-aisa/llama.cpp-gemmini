@@ -31,7 +31,7 @@ enum class DirectCpuTileSource : uint8_t {
 };
 
 struct DirectCpuTileRecord {
-    uint64_t run_id = 0;
+    std::optional<uint64_t> run_id;
     size_t stripe_id = 0;
     size_t worker_id = 0;
     size_t tile_index = 0;
@@ -71,13 +71,14 @@ using DirectCpuSampleReader = DirectCpuSample (*)(
 struct DirectExecutionTestHooks {
     DirectCpuSampleReader sample_reader = nullptr;
     void * context = nullptr;
+    bool disable_host_profile = false;
 };
 
 }
 #endif
 
 struct DirectExecutionMetrics {
-    uint64_t run_id = 0;
+    std::optional<uint64_t> run_id;
     size_t event_count = 0;
     size_t call_count = 0;
     size_t native_q8_values = 0;

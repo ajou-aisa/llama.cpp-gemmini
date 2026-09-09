@@ -1,8 +1,10 @@
 #include "../ggml/src/ggml-gemmini/residual/residual-capture.hpp"
 
 #include <gemmini/cycle_reader.hpp>
+#include <gemmini/log.hpp>
 
 #include <cstdio>
+#include <string>
 
 namespace {
 
@@ -16,6 +18,7 @@ bool check(bool condition, const char * message) {
 
 bool direct_finish_preserves_the_canonical_payload() {
     residual::TimedResidualCapture capture(residual::ResidualRoute::cpu_direct);
+    capture.set_context(0, "capture-test-layer");
     capture.reset(3, 7, 2, 64, 17);
     if (!capture.add_residual(1, 33, -129) || !capture.add_residual(0, 2, 1)) {
         return check(false, "direct fixture accepts residuals");
@@ -72,6 +75,39 @@ bool empty_capture_performs_zero_reads() {
 }
 
 #if defined(__linux__) && defined(__aarch64__) && CYCLE_DETAIL
+bool finish_records_preserve_context() {
+    FILE *output = std::tmpfile();
+    if (!check(output != nullptr, "capture log fixture opens")) return false;
+    ggml::gemmini::log::cycle.set_output(output);
+    residual::TimedResidualCapture capture(residual::ResidualRoute::cpu_direct);
+    capture.set_context(0, "capture-test-layer");
+    capture.reset(3, 7, 2, 64, 17);
+    const bool added = capture.add_residual(0, 2, 1);
+    const auto payload = capture.finish();
+    capture.set_context(std::nullopt, nullptr);
+    capture.reset(4, 9, 2, 64, 17);
+    const bool added_again = capture.add_residual(0, 2, 1);
+    const auto next_payload = capture.finish();
+    ggml::gemmini::log::cycle.set_output(nullptr);
+    std::rewind(output);
+    char line[4096];
+    const bool first_read = std::fgets(line, sizeof(line), output) != nullptr;
+    const std::string first = first_read ? line : "";
+    const bool second_read = std::fgets(line, sizeof(line), output) != nullptr;
+    const std::string second = second_read ? line : "";
+    const bool extra = std::fgets(line, sizeof(line), output) != nullptr;
+    std::fclose(output);
+    return check(added && added_again && payload.direct && next_payload.direct && !extra &&
+                     first.find("\"run_id\":0") != std::string::npos &&
+                     first.find("\"layer\":\"capture-test-layer\"") != std::string::npos &&
+                     first.find("\"stripe_id\":3") != std::string::npos &&
+                     first.find("\"worker_id\":0") != std::string::npos &&
+                     second.find("\"run_id\":null") != std::string::npos &&
+                     second.find("\"layer\":null") != std::string::npos &&
+                     second.find("\"stripe_id\":4") != std::string::npos,
+                 "finish emits once with real zero context, then clears unavailable identity");
+}
+
 bool mismatches_are_invalid_with_an_exact_reason() {
     using cycle::NativeCycleReason;
     const cycle::NativeCycleSample start{
@@ -106,6 +142,7 @@ int main() {
         empty_capture_performs_zero_reads()
 #if defined(__linux__) && defined(__aarch64__) && CYCLE_DETAIL
         && mismatches_are_invalid_with_an_exact_reason()
+        && finish_records_preserve_context()
 #endif
         ;
     if (ok) std::puts("PASS: standalone residual capture-finish contract");

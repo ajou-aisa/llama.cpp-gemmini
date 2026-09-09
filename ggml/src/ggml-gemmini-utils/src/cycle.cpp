@@ -1,11 +1,99 @@
 #include "../include/gemmini/log.hpp"
-#if defined(__linux__) && defined(__aarch64__)
-#include "cycle_reader_internal.h"
-#endif
+#include "../include/gemmini/host-timing.hpp"
 
 #include <limits>
+#include <atomic>
+#include <chrono>
+#include <ctime>
+#include <exception>
 #include <mutex>
 #include <string>
+
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#elif defined(__APPLE__)
+#include <pthread.h>
+#include <unistd.h>
+#elif defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+namespace ggml::gemmini::cycle {
+
+uint64_t host_thread_id() noexcept {
+#if defined(__linux__)
+    return static_cast<uint64_t>(syscall(SYS_gettid));
+#elif defined(__APPLE__)
+    uint64_t tid = 0;
+    return pthread_threadid_np(nullptr, &tid) == 0 ? tid : 0;
+#elif defined(_WIN32)
+    return static_cast<uint64_t>(GetCurrentThreadId());
+#else
+    static std::atomic<uint64_t> next_id{1};
+    thread_local const uint64_t tid = next_id.fetch_add(1, std::memory_order_relaxed);
+    return tid;
+#endif
+}
+
+HostSample read_host_sample() noexcept {
+    HostSample sample;
+    sample.ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    sample.tid = host_thread_id();
+#if (defined(__linux__) || defined(__APPLE__)) && defined(CLOCK_THREAD_CPUTIME_ID)
+    timespec cpu_time{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_time) == 0) {
+        sample.thread_cpu_ns = static_cast<uint64_t>(cpu_time.tv_sec) * 1000000000ULL +
+            static_cast<uint64_t>(cpu_time.tv_nsec);
+        sample.thread_cpu_valid = true;
+    }
+#endif
+    return sample;
+}
+
+std::string serialize_thread_cpu_timing(const HostSample &start, const HostSample &end) {
+    const bool start_valid = start.thread_cpu_valid && start.tid != 0;
+    const bool end_valid = end.thread_cpu_valid && end.tid != 0;
+    const bool valid = start_valid && end_valid && start.tid == end.tid &&
+        end.thread_cpu_ns >= start.thread_cpu_ns;
+    return std::string("{\"clock\":\"thread_cpu\",\"unit\":\"nanosecond\",\"start_ns\":") +
+        (start_valid ? std::to_string(start.thread_cpu_ns) : "null") +
+        ",\"end_ns\":" + (end_valid ? std::to_string(end.thread_cpu_ns) : "null") +
+        ",\"duration_ns\":" + (valid ? std::to_string(end.thread_cpu_ns - start.thread_cpu_ns) : "null") +
+        ",\"valid\":" + (valid ? "true}" : "false}");
+}
+
+std::string serialize_host_timing(uint64_t start_ns, uint64_t end_ns,
+                                  uint64_t start_tid, uint64_t end_tid) {
+    static const std::string epoch = std::to_string(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+#if defined(__linux__) || defined(__APPLE__)
+    const uint64_t pid = static_cast<uint64_t>(getpid());
+    const char * const thread_kind = "os_tid";
+#elif defined(_WIN32)
+    const uint64_t pid = static_cast<uint64_t>(GetCurrentProcessId());
+    const char * const thread_kind = "os_tid";
+#else
+    const uint64_t pid = 0;
+    const char * const thread_kind = "process_thread_token";
+#endif
+    const bool valid = start_tid != 0 && end_tid != 0 && end_ns >= start_ns;
+    return std::string("{\"execution_id\":\"") + std::to_string(pid) + "-" + epoch +
+        "\",\"clock\":\"steady_clock\",\"unit\":\"nanosecond\",\"thread_id_kind\":\"" +
+        thread_kind + "\",\"start_ns\":" + (start_tid != 0 ? std::to_string(start_ns) : "null") +
+        ",\"end_ns\":" + (end_tid != 0 ? std::to_string(end_ns) : "null") +
+        ",\"start_tid\":" + (start_tid != 0 ? std::to_string(start_tid) : "null") +
+        ",\"end_tid\":" + (end_tid != 0 ? std::to_string(end_tid) : "null") +
+        ",\"duration_ns\":" + (valid ? std::to_string(end_ns - start_ns) : "null") +
+        ",\"valid\":" + (valid ? "true}" : "false}");
+}
+
+}
 
 namespace ggml::gemmini::log
 {
@@ -13,6 +101,8 @@ namespace ggml::gemmini::log
 
     namespace
     {
+        thread_local CycleWriteTiming *active_cycle_write_timing = nullptr;
+
         void append_json_escaped(std::string &out, const char *s)
         {
             if (!s)
@@ -48,11 +138,29 @@ namespace ggml::gemmini::log
         }
     } // namespace
 
-    static std::string serialize_cycle_record_impl(
-            const CycleRecord & record, bool linux_aarch64
-#if defined(__linux__) && defined(__aarch64__)
-            , bool provenance_available, bool checked_valid, const char * checked_reason
+    ScopedCycleWriteTiming::ScopedCycleWriteTiming(CycleWriteTiming &timing) noexcept
+        : timing_(timing), previous_(active_cycle_write_timing), initial_calls_(timing.calls),
+          initial_exceptions_(std::uncaught_exceptions())
+    {
+        active_cycle_write_timing = &timing;
+#if !LOG_CYCLE
+        timing.valid = false;
 #endif
+    }
+
+    ScopedCycleWriteTiming::~ScopedCycleWriteTiming() noexcept
+    {
+        if (timing_.calls == initial_calls_ || std::uncaught_exceptions() > initial_exceptions_)
+        {
+            timing_.valid = false;
+        }
+        active_cycle_write_timing = previous_;
+    }
+
+    static std::string serialize_cycle_record_impl(
+            const CycleRecord & record, bool linux_aarch64,
+            bool provenance_available = false, bool checked_valid = false,
+            const char * checked_reason = nullptr, const char * sample_reason = nullptr
     ) {
 #if defined(__riscv)
         const char * const default_source = linux_aarch64 ? "linux_perf_cpu_cycles" : "riscv_cycle";
@@ -65,12 +173,10 @@ namespace ggml::gemmini::log
         const char * const unit = record.unit ? record.unit : default_unit;
         bool valid = record.end >= record.start;
         const char * reason = nullptr;
-#if defined(__linux__) && defined(__aarch64__)
         if (provenance_available) {
             valid = checked_valid;
             reason = checked_reason;
         } else
-#endif
         if (linux_aarch64) {
             if (record.start == 0) {
                 valid = false;
@@ -154,6 +260,7 @@ namespace ggml::gemmini::log
         json += valid ? "true" : "false";
         if (linux_aarch64 && !valid) {
             add_string("reason", reason ? reason : "counter_regression");
+            add_string("sample_reason", sample_reason);
         }
 #if LOG_DETAIL
         add_string("file", record.file);
@@ -173,13 +280,11 @@ namespace ggml::gemmini::log
 #endif
     }
 
-#if defined(__linux__) && defined(__aarch64__)
     std::string serialize_checked_cycle_record(const CycleRecord & record, bool valid,
-                                               const char * reason)
+                                               const char * reason, const char * sample_reason)
     {
-        return serialize_cycle_record_impl(record, true, true, valid, reason);
+        return serialize_cycle_record_impl(record, true, true, valid, reason, sample_reason);
     }
-#endif
 
     namespace testing
     {
@@ -248,7 +353,22 @@ namespace ggml::gemmini::log
     void CycleLog::emit(const char *path, const std::string &json)
     {
 #if LOG_CYCLE
+        CycleWriteTiming * const timing = active_cycle_write_timing;
+        const bool previously_valid = timing && timing->valid;
+        if (timing)
+        {
+            ++timing->calls;
+            timing->valid = false;
+        }
+        const auto wait_start = timing ? std::chrono::steady_clock::now() :
+            std::chrono::steady_clock::time_point{};
         std::lock_guard<std::mutex> lock(detail::output_mutex());
+        if (timing)
+        {
+            timing->mutex_wait_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - wait_start).count());
+        }
         if (disabled_)
         {
             return;
@@ -283,12 +403,22 @@ namespace ggml::gemmini::log
         }
 
         const bool write_fault = detail::consume_fault(testing::LogFault::write);
+        const auto io_start = timing ? std::chrono::steady_clock::now() :
+            std::chrono::steady_clock::time_point{};
         const std::size_t written = write_fault ? 0 : std::fwrite(json.data(), 1, json.size(), output);
         const bool flush_fault = detail::consume_fault(testing::LogFault::flush);
         const int flushed = flush_fault ? EOF : std::fflush(output);
+        if (timing)
+        {
+            timing->io_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - io_start).count());
+            timing->valid = previously_valid && written == json.size() && flushed == 0;
+        }
         if (owns_call_output)
         {
-            std::fclose(output);
+            const int closed = std::fclose(output);
+            if (timing && closed != 0) timing->valid = false;
         }
         if (written != json.size() || flushed != 0)
         {
@@ -333,6 +463,7 @@ namespace ggml::gemmini::log
     void CycleLog::report_failure(const char * operation) noexcept
     {
 #if LOG_CYCLE
+        if (active_cycle_write_timing) active_cycle_write_timing->valid = false;
         try
         {
             std::lock_guard<std::mutex> lock(detail::output_mutex());
