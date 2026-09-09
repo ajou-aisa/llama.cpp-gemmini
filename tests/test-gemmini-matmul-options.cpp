@@ -200,7 +200,7 @@ ggml_gemmini_args_t make_args(std::vector<elem_t> & activation,
     return args;
 }
 
-bool test_staged_exsia_host_pipeline_semantic_layer(const char * trace_path = nullptr) {
+bool test_staged_exsia_host_pipeline_semantic_layer() {
     constexpr size_t stripe_rows = DIM;
     constexpr size_t rows = 2 * stripe_rows + 1;
     constexpr size_t columns = 2;
@@ -273,9 +273,8 @@ bool test_staged_exsia_host_pipeline_semantic_layer(const char * trace_path = nu
     auto & meta = std::get<quants::act::exsia::Meta>(
         quant_args.act_quant.storage());
     quants::act::exsia::ExSIA exsia;
-    exsia.set_execution_mode(trace_path == nullptr
-        ? quants::act::exsia::ExSIAState::ExecutionMode::Sequential
-        : quants::act::exsia::ExSIAState::ExecutionMode::LocalFoldingPipeline);
+    exsia.set_execution_mode(
+        quants::act::exsia::ExSIAState::ExecutionMode::Sequential);
     SemanticLayerObservations observations;
     set_test_semantic_layer_observer(observe_semantic_layer, &observations);
 
@@ -323,26 +322,6 @@ bool test_staged_exsia_host_pipeline_semantic_layer(const char * trace_path = nu
     for (const auto & profile : profiles) {
         summaries.push_back(detail::pipeline_stripe_telemetry(
             semantic_layer.c_str(), profile));
-    }
-    if (trace_path != nullptr) {
-        FILE * trace = std::fopen(trace_path, "w");
-        if (!check(trace != nullptr, "host timing trace opens")) return false;
-        bool written = true;
-        for (size_t begin = 0; begin < debug_output.size();) {
-            const size_t newline = debug_output.find('\n', begin);
-            const size_t end = newline == std::string::npos ? debug_output.size() : newline;
-            if (debug_output[begin] == '{') {
-                written = std::fwrite(debug_output.data() + begin, 1, end - begin, trace) == end - begin && written;
-                written = std::fputc('\n', trace) != EOF && written;
-            }
-            begin = end + 1;
-        }
-        for (const auto & summary : summaries) {
-            const auto json = serialize_cycle_telemetry(summary);
-            written = std::fprintf(trace, "%s\n", json.c_str()) >= 0 && written;
-        }
-        written = std::fclose(trace) == 0 && written;
-        if (!check(written, "host timing trace writes captured intervals and summaries")) return false;
     }
     const bool canonical_ranges = profiles.size() == 3 &&
         profiles[0].row_begin == 0 &&
@@ -863,9 +842,6 @@ bool test_disabled_mode_status_contract() {
 }
 
 int main(int argc, char ** argv) {
-    if (argc == 3 && std::strcmp(argv[1], "--host-timing-output") == 0) {
-        return test_staged_exsia_host_pipeline_semantic_layer(argv[2]) ? 0 : 1;
-    }
     if (argc == 2 && std::strcmp(argv[1], "--staged-exsia-pipeline") == 0) {
         const bool passed = test_staged_exsia_host_pipeline_semantic_layer() &&
             test_staged_exsia_by_value_preserves_producer_metadata();
