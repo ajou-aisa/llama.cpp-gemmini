@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import csv
 import json
 import os
 import subprocess
@@ -83,30 +82,28 @@ class ResidualProfileTests(unittest.TestCase):
                                "--output-dir", str(self.output), *options],
                               capture_output=True, text=True, check=False)
 
-    def csv_rows(self, name: str) -> list:
-        with (self.output / name).open(encoding="utf-8", newline="") as stream:
-            return list(csv.DictReader(stream))
-
     def test_exact_nanoseconds_and_shared_axis_when_workers_overlap(self) -> None:
         # Given mixed legacy telemetry, an epoch above 2^53 and consecutive stripes.
         records = [{"record_type": "RMD_BACKEND_TELEMETRY"}, fixture(), fixture(1, 110)]
         # When the real CLI renders the input.
         result = self.run_cli(records)
-        # Then exact differences survive CSV export and SVG position calculation.
+        # Then exact differences survive the trace and SVG position calculation.
         self.assertEqual(result.returncode, 0, result.stderr)
-        rows = self.csv_rows("tiles.csv")
-        self.assertEqual([row["compute_wall_ns"] for row in rows], ["30", "50", "30", "50"])
-        self.assertEqual(rows[0]["start_ns"], str(EPOCH + 20))
-        self.assertEqual(rows[0]["start_relative_ns"], "20")
+        trace = json.loads((self.output / "trace.json").read_text(encoding="utf-8"))
+        tiles = [event for event in trace["traceEvents"] if event["name"] == "J-tile compute"]
+        self.assertEqual([event["args"]["wall_ns"] for event in tiles], ["30", "50", "30", "50"])
+        self.assertEqual(tiles[0]["args"]["start_ns"], str(EPOCH + 20))
+        self.assertEqual(tiles[0]["ts"], 0.020)
         tree = ET.parse(self.output / "worker-timeline.svg")
         segments = [node for node in tree.iter() if node.get("data-kind") == "compute"]
         self.assertEqual([node.get("data-start-ns") for node in segments], ["20", "25", "130", "135"])
         first, second = segments[:2]
         self.assertLess(float(second.get("x")), float(first.get("x")) + float(first.get("width")))
         self.assertGreater(float(second.get("x")), float(first.get("x")))
-        self.assertTrue((self.output / "summary.md").is_file())
+        self.assertEqual({path.name for path in self.output.iterdir()},
+                         {"summary.md", "worker-timeline.svg", "trace.json"})
 
-    def test_missing_cpu_and_unavailable_logging_remain_blank(self) -> None:
+    def test_missing_cpu_and_unavailable_logging_remain_unmeasured(self) -> None:
         # Given unavailable CPU sampling and a platform without legacy logging.
         record = fixture()
         del record["workers"][0]["thread_cpu_timing"]
@@ -121,12 +118,17 @@ class ResidualProfileTests(unittest.TestCase):
         tile["log_valid"] = False
         # When rendered.
         result = self.run_cli([record])
-        # Then missing measurements are blank, not zero or estimates.
+        # Then missing CPU measurements stay null and unavailable logging has no span.
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.csv_rows("workers.csv")[0]["worker_thread_cpu_ns"], "")
-        row = self.csv_rows("tiles.csv")[0]
-        for column in ("compute_thread_cpu_ns", "log_wall_ns", "log_thread_cpu_ns", "log_calls", "log_io_ns"):
-            self.assertEqual(row[column], "")
+        trace = json.loads((self.output / "trace.json").read_text(encoding="utf-8"))
+        worker_events = [event for event in trace["traceEvents"]
+                         if event["ph"] == "X" and event["args"].get("worker_id") == 0]
+        for name in ("worker work", "J-tile compute"):
+            event = next(event for event in worker_events if event["name"] == name)
+            self.assertIsNone(event["args"]["thread_cpu_ns"])
+        self.assertNotIn("legacy logging", [event["name"] for event in worker_events])
+        summary = (self.output / "summary.md").read_text(encoding="utf-8")
+        self.assertIn("| synthetic-test-only | 7 | synthetic.layer | 0 | 80 | 110 |  | 42 | 80 |  |", summary)
 
     def test_deep_stage_totals_preserve_cycles_and_unavailable_measurements(self) -> None:
         # Given exact large cycle values and one unavailable PMU stage.
@@ -135,19 +137,16 @@ class ResidualProfileTests(unittest.TestCase):
             cycles=None, cycles_valid=False, cycles_reason="unsupported_platform", thread_cpu_ns=None)
         # When rendered through the CLI.
         result = self.run_cli([record])
-        # Then tile, worker and stripe totals retain integers and propagate invalid measurements.
+        # Then worker and stripe totals retain integers and propagate invalid measurements.
         self.assertEqual(result.returncode, 0, result.stderr)
-        rows = self.csv_rows("stages.csv")
-        stripe = {row["stage"]: row for row in rows if row["scope"] == "stripe"}
-        self.assertEqual(stripe["weight_dot"]["cycles"], str((1 << 55) + 3))
-        self.assertEqual(stripe["weight_dot"]["calls"], "3")
-        self.assertEqual(stripe["weight_dot"]["wall_ns"], "22")
-        self.assertEqual(stripe["scale_apply"]["cycles"], "")
-        self.assertEqual(stripe["scale_apply"]["thread_cpu_ns"], "")
-        self.assertEqual(stripe["scale_apply"]["cycles_reason"], "unsupported_platform")
-        self.assertEqual(len([row for row in rows if row["scope"] == "worker"]), 6)
-        tile = next(row for row in rows if row["scope"] == "tile" and row["stage"] == "weight_dot")
-        self.assertEqual(tile["cycles"], str((1 << 54) + 1))
+        summary = (self.output / "summary.md").read_text(encoding="utf-8")
+        self.assertIn("| synthetic-test-only | 7 | synthetic.layer | 0 | stripe |  |  | weight_dot | "
+                      f"3 | 22 | 20 | {(1 << 55) + 3} | true | none |", summary)
+        self.assertIn("| synthetic-test-only | 7 | synthetic.layer | 0 | stripe |  |  | scale_apply | "
+                      "3 | 10 |  |  | false | unsupported_platform |", summary)
+        self.assertEqual(summary.count(" | 0 | worker | "), 6)
+        self.assertIn("| synthetic-test-only | 7 | synthetic.layer | 0 | worker | 0 |  | weight_dot | "
+                      f"1 | 11 | 10 | {(1 << 54) + 1} | true | none |", summary)
 
     def test_trace_and_timeline_keep_execution_origins_and_measured_spans(self) -> None:
         # Given two executions with unrelated host epochs and aggregate-only stages.
@@ -202,7 +201,11 @@ class ResidualProfileTests(unittest.TestCase):
         result = self.run_cli([unrelated, fixture()], "--run-id", "7", "--layer", "synthetic.layer", "--stripe-id", "0")
         # Then only the selected stripe is exported.
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(self.csv_rows("workers.csv")), 2)
+        trace = json.loads((self.output / "trace.json").read_text(encoding="utf-8"))
+        workers = [event for event in trace["traceEvents"] if event["name"] == "worker work"]
+        self.assertEqual([(event["args"]["run_id"], event["args"]["stripe_id"],
+                           event["args"]["worker_id"], event["tid"]) for event in workers],
+                         [(7, 0, 0, 101), (7, 0, 1, 102)])
 
     def test_corrupt_selected_telemetry_never_publishes(self) -> None:
         mutations = (
@@ -293,17 +296,15 @@ def test_runtime_fixture(executable: Path) -> None:
                                       capture_output=True, text=True, check=False)
             assert rendered.returncode == 0, rendered.stderr
             # Then repeated stripes expose a tile trace and only enabled stages.
-            with (output / "stages.csv").open(encoding="utf-8", newline="") as stream:
-                stages = list(csv.DictReader(stream))
+            summary = (output / "summary.md").read_text(encoding="utf-8")
+            stripes = [line.split(" | ") for line in summary.splitlines() if " | stripe | " in line]
             if deep_profile:
-                stripes = [row for row in stages if row["scope"] == "stripe"]
                 assert len(stripes) == 12
-                assert {row["stage"] for row in stripes} == {"event_scan", "weight_dot", "scale_apply"}
-                assert {row["run_id"] for row in stripes} == {"27159", "27160"}
-                assert all(int(row["calls"]) == (15 if row["stripe_id"] == "3" else 9)
-                           and row["wall_ns"] != "" for row in stripes)
+                assert {row[7] for row in stripes} == {"event_scan", "weight_dot", "scale_apply"}
+                assert {row[1] for row in stripes} == {"27159", "27160"}
+                assert all(int(row[8]) == (15 if row[3] == "3" else 9) and row[9] != "" for row in stripes)
             else:
-                assert not stages
+                assert not stripes
             trace = json.loads((output / "trace.json").read_text(encoding="utf-8"))
             assert sum(event["ph"] == "X" and event["name"] == "J-tile compute"
                        for event in trace["traceEvents"]) == 12

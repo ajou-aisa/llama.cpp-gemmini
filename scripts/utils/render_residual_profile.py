@@ -17,17 +17,37 @@ try:
     from .cycle_schema import CycleSchemaError
     from .residual_profile import PHASES, HostTiming, Profile, Tile, Timing, read_profiles
     from .residual_trace import trace
-    from .table_output import TableRow, export_csv, render_markdown
 except ImportError:
     from cycle_schema import CycleSchemaError
     from residual_profile import PHASES, HostTiming, Profile, Tile, Timing, read_profiles
     from residual_trace import trace
-    from table_output import TableRow, export_csv, render_markdown
 
 IDENTITY: Final = ("execution_id", "run_id", "layer", "stripe_id")
 COLORS: Final = {"compute": "#217c5b", "legacy logging": "#c97818", "barrier": "#7854a8"}
 STAGE_COLUMNS: Final = IDENTITY + ("scope", "worker_id", "node_id", "stage", "calls", "wall_ns",
                                   "thread_cpu_ns", "cycles", "cycles_valid", "cycles_reason")
+TableRow = tuple[str, ...]
+
+
+class TableOutputError(Exception):
+    """Raised when table data violates the renderer contract."""
+
+
+def _markdown_cell(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ")
+
+
+def render_markdown(headers: Sequence[str], rows: Sequence[TableRow]) -> str:
+    """Render a stable ASCII Markdown table."""
+    if not headers:
+        raise TableOutputError("at least one header is required")
+    width = len(headers)
+    if any(len(row) != width for row in rows):
+        raise TableOutputError("row width does not match headers")
+    header = "| " + " | ".join(_markdown_cell(cell) for cell in headers) + " |"
+    separator = "| " + " | ".join("---" for _ in headers) + " |"
+    body = ["| " + " | ".join(_markdown_cell(cell) for cell in row) + " |" for row in rows]
+    return "\n".join((header, separator, *body)) + "\n"
 
 
 def cell(value: Optional[int | str]) -> str:
@@ -46,36 +66,6 @@ def duration(timing: Optional[Timing]) -> Optional[int]:
     return None if timing is None else timing.host.duration_ns
 
 
-def cpu(timing: Optional[Timing]) -> Optional[int]:
-    return None if timing is None else timing.cpu_ns
-
-
-def worker_rows(profiles: Sequence[Profile]) -> tuple[TableRow, ...]:
-    rows = []
-    for profile in profiles:
-        for worker in profile.workers:
-            tiles = [tile for tile in profile.tiles if tile.worker_id == worker.worker_id]
-            rows.append(identity(profile) + tuple(cell(value) for value in (
-                worker.worker_id, worker.tid, worker.timing.host.start_ns, worker.timing.host.end_ns,
-                worker.timing.host.duration_ns, worker.timing.cpu_ns, duration(worker.barrier), cpu(worker.barrier),
-                len(tiles), sum(tile.timing.host.duration_ns for tile in tiles),
-                complete_sum([tile.timing.cpu_ns for tile in tiles]),
-                complete_sum([duration(tile.log) for tile in tiles]),
-                complete_sum([cpu(tile.log) for tile in tiles]),
-            )))
-    return tuple(rows)
-
-
-def tile_rows(profiles: Sequence[Profile]) -> tuple[TableRow, ...]:
-    origins = {profile.host.execution_id: min(item.host.start_ns for item in profiles
-               if item.host.execution_id == profile.host.execution_id) for profile in profiles}
-    return tuple(identity(profile) + tuple(cell(value) for value in (
-        tile.node_id, tile.worker_id, tile.j_begin, tile.j_end, tile.timing.host.start_ns, tile.timing.host.end_ns,
-        tile.timing.host.start_ns - origins[profile.host.execution_id], tile.timing.host.duration_ns,
-        tile.timing.cpu_ns, duration(tile.log), cpu(tile.log), tile.log_calls, tile.log_mutex_wait_ns, tile.log_io_ns,
-    )) for profile in profiles for tile in profile.tiles)
-
-
 def stage_rows(profiles: Sequence[Profile]) -> tuple[TableRow, ...]:
     rows = []
     for profile in profiles:
@@ -85,7 +75,6 @@ def stage_rows(profiles: Sequence[Profile]) -> tuple[TableRow, ...]:
         groups.extend(("worker", worker.worker_id, None,
                        tuple(tile for tile in profile.tiles if tile.worker_id == worker.worker_id))
                       for worker in profile.workers)
-        groups.extend(("tile", tile.worker_id, tile.node_id, (tile,)) for tile in profile.tiles)
         for scope, worker_id, node_id, tiles in groups:
             if not tiles:
                 continue
@@ -157,7 +146,7 @@ def summary(profiles: Sequence[Profile]) -> str:
                      "events; weight_dot includes weight reading and integer multiply/accumulate; scale_apply reads scales "
                      "and applies the block result. Deep probes add overhead. Worker and stripe totals aggregate the same "
                      "tile data; do not add scopes together. PMU cycles are independent of wall/thread CPU nanoseconds.\n")
-        lines.append(render_markdown(STAGE_COLUMNS, tuple(row for row in stages if row[4] != "tile")))
+        lines.append(render_markdown(STAGE_COLUMNS, stages))
     missing = [profile for profile in profiles if not profile.tiles[0].stages]
     if missing:
         lines.append(f"{len(missing)} selected stripe(s) have no inner-stage measurements. "
@@ -238,23 +227,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         profiles = read_profiles(args.input, run_id=args.run_id, layer=args.layer, stripe_id=args.stripe_id)
-        targets = [args.output_dir / name for name in
-                   ("summary.md", "workers.csv", "tiles.csv", "worker-timeline.svg", "stages.csv", "trace.json")]
+        targets = [args.output_dir / name for name in ("summary.md", "worker-timeline.svg", "trace.json")]
         for target in targets:
             if target.exists():
                 raise FileExistsError(f"output target already exists: {target}")
         report, svg = summary(profiles), timeline(profiles)
         args.output_dir.mkdir(parents=True, exist_ok=True)
-        export_csv(targets[1], IDENTITY + ("worker_id", "tid", "start_ns", "end_ns", "worker_wall_ns",
-            "worker_thread_cpu_ns", "barrier_wall_ns", "barrier_thread_cpu_ns", "tile_count", "sum_compute_wall_ns",
-            "sum_compute_thread_cpu_ns", "sum_log_wall_ns", "sum_log_thread_cpu_ns"), worker_rows(profiles))
-        export_csv(targets[2], IDENTITY + ("node_id", "worker_id", "j_begin", "j_end", "start_ns", "end_ns",
-            "start_relative_ns", "compute_wall_ns", "compute_thread_cpu_ns", "log_wall_ns", "log_thread_cpu_ns",
-            "log_calls", "log_mutex_wait_ns", "log_io_ns"), tile_rows(profiles))
         targets[0].write_text(report, encoding="utf-8")
-        targets[3].write_text(svg, encoding="utf-8")
-        export_csv(targets[4], STAGE_COLUMNS, stage_rows(profiles))
-        targets[5].write_text(trace(profiles), encoding="utf-8")
+        targets[1].write_text(svg, encoding="utf-8")
+        targets[2].write_text(trace(profiles), encoding="utf-8")
     except (CycleSchemaError, OSError) as error:
         print(error, file=sys.stderr)
         return 1
