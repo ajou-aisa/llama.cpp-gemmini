@@ -1,8 +1,5 @@
 #include "../include/gemmini/log.hpp"
 #include "../include/gemmini/host-timing.hpp"
-#if defined(__linux__) && defined(__aarch64__)
-#include "cycle_reader_internal.h"
-#endif
 
 #include <limits>
 #include <atomic>

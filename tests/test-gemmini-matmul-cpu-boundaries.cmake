@@ -300,8 +300,6 @@ foreach(op IN ITEMS pipeline_drain_and_join matmul_output_validation_and_publish
     require_token("${source}" "\"${op}\"" "lifecycle interval")
 endforeach()
 require_token("${source}" "kNativeCycleSource, kNativeCycleUnit" "portable records retain native domain")
-require_token("${source}" "evaluate_matmul_cpu_interval(start, end)" "algorithm result is not eligibility")
-require_token("${source}" "interval.sample_reason" "underlying PMU failure survives")
 file(READ "${gemmini_source_dir}/ggml-gemmini-matmul.hpp" header)
 require_order("${header}" "reader collection gate"
     "inline MatmulCpuSample read_matmul_cpu_sample()" "#if LOG_CYCLE"
@@ -313,6 +311,12 @@ require_order("${header}" "host reader is independent of native validity"
 # Presence is independent of scalar zero; the actual production projection is
 # exercised through the provider-free reducer target as well.
 file(READ "${gemmini_source_dir}/ggml-gemmini-telemetry.cpp" telemetry)
+require_order("${telemetry}" "shared serializer retains checked samples and host endpoints"
+    "std::string serialize_matmul_cpu_interval" "explicit_interval != nullptr ? *explicit_interval :"
+    "evaluate_matmul_cpu_interval(start, end)"
+    "record.start = start.value" "record.end = end.value"
+    "serialize_checked_cycle_record" "interval.sample_reason"
+    "cycle::serialize_host_timing(start.ns, end.ns, start.tid, end.tid)")
 require_absent("${source}" "run_id != 0" "no run-zero sentinel in lifecycle/context propagation")
 require_absent("${telemetry}" "run_id != 0" "no run-zero sentinel in CPU projection")
 require_token("${telemetry}" "record.identity_mask = profile->cpu_identity_mask" "profile presence projection")
@@ -326,9 +330,13 @@ require_token("${finish_stripes}" "matmul_cpu_run_id(args())" "output finish met
 extract_between(emitter "void emit_matmul_cpu_interval" "void emit_matmul_native_interval")
 require_order("${emitter}" "nonthrowing CPU telemetry boundary"
     "noexcept" "try {" "project_matmul_cpu_identity"
-    "serialize_checked_cycle_record" "cycle::serialize_host_timing(start.ns, end.ns, start.tid, end.tid)"
-    "log::cycle.write_json" "catch (...)"
+    "log::cycle.write_json" "serialize_matmul_cpu_interval" "catch (...)"
     "log::cycle.report_failure")
+file(READ "${gemmini_source_dir}/ggml-gemmini-im2p.cpp" im2p)
+require_order("${im2p}" "IM2P retains its measurement and failure boundary"
+    "void finish(" "const auto end = read_matmul_cpu_sample()" "active_ = false"
+    "try {" "log::cycle.write_json" "serialize_matmul_cpu_interval"
+    "record_, start_, end, operation_success" "catch (...)" "log::cycle.report_failure")
 extract_between(native_adapter "void emit_matmul_native_interval" "class ProofHash64")
 require_token("${native_adapter}" "{start.value, true, start, start_ns, start_tid}"
     "native adapter preserves CPU sample and host start independently")

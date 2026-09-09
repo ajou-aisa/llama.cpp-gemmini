@@ -8,6 +8,23 @@
 
 namespace ggml::gemmini {
 
+std::string serialize_matmul_cpu_interval(log::CycleRecord record,
+        const MatmulCpuSample & start, const MatmulCpuSample & end,
+        bool operation_success, const MatmulCpuInterval * explicit_interval) {
+    const auto interval = explicit_interval != nullptr ? *explicit_interval :
+        evaluate_matmul_cpu_interval(start, end);
+    record.start = start.value;
+    record.end = end.value;
+    std::string json = log::serialize_checked_cycle_record(record, interval.cycles.has_value(),
+        interval.reason.empty() ? nullptr : interval.reason.c_str(),
+        interval.sample_reason.empty() ? nullptr : interval.sample_reason.c_str());
+    json.insert(json.rfind('}'),
+        std::string(",\"cpu_measurement_version\":1,\"operation_success\":") +
+        (operation_success ? "true" : "false") + ",\"additive\":false,\"host_timing\":" +
+        cycle::serialize_host_timing(start.ns, end.ns, start.tid, end.tid));
+    return json;
+}
+
 void project_matmul_cpu_identity(log::CycleRecord & record,
         const MatmulJobMetrics * profile, std::optional<uint64_t> invocation_run_id) {
     if (profile != nullptr) {

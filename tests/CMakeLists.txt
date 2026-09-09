@@ -805,7 +805,8 @@ target_include_directories(test-gemmini-rmd-reducer PRIVATE
 add_test(NAME test-gemmini-rmd-reducer
     COMMAND $<TARGET_FILE:test-gemmini-rmd-reducer>)
 if (UNIX AND EXISTS "${IM2P_SIM_ROOT}/frontend/include/im2p_gemmini_frontend.hpp")
-    add_executable(test-gemmini-im2p-host-cycle test-gemmini-im2p-routing.cpp)
+    add_executable(test-gemmini-im2p-host-cycle test-gemmini-im2p-routing.cpp
+        ../ggml/src/ggml-gemmini/ggml-gemmini-telemetry.cpp)
     target_link_libraries(test-gemmini-im2p-host-cycle PRIVATE ggml-base ggml-gemmini-utils)
     target_compile_features(test-gemmini-im2p-host-cycle PRIVATE cxx_std_17)
     target_compile_definitions(test-gemmini-im2p-host-cycle PRIVATE

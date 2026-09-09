@@ -288,6 +288,10 @@ inline MatmulCpuInterval evaluate_matmul_cpu_interval(
 #endif
 }
 
+std::string serialize_matmul_cpu_interval(log::CycleRecord record,
+    const MatmulCpuSample & start, const MatmulCpuSample & end,
+    bool operation_success, const MatmulCpuInterval * explicit_interval = nullptr);
+
 inline std::optional<uint64_t> matmul_cpu_run_id(const ggml_gemmini_args_t & args) {
     const auto * meta = std::get_if<quants::act::exsia::Meta>(&args.act_quant.storage());
     return meta != nullptr ? meta->run_id : std::nullopt;

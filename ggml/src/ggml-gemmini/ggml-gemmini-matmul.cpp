@@ -22,19 +22,11 @@ void emit_matmul_cpu_interval(const char * layer, const char * op,
         std::optional<uint64_t> invocation_run_id = {}) noexcept {
 #if LOG_CYCLE
     try {
-        const auto interval = explicit_interval != nullptr ? *explicit_interval :
-            evaluate_matmul_cpu_interval(start, end);
-        log::CycleRecord record{layer, op, start.value, end.value, nullptr, 0, nullptr,
+        log::CycleRecord record{layer, op, 0, 0, nullptr, 0, nullptr,
                                 kNativeCycleSource, kNativeCycleUnit};
         project_matmul_cpu_identity(record, profile, invocation_run_id);
-        std::string json = log::serialize_checked_cycle_record(record, interval.cycles.has_value(),
-            interval.reason.empty() ? nullptr : interval.reason.c_str(),
-            interval.sample_reason.empty() ? nullptr : interval.sample_reason.c_str());
-        const std::string metadata = std::string(",\"cpu_measurement_version\":1,\"operation_success\":") +
-            (operation_success ? "true" : "false") + ",\"additive\":false,\"host_timing\":" +
-            cycle::serialize_host_timing(start.ns, end.ns, start.tid, end.tid);
-        json.insert(json.rfind('}'), metadata);
-        log::cycle.write_json(json);
+        log::cycle.write_json(serialize_matmul_cpu_interval(
+            record, start, end, operation_success, explicit_interval));
     } catch (...) {
         log::cycle.report_failure("matmul CPU interval");
     }

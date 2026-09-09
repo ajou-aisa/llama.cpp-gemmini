@@ -71,17 +71,8 @@ public:
     const auto end = read_matmul_cpu_sample();
     active_ = false;
     try {
-      const auto interval = evaluate_matmul_cpu_interval(start_, end);
-      record_.start = start_.value;
-      record_.end = end.value;
-      std::string json = log::serialize_checked_cycle_record(
-          record_, interval.cycles.has_value(), interval.reason.c_str(),
-          interval.sample_reason.empty() ? nullptr : interval.sample_reason.c_str());
-      json.insert(json.rfind('}'),
-          std::string(",\"cpu_measurement_version\":1,\"operation_success\":") +
-          (operation_success ? "true" : "false") + ",\"additive\":false,\"host_timing\":" +
-          cycle::serialize_host_timing(start_.ns, end.ns, start_.tid, end.tid));
-      log::cycle.write_json(json);
+      log::cycle.write_json(serialize_matmul_cpu_interval(
+          record_, start_, end, operation_success));
     } catch (...) {
       log::cycle.report_failure("IM2P host CPU interval");
     }
