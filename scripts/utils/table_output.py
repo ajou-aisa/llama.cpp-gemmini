@@ -3,10 +3,8 @@
 
 from __future__ import annotations
 
-import argparse
 import html
 import math
-import sys
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -71,19 +69,3 @@ def render_svg(title: str, bars: Sequence[BarValue]) -> str:
         lines.append(f'<text x="395" y="{y}" text-anchor="end">{numeric}</text>')
     lines.append("</svg>")
     return "\n".join(lines) + "\n"
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    """Exercise output-only validation from the command line."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--output-only", action="store_true")
-    parser.add_argument("units", nargs="+")
-    args = parser.parse_args(argv)
-    if args.output_only and len(set(args.units)) != 1:
-        print("bar series must use one unit", file=sys.stderr)
-        return 2
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
