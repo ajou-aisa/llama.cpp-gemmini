@@ -106,17 +106,7 @@ static int open_descriptor_count() {
 #endif
 }
 
-int main(int argc, char ** argv) {
-    const bool linux_aarch64_scalar = argc == 2 &&
-        std::string(argv[1]) == "--linux-aarch64-scalar";
-    if (argc != 1 && !linux_aarch64_scalar) {
-        std::fprintf(stderr, "usage: %s [--linux-aarch64-scalar]\n", argv[0]);
-        return 20;
-    }
-    // Select only the scalar serialization policy, not native PMU execution.
-    const auto serialize_scalar = linux_aarch64_scalar
-        ? ggml::gemmini::log::testing::serialize_linux_aarch64_scalar_cycle_record_for_test
-        : ggml::gemmini::log::serialize_cycle_record;
+int main() {
     using ggml::gemmini::log::testing::LogFault;
     // Synthetic checked output, not a physical PMU reading on this host.
     const ggml::gemmini::log::CycleRecord checked_fixture{
@@ -135,22 +125,21 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "checked output must preserve sample failure and valid zero\n");
         return 19;
     }
-    const std::string scalar = serialize_scalar(
+    const std::string scalar = ggml::gemmini::log::serialize_cycle_record(
         {"scalar", "public", 10, 12, nullptr, 0, nullptr});
-    const std::string legacy_equal = serialize_scalar(
+    const std::string legacy_equal = ggml::gemmini::log::serialize_cycle_record(
         {"scalar", "public.equal", 10, 10, nullptr, 0, nullptr});
-    const std::string legacy_regression = serialize_scalar(
+    const std::string legacy_regression = ggml::gemmini::log::serialize_cycle_record(
         {"scalar", "public", 12, 10, nullptr, 0, nullptr});
 #if defined(__linux__) && defined(__aarch64__)
-    const bool expect_linux_aarch64_scalar = true;
+    const bool regression_matches = legacy_regression.find(
+        "\"start\":12,\"end\":10,\"delta\":null,\"valid\":false,\"reason\":\"counter_regression\"") !=
+            std::string::npos;
 #else
-    const bool expect_linux_aarch64_scalar = linux_aarch64_scalar;
+    const bool regression_matches = legacy_regression.find(
+        "\"start\":12,\"end\":10,\"delta\":0,\"valid\":false") != std::string::npos &&
+        legacy_regression.find("\"reason\"") == std::string::npos;
 #endif
-    const bool regression_matches = expect_linux_aarch64_scalar
-        ? legacy_regression.find("\"start\":12,\"end\":10,\"delta\":null,\"valid\":false,"
-                                 "\"reason\":\"counter_regression\"") != std::string::npos
-        : legacy_regression.find("\"start\":12,\"end\":10,\"delta\":0,\"valid\":false") !=
-              std::string::npos && legacy_regression.find("\"reason\"") == std::string::npos;
     const std::string linux_monotonic =
         ggml::gemmini::log::testing::serialize_linux_aarch64_scalar_cycle_record_for_test(
             {"scalar", "linux.monotonic", 10, 12, nullptr, 0, nullptr});

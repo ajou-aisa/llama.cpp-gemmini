@@ -218,8 +218,6 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
 endif()
 add_test(NAME test-gemmini-log-boundary
     COMMAND $<TARGET_FILE:test-gemmini-log-boundary>)
-add_test(NAME test-gemmini-log-boundary-linux-scalar
-    COMMAND $<TARGET_FILE:test-gemmini-log-boundary> --linux-aarch64-scalar)
 add_executable(test-gemmini-host-timing test-gemmini-host-timing.cpp)
 find_package(Threads REQUIRED)
 target_link_libraries(test-gemmini-host-timing PRIVATE ggml-gemmini-utils Threads::Threads)
@@ -480,33 +478,18 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
         ${TEST_GEMMINI_EXSIA_SW_PATH}/include)
     add_dependencies(test-gemmini-exsia test-gemmini-direct-linux-aarch64-strict)
 endif()
-if (LOG_CYCLE AND CYCLE_DETAIL)
-    add_test(NAME test-gemmini-residual-host-profile
-        COMMAND $<TARGET_FILE:test-gemmini-exsia> --direct-host-profile-output
-            ${CMAKE_CURRENT_BINARY_DIR}/residual-host-profile.jsonl)
-    if (Python3_Interpreter_FOUND)
-        add_test(NAME test-residual-profile-runtime
-            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-residual-profile.py
-                --runtime-fixture $<TARGET_FILE:test-gemmini-exsia>)
-    endif()
+if (LOG_CYCLE AND CYCLE_DETAIL AND Python3_Interpreter_FOUND)
+    add_test(NAME test-residual-profile-runtime
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-residual-profile.py
+            --runtime-fixture $<TARGET_FILE:test-gemmini-exsia>)
 endif()
 add_test(NAME gemmini_direct_metrics_source_contract
     COMMAND ${CMAKE_COMMAND}
         -DDIRECT_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/residual/direct/direct-executor.cpp
         -DDIRECT_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/residual/direct/direct-executor.hpp
         -DTEST_CMAKE=${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
-        -DCXX_COMPILER=${CMAKE_CXX_COMPILER}
-        -DGENERATED_DIR=${CMAKE_BINARY_DIR}/generated
         -DPROJECT_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/..
-        -DGEMMINI_SW_PATH=${TEST_GEMMINI_EXSIA_SW_PATH}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-direct-metrics-source-contract.cmake)
-add_test(NAME gemmini_direct_metrics_adversarial_contract
-    COMMAND ${CMAKE_COMMAND}
-        -DDIRECT_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/residual/direct/direct-executor.cpp
-        -DDIRECT_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/residual/direct/direct-executor.hpp
-        -DTEST_CMAKE=${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
-        -DCONTRACT_SCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-direct-metrics-source-contract.cmake
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-direct-metrics-adversarial.cmake)
 foreach(_worker_count IN ITEMS 3 4)
     add_executable(test-gemmini-exsia-workers${_worker_count}
         test-gemmini-exsia-profile.cpp

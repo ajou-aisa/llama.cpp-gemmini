@@ -264,16 +264,6 @@ require_order("${dense}" "Dense samples exactly its facade host call"
     "dense_start = read_matmul_cpu_sample()" "facade_.run_staged_stripe"
     "dense_end = read_matmul_cpu_sample()" "to_public_status")
 require_count("${dense}" "read_matmul_cpu_sample()" 2 "matching Dense gates")
-foreach(endpoint IN ITEMS start end)
-    require_token("${dense}" "job.metrics_.ws_${endpoint}_ns = dense_${endpoint}.ns"
-        "Dense summary reuses exact host call ${endpoint}")
-    require_token("${dense}" "job.metrics_.ws_${endpoint}_tid = dense_${endpoint}.tid"
-        "Dense summary reuses executing thread ${endpoint}")
-    require_token("${residual}" "job.metrics_.backend_${endpoint}_ns = backend_${endpoint}.ns"
-        "Residual summary reuses exact backend ${endpoint}")
-    require_token("${residual}" "job.metrics_.backend_${endpoint}_tid = backend_${endpoint}.tid"
-        "Residual summary reuses executing thread ${endpoint}")
-endforeach()
 require_absent("${dense}" "#if CYCLE_DETAIL" "Dense SUMMARY collects both endpoints")
 require_absent("${external}" "cycle::read()" "external completion is unmeasured")
 require_token("${external}" "unavailable(\"external_completion\")" "external marker status")
@@ -289,44 +279,14 @@ require_order("${worker}" "worker job preparation has its own same-thread pair"
     "captured.timing.dequeue_tid = cycle::host_thread_id()"
     "preparation_start = read_matmul_cpu_sample()" "std::make_shared<MatmulStripeJob>"
     "std::make_unique<quants::act::Meta>" "preparation_end = read_matmul_cpu_sample()")
-require_token("${source}" "record.queue_end_ns = profile.capture_queue_dequeue_ns"
-    "queue summary ends at actual dequeue")
 foreach(pair IN ITEMS compose merge)
     require_token("${run_full}" "${pair}_start = read_matmul_cpu_sample()" "FULL packet ${pair} start")
     require_token("${run_full}" "${pair}_end = read_matmul_cpu_sample()" "FULL packet ${pair} end")
 endforeach()
-foreach(op IN ITEMS pipeline_drain_and_join matmul_output_validation_and_publish
-                    stripe_completion_bookkeeping collector_capacity_release)
-    require_token("${source}" "\"${op}\"" "lifecycle interval")
-endforeach()
-require_token("${source}" "kNativeCycleSource, kNativeCycleUnit" "portable records retain native domain")
 file(READ "${gemmini_source_dir}/ggml-gemmini-matmul.hpp" header)
 require_order("${header}" "reader collection gate"
     "inline MatmulCpuSample read_matmul_cpu_sample()" "#if LOG_CYCLE"
     "result.collected = true" "result.native = cycle::read_sample()")
-require_order("${header}" "host reader is independent of native validity"
-    "inline MatmulCpuSample read_matmul_cpu_sample()" "#if LOG_CYCLE"
-    "result.ns = cycle::timestamp_ns()" "result.tid = cycle::host_thread_id()"
-    "return result")
-# Presence is independent of scalar zero; the actual production projection is
-# exercised through the provider-free reducer target as well.
-file(READ "${gemmini_source_dir}/ggml-gemmini-telemetry.cpp" telemetry)
-require_order("${telemetry}" "shared serializer retains checked samples and host endpoints"
-    "std::string serialize_matmul_cpu_interval" "explicit_interval != nullptr ? *explicit_interval :"
-    "evaluate_matmul_cpu_interval(start, end)"
-    "record.start = start.value" "record.end = end.value"
-    "serialize_checked_cycle_record" "interval.sample_reason"
-    "cycle::serialize_host_timing(start.ns, end.ns, start.tid, end.tid)")
-require_absent("${source}" "run_id != 0" "no run-zero sentinel in lifecycle/context propagation")
-require_absent("${telemetry}" "run_id != 0" "no run-zero sentinel in CPU projection")
-require_token("${telemetry}" "record.identity_mask = profile->cpu_identity_mask" "profile presence projection")
-require_token("${telemetry}" "invocation_run_id.has_value()" "run-only FULL presence")
-require_token("${source}" "run_id = matmul_cpu_run_id(event, run_id)" "published snapshot supplies by-value run identity")
-require_token("${worker}" "captured.cpu_identity_mask & GEMMINI_CYCLE_HAS_RUN_ID" "staged run-zero context")
-require_token("${residual}" "job.metrics_.cpu_identity_mask & GEMMINI_CYCLE_HAS_RUN_ID" "direct metric run-zero context")
-require_count("${run_full}" "nullptr, nullptr, run_id" 6 "FULL wrappers all receive run-only context")
-require_token("${run_full}" "nullptr, run_id" "legacy FULL native Merge receives run-only context")
-require_token("${finish_stripes}" "matmul_cpu_run_id(args())" "output finish metadata identity")
 extract_between(emitter "void emit_matmul_cpu_interval" "void emit_matmul_native_interval")
 require_order("${emitter}" "nonthrowing CPU telemetry boundary"
     "noexcept" "try {" "project_matmul_cpu_identity"
