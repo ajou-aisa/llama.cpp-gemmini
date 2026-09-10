@@ -84,11 +84,6 @@ RmdStatus compose_rmd_output(const StripePacket & packet,
         return offsets;
     }
 
-    const BalancedRadixContract contract = balanced_radix_contract(packet.digit_bits);
-    if (contract.radix == 0 || packet.lane_capacity != contract.lane_capacity) {
-        return RmdStatus::invalid_packet;
-    }
-
     size_t value_count = 0;
     if (!checked_mul_size(packet.row_count, packet.logical_j, value_count)) {
         return RmdStatus::overflow;
@@ -104,31 +99,23 @@ RmdStatus compose_rmd_output(const StripePacket & packet,
         for (size_t j = 0; j < packet.logical_j; ++j) {
             __int128 total = 0;
             for (const BlockDescriptor & block : packet.blocks) {
-                __int128 block_value = 0;
-                size_t lane_position = block.active_lane_count;
-                for (uint8_t lane = packet.lane_capacity; lane-- > 0;) {
-                    if (__builtin_mul_overflow(
-                            block_value, static_cast<__int128>(contract.radix),
-                            &block_value)) {
-                        return RmdStatus::overflow;
-                    }
-                    if (lane_position != 0 &&
-                        block.lane_ids[lane_position - 1] == lane) {
-                        --lane_position;
-                        const size_t lane_base = block.output_value_offset +
-                            lane_position * block.lane_stride_values;
-                        const OutputValue source = output.values[
-                            lane_base + row * output.j_padded + j];
-                        if (__builtin_add_overflow(
-                                block_value, static_cast<__int128>(source),
-                                &block_value)) {
+                for (uint8_t lane_position = 0;
+                     lane_position < block.active_lane_count; ++lane_position) {
+                    const uint8_t lane = block.lane_ids[lane_position];
+                    const size_t lane_base = block.output_value_offset +
+                        lane_position * block.lane_stride_values;
+                    __int128 contribution = output.values[
+                        lane_base + row * output.j_padded + j];
+                    if (lane != 0) {
+                        const __int128 place = static_cast<__int128>(1) <<
+                            (packet.digit_bits * lane);
+                        if (__builtin_mul_overflow(contribution, place, &contribution)) {
                             return RmdStatus::overflow;
                         }
                     }
-                }
-                if (lane_position != 0 ||
-                    __builtin_add_overflow(total, block_value, &total)) {
-                    return RmdStatus::overflow;
+                    if (__builtin_add_overflow(total, contribution, &total)) {
+                        return RmdStatus::overflow;
+                    }
                 }
             }
             if (total > kInt64Max || total < kInt64Min) {

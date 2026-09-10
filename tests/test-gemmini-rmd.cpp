@@ -150,10 +150,13 @@ bool test_width_native_compose_and_expand() {
         uint8_t bits;
         int32_t residual;
     };
-    constexpr std::array<WidthCase, 3> cases = {{
+    constexpr std::array<WidthCase, 6> cases = {{
         {4, kSigned21Min + 1},
+        {4, 16},
         {8, 65537},
+        {8, 256},
         {16, kSigned21Max},
+        {16, 65536},
     }};
     constexpr std::array<int64_t, 2> weights = {3, -257};
     constexpr int64_t block_scale = 5;
@@ -251,13 +254,26 @@ bool test_width_native_compose_and_expand() {
         compressed.j_padded = packet->j_padded;
         compressed.values.assign(packet->total_output_values, 0);
         const BlockDescriptor & block = packet->blocks.front();
+        compressed.values[block.output_value_offset] =
+            std::numeric_limits<int64_t>::min() + 1;
+        compressed.values[block.output_value_offset + block.lane_stride_values] =
+            int64_t{1} << (63 - bits);
+        Correction correction = BlockScaledInt64Correction{{101, 103}};
+        const auto cancellation_status = compose_rmd_output(*packet, compressed, correction);
+        const auto * cancellation_values =
+            std::get_if<BlockScaledInt64Correction>(&correction);
+        ok = check(cancellation_status == RmdStatus::success &&
+                       cancellation_values != nullptr &&
+                       cancellation_values->values == std::vector<int64_t>({1}),
+                   "wide radix contribution cancels before final int64 narrowing") && ok;
+
         for (uint8_t lane_position = 0; lane_position < 2; ++lane_position) {
             compressed.values[block.output_value_offset +
                 static_cast<size_t>(lane_position) * block.lane_stride_values] =
                     std::numeric_limits<int64_t>::max();
         }
         const Correction sentinel = BlockScaledInt64Correction{{101, 103}};
-        Correction correction = sentinel;
+        correction = sentinel;
         const auto overflow_status = compose_rmd_output(*packet, compressed, correction);
         const auto * overflow_values =
             std::get_if<BlockScaledInt64Correction>(&correction);
@@ -266,6 +282,32 @@ bool test_width_native_compose_and_expand() {
                        overflow_values->values ==
                            std::get<BlockScaledInt64Correction>(sentinel).values,
                    "native-radix overflow leaves correction unchanged") && ok;
+
+        builder.reset(38, 0, 1, kBlockSize + 1, 1, bits);
+        if (!check(builder.add_residual(0, 0, static_cast<int32_t>(contract.radix)) &&
+                       builder.add_residual(0, kBlockSize,
+                                            -static_cast<int32_t>(contract.radix)),
+                   "opposite higher-lane residuals accepted across blocks")) {
+            return false;
+        }
+        const StripePacketHandle cancellation_packet = builder.finish();
+        if (!check(cancellation_packet != nullptr && cancellation_packet->blocks.size() == 2,
+                   "cross-block cancellation packet built")) {
+            return false;
+        }
+        compressed.j_padded = cancellation_packet->j_padded;
+        compressed.values.assign(cancellation_packet->total_output_values, 0);
+        compressed.values[cancellation_packet->blocks[0].output_value_offset] = int64_t{1} << 62;
+        compressed.values[cancellation_packet->blocks[1].output_value_offset] = -(int64_t{1} << 62);
+        correction = sentinel;
+        const auto block_cancellation_status =
+            compose_rmd_output(*cancellation_packet, compressed, correction);
+        const auto * block_cancellation_values =
+            std::get_if<BlockScaledInt64Correction>(&correction);
+        ok = check(block_cancellation_status == RmdStatus::success &&
+                       block_cancellation_values != nullptr &&
+                       block_cancellation_values->values == std::vector<int64_t>({0}),
+                   "wide block contributions cancel before final int64 narrowing") && ok;
     }
     return ok;
 }
