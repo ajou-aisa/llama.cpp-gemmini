@@ -451,7 +451,7 @@ bool test_malformed_packets_reject_atomically() {
 
     rmd::RmdStripeBuilder overflow_builder;
     overflow_builder.reset(23, 0, 1, 1, 1, 4);
-    ok = check(!overflow_builder.add_residual(0, 0, rmd::kSigned21Max + 1) &&
+    ok = check(!overflow_builder.add_residual(0, 0, 2004318072) &&
                    overflow_builder.status() == rmd::RmdStatus::residual_too_wide &&
                    overflow_builder.finish() == nullptr,
                "residual envelope overflow emits no packet") && ok;

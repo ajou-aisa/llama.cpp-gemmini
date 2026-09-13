@@ -1010,10 +1010,11 @@ int main(int argc, char ** argv) {
 
     common_sampler_free(smpl);
 
+    const bool fpga_execution_ok = common_fpga_execution_check();
     llama_backend_free();
 
     ggml_threadpool_free_fn(threadpool);
     ggml_threadpool_free_fn(threadpool_batch);
 
-    return 0;
+    return fpga_execution_ok ? 0 : 1;
 }

@@ -1,6 +1,8 @@
 #!/bin/bash
 
 set -euo pipefail
+SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_ROOT/scripts/im2p-host-provision.sh"
 
 if [[ "${IM2P_ARTIFACT_SET:-SELECTED}" == "ALL_MATCHED" ]]; then
   printf '%s\n' \
@@ -10,12 +12,18 @@ fi
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ||
       "${2:-}" == "-h" || "${2:-}" == "--help" ]]; then
-  printf 'Usage: %s [static] [CMake configure arguments...]\n' "${0##*/}"
+  printf 'Usage: %s [static] [--dry-run] [-DNAME[:TYPE]=value ...]\n' "${0##*/}"
   printf '%s\n' 'Environment overrides: BUILD_DIR, GGML_*.'
   printf '%s\n' 'GGML_GEMMINI_DIM=16|32|64 must match the physical Gemmini header.'
   exit 0
 fi
 
+target=riscv
+if [[ "${1:-}" = "static" ]]; then
+  target=riscv-static
+  shift
+fi
+build_dir=${BUILD_DIR:-build-$target}
 LOG_DEBUG_DEFAULT=${LOG_DEBUG:-0} # 0 | 1
 LOG_CYCLE_DEFAULT=${LOG_CYCLE:-0} # 0 | 1
 GGML_CPU_CYCLE_LOG_DEFAULT=${GGML_CPU_CYCLE_LOG:-${LOG_CYCLE_DEFAULT}}
@@ -38,7 +46,7 @@ GGML_GEMMINI_ACTIVATION_QUANT_DEFAULT=${GGML_GEMMINI_ACTIVATION_QUANT_DEFAULT:-$
 GGML_GEMMINI_ACTIVATION_BITS_DEFAULT=${GGML_GEMMINI_ACTIVATION_BITS_DEFAULT:-${GGML_GEMMINI_ACTIVATION_BITS:-8}} # 4 | 8 | 16
 GGML_GEMMINI_WEIGHT_BITS_DEFAULT=${GGML_GEMMINI_WEIGHT_BITS_DEFAULT:-${GGML_GEMMINI_WEIGHT_BITS:-8}} # 4 | 8 | 16
 # RISC-V is the hardware lane. Root CMake also rejects simulator cross-builds.
-GGML_GEMMINI_EXECUTION_BACKEND_DEFAULT=HARDWARE
+GGML_GEMMINI_EXECUTION_BACKEND_DEFAULT=${GGML_GEMMINI_EXECUTION_BACKEND:-HARDWARE}
 GGML_GEMMINI_DIM_DEFAULT=${GGML_GEMMINI_DIM:-16} # must match physical hardware: 16 | 32 | 64
 GGML_GEMMINI_BLOCK_SIZE_DEFAULT=${GGML_GEMMINI_BLOCK_SIZE_DEFAULT:-${GGML_GEMMINI_BLOCK_SIZE:-32}} # 32 | 64 | 128
 GGML_GEMMINI_EXSIA_SIGMA_DEFAULT=${GGML_GEMMINI_EXSIA_SIGMA:-2} # positive integer
@@ -55,6 +63,12 @@ GGML_GEMMINI_EXSIA_DEFAULT_MODE_DEFAULT=${GGML_GEMMINI_EXSIA_DEFAULT_MODE:-SEQUE
 GGML_GEMMINI_EXSIA_LOCAL_WORKERS_DEFAULT=${GGML_GEMMINI_EXSIA_LOCAL_WORKERS:-4} # 3 | 4
 GGML_GEMMINI_EXSIA_PROFILE_SCOPE_DEFAULT=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE:-OFF} # OFF | TIMELINE | STAGE
 
+im2p_resolve_build_options "$build_dir" "${0##*/}" "$@"
+if [[ "$IM2P_BUILD_DRY_RUN" == 1 ]]; then
+  printf 'Dry run: no provisioning, configure, build, or device access.\n'
+  exit 0
+fi
+
 if [[ "$CYCLE_DETAIL_DEFAULT" == "1" && "$LOG_CYCLE_DEFAULT" != "1" ]]; then
   printf '%s\n' "CYCLE_DETAIL=1 requires LOG_CYCLE=1" >&2
   exit 2
@@ -64,13 +78,7 @@ if [[ "$GGML_GEMMINI_EXSIA_PROFILE_SCOPE_DEFAULT" != "OFF" && "$CYCLE_DETAIL_DEF
   exit 2
 fi
 
-target=riscv
-if [[ "${1:-}" = "static" ]]; then
-  target=riscv-static
-  shift
-fi
-build_dir=${BUILD_DIR:-build-$target}
-cmake -B "$build_dir" -S . \
+cmake -B "$build_dir" -S "$SCRIPT_ROOT" \
   -DGGML_GEMMINI=ON \
   -DLOG_DEBUG="${LOG_DEBUG_DEFAULT}" \
   -DLOG_CYCLE="${LOG_CYCLE_DEFAULT}" \
@@ -106,6 +114,6 @@ cmake -B "$build_dir" -S . \
   -DGGML_GEMMINI_EXSIA_DEFAULT_MODE="${GGML_GEMMINI_EXSIA_DEFAULT_MODE_DEFAULT}" \
   -DGGML_GEMMINI_EXSIA_LOCAL_WORKERS="${GGML_GEMMINI_EXSIA_LOCAL_WORKERS_DEFAULT}" \
   -DGGML_GEMMINI_EXSIA_PROFILE_SCOPE="${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_DEFAULT}" \
-  -DCMAKE_TOOLCHAIN_FILE="cmake/$target.cmake" \
-  "$@"
+  -DCMAKE_TOOLCHAIN_FILE="$SCRIPT_ROOT/cmake/$target.cmake" \
+  "${IM2P_EFFECTIVE_CMAKE_ARGS[@]}"
 cmake --build "$build_dir" --target llama-cli -j

@@ -28,9 +28,8 @@ constexpr size_t kMaxLanes = 4; // legacy radix-256 API and Q8 execution contrac
 constexpr size_t kLegacyRadix256Lanes = kMaxLanes;
 constexpr size_t kMaxNativeRadixLanes = 8;
 
-// Residual capture intentionally supports the signed 21-bit outlier envelope.
-// Lane capacities describe the fixed transport budget, not permission to admit
-// wider synthetic values.
+// Historical signed 21-bit regression anchors. Capture accepts INT32 residuals
+// that fit the fixed native balanced-radix lane capacity.
 constexpr int32_t kSigned21Min = -(int32_t{1} << 20);
 constexpr int32_t kSigned21Max = (int32_t{1} << 20) - 1;
 
@@ -219,8 +218,8 @@ struct NativeBalancedDigits {
     }
 };
 
-// Decomposes only values in the supported signed 21-bit envelope. Both calls
-// are transactional: failure leaves the caller-provided output unchanged.
+// Decomposes INT32 residuals that fit the native lane capacity; a remaining carry
+// rejects. Composition must fit INT32. Both calls leave output unchanged on failure.
 RmdStatus decompose_balanced_radix(int32_t residual,
                                    uint8_t operand_bits,
                                    NativeBalancedDigits & out);

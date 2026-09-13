@@ -276,12 +276,13 @@ endif()
 set(_GGML_GEMMINI_WEIGHT_BITS_VALUE "${GGML_GEMMINI_WEIGHT_BITS}")
 
 set(GGML_GEMMINI_EXECUTION_BACKEND "HARDWARE" CACHE STRING
-    "Gemmini execution backend: HARDWARE or IM2P_SIM")
-set_property(CACHE GGML_GEMMINI_EXECUTION_BACKEND PROPERTY STRINGS HARDWARE IM2P_SIM)
+    "Gemmini execution backend: HARDWARE, IM2P_SIM, or FPGA_UART")
+set_property(CACHE GGML_GEMMINI_EXECUTION_BACKEND PROPERTY STRINGS HARDWARE IM2P_SIM FPGA_UART)
 if(NOT GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "HARDWARE" AND
-   NOT GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
+   NOT GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND
+   NOT GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "FPGA_UART")
     message(FATAL_ERROR
-        "GGML_GEMMINI_EXECUTION_BACKEND must be exactly HARDWARE or IM2P_SIM, got '${GGML_GEMMINI_EXECUTION_BACKEND}'")
+        "GGML_GEMMINI_EXECUTION_BACKEND must be exactly HARDWARE, IM2P_SIM, or FPGA_UART, got '${GGML_GEMMINI_EXECUTION_BACKEND}'")
 endif()
 if(_GGML_GEMMINI_OPTION_UPPER STREQUAL "OS" OR
    (_GGML_GEMMINI_OPTION_UPPER STREQUAL "CPU" AND
@@ -295,6 +296,10 @@ if(NOT GGML_GEMMINI_ACTIVATION_BITS STREQUAL
         "Gemmini requires matched activation and weight widths")
 endif()
 set(IM2P_SIM_ROOT "" CACHE PATH "Path to the IM2P.sim source and isolated build artifacts")
+if(DEFINED IM2P_DIM AND DEFINED GGML_GEMMINI_DIM AND
+   NOT IM2P_DIM STREQUAL GGML_GEMMINI_DIM)
+    message(FATAL_ERROR "IM2P_DIM conflicts with GGML_GEMMINI_DIM")
+endif()
 if(DEFINED IM2P_DIM AND NOT DEFINED GGML_GEMMINI_DIM)
     set(GGML_GEMMINI_DIM "${IM2P_DIM}" CACHE STRING
         "Gemmini array dimension: 16, 32, or 64")
@@ -448,15 +453,14 @@ if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
     file(WRITE "${_GGML_GEMMINI_IM2P_PROBE_SOURCE}" [=[
 #include <cstdint>
 #include <cstdio>
-extern "C" {
-std::uint32_t im2p_sim_abi_version(void);
-std::uint32_t im2p_sim_activation_bits(void);
-std::uint32_t im2p_sim_activation_storage_bytes(void);
-std::uint32_t im2p_sim_weight_bits(void);
-std::uint32_t im2p_sim_weight_storage_bytes(void);
-std::uint32_t im2p_sim_dim(void);
-}
+#include <cstring>
+#include "im2p_sim.h"
+static_assert(IM2P_ABI_VERSION == 5, "SCU requires typed ABI5");
 int main() {
+    const char *revision = im2p_compiled_numerical_semantics_revision();
+    if (revision == nullptr ||
+        std::strcmp(revision, IM2P_SCU_NUMERICAL_REVISION) != 0)
+        return 51;
     std::printf("%u;%u;%u;%u;%u;%u", im2p_sim_abi_version(),
                 im2p_sim_activation_bits(),
                 im2p_sim_activation_storage_bytes(),
@@ -470,11 +474,15 @@ int main() {
     try_run(_GGML_GEMMINI_IM2P_PROBE_RESULT _GGML_GEMMINI_IM2P_PROBE_COMPILED
         "${CMAKE_CURRENT_BINARY_DIR}/im2p-build-contract-probe"
         "${_GGML_GEMMINI_IM2P_PROBE_SOURCE}"
+        CMAKE_FLAGS "-DINCLUDE_DIRECTORIES=${IM2P_SIM_ROOT}/sim/include"
         LINK_LIBRARIES "${GGML_GEMMINI_IM2P_SIM_ARCHIVE}"
         RUN_OUTPUT_VARIABLE _GGML_GEMMINI_IM2P_IDENTITY)
     if(NOT _GGML_GEMMINI_IM2P_PROBE_COMPILED)
         message(FATAL_ERROR
             "Unable to link the selected IM2P simulator archive for identity validation")
+    endif()
+    if(_GGML_GEMMINI_IM2P_PROBE_RESULT EQUAL 51)
+        message(FATAL_ERROR "IM2P SCU numerical revision mismatch: header and archive differ")
     endif()
     if(NOT _GGML_GEMMINI_IM2P_PROBE_RESULT EQUAL 0 OR
        NOT _GGML_GEMMINI_IM2P_IDENTITY MATCHES "^([0-9]+);([0-9]+);([0-9]+);([0-9]+);([0-9]+);([0-9]+)$")
@@ -486,9 +494,9 @@ int main() {
     set(_GGML_GEMMINI_IM2P_WEIGHT_BITS "${CMAKE_MATCH_4}")
     set(_GGML_GEMMINI_IM2P_WEIGHT_STORAGE_BYTES "${CMAKE_MATCH_5}")
     set(_GGML_GEMMINI_IM2P_DIM "${CMAKE_MATCH_6}")
-    if(NOT _GGML_GEMMINI_IM2P_ABI STREQUAL "4")
+    if(NOT _GGML_GEMMINI_IM2P_ABI STREQUAL "5")
         message(FATAL_ERROR
-            "IM2P simulator ABI mismatch: llama requires 4, archive reports ${_GGML_GEMMINI_IM2P_ABI}")
+            "IM2P simulator ABI mismatch: llama requires 5, archive reports ${_GGML_GEMMINI_IM2P_ABI}")
     endif()
     if(NOT _GGML_GEMMINI_IM2P_ACTIVATION_BITS STREQUAL "${GGML_GEMMINI_ACTIVATION_BITS}")
         message(FATAL_ERROR
@@ -721,6 +729,23 @@ foreach(_GGML_GEMMINI_MATMUL_BOOL IN ITEMS
     ggml_gemmini_require_bool(${_GGML_GEMMINI_MATMUL_BOOL})
 endforeach()
 
+if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "FPGA_UART")
+    if(NOT GGML_GEMMINI OR NOT _GGML_GEMMINI_OPTION_UPPER STREQUAL "WS" OR
+       NOT GGML_GEMMINI_ACTIVATION_BITS STREQUAL "8" OR
+       NOT GGML_GEMMINI_WEIGHT_BITS STREQUAL "8" OR
+       NOT GGML_GEMMINI_DIM STREQUAL "16" OR
+       NOT GGML_GEMMINI_BLOCK_SIZE STREQUAL "32" OR
+       NOT _GGML_GEMMINI_COMPUTE_TYPE_UPPER STREQUAL "INT" OR
+       GGML_GEMMINI_DEQUANT_FP_TEST)
+        message(FATAL_ERROR "FPGA_UART requires WS+A8/W8/DIM16/INT/block32")
+    endif()
+    if(NOT _GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "EXSIA" AND GGML_GEMMINI_ENABLE_RMD)
+        message(FATAL_ERROR "FPGA_UART non-EXSIA activation requires GGML_GEMMINI_ENABLE_RMD=OFF, matching main")
+    endif()
+    # Install layout is bin/ plus lib/; keep relocation independent of cwd.
+    set(CMAKE_INSTALL_RPATH "$ORIGIN;$ORIGIN/../lib")
+endif()
+
 if (GGML_GEMMINI_ENABLE_RMD)
     set(_GGML_GEMMINI_ENABLE_RMD_VALUE 1)
 else()
@@ -829,6 +854,8 @@ set(GGML_GEMMINI_COMPILE_DEFS
 )
 if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
     list(APPEND GGML_GEMMINI_COMPILE_DEFS GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM=1)
+elseif(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "FPGA_UART")
+    list(APPEND GGML_GEMMINI_COMPILE_DEFS GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART=1)
 else()
     list(APPEND GGML_GEMMINI_COMPILE_DEFS GGML_GEMMINI_EXECUTION_BACKEND_HARDWARE=1)
 endif()
@@ -881,6 +908,12 @@ set(GGML_GEMMINI_UTILS_COMPILE_DEFS
     LOG_DEBUG=${LOG_DEBUG}
     LOG_CYCLE=${LOG_CYCLE}
     CYCLE_DETAIL=${CYCLE_DETAIL})
+
+# Fingerprint effective defaults and the generated mode/RMD header after their
+# definitions, so an unchanged second configure has the same identity.
+if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "FPGA_UART")
+    include(cmake/ggml-gemmini-fpga.cmake)
+endif()
 
 # ---- ggml build ----
 if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
@@ -985,3 +1018,24 @@ configure_file(cmake/llama.pc.in
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+
+# The platform scripts build these two applications, not every optional tool.
+# Keep their FPGA deployment install independent of unrelated unbuilt targets.
+if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "FPGA_UART" AND GGML_BACKEND_DL)
+    foreach(_fpga_app llama-cli llama-perplexity)
+        if (TARGET ${_fpga_app})
+            install(TARGETS ${_fpga_app}
+                RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT FPGA_UART_RUNTIME)
+        endif()
+    endforeach()
+    install(TARGETS llama ggml ggml-base ggml-gemmini-utils
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT FPGA_UART_RUNTIME)
+    # The loader searches beside the applications. Include the selected CPU
+    # backend (including explicitly enabled variants) for initial CPU assignment.
+    foreach(_fpga_backend IN LISTS GGML_AVAILABLE_BACKENDS)
+        if (_fpga_backend MATCHES "^(ggml-cpu(-.*)?|ggml-gemmini)$" AND TARGET ${_fpga_backend})
+            install(TARGETS ${_fpga_backend}
+                LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT FPGA_UART_RUNTIME)
+        endif()
+    endforeach()
+endif()

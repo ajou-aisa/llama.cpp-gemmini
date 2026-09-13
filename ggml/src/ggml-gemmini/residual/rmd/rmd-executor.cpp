@@ -740,7 +740,8 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                                   RmdExecutionMetrics * metrics,
                                   im2p_sim_t * im2p_sim = nullptr,
                                   Im2pProviderTestFault im2p_fault =
-                                      Im2pProviderTestFault::none) {
+                                      Im2pProviderTestFault::none,
+                                  const Im2pFullExecutor * executor = nullptr) {
 
     const wroute::WeightRoutePlan plan = wroute::resolve_weight_route_plan(
         args, wroute::WeightScaleInfoMode::Residual);
@@ -900,7 +901,7 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                         }
                         const RmdStatus dot_status = detail::execute_im2p_compact_dot(
                             im2p_sim, dot, im2p_values.data(), kArrayDim,
-                            im2p_stats, im2p_fault);
+                            im2p_stats, im2p_fault, executor);
                         if (dot_status != RmdStatus::success) {
                             return dot_status;
                         }
@@ -1113,16 +1114,18 @@ RmdStatus execute_rmd_stripe_im2p(im2p_sim_t * sim,
                                   const ggml_gemmini_args_t & args,
                                   const StripePacket & packet,
                                   CompressedOutput & output,
-                                  RmdExecutionMetrics * metrics) {
-#if !defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+                                  RmdExecutionMetrics * metrics,
+                                  const Im2pFullExecutor * executor) {
+#if !defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) && !defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
     (void) sim;
     (void) args;
     (void) packet;
     (void) output;
     (void) metrics;
+    (void) executor;
     return RmdStatus::unsupported_route;
 #else
-    if (sim == nullptr) {
+    if (executor != nullptr ? executor->execute == nullptr : sim == nullptr) {
         return RmdStatus::invalid_arguments;
     }
     const wroute::WeightRoutePlan plan = wroute::resolve_weight_route_plan(
@@ -1143,7 +1146,7 @@ RmdStatus execute_rmd_stripe_im2p(im2p_sim_t * sim,
         return RmdStatus::unsupported_route;
     }
     return execute_rmd_stripe_impl<CompactExecutorBackend::im2p_sim>(
-        args, packet, output, metrics, sim);
+        args, packet, output, metrics, sim, Im2pProviderTestFault::none, executor);
 #endif
 }
 
@@ -1173,6 +1176,8 @@ RmdStatus execute_rmd_stripe_ws(const ggml_gemmini_args_t & args,
             sim, args, packet, output, metrics);
         im2p_sim_destroy(sim);
         return status;
+#elif defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+        return RmdStatus::unsupported_route;
 #else
         return execute_rmd_stripe_impl<CompactExecutorBackend::checked_software>(
             args, packet, output, metrics);

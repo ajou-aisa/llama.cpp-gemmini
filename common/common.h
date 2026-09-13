@@ -438,6 +438,10 @@ void common_init();
 
 std::string common_params_get_system_info(const common_params & params);
 
+// Opt-in deployment proof: IM2P_FPGA_REQUIRE_COMPLETION=1 rejects CPU-only success.
+// Queries already-loaded backend counters; never initializes or opens a device.
+bool common_fpga_execution_check();
+
 bool parse_cpu_range(const std::string & range, bool(&boolmask)[GGML_MAX_N_THREADS]);
 bool parse_cpu_mask(const std::string & mask, bool(&boolmask)[GGML_MAX_N_THREADS]);
 void postprocess_cpu_params(cpu_params & cpuparams, const cpu_params * role_model = nullptr);

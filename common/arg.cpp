@@ -922,6 +922,19 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         }
     }
 
+    // Inspect the final selection so --device and --gpu-layers are order independent.
+    // The FPGA accelerator reports no GPU, but still honors explicit layer placement.
+    const bool explicit_fpga = std::any_of(params.devices.begin(), params.devices.end(),
+        [](ggml_backend_dev_t dev) {
+            return dev != nullptr && ggml_backend_reg_get_proc_address(
+                ggml_backend_dev_backend_reg(dev), "ggml_gemmini_fpga_stats_v1") != nullptr;
+        });
+    if (params.n_gpu_layers != -1 && !llama_supports_gpu_offload() && !explicit_fpga) {
+        fprintf(stderr, "warning: no usable GPU found, --gpu-layers option will be ignored\n");
+        fprintf(stderr, "warning: one possible reason is that llama.cpp was compiled without GPU support\n");
+        fprintf(stderr, "warning: consult docs/build.md for compilation instructions\n");
+    }
+
     postprocess_cpu_params(params.cpuparams,       nullptr);
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
 
@@ -1671,7 +1684,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.warmup = false;
         }
-    ).set_examples({LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_EMBEDDING}));
+    ).set_examples({LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--spm-infill"},
         string_format(
@@ -2356,11 +2369,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "number of layers to store in VRAM",
         [](common_params & params, int value) {
             params.n_gpu_layers = value;
-            if (!llama_supports_gpu_offload()) {
-                fprintf(stderr, "warning: no usable GPU found, --gpu-layers option will be ignored\n");
-                fprintf(stderr, "warning: one possible reason is that llama.cpp was compiled without GPU support\n");
-                fprintf(stderr, "warning: consult docs/build.md for compilation instructions\n");
-            }
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(

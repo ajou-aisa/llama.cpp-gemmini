@@ -120,7 +120,9 @@ constexpr int64_t K = 32;
 constexpr int64_t I = 3;
 #endif
 constexpr int64_t J = 2;
-constexpr size_t graph_publications = 2;
+// This J=2/K=64 graph fits one row tile at DIM16/32 and two at DIM64.
+// The direct-args lifecycle cases below separately exercise three stripes.
+constexpr size_t graph_publications = GGML_GEMMINI_TEST_IM2P_DIM == 64 ? 2 : 1;
 constexpr float sentinel = 12345.0f;
 const char *routing_program = nullptr;
 

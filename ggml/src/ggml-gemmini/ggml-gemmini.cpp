@@ -9,7 +9,9 @@
 #include <cstdlib>
 
 #include <limits>
+#include <stdexcept>
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -30,6 +32,9 @@
 #include <gemmini.h>
 #include "ggml-gemmini-args.h"
 #include "ggml-gemmini-matmul.hpp"
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+#include "ggml-gemmini-fpga.hpp"
+#endif
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
 #include "ggml-gemmini-im2p.hpp"
 #endif
@@ -58,6 +63,50 @@
 
 namespace
 {
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+    thread_local bool fpga_dispatch_failed = false;
+    // Counts only executed graph nodes and adapter calls, never supports_op probes.
+    std::atomic<uint64_t> fpga_assigned{0}, fpga_attempted{0}, fpga_completed{0}, fpga_failed{0};
+
+    bool fpga_stats_v1(ggml_gemmini_fpga_stats_v1 * out, size_t size) {
+        if (!out || size != sizeof(*out)) return false;
+        *out = {fpga_assigned.load(), fpga_attempted.load(), fpga_completed.load(), fpga_failed.load()};
+        return true;
+    }
+
+    void fpga_support_diagnostic(const ggml_tensor * op, const char * reason) {
+        const char * trace = std::getenv("IM2P_FPGA_TRACE");
+        if (!trace || std::strcmp(trace, "1") != 0) return;
+        const auto * a = op->src[0];
+        const auto * b = op->src[1];
+        GGML_LOG_INFO("FPGA_UART_SUPPORT node=%s reason=%s W_type=%d M=%lld N=%lld K=%lld "
+                      "observation=supports_op_query assignment=not_observed\n",
+                      op->name, reason, a ? int(a->type) : -1,
+                      (long long)(b ? ggml_nrows(b) : 0), (long long)(a ? a->ne[1] : 0),
+                      (long long)(a ? a->ne[0] : 0));
+    }
+    constexpr bool fpga_dense = true;
+    constexpr bool fpga_exsia = ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
+        ggml::gemmini::config::ActivationQuantAlgo::EXSIA;
+    constexpr bool fpga_token = ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
+        ggml::gemmini::config::ActivationQuantAlgo::TOKEN;
+    constexpr const char * fpga_native_formats = fpga_exsia ? "Q8_H1,Q8_HP1,Q8_0" :
+        fpga_token ? "Q8_CHANNEL" : "Q8_H1,Q8_HP1,Q8_0,Q8_CHANNEL";
+    constexpr const char * fpga_output_domains = fpga_exsia ? "1" : fpga_token ? "0" : "0,1";
+    bool gemmini_fpga_native_weight_supported(ggml_type type) {
+        constexpr auto activation = ggml::gemmini::config::CURRENT_ACTIVATION_QUANT;
+        constexpr bool exsia = activation == ggml::gemmini::config::ActivationQuantAlgo::EXSIA;
+        const bool bounded = ggml_gemmini_fpga_uses_bounded();
+        if (!exsia && !bounded) return false;
+        if (type == GGML_TYPE_Q8_CHANNEL) return !exsia && bounded;
+        // Main's TOKEN path requires channel weights (or its separate I8 ABI).
+        if (activation == ggml::gemmini::config::ActivationQuantAlgo::TOKEN) return false;
+        return type == GGML_TYPE_Q8_H1 ||
+               (bounded && (type == GGML_TYPE_Q8_HP1 || type == GGML_TYPE_Q8_0));
+    }
+#else
+    constexpr bool fpga_dense = false;
+#endif
     bool gemmini_is_extended_dequant_weight_type(ggml_type type) {
         return type == GGML_TYPE_Q4_0 ||
                type == GGML_TYPE_Q4_H1 ||
@@ -1291,6 +1340,14 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         GGML_ABORT("Gemmini mul_mat size overflow");
     }
 
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+    if (!gemmini_fpga_native_weight_supported(src0->type) || src1->type != GGML_TYPE_F32 ||
+        K == 0 || (src0->type != GGML_TYPE_Q8_CHANNEL && K % QK8_0 != 0)) {
+        GGML_LOG_ERROR("FPGA_UART unsupported native format or K alignment\n");
+        fpga_dispatch_failed = true;
+        return;
+    }
+#endif
 #if LOG_DUMP
     ggml::gemmini::log::dump(ggml::gemmini::log::file("log/tensor_data/act.jsonl"), layer, src1);
 #endif
@@ -1414,10 +1471,31 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         ggml::gemmini::log::debug(layer,
             "[matmul.invocation] status=invalid_invocation error=%d",
             static_cast<int>(matmul_resolution.error));
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+        fpga_dispatch_failed = true;
+        return;
+#else
         GGML_ABORT("Gemmini invalid matmul options");
+#endif
     }
     auto matmul_options = matmul_resolution.options;
     matmul_options.profiling = LOG_CYCLE != 0;
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+    // Preserve main's original H0 policy before Q8_0 is reprocessed to H1.
+    if (src0->type == GGML_TYPE_Q8_0 && GGML_GEMMINI_ENABLE_RMD != 0 &&
+        matmul_options.rmd_backend != ggml::gemmini::RmdBackend::cpu_direct) {
+        GGML_LOG_ERROR("FPGA_UART Q8_0 ExSIA requires CPU-direct residual execution\n");
+        fpga_dispatch_failed = true;
+        return;
+    }
+    if (!ggml_gemmini_fpga_supports(I, J, K,
+            matmul_options.mode == ggml::gemmini::MatmulInvocationMode::stripe_pipeline,
+            src0->type != GGML_TYPE_Q8_CHANNEL)) {
+        GGML_LOG_ERROR("FPGA_UART unsupported shape/mode before execution\n");
+        fpga_dispatch_failed = true;
+        return;
+    }
+#endif
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
     constexpr bool im2p_exsia =
         ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
@@ -1467,10 +1545,21 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     constexpr bool im2p_non_exsia = false;
 #endif
 #if !defined(__riscv) && !defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
-    if (matmul_options.rmd_backend == ggml::gemmini::RmdBackend::gemmini_ws_compact) {
+    bool host_residual_unavailable = !fpga_dense || GGML_GEMMINI_ENABLE_RMD != 0;
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+    host_residual_unavailable = host_residual_unavailable && !ggml_gemmini_fpga_uses_bounded();
+#endif
+    if (host_residual_unavailable &&
+        matmul_options.rmd_backend == ggml::gemmini::RmdBackend::gemmini_ws_compact) {
         ggml::gemmini::log::debug(layer,
             "[matmul.rmd] status=unsupported_backend backend=WS");
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+        GGML_LOG_ERROR("FPGA_UART unsupported_backend: RMD WS is unavailable\n");
+        fpga_dispatch_failed = true;
+        return;
+#else
         GGML_ABORT("Gemmini unsupported_backend: RMD WS is unavailable on this host");
+#endif
     }
 #endif
     const bool pipeline_requested =
@@ -1481,16 +1570,16 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         ggml::gemmini::config::CURRENT_ACTIVATION_QUANT == ggml::gemmini::config::ActivationQuantAlgo::EXSIA;
     const bool pipeline_enabled = pipeline_requested &&
                                   exsia_pipeline_supported && I > 1 &&
-                                  !im2p_non_exsia && !im2p_exsia;
+                                  !im2p_non_exsia && !im2p_exsia && !fpga_dense;
     const bool legacy_full_dispatch = false;
     const bool decode_full_dispatch = pipeline_requested &&
                                       exsia_pipeline_supported && I <= 1 &&
-                                      !im2p_non_exsia && !im2p_exsia;
+                                      !im2p_non_exsia && !im2p_exsia && !fpga_dense;
     const bool facade_full_dispatch =
         (full_requested || decode_full_dispatch) && !im2p_non_exsia &&
-        !im2p_exsia;
+        !im2p_exsia && !fpga_dense;
     const size_t pipeline_job_capacity = matmul_options.job_capacity;
-    if (pipeline_requested && !exsia_pipeline_supported && !im2p_non_exsia) {
+    if (pipeline_requested && !exsia_pipeline_supported && !im2p_non_exsia && !fpga_dense) {
       ggml::gemmini::log::debug(
           layer,
           "[matmul.pipeline] status=unsupported_invocation dispatch=fatal "
@@ -1561,10 +1650,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     ggml::gemmini::observe_test_i("activation", args.I);
 #endif
     bool quantize_ok = false;
-    const bool deferred_quantization = pipeline_enabled || im2p_exsia;
+    const bool deferred_quantization = pipeline_enabled || im2p_exsia || fpga_dense;
 #if LOG_CYCLE
     const bool quantization_overlaps_rtl =
-        pipeline_enabled || (im2p_exsia && pipeline_requested);
+        pipeline_enabled || ((im2p_exsia || (fpga_dense && exsia_pipeline_supported)) && pipeline_requested);
 #endif
     const auto quantize_activation = [&]() {
 #if LOG_CYCLE
@@ -2013,6 +2102,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             if (!ok) {
                 GGML_LOG_ERROR("%s: Q8_0 reprocessing failed for weight tensor '%s'\n",
                     __func__, src0->name);
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+                fpga_dispatch_failed = true;
+#endif
                 return;
             }
 
@@ -2076,6 +2168,25 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     // This preparation ends before any quantization, submission or execution.
     ggml::gemmini::log::cycle(layer, "gemmini.output_preparation", start, end);
 
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+    try {
+        ++fpga_attempted;
+        const bool success = ggml_gemmini_fpga_execute(args, pipeline_requested, [&]() {
+            if (!quantize_activation()) {
+                throw std::runtime_error("existing activation quantizer failed");
+            }
+        }, layer);
+        if (success) ++fpga_completed;
+        if (!success) {
+            GGML_LOG_ERROR("FPGA_UART execution failed: %s\n", ggml_gemmini_fpga_last_error().c_str());
+            fpga_dispatch_failed = true;
+        }
+    } catch (const std::exception &error) {
+        GGML_LOG_ERROR("FPGA_UART execution failed: %s\n", error.what());
+        fpga_dispatch_failed = true;
+    }
+    return;
+#endif
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
     if constexpr (im2p_exsia) {
       args.act_quant.storage()
@@ -2465,6 +2576,9 @@ static void ggml_backend_gemmini_get_rows_q8_channel(const ggml_tensor * src0,
 }
 
 static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+    fpga_dispatch_failed = false;
+#endif
     ggml_backend_gemmini_context * ctx = (ggml_backend_gemmini_context *)backend->context;
     setup_gemmini_log_outputs_if_needed();
 
@@ -2543,7 +2657,18 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
             const int32_t node_idx = node->ne[0] > 0 ? static_cast<int32_t>(node->ne[0]) : 1;
             ggml::gemmini::log::dump_set_node_idx(node_idx);
 #endif
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+            if (!ggml_is_empty(node)) {
+                ++fpga_assigned;
+                GGML_LOG_INFO("FPGA_UART_ASSIGN node=%s M=%lld N=%lld K=%lld source=executed_graph_node\n",
+                              node->name, (long long)ggml_nrows(node->src[1]),
+                              (long long)node->src[0]->ne[1], (long long)node->src[0]->ne[0]);
+            }
+#endif
             ggml_backend_gemmini_mul_mat(ctx, node);
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+            if (fpga_dispatch_failed) { ++fpga_failed; return GGML_STATUS_FAILED; }
+#endif
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) &&                        \
     defined(GGML_GEMMINI_TESTING)
             if (ggml::gemmini::im2p_adapter::test_production_failed()) {
@@ -2595,6 +2720,30 @@ static ggml_guid_t ggml_backend_gemmini_guid(void) {
 
 ggml_backend_t ggml_backend_gemmini_init(void) {
     ggml_backend_gemmini_context * ctx = new ggml_backend_gemmini_context;
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+    static std::once_flag identity_once;
+    std::call_once(identity_once, [] {
+        const char * device = std::getenv("IM2P_FPGA_DEVICE");
+        if (ggml_gemmini_fpga_uses_rtl())
+            GGML_LOG_INFO("FPGA_RTL_BUILD ABI=5 plugin_api=1 domain=%s numerical=%s "
+                          "A8/W8/D16 native=%s activation=" GGML_GEMMINI_ACTIVATION_QUANT_NAME
+                          " RMD=%s device_explicit=1 plugin=not_opened\n",
+                          fpga_output_domains, fpga_exsia ? "main_external" : "main_provider", fpga_native_formats, GGML_GEMMINI_ENABLE_RMD ? "ON" : "OFF");
+        else if (ggml_gemmini_fpga_uses_bounded())
+            GGML_LOG_INFO("FPGA_UART_BUILD ABI=5 protocol=IFR4 domain=%s numerical=%s "
+                          "A8/W8/D16 native=%s activation=" GGML_GEMMINI_ACTIVATION_QUANT_NAME
+                          " RMD=%s device_explicit=1 CAP=not_queried\n",
+                          fpga_output_domains, fpga_exsia ? "main_external" : "main_provider", fpga_native_formats, GGML_GEMMINI_ENABLE_RMD ? "ON" : "OFF");
+        else if (!fpga_exsia || GGML_GEMMINI_ENABLE_RMD)
+            GGML_LOG_INFO("FPGA_UART_BUILD ABI=5 transport=bounded_required domain=%s native=%s "
+                          "activation=" GGML_GEMMINI_ACTIVATION_QUANT_NAME " RMD=%s "
+                          "device_explicit=%d CAP=not_queried\n", fpga_output_domains,
+                          fpga_native_formats, GGML_GEMMINI_ENABLE_RMD ? "ON" : "OFF", device && *device);
+        else GGML_LOG_INFO("FPGA_UART_BUILD ABI=5 protocol=IFR3 capability=0294 domain=2 "
+                      "numerical=signed-scu-sat-v2 A8/W8/D16 native=Q8_H1 activation=EXSIA "
+                      "RMD=OFF device_explicit=%d CAP=not_queried\n", device && *device);
+    });
+#endif
     ggml::gemmini::load_q8_h1_artifact_from_env(ctx->q8_h1_artifact);
     if (ctx->q8_h1_artifact.status == ggml::gemmini::q8_h1_artifact_runtime_status::disabled_load_error) {
         GGML_LOG_WARN("%s: disabling LLAMA_GEMMINI_Q8_H1_ARTIFACT='%s': %s\n",
@@ -2626,7 +2775,17 @@ static const char * ggml_backend_gemmini_device_get_name(ggml_backend_dev_t dev)
 }
 
 static const char * ggml_backend_gemmini_device_get_description(ggml_backend_dev_t dev) {
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+    static const std::string bounded_description =
+        std::string("GEMMINI FPGA_UART ABI5 A8/W8/D16 activation=" GGML_GEMMINI_ACTIVATION_QUANT_NAME) +
+        " native=" + fpga_native_formats + " domains=" + fpga_output_domains +
+        " RMD=" + (GGML_GEMMINI_ENABLE_RMD ? "ON" : "OFF");
+    return (ggml_gemmini_fpga_uses_bounded() || !fpga_exsia || GGML_GEMMINI_ENABLE_RMD)
+        ? bounded_description.c_str()
+        : "GEMMINI FPGA_UART ABI5 IFR3 H1 final-domain2";
+#else
     return "GEMMINI";
+#endif
 
     GGML_UNUSED(dev);
 }
@@ -2711,6 +2870,29 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
             if (b->type != GGML_TYPE_F32)
                 return false;
 
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+            const auto options = ggml::gemmini::resolve_matmul_options();
+            if (!options.ok()) { fpga_support_diagnostic(op, "invalid_invocation_options"); return false; }
+            if (!gemmini_fpga_native_weight_supported(a->type)) {
+                fpga_support_diagnostic(op, "unsupported_native_weight_format"); return false;
+            }
+            if (a->type == GGML_TYPE_Q8_0 && GGML_GEMMINI_ENABLE_RMD != 0 &&
+                options.options.rmd_backend != ggml::gemmini::RmdBackend::cpu_direct) {
+                fpga_support_diagnostic(op, "Q8_0_requires_CPU_direct_residual"); return false;
+            }
+            if (!gemmini_shared_weight_contract(op)) { fpga_support_diagnostic(op, "layout_or_shared_weight_contract"); return false; }
+            // The loader's zero-byte weight buffer uses a synthetic M=512. It
+            // asks about this W's storage, not a real invocation or device CAP.
+            // Validate static N/K here; real backed graphs retain the full M gate.
+            const size_t rows = gemmini_is_loader_metadata(a) ? 1 : static_cast<size_t>(ggml_nrows(b));
+            if (!ggml_gemmini_fpga_supports(rows, static_cast<size_t>(a->ne[1]),
+                    static_cast<size_t>(a->ne[0]), options.options.mode ==
+                        ggml::gemmini::MatmulInvocationMode::stripe_pipeline,
+                    a->type != GGML_TYPE_Q8_CHANNEL)) {
+                fpga_support_diagnostic(op, ggml_gemmini_fpga_uses_bounded() ?
+                    "logical_extent_or_K32_alignment" : "capacity_M336_N48_K32_64_96"); return false;
+            }
+#endif
             // llama-model probes buffer compatibility with a zero-sized,
             // data-less tensor. Permit only the selected native artifact's
             // formats; the real path below still validates backing storage.
@@ -2724,6 +2906,13 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
                 if (gemmini_is_native_matched_weight_type(a->type)) {
                     return a->ne[0] % 32 == 0;
                 }
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+                if (a->type == GGML_TYPE_Q8_0) {
+                    // Storage-only query. Existing row reprocessing validates
+                    // the actual payload before any FPGA adapter call.
+                    return a->ne[0] % QK8_0 == 0;
+                }
+#endif
 
                 if (gemmini_is_extended_dequant_weight_type(a->type)) {
                     if constexpr (
@@ -3100,11 +3289,24 @@ static ggml_backend_dev_t ggml_backend_gemmini_reg_get_device(ggml_backend_reg_t
     GGML_UNUSED(index);
 }
 
+static void * ggml_backend_gemmini_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+    if (std::strcmp(name, "ggml_gemmini_fpga_stats_v1") == 0) return (void *) fpga_stats_v1;
+    if (std::strcmp(name, "ggml_gemmini_fpga_set_observer") == 0) return (void *) ggml_gemmini_fpga_set_observer;
+    if (std::strcmp(name, "ggml_gemmini_fpga_set_block_observer") == 0) return (void *) ggml_gemmini_fpga_set_block_observer;
+    if (std::strcmp(name, "ggml_gemmini_fpga_set_result_observer") == 0) return (void *) ggml_gemmini_fpga_set_result_observer;
+    if (std::strcmp(name, "ggml_gemmini_fpga_set_boundary_observer") == 0) return (void *) ggml_gemmini_fpga_set_boundary_observer;
+#endif
+    GGML_UNUSED(name);
+    return nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_gemmini_reg_i = {
     /* .get_name         = */ ggml_backend_gemmini_reg_get_name,
     /* .get_device_count = */ ggml_backend_gemmini_reg_get_device_count,
     /* .get_device       = */ ggml_backend_gemmini_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_gemmini_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_gemmini_reg(void) {

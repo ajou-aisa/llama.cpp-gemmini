@@ -49,7 +49,7 @@ void operator delete[](void * memory, std::size_t) noexcept { std::free(memory);
 template<typename Meta, typename Quantize>
 bool check_quantizer(const char *name, Quantize quantize)
 {
-    auto run = [&](float outlier) {
+    auto run = [&](float outlier, bool check_minimum = false) {
         std::vector<float> source(17, 1.0f);
         source.back() = outlier;
         std::vector<elem_t> quantized(source.size(), 0);
@@ -65,7 +65,17 @@ bool check_quantizer(const char *name, Quantize quantize)
         args.A.allocate(args.I, args.K, GGML_GEMMINI_ACTIVATION_BITS);
         args.sA = args.K;
         args.act_quant.storage().template emplace<Meta>();
-        return quantize(&tensor, args);
+        if (!quantize(&tensor, args)) return false;
+        if (check_minimum) {
+            const auto & meta = std::get<Meta>(args.act_quant.storage());
+            std::vector<int32_t> residual;
+            ggml::gemmini::rmd::expand_packets_to_plane(
+                meta.rmd_packets, args.I, args.K, residual);
+            if (residual.size() != source.size()) return false;
+            return static_cast<int64_t>(args.A.get(0, args.K - 1)) + residual.back() ==
+                std::numeric_limits<int32_t>::min();
+        }
+        return true;
     };
 
     if (!run(16.0f)) {
@@ -83,13 +93,13 @@ bool check_quantizer(const char *name, Quantize quantize)
         return false;
     }
     std::feclearexcept(FE_ALL_EXCEPT);
-    const bool accepted_negative_overflow = run(-FLT_MAX);
+    const bool reconstructed_minimum = run(-FLT_MAX, true);
     if (std::fetestexcept(FE_INVALID | FE_OVERFLOW) != 0) {
         std::fprintf(stderr, "FAIL: %s raised a floating exception while clamping to INT32_MIN\n", name);
         return false;
     }
-    if (accepted_negative_overflow) {
-        std::fprintf(stderr, "FAIL: %s accepted a negative finite outlier beyond the signed-21 RMD domain\n", name);
+    if (!reconstructed_minimum) {
+        std::fprintf(stderr, "FAIL: %s did not reconstruct clamped INT32_MIN from dense plus native residual\n", name);
         return false;
     }
     return true;

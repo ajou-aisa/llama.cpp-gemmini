@@ -239,6 +239,9 @@ bool run_zero_residual() {
 }
 
 bool run_signed21_overflow() {
+    // Retain the historical case selector; test the actual fixed-lane limit.
+    constexpr int32_t maximum = GGML_GEMMINI_ACTIVATION_BITS == 4 ? 2004318071 :
+        GGML_GEMMINI_ACTIVATION_BITS == 8 ? 2139062143 : 2147450879;
     RmdStripeBuilder builder;
     builder.reset(29, 0, 1, kBlockSize, 1,
                   GGML_GEMMINI_ACTIVATION_BITS);
@@ -248,8 +251,8 @@ bool run_signed21_overflow() {
     RmdExecutionMetrics metrics{};
     metrics.packet_call_count = 73;
     metrics.im2p_dot_calls = 79;
-    const bool negative_rejected =
-        !builder.add_residual(0, 0, kSigned21Min - 1) &&
+    const bool first_overflow_rejected =
+        !builder.add_residual(0, 0, maximum + 1) &&
         builder.status() == RmdStatus::residual_too_wide &&
         builder.finish() == nullptr;
 
@@ -257,19 +260,19 @@ bool run_signed21_overflow() {
     positive.reset(30, 0, 1, kBlockSize, 1,
                    GGML_GEMMINI_ACTIVATION_BITS);
     const bool positive_rejected =
-        !positive.add_residual(0, 0, kSigned21Max + 1) &&
+        !positive.add_residual(0, 0, std::numeric_limits<int32_t>::max()) &&
         positive.status() == RmdStatus::residual_too_wide &&
         positive.finish() == nullptr;
-    const bool ok = check(negative_rejected && positive_rejected,
-                          "signed-21 overflow rejects both extrema") &&
+    const bool ok = check(first_overflow_rejected && positive_rejected,
+                          "native lane capacity overflow rejects before execution") &&
         check(im2p_provider_dot_attempts_for_test() == 0 &&
                   unchanged(output, metrics),
-              "signed-21 overflow is rejected before provider or mutation");
+              "native lane capacity overflow is rejected before provider or mutation");
     if (ok) {
-        std::puts("IM2P_PROVIDER signed21-overflow status=residual_too_wide "
-                  "bounds=-1048576:1048575 attempts=0 dot_calls=0 "
+        std::printf("IM2P_PROVIDER signed21-overflow status=residual_too_wide "
+                  "policy=native-lane-capacity max=%d attempts=0 dot_calls=0 "
                   "output_sentinel=unchanged metrics_sentinel=unchanged "
-                  "ws_calls=0");
+                  "ws_calls=0\n", maximum);
     }
     return ok;
 }

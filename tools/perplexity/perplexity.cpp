@@ -2042,6 +2042,7 @@ int main(int argc, char ** argv) {
     }
 
     struct results_perplexity results;
+    bool evaluation_ok = true;
     if (params.hellaswag) {
         hellaswag_score(ctx, params);
     } else if (params.winogrande) {
@@ -2052,12 +2053,14 @@ int main(int argc, char ** argv) {
         kl_divergence(ctx, params);
     } else {
         results = perplexity(ctx, params, n_ctx);
+        evaluation_ok = results.ppl_value >= 0;
     }
 
     LOG("\n");
     llama_perf_context_print(ctx);
 
+    const bool fpga_execution_ok = common_fpga_execution_check();
     llama_backend_free();
 
-    return 0;
+    return evaluation_ok && fpga_execution_ok ? 0 : 1;
 }

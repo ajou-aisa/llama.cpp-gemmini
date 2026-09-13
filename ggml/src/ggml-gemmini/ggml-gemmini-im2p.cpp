@@ -603,10 +603,13 @@ Completion run_full(const ggml_gemmini_args_t &args) noexcept {
 #endif
 
   preparation.finish();
+  ::im2p::gemmini::Options frontend_options{65536};
+  frontend_options.numerical_contract =
+      ::im2p::gemmini::NumericalContract::main_external;
   HostCpuInterval frontend_start(args, "im2p.frontend_start_host_call");
   auto started =
       ::im2p::gemmini::execute(&runtime_args, ::im2p::gemmini::Mode::full,
-                               ::im2p::gemmini::Options{65536});
+                               frontend_options);
   frontend_start.finish(started.status.ok());
   if (!started.status.ok()) {
 #if defined(GGML_GEMMINI_TESTING)
@@ -684,10 +687,13 @@ Completion run_stripe_pipeline(const ggml_gemmini_args_t &args) noexcept {
                        runtime_args);
 #endif
   preparation.finish();
+  ::im2p::gemmini::Options frontend_options{65536};
+  frontend_options.numerical_contract =
+      ::im2p::gemmini::NumericalContract::main_external;
   HostCpuInterval frontend_start(args, "im2p.frontend_start_host_call");
   auto started = ::im2p::gemmini::execute(
       &runtime_args, ::im2p::gemmini::Mode::stripe_pipeline,
-      ::im2p::gemmini::Options{65536});
+      frontend_options);
   frontend_start.finish(started.status.ok());
   if (!started.status.ok()) {
 #if defined(GGML_GEMMINI_TESTING)
@@ -1645,10 +1651,13 @@ Completion ExsiaFullExecution::finish(bool quantization_succeeded) noexcept {
     }
   }
 #endif
+  ::im2p::gemmini::Options frontend_options{65536};
+  frontend_options.numerical_contract =
+      ::im2p::gemmini::NumericalContract::main_external;
   HostCpuInterval frontend_start(impl_->args, "im2p.frontend_start_host_call");
   auto started = ::im2p::gemmini::execute(&impl_->runtime_args,
                                           ::im2p::gemmini::Mode::full,
-                                          ::im2p::gemmini::Options{65536});
+                                          frontend_options);
   frontend_start.finish(started.status.ok());
   if (!started.status.ok())
     return {translate(started.status), {}};
@@ -1781,9 +1790,11 @@ start_exsia_stripe_pipeline(ggml_gemmini_args_t &args) noexcept {
   observe_runtime_args(TestRuntimeArgsSite::exsia_pipeline_before_execute,
                        impl->runtime_args);
 #endif
-  const ::im2p::gemmini::Options frontend_options{
+  ::im2p::gemmini::Options frontend_options{
       65536, impl->residual_mode, impl.get(),
       &ExsiaStripePipeline::Impl::residual_stage};
+  frontend_options.numerical_contract =
+      ::im2p::gemmini::NumericalContract::main_external;
   preparation.finish();
   HostCpuInterval frontend_start(args, "im2p.frontend_start_host_call");
   auto started = ::im2p::gemmini::execute(

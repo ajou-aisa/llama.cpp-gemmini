@@ -14,6 +14,7 @@
 #include <limits>
 #include <memory>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -65,9 +66,11 @@ bool test_width_native_radix_happy_boundaries() {
         {8, 256, 4, -128, 127},
         {16, 65536, 2, -32768, 32767},
     }};
-    constexpr std::array<int32_t, 13> values = {
+    constexpr std::array<int32_t, 17> values = {
         kSigned21Min, -65537, -32769, -129, -9, -8, -1,
         0, 1, 7, 8, 32768, kSigned21Max,
+        kSigned21Min - 1, kSigned21Max + 1, -1274088,
+        std::numeric_limits<int32_t>::min(),
     };
 
     bool ok = true;
@@ -81,7 +84,7 @@ bool test_width_native_radix_happy_boundaries() {
             NativeBalancedDigits digits{};
             const RmdStatus status = decompose_balanced_radix(value, width.bits, digits);
             bool value_ok = check(status == RmdStatus::success,
-                                  "signed-21 boundary decomposes");
+                                  "legacy and extended native boundaries decompose");
             value_ok = check(digits.radix == width.radix &&
                                  digits.lane_capacity == width.capacity &&
                                  digits.active_lane_count <= width.capacity,
@@ -115,14 +118,15 @@ bool test_width_native_radix_happy_boundaries() {
         int64_t place = 1;
         for (uint8_t lane = 0; lane + 1 < width.capacity; ++lane) {
             const int64_t boundary = static_cast<int64_t>(width.radix / 2) * place;
-            if (boundary > kSigned21Max) {
+            if (boundary > std::numeric_limits<int32_t>::max()) {
                 break;
             }
             for (const int64_t candidate : {
                      boundary - 1, boundary, boundary + 1,
                      -boundary + 1, -boundary, -boundary - 1,
                  }) {
-                if (candidate < kSigned21Min || candidate > kSigned21Max) {
+                if (candidate < std::numeric_limits<int32_t>::min() ||
+                    candidate > std::numeric_limits<int32_t>::max()) {
                     continue;
                 }
                 NativeBalancedDigits digits{};
@@ -150,10 +154,13 @@ bool test_width_native_compose_and_expand() {
         uint8_t bits;
         int32_t residual;
     };
-    constexpr std::array<WidthCase, 3> cases = {{
+    constexpr std::array<WidthCase, 6> cases = {{
         {4, kSigned21Min + 1},
         {8, 65537},
         {16, kSigned21Max},
+        {4, std::numeric_limits<int32_t>::min()},
+        {8, -1274088},
+        {16, 2147450879},
     }};
     constexpr std::array<int64_t, 2> weights = {3, -257};
     constexpr int64_t block_scale = 5;
@@ -271,21 +278,39 @@ bool test_width_native_compose_and_expand() {
 }
 
 bool test_width_native_first_too_wide_is_atomic() {
-    constexpr std::array<uint8_t, 3> widths = {4, 8, 16};
+    // Independent sums of maximum native digits in 8/4/2 fixed lanes.
+    constexpr std::array<std::pair<uint8_t, int32_t>, 3> widths = {{{4, 2004318071},
+        {8, 2139062143}, {16, 2147450879}}};
     bool ok = true;
-    for (const uint8_t bits : widths) {
+    for (const auto & width : widths) {
+        const uint8_t bits = width.first;
+        const int32_t maximum = width.second;
+        NativeBalancedDigits boundary{};
+        ok = check(decompose_balanced_radix(maximum, bits, boundary) == RmdStatus::success &&
+                       independently_compose(boundary) == maximum,
+                   "last native positive value round-trips") && ok;
         NativeBalancedDigits sentinel{};
         sentinel.radix = 99;
         sentinel.lane_capacity = 7;
         sentinel.active_lane_count = 3;
         sentinel.digits.fill(42);
-        for (const int32_t value : {kSigned21Min - 1, kSigned21Max + 1}) {
+        for (const int32_t value : {maximum + 1, std::numeric_limits<int32_t>::max()}) {
             NativeBalancedDigits actual = sentinel;
             ok = check(decompose_balanced_radix(value, bits, actual) ==
                            RmdStatus::residual_too_wide &&
                            actual == sentinel,
-                       "first signed-21 overflow rejects without mutating digits") && ok;
+                       "native capacity overflow rejects without mutating digits") && ok;
         }
+        // The fixed digit capacity extends below int32; the public input does not.
+        NativeBalancedDigits below_int32 = boundary;
+        for (uint8_t lane = 0; lane < below_int32.lane_capacity; ++lane) {
+            below_int32.digits[lane] = -(int32_t{1} << (bits - 1));
+        }
+        int64_t output = 42;
+        ok = check(independently_compose(below_int32) < std::numeric_limits<int32_t>::min() &&
+                       compose_balanced_radix(below_int32, output) == RmdStatus::residual_too_wide &&
+                       output == 42,
+                   "composition below int32 rejects without output mutation") && ok;
     }
     return ok;
 }
@@ -769,7 +794,9 @@ bool test_direct_oracle_happy_matrix() {
     for (const DirectOracleCase & test : kDirectOracleCases) {
         DirectOracleFixture fixture(test.bits, test.family);
         rmd::DirectOutput actual = rmd::PreScaledFloat64Correction{{91.5, -27.25}};
-        residual::DirectExecutionMetrics metrics{71, 73};
+        residual::DirectExecutionMetrics metrics{};
+        metrics.event_count = 71;
+        metrics.call_count = 73;
         const rmd::RmdStatus status = fixture.payload == nullptr ? rmd::RmdStatus::invalid_packet :
             residual::execute_direct_stripe(fixture.args, *fixture.payload, actual, &metrics);
         bool case_ok = check(status == rmd::RmdStatus::success,
@@ -860,7 +887,9 @@ bool test_direct_failure_matrix() {
         const auto * before = std::get_if<rmd::PreScaledFloat64Correction>(&output);
         const double * const before_data = before->values.data();
         const size_t before_capacity = before->values.capacity();
-        residual::DirectExecutionMetrics metrics{79, 83};
+        residual::DirectExecutionMetrics metrics{};
+        metrics.event_count = 79;
+        metrics.call_count = 83;
         const rmd::RmdStatus status =
             residual::execute_direct_stripe(args, payload, output, &metrics);
         const auto * after = std::get_if<rmd::PreScaledFloat64Correction>(&output);
@@ -1683,6 +1712,11 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
+    // Native H0 readers use the FP16 tables initialized by ggml_init.
+    ggml_context * context = ggml_init({0, nullptr, true});
+    if (!check(context != nullptr, "GGML initialization succeeds")) return 1;
+    ggml_free(context);
+
     bool ok = true;
     if (selection == TestSelection::all || selection == TestSelection::happy_table) {
         ok = test_balanced_radix_decomposition() && ok;
@@ -1737,7 +1771,7 @@ int main(int argc, char ** argv) {
             selection == TestSelection::compact_failure ?
                 "PASS: matched-width compact failure matrix" :
             selection == TestSelection::radix_happy ?
-                "PASS: width-native radix signed-21 boundaries" :
+                "PASS: width-native radix legacy and extended boundaries" :
             selection == TestSelection::radix_failure ?
                 "PASS: width-native radix rejection and malformed metadata atomicity" :
             selection == TestSelection::failure_table ?

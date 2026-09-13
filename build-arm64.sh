@@ -6,13 +6,13 @@ SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_ROOT/scripts/im2p-host-provision.sh"
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  printf 'Usage: %s [CMake configure arguments...]\n' "${0##*/}"
+  printf 'Usage: %s [--dry-run] [-DNAME[:TYPE]=value ...]\n' "${0##*/}"
   printf '%s\n' 'Environment overrides: BUILD_DIR, BUILD_JOBS, GGML_*, IM2P_*.'
   printf '%s\n' 'GGML_GEMMINI_DIM=16|32|64 selects host tiling and the matching IM2P artifact; IM2P_DIM is a deprecated alias.'
   exit 0
 fi
 
-# Build Gemmini in WS simulator mode on Apple Silicon; outputs live in build-arm64/bin by default.
+# Build the selected Gemmini backend on ARM64 (Linux or macOS); outputs live in build-arm64/bin by default.
 BUILD_DIR=${BUILD_DIR:-build-arm64}
 LLAMA_CURL_DEFAULT=${LLAMA_CURL_DEFAULT:-OFF} # disable libcurl requirement on local macOS unless explicitly enabled
 CMAKE_BUILD_TYPE_DEFAULT=${CMAKE_BUILD_TYPE_DEFAULT:-Release} # Debug | Release
@@ -47,14 +47,9 @@ GGML_GEMMINI_DEQUANT_FP_TEST_DEFAULT=${GGML_GEMMINI_DEQUANT_FP_TEST_DEFAULT:-${G
 GGML_GEMMINI_ACTIVATION_QUANT_DEFAULT=${GGML_GEMMINI_ACTIVATION_QUANT_DEFAULT:-${GGML_GEMMINI_ACTIVATION_QUANT:-EXSIA}} # EXSIA | TENSOR | TOKEN | BLOCK | STRIPE
 GGML_GEMMINI_ACTIVATION_BITS_DEFAULT=${GGML_GEMMINI_ACTIVATION_BITS_DEFAULT:-${GGML_GEMMINI_ACTIVATION_BITS:-8}} # 4 | 8 | 16
 GGML_GEMMINI_WEIGHT_BITS_DEFAULT=${GGML_GEMMINI_WEIGHT_BITS_DEFAULT:-${GGML_GEMMINI_WEIGHT_BITS:-8}} # 4 | 8 | 16
-GGML_GEMMINI_EXECUTION_BACKEND_DEFAULT=${GGML_GEMMINI_EXECUTION_BACKEND:-IM2P_SIM} # HARDWARE | IM2P_SIM
+GGML_GEMMINI_EXECUTION_BACKEND_DEFAULT=${GGML_GEMMINI_EXECUTION_BACKEND:-IM2P_SIM} # HARDWARE | IM2P_SIM | FPGA_UART
 IM2P_SIM_ROOT_DEFAULT=${IM2P_SIM_ROOT:-../IM2P.sim}
-if [[ -n "${IM2P_DIM+x}" && -n "${GGML_GEMMINI_DIM+x}" &&
-      "$IM2P_DIM" != "$GGML_GEMMINI_DIM" ]]; then
-  printf '%s\n' "IM2P_DIM and GGML_GEMMINI_DIM must match when both are set" >&2
-  exit 2
-fi
-GGML_GEMMINI_DIM_DEFAULT=${GGML_GEMMINI_DIM:-${IM2P_DIM:-64}} # 16 | 32 | 64
+GGML_GEMMINI_DIM_DEFAULT=${GGML_GEMMINI_DIM:-64} # 16 | 32 | 64
 GGML_GEMMINI_BLOCK_SIZE_DEFAULT=${GGML_GEMMINI_BLOCK_SIZE_DEFAULT:-${GGML_GEMMINI_BLOCK_SIZE:-32}} # 32 | 64 | 128
 GGML_GEMMINI_EXSIA_SIGMA_DEFAULT=${GGML_GEMMINI_EXSIA_SIGMA:-2} # positive integer
 # Public matmul invocation defaults: FULL / STRIPE_PIPELINE.
@@ -71,6 +66,12 @@ GGML_GEMMINI_EXSIA_LOCAL_WORKERS_DEFAULT=${GGML_GEMMINI_EXSIA_LOCAL_WORKERS:-3} 
 GGML_GEMMINI_EXSIA_PROFILE_SCOPE_DEFAULT=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE:-OFF} # OFF | TIMELINE | STAGE
 BREW_BIN=""
 
+im2p_resolve_build_options "$BUILD_DIR" "${0##*/}" "$@"
+if [[ "$IM2P_BUILD_DRY_RUN" == 1 ]]; then
+  printf 'Dry run: no provisioning, configure, build, or device access.\n'
+  exit 0
+fi
+
 if [[ "$CYCLE_DETAIL_DEFAULT" == "1" && "$LOG_CYCLE_DEFAULT" != "1" ]]; then
   printf '%s\n' "CYCLE_DETAIL=1 requires LOG_CYCLE=1" >&2
   exit 2
@@ -80,21 +81,24 @@ if [[ "$GGML_GEMMINI_EXSIA_PROFILE_SCOPE_DEFAULT" != "OFF" && "$CYCLE_DETAIL_DEF
   exit 2
 fi
 
-if command -v brew >/dev/null 2>&1; then
-  BREW_BIN="$(command -v brew)"
-elif [[ -x "/opt/homebrew/bin/brew" ]]; then
-  BREW_BIN="/opt/homebrew/bin/brew"
-elif [[ -x "/usr/local/bin/brew" ]]; then
-  BREW_BIN="/usr/local/bin/brew"
-fi
-
-if [[ -z "$LIBOMP_PREFIX_DEFAULT" ]] && [[ -n "$BREW_BIN" ]]; then
-  if "$BREW_BIN" list libomp >/dev/null 2>&1; then
+PLATFORM_CMAKE_ARGS=()
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  if command -v brew >/dev/null 2>&1; then
+    BREW_BIN="$(command -v brew)"
+  elif [[ -x /opt/homebrew/bin/brew ]]; then
+    BREW_BIN=/opt/homebrew/bin/brew
+  elif [[ -x /usr/local/bin/brew ]]; then
+    BREW_BIN=/usr/local/bin/brew
+  fi
+  if [[ -z "$LIBOMP_PREFIX_DEFAULT" && -n "$BREW_BIN" ]] && "$BREW_BIN" list libomp >/dev/null 2>&1; then
     LIBOMP_PREFIX_DEFAULT="$("$BREW_BIN" --prefix libomp)"
   fi
+  PLATFORM_CMAKE_ARGS+=("-DCMAKE_OSX_ARCHITECTURES=${APPLE_SILICON_ARCH_DEFAULT}")
+  if [[ -n "$LIBOMP_PREFIX_DEFAULT" ]]; then
+    PLATFORM_CMAKE_ARGS+=("-DOpenMP_ROOT=${LIBOMP_PREFIX_DEFAULT}")
+    PLATFORM_CMAKE_ARGS+=("-DCMAKE_PREFIX_PATH=${LIBOMP_PREFIX_DEFAULT}${CMAKE_PREFIX_PATH_DEFAULT:+;${CMAKE_PREFIX_PATH_DEFAULT}}")
+  fi
 fi
-
-CMAKE_PREFIX_PATH_DEFAULT="${CMAKE_PREFIX_PATH:-}"
 
 if [[ "$GGML_GEMMINI_EXECUTION_BACKEND_DEFAULT" == "IM2P_SIM" ]]; then
   im2p_provision_host_artifacts \
@@ -104,7 +108,7 @@ if [[ "$GGML_GEMMINI_EXECUTION_BACKEND_DEFAULT" == "IM2P_SIM" ]]; then
     "$GGML_GEMMINI_DIM_DEFAULT" "$GGML_GEMMINI_BLOCK_SIZE_DEFAULT"
 fi
 
-cmake -B "$BUILD_DIR" -S . \
+cmake -B "$BUILD_DIR" -S "$SCRIPT_ROOT" \
   -DGGML_METAL=OFF \
   -DGGML_BLAS=OFF \
   -DGGML_GEMMINI=ON \
@@ -145,12 +149,9 @@ cmake -B "$BUILD_DIR" -S . \
   -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE_DEFAULT}" \
   -DGGML_NATIVE="${GGML_NATIVE_DEFAULT}" \
   -DLLAMA_CURL="${LLAMA_CURL_DEFAULT}" \
-  -DCMAKE_OSX_ARCHITECTURES="${APPLE_SILICON_ARCH_DEFAULT}" \
   -DGGML_OPENMP="${GGML_OPENMP_DEFAULT}" \
   -DGGML_GEMMINI_ENABLE_OPENMP="${GGML_GEMMINI_ENABLE_OPENMP_DEFAULT}" \
-  ${LIBOMP_PREFIX_DEFAULT:+-DOpenMP_ROOT="${LIBOMP_PREFIX_DEFAULT}"} \
-  ${LIBOMP_PREFIX_DEFAULT:+-DCMAKE_PREFIX_PATH="${LIBOMP_PREFIX_DEFAULT}${CMAKE_PREFIX_PATH_DEFAULT:+:${CMAKE_PREFIX_PATH_DEFAULT}}"} \
-  "$@"
+  "${PLATFORM_CMAKE_ARGS[@]}" \
+  "${IM2P_EFFECTIVE_CMAKE_ARGS[@]}"
 
-rm -f "$BUILD_DIR/bin/libggml-cpu.so" "$BUILD_DIR/bin/libggml-gemmini.so"
 cmake --build "$BUILD_DIR" --target llama-cli llama-perplexity llama-quantize -j"${BUILD_JOBS_DEFAULT}"

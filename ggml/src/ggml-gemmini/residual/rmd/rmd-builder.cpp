@@ -137,10 +137,6 @@ RmdStatus decompose_balanced_radix(int32_t residual,
     if (contract.radix == 0) {
         return RmdStatus::invalid_arguments;
     }
-    if (residual < kSigned21Min || residual > kSigned21Max) {
-        return RmdStatus::residual_too_wide;
-    }
-
     NativeBalancedDigits staged{};
     staged.radix = contract.radix;
     staged.lane_capacity = contract.lane_capacity;
@@ -199,7 +195,8 @@ RmdStatus compose_balanced_radix(const NativeBalancedDigits & digits,
             return RmdStatus::invalid_arguments;
         }
     }
-    if (staged < kSigned21Min || staged > kSigned21Max) {
+    if (staged < std::numeric_limits<int32_t>::min() ||
+        staged > std::numeric_limits<int32_t>::max()) {
         return RmdStatus::residual_too_wide;
     }
     out = staged;

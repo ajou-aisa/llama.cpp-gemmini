@@ -2,7 +2,7 @@
 
 #include "rmd-executor.hpp"
 
-#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) || defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
 #include <im2p_sim.h>
 #endif
 
@@ -13,6 +13,17 @@ struct im2p_sim;
 typedef struct im2p_sim im2p_sim_t;
 
 namespace ggml::gemmini::rmd {
+
+struct Im2pFullExecutor;
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) || defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+struct Im2pFullExecutor {
+    void * context = nullptr;
+    // Synchronous borrowed descriptor. Success requires every checked output
+    // callback and device completion. A failure is never retried in software.
+    int (*execute)(void *, const im2p_matmul_desc_t *,
+                   im2p_work_stats_extended_t *) = nullptr;
+};
+#endif
 
 enum class Im2pProviderTestFault : uint8_t {
     none,
@@ -35,7 +46,8 @@ RmdStatus execute_rmd_stripe_im2p(im2p_sim_t * sim,
                                   const ggml_gemmini_args_t & args,
                                   const StripePacket & packet,
                                   CompressedOutput & output,
-                                  RmdExecutionMetrics * metrics = nullptr);
+                                  RmdExecutionMetrics * metrics = nullptr,
+                                  const Im2pFullExecutor * executor = nullptr);
 
 #if defined(GGML_GEMMINI_TESTING)
 RmdStatus execute_rmd_stripe_im2p_for_test(
@@ -55,7 +67,7 @@ struct Im2pProviderStatsAggregate {
     RmdProviderStats stats{};
 };
 
-#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) || defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
 void expand_im2p_provider_stats(const RmdProviderStats &source,
                                 im2p_work_stats_extended_t &destination) noexcept;
 #endif
@@ -77,7 +89,8 @@ RmdStatus execute_im2p_compact_dot(
     OutputValue * output,
     size_t output_row_stride,
     Im2pProviderStatsAggregate & aggregate,
-    Im2pProviderTestFault fault = Im2pProviderTestFault::none);
+    Im2pProviderTestFault fault = Im2pProviderTestFault::none,
+    const Im2pFullExecutor * executor = nullptr);
 
 } // namespace detail
 } // namespace ggml::gemmini::rmd
