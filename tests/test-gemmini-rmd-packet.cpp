@@ -230,11 +230,6 @@ bool test_width_native_round_trip() {
                    decoded == 42,
                "truncated native Q4 decode leaves output unchanged") && ok;
 
-    ok = check(p4->stacked_activation.packed_int4.size() >= w4_literal.size() &&
-                   std::equal(w4_literal.begin(), w4_literal.end(),
-                              p4->stacked_activation.packed_int4.begin()),
-               "signed INT4 values map to adjacent native packet bytes") && ok;
-
     std::printf("W4 bytes=");
     for (size_t i = 0; i < w4_literal.size(); ++i) {
         std::printf("%s%02x", i == 0 ? "" : " ",

@@ -67,11 +67,6 @@ RmdStatus execute_rmd_stripe_im2p_with_weights(im2p_sim_t * sim,
     const ggml_gemmini_args_t & args, const StripePacket & packet,
     Correction & correction, RmdWeightPreparation & weights,
     RmdExecutionMetrics * metrics = nullptr);
-RmdStatus execute_rmd_stripe_im2p_prepared(im2p_sim_t * sim,
-    const ggml_gemmini_args_t & args, const StripePacket & packet,
-    Correction & correction, quants::wroute::WeightRoutePlan & plan,
-    RmdExecutionMetrics * metrics = nullptr);
-
 
 struct Im2pProviderStatsAggregate {
     RmdProviderStats stats{};

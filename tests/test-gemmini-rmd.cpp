@@ -28,22 +28,6 @@ bool check(bool condition, const char * message) {
     return condition;
 }
 
-bool test_balanced_radix_decomposition() {
-    constexpr std::array<int32_t, 16> values = {
-        std::numeric_limits<int32_t>::min(), -16777217, -129, -128, -1, 0, 1,
-        127, 128, 255, 256, 16777216, 2139062143, 2139062144,
-        std::numeric_limits<int32_t>::max() - 1, std::numeric_limits<int32_t>::max(),
-    };
-    for (const int32_t value : values) {
-        BalancedDigits digits{};
-        if (!check(decompose_balanced_radix256(value, digits), "balanced value decomposes") ||
-            !check(compose_balanced_radix256(digits) == value, "balanced digits round-trip")) {
-            return false;
-        }
-    }
-    return true;
-}
-
 int64_t independently_compose(const NativeBalancedDigits & digits) {
     int64_t value = 0;
     int64_t place = 1;
@@ -79,15 +63,22 @@ bool test_width_native_radix_happy_boundaries() {
         {8, 256, 5, -128, 127},
         {16, 65536, 3, -32768, 32767},
     }};
-    constexpr std::array<int32_t, 19> values = {
+    constexpr std::array<int32_t, 28> values = {
         std::numeric_limits<int32_t>::min(), std::numeric_limits<int32_t>::min() + 1,
-        -(int32_t{1} << 20) - 1, -(int32_t{1} << 20),
-        -65537, -32769, -129, -9, -8, -1, 0, 1, 7, 8, 32768,
-        (int32_t{1} << 20) - 1, int32_t{1} << 20,
+        -16777217, -(int32_t{1} << 20) - 1, -(int32_t{1} << 20),
+        -65537, -32769, -129, -128, -9, -8, -1, 0, 1, 7, 8,
+        127, 128, 255, 256, 32768,
+        (int32_t{1} << 20) - 1, int32_t{1} << 20, 16777216, 2139062143, 2139062144,
         std::numeric_limits<int32_t>::max() - 1, std::numeric_limits<int32_t>::max(),
     };
 
-    bool ok = true;
+    NativeBalancedDigits zero{};
+    zero.digits.fill(1);
+    zero.active_lane_count = balanced_radix_contract(8).lane_capacity;
+    bool ok = check(decompose_balanced_radix(0, 8, zero) == RmdStatus::success &&
+                        zero.active_lane_count == 0 &&
+                        zero.digits == std::array<int32_t, kMaxNativeRadixLanes>{},
+                    "zero decomposition clears all reused digits and the active lane count");
     for (const WidthCase & width : widths) {
         const BalancedRadixContract contract = balanced_radix_contract(width.bits);
         ok = check(contract.radix == width.radix && contract.lane_capacity == width.capacity &&
@@ -436,15 +427,7 @@ bool test_width_native_malformed_compose_is_atomic() {
 }
 
 bool test_top_carry_lane_preserves_sparse_mask() {
-    BalancedDigits digits{};
-    digits.digits.fill(1);
-    digits.lane_mask = 0x1f;
-    const bool decomposed = decompose_balanced_radix256(std::numeric_limits<int32_t>::max(), digits);
-
-    bool ok = check(decomposed && digits.digits[4] == 1 &&
-                        (digits.lane_mask & (1u << 4)) != 0 &&
-                        compose_balanced_radix256(digits) == std::numeric_limits<int32_t>::max(),
-                    "legacy radix256 preserves the fifth lane for INT32_MAX");
+    bool ok = true;
     for (uint8_t bits : {uint8_t{4}, uint8_t{8}, uint8_t{16}}) {
         RmdStripeBuilder builder;
         builder.reset(0, 0, 1, kBlockSize, 1, bits);
@@ -1722,7 +1705,6 @@ bool test_full_int32_compact_direct_agreement(size_t rows) {
 
 bool test_shared_weight_preparation() {
     namespace wreader = ggml::gemmini::quants::wreader;
-    namespace wroute = ggml::gemmini::quants::wroute;
     namespace act = ggml::gemmini::quants::act;
     WeightCapabilityFixture fixture(GGML_GEMMINI_WEIGHT_BITS, WeightFamily::HP1);
     auto & args = fixture.args;
@@ -1787,17 +1769,17 @@ bool test_shared_weight_preparation() {
                     "concurrent stripes prepare immutable weights and selected columns once");
     wreader::test_reset_weight_reader_counters();
     for (size_t stripe = 0; stripe < packets.size(); ++stripe) {
-        wroute::WeightRoutePlan plan;
+        rmd::detail::RmdWeightPreparation fresh_weights;
         Correction fresh;
         const int64_t expected = static_cast<int64_t>(residuals[stripe]) * 5 * (stripe == 0 ? 4 : 8);
         ok = check(statuses[stripe] == RmdStatus::success &&
                        std::get<BlockScaledInt64Correction>(corrections[stripe]).values ==
                            std::vector<int64_t>{expected} &&
-                       rmd::detail::execute_rmd_stripe_ws_prepared(
-                           stripe_args[stripe], *packets[stripe], fresh, plan) == RmdStatus::success &&
+                       rmd::detail::execute_rmd_stripe_ws_with_weights(
+                           stripe_args[stripe], *packets[stripe], fresh, fresh_weights) == RmdStatus::success &&
                        direct_outputs_match(fresh, corrections[stripe]) &&
-                       rmd::detail::merge_rmd_correction_prepared(stripe_args[stripe], fresh_output.data(),
-                           *packets[stripe], fresh, plan) == RmdStatus::success &&
+                       rmd::detail::merge_rmd_correction_with_weights(stripe_args[stripe], fresh_output.data(),
+                           *packets[stripe], fresh, fresh_weights) == RmdStatus::success &&
                        shared_output[stripe] == 7.0f + static_cast<float>(
                            static_cast<double>(expected) * 0.25 * 0.5 * (stripe + 1)),
                    "shared stripes match fresh execution and literal correction with current row scales") && ok;
@@ -1837,6 +1819,14 @@ bool test_shared_weight_preparation() {
                    rmd::detail::merge_rmd_correction_with_weights(stripe_args[0], shared_output.data(),
                        *packets[0], corrections[0], shared) == RmdStatus::success,
                "only a selected mismatched block rejects, without poisoning disjoint stripes") && ok;
+    std::array<float, 3> public_output{7, 7, 7};
+    ok = check(merge_rmd_correction_to(stripe_args[0], public_output.data(),
+                   *packets[0], corrections[0]) == RmdStatus::success,
+               "public packet merge checks column scales only for selected blocks") && ok;
+    const auto public_before = public_output;
+    ok = check(merge_rmd_correction_to(stripe_args[0], public_output.data(),
+                   0, 1, corrections[0]) == RmdStatus::unsupported_route && public_output == public_before,
+               "public row-range merge checks all block scales without partial writes") && ok;
     blocks[0].channel_scale = 0.125f;
     rmd::detail::RmdWeightPreparation next_job;
     fresh_output.fill(7.0f);
@@ -1852,135 +1842,16 @@ bool test_shared_weight_preparation() {
                    stripe_args[0], *packets[0], correction, overflow_job, &metrics) == RmdStatus::overflow &&
                    direct_outputs_match(correction, sentinel) && metrics.packet_call_count == 73,
                "a fresh job retains HP1 exponent overflow and unchanged output metrics") && ok;
+    ok = check(execute_rmd_stripe_ws(stripe_args[0], *packets[0], correction) == RmdStatus::overflow &&
+                   direct_outputs_match(correction, sentinel),
+               "public execution revalidates changed weight metadata") && ok;
+    ok = check(merge_rmd_correction_to(stripe_args[0], public_output.data(),
+                   *packets[0], corrections[0]) == RmdStatus::unsupported_route &&
+                   public_output == public_before,
+               "public merge revalidates changed scales without partial writes") && ok;
     std::printf("SHARED_PREPARATION stripes=3 shared_validations=%zu fresh_validations=%zu columns=%zu selected_blocks=%zu\n",
                 shared_validations, fresh_validations, shared.column_preparations(),
                 shared.selected_block_preparations());
-    return ok;
-}
-
-bool test_prepared_execution_and_merge() {
-    namespace wreader = ggml::gemmini::quants::wreader;
-    namespace wroute = ggml::gemmini::quants::wroute;
-    namespace act = ggml::gemmini::quants::act;
-    WeightCapabilityFixture fixture(GGML_GEMMINI_WEIGHT_BITS, WeightFamily::HP1);
-    auto & args = fixture.args;
-#if GGML_GEMMINI_WEIGHT_BITS == 4
-    std::array<block_q4_hp1, 2> blocks{};
-#elif GGML_GEMMINI_WEIGHT_BITS == 16
-    std::array<block_q16_hp1, 2> blocks{};
-#else
-    std::array<block_q8_hp1, 2> blocks{};
-#endif
-
-    wroute::WeightRoutePlan prepared;
-    bool ok = true;
-    for (size_t job = 0; job < 2; ++job) {
-        const size_t rows = job + 1;
-        args.I = rows;
-        args.K = kBlockSize * rows;
-#if GGML_GEMMINI_WEIGHT_BITS == 4
-        args.q4_hp1_blocks = blocks.data();
-#elif GGML_GEMMINI_WEIGHT_BITS == 16
-        args.q16_hp1_blocks = blocks.data();
-#else
-        args.q8_hp1_blocks = blocks.data();
-#endif
-
-        args.q8_hp1_block_count = args.native_block_count = rows;
-        args.q8_hp1_blocks_per_row = args.native_blocks_per_row = rows;
-        args.native_weight_bytes = rows * sizeof(blocks[0]);
-        auto & meta = args.act_quant.storage().emplace<act::tensor::Meta>();
-        meta.scale = job == 0 ? 2.0f : 0.5f;
-        for (size_t block = 0; block < rows; ++block) {
-#if GGML_GEMMINI_WEIGHT_BITS == 4
-            std::fill(std::begin(blocks[block].qs), std::end(blocks[block].qs), uint8_t{0x88});
-            blocks[block].qs[0] = static_cast<uint8_t>(0x80 | (11 + 2 * job));
-#else
-            blocks[block].qs[0] = static_cast<int8_t>(3 + 2 * job);
-#endif
-
-            blocks[block].m = static_cast<int16_t>(2 + job + block);
-            blocks[block].channel_scale = job == 0 ? 0.25f : 0.125f;
-        }
-        RmdStripeBuilder builder;
-        builder.reset(job, 0, rows, args.K, args.J, GGML_GEMMINI_ACTIVATION_BITS);
-        if (!builder.add_residual(0, 0, 129) ||
-            (job != 0 && !builder.add_residual(1, kBlockSize, -257))) return false;
-        const auto packet = builder.finish();
-        if (!packet) return false;
-        Correction correction = PreScaledFloat64Correction{{17.0}};
-        wreader::test_reset_weight_reader_counters();
-        ok = check(rmd::detail::execute_rmd_stripe_ws_prepared(
-                       args, *packet, correction, prepared) == RmdStatus::success,
-                   "each job prepares its own compact weight plan") && ok;
-        const size_t execute_validations = wreader::test_weight_reader_storage_validations();
-        std::vector<float> output(rows, 7.0f);
-        args.f_out = output.data();
-        ok = check(prepared.scales.cols == rows &&
-                       rmd::detail::merge_rmd_correction_prepared(
-                           args, output.data(), *packet, correction, prepared) == RmdStatus::success,
-                   "prepared merge follows the current shape and scale") && ok;
-        const size_t merged_validations = wreader::test_weight_reader_storage_validations();
-        ok = check(execute_validations == 1 && merged_validations == 1,
-                   "prepared execute and merge validate weight storage only once") && ok;
-        ok = check(output[0] == (job == 0 ? 781.0f : 329.5f) &&
-                       (job == 0 || output[1] == -1278.0f),
-                   "prepared jobs match independent residual times code times scales") && ok;
-        std::printf("PREPARED_VALIDATIONS job=%zu execute=%zu execute_merge=%zu\n",
-                    job, execute_validations, merged_validations);
-
-        const Correction sentinel = correction;
-        StripePacket malformed = *packet;
-        ++malformed.version;
-        const auto plan_before = prepared;
-        ok = check(rmd::detail::execute_rmd_stripe_ws_prepared(
-                       args, malformed, correction, prepared) == RmdStatus::invalid_packet &&
-                       direct_outputs_match(correction, sentinel) &&
-                       prepared.scales.cols == plan_before.scales.cols && prepared.valid,
-                   "prepared entrypoint validates packets and commits nothing on failure") && ok;
-        const auto before = output;
-        blocks[0].m = 63;
-        ok = check(execute_rmd_stripe_ws(args, *packet, correction) == RmdStatus::overflow &&
-                       direct_outputs_match(correction, sentinel),
-                   "public execution revalidates changed weight metadata") && ok;
-        ok = check(merge_rmd_correction(args, *packet, correction) == RmdStatus::unsupported_route &&
-                       output == before,
-                   "public merge revalidates changed scales without partial writes") && ok;
-        blocks[0].m = static_cast<int16_t>(2 + job);
-        if (job != 0) {
-            blocks[1].channel_scale = 0.5f;
-            RmdStripeBuilder selected;
-            selected.reset(9, 0, rows, args.K, args.J, GGML_GEMMINI_ACTIVATION_BITS);
-            if (!selected.add_residual(0, 0, 1)) return false;
-            const auto selected_packet = selected.finish();
-            if (!selected_packet) return false;
-            ok = check(rmd::detail::execute_rmd_stripe_ws_prepared(
-                           args, *selected_packet, correction, prepared) == RmdStatus::success &&
-                           rmd::detail::merge_rmd_correction_prepared(
-                               args, output.data(), *selected_packet, correction, prepared) ==
-                           RmdStatus::success,
-                       "compact merge checks common columns only for selected blocks") && ok;
-            const auto selected_output = output;
-            ok = check(rmd::detail::merge_rmd_correction_prepared(
-                           args, output.data(), 0, rows, correction, prepared) == RmdStatus::unsupported_route &&
-                           output == selected_output,
-                       "row-range merge retains all-block scale equality and failure atomicity") && ok;
-        }
-    }
-    ggml_gemmini_args_t dense;
-    std::array<elem_t, kBlockSize> codes{};
-    dense.B = codes.data();
-    dense.J = 1;
-    dense.K = kBlockSize;
-    dense.sB = std::numeric_limits<size_t>::max();
-    dense.weight_i8_scale_active = true;
-    dense.weight_scale = 1.0f;
-    const uint16_t local_k = 0;
-    std::array<int32_t, kArrayDim * kArrayDim> tile{};
-    tile.fill(71);
-    ok = check(gather_wide_weight_tile_for_test(dense, 0, &local_k, 1, 0, 1,
-                   tile.data(), kArrayDim) == RmdStatus::execution_failed && tile[0] == 71,
-               "nonhierarchical gather still validates storage extent before reading") && ok;
     return ok;
 }
 
@@ -2174,6 +2045,21 @@ bool test_compact_failure_matrix() {
         ok = fails_atomically(malformed.args, packet, RmdStatus::invalid_packet,
                               "malformed compact packet is failure-atomic") && ok;
     }
+
+    ggml_gemmini_args_t dense;
+    std::array<elem_t, kBlockSize> codes{};
+    dense.B = codes.data();
+    dense.J = 1;
+    dense.K = kBlockSize;
+    dense.sB = std::numeric_limits<size_t>::max();
+    dense.weight_i8_scale_active = true;
+    dense.weight_scale = 1.0f;
+    const uint16_t local_k = 0;
+    std::array<int32_t, kArrayDim * kArrayDim> tile{};
+    tile.fill(71);
+    ok = check(gather_wide_weight_tile_for_test(dense, 0, &local_k, 1, 0, 1,
+                   tile.data(), kArrayDim) == RmdStatus::execution_failed && tile[0] == 71,
+               "nonhierarchical gather still validates storage extent before reading") && ok;
 
     if (ok) {
         std::puts(
@@ -2414,7 +2300,6 @@ int main(int argc, char ** argv) {
 
     bool ok = true;
     if (selection == TestSelection::all || selection == TestSelection::happy_table) {
-        ok = test_balanced_radix_decomposition() && ok;
         ok = test_width_native_radix_happy_boundaries() && ok;
         ok = test_width_native_compose_and_expand() && ok;
         ok = test_top_carry_lane_preserves_sparse_mask() && ok;
@@ -2447,7 +2332,6 @@ int main(int argc, char ** argv) {
                             kArrayDim - 1, kArrayDim, kArrayDim + 1}) {
             ok = test_full_int32_compact_direct_agreement(rows) && ok;
         }
-        ok = test_prepared_execution_and_merge() && ok;
         ok = test_shared_weight_preparation() && ok;
     }
     if (selection == TestSelection::all || selection == TestSelection::compact_failure) {

@@ -24,8 +24,6 @@ namespace ggml::gemmini::rmd {
 constexpr size_t kArrayDim = DIM;
 constexpr size_t kNativeWeightScaleGroup = 32;
 constexpr size_t kBlockSize = kNativeWeightScaleGroup;
-constexpr size_t kMaxLanes = 5; // legacy radix-256 API, including the top carry
-constexpr size_t kLegacyRadix256Lanes = kMaxLanes;
 constexpr size_t kMaxNativeRadixLanes = 9;
 
 // Full INT32 residuals need up to 9/5/3 balanced INT4/8/16 digits. The extra
@@ -237,18 +235,5 @@ RmdStatus decompose_balanced_radix(int32_t residual,
                                    NativeBalancedDigits & out);
 RmdStatus compose_balanced_radix(const NativeBalancedDigits & digits,
                                  int64_t & out);
-
-// Legacy radix-256 packet digits. `digits` is always kMaxLanes wide; unused
-// high lanes are zero.
-struct BalancedDigits {
-    std::array<int8_t, kMaxLanes> digits{};
-    uint8_t lane_mask = 0;
-};
-
-// Supports every INT32 residual, including values requiring the fifth digit.
-bool decompose_balanced_radix256(int32_t residual, BalancedDigits & out);
-
-// Reconstructs a residual from its digits; used by tests and the reference path.
-int64_t compose_balanced_radix256(const BalancedDigits & digits);
 
 }

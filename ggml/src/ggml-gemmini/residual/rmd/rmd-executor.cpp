@@ -200,29 +200,16 @@ public:
         } catch (const std::bad_alloc &) {
             return RmdStatus::allocation_failure;
         }
-        logical_count_ = count;
         return RmdStatus::success;
     }
 
-    const elem_t * data(size_t logical_offset = 0) const {
-        return reinterpret_cast<const elem_t *>(bytes(logical_offset));
-    }
-
-    const uint8_t * bytes(size_t logical_offset = 0) const {
-        if (logical_offset >= logical_count_) {
-            return nullptr;
-        }
+    const elem_t * data() const {
 #if GGML_GEMMINI_ACTIVATION_BITS == 4
-        if (logical_offset % 2 != 0) {
-            return nullptr;
-        }
-        return packed_int4_.data() + logical_offset / 2;
+        return reinterpret_cast<const elem_t *>(packed_int4_.data());
 #elif GGML_GEMMINI_ACTIVATION_BITS == 8
-        return reinterpret_cast<const uint8_t *>(
-            signed_int8_.data() + logical_offset);
+        return reinterpret_cast<const elem_t *>(signed_int8_.data());
 #else
-        return reinterpret_cast<const uint8_t *>(
-            signed_int16_.data() + logical_offset);
+        return reinterpret_cast<const elem_t *>(signed_int16_.data());
 #endif
     }
 
@@ -230,7 +217,6 @@ private:
     std::vector<uint8_t> packed_int4_;
     std::vector<int8_t> signed_int8_;
     std::vector<int16_t> signed_int16_;
-    size_t logical_count_ = 0;
 };
 
 
@@ -668,8 +654,7 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                                   RmdExecutionMetrics * metrics,
                                   im2p_sim_t * im2p_sim = nullptr,
                                   Im2pProviderTestFault im2p_fault =
-                                      Im2pProviderTestFault::none,
-                                  wroute::WeightRoutePlan * prepared_plan = nullptr) {
+                                      Im2pProviderTestFault::none) {
     const WeightGather weights(args, plan);
     if (!weights.valid()) {
         return RmdStatus::unsupported_route;
@@ -712,20 +697,10 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
     size_t max_stacked_rows = 0;
     for (const BlockDescriptor & block : packet.blocks) {
         for (const LaneGroupDescriptor & group : block.groups) {
-            if (group.lane_positions.empty() || packet.row_count >
-                    std::numeric_limits<size_t>::max() / group.lane_positions.size()) {
-                return RmdStatus::invalid_packet;
-            }
             const size_t stacked_rows = align_up(
                 group.lane_positions.size() * packet.row_count, kArrayDim);
-            if (stacked_rows == 0) {
-                return RmdStatus::invalid_packet;
-            }
             max_stacked_rows = std::max(max_stacked_rows, stacked_rows);
         }
-    }
-    if (max_stacked_rows > std::numeric_limits<size_t>::max() / kArrayDim) {
-        return RmdStatus::invalid_packet;
     }
 
     std::vector<OutputValue> stacked_values;
@@ -1083,7 +1058,6 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
         }
         *metrics = std::move(staged_metrics);
     }
-    if (prepared_plan != nullptr) *prepared_plan = plan;
     return RmdStatus::success;
 }
 
@@ -1093,7 +1067,6 @@ static RmdStatus execute_rmd_stripe_im2p_output(im2p_sim_t * sim,
                                   const StripePacket & packet,
                                   Output & output,
                                   RmdExecutionMetrics * metrics,
-                                  wroute::WeightRoutePlan * prepared_plan = nullptr,
                                   const wroute::WeightRoutePlan * shared_plan = nullptr) {
 #if !defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
     (void) sim;
@@ -1101,7 +1074,6 @@ static RmdStatus execute_rmd_stripe_im2p_output(im2p_sim_t * sim,
     (void) packet;
     (void) output;
     (void) metrics;
-    (void) prepared_plan;
     (void) shared_plan;
     return RmdStatus::unsupported_route;
 #else
@@ -1126,7 +1098,7 @@ static RmdStatus execute_rmd_stripe_im2p_output(im2p_sim_t * sim,
         return RmdStatus::unsupported_route;
     }
     return execute_rmd_stripe_impl<CompactExecutorBackend::im2p_sim>(
-        args, packet, plan, output, metrics, sim, Im2pProviderTestFault::none, prepared_plan);
+        args, packet, plan, output, metrics, sim);
 #endif
 }
 
@@ -1153,7 +1125,6 @@ static RmdStatus execute_rmd_stripe_ws_output(const ggml_gemmini_args_t & args,
                                 const StripePacket & packet,
                                 Output & output,
                                 RmdExecutionMetrics * metrics,
-                                wroute::WeightRoutePlan * prepared_plan = nullptr,
                                 const wroute::WeightRoutePlan * shared_plan = nullptr) {
     const wroute::WeightRoutePlan plan = shared_plan != nullptr ? *shared_plan :
         wroute::resolve_weight_route_plan(args, wroute::WeightScaleInfoMode::Residual);
@@ -1174,12 +1145,12 @@ static RmdStatus execute_rmd_stripe_ws_output(const ggml_gemmini_args_t & args,
             return RmdStatus::allocation_failure;
         }
         const RmdStatus status = execute_rmd_stripe_impl<CompactExecutorBackend::im2p_sim>(
-            args, packet, plan, output, metrics, sim, Im2pProviderTestFault::none, prepared_plan);
+            args, packet, plan, output, metrics, sim);
         im2p_sim_destroy(sim);
         return status;
 #else
         return execute_rmd_stripe_impl<CompactExecutorBackend::checked_software>(
-            args, packet, plan, output, metrics, nullptr, Im2pProviderTestFault::none, prepared_plan);
+            args, packet, plan, output, metrics);
 #endif
     }
 
@@ -1189,7 +1160,7 @@ static RmdStatus execute_rmd_stripe_ws_output(const ggml_gemmini_args_t & args,
     return RmdStatus::unsupported_route;
 #else
     return execute_rmd_stripe_impl<CompactExecutorBackend::gemmini_ws>(
-        args, packet, plan, output, metrics, nullptr, Im2pProviderTestFault::none, prepared_plan);
+        args, packet, plan, output, metrics);
 #endif
 }
 
@@ -1214,7 +1185,7 @@ RmdStatus execute_rmd_stripe_ws_with_weights(const ggml_gemmini_args_t & args,
     const StripePacket & packet, Correction & correction,
     RmdWeightPreparation & weights, RmdExecutionMetrics * metrics) {
     return execute_rmd_stripe_ws_output(
-        args, packet, correction, metrics, nullptr, &weights.route_plan(args));
+        args, packet, correction, metrics, &weights.route_plan(args));
 }
 
 RmdStatus execute_rmd_stripe_im2p_with_weights(im2p_sim_t * sim,
@@ -1222,20 +1193,7 @@ RmdStatus execute_rmd_stripe_im2p_with_weights(im2p_sim_t * sim,
     Correction & correction, RmdWeightPreparation & weights,
     RmdExecutionMetrics * metrics) {
     return execute_rmd_stripe_im2p_output(
-        sim, args, packet, correction, metrics, nullptr, &weights.route_plan(args));
-}
-
-RmdStatus execute_rmd_stripe_ws_prepared(const ggml_gemmini_args_t & args,
-    const StripePacket & packet, Correction & correction,
-    wroute::WeightRoutePlan & plan, RmdExecutionMetrics * metrics) {
-    return execute_rmd_stripe_ws_output(args, packet, correction, metrics, &plan);
-}
-
-RmdStatus execute_rmd_stripe_im2p_prepared(im2p_sim_t * sim,
-    const ggml_gemmini_args_t & args, const StripePacket & packet,
-    Correction & correction, wroute::WeightRoutePlan & plan,
-    RmdExecutionMetrics * metrics) {
-    return execute_rmd_stripe_im2p_output(sim, args, packet, correction, metrics, &plan);
+        sim, args, packet, correction, metrics, &weights.route_plan(args));
 }
 }
 

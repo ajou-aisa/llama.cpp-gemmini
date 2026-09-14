@@ -408,11 +408,11 @@ RmdStatus merge_rmd_correction_checked(const ggml_gemmini_args_t & args,
 
 }
 
-static RmdStatus merge_rmd_correction_to_impl(const ggml_gemmini_args_t & args,
+RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
                                   float * destination,
                                   size_t global_row_begin,
                                   size_t global_row_end,
-                                  const Correction & correction, const wroute::WeightRoutePlan * prepared,
+                                  const Correction & correction,
                                   size_t * nonzero_count) {
     MergeLayout layout;
     const RmdStatus dimensions = prepare_merge_layout(
@@ -422,8 +422,8 @@ static RmdStatus merge_rmd_correction_to_impl(const ggml_gemmini_args_t & args,
         return dimensions;
     }
 
-    const wroute::WeightRoutePlan plan = prepared != nullptr ? *prepared :
-        wroute::resolve_weight_route_plan(args, wroute::WeightScaleInfoMode::Residual);
+    const wroute::WeightRoutePlan plan = wroute::resolve_weight_route_plan(
+        args, wroute::WeightScaleInfoMode::Residual);
     if (!plan.valid) {
         return RmdStatus::unsupported_route;
     }
@@ -433,10 +433,10 @@ static RmdStatus merge_rmd_correction_to_impl(const ggml_gemmini_args_t & args,
     return merge_rmd_correction_checked(args, layout, plan, column_scale, correction, nonzero_count);
 }
 
-static RmdStatus merge_rmd_correction_to_impl(const ggml_gemmini_args_t & args,
+RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
                                   float * destination,
                                   const StripePacket & packet,
-                                  const Correction & correction, const wroute::WeightRoutePlan * prepared,
+                                  const Correction & correction,
                                   size_t * nonzero_count) {
     if (std::get_if<BlockScaledInt64Correction>(&correction) == nullptr) {
         return RmdStatus::unsupported_route;
@@ -458,8 +458,8 @@ static RmdStatus merge_rmd_correction_to_impl(const ggml_gemmini_args_t & args,
         return dimensions;
     }
 
-    const wroute::WeightRoutePlan plan = prepared != nullptr ? *prepared :
-        wroute::resolve_weight_route_plan(args, wroute::WeightScaleInfoMode::Residual);
+    const wroute::WeightRoutePlan plan = wroute::resolve_weight_route_plan(
+        args, wroute::WeightScaleInfoMode::Residual);
     if (!plan.valid || !wroute::route_supports_integer_block_scale(plan)) {
         return RmdStatus::unsupported_route;
     }
@@ -467,19 +467,6 @@ static RmdStatus merge_rmd_correction_to_impl(const ggml_gemmini_args_t & args,
     const RmdStatus scales = prepare_column_scales(args, plan, &packet, column_scale);
     if (scales != RmdStatus::success) return scales;
     return merge_rmd_correction_checked(args, layout, plan, column_scale, correction, nonzero_count);
-}
-
-RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
-    float * destination, size_t global_row_begin, size_t global_row_end,
-    const Correction & correction, size_t * nonzero_count) {
-    return merge_rmd_correction_to_impl(args, destination, global_row_begin, global_row_end,
-                                       correction, nullptr, nonzero_count);
-}
-
-RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
-    float * destination, const StripePacket & packet, const Correction & correction,
-    size_t * nonzero_count) {
-    return merge_rmd_correction_to_impl(args, destination, packet, correction, nullptr, nonzero_count);
 }
 
 namespace detail {
@@ -574,19 +561,6 @@ RmdStatus merge_rmd_correction_with_weights(const ggml_gemmini_args_t & args,
         args, layout, plan, weights.column_scale_, correction, nonzero_count);
 }
 
-RmdStatus merge_rmd_correction_prepared(const ggml_gemmini_args_t & args,
-    float * destination, const StripePacket & packet, const Correction & correction,
-    const wroute::WeightRoutePlan & plan, size_t * nonzero_count) {
-    return merge_rmd_correction_to_impl(args, destination, packet, correction, &plan, nonzero_count);
-}
-
-RmdStatus merge_rmd_correction_prepared(const ggml_gemmini_args_t & args,
-    float * destination, size_t global_row_begin, size_t global_row_end,
-    const Correction & correction, const wroute::WeightRoutePlan & plan,
-    size_t * nonzero_count) {
-    return merge_rmd_correction_to_impl(args, destination, global_row_begin, global_row_end,
-                                       correction, &plan, nonzero_count);
-}
 }
 
 

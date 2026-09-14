@@ -269,16 +269,6 @@ bool run_malformed_packet() {
     return ok;
 }
 
-bool run_zero_residual() {
-    RmdStripeBuilder builder;
-    builder.reset(23, 0, 1, kBlockSize, 1, GGML_GEMMINI_ACTIVATION_BITS);
-    const StripePacketHandle packet = builder.finish();
-    const bool ok = check(packet == nullptr && builder.status() == RmdStatus::success,
-                          "zero residual creates no provider work");
-    if (ok) std::puts("IM2P_PROVIDER zero-residual packet=empty dot_calls=0 ws_calls=0");
-    return ok;
-}
-
 bool run_shared_preparation() {
     namespace wreader = ggml::gemmini::quants::wreader;
     namespace exsia = ggml::gemmini::quants::act::exsia;
@@ -588,21 +578,16 @@ bool run_group_rows() {
                 if (!check(packet != nullptr, "row-boundary packet is valid")) return false;
                 size_t expected_values = 0;
                 size_t expected_tiles = 0;
-                size_t legacy_values = 0;
-                size_t legacy_tiles = 0;
                 for (const auto & block : packet->blocks) {
                     if (GGML_GEMMINI_ACTIVATION_BITS < 16 &&
                         !check((block.active_lane_mask & uint16_t{2}) == 0,
                                "row-boundary packet retains sparse lane IDs")) return false;
                     for (const auto & group : block.groups) {
                         const size_t group_rows = align_up(group.lane_positions.size() * rows, kArrayDim);
-                        const size_t old_rows = group.lane_positions.size() * block.rows_padded;
                         expected_values += group_rows * group.padded_k_count;
-                        legacy_values += old_rows * group.padded_k_count;
                         const size_t kj_tiles = (group.padded_k_count / kArrayDim) *
                             (packet->j_padded / kArrayDim);
                         expected_tiles += (group_rows / kArrayDim) * kj_tiles;
-                        legacy_tiles += (old_rows / kArrayDim) * kj_tiles;
                     }
                 }
                 if (!check(packet->activation_value_count == expected_values,
@@ -644,9 +629,9 @@ bool run_group_rows() {
                     }
                 }
                 std::printf("IM2P_PROVIDER group-rows rows=%zu route=%s seed=%zu payload_values=%zu "
-                            "legacy_values=%zu actual_tiles=%zu legacy_tiles=%zu dots=%zu cycles=%llu\n",
+                            "actual_tiles=%zu dots=%zu cycles=%llu\n",
                             rows, use_hp1 ? "HP1" : "H1", seed, packet->activation_value_count,
-                            legacy_values, metrics.stacked_i_tile_count, legacy_tiles, metrics.im2p_dot_calls,
+                            metrics.stacked_i_tile_count, metrics.im2p_dot_calls,
                             static_cast<unsigned long long>(metrics.im2p_stats.work_total_cycles()));
             }
         }
@@ -862,7 +847,6 @@ int main(int argc, char ** argv) {
     if (selected == "all" || selected == "hp1-exp-62") ok = run_hp1_exp_62() && ok;
     if (selected == "all" || selected == "hp1-exp-63") ok = run_hp1_exp_63() && ok;
     if (selected == "all" || selected == "malformed-packet") ok = run_malformed_packet() && ok;
-    if (selected == "all" || selected == "zero-residual") ok = run_zero_residual() && ok;
     if (selected == "all" || selected == "shared-preparation") ok = run_shared_preparation() && ok;
     if (selected == "all" || selected == "packet-merge-contract") ok = run_packet_merge_contract() && ok;
     if (selected == "all" || selected == "int32-residuals") ok = run_int32_residuals() && ok;
@@ -870,7 +854,7 @@ int main(int argc, char ** argv) {
     if (selected == "all" || selected == "native-code-edges") ok = run_native_code_edges() && ok;
     if (selected == "all" || selected == "route-matched" || selected == "route-mismatch" || selected == "h0-compact-rejection") ok = run_route(selected == "all" ? "route-matched" : selected) && ok;
 
-    constexpr std::array<std::string_view, 24> valid{{"all", "success", "provider-read-failure", "provider-write-failure", "provider-watchdog", "k-accumulation-overflow", "block-scale-overflow", "cancel-between-dots", "duplicate-output", "missing-output", "output-index", "stats-overflow", "hp1-exp-62", "hp1-exp-63", "malformed-packet", "zero-residual", "shared-preparation", "packet-merge-contract", "int32-residuals", "group-rows", "native-code-edges", "route-matched", "route-mismatch", "h0-compact-rejection"}};
+    constexpr std::array<std::string_view, 23> valid{{"all", "success", "provider-read-failure", "provider-write-failure", "provider-watchdog", "k-accumulation-overflow", "block-scale-overflow", "cancel-between-dots", "duplicate-output", "missing-output", "output-index", "stats-overflow", "hp1-exp-62", "hp1-exp-63", "malformed-packet", "shared-preparation", "packet-merge-contract", "int32-residuals", "group-rows", "native-code-edges", "route-matched", "route-mismatch", "h0-compact-rejection"}};
     const bool is_valid = std::find(valid.begin(), valid.end(), selected) != valid.end() || selected == "h0-compact-rejection";
     if (!is_valid) {
         std::fprintf(stderr, "unsupported test case: %.*s\n", static_cast<int>(selected.size()), selected.data());

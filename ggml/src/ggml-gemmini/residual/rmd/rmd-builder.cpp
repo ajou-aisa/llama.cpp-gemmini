@@ -271,32 +271,6 @@ const char * rmd_status_message(RmdStatus status) {
     return "rmd: unknown status";
 }
 
-bool decompose_balanced_radix256(int32_t residual, BalancedDigits & out) {
-    NativeBalancedDigits native{};
-    if (decompose_balanced_radix(residual, 8, native) != RmdStatus::success) {
-        return false;
-    }
-    BalancedDigits staged{};
-    for (size_t lane = 0; lane < kLegacyRadix256Lanes; ++lane) {
-        staged.digits[lane] = static_cast<int8_t>(native.digits[lane]);
-        if (native.digits[lane] != 0) {
-            staged.lane_mask |= static_cast<uint8_t>(1u << lane);
-        }
-    }
-    out = staged;
-    return true;
-}
-
-int64_t compose_balanced_radix256(const BalancedDigits & digits) {
-    int64_t place = 1;
-    int64_t value = 0;
-    for (size_t lane = 0; lane < kLegacyRadix256Lanes; ++lane) {
-        value += static_cast<int64_t>(digits.digits[lane]) * place;
-        place *= 256;
-    }
-    return value;
-}
-
 static RmdStatus read_group_digit(const StripePacket & packet,
                             const BlockDescriptor & block,
                             const LaneGroupDescriptor & group,
@@ -305,20 +279,12 @@ static RmdStatus read_group_digit(const StripePacket & packet,
                             size_t k,
                             int32_t & digit) {
     const BalancedRadixContract contract = balanced_radix_contract(packet.digit_bits);
-    if (packet.version != kPacketVersion || contract.radix == 0 ||
-        packet.lane_capacity != contract.lane_capacity ||
-        packet.digit_storage != digit_storage_for_bits(packet.digit_bits) ||
-        packet.int4_packing != int4_packing_for_bits(packet.digit_bits) ||
-        packet.block_size != kBlockSize || packet.array_dim != kArrayDim) {
-        return RmdStatus::invalid_packet;
-    }
     if (lane_position >= group.lane_positions.size() || row >= block.rows_padded ||
         k >= group.padded_k_count) {
         return RmdStatus::invalid_arguments;
     }
     if (block.active_lane_count == 0 || block.active_lane_count > contract.lane_capacity ||
         packet.row_count == 0 || block.rows_padded != align_up(packet.row_count, kArrayDim) ||
-        group.lane_positions.size() == 0 ||
         group.lane_positions.size() > contract.lane_capacity ||
         group.lane_positions[lane_position] >= block.active_lane_count ||
         block.lane_ids[group.lane_positions[lane_position]] >= contract.lane_capacity ||

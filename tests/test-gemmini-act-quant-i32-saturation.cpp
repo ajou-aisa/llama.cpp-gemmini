@@ -159,7 +159,6 @@ bool check_quantizer_zeroes_nonfinite(const char *name, Quantize quantize)
     for (float value : values) {
         std::vector<float> source(17, 1.0f);
         source[8] = value;
-        std::vector<elem_t> quantized(source.size(), 42);
         ggml_tensor tensor{};
         tensor.type = GGML_TYPE_F32;
         tensor.data = source.data();
@@ -188,7 +187,6 @@ static bool check_public_quantizer_zeroes_nonfinite()
     for (float value : values) {
         std::vector<float> source(17, 1.0f);
         source[8] = value;
-        std::vector<elem_t> quantized(source.size(), 42);
         ggml_tensor tensor{};
         tensor.type = GGML_TYPE_F32;
         tensor.data = source.data();

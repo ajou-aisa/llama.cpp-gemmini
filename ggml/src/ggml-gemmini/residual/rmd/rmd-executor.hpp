@@ -8,7 +8,6 @@
 #include <mutex>
 
 struct ggml_gemmini_args_t;
-namespace ggml::gemmini::quants::wroute { struct WeightRoutePlan; }
 
 namespace ggml::gemmini::rmd {
 namespace detail { struct RmdAssemblerAccess; }
@@ -164,11 +163,6 @@ RmdStatus execute_rmd_stripe_ws_with_weights(const ggml_gemmini_args_t & args,
     const StripePacket & packet, Correction & correction,
     RmdWeightPreparation & weights, RmdExecutionMetrics * metrics = nullptr);
 
-// The returned Residual plan is usable only while this invocation's args and
-// weight storage remain unchanged. Call/job owners retain it through merge.
-RmdStatus execute_rmd_stripe_ws_prepared(const ggml_gemmini_args_t & args,
-    const StripePacket & packet, Correction & correction,
-    quants::wroute::WeightRoutePlan & plan, RmdExecutionMetrics * metrics = nullptr);
 }
 
 // Executes every block of the compact packet, applies the block integer scale exactly

@@ -3,7 +3,6 @@
 #include "rmd-types.hpp"
 
 struct ggml_gemmini_args_t;
-namespace ggml::gemmini::quants::wroute { struct WeightRoutePlan; }
 
 namespace ggml::gemmini::rmd {
 namespace detail {
@@ -12,13 +11,6 @@ class RmdWeightPreparation;
 RmdStatus merge_rmd_correction_with_weights(const ggml_gemmini_args_t & args,
     float * destination, const StripePacket & packet, const Correction & correction,
     RmdWeightPreparation & weights, size_t * nonzero_count = nullptr);
-RmdStatus merge_rmd_correction_prepared(const ggml_gemmini_args_t & args,
-    float * destination, const StripePacket & packet, const Correction & correction,
-    const quants::wroute::WeightRoutePlan & plan, size_t * nonzero_count = nullptr);
-RmdStatus merge_rmd_correction_prepared(const ggml_gemmini_args_t & args,
-    float * destination, size_t global_row_begin, size_t global_row_end,
-    const Correction & correction, const quants::wroute::WeightRoutePlan & plan,
-    size_t * nonzero_count = nullptr);
 }
 
 

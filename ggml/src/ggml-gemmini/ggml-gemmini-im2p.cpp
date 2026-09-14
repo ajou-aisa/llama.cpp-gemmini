@@ -10,7 +10,6 @@
 #include "residual/direct/direct-executor.hpp"
 #include "residual/rmd/rmd-compose.hpp"
 #include "residual/rmd/rmd-im2p-executor.hpp"
-#include "quants/common/weight_route.hpp"
 #include <im2p_sim.h>
 #include <gemmini/log.hpp>
 

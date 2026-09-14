@@ -763,8 +763,9 @@ bool test_q8_srmd_software_ws_routing() {
                 int64_t raw_lane = 0;
                 for (const ResidualEvent & event : events) {
                     if (event.original_k / QK8_0 != block.block_id) continue;
-                    rmd::BalancedDigits digits{};
-                    if (!rmd::decompose_balanced_radix256(event.residual, digits)) return false;
+                    rmd::NativeBalancedDigits digits{};
+                    if (rmd::decompose_balanced_radix(event.residual, 8, digits) !=
+                        rmd::RmdStatus::success) return false;
                     const int8_t code = native_weights[block_index].qs[event.original_k % QK8_0];
                     raw_lane += static_cast<int64_t>(digits.digits[lane_id]) * code;
                 }
@@ -936,8 +937,9 @@ bool test_q8_hp1_srmd_software_ws_routing() {
             int64_t raw_lane = 0;
             for (const ResidualEvent & event : events) {
                 if (event.original_k / QK8_HP != block.block_id) continue;
-                rmd::BalancedDigits digits{};
-                if (!rmd::decompose_balanced_radix256(event.residual, digits)) return false;
+                rmd::NativeBalancedDigits digits{};
+                if (rmd::decompose_balanced_radix(event.residual, 8, digits) !=
+                    rmd::RmdStatus::success) return false;
                 raw_lane += static_cast<int64_t>(digits.digits[lane_id]) *
                     weights[block_index].qs[event.original_k % QK8_HP];
             }

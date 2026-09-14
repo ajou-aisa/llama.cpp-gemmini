@@ -7,7 +7,6 @@
 #include "quants/act/exsia/exsia.hpp"
 #include "residual/rmd/rmd-compose.hpp"
 #include "residual/rmd/rmd-executor.hpp"
-#include "quants/common/weight_route.hpp"
 
 #include <array>
 #include <charconv>
@@ -369,10 +368,6 @@ struct MatmulJobMetrics {
     uint64_t backend_end_ns = 0;
     uint64_t backend_start_tid = 0;
     uint64_t backend_end_tid = 0;
-    uint64_t compose_start_ns = 0;
-    uint64_t compose_end_ns = 0;
-    uint64_t compose_start_tid = 0;
-    uint64_t compose_end_tid = 0;
     uint64_t merge_start_ns = 0;
     uint64_t merge_end_ns = 0;
     uint64_t finalize_start_ns = 0;

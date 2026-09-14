@@ -1298,10 +1298,6 @@ PipelineStripeTelemetry pipeline_stripe_telemetry(
     record.residual_backend_end_ns = profile.backend_end_ns;
     record.residual_backend_start_tid = profile.backend_start_tid;
     record.residual_backend_end_tid = profile.backend_end_tid;
-    record.compose_start_ns = profile.compose_start_ns;
-    record.compose_end_ns = profile.compose_end_ns;
-    record.compose_start_tid = profile.compose_start_tid;
-    record.compose_end_tid = profile.compose_end_tid;
     record.finalize_start_ns = profile.finalize_start_ns;
     record.finalize_end_ns = profile.finalize_end_ns;
     record.finalize_start_tid = profile.finalize_start_tid;
