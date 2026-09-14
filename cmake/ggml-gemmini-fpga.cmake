@@ -50,7 +50,7 @@ if(NOT _fpga_probe_compiled)
 endif()
 
 # The cache key records source/ABI/artifact/compiler/target and linkage mode.
-# Source changes require a new binary directory, retaining the failed attempt.
+# Reconfiguration refreshes the identity and rebuilds affected targets in place.
 set(_fpga_identity "ABI5;IFR3;signed-scu-sat-v2;H1;domain2;IFR4;RTL_PLUGIN1;scu_final_integer;H1:op4,HP1:op5;domain2;explicit_main_external:domain1;A8/W8/D16;block32;RMD_${GGML_GEMMINI_ENABLE_RMD}\n")
 set(_fpga_inputs
         "${IM2P_SIM_ROOT}/sim/include/im2p_sim.h"
@@ -122,7 +122,7 @@ endforeach()
 string(SHA256 _fpga_fingerprint "${_fpga_identity}")
 if(DEFINED GGML_GEMMINI_FPGA_CONFIG_FINGERPRINT AND
    NOT GGML_GEMMINI_FPGA_CONFIG_FINGERPRINT STREQUAL _fpga_fingerprint)
-    message(FATAL_ERROR "FPGA_UART input/toolchain/linkage changed; use a fresh build directory")
+    message(STATUS "FPGA_UART input/toolchain/linkage changed; regenerating the existing build")
 endif()
 set(GGML_GEMMINI_FPGA_CONFIG_FINGERPRINT "${_fpga_fingerprint}" CACHE INTERNAL "SCU build identity")
 set(GGML_GEMMINI_FPGA_BUILD_ID "${_fpga_fingerprint}")

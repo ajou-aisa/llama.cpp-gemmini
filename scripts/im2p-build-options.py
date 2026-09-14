@@ -14,7 +14,6 @@ FPGA = {
     'GGML_GEMMINI_DIM': '16', 'GGML_GEMMINI_BLOCK_SIZE': '32',
     'GGML_GEMMINI_ENABLE_RMD': 'OFF', 'GGML_GEMMINI_DEQUANT_FP_TEST': 'OFF',
 }
-IDENTITY = tuple(FPGA) + ('GGML_GEMMINI_EXECUTION_BACKEND',)
 
 
 def configurable(name):
@@ -113,9 +112,8 @@ def resolve(build_dir, platform, defaults, args, environment):
     option = effective.get('GGML_GEMMINI_OPTION', 'CPU').upper()
     if option not in ('CPU', 'WS') or (option == 'CPU' and backend != 'HARDWARE'):
         raise ValueError(f'Illegal Gemmini option/backend combination: {option}+{backend}')
-    for name in IDENTITY:
-        if name in cache and name in effective and normalize(name, cache[name]) != effective[name]:
-            raise ValueError(f'Stale build cache: {name} changed from {cache[name]} to {effective[name]}; use a new BUILD_DIR')
+    # Valid option changes reconfigure the existing build tree. CMake replaces
+    # backend targets and compile/link commands with the resolved selection.
     if effective.get('CYCLE_DETAIL') == '1' and effective.get('LOG_CYCLE') != '1':
         raise ValueError('CYCLE_DETAIL=1 requires LOG_CYCLE=1')
     if effective.get('GGML_GEMMINI_EXSIA_PROFILE_SCOPE', 'OFF') != 'OFF' and effective.get('CYCLE_DETAIL') != '1':
