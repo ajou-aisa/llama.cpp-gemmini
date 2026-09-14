@@ -29,22 +29,22 @@ bool checked_add(size_t lhs, size_t rhs, size_t & out) {
 
 bool checked_activation_sizes(uint8_t digit_bits,
                               size_t lane_count,
-                              size_t rows_padded,
+                              size_t row_count,
                               size_t padded_k_count,
                               size_t & value_count,
                               size_t & byte_count) {
-    size_t row_values = 0;
-    if (!checked_mul(rows_padded, padded_k_count, row_values) ||
-        !checked_mul(row_values, lane_count, value_count)) {
+    size_t group_rows = 0;
+    if (!checked_mul(lane_count, row_count, group_rows) ||
+        (group_rows = align_up(group_rows, kArrayDim)) == 0 ||
+        !checked_mul(group_rows, padded_k_count, value_count)) {
         return false;
     }
     if (digit_bits == 4) {
         if (padded_k_count % 2 != 0) {
             return false;
         }
-        size_t row_bytes = padded_k_count / 2;
-        return checked_mul(rows_padded, row_bytes, row_bytes) &&
-            checked_mul(row_bytes, lane_count, byte_count);
+        byte_count = value_count / 2;
+        return true;
     }
     if (digit_bits == 8) {
         byte_count = value_count;
@@ -53,38 +53,82 @@ bool checked_activation_sizes(uint8_t digit_bits,
     return digit_bits == 16 && checked_mul(value_count, sizeof(int16_t), byte_count);
 }
 
+void choose_lane_partition(
+    const std::array<uint32_t, kMaxNativeRadixLanes> & lane_support,
+    uint8_t lane_count,
+    size_t row_count,
+    uint8_t lane_position,
+    uint8_t group_count,
+    std::array<uint8_t, kMaxNativeRadixLanes> & assignment,
+    std::array<uint8_t, kMaxNativeRadixLanes> & best_assignment,
+    size_t baseline_calls,
+    size_t & best_i_tiles) {
+    if (lane_position == lane_count) {
+        std::array<uint32_t, kMaxNativeRadixLanes> group_support{};
+        std::array<size_t, kMaxNativeRadixLanes> group_lanes{};
+        for (uint8_t lane = 0; lane < lane_count; ++lane) {
+            group_support[assignment[lane]] |= lane_support[lane];
+            ++group_lanes[assignment[lane]];
+        }
+        size_t calls = 0;
+        size_t i_tiles = 0;
+        for (uint8_t group = 0; group < group_count; ++group) {
+            const size_t k_tiles =
+                (static_cast<size_t>(__builtin_popcount(group_support[group])) +
+                 kArrayDim - 1) / kArrayDim;
+            calls += k_tiles;
+            i_tiles += k_tiles * (align_up(group_lanes[group] * row_count, kArrayDim) / kArrayDim);
+        }
+        // Reduce lane-row tile work without increasing K-tile calls per J tile.
+        if (calls <= baseline_calls && i_tiles < best_i_tiles) {
+            best_i_tiles = i_tiles;
+            best_assignment = assignment;
+        }
+        return;
+    }
+
+    // Every live group costs at least one K tile; extra groups cannot beat the baseline.
+    for (uint8_t group = 0; group <= group_count && group < baseline_calls; ++group) {
+        assignment[lane_position] = group;
+        choose_lane_partition(lane_support, lane_count, row_count,
+                              static_cast<uint8_t>(lane_position + 1),
+                              static_cast<uint8_t>(group_count + (group == group_count)),
+                              assignment, best_assignment, baseline_calls, best_i_tiles);
+    }
+}
+
 Int4Packing int4_packing_for_bits(uint8_t digit_bits) {
     return digit_bits == 4 ? Int4Packing::adjacent_low_nibble_first : Int4Packing::none;
 }
 
 RmdStatus write_packet_digit(StripePacket & packet,
-                             const BlockDescriptor & block,
+                             const LaneGroupDescriptor & group,
                              uint8_t lane_position,
                              size_t row,
                              size_t k,
                              int32_t digit) {
     const BalancedRadixContract contract = balanced_radix_contract(packet.digit_bits);
-    if (contract.radix == 0 || lane_position >= block.active_lane_count ||
-        row >= block.rows_padded || k >= block.padded_k_count ||
+    if (contract.radix == 0 || lane_position >= group.lane_positions.size() ||
+        row >= packet.row_count || k >= group.padded_k_count ||
         digit < contract.digit_min || digit > contract.digit_max) {
         return RmdStatus::invalid_arguments;
     }
 
     size_t lane_row = 0;
     size_t row_offset = 0;
-    if (!checked_mul(lane_position, block.rows_padded, lane_row) ||
+    if (!checked_mul(lane_position, packet.row_count, lane_row) ||
         !checked_add(lane_row, row, lane_row)) {
         return RmdStatus::overflow;
     }
 
     if (packet.digit_storage == DigitStorage::packed_signed_int4) {
-        const size_t row_bytes = block.padded_k_count / 2;
+        const size_t row_bytes = group.padded_k_count / 2;
         size_t packed_index = 0;
         uint8_t shift = 0;
         if (!quants::wreader::native_mvin_q4_position(
-                block.padded_k_count, k, packed_index, shift) ||
+                group.padded_k_count, k, packed_index, shift) ||
             !checked_mul(lane_row, row_bytes, row_offset) ||
-            !checked_add(block.activation_byte_offset, row_offset, row_offset) ||
+            !checked_add(group.activation_byte_offset, row_offset, row_offset) ||
             !checked_add(row_offset, packed_index, row_offset) ||
             row_offset >= packet.stacked_activation.packed_int4.size()) {
             return RmdStatus::invalid_packet;
@@ -97,8 +141,8 @@ RmdStatus write_packet_digit(StripePacket & packet,
         return RmdStatus::success;
     }
 
-    if (!checked_mul(lane_row, block.padded_k_count, row_offset) ||
-        !checked_add(block.activation_offset, row_offset, row_offset) ||
+    if (!checked_mul(lane_row, group.padded_k_count, row_offset) ||
+        !checked_add(group.activation_offset, row_offset, row_offset) ||
         !checked_add(row_offset, k, row_offset)) {
         return RmdStatus::overflow;
     }
@@ -123,9 +167,9 @@ RmdStatus write_packet_digit(StripePacket & packet,
 
 BalancedRadixContract balanced_radix_contract(uint8_t operand_bits) {
     switch (operand_bits) {
-        case 4:  return {16, 8, -8, 7};
-        case 8:  return {256, 4, -128, 127};
-        case 16: return {65536, 2, -32768, 32767};
+        case 4:  return {16, 9, -8, 7};
+        case 8:  return {256, 5, -128, 127};
+        case 16: return {65536, 3, -32768, 32767};
         default: return {};
     }
 }
@@ -137,28 +181,34 @@ RmdStatus decompose_balanced_radix(int32_t residual,
     if (contract.radix == 0) {
         return RmdStatus::invalid_arguments;
     }
-    if (residual < kSigned21Min || residual > kSigned21Max) {
-        return RmdStatus::residual_too_wide;
-    }
-
     NativeBalancedDigits staged{};
     staged.radix = contract.radix;
     staged.lane_capacity = contract.lane_capacity;
-    int64_t rest = residual;
-    for (uint8_t lane = 0; lane < contract.lane_capacity && rest != 0; ++lane) {
-        int32_t digit = static_cast<int32_t>(
-            static_cast<uint64_t>(rest) & (contract.radix - 1));
-        if (digit > contract.digit_max) {
-            digit -= static_cast<int32_t>(contract.radix);
-        }
+    // Repeat the half-radix bit in every w-bit lane: 0x8, 0x80, or 0x8000.
+    // Unsigned addition propagates balanced-radix carries; XOR removes the per-lane bias.
+    // Example (w=8): residual 255 becomes digits [-1, 1], since -1 + 256 = 255.
+    // Sign-extend before unsigned arithmetic so negative INT32 values stay negative.
+    // The 64-bit intermediate preserves a carry past bit 31 as one ordinary extra
+    // lane; e.g. INT32_MAX at w=8 becomes [-1, 0, 0, -128, 1].
+    const uint64_t high_bits = operand_bits == 4 ? 0x8888888888888888ull :
+                               operand_bits == 8 ? 0x8080808080808080ull :
+                                                   0x8000800080008000ull;
+    uint64_t packed = (static_cast<uint64_t>(static_cast<int64_t>(residual)) +
+                       high_bits) ^ high_bits;
+    const uint32_t digit_mask = contract.radix - 1;
+    const uint32_t sign_bit = contract.radix / 2;
+    // Do not stop on a zero digit: higher lanes may still be live.
+    for (uint8_t lane = 0; lane < contract.lane_capacity && packed != 0; ++lane) {
+        const uint32_t raw = static_cast<uint32_t>(packed & digit_mask);
+        // Sign-extend the w-bit digit without shifting a negative signed integer.
+        const int32_t digit = static_cast<int32_t>(raw ^ sign_bit) -
+                              static_cast<int32_t>(sign_bit);
         staged.digits[lane] = digit;
         if (digit != 0) {
+            // Highest used lane plus one, not the number of nonzero digits.
             staged.active_lane_count = static_cast<uint8_t>(lane + 1);
         }
-        rest = (rest - digit) / contract.radix;
-    }
-    if (rest != 0) {
-        return RmdStatus::residual_too_wide;
+        packed >>= operand_bits;
     }
     out = staged;
     return RmdStatus::success;
@@ -199,7 +249,8 @@ RmdStatus compose_balanced_radix(const NativeBalancedDigits & digits,
             return RmdStatus::invalid_arguments;
         }
     }
-    if (staged < kSigned21Min || staged > kSigned21Max) {
+    if (staged < std::numeric_limits<int32_t>::min() ||
+        staged > std::numeric_limits<int32_t>::max()) {
         return RmdStatus::residual_too_wide;
     }
     out = staged;
@@ -211,7 +262,7 @@ const char * rmd_status_message(RmdStatus status) {
         case RmdStatus::success:            return "success";
         case RmdStatus::invalid_arguments:  return "rmd: invalid arguments";
         case RmdStatus::invalid_packet:     return "rmd: invalid packet";
-        case RmdStatus::residual_too_wide:  return "rmd: residual exceeds the width-native lane capacity";
+        case RmdStatus::residual_too_wide:  return "rmd: reconstructed residual exceeds INT32 range";
         case RmdStatus::unsupported_route:  return "rmd: route is unsupported by the exact result contract";
         case RmdStatus::overflow:           return "rmd: integer overflow";
         case RmdStatus::allocation_failure: return "rmd: allocation failed";
@@ -221,24 +272,18 @@ const char * rmd_status_message(RmdStatus status) {
 }
 
 bool decompose_balanced_radix256(int32_t residual, BalancedDigits & out) {
-    out = BalancedDigits{};
-    int64_t rest = residual;
-    for (size_t lane = 0; lane < kLegacyRadix256Lanes; ++lane) {
-        // Balanced digit in [-128, 127] without any signed shift.
-        int32_t digit = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(rest)) & 0xFFu);
-        if (digit > 127) {
-            digit -= 256;
-        }
-        out.digits[lane] = static_cast<int8_t>(digit);
-        if (digit != 0) {
-            out.lane_mask |= static_cast<uint8_t>(1u << lane);
-        }
-        rest = (rest - digit) / 256;
-    }
-    if (rest != 0) {
-        out = BalancedDigits{};
+    NativeBalancedDigits native{};
+    if (decompose_balanced_radix(residual, 8, native) != RmdStatus::success) {
         return false;
     }
+    BalancedDigits staged{};
+    for (size_t lane = 0; lane < kLegacyRadix256Lanes; ++lane) {
+        staged.digits[lane] = static_cast<int8_t>(native.digits[lane]);
+        if (native.digits[lane] != 0) {
+            staged.lane_mask |= static_cast<uint8_t>(1u << lane);
+        }
+    }
+    out = staged;
     return true;
 }
 
@@ -252,8 +297,9 @@ int64_t compose_balanced_radix256(const BalancedDigits & digits) {
     return value;
 }
 
-RmdStatus read_packet_digit(const StripePacket & packet,
+static RmdStatus read_group_digit(const StripePacket & packet,
                             const BlockDescriptor & block,
+                            const LaneGroupDescriptor & group,
                             uint8_t lane_position,
                             size_t row,
                             size_t k,
@@ -266,15 +312,18 @@ RmdStatus read_packet_digit(const StripePacket & packet,
         packet.block_size != kBlockSize || packet.array_dim != kArrayDim) {
         return RmdStatus::invalid_packet;
     }
-    if (lane_position >= block.active_lane_count || row >= block.rows_padded ||
-        k >= block.padded_k_count) {
+    if (lane_position >= group.lane_positions.size() || row >= block.rows_padded ||
+        k >= group.padded_k_count) {
         return RmdStatus::invalid_arguments;
     }
-    if (block.active_lane_count == 0 ||
-        block.active_lane_count > contract.lane_capacity ||
-        block.lane_ids[lane_position] >= contract.lane_capacity ||
-        (block.active_lane_mask & static_cast<uint8_t>(
-             1u << block.lane_ids[lane_position])) == 0) {
+    if (block.active_lane_count == 0 || block.active_lane_count > contract.lane_capacity ||
+        packet.row_count == 0 || block.rows_padded != align_up(packet.row_count, kArrayDim) ||
+        group.lane_positions.size() == 0 ||
+        group.lane_positions.size() > contract.lane_capacity ||
+        group.lane_positions[lane_position] >= block.active_lane_count ||
+        block.lane_ids[group.lane_positions[lane_position]] >= contract.lane_capacity ||
+        (block.active_lane_mask & static_cast<uint16_t>(
+             1u << block.lane_ids[group.lane_positions[lane_position]])) == 0) {
         return RmdStatus::invalid_packet;
     }
 
@@ -284,48 +333,51 @@ RmdStatus read_packet_digit(const StripePacket & packet,
     size_t expected_byte_end = 0;
     size_t mapped_byte_offset = 0;
     size_t packet_byte_count = 0;
-    if (!checked_activation_sizes(packet.digit_bits, block.active_lane_count,
-                                  block.rows_padded, block.padded_k_count,
+    if (!checked_activation_sizes(packet.digit_bits, group.lane_positions.size(),
+                                  packet.row_count, group.padded_k_count,
                                   expected_values, expected_bytes) ||
-        block.activation_byte_count != expected_bytes ||
-        !checked_add(block.activation_offset, expected_values, expected_value_end) ||
-        !checked_add(block.activation_byte_offset, expected_bytes, expected_byte_end) ||
+        group.activation_byte_count != expected_bytes ||
+        !checked_add(group.activation_offset, expected_values, expected_value_end) ||
+        !checked_add(group.activation_byte_offset, expected_bytes, expected_byte_end) ||
         expected_value_end > packet.activation_value_count) {
         return RmdStatus::invalid_packet;
     }
     if (packet.digit_storage == DigitStorage::packed_signed_int4) {
-        if (block.activation_offset % 2 != 0 ||
+        if (group.activation_offset % 2 != 0 ||
             packet.activation_value_count % 2 != 0) {
             return RmdStatus::invalid_packet;
         }
-        mapped_byte_offset = block.activation_offset / 2;
+        mapped_byte_offset = group.activation_offset / 2;
         packet_byte_count = packet.activation_value_count / 2;
     } else if (packet.digit_storage == DigitStorage::signed_int8) {
-        mapped_byte_offset = block.activation_offset;
+        mapped_byte_offset = group.activation_offset;
         packet_byte_count = packet.activation_value_count;
-    } else if (!checked_mul(block.activation_offset, sizeof(int16_t),
+    } else if (!checked_mul(group.activation_offset, sizeof(int16_t),
                             mapped_byte_offset) ||
                !checked_mul(packet.activation_value_count, sizeof(int16_t),
                             packet_byte_count)) {
         return RmdStatus::invalid_packet;
     }
-    if (block.activation_byte_offset != mapped_byte_offset) {
+    if (group.activation_byte_offset != mapped_byte_offset) {
         return RmdStatus::invalid_packet;
     }
 
     size_t lane_row = 0;
     size_t row_offset = 0;
     int32_t staged = 0;
-    if (!checked_mul(lane_position, block.rows_padded, lane_row) ||
-        !checked_add(lane_row, row, lane_row)) {
+    // Logical per-lane padding has no stored row. Validate the lane's first row
+    // and its payload extent before returning the virtual zero below.
+    const bool padded_row = row >= packet.row_count;
+    if (!checked_mul(lane_position, packet.row_count, lane_row) ||
+        !checked_add(lane_row, padded_row ? 0 : row, lane_row)) {
         return RmdStatus::invalid_packet;
     }
 
     if (packet.digit_storage == DigitStorage::packed_signed_int4) {
-        const size_t row_bytes = block.padded_k_count / 2;
+        const size_t row_bytes = group.padded_k_count / 2;
         int8_t decoded = 0;
         if (!checked_mul(lane_row, row_bytes, row_offset) ||
-            !checked_add(block.activation_byte_offset, row_offset, row_offset) ||
+            !checked_add(group.activation_byte_offset, row_offset, row_offset) ||
             row_offset >= expected_byte_end ||
             expected_byte_end > packet.stacked_activation.packed_int4.size() ||
             packet.stacked_activation.packed_int4.size() != packet_byte_count ||
@@ -333,13 +385,13 @@ RmdStatus read_packet_digit(const StripePacket & packet,
             !packet.stacked_activation.signed_int16.empty() ||
             !quants::wreader::decode_native_mvin_q4(
                 packet.stacked_activation.packed_int4.data() + row_offset,
-                row_bytes, block.padded_k_count, k, decoded)) {
+                row_bytes, group.padded_k_count, k, decoded)) {
             return RmdStatus::invalid_packet;
         }
         staged = decoded;
     } else {
-        if (!checked_mul(lane_row, block.padded_k_count, row_offset) ||
-            !checked_add(block.activation_offset, row_offset, row_offset) ||
+        if (!checked_mul(lane_row, group.padded_k_count, row_offset) ||
+            !checked_add(group.activation_offset, row_offset, row_offset) ||
             !checked_add(row_offset, k, row_offset)) {
             return RmdStatus::invalid_packet;
         }
@@ -356,8 +408,8 @@ RmdStatus read_packet_digit(const StripePacket & packet,
             }
             staged = packet.stacked_activation.signed_int8[row_offset];
         } else if (packet.digit_storage == DigitStorage::signed_int16) {
-            if (block.activation_byte_offset % alignof(int16_t) != 0 ||
-                block.activation_byte_count % sizeof(int16_t) != 0 ||
+            if (group.activation_byte_offset % alignof(int16_t) != 0 ||
+                group.activation_byte_count % sizeof(int16_t) != 0 ||
                 expected_byte_end > packet_byte_count ||
                 expected_value_end > packet.stacked_activation.signed_int16.size() ||
                 packet.stacked_activation.signed_int16.size() !=
@@ -375,7 +427,56 @@ RmdStatus read_packet_digit(const StripePacket & packet,
     if (staged < contract.digit_min || staged > contract.digit_max) {
         return RmdStatus::invalid_packet;
     }
-    digit = staged;
+    digit = padded_row ? 0 : staged;
+    return RmdStatus::success;
+}
+
+RmdStatus read_packet_digit(const StripePacket & packet,
+                            const BlockDescriptor & block,
+                            uint8_t lane_position, size_t row, size_t k,
+                            int32_t & digit) {
+    const BalancedRadixContract contract = balanced_radix_contract(packet.digit_bits);
+    if (packet.version != kPacketVersion || contract.radix == 0 ||
+        packet.lane_capacity != contract.lane_capacity ||
+        packet.digit_storage != digit_storage_for_bits(packet.digit_bits) ||
+        packet.int4_packing != int4_packing_for_bits(packet.digit_bits) ||
+        packet.block_size != kBlockSize || packet.array_dim != kArrayDim) {
+        return RmdStatus::invalid_packet;
+    }
+    if (lane_position >= block.active_lane_count || row >= block.rows_padded ||
+        k >= block.padded_k_count) {
+        return RmdStatus::invalid_arguments;
+    }
+    const LaneGroupDescriptor * selected = nullptr;
+    size_t group_lane = 0;
+    for (const LaneGroupDescriptor & group : block.groups) {
+        for (size_t lane = 0; lane < group.lane_positions.size(); ++lane) {
+            if (group.lane_positions[lane] == lane_position) {
+                if (selected != nullptr) return RmdStatus::invalid_packet;
+                selected = &group;
+                group_lane = lane;
+            }
+        }
+    }
+    if (selected == nullptr) return RmdStatus::invalid_packet;
+    size_t group_k = 0;
+    bool absent = k >= block.compact_k_count;
+    if (!absent) {
+        const size_t index = static_cast<size_t>(block.k_index_offset) + k;
+        if (index >= packet.k_indices.size() || packet.k_indices[index] >= kBlockSize) {
+            return RmdStatus::invalid_packet;
+        }
+        // The public K index is block-compact; group masks use original local K.
+        const uint32_t bit = uint32_t{1} << packet.k_indices[index];
+        absent = (selected->k_mask & bit) == 0;
+        // Selected bits below this K give its rank in the group's packed row.
+        group_k = static_cast<size_t>(__builtin_popcount(selected->k_mask & (bit - 1)));
+    }
+    int32_t staged = 0;
+    const RmdStatus status = read_group_digit(packet, block, *selected,
+        static_cast<uint8_t>(group_lane), row, absent ? 0 : group_k, staged);
+    if (status != RmdStatus::success) return status;
+    digit = absent ? 0 : staged;
     return RmdStatus::success;
 }
 
@@ -438,12 +539,15 @@ bool RmdStripeBuilder::add_residual(size_t local_row, size_t original_k, int32_t
 
     try {
         BlockAccum & accum = blocks_[static_cast<uint32_t>(block_id)];
-        accum.k.insert(static_cast<uint16_t>(block_local_k));
+        // K bits retain original block-local coordinates; OR unions this stripe's rows.
+        accum.k_mask |= uint32_t{1} << block_local_k;
         for (uint8_t lane = 0; lane < digits.lane_capacity; ++lane) {
             if (digits.digits[lane] == 0) {
                 continue;
             }
-            accum.lane_mask |= static_cast<uint8_t>(1u << lane);
+            // Keep original lane IDs so pruning cannot change the radix exponent.
+            accum.lane_mask |= static_cast<uint16_t>(1u << lane);
+            accum.lane_k_masks[lane] |= uint32_t{1} << block_local_k;
             entries_.push_back({
                 static_cast<uint32_t>(block_id),
                 static_cast<uint32_t>(local_row),
@@ -514,9 +618,12 @@ StripePacketHandle RmdStripeBuilder::finish() {
         size_t activation_value_cursor = 0;
         size_t activation_byte_cursor = 0;
         size_t output_cursor = 0;
-        std::map<uint32_t, size_t> block_index_by_id;
-        // block id -> (block-local k -> compact index)
-        std::map<uint32_t, std::vector<uint16_t>> compact_index_by_block;
+        struct BlockPacking {
+            size_t block_index = 0;
+            std::array<uint8_t, kMaxNativeRadixLanes> group_ids{};
+            std::array<uint8_t, kMaxNativeRadixLanes> group_lanes{};
+        };
+        std::map<uint32_t, BlockPacking> packing_by_block;
 
         for (const auto & [block_id, accum] : blocks_) {
             BlockDescriptor descriptor{};
@@ -528,8 +635,9 @@ StripePacketHandle RmdStripeBuilder::finish() {
                 return nullptr;
             }
             descriptor.global_k_begin = static_cast<uint32_t>(global_k_begin);
-            descriptor.compact_k_count = static_cast<uint16_t>(accum.k.size());
-            const size_t padded_k = align_up(accum.k.size(), kArrayDim);
+            const size_t compact_k_count = static_cast<size_t>(__builtin_popcount(accum.k_mask));
+            descriptor.compact_k_count = static_cast<uint16_t>(compact_k_count);
+            const size_t padded_k = align_up(compact_k_count, kArrayDim);
             if (padded_k == 0) {
                 status_ = RmdStatus::overflow;
                 return nullptr;
@@ -540,24 +648,69 @@ StripePacketHandle RmdStripeBuilder::finish() {
             }
             descriptor.padded_k_count = static_cast<uint16_t>(padded_k);
             descriptor.active_lane_mask = accum.lane_mask;
+            descriptor.lane_k_masks = accum.lane_k_masks;
             descriptor.rows_padded = static_cast<uint16_t>(rows_padded);
             descriptor.lane_stride_values = static_cast<uint32_t>(lane_stride_values);
 
             uint8_t lane_count = 0;
             for (uint8_t lane = 0; lane < contract.lane_capacity; ++lane) {
-                if ((accum.lane_mask & static_cast<uint8_t>(1u << lane)) != 0) {
+                if ((accum.lane_mask & static_cast<uint16_t>(1u << lane)) != 0) {
                     descriptor.lane_ids[lane_count++] = lane;
                 }
             }
             descriptor.active_lane_count = lane_count;
 
+            // Fix the final groups before allocating payload; each entry is packed once.
+            std::array<uint32_t, kMaxNativeRadixLanes> lane_support{};
+            for (uint8_t lane = 0; lane < lane_count; ++lane) {
+                lane_support[lane] = descriptor.lane_k_masks[descriptor.lane_ids[lane]];
+            }
+            std::array<uint8_t, kMaxNativeRadixLanes> assignment{};
+            std::array<uint8_t, kMaxNativeRadixLanes> best_assignment{};
+            const size_t baseline_calls = padded_k / kArrayDim;
+            size_t best_i_tiles = baseline_calls * (align_up(lane_count * row_count_, kArrayDim) / kArrayDim);
+            if (baseline_calls > 1) {
+                choose_lane_partition(lane_support, lane_count, row_count_,
+                    1, 1, assignment, best_assignment, baseline_calls, best_i_tiles);
+            }
+            const size_t group_count = *std::max_element(best_assignment.begin(),
+                best_assignment.begin() + lane_count) + 1;
+            descriptor.groups.resize(group_count);
+            BlockPacking packing{};
+            packing.block_index = packet->blocks.size();
+            for (uint8_t lane = 0; lane < lane_count; ++lane) {
+                LaneGroupDescriptor & group = descriptor.groups[best_assignment[lane]];
+                packing.group_ids[descriptor.lane_ids[lane]] = best_assignment[lane];
+                packing.group_lanes[descriptor.lane_ids[lane]] =
+                    static_cast<uint8_t>(group.lane_positions.size());
+                group.lane_positions.push_back(lane);
+                group.k_mask |= lane_support[lane];
+            }
             size_t block_activation_values = 0;
             size_t block_activation_bytes = 0;
+            for (LaneGroupDescriptor & group : descriptor.groups) {
+                group.padded_k_count = static_cast<uint16_t>(align_up(
+                    static_cast<size_t>(__builtin_popcount(group.k_mask)), kArrayDim));
+                size_t values = 0, bytes = 0;
+                size_t value_offset = 0, byte_offset = 0;
+                if (!checked_activation_sizes(digit_bits_, group.lane_positions.size(),
+                        row_count_, group.padded_k_count, values, bytes) ||
+                    !checked_add(activation_value_cursor, block_activation_values, value_offset) ||
+                    !checked_add(activation_byte_cursor, block_activation_bytes, byte_offset) ||
+                    value_offset > std::numeric_limits<uint32_t>::max() ||
+                    byte_offset > std::numeric_limits<uint32_t>::max() ||
+                    bytes > std::numeric_limits<uint32_t>::max() ||
+                    !checked_add(block_activation_values, values, block_activation_values) ||
+                    !checked_add(block_activation_bytes, bytes, block_activation_bytes)) {
+                    status_ = RmdStatus::overflow;
+                    return nullptr;
+                }
+                group.activation_offset = static_cast<uint32_t>(value_offset);
+                group.activation_byte_offset = static_cast<uint32_t>(byte_offset);
+                group.activation_byte_count = static_cast<uint32_t>(bytes);
+            }
             size_t block_output = 0;
             if (lane_count == 0 ||
-                !checked_activation_sizes(digit_bits_, lane_count, rows_padded,
-                                          padded_k, block_activation_values,
-                                          block_activation_bytes) ||
                 !checked_mul(lane_stride_values, lane_count, block_output) ||
                 k_cursor > std::numeric_limits<uint32_t>::max() ||
                 activation_value_cursor > std::numeric_limits<uint32_t>::max() ||
@@ -574,15 +727,13 @@ StripePacketHandle RmdStripeBuilder::finish() {
             descriptor.output_value_offset = static_cast<uint32_t>(output_cursor);
 
             // Compact K index table for this block: ascending, deduplicated, block local.
-            std::vector<uint16_t> compact(kBlockSize, std::numeric_limits<uint16_t>::max());
-            uint16_t compact_index = 0;
-            for (const uint16_t local_k : accum.k) {
-                compact[local_k] = compact_index++;
+            // ctz finds the lowest set bit; x & (x - 1) removes it. Never call ctz(0).
+            for (uint32_t remaining = accum.k_mask; remaining != 0; remaining &= remaining - 1) {
+                const uint16_t local_k = static_cast<uint16_t>(__builtin_ctz(remaining));
                 packet->k_indices.push_back(local_k);
             }
-            compact_index_by_block.emplace(block_id, std::move(compact));
 
-            if (!checked_add(k_cursor, accum.k.size(), k_cursor) ||
+            if (!checked_add(k_cursor, compact_k_count, k_cursor) ||
                 !checked_add(activation_value_cursor, block_activation_values,
                              activation_value_cursor) ||
                 !checked_add(activation_byte_cursor, block_activation_bytes,
@@ -596,7 +747,7 @@ StripePacketHandle RmdStripeBuilder::finish() {
                 return nullptr;
             }
 
-            block_index_by_id.emplace(block_id, packet->blocks.size());
+            packing_by_block.emplace(block_id, packing);
             packet->blocks.push_back(descriptor);
         }
 
@@ -612,24 +763,15 @@ StripePacketHandle RmdStripeBuilder::finish() {
         }
 
         for (const DigitEntry & entry : entries_) {
-            const BlockDescriptor & descriptor =
-                packet->blocks[block_index_by_id[entry.block_id]];
-            const uint16_t compact_k =
-                compact_index_by_block[entry.block_id][entry.block_local_k];
-            uint8_t lane_position = kMaxNativeRadixLanes;
-            for (uint8_t position = 0; position < descriptor.active_lane_count; ++position) {
-                if (descriptor.lane_ids[position] == entry.lane) {
-                    lane_position = position;
-                    break;
-                }
-            }
-            if (lane_position == kMaxNativeRadixLanes ||
-                compact_k >= descriptor.compact_k_count) {
-                status_ = RmdStatus::invalid_packet;
-                return nullptr;
-            }
-            const RmdStatus write = write_packet_digit(
-                *packet, descriptor, lane_position, entry.local_row, compact_k, entry.digit);
+            const BlockPacking & packing = packing_by_block[entry.block_id];
+            const BlockDescriptor & descriptor = packet->blocks[packing.block_index];
+            const LaneGroupDescriptor & group = descriptor.groups[packing.group_ids[entry.lane]];
+            const uint32_t bit = uint32_t{1} << entry.block_local_k;
+            // bit - 1 selects lower K positions; their popcount is the packed index.
+            const size_t group_k = static_cast<size_t>(
+                __builtin_popcount(group.k_mask & (bit - 1)));
+            const RmdStatus write = write_packet_digit(*packet, group,
+                packing.group_lanes[entry.lane], entry.local_row, group_k, entry.digit);
             if (write != RmdStatus::success) {
                 status_ = write;
                 return nullptr;
@@ -844,17 +986,14 @@ RmdStatus validate_packet(const StripePacket & packet) {
             return RmdStatus::invalid_packet;
         }
 
-        uint8_t rebuilt_mask = 0;
+        uint16_t rebuilt_mask = 0;
         for (uint8_t position = 0; position < block.active_lane_count; ++position) {
             const uint8_t lane_id = block.lane_ids[position];
             if (lane_id >= contract.lane_capacity ||
                 (position != 0 && lane_id <= block.lane_ids[position - 1])) {
                 return RmdStatus::invalid_packet;
             }
-            const uint8_t bit = static_cast<uint8_t>(1u << lane_id);
-            if ((rebuilt_mask & bit) != 0) {
-                return RmdStatus::invalid_packet;
-            }
+            const uint16_t bit = static_cast<uint16_t>(1u << lane_id);
             rebuilt_mask |= bit;
         }
         if (rebuilt_mask != block.active_lane_mask) {
@@ -870,9 +1009,41 @@ RmdStatus validate_packet(const StripePacket & packet) {
         size_t block_activation_values = 0;
         size_t block_activation_bytes = 0;
         size_t block_output = 0;
-        if (!checked_activation_sizes(packet.digit_bits, block.active_lane_count,
-                                      block.rows_padded, block.padded_k_count,
-                                      block_activation_values, block_activation_bytes) ||
+        uint16_t grouped_lanes = 0;
+        if (block.groups.empty() || block.groups.size() > block.active_lane_count) {
+            return RmdStatus::invalid_packet;
+        }
+        for (const LaneGroupDescriptor & group : block.groups) {
+            if (group.lane_positions.empty() ||
+                group.lane_positions.size() > block.active_lane_count || group.k_mask == 0 ||
+                group.padded_k_count != align_up(
+                    static_cast<size_t>(__builtin_popcount(group.k_mask)), kArrayDim)) {
+                return RmdStatus::invalid_packet;
+            }
+            uint32_t support = 0;
+            for (size_t lane = 0; lane < group.lane_positions.size(); ++lane) {
+                const uint8_t position = group.lane_positions[lane];
+                if (position >= block.active_lane_count ||
+                    (lane != 0 && position <= group.lane_positions[lane - 1]) ||
+                    (grouped_lanes & (uint16_t{1} << position)) != 0) {
+                    return RmdStatus::invalid_packet;
+                }
+                grouped_lanes |= uint16_t{1} << position;
+                support |= block.lane_k_masks[block.lane_ids[position]];
+            }
+            size_t values = 0, bytes = 0;
+            if (support != group.k_mask ||
+                !checked_activation_sizes(packet.digit_bits, group.lane_positions.size(),
+                    packet.row_count, group.padded_k_count, values, bytes) ||
+                group.activation_offset != expected_activation_values + block_activation_values ||
+                group.activation_byte_offset != expected_activation_bytes + block_activation_bytes ||
+                group.activation_byte_count != bytes ||
+                !checked_add(block_activation_values, values, block_activation_values) ||
+                !checked_add(block_activation_bytes, bytes, block_activation_bytes)) {
+                return RmdStatus::invalid_packet;
+            }
+        }
+        if (grouped_lanes != (uint16_t{1} << block.active_lane_count) - 1 ||
             !checked_mul(block.active_lane_count, block.lane_stride_values,
                          block_output) ||
             block.activation_byte_count != block_activation_bytes ||
@@ -947,41 +1118,97 @@ RmdStatus validate_packet(const StripePacket & packet) {
     // Every stored lane is active, while padded rows and K slots decode to zero.
     size_t rebuilt_residual_event_count = 0;
     for (const BlockDescriptor & block : packet.blocks) {
-        for (uint8_t position = 0; position < block.active_lane_count; ++position) {
-            bool lane_has_value = false;
-            for (size_t row = 0; row < block.rows_padded; ++row) {
-                for (size_t k = 0; k < block.padded_k_count; ++k) {
-                    int32_t digit = 0;
-                    if (read_packet_digit(packet, block, position, row, k, digit) !=
-                        RmdStatus::success) {
-                        return RmdStatus::invalid_packet;
-                    }
-                    const bool logical =
-                        row < packet.row_count && k < block.compact_k_count;
-                    if (!logical && digit != 0) {
-                        return RmdStatus::invalid_packet;
-                    }
-                    lane_has_value = lane_has_value || (logical && digit != 0);
-                }
-            }
-            if (!lane_has_value) {
-                return RmdStatus::invalid_packet;
+        std::array<uint32_t, kMaxNativeRadixLanes> rebuilt_lane_k_masks{};
+        std::array<std::array<uint32_t, kBlockSize>, kMaxNativeRadixLanes> group_k_bits{};
+        for (size_t group_index = 0; group_index < block.groups.size(); ++group_index) {
+            size_t k_count = 0;
+            for (uint32_t remaining = block.groups[group_index].k_mask;
+                 remaining != 0; remaining &= remaining - 1) {
+                // Unsigned negation isolates the lowest original-K bit, including K=31.
+                group_k_bits[group_index][k_count++] = remaining & (0u - remaining);
             }
         }
         for (size_t row = 0; row < packet.row_count; ++row) {
-            for (size_t k = 0; k < block.compact_k_count; ++k) {
-                bool residual_nonzero = false;
-                for (uint8_t position = 0;
-                     position < block.active_lane_count; ++position) {
-                    int32_t digit = 0;
-                    if (read_packet_digit(packet, block, position, row, k,
-                                          digit) != RmdStatus::success) {
-                        return RmdStatus::invalid_packet;
+            uint32_t row_k_mask = 0;
+            for (size_t group_index = 0; group_index < block.groups.size(); ++group_index) {
+                const LaneGroupDescriptor & group = block.groups[group_index];
+                const size_t k_count = static_cast<size_t>(__builtin_popcount(group.k_mask));
+                for (size_t lane = 0; lane < group.lane_positions.size(); ++lane) {
+                    const uint8_t lane_id = block.lane_ids[group.lane_positions[lane]];
+                    const size_t lane_row = lane * packet.row_count + row;
+                    const auto record_digit = [&](size_t k, bool nonzero) {
+                        if (!nonzero) return true;
+                        if (k >= k_count) return false;
+                        const uint32_t bit = group_k_bits[group_index][k];
+                        rebuilt_lane_k_masks[lane_id] |= bit;
+                        row_k_mask |= bit;
+                        return true;
+                    };
+                    // Extents are validated above; every native bit pattern is a valid digit.
+                    if (packet.digit_storage == DigitStorage::packed_signed_int4) {
+                        const uint8_t * values = packet.stacked_activation.packed_int4.data() +
+                            group.activation_byte_offset + lane_row * (group.padded_k_count / 2);
+                        for (size_t k = 0; k < group.padded_k_count; ++k) {
+                            if (!record_digit(k, ((values[k / 2] >> (4 * (k % 2))) & 0x0f) != 0)) {
+                                return RmdStatus::invalid_packet;
+                            }
+                        }
+                    } else if (packet.digit_storage == DigitStorage::signed_int8) {
+                        const int8_t * values = packet.stacked_activation.signed_int8.data() +
+                            group.activation_offset + lane_row * group.padded_k_count;
+                        for (size_t k = 0; k < group.padded_k_count; ++k) {
+                            if (!record_digit(k, values[k] != 0)) return RmdStatus::invalid_packet;
+                        }
+                    } else {
+                        const int16_t * values = packet.stacked_activation.signed_int16.data() +
+                            group.activation_offset + lane_row * group.padded_k_count;
+                        for (size_t k = 0; k < group.padded_k_count; ++k) {
+                            if (!record_digit(k, values[k] != 0)) return RmdStatus::invalid_packet;
+                        }
                     }
-                    residual_nonzero = residual_nonzero || digit != 0;
                 }
-                rebuilt_residual_event_count += residual_nonzero;
             }
+            rebuilt_residual_event_count += static_cast<size_t>(__builtin_popcount(row_k_mask));
+        }
+        // Real lane rows are adjacent; only the tail of the complete group is padding.
+        for (const LaneGroupDescriptor & group : block.groups) {
+            const size_t real_values = group.lane_positions.size() * packet.row_count *
+                group.padded_k_count;
+            const auto nonzero = [](auto value) { return value != 0; };
+            if (packet.digit_storage == DigitStorage::packed_signed_int4) {
+                const auto begin = packet.stacked_activation.packed_int4.begin() +
+                    group.activation_byte_offset;
+                if (std::any_of(begin + real_values / 2,
+                                begin + group.activation_byte_count, nonzero)) {
+                    return RmdStatus::invalid_packet;
+                }
+            } else if (packet.digit_storage == DigitStorage::signed_int8) {
+                const auto begin = packet.stacked_activation.signed_int8.begin() +
+                    group.activation_offset;
+                if (std::any_of(begin + real_values,
+                                begin + group.activation_byte_count, nonzero)) {
+                    return RmdStatus::invalid_packet;
+                }
+            } else {
+                const auto begin = packet.stacked_activation.signed_int16.begin() +
+                    group.activation_offset;
+                if (std::any_of(begin + real_values,
+                                begin + group.activation_byte_count / sizeof(int16_t), nonzero)) {
+                    return RmdStatus::invalid_packet;
+                }
+            }
+        }
+        for (uint8_t position = 0; position < block.active_lane_count; ++position) {
+            if (rebuilt_lane_k_masks[block.lane_ids[position]] == 0) return RmdStatus::invalid_packet;
+        }
+        uint32_t selected_k_mask = 0, rebuilt_k_mask = 0;
+        for (size_t k = 0; k < block.compact_k_count; ++k) {
+            selected_k_mask |= uint32_t{1} << packet.k_indices[block.k_index_offset + k];
+        }
+        for (uint32_t support : rebuilt_lane_k_masks) rebuilt_k_mask |= support;
+        if (selected_k_mask != rebuilt_k_mask) return RmdStatus::invalid_packet;
+        if (rebuilt_lane_k_masks != block.lane_k_masks) {
+            return RmdStatus::invalid_packet;
         }
     }
     if (packet.residual_event_count == 0 ||

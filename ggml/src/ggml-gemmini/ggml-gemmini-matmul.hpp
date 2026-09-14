@@ -7,6 +7,7 @@
 #include "quants/act/exsia/exsia.hpp"
 #include "residual/rmd/rmd-compose.hpp"
 #include "residual/rmd/rmd-executor.hpp"
+#include "quants/common/weight_route.hpp"
 
 #include <array>
 #include <charconv>
@@ -350,8 +351,6 @@ struct MatmulJobMetrics {
     MatmulStageMetrics rmd_pack;
     MatmulStageMetrics rmd_queue;
     MatmulStageMetrics rmd_execute;
-    MatmulStageMetrics rmd_output_read;
-    MatmulStageMetrics rmd_compose;
     MatmulStageMetrics rmd_finalize;
     uint64_t producer_wait_start_ns = 0;
     uint64_t producer_wait_end_ns = 0;
@@ -390,8 +389,6 @@ struct MatmulJobMetrics {
     uint64_t telemetry_merge_end = 0;
     uint64_t telemetry_residual_end = 0;
 #if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
-    cycle::NativeCycleSample telemetry_compose_start_sample;
-    cycle::NativeCycleSample telemetry_compose_end_sample;
     cycle::NativeCycleSample telemetry_finalize_start_sample;
     cycle::NativeCycleSample telemetry_finalize_end_sample;
 #endif
@@ -843,6 +840,7 @@ private:
     MatmulStatus status_;
     MatmulExecutionState state_ = MatmulExecutionState::empty;
     std::shared_ptr<std::mutex> state_mutex_ = std::make_shared<std::mutex>();
+    std::unique_ptr<rmd::detail::RmdWeightPreparation> rmd_weights_;
     size_t active_jobs_ = 0;
     size_t captured_rows_ = 0;
     size_t finalized_rows_ = 0;
@@ -929,8 +927,8 @@ private:
     std::condition_variable lifecycle_condition_;
     residual::DirectStripePayloadHandle direct_residual_;
     rmd::StripePacketHandle rmd_packet_;
-    rmd::CompressedOutput rmd_output_;
     rmd::Correction rmd_correction_ = rmd::BlockScaledInt64Correction{};
+    bool rmd_correction_ready_ = false;
     MatmulDenseState dense_state_ = MatmulDenseState::idle;
     MatmulResidualState residual_state_ = MatmulResidualState::idle;
     bool captured_ = true;

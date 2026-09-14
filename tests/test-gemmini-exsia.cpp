@@ -634,12 +634,31 @@ bool test_rmd_cpu_ws_routes() {
                 static_cast<long long>(cancel_direct.front()), static_cast<long long>(cancel_composed_values->front()));
 #endif
 #endif
-    return check(packet->blocks.size() == packet_before.blocks.size() &&
-              std::memcmp(packet->blocks.data(), packet_before.blocks.data(),
-                          packet->blocks.size() * sizeof(rmd::BlockDescriptor)) == 0 &&
+    const auto same_block = [](const rmd::BlockDescriptor & a, const rmd::BlockDescriptor & b) {
+        const bool metadata_equal = a.block_id == b.block_id &&
+            a.global_k_begin == b.global_k_begin && a.compact_k_count == b.compact_k_count &&
+            a.padded_k_count == b.padded_k_count && a.active_lane_mask == b.active_lane_mask &&
+            a.active_lane_count == b.active_lane_count && a.lane_ids == b.lane_ids &&
+            a.lane_k_masks == b.lane_k_masks && a.k_index_offset == b.k_index_offset &&
+            a.activation_offset == b.activation_offset &&
+            a.activation_byte_offset == b.activation_byte_offset &&
+            a.activation_byte_count == b.activation_byte_count &&
+            a.output_value_offset == b.output_value_offset && a.rows_padded == b.rows_padded &&
+            a.lane_stride_values == b.lane_stride_values;
+        return metadata_equal && std::equal(a.groups.begin(), a.groups.end(),
+            b.groups.begin(), b.groups.end(), [](const auto & left, const auto & right) {
+                return left.lane_positions == right.lane_positions &&
+                    left.k_mask == right.k_mask && left.padded_k_count == right.padded_k_count &&
+                    left.activation_offset == right.activation_offset &&
+                    left.activation_byte_offset == right.activation_byte_offset &&
+                    left.activation_byte_count == right.activation_byte_count;
+            });
+    };
+    return check(std::equal(packet->blocks.begin(), packet->blocks.end(),
+                          packet_before.blocks.begin(), packet_before.blocks.end(), same_block) &&
               packet->k_indices == packet_before.k_indices &&
               packet->stacked_activation == packet_before.stacked_activation,
-              "compact execution preserves packet bytes");
+              "compact execution preserves packet metadata and payload");
 }
 
 bool test_q8_srmd_software_ws_routing() {
@@ -1157,10 +1176,10 @@ bool test_rmd_cpu_direct_parity() {
     residuals[0 * logical_k + 32] = 65536;
     residuals[0 * logical_k + 64] = 256;
     residuals[1 * logical_k + 15] = -256;
-    residuals[1 * logical_k + 47] = rmd::kSigned21Max;
+    residuals[1 * logical_k + 47] = std::numeric_limits<int32_t>::max();
     residuals[1 * logical_k + 63] = 129;
     residuals[16 * logical_k + 1] = -65536;
-    residuals[16 * logical_k + 33] = rmd::kSigned21Min;
+    residuals[16 * logical_k + 33] = std::numeric_limits<int32_t>::min();
 
     std::vector<elem_t> baseline_activation(rows * logical_k);
     for (size_t row = 0; row < rows; ++row) {
@@ -1314,13 +1333,16 @@ bool test_rmd_cpu_direct_parity() {
                "RMD direct-parity merge")) {
         return false;
     }
+    if (!check(std::any_of(expected.begin(), expected.end(), [](int64_t value) {
+                   return value < std::numeric_limits<int32_t>::min() ||
+                       value > std::numeric_limits<int32_t>::max();
+               }), "H1 merge fixture exercises correction values outside INT32")) {
+        return false;
+    }
+    // H1 keeps the INT64 correction until scaling; this fixture has unit column/activation scales.
     for (size_t index = 0; index < expected.size(); ++index) {
-        const int64_t saturated = std::clamp(
-            expected[index],
-            static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
-            static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
-        if (!check(merged[index] == static_cast<float>(saturated),
-                   "merged RMD correction saturates after complete composition")) {
+        if (!check(merged[index] == static_cast<float>(expected[index]),
+                   "merged H1 correction preserves INT64 values until FP32 conversion")) {
             return false;
         }
     }
@@ -1350,12 +1372,8 @@ bool test_rmd_cpu_direct_parity() {
         for (size_t row = 0; row < rows; ++row) {
             for (size_t j = 0; j < columns; ++j) {
                 const size_t index = row * columns + j;
-                const int64_t saturated = std::clamp(
-                    expected[index],
-                    static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
-                    static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
                 const float wanted = static_cast<float>(baseline[index]) +
-                    static_cast<float>(saturated);
+                    static_cast<float>(expected[index]);
                 if (ws_merged[index] != wanted) {
                     ++mismatch_count;
                     if (first_row == rows) {
@@ -2134,14 +2152,15 @@ bool test_rmd_lane_partition() {
         check(metrics.matmul_call_count == expected_k_tiles,
                "RMD lane partition preserves DIM-aware B-load count") &&
         check(metrics.active_lanes == 3 &&
-                  metrics.lane_group_count == expected_k_tiles,
-               "RMD lane partition uses the minimal DIM-aware lane groups") &&
+                  metrics.lane_group_count == 1,
+               "RMD lane partition keeps one group when packed tile costs tie") &&
         check(metrics.baseline_stacked_i_tile_count == 3 * expected_k_tiles &&
-                   metrics.stacked_i_tile_count == 3,
-               "RMD lane partition preserves optimal stacked I-by-K tiles");
+                   metrics.stacked_i_tile_count == expected_k_tiles,
+               "RMD lane partition packs each group's real rows into one I tile");
 }
 
 bool test_rmd_weight_gather() {
+    namespace wreader = ggml::gemmini::quants::wreader;
     constexpr size_t logical_k = 65;
     constexpr size_t columns = 3;
     constexpr size_t blocks_per_row = 3;
@@ -2247,6 +2266,7 @@ bool test_rmd_weight_gather() {
     args.weight_scale = 1.0f;
     tile.fill(0x55);
     metrics = {};
+    wreader::test_reset_weight_reader_counters();
     if (!check(rmd::gather_weight_tile_for_test(
                    args, 1, dense_local_k.data(), dense_local_k.size(), 1, 3,
                    tile.data(), rmd::kArrayDim, &metrics) == rmd::RmdStatus::success,
@@ -2263,8 +2283,10 @@ bool test_rmd_weight_gather() {
             }
         }
     }
-    if (!check(metrics.weight_address_resolutions == 3,
-               "dense JxK resolves once per valid column")) {
+    if (!check(metrics.weight_address_resolutions == dense_local_k.size() * 3 &&
+                   wreader::test_weight_reader_code_address_resolutions() ==
+                       metrics.weight_address_resolutions,
+               "dense JxK reports its checked scalar address resolutions")) {
         return false;
     }
 
@@ -2286,6 +2308,7 @@ bool test_rmd_weight_gather() {
     args.transpose_B = false;
     tile.fill(0x55);
     metrics = {};
+    wreader::test_reset_weight_reader_counters();
     if (!check(rmd::gather_weight_tile_for_test(
                    args, 1, dense_local_k.data(), dense_local_k.size(), 1, 3,
                    tile.data(), rmd::kArrayDim, &metrics) == rmd::RmdStatus::success,
@@ -2304,8 +2327,10 @@ bool test_rmd_weight_gather() {
     }
     return check(metrics.weight_values_gathered == dense_local_k.size() * 3 &&
                  metrics.weight_baseline_address_resolutions == dense_local_k.size() * 3 &&
-                 metrics.weight_address_resolutions == dense_local_k.size(),
-                 "dense KxJ resolves once per valid K row");
+                 metrics.weight_address_resolutions == dense_local_k.size() * 3 &&
+                 wreader::test_weight_reader_code_address_resolutions() ==
+                     metrics.weight_address_resolutions,
+                 "dense KxJ reports its checked scalar address resolutions");
 }
 
 struct GatherBenchResult {

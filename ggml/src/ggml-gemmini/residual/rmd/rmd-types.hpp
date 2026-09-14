@@ -24,22 +24,21 @@ namespace ggml::gemmini::rmd {
 constexpr size_t kArrayDim = DIM;
 constexpr size_t kNativeWeightScaleGroup = 32;
 constexpr size_t kBlockSize = kNativeWeightScaleGroup;
-constexpr size_t kMaxLanes = 4; // legacy radix-256 API and Q8 execution contract
+constexpr size_t kMaxLanes = 5; // legacy radix-256 API, including the top carry
 constexpr size_t kLegacyRadix256Lanes = kMaxLanes;
-constexpr size_t kMaxNativeRadixLanes = 8;
+constexpr size_t kMaxNativeRadixLanes = 9;
 
-// Residual capture intentionally supports the signed 21-bit outlier envelope.
-// Lane capacities describe the fixed transport budget, not permission to admit
-// wider synthetic values.
-constexpr int32_t kSigned21Min = -(int32_t{1} << 20);
-constexpr int32_t kSigned21Max = (int32_t{1} << 20) - 1;
+// Full INT32 residuals need up to 9/5/3 balanced INT4/8/16 digits. The extra
+// lane holds the carry at bit 32 and follows the same packing/execution path.
+static_assert(kMaxNativeRadixLanes <= std::numeric_limits<uint16_t>::digits,
+              "active lane mask must hold every native radix lane");
 
 static_assert(kArrayDim > 0, "Gemmini DIM must be positive");
 static_assert(kBlockSize > 0, "native weight scale group must be positive");
 static_assert(kBlockSize % kArrayDim == 0 || kArrayDim % kBlockSize == 0,
               "Gemmini DIM and native weight scale group must divide one another");
 
-constexpr uint32_t kPacketVersion = 2;
+constexpr uint32_t kPacketVersion = 5;
 
 // The compact RMD packet stores adjacent logical Q4 digits low nibble first as
 // signed two's-complement INT4. IM2P model weights remain GGUF split-half,
@@ -100,6 +99,16 @@ inline size_t align_up(size_t value, size_t alignment) {
     return value > std::numeric_limits<size_t>::max() - padding ? 0 : value + padding;
 }
 
+struct LaneGroupDescriptor {
+    // Input lanes use row_count rows each, followed by one group tail padded to DIM.
+    std::vector<uint8_t> lane_positions;
+    uint32_t k_mask = 0; // original block-local K, shared by the group's lanes
+    uint16_t padded_k_count = 0;
+    uint32_t activation_offset = 0;
+    uint32_t activation_byte_offset = 0;
+    uint32_t activation_byte_count = 0;
+};
+
 // One original weight block that carries at least one residual digit in this stripe.
 struct BlockDescriptor {
     uint32_t block_id = 0;        // original weight block index (K / kBlockSize)
@@ -108,9 +117,11 @@ struct BlockDescriptor {
     uint16_t compact_k_count = 0; // selected K within this block
     uint16_t padded_k_count = 0;  // compact_k_count aligned to kArrayDim
 
-    uint8_t active_lane_mask = 0; // bit l set when lane l carries a nonzero digit
+    uint16_t active_lane_mask = 0; // bit l set when lane l carries a nonzero digit
     uint8_t active_lane_count = 0;
     std::array<uint8_t, kMaxNativeRadixLanes> lane_ids{}; // position -> lane id
+    std::array<uint32_t, kMaxNativeRadixLanes> lane_k_masks{}; // lane id -> original block-local K
+    std::vector<LaneGroupDescriptor> groups;
 
     uint32_t k_index_offset = 0;    // into StripePacket::k_indices (block-local K)
     uint32_t activation_offset = 0; // logical digit offset before native storage
@@ -118,7 +129,7 @@ struct BlockDescriptor {
     uint32_t activation_byte_count = 0;  // byte extent owned by this block
 
     uint32_t output_value_offset = 0; // into CompressedOutput::values
-    uint16_t rows_padded = 0;         // row_count aligned to kArrayDim
+    uint16_t rows_padded = 0;         // output lane rows: row_count aligned to kArrayDim
     uint32_t lane_stride_values = 0;  // rows_padded * j_padded
 };
 
@@ -147,7 +158,7 @@ struct ActivationPayload {
 struct StripePacket {
     uint32_t version = kPacketVersion;
     uint8_t digit_bits = 8;
-    uint8_t lane_capacity = 4;
+    uint8_t lane_capacity = 5;
     DigitStorage digit_storage = DigitStorage::signed_int8;
     Int4Packing int4_packing = Int4Packing::none;
 
@@ -163,7 +174,7 @@ struct StripePacket {
 
     std::vector<BlockDescriptor> blocks;
     std::vector<uint16_t> k_indices; // block-local K, ascending inside each block
-    // block / lane position / padded row / padded K in selected native storage
+    // block / group / group lane / real row / group K; zero padding only at each group tail
     ActivationPayload stacked_activation;
     size_t activation_value_count = 0; // decoded values, including DIM padding
     size_t residual_event_count = 0;   // nonzero source residuals before radix expansion
@@ -187,7 +198,7 @@ enum class RmdStatus : uint8_t {
     success,
     invalid_arguments,
     invalid_packet,
-    residual_too_wide,   // outside the supported width-native residual envelope
+    residual_too_wide,   // reconstructed digits exceed the INT32 residual range
     unsupported_route,   // route cannot satisfy the exact result contract
     overflow,
     allocation_failure,
@@ -219,8 +230,8 @@ struct NativeBalancedDigits {
     }
 };
 
-// Decomposes only values in the supported signed 21-bit envelope. Both calls
-// are transactional: failure leaves the caller-provided output unchanged.
+// Supports every INT32 residual; composition rejects digits outside that range.
+// Both calls are transactional: failure leaves the caller-provided output unchanged.
 RmdStatus decompose_balanced_radix(int32_t residual,
                                    uint8_t operand_bits,
                                    NativeBalancedDigits & out);
@@ -234,8 +245,7 @@ struct BalancedDigits {
     uint8_t lane_mask = 0;
 };
 
-// Returns false when the value needs a fifth digit (explicit failure, never a
-// silent truncation).
+// Supports every INT32 residual, including values requiring the fifth digit.
 bool decompose_balanced_radix256(int32_t residual, BalancedDigits & out);
 
 // Reconstructs a residual from its digits; used by tests and the reference path.

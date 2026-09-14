@@ -10,6 +10,7 @@
 #include "residual/direct/direct-executor.hpp"
 #include "residual/rmd/rmd-compose.hpp"
 #include "residual/rmd/rmd-im2p-executor.hpp"
+#include "quants/common/weight_route.hpp"
 #include <im2p_sim.h>
 #include <gemmini/log.hpp>
 
@@ -21,6 +22,7 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -908,7 +910,11 @@ static Result apply_captured_rmd_full(
           stripe.event.stripe_id != index ||
           stripe.event.row_begin != next_row ||
           stripe.event.row_begin >= stripe.event.row_end ||
-          stripe.event.row_end > runtime_args.I) {
+          stripe.event.row_end > runtime_args.I ||
+          (stripe.event.rmd_packet != nullptr &&
+           (stripe.event.rmd_packet->row_begin != stripe.event.row_begin ||
+            stripe.event.rmd_packet->row_count !=
+                stripe.event.row_end - stripe.event.row_begin))) {
         return {Error::invalid_contract,
                 "captured FULL stripes are not canonical", false};
       }
@@ -974,11 +980,12 @@ static Result apply_captured_rmd_full(
 
   ::im2p::gemmini::ResidualStripeStats staged_stats{};
   rmd::RmdProviderStats staged_provider_stats{};
+  rmd::detail::RmdWeightPreparation weights;
   for (const auto *captured_stripe : ordered) {
     const auto &event = captured_stripe->event;
     rmd::Correction correction = rmd::BlockScaledInt64Correction{};
-    rmd::CompressedOutput compressed;
     rmd::RmdExecutionMetrics metrics{};
+    bool shared_weights = false;
     residual::DirectExecutionMetrics direct_metrics{};
     rmd::RmdStatus status = rmd::RmdStatus::success;
     const bool no_residual =
@@ -995,13 +1002,14 @@ static Result apply_captured_rmd_full(
 #if defined(GGML_GEMMINI_TESTING)
       if (provider_fault(failure) != rmd::Im2pProviderTestFault::none) {
         status = rmd::execute_rmd_stripe_im2p_for_test(
-            simulator.get(), *rmd_args, *event.rmd_packet, compressed, &metrics,
+            simulator.get(), *rmd_args, *event.rmd_packet, correction, &metrics,
             provider_fault(failure));
       } else
 #endif
       {
-        status = rmd::execute_rmd_stripe_im2p(
-            simulator.get(), *rmd_args, *event.rmd_packet, compressed, &metrics);
+        status = rmd::detail::execute_rmd_stripe_im2p_with_weights(
+            simulator.get(), *rmd_args, *event.rmd_packet, correction, weights, &metrics);
+        shared_weights = true;
       }
       backend.finish(status == rmd::RmdStatus::success);
     }
@@ -1029,15 +1037,13 @@ static Result apply_captured_rmd_full(
               "injected FULL RMD compose failure", false};
     }
 #endif
-    if (event.rmd_packet != nullptr) {
-      HostCpuInterval reconstruction(*rmd_args, "im2p.residual_result_reconstruction", &event);
-      status = rmd::compose_rmd_output(*event.rmd_packet, compressed, correction);
-      reconstruction.finish(status == rmd::RmdStatus::success);
-    }
     if (status == rmd::RmdStatus::success && !no_residual) {
       HostCpuInterval merge(*rmd_args, "im2p.output_correction_apply", &event);
-      status = rmd::merge_rmd_correction_to(
-          *rmd_args, output_data, event.row_begin, event.row_end, correction);
+      status = shared_weights
+          ? rmd::detail::merge_rmd_correction_with_weights(
+                *rmd_args, output_data, *event.rmd_packet, correction, weights)
+          : rmd::merge_rmd_correction_to(
+                *rmd_args, output_data, event.row_begin, event.row_end, correction);
       merge.finish(status == rmd::RmdStatus::success);
     }
     if (status != rmd::RmdStatus::success)
@@ -1108,6 +1114,9 @@ public:
         event.activation_metadata->theta ==
             std::numeric_limits<std::int16_t>::min() ||
         event.row_begin >= event.row_end || event.row_end > runtime_args.I ||
+        (event.rmd_packet != nullptr &&
+         (event.rmd_packet->row_begin != event.row_begin ||
+          event.rmd_packet->row_count != event.row_end - event.row_begin)) ||
         stage.data == nullptr ||
         (event.direct_residual != nullptr && event.rmd_packet != nullptr) ||
         (residual_mode == ::im2p::gemmini::ResidualStageMode::host_direct
@@ -1170,8 +1179,8 @@ public:
 #endif
 
     rmd::Correction correction = rmd::BlockScaledInt64Correction{};
-    rmd::CompressedOutput compressed;
     rmd::RmdExecutionMetrics metrics{};
+    bool shared_weights = false;
     residual::DirectExecutionMetrics direct_metrics{};
     rmd::RmdStatus status = rmd::RmdStatus::success;
     const bool no_residual =
@@ -1187,13 +1196,14 @@ public:
 #if defined(GGML_GEMMINI_TESTING)
       if (provider_fault(failure) != rmd::Im2pProviderTestFault::none) {
         status = rmd::execute_rmd_stripe_im2p_for_test(
-            simulator, stripe_args, *event.rmd_packet, compressed, &metrics,
+            simulator, stripe_args, *event.rmd_packet, correction, &metrics,
             provider_fault(failure));
       } else
 #endif
       {
-        status = rmd::execute_rmd_stripe_im2p(
-            simulator, stripe_args, *event.rmd_packet, compressed, &metrics);
+        status = rmd::detail::execute_rmd_stripe_im2p_with_weights(
+            simulator, stripe_args, *event.rmd_packet, correction, *rmd_weights, &metrics);
+        shared_weights = true;
       }
       backend.finish(status == rmd::RmdStatus::success);
     }
@@ -1211,15 +1221,13 @@ public:
           {Error::execution_failure, "injected RMD compose failure", false});
     }
 #endif
-    if (event.rmd_packet != nullptr) {
-      HostCpuInterval reconstruction(stripe_args, "im2p.residual_result_reconstruction", &event);
-      status = rmd::compose_rmd_output(*event.rmd_packet, compressed, correction);
-      reconstruction.finish(status == rmd::RmdStatus::success);
-    }
     if (status == rmd::RmdStatus::success && !no_residual) {
       HostCpuInterval merge(stripe_args, "im2p.output_correction_apply", &event);
-      status = rmd::merge_rmd_correction_to(
-          stripe_args, stage.data, event.row_begin, event.row_end, correction);
+      status = shared_weights
+          ? rmd::detail::merge_rmd_correction_with_weights(
+                stripe_args, stage.data, *event.rmd_packet, correction, *rmd_weights)
+          : rmd::merge_rmd_correction_to(
+                stripe_args, stage.data, event.row_begin, event.row_end, correction);
       merge.finish(status == rmd::RmdStatus::success);
     }
     if (status != rmd::RmdStatus::success)
@@ -1415,6 +1423,7 @@ public:
   ggml_gemmini_args_t runtime_args;
   std::vector<float> staged_output;
   std::vector<PublishedStripe> published;
+  std::optional<rmd::detail::RmdWeightPreparation> rmd_weights{std::in_place};
   std::unique_ptr<::im2p::gemmini::Run> run;
   quants::act::exsia::StripeReadySink sink;
   Result sink_result{};
@@ -1853,6 +1862,7 @@ Completion ExsiaStripePipeline::finish(bool quantization_succeeded) noexcept {
       (impl_->runtime_args.I - 1) /
           impl_->runtime_args.activation_rows_per_stripe +
       1);
+  impl_->rmd_weights.reset();
   Completion completion = translate(
       fenced, ::im2p::gemmini::Mode::stripe_pipeline, expected_publications,
       static_cast<std::uint64_t>(impl_->runtime_args.I));

@@ -3,7 +3,6 @@
 #include "rmd-types.hpp"
 
 #include <map>
-#include <set>
 
 namespace ggml::gemmini::rmd {
 
@@ -37,8 +36,10 @@ private:
     };
 
     struct BlockAccum {
-        std::set<uint16_t> k;
-        uint8_t lane_mask = 0;
+        static_assert(kBlockSize <= 32, "block-local K mask must fit uint32_t");
+        uint32_t k_mask = 0;
+        std::array<uint32_t, kMaxNativeRadixLanes> lane_k_masks{};
+        uint16_t lane_mask = 0;
     };
 
     RmdStatus status_ = RmdStatus::success;

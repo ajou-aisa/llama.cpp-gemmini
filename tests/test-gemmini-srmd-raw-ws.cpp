@@ -132,22 +132,27 @@ void report_radix_mismatch(size_t row, size_t column, const std::array<size_t, 5
     std::fprintf(stderr, "FAIL: row=%zu J=%zu", row, column);
     for (size_t packed_k = 0; packed_k < original_k.size(); ++packed_k) {
         const BalancedDigits & cell = digits[row * original_k.size() + packed_k];
-        std::fprintf(stderr, " original_K=%zu packed_K=%zu digits=[%d,%d,%d,%d]", original_k[packed_k],
-                     packed_k, static_cast<int>(cell.digits[0]), static_cast<int>(cell.digits[1]),
-                     static_cast<int>(cell.digits[2]), static_cast<int>(cell.digits[3]));
+        std::fprintf(stderr, " original_K=%zu packed_K=%zu digits=[", original_k[packed_k], packed_k);
+        for (size_t lane = 0; lane < kLegacyRadix256Lanes; ++lane) {
+            std::fprintf(stderr, "%s%d", lane == 0 ? "" : ",", static_cast<int>(cell.digits[lane]));
+        }
+        std::fputs("]", stderr);
     }
-    std::fprintf(stderr, " lane_raw=[%d,%d,%d,%d] reconstructed=%lld direct=%lld\n",
-                 static_cast<int>(lane_raw[(row * 4 + 0) * columns + column]),
-                 static_cast<int>(lane_raw[(row * 4 + 1) * columns + column]),
-                 static_cast<int>(lane_raw[(row * 4 + 2) * columns + column]),
-                 static_cast<int>(lane_raw[(row * 4 + 3) * columns + column]),
+    std::fputs(" lane_raw=[", stderr);
+    for (size_t lane = 0; lane < kLegacyRadix256Lanes; ++lane) {
+        std::fprintf(stderr, "%s%d", lane == 0 ? "" : ",",
+                     static_cast<int>(lane_raw[(row * kLegacyRadix256Lanes + lane) * columns + column]));
+    }
+    std::fprintf(stderr, "] reconstructed=%lld direct=%lld\n",
                  static_cast<long long>(reconstructed), static_cast<long long>(direct));
 }
 
 bool run_cpu_radix_case() {
-    constexpr std::array<int32_t, 17> values = {
+    constexpr std::array<int32_t, 20> values = {
         std::numeric_limits<int32_t>::min(), -16777217, -129, -128, -1, 0, 1, 127, 128,
         129, 255, 256, 65535, 65536, 16777215, 16777216, 2139062143,
+        2139062144, std::numeric_limits<int32_t>::max() - 1,
+        std::numeric_limits<int32_t>::max(),
     };
     constexpr std::array<size_t, 5> original_k = {1, 4, 9, 17, 31};
     constexpr size_t scale_group_begin = 0;
@@ -162,7 +167,7 @@ bool run_cpu_radix_case() {
     const std::vector<elem_t> b(physical_b.begin(), physical_b.end());
     std::vector<int32_t> residuals(shape.m * shape.k, 0);
     std::vector<BalancedDigits> digits(shape.m * shape.k);
-    std::vector<elem_t> a_stacked(shape.m * 4 * shape.k, 0);
+    std::vector<elem_t> a_stacked(shape.m * kLegacyRadix256Lanes * shape.k, 0);
 
     for (size_t packed_k = 0; packed_k < original_k.size(); ++packed_k) {
         if (original_k[packed_k] < scale_group_begin ||
@@ -179,24 +184,24 @@ bool run_cpu_radix_case() {
             if (!decompose_balanced_radix256(residuals[row * shape.k + kp], cell)) {
                 return fail("accepted radix fixture residual rejected");
             }
-            for (size_t lane = 0; lane < 4; ++lane) {
-                a_stacked[(row * 4 + lane) * shape.k + kp] = cell.digits[lane];
+            for (size_t lane = 0; lane < kLegacyRadix256Lanes; ++lane) {
+                a_stacked[(row * kLegacyRadix256Lanes + lane) * shape.k + kp] = cell.digits[lane];
             }
         }
     }
 
-    BalancedDigits rejected{};
-    rejected.digits.fill(1);
-    rejected.lane_mask = 0x0f;
-    if (decompose_balanced_radix256(std::numeric_limits<int32_t>::max(), rejected) ||
-        rejected.lane_mask != 0 || rejected.digits != std::array<int8_t, 4>{}) {
-        return fail("INT32_MAX decomposition must reject and clear digits");
+    BalancedDigits zero{};
+    zero.digits.fill(1);
+    zero.lane_mask = 0x1f;
+    if (!decompose_balanced_radix256(0, zero) ||
+        zero.lane_mask != 0 || zero.digits != std::array<int8_t, kLegacyRadix256Lanes>{}) {
+        return fail("zero decomposition must clear reused digits and the top lane mask");
     }
 
     std::vector<acc_t> lane_raw;
     std::vector<acc_t> lane_oracle;
-    if (!cpu_gemm(a_stacked, b, {shape.m * 4, shape.j, shape.k}, lane_raw) ||
-        !exact_oracle(a_stacked, b, {shape.m * 4, shape.j, shape.k}, lane_oracle)) {
+    if (!cpu_gemm(a_stacked, b, {shape.m * kLegacyRadix256Lanes, shape.j, shape.k}, lane_raw) ||
+        !exact_oracle(a_stacked, b, {shape.m * kLegacyRadix256Lanes, shape.j, shape.k}, lane_oracle)) {
         return false;
     }
     for (size_t cell = 0; cell < lane_raw.size(); ++cell) {
@@ -208,8 +213,9 @@ bool run_cpu_radix_case() {
         for (size_t column = 0; column < shape.j; ++column) {
             __int128 reconstructed_sum = 0;
             __int128 place = 1;
-            for (size_t lane = 0; lane < 4; ++lane) {
-                reconstructed_sum += static_cast<__int128>(lane_raw[(row * 4 + lane) * shape.j + column]) * place;
+            for (size_t lane = 0; lane < kLegacyRadix256Lanes; ++lane) {
+                reconstructed_sum += static_cast<__int128>(
+                    lane_raw[(row * kLegacyRadix256Lanes + lane) * shape.j + column]) * place;
                 place *= 256;
             }
             int64_t reconstructed = 0;

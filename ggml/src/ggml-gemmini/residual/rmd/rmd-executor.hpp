@@ -1,22 +1,25 @@
 #pragma once
 
 #include "rmd-types.hpp"
+#include "../../quants/common/weight_route.hpp"
 
 #include <array>
 #include <limits>
+#include <mutex>
 
 struct ggml_gemmini_args_t;
+namespace ggml::gemmini::quants::wroute { struct WeightRoutePlan; }
 
 namespace ggml::gemmini::rmd {
+namespace detail { struct RmdAssemblerAccess; }
 
 constexpr bool compact_rmd_backend_available(bool hardware_target,
                                              bool im2p_build) {
     return hardware_target || im2p_build;
 }
 
-// Raw NPU tile result. The physical tile order is an executor-internal detail: the
-// assembler below normalises it into the canonical compressed output layout before
-// anything outside the executor can observe it.
+// Raw NPU tile result. Physical tile order is executor-internal; the assembler
+// validates tags before storing compressed output or composing the correction.
 struct PhysicalTile {
     uint32_t packet_block_index = 0;
     uint8_t lane_position = 0;
@@ -25,7 +28,7 @@ struct PhysicalTile {
     uint32_t j_tile = 0;
     uint16_t valid_rows = 0;
     uint16_t valid_cols = 0;
-    const OutputValue * values = nullptr; // kArrayDim * kArrayDim, row major
+    const OutputValue * values = nullptr; // valid_rows rows, row stride kArrayDim
 };
 
 // Accepts physical tiles in any order and rejects duplicates, missing tiles and
@@ -33,12 +36,19 @@ struct PhysicalTile {
 class RmdOutputAssembler {
 public:
     RmdStatus begin(const StripePacket & packet, CompressedOutput & output);
+    RmdStatus begin(const StripePacket & packet, Correction & correction);
     RmdStatus submit(const PhysicalTile & tile);
     RmdStatus finish();
 
 private:
+    friend struct detail::RmdAssemblerAccess;
+    RmdStatus begin_validated(const StripePacket & packet, CompressedOutput & output);
+    RmdStatus begin_validated(const StripePacket & packet, Correction & correction);
+    RmdStatus begin(const StripePacket & packet);
     const StripePacket * packet_ = nullptr;
     CompressedOutput * output_ = nullptr;
+    Correction * correction_ = nullptr;
+    std::vector<__int128> correction_values_;
     std::vector<uint8_t> seen_;
     std::vector<size_t> tile_offset_;   // per block: index of its first tile slot
     size_t m_tiles_ = 0;
@@ -99,13 +109,14 @@ struct RmdExecutionMetrics {
     size_t active_lanes = 0;
     size_t compact_k_count = 0;
     size_t padded_k_count = 0;
-    size_t physical_tile_count = 0;
+    size_t physical_tile_count = 0; // logical per-lane tiles submitted to the assembler
     size_t matmul_call_count = 0;
     size_t lane_group_count = 0;
     size_t baseline_stacked_i_tile_count = 0;
-    size_t stacked_i_tile_count = 0;
+    size_t stacked_i_tile_count = 0; // dispatched group row tiles, including K/J repeats
     size_t packet_bytes = 0;
     size_t compressed_output_values = 0;
+    // Per-axis padding counts overlap at cells padded in both rows and K.
     size_t block_padding_zeros = 0;
     size_t row_padding_zeros = 0;
     size_t j_padding_zeros = 0;
@@ -122,6 +133,44 @@ struct RmdExecutionMetrics {
 
 void collect_packet_metrics(const StripePacket & packet, RmdExecutionMetrics & metrics);
 
+namespace detail {
+// One immutable matmul weight lifetime. Activation metadata may vary by stripe;
+// changing weights or their shape requires a new context. Preparation alone locks.
+class RmdWeightPreparation {
+public:
+    const quants::wroute::WeightRoutePlan & route_plan(const ggml_gemmini_args_t & args);
+#if defined(GGML_GEMMINI_TESTING)
+    size_t column_preparations() const { return column_preparations_; }
+    size_t selected_block_preparations() const { return selected_block_preparations_; }
+#endif
+
+private:
+    friend RmdStatus merge_rmd_correction_with_weights(const ggml_gemmini_args_t &,
+        float *, const StripePacket &, const Correction &, RmdWeightPreparation &, size_t *);
+    RmdStatus prepare_columns(const ggml_gemmini_args_t & args, const StripePacket & packet);
+    std::mutex mutex_;
+    bool plan_ready_ = false;
+    bool columns_ready_ = false;
+    quants::wroute::WeightRoutePlan plan_;
+    std::vector<float> column_scale_;
+    std::vector<uint8_t> checked_blocks_;
+#if defined(GGML_GEMMINI_TESTING)
+    size_t column_preparations_ = 0;
+    size_t selected_block_preparations_ = 0;
+#endif
+};
+
+RmdStatus execute_rmd_stripe_ws_with_weights(const ggml_gemmini_args_t & args,
+    const StripePacket & packet, Correction & correction,
+    RmdWeightPreparation & weights, RmdExecutionMetrics * metrics = nullptr);
+
+// The returned Residual plan is usable only while this invocation's args and
+// weight storage remain unchanged. Call/job owners retain it through merge.
+RmdStatus execute_rmd_stripe_ws_prepared(const ggml_gemmini_args_t & args,
+    const StripePacket & packet, Correction & correction,
+    quants::wroute::WeightRoutePlan & plan, RmdExecutionMetrics * metrics = nullptr);
+}
+
 // Executes every block of the compact packet, applies the block integer scale exactly
 // once, and writes canonical block-scaled INT64 output. Matched IM2P_SIM H1/HP1
 // routes use the typed provider executor; non-IM2P builds retain their existing
@@ -131,15 +180,23 @@ RmdStatus execute_rmd_stripe_ws(const ggml_gemmini_args_t & args,
                                 CompressedOutput & output,
                                 RmdExecutionMetrics * metrics = nullptr);
 
-// True when the weight route can express its scale as
-// integer_block_scale(j, block) * column_scale(j).
-bool weight_route_supports_rmd(const ggml_gemmini_args_t & args);
+// Composes block-scaled tiles as they arrive and publishes the final INT64
+// correction only after all tiles and overflow checks succeed.
+RmdStatus execute_rmd_stripe_ws(const ggml_gemmini_args_t & args,
+                                const StripePacket & packet,
+                                Correction & correction,
+                                RmdExecutionMetrics * metrics = nullptr);
 
 #if defined(GGML_GEMMINI_TESTING)
 // Scalar packet oracle for tests only. Production callers cannot select or invoke it.
 RmdStatus execute_rmd_stripe_reference(const ggml_gemmini_args_t & args,
                                        const StripePacket & packet,
                                        CompressedOutput & output,
+                                       RmdExecutionMetrics * metrics = nullptr);
+
+RmdStatus execute_rmd_stripe_reference(const ggml_gemmini_args_t & args,
+                                       const StripePacket & packet,
+                                       Correction & correction,
                                        RmdExecutionMetrics * metrics = nullptr);
 
 // Instantiates the native Gemmini path in host test builds. Widened codes are

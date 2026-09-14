@@ -190,31 +190,14 @@ require_count("${source}" "\"rmd_merge_cycles\"" 1 "exact U12 label/site count")
 require_count("${source}" "\"matmul_output_commit_cycles\"" 1
     "exact U16 label/site count")
 
-# One full packet Compose pair. Direct/no-packet Compose exits structurally
-# before the start sample; operation failures still close the pair before they
-# can publish anything.
-require_count("${compose}" "cycle::read_sample()" 2 "one full Compose pair")
-require_count("${compose}" "telemetry_compose_start_sample" 2 "Compose start endpoint storage/use")
-require_count("${compose}" "telemetry_compose_end_sample" 2 "Compose end endpoint storage/use")
-require_order("${compose}" "Compose detail boundary"
-    "job.direct_residual_ != nullptr || packet == nullptr"
-    "telemetry_compose_start_sample = cycle::read_sample()"
-    "rmd::compose_rmd_output"
-    "telemetry_compose_end_sample = cycle::read_sample()"
-    "if (status != rmd::RmdStatus::success)")
-require_absent("${compose}" "compose_cpu_work" "Compose is standalone, not canonical CPU work")
-require_absent("${compose}" "CpuWorkCoverage" "Compose has no coverage framework")
-require_checked_publication("${compose}" "compose" "status == rmd::RmdStatus::success" "Compose")
-require_order("${compose}" "Compose captures host endpoints before publication"
-    "compose_start_ns = now_ns()" "compose_start_tid = cycle::host_thread_id()"
-    "rmd::compose_rmd_output" "compose_end_ns = now_ns()"
-    "compose_end_tid = cycle::host_thread_id()" "emit_matmul_native_interval"
-    "job.metrics_.compose_end_ns = compose_end_ns")
-require_token("${compose}" "job.metrics_.compose_start_ns, compose_end_ns"
-    "Compose publishes captured host ns")
-require_token("${compose}" "job.metrics_.compose_start_tid, compose_end_tid"
-    "Compose publishes executing thread identity")
-require_native_detail_gate("${compose}" "Compose")
+require_absent("${source}" "rmd::CompressedOutput" "production stages final corrections")
+require_absent("${source}" "rmd::compose_rmd_output" "composition is fused into executor")
+require_absent("${compose}" "cycle::read_sample()" "lifecycle completion has no synthetic Compose pair")
+require_absent("${compose}" "emit_matmul_native_interval" "fused Compose belongs to backend interval")
+require_order("${compose}" "Compose requires a published correction even for empty packets"
+    "std::lock_guard<std::mutex> lock" "!job.rmd_correction_ready_"
+    "return invalid_state(\"compose requires" "job.residual_state_ = MatmulResidualState::complete"
+    "job.lifecycle_condition_.notify_all()")
 
 # Keep one legacy inclusive Finalize pair. Its checked children are never
 # added to or subtracted from their inclusive parent.
@@ -227,7 +210,9 @@ require_order("${finalize}" "Finalize contains Merge/diagnostics, not completion
     "telemetry_finalize_start_sample = cycle::read_sample()"
     "merge_start = read_matmul_cpu_sample()" "rmd::merge_rmd_correction"
     "merge_end = read_matmul_cpu_sample()"
-    "stats_start = read_matmul_cpu_sample()" "std::count_if"
+    "stats_start = read_matmul_cpu_sample()"
+    "telemetry_correction_nonzero_count = status == rmd::RmdStatus::success"
+    "? correction_nonzero_count : std::visit(" "std::count_if"
     "stats_end = read_matmul_cpu_sample()"
     "matmul_telemetry_hash_enabled()" "hash_start = read_matmul_cpu_sample()"
     "rmd_input_hash" "hash_end = read_matmul_cpu_sample()"
@@ -279,11 +264,24 @@ require_order("${worker}" "worker job preparation has its own same-thread pair"
     "captured.timing.dequeue_tid = cycle::host_thread_id()"
     "preparation_start = read_matmul_cpu_sample()" "std::make_shared<MatmulStripeJob>"
     "std::make_unique<quants::act::Meta>" "preparation_end = read_matmul_cpu_sample()")
-foreach(pair IN ITEMS compose merge)
+require_order("${residual}" "backend interval includes final correction production"
+    "backend_start = read_matmul_cpu_sample()" "rmd::detail::execute_rmd_stripe_ws_with_weights"
+    "*packet, correction, *weights, &metrics" "backend_end = read_matmul_cpu_sample()"
+    "if (status != rmd::RmdStatus::success)"
+    "job.rmd_correction_ = std::move(correction)")
+require_token("${residual}"
+    "if (!job.status_) return job.status_;\n        job.rmd_correction_ = std::move(correction);\n        job.rmd_correction_ready_ = true"
+    "correction readiness is published only after success and cancellation checks")
+require_absent("${run_full}" "compose_start = read_matmul_cpu_sample()"
+    "FULL fused Compose belongs to backend interval")
+foreach(pair IN ITEMS merge)
     require_token("${run_full}" "${pair}_start = read_matmul_cpu_sample()" "FULL packet ${pair} start")
     require_token("${run_full}" "${pair}_end = read_matmul_cpu_sample()" "FULL packet ${pair} end")
 endforeach()
 file(READ "${gemmini_source_dir}/ggml-gemmini-matmul.hpp" header)
+require_token("${header}" "bool rmd_correction_ready_ = false" "new jobs have no published correction")
+require_token("${source}" "rmd_correction_ready_(other.rmd_correction_ready_)" "move construction preserves readiness")
+require_token("${source}" "rmd_correction_ready_ = other.rmd_correction_ready_" "move assignment preserves readiness")
 require_order("${header}" "reader collection gate"
     "inline MatmulCpuSample read_matmul_cpu_sample()" "#if LOG_CYCLE"
     "result.collected = true" "result.native = cycle::read_sample()")
@@ -293,6 +291,10 @@ require_order("${emitter}" "nonthrowing CPU telemetry boundary"
     "log::cycle.write_json" "serialize_matmul_cpu_interval" "catch (...)"
     "log::cycle.report_failure")
 file(READ "${gemmini_source_dir}/ggml-gemmini-im2p.cpp" im2p)
+require_absent("${im2p}" "rmd::CompressedOutput" "IM2P stages final corrections")
+require_absent("${im2p}" "rmd::compose_rmd_output" "IM2P reconstruction belongs to backend interval")
+require_count("${im2p}" "if (failure == TestFailure::compose)" 2
+    "FULL and PIPELINE preserve compose failure injection before merge")
 require_order("${im2p}" "IM2P retains its measurement and failure boundary"
     "void finish(" "const auto end = read_matmul_cpu_sample()" "active_ = false"
     "try {" "log::cycle.write_json" "serialize_matmul_cpu_interval"

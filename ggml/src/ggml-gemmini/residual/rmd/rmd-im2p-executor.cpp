@@ -262,7 +262,9 @@ RmdStatus execute_im2p_compact_dot(
 #else
     if (sim == nullptr || dot.activations == nullptr || dot.weights == nullptr ||
         output == nullptr || dot.rows == 0 || dot.columns == 0 || dot.k == 0 ||
-        dot.activation_row_stride < dot.k || dot.weight_row_stride < dot.columns ||
+        dot.activation_row_stride_bytes < dot.k * (dot.operand_bits == 16 ? sizeof(int16_t) : 1) ||
+        (dot.operand_bits == 16 && dot.activation_row_stride_bytes % sizeof(int16_t) != 0) ||
+        dot.weight_row_stride < dot.columns ||
         output_row_stride < dot.columns ||
         (dot.operand_bits != 4 && dot.operand_bits != 8 && dot.operand_bits != 16) ||
         dot.operand_bits != GGML_GEMMINI_ACTIVATION_BITS ||
@@ -282,54 +284,23 @@ RmdStatus execute_im2p_compact_dot(
         return RmdStatus::allocation_failure;
     }
 
-    std::vector<int8_t> activation_i8;
-    std::vector<int16_t> activation_i16;
-    const void * activation_data = nullptr;
-    try {
-        if (dot.operand_bits == 16) {
-            activation_i16.resize(dot.rows * dot.k);
-            for (size_t row = 0; row < dot.rows; ++row) {
-                for (size_t k = 0; k < dot.k; ++k) {
-                    const int32_t value = dot.activations[row * dot.activation_row_stride + k];
-                    if (value < std::numeric_limits<int16_t>::min() ||
-                        value > std::numeric_limits<int16_t>::max()) return RmdStatus::overflow;
-                    activation_i16[row * dot.k + k] = static_cast<int16_t>(value);
-                }
-            }
-            activation_data = activation_i16.data();
-        } else {
-            const int32_t minimum = dot.operand_bits == 4 ? -8 : -128;
-            const int32_t maximum = dot.operand_bits == 4 ? 7 : 127;
-            activation_i8.resize(dot.rows * dot.k);
-            for (size_t row = 0; row < dot.rows; ++row) {
-                for (size_t k = 0; k < dot.k; ++k) {
-                    const int32_t value = dot.activations[row * dot.activation_row_stride + k];
-                    if (value < minimum || value > maximum) return RmdStatus::overflow;
-                    // A4 crosses the ABI unpacked: one signed byte per low-nibble-first digit.
-                    activation_i8[row * dot.k + k] = static_cast<int8_t>(value);
-                }
-            }
-            activation_data = activation_i8.data();
-        }
-    } catch (const std::bad_alloc &) {
-        return RmdStatus::allocation_failure;
-    }
-
     im2p_matmul_desc_t descriptor{};
     descriptor.abi_version = IM2P_ABI_VERSION;
     descriptor.activation_bits = dot.operand_bits;
+    // A4 is already unpacked to signed bytes by the caller; A16 uses two bytes per digit.
+    // Preserve the caller's byte stride so padded native rows need no repacking here.
     descriptor.activation_storage_bytes = dot.operand_bits == 16 ? 2 : 1;
     descriptor.weight_bits = dot.operand_bits;
     descriptor.weight_storage_bytes = dot.operand_bits == 16 ? 2 : 1;
     descriptor.dim = DIM;
-    descriptor.activations = activation_data;
+    descriptor.activations = dot.activations;
     descriptor.weights = nullptr;
     descriptor.scales = nullptr;
     descriptor.output = nullptr;
     descriptor.m = dot.rows;
     descriptor.n = dot.columns;
     descriptor.k = dot.k;
-    descriptor.activation_row_stride_bytes = dot.k * descriptor.activation_storage_bytes;
+    descriptor.activation_row_stride_bytes = dot.activation_row_stride_bytes;
     descriptor.weight_row_stride_bytes = dot.columns * descriptor.weight_storage_bytes;
     descriptor.output_row_stride = output_row_stride;
     descriptor.tile_i_rows = std::min(dot.rows, static_cast<size_t>(DIM));

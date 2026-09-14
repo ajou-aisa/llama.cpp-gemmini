@@ -3,8 +3,24 @@
 #include "rmd-types.hpp"
 
 struct ggml_gemmini_args_t;
+namespace ggml::gemmini::quants::wroute { struct WeightRoutePlan; }
 
 namespace ggml::gemmini::rmd {
+namespace detail {
+class RmdWeightPreparation;
+// The immutable packet must already have passed execution validation.
+RmdStatus merge_rmd_correction_with_weights(const ggml_gemmini_args_t & args,
+    float * destination, const StripePacket & packet, const Correction & correction,
+    RmdWeightPreparation & weights, size_t * nonzero_count = nullptr);
+RmdStatus merge_rmd_correction_prepared(const ggml_gemmini_args_t & args,
+    float * destination, const StripePacket & packet, const Correction & correction,
+    const quants::wroute::WeightRoutePlan & plan, size_t * nonzero_count = nullptr);
+RmdStatus merge_rmd_correction_prepared(const ggml_gemmini_args_t & args,
+    float * destination, size_t global_row_begin, size_t global_row_end,
+    const Correction & correction, const quants::wroute::WeightRoutePlan & plan,
+    size_t * nonzero_count = nullptr);
+}
+
 
 // Radix composition of the canonical block-scaled INT64 output.
 //
@@ -22,32 +38,32 @@ RmdStatus compose_rmd_output(const StripePacket & packet,
 // Applies the correction according to its tagged domain and the per-row activation
 // scale, then commits the fully staged result. H1/HP1 consume the column scale here
 // exactly once; H0 values are already weight-scaled and are used directly. The output
-// is unchanged on every failure.
+// and optional raw correction nonzero count are unchanged on every failure.
 RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
                                   float * destination,
                                   size_t global_row_begin,
                                   size_t global_row_end,
-                                  const Correction & correction);
+                                  const Correction & correction,
+                                  size_t * nonzero_count = nullptr);
 
 RmdStatus merge_rmd_correction(const ggml_gemmini_args_t & args,
                                size_t global_row_begin,
                                size_t global_row_end,
-                               const Correction & correction);
+                               const Correction & correction,
+                               size_t * nonzero_count = nullptr);
 
 // The weight-stationary packet path preserves packet-scoped weight validation, then
 // delegates scaling and atomic output update to the common checked implementation.
 RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
                                   float * destination,
                                   const StripePacket & packet,
-                                  const Correction & correction);
+                                  const Correction & correction,
+                                  size_t * nonzero_count = nullptr);
 
 RmdStatus merge_rmd_correction(const ggml_gemmini_args_t & args,
                                const StripePacket & packet,
-                               const Correction & correction);
-
-// execute -> compose -> common scale / final merge, for callers that do not need to
-// observe the intermediate compressed output.
-RmdStatus apply_rmd_packet_ws(const ggml_gemmini_args_t & args, const StripePacket & packet);
+                               const Correction & correction,
+                               size_t * nonzero_count = nullptr);
 
 // Rebuilds the dense INT32 residual plane carried by valid width-native stripe packets.
 // Only the activation dequantizers (validation / FLOAT parity) need this; the

@@ -1,9 +1,13 @@
 #include "weight_reader.hpp"
 
+#include <gemmini_params.h>
+
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <type_traits>
 
 namespace ggml::gemmini::quants::wreader
 {
@@ -51,6 +55,7 @@ constexpr size_t kBlockSize = 32;
 
 #if defined(GGML_GEMMINI_TESTING)
 std::atomic_size_t storage_validation_count{0};
+std::atomic_size_t code_address_resolution_count{0};
 #endif
 
 bool checked_mul_size(size_t lhs, size_t rhs, size_t &result)
@@ -456,6 +461,10 @@ WeightCodeResult read_code_validated(
     }
     result.status = WeightReaderStatus::Success;
 
+#if defined(GGML_GEMMINI_TESTING)
+    code_address_resolution_count.fetch_add(1, std::memory_order_relaxed);
+#endif
+
     if (plan.route == Route::Dense ||
         plan.route == Route::Q8ChannelDirect ||
         plan.route == Route::Q8ChannelSidecar) {
@@ -558,6 +567,90 @@ WeightCodeResult read_code_validated(
     return result;
 }
 
+WeightReaderStatus read_code_tile_validated(
+    const ggml_gemmini_args_t &args,
+    const wroute::WeightRoutePlan &plan,
+    size_t block_index,
+    const uint16_t *local_k,
+    size_t valid_k,
+    size_t col_base,
+    size_t valid_cols,
+    int32_t *values,
+    size_t &address_resolutions)
+{
+    if (local_k == nullptr || values == nullptr || valid_k == 0 ||
+        valid_k > DIM || valid_k > kBlockSize || valid_cols == 0 || valid_cols > DIM ||
+        col_base > args.J || valid_cols > args.J - col_base ||
+        args.K == 0 || block_index > (args.K - 1) / kBlockSize) {
+        return WeightReaderStatus::InvalidArguments;
+    }
+    const size_t k_base = block_index * kBlockSize;
+    for (size_t index = 0; index < valid_k; ++index) {
+        if (local_k[index] >= kBlockSize || local_k[index] >= args.K - k_base)
+            return WeightReaderStatus::InvalidArguments;
+    }
+
+    size_t resolutions = 0;
+    const auto gather = [&](auto resolve_block) {
+        std::array<decltype(resolve_block(col_base)), DIM> blocks{};
+        for (size_t col = 0; col < valid_cols; ++col) {
+            blocks[col] = resolve_block(col_base + col);
+            if (blocks[col] == nullptr)
+                return WeightReaderStatus::InvalidMetadata;
+            ++resolutions;
+#if defined(GGML_GEMMINI_TESTING)
+            code_address_resolution_count.fetch_add(1, std::memory_order_relaxed);
+#endif
+        }
+        for (size_t k = 0; k < valid_k; ++k) {
+            for (size_t col = 0; col < valid_cols; ++col) {
+                const auto *block = blocks[col];
+                if constexpr (std::is_same_v<std::remove_cv_t<
+                                  std::remove_reference_t<decltype(block->qs[0])>>, uint8_t>) {
+                    values[k * DIM + col] = decode_q4(block->qs, local_k[k]);
+                } else {
+                    values[k * DIM + col] = block->qs[local_k[k]];
+                }
+            }
+        }
+        address_resolutions = resolutions;
+        return WeightReaderStatus::Success;
+    };
+    if (plan.route == Route::H1 || plan.route == Route::HP1) {
+        switch (args.weight_format) {
+            case Format::q4_h1:
+                return gather([&](size_t j) { return native_block(args.q4_h1_blocks,
+                    args.native_block_count, args.native_blocks_per_row, j, block_index); });
+            case Format::q4_hp1:
+                return gather([&](size_t j) { return native_block(args.q4_hp1_blocks,
+                    args.native_block_count, args.native_blocks_per_row, j, block_index); });
+            case Format::q8_h1:
+                return gather([&](size_t j) { return args.q8_h1_block(j, block_index); });
+            case Format::q8_hp1:
+                return gather([&](size_t j) { return args.q8_hp1_block(j, block_index); });
+            case Format::q16_h1:
+                return gather([&](size_t j) { return native_block(args.q16_h1_blocks,
+                    args.native_block_count, args.native_blocks_per_row, j, block_index); });
+            case Format::q16_hp1:
+                return gather([&](size_t j) { return native_block(args.q16_hp1_blocks,
+                    args.native_block_count, args.native_blocks_per_row, j, block_index); });
+            default:
+                break;
+        }
+    }
+    for (size_t k = 0; k < valid_k; ++k) {
+        for (size_t col = 0; col < valid_cols; ++col) {
+            const WeightCodeResult code = read_code(args, plan, col_base + col, k_base + local_k[k]);
+            if (!code.ok())
+                return code.status;
+            ++resolutions;
+            values[k * DIM + col] = code.value;
+        }
+    }
+    address_resolutions = resolutions;
+    return WeightReaderStatus::Success;
+}
+
 WeightCodeResult read_code(
     const ggml_gemmini_args_t &args,
     const wroute::WeightRoutePlan &plan,
@@ -609,11 +702,17 @@ const char *weight_reader_status_name(WeightReaderStatus status)
 void test_reset_weight_reader_counters()
 {
     storage_validation_count.store(0, std::memory_order_relaxed);
+    code_address_resolution_count.store(0, std::memory_order_relaxed);
 }
 
 size_t test_weight_reader_storage_validations()
 {
     return storage_validation_count.load(std::memory_order_relaxed);
+}
+
+size_t test_weight_reader_code_address_resolutions()
+{
+    return code_address_resolution_count.load(std::memory_order_relaxed);
 }
 #endif
 

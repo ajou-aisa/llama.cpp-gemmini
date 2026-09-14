@@ -46,50 +46,103 @@ void operator delete[](void * memory) noexcept { std::free(memory); }
 void operator delete(void * memory, std::size_t) noexcept { std::free(memory); }
 void operator delete[](void * memory, std::size_t) noexcept { std::free(memory); }
 
+static bool check_saturated_reconstruction(const char * name,
+                                          const ggml_gemmini_args_t & args,
+                                          int32_t expected)
+{
+    namespace rmd = ggml::gemmini::rmd;
+    const auto & packets = ggml::gemmini::quants::activation_rmd_packets(args);
+    const auto & direct = ggml::gemmini::quants::activation_direct_residuals(args);
+    const bool packet_route = args.residual_route == act::ResidualRoute::ws_packet;
+    if (args.act_quant.kind() == act::MetaKind::none ||
+        (packet_route ? packets.empty() || !direct.empty() : direct.empty() || !packets.empty())) {
+        std::fprintf(stderr, "FAIL: %s did not commit metadata and the selected residual payload\n", name);
+        return false;
+    }
+    int64_t residual = 0;
+    const size_t outlier_k = args.K - 1;
+    for (const auto & packet : packets) {
+        if (!packet || rmd::validate_packet(*packet) != rmd::RmdStatus::success) return false;
+        for (const auto & block : packet->blocks) {
+            for (size_t k = 0; k < block.compact_k_count; ++k) {
+                if (block.global_k_begin + packet->k_indices[block.k_index_offset + k] != outlier_k)
+                    continue;
+                for (size_t lane = 0; lane < block.active_lane_count; ++lane) {
+                    int32_t digit = 0;
+                    if (rmd::read_packet_digit(*packet, block, lane, 0, k, digit) !=
+                            rmd::RmdStatus::success) return false;
+                    residual += static_cast<int64_t>(digit) *
+                        (int64_t{1} << (packet->digit_bits * block.lane_ids[lane]));
+                }
+            }
+        }
+    }
+    for (const auto & payload : direct) {
+        if (!payload) return false;
+        for (const auto & event : payload->events) {
+            if (event.local_row == 0 && event.original_k == outlier_k) residual += event.residual;
+        }
+    }
+    const int32_t clipped = expected < 0 ? ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_QMIN :
+                                         ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_QMAX;
+    if (args.A.get(0, outlier_k) != clipped ||
+        static_cast<int64_t>(clipped) + residual != expected) {
+        std::fprintf(stderr, "FAIL: %s clipped activation plus residual did not reconstruct INT32 endpoint\n", name);
+        return false;
+    }
+    return true;
+}
+
 template<typename Meta, typename Quantize>
 bool check_quantizer(const char *name, Quantize quantize)
 {
-    auto run = [&](float outlier) {
+    auto run = [&](float outlier, const int32_t * expected = nullptr) {
         std::vector<float> source(17, 1.0f);
         source.back() = outlier;
-        std::vector<elem_t> quantized(source.size(), 0);
 
         ggml_tensor tensor{};
         tensor.type = GGML_TYPE_F32;
         tensor.data = source.data();
 
-        ggml_gemmini_args_t args{};
-        args.I = 1;
-        args.J = 1;
-        args.K = source.size();
-        args.A.allocate(args.I, args.K, GGML_GEMMINI_ACTIVATION_BITS);
-        args.sA = args.K;
-        args.act_quant.storage().template emplace<Meta>();
-        return quantize(&tensor, args);
+        for (const auto route : {act::ResidualRoute::ws_packet, act::ResidualRoute::cpu_direct}) {
+            ggml_gemmini_args_t args{};
+            args.I = 1;
+            args.J = 1;
+            args.K = source.size();
+            args.A.allocate(args.I, args.K, GGML_GEMMINI_ACTIVATION_BITS);
+            args.sA = args.K;
+            args.residual_route = route;
+            args.act_quant.storage().template emplace<Meta>();
+            if (!quantize(&tensor, args) ||
+                (expected && !check_saturated_reconstruction(name, args, *expected))) return false;
+        }
+        return true;
     };
 
     if (!run(16.0f)) {
-        std::fprintf(stderr, "FAIL: %s rejected a signed-21 representable finite outlier\n", name);
+        std::fprintf(stderr, "FAIL: %s rejected a representable finite outlier\n", name);
         return false;
     }
+    const int32_t maximum = std::numeric_limits<int32_t>::max();
+    const int32_t minimum = std::numeric_limits<int32_t>::min();
     std::feclearexcept(FE_ALL_EXCEPT);
-    const bool accepted_overflow = run(FLT_MAX);
+    const bool accepted_overflow = run(FLT_MAX, &maximum);
     if (std::fetestexcept(FE_INVALID | FE_OVERFLOW) != 0) {
         std::fprintf(stderr, "FAIL: %s raised a floating exception before clamping to INT32\n", name);
         return false;
     }
-    if (accepted_overflow) {
-        std::fprintf(stderr, "FAIL: %s accepted a finite outlier beyond the INT32/RMD domain\n", name);
+    if (!accepted_overflow) {
+        std::fprintf(stderr, "FAIL: %s failed to preserve a finite outlier saturated to INT32_MAX\n", name);
         return false;
     }
     std::feclearexcept(FE_ALL_EXCEPT);
-    const bool accepted_negative_overflow = run(-FLT_MAX);
+    const bool accepted_negative_overflow = run(-FLT_MAX, &minimum);
     if (std::fetestexcept(FE_INVALID | FE_OVERFLOW) != 0) {
         std::fprintf(stderr, "FAIL: %s raised a floating exception while clamping to INT32_MIN\n", name);
         return false;
     }
-    if (accepted_negative_overflow) {
-        std::fprintf(stderr, "FAIL: %s accepted a negative finite outlier beyond the signed-21 RMD domain\n", name);
+    if (!accepted_negative_overflow) {
+        std::fprintf(stderr, "FAIL: %s failed to preserve a finite outlier saturated to INT32_MIN\n", name);
         return false;
     }
     return true;
@@ -162,33 +215,29 @@ static bool check_public_quantizer_zeroes_nonfinite()
     return true;
 }
 
-static bool check_public_quantizer_rejects_too_wide_without_commit()
+static bool check_public_quantizer_saturates_and_commits()
 {
-    std::vector<float> source(17, 1.0f);
-    source.back() = FLT_MAX;
-    std::vector<elem_t> quantized(source.size(), 42);
-    ggml_tensor tensor{};
-    tensor.type = GGML_TYPE_F32;
-    tensor.data = source.data();
-    ggml_gemmini_args_t args{};
-    args.I = 1;
-    args.J = 1;
-    args.K = source.size();
-        args.A.allocate(args.I, args.K, GGML_GEMMINI_ACTIVATION_BITS);
-        args.sA = args.K;
-
-    if (ggml::gemmini::quants::quantize_activation(&tensor, args)) {
-        std::fputs("FAIL: public activation quantizer accepted a residual beyond four lanes\n", stderr);
-        return false;
-    }
-    if (args.act_quant.kind() != act::MetaKind::none) {
-        std::fputs("FAIL: failed quantization committed activation metadata\n", stderr);
-        return false;
-    }
-    for (size_t i = 0; i < args.I * args.K; ++i) {
-        if (args.A.get(i / args.K, i % args.K) != 0) {
-            std::fputs("FAIL: failed quantization left partial activation output\n", stderr);
-            return false;
+    for (float outlier : {FLT_MAX, -FLT_MAX}) {
+        for (const auto route : {act::ResidualRoute::ws_packet, act::ResidualRoute::cpu_direct}) {
+            std::vector<float> source(17, 1.0f);
+            source.back() = outlier;
+            ggml_tensor tensor{};
+            tensor.type = GGML_TYPE_F32;
+            tensor.data = source.data();
+            ggml_gemmini_args_t args{};
+            args.I = 1;
+            args.J = 1;
+            args.K = source.size();
+            args.A.allocate(args.I, args.K, GGML_GEMMINI_ACTIVATION_BITS);
+            args.sA = args.K;
+            args.residual_route = route;
+            const int32_t expected = outlier < 0 ? std::numeric_limits<int32_t>::min() :
+                                                   std::numeric_limits<int32_t>::max();
+            if (!ggml::gemmini::quants::quantize_activation(&tensor, args) ||
+                !check_saturated_reconstruction("public quantizer", args, expected)) {
+                std::fputs("FAIL: public activation quantizer did not commit saturated INT32 activation\n", stderr);
+                return false;
+            }
         }
     }
     return true;
@@ -336,9 +385,12 @@ static bool check_backend_neutral_checked_merge()
 
     std::vector<float> wrapped = sentinel;
     args.f_out = wrapped.data();
-    const auto wrapped_status = ggml::gemmini::rmd::merge_rmd_correction(args, *packet, correction);
+    size_t nonzero_count = 99;
+    const auto wrapped_status = ggml::gemmini::rmd::merge_rmd_correction(
+        args, *packet, correction, &nonzero_count);
     if (direct_status != ggml::gemmini::rmd::RmdStatus::success ||
-        wrapped_status != ggml::gemmini::rmd::RmdStatus::success || direct != wrapped) {
+        wrapped_status != ggml::gemmini::rmd::RmdStatus::success || direct != wrapped ||
+        nonzero_count != 4) {
         std::fputs("FAIL: direct and packet checked merges differ\n", stderr);
         return false;
     }
@@ -357,6 +409,21 @@ static bool check_backend_neutral_checked_merge()
             return false;
         }
     }
+
+    const ggml::gemmini::rmd::Correction sparse_correction =
+        ggml::gemmini::rmd::BlockScaledInt64Correction{{0, -3, 7, 0}};
+    for (auto & weight : weights) weight.s_rf = 0.0f;
+    wrapped = sentinel;
+    nonzero_count = 99;
+    if (ggml::gemmini::rmd::merge_rmd_correction(
+            args, *packet, sparse_correction, &nonzero_count) !=
+            ggml::gemmini::rmd::RmdStatus::success ||
+        nonzero_count != 2 || wrapped != sentinel) {
+        std::fputs("FAIL: nonzero count must use raw correction before zero column scale\n", stderr);
+        return false;
+    }
+    weights[0].s_rf = weights[1].s_rf = 0.5f;
+    weights[2].s_rf = weights[3].s_rf = 2.0f;
 
     ggml::gemmini::rmd::RmdStripeBuilder block_zero_builder;
     block_zero_builder.reset(5, row_begin, row_end - row_begin, args.K, columns);
@@ -406,8 +473,10 @@ static bool check_backend_neutral_checked_merge()
                                      const ggml::gemmini::rmd::Correction & values) {
         direct = sentinel;
         args.f_out = direct.data();
-        const auto status = ggml::gemmini::rmd::merge_rmd_correction(args, begin, end, values);
-        if (status != expected || direct != sentinel) {
+        size_t failure_count = 99;
+        const auto status = ggml::gemmini::rmd::merge_rmd_correction(
+            args, begin, end, values, &failure_count);
+        if (status != expected || direct != sentinel || failure_count != 99) {
             std::fprintf(stderr, "FAIL: %s did not preserve sentinel output\n", name);
             return false;
         }
@@ -485,7 +554,7 @@ int main()
         check_quantizer_zeroes_nonfinite<act::token::Meta>("TOKEN", act::token::quantize) &&
         check_quantizer_zeroes_nonfinite<act::stripe::Meta>("STRIPE", act::stripe::quantize) &&
         check_public_quantizer_zeroes_nonfinite() &&
-        check_public_quantizer_rejects_too_wide_without_commit() &&
+        check_public_quantizer_saturates_and_commits() &&
         check_exact_packet_slice_reuses_handle() &&
         check_radix_compose_allows_final_int64_cancellation() &&
         check_backend_neutral_checked_merge();

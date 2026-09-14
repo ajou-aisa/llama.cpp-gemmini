@@ -37,6 +37,12 @@ RmdStatus execute_rmd_stripe_im2p(im2p_sim_t * sim,
                                   CompressedOutput & output,
                                   RmdExecutionMetrics * metrics = nullptr);
 
+RmdStatus execute_rmd_stripe_im2p(im2p_sim_t * sim,
+                                  const ggml_gemmini_args_t & args,
+                                  const StripePacket & packet,
+                                  Correction & correction,
+                                  RmdExecutionMetrics * metrics = nullptr);
+
 #if defined(GGML_GEMMINI_TESTING)
 RmdStatus execute_rmd_stripe_im2p_for_test(
     im2p_sim_t * sim,
@@ -45,11 +51,27 @@ RmdStatus execute_rmd_stripe_im2p_for_test(
     CompressedOutput & output,
     RmdExecutionMetrics * metrics,
     Im2pProviderTestFault fault);
+RmdStatus execute_rmd_stripe_im2p_for_test(
+    im2p_sim_t * sim,
+    const ggml_gemmini_args_t & args,
+    const StripePacket & packet,
+    Correction & correction,
+    RmdExecutionMetrics * metrics,
+    Im2pProviderTestFault fault);
 void reset_im2p_provider_dot_attempts_for_test();
 [[nodiscard]] size_t im2p_provider_dot_attempts_for_test();
 #endif
 
 namespace detail {
+RmdStatus execute_rmd_stripe_im2p_with_weights(im2p_sim_t * sim,
+    const ggml_gemmini_args_t & args, const StripePacket & packet,
+    Correction & correction, RmdWeightPreparation & weights,
+    RmdExecutionMetrics * metrics = nullptr);
+RmdStatus execute_rmd_stripe_im2p_prepared(im2p_sim_t * sim,
+    const ggml_gemmini_args_t & args, const StripePacket & packet,
+    Correction & correction, quants::wroute::WeightRoutePlan & plan,
+    RmdExecutionMetrics * metrics = nullptr);
+
 
 struct Im2pProviderStatsAggregate {
     RmdProviderStats stats{};
@@ -62,9 +84,9 @@ void expand_im2p_provider_stats(const RmdProviderStats &source,
 
 struct Im2pCompactDot {
     uint8_t operand_bits = 0;
-    const int32_t * activations = nullptr;
+    const void * activations = nullptr;
     size_t rows = 0;
-    size_t activation_row_stride = 0;
+    size_t activation_row_stride_bytes = 0;
     const int32_t * weights = nullptr;
     size_t columns = 0;
     size_t weight_row_stride = 0;
