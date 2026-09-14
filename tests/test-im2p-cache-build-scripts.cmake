@@ -143,6 +143,7 @@ execute_process(
     COMMAND "${CMAKE_COMMAND}" -E env
         "PATH=${test_root}/bin:$ENV{PATH}"
         "CONTRACT_LOG=${test_root}/invalid-jobs.log"
+        "BUILD_DIR=${test_root}/invalid-jobs-build"
         "BUILD_JOBS=1"
         "IM2P_CACHE_JOBS=0"
         "IM2P_SIM_ROOT=${TEST_IM2P_ROOT}"

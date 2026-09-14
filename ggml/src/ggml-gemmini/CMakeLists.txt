@@ -179,6 +179,47 @@ target_link_libraries(ggml-gemmini PRIVATE
   ggml-gemmini-utils
 )
 
+if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "FPGA_UART")
+  # The frontend is built with the selected headers. There is no stale C++
+  # Options/args ABI from a separately compiled frontend archive.
+  add_library(ggml-gemmini-fpga-frontend STATIC
+    "${IM2P_SIM_ROOT}/frontend/src/im2p_gemmini_frontend.cpp")
+  set_target_properties(ggml-gemmini-fpga-frontend PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  target_compile_features(ggml-gemmini-fpga-frontend PRIVATE cxx_std_20)
+  target_compile_options(ggml-gemmini-fpga-frontend PRIVATE -O2 -fno-fast-math)
+  target_compile_definitions(ggml-gemmini-fpga-frontend PRIVATE
+    ${GGML_GEMMINI_COMPILE_DEFS}
+    IM2P_GEMMINI_EXTERNAL_EXECUTOR_ONLY=1
+    IM2P_GEMMINI_FRONTEND_EXPECTED_DIM=16
+    IM2P_GEMMINI_FRONTEND_ACTIVATION_BITS=8)
+  target_include_directories(ggml-gemmini-fpga-frontend PRIVATE
+    "${IM2P_SIM_ROOT}/frontend/include" "${IM2P_SIM_ROOT}/sim/include"
+    "${GGML_GEMMINI_GENERATED_CONFIG_DIR}" "${CMAKE_CURRENT_LIST_DIR}"
+    "${CMAKE_CURRENT_LIST_DIR}/../../include" "${CMAKE_CURRENT_LIST_DIR}/.."
+    "${CMAKE_CURRENT_LIST_DIR}/../ggml-gemmini-utils/include" "${GEMMINI_SW_PATH}")
+
+  target_sources(ggml-gemmini PRIVATE
+    "${GGML_GEMMINI_FPGA_SOURCE_DIR}/ggml-gemmini-fpga.cpp"
+    "${GGML_GEMMINI_FPGA_SOURCE_DIR}/uart.cpp"
+    "${GGML_GEMMINI_FPGA_SOURCE_DIR}/window_uart.cpp")
+  target_compile_features(ggml-gemmini PRIVATE cxx_std_20)
+  target_compile_definitions(ggml-gemmini PRIVATE
+    IM2P_FPGA_PROTOCOL_VERSION=3 IM2P_FPGA_BUILD_ID="${GGML_GEMMINI_FPGA_BUILD_ID}")
+  if (DEFINED IM2P_FPGA_DEFAULT_DEVICE AND NOT IM2P_FPGA_DEFAULT_DEVICE STREQUAL "")
+    target_compile_definitions(ggml-gemmini PRIVATE
+      IM2P_FPGA_DEFAULT_DEVICE="${IM2P_FPGA_DEFAULT_DEVICE}")
+  endif()
+  target_include_directories(ggml-gemmini PRIVATE
+    "${GGML_GEMMINI_FPGA_SOURCE_DIR}"
+    "${IM2P_SIM_ROOT}/frontend/include" "${IM2P_SIM_ROOT}/sim/include")
+  target_link_libraries(ggml-gemmini PRIVATE
+    ggml-gemmini-fpga-frontend
+    Threads::Threads ${CMAKE_DL_LIBS} m)
+  # A module with unresolved imports is not a deployable backend.
+  target_link_options(ggml-gemmini PRIVATE -Wl,--no-undefined
+    "-Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/ggml-gemmini.map")
+endif()
+
 if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
   foreach(_IM2P_REQUIRED_VAR IN ITEMS
           IM2P_SIM_ROOT GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE GGML_GEMMINI_IM2P_SIM_ARCHIVE)
@@ -209,9 +250,31 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
 
   find_package(Threads REQUIRED)
   target_sources(ggml-gemmini PRIVATE ggml-gemmini-im2p.cpp)
+  set(_IM2P_FRONTEND_TARGET ggml-gemmini-im2p-frontend)
   if (LLAMA_BUILD_TESTS AND NOT GGML_BACKEND_DL)
     target_include_directories(ggml-gemmini PRIVATE
       "${IM2P_SIM_ROOT}/frontend/tests")
+    # Match the separate testing archive in IM2P's frontend Makefile.
+    add_library(ggml-gemmini-im2p-frontend-testing STATIC
+      "${IM2P_SIM_ROOT}/frontend/src/im2p_gemmini_frontend.cpp")
+    set_target_properties(ggml-gemmini-im2p-frontend-testing PROPERTIES
+      POSITION_INDEPENDENT_CODE ON)
+    target_compile_features(ggml-gemmini-im2p-frontend-testing PRIVATE cxx_std_20)
+    target_compile_options(ggml-gemmini-im2p-frontend-testing PRIVATE -O2 -fno-fast-math)
+    target_compile_definitions(ggml-gemmini-im2p-frontend-testing PRIVATE
+      ${GGML_GEMMINI_COMPILE_DEFS}
+      IM2P_GEMMINI_FRONTEND_TESTING=1
+      IM2P_GEMMINI_FRONTEND_EXPECTED_DIM=${GGML_GEMMINI_DIM}
+      IM2P_GEMMINI_FRONTEND_ACTIVATION_BITS=${GGML_GEMMINI_ACTIVATION_BITS})
+    ggml_gemmini_apply_profile_compile_definitions(ggml-gemmini-im2p-frontend-testing)
+    ggml_gemmini_assert_profile_compile_definitions(ggml-gemmini-im2p-frontend-testing)
+    target_include_directories(ggml-gemmini-im2p-frontend-testing PRIVATE
+      "${IM2P_SIM_ROOT}/frontend/include" "${IM2P_SIM_ROOT}/sim/include"
+      "${GGML_GEMMINI_GENERATED_CONFIG_DIR}" "${CMAKE_CURRENT_LIST_DIR}"
+      "${CMAKE_CURRENT_LIST_DIR}/../../include" "${CMAKE_CURRENT_LIST_DIR}/.."
+      "${CMAKE_CURRENT_LIST_DIR}/../ggml-gemmini-utils/include" "${GEMMINI_SW_PATH}")
+    target_link_libraries(ggml-gemmini-im2p-frontend-testing PRIVATE Threads::Threads)
+    set(_IM2P_FRONTEND_TARGET ggml-gemmini-im2p-frontend-testing)
   endif()
   target_include_directories(ggml-gemmini PRIVATE
     "${IM2P_SIM_ROOT}/frontend/include"
@@ -219,7 +282,7 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
   # Static-library order is intentional: the frontend consumes the C ABI from
   # the simulator archive, and neither archive is present in HARDWARE builds.
   target_link_libraries(ggml-gemmini PRIVATE
-    ggml-gemmini-im2p-frontend
+    ${_IM2P_FRONTEND_TARGET}
     ggml-gemmini-im2p-simulator
     Threads::Threads
     ${CMAKE_DL_LIBS})

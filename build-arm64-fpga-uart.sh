@@ -1,0 +1,12 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export BUILD_DIR=${BUILD_DIR:-build-arm64-fpga-uart}
+export GGML_GEMMINI_EXECUTION_BACKEND=FPGA_UART
+export GGML_GEMMINI_DIM=16
+export GGML_GEMMINI_ACTIVATION_BITS=8
+export GGML_GEMMINI_WEIGHT_BITS=8
+export GGML_GEMMINI_BLOCK_SIZE=32
+export GGML_GEMMINI_ENABLE_RMD=${GGML_GEMMINI_ENABLE_RMD:-OFF}
+exec "$SCRIPT_ROOT/build-arm64.sh" "$@"

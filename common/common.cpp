@@ -3,6 +3,7 @@
 #endif
 
 #include "ggml.h"
+#include "ggml-gemmini.h"
 #include "gguf.h"
 
 #include "common.h"
@@ -359,6 +360,33 @@ void common_init() {
 #endif
 
     LOG_INF("build: %d (%s) with %s for %s%s\n", LLAMA_BUILD_NUMBER, LLAMA_COMMIT, LLAMA_COMPILER, LLAMA_BUILD_TARGET, build_type);
+}
+
+bool common_fpga_execution_check() {
+    const char * setting = std::getenv("IM2P_FPGA_REQUIRE_COMPLETION");
+    if (setting && std::strcmp(setting, "0") != 0 && std::strcmp(setting, "1") != 0) {
+        LOG_ERR("FPGA_UART_VERIFY invalid IM2P_FPGA_REQUIRE_COMPLETION; expected 0 or 1\n");
+        return false;
+    }
+    const bool required = setting && std::strcmp(setting, "1") == 0;
+    auto reg = ggml_backend_reg_by_name("GEMMINI");
+    auto get = reg ? (ggml_gemmini_fpga_stats_v1_fn) ggml_backend_reg_get_proc_address(
+        reg, "ggml_gemmini_fpga_stats_v1") : nullptr;
+    if (!get && !required) return true;
+    ggml_gemmini_fpga_stats_v1 stats{};
+    if (!get || !get(&stats, sizeof(stats))) {
+        LOG_ERR("FPGA_UART_VERIFY failed: selected FPGA_UART runtime counters unavailable\n");
+        return false;
+    }
+    const bool ok = (!required || stats.completed > 0) && stats.failed == 0 &&
+                    stats.assigned == stats.attempted && stats.attempted == stats.completed;
+    if (required || stats.assigned || !ok) {
+        LOG_INF("FPGA_UART_VERIFY assigned=%" PRIu64 " adapter_attempted=%" PRIu64
+                " completed=%" PRIu64 " failed=%" PRIu64 " status=%s "
+                "CAP=not_queried_by_verifier fallback_calls=not_instrumented\n",
+                stats.assigned, stats.attempted, stats.completed, stats.failed, ok ? "PASS" : "FAIL");
+    }
+    return ok;
 }
 
 std::string common_params_get_system_info(const common_params & params) {
@@ -1005,6 +1033,10 @@ struct common_init_result common_init_from_params(common_params & params) {
     }
 
     if (params.warmup) {
+        // Registry inspection is metadata only; it does not initialize a device.
+        auto fpga_reg = ggml_backend_reg_by_name("GEMMINI");
+        const bool fpga_runtime = fpga_reg && ggml_backend_reg_get_proc_address(
+            fpga_reg, "ggml_gemmini_fpga_stats_v1") != nullptr;
         LOG_WRN("%s: warming up the model with an empty run - please wait ... (--no-warmup to disable)\n", __func__);
 
         llama_set_warmup(lctx, true);
@@ -1025,7 +1057,13 @@ struct common_init_result common_init_from_params(common_params & params) {
         }
 
         if (llama_model_has_encoder(model)) {
-            llama_encode(lctx, llama_batch_get_one(tmp.data(), tmp.size()));
+            const int warmup_status = llama_encode(lctx, llama_batch_get_one(tmp.data(), tmp.size()));
+            if (warmup_status != 0 && fpga_runtime) {
+                LOG_ERR("FPGA_UART_WARMUP_FAIL phase=encode status=%d\n", warmup_status);
+                llama_free(lctx);
+                llama_model_free(model);
+                return iparams;
+            }
             llama_token decoder_start_token_id = llama_model_decoder_start_token(model);
             if (decoder_start_token_id == LLAMA_TOKEN_NULL) {
                 decoder_start_token_id = bos;
@@ -1034,7 +1072,13 @@ struct common_init_result common_init_from_params(common_params & params) {
             tmp.push_back(decoder_start_token_id);
         }
         if (llama_model_has_decoder(model)) {
-            llama_decode(lctx, llama_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t) params.n_batch)));
+            const int warmup_status = llama_decode(lctx, llama_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t) params.n_batch)));
+            if (warmup_status != 0 && fpga_runtime) {
+                LOG_ERR("FPGA_UART_WARMUP_FAIL phase=decode status=%d\n", warmup_status);
+                llama_free(lctx);
+                llama_model_free(model);
+                return iparams;
+            }
         }
         llama_kv_self_clear(lctx);
         llama_synchronize(lctx);

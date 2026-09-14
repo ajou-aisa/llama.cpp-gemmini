@@ -1,6 +1,6 @@
 #include "rmd-im2p-executor.hpp"
 
-#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) || defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
 #include <im2p_sim.h>
 
 #include <algorithm>
@@ -19,7 +19,7 @@ namespace ggml::gemmini::rmd::detail {
 std::atomic<size_t> provider_dot_attempts{0};
 #endif
 
-#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) || defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
 namespace {
 
 struct ProviderContext {
@@ -72,10 +72,10 @@ int read_weight_i16(void * opaque, size_t row, size_t column, size_t count,
 }
 
 int write_output(void * opaque, size_t block, size_t row, size_t column,
-                 size_t count, const int64_t * values) {
+                 size_t count, const int64_t * values, uint32_t output_domain) {
     auto * context = static_cast<ProviderContext *>(opaque);
     if (context == nullptr || context->dot == nullptr || values == nullptr ||
-        context->fail_write || block != 0 || row >= context->dot->rows ||
+        context->fail_write || output_domain != 0 || block != 0 || row >= context->dot->rows ||
         column > context->dot->columns || count > context->dot->columns - column) {
         return -1;
     }
@@ -199,6 +199,7 @@ RmdStatus aggregate_stats(const im2p_work_stats_extended_t &stats,
     return checked_accumulate_provider_stats(aggregate.stats, source);
 }
 
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
 int synthetic_execute(const im2p_matmul_desc_t * descriptor,
                       im2p_work_stats_extended_t * stats,
                       Im2pProviderTestFault fault) {
@@ -231,10 +232,10 @@ int synthetic_execute(const im2p_matmul_desc_t * descriptor,
             descriptor->provider.write_output(
                 descriptor->provider.context, 0,
                 fault == Im2pProviderTestFault::output_index ? descriptor->m : i,
-                0, descriptor->n, row.data()) != 0) return IM2P_ERROR;
+                0, descriptor->n, row.data(), descriptor->output_domain) != 0) return IM2P_ERROR;
         if (fault == Im2pProviderTestFault::duplicate_output &&
             descriptor->provider.write_output(descriptor->provider.context, 0, i, 0,
-                                              descriptor->n, row.data()) != 0) return IM2P_ERROR;
+                                              descriptor->n, row.data(), descriptor->output_domain) != 0) return IM2P_ERROR;
     }
     if (stats != nullptr) {
         stats->base.work_total_cycles = fault == Im2pProviderTestFault::stats_overflow
@@ -244,6 +245,7 @@ int synthetic_execute(const im2p_matmul_desc_t * descriptor,
     }
     return IM2P_OK;
 }
+#endif
 
 } // namespace
 #endif
@@ -254,13 +256,14 @@ RmdStatus execute_im2p_compact_dot(
     OutputValue * output,
     size_t output_row_stride,
     Im2pProviderStatsAggregate & aggregate,
-    Im2pProviderTestFault fault) {
-#if !defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    Im2pProviderTestFault fault,
+    const Im2pFullExecutor * executor) {
+#if !defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) && !defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
     (void) sim; (void) dot; (void) output; (void) output_row_stride;
-    (void) aggregate; (void) fault;
+    (void) aggregate; (void) fault; (void) executor;
     return RmdStatus::unsupported_route;
 #else
-    if (sim == nullptr || dot.activations == nullptr || dot.weights == nullptr ||
+    if ((executor != nullptr ? executor->execute == nullptr : sim == nullptr) || dot.activations == nullptr || dot.weights == nullptr ||
         output == nullptr || dot.rows == 0 || dot.columns == 0 || dot.k == 0 ||
         dot.activation_row_stride_bytes < dot.k * (dot.operand_bits == 16 ? sizeof(int16_t) : 1) ||
         (dot.operand_bits == 16 && dot.activation_row_stride_bytes % sizeof(int16_t) != 0) ||
@@ -272,6 +275,10 @@ RmdStatus execute_im2p_compact_dot(
         return RmdStatus::invalid_arguments;
     }
 
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+    if (executor == nullptr || fault != Im2pProviderTestFault::none)
+        return RmdStatus::unsupported_route;
+#endif
     ProviderContext context{};
     context.dot = &dot;
     context.output = output;
@@ -317,9 +324,18 @@ RmdStatus execute_im2p_compact_dot(
 #if defined(GGML_GEMMINI_TESTING)
     provider_dot_attempts.fetch_add(1, std::memory_order_relaxed);
 #endif
-    const int provider_status = fault == Im2pProviderTestFault::none
-        ? im2p_execute_matmul_extended(sim, &descriptor, &stats)
-        : synthetic_execute(&descriptor, &stats, fault);
+    int provider_status = IM2P_ERROR;
+    if (executor != nullptr) {
+        if (fault != Im2pProviderTestFault::none) return RmdStatus::invalid_arguments;
+        provider_status = executor->execute(executor->context, &descriptor, &stats);
+    }
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    else {
+        provider_status = fault == Im2pProviderTestFault::none
+            ? im2p_execute_matmul_extended(sim, &descriptor, &stats)
+            : synthetic_execute(&descriptor, &stats, fault);
+    }
+#endif
     if (provider_status != IM2P_OK) return RmdStatus::execution_failed;
     if (context.seen_count != dot.rows * dot.columns) return RmdStatus::invalid_packet;
     return aggregate_stats(stats, aggregate);

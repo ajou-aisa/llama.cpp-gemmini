@@ -1486,6 +1486,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         std::copy(tensor_split, tensor_split + n_devices(), splits.begin());
     }
 
+    // A single explicitly selected FPGA uses host memory and reports no private
+    // memory. Give it the sole scheduling share without claiming device capacity.
+    if (all_zero && devices.size() == 1 && splits[0] == 0.0f &&
+            ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(devices[0]),
+                "ggml_gemmini_fpga_stats_v1") != nullptr) {
+        splits[0] = 1.0f;
+    }
+
     // sum and normalize the splits to get the split points
     float split_sum = 0.0f;
     for (size_t i = 0; i < n_devices(); ++i) {

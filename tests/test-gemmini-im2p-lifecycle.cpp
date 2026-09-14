@@ -448,6 +448,9 @@ bool test_publication_geometry() {
   const auto a_k3 = execute(2 * DIM + 1, 1, 4 * DIM);
   const auto b_k1 = execute(16 * DIM, 5, 2 * DIM);
   const auto b_k3 = execute(16 * DIM, 5, 4 * DIM);
+  // main_external: K=4*DIM, fragments are bounded by both DIM and K32 blocks.
+  // DIM16/32 therefore have four fragments per work; DIM64 has eight.
+  constexpr size_t k3_fragments_per_work = DIM == 64 ? 8 : 4;
   const auto rows = [](const TestCounters &counters, size_t index) {
     return counters.stripe_row_end[index] - counters.stripe_row_begin[index];
   };
@@ -501,8 +504,8 @@ bool test_publication_geometry() {
                           b_k3.pipeline.stats.rtl_stripes_published == 4 &&
                           a_k3.pipeline.stats.rtl_completed_output_works == 3 &&
                           b_k3.pipeline.stats.rtl_completed_output_works == 16 &&
-                          a_k3.pipeline.stats.rtl_completed_fragments == 24 &&
-                          b_k3.pipeline.stats.rtl_completed_fragments == 128 &&
+                          a_k3.pipeline.stats.rtl_completed_fragments == 3 * k3_fragments_per_work &&
+                          b_k3.pipeline.stats.rtl_completed_fragments == 16 * k3_fragments_per_work &&
                           a_k3.pipeline.stats.rtl_scheduler_groups_completed == 3 &&
                           b_k3.pipeline.stats.rtl_scheduler_groups_completed == 4,
                       "works, scheduler groups, fragments, and publications remain distinct") &&
@@ -513,10 +516,11 @@ bool test_publication_geometry() {
                       "K fragments change fragment stats but never publication count");
   if (ok) {
     std::printf("PUBLICATION_GEOMETRY A_rows=[%d,%d,1] B_rows=[%d,%d,%d,%d] "
-                "A_works/groups/fragments=3/3/24 "
-                "B_works/groups/fragments=16/4/128 full_publications=0 "
+                "A_works/groups/fragments=3/3/%zu "
+                "B_works/groups/fragments=16/4/%zu full_publications=0 "
                 "slots=A[0,1,0],B[0,1,0,1]\n",
-                DIM, DIM, 5 * DIM, 5 * DIM, 5 * DIM, DIM);
+                DIM, DIM, 5 * DIM, 5 * DIM, 5 * DIM, DIM,
+                3 * k3_fragments_per_work, 16 * k3_fragments_per_work);
   }
   return ok;
 }

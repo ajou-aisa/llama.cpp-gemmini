@@ -13,6 +13,10 @@ im2p_provision_host_artifacts() {
   local artifact_set=${IM2P_ARTIFACT_SET:-SELECTED}
   local cache_jobs
   local target
+  local build_args=()
+  if [[ -n "${8:-}" ]]; then
+    build_args+=("BUILD_DIR=$8")
+  fi
 
   case "$artifact_set" in
     SELECTED)
@@ -52,5 +56,41 @@ im2p_provision_host_artifacts() {
     GEMMINI_FRONTEND_WEIGHT_BITS="$weight_bits" \
     GEMMINI_FRONTEND_DIM="$dim" \
     GEMMINI_FRONTEND_BLOCK_SIZE="$block_size" \
+    "${build_args[@]}" \
     "$target"
+}
+
+# Resolve once before provisioning and configure. Python emits only shell-quoted
+# assignments; no argument is executed as shell code.
+im2p_resolve_build_options() {
+  local build_dir=$1
+  local platform=$2
+  shift 2
+  local name resolved
+  local defaults=()
+  while IFS= read -r name; do
+    [[ "$name" == *_DEFAULT ]] || continue
+    defaults+=("${name%_DEFAULT}=${!name}")
+  done < <(compgen -A variable)
+  resolved="$(python3 "$SCRIPT_ROOT/scripts/im2p-build-options.py" \
+    "$build_dir" "$platform" "${defaults[@]}" -- "$@")" || return $?
+  eval "$resolved"
+  if [[ "$GGML_GEMMINI_EXECUTION_BACKEND_DEFAULT" == FPGA_UART &&
+        -n "${GGML_GEMMINI_FPGA_SIM_MANIFEST_DEFAULT:-}" ]]; then
+    printf '%s\n' \
+      'GGML_GEMMINI_FPGA_SIM_MANIFEST is invalid for FPGA_UART; physical external executor uses no simulator archive' >&2
+    return 2
+  fi
+  if [[ "$GGML_GEMMINI_EXECUTION_BACKEND_DEFAULT" == FPGA_UART &&
+        "$IM2P_BUILD_DRY_RUN" != 1 && "$(uname -s)" == Linux ]]; then
+    local machine
+    machine="$(uname -m)"
+    case "$platform:$machine" in
+      build-x86.sh:x86_64|build-arm64.sh:aarch64|build-arm64.sh:arm64|build-arm64-cpu.sh:aarch64|build-arm64-cpu.sh:arm64) ;;
+      *)
+        printf 'FPGA_UART native script/host mismatch: %s on %s; use the matching script or direct CMake with target artifacts\n' "$platform" "$machine" >&2
+        return 2
+        ;;
+    esac
+  fi
 }

@@ -247,7 +247,7 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aar
     add_test(NAME test-gemmini-cycle-reader-aarch64
         COMMAND $<TARGET_FILE:test-gemmini-cycle-reader-aarch64>)
 endif()
-if (LOG_CYCLE AND GGML_CPU_CYCLE_LOG AND TARGET ggml-cpu)
+if (LOG_CYCLE AND GGML_CPU_CYCLE_LOG AND TARGET ggml-cpu AND NOT GGML_BACKEND_DL)
     add_executable(test-ggml-cpu-cycle-sink test-ggml-cpu-cycle-sink.cpp)
     target_link_libraries(test-ggml-cpu-cycle-sink PRIVATE ggml-base ggml-cpu ggml-gemmini-utils)
     target_compile_features(test-ggml-cpu-cycle-sink PRIVATE cxx_std_17)
@@ -281,11 +281,15 @@ if (UNIX AND BUILD_SHARED_LIBS AND LOG_CYCLE AND TARGET ggml-gemmini)
             ${CMAKE_CURRENT_BINARY_DIR}/gemmini-log-cross-image/cycle-log.jsonl
             ${CMAKE_CURRENT_BINARY_DIR}/gemmini-log-cross-image/stderr.txt)
 endif()
-llama_build_and_test(test-gemmini-weight-formats.cpp NAME gemmini_weight_formats)
-target_link_libraries(gemmini_weight_formats PRIVATE ggml-base ggml-gemmini)
-target_compile_definitions(gemmini_weight_formats PRIVATE
-    GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
-    GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE})
+# Direct backend symbols require a linkable backend, not a dlopen MODULE.
+if (NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-gemmini-weight-formats.cpp NAME gemmini_weight_formats)
+    target_link_libraries(gemmini_weight_formats PRIVATE ggml-base ggml-gemmini)
+    target_compile_definitions(gemmini_weight_formats PRIVATE
+        GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+        GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE})
+endif()
+
 add_test(NAME test-gemmini-weight-reader-callers
     COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-weight-reader-callers.cmake)
 
@@ -662,34 +666,41 @@ add_test(NAME gemmini-exsia-output-invalid-parent
         $<TARGET_FILE:test-gemmini-exsia-writer> --profile-output blocked/detail.jsonl --invalid-parent)
 set_tests_properties(gemmini-exsia-output-invalid-parent PROPERTIES WORKING_DIRECTORY "${GEMMINI_WRITER_TEST_ROOT}/exsia-invalid")
 
-add_executable(test-gemmini-rmd
-    test-gemmini-rmd.cpp
-    ../ggml/src/ggml-gemmini/residual/direct/direct-executor.cpp
-    ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp)
-target_link_libraries(test-gemmini-rmd PRIVATE ggml-base ggml-gemmini ggml-gemmini-utils)
-target_compile_features(test-gemmini-rmd PRIVATE cxx_std_17)
-target_compile_definitions(test-gemmini-rmd PRIVATE
-    GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
-    GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE})
-target_include_directories(test-gemmini-rmd PRIVATE
-    ../ggml/src
-    ../ggml/src/ggml-gemmini
-    ../ggml/src/ggml-gemmini/residual/rmd
-    ${GEMMINI_SW_PATH}
-    ${GEMMINI_SW_PATH}/include)
-add_test(NAME test-gemmini-rmd COMMAND $<TARGET_FILE:test-gemmini-rmd>)
-add_test(NAME test-gemmini-rmd-direct-happy
-    COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=direct-happy)
-add_test(NAME test-gemmini-rmd-direct-failure
-    COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=direct-failure)
-add_test(NAME test-gemmini-rmd-compact-happy
-    COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=compact-happy)
-add_test(NAME test-gemmini-rmd-compact-failure
-    COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=compact-failure)
-add_test(NAME test-gemmini-rmd-radix-happy
-    COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=radix-happy)
-add_test(NAME test-gemmini-rmd-radix-failure
-    COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=radix-failure)
+# Direct backend symbols require a linkable backend, not a dlopen MODULE.
+if (NOT GGML_BACKEND_DL)
+    add_executable(test-gemmini-rmd
+        test-gemmini-rmd.cpp
+        ../ggml/src/ggml-gemmini/residual/direct/direct-executor.cpp
+        ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp)
+    target_link_libraries(test-gemmini-rmd PRIVATE ggml-base ggml-gemmini ggml-gemmini-utils)
+    target_compile_features(test-gemmini-rmd PRIVATE cxx_std_17)
+    target_compile_definitions(test-gemmini-rmd PRIVATE
+        GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+        GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE})
+    if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "FPGA_UART")
+        target_compile_definitions(test-gemmini-rmd PRIVATE
+            GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART=1)
+    endif()
+    target_include_directories(test-gemmini-rmd PRIVATE
+        ../ggml/src
+        ../ggml/src/ggml-gemmini
+        ../ggml/src/ggml-gemmini/residual/rmd
+        ${GEMMINI_SW_PATH}
+        ${GEMMINI_SW_PATH}/include)
+    add_test(NAME test-gemmini-rmd COMMAND $<TARGET_FILE:test-gemmini-rmd>)
+    add_test(NAME test-gemmini-rmd-direct-happy
+        COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=direct-happy)
+    add_test(NAME test-gemmini-rmd-direct-failure
+        COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=direct-failure)
+    add_test(NAME test-gemmini-rmd-compact-happy
+        COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=compact-happy)
+    add_test(NAME test-gemmini-rmd-compact-failure
+        COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=compact-failure)
+    add_test(NAME test-gemmini-rmd-radix-happy
+        COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=radix-happy)
+    add_test(NAME test-gemmini-rmd-radix-failure
+        COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=radix-failure)
+endif()
 
 add_executable(test-gemmini-rmd-packet
     test-gemmini-rmd-packet.cpp
@@ -750,27 +761,31 @@ target_include_directories(test-gemmini-production-host-backend PRIVATE
 add_test(NAME test-gemmini-production-host
     COMMAND $<TARGET_FILE:test-gemmini-production-host-backend>)
 
-add_executable(test-gemmini-rmd-telemetry
-    test-gemmini-rmd-telemetry.cpp)
-target_link_libraries(test-gemmini-rmd-telemetry PRIVATE
-    ggml-gemmini ggml-base ggml-gemmini-utils)
-target_compile_features(test-gemmini-rmd-telemetry PRIVATE cxx_std_17)
-target_compile_definitions(test-gemmini-rmd-telemetry PRIVATE
-    GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
-    GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
-    LOG_DEBUG=${LOG_DEBUG}
-    LOG_CYCLE=${LOG_CYCLE}
-    CYCLE_DETAIL=${CYCLE_DETAIL})
-target_include_directories(test-gemmini-rmd-telemetry PRIVATE
-    ../ggml/include ../ggml/src ../ggml/src/ggml-gemmini
-    ../ggml/src/ggml-gemmini-utils/include ${GGML_GEMMINI_GENERATED_CONFIG_DIR}
-    ${IM2P_SIM_ROOT}/frontend/include ${IM2P_SIM_ROOT}/sim/include
-    ${GEMMINI_SW_PATH} ${GEMMINI_SW_PATH}/include)
-add_test(NAME test-gemmini-rmd-telemetry
-    COMMAND $<TARGET_FILE:test-gemmini-rmd-telemetry>)
-add_test(NAME test-gemmini-aggregate-cycle-driver
-    COMMAND $<TARGET_FILE:test-gemmini-rmd-telemetry> --aggregate-driver
-            ${CMAKE_CURRENT_BINARY_DIR}/gemmini-aggregate-driver/cycle-log.jsonl)
+# Direct backend symbols require a linkable backend, not a dlopen MODULE.
+if (NOT GGML_BACKEND_DL)
+    add_executable(test-gemmini-rmd-telemetry
+        test-gemmini-rmd-telemetry.cpp)
+    target_link_libraries(test-gemmini-rmd-telemetry PRIVATE
+        ggml-gemmini ggml-base ggml-gemmini-utils)
+    target_compile_features(test-gemmini-rmd-telemetry PRIVATE cxx_std_17)
+    target_compile_definitions(test-gemmini-rmd-telemetry PRIVATE
+        GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+        GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
+        LOG_DEBUG=${LOG_DEBUG}
+        LOG_CYCLE=${LOG_CYCLE}
+        CYCLE_DETAIL=${CYCLE_DETAIL})
+    target_include_directories(test-gemmini-rmd-telemetry PRIVATE
+        ../ggml/include ../ggml/src ../ggml/src/ggml-gemmini
+        ../ggml/src/ggml-gemmini-utils/include ${GGML_GEMMINI_GENERATED_CONFIG_DIR}
+        ${IM2P_SIM_ROOT}/frontend/include ${IM2P_SIM_ROOT}/sim/include
+        ${GEMMINI_SW_PATH} ${GEMMINI_SW_PATH}/include)
+    add_test(NAME test-gemmini-rmd-telemetry
+        COMMAND $<TARGET_FILE:test-gemmini-rmd-telemetry>)
+    add_test(NAME test-gemmini-aggregate-cycle-driver
+        COMMAND $<TARGET_FILE:test-gemmini-rmd-telemetry> --aggregate-driver
+                ${CMAKE_CURRENT_BINARY_DIR}/gemmini-aggregate-driver/cycle-log.jsonl)
+endif()
+
 add_executable(test-gemmini-rmd-reducer
     test-gemmini-rmd-telemetry.cpp
     ../ggml/src/ggml-gemmini/ggml-gemmini-telemetry.cpp)
@@ -819,6 +834,9 @@ add_test(NAME test-gemmini-telemetry-clock-gate
 option(GEMMINI_BUILD_SRMD_RAW_WS_TESTS
     "Build the raw-WS SRMD tests against the configured Gemmini headers"
     OFF)
+if (GEMMINI_BUILD_SRMD_RAW_WS_TESTS AND GGML_BACKEND_DL)
+    message(FATAL_ERROR "Raw WS tests link backend symbols directly; use GGML_BACKEND_DL=OFF")
+endif()
 if (GEMMINI_BUILD_SRMD_RAW_WS_TESTS)
     set(GEMMINI_SRMD_RAW_WS_HEADER "")
     foreach(_header IN ITEMS
@@ -1108,17 +1126,17 @@ add_test(NAME test-gemmini-profiled-domain-contract
 set(_GEMMINI_REGISTERED_TEST_EXECUTABLES
     test-gemmini-log
     test-gemmini-log-boundary
-    gemmini_weight_formats
     test-gemmini-act-quant-i32-saturation
     test-gemmini-exsia
     test-gemmini-exsia-writer
-    test-gemmini-rmd
     test-gemmini-rmd-packet
     test-gemmini-production-host-backend
-    test-gemmini-rmd-telemetry
     test-gemmini-rmd-reducer
     gemmini-quant-dispatch-smoke)
 foreach(_GEMMINI_OPTIONAL_TEST_EXECUTABLE IN ITEMS
+        gemmini_weight_formats
+        test-gemmini-rmd
+        test-gemmini-rmd-telemetry
         gemmini_q8_h1_h2_dequant_fp
         gemmini_width_h1_dequant_fp
         test-gemmini-srmd-raw-ws
@@ -1159,3 +1177,19 @@ target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
+
+# This test deliberately links no simulator archive: injected compact execution
+# must work with a null simulator and reject incomplete or duplicate outputs.
+if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "FPGA_UART")
+    add_executable(test-gemmini-rmd-executor
+        test-gemmini-rmd-executor.cpp
+        ../ggml/src/ggml-gemmini/residual/rmd/rmd-im2p-executor.cpp)
+    target_compile_features(test-gemmini-rmd-executor PRIVATE cxx_std_17)
+    target_compile_definitions(test-gemmini-rmd-executor PRIVATE ${GGML_GEMMINI_COMPILE_DEFS})
+    target_include_directories(test-gemmini-rmd-executor PRIVATE
+        "${GGML_GEMMINI_GENERATED_CONFIG_DIR}"
+        "${IM2P_SIM_ROOT}/sim/include"
+        "${GEMMINI_SW_PATH}" "${GEMMINI_SW_PATH}/include"
+        ../ggml/src/ggml-gemmini ../ggml/src/ggml-gemmini-utils/include ../ggml/include)
+    add_test(NAME test-gemmini-rmd-executor COMMAND $<TARGET_FILE:test-gemmini-rmd-executor>)
+endif()

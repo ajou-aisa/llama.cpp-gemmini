@@ -15,6 +15,7 @@
 #include <memory>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -863,7 +864,9 @@ bool test_direct_oracle_happy_matrix() {
     for (const DirectOracleCase & test : kDirectOracleCases) {
         DirectOracleFixture fixture(test.bits, test.family);
         rmd::DirectOutput actual = rmd::PreScaledFloat64Correction{{91.5, -27.25}};
-        residual::DirectExecutionMetrics metrics{71, 73};
+        residual::DirectExecutionMetrics metrics{};
+        metrics.event_count = 71;
+        metrics.call_count = 73;
         const rmd::RmdStatus status = fixture.payload == nullptr ? rmd::RmdStatus::invalid_packet :
             residual::execute_direct_stripe(fixture.args, *fixture.payload, actual, &metrics);
         bool case_ok = check(status == rmd::RmdStatus::success,
@@ -1745,6 +1748,19 @@ bool test_shared_weight_preparation() {
         packets[stripe] = builder.finish();
         if (!packets[stripe]) return false;
     }
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+    Correction rejected = PreScaledFloat64Correction{{19.0}};
+    const Correction rejected_sentinel = rejected;
+    RmdExecutionMetrics rejected_metrics{};
+    rejected_metrics.packet_call_count = 73;
+    rmd::detail::RmdWeightPreparation rejected_weights;
+    return check(rmd::detail::execute_rmd_stripe_ws_with_weights(
+                     stripe_args[0], *packets[0], rejected, rejected_weights,
+                     &rejected_metrics) == RmdStatus::unsupported_route &&
+                     direct_outputs_match(rejected, rejected_sentinel) &&
+                     rejected_metrics.packet_call_count == 73,
+                 "FPGA UART rejects shared WS execution without CPU fallback");
+#endif
     std::array<Correction, 3> corrections;
     std::array<RmdStatus, 3> statuses{};
     std::array<float, 3> shared_output{7, 7, 7};
@@ -2297,6 +2313,11 @@ int main(int argc, char ** argv) {
             stderr);
         return 2;
     }
+
+    // Native H0 readers use the FP16 tables initialized by ggml_init.
+    ggml_context * context = ggml_init({0, nullptr, true});
+    if (!check(context != nullptr, "GGML initialization succeeds")) return 1;
+    ggml_free(context);
 
     bool ok = true;
     if (selection == TestSelection::all || selection == TestSelection::happy_table) {
