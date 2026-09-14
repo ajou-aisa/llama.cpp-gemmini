@@ -72,6 +72,14 @@ def resolve(build_dir, platform, defaults, args, environment):
     for label, level in (('cache', cache), ('environment', env), ('command-line', cli)):
         effective.update(level)
         origin.update({key: label for key in level})
+    # Backend selected by the script is lane intent, not a reusable cache
+    # default. An explicit environment/CLI selection may override it; a stale
+    # cache may not silently switch lanes and trigger provisioning.
+    if ('GGML_GEMMINI_EXECUTION_BACKEND' not in env and
+            'GGML_GEMMINI_EXECUTION_BACKEND' not in cli and
+            'GGML_GEMMINI_EXECUTION_BACKEND' in defaults):
+        effective['GGML_GEMMINI_EXECUTION_BACKEND'] = defaults['GGML_GEMMINI_EXECUTION_BACKEND']
+        origin['GGML_GEMMINI_EXECUTION_BACKEND'] = 'default'
     if origin.get('GGML_CPU_CYCLE_LOG', 'default') == 'default':
         effective['GGML_CPU_CYCLE_LOG'] = effective.get('LOG_CYCLE', '0')
         origin['GGML_CPU_CYCLE_LOG'] = 'derived-default:LOG_CYCLE'
@@ -82,6 +90,8 @@ def resolve(build_dir, platform, defaults, args, environment):
     if platform == 'build-riscv.sh' and backend != 'HARDWARE':
         raise ValueError('build-riscv.sh is the HARDWARE lane; FPGA_UART uses the native x86/ARM64 script')
     if backend == 'FPGA_UART':
+        if effective.get('GGML_GEMMINI_FPGA_SIM_MANIFEST'):
+            raise ValueError('GGML_GEMMINI_FPGA_SIM_MANIFEST is invalid for FPGA_UART; physical external executor uses no simulator archive')
         for name, required in FPGA.items():
             if name == 'GGML_GEMMINI_ACTIVATION_QUANT' and origin.get(name, 'default') != 'default':
                 effective[name] = effective[name].upper()
@@ -127,7 +137,7 @@ def main():
         return 2
     summary = {'build_dir': str(Path(build_dir).resolve()), 'precedence': ['command-line', 'environment', 'cache', 'default'],
                'dry_run': dry, 'effective': effective, 'origin': origin,
-               'provisioning': 'matching IM2P_SIM cache' if effective.get('GGML_GEMMINI_EXECUTION_BACKEND') == 'IM2P_SIM' else ('none; explicit FPGA manifest verified by CMake' if effective.get('GGML_GEMMINI_FPGA_SIM_MANIFEST') else 'matching FPGA profile in BUILD_DIR/im2p-native; pin immutable generation') if effective.get('GGML_GEMMINI_EXECUTION_BACKEND') == 'FPGA_UART' else 'none'}
+               'provisioning': 'matching IM2P_SIM cache' if effective.get('GGML_GEMMINI_EXECUTION_BACKEND') == 'IM2P_SIM' else 'none; FPGA_UART uses physical external executor' if effective.get('GGML_GEMMINI_EXECUTION_BACKEND') == 'FPGA_UART' else 'none'}
     print('IM2P_EFFECTIVE_CONFIG=' + json.dumps(summary, sort_keys=True), file=sys.stderr)
     for name, value in effective.items():
         if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name):

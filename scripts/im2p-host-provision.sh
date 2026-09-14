@@ -76,6 +76,12 @@ im2p_resolve_build_options() {
     "$build_dir" "$platform" "${defaults[@]}" -- "$@")" || return $?
   eval "$resolved"
   if [[ "$GGML_GEMMINI_EXECUTION_BACKEND_DEFAULT" == FPGA_UART &&
+        -n "${GGML_GEMMINI_FPGA_SIM_MANIFEST_DEFAULT:-}" ]]; then
+    printf '%s\n' \
+      'GGML_GEMMINI_FPGA_SIM_MANIFEST is invalid for FPGA_UART; physical external executor uses no simulator archive' >&2
+    return 2
+  fi
+  if [[ "$GGML_GEMMINI_EXECUTION_BACKEND_DEFAULT" == FPGA_UART &&
         "$IM2P_BUILD_DRY_RUN" != 1 && "$(uname -s)" == Linux ]]; then
     local machine
     machine="$(uname -m)"
@@ -86,17 +92,5 @@ im2p_resolve_build_options() {
         return 2
         ;;
     esac
-    if [[ -z "${GGML_GEMMINI_FPGA_SIM_MANIFEST_DEFAULT:-}" ]]; then
-      local native_dir
-      native_dir="$(realpath -m -- "$build_dir/im2p-native")" || return $?
-      im2p_provision_host_artifacts \
-        "$IM2P_SIM_ROOT_DEFAULT" "$SCRIPT_ROOT" "$BUILD_JOBS_DEFAULT" \
-        "$GGML_GEMMINI_ACTIVATION_BITS_DEFAULT" "$GGML_GEMMINI_WEIGHT_BITS_DEFAULT" \
-        "$GGML_GEMMINI_DIM_DEFAULT" "$GGML_GEMMINI_BLOCK_SIZE_DEFAULT" "$native_dir" || return $?
-      # Resolve selected/current once; CMake verifies the immutable generation.
-      GGML_GEMMINI_FPGA_SIM_MANIFEST_DEFAULT="$(realpath -e -- \
-        "$native_dir/selected/a8-w8-d16/current/real-lib.json")" || return $?
-      IM2P_EFFECTIVE_CMAKE_ARGS+=("-DGGML_GEMMINI_FPGA_SIM_MANIFEST:FILEPATH=$GGML_GEMMINI_FPGA_SIM_MANIFEST_DEFAULT")
-    fi
   fi
 }

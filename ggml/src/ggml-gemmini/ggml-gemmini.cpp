@@ -2721,6 +2721,17 @@ static ggml_guid_t ggml_backend_gemmini_guid(void) {
 ggml_backend_t ggml_backend_gemmini_init(void) {
     ggml_backend_gemmini_context * ctx = new ggml_backend_gemmini_context;
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+    ggml::gemmini::log::debug("backend",
+        "compiled_backend=FPGA_UART device=%s connection=not_opened",
+        std::getenv("IM2P_FPGA_DEVICE") ? std::getenv("IM2P_FPGA_DEVICE") : "<unset>");
+#elif defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    ggml::gemmini::log::debug("backend",
+        "compiled_backend=IM2P_SIM transport=Verilator physical_fpga=0");
+#else
+    ggml::gemmini::log::debug("backend",
+        "compiled_backend=HARDWARE physical_fpga_uart=0");
+#endif
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
     static std::once_flag identity_once;
     std::call_once(identity_once, [] {
         const char * device = std::getenv("IM2P_FPGA_DEVICE");
@@ -3310,6 +3321,11 @@ static const struct ggml_backend_reg_i ggml_backend_gemmini_reg_i = {
 };
 
 ggml_backend_reg_t ggml_backend_gemmini_reg(void) {
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART) && defined(IM2P_FPGA_DEFAULT_DEVICE)
+    if (!std::getenv("IM2P_FPGA_DEVICE")) {
+        setenv("IM2P_FPGA_DEVICE", IM2P_FPGA_DEFAULT_DEVICE, 0);
+    }
+#endif
     static struct ggml_backend_reg ggml_backend_gemmini_reg = {
         /* .api_version = */ GGML_BACKEND_API_VERSION,
         /* .iface       = */ ggml_backend_gemmini_reg_i,
