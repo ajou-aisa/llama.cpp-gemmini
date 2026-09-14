@@ -92,7 +92,7 @@ namespace
         ggml::gemmini::config::ActivationQuantAlgo::TOKEN;
     constexpr const char * fpga_native_formats = fpga_exsia ? "Q8_H1,Q8_HP1,Q8_0" :
         fpga_token ? "Q8_CHANNEL" : "Q8_H1,Q8_HP1,Q8_0,Q8_CHANNEL";
-    constexpr const char * fpga_output_domains = fpga_exsia ? "1" : fpga_token ? "0" : "0,1";
+    constexpr const char * fpga_output_domains = fpga_exsia ? "1,2" : fpga_token ? "0" : "0,1,2";
     bool gemmini_fpga_native_weight_supported(ggml_type type) {
         constexpr auto activation = ggml::gemmini::config::CURRENT_ACTIVATION_QUANT;
         constexpr bool exsia = activation == ggml::gemmini::config::ActivationQuantAlgo::EXSIA;
@@ -2175,7 +2175,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             if (!quantize_activation()) {
                 throw std::runtime_error("existing activation quantizer failed");
             }
-        }, layer);
+        }, layer, src0->type == GGML_TYPE_Q8_H1 || src0->type == GGML_TYPE_Q8_HP1);
         if (success) ++fpga_completed;
         if (!success) {
             GGML_LOG_ERROR("FPGA_UART execution failed: %s\n", ggml_gemmini_fpga_last_error().c_str());
@@ -2736,15 +2736,15 @@ ggml_backend_t ggml_backend_gemmini_init(void) {
     std::call_once(identity_once, [] {
         const char * device = std::getenv("IM2P_FPGA_DEVICE");
         if (ggml_gemmini_fpga_uses_rtl())
-            GGML_LOG_INFO("FPGA_RTL_BUILD ABI=5 plugin_api=1 domain=%s numerical=%s "
+            GGML_LOG_INFO("FPGA_RTL_BUILD ABI=5 plugin_api=1 domain=descriptor_selected numerical=%s "
                           "A8/W8/D16 native=%s activation=" GGML_GEMMINI_ACTIVATION_QUANT_NAME
                           " RMD=%s device_explicit=1 plugin=not_opened\n",
-                          fpga_output_domains, fpga_exsia ? "main_external" : "main_provider", fpga_native_formats, GGML_GEMMINI_ENABLE_RMD ? "ON" : "OFF");
+                          std::getenv("IM2P_FPGA_NUMERICAL_CONTRACT") ? std::getenv("IM2P_FPGA_NUMERICAL_CONTRACT") : "native_scu_final_integer", fpga_native_formats, GGML_GEMMINI_ENABLE_RMD ? "ON" : "OFF");
         else if (ggml_gemmini_fpga_uses_bounded())
-            GGML_LOG_INFO("FPGA_UART_BUILD ABI=5 protocol=IFR4 domain=%s numerical=%s "
+            GGML_LOG_INFO("FPGA_UART_BUILD ABI=5 protocol=IFR4 domain=descriptor_selected numerical=%s "
                           "A8/W8/D16 native=%s activation=" GGML_GEMMINI_ACTIVATION_QUANT_NAME
                           " RMD=%s device_explicit=1 CAP=not_queried\n",
-                          fpga_output_domains, fpga_exsia ? "main_external" : "main_provider", fpga_native_formats, GGML_GEMMINI_ENABLE_RMD ? "ON" : "OFF");
+                          std::getenv("IM2P_FPGA_NUMERICAL_CONTRACT") ? std::getenv("IM2P_FPGA_NUMERICAL_CONTRACT") : "native_scu_final_integer", fpga_native_formats, GGML_GEMMINI_ENABLE_RMD ? "ON" : "OFF");
         else if (!fpga_exsia || GGML_GEMMINI_ENABLE_RMD)
             GGML_LOG_INFO("FPGA_UART_BUILD ABI=5 transport=bounded_required domain=%s native=%s "
                           "activation=" GGML_GEMMINI_ACTIVATION_QUANT_NAME " RMD=%s "

@@ -32,6 +32,7 @@ file(WRITE "${_fpga_probe}" [=[
 #include <cstdint>
 static_assert(IM2P_ABI_VERSION == 5 && IM2P_OUTPUT_SCU_FINAL == 2);
 static_assert(IM2P_VECTOR_UNSIGNED_MULTIPLY == 4);
+static_assert(IM2P_VECTOR_LEFT_SHIFT == 5);
 static_assert(sizeof(*im2p_matmul_desc_t{}.scales) == 4);
 static_assert(std::bit_cast<std::uint32_t>(1.0f) == 0x3f800000u);
 int main() { return 0; }
@@ -50,7 +51,7 @@ endif()
 
 # The cache key records source/ABI/artifact/compiler/target and linkage mode.
 # Source changes require a new binary directory, retaining the failed attempt.
-set(_fpga_identity "ABI5;IFR3;signed-scu-sat-v2;H1;domain2;IFR4;RTL_PLUGIN1;main_external;H1,HP1;domain1;A8/W8/D16;block32;RMD_${GGML_GEMMINI_ENABLE_RMD}\n")
+set(_fpga_identity "ABI5;IFR3;signed-scu-sat-v2;H1;domain2;IFR4;RTL_PLUGIN1;scu_final_integer;H1:op4,HP1:op5;domain2;explicit_main_external:domain1;A8/W8/D16;block32;RMD_${GGML_GEMMINI_ENABLE_RMD}\n")
 set(_fpga_inputs
         "${IM2P_SIM_ROOT}/sim/include/im2p_sim.h"
         "${IM2P_SIM_ROOT}/frontend/include/im2p_gemmini_frontend.hpp"
@@ -127,5 +128,5 @@ set(GGML_GEMMINI_FPGA_CONFIG_FINGERPRINT "${_fpga_fingerprint}" CACHE INTERNAL "
 set(GGML_GEMMINI_FPGA_BUILD_ID "${_fpga_fingerprint}")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/fpga-build-contract.txt"
     "${_fpga_identity}fingerprint=${_fpga_fingerprint}\nabi_runtime=${GGML_GEMMINI_FPGA_ABI_RUNTIME}\n")
-message(STATUS "GEMMINI backend=FPGA_UART ABI5 IFR3 H1 domain2; rtl: H1/HP1 main_external domain1; RMD=${GGML_GEMMINI_ENABLE_RMD} ABI_RUNTIME=${GGML_GEMMINI_FPGA_ABI_RUNTIME}")
+message(STATUS "GEMMINI backend=FPGA_UART ABI5 IFR3 H1 domain2; IFR4/rtl native H1 op4, HP1 op5, SCU final domain2; explicit main_external domain1; RMD=${GGML_GEMMINI_ENABLE_RMD} (SCU residual merge unavailable) ABI_RUNTIME=${GGML_GEMMINI_FPGA_ABI_RUNTIME}")
 message(STATUS "GEMMINI FPGA provisioning: none; physical external executor")

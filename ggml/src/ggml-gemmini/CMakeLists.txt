@@ -216,7 +216,8 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "FPGA_UART")
     ggml-gemmini-fpga-frontend
     Threads::Threads ${CMAKE_DL_LIBS} m)
   # A module with unresolved imports is not a deployable backend.
-  target_link_options(ggml-gemmini PRIVATE -Wl,--no-undefined)
+  target_link_options(ggml-gemmini PRIVATE -Wl,--no-undefined
+    "-Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/ggml-gemmini.map")
 endif()
 
 if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
