@@ -223,7 +223,7 @@ foreach(operation IN ITEMS
         im2p.fence_host_call
         im2p.residual_metadata_preparation
         im2p.residual_backend_host_call
-        im2p.residual_result_reconstruction
+        im2p.residual_simulator_host_call
         im2p.output_correction_apply
         im2p.post_fence_validation
         im2p.output_authorize_host_call

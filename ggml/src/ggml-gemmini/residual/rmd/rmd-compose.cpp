@@ -49,27 +49,6 @@ bool finite_double_representation(double value) {
         UINT64_C(0x7ff0000000000000);
 }
 
-RmdStatus check_offsets(const StripePacket & packet, const CompressedOutput & output) {
-    if (output.domain != CompressedOutput::Domain::block_scaled_int64 ||
-        output.j_padded != packet.j_padded ||
-        output.values.size() != packet.total_output_values) {
-        return RmdStatus::invalid_arguments;
-    }
-
-    size_t cursor = 0;
-    for (const BlockDescriptor & block : packet.blocks) {
-        if (block.output_value_offset != cursor) {
-            return RmdStatus::invalid_packet; // overlapping or gapped block regions
-        }
-        const size_t span = static_cast<size_t>(block.active_lane_count) * block.lane_stride_values;
-        if (cursor > output.values.size() || span > output.values.size() - cursor) {
-            return RmdStatus::invalid_packet;
-        }
-        cursor += span;
-    }
-    return cursor == output.values.size() ? RmdStatus::success : RmdStatus::invalid_packet;
-}
-
 }
 
 RmdStatus compose_rmd_output(const StripePacket & packet,
@@ -79,14 +58,10 @@ RmdStatus compose_rmd_output(const StripePacket & packet,
     if (validation != RmdStatus::success) {
         return validation;
     }
-    const RmdStatus offsets = check_offsets(packet, output);
-    if (offsets != RmdStatus::success) {
-        return offsets;
-    }
-
-    const BalancedRadixContract contract = balanced_radix_contract(packet.digit_bits);
-    if (contract.radix == 0 || packet.lane_capacity != contract.lane_capacity) {
-        return RmdStatus::invalid_packet;
+    if (output.domain != CompressedOutput::Domain::block_scaled_int64 ||
+        output.j_padded != packet.j_padded ||
+        output.values.size() != packet.total_output_values) {
+        return RmdStatus::invalid_arguments;
     }
 
     size_t value_count = 0;
@@ -104,31 +79,23 @@ RmdStatus compose_rmd_output(const StripePacket & packet,
         for (size_t j = 0; j < packet.logical_j; ++j) {
             __int128 total = 0;
             for (const BlockDescriptor & block : packet.blocks) {
-                __int128 block_value = 0;
-                size_t lane_position = block.active_lane_count;
-                for (uint8_t lane = packet.lane_capacity; lane-- > 0;) {
-                    if (__builtin_mul_overflow(
-                            block_value, static_cast<__int128>(contract.radix),
-                            &block_value)) {
-                        return RmdStatus::overflow;
-                    }
-                    if (lane_position != 0 &&
-                        block.lane_ids[lane_position - 1] == lane) {
-                        --lane_position;
-                        const size_t lane_base = block.output_value_offset +
-                            lane_position * block.lane_stride_values;
-                        const OutputValue source = output.values[
-                            lane_base + row * output.j_padded + j];
-                        if (__builtin_add_overflow(
-                                block_value, static_cast<__int128>(source),
-                                &block_value)) {
+                for (uint8_t lane_position = 0;
+                     lane_position < block.active_lane_count; ++lane_position) {
+                    const uint8_t lane = block.lane_ids[lane_position];
+                    const size_t lane_base = block.output_value_offset +
+                        lane_position * block.lane_stride_values;
+                    __int128 contribution = output.values[
+                        lane_base + row * output.j_padded + j];
+                    if (lane != 0) {
+                        const __int128 place = static_cast<__int128>(1) <<
+                            (packet.digit_bits * lane);
+                        if (__builtin_mul_overflow(contribution, place, &contribution)) {
                             return RmdStatus::overflow;
                         }
                     }
-                }
-                if (lane_position != 0 ||
-                    __builtin_add_overflow(total, block_value, &total)) {
-                    return RmdStatus::overflow;
+                    if (__builtin_add_overflow(total, contribution, &total)) {
+                        return RmdStatus::overflow;
+                    }
                 }
             }
             if (total > kInt64Max || total < kInt64Min) {
@@ -141,20 +108,6 @@ RmdStatus compose_rmd_output(const StripePacket & packet,
     Correction staged = BlockScaledInt64Correction{std::move(staged_correction)};
     correction.swap(staged);
     return RmdStatus::success;
-}
-
-RmdStatus apply_rmd_packet_ws(const ggml_gemmini_args_t & args, const StripePacket & packet) {
-    CompressedOutput output;
-    RmdStatus status = execute_rmd_stripe_ws(args, packet, output);
-    if (status != RmdStatus::success) {
-        return status;
-    }
-    Correction correction = BlockScaledInt64Correction{};
-    status = compose_rmd_output(packet, output, correction);
-    if (status != RmdStatus::success) {
-        return status;
-    }
-    return merge_rmd_correction(args, packet, correction);
 }
 
 RmdStatus expand_packets_to_plane(
@@ -312,22 +265,39 @@ RmdStatus prepare_merge_layout(const ggml_gemmini_args_t & args,
     return RmdStatus::success;
 }
 
-bool common_column_scale_matches(const ggml_gemmini_args_t & args,
-                                 const wroute::WeightRoutePlan & plan,
-                                 size_t j,
-                                 size_t block_id) {
+RmdStatus prepare_column_scales(const ggml_gemmini_args_t & args,
+                                const wroute::WeightRoutePlan & plan,
+                                const StripePacket * packet,
+                                std::vector<float> & column_scale) {
     if (plan.route != wroute::WeightRouteKind::H1 &&
-        plan.route != wroute::WeightRouteKind::HP1) {
-        return true;
+        plan.route != wroute::WeightRouteKind::HP1) return RmdStatus::success;
+    try {
+        column_scale.resize(args.J);
+    } catch (const std::bad_alloc &) {
+        return RmdStatus::allocation_failure;
     }
-    const wreader::WeightScaleResult reference =
-        wreader::read_scale(args, plan, j, 0);
-    const wreader::WeightScaleResult current =
-        wreader::read_scale(args, plan, j, block_id);
-    return reference.ok() && current.ok() &&
-        reference.domain == wroute::WeightScaleDomain::IntegerBlockTimesColumn &&
-        current.domain == reference.domain &&
-        current.column_scale == reference.column_scale;
+    for (size_t j = 0; j < args.J; ++j) {
+        const auto reference = wreader::read_scale_validated(args, plan, j, 0);
+        if (!reference.ok() || reference.domain !=
+                wroute::WeightScaleDomain::IntegerBlockTimesColumn) {
+            return RmdStatus::unsupported_route;
+        }
+        // Cache the column factor for all rows, but verify it matches each relevant block.
+        // Packet merges check selected blocks; callers without a packet check every block.
+        column_scale[j] = reference.column_scale;
+        const size_t block_count = packet != nullptr ? packet->blocks.size() : plan.scales.cols;
+        for (size_t block = 0; block < block_count; ++block) {
+            const size_t block_id = packet != nullptr ? packet->blocks[block].block_id : block;
+            if (block_id == 0) continue;
+            const auto current = wreader::read_scale_validated(args, plan, j, block_id);
+            if (!current.ok() || current.domain != reference.domain ||
+                current.column_scale != reference.column_scale) {
+                return RmdStatus::unsupported_route;
+            }
+        }
+        if (!finite_float_representation(column_scale[j])) return RmdStatus::unsupported_route;
+    }
+    return RmdStatus::success;
 }
 
 double saturate_signed_32(double value) {
@@ -340,7 +310,9 @@ double saturate_signed_32(double value) {
 RmdStatus merge_rmd_correction_checked(const ggml_gemmini_args_t & args,
                                        const MergeLayout & layout,
                                        const wroute::WeightRoutePlan & plan,
-                                       const Correction & correction) {
+                                       const std::vector<float> & prepared_column_scale,
+                                       const Correction & correction,
+                                       size_t * nonzero_count) {
     const auto * integer = std::get_if<BlockScaledInt64Correction>(&correction);
     const auto * floating = std::get_if<PreScaledFloat64Correction>(&correction);
     const bool integer_route =
@@ -359,20 +331,22 @@ RmdStatus merge_rmd_correction_checked(const ggml_gemmini_args_t & args,
         return RmdStatus::invalid_arguments;
     }
 
-    std::vector<float> column_scale;
+    const bool columns_prepared = !prepared_column_scale.empty();
+    std::vector<float> unprepared_column_scale;
+    const auto & column_scale = columns_prepared ? prepared_column_scale : unprepared_column_scale;
     std::vector<float> activation_scale;
     std::vector<float> staged_output;
     try {
-        if (integer != nullptr) column_scale.resize(args.J);
+        if (integer != nullptr && !columns_prepared) unprepared_column_scale.resize(args.J);
         activation_scale.resize(layout.row_count);
         staged_output.resize(layout.value_count);
     } catch (const std::bad_alloc &) {
         return RmdStatus::allocation_failure;
     }
 
-    if (integer != nullptr) {
+    if (integer != nullptr && !columns_prepared) {
         for (size_t j = 0; j < args.J; ++j) {
-            column_scale[j] = wroute::route_column_scale(plan, args, j);
+            unprepared_column_scale[j] = wroute::route_column_scale(plan, args, j);
             if (!finite_float_representation(column_scale[j])) {
                 return RmdStatus::unsupported_route;
             }
@@ -384,6 +358,9 @@ RmdStatus merge_rmd_correction_checked(const ggml_gemmini_args_t & args,
         }
     }
 
+    // Count composed raw corrections, before scales or H0 saturation: lane terms may cancel,
+    // and a zero scale must not erase a nonzero correction from this statistic.
+    size_t staged_nonzero_count = 0;
     for (size_t row = 0; row < layout.row_count; ++row) {
         const size_t destination_row =
             (layout.global_row_begin + row) * layout.row_stride;
@@ -391,10 +368,13 @@ RmdStatus merge_rmd_correction_checked(const ggml_gemmini_args_t & args,
         for (size_t j = 0; j < args.J; ++j) {
             double domain_value = 0.0;
             if (integer != nullptr) {
-                domain_value = static_cast<double>(integer->values[source_row + j]) *
+                const int64_t value = integer->values[source_row + j];
+                staged_nonzero_count += value != 0;
+                domain_value = static_cast<double>(value) *
                     static_cast<double>(column_scale[j]);
             } else {
                 const double value = floating->values[source_row + j];
+                staged_nonzero_count += value != 0;
                 if (!finite_double_representation(value)) return RmdStatus::overflow;
                 domain_value = saturate_signed_32(value);
             }
@@ -421,6 +401,8 @@ RmdStatus merge_rmd_correction_checked(const ggml_gemmini_args_t & args,
                 staged_output[source_row + j];
         }
     }
+    // Publish the count only after the whole merge succeeds, just like the destination.
+    if (nonzero_count != nullptr) *nonzero_count = staged_nonzero_count;
     return RmdStatus::success;
 }
 
@@ -430,7 +412,8 @@ RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
                                   float * destination,
                                   size_t global_row_begin,
                                   size_t global_row_end,
-                                  const Correction & correction) {
+                                  const Correction & correction,
+                                  size_t * nonzero_count) {
     MergeLayout layout;
     const RmdStatus dimensions = prepare_merge_layout(
         args, destination, global_row_begin, global_row_end,
@@ -444,22 +427,17 @@ RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
     if (!plan.valid) {
         return RmdStatus::unsupported_route;
     }
-    if (wroute::route_supports_integer_block_scale(plan)) {
-        for (size_t j = 0; j < args.J; ++j) {
-            for (size_t block = 0; block < plan.scales.cols; ++block) {
-                if (!common_column_scale_matches(args, plan, j, block)) {
-                    return RmdStatus::unsupported_route;
-                }
-            }
-        }
-    }
-    return merge_rmd_correction_checked(args, layout, plan, correction);
+    std::vector<float> column_scale;
+    const RmdStatus scales = prepare_column_scales(args, plan, nullptr, column_scale);
+    if (scales != RmdStatus::success) return scales;
+    return merge_rmd_correction_checked(args, layout, plan, column_scale, correction, nonzero_count);
 }
 
 RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
                                   float * destination,
                                   const StripePacket & packet,
-                                  const Correction & correction) {
+                                  const Correction & correction,
+                                  size_t * nonzero_count) {
     if (std::get_if<BlockScaledInt64Correction>(&correction) == nullptr) {
         return RmdStatus::unsupported_route;
     }
@@ -485,29 +463,121 @@ RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
     if (!plan.valid || !wroute::route_supports_integer_block_scale(plan)) {
         return RmdStatus::unsupported_route;
     }
-    for (const BlockDescriptor & block : packet.blocks) {
+    std::vector<float> column_scale;
+    const RmdStatus scales = prepare_column_scales(args, plan, &packet, column_scale);
+    if (scales != RmdStatus::success) return scales;
+    return merge_rmd_correction_checked(args, layout, plan, column_scale, correction, nonzero_count);
+}
+
+namespace detail {
+const wroute::WeightRoutePlan & RmdWeightPreparation::route_plan(
+    const ggml_gemmini_args_t & args) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!plan_ready_) {
+        plan_ = wroute::resolve_weight_route_plan(args, wroute::WeightScaleInfoMode::Residual);
+        plan_ready_ = true;
+    }
+    return plan_;
+}
+
+RmdStatus RmdWeightPreparation::prepare_columns(
+    const ggml_gemmini_args_t & args, const StripePacket & packet) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const bool native_columns = plan_.route == wroute::WeightRouteKind::H1 ||
+        plan_.route == wroute::WeightRouteKind::HP1;
+    if (!columns_ready_) {
+        std::vector<float> columns;
+        std::vector<uint8_t> checked;
+        try {
+            columns.resize(args.J);
+            if (native_columns) checked.resize(plan_.scales.cols, 0);
+        } catch (const std::bad_alloc &) {
+            return RmdStatus::allocation_failure;
+        } catch (const std::length_error &) {
+            return RmdStatus::allocation_failure;
+        }
         for (size_t j = 0; j < args.J; ++j) {
-            if (!common_column_scale_matches(args, plan, j, block.block_id)) {
+            if (native_columns) {
+                const auto reference = wreader::read_scale_validated(args, plan_, j, 0);
+                if (!reference.ok() || reference.domain !=
+                        wroute::WeightScaleDomain::IntegerBlockTimesColumn) {
+                    return RmdStatus::unsupported_route;
+                }
+                columns[j] = reference.column_scale;
+            } else {
+                columns[j] = wroute::route_column_scale(plan_, args, j);
+            }
+            if (!finite_float_representation(columns[j])) return RmdStatus::unsupported_route;
+        }
+        column_scale_.swap(columns);
+        checked_blocks_.swap(checked);
+        columns_ready_ = true;
+#if defined(GGML_GEMMINI_TESTING)
+        ++column_preparations_;
+#endif
+    }
+    if (!native_columns) return RmdStatus::success;
+    for (const auto & block : packet.blocks) {
+        if (block.block_id >= checked_blocks_.size()) return RmdStatus::unsupported_route;
+        if (block.block_id == 0 || checked_blocks_[block.block_id] != 0) continue;
+        for (size_t j = 0; j < args.J; ++j) {
+            const auto current = wreader::read_scale_validated(args, plan_, j, block.block_id);
+            if (!current.ok() || current.domain !=
+                    wroute::WeightScaleDomain::IntegerBlockTimesColumn ||
+                current.column_scale != column_scale_[j]) {
                 return RmdStatus::unsupported_route;
             }
         }
+        checked_blocks_[block.block_id] = 1;
+#if defined(GGML_GEMMINI_TESTING)
+        ++selected_block_preparations_;
+#endif
     }
-    return merge_rmd_correction_checked(args, layout, plan, correction);
+    return RmdStatus::success;
+}
+
+RmdStatus merge_rmd_correction_with_weights(const ggml_gemmini_args_t & args,
+    float * destination, const StripePacket & packet, const Correction & correction,
+    RmdWeightPreparation & weights, size_t * nonzero_count) {
+    if (std::get_if<BlockScaledInt64Correction>(&correction) == nullptr) {
+        return RmdStatus::unsupported_route;
+    }
+    size_t global_row_end = 0;
+    if (packet.logical_j != args.J || packet.logical_k != args.K ||
+        !checked_add_size(packet.row_begin, packet.row_count, global_row_end)) {
+        return RmdStatus::invalid_arguments;
+    }
+    MergeLayout layout;
+    const RmdStatus dimensions = prepare_merge_layout(args, destination,
+        packet.row_begin, global_row_end, correction_size(correction), layout);
+    if (dimensions != RmdStatus::success) return dimensions;
+    const auto & plan = weights.route_plan(args);
+    if (!plan.valid || !wroute::route_supports_integer_block_scale(plan)) {
+        return RmdStatus::unsupported_route;
+    }
+    const RmdStatus scales = weights.prepare_columns(args, packet);
+    if (scales != RmdStatus::success) return scales;
+    return merge_rmd_correction_checked(
+        args, layout, plan, weights.column_scale_, correction, nonzero_count);
+}
+
 }
 
 
 RmdStatus merge_rmd_correction(const ggml_gemmini_args_t & args,
                                size_t global_row_begin,
                                size_t global_row_end,
-                               const Correction & correction) {
+                               const Correction & correction,
+                               size_t * nonzero_count) {
     return merge_rmd_correction_to(
-        args, args.f_out, global_row_begin, global_row_end, correction);
+        args, args.f_out, global_row_begin, global_row_end, correction, nonzero_count);
 }
 
 RmdStatus merge_rmd_correction(const ggml_gemmini_args_t & args,
                                const StripePacket & packet,
-                               const Correction & correction) {
-    return merge_rmd_correction_to(args, args.f_out, packet, correction);
+                               const Correction & correction,
+                               size_t * nonzero_count) {
+    return merge_rmd_correction_to(args, args.f_out, packet, correction, nonzero_count);
 }
 
 }

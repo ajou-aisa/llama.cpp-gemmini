@@ -1298,10 +1298,6 @@ PipelineStripeTelemetry pipeline_stripe_telemetry(
     record.residual_backend_end_ns = profile.backend_end_ns;
     record.residual_backend_start_tid = profile.backend_start_tid;
     record.residual_backend_end_tid = profile.backend_end_tid;
-    record.compose_start_ns = profile.compose_start_ns;
-    record.compose_end_ns = profile.compose_end_ns;
-    record.compose_start_tid = profile.compose_start_tid;
-    record.compose_end_tid = profile.compose_end_tid;
     record.finalize_start_ns = profile.finalize_start_ns;
     record.finalize_end_ns = profile.finalize_end_ns;
     record.finalize_start_tid = profile.finalize_start_tid;
@@ -1601,30 +1597,23 @@ MatMulResult MatMul::run_full() {
             if (residual_status != rmd::RmdStatus::success) break;
         }
     } else {
+        rmd::detail::RmdWeightPreparation weights;
         for (const auto & packet : quants::activation_rmd_packets(args())) {
             if (packet == nullptr) continue;
-            rmd::CompressedOutput compressed;
             rmd::Correction correction = rmd::BlockScaledInt64Correction{};
             test_detail::observe_residual_dispatch();
             test_detail::observe_backend_dispatch(false);
             const auto backend_start = read_matmul_cpu_sample();
-            residual_status = rmd::execute_rmd_stripe_ws(args(), *packet, compressed);
+            residual_status = rmd::detail::execute_rmd_stripe_ws_with_weights(
+                args(), *packet, correction, weights);
             const auto backend_end = read_matmul_cpu_sample();
             emit_matmul_cpu_interval(args().matmul_layer.c_str(), "residual_backend_host_call",
                 backend_start, backend_end, residual_status == rmd::RmdStatus::success,
                 nullptr, nullptr, run_id);
             if (residual_status == rmd::RmdStatus::success) {
-                const auto compose_start = read_matmul_cpu_sample();
-                residual_status = rmd::compose_rmd_output(*packet, compressed, correction);
-                const auto compose_end = read_matmul_cpu_sample();
-                emit_matmul_cpu_interval(args().matmul_layer.c_str(), "residual_result_reconstruction",
-                    compose_start, compose_end, residual_status == rmd::RmdStatus::success,
-                    nullptr, nullptr, run_id);
-            }
-            if (residual_status == rmd::RmdStatus::success) {
                 const auto merge_start = read_matmul_cpu_sample();
-                residual_status = rmd::merge_rmd_correction(
-                    args(), *packet, correction);
+                residual_status = rmd::detail::merge_rmd_correction_with_weights(
+                    args(), args().f_out, *packet, correction, weights);
                 const auto merge_end = read_matmul_cpu_sample();
                 emit_matmul_cpu_interval(args().matmul_layer.c_str(), "output_correction_apply",
                     merge_start, merge_end, residual_status == rmd::RmdStatus::success,
@@ -1972,6 +1961,7 @@ MatmulExecution & MatmulExecution::operator=(MatmulExecution && other) noexcept 
     status_ = other.status_;
     state_ = other.state_;
     state_mutex_ = std::move(other.state_mutex_);
+    rmd_weights_ = std::move(other.rmd_weights_);
     active_jobs_ = other.active_jobs_;
     captured_rows_ = other.captured_rows_;
     finalized_rows_ = other.finalized_rows_;
@@ -2670,8 +2660,8 @@ MatmulStripeJob::MatmulStripeJob(MatmulStripeJob && other) noexcept
       rmd_queued_ns_(other.rmd_queued_ns_), job_mutex_(std::move(other.job_mutex_)),
       direct_residual_(std::move(other.direct_residual_)),
       rmd_packet_(std::move(other.rmd_packet_)),
-      rmd_output_(std::move(other.rmd_output_)),
       rmd_correction_(std::move(other.rmd_correction_)),
+      rmd_correction_ready_(other.rmd_correction_ready_),
       dense_state_(other.dense_state_), residual_state_(other.residual_state_),
       captured_(other.captured_), finalized_(other.finalized_) {
     other.execution_ = nullptr;
@@ -2690,8 +2680,8 @@ MatmulStripeJob & MatmulStripeJob::operator=(MatmulStripeJob && other) noexcept 
         staged_activation_meta_ = std::move(other.staged_activation_meta_);
         direct_residual_ = std::move(other.direct_residual_);
         rmd_packet_ = std::move(other.rmd_packet_);
-        rmd_output_ = std::move(other.rmd_output_);
         rmd_correction_ = std::move(other.rmd_correction_);
+        rmd_correction_ready_ = other.rmd_correction_ready_;
         owns_slot_ = other.owns_slot_;
         released_ = other.released_;
         collector_slot_released_ = other.collector_slot_released_;
@@ -3061,8 +3051,6 @@ MatmulStatus accept_external_dense_completion(MatmulStripeJob &job) {
   return {};
 }
 
-// Executes the stripe's RMD packet on the NPU stream and produces the canonical
-// block-scaled INT64 compressed output.
 MatmulStatus execute_rmd_stripe(MatmulStripeJob & job) {
     if (job.job_mutex_ == nullptr) {
         return invalid_state("residual state unavailable");
@@ -3086,8 +3074,9 @@ MatmulStatus execute_rmd_stripe(MatmulStripeJob & job) {
     }
     if (direct == nullptr && packet == nullptr) {
         std::lock_guard<std::mutex> lock(*job.job_mutex_);
-        job.rmd_output_ = {};
+        if (!job.status_) return job.status_;
         job.rmd_correction_ = rmd::BlockScaledInt64Correction{};
+        job.rmd_correction_ready_ = true;
         job.metrics_.cpu_prep = MatmulCpuInterval::unavailable("not_applicable");
         job.metrics_.cpu_backend = MatmulCpuInterval::unavailable("not_applicable");
         job.metrics_.cpu_merge = MatmulCpuInterval::unavailable("not_applicable");
@@ -3099,9 +3088,22 @@ MatmulStatus execute_rmd_stripe(MatmulStripeJob & job) {
 
     const auto start = Clock::now();
     const auto residual_start = read_matmul_cpu_sample();
-    rmd::CompressedOutput output;
-    rmd::Correction direct_correction = rmd::BlockScaledInt64Correction{};
+    rmd::Correction correction = rmd::BlockScaledInt64Correction{};
     rmd::RmdExecutionMetrics metrics{};
+    rmd::detail::RmdWeightPreparation * weights = nullptr;
+    if (packet != nullptr) {
+        try {
+            std::lock_guard<std::mutex> state_lock(*job.execution_->state_mutex_);
+            if (job.execution_->rmd_weights_ == nullptr) {
+                job.execution_->rmd_weights_ = std::make_unique<rmd::detail::RmdWeightPreparation>();
+            }
+            weights = job.execution_->rmd_weights_.get();
+        } catch (const std::bad_alloc &) {
+            const MatmulStatus failure = from_rmd_status(rmd::RmdStatus::allocation_failure);
+            job.record_failure(failure, false);
+            return failure;
+        }
+    }
     residual::DirectExecutionMetrics direct_metrics{};
     if ((job.metrics_.cpu_identity_mask & GEMMINI_CYCLE_HAS_RUN_ID) != 0)
         direct_metrics.run_id = job.metrics_.run_id;
@@ -3110,9 +3112,9 @@ MatmulStatus execute_rmd_stripe(MatmulStripeJob & job) {
     const auto backend_start = read_matmul_cpu_sample();
     const rmd::RmdStatus status = direct != nullptr
         ? residual::execute_direct_stripe(
-              job.execution_->facade_.args(), *direct, direct_correction, &direct_metrics)
-        : rmd::execute_rmd_stripe_ws(
-              job.execution_->facade_.args(), *packet, output, &metrics);
+              job.execution_->facade_.args(), *direct, correction, &direct_metrics)
+        : rmd::detail::execute_rmd_stripe_ws_with_weights(
+              job.execution_->facade_.args(), *packet, correction, *weights, &metrics);
     const auto backend_end = read_matmul_cpu_sample();
     metrics.direct_event_count = direct_metrics.event_count;
     metrics.direct_call_count = direct_metrics.call_count;
@@ -3140,8 +3142,8 @@ MatmulStatus execute_rmd_stripe(MatmulStripeJob & job) {
     {
         std::lock_guard<std::mutex> lock(*job.job_mutex_);
         if (!job.status_) return job.status_;
-        job.rmd_output_ = std::move(output);
-        job.rmd_correction_ = std::move(direct_correction);
+        job.rmd_correction_ = std::move(correction);
+        job.rmd_correction_ready_ = true;
         job.metrics_.rmd = metrics;
         record_metric(job.metrics_.rmd_execute, job.execution_->options_.profiling, start);
     }
@@ -3149,73 +3151,19 @@ MatmulStatus execute_rmd_stripe(MatmulStripeJob & job) {
     return {};
 }
 
-// Reads the canonical compressed output and performs the radix composition.
+// Completes the residual lifecycle after the executor has staged the correction.
 MatmulStatus compose_rmd_stripe(MatmulStripeJob & job) {
     if (job.job_mutex_ == nullptr) {
         return invalid_state("residual state unavailable");
     }
-    rmd::StripePacketHandle packet;
     {
         std::lock_guard<std::mutex> lock(*job.job_mutex_);
         if (job.execution_ == nullptr || !job.captured_ || job.finalized_ || !job.status_ ||
+            !job.rmd_correction_ready_ ||
             (job.residual_state_ != MatmulResidualState::running &&
              job.residual_state_ != MatmulResidualState::complete)) {
             return invalid_state("compose requires an executed residual stripe");
         }
-        packet = job.rmd_packet_;
-        if (job.direct_residual_ != nullptr || packet == nullptr) {
-            job.residual_state_ = MatmulResidualState::complete;
-            job.metrics_.rmd_end_ns = now_ns();
-            return {};
-        }
-    }
-
-    const auto read_start = Clock::now();
-    {
-        std::lock_guard<std::mutex> lock(*job.job_mutex_);
-#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
-        job.metrics_.telemetry_compose_start_sample = cycle::read_sample();
-#endif
-        job.metrics_.compose_start_ns = now_ns();
-#if LOG_CYCLE
-        job.metrics_.compose_start_tid = cycle::host_thread_id();
-#endif
-    }
-    rmd::Correction correction = rmd::BlockScaledInt64Correction{};
-    const rmd::RmdStatus status = rmd::compose_rmd_output(*packet, job.rmd_output_, correction);
-#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
-    job.metrics_.telemetry_compose_end_sample = cycle::read_sample();
-#endif
-    const uint64_t compose_end_ns = now_ns();
-#if LOG_CYCLE
-    const uint64_t compose_end_tid = cycle::host_thread_id();
-#endif
-#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
-    emit_matmul_native_interval(job.execution_->facade_.args().matmul_layer.c_str(),
-        "rmd_packet_compose_cycles", job.metrics_.telemetry_compose_start_sample,
-        job.metrics_.telemetry_compose_end_sample,
-        job.metrics_.compose_start_ns, compose_end_ns,
-        job.metrics_.compose_start_tid, compose_end_tid,
-        status == rmd::RmdStatus::success,
-        &job.metrics_);
-#endif
-    if (status != rmd::RmdStatus::success) {
-        const MatmulStatus failure = from_rmd_status(status);
-        job.record_failure(failure, false);
-        return failure;
-    }
-    {
-        std::lock_guard<std::mutex> lock(*job.job_mutex_);
-        if (!job.status_) {
-            return job.status_;
-        }
-        job.rmd_correction_ = std::move(correction);
-        record_metric(job.metrics_.rmd_compose, job.execution_->options_.profiling, read_start);
-        job.metrics_.rmd_output_read = job.metrics_.rmd_compose;
-        job.metrics_.compose_end_ns = compose_end_ns;
-#if LOG_CYCLE
-        job.metrics_.compose_end_tid = compose_end_tid;
-#endif
         job.residual_state_ = MatmulResidualState::complete;
         job.metrics_.rmd_end_ns = now_ns();
     }
@@ -3260,14 +3208,16 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
         job.metrics_.row_end = job.input_.row_end();
         if (!rmd::correction_empty(job.rmd_correction_)) {
             merged = true;
+            size_t correction_nonzero_count = 0;
             merge_start = read_matmul_cpu_sample();
             const rmd::RmdStatus status = job.direct_residual_ != nullptr
                 ? rmd::merge_rmd_correction(
                       job.execution_->facade_.args(), job.input_.row_begin(),
-                      job.input_.row_end(), job.rmd_correction_)
-                : rmd::merge_rmd_correction(
-                      job.execution_->facade_.args(), *job.rmd_packet_,
-                      job.rmd_correction_);
+                      job.input_.row_end(), job.rmd_correction_, &correction_nonzero_count)
+                : rmd::detail::merge_rmd_correction_with_weights(
+                      job.execution_->facade_.args(), job.execution_->facade_.args().f_out,
+                      *job.rmd_packet_, job.rmd_correction_, *job.execution_->rmd_weights_,
+                      &correction_nonzero_count);
             merge_end = read_matmul_cpu_sample();
             job.metrics_.merge_start_ns = merge_start.ns;
             job.metrics_.merge_end_ns = merge_end.ns;
@@ -3278,7 +3228,8 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
             job.metrics_.cpu_residual_total = evaluate_matmul_cpu_interval(
                 job.metrics_.cpu_residual_start, merge_end);
             stats_start = read_matmul_cpu_sample();
-            job.metrics_.telemetry_correction_nonzero_count = std::visit(
+            job.metrics_.telemetry_correction_nonzero_count = status == rmd::RmdStatus::success
+                ? correction_nonzero_count : std::visit(
                 [](const auto & typed) {
                     return static_cast<uint64_t>(std::count_if(
                         typed.values.begin(), typed.values.end(),
@@ -3360,6 +3311,9 @@ MatmulStatus finish_execution(MatmulExecution & execution) {
     const auto finish_start = read_matmul_cpu_sample();
     const auto result = [&]() -> MatmulStatus {
     std::lock_guard<std::mutex> state_lock(*execution.state_mutex_);
+    if (!execution.pipeline_attached_ && execution.active_jobs_ == 0) {
+        execution.rmd_weights_.reset();
+    }
     if (!execution.status_.ok()) {
         execution.facade_.discard_output_transaction();
         execution.state_ = MatmulExecutionState::failed;

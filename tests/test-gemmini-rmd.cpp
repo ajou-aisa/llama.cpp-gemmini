@@ -13,6 +13,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -27,21 +28,6 @@ bool check(bool condition, const char * message) {
     return condition;
 }
 
-bool test_balanced_radix_decomposition() {
-    constexpr std::array<int32_t, 13> values = {
-        std::numeric_limits<int32_t>::min(), -16777217, -129, -128, -1, 0, 1,
-        127, 128, 255, 256, 16777216, 2139062143,
-    };
-    for (const int32_t value : values) {
-        BalancedDigits digits{};
-        if (!check(decompose_balanced_radix256(value, digits), "balanced value decomposes") ||
-            !check(compose_balanced_radix256(digits) == value, "balanced digits round-trip")) {
-            return false;
-        }
-    }
-    return true;
-}
-
 int64_t independently_compose(const NativeBalancedDigits & digits) {
     int64_t value = 0;
     int64_t place = 1;
@@ -50,6 +36,18 @@ int64_t independently_compose(const NativeBalancedDigits & digits) {
         place *= digits.radix;
     }
     return value;
+}
+
+bool matches_division_oracle(int32_t residual, const NativeBalancedDigits & digits) {
+    int64_t remaining = residual;
+    for (size_t lane = 0; lane < digits.digits.size(); ++lane) {
+        int64_t digit = remaining % digits.radix;
+        if (digit >= static_cast<int64_t>(digits.radix / 2)) digit -= digits.radix;
+        if (digit < -static_cast<int64_t>(digits.radix / 2)) digit += digits.radix;
+        if (digits.digits[lane] != digit) return false;
+        remaining = (remaining - digit) / digits.radix;
+    }
+    return remaining == 0 && independently_compose(digits) == residual;
 }
 
 bool test_width_native_radix_happy_boundaries() {
@@ -61,16 +59,26 @@ bool test_width_native_radix_happy_boundaries() {
         int32_t digit_max;
     };
     constexpr std::array<WidthCase, 3> widths = {{
-        {4, 16, 8, -8, 7},
-        {8, 256, 4, -128, 127},
-        {16, 65536, 2, -32768, 32767},
+        {4, 16, 9, -8, 7},
+        {8, 256, 5, -128, 127},
+        {16, 65536, 3, -32768, 32767},
     }};
-    constexpr std::array<int32_t, 13> values = {
-        kSigned21Min, -65537, -32769, -129, -9, -8, -1,
-        0, 1, 7, 8, 32768, kSigned21Max,
+    constexpr std::array<int32_t, 28> values = {
+        std::numeric_limits<int32_t>::min(), std::numeric_limits<int32_t>::min() + 1,
+        -16777217, -(int32_t{1} << 20) - 1, -(int32_t{1} << 20),
+        -65537, -32769, -129, -128, -9, -8, -1, 0, 1, 7, 8,
+        127, 128, 255, 256, 32768,
+        (int32_t{1} << 20) - 1, int32_t{1} << 20, 16777216, 2139062143, 2139062144,
+        std::numeric_limits<int32_t>::max() - 1, std::numeric_limits<int32_t>::max(),
     };
 
-    bool ok = true;
+    NativeBalancedDigits zero{};
+    zero.digits.fill(1);
+    zero.active_lane_count = balanced_radix_contract(8).lane_capacity;
+    bool ok = check(decompose_balanced_radix(0, 8, zero) == RmdStatus::success &&
+                        zero.active_lane_count == 0 &&
+                        zero.digits == std::array<int32_t, kMaxNativeRadixLanes>{},
+                    "zero decomposition clears all reused digits and the active lane count");
     for (const WidthCase & width : widths) {
         const BalancedRadixContract contract = balanced_radix_contract(width.bits);
         ok = check(contract.radix == width.radix && contract.lane_capacity == width.capacity &&
@@ -81,7 +89,7 @@ bool test_width_native_radix_happy_boundaries() {
             NativeBalancedDigits digits{};
             const RmdStatus status = decompose_balanced_radix(value, width.bits, digits);
             bool value_ok = check(status == RmdStatus::success,
-                                  "signed-21 boundary decomposes");
+                                  "full int32 boundary decomposes");
             value_ok = check(digits.radix == width.radix &&
                                  digits.lane_capacity == width.capacity &&
                                  digits.active_lane_count <= width.capacity,
@@ -103,8 +111,8 @@ bool test_width_native_radix_happy_boundaries() {
             }
             value_ok = check(digits.active_lane_count == expected_active,
                              "active lanes trim only trailing zero places") && value_ok;
-            value_ok = check(independently_compose(digits) == value,
-                             "independent int64 radix oracle recomposes exactly") && value_ok;
+            value_ok = check(matches_division_oracle(value, digits),
+                             "independent division oracle agrees on every signed digit") && value_ok;
             int64_t composed = std::numeric_limits<int64_t>::min();
             value_ok = check(compose_balanced_radix(digits, composed) == RmdStatus::success &&
                                  composed == value,
@@ -115,20 +123,21 @@ bool test_width_native_radix_happy_boundaries() {
         int64_t place = 1;
         for (uint8_t lane = 0; lane + 1 < width.capacity; ++lane) {
             const int64_t boundary = static_cast<int64_t>(width.radix / 2) * place;
-            if (boundary > kSigned21Max) {
+            if (boundary > std::numeric_limits<int32_t>::max()) {
                 break;
             }
             for (const int64_t candidate : {
                      boundary - 1, boundary, boundary + 1,
                      -boundary + 1, -boundary, -boundary - 1,
                  }) {
-                if (candidate < kSigned21Min || candidate > kSigned21Max) {
+                if (candidate < std::numeric_limits<int32_t>::min() ||
+                    candidate > std::numeric_limits<int32_t>::max()) {
                     continue;
                 }
                 NativeBalancedDigits digits{};
                 ok = check(decompose_balanced_radix(static_cast<int32_t>(candidate),
                                                     width.bits, digits) == RmdStatus::success &&
-                               independently_compose(digits) == candidate,
+                               matches_division_oracle(static_cast<int32_t>(candidate), digits),
                            "every native digit boundary carries and borrows exactly") && ok;
             }
 
@@ -141,6 +150,37 @@ bool test_width_native_radix_happy_boundaries() {
                        "positive half-radix carries into the next native lane") && ok;
             place *= width.radix;
         }
+
+        int64_t without_top_carry_max = 0;
+        place = 1;
+        for (uint8_t lane = 0; lane + 1 < width.capacity; ++lane) {
+            without_top_carry_max += width.digit_max * place;
+            place *= width.radix;
+        }
+        for (int64_t candidate : {without_top_carry_max - 1, without_top_carry_max,
+                                  without_top_carry_max + 1, without_top_carry_max + 2}) {
+            NativeBalancedDigits digits{};
+            ok = check(decompose_balanced_radix(static_cast<int32_t>(candidate), width.bits,
+                                                digits) == RmdStatus::success &&
+                           matches_division_oracle(static_cast<int32_t>(candidate), digits) &&
+                           digits.digits[width.capacity - 1] ==
+                               (candidate > without_top_carry_max ? 1 : 0),
+                       "first top carry uses the extra ordinary radix lane") && ok;
+        }
+
+        uint32_t state = 0x12345678u;
+        for (size_t sample = 0; sample < 100000; ++sample) {
+            state = state * 1664525u + 1013904223u;
+            const int64_t signed_value = state <= uint32_t{INT32_MAX} ?
+                static_cast<int64_t>(state) : static_cast<int64_t>(state) - (int64_t{1} << 32);
+            NativeBalancedDigits digits{};
+            if (!check(decompose_balanced_radix(static_cast<int32_t>(signed_value), width.bits,
+                                                digits) == RmdStatus::success &&
+                           matches_division_oracle(static_cast<int32_t>(signed_value), digits),
+                       "full-range samples match independent division without signed overflow")) {
+                return false;
+            }
+        }
     }
     return ok;
 }
@@ -150,10 +190,17 @@ bool test_width_native_compose_and_expand() {
         uint8_t bits;
         int32_t residual;
     };
-    constexpr std::array<WidthCase, 3> cases = {{
-        {4, kSigned21Min + 1},
+    constexpr std::array<WidthCase, 10> cases = {{
+        {4, std::numeric_limits<int32_t>::min()},
+        {4, std::numeric_limits<int32_t>::max()},
+        {4, 16},
+        {8, std::numeric_limits<int32_t>::min()},
+        {8, std::numeric_limits<int32_t>::max()},
         {8, 65537},
-        {16, kSigned21Max},
+        {8, 256},
+        {16, std::numeric_limits<int32_t>::min()},
+        {16, std::numeric_limits<int32_t>::max()},
+        {16, 65536},
     }};
     constexpr std::array<int64_t, 2> weights = {3, -257};
     constexpr int64_t block_scale = 5;
@@ -251,13 +298,26 @@ bool test_width_native_compose_and_expand() {
         compressed.j_padded = packet->j_padded;
         compressed.values.assign(packet->total_output_values, 0);
         const BlockDescriptor & block = packet->blocks.front();
+        compressed.values[block.output_value_offset] =
+            std::numeric_limits<int64_t>::min() + 1;
+        compressed.values[block.output_value_offset + block.lane_stride_values] =
+            int64_t{1} << (63 - bits);
+        Correction correction = BlockScaledInt64Correction{{101, 103}};
+        const auto cancellation_status = compose_rmd_output(*packet, compressed, correction);
+        const auto * cancellation_values =
+            std::get_if<BlockScaledInt64Correction>(&correction);
+        ok = check(cancellation_status == RmdStatus::success &&
+                       cancellation_values != nullptr &&
+                       cancellation_values->values == std::vector<int64_t>({1}),
+                   "wide radix contribution cancels before final int64 narrowing") && ok;
+
         for (uint8_t lane_position = 0; lane_position < 2; ++lane_position) {
             compressed.values[block.output_value_offset +
                 static_cast<size_t>(lane_position) * block.lane_stride_values] =
                     std::numeric_limits<int64_t>::max();
         }
         const Correction sentinel = BlockScaledInt64Correction{{101, 103}};
-        Correction correction = sentinel;
+        correction = sentinel;
         const auto overflow_status = compose_rmd_output(*packet, compressed, correction);
         const auto * overflow_values =
             std::get_if<BlockScaledInt64Correction>(&correction);
@@ -266,25 +326,51 @@ bool test_width_native_compose_and_expand() {
                        overflow_values->values ==
                            std::get<BlockScaledInt64Correction>(sentinel).values,
                    "native-radix overflow leaves correction unchanged") && ok;
+
+        builder.reset(38, 0, 1, kBlockSize + 1, 1, bits);
+        if (!check(builder.add_residual(0, 0, static_cast<int32_t>(contract.radix)) &&
+                       builder.add_residual(0, kBlockSize,
+                                            -static_cast<int32_t>(contract.radix)),
+                   "opposite higher-lane residuals accepted across blocks")) {
+            return false;
+        }
+        const StripePacketHandle cancellation_packet = builder.finish();
+        if (!check(cancellation_packet != nullptr && cancellation_packet->blocks.size() == 2,
+                   "cross-block cancellation packet built")) {
+            return false;
+        }
+        compressed.j_padded = cancellation_packet->j_padded;
+        compressed.values.assign(cancellation_packet->total_output_values, 0);
+        compressed.values[cancellation_packet->blocks[0].output_value_offset] = int64_t{1} << 62;
+        compressed.values[cancellation_packet->blocks[1].output_value_offset] = -(int64_t{1} << 62);
+        correction = sentinel;
+        const auto block_cancellation_status =
+            compose_rmd_output(*cancellation_packet, compressed, correction);
+        const auto * block_cancellation_values =
+            std::get_if<BlockScaledInt64Correction>(&correction);
+        ok = check(block_cancellation_status == RmdStatus::success &&
+                       block_cancellation_values != nullptr &&
+                       block_cancellation_values->values == std::vector<int64_t>({0}),
+                   "wide block contributions cancel before final int64 narrowing") && ok;
     }
     return ok;
 }
 
-bool test_width_native_first_too_wide_is_atomic() {
+bool test_width_native_out_of_int32_compose_is_atomic() {
     constexpr std::array<uint8_t, 3> widths = {4, 8, 16};
     bool ok = true;
     for (const uint8_t bits : widths) {
-        NativeBalancedDigits sentinel{};
-        sentinel.radix = 99;
-        sentinel.lane_capacity = 7;
-        sentinel.active_lane_count = 3;
-        sentinel.digits.fill(42);
-        for (const int32_t value : {kSigned21Min - 1, kSigned21Max + 1}) {
-            NativeBalancedDigits actual = sentinel;
-            ok = check(decompose_balanced_radix(value, bits, actual) ==
+        const auto contract = balanced_radix_contract(bits);
+        for (const int32_t top_digit : {-1, 1}) {
+            NativeBalancedDigits digits{};
+            digits.radix = contract.radix;
+            digits.lane_capacity = digits.active_lane_count = contract.lane_capacity;
+            digits.digits[contract.lane_capacity - 1] = top_digit;
+            int64_t output = 123456789;
+            ok = check(compose_balanced_radix(digits, output) ==
                            RmdStatus::residual_too_wide &&
-                           actual == sentinel,
-                       "first signed-21 overflow rejects without mutating digits") && ok;
+                           output == 123456789,
+                       "digits representing plus or minus 2^32 reject atomically") && ok;
         }
     }
     return ok;
@@ -340,19 +426,27 @@ bool test_width_native_malformed_compose_is_atomic() {
     return ok;
 }
 
-bool test_q4_nonzero_fails_explicitly() {
-    BalancedDigits digits{};
-    digits.digits.fill(1);
-    digits.lane_mask = 0x0f;
-    const bool decomposed = decompose_balanced_radix256(std::numeric_limits<int32_t>::max(), digits);
-
-    RmdStripeBuilder builder;
-    builder.reset(0, 0, 1, 1, 1);
-    const bool added = builder.add_residual(0, 0, std::numeric_limits<int32_t>::max());
-    return check(!decomposed, "q4 != 0 rejects decomposition") &&
-        check(digits.lane_mask == 0, "failed decomposition clears output") &&
-        check(!added && builder.status() == RmdStatus::residual_too_wide,
-              "builder exposes q4 failure status");
+bool test_top_carry_lane_preserves_sparse_mask() {
+    bool ok = true;
+    for (uint8_t bits : {uint8_t{4}, uint8_t{8}, uint8_t{16}}) {
+        RmdStripeBuilder builder;
+        builder.reset(0, 0, 1, kBlockSize, 1, bits);
+        if (!check(builder.add_residual(0, 31, std::numeric_limits<int32_t>::max()),
+                   "builder accepts full int32 residual at K31")) return false;
+        const auto packet = builder.finish();
+        if (!check(packet != nullptr && packet->blocks.size() == 1,
+                   "top carry packet builds")) return false;
+        const auto & block = packet->blocks.front();
+        const uint8_t top_lane = 32 / bits;
+        const uint16_t expected_mask = (1u << 0) | (1u << (top_lane - 1)) | (1u << top_lane);
+        ok = check(block.active_lane_mask == expected_mask && block.active_lane_count == 3 &&
+                       block.lane_ids[0] == 0 && block.lane_ids[1] == top_lane - 1 &&
+                       block.lane_ids[2] == top_lane &&
+                       block.lane_k_masks[top_lane] == (uint32_t{1} << 31) &&
+                       validate_packet(*packet) == RmdStatus::success,
+                   "sparse mask retains original top lane and original K31") && ok;
+    }
+    return ok;
 }
 
 bool test_EXPLICIT_BLOCK_ID_DIM_PADDING() {
@@ -860,7 +954,9 @@ bool test_direct_failure_matrix() {
         const auto * before = std::get_if<rmd::PreScaledFloat64Correction>(&output);
         const double * const before_data = before->values.data();
         const size_t before_capacity = before->values.capacity();
-        residual::DirectExecutionMetrics metrics{79, 83};
+        residual::DirectExecutionMetrics metrics{};
+        metrics.event_count = 79;
+        metrics.call_count = 83;
         const rmd::RmdStatus status =
             residual::execute_direct_stripe(args, payload, output, &metrics);
         const auto * after = std::get_if<rmd::PreScaledFloat64Correction>(&output);
@@ -1118,18 +1214,21 @@ struct CompactOracleFixture {
         }
 
         const BalancedRadixContract radix = balanced_radix_contract(bits);
+        // Keep this fixture's original small magnitudes: its scale-overflow tests
+        // target block scaling, while full-int32 execution is exercised separately.
+        constexpr int32_t fixture_magnitude = int32_t{1} << 20;
         std::array<int64_t, kMaxNativeRadixLanes> places{};
         places[0] = 1;
         active_lane_count = 1;
         while (active_lane_count < radix.lane_capacity &&
                places[active_lane_count - 1] <=
-                   static_cast<int64_t>(-kSigned21Min) / radix.radix) {
+                   static_cast<int64_t>(fixture_magnitude) / radix.radix) {
             places[active_lane_count] =
                 places[active_lane_count - 1] * radix.radix;
             ++active_lane_count;
         }
         auto digit_for = [&](size_t ordinal, uint8_t lane) {
-            return places[lane] > kSigned21Max || ordinal % 2 != 0 ?
+            return places[lane] >= fixture_magnitude || ordinal % 2 != 0 ?
                 int8_t{-1} : int8_t{1};
         };
         for (size_t local_k = 0; local_k < 19; ++local_k) {
@@ -1217,6 +1316,113 @@ bool compressed_outputs_match(const CompressedOutput & lhs,
         lhs.values == rhs.values;
 }
 
+RmdStatus stream_compressed_reverse(const StripePacket & packet,
+                                    const CompressedOutput & compressed,
+                                    Correction & correction) {
+    RmdOutputAssembler assembler;
+    RmdStatus status = assembler.begin(packet, correction);
+    if (status != RmdStatus::success) return status;
+    for (size_t block_index = packet.blocks.size(); block_index-- > 0;) {
+        const BlockDescriptor & block = packet.blocks[block_index];
+        for (size_t lane = block.active_lane_count; lane-- > 0;) {
+            for (size_t m = (packet.row_count + kArrayDim - 1) / kArrayDim; m-- > 0;) {
+                for (size_t j = packet.j_padded / kArrayDim; j-- > 0;) {
+                    std::array<OutputValue, kArrayDim * kArrayDim> values{};
+                    const size_t rows = std::min(kArrayDim, packet.row_count - m * kArrayDim);
+                    const size_t cols = std::min(kArrayDim, packet.logical_j - j * kArrayDim);
+                    for (size_t row = 0; row < rows; ++row) {
+                        const size_t source = block.output_value_offset +
+                            lane * block.lane_stride_values +
+                            (m * kArrayDim + row) * packet.j_padded + j * kArrayDim;
+                        std::copy_n(compressed.values.data() + source, cols,
+                                    values.data() + row * kArrayDim);
+                    }
+                    PhysicalTile tile{};
+                    tile.packet_block_index = static_cast<uint32_t>(block_index);
+                    tile.lane_position = static_cast<uint8_t>(lane);
+                    tile.lane_id = block.lane_ids[lane];
+                    tile.m_tile = static_cast<uint32_t>(m);
+                    tile.j_tile = static_cast<uint32_t>(j);
+                    tile.valid_rows = static_cast<uint16_t>(rows);
+                    tile.valid_cols = static_cast<uint16_t>(cols);
+                    tile.values = values.data();
+                    status = assembler.submit(tile);
+                    if (status != RmdStatus::success) return status;
+                }
+            }
+        }
+    }
+    return assembler.finish();
+}
+
+bool test_streaming_assembler_boundaries() {
+    const Correction sentinel = PreScaledFloat64Correction{{13.25, -9.5}};
+    bool ok = true;
+    for (uint8_t bits : {uint8_t{4}, uint8_t{8}, uint8_t{16}}) {
+        RmdStripeBuilder builder;
+        builder.reset(53, 0, 1, 3 * kBlockSize, 1, bits);
+        builder.add_residual(0, 0, int32_t{1} << bits);
+        builder.add_residual(0, kBlockSize, int32_t{1} << bits);
+        builder.add_residual(0, 2 * kBlockSize, 1);
+        const StripePacketHandle packet = builder.finish();
+        if (!check(packet != nullptr && packet->blocks.size() == 3,
+                   "streaming cancellation packet builds")) return false;
+        CompressedOutput compressed;
+        compressed.j_padded = packet->j_padded;
+        compressed.values.assign(packet->total_output_values, 0);
+        compressed.values[packet->blocks[0].output_value_offset] =
+            std::numeric_limits<int64_t>::max();
+        compressed.values[packet->blocks[1].output_value_offset] =
+            -std::numeric_limits<int64_t>::max();
+        compressed.values[packet->blocks[2].output_value_offset] = 7;
+        Correction composed = sentinel;
+        Correction streamed = sentinel;
+        ok = check(compose_rmd_output(*packet, compressed, composed) == RmdStatus::success &&
+                       stream_compressed_reverse(*packet, compressed, streamed) ==
+                           RmdStatus::success &&
+                       direct_outputs_match(composed, streamed) &&
+                       std::get<BlockScaledInt64Correction>(streamed).values ==
+                           std::vector<int64_t>{7},
+                   "streaming original lane shifts preserve wide cross-block cancellation") && ok;
+
+        compressed.values[packet->blocks[1].output_value_offset] = 0;
+        composed = streamed = sentinel;
+        ok = check(compose_rmd_output(*packet, compressed, composed) == RmdStatus::overflow &&
+                       stream_compressed_reverse(*packet, compressed, streamed) ==
+                           RmdStatus::overflow &&
+                       direct_outputs_match(composed, sentinel) &&
+                       direct_outputs_match(streamed, sentinel),
+                   "streaming final narrowing overflow leaves correction unchanged") && ok;
+
+        std::array<OutputValue, kArrayDim * kArrayDim> values{};
+        values[0] = 1;
+        PhysicalTile tile{};
+        tile.lane_id = packet->blocks[0].lane_ids[0];
+        tile.valid_rows = tile.valid_cols = 1;
+        tile.values = values.data();
+        RmdOutputAssembler assembler;
+        streamed = sentinel;
+        ok = check(assembler.begin(*packet, streamed) == RmdStatus::success &&
+                       direct_outputs_match(streamed, sentinel) &&
+                       assembler.submit(tile) == RmdStatus::success &&
+                       direct_outputs_match(streamed, sentinel) &&
+                       assembler.finish() == RmdStatus::invalid_packet &&
+                       direct_outputs_match(streamed, sentinel),
+                   "streaming missing tiles do not publish a partial correction") && ok;
+        ok = check(assembler.begin(*packet, streamed) == RmdStatus::success &&
+                       assembler.submit(tile) == RmdStatus::success &&
+                       assembler.submit(tile) == RmdStatus::invalid_arguments &&
+                       direct_outputs_match(streamed, sentinel),
+                   "streaming duplicate tile preserves correction") && ok;
+        ++tile.lane_id;
+        ok = check(assembler.begin(*packet, streamed) == RmdStatus::success &&
+                       assembler.submit(tile) == RmdStatus::invalid_arguments &&
+                       direct_outputs_match(streamed, sentinel),
+                   "streaming mismatched lane tag preserves correction") && ok;
+    }
+    return ok;
+}
+
 bool test_compact_oracle_happy_matrix() {
     struct CompactCase {
         uint8_t bits;
@@ -1234,24 +1440,67 @@ bool test_compact_oracle_happy_matrix() {
     for (const CompactCase & test : cases) {
         CompactOracleFixture fixture(test.bits, test.family);
 #if defined(GGML_GEMMINI_TESTING)
-        constexpr std::array<uint16_t, 3> edge_k = {0, 1, 2};
+        constexpr std::array<uint16_t, 6> edge_k = {0, 1, 2, 31, 15, 16};
         std::array<int32_t, kArrayDim * kArrayDim> wide_tile{};
         wide_tile.fill(123456789);
+        RmdExecutionMetrics gather_metrics{};
+        ggml::gemmini::quants::wreader::test_reset_weight_reader_counters();
         const RmdStatus gather_status = fixture.valid ?
             rmd::gather_wide_weight_tile_for_test(
-                fixture.args, 0, edge_k.data(), edge_k.size(), 0,
-                CompactOracleFixture::columns, wide_tile.data(), kArrayDim) :
+                fixture.args, 1, edge_k.data(), edge_k.size(), 1,
+                CompactOracleFixture::columns - 1, wide_tile.data(), kArrayDim,
+                &gather_metrics) :
             RmdStatus::invalid_packet;
         bool gather_ok = check(gather_status == RmdStatus::success,
                                "matched-width WeightGather accepts signed edge codes");
-        for (size_t k = 0; k < edge_k.size(); ++k) {
-            for (size_t j = 0; j < CompactOracleFixture::columns; ++j) {
-                gather_ok = check(wide_tile[k * kArrayDim + j] ==
-                                      fixture.code(j, edge_k[k]),
-                                  "wide WeightGather preserves min/max/zero exactly") &&
-                    gather_ok;
+        gather_ok = check(gather_metrics.weight_values_gathered == edge_k.size() * 2 &&
+                              gather_metrics.weight_baseline_address_resolutions == edge_k.size() * 2 &&
+                              gather_metrics.weight_address_resolutions == 2 &&
+                              ggml::gemmini::quants::wreader::test_weight_reader_code_address_resolutions() == 2,
+                          "native gather resolves each selected column block exactly once") && gather_ok;
+        for (size_t k = 0; k < kArrayDim; ++k) {
+            for (size_t j = 0; j < kArrayDim; ++j) {
+                const int32_t expected_code = k < edge_k.size() && j < 2 ?
+                    fixture.code(j + 1, kBlockSize + edge_k[k]) : 123456789;
+                gather_ok = check(wide_tile[k * kArrayDim + j] == expected_code,
+                                  "native gather preserves original K order, column stride, and padding") && gather_ok;
             }
         }
+        const auto valid_tile = wide_tile;
+        auto invalid_k = edge_k;
+        invalid_k.back() = kBlockSize;
+        ggml::gemmini::quants::wreader::test_reset_weight_reader_counters();
+        gather_ok = check(rmd::gather_wide_weight_tile_for_test(
+                              fixture.args, 1, invalid_k.data(), invalid_k.size(), 1, 2,
+                              wide_tile.data(), kArrayDim, &gather_metrics) == RmdStatus::execution_failed &&
+                              wide_tile == valid_tile && gather_metrics.weight_address_resolutions == 2 &&
+                              gather_metrics.weight_values_gathered == edge_k.size() * 2 &&
+                              ggml::gemmini::quants::wreader::test_weight_reader_code_address_resolutions() == 0,
+                          "late invalid K rejects before block resolution without publishing a tile") && gather_ok;
+        uint16_t single_k = 31;
+        wide_tile.fill(123456789);
+        auto single_expected = wide_tile;
+        single_expected[0] = fixture.code(1, kBlockSize + single_k);
+        single_expected[1] = fixture.code(2, kBlockSize + single_k);
+        gather_metrics = {};
+        ggml::gemmini::quants::wreader::test_reset_weight_reader_counters();
+        gather_ok = check(rmd::gather_wide_weight_tile_for_test(
+                              fixture.args, 1, &single_k, 1, 1, 2, wide_tile.data(), kArrayDim,
+                              &gather_metrics) == RmdStatus::success && wide_tile == single_expected &&
+                              gather_metrics.weight_values_gathered == 2 &&
+                              gather_metrics.weight_baseline_address_resolutions == 2 &&
+                              gather_metrics.weight_address_resolutions == 2 &&
+                              ggml::gemmini::quants::wreader::test_weight_reader_code_address_resolutions() == 2,
+                          "single-K native gather preserves K31, padding, and observed address counts") && gather_ok;
+        single_k = kBlockSize;
+        ggml::gemmini::quants::wreader::test_reset_weight_reader_counters();
+        gather_ok = check(rmd::gather_wide_weight_tile_for_test(
+                              fixture.args, 1, &single_k, 1, 1, 2, wide_tile.data(), kArrayDim,
+                              &gather_metrics) == RmdStatus::execution_failed && wide_tile == single_expected &&
+                              gather_metrics.weight_values_gathered == 2 &&
+                              gather_metrics.weight_address_resolutions == 2 &&
+                              ggml::gemmini::quants::wreader::test_weight_reader_code_address_resolutions() == 0,
+                          "invalid single local K preserves tile and metrics before any read") && gather_ok;
 #else
         bool gather_ok = check(false, "compact oracle requires GGML_GEMMINI_TESTING");
 #endif
@@ -1272,6 +1521,28 @@ bool test_compact_oracle_happy_matrix() {
                         "compact output matches independent block/lane oracle") && case_ok;
         case_ok = check(metrics.packet_call_count == 1 && metrics.ws_call_count == 0,
                         "software compact executes one packet and no hardware dispatch") && case_ok;
+        if (status == RmdStatus::success) {
+            Correction composed = PreScaledFloat64Correction{{13.25}};
+            Correction streamed = composed;
+            RmdExecutionMetrics streaming_metrics{};
+            case_ok = check(compose_rmd_output(*fixture.packet, actual, composed) ==
+                                RmdStatus::success &&
+                                execute_rmd_stripe_reference(fixture.args, *fixture.packet,
+                                                            streamed, &streaming_metrics) ==
+                                RmdStatus::success &&
+                                direct_outputs_match(streamed, composed),
+                            "streaming executor equals compact execution plus compose") && case_ok;
+            case_ok = check(streaming_metrics.packet_call_count == metrics.packet_call_count &&
+                                streaming_metrics.matmul_call_count == metrics.matmul_call_count &&
+                                streaming_metrics.physical_tile_count == metrics.physical_tile_count &&
+                                streaming_metrics.lane_group_count == metrics.lane_group_count,
+                            "streaming preserves execution geometry metrics") && case_ok;
+            streamed = PreScaledFloat64Correction{{-29.5}};
+            case_ok = check(stream_compressed_reverse(*fixture.packet, actual, streamed) ==
+                                RmdStatus::success && direct_outputs_match(streamed, composed),
+                            "reverse physical tile order preserves all logical rows and columns") &&
+                case_ok;
+        }
         const size_t packet_block_count =
             fixture.packet == nullptr ? 0 : fixture.packet->blocks.size();
         case_ok = check(packet_block_count == 2 &&
@@ -1318,6 +1589,272 @@ bool test_compact_oracle_happy_matrix() {
     return ok;
 }
 
+bool test_full_int32_compact_direct_agreement(size_t rows) {
+    namespace act = ggml::gemmini::quants::act;
+    bool ok = true;
+    for (uint8_t bits : {uint8_t{4}, uint8_t{8}, uint8_t{16}}) {
+        for (WeightFamily family : {WeightFamily::H1, WeightFamily::HP1}) {
+            WeightCapabilityFixture fixture(bits, family);
+            const auto contract = balanced_radix_contract(bits);
+            int64_t carry_boundary = 0;
+            int64_t place = 1;
+            for (uint8_t lane = 0; lane + 1 < contract.lane_capacity; ++lane) {
+                carry_boundary += contract.digit_max * place;
+                place *= contract.radix;
+            }
+            const std::array<int32_t, 8> samples = {
+                std::numeric_limits<int32_t>::min(), std::numeric_limits<int32_t>::max(),
+                static_cast<int32_t>(carry_boundary), static_cast<int32_t>(carry_boundary + 1),
+                -(int32_t{1} << 20) - 1, int32_t{1} << 20, 0, 1,
+            };
+            std::vector<int32_t> values(rows);
+            for (size_t row = 0; row < rows; ++row) {
+                values[row] = samples[row % samples.size()];
+            }
+            fixture.args.I = values.size();
+            if (!check(fixture.args.A.allocate(values.size(), kBlockSize, bits),
+                       "full int32 fixture activation storage allocates")) return false;
+            fixture.args.act_quant.storage().emplace<act::tensor::Meta>().scale = 0.5f;
+            fixture.q4_h1.qs[0] = fixture.q4_hp1.qs[0] = 0x85;
+            fixture.q4_h1.qs[15] = fixture.q4_hp1.qs[15] = 0xd8;
+            fixture.q8_h1.qs[0] = fixture.q8_hp1.qs[0] = -3;
+            fixture.q8_h1.qs[31] = fixture.q8_hp1.qs[31] = 5;
+            fixture.q16_h1.qs[0] = fixture.q16_hp1.qs[0] = -3;
+            fixture.q16_h1.qs[31] = fixture.q16_hp1.qs[31] = 5;
+
+            RmdStripeBuilder compact_builder;
+            residual::DirectStripeBuilder direct_builder;
+            compact_builder.reset(83, 0, values.size(), kBlockSize, 1, bits);
+            direct_builder.reset(83, 0, values.size(), kBlockSize, 1);
+            for (size_t row = 0; row < values.size(); ++row) {
+                if (!compact_builder.add_residual(row, 0, values[row]) ||
+                    !compact_builder.add_residual(row, 31, 1) ||
+                    !direct_builder.add_residual(row, 0, values[row]) ||
+                    !direct_builder.add_residual(row, 31, 1)) {
+                    return check(false, "full int32 compact and direct builders accept all events");
+                }
+            }
+            const auto packet = compact_builder.finish();
+            const auto direct_payload = direct_builder.finish();
+            if (!check(packet != nullptr && direct_payload != nullptr,
+                       "full int32 compact and direct payloads build")) return false;
+
+            Correction streamed = PreScaledFloat64Correction{{-7.5}};
+            Correction direct = streamed;
+            Correction composed = streamed;
+            CompressedOutput compressed;
+            RmdExecutionMetrics metrics{};
+            if (!check(execute_rmd_stripe_reference(fixture.args, *packet, streamed, &metrics) ==
+                           RmdStatus::success &&
+                           execute_rmd_stripe_reference(fixture.args, *packet, compressed) ==
+                           RmdStatus::success &&
+                           compose_rmd_output(*packet, compressed, composed) == RmdStatus::success &&
+                           residual::execute_direct_stripe(fixture.args, *direct_payload, direct) ==
+                           RmdStatus::success,
+                       "full int32 executes through streaming, compose and CPU direct")) return false;
+            const int64_t scale = family == WeightFamily::H1 ? 5 : 4;
+            std::vector<int64_t> expected;
+            for (int32_t value : values) {
+                expected.push_back((static_cast<int64_t>(value) * -3 + 5) * scale);
+            }
+            ok = check(std::get<BlockScaledInt64Correction>(streamed).values == expected &&
+                           direct_outputs_match(streamed, direct) &&
+                           direct_outputs_match(streamed, composed),
+                       "top carry correction matches literal int64 and independent direct output") && ok;
+
+            const auto & block = packet->blocks.front();
+            const size_t group_rows = align_up(block.active_lane_count * rows, kArrayDim);
+            ok = check(packet->blocks.size() == 1 && block.groups.size() == 1 &&
+                           metrics.stacked_i_tile_count == group_rows / kArrayDim &&
+                           metrics.physical_tile_count ==
+                               block.active_lane_count * align_up(rows, kArrayDim) / kArrayDim &&
+                           metrics.block_padding_zeros == group_rows * (kArrayDim - 2) &&
+                           metrics.row_padding_zeros ==
+                               (group_rows - block.active_lane_count * rows) * kArrayDim &&
+                           packet->activation_value_count == group_rows * kArrayDim,
+                       "group row padding drives payload size and dispatched tile metrics") && ok;
+            for (size_t lane = 0; lane < block.active_lane_count; ++lane) {
+                for (size_t row = 0; row < block.rows_padded; ++row) {
+                    for (size_t col = 0; col < packet->j_padded; ++col) {
+                        if (row >= rows || col >= packet->logical_j) {
+                            const size_t index = block.output_value_offset +
+                                lane * block.lane_stride_values + row * packet->j_padded + col;
+                            ok = check(compressed.values[index] == 0,
+                                       "dense input groups preserve zero compressed output padding") && ok;
+                        }
+                    }
+                }
+            }
+
+            std::vector<float> output(values.size(), 7.0f);
+            fixture.args.f_out = output.data();
+            size_t nonzero_count = 0;
+            ok = check(merge_rmd_correction(fixture.args, *packet, streamed, &nonzero_count) ==
+                           RmdStatus::success && nonzero_count == values.size(),
+                       "full int32 correction merges with final nonzero count") && ok;
+            for (size_t row = 0; row < values.size(); ++row) {
+                const float expected_output = 7.0f + static_cast<float>(
+                    static_cast<double>(expected[row]) * 0.25 * 0.5);
+                ok = check(output[row] == expected_output,
+                           "full int32 merge matches explicit column and activation scales") && ok;
+            }
+        }
+    }
+    return ok;
+}
+
+bool test_shared_weight_preparation() {
+    namespace wreader = ggml::gemmini::quants::wreader;
+    namespace act = ggml::gemmini::quants::act;
+    WeightCapabilityFixture fixture(GGML_GEMMINI_WEIGHT_BITS, WeightFamily::HP1);
+    auto & args = fixture.args;
+#if GGML_GEMMINI_WEIGHT_BITS == 4
+    std::array<block_q4_hp1, 3> blocks{};
+    args.q4_hp1_blocks = blocks.data();
+#elif GGML_GEMMINI_WEIGHT_BITS == 16
+    std::array<block_q16_hp1, 3> blocks{};
+    args.q16_hp1_blocks = blocks.data();
+#else
+    std::array<block_q8_hp1, 3> blocks{};
+    args.q8_hp1_blocks = blocks.data();
+#endif
+    args.I = 3;
+    args.K = kBlockSize * blocks.size();
+    args.q8_hp1_block_count = args.native_block_count = blocks.size();
+    args.q8_hp1_blocks_per_row = args.native_blocks_per_row = blocks.size();
+    args.native_weight_bytes = sizeof(blocks);
+    for (size_t block = 0; block < blocks.size(); ++block) {
+#if GGML_GEMMINI_WEIGHT_BITS == 4
+        std::fill(std::begin(blocks[block].qs), std::end(blocks[block].qs), uint8_t{0x88});
+        blocks[block].qs[0] = 0x8d;
+#else
+        blocks[block].qs[0] = 5;
+#endif
+        blocks[block].m = static_cast<int16_t>(2 + block);
+        blocks[block].channel_scale = block == 2 ? 0.5f : 0.25f;
+    }
+    const std::array<int32_t, 3> residuals{129, -257, 3};
+    std::array<StripePacketHandle, 3> packets;
+    std::array<ggml_gemmini_args_t, 3> stripe_args{args, args, args};
+    for (size_t stripe = 0; stripe < packets.size(); ++stripe) {
+        stripe_args[stripe].act_quant.storage().emplace<act::tensor::Meta>().scale =
+            0.5f * static_cast<float>(stripe + 1);
+        RmdStripeBuilder builder;
+        builder.reset(stripe, stripe, 1, args.K, args.J, GGML_GEMMINI_ACTIVATION_BITS);
+        if (!builder.add_residual(0, stripe == 0 ? 0 : kBlockSize, residuals[stripe])) return false;
+        packets[stripe] = builder.finish();
+        if (!packets[stripe]) return false;
+    }
+    std::array<Correction, 3> corrections;
+    std::array<RmdStatus, 3> statuses{};
+    std::array<float, 3> shared_output{7, 7, 7};
+    std::array<float, 3> fresh_output = shared_output;
+    rmd::detail::RmdWeightPreparation shared;
+    wreader::test_reset_weight_reader_counters();
+    std::array<std::thread, 3> workers;
+    for (size_t stripe = 0; stripe < packets.size(); ++stripe) {
+        workers[stripe] = std::thread([&, stripe] {
+            statuses[stripe] = rmd::detail::execute_rmd_stripe_ws_with_weights(
+                stripe_args[stripe], *packets[stripe], corrections[stripe], shared);
+            if (statuses[stripe] == RmdStatus::success) {
+                statuses[stripe] = rmd::detail::merge_rmd_correction_with_weights(
+                    stripe_args[stripe], shared_output.data(), *packets[stripe], corrections[stripe], shared);
+            }
+        });
+    }
+    for (auto & worker : workers) worker.join();
+    const size_t shared_validations = wreader::test_weight_reader_storage_validations();
+    bool ok = check(shared_validations == 1 && shared.column_preparations() == 1 &&
+                        shared.selected_block_preparations() == 1,
+                    "concurrent stripes prepare immutable weights and selected columns once");
+    wreader::test_reset_weight_reader_counters();
+    for (size_t stripe = 0; stripe < packets.size(); ++stripe) {
+        rmd::detail::RmdWeightPreparation fresh_weights;
+        Correction fresh;
+        const int64_t expected = static_cast<int64_t>(residuals[stripe]) * 5 * (stripe == 0 ? 4 : 8);
+        ok = check(statuses[stripe] == RmdStatus::success &&
+                       std::get<BlockScaledInt64Correction>(corrections[stripe]).values ==
+                           std::vector<int64_t>{expected} &&
+                       rmd::detail::execute_rmd_stripe_ws_with_weights(
+                           stripe_args[stripe], *packets[stripe], fresh, fresh_weights) == RmdStatus::success &&
+                       direct_outputs_match(fresh, corrections[stripe]) &&
+                       rmd::detail::merge_rmd_correction_with_weights(stripe_args[stripe], fresh_output.data(),
+                           *packets[stripe], fresh, fresh_weights) == RmdStatus::success &&
+                       shared_output[stripe] == 7.0f + static_cast<float>(
+                           static_cast<double>(expected) * 0.25 * 0.5 * (stripe + 1)),
+                   "shared stripes match fresh execution and literal correction with current row scales") && ok;
+    }
+    const size_t fresh_validations = wreader::test_weight_reader_storage_validations();
+    ok = check(fresh_validations == 3 && shared_output == fresh_output,
+               "shared preparation reduces three validations to one with exact FP32 output") && ok;
+
+    const auto output_before = shared_output;
+    Correction sentinel = PreScaledFloat64Correction{{19.0}};
+    Correction correction = sentinel;
+    RmdExecutionMetrics metrics;
+    metrics.packet_call_count = 73;
+    auto malformed = *packets[0];
+    ++malformed.version;
+    size_t count = 91;
+    ok = check(rmd::detail::execute_rmd_stripe_ws_with_weights(
+                   stripe_args[0], malformed, correction, shared, &metrics) == RmdStatus::invalid_packet &&
+                   direct_outputs_match(correction, sentinel) && metrics.packet_call_count == 73,
+               "reused preparation retains packet validation and transactional failures") && ok;
+    malformed = *packets[0];
+    ++malformed.logical_j;
+    ok = check(rmd::detail::merge_rmd_correction_with_weights(stripe_args[0], shared_output.data(),
+                   malformed, corrections[0], shared, &count) == RmdStatus::invalid_arguments &&
+                   shared_output == output_before && count == 91,
+               "shared merge retains per-stripe shape checks without partial writes") && ok;
+    RmdStripeBuilder selected;
+    selected.reset(9, 0, 1, args.K, args.J, GGML_GEMMINI_ACTIVATION_BITS);
+    if (!selected.add_residual(0, 2 * kBlockSize, 1)) return false;
+    const auto mismatched = selected.finish();
+    if (!mismatched) return false;
+    ok = check(rmd::detail::execute_rmd_stripe_ws_with_weights(
+                   stripe_args[0], *mismatched, correction, shared) == RmdStatus::success &&
+                   rmd::detail::merge_rmd_correction_with_weights(stripe_args[0], shared_output.data(),
+                       *mismatched, correction, shared, &count) == RmdStatus::unsupported_route &&
+                   shared_output == output_before && count == 91 &&
+                   rmd::detail::merge_rmd_correction_with_weights(stripe_args[0], shared_output.data(),
+                       *packets[0], corrections[0], shared) == RmdStatus::success,
+               "only a selected mismatched block rejects, without poisoning disjoint stripes") && ok;
+    std::array<float, 3> public_output{7, 7, 7};
+    ok = check(merge_rmd_correction_to(stripe_args[0], public_output.data(),
+                   *packets[0], corrections[0]) == RmdStatus::success,
+               "public packet merge checks column scales only for selected blocks") && ok;
+    const auto public_before = public_output;
+    ok = check(merge_rmd_correction_to(stripe_args[0], public_output.data(),
+                   0, 1, corrections[0]) == RmdStatus::unsupported_route && public_output == public_before,
+               "public row-range merge checks all block scales without partial writes") && ok;
+    blocks[0].channel_scale = 0.125f;
+    rmd::detail::RmdWeightPreparation next_job;
+    fresh_output.fill(7.0f);
+    ok = check(rmd::detail::execute_rmd_stripe_ws_with_weights(
+                   stripe_args[0], *packets[0], correction, next_job) == RmdStatus::success &&
+                   rmd::detail::merge_rmd_correction_with_weights(stripe_args[0], fresh_output.data(),
+                       *packets[0], correction, next_job) == RmdStatus::success && fresh_output[0] == 168.25f,
+               "a fresh job reads changed metadata at the same storage address") && ok;
+    blocks[0].m = 63;
+    rmd::detail::RmdWeightPreparation overflow_job;
+    correction = sentinel;
+    ok = check(rmd::detail::execute_rmd_stripe_ws_with_weights(
+                   stripe_args[0], *packets[0], correction, overflow_job, &metrics) == RmdStatus::overflow &&
+                   direct_outputs_match(correction, sentinel) && metrics.packet_call_count == 73,
+               "a fresh job retains HP1 exponent overflow and unchanged output metrics") && ok;
+    ok = check(execute_rmd_stripe_ws(stripe_args[0], *packets[0], correction) == RmdStatus::overflow &&
+                   direct_outputs_match(correction, sentinel),
+               "public execution revalidates changed weight metadata") && ok;
+    ok = check(merge_rmd_correction_to(stripe_args[0], public_output.data(),
+                   *packets[0], corrections[0]) == RmdStatus::unsupported_route &&
+                   public_output == public_before,
+               "public merge revalidates changed scales without partial writes") && ok;
+    std::printf("SHARED_PREPARATION stripes=3 shared_validations=%zu fresh_validations=%zu columns=%zu selected_blocks=%zu\n",
+                shared_validations, fresh_validations, shared.column_preparations(),
+                shared.selected_block_preparations());
+    return ok;
+}
+
 bool test_compact_failure_matrix() {
     const CompressedOutput sentinel = {
         CompressedOutput::Domain::block_scaled_int64, 7, {13, -9, 4},
@@ -1329,9 +1866,21 @@ bool test_compact_failure_matrix() {
         CompressedOutput output = sentinel;
         RmdExecutionMetrics metrics{};
         const RmdStatus status = execute_rmd_stripe_ws(args, packet, output, &metrics);
+        const Correction correction_sentinel = PreScaledFloat64Correction{{13.25, -9.5}};
+        Correction correction = correction_sentinel;
+        RmdExecutionMetrics streaming_metrics{};
+        streaming_metrics.packet_call_count = 17;
+        streaming_metrics.matmul_call_count = 19;
+        streaming_metrics.im2p_stats.fields[0] = 23;
+        const RmdStatus streaming_status =
+            execute_rmd_stripe_ws(args, packet, correction, &streaming_metrics);
         return check(status == expected && compressed_outputs_match(output, sentinel) &&
                          metrics.packet_call_count == 0 && metrics.ws_call_count == 0 &&
-                         metrics.matmul_call_count == 0,
+                         metrics.matmul_call_count == 0 && streaming_status == expected &&
+                         direct_outputs_match(correction, correction_sentinel) &&
+                         streaming_metrics.packet_call_count == 17 &&
+                         streaming_metrics.matmul_call_count == 19 &&
+                         streaming_metrics.im2p_stats.fields[0] == 23,
                      message);
     };
 
@@ -1385,6 +1934,15 @@ bool test_compact_failure_matrix() {
     ok = fails_atomically(hp2_args, *single_packet, RmdStatus::unsupported_route,
                           "HP2 compact rejects before packet dispatch") && ok;
 
+    CompactOracleFixture forged_mask(8, WeightFamily::HP1);
+    ok = check(forged_mask.valid, "forged K-mask fixture builds") && ok;
+    if (forged_mask.valid) {
+        StripePacket malformed = *forged_mask.packet;
+        malformed.blocks.front().lane_k_masks.fill(0);
+        ok = fails_atomically(forged_mask.args, malformed, RmdStatus::invalid_packet,
+                              "forged K-mask rejects before packet dispatch") && ok;
+    }
+
     CompactOracleFixture mixed(16, WeightFamily::H1);
     mixed.args.A.allocate(CompactOracleFixture::rows,
                           CompactOracleFixture::logical_k, 8);
@@ -1411,6 +1969,37 @@ bool test_compact_failure_matrix() {
                        metrics.matmul_call_count == 0,
                    "packet/build width mismatch rejects before Gemmini dispatch") && ok;
     }
+    CompactOracleFixture truncated_native(GGML_GEMMINI_WEIGHT_BITS, WeightFamily::H1);
+    --truncated_native.args.native_weight_bytes;
+    if (truncated_native.valid) {
+        CompressedOutput output = sentinel;
+        RmdExecutionMetrics metrics{};
+        ggml::gemmini::quants::wreader::test_reset_weight_reader_counters();
+        ok = check(rmd::execute_rmd_stripe_gemmini_for_test(
+                       truncated_native.args, *truncated_native.packet, output, &metrics) ==
+                       RmdStatus::unsupported_route && compressed_outputs_match(output, sentinel) &&
+                       metrics.packet_call_count == 0 && metrics.ws_call_count == 0 &&
+                       ggml::gemmini::quants::wreader::test_weight_reader_code_address_resolutions() == 0,
+                   "truncated native weights reject before any gather or Gemmini dispatch") && ok;
+    } else {
+        ok = check(false, "truncated native fixture builds") && ok;
+    }
+    if (sizeof(elem_t) < sizeof(int16_t)) {
+        CompactOracleFixture wide_source(16, WeightFamily::HP1);
+        const std::array<uint16_t, 2> local_k = {2, 0};
+        std::array<elem_t, kArrayDim * kArrayDim> tile{};
+        tile.fill(71);
+        const auto before = tile;
+        RmdExecutionMetrics metrics{};
+        metrics.weight_values_gathered = 19;
+        metrics.weight_address_resolutions = 23;
+        ok = check(wide_source.valid && gather_weight_tile_for_test(
+                       wide_source.args, 1, local_k.data(), local_k.size(), 1, 2,
+                       tile.data(), kArrayDim, &metrics) == RmdStatus::overflow &&
+                       tile == before && metrics.weight_values_gathered == 19 &&
+                       metrics.weight_address_resolutions == 23,
+                   "late code narrowing overflow preserves the whole tile and metrics") && ok;
+    }
 #else
     ok = check(false, "compact failure matrix requires GGML_GEMMINI_TESTING") && ok;
 #endif
@@ -1431,6 +2020,17 @@ bool test_compact_failure_matrix() {
                        metrics.packet_call_count == 0 && metrics.ws_call_count == 0 &&
                        metrics.matmul_call_count == 0,
                    "checked int64 block-scale overflow is failure-atomic") && ok;
+        const Correction correction_sentinel = PreScaledFloat64Correction{{13.25, -9.5}};
+        Correction correction = correction_sentinel;
+        metrics.packet_call_count = 17;
+        metrics.matmul_call_count = 19;
+        metrics.im2p_stats.fields[0] = 23;
+        ok = check(execute_rmd_stripe_reference(scale_overflow.args, *scale_overflow.packet,
+                                                correction, &metrics) == RmdStatus::overflow &&
+                       direct_outputs_match(correction, correction_sentinel) &&
+                       metrics.packet_call_count == 17 && metrics.matmul_call_count == 19 &&
+                       metrics.im2p_stats.fields[0] == 23,
+                   "streaming scale overflow preserves correction and existing metrics") && ok;
 #else
         ok = check(false, "scale overflow oracle requires GGML_GEMMINI_TESTING") && ok;
 #endif
@@ -1445,6 +2045,21 @@ bool test_compact_failure_matrix() {
         ok = fails_atomically(malformed.args, packet, RmdStatus::invalid_packet,
                               "malformed compact packet is failure-atomic") && ok;
     }
+
+    ggml_gemmini_args_t dense;
+    std::array<elem_t, kBlockSize> codes{};
+    dense.B = codes.data();
+    dense.J = 1;
+    dense.K = kBlockSize;
+    dense.sB = std::numeric_limits<size_t>::max();
+    dense.weight_i8_scale_active = true;
+    dense.weight_scale = 1.0f;
+    const uint16_t local_k = 0;
+    std::array<int32_t, kArrayDim * kArrayDim> tile{};
+    tile.fill(71);
+    ok = check(gather_wide_weight_tile_for_test(dense, 0, &local_k, 1, 0, 1,
+                   tile.data(), kArrayDim) == RmdStatus::execution_failed && tile[0] == 71,
+               "nonhierarchical gather still validates storage extent before reading") && ok;
 
     if (ok) {
         std::puts(
@@ -1685,9 +2300,9 @@ int main(int argc, char ** argv) {
 
     bool ok = true;
     if (selection == TestSelection::all || selection == TestSelection::happy_table) {
-        ok = test_balanced_radix_decomposition() && ok;
         ok = test_width_native_radix_happy_boundaries() && ok;
         ok = test_width_native_compose_and_expand() && ok;
+        ok = test_top_carry_lane_preserves_sparse_mask() && ok;
         ok = test_EXPLICIT_BLOCK_ID_DIM_PADDING() && ok;
         ok = test_empty_residual_is_empty_success() && ok;
         ok = test_cpu_capture_is_canonical_and_packet_free() && ok;
@@ -1697,8 +2312,7 @@ int main(int argc, char ** argv) {
         ok = test_weight_capability_happy_table() && ok;
     }
     if (selection == TestSelection::all || selection == TestSelection::failure_table) {
-        ok = test_q4_nonzero_fails_explicitly() && ok;
-        ok = test_width_native_first_too_wide_is_atomic() && ok;
+        ok = test_width_native_out_of_int32_compose_is_atomic() && ok;
         ok = test_width_native_malformed_compose_is_atomic() && ok;
         ok = test_padding_overflow_fails() && ok;
         ok = test_direct_payload_validation_rejects_malformed_contracts() && ok;
@@ -1714,16 +2328,23 @@ int main(int argc, char ** argv) {
     }
     if (selection == TestSelection::all || selection == TestSelection::compact_happy) {
         ok = test_compact_oracle_happy_matrix() && ok;
+        for (size_t rows : {size_t{1}, size_t{2}, size_t{8},
+                            kArrayDim - 1, kArrayDim, kArrayDim + 1}) {
+            ok = test_full_int32_compact_direct_agreement(rows) && ok;
+        }
+        ok = test_shared_weight_preparation() && ok;
     }
     if (selection == TestSelection::all || selection == TestSelection::compact_failure) {
         ok = test_compact_failure_matrix() && ok;
+        ok = test_streaming_assembler_boundaries() && ok;
     }
     if (selection == TestSelection::radix_happy) {
         ok = test_width_native_radix_happy_boundaries() && ok;
         ok = test_width_native_compose_and_expand() && ok;
+        ok = test_top_carry_lane_preserves_sparse_mask() && ok;
     }
     if (selection == TestSelection::radix_failure) {
-        ok = test_width_native_first_too_wide_is_atomic() && ok;
+        ok = test_width_native_out_of_int32_compose_is_atomic() && ok;
         ok = test_width_native_malformed_compose_is_atomic() && ok;
     }
     if (ok) {
@@ -1737,7 +2358,7 @@ int main(int argc, char ** argv) {
             selection == TestSelection::compact_failure ?
                 "PASS: matched-width compact failure matrix" :
             selection == TestSelection::radix_happy ?
-                "PASS: width-native radix signed-21 boundaries" :
+                "PASS: width-native radix full int32 boundaries" :
             selection == TestSelection::radix_failure ?
                 "PASS: width-native radix rejection and malformed metadata atomicity" :
             selection == TestSelection::failure_table ?

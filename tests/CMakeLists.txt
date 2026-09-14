@@ -848,8 +848,6 @@ if (GEMMINI_BUILD_SRMD_RAW_WS_TESTS)
         ../ggml/src/ggml-gemmini/residual/rmd)
     add_test(NAME test-gemmini-srmd-raw-ws-cpu
         COMMAND $<TARGET_FILE:test-gemmini-srmd-raw-ws> --cpu)
-    add_test(NAME test-gemmini-srmd-layouts-cpu
-        COMMAND $<TARGET_FILE:test-gemmini-srmd-raw-ws> --bench-layouts)
 endif()
 
 if (_GGML_GEMMINI_ACTIVATION_BITS_VALUE EQUAL 8 AND

@@ -69,6 +69,19 @@ namespace ggml::gemmini::quants::wreader
         size_t j,
         size_t k);
 
+    // Same plan lifetime as read_code_validated. Values are DIM-by-DIM caller
+    // scratch; native H1/HP1 resolves one block per column, others use checked reads.
+    WeightReaderStatus read_code_tile_validated(
+        const ggml_gemmini_args_t &args,
+        const wroute::WeightRoutePlan &plan,
+        size_t block_index,
+        const uint16_t *local_k,
+        size_t valid_k,
+        size_t col_base,
+        size_t valid_cols,
+        int32_t *values,
+        size_t &address_resolutions);
+
     WeightScaleResult read_scale(
         const ggml_gemmini_args_t &args,
         const wroute::WeightRoutePlan &plan,
@@ -86,5 +99,6 @@ namespace ggml::gemmini::quants::wreader
 #if defined(GGML_GEMMINI_TESTING)
     void test_reset_weight_reader_counters();
     size_t test_weight_reader_storage_validations();
+    size_t test_weight_reader_code_address_resolutions();
 #endif
 }
