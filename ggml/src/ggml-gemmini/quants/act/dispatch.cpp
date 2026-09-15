@@ -43,8 +43,10 @@ ActivationMetadataView::ActivationMetadataView(const ggml_gemmini_args_t &source
     if (global_row_begin > global_row_end)
         return;
 
-    rows_per_stripe_ = source.I;
-    if (source.tile_I > 0 && !checked_mul_size(source.tile_I, DIM, rows_per_stripe_))
+    rows_per_stripe_ = source.activation_rows_per_stripe > 0 ?
+        source.activation_rows_per_stripe : source.I;
+    if (source.activation_rows_per_stripe == 0 && source.tile_I > 0 &&
+        !checked_mul_size(source.tile_I, DIM, rows_per_stripe_))
         return;
     if (rows_per_stripe_ == 0 ||
         global_row_end > std::numeric_limits<size_t>::max() - (rows_per_stripe_ - 1))

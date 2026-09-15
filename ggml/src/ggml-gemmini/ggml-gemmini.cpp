@@ -2200,7 +2200,12 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             if (!quantize_activation()) {
                 throw std::runtime_error("existing activation quantizer failed");
             }
-        }, layer, src0->type == GGML_TYPE_Q8_H1 || src0->type == GGML_TYPE_Q8_HP1);
+        }, layer,
+#if defined(IM2P_FPGA_ARCH_GEMMINI_HP1)
+            gemmini_hp1_native_weight_supported(src0->type));
+#else
+            src0->type == GGML_TYPE_Q8_H1 || src0->type == GGML_TYPE_Q8_HP1);
+#endif
         if (success) ++fpga_completed;
         if (!success) {
             GGML_LOG_ERROR("FPGA_UART execution failed: %s\n", ggml_gemmini_fpga_last_error().c_str());

@@ -36,6 +36,8 @@ function(write_profile path bits dim)
         "  \"scu\": \"hp1-left-shift\",\n"
         "  \"packing\": \"${packing}\",\n"
         "  \"numerical_revision\": \"hp1-fragment-sat32-v1\",\n"
+        "  \"rmd_raw\": true,\n"
+        "  \"rmd_numerical_revision\": \"rmd-raw-k32-cpu-compose-v1\",\n"
         "  \"memory\": {\"bank_count\": 4, \"bank_rows\": ${bank_rows}, "
         "\"accumulator_rows\": ${accumulator_rows}, \"scratchpad_row_bytes\": ${scratchpad_row_bytes}, "
         "\"accumulator_row_bytes\": ${accumulator_row_bytes}, \"scratchpad_total_bytes\": 262144, "
@@ -88,6 +90,11 @@ foreach(bits IN ITEMS 4 8)
         expect_contains("${output}" "GGML_GEMMINI_WEIGHT_BITS_DEFAULT=${bits}")
         expect_contains("${output}" "GGML_GEMMINI_DIM_DEFAULT=${dim}")
         expect_contains("${output}" "IM2P_FPGA_ARCH_DEFAULT=GEMMINI_HP1")
+        run_resolver("a${bits}w${bits}-d${dim}-rmd" TRUE rmd_output
+            -DIM2P_FPGA_ARCH=GEMMINI_HP1
+            -DIM2P_GEMMINI_RESOLVED_PROFILE=${profile}
+            -DGGML_GEMMINI_ENABLE_RMD=ON)
+        expect_contains("${rmd_output}" "GGML_GEMMINI_ENABLE_RMD_DEFAULT=ON")
     endforeach()
 endforeach()
 
@@ -109,11 +116,27 @@ expect_contains("${legacy_output}" "GGML_GEMMINI_DIM_DEFAULT=16")
 expect_contains("${legacy_output}" "GGML_GEMMINI_ENABLE_RMD_DEFAULT=ON")
 
 set(profile "${TEST_BINARY_ROOT}/a4w4-d16-hp1.json")
-run_resolver(rmd-on FALSE rmd_output
+file(READ "${profile}" dense_only_text)
+string(REPLACE "\"rmd_raw\": true" "\"rmd_raw\": false" dense_only_text "${dense_only_text}")
+file(WRITE "${TEST_BINARY_ROOT}/dense-only.json" "${dense_only_text}")
+run_resolver(rmd-dense-only FALSE rmd_output
+    -DIM2P_FPGA_ARCH=GEMMINI_HP1
+    -DIM2P_GEMMINI_RESOLVED_PROFILE=${TEST_BINARY_ROOT}/dense-only.json
+    -DGGML_GEMMINI_ENABLE_RMD=ON)
+expect_contains("${rmd_output}" "GEMMINI_HP1 RMD ON requires the RMD_RAW manifest contract")
+
+run_resolver(rmd-invalid FALSE rmd_output
     -DIM2P_FPGA_ARCH=GEMMINI_HP1
     -DIM2P_GEMMINI_RESOLVED_PROFILE=${profile}
+    -DGGML_GEMMINI_ENABLE_RMD=invalid)
+expect_contains("${rmd_output}" "GGML_GEMMINI_ENABLE_RMD must be ON or OFF")
+
+run_resolver(rmd-non-exsia FALSE rmd_output
+    -DIM2P_FPGA_ARCH=GEMMINI_HP1
+    -DIM2P_GEMMINI_RESOLVED_PROFILE=${profile}
+    -DGGML_GEMMINI_ACTIVATION_QUANT=TOKEN
     -DGGML_GEMMINI_ENABLE_RMD=ON)
-expect_contains("${rmd_output}" "GEMMINI_HP1 requires GGML_GEMMINI_ENABLE_RMD=OFF")
+expect_contains("${rmd_output}" "non-EXSIA activation requires GGML_GEMMINI_ENABLE_RMD=OFF")
 
 run_resolver(profile-mismatch FALSE mismatch_output
     -DIM2P_FPGA_ARCH=GEMMINI_HP1

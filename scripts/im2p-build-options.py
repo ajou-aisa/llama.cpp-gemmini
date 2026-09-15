@@ -20,7 +20,7 @@ class BuildConfigurationError(ValueError):
     pass
 
 
-def load_hp1_profile(path):
+def load_hp1_profile(path, require_rmd: bool = False):
     try:
         profile = json.loads(Path(path).read_text())
     except (OSError, json.JSONDecodeError) as error:
@@ -71,6 +71,9 @@ def load_hp1_profile(path):
     if not profile.get('host_contract_source') or not isinstance(contract_hash, str) or \
             len(contract_hash) != 64 or any(character not in '0123456789abcdef' for character in contract_hash):
         raise BuildConfigurationError('GEMMINI_HP1 resolved profile host contract identity is invalid')
+    if require_rmd and (profile.get('rmd_raw') is not True or
+                        profile.get('rmd_numerical_revision') != 'rmd-raw-k32-cpu-compose-v1'):
+        raise BuildConfigurationError('GEMMINI_HP1 RMD ON requires the RMD_RAW manifest contract')
     return profile
 
 
@@ -160,7 +163,7 @@ def resolve(build_dir, platform, defaults, args, environment):
             manifest = effective.get('IM2P_GEMMINI_RESOLVED_PROFILE')
             if not manifest:
                 raise BuildConfigurationError('GEMMINI_HP1 requires IM2P_GEMMINI_RESOLVED_PROFILE')
-            profile = load_hp1_profile(manifest)
+            profile = load_hp1_profile(manifest, effective.get('GGML_GEMMINI_ENABLE_RMD') == 'ON')
             profile_label = 'GEMMINI_HP1'
             resolved = {
                 'GGML_GEMMINI_ACTIVATION_BITS': str(profile['activation_bits']),
@@ -183,8 +186,7 @@ def resolve(build_dir, platform, defaults, args, environment):
             if name == 'GGML_GEMMINI_ENABLE_RMD' and origin.get(name, 'default') != 'default':
                 if effective.get(name) not in ('ON', 'OFF'):
                     raise BuildConfigurationError('GGML_GEMMINI_ENABLE_RMD must be ON or OFF')
-                if fpga_arch != 'GEMMINI_HP1' or effective.get(name) == required:
-                    continue
+                continue
             if origin.get(name, 'default') != 'default' and effective.get(name) != required:
                 raise BuildConfigurationError(f'{profile_label} requires {name}={required}; got {effective.get(name)!r} from {origin[name]}')
             effective[name] = required
@@ -210,7 +212,10 @@ def resolve(build_dir, platform, defaults, args, environment):
 def main():
     if sys.argv[1:2] == ['--validate-hp1-profile']:
         try:
-            profile = load_hp1_profile(sys.argv[2])
+            rmd = normalize('GGML_GEMMINI_ENABLE_RMD', sys.argv[7]) if len(sys.argv) > 7 else 'OFF'
+            if rmd not in ('ON', 'OFF'):
+                raise BuildConfigurationError('GGML_GEMMINI_ENABLE_RMD must be ON or OFF')
+            profile = load_hp1_profile(sys.argv[2], rmd == 'ON')
             requested = tuple(map(int, sys.argv[3:7]))
             actual = (profile['activation_bits'], profile['weight_bits'], profile['dim'], profile['block_size'])
             if requested != actual:

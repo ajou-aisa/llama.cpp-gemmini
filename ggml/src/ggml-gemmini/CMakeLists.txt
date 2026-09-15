@@ -209,6 +209,7 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "FPGA_UART")
   if(IM2P_FPGA_ARCH STREQUAL "GEMMINI_HP1")
     target_sources(ggml-gemmini PRIVATE
       "${GGML_GEMMINI_FPGA_SOURCE_DIR}/ggml-gemmini-fpga.cpp"
+      "${GGML_GEMMINI_FPGA_SOURCE_DIR}/rmd.cpp"
       "${GGML_GEMMINI_FPGA_SOURCE_DIR}/uart.cpp")
   else()
     target_sources(ggml-gemmini PRIVATE

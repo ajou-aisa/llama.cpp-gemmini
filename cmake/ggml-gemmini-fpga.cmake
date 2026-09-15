@@ -17,6 +17,11 @@ set(_fpga_required
         "${GGML_GEMMINI_FPGA_SOURCE_DIR}/ggml-gemmini-fpga.hpp"
         "${GGML_GEMMINI_FPGA_SOURCE_DIR}/uart.cpp"
         "${GGML_GEMMINI_FPGA_SOURCE_DIR}/uart.hpp")
+if(IM2P_FPGA_ARCH STREQUAL "GEMMINI_HP1")
+    list(APPEND _fpga_required
+        "${GGML_GEMMINI_FPGA_SOURCE_DIR}/rmd.hpp"
+        "${GGML_GEMMINI_FPGA_SOURCE_DIR}/rmd.cpp")
+endif()
 if(NOT IM2P_FPGA_ARCH STREQUAL "GEMMINI_HP1")
     list(APPEND _fpga_required
         "${GGML_GEMMINI_FPGA_SOURCE_DIR}/rtl_plugin.hpp"
@@ -66,7 +71,7 @@ if(IM2P_FPGA_ARCH STREQUAL "GEMMINI_HP1")
         set(_fpga_packing signed-int8)
     endif()
     set(_fpga_identity
-        "ABI5;GEMMINI_HP1;HP1_ONLY;${IM2P_GEMMINI_PROFILE_ID};A${GGML_GEMMINI_ACTIVATION_BITS}/W${GGML_GEMMINI_WEIGHT_BITS}/D${GGML_GEMMINI_DIM};ACC32;block32;${_fpga_packing};hp1-fragment-sat32-v1;RMD_OFF\n")
+        "ABI5;GEMMINI_HP1;HP1_ONLY;${IM2P_GEMMINI_PROFILE_ID};A${GGML_GEMMINI_ACTIVATION_BITS}/W${GGML_GEMMINI_WEIGHT_BITS}/D${GGML_GEMMINI_DIM};ACC32;block32;${_fpga_packing};hp1-fragment-sat32-v1;RMD_${GGML_GEMMINI_ENABLE_RMD};rmd-raw-k32-cpu-compose-v1\n")
 else()
     set(_fpga_identity "ABI5;IFR3;signed-scu-sat-v2;H1;domain2;IFR4;RTL_PLUGIN1;scu_final_integer;H1:op4,HP1:op5;domain2;explicit_main_external:domain1;A8/W8/D16;block32;RMD_${GGML_GEMMINI_ENABLE_RMD}\n")
 endif()
@@ -87,7 +92,9 @@ set(_fpga_inputs
         "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-common.h"
         "${GGML_GEMMINI_GENERATED_CONFIG_DIR}/ggml-gemmini-matmul-config.hpp")
 if(IM2P_FPGA_ARCH STREQUAL "GEMMINI_HP1")
-    list(APPEND _fpga_inputs "${IM2P_GEMMINI_RESOLVED_PROFILE}")
+    list(APPEND _fpga_inputs "${IM2P_GEMMINI_RESOLVED_PROFILE}"
+        "${GGML_GEMMINI_FPGA_SOURCE_DIR}/rmd.hpp"
+        "${GGML_GEMMINI_FPGA_SOURCE_DIR}/rmd.cpp")
 else()
     list(APPEND _fpga_inputs
         "${GGML_GEMMINI_FPGA_SOURCE_DIR}/rtl_plugin.hpp"
@@ -153,7 +160,7 @@ file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/fpga-build-contract.txt"
     "${_fpga_identity}fingerprint=${_fpga_fingerprint}\nabi_runtime=${GGML_GEMMINI_FPGA_ABI_RUNTIME}\n")
 if(IM2P_FPGA_ARCH STREQUAL "GEMMINI_HP1")
     message(STATUS
-        "GEMMINI backend=FPGA_UART architecture=GEMMINI_HP1 profile=${IM2P_GEMMINI_PROFILE_ID} HP1-only ACC32 block32 RMD=OFF ABI_RUNTIME=${GGML_GEMMINI_FPGA_ABI_RUNTIME}")
+        "GEMMINI backend=FPGA_UART architecture=GEMMINI_HP1 profile=${IM2P_GEMMINI_PROFILE_ID} HP1-only ACC32 block32 RMD=${GGML_GEMMINI_ENABLE_RMD} CPU-compose ABI_RUNTIME=${GGML_GEMMINI_FPGA_ABI_RUNTIME}")
 else()
     message(STATUS "GEMMINI backend=FPGA_UART ABI5 IFR3 H1 domain2; IFR4/rtl native H1 op4, HP1 op5, SCU final domain2; explicit main_external domain1; RMD=${GGML_GEMMINI_ENABLE_RMD} (SCU residual merge unavailable) ABI_RUNTIME=${GGML_GEMMINI_FPGA_ABI_RUNTIME}")
 endif()
