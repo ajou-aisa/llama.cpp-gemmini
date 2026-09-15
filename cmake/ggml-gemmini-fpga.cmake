@@ -3,20 +3,28 @@
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(FATAL_ERROR "FPGA_UART currently supports Linux hosts only")
 endif()
-set(GGML_GEMMINI_FPGA_SOURCE_DIR "${IM2P_SIM_ROOT}/fpga/scu_block_scale" CACHE PATH
-    "Selected IFR3 SCU adapter source directory")
-foreach(_required IN ITEMS
+if(IM2P_FPGA_ARCH STREQUAL "GEMMINI_HP1")
+    set(GGML_GEMMINI_FPGA_SOURCE_DIR "${IM2P_SIM_ROOT}/fpga/gemmini_hp1/host")
+else()
+    set(GGML_GEMMINI_FPGA_SOURCE_DIR "${IM2P_SIM_ROOT}/fpga/scu_block_scale" CACHE PATH
+        "Selected IFR3 SCU adapter source directory")
+endif()
+set(_fpga_required
         "${IM2P_SIM_ROOT}/sim/include/im2p_sim.h"
         "${IM2P_SIM_ROOT}/frontend/include/im2p_gemmini_frontend.hpp"
         "${IM2P_SIM_ROOT}/frontend/src/im2p_gemmini_frontend.cpp"
         "${GGML_GEMMINI_FPGA_SOURCE_DIR}/ggml-gemmini-fpga.cpp"
         "${GGML_GEMMINI_FPGA_SOURCE_DIR}/ggml-gemmini-fpga.hpp"
         "${GGML_GEMMINI_FPGA_SOURCE_DIR}/uart.cpp"
+        "${GGML_GEMMINI_FPGA_SOURCE_DIR}/uart.hpp")
+if(NOT IM2P_FPGA_ARCH STREQUAL "GEMMINI_HP1")
+    list(APPEND _fpga_required
         "${GGML_GEMMINI_FPGA_SOURCE_DIR}/rtl_plugin.hpp"
         "${GGML_GEMMINI_FPGA_SOURCE_DIR}/window_uart.hpp"
         "${GGML_GEMMINI_FPGA_SOURCE_DIR}/window_uart.cpp"
-        "${GGML_GEMMINI_FPGA_SOURCE_DIR}/window_protocol.hpp"
-        "${GGML_GEMMINI_FPGA_SOURCE_DIR}/uart.hpp")
+        "${GGML_GEMMINI_FPGA_SOURCE_DIR}/window_protocol.hpp")
+endif()
+foreach(_required IN LISTS _fpga_required)
     if(NOT EXISTS "${_required}" OR IS_DIRECTORY "${_required}")
         message(FATAL_ERROR "FPGA_UART missing selected input: ${_required}")
     endif()
@@ -51,7 +59,17 @@ endif()
 
 # The cache key records source/ABI/artifact/compiler/target and linkage mode.
 # Reconfiguration refreshes the identity and rebuilds affected targets in place.
-set(_fpga_identity "ABI5;IFR3;signed-scu-sat-v2;H1;domain2;IFR4;RTL_PLUGIN1;scu_final_integer;H1:op4,HP1:op5;domain2;explicit_main_external:domain1;A8/W8/D16;block32;RMD_${GGML_GEMMINI_ENABLE_RMD}\n")
+if(IM2P_FPGA_ARCH STREQUAL "GEMMINI_HP1")
+    if(GGML_GEMMINI_ACTIVATION_BITS STREQUAL "4")
+        set(_fpga_packing signed-int4-low-nibble-first)
+    else()
+        set(_fpga_packing signed-int8)
+    endif()
+    set(_fpga_identity
+        "ABI5;GEMMINI_HP1;HP1_ONLY;${IM2P_GEMMINI_PROFILE_ID};A${GGML_GEMMINI_ACTIVATION_BITS}/W${GGML_GEMMINI_WEIGHT_BITS}/D${GGML_GEMMINI_DIM};ACC32;block32;${_fpga_packing};hp1-fragment-sat32-v1;RMD_OFF\n")
+else()
+    set(_fpga_identity "ABI5;IFR3;signed-scu-sat-v2;H1;domain2;IFR4;RTL_PLUGIN1;scu_final_integer;H1:op4,HP1:op5;domain2;explicit_main_external:domain1;A8/W8/D16;block32;RMD_${GGML_GEMMINI_ENABLE_RMD}\n")
+endif()
 set(_fpga_inputs
         "${IM2P_SIM_ROOT}/sim/include/im2p_sim.h"
         "${IM2P_SIM_ROOT}/frontend/include/im2p_gemmini_frontend.hpp"
@@ -60,10 +78,6 @@ set(_fpga_inputs
         "${GGML_GEMMINI_FPGA_SOURCE_DIR}/ggml-gemmini-fpga.cpp"
         "${GGML_GEMMINI_FPGA_SOURCE_DIR}/uart.hpp"
         "${GGML_GEMMINI_FPGA_SOURCE_DIR}/uart.cpp"
-        "${GGML_GEMMINI_FPGA_SOURCE_DIR}/rtl_plugin.hpp"
-        "${GGML_GEMMINI_FPGA_SOURCE_DIR}/window_uart.hpp"
-        "${GGML_GEMMINI_FPGA_SOURCE_DIR}/window_uart.cpp"
-        "${GGML_GEMMINI_FPGA_SOURCE_DIR}/window_protocol.hpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt"
         "${CMAKE_CURRENT_LIST_FILE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/ggml/CMakeLists.txt"
@@ -72,6 +86,15 @@ set(_fpga_inputs
         "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-quants.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-common.h"
         "${GGML_GEMMINI_GENERATED_CONFIG_DIR}/ggml-gemmini-matmul-config.hpp")
+if(IM2P_FPGA_ARCH STREQUAL "GEMMINI_HP1")
+    list(APPEND _fpga_inputs "${IM2P_GEMMINI_RESOLVED_PROFILE}")
+else()
+    list(APPEND _fpga_inputs
+        "${GGML_GEMMINI_FPGA_SOURCE_DIR}/rtl_plugin.hpp"
+        "${GGML_GEMMINI_FPGA_SOURCE_DIR}/window_uart.hpp"
+        "${GGML_GEMMINI_FPGA_SOURCE_DIR}/window_uart.cpp"
+        "${GGML_GEMMINI_FPGA_SOURCE_DIR}/window_protocol.hpp")
+endif()
 # Include transitive metadata/quantizer headers and backend control flow, not
 # just the frontend's two direct headers. Whole CLI/source sealing is separate.
 foreach(_tree IN ITEMS
@@ -128,5 +151,10 @@ set(GGML_GEMMINI_FPGA_CONFIG_FINGERPRINT "${_fpga_fingerprint}" CACHE INTERNAL "
 set(GGML_GEMMINI_FPGA_BUILD_ID "${_fpga_fingerprint}")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/fpga-build-contract.txt"
     "${_fpga_identity}fingerprint=${_fpga_fingerprint}\nabi_runtime=${GGML_GEMMINI_FPGA_ABI_RUNTIME}\n")
-message(STATUS "GEMMINI backend=FPGA_UART ABI5 IFR3 H1 domain2; IFR4/rtl native H1 op4, HP1 op5, SCU final domain2; explicit main_external domain1; RMD=${GGML_GEMMINI_ENABLE_RMD} (SCU residual merge unavailable) ABI_RUNTIME=${GGML_GEMMINI_FPGA_ABI_RUNTIME}")
+if(IM2P_FPGA_ARCH STREQUAL "GEMMINI_HP1")
+    message(STATUS
+        "GEMMINI backend=FPGA_UART architecture=GEMMINI_HP1 profile=${IM2P_GEMMINI_PROFILE_ID} HP1-only ACC32 block32 RMD=OFF ABI_RUNTIME=${GGML_GEMMINI_FPGA_ABI_RUNTIME}")
+else()
+    message(STATUS "GEMMINI backend=FPGA_UART ABI5 IFR3 H1 domain2; IFR4/rtl native H1 op4, HP1 op5, SCU final domain2; explicit main_external domain1; RMD=${GGML_GEMMINI_ENABLE_RMD} (SCU residual merge unavailable) ABI_RUNTIME=${GGML_GEMMINI_FPGA_ABI_RUNTIME}")
+endif()
 message(STATUS "GEMMINI FPGA provisioning: none; physical external executor")

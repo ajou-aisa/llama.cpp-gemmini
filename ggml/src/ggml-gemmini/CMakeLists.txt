@@ -189,22 +189,43 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "FPGA_UART")
   target_compile_options(ggml-gemmini-fpga-frontend PRIVATE -O2 -fno-fast-math)
   target_compile_definitions(ggml-gemmini-fpga-frontend PRIVATE
     ${GGML_GEMMINI_COMPILE_DEFS}
-    IM2P_GEMMINI_EXTERNAL_EXECUTOR_ONLY=1
-    IM2P_GEMMINI_FRONTEND_EXPECTED_DIM=16
-    IM2P_GEMMINI_FRONTEND_ACTIVATION_BITS=8)
+    IM2P_GEMMINI_EXTERNAL_EXECUTOR_ONLY=1)
+  if(IM2P_FPGA_ARCH STREQUAL "GEMMINI_HP1")
+    target_compile_definitions(ggml-gemmini-fpga-frontend PRIVATE
+      IM2P_GEMMINI_FRONTEND_EXPECTED_DIM=${GGML_GEMMINI_DIM}
+      IM2P_GEMMINI_FRONTEND_ACTIVATION_BITS=${GGML_GEMMINI_ACTIVATION_BITS}
+      IM2P_FPGA_ARCH_GEMMINI_HP1=1)
+  else()
+    target_compile_definitions(ggml-gemmini-fpga-frontend PRIVATE
+      IM2P_GEMMINI_FRONTEND_EXPECTED_DIM=16
+      IM2P_GEMMINI_FRONTEND_ACTIVATION_BITS=8)
+  endif()
   target_include_directories(ggml-gemmini-fpga-frontend PRIVATE
     "${IM2P_SIM_ROOT}/frontend/include" "${IM2P_SIM_ROOT}/sim/include"
     "${GGML_GEMMINI_GENERATED_CONFIG_DIR}" "${CMAKE_CURRENT_LIST_DIR}"
     "${CMAKE_CURRENT_LIST_DIR}/../../include" "${CMAKE_CURRENT_LIST_DIR}/.."
     "${CMAKE_CURRENT_LIST_DIR}/../ggml-gemmini-utils/include" "${GEMMINI_SW_PATH}")
 
-  target_sources(ggml-gemmini PRIVATE
-    "${GGML_GEMMINI_FPGA_SOURCE_DIR}/ggml-gemmini-fpga.cpp"
-    "${GGML_GEMMINI_FPGA_SOURCE_DIR}/uart.cpp"
-    "${GGML_GEMMINI_FPGA_SOURCE_DIR}/window_uart.cpp")
+  if(IM2P_FPGA_ARCH STREQUAL "GEMMINI_HP1")
+    target_sources(ggml-gemmini PRIVATE
+      "${GGML_GEMMINI_FPGA_SOURCE_DIR}/ggml-gemmini-fpga.cpp"
+      "${GGML_GEMMINI_FPGA_SOURCE_DIR}/uart.cpp")
+  else()
+    target_sources(ggml-gemmini PRIVATE
+      "${GGML_GEMMINI_FPGA_SOURCE_DIR}/ggml-gemmini-fpga.cpp"
+      "${GGML_GEMMINI_FPGA_SOURCE_DIR}/uart.cpp"
+      "${GGML_GEMMINI_FPGA_SOURCE_DIR}/window_uart.cpp")
+  endif()
   target_compile_features(ggml-gemmini PRIVATE cxx_std_20)
-  target_compile_definitions(ggml-gemmini PRIVATE
-    IM2P_FPGA_PROTOCOL_VERSION=3 IM2P_FPGA_BUILD_ID="${GGML_GEMMINI_FPGA_BUILD_ID}")
+  if(IM2P_FPGA_ARCH STREQUAL "GEMMINI_HP1")
+    target_compile_definitions(ggml-gemmini PRIVATE
+      IM2P_FPGA_ARCH_GEMMINI_HP1=1
+      IM2P_FPGA_PROFILE_ID="${IM2P_GEMMINI_PROFILE_ID}"
+      IM2P_FPGA_BUILD_ID="${GGML_GEMMINI_FPGA_BUILD_ID}")
+  else()
+    target_compile_definitions(ggml-gemmini PRIVATE
+      IM2P_FPGA_PROTOCOL_VERSION=3 IM2P_FPGA_BUILD_ID="${GGML_GEMMINI_FPGA_BUILD_ID}")
+  endif()
   if (DEFINED IM2P_FPGA_DEFAULT_DEVICE AND NOT IM2P_FPGA_DEFAULT_DEVICE STREQUAL "")
     target_compile_definitions(ggml-gemmini PRIVATE
       IM2P_FPGA_DEFAULT_DEVICE="${IM2P_FPGA_DEFAULT_DEVICE}")
