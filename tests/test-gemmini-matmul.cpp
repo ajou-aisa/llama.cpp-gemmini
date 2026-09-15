@@ -72,6 +72,11 @@ bool counters_zero(const MatmulTestCounters & counters) {
         counters.hardware_dispatches == 0 && counters.fallback_dispatches == 0;
 }
 
+bool test_hp1_native_weight_admission() {
+    return expect(test_hp1_native_weight_admission_contract(),
+                  "GEMMINI_HP1 admits only the native HP1 weight for the configured width");
+}
+
 bool test_removed_sequential_rejects_before_work() {
     std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
     std::vector<elem_t> weights = { 1, -1, 2, 3 };
@@ -1472,6 +1477,9 @@ bool test_q16_pipeline_owns_args_snapshot() {
 }
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--case=hp1-native-admission") {
+        return test_hp1_native_weight_admission() ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--invalid-geometry-probe") {
         const bool ok = test_invalid_geometry_rejects_before_allocation();
         const auto counters = test_matmul_counters();
@@ -1557,12 +1565,14 @@ int main(int argc, char ** argv) {
         return ok ? 0 : 1;
     }
 #if GGML_GEMMINI_ACTIVATION_BITS == 16 && GGML_GEMMINI_WEIGHT_BITS == 16
-    if (!test_native_q16_hp1_cpu_dense_output() ||
+    if (!test_hp1_native_weight_admission() ||
+        !test_native_q16_hp1_cpu_dense_output() ||
         !test_q16_pipeline_owns_args_snapshot()) {
         return 1;
     }
 #else
-    if (!test_removed_sequential_rejects_before_work() ||
+    if (!test_hp1_native_weight_admission() ||
+        !test_removed_sequential_rejects_before_work() ||
         !test_invalid_geometry_rejects_before_allocation() ||
         !test_output_parity() || !test_single_row_pipeline() ||
         !test_native_q4_hp1_cpu_dense_output() ||

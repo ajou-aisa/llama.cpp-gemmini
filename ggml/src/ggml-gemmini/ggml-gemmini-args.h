@@ -772,6 +772,7 @@ GGML_API bool test_probe_fp_facade_layer(const std::string & layer);
 
 #if defined(GGML_GEMMINI_TESTING)
 namespace ggml::gemmini {
+GGML_API bool test_hp1_native_weight_admission_contract();
 GGML_API std::string test_resolve_backend_matmul_layer(
     std::string_view model_arch, std::string_view weight_name,
     std::string_view input_name, std::string_view consumer_name);
