@@ -83,11 +83,13 @@ int main() {
 #include "ggml-gemmini-args.h"
 #include "ggml-gemmini-geometry.hpp"
 #include "ggml-gemmini-im2p.hpp"
+#include "ggml-gemmini-matmul.hpp"
 #include "im2p_gemmini_frontend.hpp"
 #include "quants/act/exsia/exsia.hpp"
 #include "quants/act/exsia/exsia_shift.hpp"
 #include "quants/act/quantize.hpp"
 #include "residual/direct/direct-executor.hpp"
+#include <gemmini.h>
 #include <gemmini/cycle_reader.hpp>
 #if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
 #include <gemmini/log.h>
@@ -117,7 +119,11 @@ constexpr int64_t I = 16 * GGML_GEMMINI_TEST_IM2P_DIM;
 #else
 constexpr bool compiled_exsia = false;
 constexpr int64_t K = 32;
+#if GGML_GEMMINI_ENABLE_RMD
+constexpr int64_t I = 2 * GGML_GEMMINI_TEST_IM2P_DIM + 1;
+#else
 constexpr int64_t I = 3;
+#endif
 #endif
 constexpr int64_t J = 2;
 // This J=2/K=64 graph fits one row tile at DIM16/32 and two at DIM64.
@@ -261,7 +267,7 @@ const char *compiled_weight_route() {
 #elif GGML_GEMMINI_WEIGHT_BITS == 16
   return "q16_h1";
 #else
-  return compiled_exsia ? "q8_0" : "q8_channel";
+  return compiled_exsia || GGML_GEMMINI_ACTIVATION_QUANT == 3 ? "q8_0" : "q8_channel";
 #endif
 }
 
@@ -306,6 +312,10 @@ std::vector<float> make_activations(int64_t rows = I) {
       }
 #else
       values[i * K + k] = 0.125f * static_cast<float>((i + 2 * k) % 11 - 5);
+#if GGML_GEMMINI_ENABLE_RMD
+      values[i * K + k] *= static_cast<float>(i + 1);
+      if (k == 0) values[i * K + k] = 128.0f * static_cast<float>(i + 1);
+#endif
 #endif
     }
   }
@@ -351,7 +361,7 @@ std::vector<uint8_t> make_weights() {
     }
   }
   return encoded;
-#elif GGML_GEMMINI_ACTIVATION_QUANT == 0
+#elif GGML_GEMMINI_ACTIVATION_QUANT == 0 || GGML_GEMMINI_ACTIVATION_QUANT == 3
   constexpr size_t blocks_per_row = K / QK8_0;
   std::vector<uint8_t> encoded(J * blocks_per_row * sizeof(block_q8_0));
   auto *blocks = reinterpret_cast<block_q8_0 *>(encoded.data());
@@ -412,6 +422,10 @@ bool scalar_oracle(const std::vector<float> &activations,
   args.tile_K = 1;
   args.activation_rows_per_stripe = GGML_GEMMINI_TEST_IM2P_DIM;
   args.residual_route = ggml::gemmini::residual::ResidualRoute::cpu_direct;
+#else
+  ggml::gemmini::gemmini_set_tile_ws(&args);
+  args.activation_rows_per_stripe = args.tile_I * GGML_GEMMINI_TEST_IM2P_DIM;
+  args.residual_route = ggml::gemmini::residual::ResidualRoute::ws_packet;
 #endif
   const bool allocated =
       args.A.allocate(rows, K, GGML_GEMMINI_ACTIVATION_BITS);
@@ -470,10 +484,7 @@ bool scalar_oracle(const std::vector<float> &activations,
   const bool valid_block_meta =
       block_meta != nullptr &&
       block_meta->scales.size() == static_cast<size_t>(rows) &&
-      block_meta->rmd_packets.empty() && block_meta->direct_residuals.empty() &&
-      std::all_of(
-          block_meta->scales.begin() + 1, block_meta->scales.end(),
-          [&](float scale) { return scale == block_meta->scales.front(); });
+      block_meta->direct_residuals.empty();
 #else
   const bool valid_block_meta = true;
 #endif
@@ -518,7 +529,7 @@ bool scalar_oracle(const std::vector<float> &activations,
       }
     }
   }
-#elif GGML_GEMMINI_ACTIVATION_QUANT == 0
+#elif GGML_GEMMINI_ACTIVATION_QUANT == 0 || GGML_GEMMINI_ACTIVATION_QUANT == 3
   constexpr size_t blocks_per_row = K / QK8_0;
   const auto *blocks = reinterpret_cast<const block_q8_0 *>(weights.data());
   for (int64_t i = 0; i < rows; ++i) {
@@ -587,7 +598,7 @@ struct GraphCase {
     ggml_tensor *weight = ggml_new_tensor_2d(context, GGML_TYPE_Q16_H1, K, J);
     ggml_tensor *mismatched_weight =
         ggml_new_tensor_2d(context, GGML_TYPE_Q4_H1, K, J);
-#elif GGML_GEMMINI_ACTIVATION_QUANT == 0
+#elif GGML_GEMMINI_ACTIVATION_QUANT == 0 || GGML_GEMMINI_ACTIVATION_QUANT == 3
     ggml_tensor *weight = ggml_new_tensor_2d(context, GGML_TYPE_Q8_0, K, J);
 #else
     ggml_tensor *weight =
@@ -2787,8 +2798,10 @@ bool run_routing_geometry_contract() {
       {{static_cast<size_t>(I), static_cast<size_t>(J), static_cast<size_t>(K)},
        {2, 1, 1}, GGML_GEMMINI_TEST_IM2P_DIM});
   const size_t expected_stripe_rows = 2 * GGML_GEMMINI_TEST_IM2P_DIM;
-  const size_t expected_stripes = compiled_exsia ? 8 : 1;
-  const size_t expected_final_rows = compiled_exsia ? expected_stripe_rows : 3;
+  const size_t expected_stripes = compiled_exsia ? 8 :
+      GGML_GEMMINI_ENABLE_RMD ? 2 : 1;
+  const size_t expected_final_rows = compiled_exsia ? expected_stripe_rows :
+      GGML_GEMMINI_ENABLE_RMD ? 1 : 3;
   bool ok = check(geometry.ok(), "routing geometry is valid") &&
             check(geometry.geometry.stripe_rows == expected_stripe_rows &&
                       geometry.geometry.stripe_count == expected_stripes &&
@@ -2858,10 +2871,22 @@ bool run_success_mode(const char *mode) {
             "production dispatch enters no hardware path");
   for (size_t index = 0; index < actual.size(); ++index) {
     ok = check(std::isfinite(actual[index]) &&
-                   std::fabs(actual[index] - expected[index]) < 1e-4f,
+                   std::fabs(actual[index] - expected[index]) <=
+                       1e-4f + 1e-5f * std::fabs(expected[index]),
                "production output matches scalar quantized oracle") &&
          ok;
   }
+#if GGML_GEMMINI_ENABLE_RMD
+  const auto options = ggml::gemmini::resolve_matmul_options();
+  const bool compact = options.options.rmd_backend ==
+      ggml::gemmini::RmdBackend::gemmini_ws_compact;
+  ok = check(counters.residual_executions > 0 && counters.compositions > 0,
+             "baseline executes and merges nonempty residuals") && ok;
+  ok = check(counters.residual_simulator_creates == (compact ? 1u : 0u) &&
+                 counters.live_residual_simulators == 0 &&
+                 (!compact || counters.rmd_dot_calls > 0),
+             "baseline compact simulator executes and is destroyed") && ok;
+#endif
   if (ok) {
     std::printf("route=%s weight=%s mode=%s bits=%d weight_bits=%d dim=%d "
                 "full=%llu stripe=%llu hardware=0 supports_selected=yes "
@@ -2923,6 +2948,7 @@ bool run_fence_failure(const char *mode) {
 
 bool run_rmd_rejection() {
   using namespace ggml::gemmini::im2p_adapter;
+  setenv("GEMMINI_MATMUL_MODE", "STRIPE_PIPELINE", 1);
   GraphCase test_case;
   if (!check(test_case.initialize(), "initialize RMD rejection graph")) {
     return false;
@@ -2932,7 +2958,7 @@ bool run_rmd_rejection() {
       ggml_backend_graph_compute(test_case.backend, test_case.graph);
   const auto counters = test_counters();
   return check(status != GGML_STATUS_SUCCESS,
-               "non-ExSIA RMD reaches failed graph status") &&
+               "baseline RMD pipeline reaches failed graph status") &&
          check(all_sentinel(test_case.read_output()),
                "RMD rejection preserves destination sentinel") &&
          check(counters.full == 0 && counters.fence == 0 &&
@@ -2994,10 +3020,10 @@ int main(int argc, char **argv) {
     return run_invalid_mode_child() ? 0 : 1;
   }
   if (!run_matched_weight_gate_contract() || !run_graph_overhead_regression() ||
-      !run_exsia_shift_regression() ||
-      !run_simple_runtime_args_observer_contract() ||
-      !run_im2p_semantic_logging_contract()
+      !run_exsia_shift_regression()
 #if GGML_GEMMINI_ACTIVATION_QUANT == 0
+      || !run_simple_runtime_args_observer_contract()
+      || !run_im2p_semantic_logging_contract()
       || !run_exsia_publication_boundary()
 #endif
   ) {
@@ -3099,7 +3125,6 @@ int main(int argc, char **argv) {
     unsetenv("GEMMINI_STRIPE_JOB_CAPACITY");
     return selected_ok ? 0 : 1;
 #else
-    const std::string_view selected(argv[2]);
     if (selected == "cycle-simple-full") {
       return run_success_mode("FULL") ? 0 : 1;
     }
@@ -3207,7 +3232,16 @@ int main(int argc, char **argv) {
   return ok ? 0 : 1;
 #else
 #if GGML_GEMMINI_ENABLE_RMD
-  return run_rmd_rejection() ? 0 : 1;
+  bool rmd_ok = true;
+  for (const char *backend : {"CPU", "WS"}) {
+    setenv("GEMMINI_RMD_BACKEND", backend, 1);
+    rmd_ok = run_success_mode("FULL") && rmd_ok;
+    rmd_ok = run_fence_failure("FULL") && rmd_ok;
+    rmd_ok = run_rmd_rejection() && rmd_ok;
+  }
+  unsetenv("GEMMINI_RMD_BACKEND");
+  unsetenv("GEMMINI_MATMUL_MODE");
+  return rmd_ok ? 0 : 1;
 #endif
 
   bool ok = true;

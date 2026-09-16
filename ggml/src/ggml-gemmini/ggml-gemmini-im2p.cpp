@@ -5,6 +5,7 @@
 #include "ggml-gemmini-telemetry.hpp"
 #include "ggml-impl.h"
 #include "im2p_gemmini_frontend.hpp"
+#include "quants/act/dispatch.hpp"
 #include "quants/act/exsia/exsia.hpp"
 #include "quants/act/exsia/types.hpp"
 #include "residual/direct/direct-executor.hpp"
@@ -68,6 +69,11 @@ public:
     if (const auto *metadata =
             std::get_if<quants::act::exsia::Meta>(&args.act_quant.storage());
         metadata != nullptr && metadata->run_id.has_value()) {
+      record_.identity_mask = GEMMINI_CYCLE_HAS_RUN_ID;
+      record_.run_id = *metadata->run_id;
+    } else if (const auto *metadata =
+                   std::get_if<quants::act::block::Meta>(&args.act_quant.storage());
+               metadata != nullptr && metadata->run_id.has_value()) {
       record_.identity_mask = GEMMINI_CYCLE_HAS_RUN_ID;
       record_.run_id = *metadata->run_id;
     }
@@ -520,14 +526,56 @@ Result gate_route(const ExsiaRouteRequest &request) noexcept {
     return {Error::unsupported_route, "unsupported residual backend", false};
   }
   if (!request.exsia) {
-    if (!request.rmd_enabled &&
-        request.activation_bits == request.weight_bits) {
-      return {};
+    if (request.block_activation && request.mode != PublicMode::full) {
+      return {Error::unsupported_route,
+              "BLOCK IM2P requires FULL mode", false};
+    }
+    if (request.rmd_enabled) {
+      if (request.mode != PublicMode::full) {
+        return {Error::unsupported_route,
+                "baseline IM2P RMD requires FULL mode", false};
+      }
+      if (request.build_identity != BuildIdentity::im2p_sim_ws) {
+        return {Error::unsupported_route,
+                "baseline IM2P RMD requires the WS+IM2P_SIM build identity",
+                false};
+      }
+      if (request.activation_bits != request.weight_bits) {
+        return {Error::unsupported_route,
+                "baseline IM2P RMD requires matched activation and weight widths",
+                false};
+      }
+      switch (request.family) {
+      case WeightFamily::h0:
+        return request.residual_backend == ResidualBackend::cpu_direct
+                   ? Result{}
+                   : Result{Error::unsupported_route,
+                            "H0 baseline requires CPU-direct residual execution",
+                            false};
+      case WeightFamily::h1:
+      case WeightFamily::hp1:
+        return {};
+      case WeightFamily::channel:
+        return request.weight_bits == 8 && !request.block_activation
+                   ? Result{}
+                   : Result{Error::unsupported_route,
+                            "channel RMD requires an 8-bit non-BLOCK activation", false};
+      case WeightFamily::h2:
+      case WeightFamily::hp2:
+        return {Error::unsupported_route,
+                "H2/HP2 baseline residual formats are unsupported", false};
+      case WeightFamily::unsupported:
+        return {Error::unsupported_route,
+                "unsupported baseline residual weight family", false};
+      }
+      return {Error::unsupported_route,
+              "unsupported baseline residual weight family", false};
+    }
+    if (request.activation_bits == request.weight_bits) {
+        return {};
     }
     return {Error::unsupported_route,
-            request.rmd_enabled
-                ? "non-ExSIA IM2P execution does not support RMD"
-                : "IM2P routes require matched activation and weight widths",
+            "IM2P routes require matched activation and weight widths",
             false};
   }
   if (request.build_identity != BuildIdentity::im2p_sim_ws) {
@@ -556,6 +604,7 @@ Result gate_route(const ExsiaRouteRequest &request) noexcept {
       return {Error::unsupported_route,
               "H2/HP2 ExSIA residual formats are unsupported", false};
     case WeightFamily::unsupported:
+    case WeightFamily::channel:
       return {Error::unsupported_route,
               "unsupported ExSIA residual weight family", false};
   }
@@ -575,6 +624,178 @@ Result gate_route(bool exsia, std::uint8_t activation_bits, bool rmd_enabled,
                      cpu_direct_rmd ? ResidualBackend::cpu_direct
                                     : ResidualBackend::compact_ws,
                      BuildIdentity::im2p_sim_ws});
+}
+
+static Result apply_baseline_rmd_full(
+    const ggml_gemmini_args_t &runtime_args, float *output_data,
+    size_t output_elements,
+    ::im2p::gemmini::ResidualStripeStats &result_stats,
+    std::uint64_t &semantic_completion_count) noexcept {
+  const auto *metadata =
+      std::get_if<quants::act::block::Meta>(&runtime_args.act_quant.storage());
+  const auto &direct_residuals = quants::act::direct_residuals(runtime_args);
+  const auto &rmd_packets = quants::act::rmd_packets(runtime_args);
+  size_t output_extent = 0;
+  if (!checked_output_extent(runtime_args, output_extent) ||
+      output_extent > output_elements) {
+    return {Error::invalid_contract,
+            "baseline FULL residual staging does not cover the output layout",
+            false};
+  }
+  const quants::act::ActivationMetadataView metadata_view(
+      runtime_args, runtime_args.activation_row_offset,
+      runtime_args.activation_row_offset + runtime_args.I);
+  if (!metadata_view.valid() ||
+      (!direct_residuals.empty() && !rmd_packets.empty())) {
+    return {Error::invalid_contract,
+            "baseline FULL residual metadata is malformed", false};
+  }
+  const bool direct_route =
+      runtime_args.residual_route == residual::ResidualRoute::cpu_direct;
+  if ((direct_route && !rmd_packets.empty()) ||
+      (!direct_route && !direct_residuals.empty())) {
+    return {Error::invalid_contract,
+            "baseline FULL residual payload does not match the selected backend",
+            false};
+  }
+
+  struct SimulatorDeleter {
+    void operator()(im2p_sim_t *sim) const noexcept {
+      if (sim != nullptr) im2p_sim_destroy(sim);
+#if defined(GGML_GEMMINI_TESTING)
+      if (sim != nullptr) {
+        std::lock_guard lock(test_mutex);
+        --counters.live_residual_simulators;
+      }
+#endif
+    }
+  };
+  std::unique_ptr<im2p_sim_t, SimulatorDeleter> simulator;
+  if (!direct_route && !rmd_packets.empty()) {
+    HostCpuInterval setup(runtime_args,
+                          "im2p.residual_simulator_setup_host_call");
+    simulator.reset(im2p_sim_create());
+    setup.finish(simulator != nullptr);
+    if (!simulator) {
+      return {Error::out_of_memory,
+              "failed to create baseline FULL residual simulator", false};
+    }
+#if defined(GGML_GEMMINI_TESTING)
+    {
+      std::lock_guard lock(test_mutex);
+      ++counters.residual_simulator_creates;
+      ++counters.live_residual_simulators;
+    }
+#endif
+  }
+
+  ::im2p::gemmini::ResidualStripeStats staged_stats{};
+  rmd::RmdProviderStats staged_provider_stats{};
+  rmd::detail::RmdWeightPreparation weights;
+  const auto accumulate_metrics = [&](const rmd::RmdExecutionMetrics &metrics) {
+    if (metrics.im2p_dot_calls >
+            std::numeric_limits<std::uint64_t>::max() -
+                staged_stats.rmd_dot_calls ||
+        rmd::checked_accumulate_provider_stats(
+            staged_provider_stats, metrics.im2p_stats) !=
+            rmd::RmdStatus::success) {
+      return false;
+    }
+    staged_stats.rmd_dot_calls += metrics.im2p_dot_calls;
+    return true;
+  };
+
+  if (direct_route) {
+    for (const auto &payload : direct_residuals) {
+      if (payload == nullptr) {
+        return {Error::invalid_contract,
+                "baseline FULL direct residual payload is null", false};
+      }
+      size_t row_end = 0;
+      if (__builtin_add_overflow(payload->row_begin, payload->row_count,
+                                 &row_end) ||
+          row_end > runtime_args.I) {
+        return {Error::invalid_contract,
+                "baseline FULL direct residual rows are invalid", false};
+      }
+      rmd::Correction correction = rmd::BlockScaledInt64Correction{};
+      residual::DirectExecutionMetrics direct_metrics{};
+      if (metadata != nullptr) direct_metrics.run_id = metadata->run_id;
+      HostCpuInterval backend(runtime_args,
+                              "im2p.residual_backend_host_call");
+      const rmd::RmdStatus executed = residual::execute_direct_stripe(
+          runtime_args, *payload, correction, &direct_metrics);
+      backend.finish(executed == rmd::RmdStatus::success);
+      if (executed != rmd::RmdStatus::success) return from_rmd_status(executed);
+#if defined(GGML_GEMMINI_TESTING)
+      {
+        std::lock_guard lock(test_mutex);
+        ++counters.residual_executions;
+      }
+#endif
+      HostCpuInterval merge(runtime_args, "im2p.output_correction_apply");
+      const rmd::RmdStatus merged = rmd::merge_rmd_correction_to(
+          runtime_args, output_data, payload->row_begin, row_end, correction);
+      merge.finish(merged == rmd::RmdStatus::success);
+      if (merged != rmd::RmdStatus::success) return from_rmd_status(merged);
+#if defined(GGML_GEMMINI_TESTING)
+      {
+        std::lock_guard lock(test_mutex);
+        ++counters.compositions;
+        ++counters.rmd_calls;
+        counters.rmd_events += direct_metrics.event_count;
+      }
+#endif
+      ++semantic_completion_count;
+    }
+  } else {
+    for (const auto &packet : rmd_packets) {
+      if (packet == nullptr) {
+        return {Error::invalid_contract,
+                "baseline FULL compact residual packet is null", false};
+      }
+      rmd::Correction correction = rmd::BlockScaledInt64Correction{};
+      rmd::RmdExecutionMetrics metrics{};
+      HostCpuInterval backend(runtime_args,
+                              "im2p.residual_simulator_host_call");
+      const rmd::RmdStatus executed =
+          rmd::detail::execute_rmd_stripe_im2p_with_weights(
+              simulator.get(), runtime_args, *packet, correction, weights,
+              &metrics);
+      backend.finish(executed == rmd::RmdStatus::success);
+      if (executed != rmd::RmdStatus::success) return from_rmd_status(executed);
+#if defined(GGML_GEMMINI_TESTING)
+      {
+        std::lock_guard lock(test_mutex);
+        ++counters.residual_executions;
+        counters.rmd_dot_calls += metrics.im2p_dot_calls;
+      }
+#endif
+      if (!accumulate_metrics(metrics)) {
+        return {Error::execution_failure,
+                "baseline FULL RMD provider statistics overflow", false};
+      }
+      HostCpuInterval merge(runtime_args, "im2p.output_correction_apply");
+      const rmd::RmdStatus merged =
+          rmd::detail::merge_rmd_correction_with_weights(
+              runtime_args, output_data, *packet, correction, weights);
+      merge.finish(merged == rmd::RmdStatus::success);
+      if (merged != rmd::RmdStatus::success) return from_rmd_status(merged);
+#if defined(GGML_GEMMINI_TESTING)
+      {
+        std::lock_guard lock(test_mutex);
+        ++counters.compositions;
+        ++counters.rmd_calls;
+        ++counters.rmd_packets;
+      }
+#endif
+      ++semantic_completion_count;
+    }
+  }
+  rmd::detail::expand_im2p_provider_stats(staged_provider_stats,
+                                          staged_stats.rmd_stats);
+  result_stats = staged_stats;
+  return {};
 }
 
 Completion run_full(const ggml_gemmini_args_t &args) noexcept {
@@ -675,6 +896,23 @@ Completion run_full(const ggml_gemmini_args_t &args) noexcept {
   }
 #endif
   if (completion.result.ok()) {
+#if GGML_GEMMINI_ENABLE_RMD
+    {
+      ::im2p::gemmini::ResidualStripeStats rmd_stats{};
+      std::uint64_t semantic_completion_count = 0;
+      const Result rmd = apply_baseline_rmd_full(
+          runtime_args, staged_output.data(), staged_output.size(),
+          rmd_stats, semantic_completion_count);
+      if (!rmd.ok()) return {rmd, completion.stats};
+      if (const auto *metadata = std::get_if<quants::act::block::Meta>(
+              &runtime_args.act_quant.storage())) {
+        completion.run_id = metadata->run_id.value_or(0);
+      }
+      completion.semantic_completion_count = semantic_completion_count;
+      completion.rmd_dot_calls = rmd_stats.rmd_dot_calls;
+      completion.rmd_stats = translate_stats(rmd_stats.rmd_stats);
+    }
+#endif
     copy_staged_output(args, staged_output);
   }
   return completion;

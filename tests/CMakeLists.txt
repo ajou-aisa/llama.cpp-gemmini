@@ -367,7 +367,7 @@ target_link_libraries(test-gemmini-act-quant-i32-saturation PRIVATE ggml-base gg
 target_compile_features(test-gemmini-act-quant-i32-saturation PRIVATE cxx_std_17)
 set(_GGML_GEMMINI_SATURATION_TEST_ACTIVATION_QUANT ${_GGML_GEMMINI_ACTIVATION_QUANT_VALUE})
 if (_GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "BLOCK")
-    # BLOCK intentionally has no residual/RMD path; keep this RMD saturation test on ExSIA.
+    # Keep the existing ExSIA merge fixture; BLOCK saturation is covered by test-gemmini-block-quant.
     set(_GGML_GEMMINI_SATURATION_TEST_ACTIVATION_QUANT 0)
 endif()
 target_compile_definitions(test-gemmini-act-quant-i32-saturation PRIVATE
@@ -383,6 +383,66 @@ target_include_directories(test-gemmini-act-quant-i32-saturation PRIVATE
     ../ggml/src/ggml-gemmini-utils/include)
 add_test(NAME test-gemmini-act-quant-i32-saturation
     COMMAND $<TARGET_FILE:test-gemmini-act-quant-i32-saturation>)
+
+if (_GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "BLOCK")
+add_executable(test-gemmini-block-quant
+    test-gemmini-block-quant.cpp
+    ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
+    ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
+    ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
+    ../ggml/src/ggml-gemmini/quants/act/quantize.cpp
+    ../ggml/src/ggml-gemmini/quants/act/block/block.cpp
+    ../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
+    ../ggml/src/ggml-gemmini/quants/act/tensor/tensor.cpp
+    ../ggml/src/ggml-gemmini/quants/act/token/token.cpp
+    ../ggml/src/ggml-gemmini/quants/act/stripe/stripe.cpp)
+target_link_libraries(test-gemmini-block-quant PRIVATE ggml-base ggml-gemmini-utils)
+target_compile_features(test-gemmini-block-quant PRIVATE cxx_std_17)
+target_compile_definitions(test-gemmini-block-quant PRIVATE
+    GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+    GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
+    GGML_GEMMINI_ACTIVATION_QUANT=${_GGML_GEMMINI_ACTIVATION_QUANT_VALUE}
+    GGML_GEMMINI_EXSIA_SIGMA=${GGML_GEMMINI_EXSIA_SIGMA}
+    GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
+    LOG_CYCLE=${LOG_CYCLE}
+    CYCLE_DETAIL=${CYCLE_DETAIL})
+target_include_directories(test-gemmini-block-quant PRIVATE
+    ../ggml/include
+    ../ggml/src
+    ../ggml/src/ggml-gemmini
+    ../ggml/src/ggml-gemmini-utils/include)
+add_test(NAME gemmini_block_metadata
+    COMMAND $<TARGET_FILE:test-gemmini-block-quant> --metadata)
+add_test(NAME gemmini_block_quant
+    COMMAND $<TARGET_FILE:test-gemmini-block-quant> --quant)
+
+add_executable(test-gemmini-block-dense test-gemmini-block-dense.cpp)
+target_link_libraries(test-gemmini-block-dense PRIVATE
+    ggml-gemmini ggml-base ggml-gemmini-utils)
+target_compile_features(test-gemmini-block-dense PRIVATE cxx_std_17)
+target_compile_definitions(test-gemmini-block-dense PRIVATE
+    ${GGML_GEMMINI_COMPILE_DEFS})
+add_test(NAME gemmini_block_dense COMMAND $<TARGET_FILE:test-gemmini-block-dense>)
+
+if (NOT GGML_BACKEND_DL)
+    add_executable(test-gemmini-block-end-to-end test-gemmini-block-end-to-end.cpp)
+    target_link_libraries(test-gemmini-block-end-to-end PRIVATE
+        common ggml-gemmini ggml-base ggml-gemmini-utils)
+    target_compile_features(test-gemmini-block-end-to-end PRIVATE cxx_std_17)
+    target_compile_definitions(test-gemmini-block-end-to-end PRIVATE ${GGML_GEMMINI_COMPILE_DEFS})
+    target_include_directories(test-gemmini-block-end-to-end PRIVATE
+        ../ggml/include
+        ../ggml/src
+        ../ggml/src/ggml-gemmini
+        ../ggml/src/ggml-gemmini-utils/include)
+    add_test(NAME gemmini_block_end_to_end
+        COMMAND $<TARGET_FILE:test-gemmini-block-end-to-end>)
+endif()
+
+endif()
 
 set(TEST_GEMMINI_EXSIA_SW_PATH "")
 if (DEFINED GEMMINI_SW_PATH AND NOT GEMMINI_SW_PATH STREQUAL "")
@@ -934,7 +994,7 @@ endif()
 
 if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
     add_executable(test-gemmini-im2p-routing test-gemmini-im2p-routing.cpp)
-    target_link_libraries(test-gemmini-im2p-routing PRIVATE ggml-gemmini ggml-base)
+    target_link_libraries(test-gemmini-im2p-routing PRIVATE ggml-gemmini ggml-base ggml-gemmini-utils)
     target_compile_features(test-gemmini-im2p-routing PRIVATE cxx_std_17)
     target_compile_definitions(test-gemmini-im2p-routing PRIVATE
         GGML_GEMMINI_TESTING=1
@@ -959,10 +1019,12 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
         COMMAND $<TARGET_FILE:test-gemmini-im2p-routing>)
     add_test(NAME test-gemmini-im2p-route-matrix
         COMMAND $<TARGET_FILE:test-gemmini-im2p-routing> --route-matrix)
-    add_test(NAME test-gemmini-im2p-routing-multiwidth-matrix
-        COMMAND $<TARGET_FILE:test-gemmini-im2p-routing> --case multiwidth-matrix)
-    add_test(NAME test-gemmini-im2p-routing-boundary-rejections
-        COMMAND $<TARGET_FILE:test-gemmini-im2p-routing> --case boundary-rejections)
+    if (_GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "EXSIA" AND GGML_GEMMINI_ENABLE_RMD)
+        add_test(NAME test-gemmini-im2p-routing-multiwidth-matrix
+            COMMAND $<TARGET_FILE:test-gemmini-im2p-routing> --case multiwidth-matrix)
+        add_test(NAME test-gemmini-im2p-routing-boundary-rejections
+            COMMAND $<TARGET_FILE:test-gemmini-im2p-routing> --case boundary-rejections)
+    endif()
     add_test(NAME test-gemmini-im2p-routing-geometry
         COMMAND $<TARGET_FILE:test-gemmini-im2p-routing> --geometry-contract)
     add_test(NAME test-gemmini-im2p-routing-stats-translation

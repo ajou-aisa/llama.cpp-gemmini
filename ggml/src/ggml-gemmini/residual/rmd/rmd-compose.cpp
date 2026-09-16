@@ -315,21 +315,25 @@ RmdStatus merge_rmd_correction_checked(const ggml_gemmini_args_t & args,
                                        size_t * nonzero_count) {
     const auto * integer = std::get_if<BlockScaledInt64Correction>(&correction);
     const auto * floating = std::get_if<PreScaledFloat64Correction>(&correction);
+    const auto * fully_scaled = std::get_if<FullyScaledFloat64Correction>(&correction);
     const bool integer_route =
         plan.scale_domain == wroute::WeightScaleDomain::IntegerBlockTimesColumn &&
         wroute::route_supports_integer_block_scale(plan);
     const bool floating_route =
         plan.route == wroute::WeightRouteKind::H0 &&
         plan.scale_domain == wroute::WeightScaleDomain::FloatingBlock;
-    if ((integer != nullptr) != integer_route || (floating != nullptr) != floating_route) {
+    const bool block_activation =
+        std::holds_alternative<quants::act::block::Meta>(args.act_quant.storage());
+    if (fully_scaled != nullptr ?
+            (!block_activation || (!integer_route && !floating_route)) :
+            (block_activation || (integer != nullptr) != integer_route ||
+             (floating != nullptr) != floating_route)) {
         return RmdStatus::unsupported_route;
     }
 
     const quants::act::ActivationMetadataView metadata(
         args, layout.metadata_row_begin, layout.metadata_row_end);
-    if (!metadata.valid()) {
-        return RmdStatus::invalid_arguments;
-    }
+    if (!metadata.valid()) return RmdStatus::invalid_arguments;
 
     const bool columns_prepared = !prepared_column_scale.empty();
     std::vector<float> unprepared_column_scale;
@@ -338,7 +342,7 @@ RmdStatus merge_rmd_correction_checked(const ggml_gemmini_args_t & args,
     std::vector<float> staged_output;
     try {
         if (integer != nullptr && !columns_prepared) unprepared_column_scale.resize(args.J);
-        activation_scale.resize(layout.row_count);
+        if (fully_scaled == nullptr) activation_scale.resize(layout.row_count);
         staged_output.resize(layout.value_count);
     } catch (const std::bad_alloc &) {
         return RmdStatus::allocation_failure;
@@ -352,9 +356,11 @@ RmdStatus merge_rmd_correction_checked(const ggml_gemmini_args_t & args,
             }
         }
     }
-    for (size_t row = 0; row < layout.row_count; ++row) {
-        if (!metadata.scale(row, activation_scale[row])) {
-            return RmdStatus::invalid_arguments;
+    if (fully_scaled == nullptr) {
+        for (size_t row = 0; row < layout.row_count; ++row) {
+            if (!metadata.scale(row, activation_scale[row])) {
+                return RmdStatus::invalid_arguments;
+            }
         }
     }
 
@@ -367,7 +373,11 @@ RmdStatus merge_rmd_correction_checked(const ggml_gemmini_args_t & args,
         const size_t source_row = row * args.J;
         for (size_t j = 0; j < args.J; ++j) {
             double domain_value = 0.0;
-            if (integer != nullptr) {
+            if (fully_scaled != nullptr) {
+                domain_value = fully_scaled->values[source_row + j];
+                staged_nonzero_count += domain_value != 0.0;
+                if (!finite_double_representation(domain_value)) return RmdStatus::overflow;
+            } else if (integer != nullptr) {
                 const int64_t value = integer->values[source_row + j];
                 staged_nonzero_count += value != 0;
                 domain_value = static_cast<double>(value) *
@@ -378,8 +388,8 @@ RmdStatus merge_rmd_correction_checked(const ggml_gemmini_args_t & args,
                 if (!finite_double_representation(value)) return RmdStatus::overflow;
                 domain_value = saturate_signed_32(value);
             }
-            const double scaled = domain_value *
-                static_cast<double>(activation_scale[row]);
+            const double scaled = fully_scaled != nullptr ? domain_value :
+                domain_value * static_cast<double>(activation_scale[row]);
             const float delta = static_cast<float>(scaled);
             const float merged = layout.destination[destination_row + j * layout.col_stride] + delta;
             if (!finite_double_representation(domain_value) ||
@@ -406,6 +416,97 @@ RmdStatus merge_rmd_correction_checked(const ggml_gemmini_args_t & args,
     return RmdStatus::success;
 }
 
+}
+
+RmdStatus compose_block_rmd_output(const ggml_gemmini_args_t & args,
+                                   const StripePacket & packet,
+                                   const CompressedOutput & output,
+                                   Correction & correction) {
+    const RmdStatus validation = validate_packet(packet);
+    if (validation != RmdStatus::success) return validation;
+    if (!std::holds_alternative<quants::act::block::Meta>(args.act_quant.storage()) ||
+        output.domain != CompressedOutput::Domain::block_scaled_int64 ||
+        output.j_padded != packet.j_padded ||
+        output.values.size() != packet.total_output_values ||
+        packet.logical_k != args.K || packet.logical_j != args.J) {
+        return RmdStatus::invalid_arguments;
+    }
+
+    size_t metadata_row_begin = 0;
+    size_t metadata_row_end = 0;
+    size_t packet_row_end = 0;
+    if (!checked_add_size(packet.row_begin, packet.row_count, packet_row_end) ||
+        !checked_add_size(args.activation_row_offset, packet.row_begin,
+                          metadata_row_begin) ||
+        !checked_add_size(args.activation_row_offset, packet_row_end,
+                          metadata_row_end)) {
+        return RmdStatus::overflow;
+    }
+    const quants::act::ActivationMetadataView metadata(
+        args, metadata_row_begin, metadata_row_end);
+    if (!metadata.valid()) return RmdStatus::invalid_arguments;
+
+    const wroute::WeightRoutePlan plan = wroute::resolve_weight_route_plan(
+        args, wroute::WeightScaleInfoMode::Residual);
+    if (!plan.valid || (plan.route != wroute::WeightRouteKind::H1 &&
+                        plan.route != wroute::WeightRouteKind::HP1)) {
+        return RmdStatus::unsupported_route;
+    }
+    std::vector<float> column_scale;
+    const RmdStatus scales = prepare_column_scales(args, plan, &packet, column_scale);
+    if (scales != RmdStatus::success) return scales;
+
+    size_t value_count = 0;
+    if (!checked_mul_size(packet.row_count, packet.logical_j, value_count)) {
+        return RmdStatus::overflow;
+    }
+    FullyScaledFloat64Correction staged;
+    try {
+        staged.values.assign(value_count, 0.0);
+    } catch (const std::bad_alloc &) {
+        return RmdStatus::allocation_failure;
+    }
+
+    for (size_t row = 0; row < packet.row_count; ++row) {
+        for (const BlockDescriptor & block : packet.blocks) {
+            float activation_scale = 0.0f;
+            if (!metadata.scale(row, block.global_k_begin, activation_scale)) {
+                return RmdStatus::invalid_arguments;
+            }
+            for (size_t j = 0; j < packet.logical_j; ++j) {
+                __int128 block_total = 0;
+                for (uint8_t lane_position = 0;
+                     lane_position < block.active_lane_count; ++lane_position) {
+                    const uint8_t lane = block.lane_ids[lane_position];
+                    const size_t lane_base = block.output_value_offset +
+                        static_cast<size_t>(lane_position) * block.lane_stride_values;
+                    __int128 contribution = output.values[
+                        lane_base + row * output.j_padded + j];
+                    const __int128 place = static_cast<__int128>(1) <<
+                        (packet.digit_bits * lane);
+                    if (__builtin_mul_overflow(contribution, place, &contribution) ||
+                        __builtin_add_overflow(block_total, contribution, &block_total)) {
+                        return RmdStatus::overflow;
+                    }
+                }
+                if (block_total > kInt64Max || block_total < kInt64Min) {
+                    return RmdStatus::overflow;
+                }
+                const double scaled = static_cast<double>(static_cast<int64_t>(block_total)) *
+                    static_cast<double>(activation_scale) *
+                    static_cast<double>(column_scale[j]);
+                double & total = staged.values[row * packet.logical_j + j];
+                const double sum = total + scaled;
+                if (!finite_double_representation(scaled) ||
+                    !finite_double_representation(sum)) {
+                    return RmdStatus::overflow;
+                }
+                total = sum;
+            }
+        }
+    }
+    correction = std::move(staged);
+    return RmdStatus::success;
 }
 
 RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
@@ -438,7 +539,8 @@ RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
                                   const StripePacket & packet,
                                   const Correction & correction,
                                   size_t * nonzero_count) {
-    if (std::get_if<BlockScaledInt64Correction>(&correction) == nullptr) {
+    if (std::get_if<BlockScaledInt64Correction>(&correction) == nullptr &&
+        std::get_if<FullyScaledFloat64Correction>(&correction) == nullptr) {
         return RmdStatus::unsupported_route;
     }
     size_t global_row_end = 0;
@@ -539,7 +641,8 @@ RmdStatus RmdWeightPreparation::prepare_columns(
 RmdStatus merge_rmd_correction_with_weights(const ggml_gemmini_args_t & args,
     float * destination, const StripePacket & packet, const Correction & correction,
     RmdWeightPreparation & weights, size_t * nonzero_count) {
-    if (std::get_if<BlockScaledInt64Correction>(&correction) == nullptr) {
+    if (std::get_if<BlockScaledInt64Correction>(&correction) == nullptr &&
+        std::get_if<FullyScaledFloat64Correction>(&correction) == nullptr) {
         return RmdStatus::unsupported_route;
     }
     size_t global_row_end = 0;

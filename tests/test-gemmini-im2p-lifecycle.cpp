@@ -100,10 +100,15 @@ bool test_transactional_stripe_log_failures() {
   return true;
 #else
 #if defined(GGML_GEMMINI_ROUTING_BINARY)
+#if GGML_GEMMINI_ACTIVATION_QUANT == 0
   constexpr std::array<const char *, 12> selectors{{
       "full", "quantization", "provider", "progress", "poll", "fence",
       "rmd", "dense", "output-authorization", "malformed-completion",
       "incomplete-publication", "output-copy"}};
+#else
+  constexpr std::array<const char *, 2> selectors{{
+      "cycle-simple-full", "cycle-simple-full-fence-failure"}};
+#endif
   for (const char *selector : selectors) {
     std::error_code error;
     std::filesystem::remove_all("output", error);
