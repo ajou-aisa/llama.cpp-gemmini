@@ -1500,6 +1500,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     constexpr bool im2p_exsia =
         ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
         ggml::gemmini::config::ActivationQuantAlgo::EXSIA;
+    constexpr bool im2p_block =
+        ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
+        ggml::gemmini::config::ActivationQuantAlgo::BLOCK;
     constexpr bool im2p_non_exsia = !im2p_exsia;
     const auto route_gate =
         product_weight_bits != GGML_GEMMINI_WEIGHT_BITS
@@ -1518,12 +1521,19 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                           ggml::gemmini::MatmulInvocationMode::full
                       ? ggml::gemmini::im2p_adapter::PublicMode::full
                       : ggml::gemmini::im2p_adapter::PublicMode::stripe_pipeline,
-                  gemmini_exsia_weight_family(src0->type),
+                  im2p_non_exsia &&
+                          (src0->type == GGML_TYPE_Q4_0 ||
+                           src0->type == GGML_TYPE_Q8_0)
+                      ? ggml::gemmini::im2p_adapter::WeightFamily::h1
+                      : im2p_non_exsia && src0->type == GGML_TYPE_Q8_CHANNEL
+                            ? ggml::gemmini::im2p_adapter::WeightFamily::channel
+                            : gemmini_exsia_weight_family(src0->type),
                   matmul_options.rmd_backend ==
                           ggml::gemmini::RmdBackend::cpu_direct
                       ? ggml::gemmini::im2p_adapter::ResidualBackend::cpu_direct
                       : ggml::gemmini::im2p_adapter::ResidualBackend::compact_ws,
-                  ggml::gemmini::im2p_adapter::BuildIdentity::im2p_sim_ws});
+                  ggml::gemmini::im2p_adapter::BuildIdentity::im2p_sim_ws,
+                  im2p_block});
     if (!route_gate.ok()) {
       ggml::gemmini::im2p_adapter::log_failure("route", route_gate);
 #if defined(GGML_GEMMINI_TESTING)
@@ -1673,9 +1683,19 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 static_cast<unsigned long long>(
                     quantize_end - quantize_start));
         } else {
-            ggml::gemmini::log::cycle(
-                layer, "gemmini.quantize_activation",
-                quantize_start, quantize_end);
+            if (const auto *metadata = std::get_if<ggml::gemmini::quants::act::block::Meta>(
+                    &args.act_quant.storage());
+                metadata != nullptr && metadata->run_id.has_value()) {
+                ggml::gemmini::log::CycleRecord record{
+                    layer, "gemmini.quantize_activation", quantize_start, quantize_end};
+                record.identity_mask = GEMMINI_CYCLE_HAS_RUN_ID;
+                record.run_id = *metadata->run_id;
+                ggml::gemmini::log::cycle.write(record);
+            } else {
+                ggml::gemmini::log::cycle(
+                    layer, "gemmini.quantize_activation",
+                    quantize_start, quantize_end);
+            }
         }
 #endif
         return result;
@@ -2350,6 +2370,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             pipeline_requested ? "stripe execution" : "full execution",
             completion.result);
 #if defined(GGML_GEMMINI_TESTING)
+        ggml::gemmini::im2p_adapter::test_record_production_failure(
+            completion.result.error);
         return;
 #else
         GGML_ABORT("Gemmini IM2P execution failed");
@@ -2358,6 +2380,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
       ggml::gemmini::im2p_adapter::log_stats(
           pipeline_requested ? "stripe_pipeline" : "full",
           completion.stats, completion.run_id, args);
+      ggml::gemmini::im2p_adapter::log_rmd_stats(completion, args);
     }
 #endif
 

@@ -102,6 +102,7 @@ enum class WeightFamily : std::uint8_t {
   h2,
   hp2,
   unsupported,
+  channel,
 };
 
 enum class ResidualBackend : std::uint8_t {
@@ -128,6 +129,7 @@ struct ExsiaRouteRequest {
   WeightFamily family = WeightFamily::unsupported;
   ResidualBackend residual_backend = ResidualBackend::cpu_direct;
   BuildIdentity build_identity = BuildIdentity::unsupported;
+  bool block_activation = false;
 };
 
 [[nodiscard]] Result translate(const ::im2p::gemmini::Status &status) noexcept;

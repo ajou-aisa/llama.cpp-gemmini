@@ -427,6 +427,21 @@ target_compile_definitions(test-gemmini-block-dense PRIVATE
     ${GGML_GEMMINI_COMPILE_DEFS})
 add_test(NAME gemmini_block_dense COMMAND $<TARGET_FILE:test-gemmini-block-dense>)
 
+if (NOT GGML_BACKEND_DL)
+    add_executable(test-gemmini-block-end-to-end test-gemmini-block-end-to-end.cpp)
+    target_link_libraries(test-gemmini-block-end-to-end PRIVATE
+        common ggml-gemmini ggml-base ggml-gemmini-utils)
+    target_compile_features(test-gemmini-block-end-to-end PRIVATE cxx_std_17)
+    target_compile_definitions(test-gemmini-block-end-to-end PRIVATE ${GGML_GEMMINI_COMPILE_DEFS})
+    target_include_directories(test-gemmini-block-end-to-end PRIVATE
+        ../ggml/include
+        ../ggml/src
+        ../ggml/src/ggml-gemmini
+        ../ggml/src/ggml-gemmini-utils/include)
+    add_test(NAME gemmini_block_end_to_end
+        COMMAND $<TARGET_FILE:test-gemmini-block-end-to-end>)
+endif()
+
 endif()
 
 set(TEST_GEMMINI_EXSIA_SW_PATH "")
@@ -969,7 +984,7 @@ endif()
 
 if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
     add_executable(test-gemmini-im2p-routing test-gemmini-im2p-routing.cpp)
-    target_link_libraries(test-gemmini-im2p-routing PRIVATE ggml-gemmini ggml-base)
+    target_link_libraries(test-gemmini-im2p-routing PRIVATE ggml-gemmini ggml-base ggml-gemmini-utils)
     target_compile_features(test-gemmini-im2p-routing PRIVATE cxx_std_17)
     target_compile_definitions(test-gemmini-im2p-routing PRIVATE
         GGML_GEMMINI_TESTING=1
@@ -994,10 +1009,12 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
         COMMAND $<TARGET_FILE:test-gemmini-im2p-routing>)
     add_test(NAME test-gemmini-im2p-route-matrix
         COMMAND $<TARGET_FILE:test-gemmini-im2p-routing> --route-matrix)
-    add_test(NAME test-gemmini-im2p-routing-multiwidth-matrix
-        COMMAND $<TARGET_FILE:test-gemmini-im2p-routing> --case multiwidth-matrix)
-    add_test(NAME test-gemmini-im2p-routing-boundary-rejections
-        COMMAND $<TARGET_FILE:test-gemmini-im2p-routing> --case boundary-rejections)
+    if (_GGML_GEMMINI_ACTIVATION_QUANT_UPPER STREQUAL "EXSIA" AND GGML_GEMMINI_ENABLE_RMD)
+        add_test(NAME test-gemmini-im2p-routing-multiwidth-matrix
+            COMMAND $<TARGET_FILE:test-gemmini-im2p-routing> --case multiwidth-matrix)
+        add_test(NAME test-gemmini-im2p-routing-boundary-rejections
+            COMMAND $<TARGET_FILE:test-gemmini-im2p-routing> --case boundary-rejections)
+    endif()
     add_test(NAME test-gemmini-im2p-routing-geometry
         COMMAND $<TARGET_FILE:test-gemmini-im2p-routing> --geometry-contract)
     add_test(NAME test-gemmini-im2p-routing-stats-translation

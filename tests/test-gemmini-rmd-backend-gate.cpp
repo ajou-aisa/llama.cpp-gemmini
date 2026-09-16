@@ -173,6 +173,62 @@ int main() {
                     accepted, rejected)) return 1;
     }
 
+    std::size_t block_accepted = 0;
+    std::size_t block_rejected = 0;
+    auto block = request(8, 8, PublicMode::full, WeightFamily::h1,
+                         ResidualBackend::compact_ws);
+    block.exsia = false;
+    if (block.block_activation) return 1;
+    block.rmd_enabled = false;
+    if (!expect("legacy non-BLOCK RMD-off", block, Error::success,
+                block_accepted, block_rejected)) return 1;
+    block.rmd_enabled = true;
+    if (!expect("baseline FULL RMD", block, Error::success,
+                block_accepted, block_rejected)) return 1;
+    block.mode = PublicMode::stripe_pipeline;
+    if (!expect("baseline RMD pipeline", block, Error::unsupported_route,
+                block_accepted, block_rejected)) return 1;
+    block.mode = PublicMode::full;
+    block.family = WeightFamily::channel;
+    if (!expect("baseline channel RMD", block, Error::success,
+                block_accepted, block_rejected)) return 1;
+    block.block_activation = true;
+    if (!expect("BLOCK channel RMD", block, Error::unsupported_route,
+                block_accepted, block_rejected)) return 1;
+    block.block_activation = false;
+    block.exsia = true;
+    if (!expect("ExSIA channel", block, Error::unsupported_route,
+                block_accepted, block_rejected)) return 1;
+    block.exsia = false;
+    block.family = WeightFamily::h1;
+    block.block_activation = true;
+    if (!expect("BLOCK FULL", block, Error::success,
+                block_accepted, block_rejected)) return 1;
+    block.mode = PublicMode::stripe_pipeline;
+    if (!expect("BLOCK pipeline", block, Error::unsupported_route,
+                block_accepted, block_rejected)) return 1;
+    block.rmd_enabled = false;
+    if (!expect("BLOCK RMD-off pipeline", block, Error::unsupported_route,
+                block_accepted, block_rejected)) return 1;
+    block.mode = PublicMode::full;
+    if (!expect("BLOCK RMD-off FULL", block, Error::success,
+                block_accepted, block_rejected)) return 1;
+    block.rmd_enabled = true;
+    block.build_identity = BuildIdentity::hardware_os;
+    if (!expect("BLOCK OS", block, Error::unsupported_route,
+                block_accepted, block_rejected)) return 1;
+    block.build_identity = BuildIdentity::im2p_sim_ws;
+    block.family = WeightFamily::h2;
+    if (!expect("BLOCK H2", block, Error::unsupported_route,
+                block_accepted, block_rejected)) return 1;
+    block.family = WeightFamily::h0;
+    if (!expect("BLOCK H0 compact", block, Error::unsupported_route,
+                block_accepted, block_rejected)) return 1;
+    std::printf("BLOCK IM2P gate: PASS accepted=%zu rejected=%zu "
+                "baseline_full_rmd=accepted pipeline=rejected os=rejected "
+                "h2=rejected h0_compact=rejected\n",
+                block_accepted, block_rejected);
+
     std::printf("IM2P RMD backend gate: PASS accepted=%zu rejected=%zu "
                 "strict_invalid_mode=rejected strict_invalid_backend=rejected\n",
                 accepted, rejected);

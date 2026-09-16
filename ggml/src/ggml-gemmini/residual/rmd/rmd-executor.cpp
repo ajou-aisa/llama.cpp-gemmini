@@ -1095,7 +1095,9 @@ static RmdStatus execute_rmd_stripe_im2p_output(im2p_sim_t * sim,
         return validation;
     }
     if ((plan.route != wroute::WeightRouteKind::H1 &&
-         plan.route != wroute::WeightRouteKind::HP1) ||
+         plan.route != wroute::WeightRouteKind::HP1 &&
+         plan.route != wroute::WeightRouteKind::Q8ChannelDirect &&
+         plan.route != wroute::WeightRouteKind::Q8ChannelSidecar) ||
         packet.digit_bits != GGML_GEMMINI_ACTIVATION_BITS ||
         plan.weight_bits != GGML_GEMMINI_WEIGHT_BITS ||
         packet.digit_bits != plan.weight_bits) {
@@ -1331,7 +1333,9 @@ static RmdStatus execute_rmd_stripe_im2p_for_test_output(
     const RmdStatus validation = validate_execution_request(args, packet);
     if (validation != RmdStatus::success) return validation;
     if ((plan.route != wroute::WeightRouteKind::H1 &&
-         plan.route != wroute::WeightRouteKind::HP1) ||
+         plan.route != wroute::WeightRouteKind::HP1 &&
+         plan.route != wroute::WeightRouteKind::Q8ChannelDirect &&
+         plan.route != wroute::WeightRouteKind::Q8ChannelSidecar) ||
         packet.digit_bits != GGML_GEMMINI_ACTIVATION_BITS ||
         plan.weight_bits != GGML_GEMMINI_WEIGHT_BITS ||
         packet.digit_bits != plan.weight_bits) {
