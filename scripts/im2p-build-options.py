@@ -77,6 +77,27 @@ def load_hp1_profile(path, require_rmd: bool = False):
     return profile
 
 
+def apply_hp1_profile(effective, origin):
+    manifest = effective.get('IM2P_GEMMINI_RESOLVED_PROFILE')
+    if not manifest:
+        raise BuildConfigurationError('GEMMINI_HP1 requires IM2P_GEMMINI_RESOLVED_PROFILE')
+    profile = load_hp1_profile(manifest, effective.get('GGML_GEMMINI_ENABLE_RMD') == 'ON')
+    resolved = {
+        'GGML_GEMMINI_ACTIVATION_BITS': str(profile['activation_bits']),
+        'GGML_GEMMINI_WEIGHT_BITS': str(profile['weight_bits']),
+        'GGML_GEMMINI_DIM': str(profile['dim']),
+        'GGML_GEMMINI_BLOCK_SIZE': str(profile['block_size']),
+    }
+    for name, required in resolved.items():
+        if origin.get(name) in ('environment', 'command-line') and effective.get(name) != required:
+            raise BuildConfigurationError(
+                f'GEMMINI_HP1 resolved profile requires {name}={required}; '
+                f'got {effective.get(name)!r} from {origin[name]}')
+        effective[name] = required
+        origin[name] = 'resolved-profile'
+    return resolved
+
+
 def configurable(name):
     return name.startswith(('GGML_', 'IM2P_', 'LOG_', 'CYCLE_', 'CMAKE_', 'LLAMA_')) or name in ('BUILD_SHARED_LIBS', 'OpenMP_ROOT')
 
@@ -108,38 +129,21 @@ def resolve(build_dir, platform, defaults, args, environment):
     if platform != 'build-riscv.sh' and ('CMAKE_TOOLCHAIN_FILE' in cli or environment.get('CMAKE_TOOLCHAIN_FILE')):
         raise BuildConfigurationError('Native build scripts do not provision cross toolchains; use direct CMake with explicit target artifacts')
 
-    cache = {}
-    cache_path = Path(build_dir) / 'CMakeCache.txt'
-    if cache_path.is_file():
-        for line in cache_path.read_text().splitlines():
-            match = re.fullmatch(r'([^#/:][^:]*):(BOOL|FILEPATH|PATH|STRING)=(.*)', line)
-            if match and configurable(match[1]):
-                cache[match[1]] = match[3]
-    if platform != 'build-riscv.sh' and cache.get('CMAKE_TOOLCHAIN_FILE'):
-        raise BuildConfigurationError('Native build script found a cross-toolchain cache; use a new BUILD_DIR and direct CMake')
     env = {k: v for k, v in environment.items() if configurable(k) and not k.endswith('_DEFAULT')}
     for key, value in environment.items():
         if key.endswith('_DEFAULT') and configurable(key[:-8]):
             env.setdefault(key[:-8], value)
     # The alias is resolved at its own precedence level; same-level disagreement is an error.
-    for level in (defaults, cache, env, cli):
+    for level in (defaults, env, cli):
         if 'IM2P_DIM' in level:
             if 'GGML_GEMMINI_DIM' in level and level['IM2P_DIM'] != level['GGML_GEMMINI_DIM']:
                 raise BuildConfigurationError('IM2P_DIM and GGML_GEMMINI_DIM must match when set at the same precedence level')
             level['GGML_GEMMINI_DIM'] = level.pop('IM2P_DIM')
     effective = dict(defaults)
     origin = {key: 'default' for key in defaults}
-    for label, level in (('cache', cache), ('environment', env), ('command-line', cli)):
+    for label, level in (('environment', env), ('command-line', cli)):
         effective.update(level)
         origin.update({key: label for key in level})
-    # Backend selected by the script is lane intent, not a reusable cache
-    # default. An explicit environment/CLI selection may override it; a stale
-    # cache may not silently switch lanes and trigger provisioning.
-    if ('GGML_GEMMINI_EXECUTION_BACKEND' not in env and
-            'GGML_GEMMINI_EXECUTION_BACKEND' not in cli and
-            'GGML_GEMMINI_EXECUTION_BACKEND' in defaults):
-        effective['GGML_GEMMINI_EXECUTION_BACKEND'] = defaults['GGML_GEMMINI_EXECUTION_BACKEND']
-        origin['GGML_GEMMINI_EXECUTION_BACKEND'] = 'default'
     if origin.get('GGML_CPU_CYCLE_LOG', 'default') == 'default':
         effective['GGML_CPU_CYCLE_LOG'] = effective.get('LOG_CYCLE', '0')
         origin['GGML_CPU_CYCLE_LOG'] = 'derived-default:LOG_CYCLE'
@@ -149,6 +153,27 @@ def resolve(build_dir, platform, defaults, args, environment):
         raise BuildConfigurationError(f'Unknown GGML_GEMMINI_EXECUTION_BACKEND={backend}')
     if platform == 'build-riscv.sh' and backend != 'HARDWARE':
         raise BuildConfigurationError('build-riscv.sh is the HARDWARE lane; FPGA_UART uses the native x86/ARM64 script')
+    implementation = effective.get('IM2P_SIM_IMPLEMENTATION', 'LEGACY_BSV')
+    if implementation not in ('GEMMINI_HP1', 'LEGACY_BSV'):
+        raise BuildConfigurationError(f'Unknown IM2P_SIM_IMPLEMENTATION={implementation}')
+    if backend != 'IM2P_SIM':
+        if origin.get('IM2P_SIM_IMPLEMENTATION') in ('environment', 'command-line'):
+            raise BuildConfigurationError(
+                'IM2P_SIM_IMPLEMENTATION is valid only with '
+                'GGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM')
+        effective['IM2P_SIM_IMPLEMENTATION'] = ''
+        origin['IM2P_SIM_IMPLEMENTATION'] = 'cleared:non-IM2P_SIM'
+    else:
+        effective['IM2P_SIM_IMPLEMENTATION'] = implementation
+        if 'IM2P_SIM_IMPLEMENTATION' not in origin:
+            origin['IM2P_SIM_IMPLEMENTATION'] = 'IM2P_SIM default'
+        if effective.get('IM2P_GEMMINI_RESOLVED_PROFILE'):
+            if origin.get('IM2P_GEMMINI_RESOLVED_PROFILE') in ('environment', 'command-line'):
+                raise BuildConfigurationError(
+                    'IM2P_GEMMINI_RESOLVED_PROFILE is valid only with '
+                    'GGML_GEMMINI_EXECUTION_BACKEND=FPGA_UART')
+            effective.pop('IM2P_GEMMINI_RESOLVED_PROFILE', None)
+            origin.pop('IM2P_GEMMINI_RESOLVED_PROFILE', None)
     fpga_arch = effective.get('IM2P_FPGA_ARCH', '')
     if fpga_arch and backend != 'FPGA_UART':
         raise BuildConfigurationError('IM2P_FPGA_ARCH is valid only with GGML_GEMMINI_EXECUTION_BACKEND=FPGA_UART')
@@ -160,22 +185,8 @@ def resolve(build_dir, platform, defaults, args, environment):
         required_profile = dict(FPGA)
         profile_label = 'FPGA_UART'
         if fpga_arch == 'GEMMINI_HP1':
-            manifest = effective.get('IM2P_GEMMINI_RESOLVED_PROFILE')
-            if not manifest:
-                raise BuildConfigurationError('GEMMINI_HP1 requires IM2P_GEMMINI_RESOLVED_PROFILE')
-            profile = load_hp1_profile(manifest, effective.get('GGML_GEMMINI_ENABLE_RMD') == 'ON')
             profile_label = 'GEMMINI_HP1'
-            resolved = {
-                'GGML_GEMMINI_ACTIVATION_BITS': str(profile['activation_bits']),
-                'GGML_GEMMINI_WEIGHT_BITS': str(profile['weight_bits']),
-                'GGML_GEMMINI_DIM': str(profile['dim']),
-                'GGML_GEMMINI_BLOCK_SIZE': str(profile['block_size']),
-            }
-            for name, required in resolved.items():
-                if origin.get(name) in ('environment', 'command-line') and effective.get(name) != required:
-                    raise BuildConfigurationError(f'GEMMINI_HP1 resolved profile requires {name}={required}; got {effective.get(name)!r} from {origin[name]}')
-                effective[name] = required
-                origin[name] = 'resolved-profile'
+            resolved = apply_hp1_profile(effective, origin)
             required_profile.update(resolved)
         for name, required in required_profile.items():
             if name == 'GGML_GEMMINI_ACTIVATION_QUANT' and origin.get(name, 'default') != 'default':
@@ -234,15 +245,13 @@ def main():
     except ValueError as error:
         print(f'build configuration error: {error}', file=sys.stderr)
         return 2
-    summary = {'build_dir': str(Path(build_dir).resolve()), 'precedence': ['command-line', 'environment', 'cache', 'default'],
+    summary = {'build_dir': str(Path(build_dir).resolve()), 'precedence': ['command-line', 'environment', 'script-default'],
                'dry_run': dry, 'effective': effective, 'origin': origin,
-               'provisioning': 'matching IM2P_SIM cache' if effective.get('GGML_GEMMINI_EXECUTION_BACKEND') == 'IM2P_SIM' else 'none; FPGA_UART uses physical external executor' if effective.get('GGML_GEMMINI_EXECUTION_BACKEND') == 'FPGA_UART' else 'none'}
+               'provisioning': 'matching IM2P_SIM artifacts' if effective.get('GGML_GEMMINI_EXECUTION_BACKEND') == 'IM2P_SIM' else 'none; FPGA_UART uses physical external executor' if effective.get('GGML_GEMMINI_EXECUTION_BACKEND') == 'FPGA_UART' else 'none'}
     print('IM2P_EFFECTIVE_CONFIG=' + json.dumps(summary, sort_keys=True), file=sys.stderr)
     for name, value in effective.items():
         if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name):
             print(f'{name}_DEFAULT={shlex.quote(value)}')
-    # Emit every resolved value once, after legacy script defaults. Typed user -D is
-    # kept first so CMake retains its declared cache type; the effective value wins.
     cmake_args = passthrough + [f'-D{name}={value}' for name, value in sorted(effective.items()) if configurable(name)]
     print('IM2P_EFFECTIVE_CMAKE_ARGS=(' + ' '.join(map(shlex.quote, cmake_args)) + ')')
     print('IM2P_BUILD_DRY_RUN=' + ('1' if dry else '0'))

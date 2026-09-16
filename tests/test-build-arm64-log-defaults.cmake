@@ -5,10 +5,10 @@ endif()
 file(READ "${TEST_SCRIPT}" script)
 foreach(variable IN ITEMS LOG_DEBUG LOG_CYCLE)
     string(FIND "${script}"
-        "${variable}_DEFAULT=\${${variable}:-0}"
+        "${variable}_DEFAULT=\${${variable}:-1}"
         default_offset)
     if(default_offset EQUAL -1)
         message(FATAL_ERROR
-            "${variable} must default off in build-arm64.sh")
+            "${variable} must default on in build-arm64.sh")
     endif()
 endforeach()

@@ -971,6 +971,7 @@ namespace ggml::gemmini::quants::act::exsia
         static constexpr size_t no_failure_stripe = std::numeric_limits<size_t>::max();
         FailureCode failure_code = FailureCode::None;
         size_t failure_stripe = no_failure_stripe;
+        uint64_t run_id = 0;
         size_t B_size = BLOCK_SIZE;
         size_t K_logical = 0;
         size_t K_padded = 0;
@@ -1179,6 +1180,9 @@ namespace ggml::gemmini::quants::act::exsia
         OutlierMarker unit_outlier_;
         ResidualClipper unit_clip_;
     };
+
+    const char *failure_code_name(ExSIAState::FailureCode code) noexcept;
+    const char *failure_origin_name(ExSIAState::FailureCode code) noexcept;
 
     class ExSIA
     {

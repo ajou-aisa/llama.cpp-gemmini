@@ -1313,6 +1313,9 @@ static void setup_gemmini_log_outputs_if_needed(void) {
     if (!result.debug) {
         GGML_LOG_WARN("%s: failed to set default debug log path '%s'\n", __func__, GEMMINI_LOG_DEFAULT_DEBUG_PATH);
     }
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    ggml::gemmini::im2p_adapter::install_rtl_debug_sink();
+#endif
 }
 
 static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,

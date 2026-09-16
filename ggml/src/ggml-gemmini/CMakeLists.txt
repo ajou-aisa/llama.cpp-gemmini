@@ -255,6 +255,7 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
       "${_GGML_GEMMINI_IM2P_CACHE_VERIFIER}" verify
       --manifest "${GGML_GEMMINI_IM2P_MANIFEST}"
       --expected-identity "${GGML_GEMMINI_IM2P_ARTIFACT_ID}"
+      --expected-implementation "${IM2P_SIM_IMPLEMENTATION}"
       --expected-block-size "${GGML_GEMMINI_BLOCK_SIZE}"
       --expected-platform "${CMAKE_SYSTEM_NAME}"
       --expected-platform-release "${CMAKE_SYSTEM_VERSION}"

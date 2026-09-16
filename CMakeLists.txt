@@ -310,6 +310,24 @@ if(NOT GGML_GEMMINI_ACTIVATION_BITS STREQUAL
         "Gemmini requires matched activation and weight widths")
 endif()
 set(IM2P_SIM_ROOT "" CACHE PATH "Path to the IM2P.sim source and isolated build artifacts")
+set(IM2P_SIM_IMPLEMENTATION "" CACHE STRING
+    "IM2P simulator implementation: LEGACY_BSV or GEMMINI_HP1")
+set_property(CACHE IM2P_SIM_IMPLEMENTATION PROPERTY STRINGS LEGACY_BSV GEMMINI_HP1)
+if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND
+   IM2P_SIM_IMPLEMENTATION STREQUAL "")
+    set(IM2P_SIM_IMPLEMENTATION "LEGACY_BSV")
+endif()
+if(NOT GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND
+   NOT IM2P_SIM_IMPLEMENTATION STREQUAL "")
+    message(FATAL_ERROR
+        "IM2P_SIM_IMPLEMENTATION is valid only with GGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM")
+endif()
+if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND
+   NOT IM2P_SIM_IMPLEMENTATION STREQUAL "LEGACY_BSV" AND
+   NOT IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1")
+    message(FATAL_ERROR
+        "IM2P_SIM_IMPLEMENTATION must be LEGACY_BSV or GEMMINI_HP1, got '${IM2P_SIM_IMPLEMENTATION}'")
+endif()
 if(DEFINED IM2P_DIM AND DEFINED GGML_GEMMINI_DIM AND
    NOT IM2P_DIM STREQUAL GGML_GEMMINI_DIM)
     message(FATAL_ERROR "IM2P_DIM conflicts with GGML_GEMMINI_DIM")
@@ -389,6 +407,12 @@ if(GGML_GEMMINI)
 endif()
 
 if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
+    if(IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1")
+        set(_GGML_GEMMINI_IM2P_EXPECTED_IMPLEMENTATION
+            "gemmini-hp1-integrated-v1")
+    else()
+        set(_GGML_GEMMINI_IM2P_EXPECTED_IMPLEMENTATION "legacy-bsv-v1")
+    endif()
     if(NOT GGML_GEMMINI)
         message(FATAL_ERROR "GGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM requires GGML_GEMMINI=ON")
     endif()
@@ -408,7 +432,7 @@ if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
     set(GGML_GEMMINI_IM2P_ARTIFACT_ID
         "a${GGML_GEMMINI_ACTIVATION_BITS}-w${GGML_GEMMINI_WEIGHT_BITS}-d${GGML_GEMMINI_DIM}")
     set(_GGML_GEMMINI_IM2P_CURRENT
-        "${IM2P_SIM_ROOT}/build/selected/${GGML_GEMMINI_IM2P_ARTIFACT_ID}/current")
+        "${IM2P_SIM_ROOT}/build/selected/${IM2P_SIM_IMPLEMENTATION}/${GGML_GEMMINI_IM2P_ARTIFACT_ID}/current")
     if(NOT IS_SYMLINK "${_GGML_GEMMINI_IM2P_CURRENT}")
         message(FATAL_ERROR
             "Missing atomic IM2P selected generation: ${_GGML_GEMMINI_IM2P_CURRENT}")
@@ -416,7 +440,7 @@ if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
     get_filename_component(GGML_GEMMINI_IM2P_GENERATION
         "${_GGML_GEMMINI_IM2P_CURRENT}" REALPATH)
     get_filename_component(_GGML_GEMMINI_IM2P_GENERATION_ROOT
-        "${IM2P_SIM_ROOT}/build/selected/${GGML_GEMMINI_IM2P_ARTIFACT_ID}/generations"
+        "${IM2P_SIM_ROOT}/build/selected/${IM2P_SIM_IMPLEMENTATION}/${GGML_GEMMINI_IM2P_ARTIFACT_ID}/generations"
         REALPATH)
     string(FIND "${GGML_GEMMINI_IM2P_GENERATION}/"
         "${_GGML_GEMMINI_IM2P_GENERATION_ROOT}/"
@@ -439,6 +463,7 @@ if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
             "${_GGML_GEMMINI_IM2P_CACHE_VERIFIER}" verify
             --manifest "${GGML_GEMMINI_IM2P_MANIFEST}"
             --expected-identity "${GGML_GEMMINI_IM2P_ARTIFACT_ID}"
+            --expected-implementation "${IM2P_SIM_IMPLEMENTATION}"
             --expected-block-size "${GGML_GEMMINI_BLOCK_SIZE}"
             --expected-platform "${CMAKE_SYSTEM_NAME}"
             --expected-platform-release "${CMAKE_SYSTEM_VERSION}"
@@ -472,10 +497,13 @@ if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
 static_assert(IM2P_ABI_VERSION == 5, "SCU requires typed ABI5");
 int main() {
     const char *revision = im2p_compiled_numerical_semantics_revision();
+    const char *implementation = im2p_sim_implementation();
     if (revision == nullptr ||
         std::strcmp(revision, IM2P_SCU_NUMERICAL_REVISION) != 0)
         return 51;
-    std::printf("%u;%u;%u;%u;%u;%u", im2p_sim_abi_version(),
+    if (implementation == nullptr)
+        return 52;
+    std::printf("%s;%u;%u;%u;%u;%u;%u", implementation, im2p_sim_abi_version(),
                 im2p_sim_activation_bits(),
                 im2p_sim_activation_storage_bytes(),
                 im2p_sim_weight_bits(), im2p_sim_weight_storage_bytes(),
@@ -498,16 +526,25 @@ int main() {
     if(_GGML_GEMMINI_IM2P_PROBE_RESULT EQUAL 51)
         message(FATAL_ERROR "IM2P SCU numerical revision mismatch: header and archive differ")
     endif()
+    if(_GGML_GEMMINI_IM2P_PROBE_RESULT EQUAL 52)
+        message(FATAL_ERROR "IM2P simulator implementation identity is missing")
+    endif()
     if(NOT _GGML_GEMMINI_IM2P_PROBE_RESULT EQUAL 0 OR
-       NOT _GGML_GEMMINI_IM2P_IDENTITY MATCHES "^([0-9]+);([0-9]+);([0-9]+);([0-9]+);([0-9]+);([0-9]+)$")
+       NOT _GGML_GEMMINI_IM2P_IDENTITY MATCHES "^([^;]+);([0-9]+);([0-9]+);([0-9]+);([0-9]+);([0-9]+);([0-9]+)$")
         message(FATAL_ERROR "Malformed IM2P simulator identity '${_GGML_GEMMINI_IM2P_IDENTITY}'")
     endif()
-    set(_GGML_GEMMINI_IM2P_ABI "${CMAKE_MATCH_1}")
-    set(_GGML_GEMMINI_IM2P_ACTIVATION_BITS "${CMAKE_MATCH_2}")
-    set(_GGML_GEMMINI_IM2P_ACTIVATION_STORAGE_BYTES "${CMAKE_MATCH_3}")
-    set(_GGML_GEMMINI_IM2P_WEIGHT_BITS "${CMAKE_MATCH_4}")
-    set(_GGML_GEMMINI_IM2P_WEIGHT_STORAGE_BYTES "${CMAKE_MATCH_5}")
-    set(_GGML_GEMMINI_IM2P_DIM "${CMAKE_MATCH_6}")
+    set(_GGML_GEMMINI_IM2P_IMPLEMENTATION "${CMAKE_MATCH_1}")
+    set(_GGML_GEMMINI_IM2P_ABI "${CMAKE_MATCH_2}")
+    set(_GGML_GEMMINI_IM2P_ACTIVATION_BITS "${CMAKE_MATCH_3}")
+    set(_GGML_GEMMINI_IM2P_ACTIVATION_STORAGE_BYTES "${CMAKE_MATCH_4}")
+    set(_GGML_GEMMINI_IM2P_WEIGHT_BITS "${CMAKE_MATCH_5}")
+    set(_GGML_GEMMINI_IM2P_WEIGHT_STORAGE_BYTES "${CMAKE_MATCH_6}")
+    set(_GGML_GEMMINI_IM2P_DIM "${CMAKE_MATCH_7}")
+    if(NOT _GGML_GEMMINI_IM2P_IMPLEMENTATION STREQUAL
+       "${_GGML_GEMMINI_IM2P_EXPECTED_IMPLEMENTATION}")
+        message(FATAL_ERROR
+            "IM2P simulator implementation mismatch: llama requires ${_GGML_GEMMINI_IM2P_EXPECTED_IMPLEMENTATION}, archive reports ${_GGML_GEMMINI_IM2P_IMPLEMENTATION}")
+    endif()
     if(NOT _GGML_GEMMINI_IM2P_ABI STREQUAL "5")
         message(FATAL_ERROR
             "IM2P simulator ABI mismatch: llama requires 5, archive reports ${_GGML_GEMMINI_IM2P_ABI}")
@@ -926,6 +963,9 @@ set(GGML_GEMMINI_COMPILE_DEFS
 )
 if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
     list(APPEND GGML_GEMMINI_COMPILE_DEFS GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM=1)
+    if(IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1")
+        list(APPEND GGML_GEMMINI_COMPILE_DEFS IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1=1)
+    endif()
 elseif(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "FPGA_UART")
     list(APPEND GGML_GEMMINI_COMPILE_DEFS GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART=1)
     if(IM2P_FPGA_ARCH STREQUAL "GEMMINI_HP1")

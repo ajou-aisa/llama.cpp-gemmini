@@ -33,6 +33,27 @@
 namespace ggml::gemmini::im2p_adapter {
 namespace {
 
+void rtl_debug_log_callback(void *, const char *message, size_t length) noexcept {
+#if LOG_DEBUG
+  if (message == nullptr || length == 0) return;
+  while (length > 0 && (message[length - 1] == '\n' || message[length - 1] == '\r')) {
+    --length;
+  }
+  if (length == 0) return;
+  const int printable = length > static_cast<size_t>(std::numeric_limits<int>::max())
+                            ? std::numeric_limits<int>::max()
+                            : static_cast<int>(length);
+  try {
+    log::debug("rtl.gemmini", "[rtl] %.*s", printable, message);
+  } catch (...) {
+    // RTL diagnostics must never affect simulator execution.
+  }
+#else
+  (void)message;
+  (void)length;
+#endif
+}
+
 // Same-caller CPU cost, not simulator-worker totals. Explicit finish excludes
 // subsequent status/telemetry handling; destruction preserves partial costs.
 class HostCpuInterval {
@@ -606,7 +627,11 @@ Completion run_full(const ggml_gemmini_args_t &args) noexcept {
   preparation.finish();
   ::im2p::gemmini::Options frontend_options{65536};
   frontend_options.numerical_contract =
+#if defined(IM2P_FPGA_ARCH_GEMMINI_HP1) || defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1)
+      ::im2p::gemmini::NumericalContract::scu_final_integer;
+#else
       ::im2p::gemmini::NumericalContract::main_external;
+#endif
   HostCpuInterval frontend_start(args, "im2p.frontend_start_host_call");
   auto started =
       ::im2p::gemmini::execute(&runtime_args, ::im2p::gemmini::Mode::full,
@@ -690,7 +715,11 @@ Completion run_stripe_pipeline(const ggml_gemmini_args_t &args) noexcept {
   preparation.finish();
   ::im2p::gemmini::Options frontend_options{65536};
   frontend_options.numerical_contract =
+#if defined(IM2P_FPGA_ARCH_GEMMINI_HP1) || defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1)
+      ::im2p::gemmini::NumericalContract::scu_final_integer;
+#else
       ::im2p::gemmini::NumericalContract::main_external;
+#endif
   HostCpuInterval frontend_start(args, "im2p.frontend_start_host_call");
   auto started = ::im2p::gemmini::execute(
       &runtime_args, ::im2p::gemmini::Mode::stripe_pipeline,
@@ -1661,7 +1690,11 @@ Completion ExsiaFullExecution::finish(bool quantization_succeeded) noexcept {
 #endif
   ::im2p::gemmini::Options frontend_options{65536};
   frontend_options.numerical_contract =
+#if defined(IM2P_FPGA_ARCH_GEMMINI_HP1) || defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1)
+      ::im2p::gemmini::NumericalContract::scu_final_integer;
+#else
       ::im2p::gemmini::NumericalContract::main_external;
+#endif
   HostCpuInterval frontend_start(impl_->args, "im2p.frontend_start_host_call");
   auto started = ::im2p::gemmini::execute(&impl_->runtime_args,
                                           ::im2p::gemmini::Mode::full,
@@ -1802,7 +1835,11 @@ start_exsia_stripe_pipeline(ggml_gemmini_args_t &args) noexcept {
       65536, impl->residual_mode, impl.get(),
       &ExsiaStripePipeline::Impl::residual_stage};
   frontend_options.numerical_contract =
+#if defined(IM2P_FPGA_ARCH_GEMMINI_HP1) || defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1)
+      ::im2p::gemmini::NumericalContract::scu_final_integer;
+#else
       ::im2p::gemmini::NumericalContract::main_external;
+#endif
   preparation.finish();
   HostCpuInterval frontend_start(args, "im2p.frontend_start_host_call");
   auto started = ::im2p::gemmini::execute(
@@ -2076,6 +2113,14 @@ void test_observe_hardware_dispatch() noexcept {
 }
 
 #endif
+
+void install_rtl_debug_sink() noexcept {
+#if LOG_DEBUG
+  im2p_set_rtl_log_callback(&rtl_debug_log_callback, nullptr);
+#else
+  im2p_set_rtl_log_callback(nullptr, nullptr);
+#endif
+}
 
 void log_failure(const char *operation, const Result &result) noexcept {
   if (result.ok()) {
