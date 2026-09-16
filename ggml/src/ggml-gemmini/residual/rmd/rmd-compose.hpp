@@ -27,10 +27,14 @@ RmdStatus compose_rmd_output(const StripePacket & packet,
                              const CompressedOutput & output,
                              Correction & correction); // row_count * logical_j
 
-// Applies the correction according to its tagged domain and the per-row activation
-// scale, then commits the fully staged result. H1/HP1 consume the column scale here
-// exactly once; H0 values are already weight-scaled and are used directly. The output
-// and optional raw correction nonzero count are unchanged on every failure.
+RmdStatus compose_block_rmd_output(const ggml_gemmini_args_t & args,
+                                   const StripePacket & packet,
+                                   const CompressedOutput & output,
+                                   Correction & correction);
+
+// Applies any remaining scales required by the correction's tagged domain, then
+// commits the fully staged result. Fully scaled BLOCK corrections are added directly.
+// The output and optional raw correction nonzero count are unchanged on every failure.
 RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
                                   float * destination,
                                   size_t global_row_begin,

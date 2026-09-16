@@ -57,8 +57,18 @@ ActivationMetadataView::ActivationMetadataView(const ggml_gemmini_args_t &source
         valid_ = global_stripe_end_ <= meta->theta.size();
     else if (const auto *meta = std::get_if<token::Meta>(&storage))
         valid_ = global_row_end_ <= meta->scales.size();
-    else if (const auto *meta = std::get_if<block::Meta>(&storage))
-        valid_ = global_row_end_ <= meta->scales.size();
+    else if (const auto *meta = std::get_if<block::Meta>(&storage)) {
+        size_t scale_count = 0;
+        const size_t blocks_per_row =
+            meta->cols / block::kGroupSize + (meta->cols % block::kGroupSize != 0);
+        valid_ = meta->rows != 0 && meta->cols == source.K &&
+            global_row_end_ <= meta->rows &&
+            checked_mul_size(meta->rows, blocks_per_row, scale_count) &&
+            scale_count == meta->scales.size() &&
+            std::all_of(meta->scales.begin(), meta->scales.end(), [](float scale) {
+                return std::isfinite(scale) && scale > 0.0f;
+            });
+    }
     else if (const auto *meta = std::get_if<stripe::Meta>(&storage))
         valid_ = global_stripe_end_ <= meta->scales.size();
     else
@@ -112,13 +122,34 @@ bool ActivationMetadataView::scale(size_t local_row, float &scale) const
         scale = meta->scale;
     } else if (const auto *meta = std::get_if<token::Meta>(&storage)) {
         scale = meta->scales[row];
-    } else if (const auto *meta = std::get_if<block::Meta>(&storage)) {
-        scale = meta->scales[row];
+    } else if (std::holds_alternative<block::Meta>(storage)) {
+        return false;
     } else if (const auto *meta = std::get_if<stripe::Meta>(&storage)) {
         scale = meta->scales[row / rows_per_stripe_];
     } else {
         return false;
     }
+    return std::isfinite(scale) && scale > 0.0f;
+}
+
+bool ActivationMetadataView::scale(size_t local_row, size_t k, float &scale) const
+{
+    const auto *meta = source_ == nullptr ? nullptr :
+        std::get_if<block::Meta>(&source_->act_quant.storage());
+    if (meta == nullptr)
+        return this->scale(local_row, scale);
+
+    size_t row = 0;
+    if (!global_row(local_row, row) || k >= meta->cols)
+        return false;
+    const size_t blocks_per_row =
+        meta->cols / block::kGroupSize + (meta->cols % block::kGroupSize != 0);
+    if (row > std::numeric_limits<size_t>::max() / blocks_per_row)
+        return false;
+    const size_t index = row * blocks_per_row + k / block::kGroupSize;
+    if (index >= meta->scales.size())
+        return false;
+    scale = meta->scales[index];
     return std::isfinite(scale) && scale > 0.0f;
 }
 

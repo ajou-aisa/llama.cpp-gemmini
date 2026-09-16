@@ -23,6 +23,7 @@ public:
     bool global_row(size_t local_row, size_t &global_row) const;
     bool global_stripe(size_t local_stripe, size_t &global_stripe) const;
     bool scale(size_t local_row, float &scale) const;
+    bool scale(size_t local_row, size_t k, float &scale) const;
     bool theta(size_t local_stripe, int16_t &theta) const;
 
 private:

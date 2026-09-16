@@ -147,8 +147,11 @@ std::string rmd_correction_hash(const rmd::Correction & correction) {
             hash.u64(static_cast<uint64_t>(value));
         }
     } else {
-        hash.u8(1);
-        for (const double value : std::get<rmd::PreScaledFloat64Correction>(correction).values) {
+        const auto * fully_scaled = std::get_if<rmd::FullyScaledFloat64Correction>(&correction);
+        hash.u8(fully_scaled != nullptr ? 2 : 1);
+        const auto & values = fully_scaled != nullptr ? fully_scaled->values :
+            std::get<rmd::PreScaledFloat64Correction>(correction).values;
+        for (const double value : values) {
             uint64_t bits = 0;
             static_assert(sizeof(bits) == sizeof(value), "FP64 proof hash requires 64-bit double");
             std::memcpy(&bits, &value, sizeof(bits));
@@ -411,6 +414,9 @@ bool valid_activation_metadata(const ggml_gemmini_args_t & args) {
     }
     const quants::act::ActivationMetadataView metadata(
         args, args.activation_row_offset, args.activation_row_offset + args.I);
+    if (std::holds_alternative<quants::act::block::Meta>(args.act_quant.storage())) {
+        return metadata.valid();
+    }
     float scale = 0.0f;
     for (size_t row = 0; metadata.valid() && row < args.I; ++row) {
         if (!metadata.scale(row, scale)) {
@@ -514,16 +520,18 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
     if (!activation_meta.valid()) {
         return MatMulStatus::invalid_contract;
     }
+    const bool block_activation =
+        std::holds_alternative<quants::act::block::Meta>(args.act_quant.storage());
 
     std::vector<float> activation_scales;
     try {
-        activation_scales.resize(args.I);
+        if (!block_activation) activation_scales.resize(args.I);
     } catch (const std::bad_alloc &) {
         return MatMulStatus::invalid_arguments;
     } catch (const std::length_error &) {
         return MatMulStatus::invalid_arguments;
     }
-    for (size_t row = 0; row < args.I; ++row) {
+    for (size_t row = 0; row < activation_scales.size(); ++row) {
         if (!activation_meta.scale(row, activation_scales[row])) {
             return MatMulStatus::invalid_contract;
         }
@@ -632,11 +640,20 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
             scratch.accumulations.begin(),
             row_count * column_count, 0.0);
 
-        for (size_t block_begin = 0; block_begin < args.K;
-             block_begin += block_size) {
+        for (size_t block_begin = 0; block_begin < args.K;) {
             const size_t block_index = block_begin / block_size;
+            const size_t weight_block_end =
+                block_begin + std::min(
+                    block_size - block_begin % block_size,
+                    args.K - block_begin);
+            const size_t activation_block_end = block_activation
+                ? block_begin + std::min(
+                      quants::act::block::kGroupSize -
+                          block_begin % quants::act::block::kGroupSize,
+                      args.K - block_begin)
+                : weight_block_end;
             const size_t block_count =
-                std::min(block_size, args.K - block_begin);
+                std::min(weight_block_end, activation_block_end) - block_begin;
             bool tile_valid = true;
 
             for (size_t local_column = 0;
@@ -696,6 +713,13 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
                 const int32_t * activation =
                     scratch.activation_codes.data() +
                     local_row * block_size;
+                float activation_scale = 1.0f;
+                if (block_activation &&
+                    !activation_meta.scale(
+                        row_begin + local_row, block_begin, activation_scale)) {
+                    execution_valid.store(false, std::memory_order_relaxed);
+                    return;
+                }
                 for (size_t local_column = 0;
                      local_column < column_count; ++local_column) {
                     const int32_t * weight =
@@ -711,10 +735,12 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
                     scratch.accumulations[
                         local_row * column_count + local_column] +=
                         static_cast<double>(block_dot) *
-                        scratch.weight_scales[local_column];
+                        scratch.weight_scales[local_column] *
+                        static_cast<double>(activation_scale);
                     test_detail::observe_native_post_dot_scale();
                 }
             }
+            block_begin += block_count;
         }
 
         for (size_t local_row = 0; local_row < row_count; ++local_row) {
@@ -724,8 +750,10 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
                 const size_t column = column_begin + local_column;
                 double value =
                     scratch.accumulations[
-                        local_row * column_count + local_column] *
-                    static_cast<double>(activation_scales[row]);
+                        local_row * column_count + local_column];
+                if (!block_activation) {
+                    value *= static_cast<double>(activation_scales[row]);
+                }
                 if (args.D != nullptr) {
                     const size_t bias_row = args.repeating_bias ? 0 : row;
                     const size_t bias_index =

@@ -293,6 +293,8 @@ std::string serialize_matmul_cpu_interval(log::CycleRecord record,
     bool operation_success, const MatmulCpuInterval * explicit_interval = nullptr);
 
 inline std::optional<uint64_t> matmul_cpu_run_id(const ggml_gemmini_args_t & args) {
+    if (const auto *meta = std::get_if<quants::act::block::Meta>(&args.act_quant.storage()))
+        return meta->run_id;
     const auto * meta = std::get_if<quants::act::exsia::Meta>(&args.act_quant.storage());
     return meta != nullptr ? meta->run_id : std::nullopt;
 }

@@ -1,6 +1,7 @@
 #include "rmd-executor.hpp"
 
 #include "rmd-builder.hpp"
+#include "rmd-compose.hpp"
 #include "rmd-im2p-executor.hpp"
 
 #include "../../ggml-gemmini-args.h"
@@ -1106,6 +1107,29 @@ static RmdStatus execute_rmd_stripe_im2p_output(im2p_sim_t * sim,
 #endif
 }
 
+template<typename Execute>
+RmdStatus execute_block_correction(const ggml_gemmini_args_t & args,
+                                   const StripePacket & packet,
+                                   Correction & output,
+                                   RmdExecutionMetrics * metrics,
+                                   Execute execute) {
+    CompressedOutput compressed;
+    RmdExecutionMetrics staged_metrics;
+    RmdExecutionMetrics * const staged = metrics != nullptr ? &staged_metrics : nullptr;
+    const RmdStatus status = execute(compressed, staged);
+    if (status != RmdStatus::success) return status;
+    Correction staged_output = BlockScaledInt64Correction{};
+    const RmdStatus compose =
+        compose_block_rmd_output(args, packet, compressed, staged_output);
+    if (compose != RmdStatus::success) return compose;
+    output.swap(staged_output);
+    if (metrics != nullptr) {
+        staged_metrics.compressed_output_values = 0;
+        *metrics = std::move(staged_metrics);
+    }
+    return RmdStatus::success;
+}
+
 RmdStatus execute_rmd_stripe_im2p(
     im2p_sim_t * sim,
     const ggml_gemmini_args_t & args,
@@ -1123,6 +1147,13 @@ RmdStatus execute_rmd_stripe_im2p(
     const StripePacket & packet,
     Correction & output,
     RmdExecutionMetrics * metrics) {
+    if (std::holds_alternative<quants::act::block::Meta>(args.act_quant.storage())) {
+        return execute_block_correction(args, packet, output, metrics,
+            [&](CompressedOutput & compressed, RmdExecutionMetrics * staged) {
+                return execute_rmd_stripe_im2p_output(
+                    sim, args, packet, compressed, staged);
+            });
+    }
     return execute_rmd_stripe_im2p_output(sim, args, packet, output, metrics);
 }
 
@@ -1142,6 +1173,13 @@ static RmdStatus execute_rmd_stripe_ws_output(const ggml_gemmini_args_t & args,
     if (validation != RmdStatus::success) {
         return validation;
     }
+
+#if !defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) && \
+    !defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART) && !defined(__riscv)
+    if (std::holds_alternative<quants::act::block::Meta>(args.act_quant.storage())) {
+        return RmdStatus::unsupported_route;
+    }
+#endif
 
     if (plan.route == wroute::WeightRouteKind::H1 ||
         plan.route == wroute::WeightRouteKind::HP1) {
@@ -1185,6 +1223,12 @@ RmdStatus execute_rmd_stripe_ws(
     const StripePacket & packet,
     Correction & output,
     RmdExecutionMetrics * metrics) {
+    if (std::holds_alternative<quants::act::block::Meta>(args.act_quant.storage())) {
+        return execute_block_correction(args, packet, output, metrics,
+            [&](CompressedOutput & compressed, RmdExecutionMetrics * staged) {
+                return execute_rmd_stripe_ws_output(args, packet, compressed, staged);
+            });
+    }
     return execute_rmd_stripe_ws_output(args, packet, output, metrics);
 }
 
@@ -1192,6 +1236,13 @@ namespace detail {
 RmdStatus execute_rmd_stripe_ws_with_weights(const ggml_gemmini_args_t & args,
     const StripePacket & packet, Correction & correction,
     RmdWeightPreparation & weights, RmdExecutionMetrics * metrics) {
+    if (std::holds_alternative<quants::act::block::Meta>(args.act_quant.storage())) {
+        return execute_block_correction(args, packet, correction, metrics,
+            [&](CompressedOutput & compressed, RmdExecutionMetrics * staged) {
+                return execute_rmd_stripe_ws_output(
+                    args, packet, compressed, staged, &weights.route_plan(args));
+            });
+    }
     return execute_rmd_stripe_ws_output(
         args, packet, correction, metrics, &weights.route_plan(args));
 }
@@ -1200,6 +1251,13 @@ RmdStatus execute_rmd_stripe_im2p_with_weights(im2p_sim_t * sim,
     const ggml_gemmini_args_t & args, const StripePacket & packet,
     Correction & correction, RmdWeightPreparation & weights,
     RmdExecutionMetrics * metrics) {
+    if (std::holds_alternative<quants::act::block::Meta>(args.act_quant.storage())) {
+        return execute_block_correction(args, packet, correction, metrics,
+            [&](CompressedOutput & compressed, RmdExecutionMetrics * staged) {
+                return execute_rmd_stripe_im2p_output(
+                    sim, args, packet, compressed, staged, &weights.route_plan(args));
+            });
+    }
     return execute_rmd_stripe_im2p_output(
         sim, args, packet, correction, metrics, &weights.route_plan(args));
 }
@@ -1238,6 +1296,13 @@ RmdStatus execute_rmd_stripe_reference(
     const StripePacket & packet,
     Correction & output,
     RmdExecutionMetrics * metrics) {
+    if (std::holds_alternative<quants::act::block::Meta>(args.act_quant.storage())) {
+        return execute_block_correction(args, packet, output, metrics,
+            [&](CompressedOutput & compressed, RmdExecutionMetrics * staged) {
+                return execute_rmd_stripe_reference_output(
+                    args, packet, compressed, staged);
+            });
+    }
     return execute_rmd_stripe_reference_output(args, packet, output, metrics);
 }
 
@@ -1294,6 +1359,13 @@ RmdStatus execute_rmd_stripe_im2p_for_test(
     Correction & output,
     RmdExecutionMetrics * metrics,
     Im2pProviderTestFault fault) {
+    if (std::holds_alternative<quants::act::block::Meta>(args.act_quant.storage())) {
+        return execute_block_correction(args, packet, output, metrics,
+            [&](CompressedOutput & compressed, RmdExecutionMetrics * staged) {
+                return execute_rmd_stripe_im2p_for_test_output(
+                    sim, args, packet, compressed, staged, fault);
+            });
+    }
     return execute_rmd_stripe_im2p_for_test_output(sim, args, packet, output, metrics, fault);
 }
 

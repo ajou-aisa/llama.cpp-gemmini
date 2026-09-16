@@ -2,6 +2,7 @@
 
 #include "direct-builder.hpp"
 #include "../../ggml-gemmini-args.h"
+#include "../../quants/act/dispatch.hpp"
 #include "../../quants/common/weight_reader.hpp"
 #include "../../quants/common/weight_route.hpp"
 #if LOG_CYCLE && CYCLE_DETAIL
@@ -225,6 +226,8 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
         plan.scale_domain == wroute::WeightScaleDomain::FloatingBlock;
     const bool integer_block =
         plan.scale_domain == wroute::WeightScaleDomain::IntegerBlockTimesColumn;
+    const bool fully_scaled = std::holds_alternative<quants::act::block::Meta>(
+        args.act_quant.storage());
     if ((floating_block && plan.route != wroute::WeightRouteKind::H0) ||
         (!floating_block && (!integer_block ||
          !wroute::route_supports_integer_block_scale(plan)))) {
@@ -246,14 +249,27 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
 #if LOG_CYCLE && CYCLE_DETAIL
     profile.next_phase(1);
 #endif
+    size_t metadata_row_begin = 0;
+    size_t metadata_row_end = 0;
+    if (fully_scaled &&
+        (__builtin_add_overflow(args.activation_row_offset, payload.row_begin,
+                               &metadata_row_begin) ||
+        __builtin_add_overflow(metadata_row_begin, payload.row_count,
+                               &metadata_row_end))) {
+        return rmd::RmdStatus::overflow;
+    }
+    const quants::act::ActivationMetadataView metadata(
+        args, metadata_row_begin, metadata_row_end);
+    if (fully_scaled && !metadata.valid()) return rmd::RmdStatus::invalid_arguments;
+
     std::vector<rmd::OutputValue> staged_integer;
     std::vector<double> staged_floating;
-    if ((integer_block && output_count > staged_integer.max_size()) ||
-        (floating_block && output_count > staged_floating.max_size())) {
+    if ((!fully_scaled && integer_block && output_count > staged_integer.max_size()) ||
+        ((fully_scaled || floating_block) && output_count > staged_floating.max_size())) {
         return rmd::RmdStatus::allocation_failure;
     }
     try {
-        if (floating_block) {
+        if (fully_scaled || floating_block) {
             staged_floating.assign(output_count, 0.0);
         } else {
             staged_integer.assign(output_count, rmd::OutputValue{0});
@@ -324,6 +340,11 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
                 const ResidualEvent & first = payload.events[event_index];
                 const size_t row = first.local_row;
                 const size_t block_id = first.original_k / rmd::kBlockSize;
+                float activation_scale = 1.0f;
+                if (fully_scaled &&
+                    !metadata.scale(row, first.original_k, activation_scale)) {
+                    return rmd::RmdStatus::invalid_arguments;
+                }
                 size_t span_end = event_index + 1;
                 while (span_end < payload.events.size() &&
                        payload.events[span_end].local_row == row &&
@@ -369,9 +390,28 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
                         return rmd::RmdStatus::execution_failed;
 
                     const size_t output_index = row * payload.logical_j + j;
-                    if (floating_block) {
-                        const double scaled = static_cast<double>(block_sum[local_j]) *
-                            static_cast<double>(scale.floating_block_scale);
+                    if (fully_scaled || floating_block) {
+                        double scaled = static_cast<double>(block_sum[local_j]);
+                        if (floating_block) {
+                            scaled *= static_cast<double>(scale.floating_block_scale);
+                        } else {
+                            if (scale.integer_block_scale >
+                                static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+                                return rmd::RmdStatus::overflow;
+                            }
+                            int64_t integer_scaled = 0;
+                            if (!checked_multiply(
+                                    block_sum[local_j],
+                                    static_cast<int64_t>(scale.integer_block_scale),
+                                    integer_scaled)) {
+                                return rmd::RmdStatus::overflow;
+                            }
+                            scaled = static_cast<double>(integer_scaled) *
+                                static_cast<double>(scale.column_scale);
+                        }
+                        if (fully_scaled) {
+                            scaled *= static_cast<double>(activation_scale);
+                        }
                         const double sum = staged_floating[output_index] + scaled;
                         if (!finite_double(scaled) || !finite_double(sum))
                             return rmd::RmdStatus::overflow;
@@ -520,9 +560,11 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
         native_q8_values += tile_native_q8_values[tile_index];
     }
 
-    rmd::DirectOutput staged_output = floating_block ?
-        rmd::DirectOutput(rmd::PreScaledFloat64Correction{std::move(staged_floating)}) :
-        rmd::DirectOutput(rmd::BlockScaledInt64Correction{std::move(staged_integer)});
+    rmd::DirectOutput staged_output = fully_scaled ?
+        rmd::DirectOutput(rmd::FullyScaledFloat64Correction{std::move(staged_floating)}) :
+        floating_block ?
+            rmd::DirectOutput(rmd::PreScaledFloat64Correction{std::move(staged_floating)}) :
+            rmd::DirectOutput(rmd::BlockScaledInt64Correction{std::move(staged_integer)});
     correction.swap(staged_output);
 
     if (metrics != nullptr) {

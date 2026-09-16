@@ -73,10 +73,16 @@ struct PreScaledFloat64Correction {
     std::vector<double> values;
 };
 
+struct FullyScaledFloat64Correction {
+    std::vector<double> values;
+};
+
 // The correction remains tagged through execution, radix composition, and the
 // final destination merge. Integer-block-scaled and pre-scaled floating values
 // are intentionally not implicitly convertible to one another.
-using Correction = std::variant<BlockScaledInt64Correction, PreScaledFloat64Correction>;
+using Correction = std::variant<BlockScaledInt64Correction,
+                                PreScaledFloat64Correction,
+                                FullyScaledFloat64Correction>;
 using DirectOutput = Correction;
 
 inline size_t correction_size(const Correction & correction) {

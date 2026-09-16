@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -854,9 +855,71 @@ bool direct_outputs_match(const rmd::DirectOutput & lhs, const rmd::DirectOutput
         const auto * right = std::get_if<rmd::BlockScaledInt64Correction>(&rhs);
         return right != nullptr && left->values == right->values;
     }
-    const auto * left = std::get_if<rmd::PreScaledFloat64Correction>(&lhs);
-    const auto * right = std::get_if<rmd::PreScaledFloat64Correction>(&rhs);
+    if (const auto * left = std::get_if<rmd::PreScaledFloat64Correction>(&lhs)) {
+        const auto * right = std::get_if<rmd::PreScaledFloat64Correction>(&rhs);
+        return right != nullptr && left->values == right->values;
+    }
+    const auto * left = std::get_if<rmd::FullyScaledFloat64Correction>(&lhs);
+    const auto * right = std::get_if<rmd::FullyScaledFloat64Correction>(&rhs);
     return left != nullptr && right != nullptr && left->values == right->values;
+}
+
+bool test_block_direct_weight_families() {
+    bool ok = true;
+    for (WeightFamily family : {WeightFamily::H0, WeightFamily::H1, WeightFamily::HP1}) {
+        DirectOracleFixture fixture(8, family);
+        if (!check(fixture.payload != nullptr, "BLOCK direct family fixture builds")) {
+            return false;
+        }
+        auto & metadata = fixture.args.act_quant.storage().emplace<
+            ggml::gemmini::quants::act::block::Meta>();
+        metadata.rows = fixture.payload->row_begin + fixture.payload->row_count;
+        metadata.cols = fixture.args.K;
+        metadata.scales.assign(metadata.rows * 2, 1.0f);
+        metadata.scales[(fixture.payload->row_begin + 0) * 2 + 0] = 0.5f;
+        metadata.scales[(fixture.payload->row_begin + 0) * 2 + 1] = 8.0f;
+        metadata.scales[(fixture.payload->row_begin + 2) * 2 + 0] = 2.0f;
+        metadata.scales[(fixture.payload->row_begin + 2) * 2 + 1] = 0.25f;
+
+        std::vector<double> expected(fixture.payload->row_count * fixture.args.J, 0.0);
+        for (const residual::ResidualEvent & event : fixture.payload->events) {
+            const size_t block = event.original_k / kBlockSize;
+            const size_t global_row = fixture.payload->row_begin + event.local_row;
+            const double activation_scale = metadata.scales[global_row * 2 + block];
+            for (size_t j = 0; j < fixture.args.J; ++j) {
+                const size_t index = j * 2 + block;
+                const size_t k = event.original_k % kBlockSize;
+                int32_t code;
+                double scale;
+                if (family == WeightFamily::H0) {
+                    code = fixture.q8_h0[index].qs[k];
+                    scale = ggml_fp16_to_fp32(fixture.q8_h0[index].d);
+                } else if (family == WeightFamily::H1) {
+                    const auto & weight = fixture.q8_h1[index];
+                    code = weight.qs[k];
+                    scale = static_cast<double>(weight.c_b + weight.R) * weight.s_rf;
+                } else {
+                    const auto & weight = fixture.q8_hp1[index];
+                    code = weight.qs[k];
+                    scale = weight.m == std::numeric_limits<int16_t>::min() ? 0.0 :
+                        std::ldexp(static_cast<double>(weight.channel_scale), weight.m);
+                }
+                expected[event.local_row * fixture.args.J + j] +=
+                    static_cast<double>(event.residual) *
+                    static_cast<double>(code) * scale * activation_scale;
+            }
+        }
+
+        Correction actual = BlockScaledInt64Correction{{777}};
+        const RmdStatus status = residual::execute_direct_stripe(
+            fixture.args, *fixture.payload, actual);
+        const auto * fully_scaled = std::get_if<FullyScaledFloat64Correction>(&actual);
+        ok = check(status == RmdStatus::success && fully_scaled != nullptr &&
+                       fully_scaled->values == expected,
+                   "BLOCK H0/H1/HP1 direct matches independent per-block reference") && ok;
+    }
+    if (ok) std::puts("BLOCK_DIRECT_FAMILIES H0=pass H1=pass HP1=pass scales=differ");
+    return ok;
 }
 
 bool test_direct_oracle_happy_matrix() {
@@ -1317,6 +1380,165 @@ bool compressed_outputs_match(const CompressedOutput & lhs,
                               const CompressedOutput & rhs) {
     return lhs.domain == rhs.domain && lhs.j_padded == rhs.j_padded &&
         lhs.values == rhs.values;
+}
+
+bool test_block_scale_before_sum() {
+    CompactOracleFixture fixture(8, WeightFamily::H1);
+    if (!check(fixture.valid, "BLOCK compact scale fixture builds")) return false;
+
+    RmdStripeBuilder builder;
+    builder.reset(79, 0, 1, 2 * kBlockSize, 1, 8);
+    builder.add_residual(0, 0, 1);
+    builder.add_residual(0, kBlockSize, 1);
+    const StripePacketHandle packet = builder.finish();
+    if (!check(packet != nullptr && packet->blocks.size() == 2,
+               "BLOCK compact packet keeps both original K blocks")) return false;
+
+    CompressedOutput compressed;
+    compressed.j_padded = packet->j_padded;
+    compressed.values.assign(packet->total_output_values, 0);
+    compressed.values[packet->blocks[0].output_value_offset] = 32;
+    compressed.values[packet->blocks[1].output_value_offset] = -32;
+
+    fixture.args.I = 1;
+    fixture.args.J = 1;
+    fixture.q8_h1[0].qs[0] = 32;
+    fixture.q8_h1[1].qs[0] = -32;
+    fixture.q8_h1[0].c_b = 1;
+    fixture.q8_h1[1].c_b = 1;
+    fixture.q8_h1[0].R = 0;
+    fixture.q8_h1[1].R = 0;
+    fixture.q8_h1[0].s_rf = 1.0f;
+    fixture.q8_h1[1].s_rf = 1.0f;
+    auto & metadata =
+        fixture.args.act_quant.storage().emplace<act::block::Meta>();
+    metadata.rows = 1;
+    metadata.cols = 2 * kBlockSize;
+    metadata.scales = {1.0f, 10.0f};
+
+    Correction correction = BlockScaledInt64Correction{{777}};
+    std::array<float, 1> destination = {123.0f};
+    fixture.args.f_out = destination.data();
+    const RmdStatus compose_status =
+        compose_block_rmd_output(fixture.args, *packet, compressed, correction);
+    size_t nonzero_count = 0;
+    const RmdStatus merge_status = compose_status == RmdStatus::success ?
+        merge_rmd_correction(fixture.args, *packet, correction, &nonzero_count) : compose_status;
+    Correction compact = BlockScaledInt64Correction{{777}};
+    Correction direct = BlockScaledInt64Correction{{779}};
+    residual::DirectStripeBuilder direct_builder;
+    direct_builder.reset(79, 0, 1, 2 * kBlockSize, 1);
+    direct_builder.add_residual(0, 0, 1);
+    direct_builder.add_residual(0, kBlockSize, 1);
+    const auto direct_payload = direct_builder.finish();
+    const RmdStatus compact_status =
+        execute_rmd_stripe_reference(fixture.args, *packet, compact);
+    residual::DirectExecutionMetrics metrics{};
+    const RmdStatus direct_status = direct_payload == nullptr ? RmdStatus::invalid_packet :
+        residual::execute_direct_stripe(fixture.args, *direct_payload, direct, &metrics);
+    bool ok = check(merge_status == RmdStatus::success && destination[0] == -165.0f &&
+                              nonzero_count == 1 && metrics.event_count == 2 && metrics.call_count == 1 &&
+                              compact_status == RmdStatus::success &&
+                              direct_status == RmdStatus::success &&
+                              direct_outputs_match(compact, direct) &&
+                              direct_outputs_match(compact, correction),
+                          "BLOCK direct and compact apply each activation scale before the K sum");
+    correction = FullyScaledFloat64Correction{{3000000000.0}};
+    destination[0] = 0.0f;
+    ok = check(merge_rmd_correction(fixture.args, 0, 1, correction) == RmdStatus::success &&
+                   destination[0] == static_cast<float>(3000000000.0),
+               "fully-scaled correction is not clamped to INT32") && ok;
+    if (ok) std::puts("BLOCK_DIRECT_COMPACT correction=-288 merged=-165 unclamped=3e9 tag=fully_scaled");
+    return ok;
+}
+
+bool test_block_correction_failure_atomicity() {
+    CompactOracleFixture fixture(8, WeightFamily::H1);
+    if (!check(fixture.valid, "BLOCK correction failure fixture builds")) return false;
+
+    auto & metadata =
+        fixture.args.act_quant.storage().emplace<act::block::Meta>();
+    metadata.rows = fixture.args.I + fixture.packet->row_begin;
+    metadata.cols = fixture.args.K;
+    metadata.scales.assign(metadata.rows * CompactOracleFixture::blocks_per_row, 1.0f);
+
+    Correction correction = FullyScaledFloat64Correction{{13.25, -9.5}};
+    const Correction correction_before = correction;
+    RmdExecutionMetrics metrics{};
+    metrics.packet_call_count = 17;
+    metrics.matmul_call_count = 19;
+#if !defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) && \
+    !defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART) && !defined(__riscv)
+    bool ok = check(execute_rmd_stripe_ws(
+                        fixture.args, *fixture.packet, correction, &metrics) ==
+                            RmdStatus::unsupported_route &&
+                        direct_outputs_match(correction, correction_before) &&
+                        metrics.packet_call_count == 17 && metrics.matmul_call_count == 19,
+                    "production host BLOCK compact rejection is failure-atomic");
+#else
+    bool ok = true;
+#endif
+
+    std::vector<OutputValue> values;
+    if (!compact_oracle_output(fixture, values)) return false;
+    CompressedOutput compressed;
+    compressed.j_padded = fixture.packet->j_padded;
+    compressed.values = std::move(values);
+    metadata.scales[0] = std::numeric_limits<float>::quiet_NaN();
+    correction = correction_before;
+    ok = check(compose_block_rmd_output(
+                   fixture.args, *fixture.packet, compressed, correction) ==
+                       RmdStatus::invalid_arguments &&
+                   direct_outputs_match(correction, correction_before),
+               "malformed BLOCK scale preserves compact correction") && ok;
+
+    metadata.scales[0] = 1.0f;
+#if GGML_GEMMINI_WEIGHT_BITS == 8
+    auto channel_args = fixture.args;
+    std::vector<elem_t> channel_codes(channel_args.J * channel_args.K, 1);
+    std::vector<float> channel_scales(channel_args.J, 1.0f);
+    channel_args.B = channel_codes.data();
+    channel_args.sB = channel_args.K;
+    channel_args.weight_format =
+        ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar;
+    channel_args.weight_channel_scales = channel_scales.data();
+    channel_args.weight_channel_scale_count = channel_scales.size();
+    ok = check(channel_args.has_q8_channel_dense_sidecar_contract() &&
+                   compose_block_rmd_output(channel_args, *fixture.packet, compressed,
+                                            correction) == RmdStatus::unsupported_route &&
+                   direct_outputs_match(correction, correction_before) &&
+                   execute_rmd_stripe_reference(channel_args, *fixture.packet, correction,
+                                                &metrics) == RmdStatus::unsupported_route &&
+                   direct_outputs_match(correction, correction_before) &&
+                   metrics.packet_call_count == 17 && metrics.matmul_call_count == 19,
+               "unsupported BLOCK channel correction preserves output and metrics") && ok;
+#endif
+    std::vector<float> destination(fixture.args.I * fixture.args.J, 23.0f);
+    const auto destination_before = destination;
+    fixture.args.f_out = destination.data();
+    Correction huge = FullyScaledFloat64Correction{
+        std::vector<double>(fixture.args.J, std::numeric_limits<double>::max())};
+    size_t nonzero_count = 29;
+    ok = check(merge_rmd_correction(
+                   fixture.args, 0, 1, huge, &nonzero_count) == RmdStatus::overflow &&
+                   destination == destination_before && nonzero_count == 29,
+               "fully-scaled overflow preserves destination and metrics") && ok;
+
+    fixture.args.act_quant.storage().emplace<act::tensor::Meta>().scale = 1.0f;
+    correction = FullyScaledFloat64Correction{
+        std::vector<double>(fixture.args.J, 1.0)};
+    destination.assign(destination.size(), 31.0f);
+    const auto domain_before = destination;
+    nonzero_count = 37;
+    const bool domain_ok = check(merge_rmd_correction(
+                     fixture.args, 0, 1, correction, &nonzero_count) ==
+                         RmdStatus::unsupported_route &&
+                     destination == domain_before && nonzero_count == 37,
+                 "fully-scaled domain mismatch preserves destination and metrics") && ok;
+    if (domain_ok) {
+        std::puts("BLOCK_CORRECTION_FAILURE malformed=atomic overflow=atomic domain=atomic host_fallback=rejected");
+    }
+    return domain_ok;
 }
 
 RmdStatus stream_compressed_reverse(const StripePacket & packet,
@@ -2342,12 +2564,14 @@ int main(int argc, char ** argv) {
         ok = test_weight_capability_failure_table() && ok;
     }
     if (selection == TestSelection::all || selection == TestSelection::direct_happy) {
+        ok = test_block_direct_weight_families() && ok;
         ok = test_direct_oracle_happy_matrix() && ok;
     }
     if (selection == TestSelection::all || selection == TestSelection::direct_failure) {
         ok = test_direct_failure_matrix() && ok;
     }
     if (selection == TestSelection::all || selection == TestSelection::compact_happy) {
+        ok = test_block_scale_before_sum() && ok;
         ok = test_compact_oracle_happy_matrix() && ok;
         for (size_t rows : {size_t{1}, size_t{2}, size_t{8},
                             kArrayDim - 1, kArrayDim, kArrayDim + 1}) {
@@ -2356,6 +2580,7 @@ int main(int argc, char ** argv) {
         ok = test_shared_weight_preparation() && ok;
     }
     if (selection == TestSelection::all || selection == TestSelection::compact_failure) {
+        ok = test_block_correction_failure_atomicity() && ok;
         ok = test_compact_failure_matrix() && ok;
         ok = test_streaming_assembler_boundaries() && ok;
     }
