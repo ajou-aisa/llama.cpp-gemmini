@@ -53,7 +53,8 @@ RmdStatus execute_rmd_stripe_im2p(im2p_sim_t * sim,
                                   const ggml_gemmini_args_t & args,
                                   const StripePacket & packet,
                                   Correction & correction,
-                                  RmdExecutionMetrics * metrics = nullptr);
+                                  RmdExecutionMetrics * metrics = nullptr,
+                                  const Im2pFullExecutor * executor = nullptr);
 
 #if defined(GGML_GEMMINI_TESTING)
 RmdStatus execute_rmd_stripe_im2p_for_test(

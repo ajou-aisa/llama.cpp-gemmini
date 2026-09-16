@@ -322,11 +322,18 @@ bool test_activation_stripe_geometry_contract() {
     const bool direct_atomic_ok =
         check(!bad_exsia_ok && bad_exsia.state().failure_code ==
                   quants::act::exsia::ExSIAState::FailureCode::InvalidInput &&
+                  bad_exsia.state().run_id != 0 &&
+                  std::strcmp(quants::act::exsia::failure_code_name(
+                                  bad_exsia.state().failure_code),
+                              "InvalidInput") == 0 &&
+                  std::strcmp(quants::act::exsia::failure_origin_name(
+                                  quants::act::exsia::ExSIAState::FailureCode::StripeReadySinkFailure),
+                              "downstream_sink") == 0 &&
                   bad_trace.publications == 0 && !bad_exsia_meta.run_id.has_value() &&
                   bad_exsia_meta.theta.empty() &&
                   bad_exsia.state().stripe.empty() && bad_exsia.state().residual.empty() &&
                   direct_sentinel_unchanged,
-              "direct ExSIA mismatch is typed, atomic, and has zero side effects");
+              "direct ExSIA mismatch keeps run identity and typed failure provenance");
     const bool public_atomic_ok =
         check(!public_bad_ok && public_sentinel_unchanged &&
                   std::holds_alternative<quants::act::NoneMeta>(public_bad_args.act_quant.storage()),

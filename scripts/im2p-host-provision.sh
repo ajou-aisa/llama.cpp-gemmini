@@ -10,13 +10,10 @@ im2p_provision_host_artifacts() {
   local weight_bits=$5
   local dim=$6
   local block_size=$7
+  local implementation=${8:-LEGACY_BSV}
   local artifact_set=${IM2P_ARTIFACT_SET:-SELECTED}
   local cache_jobs
   local target
-  local build_args=()
-  if [[ -n "${8:-}" ]]; then
-    build_args+=("BUILD_DIR=$8")
-  fi
 
   case "$artifact_set" in
     SELECTED)
@@ -46,18 +43,18 @@ im2p_provision_host_artifacts() {
 
   local sim_root_abs
   sim_root_abs="$(cd "$sim_root" && pwd)"
-  make -C "$sim_root_abs" -j"$cache_jobs" \
+  local make_args=(
     IM2P_CACHE_JOBS="$cache_jobs" \
     GEMMINI_ROOT="$gemmini_root" \
+    IM2P_SIM_IMPLEMENTATION="$implementation" \
     IM2P_ACTIVATION_BITS="$activation_bits" \
     IM2P_WEIGHT_BITS="$weight_bits" \
     IM2P_DIM="$dim" \
     GEMMINI_FRONTEND_ACTIVATION_BITS="$activation_bits" \
     GEMMINI_FRONTEND_WEIGHT_BITS="$weight_bits" \
     GEMMINI_FRONTEND_DIM="$dim" \
-    GEMMINI_FRONTEND_BLOCK_SIZE="$block_size" \
-    "${build_args[@]}" \
-    "$target"
+    GEMMINI_FRONTEND_BLOCK_SIZE="$block_size")
+  make -C "$sim_root_abs" -j"$cache_jobs" "${make_args[@]}" "$target"
 }
 
 # Resolve once before provisioning and configure. Python emits only shell-quoted

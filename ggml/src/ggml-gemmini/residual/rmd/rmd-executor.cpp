@@ -1122,8 +1122,10 @@ RmdStatus execute_rmd_stripe_im2p(
     const ggml_gemmini_args_t & args,
     const StripePacket & packet,
     Correction & output,
-    RmdExecutionMetrics * metrics) {
-    return execute_rmd_stripe_im2p_output(sim, args, packet, output, metrics);
+    RmdExecutionMetrics * metrics,
+    const Im2pFullExecutor * executor) {
+    return execute_rmd_stripe_im2p_output(
+        sim, args, packet, output, metrics, nullptr, executor);
 }
 
 template<typename Output>

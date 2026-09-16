@@ -920,6 +920,16 @@ if (EXISTS "${CMAKE_COMMAND}" AND EXISTS "${LLAMA_TEST_SOURCE_DIR}/CMakeLists.tx
             -DTEST_GENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM}
             -DTEST_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-build-contract.cmake)
+    if(Python3_Interpreter_FOUND)
+        add_test(
+            NAME test-gemmini-hp1-fpga-contract
+            COMMAND ${CMAKE_COMMAND}
+                -DTEST_CMAKE=${CMAKE_COMMAND}
+                -DTEST_PYTHON=${Python3_EXECUTABLE}
+                -DTEST_SOURCE_DIR=${LLAMA_TEST_SOURCE_DIR}
+                -DTEST_BINARY_ROOT=${CMAKE_CURRENT_BINARY_DIR}/gemmini-hp1-fpga-contract
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-hp1-fpga-contract.cmake)
+    endif()
 endif()
 
 if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
