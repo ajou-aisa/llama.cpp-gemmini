@@ -1767,6 +1767,55 @@ namespace ggml::gemmini::quants::act::exsia
         return true;
     }
 
+    const char *failure_code_name(ExSIAState::FailureCode code) noexcept
+    {
+        switch (code)
+        {
+        case ExSIAState::FailureCode::None: return "None";
+        case ExSIAState::FailureCode::InvalidInput: return "InvalidInput";
+        case ExSIAState::FailureCode::OpenMPUnavailable: return "OpenMPUnavailable";
+        case ExSIAState::FailureCode::WrongTeamSize: return "WrongTeamSize";
+        case ExSIAState::FailureCode::ExternalOpenMPRegionUnsupported: return "ExternalOpenMPRegionUnsupported";
+        case ExSIAState::FailureCode::LocalBlockFailure: return "LocalBlockFailure";
+        case ExSIAState::FailureCode::MaskAssemblyFailure: return "MaskAssemblyFailure";
+        case ExSIAState::FailureCode::ExponentReductionFailure: return "ExponentReductionFailure";
+        case ExSIAState::FailureCode::FoldingFailure: return "FoldingFailure";
+        case ExSIAState::FailureCode::ValidationSnapshotFailure: return "ValidationSnapshotFailure";
+        case ExSIAState::FailureCode::StripeReadySinkFailure: return "StripeReadySinkFailure";
+        case ExSIAState::FailureCode::ProfileIntervalInvalid: return "ProfileIntervalInvalid";
+        case ExSIAState::FailureCode::ProfileFlushFailure: return "ProfileFlushFailure";
+        case ExSIAState::FailureCode::Exception: return "Exception";
+        }
+        return "Unknown";
+    }
+
+    const char *failure_origin_name(ExSIAState::FailureCode code) noexcept
+    {
+        switch (code)
+        {
+        case ExSIAState::FailureCode::None: return "none";
+        case ExSIAState::FailureCode::InvalidInput:
+        case ExSIAState::FailureCode::OpenMPUnavailable:
+        case ExSIAState::FailureCode::WrongTeamSize:
+        case ExSIAState::FailureCode::ExternalOpenMPRegionUnsupported:
+            return "exsia_setup";
+        case ExSIAState::FailureCode::LocalBlockFailure:
+        case ExSIAState::FailureCode::MaskAssemblyFailure:
+        case ExSIAState::FailureCode::ExponentReductionFailure:
+        case ExSIAState::FailureCode::FoldingFailure:
+            return "exsia_compute";
+        case ExSIAState::FailureCode::ValidationSnapshotFailure:
+        case ExSIAState::FailureCode::ProfileIntervalInvalid:
+        case ExSIAState::FailureCode::ProfileFlushFailure:
+            return "exsia_validation";
+        case ExSIAState::FailureCode::StripeReadySinkFailure:
+            return "downstream_sink";
+        case ExSIAState::FailureCode::Exception:
+            return "exception";
+        }
+        return "unknown";
+    }
+
     void ExSIA::reset_failure_state()
     {
         first_failure_code_.store(ExSIAState::FailureCode::None, std::memory_order_relaxed);
@@ -1834,6 +1883,7 @@ namespace ggml::gemmini::quants::act::exsia
             meta.rho = config::GGML_GEMMINI_ACTIVATION_RHO;
             state_ = ExSIAState{};
             state_.mode = requested_mode_;
+            state_.run_id = run_id;
             state_.failure_code = ExSIAState::FailureCode::InvalidInput;
             state_.failure_stripe = ExSIAState::no_failure_stripe;
             return false;
@@ -1857,6 +1907,7 @@ namespace ggml::gemmini::quants::act::exsia
 #endif
             state_ = ExSIAState{};
             state_.mode = requested_mode_;
+            state_.run_id = run_id;
             state_.failure_code = failure_code;
             state_.failure_stripe = failure_stripe;
 #if EXSIA_VALIDATION && EXSIA_PROFILE_COLLECTION_ENABLED
@@ -1876,6 +1927,7 @@ namespace ggml::gemmini::quants::act::exsia
         local_workspace_.reset_for_run();
         state_ = ExSIAState{};
         state_.mode = requested_mode_;
+        state_.run_id = run_id;
 #if !defined(GGML_GEMMINI_HAS_OPENMP)
         if (state_.mode == ExSIAState::ExecutionMode::LocalParallel ||
             state_.mode == ExSIAState::ExecutionMode::LocalFoldingPipeline)
@@ -2001,7 +2053,13 @@ namespace ggml::gemmini::quants::act::exsia
             const int16_t theta =
                 meta.resolve_stripe_theta(static_cast<int>(slot.stripe_idx));
             if (theta == std::numeric_limits<int16_t>::min())
+            {
+                ggml::gemmini::log::debug(
+                    layer,
+                    "[exsia] stripe ready handoff failed run_id=%llu stripe=%zu reason=missing_theta",
+                    static_cast<unsigned long long>(run_id), slot.stripe_idx);
                 return false;
+            }
             event.activation_metadata =
                 StripeMetadataSnapshot{meta.e_s, meta.rho, meta.sigma, theta};
             event.quantization_start = slot.quantization_start;
@@ -2032,6 +2090,13 @@ namespace ggml::gemmini::quants::act::exsia
             const bool accepted = sink->on_ready(
                 sink->user_data,
                 event);
+            if (!accepted)
+            {
+                ggml::gemmini::log::debug(
+                    layer,
+                    "[exsia] stripe ready handoff failed run_id=%llu stripe=%zu reason=sink_rejected",
+                    static_cast<unsigned long long>(run_id), slot.stripe_idx);
+            }
 #if defined(__linux__) && defined(__aarch64__) && CYCLE_DETAIL
             if (measure_stripe_ready_handoff)
             {

@@ -215,6 +215,7 @@ start_exsia_stripe_pipeline(ggml_gemmini_args_t &args) noexcept;
     const ggml_gemmini_args_t &args,
     std::uint64_t expected_run_id) noexcept;
 
+void install_rtl_debug_sink() noexcept;
 void log_failure(const char *operation, const Result &result) noexcept;
 void log_stats(const char * mode, const Stats & stats,
                std::uint64_t run_id,

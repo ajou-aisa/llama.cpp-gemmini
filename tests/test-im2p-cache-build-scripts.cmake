@@ -134,10 +134,77 @@ function(run_host_selected script)
         message(FATAL_ERROR
             "${script} must default to the selected target:\n${commands}")
     endif()
+    if(script STREQUAL "build-arm64.sh")
+        string(FIND "${commands}" "IM2P_SIM_IMPLEMENTATION=GEMMINI_HP1" implementation_at)
+        if(implementation_at EQUAL -1)
+            message(FATAL_ERROR
+                "build-arm64.sh must provision GEMMINI_HP1 integrated IM2P artifacts:\n${commands}")
+        endif()
+    endif()
 endfunction()
 
 run_host_selected(build-arm64.sh)
 run_host_selected(build-x86.sh)
+
+# A reused host build directory may carry CPU/HARDWARE defaults. The ARM64
+# simulator script owns its lane defaults unless an environment or -D override
+# explicitly selects another option/backend.
+set(stale_root "${test_root}/arm64-stale-cache")
+file(MAKE_DIRECTORY "${stale_root}")
+file(WRITE "${stale_root}/CMakeCache.txt"
+    "GGML_GEMMINI_OPTION:STRING=CPU\n"
+    "GGML_GEMMINI_EXECUTION_BACKEND:STRING=HARDWARE\n"
+    "CMAKE_TOOLCHAIN_FILE:FILEPATH=/stale/toolchain.cmake\n"
+    "CMAKE_PREFIX_PATH:PATH=/stale/prefix\n"
+    "OpenMP_ROOT:PATH=/stale/openmp\n"
+    "CMAKE_BUILD_TYPE:STRING=Debug\n"
+    "GGML_GEMMINI_DEFAULT_RMD_BACKEND:STRING=CPU\n"
+    "GGML_GEMMINI_ENABLE_RMD:BOOL=OFF\n"
+    "LOG_DEBUG:STRING=0\n"
+    "LOG_CYCLE:STRING=0\n")
+set(stale_log "${test_root}/build-arm64-stale-cache.log")
+execute_process(
+    COMMAND "${CMAKE_COMMAND}" -E env
+        "PATH=${test_root}/bin:$ENV{PATH}"
+        "CONTRACT_LOG=${stale_log}"
+        "BUILD_DIR=${stale_root}"
+        "BUILD_JOBS=1"
+        "IM2P_SIM_ROOT=${TEST_IM2P_ROOT}"
+        bash "${TEST_SOURCE_DIR}/build-arm64.sh"
+    WORKING_DIRECTORY "${TEST_SOURCE_DIR}"
+    RESULT_VARIABLE stale_rc
+    OUTPUT_VARIABLE stale_stdout
+    ERROR_VARIABLE stale_stderr)
+if(NOT stale_rc EQUAL 0)
+    message(FATAL_ERROR
+        "build-arm64.sh stale CPU/HARDWARE cache recovery failed:\n${stale_stdout}\n${stale_stderr}")
+endif()
+file(READ "${stale_log}" stale_commands)
+foreach(stale_arg IN ITEMS
+        "-U GGML_*"
+        "-U IM2P_*"
+        "-U LLAMA_*"
+        "-U LOG_*"
+        "-U CYCLE_*"
+        "-U BUILD_SHARED_LIBS"
+        "-U CMAKE_TOOLCHAIN_FILE"
+        "-U CMAKE_PREFIX_PATH"
+        "-U OpenMP_ROOT"
+        "-DGGML_GEMMINI_OPTION=WS"
+        "-DGGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM"
+        "-DIM2P_SIM_IMPLEMENTATION=GEMMINI_HP1"
+        "-DCMAKE_BUILD_TYPE=Release"
+        "-DGGML_GEMMINI_DEFAULT_RMD_BACKEND=WS"
+        "-DGGML_GEMMINI_ENABLE_RMD=ON"
+        "-DLOG_DEBUG=1"
+        "-DLOG_CYCLE=1"
+        "IM2P_SIM_IMPLEMENTATION=GEMMINI_HP1")
+    string(FIND "${stale_commands}" "${stale_arg}" stale_arg_at)
+    if(stale_arg_at EQUAL -1)
+        message(FATAL_ERROR
+            "build-arm64.sh must override stale cache with ${stale_arg}:\n${stale_commands}")
+    endif()
+endforeach()
 
 execute_process(
     COMMAND "${CMAKE_COMMAND}" -E env
@@ -193,7 +260,7 @@ endif()
 
 file(READ "${TEST_SOURCE_DIR}/CMakeLists.txt" root_cmake)
 string(FIND "${root_cmake}"
-    [=[/build/selected/${GGML_GEMMINI_IM2P_ARTIFACT_ID}/current]=]
+    [=[/build/selected/${IM2P_SIM_IMPLEMENTATION}/${GGML_GEMMINI_IM2P_ARTIFACT_ID}/current]=]
     manifest_at)
 string(FIND "${root_cmake}"
     [=[GGML_GEMMINI_IM2P_GENERATION]=] generation_at)
@@ -217,6 +284,7 @@ if(manifest_at EQUAL -1 OR generation_at EQUAL -1 OR realpath_at EQUAL -1 OR
 endif()
 foreach(expected_verifier_arg IN ITEMS
         "--expected-identity"
+        "--expected-implementation"
         "--expected-block-size"
         "--expected-platform"
         "--expected-platform-release"
@@ -228,10 +296,24 @@ foreach(expected_verifier_arg IN ITEMS
             "CMake verifier must enforce ${expected_verifier_arg}")
     endif()
 endforeach()
+string(FIND "${root_cmake}" "im2p_sim_implementation()" simulator_implementation_at)
+string(FIND "${root_cmake}" "gemmini-hp1-integrated-v1" hp1_implementation_at)
+string(FIND "${root_cmake}" "IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1=1" simulator_hp1_define_at)
+if(simulator_implementation_at EQUAL -1 OR hp1_implementation_at EQUAL -1)
+    message(FATAL_ERROR "CMake must validate selected IM2P simulator implementation identity")
+endif()
+if(simulator_hp1_define_at EQUAL -1)
+    message(FATAL_ERROR
+        "CMake must select SCU numerical contract for integrated GEMMINI_HP1 simulator")
+endif()
 
 file(READ
     "${TEST_SOURCE_DIR}/ggml/src/ggml-gemmini/CMakeLists.txt"
     gemmini_cmake)
+file(READ
+    "${TEST_IM2P_ROOT}/frontend/src/im2p_gemmini_frontend.cpp"
+    im2p_frontend_source)
+file(READ "${TEST_IM2P_ROOT}/Makefile" im2p_makefile)
 foreach(build_verify_contract IN ITEMS
         "add_custom_target(ggml-gemmini-im2p-verify"
         "add_dependencies(ggml-gemmini ggml-gemmini-im2p-verify)")
@@ -241,6 +323,20 @@ foreach(build_verify_contract IN ITEMS
             "IM2P archive integrity must be rechecked at build time")
     endif()
 endforeach()
+string(FIND "${gemmini_cmake}" "--expected-implementation" target_implementation_at)
+if(target_implementation_at EQUAL -1)
+    message(FATAL_ERROR "IM2P build-time verification must enforce implementation identity")
+endif()
+string(FIND "${im2p_frontend_source}" "IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1" frontend_hp1_residual_at)
+if(frontend_hp1_residual_at EQUAL -1)
+    message(FATAL_ERROR
+        "provisioned IM2P frontend must allow integrated GEMMINI_HP1 residual callback")
+endif()
+string(FIND "${im2p_makefile}" "IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1=1" makefile_hp1_residual_at)
+if(makefile_hp1_residual_at EQUAL -1)
+    message(FATAL_ERROR
+        "IM2P Makefile must compile integrated GEMMINI_HP1 frontend contract")
+endif()
 foreach(selected_archive IN ITEMS
         [=[${GGML_GEMMINI_IM2P_GENERATION}/libim2p_gemmini_frontend.a]=]
         [=[${GGML_GEMMINI_IM2P_GENERATION}/libim2p_sim.a]=])

@@ -63,6 +63,14 @@
 
 namespace
 {
+    constexpr bool gemmini_hp1_native_weight_supported(
+            ggml_type type,
+            int activation_bits = GGML_GEMMINI_ACTIVATION_BITS,
+            int weight_bits = GGML_GEMMINI_WEIGHT_BITS) {
+        return (activation_bits == 4 && weight_bits == 4 && type == GGML_TYPE_Q4_HP1) ||
+               (activation_bits == 8 && weight_bits == 8 && type == GGML_TYPE_Q8_HP1);
+    }
+
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
     thread_local bool fpga_dispatch_failed = false;
     // Counts only executed graph nodes and adapter calls, never supports_op probes.
@@ -90,10 +98,18 @@ namespace
         ggml::gemmini::config::ActivationQuantAlgo::EXSIA;
     constexpr bool fpga_token = ggml::gemmini::config::CURRENT_ACTIVATION_QUANT ==
         ggml::gemmini::config::ActivationQuantAlgo::TOKEN;
+#if defined(IM2P_FPGA_ARCH_GEMMINI_HP1)
+    constexpr const char * fpga_native_formats =
+        GGML_GEMMINI_ACTIVATION_BITS == 4 ? "Q4_HP1" : "Q8_HP1";
+#else
     constexpr const char * fpga_native_formats = fpga_exsia ? "Q8_H1,Q8_HP1,Q8_0" :
         fpga_token ? "Q8_CHANNEL" : "Q8_H1,Q8_HP1,Q8_0,Q8_CHANNEL";
+#endif
     constexpr const char * fpga_output_domains = fpga_exsia ? "1,2" : fpga_token ? "0" : "0,1,2";
     bool gemmini_fpga_native_weight_supported(ggml_type type) {
+#if defined(IM2P_FPGA_ARCH_GEMMINI_HP1)
+        return gemmini_hp1_native_weight_supported(type);
+#else
         constexpr auto activation = ggml::gemmini::config::CURRENT_ACTIVATION_QUANT;
         constexpr bool exsia = activation == ggml::gemmini::config::ActivationQuantAlgo::EXSIA;
         const bool bounded = ggml_gemmini_fpga_uses_bounded();
@@ -103,6 +119,7 @@ namespace
         if (activation == ggml::gemmini::config::ActivationQuantAlgo::TOKEN) return false;
         return type == GGML_TYPE_Q8_H1 ||
                (bounded && (type == GGML_TYPE_Q8_HP1 || type == GGML_TYPE_Q8_0));
+#endif
     }
 #else
     constexpr bool fpga_dense = false;
@@ -980,6 +997,14 @@ namespace
 }
 
 #if defined(GGML_GEMMINI_TESTING)
+bool ggml::gemmini::test_hp1_native_weight_admission_contract() {
+    return gemmini_hp1_native_weight_supported(GGML_TYPE_Q4_HP1, 4, 4) &&
+           gemmini_hp1_native_weight_supported(GGML_TYPE_Q8_HP1, 8, 8) &&
+           !gemmini_hp1_native_weight_supported(GGML_TYPE_Q8_HP1, 4, 4) &&
+           !gemmini_hp1_native_weight_supported(GGML_TYPE_Q4_HP1, 8, 8) &&
+           !gemmini_hp1_native_weight_supported(GGML_TYPE_Q4_HP1, 4, 8);
+}
+
 std::string ggml::gemmini::test_resolve_backend_matmul_layer(
     std::string_view model_arch, std::string_view weight_name,
     std::string_view input_name, std::string_view consumer_name) {
@@ -1288,6 +1313,9 @@ static void setup_gemmini_log_outputs_if_needed(void) {
     if (!result.debug) {
         GGML_LOG_WARN("%s: failed to set default debug log path '%s'\n", __func__, GEMMINI_LOG_DEFAULT_DEBUG_PATH);
     }
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    ggml::gemmini::im2p_adapter::install_rtl_debug_sink();
+#endif
 }
 
 static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
@@ -2195,7 +2223,12 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             if (!quantize_activation()) {
                 throw std::runtime_error("existing activation quantizer failed");
             }
-        }, layer, src0->type == GGML_TYPE_Q8_H1 || src0->type == GGML_TYPE_Q8_HP1);
+        }, layer,
+#if defined(IM2P_FPGA_ARCH_GEMMINI_HP1)
+            gemmini_hp1_native_weight_supported(src0->type));
+#else
+            src0->type == GGML_TYPE_Q8_H1 || src0->type == GGML_TYPE_Q8_HP1);
+#endif
         if (success) ++fpga_completed;
         if (!success) {
             GGML_LOG_ERROR("FPGA_UART execution failed: %s\n", ggml_gemmini_fpga_last_error().c_str());

@@ -43,8 +43,10 @@ ActivationMetadataView::ActivationMetadataView(const ggml_gemmini_args_t &source
     if (global_row_begin > global_row_end)
         return;
 
-    rows_per_stripe_ = source.I;
-    if (source.tile_I > 0 && !checked_mul_size(source.tile_I, DIM, rows_per_stripe_))
+    rows_per_stripe_ = source.activation_rows_per_stripe > 0 ?
+        source.activation_rows_per_stripe : source.I;
+    if (source.activation_rows_per_stripe == 0 && source.tile_I > 0 &&
+        !checked_mul_size(source.tile_I, DIM, rows_per_stripe_))
         return;
     if (rows_per_stripe_ == 0 ||
         global_row_end > std::numeric_limits<size_t>::max() - (rows_per_stripe_ - 1))
@@ -172,13 +174,31 @@ bool quantize(const ggml_tensor *src, ggml_gemmini_args_t &args)
     default:
     {
         auto &meta = args.act_quant.storage().emplace<exsia::Meta>();
-        exsia::ExSIA exsia;
-        if (!exsia.run(meta, src, args, args.exsia_stripe_ready_sink)) {
-            ggml::gemmini::log::debug(
-                args.matmul_layer.c_str(),
-                "[exsia] quantization failed failure_code=%d failure_stripe=%zu",
-                static_cast<int>(exsia.state().failure_code),
-                exsia.state().failure_stripe);
+        exsia::ExSIA quantizer;
+        if (!quantizer.run(meta, src, args, args.exsia_stripe_ready_sink)) {
+            const auto &state = quantizer.state();
+            const bool sink_attached = args.exsia_stripe_ready_sink != nullptr &&
+                                       args.exsia_stripe_ready_sink->on_ready != nullptr;
+            if (state.failure_stripe == exsia::ExSIAState::no_failure_stripe) {
+                ggml::gemmini::log::debug(
+                    args.matmul_layer.c_str(),
+                    "[exsia] run failed run_id=%llu failure=%s failure_code=%d failure_origin=%s failure_stripe=none I=%zu J=%zu K=%zu sink_attached=%s",
+                    static_cast<unsigned long long>(state.run_id),
+                    exsia::failure_code_name(state.failure_code),
+                    static_cast<int>(state.failure_code),
+                    exsia::failure_origin_name(state.failure_code),
+                    args.I, args.J, args.K, sink_attached ? "true" : "false");
+            } else {
+                ggml::gemmini::log::debug(
+                    args.matmul_layer.c_str(),
+                    "[exsia] run failed run_id=%llu failure=%s failure_code=%d failure_origin=%s failure_stripe=%zu I=%zu J=%zu K=%zu sink_attached=%s",
+                    static_cast<unsigned long long>(state.run_id),
+                    exsia::failure_code_name(state.failure_code),
+                    static_cast<int>(state.failure_code),
+                    exsia::failure_origin_name(state.failure_code),
+                    state.failure_stripe, args.I, args.J, args.K,
+                    sink_attached ? "true" : "false");
+            }
             reset_quantize_failure(args);
             return false;
         }

@@ -1148,15 +1148,17 @@ RmdStatus execute_rmd_stripe_im2p(
     const ggml_gemmini_args_t & args,
     const StripePacket & packet,
     Correction & output,
-    RmdExecutionMetrics * metrics) {
+    RmdExecutionMetrics * metrics,
+    const Im2pFullExecutor * executor) {
     if (std::holds_alternative<quants::act::block::Meta>(args.act_quant.storage())) {
         return execute_block_correction(args, packet, output, metrics,
             [&](CompressedOutput & compressed, RmdExecutionMetrics * staged) {
                 return execute_rmd_stripe_im2p_output(
-                    sim, args, packet, compressed, staged);
+                    sim, args, packet, compressed, staged, nullptr, executor);
             });
     }
-    return execute_rmd_stripe_im2p_output(sim, args, packet, output, metrics);
+    return execute_rmd_stripe_im2p_output(
+        sim, args, packet, output, metrics, nullptr, executor);
 }
 
 template<typename Output>

@@ -17,3 +17,4 @@ gpt2/*
 #venv files
 
 .venv/*
+.omx/
