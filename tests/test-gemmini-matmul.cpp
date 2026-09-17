@@ -354,6 +354,7 @@ bool test_cpu_cycle_lifecycle() {
             const uint64_t producer_tid = cycle::host_thread_id();
             log::cycle.set_output(sink);
             bool ok = execution.status().ok() && collector.start(execution);
+            std::array<std::optional<uint64_t>, 3> submission_waits{};
             for (size_t stripe = 0; ok && stripe != 3; ++stripe) {
                 quants::act::exsia::StripeReadyEvent event{};
                 event.run_id = run_id;
@@ -362,7 +363,9 @@ bool test_cpu_cycle_lifecycle() {
                 event.row_begin = stripe;
                 event.row_end = stripe + 1;
                 event.direct_residual = make_direct_payload(stripe, stripe, 1, 128);
+                event.collect_submission_timing = true;
                 ok = collector.sink()->on_ready(collector.sink()->user_data, event);
+                submission_waits[stripe] = event.submission_wait_ns;
             }
             ok = collector.finish().ok() && ok;
             ok = finish_execution(execution).ok() && ok;
@@ -401,15 +404,38 @@ bool test_cpu_cycle_lifecycle() {
             };
             for (size_t stripe = 0; stripe != profiles.size(); ++stripe) {
                 const auto & profile = profiles[stripe];
+                if (!expect(submission_waits[stripe].has_value() &&
+                            *submission_waits[stripe] == profile.producer_wait.nanoseconds &&
+                            profile.producer_wait_end_ns - profile.producer_wait_start_ns ==
+                                profile.producer_wait.nanoseconds &&
+                            (stripe != 0 || *submission_waits[stripe] == 0),
+                            "producer reports exact capacity wait and zero for the first submission")) return false;
                 if (!expect(profile.run_id == run_id && profile.stripe_id == stripe &&
                             (profile.cpu_identity_mask & GEMMINI_CYCLE_HAS_RUN_ID) != 0 &&
                             (profile.cpu_identity_mask & GEMMINI_CYCLE_HAS_SLOT) != 0 &&
                             profile.slot == stripe % 2 && profile.cpu_dense.reason != "not_collected" &&
                             profile.cpu_backend.reason != "not_collected",
                             "worker CPU collection and identity survive slot reuse")) return false;
+                if (profile.producer_wait.count != 0) {
+                    const auto wait = cpu_row("producer_capacity_wait", stripe);
+                    if (!expect(!wait.empty() && ns_field(wait, "start_tid") == producer_tid &&
+                                ns_field(wait, "end_tid") == producer_tid &&
+                                ns_field(wait, "start_ns") <= profile.producer_wait_start_ns &&
+                                ns_field(wait, "end_ns") >= profile.producer_wait_end_ns &&
+                                wait.find("\"native_cycles\":{\"start\":{") != std::string_view::npos &&
+                                wait.find("\"additive\":false") != std::string_view::npos,
+                                "capacity waits retain same-owner endpoints and wall duration")) return false;
+                }
                 const auto preparation = cpu_row("stripe_job_preparation", stripe);
                 const auto dense = cpu_row("dense_backend_host_call", stripe);
                 const auto residual = cpu_row("residual_backend_host_call", stripe);
+                for (const auto row : {preparation, dense, residual}) {
+                    if (!expect(row.find("\"native_cycles\":{\"start\":{") != std::string_view::npos &&
+                                row.find("\"owner_token\":") != std::string_view::npos &&
+                                row.find("\"generation\":") != std::string_view::npos &&
+                                row.find("\"thread_cpu_timing\":{") != std::string_view::npos,
+                                "stage logs preserve raw CPU endpoints for offline selection")) return false;
+                }
                 const auto summary = detail::pipeline_stripe_telemetry(args.matmul_layer.c_str(), profile);
                 if (!expect(profile.capture_queue_enqueue_ns > 0 &&
                             profile.capture_queue_enqueue_ns <= profile.capture_queue_dequeue_ns &&
@@ -458,9 +484,36 @@ bool test_cpu_cycle_lifecycle() {
                     "dense_backend_host_call", "residual_backend_host_call",
                     "output_correction_apply", "telemetry_stats_compute",
                     "stripe_completion_bookkeeping", "collector_capacity_release",
-                    "pipeline_drain_and_join", "matmul_output_validation_and_publish"}) {
+                    "pipeline_drain_and_join", "worker_queue_wait", "worker_join_wait",
+                    "matmul_output_validation_and_publish"}) {
                 if (!expect(emitted.find(std::string("\"op\":\"") + op + "\"") != std::string::npos,
                             "actual lifecycle work emits its CPU interval")) return false;
+            }
+            for (const auto name : {"worker_queue_wait", "worker_join_wait"}) {
+                const std::string needle = std::string("\"op\":\"") + name + "\"";
+                size_t count = 0;
+                for (size_t pos = 0; pos < emitted.size();) {
+                    const size_t end = emitted.find('\n', pos);
+                    const std::string_view row(emitted.data() + pos,
+                        (end == std::string::npos ? emitted.size() : end) - pos);
+                    if (row.find(needle) != std::string_view::npos) {
+                        ++count;
+                        const uint64_t tid = ns_field(row, "start_tid");
+                        if (!expect(tid != 0 && tid == ns_field(row, "end_tid") &&
+                                    ns_field(row, "run_id") == run_id &&
+                                    row.find("\"run_id\":" + std::to_string(run_id) + ",") != std::string_view::npos &&
+                                    row.find("\"stripe_id\":null") != std::string_view::npos &&
+                                    row.find("\"native_cycles\":{") != std::string_view::npos &&
+                                    row.find("\"additive\":false") != std::string_view::npos &&
+                                    (std::string_view(name) == "worker_join_wait" ?
+                                        tid == producer_tid : tid != producer_tid),
+                                    "worker and join waits preserve their own owner and invocation identity")) return false;
+                    }
+                    if (end == std::string::npos) break;
+                    pos = end + 1;
+                }
+                if (!expect(count == (std::string_view(name) == "worker_join_wait" ? 1 : 4),
+                            "one join and one queue wait per stripe plus drain are recorded")) return false;
             }
             if (hash == 0) reference = output;
             else if (!expect(same_output(reference, output), "hash opt-in preserves output exactly")) return false;

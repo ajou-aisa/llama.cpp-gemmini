@@ -1,8 +1,10 @@
+#include <gemmini/trace-context.hpp>
 #include "rmd-executor.hpp"
 
 #include "rmd-builder.hpp"
 #include "rmd-compose.hpp"
 #include "rmd-im2p-executor.hpp"
+#include "../direct/direct-types.hpp"
 
 #include "../../ggml-gemmini-args.h"
 
@@ -555,6 +557,30 @@ RmdStatus RmdOutputAssembler::finish() {
 }
 
 void collect_packet_metrics(const StripePacket & packet, RmdExecutionMetrics & metrics) {
+    metrics.residual_observations_valid = packet.residual_observations_valid;
+    metrics.digit_bits = packet.digit_bits;
+    metrics.residual_nnz = packet.residual_event_count;
+    metrics.residual_min = packet.residual_min;
+    metrics.residual_max = packet.residual_max;
+    metrics.required_planes = packet.required_planes;
+    metrics.digit_nnz = packet.digit_nnz;
+    metrics.original_rows = packet.row_count;
+    metrics.logical_k = packet.logical_k;
+    metrics.logical_j = packet.logical_j;
+    metrics.array_dim = packet.array_dim;
+    metrics.active_original_rows = packet.active_original_rows;
+    metrics.active_original_rows_valid = packet.active_original_rows_valid;
+    metrics.original_rows_after_pruning = packet.row_count;
+    metrics.lane_rows_before_pruning = packet.blocks.size() * packet.lane_capacity * packet.row_count;
+    metrics.lane_rows_after_pruning = 0;
+    metrics.group_rows_padded = 0;
+    metrics.group_active_k_count = 0;
+    metrics.group_padded_k_count = 0;
+    metrics.source_residual_macs = packet.residual_event_count * packet.logical_j;
+    metrics.useful_digit_macs = packet.digit_nnz * packet.logical_j;
+    metrics.activation_payload_bytes = packet.stacked_activation.packed_int4.size() +
+        packet.stacked_activation.signed_int8.size() +
+        packet.stacked_activation.signed_int16.size() * sizeof(int16_t);
     metrics.active_blocks = packet.blocks.size();
     metrics.active_lanes = 0;
     metrics.compact_k_count = 0;
@@ -582,6 +608,7 @@ void collect_packet_metrics(const StripePacket & packet, RmdExecutionMetrics & m
 
     for (const BlockDescriptor & block : packet.blocks) {
         metrics.active_lanes += block.active_lane_count;
+        metrics.lane_rows_after_pruning += block.active_lane_count * packet.row_count;
         metrics.compact_k_count += block.compact_k_count;
         metrics.padded_k_count += block.padded_k_count;
         metrics.physical_tile_count += static_cast<size_t>(block.active_lane_count) * m_tiles * j_tiles;
@@ -592,6 +619,9 @@ void collect_packet_metrics(const StripePacket & packet, RmdExecutionMetrics & m
             metrics.packet_bytes += group.lane_positions.size() * sizeof(uint8_t);
             const size_t valid_rows = group.lane_positions.size() * packet.row_count;
             const size_t stacked_rows = align_up(valid_rows, kArrayDim);
+            metrics.group_rows_padded += stacked_rows;
+            metrics.group_active_k_count += static_cast<size_t>(__builtin_popcount(group.k_mask));
+            metrics.group_padded_k_count += group.padded_k_count;
             const size_t k_pad = group.padded_k_count -
                 static_cast<size_t>(__builtin_popcount(group.k_mask));
             metrics.block_padding_zeros += stacked_rows * k_pad;
@@ -600,6 +630,43 @@ void collect_packet_metrics(const StripePacket & packet, RmdExecutionMetrics & m
     }
     metrics.j_padding_zeros = (packet.j_padded - packet.logical_j) * packet.row_count *
         metrics.active_lanes;
+    metrics.metadata_host_bytes = metrics.packet_bytes - metrics.activation_payload_bytes;
+}
+
+void collect_direct_metrics(const residual::DirectStripePayload & payload,
+                            RmdExecutionMetrics & metrics) {
+    metrics.residual_observations_valid = true;
+    metrics.active_original_rows_valid = true;
+    metrics.digit_bits = GGML_GEMMINI_ACTIVATION_BITS;
+    metrics.residual_nnz = payload.events.size();
+    metrics.original_rows = payload.row_count;
+    metrics.logical_k = payload.logical_k;
+    metrics.logical_j = payload.logical_j;
+    metrics.array_dim = kArrayDim;
+    metrics.original_rows_after_pruning = payload.row_count;
+    metrics.source_residual_macs = payload.events.size() * payload.logical_j;
+    metrics.activation_payload_bytes = payload.events.size() * sizeof(int32_t);
+    metrics.metadata_host_bytes = sizeof(payload) +
+        payload.events.size() * (sizeof(residual::ResidualEvent) - sizeof(int32_t));
+    metrics.correction_bytes = payload.events.empty() ? 0 :
+        payload.row_count * payload.logical_j * sizeof(OutputValue);
+    metrics.residual_min = metrics.residual_max = 0;
+    metrics.required_planes = 0;
+    metrics.digit_nnz = metrics.active_original_rows = 0;
+    for (size_t index = 0; index < payload.events.size(); ++index) {
+        const auto & event = payload.events[index];
+        metrics.residual_min = index == 0 ? event.residual : std::min(metrics.residual_min, event.residual);
+        metrics.residual_max = index == 0 ? event.residual : std::max(metrics.residual_max, event.residual);
+        metrics.active_original_rows += index == 0 || payload.events[index - 1].local_row != event.local_row;
+        NativeBalancedDigits digits;
+        if (decompose_balanced_radix(event.residual, GGML_GEMMINI_ACTIVATION_BITS, digits) !=
+            RmdStatus::success) {
+            metrics.residual_observations_valid = false;
+            return;
+        }
+        metrics.required_planes = std::max(metrics.required_planes, digits.active_lane_count);
+        for (int32_t digit : digits.digits) metrics.digit_nnz += digit != 0;
+    }
 }
 
 static RmdStatus validate_execution_request(const ggml_gemmini_args_t & args,
@@ -657,6 +724,14 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                                   Im2pProviderTestFault im2p_fault =
                                       Im2pProviderTestFault::none,
                                   const Im2pFullExecutor * executor = nullptr) {
+    trace::ScopedRole residual_role(GEMMINI_TRACE_ROLE_RESIDUAL);
+    RmdExecutionMetrics staged_metrics{};
+    if (metrics != nullptr) staged_metrics.timing_identity = metrics->timing_identity;
+    staged_metrics.timing_identity.interval.layer = args.matmul_layer.c_str();
+    staged_metrics.timing_identity.identity_mask |= GEMMINI_CYCLE_HAS_STRIPE_ID;
+    staged_metrics.timing_identity.stripe_id = packet.stripe_id;
+    auto * measured = metrics != nullptr ? &staged_metrics : nullptr;
+    detail::RmdHostStageScope preparation(measured, RmdHostStage::preparation);
     const WeightGather weights(args, plan);
     if (!weights.valid()) {
         return RmdStatus::unsupported_route;
@@ -694,7 +769,7 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
     size_t weight_values_gathered = 0;
     size_t weight_baseline_address_resolutions = 0;
     size_t weight_address_resolutions = 0;
-    RmdExecutionMetrics staged_metrics{};
+    size_t logical_dot_result_bytes = 0;
 
     size_t max_stacked_rows = 0;
     for (const BlockDescriptor & block : packet.blocks) {
@@ -725,8 +800,10 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
     } catch (const std::bad_alloc &) {
         return RmdStatus::allocation_failure;
     }
+    preparation.finish();
 
     for (size_t block_index = 0; block_index < packet.blocks.size(); ++block_index) {
+        detail::RmdHostStageScope block_preparation(measured, RmdHostStage::preparation);
         const BlockDescriptor & block = packet.blocks[block_index];
         lane_group_count += block.groups.size();
         std::array<std::array<uint16_t, kBlockSize>, kMaxNativeRadixLanes> group_k{};
@@ -756,16 +833,21 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                 }
             }
         }
+        block_preparation.finish();
 
         for (size_t j_tile = 0; j_tile < j_tiles; ++j_tile) {
             const size_t col_base = j_tile * kArrayDim;
             const size_t valid_cols = std::min(kArrayDim, packet.logical_j - col_base);
 
             // Integer block scale, resolved once per (block, output column).
-            for (size_t col = 0; col < valid_cols; ++col) {
-                block_scales[col] = plan.scales.row_header_mode || plan.scales.scalar_mode ||
-                    plan.scales.channel_mode ? 1 : wreader::read_scale_validated(
-                        args, plan, col_base + col, block.block_id).integer_block_scale;
+            {
+                detail::RmdHostStageScope scale_metadata(measured, RmdHostStage::block_scale_metadata);
+                for (size_t col = 0; col < valid_cols; ++col) {
+                    block_scales[col] = plan.scales.row_header_mode || plan.scales.scalar_mode ||
+                        plan.scales.channel_mode ? 1 : wreader::read_scale_validated(
+                            args, plan, col_base + col, block.block_id).integer_block_scale;
+                }
+                staged_metrics.block_scale_values_bytes += valid_cols * sizeof(uint64_t);
             }
 
             for (size_t group_index = 0; group_index < block.groups.size(); ++group_index) {
@@ -785,10 +867,14 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                     }
                     ++matmul_call_count;
                     stacked_i_tile_count += stacked_rows / kArrayDim;
+                    logical_dot_result_bytes += group.lane_positions.size() * packet.row_count *
+                        valid_cols * sizeof(OutputValue);
                     WeightGatherCounts gather_counts{};
+                    detail::RmdHostStageScope gather(measured, RmdHostStage::weight_gather);
                     const RmdStatus gather_status = weights.fill_tile(
                         block.block_id, group_k[group_index].data() + k_base, valid_k, col_base,
                         valid_cols, weight_tile.data(), kArrayDim, gather_counts);
+                    gather.finish();
                     if (gather_status != RmdStatus::success) {
                         return gather_status;
                     }
@@ -814,6 +900,8 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                             valid_cols,
                             kArrayDim,
                             valid_k,
+                            staged_metrics.timing_identity,
+                            block.block_id, group_index, k_base, col_base,
                         };
                         if (im2p_fault ==
                                 Im2pProviderTestFault::cancel_after_first_dot &&
@@ -835,6 +923,7 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                                     : OutputValue{1});
                         }
                         ++staged_metrics.im2p_dot_calls;
+                        detail::RmdHostStageScope accumulate(measured, RmdHostStage::dot_output_accumulate);
                         for (size_t row = 0; row < stacked_rows; ++row) {
                             OutputValue * accumulator =
                                 stacked_values.data() + row * kArrayDim;
@@ -868,12 +957,17 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                         }
                         ++staged_metrics.ws_call_count;
                         std::fill_n(ws_values.begin(), stacked_value_count, acc_t{0});
+#if LOG_CYCLE
+                        const log::ScopedWsCycleIdentity ws_scope(
+                            staged_metrics.timing_identity, "gemmini_hw_residual");
+#endif
                         tiled_matmul(stacked_rows, valid_cols, valid_k,
                             native_activation_tile, native_weight, nullptr, ws_values.data(),
                             group.padded_k_count, kArrayDim, 0, kArrayDim,
                             1.0f, 1.0f, 1.0f,
                             NO_ACTIVATION, ACC_SCALE_IDENTITY, ACC_SCALE_IDENTITY, false,
                             1, 1, 1, false, false, true, false, 0, WS);
+                        detail::RmdHostStageScope accumulate(measured, RmdHostStage::dot_output_accumulate);
                         for (size_t row = 0; row < stacked_rows; ++row) {
                             OutputValue * accumulator = stacked_values.data() + row * kArrayDim;
                             for (size_t col = 0; col < valid_cols; ++col) {
@@ -961,6 +1055,7 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                 }
 #endif
                 // Block integer scale is applied exactly once after all compact K tiles.
+                detail::RmdHostStageScope block_scale(measured, RmdHostStage::block_scale_apply);
                 if constexpr (Backend == CompactExecutorBackend::im2p_sim) {
                     if (im2p_fault ==
                         Im2pProviderTestFault::block_scale_overflow) {
@@ -982,6 +1077,7 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                         }
                     }
                 }
+                block_scale.finish();
 
 #if defined(GGML_GEMMINI_TESTING)
                 if constexpr (Backend == CompactExecutorBackend::gemmini_ws) {
@@ -1005,6 +1101,7 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                     }
                 }
 #endif
+                detail::RmdHostStageScope reconstruct(measured, RmdHostStage::radix_reconstruct_combine);
                 for (size_t group_lane = 0;
                      group_lane < group.lane_positions.size(); ++group_lane) {
                     const uint8_t lane_position = group.lane_positions[group_lane];
@@ -1034,7 +1131,9 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
         }
     }
 
+    detail::RmdHostStageScope reconstruct(measured, RmdHostStage::radix_reconstruct_combine);
     const RmdStatus finish_status = assembler.finish();
+    reconstruct.finish();
     if (finish_status != RmdStatus::success) {
         return finish_status;
     }
@@ -1043,11 +1142,15 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
         collect_packet_metrics(packet, staged_metrics);
         if constexpr (std::is_same_v<Output, Correction>) {
             staged_metrics.compressed_output_values = 0;
+            staged_metrics.correction_bytes = packet.row_count * packet.logical_j * sizeof(OutputValue);
         }
         staged_metrics.matmul_call_count = matmul_call_count;
         staged_metrics.lane_group_count = lane_group_count;
         staged_metrics.stacked_i_tile_count = stacked_i_tile_count;
         staged_metrics.weight_values_gathered = weight_values_gathered;
+        staged_metrics.gathered_weight_host_bytes = weight_values_gathered * sizeof(int32_t);
+        staged_metrics.issued_mac_capacity = stacked_i_tile_count * kArrayDim * kArrayDim * kArrayDim;
+        staged_metrics.logical_dot_result_bytes = logical_dot_result_bytes;
         staged_metrics.weight_baseline_address_resolutions =
             weight_baseline_address_resolutions;
         staged_metrics.weight_address_resolutions = weight_address_resolutions;

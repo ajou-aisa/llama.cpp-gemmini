@@ -98,7 +98,7 @@ def _integer(record: Mapping[str, JsonValue], key: str, line: int) -> int:
     return value
 
 
-def _host(value: JsonValue, line: int) -> Optional[HostTiming]:
+def _host(value: JsonValue, line: int, same_thread: bool = True) -> Optional[HostTiming]:
     record = _mapping(value, line)
     execution = _optional_string(record, "execution_id", line)
     kind = _optional_string(record, "thread_id_kind", line)
@@ -115,7 +115,8 @@ def _host(value: JsonValue, line: int) -> Optional[HostTiming]:
         return None
     start, end, start_tid, end_tid, duration = values
     if (start is None or end is None or start_tid is None or end_tid is None or duration is None
-            or not start_tid or start_tid != end_tid or end < start or duration != end - start):
+            or not start_tid or not end_tid or (same_thread and start_tid != end_tid)
+            or end < start or duration != end - start):
         raise CycleSchemaError(line, "host_timing has invalid endpoints, thread identity or duration")
     return HostTiming(execution, start, end, start_tid, end_tid, kind)
 

@@ -3,6 +3,8 @@
 add_library(ggml-gemmini-utils
     src/debug.cpp
     src/cycle.cpp
+    src/performance.cpp
+    src/trace-context.cpp
     src/log-capi.cpp
     src/cycle_reader-capi.cpp
 )
@@ -17,6 +19,8 @@ install(TARGETS ggml-gemmini-utils LIBRARY ARCHIVE RUNTIME)
 target_include_directories(ggml-gemmini-utils
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../common
 )
 
 target_compile_features(ggml-gemmini-utils PUBLIC cxx_std_17)

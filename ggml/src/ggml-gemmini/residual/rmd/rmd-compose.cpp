@@ -53,7 +53,8 @@ bool finite_double_representation(double value) {
 
 RmdStatus compose_rmd_output(const StripePacket & packet,
                              const CompressedOutput & output,
-                             Correction & correction) {
+                             Correction & correction,
+                             RmdExecutionMetrics * metrics) {
     const RmdStatus validation = validate_packet(packet);
     if (validation != RmdStatus::success) {
         return validation;
@@ -107,6 +108,7 @@ RmdStatus compose_rmd_output(const StripePacket & packet,
     }
     Correction staged = BlockScaledInt64Correction{std::move(staged_correction)};
     correction.swap(staged);
+    if (metrics != nullptr) metrics->correction_bytes = value_count * sizeof(OutputValue);
     return RmdStatus::success;
 }
 
@@ -312,7 +314,9 @@ RmdStatus merge_rmd_correction_checked(const ggml_gemmini_args_t & args,
                                        const wroute::WeightRoutePlan & plan,
                                        const std::vector<float> & prepared_column_scale,
                                        const Correction & correction,
-                                       size_t * nonzero_count) {
+                                       size_t * nonzero_count,
+                                       RmdExecutionMetrics * metrics) {
+    detail::RmdHostStageScope preparation(metrics, RmdHostStage::final_metadata);
     const auto * integer = std::get_if<BlockScaledInt64Correction>(&correction);
     const auto * floating = std::get_if<PreScaledFloat64Correction>(&correction);
     const auto * fully_scaled = std::get_if<FullyScaledFloat64Correction>(&correction);
@@ -363,6 +367,8 @@ RmdStatus merge_rmd_correction_checked(const ggml_gemmini_args_t & args,
             }
         }
     }
+    preparation.finish();
+    detail::RmdHostStageScope combine(metrics, RmdHostStage::final_scale_combine_stage);
 
     // Count composed raw corrections, before scales or H0 saturation: lane terms may cancel,
     // and a zero scale must not erase a nonzero correction from this statistic.
@@ -402,6 +408,8 @@ RmdStatus merge_rmd_correction_checked(const ggml_gemmini_args_t & args,
         }
     }
 
+    combine.finish();
+    detail::RmdHostStageScope store(metrics, RmdHostStage::output_store);
     for (size_t row = 0; row < layout.row_count; ++row) {
         const size_t destination_row =
             (layout.global_row_begin + row) * layout.row_stride;
@@ -413,6 +421,10 @@ RmdStatus merge_rmd_correction_checked(const ggml_gemmini_args_t & args,
     }
     // Publish the count only after the whole merge succeeds, just like the destination.
     if (nonzero_count != nullptr) *nonzero_count = staged_nonzero_count;
+    if (metrics != nullptr) {
+        metrics->final_scale_values_bytes = (layout.row_count + (integer != nullptr ? args.J : 0)) * sizeof(float);
+        metrics->final_output_store_bytes = layout.value_count * sizeof(float);
+    }
     return RmdStatus::success;
 }
 
@@ -514,7 +526,9 @@ RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
                                   size_t global_row_begin,
                                   size_t global_row_end,
                                   const Correction & correction,
-                                  size_t * nonzero_count) {
+                                  size_t * nonzero_count,
+                                  RmdExecutionMetrics * metrics) {
+    detail::RmdHostStageScope preparation(metrics, RmdHostStage::final_metadata);
     MergeLayout layout;
     const RmdStatus dimensions = prepare_merge_layout(
         args, destination, global_row_begin, global_row_end,
@@ -531,14 +545,17 @@ RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
     std::vector<float> column_scale;
     const RmdStatus scales = prepare_column_scales(args, plan, nullptr, column_scale);
     if (scales != RmdStatus::success) return scales;
-    return merge_rmd_correction_checked(args, layout, plan, column_scale, correction, nonzero_count);
+    preparation.finish();
+    return merge_rmd_correction_checked(args, layout, plan, column_scale, correction, nonzero_count, metrics);
 }
 
 RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
                                   float * destination,
                                   const StripePacket & packet,
                                   const Correction & correction,
-                                  size_t * nonzero_count) {
+                                  size_t * nonzero_count,
+                                  RmdExecutionMetrics * metrics) {
+    detail::RmdHostStageScope preparation(metrics, RmdHostStage::final_metadata);
     if (std::get_if<BlockScaledInt64Correction>(&correction) == nullptr &&
         std::get_if<FullyScaledFloat64Correction>(&correction) == nullptr) {
         return RmdStatus::unsupported_route;
@@ -568,7 +585,8 @@ RmdStatus merge_rmd_correction_to(const ggml_gemmini_args_t & args,
     std::vector<float> column_scale;
     const RmdStatus scales = prepare_column_scales(args, plan, &packet, column_scale);
     if (scales != RmdStatus::success) return scales;
-    return merge_rmd_correction_checked(args, layout, plan, column_scale, correction, nonzero_count);
+    preparation.finish();
+    return merge_rmd_correction_checked(args, layout, plan, column_scale, correction, nonzero_count, metrics);
 }
 
 namespace detail {
@@ -640,7 +658,8 @@ RmdStatus RmdWeightPreparation::prepare_columns(
 
 RmdStatus merge_rmd_correction_with_weights(const ggml_gemmini_args_t & args,
     float * destination, const StripePacket & packet, const Correction & correction,
-    RmdWeightPreparation & weights, size_t * nonzero_count) {
+    RmdWeightPreparation & weights, size_t * nonzero_count, RmdExecutionMetrics * metrics) {
+    RmdHostStageScope preparation(metrics, RmdHostStage::final_metadata);
     if (std::get_if<BlockScaledInt64Correction>(&correction) == nullptr &&
         std::get_if<FullyScaledFloat64Correction>(&correction) == nullptr) {
         return RmdStatus::unsupported_route;
@@ -660,8 +679,9 @@ RmdStatus merge_rmd_correction_with_weights(const ggml_gemmini_args_t & args,
     }
     const RmdStatus scales = weights.prepare_columns(args, packet);
     if (scales != RmdStatus::success) return scales;
+    preparation.finish();
     return merge_rmd_correction_checked(
-        args, layout, plan, weights.column_scale_, correction, nonzero_count);
+        args, layout, plan, weights.column_scale_, correction, nonzero_count, metrics);
 }
 
 }
@@ -671,16 +691,18 @@ RmdStatus merge_rmd_correction(const ggml_gemmini_args_t & args,
                                size_t global_row_begin,
                                size_t global_row_end,
                                const Correction & correction,
-                               size_t * nonzero_count) {
+                               size_t * nonzero_count,
+                               RmdExecutionMetrics * metrics) {
     return merge_rmd_correction_to(
-        args, args.f_out, global_row_begin, global_row_end, correction, nonzero_count);
+        args, args.f_out, global_row_begin, global_row_end, correction, nonzero_count, metrics);
 }
 
 RmdStatus merge_rmd_correction(const ggml_gemmini_args_t & args,
                                const StripePacket & packet,
                                const Correction & correction,
-                               size_t * nonzero_count) {
-    return merge_rmd_correction_to(args, args.f_out, packet, correction, nonzero_count);
+                               size_t * nonzero_count,
+                               RmdExecutionMetrics * metrics) {
+    return merge_rmd_correction_to(args, args.f_out, packet, correction, nonzero_count, metrics);
 }
 
 }

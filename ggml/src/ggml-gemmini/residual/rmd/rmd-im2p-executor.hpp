@@ -99,6 +99,8 @@ struct Im2pCompactDot {
     size_t columns = 0;
     size_t weight_row_stride = 0;
     size_t k = 0;
+    gemmini_cycle_record_v2 timing_identity{};
+    size_t block_id = 0, lane_group = 0, k_offset = 0, column_offset = 0;
 };
 
 RmdStatus execute_im2p_compact_dot(

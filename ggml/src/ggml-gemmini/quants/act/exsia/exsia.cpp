@@ -1,3 +1,4 @@
+#include <gemmini/trace-context.hpp>
 #include "exsia.hpp"
 
 #include "../../../ggml-gemmini-telemetry.hpp"
@@ -10,7 +11,9 @@
 
 #include <gemmini/cycle_reader.hpp>
 #include <gemmini/host-timing.hpp>
+#include <gemmini/log.h>
 #include <gemmini/log.hpp>
+#include <gemmini/performance.hpp>
 #if defined(__linux__) && defined(__aarch64__) && CYCLE_DETAIL
 #include <gemmini/log.h>
 #include "../../../../ggml-gemmini-utils/src/cycle_reader_internal.h"
@@ -27,6 +30,8 @@
 #if EXSIA_PROFILE_LOG_ENABLED
 #include <fstream>
 #include <mutex>
+#endif
+#if LOG_CYCLE
 #include <sstream>
 #include <string>
 #endif
@@ -177,6 +182,8 @@ namespace ggml::gemmini::quants::act::exsia
         {
             std::string log_path;
             std::string requested_path;
+            std::string inference_context = performance::log_context();
+            std::string execution_id = cycle::host_execution_id();
             bool setup_ok = false;
         };
 
@@ -229,6 +236,89 @@ namespace ggml::gemmini::quants::act::exsia
             return 0;
 #endif
         }
+
+#if LOG_CYCLE
+        uint64_t cpu_worker_id()
+        {
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+            return static_cast<uint64_t>(omp_get_thread_num());
+#else
+            return 0;
+#endif
+        }
+
+        gemmini_cycle_record_v2 cpu_identity(const char *layer, uint64_t run_id,
+                                             const char *op, uint64_t stripe = UINT64_MAX,
+                                             uint64_t node = UINT64_MAX)
+        {
+            gemmini_cycle_record_v2 identity{};
+            identity.interval.layer = layer;
+            identity.interval.op = op;
+            identity.identity_mask = GEMMINI_CYCLE_HAS_RUN_ID | GEMMINI_CYCLE_HAS_WORKER_ID;
+            identity.run_id = run_id;
+            identity.worker_id = cpu_worker_id();
+            if (stripe != UINT64_MAX) {
+                identity.identity_mask |= GEMMINI_CYCLE_HAS_STRIPE_ID | GEMMINI_CYCLE_HAS_SLOT;
+                identity.stripe_id = stripe;
+                identity.slot = stripe % EXSIA_PIPELINE_SLOT_COUNT;
+            }
+            if (node != UINT64_MAX) {
+                identity.identity_mask |= GEMMINI_CYCLE_HAS_NODE_ID;
+                identity.node_id = node;
+            }
+            return identity;
+        }
+#endif
+
+        class CpuWallInterval
+        {
+#if LOG_CYCLE
+            gemmini_cycle_record_v2 identity_{};
+            gemmini_cpu_sample start_{};
+#endif
+
+        public:
+            CpuWallInterval(const char *layer, uint64_t run_id, const char *op,
+                            uint64_t stripe = UINT64_MAX, uint64_t node = UINT64_MAX)
+            {
+#if LOG_CYCLE
+                identity_ = cpu_identity(layer, run_id, op, stripe, node);
+#else
+                (void) layer; (void) run_id; (void) op; (void) stripe; (void) node;
+#endif
+                resume();
+            }
+
+            void pause()
+            {
+#if LOG_CYCLE
+                if (start_.ns != 0) {
+                    const auto end = gemmini_cpu_timing_read();
+                    performance::record_cpu_wall(start_.ns, end.ns);
+                    gemmini_cpu_timing_record(&identity_, &start_, &end);
+                    start_ = {};
+                }
+#endif
+            }
+
+            void resume()
+            {
+#if LOG_CYCLE
+                start_ = gemmini_cpu_timing_read();
+#endif
+            }
+            void next(const char *op)
+            {
+                pause();
+#if LOG_CYCLE
+                identity_.interval.op = op;
+#else
+                (void) op;
+#endif
+                resume();
+            }
+            ~CpuWallInterval() { pause(); }
+        };
 
 #if EXSIA_PROFILE_COLLECTION_ENABLED
 #if !defined(__linux__) || !defined(__aarch64__)
@@ -288,7 +378,7 @@ namespace ggml::gemmini::quants::act::exsia
         }
 #endif
 
-#if EXSIA_PROFILE_LOG_ENABLED
+#if LOG_CYCLE
         void write_json_string(std::ostream &out, const std::string &value)
         {
             out.put('"');
@@ -301,11 +391,106 @@ namespace ggml::gemmini::quants::act::exsia
                 case '\n': out << "\\n"; break;
                 case '\r': out << "\\r"; break;
                 case '\t': out << "\\t"; break;
-                default: out.put(character); break;
+                default:
+                    if (static_cast<unsigned char>(character) < 0x20) {
+                        const char hex[] = "0123456789abcdef";
+                        out << "\\u00" << hex[(character >> 4) & 0xf] << hex[character & 0xf];
+                    } else {
+                        out.put(character);
+                    }
+                    break;
                 }
             }
             out.put('"');
         }
+
+        struct ExsiaRunTiming
+        {
+            const char *layer;
+            uint64_t run_id;
+            gemmini_cpu_sample start = gemmini_cpu_timing_read();
+            std::array<gemmini_cpu_totals, EXSIA_OMP_THREAD_COUNT> worker_cpu{};
+            uint64_t handoff_ns = 0;
+            uint64_t wait_ns = 0;
+            uint64_t handoff_calls = 0;
+            uint64_t wait_measured_calls = 0;
+            bool success = false;
+
+            void submission(const StripeReadyEvent &event, const gemmini_cpu_sample &begin,
+                            const gemmini_cpu_sample &end, bool accepted)
+            {
+                const uint64_t elapsed = end.ns - begin.ns;
+                const bool measured = event.submission_wait_ns.has_value() &&
+                    *event.submission_wait_ns <= elapsed;
+                ++handoff_calls;
+                handoff_ns += elapsed;
+                if (measured) {
+                    ++wait_measured_calls;
+                    wait_ns += *event.submission_wait_ns;
+                }
+                const auto identity = cpu_identity(layer, run_id, "exsia.submission_callback", event.stripe_id);
+                gemmini_cpu_timing_record(&identity, &begin, &end);
+#if CYCLE_DETAIL
+                log::CycleRecord record{};
+                record.layer = layer;
+                record.op = "exsia.stripe_submission";
+                record.source = "steady_clock";
+                record.unit = "nanosecond";
+                record.start = begin.ns;
+                record.end = end.ns;
+                record.identity_mask = GEMMINI_CYCLE_HAS_RUN_ID | GEMMINI_CYCLE_HAS_STRIPE_ID;
+                record.identity_mask |= GEMMINI_CYCLE_HAS_SLOT;
+                record.run_id = run_id;
+                record.stripe_id = event.stripe_id;
+                record.slot = event.slot;
+                std::string json = log::serialize_cycle_record(record);
+                json.insert(json.rfind('}'),
+                    std::string(",\"additive\":false,\"operation_success\":") +
+                    (accepted ? "true" : "false") + ",\"host_timing\":" +
+                    cycle::serialize_host_timing(begin.ns, end.ns, begin.tid, end.tid) +
+                    ",\"submission_wait_ns\":" +
+                    (measured ? std::to_string(*event.submission_wait_ns) : "null") +
+                    ",\"handoff_nonwait_ns\":" +
+                    (measured ? std::to_string(elapsed - *event.submission_wait_ns) : "null"));
+                log::cycle.write_json(json);
+#else
+                (void) accepted;
+#endif
+            }
+
+            ~ExsiaRunTiming()
+            {
+                const auto end = gemmini_cpu_timing_read();
+                const auto identity = cpu_identity(layer, run_id, "exsia.run.caller");
+                gemmini_cpu_timing_record(&identity, &start, &end);
+                gemmini_cpu_totals cpu_workers{};
+                gemmini_cpu_timing_add(&cpu_workers, &start, &end);
+                for (const auto &worker : worker_cpu)
+                    gemmini_cpu_timing_merge(&cpu_workers, &worker);
+                const uint64_t elapsed = end.ns - start.ns;
+                const bool complete = handoff_calls == wait_measured_calls;
+                std::ostringstream out;
+                out << "{\"schema\":\"gemmini.cycle\",\"version\":2,"
+                    << "\"record_type\":\"EXSIA_RUN_SUMMARY\",\"op\":\"exsia.run.summary\","
+                    << "\"source\":\"steady_clock\",\"unit\":\"nanosecond\",\"layer\":";
+                write_json_string(out, layer);
+                out << ",\"run_id\":" << run_id
+                    << ",\"host_timing\":" << cycle::serialize_host_timing(
+                        start.ns, end.ns, start.tid, end.tid)
+                    << ",\"cpu_workers\":" << cycle::serialize_cpu_totals(cpu_workers)
+                    << ",\"run_wall_ns\":" << elapsed
+                    << ",\"handoff_wall_ns\":" << handoff_ns
+                    << ",\"outside_handoff_wall_ns\":" << elapsed - handoff_ns
+                    << ",\"submission_wait_ns\":" << (complete ? std::to_string(wait_ns) : "null")
+                    << ",\"handoff_nonwait_ns\":"
+                    << (complete ? std::to_string(handoff_ns - wait_ns) : "null")
+                    << ",\"handoff_calls\":" << handoff_calls
+                    << ",\"wait_measured_calls\":" << wait_measured_calls
+                    << ",\"operation_success\":" << (success ? "true" : "false")
+                    << ",\"valid\":true,\"additive\":false}";
+                log::cycle.write_json(out.str());
+            }
+        };
 #endif
 
     }
@@ -593,7 +778,8 @@ namespace ggml::gemmini::quants::act::exsia
                                                             uint64_t run_id,
                                                             const char *mode,
                                                             const std::vector<StripeProfileRecord> &profiles,
-                                                            const ProfileInterval &run_interval)
+                                                            const ProfileInterval &run_interval,
+                                                            const ExSIAState &state)
         {
             std::ostringstream trace;
             const size_t expected_team_size = expected_profile_team_size(mode);
@@ -634,6 +820,30 @@ namespace ggml::gemmini::quants::act::exsia
                                      "exsia.stripe_total", profile.stripe_total, profile.team_size,
                                      nullptr);
 #if EXSIA_STAGE_PROFILE_ENABLED
+                const uint64_t blocks = profile.stats.p3_bypass_no_int_count +
+                    profile.stats.p3_bypass_same_scale_count + profile.stats.p3_replay_count;
+                const uint64_t logical = (profile.row_end - profile.row_start) * state.K_logical;
+                const uint64_t padded = (profile.row_end - profile.row_start) * state.K_padded;
+                trace << "{\"schema\":\"gemmini.cycle\",\"version\":2,"
+                      << "\"record_type\":\"EXSIA_WORKLOAD\",\"op\":\"exsia.workload\",\"layer\":";
+                write_nullable_json_string(trace, layer);
+                trace << ",\"run_id\":" << run_id << ",\"stripe_id\":" << profile.stripe_idx
+                      << ",\"slot\":" << profile.stripe_idx % EXSIA_PIPELINE_SLOT_COUNT
+                      << ",\"mode\":";
+                write_json_string(trace, mode);
+                trace << ",\"row_begin\":" << profile.row_start << ",\"row_end\":" << profile.row_end
+                      << ",\"logical_elements\":" << logical << ",\"padded_elements\":" << padded
+                      << ",\"padding_elements\":" << padded - logical
+                      << ",\"processed_blocks\":" << blocks
+                      << ",\"reused_blocks\":" << blocks - profile.stats.p3_replay_count - profile.stats.forced_recompute_count
+                      << ",\"regenerated_blocks\":" << profile.stats.p3_replay_count + profile.stats.forced_recompute_count
+                      << ",\"forced_recomputed_blocks\":" << profile.stats.forced_recompute_count
+                      << ",\"selected_positions\":" << profile.selected_positions
+                      << ",\"residual_nnz\":" << profile.residual_nnz
+                      << ",\"host_timing\":" << cycle::serialize_host_timing(
+                          profile.stripe_total.start_ns, profile.stripe_total.end_ns,
+                          profile.stripe_total.start_tid, profile.stripe_total.end_tid)
+                      << ",\"source\":\"host_observation\",\"unit\":\"count\",\"valid\":true}\n";
                 const StageCycleStats *stages[] = {
                     &profile.stats.p0,
                     &profile.stats.p1,
@@ -680,13 +890,23 @@ namespace ggml::gemmini::quants::act::exsia
             const size_t run_team_size = profiles.empty() ? expected_team_size : profiles.front().team_size;
             write_timeline_run_event(trace, layer, run_id, mode, run_interval, run_team_size);
 
+            (void) state;
+            std::string serialized = trace.str();
+            const std::string context = ",\"execution_id\":\"" + config.execution_id +
+                "\",\"inference_context\":" +
+                (config.inference_context.empty() ? "null" : config.inference_context);
+            for (size_t end = serialized.find('\n'); end != std::string::npos;
+                 end = serialized.find('\n', end + context.size() + 1))
+                serialized.insert(end - 1, context);
+            log::cycle.write_json(serialized);
+
             std::lock_guard<std::mutex> lock(profile_flush_mutex);
             if (!ggml::gemmini::log::prepare_output_parent(config.log_path))
                 return ExSIAState::FailureCode::ProfileFlushFailure;
             std::ofstream file(config.log_path, std::ios::app);
             if (!file)
                 return ExSIAState::FailureCode::ProfileFlushFailure;
-            file << trace.str();
+            file << serialized;
             file.flush();
             return file ? ExSIAState::FailureCode::None : ExSIAState::FailureCode::ProfileFlushFailure;
         }
@@ -1227,6 +1447,14 @@ namespace ggml::gemmini::quants::act::exsia
             }
         }
 
+        if (force_recompute_ && (!has_int_outlier || blk.theta_b == theta_pre))
+        {
+            for (size_t i = 0; i < block_size; ++i)
+                q_out[i] = quantize_to_i32(x[i], blk.theta_b);
+#if EXSIA_STAGE_PROFILE_ENABLED
+            ++cycle_sample.forced_recompute_count;
+#endif
+        }
         block_exp_out = blk.e_b;
 #if EXSIA_BRANCH_COUNTS_ENABLED
         ++cycle_sample.block_exp_commit_count;
@@ -1412,6 +1640,14 @@ namespace ggml::gemmini::quants::act::exsia
             }
         }
 
+        if (force_recompute_ && (!has_int_outlier || blk.theta_b == theta_pre))
+        {
+            for (size_t i = 0; i < block_size; ++i)
+                q_out[i] = quantize_to_i32(blk.x[i], blk.theta_b);
+#if EXSIA_STAGE_PROFILE_ENABLED
+            ++cycle_sample.forced_recompute_count;
+#endif
+        }
         block_exp_out = blk.e_b;
 #if EXSIA_BRANCH_COUNTS_ENABLED
         ++cycle_sample.block_exp_commit_count;
@@ -1641,6 +1877,10 @@ namespace ggml::gemmini::quants::act::exsia
                             residual::TimedResidualCapture &rmd_builder)
     {
         const int16_t neg_inf = std::numeric_limits<int16_t>::min();
+#if EXSIA_STAGE_PROFILE_ENABLED
+        stripe.selected_positions = 0;
+        stripe.residual_nnz = 0;
+#endif
 #if GGML_GEMMINI_ENABLE_RMD
         rmd_builder.reset(stripe_idx, stripe.row_start, stripe.row_count(), args.K, args.J);
 #else
@@ -1723,6 +1963,10 @@ namespace ggml::gemmini::quants::act::exsia
 
                     const bool outlier = col < args.K && stripe.outlier_mask.is_set(local_row, col);
                     const int32_t residual_i32 = outlier ? res : 0;
+#if EXSIA_STAGE_PROFILE_ENABLED
+                    stripe.selected_positions += outlier;
+                    stripe.residual_nnz += residual_i32 != 0;
+#endif
                     const size_t global_idx = r * state.K_padded + col;
                     GGML_ASSERT(global_idx < residual.size());
                     residual[global_idx] = residual_i32;
@@ -1850,10 +2094,19 @@ namespace ggml::gemmini::quants::act::exsia
         const StripeReadySink *sink)
     {
         const char * layer = args.matmul_layer.c_str();
+        [[maybe_unused]] const auto task_trace_origin = gemmini_trace_capture();
         const uint64_t run_id = next_exsia_run_id();
         meta.run_id = run_id;
+        const char *force_recompute = std::getenv("GGML_GEMMINI_EXSIA_FORCE_RECOMPUTE");
+        local_.set_force_recompute(force_recompute != nullptr && std::strcmp(force_recompute, "1") == 0);
+#if LOG_CYCLE
+        ExsiaRunTiming run_timing{layer, run_id};
+#endif
+        CpuWallInterval run_cpu_wall(layer, run_id, "exsia.run.cpu");
         EXSIA_PROFILE_LOG(
+        run_cpu_wall.pause();
         const ProfileConfig profile_config = compile_profile_config();
+        run_cpu_wall.resume();
         )
         EXSIA_PROFILE_COLLECT(
         ProfileInterval run_profile;
@@ -2035,12 +2288,17 @@ namespace ggml::gemmini::quants::act::exsia
             return true;
         };
         const auto notify_stripe_ready = [&](StripePipelineSlot &slot, uint64_t run_id,
-                                             bool measure_stripe_ready_handoff
+                                             bool measure_stripe_ready_handoff,
+                                             CpuWallInterval &cpu_wall
 #if EXSIA_PROFILE_COLLECTION_ENABLED
-                                             , const StripeProfileRecord *profile
+                                             , StripeProfileRecord *profile
 #endif
                                              ) {
             (void) measure_stripe_ready_handoff;
+#if EXSIA_STAGE_PROFILE_ENABLED
+            profile->selected_positions = slot.stripe.selected_positions;
+            profile->residual_nnz = slot.stripe.residual_nnz;
+#endif
             if (sink == nullptr || sink->on_ready == nullptr)
                 return true;
 
@@ -2082,6 +2340,11 @@ namespace ggml::gemmini::quants::act::exsia
             }
 #endif
             event.folding_commit_ns = slot.folding_commit_ns;
+            cpu_wall.pause();
+#if LOG_CYCLE
+            event.collect_submission_timing = true;
+            const auto submission_start = gemmini_cpu_timing_read();
+#endif
 #if defined(__linux__) && defined(__aarch64__) && CYCLE_DETAIL
             ggml::gemmini::cycle::NativeCycleSample stripe_ready_handoff_start{};
             if (measure_stripe_ready_handoff)
@@ -2101,6 +2364,9 @@ namespace ggml::gemmini::quants::act::exsia
             if (measure_stripe_ready_handoff)
             {
                 const auto stripe_ready_handoff_end = ggml::gemmini::cycle::read_sample();
+#if LOG_CYCLE
+                run_timing.submission(event, submission_start, gemmini_cpu_timing_read(), accepted);
+#endif
                 const gemmini_native_cycle_sample_internal stripe_ready_handoff_start_sample{
                     stripe_ready_handoff_start.value,
                     static_cast<uint8_t>(stripe_ready_handoff_start.valid),
@@ -2128,6 +2394,13 @@ namespace ggml::gemmini::quants::act::exsia
                     &stripe_ready_handoff_end_sample, 1);
             }
 #endif
+#if LOG_CYCLE
+#if defined(__linux__) && defined(__aarch64__) && CYCLE_DETAIL
+            if (!measure_stripe_ready_handoff)
+#endif
+                run_timing.submission(event, submission_start, gemmini_cpu_timing_read(), accepted);
+#endif
+            cpu_wall.resume();
             return accepted;
         };
 #if defined(GGML_GEMMINI_HAS_OPENMP)
@@ -2146,6 +2419,7 @@ namespace ggml::gemmini::quants::act::exsia
             stats.p2.add(sample.p2);
             stats.p3.add(sample.p3);
 #endif
+            stats.forced_recompute_count += sample.forced_recompute_count;
 #endif
             switch (sample.p3_path)
             {
@@ -2210,8 +2484,19 @@ namespace ggml::gemmini::quants::act::exsia
             [[maybe_unused]] uint8_t *slot_released = slot_released_storage.data();
             [[maybe_unused]] uint8_t post_chain = 0;
             std::atomic<bool> pipeline_ok{true};
+            run_cpu_wall.pause();
+#if LOG_CYCLE
+            // Task bodies are measured below; OpenMP scheduling outside them is not.
+            performance::incomplete_cpu_wall("exsia_task_scheduler_cpu_wall_unmeasured");
+#endif
 #pragma omp parallel num_threads(EXSIA_OMP_THREAD_COUNT)
             {
+                trace::ScopedContext team_context(task_trace_origin, true);
+                trace::CpuStage team_lifetime(layer, "task.host_work");
+#if LOG_CYCLE
+                const bool collect_worker_cpu = cycle::host_thread_id() != run_timing.start.tid;
+                const auto worker_start = collect_worker_cpu ? gemmini_cpu_timing_read() : gemmini_cpu_sample{};
+#endif
 #pragma omp single
                 {
                     const size_t observed_team_size = static_cast<size_t>(omp_get_num_threads());
@@ -2231,6 +2516,9 @@ namespace ggml::gemmini::quants::act::exsia
                         {
 #pragma omp task depend(out : prepared[s]) firstprivate(s, slot_idx, row_start, row_end, observed_team_size)
                             {
+                                trace::ScopedContext task_context(task_trace_origin, true);
+                                trace::CpuStage task_lifetime(layer, "task.host_work");
+                                CpuWallInterval task_cpu_wall(layer, run_id, "exsia.prepare", s);
                                 try
                                 {
                                 if (pipeline_ok.load(std::memory_order_relaxed))
@@ -2295,6 +2583,9 @@ namespace ggml::gemmini::quants::act::exsia
                         {
 #pragma omp task depend(in : local_sealed[s - 1]) depend(out : prepared[s]) firstprivate(s, slot_idx, row_start, row_end, observed_team_size)
                             {
+                                trace::ScopedContext task_context(task_trace_origin, true);
+                                trace::CpuStage task_lifetime(layer, "task.host_work");
+                                CpuWallInterval task_cpu_wall(layer, run_id, "exsia.prepare", s);
                                 try
                                 {
                                 if (pipeline_ok.load(std::memory_order_relaxed))
@@ -2359,6 +2650,9 @@ namespace ggml::gemmini::quants::act::exsia
                         {
 #pragma omp task depend(in : local_sealed[s - 1], slot_released[s - 2]) depend(out : prepared[s]) firstprivate(s, slot_idx, row_start, row_end, observed_team_size)
                             {
+                                trace::ScopedContext task_context(task_trace_origin, true);
+                                trace::CpuStage task_lifetime(layer, "task.host_work");
+                                CpuWallInterval task_cpu_wall(layer, run_id, "exsia.prepare", s);
                                 try
                                 {
                                 if (pipeline_ok.load(std::memory_order_relaxed))
@@ -2424,6 +2718,9 @@ namespace ggml::gemmini::quants::act::exsia
                         {
 #pragma omp task depend(in : prepared[s]) depend(out : worker_done[s * EXSIA_LOCAL_WORKER_COUNT + task_id]) firstprivate(s, slot_idx, task_id)
                             {
+                                trace::ScopedContext task_context(task_trace_origin, true);
+                                trace::CpuStage task_lifetime(layer, "task.host_work");
+                                CpuWallInterval task_cpu_wall(layer, run_id, "exsia.local", s, task_id);
                                 try
                                 {
                                 if (pipeline_ok.load(std::memory_order_relaxed))
@@ -2480,6 +2777,9 @@ namespace ggml::gemmini::quants::act::exsia
 #error "Unsupported ExSIA local worker count"
 #endif
                         {
+                            trace::ScopedContext task_context(task_trace_origin, true);
+                            trace::CpuStage task_lifetime(layer, "task.host_work");
+                            CpuWallInterval task_cpu_wall(layer, run_id, "exsia.local_seal", s);
                             try
                             {
                             if (pipeline_ok.load(std::memory_order_relaxed))
@@ -2524,6 +2824,7 @@ namespace ggml::gemmini::quants::act::exsia
                                 slot.cycle_stats.p3.max = std::max(slot.cycle_stats.p3.max, task_stats.p3.max);
                                 slot.cycle_stats.p3.count += task_stats.p3.count;
 #endif
+                                slot.cycle_stats.forced_recompute_count += task_stats.forced_recompute_count;
 #endif
                                 slot.cycle_stats.p3_bypass_no_int_count += task_stats.p3_bypass_no_int_count;
                                 slot.cycle_stats.p3_bypass_same_scale_count += task_stats.p3_bypass_same_scale_count;
@@ -2567,6 +2868,9 @@ namespace ggml::gemmini::quants::act::exsia
 
 #pragma omp task depend(in : local_sealed[s]) depend(inout : post_chain) depend(out : slot_released[s]) firstprivate(s, slot_idx)
                         {
+                            trace::ScopedContext task_context(task_trace_origin, true);
+                            trace::CpuStage task_lifetime(layer, "task.host_work");
+                            CpuWallInterval task_cpu_wall(layer, run_id, "exsia.mask_assembly", s);
                             try
                             {
                             if (pipeline_ok.load(std::memory_order_relaxed))
@@ -2601,6 +2905,7 @@ namespace ggml::gemmini::quants::act::exsia
                                 }
                                 else
                                 {
+                                    task_cpu_wall.next("exsia.exponent_reduction");
                                     EXSIA_PROFILE_COLLECT(start_profile_interval(profile.exponent_reduction);)
                                     reduce_stripe_exponents(slot, active_block_count);
                                     EXSIA_PROFILE_COLLECT(
@@ -2613,6 +2918,7 @@ namespace ggml::gemmini::quants::act::exsia
                                     slot.mark_local_filled();
                                     if (pipeline_ok.load(std::memory_order_relaxed))
                                     {
+                                        task_cpu_wall.next("exsia.folding_and_pack");
                                         EXSIA_PROFILE_COLLECT(start_profile_interval(profile.folding);)
                                         if (!folding_.run(meta, state_, slot.stripe, args, s,
                                                           slot.q_wide, slot.block_exp,
@@ -2644,9 +2950,10 @@ namespace ggml::gemmini::quants::act::exsia
                                                 }
                                                 )
                                                 bool stripe_ready_accepted = true;
+                                                task_cpu_wall.next("exsia.publish");
                                                 if (pipeline_ok.load(std::memory_order_relaxed))
                                                 {
-                                                    stripe_ready_accepted = notify_stripe_ready(slot, run_id, true
+                                                    stripe_ready_accepted = notify_stripe_ready(slot, run_id, true, task_cpu_wall
 #if EXSIA_PROFILE_COLLECTION_ENABLED
                                                                                                , &profile
 #endif
@@ -2683,7 +2990,19 @@ namespace ggml::gemmini::quants::act::exsia
                     }
                     }
                 }
+#if LOG_CYCLE
+                // The single barrier joins all tasks; the final parallel barrier is excluded.
+                if (collect_worker_cpu)
+                {
+                    const auto worker_end = gemmini_cpu_timing_read();
+                    gemmini_cpu_timing_add(&run_timing.worker_cpu[omp_get_thread_num()],
+                                           &worker_start, &worker_end);
+                    const auto identity = cpu_identity(layer, run_id, "exsia.worker");
+                    gemmini_cpu_timing_record(&identity, &worker_start, &worker_end);
+                }
+#endif
             }
+            run_cpu_wall.resume();
             if (!pipeline_ok.load(std::memory_order_relaxed))
                 return fail();
 #else
@@ -2692,8 +3011,10 @@ namespace ggml::gemmini::quants::act::exsia
         }
         else
         {
+        run_cpu_wall.pause();
         for (size_t s = 0; s < num_stripes; ++s)
         {
+            CpuWallInterval stripe_cpu_wall(layer, run_id, "exsia.prepare", s);
             const size_t row_start = s * rows_per_stripe;
             const size_t row_end = std::min((s + 1) * rows_per_stripe, args.I);
             StripePipelineSlot &slot = pipeline_slots_[s % EXSIA_PIPELINE_SLOT_COUNT];
@@ -2728,6 +3049,7 @@ namespace ggml::gemmini::quants::act::exsia
                 stats.p2.add(sample.p2);
                 stats.p3.add(sample.p3);
 #endif
+                stats.forced_recompute_count += sample.forced_recompute_count;
 #endif
                 switch (sample.p3_path)
                 {
@@ -2776,6 +3098,7 @@ namespace ggml::gemmini::quants::act::exsia
                 return true;
             };
 
+            stripe_cpu_wall.next("exsia.local");
             if (state_.mode == ExSIAState::ExecutionMode::LocalParallel)
             {
 #if defined(GGML_GEMMINI_HAS_OPENMP)
@@ -2808,6 +3131,12 @@ namespace ggml::gemmini::quants::act::exsia
                 size_t observed_team_size = 0;
 #pragma omp parallel num_threads(EXSIA_OMP_THREAD_COUNT)
                 {
+                    trace::ScopedContext team_context(task_trace_origin, true);
+                    trace::CpuStage team_lifetime(layer, "task.host_work");
+#if LOG_CYCLE
+                    const bool collect_worker_cpu = cycle::host_thread_id() != run_timing.start.tid;
+                    const auto worker_start = collect_worker_cpu ? gemmini_cpu_timing_read() : gemmini_cpu_sample{};
+#endif
 #pragma omp single
                     {
 #if EXSIA_OBSERVATION_ENABLED
@@ -2825,6 +3154,9 @@ namespace ggml::gemmini::quants::act::exsia
                         {
 #pragma omp task firstprivate(task_id)
                             {
+                                trace::ScopedContext task_context(task_trace_origin, true);
+                                trace::CpuStage task_lifetime(layer, "task.host_work");
+                                CpuWallInterval task_cpu_wall(layer, run_id, "exsia.local", s, task_id);
                                 try
                                 {
                                 if (local_parallel_ok.load(std::memory_order_relaxed))
@@ -2868,8 +3200,22 @@ namespace ggml::gemmini::quants::act::exsia
                                 }
                             }
                         }
+                        {
+                            trace::CpuStage taskwait(layer, "openmp.task_wait");
 #pragma omp taskwait
+                        }
                     }
+#if LOG_CYCLE
+                    // Sample after the single barrier, before the final parallel barrier.
+                    if (collect_worker_cpu)
+                    {
+                        const auto worker_end = gemmini_cpu_timing_read();
+                        gemmini_cpu_timing_add(&run_timing.worker_cpu[omp_get_thread_num()],
+                                               &worker_start, &worker_end);
+                        const auto identity = cpu_identity(layer, run_id, "exsia.worker", s);
+                        gemmini_cpu_timing_record(&identity, &worker_start, &worker_end);
+                    }
+#endif
                 }
 
                 EXSIA_PROFILE_COLLECT(profile.team_size = observed_team_size;)
@@ -2912,6 +3258,7 @@ namespace ggml::gemmini::quants::act::exsia
                     slot.cycle_stats.p3.max = std::max(slot.cycle_stats.p3.max, task_stats.p3.max);
                     slot.cycle_stats.p3.count += task_stats.p3.count;
 #endif
+                    slot.cycle_stats.forced_recompute_count += task_stats.forced_recompute_count;
 #endif
                     slot.cycle_stats.p3_bypass_no_int_count += task_stats.p3_bypass_no_int_count;
                     slot.cycle_stats.p3_bypass_same_scale_count += task_stats.p3_bypass_same_scale_count;
@@ -2945,6 +3292,7 @@ namespace ggml::gemmini::quants::act::exsia
                 return fail(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
             )
             const size_t active_block_count = stripe.row_count() * state_.blocks_per_row;
+            stripe_cpu_wall.next("exsia.mask_assembly");
             EXSIA_PROFILE_COLLECT(start_profile_interval(profile.mask_assembly);)
             const bool assembled = assemble_stripe_mask(slot, state_);
             EXSIA_PROFILE_COLLECT(
@@ -2955,6 +3303,7 @@ namespace ggml::gemmini::quants::act::exsia
                 return fail(ExSIAState::FailureCode::MaskAssemblyFailure, s);
             if (active_block_count > slot.block_exp.size())
                 return fail(ExSIAState::FailureCode::ExponentReductionFailure, s);
+            stripe_cpu_wall.next("exsia.exponent_reduction");
             EXSIA_PROFILE_COLLECT(start_profile_interval(profile.exponent_reduction);)
             reduce_stripe_exponents(slot, active_block_count);
             EXSIA_PROFILE_COLLECT(
@@ -2962,6 +3311,7 @@ namespace ggml::gemmini::quants::act::exsia
                 return fail(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
             )
             slot.mark_local_filled();
+            stripe_cpu_wall.next("exsia.folding_and_pack");
             EXSIA_PROFILE_COLLECT(start_profile_interval(profile.folding);)
 
             if (!folding_.run(meta, state_, stripe, args, s,
@@ -2986,7 +3336,8 @@ namespace ggml::gemmini::quants::act::exsia
 #if EXSIA_STAGE_PROFILE_ENABLED
             profile.stats = slot.cycle_stats;
 #endif
-            if (!notify_stripe_ready(slot, run_id, true
+            stripe_cpu_wall.next("exsia.publish");
+            if (!notify_stripe_ready(slot, run_id, true, stripe_cpu_wall
 #if EXSIA_PROFILE_COLLECTION_ENABLED
                                      , &profile
 #endif
@@ -2998,6 +3349,7 @@ namespace ggml::gemmini::quants::act::exsia
                 return fail(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
             )
         }
+        run_cpu_wall.resume();
         }
 
 #if EXSIA_PROFILE_COLLECTION_ENABLED
@@ -3010,9 +3362,10 @@ namespace ggml::gemmini::quants::act::exsia
         state_.profile_snapshot.stripes = stripe_profiles;
 #endif
 #endif
+        run_cpu_wall.pause();
         EXSIA_PROFILE_LOG(
         const ExSIAState::FailureCode profile_failure = flush_profile(
-            profile_config, layer, run_id, mode, stripe_profiles, run_profile);
+            profile_config, layer, run_id, mode, stripe_profiles, run_profile, state_);
         if (profile_failure != ExSIAState::FailureCode::None)
             return fail(profile_failure);
         )
@@ -3025,6 +3378,9 @@ namespace ggml::gemmini::quants::act::exsia
             meta.sigma,
             meta.rmd_packets.size());
 
+#if LOG_CYCLE
+        run_timing.success = true;
+#endif
         return true;
     }
 

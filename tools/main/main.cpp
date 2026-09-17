@@ -5,16 +5,173 @@
 #include "sampling.h"
 #include "llama.h"
 #include "chat.h"
+#include "json.hpp"
 #include <cstdio>
+#include <charconv>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include <gemmini/log.hpp>
+#include <gemmini/host-timing.hpp>
+#include <gemmini/performance.hpp>
+
+namespace perf = ggml::gemmini::performance;
+
+static uint64_t performance_now_ns() {
+    return ggml::gemmini::cycle::read_host_sample().ns;
+}
+
+#if LOG_CYCLE
+static void log_inference_configuration(const common_params & params, llama_model * model,
+                                        llama_context * ctx, size_t input_tokens,
+                                        size_t cached_tokens, bool separate_batch_pool) {
+    using Json = nlohmann::json;
+    const auto sample = ggml::gemmini::cycle::read_host_sample();
+    const auto pool = [](const cpu_params & cpu) {
+        Json mask = nullptr;
+        if (cpu.mask_valid) {
+            mask = Json::array();
+            for (size_t i = 0; i < GGML_MAX_N_THREADS; ++i)
+                if (cpu.cpumask[i]) mask.push_back(i);
+        }
+        return Json{{"threads", cpu.n_threads}, {"affinity_requested", mask},
+            {"strict_affinity", cpu.strict_cpu}, {"poll_level", cpu.poll},
+            {"priority", static_cast<int>(cpu.priority)}};
+    };
+    Json environment = Json::object();
+    for (const char * name : {"OMP_NUM_THREADS", "OMP_THREAD_LIMIT", "OMP_MAX_ACTIVE_LEVELS",
+            "OMP_DYNAMIC", "OMP_PROC_BIND", "OMP_PLACES", "OMP_WAIT_POLICY",
+            "GGML_GEMMINI_EXSIA_FORCE_RECOMPUTE", "GGML_GEMMINI_NPU_HZ"}) {
+        const char * value = std::getenv(name);
+        environment[name] = value ? Json(value) : Json();
+    }
+    Json devices = Json::array();
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        const auto device = ggml_backend_dev_get(i);
+        devices.push_back({{"name", ggml_backend_dev_name(device)},
+            {"description", ggml_backend_dev_description(device)},
+            {"registry", ggml_backend_reg_name(ggml_backend_dev_backend_reg(device))}});
+    }
+    char description[256]{};
+    llama_model_desc(model, description, sizeof(description));
+    Json record = {{"schema", "gemmini.cycle"}, {"version", 2},
+        {"record_type", "INFERENCE_CONFIGURATION"}, {"execution_id", ggml::gemmini::cycle::host_execution_id()},
+        {"timestamp_ns", sample.ns}, {"inference_context", nullptr},
+        {"build_commit", LLAMA_COMMIT}, {"build_compiler", LLAMA_COMPILER},
+        {"build_target", LLAMA_BUILD_TARGET}, {"model_path", params.model.path},
+        {"model_description", description}, {"model_parameters", llama_model_n_params(model)},
+        {"model_identity_kind", "path_and_loaded_metadata"},
+        {"initial_input_tokens", input_tokens}, {"requested_output_tokens", params.n_predict},
+        {"batch", llama_n_batch(ctx)}, {"ubatch", llama_n_ubatch(ctx)}, {"context", llama_n_ctx(ctx)},
+        {"warmup_enabled", params.warmup}, {"warmup_included", false},
+        {"prompt_cache_enabled", !params.path_prompt_cache.empty()},
+        {"prompt_cache_read_only", params.prompt_cache_ro}, {"prompt_cache_all", params.prompt_cache_all},
+        {"initial_matching_cache_tokens", cached_tokens},
+        {"kv_type_k", ggml_type_name(params.cache_type_k)}, {"kv_type_v", ggml_type_name(params.cache_type_v)},
+        {"cpu_pool", pool(params.cpuparams)}, {"cpu_batch_pool", pool(params.cpuparams_batch)},
+        {"separate_batch_pool", separate_batch_pool}, {"environment", environment},
+        {"registered_devices", devices}, {"registered_devices_are_dispatch_evidence", false},
+        {"seed", params.sampling.seed}, {"temperature", params.sampling.temp},
+        {"cpu_affinity_observed", nullptr}, {"cpu_frequency_policies", nullptr},
+        {"host_policy_reason", "unsupported_platform"}};
+#if defined(__linux__)
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.compare(0, 18, "Cpus_allowed_list:") == 0)
+            record["cpu_affinity_observed"] = line.substr(line.find_first_not_of("\t ", 18));
+    }
+    Json policies = Json::array();
+    std::error_code error;
+    const std::filesystem::path base("/sys/devices/system/cpu/cpufreq");
+    for (const auto & entry : std::filesystem::directory_iterator(base, error)) {
+        Json policy = {{"name", entry.path().filename().string()}};
+        for (const char * field : {"related_cpus", "scaling_governor", "scaling_min_freq", "scaling_max_freq"}) {
+            std::ifstream input(entry.path() / field);
+            policy[field] = std::getline(input, line) ? Json(line) : Json();
+        }
+        policies.push_back(std::move(policy));
+    }
+    record["cpu_frequency_policies"] = policies;
+    record["host_policy_reason"] = (record["cpu_affinity_observed"].is_null() || policies.empty())
+        ? Json("host_policy_partially_unavailable") : Json();
+#endif
+    ggml::gemmini::log::cycle.write_json(record.dump());
+    (void) gemmini_log_cycle_flush();
+}
+#endif
+
+static void print_final_performance() {
+    perf::finish_request(performance_now_ns());
+    perf::finish_recording();
+    perf::Summary summary;
+#if LOG_CYCLE
+    if (!gemmini_log_cycle_flush() || !ggml::gemmini::log::cycle.healthy()) {
+        summary.reason = "cycle_log_write_failed";
+    } else {
+        const auto path = ggml::gemmini::log::cycle.output_path();
+        if (path.empty()) summary.reason = "cycle_log_not_readable_file";
+        else summary = perf::read_summary(path);
+    }
+#else
+    summary.reason = "LOG_CYCLE_disabled";
+#endif
+    ggml::gemmini::log::cycle.write_json(summary.serialize());
+    (void) gemmini_log_cycle_flush();
+    summary.print(stderr);
+}
+
+// Close each evaluation before flushing, so log I/O is not CPU work time.
+class InferenceOperation {
+public:
+    explicit InferenceOperation(perf::Phase phase, const char * op, bool cpu_work = false)
+        : start_ns(performance_now_ns()), op(op), cpu_work(cpu_work) {
+        perf::begin_operation(phase, start_ns);
+        start = gemmini_cpu_timing_read();
+        if (cpu_work) work_start_ns = performance_now_ns();
+#if !LOG_CYCLE
+        perf::incomplete_cpu_wall("LOG_CYCLE_disabled");
+#endif
+    }
+
+    ~InferenceOperation() {
+        if (!finished) finish(false);
+    }
+
+    uint64_t finish(bool success) {
+        const auto end = gemmini_cpu_timing_read();
+        const uint64_t end_ns = performance_now_ns();
+#if LOG_CYCLE
+        gemmini_cpu_totals totals{};
+        gemmini_cpu_timing_add(&totals, &start, &end);
+        gemmini_cycle_record_v2 identity{};
+        identity.interval.layer = "llama";
+        identity.interval.op = op;
+        gemmini_cpu_timing_record(&identity, &start, &end);
+#else
+        (void) end;
+#endif
+        if (cpu_work) perf::record_cpu_wall(work_start_ns, end_ns);
+        perf::end_operation(end_ns, success);
+        finished = true;
+        return end_ns;
+    }
+
+private:
+    uint64_t start_ns;
+    uint64_t work_start_ns = 0;
+    gemmini_cpu_sample start{};
+    [[maybe_unused]] const char * op;
+    bool cpu_work;
+    bool finished = false;
+};
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
@@ -105,6 +262,16 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    uint64_t npu_hz = 0;
+    if (const char * value = std::getenv("GGML_GEMMINI_NPU_HZ")) {
+        const char * end = value + std::strlen(value);
+        const auto parsed = std::from_chars(value, end, npu_hz);
+        if (parsed.ec != std::errc() || parsed.ptr != end || npu_hz == 0) {
+            fprintf(stderr, "error: GGML_GEMMINI_NPU_HZ must be a positive integer in Hz\n");
+            return 1;
+        }
+    }
+
 #if LOG_DEBUG
     if (!params.gemmini_debug_log.empty() && !set_gemmini_debug_log_output(params.gemmini_debug_log.c_str())) {
         fprintf(stderr, "error: failed to open Gemmini debug log output: %s\n", params.gemmini_debug_log.c_str());
@@ -125,6 +292,7 @@ int main(int argc, char ** argv) {
     if (!params.gemmini_cycle_log.empty() && !cycle_log_ready) {
         return 1;
     }
+    ggml::gemmini::log::cycle.set_buffered(true);
 #else
     if (!params.gemmini_cycle_log.empty()) {
         fprintf(stderr, "error: --gemmini-cycle-log is unavailable because this build has LOG_CYCLE=0\n");
@@ -583,12 +751,30 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // common_init_from_params already synchronized and reset warmup statistics.
+    // A request begins with its tokenized prompt ready for evaluation.
+#if LOG_CYCLE
+    log_inference_configuration(params, model, ctx, embd_inp.size(),
+                                n_matching_session_tokens, threadpool_batch != nullptr);
+#endif
+    perf::reset();
+    perf::set_npu_frequency(npu_hz);
+    if (!embd_inp.empty()) {
+        perf::start_request(performance_now_ns());
+    }
+    perf::Phase inference_phase = perf::Phase::prefill;
+
     if (llama_model_has_encoder(model)) {
         int enc_input_size = embd_inp.size();
         llama_token * enc_input_buf = embd_inp.data();
 
-        if (llama_encode(ctx, llama_batch_get_one(enc_input_buf, enc_input_size))) {
+        InferenceOperation operation(perf::Phase::prefill, "llama.encode");
+        const int status = llama_encode(ctx, llama_batch_get_one(enc_input_buf, enc_input_size));
+        llama_synchronize(ctx);
+        operation.finish(status == 0);
+        if (status) {
             LOG_ERR("%s : failed to eval\n", __func__);
+            print_final_performance();
             return 1;
         }
 
@@ -707,8 +893,13 @@ int main(int argc, char ** argv) {
 
                 LOG_DBG("eval: %s\n", string_from(ctx, embd).c_str());
 
-                if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval))) {
+                InferenceOperation operation(inference_phase, "llama.decode");
+                const int status = llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval));
+                llama_synchronize(ctx);
+                operation.finish(status == 0);
+                if (status) {
                     LOG_ERR("%s : failed to eval\n", __func__);
+                    print_final_performance();
                     return 1;
                 }
 
@@ -738,9 +929,13 @@ int main(int argc, char ** argv) {
                 LOG_DBG("saved session to %s\n", path_session.c_str());
             }
 
+            InferenceOperation sampling(inference_phase, "llama.sample", true);
             const llama_token id = common_sampler_sample(smpl, ctx, -1);
 
             common_sampler_accept(smpl, id, /* accept_grammar= */ true);
+            const uint64_t token_ready_ns = sampling.finish(true);
+            perf::token_ready(token_ready_ns, id);
+            inference_phase = perf::Phase::decode;
 
             // LOG_DBG("last: %s\n", string_from(ctx, smpl->prev.to_vector()).c_str());
 
@@ -754,6 +949,7 @@ int main(int argc, char ** argv) {
 
             LOG_DBG("n_remain: %d\n", n_remain);
         } else {
+            if ((int) embd_inp.size() > n_consumed) inference_phase = perf::Phase::prefill;
             // some user input remains from prompt or interaction, forward it to processing
             LOG_DBG("embd_inp.size(): %d, n_consumed: %d\n", (int) embd_inp.size(), n_consumed);
             while ((int) embd_inp.size() > n_consumed) {
@@ -872,6 +1068,7 @@ int main(int argc, char ** argv) {
             }
 
             if ((n_past > 0 || waiting_for_first_input) && is_interacting) {
+                perf::finish_request(performance_now_ns());
                 LOG_DBG("waiting for user input\n");
 
                 if (params.conversation_mode) {
@@ -920,6 +1117,7 @@ int main(int argc, char ** argv) {
                 if (buffer.empty()) { // Enter key on empty line lets the user pass control back
                     LOG_DBG("empty line, passing control back\n");
                 } else { // Add tokens to embd only if the input buffer is non-empty
+                    inference_phase = perf::Phase::prefill;
                     // append input suffix if any
                     if (!params.input_suffix.empty() && !params.conversation_mode) {
                         LOG_DBG("appending input suffix: '%s'\n", params.input_suffix.c_str());
@@ -969,6 +1167,8 @@ int main(int argc, char ** argv) {
                     LOG_DBG("n_remain: %d\n", n_remain);
                 }
 
+                perf::start_request(performance_now_ns());
+
                 input_echo = false; // do not echo this again
             }
 
@@ -1000,6 +1200,8 @@ int main(int argc, char ** argv) {
         }
     }
 
+    perf::finish_request(performance_now_ns());
+
     if (!path_session.empty() && params.prompt_cache_all && !params.prompt_cache_ro) {
         LOG("\n%s: saving final output to session file '%s'\n", __func__, path_session.c_str());
         llama_state_save_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.size());
@@ -1007,6 +1209,7 @@ int main(int argc, char ** argv) {
 
     LOG("\n\n");
     common_perf_print(ctx, smpl);
+    print_final_performance();
 
     common_sampler_free(smpl);
 

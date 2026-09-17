@@ -1,3 +1,4 @@
+#include <gemmini/trace-context.hpp>
 #include "direct-executor.hpp"
 
 #include "direct-builder.hpp"
@@ -5,7 +6,9 @@
 #include "../../quants/act/dispatch.hpp"
 #include "../../quants/common/weight_reader.hpp"
 #include "../../quants/common/weight_route.hpp"
-#if LOG_CYCLE && CYCLE_DETAIL
+#include <gemmini/cpu-timing.h>
+#include <gemmini/log.h>
+#if LOG_CYCLE
 #include "direct-profile.hpp"
 #endif
 #if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
@@ -64,10 +67,9 @@ CpuSample read_cpu_sample(const testing::DirectExecutionTestHooks * hooks,
     return {};
 }
 #else
-CpuSample read_cpu_sample() {
-    const auto sample = cycle::read_sample();
-    return {sample.value, sample.valid, sample.owner_event_token, sample.generation,
-            static_cast<DirectCpuTileReason>(sample.reason),
+CpuSample read_cpu_sample(const gemmini_cpu_sample & sample) {
+    return {sample.counter, sample.native_valid != 0, sample.owner_token, sample.generation,
+            static_cast<DirectCpuTileReason>(sample.native_reason),
             DirectCpuTileSource::perf_cpu_cycles};
 }
 #endif
@@ -108,8 +110,7 @@ CpuInterval cpu_interval(const CpuSample & start, const CpuSample & end) {
 
 #endif
 
-#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
-    (CYCLE_DETAIL && (LOG_CYCLE || (defined(__linux__) && defined(__aarch64__))))
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || LOG_CYCLE
 size_t direct_worker_id() {
 #if defined(GGML_GEMMINI_HAS_OPENMP)
     return static_cast<size_t>(omp_get_thread_num());
@@ -197,7 +198,7 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
                                      rmd::DirectOutput & correction,
                                      DirectExecutionMetrics * metrics) {
 #endif
-#if LOG_CYCLE && CYCLE_DETAIL
+#if LOG_CYCLE
     detail::DirectHostProfile profile(payload, args.matmul_layer,
         metrics != nullptr ? metrics->run_id : std::nullopt
 #if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
@@ -246,7 +247,7 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
     if (!checked_size_product(payload.row_count, payload.logical_j, output_count))
         return rmd::RmdStatus::overflow;
 
-#if LOG_CYCLE && CYCLE_DETAIL
+#if LOG_CYCLE
     profile.next_phase(1);
 #endif
     size_t metadata_row_begin = 0;
@@ -310,13 +311,17 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
     // Events are canonical row/K order. For each J tile, consume contiguous
     // row/block/K spans, then apply that block's scale exactly once.
     auto execute_j_tile = [&](size_t tile_index) {
+#if LOG_CYCLE
+        const auto tile_cpu_start = gemmini_cpu_timing_read();
+        const auto tile_identity = profile.identity("rmd_direct_j_tile_interval", direct_worker_id(), tile_index);
+#endif
 #if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
     (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
         const CpuSample tile_start =
 #if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
             read_cpu_sample(hooks, testing::DirectCpuSamplePoint::tile_start, tile_index);
 #else
-            read_cpu_sample();
+            read_cpu_sample(tile_cpu_start);
 #endif
 #endif
 #if LOG_CYCLE && CYCLE_DETAIL
@@ -324,7 +329,7 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
             profile.tiles[tile_index].worker_id = direct_worker_id();
             profile.tiles[tile_index].j_begin = tile_index * kJTile;
             profile.tiles[tile_index].j_end = std::min(payload.logical_j, (tile_index + 1) * kJTile);
-            profile.tiles[tile_index].compute.start = cycle::read_host_sample();
+            profile.tiles[tile_index].compute.start = tile_cpu_start;
         }
 #endif
         const rmd::RmdStatus status = [&] {
@@ -335,7 +340,7 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
             while (event_index < payload.events.size()) {
 #if LOG_CYCLE && CYCLE_DETAIL
                 detail::DirectStageProbe stage_probe(profile.ready && profile.deep_profile ?
-                    &profile.tiles[tile_index].stages : nullptr);
+                    &profile.tiles[tile_index].stages : nullptr, &tile_identity);
 #endif
                 const ResidualEvent & first = payload.events[event_index];
                 const size_t row = first.local_row;
@@ -435,8 +440,12 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
             }
             return rmd::RmdStatus::success;
         }();
-#if LOG_CYCLE && CYCLE_DETAIL
-        if (profile.ready) profile.tiles[tile_index].compute.end = cycle::read_host_sample();
+#if LOG_CYCLE
+        const auto tile_cpu_end = gemmini_cpu_timing_read();
+#if CYCLE_DETAIL
+        if (profile.ready) profile.tiles[tile_index].compute.end = tile_cpu_end;
+#endif
+        gemmini_cpu_timing_record(&tile_identity, &tile_cpu_start, &tile_cpu_end);
 #endif
 #if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
     (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
@@ -444,7 +453,7 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
             const CpuSample tile_end = read_cpu_sample(hooks,
                 testing::DirectCpuSamplePoint::tile_end, tile_index);
 #else
-            const CpuSample tile_end = read_cpu_sample();
+            const CpuSample tile_end = read_cpu_sample(tile_cpu_end);
 #endif
             const CpuInterval interval = cpu_interval(tile_start, tile_end);
             DirectCpuTileRecord & record = tile_cpu_records[tile_index];
@@ -463,94 +472,63 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
             record.source = tile_start.source;
             record.owner_event_token = tile_start.owner;
             record.generation = tile_start.generation;
-#if !defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
-            const gemmini_native_cycle_sample_internal start_sample{
-                tile_start.value, static_cast<uint8_t>(tile_start.valid),
-                static_cast<uint8_t>(tile_start.reason),
-                GEMMINI_NATIVE_CYCLE_SOURCE_LINUX_PERF_CPU_CYCLES,
-                tile_start.owner, tile_start.generation};
-            const gemmini_native_cycle_sample_internal end_sample{
-                tile_end.value, static_cast<uint8_t>(tile_end.valid),
-                static_cast<uint8_t>(tile_end.reason),
-                GEMMINI_NATIVE_CYCLE_SOURCE_LINUX_PERF_CPU_CYCLES,
-                tile_end.owner, tile_end.generation};
-            uint32_t identity_mask =
-                static_cast<uint32_t>(GEMMINI_CYCLE_HAS_STRIPE_ID) |
-                static_cast<uint32_t>(GEMMINI_CYCLE_HAS_NODE_ID) |
-                static_cast<uint32_t>(GEMMINI_CYCLE_HAS_WORKER_ID);
-            if (direct_run_id.has_value()) {
-                identity_mask |= static_cast<uint32_t>(GEMMINI_CYCLE_HAS_RUN_ID);
-            }
-            const gemmini_cycle_record_v2 detail{{
-                args.matmul_layer.empty() ? nullptr : args.matmul_layer.c_str(),
-                "rmd_direct_j_tile_interval",
-                tile_start.value, tile_end.value, nullptr, 0, nullptr},
-                identity_mask, direct_run_id.value_or(0), payload.stripe_id, 0, tile_index,
-                record.worker_id};
-#if LOG_CYCLE && CYCLE_DETAIL
-            auto * host_tile = profile.ready ? &profile.tiles[tile_index] : nullptr;
-            if (host_tile != nullptr) host_tile->logging.start = cycle::read_host_sample();
-            {
-                std::optional<log::ScopedCycleWriteTiming> write_timing;
-                if (host_tile != nullptr) write_timing.emplace(host_tile->writes);
-#endif
-                gemmini_log_cycle_record_v2_checked_internal(
-                    &detail, &start_sample, &end_sample, 1);
-#if LOG_CYCLE && CYCLE_DETAIL
-            }
-            if (host_tile != nullptr) host_tile->logging.end = cycle::read_host_sample();
-#endif
-#endif
 #endif
         return status;
     };
 
-#if LOG_CYCLE && CYCLE_DETAIL
+#if LOG_CYCLE
     profile.next_phase(2);
+#endif
+    const auto direct_task_origin = gemmini_trace_capture();
 #if defined(GGML_GEMMINI_HAS_OPENMP)
 #pragma omp parallel if(j_tile_count > 1)
+#endif
     {
+        trace::ScopedContext direct_task(direct_task_origin, true);
+        trace::CpuStage task_lifetime(args.matmul_layer.c_str(), "task.host_work");
+        trace::ScopedRole residual_role(GEMMINI_TRACE_ROLE_RESIDUAL);
+#if LOG_CYCLE
+        const auto worker_cpu_start = gemmini_cpu_timing_read();
+#endif
+#if LOG_CYCLE && CYCLE_DETAIL
         const size_t worker_id = direct_worker_id();
         if (profile.ready) {
             profile.workers[worker_id].active = true;
-            profile.workers[worker_id].work.start = cycle::read_host_sample();
+            profile.workers[worker_id].work.start = worker_cpu_start;
         }
+#endif
+#if defined(GGML_GEMMINI_HAS_OPENMP)
 #pragma omp for schedule(static) nowait
+#endif
         for (std::ptrdiff_t tile_index = 0;
              tile_index < static_cast<std::ptrdiff_t>(j_tile_count);
              ++tile_index) {
             tile_status[static_cast<size_t>(tile_index)] =
                 execute_j_tile(static_cast<size_t>(tile_index));
         }
+#if LOG_CYCLE
+        const auto worker_cpu_end = gemmini_cpu_timing_read();
+        gemmini_cpu_totals worker_cpu{};
+        gemmini_cpu_timing_add(&worker_cpu, &worker_cpu_start, &worker_cpu_end);
+        const auto worker_identity = profile.identity("rmd.cpu_direct.worker", direct_worker_id());
+        gemmini_cpu_timing_record(&worker_identity, &worker_cpu_start, &worker_cpu_end);
+#endif
+#if LOG_CYCLE && CYCLE_DETAIL
         if (profile.ready) {
             auto & worker = profile.workers[worker_id];
-            worker.work.end = cycle::read_host_sample();
-            worker.barrier.start = worker.work.end;
-        }
-#pragma omp barrier
-        if (profile.ready) profile.workers[worker_id].barrier.end = cycle::read_host_sample();
-    }
-#else
-    if (profile.ready) {
-        profile.workers[0].active = true;
-        profile.workers[0].work.start = cycle::read_host_sample();
-    }
-    for (size_t tile_index = 0; tile_index < j_tile_count; ++tile_index) {
-        tile_status[tile_index] = execute_j_tile(tile_index);
-    }
-    if (profile.ready) profile.workers[0].work.end = cycle::read_host_sample();
-#endif
-    profile.next_phase(3);
-#else
+            worker.work.end = worker_cpu_end;
 #if defined(GGML_GEMMINI_HAS_OPENMP)
-#pragma omp parallel for schedule(static) if(j_tile_count > 1)
+            worker.barrier.start = worker.work.end;
 #endif
-    for (std::ptrdiff_t tile_index = 0;
-         tile_index < static_cast<std::ptrdiff_t>(j_tile_count);
-         ++tile_index) {
-        tile_status[static_cast<size_t>(tile_index)] =
-            execute_j_tile(static_cast<size_t>(tile_index));
+        }
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+#pragma omp barrier
+        if (profile.ready) profile.workers[worker_id].barrier.end = gemmini_cpu_timing_read();
+#endif
+#endif
     }
+#if LOG_CYCLE
+    profile.next_phase(3);
 #endif
     size_t native_q8_values = 0;
     for (size_t tile_index = 0; tile_index < j_tile_count; ++tile_index) {

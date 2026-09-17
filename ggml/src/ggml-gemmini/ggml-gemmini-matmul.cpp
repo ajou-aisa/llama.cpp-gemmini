@@ -1,9 +1,11 @@
+#include <gemmini/trace-context.hpp>
 #define GGML_GEMMINI_MATMUL_IMPLEMENTATION 1
 #include "ggml-gemmini-matmul.hpp"
 #include "quants/common/weight_reader.hpp"
 
 #include <gemmini/log.hpp>
 #include <gemmini/cycle_reader.hpp>
+#include <gemmini/performance.hpp>
 
 #include <cstdio>
 #include <algorithm>
@@ -15,6 +17,22 @@
 namespace ggml::gemmini {
 
 namespace {
+struct MatmulCycleFlush {
+    ~MatmulCycleFlush() {
+#if LOG_CYCLE
+        (void) gemmini_log_cycle_flush();
+#endif
+    }
+};
+
+void record_matmul_cpu_wall(const MatmulCpuSample & start, const MatmulCpuSample & end) {
+#if LOG_CYCLE
+    performance::record_cpu_wall(start.ns, end.ns);
+#else
+    (void) start; (void) end;
+#endif
+}
+
 void emit_matmul_cpu_interval(const char * layer, const char * op,
         const MatmulCpuSample & start, const MatmulCpuSample & end,
         bool operation_success, const MatmulJobMetrics * profile = nullptr,
@@ -36,18 +54,30 @@ void emit_matmul_cpu_interval(const char * layer, const char * op,
 #endif
 }
 
-#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
-void emit_matmul_native_interval(const char * layer, const char * op,
-        const cycle::NativeCycleSample & start, const cycle::NativeCycleSample & end,
-        uint64_t start_ns, uint64_t end_ns, uint64_t start_tid, uint64_t end_tid,
-        bool operation_success, const MatmulJobMetrics * profile = nullptr,
-        std::optional<uint64_t> invocation_run_id = {}) noexcept {
-    emit_matmul_cpu_interval(layer, op,
-                             {start.value, true, start, start_ns, start_tid},
-                             {end.value, true, end, end_ns, end_tid},
-                             operation_success, profile, nullptr, invocation_run_id);
-}
+void emit_rmd_stripe_metrics(const std::string & layer, const MatmulJobMetrics & profile,
+        RmdBackend backend, bool success, const char * reason,
+        const rmd::RmdExecutionMetrics * metrics) noexcept {
+#if LOG_CYCLE
+    try {
+        RmdStripeTelemetry record;
+        record.layer = layer;
+        if (profile.cpu_identity_mask & GEMMINI_CYCLE_HAS_RUN_ID) record.run_id = profile.run_id;
+        if (profile.cpu_identity_mask & GEMMINI_CYCLE_HAS_SLOT) record.slot = profile.slot;
+        record.stripe_id = profile.stripe_id;
+        record.row_begin = profile.row_begin;
+        record.row_end = profile.row_end;
+        record.backend = backend == RmdBackend::cpu_direct ? "cpu_direct" : "compact";
+        record.success = success;
+        record.reason = reason;
+        record.metrics = metrics;
+        emit_cycle_telemetry(record);
+    } catch (...) {
+        log::cycle.report_failure("RMD stripe metrics");
+    }
+#else
+    (void) layer; (void) profile; (void) backend; (void) success; (void) reason; (void) metrics;
 #endif
+}
 
 class ProofHash64 {
 public:
@@ -775,33 +805,76 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
         }
     };
 
+    const auto dense_task_origin = gemmini_trace_capture();
 #if defined(GGML_GEMMINI_HAS_OPENMP)
-#pragma omp parallel for schedule(static) \
-    if(parallel_tile_execution)
+#pragma omp parallel if(parallel_tile_execution)
 #endif
-    for (std::ptrdiff_t tile_pair = 0;
-         tile_pair < static_cast<std::ptrdiff_t>(tile_pair_count);
-         ++tile_pair) {
-        execute_tile_pair(static_cast<size_t>(tile_pair));
+    {
+        trace::ScopedContext dense_task(dense_task_origin, true);
+        trace::CpuStage task_lifetime(args.matmul_layer.c_str(), "task.host_work");
+#if LOG_CYCLE
+        const auto worker_cpu_start = gemmini_cpu_timing_read();
+#endif
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+#pragma omp for schedule(static) nowait
+#endif
+        for (std::ptrdiff_t tile_pair = 0;
+             tile_pair < static_cast<std::ptrdiff_t>(tile_pair_count);
+             ++tile_pair) {
+            execute_tile_pair(static_cast<size_t>(tile_pair));
+        }
+#if LOG_CYCLE
+        const auto worker_cpu_end = gemmini_cpu_timing_read();
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+#pragma omp barrier
+        const auto barrier_cpu_end = gemmini_cpu_timing_read();
+#endif
+        gemmini_cpu_totals worker_cpu{};
+        gemmini_cpu_timing_add(&worker_cpu, &worker_cpu_start, &worker_cpu_end);
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+        gemmini_cpu_timing_add(&worker_cpu, &worker_cpu_end, &barrier_cpu_end);
+#endif
+        gemmini_cycle_record_v2 worker_record{};
+        worker_record.interval.layer = args.matmul_layer.c_str();
+        worker_record.interval.op = "cpu.dense_worker";
+        worker_record.identity_mask = GEMMINI_CYCLE_HAS_WORKER_ID;
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+        worker_record.worker_id = static_cast<uint64_t>(omp_get_thread_num());
+#endif
+        if (const auto run_id = matmul_cpu_run_id(args)) {
+            worker_record.identity_mask |= GEMMINI_CYCLE_HAS_RUN_ID;
+            worker_record.run_id = *run_id;
+        }
+        gemmini_cpu_timing_record(&worker_record, &worker_cpu_start, &worker_cpu_end);
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+        worker_record.interval.op = "cpu.dense_worker_barrier";
+        gemmini_cpu_timing_record(&worker_record, &worker_cpu_end, &barrier_cpu_end);
+#endif
+#endif
     }
     return execution_valid.load(std::memory_order_relaxed)
         ? MatMulStatus::success
         : MatMulStatus::invalid_contract;
 }
 
-MatMulStatus physical_dense_status(DenseMatmulStatus status) {
-    switch (status) {
-        case DenseMatmulStatus::success:
-            return MatMulStatus::success;
-        case DenseMatmulStatus::invalid_contract:
-            return MatMulStatus::invalid_contract;
-        case DenseMatmulStatus::unsupported:
-            return MatMulStatus::unsupported;
+MatMulStatus execute_dense(ggml_gemmini_args_t &args, std::optional<uint64_t> stripe_id = {}) {
+#if LOG_CYCLE
+    gemmini_cycle_record_v2 ws_identity{};
+    ws_identity.interval.layer = args.matmul_layer.c_str();
+    if (const auto run_id = matmul_cpu_run_id(args)) {
+        ws_identity.identity_mask |= GEMMINI_CYCLE_HAS_RUN_ID;
+        ws_identity.run_id = *run_id;
     }
-    return MatMulStatus::invalid_state;
-}
-
-MatMulStatus execute_dense(ggml_gemmini_args_t &args) {
+    if (stripe_id) {
+        ws_identity.identity_mask |= GEMMINI_CYCLE_HAS_STRIPE_ID;
+        ws_identity.stripe_id = *stripe_id;
+    }
+    const log::ScopedWsCycleIdentity ws_scope(ws_identity, "gemmini_hw_dense");
+#else
+    (void) stripe_id;
+#endif
+    const auto cpu_start = read_matmul_cpu_sample();
+    const auto status = [&]() -> MatMulStatus {
     if (args.A_fp32 != nullptr || args.B_fp32 != nullptr) {
         if (args.A_fp32 == nullptr || args.B_fp32 == nullptr || args.f_out == nullptr) {
             return MatMulStatus::invalid_contract;
@@ -823,16 +896,42 @@ MatMulStatus execute_dense(ggml_gemmini_args_t &args) {
     }
     test_detail::observe_backend_dispatch(args.tiled_matmul_type == CPU);
     if (uses_baseline_channel_route(args)) {
-        return physical_dense_status(tiled_matmul_auto_baseline(
-            &args, baseline_activation_for(args),
-            baseline_weight_quant_t::CHANNEL));
+        tiled_matmul_auto_baseline(&args, baseline_activation_for(args),
+                                   baseline_weight_quant_t::CHANNEL);
     } else if (args.weight_i8_scale_active) {
-        return physical_dense_status(tiled_matmul_auto_baseline(
-            &args, baseline_activation_for(args),
-            baseline_weight_quant_t::TENSOR));
+        tiled_matmul_auto_baseline(&args, baseline_activation_for(args),
+                                   baseline_weight_quant_t::TENSOR);
     } else {
-        return physical_dense_status(tiled_matmul_auto_im2p(&args));
+        using Format = ggml_gemmini_args_t::im2p_weight_format_t;
+        switch (args.weight_format) {
+            case Format::q8_h1:
+            case Format::q8_h2:
+            case Format::q8_hp1:
+            case Format::q8_hp2:
+                break;
+            case Format::q8_h0:
+            case Format::q8_channel:
+            case Format::q8_channel_dense_sidecar:
+            default:
+                return MatMulStatus::unsupported;
+        }
+        if (args.tiled_matmul_type != CPU && args.tiled_matmul_type != WS) {
+            return MatMulStatus::unsupported;
+        }
+        tiled_matmul_auto_im2p(&args);
     }
+    return MatMulStatus::success;
+    }();
+    const auto cpu_end = read_matmul_cpu_sample();
+    if (args.tiled_matmul_type == CPU || (args.A_fp32 != nullptr && args.B_fp32 != nullptr)) {
+        record_matmul_cpu_wall(cpu_start, cpu_end);
+    } else {
+#if LOG_CYCLE
+        // The backend call also contains device execution and waits.
+        performance::incomplete_cpu_wall("accelerator_cpu_stage_coverage_incomplete");
+#endif
+    }
+    return status;
 }
 
 MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe, size_t stripe_id,
@@ -872,9 +971,7 @@ MatMulStatus execute_stripe(ggml_gemmini_args_t args, MatMulStripe stripe, size_
     }
     args.f_out += output_offset;
 
-    (void) stripe_id;
-
-    return execute_dense(args);
+    return execute_dense(args, stripe_id);
 }
 
 MatmulStatus to_public_status(MatMulStatus status, MatMulCapability capability,
@@ -1237,6 +1334,7 @@ MatmulCapturedStripe capture_collector_event(
         MatmulCaptureTiming timing, std::optional<uint64_t> run_id) {
     run_id = matmul_cpu_run_id(event, run_id);
     MatmulCapturedStripe captured{};
+    captured.trace_origin = gemmini_trace_capture();
     captured.cpu_identity_mask = GEMMINI_CYCLE_HAS_STRIPE_ID;
     if (run_id.has_value())
         captured.cpu_identity_mask |= GEMMINI_CYCLE_HAS_RUN_ID | GEMMINI_CYCLE_HAS_SLOT;
@@ -1433,26 +1531,16 @@ MatMulStatus MatMul::begin_output_transaction() {
 
 void MatMul::commit_output_transaction() {
     if (output_destination_ == nullptr || args_ptr_ == nullptr) return;
-#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
-    const cycle::NativeCycleSample commit_start_sample = cycle::read_sample();
-    const uint64_t commit_start_ns = cycle::timestamp_ns();
-    const uint64_t commit_start_tid = cycle::host_thread_id();
-#endif
+    const auto commit_start = read_matmul_cpu_sample();
     for (size_t row = 0; row < args().I; ++row) {
         for (size_t column = 0; column < args().J; ++column) {
             const size_t offset = row * output_row_stride_ + column * output_col_stride_;
             output_destination_[offset] = output_stage_[offset];
         }
     }
-#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
-    const cycle::NativeCycleSample commit_end_sample = cycle::read_sample();
-    const uint64_t commit_end_ns = cycle::timestamp_ns();
-    const uint64_t commit_end_tid = cycle::host_thread_id();
-    emit_matmul_native_interval(args().matmul_layer.c_str(), "matmul_output_commit_cycles",
-        commit_start_sample, commit_end_sample,
-        commit_start_ns, commit_end_ns, commit_start_tid, commit_end_tid,
-        true, nullptr, matmul_cpu_run_id(args()));
-#endif
+    const auto commit_end = read_matmul_cpu_sample();
+    emit_matmul_cpu_interval(args().matmul_layer.c_str(), "matmul_output_commit_cycles",
+        commit_start, commit_end, true, nullptr, nullptr, matmul_cpu_run_id(args()));
     args().f_out = output_destination_;
     output_destination_ = nullptr;
     output_row_stride_ = 0;
@@ -1470,6 +1558,7 @@ void MatMul::discard_output_transaction() {
 }
 
 MatMulResult MatMul::run_dense() {
+    const MatmulCycleFlush flush;
     return run_dense(false);
 }
 
@@ -1569,6 +1658,7 @@ MatMulResult MatMul::run_dense(bool transactional) {
 }
 
 MatMulResult MatMul::run_full() {
+    const MatmulCycleFlush flush;
     const auto run_id = matmul_cpu_run_id(args());
     const auto dense_start = read_matmul_cpu_sample();
     const MatMulResult dense = run_dense(true);
@@ -1585,6 +1675,18 @@ MatMulResult MatMul::run_full() {
         for (const auto & payload : quants::activation_direct_residuals(args())) {
             if (payload == nullptr) continue;
             size_t row_end = 0;
+            rmd::RmdExecutionMetrics * measured = nullptr;
+#if LOG_CYCLE
+            MatmulJobMetrics profile;
+            profile.cpu_identity_mask = run_id ? GEMMINI_CYCLE_HAS_RUN_ID : 0;
+            profile.run_id = run_id.value_or(0);
+            profile.stripe_id = payload->stripe_id;
+            profile.row_begin = payload->row_begin;
+            profile.rmd.timing_identity = {{args().matmul_layer.c_str(), nullptr, 0, 0, nullptr, 0, nullptr},
+                profile.cpu_identity_mask | GEMMINI_CYCLE_HAS_STRIPE_ID,
+                profile.run_id, payload->stripe_id, 0, 0, 0};
+            measured = &profile.rmd;
+#endif
             rmd::Correction correction = rmd::BlockScaledInt64Correction{};
             residual_status = __builtin_add_overflow(
                 payload->row_begin, payload->row_count, &row_end)
@@ -1598,55 +1700,88 @@ MatMulResult MatMul::run_full() {
                     const auto backend_start = read_matmul_cpu_sample();
                     const auto status = residual::execute_direct_stripe(args(), *payload, correction, &direct_metrics);
                     const auto backend_end = read_matmul_cpu_sample();
+#if LOG_CYCLE
+                    profile.rmd.direct_call_count = direct_metrics.call_count;
+                    profile.rmd.direct_event_count = direct_metrics.event_count;
+#endif
+                    record_matmul_cpu_wall(backend_start, backend_end);
                     emit_matmul_cpu_interval(args().matmul_layer.c_str(), "residual_backend_host_call",
                         backend_start, backend_end, status == rmd::RmdStatus::success,
                         nullptr, nullptr, run_id);
                     return status;
                 })();
+#if LOG_CYCLE
+            profile.row_end = row_end;
+#endif
             if (residual_status == rmd::RmdStatus::success) {
-#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
-                const cycle::NativeCycleSample merge_start_sample = cycle::read_sample();
-                const uint64_t merge_start_ns = cycle::timestamp_ns();
-                const uint64_t merge_start_tid = cycle::host_thread_id();
+#if LOG_CYCLE
+                const auto observation_start = read_matmul_cpu_sample();
+                rmd::collect_direct_metrics(*payload, profile.rmd);
+                const auto observation_end = read_matmul_cpu_sample();
+                emit_matmul_cpu_interval(args().matmul_layer.c_str(), "residual_workload_observation",
+                    observation_start, observation_end, true, &profile);
 #endif
+                const auto merge_start = read_matmul_cpu_sample();
                 residual_status = rmd::merge_rmd_correction(
-                    args(), payload->row_begin, row_end, correction);
-#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
-                const cycle::NativeCycleSample merge_end_sample = cycle::read_sample();
-                const uint64_t merge_end_ns = cycle::timestamp_ns();
-                const uint64_t merge_end_tid = cycle::host_thread_id();
-                emit_matmul_native_interval(args().matmul_layer.c_str(), "rmd_merge_cycles",
-                    merge_start_sample, merge_end_sample,
-                    merge_start_ns, merge_end_ns, merge_start_tid, merge_end_tid,
-                    residual_status == rmd::RmdStatus::success,
-                    nullptr, run_id);
-#endif
+                    args(), payload->row_begin, row_end, correction, nullptr, measured);
+                const auto merge_end = read_matmul_cpu_sample();
+                record_matmul_cpu_wall(merge_start, merge_end);
+                emit_matmul_cpu_interval(args().matmul_layer.c_str(), "rmd_merge_cycles",
+                    merge_start, merge_end, residual_status == rmd::RmdStatus::success,
+                    nullptr, nullptr, run_id);
             }
+#if LOG_CYCLE
+            emit_rmd_stripe_metrics(args().matmul_layer, profile, RmdBackend::cpu_direct,
+                residual_status == rmd::RmdStatus::success, rmd::rmd_status_message(residual_status),
+                profile.rmd.residual_observations_valid ? &profile.rmd : nullptr);
+#endif
             if (residual_status != rmd::RmdStatus::success) break;
         }
     } else {
         rmd::detail::RmdWeightPreparation weights;
         for (const auto & packet : quants::activation_rmd_packets(args())) {
             if (packet == nullptr) continue;
+            rmd::RmdExecutionMetrics * measured = nullptr;
+#if LOG_CYCLE
+            MatmulJobMetrics profile;
+            profile.cpu_identity_mask = run_id ? GEMMINI_CYCLE_HAS_RUN_ID : 0;
+            profile.run_id = run_id.value_or(0);
+            profile.stripe_id = packet->stripe_id;
+            profile.row_begin = packet->row_begin;
+            profile.row_end = packet->row_begin + packet->row_count;
+            profile.rmd.timing_identity = {{args().matmul_layer.c_str(), nullptr, 0, 0, nullptr, 0, nullptr},
+                profile.cpu_identity_mask | GEMMINI_CYCLE_HAS_STRIPE_ID,
+                profile.run_id, packet->stripe_id, 0, 0, 0};
+            measured = &profile.rmd;
+#endif
             rmd::Correction correction = rmd::BlockScaledInt64Correction{};
             test_detail::observe_residual_dispatch();
             test_detail::observe_backend_dispatch(false);
             const auto backend_start = read_matmul_cpu_sample();
             residual_status = rmd::detail::execute_rmd_stripe_ws_with_weights(
-                args(), *packet, correction, weights);
+                args(), *packet, correction, weights, measured);
             const auto backend_end = read_matmul_cpu_sample();
+#if LOG_CYCLE
+            performance::incomplete_cpu_wall("accelerator_cpu_stage_coverage_incomplete");
+#endif
             emit_matmul_cpu_interval(args().matmul_layer.c_str(), "residual_backend_host_call",
                 backend_start, backend_end, residual_status == rmd::RmdStatus::success,
                 nullptr, nullptr, run_id);
             if (residual_status == rmd::RmdStatus::success) {
                 const auto merge_start = read_matmul_cpu_sample();
                 residual_status = rmd::detail::merge_rmd_correction_with_weights(
-                    args(), args().f_out, *packet, correction, weights);
+                    args(), args().f_out, *packet, correction, weights, nullptr, measured);
                 const auto merge_end = read_matmul_cpu_sample();
+                record_matmul_cpu_wall(merge_start, merge_end);
                 emit_matmul_cpu_interval(args().matmul_layer.c_str(), "output_correction_apply",
                     merge_start, merge_end, residual_status == rmd::RmdStatus::success,
                     nullptr, nullptr, run_id);
             }
+#if LOG_CYCLE
+            emit_rmd_stripe_metrics(args().matmul_layer, profile, RmdBackend::gemmini_ws_compact,
+                residual_status == rmd::RmdStatus::success, rmd::rmd_status_message(residual_status),
+                profile.rmd.residual_observations_valid ? &profile.rmd : nullptr);
+#endif
             if (residual_status != rmd::RmdStatus::success) break;
         }
     }
@@ -1668,6 +1803,7 @@ MatMulResult MatMul::run_full() {
         return { MatMulStatus::success, MatMulCapability::supported };
     }();
     const auto output_end = read_matmul_cpu_sample();
+    record_matmul_cpu_wall(output_start, output_end);
     emit_matmul_cpu_interval(args().matmul_layer.c_str(), "matmul_output_validation_and_publish",
         output_start, output_end, result.status == MatMulStatus::success, nullptr, nullptr, run_id);
     return result;
@@ -1794,6 +1930,7 @@ MatMulStatus MatMul::finish_stripes() {
     return MatMulStatus::success;
     }();
     const auto output_end = read_matmul_cpu_sample();
+    record_matmul_cpu_wall(output_start, output_end);
     emit_matmul_cpu_interval(args().matmul_layer.c_str(), "matmul_output_validation_and_publish",
         output_start, output_end, result == MatMulStatus::success,
         nullptr, nullptr, matmul_cpu_run_id(args()));
@@ -2171,7 +2308,11 @@ bool MatmulStripeCollector::start(MatmulExecution & execution) {
             }
         }
 #endif
-        worker_ = std::thread(&MatmulStripeCollector::worker_loop, this);
+        const auto submitted_context = gemmini_trace_capture();
+        worker_ = std::thread([this, submitted_context] {
+            trace::ScopedContext submission_scope(submitted_context);
+            worker_loop();
+        });
     } catch (const std::bad_alloc &) {
         return fail_start(make_status(
             MatmulStatusCode::out_of_memory, "collector startup allocation failed"));
@@ -2278,6 +2419,7 @@ void MatmulStripeCollector::release_in_flight_once(
         --in_flight_;
     }
     const auto release_end = read_matmul_cpu_sample();
+    record_matmul_cpu_wall(release_start, release_end);
     emit_matmul_cpu_interval(layer.c_str(), "collector_capacity_release",
         release_start, release_end, true, &context);
 }
@@ -2301,7 +2443,12 @@ MatmulStatus MatmulStripeCollector::finish() {
     }
     condition_.notify_all();
     if (worker_.joinable()) {
+        const auto join_start = read_matmul_cpu_sample();
         worker_.join();
+        const auto join_end = read_matmul_cpu_sample();
+        // This is the caller's wait interval, not the worker's execution cost.
+        emit_matmul_cpu_interval(layer.empty() ? nullptr : layer.c_str(),
+            "worker_join_wait", join_start, join_end, true, nullptr, nullptr, run_id);
     }
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -2336,6 +2483,10 @@ MatmulStatus MatmulStripeCollector::finish() {
 
 // One NPU stream: dense WS and RMD run back to back in this worker, in that order.
 void MatmulStripeCollector::worker_loop() {
+#if LOG_CYCLE
+    cycle::WorkerCpuTiming worker_cpu;
+    cycle::WorkerCpuTiming::observe(&worker_cpu, true);
+#endif
     try {
 #if defined(GGML_GEMMINI_TEST_OBSERVER)
         {
@@ -2353,25 +2504,48 @@ void MatmulStripeCollector::worker_loop() {
         for (;;) {
             CapturedStripe captured{};
             MatmulExecution * execution = nullptr;
+            MatmulCpuSample queue_wait_start, queue_wait_end;
+            const char * wait_layer = nullptr;
+            std::optional<uint64_t> wait_run_id;
+            bool queue_drained = false;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
+#if LOG_CYCLE
+                if (execution_ != nullptr) {
+                    // The execution owns this string until finish() joins us.
+                    wait_layer = execution_->facade_.args().matmul_layer.c_str();
+                    wait_run_id = matmul_cpu_run_id(execution_->facade_.args());
+                }
+#endif
+                queue_wait_start = read_matmul_cpu_sample();
                 condition_.wait(lock, [this] {
                     return stop_requested_ || (!pending_.empty() && in_flight_ < capacity_);
                 });
-                if (pending_.empty()) {
-                    break;
-                }
-                execution = execution_;
-                captured = std::move(pending_.front());
-                pending_.pop_front();
-                captured.timing.dequeued_ns = now_ns();
+                queue_wait_end = read_matmul_cpu_sample();
+                queue_drained = pending_.empty();
+                if (!queue_drained) {
+                    execution = execution_;
+                    captured = std::move(pending_.front());
+                    pending_.pop_front();
+                    captured.timing.dequeued_ns = now_ns();
 #if LOG_CYCLE
-                captured.timing.dequeue_tid = cycle::host_thread_id();
+                    captured.timing.dequeue_tid = cycle::host_thread_id();
+                    if ((captured.cpu_identity_mask & GEMMINI_CYCLE_HAS_RUN_ID) != 0)
+                        wait_run_id = captured.run_id;
 #endif
-                ++in_flight_;
-                condition_.notify_all();
+                    ++in_flight_;
+                    condition_.notify_all();
+                }
             }
+            // Publish after releasing the queue mutex; do not classify a wait
+            // as CPU-work wall time or subtract across the producer/worker.
+            emit_matmul_cpu_interval(wait_layer,
+                "worker_queue_wait", queue_wait_start, queue_wait_end, true,
+                nullptr, nullptr, wait_run_id);
+            if (queue_drained) break;
 
+            trace::ScopedContext stripe_task(captured.trace_origin, true);
+            trace::CpuStage stripe_lifetime(execution->facade_.args().matmul_layer.c_str(), "task.host_work");
             std::shared_ptr<MatmulStripeJob> job;
             const auto preparation_start = read_matmul_cpu_sample();
             try {
@@ -2400,6 +2574,7 @@ void MatmulStripeCollector::worker_loop() {
                 throw;
             }
             const auto preparation_end = read_matmul_cpu_sample();
+            record_matmul_cpu_wall(preparation_start, preparation_end);
             {
                 std::lock_guard<std::mutex> job_lock(*job->job_mutex_);
                 detail::apply_captured_stripe(captured, job->metrics_);
@@ -2480,6 +2655,12 @@ void MatmulStripeCollector::worker_loop() {
     } catch (const std::exception &) {
         fail(make_status(MatmulStatusCode::execution_failure, "collector worker thread failed"));
     }
+#if LOG_CYCLE
+    cycle::WorkerCpuTiming::observe(&worker_cpu, false);
+    const auto &args = execution_->facade_.args();
+    worker_cpu.emit(args.matmul_layer.c_str(), "gemmini.matmul_worker",
+                    matmul_cpu_run_id(args), status().ok());
+#endif
 }
 
 const quants::act::exsia::StripeReadySink * MatmulStripeCollector::sink() const {
@@ -2565,6 +2746,7 @@ MatmulDenseState MatmulStripeCollector::test_dense_state_at_release() const {
 
 bool MatmulStripeCollector::on_ready(
         void * user_data, const quants::act::exsia::StripeReadyEvent & event) {
+    if (event.collect_submission_timing) event.submission_wait_ns = 0;
     auto & collector = *static_cast<MatmulStripeCollector *>(user_data);
     if (event.row_begin >= event.row_end ||
         (event.activation_metadata.has_value() &&
@@ -2592,6 +2774,7 @@ bool MatmulStripeCollector::on_ready(
             collector.execution_ != nullptr ? matmul_cpu_run_id(collector.execution_->facade_.args())
                                             : std::nullopt);
         const auto capture_end = read_matmul_cpu_sample();
+        record_matmul_cpu_wall(capture_start, capture_end);
         record_metric(captured.timing.capture_copy, true, copy_start);
         MatmulJobMetrics context;
         context.cpu_identity_mask = captured.cpu_identity_mask;
@@ -2610,19 +2793,48 @@ bool MatmulStripeCollector::on_ready(
             return false;
         }
         if (collector.worker_started_) {
-            const auto wait_start = Clock::now();
-            const uint64_t producer_wait_start_ns = now_ns();
-            collector.condition_.wait(lock, [&collector] {
-                return collector.stop_requested_ || !collector.status_ ||
-                    collector.pending_.size() + collector.in_flight_ < collector.capacity_;
-            });
+            MatmulStageMetrics producer_wait;
+            uint64_t producer_wait_start_ns = 0;
+            uint64_t producer_wait_end_ns = 0;
+            if (collector.pending_.size() + collector.in_flight_ >= collector.capacity_) {
+                const auto wait_start = read_matmul_cpu_sample();
+                producer_wait_start_ns = now_ns();
+                collector.condition_.wait(lock, [&collector] {
+                    return collector.stop_requested_ || !collector.status_ ||
+                        collector.pending_.size() + collector.in_flight_ < collector.capacity_;
+                });
+                producer_wait_end_ns = now_ns();
+                const auto wait_end = read_matmul_cpu_sample();
+                producer_wait.nanoseconds = producer_wait_end_ns - producer_wait_start_ns;
+                producer_wait.count = 1;
+                if (event.collect_submission_timing)
+                    event.submission_wait_ns = producer_wait.nanoseconds;
+#if LOG_CYCLE
+                MatmulJobMetrics wait_context;
+                wait_context.cpu_identity_mask = GEMMINI_CYCLE_HAS_STRIPE_ID;
+                wait_context.stripe_id = event.stripe_id;
+                const auto run_id = matmul_cpu_run_id(event, collector.execution_ != nullptr ?
+                    matmul_cpu_run_id(collector.execution_->facade_.args()) : std::nullopt);
+                if (run_id.has_value()) {
+                    wait_context.cpu_identity_mask |= GEMMINI_CYCLE_HAS_RUN_ID | GEMMINI_CYCLE_HAS_SLOT;
+                    wait_context.run_id = *run_id;
+                    wait_context.slot = event.slot;
+                }
+                // Retain the caller's completed sample even when cancellation
+                // prevents the pending stripe from being admitted afterward.
+                emit_matmul_cpu_interval(collector.execution_ != nullptr ?
+                    collector.execution_->facade_.args().matmul_layer.c_str() : nullptr,
+                    "producer_capacity_wait", wait_start, wait_end,
+                    collector.status_.ok() && !collector.stop_requested_, &wait_context);
+#else
+                (void) wait_start; (void) wait_end;
+#endif
+            }
             if (collector.stop_requested_ || !collector.status_) {
                 return false;
             }
-            MatmulStageMetrics producer_wait;
-            record_metric(producer_wait, true, wait_start);
             CapturedStripe captured = make_captured(
-                capture_copy, producer_wait, producer_wait_start_ns, now_ns());
+                capture_copy, producer_wait, producer_wait_start_ns, producer_wait_end_ns);
             const auto insert_start = Clock::now();
             collector.pending_.push_back(std::move(captured));
             record_metric(collector.pending_.back().timing.queue_insert, true, insert_start);
@@ -3094,6 +3306,9 @@ MatmulStatus execute_rmd_stripe(MatmulStripeJob & job) {
         direct = job.direct_residual_;
         packet = job.rmd_packet_;
         job.residual_state_ = MatmulResidualState::running;
+        job.metrics_.stripe_id = job.input_.stripe_id();
+        job.metrics_.row_begin = job.input_.row_begin();
+        job.metrics_.row_end = job.input_.row_end();
         job.metrics_.rmd_start_ns = now_ns();
         if (job.execution_->options_.profiling && job.rmd_queued_ns_ != 0) {
             job.metrics_.rmd_queue.nanoseconds = job.metrics_.rmd_start_ns - job.rmd_queued_ns_;
@@ -3105,6 +3320,14 @@ MatmulStatus execute_rmd_stripe(MatmulStripeJob & job) {
         if (!job.status_) return job.status_;
         job.rmd_correction_ = rmd::BlockScaledInt64Correction{};
         job.rmd_correction_ready_ = true;
+        job.metrics_.rmd.residual_observations_valid = true;
+        job.metrics_.rmd.active_original_rows_valid = true;
+        job.metrics_.rmd.digit_bits = GGML_GEMMINI_ACTIVATION_BITS;
+        job.metrics_.rmd.original_rows = job.input_.row_end() - job.input_.row_begin();
+        job.metrics_.rmd.logical_k = job.execution_->facade_.args().K;
+        job.metrics_.rmd.logical_j = job.execution_->facade_.args().J;
+        job.metrics_.rmd.array_dim = rmd::kArrayDim;
+        job.metrics_.rmd.original_rows_after_pruning = job.metrics_.rmd.original_rows;
         job.metrics_.cpu_prep = MatmulCpuInterval::unavailable("not_applicable");
         job.metrics_.cpu_backend = MatmulCpuInterval::unavailable("not_applicable");
         job.metrics_.cpu_merge = MatmulCpuInterval::unavailable("not_applicable");
@@ -3118,6 +3341,10 @@ MatmulStatus execute_rmd_stripe(MatmulStripeJob & job) {
     const auto residual_start = read_matmul_cpu_sample();
     rmd::Correction correction = rmd::BlockScaledInt64Correction{};
     rmd::RmdExecutionMetrics metrics{};
+    metrics.timing_identity = {{job.execution_->facade_.args().matmul_layer.c_str(), nullptr,
+        0, 0, nullptr, 0, nullptr},
+        job.metrics_.cpu_identity_mask | GEMMINI_CYCLE_HAS_STRIPE_ID,
+        job.metrics_.run_id, job.input_.stripe_id(), job.metrics_.slot, 0, 0};
     rmd::detail::RmdWeightPreparation * weights = nullptr;
     if (packet != nullptr) {
         try {
@@ -3144,6 +3371,23 @@ MatmulStatus execute_rmd_stripe(MatmulStripeJob & job) {
         : rmd::detail::execute_rmd_stripe_ws_with_weights(
               job.execution_->facade_.args(), *packet, correction, *weights, &metrics);
     const auto backend_end = read_matmul_cpu_sample();
+#if LOG_CYCLE
+    if (direct != nullptr && status == rmd::RmdStatus::success) {
+        const auto metrics_start = read_matmul_cpu_sample();
+        rmd::collect_direct_metrics(*direct, metrics);
+        const auto metrics_end = read_matmul_cpu_sample();
+        emit_matmul_cpu_interval(job.execution_->facade_.args().matmul_layer.c_str(),
+            "residual_workload_observation", metrics_start, metrics_end, true, &job.metrics_);
+    }
+#endif
+    record_matmul_cpu_wall(residual_start, backend_start);
+    if (direct != nullptr) {
+        record_matmul_cpu_wall(backend_start, backend_end);
+    } else {
+#if LOG_CYCLE
+        performance::incomplete_cpu_wall("accelerator_cpu_stage_coverage_incomplete");
+#endif
+    }
     metrics.direct_event_count = direct_metrics.event_count;
     metrics.direct_call_count = direct_metrics.call_count;
     {
@@ -3163,6 +3407,9 @@ MatmulStatus execute_rmd_stripe(MatmulStripeJob & job) {
         "residual_backend_host_call", backend_start, backend_end,
         status == rmd::RmdStatus::success, &job.metrics_);
     if (status != rmd::RmdStatus::success) {
+        emit_rmd_stripe_metrics(job.execution_->facade_.args().matmul_layer,
+            job.metrics_, job.execution_->options_.rmd_backend, false,
+            rmd::rmd_status_message(status), nullptr);
         const MatmulStatus failure = from_rmd_status(status);
         job.record_failure(failure, false);
         return failure;
@@ -3224,13 +3471,9 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
         completion_context.slot = job.metrics_.slot;
         layer = job.execution_->facade_.args().matmul_layer;
         job.finalized_ = true;
-#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
-        job.metrics_.telemetry_finalize_start_sample = cycle::read_sample();
-#endif
-        job.metrics_.finalize_start_ns = now_ns();
-#if LOG_CYCLE
-        job.metrics_.finalize_start_tid = cycle::host_thread_id();
-#endif
+        const auto finalize_start = read_matmul_cpu_sample();
+        job.metrics_.finalize_start_ns = finalize_start.ns;
+        job.metrics_.finalize_start_tid = finalize_start.tid;
         job.metrics_.stripe_id = job.input_.stripe_id();
         job.metrics_.row_begin = job.input_.row_begin();
         job.metrics_.row_end = job.input_.row_end();
@@ -3241,11 +3484,12 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
             const rmd::RmdStatus status = job.direct_residual_ != nullptr
                 ? rmd::merge_rmd_correction(
                       job.execution_->facade_.args(), job.input_.row_begin(),
-                      job.input_.row_end(), job.rmd_correction_, &correction_nonzero_count)
+                      job.input_.row_end(), job.rmd_correction_, &correction_nonzero_count,
+                      &job.metrics_.rmd)
                 : rmd::detail::merge_rmd_correction_with_weights(
                       job.execution_->facade_.args(), job.execution_->facade_.args().f_out,
                       *job.rmd_packet_, job.rmd_correction_, *job.execution_->rmd_weights_,
-                      &correction_nonzero_count);
+                      &correction_nonzero_count, &job.metrics_.rmd);
             merge_end = read_matmul_cpu_sample();
             job.metrics_.merge_start_ns = merge_start.ns;
             job.metrics_.merge_end_ns = merge_end.ns;
@@ -3289,35 +3533,30 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
             job.metrics_.cpu_merge = MatmulCpuInterval::unavailable("not_applicable");
         }
         record_metric(job.metrics_.rmd_finalize, job.execution_->options_.profiling, start);
-        job.metrics_.finalize_end_ns = now_ns();
-#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
-        job.metrics_.telemetry_finalize_end_sample = cycle::read_sample();
-#endif
-#if LOG_CYCLE
-        job.metrics_.finalize_end_tid = cycle::host_thread_id();
-#endif
-#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
-        emit_matmul_native_interval(layer.c_str(),
+        const auto finalize_end = read_matmul_cpu_sample();
+        job.metrics_.finalize_end_ns = finalize_end.ns;
+        job.metrics_.finalize_end_tid = finalize_end.tid;
+        emit_matmul_cpu_interval(layer.c_str(),
             job.direct_residual_ != nullptr ? "rmd_cpu_direct_finalize_cycles" :
                 (job.rmd_packet_ != nullptr ? "rmd_packet_finalize_cycles" : "dense_finalize_cycles"),
-            job.metrics_.telemetry_finalize_start_sample,
-            job.metrics_.telemetry_finalize_end_sample,
-            job.metrics_.finalize_start_ns, job.metrics_.finalize_end_ns,
-            job.metrics_.finalize_start_tid, job.metrics_.finalize_end_tid,
-            merge_failure.ok(), &completion_context);
-#endif
+            finalize_start, finalize_end, merge_failure.ok(), &completion_context);
     }
     // Publish children after the legacy inclusive end, without summing nested work.
     if (merged) {
+        record_matmul_cpu_wall(merge_start, merge_end);
+        record_matmul_cpu_wall(stats_start, stats_end);
         emit_matmul_cpu_interval(layer.c_str(), "output_correction_apply", merge_start, merge_end,
                                  merge_failure.ok(), &completion_context);
         emit_matmul_cpu_interval(layer.c_str(), "telemetry_stats_compute", stats_start, stats_end,
                                  true, &completion_context);
         if (hash_start.collected) {
+            record_matmul_cpu_wall(hash_start, hash_end);
             emit_matmul_cpu_interval(layer.c_str(), "telemetry_hash_compute", hash_start, hash_end,
                                      true, &completion_context);
         }
     }
+    emit_rmd_stripe_metrics(layer, job.metrics_, job.execution_->options_.rmd_backend,
+        merge_failure.ok(), merge_failure.ok() ? "none" : "correction_merge_failed", &job.metrics_.rmd);
     if (!merge_failure.ok()) {
         job.record_failure(merge_failure, false);
         return merge_failure;
@@ -3330,12 +3569,14 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
     job.release_slot();
     job.lifecycle_condition_.notify_all();
     const auto completion_end = read_matmul_cpu_sample();
+    record_matmul_cpu_wall(completion_start, completion_end);
     emit_matmul_cpu_interval(layer.c_str(), "stripe_completion_bookkeeping",
         completion_start, completion_end, true, &completion_context);
     return {};
 }
 
 MatmulStatus finish_execution(MatmulExecution & execution) {
+    const MatmulCycleFlush flush;
     const auto finish_start = read_matmul_cpu_sample();
     const auto result = [&]() -> MatmulStatus {
     std::lock_guard<std::mutex> state_lock(*execution.state_mutex_);

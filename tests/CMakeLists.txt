@@ -220,11 +220,20 @@ add_test(NAME test-gemmini-log-boundary
     COMMAND $<TARGET_FILE:test-gemmini-log-boundary>)
 add_executable(test-gemmini-host-timing test-gemmini-host-timing.cpp)
 find_package(Threads REQUIRED)
+target_link_libraries(test-gemmini-log-boundary PRIVATE Threads::Threads)
 target_link_libraries(test-gemmini-host-timing PRIVATE ggml-gemmini-utils Threads::Threads)
 target_compile_features(test-gemmini-host-timing PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-host-timing PRIVATE
     EXPECT_LOG_CYCLE=$<IF:$<BOOL:${LOG_CYCLE}>,1,0>)
 add_test(NAME test-gemmini-host-timing COMMAND $<TARGET_FILE:test-gemmini-host-timing>)
+add_executable(test-gemmini-trace-context test-gemmini-trace-context.cpp)
+target_link_libraries(test-gemmini-trace-context PRIVATE ggml-gemmini-utils Threads::Threads)
+target_compile_features(test-gemmini-trace-context PRIVATE cxx_std_17)
+target_compile_definitions(test-gemmini-trace-context PRIVATE
+    EXPECT_LOG_CYCLE=$<IF:$<BOOL:${LOG_CYCLE}>,1,0>)
+add_test(NAME test-gemmini-trace-context COMMAND $<TARGET_FILE:test-gemmini-trace-context>
+    ${CMAKE_CURRENT_BINARY_DIR}/trace-context)
+
 find_package(Python3 3.9 COMPONENTS Interpreter QUIET)
 if (Python3_Interpreter_FOUND)
     add_test(NAME test-host-overlap
@@ -281,6 +290,10 @@ if (UNIX AND BUILD_SHARED_LIBS AND LOG_CYCLE AND TARGET ggml-gemmini)
             ${CMAKE_CURRENT_BINARY_DIR}/gemmini-log-cross-image/cycle-log.jsonl
             ${CMAKE_CURRENT_BINARY_DIR}/gemmini-log-cross-image/stderr.txt)
 endif()
+# CPU-only builds retain the common logger, host timing and CPU-operator tests
+# above, but do not create fixtures that require the absent Gemmini backend or
+# its generated profile helper functions.
+if (TARGET ggml-gemmini)
 # Direct backend symbols require a linkable backend, not a dlopen MODULE.
 if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-gemmini-weight-formats.cpp NAME gemmini_weight_formats)
@@ -552,6 +565,10 @@ add_test(NAME gemmini_direct_metrics_source_contract
         -DTEST_CMAKE=${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
         -DPROJECT_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/..
         -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-direct-metrics-source-contract.cmake)
+# These fixtures deliberately compile the ExSIA profiling implementation with
+# LOG_CYCLE=1/CYCLE_DETAIL=1 and assert both main and detail sink records. They
+# must not link against an OFF logger; OFF behavior is tested by the log suite.
+if (LOG_CYCLE AND CYCLE_DETAIL)
 foreach(_worker_count IN ITEMS 3 4)
     add_executable(test-gemmini-exsia-workers${_worker_count}
         test-gemmini-exsia-profile.cpp
@@ -628,6 +645,7 @@ foreach(_worker_count IN ITEMS 3 4)
     add_test(NAME test-gemmini-exsia-workers${_worker_count}
         COMMAND $<TARGET_FILE:test-gemmini-exsia-workers${_worker_count}>)
 endforeach()
+endif()
 add_test(NAME test-gemmini-exsia-profile-contract
     COMMAND ${CMAKE_COMMAND}
         -DEXSIA_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp
@@ -735,6 +753,7 @@ if (NOT GGML_BACKEND_DL)
     target_link_libraries(test-gemmini-rmd PRIVATE ggml-base ggml-gemmini ggml-gemmini-utils)
     target_compile_features(test-gemmini-rmd PRIVATE cxx_std_17)
     target_compile_definitions(test-gemmini-rmd PRIVATE
+        LOG_CYCLE=${LOG_CYCLE}
         GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
         GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE})
     if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "FPGA_UART")
@@ -813,8 +832,10 @@ target_compile_definitions(test-gemmini-production-host-backend PRIVATE
     GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
     GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE})
 target_include_directories(test-gemmini-production-host-backend PRIVATE
+    ../ggml/include
     ../ggml/src
     ../ggml/src/ggml-gemmini
+    ../ggml/src/ggml-gemmini-utils/include
     ${GGML_GEMMINI_GENERATED_CONFIG_DIR}
     ${GEMMINI_SW_PATH}
     ${GEMMINI_SW_PATH}/include)
@@ -837,8 +858,16 @@ if (NOT GGML_BACKEND_DL)
     target_include_directories(test-gemmini-rmd-telemetry PRIVATE
         ../ggml/include ../ggml/src ../ggml/src/ggml-gemmini
         ../ggml/src/ggml-gemmini-utils/include ${GGML_GEMMINI_GENERATED_CONFIG_DIR}
-        ${IM2P_SIM_ROOT}/frontend/include ${IM2P_SIM_ROOT}/sim/include
         ${GEMMINI_SW_PATH} ${GEMMINI_SW_PATH}/include)
+    # Plain HARDWARE/CPU builds do not compile the IM2P adapter and must not
+    # require simulator headers merely to test the common telemetry schema.
+    if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" OR
+        GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "FPGA_UART")
+        target_compile_definitions(test-gemmini-rmd-telemetry PRIVATE
+            GGML_GEMMINI_TELEMETRY_HAS_IM2P=1)
+        target_include_directories(test-gemmini-rmd-telemetry PRIVATE
+            ${IM2P_SIM_ROOT}/frontend/include ${IM2P_SIM_ROOT}/sim/include)
+    endif()
     add_test(NAME test-gemmini-rmd-telemetry
         COMMAND $<TARGET_FILE:test-gemmini-rmd-telemetry>)
     add_test(NAME test-gemmini-aggregate-cycle-driver
@@ -1128,6 +1157,8 @@ if (NOT GGML_BACKEND_DL)
     add_test(NAME test-gemmini-buffer-artifacts COMMAND $<TARGET_FILE:test-gemmini-buffer-artifacts>)
 endif()
 
+endif() # TARGET ggml-gemmini
+
 llama_build_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_build_and_test(test-autorelease.cpp        LABEL "model")
 
@@ -1139,6 +1170,7 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-rope.cpp)
 endif()
 
+if (TARGET ggml-gemmini)
 add_executable(gemmini-quant-dispatch-smoke
     gemmini-quant-dispatch-smoke.cpp
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
@@ -1193,11 +1225,18 @@ add_test(NAME test-gemmini-profiled-domain-contract
         -DGEMMINI_SOURCE_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-gemmini
         -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-profiled-domain-contract.cmake)
 
+endif() # TARGET ggml-gemmini
+
 # Keep the executable side of Gemmini's CTest registration explicit. Building
 # this target before CTest prevents a stale tree from hiding missing artifacts.
 set(_GEMMINI_REGISTERED_TEST_EXECUTABLES
     test-gemmini-log
-    test-gemmini-log-boundary
+    test-gemmini-host-timing
+    test-gemmini-trace-context
+    test-gemmini-log-boundary)
+if (TARGET ggml-gemmini)
+list(APPEND _GEMMINI_REGISTERED_TEST_EXECUTABLES
+    test-gemmini-rmd-capture
     test-gemmini-act-quant-i32-saturation
     test-gemmini-exsia
     test-gemmini-exsia-writer
@@ -1205,7 +1244,14 @@ set(_GEMMINI_REGISTERED_TEST_EXECUTABLES
     test-gemmini-production-host-backend
     test-gemmini-rmd-reducer
     gemmini-quant-dispatch-smoke)
+endif()
 foreach(_GEMMINI_OPTIONAL_TEST_EXECUTABLE IN ITEMS
+        test-gemmini-exsia-workers3
+        test-gemmini-exsia-workers4
+        test-gemmini-block-quant
+        test-gemmini-block-dense
+        test-gemmini-block-end-to-end
+        test-gemmini-cycle-reader-aarch64
         gemmini_weight_formats
         test-gemmini-rmd
         test-gemmini-rmd-telemetry
@@ -1252,7 +1298,7 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 
 # This test deliberately links no simulator archive: injected compact execution
 # must work with a null simulator and reject incomplete or duplicate outputs.
-if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "FPGA_UART")
+if (TARGET ggml-gemmini AND GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "FPGA_UART")
     add_executable(test-gemmini-rmd-executor
         test-gemmini-rmd-executor.cpp
         ../ggml/src/ggml-gemmini/residual/rmd/rmd-im2p-executor.cpp)

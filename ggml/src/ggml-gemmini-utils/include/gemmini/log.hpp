@@ -29,14 +29,20 @@
 #pragma once
 
 #include "log.h"
+#include "cpu-timing.h"
 
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
+
+namespace ggml::gemmini::performance { struct Measurement; }
 
 #ifndef LOG_DEBUG
 #define LOG_DEBUG 0
@@ -95,6 +101,7 @@ namespace ggml::gemmini::log
         FILE *select_output_unlocked(const char *path, bool *owns) const;
         void close_owned_unlocked();
         void disable_output_unlocked();
+        bool owns_output_unlocked() const { return owns_; }
 
         FILE *out_;
 
@@ -139,6 +146,24 @@ namespace ggml::gemmini::log
         uint64_t gemmini_outer_j = 0;
         uint64_t gemmini_outer_k = 0;
         uint64_t ws_inner_calls = 0;
+        gemmini_cycle_record_v2 identity{};
+        const char *domain = "gemmini_hw_unknown";
+        const char *containing_interval_source = nullptr;
+    };
+
+    class ScopedWsCycleIdentity
+    {
+    public:
+        ScopedWsCycleIdentity(gemmini_cycle_record_v2 identity, const char *domain) noexcept;
+        ~ScopedWsCycleIdentity() noexcept;
+        ScopedWsCycleIdentity(const ScopedWsCycleIdentity &) = delete;
+        ScopedWsCycleIdentity &operator=(const ScopedWsCycleIdentity &) = delete;
+
+        const gemmini_cycle_record_v2 identity;
+        const char *const domain;
+
+    private:
+        const ScopedWsCycleIdentity *previous_;
     };
 
     std::string serialize_cycle_record(const CycleRecord &record);
@@ -210,12 +235,30 @@ namespace ggml::gemmini::log
     {
     public:
         explicit CycleLog(FILE *out = stderr) : Log(out) {}
+        ~CycleLog() override;
         void set_output(FILE *out);
         bool set_output_path(const char *path, bool truncate = false);
+        // Opt in to bounded worker buffers for owned regular files; flush at operation/run end.
+        void set_buffered(bool buffered);
+        bool flush();
+        bool healthy() const;
+        std::filesystem::path output_path() const;
 
         void write(const CycleRecord &record);
         void write_json(std::string_view json_record);
+        void write_cpu(const gemmini_cycle_record_v2 &identity,
+                       const gemmini_cpu_sample &start, const gemmini_cpu_sample &end,
+                       std::optional<bool> operation_success = {}, bool raw_segment = false);
+        void write_measurement(const performance::Measurement &measurement);
         void report_failure(const char * operation) noexcept;
+
+        struct BufferStats
+        {
+            std::size_t workers, peak_entries, peak_bytes;
+            static constexpr std::size_t max_entries = 128;
+            static constexpr std::size_t max_bytes = 256 * 1024;
+        };
+        BufferStats buffer_stats_for_test() const;
 
         void operator()(const char *layer, const char *op,
                         uint64_t start, uint64_t end);
@@ -230,11 +273,28 @@ namespace ggml::gemmini::log
                    uint64_t start, uint64_t end);
 
     private:
+        struct Entry;
+        struct WorkerBuffer;
+        void submit(Entry entry, const char *path = nullptr);
+        bool enqueue(Entry &entry);
         void emit(const char *path, const std::string &json);
+        bool emit_unlocked(const char *path, const std::string &json, CycleWriteTiming *timing = nullptr);
+        bool drain_worker_unlocked(WorkerBuffer &worker);
+        bool drain_unlocked();
+        void update_queue_enabled_unlocked();
+        bool flush_unlocked();
         void warn_once_unlocked(const char *operation);
 
+        bool buffered_ = false;
+        bool regular_output_ = false;
         bool disabled_ = false;
         bool warned_ = false;
+        bool lost_records_ = false;
+        std::atomic<bool> queue_enabled_{false};
+        std::filesystem::path output_path_;
+        std::vector<WorkerBuffer *> workers_;
+        std::size_t peak_entries_ = 0;
+        std::size_t peak_bytes_ = 0;
     };
 
     namespace testing

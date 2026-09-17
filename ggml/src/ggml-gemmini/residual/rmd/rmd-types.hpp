@@ -182,6 +182,13 @@ struct StripePacket {
     ActivationPayload stacked_activation;
     size_t activation_value_count = 0; // decoded values, including DIM padding
     size_t residual_event_count = 0;   // nonzero source residuals before radix expansion
+    int32_t residual_min = 0;
+    int32_t residual_max = 0;
+    uint8_t required_planes = 0; // highest required signed digit index plus one
+    size_t digit_nnz = 0;
+    size_t active_original_rows = 0;
+    bool active_original_rows_valid = false;
+    bool residual_observations_valid = false;
 
     size_t total_output_values = 0;
 };

@@ -1,4 +1,4 @@
-#include <gemmini/cycle_reader.h>
+#include <gemmini/cpu-timing.h>
 #include <gemmini/layer.h>
 #include <gemmini/log.h>
 
@@ -444,6 +444,10 @@ struct ggml_threadpool {
     struct ggml_cgraph * cgraph;
     struct ggml_cplan  * cplan;
     uint64_t cycle_run_id;
+#if CYCLE_LOG
+    gemmini_trace_context trace_origin;
+    uint64_t trace_operator_base;
+#endif
 
     // synchronization primitives
     atomic_int n_graph;       // incremented when there is work to be done (i.e each graph)
@@ -476,6 +480,9 @@ struct ggml_compute_state {
 #endif
     struct ggml_threadpool * threadpool;
     int ith;
+#if CYCLE_LOG
+    gemmini_cpu_totals cpu_totals;
+#endif
 };
 
 // Helpers for polling loops
@@ -530,7 +537,7 @@ static struct ggml_state g_state = {0};
 static atomic_uint_fast64_t ggml_cpu_cycle_run_id = 0;
 #endif
 
-void ggml_barrier(struct ggml_threadpool * tp) {
+static void ggml_barrier_impl(struct ggml_threadpool * tp) {
     int n_threads = atomic_load_explicit(&tp->n_threads_cur, memory_order_relaxed);
     if (n_threads == 1) {
         return;
@@ -565,6 +572,36 @@ void ggml_barrier(struct ggml_threadpool * tp) {
     #else
     atomic_thread_fence(memory_order_seq_cst);
     #endif
+#endif
+}
+
+void ggml_barrier(struct ggml_threadpool * tp) {
+#if CYCLE_LOG
+    const gemmini_trace_context context = gemmini_trace_capture();
+    const uint64_t run_id = tp->cycle_run_id;
+    const bool measure = context.task_id != 0 &&
+        atomic_load_explicit(&tp->n_threads_cur, memory_order_relaxed) > 1;
+    const gemmini_cpu_sample start = measure ? gemmini_cpu_timing_read() : (gemmini_cpu_sample) {0};
+#endif
+    ggml_barrier_impl(tp);
+#if CYCLE_LOG
+    if (measure) {
+        const gemmini_cpu_sample end = gemmini_cpu_timing_read();
+        gemmini_cycle_record_v2 identity = {
+            .interval = {.layer = "cpu.operator", .op = "barrier.wait"},
+            .identity_mask = GEMMINI_CYCLE_HAS_RUN_ID,
+            .run_id = run_id,
+        };
+        if (context.flags & GEMMINI_TRACE_OPERATOR) {
+            identity.identity_mask |= GEMMINI_CYCLE_HAS_NODE_ID;
+            identity.node_id = context.node_id;
+        }
+        if (context.flags & GEMMINI_TRACE_WORKER) {
+            identity.identity_mask |= GEMMINI_CYCLE_HAS_WORKER_ID;
+            identity.worker_id = context.worker_id;
+        }
+        gemmini_cpu_timing_record_segment(&identity, &start, &end);
+    }
 #endif
 }
 
@@ -1726,13 +1763,11 @@ static void ggml_compute_forward_mul_mat_id(
 #if CYCLE_LOG
 static inline void ggml_log_cpu_cycle(const struct ggml_compute_params * params,
                                       const char *layer, const char *op,
-                                      uint64_t start, uint64_t end) {
+                                      const gemmini_cpu_sample *start, const gemmini_cpu_sample *end) {
     const gemmini_cycle_record_v2 record = {
         .interval = {
             .layer = layer,
             .op = op,
-            .start = start,
-            .end = end,
         },
         .identity_mask = GEMMINI_CYCLE_HAS_RUN_ID |
                          GEMMINI_CYCLE_HAS_NODE_ID |
@@ -1741,11 +1776,11 @@ static inline void ggml_log_cpu_cycle(const struct ggml_compute_params * params,
         .node_id = params->node_id,
         .worker_id = (uint64_t) params->ith,
     };
-    gemmini_log_cycle_record_v2(&record);
+    gemmini_cpu_timing_record(&record, start, end);
 }
 
 #define gemmini_log_cycle(layer, op, start, end) \
-    ggml_log_cpu_cycle(params, layer, op, start, end)
+    ggml_log_cpu_cycle(params, layer, op, &(start), &(end))
 #endif
 
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
@@ -1761,8 +1796,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     }
 
     #if CYCLE_LOG
-    // cycle var
-    uint64_t start, end;
+    gemmini_cpu_sample start, end;
     // layer name
     char layer[GGML_MAX_NAME];
     gemmini_get_layer(tensor->name, layer, sizeof(layer));
@@ -1772,693 +1806,693 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_DUP:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_dup(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.dup", start, end);
                 #endif
             } break;
         case GGML_OP_ADD:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_add(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.add", start, end);
                 #endif
             } break;
         case GGML_OP_ADD1:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_add1(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.add1", start, end);
                 #endif
             } break;
         case GGML_OP_ACC:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_acc(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.acc", start, end);
                 #endif
             } break;
         case GGML_OP_SUB:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_sub(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.sub", start, end);
                 #endif
             } break;
         case GGML_OP_MUL:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_mul(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.mul", start, end);
                 #endif
             } break;
         case GGML_OP_DIV:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_div(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.div", start, end);
                 #endif
             } break;
         case GGML_OP_SQR:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_sqr(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.sqr", start, end);
                 #endif
             } break;
         case GGML_OP_SQRT:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_sqrt(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.sqrt", start, end);
                 #endif
             } break;
         case GGML_OP_LOG:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_log(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.log", start, end);
                 #endif
             } break;
         case GGML_OP_SIN:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_sin(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.sin", start, end);
                 #endif
             } break;
         case GGML_OP_COS:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_cos(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.cos", start, end);
                 #endif
             } break;
         case GGML_OP_SUM:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_sum(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.sum", start, end);
                 #endif
             } break;
         case GGML_OP_SUM_ROWS:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_sum_rows(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.sum_rows", start, end);
                 #endif
             } break;
         case GGML_OP_MEAN:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_mean(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.mean", start, end);
                 #endif
             } break;
         case GGML_OP_ARGMAX:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_argmax(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.argmax", start, end);
                 #endif
             } break;
         case GGML_OP_COUNT_EQUAL:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_count_equal(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.count_equal", start, end);
                 #endif
             } break;
         case GGML_OP_REPEAT:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_repeat(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.repeat", start, end);
                 #endif
             } break;
         case GGML_OP_REPEAT_BACK:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_repeat_back(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.repeat_back", start, end);
                 #endif
             } break;
         case GGML_OP_CONCAT:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_concat(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.concat", start, end);
                 #endif
             } break;
         case GGML_OP_SILU_BACK:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_silu_back(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.silu_back", start, end);
                 #endif
             } break;
         case GGML_OP_NORM:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_norm(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.norm", start, end);
                 #endif
             } break;
         case GGML_OP_RMS_NORM:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_rms_norm(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.rms_norm", start, end);
                 #endif
             } break;
         case GGML_OP_RMS_NORM_BACK:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_rms_norm_back(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.rms_norm_back", start, end);
                 #endif
             } break;
         case GGML_OP_GROUP_NORM:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_group_norm(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.group_norm", start, end);
                 #endif
             } break;
         case GGML_OP_L2_NORM:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_l2_norm(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.l2_norm", start, end);
                 #endif
             } break;
         case GGML_OP_MUL_MAT:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_mul_mat(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.mul_mat", start, end);
                 #endif
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_mul_mat_id(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.mul_mat_id", start, end);
                 #endif
             } break;
         case GGML_OP_OUT_PROD:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_out_prod(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.out_prod", start, end);
                 #endif
             } break;
         case GGML_OP_SCALE:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_scale(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.scale", start, end);
                 #endif
             } break;
         case GGML_OP_SET:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_set(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.set", start, end);
                 #endif
             } break;
         case GGML_OP_CPY:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_cpy(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.cpy", start, end);
                 #endif
             } break;
         case GGML_OP_CONT:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_cont(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.cont", start, end);
                 #endif
             } break;
         case GGML_OP_RESHAPE:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_reshape(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.reshape", start, end);
                 #endif
             } break;
         case GGML_OP_VIEW:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_view(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.view", start, end);
                 #endif
             } break;
         case GGML_OP_PERMUTE:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_permute(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.permute", start, end);
                 #endif
             } break;
         case GGML_OP_TRANSPOSE:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_transpose(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.transpose", start, end);
                 #endif
             } break;
         case GGML_OP_GET_ROWS:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_get_rows(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.get_rows", start, end);
                 #endif
             } break;
         case GGML_OP_GET_ROWS_BACK:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_get_rows_back(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.get_rows_back", start, end);
                 #endif
             } break;
         case GGML_OP_DIAG:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_diag(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.diag", start, end);
                 #endif
             } break;
         case GGML_OP_DIAG_MASK_INF:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_diag_mask_inf(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.diag_mask_inf", start, end);
                 #endif
             } break;
         case GGML_OP_DIAG_MASK_ZERO:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_diag_mask_zero(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.diag_mask_zero", start, end);
                 #endif
             } break;
         case GGML_OP_SOFT_MAX:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_soft_max(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.softmax", start, end);
                 #endif
             } break;
         case GGML_OP_SOFT_MAX_BACK:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_soft_max_ext_back(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.softmax_back", start, end);
                 #endif
             } break;
         case GGML_OP_ROPE:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_rope(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.rope", start, end);
                 #endif
             } break;
         case GGML_OP_ROPE_BACK:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_rope_back(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.rope_back", start, end);
                 #endif
             } break;
         case GGML_OP_CLAMP:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_clamp(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.clamp", start, end);
                 #endif
             } break;
         case GGML_OP_CONV_TRANSPOSE_1D:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_conv_transpose_1d(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.conv_transpose_1d", start, end);
                 #endif
             } break;
         case GGML_OP_IM2COL:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_im2col(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.im2col", start, end);
                 #endif
             } break;
         case GGML_OP_IM2COL_BACK:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_im2col_back_f32(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.im2col_back", start, end);
                 #endif
             } break;
         case GGML_OP_CONV_2D_DW:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_conv_2d_dw(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.conv_2d_dw", start, end);
                 #endif
             } break;
         case GGML_OP_CONV_TRANSPOSE_2D:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_conv_transpose_2d(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.conv_transpose_2d", start, end);
                 #endif
             } break;
         case GGML_OP_POOL_1D:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_pool_1d(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.pool_1d", start, end);
                 #endif
             } break;
         case GGML_OP_POOL_2D:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_pool_2d(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.pool_2d", start, end);
                 #endif
             } break;
         case GGML_OP_POOL_2D_BACK:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_pool_2d_back(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.pool_2d_back", start, end);
                 #endif
             } break;
         case GGML_OP_UPSCALE:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_upscale(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.upscale", start, end);
                 #endif
             } break;
         case GGML_OP_PAD:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_pad(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.pad", start, end);
                 #endif
             } break;
         case GGML_OP_PAD_REFLECT_1D:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_pad_reflect_1d(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.pad_reflect_1d", start, end);
                 #endif
             } break;
         case GGML_OP_ARANGE:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_arange(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.arange", start, end);
                 #endif
             } break;
         case GGML_OP_TIMESTEP_EMBEDDING:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_timestep_embedding(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.timestep_embedding", start, end);
                 #endif
             } break;
         case GGML_OP_ARGSORT:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_argsort(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.argsort", start, end);
                 #endif
             } break;
         case GGML_OP_LEAKY_RELU:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_leaky_relu(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.leaky_relu", start, end);
                 #endif
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_flash_attn_ext(params, tensor->src[0], tensor->src[1], tensor->src[2], tensor->src[3], tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.flash_attn_ext", start, end);
                 #endif
             } break;
@@ -2469,132 +2503,132 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 bool masked = t != 0;
 
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_flash_attn_back(params, masked, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.flash_attn_back", start, end);
                 #endif
             } break;
         case GGML_OP_SSM_CONV:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_ssm_conv(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.ssm_conv", start, end);
                 #endif
             } break;
         case GGML_OP_SSM_SCAN:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_ssm_scan(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.ssm_scan", start, end);
                 #endif
             } break;
         case GGML_OP_WIN_PART:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_win_part(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.win_part", start, end);
                 #endif
             } break;
         case GGML_OP_WIN_UNPART:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_win_unpart(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.win_unpart", start, end);
                 #endif
             } break;
         case GGML_OP_UNARY:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_unary(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.unary", start, end);
                 #endif
             } break;
         case GGML_OP_GET_REL_POS:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_get_rel_pos(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.get_rel_pos", start, end);
                 #endif
             } break;
         case GGML_OP_ADD_REL_POS:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_add_rel_pos(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.add_rel_pos", start, end);
                 #endif
             } break;
         case GGML_OP_RWKV_WKV6:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_rwkv_wkv6(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.rwkv_wkv6", start, end);
                 #endif
             } break;
         case GGML_OP_GATED_LINEAR_ATTN:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_gla(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.gated_linear_attn", start, end);
                 #endif
             } break;
         case GGML_OP_RWKV_WKV7:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_rwkv_wkv7(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.rwkv_wkv7", start, end);
                 #endif
             } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_map_custom1(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.map_custom1", start, end);
                 #endif
             }
@@ -2602,11 +2636,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MAP_CUSTOM2:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_map_custom2(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.map_custom2", start, end);
                 #endif
             }
@@ -2614,11 +2648,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MAP_CUSTOM3:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_map_custom3(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.map_custom3", start, end);
                 #endif
             }
@@ -2626,11 +2660,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_CUSTOM:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_custom(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.custom", start, end);
                 #endif
             }
@@ -2638,11 +2672,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_CROSS_ENTROPY_LOSS:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_cross_entropy_loss(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.cross_entropy_loss", start, end);
                 #endif
             }
@@ -2650,11 +2684,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_cross_entropy_loss_back(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.cross_entropy_loss_back", start, end);
                 #endif
             }
@@ -2662,11 +2696,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_OPT_STEP_ADAMW:
             {
                 #if CYCLE_LOG
-                start = gemmini_read_cycles();
+                start = gemmini_cpu_timing_read();
                 #endif
                 ggml_compute_forward_opt_step_adamw(params, tensor);
                 #if CYCLE_LOG
-                end = gemmini_read_cycles();
+                end = gemmini_cpu_timing_read();
                 gemmini_log_cycle(layer, "cpu.opt_step_adamw", start, end);
                 #endif
             }
@@ -3443,6 +3477,14 @@ struct ggml_cplan ggml_graph_plan(
 
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+#if CYCLE_LOG
+    state->cpu_totals = (gemmini_cpu_totals) {0};
+    gemmini_trace_context worker_trace = gemmini_trace_fork(state->threadpool->trace_origin);
+    worker_trace.worker_id = (uint64_t)state->ith;
+    worker_trace.flags |= GEMMINI_TRACE_WORKER;
+    const gemmini_trace_context previous_worker_trace = gemmini_trace_bind(worker_trace);
+    const gemmini_cpu_sample cpu_start = gemmini_cpu_timing_read();
+#endif
     struct ggml_threadpool    * tp    = state->threadpool;
 
     const struct ggml_cgraph * cgraph = tp->cgraph;
@@ -3464,7 +3506,15 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
         params.node_id = (uint64_t) node_n;
+#if CYCLE_LOG
+        const gemmini_trace_context previous_operator_trace = gemmini_trace_bind(
+            gemmini_trace_operator(gemmini_trace_capture(), tp->trace_origin.graph_id,
+                tp->trace_operator_base + (uint64_t)node_n, (uint64_t)node_n,
+                ggml_op_name(node->op), (uint64_t)state->ith, 1, params.nth > 1));
+        const gemmini_cpu_sample operator_start = gemmini_cpu_timing_read();
+#endif
         ggml_compute_forward(&params, node);
+
 
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
@@ -3475,10 +3525,42 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
+#if CYCLE_LOG
+        const gemmini_cpu_sample operator_end = gemmini_cpu_timing_read();
+        if (node->op != GGML_OP_NONE && !ggml_is_empty(node)) {
+            const gemmini_cycle_record_v2 dispatch_record = {
+                .interval = {.layer = node->name, .op = "operator.host_dispatch"},
+                .identity_mask = GEMMINI_CYCLE_HAS_RUN_ID | GEMMINI_CYCLE_HAS_NODE_ID | GEMMINI_CYCLE_HAS_WORKER_ID,
+                .run_id = tp->cycle_run_id, .node_id = (uint64_t)node_n, .worker_id = (uint64_t)state->ith,
+            };
+            gemmini_cpu_timing_record_segment(&dispatch_record, &operator_start, &operator_end);
+        }
+#endif
+#if CYCLE_LOG
+        gemmini_trace_restore(previous_operator_trace);
+#endif
     }
 
+#if CYCLE_LOG
+    const gemmini_cpu_sample cpu_end = gemmini_cpu_timing_read();
+    // Publish before the existing final barrier, excluding its rendezvous wait.
+    gemmini_cpu_timing_add(&state->cpu_totals, &cpu_start, &cpu_end);
+    const gemmini_cycle_record_v2 worker_record = {
+        .interval = {.layer = "cpu.graph", .op = "cpu.graph_worker"},
+        .identity_mask = GEMMINI_CYCLE_HAS_RUN_ID | GEMMINI_CYCLE_HAS_WORKER_ID,
+        .run_id = tp->cycle_run_id,
+        .worker_id = (uint64_t) state->ith,
+    };
+    gemmini_cpu_timing_record(&worker_record, &cpu_start, &cpu_end);
+#endif
     ggml_barrier(state->threadpool);
-
+#if CYCLE_LOG
+    const gemmini_cpu_sample worker_lifetime_end = gemmini_cpu_timing_read();
+    gemmini_cycle_record_v2 lifetime_record = worker_record;
+    lifetime_record.interval.op = "task.host_work";
+    gemmini_cpu_timing_record_segment(&lifetime_record, &cpu_start, &worker_lifetime_end);
+    gemmini_trace_restore(previous_worker_trace);
+#endif
     return 0;
 }
 
@@ -3640,6 +3722,10 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->cgraph           = cgraph;
         threadpool->cplan            = cplan;
         threadpool->cycle_run_id     = 0;
+#if CYCLE_LOG
+        threadpool->trace_origin = (gemmini_trace_context) {0};
+        threadpool->trace_operator_base = 0;
+#endif
         threadpool->n_graph          = 0;
         threadpool->n_barrier        = 0;
         threadpool->n_barrier_passed = 0;
@@ -3732,6 +3818,10 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 #if CYCLE_LOG
     threadpool->cycle_run_id = (uint64_t) atomic_fetch_add_explicit(
         &ggml_cpu_cycle_run_id, 1, memory_order_relaxed) + 1;
+    threadpool->trace_origin = gemmini_trace_capture();
+    threadpool->trace_origin.graph_id = gemmini_trace_reserve_ids((uint64_t)cgraph->n_nodes + 1);
+    threadpool->trace_operator_base = threadpool->trace_origin.graph_id + 1;
+    const gemmini_cpu_sample cpu_graph_start = gemmini_cpu_timing_read();
 #endif
 
 #ifdef GGML_USE_OPENMP
@@ -3762,6 +3852,18 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     // This is a work thread too
     ggml_graph_compute_thread(&threadpool->workers[0]);
+#endif
+
+#if CYCLE_LOG
+    const gemmini_cpu_sample cpu_graph_end = gemmini_cpu_timing_read();
+    gemmini_cpu_totals cpu_totals = {0};
+    const int cpu_worker_count = atomic_load_explicit(&threadpool->n_threads_cur, memory_order_relaxed);
+    for (int ith = 0; ith < cpu_worker_count; ++ith) {
+        gemmini_cpu_timing_merge(&cpu_totals, &threadpool->workers[ith].cpu_totals);
+    }
+    gemmini_cpu_timing_emit("cpu.graph", "cpu.graph_workers", &threadpool->cycle_run_id,
+                            threadpool->ec == GGML_STATUS_SUCCESS,
+                            &cpu_graph_start, &cpu_graph_end, &cpu_totals);
 #endif
 
     // don't leave affinity set on the main thread

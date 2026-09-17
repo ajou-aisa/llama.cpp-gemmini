@@ -6,8 +6,10 @@
 #include <array>
 #include <limits>
 #include <mutex>
+#include <gemmini/cpu-timing.h>
 
 struct ggml_gemmini_args_t;
+namespace ggml::gemmini::residual { struct DirectStripePayload; }
 
 namespace ggml::gemmini::rmd {
 namespace detail { struct RmdAssemblerAccess; }
@@ -98,7 +100,59 @@ inline RmdStatus checked_accumulate_provider_stats(
     return RmdStatus::success;
 }
 
+enum class RmdHostStage : size_t {
+    preparation,
+    weight_gather,
+    block_scale_metadata,
+    dot_output_accumulate,
+    block_scale_apply,
+    radix_reconstruct_combine,
+    final_metadata,
+    final_scale_combine_stage,
+    output_store,
+    count,
+};
+
+struct RmdHostStageTiming {
+    uint64_t calls = 0;
+    uint64_t wall_ns = 0;
+    bool wall_valid = true;
+    gemmini_cpu_totals cpu{};
+};
+
 struct RmdExecutionMetrics {
+    bool residual_observations_valid = false;
+    uint8_t digit_bits = 0;
+    size_t residual_nnz = 0;
+    int32_t residual_min = 0;
+    int32_t residual_max = 0;
+    uint8_t required_planes = 0;
+    size_t digit_nnz = 0;
+    size_t original_rows = 0;
+    size_t logical_k = 0;
+    size_t logical_j = 0;
+    size_t array_dim = 0;
+    size_t active_original_rows = 0;
+    bool active_original_rows_valid = false;
+    size_t original_rows_after_pruning = 0;
+    size_t lane_rows_before_pruning = 0;
+    size_t lane_rows_after_pruning = 0;
+    size_t group_rows_padded = 0;
+    size_t group_active_k_count = 0;
+    size_t group_padded_k_count = 0;
+    size_t source_residual_macs = 0;
+    size_t useful_digit_macs = 0;
+    size_t issued_mac_capacity = 0;
+    size_t activation_payload_bytes = 0;
+    size_t metadata_host_bytes = 0;
+    size_t gathered_weight_host_bytes = 0;
+    size_t correction_bytes = 0;
+    size_t logical_dot_result_bytes = 0;
+    size_t block_scale_values_bytes = 0;
+    size_t final_scale_values_bytes = 0;
+    size_t final_output_store_bytes = 0;
+    std::array<RmdHostStageTiming, static_cast<size_t>(RmdHostStage::count)> host_stages{};
+    gemmini_cycle_record_v2 timing_identity{};
     size_t direct_event_count = 0;
     size_t direct_call_count = 0;
     size_t packet_call_count = 0;
@@ -131,8 +185,51 @@ struct RmdExecutionMetrics {
 };
 
 void collect_packet_metrics(const StripePacket & packet, RmdExecutionMetrics & metrics);
+void collect_direct_metrics(const residual::DirectStripePayload & payload,
+                            RmdExecutionMetrics & metrics);
 
 namespace detail {
+class RmdHostStageScope {
+public:
+    RmdHostStageScope(RmdExecutionMetrics * metrics, RmdHostStage stage) noexcept :
+        timing_(metrics == nullptr ? nullptr : &metrics->host_stages[static_cast<size_t>(stage)]),
+        identity_(metrics == nullptr ? gemmini_cycle_record_v2{} : metrics->timing_identity), stage_(stage) {
+#if LOG_CYCLE
+        if (timing_ != nullptr) start_ = gemmini_cpu_timing_read();
+#endif
+    }
+    ~RmdHostStageScope() { finish(); }
+    void finish() noexcept {
+#if LOG_CYCLE
+        if (timing_ == nullptr) return;
+        const auto end = gemmini_cpu_timing_read();
+        ++timing_->calls;
+        uint64_t sum = 0;
+        timing_->wall_valid = timing_->wall_valid && start_.tid != 0 &&
+            start_.tid == end.tid && end.ns >= start_.ns &&
+            !__builtin_add_overflow(timing_->wall_ns, end.ns - start_.ns, &sum);
+        if (timing_->wall_valid) timing_->wall_ns = sum;
+        gemmini_cpu_timing_add(&timing_->cpu, &start_, &end);
+        constexpr std::array<const char *, static_cast<size_t>(RmdHostStage::count)> names{
+            "rmd.preparation", "rmd.weight_gather", "rmd.block_scale_metadata",
+            "rmd.dot_output_accumulate", "rmd.block_scale_apply", "rmd.radix_reconstruct_combine",
+            "rmd.final_metadata", "rmd.final_scale_combine_stage", "rmd.output_store"};
+        identity_.interval.op = names[static_cast<size_t>(stage_)];
+        gemmini_cpu_timing_record(&identity_, &start_, &end);
+#endif
+        timing_ = nullptr;
+    }
+    RmdHostStageScope(const RmdHostStageScope &) = delete;
+    RmdHostStageScope & operator=(const RmdHostStageScope &) = delete;
+private:
+    RmdHostStageTiming * timing_;
+    gemmini_cycle_record_v2 identity_;
+    RmdHostStage stage_;
+#if LOG_CYCLE
+    gemmini_cpu_sample start_{};
+#endif
+};
+
 // One immutable matmul weight lifetime. Activation metadata may vary by stripe;
 // changing weights or their shape requires a new context. Preparation alone locks.
 class RmdWeightPreparation {
@@ -145,7 +242,7 @@ public:
 
 private:
     friend RmdStatus merge_rmd_correction_with_weights(const ggml_gemmini_args_t &,
-        float *, const StripePacket &, const Correction &, RmdWeightPreparation &, size_t *);
+        float *, const StripePacket &, const Correction &, RmdWeightPreparation &, size_t *, RmdExecutionMetrics *);
     RmdStatus prepare_columns(const ggml_gemmini_args_t & args, const StripePacket & packet);
     std::mutex mutex_;
     bool plan_ready_ = false;

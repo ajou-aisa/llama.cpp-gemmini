@@ -1914,9 +1914,22 @@ bool test_full_int32_compact_direct_agreement(size_t rows) {
             std::vector<float> output(values.size(), 7.0f);
             fixture.args.f_out = output.data();
             size_t nonzero_count = 0;
-            ok = check(merge_rmd_correction(fixture.args, *packet, streamed, &nonzero_count) ==
-                           RmdStatus::success && nonzero_count == values.size(),
-                       "full int32 correction merges with final nonzero count") && ok;
+            ok = check(merge_rmd_correction(fixture.args, *packet, streamed,
+                                            &nonzero_count, &metrics) == RmdStatus::success &&
+                           nonzero_count == values.size() &&
+                           metrics.final_output_store_bytes == rows * fixture.args.J * sizeof(float) &&
+                           metrics.final_scale_values_bytes == (rows + fixture.args.J) * sizeof(float),
+                       "full int32 merge publishes nonzero count and final scale/store bytes") && ok;
+            for (const RmdHostStage stage : {RmdHostStage::final_metadata,
+                                             RmdHostStage::final_scale_combine_stage,
+                                             RmdHostStage::output_store}) {
+                const uint64_t calls = metrics.host_stages[static_cast<size_t>(stage)].calls;
+#if LOG_CYCLE
+                ok = check(calls > 0, "cycle logging measures each final merge stage") && ok;
+#else
+                ok = check(calls == 0, "disabled cycle logging leaves merge stages unmeasured") && ok;
+#endif
+            }
             for (size_t row = 0; row < values.size(); ++row) {
                 const float expected_output = 7.0f + static_cast<float>(
                     static_cast<double>(expected[row]) * 0.25 * 0.5);
@@ -1924,6 +1937,132 @@ bool test_full_int32_compact_direct_agreement(size_t rows) {
                            "full int32 merge matches explicit column and activation scales") && ok;
             }
         }
+    }
+    return ok;
+}
+
+bool test_compact_residual_metrics() {
+    bool ok = true;
+    for (uint8_t bits : {uint8_t{4}, uint8_t{8}, uint8_t{16}}) {
+        CompactOracleFixture fixture(bits, WeightFamily::H1);
+        if (!check(fixture.valid, "residual metrics weight fixture builds")) return false;
+        const auto contract = balanced_radix_contract(bits);
+        const int32_t negative = -static_cast<int32_t>(contract.radix / 2);
+        constexpr size_t rows = CompactOracleFixture::rows;
+        constexpr size_t columns = CompactOracleFixture::columns;
+        RmdStripeBuilder builder;
+        residual::DirectStripeBuilder direct_builder;
+        builder.reset(97, 0, rows, fixture.args.K, columns, bits);
+        direct_builder.reset(97, 0, rows, fixture.args.K, columns);
+        for (size_t k = 0; k < 18; ++k) {
+            if (!builder.add_residual(0, k, 1) || !direct_builder.add_residual(0, k, 1)) {
+                return check(false, "residual metrics sparse K prefix accepted");
+            }
+        }
+        for (const residual::ResidualEvent event : {
+                 residual::ResidualEvent{2, 18, std::numeric_limits<int32_t>::max()},
+                 residual::ResidualEvent{0, kBlockSize, -1},
+                 residual::ResidualEvent{2, 2 * kBlockSize - 1, negative},
+             }) {
+            if (!builder.add_residual(event.local_row, event.original_k, event.residual) ||
+                !direct_builder.add_residual(event.local_row, event.original_k, event.residual)) {
+                return check(false, "residual metrics carry and signed tail accepted");
+            }
+        }
+        const auto packet = builder.finish();
+        const auto direct_payload = direct_builder.finish();
+        if (!check(packet != nullptr && direct_payload != nullptr &&
+                       packet->blocks.size() == 2 && packet->blocks[0].groups.size() == 1 &&
+                       packet->blocks[1].groups.size() == 1,
+                   "residual metrics fixture keeps one group per original block")) return false;
+
+        Correction correction, direct;
+        RmdExecutionMetrics metrics{};
+        if (!check(execute_rmd_stripe_reference(fixture.args, *packet, correction, &metrics) ==
+                       RmdStatus::success &&
+                       residual::execute_direct_stripe(fixture.args, *direct_payload, direct) ==
+                       RmdStatus::success,
+                   "residual metrics fixture executes compact and direct")) return false;
+        std::vector<int64_t> expected(rows * columns, 0);
+        for (size_t j = 0; j < columns; ++j) {
+            int64_t prefix_dot = 0;
+            for (size_t k = 0; k < 18; ++k) prefix_dot += fixture.code(j, k);
+            const int64_t first_scale = fixture.integer_scales[2 * j];
+            const int64_t second_scale = fixture.integer_scales[2 * j + 1];
+            expected[j] = prefix_dot * first_scale - fixture.code(j, kBlockSize) * second_scale;
+            expected[2 * columns + j] =
+                static_cast<int64_t>(std::numeric_limits<int32_t>::max()) *
+                    fixture.code(j, 18) * first_scale +
+                static_cast<int64_t>(negative) * fixture.code(j, 2 * kBlockSize - 1) * second_scale;
+        }
+        ok = check(std::get<BlockScaledInt64Correction>(correction).values == expected &&
+                       direct_outputs_match(correction, direct),
+                   "metric collection preserves original block scales and zero original rows") && ok;
+        ok = check(metrics.residual_observations_valid && metrics.residual_nnz == 21 &&
+                       metrics.residual_min == negative &&
+                       metrics.residual_max == std::numeric_limits<int32_t>::max() &&
+                       metrics.required_planes == contract.lane_capacity && metrics.digit_nnz == 23,
+                   "source range and required carry planes differ from nonzero digit count") && ok;
+        ok = check(metrics.original_rows == rows &&
+                       metrics.logical_k == 2 * kBlockSize && metrics.logical_j == columns &&
+                       metrics.array_dim == kArrayDim &&
+                       metrics.original_rows_after_pruning == rows &&
+                       metrics.lane_rows_before_pruning == 2 * contract.lane_capacity * rows &&
+                       metrics.lane_rows_after_pruning == 4 * rows &&
+                       metrics.group_rows_padded == 6 * kArrayDim,
+                   "lane pruning and group padding retain every original row") && ok;
+#if LOG_CYCLE
+        ok = check(metrics.active_original_rows_valid && metrics.active_original_rows == 2,
+                   "cycle logging records original active rows") && ok;
+#else
+        ok = check(!metrics.active_original_rows_valid && metrics.active_original_rows == 0,
+                   "disabled cycle logging does not collect original active rows") && ok;
+#endif
+
+        const size_t first_k_tiles = align_up(19, kArrayDim) / kArrayDim;
+        const size_t issued_tiles = 4 * first_k_tiles + 2;
+        ok = check(metrics.active_blocks == 2 && metrics.active_lanes == 4 &&
+                       metrics.compact_k_count == 21 && metrics.group_active_k_count == 21 &&
+                       metrics.padded_k_count == (first_k_tiles + 1) * kArrayDim &&
+                       metrics.group_padded_k_count == (first_k_tiles + 1) * kArrayDim &&
+                       metrics.lane_group_count == 2 && metrics.matmul_call_count == first_k_tiles + 1 &&
+                       metrics.physical_tile_count == 8 &&
+                       metrics.baseline_stacked_i_tile_count == 6 * first_k_tiles + 2 &&
+                       metrics.stacked_i_tile_count == issued_tiles,
+                   "K-tail repeats count dispatched group tiles separately from logical output tiles") && ok;
+        ok = check(metrics.source_residual_macs == 21 * columns &&
+                       metrics.useful_digit_macs == 23 * columns &&
+                       metrics.issued_mac_capacity == issued_tiles * kArrayDim * kArrayDim * kArrayDim,
+                   "source work, digit work and issued tile capacity have distinct MAC counts") && ok;
+        const size_t payload_bytes = (4 * first_k_tiles + 2) * kArrayDim * kArrayDim * bits / 8;
+        const size_t metadata_bytes = sizeof(StripePacket) + 2 * sizeof(BlockDescriptor) +
+            2 * sizeof(LaneGroupDescriptor) + 21 * sizeof(uint16_t) + 4 * sizeof(uint8_t);
+        ok = check(metrics.activation_payload_bytes == payload_bytes &&
+                       metrics.metadata_host_bytes == metadata_bytes &&
+                       metrics.packet_bytes == payload_bytes + metadata_bytes &&
+                       metrics.gathered_weight_host_bytes == 21 * columns * sizeof(int32_t) &&
+                       metrics.block_scale_values_bytes == 2 * columns * sizeof(uint64_t) &&
+                       metrics.correction_bytes == rows * columns * sizeof(int64_t) &&
+                       metrics.logical_dot_result_bytes ==
+                           (3 * first_k_tiles + 1) * rows * columns * sizeof(int64_t) &&
+                       metrics.compressed_output_values == 0,
+                   "packet storage, gathered INT32 weights and repeated dot outputs use explicit byte units") && ok;
+        CompressedOutput compressed;
+        RmdExecutionMetrics compressed_metrics{};
+        ok = check(execute_rmd_stripe_reference(fixture.args, *packet, compressed,
+                                               &compressed_metrics) == RmdStatus::success &&
+                       compressed_metrics.residual_nnz == metrics.residual_nnz &&
+                       compressed_metrics.required_planes == metrics.required_planes &&
+                       compressed_metrics.issued_mac_capacity == metrics.issued_mac_capacity &&
+                       compressed_metrics.logical_dot_result_bytes == metrics.logical_dot_result_bytes &&
+                       compressed_metrics.correction_bytes == 0 &&
+                       compressed_metrics.compressed_output_values == 8 * kArrayDim * kArrayDim,
+                   "compressed execution preserves workload metrics without claiming correction allocation") && ok;
+        Correction recomposed;
+        ok = check(compose_rmd_output(*packet, compressed, recomposed, &compressed_metrics) ==
+                       RmdStatus::success && direct_outputs_match(recomposed, correction) &&
+                       compressed_metrics.correction_bytes == rows * columns * sizeof(int64_t),
+                   "compressed compose publishes correction bytes after successful reconstruction") && ok;
     }
     return ok;
 }
@@ -2110,6 +2249,11 @@ bool test_compact_failure_matrix() {
         streaming_metrics.packet_call_count = 17;
         streaming_metrics.matmul_call_count = 19;
         streaming_metrics.im2p_stats.fields[0] = 23;
+        streaming_metrics.residual_nnz = 29;
+        streaming_metrics.residual_min = -31;
+        streaming_metrics.required_planes = 5;
+        streaming_metrics.issued_mac_capacity = 37;
+        streaming_metrics.logical_dot_result_bytes = 41;
         const RmdStatus streaming_status =
             execute_rmd_stripe_ws(args, packet, correction, &streaming_metrics);
         return check(status == expected && compressed_outputs_match(output, sentinel) &&
@@ -2118,7 +2262,12 @@ bool test_compact_failure_matrix() {
                          direct_outputs_match(correction, correction_sentinel) &&
                          streaming_metrics.packet_call_count == 17 &&
                          streaming_metrics.matmul_call_count == 19 &&
-                         streaming_metrics.im2p_stats.fields[0] == 23,
+                         streaming_metrics.im2p_stats.fields[0] == 23 &&
+                         streaming_metrics.residual_nnz == 29 &&
+                         streaming_metrics.residual_min == -31 &&
+                         streaming_metrics.required_planes == 5 &&
+                         streaming_metrics.issued_mac_capacity == 37 &&
+                         streaming_metrics.logical_dot_result_bytes == 41,
                      message);
     };
 
@@ -2263,11 +2412,17 @@ bool test_compact_failure_matrix() {
         metrics.packet_call_count = 17;
         metrics.matmul_call_count = 19;
         metrics.im2p_stats.fields[0] = 23;
+        metrics.residual_nnz = 29;
+        metrics.residual_max = 31;
+        metrics.digit_nnz = 37;
+        metrics.gathered_weight_host_bytes = 41;
         ok = check(execute_rmd_stripe_reference(scale_overflow.args, *scale_overflow.packet,
                                                 correction, &metrics) == RmdStatus::overflow &&
                        direct_outputs_match(correction, correction_sentinel) &&
                        metrics.packet_call_count == 17 && metrics.matmul_call_count == 19 &&
-                       metrics.im2p_stats.fields[0] == 23,
+                       metrics.im2p_stats.fields[0] == 23 && metrics.residual_nnz == 29 &&
+                       metrics.residual_max == 31 && metrics.digit_nnz == 37 &&
+                       metrics.gathered_weight_host_bytes == 41,
                    "streaming scale overflow preserves correction and existing metrics") && ok;
 #else
         ok = check(false, "scale overflow oracle requires GGML_GEMMINI_TESTING") && ok;
@@ -2326,9 +2481,20 @@ static bool test_cpu_capture_is_canonical_and_packet_free() {
         return false;
     }
     const auto &events = payload.direct->events;
+    RmdExecutionMetrics metrics{};
+    collect_direct_metrics(*payload.direct, metrics);
     return check(events[0] == ResidualEvent{0, 2, 1}, "CPU event order row 0 k 2") &&
         check(events[1] == ResidualEvent{0, 31, 256}, "CPU event order row 0 k 31") &&
-        check(events[2] == ResidualEvent{1, 33, -129}, "CPU event order row 1 k 33");
+        check(events[2] == ResidualEvent{1, 33, -129}, "CPU event order row 1 k 33") &&
+        check(metrics.residual_observations_valid && metrics.residual_nnz == 3 &&
+                  metrics.residual_min == -129 &&
+                  metrics.residual_max == 256 && metrics.original_rows == 2 &&
+                  metrics.logical_k == 64 && metrics.logical_j == 17 &&
+                  metrics.array_dim == kArrayDim &&
+                  metrics.active_original_rows_valid && metrics.active_original_rows == 2 &&
+                  metrics.original_rows_after_pruning == 2 &&
+                  metrics.source_residual_macs == 3 * 17,
+              "CPU metrics describe original sparse residuals without a compact packet");
 }
 
 static bool test_ws_capture_preserves_packet_contract() {
@@ -2365,13 +2531,33 @@ static bool test_empty_capture_and_single_sink_selection() {
     TimedResidualCapture ws(ResidualRoute::ws_packet);
     ws.reset(0, 0, 1, 1, 1);
     const ResidualStripePayload ws_empty = ws.finish();
+    DirectOracleFixture fixture(GGML_GEMMINI_ACTIVATION_BITS, WeightFamily::H1);
+    DirectStripePayload empty;
+    empty.row_count = fixture.args.I;
+    empty.logical_k = fixture.args.K;
+    empty.logical_j = fixture.args.J;
+    RmdExecutionMetrics metrics{};
+    collect_direct_metrics(empty, metrics);
+    Correction correction = BlockScaledInt64Correction{{13}};
+    const RmdStatus status = execute_direct_stripe(fixture.args, empty, correction);
     return check(cpu.holds_cpu_sink() && !cpu.holds_ws_sink(),
                  "CPU selection instantiates only CPU sink") &&
         check(ws.holds_ws_sink() && !ws.holds_cpu_sink(),
               "WS selection instantiates only WS sink") &&
         check(cpu_empty.empty() && ws_empty.empty(), "empty stripes produce no work") &&
         check(cpu_empty.capture_ns == 0 && ws_empty.capture_ns == 0,
-              "empty stripes skip timed finish work");
+              "empty stripes skip timed finish work") &&
+        check(metrics.residual_observations_valid && metrics.residual_nnz == 0 &&
+                  metrics.residual_min == 0 &&
+                  metrics.residual_max == 0 && metrics.active_original_rows_valid &&
+                  metrics.active_original_rows == 0 &&
+                  metrics.source_residual_macs == 0 && metrics.original_rows == 3 &&
+                  metrics.original_rows_after_pruning == 3 &&
+                  metrics.correction_bytes == 0,
+              "empty direct metrics retain geometry without correction allocation") &&
+        check(status == RmdStatus::invalid_packet &&
+                  std::get<BlockScaledInt64Correction>(correction).values == std::vector<int64_t>{13},
+              "empty direct execution rejects the packet without changing correction");
 }
 
 static bool test_direct_payload_slicing_and_ownership() {
@@ -2573,6 +2759,7 @@ int main(int argc, char ** argv) {
     if (selection == TestSelection::all || selection == TestSelection::compact_happy) {
         ok = test_block_scale_before_sum() && ok;
         ok = test_compact_oracle_happy_matrix() && ok;
+        ok = test_compact_residual_metrics() && ok;
         for (size_t rows : {size_t{1}, size_t{2}, size_t{8},
                             kArrayDim - 1, kArrayDim, kArrayDim + 1}) {
             ok = test_full_int32_compact_direct_agreement(rows) && ok;

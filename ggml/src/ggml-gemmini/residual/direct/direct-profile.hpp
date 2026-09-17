@@ -15,19 +15,24 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+#include <omp.h>
+#endif
 
 namespace ggml::gemmini::residual::detail {
 
 struct DirectHostSpan {
-    cycle::HostSample start{};
-    cycle::HostSample end{};
+    gemmini_cpu_sample start{};
+    gemmini_cpu_sample end{};
 
     std::string host_json() const {
         return cycle::serialize_host_timing(start.ns, end.ns, start.tid, end.tid);
     }
 
     std::string cpu_json() const {
-        return cycle::serialize_thread_cpu_timing(start, end);
+        return cycle::serialize_thread_cpu_timing(
+            {start.ns, start.tid, start.thread_cpu_ns, start.thread_cpu_valid != 0},
+            {end.ns, end.tid, end.thread_cpu_ns, end.thread_cpu_valid != 0});
     }
 };
 
@@ -52,29 +57,47 @@ public:
     DirectHostProfile(const DirectStripePayload & payload, const std::string & layer,
                       std::optional<uint64_t> run_id, bool enabled = true) noexcept :
         payload_(payload), layer_(layer), run_id_(run_id), enabled_(enabled) {
-        if (enabled_) phases_[0].start = cycle::read_host_sample();
+        phases_[0].start = gemmini_cpu_timing_read();
         const char * deep = std::getenv("GGML_GEMMINI_RESIDUAL_DEEP_PROFILE");
         deep_profile = enabled_ && deep != nullptr && std::strcmp(deep, "1") == 0;
     }
 
     ~DirectHostProfile() noexcept {
-        if (!enabled_) return;
-        const cycle::HostSample end = cycle::read_host_sample();
+        const auto end = gemmini_cpu_timing_read();
         phases_[phase_].end = end;
+        constexpr std::array<const char *, 4> names{
+            "rmd.cpu_direct.validation", "rmd.cpu_direct.preparation",
+            "rmd.cpu_direct.parallel", "rmd.cpu_direct.finalization"};
+        for (size_t phase = 0; phase <= phase_; ++phase) {
+            const auto record = identity(names[phase], caller_worker_id());
+            gemmini_cpu_timing_record(&record, &phases_[phase].start, &phases_[phase].end);
+        }
+#if CYCLE_DETAIL
+        if (!enabled_) return;
         try {
             // Serialization and the sidecar write are outside all measured spans.
             log::cycle.write_json(serialize(end));
         } catch (...) {
             log::cycle.report_failure("residual host profile");
         }
+#endif
     }
 
     void next_phase(size_t phase) noexcept {
-        if (!enabled_) return;
-        const cycle::HostSample sample = cycle::read_host_sample();
+        const auto sample = gemmini_cpu_timing_read();
         phases_[phase_].end = sample;
         phases_[phase].start = sample;
         phase_ = phase;
+    }
+
+    gemmini_cycle_record_v2 identity(const char *op, uint64_t worker_id,
+                                     uint64_t node_id = UINT64_MAX) const noexcept {
+        const std::optional<uint64_t> direct_run_id = run_id_;
+        uint32_t identity_mask = GEMMINI_CYCLE_HAS_STRIPE_ID | GEMMINI_CYCLE_HAS_WORKER_ID;
+        if (direct_run_id.has_value()) identity_mask |= GEMMINI_CYCLE_HAS_RUN_ID;
+        if (node_id != UINT64_MAX) identity_mask |= GEMMINI_CYCLE_HAS_NODE_ID;
+        return {{layer_.empty() ? nullptr : layer_.c_str(), op, 0, 0, nullptr, 0, nullptr},
+            identity_mask, direct_run_id.value_or(0), payload_.stripe_id, 0, node_id, worker_id};
     }
 
     void prepare(size_t tile_count, size_t worker_count) noexcept {
@@ -109,6 +132,14 @@ public:
     std::vector<DirectHostWorker> workers;
 
 private:
+    static uint64_t caller_worker_id() noexcept {
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+        return static_cast<uint64_t>(omp_get_thread_num());
+#else
+        return 0;
+#endif
+    }
+
     static void quote(std::ostream & out, const std::string & value) {
         constexpr char hex[] = "0123456789abcdef";
         out << '"';
@@ -124,7 +155,7 @@ private:
         out << '"';
     }
 
-    std::string serialize(const cycle::HostSample & end) const {
+    std::string serialize(const gemmini_cpu_sample & end) const {
         const DirectHostSpan total{phases_[0].start, end};
         const bool valid = success && ready && total.start.tid != 0 &&
             total.start.tid == end.tid && end.ns >= total.start.ns;

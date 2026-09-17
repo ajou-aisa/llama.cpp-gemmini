@@ -447,6 +447,8 @@ static bool test_hardware_counter_contract(const std::filesystem::path & root) {
                          2, 3, 4, 1, 1, 1, 2, 3, 4, 0, 1);
     gemmini_log_ws_cycle(10, 11, 2, 3, 4,
                          2, 3, 4, 1, 1, 1, 2, 3, 4, 0, 1);
+    gemmini_log_ws_cycle(0, 0, 0, 0, 0,
+                         2, 3, 4, 1, 1, 1, 2, 3, 4, 0, 1);
     ggml::gemmini::log::cycle.set_output(stderr);
 
     const std::string json = read_file(output);
@@ -456,11 +458,16 @@ static bool test_hardware_counter_contract(const std::filesystem::path & root) {
         return found;
     };
     if (!every_line_is_json(output) ||
-        count("\"record_type\":\"WS_LOOP_TELEMETRY\"") != 3 ||
-        count("\"containing_interval_counter_bits\":64") != 3 ||
-        count("\"occupancy_counter_bits\":32") != 3 ||
-        count("\"valid\":true") != 1 || count("\"valid\":false") != 2) {
-        std::cerr << "hardware counter width/wrap contract failed: " << json << '\n';
+        count("\"record_type\":\"WS_LOOP_TELEMETRY\"") != 4 ||
+        count("\"containing_interval_counter_bits\":64") != 4 ||
+        count("\"containing_interval_domain\":\"cpu_counter\"") != 4 ||
+        count("\"occupancy_counter_bits\":32") != 4 ||
+        count("\"occupancy_counter_semantics\":\"raw_modulo_2^32_readings\"") != 4 ||
+        count("\"load_occupancy_cycles\":4294967295") != 1 ||
+        count("\"load_occupancy_cycles\":0,") != 1 ||
+        count("\"reason\":\"device_counter_window_and_wrap_unverified\"") != 4 ||
+        count("\"valid\":true") != 0 || count("\"valid\":false") != 4) {
+        std::cerr << "raw hardware counters must not become validated durations: " << json << '\n';
         return false;
     }
 

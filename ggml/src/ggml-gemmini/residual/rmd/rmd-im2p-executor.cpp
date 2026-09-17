@@ -1,4 +1,7 @@
 #include "rmd-im2p-executor.hpp"
+#include <gemmini/trace-context.hpp>
+#include <gemmini/log.hpp>
+#include "../../../../../common/json.hpp"
 
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) || defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
 #include <im2p_sim.h>
@@ -324,6 +327,8 @@ RmdStatus execute_im2p_compact_dot(
 #if defined(GGML_GEMMINI_TESTING)
     provider_dot_attempts.fetch_add(1, std::memory_order_relaxed);
 #endif
+    trace::ScopedRole residual_role(GEMMINI_TRACE_ROLE_RESIDUAL);
+    trace::CpuStage host_call(dot.timing_identity.interval.layer, "rmd.device_host_call");
     int provider_status = IM2P_ERROR;
     if (executor != nullptr) {
         if (fault != Im2pProviderTestFault::none) return RmdStatus::invalid_arguments;
@@ -335,6 +340,50 @@ RmdStatus execute_im2p_compact_dot(
             ? im2p_execute_matmul_extended(sim, &descriptor, &stats)
             : synthetic_execute(&descriptor, &stats, fault);
     }
+#endif
+    host_call.finish(provider_status == IM2P_OK);
+#if LOG_CYCLE
+    try {
+        using Json = nlohmann::json;
+        const bool real_provider = fault == Im2pProviderTestFault::none;
+        const bool counter_valid = real_provider && provider_status == IM2P_OK;
+        const auto optional_id = [&](uint32_t flag, uint64_t value) -> Json {
+            return dot.timing_identity.identity_mask & flag ? Json(value) : Json();
+        };
+        Json record = {{"schema","gemmini.cycle"},{"version",2},
+            {"record_type","NPU_OPERATOR_SEGMENT"},{"op","rmd.matmul.execute"},
+            {"layer",dot.timing_identity.interval.layer ? Json(dot.timing_identity.interval.layer) : Json()},
+            {"command_id",gemmini_trace_reserve_ids(1)},
+            {"backend",executor ? "external_executor" : "im2p_sim"},
+            {"source",real_provider ? (executor ? "provider_device_cycles" : "im2p_rtl") : "synthetic_test_provider"},
+            {"unit","cycle"},{"clock_domain",executor ? "external_rmd_device" : "independent_rmd_simulator"},
+            {"counter_semantics","one_matmul_provider_call"},{"additive",false},
+            {"run_id",optional_id(GEMMINI_CYCLE_HAS_RUN_ID,dot.timing_identity.run_id)},
+            {"stripe_id",optional_id(GEMMINI_CYCLE_HAS_STRIPE_ID,dot.timing_identity.stripe_id)},
+            {"slot",optional_id(GEMMINI_CYCLE_HAS_SLOT,dot.timing_identity.slot)},
+            {"block_id",dot.block_id},{"lane_group",dot.lane_group},
+            {"k_offset",dot.k_offset},{"column_offset",dot.column_offset},
+            {"m",dot.rows},{"n",dot.columns},{"k",dot.k},{"operand_bits",dot.operand_bits},
+            {"raw_cycles",stats.base.work_total_cycles},
+            {"cycles",counter_valid ? Json(stats.base.work_total_cycles) : Json()},
+            {"valid",counter_valid},
+            {"reason",counter_valid ? Json() : Json(real_provider ? "provider_did_not_complete" : "synthetic_test_provider")},
+            {"operation_success",provider_status == IM2P_OK && context.seen_count == dot.rows * dot.columns},
+            {"provider_status",provider_status}};
+        // Keep each observed hardware counter separately. They overlap by
+        // definition and are never added to manufacture a total cycle count.
+        record["counters"] = {{"compute_cycles",stats.base.compute_cycles},
+            {"activation_wait_cycles",stats.base.activation_wait_cycles},
+            {"weight_wait_cycles",stats.base.weight_wait_cycles},
+            {"scale_wait_cycles",stats.base.scale_wait_cycles},
+            {"output_wait_cycles",stats.base.output_wait_cycles},
+            {"drain_cycles",stats.base.drain_cycles},
+            {"activation_read_requests",stats.base.activation_read_requests},
+            {"weight_read_requests",stats.base.weight_read_requests},
+            {"output_write_requests",stats.base.output_write_requests},
+            {"output_write_responses",stats.base.output_write_responses}};
+        log::cycle.write_json(record.dump());
+    } catch (...) { log::cycle.report_failure("RMD device segment"); }
 #endif
     if (provider_status != IM2P_OK) return RmdStatus::execution_failed;
     if (context.seen_count != dot.rows * dot.columns) return RmdStatus::invalid_packet;

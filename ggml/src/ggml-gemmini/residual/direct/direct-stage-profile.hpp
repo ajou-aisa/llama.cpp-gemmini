@@ -1,6 +1,7 @@
 #pragma once
 
 #include <gemmini/host-timing.hpp>
+#include <gemmini/log.h>
 #if defined(__linux__) && defined(__aarch64__)
 #include <gemmini/cycle_reader.hpp>
 #endif
@@ -41,7 +42,9 @@ struct DirectStageTotals {
 
 class DirectStageProbe {
 public:
-    explicit DirectStageProbe(std::array<DirectStageTotals, 3> * stages) noexcept : stages_(stages) {
+    explicit DirectStageProbe(std::array<DirectStageTotals, 3> * stages,
+                              const gemmini_cycle_record_v2 * identity = nullptr) noexcept :
+        stages_(stages), identity_(identity) {
         begin();
     }
     ~DirectStageProbe() noexcept { finish(); }
@@ -57,18 +60,12 @@ public:
 private:
     void begin() noexcept {
         if (stages_ == nullptr) return;
-        host_start_ = cycle::read_host_sample();
-#if defined(__linux__) && defined(__aarch64__)
-        cycle_start_ = cycle::read_sample();
-#endif
+        host_start_ = gemmini_cpu_timing_read();
     }
 
     void finish() noexcept {
         if (stages_ == nullptr) return;
-#if defined(__linux__) && defined(__aarch64__)
-        const auto cycle_end = cycle::read_sample();
-#endif
-        const auto host_end = cycle::read_host_sample();
+        const auto host_end = gemmini_cpu_timing_read();
         auto & stage = (*stages_)[index_];
         ++stage.calls;
         const bool same_thread = host_start_.tid != 0 && host_start_.tid == host_end.tid;
@@ -79,7 +76,12 @@ private:
             DirectStageTotals::accumulate(host_end.thread_cpu_ns - host_start_.thread_cpu_ns,
                                           stage.thread_cpu_ns);
 #if defined(__linux__) && defined(__aarch64__)
-        const auto interval = cycle::evaluate_interval(cycle_start_, cycle_end, same_thread);
+        const auto native = [](const gemmini_cpu_sample & sample) {
+            return cycle::NativeCycleSample{sample.counter, sample.native_valid != 0,
+                static_cast<cycle::NativeCycleReason>(sample.native_reason),
+                cycle::NativeCycleSource::perf_cpu_cycles, sample.owner_token, sample.generation};
+        };
+        const auto interval = cycle::evaluate_interval(native(host_start_), native(host_end), same_thread);
         if (stage.cycles_valid) {
             if (!interval.valid) {
                 stage.cycles_valid = false;
@@ -95,14 +97,19 @@ private:
         stage.cycles_valid = false;
         stage.cycles_reason = "unsupported_platform";
 #endif
+        if (identity_ != nullptr) {
+            constexpr std::array<const char *, 3> names{
+                "rmd.cpu_direct.event_scan", "rmd.cpu_direct.weight_dot", "rmd.cpu_direct.scale_apply"};
+            auto record = *identity_;
+            record.interval.op = names[index_];
+            gemmini_cpu_timing_record(&record, &host_start_, &host_end);
+        }
     }
 
     std::array<DirectStageTotals, 3> * stages_;
+    const gemmini_cycle_record_v2 * identity_;
     size_t index_ = 0;
-    cycle::HostSample host_start_{};
-#if defined(__linux__) && defined(__aarch64__)
-    cycle::NativeCycleSample cycle_start_{};
-#endif
+    gemmini_cpu_sample host_start_{};
 };
 
 }

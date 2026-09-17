@@ -1,6 +1,9 @@
 #pragma once
 
+#include "ggml-gemmini-im2p.hpp"
+
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace ggml::gemmini {
@@ -46,6 +49,7 @@ struct WsLoopTelemetry {
 };
 
 struct Im2pExecutionTelemetry {
+    enum class CounterCoverage { simulator, fpga_basic, fpga_wait_overlap };
     std::string layer;
     std::uint64_t run_id = 0;
     std::string mode;
@@ -86,9 +90,32 @@ struct Im2pExecutionTelemetry {
     std::uint64_t row_begin = 0;
     std::uint64_t row_end = 0;
     std::uint64_t rmd_dot_calls = 0;
+
+    std::optional<im2p_adapter::Stats> provider_stats;
+    CounterCoverage counter_coverage = CounterCoverage::simulator;
+    std::string backend;
+    std::string clock_domain;
+    std::string numerical_contract;
+    std::string scale_mode;
+    std::uint8_t vector_op = 0;
+    std::uint8_t output_domain = 0;
 };
 
 struct RmdTelemetryRecord;
+namespace rmd { struct RmdExecutionMetrics; }
+
+struct RmdStripeTelemetry {
+    std::string layer;
+    std::optional<std::uint64_t> run_id;
+    std::uint64_t stripe_id = 0;
+    std::optional<std::uint64_t> slot;
+    std::uint64_t row_begin = 0, row_end = 0;
+    std::string backend;
+    bool success = false;
+    std::string reason;
+    // Borrowed only during synchronous serialization; CycleLog retains owned JSON.
+    const rmd::RmdExecutionMetrics * metrics = nullptr;
+};
 
 struct Im2pStripeTelemetry {
     std::string layer;
@@ -150,6 +177,7 @@ std::string serialize_cycle_telemetry(const Im2pStripeTelemetry & record);
 std::string serialize_cycle_telemetry(const QuantizationStripeTelemetry & record);
 std::string serialize_cycle_telemetry(const PipelineStripeTelemetry & record);
 std::string serialize_cycle_telemetry(const RmdTelemetryRecord & record);
+std::string serialize_cycle_telemetry(const RmdStripeTelemetry & record);
 
 void emit_cycle_telemetry(const CycleIntervalTelemetry & record);
 void emit_cycle_telemetry(const WsLoopTelemetry & record);
@@ -158,5 +186,6 @@ void emit_cycle_telemetry(const Im2pStripeTelemetry & record);
 void emit_cycle_telemetry(const QuantizationStripeTelemetry & record);
 void emit_cycle_telemetry(const PipelineStripeTelemetry & record);
 void emit_cycle_telemetry(const RmdTelemetryRecord & record);
+void emit_cycle_telemetry(const RmdStripeTelemetry & record);
 
 } // namespace ggml::gemmini

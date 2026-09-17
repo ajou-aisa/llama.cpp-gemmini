@@ -55,10 +55,21 @@ if(NOT actual_labels STREQUAL expected_labels)
     message(FATAL_ERROR "generic CPU labels or ordering changed")
 endif()
 
-require_cpu_count("gemmini_read_cycles\\(\\)" 162 "public scalar CPU endpoints")
 require_cpu_count("static inline void ggml_log_cpu_cycle\\(" 1 "shared CPU log helper")
-require_cpu_count("uint64_t start, uint64_t end\\)" 1 "scalar CPU logger endpoints")
-require_cpu_count("gemmini_log_cycle_record_v2\\(&record\\)" 1 "public scalar CPU logger")
+require_cpu_count("const gemmini_cpu_sample \\*start, const gemmini_cpu_sample \\*end" 1
+    "CPU logger preserves native and host endpoints")
+require_cpu_count("gemmini_cpu_timing_record\\(&record, start, end\\)" 1
+    "shared checked CPU logger")
+foreach(token IN ITEMS ".run_id = params->run_id" ".node_id = params->node_id"
+                       ".worker_id = (uint64_t) params->ith"
+                       "gemmini_cpu_timing_add(&state->cpu_totals, &cpu_start, &cpu_end)"
+                       "gemmini_cpu_timing_record(&worker_record, &cpu_start, &cpu_end)"
+                       "gemmini_cpu_timing_merge(&cpu_totals, &threadpool->workers[ith].cpu_totals)")
+    string(FIND "${cpu_source}" "${token}" cpu_token)
+    if(cpu_token EQUAL -1)
+        message(FATAL_ERROR "CPU worker identity/resource endpoint missing ${token}")
+    endif()
+endforeach()
 
 string(FIND "${cpu_source}"
     "static void ggml_compute_forward(struct ggml_compute_params" forward_start)
@@ -68,11 +79,11 @@ if(forward_start EQUAL -1 OR switch_start EQUAL -1 OR switch_start LESS forward_
 endif()
 math(EXPR forward_length "${switch_start} - ${forward_start}")
 string(SUBSTRING "${cpu_source}" ${forward_start} ${forward_length} forward_preamble)
-string(REGEX MATCHALL "uint64_t start, end" scalar_declarations "${forward_preamble}")
+string(REGEX MATCHALL "gemmini_cpu_sample start, end" scalar_declarations "${forward_preamble}")
 list(LENGTH scalar_declarations scalar_declaration_count)
 if(NOT scalar_declaration_count EQUAL 1)
     message(FATAL_ERROR
-        "shared scalar endpoint declaration: expected 1, got ${scalar_declaration_count}")
+        "shared native endpoint declaration: expected 1, got ${scalar_declaration_count}")
 endif()
 
 string(SUBSTRING "${cpu_source}" ${forward_start} -1 cycle_region)
@@ -84,8 +95,8 @@ endif()
 
 string(SUBSTRING "${cpu_source}" ${switch_start} -1 remaining)
 foreach(label IN LISTS expected_labels)
-    set(start_token "start = gemmini_read_cycles();")
-    set(end_token "end = gemmini_read_cycles();")
+    set(start_token "start = gemmini_cpu_timing_read();")
+    set(end_token "end = gemmini_cpu_timing_read();")
     set(log_token "gemmini_log_cycle(layer, \"${label}\", start, end)")
     string(FIND "${remaining}" "${start_token}" start_pos)
     string(FIND "${remaining}" "${end_token}" end_pos)
@@ -93,14 +104,15 @@ foreach(label IN LISTS expected_labels)
     if(start_pos EQUAL -1 OR end_pos EQUAL -1 OR log_pos EQUAL -1 OR
        NOT start_pos LESS end_pos OR NOT end_pos LESS log_pos)
         message(FATAL_ERROR
-            "${label}: expected scalar start -> operation -> scalar end -> log")
+            "${label}: expected native start, operation, native end, log")
     endif()
-    math(EXPR operation_start "${start_pos} + 31")
+    string(LENGTH "${start_token}" start_length)
+    math(EXPR operation_start "${start_pos} + ${start_length}")
     math(EXPR operation_length "${end_pos} - ${operation_start}")
     string(SUBSTRING "${remaining}" ${operation_start} ${operation_length} operation_source)
     string(REGEX REPLACE "#[^\r\n]*" "" operation_source "${operation_source}")
     if(NOT operation_source MATCHES "[a-zA-Z_][a-zA-Z0-9_]* *\\(")
-        message(FATAL_ERROR "${label}: operation body is missing between scalar endpoints")
+        message(FATAL_ERROR "${label}: operation body is missing between native endpoints")
     endif()
     string(LENGTH "${log_token}" log_length)
     math(EXPR next_pos "${log_pos} + ${log_length}")
@@ -108,6 +120,10 @@ foreach(label IN LISTS expected_labels)
 endforeach()
 
 set(forbidden_cpu_tokens
+    "gemmini_read_cycles()"
+    "gemmini_log_cycle_record_v2(&record)"
+    "if (params->run_id)"
+    "if (params->ith)"
     "gemmini_read_native_cycle_sample_internal"
     "gemmini_native_cycle_sample_internal"
     "gemmini_log_cycle_record_v2_checked_internal"
@@ -128,10 +144,10 @@ foreach(token IN ITEMS "ggml-gemmini-utils/src" "cycle_reader_internal.h")
     endif()
 endforeach()
 
-require_gemmini_count("ggml::gemmini::cycle::read\\(\\)" 13
-    "Gemmini public scalar cycle endpoints")
-require_gemmini_count("uint64_t start = 0" 1 "Gemmini shared scalar start endpoint")
-require_gemmini_count("uint64_t end = 0" 1 "Gemmini shared scalar end endpoint")
+require_gemmini_count("ggml::gemmini::cycle::read\\(\\)" 0
+    "Gemmini outer scopes have no unowned scalar cycle endpoints")
+require_gemmini_count("gemmini_cpu_sample start\\{\\}, end\\{\\}" 1
+    "Gemmini shared native/host endpoint storage")
 require_gemmini_count(
     "rmd_telemetry_invocation_start = ggml::gemmini::read_matmul_cpu_sample\\(\\)" 1
     "Gemmini invocation start boundary")
@@ -139,30 +155,47 @@ require_gemmini_count(
     "rmd_telemetry_invocation_end = ggml::gemmini::read_matmul_cpu_sample\\(\\)" 1
     "Gemmini invocation end boundary")
 require_gemmini_count(
-    "quantize_start =[
- ]*ggml::gemmini::cycle::read\\(\\)" 1
+    "quantize_start = gemmini_cpu_timing_read\\(\\)" 1
     "Gemmini quantization start boundary")
 require_gemmini_count(
-    "quantize_end =[
- ]*ggml::gemmini::cycle::read\\(\\)" 1
+    "quantize_end = gemmini_cpu_timing_read\\(\\)" 1
     "Gemmini quantization end boundary")
 
 set(expected_gemmini_labels
     gemmini.prepare_args
     gemmini.select_tile
+    gemmini.activation_buffer_preparation
     gemmini.quantize_activation
     gemmini.prepare_dense_i8_weight
     gemmini.convert_q4_0_to_q4_h1
     gemmini.convert_q8_0_to_q8_h1
+    gemmini.prepare_weight
     gemmini.output_preparation)
 string(REGEX MATCHALL
-    "ggml::gemmini::log::cycle\\([^;]*\"gemmini\\.[a-zA-Z0-9_]+\"[^;]*\\)"
+    "log_outer_cpu_interval\\(args,[^;]*\"gemmini\\.[a-zA-Z0-9_]+\"[^;]*\\)"
     gemmini_records "${gemmini_source}")
 list(LENGTH gemmini_records gemmini_record_count)
-if(NOT gemmini_record_count EQUAL 7)
+if(NOT gemmini_record_count EQUAL 9)
     message(FATAL_ERROR
-        "Gemmini scalar record count: expected 7, got ${gemmini_record_count}")
+        "Gemmini native interval count: expected 9, got ${gemmini_record_count}")
 endif()
+
+foreach(token IN ITEMS "overlaps_rtl=true" "excluded_from_cycle_sink=true")
+    string(FIND "${gemmini_source}" "${token}" overlap_token)
+    if(NOT overlap_token EQUAL -1)
+        message(FATAL_ERROR "Gemmini must preserve timestamps without asserting overlap: ${token}")
+    endif()
+endforeach()
+foreach(token IN ITEMS "gemmini_cpu_timing_add(&totals, &start, &end)"
+                       "cycle::serialize_cpu_native(start, end)"
+                       "cycle::serialize_host_timing(start.ns, end.ns, start.tid, end.tid)"
+                       "matmul_invocation_id" "MATMUL_CONFIGURATION"
+                       "quantize_start, quantize_end, false, result")
+    string(FIND "${gemmini_source}" "${token}" required_token)
+    if(required_token EQUAL -1)
+        message(FATAL_ERROR "Gemmini native context/endpoint contract missing ${token}")
+    endif()
+endforeach()
 set(actual_gemmini_labels)
 foreach(record IN LISTS gemmini_records)
     string(REGEX REPLACE
@@ -202,7 +235,6 @@ set(forbidden_gemmini_tokens
     "telemetry_execution_route"
     "invocation_valid"
     "invocation_reason"
-    "cpu_work"
     "CpuWork")
 foreach(token IN LISTS forbidden_gemmini_tokens)
     string(FIND "${gemmini_source}" "${token}" token_pos)
@@ -233,17 +265,27 @@ foreach(operation IN ITEMS
         message(FATAL_ERROR "Missing real IM2P host CPU boundary: ${operation}")
     endif()
 endforeach()
-# Both callback and FULL must connect the actual event to the direct worker metrics.
+# The captured FULL and PIPELINE callbacks bind the actual event, while the
+# upstream baseline FULL path obtains the optional run from its own metadata.
 string(REGEX MATCHALL "direct_metrics[.]run_id[ ]*=[^;]*" direct_run_bindings "${im2p_source}")
 list(LENGTH direct_run_bindings direct_run_count)
-if(NOT direct_run_count EQUAL 2)
-    message(FATAL_ERROR "FULL and PIPELINE must preserve direct worker run identity, including zero")
+if(NOT direct_run_count EQUAL 3)
+    message(FATAL_ERROR "All three direct worker callsites must preserve run identity, including zero")
 endif()
+set(event_run_count 0)
+set(metadata_run_count 0)
 foreach(binding IN LISTS direct_run_bindings)
-    if(NOT binding STREQUAL "direct_metrics.run_id = event.run_id")
-        message(FATAL_ERROR "Direct worker identity must come from the actual event")
+    if(binding STREQUAL "direct_metrics.run_id = event.run_id")
+        math(EXPR event_run_count "${event_run_count} + 1")
+    elseif(binding STREQUAL "direct_metrics.run_id = metadata->run_id")
+        math(EXPR metadata_run_count "${metadata_run_count} + 1")
+    else()
+        message(FATAL_ERROR "Direct worker identity must come from its actual event or metadata: ${binding}")
     endif()
 endforeach()
+if(NOT event_run_count EQUAL 2 OR NOT metadata_run_count EQUAL 1)
+    message(FATAL_ERROR "Expected two event bindings and one baseline metadata binding")
+endif()
 
 message(STATUS
     "CPU operation coverage and IM2P host boundary contract passed")

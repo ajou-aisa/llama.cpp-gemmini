@@ -108,7 +108,15 @@ int main(int argc, char ** argv) {
     dlclose(image);
     if (!restore_ok || !stderr_output.empty() ||
         cycle_output.find("\"record_type\":\"WS_LOOP_TELEMETRY\"") == std::string::npos ||
-        cycle_output.find("\"valid\":true") == std::string::npos ||
+        // Raw occupancy counters remain useful diagnostics, but this synthetic
+        // call establishes neither their device window nor wrap validity.
+        cycle_output.find("\"valid\":false") == std::string::npos ||
+        cycle_output.find("\"reason\":\"device_counter_window_and_wrap_unverified\"") == std::string::npos ||
+        cycle_output.find("\"load_occupancy_cycles\":10") == std::string::npos ||
+        cycle_output.find("\"execute_occupancy_cycles\":20") == std::string::npos ||
+        cycle_output.find("\"store_occupancy_cycles\":30") == std::string::npos ||
+        cycle_output.find("\"loop_occupancy_cycles\":40") == std::string::npos ||
+        cycle_output.find("\"additive\":false") == std::string::npos ||
         cycle_output.find('\n') == std::string::npos) {
         std::cerr << "cross-image CycleLog routing failed: cycle_bytes=" << cycle_output.size()
                   << " stderr_bytes=" << stderr_output.size() << '\n';

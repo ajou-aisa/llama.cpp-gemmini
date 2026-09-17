@@ -1501,8 +1501,8 @@ bool direct_host_profile_output(const std::filesystem::path & output_path, size_
                        integer_values_equal(output, expected) &&
                        integer_values_equal(disabled_output, expected),
                    "direct host profiling preserves independent reference output") ||
-            !check(profiled_size > 0 && std::filesystem::file_size(path) == profiled_size,
-                   "disabled direct host profiling emits no record") ||
+            !check(profiled_size > 0 && std::filesystem::file_size(path) > profiled_size,
+                   "disabled detailed profiling still preserves raw CPU records") ||
             !check(metrics.event_count == events.size() && metrics.call_count == 1 &&
                        metrics.j_tile_count == 3 && metrics.native_q8_values == 0 &&
                        disabled_metrics.event_count == metrics.event_count &&
@@ -1511,11 +1511,44 @@ bool direct_host_profile_output(const std::filesystem::path & output_path, size_
 
         std::ifstream input(path);
         input.seekg(static_cast<std::streamoff>(profile_offset));
-        std::string line, extra;
-        if (!check(static_cast<bool>(std::getline(input, line)) && !std::getline(input, extra),
-                   "each direct execution emits exactly one JSONL profile")) return false;
         try {
-            const Json profile = Json::parse(line);
+            std::vector<Json> profiles, raw;
+            size_t disabled_profiles = 0, disabled_raw = 0;
+            for (std::string line; std::getline(input, line);) {
+                const auto record = Json::parse(line);
+                if (record.at("record_type") == "RESIDUAL_HOST_PROFILE") {
+                    if (record.at("run_id") == run_id) profiles.push_back(record);
+                    else ++disabled_profiles;
+                } else if (record.at("record_type") == "CPU_INTERVAL") {
+                    if (record.at("run_id") == run_id) raw.push_back(record);
+                    else ++disabled_raw;
+                }
+            }
+            if (!check(profiles.size() == 1 && disabled_profiles == 0 && disabled_raw != 0,
+                       "host-profile option controls only its one detailed record")) return false;
+            size_t raw_tiles = 0, raw_workers = 0, raw_phases = 0, raw_deep = 0;
+            for (const auto & record : raw) {
+                if (!check(record.at("layer") == layer && record.at("stripe_id") == stripe_id &&
+                               record.at("worker_id").is_number_unsigned() &&
+                               record.at("host_timing").at("valid") == true &&
+                               record.at("native_cycles").at("start").contains("owner_token") &&
+                               record.at("native_cycles").at("end").contains("generation") &&
+                               record.contains("thread_cpu_timing") && record.at("additive") == false,
+                           "direct raw spans retain identity, wall time, native endpoints and provenance")) return false;
+                const std::string op = record.at("op");
+                if (op == "rmd_direct_j_tile_interval") {
+                    ++raw_tiles;
+                    if (!check(record.at("node_id").is_number_unsigned() && record.at("node_id") < 3,
+                               "raw J tile uses its actual tile index")) return false;
+                } else if (op == "rmd.cpu_direct.worker") ++raw_workers;
+                else if (op == "rmd.cpu_direct.event_scan" || op == "rmd.cpu_direct.weight_dot" ||
+                         op == "rmd.cpu_direct.scale_apply") ++raw_deep;
+                else ++raw_phases;
+            }
+            if (!check(raw_tiles == 3 && raw_workers != 0 && raw_phases == 4 &&
+                           raw_deep == (deep_profile ? active_row_blocks * 3 * 3 : 0),
+                       "raw CPU records cover every tile, worker, phase and requested deep stage")) return false;
+            const Json & profile = profiles.front();
             const auto & workload = profile.at("workload");
             if (!check(profile.at("record_type") == "RESIDUAL_HOST_PROFILE" &&
                            profile.at("layer") == layer &&
