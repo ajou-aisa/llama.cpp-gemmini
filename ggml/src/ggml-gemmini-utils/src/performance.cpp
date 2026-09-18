@@ -617,7 +617,6 @@ void reset() {
 }
 
 void finish_recording() {
-    log::cycle.flush();
     emit_event("session_end", 0);
 }
 
@@ -643,7 +642,6 @@ void begin_operation(Phase phase, uint64_t start_ns) {
 void end_operation(uint64_t end_ns, bool success) {
     auto context = capture_context();
     if (!context.operation_id) return;
-    log::cycle.flush();
     emit_event("operation_end", end_ns, success);
     context.operation_id = 0;
     publish_context(context);
@@ -651,14 +649,12 @@ void end_operation(uint64_t end_ns, bool success) {
 
 void token_ready(uint64_t ready_ns, std::optional<int32_t> token_id) {
     if (!capture_context().request_id) return;
-    log::cycle.flush();
     emit_event("token_ready", ready_ns, true, token_id);
 }
 
 void finish_request(uint64_t end_ns) {
     if (!capture_context().request_id) return;
     end_operation(end_ns, false);
-    log::cycle.flush();
     emit_event("request_end", end_ns);
     publish_context({});
 }
@@ -748,13 +744,15 @@ Summary read_summary(std::istream & input) {
             const auto record = parse_line(line);
             if (!record.is_object()) throw std::runtime_error("invalid_jsonl_record");
             const auto type = record.value("record_type", std::string());
+            const auto kind = record.value("kind", std::string());
+            const bool compact_cpu_interval = type.empty() && kind == "cpu" && record.contains("cpu_interval_sequence");
             if (type == "LOG_ERROR" || type == "LOG_FAILURE") throw std::runtime_error("log_collection_failure");
             const bool event = type == "INFERENCE_EVENT";
             const bool resource = type == "RESOURCE_SAMPLE";
             if (!event && !resource) {
                 const bool included = record.contains("inference_context") && !record.at("inference_context").is_null();
                 if (included) match_context(record, state);
-                if (type == "CPU_INTERVAL" && included && state.operation.active) {
+                if ((type == "CPU_INTERVAL" || compact_cpu_interval) && included && state.operation.active) {
                     ++state.operation.cpu_interval_records;
                     if (record.contains("cpu_interval_sequence"))
                         state.operation.cpu_interval_sequences.push_back(number(record, "cpu_interval_sequence"));

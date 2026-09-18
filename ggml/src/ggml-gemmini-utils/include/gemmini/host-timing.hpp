@@ -15,6 +15,7 @@ struct HostSample {
 };
 
 uint64_t host_thread_id() noexcept;
+uint64_t timeline_now_ns() noexcept;
 const std::string &host_execution_id();
 HostSample read_host_sample() noexcept;
 std::string serialize_host_timing(uint64_t start_ns, uint64_t end_ns,

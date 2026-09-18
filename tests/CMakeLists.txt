@@ -195,7 +195,8 @@ target_link_libraries(test-gemmini-log PRIVATE ggml-gemmini-utils llama)
 target_compile_features(test-gemmini-log PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-log PRIVATE
     EXPECT_LOG_DEBUG=$<IF:$<BOOL:${LOG_DEBUG}>,1,0>
-    EXPECT_LOG_CYCLE=$<IF:$<BOOL:${LOG_CYCLE}>,1,0>)
+    EXPECT_LOG_CYCLE=$<IF:$<BOOL:${LOG_CYCLE}>,1,0>
+    EXPECT_CYCLE_DETAIL=$<IF:$<BOOL:${CYCLE_DETAIL}>,1,0>)
 target_include_directories(test-gemmini-log PRIVATE
     ../ggml/src/ggml-gemmini-utils/include
     ../src)
@@ -210,7 +211,8 @@ target_link_libraries(test-gemmini-log-boundary PRIVATE ggml-gemmini-utils)
 target_compile_features(test-gemmini-log-boundary PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-log-boundary PRIVATE
     EXPECT_LOG_DEBUG=$<IF:$<BOOL:${LOG_DEBUG}>,1,0>
-    EXPECT_LOG_CYCLE=$<IF:$<BOOL:${LOG_CYCLE}>,1,0>)
+    EXPECT_LOG_CYCLE=$<IF:$<BOOL:${LOG_CYCLE}>,1,0>
+    EXPECT_CYCLE_DETAIL=$<IF:$<BOOL:${CYCLE_DETAIL}>,1,0>)
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
     CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
     target_include_directories(test-gemmini-log-boundary PRIVATE
@@ -224,13 +226,15 @@ target_link_libraries(test-gemmini-log-boundary PRIVATE Threads::Threads)
 target_link_libraries(test-gemmini-host-timing PRIVATE ggml-gemmini-utils Threads::Threads)
 target_compile_features(test-gemmini-host-timing PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-host-timing PRIVATE
-    EXPECT_LOG_CYCLE=$<IF:$<BOOL:${LOG_CYCLE}>,1,0>)
+    EXPECT_LOG_CYCLE=$<IF:$<BOOL:${LOG_CYCLE}>,1,0>
+    EXPECT_CYCLE_DETAIL=$<IF:$<BOOL:${CYCLE_DETAIL}>,1,0>)
 add_test(NAME test-gemmini-host-timing COMMAND $<TARGET_FILE:test-gemmini-host-timing>)
 add_executable(test-gemmini-trace-context test-gemmini-trace-context.cpp)
 target_link_libraries(test-gemmini-trace-context PRIVATE ggml-gemmini-utils Threads::Threads)
 target_compile_features(test-gemmini-trace-context PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-trace-context PRIVATE
-    EXPECT_LOG_CYCLE=$<IF:$<BOOL:${LOG_CYCLE}>,1,0>)
+    EXPECT_LOG_CYCLE=$<IF:$<BOOL:${LOG_CYCLE}>,1,0>
+    EXPECT_CYCLE_DETAIL=$<IF:$<BOOL:${CYCLE_DETAIL}>,1,0>)
 add_test(NAME test-gemmini-trace-context COMMAND $<TARGET_FILE:test-gemmini-trace-context>
     ${CMAKE_CURRENT_BINARY_DIR}/trace-context)
 

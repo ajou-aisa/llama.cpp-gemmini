@@ -102,22 +102,41 @@ bool test_context_and_delayed_records(const std::filesystem::path &path) {
                legacy["inference_context"]["operation_id"] == origin.inference_operation_id &&
                origin.request_id != current.request_id,
                "late worker retains origin instead of latest global request")) return false;
+#if EXPECT_CYCLE_DETAIL
     if (!check(raw["record_type"] == "OPERATOR_SEGMENT" && !raw.contains("cpu_interval_sequence") &&
                raw["operator_context"]["request_id"] == origin.request_id &&
                raw["operator_context"]["inference_operation_id"] == origin.inference_operation_id &&
                raw["operation_success"] == false &&
                raw["thread_cpu_timing"]["valid"] == true,
-               "raw canceled segment retains valid owner timing independently of outcome")) return false;
+               "detail raw canceled segment retains owner timing independently of outcome")) return false;
+#else
+    if (!check(raw["kind"] == "segment" && !raw.contains("cpu_interval_sequence") &&
+               raw["inference_context"]["request_id"] == origin.request_id &&
+               raw["inference_context"]["operation_id"] == origin.inference_operation_id &&
+               raw["operation_success"] == false && !raw.contains("thread_cpu_timing") &&
+               !raw.contains("host_timing") && !raw.contains("record_type") &&
+               raw["ns_start"].get<uint64_t>() <= raw["ns_end"].get<uint64_t>(),
+               "compact raw segment retains origin, shared timeline, and outcome without nested timing metadata")) return false;
+#endif
     if (!check(!empty.contains("inference_context") && !empty.contains("operator_context"),
                "captured-empty origin never inherits unrelated request")) return false;
     const auto &meta = legacy["operator_context"];
+#if EXPECT_CYCLE_DETAIL
     if (!check(meta["operator_id"] == origin.operator_id && meta["operator_kind"] == "MUL_MAT" &&
                meta["node_id"] == 0 && meta["worker_id"] == 0 && meta["role"] == "dense" &&
                meta["device"] == "cpu" && meta["parent_task_id"] == origin.task_id &&
                meta["task_id"] != origin.task_id &&
                legacy["host_timing"]["start_tid"] == legacy["host_timing"]["end_tid"] &&
                worker_start.tid != cycle::host_thread_id(),
-               "operator, optional zero IDs, task lineage and true sample owner survive buffering")) return false;
+               "detail metadata preserves duplicated device/timing attribution")) return false;
+#else
+    if (!check(meta["operator_id"] == origin.operator_id && meta["operator_kind"] == "MUL_MAT" &&
+               meta["role"] == "dense" && meta["parent_task_id"] == origin.task_id &&
+               meta["task_id"] != origin.task_id && legacy["node_id"] == 0 && legacy["worker_id"] == 0 &&
+               !meta.contains("node_id") && !meta.contains("worker_id") && !meta.contains("device") &&
+               worker_start.tid != cycle::host_thread_id(),
+               "compact metadata keeps task lineage while top-level identity is not duplicated")) return false;
+#endif
 #else
     if (!check(rows.empty() && base == 0 && origin.flags == 0,
                "disabled logging allocates no identity and emits no records")) return false;
@@ -138,8 +157,14 @@ bool test_counter_task_separation() {
     a.trace.task_id = b.trace.task_id;
     gemmini_cpu_totals zero{};
     gemmini_cpu_timing_add(&zero, &a, &b);
+#if EXPECT_CYCLE_DETAIL
     if (!check(zero.thread_cpu_valid_count == 1 && zero.thread_cpu_ns == 0,
                "valid zero thread time is preserved")) return false;
+#else
+    if (!check(zero.thread_cpu_valid_count == 0 && zero.thread_cpu_reason != nullptr &&
+               std::string(zero.thread_cpu_reason) == "cycle_detail_disabled",
+               "compact cycle mode omits thread CPU time")) return false;
+#endif
     b.tid = 8;
     json = Json::parse(cycle::serialize_cpu_native(a,b));
 #if defined(__linux__) && defined(__aarch64__)
@@ -157,15 +182,22 @@ bool test_uniform_device_metadata() {
     const auto npu = Json::parse(trace::append_metadata(
         R"({"schema":"gemmini.cycle","version":2,"record_type":"NPU_OPERATOR_SEGMENT","op":"rmd.matmul.execute","backend":"im2p_sim","clock_domain":"independent_rmd_simulator","cycles":0,"valid":true})",context,62));
     const auto &a = cpu["operator_context"]; const auto &b = npu["operator_context"];
+#if EXPECT_CYCLE_DETAIL
     if (!check(a["operator_kind"] == b["operator_kind"] && a["stage"] == b["stage"] &&
                a["role"] == b["role"] && a["device"] == "cpu" && b["device"] == "npu" &&
                b["backend"] == "im2p_sim" && npu["cycles"] == 0 && npu["valid"] == true,
-               "same operator/stage/role across devices preserves measured zero")) return false;
+               "detail metadata carries uniform device attribution")) return false;
+#else
+    if (!check(a["operator_kind"] == b["operator_kind"] && a["stage"] == b["stage"] &&
+               a["role"] == b["role"] && !a.contains("device") && !b.contains("device") &&
+               npu["backend"] == "im2p_sim" && npu["cycles"] == 0 && npu["valid"] == true,
+               "compact metadata avoids duplicating device/backend fields")) return false;
+#endif
     auto envelope = Json::parse(trace::append_metadata(
         R"({"record_type":"OPERATOR_SEGMENT","op":"operator.host_dispatch"})",context,63));
     if (!check(envelope["operator_context"]["structural_reason"] == "structurally_cross_task" &&
                envelope["operator_context"]["scope"] == "caller_thread_envelope" &&
-               a["structural_reason"].is_null(),
+               (!a.contains("structural_reason") || a["structural_reason"].is_null()),
                "parent cross-task structure does not invalidate measurable children")) return false;
 #endif
     return true;
@@ -195,9 +227,16 @@ bool test_thread_reuse_and_bounded_buffer(const std::filesystem::path &path) {
         const auto &c = row.at("operator_context");
         task_ids.insert(c.at("task_id").get<uint64_t>());
         segment_ids.insert(c.at("segment_id").get<uint64_t>());
+#if EXPECT_CYCLE_DETAIL
         if (!check(c["operator_id"] == 72 && c["parent_task_id"] == root.task_id &&
                    row["host_timing"]["start_tid"] == row["host_timing"]["end_tid"],
-                   "reused OS worker preserves distinct task identity")) return false;
+                   "detail reused OS worker preserves distinct task identity")) return false;
+#else
+        if (!check(c["operator_id"] == 72 && c["parent_task_id"] == root.task_id &&
+                   row["kind"] == "segment" && !row.contains("host_timing") &&
+                   row["ns_start"].get<uint64_t>() <= row["ns_end"].get<uint64_t>(),
+                   "compact reused worker preserves task identity on the shared timeline")) return false;
+#endif
     }
     if (!check(rows.size() == threads*per_thread && task_ids.size() == rows.size() &&
                segment_ids.size() == rows.size() && stats.peak_entries <= stats.max_entries &&

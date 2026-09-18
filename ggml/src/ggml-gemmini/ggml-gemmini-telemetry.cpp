@@ -22,6 +22,7 @@ std::string serialize_matmul_cpu_interval(log::CycleRecord record,
     std::string json = log::serialize_checked_cycle_record(record, interval.cycles.has_value(),
         interval.reason.empty() ? nullptr : interval.reason.c_str(),
         interval.sample_reason.empty() ? nullptr : interval.sample_reason.c_str());
+#if CYCLE_DETAIL
     const auto cpu_sample = [](const MatmulCpuSample & sample) {
         gemmini_cpu_sample result{};
         result.trace = sample.trace;
@@ -39,6 +40,8 @@ std::string serialize_matmul_cpu_interval(log::CycleRecord record,
 #endif
         return result;
     };
+#endif
+#if CYCLE_DETAIL
     json.insert(json.rfind('}'),
         std::string(",\"cpu_measurement_version\":1,\"operation_success\":") +
         (operation_success ? "true" : "false") + ",\"additive\":false,\"host_timing\":" +
@@ -47,6 +50,10 @@ std::string serialize_matmul_cpu_interval(log::CycleRecord record,
         ",\"thread_cpu_timing\":" + cycle::serialize_thread_cpu_timing(
             {start.ns, start.tid, start.thread_cpu_ns, start.thread_cpu_valid},
             {end.ns, end.tid, end.thread_cpu_ns, end.thread_cpu_valid}));
+#else
+    json.insert(json.rfind('}'),
+        std::string(",\"operation_success\":") + (operation_success ? "true" : "false"));
+#endif
     return trace::annotate_origin(std::move(json), start.trace);
 }
 
@@ -547,7 +554,7 @@ std::string serialize_cycle_telemetry(const Im2pStripeTelemetry & record) {
 }
 
 std::string serialize_cycle_telemetry(const QuantizationStripeTelemetry & record) {
-#if !LOG_CYCLE
+#if !LOG_CYCLE || !CYCLE_DETAIL
     (void) record;
     return {};
 #else
@@ -699,11 +706,13 @@ std::string serialize_cycle_telemetry(const RmdStripeTelemetry & record) {
             nullable_string_field(out, (std::string(name) + "_reason").c_str(), valid ? "" :
                 stage.calls == 0 ? "no_samples" : reason ? reason : "invalid_sample");
         };
+#if CYCLE_DETAIL
         sample("wall_ns", stage.wall_ns, stage.calls && stage.wall_valid, "invalid_host_interval");
         sample("thread_cpu_ns", stage.cpu.thread_cpu_ns,
             stage.calls && stage.cpu.interval_count == stage.calls &&
             stage.cpu.thread_cpu_valid_count == stage.calls && !stage.cpu.thread_cpu_reason,
             stage.cpu.thread_cpu_reason);
+#endif
         sample("native_cycles", stage.cpu.cycles,
             stage.calls && stage.cpu.interval_count == stage.calls &&
             stage.cpu.cycles_valid_count == stage.calls && !stage.cpu.cycles_reason,
@@ -716,7 +725,7 @@ std::string serialize_cycle_telemetry(const RmdStripeTelemetry & record) {
 }
 
 std::string serialize_cycle_telemetry(const PipelineStripeTelemetry & record) {
-#if !LOG_CYCLE
+#if !LOG_CYCLE || !CYCLE_DETAIL
     (void) record;
     return {};
 #else

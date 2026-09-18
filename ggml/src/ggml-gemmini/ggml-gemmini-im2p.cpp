@@ -186,7 +186,9 @@ public:
     active_ = false;
     // Only these stages are CPU work. Submission, fencing and simulator calls
     // can block on NPU progress and cannot certify a CPU-work wall interval.
+#if CYCLE_DETAIL
     if (cpu_work_) performance::record_cpu_wall(start_.ns, end.ns);
+#endif
     try {
       log::cycle.write_json(serialize_matmul_cpu_interval(
           record_, start_, end, operation_success));
@@ -2596,7 +2598,9 @@ void log_rmd_stats(const Completion &completion,
   device_diagnostics(record, args, completion.rmd_stats, true);
   record.mode = "full";
   emit_cycle_telemetry(record);
+#if CYCLE_DETAIL
   log::cycle.flush();
+#endif
 #else
   (void)completion;
   (void)args;
@@ -2638,7 +2642,7 @@ void log_stats(const char * mode, const Stats & stats,
   record.rtl_stripe_rows_published = stats.rtl_stripe_rows_published;
   device_diagnostics(record, args, stats);
   emit_cycle_telemetry(record);
-#if LOG_CYCLE
+#if LOG_CYCLE && CYCLE_DETAIL
   log::cycle.flush();
 #endif
 #else

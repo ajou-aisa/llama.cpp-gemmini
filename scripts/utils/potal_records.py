@@ -19,6 +19,24 @@ from scripts.utils.residual_profile import _mapping
 IDENTITY: Final = ("matmul_invocation_id", "run_id", "layer", "stripe_id", "slot", "node_id", "worker_id")
 MIRRORED: Final = frozenset({"TIMELINE", "STAGE", "EXSIA_WORKLOAD"})
 
+COMPACT_RECORD_TYPES: Final = {
+    "cpu": "CPU_INTERVAL",
+    "segment": "OPERATOR_SEGMENT",
+    "cycle": "CYCLE_INTERVAL",
+}
+
+
+def effective_record_type(data: Mapping[str, JsonValue], line: int) -> str:
+    raw = data.get("record_type")
+    if raw is not None:
+        if not isinstance(raw, str) or not raw:
+            raise CycleSchemaError(line, "record_type must be a nonempty string")
+        return raw
+    kind = data.get("kind")
+    if isinstance(kind, str) and kind in COMPACT_RECORD_TYPES:
+        return COMPACT_RECORD_TYPES[kind]
+    raise CycleSchemaError(line, "missing record_type/kind")
+
 
 @dataclass(frozen=True)
 class Record:
@@ -62,9 +80,22 @@ def json_records(path: Path) -> Iterator[tuple[int, Mapping[str, JsonValue]]]:
             if not contents.endswith("\n"):
                 raise CycleSchemaError(line, f"{path}: truncated JSONL")
             data = _mapping(parse_json_line(contents, line), line)
-            if data.get("schema") != "gemmini.cycle" or type(data.get("version")) is not int or data["version"] != 2:
-                raise CycleSchemaError(line, f"{path}: unsupported schema/version")
-            text(data, "record_type", line)
+            compact = data.get("record_type") is None and data.get("kind") in COMPACT_RECORD_TYPES
+            if compact:
+                if not isinstance(data.get("op"), str) or not data["op"]:
+                    raise CycleSchemaError(line, f"{path}: compact interval requires op")
+                for key in ("start", "end"):
+                    integer(data.get(key), line)
+                if type(data.get("valid")) is not bool:
+                    raise CycleSchemaError(line, f"{path}: compact interval requires boolean valid")
+                if data.get("valid") is True:
+                    integer(data.get("delta"), line)
+                elif data.get("delta") is not None:
+                    raise CycleSchemaError(line, f"{path}: invalid compact interval must have null delta")
+            else:
+                if data.get("schema") != "gemmini.cycle" or type(data.get("version")) is not int or data["version"] != 2:
+                    raise CycleSchemaError(line, f"{path}: unsupported schema/version")
+            effective_record_type(data, line)
             yield line, data
 
 
@@ -86,6 +117,8 @@ def open_capture(main: Path, detail: Path | None, binary: Path) -> Capture:
 
 def parse_record(capture: Capture, source: Path, item: tuple[int, Mapping[str, JsonValue]]) -> Record:
     line, data = item
+    if "record_type" not in data:
+        data = {**data, "record_type": effective_record_type(data, line)}
     for key in IDENTITY:
         value = data.get(key)
         if value is not None:

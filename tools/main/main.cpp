@@ -25,7 +25,7 @@
 namespace perf = ggml::gemmini::performance;
 
 static uint64_t performance_now_ns() {
-    return ggml::gemmini::cycle::read_host_sample().ns;
+    return ggml::gemmini::cycle::timeline_now_ns();
 }
 
 #if LOG_CYCLE
@@ -33,7 +33,7 @@ static void log_inference_configuration(const common_params & params, llama_mode
                                         llama_context * ctx, size_t input_tokens,
                                         size_t cached_tokens, bool separate_batch_pool) {
     using Json = nlohmann::json;
-    const auto sample = ggml::gemmini::cycle::read_host_sample();
+    const uint64_t timestamp_ns = performance_now_ns();
     const auto pool = [](const cpu_params & cpu) {
         Json mask = nullptr;
         if (cpu.mask_valid) {
@@ -63,7 +63,7 @@ static void log_inference_configuration(const common_params & params, llama_mode
     llama_model_desc(model, description, sizeof(description));
     Json record = {{"schema", "gemmini.cycle"}, {"version", 2},
         {"record_type", "INFERENCE_CONFIGURATION"}, {"execution_id", ggml::gemmini::cycle::host_execution_id()},
-        {"timestamp_ns", sample.ns}, {"inference_context", nullptr},
+        {"timestamp_ns", timestamp_ns}, {"inference_context", nullptr},
         {"build_commit", LLAMA_COMMIT}, {"build_compiler", LLAMA_COMPILER},
         {"build_target", LLAMA_BUILD_TARGET}, {"model_path", params.model.path},
         {"model_description", description}, {"model_parameters", llama_model_n_params(model)},
@@ -79,8 +79,19 @@ static void log_inference_configuration(const common_params & params, llama_mode
         {"separate_batch_pool", separate_batch_pool}, {"environment", environment},
         {"registered_devices", devices}, {"registered_devices_are_dispatch_evidence", false},
         {"seed", params.sampling.seed}, {"temperature", params.sampling.temp},
+        {"cycle_detail", CYCLE_DETAIL != 0},
+        {"interval_format", CYCLE_DETAIL ? "gemmini.cycle.v2" : "op-cycle-v2"},
+        {"cpu_cycle_unit", "cycle"}, {"timeline_clock", "steady_clock"},
+        {"timeline_unit", "nanosecond"},
         {"cpu_affinity_observed", nullptr}, {"cpu_frequency_policies", nullptr},
         {"host_policy_reason", "unsupported_platform"}};
+#if defined(__linux__) && defined(__aarch64__)
+    record["cpu_cycle_source"] = "linux_perf_cpu_cycles";
+#elif defined(__riscv)
+    record["cpu_cycle_source"] = "riscv_cycle";
+#else
+    record["cpu_cycle_source"] = "host_tick";
+#endif
 #if defined(__linux__)
     std::ifstream status("/proc/self/status");
     std::string line;
@@ -132,10 +143,19 @@ static void print_final_performance() {
 class InferenceOperation {
 public:
     explicit InferenceOperation(perf::Phase phase, const char * op, bool cpu_work = false)
-        : start_ns(performance_now_ns()), op(op), cpu_work(cpu_work) {
+        : start_ns(performance_now_ns()), op(op)
+#if CYCLE_DETAIL
+        , cpu_work(cpu_work)
+#endif
+    {
+#if !CYCLE_DETAIL
+        (void) cpu_work;
+#endif
         perf::begin_operation(phase, start_ns);
         start = gemmini_cpu_timing_read();
+#if CYCLE_DETAIL
         if (cpu_work) work_start_ns = performance_now_ns();
+#endif
 #if !LOG_CYCLE
         perf::incomplete_cpu_wall("LOG_CYCLE_disabled");
 #endif
@@ -158,7 +178,9 @@ public:
 #else
         (void) end;
 #endif
+#if CYCLE_DETAIL
         if (cpu_work) perf::record_cpu_wall(work_start_ns, end_ns);
+#endif
         perf::end_operation(end_ns, success);
         finished = true;
         return end_ns;
@@ -166,10 +188,14 @@ public:
 
 private:
     uint64_t start_ns;
+#if CYCLE_DETAIL
     uint64_t work_start_ns = 0;
+#endif
     gemmini_cpu_sample start{};
     [[maybe_unused]] const char * op;
+#if CYCLE_DETAIL
     bool cpu_work;
+#endif
     bool finished = false;
 };
 

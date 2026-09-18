@@ -559,16 +559,27 @@ static bool test_atomic_cycle_sink(const std::filesystem::path & root) {
     const std::string combined = read_file(first) + read_file(second);
     if (combined.find("\"layer\":\"c-layer\\n\"") == std::string::npos ||
         combined.find("\"op\":\"c-op\\\"\"") == std::string::npos ||
-        combined.find("\"run_id\":null") == std::string::npos ||
-        combined.find("\"stripe_id\":null") == std::string::npos ||
         combined.find("\"delta\":3") == std::string::npos ||
         combined.find("\"layer\":\"cpp-layer\"") == std::string::npos ||
         combined.find("\"record_type\":\"TEST_AGGREGATE\"") == std::string::npos ||
-        combined.find("\"record_type\":\"CYCLE_INTERVAL\"") == std::string::npos ||
         combined.find("\"record_type\":\"WS_LOOP_TELEMETRY\"") == std::string::npos) {
         std::cerr << "structured C/C++ cycle fields were not preserved\n";
         return false;
     }
+#if EXPECT_CYCLE_DETAIL
+    if (combined.find("\"run_id\":null") == std::string::npos ||
+        combined.find("\"stripe_id\":null") == std::string::npos ||
+        combined.find("\"record_type\":\"CYCLE_INTERVAL\"") == std::string::npos) {
+        std::cerr << "detail cycle schema was not preserved\n";
+        return false;
+    }
+#else
+    if (combined.find("{\"op\":\"c-op\\\"\",\"kind\":\"cycle\"") == std::string::npos ||
+        combined.find("\"record_type\":\"CYCLE_INTERVAL\"") != std::string::npos) {
+        std::cerr << "compact cycle schema was not preserved\n";
+        return false;
+    }
+#endif
     return true;
 #endif
 }

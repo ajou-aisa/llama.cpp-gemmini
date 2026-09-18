@@ -204,11 +204,15 @@ public:
         if (timing_ == nullptr) return;
         const auto end = gemmini_cpu_timing_read();
         ++timing_->calls;
+#if CYCLE_DETAIL
         uint64_t sum = 0;
         timing_->wall_valid = timing_->wall_valid && start_.tid != 0 &&
             start_.tid == end.tid && end.ns >= start_.ns &&
             !__builtin_add_overflow(timing_->wall_ns, end.ns - start_.ns, &sum);
         if (timing_->wall_valid) timing_->wall_ns = sum;
+#else
+        timing_->wall_valid = false;
+#endif
         gemmini_cpu_timing_add(&timing_->cpu, &start_, &end);
         constexpr std::array<const char *, static_cast<size_t>(RmdHostStage::count)> names{
             "rmd.preparation", "rmd.weight_gather", "rmd.block_scale_metadata",

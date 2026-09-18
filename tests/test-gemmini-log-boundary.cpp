@@ -343,13 +343,24 @@ static bool test_worker_cycle_buffers(const std::filesystem::path & root) {
     for (std::size_t worker = 0; worker < thread_count; ++worker) {
         for (std::size_t record = 0; record < records; ++record) {
             const std::string suffix = std::to_string(worker) + "_" + std::to_string(record);
+#if EXPECT_CYCLE_DETAIL
             const std::string names = "\"layer\":\"worker_" + std::to_string(worker) +
                 "_record_" + std::to_string(record) + "\",\"op\":\"stack_op_" + suffix + "\"";
+#else
+            const std::string names = "{\"op\":\"stack_op_" + suffix +
+                "\",\"kind\":\"cpu\",\"layer\":\"worker_" + std::to_string(worker) +
+                "_record_" + std::to_string(record) + "\"";
+#endif
             if (json.find(names) == std::string::npos) return false;
         }
     }
+#if EXPECT_CYCLE_DETAIL
     if (json.find("\"start_ns\":99") != std::string::npos ||
         json.find("\"start_ns\":10") == std::string::npos) return false;
+#else
+    if (json.find("\"start_ns\"") != std::string::npos ||
+        json.find("\"thread_cpu_timing\"") != std::string::npos) return false;
+#endif
 #else
     (void) root;
 #endif
@@ -550,14 +561,14 @@ int main() {
         {"scalar", "public.equal", 10, 10, nullptr, 0, nullptr});
     const std::string legacy_regression = ggml::gemmini::log::serialize_cycle_record(
         {"scalar", "public", 12, 10, nullptr, 0, nullptr});
-#if defined(__linux__) && defined(__aarch64__)
-    const bool regression_matches = legacy_regression.find(
-        "\"start\":12,\"end\":10,\"delta\":null,\"valid\":false,\"reason\":\"counter_regression\"") !=
-            std::string::npos;
-#else
+#if EXPECT_CYCLE_DETAIL && (!defined(__linux__) || !defined(__aarch64__))
     const bool regression_matches = legacy_regression.find(
         "\"start\":12,\"end\":10,\"delta\":0,\"valid\":false") != std::string::npos &&
         legacy_regression.find("\"reason\"") == std::string::npos;
+#else
+    const bool regression_matches = legacy_regression.find(
+        "\"start\":12,\"end\":10,\"delta\":null,\"valid\":false,\"reason\":\"counter_regression\"") !=
+            std::string::npos;
 #endif
     const std::string linux_monotonic =
         ggml::gemmini::log::testing::serialize_linux_aarch64_scalar_cycle_record_for_test(
@@ -569,7 +580,12 @@ int main() {
         legacy_equal.find("\"start\":10,\"end\":10,\"delta\":0,\"valid\":true") == std::string::npos ||
         scalar.find("scalar_provenance_unavailable") != std::string::npos ||
         !regression_matches ||
+#if EXPECT_CYCLE_DETAIL
         linux_monotonic.find("\"source\":\"linux_perf_cpu_cycles\",\"unit\":\"cycle\"") == std::string::npos ||
+#else
+        linux_monotonic.find("{\"op\":\"linux.monotonic\",\"kind\":\"cycle\"") == std::string::npos ||
+        linux_monotonic.find("\"source\"") != std::string::npos ||
+#endif
         linux_monotonic.find("\"start\":10,\"end\":12,\"delta\":2,\"valid\":true") == std::string::npos ||
         linux_equal.find("\"start\":10,\"end\":10,\"delta\":0,\"valid\":true") == std::string::npos) {
         std::fprintf(stderr, "scalar records must retain platform arithmetic: %s",

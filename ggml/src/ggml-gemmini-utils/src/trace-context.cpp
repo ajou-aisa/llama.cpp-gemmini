@@ -93,13 +93,66 @@ std::string append_metadata(std::string text, const gemmini_trace_context &conte
                             uint64_t segment_id) {
 #if LOG_CYCLE
     if (!(context.flags & GEMMINI_TRACE_OPERATOR) && !context.task_id) return text;
+#if !CYCLE_DETAIL
+    // High-frequency compact intervals already have a fixed op/kind prefix.
+    // Avoid reparsing them with nlohmann::json just to append structural IDs.
+    const bool fast_compact_interval = text.rfind("{\"op\":", 0) == 0 &&
+        (text.find("\"kind\":\"cpu\"") != std::string::npos ||
+         text.find("\"kind\":\"segment\"") != std::string::npos ||
+         text.find("\"kind\":\"cycle\"") != std::string::npos);
+    if (fast_compact_interval) {
+        if (text.find("\"operator_context\":") != std::string::npos) return text;
+        const bool envelope = text.rfind("{\"op\":\"operator.host_dispatch\"", 0) == 0 ||
+            text.rfind("{\"op\":\"task.host_work\"", 0) == 0 ||
+            text.rfind("{\"op\":\"gemmini.matmul_worker\"", 0) == 0 ||
+            text.rfind("{\"op\":\"im2p.simulation_worker\"", 0) == 0;
+        const bool residual = context.role == GEMMINI_TRACE_ROLE_RESIDUAL ||
+            text.rfind("{\"op\":\"rmd.", 0) == 0 ||
+            text.find("residual") != std::string::npos ||
+            text.find("correction") != std::string::npos;
+        std::string info = "{";
+        bool first = true;
+        auto key = [&](const char *name) {
+            if (!first) info += ',';
+            first = false;
+            info += '\"'; info += name; info += "\":";
+        };
+        auto number = [&](const char *name, uint64_t value) {
+            if (!value) return;
+            key(name); info += std::to_string(value);
+        };
+        auto string = [&](const char *name, const char *value) {
+            if (!value || !*value) return;
+            key(name); info += nlohmann::json(value).dump();
+        };
+        number("operator_id", context.operator_id);
+        number("graph_id", context.graph_id);
+        string("operator_kind", context.operator_name);
+        number("task_id", context.task_id);
+        number("parent_task_id", context.parent_task_id);
+        number("segment_id", envelope ? context.span_id : segment_id);
+        number("parent_segment_id", envelope ? context.parent_span_id : context.span_id);
+        string("role", residual ? "residual" :
+            context.role == GEMMINI_TRACE_ROLE_DENSE ? "dense" : "operator");
+        if (envelope && (context.flags & GEMMINI_TRACE_MULTITASK))
+            string("structural_reason", "structurally_cross_task");
+        info += '}';
+        const auto close = text.rfind('}');
+        if (close != std::string::npos) text.insert(close, ",\"operator_context\":" + info);
+        return text;
+    }
+#endif
     using Json = nlohmann::json;
     // Formatting occurs when bounded records drain, after endpoint capture.
     // Preserve the legacy row and schema; common carries device-neutral keys.
     auto row = Json::parse(text);
     if (!row.is_object() || row.contains("operator_context")) return text;
     const auto type = row.value("record_type", std::string());
-    if (type.empty() || type == "INFERENCE_EVENT" || type.find("CONFIGURATION") != std::string::npos ||
+    const auto compact_kind = row.value("kind", std::string());
+    const bool compact_interval = type.empty() &&
+        (compact_kind == "cpu" || compact_kind == "segment" || compact_kind == "cycle");
+    if ((!compact_interval && type.empty()) || type == "INFERENCE_EVENT" ||
+        type.find("CONFIGURATION") != std::string::npos ||
         type.find("SUMMARY") != std::string::npos) return text;
     const auto string_value = [&](const char *key, std::string fallback = {}) {
         const auto found = row.find(key);
@@ -140,6 +193,7 @@ std::string append_metadata(std::string text, const gemmini_trace_context &conte
         }
     }
     auto nullable = [](uint64_t n) -> Json { return n ? Json(n) : Json(); };
+#if CYCLE_DETAIL
     const std::string backend = npu ? string_value("backend", type == "WS_LOOP_TELEMETRY" ? "gemmini" : "im2p_sim") : "cpu";
     Json domain = row.contains("clock_domain") ? row["clock_domain"] :
         row.contains("domain") ? row["domain"] : row.contains("source") ? row["source"] : Json();
@@ -197,10 +251,25 @@ std::string append_metadata(std::string text, const gemmini_trace_context &conte
         counter["start"] = row.value("start",Json());
         counter["end"] = row.value("end",Json());
     }
-    // This is a projection of one observed counter, not an aggregate. In
-    // particular CPU wrapper cost is never projected as NPU elapsed cycles.
     info["counter"] = std::move(counter);
     info["wall_time"] = row.contains("host_timing") ? row["host_timing"] : Json();
+#else
+    // Normal cycle mode keeps only structural attribution that cannot be
+    // recovered from the interval itself or inference_context.
+    Json info = {{"operator_id",nullable(context.operator_id)},
+        {"graph_id",nullable(context.graph_id)},
+        {"operator_kind",context.operator_name[0] ? Json(context.operator_name) : Json()},
+        {"task_id",nullable(context.task_id)},
+        {"parent_task_id",nullable(context.parent_task_id)},
+        {"segment_id",nullable(envelope ? context.span_id : segment_id)},
+        {"parent_segment_id",nullable(envelope ? context.parent_span_id : context.span_id)},
+        {"role",residual ? "residual" : context.role == GEMMINI_TRACE_ROLE_DENSE ? "dense" : "operator"},
+        {"stage",stage},{"stage_kind",kind},
+        {"scope",envelope ? "caller_thread_envelope" :
+            op == "openmp.task_wait" ? "runtime_wait_envelope" : "owner_segment"}};
+    if (envelope && (context.flags & GEMMINI_TRACE_MULTITASK))
+        info["structural_reason"] = "structurally_cross_task";
+#endif
     // Append instead of reserializing the legacy object so existing exact
     // schema checks and field ordering remain compatible.
     const auto close = text.rfind('}');

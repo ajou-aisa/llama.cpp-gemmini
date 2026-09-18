@@ -106,6 +106,23 @@ def native_cycles(record: Record) -> tuple[int | None, str]:
 
 def cpu_rows(record: Record) -> Iterator[CsvRow]:
     row = base(record)
+    if record.data.get("kind") in {"cpu", "cycle"}:
+        valid = record.data.get("valid")
+        if type(valid) is not bool:
+            raise CycleSchemaError(record.line, "compact cycle valid must be boolean")
+        value = integer(record.data.get("delta"), record.line) if valid else None
+        reason = "" if valid else text(record.data, "reason", record.line)
+        yield {**measured(row, "native_cycles", value), "unit": "cycle",
+               "reason": reason, "source_field": "delta", "source": None}
+        start_ns, end_ns = record.data.get("ns_start"), record.data.get("ns_end")
+        if start_ns is not None or end_ns is not None:
+            begin = integer(start_ns, record.line)
+            end = integer(end_ns, record.line)
+            wall = end - begin if end >= begin else None
+            yield {**measured(row, "wall_ns", wall), "unit": "nanosecond",
+                   "reason": "" if wall is not None else "clock_regression",
+                   "source_field": "ns_end-ns_start", "source": "steady_clock"}
+        return
     host_raw = record.data.get("host_timing")
     host = _host(host_raw, record.line, same_thread=record.data.get("record_type") != "TIMELINE") if host_raw is not None else None
     wall = measured(row, "wall_ns", host.duration_ns if host else None)

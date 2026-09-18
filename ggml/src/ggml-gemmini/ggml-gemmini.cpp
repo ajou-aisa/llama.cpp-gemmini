@@ -139,7 +139,9 @@ namespace
         try {
             gemmini_cpu_totals totals{};
             gemmini_cpu_timing_add(&totals, &start, &end);
+#if CYCLE_DETAIL
             if (cpu_work) performance::record_cpu_wall(start.ns, end.ns);
+#endif
             log::CycleRecord record{args.matmul_layer.c_str(), op, start.counter, end.counter};
             record.source = start.native_source == GEMMINI_CPU_COUNTER_THREAD_PERF
                 ? "linux_perf_cpu_cycles" : "unavailable";
@@ -1556,7 +1558,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 #endif
     }
     auto matmul_options = matmul_resolution.options;
-    matmul_options.profiling = LOG_CYCLE != 0;
+    matmul_options.profiling = CYCLE_DETAIL != 0;
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
     // Preserve main's original H0 policy before Q8_0 is reprocessed to H1.
     if (src0->type == GGML_TYPE_Q8_0 && GGML_GEMMINI_ENABLE_RMD != 0 &&

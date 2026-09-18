@@ -19,14 +19,14 @@ namespace ggml::gemmini {
 namespace {
 struct MatmulCycleFlush {
     ~MatmulCycleFlush() {
-#if LOG_CYCLE
+#if LOG_CYCLE && CYCLE_DETAIL
         (void) gemmini_log_cycle_flush();
 #endif
     }
 };
 
 void record_matmul_cpu_wall(const MatmulCpuSample & start, const MatmulCpuSample & end) {
-#if LOG_CYCLE
+#if LOG_CYCLE && CYCLE_DETAIL
     performance::record_cpu_wall(start.ns, end.ns);
 #else
     (void) start; (void) end;
@@ -1129,7 +1129,11 @@ MatmulStatus from_rmd_status(rmd::RmdStatus status) {
 struct Clock {
     using time_point = std::chrono::steady_clock::time_point;
     static time_point now() {
+#if CYCLE_DETAIL
         return time_point(std::chrono::nanoseconds(cycle::timestamp_ns()));
+#else
+        return time_point{};
+#endif
     }
 };
 
@@ -1144,7 +1148,11 @@ void record_metric(MatmulStageMetrics & metric, bool enabled, Clock::time_point 
 }
 
 uint64_t now_ns() {
+#if CYCLE_DETAIL
     return cycle::timestamp_ns();
+#else
+    return 0;
+#endif
 }
 
 }
@@ -1424,6 +1432,10 @@ PipelineStripeTelemetry pipeline_stripe_telemetry(
     record.residual_backend_end_ns = profile.backend_end_ns;
     record.residual_backend_start_tid = profile.backend_start_tid;
     record.residual_backend_end_tid = profile.backend_end_tid;
+    record.compose_start_ns = profile.merge_start_ns;
+    record.compose_end_ns = profile.merge_end_ns;
+    record.compose_start_tid = profile.merge_start_tid;
+    record.compose_end_tid = profile.merge_end_tid;
     record.finalize_start_ns = profile.finalize_start_ns;
     record.finalize_end_ns = profile.finalize_end_ns;
     record.finalize_start_tid = profile.finalize_start_tid;
@@ -3493,6 +3505,8 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
             merge_end = read_matmul_cpu_sample();
             job.metrics_.merge_start_ns = merge_start.ns;
             job.metrics_.merge_end_ns = merge_end.ns;
+            job.metrics_.merge_start_tid = merge_start.tid;
+            job.metrics_.merge_end_tid = merge_end.tid;
             job.metrics_.telemetry_merge_start = merge_start.value;
             job.metrics_.telemetry_merge_end = merge_end.value;
             job.metrics_.telemetry_residual_end = merge_end.value;

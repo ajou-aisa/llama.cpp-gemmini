@@ -173,6 +173,7 @@ bool check_worker_cpu_totals() {
     gemmini_cpu_timing_add(&one, &start, &end);
     gemmini_cpu_timing_merge(&combined, &one);
     gemmini_cpu_timing_merge(&combined, &one);
+#if EXPECT_CYCLE_DETAIL
     if (!check(combined.interval_count == 2 && combined.thread_cpu_valid_count == 2 &&
                combined.thread_cpu_ns == 60 && combined.thread_cpu_reason == nullptr,
                "disjoint worker CPU intervals sum independently of wall time")) return false;
@@ -187,6 +188,16 @@ bool check_worker_cpu_totals() {
     if (!check(std::string(combined.thread_cpu_reason) == "aggregate_overflow" &&
                serialize_cpu_totals(combined).find("\"thread_cpu_ns\":null") != std::string::npos,
                "overflow never wraps into a valid CPU duration")) return false;
+#else
+    if (!check(combined.interval_count == 2 && combined.thread_cpu_valid_count == 0 &&
+               combined.thread_cpu_reason != nullptr &&
+               std::string(combined.thread_cpu_reason) == "cycle_detail_disabled",
+               "compact cycle mode does not collect worker thread CPU time")) return false;
+    end.tid = 8;
+    gemmini_cpu_timing_add(&combined, &start, &end);
+    if (!check(combined.interval_count == 3 && combined.thread_cpu_valid_count == 0,
+               "compact cycle mode keeps interval cardinality without thread CPU samples")) return false;
+#endif
 #if defined(__linux__) && defined(__aarch64__)
     if (!check(one.cycles == 100 && one.cycles_valid_count == 1 && !one.cycles_reason,
                "native worker CPU cycles retain a valid same-owner delta")) return false;
@@ -205,8 +216,13 @@ bool check_worker_cpu_totals() {
     const auto reads = read_count_for_test();
     const auto actual = gemmini_cpu_timing_read();
 #if EXPECT_LOG_CYCLE
+#if EXPECT_CYCLE_DETAIL
     if (!check(actual.tid == host_thread_id() && actual.ns != 0,
-               "worker sampler records the actual calling thread")) return false;
+               "detail worker sampler records thread and host time")) return false;
+#else
+    if (!check(actual.tid == host_thread_id() && actual.ns != 0 && actual.thread_cpu_ns == 0,
+               "compact worker sampler records the shared timeline without thread CPU time")) return false;
+#endif
 #else
     if (!check(actual.ns == 0 && actual.tid == 0 && read_count_for_test() == reads,
                "compiled-off worker timing reads no clocks")) return false;
@@ -331,7 +347,12 @@ bool check_cpu_interval_record() {
                contains(summary.serialize(), "\"cpu_interval_coverage\":\"verified\""),
                "operation completion accounts for every producer-emitted diagnostic CPU interval") && ok;
     std::string dropped = json;
-    const auto raw_marker = dropped.find("\"record_type\":\"CPU_INTERVAL\"");
+#if EXPECT_CYCLE_DETAIL
+    const char *cpu_marker = "\"record_type\":\"CPU_INTERVAL\"";
+#else
+    const char *cpu_marker = "\"kind\":\"cpu\"";
+#endif
+    const auto raw_marker = dropped.find(cpu_marker);
     const auto raw_begin = dropped.rfind('\n', raw_marker) + 1;
     const auto raw_end = dropped.find('\n', raw_marker) + 1;
     dropped.erase(raw_begin, raw_end - raw_begin);
@@ -352,7 +373,7 @@ bool check_cpu_interval_record() {
                !replay(json + "{\"record_type\":\"EXSIA_TIMELINE\",\"inference_context\":[]}\n").available,
                "explicitly excluded diagnostics do not acquire a request but malformed contexts fail") && ok;
     std::string mismatched = json;
-    const auto diagnostic = mismatched.find("\"record_type\":\"CPU_INTERVAL\"");
+    const auto diagnostic = mismatched.find(cpu_marker);
     const auto request = mismatched.find("\"request_id\":1", diagnostic);
     if (check(request != std::string::npos && request < mismatched.find('\n', diagnostic),
               "CPU diagnostic records carry their inference context")) {
@@ -360,27 +381,49 @@ bool check_cpu_interval_record() {
         ok = check(!replay(mismatched).available,
                    "diagnostic context mismatches invalidate replay without adding resources") && ok;
     } else ok = false;
+#if EXPECT_CYCLE_DETAIL
     ok = check(contains(json, "\"record_type\":\"CPU_INTERVAL\"") &&
                contains(json, "\"layer\":\"layer\\\"\\\\\\n\"") &&
                contains(json, "\"op\":\"packing\\tstage\"") &&
                contains(json, "\"run_id\":11,\"stripe_id\":12,\"slot\":13,\"node_id\":14,\"worker_id\":0") &&
                contains(json, "\"run_id\":null,\"stripe_id\":null,\"slot\":null,\"node_id\":null,\"worker_id\":null"),
-               "raw CPU records preserve escaped identity including worker zero and unset IDs") && ok;
+               "detail CPU records preserve full escaped identity including explicit null IDs") && ok;
     ok = check(contains(json, "\"start\":{\"value\":400,\"valid\":true") &&
                contains(json, "\"end\":{\"value\":470,\"valid\":true") &&
                contains(json, "\"owner_token\":17,\"generation\":3") &&
                contains(json, "\"start_ns\":100,\"end_ns\":200,\"start_tid\":7,\"end_tid\":7") &&
                contains(json, "\"thread_cpu_timing\":{\"clock\":\"thread_cpu\",\"unit\":\"nanosecond\",\"start_ns\":20,\"end_ns\":50,\"duration_ns\":30,\"valid\":true}"),
-               "raw PMU ownership, original wall endpoints and worker CPU samples survive serialization") && ok;
+               "detail records retain PMU provenance, wall endpoints and worker CPU samples") && ok;
     ok = check(contains(json, "\"value\":null,\"valid\":false,\"source\":null,\"reason\":\"not_thread_cpu_counter\"") &&
                contains(json, "\"duration_ns\":null,\"valid\":false"),
-               "unavailable native values stay null and cross-thread CPU durations are invalid") && ok;
+               "detail records retain unavailable native and cross-thread timing status") && ok;
+#else
+    const auto compact_begin = json.rfind('\n', json.find(cpu_marker)) + 1;
+    const auto compact_end = json.find('\n', compact_begin);
+    const std::string compact = json.substr(compact_begin, compact_end - compact_begin);
+    ok = check(compact.rfind("{\"op\":", 0) == 0 &&
+               compact.find("\"schema\"") == std::string::npos &&
+               compact.find("\"version\"") == std::string::npos &&
+               compact.find("\"record_type\"") == std::string::npos,
+               "compact CPU records start at op and omit repeated schema headers") && ok;
+    ok = check(contains(json, "\"op\":\"packing\\tstage\",\"kind\":\"cpu\",\"layer\":\"layer\\\"\\\\\\n\"") &&
+               contains(json, "\"run_id\":11,\"stripe_id\":12,\"slot\":13,\"node_id\":14,\"worker_id\":0") &&
+               !contains(compact, "\"host_timing\"") && !contains(compact, "\"thread_cpu_timing\"") &&
+               !contains(compact, "\"native_cycles\""),
+               "compact CPU records retain identity and one canonical cycle representation only") && ok;
+    ok = check(contains(compact, "\"start\":400,\"end\":470") &&
+               contains(compact, "\"ns_start\":100,\"ns_end\":200,\"tid\":7") &&
+               !contains(compact, "\"owner_token\"") && !contains(compact, "\"generation\""),
+               "compact CPU records keep cycle and shared timeline endpoints without PMU provenance") && ok;
+#endif
 #if defined(__linux__) && defined(__aarch64__)
-    ok = check(contains(json, "\"delta\":70,\"valid\":true,\"reason\":null") &&
-               contains(json, "\"delta\":null,\"valid\":false,\"reason\":\"thread_mismatch\""),
+    ok = check(contains(json, "\"delta\":70") && contains(json, "\"valid\":true") &&
+               contains(json, "\"delta\":null") && contains(json, "\"valid\":false") &&
+               contains(json, "\"reason\":\"thread_mismatch\""),
                "raw delta uses the same native interval validation as CPU totals") && ok;
 #else
-    ok = check(contains(json, "\"delta\":null,\"valid\":false,\"reason\":\"not_thread_cpu_counter\""),
+    ok = check(contains(json, "\"delta\":null") && contains(json, "\"valid\":false") &&
+               contains(json, "\"reason\":\"not_thread_cpu_counter\""),
                "non-PMU hosts cannot publish valid native CPU cycles") && ok;
 #endif
 #else

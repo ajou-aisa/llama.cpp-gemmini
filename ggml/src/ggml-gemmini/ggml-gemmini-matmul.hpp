@@ -265,11 +265,15 @@ inline MatmulCpuSample read_matmul_cpu_sample() {
 #else
     result.value = cycle::read();
 #endif
+#if CYCLE_DETAIL
     const auto host = cycle::read_host_sample();
     result.ns = host.ns;
     result.tid = host.tid;
     result.thread_cpu_ns = host.thread_cpu_ns;
     result.thread_cpu_valid = host.thread_cpu_valid;
+#else
+    result.tid = cycle::host_thread_id();
+#endif
 #endif
     return result;
 }
@@ -381,6 +385,8 @@ struct MatmulJobMetrics {
     uint64_t backend_end_tid = 0;
     uint64_t merge_start_ns = 0;
     uint64_t merge_end_ns = 0;
+    uint64_t merge_start_tid = 0;
+    uint64_t merge_end_tid = 0;
     uint64_t finalize_start_ns = 0;
     uint64_t finalize_end_ns = 0;
     uint64_t finalize_start_tid = 0;

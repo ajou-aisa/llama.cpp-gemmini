@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Final
 
 ROOT: Final = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 SCRIPT: Final = ROOT / "scripts/utils/export_potal_csv.py"
 LATENCY_METRICS: Final = ("ttft_ns", "request_elapsed_ns", "tokens", "tpot_ns")
 COMMON: Final = {
@@ -54,6 +55,17 @@ def main() -> None:
     mirror_text += json.dumps({key: value for key, value in workload_mirror.items() if key != "inference_context"}) + "\n"
     encoded = [json.dumps(record) for record in records]
     with tempfile.TemporaryDirectory(prefix="potal-csv-") as temporary:
+        # Compact CYCLE_DETAIL=0 intervals intentionally omit schema/version/record_type.
+        compact = Path(temporary) / "compact.jsonl"
+        compact.write_text(
+            '{"op":"cpu.add","kind":"cpu","start":10,"end":15,"delta":5,"valid":true}\n'
+            '{"op":"task.host_work","kind":"segment","start":20,"end":25,"delta":5,"valid":true}\n',
+            encoding="utf-8")
+        from scripts.utils.potal_records import effective_record_type, json_records
+        compact_rows = list(json_records(compact))
+        assert [effective_record_type(data, line) for line, data in compact_rows] == [
+            "CPU_INTERVAL", "OPERATOR_SEGMENT"]
+
         source = Path(temporary) / "main.jsonl"
         detail = Path(temporary) / "detail.jsonl"
         destination = Path(temporary) / "csv"

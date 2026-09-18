@@ -34,7 +34,7 @@
 
 namespace {
 std::string serialize_cpu_record(const gemmini_cycle_record_v2 &identity,
-    const gemmini_cpu_sample &start, const gemmini_cpu_sample &end);
+    const gemmini_cpu_sample &start, const gemmini_cpu_sample &end, bool raw_segment);
 }
 
 namespace ggml::gemmini::cycle {
@@ -54,10 +54,14 @@ uint64_t host_thread_id() noexcept {
 #endif
 }
 
+uint64_t timeline_now_ns() noexcept {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
 HostSample read_host_sample() noexcept {
     HostSample sample;
-    sample.ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count());
+    sample.ns = timeline_now_ns();
     sample.tid = host_thread_id();
 #if (defined(__linux__) || defined(__APPLE__)) && defined(CLOCK_THREAD_CPUTIME_ID)
     timespec cpu_time{};
@@ -186,6 +190,7 @@ namespace ggml::gemmini::log
             bool provenance_available = false, bool checked_valid = false,
             const char * checked_reason = nullptr, const char * sample_reason = nullptr
     ) {
+#if CYCLE_DETAIL
 #if defined(__riscv)
         const char * const default_source = linux_aarch64 ? "linux_perf_cpu_cycles" : "riscv_cycle";
         const char * const default_unit = "cycle";
@@ -195,6 +200,7 @@ namespace ggml::gemmini::log
 #endif
         const char * const source = record.source ? record.source : default_source;
         const char * const unit = record.unit ? record.unit : default_unit;
+#endif
         bool valid = record.end >= record.start;
         const char * reason = nullptr;
         if (provenance_available) {
@@ -248,6 +254,7 @@ namespace ggml::gemmini::log
             }
             add_string(key, value);
         };
+#if CYCLE_DETAIL
         auto add_identity = [&](const char *key, uint32_t flag, uint64_t value) {
             if ((record.identity_mask & flag) != 0) {
                 add_u64(key, value);
@@ -255,6 +262,7 @@ namespace ggml::gemmini::log
                 add_null(key);
             }
         };
+#endif
 #if LOG_DETAIL
         auto add_i32 = [&](const char *key, int value) {
             add_key(key);
@@ -265,6 +273,7 @@ namespace ggml::gemmini::log
 #endif
 
         json.push_back('{');
+#if CYCLE_DETAIL
         add_string("schema", "gemmini.cycle");
         add_u64("version", 2);
         add_string("record_type", "CYCLE_INTERVAL");
@@ -277,15 +286,36 @@ namespace ggml::gemmini::log
         add_identity("slot", GEMMINI_CYCLE_HAS_SLOT, record.slot);
         add_identity("node_id", GEMMINI_CYCLE_HAS_NODE_ID, record.node_id);
         add_identity("worker_id", GEMMINI_CYCLE_HAS_WORKER_ID, record.worker_id);
+#else
+        add_nullable_string("op", record.op);
+        add_string("kind", "cycle");
+        add_nullable_string("layer", record.layer);
+        if (record.identity_mask & GEMMINI_CYCLE_HAS_RUN_ID) add_u64("run_id", record.run_id);
+        if (record.identity_mask & GEMMINI_CYCLE_HAS_STRIPE_ID) add_u64("stripe_id", record.stripe_id);
+        if (record.identity_mask & GEMMINI_CYCLE_HAS_SLOT) add_u64("slot", record.slot);
+        if (record.identity_mask & GEMMINI_CYCLE_HAS_NODE_ID) add_u64("node_id", record.node_id);
+        if (record.identity_mask & GEMMINI_CYCLE_HAS_WORKER_ID) add_u64("worker_id", record.worker_id);
+#endif
         add_u64("start", record.start);
         add_u64("end", record.end);
+#if CYCLE_DETAIL
         if (linux_aarch64 && !valid) add_null("delta"); else add_u64("delta", cycles);
+#else
+        if (!valid) add_null("delta"); else add_u64("delta", cycles);
+#endif
         add_key("valid");
         json += valid ? "true" : "false";
+#if CYCLE_DETAIL
         if (linux_aarch64 && !valid) {
             add_string("reason", reason ? reason : "counter_regression");
             add_string("sample_reason", sample_reason);
         }
+#else
+        if (!valid) {
+            add_string("reason", reason ? reason : "counter_regression");
+            add_string("sample_reason", sample_reason);
+        }
+#endif
 #if LOG_DETAIL
         add_string("file", record.file);
         if (record.file) add_i32("line", record.line);
@@ -435,12 +465,7 @@ namespace ggml::gemmini::log
                     auto identity = record.identity;
                     identity.interval.layer = record.layer.c_str();
                     identity.interval.op = record.op.c_str();
-                    auto json = serialize_cpu_record(identity, record.start, record.end);
-                    if (record.raw_segment) {
-                        const auto marker = json.find("\"record_type\":\"CPU_INTERVAL\"");
-                        if (marker != std::string::npos) json.replace(marker,
-                            std::strlen("\"record_type\":\"CPU_INTERVAL\""), "\"record_type\":\"OPERATOR_SEGMENT\"");
-                    }
+                    auto json = serialize_cpu_record(identity, record.start, record.end, record.raw_segment);
                     if (record.operation_success.has_value()) json.insert(json.size() - 1,
                         std::string(",\"operation_success\":") + (*record.operation_success ? "true" : "false"));
                     if (record.sequence) json.insert(json.size() - 1,
@@ -868,15 +893,15 @@ namespace ggml::gemmini::log
         const auto context = trace::inference_context(captured);
         Entry::Cpu cpu{identity, start, end,
             identity.interval.layer ? identity.interval.layer : "",
-            identity.interval.op ? identity.interval.op : ""};
+            identity.interval.op ? identity.interval.op : "",
+            0, std::nullopt, false};
         if (!raw_segment && this == &ggml::gemmini::log::cycle)
             cpu.sequence = performance::next_cpu_interval_sequence(context);
         cpu.operation_success = operation_success;
         cpu.raw_segment = raw_segment;
         cpu.identity.interval.layer = cpu.identity.interval.op = nullptr;
         cpu.identity.interval.file = cpu.identity.interval.func = nullptr;
-        submit({raw_segment ? performance::Context{} : context,
-                std::move(cpu), captured, gemmini_trace_reserve_ids(1)});
+        submit({context, std::move(cpu), captured, gemmini_trace_reserve_ids(1)});
 #else
         (void)identity; (void)start; (void)end; (void)operation_success; (void)raw_segment;
 #endif
@@ -939,11 +964,16 @@ extern "C" gemmini_cpu_sample gemmini_cpu_timing_read(void) {
     gemmini_cpu_sample result{};
 #if LOG_CYCLE
     result.trace = gemmini_trace_capture();
+#if CYCLE_DETAIL
     const auto host = ggml::gemmini::cycle::read_host_sample();
     result.ns = host.ns;
     result.tid = host.tid;
     result.thread_cpu_ns = host.thread_cpu_ns;
     result.thread_cpu_valid = host.thread_cpu_valid;
+#else
+    result.ns = ggml::gemmini::cycle::timeline_now_ns();
+    result.tid = ggml::gemmini::cycle::host_thread_id();
+#endif
 #if defined(__linux__) && defined(__aarch64__)
     const auto native = ggml::gemmini::cycle::read_sample();
     result.counter = native.value;
@@ -975,6 +1005,10 @@ gemmini_cpu_totals evaluate_cpu_interval(const gemmini_cpu_sample *start,
         return interval;
     }
     const bool same_thread = start->tid != 0 && start->tid == end->tid;
+#if !CYCLE_DETAIL && (!defined(__linux__) || !defined(__aarch64__))
+    (void) same_thread;
+#endif
+#if CYCLE_DETAIL
     if (!same_thread) {
         interval.thread_cpu_reason = "thread_mismatch";
     } else if (!start->thread_cpu_valid || !end->thread_cpu_valid) {
@@ -985,6 +1019,9 @@ gemmini_cpu_totals evaluate_cpu_interval(const gemmini_cpu_sample *start,
         interval.thread_cpu_ns = end->thread_cpu_ns - start->thread_cpu_ns;
         interval.thread_cpu_valid_count = 1;
     }
+#else
+    interval.thread_cpu_reason = "cycle_detail_disabled";
+#endif
 #if defined(__linux__) && defined(__aarch64__)
     using namespace ggml::gemmini::cycle;
     if (!same_thread) {
@@ -1019,7 +1056,7 @@ extern "C" void gemmini_cpu_timing_add(gemmini_cpu_totals *totals,
         const gemmini_cpu_sample *start, const gemmini_cpu_sample *end) {
     const auto interval = evaluate_cpu_interval(start, end);
     gemmini_cpu_timing_merge(totals, &interval);
-#if LOG_CYCLE
+#if LOG_CYCLE && CYCLE_DETAIL
     ggml::gemmini::performance::record_cpu(*start, *end, interval);
 #endif
 }
@@ -1129,34 +1166,76 @@ void WorkerCpuTiming::emit(const char *layer, const char *scope, std::optional<u
 
 namespace {
 std::string serialize_cpu_record(const gemmini_cycle_record_v2 &record,
-        const gemmini_cpu_sample &start_sample, const gemmini_cpu_sample &end_sample) {
+        const gemmini_cpu_sample &start_sample, const gemmini_cpu_sample &end_sample,
+        bool raw_segment) {
     using namespace ggml::gemmini;
     const auto *identity = &record;
     const auto *start = &start_sample;
     const auto *end = &end_sample;
-        std::string json = "{\"schema\":\"gemmini.cycle\",\"version\":2,"
-            "\"record_type\":\"CPU_INTERVAL\",\"unit\":\"cycle\",\"source\":";
-        json += start->native_source == GEMMINI_CPU_COUNTER_THREAD_PERF &&
-                end->native_source == GEMMINI_CPU_COUNTER_THREAD_PERF ?
-            "\"linux_perf_cpu_cycles\"" : "null";
-        json += ",\"layer\":" + cpu_json_string(identity->interval.layer) +
-            ",\"op\":" + cpu_json_string(identity->interval.op);
-        const auto add_identity = [&](const char *key, uint32_t field, uint64_t value) {
-            json += std::string(",\"") + key + "\":" +
-                ((identity->identity_mask & field) ? std::to_string(value) : "null");
-        };
-        add_identity("run_id", GEMMINI_CYCLE_HAS_RUN_ID, identity->run_id);
-        add_identity("stripe_id", GEMMINI_CYCLE_HAS_STRIPE_ID, identity->stripe_id);
-        add_identity("slot", GEMMINI_CYCLE_HAS_SLOT, identity->slot);
-        add_identity("node_id", GEMMINI_CYCLE_HAS_NODE_ID, identity->node_id);
-        add_identity("worker_id", GEMMINI_CYCLE_HAS_WORKER_ID, identity->worker_id);
-        json += ",\"native_cycles\":" + cycle::serialize_cpu_native(*start, *end) +
-            ",\"host_timing\":" + cycle::serialize_host_timing(start->ns, end->ns, start->tid, end->tid) +
-            ",\"thread_cpu_timing\":" + cycle::serialize_thread_cpu_timing(
-                {start->ns, start->tid, start->thread_cpu_ns, start->thread_cpu_valid != 0},
-                {end->ns, end->tid, end->thread_cpu_ns, end->thread_cpu_valid != 0}) +
-            ",\"additive\":false}";
+#if CYCLE_DETAIL
+    std::string json = "{\"schema\":\"gemmini.cycle\",\"version\":2,"
+        "\"record_type\":\"CPU_INTERVAL\",\"unit\":\"cycle\",\"source\":";
+    json += start->native_source == GEMMINI_CPU_COUNTER_THREAD_PERF &&
+            end->native_source == GEMMINI_CPU_COUNTER_THREAD_PERF ?
+        "\"linux_perf_cpu_cycles\"" : "null";
+    json += ",\"layer\":" + cpu_json_string(identity->interval.layer) +
+        ",\"op\":" + cpu_json_string(identity->interval.op);
+    const auto add_identity = [&](const char *key, uint32_t field, uint64_t value) {
+        json += std::string(",\"") + key + "\":" +
+            ((identity->identity_mask & field) ? std::to_string(value) : "null");
+    };
+    add_identity("run_id", GEMMINI_CYCLE_HAS_RUN_ID, identity->run_id);
+    add_identity("stripe_id", GEMMINI_CYCLE_HAS_STRIPE_ID, identity->stripe_id);
+    add_identity("slot", GEMMINI_CYCLE_HAS_SLOT, identity->slot);
+    add_identity("node_id", GEMMINI_CYCLE_HAS_NODE_ID, identity->node_id);
+    add_identity("worker_id", GEMMINI_CYCLE_HAS_WORKER_ID, identity->worker_id);
+    json += ",\"native_cycles\":" + cycle::serialize_cpu_native(*start, *end) +
+        ",\"host_timing\":" + cycle::serialize_host_timing(start->ns, end->ns, start->tid, end->tid) +
+        ",\"thread_cpu_timing\":" + cycle::serialize_thread_cpu_timing(
+            {start->ns, start->tid, start->thread_cpu_ns, start->thread_cpu_valid != 0},
+            {end->ns, end->tid, end->thread_cpu_ns, end->thread_cpu_valid != 0}) +
+        ",\"additive\":false}";
+    if (raw_segment) {
+        const auto marker = json.find("\"record_type\":\"CPU_INTERVAL\"");
+        if (marker != std::string::npos)
+            json.replace(marker, std::strlen("\"record_type\":\"CPU_INTERVAL\""),
+                         "\"record_type\":\"OPERATOR_SEGMENT\"");
+    }
     return json;
+#else
+    const auto interval = evaluate_cpu_interval(start, end);
+    const bool valid = interval.cycles_valid_count == 1 && !interval.cycles_reason;
+    std::string json = "{\"op\":" + cpu_json_string(identity->interval.op) +
+        ",\"kind\":\"" + (raw_segment ? std::string("segment") : std::string("cpu")) + "\"";
+    if (identity->interval.layer && *identity->interval.layer)
+        json += ",\"layer\":" + cpu_json_string(identity->interval.layer);
+    const auto add_identity = [&](const char *key, uint32_t field, uint64_t value) {
+        if (identity->identity_mask & field)
+            json += std::string(",\"") + key + "\":" + std::to_string(value);
+    };
+    add_identity("run_id", GEMMINI_CYCLE_HAS_RUN_ID, identity->run_id);
+    add_identity("stripe_id", GEMMINI_CYCLE_HAS_STRIPE_ID, identity->stripe_id);
+    add_identity("slot", GEMMINI_CYCLE_HAS_SLOT, identity->slot);
+    add_identity("node_id", GEMMINI_CYCLE_HAS_NODE_ID, identity->node_id);
+    add_identity("worker_id", GEMMINI_CYCLE_HAS_WORKER_ID, identity->worker_id);
+    json += ",\"start\":" + std::to_string(start->counter) +
+        ",\"end\":" + std::to_string(end->counter) +
+        ",\"delta\":" + (valid ? std::to_string(interval.cycles) : std::string("null")) +
+        ",\"ns_start\":" + std::to_string(start->ns) +
+        ",\"ns_end\":" + std::to_string(end->ns);
+    if (start->tid != 0 && start->tid == end->tid) {
+        json += ",\"tid\":" + std::to_string(start->tid);
+    } else {
+        json += ",\"tid_start\":" + std::to_string(start->tid) +
+            ",\"tid_end\":" + std::to_string(end->tid);
+    }
+    json += ",\"valid\":";
+    json += valid ? "true" : "false";
+    if (interval.cycles_reason)
+        json += ",\"reason\":" + cpu_json_string(interval.cycles_reason);
+    json += '}';
+    return json;
+#endif
 }
 }
 
@@ -1189,7 +1268,7 @@ extern "C" void gemmini_cpu_timing_record_segment(const gemmini_cycle_record_v2 
 extern "C" void gemmini_cpu_timing_emit(const char *layer, const char *scope, const uint64_t *run_id,
         int operation_success, const gemmini_cpu_sample *start, const gemmini_cpu_sample *end,
         const gemmini_cpu_totals *totals) {
-#if LOG_CYCLE
+#if LOG_CYCLE && CYCLE_DETAIL
     using namespace ggml::gemmini;
     try {
         if (scope && std::string_view(scope) == "cpu.graph_workers") {

@@ -221,7 +221,7 @@ namespace ggml::gemmini::quants::act::exsia
 
         uint64_t aggregate_now_ns()
         {
-#if LOG_CYCLE
+#if LOG_CYCLE && CYCLE_DETAIL
             return ggml::gemmini::cycle::timestamp_ns();
 #else
             return 0;
@@ -463,6 +463,7 @@ namespace ggml::gemmini::quants::act::exsia
                 const auto end = gemmini_cpu_timing_read();
                 const auto identity = cpu_identity(layer, run_id, "exsia.run.caller");
                 gemmini_cpu_timing_record(&identity, &start, &end);
+#if CYCLE_DETAIL
                 gemmini_cpu_totals cpu_workers{};
                 gemmini_cpu_timing_add(&cpu_workers, &start, &end);
                 for (const auto &worker : worker_cpu)
@@ -489,6 +490,7 @@ namespace ggml::gemmini::quants::act::exsia
                     << ",\"operation_success\":" << (success ? "true" : "false")
                     << ",\"valid\":true,\"additive\":false}";
                 log::cycle.write_json(out.str());
+#endif
             }
         };
 #endif
