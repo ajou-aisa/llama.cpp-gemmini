@@ -51,8 +51,17 @@ std::string serialize_matmul_cpu_interval(log::CycleRecord record,
             {start.ns, start.tid, start.thread_cpu_ns, start.thread_cpu_valid},
             {end.ns, end.tid, end.thread_cpu_ns, end.thread_cpu_valid}));
 #else
-    json.insert(json.rfind('}'),
-        std::string(",\"operation_success\":") + (operation_success ? "true" : "false"));
+    std::string compact = std::string(",\"operation_success\":") +
+        (operation_success ? "true" : "false") +
+        ",\"ns_start\":" + std::to_string(start.ns) +
+        ",\"ns_end\":" + std::to_string(end.ns);
+    if (start.tid != 0 && start.tid == end.tid) {
+        compact += ",\"tid\":" + std::to_string(start.tid);
+    } else {
+        compact += ",\"tid_start\":" + std::to_string(start.tid) +
+            ",\"tid_end\":" + std::to_string(end.tid);
+    }
+    json.insert(json.rfind('}'), compact);
 #endif
     return trace::annotate_origin(std::move(json), start.trace);
 }

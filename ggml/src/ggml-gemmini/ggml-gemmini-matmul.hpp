@@ -272,6 +272,7 @@ inline MatmulCpuSample read_matmul_cpu_sample() {
     result.thread_cpu_ns = host.thread_cpu_ns;
     result.thread_cpu_valid = host.thread_cpu_valid;
 #else
+    result.ns = cycle::timeline_now_ns();
     result.tid = cycle::host_thread_id();
 #endif
 #endif

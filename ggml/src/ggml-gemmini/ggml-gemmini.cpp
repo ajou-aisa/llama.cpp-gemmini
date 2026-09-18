@@ -150,6 +150,7 @@ namespace
             std::string json = log::serialize_checked_cycle_record(
                 record, totals.cycles_valid_count == 1 && totals.cycles_reason == nullptr,
                 totals.cycles_reason);
+#if CYCLE_DETAIL
             json.insert(json.rfind('}'),
                 ",\"matmul_invocation_id\":" + std::to_string(invocation_id) +
                 ",\"cpu_measurement_version\":1,\"additive\":false,\"aggregation_role\":\"" +
@@ -160,6 +161,21 @@ namespace
                 ",\"thread_cpu_timing\":" + cycle::serialize_thread_cpu_timing(
                     {start.ns, start.tid, start.thread_cpu_ns, start.thread_cpu_valid != 0},
                     {end.ns, end.tid, end.thread_cpu_ns, end.thread_cpu_valid != 0}));
+#else
+            std::string compact =
+                ",\"matmul_invocation_id\":" + std::to_string(invocation_id) +
+                ",\"aggregation_role\":\"" + (cpu_work ? std::string("cpu_stage") : std::string("caller_envelope")) +
+                "\",\"operation_success\":" + (success ? "true" : "false") +
+                ",\"ns_start\":" + std::to_string(start.ns) +
+                ",\"ns_end\":" + std::to_string(end.ns);
+            if (start.tid != 0 && start.tid == end.tid) {
+                compact += ",\"tid\":" + std::to_string(start.tid);
+            } else {
+                compact += ",\"tid_start\":" + std::to_string(start.tid) +
+                    ",\"tid_end\":" + std::to_string(end.tid);
+            }
+            json.insert(json.rfind('}'), compact);
+#endif
             log::cycle.write_json(json);
         } catch (...) {
             log::cycle.report_failure("Gemmini outer CPU interval");
