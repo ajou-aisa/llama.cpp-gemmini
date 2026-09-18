@@ -137,17 +137,17 @@ void rtl_debug_log_callback(void *, const char *message, size_t length) noexcept
 
 // Same-caller CPU cost, not simulator-worker totals. Explicit finish excludes
 // subsequent status/telemetry handling; destruction preserves partial costs.
+enum class HostIntervalAccounting : uint8_t {
+  cpu_work,
+  excluded_from_cpu_work,
+};
+
 class HostCpuInterval {
 public:
   HostCpuInterval(const ggml_gemmini_args_t &args, const char *operation,
+                  HostIntervalAccounting accounting,
                   const quants::act::exsia::StripeReadyEvent *event = nullptr)
-      : record_{}, cpu_work_(std::string_view(operation) == "im2p.host_input_preparation" ||
-                            std::string_view(operation) == "im2p.residual_metadata_preparation" ||
-                            std::string_view(operation) == "im2p.stripe_input_capture" ||
-                            std::string_view(operation) == "im2p.output_buffer_copy" ||
-                            std::string_view(operation) == "im2p.post_fence_validation" ||
-                            std::string_view(operation) == "im2p.residual_backend_host_call" ||
-                            std::string_view(operation) == "im2p.output_correction_apply") {
+      : record_{}, cpu_work_(accounting == HostIntervalAccounting::cpu_work) {
     record_.layer = args.matmul_layer.empty() ? nullptr : args.matmul_layer.c_str();
     record_.op = operation;
     record_.source = kNativeCycleSource;
@@ -294,7 +294,7 @@ bool checked_output_extent(const ggml_gemmini_args_t &args,
 
 void copy_staged_output(const ggml_gemmini_args_t &args,
                         const std::vector<float> &staged) noexcept {
-  HostCpuInterval copy(args, "im2p.output_buffer_copy");
+  HostCpuInterval copy(args, "im2p.output_buffer_copy", HostIntervalAccounting::cpu_work);
   const size_t row_stride = args.stride_f_out == 0 ? args.J : args.stride_f_out;
   const size_t col_stride =
       args.col_stride_f_out == 0 ? 1 : args.col_stride_f_out;
@@ -810,7 +810,7 @@ static Result apply_baseline_rmd_full(
   std::unique_ptr<im2p_sim_t, SimulatorDeleter> simulator;
   if (!direct_route && !rmd_packets.empty()) {
     HostCpuInterval setup(runtime_args,
-                          "im2p.residual_simulator_setup_host_call");
+                          "im2p.residual_simulator_setup_host_call", HostIntervalAccounting::excluded_from_cpu_work);
     simulator.reset(im2p_sim_create());
     setup.finish(simulator != nullptr);
     if (!simulator) {
@@ -859,7 +859,7 @@ static Result apply_baseline_rmd_full(
       residual::DirectExecutionMetrics direct_metrics{};
       if (metadata != nullptr) direct_metrics.run_id = metadata->run_id;
       HostCpuInterval backend(runtime_args,
-                              "im2p.residual_backend_host_call");
+                              "im2p.residual_backend_host_call", HostIntervalAccounting::cpu_work);
       const rmd::RmdStatus executed = residual::execute_direct_stripe(
           runtime_args, *payload, correction, &direct_metrics);
       backend.finish(executed == rmd::RmdStatus::success);
@@ -870,7 +870,7 @@ static Result apply_baseline_rmd_full(
         ++counters.residual_executions;
       }
 #endif
-      HostCpuInterval merge(runtime_args, "im2p.output_correction_apply");
+      HostCpuInterval merge(runtime_args, "im2p.output_correction_apply", HostIntervalAccounting::cpu_work);
       const rmd::RmdStatus merged = rmd::merge_rmd_correction_to(
           runtime_args, output_data, payload->row_begin, row_end, correction);
       merge.finish(merged == rmd::RmdStatus::success);
@@ -894,7 +894,7 @@ static Result apply_baseline_rmd_full(
       rmd::Correction correction = rmd::BlockScaledInt64Correction{};
       rmd::RmdExecutionMetrics metrics{};
       HostCpuInterval backend(runtime_args,
-                              "im2p.residual_simulator_host_call");
+                              "im2p.residual_simulator_host_call", HostIntervalAccounting::excluded_from_cpu_work);
       const rmd::RmdStatus executed =
           rmd::detail::execute_rmd_stripe_im2p_with_weights(
               simulator.get(), runtime_args, *packet, correction, weights,
@@ -912,7 +912,7 @@ static Result apply_baseline_rmd_full(
         return {Error::execution_failure,
                 "baseline FULL RMD provider statistics overflow", false};
       }
-      HostCpuInterval merge(runtime_args, "im2p.output_correction_apply");
+      HostCpuInterval merge(runtime_args, "im2p.output_correction_apply", HostIntervalAccounting::cpu_work);
       const rmd::RmdStatus merged =
           rmd::detail::merge_rmd_correction_with_weights(
               runtime_args, output_data, *packet, correction, weights);
@@ -936,7 +936,7 @@ static Result apply_baseline_rmd_full(
 }
 
 Completion run_full(const ggml_gemmini_args_t &args) noexcept {
-  HostCpuInterval preparation(args, "im2p.host_input_preparation");
+  HostCpuInterval preparation(args, "im2p.host_input_preparation", HostIntervalAccounting::cpu_work);
   // The ggml orchestration always materializes an all-zero repeating bias.
   // IM2P's provider contract represents that identity bias by absence.
   ggml_gemmini_args_t runtime_args = args;
@@ -992,7 +992,7 @@ Completion run_full(const ggml_gemmini_args_t &args) noexcept {
 #endif
   FrontendWorkerTiming worker_timing(args);
   worker_timing.attach(frontend_options);
-  HostCpuInterval frontend_start(args, "im2p.frontend_start_host_call");
+  HostCpuInterval frontend_start(args, "im2p.frontend_start_host_call", HostIntervalAccounting::excluded_from_cpu_work);
   auto started =
       ::im2p::gemmini::execute(&runtime_args, ::im2p::gemmini::Mode::full,
                                frontend_options);
@@ -1017,7 +1017,7 @@ Completion run_full(const ggml_gemmini_args_t &args) noexcept {
     ++counters.fence;
   }
 #endif
-  HostCpuInterval fence(args, "im2p.fence_host_call");
+  HostCpuInterval fence(args, "im2p.fence_host_call", HostIntervalAccounting::excluded_from_cpu_work);
   const auto fenced = ::im2p::gemmini::fence(*started.run);
   fence.finish(fenced.status.ok());
   worker_timing.success = fenced.status.ok();
@@ -1059,7 +1059,7 @@ Completion run_full(const ggml_gemmini_args_t &args) noexcept {
 }
 
 Completion run_stripe_pipeline(const ggml_gemmini_args_t &args) noexcept {
-  HostCpuInterval preparation(args, "im2p.host_input_preparation");
+  HostCpuInterval preparation(args, "im2p.host_input_preparation", HostIntervalAccounting::cpu_work);
   ggml_gemmini_args_t runtime_args = args;
   runtime_args.D = nullptr;
   runtime_args.repeating_bias = false;
@@ -1100,7 +1100,7 @@ Completion run_stripe_pipeline(const ggml_gemmini_args_t &args) noexcept {
 #endif
   FrontendWorkerTiming worker_timing(args);
   worker_timing.attach(frontend_options);
-  HostCpuInterval frontend_start(args, "im2p.frontend_start_host_call");
+  HostCpuInterval frontend_start(args, "im2p.frontend_start_host_call", HostIntervalAccounting::excluded_from_cpu_work);
   auto started = ::im2p::gemmini::execute(
       &runtime_args, ::im2p::gemmini::Mode::stripe_pipeline,
       frontend_options);
@@ -1132,7 +1132,7 @@ Completion run_stripe_pipeline(const ggml_gemmini_args_t &args) noexcept {
     event.row_end =
         std::min(runtime_args.I,
                  row_begin + runtime_args.activation_rows_per_stripe);
-    HostCpuInterval submit(args, "im2p.stripe_submit_host_call", &event);
+    HostCpuInterval submit(args, "im2p.stripe_submit_host_call", HostIntervalAccounting::excluded_from_cpu_work, &event);
     const auto status = ::im2p::gemmini::submit_stripe(*started.run, event);
     submit.finish(status.ok());
     if (!status.ok()) {
@@ -1162,7 +1162,7 @@ Completion run_stripe_pipeline(const ggml_gemmini_args_t &args) noexcept {
     ++counters.fence;
   }
 #endif
-  HostCpuInterval fence(args, "im2p.fence_host_call");
+  HostCpuInterval fence(args, "im2p.fence_host_call", HostIntervalAccounting::excluded_from_cpu_work);
   const auto fenced = ::im2p::gemmini::fence(*started.run);
   fence.finish(fenced.status.ok());
   worker_timing.success = fenced.status.ok();
@@ -1185,7 +1185,7 @@ Completion run_stripe_pipeline(const ggml_gemmini_args_t &args) noexcept {
 #endif
     return completion;
   }
-  HostCpuInterval validation(args, "im2p.post_fence_validation");
+  HostCpuInterval validation(args, "im2p.post_fence_validation", HostIntervalAccounting::cpu_work);
   const Result timing_status = validate_stripe_timings(
       fenced.stripe_rtl_timings, runtime_args, completion.stats, run_id);
   const Result residual_timing_status =
@@ -1199,7 +1199,7 @@ Completion run_stripe_pipeline(const ggml_gemmini_args_t &args) noexcept {
     return {timing_status.ok() ? residual_timing_status : timing_status,
             completion.stats};
   }
-  HostCpuInterval authorization(args, "im2p.output_authorize_host_call");
+  HostCpuInterval authorization(args, "im2p.output_authorize_host_call", HostIntervalAccounting::excluded_from_cpu_work);
   const auto committed =
       ::im2p::gemmini::authorize_output_commit(*started.run, true);
   authorization.finish(committed.ok());
@@ -1297,7 +1297,7 @@ static Result apply_captured_rmd_full(
 #else
   constexpr bool force_malformed_order = false;
 #endif
-  HostCpuInterval metadata_preparation(runtime_args, "im2p.residual_metadata_preparation");
+  HostCpuInterval metadata_preparation(runtime_args, "im2p.residual_metadata_preparation", HostIntervalAccounting::cpu_work);
   std::unique_ptr<ggml_gemmini_args_t> rmd_args;
   std::vector<const CapturedExsiaStripe *> ordered;
   try {
@@ -1378,7 +1378,7 @@ static Result apply_captured_rmd_full(
               "injected FULL residual simulator creation failure", false};
     }
 #endif
-    HostCpuInterval simulator_start(runtime_args, "im2p.residual_simulator_setup_host_call");
+    HostCpuInterval simulator_start(runtime_args, "im2p.residual_simulator_setup_host_call", HostIntervalAccounting::excluded_from_cpu_work);
     simulator.reset(im2p_sim_create());
     simulator_start.finish(simulator != nullptr);
     if (!simulator) {
@@ -1425,17 +1425,17 @@ static Result apply_captured_rmd_full(
     direct_metrics.run_id = event.run_id;
     if (event.direct_residual != nullptr) {
 #if LOG_CYCLE
-      HostCpuInterval observation(*rmd_args, "im2p.residual_workload_observation", &event);
+      HostCpuInterval observation(*rmd_args, "im2p.residual_workload_observation", HostIntervalAccounting::excluded_from_cpu_work, &event);
       rmd::collect_direct_metrics(*event.direct_residual, metrics);
       observation.finish();
 #endif
-      HostCpuInterval backend(*rmd_args, "im2p.residual_backend_host_call", &event);
+      HostCpuInterval backend(*rmd_args, "im2p.residual_backend_host_call", HostIntervalAccounting::cpu_work, &event);
       status = residual::execute_direct_stripe(
           *rmd_args, *event.direct_residual, correction, &direct_metrics);
       backend.finish(status == rmd::RmdStatus::success);
     } else if (event.rmd_packet != nullptr) {
       // Includes blocking execution of the separate residual simulator.
-      HostCpuInterval backend(*rmd_args, "im2p.residual_simulator_host_call", &event);
+      HostCpuInterval backend(*rmd_args, "im2p.residual_simulator_host_call", HostIntervalAccounting::excluded_from_cpu_work, &event);
 #if defined(GGML_GEMMINI_TESTING)
       if (provider_fault(failure) != rmd::Im2pProviderTestFault::none) {
         status = rmd::execute_rmd_stripe_im2p_for_test(
@@ -1477,7 +1477,7 @@ static Result apply_captured_rmd_full(
     }
 #endif
     if (status == rmd::RmdStatus::success && !no_residual) {
-      HostCpuInterval merge(*rmd_args, "im2p.output_correction_apply", &event);
+      HostCpuInterval merge(*rmd_args, "im2p.output_correction_apply", HostIntervalAccounting::cpu_work, &event);
       status = shared_weights
           ? rmd::detail::merge_rmd_correction_with_weights(
                 *rmd_args, output_data, *event.rmd_packet, correction, weights, nullptr, &metrics)
@@ -1575,7 +1575,7 @@ public:
            "PIPELINE residual stage does not cover the output layout", false});
     }
 
-    HostCpuInterval metadata_preparation(runtime_args, "im2p.residual_metadata_preparation", &event);
+    HostCpuInterval metadata_preparation(runtime_args, "im2p.residual_metadata_preparation", HostIntervalAccounting::cpu_work, &event);
     ggml_gemmini_args_t stripe_args;
     try {
       stripe_args = runtime_args;
@@ -1645,16 +1645,16 @@ public:
     direct_metrics.run_id = event.run_id;
     if (event.direct_residual != nullptr) {
 #if LOG_CYCLE
-      HostCpuInterval observation(stripe_args, "im2p.residual_workload_observation", &event);
+      HostCpuInterval observation(stripe_args, "im2p.residual_workload_observation", HostIntervalAccounting::excluded_from_cpu_work, &event);
       rmd::collect_direct_metrics(*event.direct_residual, metrics);
       observation.finish();
 #endif
-      HostCpuInterval backend(stripe_args, "im2p.residual_backend_host_call", &event);
+      HostCpuInterval backend(stripe_args, "im2p.residual_backend_host_call", HostIntervalAccounting::cpu_work, &event);
       status = residual::execute_direct_stripe(
           stripe_args, *event.direct_residual, correction, &direct_metrics);
       backend.finish(status == rmd::RmdStatus::success);
     } else if (event.rmd_packet != nullptr) {
-      HostCpuInterval backend(stripe_args, "im2p.residual_simulator_host_call", &event);
+      HostCpuInterval backend(stripe_args, "im2p.residual_simulator_host_call", HostIntervalAccounting::excluded_from_cpu_work, &event);
 #if defined(GGML_GEMMINI_TESTING)
       if (provider_fault(failure) != rmd::Im2pProviderTestFault::none) {
         status = rmd::execute_rmd_stripe_im2p_for_test(
@@ -1686,7 +1686,7 @@ public:
     }
 #endif
     if (status == rmd::RmdStatus::success && !no_residual) {
-      HostCpuInterval merge(stripe_args, "im2p.output_correction_apply", &event);
+      HostCpuInterval merge(stripe_args, "im2p.output_correction_apply", HostIntervalAccounting::cpu_work, &event);
       status = shared_weights
           ? rmd::detail::merge_rmd_correction_with_weights(
                 stripe_args, stage.data, *event.rmd_packet, correction, *rmd_weights, nullptr, &metrics)
@@ -1755,7 +1755,7 @@ public:
       }
     }
 #endif
-    HostCpuInterval capture(args, "im2p.stripe_input_capture", &event);
+    HostCpuInterval capture(args, "im2p.stripe_input_capture", HostIntervalAccounting::cpu_work, &event);
     const auto *metadata =
         std::get_if<quants::act::exsia::Meta>(&args.act_quant.storage());
     const std::int16_t theta =
@@ -1780,7 +1780,7 @@ public:
       return false;
     }
     capture.finish();
-    HostCpuInterval submit(args, "im2p.stripe_submit_host_call", &event);
+    HostCpuInterval submit(args, "im2p.stripe_submit_host_call", HostIntervalAccounting::excluded_from_cpu_work, &event);
     const auto status =
         ::im2p::gemmini::submit_stripe(*run, event, {true, theta});
     submit.finish(status.ok());
@@ -1827,7 +1827,7 @@ public:
       }
     }
 #endif
-    HostCpuInterval authorization(args, "im2p.output_authorize_host_call");
+    HostCpuInterval authorization(args, "im2p.output_authorize_host_call", HostIntervalAccounting::excluded_from_cpu_work);
     const auto status = ::im2p::gemmini::authorize_output_commit(*run, rmd_succeeded);
     authorization.finish(status.ok());
     return translate(status);
@@ -1941,7 +1941,7 @@ public:
       }
     }
 #endif
-    HostCpuInterval capture(args, "im2p.stripe_input_capture", &event);
+    HostCpuInterval capture(args, "im2p.stripe_input_capture", HostIntervalAccounting::cpu_work, &event);
     const auto *metadata =
         std::get_if<quants::act::exsia::Meta>(&args.act_quant.storage());
     const std::int16_t theta =
@@ -2041,7 +2041,7 @@ Result ExsiaFullExecution::install_sink() noexcept {
 
 ExsiaFullExecutionStart
 start_exsia_full_execution(ggml_gemmini_args_t &args) noexcept {
-  HostCpuInterval preparation(args, "im2p.host_input_preparation");
+  HostCpuInterval preparation(args, "im2p.host_input_preparation", HostIntervalAccounting::cpu_work);
   GemminiGeometry geometry;
   size_t output_extent = 0;
   if (!args.activation_geometry_matches(geometry) ||
@@ -2101,7 +2101,7 @@ Completion ExsiaFullExecution::finish(bool quantization_succeeded) noexcept {
     return {{Error::execution_failure, "ExSIA quantization failed", false}, {}};
   }
 
-  HostCpuInterval preparation(impl_->args, "im2p.host_input_preparation");
+  HostCpuInterval preparation(impl_->args, "im2p.host_input_preparation", HostIntervalAccounting::cpu_work);
   impl_->runtime_args = impl_->args;
   impl_->runtime_args.D = nullptr;
   impl_->runtime_args.repeating_bias = false;
@@ -2132,7 +2132,7 @@ Completion ExsiaFullExecution::finish(bool quantization_succeeded) noexcept {
       ::im2p::gemmini::NumericalContract::main_external;
 #endif
   impl_->worker_timing.attach(frontend_options);
-  HostCpuInterval frontend_start(impl_->args, "im2p.frontend_start_host_call");
+  HostCpuInterval frontend_start(impl_->args, "im2p.frontend_start_host_call", HostIntervalAccounting::excluded_from_cpu_work);
   auto started = ::im2p::gemmini::execute(&impl_->runtime_args,
                                           ::im2p::gemmini::Mode::full,
                                           frontend_options);
@@ -2150,7 +2150,7 @@ Completion ExsiaFullExecution::finish(bool quantization_succeeded) noexcept {
     ++counters.fence;
   }
 #endif
-  HostCpuInterval fence(impl_->args, "im2p.fence_host_call");
+  HostCpuInterval fence(impl_->args, "im2p.fence_host_call", HostIntervalAccounting::excluded_from_cpu_work);
   const auto fenced = ::im2p::gemmini::fence(*impl_->run);
   fence.finish(fenced.status.ok());
   impl_->worker_timing.success = fenced.status.ok();
@@ -2188,7 +2188,7 @@ Completion ExsiaFullExecution::finish(bool quantization_succeeded) noexcept {
     }
   }
 #endif
-  HostCpuInterval copy(impl_->args, "im2p.output_buffer_copy");
+  HostCpuInterval copy(impl_->args, "im2p.output_buffer_copy", HostIntervalAccounting::cpu_work);
   impl_->copy_staged_output();
   copy.finish();
   return completion;
@@ -2214,7 +2214,7 @@ Result ExsiaStripePipeline::install_sink() noexcept {
 
 ExsiaStripePipelineStart
 start_exsia_stripe_pipeline(ggml_gemmini_args_t &args) noexcept {
-  HostCpuInterval preparation(args, "im2p.host_input_preparation");
+  HostCpuInterval preparation(args, "im2p.host_input_preparation", HostIntervalAccounting::cpu_work);
   GemminiGeometry geometry;
   if (!args.activation_geometry_matches(geometry)) {
     return {{Error::invalid_contract,
@@ -2280,7 +2280,7 @@ start_exsia_stripe_pipeline(ggml_gemmini_args_t &args) noexcept {
 #endif
   impl->worker_timing.attach(frontend_options);
   preparation.finish();
-  HostCpuInterval frontend_start(args, "im2p.frontend_start_host_call");
+  HostCpuInterval frontend_start(args, "im2p.frontend_start_host_call", HostIntervalAccounting::excluded_from_cpu_work);
   auto started = ::im2p::gemmini::execute(
       &impl->runtime_args, ::im2p::gemmini::Mode::stripe_pipeline,
       frontend_options);
@@ -2341,7 +2341,7 @@ Completion ExsiaStripePipeline::finish(bool quantization_succeeded) noexcept {
     failure = injected_failure;
   }
 #endif
-  HostCpuInterval fence(impl_->args, "im2p.fence_host_call");
+  HostCpuInterval fence(impl_->args, "im2p.fence_host_call", HostIntervalAccounting::excluded_from_cpu_work);
   const auto fenced = ::im2p::gemmini::fence(*impl_->run);
   fence.finish(fenced.status.ok());
   impl_->worker_timing.success = fenced.status.ok();
@@ -2402,7 +2402,7 @@ Completion ExsiaStripePipeline::finish(bool quantization_succeeded) noexcept {
             completion.stats};
   }
   const std::uint64_t run_id = impl_->published.front().event.run_id;
-  HostCpuInterval validation(impl_->args, "im2p.post_fence_validation");
+  HostCpuInterval validation(impl_->args, "im2p.post_fence_validation", HostIntervalAccounting::cpu_work);
   const Result timing_status = validate_stripe_timings(
       fenced.stripe_rtl_timings, impl_->runtime_args, completion.stats, run_id);
   const Result residual_timing_status =
@@ -2438,7 +2438,7 @@ Completion ExsiaStripePipeline::finish(bool quantization_succeeded) noexcept {
     }
   }
 #endif
-  HostCpuInterval copy(impl_->args, "im2p.output_buffer_copy");
+  HostCpuInterval copy(impl_->args, "im2p.output_buffer_copy", HostIntervalAccounting::cpu_work);
   impl_->copy_staged_output();
   copy.finish();
   completion.run_id = run_id;

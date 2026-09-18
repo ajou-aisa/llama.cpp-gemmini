@@ -2824,7 +2824,7 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
         ggml::gemmini::trace::ScopedContext operator_context(gemmini_trace_operator(
             graph_trace, graph_id, graph_id + 1 + static_cast<uint64_t>(i),
             static_cast<uint64_t>(i), ggml_op_name(node->op), 0, 1, 1));
-        ggml::gemmini::trace::CpuStage operator_dispatch(node->name, "operator.host_dispatch");
+        ggml::gemmini::trace::CpuStage operator_dispatch(node->name, "operator.host_dispatch", ggml::gemmini::trace::CpuStage::Scope::envelope);
 
         switch (node->op)
         {

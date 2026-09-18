@@ -3,8 +3,9 @@
 # requires-python = ">=3.9"
 # dependencies = []
 # ///
-# How to run:
-#   python3 scripts/utils/cycle_timeline.py cycle-log.jsonl --rows timeline.jsonl --trace timeline.json
+# Basic usage:
+#   python3 scripts/utils/cycle_timeline.py cycle-log.jsonl
+# Default outputs: normalized rows plus thread/operator Chrome traces.
 from __future__ import annotations
 
 import argparse
@@ -38,7 +39,6 @@ class TimelineRow:
     source_line: int
     execution_id: Optional[str]
     kind: str
-    stage_class: str
     op: Optional[str]
     layer: Optional[str]
     request_id: Optional[int]
@@ -186,25 +186,6 @@ def _common(record: Mapping[str, JsonValue], line: int) -> dict[str, Any]:
     }
 
 
-def classify_stage(op: Optional[str], kind: str) -> str:
-    if kind == "event":
-        return "event"
-    if kind == "device":
-        return "device"
-    value = (op or "").lower()
-    if value in {"operator.host_dispatch", "task.host_work", "gemmini.matmul_worker", "im2p.simulation_worker"}:
-        return "envelope"
-    if any(token in value for token in ("wait", "fence", "join", "barrier")):
-        return "wait"
-    if any(token in value for token in ("copy", "transfer", "send", "receive")):
-        return "transfer"
-    if any(token in value for token in ("submit", "handoff", "queue")):
-        return "synchronization"
-    if "host_call" in value or "device_call" in value:
-        return "device_call"
-    return "compute"
-
-
 def _compact_interval(record: Mapping[str, JsonValue], line: int, execution: Optional[str]) -> TimelineRow:
     kind = _string(record.get("kind"), line, "kind", optional=False)
     if kind not in COMPACT_KINDS:
@@ -254,7 +235,6 @@ def _compact_interval(record: Mapping[str, JsonValue], line: int, execution: Opt
 
     return TimelineRow(
         row_type="interval", source_line=line, kind=kind,
-        stage_class=classify_stage(common["op"], kind),
         tid=tid, tid_start=tid_start, tid_end=tid_end,
         ns_start=ns_start, ns_end=ns_end, wall_ns=ns_end - ns_start,
         cycle_clock="thread_pmu", cycle_start=cycle_start, cycle_end=cycle_end,
@@ -299,7 +279,6 @@ def _full_cpu_interval(record: Mapping[str, JsonValue], line: int, execution: Op
     return TimelineRow(
         row_type="interval", source_line=line,
         kind="segment" if record_type == "OPERATOR_SEGMENT" else "cpu",
-        stage_class=classify_stage(common["op"], "segment" if record_type == "OPERATOR_SEGMENT" else "cpu"),
         tid=tid_start if tid_start == tid_end else None, tid_start=tid_start, tid_end=tid_end,
         ns_start=ns_start, ns_end=ns_end, wall_ns=ns_end - ns_start,
         cycle_clock="thread_pmu", cycle_start=cycle_start, cycle_end=cycle_end,
@@ -316,7 +295,7 @@ def _event(record: Mapping[str, JsonValue], line: int, execution: Optional[str])
     event = _string(record.get("event"), line, "event", optional=False)
     timestamp = _uint(record.get("timestamp_ns"), line, "timestamp_ns", optional=False)
     return TimelineRow(
-        row_type="event", source_line=line, kind="event", stage_class="event",
+        row_type="event", source_line=line, kind="event",
         tid=None, tid_start=None, tid_end=None,
         ns_start=timestamp, ns_end=timestamp, wall_ns=0,
         cycle_clock=None, cycle_start=None, cycle_end=None, cycles=None,
@@ -340,7 +319,7 @@ def _device_interval(record: Mapping[str, JsonValue], line: int, execution: Opti
     if end < start or delta != end - start:
         raise CycleSchemaError(line, "device cycle interval has inconsistent endpoints/delta")
     return TimelineRow(
-        row_type="device", source_line=line, kind="device", stage_class="device",
+        row_type="device", source_line=line, kind="device",
         tid=None, tid_start=None, tid_end=None,
         ns_start=None, ns_end=None, wall_ns=None,
         cycle_clock=_string(record.get("source"), line, "source") or "rtl_cycle",
@@ -357,7 +336,7 @@ def _device_summary(record: Mapping[str, JsonValue], line: int, execution: Optio
     expected_stripes = _uint(record.get("rtl_stripes_published"), line, "rtl_stripes_published")
     cycles = _uint(record.get("rtl_work_total_cycles"), line, "rtl_work_total_cycles")
     return TimelineRow(
-        row_type="device_summary", source_line=line, kind="device_summary", stage_class="device",
+        row_type="device_summary", source_line=line, kind="device_summary",
         tid=None, tid_start=None, tid_end=None,
         ns_start=None, ns_end=None, wall_ns=None,
         cycle_clock=_string(record.get("source"), line, "source") or "rtl_cycle",
@@ -456,9 +435,7 @@ def validate_relationships(rows: list[TimelineRow], require_valid_cycles: bool) 
         if row.parent_task_id is not None and row.task_id is not None and row.parent_task_id == row.task_id:
             errors.append(f"line {row.source_line}: task_id is its own parent")
         if row.parent_segment_id is not None and row.segment_id is not None and row.parent_segment_id == row.segment_id:
-            # task.host_work is the one intentional envelope whose segment is the task itself.
-            if row.op != "task.host_work":
-                errors.append(f"line {row.source_line}: segment_id is its own parent")
+            errors.append(f"line {row.source_line}: segment_id is its own parent")
 
     return errors
 
@@ -580,7 +557,40 @@ def write_rows(path: Path, rows: list[TimelineRow]) -> None:
             stream.write(json.dumps(_row_dict(row), separators=(",", ":"), ensure_ascii=False) + "\n")
 
 
-def write_trace(path: Path, rows: list[TimelineRow], included_only: bool) -> None:
+TRACE_VIEWS = ("thread", "operator", "task", "stripe")
+
+
+def _trace_lane(row: TimelineRow, view: str) -> Optional[tuple[object, str]]:
+    if view == "thread":
+        tid = row.tid if row.tid is not None else row.tid_start
+        return None if tid is None else (tid, f"tid {tid}")
+    if view == "operator":
+        if row.operator_id is None:
+            return None
+        label = f"operator {row.operator_id}"
+        if row.operator_kind:
+            label += f" {row.operator_kind}"
+        return row.operator_id, label
+    if view == "task":
+        if row.task_id is None:
+            return None
+        label = f"task {row.task_id}"
+        if row.operator_kind:
+            label += f" ({row.operator_kind})"
+        return row.task_id, label
+    if view == "stripe":
+        if row.run_id is None or row.stripe_id is None:
+            return None
+        key = (row.run_id, row.stripe_id, row.layer)
+        label = f"run {row.run_id} / stripe {row.stripe_id}"
+        if row.layer:
+            label += f" / {row.layer}"
+        return key, label
+    raise ValueError(f"unsupported trace view: {view}")
+
+
+def write_trace(path: Path, rows: list[TimelineRow], included_only: bool,
+                view: str) -> dict[str, int | str]:
     executions = [row.execution_id or "unknown" for row in rows if row.ns_start is not None]
     execution_order = list(dict.fromkeys(executions))
     pid_for = {execution: index + 1 for index, execution in enumerate(execution_order)}
@@ -598,11 +608,18 @@ def write_trace(path: Path, rows: list[TimelineRow], included_only: bool) -> Non
             "args": {"name": execution},
         })
 
-    named_threads: set[tuple[str, int]] = set()
+    lane_ids: dict[tuple[str, object], int] = {}
+    lane_names: dict[tuple[str, object], str] = {}
+    next_lane: dict[str, int] = defaultdict(lambda: 1)
+    placed = 0
+    skipped_missing_lane = 0
+    skipped_context_free = 0
+
     for row in rows:
         if row.ns_start is None:
             continue
         if included_only and row.request_id is None and row.row_type != "event":
+            skipped_context_free += 1
             continue
         execution = row.execution_id or "unknown"
         pid = pid_for[execution]
@@ -614,26 +631,46 @@ def write_trace(path: Path, rows: list[TimelineRow], included_only: bool) -> Non
                 "args": _row_dict(row),
             })
             continue
-        tid = row.tid if row.tid is not None else row.tid_start
-        if tid is None:
+
+        lane = _trace_lane(row, view)
+        if lane is None:
+            skipped_missing_lane += 1
             continue
-        if (execution, tid) not in named_threads:
-            named_threads.add((execution, tid))
+        lane_key, lane_name = lane
+        map_key = (execution, lane_key)
+        if view == "thread":
+            lane_id = int(lane_key)
+        else:
+            lane_id = lane_ids.get(map_key, 0)
+            if lane_id == 0:
+                lane_id = next_lane[execution]
+                next_lane[execution] += 1
+                lane_ids[map_key] = lane_id
+        if map_key not in lane_names:
+            lane_names[map_key] = lane_name
             events.append({
-                "ph": "M", "name": "thread_name", "pid": pid, "tid": tid,
-                "args": {"name": f"tid {tid}"},
+                "ph": "M", "name": "thread_name", "pid": pid, "tid": lane_id,
+                "args": {"name": lane_name},
             })
         events.append({
             "ph": "X", "name": row.op or row.kind, "cat": row.kind,
-            "pid": pid, "tid": tid, "ts": (row.ns_start - origin) / 1000.0,
+            "pid": pid, "tid": lane_id, "ts": (row.ns_start - origin) / 1000.0,
             "dur": ((row.ns_end or row.ns_start) - row.ns_start) / 1000.0,
             "args": _row_dict(row),
         })
+        placed += 1
 
     path.write_text(
-        json.dumps({"traceEvents": events, "displayTimeUnit": "ns"}, separators=(",", ":"), ensure_ascii=False) + "\n",
+        json.dumps({"traceEvents": events, "displayTimeUnit": "ns", "view": view},
+                   separators=(",", ":"), ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
+    return {
+        "view": view,
+        "placed_intervals": placed,
+        "skipped_missing_lane": skipped_missing_lane,
+        "skipped_context_free": skipped_context_free,
+    }
 
 
 def report(rows: list[TimelineRow], summary: ValidationSummary, relationship_errors: list[str],
@@ -669,8 +706,10 @@ def report(rows: list[TimelineRow], summary: ValidationSummary, relationship_err
 class Arguments(argparse.Namespace):
     input: Path
     rows: Optional[Path]
-    trace: Optional[Path]
-    require_valid_cycles: bool
+    trace_dir: Optional[Path]
+    view: Optional[list[str]]
+    all_views: bool
+    allow_invalid_cycles: bool
     included_only: bool
 
 
@@ -684,29 +723,49 @@ def main() -> int:
         ),
     )
     parser.add_argument("input", type=Path, help="cycle-log.jsonl")
-    parser.add_argument("--rows", type=Path, help="write normalized raw rows as JSONL")
-    parser.add_argument("--trace", type=Path, help="write observed shared-ns Chrome trace JSON")
-    parser.add_argument("--require-valid-cycles", action="store_true",
-                        help="fail if any CPU kind interval lacks a valid native cycle delta")
+    parser.add_argument("--rows", type=Path,
+                        help="normalized raw JSONL output; default: <input>.timeline.jsonl")
+    parser.add_argument("--trace-dir", type=Path,
+                        help="directory for Chrome traces; default: input directory")
+    parser.add_argument("--view", action="append", choices=TRACE_VIEWS,
+                        help="trace lane view; repeatable. default: thread + operator")
+    parser.add_argument("--all-views", action="store_true",
+                        help="write thread, operator, task, and stripe traces")
+    parser.add_argument("--allow-invalid-cycles", action="store_true",
+                        help="inspect non-PMU logs without failing invalid CPU cycle intervals")
     parser.add_argument("--included-only", action="store_true",
                         help="omit context-free warmup/raw intervals from trace output")
     args = Arguments()
     parser.parse_args(namespace=args)
 
+    base_name = args.input.name[:-6] if args.input.name.endswith(".jsonl") else args.input.stem
+    rows_path = args.rows or args.input.with_name(base_name + ".timeline.jsonl")
+    trace_dir = args.trace_dir or args.input.parent
+    if args.all_views:
+        views = list(TRACE_VIEWS)
+    elif args.view:
+        views = list(dict.fromkeys(args.view))
+    else:
+        views = ["thread", "operator"]
+
     try:
         rows, summary = read_rows(args.input)
-        errors = validate_relationships(rows, args.require_valid_cycles)
+        errors = validate_relationships(rows, not args.allow_invalid_cycles)
         cardinality_errors, cpu_interval_coverage = validate_cpu_cardinality(rows)
         errors.extend(cardinality_errors)
         stripe_errors, stripe_coverage = validate_stripe_cardinality(rows)
         errors.extend(stripe_errors)
-        if args.rows is not None:
-            args.rows.parent.mkdir(parents=True, exist_ok=True)
-            write_rows(args.rows, rows)
-        if args.trace is not None:
-            args.trace.parent.mkdir(parents=True, exist_ok=True)
-            write_trace(args.trace, rows, args.included_only)
+        rows_path.parent.mkdir(parents=True, exist_ok=True)
+        write_rows(rows_path, rows)
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        traces: dict[str, dict[str, int | str]] = {}
+        for view in views:
+            trace_path = trace_dir / f"{base_name}.timeline.{view}.chrome.json"
+            stats = write_trace(trace_path, rows, args.included_only, view)
+            traces[view] = {**stats, "path": str(trace_path)}
         result = report(rows, summary, errors, cpu_interval_coverage, stripe_coverage)
+        result["rows_output"] = str(rows_path)
+        result["traces"] = traces
         print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
         return 0 if not errors else 2
     except (OSError, UnicodeError, CycleSchemaError, TimelineError) as error:

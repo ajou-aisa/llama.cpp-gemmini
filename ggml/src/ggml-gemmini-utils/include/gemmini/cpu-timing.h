@@ -48,6 +48,15 @@ void gemmini_cpu_timing_record_segment(const gemmini_cycle_record_v2 *identity,
     noexcept
 #endif
     ;
+// Structural task/operator envelopes are explicit; the logger never infers
+// them from op-name strings.
+void gemmini_cpu_timing_record_envelope(const gemmini_cycle_record_v2 *identity,
+                                       const gemmini_cpu_sample *start,
+                                       const gemmini_cpu_sample *end)
+#ifdef __cplusplus
+    noexcept
+#endif
+    ;
 void gemmini_cpu_timing_emit(const char *layer, const char *scope, const uint64_t *run_id,
                             int operation_success, const gemmini_cpu_sample *start,
                             const gemmini_cpu_sample *end, const gemmini_cpu_totals *totals);

@@ -9,7 +9,7 @@
 namespace ggml::gemmini::trace {
 performance::Context inference_context(const gemmini_trace_context &context) noexcept;
 std::string append_metadata(std::string json, const gemmini_trace_context &context,
-                            uint64_t segment_id);
+                            uint64_t segment_id, bool structural_envelope = false);
 
 std::string annotate_origin(std::string json, const gemmini_trace_context &context);
 
@@ -38,8 +38,9 @@ private:
  * ScopedContext's value snapshot; a CPU sample is never continued on a peer. */
 class CpuStage {
 public:
-    CpuStage(const char *layer, const char *stage) noexcept
-        : layer_(layer), stage_(stage), exceptions_(std::uncaught_exceptions()),
+    enum class Scope : uint8_t { stage, envelope };
+    CpuStage(const char *layer, const char *stage, Scope scope = Scope::stage) noexcept
+        : layer_(layer), stage_(stage), scope_(scope), exceptions_(std::uncaught_exceptions()),
           start_(gemmini_cpu_timing_read()) {}
     ~CpuStage() noexcept { finish(std::uncaught_exceptions() == exceptions_); }
     void finish(bool success = true) noexcept;
@@ -47,6 +48,7 @@ public:
     CpuStage &operator=(const CpuStage &) = delete;
 private:
     const char *layer_, *stage_;
+    Scope scope_;
     int exceptions_;
     gemmini_cpu_sample start_{};
     bool finished_ = false;

@@ -4,8 +4,6 @@
 #include <atomic>
 #include <cstring>
 #include <limits>
-#include <algorithm>
-#include <cctype>
 
 namespace {
 thread_local gemmini_trace_context bound_context{};
@@ -90,7 +88,7 @@ performance::Context inference_context(const gemmini_trace_context &context) noe
             context.phase ? performance::Phase::decode : performance::Phase::prefill};
 }
 std::string append_metadata(std::string text, const gemmini_trace_context &context,
-                            uint64_t segment_id) {
+                            uint64_t segment_id, bool structural_envelope) {
 #if LOG_CYCLE
     if (!(context.flags & GEMMINI_TRACE_OPERATOR) && !context.task_id) return text;
 #if !CYCLE_DETAIL
@@ -102,14 +100,7 @@ std::string append_metadata(std::string text, const gemmini_trace_context &conte
          text.find("\"kind\":\"cycle\"") != std::string::npos);
     if (fast_compact_interval) {
         if (text.find("\"operator_context\":") != std::string::npos) return text;
-        const bool envelope = text.rfind("{\"op\":\"operator.host_dispatch\"", 0) == 0 ||
-            text.rfind("{\"op\":\"task.host_work\"", 0) == 0 ||
-            text.rfind("{\"op\":\"gemmini.matmul_worker\"", 0) == 0 ||
-            text.rfind("{\"op\":\"im2p.simulation_worker\"", 0) == 0;
-        const bool residual = context.role == GEMMINI_TRACE_ROLE_RESIDUAL ||
-            text.rfind("{\"op\":\"rmd.", 0) == 0 ||
-            text.find("residual") != std::string::npos ||
-            text.find("correction") != std::string::npos;
+        const bool residual = context.role == GEMMINI_TRACE_ROLE_RESIDUAL;
         std::string info = "{";
         bool first = true;
         auto key = [&](const char *name) {
@@ -130,11 +121,11 @@ std::string append_metadata(std::string text, const gemmini_trace_context &conte
         string("operator_kind", context.operator_name);
         number("task_id", context.task_id);
         number("parent_task_id", context.parent_task_id);
-        number("segment_id", envelope ? context.span_id : segment_id);
-        number("parent_segment_id", envelope ? context.parent_span_id : context.span_id);
+        number("segment_id", structural_envelope ? context.span_id : segment_id);
+        number("parent_segment_id", structural_envelope ? context.parent_span_id : context.span_id);
         string("role", residual ? "residual" :
             context.role == GEMMINI_TRACE_ROLE_DENSE ? "dense" : "operator");
-        if (envelope && (context.flags & GEMMINI_TRACE_MULTITASK))
+        if (structural_envelope && (context.flags & GEMMINI_TRACE_MULTITASK))
             string("structural_reason", "structurally_cross_task");
         info += '}';
         const auto close = text.rfind('}');
@@ -154,47 +145,18 @@ std::string append_metadata(std::string text, const gemmini_trace_context &conte
     if ((!compact_interval && type.empty()) || type == "INFERENCE_EVENT" ||
         type.find("CONFIGURATION") != std::string::npos ||
         type.find("SUMMARY") != std::string::npos) return text;
+    const bool residual = context.role == GEMMINI_TRACE_ROLE_RESIDUAL;
+    auto nullable = [](uint64_t n) -> Json { return n ? Json(n) : Json(); };
+#if CYCLE_DETAIL
     const auto string_value = [&](const char *key, std::string fallback = {}) {
         const auto found = row.find(key);
         return found != row.end() && found->is_string() ? found->get<std::string>() : fallback;
     };
-    const auto op = string_value("op", string_value("metric"));
-    std::string lower = op;
-    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return char(std::tolower(c)); });
-    const bool npu = type == "NPU_OPERATOR_SEGMENT" || type == "WS_LOOP_TELEMETRY" || type == "IM2P_EXECUTION_TELEMETRY" ||
-        type == "IM2P_STRIPE_TELEMETRY" || type == "IM2P_RMD_STRIPE_TELEMETRY" ||
-        type == "IM2P_RMD_EXECUTION_TELEMETRY" ||
+    const bool npu = type == "NPU_OPERATOR_SEGMENT" || type == "WS_LOOP_TELEMETRY" ||
+        type == "IM2P_EXECUTION_TELEMETRY" || type == "IM2P_STRIPE_TELEMETRY" ||
+        type == "IM2P_RMD_STRIPE_TELEMETRY" || type == "IM2P_RMD_EXECUTION_TELEMETRY" ||
         (type == "RESOURCE_SAMPLE" && row.value("kind", std::string()) == "npu");
-    const bool envelope = op == "operator.host_dispatch" || op == "task.host_work" ||
-        op == "gemmini.matmul_worker" || op == "im2p.simulation_worker";
-    const bool residual = context.role == GEMMINI_TRACE_ROLE_RESIDUAL ||
-        lower.find("rmd") != std::string::npos || lower.find("residual") != std::string::npos ||
-        lower.find("correction") != std::string::npos;
-    std::string kind = "compute", stage = lower;
-    if (envelope) { kind = "envelope"; stage = "dispatch"; }
-    else if (lower.find("wait") != std::string::npos || lower.find("fence") != std::string::npos ||
-             lower.find("join") != std::string::npos || lower.find("barrier") != std::string::npos) {
-        kind = "wait";
-    } else if (lower.find("copy") != std::string::npos || lower.find("transfer") != std::string::npos ||
-               lower.find("send") != std::string::npos || lower.find("receive") != std::string::npos) {
-        kind = "transfer";
-    } else if (lower.find("submit") != std::string::npos || lower.find("handoff") != std::string::npos ||
-               lower.find("queue") != std::string::npos) kind = "synchronization";
-    if (npu) stage = "execute";
-    else if (!envelope && lower.find("host_call") != std::string::npos)
-        stage = "device_call";
-    else if (!envelope && (lower.find("matmul") != std::string::npos ||
-             lower.find("mul_mat") != std::string::npos || lower.find("ggml_compute_forward") != std::string::npos))
-        stage = "execute";
-    else {
-        for (const char *prefix : {"cpu.", "gemmini.", "im2p.", "rmd.", "frontend."}) {
-            const auto n = std::strlen(prefix);
-            if (stage.compare(0, n, prefix) == 0) stage.erase(0,n);
-        }
-    }
-    auto nullable = [](uint64_t n) -> Json { return n ? Json(n) : Json(); };
-#if CYCLE_DETAIL
-    const std::string backend = npu ? string_value("backend", type == "WS_LOOP_TELEMETRY" ? "gemmini" : "im2p_sim") : "cpu";
+    Json backend = row.contains("backend") ? row["backend"] : Json();
     Json domain = row.contains("clock_domain") ? row["clock_domain"] :
         row.contains("domain") ? row["domain"] : row.contains("source") ? row["source"] : Json();
     Json info = {{"version",1},{"request_id",nullable(context.request_id)},
@@ -204,15 +166,13 @@ std::string append_metadata(std::string text, const gemmini_trace_context &conte
         {"graph_id",nullable(context.graph_id)},{"node_id",context.flags & GEMMINI_TRACE_OPERATOR ? Json(context.node_id) : Json()},
         {"operator_kind",context.operator_name[0] ? Json(context.operator_name) : Json()},
         {"task_id",nullable(context.task_id)},{"parent_task_id",nullable(context.parent_task_id)},
-        {"segment_id",nullable(envelope ? context.span_id : segment_id)},
-        {"parent_segment_id",nullable(envelope ? context.parent_span_id : context.span_id)},
+        {"segment_id",nullable(structural_envelope ? context.span_id : segment_id)},
+        {"parent_segment_id",nullable(structural_envelope ? context.parent_span_id : context.span_id)},
         {"worker_id",context.flags & GEMMINI_TRACE_WORKER ? Json(context.worker_id) : Json()},
         {"role",residual ? "residual" : context.role == GEMMINI_TRACE_ROLE_DENSE ? "dense" : "operator"},
-        {"stage",stage},{"stage_kind",kind},{"device",npu ? "npu" : "cpu"},
-        {"backend",backend},{"clock_domain",domain},{"additive",false},
-        {"scope",npu ? "device_counter" : envelope ? "caller_thread_envelope" :
-            op == "openmp.task_wait" ? "runtime_wait_envelope" : "owner_segment"},
-        {"structural_reason",envelope && (context.flags & GEMMINI_TRACE_MULTITASK) ? Json("structurally_cross_task") : Json()}};
+        {"device",npu ? "npu" : "cpu"},{"backend",backend},{"clock_domain",domain},{"additive",false},
+        {"scope",npu ? "device_counter" : structural_envelope ? "caller_thread_envelope" : "owner_segment"},
+        {"structural_reason",structural_envelope && (context.flags & GEMMINI_TRACE_MULTITASK) ? Json("structurally_cross_task") : Json()}};
     Json counter = {{"metric",npu ? "work_total_cycles" : "cpu_cycles"},
         {"unit","cycle"},{"source",row.contains("source") ? row["source"] : Json()},
         {"domain",domain},{"value",nullptr},{"valid",false},
@@ -261,13 +221,11 @@ std::string append_metadata(std::string text, const gemmini_trace_context &conte
         {"operator_kind",context.operator_name[0] ? Json(context.operator_name) : Json()},
         {"task_id",nullable(context.task_id)},
         {"parent_task_id",nullable(context.parent_task_id)},
-        {"segment_id",nullable(envelope ? context.span_id : segment_id)},
-        {"parent_segment_id",nullable(envelope ? context.parent_span_id : context.span_id)},
+        {"segment_id",nullable(structural_envelope ? context.span_id : segment_id)},
+        {"parent_segment_id",nullable(structural_envelope ? context.parent_span_id : context.span_id)},
         {"role",residual ? "residual" : context.role == GEMMINI_TRACE_ROLE_DENSE ? "dense" : "operator"},
-        {"stage",stage},{"stage_kind",kind},
-        {"scope",envelope ? "caller_thread_envelope" :
-            op == "openmp.task_wait" ? "runtime_wait_envelope" : "owner_segment"}};
-    if (envelope && (context.flags & GEMMINI_TRACE_MULTITASK))
+        {"scope",structural_envelope ? "caller_thread_envelope" : "owner_segment"}};
+    if (structural_envelope && (context.flags & GEMMINI_TRACE_MULTITASK))
         info["structural_reason"] = "structurally_cross_task";
 #endif
     // Append instead of reserializing the legacy object so existing exact
@@ -297,7 +255,8 @@ void CpuStage::finish(bool success) noexcept {
     identity.interval.layer = layer_; identity.interval.op = stage_;
     // Native ownership and timing validity are independent of operation outcome.
     try {
-        log::cycle.write_cpu(identity, start_, end, success, true);
+        log::cycle.write_cpu(identity, start_, end, success, true,
+            scope_ == Scope::envelope);
     } catch (...) { log::cycle.report_failure("operator stage"); }
 #else
     (void)success;

@@ -183,18 +183,18 @@ bool test_uniform_device_metadata() {
         R"({"schema":"gemmini.cycle","version":2,"record_type":"NPU_OPERATOR_SEGMENT","op":"rmd.matmul.execute","backend":"im2p_sim","clock_domain":"independent_rmd_simulator","cycles":0,"valid":true})",context,62));
     const auto &a = cpu["operator_context"]; const auto &b = npu["operator_context"];
 #if EXPECT_CYCLE_DETAIL
-    if (!check(a["operator_kind"] == b["operator_kind"] && a["stage"] == b["stage"] &&
+    if (!check(a["operator_kind"] == b["operator_kind"] &&
                a["role"] == b["role"] && a["device"] == "cpu" && b["device"] == "npu" &&
                b["backend"] == "im2p_sim" && npu["cycles"] == 0 && npu["valid"] == true,
                "detail metadata carries uniform device attribution")) return false;
 #else
-    if (!check(a["operator_kind"] == b["operator_kind"] && a["stage"] == b["stage"] &&
+    if (!check(a["operator_kind"] == b["operator_kind"] &&
                a["role"] == b["role"] && !a.contains("device") && !b.contains("device") &&
                npu["backend"] == "im2p_sim" && npu["cycles"] == 0 && npu["valid"] == true,
                "compact metadata avoids duplicating device/backend fields")) return false;
 #endif
     auto envelope = Json::parse(trace::append_metadata(
-        R"({"record_type":"OPERATOR_SEGMENT","op":"operator.host_dispatch"})",context,63));
+        R"({"record_type":"OPERATOR_SEGMENT","op":"operator.host_dispatch"})",context,63,true));
     if (!check(envelope["operator_context"]["structural_reason"] == "structurally_cross_task" &&
                envelope["operator_context"]["scope"] == "caller_thread_envelope" &&
                (!a.contains("structural_reason") || a["structural_reason"].is_null()),

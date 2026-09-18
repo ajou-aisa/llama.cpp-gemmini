@@ -3533,7 +3533,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 .identity_mask = GEMMINI_CYCLE_HAS_RUN_ID | GEMMINI_CYCLE_HAS_NODE_ID | GEMMINI_CYCLE_HAS_WORKER_ID,
                 .run_id = tp->cycle_run_id, .node_id = (uint64_t)node_n, .worker_id = (uint64_t)state->ith,
             };
-            gemmini_cpu_timing_record_segment(&dispatch_record, &operator_start, &operator_end);
+            gemmini_cpu_timing_record_envelope(&dispatch_record, &operator_start, &operator_end);
         }
 #endif
 #if CYCLE_LOG
@@ -3558,7 +3558,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     const gemmini_cpu_sample worker_lifetime_end = gemmini_cpu_timing_read();
     gemmini_cycle_record_v2 lifetime_record = worker_record;
     lifetime_record.interval.op = "task.host_work";
-    gemmini_cpu_timing_record_segment(&lifetime_record, &cpu_start, &worker_lifetime_end);
+    gemmini_cpu_timing_record_envelope(&lifetime_record, &cpu_start, &worker_lifetime_end);
     gemmini_trace_restore(previous_worker_trace);
 #endif
     return 0;

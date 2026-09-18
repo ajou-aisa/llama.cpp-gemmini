@@ -26,8 +26,9 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="cycle-timeline-") as temporary:
         root = Path(temporary)
         source = root / "cycle-log.jsonl"
-        rows_path = root / "rows.jsonl"
-        trace_path = root / "trace.json"
+        rows_path = root / "cycle-log.timeline.jsonl"
+        thread_trace_path = root / "cycle-log.timeline.thread.chrome.json"
+        operator_trace_path = root / "cycle-log.timeline.operator.chrome.json"
 
         inference = {"request_id": 1, "operation_id": 2, "phase": "decode", "included": True}
         operator = {
@@ -85,10 +86,15 @@ def main() -> None:
         ]
         source.write_text("".join(line(record) for record in records), encoding="utf-8")
 
-        result = run(source, "--rows", str(rows_path), "--trace", str(trace_path), "--require-valid-cycles")
+        result = run(source)
         assert result.returncode == 0, result.stdout + result.stderr
         summary = json.loads(result.stdout)
         assert summary["status"] == "ok"
+        assert Path(summary["rows_output"]) == rows_path
+        assert Path(summary["traces"]["thread"]["path"]) == thread_trace_path
+        assert Path(summary["traces"]["operator"]["path"]) == operator_trace_path
+        assert summary["traces"]["thread"]["placed_intervals"] == 2
+        assert summary["traces"]["operator"]["placed_intervals"] == 2
         assert summary["records"] == 7
         assert summary["normalized_rows"] == 7
         assert summary["interval_rows"] == 2
@@ -114,17 +120,35 @@ def main() -> None:
         cpu = next(row for row in rows if row.get("op") == "cpu.mul_mat")
         wait = next(row for row in rows if row.get("op") == "worker_queue_wait")
         device = next(row for row in rows if row.get("row_type") == "device")
-        assert (cpu["cycles"], cpu["wall_ns"], cpu["tid"], cpu["stage_class"]) == (60, 80, 42, "compute")
-        assert (wait["cycles"], wait["wall_ns"], wait["stage_class"]) == (5, 250, "wait")
+        assert (cpu["cycles"], cpu["wall_ns"], cpu["tid"]) == (60, 80, 42)
+        assert (wait["cycles"], wait["wall_ns"]) == (5, 250)
         assert (device["cycle_start"], device["cycle_end"], device["cycles"]) == (700, 900, 200)
         assert "ns_start" not in device
 
-        trace = json.loads(trace_path.read_text(encoding="utf-8"))
-        spans = [event for event in trace["traceEvents"] if event.get("ph") == "X"]
+        thread_trace = json.loads(thread_trace_path.read_text(encoding="utf-8"))
+        spans = [event for event in thread_trace["traceEvents"] if event.get("ph") == "X"]
+        assert thread_trace["view"] == "thread"
         assert len(spans) == 2
         assert {event["name"] for event in spans} == {"cpu.mul_mat", "worker_queue_wait"}
         assert all(event["tid"] == 42 for event in spans)
         assert not any(event.get("name") == "im2p.execute" for event in spans)
+
+        operator_trace = json.loads(operator_trace_path.read_text(encoding="utf-8"))
+        operator_spans = [event for event in operator_trace["traceEvents"] if event.get("ph") == "X"]
+        operator_names = [event for event in operator_trace["traceEvents"] if event.get("name") == "thread_name"]
+        assert operator_trace["view"] == "operator"
+        assert len(operator_spans) == 2
+        assert len({event["tid"] for event in operator_spans}) == 1
+        assert any(event["args"]["name"] == "operator 11 MUL_MAT" for event in operator_names)
+
+        all_views_dir = root / "all-views"
+        result = run(source, "--all-views", "--trace-dir", str(all_views_dir))
+        assert result.returncode == 0, result.stdout
+        all_views = json.loads(result.stdout)["traces"]
+        assert set(all_views) == {"thread", "operator", "task", "stripe"}
+        assert all(Path(info["path"]).exists() for info in all_views.values())
+        assert all_views["task"]["placed_intervals"] == 2
+        assert all_views["stripe"]["placed_intervals"] == 1
 
         # Gemmini compact kind=cycle rows keep the shared ns timeline and invocation identity.
         scalar = root / "compact-cycle.jsonl"
@@ -139,7 +163,8 @@ def main() -> None:
         assert result.returncode == 0, result.stdout
         scalar_row = json.loads(scalar_rows.read_text(encoding="utf-8"))
         assert scalar_row["matmul_invocation_id"] == 77
-        assert scalar_row["stage_class"] == "device_call"
+        assert scalar_row["op"] == "dense_backend_host_call"
+        assert scalar_row["kind"] == "cycle"
         assert (scalar_row["wall_ns"], scalar_row["cycles"]) == (100, 40)
 
         # Invalid compact cycle arithmetic must fail before timeline export.
@@ -170,10 +195,11 @@ def main() -> None:
             "ns_start": 1, "ns_end": 2, "tid": 7, "valid": False,
             "reason": "unavailable_event",
         }), encoding="utf-8")
-        assert run(invalid_cycle).returncode == 0
-        strict = run(invalid_cycle, "--require-valid-cycles")
+        strict = run(invalid_cycle)
         assert strict.returncode == 2
         assert "invalid cycle counter" in strict.stdout
+        relaxed = run(invalid_cycle, "--allow-invalid-cycles")
+        assert relaxed.returncode == 0
 
         # Dropping one counted CPU interval is a hard cardinality hole.
         missing = root / "missing-counted-cpu.jsonl"

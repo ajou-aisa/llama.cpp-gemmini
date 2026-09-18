@@ -811,7 +811,7 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
 #endif
     {
         trace::ScopedContext dense_task(dense_task_origin, true);
-        trace::CpuStage task_lifetime(args.matmul_layer.c_str(), "task.host_work");
+        trace::CpuStage task_lifetime(args.matmul_layer.c_str(), "task.host_work", trace::CpuStage::Scope::envelope);
 #if LOG_CYCLE
         const auto worker_cpu_start = gemmini_cpu_timing_read();
 #endif
@@ -2557,7 +2557,7 @@ void MatmulStripeCollector::worker_loop() {
             if (queue_drained) break;
 
             trace::ScopedContext stripe_task(captured.trace_origin, true);
-            trace::CpuStage stripe_lifetime(execution->facade_.args().matmul_layer.c_str(), "task.host_work");
+            trace::CpuStage stripe_lifetime(execution->facade_.args().matmul_layer.c_str(), "task.host_work", trace::CpuStage::Scope::envelope);
             std::shared_ptr<MatmulStripeJob> job;
             const auto preparation_start = read_matmul_cpu_sample();
             try {

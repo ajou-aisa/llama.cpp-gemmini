@@ -2494,7 +2494,7 @@ namespace ggml::gemmini::quants::act::exsia
 #pragma omp parallel num_threads(EXSIA_OMP_THREAD_COUNT)
             {
                 trace::ScopedContext team_context(task_trace_origin, true);
-                trace::CpuStage team_lifetime(layer, "task.host_work");
+                trace::CpuStage team_lifetime(layer, "task.host_work", trace::CpuStage::Scope::envelope);
 #if LOG_CYCLE
                 const bool collect_worker_cpu = cycle::host_thread_id() != run_timing.start.tid;
                 const auto worker_start = collect_worker_cpu ? gemmini_cpu_timing_read() : gemmini_cpu_sample{};
@@ -2519,7 +2519,7 @@ namespace ggml::gemmini::quants::act::exsia
 #pragma omp task depend(out : prepared[s]) firstprivate(s, slot_idx, row_start, row_end, observed_team_size)
                             {
                                 trace::ScopedContext task_context(task_trace_origin, true);
-                                trace::CpuStage task_lifetime(layer, "task.host_work");
+                                trace::CpuStage task_lifetime(layer, "task.host_work", trace::CpuStage::Scope::envelope);
                                 CpuWallInterval task_cpu_wall(layer, run_id, "exsia.prepare", s);
                                 try
                                 {
@@ -2586,7 +2586,7 @@ namespace ggml::gemmini::quants::act::exsia
 #pragma omp task depend(in : local_sealed[s - 1]) depend(out : prepared[s]) firstprivate(s, slot_idx, row_start, row_end, observed_team_size)
                             {
                                 trace::ScopedContext task_context(task_trace_origin, true);
-                                trace::CpuStage task_lifetime(layer, "task.host_work");
+                                trace::CpuStage task_lifetime(layer, "task.host_work", trace::CpuStage::Scope::envelope);
                                 CpuWallInterval task_cpu_wall(layer, run_id, "exsia.prepare", s);
                                 try
                                 {
@@ -2653,7 +2653,7 @@ namespace ggml::gemmini::quants::act::exsia
 #pragma omp task depend(in : local_sealed[s - 1], slot_released[s - 2]) depend(out : prepared[s]) firstprivate(s, slot_idx, row_start, row_end, observed_team_size)
                             {
                                 trace::ScopedContext task_context(task_trace_origin, true);
-                                trace::CpuStage task_lifetime(layer, "task.host_work");
+                                trace::CpuStage task_lifetime(layer, "task.host_work", trace::CpuStage::Scope::envelope);
                                 CpuWallInterval task_cpu_wall(layer, run_id, "exsia.prepare", s);
                                 try
                                 {
@@ -2721,7 +2721,7 @@ namespace ggml::gemmini::quants::act::exsia
 #pragma omp task depend(in : prepared[s]) depend(out : worker_done[s * EXSIA_LOCAL_WORKER_COUNT + task_id]) firstprivate(s, slot_idx, task_id)
                             {
                                 trace::ScopedContext task_context(task_trace_origin, true);
-                                trace::CpuStage task_lifetime(layer, "task.host_work");
+                                trace::CpuStage task_lifetime(layer, "task.host_work", trace::CpuStage::Scope::envelope);
                                 CpuWallInterval task_cpu_wall(layer, run_id, "exsia.local", s, task_id);
                                 try
                                 {
@@ -2780,7 +2780,7 @@ namespace ggml::gemmini::quants::act::exsia
 #endif
                         {
                             trace::ScopedContext task_context(task_trace_origin, true);
-                            trace::CpuStage task_lifetime(layer, "task.host_work");
+                            trace::CpuStage task_lifetime(layer, "task.host_work", trace::CpuStage::Scope::envelope);
                             CpuWallInterval task_cpu_wall(layer, run_id, "exsia.local_seal", s);
                             try
                             {
@@ -2871,7 +2871,7 @@ namespace ggml::gemmini::quants::act::exsia
 #pragma omp task depend(in : local_sealed[s]) depend(inout : post_chain) depend(out : slot_released[s]) firstprivate(s, slot_idx)
                         {
                             trace::ScopedContext task_context(task_trace_origin, true);
-                            trace::CpuStage task_lifetime(layer, "task.host_work");
+                            trace::CpuStage task_lifetime(layer, "task.host_work", trace::CpuStage::Scope::envelope);
                             CpuWallInterval task_cpu_wall(layer, run_id, "exsia.mask_assembly", s);
                             try
                             {
@@ -3134,7 +3134,7 @@ namespace ggml::gemmini::quants::act::exsia
 #pragma omp parallel num_threads(EXSIA_OMP_THREAD_COUNT)
                 {
                     trace::ScopedContext team_context(task_trace_origin, true);
-                    trace::CpuStage team_lifetime(layer, "task.host_work");
+                    trace::CpuStage team_lifetime(layer, "task.host_work", trace::CpuStage::Scope::envelope);
 #if LOG_CYCLE
                     const bool collect_worker_cpu = cycle::host_thread_id() != run_timing.start.tid;
                     const auto worker_start = collect_worker_cpu ? gemmini_cpu_timing_read() : gemmini_cpu_sample{};
@@ -3157,7 +3157,7 @@ namespace ggml::gemmini::quants::act::exsia
 #pragma omp task firstprivate(task_id)
                             {
                                 trace::ScopedContext task_context(task_trace_origin, true);
-                                trace::CpuStage task_lifetime(layer, "task.host_work");
+                                trace::CpuStage task_lifetime(layer, "task.host_work", trace::CpuStage::Scope::envelope);
                                 CpuWallInterval task_cpu_wall(layer, run_id, "exsia.local", s, task_id);
                                 try
                                 {

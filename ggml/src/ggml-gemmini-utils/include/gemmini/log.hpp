@@ -248,7 +248,8 @@ namespace ggml::gemmini::log
         void write_json(std::string_view json_record);
         void write_cpu(const gemmini_cycle_record_v2 &identity,
                        const gemmini_cpu_sample &start, const gemmini_cpu_sample &end,
-                       std::optional<bool> operation_success = {}, bool raw_segment = false);
+                       std::optional<bool> operation_success = {}, bool raw_segment = false,
+                       bool structural_envelope = false);
         void write_measurement(const performance::Measurement &measurement);
         void report_failure(const char * operation) noexcept;
 

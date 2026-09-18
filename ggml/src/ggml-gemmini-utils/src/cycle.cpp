@@ -436,6 +436,7 @@ namespace ggml::gemmini::log
             uint64_t sequence = 0;
             std::optional<bool> operation_success;
             bool raw_segment = false;
+            bool structural_envelope = false;
         };
         performance::Context context;
         std::variant<std::string, Cpu, performance::Measurement> value;
@@ -480,7 +481,9 @@ namespace ggml::gemmini::log
                     const auto next = json.find('\n', begin);
                     const auto end = next == std::string::npos ? json.size() : next;
                     if (end > begin) decorated += trace::append_metadata(json.substr(begin, end-begin),
-                        trace_context, begin == 0 ? segment_id : gemmini_trace_reserve_ids(1));
+                        trace_context, begin == 0 ? segment_id : gemmini_trace_reserve_ids(1),
+                        begin == 0 && std::holds_alternative<Cpu>(value) &&
+                            std::get<Cpu>(value).structural_envelope);
                     if (next != std::string::npos) decorated += '\n';
                     begin = end+1;
                 }
@@ -886,7 +889,8 @@ namespace ggml::gemmini::log
 
     void CycleLog::write_cpu(const gemmini_cycle_record_v2 &identity,
                             const gemmini_cpu_sample &start, const gemmini_cpu_sample &end,
-                            std::optional<bool> operation_success, bool raw_segment) try
+                            std::optional<bool> operation_success, bool raw_segment,
+                            bool structural_envelope) try
     {
 #if LOG_CYCLE
         const auto captured = start.trace.flags & GEMMINI_TRACE_CAPTURED ? start.trace : gemmini_trace_capture();
@@ -894,16 +898,18 @@ namespace ggml::gemmini::log
         Entry::Cpu cpu{identity, start, end,
             identity.interval.layer ? identity.interval.layer : "",
             identity.interval.op ? identity.interval.op : "",
-            0, std::nullopt, false};
+            0, std::nullopt, false, false};
         if (!raw_segment && this == &ggml::gemmini::log::cycle)
             cpu.sequence = performance::next_cpu_interval_sequence(context);
         cpu.operation_success = operation_success;
         cpu.raw_segment = raw_segment;
+        cpu.structural_envelope = structural_envelope;
         cpu.identity.interval.layer = cpu.identity.interval.op = nullptr;
         cpu.identity.interval.file = cpu.identity.interval.func = nullptr;
         submit({context, std::move(cpu), captured, gemmini_trace_reserve_ids(1)});
 #else
         (void)identity; (void)start; (void)end; (void)operation_success; (void)raw_segment;
+        (void)structural_envelope;
 #endif
     }
     catch (...) { report_failure("CPU interval"); throw; }
@@ -1156,7 +1162,7 @@ void WorkerCpuTiming::emit(const char *layer, const char *scope, std::optional<u
         identity.identity_mask = GEMMINI_CYCLE_HAS_RUN_ID;
         identity.run_id = *run_id;
     }
-    gemmini_cpu_timing_record(&identity, &start, &end);
+    gemmini_cpu_timing_record_envelope(&identity, &start, &end);
     gemmini_cpu_totals totals{};
     gemmini_cpu_timing_add(&totals, &start, &end);
     gemmini_cpu_timing_emit(layer, scope, run_id ? &*run_id : nullptr,
@@ -1260,6 +1266,17 @@ extern "C" void gemmini_cpu_timing_record_segment(const gemmini_cycle_record_v2 
     if (!identity || !start || !end) return;
     try { ggml::gemmini::log::cycle.write_cpu(*identity, *start, *end, {}, true); }
     catch (...) { ggml::gemmini::log::cycle.report_failure("operator segment"); }
+#else
+    (void)identity; (void)start; (void)end;
+#endif
+}
+
+extern "C" void gemmini_cpu_timing_record_envelope(const gemmini_cycle_record_v2 *identity,
+        const gemmini_cpu_sample *start, const gemmini_cpu_sample *end) noexcept {
+#if LOG_CYCLE
+    if (!identity || !start || !end) return;
+    try { ggml::gemmini::log::cycle.write_cpu(*identity, *start, *end, {}, true, true); }
+    catch (...) { ggml::gemmini::log::cycle.report_failure("structural envelope"); }
 #else
     (void)identity; (void)start; (void)end;
 #endif

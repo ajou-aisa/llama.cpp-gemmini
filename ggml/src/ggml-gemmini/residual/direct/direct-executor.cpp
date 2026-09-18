@@ -485,7 +485,7 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
 #endif
     {
         trace::ScopedContext direct_task(direct_task_origin, true);
-        trace::CpuStage task_lifetime(args.matmul_layer.c_str(), "task.host_work");
+        trace::CpuStage task_lifetime(args.matmul_layer.c_str(), "task.host_work", trace::CpuStage::Scope::envelope);
         trace::ScopedRole residual_role(GEMMINI_TRACE_ROLE_RESIDUAL);
 #if LOG_CYCLE
         const auto worker_cpu_start = gemmini_cpu_timing_read();
