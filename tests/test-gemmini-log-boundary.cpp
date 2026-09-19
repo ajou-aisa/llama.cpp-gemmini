@@ -15,6 +15,7 @@ static_assert(noexcept(gemmini_log_cycle_flush()));
 #include <future>
 #include <iterator>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -98,6 +99,51 @@ static bool checked_bridge_matrix(const std::filesystem::path & path) {
 #endif
 }
 #endif
+
+static bool test_scalar_cycle_shared_timeline(const std::filesystem::path & root) {
+#if !EXPECT_LOG_CYCLE
+    (void) root;
+    return true;
+#else
+    const auto path = root / "scalar-shared-timeline.jsonl";
+    if (!gemmini_log_cycle_set_output_path(path.c_str())) return false;
+
+    gemmini_cycle_record_v2 inner{};
+    inner.interval.layer = "scalar";
+    inner.interval.op = "scalar.inner";
+    inner.identity_mask = GEMMINI_CYCLE_HAS_RUN_ID;
+    inner.run_id = 7;
+
+    gemmini_cycle_record_v2 outer = inner;
+    outer.interval.op = "scalar.outer";
+
+    outer.interval.start = gemmini_read_cycles();
+    inner.interval.start = gemmini_read_cycles();
+    inner.interval.end = gemmini_read_cycles();
+    gemmini_log_cycle_record_v2(&inner);
+    outer.interval.end = gemmini_read_cycles();
+    gemmini_log_cycle_record_v2(&outer);
+
+    const bool flushed = gemmini_log_cycle_flush() != 0;
+    gemmini_log_cycle_set_output(stderr);
+    if (!flushed) return false;
+
+    const std::string output = read_file(path);
+    const auto has_timeline = [&](const char * op) {
+        const auto at = output.find(std::string("\"op\":\"") + op + "\"");
+        if (at == std::string::npos) return false;
+        const auto end = output.find('\n', at);
+        const std::string_view row(output.data() + at,
+            (end == std::string::npos ? output.size() : end) - at);
+        return row.find("\"ns_start\":") != std::string_view::npos &&
+               row.find("\"ns_end\":") != std::string_view::npos &&
+               (row.find("\"tid\":") != std::string_view::npos ||
+                (row.find("\"tid_start\":") != std::string_view::npos &&
+                 row.find("\"tid_end\":") != std::string_view::npos));
+    };
+    return has_timeline("scalar.inner") && has_timeline("scalar.outer");
+#endif
+}
 
 static int open_descriptor_count() {
 #if defined(_WIN32)
@@ -632,6 +678,7 @@ int main() {
     std::filesystem::create_directory(root, error);
     if (error) return 1;
     if (!test_buffered_cycle_output(root)) return 20;
+    if (!test_scalar_cycle_shared_timeline(root)) return 27;
     if (!test_hardware_cycle_summary(root)) return 21;
     if (!test_inference_log_context(root)) return 22;
     if (!test_worker_cycle_buffers(root)) return 23;

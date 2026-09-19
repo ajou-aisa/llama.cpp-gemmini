@@ -127,6 +127,11 @@ namespace ggml::gemmini::log
         uint64_t slot = 0;
         uint64_t node_id = 0;
         uint64_t worker_id = 0;
+        uint64_t ns_start = 0;
+        uint64_t ns_end = 0;
+        uint64_t tid_start = 0;
+        uint64_t tid_end = 0;
+        bool host_timing_valid = false;
     };
 
     struct WsCycleRecord

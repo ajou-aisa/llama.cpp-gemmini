@@ -295,6 +295,16 @@ namespace ggml::gemmini::log
         if (record.identity_mask & GEMMINI_CYCLE_HAS_SLOT) add_u64("slot", record.slot);
         if (record.identity_mask & GEMMINI_CYCLE_HAS_NODE_ID) add_u64("node_id", record.node_id);
         if (record.identity_mask & GEMMINI_CYCLE_HAS_WORKER_ID) add_u64("worker_id", record.worker_id);
+        if (record.host_timing_valid) {
+            add_u64("ns_start", record.ns_start);
+            add_u64("ns_end", record.ns_end);
+            if (record.tid_start != 0 && record.tid_start == record.tid_end) {
+                add_u64("tid", record.tid_start);
+            } else {
+                add_u64("tid_start", record.tid_start);
+                add_u64("tid_end", record.tid_end);
+            }
+        }
 #endif
         add_u64("start", record.start);
         add_u64("end", record.end);

@@ -1,9 +1,9 @@
 #include "../include/gemmini/log.hpp"
 #include "../include/gemmini/log.h"
 #include "../include/gemmini/performance.hpp"
+#include "cycle_reader_internal.h"
 #if defined(__linux__) && defined(__aarch64__)
 #include "../include/gemmini/cycle_reader.hpp"
-#include "cycle_reader_internal.h"
 #endif
 
 #include <cstdarg>
@@ -25,6 +25,18 @@ thread_local const ggml::gemmini::log::ScopedWsCycleIdentity *ws_cycle_identity 
 void report_cycle_boundary_failure() noexcept
 {
     ggml::gemmini::log::cycle.report_failure("serialization");
+}
+
+void attach_scalar_host_timing(ggml::gemmini::log::CycleRecord & record) noexcept
+{
+    gemmini_scalar_cycle_interval_internal timing{};
+    if (!gemmini_take_scalar_cycle_interval_internal(record.start, record.end, &timing)) return;
+    if (timing.start_tid == 0 || timing.end_tid == 0 || timing.end_ns < timing.start_ns) return;
+    record.ns_start = timing.start_ns;
+    record.ns_end = timing.end_ns;
+    record.tid_start = timing.start_tid;
+    record.tid_end = timing.end_tid;
+    record.host_timing_valid = true;
 }
 
 #if defined(__linux__) && defined(__aarch64__)
@@ -239,8 +251,11 @@ extern "C"
         if (!record) return;
         try
         {
-            ggml::gemmini::log::cycle.write({record->layer, record->op, record->start, record->end,
-                                             record->file, record->line, record->func});
+            ggml::gemmini::log::CycleRecord captured{
+                record->layer, record->op, record->start, record->end,
+                record->file, record->line, record->func};
+            attach_scalar_host_timing(captured);
+            ggml::gemmini::log::cycle.write(captured);
         }
         catch (...) { report_cycle_boundary_failure(); }
     }
@@ -251,11 +266,13 @@ extern "C"
         try
         {
             const gemmini_cycle_record & interval = record->interval;
-            ggml::gemmini::log::cycle.write({
+            ggml::gemmini::log::CycleRecord captured{
                 interval.layer, interval.op, interval.start, interval.end,
                 interval.file, interval.line, interval.func, nullptr, nullptr,
                 record->identity_mask, record->run_id, record->stripe_id,
-                record->slot, record->node_id, record->worker_id});
+                record->slot, record->node_id, record->worker_id};
+            attach_scalar_host_timing(captured);
+            ggml::gemmini::log::cycle.write(captured);
         }
         catch (...) { report_cycle_boundary_failure(); }
     }
