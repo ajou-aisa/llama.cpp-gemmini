@@ -6,6 +6,9 @@
 #include "../../quants/common/hp1_scu.hpp"
 #include <gemmini.h>
 #include <im2p_sim.h>
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+#include <im2p_production_trace.hpp>
+#endif
 
 #include <algorithm>
 #include <limits>
@@ -352,6 +355,10 @@ RmdStatus execute_im2p_compact_dot(im2p_sim_t *sim, const Im2pCompactDot &dot,
     return RmdStatus::unsupported_route;
 #endif
   const bool scaled = dot.hp1_carriers != nullptr;
+  if (dot.trace_context &&
+      (!*dot.trace_context || !scaled || executor ||
+       fault != Im2pProviderTestFault::none))
+    return RmdStatus::unsupported_route;
   if (scaled &&
       ((dot.operand_bits != 4 && dot.operand_bits != 8) || dot.k > 32))
     return RmdStatus::unsupported_route;
@@ -472,6 +479,21 @@ RmdStatus execute_im2p_compact_dot(im2p_sim_t *sim, const Im2pCompactDot &dot,
 #endif
   if (provider_status != IM2P_OK)
     return RmdStatus::execution_failed;
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+  if (dot.trace_context) {
+    auto work = im2p::gemmini::production_trace::full(
+        descriptor, geometry, dot.trace_layer);
+    work.provenance = "residual";
+    work.scope = "residual_compact";
+    work.original_block_id = dot.original_block_id;
+    work.source_row_begin = dot.source_row_begin;
+    work.source_row_count = dot.source_row_count;
+    work.stripe_id = dot.stripe_id;
+    work.column_begin = dot.column_begin;
+    work.group_index = dot.group_index;
+    dot.trace_context->session->accepted(*dot.trace_context, work);
+  }
+#endif
   if (context.seen_count != dot.rows * dot.columns)
     return RmdStatus::invalid_packet;
   const auto status = aggregate_stats(stats, aggregate);

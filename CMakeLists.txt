@@ -310,6 +310,8 @@ if(NOT GGML_GEMMINI_ACTIVATION_BITS STREQUAL
         "Gemmini requires matched activation and weight widths")
 endif()
 set(IM2P_SIM_ROOT "" CACHE PATH "Path to the IM2P.sim source and isolated build artifacts")
+set(IM2P_SIM_BUILD_DIR "" CACHE PATH
+    "Optional isolated IM2P managed-cache build root (default: IM2P_SIM_ROOT/build)")
 set(IM2P_SIM_IMPLEMENTATION "" CACHE STRING
     "IM2P simulator implementation: LEGACY_BSV or GEMMINI_HP1")
 set_property(CACHE IM2P_SIM_IMPLEMENTATION PROPERTY STRINGS LEGACY_BSV GEMMINI_HP1)
@@ -431,8 +433,16 @@ if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
 
     set(GGML_GEMMINI_IM2P_ARTIFACT_ID
         "a${GGML_GEMMINI_ACTIVATION_BITS}-w${GGML_GEMMINI_WEIGHT_BITS}-d${GGML_GEMMINI_DIM}")
+    # Keep provenance experiments outside the production selected generation.
+    # The existing cache verifier and containment checks remain mandatory.
+    if(IM2P_SIM_BUILD_DIR STREQUAL "")
+        set(_GGML_GEMMINI_IM2P_BUILD_DIR "${IM2P_SIM_ROOT}/build")
+    else()
+        get_filename_component(_GGML_GEMMINI_IM2P_BUILD_DIR
+            "${IM2P_SIM_BUILD_DIR}" ABSOLUTE)
+    endif()
     set(_GGML_GEMMINI_IM2P_CURRENT
-        "${IM2P_SIM_ROOT}/build/selected/${IM2P_SIM_IMPLEMENTATION}/${GGML_GEMMINI_IM2P_ARTIFACT_ID}/current")
+        "${_GGML_GEMMINI_IM2P_BUILD_DIR}/selected/${IM2P_SIM_IMPLEMENTATION}/${GGML_GEMMINI_IM2P_ARTIFACT_ID}/current")
     if(NOT IS_SYMLINK "${_GGML_GEMMINI_IM2P_CURRENT}")
         message(FATAL_ERROR
             "Missing atomic IM2P selected generation: ${_GGML_GEMMINI_IM2P_CURRENT}")
@@ -440,7 +450,7 @@ if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
     get_filename_component(GGML_GEMMINI_IM2P_GENERATION
         "${_GGML_GEMMINI_IM2P_CURRENT}" REALPATH)
     get_filename_component(_GGML_GEMMINI_IM2P_GENERATION_ROOT
-        "${IM2P_SIM_ROOT}/build/selected/${IM2P_SIM_IMPLEMENTATION}/${GGML_GEMMINI_IM2P_ARTIFACT_ID}/generations"
+        "${_GGML_GEMMINI_IM2P_BUILD_DIR}/selected/${IM2P_SIM_IMPLEMENTATION}/${GGML_GEMMINI_IM2P_ARTIFACT_ID}/generations"
         REALPATH)
     string(FIND "${GGML_GEMMINI_IM2P_GENERATION}/"
         "${_GGML_GEMMINI_IM2P_GENERATION_ROOT}/"
@@ -645,7 +655,11 @@ int main() {
     try_run(_GGML_GEMMINI_IM2P_PAIR_PROBE_RESULT
         _GGML_GEMMINI_IM2P_PAIR_PROBE_COMPILED
         "${CMAKE_CURRENT_BINARY_DIR}/im2p-frontend-pair-probe"
-        "${_GGML_GEMMINI_IM2P_PAIR_PROBE_SOURCE}"
+        SOURCES
+            "${_GGML_GEMMINI_IM2P_PAIR_PROBE_SOURCE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-gemmini-utils/src/optrace.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-gemmini-utils/src/debug.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-gemmini-utils/src/cycle.cpp"
         CMAKE_FLAGS
             "-DCMAKE_CXX_STANDARD=20"
             "-DCMAKE_CXX_STANDARD_REQUIRED=ON"

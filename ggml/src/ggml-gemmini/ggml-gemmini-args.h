@@ -22,6 +22,7 @@
 #include "quants/act/types.hpp"
 
 namespace act = ggml::gemmini::quants::act;
+namespace ggml::gemmini::optrace { struct Context; }
 
 namespace ggml::gemmini::quants::act {
 
@@ -429,6 +430,9 @@ typedef struct ggml_gemmini_args_t {
     size_t gemmini_call_tile_k_elems = 0;
 
     std::string matmul_layer;
+    // Optional immutable driver provenance, explicitly owned by asynchronous
+    // frontend/RMD work. No process-global phase and no allocation when off.
+    std::shared_ptr<const ggml::gemmini::optrace::Context> optrace_context;
 
     inline const uint8_t *q8_channel_row(size_t row) const {
         if (q8_channel_row_base == nullptr || q8_channel_row_stride == 0 ||

@@ -861,7 +861,11 @@ RmdStatus execute_rmd_stripe_impl(
                 kArrayDim,
                 compact_k,
                 hp1_carriers.data(),
-                block.block_id};
+                block.block_id,
+                args.optrace_context,
+                args.optrace_context ? args.matmul_layer : std::string{},
+                packet.row_begin, packet.row_count, packet.stripe_id,
+                col_base, group_index};
             if (im2p_fault == Im2pProviderTestFault::cancel_after_first_dot &&
                 staged_metrics.im2p_dot_calls != 0)
               return RmdStatus::execution_failed;
@@ -1209,6 +1213,15 @@ RmdStatus execute_rmd_stripe_impl(
   const RmdStatus finish_status = assembler.finish();
   if (finish_status != RmdStatus::success) {
     return finish_status;
+  }
+  if constexpr (Backend == CompactExecutorBackend::im2p_sim) {
+    if (args.optrace_context) {
+      // Independently accumulated execution metric, not a writer callback
+      // count. A failed packet cannot finalize as a successful traced run.
+      args.optrace_context->session->independent_count(
+          *args.optrace_context, args.matmul_layer, "residual",
+          staged_metrics.im2p_dot_calls);
+    }
   }
   output = std::move(staged_output);
   if (metrics != nullptr) {

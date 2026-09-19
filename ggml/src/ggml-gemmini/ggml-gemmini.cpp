@@ -27,6 +27,7 @@
 #include "ggml-quants.h"
 
 #include <gemmini/log.hpp>
+#include <gemmini/optrace.hpp>
 #include "dump/dump_tensor.hpp"
 
 #include <gemmini.h>
@@ -1340,6 +1341,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.model_arch = ctx->model_arch.c_str();
     args.matmul_layer = resolve_backend_matmul_layer(
         ctx->model_arch, src0->name, src1->name, dst->name);
+    if (auto trace = ggml::gemmini::optrace::current_context())
+        args.optrace_context =
+            std::make_shared<const ggml::gemmini::optrace::Context>(std::move(trace));
     const char * layer = args.matmul_layer.c_str();
     ggml::gemmini::log::debug(layer, "ggml_backend_gemmini_mul_mat called");
 

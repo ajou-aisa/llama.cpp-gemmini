@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <gemmini/optrace.hpp>
 
 struct im2p_sim;
 typedef struct im2p_sim im2p_sim_t;
@@ -108,6 +109,10 @@ struct Im2pCompactDot {
   const uint32_t *hp1_carriers =
       nullptr;                    // one original-block carrier per column
   uint32_t original_block_id = 0; // host provenance, not a numerical mode
+  std::shared_ptr<const ggml::gemmini::optrace::Context> trace_context;
+  std::string trace_layer;
+  uint64_t source_row_begin = 0, source_row_count = 0;
+  uint64_t stripe_id = 0, column_begin = 0, group_index = 0;
 };
 
 RmdStatus execute_im2p_compact_dot(

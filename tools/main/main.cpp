@@ -15,6 +15,9 @@
 #include <vector>
 
 #include <gemmini/log.hpp>
+#include <gemmini/optrace.hpp>
+#include <cstdlib>
+#include <filesystem>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
@@ -102,6 +105,22 @@ int main(int argc, char ** argv) {
     common_params params;
     g_params = &params;
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_MAIN, print_usage)) {
+        return 1;
+    }
+
+    const char * optrace_path = std::getenv("GEMMINI_OPTRACE_PATH");
+    const bool optrace_requested = optrace_path && *optrace_path;
+    // v1 records one fresh decoder run. Reject unrepresented execution instead
+    // of changing warmup/cache/interactive behavior or silently losing work.
+    if (optrace_requested && (std::getenv("GEMMINI_MATMUL_MODE") ||
+        std::getenv("GEMMINI_RMD_BACKEND") || std::getenv("GEMMINI_STRIPE_JOB_CAPACITY"))) {
+        fprintf(stderr, "error: optrace v1 records compiled mode/config; use a matching build without Gemmini runtime mode overrides\n");
+        return 1;
+    }
+    if (optrace_requested && (params.warmup || params.interactive ||
+        params.interactive_first || params.embedding || params.n_predict <= 0 ||
+        params.grp_attn_n != 1 || !params.path_prompt_cache.empty())) {
+        fprintf(stderr, "error: GEMMINI_OPTRACE_PATH requires --no-warmup, a fresh noninteractive decoder run, and a positive token limit\n");
         return 1;
     }
 
@@ -573,6 +592,30 @@ int main(int argc, char ** argv) {
 
     std::vector<llama_token> embd;
 
+    namespace optrace = ggml::gemmini::optrace;
+    std::shared_ptr<optrace::Session> production_trace;
+    optrace::Context prefill_context;
+    uint64_t trace_decode_index = 0;
+    // Track the actual driver origin, not the token count or GEMM shape.
+    bool embd_from_generated = false;
+    if (optrace_requested) {
+        if (params.interactive || llama_model_has_encoder(model) ||
+            embd_inp.size() + static_cast<size_t>(params.n_predict) >= static_cast<size_t>(n_ctx)) {
+            LOG_ERR("optrace: only a complete noninteractive decoder run without context shifting is supported\n");
+            return 1;
+        }
+        try {
+            const auto identity = params.model_alias.empty()
+                ? std::filesystem::path(params.model.path).filename().string()
+                : params.model_alias;
+            production_trace = optrace::Session::start(optrace_path,
+                optrace::compiled_run_info(identity, embd_inp.size(), params.n_predict));
+        } catch (const std::exception & error) {
+            LOG_ERR("optrace: %s\n", error.what());
+            return 1;
+        }
+    }
+
     // single-token antiprompts
     std::vector<llama_token> antiprompt_token;
 
@@ -707,8 +750,24 @@ int main(int argc, char ** argv) {
 
                 LOG_DBG("eval: %s\n", string_from(ctx, embd).c_str());
 
-                if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval))) {
-                    LOG_ERR("%s : failed to eval\n", __func__);
+                try {
+                    optrace::Context trace_context;
+                    if (production_trace) {
+                        if (embd_from_generated) {
+                            trace_context = production_trace->phase("decode", trace_decode_index++, n_eval);
+                        } else {
+                            if (!prefill_context)
+                                prefill_context = production_trace->phase("prefill", std::nullopt, embd_inp.size());
+                            trace_context = prefill_context;
+                        }
+                    }
+                    optrace::ScopedContext trace_scope(std::move(trace_context));
+                    if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval))) {
+                        LOG_ERR("%s : failed to eval\n", __func__);
+                        return 1;
+                    }
+                } catch (const std::exception & error) {
+                    LOG_ERR("optrace/evaluation: %s\n", error.what());
                     return 1;
                 }
 
@@ -745,6 +804,7 @@ int main(int argc, char ** argv) {
             // LOG_DBG("last: %s\n", string_from(ctx, smpl->prev.to_vector()).c_str());
 
             embd.push_back(id);
+            embd_from_generated = true;
 
             // echo this to console
             input_echo = true;
@@ -755,6 +815,7 @@ int main(int argc, char ** argv) {
             LOG_DBG("n_remain: %d\n", n_remain);
         } else {
             // some user input remains from prompt or interaction, forward it to processing
+            embd_from_generated = false;
             LOG_DBG("embd_inp.size(): %d, n_consumed: %d\n", (int) embd_inp.size(), n_consumed);
             while ((int) embd_inp.size() > n_consumed) {
                 embd.push_back(embd_inp[n_consumed]);
@@ -1010,7 +1071,16 @@ int main(int argc, char ** argv) {
 
     common_sampler_free(smpl);
 
-    const bool fpga_execution_ok = common_fpga_execution_check();
+    bool fpga_execution_ok = common_fpga_execution_check();
+    if (production_trace) {
+        try {
+            production_trace->finish(fpga_execution_ok,
+                fpga_execution_ok ? "" : "backend execution failed");
+        } catch (const std::exception & error) {
+            LOG_ERR("optrace: %s\n", error.what());
+            fpga_execution_ok = false;
+        }
+    }
     llama_backend_free();
 
     ggml_threadpool_free_fn(threadpool);
