@@ -72,6 +72,5 @@ void set_npu_frequency(uint64_t hz);
 
 std::string log_context();
 std::string serialize();
-void print(FILE * output);
 
 }

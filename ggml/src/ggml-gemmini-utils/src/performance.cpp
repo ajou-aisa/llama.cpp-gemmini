@@ -925,14 +925,4 @@ std::string serialize() {
     return read_summary(log::cycle.output_path()).serialize();
 }
 
-void print(FILE * output) {
-    if (!log::cycle.flush() || !log::cycle.healthy()) {
-        Summary result;
-        result.reason = "log_collection_failure";
-        result.print(output);
-        return;
-    }
-    read_summary(log::cycle.output_path()).print(output);
-}
-
 } // namespace ggml::gemmini::performance

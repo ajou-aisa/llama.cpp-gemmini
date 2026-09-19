@@ -101,7 +101,7 @@ static bool checked_bridge_matrix(const std::filesystem::path & path) {
 #endif
 
 static bool test_scalar_cycle_shared_timeline(const std::filesystem::path & root) {
-#if !EXPECT_LOG_CYCLE
+#if !EXPECT_LOG_CYCLE || EXPECT_CYCLE_DETAIL
     (void) root;
     return true;
 #else

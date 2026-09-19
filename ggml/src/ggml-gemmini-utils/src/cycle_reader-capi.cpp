@@ -1,8 +1,9 @@
 #include "../include/gemmini/cycle_reader.hpp"
 #include "../include/gemmini/cycle_reader.h"
-#include "../include/gemmini/host-timing.hpp"
 #include "cycle_reader_internal.h"
 
+#if LOG_CYCLE && !CYCLE_DETAIL
+#include "../include/gemmini/host-timing.hpp"
 #include <array>
 #include <cstddef>
 
@@ -31,11 +32,12 @@ const ScalarCycleEndpoint * endpoint_for_sequence(uint64_t sequence) noexcept {
     return endpoint.sequence == sequence && endpoint.active ? &endpoint : nullptr;
 }
 }
+#endif
 
 extern "C" uint64_t gemmini_read_cycles(void) noexcept
 {
     try {
-#if LOG_CYCLE
+#if LOG_CYCLE && !CYCLE_DETAIL
         const uint64_t ns = ggml::gemmini::cycle::timeline_now_ns();
         const uint64_t tid = ggml::gemmini::cycle::host_thread_id();
         const uint64_t value = ggml::gemmini::cycle::read();
@@ -48,6 +50,7 @@ extern "C" uint64_t gemmini_read_cycles(void) noexcept
     catch (...) { return 0; }
 }
 
+#if !CYCLE_DETAIL
 extern "C" uint8_t gemmini_take_scalar_cycle_interval_internal(
         uint64_t start, uint64_t end,
         gemmini_scalar_cycle_interval_internal * interval) noexcept
@@ -93,3 +96,4 @@ extern "C" uint8_t gemmini_take_scalar_cycle_interval_internal(
     return 1;
 #endif
 }
+#endif

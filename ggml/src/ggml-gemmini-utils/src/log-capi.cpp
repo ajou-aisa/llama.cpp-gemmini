@@ -27,6 +27,7 @@ void report_cycle_boundary_failure() noexcept
     ggml::gemmini::log::cycle.report_failure("serialization");
 }
 
+#if !CYCLE_DETAIL
 void attach_scalar_host_timing(ggml::gemmini::log::CycleRecord & record) noexcept
 {
     gemmini_scalar_cycle_interval_internal timing{};
@@ -38,6 +39,7 @@ void attach_scalar_host_timing(ggml::gemmini::log::CycleRecord & record) noexcep
     record.tid_end = timing.end_tid;
     record.host_timing_valid = true;
 }
+#endif
 
 #if defined(__linux__) && defined(__aarch64__)
 const char * internal_source_name(uint8_t source) noexcept
@@ -254,7 +256,9 @@ extern "C"
             ggml::gemmini::log::CycleRecord captured{
                 record->layer, record->op, record->start, record->end,
                 record->file, record->line, record->func};
+#if !CYCLE_DETAIL
             attach_scalar_host_timing(captured);
+#endif
             ggml::gemmini::log::cycle.write(captured);
         }
         catch (...) { report_cycle_boundary_failure(); }
@@ -271,7 +275,9 @@ extern "C"
                 interval.file, interval.line, interval.func, nullptr, nullptr,
                 record->identity_mask, record->run_id, record->stripe_id,
                 record->slot, record->node_id, record->worker_id};
+#if !CYCLE_DETAIL
             attach_scalar_host_timing(captured);
+#endif
             ggml::gemmini::log::cycle.write(captured);
         }
         catch (...) { report_cycle_boundary_failure(); }

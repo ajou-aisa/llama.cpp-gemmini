@@ -42,6 +42,7 @@ typedef struct gemmini_native_cycle_sample_internal {
     uint64_t generation;
 } gemmini_native_cycle_sample_internal;
 
+#if !CYCLE_DETAIL
 typedef struct gemmini_scalar_cycle_interval_internal {
     uint64_t start_ns;
     uint64_t end_ns;
@@ -52,6 +53,7 @@ typedef struct gemmini_scalar_cycle_interval_internal {
 uint8_t gemmini_take_scalar_cycle_interval_internal(
     uint64_t start, uint64_t end,
     gemmini_scalar_cycle_interval_internal * interval) GEMMINI_INTERNAL_NOEXCEPT;
+#endif
 
 struct gemmini_cycle_record_v2;
 
