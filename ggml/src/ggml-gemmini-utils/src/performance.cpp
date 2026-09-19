@@ -377,6 +377,10 @@ void emit_event(const char * event, uint64_t timestamp, bool success = true,
             record["success"] = success;
             record["resource_samples"] = resource_sequence.load();
             record["cpu_interval_samples"] = cpu_interval_sequence.load();
+            // Worker CPU intervals are buffered per thread. Drain them before
+            // publishing the operation boundary so replay observes the same
+            // logical ordering as execution even while threadpool workers live.
+            log::cycle.flush();
         }
         if (std::string_view(event) == "session_end") record["log_healthy"] = log::cycle.healthy();
         log::cycle.write_json(record.dump());

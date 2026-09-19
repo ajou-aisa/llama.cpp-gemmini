@@ -280,6 +280,61 @@ static bool test_inference_log_context(const std::filesystem::path & root) {
 #endif
 }
 
+static bool test_operation_end_drains_worker_cpu_intervals(const std::filesystem::path & root) {
+#if !EXPECT_LOG_CYCLE
+    (void) root;
+    return true;
+#else
+    namespace perf = ggml::gemmini::performance;
+    using ggml::gemmini::log::cycle;
+    const auto path = root / "operation-end-worker-drain.jsonl";
+    if (!cycle.set_output_path(path.c_str(), true)) return false;
+    cycle.set_buffered(true);
+
+    perf::reset();
+    perf::start_request(100);
+    perf::begin_operation(perf::Phase::prefill, 110);
+    const auto origin = gemmini_trace_capture();
+
+    std::promise<void> queued, release;
+    auto released = release.get_future();
+    std::thread worker([&] {
+        gemmini_cycle_record_v2 identity{};
+        identity.interval.layer = "buffered.operation";
+        identity.interval.op = "buffered.worker.cpu";
+        gemmini_cpu_sample start{}, end{};
+        start.ns = 120; end.ns = 130;
+        start.tid = end.tid = 77;
+        start.thread_cpu_ns = 10; end.thread_cpu_ns = 20;
+        start.thread_cpu_valid = end.thread_cpu_valid = 1;
+        start.trace = end.trace = origin;
+        cycle.write_cpu(identity, start, end);
+        queued.set_value();
+        released.wait();
+    });
+    queued.get_future().wait();
+
+    // The worker stays alive with its thread-local buffer populated. Ending the
+    // operation must drain that buffer before publishing operation_end.
+    perf::end_operation(140, true);
+    release.set_value();
+    worker.join();
+    perf::finish_request(150);
+    perf::finish_recording();
+    const bool flushed = cycle.flush();
+    const std::string output = read_file(path);
+    const auto summary = perf::read_summary(path);
+    cycle.set_buffered(false);
+    cycle.set_output(stderr);
+
+    const auto cpu = output.find("\"op\":\"buffered.worker.cpu\"");
+    const auto operation_end = output.find("\"event\":\"operation_end\"");
+    return flushed && summary.available && cpu != std::string::npos &&
+        operation_end != std::string::npos && cpu < operation_end &&
+        output.find("\"cpu_interval_samples\":1") != std::string::npos;
+#endif
+}
+
 static bool test_hardware_cycle_summary(const std::filesystem::path & root) {
     using namespace ggml::gemmini::performance;
     const auto path = root / "hardware-summary.jsonl";
@@ -679,6 +734,7 @@ int main() {
     if (error) return 1;
     if (!test_buffered_cycle_output(root)) return 20;
     if (!test_scalar_cycle_shared_timeline(root)) return 27;
+    if (!test_operation_end_drains_worker_cpu_intervals(root)) return 28;
     if (!test_hardware_cycle_summary(root)) return 21;
     if (!test_inference_log_context(root)) return 22;
     if (!test_worker_cycle_buffers(root)) return 23;
