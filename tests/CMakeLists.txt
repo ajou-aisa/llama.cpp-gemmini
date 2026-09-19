@@ -813,8 +813,10 @@ target_compile_definitions(test-gemmini-production-host-backend PRIVATE
     GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
     GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE})
 target_include_directories(test-gemmini-production-host-backend PRIVATE
+    ../ggml/include
     ../ggml/src
     ../ggml/src/ggml-gemmini
+    ../ggml/src/ggml-gemmini-utils/include
     ${GGML_GEMMINI_GENERATED_CONFIG_DIR}
     ${GEMMINI_SW_PATH}
     ${GEMMINI_SW_PATH}/include)
