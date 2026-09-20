@@ -6,13 +6,17 @@ From the repository root on Nano:
   python3 scripts/experiment/cycle_matrix.py --base-build build-arm64-cpu
 
 The JSON manifest defines models, exact quantization filename patterns and prompts.
-Each bit width gets a separate CPU+HARDWARE build seeded from the base CMake cache;
-the base build and model files are never modified. This is NOT an NPU/RTL test.
+Every run creates EMPTY, run-specific A4/W4, A8/W8 and A16/W16 build directories.
+Only settings are read from the base CMake cache; no binaries/objects are reused.
+The base build and model files are never modified. This is NOT an NPU/RTL test.
 Missing/ambiguous models, unavailable PMU values, incomplete summaries and invalid
 analyzer output FAIL the case. Partial selections are explicitly labelled as such.
-Each run has fresh logs; no old log can satisfy a new case. Exit 0 means all selected
-cases passed (except --plan, which only checks inputs). Output includes results.json,
-results.csv, commands, build logs, per-case raw logs, summaries and all trace views.
+Each run has fresh logs; no old log can satisfy a new case. CYCLE_MATRIX_OK and
+OK.txt are issued ONLY after the complete bundled matrix passes, including fresh
+builds and unchanged-source/artifact checks. Copy that final line as the receipt.
+Selections get CYCLE_MATRIX_SELECTION_PASSED instead, never the full OK marker.
+Exit 0 means the selected cases passed (--plan only checks inputs). Output includes
+results.json/CSV, commands, exit codes, build logs, raw logs, summaries and traces.
 """
 from __future__ import annotations
 
@@ -35,6 +39,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 PHASES = ("prefill", "decode")
+DEFAULT_CONFIG = Path(__file__).with_name("cycle-matrix.json")
+CASE_GATES = ("build_ok", "inference_ok", "summary_ok", "analyzer_ok", "artifacts_ok")
 # Only user configuration is copied, not CMake's generated paths or probe results.
 CACHE_KEYS = {
     "GEMMINI_SW_PATH", "BUILD_SHARED_LIBS", "CMAKE_BUILD_TYPE",
@@ -56,8 +62,14 @@ def require(condition: bool, message: str) -> None:
 def json_read(path: Path) -> Any:
     def invalid_constant(value: str) -> None:
         raise CheckError(f"non-finite JSON constant: {value}")
+    def unique_keys(pairs: list[tuple[str, Any]]) -> dict:
+        result = {}
+        for key, value in pairs:
+            require(key not in result, f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
     with path.open(encoding="utf-8") as stream:
-        return json.load(stream, parse_constant=invalid_constant)
+        return json.load(stream, parse_constant=invalid_constant, object_pairs_hook=unique_keys)
 
 
 def json_write(path: Path, value: Any) -> None:
@@ -70,6 +82,52 @@ def json_write(path: Path, value: Any) -> None:
 def absolute(path: str, root: Path = ROOT) -> Path:
     value = Path(path).expanduser()
     return (value if value.is_absolute() else root / value).resolve()
+
+
+def file_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def matrix_keys(config: dict) -> set[tuple[str, int, str]]:
+    return {(model["name"], bits, family) for model in config["models"]
+            for bits in config["bits"] for family in config["families"]}
+
+
+def source_snapshot() -> dict[str, str]:
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT).strip()
+    patch = subprocess.check_output(["git", "diff", "--binary", "HEAD"], cwd=ROOT)
+    digest = hashlib.sha256(commit + b"\0" + patch)
+    # Untracked build/results directories do not matter; untracked source does.
+    extra = subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard", "-z", "--",
+                                     "src", "ggml", "common", "cmake", "scripts", "tools", "tests"], cwd=ROOT)
+    for name in sorted(filter(None, extra.split(b"\0"))):
+        digest.update(name + b"\0" + file_hash(ROOT / os.fsdecode(name)).encode())
+    return {"commit": commit.decode(), "sha256": digest.hexdigest()}
+
+
+def build_artifacts(build: Path) -> dict[str, str]:
+    paths = {build / "bin" / name for name in ("llama-cli", "llama-cycle-summary")}
+    paths.add(build / "CMakeCache.txt")
+    for pattern in ("lib*.so*", "lib*.dylib*"):
+        paths.update((build / "bin").glob(pattern))
+    result = {}
+    for path in sorted(paths):
+        require(path.is_file() and build.resolve() in path.resolve().parents,
+                f"missing or nonlocal build artifact: {path}")
+        result[str(path.relative_to(build))] = file_hash(path)
+    return result
+
+
+def check_inputs(case: dict) -> None:
+    model = Path(case["model_path"])
+    stat = model.stat()
+    require((stat.st_size, stat.st_mtime_ns) == (case["model_bytes"], case["model_mtime_ns"]),
+            f"model changed after preflight: {model}")
+    require(file_hash(Path(case["prompt"])) == case["prompt_sha256"], "prompt changed after preflight")
 
 
 def positive_int(value: str) -> int:
@@ -147,12 +205,13 @@ def execute(command: list[str], directory: Path, label: str, env: dict[str, str]
     json_write(directory / f"{label}.command.json", {"argv": command, "cwd": str(cwd)})
     stdout = directory / f"{label}.stdout.txt"
     stderr = directory / f"{label}.stderr.txt"
+    started = time.monotonic()
     with stdout.open("wb") as out, stderr.open("wb") as err:
         process = subprocess.Popen(command, cwd=cwd, env=env, stdout=out, stderr=err,
                                    start_new_session=True)
         try:
             code = process.wait(timeout=timeout)
-        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+        except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
             # Also terminate descendants; never leave an inference/build running.
             try:
                 os.killpg(process.pid, signal.SIGTERM)
@@ -163,12 +222,25 @@ def execute(command: list[str], directory: Path, label: str, env: dict[str, str]
                 except ProcessLookupError:
                     pass
                 process.wait()
+            # A child can survive after the group leader exits on SIGTERM.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            json_write(directory / f"{label}.result.json", {
+                "success": False, "exit_code": process.returncode,
+                "error": type(error).__name__, "elapsed_seconds": time.monotonic() - started})
             raise
+    json_write(directory / f"{label}.result.json", {
+        "success": code == 0, "exit_code": code, "elapsed_seconds": time.monotonic() - started})
     require(code == 0, f"{label}: exit={code}; see {stderr}")
 
 
 def prepare_build(args: argparse.Namespace, base: dict, width: int, logs: Path) -> Path:
-    build = absolute(args.build_root) / f"a{width}-w{width}-detail{args.detail}"
+    # logs.parent is the exclusive output/run ID, not the reusable base build.
+    build = absolute(args.build_root) / logs.parent.name / f"a{width}-w{width}-detail{args.detail}"
+    require(not build.exists(), f"fresh build directory already exists: {build}")
+    build.mkdir(parents=True, exist_ok=False)
     required = {
         "GGML_GEMMINI": "ON", "GGML_GEMMINI_OPTION": "CPU",
         "GGML_GEMMINI_EXECUTION_BACKEND": "HARDWARE",
@@ -178,17 +250,17 @@ def prepare_build(args: argparse.Namespace, base: dict, width: int, logs: Path) 
         "LLAMA_BUILD_COMMON": "ON", "LLAMA_BUILD_TOOLS": "ON",
         "LLAMA_BUILD_TESTS": "OFF", "LLAMA_BUILD_SERVER": "OFF", "LLAMA_BUILD_EXAMPLES": "OFF",
         "LLAMA_CURL": "OFF", "GGML_METAL": "OFF", "GGML_CUDA": "OFF", "IM2P_SIM_IMPLEMENTATION": "",
+        "CMAKE_C_COMPILER_LAUNCHER": "", "CMAKE_CXX_COMPILER_LAUNCHER": "",
     }
-    if not args.no_build:
-        options = {key: value for key, (kind, value) in base.items()
-                   if kind in ("BOOL", "STRING", "PATH", "FILEPATH", "UNINITIALIZED")
-                   and (key in CACHE_KEYS or key.startswith("GGML_GEMMINI_"))}
-        options.update(required)
-        command = ["cmake", "-S", str(ROOT), "-B", str(build)]
-        command += [f"-D{key}={value}" for key, value in sorted(options.items())]
-        execute(command, logs, "configure", os.environ.copy(), args.timeout)
-        execute(["cmake", "--build", str(build), "--target", "llama-cli", "llama-cycle-summary",
-                 "-j", str(args.jobs)], logs, "build", os.environ.copy(), args.timeout)
+    options = {key: value for key, (kind, value) in base.items()
+               if kind in ("BOOL", "STRING", "PATH", "FILEPATH", "UNINITIALIZED")
+               and (key in CACHE_KEYS or key.startswith("GGML_GEMMINI_"))}
+    options.update(required)
+    command = ["cmake", "-S", str(ROOT), "-B", str(build)]
+    command += [f"-D{key}={value}" for key, value in sorted(options.items())]
+    execute(command, logs, "configure", os.environ.copy(), args.timeout)
+    execute(["cmake", "--build", str(build), "--target", "llama-cli", "llama-cycle-summary",
+             "-j", str(args.jobs)], logs, "build", os.environ.copy(), args.timeout)
     configured = cache_read(build)
     for key, value in required.items():
         actual = configured.get(key, (None, None))[1]
@@ -199,6 +271,9 @@ def prepare_build(args: argparse.Namespace, base: dict, width: int, logs: Path) 
     for executable in ("llama-cli", "llama-cycle-summary"):
         require(os.access(build / "bin" / executable, os.X_OK), f"missing executable: {build / 'bin' / executable}")
     json_write(logs / "cache.json", {key: value for key, (_, value) in configured.items()})
+    json_write(logs / "build.json", {
+        "path": str(build), "logs": str(logs), "fresh": True, "bits": width, "detail": args.detail,
+        "artifacts": build_artifacts(build)})
     return build
 
 
@@ -228,7 +303,7 @@ def validate_summary(summary: dict, tokens: int, runtime: str) -> list[str]:
                 phase.get("failed_operations") == 0, f"{name}: missing or failed operations")
         for key in ("elapsed_ns", "cpu_cycles", "thread_cpu_ns"):
             value = phase.get(key)
-            require(number(value) and value > 0 and phase.get(key + "_reason") is None,
+            require(type(value) is int and value > 0 and phase.get(key + "_reason") is None,
                     f"{name}.{key}: {phase.get(key + '_reason') or value}")
         line = re.search(rf"^  {name}: elapsed=([0-9.]+) ms, CPU cycles=([0-9]+), worker CPU=([0-9.]+) ms, .*failures=0$",
                          runtime, re.M)
@@ -276,12 +351,27 @@ def validate_analyzer(report: dict, rows: Path, summary: dict) -> dict[str, int]
         path = Path(trace.get("path", ""))
         require(path.is_file() and path.stat().st_size > 0 and path.parent.resolve() == rows.parent.resolve(),
                 f"missing or wrong-destination {view} trace")
-    require(report["traces"]["thread"].get("skipped_missing_lane") == 0,
-            "host intervals could not be placed on a thread lane")
+        # Existence alone is not evidence: parse each trace separately to bound memory.
+        document = json_read(path)
+        require(isinstance(document, dict) and document.get("view") == view and
+                isinstance(document.get("traceEvents"), list), f"malformed {view} trace")
+        placed = 0
+        for event in document["traceEvents"]:
+            require(isinstance(event, dict), f"malformed {view} trace event")
+            if event.get("ph") == "X":
+                placed += 1
+                require(all(number(event.get(key)) and event[key] >= 0 for key in ("ts", "dur")),
+                        f"invalid {view} trace interval")
+        require(placed == trace.get("placed_intervals"), f"{view} trace count mismatch")
+        del document
+    require(report["traces"]["thread"].get("skipped_missing_lane") == 0 and
+            report["traces"]["thread"].get("placed_intervals") == report["interval_rows"],
+            "host intervals could not all be placed on a thread lane")
     return dict(phase_rows)
 
 
 def run_case(case: dict, build: Path, config: dict, output: Path, timeout: int) -> None:
+    check_inputs(case)
     directory = output / case["name"]
     directory.mkdir()
     case["output"] = str(directory)
@@ -292,6 +382,10 @@ def run_case(case: dict, build: Path, config: dict, output: Path, timeout: int) 
     for key in list(env):
         if key.startswith("GGML_GEMMINI_") or key.startswith("GEMMINI_LOG_"):
             env.pop(key)
+    # The freshly built backend must not be replaced through loader overrides.
+    for key in ("LD_LIBRARY_PATH", "LD_PRELOAD", "DYLD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
+                "DYLD_FALLBACK_LIBRARY_PATH", "GGML_BACKEND_PATH"):
+        env.pop(key, None)
     env.update(GGML_CPU_CYCLE_LOG="1", GGML_GEMMINI_TELEMETRY_HASH="0",
                OUTPUT_ROOT=str(directory), OUTPUT_DIR=str(directory), EXPERIMENT_DIR=str(directory),
                LOG_DIR=str(directory), GEMMINI_LOG_DIR=str(directory),
@@ -305,6 +399,7 @@ def run_case(case: dict, build: Path, config: dict, output: Path, timeout: int) 
     execute(command, directory, "inference", env, timeout, cwd=directory)
     case["inference_ok"] = True
     require(raw.is_file() and raw.stat().st_size > 0, "no fresh cycle-log.jsonl")
+    raw_digest = file_hash(raw)
     summary_command = [str(build / "bin/llama-cycle-summary")]
     execute(summary_command + [str(raw)], directory, "summary", env, timeout)
     execute(summary_command + ["--json", str(raw)], directory, "summary-json", env, timeout)
@@ -331,7 +426,11 @@ def run_case(case: dict, build: Path, config: dict, output: Path, timeout: int) 
     except CheckError as error:
         errors.append(f"analyzer: {error}")
     case["summary"] = summary
+    check_inputs(case)
+    require(file_hash(raw) == raw_digest, "raw log changed during summary/analyzer checks")
+    case["raw_sha256"] = raw_digest
     require(not errors, "; ".join(errors))
+    case["artifacts_ok"] = True
 
 
 def save_results(output: Path, report: dict) -> None:
@@ -340,7 +439,7 @@ def save_results(output: Path, report: dict) -> None:
     report["status"] = ("running" if counts.get("pending") else
                         "ok" if counts.get("ok") == len(report["cases"]) else "failed")
     json_write(output / "results.json", report)
-    columns = ("name", "bits", "family", "status", "inference_ok", "summary_ok", "analyzer_ok", "errors", "output")
+    columns = ("name", "bits", "family", "status", *CASE_GATES, "errors", "output")
     with (output / "results.csv").open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=columns, extrasaction="ignore")
         writer.writeheader()
@@ -348,9 +447,65 @@ def save_results(output: Path, report: dict) -> None:
             writer.writerow({**case, "errors": "; ".join(case["errors"])})
 
 
+def finish_run(output: Path, report: dict) -> tuple[str, int]:
+    # Never leave an earlier success receipt next to newly failed results.
+    marker = output / "OK.txt"
+    marker.unlink(missing_ok=True)
+    audit_errors = []
+    try:
+        require(source_snapshot() == report["source"], "source changed during the matrix run")
+        widths = {case["bits"] for case in report["cases"]}
+        builds = report["builds"]
+        require(len(builds) == len(widths) and {build["bits"] for build in builds} == widths,
+                "not every selected width has a fresh successful build")
+        for build in builds:
+            require(build.get("fresh") is True and build["detail"] == report["detail"],
+                    "build receipt does not match the run")
+            path, logs = Path(build["path"]), Path(build["logs"])
+            require(path.parent.name == output.name and logs.parent == output,
+                    "build belongs to a different run")
+            for step in ("configure", "build"):
+                result = json_read(logs / f"{step}.result.json")
+                require(result.get("success") is True and result.get("exit_code") == 0,
+                        f"unsuccessful {step}: {logs}")
+            require(build_artifacts(path) == build["artifacts"], "build artifacts changed after compilation")
+    except (CheckError, OSError, KeyError, ValueError, subprocess.SubprocessError) as error:
+        audit_errors.append(str(error))
+    for case in report["cases"]:
+        if case["status"] == "ok":
+            missing = [gate for gate in CASE_GATES if case.get(gate) is not True]
+            problems = audit_errors + (["missing gates: " + ", ".join(missing)] if missing else [])
+            if case["errors"] or problems:
+                case["status"] = "failed"
+                case["errors"].extend(problems)
+    report["audit_errors"] = audit_errors
+    total = len(report["cases"])
+    expected = matrix_keys(json_read(DEFAULT_CONFIG))
+    observed = {(case["model"], case["bits"], case["family"]) for case in report["cases"]}
+    full = observed == expected and total == len(expected)
+    report["scope"] = "full" if full else "selection"
+    save_results(output, report)
+    passed = report["counts"].get("ok", 0)
+    complete = total > 0 and passed == total and not audit_errors
+    if complete and full:
+        label = "CYCLE_MATRIX_OK"
+    elif complete:
+        label = "CYCLE_MATRIX_SELECTION_PASSED"
+    else:
+        label = "CYCLE_MATRIX_FAILED"
+    line = (f"{label} cases={passed}/{total} builds={len(report['builds'])}/{len({c['bits'] for c in report['cases']})} "
+            f"fresh=1 detail={report['detail']} tokens={report['config']['generation']['tokens']} "
+            f"commit={report['source']['commit'][:12]} source={report['source']['sha256'][:16]} "
+            f"run={output.name} report_sha256={file_hash(output / 'results.json')}")
+    if complete and full:
+        with marker.open("x", encoding="utf-8") as stream:
+            stream.write(line + "\n")
+    return line, 0 if complete else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", default=str(Path(__file__).with_name("cycle-matrix.json")))
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--model-root", default="models")
     parser.add_argument("--base-build", default="build-arm64-cpu")
     parser.add_argument("--build-root", default=".cache/cycle-matrix-build")
@@ -362,7 +517,6 @@ def main() -> int:
     parser.add_argument("--jobs", type=positive_int, default=2)
     parser.add_argument("--timeout", type=positive_int, default=1800, help="timeout per subprocess, seconds")
     parser.add_argument("--plan", action="store_true", help="resolve the matrix and check files without building/running")
-    parser.add_argument("--no-build", action="store_true", help="reuse validated matrix builds; does not use the base binary")
     args = parser.parse_args()
     config = json_read(absolute(args.config))
     generation = config["generation"]
@@ -371,8 +525,10 @@ def main() -> int:
     require(generation["tokens"] >= 2, "at least two output tokens are needed to validate decode and TPOT")
     require(type(generation["seed"]) is int and generation["seed"] >= 0, "invalid seed")
     cases = input_cases(config, absolute(args.model_root), args.models, args.bits, args.families)
-    full_count = len(config["models"]) * len(config["bits"]) * len(config["families"])
-    scope = "full" if len(cases) == full_count else "selection"
+    expected_cases = matrix_keys(json_read(DEFAULT_CONFIG))
+    full_count = len(expected_cases)
+    actual_cases = {(case["model"], case["bits"], case["family"]) for case in cases}
+    scope = "full" if actual_cases == expected_cases and len(cases) == full_count else "selection"
     for case in cases:
         print(f"{'MISSING' if case['errors'] else 'READY'} {case['name']} " +
               ("; ".join(case["errors"]) or case["model_path"]), flush=True)
@@ -382,7 +538,8 @@ def main() -> int:
         return 2 if any(case["errors"] for case in cases) else 0
     base = cache_read(absolute(args.base_build))
     build_root = absolute(args.build_root)
-    require(build_root != absolute(args.base_build), "matrix build root must not be the base build")
+    require(build_root != absolute(args.base_build) and absolute(args.base_build) not in build_root.parents,
+            "matrix build root must not be inside the base build")
     build_root.mkdir(parents=True, exist_ok=True)
     lock = build_root / ".matrix.lock"
     try:
@@ -393,10 +550,11 @@ def main() -> int:
     try:
         output = absolute(args.output_root) / (time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8])
         output.mkdir(parents=True)
-        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+        source = source_snapshot()
         report = {"scope": scope, "configured_cases": full_count, "platform": platform.platform(),
-                  "git_commit": sha, "detail": args.detail, "base_build": str(absolute(args.base_build)),
-                  "config": config, "cases": cases}
+                  "git_commit": source["commit"], "source": source, "detail": args.detail,
+                  "base_build": str(absolute(args.base_build)), "build_policy": "fresh_run_directory",
+                  "builds": [], "config": config, "cases": cases}
         patch = subprocess.check_output(["git", "diff", "HEAD"], cwd=ROOT)
         (output / "source.patch").write_bytes(patch)
         save_results(output, report)
@@ -410,6 +568,9 @@ def main() -> int:
                 try:
                     print(f"BUILD A{width}/W{width}", flush=True)
                     build = prepare_build(args, base, width, logs)
+                    report["builds"].append(json_read(logs / "build.json"))
+                    for case in group:
+                        case["build_ok"] = True
                 except (CheckError, OSError, subprocess.SubprocessError) as error:
                     for case in group:
                         case.update(status="failed", errors=[f"build: {error}"])
@@ -422,18 +583,20 @@ def main() -> int:
                         case["status"] = "ok"
                     except (CheckError, OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
                         case.update(status="failed", errors=[str(error)])
-                    print(f"{case['status'].upper()} {case['name']} {'; '.join(case['errors'])}", flush=True)
+                    label = "CASE_PASSED" if case["status"] == "ok" else "CASE_FAILED"
+                    print(f"{label} {case['name']} {'; '.join(case['errors'])}", flush=True)
                     save_results(output, report)
         except KeyboardInterrupt:
             for case in cases:
                 if case["status"] == "pending":
                     case.update(status="failed", errors=["interrupted before completion"])
             save_results(output, report)
-            print(f"Interrupted; partial results: {output / 'results.json'}", file=sys.stderr)
+            print(f"CYCLE_MATRIX_INTERRUPTED results={output / 'results.json'}", file=sys.stderr)
             return 130
-        save_results(output, report)
-        print(json.dumps({"status": report["status"], "scope": scope, "counts": report["counts"], "output": str(output)}))
-        return 0 if report["status"] == "ok" else 1
+        line, code = finish_run(output, report)
+        print(f"Results: {output / 'results.json'}", flush=True)
+        print(line, flush=True)
+        return code
     finally:
         lock.unlink()
 
@@ -442,5 +605,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except (CheckError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
-        print(f"cycle-matrix: {error}", file=sys.stderr)
+        print(f"CYCLE_MATRIX_FAILED error={error}", file=sys.stderr)
         sys.exit(2)
