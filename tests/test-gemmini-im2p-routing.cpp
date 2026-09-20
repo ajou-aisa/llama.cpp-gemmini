@@ -1,3 +1,47 @@
+#include <gemmini/log.hpp>
+#include <gemmini/performance.hpp>
+#include <cstdio>
+#include <string>
+#include <unistd.h>
+
+namespace {
+class SummaryCycleFile {
+public:
+  SummaryCycleFile() : previous_(ggml::gemmini::log::cycle.output_path()) {
+#if LOG_CYCLE
+    path_ = (std::filesystem::temp_directory_path() / "im2p-summary-XXXXXX").string();
+    const int fd = mkstemp(path_.data());
+    if (fd < 0) return;
+    close(fd);
+    ready_ = ggml::gemmini::log::cycle.set_output_path(path_.c_str(), true);
+#else
+    ready_ = true;
+#endif
+  }
+  ~SummaryCycleFile() {
+#if LOG_CYCLE
+    if (previous_.empty()) ggml::gemmini::log::cycle.set_output(stderr);
+    else (void) ggml::gemmini::log::cycle.set_output_path(previous_.string().c_str());
+    if (!path_.empty()) {
+      const std::filesystem::path saved("output/log/im2p-provider-cycle-log.jsonl");
+      std::error_code error;
+      std::filesystem::create_directories(saved.parent_path(), error);
+      if (!error)
+        std::filesystem::copy_file(path_, saved, std::filesystem::copy_options::overwrite_existing, error);
+      std::fprintf(error ? stderr : stdout, "provider_cycle_log=%s scope=isolated_summary_test status=%s\n",
+                   saved.string().c_str(), error ? error.message().c_str() : "saved");
+      std::remove(path_.c_str());
+    }
+#endif
+  }
+  bool ready() const { return ready_; }
+private:
+  std::filesystem::path previous_;
+  std::string path_;
+  bool ready_ = false;
+};
+}
+
 #if defined(GGML_GEMMINI_IM2P_HOST_CYCLE_TEST)
 // Compile the real adapter translation unit against real dependency headers.
 // Dead stripping permits this host-only seam without linking simulator/model
@@ -5,6 +49,91 @@
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-im2p.cpp"
 #include <cstdio>
 #include <string>
+#include <thread>
+
+static bool check_frontend_worker_summary() {
+  using namespace ggml::gemmini;
+  FILE *output = std::tmpfile();
+  if (!output) return false;
+  log::cycle.set_output(output);
+  ggml_gemmini_args_t args;
+  args.matmul_layer = "test.worker";
+  args.act_quant.storage().emplace<quants::act::exsia::Meta>().run_id = 42;
+  uint64_t worker_tid = 0;
+  bool enabled = false;
+  for (bool success : {true, false}) {
+    if (!success) std::get<quants::act::exsia::Meta>(args.act_quant.storage()).run_id.reset();
+    im2p_adapter::FrontendWorkerTiming timing(args);
+    ::im2p::gemmini::Options options;
+    timing.attach(options);
+    enabled = options.worker_timing != nullptr;
+    std::thread worker([&] {
+      worker_tid = cycle::host_thread_id();
+      if (options.worker_timing) {
+        options.worker_timing(options.worker_timing_context, true);
+        options.worker_timing(options.worker_timing_context, false);
+      }
+    });
+    worker.join();
+    timing.success = success;
+  }
+  std::rewind(output);
+  std::string json;
+  char buffer[1024];
+  while (const size_t count = std::fread(buffer, 1, sizeof(buffer), output))
+    json.append(buffer, count);
+  log::cycle.set_output(stderr);
+  std::fclose(output);
+#if LOG_CYCLE
+  const auto first = json.find("\"record_type\":\"CPU_WORK_SUMMARY\"");
+  const auto second = json.find("\"record_type\":\"CPU_WORK_SUMMARY\"", first + 1);
+  return enabled && first != std::string::npos && second != std::string::npos &&
+    json.find("\"record_type\":\"CPU_WORK_SUMMARY\"", second + 1) == std::string::npos &&
+    json.find("\"op\":\"im2p.simulation_worker\"") != std::string::npos &&
+    json.find("\"run_id\":42") != std::string::npos &&
+    json.find("\"run_id\":null") != std::string::npos &&
+    json.find("\"interval_count\":1") != std::string::npos &&
+    json.find("\"start_tid\":" + std::to_string(worker_tid)) != std::string::npos &&
+    json.find("\"end_tid\":" + std::to_string(worker_tid)) != std::string::npos &&
+    json.find("\"start_tid\":" + std::to_string(cycle::host_thread_id())) == std::string::npos &&
+    json.find("\"operation_success\":true") != std::string::npos &&
+    json.find("\"operation_success\":false") != std::string::npos;
+#else
+  (void) worker_tid;
+  return !enabled && json.empty();
+#endif
+}
+
+static bool check_npu_summary_ingress() {
+  using namespace ggml::gemmini;
+  SummaryCycleFile cycle_file;
+  if (!cycle_file.ready()) return false;
+  performance::reset();
+  performance::start_request(10);
+  performance::begin_operation(performance::Phase::prefill, 10);
+  ggml_gemmini_args_t args;
+  im2p_adapter::Stats dense{};
+  dense.rtl_work_total_cycles = 117;
+  im2p_adapter::Completion completion{};
+  completion.rmd_dot_calls = 2;
+  completion.rmd_stats.rtl_work_total_cycles = 23;
+  im2p_adapter::log_stats("full", dense, 41, args);
+  im2p_adapter::log_rmd_stats(completion, args);
+  performance::end_operation(20, true);
+  performance::finish_request(20);
+  performance::finish_recording();
+  const auto json = performance::serialize();
+  performance::reset();
+#if LOG_CYCLE
+  return json.find("\"backend\":\"im2p_sim\",\"domain\":\"dense\",\"metric\":\"work_total_cycles\",\"cycles\":117,") != std::string::npos &&
+         json.find("\"backend\":\"im2p_sim\",\"domain\":\"residual\",\"metric\":\"work_total_cycles\",\"cycles\":23,") != std::string::npos &&
+         json.find("im2p_frontend_cpu_stage_coverage_incomplete") != std::string::npos &&
+         json.find("\"time_reason\":\"npu_frequency_unavailable\"") != std::string::npos;
+#else
+  return json.find("\"available\":false") != std::string::npos &&
+         json.find("\"reason\":\"file_output_unavailable\"") != std::string::npos;
+#endif
+}
 
 int main() {
   using namespace ggml::gemmini;
@@ -46,7 +175,7 @@ int main() {
     json.append(buffer, count);
   log::cycle.set_output(stderr);
   std::fclose(output);
-#if LOG_CYCLE && CYCLE_DETAIL
+#if LOG_CYCLE
   const auto occurrences = [&](const std::string &token) {
     size_t count = 0;
     for (size_t pos = 0; (pos = json.find(token, pos)) != std::string::npos;
@@ -63,14 +192,19 @@ int main() {
        occurrences("\"operation_success\":false") == 1 &&
        occurrences("\"additive\":false") == 3 &&
        occurrences("\"host_timing\":{") == 3 &&
+       occurrences("\"native_cycles\":{") == 3 &&
+       occurrences("\"thread_cpu_timing\":{") == 3 &&
        occurrences("\"start_tid\":" + std::to_string(cycle::host_thread_id())) == 3 &&
        occurrences("\"end_tid\":" + std::to_string(cycle::host_thread_id())) == 3;
 #if !defined(__linux__) || !defined(__aarch64__)
-  ok = ok && copy_reads == 4;
+  ok = ok && copy_reads == 2;
 #endif
 #else
-  ok = ok && json.empty() && copy_reads == 0;
+  ok = ok && json.empty();
+  ok = ok && copy_reads == 0;
 #endif
+  ok = check_frontend_worker_summary() && ok;
+  ok = check_npu_summary_ingress() && ok;
   if (!ok) std::fprintf(stderr, "FAIL: real adapter host copy/identity/completion seam\n%s", json.c_str());
   return ok ? 0 : 1;
 }
@@ -91,6 +225,7 @@ int main() {
 #include "residual/direct/direct-executor.hpp"
 #include <gemmini.h>
 #include <gemmini/cycle_reader.hpp>
+#include <gemmini/performance.hpp>
 #if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
 #include <gemmini/log.h>
 #include "../ggml/src/ggml-gemmini-utils/src/cycle_reader_internal.h"
@@ -435,7 +570,7 @@ bool scalar_oracle(const std::vector<float> &activations,
 #if GGML_GEMMINI_ACTIVATION_QUANT == 0
   const auto *exsia_meta = std::get_if<ggml::gemmini::quants::act::exsia::Meta>(
       &args.act_quant.storage());
-  std::vector<int32_t> residuals(I * K, 0);
+  std::vector<int32_t> residuals(rows * K, 0);
   size_t residual_event_count = 0;
   if (exsia_meta != nullptr) {
     for (const auto &payload : exsia_meta->direct_residuals) {
@@ -1258,12 +1393,13 @@ bool run_im2p_semantic_logging_contract() {
 }
 
 bool check_graph_stripe_trace(
-    const ggml::gemmini::im2p_adapter::TestCounters &counters) {
-  if (!check(counters.stripe_trace_size == graph_publications,
+    const ggml::gemmini::im2p_adapter::TestCounters &counters,
+    size_t publications = graph_publications) {
+  if (!check(counters.stripe_trace_size == publications,
              "all graph stripe publications are traced")) {
     return false;
   }
-  for (size_t index = 0; index < graph_publications; ++index) {
+  for (size_t index = 0; index < publications; ++index) {
     if (!check(counters.stripe_ids[index] == static_cast<int>(index) &&
                    counters.slot_ids[index] == static_cast<int>(index % 2),
                "graph stripe ids and slots are deterministic")) {
@@ -1361,9 +1497,26 @@ bool run_exsia_full_im2p_provider(TestFailure failure = TestFailure::none) {
   const auto checked_oracle = run_integrated_exsia_lifecycle(
       rows, 1, LifecycleFamily::h1, LifecycleBackend::cpu_direct,
       PublicMode::full);
+  namespace performance = ggml::gemmini::performance;
+  SummaryCycleFile cycle_file;
+  if (!cycle_file.ready()) return false;
+  performance::reset();
+  const auto summary_start = ggml::gemmini::cycle::timestamp_ns();
+  performance::start_request(summary_start);
+  performance::begin_operation(performance::Phase::prefill, summary_start);
   const auto active = run_integrated_exsia_lifecycle(
       rows, 1, LifecycleFamily::h1, LifecycleBackend::compact_ws,
       PublicMode::full, failure);
+  if (active.ok) {
+    ggml_gemmini_args_t summary_args;
+    log_stats("full", active.completion.stats, active.completion.run_id, summary_args);
+    log_rmd_stats(active.completion, summary_args);
+  }
+  const auto summary_end = ggml::gemmini::cycle::timestamp_ns();
+  performance::end_operation(summary_end, active.ok);
+  performance::finish_request(summary_end);
+  performance::finish_recording();
+  const auto summary = performance::serialize();
   if (failure != TestFailure::none) {
     const char *name = failure == TestFailure::provider ? "provider"
                        : failure == TestFailure::simulator_create ? "create"
@@ -1404,6 +1557,17 @@ bool run_exsia_full_im2p_provider(TestFailure failure = TestFailure::none) {
             "FULL checked oracle and IM2P provider executions succeed") &&
       check(active.output == checked_oracle.output,
             "FULL IM2P output equals the CPU-direct oracle") &&
+#if LOG_CYCLE
+      check(summary.find("\"domain\":\"dense\",\"metric\":\"work_total_cycles\",\"cycles\":" +
+                         std::to_string(active.completion.stats.rtl_work_total_cycles) + ",") != std::string::npos &&
+            summary.find("\"domain\":\"residual\",\"metric\":\"work_total_cycles\",\"cycles\":" +
+                         std::to_string(active.completion.rmd_stats.rtl_work_total_cycles) + ",") != std::string::npos,
+            "FULL summary records dense and residual run totals once in separate domains") &&
+#else
+      check(summary.find("\"available\":false") != std::string::npos &&
+            summary.find("\"reason\":\"file_output_unavailable\"") != std::string::npos,
+            "FULL summary is explicitly unavailable without a cycle file") &&
+#endif
       check(active.counters.full == 1 && active.counters.pipeline == 0 &&
                 active.counters.stripe == 0 && active.counters.fence == 1,
             "FULL executes one dense run and publishes zero stripes") &&
@@ -1520,9 +1684,25 @@ bool run_exsia_pipeline_callback() {
   const auto direct = run_integrated_exsia_lifecycle(
       rows, 1, LifecycleFamily::h1, LifecycleBackend::cpu_direct,
       PublicMode::stripe_pipeline);
+  namespace performance = ggml::gemmini::performance;
+  SummaryCycleFile cycle_file;
+  if (!cycle_file.ready()) return false;
+  performance::reset();
+  const auto summary_start = ggml::gemmini::cycle::timestamp_ns();
+  performance::start_request(summary_start);
+  performance::begin_operation(performance::Phase::prefill, summary_start);
   const auto compact = run_integrated_exsia_lifecycle(
       rows, 1, LifecycleFamily::h1, LifecycleBackend::compact_ws,
       PublicMode::stripe_pipeline);
+  if (compact.ok) {
+    ggml_gemmini_args_t summary_args;
+    log_stats("stripe_pipeline", compact.completion.stats, compact.completion.run_id, summary_args);
+  }
+  const auto summary_end = ggml::gemmini::cycle::timestamp_ns();
+  performance::end_operation(summary_end, compact.ok);
+  performance::finish_request(summary_end);
+  performance::finish_recording();
+  const auto summary = performance::serialize();
   const auto empty = run_integrated_exsia_lifecycle(
       rows, 1, LifecycleFamily::h1, LifecycleBackend::compact_ws,
       PublicMode::stripe_pipeline, TestFailure::none, true);
@@ -1548,6 +1728,17 @@ bool run_exsia_pipeline_callback() {
             "PIPELINE direct, compact, and empty callback routes succeed") &&
       check(direct.output == compact.output,
             "PIPELINE worker-owned IM2P output equals CPU-direct oracle") &&
+#if LOG_CYCLE
+      check(summary.find("\"domain\":\"dense\",\"metric\":\"work_total_cycles\",\"cycles\":" +
+                         std::to_string(compact.completion.stats.rtl_work_total_cycles) + ",") != std::string::npos &&
+            summary.find("\"domain\":\"residual\",\"metric\":\"work_total_cycles\",\"cycles\":" +
+                         std::to_string(compact.completion.rmd_stats.rtl_work_total_cycles) + ",") != std::string::npos,
+            "PIPELINE summary counts the aggregate once without adding stripe diagnostics") &&
+#else
+      check(summary.find("\"available\":false") != std::string::npos &&
+            summary.find("\"reason\":\"file_output_unavailable\"") != std::string::npos,
+            "PIPELINE summary is explicitly unavailable without a cycle file") &&
+#endif
       check(canonical_callbacks(direct) && canonical_callbacks(compact) &&
                 canonical_callbacks(empty),
             "each dense stripe is immediately executed and merged before the next dense completion") &&
@@ -1781,12 +1972,13 @@ bool run_exsia_full_collector_capture_failure() {
   return ok;
 }
 
-bool run_exsia_success() {
+bool run_exsia_success(bool collect_summary = false) {
   using namespace ggml::gemmini::im2p_adapter;
   setenv("GEMMINI_MATMUL_MODE", "STRIPE_PIPELINE", 1);
   setenv("GEMMINI_RMD_BACKEND", "CPU", 1);
   setenv("GEMMINI_STRIPE_JOB_CAPACITY", "2", 1);
-  GraphCase test_case;
+  const size_t publications = collect_summary ? 2 : graph_publications;
+  GraphCase test_case(collect_summary ? 1024 : I);
   if (!check(test_case.initialize(), "initialize real ExSIA Gemmini graph")) {
     return false;
   }
@@ -1797,8 +1989,23 @@ bool run_exsia_success() {
   }
 
   test_reset();
+  if (collect_summary) {
+    if (!check(ggml::gemmini::log::setup_default_outputs().cycle,
+               "initialize the cycle file before recording the request"))
+      return false;
+    ggml::gemmini::performance::reset();
+    const auto begin = ggml::gemmini::cycle::timestamp_ns();
+    ggml::gemmini::performance::start_request(begin);
+    ggml::gemmini::performance::begin_operation(ggml::gemmini::performance::Phase::prefill, begin);
+  }
   const ggml_status status =
       ggml_backend_graph_compute(test_case.backend, test_case.graph);
+  if (collect_summary) {
+    const auto end = ggml::gemmini::cycle::timestamp_ns();
+    ggml::gemmini::performance::end_operation(end, status == GGML_STATUS_SUCCESS);
+    ggml::gemmini::performance::finish_request(end);
+    ggml::gemmini::performance::finish_recording();
+  }
   const auto counters = test_counters();
   const auto actual = test_case.read_output();
   bool ok =
@@ -1809,12 +2016,12 @@ bool run_exsia_success() {
           counters.full == 0 && counters.pipeline == 1,
           "ExSIA dispatch executes exactly one pipeline run and no full run") &&
       check(counters.fence == 1, "ExSIA dispatch fences exactly once") &&
-      check(counters.stripe == graph_publications &&
-                counters.accepted_stripes == graph_publications,
+      check(counters.stripe == publications &&
+                counters.accepted_stripes == publications,
             "all canonical post-fold stripes reach the frontend") &&
       check(counters.max_outstanding > 0 && counters.max_outstanding <= 2,
             "frontend keeps at most two stripes outstanding") &&
-      check(counters.rmd_calls == graph_publications &&
+      check(counters.rmd_calls == publications &&
                 counters.rmd_events > 0,
             "unchanged cpu_direct RMD consumes every stripe and real residual "
             "events") &&
@@ -1825,7 +2032,7 @@ bool run_exsia_success() {
       check(counters.hardware == 0 && counters.fallback == 0,
             "ExSIA route enters no hardware or fallback path") &&
       check(counters.live_runs == 0, "all frontend workers are joined") &&
-      check_graph_stripe_trace(counters);
+      check_graph_stripe_trace(counters, publications);
   for (size_t index = 0; index < actual.size(); ++index) {
     const float tolerance = 1e-4f * std::max(1.0f, std::fabs(expected[index]));
     ok = check(std::isfinite(actual[index]) &&
@@ -1835,18 +2042,20 @@ bool run_exsia_success() {
   }
   if (ok) {
     std::printf(
-        "route=exsia mode=stripe_pipeline bits=%d dim=%d stripes=1 slots=0 "
+        "route=exsia mode=stripe_pipeline bits=%d dim=%d stripes=%zu "
         "capacity=2 events=seal>fold_commit>callback>rtl_publish>"
         "activation_read>quantization_complete rmd=cpu_direct "
         "publish_cycle=%llu activation_read_cycle=%llu "
         "rmd_terminal_event=%llu authorize_event=%llu "
-        "full=0 pipeline=1 stripes=1 fence=1 rmd=1 commit=1 "
+        "full=0 pipeline=1 fence=1 rmd=%zu commit=1 "
         "hardware=0 fallback=0\n",
         GGML_GEMMINI_ACTIVATION_BITS, GGML_GEMMINI_TEST_IM2P_DIM,
+        publications,
         static_cast<unsigned long long>(counters.first_publish_cycle),
         static_cast<unsigned long long>(counters.first_activation_read_cycle),
         static_cast<unsigned long long>(counters.rmd_terminal_event),
-        static_cast<unsigned long long>(counters.authorize_success_event));
+        static_cast<unsigned long long>(counters.authorize_success_event),
+        static_cast<size_t>(counters.rmd_calls));
   }
   return ok;
 }
@@ -3042,7 +3251,7 @@ int main(int argc, char **argv) {
     } else if (selected == "cross-mode-oracle") {
       selected_ok = run_exsia_cross_mode_parity();
     } else if (selected == "pipeline") {
-      selected_ok = run_exsia_success() && run_exsia_pipeline_callback();
+      selected_ok = run_exsia_success(true) && run_exsia_pipeline_callback();
     } else if (selected == "full-collector-allocation") {
       selected_ok = run_exsia_full_failure(TestFailure::collector_allocation);
     } else if (selected == "full-collector-capture") {

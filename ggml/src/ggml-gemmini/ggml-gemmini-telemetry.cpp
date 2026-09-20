@@ -1,10 +1,14 @@
+#include <gemmini/trace-context.hpp>
 #include "ggml-gemmini-telemetry.hpp"
 #include "ggml-gemmini-matmul.hpp"
+#include "residual/rmd/rmd-executor.hpp"
 #include <gemmini/log.hpp>
 
 #include <sstream>
+#include <iterator>
 #include <limits>
 #include <string_view>
+#include <utility>
 
 namespace ggml::gemmini {
 
@@ -24,11 +28,48 @@ std::string serialize_matmul_cpu_interval(log::CycleRecord record,
     std::string json = log::serialize_checked_cycle_record(record, interval.cycles.has_value(),
         interval.reason.empty() ? nullptr : interval.reason.c_str(),
         interval.sample_reason.empty() ? nullptr : interval.sample_reason.c_str());
+#if CYCLE_DETAIL
+    const auto cpu_sample = [](const MatmulCpuSample & sample) {
+        gemmini_cpu_sample result{};
+        result.trace = sample.trace;
+        result.ns = sample.ns;
+        result.tid = sample.tid;
+        result.thread_cpu_ns = sample.thread_cpu_ns;
+        result.thread_cpu_valid = sample.thread_cpu_valid;
+#if defined(__linux__) && defined(__aarch64__)
+        result.counter = sample.native.value;
+        result.native_valid = sample.collected && sample.native.valid;
+        result.native_reason = static_cast<uint8_t>(sample.native.reason);
+        result.native_source = GEMMINI_CPU_COUNTER_THREAD_PERF;
+        result.owner_token = sample.native.owner_event_token;
+        result.generation = sample.native.generation;
+#endif
+        return result;
+    };
+#endif
+#if CYCLE_DETAIL
     json.insert(json.rfind('}'),
         std::string(",\"cpu_measurement_version\":1,\"operation_success\":") +
         (operation_success ? "true" : "false") + ",\"additive\":false,\"host_timing\":" +
-        cycle::serialize_host_timing(start.ns, end.ns, start.tid, end.tid));
-    return json;
+        cycle::serialize_host_timing(start.ns, end.ns, start.tid, end.tid) +
+        ",\"native_cycles\":" + cycle::serialize_cpu_native(cpu_sample(start), cpu_sample(end)) +
+        ",\"thread_cpu_timing\":" + cycle::serialize_thread_cpu_timing(
+            {start.ns, start.tid, start.thread_cpu_ns, start.thread_cpu_valid},
+            {end.ns, end.tid, end.thread_cpu_ns, end.thread_cpu_valid}));
+#else
+    std::string compact = std::string(",\"operation_success\":") +
+        (operation_success ? "true" : "false") +
+        ",\"ns_start\":" + std::to_string(start.ns) +
+        ",\"ns_end\":" + std::to_string(end.ns);
+    if (start.tid != 0 && start.tid == end.tid) {
+        compact += ",\"tid\":" + std::to_string(start.tid);
+    } else {
+        compact += ",\"tid_start\":" + std::to_string(start.tid) +
+            ",\"tid_end\":" + std::to_string(end.tid);
+    }
+    json.insert(json.rfind('}'), compact);
+#endif
+    return trace::annotate_origin(std::move(json), start.trace);
 }
 
 void project_matmul_cpu_identity(log::CycleRecord & record,
@@ -309,6 +350,83 @@ void prefix(std::ostringstream & out, const char * type,
     json_string(out, unit);
 }
 
+void device_diagnostics(std::ostringstream & out, const Im2pExecutionTelemetry & record) {
+    if (!record.provider_stats) return;
+    string_field(out, "execution_id", cycle::host_execution_id());
+    const auto & stats = *record.provider_stats;
+    const bool full = record.counter_coverage == Im2pExecutionTelemetry::CounterCoverage::simulator;
+    const bool waits = record.counter_coverage != Im2pExecutionTelemetry::CounterCoverage::fpga_basic;
+    out << ",\"device\":{\"additive\":false,\"counter_bits\":64";
+    string_field(out, "backend", record.backend);
+    string_field(out, "clock_domain", record.clock_domain);
+    string_field(out, "numerical_contract", record.numerical_contract);
+    string_field(out, "scale_mode", record.scale_mode);
+    field(out, "vector_op", record.vector_op);
+    field(out, "output_domain", record.output_domain);
+    field(out, "activation_bits", record.activation_bits);
+    field(out, "weight_bits", record.weight_bits);
+    field(out, "dim", record.dim);
+    field(out, "problem_i", record.problem_i);
+    field(out, "problem_j", record.problem_j);
+    field(out, "problem_k", record.problem_k);
+    string_field(out, "mode", record.mode);
+    string_field(out, "counter_semantics", "independent_observations");
+    out << ",\"counters\":{\"additive\":false";
+    const auto counter = [&](const char *name, uint64_t value, bool available) {
+        if (available) field(out, name, value);
+        else {
+            null_field(out, name);
+            string_field(out, (std::string(name) + "_reason").c_str(), "provider_counter_unavailable");
+        }
+    };
+#define IM2P_COUNTER(member, available) counter(#member, stats.member, available)
+    IM2P_COUNTER(rtl_work_total_cycles, true);
+    IM2P_COUNTER(rtl_activation_read_requests, true);
+    IM2P_COUNTER(rtl_weight_read_requests, true);
+    IM2P_COUNTER(rtl_scale_read_requests, full);
+    IM2P_COUNTER(rtl_output_write_requests, true);
+    IM2P_COUNTER(rtl_output_write_responses, true);
+    IM2P_COUNTER(rtl_activation_wait_cycles, full);
+    IM2P_COUNTER(rtl_weight_wait_cycles, full);
+    IM2P_COUNTER(rtl_scale_wait_cycles, full);
+    IM2P_COUNTER(rtl_output_wait_cycles, full);
+    IM2P_COUNTER(rtl_stripe_host_wait_cycles, waits);
+    IM2P_COUNTER(rtl_drain_cycles, full);
+    IM2P_COUNTER(rtl_weight_preload_cycles, full);
+    IM2P_COUNTER(rtl_same_block_scale_hits, full);
+    IM2P_COUNTER(rtl_next_scale_hits, full);
+    IM2P_COUNTER(rtl_scale_demand_misses, full);
+    IM2P_COUNTER(rtl_compute_cycles, full);
+    IM2P_COUNTER(rtl_overlap_cycles, waits);
+    IM2P_COUNTER(rtl_activation_overlap_cycles, full);
+    IM2P_COUNTER(rtl_weight_overlap_cycles, full);
+    IM2P_COUNTER(rtl_scale_overlap_cycles, full);
+    IM2P_COUNTER(rtl_completed_fragments, true);
+    IM2P_COUNTER(rtl_completed_output_works, true);
+    IM2P_COUNTER(rtl_scheduler_groups_completed, full);
+    IM2P_COUNTER(rtl_stripes_published, full);
+    IM2P_COUNTER(rtl_stripe_rows_published, full);
+    IM2P_COUNTER(rtl_weight_bank_activations, full);
+    IM2P_COUNTER(rtl_cross_stripe_overlap_cycles, full);
+    IM2P_COUNTER(rtl_lookahead_prepared, full);
+    IM2P_COUNTER(rtl_first_publish_cycle, full);
+    IM2P_COUNTER(rtl_first_activation_read_cycle, full);
+    IM2P_COUNTER(rtl_first_weight_read_cycle, full);
+    IM2P_COUNTER(rtl_weight_preload_cycle, full);
+    IM2P_COUNTER(rtl_lookahead_weight_requests, full);
+    IM2P_COUNTER(rtl_lookahead_weight_reuse_hits, full);
+    IM2P_COUNTER(rtl_first_scale_read_cycle, full);
+    IM2P_COUNTER(rtl_lookahead_scale_requests, full);
+    IM2P_COUNTER(rtl_lookahead_scale_reuses, full);
+    IM2P_COUNTER(rtl_current_scheduler_group_completion_cycle, full);
+    IM2P_COUNTER(rtl_lookahead_ready_cycle, full);
+    IM2P_COUNTER(rtl_lookahead_start_cycle, full);
+#undef IM2P_COUNTER
+    for (const char *name : {"scu_execution_cycles", "saturation_events", "overflow_events", "metadata_bytes"})
+        counter(name, 0, false);
+    out << "}}";
+}
+
 #if LOG_DEBUG
 void debug_field(std::ostringstream & out, const char * name, std::uint64_t value) {
     out << ' ' << name << '=' << value;
@@ -385,7 +503,8 @@ std::string serialize_cycle_telemetry(const Im2pExecutionTelemetry & record) {
         prefix(out, record.residual_aggregate
                         ? "IM2P_RMD_EXECUTION_TELEMETRY"
                         : "IM2P_RMD_STRIPE_TELEMETRY",
-               "im2p_rmd_rtl", "rtl_cycle");
+               record.backend.empty() || record.backend == "im2p_sim" ? "im2p_rmd_rtl" : record.backend,
+               "rtl_cycle");
         string_field(out, "op", "rmd.im2p.execute");
         nullable_string_field(out, "layer", record.layer);
         field(out, "run_id", record.run_id);
@@ -404,11 +523,13 @@ std::string serialize_cycle_telemetry(const Im2pExecutionTelemetry & record) {
         }
         field(out, "rmd_dot_calls", record.rmd_dot_calls);
         field(out, "rmd_work_total_cycles", record.rtl_work_total_cycles);
-        string_field(out, "clock_domain", "independent_rmd_simulator");
+        string_field(out, "clock_domain", record.clock_domain.empty() ? "independent_rmd_simulator" : record.clock_domain);
+        device_diagnostics(out, record);
         out << ",\"additive\":false}";
         return out.str();
     }
-    prefix(out, "IM2P_EXECUTION_TELEMETRY", "im2p_rtl", "rtl_cycle");
+    prefix(out, "IM2P_EXECUTION_TELEMETRY",
+           record.backend.empty() || record.backend == "im2p_sim" ? "im2p_rtl" : record.backend, "rtl_cycle");
     string_field(out, "op", "im2p.execute");
     nullable_string_field(out, "layer", record.layer);
     field(out, "run_id", record.run_id);
@@ -417,6 +538,7 @@ std::string serialize_cycle_telemetry(const Im2pExecutionTelemetry & record) {
     null_field(out, "node_id");
     null_field(out, "worker_id");
     field(out, "rtl_work_total_cycles", record.rtl_work_total_cycles);
+    device_diagnostics(out, record);
     out << '}';
     return out.str();
 #endif
@@ -447,7 +569,7 @@ std::string serialize_cycle_telemetry(const Im2pStripeTelemetry & record) {
 }
 
 std::string serialize_cycle_telemetry(const QuantizationStripeTelemetry & record) {
-#if !LOG_CYCLE
+#if !LOG_CYCLE || !CYCLE_DETAIL
     (void) record;
     return {};
 #else
@@ -470,8 +592,9 @@ std::string serialize_cycle_telemetry(const QuantizationStripeTelemetry & record
     field(out, "start_ns", record.start_ns);
     field(out, "end_ns", record.end_ns);
     field(out, "duration_ns", record.end_ns - record.start_ns);
-    out << ",\"overlaps_rtl\":true,\"additive\":false"
-        << log::serialize_cpu_service_metadata("exsia.quantize", "cross_task_summary") << '}';
+    string_field(out, "execution_id", cycle::host_execution_id());
+    out << ",\"host_clock\":\"steady_clock\",\"overlaps_rtl\":null,"
+           "\"overlaps_rtl_reason\":\"independent_clock_domains\",\"additive\":false}";
     return out.str();
 #endif
 }
@@ -480,8 +603,144 @@ std::string serialize_cycle_telemetry(const RmdTelemetryRecord & record) {
     return serialize_rmd_telemetry(record);
 }
 
-std::string serialize_cycle_telemetry(const PipelineStripeTelemetry & record) {
+std::string serialize_cycle_telemetry(const RmdStripeTelemetry & record) {
 #if !LOG_CYCLE
+    (void) record;
+    return {};
+#else
+    std::ostringstream out;
+    prefix(out, "RMD_STRIPE_TELEMETRY", "host_observation", "mixed");
+    string_field(out, "execution_id", cycle::host_execution_id());
+    string_field(out, "op", "rmd.stripe");
+    nullable_string_field(out, "layer", record.layer);
+    if (record.run_id) field(out, "run_id", *record.run_id); else null_field(out, "run_id");
+    field(out, "stripe_id", record.stripe_id);
+    if (record.slot) field(out, "slot", *record.slot); else null_field(out, "slot");
+    null_field(out, "node_id");
+    null_field(out, "worker_id");
+    field(out, "row_begin", record.row_begin);
+    field(out, "row_end", record.row_end);
+    string_field(out, "backend", record.backend);
+    out << ",\"additive\":false,\"operation_success\":" << (record.success ? "true" : "false")
+        << ",\"valid\":" << (record.success && record.metrics ? "true" : "false");
+    nullable_string_field(out, "reason", record.metrics ? record.reason : "missing_metrics");
+    if (!record.metrics) { out << ",\"metrics\":null}"; return out.str(); }
+    const auto &m = *record.metrics;
+    out << ",\"metrics\":{\"additive\":false";
+    string_field(out, "digit_observation_scope", "signed_radix_input_decomposition");
+    const auto compact_field = [&](const char *name, uint64_t value) {
+        if (record.backend != "cpu_direct") field(out, name, value);
+        else {
+            null_field(out, name);
+            string_field(out, (std::string(name) + "_reason").c_str(), "not_applicable_cpu_direct");
+        }
+    };
+#define RMD_FIELD(member) field(out, #member, m.member)
+#define RMD_COMPACT_FIELD(member) compact_field(#member, m.member)
+    RMD_FIELD(residual_nnz);
+    RMD_FIELD(digit_bits);
+    const auto observed = [&](const char *name, uint64_t value) {
+        if (m.residual_observations_valid) field(out, name, value);
+        else {
+            null_field(out, name);
+            string_field(out, (std::string(name) + "_reason").c_str(), "input_observation_unavailable");
+        }
+    };
+    for (const auto &entry : {std::pair{"residual_min", m.residual_min}, std::pair{"residual_max", m.residual_max}}) {
+        if (m.residual_observations_valid && m.residual_nnz) out << ",\"" << entry.first << "\":" << entry.second;
+        else {
+            null_field(out, entry.first);
+            string_field(out, (std::string(entry.first) + "_reason").c_str(),
+                         m.residual_observations_valid ? "no_nonzero_residual" : "input_observation_unavailable");
+        }
+    }
+    observed("required_planes", m.required_planes);
+    observed("digit_nnz", m.digit_nnz);
+    if (m.active_original_rows_valid) field(out, "active_original_rows", m.active_original_rows);
+    else {
+        null_field(out, "active_original_rows");
+        string_field(out, "active_original_rows_reason", "input_observation_unavailable");
+    }
+    RMD_FIELD(original_rows);
+    RMD_FIELD(logical_k);
+    RMD_FIELD(logical_j);
+    RMD_FIELD(array_dim);
+    RMD_FIELD(original_rows_after_pruning);
+    RMD_COMPACT_FIELD(lane_rows_before_pruning);
+    RMD_COMPACT_FIELD(lane_rows_after_pruning);
+    RMD_COMPACT_FIELD(group_rows_padded);
+    RMD_COMPACT_FIELD(group_active_k_count);
+    RMD_COMPACT_FIELD(group_padded_k_count);
+    RMD_FIELD(source_residual_macs);
+    RMD_COMPACT_FIELD(useful_digit_macs);
+    RMD_FIELD(issued_mac_capacity);
+    RMD_FIELD(activation_payload_bytes);
+    RMD_FIELD(metadata_host_bytes);
+    RMD_FIELD(gathered_weight_host_bytes);
+    RMD_FIELD(correction_bytes);
+    RMD_FIELD(logical_dot_result_bytes);
+    RMD_COMPACT_FIELD(block_scale_values_bytes);
+    RMD_FIELD(final_scale_values_bytes);
+    RMD_FIELD(final_output_store_bytes);
+    RMD_FIELD(direct_event_count);
+    RMD_FIELD(direct_call_count);
+    RMD_FIELD(packet_call_count);
+    RMD_FIELD(ws_call_count);
+    RMD_FIELD(im2p_dot_calls);
+    RMD_COMPACT_FIELD(active_blocks);
+    RMD_COMPACT_FIELD(active_lanes);
+    RMD_COMPACT_FIELD(compact_k_count);
+    RMD_COMPACT_FIELD(padded_k_count);
+    RMD_FIELD(physical_tile_count);
+    RMD_FIELD(matmul_call_count);
+    RMD_FIELD(lane_group_count);
+    RMD_FIELD(baseline_stacked_i_tile_count);
+    RMD_FIELD(stacked_i_tile_count);
+    RMD_FIELD(packet_bytes);
+    RMD_FIELD(compressed_output_values);
+    RMD_FIELD(block_padding_zeros);
+    RMD_FIELD(row_padding_zeros);
+    RMD_FIELD(j_padding_zeros);
+    RMD_FIELD(weight_values_gathered);
+    RMD_FIELD(weight_baseline_address_resolutions);
+    RMD_FIELD(weight_address_resolutions);
+#undef RMD_FIELD
+#undef RMD_COMPACT_FIELD
+    out << "},\"host_stages\":{";
+    constexpr const char *names[] = {"preparation", "weight_gather", "block_scale_metadata",
+        "dot_output_accumulate", "block_scale_apply", "radix_reconstruct_combine",
+        "final_metadata", "final_scale_combine_stage", "output_store"};
+    static_assert(std::size(names) == static_cast<size_t>(rmd::RmdHostStage::count));
+    for (size_t i = 0; i < std::size(names); ++i) {
+        const auto &stage = m.host_stages[i];
+        if (i) out << ',';
+        out << '"' << names[i] << "\":{\"additive\":false,\"calls\":" << stage.calls;
+        const auto sample = [&](const char *name, uint64_t value, bool valid, const char *reason) {
+            if (valid) field(out, name, value); else null_field(out, name);
+            out << ",\"" << name << "_valid\":" << (valid ? "true" : "false");
+            nullable_string_field(out, (std::string(name) + "_reason").c_str(), valid ? "" :
+                stage.calls == 0 ? "no_samples" : reason ? reason : "invalid_sample");
+        };
+#if CYCLE_DETAIL
+        sample("wall_ns", stage.wall_ns, stage.calls && stage.wall_valid, "invalid_host_interval");
+        sample("thread_cpu_ns", stage.cpu.thread_cpu_ns,
+            stage.calls && stage.cpu.interval_count == stage.calls &&
+            stage.cpu.thread_cpu_valid_count == stage.calls && !stage.cpu.thread_cpu_reason,
+            stage.cpu.thread_cpu_reason);
+#endif
+        sample("native_cycles", stage.cpu.cycles,
+            stage.calls && stage.cpu.interval_count == stage.calls &&
+            stage.cpu.cycles_valid_count == stage.calls && !stage.cpu.cycles_reason,
+            stage.cpu.cycles_reason);
+        out << '}';
+    }
+    out << "}}";
+    return out.str();
+#endif
+}
+
+std::string serialize_cycle_telemetry(const PipelineStripeTelemetry & record) {
+#if !LOG_CYCLE || !CYCLE_DETAIL
     (void) record;
     return {};
 #else
@@ -553,5 +812,6 @@ void emit_cycle_telemetry(const Im2pStripeTelemetry & record) { log::cycle.write
 void emit_cycle_telemetry(const QuantizationStripeTelemetry & record) { log::cycle.write_json(serialize_cycle_telemetry(record)); }
 void emit_cycle_telemetry(const PipelineStripeTelemetry & record) { log::cycle.write_json(serialize_cycle_telemetry(record)); }
 void emit_cycle_telemetry(const RmdTelemetryRecord & record) { log::cycle.write_json(serialize_cycle_telemetry(record)); }
+void emit_cycle_telemetry(const RmdStripeTelemetry & record) { log::cycle.write_json(serialize_cycle_telemetry(record)); }
 
 } // namespace ggml::gemmini

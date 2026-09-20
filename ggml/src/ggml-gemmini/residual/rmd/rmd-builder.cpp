@@ -463,6 +463,8 @@ void RmdStripeBuilder::reset(size_t stripe_id, size_t row_begin, size_t row_coun
     logical_j_ = logical_j;
     digit_bits_ = digit_bits;
     residual_event_count_ = 0;
+    residual_min_ = residual_max_ = 0;
+    required_planes_ = 0;
     entries_.clear();
     blocks_.clear();
     if (row_count == 0 || logical_k == 0 || logical_j == 0 ||
@@ -496,6 +498,9 @@ bool RmdStripeBuilder::add_residual(size_t local_row, size_t original_k, int32_t
     }
 
     ++residual_event_count_;
+    residual_min_ = residual_event_count_ == 1 ? residual : std::min(residual_min_, residual);
+    residual_max_ = residual_event_count_ == 1 ? residual : std::max(residual_max_, residual);
+    required_planes_ = std::max(required_planes_, digits.active_lane_count);
     const size_t block_id = original_k / kBlockSize;
     const size_t block_local_k = original_k % kBlockSize;
     if (block_id > std::numeric_limits<uint32_t>::max()) {
@@ -560,6 +565,11 @@ StripePacketHandle RmdStripeBuilder::finish() {
         packet->block_size = kBlockSize;
         packet->array_dim = kArrayDim;
         packet->residual_event_count = residual_event_count_;
+        packet->residual_min = residual_min_;
+        packet->residual_max = residual_max_;
+        packet->required_planes = required_planes_;
+        packet->digit_nnz = entries_.size();
+        packet->residual_observations_valid = true;
 
         const size_t rows_padded = align_up(row_count_, kArrayDim);
         if (rows_padded == 0) {
@@ -728,7 +738,13 @@ StripePacketHandle RmdStripeBuilder::finish() {
             packet->stacked_activation.signed_int16.assign(activation_value_cursor, 0);
         }
 
+#if LOG_CYCLE
+        std::vector<uint64_t> active_rows((row_count_ + 63) / 64, 0);
+#endif
         for (const DigitEntry & entry : entries_) {
+#if LOG_CYCLE
+            active_rows[entry.local_row / 64] |= uint64_t{1} << (entry.local_row % 64);
+#endif
             const BlockPacking & packing = packing_by_block[entry.block_id];
             const BlockDescriptor & descriptor = packet->blocks[packing.block_index];
             const LaneGroupDescriptor & group = descriptor.groups[packing.group_ids[entry.lane]];
@@ -743,6 +759,13 @@ StripePacketHandle RmdStripeBuilder::finish() {
                 return nullptr;
             }
         }
+
+#if LOG_CYCLE
+        for (uint64_t rows : active_rows) {
+            packet->active_original_rows += static_cast<size_t>(__builtin_popcountll(rows));
+        }
+        packet->active_original_rows_valid = true;
+#endif
 
         const RmdStatus validation = validate_packet(*packet);
         if (validation != RmdStatus::success) {

@@ -556,12 +556,20 @@ elseif(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
         endif()
     endforeach()
 
-    set(_GGML_GEMMINI_IM2P_PROBE_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/im2p-build-contract-probe.cpp")
-    file(WRITE "${_GGML_GEMMINI_IM2P_PROBE_SOURCE}" [=[
+    # Validate the public frontend and simulator identity in one native-link
+    # probe. GEMMINI_HP1 keeps identity entry points in the same static-library
+    # object as the Verilator runtime bridge, so probing libim2p_sim.a alone can
+    # accidentally pull in the runtime without its required native link flags.
+    find_package(Threads REQUIRED)
+    set(_GGML_GEMMINI_IM2P_PAIR_PROBE_SOURCE
+        "${CMAKE_CURRENT_BINARY_DIR}/im2p-frontend-pair-probe.cpp")
+    file(WRITE "${_GGML_GEMMINI_IM2P_PAIR_PROBE_SOURCE}" [=[
+#include "im2p_gemmini_frontend.hpp"
+#include "im2p_sim.h"
+#include "ggml-gemmini-args.h"
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include "im2p_sim.h"
 static_assert(IM2P_ABI_VERSION == 5, "SCU requires typed ABI5");
 int main() {
     const char *revision = im2p_compiled_numerical_semantics_revision();
@@ -576,29 +584,98 @@ int main() {
                 im2p_sim_activation_storage_bytes(),
                 im2p_sim_weight_bits(), im2p_sim_weight_storage_bytes(),
                 im2p_sim_dim());
-    return 0;
+    if (im2p_execute_matmul_extended(nullptr, nullptr, nullptr) !=
+        IM2P_INVALID_LAYOUT)
+        return 9;
+    if (im2p_begin_striped_matmul(nullptr, nullptr, nullptr) != IM2P_ERROR)
+        return 10;
+    if (im2p_publish_stripe(nullptr, nullptr) != IM2P_INVALID_LAYOUT)
+        return 11;
+    if (im2p::gemmini::compiled_activation_bits() !=
+        @GGML_GEMMINI_ACTIVATION_BITS@)
+        return 20;
+    if (im2p::gemmini::compiled_weight_bits() !=
+        @GGML_GEMMINI_WEIGHT_BITS@)
+        return 30;
+    if (im2p::gemmini::compiled_dim() != @GGML_GEMMINI_DIM@)
+        return 40;
+    ggml_gemmini_args_t args{};
+    const auto *base = reinterpret_cast<const std::uint8_t *>(&args);
+    const auto offset = [base](const auto *member) -> std::uint64_t {
+        return static_cast<std::uint64_t>(
+            reinterpret_cast<const std::uint8_t *>(member) - base);
+    };
+    const auto linked = im2p::gemmini::compiled_args_layout_fingerprint();
+    return linked.size == sizeof(args) &&
+                   linked.native_weight_bytes == offset(&args.native_weight_bytes) &&
+                   linked.col_stride_f_out == offset(&args.col_stride_f_out) &&
+                   linked.stride_f_out == offset(&args.stride_f_out) &&
+                   linked.tile_i == offset(&args.tile_I)
+               ? 0
+               : 50;
 }
 ]=])
-    unset(_GGML_GEMMINI_IM2P_PROBE_COMPILED CACHE)
-    unset(_GGML_GEMMINI_IM2P_PROBE_RESULT CACHE)
-    try_run(_GGML_GEMMINI_IM2P_PROBE_RESULT _GGML_GEMMINI_IM2P_PROBE_COMPILED
-        "${CMAKE_CURRENT_BINARY_DIR}/im2p-build-contract-probe"
-        "${_GGML_GEMMINI_IM2P_PROBE_SOURCE}"
-        CMAKE_FLAGS "-DINCLUDE_DIRECTORIES=${IM2P_SIM_ROOT}/sim/include"
-        LINK_LIBRARIES "${GGML_GEMMINI_IM2P_SIM_ARCHIVE}"
-        RUN_OUTPUT_VARIABLE _GGML_GEMMINI_IM2P_IDENTITY)
-    if(NOT _GGML_GEMMINI_IM2P_PROBE_COMPILED)
+    file(READ "${_GGML_GEMMINI_IM2P_PAIR_PROBE_SOURCE}"
+        _GGML_GEMMINI_IM2P_PAIR_PROBE_CONTENT)
+    string(CONFIGURE "${_GGML_GEMMINI_IM2P_PAIR_PROBE_CONTENT}"
+        _GGML_GEMMINI_IM2P_PAIR_PROBE_CONTENT @ONLY)
+    file(WRITE "${_GGML_GEMMINI_IM2P_PAIR_PROBE_SOURCE}"
+        "${_GGML_GEMMINI_IM2P_PAIR_PROBE_CONTENT}")
+    set(_GGML_GEMMINI_IM2P_PAIR_PROBE_INCLUDES
+        "${CMAKE_CURRENT_BINARY_DIR}/generated"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-gemmini"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ggml/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-gemmini-utils/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/common"
+        "${GEMMINI_SW_PATH}"
+        "${GEMMINI_SW_PATH}/include"
+        "${IM2P_SIM_ROOT}/frontend/include"
+        "${IM2P_SIM_ROOT}/sim/include")
+    unset(_GGML_GEMMINI_IM2P_PAIR_PROBE_COMPILED CACHE)
+    unset(_GGML_GEMMINI_IM2P_PAIR_PROBE_RESULT CACHE)
+    try_run(_GGML_GEMMINI_IM2P_PAIR_PROBE_RESULT
+        _GGML_GEMMINI_IM2P_PAIR_PROBE_COMPILED
+        "${CMAKE_CURRENT_BINARY_DIR}/im2p-frontend-pair-probe"
+        SOURCES
+            "${_GGML_GEMMINI_IM2P_PAIR_PROBE_SOURCE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-gemmini-utils/src/optrace.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-gemmini-utils/src/debug.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-gemmini-utils/src/cycle.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-gemmini-utils/src/performance.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-gemmini-utils/src/trace-context.cpp"
+        CMAKE_FLAGS
+            "-DCMAKE_CXX_STANDARD=20"
+            "-DCMAKE_CXX_STANDARD_REQUIRED=ON"
+            "-DINCLUDE_DIRECTORIES=${_GGML_GEMMINI_IM2P_PAIR_PROBE_INCLUDES}"
+        COMPILE_DEFINITIONS
+            "-DGGML_GEMMINI_BLOCK_SIZE=${GGML_GEMMINI_BLOCK_SIZE}"
+            "-DGGML_GEMMINI_ACTIVATION_BITS=${GGML_GEMMINI_ACTIVATION_BITS}"
+            "-DGGML_GEMMINI_WEIGHT_BITS=${GGML_GEMMINI_WEIGHT_BITS}"
+        LINK_LIBRARIES
+            "${GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE}"
+            "${GGML_GEMMINI_IM2P_SIM_ARCHIVE}"
+            Threads::Threads
+            ${CMAKE_DL_LIBS}
+        RUN_OUTPUT_VARIABLE _GGML_GEMMINI_IM2P_IDENTITY
+        COMPILE_OUTPUT_VARIABLE _GGML_GEMMINI_IM2P_PAIR_PROBE_BUILD_OUTPUT)
+    if(NOT _GGML_GEMMINI_IM2P_PAIR_PROBE_COMPILED)
+        if(_GGML_GEMMINI_IM2P_PAIR_PROBE_BUILD_OUTPUT MATCHES
+           "im2p_poll_completed_extended")
+            message(FATAL_ERROR
+                "Incompatible IM2P pair: simulator archive is missing required symbol im2p_poll_completed_extended")
+        endif()
         message(FATAL_ERROR
-            "Unable to link the selected IM2P simulator archive for identity validation")
+            "Unable to link the selected IM2P frontend/simulator pair:\n${_GGML_GEMMINI_IM2P_PAIR_PROBE_BUILD_OUTPUT}")
     endif()
-    if(_GGML_GEMMINI_IM2P_PROBE_RESULT EQUAL 51)
+    if(_GGML_GEMMINI_IM2P_PAIR_PROBE_RESULT EQUAL 51)
         message(FATAL_ERROR "IM2P SCU numerical revision mismatch: header and archive differ")
     endif()
-    if(_GGML_GEMMINI_IM2P_PROBE_RESULT EQUAL 52)
+    if(_GGML_GEMMINI_IM2P_PAIR_PROBE_RESULT EQUAL 52)
         message(FATAL_ERROR "IM2P simulator implementation identity is missing")
     endif()
-    if(NOT _GGML_GEMMINI_IM2P_PROBE_RESULT EQUAL 0 OR
-       NOT _GGML_GEMMINI_IM2P_IDENTITY MATCHES "^([^;]+);([0-9]+);([0-9]+);([0-9]+);([0-9]+);([0-9]+);([0-9]+)$")
+    if(NOT _GGML_GEMMINI_IM2P_IDENTITY MATCHES
+       "^([^;]+);([0-9]+);([0-9]+);([0-9]+);([0-9]+);([0-9]+);([0-9]+)$")
         message(FATAL_ERROR "Malformed IM2P simulator identity '${_GGML_GEMMINI_IM2P_IDENTITY}'")
     endif()
     set(_GGML_GEMMINI_IM2P_IMPLEMENTATION "${CMAKE_MATCH_1}")
@@ -649,102 +726,20 @@ int main() {
         message(FATAL_ERROR
             "IM2P DIM mismatch: llama requests ${GGML_GEMMINI_DIM}, archive reports ${_GGML_GEMMINI_IM2P_DIM}")
     endif()
-
-    # The simulator queries above validate the Rust/RTL archive itself. Exercise
-    # the public frontend with that same archive to catch a stale frontend copied
-    # into a correctly named pair directory before any project target compiles.
-    find_package(Threads REQUIRED)
-    set(_GGML_GEMMINI_IM2P_PAIR_PROBE_SOURCE
-        "${CMAKE_CURRENT_BINARY_DIR}/im2p-frontend-pair-probe.cpp")
-    file(WRITE "${_GGML_GEMMINI_IM2P_PAIR_PROBE_SOURCE}" [=[
-#include "im2p_gemmini_frontend.hpp"
-#include "ggml-gemmini-args.h"
-#include <cstdint>
-int main() {
-    if (im2p_execute_matmul_extended(nullptr, nullptr, nullptr) !=
-        IM2P_INVALID_LAYOUT)
-        return 9;
-    if (im2p_begin_striped_matmul(nullptr, nullptr, nullptr) != IM2P_ERROR)
-        return 10;
-    if (im2p_publish_stripe(nullptr, nullptr) != IM2P_INVALID_LAYOUT)
-        return 11;
-    if (im2p::gemmini::compiled_activation_bits() !=
-        @GGML_GEMMINI_ACTIVATION_BITS@)
-        return 20;
-    if (im2p::gemmini::compiled_weight_bits() !=
-        @GGML_GEMMINI_WEIGHT_BITS@)
-        return 30;
-    if (im2p::gemmini::compiled_dim() != @GGML_GEMMINI_DIM@)
-        return 40;
-    ggml_gemmini_args_t args{};
-    const auto *base = reinterpret_cast<const std::uint8_t *>(&args);
-    const auto offset = [base](const auto *member) -> std::uint64_t {
-        return static_cast<std::uint64_t>(
-            reinterpret_cast<const std::uint8_t *>(member) - base);
-    };
-    const auto linked = im2p::gemmini::compiled_args_layout_fingerprint();
-    return linked.size == sizeof(args) &&
-                   linked.native_weight_bytes == offset(&args.native_weight_bytes) &&
-                   linked.col_stride_f_out == offset(&args.col_stride_f_out) &&
-                   linked.stride_f_out == offset(&args.stride_f_out) &&
-                   linked.tile_i == offset(&args.tile_I)
-               ? 0
-               : 50;
-}
-]=])
-    file(READ "${_GGML_GEMMINI_IM2P_PAIR_PROBE_SOURCE}"
-        _GGML_GEMMINI_IM2P_PAIR_PROBE_CONTENT)
-    string(CONFIGURE "${_GGML_GEMMINI_IM2P_PAIR_PROBE_CONTENT}"
-        _GGML_GEMMINI_IM2P_PAIR_PROBE_CONTENT @ONLY)
-    file(WRITE "${_GGML_GEMMINI_IM2P_PAIR_PROBE_SOURCE}"
-        "${_GGML_GEMMINI_IM2P_PAIR_PROBE_CONTENT}")
-    set(_GGML_GEMMINI_IM2P_PAIR_PROBE_INCLUDES
-        "${CMAKE_CURRENT_BINARY_DIR}/generated"
-        "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-gemmini"
-        "${CMAKE_CURRENT_SOURCE_DIR}/ggml/include"
-        "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src"
-        "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-gemmini-utils/include"
-        "${GEMMINI_SW_PATH}"
-        "${GEMMINI_SW_PATH}/include"
-        "${IM2P_SIM_ROOT}/frontend/include"
-        "${IM2P_SIM_ROOT}/sim/include")
-    unset(_GGML_GEMMINI_IM2P_PAIR_PROBE_COMPILED CACHE)
-    unset(_GGML_GEMMINI_IM2P_PAIR_PROBE_RESULT CACHE)
-    try_run(_GGML_GEMMINI_IM2P_PAIR_PROBE_RESULT
-        _GGML_GEMMINI_IM2P_PAIR_PROBE_COMPILED
-        "${CMAKE_CURRENT_BINARY_DIR}/im2p-frontend-pair-probe"
-        SOURCES
-            "${_GGML_GEMMINI_IM2P_PAIR_PROBE_SOURCE}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-gemmini-utils/src/optrace.cpp"
-            "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-gemmini-utils/src/debug.cpp"
-            "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-gemmini-utils/src/cycle.cpp"
-        CMAKE_FLAGS
-            "-DCMAKE_CXX_STANDARD=20"
-            "-DCMAKE_CXX_STANDARD_REQUIRED=ON"
-            "-DINCLUDE_DIRECTORIES=${_GGML_GEMMINI_IM2P_PAIR_PROBE_INCLUDES}"
-        COMPILE_DEFINITIONS
-            "-DGGML_GEMMINI_BLOCK_SIZE=${GGML_GEMMINI_BLOCK_SIZE}"
-            "-DGGML_GEMMINI_ACTIVATION_BITS=${GGML_GEMMINI_ACTIVATION_BITS}"
-            "-DGGML_GEMMINI_WEIGHT_BITS=${GGML_GEMMINI_WEIGHT_BITS}"
-        LINK_LIBRARIES
-            "${GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE}"
-            "${GGML_GEMMINI_IM2P_SIM_ARCHIVE}"
-            Threads::Threads
-            ${CMAKE_DL_LIBS}
-        COMPILE_OUTPUT_VARIABLE _GGML_GEMMINI_IM2P_PAIR_PROBE_BUILD_OUTPUT)
-    if(NOT _GGML_GEMMINI_IM2P_PAIR_PROBE_COMPILED)
-        if(_GGML_GEMMINI_IM2P_PAIR_PROBE_BUILD_OUTPUT MATCHES
-           "im2p_poll_completed_extended")
-            message(FATAL_ERROR
-                "Incompatible IM2P pair: simulator archive is missing required symbol im2p_poll_completed_extended")
-        endif()
-        message(FATAL_ERROR
-            "IM2P frontend args layout mismatch or incompatible pair: unable to link the selected frontend/simulator pair")
+    if(_GGML_GEMMINI_IM2P_PAIR_PROBE_RESULT EQUAL 20)
+        message(FATAL_ERROR "IM2P frontend activation width mismatch")
+    endif()
+    if(_GGML_GEMMINI_IM2P_PAIR_PROBE_RESULT EQUAL 30)
+        message(FATAL_ERROR "IM2P frontend weight width mismatch")
+    endif()
+    if(_GGML_GEMMINI_IM2P_PAIR_PROBE_RESULT EQUAL 40)
+        message(FATAL_ERROR "IM2P frontend DIM mismatch")
     endif()
     if(_GGML_GEMMINI_IM2P_PAIR_PROBE_RESULT EQUAL 50)
         message(FATAL_ERROR
             "IM2P frontend args layout mismatch for ${GGML_GEMMINI_IM2P_ARTIFACT_ID}; rebuild the selected frontend archive")
-    elseif(NOT _GGML_GEMMINI_IM2P_PAIR_PROBE_RESULT EQUAL 0)
+    endif()
+    if(NOT _GGML_GEMMINI_IM2P_PAIR_PROBE_RESULT EQUAL 0)
         message(FATAL_ERROR
             "IM2P frontend configuration mismatch for ${GGML_GEMMINI_IM2P_ARTIFACT_ID} (probe result ${_GGML_GEMMINI_IM2P_PAIR_PROBE_RESULT})")
     endif()

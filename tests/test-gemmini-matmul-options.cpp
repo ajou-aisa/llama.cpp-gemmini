@@ -165,15 +165,30 @@ bool test_args_layout_extension() {
     const auto offset = [base](const auto * member) {
         return static_cast<size_t>(reinterpret_cast<const uint8_t *>(member) - base);
     };
+    const auto follows = [&](const auto * previous, const auto * member) {
+        using Previous = std::remove_cv_t<std::remove_reference_t<decltype(*previous)>>;
+        using Member = std::remove_cv_t<std::remove_reference_t<decltype(*member)>>;
+        const size_t end = offset(previous) + sizeof(Previous);
+        const size_t alignment = alignof(Member);
+        return offset(member) == (end + alignment - 1) / alignment * alignment;
+    };
 
-    return check(sizeof(args) > 1032, "owned semantic layer increases args size") &&
-        check(offset(&args.native_weight_bytes) == 848,
-              "native_weight_bytes offset remains unchanged") &&
-        check(offset(&args.col_stride_f_out) == 952,
-              "col_stride_f_out offset remains unchanged") &&
-        check(offset(&args.stride_f_out) == 960,
-              "stride_f_out offset remains unchanged") &&
-        check(offset(&args.tile_I) == 984, "tile_I offset remains unchanged");
+    // act_quant contains a C++ variant whose size changes with its alternatives
+    // and standard library. Historical absolute offsets are not a portable ABI.
+    // The linked IM2P frontend is still checked against its compiled fingerprint
+    // by CMake's frontend-pair probe; this test checks the append-only tail here.
+    return check(follows(&args.native_blocks_per_row, &args.native_weight_bytes),
+                 "native weight extent immediately follows its block geometry") &&
+        check(follows(&args.f_out, &args.col_stride_f_out),
+              "column stride immediately follows the output buffer") &&
+        check(follows(&args.col_stride_f_out, &args.stride_f_out),
+              "row stride immediately follows column stride") &&
+        check(follows(&args.model_arch, &args.tile_I),
+              "tile geometry immediately follows model architecture") &&
+        check(offset(&args.matmul_layer) >= offset(&args.tile_K) + sizeof(args.tile_K),
+              "owned semantic layer remains after the existing transport fields") &&
+        check(sizeof(args) >= offset(&args.matmul_layer) + sizeof(args.matmul_layer),
+              "args contains the complete owned semantic layer");
 }
 
 ggml_gemmini_args_t make_args(std::vector<elem_t> & activation,

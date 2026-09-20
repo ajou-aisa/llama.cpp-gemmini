@@ -245,13 +245,16 @@ struct MatmulCpuInterval {
 struct MatmulCpuSample {
     uint64_t value = 0;
     bool collected = false;
+    log::CpuExclusionSnapshot exclusion{};
+    log::CpuCorrelation correlation{};
 #if defined(__linux__) && defined(__aarch64__)
     cycle::NativeCycleSample native;
 #endif
     uint64_t ns = 0;
     uint64_t tid = 0;
-    log::CpuExclusionSnapshot exclusion{};
-    log::CpuCorrelation correlation{};
+    uint64_t thread_cpu_ns = 0;
+    bool thread_cpu_valid = false;
+    gemmini_trace_context trace{};
 };
 
 inline MatmulCpuSample read_matmul_cpu_sample() {
@@ -262,14 +265,23 @@ inline MatmulCpuSample read_matmul_cpu_sample() {
 #endif
 #if LOG_CYCLE
     result.collected = true;
+    result.trace = gemmini_trace_capture();
 #if defined(__linux__) && defined(__aarch64__)
     result.native = cycle::read_sample();
     result.value = result.native.value;
 #else
     result.value = cycle::read();
 #endif
-    result.ns = cycle::timestamp_ns();
+#if CYCLE_DETAIL
+    const auto host = cycle::read_host_sample();
+    result.ns = host.ns;
+    result.tid = host.tid;
+    result.thread_cpu_ns = host.thread_cpu_ns;
+    result.thread_cpu_valid = host.thread_cpu_valid;
+#else
+    result.ns = cycle::timeline_now_ns();
     result.tid = cycle::host_thread_id();
+#endif
 #endif
     return result;
 }
@@ -278,11 +290,10 @@ inline MatmulCpuInterval evaluate_matmul_cpu_interval(
         const MatmulCpuSample & start, const MatmulCpuSample & end,
         bool same_task = true) {
     if (!start.collected || !end.collected) return {};
-#if CYCLE_SIM
-    if (start.exclusion.active || end.exclusion.active ||
-            start.exclusion.epoch != end.exclusion.epoch)
-        return MatmulCpuInterval::unavailable("functional_emulation");
-#endif
+    if (const char *excluded = log::cpu_exclusion_since(start.exclusion))
+        return MatmulCpuInterval::unavailable(excluded);
+    if (start.trace.task_id && end.trace.task_id && start.trace.task_id != end.trace.task_id)
+        return MatmulCpuInterval::unavailable("structurally_cross_task");
 #if defined(__linux__) && defined(__aarch64__)
     const auto delta = cycle::evaluate_interval(start.native, end.native, same_task);
     if (!delta.valid) {
@@ -384,6 +395,8 @@ struct MatmulJobMetrics {
     uint64_t backend_end_tid = 0;
     uint64_t merge_start_ns = 0;
     uint64_t merge_end_ns = 0;
+    uint64_t merge_start_tid = 0;
+    uint64_t merge_end_tid = 0;
     uint64_t finalize_start_ns = 0;
     uint64_t finalize_end_ns = 0;
     uint64_t finalize_start_tid = 0;
@@ -397,10 +410,6 @@ struct MatmulJobMetrics {
     uint64_t telemetry_merge_start = 0;
     uint64_t telemetry_merge_end = 0;
     uint64_t telemetry_residual_end = 0;
-#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
-    cycle::NativeCycleSample telemetry_finalize_start_sample;
-    cycle::NativeCycleSample telemetry_finalize_end_sample;
-#endif
     std::string telemetry_input_hash;
     std::string telemetry_correction_hash;
     uint64_t telemetry_correction_nonzero_count = 0;
@@ -424,6 +433,7 @@ struct MatmulCaptureTiming {
 };
 
 struct MatmulCapturedStripe {
+    gemmini_trace_context trace_origin{};
     uint32_t cpu_identity_mask = 0;
     uint64_t run_id = 0;
     size_t stripe_id = 0;

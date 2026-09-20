@@ -331,6 +331,10 @@ namespace ggml::gemmini::quants::act::exsia
 
         BitMask outlier_mask; // bitmask indicating outlier positions in a stripe
         StripeScratch scratch;
+#if EXSIA_STAGE_PROFILE_ENABLED
+        uint64_t selected_positions = 0; // final logical mask positions, including zero residuals
+        uint64_t residual_nnz = 0;
+#endif
 
         size_t row_count() const
         {
@@ -405,6 +409,9 @@ namespace ggml::gemmini::quants::act::exsia
 #if CYCLE_SIM
         std::vector<uint64_t> cycle_sim_host_dependencies{};
 #endif
+        // The synchronous sink reports queue-capacity wait; null means it is not instrumented.
+        bool collect_submission_timing = false;
+        mutable std::optional<uint64_t> submission_wait_ns;
     };
 
     struct StripeReadySink
@@ -510,6 +517,7 @@ namespace ggml::gemmini::quants::act::exsia
         uint64_t p1 = 0;
         uint64_t p2 = 0;
         uint64_t p3 = 0;
+        uint64_t forced_recompute_count = 0;
 #if defined(__linux__) && defined(__aarch64__)
         std::array<ggml::gemmini::cycle::NativeCycleSample, 5> stage_endpoints{};
         std::array<ProfileCycleValue, 4> stage_intervals{};
@@ -540,6 +548,7 @@ namespace ggml::gemmini::quants::act::exsia
         StageCycleStats p1;
         StageCycleStats p2;
         StageCycleStats p3;
+        uint64_t forced_recompute_count = 0;
 #endif
         uint64_t p3_bypass_no_int_count = 0;
         uint64_t p3_bypass_same_scale_count = 0;
@@ -552,6 +561,7 @@ namespace ggml::gemmini::quants::act::exsia
             p1.reset();
             p2.reset();
             p3.reset();
+            forced_recompute_count = 0;
 #endif
             p3_bypass_no_int_count = 0;
             p3_bypass_same_scale_count = 0;
@@ -606,6 +616,8 @@ namespace ggml::gemmini::quants::act::exsia
         size_t team_size = 1;
 #if EXSIA_STAGE_PROFILE_ENABLED
         StripeCycleStats stats;
+        uint64_t selected_positions = 0;
+        uint64_t residual_nnz = 0;
 #endif
     };
 
@@ -1105,6 +1117,8 @@ namespace ggml::gemmini::quants::act::exsia
     class LocalStage
     {
     public:
+        // Ablation regenerates final codes after the unchanged selection and scale decisions.
+        void set_force_recompute(bool enabled) { force_recompute_ = enabled; }
         // q_out addresses one caller-owned, block-disjoint slot q_wide range and never aliases x.
         bool run_optimized(
             Meta &meta,
@@ -1174,6 +1188,7 @@ namespace ggml::gemmini::quants::act::exsia
         ExpScanner unit_exp_;
         WideQuantizer unit_quant_;
         SigmaDetector unit_sigma_;
+        bool force_recompute_ = false;
     };
 
     class StripeFolding

@@ -64,7 +64,8 @@ function(require_token value token label)
 endfunction()
 
 function(require_checked_publication value operation operation_success label)
-    require_count("${value}" "emit_matmul_native_interval" 1 "${label} one publication")
+    require_count("${value}" "finalize_start, finalize_end, ${operation_success}" 1
+        "${label} one publication of its own endpoints")
     require_token("${value}" "${operation}" "${label} operation ID")
     require_token("${value}" "${operation_success}" "${label} separate algorithm result")
     require_absent("${value}" "gemmini_log_cycle_record_v2_checked_internal"
@@ -72,17 +73,16 @@ function(require_checked_publication value operation operation_success label)
 endfunction()
 
 function(require_run_only_checked_pair value operation target label)
-    require_count("${value}" "cycle::read_sample()" 2 "${label} native endpoints")
-    require_count("${value}" "emit_matmul_native_interval" 1
+    require_count("${value}" "read_matmul_cpu_sample()" 2 "${label} CPU endpoints")
+    require_count("${value}" "emit_matmul_cpu_interval" 1
         "${label} checked publication")
     require_count("${value}" "\"${operation}\"" 1 "${label} operation label")
     require_order("${value}" "${label} exact boundary"
-        "cycle::read_sample()" "${target}" "commit_end_sample = cycle::read_sample()"
-        "emit_matmul_native_interval")
+        "commit_start = read_matmul_cpu_sample()" "${target}"
+        "commit_end = read_matmul_cpu_sample()" "emit_matmul_cpu_interval")
     foreach(token IN ITEMS "args().matmul_layer.c_str()" "matmul_cpu_run_id(args())"
-                           "commit_start_sample, commit_end_sample"
-                           "commit_start_ns, commit_end_ns, commit_start_tid, commit_end_tid"
-                           "true, nullptr, matmul_cpu_run_id(args())")
+                           "commit_start, commit_end"
+                           "true, nullptr, nullptr, matmul_cpu_run_id(args())")
         require_token("${value}" "${token}" "${label} publication contract")
     endforeach()
     foreach(token IN ITEMS GEMMINI_CYCLE_HAS_STRIPE_ID
@@ -91,15 +91,6 @@ function(require_run_only_checked_pair value operation target label)
                            "cycle::read()" "gemmini_log_cycle_record_v2_checked_internal")
         require_absent("${value}" "${token}" "${label} synthetic identity/domain")
     endforeach()
-endfunction()
-
-function(require_native_detail_gate value label)
-    require_token("${value}"
-        "#if LOG_CYCLE && CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)"
-        "${label} native reads require enabled detail collection")
-    require_absent("${value}"
-        "#if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)"
-        "${label} OFF cannot bypass the collection gate")
 endfunction()
 
 extract_between(commit "void MatMul::commit_output_transaction" "void MatMul::discard_output_transaction")
@@ -128,25 +119,29 @@ if(direct_begin EQUAL -1 OR packet_begin EQUAL -1 OR packet_begin LESS_EQUAL dir
 endif()
 math(EXPR direct_length "${packet_begin} - ${direct_begin}")
 string(SUBSTRING "${run_full}" ${direct_begin} ${direct_length} direct_full)
-require_count("${direct_full}" "cycle::read_sample()" 2 "one legacy FULL Merge pair")
+require_count("${direct_full}" "merge_start = read_matmul_cpu_sample()" 1 "one FULL Merge start")
+require_count("${direct_full}" "merge_end = read_matmul_cpu_sample()" 1 "one FULL Merge end")
 require_count("${direct_full}" "\"rmd_merge_cycles\"" 1 "one legacy FULL Merge label")
 require_order("${direct_full}" "U12 success-only callsite guard"
     "if (residual_status == rmd::RmdStatus::success)"
-    "merge_start_sample = cycle::read_sample()" "rmd::merge_rmd_correction"
-    "merge_end_sample = cycle::read_sample()"
-    "emit_matmul_native_interval"
+    "merge_start = read_matmul_cpu_sample()" "rmd::merge_rmd_correction"
+    "merge_end = read_matmul_cpu_sample()"
+    "\"rmd_merge_cycles\""
     "if (residual_status != rmd::RmdStatus::success)")
+require_token("${direct_full}" "merge_start, merge_end, residual_status == rmd::RmdStatus::success"
+    "FULL Merge preserves endpoints and independent operation success")
+require_token("${direct_full}" "nullptr, nullptr, run_id" "FULL Merge preserves run identity")
 require_absent("${finalize}" "\"rmd_merge_cycles\""
     "U12 must not duplicate stripe finalize Merge")
 
-# U14 and U15 retain the origin/develop direct finite checks. Only U12 owns
-# native sample endpoints in run_full; finish_stripes owns none.
+# U14 and U15 retain the origin/develop direct finite checks. Native reads
+# belong to the shared sample reader, never a second callsite-only pair.
 require_count("${source}" "\"matmul_finite_output_validate_cycles\"" 0
     "U14/U15 finite validation label/site count")
 require_count("${source}" "if (!finite_output(args()))" 2
     "U14/U15 direct finite validation count")
-require_count("${run_full}" "cycle::read_sample()" 2
-    "run_full U12-only native endpoints")
+require_count("${run_full}" "cycle::read_sample()" 0
+    "run_full never duplicates shared native reads")
 require_count("${finish_stripes}" "cycle::read_sample()" 0
     "finish-stripes native endpoints")
 
@@ -178,14 +173,11 @@ require_run_only_checked_pair("${commit}" "matmul_output_commit_cycles"
     "for (size_t row = 0; row < args().I; ++row)" "U16 output commit copy")
 require_order("${commit}" "U16 success-only commit boundary"
     "if (output_destination_ == nullptr || args_ptr_ == nullptr) return"
-    "commit_start_sample = cycle::read_sample()"
-    "commit_start_ns = cycle::timestamp_ns()" "commit_start_tid = cycle::host_thread_id()"
+    "commit_start = read_matmul_cpu_sample()"
     "for (size_t row = 0; row < args().I; ++row)"
-    "commit_end_sample = cycle::read_sample()"
-    "commit_end_ns = cycle::timestamp_ns()" "commit_end_tid = cycle::host_thread_id()"
-    "emit_matmul_native_interval"
+    "commit_end = read_matmul_cpu_sample()" "emit_matmul_cpu_interval"
     "args().f_out = output_destination_")
-require_native_detail_gate("${commit}" "U16")
+require_absent("${commit}" "CYCLE_DETAIL" "U16 raw intervals survive DETAIL=0")
 require_count("${source}" "\"rmd_merge_cycles\"" 1 "exact U12 label/site count")
 require_count("${source}" "\"matmul_output_commit_cycles\"" 1
     "exact U16 label/site count")
@@ -193,7 +185,7 @@ require_count("${source}" "\"matmul_output_commit_cycles\"" 1
 require_absent("${source}" "rmd::CompressedOutput" "production stages final corrections")
 require_absent("${source}" "rmd::compose_rmd_output" "composition is fused into executor")
 require_absent("${compose}" "cycle::read_sample()" "lifecycle completion has no synthetic Compose pair")
-require_absent("${compose}" "emit_matmul_native_interval" "fused Compose belongs to backend interval")
+require_absent("${compose}" "emit_matmul_cpu_interval" "fused Compose belongs to backend interval")
 require_order("${compose}" "Compose requires a published correction even for empty packets"
     "std::lock_guard<std::mutex> lock" "!job.rmd_correction_ready_"
     "return invalid_state(\"compose requires" "job.residual_state_ = MatmulResidualState::complete"
@@ -201,13 +193,13 @@ require_order("${compose}" "Compose requires a published correction even for emp
 
 # Keep one legacy inclusive Finalize pair. Its checked children are never
 # added to or subtracted from their inclusive parent.
-require_count("${finalize}" "cycle::read_sample()" 2 "one full Finalize native pair")
-require_count("${finalize}" "telemetry_finalize_start_sample = cycle::read_sample()" 1 "Finalize start")
-require_count("${finalize}" "telemetry_finalize_end_sample = cycle::read_sample()" 1 "Finalize end")
+require_count("${finalize}" "cycle::read_sample()" 0 "Finalize never duplicates shared native reads")
+require_count("${finalize}" "finalize_start = read_matmul_cpu_sample()" 1 "Finalize start")
+require_count("${finalize}" "finalize_end = read_matmul_cpu_sample()" 1 "Finalize end")
 require_count("${finalize}" "merge_start = read_matmul_cpu_sample()" 1 "checked Merge start")
 require_count("${finalize}" "merge_end = read_matmul_cpu_sample()" 1 "checked Merge end")
 require_order("${finalize}" "Finalize contains Merge/diagnostics, not completion"
-    "telemetry_finalize_start_sample = cycle::read_sample()"
+    "finalize_start = read_matmul_cpu_sample()"
     "merge_start = read_matmul_cpu_sample()" "rmd::merge_rmd_correction"
     "merge_end = read_matmul_cpu_sample()"
     "stats_start = read_matmul_cpu_sample()"
@@ -216,7 +208,7 @@ require_order("${finalize}" "Finalize contains Merge/diagnostics, not completion
     "stats_end = read_matmul_cpu_sample()"
     "matmul_telemetry_hash_enabled()" "hash_start = read_matmul_cpu_sample()"
     "rmd_input_hash" "hash_end = read_matmul_cpu_sample()"
-    "telemetry_finalize_end_sample = cycle::read_sample()"
+    "finalize_end = read_matmul_cpu_sample()"
     "completion_start = read_matmul_cpu_sample()" "finalized_rows_ +="
     "job.release_slot()" "completion_end = read_matmul_cpu_sample()")
 foreach(token IN ITEMS cpu_work CpuWorkCoverage additive profiled_stripe checked_sum
@@ -231,14 +223,13 @@ require_absent("${finalize}" "telemetry_residual_end_sample = cycle::read_sample
     "Finalize has no third residual-total endpoint")
 require_checked_publication("${finalize}" "finalize" "merge_failure.ok()" "Finalize")
 require_order("${finalize}" "Finalize captures host endpoints before publication"
-    "finalize_start_ns = now_ns()" "finalize_start_tid = cycle::host_thread_id()"
-    "merge_start = read_matmul_cpu_sample()" "finalize_end_ns = now_ns()"
-    "finalize_end_tid = cycle::host_thread_id()" "emit_matmul_native_interval")
-require_token("${finalize}" "job.metrics_.finalize_start_ns, job.metrics_.finalize_end_ns"
-    "Finalize publishes captured host ns")
-require_token("${finalize}" "job.metrics_.finalize_start_tid, job.metrics_.finalize_end_tid"
-    "Finalize publishes executing thread identity")
-require_native_detail_gate("${finalize}" "Finalize")
+    "finalize_start_ns = finalize_start.ns" "finalize_start_tid = finalize_start.tid"
+    "merge_start = read_matmul_cpu_sample()" "finalize_end_ns = finalize_end.ns"
+    "finalize_end_tid = finalize_end.tid" "emit_matmul_cpu_interval")
+require_token("${finalize}" "finalize_start, finalize_end, merge_failure.ok(), &completion_context"
+    "Finalize publishes captured CPU/host endpoints and stripe identity")
+require_absent("${finalize}" "#if LOG_CYCLE && CYCLE_DETAIL"
+    "Finalize raw intervals survive DETAIL=0")
 
 extract_between(dense "MatmulStatus execute_dense_stripe" "MatmulStatus accept_external_dense_completion")
 extract_between(external "MatmulStatus accept_external_dense_completion" "MatmulStatus execute_rmd_stripe")
@@ -285,9 +276,9 @@ require_token("${source}" "rmd_correction_ready_ = other.rmd_correction_ready_" 
 require_order("${header}" "reader collection gate"
     "inline MatmulCpuSample read_matmul_cpu_sample()" "#if LOG_CYCLE"
     "result.collected = true" "result.native = cycle::read_sample()")
-extract_between(emitter "void emit_matmul_cpu_interval" "void emit_matmul_native_interval")
+extract_between(emitter "void emit_matmul_cpu_interval" "class ProofHash64")
 require_order("${emitter}" "nonthrowing CPU telemetry boundary"
-    "noexcept" "try {" "project_matmul_cpu_identity"
+    "noexcept" "#if LOG_CYCLE" "try {" "project_matmul_cpu_identity"
     "log::cycle.write_json" "serialize_matmul_cpu_interval" "catch (...)"
     "log::cycle.report_failure")
 file(READ "${gemmini_source_dir}/ggml-gemmini-im2p.cpp" im2p)
@@ -295,13 +286,29 @@ require_absent("${im2p}" "rmd::CompressedOutput" "IM2P stages final corrections"
 require_absent("${im2p}" "rmd::compose_rmd_output" "IM2P reconstruction belongs to backend interval")
 require_count("${im2p}" "if (failure == TestFailure::compose)" 2
     "FULL and PIPELINE preserve compose failure injection before merge")
-require_order("${im2p}" "IM2P retains its measurement and failure boundary"
+# Restrict this assertion to HostCpuInterval: unrelated upstream callbacks may
+# contain their own try/catch before this class in the translation unit.
+string(FIND "${im2p}" "class HostCpuInterval {" im2p_host_begin)
+string(FIND "${im2p}" "::im2p::gemmini::Status to_frontend_status" im2p_host_end)
+if(im2p_host_begin EQUAL -1 OR im2p_host_end LESS_EQUAL im2p_host_begin)
+    message(FATAL_ERROR "Cannot locate the actual IM2P host interval class")
+endif()
+math(EXPR im2p_host_length "${im2p_host_end} - ${im2p_host_begin}")
+string(SUBSTRING "${im2p}" ${im2p_host_begin} ${im2p_host_length} im2p_host_interval)
+string(FIND "${im2p_host_interval}" "void finish(" im2p_finish_begin)
+string(FIND "${im2p_host_interval}" "private:" im2p_finish_end)
+if(im2p_finish_begin EQUAL -1 OR im2p_finish_end LESS_EQUAL im2p_finish_begin)
+    message(FATAL_ERROR "Cannot locate the actual IM2P host interval finish boundary")
+endif()
+math(EXPR im2p_finish_length "${im2p_finish_end} - ${im2p_finish_begin}")
+string(SUBSTRING "${im2p_host_interval}" ${im2p_finish_begin} ${im2p_finish_length} im2p_finish)
+require_order("${im2p_finish}" "IM2P retains its measurement and failure boundary"
     "void finish(" "const auto end = read_matmul_cpu_sample()" "active_ = false"
     "try {" "log::cycle.write_json" "serialize_matmul_cpu_interval"
-    "record_, start_, end, operation_success" "catch (...)" "log::cycle.report_failure")
-extract_between(native_adapter "void emit_matmul_native_interval" "class ProofHash64")
-require_token("${native_adapter}" "{start.value, true, start, start_ns, start_tid}"
-    "native adapter preserves CPU sample and host start independently")
-require_token("${native_adapter}" "{end.value, true, end, end_ns, end_tid}"
-    "native adapter preserves CPU sample and host end independently")
+    "record_, start_, end," "catch (...)" "log::cycle.report_failure")
+require_absent("${emitter}" "CYCLE_DETAIL" "raw CPU logging survives DETAIL=0")
+require_order("${header}" "one native sample plus host and thread CPU snapshot"
+    "result.native = cycle::read_sample()" "const auto host = cycle::read_host_sample()"
+    "result.ns = host.ns" "result.tid = host.tid"
+    "result.thread_cpu_ns = host.thread_cpu_ns" "result.thread_cpu_valid = host.thread_cpu_valid")
 message(STATUS "checked CPU validity, identity presence, and lifecycle boundaries passed")

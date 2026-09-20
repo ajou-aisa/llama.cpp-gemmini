@@ -14,6 +14,8 @@ int gemmini_log_c_boundary_call(int operation, const char * path) {
         case 4: gemmini_log_debug_to(gemmini_log_file(path), "c-target-format-%d", 4); return 1;
         case 5: gemmini_log_debug_to_layer(gemmini_log_file(path), "c-layer", "c-target-layer-%d", 5); return 1;
         case 6: gemmini_log_debug_to_loc(gemmini_log_file(path), "c-file", 6, "c-func", "c-target-loc-%d", 6); return 1;
+        case 7: gemmini_log_cycle_set_buffered(1); return 1;
+        case 8: return gemmini_log_cycle_flush();
         default: return 0;
     }
 }

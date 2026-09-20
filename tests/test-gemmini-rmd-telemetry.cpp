@@ -1,6 +1,6 @@
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-matmul.hpp"
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-telemetry.hpp"
-#if !defined(GGML_GEMMINI_REDUCER_TEST_ONLY)
+#if !defined(GGML_GEMMINI_REDUCER_TEST_ONLY) && defined(GGML_GEMMINI_TELEMETRY_HAS_IM2P)
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-im2p.hpp"
 #include "im2p_gemmini_frontend.hpp"
 #endif
@@ -23,6 +23,88 @@ namespace {
 bool expect(bool condition, const char * message) {
     if (!condition) std::fprintf(stderr, "FAIL: %s\n", message);
     return condition;
+}
+bool provider_diagnostic_fixtures() {
+    Im2pExecutionTelemetry device;
+    device.backend = "im2p_sim";
+    device.clock_domain = "dense_simulator";
+    device.numerical_contract = "main_external";
+    device.scale_mode = "external_block_scale";
+    auto &stats = device.provider_stats.emplace();
+    stats.rtl_work_total_cycles = device.rtl_work_total_cycles = UINT64_C(9007199254740993);
+    stats.rtl_scale_wait_cycles = 17;
+    stats.rtl_same_block_scale_hits = 23;
+    const auto simulator = serialize_cycle_telemetry(device);
+    device.backend = "im2p_uart_test";
+    device.counter_coverage = Im2pExecutionTelemetry::CounterCoverage::fpga_basic;
+    const auto uart4 = serialize_cycle_telemetry(device);
+    device.counter_coverage = Im2pExecutionTelemetry::CounterCoverage::fpga_wait_overlap;
+    const auto uart3 = serialize_cycle_telemetry(device);
+    rmd::RmdExecutionMetrics metrics;
+    metrics.residual_observations_valid = true;
+    metrics.original_rows = metrics.original_rows_after_pruning = 2;
+    RmdStripeTelemetry stripe;
+    stripe.layer = "layer\"escaped";
+    stripe.run_id = 0; stripe.slot = 0; stripe.stripe_id = 1;
+    stripe.row_begin = 2; stripe.row_end = 4;
+    stripe.backend = "none"; stripe.success = true; stripe.metrics = &metrics;
+    const auto empty = serialize_cycle_telemetry(stripe);
+    metrics.residual_nnz = 2;
+    metrics.residual_min = INT32_MIN;
+    metrics.residual_max = INT32_MAX;
+    metrics.required_planes = 5;
+    metrics.digit_nnz = 7;
+    auto &stage = metrics.host_stages[static_cast<size_t>(rmd::RmdHostStage::weight_gather)];
+    stage.calls = 1; stage.wall_ns = 19; stage.cpu.interval_count = 1;
+    stage.cpu.cycles = 31; stage.cpu.cycles_valid_count = 1;
+    stage.cpu.thread_cpu_ns = 13; stage.cpu.thread_cpu_valid_count = 1;
+    const auto nonzero = serialize_cycle_telemetry(stripe);
+    metrics.residual_observations_valid = false;
+    const auto unobserved = serialize_cycle_telemetry(stripe);
+    stripe.backend = "cpu_direct";
+    const auto direct = serialize_cycle_telemetry(stripe);
+#if !LOG_CYCLE
+    return expect(simulator.empty() && uart4.empty() && uart3.empty() && empty.empty() &&
+                  nonzero.empty() && unobserved.empty() && direct.empty(), "OFF suppresses provider and residual diagnostics");
+#else
+    if (std::getenv("GEMMINI_TELEMETRY_PRINT_ALL"))
+        std::printf("%s\n%s\n%s\n%s\n", simulator.c_str(), uart4.c_str(), empty.c_str(), nonzero.c_str());
+    return expect(simulator.find("\"rtl_work_total_cycles\":9007199254740993") != std::string::npos &&
+                  simulator.find("\"rtl_scale_wait_cycles\":17") != std::string::npos &&
+                  simulator.find("\"rtl_same_block_scale_hits\":23") != std::string::npos &&
+                  simulator.find("\"counter_semantics\":\"independent_observations\"") != std::string::npos,
+                  "provider diagnostics preserve exact counters and nonadditive semantics") &&
+        expect(uart4.find("\"rtl_overlap_cycles\":null,\"rtl_overlap_cycles_reason\":\"provider_counter_unavailable\"") != std::string::npos &&
+               uart4.find("\"rtl_stripe_host_wait_cycles\":null") != std::string::npos &&
+               uart4.find("\"rtl_activation_read_requests\":0") != std::string::npos &&
+               uart3.find("\"rtl_overlap_cycles\":0") != std::string::npos,
+               "IFR4 unavailable counters differ from supported measured zero") &&
+        expect(empty.find("\"run_id\":0,\"stripe_id\":1,\"slot\":0") != std::string::npos &&
+               empty.find("\"residual_nnz\":0") != std::string::npos &&
+               empty.find("\"residual_min\":null,\"residual_min_reason\":\"no_nonzero_residual\"") != std::string::npos &&
+               empty.find("\"native_cycles\":null,\"native_cycles_valid\":false,\"native_cycles_reason\":\"no_samples\"") != std::string::npos,
+               "empty residual is a valid observed zero with absent native samples") &&
+#if CYCLE_DETAIL
+        expect(empty.find("\"wall_ns\":null,\"wall_ns_valid\":false,\"wall_ns_reason\":\"no_samples\"") != std::string::npos,
+
+               "detail empty stages preserve absent wall samples") &&
+        expect(nonzero.find("\"wall_ns\":19,\"wall_ns_valid\":true") != std::string::npos,
+               "detail stages retain measured wall time") &&
+#else
+        expect(empty.find("\"wall_ns\"") == std::string::npos &&
+               nonzero.find("\"wall_ns\"") == std::string::npos &&
+               nonzero.find("\"thread_cpu_ns\"") == std::string::npos,
+               "compact diagnostic stages omit detail-only timing fields") &&
+#endif
+        expect(nonzero.find("\"residual_min\":-2147483648,\"residual_max\":2147483647") != std::string::npos &&
+               nonzero.find("\"required_planes\":5") != std::string::npos &&
+               nonzero.find("\"native_cycles\":31,\"native_cycles_valid\":true") != std::string::npos &&
+               unobserved.find("\"required_planes\":null,\"required_planes_reason\":\"input_observation_unavailable\"") != std::string::npos,
+               "signed INT32 observations and sampled stage counters retain exact values and validity") &&
+        expect(direct.find("\"useful_digit_macs\":null,\"useful_digit_macs_reason\":\"not_applicable_cpu_direct\"") != std::string::npos &&
+               direct.find("\"issued_mac_capacity\":0") != std::string::npos,
+               "CPU direct has no executed radix digits or dispatched device tiles");
+#endif
 }
 #if !defined(GGML_GEMMINI_REDUCER_TEST_ONLY)
 RmdTelemetryRecord cpu_record() {
@@ -81,8 +163,16 @@ bool cpu_identity_projection_regression() {
     MatmulJobMetrics manual;
     manual.cpu_identity_mask = GEMMINI_CYCLE_HAS_STRIPE_ID;
     manual.stripe_id = 3;
+#if CYCLE_DETAIL
     ok = expect(projected(&manual).find("\"run_id\":null,\"stripe_id\":3,\"slot\":null") != std::string::npos,
                 "manual capture has an actual stripe but no invented run or slot") && ok;
+#else
+    const auto manual_json = projected(&manual);
+    ok = expect(manual_json.find("\"stripe_id\":3") != std::string::npos &&
+                    manual_json.find("\"run_id\"") == std::string::npos &&
+                    manual_json.find("\"slot\"") == std::string::npos,
+                "manual capture has an actual stripe but no invented run or slot") && ok;
+#endif
     zero.run_id = 91;
     ok = expect(projected(&zero).find("\"run_id\":91,\"stripe_id\":3,\"slot\":0") != std::string::npos,
                 "present nonzero run identity survives the same projection") && ok;
@@ -91,14 +181,29 @@ bool cpu_identity_projection_regression() {
     for (uint64_t run_id : {uint64_t{0}, uint64_t{91}}) {
         meta.run_id = run_id;
         const auto full = projected(nullptr, matmul_cpu_run_id(args));
+#if CYCLE_DETAIL
         ok = expect(full.find("\"run_id\":" + std::to_string(run_id) +
                               ",\"stripe_id\":null,\"slot\":null") != std::string::npos,
                     "FULL uses optional metadata run only, including zero") && ok;
+#else
+        ok = expect(full.find("\"run_id\":" + std::to_string(run_id)) != std::string::npos &&
+                        full.find("\"stripe_id\"") == std::string::npos &&
+                        full.find("\"slot\"") == std::string::npos,
+                    "FULL uses optional metadata run only, including zero") && ok;
+#endif
     }
     meta.run_id.reset();
+#if CYCLE_DETAIL
     ok = expect(projected(nullptr, matmul_cpu_run_id(args)).find(
                     "\"run_id\":null,\"stripe_id\":null,\"slot\":null") != std::string::npos,
                 "absent ExSIA run metadata stays absent") && ok;
+#else
+    const auto absent_json = projected(nullptr, matmul_cpu_run_id(args));
+    ok = expect(absent_json.find("\"run_id\"") == std::string::npos &&
+                    absent_json.find("\"stripe_id\"") == std::string::npos &&
+                    absent_json.find("\"slot\"") == std::string::npos,
+                "absent ExSIA run metadata stays absent") && ok;
+#endif
     args.act_quant.storage().emplace<quants::act::tensor::Meta>();
     ok = expect(!matmul_cpu_run_id(args).has_value(), "non-ExSIA metadata invents no run") && ok;
     quants::act::exsia::StripeReadyEvent event{};
@@ -214,7 +319,7 @@ bool reducer_validity_regression() {
 
 #if defined(GGML_GEMMINI_REDUCER_TEST_ONLY)
 }
-int main() { return cpu_identity_projection_regression() && reducer_validity_regression() ? 0 : 1; }
+int main() { return provider_diagnostic_fixtures() && cpu_identity_projection_regression() && reducer_validity_regression() ? 0 : 1; }
 #else
 bool aggregate_serializer_fixtures() {
     static_assert(std::is_same_v<decltype(WsLoopTelemetry::load_occupancy_cycles), std::uint32_t>);
@@ -228,6 +333,7 @@ bool aggregate_serializer_fixtures() {
     interval.layer = "ffn\"norm"; interval.op = "dense";
     interval.start = 10; interval.end = 34;
     const std::string interval_json = serialize_cycle_telemetry(interval);
+#if CYCLE_DETAIL
     const std::string expected_interval =
         "{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"CYCLE_INTERVAL\","
         "\"source\":\"host_tick\",\"unit\":\"tick\",\"op\":\"dense\",\"layer\":\"ffn\\\"norm\","
@@ -236,22 +342,15 @@ bool aggregate_serializer_fixtures() {
 #if CYCLE_SIM
         ",\"cpu_service\":true"
 #endif
-#if LOG_CYCLE || CYCLE_SIM
-        ",\"duration_role\":\"OBSERVATION_ONLY\",\"exclusion_reason\":\"outside_collection\""
+        ",\"duration_role\":\"OBSERVATION_ONLY\",\"exclusion_reason\":\"outside_collection\"}";
+#else
+    const std::string expected_interval =
+        "{\"op\":\"dense\",\"kind\":\"cycle\",\"layer\":\"ffn\\\"norm\","
+        "\"start\":10,\"end\":34,\"delta\":24,\"valid\":true"
+#if CYCLE_SIM
+        ",\"cpu_service\":true"
 #endif
-        "}";
-
-#if LOG_CYCLE
-    std::string bound_interval_json;
-    {
-        log::CpuCorrelation correlation;
-        correlation.semantic_context = std::make_shared<semantic::Context>(semantic::Context{
-            {"prefill", {}, 3, 7}, semantic::Source::FullCpu, "cross-image-context"});
-        log::ScopedCpuCorrelation scope(correlation);
-        CycleIntervalTelemetry bound_interval = interval;
-        bound_interval.op = "cpu.context_fixture";
-        bound_interval_json = serialize_cycle_telemetry(bound_interval);
-    }
+        ",\"duration_role\":\"OBSERVATION_ONLY\",\"exclusion_reason\":\"outside_collection\"}";
 #endif
 
     WsLoopTelemetry ws{};
@@ -266,16 +365,22 @@ bool aggregate_serializer_fixtures() {
     const std::string expected_ws =
         "{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"WS_LOOP_TELEMETRY\","
         "\"source\":\"gemmini_hw_counter\",\"unit\":\"cycle\",\"op\":\"gemmini.ws_loop\","
-        "\"layer\":null,\"run_id\":null,\"stripe_id\":null,\"slot\":null,\"node_id\":null,\"worker_id\":null,"
+        "\"layer\":null,\"domain\":\"gemmini_hw_unknown\",\"run_id\":null,\"stripe_id\":null,\"slot\":null,\"node_id\":null,\"worker_id\":null,"
         "\"problem_i\":256,\"problem_j\":768,\"problem_k\":768,"
         "\"tile_i\":5,\"tile_j\":3,\"tile_k\":6,\"gemmini_outer_i\":4,\"gemmini_outer_j\":29,\"gemmini_outer_k\":1,"
         "\"ws_inner_calls\":116,\"containing_interval_cycles\":1000,\"containing_interval_counter_bits\":64,"
+        "\"containing_interval_source\":null,\"containing_interval_domain\":\"cpu_counter\",\"containing_interval_unit\":\"cycle\","
         "\"load_occupancy_cycles\":101,\"execute_occupancy_cycles\":202,\"store_occupancy_cycles\":303,"
-        "\"loop_occupancy_cycles\":999,\"occupancy_counter_bits\":32,\"valid\":true}";
-    WsLoopTelemetry invalid_ws = ws;
-    invalid_ws.load_occupancy_cycles = 1001;
-    WsLoopTelemetry wrapped_ws = ws;
-    wrapped_ws.containing_interval_cycles = static_cast<std::uint64_t>(UINT32_MAX) + 1;
+        "\"loop_occupancy_cycles\":999,\"occupancy_counter_bits\":32,"
+        "\"occupancy_counter_semantics\":\"raw_modulo_2^32_readings\",\"valid\":false,"
+        "\"reason\":\"device_counter_window_and_wrap_unverified\",\"aggregation_role\":\"diagnostic\",\"additive\":false}";
+    WsLoopTelemetry max_reading_ws = ws;
+    max_reading_ws.load_occupancy_cycles = UINT32_MAX;
+    const std::string max_reading_ws_json = serialize_cycle_telemetry(max_reading_ws);
+    WsLoopTelemetry wide_cpu_ws = max_reading_ws;
+    wide_cpu_ws.containing_interval_cycles = static_cast<std::uint64_t>(UINT32_MAX) + 1;
+    const std::string wide_cpu_ws_json = serialize_cycle_telemetry(wide_cpu_ws);
+    const std::string zero_ws_json = serialize_cycle_telemetry(WsLoopTelemetry{});
 
     Im2pExecutionTelemetry rtl{};
     rtl.layer = "blk.15.mlp.down_proj"; rtl.run_id = 17;
@@ -374,14 +479,9 @@ bool aggregate_serializer_fixtures() {
         "\"node_id\":null,\"worker_id\":null,\"row_begin\":80,\"row_end\":160,"
         "\"start\":null,\"end\":null,\"delta\":null,\"valid\":false,"
         "\"reason\":\"structurally_cross_task\",\"start_ns\":90,\"end_ns\":108,"
-        "\"duration_ns\":18,\"overlaps_rtl\":true,\"additive\":false"
-#if CYCLE_SIM
-        ",\"cpu_service\":false,\"cpu_service_exclusion\":\"cross_task_summary\""
-#endif
-#if LOG_CYCLE || CYCLE_SIM
-        ",\"duration_role\":\"OBSERVATION_ONLY\",\"exclusion_reason\":\"outside_collection\""
-#endif
-        "}";
+        "\"duration_ns\":18,\"execution_id\":\"" + cycle::host_execution_id() +
+        "\",\"host_clock\":\"steady_clock\",\"overlaps_rtl\":null,"
+        "\"overlaps_rtl_reason\":\"independent_clock_domains\",\"additive\":false}";
 
     PipelineStripeTelemetry pipeline{};
     pipeline.layer = "ffn"; pipeline.run_id = 7; pipeline.stripe_id = 2;
@@ -427,22 +527,23 @@ bool aggregate_serializer_fixtures() {
                     quantization_json.c_str(), second_quantization_json.c_str(), pipeline_json.c_str());
     }
 #if !LOG_CYCLE
-    return expect(interval_json.empty() && ws_json.empty() && rtl_json.empty() && stripe_json.empty() &&
+    return expect(interval_json.empty() && ws_json.empty() && max_reading_ws_json.empty() &&
+                      wide_cpu_ws_json.empty() && zero_ws_json.empty() && rtl_json.empty() && stripe_json.empty() &&
                       overlap_stripe_json.empty() && zero_stripe_json.empty() && wrapped_stripe_json.empty() &&
                       quantization_json.empty() && second_quantization_json.empty() && pipeline_json.empty(),
                   "cycle-off suppresses every aggregate serializer");
 #else
     return expect(interval_json == expected_interval, "cycle interval exact schema") &&
-        expect(bound_interval_json.find("\"run_config_id\":\"cross-image-context\"") != std::string::npos &&
-                   bound_interval_json.find("\"duration_role\":\"ORDINARY_CPU_REFERENCE\"") != std::string::npos &&
-                   bound_interval_json.find("\"semantic_node_ordinal\":7") != std::string::npos &&
-                   !log::current_cpu_correlation().semantic_context,
-               "caller context reaches telemetry shared image and scope restores unbound state") &&
-        expect(ws_json == expected_ws, "WS exact schema and 32-bit occupancy") &&
-        expect(serialize_cycle_telemetry(invalid_ws).find("\"valid\":false") != std::string::npos,
-               "hardware occupancy outside containing interval is invalid") &&
-        expect(serialize_cycle_telemetry(wrapped_ws).find("\"valid\":false") != std::string::npos,
-               "hardware containing interval wider than occupancy counter is invalid") &&
+        expect(ws_json == expected_ws, "WS exact schema retains raw readings as unverified non-additive diagnostics") &&
+        expect(max_reading_ws_json.find("\"load_occupancy_cycles\":4294967295") != std::string::npos &&
+               max_reading_ws_json.find("\"reason\":\"device_counter_window_and_wrap_unverified\"") != std::string::npos,
+               "maximum uint32 device reading is retained without comparing CPU and device counters") &&
+        expect(wide_cpu_ws_json.find("\"containing_interval_cycles\":4294967296") != std::string::npos &&
+               wide_cpu_ws_json.find("\"reason\":\"device_counter_window_and_wrap_unverified\"") != std::string::npos,
+               "wider CPU interval does not establish a device counter window or wrap proof") &&
+        expect(zero_ws_json.find("\"load_occupancy_cycles\":0,\"execute_occupancy_cycles\":0,\"store_occupancy_cycles\":0,\"loop_occupancy_cycles\":0") != std::string::npos &&
+               zero_ws_json.find("\"valid\":false,\"reason\":\"device_counter_window_and_wrap_unverified\"") != std::string::npos,
+               "zero register readings stay numeric while occupancy duration remains unverified") &&
         expect(rtl_json == expected_rtl, "RTL aggregate has run correlation and exactly one cycle payload") &&
         expect(count_occurrences(rtl_json, "\":") == 13, "RTL aggregate schema has exactly thirteen top-level fields") &&
         expect(malformed_rtl_json == expected_malformed_rtl,
@@ -456,6 +557,7 @@ bool aggregate_serializer_fixtures() {
                "RTL stripe zero endpoints are serialized rather than treated as missing") &&
         expect(wrapped_stripe_json == expected_wrapped_stripe,
                "RTL stripe wrapped latency uses unsigned endpoint subtraction") &&
+#if CYCLE_DETAIL
         expect(quantization_json == expected_quantization,
                "cross-task quantization cycles are unavailable while ns stays exact") &&
         expect(quantization_cycle_reads == 0,
@@ -465,6 +567,11 @@ bool aggregate_serializer_fixtures() {
                    second_quantization_json.find("quantize_total") == std::string::npos,
                "each stripe retains ns without manufacturing a canonical cycle total") &&
         expect(pipeline_json == expected_pipeline, "pipeline exact schema remains host-nanosecond-only") &&
+#else
+        expect(quantization_json.empty() && second_quantization_json.empty() && pipeline_json.empty() &&
+               quantization_cycle_reads == 0,
+               "compact mode omits detail-only cross-task and pipeline summaries without cycle reads") &&
+#endif
         [&] {
             const std::uint64_t first_generic_run_id = quants::act::exsia::next_exsia_run_id();
             const std::uint64_t second_generic_run_id = quants::act::exsia::next_exsia_run_id();
@@ -515,16 +622,23 @@ bool aggregate_cycle_sink_fixtures() {
     const std::string debug_output = read_file(debug_path);
     bool ok = true;
 #if LOG_CYCLE
-    const char * types[] = {"CYCLE_INTERVAL", "WS_LOOP_TELEMETRY", "IM2P_EXECUTION_TELEMETRY",
-                            "IM2P_STRIPE_TELEMETRY", "QUANTIZATION_STRIPE_TELEMETRY",
-                            "PIPELINE_STRIPE_SUMMARY", "RMD_BACKEND_TELEMETRY"};
+    const char * types[] = {"WS_LOOP_TELEMETRY", "IM2P_EXECUTION_TELEMETRY",
+                            "IM2P_STRIPE_TELEMETRY", "RMD_BACKEND_TELEMETRY",
+#if CYCLE_DETAIL
+                            "CYCLE_INTERVAL", "QUANTIZATION_STRIPE_TELEMETRY", "PIPELINE_STRIPE_SUMMARY",
+#endif
+    };
     for (const char * type : types) {
         ok &= expect(cycle_output.find(std::string("\"record_type\":\"") + type + "\"") != std::string::npos,
                      "aggregate record reaches cycle sink");
     }
-    ok &= expect(count_occurrences(cycle_output, "\"record_type\":") == 7 &&
-                 count_occurrences(cycle_output, "\"additive\":false") == 2,
-                 "cycle sink receives non-additive quantization and RTL stripe rows");
+    ok &= expect(count_occurrences(cycle_output, "\"record_type\":") == std::size(types) &&
+                 count_occurrences(cycle_output, "\"additive\":false") == (CYCLE_DETAIL ? 3 : 2),
+                 "cycle sink receives exactly the records enabled by its log mode");
+#if !CYCLE_DETAIL
+    ok &= expect(cycle_output.find("\"op\":\"interval\",\"kind\":\"cycle\"") != std::string::npos,
+                 "compact scalar interval reaches the same sink");
+#endif
 #else
     ok &= expect(cycle_output.empty(), "cycle-off suppresses aggregate records");
 #endif
@@ -591,6 +705,7 @@ bool residual_capture_timer_seam() {
 #endif
 }
 
+#if defined(GGML_GEMMINI_TELEMETRY_HAS_IM2P)
 bool residual_transport_fixtures(bool failure_selector) {
     Im2pExecutionTelemetry serialized{};
     serialized.residual_domain = true;
@@ -718,6 +833,8 @@ bool residual_transport_fixtures(bool failure_selector) {
     return ok && !error;
 }
 
+#endif // GGML_GEMMINI_TELEMETRY_HAS_IM2P
+
 bool negative_fixtures() {
     RmdTelemetryRecord malformed = cpu_record(); malformed.schema = "wrong";
     RmdTelemetryRecord zero = cpu_record(); zero.work = false; zero.counters = {};
@@ -783,16 +900,21 @@ int main(int argc, char ** argv) {
     if (argc == 3 && std::string(argv[1]) == "--aggregate-driver") {
         return run_aggregate_driver(argv[2]) ? 0 : 1;
     }
+#if defined(GGML_GEMMINI_TELEMETRY_HAS_IM2P)
     if (argc == 3 && std::string(argv[1]) == "--case" &&
         std::string(argv[2]) == "residual-failure") {
         return residual_transport_fixtures(true) ? 0 : 1;
     }
+#endif
     if (argc != 1) {
         std::fprintf(stderr, "unsupported test case\n");
         return 2;
     }
-    if (!aggregate_serializer_fixtures() || !aggregate_cycle_sink_fixtures() ||
-        !residual_capture_timer_seam() || !residual_transport_fixtures(false)) return 1;
+    if (!provider_diagnostic_fixtures() || !aggregate_serializer_fixtures() || !aggregate_cycle_sink_fixtures() ||
+        !residual_capture_timer_seam()) return 1;
+#if defined(GGML_GEMMINI_TELEMETRY_HAS_IM2P)
+    if (!residual_transport_fixtures(false)) return 1;
+#endif
     if (!expect(resolve_rmd_model_id("model-id-env", "model-arch") == "model-id-env",
                 "model ID environment value wins") ||
         !expect(resolve_rmd_model_id("", "model-arch").empty(),

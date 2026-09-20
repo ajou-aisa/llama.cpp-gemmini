@@ -91,6 +91,9 @@ extern "C"
     int gemmini_log_cycle_set_output_path(const char *path) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT; // 1/0
     void gemmini_log_debug_set_output(FILE *out) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
     void gemmini_log_cycle_set_output(FILE *out) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
+    // Buffer owned regular files until operation/run end; borrowed streams still flush per record.
+    void gemmini_log_cycle_set_buffered(int buffered) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
+    int gemmini_log_cycle_flush(void) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT; // 1: success (also when disabled at build time), 0: sink failure
 
     void gemmini_log_debug(const char *fmt, ...) GEMMINI_LOG_C_BOUNDARY_NOEXCEPT;
 

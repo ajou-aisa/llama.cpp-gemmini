@@ -1,3 +1,4 @@
+#include <gemmini/trace-context.hpp>
 // ggml-gemmini.cpp
 
 #include <cstdio>
@@ -28,8 +29,12 @@
 
 #include <gemmini/log.hpp>
 #include <gemmini/optrace.hpp>
+#include <gemmini/performance.hpp>
 #if LOG_CYCLE || CYCLE_SIM
 #include <gemmini/semantic.hpp>
+#endif
+#if LOG_CYCLE
+#include "../../../common/json.hpp"
 #endif
 #include "dump/dump_tensor.hpp"
 
@@ -128,6 +133,63 @@ namespace
 #else
     constexpr bool fpga_dense = false;
 #endif
+
+    void log_outer_cpu_interval(const ggml_gemmini_args_t &args, uint64_t invocation_id,
+                               const char *op, const gemmini_cpu_sample &start,
+                               const gemmini_cpu_sample &end, bool cpu_work = true,
+                               bool success = true) noexcept {
+#if LOG_CYCLE
+        using namespace ggml::gemmini;
+        try {
+            gemmini_cpu_totals totals{};
+            gemmini_cpu_timing_add(&totals, &start, &end);
+#if CYCLE_DETAIL
+            if (cpu_work) performance::record_cpu_wall(start.ns, end.ns);
+#endif
+            log::CycleRecord record{args.matmul_layer.c_str(), op, start.counter, end.counter};
+            record.source = start.native_source == GEMMINI_CPU_COUNTER_THREAD_PERF
+                ? "linux_perf_cpu_cycles" : "unavailable";
+            record.unit = "cycle";
+            project_matmul_cpu_identity(record, nullptr, matmul_cpu_run_id(args));
+            std::string json = log::serialize_checked_cycle_record(
+                record, totals.cycles_valid_count == 1 && totals.cycles_reason == nullptr,
+                totals.cycles_reason);
+#if CYCLE_DETAIL
+            json.insert(json.rfind('}'),
+                ",\"matmul_invocation_id\":" + std::to_string(invocation_id) +
+                ",\"cpu_measurement_version\":1,\"additive\":false,\"aggregation_role\":\"" +
+                (cpu_work ? "cpu_stage" : "caller_envelope") +
+                "\",\"operation_success\":" + (success ? "true" : "false") +
+                ",\"native_cycles\":" + cycle::serialize_cpu_native(start, end) +
+                ",\"host_timing\":" + cycle::serialize_host_timing(start.ns, end.ns, start.tid, end.tid) +
+                ",\"thread_cpu_timing\":" + cycle::serialize_thread_cpu_timing(
+                    {start.ns, start.tid, start.thread_cpu_ns, start.thread_cpu_valid != 0},
+                    {end.ns, end.tid, end.thread_cpu_ns, end.thread_cpu_valid != 0}));
+#else
+            std::string compact =
+                ",\"matmul_invocation_id\":" + std::to_string(invocation_id) +
+                ",\"aggregation_role\":\"" + (cpu_work ? std::string("cpu_stage") : std::string("caller_envelope")) +
+                "\",\"operation_success\":" + (success ? "true" : "false") +
+                ",\"ns_start\":" + std::to_string(start.ns) +
+                ",\"ns_end\":" + std::to_string(end.ns);
+            if (start.tid != 0 && start.tid == end.tid) {
+                compact += ",\"tid\":" + std::to_string(start.tid);
+            } else {
+                compact += ",\"tid_start\":" + std::to_string(start.tid) +
+                    ",\"tid_end\":" + std::to_string(end.tid);
+            }
+            json.insert(json.rfind('}'), compact);
+#endif
+            log::cycle.write_json(json);
+        } catch (...) {
+            log::cycle.report_failure("Gemmini outer CPU interval");
+        }
+#else
+        (void) args; (void) invocation_id; (void) op; (void) start; (void) end;
+        (void) cpu_work; (void) success;
+#endif
+    }
+
     bool gemmini_is_extended_dequant_weight_type(ggml_type type) {
         return type == GGML_TYPE_Q4_0 ||
                type == GGML_TYPE_Q4_H1 ||
@@ -1353,8 +1415,13 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     const char * layer = args.matmul_layer.c_str();
     ggml::gemmini::log::debug(layer, "ggml_backend_gemmini_mul_mat called");
 
-    uint64_t start = 0;
-    uint64_t end = 0;
+    gemmini_cpu_sample start{}, end{};
+#if LOG_CYCLE
+    static std::atomic<uint64_t> next_matmul_invocation_id{0};
+    const uint64_t matmul_invocation_id = next_matmul_invocation_id.fetch_add(1);
+#else
+    constexpr uint64_t matmul_invocation_id = 0;
+#endif
 
     /* _______________________ 2. Gemmini용 dimension _____________________ */
     size_t I = 0;
@@ -1517,7 +1584,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 #endif
     }
     auto matmul_options = matmul_resolution.options;
-    matmul_options.profiling = LOG_CYCLE != 0;
+    matmul_options.profiling = CYCLE_DETAIL != 0;
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
     // Preserve main's original H0 policy before Q8_0 is reprocessed to H1.
     if (src0->type == GGML_TYPE_Q8_0 && GGML_GEMMINI_ENABLE_RMD != 0 &&
@@ -1641,7 +1708,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             "[matmul.pipeline] dispatch=full reason=single-row decode I=%zu", I);
     }
     // set args
-    start = ggml::gemmini::cycle::read();
+    start = gemmini_cpu_timing_read();
     args.transpose_B = (TRANSPOSE_B != 0);
     ggml::gemmini::log::debug(layer, "model_arch=%s\n", args.model_arch ? args.model_arch : "");
     args.full_C = FULL_C;
@@ -1659,11 +1726,11 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.sA = K;
     args.sC = J;
 
-    end = ggml::gemmini::cycle::read();
-    ggml::gemmini::log::cycle(layer, "gemmini.prepare_args", start, end);
+    end = gemmini_cpu_timing_read();
+    log_outer_cpu_interval(args, matmul_invocation_id, "gemmini.prepare_args", start, end);
 
     // set tile size
-    start = ggml::gemmini::cycle::read();
+    start = gemmini_cpu_timing_read();
     ggml::gemmini::gemmini_set_tile_ws(&args);
     const auto gemmini_geometry = ggml::gemmini::make_gemmini_geometry(
         {{args.I, args.J, args.K}, {args.tile_I, args.tile_J, args.tile_K}, DIM});
@@ -1671,13 +1738,14 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         GGML_ABORT("Gemmini geometry is invalid");
     }
     args.activation_rows_per_stripe = gemmini_geometry.geometry.stripe_rows;
-    end = ggml::gemmini::cycle::read();
-    ggml::gemmini::log::cycle(layer, "gemmini.select_tile", start, end);
+    end = gemmini_cpu_timing_read();
+    log_outer_cpu_interval(args, matmul_invocation_id, "gemmini.select_tile", start, end);
 
 #if defined(GGML_GEMMINI_TESTING) && \
     defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
     ggml::gemmini::im2p_adapter::test_observe_activation_allocation();
 #endif
+    start = gemmini_cpu_timing_read();
     if (!args.A.allocate(args.I, args.K, GGML_GEMMINI_ACTIVATION_BITS)) {
         ggml::gemmini::log::debug(
             args.matmul_layer.c_str(),
@@ -1689,6 +1757,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         pipeline_collector = std::make_unique<ggml::gemmini::MatmulStripeCollector>(pipeline_job_capacity);
         args.exsia_stripe_ready_sink = pipeline_collector->sink();
     }
+    end = gemmini_cpu_timing_read();
+    log_outer_cpu_interval(args, matmul_invocation_id, "gemmini.activation_buffer_preparation", start, end);
     ggml::gemmini::log::debug(
         args.matmul_layer.c_str(),
         "[" GGML_GEMMINI_ACTIVATION_QUANT_NAME "] final cfg model_arch=%s",
@@ -1699,43 +1769,85 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 #endif
     bool quantize_ok = false;
     const bool deferred_quantization = pipeline_enabled || im2p_exsia || fpga_dense;
+    const auto log_configuration = [&]() noexcept {
 #if LOG_CYCLE
-    const bool quantization_overlaps_rtl =
-        pipeline_enabled || ((im2p_exsia || (fpga_dense && exsia_pipeline_supported)) && pipeline_requested);
+        using namespace ggml::gemmini;
+        try {
+            const auto route = detail::normalize_route(args);
+            const char *dense_backend = detail::backend_route_name(route.backend);
+            const char *packet_backend = "gemmini_ws";
+            using WeightFormat = ggml_gemmini_args_t::im2p_weight_format_t;
+            const bool native_q8_cpu_helper = args.weight_format == WeightFormat::q8_h1 ||
+                args.weight_format == WeightFormat::q8_h2 || args.weight_format == WeightFormat::q8_hp1 ||
+                args.weight_format == WeightFormat::q8_hp2;
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+            dense_backend = "im2p_sim";
+            packet_backend = "im2p_sim";
+#elif defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+            dense_backend = "fpga_uart";
+            packet_backend = "fpga_uart";
+#else
+            if (args.tiled_matmul_type == WS && native_q8_cpu_helper) dense_backend = "cpu";
 #endif
-    const auto quantize_activation = [&]() {
-#if LOG_CYCLE
-        const std::uint64_t quantize_start =
-            ggml::gemmini::cycle::read();
+            const bool dense_cpu = std::strcmp(dense_backend, "cpu") == 0;
+            const bool host_block_scale = native_q8_cpu_helper || product_weight_bits != 8;
+            const bool residual_enabled = GGML_GEMMINI_ENABLE_RMD != 0 && exsia_pipeline_supported;
+            const bool residual_direct = matmul_options.rmd_backend == RmdBackend::cpu_direct;
+            const char *residual_backend = !residual_enabled ? "disabled" :
+                residual_direct ? "cpu_direct" : packet_backend;
+            const auto run_id = matmul_cpu_run_id(args);
+            std::string json = "{\"schema\":\"gemmini.cycle\",\"version\":2,"
+                "\"record_type\":\"MATMUL_CONFIGURATION\",\"op\":\"gemmini.configuration\",\"layer\":";
+            json += nlohmann::json(layer).dump();
+            json += ",\"execution_id\":" + nlohmann::json(cycle::host_execution_id()).dump();
+            json += ",\"matmul_invocation_id\":" + std::to_string(matmul_invocation_id) +
+                ",\"run_id\":" + (run_id ? std::to_string(*run_id) : "null") +
+                ",\"configured_dense_backend\":\"" + detail::backend_route_name(route.backend) +
+                "\",\"dense_scu_mode\":" + (dense_cpu ? "\"not_executed_cpu\"" : "null") +
+                ",\"dense_scale_mode\":" + (dense_cpu ? (host_block_scale ? "\"host_fp64_block_scale\"" : "\"host_final_scale\"") : "null") +
+                ",\"dense_scale_mode_source\":\"" + (dense_cpu ? "host_route" : "device_telemetry") + '"' +
+                ",\"dense_backend\":\"" + dense_backend + "\",\"residual_backend\":\"" + residual_backend +
+                "\",\"residual_route\":\"" + (!residual_enabled ? "disabled" : residual_direct ? "cpu_direct" : "ws_packet") +
+                "\",\"dense_cpu_matmul_emulation\":" + (dense_cpu ? "true" : "false") +
+                ",\"dense_activation_bits\":" + std::to_string(GGML_GEMMINI_ACTIVATION_BITS) +
+                ",\"dense_weight_bits\":" + std::to_string(product_weight_bits) +
+                ",\"residual_activation_bits\":" + (!residual_enabled ? "null" : std::to_string(residual_direct ? 32 : GGML_GEMMINI_ACTIVATION_BITS)) +
+                ",\"residual_weight_bits\":" + (!residual_enabled ? "null" : std::to_string(product_weight_bits)) +
+                ",\"I\":" + std::to_string(I) + ",\"J\":" + std::to_string(J) + ",\"K\":" + std::to_string(K) +
+                ",\"array_dim\":" + std::to_string(DIM) + ",\"stripe_rows\":" + std::to_string(args.activation_rows_per_stripe) +
+                ",\"tile_I\":" + std::to_string(args.tile_I) + ",\"tile_J\":" + std::to_string(args.tile_J) +
+                ",\"tile_K\":" + std::to_string(args.tile_K) + ",\"tile_K_elements\":" + std::to_string(args.tile_K * DIM) +
+                ",\"weight_block_K\":" + std::to_string(args.block_size_k) +
+                ",\"activation_block_K\":" + (exsia_pipeline_supported ? "32" : "null") +
+                ",\"source_weight_type\":\"" + ggml_type_name(src0->type) +
+                "\",\"resolved_weight_format\":" + std::to_string(static_cast<int>(args.weight_format)) +
+                ",\"activation_quantization\":\"" GGML_GEMMINI_ACTIVATION_QUANT_NAME "\",\"pipeline_requested\":" +
+                (pipeline_requested ? "true" : "false") + ",\"pipeline_enabled\":" +
+                ((pipeline_enabled || ((im2p_exsia || im2p_non_exsia || fpga_dense) && pipeline_requested)) ? "true" : "false") +
+                ",\"requested_job_capacity\":" + std::to_string(pipeline_job_capacity) +
+                ",\"weight_preparation\":\"" + ((src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0)
+                    ? "runtime_reprocess_per_invocation" : "loaded_artifact") + "\",\"openmp_max_threads\":" +
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+                std::to_string(omp_get_max_threads()) + '}';
+#else
+                "null}";
 #endif
-        const bool result =
-            ggml::gemmini::quants::quantize_activation(src1, args);
-#if LOG_CYCLE
-        const std::uint64_t quantize_end =
-            ggml::gemmini::cycle::read();
-        if (quantization_overlaps_rtl) {
-            ggml::gemmini::log::debug(
-                layer,
-                "[matmul.pipeline] cpu_quantization_host_ticks=%llu "
-                "overlaps_rtl=true excluded_from_cycle_sink=true",
-                static_cast<unsigned long long>(
-                    quantize_end - quantize_start));
-        } else {
-            if (const auto *metadata = std::get_if<ggml::gemmini::quants::act::block::Meta>(
-                    &args.act_quant.storage());
-                metadata != nullptr && metadata->run_id.has_value()) {
-                ggml::gemmini::log::CycleRecord record{
-                    layer, "gemmini.quantize_activation", quantize_start, quantize_end};
-                record.identity_mask = GEMMINI_CYCLE_HAS_RUN_ID;
-                record.run_id = *metadata->run_id;
-                ggml::gemmini::log::cycle.write(record);
-            } else {
-                ggml::gemmini::log::cycle(
-                    layer, "gemmini.quantize_activation",
-                    quantize_start, quantize_end);
-            }
+            log::cycle.write_json(json);
+        } catch (...) {
+            log::cycle.report_failure("Gemmini matmul configuration");
         }
 #endif
+    };
+    const auto quantize_activation = [&]() {
+        const auto quantize_start = gemmini_cpu_timing_read();
+        const bool result =
+            ggml::gemmini::quants::quantize_activation(src1, args);
+        const auto quantize_end = gemmini_cpu_timing_read();
+        // This caller envelope can contain queue waits and nested worker work.
+        // Its wall span is not CPU work time; actual overlap uses the endpoints.
+        log_outer_cpu_interval(args, matmul_invocation_id, "gemmini.quantize_activation",
+                               quantize_start, quantize_end, false, result);
+        if (deferred_quantization) log_configuration();
         return result;
     };
     if (!deferred_quantization) {
@@ -1854,7 +1966,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     if (!deferred_quantization && run_dequant_fp_test())
       return;
 
-    start = ggml::gemmini::cycle::read();
+    const auto weight_prepare_start = gemmini_cpu_timing_read();
+    start = weight_prepare_start;
     const int64_t dim_k = src0->ne[0];
     const int64_t dim_j = src0->ne[1] ? src0->ne[1] : 1;
     const int64_t dim_z = src0->ne[2] ? src0->ne[2] : 1;
@@ -1905,8 +2018,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
         args.s_rf_stripe = nullptr;
         args.R_stripe = nullptr;
 
-        end = ggml::gemmini::cycle::read();
-        ggml::gemmini::log::cycle(layer, "gemmini.prepare_dense_i8_weight", start, end);
+        end = gemmini_cpu_timing_read();
+        log_outer_cpu_interval(args, matmul_invocation_id, "gemmini.prepare_dense_i8_weight", start, end);
     } else {
         if (src0->type == GGML_TYPE_Q4_0) {
             size_t q4_0_blocks_per_row = 0;
@@ -1954,9 +2067,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                 (void *)reprocessed_q4_h1.data(),
                 q4_0_blocks_per_row,
                 q4_0_reprocess_rows);
-            end = ggml::gemmini::cycle::read();
-            ggml::gemmini::log::cycle(
-                layer, "gemmini.convert_q4_0_to_q4_h1", start, end);
+            end = gemmini_cpu_timing_read();
+            log_outer_cpu_interval(args, matmul_invocation_id,
+                                   "gemmini.convert_q4_0_to_q4_h1", start, end);
         } else if (src0->type == GGML_TYPE_Q4_H1 ||
             src0->type == GGML_TYPE_Q4_HP1 || src0->type == GGML_TYPE_Q16_0 ||
             src0->type == GGML_TYPE_Q16_H1 || src0->type == GGML_TYPE_Q16_HP1) {
@@ -2149,7 +2262,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
                     args.weight_channel_scale_count, logical_rows, static_cast<int>(args.tiled_matmul_type));
             }
         } else if (src0->type == GGML_TYPE_Q8_0) {
-            start = ggml::gemmini::cycle::read();
+            start = gemmini_cpu_timing_read();
             size_t q8_0_reprocess_rows = logical_rows;
             const bool ok = ggml::gemmini::prepare_q8_0_rows_for_q8_h1(
                 src0,
@@ -2194,8 +2307,8 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             ggml::gemmini::log::debug(layer,
                 "[Q8_0 reprocess] blocks=%p sB=%zu blocks_per_row=%zu logical_rows=%zu",
                 (void *)reprocessed_q8_h1.data(), args.sB, args.blocks_per_row, q8_0_reprocess_rows);
-            end = ggml::gemmini::cycle::read();
-            ggml::gemmini::log::cycle(layer, "gemmini.convert_q8_0_to_q8_h1", start, end);
+            end = gemmini_cpu_timing_read();
+            log_outer_cpu_interval(args, matmul_invocation_id, "gemmini.convert_q8_0_to_q8_h1", start, end);
         } else {
             ggml::gemmini::log::debug(layer, "int compute unsupported weight type=%d", (int)src0->type);
             GGML_ABORT("Gemmini int mul_mat received unsupported weight type");
@@ -2203,7 +2316,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     }
 
-    start = ggml::gemmini::cycle::read();
+    end = gemmini_cpu_timing_read();
+    log_outer_cpu_interval(args, matmul_invocation_id, "gemmini.prepare_weight", weight_prepare_start, end);
+
+    start = gemmini_cpu_timing_read();
     /* ______________________________ 4. bias 텐서 처리 _________________________________ */
     std::vector<int32_t> zero_bias(J, 0);
 
@@ -2222,9 +2338,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.f_out = static_cast<float*>(dst->data);
     args.col_stride_f_out = dst->nb[0] / sizeof(float);
     args.stride_f_out = dst->nb[1] / sizeof(float);
-    end = ggml::gemmini::cycle::read();
+    end = gemmini_cpu_timing_read();
     // This preparation ends before any quantization, submission or execution.
-    ggml::gemmini::log::cycle(layer, "gemmini.output_preparation", start, end);
+    log_outer_cpu_interval(args, matmul_invocation_id, "gemmini.output_preparation", start, end);
+    if (!deferred_quantization) log_configuration();
 
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
     try {
@@ -2709,12 +2826,18 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
     ggml::gemmini::log::dump_begin_graph(phase, step_id, mxI);
 #endif
 
+    const auto graph_trace = gemmini_trace_capture();
+    const uint64_t graph_id = gemmini_trace_reserve_ids(static_cast<uint64_t>(cgraph->n_nodes) + 1);
     for (int i = 0; i < cgraph->n_nodes; i++)
     {
         struct ggml_tensor *node = cgraph->nodes[i];
 #if LOG_CYCLE || CYCLE_SIM
         ggml::gemmini::semantic::ScopedNode semantic_scope(node, 1);
 #endif
+        ggml::gemmini::trace::ScopedContext operator_context(gemmini_trace_operator(
+            graph_trace, graph_id, graph_id + 1 + static_cast<uint64_t>(i),
+            static_cast<uint64_t>(i), ggml_op_name(node->op), 0, 1, 1));
+        ggml::gemmini::trace::CpuStage operator_dispatch(node->name, "operator.host_dispatch", ggml::gemmini::trace::CpuStage::Scope::envelope);
 
         switch (node->op)
         {
@@ -2743,7 +2866,7 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
             if (cycle_sim_context) cycle_sim_context.session->ensure_healthy();
 #endif
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
-            if (fpga_dispatch_failed) { ++fpga_failed; return GGML_STATUS_FAILED; }
+            if (fpga_dispatch_failed) { operator_dispatch.finish(false); ++fpga_failed; return GGML_STATUS_FAILED; }
 #endif
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) &&                        \
     defined(GGML_GEMMINI_TESTING)

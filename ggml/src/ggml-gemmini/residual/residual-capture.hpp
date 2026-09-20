@@ -81,7 +81,7 @@ public:
     ResidualStripePayload finish() {
         ResidualStripePayload result;
         if (empty()) return result;
-#if LOG_CYCLE
+#if LOG_CYCLE && CYCLE_DETAIL
         const uint64_t start = cycle::timestamp_ns();
 #endif
 #if defined(__linux__) && defined(__aarch64__) && CYCLE_DETAIL
@@ -129,7 +129,7 @@ public:
                                               run_id_.value_or(0), stripe_id_, 0, 0, worker_id};
         gemmini_log_cycle_record_v2_checked_internal(&record, &start_sample, &end_sample, 1);
 #endif
-#if LOG_CYCLE
+#if LOG_CYCLE && CYCLE_DETAIL
         const uint64_t end = cycle::timestamp_ns();
         result.capture_ns = end >= start ? end - start : 0;
 #endif
