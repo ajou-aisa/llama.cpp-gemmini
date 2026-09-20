@@ -583,7 +583,7 @@ bool run_group_rows() {
                         !check((block.active_lane_mask & uint16_t{2}) == 0,
                                "row-boundary packet retains sparse lane IDs")) return false;
                     for (const auto & group : block.groups) {
-                        const size_t group_rows = align_up(group.lane_positions.size() * rows, kArrayDim);
+                        const size_t group_rows = align_up(group.row_ids.size(), kArrayDim);
                         expected_values += group_rows * group.padded_k_count;
                         const size_t kj_tiles = (group.padded_k_count / kArrayDim) *
                             (packet->j_padded / kArrayDim);

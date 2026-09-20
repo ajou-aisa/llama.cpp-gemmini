@@ -377,9 +377,8 @@ RmdStatus RmdOutputAssembler::begin(const StripePacket &packet) {
     output_ = nullptr;
     correction_ = nullptr;
     correction_values_.clear();
-    m_tiles_ = (packet.row_count + kArrayDim - 1) / kArrayDim;
     j_tiles_ = (packet.logical_j + kArrayDim - 1) / kArrayDim;
-    if (m_tiles_ == 0 || j_tiles_ == 0) {
+    if (packet.row_count == 0 || j_tiles_ == 0) {
         return RmdStatus::invalid_packet;
     }
 
@@ -388,8 +387,12 @@ RmdStatus RmdOutputAssembler::begin(const StripePacket &packet) {
         size_t cursor = 0;
         for (size_t index = 0; index < packet.blocks.size(); ++index) {
             tile_offset_[index] = cursor;
-      cursor += static_cast<size_t>(packet.blocks[index].active_lane_count) *
-                m_tiles_ * j_tiles_;
+            for (const auto & group : packet.blocks[index].groups) {
+                for (size_t lane = 0; lane < group.lane_positions.size(); ++lane) {
+                    const size_t rows = group.row_offsets[lane + 1] - group.row_offsets[lane];
+                    cursor += ((rows + kArrayDim - 1) / kArrayDim) * j_tiles_;
+                }
+            }
         }
         expected_ = cursor;
         submitted_ = 0;
@@ -458,26 +461,36 @@ RmdStatus RmdOutputAssembler::submit(const PhysicalTile &tile) {
     }
   const BlockDescriptor &block = packet_->blocks[tile.packet_block_index];
     if (tile.lane_position >= block.active_lane_count ||
-        tile.lane_id != block.lane_ids[tile.lane_position] ||
-        tile.m_tile >= m_tiles_ || tile.j_tile >= j_tiles_) {
+        tile.lane_id != block.lane_ids[tile.lane_position] || tile.j_tile >= j_tiles_) {
         return RmdStatus::invalid_arguments;
     }
 
+    // Resolve the packed lane without restoring its removed zero rows.
+    size_t lane_tiles = 0, lane_rows = 0, selected_offset = 0;
+    const uint16_t * row_ids = nullptr;
+    for (const auto & group : block.groups) {
+        for (size_t lane = 0; lane < group.lane_positions.size(); ++lane) {
+            const size_t first = group.row_offsets[lane];
+            const size_t rows = group.row_offsets[lane + 1] - first;
+            if (group.lane_positions[lane] == tile.lane_position) {
+                row_ids = group.row_ids.data() + first;
+                lane_rows = rows;
+                selected_offset = lane_tiles;
+            }
+            lane_tiles += (rows + kArrayDim - 1) / kArrayDim;
+        }
+    }
     const size_t row_base = static_cast<size_t>(tile.m_tile) * kArrayDim;
+    if (row_ids == nullptr || row_base >= lane_rows) return RmdStatus::invalid_arguments;
     const size_t col_base = static_cast<size_t>(tile.j_tile) * kArrayDim;
-  const size_t expected_rows =
-      std::min(kArrayDim, packet_->row_count - row_base);
-  const size_t expected_cols =
-      std::min(kArrayDim, packet_->logical_j - col_base);
+    const size_t expected_rows = std::min(kArrayDim, lane_rows - row_base);
+    const size_t expected_cols = std::min(kArrayDim, packet_->logical_j - col_base);
     if (tile.valid_rows != expected_rows || tile.valid_cols != expected_cols) {
         return RmdStatus::invalid_arguments;
     }
 
-  const size_t slot =
-      tile_offset_[tile.packet_block_index] +
-      (static_cast<size_t>(tile.lane_position) * m_tiles_ + tile.m_tile) *
-          j_tiles_ +
-      tile.j_tile;
+    const size_t slot = tile_offset_[tile.packet_block_index] +
+        (selected_offset + tile.m_tile) * j_tiles_ + tile.j_tile;
     if (slot >= seen_.size()) {
         return RmdStatus::invalid_arguments;
     }
@@ -494,7 +507,7 @@ RmdStatus RmdOutputAssembler::submit(const PhysicalTile &tile) {
         const __int128 place = __int128{1} << (packet_->digit_bits * tile.lane_id);
         for (size_t row = 0; row < tile.valid_rows; ++row) {
       const size_t destination =
-          (row_base + row) * packet_->logical_j + col_base;
+          static_cast<size_t>(row_ids[row_base + row]) * packet_->logical_j + col_base;
             for (size_t col = 0; col < tile.valid_cols; ++col) {
                 __int128 contribution = tile.values[row * kArrayDim + col];
         // Lane/block terms may exceed INT64 and cancel; narrow only in
@@ -514,7 +527,7 @@ RmdStatus RmdOutputAssembler::submit(const PhysicalTile &tile) {
         static_cast<size_t>(tile.lane_position) * block.lane_stride_values;
     for (size_t row = 0; row < tile.valid_rows; ++row) {
     const size_t destination =
-        lane_base + (row_base + row) * output_->j_padded + col_base;
+        lane_base + static_cast<size_t>(row_ids[row_base + row]) * output_->j_padded + col_base;
         if (destination + tile.valid_cols > output_->values.size()) {
             return RmdStatus::invalid_packet;
         }
@@ -612,18 +625,21 @@ void collect_packet_metrics(const StripePacket & packet, RmdExecutionMetrics & m
 
   for (const BlockDescriptor &block : packet.blocks) {
         metrics.active_lanes += block.active_lane_count;
-        metrics.lane_rows_after_pruning += block.active_lane_count * packet.row_count;
         metrics.compact_k_count += block.compact_k_count;
         metrics.padded_k_count += block.padded_k_count;
-    metrics.physical_tile_count +=
-        static_cast<size_t>(block.active_lane_count) * m_tiles * j_tiles;
         metrics.baseline_stacked_i_tile_count +=
         (block.padded_k_count / kArrayDim) * block.active_lane_count * m_tiles *
         j_tiles;
         metrics.packet_bytes += block.groups.size() * sizeof(LaneGroupDescriptor);
     for (const LaneGroupDescriptor &group : block.groups) {
-            metrics.packet_bytes += group.lane_positions.size() * sizeof(uint8_t);
-            const size_t valid_rows = group.lane_positions.size() * packet.row_count;
+            metrics.packet_bytes += group.lane_positions.size() * sizeof(uint8_t) +
+                group.row_ids.size() * sizeof(uint16_t);
+            const size_t valid_rows = group.row_ids.size();
+            metrics.lane_rows_after_pruning += valid_rows;
+            for (size_t lane = 0; lane < group.lane_positions.size(); ++lane) {
+                const size_t rows = group.row_offsets[lane + 1] - group.row_offsets[lane];
+                metrics.physical_tile_count += ((rows + kArrayDim - 1) / kArrayDim) * j_tiles;
+            }
             const size_t stacked_rows = align_up(valid_rows, kArrayDim);
             metrics.group_rows_padded += stacked_rows;
             metrics.group_active_k_count += static_cast<size_t>(__builtin_popcount(group.k_mask));
@@ -782,7 +798,6 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
         return begin_status;
     }
 
-    const size_t m_tiles = (packet.row_count + kArrayDim - 1) / kArrayDim;
     const size_t j_tiles = (packet.logical_j + kArrayDim - 1) / kArrayDim;
     size_t matmul_call_count = 0;
     size_t lane_group_count = 0;
@@ -796,7 +811,7 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
   for (const BlockDescriptor &block : packet.blocks) {
     for (const LaneGroupDescriptor &group : block.groups) {
       const size_t stacked_rows =
-          align_up(group.lane_positions.size() * packet.row_count, kArrayDim);
+          align_up(group.row_ids.size(), kArrayDim);
             max_stacked_rows = std::max(max_stacked_rows, stacked_rows);
         }
     }
@@ -902,7 +917,7 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
         const LaneGroupDescriptor &group = block.groups[group_index];
                 const size_t k_tiles = group.padded_k_count / kArrayDim;
         const size_t stacked_rows =
-            align_up(group.lane_positions.size() * packet.row_count, kArrayDim);
+            align_up(group.row_ids.size(), kArrayDim);
                 const size_t stacked_value_count = stacked_rows * kArrayDim;
         std::fill_n(stacked_values.begin(), stacked_value_count,
                     OutputValue{0});
@@ -910,7 +925,7 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
         if (hp1_scu) {
           const size_t compact_k = group_k_counts[group_index];
           const size_t logical_rows =
-              group.lane_positions.size() * packet.row_count;
+              group.row_ids.size();
           // The gather primitive is DIM-sized, not the NPU request.
           // Append every selected row before the ONE logical K<=32 call.
           for (size_t base = 0; base < compact_k; base += kArrayDim) {
@@ -1013,7 +1028,7 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                     }
                     ++matmul_call_count;
                     stacked_i_tile_count += stacked_rows / kArrayDim;
-                    logical_dot_result_bytes += group.lane_positions.size() * packet.row_count *
+                    logical_dot_result_bytes += group.row_ids.size() *
                         valid_cols * sizeof(OutputValue);
                     WeightGatherCounts gather_counts{};
                     detail::RmdHostStageScope gather(measured, RmdHostStage::weight_gather);
@@ -1045,9 +1060,8 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                       : static_cast<const void *>(unpacked_int4.data() +
                                                   activation_offset -
                                                   block.activation_offset),
-                  // Keep padded storage, but execute only the original lane
-                  // rows.
-                            group.lane_positions.size() * packet.row_count,
+                  // Keep padded storage, but execute only nonzero packed rows.
+                            group.row_ids.size(),
                   group.padded_k_count *
                       (packet.digit_bits == 16 ? sizeof(int16_t) : 1),
                             weight_tile.data(),
@@ -1122,7 +1136,7 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                         const log::ScopedWsCycleIdentity ws_scope(
                             staged_metrics.timing_identity, "gemmini_hw_residual");
 #endif
-                        tiled_matmul(stacked_rows, valid_cols, valid_k,
+                        tiled_matmul(group.row_ids.size(), valid_cols, valid_k,
                             native_activation_tile, native_weight, nullptr, ws_values.data(),
                             group.padded_k_count, kArrayDim, 0, kArrayDim,
                             1.0f, 1.0f, 1.0f,
@@ -1196,7 +1210,7 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
 #if defined(GGML_GEMMINI_TESTING)
                 WsCallObservation observation{};
                 if constexpr (Backend == CompactExecutorBackend::gemmini_ws) {
-                    observation.rows = stacked_rows;
+                    observation.rows = group.row_ids.size();
                     observation.cols = valid_cols;
                     observation.k = group_k_counts[group_index];
                     observation.lane_id = block.lane_ids[group.lane_positions.front()];
@@ -1208,7 +1222,7 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
               std::lower_bound(compact_begin,
                                compact_begin + block.compact_k_count, first_k) -
               compact_begin);
-          if (read_packet_digit(packet, block, group.lane_positions.front(), 0,
+          if (read_packet_digit(packet, block, group.lane_positions.front(), group.row_ids.front(),
                                 first_compact,
                                 first_activation) != RmdStatus::success) {
                         return RmdStatus::invalid_packet;
@@ -1220,7 +1234,7 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
             for (size_t group_lane = 0;
                  group_lane < group.lane_positions.size(); ++group_lane) {
                         staged_metrics.raw_lane_values.push_back(
-                            stacked_values[group_lane * packet.row_count * kArrayDim]);
+                            stacked_values[group.row_offsets[group_lane] * kArrayDim]);
                     }
                 }
                 for (size_t row = 0; row < stacked_rows; ++row) {
@@ -1287,14 +1301,11 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                 for (size_t group_lane = 0;
                      group_lane < group.lane_positions.size(); ++group_lane) {
                     const uint8_t lane_position = group.lane_positions[group_lane];
-                    // Input lanes touch; only the group tail has physical row padding.
-          // The assembler still writes each logical lane's padded output
-          // stride.
-                    const size_t lane_row_base = group_lane * packet.row_count;
-                    for (size_t m_tile = 0; m_tile < m_tiles; ++m_tile) {
+                    const size_t lane_row_base = group.row_offsets[group_lane];
+                    const size_t lane_rows = group.row_offsets[group_lane + 1] - lane_row_base;
+                    for (size_t m_tile = 0; m_tile < (lane_rows + kArrayDim - 1) / kArrayDim; ++m_tile) {
                         const size_t row_base = m_tile * kArrayDim;
-            const size_t valid_rows =
-                std::min(kArrayDim, packet.row_count - row_base);
+                        const size_t valid_rows = std::min(kArrayDim, lane_rows - row_base);
                         PhysicalTile tile{};
                         tile.packet_block_index = static_cast<uint32_t>(block_index);
                         tile.lane_position = lane_position;

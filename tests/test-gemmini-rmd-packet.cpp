@@ -39,7 +39,8 @@ bool descriptor_equals(const rmd::BlockDescriptor & left,
     for (size_t index = 0; index < left.groups.size(); ++index) {
         const auto & a = left.groups[index];
         const auto & b = right.groups[index];
-        if (a.lane_positions != b.lane_positions || a.k_mask != b.k_mask ||
+        if (a.lane_positions != b.lane_positions || a.row_offsets != b.row_offsets ||
+            a.row_ids != b.row_ids || a.k_mask != b.k_mask ||
             a.padded_k_count != b.padded_k_count ||
             a.activation_offset != b.activation_offset ||
             a.activation_byte_offset != b.activation_byte_offset ||
@@ -593,8 +594,7 @@ bool test_final_group_payload() {
         ++malformed.blocks[0].groups.back().activation_offset;
         ok = rejects_without_mutation(malformed, "misaligned group extent rejects") && ok;
         malformed = *packet;
-        const size_t row_padding = block.groups[0].lane_positions.size() *
-            packet->row_count * block.groups[0].padded_k_count;
+        const size_t row_padding = block.groups[0].row_ids.size() * block.groups[0].padded_k_count;
         if (bits == 4) malformed.stacked_activation.packed_int4[row_padding / 2] = 1;
         if (bits == 8) malformed.stacked_activation.signed_int8[row_padding] = 1;
         if (bits == 16) malformed.stacked_activation.signed_int16[row_padding] = 1;
@@ -730,8 +730,12 @@ bool test_overlapping_lane_k_content() {
 
         const auto set_digit = [&](rmd::StripePacket & target, size_t lane,
                                    size_t row, size_t k, uint8_t value) {
-            const size_t index = (lane * packet->row_count + row) *
-                block.groups[0].padded_k_count + k;
+            const auto & group = block.groups[0];
+            const auto begin = group.row_ids.begin() + group.row_offsets[lane];
+            const auto end = group.row_ids.begin() + group.row_offsets[lane + 1];
+            const auto found = std::lower_bound(begin, end, row);
+            if (found == end || *found != row) return;
+            const size_t index = static_cast<size_t>(found - group.row_ids.begin()) * group.padded_k_count + k;
             if (bits == 4) {
                 const uint8_t shift = 4 * (index % 2);
                 uint8_t & packed = target.stacked_activation.packed_int4[index / 2];
@@ -766,6 +770,94 @@ bool test_overlapping_lane_k_content() {
     return ok;
 }
 
+bool test_zero_limb_rows_are_not_packed() {
+    rmd::RmdStripeBuilder builder;
+    builder.reset(0, 0, 3, 5, 1, 8);
+    if (!builder.add_residual(0, 1, 128) || !builder.add_residual(0, 2, 256) ||
+        !builder.add_residual(1, 1, -129) || !builder.add_residual(1, 4, 65538) ||
+        !builder.add_residual(2, 4, 16777216)) return false;
+    const auto packet = builder.finish();
+    if (!check(packet && packet->blocks.size() == 1 && packet->blocks[0].groups.size() == 1,
+               "zero-row example builds one block and group")) return false;
+    const auto & group = packet->blocks[0].groups[0];
+    if (!check(group.row_offsets == std::array<uint32_t, rmd::kMaxNativeRadixLanes + 1>{0,2,4,5,6} &&
+                   group.row_ids == std::vector<uint16_t>({0,1,0,1,1,2}) &&
+                   packet->k_indices == std::vector<uint16_t>({1,2,4}),
+               "example retains exact original row/lane/K mapping")) return false;
+    const int8_t expected[][3] = {{-128,0,0},{127,0,2},{1,1,0},{-1,0,0},{0,0,1},{0,0,1}};
+    for (size_t row = 0; row < std::size(expected); ++row) {
+        for (size_t k = 0; k < 3; ++k) {
+            if (!check(packet->stacked_activation.signed_int8[
+                           group.activation_offset + row * group.padded_k_count + k] == expected[row][k],
+                       "pack contains only the six nonzero limb/row pairs in canonical order")) return false;
+        }
+    }
+    return true;
+}
+
+bool test_row_mapping_contract() {
+    bool ok = true;
+    for (uint8_t bits : {4, 8, 16}) {
+        rmd::RmdStripeBuilder builder;
+        builder.reset(91, 7, 130, 64, 3, bits);
+        const int32_t place = int32_t{1} << bits;
+        // Deliberately shuffled input, rows on both sides of a 64-bit boundary,
+        // multiple K values for one row, sparse lanes and separate weight blocks.
+        for (const auto & event : std::vector<std::array<int32_t,3>>{
+                 {129,31,place},{64,1,1},{0,3,1},{64,3,2},{65,32,-place},{63,31,-1}}) {
+            if (!builder.add_residual(event[0], event[1], event[2])) return false;
+        }
+        const auto packet = builder.finish();
+        if (!check(packet && rmd::validate_packet(*packet) == rmd::RmdStatus::success,
+                   "row masks handle shuffled input beyond 64 original rows")) return false;        const auto & group = packet->blocks[0].groups[0];
+        ok = check(group.row_offsets == std::array<uint32_t, rmd::kMaxNativeRadixLanes + 1>{0,3,4} &&
+                       group.row_ids == std::vector<uint16_t>({0,63,64,129}),
+                   "row mapping is sorted, unique per lane and independent of input order") && ok;
+        int32_t digit = 99;
+        ok = check(rmd::read_packet_digit(*packet, packet->blocks[0], 0, 65, 0, digit) ==
+                       rmd::RmdStatus::success && digit == 0,
+                   "removed original row reads as implicit zero") && ok;
+        rmd::RmdStatus status;
+        const auto sliced = rmd::slice_packets({packet}, 70, 73, 92, status);
+        ok = check(sliced && status == rmd::RmdStatus::success && sliced->row_count == 3 &&
+                       rmd::validate_packet(*sliced) == rmd::RmdStatus::success,
+                   "slicing remaps compact rows across the word and weight-block boundaries") && ok;
+        const auto empty = rmd::slice_packets({packet}, 8, 10, 93, status);
+        ok = check(!empty && status == rmd::RmdStatus::success,
+                   "an all-zero slice does not create a packed GEMM") && ok;
+        for (unsigned mutation = 0; mutation < 8; ++mutation) {
+            auto bad = *packet;
+            auto & g = bad.blocks[0].groups[0];
+            switch (mutation) {
+                case 0: g.row_offsets.fill(0); break;
+                case 1: ++g.row_offsets.front(); break;
+                case 2: g.row_offsets[1] = 0; break;
+                case 3: ++g.row_offsets[g.lane_positions.size()]; break;
+                case 4: g.row_ids[1] = g.row_ids[0]; break;
+                case 5: g.row_ids[0] = 130; break;
+                case 6: std::swap(g.row_ids[0], g.row_ids[1]); break;
+                case 7: {
+                    const size_t index = g.activation_offset;
+                    if (bits == 4) std::fill_n(bad.stacked_activation.packed_int4.begin() + index / 2,
+                                              g.padded_k_count / 2, uint8_t{0});
+                    if (bits == 8) std::fill_n(bad.stacked_activation.signed_int8.begin() + index,
+                                              g.padded_k_count, int8_t{0});
+                    if (bits == 16) std::fill_n(bad.stacked_activation.signed_int16.begin() + index,
+                                               g.padded_k_count, int16_t{0});
+                    break;
+                }
+            }
+            ok = rejects_without_mutation(bad, "invalid mapping or all-zero stored row is rejected") && ok;
+        }
+        builder.reset(94, 0, 1, 1, 1, bits);
+        builder.add_residual(0,0,1);
+        const auto reset = builder.finish();
+        ok = check(reset && reset->blocks[0].groups[0].row_ids == std::vector<uint16_t>{0},
+                   "reset clears previous row masks") && ok;
+    }
+    return ok;
+}
+
 bool test_group_row_padding() {
     bool ok = true;
     for (uint8_t bits : {4, 8, 16}) {
@@ -786,12 +878,17 @@ bool test_group_row_padding() {
                        "group row boundary fixture builds")) return false;
             const auto & block = packet->blocks[0];
             const auto & group = block.groups[0];
-            const size_t stored_rows = rmd::align_up(2 * rows, rmd::kArrayDim);
+            const size_t zero_low_rows = (rows + 3) / 7;
+            const size_t packed_rows = 2 * rows - zero_low_rows;
+            const size_t stored_rows = rmd::align_up(packed_rows, rmd::kArrayDim);
             const size_t values = stored_rows * rmd::kArrayDim;
             const size_t bytes = values * bits / 8;
-            ok = check(packet->version == 5 && block.active_lane_count == 2 &&
+            ok = check(packet->version == rmd::kPacketVersion && block.active_lane_count == 2 &&
                            block.lane_ids[0] == 0 && block.lane_ids[1] == upper_lane &&
                            group.lane_positions == std::vector<uint8_t>({0, 1}) &&
+                           group.row_offsets == std::array<uint32_t, rmd::kMaxNativeRadixLanes + 1>{0,
+                               static_cast<uint32_t>(rows - zero_low_rows), static_cast<uint32_t>(packed_rows)} &&
+                           group.row_ids.size() == packed_rows &&
                            packet->activation_value_count == values &&
                            group.activation_byte_count == bytes &&
                            block.activation_byte_count == bytes &&
@@ -802,6 +899,7 @@ bool test_group_row_padding() {
             std::vector<uint8_t> expected4(bits == 4 ? bytes : 0, 0);
             std::vector<int8_t> expected8(bits == 8 ? values : 0, 0);
             std::vector<int16_t> expected16(bits == 16 ? values : 0, 0);
+            size_t packed_row = 0;
             for (uint8_t lane = 0; lane < 2; ++lane) {
                 for (size_t row = 0; row < block.rows_padded; ++row) {
                     const int32_t expected = row >= rows ? 0 : lane == 0 ?
@@ -810,8 +908,9 @@ bool test_group_row_padding() {
                     ok = check(rmd::read_packet_digit(*packet, block, lane, row, 0, digit) ==
                                    rmd::RmdStatus::success && digit == expected,
                                "dense lane rows decode with virtual per-lane zero padding") && ok;
-                    if (row >= rows) continue;
-                    const size_t index = (lane * rows + row) * rmd::kArrayDim;
+                    if (row >= rows || expected == 0) continue;
+                    ok = check(group.row_ids[packed_row] == row, "packed row maps to the original row") && ok;
+                    const size_t index = packed_row++ * rmd::kArrayDim;
                     if (bits == 4) expected4[index / 2] = static_cast<uint8_t>(expected) & 0x0f;
                     if (bits == 8) expected8[index] = static_cast<int8_t>(expected);
                     if (bits == 16) expected16[index] = static_cast<int16_t>(expected);
@@ -821,9 +920,9 @@ bool test_group_row_padding() {
                            packet->stacked_activation.signed_int8 == expected8 &&
                            packet->stacked_activation.signed_int16 == expected16,
                        "native bytes contain adjacent real lane rows and one zero group tail") && ok;
-            if (stored_rows > 2 * rows) {
+            if (stored_rows > packed_rows) {
                 auto malformed = *packet;
-                const size_t index = 2 * rows * rmd::kArrayDim;
+                const size_t index = packed_rows * rmd::kArrayDim;
                 if (bits == 4) malformed.stacked_activation.packed_int4[index / 2] = 0x10;
                 if (bits == 8) malformed.stacked_activation.signed_int8[index] = 1;
                 if (bits == 16) malformed.stacked_activation.signed_int16[index] = 1;
@@ -848,7 +947,8 @@ bool test_group_row_padding() {
 }
 
 int main() {
-    const bool ok = test_width_native_round_trip() &&
+    const bool ok = test_zero_limb_rows_are_not_packed() && test_row_mapping_contract() &&
+        test_width_native_round_trip() &&
         test_lane_capacity_and_trimming() &&
         test_int32_packet_round_trip() &&
         test_multiblock_offsets_and_output_layout() &&
