@@ -1,8 +1,9 @@
 #include "../include/gemmini/log.hpp"
 #include "../include/gemmini/log.h"
+#include "../include/gemmini/performance.hpp"
+#include "cycle_reader_internal.h"
 #if defined(__linux__) && defined(__aarch64__)
 #include "../include/gemmini/cycle_reader.hpp"
-#include "cycle_reader_internal.h"
 #endif
 
 #include <cstdarg>
@@ -19,11 +20,26 @@ std::mutex & hardware_counter_mutex()
 }
 
 thread_local bool hardware_counter_c_lease_acquired = false;
+thread_local const ggml::gemmini::log::ScopedWsCycleIdentity *ws_cycle_identity = nullptr;
 
 void report_cycle_boundary_failure() noexcept
 {
     ggml::gemmini::log::cycle.report_failure("serialization");
 }
+
+#if !CYCLE_DETAIL
+void attach_scalar_host_timing(ggml::gemmini::log::CycleRecord & record) noexcept
+{
+    gemmini_scalar_cycle_interval_internal timing{};
+    if (!gemmini_take_scalar_cycle_interval_internal(record.start, record.end, &timing)) return;
+    if (timing.start_tid == 0 || timing.end_tid == 0 || timing.end_ns < timing.start_ns) return;
+    record.ns_start = timing.start_ns;
+    record.ns_end = timing.end_ns;
+    record.tid_start = timing.start_tid;
+    record.tid_end = timing.end_tid;
+    record.host_timing_valid = true;
+}
+#endif
 
 #if defined(__linux__) && defined(__aarch64__)
 const char * internal_source_name(uint8_t source) noexcept
@@ -41,6 +57,18 @@ const char * internal_unit_name(uint8_t) noexcept
 
 namespace ggml::gemmini::log
 {
+ScopedWsCycleIdentity::ScopedWsCycleIdentity(
+        gemmini_cycle_record_v2 identity, const char *domain) noexcept
+    : identity(identity), domain(domain), previous_(ws_cycle_identity)
+{
+    ws_cycle_identity = this;
+}
+
+ScopedWsCycleIdentity::~ScopedWsCycleIdentity() noexcept
+{
+    ws_cycle_identity = previous_;
+}
+
 HardwareCounterLease::HardwareCounterLease()
 {
     hardware_counter_mutex().lock();
@@ -85,6 +113,18 @@ extern "C"
     void gemmini_log_cycle_set_output(FILE *out) noexcept
     {
         try { ggml::gemmini::log::cycle.set_output(out); } catch (...) { report_cycle_boundary_failure(); }
+    }
+
+    void gemmini_log_cycle_set_buffered(int buffered) noexcept
+    {
+        try { ggml::gemmini::log::cycle.set_buffered(buffered != 0); }
+        catch (...) { ggml::gemmini::log::cycle.report_failure("buffering"); }
+    }
+
+    int gemmini_log_cycle_flush(void) noexcept
+    {
+        try { return ggml::gemmini::log::cycle.flush() ? 1 : 0; }
+        catch (...) { ggml::gemmini::log::cycle.report_failure("flush"); return 0; }
     }
 
     void gemmini_log_debug(const char *fmt, ...) noexcept
@@ -175,11 +215,28 @@ extern "C"
             };
             (void) a_reuse;
             (void) b_reuse;
-            const ggml::gemmini::log::WsCycleRecord record{
+            ggml::gemmini::log::WsCycleRecord record{
                 containing_interval_cycles, load_occupancy_cycles, execute_occupancy_cycles,
                 store_occupancy_cycles, loop_occupancy_cycles, dim_I, dim_J, dim_K,
                 tile_I, tile_J, tile_K, I0, J0, K0,
                 checked_product(checked_product(I0, J0), K0)};
+            if (ws_cycle_identity != nullptr) {
+                record.identity = ws_cycle_identity->identity;
+                record.domain = ws_cycle_identity->domain;
+            }
+#if defined(__riscv)
+            record.containing_interval_source = "riscv_cycle";
+#endif
+            const auto occupancy = [&record](const char * metric, uint32_t cycles) {
+                ggml::gemmini::performance::record_npu("HARDWARE", record.domain, metric,
+                    cycles, false, "device_counter_window_and_wrap_unverified");
+            };
+            occupancy("load_occupancy_cycles", load_occupancy_cycles);
+            occupancy("execute_occupancy_cycles", execute_occupancy_cycles);
+            occupancy("store_occupancy_cycles", store_occupancy_cycles);
+            occupancy("loop_occupancy_cycles", loop_occupancy_cycles);
+            ggml::gemmini::performance::record_npu("HARDWARE", record.domain,
+                "work_total_cycles", 0, false, "unavailable_device_elapsed_counter");
             ggml::gemmini::log::cycle.write_json(ggml::gemmini::log::serialize_ws_cycle_record(record));
         }
         catch (...) { report_cycle_boundary_failure(); }
@@ -196,8 +253,13 @@ extern "C"
         if (!record) return;
         try
         {
-            ggml::gemmini::log::cycle.write({record->layer, record->op, record->start, record->end,
-                                             record->file, record->line, record->func});
+            ggml::gemmini::log::CycleRecord captured{
+                record->layer, record->op, record->start, record->end,
+                record->file, record->line, record->func};
+#if !CYCLE_DETAIL
+            attach_scalar_host_timing(captured);
+#endif
+            ggml::gemmini::log::cycle.write(captured);
         }
         catch (...) { report_cycle_boundary_failure(); }
     }
@@ -208,11 +270,15 @@ extern "C"
         try
         {
             const gemmini_cycle_record & interval = record->interval;
-            ggml::gemmini::log::cycle.write({
+            ggml::gemmini::log::CycleRecord captured{
                 interval.layer, interval.op, interval.start, interval.end,
                 interval.file, interval.line, interval.func, nullptr, nullptr,
                 record->identity_mask, record->run_id, record->stripe_id,
-                record->slot, record->node_id, record->worker_id});
+                record->slot, record->node_id, record->worker_id};
+#if !CYCLE_DETAIL
+            attach_scalar_host_timing(captured);
+#endif
+            ggml::gemmini::log::cycle.write(captured);
         }
         catch (...) { report_cycle_boundary_failure(); }
     }

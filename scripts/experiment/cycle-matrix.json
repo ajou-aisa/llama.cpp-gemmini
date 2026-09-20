@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "bits": [4, 8, 16],
+  "families": ["0", "H1", "HP1"],
+  "models": [
+    {
+      "name": "gpt2",
+      "files": ["**/gpt2.Q{bits}_{family}.gguf", "**/gpt2-base.Q{bits}_{family}.gguf"],
+      "prompt": "prompts/gpt2-256.txt"
+    },
+    {
+      "name": "llama3.2-1B",
+      "files": ["**/llama3.2-1B.Q{bits}_{family}.gguf", "**/llama3.2.Q{bits}_{family}.gguf", "**/llama3.2-1B-base.Q{bits}_{family}.gguf"],
+      "prompt": "prompts/llama3.2-256.txt"
+    },
+    {
+      "name": "qwen2-0.5B",
+      "files": ["**/qwen2-0.5B.Q{bits}_{family}.gguf", "**/qwen2.Q{bits}_{family}.gguf", "**/qwen2-0.5B-base.Q{bits}_{family}.gguf"],
+      "prompt": "prompts/qwen2-256.txt"
+    }
+  ],
+  "generation": {
+    "tokens": 10,
+    "threads": 6,
+    "context": 1024,
+    "batch": 512,
+    "seed": 1
+  }
+}

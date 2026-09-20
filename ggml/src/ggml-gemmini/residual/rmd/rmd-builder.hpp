@@ -50,6 +50,9 @@ private:
     size_t logical_j_ = 0;
     uint8_t digit_bits_ = 8;
     size_t residual_event_count_ = 0;
+    int32_t residual_min_ = 0;
+    int32_t residual_max_ = 0;
+    uint8_t required_planes_ = 0;
     std::vector<DigitEntry> entries_;
     std::map<uint32_t, BlockAccum> blocks_;
 };

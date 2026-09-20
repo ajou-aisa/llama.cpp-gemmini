@@ -4,6 +4,8 @@ endif()
 
 file(READ "${DIRECT_SOURCE}" direct_source)
 file(READ "${DIRECT_HEADER}" direct_header)
+get_filename_component(direct_source_dir "${DIRECT_SOURCE}" DIRECTORY)
+file(READ "${direct_source_dir}/direct-profile.hpp" direct_profile)
 file(READ "${TEST_CMAKE}" test_cmake)
 if(NOT DEFINED PROJECT_ROOT)
     get_filename_component(direct_source_dir "${DIRECT_SOURCE}" DIRECTORY)
@@ -36,10 +38,18 @@ require_count("${direct_source}" "const CpuSample tile_start" 1
     "one J-tile start boundary declaration")
 
 # Hooks only substitute endpoint samples. The normal Linux-AArch64 detail path
-# samples and emits for every dynamic tile invocation, including production
-# callers which do not request DirectExecutionMetrics.
-require_count("${direct_source}" "cycle::read_sample\\(\\)" 1
-    "production J-tile endpoint reader")
+# samples once and emits the same pair for every dynamic tile invocation,
+# including callers which do not request DirectExecutionMetrics.
+require_count("${direct_source}" "const auto tile_cpu_start = gemmini_cpu_timing_read\\(\\)" 1
+    "production J-tile shared start sample")
+require_count("${direct_source}" "const auto tile_cpu_end = gemmini_cpu_timing_read\\(\\)" 1
+    "production J-tile shared end sample")
+require_count("${direct_source}" "cycle::read_sample\\(\\)" 0
+    "no duplicate native endpoint reader")
+require_count("${direct_source}" "read_cpu_sample\\(tile_cpu_start\\)" 1
+    "production metrics reuse the raw start sample")
+require_count("${direct_source}" "read_cpu_sample\\(tile_cpu_end\\)" 1
+    "production metrics reuse the raw end sample")
 require_count("${direct_source}" "cycle::evaluate_interval\\(" 1
     "production J-tile provenance evaluator")
 string(FIND "${direct_source}" "CpuInterval cpu_interval" interval_start)
@@ -52,8 +62,9 @@ string(SUBSTRING "${direct_source}" ${interval_start} ${interval_length} interva
 if(NOT interval_block MATCHES "cycle::evaluate_interval\\(")
     message(FATAL_ERROR "J-tile record validity must come from the native evaluator")
 endif()
-require_count("${direct_source}" "gemmini_log_cycle_record_v2_checked_internal\\(" 1
-    "production J-tile checked emitter")
+require_count("${direct_source}"
+    "gemmini_cpu_timing_record\\(&tile_identity, &tile_cpu_start, &tile_cpu_end\\)" 1
+    "production J-tile shared raw checked emitter")
 require_count("${direct_source}" "rmd_direct_j_tile_interval" 1
     "standalone J-tile operation identity")
 if(direct_source MATCHES
@@ -97,29 +108,29 @@ if(NOT DEFINED SEMANTIC_CASE OR SEMANTIC_CASE STREQUAL "F1a")
             "F1a: MatMul::run_full null-metrics direct execution must remain covered")
     endif()
 
-    string(FIND "${direct_source}" "uint64_t identity_mask" wide_identity_mask)
-    string(FIND "${direct_source}" "static_cast<uint32_t>(identity_mask)"
+    string(FIND "${direct_profile}" "uint64_t identity_mask" wide_identity_mask)
+    string(FIND "${direct_profile}" "static_cast<uint32_t>(identity_mask)"
         narrowed_identity_mask)
     if(NOT wide_identity_mask EQUAL -1 OR NOT narrowed_identity_mask EQUAL -1)
         message(FATAL_ERROR
             "F1a: identity_mask must match the uint32_t checked-record ABI without narrowing")
     endif()
-    string(FIND "${direct_source}" "uint32_t identity_mask" identity_begin)
-    string(FIND "${direct_source}"
-        "gemmini_log_cycle_record_v2_checked_internal(" identity_end)
+    string(FIND "${direct_profile}" "uint32_t identity_mask" identity_begin)
+    string(FIND "${direct_profile}"
+        "void prepare(" identity_end)
     if(identity_begin EQUAL -1 OR identity_end EQUAL -1 OR
        identity_end LESS identity_begin)
         message(FATAL_ERROR "F1a: bounded checked identity block is unavailable")
     endif()
     math(EXPR identity_length "${identity_end} - ${identity_begin}")
-    string(SUBSTRING "${direct_source}" ${identity_begin} ${identity_length} identity_block)
+    string(SUBSTRING "${direct_profile}" ${identity_begin} ${identity_length} identity_block)
     string(FIND "${identity_block}" "GEMMINI_CYCLE_HAS_STRIPE_ID" stripe_identity)
     string(FIND "${identity_block}" "GEMMINI_CYCLE_HAS_NODE_ID" node_identity)
     string(FIND "${identity_block}" "GEMMINI_CYCLE_HAS_WORKER_ID" worker_identity)
     string(FIND "${identity_block}" "if (direct_run_id.has_value())" conditional_run)
     string(FIND "${identity_block}" "GEMMINI_CYCLE_HAS_RUN_ID" run_identity)
     string(FIND "${identity_block}" "identity_mask, direct_run_id.value_or(0)" direct_identity_use)
-    string(FIND "${identity_block}" "args.matmul_layer.c_str()" layer_identity)
+    string(FIND "${identity_block}" "layer_.c_str()" layer_identity)
     if(layer_identity EQUAL -1 OR stripe_identity EQUAL -1 OR node_identity EQUAL -1 OR worker_identity EQUAL -1 OR
        conditional_run EQUAL -1 OR run_identity EQUAL -1 OR direct_identity_use EQUAL -1 OR
        NOT conditional_run LESS run_identity)
@@ -134,7 +145,7 @@ if(NOT direct_source MATCHES
 endif()
 foreach(identity_flag IN ITEMS GEMMINI_CYCLE_HAS_RUN_ID GEMMINI_CYCLE_HAS_STRIPE_ID
                                GEMMINI_CYCLE_HAS_NODE_ID GEMMINI_CYCLE_HAS_WORKER_ID)
-    if(NOT direct_source MATCHES "${identity_flag}")
+    if(NOT direct_profile MATCHES "${identity_flag}")
         message(FATAL_ERROR "standalone production emitter lacks ${identity_flag}")
     endif()
 endforeach()
