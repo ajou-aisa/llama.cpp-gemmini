@@ -173,10 +173,9 @@ bool check_worker_cpu_totals() {
     gemmini_cpu_timing_add(&one, &start, &end);
     gemmini_cpu_timing_merge(&combined, &one);
     gemmini_cpu_timing_merge(&combined, &one);
-#if EXPECT_CYCLE_DETAIL
     if (!check(combined.interval_count == 2 && combined.thread_cpu_valid_count == 2 &&
                combined.thread_cpu_ns == 60 && combined.thread_cpu_reason == nullptr,
-               "disjoint worker CPU intervals sum independently of wall time")) return false;
+               "worker CPU intervals sum independently of cycle detail output")) return false;
     end.tid = 8;
     gemmini_cpu_timing_add(&combined, &start, &end);
     if (!check(combined.interval_count == 3 && combined.thread_cpu_valid_count == 2 &&
@@ -188,16 +187,6 @@ bool check_worker_cpu_totals() {
     if (!check(std::string(combined.thread_cpu_reason) == "aggregate_overflow" &&
                serialize_cpu_totals(combined).find("\"thread_cpu_ns\":null") != std::string::npos,
                "overflow never wraps into a valid CPU duration")) return false;
-#else
-    if (!check(combined.interval_count == 2 && combined.thread_cpu_valid_count == 0 &&
-               combined.thread_cpu_reason != nullptr &&
-               std::string(combined.thread_cpu_reason) == "cycle_detail_disabled",
-               "compact cycle mode does not collect worker thread CPU time")) return false;
-    end.tid = 8;
-    gemmini_cpu_timing_add(&combined, &start, &end);
-    if (!check(combined.interval_count == 3 && combined.thread_cpu_valid_count == 0,
-               "compact cycle mode keeps interval cardinality without thread CPU samples")) return false;
-#endif
 #if defined(__linux__) && defined(__aarch64__)
     if (!check(one.cycles == 100 && one.cycles_valid_count == 1 && !one.cycles_reason,
                "native worker CPU cycles retain a valid same-owner delta")) return false;
@@ -216,12 +205,14 @@ bool check_worker_cpu_totals() {
     const auto reads = read_count_for_test();
     const auto actual = gemmini_cpu_timing_read();
 #if EXPECT_LOG_CYCLE
-#if EXPECT_CYCLE_DETAIL
     if (!check(actual.tid == host_thread_id() && actual.ns != 0,
-               "detail worker sampler records thread and host time")) return false;
+               "worker sampler records thread identity and host time in compact and detail modes")) return false;
+#if (defined(__linux__) || defined(__APPLE__)) && defined(CLOCK_THREAD_CPUTIME_ID)
+    if (!check(actual.thread_cpu_valid,
+               "worker sampler retains thread CPU time in compact and detail modes")) return false;
 #else
-    if (!check(actual.tid == host_thread_id() && actual.ns != 0 && actual.thread_cpu_ns == 0,
-               "compact worker sampler records the shared timeline without thread CPU time")) return false;
+    if (!check(!actual.thread_cpu_valid,
+               "unsupported thread CPU clocks remain unavailable")) return false;
 #endif
 #else
     if (!check(actual.ns == 0 && actual.tid == 0 && read_count_for_test() == reads,
@@ -444,6 +435,54 @@ bool check_cpu_interval_record() {
                contains(invalid, "\"owner_token\":17,\"generation\":3"),
                "sample failures retain the original sampled value and provenance with invalid status") && ok;
     return ok;
+}
+
+bool check_cpu_resource_summary_from_timing_add() {
+    using namespace ggml::gemmini::performance;
+    Recording recording;
+    if (!check(recording.output != nullptr, "create CPU resource recording")) return false;
+
+    start_request(100);
+    begin_operation(Phase::prefill, 100);
+    gemmini_cpu_sample start{}, end{};
+    start.ns = 110; end.ns = 150;
+    start.tid = end.tid = 7;
+    start.thread_cpu_ns = 20; end.thread_cpu_ns = 50;
+    start.thread_cpu_valid = end.thread_cpu_valid = 1;
+    start.counter = 100; end.counter = 180;
+    start.native_valid = end.native_valid = 1;
+    start.native_source = end.native_source = GEMMINI_CPU_COUNTER_THREAD_PERF;
+    start.owner_token = end.owner_token = 9;
+    start.generation = end.generation = 3;
+    start.trace = end.trace = gemmini_trace_capture();
+    gemmini_cpu_totals totals{};
+    gemmini_cpu_timing_add(&totals, &start, &end);
+    end_operation(160, true);
+    token_ready(170);
+    finish_request(180);
+    finish_recording();
+
+    const std::string output = read_output(recording.output);
+    const auto summary = replay(output);
+#if EXPECT_LOG_CYCLE
+    const auto prefill = phase_json(summary.serialize(), "prefill");
+    bool ok = check(summary.available &&
+                    contains(output, "\"record_type\":\"RESOURCE_SAMPLE\"") &&
+                    contains(output, "\"kind\":\"cpu\"") &&
+                    contains(prefill, "\"thread_cpu_ns\":30,"),
+                    "CPU timing add publishes the summary resource in compact and detail modes");
+#if defined(__linux__) && defined(__aarch64__)
+    ok = check(contains(prefill, "\"cpu_cycles\":80,"),
+               "Linux AArch64 compact summary retains PMU CPU cycles") && ok;
+#else
+    ok = check(contains(prefill, "\"cpu_cycles\":null,\"cpu_cycles_reason\":\"not_thread_cpu_counter\""),
+               "non-PMU hosts keep CPU cycles unavailable without losing thread CPU time") && ok;
+#endif
+    return ok;
+#else
+    return check(output.empty() && !summary.available,
+                 "compiled-off logging publishes no CPU summary resource");
+#endif
 }
 
 bool check_inference_summary() {
@@ -975,6 +1014,7 @@ int main() {
     ok = check_worker_cpu_totals() && ok;
     ok = check_cpu_interval_record() && ok;
     ok = check_cycle_write_timing() && ok;
+    ok = check_cpu_resource_summary_from_timing_add() && ok;
     ok = check_inference_summary() && ok;
     ok = check_nested_cpu_integrity() && ok;
     ok = check_inference_summary_incomplete() && ok;

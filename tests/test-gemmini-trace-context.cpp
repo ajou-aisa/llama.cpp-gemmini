@@ -157,14 +157,8 @@ bool test_counter_task_separation() {
     a.trace.task_id = b.trace.task_id;
     gemmini_cpu_totals zero{};
     gemmini_cpu_timing_add(&zero, &a, &b);
-#if EXPECT_CYCLE_DETAIL
     if (!check(zero.thread_cpu_valid_count == 1 && zero.thread_cpu_ns == 0,
-               "valid zero thread time is preserved")) return false;
-#else
-    if (!check(zero.thread_cpu_valid_count == 0 && zero.thread_cpu_reason != nullptr &&
-               std::string(zero.thread_cpu_reason) == "cycle_detail_disabled",
-               "compact cycle mode omits thread CPU time")) return false;
-#endif
+               "valid zero thread time is preserved independently of cycle detail output")) return false;
     b.tid = 8;
     json = Json::parse(cycle::serialize_cpu_native(a,b));
 #if defined(__linux__) && defined(__aarch64__)

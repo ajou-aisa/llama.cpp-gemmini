@@ -980,16 +980,11 @@ extern "C" gemmini_cpu_sample gemmini_cpu_timing_read(void) {
     gemmini_cpu_sample result{};
 #if LOG_CYCLE
     result.trace = gemmini_trace_capture();
-#if CYCLE_DETAIL
     const auto host = ggml::gemmini::cycle::read_host_sample();
     result.ns = host.ns;
     result.tid = host.tid;
     result.thread_cpu_ns = host.thread_cpu_ns;
     result.thread_cpu_valid = host.thread_cpu_valid;
-#else
-    result.ns = ggml::gemmini::cycle::timeline_now_ns();
-    result.tid = ggml::gemmini::cycle::host_thread_id();
-#endif
 #if defined(__linux__) && defined(__aarch64__)
     const auto native = ggml::gemmini::cycle::read_sample();
     result.counter = native.value;
@@ -1021,10 +1016,6 @@ gemmini_cpu_totals evaluate_cpu_interval(const gemmini_cpu_sample *start,
         return interval;
     }
     const bool same_thread = start->tid != 0 && start->tid == end->tid;
-#if !CYCLE_DETAIL && (!defined(__linux__) || !defined(__aarch64__))
-    (void) same_thread;
-#endif
-#if CYCLE_DETAIL
     if (!same_thread) {
         interval.thread_cpu_reason = "thread_mismatch";
     } else if (!start->thread_cpu_valid || !end->thread_cpu_valid) {
@@ -1035,9 +1026,6 @@ gemmini_cpu_totals evaluate_cpu_interval(const gemmini_cpu_sample *start,
         interval.thread_cpu_ns = end->thread_cpu_ns - start->thread_cpu_ns;
         interval.thread_cpu_valid_count = 1;
     }
-#else
-    interval.thread_cpu_reason = "cycle_detail_disabled";
-#endif
 #if defined(__linux__) && defined(__aarch64__)
     using namespace ggml::gemmini::cycle;
     if (!same_thread) {
@@ -1072,7 +1060,7 @@ extern "C" void gemmini_cpu_timing_add(gemmini_cpu_totals *totals,
         const gemmini_cpu_sample *start, const gemmini_cpu_sample *end) {
     const auto interval = evaluate_cpu_interval(start, end);
     gemmini_cpu_timing_merge(totals, &interval);
-#if LOG_CYCLE && CYCLE_DETAIL
+#if LOG_CYCLE
     ggml::gemmini::performance::record_cpu(*start, *end, interval);
 #endif
 }
