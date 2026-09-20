@@ -33,7 +33,8 @@ static_assert(kMaxNativeRadixLanes <= std::numeric_limits<uint16_t>::digits,
 
 static_assert(kArrayDim > 0, "Gemmini DIM must be positive");
 static_assert(kBlockSize > 0, "native weight scale group must be positive");
-static_assert(kBlockSize % kArrayDim == 0 || kArrayDim % kBlockSize == 0,
+static_assert(
+    kBlockSize % kArrayDim == 0 || kArrayDim % kBlockSize == 0,
               "Gemmini DIM and native weight scale group must divide one another");
 
 constexpr uint32_t kPacketVersion = 5;
@@ -54,14 +55,17 @@ enum class Int4Packing : uint8_t {
 };
 
 constexpr DigitStorage digit_storage_for_bits(uint8_t digit_bits) {
-    return digit_bits == 4 ? DigitStorage::packed_signed_int4 :
-        digit_bits == 8 ? DigitStorage::signed_int8 :
-        digit_bits == 16 ? DigitStorage::signed_int16 : DigitStorage::invalid;
+  return digit_bits == 4    ? DigitStorage::packed_signed_int4
+         : digit_bits == 8  ? DigitStorage::signed_int8
+         : digit_bits == 16 ? DigitStorage::signed_int16
+                            : DigitStorage::invalid;
 }
 
 using OutputValue = int64_t;
 
-// CPU-direct H1/HP1 corrections have consumed the integer block factor but not
+// HP1 NPU corrections have consumed the block carrier through hardware SCU;
+// the host only composes radix lanes. Explicit CPU-direct H1/HP1 corrections
+// retain their separately selected CPU semantics. Both exclude
 // the per-column floating factor. H0 corrections have consumed their arbitrary
 // floating block factors in double precision. The variant keeps those domains
 // distinct until the common composition path handles them.
@@ -80,16 +84,17 @@ struct FullyScaledFloat64Correction {
 // The correction remains tagged through execution, radix composition, and the
 // final destination merge. Integer-block-scaled and pre-scaled floating values
 // are intentionally not implicitly convertible to one another.
-using Correction = std::variant<BlockScaledInt64Correction,
-                                PreScaledFloat64Correction,
+using Correction =
+    std::variant<BlockScaledInt64Correction, PreScaledFloat64Correction,
                                 FullyScaledFloat64Correction>;
 using DirectOutput = Correction;
 
-inline size_t correction_size(const Correction & correction) {
-    return std::visit([](const auto & typed) { return typed.values.size(); }, correction);
+inline size_t correction_size(const Correction &correction) {
+  return std::visit([](const auto &typed) { return typed.values.size(); },
+                    correction);
 }
 
-inline bool correction_empty(const Correction & correction) {
+inline bool correction_empty(const Correction &correction) {
     return correction_size(correction) == 0;
 }
 
@@ -100,11 +105,13 @@ inline size_t align_up(size_t value, size_t alignment) {
     if (remainder == 0)
         return value;
     const size_t padding = alignment - remainder;
-    return value > std::numeric_limits<size_t>::max() - padding ? 0 : value + padding;
+  return value > std::numeric_limits<size_t>::max() - padding ? 0
+                                                              : value + padding;
 }
 
 struct LaneGroupDescriptor {
-    // Input lanes use row_count rows each, followed by one group tail padded to DIM.
+  // Input lanes use row_count rows each, followed by one group tail padded to
+  // DIM.
     std::vector<uint8_t> lane_positions;
     uint32_t k_mask = 0; // original block-local K, shared by the group's lanes
     uint16_t padded_k_count = 0;
@@ -113,7 +120,8 @@ struct LaneGroupDescriptor {
     uint32_t activation_byte_count = 0;
 };
 
-// One original weight block that carries at least one residual digit in this stripe.
+// One original weight block that carries at least one residual digit in this
+// stripe.
 struct BlockDescriptor {
     uint32_t block_id = 0;        // original weight block index (K / kBlockSize)
     uint32_t global_k_begin = 0;  // block_id * kBlockSize
@@ -121,10 +129,12 @@ struct BlockDescriptor {
     uint16_t compact_k_count = 0; // selected K within this block
     uint16_t padded_k_count = 0;  // compact_k_count aligned to kArrayDim
 
-    uint16_t active_lane_mask = 0; // bit l set when lane l carries a nonzero digit
+  uint16_t active_lane_mask =
+      0; // bit l set when lane l carries a nonzero digit
     uint8_t active_lane_count = 0;
     std::array<uint8_t, kMaxNativeRadixLanes> lane_ids{}; // position -> lane id
-    std::array<uint32_t, kMaxNativeRadixLanes> lane_k_masks{}; // lane id -> original block-local K
+  std::array<uint32_t, kMaxNativeRadixLanes>
+      lane_k_masks{}; // lane id -> original block-local K
     std::vector<LaneGroupDescriptor> groups;
 
     uint32_t k_index_offset = 0;    // into StripePacket::k_indices (block-local K)
@@ -144,15 +154,15 @@ struct ActivationPayload {
     std::vector<int8_t> signed_int8;
     std::vector<int16_t> signed_int16;
 
-    friend bool operator==(const ActivationPayload & left,
-                           const ActivationPayload & right) {
+  friend bool operator==(const ActivationPayload &left,
+                         const ActivationPayload &right) {
         return left.packed_int4 == right.packed_int4 &&
             left.signed_int8 == right.signed_int8 &&
             left.signed_int16 == right.signed_int16;
     }
 
-    friend bool operator!=(const ActivationPayload & left,
-                           const ActivationPayload & right) {
+  friend bool operator!=(const ActivationPayload &left,
+                         const ActivationPayload &right) {
         return !(left == right);
     }
 };
@@ -178,7 +188,8 @@ struct StripePacket {
 
     std::vector<BlockDescriptor> blocks;
     std::vector<uint16_t> k_indices; // block-local K, ascending inside each block
-    // block / group / group lane / real row / group K; zero padding only at each group tail
+  // block / group / group lane / real row / group K; zero padding only at each
+  // group tail
     ActivationPayload stacked_activation;
     size_t activation_value_count = 0; // decoded values, including DIM padding
     size_t residual_event_count = 0;   // nonzero source residuals before radix expansion
@@ -216,7 +227,7 @@ enum class RmdStatus : uint8_t {
     execution_failed,
 };
 
-const char * rmd_status_message(RmdStatus status);
+const char *rmd_status_message(RmdStatus status);
 
 // Width-native numerical contract shared by packet construction and consumers.
 struct BalancedRadixContract {
@@ -234,7 +245,7 @@ struct NativeBalancedDigits {
     uint8_t lane_capacity = 0;
     uint8_t active_lane_count = 0;
 
-    bool operator==(const NativeBalancedDigits & other) const {
+  bool operator==(const NativeBalancedDigits &other) const {
         return digits == other.digits && radix == other.radix &&
             lane_capacity == other.lane_capacity &&
             active_lane_count == other.active_lane_count;
@@ -242,11 +253,11 @@ struct NativeBalancedDigits {
 };
 
 // Supports every INT32 residual; composition rejects digits outside that range.
-// Both calls are transactional: failure leaves the caller-provided output unchanged.
-RmdStatus decompose_balanced_radix(int32_t residual,
-                                   uint8_t operand_bits,
-                                   NativeBalancedDigits & out);
-RmdStatus compose_balanced_radix(const NativeBalancedDigits & digits,
-                                 int64_t & out);
+// Both calls are transactional: failure leaves the caller-provided output
+// unchanged.
+RmdStatus decompose_balanced_radix(int32_t residual, uint8_t operand_bits,
+                                   NativeBalancedDigits &out);
+RmdStatus compose_balanced_radix(const NativeBalancedDigits &digits,
+                                 int64_t &out);
 
-}
+} // namespace ggml::gemmini::rmd

@@ -81,11 +81,22 @@ bool provider_diagnostic_fixtures() {
         expect(empty.find("\"run_id\":0,\"stripe_id\":1,\"slot\":0") != std::string::npos &&
                empty.find("\"residual_nnz\":0") != std::string::npos &&
                empty.find("\"residual_min\":null,\"residual_min_reason\":\"no_nonzero_residual\"") != std::string::npos &&
-               empty.find("\"wall_ns\":null,\"wall_ns_valid\":false,\"wall_ns_reason\":\"no_samples\"") != std::string::npos,
-               "empty residual is a valid observed zero with absent range and stage samples") &&
+               empty.find("\"native_cycles\":null,\"native_cycles_valid\":false,\"native_cycles_reason\":\"no_samples\"") != std::string::npos,
+               "empty residual is a valid observed zero with absent native samples") &&
+#if CYCLE_DETAIL
+        expect(empty.find("\"wall_ns\":null,\"wall_ns_valid\":false,\"wall_ns_reason\":\"no_samples\"") != std::string::npos,
+
+               "detail empty stages preserve absent wall samples") &&
+        expect(nonzero.find("\"wall_ns\":19,\"wall_ns_valid\":true") != std::string::npos,
+               "detail stages retain measured wall time") &&
+#else
+        expect(empty.find("\"wall_ns\"") == std::string::npos &&
+               nonzero.find("\"wall_ns\"") == std::string::npos &&
+               nonzero.find("\"thread_cpu_ns\"") == std::string::npos,
+               "compact diagnostic stages omit detail-only timing fields") &&
+#endif
         expect(nonzero.find("\"residual_min\":-2147483648,\"residual_max\":2147483647") != std::string::npos &&
                nonzero.find("\"required_planes\":5") != std::string::npos &&
-               nonzero.find("\"wall_ns\":19,\"wall_ns_valid\":true") != std::string::npos &&
                nonzero.find("\"native_cycles\":31,\"native_cycles_valid\":true") != std::string::npos &&
                unobserved.find("\"required_planes\":null,\"required_planes_reason\":\"input_observation_unavailable\"") != std::string::npos,
                "signed INT32 observations and sampled stage counters retain exact values and validity") &&
@@ -298,11 +309,17 @@ bool aggregate_serializer_fixtures() {
     interval.layer = "ffn\"norm"; interval.op = "dense";
     interval.start = 10; interval.end = 34;
     const std::string interval_json = serialize_cycle_telemetry(interval);
+#if CYCLE_DETAIL
     const std::string expected_interval =
         "{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"CYCLE_INTERVAL\","
         "\"source\":\"host_tick\",\"unit\":\"tick\",\"op\":\"dense\",\"layer\":\"ffn\\\"norm\","
         "\"run_id\":null,\"stripe_id\":null,\"slot\":null,\"node_id\":null,\"worker_id\":null,"
         "\"start\":10,\"end\":34,\"delta\":24,\"valid\":true}";
+#else
+    const std::string expected_interval =
+        "{\"op\":\"dense\",\"kind\":\"cycle\",\"layer\":\"ffn\\\"norm\","
+        "\"start\":10,\"end\":34,\"delta\":24,\"valid\":true}";
+#endif
 
     WsLoopTelemetry ws{};
     ws.problem_i = 256; ws.problem_j = 768; ws.problem_k = 768;
@@ -501,6 +518,7 @@ bool aggregate_serializer_fixtures() {
                "RTL stripe zero endpoints are serialized rather than treated as missing") &&
         expect(wrapped_stripe_json == expected_wrapped_stripe,
                "RTL stripe wrapped latency uses unsigned endpoint subtraction") &&
+#if CYCLE_DETAIL
         expect(quantization_json == expected_quantization,
                "cross-task quantization cycles are unavailable while ns stays exact") &&
         expect(quantization_cycle_reads == 0,
@@ -510,6 +528,11 @@ bool aggregate_serializer_fixtures() {
                    second_quantization_json.find("quantize_total") == std::string::npos,
                "each stripe retains ns without manufacturing a canonical cycle total") &&
         expect(pipeline_json == expected_pipeline, "pipeline exact schema remains host-nanosecond-only") &&
+#else
+        expect(quantization_json.empty() && second_quantization_json.empty() && pipeline_json.empty() &&
+               quantization_cycle_reads == 0,
+               "compact mode omits detail-only cross-task and pipeline summaries without cycle reads") &&
+#endif
         [&] {
             const std::uint64_t first_generic_run_id = quants::act::exsia::next_exsia_run_id();
             const std::uint64_t second_generic_run_id = quants::act::exsia::next_exsia_run_id();
@@ -560,16 +583,23 @@ bool aggregate_cycle_sink_fixtures() {
     const std::string debug_output = read_file(debug_path);
     bool ok = true;
 #if LOG_CYCLE
-    const char * types[] = {"CYCLE_INTERVAL", "WS_LOOP_TELEMETRY", "IM2P_EXECUTION_TELEMETRY",
-                            "IM2P_STRIPE_TELEMETRY", "QUANTIZATION_STRIPE_TELEMETRY",
-                            "PIPELINE_STRIPE_SUMMARY", "RMD_BACKEND_TELEMETRY"};
+    const char * types[] = {"WS_LOOP_TELEMETRY", "IM2P_EXECUTION_TELEMETRY",
+                            "IM2P_STRIPE_TELEMETRY", "RMD_BACKEND_TELEMETRY",
+#if CYCLE_DETAIL
+                            "CYCLE_INTERVAL", "QUANTIZATION_STRIPE_TELEMETRY", "PIPELINE_STRIPE_SUMMARY",
+#endif
+    };
     for (const char * type : types) {
         ok &= expect(cycle_output.find(std::string("\"record_type\":\"") + type + "\"") != std::string::npos,
                      "aggregate record reaches cycle sink");
     }
-    ok &= expect(count_occurrences(cycle_output, "\"record_type\":") == 7 &&
-                 count_occurrences(cycle_output, "\"additive\":false") == 3,
-                 "cycle sink receives non-additive WS, quantization and RTL stripe rows");
+    ok &= expect(count_occurrences(cycle_output, "\"record_type\":") == std::size(types) &&
+                 count_occurrences(cycle_output, "\"additive\":false") == (CYCLE_DETAIL ? 3 : 2),
+                 "cycle sink receives exactly the records enabled by its log mode");
+#if !CYCLE_DETAIL
+    ok &= expect(cycle_output.find("\"op\":\"interval\",\"kind\":\"cycle\"") != std::string::npos,
+                 "compact scalar interval reaches the same sink");
+#endif
 #else
     ok &= expect(cycle_output.empty(), "cycle-off suppresses aggregate records");
 #endif

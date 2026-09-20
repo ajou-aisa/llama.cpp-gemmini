@@ -1,7 +1,7 @@
 #pragma once
 
-#include "rmd-types.hpp"
 #include "../../quants/common/weight_route.hpp"
+#include "rmd-types.hpp"
 
 #include <array>
 #include <limits>
@@ -12,15 +12,18 @@ struct ggml_gemmini_args_t;
 namespace ggml::gemmini::residual { struct DirectStripePayload; }
 
 namespace ggml::gemmini::rmd {
-namespace detail { struct RmdAssemblerAccess; }
+namespace detail {
+struct RmdAssemblerAccess;
+}
 
 constexpr bool compact_rmd_backend_available(bool hardware_target,
                                              bool im2p_build) {
     return hardware_target || im2p_build;
 }
 
-// Raw NPU tile result. Physical tile order is executor-internal; the assembler
-// validates tags before storing compressed output or composing the correction.
+// Final integer tile result (SCU-scaled for production HP1). Physical tile
+// order is executor-internal; the assembler validates tags before storing
+// compressed output or composing the correction.
 struct PhysicalTile {
     uint32_t packet_block_index = 0;
     uint8_t lane_position = 0;
@@ -29,26 +32,27 @@ struct PhysicalTile {
     uint32_t j_tile = 0;
     uint16_t valid_rows = 0;
     uint16_t valid_cols = 0;
-    const OutputValue * values = nullptr; // valid_rows rows, row stride kArrayDim
+  const OutputValue *values = nullptr; // valid_rows rows, row stride kArrayDim
 };
 
 // Accepts physical tiles in any order and rejects duplicates, missing tiles and
 // out-of-range tags.
 class RmdOutputAssembler {
 public:
-    RmdStatus begin(const StripePacket & packet, CompressedOutput & output);
-    RmdStatus begin(const StripePacket & packet, Correction & correction);
-    RmdStatus submit(const PhysicalTile & tile);
+  RmdStatus begin(const StripePacket &packet, CompressedOutput &output);
+  RmdStatus begin(const StripePacket &packet, Correction &correction);
+  RmdStatus submit(const PhysicalTile &tile);
     RmdStatus finish();
 
 private:
     friend struct detail::RmdAssemblerAccess;
-    RmdStatus begin_validated(const StripePacket & packet, CompressedOutput & output);
-    RmdStatus begin_validated(const StripePacket & packet, Correction & correction);
-    RmdStatus begin(const StripePacket & packet);
-    const StripePacket * packet_ = nullptr;
-    CompressedOutput * output_ = nullptr;
-    Correction * correction_ = nullptr;
+  RmdStatus begin_validated(const StripePacket &packet,
+                            CompressedOutput &output);
+  RmdStatus begin_validated(const StripePacket &packet, Correction &correction);
+  RmdStatus begin(const StripePacket &packet);
+  const StripePacket *packet_ = nullptr;
+  CompressedOutput *output_ = nullptr;
+  Correction *correction_ = nullptr;
     std::vector<__int128> correction_values_;
     std::vector<uint8_t> seen_;
     std::vector<size_t> tile_offset_;   // per block: index of its first tile slot
@@ -87,8 +91,9 @@ struct RmdProviderStats {
     }
 };
 
-inline RmdStatus checked_accumulate_provider_stats(
-    RmdProviderStats &aggregate, const RmdProviderStats &value) noexcept {
+inline RmdStatus
+checked_accumulate_provider_stats(RmdProviderStats &aggregate,
+                                  const RmdProviderStats &value) noexcept {
     auto staged = aggregate;
     for (size_t index = 0; index < RmdProviderStats::field_count; ++index) {
         if (staged.fields[index] >
@@ -162,11 +167,13 @@ struct RmdExecutionMetrics {
     size_t active_lanes = 0;
     size_t compact_k_count = 0;
     size_t padded_k_count = 0;
-    size_t physical_tile_count = 0; // logical per-lane tiles submitted to the assembler
+  size_t physical_tile_count =
+      0; // logical per-lane tiles submitted to the assembler
     size_t matmul_call_count = 0;
     size_t lane_group_count = 0;
     size_t baseline_stacked_i_tile_count = 0;
-    size_t stacked_i_tile_count = 0; // dispatched group row tiles, including K/J repeats
+  size_t stacked_i_tile_count =
+      0; // dispatched group row tiles, including K/J repeats
     size_t packet_bytes = 0;
     size_t compressed_output_values = 0;
     // Per-axis padding counts overlap at cells padded in both rows and K.
@@ -235,13 +242,17 @@ private:
 };
 
 // One immutable matmul weight lifetime. Activation metadata may vary by stripe;
-// changing weights or their shape requires a new context. Preparation alone locks.
+// changing weights or their shape requires a new context. Preparation alone
+// locks.
 class RmdWeightPreparation {
 public:
-    const quants::wroute::WeightRoutePlan & route_plan(const ggml_gemmini_args_t & args);
+  const quants::wroute::WeightRoutePlan &
+  route_plan(const ggml_gemmini_args_t &args);
 #if defined(GGML_GEMMINI_TESTING)
     size_t column_preparations() const { return column_preparations_; }
-    size_t selected_block_preparations() const { return selected_block_preparations_; }
+  size_t selected_block_preparations() const {
+    return selected_block_preparations_;
+  }
 #endif
 
 private:
@@ -260,87 +271,70 @@ private:
 #endif
 };
 
-RmdStatus execute_rmd_stripe_ws_with_weights(const ggml_gemmini_args_t & args,
-    const StripePacket & packet, Correction & correction,
-    RmdWeightPreparation & weights, RmdExecutionMetrics * metrics = nullptr);
+RmdStatus execute_rmd_stripe_ws_with_weights(
+    const ggml_gemmini_args_t &args, const StripePacket &packet,
+    Correction &correction, RmdWeightPreparation &weights,
+    RmdExecutionMetrics *metrics = nullptr);
 
-}
+} // namespace detail
 
-// Executes every block of the compact packet, applies the block integer scale exactly
-// once, and writes canonical block-scaled INT64 output. Matched IM2P_SIM H1/HP1
-// routes use the typed provider executor; non-IM2P builds retain their existing
-// hardware/host policy. The explicit checked-software oracle remains test-only.
-RmdStatus execute_rmd_stripe_ws(const ggml_gemmini_args_t & args,
-                                const StripePacket & packet,
-                                CompressedOutput & output,
-                                RmdExecutionMetrics * metrics = nullptr);
+// Production HP1 executes a whole compact group K on the NPU, including SCU and
+// signed32 fragment accumulation. Host work is radix composition and final
+// float reconstruction only. Legacy non-HP1 routes remain explicitly separate;
+// the checked-software HP1 oracle is available only through the test entry
+// point.
+RmdStatus execute_rmd_stripe_ws(const ggml_gemmini_args_t &args,
+                                const StripePacket &packet,
+                                CompressedOutput &output,
+                                RmdExecutionMetrics *metrics = nullptr);
 
 // Composes block-scaled tiles as they arrive and publishes the final INT64
 // correction only after all tiles and overflow checks succeed.
-RmdStatus execute_rmd_stripe_ws(const ggml_gemmini_args_t & args,
-                                const StripePacket & packet,
-                                Correction & correction,
-                                RmdExecutionMetrics * metrics = nullptr);
+RmdStatus execute_rmd_stripe_ws(const ggml_gemmini_args_t &args,
+                                const StripePacket &packet,
+                                Correction &correction,
+                                RmdExecutionMetrics *metrics = nullptr);
 
 #if defined(GGML_GEMMINI_TESTING)
-// Scalar packet oracle for tests only. Production callers cannot select or invoke it.
-RmdStatus execute_rmd_stripe_reference(const ggml_gemmini_args_t & args,
-                                       const StripePacket & packet,
-                                       CompressedOutput & output,
-                                       RmdExecutionMetrics * metrics = nullptr);
+// Scalar packet oracle for tests only. Production callers cannot select or
+// invoke it.
+RmdStatus execute_rmd_stripe_reference(const ggml_gemmini_args_t &args,
+                                       const StripePacket &packet,
+                                       CompressedOutput &output,
+                                       RmdExecutionMetrics *metrics = nullptr);
 
-RmdStatus execute_rmd_stripe_reference(const ggml_gemmini_args_t & args,
-                                       const StripePacket & packet,
-                                       Correction & correction,
-                                       RmdExecutionMetrics * metrics = nullptr);
+RmdStatus execute_rmd_stripe_reference(const ggml_gemmini_args_t &args,
+                                       const StripePacket &packet,
+                                       Correction &correction,
+                                       RmdExecutionMetrics *metrics = nullptr);
 
 // Instantiates the native Gemmini path in host test builds. Widened codes are
 // preflighted against elem_t and fail before tiled_matmul or metric commit.
 RmdStatus execute_rmd_stripe_gemmini_for_test(
-    const ggml_gemmini_args_t & args,
-    const StripePacket & packet,
-    CompressedOutput & output,
-    RmdExecutionMetrics * metrics = nullptr);
+    const ggml_gemmini_args_t &args, const StripePacket &packet,
+    CompressedOutput &output, RmdExecutionMetrics *metrics = nullptr);
 
-RmdStatus gather_weight_tile_for_test(const ggml_gemmini_args_t & args,
+RmdStatus gather_weight_tile_for_test(const ggml_gemmini_args_t &args,
                                       uint32_t block_id,
-                                      const uint16_t * local_k,
-                                      size_t valid_k,
-                                      size_t col_base,
-                                      size_t valid_cols,
-                                      elem_t * tile,
-                                      size_t tile_stride,
-                                      RmdExecutionMetrics * metrics = nullptr);
+                                      const uint16_t *local_k, size_t valid_k,
+                                      size_t col_base, size_t valid_cols,
+                                      elem_t *tile, size_t tile_stride,
+                                      RmdExecutionMetrics *metrics = nullptr);
 
 RmdStatus gather_wide_weight_tile_for_test(
-    const ggml_gemmini_args_t & args,
-    uint32_t block_id,
-    const uint16_t * local_k,
-    size_t valid_k,
-    size_t col_base,
-    size_t valid_cols,
-    int32_t * tile,
-    size_t tile_stride,
-    RmdExecutionMetrics * metrics = nullptr);
+    const ggml_gemmini_args_t &args, uint32_t block_id, const uint16_t *local_k,
+    size_t valid_k, size_t col_base, size_t valid_cols, int32_t *tile,
+    size_t tile_stride, RmdExecutionMetrics *metrics = nullptr);
 
-RmdStatus repeat_weight_tile_gather_for_test(const ggml_gemmini_args_t & args,
-                                             uint32_t block_count,
-                                             const uint16_t * local_k,
-                                             size_t valid_k,
-                                             size_t col_base,
-                                             size_t valid_cols,
-                                             size_t iterations,
-                                             uint64_t & checksum,
-                                             RmdExecutionMetrics & metrics);
+RmdStatus repeat_weight_tile_gather_for_test(
+    const ggml_gemmini_args_t &args, uint32_t block_count,
+    const uint16_t *local_k, size_t valid_k, size_t col_base, size_t valid_cols,
+    size_t iterations, uint64_t &checksum, RmdExecutionMetrics &metrics);
 
-RmdStatus repeat_scalar_weight_tile_gather_for_test(const ggml_gemmini_args_t & args,
-                                                    uint32_t block_count,
-                                                    const uint16_t * local_k,
-                                                    size_t valid_k,
-                                                    size_t col_base,
-                                                    size_t valid_cols,
-                                                    size_t iterations,
-                                                    uint64_t & checksum);
+RmdStatus repeat_scalar_weight_tile_gather_for_test(
+    const ggml_gemmini_args_t &args, uint32_t block_count,
+    const uint16_t *local_k, size_t valid_k, size_t col_base, size_t valid_cols,
+    size_t iterations, uint64_t &checksum);
 #endif
 
-}
+} // namespace ggml::gemmini::rmd

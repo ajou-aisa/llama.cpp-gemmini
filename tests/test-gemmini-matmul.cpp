@@ -394,6 +394,13 @@ bool test_cpu_cycle_lifecycle() {
                 return std::string_view{};
             };
             const auto ns_field = [](std::string_view row, const char * key) {
+#if !CYCLE_DETAIL
+                // Compact rows carry the same timeline without nested endpoint objects.
+                const std::string_view field(key);
+                if (field == "start_ns") key = "ns_start";
+                else if (field == "end_ns") key = "ns_end";
+                else if (field == "start_tid" || field == "end_tid") key = "tid";
+#endif
                 const std::string needle = std::string("\"") + key + "\":";
                 const auto pos = row.find(needle);
                 uint64_t value = 0;
@@ -420,23 +427,42 @@ bool test_cpu_cycle_lifecycle() {
                     const auto wait = cpu_row("producer_capacity_wait", stripe);
                     if (!expect(!wait.empty() && ns_field(wait, "start_tid") == producer_tid &&
                                 ns_field(wait, "end_tid") == producer_tid &&
-                                ns_field(wait, "start_ns") <= profile.producer_wait_start_ns &&
-                                ns_field(wait, "end_ns") >= profile.producer_wait_end_ns &&
-                                wait.find("\"native_cycles\":{\"start\":{") != std::string_view::npos &&
+                                ns_field(wait, "start_ns") > 0 &&
+                                ns_field(wait, "end_ns") >= ns_field(wait, "start_ns"),
+                                "capacity waits retain same-thread endpoints and wall duration")) return false;
+#if CYCLE_DETAIL
+                    if (!expect(ns_field(wait, "start_ns") <= profile.producer_wait_start_ns &&
+                                ns_field(wait, "end_ns") >= profile.producer_wait_end_ns,
+                                "detail wait interval contains the profiled wait")) return false;
+                    if (!expect(wait.find("\"native_cycles\":{\"start\":{") != std::string_view::npos &&
                                 wait.find("\"additive\":false") != std::string_view::npos,
-                                "capacity waits retain same-owner endpoints and wall duration")) return false;
+                                "detail waits retain native provenance and nonadditive semantics")) return false;
+#endif
                 }
                 const auto preparation = cpu_row("stripe_job_preparation", stripe);
                 const auto dense = cpu_row("dense_backend_host_call", stripe);
                 const auto residual = cpu_row("residual_backend_host_call", stripe);
                 for (const auto row : {preparation, dense, residual}) {
+                    if (!expect(!row.empty() && ns_field(row, "start_ns") > 0 &&
+                                ns_field(row, "end_ns") >= ns_field(row, "start_ns") &&
+                                ns_field(row, "start_tid") != 0,
+                                "both log modes retain placed stage intervals")) return false;
+#if CYCLE_DETAIL
                     if (!expect(row.find("\"native_cycles\":{\"start\":{") != std::string_view::npos &&
                                 row.find("\"owner_token\":") != std::string_view::npos &&
                                 row.find("\"generation\":") != std::string_view::npos &&
                                 row.find("\"thread_cpu_timing\":{") != std::string_view::npos,
                                 "stage logs preserve raw CPU endpoints for offline selection")) return false;
+#else
+                    if (!expect(row.find("\"start\":") != std::string_view::npos &&
+                                row.find("\"end\":") != std::string_view::npos &&
+                                row.find("\"delta\":") != std::string_view::npos &&
+                                row.find("\"valid\":") != std::string_view::npos,
+                                "compact stages retain scalar endpoints and validity")) return false;
+#endif
                 }
                 const auto summary = detail::pipeline_stripe_telemetry(args.matmul_layer.c_str(), profile);
+#if CYCLE_DETAIL
                 if (!expect(profile.capture_queue_enqueue_ns > 0 &&
                             profile.capture_queue_enqueue_ns <= profile.capture_queue_dequeue_ns &&
                             profile.capture_queue_dequeue_ns <= ns_field(preparation, "start_ns") &&
@@ -444,6 +470,11 @@ bool test_cpu_cycle_lifecycle() {
                             ns_field(preparation, "end_ns") <= profile.ws_start_ns &&
                             summary.queue_end_ns == profile.capture_queue_dequeue_ns,
                             "queue ends at actual dequeue before preparation and dense work")) return false;
+#else
+                if (!expect(profile.capture_queue_enqueue_ns == 0 && profile.capture_queue_dequeue_ns == 0 &&
+                            ns_field(preparation, "end_ns") <= profile.ws_start_ns,
+                            "compact mode omits detail queue timestamps but preserves preparation ordering")) return false;
+#endif
                 if (!expect(profile.queue_enqueue_tid == producer_tid &&
                             profile.queue_dequeue_tid != 0 && profile.queue_dequeue_tid != producer_tid &&
                             profile.ws_start_tid == profile.queue_dequeue_tid &&
@@ -453,6 +484,7 @@ bool test_cpu_cycle_lifecycle() {
                             profile.finalize_start_tid == profile.backend_end_tid &&
                             profile.finalize_end_tid == profile.finalize_start_tid,
                             "producer and execution worker identities survive deferred serialization")) return false;
+#if CYCLE_DETAIL
                 if (!expect(profile.ws_end_ns >= profile.ws_start_ns &&
                             profile.rmd_start_ns >= profile.ws_end_ns &&
                             profile.backend_start_ns >= profile.rmd_start_ns &&
@@ -461,12 +493,19 @@ bool test_cpu_cycle_lifecycle() {
                             (stripe == 0 || profiles[stripe - 1].finalize_end_ns <=
                                              profile.capture_queue_dequeue_ns),
                             "host intervals preserve actual dense/residual and stripe ordering")) return false;
+#else
+                if (!expect(profile.ws_end_ns >= profile.ws_start_ns &&
+                            profile.backend_start_ns >= profile.ws_end_ns &&
+                            profile.backend_end_ns >= profile.backend_start_ns,
+                            "compact intervals preserve actual dense/residual ordering")) return false;
+#endif
                 const auto dense_host = cycle::serialize_host_timing(
                     profile.ws_start_ns, profile.ws_end_ns, profile.ws_start_tid, profile.ws_end_tid);
                 const auto residual_host = cycle::serialize_host_timing(
                     profile.backend_start_ns, profile.backend_end_ns,
                     profile.backend_start_tid, profile.backend_end_tid);
                 const auto summary_json = serialize_cycle_telemetry(summary);
+#if CYCLE_DETAIL
                 if (!expect(dense.find("\"host_timing\":" + dense_host) != std::string_view::npos &&
                             residual.find("\"host_timing\":" + residual_host) != std::string_view::npos &&
                             summary_json.find("\"dense\":" + dense_host) != std::string::npos &&
@@ -474,10 +513,18 @@ bool test_cpu_cycle_lifecycle() {
                             summary_json.find("\"host_stages\":{") != std::string::npos &&
                             summary_json.find("\"host_timing\":") == std::string::npos,
                             "pipeline summaries reuse exact backend call boundaries excluding log output")) return false;
-#if CYCLE_DETAIL
                 if (!expect(profile.telemetry_hash_enabled == (hash != 0) &&
                             profile.telemetry_output_hash.empty() == (hash == 0),
                             "hash work is explicitly opt-in")) return false;
+#else
+                (void) dense_host;
+                (void) residual_host;
+                if (!expect(summary_json.empty() &&
+                            ns_field(dense, "start_ns") == profile.ws_start_ns &&
+                            ns_field(dense, "end_ns") == profile.ws_end_ns &&
+                            ns_field(residual, "start_ns") == profile.backend_start_ns &&
+                            ns_field(residual, "end_ns") == profile.backend_end_ns,
+                            "compact stages retain exact boundaries without a detail summary")) return false;
 #endif
             }
             for (const char * op : {"stripe_input_capture", "stripe_job_preparation",
@@ -502,9 +549,14 @@ bool test_cpu_cycle_lifecycle() {
                         if (!expect(tid != 0 && tid == ns_field(row, "end_tid") &&
                                     ns_field(row, "run_id") == run_id &&
                                     row.find("\"run_id\":" + std::to_string(run_id) + ",") != std::string_view::npos &&
+#if CYCLE_DETAIL
                                     row.find("\"stripe_id\":null") != std::string_view::npos &&
                                     row.find("\"native_cycles\":{") != std::string_view::npos &&
                                     row.find("\"additive\":false") != std::string_view::npos &&
+#else
+                                    row.find("\"stripe_id\":") == std::string_view::npos &&
+                                    row.find("\"delta\":") != std::string_view::npos &&
+#endif
                                     (std::string_view(name) == "worker_join_wait" ?
                                         tid == producer_tid : tid != producer_tid),
                                     "worker and join waits preserve their own owner and invocation identity")) return false;

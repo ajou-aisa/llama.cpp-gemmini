@@ -114,14 +114,40 @@ private:
 #endif
 };
 
-void rtl_debug_log_callback(void *, const char *message, size_t length) noexcept {
+// This generic stream route does not call the separate matmul facade's
+// execute_stripe retiler. Snapshot its actual dispatch args at each
+// publication; never reconstruct counts from M/N/K in the simulator.
+::im2p::gemmini::Status
+submit_final_geometry(::im2p::gemmini::Run &run,
+                      const ggml_gemmini_args_t &dispatch_args,
+                      const quants::act::exsia::StripeReadyEvent &event,
+                      ::im2p::gemmini::StripeMetadata metadata = {}) noexcept {
+#if defined(IM2P_FPGA_ARCH_GEMMINI_HP1) ||                                     \
+    defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1)
+  const auto geometry = ::im2p::gemmini::capture_production_geometry(
+      dispatch_args, IM2P_GEOMETRY_STRIPE, event.row_begin,
+      event.row_end - event.row_begin, event.stripe_id);
+  return ::im2p::gemmini::submit_stripe_planned(run, event, &geometry,
+                                                metadata);
+#else
+  (void)dispatch_args;
+  return ::im2p::gemmini::submit_stripe(run, event, metadata);
+#endif
+}
+
+void rtl_debug_log_callback(void *, const char *message,
+                            size_t length) noexcept {
 #if LOG_DEBUG
-  if (message == nullptr || length == 0) return;
-  while (length > 0 && (message[length - 1] == '\n' || message[length - 1] == '\r')) {
+  if (message == nullptr || length == 0)
+    return;
+  while (length > 0 &&
+         (message[length - 1] == '\n' || message[length - 1] == '\r')) {
     --length;
   }
-  if (length == 0) return;
-  const int printable = length > static_cast<size_t>(std::numeric_limits<int>::max())
+  if (length == 0)
+    return;
+  const int printable =
+      length > static_cast<size_t>(std::numeric_limits<int>::max())
                             ? std::numeric_limits<int>::max()
                             : static_cast<int>(length);
   try {
@@ -157,15 +183,16 @@ public:
         metadata != nullptr && metadata->run_id.has_value()) {
       record_.identity_mask = GEMMINI_CYCLE_HAS_RUN_ID;
       record_.run_id = *metadata->run_id;
-    } else if (const auto *metadata =
-                   std::get_if<quants::act::block::Meta>(&args.act_quant.storage());
+    } else if (const auto *metadata = std::get_if<quants::act::block::Meta>(
+                   &args.act_quant.storage());
                metadata != nullptr && metadata->run_id.has_value()) {
       record_.identity_mask = GEMMINI_CYCLE_HAS_RUN_ID;
       record_.run_id = *metadata->run_id;
     }
     if (event != nullptr) {
       record_.identity_mask = GEMMINI_CYCLE_HAS_RUN_ID |
-                              GEMMINI_CYCLE_HAS_STRIPE_ID | GEMMINI_CYCLE_HAS_SLOT;
+                              GEMMINI_CYCLE_HAS_STRIPE_ID |
+                              GEMMINI_CYCLE_HAS_SLOT;
       record_.run_id = event->run_id;
       record_.stripe_id = event->stripe_id;
       record_.slot = event->slot;
@@ -190,8 +217,8 @@ public:
     if (cpu_work_) performance::record_cpu_wall(start_.ns, end.ns);
 #endif
     try {
-      log::cycle.write_json(serialize_matmul_cpu_interval(
-          record_, start_, end, operation_success));
+      log::cycle.write_json(serialize_matmul_cpu_interval(record_, start_, end,
+                                                          operation_success));
     } catch (...) {
       log::cycle.report_failure("IM2P host CPU interval");
     }
@@ -209,14 +236,29 @@ private:
   using Code = ::im2p::gemmini::StatusCode;
   Code code = Code::execution_failure;
   switch (result.error) {
-  case Error::success: code = Code::success; break;
-  case Error::invalid_argument: code = Code::invalid_argument; break;
-  case Error::invalid_contract: code = Code::invalid_contract; break;
-  case Error::unsupported_route: code = Code::unsupported_route; break;
-  case Error::invalid_state: code = Code::invalid_state; break;
-  case Error::backpressure: code = Code::backpressure; break;
-  case Error::out_of_memory: code = Code::out_of_memory; break;
-  case Error::execution_failure: break;
+  case Error::success:
+    code = Code::success;
+    break;
+  case Error::invalid_argument:
+    code = Code::invalid_argument;
+    break;
+  case Error::invalid_contract:
+    code = Code::invalid_contract;
+    break;
+  case Error::unsupported_route:
+    code = Code::unsupported_route;
+    break;
+  case Error::invalid_state:
+    code = Code::invalid_state;
+    break;
+  case Error::backpressure:
+    code = Code::backpressure;
+    break;
+  case Error::out_of_memory:
+    code = Code::out_of_memory;
+    break;
+  case Error::execution_failure:
+    break;
   }
   return {code, ::im2p::gemmini::Route::unknown, result.native_contract,
           result.message};
@@ -386,8 +428,8 @@ Result translate(const ::im2p::gemmini::Status &status) noexcept {
   return {error, status.message, status.native_contract};
 }
 
-static Stats translate_stats(
-    const im2p_work_stats_extended_t &source) noexcept {
+static Stats
+translate_stats(const im2p_work_stats_extended_t &source) noexcept {
   const auto &base = source.base;
   return Stats{
       base.work_total_cycles,
@@ -499,7 +541,8 @@ Completion translate(const ::im2p::gemmini::FenceResult &result,
   } else if (expected_publications == 0 || expected_published_rows == 0 ||
              base.stripes_published != expected_publications ||
              base.stripe_rows_published != expected_published_rows) {
-    return {{Error::invalid_contract,
+    return {
+        {Error::invalid_contract,
              "PIPELINE IM2P publication statistics do not match canonical geometry",
              false},
             stats};
@@ -511,8 +554,8 @@ Completion translate(const ::im2p::gemmini::FenceResult &result,
   return completion;
 }
 
-static Result validate_stripe_timings(
-    const ::im2p::gemmini::StripeRtlTimingView &timings,
+static Result
+validate_stripe_timings(const ::im2p::gemmini::StripeRtlTimingView &timings,
     const ggml_gemmini_args_t &args, const Stats &stats,
     std::uint64_t expected_run_id) noexcept {
   if (args.activation_rows_per_stripe == 0) {
@@ -525,7 +568,8 @@ static Result validate_stripe_timings(
   if (timings.data == nullptr || timings.size != expected_count ||
       stats.rtl_stripes_published != expected_count ||
       stats.rtl_stripe_rows_published != args.I) {
-    return {Error::invalid_contract,
+    return {
+        Error::invalid_contract,
             "PIPELINE stripe timing count does not match publication statistics",
             false};
   }
@@ -552,8 +596,8 @@ static Result validate_stripe_timings(
   return {};
 }
 
-static void emit_stripe_timings(
-    const ::im2p::gemmini::StripeRtlTimingView &timings,
+static void
+emit_stripe_timings(const ::im2p::gemmini::StripeRtlTimingView &timings,
     const ggml_gemmini_args_t &args) noexcept {
   for (const auto &timing : timings) {
     Im2pStripeTelemetry record{};
@@ -569,8 +613,8 @@ static void emit_stripe_timings(
   }
 }
 
-static Result validate_residual_stripe_timings(
-    const ::im2p::gemmini::FenceResult &result,
+static Result
+validate_residual_stripe_timings(const ::im2p::gemmini::FenceResult &result,
     std::uint64_t expected_run_id) noexcept {
   const Result status = translate(result.status);
   if (!status.ok())
@@ -590,10 +634,12 @@ static Result validate_residual_stripe_timings(
   for (std::size_t index = 0; index < count; ++index) {
     const auto &semantic = result.semantic_stripes[index];
     const auto &timing = result.residual_stripe_timings[index];
-    if (semantic.run_id != expected_run_id || timing.run_id != expected_run_id ||
-        semantic.stripe_id != index || timing.stripe_id != index ||
-        semantic.slot != timing.slot || semantic.row_begin != timing.row_begin ||
-        semantic.row_end != timing.row_end || semantic.row_end < semantic.row_begin ||
+    if (semantic.run_id != expected_run_id ||
+        timing.run_id != expected_run_id || semantic.stripe_id != index ||
+        timing.stripe_id != index || semantic.slot != timing.slot ||
+        semantic.row_begin != timing.row_begin ||
+        semantic.row_end != timing.row_end ||
+        semantic.row_end < semantic.row_begin ||
         timing.rmd_dot_calls >
             std::numeric_limits<std::uint64_t>::max() - summed_calls ||
         timing.rmd_stats.base.work_total_cycles >
@@ -613,8 +659,7 @@ static Result validate_residual_stripe_timings(
   return {};
 }
 
-Result emit_residual_stripe_timings(
-    const ::im2p::gemmini::FenceResult &result,
+Result emit_residual_stripe_timings(const ::im2p::gemmini::FenceResult &result,
     const ggml_gemmini_args_t &args,
     std::uint64_t expected_run_id) noexcept {
   const Result status =
@@ -644,7 +689,8 @@ Result gate_route(const ExsiaRouteRequest &request) noexcept {
     return bits == 4 || bits == 8 || bits == 16;
   };
   if (!supported_width(request.activation_bits)) {
-    return {Error::unsupported_route, "unsupported IM2P activation width", false};
+    return {Error::unsupported_route, "unsupported IM2P activation width",
+            false};
   }
   if (!supported_width(request.weight_bits)) {
     return {Error::unsupported_route, "unsupported IM2P weight width", false};
@@ -664,8 +710,7 @@ Result gate_route(const ExsiaRouteRequest &request) noexcept {
   }
   if (!request.exsia) {
     if (request.block_activation && request.mode != PublicMode::full) {
-      return {Error::unsupported_route,
-              "BLOCK IM2P requires FULL mode", false};
+      return {Error::unsupported_route, "BLOCK IM2P requires FULL mode", false};
     }
     if (request.rmd_enabled) {
       if (request.mode != PublicMode::full) {
@@ -678,7 +723,8 @@ Result gate_route(const ExsiaRouteRequest &request) noexcept {
                 false};
       }
       if (request.activation_bits != request.weight_bits) {
-        return {Error::unsupported_route,
+        return {
+            Error::unsupported_route,
                 "baseline IM2P RMD requires matched activation and weight widths",
                 false};
       }
@@ -686,7 +732,8 @@ Result gate_route(const ExsiaRouteRequest &request) noexcept {
       case WeightFamily::h0:
         return request.residual_backend == ResidualBackend::cpu_direct
                    ? Result{}
-                   : Result{Error::unsupported_route,
+                   : Result{
+                         Error::unsupported_route,
                             "H0 baseline requires CPU-direct residual execution",
                             false};
       case WeightFamily::h1:
@@ -695,8 +742,10 @@ Result gate_route(const ExsiaRouteRequest &request) noexcept {
       case WeightFamily::channel:
         return request.weight_bits == 8 && !request.block_activation
                    ? Result{}
-                   : Result{Error::unsupported_route,
-                            "channel RMD requires an 8-bit non-BLOCK activation", false};
+                   : Result{
+                         Error::unsupported_route,
+                         "channel RMD requires an 8-bit non-BLOCK activation",
+                         false};
       case WeightFamily::h2:
       case WeightFamily::hp2:
         return {Error::unsupported_route,
@@ -712,8 +761,7 @@ Result gate_route(const ExsiaRouteRequest &request) noexcept {
         return {};
     }
     return {Error::unsupported_route,
-            "IM2P routes require matched activation and weight widths",
-            false};
+            "IM2P routes require matched activation and weight widths", false};
   }
   if (request.build_identity != BuildIdentity::im2p_sim_ws) {
     return {Error::unsupported_route,
@@ -750,22 +798,17 @@ Result gate_route(const ExsiaRouteRequest &request) noexcept {
 
 Result gate_route(bool exsia, std::uint8_t activation_bits, bool rmd_enabled,
                   bool cpu_direct_rmd, std::uint8_t weight_bits) noexcept {
-  return gate_route({exsia,
-                     activation_bits,
-                     weight_bits,
-                     activation_bits,
-                     weight_bits,
-                     rmd_enabled,
-                     PublicMode::full,
+  return gate_route({exsia, activation_bits, weight_bits, activation_bits,
+                     weight_bits, rmd_enabled, PublicMode::full,
                      WeightFamily::h1,
                      cpu_direct_rmd ? ResidualBackend::cpu_direct
                                     : ResidualBackend::compact_ws,
                      BuildIdentity::im2p_sim_ws});
 }
 
-static Result apply_baseline_rmd_full(
-    const ggml_gemmini_args_t &runtime_args, float *output_data,
-    size_t output_elements,
+static Result
+apply_baseline_rmd_full(const ggml_gemmini_args_t &runtime_args,
+                        float *output_data, size_t output_elements,
     ::im2p::gemmini::ResidualStripeStats &result_stats,
     std::uint64_t &semantic_completion_count) noexcept {
   const auto *metadata =
@@ -791,14 +834,16 @@ static Result apply_baseline_rmd_full(
       runtime_args.residual_route == residual::ResidualRoute::cpu_direct;
   if ((direct_route && !rmd_packets.empty()) ||
       (!direct_route && !direct_residuals.empty())) {
-    return {Error::invalid_contract,
+    return {
+        Error::invalid_contract,
             "baseline FULL residual payload does not match the selected backend",
             false};
   }
 
   struct SimulatorDeleter {
     void operator()(im2p_sim_t *sim) const noexcept {
-      if (sim != nullptr) im2p_sim_destroy(sim);
+      if (sim != nullptr)
+        im2p_sim_destroy(sim);
 #if defined(GGML_GEMMINI_TESTING)
       if (sim != nullptr) {
         std::lock_guard lock(test_mutex);
@@ -830,11 +875,10 @@ static Result apply_baseline_rmd_full(
   rmd::RmdProviderStats staged_provider_stats{};
   rmd::detail::RmdWeightPreparation weights;
   const auto accumulate_metrics = [&](const rmd::RmdExecutionMetrics &metrics) {
-    if (metrics.im2p_dot_calls >
-            std::numeric_limits<std::uint64_t>::max() -
+    if (metrics.im2p_dot_calls > std::numeric_limits<std::uint64_t>::max() -
                 staged_stats.rmd_dot_calls ||
-        rmd::checked_accumulate_provider_stats(
-            staged_provider_stats, metrics.im2p_stats) !=
+        rmd::checked_accumulate_provider_stats(staged_provider_stats,
+                                               metrics.im2p_stats) !=
             rmd::RmdStatus::success) {
       return false;
     }
@@ -863,7 +907,8 @@ static Result apply_baseline_rmd_full(
       const rmd::RmdStatus executed = residual::execute_direct_stripe(
           runtime_args, *payload, correction, &direct_metrics);
       backend.finish(executed == rmd::RmdStatus::success);
-      if (executed != rmd::RmdStatus::success) return from_rmd_status(executed);
+      if (executed != rmd::RmdStatus::success)
+        return from_rmd_status(executed);
 #if defined(GGML_GEMMINI_TESTING)
       {
         std::lock_guard lock(test_mutex);
@@ -874,7 +919,8 @@ static Result apply_baseline_rmd_full(
       const rmd::RmdStatus merged = rmd::merge_rmd_correction_to(
           runtime_args, output_data, payload->row_begin, row_end, correction);
       merge.finish(merged == rmd::RmdStatus::success);
-      if (merged != rmd::RmdStatus::success) return from_rmd_status(merged);
+      if (merged != rmd::RmdStatus::success)
+        return from_rmd_status(merged);
 #if defined(GGML_GEMMINI_TESTING)
       {
         std::lock_guard lock(test_mutex);
@@ -900,7 +946,8 @@ static Result apply_baseline_rmd_full(
               simulator.get(), runtime_args, *packet, correction, weights,
               &metrics);
       backend.finish(executed == rmd::RmdStatus::success);
-      if (executed != rmd::RmdStatus::success) return from_rmd_status(executed);
+      if (executed != rmd::RmdStatus::success)
+        return from_rmd_status(executed);
 #if defined(GGML_GEMMINI_TESTING)
       {
         std::lock_guard lock(test_mutex);
@@ -917,7 +964,8 @@ static Result apply_baseline_rmd_full(
           rmd::detail::merge_rmd_correction_with_weights(
               runtime_args, output_data, *packet, correction, weights);
       merge.finish(merged == rmd::RmdStatus::success);
-      if (merged != rmd::RmdStatus::success) return from_rmd_status(merged);
+      if (merged != rmd::RmdStatus::success)
+        return from_rmd_status(merged);
 #if defined(GGML_GEMMINI_TESTING)
       {
         std::lock_guard lock(test_mutex);
@@ -985,8 +1033,10 @@ Completion run_full(const ggml_gemmini_args_t &args) noexcept {
   preparation.finish();
   ::im2p::gemmini::Options frontend_options{65536};
   frontend_options.numerical_contract =
-#if defined(IM2P_FPGA_ARCH_GEMMINI_HP1) || defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1)
+#if defined(IM2P_FPGA_ARCH_GEMMINI_HP1) ||                                     \
+    defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1)
       ::im2p::gemmini::NumericalContract::scu_final_integer;
+  frontend_options.production_geometry = true;
 #else
       ::im2p::gemmini::NumericalContract::main_external;
 #endif
@@ -1041,9 +1091,10 @@ Completion run_full(const ggml_gemmini_args_t &args) noexcept {
       ::im2p::gemmini::ResidualStripeStats rmd_stats{};
       std::uint64_t semantic_completion_count = 0;
       const Result rmd = apply_baseline_rmd_full(
-          runtime_args, staged_output.data(), staged_output.size(),
-          rmd_stats, semantic_completion_count);
-      if (!rmd.ok()) return {rmd, completion.stats};
+          runtime_args, staged_output.data(), staged_output.size(), rmd_stats,
+          semantic_completion_count);
+      if (!rmd.ok())
+        return {rmd, completion.stats};
       if (const auto *metadata = std::get_if<quants::act::block::Meta>(
               &runtime_args.act_quant.storage())) {
         completion.run_id = metadata->run_id.value_or(0);
@@ -1093,8 +1144,10 @@ Completion run_stripe_pipeline(const ggml_gemmini_args_t &args) noexcept {
   preparation.finish();
   ::im2p::gemmini::Options frontend_options{65536};
   frontend_options.numerical_contract =
-#if defined(IM2P_FPGA_ARCH_GEMMINI_HP1) || defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1)
+#if defined(IM2P_FPGA_ARCH_GEMMINI_HP1) ||                                     \
+    defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1)
       ::im2p::gemmini::NumericalContract::scu_final_integer;
+  frontend_options.production_geometry = true;
 #else
       ::im2p::gemmini::NumericalContract::main_external;
 #endif
@@ -1102,8 +1155,7 @@ Completion run_stripe_pipeline(const ggml_gemmini_args_t &args) noexcept {
   worker_timing.attach(frontend_options);
   HostCpuInterval frontend_start(args, "im2p.frontend_start_host_call", HostIntervalAccounting::excluded_from_cpu_work);
   auto started = ::im2p::gemmini::execute(
-      &runtime_args, ::im2p::gemmini::Mode::stripe_pipeline,
-      frontend_options);
+      &runtime_args, ::im2p::gemmini::Mode::stripe_pipeline, frontend_options);
   frontend_start.finish(started.status.ok());
   if (!started.status.ok()) {
 #if defined(GGML_GEMMINI_TESTING)
@@ -1129,11 +1181,11 @@ Completion run_stripe_pipeline(const ggml_gemmini_args_t &args) noexcept {
     event.stripe_id = stripe_id;
     event.slot = stripe_id % 2;
     event.row_begin = row_begin;
-    event.row_end =
-        std::min(runtime_args.I,
-                 row_begin + runtime_args.activation_rows_per_stripe);
-    HostCpuInterval submit(args, "im2p.stripe_submit_host_call", HostIntervalAccounting::excluded_from_cpu_work, &event);
-    const auto status = ::im2p::gemmini::submit_stripe(*started.run, event);
+    event.row_end = std::min(
+        runtime_args.I, row_begin + runtime_args.activation_rows_per_stripe);
+    HostCpuInterval submit(args, "im2p.stripe_submit_host_call",
+                           HostIntervalAccounting::excluded_from_cpu_work, &event);
+    const auto status = submit_final_geometry(*started.run, runtime_args, event);
     submit.finish(status.ok());
     if (!status.ok()) {
 #if defined(GGML_GEMMINI_TESTING)
@@ -1221,8 +1273,8 @@ struct CapturedExsiaStripe {
   std::int16_t theta = 0;
 };
 
-static void emit_quantization_timings(
-    const std::vector<CapturedExsiaStripe> &stripes,
+static void
+emit_quantization_timings(const std::vector<CapturedExsiaStripe> &stripes,
     const ggml_gemmini_args_t &args) noexcept {
   for (const auto &stripe : stripes) {
     QuantizationStripeTelemetry record{};
@@ -1283,8 +1335,7 @@ static WeightFamily concrete_weight_family(
 // facade, it keeps one compact simulator alive across every canonical packet.
 static Result apply_captured_rmd_full(
     const ggml_gemmini_args_t &runtime_args, float *output_data,
-    size_t output_elements,
-    const std::vector<CapturedExsiaStripe> &captured,
+    size_t output_elements, const std::vector<CapturedExsiaStripe> &captured,
     ::im2p::gemmini::ResidualStripeStats &result_stats) noexcept {
 #if defined(GGML_GEMMINI_TESTING)
   TestFailure failure;
@@ -1312,7 +1363,8 @@ static Result apply_captured_rmd_full(
     ordered.reserve(captured.size());
     for (const auto &stripe : captured)
       ordered.push_back(&stripe);
-    std::sort(ordered.begin(), ordered.end(), [](const auto *lhs, const auto *rhs) {
+    std::sort(ordered.begin(), ordered.end(),
+              [](const auto *lhs, const auto *rhs) {
       return lhs->event.row_begin < rhs->event.row_begin;
     });
     auto &metadata =
@@ -1382,8 +1434,8 @@ static Result apply_captured_rmd_full(
     simulator.reset(im2p_sim_create());
     simulator_start.finish(simulator != nullptr);
     if (!simulator) {
-      return {Error::out_of_memory,
-              "failed to create FULL residual simulator", false};
+      return {Error::out_of_memory, "failed to create FULL residual simulator",
+              false};
     }
 #if defined(GGML_GEMMINI_TESTING)
     {
@@ -1445,7 +1497,8 @@ static Result apply_captured_rmd_full(
 #endif
       {
         status = rmd::detail::execute_rmd_stripe_im2p_with_weights(
-            simulator.get(), *rmd_args, *event.rmd_packet, correction, weights, &metrics);
+            simulator.get(), *rmd_args, *event.rmd_packet, correction, weights,
+            &metrics);
         shared_weights = true;
       }
       backend.finish(status == rmd::RmdStatus::success);
@@ -1457,11 +1510,11 @@ static Result apply_captured_rmd_full(
     if (metrics.im2p_dot_calls >
             std::numeric_limits<std::uint64_t>::max() -
                 staged_stats.rmd_dot_calls ||
-        rmd::checked_accumulate_provider_stats(
-            staged_provider_stats, metrics.im2p_stats) !=
+        rmd::checked_accumulate_provider_stats(staged_provider_stats,
+                                               metrics.im2p_stats) !=
             rmd::RmdStatus::success) {
-      return {Error::execution_failure,
-              "FULL RMD provider statistics overflow", false};
+      return {Error::execution_failure, "FULL RMD provider statistics overflow",
+              false};
     }
     staged_stats.rmd_dot_calls += metrics.im2p_dot_calls;
 
@@ -1472,8 +1525,8 @@ static Result apply_captured_rmd_full(
       counters.rmd_dot_calls += metrics.im2p_dot_calls;
     }
     if (failure == TestFailure::compose) {
-      return {Error::execution_failure,
-              "injected FULL RMD compose failure", false};
+      return {Error::execution_failure, "injected FULL RMD compose failure",
+              false};
     }
 #endif
     if (status == rmd::RmdStatus::success && !no_residual) {
@@ -1537,8 +1590,8 @@ public:
     return static_cast<Impl *>(opaque)->publish(event);
   }
 
-  static ::im2p::gemmini::Status residual_stage(
-      void *opaque, im2p_sim_t *simulator,
+  static ::im2p::gemmini::Status
+  residual_stage(void *opaque, im2p_sim_t *simulator,
       const quants::act::exsia::StripeReadyEvent &event,
       ::im2p::gemmini::ResidualStageView stage,
       ::im2p::gemmini::ResidualStripeStats &stats) noexcept {
@@ -1546,8 +1599,8 @@ public:
                                                        stats);
   }
 
-  ::im2p::gemmini::Status apply_residual(
-      im2p_sim_t *simulator,
+  ::im2p::gemmini::Status
+  apply_residual(im2p_sim_t *simulator,
       const quants::act::exsia::StripeReadyEvent &event,
       ::im2p::gemmini::ResidualStageView stage,
       ::im2p::gemmini::ResidualStripeStats &stats) noexcept {
@@ -1563,8 +1616,8 @@ public:
         (residual_mode == ::im2p::gemmini::ResidualStageMode::host_direct
              ? simulator != nullptr || event.rmd_packet != nullptr
              : simulator == nullptr || event.direct_residual != nullptr)) {
-      return to_frontend_status(
-          {Error::invalid_contract, "invalid PIPELINE residual callback event",
+      return to_frontend_status({Error::invalid_contract,
+                                 "invalid PIPELINE residual callback event",
            false});
     }
     size_t output_extent = 0;
@@ -1579,8 +1632,8 @@ public:
     ggml_gemmini_args_t stripe_args;
     try {
       stripe_args = runtime_args;
-      auto &metadata = stripe_args.act_quant.storage()
-                           .emplace<quants::act::exsia::Meta>();
+      auto &metadata =
+          stripe_args.act_quant.storage().emplace<quants::act::exsia::Meta>();
       metadata.e_s = event.activation_metadata->e_s;
       metadata.rho = event.activation_metadata->rho;
       metadata.sigma = event.activation_metadata->sigma;
@@ -1614,8 +1667,7 @@ public:
       const char *message = failure == TestFailure::dense
                                 ? "injected dense completion failure"
                                 : "injected residual execute failure";
-      return to_frontend_status(
-          {Error::execution_failure, message, false});
+      return to_frontend_status({Error::execution_failure, message, false});
     }
 #endif
 
@@ -1664,7 +1716,8 @@ public:
 #endif
       {
         status = rmd::detail::execute_rmd_stripe_im2p_with_weights(
-            simulator, stripe_args, *event.rmd_packet, correction, *rmd_weights, &metrics);
+            simulator, stripe_args, *event.rmd_packet, correction, *rmd_weights,
+            &metrics);
         shared_weights = true;
       }
       backend.finish(status == rmd::RmdStatus::success);
@@ -1763,7 +1816,8 @@ public:
             ? std::numeric_limits<std::int16_t>::min()
             : metadata->resolve_stripe_theta(static_cast<int>(event.stripe_id));
     if (metadata == nullptr || !has_immediate_theta_prefix(*metadata, event)) {
-      sink_result = {Error::invalid_contract,
+      sink_result = {
+          Error::invalid_contract,
                      "published ExSIA stripe is not at the immediate theta boundary",
                      false};
       return false;
@@ -1782,7 +1836,7 @@ public:
     capture.finish();
     HostCpuInterval submit(args, "im2p.stripe_submit_host_call", HostIntervalAccounting::excluded_from_cpu_work, &event);
     const auto status =
-        ::im2p::gemmini::submit_stripe(*run, event, {true, theta});
+        submit_final_geometry(*run, runtime_args, event, {true, theta});
     submit.finish(status.ok());
     if (!status.ok()) {
       published.pop_back();
@@ -1949,7 +2003,8 @@ public:
             ? std::numeric_limits<std::int16_t>::min()
             : metadata->resolve_stripe_theta(static_cast<int>(event.stripe_id));
     if (metadata == nullptr || !has_immediate_theta_prefix(*metadata, event)) {
-      collector_result = {Error::invalid_contract,
+      collector_result = {
+          Error::invalid_contract,
                           "collected ExSIA stripe is not at the immediate theta boundary",
                           false};
       return false;
@@ -2126,8 +2181,10 @@ Completion ExsiaFullExecution::finish(bool quantization_succeeded) noexcept {
 #endif
   ::im2p::gemmini::Options frontend_options{65536};
   frontend_options.numerical_contract =
-#if defined(IM2P_FPGA_ARCH_GEMMINI_HP1) || defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1)
+#if defined(IM2P_FPGA_ARCH_GEMMINI_HP1) ||                                     \
+    defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1)
       ::im2p::gemmini::NumericalContract::scu_final_integer;
+  frontend_options.production_geometry = true;
 #else
       ::im2p::gemmini::NumericalContract::main_external;
 #endif
@@ -2238,8 +2295,8 @@ start_exsia_stripe_pipeline(ggml_gemmini_args_t &args) noexcept {
 #endif
   size_t output_extent = 0;
   if (!checked_output_extent(args, output_extent)) {
-    return {{Error::invalid_contract,
-             "invalid IM2P ExSIA output layout", false},
+    return {
+        {Error::invalid_contract, "invalid IM2P ExSIA output layout", false},
             {}};
   }
 
@@ -2273,8 +2330,10 @@ start_exsia_stripe_pipeline(ggml_gemmini_args_t &args) noexcept {
       65536, impl->residual_mode, impl.get(),
       &ExsiaStripePipeline::Impl::residual_stage};
   frontend_options.numerical_contract =
-#if defined(IM2P_FPGA_ARCH_GEMMINI_HP1) || defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1)
+#if defined(IM2P_FPGA_ARCH_GEMMINI_HP1) ||                                     \
+    defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1)
       ::im2p::gemmini::NumericalContract::scu_final_integer;
+  frontend_options.production_geometry = true;
 #else
       ::im2p::gemmini::NumericalContract::main_external;
 #endif
@@ -2412,7 +2471,8 @@ Completion ExsiaStripePipeline::finish(bool quantization_succeeded) noexcept {
   if (!timing_status.ok() || !residual_timing_status.ok() ||
       impl_->published.size() != fenced.stripe_rtl_timings.size) {
     (void)impl_->authorize(false);
-    return {!timing_status.ok()
+    return {
+        !timing_status.ok()
                 ? timing_status
                 : (!residual_timing_status.ok()
                        ? residual_timing_status
@@ -2432,8 +2492,8 @@ Completion ExsiaStripePipeline::finish(bool quantization_succeeded) noexcept {
   {
     std::lock_guard lock(test_mutex);
     if (failure == TestFailure::output_copy) {
-      return {{Error::execution_failure,
-               "injected staged-output copy failure", false},
+      return {{Error::execution_failure, "injected staged-output copy failure",
+               false},
               completion.stats};
     }
   }
@@ -2509,8 +2569,7 @@ void test_release_blocked_producer_with_error() noexcept {
 TestCounters test_counters() noexcept {
   std::lock_guard lock(test_mutex);
   TestCounters snapshot = counters;
-  snapshot.provider_dot_attempts =
-      rmd::im2p_provider_dot_attempts_for_test();
+  snapshot.provider_dot_attempts = rmd::im2p_provider_dot_attempts_for_test();
   return snapshot;
 }
 
@@ -2622,8 +2681,12 @@ void log_stats(const char * mode, const Stats & stats,
   record.activation_bits = GGML_GEMMINI_ACTIVATION_BITS;
   record.weight_bits = GGML_GEMMINI_WEIGHT_BITS;
   record.dim = DIM;
-  record.problem_i = args.I; record.problem_j = args.J; record.problem_k = args.K;
-  record.tile_i = args.tile_I; record.tile_j = args.tile_J; record.tile_k = args.tile_K;
+  record.problem_i = args.I;
+  record.problem_j = args.J;
+  record.problem_k = args.K;
+  record.tile_i = args.tile_I;
+  record.tile_j = args.tile_J;
+  record.tile_k = args.tile_K;
   record.rtl_work_total_cycles = stats.rtl_work_total_cycles;
   record.rtl_compute_cycles = stats.rtl_compute_cycles;
   record.rtl_drain_cycles = stats.rtl_drain_cycles;
@@ -2646,7 +2709,10 @@ void log_stats(const char * mode, const Stats & stats,
   log::cycle.drain();
 #endif
 #else
-  (void) mode; (void) stats; (void) run_id; (void) args;
+  (void)mode;
+  (void)stats;
+  (void)run_id;
+  (void)args;
 #endif
 }
 

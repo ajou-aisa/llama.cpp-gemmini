@@ -855,7 +855,7 @@ bool test_q8_srmd_software_ws_routing() {
 #endif
 }
 
-bool test_q8_hp1_srmd_software_ws_routing() {
+bool test_q8_hp1_srmd_reference_and_routing() {
     using residual::DirectStripeBuilder;
     using residual::ResidualEvent;
 
@@ -919,20 +919,25 @@ bool test_q8_hp1_srmd_software_ws_routing() {
                "CPU Q8_HP1 residual retains its integer correction domain")) return false;
     const auto & direct_correction = *direct_correction_ptr;
 
-    rmd::CompressedOutput compressed;
-    rmd::RmdExecutionMetrics metrics{};
-    const rmd::RmdStatus status =
-        rmd::execute_rmd_stripe_ws(args, *packet, compressed, &metrics);
-    if (status != rmd::RmdStatus::success) {
-        std::fprintf(stderr,
-                     "FAIL: Q8_HP1 WS must select compact SRMD software executor; status=%s\n",
-                     rmd::rmd_status_message(status));
+#if !defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    rmd::CompressedOutput rejected;
+    rejected.values = {123};
+    rmd::RmdExecutionMetrics rejected_metrics{};
+    rejected_metrics.packet_call_count = 17;
+    if (!check(rmd::execute_rmd_stripe_ws(args, *packet, rejected, &rejected_metrics) ==
+                   rmd::RmdStatus::unsupported_route &&
+                   rejected.values == std::vector<rmd::OutputValue>{123} &&
+                   rejected_metrics.packet_call_count == 17 && rejected_metrics.ws_call_count == 0,
+               "production HP1 without an SCU provider rejects atomically, without software fallback")) {
         return false;
     }
-    if (!check(metrics.ws_call_count == 0,
-               "Q8_HP1 software WS route must not invoke hardware tiled_matmul") ||
-        !check(metrics.packet_call_count == 1,
-               "Q8_HP1 software WS route executes one compact packet")) {
+#endif
+    rmd::CompressedOutput compressed;
+    rmd::RmdExecutionMetrics metrics{};
+    if (!check(rmd::execute_rmd_stripe_reference(args, *packet, compressed, &metrics) ==
+                   rmd::RmdStatus::success && metrics.ws_call_count == 0 &&
+                   metrics.packet_call_count == 1,
+               "explicit HP1 reference evaluates one packet without hardware dispatch")) {
         return false;
     }
 
@@ -1008,19 +1013,35 @@ bool test_q8_hp1_srmd_software_ws_routing() {
     invalid_weights[1].m = 63;
     args.q8_hp1_blocks = invalid_weights.data();
     rmd::CompressedOutput invalid_output;
-    if (!check(rmd::execute_rmd_stripe_ws(args, *packet, invalid_output, nullptr) ==
-                   rmd::RmdStatus::overflow,
-               "Q8_HP1 rejects unrepresentable exponent scale")) {
+    if (!check(rmd::execute_rmd_stripe_reference(args, *packet, invalid_output) ==
+                   rmd::RmdStatus::success,
+               "HP1 exponent 63 stays a carrier instead of overflowing a host scale factor")) {
         return false;
+    }
+    const auto & saturated_block = packet->blocks[1];
+    for (size_t lane = 0; lane < saturated_block.active_lane_count; ++lane) {
+        const auto value = invalid_output.values[saturated_block.output_value_offset +
+                                                 lane * saturated_block.lane_stride_values];
+        if (!check(value == 0 || value == INT32_MIN || value == INT32_MAX,
+                   "HP1 large carriers saturate nonzero lane results to signed32")) return false;
     }
     invalid_weights[1].m = INT16_MIN;
     args.q8_hp1_blocks = invalid_weights.data();
-    if (!check(rmd::execute_rmd_stripe_ws(args, *packet, invalid_output, nullptr) ==
+    if (!check(rmd::execute_rmd_stripe_reference(args, *packet, invalid_output) ==
                    rmd::RmdStatus::success,
                "Q8_HP1 zero-block sentinel executes safely")) {
         return false;
     }
-    return true;
+    for (size_t lane = 0; lane < saturated_block.active_lane_count; ++lane) {
+        if (!check(invalid_output.values[saturated_block.output_value_offset +
+                                          lane * saturated_block.lane_stride_values] == 0,
+                   "HP1 zero carrier produces zero for every lane")) return false;
+    }
+    const auto unchanged = invalid_output.values;
+    invalid_weights[1].m = -1;
+    return check(rmd::execute_rmd_stripe_reference(args, *packet, invalid_output) ==
+                     rmd::RmdStatus::unsupported_route && invalid_output.values == unchanged,
+                 "invalid negative HP1 carrier rejects without publishing output");
 }
 
 bool test_rmd_ws_contract_probe() {
@@ -2658,7 +2679,7 @@ bool test_compiled_width_rmd_suite() {
 #if GGML_GEMMINI_ACTIVATION_BITS == 8 && GGML_GEMMINI_WEIGHT_BITS == 8
     return test_rmd_cpu_ws_routes() &&
         test_q8_srmd_software_ws_routing() &&
-        test_q8_hp1_srmd_software_ws_routing() &&
+        test_q8_hp1_srmd_reference_and_routing() &&
         test_rmd_cpu_direct_parity() &&
         test_rmd_lane_partition() &&
         test_rmd_weight_gather();
@@ -2756,7 +2777,7 @@ int main(int argc, char ** argv) {
         (case_name == "dispatch" && test_dispatch_modes()) ||
         (case_name == "rmd-routes" && test_rmd_cpu_ws_routes()) ||
         (case_name == "q8-srmd-software-ws" && test_q8_srmd_software_ws_routing()) ||
-        (case_name == "hp1-srmd-software-ws" && test_q8_hp1_srmd_software_ws_routing()) ||
+        (case_name == "hp1-srmd-software-ws" && test_q8_hp1_srmd_reference_and_routing()) ||
         (case_name == "rmd-ws-contract-probe" && test_rmd_ws_contract_probe()) ||
         (case_name == "rmd-direct-parity" && test_rmd_cpu_direct_parity() &&
          test_rmd_lane_partition()) ||
