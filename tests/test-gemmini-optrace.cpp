@@ -1,6 +1,7 @@
 #include <gemmini/optrace.hpp>
 
 #include <cassert>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -21,6 +22,8 @@ static trace::RunInfo info(unsigned bits = 8, unsigned dim = 16) {
     r.dim = dim;
     r.backend = "IM2P_SIM/GEMMINI_HP1";
     r.mode = "FULL";
+    r.hardware_contract_sha256 = std::string(64, '3');
+    r.runtime_manifest_sha256 = std::string(64, '4');
     r.prompt_tokens = 256;
     r.requested_generated_tokens = 5;
     for (const char *name : {"IM2P.sim", "llama.cpp-gemmini", "headers"}) {
@@ -52,7 +55,8 @@ static void rejects(const std::function<void()> &f) {
 
 int main(int argc, char **argv) {
     assert(argc == 2);
-    const std::filesystem::path root = std::filesystem::absolute(argv[1]);
+    const auto root = std::filesystem::absolute(argv[1]) /
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     std::filesystem::create_directories(root);
     assert(!trace::Session::start(nullptr, info()));
     assert(!trace::Session::start("", info()));
@@ -73,7 +77,9 @@ int main(int argc, char **argv) {
                     assert(!trace::current_context());
                     trace::ScopedContext bind(context);
                     auto w = work(bits, dim);
-                    context.session->accepted(trace::current_context(), w);
+                    const auto parent = context.session->parent_begin(trace::current_context(), w);
+                    context.session->accepted(parent, w);
+                    context.session->parent_end(parent);
                     context.session->independent_count(context, w.layer, "dense_main", 1);
                 });
                 worker.join();
@@ -82,7 +88,9 @@ int main(int argc, char **argv) {
             auto decode = session->phase("decode", 0, 1);
             auto w = work(bits, dim);
             w.m = w.geometry_m = w.row_count = 1;
-            session->accepted(decode, w);
+            const auto parent = session->parent_begin(decode, w);
+            session->accepted(parent, w);
+            session->parent_end(parent);
             session->independent_count(decode, w.layer, "dense_main", 1);
             session->finish();
             rejects([&] { session->accepted(decode, w); });
@@ -93,6 +101,7 @@ int main(int argc, char **argv) {
     const auto bad = [&](const char *name, const std::function<void(trace::Work &)> &mutate) {
         auto s = trace::Session::start((root/(std::string(name)+".jsonl")).c_str(), info());
         auto c = s->phase("prefill", std::nullopt, 256);
+        c = s->parent_begin(c, work());
         auto w = work(); mutate(w);
         rejects([&] { s->accepted(c, w); });
         s->finish(false, "intentional negative fixture");
@@ -105,8 +114,35 @@ int main(int argc, char **argv) {
     {
         auto s = trace::Session::start((root/"count-mismatch.jsonl").c_str(), info());
         auto c = s->phase("prefill", std::nullopt, 256);
+        c = s->parent_begin(c, work());
         s->accepted(c, work());
+        s->parent_end(c);
         rejects([&] { s->finish(); });
+    }
+    {
+        auto s = trace::Session::start((root/"interleaved-parents.jsonl").c_str(), info());
+        const auto phase = s->phase("prefill", std::nullopt, 2);
+        auto descriptor = work(); descriptor.scope = "stripe";
+        const auto first = s->parent_begin(phase, descriptor);
+        const auto second = s->parent_begin(phase, descriptor);
+        auto stripe = descriptor;
+        stripe.m = stripe.row_count = 1; stripe.stripe_id = 0; stripe.host_slot = 0;
+        auto invalid = stripe; invalid.host_slot = 999;
+        rejects([&] { s->accepted(first, invalid); });
+        s->accepted(first, stripe); s->accepted(second, stripe);
+        rejects([&] { s->accepted(first, stripe); });
+        rejects([&] { s->parent_end(first); });
+        rejects([&] { s->phase("decode", 0, 1); });
+        invalid = stripe; invalid.row_begin = 1; invalid.stripe_id = 1; invalid.n = 2;
+        rejects([&] { s->accepted(first, invalid); });
+        stripe.row_begin = 1; stripe.stripe_id = 1; stripe.host_slot = 1;
+        stripe.tile_i_count = 2; stripe.tile_j_count = 3; stripe.tile_k_count = 4;
+        s->accepted(first, stripe); s->accepted(second, stripe);
+        s->parent_end(first); s->parent_end(second);
+        rejects([&] { s->accepted(first, stripe); });
+        rejects([&] { s->parent_end(first); });
+        s->independent_count(phase, descriptor.layer, "dense_main", 4);
+        s->finish();
     }
     {
         auto s = trace::Session::start((root/"wrong-phase.jsonl").c_str(), info());

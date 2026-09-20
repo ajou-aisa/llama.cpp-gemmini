@@ -35,6 +35,7 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND
         --llama "${_OPTRACE_LLAMA_ROOT}" --sim "${IM2P_SIM_ROOT}"
         --headers "${_OPTRACE_LLAMA_ROOT}/../RISC-V-DynDNN-gemmini-include"
         --out "${_OPTRACE_GENERATED}"
+        --runtime-manifest "${GGML_GEMMINI_IM2P_MANIFEST}"
         --bits "${GGML_GEMMINI_ACTIVATION_BITS}" --dim "${GGML_GEMMINI_DIM}"
         --mode "${GGML_GEMMINI_DEFAULT_MATMUL_MODE}"
         --rmd "${GGML_GEMMINI_ENABLE_RMD}"

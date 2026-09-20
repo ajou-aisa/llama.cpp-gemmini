@@ -203,6 +203,14 @@ add_test(NAME test-gemmini-log
     COMMAND $<TARGET_FILE:test-gemmini-log> ${CMAKE_CURRENT_BINARY_DIR}/gemmini-log-regression)
 add_test(NAME test-llama-log-callback
     COMMAND $<TARGET_FILE:test-gemmini-log> --llama-callback)
+add_executable(test-gemmini-optrace test-gemmini-optrace.cpp)
+target_link_libraries(test-gemmini-optrace PRIVATE ggml-gemmini-utils)
+target_compile_features(test-gemmini-optrace PRIVATE cxx_std_17)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(test-gemmini-optrace PRIVATE -UNDEBUG)
+endif()
+add_test(NAME test-gemmini-optrace
+    COMMAND $<TARGET_FILE:test-gemmini-optrace> ${CMAKE_CURRENT_BINARY_DIR}/gemmini-optrace)
 add_executable(test-gemmini-log-boundary
     test-gemmini-log-boundary.cpp
     test-gemmini-log-c-boundary.c)
@@ -1095,6 +1103,21 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
         COMMAND $<TARGET_FILE:test-gemmini-rmd-im2p-provider> --case success)
     add_test(NAME test-gemmini-rmd-im2p-provider-failures
         COMMAND $<TARGET_FILE:test-gemmini-rmd-im2p-provider> --case all)
+
+    if (IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1" AND GGML_GEMMINI_ENABLE_RMD)
+        add_executable(test-gemmini-optrace-dispatch test-gemmini-optrace-dispatch.cpp)
+        target_link_libraries(test-gemmini-optrace-dispatch PRIVATE ggml-gemmini ggml-base)
+        target_compile_features(test-gemmini-optrace-dispatch PRIVATE cxx_std_17)
+        target_compile_definitions(test-gemmini-optrace-dispatch PRIVATE GGML_GEMMINI_TESTING=1)
+        ggml_gemmini_apply_profile_compile_definitions(test-gemmini-optrace-dispatch)
+        target_include_directories(test-gemmini-optrace-dispatch PRIVATE
+            ../ggml/src ../ggml/src/ggml-gemmini ${IM2P_SIM_ROOT}/sim/include
+            ${IM2P_SIM_ROOT}/frontend/include ${GEMMINI_SW_PATH} ${GEMMINI_SW_PATH}/include)
+        foreach(mode IN ITEMS full pipeline residual)
+            add_test(NAME test-gemmini-optrace-dispatch-${mode}
+                COMMAND $<TARGET_FILE:test-gemmini-optrace-dispatch> ${mode})
+        endforeach()
+    endif()
 
     add_executable(test-gemmini-rmd-backend-gate
         test-gemmini-rmd-backend-gate.cpp)

@@ -80,6 +80,8 @@ void validate(const RunInfo &r) {
             "-d" + number(r.dim) + "-hp1", "profile identity mismatch");
     require(r.backend == "IM2P_SIM/GEMMINI_HP1", "only production HP1 simulator tracing is supported");
     require(!r.mode.empty(), "mode identity is required");
+    require(hex_digest(r.hardware_contract_sha256, 64) &&
+            hex_digest(r.runtime_manifest_sha256, 64), "hardware/runtime build contract is required");
     require(r.source_commits.size() == 3 && r.source_worktree_sha256.size() == 3,
             "three source identities are required");
     for (const char *name : {"IM2P.sim", "llama.cpp-gemmini", "headers"}) {
@@ -105,6 +107,7 @@ void validate(const Work &w, const RunInfo &r) {
     require(w.block_size == 32 && w.vector_op == 5 && w.output_domain == 2 &&
             w.production_geometry_version == 1, "non-HP1 or unsupported production contract");
     require(!w.rmd_raw && !w.host_integer_block_multiply, "raw/host-integer residual paths are not production HP1");
+    require(!w.host_slot || *w.host_slot < 2, "host slot must be 0 or 1");
     if (w.provenance == "residual") {
         require(r.residual_enabled, "residual work in residual-disabled run");
         require(w.scope == "residual_compact" && w.k <= 32 && w.original_block_id.has_value(),
@@ -114,18 +117,25 @@ void validate(const Work &w, const RunInfo &r) {
                 "invalid dense provenance");
         require(w.scope == "full" || w.scope == "stripe", "invalid dense scope");
     }
-    if (w.scope == "stripe") require(w.stripe_id && w.host_slot, "stripe identity/host slot required");
+    if (w.scope == "stripe") require(w.stripe_id && w.host_slot && *w.host_slot < 2,
+                                      "stripe identity/host slot 0 or 1 required");
     else require(w.row_begin == 0 && w.geometry_m == w.m, "non-stripe geometry must describe full compact work");
 }
 } // namespace
 
 struct Session::Impl {
+    struct Parent {
+        Work descriptor;
+        uint64_t next_row = 0, next_stripe = 0, works = 0;
+    };
     RunInfo info;
     FILE *file = nullptr;
     std::mutex mutex;
     uint64_t sequence = 0, work_count = 0, phase_id = 0, next_decode = 0;
     bool has_phase = false, closed = false, io_failed = false;
     Counts trace_counts, independent_counts;
+    uint64_t next_parent = 0;
+    std::map<uint64_t, Parent> parents;
 
     ~Impl() { if (file) std::fclose(file); }
     std::string base(const char *kind) const {
@@ -163,7 +173,7 @@ std::shared_ptr<Session> Session::start(const char *path, const RunInfo &info) {
     impl->file = std::fopen(resolved.string().c_str(), "wx");
     if (!impl->file) throw std::runtime_error(std::string("optrace: exclusive open failed: ") + std::strerror(errno));
     auto s = impl->base("run");
-    field(s, "schema", quote("im2p-production-optrace")); field(s, "version", "1");
+    field(s, "schema", quote("im2p-production-optrace")); field(s, "version", "2");
     field(s, "model", quote(info.model)); field(s, "profile", quote(info.profile));
     field(s, "activation_bits", number(info.activation_bits)); field(s, "weight_bits", number(info.weight_bits));
     field(s, "dim", number(info.dim)); field(s, "backend", quote(info.backend)); field(s, "mode", quote(info.mode));
@@ -172,6 +182,8 @@ std::shared_ptr<Session> Session::start(const char *path, const RunInfo &info) {
     field(s, "requested_generated_tokens", number(info.requested_generated_tokens));
     field(s, "source_commits", string_map(info.source_commits));
     field(s, "source_worktree_sha256", string_map(info.source_worktree_sha256));
+    field(s, "hardware_contract_sha256", quote(info.hardware_contract_sha256));
+    field(s, "runtime_manifest_sha256", quote(info.runtime_manifest_sha256));
     impl->emit(std::move(s));
     return std::shared_ptr<Session>(new Session(std::move(impl)));
 }
@@ -184,6 +196,7 @@ Context Session::phase(const std::string &kind, std::optional<uint64_t> decode_i
     std::lock_guard<std::mutex> lock(impl_->mutex);
     auto &x = *impl_;
     require(!x.closed, "phase after run end");
+    require(x.parents.empty(), "phase changed with incomplete parent");
     if (!x.has_phase) require(kind == "prefill" && !decode_index, "first phase must be prefill");
     else require(kind == "decode" && decode_index && *decode_index == x.next_decode,
                  "decode phases must be contiguous from zero");
@@ -193,7 +206,52 @@ Context Session::phase(const std::string &kind, std::optional<uint64_t> decode_i
     field(s, "input_tokens", number(input_tokens)); x.emit(std::move(s));
     x.phase_id = id; x.has_phase = true;
     if (decode_index) ++x.next_decode;
-    return {shared_from_this(), id};
+    return {shared_from_this(), id, std::nullopt};
+}
+Context Session::parent_begin(const Context &phase, const Work &w) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    auto &x = *impl_;
+    require(!x.closed && phase.session.get() == this && x.has_phase &&
+            phase.phase_id == x.phase_id && !phase.parent_invocation_id,
+            "parent belongs to missing/stale/foreign phase");
+    Work full = w;
+    if (full.scope == "stripe") full.scope = "full";
+    validate(full, x.info);
+    require(w.row_begin == 0 && w.m == w.geometry_m && w.row_count == w.m,
+            "parent descriptor must contain complete shape");
+    require(x.next_parent != UINT64_MAX, "parent identity overflow");
+    const uint64_t id = x.next_parent++;
+    auto s = x.base("parent_begin");
+    field(s, "phase_id", number(phase.phase_id));
+    field(s, "parent_invocation_id", number(id));
+    field(s, "layer", quote(w.layer)); field(s, "operation", quote(w.operation));
+    field(s, "provenance", quote(w.provenance)); field(s, "scope", quote(w.scope));
+#define NUM(name) field(s, #name, number(w.name))
+    NUM(activation_bits); NUM(weight_bits); NUM(dim); NUM(m); NUM(n); NUM(k);
+    NUM(tile_i_count); NUM(tile_j_count); NUM(tile_k_count);
+    NUM(activation_stride_bytes); NUM(weight_stride_bytes); NUM(output_stride_bytes); NUM(scale_stride_elements);
+    NUM(block_size); NUM(vector_op); NUM(output_domain); NUM(production_geometry_version);
+#undef NUM
+    x.emit(std::move(s));
+    x.parents.emplace(id, Impl::Parent{w});
+    return {shared_from_this(), phase.phase_id, id};
+}
+void Session::parent_end(const Context &parent) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    auto &x = *impl_;
+    require(parent.session.get() == this && parent.phase_id == x.phase_id &&
+            parent.parent_invocation_id, "invalid parent completion context");
+    const auto found = x.parents.find(*parent.parent_invocation_id);
+    require(found != x.parents.end(), "parent missing or already completed");
+    const auto &p = found->second;
+    require(p.works && p.next_row == p.descriptor.m,
+            "parent completed with incomplete row coverage");
+    auto s = x.base("parent_end");
+    field(s, "phase_id", number(parent.phase_id));
+    field(s, "parent_invocation_id", number(parent.parent_invocation_id));
+    field(s, "status", quote("success"));
+    x.emit(std::move(s));
+    x.parents.erase(found);
 }
 void Session::accepted(const Context &context, const Work &w) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -201,7 +259,26 @@ void Session::accepted(const Context &context, const Work &w) {
     require(context.session.get() == this && x.has_phase && context.phase_id == x.phase_id,
             "work belongs to missing/stale/foreign phase");
     validate(w, x.info);
+    require(context.parent_invocation_id.has_value(), "work has no declared parent");
+    const auto found = x.parents.find(*context.parent_invocation_id);
+    require(found != x.parents.end(), "work parent missing or completed");
+    auto &p = found->second;
+    const auto &d = p.descriptor;
+    require(w.layer == d.layer && w.operation == d.operation && w.provenance == d.provenance &&
+            w.scope == d.scope && w.geometry_m == d.m && w.n == d.n && w.k == d.k &&
+            w.activation_stride_bytes == d.activation_stride_bytes &&
+            w.weight_stride_bytes == d.weight_stride_bytes &&
+            w.output_stride_bytes == d.output_stride_bytes &&
+            w.scale_stride_elements == d.scale_stride_elements,
+            "work differs from declared parent descriptor/geometry");
+    require(w.scope == "stripe" || (w.tile_i_count == d.tile_i_count &&
+            w.tile_j_count == d.tile_j_count && w.tile_k_count == d.tile_k_count),
+            "FULL/compact work differs from parent final tile geometry");
+    require(w.row_begin == p.next_row && (w.scope == "stripe"
+            ? w.stripe_id == p.next_stripe : p.works == 0),
+            "duplicate, overlapping, gapped, or unordered parent work");
     auto s = x.base("npu_work"); field(s, "phase_id", number(context.phase_id));
+    field(s, "parent_invocation_id", number(context.parent_invocation_id));
     field(s, "layer", quote(w.layer)); field(s, "operation", quote(w.operation));
     field(s, "provenance", quote(w.provenance)); field(s, "numerical_datapath", quote("hp1_scu"));
     field(s, "scope", quote(w.scope));
@@ -216,6 +293,7 @@ void Session::accepted(const Context &context, const Work &w) {
     field(s, "logical_work_id", number(x.sequence));
     field(s, "rmd_raw", boolean(w.rmd_raw)); field(s, "host_integer_block_multiply", boolean(w.host_integer_block_multiply));
     x.emit(std::move(s));
+    p.next_row += w.row_count; ++p.next_stripe; ++p.works;
     add_count(x.trace_counts, {context.phase_id, w.layer, w.provenance}, 1);
     ++x.work_count;
 }
@@ -233,9 +311,10 @@ void Session::finish(bool success, const std::string &reason) {
     auto &x = *impl_;
     require(!x.closed, "run already finalized");
     const bool counts_match = x.trace_counts == x.independent_counts;
-    const bool valid = success && counts_match && x.has_phase && !x.io_failed;
+    const bool valid = success && counts_match && x.has_phase && !x.io_failed && x.parents.empty();
     auto s = x.base("run_end"); field(s, "status", quote(valid ? "success" : "failed"));
-    field(s, "reason", quote(success && !counts_match ? "independent accepted-dispatch count mismatch" : reason));
+    field(s, "reason", quote(success && !counts_match ? "independent accepted-dispatch count mismatch" :
+                            success && !x.parents.empty() ? "incomplete parent invocation" : reason));
     field(s, "work_count", number(x.work_count));
     field(s, "independent_counts", serialize_counts(x.independent_counts));
     x.emit(std::move(s));

@@ -455,6 +455,23 @@ RmdStatus execute_im2p_compact_dot(im2p_sim_t *sim, const Im2pCompactDot &dot,
                 0};
   }
   im2p_work_stats_extended_t stats{};
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+  optrace::Context trace_parent;
+  optrace::Work trace_work;
+  if (dot.trace_context) {
+    trace_work = im2p::gemmini::production_trace::full(
+        descriptor, geometry, dot.trace_layer);
+    trace_work.provenance = "residual";
+    trace_work.scope = "residual_compact";
+    trace_work.original_block_id = dot.original_block_id;
+    trace_work.source_row_begin = dot.source_row_begin;
+    trace_work.source_row_count = dot.source_row_count;
+    trace_work.stripe_id = dot.stripe_id;
+    trace_work.column_begin = dot.column_begin;
+    trace_work.group_index = dot.group_index;
+    trace_parent = dot.trace_context->session->parent_begin(*dot.trace_context, trace_work);
+  }
+#endif
 #if defined(GGML_GEMMINI_TESTING)
   provider_dot_attempts.fetch_add(1, std::memory_order_relaxed);
 #endif
@@ -481,17 +498,7 @@ RmdStatus execute_im2p_compact_dot(im2p_sim_t *sim, const Im2pCompactDot &dot,
     return RmdStatus::execution_failed;
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
   if (dot.trace_context) {
-    auto work = im2p::gemmini::production_trace::full(
-        descriptor, geometry, dot.trace_layer);
-    work.provenance = "residual";
-    work.scope = "residual_compact";
-    work.original_block_id = dot.original_block_id;
-    work.source_row_begin = dot.source_row_begin;
-    work.source_row_count = dot.source_row_count;
-    work.stripe_id = dot.stripe_id;
-    work.column_begin = dot.column_begin;
-    work.group_index = dot.group_index;
-    dot.trace_context->session->accepted(*dot.trace_context, work);
+    trace_parent.session->accepted(trace_parent, trace_work);
   }
 #endif
   if (context.seen_count != dot.rows * dot.columns)
@@ -502,6 +509,9 @@ RmdStatus execute_im2p_compact_dot(im2p_sim_t *sim, const Im2pCompactDot &dot,
   for (size_t row = 0; row < dot.rows; ++row)
     std::copy_n(staged_values.data() + row * dot.columns, dot.columns,
                 output + row * output_row_stride);
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+  if (trace_parent) trace_parent.session->parent_end(trace_parent);
+#endif
   return RmdStatus::success;
 #endif
 }
