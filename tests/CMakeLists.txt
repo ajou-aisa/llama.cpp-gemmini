@@ -212,7 +212,9 @@ target_compile_features(test-gemmini-log-boundary PRIVATE cxx_std_17)
 target_compile_definitions(test-gemmini-log-boundary PRIVATE
     EXPECT_LOG_DEBUG=$<IF:$<BOOL:${LOG_DEBUG}>,1,0>
     EXPECT_LOG_CYCLE=$<IF:$<BOOL:${LOG_CYCLE}>,1,0>
-    EXPECT_CYCLE_DETAIL=$<IF:$<BOOL:${CYCLE_DETAIL}>,1,0>)
+    EXPECT_CYCLE_DETAIL=$<IF:$<BOOL:${CYCLE_DETAIL}>,1,0>
+    LOG_CYCLE=$<IF:$<BOOL:${LOG_CYCLE}>,1,0>
+    CYCLE_DETAIL=$<IF:$<BOOL:${CYCLE_DETAIL}>,1,0>)
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
     CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
     target_include_directories(test-gemmini-log-boundary PRIVATE

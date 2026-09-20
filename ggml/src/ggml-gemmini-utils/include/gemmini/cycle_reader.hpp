@@ -82,6 +82,10 @@ namespace ggml::gemmini::cycle
 #endif
 #endif
 
+#if LOG_CYCLE && !CYCLE_DETAIL
+    void track_scalar_cycle_read(uint64_t value) noexcept;
+#endif
+
     static inline uint64_t read()
     {
 #if !LOG_CYCLE
@@ -102,6 +106,9 @@ namespace ggml::gemmini::cycle
             std::chrono::steady_clock::now().time_since_epoch().count());
 #endif
         std::atomic_signal_fence(std::memory_order_seq_cst);
+#if LOG_CYCLE && !CYCLE_DETAIL
+        track_scalar_cycle_read(value);
+#endif
         return value;
 #endif
     }

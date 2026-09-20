@@ -34,19 +34,17 @@ const ScalarCycleEndpoint * endpoint_for_sequence(uint64_t sequence) noexcept {
 }
 #endif
 
+#if LOG_CYCLE && !CYCLE_DETAIL
+namespace ggml::gemmini::cycle {
+void track_scalar_cycle_read(uint64_t value) noexcept {
+    remember_scalar_cycle_endpoint(value, timeline_now_ns(), host_thread_id());
+}
+}
+#endif
+
 extern "C" uint64_t gemmini_read_cycles(void) noexcept
 {
-    try {
-#if LOG_CYCLE && !CYCLE_DETAIL
-        const uint64_t ns = ggml::gemmini::cycle::timeline_now_ns();
-        const uint64_t tid = ggml::gemmini::cycle::host_thread_id();
-        const uint64_t value = ggml::gemmini::cycle::read();
-        remember_scalar_cycle_endpoint(value, ns, tid);
-        return value;
-#else
-        return ggml::gemmini::cycle::read();
-#endif
-    }
+    try { return ggml::gemmini::cycle::read(); }
     catch (...) { return 0; }
 }
 

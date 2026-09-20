@@ -1,4 +1,5 @@
 #include <gemmini/cycle_reader.h>
+#include <gemmini/cycle_reader.hpp>
 #include <gemmini/log.hpp>
 #include <gemmini/performance.hpp>
 #if defined(__linux__) && defined(__aarch64__)
@@ -117,11 +118,11 @@ static bool test_scalar_cycle_shared_timeline(const std::filesystem::path & root
     gemmini_cycle_record_v2 outer = inner;
     outer.interval.op = "scalar.outer";
 
-    outer.interval.start = gemmini_read_cycles();
+    outer.interval.start = ggml::gemmini::cycle::read();
     inner.interval.start = gemmini_read_cycles();
     inner.interval.end = gemmini_read_cycles();
     gemmini_log_cycle_record_v2(&inner);
-    outer.interval.end = gemmini_read_cycles();
+    outer.interval.end = ggml::gemmini::cycle::read();
     gemmini_log_cycle_record_v2(&outer);
 
     const bool flushed = gemmini_log_cycle_flush() != 0;
