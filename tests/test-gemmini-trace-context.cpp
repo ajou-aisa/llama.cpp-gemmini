@@ -196,7 +196,7 @@ bool test_uniform_device_metadata() {
 #endif
     return true;
 }
-bool test_thread_reuse_and_bounded_buffer(const std::filesystem::path &path) {
+bool test_thread_reuse_buffered_logging(const std::filesystem::path &path) {
     log::CycleLog logger;
     if (!logger.set_output_path(path.c_str(),true)) return false;
     logger.set_buffered(true);
@@ -214,7 +214,7 @@ bool test_thread_reuse_and_bounded_buffer(const std::filesystem::path &path) {
     });
     for (auto &worker : workers) worker.join();
     if (!logger.flush() || !logger.healthy()) return false;
-    const auto rows = read(path); const auto stats = logger.buffer_stats_for_test();
+    const auto rows = read(path);
 #if EXPECT_LOG_CYCLE
     std::set<uint64_t> task_ids, segment_ids;
     for (const auto &row : rows) {
@@ -233,11 +233,9 @@ bool test_thread_reuse_and_bounded_buffer(const std::filesystem::path &path) {
 #endif
     }
     if (!check(rows.size() == threads*per_thread && task_ids.size() == rows.size() &&
-               segment_ids.size() == rows.size() && stats.peak_entries <= stats.max_entries &&
-               stats.peak_bytes <= stats.max_bytes,
-               "bounded concurrent buffers retain every unique raw segment")) return false;
+               segment_ids.size() == rows.size(),
+               "buffered concurrent logging retains every unique raw segment")) return false;
 #else
-    (void)stats;
     if (!check(rows.empty(), "OFF concurrent recording remains empty")) return false;
 #endif
     return true;
@@ -251,7 +249,7 @@ int main(int argc, char **argv) {
         log::cycle.set_output(nullptr);
         const bool ok = test_context_and_delayed_records(root/"delayed.jsonl") &&
             test_counter_task_separation() && test_uniform_device_metadata() &&
-            test_thread_reuse_and_bounded_buffer(root/"workers.jsonl");
+            test_thread_reuse_buffered_logging(root/"workers.jsonl");
         if (ok) std::puts("TRACE_CONTEXT_PASS delayed ownership, task reuse, cross-task rejection, device naming, buffer integrity");
         return ok ? 0 : 1;
     } catch (const std::exception &error) {

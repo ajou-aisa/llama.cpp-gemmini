@@ -261,14 +261,6 @@ namespace ggml::gemmini::log
         void write_measurement(const performance::Measurement &measurement);
         void report_failure(const char * operation) noexcept;
 
-        struct BufferStats
-        {
-            std::size_t workers, peak_entries, peak_bytes;
-            static constexpr std::size_t max_entries = 128;
-            static constexpr std::size_t max_bytes = 256 * 1024;
-        };
-        BufferStats buffer_stats_for_test() const;
-
         void operator()(const char *layer, const char *op,
                         uint64_t start, uint64_t end);
         void operator()(const char *file, int line, const char *func, const char *layer, const char *op,
@@ -302,8 +294,6 @@ namespace ggml::gemmini::log
         std::atomic<bool> queue_enabled_{false};
         std::filesystem::path output_path_;
         std::vector<WorkerBuffer *> workers_;
-        std::size_t peak_entries_ = 0;
-        std::size_t peak_bytes_ = 0;
     };
 
     namespace testing

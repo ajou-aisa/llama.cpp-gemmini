@@ -33,6 +33,9 @@
 #endif
 
 namespace {
+constexpr std::size_t kMaxBufferEntries = 128;
+constexpr std::size_t kMaxBufferBytes = 256 * 1024;
+
 std::string serialize_cpu_record(const gemmini_cycle_record_v2 &identity,
     const gemmini_cpu_sample &start, const gemmini_cpu_sample &end, bool raw_segment);
 }
@@ -529,7 +532,7 @@ namespace ggml::gemmini::log
         std::mutex *output_mutex = nullptr;
         CycleLog *owner = nullptr;
         std::vector<Entry> entries;
-        std::size_t bytes = 0, peak_entries = 0, peak_bytes = 0;
+        std::size_t bytes = 0;
 
         ~WorkerBuffer()
         {
@@ -556,15 +559,13 @@ namespace ggml::gemmini::log
         thread_local WorkerBuffer worker;
         const std::size_t owned = entry.owned_bytes();
         const auto fits = [&] {
-            return worker.bytes <= BufferStats::max_bytes &&
-                worker.entries.size() < BufferStats::max_entries &&
-                owned <= BufferStats::max_bytes - worker.bytes;
+            return worker.bytes <= kMaxBufferBytes &&
+                worker.entries.size() < kMaxBufferEntries &&
+                owned <= kMaxBufferBytes - worker.bytes;
         };
         const auto push = [&] {
             worker.entries.push_back(std::move(entry));
             worker.bytes += owned;
-            worker.peak_entries = std::max(worker.peak_entries, worker.entries.size());
-            worker.peak_bytes = std::max(worker.peak_bytes, worker.bytes);
         };
         {
             std::lock_guard<std::mutex> lock(worker.mutex);
@@ -584,13 +585,11 @@ namespace ggml::gemmini::log
         }
         if (!queue_enabled_.load(std::memory_order_acquire)) return false;
         if (!worker.owner) {
-            worker.entries.reserve(BufferStats::max_entries);
+            worker.entries.reserve(kMaxBufferEntries);
             workers_.push_back(&worker);
             worker.owner = this;
             worker.output_mutex = &output_mutex;
             worker.bytes = worker.entries.capacity() * sizeof(Entry);
-            worker.peak_entries = 0;
-            worker.peak_bytes = worker.bytes;
         }
         if (!fits()) drain_worker_unlocked(worker);
         if (!queue_enabled_.load(std::memory_order_acquire) || !fits()) return false;
@@ -615,8 +614,6 @@ namespace ggml::gemmini::log
                 warn_once_unlocked("serialization");
             }
         }
-        peak_entries_ = std::max(peak_entries_, worker.peak_entries);
-        peak_bytes_ = std::max(peak_bytes_, worker.peak_bytes);
         worker.entries.clear();
         worker.bytes = worker.entries.capacity() * sizeof(Entry);
         return ok;
@@ -848,18 +845,6 @@ namespace ggml::gemmini::log
     {
         std::lock_guard<std::mutex> lock(detail::output_mutex());
         return output_path_;
-    }
-
-    CycleLog::BufferStats CycleLog::buffer_stats_for_test() const
-    {
-        std::lock_guard<std::mutex> lock(detail::output_mutex());
-        BufferStats stats{workers_.size(), peak_entries_, peak_bytes_};
-        for (auto *worker : workers_) {
-            std::lock_guard<std::mutex> worker_lock(worker->mutex);
-            stats.peak_entries = std::max(stats.peak_entries, worker->peak_entries);
-            stats.peak_bytes = std::max(stats.peak_bytes, worker->peak_bytes);
-        }
-        return stats;
     }
 
     void CycleLog::report_failure(const char * operation) noexcept

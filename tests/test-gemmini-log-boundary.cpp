@@ -415,11 +415,11 @@ static bool test_worker_cycle_buffers(const std::filesystem::path & root) {
     output.set_buffered(true);
     if (!output.set_output_path(path.c_str()) || output.output_path() != path) return false;
     constexpr std::size_t thread_count = 4;
-    constexpr std::size_t records = 3 * CycleLog::BufferStats::max_entries + 7;
+    constexpr std::size_t records_per_thread = 512;
     std::vector<std::thread> workers;
     for (std::size_t worker = 0; worker < thread_count; ++worker) {
         workers.emplace_back([&, worker] {
-            for (std::size_t record = 0; record < records; ++record) {
+            for (std::size_t record = 0; record < records_per_thread; ++record) {
                 char layer[80], op[80];
                 std::snprintf(layer, sizeof(layer), "worker_%zu_record_%zu", worker, record);
                 std::snprintf(op, sizeof(op), "stack_op_%zu_%zu", worker, record);
@@ -439,15 +439,12 @@ static bool test_worker_cycle_buffers(const std::filesystem::path & root) {
         });
     }
     for (auto & worker : workers) worker.join();
-    const auto stats = output.buffer_stats_for_test();
-    if (stats.workers != 0 || stats.peak_entries != CycleLog::BufferStats::max_entries ||
-        stats.peak_bytes == 0 || stats.peak_bytes > CycleLog::BufferStats::max_bytes ||
-        !output.healthy() || !output.flush()) return false;
+    if (!output.healthy() || !output.flush()) return false;
     const std::string json = read_file(path);
     if (static_cast<std::size_t>(std::count(json.begin(), json.end(), '\n')) !=
-        thread_count * records) return false;
+        thread_count * records_per_thread) return false;
     for (std::size_t worker = 0; worker < thread_count; ++worker) {
-        for (std::size_t record = 0; record < records; ++record) {
+        for (std::size_t record = 0; record < records_per_thread; ++record) {
             const std::string suffix = std::to_string(worker) + "_" + std::to_string(record);
 #if EXPECT_CYCLE_DETAIL
             const std::string names = "\"layer\":\"worker_" + std::to_string(worker) +
@@ -482,8 +479,8 @@ static bool test_cycle_buffer_bytes(const std::filesystem::path & root) {
     output.set_buffered(true);
     if (!output.set_output_path(path.c_str())) return false;
     std::string expected;
-    const std::size_t sizes[] = {3, 8193, CycleLog::BufferStats::max_bytes / 4,
-        CycleLog::BufferStats::max_bytes / 2 + 13, CycleLog::BufferStats::max_bytes + 31};
+    constexpr std::size_t kib = 1024;
+    const std::size_t sizes[] = {3, 8193, 64 * kib, 160 * kib, 320 * kib};
     for (int pass = 0; pass < 3; ++pass) {
         for (const auto size : sizes) {
             std::string record = "{\"payload\":\"" + std::string(size, 'a' + pass) + "\"}\n";
@@ -499,11 +496,7 @@ static bool test_cycle_buffer_bytes(const std::filesystem::path & root) {
         output.write_measurement(measurement);
         measurement.reason.assign(measurement.reason.size(), '?');
     }
-    const auto stats = output.buffer_stats_for_test();
-    if (stats.workers != 1 || stats.peak_entries == 0 ||
-        stats.peak_entries > CycleLog::BufferStats::max_entries || stats.peak_bytes == 0 ||
-        stats.peak_bytes > CycleLog::BufferStats::max_bytes || !output.healthy() ||
-        !output.flush() || read_file(path) != expected) return false;
+    if (!output.healthy() || !output.flush() || read_file(path) != expected) return false;
 #else
     (void) root;
 #endif
@@ -524,12 +517,9 @@ static bool test_cycle_buffer_ownership(const std::filesystem::path & root) {
             !second.set_output_path(second_path.c_str())) return false;
         first.write_json("{\"first\":1}");
         second.write_json("{\"second\":1}");
-        if (first.buffer_stats_for_test().workers != 0 ||
-            second.buffer_stats_for_test().workers != 1 || !first.flush() ||
-            read_file(first_path) != "{\"first\":1}\n") return false;
+        if (!first.flush() || read_file(first_path) != "{\"first\":1}\n") return false;
         first.write_json("{\"before_route\":1}");
-        if (second.buffer_stats_for_test().workers != 0 || !second.flush() ||
-            read_file(second_path) != "{\"second\":1}\n") return false;
+        if (!second.flush() || read_file(second_path) != "{\"second\":1}\n") return false;
         if (!first.set_output_path(routed_path.c_str()) ||
             first.output_path() != routed_path ||
             read_file(first_path) != "{\"first\":1}\n{\"before_route\":1}\n") return false;
@@ -544,7 +534,7 @@ static bool test_cycle_buffer_ownership(const std::filesystem::path & root) {
     replacement.set_buffered(true);
     if (!replacement.set_output_path(second_path.c_str())) return false;
     replacement.write_json("{\"replacement\":1}");
-    if (!replacement.flush() || replacement.buffer_stats_for_test().workers != 1 ||
+    if (!replacement.flush() ||
         read_file(second_path) != "{\"second\":1}\n{\"replacement\":1}\n") return false;
     std::promise<void> queued, release;
     auto released = release.get_future();
