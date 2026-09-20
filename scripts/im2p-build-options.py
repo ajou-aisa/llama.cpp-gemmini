@@ -148,10 +148,15 @@ def resolve(build_dir, platform, defaults, args, environment):
         effective['GGML_CPU_CYCLE_LOG'] = effective.get('LOG_CYCLE', '0')
         origin['GGML_CPU_CYCLE_LOG'] = 'derived-default:LOG_CYCLE'
     effective = {key: normalize(key, value) for key, value in effective.items()}
+    cycle_sim = effective.get('CYCLE_SIM', '0')
+    if cycle_sim not in ('0', '1'):
+        raise BuildConfigurationError('CYCLE_SIM must be 0 or 1')
     backend = effective.get('GGML_GEMMINI_EXECUTION_BACKEND', 'HARDWARE')
+    if cycle_sim == '1' and backend == 'FPGA_UART':
+        raise BuildConfigurationError('CYCLE_SIM cannot use FPGA_UART')
     if backend not in ('HARDWARE', 'IM2P_SIM', 'FPGA_UART'):
         raise BuildConfigurationError(f'Unknown GGML_GEMMINI_EXECUTION_BACKEND={backend}')
-    if platform == 'build-riscv.sh' and backend != 'HARDWARE':
+    if platform == 'build-riscv.sh' and backend != 'HARDWARE' and cycle_sim != '1':
         raise BuildConfigurationError('build-riscv.sh is the HARDWARE lane; FPGA_UART uses the native x86/ARM64 script')
     implementation = effective.get('IM2P_SIM_IMPLEMENTATION', 'LEGACY_BSV')
     if implementation not in ('GEMMINI_HP1', 'LEGACY_BSV'):
@@ -247,7 +252,7 @@ def main():
         return 2
     summary = {'build_dir': str(Path(build_dir).resolve()), 'precedence': ['command-line', 'environment', 'script-default'],
                'dry_run': dry, 'effective': effective, 'origin': origin,
-               'provisioning': 'matching IM2P_SIM artifacts' if effective.get('GGML_GEMMINI_EXECUTION_BACKEND') == 'IM2P_SIM' else 'none; FPGA_UART uses physical external executor' if effective.get('GGML_GEMMINI_EXECUTION_BACKEND') == 'FPGA_UART' else 'none'}
+               'provisioning': 'none; CPU-functional source build' if effective.get('CYCLE_SIM') == '1' else 'matching IM2P_SIM artifacts' if effective.get('GGML_GEMMINI_EXECUTION_BACKEND') == 'IM2P_SIM' else 'none; FPGA_UART uses physical external executor' if effective.get('GGML_GEMMINI_EXECUTION_BACKEND') == 'FPGA_UART' else 'none'}
     print('IM2P_EFFECTIVE_CONFIG=' + json.dumps(summary, sort_keys=True), file=sys.stderr)
     for name, value in effective.items():
         if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name):

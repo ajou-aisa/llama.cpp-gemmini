@@ -10,6 +10,9 @@
 #include <cstring>
 #include <stdexcept>
 #include <cinttypes>
+#if LOG_CYCLE || CYCLE_SIM
+#include "llama-semantic-graph.hpp"
+#endif
 
 //
 // llama_context
@@ -767,6 +770,10 @@ int llama_context::encode(llama_batch & inp_batch) {
     auto * gf = graph_init();
     auto res = graph_build(ctx_compute.get(), gf, ubatch, LLM_GRAPH_TYPE_ENCODER);
 
+#if LOG_CYCLE || CYCLE_SIM
+    ggml::gemmini::semantic::capture_graph(gf);
+#endif
+
     ggml_backend_sched_alloc_graph(sched.get(), gf);
 
     res->set_inputs(&ubatch);
@@ -984,6 +991,10 @@ int llama_context::decode(llama_batch & inp_batch) {
 
         auto * gf = graph_init();
         auto res = graph_build(ctx_compute.get(), gf, ubatch, LLM_GRAPH_TYPE_DECODER);
+
+#if LOG_CYCLE || CYCLE_SIM
+        ggml::gemmini::semantic::capture_graph(gf);
+#endif
 
         // LLAMA_LOG_INFO("graph build time: %.3f ms (%d nodes, %d leafs)\n", (ggml_time_us() - t_start_us)/1000.0, gf->n_nodes, gf->n_leafs);
 

@@ -15,6 +15,12 @@ std::string serialize_matmul_cpu_interval(log::CycleRecord record,
         evaluate_matmul_cpu_interval(start, end);
     record.start = start.value;
     record.end = end.value;
+    record.correlation = start.correlation;
+#if CYCLE_SIM
+    if (start.exclusion.active || end.exclusion.active ||
+            start.exclusion.epoch != end.exclusion.epoch)
+        record.cpu_service_exclusion = "functional_emulation";
+#endif
     std::string json = log::serialize_checked_cycle_record(record, interval.cycles.has_value(),
         interval.reason.empty() ? nullptr : interval.reason.c_str(),
         interval.sample_reason.empty() ? nullptr : interval.sample_reason.c_str());
@@ -249,7 +255,7 @@ std::string serialize_rmd_telemetry(const RmdTelemetryRecord & record) {
     }
     out << ']';
 #endif
-    out << '}';
+    out << log::serialize_cpu_service_metadata("rmd.execute", "nonadditive_summary") << '}';
     return out.str();
 #endif
 }
@@ -464,7 +470,8 @@ std::string serialize_cycle_telemetry(const QuantizationStripeTelemetry & record
     field(out, "start_ns", record.start_ns);
     field(out, "end_ns", record.end_ns);
     field(out, "duration_ns", record.end_ns - record.start_ns);
-    out << ",\"overlaps_rtl\":true,\"additive\":false}";
+    out << ",\"overlaps_rtl\":true,\"additive\":false"
+        << log::serialize_cpu_service_metadata("exsia.quantize", "cross_task_summary") << '}';
     return out.str();
 #endif
 }
@@ -525,7 +532,8 @@ std::string serialize_cycle_telemetry(const PipelineStripeTelemetry & record) {
         << ",\"finalize\":"
         << cycle::serialize_host_timing(record.finalize_start_ns, record.finalize_end_ns,
                                        record.finalize_start_tid, record.finalize_end_tid) << '}';
-    out << ",\"valid\":" << (valid ? "true" : "false") << '}';
+    out << ",\"valid\":" << (valid ? "true" : "false")
+        << log::serialize_cpu_service_metadata("matmul.pipeline", "nonadditive_summary") << '}';
     return out.str();
 #endif
 }

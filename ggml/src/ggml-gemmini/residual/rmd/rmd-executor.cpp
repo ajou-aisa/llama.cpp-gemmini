@@ -3,6 +3,9 @@
 #include "rmd-builder.hpp"
 #include "rmd-compose.hpp"
 #include "rmd-im2p-executor.hpp"
+#if CYCLE_SIM
+#include <im2p_cycle_sim.hpp>
+#endif
 
 #include "../../ggml-gemmini-args.h"
 
@@ -698,6 +701,17 @@ RmdStatus execute_rmd_stripe_impl(
     }
   }
 
+#if CYCLE_SIM
+  const auto event_context = Backend == CompactExecutorBackend::im2p_sim
+      ? args.cycle_sim_context : cycle_sim::Context{};
+  std::vector<uint64_t> packet_work_ids;
+  im2p::gemmini::cycle_sim::WorkCollector packet_collector(packet_work_ids, true);
+  im2p::gemmini::cycle_sim::StageCall prepare_call(event_context, cycle_sim::CallKind::ResidualPrepare);
+  im2p::gemmini::cycle_sim::HostStageScope preparation(event_context,
+      "im2p.residual_preparation", "POTAL_HOST", "llama.cpp-gemmini",
+      "ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp:execute_rmd_stripe_impl",
+      args.matmul_layer.c_str(), {}, args.cycle_sim_host_dependencies, true);
+#endif
   Output staged_output;
   RmdOutputAssembler assembler;
   const RmdStatus begin_status =
@@ -752,8 +766,20 @@ RmdStatus execute_rmd_stripe_impl(
     return RmdStatus::allocation_failure;
   }
 
+#if CYCLE_SIM
+  preparation.finish();
+  auto packet_host_dependencies = args.cycle_sim_host_dependencies;
+  if (preparation.id()) packet_host_dependencies.push_back(*preparation.id());
+  prepare_call.finish();
+#endif
   for (size_t block_index = 0; block_index < packet.blocks.size();
        ++block_index) {
+#if CYCLE_SIM
+    im2p::gemmini::cycle_sim::HostStageScope block_preparation(event_context,
+        "im2p.residual_block_preparation", "POTAL_HOST", "llama.cpp-gemmini",
+        "ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp:execute_rmd_stripe_impl",
+        args.matmul_layer.c_str(), {}, packet_host_dependencies, true);
+#endif
     const BlockDescriptor &block = packet.blocks[block_index];
     lane_group_count += block.groups.size();
     std::array<std::array<uint16_t, kBlockSize>, kMaxNativeRadixLanes>
@@ -788,7 +814,18 @@ RmdStatus execute_rmd_stripe_impl(
       }
     }
 
+#if CYCLE_SIM
+    block_preparation.finish();
+    auto block_host_dependencies = packet_host_dependencies;
+    if (block_preparation.id()) block_host_dependencies.push_back(*block_preparation.id());
+#endif
     for (size_t j_tile = 0; j_tile < j_tiles; ++j_tile) {
+#if CYCLE_SIM
+      im2p::gemmini::cycle_sim::HostStageScope column_preparation(event_context,
+          "im2p.residual_carrier_preparation", "POTAL_HOST", "llama.cpp-gemmini",
+          "ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp:execute_rmd_stripe_impl",
+          args.matmul_layer.c_str(), {}, block_host_dependencies, true);
+#endif
       const size_t col_base = j_tile * kArrayDim;
       const size_t valid_cols =
           std::min(kArrayDim, packet.logical_j - col_base);
@@ -813,8 +850,19 @@ RmdStatus execute_rmd_stripe_impl(
         }
       }
 
+#if CYCLE_SIM
+      column_preparation.finish();
+      auto column_host_dependencies = block_host_dependencies;
+      if (column_preparation.id()) column_host_dependencies.push_back(*column_preparation.id());
+#endif
       for (size_t group_index = 0; group_index < block.groups.size();
            ++group_index) {
+#if CYCLE_SIM
+        im2p::gemmini::cycle_sim::HostStageScope gather(event_context,
+            "im2p.residual_gather", "POTAL_HOST", "llama.cpp-gemmini",
+            "ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp:execute_rmd_stripe_impl",
+            args.matmul_layer.c_str(), {}, column_host_dependencies, true);
+#endif
         const LaneGroupDescriptor &group = block.groups[group_index];
         const size_t k_tiles = group.padded_k_count / kArrayDim;
         const size_t stacked_rows =
@@ -822,6 +870,9 @@ RmdStatus execute_rmd_stripe_impl(
         const size_t stacked_value_count = stacked_rows * kArrayDim;
         std::fill_n(stacked_values.begin(), stacked_value_count,
                     OutputValue{0});
+#if CYCLE_SIM
+        const size_t required_begin = im2p::gemmini::cycle_sim::work_count();
+#endif
 
         if (hp1_scu) {
           const size_t compact_k = group_k_counts[group_index];
@@ -843,6 +894,11 @@ RmdStatus execute_rmd_stripe_impl(
                 gathered.baseline_address_resolutions;
             weight_address_resolutions += gathered.address_resolutions;
           }
+#if CYCLE_SIM
+          gather.finish();
+          auto dot_host_dependencies = column_host_dependencies;
+          if (gather.id()) dot_host_dependencies.push_back(*gather.id());
+#endif
           ++matmul_call_count;
           stacked_i_tile_count += stacked_rows / kArrayDim;
           if constexpr (Backend == CompactExecutorBackend::im2p_sim) {
@@ -865,7 +921,11 @@ RmdStatus execute_rmd_stripe_impl(
                 args.optrace_context,
                 args.optrace_context ? args.matmul_layer : std::string{},
                 packet.row_begin, packet.row_count, packet.stripe_id,
-                col_base, group_index};
+                col_base, group_index
+#if CYCLE_SIM
+                , args.cycle_sim_context, dot_host_dependencies
+#endif
+            };
             if (im2p_fault == Im2pProviderTestFault::cancel_after_first_dot &&
                 staged_metrics.im2p_dot_calls != 0)
               return RmdStatus::execution_failed;
@@ -1179,6 +1239,16 @@ RmdStatus execute_rmd_stripe_impl(
           }
         }
 #endif
+#if CYCLE_SIM
+        im2p::gemmini::cycle_sim::StageCall recompose_call(
+            event_context, cycle_sim::CallKind::ResidualRecompose, required_begin);
+        im2p::gemmini::cycle_sim::HostStageScope recomposition(event_context,
+            std::is_same_v<Output, Correction> ? "im2p.residual_radix_recomposition"
+                                             : "im2p.residual_output_assembly",
+            "POTAL_HOST", "llama.cpp-gemmini",
+            "ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp:execute_rmd_stripe_impl",
+            args.matmul_layer.c_str(), im2p::gemmini::cycle_sim::work_ids_since(required_begin), {}, true);
+#endif
         for (size_t group_lane = 0; group_lane < group.lane_positions.size();
              ++group_lane) {
           const uint8_t lane_position = group.lane_positions[group_lane];
@@ -1206,6 +1276,10 @@ RmdStatus execute_rmd_stripe_impl(
             }
           }
         }
+#if CYCLE_SIM
+        recomposition.finish();
+        recompose_call.finish();
+#endif
       }
     }
   }
@@ -1223,6 +1297,12 @@ RmdStatus execute_rmd_stripe_impl(
           staged_metrics.im2p_dot_calls);
     }
   }
+#if CYCLE_SIM
+  if (event_context) {
+    try { event_context.session->ensure_healthy(); }
+    catch (...) { return RmdStatus::execution_failed; }
+  }
+#endif
   output = std::move(staged_output);
   if (metrics != nullptr) {
     collect_packet_metrics(packet, staged_metrics);
@@ -1301,7 +1381,14 @@ template <typename Execute>
 RmdStatus
 execute_block_correction(const ggml_gemmini_args_t &args,
                          const StripePacket &packet, Correction &output,
-                         RmdExecutionMetrics *metrics, Execute execute) {
+                         RmdExecutionMetrics *metrics, Execute execute,
+                         [[maybe_unused]] bool npu_residual = false) {
+#if CYCLE_SIM
+  const auto event_context = npu_residual ? args.cycle_sim_context : cycle_sim::Context{};
+  std::vector<uint64_t> packet_work_ids;
+  im2p::gemmini::cycle_sim::WorkCollector packet_collector(packet_work_ids, true);
+  const size_t required_begin = im2p::gemmini::cycle_sim::work_count();
+#endif
   CompressedOutput compressed;
   RmdExecutionMetrics staged_metrics;
   RmdExecutionMetrics *const staged =
@@ -1310,10 +1397,28 @@ execute_block_correction(const ggml_gemmini_args_t &args,
   if (status != RmdStatus::success)
     return status;
   Correction staged_output = BlockScaledInt64Correction{};
+#if CYCLE_SIM
+  im2p::gemmini::cycle_sim::StageCall recompose_call(
+      event_context, cycle_sim::CallKind::ResidualRecompose, required_begin);
+  im2p::gemmini::cycle_sim::HostStageScope recomposition(event_context,
+      "im2p.residual_block_recomposition", "POTAL_HOST", "llama.cpp-gemmini",
+      "ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp:execute_block_correction",
+      args.matmul_layer.c_str(), im2p::gemmini::cycle_sim::work_ids_since(required_begin), {}, true);
+#endif
   const RmdStatus compose =
       compose_block_rmd_output(args, packet, compressed, staged_output);
+#if CYCLE_SIM
+  recomposition.finish(compose == RmdStatus::success);
+#endif
   if (compose != RmdStatus::success)
     return compose;
+#if CYCLE_SIM
+  recompose_call.finish();
+  if (event_context) {
+    try { event_context.session->ensure_healthy(); }
+    catch (...) { return RmdStatus::execution_failed; }
+  }
+#endif
   output.swap(staged_output);
   if (metrics != nullptr) {
     staged_metrics.compressed_output_values = 0;
@@ -1345,7 +1450,7 @@ RmdStatus execute_rmd_stripe_im2p(im2p_sim_t *sim,
         [&](CompressedOutput &compressed, RmdExecutionMetrics *staged) {
           return execute_rmd_stripe_im2p_output(sim, args, packet, compressed,
                                                 staged, nullptr, executor);
-        });
+        }, true);
   }
   return execute_rmd_stripe_im2p_output(sim, args, packet, output, metrics,
                                         nullptr, executor);
@@ -1463,7 +1568,7 @@ RmdStatus execute_rmd_stripe_im2p_with_weights(im2p_sim_t *sim,
         [&](CompressedOutput &compressed, RmdExecutionMetrics *staged) {
           return execute_rmd_stripe_im2p_output(
               sim, args, packet, compressed, staged, &weights.route_plan(args));
-        });
+        }, true);
   }
   return execute_rmd_stripe_im2p_output(sim, args, packet, correction, metrics,
                                         &weights.route_plan(args));

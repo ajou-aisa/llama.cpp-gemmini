@@ -26,6 +26,7 @@
 
 #include <gemmini/cycle_reader.hpp>
 #include <gemmini/host-timing.hpp>
+#include <gemmini/cpu_log_context.hpp>
 
 #if !defined(GGML_GEMMINI_CONFIG_HAS_ACTIVATION_QUANT)
 namespace ggml::gemmini::config {
@@ -249,10 +250,16 @@ struct MatmulCpuSample {
 #endif
     uint64_t ns = 0;
     uint64_t tid = 0;
+    log::CpuExclusionSnapshot exclusion{};
+    log::CpuCorrelation correlation{};
 };
 
 inline MatmulCpuSample read_matmul_cpu_sample() {
     MatmulCpuSample result;
+    result.exclusion = log::capture_cpu_exclusion();
+#if LOG_CYCLE || CYCLE_SIM
+    result.correlation = log::current_cpu_correlation();
+#endif
 #if LOG_CYCLE
     result.collected = true;
 #if defined(__linux__) && defined(__aarch64__)
@@ -271,6 +278,11 @@ inline MatmulCpuInterval evaluate_matmul_cpu_interval(
         const MatmulCpuSample & start, const MatmulCpuSample & end,
         bool same_task = true) {
     if (!start.collected || !end.collected) return {};
+#if CYCLE_SIM
+    if (start.exclusion.active || end.exclusion.active ||
+            start.exclusion.epoch != end.exclusion.epoch)
+        return MatmulCpuInterval::unavailable("functional_emulation");
+#endif
 #if defined(__linux__) && defined(__aarch64__)
     const auto delta = cycle::evaluate_interval(start.native, end.native, same_task);
     if (!delta.valid) {

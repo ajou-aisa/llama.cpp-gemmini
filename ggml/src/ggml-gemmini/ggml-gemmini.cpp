@@ -28,6 +28,9 @@
 
 #include <gemmini/log.hpp>
 #include <gemmini/optrace.hpp>
+#if LOG_CYCLE || CYCLE_SIM
+#include <gemmini/semantic.hpp>
+#endif
 #include "dump/dump_tensor.hpp"
 
 #include <gemmini.h>
@@ -1344,6 +1347,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     if (auto trace = ggml::gemmini::optrace::current_context())
         args.optrace_context =
             std::make_shared<const ggml::gemmini::optrace::Context>(std::move(trace));
+#if CYCLE_SIM
+    args.cycle_sim_context = ggml::gemmini::cycle_sim::context_for(dst);
+#endif
     const char * layer = args.matmul_layer.c_str();
     ggml::gemmini::log::debug(layer, "ggml_backend_gemmini_mul_mat called");
 
@@ -2706,6 +2712,9 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
     for (int i = 0; i < cgraph->n_nodes; i++)
     {
         struct ggml_tensor *node = cgraph->nodes[i];
+#if LOG_CYCLE || CYCLE_SIM
+        ggml::gemmini::semantic::ScopedNode semantic_scope(node, 1);
+#endif
 
         switch (node->op)
         {
@@ -2725,7 +2734,14 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
                               (long long)node->src[0]->ne[1], (long long)node->src[0]->ne[0]);
             }
 #endif
+#if CYCLE_SIM
+            const auto cycle_sim_context = ggml::gemmini::cycle_sim::context_for(node);
+            ggml::gemmini::cycle_sim::ScopedContext cycle_sim_scope(cycle_sim_context);
+#endif
             ggml_backend_gemmini_mul_mat(ctx, node);
+#if CYCLE_SIM
+            if (cycle_sim_context) cycle_sim_context.session->ensure_healthy();
+#endif
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
             if (fpga_dispatch_failed) { ++fpga_failed; return GGML_STATUS_FAILED; }
 #endif

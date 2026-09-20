@@ -163,6 +163,9 @@ ScopedContext::~ScopedContext() noexcept { bound_context = std::move(previous_);
 Session::Session(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 std::shared_ptr<Session> Session::start(const char *path, const RunInfo &info) {
     if (!path || !*path) return {};
+#if CYCLE_SIM
+    throw std::runtime_error("optrace: CPU-functional collection cannot claim production RTL acceptance");
+#endif
     validate(info);
     auto impl = std::make_unique<Impl>();
     impl->info = info;

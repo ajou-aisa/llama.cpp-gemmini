@@ -1,6 +1,12 @@
 #include <gemmini/cycle_reader.h>
 #include <gemmini/layer.h>
 #include <gemmini/log.h>
+#if LOG_CYCLE || CYCLE_SIM
+#include <gemmini/semantic.h>
+#endif
+#if CYCLE_SIM
+#include <gemmini/cycle_sim_context.h>
+#endif
 
 #ifndef CYCLE_LOG
 #define CYCLE_LOG 0
@@ -3464,7 +3470,19 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
         params.node_id = (uint64_t) node_n;
+#if LOG_CYCLE || CYCLE_SIM
+        void *semantic_context = gemmini_semantic_enter(node, (uint64_t) params.nth);
+#endif
+#if CYCLE_SIM
+        void *cycle_sim_context = gemmini_cycle_sim_context_enter(node);
+#endif
         ggml_compute_forward(&params, node);
+#if CYCLE_SIM
+        gemmini_cycle_sim_context_exit(cycle_sim_context);
+#endif
+#if LOG_CYCLE || CYCLE_SIM
+        gemmini_semantic_exit(semantic_context);
+#endif
 
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {

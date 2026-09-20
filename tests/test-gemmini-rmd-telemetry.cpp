@@ -7,6 +7,7 @@
 #include "../ggml/src/ggml-gemmini/quants/act/exsia/exsia.hpp"
 #include <gemmini/cycle_reader.hpp>
 #include <gemmini/log.hpp>
+#include <gemmini/semantic.hpp>
 #include "../ggml/src/ggml-gemmini/residual/residual-capture.hpp"
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.hpp"
 #include <atomic>
@@ -231,7 +232,27 @@ bool aggregate_serializer_fixtures() {
         "{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"CYCLE_INTERVAL\","
         "\"source\":\"host_tick\",\"unit\":\"tick\",\"op\":\"dense\",\"layer\":\"ffn\\\"norm\","
         "\"run_id\":null,\"stripe_id\":null,\"slot\":null,\"node_id\":null,\"worker_id\":null,"
-        "\"start\":10,\"end\":34,\"delta\":24,\"valid\":true}";
+        "\"start\":10,\"end\":34,\"delta\":24,\"valid\":true"
+#if CYCLE_SIM
+        ",\"cpu_service\":true"
+#endif
+#if LOG_CYCLE || CYCLE_SIM
+        ",\"duration_role\":\"OBSERVATION_ONLY\",\"exclusion_reason\":\"outside_collection\""
+#endif
+        "}";
+
+#if LOG_CYCLE
+    std::string bound_interval_json;
+    {
+        log::CpuCorrelation correlation;
+        correlation.semantic_context = std::make_shared<semantic::Context>(semantic::Context{
+            {"prefill", {}, 3, 7}, semantic::Source::FullCpu, "cross-image-context"});
+        log::ScopedCpuCorrelation scope(correlation);
+        CycleIntervalTelemetry bound_interval = interval;
+        bound_interval.op = "cpu.context_fixture";
+        bound_interval_json = serialize_cycle_telemetry(bound_interval);
+    }
+#endif
 
     WsLoopTelemetry ws{};
     ws.problem_i = 256; ws.problem_j = 768; ws.problem_k = 768;
@@ -353,7 +374,14 @@ bool aggregate_serializer_fixtures() {
         "\"node_id\":null,\"worker_id\":null,\"row_begin\":80,\"row_end\":160,"
         "\"start\":null,\"end\":null,\"delta\":null,\"valid\":false,"
         "\"reason\":\"structurally_cross_task\",\"start_ns\":90,\"end_ns\":108,"
-        "\"duration_ns\":18,\"overlaps_rtl\":true,\"additive\":false}";
+        "\"duration_ns\":18,\"overlaps_rtl\":true,\"additive\":false"
+#if CYCLE_SIM
+        ",\"cpu_service\":false,\"cpu_service_exclusion\":\"cross_task_summary\""
+#endif
+#if LOG_CYCLE || CYCLE_SIM
+        ",\"duration_role\":\"OBSERVATION_ONLY\",\"exclusion_reason\":\"outside_collection\""
+#endif
+        "}";
 
     PipelineStripeTelemetry pipeline{};
     pipeline.layer = "ffn"; pipeline.run_id = 7; pipeline.stripe_id = 2;
@@ -383,7 +411,14 @@ bool aggregate_serializer_fixtures() {
         cycle::serialize_host_timing(12, 30, 61, 61) + ",\"residual_backend\":" +
         cycle::serialize_host_timing(32, 38, 61, 61) + ",\"compose\":" +
         cycle::serialize_host_timing(40, 44, 61, 61) + ",\"finalize\":" +
-        cycle::serialize_host_timing(44, 48, 61, 61) + "},\"valid\":true}";
+        cycle::serialize_host_timing(44, 48, 61, 61) + "},\"valid\":true"
+#if CYCLE_SIM
+        ",\"cpu_service\":false,\"cpu_service_exclusion\":\"nonadditive_summary\""
+#endif
+#if LOG_CYCLE || CYCLE_SIM
+        ",\"duration_role\":\"OBSERVATION_ONLY\",\"exclusion_reason\":\"outside_collection\""
+#endif
+        "}";
 
     if (std::getenv("GEMMINI_TELEMETRY_PRINT_ALL") != nullptr) {
         std::printf("%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n", interval_json.c_str(), ws_json.c_str(),
@@ -398,6 +433,11 @@ bool aggregate_serializer_fixtures() {
                   "cycle-off suppresses every aggregate serializer");
 #else
     return expect(interval_json == expected_interval, "cycle interval exact schema") &&
+        expect(bound_interval_json.find("\"run_config_id\":\"cross-image-context\"") != std::string::npos &&
+                   bound_interval_json.find("\"duration_role\":\"ORDINARY_CPU_REFERENCE\"") != std::string::npos &&
+                   bound_interval_json.find("\"semantic_node_ordinal\":7") != std::string::npos &&
+                   !log::current_cpu_correlation().semantic_context,
+               "caller context reaches telemetry shared image and scope restores unbound state") &&
         expect(ws_json == expected_ws, "WS exact schema and 32-bit occupancy") &&
         expect(serialize_cycle_telemetry(invalid_ws).find("\"valid\":false") != std::string::npos,
                "hardware occupancy outside containing interval is invalid") &&
@@ -633,6 +673,7 @@ bool residual_transport_fixtures(bool failure_selector) {
     if (!expect(log::cycle.set_output_path(path.c_str(), true), "RMD failure sink setup")) return false;
 #endif
     const auto emitted = im2p_adapter::emit_residual_stripe_timings(success, args, 17);
+    const std::string successful_output = read_file(path);
 
     auto failed = success;
     failed.status.code = ::im2p::gemmini::StatusCode::execution_failure;
@@ -647,10 +688,10 @@ bool residual_transport_fixtures(bool failure_selector) {
         im2p_adapter::emit_residual_stripe_timings(malformed, args, 17);
     log::cycle.set_output(stderr);
     const std::string output = read_file(path);
-#if LOG_CYCLE
-    const bool row_count_ok = count_occurrences(output, "IM2P_RMD_STRIPE_TELEMETRY") == 1;
+#if LOG_CYCLE && !CYCLE_SIM
+    const bool row_count_ok = count_occurrences(successful_output, "IM2P_RMD_STRIPE_TELEMETRY") == 1;
 #else
-    const bool row_count_ok = output.empty();
+    const bool row_count_ok = successful_output.empty();
 #endif
     const bool ok = expect(emitted.ok(), "successful semantic telemetry emits") &&
         expect(!failed_emit.ok() && !failed_translation.result.ok() &&
@@ -659,7 +700,8 @@ bool residual_transport_fixtures(bool failure_selector) {
                    failed_translation.rmd_stats.rtl_work_total_cycles == 0,
                "failed residual result exposes no successful semantic aggregate") &&
         expect(!malformed_emit.ok(), "malformed RMD aggregate fails closed") &&
-        expect(row_count_ok, "failed and malformed residual telemetry emit no rows");
+        expect(row_count_ok, "only numerical RTL builds emit successful residual timing rows") &&
+        expect(output == successful_output, "failed and malformed residual telemetry emit no rows");
     if (failure_selector) {
         if (!json.empty()) std::printf("%s\n", json.c_str());
         std::printf("RMD_RESIDUAL_FAILURE sink=%s dense_cycles=%llu "

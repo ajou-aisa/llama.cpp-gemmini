@@ -10,6 +10,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <gemmini/optrace.hpp>
+#if CYCLE_SIM
+#include <gemmini/cycle_sim_log.hpp>
+#endif
 
 struct im2p_sim;
 typedef struct im2p_sim im2p_sim_t;
@@ -113,6 +116,10 @@ struct Im2pCompactDot {
   std::string trace_layer{};
   uint64_t source_row_begin = 0, source_row_count = 0;
   uint64_t stripe_id = 0, column_begin = 0, group_index = 0;
+#if CYCLE_SIM
+  ggml::gemmini::cycle_sim::Context cycle_sim_context{};
+  std::vector<uint64_t> required_host_stage_ids{};
+#endif
 };
 
 RmdStatus execute_im2p_compact_dot(

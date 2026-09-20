@@ -60,14 +60,22 @@ int main(int argc, char ** argv) {
     ggml_backend_tensor_set(lhs, left.data(), 0, sizeof(left));
     ggml_backend_tensor_set(rhs, right.data(), 0, sizeof(right));
     const ggml_status status = ggml_backend_graph_compute(backend, graph);
+    std::array<float, 4> computed{};
+    ggml_backend_tensor_get(sum, computed.data(), 0, sizeof(computed));
     gemmini_log_cycle_set_output(stderr);
     ggml_backend_buffer_free(buffer);
     ggml_free(context);
     ggml_backend_free(backend);
     if (status != GGML_STATUS_SUCCESS) return 8;
+    if (computed != std::array<float, 4>{6, 8, 10, 12}) return 16;
 
     const std::string output = read_file(selected);
     const auto default_path = root / "work/output/log/cycle-log.jsonl";
+#if defined(EXPECT_CPU_CYCLE_LOG) && (!EXPECT_CPU_CYCLE_LOG || !EXPECT_LOG_CYCLE)
+    if (!output.empty() || std::filesystem::exists(selected) != bool(EXPECT_LOG_CYCLE) ||
+        std::filesystem::exists(default_path) ||
+        std::filesystem::exists(root / "work/output/log/npu-cycle-trace.jsonl")) return 9;
+#else
     if (output.find("\"version\":2") == std::string::npos ||
         output.find("\"op\":\"cpu.add\"") == std::string::npos ||
         output.find("\"layer\":\"blk.7.attn_norm\"") == std::string::npos ||
@@ -85,6 +93,7 @@ int main(int argc, char ** argv) {
         output.find("\"valid\":true") == std::string::npos ||
         output.find("scalar_provenance_unavailable") != std::string::npos ||
         std::filesystem::exists(default_path)) return 9;
+#endif
     if (!preserve) std::filesystem::remove_all(root, error);
     return error ? 10 : 0;
 }

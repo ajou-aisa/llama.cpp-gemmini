@@ -17,6 +17,9 @@
 #include <vector>
 
 #include "ggml-gemmini-config.hpp"
+#if CYCLE_SIM
+#include <gemmini/cycle_sim_log.hpp>
+#endif
 #include "ggml-gemmini-geometry.hpp"
 #include "quants/act/meta.hpp"
 #include "quants/act/types.hpp"
@@ -433,6 +436,10 @@ typedef struct ggml_gemmini_args_t {
     // Optional immutable driver provenance, explicitly owned by asynchronous
     // frontend/RMD work. No process-global phase and no allocation when off.
     std::shared_ptr<const ggml::gemmini::optrace::Context> optrace_context;
+#if CYCLE_SIM
+    ggml::gemmini::cycle_sim::Context cycle_sim_context;
+    std::vector<uint64_t> cycle_sim_host_dependencies;
+#endif
 
     inline const uint8_t *q8_channel_row(size_t row) const {
         if (q8_channel_row_base == nullptr || q8_channel_row_stride == 0 ||

@@ -16,6 +16,12 @@
 
 #include <gemmini/log.hpp>
 #include <gemmini/optrace.hpp>
+#if LOG_CYCLE || CYCLE_SIM
+#include <gemmini/semantic.hpp>
+#endif
+#if CYCLE_SIM
+#include <gemmini/cycle_sim_log.hpp>
+#endif
 #include <cstdlib>
 #include <filesystem>
 
@@ -110,6 +116,12 @@ int main(int argc, char ** argv) {
 
     const char * optrace_path = std::getenv("GEMMINI_OPTRACE_PATH");
     const bool optrace_requested = optrace_path && *optrace_path;
+#if CYCLE_SIM
+    if (optrace_requested) {
+        fprintf(stderr, "error: CPU-functional cycle-sim cannot emit production RTL optrace\n");
+        return 1;
+    }
+#endif
     // v1 records one fresh decoder run. Reject unrepresented execution instead
     // of changing warmup/cache/interactive behavior or silently losing work.
     if (optrace_requested && (std::getenv("GEMMINI_MATMUL_MODE") ||
@@ -147,6 +159,14 @@ int main(int argc, char ** argv) {
 #else
     if (!params.gemmini_cycle_log.empty()) {
         fprintf(stderr, "error: --gemmini-cycle-log is unavailable because this build has LOG_CYCLE=0\n");
+        return 1;
+    }
+#endif
+
+#if CYCLE_SIM
+    if (params.interactive || params.interactive_first || params.embedding ||
+        params.n_predict <= 0 || params.grp_attn_n != 1 || !params.path_prompt_cache.empty()) {
+        fprintf(stderr, "error: CYCLE_SIM requires a fresh noninteractive decoder run with a positive token limit\n");
         return 1;
     }
 #endif
@@ -598,6 +618,73 @@ int main(int argc, char ** argv) {
     uint64_t trace_decode_index = 0;
     // Track the actual driver origin, not the token count or GEMM shape.
     bool embd_from_generated = false;
+#if LOG_CYCLE || CYCLE_SIM
+    namespace semantic = ggml::gemmini::semantic;
+    std::shared_ptr<semantic::Session> semantic_trace;
+    bool semantic_prefill = false;
+    uint64_t semantic_decode_index = 0;
+    if (!params.interactive && !params.interactive_first && !params.embedding &&
+        params.n_predict > 0 && params.path_prompt_cache.empty() &&
+        !llama_model_has_encoder(model)) {
+        const auto cpu_config = [](const cpu_params &cpu) {
+            std::string mask;
+            for (bool bit : cpu.cpumask) mask += bit ? '1' : '0';
+            return "{\"threads\":" + std::to_string(cpu.n_threads) +
+                ",\"poll\":" + std::to_string(cpu.poll) + ",\"priority\":" + std::to_string(cpu.priority) +
+                ",\"strict_cpu\":" + (cpu.strict_cpu ? "true" : "false") +
+                ",\"mask_valid\":" + (cpu.mask_valid ? "true" : "false") + ",\"mask\":" + semantic::quote(mask) + '}';
+        };
+        const std::string workload = "{\"model\":" + semantic::quote(std::filesystem::path(params.model.path).filename().string()) +
+            ",\"prompt_tokens\":" + std::to_string(embd_inp.size()) + ",\"generated_tokens\":" + std::to_string(params.n_predict) +
+            ",\"context_tokens\":" + std::to_string(n_ctx) + ",\"batch_tokens\":" + std::to_string(params.n_batch) +
+            ",\"microbatch_tokens\":" + std::to_string(params.n_ubatch) + ",\"cpu\":" + cpu_config(params.cpuparams) +
+            ",\"cpu_batch\":" + cpu_config(params.cpuparams_batch) + ",\"flash_attention\":" + (params.flash_attn ? "true" : "false") +
+            ",\"kv_type_k\":" + semantic::quote(ggml_type_name(params.cache_type_k)) +
+            ",\"kv_type_v\":" + semantic::quote(ggml_type_name(params.cache_type_v)) +
+            ",\"seed\":" + std::to_string(params.sampling.seed) + ",\"numa\":" + std::to_string(params.numa) +
+            ",\"build_target\":" + semantic::quote(LLAMA_BUILD_TARGET) + '}';
+        const bool cpu_only_build = semantic::compiled_cpu_only_build();
+        const auto source = CYCLE_SIM ? semantic::Source::PotalCollection :
+            cpu_only_build ? semantic::Source::FullCpu : semantic::Source::Unspecified;
+        const std::string producer = std::string("{\"cycle_sim\":") + std::to_string(CYCLE_SIM) +
+            ",\"log_cycle\":" + std::to_string(LOG_CYCLE) + ",\"cpu_only_build\":" + (cpu_only_build ? "true" : "false") +
+            ",\"git_commit\":" + semantic::quote(LLAMA_COMMIT) +
+            ",\"warmup_excluded\":true,\"reserve_measure_graphs_excluded\":true}";
+        try {
+            semantic_trace = semantic::Session::start(source, workload, producer, cpu_only_build);
+        } catch (const std::exception &error) {
+            LOG_ERR("semantic metadata: %s\n", error.what());
+            return 1;
+        }
+    }
+#endif
+#if CYCLE_SIM
+    namespace cycle_sim = ggml::gemmini::cycle_sim;
+    std::shared_ptr<cycle_sim::Session> functional_trace;
+    cycle_sim::Context functional_prefill;
+    uint64_t functional_decode_index = 0;
+    if (llama_model_has_encoder(model) ||
+        embd_inp.size() + static_cast<size_t>(params.n_predict) >= static_cast<size_t>(n_ctx)) {
+        LOG_ERR("cycle-sim: encoder or context-shifting execution is unsupported\n");
+        return 1;
+    }
+    try {
+        const auto identity = params.model_alias.empty()
+            ? std::filesystem::path(params.model.path).filename().string()
+            : params.model_alias;
+        functional_trace = cycle_sim::Session::start(
+            cycle_sim::compiled_run_info(identity, embd_inp.size(), params.n_predict));
+        functional_trace->set_policy_query({ggml_backend_dev_by_name("GEMMINI"),
+            [](void *device, const void *node) {
+                return device && ggml_backend_dev_supports_op(
+                    static_cast<ggml_backend_dev_t>(device),
+                    static_cast<const ggml_tensor *>(node));
+            }});
+    } catch (const std::exception &error) {
+        LOG_ERR("cycle-sim: %s\n", error.what());
+        return 1;
+    }
+#endif
     if (optrace_requested) {
         if (params.interactive || llama_model_has_encoder(model) ||
             embd_inp.size() + static_cast<size_t>(params.n_predict) >= static_cast<size_t>(n_ctx)) {
@@ -751,6 +838,16 @@ int main(int argc, char ** argv) {
                 LOG_DBG("eval: %s\n", string_from(ctx, embd).c_str());
 
                 try {
+#if LOG_CYCLE || CYCLE_SIM
+                    if (semantic_trace) {
+                        if (embd_from_generated)
+                            semantic_trace->phase("decode", semantic_decode_index++, &embd[i], n_eval);
+                        else if (!semantic_prefill) {
+                            semantic_trace->phase("prefill", std::nullopt, embd_inp.data(), embd_inp.size());
+                            semantic_prefill = true;
+                        }
+                    }
+#endif
                     optrace::Context trace_context;
                     if (production_trace) {
                         if (embd_from_generated) {
@@ -762,10 +859,27 @@ int main(int argc, char ** argv) {
                         }
                     }
                     optrace::ScopedContext trace_scope(std::move(trace_context));
+#if CYCLE_SIM
+                    cycle_sim::Context functional_context;
+                    if (embd_from_generated) {
+                        functional_context = functional_trace->phase("decode", functional_decode_index++, n_eval);
+                    } else {
+                        if (!functional_prefill)
+                            functional_prefill = functional_trace->phase("prefill", std::nullopt, embd_inp.size());
+                        functional_context = functional_prefill;
+                    }
+                    cycle_sim::ScopedContext functional_scope(functional_context);
+#endif
                     if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval))) {
                         LOG_ERR("%s : failed to eval\n", __func__);
                         return 1;
                     }
+#if LOG_CYCLE || CYCLE_SIM
+                    if (semantic_trace) semantic_trace->ensure_healthy();
+#endif
+#if CYCLE_SIM
+                    functional_trace->ensure_healthy();
+#endif
                 } catch (const std::exception & error) {
                     LOG_ERR("optrace/evaluation: %s\n", error.what());
                     return 1;
@@ -1072,6 +1186,24 @@ int main(int argc, char ** argv) {
     common_sampler_free(smpl);
 
     bool fpga_execution_ok = common_fpga_execution_check();
+#if LOG_CYCLE || CYCLE_SIM
+    if (semantic_trace) {
+        try { semantic_trace->finish(fpga_execution_ok); }
+        catch (const std::exception &error) {
+            LOG_ERR("semantic metadata: %s\n", error.what());
+            fpga_execution_ok = false;
+        }
+    }
+#endif
+#if CYCLE_SIM
+    try {
+        functional_trace->finish(fpga_execution_ok,
+            fpga_execution_ok ? "" : "backend execution failed");
+    } catch (const std::exception &error) {
+        LOG_ERR("cycle-sim: %s\n", error.what());
+        fpga_execution_ok = false;
+    }
+#endif
     if (production_trace) {
         try {
             production_trace->finish(fpga_execution_ok,

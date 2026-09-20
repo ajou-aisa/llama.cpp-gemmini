@@ -1,5 +1,8 @@
 #include "../include/gemmini/log.hpp"
 #include "../include/gemmini/host-timing.hpp"
+#if LOG_CYCLE || CYCLE_SIM
+#include "../include/gemmini/semantic.hpp"
+#endif
 
 #include <limits>
 #include <atomic>
@@ -8,6 +11,7 @@
 #include <exception>
 #include <mutex>
 #include <string>
+#include <utility>
 
 #if defined(__linux__)
 #include <sys/syscall.h>
@@ -99,6 +103,32 @@ namespace ggml::gemmini::log
 {
     CycleLog cycle;
 
+    namespace {
+#if LOG_CYCLE || CYCLE_SIM
+        thread_local CpuCorrelation cpu_correlation;
+#endif
+    }
+
+    CpuCorrelation current_cpu_correlation() noexcept {
+#if LOG_CYCLE || CYCLE_SIM
+        auto result = cpu_correlation;
+        result.captured = true;
+        return result;
+#else
+        return {};
+#endif
+    }
+
+    CpuCorrelation exchange_cpu_correlation(CpuCorrelation value) noexcept {
+        const auto previous = current_cpu_correlation();
+#if LOG_CYCLE || CYCLE_SIM
+        cpu_correlation = std::move(value);
+#else
+        (void) value;
+#endif
+        return previous;
+    }
+
     namespace
     {
         thread_local CycleWriteTiming *active_cycle_write_timing = nullptr;
@@ -157,6 +187,59 @@ namespace ggml::gemmini::log
         active_cycle_write_timing = previous_;
     }
 
+    std::string serialize_cpu_service_metadata(const char *operation,
+            const char *exclusion, CpuCorrelation correlation) {
+#if LOG_CYCLE || CYCLE_SIM
+#if !CYCLE_SIM
+        if (!correlation.semantic_context)
+            return ",\"duration_role\":\"OBSERVATION_ONLY\",\"exclusion_reason\":\"outside_collection\"";
+#endif
+        if (exclusion == nullptr) exclusion = cpu_service_exclusion(operation);
+        std::string json = exclusion ? ",\"cpu_service\":false" : ",\"cpu_service\":true";
+        if (exclusion) {
+            json += ",\"cpu_service_exclusion\":\"";
+            append_json_escaped(json, exclusion);
+            json += '"';
+        }
+        if (correlation.present) {
+            const auto add = [&](const char *key, uint64_t value) {
+                json += std::string(",\"") + key + "\":" +
+                    (value == UINT64_MAX ? "null" : std::to_string(value));
+            };
+            add("collection_run_id", correlation.collection_run_id);
+            add("phase_id", correlation.phase_id);
+            add("operation_id", correlation.operation_id);
+            add("target_node_id", correlation.target_node_id);
+            add("parent_id", correlation.parent_id);
+            add("work_id", correlation.work_id);
+            add("call_id", correlation.call_id);
+        }
+        if (correlation.semantic_context) {
+            const auto &context = *correlation.semantic_context;
+            const bool ordinary = operation && std::strncmp(operation, "cpu.", 4) == 0;
+            const char *role = "OBSERVATION_ONLY";
+            if (!exclusion && context.duration_source == semantic::Source::FullCpu && ordinary)
+                role = "ORDINARY_CPU_REFERENCE";
+            if (!exclusion && !ordinary && context.duration_source == semantic::Source::PotalCollection &&
+                    correlation.host_stage_id != UINT64_MAX)
+                role = "POTAL_HOST";
+            json += semantic::serialize_context_fields(context);
+            json += std::string(",\"duration_source\":\"") + semantic::source_name(context.duration_source) + '"';
+            json += std::string(",\"duration_role\":\"") + role + '"';
+            json += ",\"host_stage_id\":" + (correlation.host_stage_id == UINT64_MAX
+                ? std::string("null") : std::to_string(correlation.host_stage_id));
+            json += ",\"worker_count\":" + (correlation.worker_count == UINT64_MAX
+                ? std::string("null") : std::to_string(correlation.worker_count));
+        } else {
+            json += ",\"duration_role\":\"OBSERVATION_ONLY\",\"exclusion_reason\":\"outside_collection\"";
+        }
+        return json;
+#else
+        (void) operation; (void) exclusion; (void) correlation;
+        return {};
+#endif
+    }
+
     static std::string serialize_cycle_record_impl(
             const CycleRecord & record, bool linux_aarch64,
             bool provenance_available = false, bool checked_valid = false,
@@ -171,6 +254,10 @@ namespace ggml::gemmini::log
 #endif
         const char * const source = record.source ? record.source : default_source;
         const char * const unit = record.unit ? record.unit : default_unit;
+        const char *exclusion = nullptr;
+#if CYCLE_SIM
+        exclusion = record.cpu_service_exclusion ? record.cpu_service_exclusion : cpu_service_exclusion(record.op);
+#endif
         bool valid = record.end >= record.start;
         const char * reason = nullptr;
         if (provenance_available) {
@@ -188,6 +275,10 @@ namespace ggml::gemmini::log
                 valid = false;
                 reason = "counter_regression";
             }
+        }
+        if (exclusion != nullptr) {
+            valid = false;
+            reason = exclusion;
         }
         const uint64_t cycles = valid ? record.end - record.start : 0;
         std::string json;
@@ -255,13 +346,16 @@ namespace ggml::gemmini::log
         add_identity("worker_id", GEMMINI_CYCLE_HAS_WORKER_ID, record.worker_id);
         add_u64("start", record.start);
         add_u64("end", record.end);
-        if (linux_aarch64 && !valid) add_null("delta"); else add_u64("delta", cycles);
+        if ((linux_aarch64 && !valid) || exclusion) add_null("delta"); else add_u64("delta", cycles);
         add_key("valid");
         json += valid ? "true" : "false";
-        if (linux_aarch64 && !valid) {
+        if ((linux_aarch64 && !valid) || exclusion) {
             add_string("reason", reason ? reason : "counter_regression");
             add_string("sample_reason", sample_reason);
         }
+        json += serialize_cpu_service_metadata(record.op, exclusion,
+            record.correlation.captured || record.correlation.present || record.correlation.semantic_context
+                ? record.correlation : current_cpu_correlation());
 #if LOG_DETAIL
         add_string("file", record.file);
         if (record.file) add_i32("line", record.line);

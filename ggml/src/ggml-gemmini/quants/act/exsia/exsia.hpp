@@ -17,6 +17,10 @@
 #include <vector>
 
 #include <gemmini/layer.hpp>
+#include <gemmini/cpu_log_context.hpp>
+#if CYCLE_SIM
+#include <gemmini/cycle_sim_log.hpp>
+#endif
 
 #ifndef GGML_GEMMINI_BLOCK_SIZE
 #define GGML_GEMMINI_BLOCK_SIZE 32
@@ -46,8 +50,8 @@
 #define EXSIA_VALIDATION 0
 #endif
 
-#define EXSIA_PROFILE_COLLECTION_ENABLED (CYCLE_DETAIL && GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE != 0)
-#define EXSIA_PROFILE_LOG_ENABLED (EXSIA_PROFILE_COLLECTION_ENABLED && LOG_CYCLE)
+#define EXSIA_PROFILE_COLLECTION_ENABLED ((CYCLE_DETAIL && GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE != 0) || CYCLE_SIM)
+#define EXSIA_PROFILE_LOG_ENABLED (CYCLE_DETAIL && GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE != 0 && LOG_CYCLE)
 #define EXSIA_STAGE_PROFILE_ENABLED (CYCLE_DETAIL && GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE == 2)
 #define EXSIA_BRANCH_COUNTS_ENABLED (EXSIA_STAGE_PROFILE_ENABLED || EXSIA_VALIDATION)
 #define EXSIA_OBSERVATION_ENABLED (EXSIA_VALIDATION || EXSIA_PROFILE_COLLECTION_ENABLED)
@@ -398,6 +402,9 @@ namespace ggml::gemmini::quants::act::exsia
         uint64_t exponent_reduction_start_ns = 0;
         uint64_t exponent_reduction_end_ns = 0;
         uint64_t folding_commit_ns = 0;
+#if CYCLE_SIM
+        std::vector<uint64_t> cycle_sim_host_dependencies{};
+#endif
     };
 
     struct StripeReadySink
@@ -576,6 +583,13 @@ namespace ggml::gemmini::quants::act::exsia
         ggml::gemmini::cycle::NativeCycleSample end_sample{};
 #endif
         bool valid = false;
+#if CYCLE_SIM
+        cycle_sim::Context host_stage{};
+        log::CpuCorrelation correlation{};
+        const char *host_operation = nullptr;
+        std::string host_layer;
+        uint64_t stripe_id = UINT64_MAX;
+#endif
     };
 
     struct StripeProfileRecord

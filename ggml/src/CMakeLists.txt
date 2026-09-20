@@ -1,6 +1,13 @@
 include(CheckCXXCompilerFlag)
 include("../cmake/common.cmake")
 
+if(NOT DEFINED CYCLE_SIM)
+    set(CYCLE_SIM 0)
+endif()
+if(NOT DEFINED LOG_CYCLE)
+    set(LOG_CYCLE 0)
+endif()
+
 add_compile_definitions(GGML_SCHED_MAX_COPIES=${GGML_SCHED_MAX_COPIES})
 
 # enable libstdc++ assertions for debug builds
@@ -282,6 +289,10 @@ function(ggml_add_cpu_backend_variant tag_name)
 endfunction()
 
 add_subdirectory(ggml-gemmini-utils)
+target_compile_definitions(ggml-base PRIVATE CYCLE_SIM=${CYCLE_SIM} LOG_CYCLE=${LOG_CYCLE})
+if(LOG_CYCLE OR CYCLE_SIM)
+    target_link_libraries(ggml-base PRIVATE ggml-gemmini-utils)
+endif()
 
 ggml_add_backend(CPU)
 

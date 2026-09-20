@@ -4,12 +4,6 @@ set -euo pipefail
 SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_ROOT/scripts/im2p-host-provision.sh"
 
-if [[ "${IM2P_ARTIFACT_SET:-SELECTED}" == "ALL_MATCHED" ]]; then
-  printf '%s\n' \
-    'IM2P_ARTIFACT_SET=ALL_MATCHED is host-only; build-riscv.sh is hardware-only' >&2
-  exit 2
-fi
-
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ||
       "${2:-}" == "-h" || "${2:-}" == "--help" ]]; then
   printf 'Usage: %s [static] [--dry-run] [-DNAME[:TYPE]=value ...]\n' "${0##*/}"
@@ -26,6 +20,7 @@ fi
 build_dir=${BUILD_DIR:-build-$target}
 LOG_DEBUG_DEFAULT=${LOG_DEBUG:-0} # 0 | 1
 LOG_CYCLE_DEFAULT=${LOG_CYCLE:-0} # 0 | 1
+CYCLE_SIM_DEFAULT=${CYCLE_SIM:-0}
 GGML_CPU_CYCLE_LOG_DEFAULT=${GGML_CPU_CYCLE_LOG:-${LOG_CYCLE_DEFAULT}}
 CYCLE_DETAIL_DEFAULT=${CYCLE_DETAIL:-0} # 0 | 1
 LOG_DUMP_DEFAULT=${LOG_DUMP:-0} # 0 | 1
@@ -65,6 +60,11 @@ GGML_GEMMINI_EXSIA_LOCAL_WORKERS_DEFAULT=${GGML_GEMMINI_EXSIA_LOCAL_WORKERS:-4} 
 GGML_GEMMINI_EXSIA_PROFILE_SCOPE_DEFAULT=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE:-OFF} # OFF | TIMELINE | STAGE
 
 im2p_resolve_build_options "$build_dir" "${0##*/}" "$@"
+if [[ "${IM2P_ARTIFACT_SET:-SELECTED}" == "ALL_MATCHED" && "$CYCLE_SIM_DEFAULT" == 0 ]]; then
+  printf '%s\n' \
+    'IM2P_ARTIFACT_SET=ALL_MATCHED is host-only; build-riscv.sh is hardware-only' >&2
+  exit 2
+fi
 if [[ "$IM2P_BUILD_DRY_RUN" == 1 ]]; then
   printf 'Dry run: no provisioning, configure, build, or device access.\n'
   exit 0

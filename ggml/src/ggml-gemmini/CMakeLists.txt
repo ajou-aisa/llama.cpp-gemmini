@@ -242,7 +242,42 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "FPGA_UART")
     "-Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/ggml-gemmini.map")
 endif()
 
-if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
+if(CYCLE_SIM AND GGML_GEMMINI_OPTION STREQUAL "WS")
+  find_package(Threads REQUIRED)
+  add_library(ggml-gemmini-cpu-functional STATIC
+    "${IM2P_SIM_ROOT}/frontend/src/im2p_gemmini_frontend.cpp"
+    "${IM2P_SIM_ROOT}/frontend/src/im2p_cpu_functional.cpp"
+    "${IM2P_SIM_ROOT}/frontend/src/im2p_cpu_functional_compute.cpp")
+  set_target_properties(ggml-gemmini-cpu-functional PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  target_compile_features(ggml-gemmini-cpu-functional PRIVATE cxx_std_20)
+  target_compile_options(ggml-gemmini-cpu-functional PRIVATE -O2 -fno-fast-math)
+  target_compile_definitions(ggml-gemmini-cpu-functional PRIVATE
+    ${GGML_GEMMINI_COMPILE_DEFS}
+    IM2P_GEMMINI_FRONTEND_EXPECTED_DIM=${GGML_GEMMINI_DIM}
+    IM2P_GEMMINI_FRONTEND_ACTIVATION_BITS=${GGML_GEMMINI_ACTIVATION_BITS}
+    IM2P_ACTIVATION_BITS=${GGML_GEMMINI_ACTIVATION_BITS}
+    IM2P_WEIGHT_BITS=${GGML_GEMMINI_WEIGHT_BITS}
+    IM2P_DIM=${GGML_GEMMINI_DIM}
+    IM2P_ACCUMULATOR_ROWS=${IM2P_CYCLE_SIM_ACCUMULATOR_ROWS}
+    IM2P_PARTIAL_BITS=${IM2P_CYCLE_SIM_PARTIAL_BITS}
+    IM2P_GEMMINI_BANK_COUNT=${IM2P_CYCLE_SIM_BANK_COUNT}
+    IM2P_GEMMINI_BANK_ROWS=${IM2P_CYCLE_SIM_BANK_ROWS})
+  if(LLAMA_BUILD_TESTS AND NOT GGML_BACKEND_DL)
+    target_compile_definitions(ggml-gemmini-cpu-functional PRIVATE IM2P_GEMMINI_FRONTEND_TESTING=1)
+    target_compile_definitions(ggml-gemmini-cpu-functional PUBLIC IM2P_CPU_FUNCTIONAL_TEST_HOOKS=1)
+    target_include_directories(ggml-gemmini PRIVATE "${IM2P_SIM_ROOT}/frontend/tests")
+  endif()
+  target_include_directories(ggml-gemmini-cpu-functional PRIVATE
+    "${IM2P_SIM_ROOT}/frontend/include" "${IM2P_SIM_ROOT}/sim/include"
+    "${GGML_GEMMINI_GENERATED_CONFIG_DIR}" "${CMAKE_CURRENT_LIST_DIR}"
+    "${CMAKE_CURRENT_LIST_DIR}/../../include" "${CMAKE_CURRENT_LIST_DIR}/.."
+    "${GEMMINI_SW_PATH}")
+  target_link_libraries(ggml-gemmini-cpu-functional PRIVATE ggml-gemmini-utils Threads::Threads)
+  target_sources(ggml-gemmini PRIVATE ggml-gemmini-im2p.cpp)
+  target_include_directories(ggml-gemmini PRIVATE
+    "${IM2P_SIM_ROOT}/frontend/include" "${IM2P_SIM_ROOT}/sim/include")
+  target_link_libraries(ggml-gemmini PRIVATE ggml-gemmini-cpu-functional Threads::Threads)
+elseif (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
   foreach(_IM2P_REQUIRED_VAR IN ITEMS
           IM2P_SIM_ROOT GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE GGML_GEMMINI_IM2P_SIM_ARCHIVE)
     if (NOT DEFINED ${_IM2P_REQUIRED_VAR} OR "${${_IM2P_REQUIRED_VAR}}" STREQUAL "")

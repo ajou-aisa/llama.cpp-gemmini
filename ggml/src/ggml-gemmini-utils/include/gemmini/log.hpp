@@ -29,6 +29,7 @@
 #pragma once
 
 #include "log.h"
+#include "cpu_log_context.hpp"
 
 #include <cstdarg>
 #include <cstdio>
@@ -120,6 +121,8 @@ namespace ggml::gemmini::log
         uint64_t slot = 0;
         uint64_t node_id = 0;
         uint64_t worker_id = 0;
+        const char *cpu_service_exclusion = nullptr;
+        CpuCorrelation correlation{};
     };
 
     struct WsCycleRecord
@@ -146,6 +149,8 @@ namespace ggml::gemmini::log
                                                const char *reason,
                                                const char *sample_reason = nullptr);
     std::string serialize_ws_cycle_record(const WsCycleRecord &record);
+    std::string serialize_cpu_service_metadata(const char *operation,
+        const char *exclusion = nullptr, CpuCorrelation correlation = current_cpu_correlation());
 
     struct CycleWriteTiming
     {

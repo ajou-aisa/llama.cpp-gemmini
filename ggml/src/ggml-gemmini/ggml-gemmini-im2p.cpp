@@ -5,6 +5,9 @@
 #include "ggml-gemmini-telemetry.hpp"
 #include "ggml-impl.h"
 #include "im2p_gemmini_frontend.hpp"
+#if CYCLE_SIM
+#include "im2p_cycle_sim.hpp"
+#endif
 #include "quants/act/dispatch.hpp"
 #include "quants/act/exsia/exsia.hpp"
 #include "quants/act/exsia/types.hpp"
@@ -112,7 +115,20 @@ public:
       record_.stripe_id = event->stripe_id;
       record_.slot = event->slot;
     }
-#if LOG_CYCLE && CYCLE_DETAIL
+#if CYCLE_SIM
+    if (args.cycle_sim_context && log::cpu_service_exclusion(operation) == nullptr &&
+        std::strcmp(operation, "im2p.output_buffer_copy") != 0 &&
+        std::strcmp(operation, "im2p.output_authorize_host_call") != 0 &&
+        std::strcmp(operation, "im2p.residual_simulator_setup_host_call") != 0) {
+      try {
+        host_stage_ = std::make_unique<::im2p::gemmini::cycle_sim::HostStageScope>(
+            args.cycle_sim_context, operation, "POTAL_HOST", "llama.cpp-gemmini",
+            "ggml/src/ggml-gemmini/ggml-gemmini-im2p.cpp:HostCpuInterval", record_.layer,
+            std::vector<uint64_t>{}, args.cycle_sim_host_dependencies);
+      } catch (...) { args.cycle_sim_context.session->record_failure("adapter host stage declaration failed"); }
+    }
+#endif
+#if LOG_CYCLE && (CYCLE_DETAIL || CYCLE_SIM)
     start_ = read_matmul_cpu_sample();
     active_ = true;
 #endif
@@ -122,7 +138,7 @@ public:
   ~HostCpuInterval() { finish(false); }
 
   void finish([[maybe_unused]] bool operation_success = true) noexcept {
-#if LOG_CYCLE && CYCLE_DETAIL
+#if LOG_CYCLE && (CYCLE_DETAIL || CYCLE_SIM)
     if (!active_)
       return;
     const auto end = read_matmul_cpu_sample();
@@ -134,13 +150,34 @@ public:
       log::cycle.report_failure("IM2P host CPU interval");
     }
 #endif
+#if CYCLE_SIM
+    if (host_stage_) host_stage_->finish(operation_success);
+#endif
   }
 
 private:
   log::CycleRecord record_;
   [[maybe_unused]] MatmulCpuSample start_;
   [[maybe_unused]] bool active_ = false;
+#if CYCLE_SIM
+  std::unique_ptr<::im2p::gemmini::cycle_sim::HostStageScope> host_stage_;
+#endif
 };
+
+Result cycle_sim_health(const ggml_gemmini_args_t &args) noexcept {
+#if CYCLE_SIM
+  if (args.cycle_sim_context) {
+    try {
+      args.cycle_sim_context.session->ensure_healthy();
+    } catch (...) {
+      return {Error::execution_failure, "cycle-sim provenance failed before output commit", false};
+    }
+  }
+#else
+  (void)args;
+#endif
+  return {};
+}
 
 ::im2p::gemmini::Status to_frontend_status(const Result &result) noexcept {
   using Code = ::im2p::gemmini::StatusCode;
@@ -244,19 +281,30 @@ bool checked_output_extent(const ggml_gemmini_args_t &args,
   return true;
 }
 
-void copy_staged_output(const ggml_gemmini_args_t &args,
+bool copy_staged_output(const ggml_gemmini_args_t &args,
                         const std::vector<float> &staged) noexcept {
-  HostCpuInterval copy(args, "im2p.output_buffer_copy");
   const size_t row_stride = args.stride_f_out == 0 ? args.J : args.stride_f_out;
   const size_t col_stride =
       args.col_stride_f_out == 0 ? 1 : args.col_stride_f_out;
+  const auto copy = [&] {
   for (size_t row = 0; row < args.I; ++row) {
     for (size_t column = 0; column < args.J; ++column) {
       const size_t offset = row * row_stride + column * col_stride;
       args.f_out[offset] = staged[offset];
     }
   }
-  copy.finish();
+  };
+#if CYCLE_SIM
+  return ::im2p::gemmini::cycle_sim::publish_output(args.cycle_sim_context,
+      "im2p.output_buffer_copy", "llama.cpp-gemmini",
+      "ggml/src/ggml-gemmini/ggml-gemmini-im2p.cpp:copy_staged_output", args.matmul_layer.c_str(),
+      args.f_out, args.I, args.J, row_stride, col_stride, {}, args.cycle_sim_host_dependencies, copy);
+#else
+  HostCpuInterval timing(args, "im2p.output_buffer_copy");
+  copy();
+  timing.finish();
+  return true;
+#endif
 }
 
 #if defined(GGML_GEMMINI_TESTING)
@@ -466,6 +514,7 @@ validate_stripe_timings(const ::im2p::gemmini::StripeRtlTimingView &timings,
 static void
 emit_stripe_timings(const ::im2p::gemmini::StripeRtlTimingView &timings,
                     const ggml_gemmini_args_t &args) noexcept {
+#if !CYCLE_SIM
   for (const auto &timing : timings) {
     Im2pStripeTelemetry record{};
     record.layer = args.matmul_layer;
@@ -478,6 +527,10 @@ emit_stripe_timings(const ::im2p::gemmini::StripeRtlTimingView &timings,
     record.completion_cycle = timing.completion_cycle;
     emit_cycle_telemetry(record);
   }
+#else
+  (void)timings;
+  (void)args;
+#endif
 }
 
 static Result
@@ -533,6 +586,7 @@ Result emit_residual_stripe_timings(const ::im2p::gemmini::FenceResult &result,
       validate_residual_stripe_timings(result, expected_run_id);
   if (!status.ok())
     return status;
+#if !CYCLE_SIM
   for (const auto &timing : result.residual_stripe_timings) {
     Im2pExecutionTelemetry record{};
     record.residual_domain = true;
@@ -546,6 +600,9 @@ Result emit_residual_stripe_timings(const ::im2p::gemmini::FenceResult &result,
     record.rtl_work_total_cycles = timing.rmd_stats.base.work_total_cycles;
     emit_cycle_telemetry(record);
   }
+#else
+  (void)args;
+#endif
   return {};
 }
 
@@ -676,6 +733,10 @@ apply_baseline_rmd_full(const ggml_gemmini_args_t &runtime_args,
                         float *output_data, size_t output_elements,
                         ::im2p::gemmini::ResidualStripeStats &result_stats,
                         std::uint64_t &semantic_completion_count) noexcept {
+#if CYCLE_SIM
+  std::vector<uint64_t> packet_work_ids;
+  ::im2p::gemmini::cycle_sim::WorkCollector packet_collector(packet_work_ids, true);
+#endif
   const auto *metadata =
       std::get_if<quants::act::block::Meta>(&runtime_args.act_quant.storage());
   const auto &direct_residuals = quants::act::direct_residuals(runtime_args);
@@ -780,10 +841,17 @@ apply_baseline_rmd_full(const ggml_gemmini_args_t &runtime_args,
         ++counters.residual_executions;
       }
 #endif
+#if CYCLE_SIM
+      ::im2p::gemmini::cycle_sim::StageCall merge_call(
+          runtime_args.cycle_sim_context, cycle_sim::CallKind::ResidualMerge);
+#endif
       HostCpuInterval merge(runtime_args, "im2p.output_correction_apply");
       const rmd::RmdStatus merged = rmd::merge_rmd_correction_to(
           runtime_args, output_data, payload->row_begin, row_end, correction);
       merge.finish(merged == rmd::RmdStatus::success);
+#if CYCLE_SIM
+      if (merged == rmd::RmdStatus::success) merge_call.finish();
+#endif
       if (merged != rmd::RmdStatus::success)
         return from_rmd_status(merged);
 #if defined(GGML_GEMMINI_TESTING)
@@ -804,6 +872,9 @@ apply_baseline_rmd_full(const ggml_gemmini_args_t &runtime_args,
       }
       rmd::Correction correction = rmd::BlockScaledInt64Correction{};
       rmd::RmdExecutionMetrics metrics{};
+#if CYCLE_SIM
+      const size_t required_begin = ::im2p::gemmini::cycle_sim::work_count();
+#endif
       HostCpuInterval backend(runtime_args,
                               "im2p.residual_simulator_host_call");
       const rmd::RmdStatus executed =
@@ -824,11 +895,18 @@ apply_baseline_rmd_full(const ggml_gemmini_args_t &runtime_args,
         return {Error::execution_failure,
                 "baseline FULL RMD provider statistics overflow", false};
       }
+#if CYCLE_SIM
+      ::im2p::gemmini::cycle_sim::StageCall merge_call(
+          runtime_args.cycle_sim_context, cycle_sim::CallKind::ResidualMerge, required_begin);
+#endif
       HostCpuInterval merge(runtime_args, "im2p.output_correction_apply");
       const rmd::RmdStatus merged =
           rmd::detail::merge_rmd_correction_with_weights(
               runtime_args, output_data, *packet, correction, weights);
       merge.finish(merged == rmd::RmdStatus::success);
+#if CYCLE_SIM
+      if (merged == rmd::RmdStatus::success) merge_call.finish();
+#endif
       if (merged != rmd::RmdStatus::success)
         return from_rmd_status(merged);
 #if defined(GGML_GEMMINI_TESTING)
@@ -964,7 +1042,10 @@ Completion run_full(const ggml_gemmini_args_t &args) noexcept {
       completion.rmd_stats = translate_stats(rmd_stats.rmd_stats);
     }
 #endif
-    copy_staged_output(args, staged_output);
+    const auto health = cycle_sim_health(args);
+    if (!health.ok()) return {health, completion.stats};
+    if (!copy_staged_output(args, staged_output))
+      return {{Error::execution_failure, "output publication provenance failed", false}, completion.stats};
   }
   return completion;
 }
@@ -1193,6 +1274,10 @@ static Result apply_captured_rmd_full(
     const ggml_gemmini_args_t &runtime_args, float *output_data,
     size_t output_elements, const std::vector<CapturedExsiaStripe> &captured,
     ::im2p::gemmini::ResidualStripeStats &result_stats) noexcept {
+#if CYCLE_SIM
+  std::vector<uint64_t> packet_work_ids;
+  ::im2p::gemmini::cycle_sim::WorkCollector packet_collector(packet_work_ids, true);
+#endif
 #if defined(GGML_GEMMINI_TESTING)
   TestFailure failure;
   {
@@ -1308,6 +1393,9 @@ static Result apply_captured_rmd_full(
   rmd::RmdProviderStats staged_provider_stats{};
   rmd::detail::RmdWeightPreparation weights;
   for (const auto *captured_stripe : ordered) {
+#if CYCLE_SIM
+    const size_t required_begin = ::im2p::gemmini::cycle_sim::work_count();
+#endif
     const auto &event = captured_stripe->event;
     rmd::Correction correction = rmd::BlockScaledInt64Correction{};
     rmd::RmdExecutionMetrics metrics{};
@@ -1366,6 +1454,10 @@ static Result apply_captured_rmd_full(
     }
 #endif
     if (status == rmd::RmdStatus::success && !no_residual) {
+#if CYCLE_SIM
+      ::im2p::gemmini::cycle_sim::StageCall merge_call(
+          rmd_args->cycle_sim_context, cycle_sim::CallKind::ResidualMerge, required_begin);
+#endif
       HostCpuInterval merge(*rmd_args, "im2p.output_correction_apply", &event);
       status = shared_weights
                    ? rmd::detail::merge_rmd_correction_with_weights(
@@ -1375,6 +1467,9 @@ static Result apply_captured_rmd_full(
                                                   event.row_begin,
                                                   event.row_end, correction);
       merge.finish(status == rmd::RmdStatus::success);
+#if CYCLE_SIM
+      if (status == rmd::RmdStatus::success) merge_call.finish();
+#endif
     }
     if (status != rmd::RmdStatus::success)
       return from_rmd_status(status);
@@ -1440,6 +1535,11 @@ public:
                  const quants::act::exsia::StripeReadyEvent &event,
                  ::im2p::gemmini::ResidualStageView stage,
                  ::im2p::gemmini::ResidualStripeStats &stats) noexcept {
+#if CYCLE_SIM
+    std::vector<uint64_t> packet_work_ids;
+    ::im2p::gemmini::cycle_sim::WorkCollector packet_collector(packet_work_ids, true);
+    const size_t required_begin = ::im2p::gemmini::cycle_sim::work_count();
+#endif
     if (!event.activation_metadata.has_value() ||
         event.activation_metadata->theta ==
             std::numeric_limits<std::int16_t>::min() ||
@@ -1469,6 +1569,10 @@ public:
     ggml_gemmini_args_t stripe_args;
     try {
       stripe_args = runtime_args;
+#if CYCLE_SIM
+      ::im2p::gemmini::cycle_sim::append_host_dependencies(
+          stripe_args.cycle_sim_host_dependencies, event.cycle_sim_host_dependencies);
+#endif
       auto &metadata =
           stripe_args.act_quant.storage().emplace<quants::act::exsia::Meta>();
       metadata.e_s = event.activation_metadata->e_s;
@@ -1555,6 +1659,10 @@ public:
     }
 #endif
     if (status == rmd::RmdStatus::success && !no_residual) {
+#if CYCLE_SIM
+      ::im2p::gemmini::cycle_sim::StageCall merge_call(
+          stripe_args.cycle_sim_context, cycle_sim::CallKind::ResidualMerge, required_begin);
+#endif
       HostCpuInterval merge(stripe_args, "im2p.output_correction_apply",
                             &event);
       status = shared_weights
@@ -1565,6 +1673,9 @@ public:
                                                   event.row_begin,
                                                   event.row_end, correction);
       merge.finish(status == rmd::RmdStatus::success);
+#if CYCLE_SIM
+      if (status == rmd::RmdStatus::success) merge_call.finish();
+#endif
     }
     if (status != rmd::RmdStatus::success)
       return to_frontend_status(from_rmd_status(status));
@@ -1713,7 +1824,10 @@ public:
 #endif
   }
 
-  void copy_staged_output() noexcept {
+  bool copy_staged_output() noexcept {
+#if CYCLE_SIM
+    if (!im2p_adapter::copy_staged_output(args, staged_output)) return false;
+#else
     float *destination = args.f_out;
     const size_t row_stride =
         args.stride_f_out == 0 ? args.J : args.stride_f_out;
@@ -1725,11 +1839,13 @@ public:
         destination[offset] = staged_output[offset];
       }
     }
+#endif
 #if defined(GGML_GEMMINI_TESTING)
     std::lock_guard lock(test_mutex);
     ++counters.commit;
     counters.commit_event = ++counters.order_event_sequence;
 #endif
+    return true;
   }
 
 #if defined(GGML_GEMMINI_TESTING)
@@ -1859,7 +1975,10 @@ public:
 #endif
   }
 
-  void copy_staged_output() noexcept {
+  bool copy_staged_output() noexcept {
+#if CYCLE_SIM
+    if (!im2p_adapter::copy_staged_output(args, staged_output)) return false;
+#else
     float *destination = args.f_out;
     const size_t row_stride =
         args.stride_f_out == 0 ? args.J : args.stride_f_out;
@@ -1871,11 +1990,13 @@ public:
         destination[offset] = staged_output[offset];
       }
     }
+#endif
 #if defined(GGML_GEMMINI_TESTING)
     std::lock_guard lock(test_mutex);
     ++counters.commit;
     counters.commit_event = ++counters.order_event_sequence;
 #endif
+    return true;
   }
 
   ggml_gemmini_args_t &args;
@@ -2056,7 +2177,10 @@ Completion ExsiaFullExecution::finish(bool quantization_succeeded) noexcept {
   }
 #endif
   HostCpuInterval copy(impl_->args, "im2p.output_buffer_copy");
-  impl_->copy_staged_output();
+  const auto health = cycle_sim_health(impl_->args);
+  if (!health.ok()) return {health, completion.stats};
+  if (!impl_->copy_staged_output())
+    return {{Error::execution_failure, "output publication provenance failed", false}, completion.stats};
   copy.finish();
   return completion;
 }
@@ -2307,7 +2431,10 @@ Completion ExsiaStripePipeline::finish(bool quantization_succeeded) noexcept {
   }
 #endif
   HostCpuInterval copy(impl_->args, "im2p.output_buffer_copy");
-  impl_->copy_staged_output();
+  const auto health = cycle_sim_health(impl_->args);
+  if (!health.ok()) return {health, completion.stats};
+  if (!impl_->copy_staged_output())
+    return {{Error::execution_failure, "output publication provenance failed", false}, completion.stats};
   copy.finish();
   completion.run_id = run_id;
   emit_quantization_timings(impl_->published, impl_->args);
@@ -2433,6 +2560,10 @@ void log_failure(const char *operation, const Result &result) noexcept {
   if (result.ok()) {
     return;
   }
+#if CYCLE_SIM
+  if (const auto context = cycle_sim::current_context())
+    context.session->record_failure(result.message ? result.message : "CPU-functional dispatch failed");
+#endif
   GGML_LOG_ERROR("IM2P %s failed: %s (error=%u, native_contract=%u)\n",
                  operation ? operation : "operation",
                  result.message ? result.message : "unknown error",
@@ -2442,7 +2573,7 @@ void log_failure(const char *operation, const Result &result) noexcept {
 
 void log_rmd_stats(const Completion &completion,
                    const ggml_gemmini_args_t &args) noexcept {
-#if LOG_CYCLE
+#if LOG_CYCLE && !CYCLE_SIM
   if (completion.rmd_dot_calls == 0 &&
       completion.rmd_stats.rtl_work_total_cycles == 0)
     return;
@@ -2462,7 +2593,7 @@ void log_rmd_stats(const Completion &completion,
 
 void log_stats(const char *mode, const Stats &stats, std::uint64_t run_id,
                const ggml_gemmini_args_t &args) noexcept {
-#if LOG_CYCLE || LOG_DEBUG
+#if (LOG_CYCLE || LOG_DEBUG) && !CYCLE_SIM
   Im2pExecutionTelemetry record{};
   record.layer = args.matmul_layer;
   record.run_id = run_id;

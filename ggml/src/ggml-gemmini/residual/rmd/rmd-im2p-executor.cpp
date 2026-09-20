@@ -8,6 +8,9 @@
 #include <im2p_sim.h>
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
 #include <im2p_production_trace.hpp>
+#if CYCLE_SIM
+#include <im2p_cycle_sim.hpp>
+#endif
 #endif
 
 #include <algorithm>
@@ -322,6 +325,16 @@ RmdStatus execute_im2p_compact_dot(im2p_sim_t *sim, const Im2pCompactDot &dot,
                                    Im2pProviderStatsAggregate &aggregate,
                                    Im2pProviderTestFault fault,
                                    const Im2pFullExecutor *executor) {
+#if CYCLE_SIM
+  struct CompletionGuard {
+    const cycle_sim::Context &context;
+    bool success = false;
+    ~CompletionGuard() {
+      if (context && !success)
+        context.session->record_failure("CPU-functional residual dispatch failed");
+    }
+  } completion{dot.cycle_sim_context};
+#endif
 #if !defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) &&                       \
     !defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
   (void)sim;
@@ -355,6 +368,12 @@ RmdStatus execute_im2p_compact_dot(im2p_sim_t *sim, const Im2pCompactDot &dot,
     return RmdStatus::unsupported_route;
 #endif
   const bool scaled = dot.hp1_carriers != nullptr;
+#if CYCLE_SIM
+  if (dot.trace_context || (dot.cycle_sim_context &&
+      (!dot.cycle_sim_context.operation_id || !scaled || executor ||
+       fault != Im2pProviderTestFault::none)))
+    return RmdStatus::unsupported_route;
+#endif
   if (dot.trace_context &&
       (!*dot.trace_context || !scaled || executor ||
        fault != Im2pProviderTestFault::none))
@@ -455,6 +474,29 @@ RmdStatus execute_im2p_compact_dot(im2p_sim_t *sim, const Im2pCompactDot &dot,
                 0};
   }
   im2p_work_stats_extended_t stats{};
+#if CYCLE_SIM
+  cycle_sim::Context cycle_context;
+  try {
+    if (dot.cycle_sim_context)
+      cycle_context = dot.cycle_sim_context.session->new_dispatch(dot.cycle_sim_context);
+  } catch (...) {
+    return RmdStatus::execution_failed;
+  }
+  cycle_sim::ScopedContext cycle_scope(cycle_context);
+  auto selected_work = im2p::gemmini::cycle_sim::full(descriptor, geometry);
+  selected_work.provenance = "residual";
+  selected_work.scope = "residual_compact";
+  selected_work.original_block_id = dot.original_block_id;
+  selected_work.source_row_begin = dot.source_row_begin;
+  selected_work.source_row_count = dot.source_row_count;
+  selected_work.stripe_id = dot.stripe_id;
+  selected_work.column_begin = dot.column_begin;
+  selected_work.group_index = dot.group_index;
+  selected_work.required_host_stage_ids = dot.required_host_stage_ids;
+  im2p::gemmini::cycle_sim::DispatchEvents dispatch_events(
+      cycle_context, &selected_work, cycle_sim::CallKind::ResidualCompact);
+  im2p::cpu_functional::TimingRegistration timing_registration(dispatch_events.observer());
+#endif
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
   optrace::Context trace_parent;
   optrace::Work trace_work;
@@ -469,7 +511,11 @@ RmdStatus execute_im2p_compact_dot(im2p_sim_t *sim, const Im2pCompactDot &dot,
     trace_work.stripe_id = dot.stripe_id;
     trace_work.column_begin = dot.column_begin;
     trace_work.group_index = dot.group_index;
-    trace_parent = dot.trace_context->session->parent_begin(*dot.trace_context, trace_work);
+    try {
+      trace_parent = dot.trace_context->session->parent_begin(*dot.trace_context, trace_work);
+    } catch (...) {
+      return RmdStatus::execution_failed;
+    }
   }
 #endif
 #if defined(GGML_GEMMINI_TESTING)
@@ -496,9 +542,23 @@ RmdStatus execute_im2p_compact_dot(im2p_sim_t *sim, const Im2pCompactDot &dot,
 #endif
   if (provider_status != IM2P_OK)
     return RmdStatus::execution_failed;
+#if CYCLE_SIM
+  if (cycle_context) {
+    try {
+      dispatch_events.complete();
+      cycle_context.session->ensure_healthy();
+    } catch (...) {
+      return RmdStatus::execution_failed;
+    }
+  }
+#endif
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
   if (dot.trace_context) {
-    trace_parent.session->accepted(trace_parent, trace_work);
+    try {
+      trace_parent.session->accepted(trace_parent, trace_work);
+    } catch (...) {
+      return RmdStatus::execution_failed;
+    }
   }
 #endif
   if (context.seen_count != dot.rows * dot.columns)
@@ -506,11 +566,29 @@ RmdStatus execute_im2p_compact_dot(im2p_sim_t *sim, const Im2pCompactDot &dot,
   const auto status = aggregate_stats(stats, aggregate);
   if (status != RmdStatus::success)
     return status;
-  for (size_t row = 0; row < dot.rows; ++row)
-    std::copy_n(staged_values.data() + row * dot.columns, dot.columns,
-                output + row * output_row_stride);
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
-  if (trace_parent) trace_parent.session->parent_end(trace_parent);
+  if (trace_parent) {
+    try {
+      trace_parent.session->parent_end(trace_parent);
+    } catch (...) {
+      return RmdStatus::execution_failed;
+    }
+  }
+#endif
+  const auto publish = [&] {
+    for (size_t row = 0; row < dot.rows; ++row)
+      std::copy_n(staged_values.data() + row * dot.columns, dot.columns,
+                  output + row * output_row_stride);
+  };
+#if CYCLE_SIM
+  if (!im2p::gemmini::cycle_sim::publish_output(cycle_context, "im2p.residual_output_publish",
+          "llama.cpp-gemmini", "ggml/src/ggml-gemmini/residual/rmd/rmd-im2p-executor.cpp:execute_im2p_compact_dot",
+          dot.trace_layer.c_str(), output, dot.rows, dot.columns, output_row_stride, 1,
+          dispatch_events.required_work(), {}, publish))
+    return RmdStatus::execution_failed;
+  completion.success = true;
+#else
+  publish();
 #endif
   return RmdStatus::success;
 #endif
