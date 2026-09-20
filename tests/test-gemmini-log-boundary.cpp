@@ -316,13 +316,17 @@ static bool test_operation_end_drains_worker_cpu_intervals(const std::filesystem
     queued.get_future().wait();
 
     // The worker stays alive with its thread-local buffer populated. Ending the
-    // operation must drain that buffer before publishing operation_end.
+    // operation must drain that buffer before publishing operation_end, but it
+    // must not force stdio to the backing file.
+    ggml::gemmini::log::testing::set_log_fault(ggml::gemmini::log::testing::LogFault::flush);
     perf::end_operation(140, true);
+    const bool boundary_healthy = cycle.healthy();
+    ggml::gemmini::log::testing::clear_log_fault();
     release.set_value();
     worker.join();
     perf::finish_request(150);
     perf::finish_recording();
-    const bool flushed = cycle.flush();
+    const bool recording_healthy = cycle.healthy();
     const std::string output = read_file(path);
     const auto summary = perf::read_summary(path);
     cycle.set_buffered(false);
@@ -330,7 +334,7 @@ static bool test_operation_end_drains_worker_cpu_intervals(const std::filesystem
 
     const auto cpu = output.find("\"op\":\"buffered.worker.cpu\"");
     const auto operation_end = output.find("\"event\":\"operation_end\"");
-    return flushed && summary.available && cpu != std::string::npos &&
+    return boundary_healthy && recording_healthy && summary.available && cpu != std::string::npos &&
         operation_end != std::string::npos && cpu < operation_end &&
         output.find("\"cpu_interval_samples\":1") != std::string::npos;
 #endif
@@ -364,12 +368,12 @@ static bool test_hardware_cycle_summary(const std::filesystem::path & root) {
     end_operation(4, true);
     finish_request(5);
     finish_recording();
-    const bool flushed = gemmini_log_cycle_flush() != 0;
+    const bool recording_healthy = ggml::gemmini::log::cycle.healthy();
     const auto replay = read_summary(path);
     const std::string summary = replay.serialize();
     gemmini_log_cycle_set_buffered(0);
     gemmini_log_cycle_set_output(stderr);
-    if (!flushed) return false;
+    if (!recording_healthy) return false;
 #if EXPECT_LOG_CYCLE
     if (!replay.available) return false;
     const std::string raw = read_file(path);

@@ -358,33 +358,35 @@ void emit_event(const char * event, uint64_t timestamp, bool success = true,
                 std::optional<int32_t> token_id = {}) noexcept {
 #if LOG_CYCLE
     try {
+        const std::string_view event_name(event);
         Json record = {{"schema", "gemmini.cycle"}, {"version", 2},
             {"record_type", "INFERENCE_EVENT"}, {"event", event},
             {"execution_id", cycle::host_execution_id()}, {"timestamp_ns", timestamp},
             {"event_sequence", ++event_sequence}, {"npu_frequency_hz", frequency_hz}};
-        if (std::string_view(event) == "request_start" || std::string_view(event) == "token_ready") {
+        if (event_name == "request_start" || event_name == "token_ready") {
             record["clock"] = "steady_clock";
-            record["boundary"] = std::string_view(event) == "request_start" ?
+            record["boundary"] = event_name == "request_start" ?
                 "tokenized_prompt_before_inference" : "sampling_and_accept_complete";
         }
-        if (std::string_view(event) == "token_ready") {
+        if (event_name == "token_ready") {
             record["token_index"] = token_sequence++;
             record["token_id"] = token_id ? Json(*token_id) : Json();
         }
-        if (std::string_view(event) == "operation_start" || std::string_view(event) == "operation_end")
+        if (event_name == "operation_start" || event_name == "operation_end")
             record["token_step"] = token_sequence;
-        if (std::string_view(event) == "operation_end") {
+        if (event_name == "operation_end") {
             record["success"] = success;
             record["resource_samples"] = resource_sequence.load();
             record["cpu_interval_samples"] = cpu_interval_sequence.load();
-            // Worker CPU intervals are buffered per thread. Drain them before
-            // publishing the operation boundary so replay observes the same
-            // logical ordering as execution even while threadpool workers live.
-            log::cycle.flush();
+            // Preserve replay order without forcing stdio to the backing file.
+            // Worker-local records must precede the operation boundary.
+            log::cycle.drain();
         }
-        if (std::string_view(event) == "session_end") record["log_healthy"] = log::cycle.healthy();
+        if (event_name == "session_end") record["log_healthy"] = log::cycle.healthy();
         log::cycle.write_json(record.dump());
-        log::cycle.flush();
+        // Materialize event ordering in the stream while keeping fflush() out of
+        // the inference hot path. The bounded worker queues still self-drain.
+        log::cycle.drain();
     } catch (...) {
         log::cycle.report_failure("inference event");
     }
@@ -479,7 +481,7 @@ void match_context(const Json & record, const State & state) {
         throw std::runtime_error("token_step_mismatch");
     if (state.operation.active) {
         if (number(context, "operation_id") != state.operation.id ||
-            text_value(context, "phase") != (state.operation.phase == Phase::prefill ? "prefill" : "decode"))
+            text_value(context, "phase") != phase_name(state.operation.phase))
             throw std::runtime_error("operation_context_mismatch");
     } else if (!context.at("operation_id").is_null() || !context.at("phase").is_null()) {
         throw std::runtime_error("operation_context_mismatch");
@@ -561,7 +563,7 @@ std::string serialize_context(Context context) {
     return "{\"request_id\":" + std::to_string(context.request_id) +
         ",\"operation_id\":" + (context.operation_id ? std::to_string(context.operation_id) : "null") +
         ",\"phase\":" + (context.operation_id ?
-            (context.phase == Phase::prefill ? "\"prefill\"" : "\"decode\"") : "null") +
+            std::string("\"") + phase_name(context.phase) + "\"" : "null") +
         ",\"included\":true}";
 }
 
@@ -622,6 +624,7 @@ void reset() {
 
 void finish_recording() {
     emit_event("session_end", 0);
+    log::cycle.flush();
 }
 
 void start_request(uint64_t start_ns) {

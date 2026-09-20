@@ -124,7 +124,7 @@ static void print_final_performance() {
     perf::finish_recording();
     perf::Summary summary;
 #if LOG_CYCLE
-    if (!gemmini_log_cycle_flush() || !ggml::gemmini::log::cycle.healthy()) {
+    if (!ggml::gemmini::log::cycle.healthy()) {
         summary.reason = "cycle_log_write_failed";
     } else {
         const auto path = ggml::gemmini::log::cycle.output_path();
@@ -139,7 +139,7 @@ static void print_final_performance() {
     summary.print(stderr);
 }
 
-// Close each evaluation before flushing, so log I/O is not CPU work time.
+// Close each evaluation before draining its log records, so log I/O is not CPU work time.
 class InferenceOperation {
 public:
     explicit InferenceOperation(perf::Phase phase, const char * op, bool cpu_work = false)

@@ -817,11 +817,21 @@ namespace ggml::gemmini::log
         return false;
     }
 
+    bool CycleLog::drain()
+    {
+#if LOG_CYCLE
+        std::lock_guard<std::mutex> lock(detail::output_mutex());
+        return drain_unlocked() && !lost_records_;
+#else
+        return true;
+#endif
+    }
+
     bool CycleLog::flush()
     {
 #if LOG_CYCLE
         std::lock_guard<std::mutex> lock(detail::output_mutex());
-        drain_unlocked();
+        if (!drain_unlocked()) return false;
         return flush_unlocked() && !lost_records_;
 #else
         return true;
@@ -1307,7 +1317,7 @@ extern "C" void gemmini_cpu_timing_emit(const char *layer, const char *scope, co
             ",\"operation_success\":" + (operation_success ? "true" : "false") +
             ",\"additive\":false}";
         log::cycle.write_json(json);
-        if (scope && std::string_view(scope) == "cpu.graph_workers") log::cycle.flush();
+        if (scope && std::string_view(scope) == "cpu.graph_workers") log::cycle.drain();
     } catch (...) {
         log::cycle.report_failure("CPU worker summary");
     }

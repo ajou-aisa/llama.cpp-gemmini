@@ -121,6 +121,9 @@ def main() -> None:
         wait = next(row for row in rows if row.get("op") == "worker_queue_wait")
         device = next(row for row in rows if row.get("row_type") == "device")
         assert (cpu["cycles"], cpu["wall_ns"], cpu["tid"]) == (60, 80, 42)
+        assert cpu["phase"] == "decode"
+        assert wait["phase"] == "decode"
+        assert device["phase"] == "decode"
         assert (wait["cycles"], wait["wall_ns"]) == (5, 250)
         assert (device["cycle_start"], device["cycle_end"], device["cycles"]) == (700, 900, 200)
         assert "ns_start" not in device

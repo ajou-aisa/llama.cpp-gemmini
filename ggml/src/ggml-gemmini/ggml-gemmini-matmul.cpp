@@ -17,10 +17,10 @@
 namespace ggml::gemmini {
 
 namespace {
-struct MatmulCycleFlush {
-    ~MatmulCycleFlush() {
+struct MatmulCycleDrain {
+    ~MatmulCycleDrain() {
 #if LOG_CYCLE && CYCLE_DETAIL
-        (void) gemmini_log_cycle_flush();
+        (void) log::cycle.drain();
 #endif
     }
 };
@@ -1570,7 +1570,7 @@ void MatMul::discard_output_transaction() {
 }
 
 MatMulResult MatMul::run_dense() {
-    const MatmulCycleFlush flush;
+    const MatmulCycleDrain drain;
     return run_dense(false);
 }
 
@@ -1670,7 +1670,7 @@ MatMulResult MatMul::run_dense(bool transactional) {
 }
 
 MatMulResult MatMul::run_full() {
-    const MatmulCycleFlush flush;
+    const MatmulCycleDrain drain;
     const auto run_id = matmul_cpu_run_id(args());
     const auto dense_start = read_matmul_cpu_sample();
     const MatMulResult dense = run_dense(true);
@@ -3590,7 +3590,7 @@ MatmulStatus finalize_stripe(MatmulStripeJob & job) {
 }
 
 MatmulStatus finish_execution(MatmulExecution & execution) {
-    const MatmulCycleFlush flush;
+    const MatmulCycleDrain drain;
     const auto finish_start = read_matmul_cpu_sample();
     const auto result = [&]() -> MatmulStatus {
     std::lock_guard<std::mutex> state_lock(*execution.state_mutex_);

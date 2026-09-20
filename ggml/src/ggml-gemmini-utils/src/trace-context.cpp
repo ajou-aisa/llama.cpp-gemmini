@@ -161,7 +161,8 @@ std::string append_metadata(std::string text, const gemmini_trace_context &conte
         row.contains("domain") ? row["domain"] : row.contains("source") ? row["source"] : Json();
     Json info = {{"version",1},{"request_id",nullable(context.request_id)},
         {"inference_operation_id",nullable(context.inference_operation_id)},
-        {"phase",context.inference_operation_id ? Json(context.phase ? "decode" : "prefill") : Json()},
+        {"phase",context.inference_operation_id ? Json(performance::phase_name(
+            context.phase ? performance::Phase::decode : performance::Phase::prefill)) : Json()},
         {"operator_id",nullable(context.operator_id)},
         {"graph_id",nullable(context.graph_id)},{"node_id",context.flags & GEMMINI_TRACE_OPERATOR ? Json(context.node_id) : Json()},
         {"operator_kind",context.operator_name[0] ? Json(context.operator_name) : Json()},

@@ -13,6 +13,14 @@ namespace ggml::gemmini::performance {
 
 enum class Phase { prefill, decode };
 
+constexpr const char * phase_name(Phase phase) noexcept {
+    switch (phase) {
+        case Phase::prefill: return "prefill";
+        case Phase::decode:  return "decode";
+    }
+    return "unknown";
+}
+
 struct Context {
     uint64_t request_id = 0;
     uint64_t operation_id = 0;

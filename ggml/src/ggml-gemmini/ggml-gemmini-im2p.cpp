@@ -2599,7 +2599,7 @@ void log_rmd_stats(const Completion &completion,
   record.mode = "full";
   emit_cycle_telemetry(record);
 #if CYCLE_DETAIL
-  log::cycle.flush();
+  log::cycle.drain();
 #endif
 #else
   (void)completion;
@@ -2643,7 +2643,7 @@ void log_stats(const char * mode, const Stats & stats,
   device_diagnostics(record, args, stats);
   emit_cycle_telemetry(record);
 #if LOG_CYCLE && CYCLE_DETAIL
-  log::cycle.flush();
+  log::cycle.drain();
 #endif
 #else
   (void) mode; (void) stats; (void) run_id; (void) args;

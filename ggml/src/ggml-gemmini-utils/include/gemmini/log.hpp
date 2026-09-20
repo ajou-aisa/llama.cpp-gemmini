@@ -243,8 +243,11 @@ namespace ggml::gemmini::log
         ~CycleLog() override;
         void set_output(FILE *out);
         bool set_output_path(const char *path, bool truncate = false);
-        // Opt in to bounded worker buffers for owned regular files; flush at operation/run end.
+        // Opt in to bounded worker buffers for owned regular files.
         void set_buffered(bool buffered);
+        // Drain worker-local queues into the stdio stream without forcing fflush().
+        bool drain();
+        // Drain pending records and flush the stdio stream to the backing file.
         bool flush();
         bool healthy() const;
         std::filesystem::path output_path() const;
