@@ -144,12 +144,19 @@ int main(int argc, char ** argv) {
             const auto & wall = record.at("host_timing");
             const auto & cpu = record.at("thread_cpu_timing");
             const auto & native = record.at("native_cycles");
-            if (record.at("record_type") != "CPU_INTERVAL" || record.at("additive") != false ||
+            if (record.at("record_type") != "CYCLE_INTERVAL" || record.at("additive") != false ||
+                !record.contains("start") || !record.contains("end") ||
+                !record.contains("delta") || !record.contains("valid") ||
                 wall.at("valid") != true || wall.at("start_tid") != wall.at("end_tid") ||
                 wall.at("start_ns").get<uint64_t>() > wall.at("end_ns").get<uint64_t>() ||
                 wall.at("duration_ns").get<uint64_t>() !=
                     wall.at("end_ns").get<uint64_t>() - wall.at("start_ns").get<uint64_t>() ||
                 native.at("delta").is_null() == native.at("valid").get<bool>()) return 24;
+            if (record.at("valid").get<bool>()) {
+                if (record.at("start").get<uint64_t>() > record.at("end").get<uint64_t>() ||
+                    record.at("delta").get<uint64_t>() != record.at("end").get<uint64_t>() -
+                        record.at("start").get<uint64_t>()) return 24;
+            } else if (!record.at("delta").is_null() || !record.contains("reason")) return 24;
 #if defined(__APPLE__) || defined(__linux__)
             if (cpu.at("valid") != true || cpu.at("duration_ns").get<uint64_t>() !=
                     cpu.at("end_ns").get<uint64_t>() - cpu.at("start_ns").get<uint64_t>()) return 25;

@@ -7,6 +7,16 @@
 
 namespace ggml::gemmini::cycle {
 
+enum class TimingIntervalClass : uint8_t {
+    canonical_additive,
+    per_worker_cpu_work,
+    functional_emulation,
+    wait,
+    non_additive,
+    structural,
+    diagnostic,
+};
+
 struct HostSample {
     uint64_t ns = 0;
     uint64_t tid = 0;
@@ -23,6 +33,9 @@ std::string serialize_host_timing(uint64_t start_ns, uint64_t end_ns,
 std::string serialize_thread_cpu_timing(const HostSample &start, const HostSample &end);
 std::string serialize_cpu_totals(const gemmini_cpu_totals &totals);
 std::string serialize_cpu_native(const gemmini_cpu_sample &start, const gemmini_cpu_sample &end);
+const char *timing_interval_class_name(TimingIntervalClass value) noexcept;
+std::string serialize_cpu_timing_contract(const gemmini_cpu_sample &start,
+                                          const gemmini_cpu_sample &end);
 
 struct WorkerCpuTiming {
     gemmini_cpu_sample start{}, end{};

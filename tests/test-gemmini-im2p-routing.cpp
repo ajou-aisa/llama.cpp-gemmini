@@ -77,6 +77,7 @@ static bool check_frontend_worker_summary() {
     worker.join();
     timing.success = success;
   }
+  (void) log::cycle.drain();
   std::rewind(output);
   std::string json;
   char buffer[1024];
@@ -84,10 +85,10 @@ static bool check_frontend_worker_summary() {
     json.append(buffer, count);
   log::cycle.set_output(stderr);
   std::fclose(output);
-#if LOG_CYCLE
+#if LOG_CYCLE && CYCLE_DETAIL
   const auto first = json.find("\"record_type\":\"CPU_WORK_SUMMARY\"");
   const auto second = json.find("\"record_type\":\"CPU_WORK_SUMMARY\"", first + 1);
-  return enabled && first != std::string::npos && second != std::string::npos &&
+  const bool valid = enabled && first != std::string::npos && second != std::string::npos &&
     json.find("\"record_type\":\"CPU_WORK_SUMMARY\"", second + 1) == std::string::npos &&
     json.find("\"op\":\"im2p.simulation_worker\"") != std::string::npos &&
     json.find("\"run_id\":42") != std::string::npos &&
@@ -98,6 +99,22 @@ static bool check_frontend_worker_summary() {
     json.find("\"start_tid\":" + std::to_string(cycle::host_thread_id())) == std::string::npos &&
     json.find("\"operation_success\":true") != std::string::npos &&
     json.find("\"operation_success\":false") != std::string::npos;
+  if (!valid) std::fprintf(stderr, "invalid frontend worker summary: %s\n", json.c_str());
+  return valid;
+#elif LOG_CYCLE
+  const auto count = [&](const std::string &token) {
+    size_t result = 0;
+    for (size_t pos = 0; (pos = json.find(token, pos)) != std::string::npos;
+         pos += token.size()) ++result;
+    return result;
+  };
+  return enabled && count("\"kind\":\"segment\"") == 2 &&
+      count("\"op\":\"im2p.simulation_worker\"") == 2 &&
+      count("\"interval_class\":\"STRUCTURAL\"") == 2 &&
+      count("\"run_id\":42") == 1 &&
+      json.find("\"thread_id\":" + std::to_string(worker_tid)) != std::string::npos &&
+      json.find("\"thread_id\":" + std::to_string(cycle::host_thread_id())) == std::string::npos &&
+      json.find("CPU_WORK_SUMMARY") == std::string::npos;
 #else
   (void) worker_tid;
   return !enabled && json.empty();
@@ -124,7 +141,12 @@ static bool check_npu_summary_ingress() {
   performance::finish_recording();
   const auto json = performance::serialize();
   performance::reset();
-#if LOG_CYCLE
+#if CYCLE_SIM
+  const bool clean = json.find("work_total_cycles") == std::string::npos &&
+      json.find("\"resource\":\"npu\"") == std::string::npos;
+  if (!clean) std::fprintf(stderr, "unexpected online NPU summary: %s\n", json.c_str());
+  return clean;
+#elif LOG_CYCLE
   return json.find("\"backend\":\"im2p_sim\",\"domain\":\"dense\",\"metric\":\"work_total_cycles\",\"cycles\":117,") != std::string::npos &&
          json.find("\"backend\":\"im2p_sim\",\"domain\":\"residual\",\"metric\":\"work_total_cycles\",\"cycles\":23,") != std::string::npos &&
          json.find("im2p_frontend_cpu_stage_coverage_incomplete") != std::string::npos &&
@@ -159,12 +181,14 @@ int main() {
   event.stripe_id = 3;
   event.slot = 1;
   {
-    im2p_adapter::HostCpuInterval interval(args, "test.explicit_finish", &event);
+    im2p_adapter::HostCpuInterval interval(args, "test.explicit_finish",
+        im2p_adapter::HostIntervalAccounting::cpu_work, &event);
     interval.finish();
     interval.finish();
   }
   {
-    im2p_adapter::HostCpuInterval interval(args, "test.partial_return", &event);
+    im2p_adapter::HostCpuInterval interval(args, "test.partial_return",
+        im2p_adapter::HostIntervalAccounting::cpu_work, &event);
     // A return before the success boundary must not claim operation success.
   }
   std::fflush(output);
@@ -182,6 +206,16 @@ int main() {
          pos += token.size()) ++count;
     return count;
   };
+#if CYCLE_SIM
+  ok = ok && occurrences("\"op\":\"im2p.output_buffer_copy\"") == 0 &&
+       occurrences("\"op\":\"test.explicit_finish\"") == 1 &&
+       occurrences("\"op\":\"test.partial_return\"") == 1 &&
+       occurrences("\"run_id\":0") == 2 &&
+       occurrences("\"stripe_id\":3") == 2 &&
+       occurrences("\"slot\":1") == 2 &&
+       occurrences("\"operation_success\":true") == 1 &&
+       occurrences("\"operation_success\":false") == 1;
+#else
   ok = ok && occurrences("\"op\":\"im2p.output_buffer_copy\"") == 1 &&
        occurrences("\"op\":\"test.explicit_finish\"") == 1 &&
        occurrences("\"op\":\"test.partial_return\"") == 1 &&
@@ -189,22 +223,37 @@ int main() {
        occurrences("\"stripe_id\":3") == 2 &&
        occurrences("\"slot\":1") == 2 &&
        occurrences("\"operation_success\":true") == 2 &&
-       occurrences("\"operation_success\":false") == 1 &&
-       occurrences("\"additive\":false") == 3 &&
-       occurrences("\"host_timing\":{") == 3 &&
-       occurrences("\"native_cycles\":{") == 3 &&
-       occurrences("\"thread_cpu_timing\":{") == 3 &&
-       occurrences("\"start_tid\":" + std::to_string(cycle::host_thread_id())) == 3 &&
-       occurrences("\"end_tid\":" + std::to_string(cycle::host_thread_id())) == 3;
+       occurrences("\"operation_success\":false") == 1;
+#endif
+#if CYCLE_DETAIL
+  ok = ok &&
+       occurrences("\"additive\":false") == (CYCLE_SIM ? 2 : 3) &&
+       occurrences("\"host_timing\":{") == (CYCLE_SIM ? 2 : 3) &&
+       occurrences("\"native_cycles\":{") == (CYCLE_SIM ? 2 : 3) &&
+       occurrences("\"thread_cpu_timing\":{") == (CYCLE_SIM ? 2 : 3) &&
+       occurrences("\"start_tid\":" + std::to_string(cycle::host_thread_id())) == (CYCLE_SIM ? 2 : 3) &&
+       occurrences("\"end_tid\":" + std::to_string(cycle::host_thread_id())) == (CYCLE_SIM ? 2 : 3);
+#else
+  ok = ok && occurrences("\"interval_class\":\"PER_WORKER_CPU_WORK\"") == (CYCLE_SIM ? 2 : 3) &&
+       occurrences("\"host_execution_id\":") == (CYCLE_SIM ? 2 : 3) &&
+       occurrences("\"host_elapsed_ns\":") == (CYCLE_SIM ? 2 : 3) &&
+       occurrences("\"thread_id\":" + std::to_string(cycle::host_thread_id())) == (CYCLE_SIM ? 2 : 3) &&
+       occurrences("\"host_timing\":{") == 0 &&
+       occurrences("\"native_cycles\":{") == 0 &&
+       occurrences("\"thread_cpu_timing\":{") == 0;
+#endif
 #if !defined(__linux__) || !defined(__aarch64__)
-  ok = ok && copy_reads == 2;
+  ok = ok && copy_reads == (CYCLE_SIM ? 0 : 2);
 #endif
 #else
   ok = ok && json.empty();
   ok = ok && copy_reads == 0;
 #endif
-  ok = check_frontend_worker_summary() && ok;
-  ok = check_npu_summary_ingress() && ok;
+  const bool worker_summary_ok = check_frontend_worker_summary();
+  const bool npu_summary_ok = check_npu_summary_ingress();
+  if (!worker_summary_ok) std::fputs("FAIL: frontend worker summary\n", stderr);
+  if (!npu_summary_ok) std::fputs("FAIL: NPU summary ingress\n", stderr);
+  ok = worker_summary_ok && npu_summary_ok && ok;
   if (!ok) std::fprintf(stderr, "FAIL: real adapter host copy/identity/completion seam\n%s", json.c_str());
   return ok ? 0 : 1;
 }

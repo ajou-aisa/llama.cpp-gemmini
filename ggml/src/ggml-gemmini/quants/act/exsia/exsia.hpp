@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <gemmini/layer.hpp>
+#include <gemmini/cpu-timing.h>
 #include <gemmini/cpu_log_context.hpp>
 #if CYCLE_SIM
 #include <gemmini/cycle_sim_log.hpp>
@@ -599,6 +600,9 @@ namespace ggml::gemmini::quants::act::exsia
         const char *host_operation = nullptr;
         std::string host_layer;
         uint64_t stripe_id = UINT64_MAX;
+#if LOG_CYCLE
+        gemmini_cpu_sample host_start_sample{};
+#endif
 #endif
     };
 

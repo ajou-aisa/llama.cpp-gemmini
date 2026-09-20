@@ -19,7 +19,7 @@ endif()
 add_executable(test-functional-emulation-exclusion test-functional-emulation-exclusion.cpp)
 target_compile_features(test-functional-emulation-exclusion PRIVATE cxx_std_17)
 target_compile_definitions(test-functional-emulation-exclusion PRIVATE
-    CYCLE_SIM=${CYCLE_SIM} LOG_CYCLE=${LOG_CYCLE})
+    CYCLE_SIM=${CYCLE_SIM} LOG_CYCLE=${LOG_CYCLE} CYCLE_DETAIL=${CYCLE_DETAIL})
 target_compile_options(test-functional-emulation-exclusion PRIVATE -UNDEBUG)
 target_link_libraries(test-functional-emulation-exclusion PRIVATE ggml-gemmini-utils Threads::Threads)
 add_test(NAME test-functional-emulation-exclusion COMMAND test-functional-emulation-exclusion)
@@ -28,6 +28,7 @@ if(TARGET ggml-cpu AND NOT GGML_BACKEND_DL)
     target_compile_features(test-cycle-sim-cpu-smoke PRIVATE cxx_std_17)
     target_compile_definitions(test-cycle-sim-cpu-smoke PRIVATE
         LOG_CYCLE=${LOG_CYCLE} CYCLE_SIM=${CYCLE_SIM}
+        CYCLE_DETAIL=${CYCLE_DETAIL}
         EXPECT_LOG_CYCLE=${LOG_CYCLE}
         EXPECT_CPU_CYCLE_LOG=$<IF:$<BOOL:${GGML_CPU_CYCLE_LOG}>,1,0>)
     target_link_libraries(test-cycle-sim-cpu-smoke PRIVATE ggml-base ggml-cpu ggml-gemmini-utils)
@@ -37,6 +38,7 @@ if(TARGET ggml-cpu AND NOT GGML_BACKEND_DL)
         -P "${CMAKE_CURRENT_SOURCE_DIR}/test-cycle-sim-cpu-smoke.cmake")
 endif()
 if(CYCLE_SIM)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_executable(test-gemmini-cycle-sim-log test-gemmini-cycle-sim-log.cpp)
     target_compile_options(test-gemmini-cycle-sim-log PRIVATE -UNDEBUG)
     target_compile_definitions(test-gemmini-cycle-sim-log PRIVATE CYCLE_SIM=1 LOG_CYCLE=${LOG_CYCLE})
@@ -67,6 +69,7 @@ if(CYCLE_SIM)
             add_test(NAME test-gemmini-cycle-sim-dispatch-${mode} COMMAND "${CMAKE_COMMAND}"
                 "-DTEST_EXECUTABLE=$<TARGET_FILE:test-gemmini-cycle-sim-dispatch>"
                 "-DTEST_MODE=${mode}" "-DTEST_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+                "-DTEST_PYTHON=${Python3_EXECUTABLE}"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/test-cycle-sim-dispatch.cmake")
         endforeach()
         add_executable(test-cpu-functional-contract "${IM2P_SIM_ROOT}/frontend/tests/cpu_functional_contract.cpp")

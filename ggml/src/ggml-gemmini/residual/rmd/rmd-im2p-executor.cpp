@@ -546,7 +546,7 @@ RmdStatus execute_im2p_compact_dot(im2p_sim_t *sim, const Im2pCompactDot &dot,
     }
 #endif
     host_call.finish(provider_status == IM2P_OK);
-#if LOG_CYCLE
+#if LOG_CYCLE && !CYCLE_SIM
     try {
         using Json = nlohmann::json;
         const bool real_provider = fault == Im2pProviderTestFault::none;

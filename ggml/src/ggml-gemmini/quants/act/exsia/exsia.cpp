@@ -361,6 +361,9 @@ namespace ggml::gemmini::quants::act::exsia
                 interval.host_operation = operation;
                 interval.host_layer = args->matmul_layer;
                 interval.stripe_id = stripe_id;
+#if LOG_CYCLE
+                interval.host_start_sample = gemmini_cpu_timing_read();
+#endif
             }
 #endif
             interval.valid = true;
@@ -409,22 +412,21 @@ namespace ggml::gemmini::quants::act::exsia
             interval.end_thread_id = profile_thread_id();
 #if CYCLE_SIM
             if (interval.host_stage) {
-                const auto checked = checked_profile_interval(interval,
-                    interval.start_tid == interval.end_tid);
-                log::CycleRecord record{interval.host_layer.c_str(), interval.host_operation,
-                    interval.start, interval.end, nullptr, 0, nullptr, kNativeCycleSource, kNativeCycleUnit};
-                record.correlation = interval.correlation;
+#if LOG_CYCLE
+                const cycle_sim::ScopedContext scope(interval.host_stage);
+                const auto host_end_sample = gemmini_cpu_timing_read();
+                gemmini_cycle_record_v2 record{};
+                record.interval.layer = interval.host_layer.c_str();
+                record.interval.op = interval.host_operation;
                 record.identity_mask = GEMMINI_CYCLE_HAS_WORKER_ID;
                 record.worker_id = 0;
                 if (interval.stripe_id != UINT64_MAX) {
                     record.identity_mask |= GEMMINI_CYCLE_HAS_STRIPE_ID;
                     record.stripe_id = interval.stripe_id;
                 }
-                auto json = log::serialize_checked_cycle_record(record,
-                    checked.cycles.has_value(), checked.cycles ? nullptr : "invalid_exsia_leaf_interval");
-                json.insert(json.rfind('}'), ",\"host_timing\":" + cycle::serialize_host_timing(
-                    interval.start_ns, interval.end_ns, interval.start_tid, interval.end_tid));
-                log::cycle.write_json(json);
+                log::cycle.write_cpu(record, interval.host_start_sample, host_end_sample,
+                    true, false, false, cycle::TimingIntervalClass::canonical_additive);
+#endif
                 interval.host_stage.session->host_stage_end(interval.host_stage);
             }
 #endif

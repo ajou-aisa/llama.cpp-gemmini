@@ -181,6 +181,9 @@ public:
     record_.op = operation;
     record_.source = kNativeCycleSource;
     record_.unit = kNativeCycleUnit;
+    record_.timing_interval_class = cpu_work_
+        ? cycle::TimingIntervalClass::per_worker_cpu_work
+        : cycle::TimingIntervalClass::non_additive;
     if (const auto *metadata =
             std::get_if<quants::act::exsia::Meta>(&args.act_quant.storage());
         metadata != nullptr && metadata->run_id.has_value()) {
@@ -210,6 +213,7 @@ public:
             args.cycle_sim_context, operation, "POTAL_HOST", "llama.cpp-gemmini",
             "ggml/src/ggml-gemmini/ggml-gemmini-im2p.cpp:HostCpuInterval", record_.layer,
             std::vector<uint64_t>{}, args.cycle_sim_host_dependencies);
+        record_.timing_interval_class = cycle::TimingIntervalClass::canonical_additive;
       } catch (...) {
         args.cycle_sim_context.session->record_failure("adapter host stage declaration failed");
       }

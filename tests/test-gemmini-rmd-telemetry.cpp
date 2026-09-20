@@ -338,7 +338,7 @@ bool aggregate_serializer_fixtures() {
         "{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"CYCLE_INTERVAL\","
         "\"source\":\"host_tick\",\"unit\":\"tick\",\"op\":\"dense\",\"layer\":\"ffn\\\"norm\","
         "\"run_id\":null,\"stripe_id\":null,\"slot\":null,\"node_id\":null,\"worker_id\":null,"
-        "\"start\":10,\"end\":34,\"delta\":24,\"valid\":true"
+        "\"start\":10,\"end\":34,\"delta\":24,\"valid\":true,\"interval_class\":\"DIAGNOSTIC\""
 #if CYCLE_SIM
         ",\"cpu_service\":true"
 #endif
@@ -346,7 +346,7 @@ bool aggregate_serializer_fixtures() {
 #else
     const std::string expected_interval =
         "{\"op\":\"dense\",\"kind\":\"cycle\",\"layer\":\"ffn\\\"norm\","
-        "\"start\":10,\"end\":34,\"delta\":24,\"valid\":true"
+        "\"start\":10,\"end\":34,\"delta\":24,\"valid\":true,\"interval_class\":\"DIAGNOSTIC\""
 #if CYCLE_SIM
         ",\"cpu_service\":true"
 #endif

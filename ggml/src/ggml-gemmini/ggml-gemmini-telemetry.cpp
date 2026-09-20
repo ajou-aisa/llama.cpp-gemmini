@@ -22,13 +22,11 @@ std::string serialize_matmul_cpu_interval(log::CycleRecord record,
     record.correlation = start.correlation;
 #if CYCLE_SIM
     if (start.exclusion.active || end.exclusion.active ||
-            start.exclusion.epoch != end.exclusion.epoch)
+            start.exclusion.epoch != end.exclusion.epoch) {
         record.cpu_service_exclusion = "functional_emulation";
+        record.timing_interval_class = cycle::TimingIntervalClass::functional_emulation;
+    }
 #endif
-    std::string json = log::serialize_checked_cycle_record(record, interval.cycles.has_value(),
-        interval.reason.empty() ? nullptr : interval.reason.c_str(),
-        interval.sample_reason.empty() ? nullptr : interval.sample_reason.c_str());
-#if CYCLE_DETAIL
     const auto cpu_sample = [](const MatmulCpuSample & sample) {
         gemmini_cpu_sample result{};
         result.trace = sample.trace;
@@ -46,16 +44,21 @@ std::string serialize_matmul_cpu_interval(log::CycleRecord record,
 #endif
         return result;
     };
-#endif
+    std::string json = log::serialize_checked_cycle_record(record, interval.cycles.has_value(),
+        interval.reason.empty() ? nullptr : interval.reason.c_str(),
+        interval.sample_reason.empty() ? nullptr : interval.sample_reason.c_str());
 #if CYCLE_DETAIL
     json.insert(json.rfind('}'),
         std::string(",\"cpu_measurement_version\":1,\"operation_success\":") +
-        (operation_success ? "true" : "false") + ",\"additive\":false,\"host_timing\":" +
+        (operation_success ? "true" : "false") + ",\"additive\":" +
+        (record.timing_interval_class == cycle::TimingIntervalClass::canonical_additive ? "true" : "false") +
+        ",\"host_timing\":" +
         cycle::serialize_host_timing(start.ns, end.ns, start.tid, end.tid) +
         ",\"native_cycles\":" + cycle::serialize_cpu_native(cpu_sample(start), cpu_sample(end)) +
         ",\"thread_cpu_timing\":" + cycle::serialize_thread_cpu_timing(
             {start.ns, start.tid, start.thread_cpu_ns, start.thread_cpu_valid},
-            {end.ns, end.tid, end.thread_cpu_ns, end.thread_cpu_valid}));
+            {end.ns, end.tid, end.thread_cpu_ns, end.thread_cpu_valid}) +
+        cycle::serialize_cpu_timing_contract(cpu_sample(start), cpu_sample(end)));
 #else
     std::string compact = std::string(",\"operation_success\":") +
         (operation_success ? "true" : "false") +
@@ -67,6 +70,7 @@ std::string serialize_matmul_cpu_interval(log::CycleRecord record,
         compact += ",\"tid_start\":" + std::to_string(start.tid) +
             ",\"tid_end\":" + std::to_string(end.tid);
     }
+    compact += cycle::serialize_cpu_timing_contract(cpu_sample(start), cpu_sample(end));
     json.insert(json.rfind('}'), compact);
 #endif
     return trace::annotate_origin(std::move(json), start.trace);
