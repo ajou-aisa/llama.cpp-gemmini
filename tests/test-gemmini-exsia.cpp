@@ -655,6 +655,7 @@ bool test_rmd_cpu_ws_routes() {
         return metadata_equal && std::equal(a.groups.begin(), a.groups.end(),
             b.groups.begin(), b.groups.end(), [](const auto & left, const auto & right) {
                 return left.lane_positions == right.lane_positions &&
+                    left.row_offsets == right.row_offsets && left.row_ids == right.row_ids &&
                     left.k_mask == right.k_mask && left.padded_k_count == right.padded_k_count &&
                     left.activation_offset == right.activation_offset &&
                     left.activation_byte_offset == right.activation_byte_offset &&

@@ -40,6 +40,7 @@ private:
         uint32_t k_mask = 0;
         std::array<uint32_t, kMaxNativeRadixLanes> lane_k_masks{};
         uint16_t lane_mask = 0;
+        std::vector<uint16_t> row_lane_masks; // original row -> nonzero limb bits
     };
 
     RmdStatus status_ = RmdStatus::success;

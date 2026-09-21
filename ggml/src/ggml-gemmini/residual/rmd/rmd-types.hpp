@@ -37,7 +37,7 @@ static_assert(
     kBlockSize % kArrayDim == 0 || kArrayDim % kBlockSize == 0,
               "Gemmini DIM and native weight scale group must divide one another");
 
-constexpr uint32_t kPacketVersion = 5;
+constexpr uint32_t kPacketVersion = 6;
 
 // The compact RMD packet stores adjacent logical Q4 digits low nibble first as
 // signed two's-complement INT4. IM2P model weights remain GGUF split-half,
@@ -110,9 +110,11 @@ inline size_t align_up(size_t value, size_t alignment) {
 }
 
 struct LaneGroupDescriptor {
-  // Input lanes use row_count rows each, followed by one group tail padded to
-  // DIM.
+    // Only nonzero (lane, original row) pairs are stored, then one DIM-padded tail.
+    // row_offsets bounds each lane's sorted slice of row_ids (both group-local).
     std::vector<uint8_t> lane_positions;
+    std::array<uint32_t, kMaxNativeRadixLanes + 1> row_offsets{};
+    std::vector<uint16_t> row_ids;
     uint32_t k_mask = 0; // original block-local K, shared by the group's lanes
     uint16_t padded_k_count = 0;
     uint32_t activation_offset = 0;
@@ -188,8 +190,8 @@ struct StripePacket {
 
     std::vector<BlockDescriptor> blocks;
     std::vector<uint16_t> k_indices; // block-local K, ascending inside each block
-  // block / group / group lane / real row / group K; zero padding only at each
-  // group tail
+    // block / group / group lane / active original row / group K;
+    // zero row padding only at each group tail.
     ActivationPayload stacked_activation;
     size_t activation_value_count = 0; // decoded values, including DIM padding
     size_t residual_event_count = 0;   // nonzero source residuals before radix expansion

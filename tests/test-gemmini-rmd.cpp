@@ -1856,18 +1856,26 @@ RmdStatus stream_compressed_reverse(const StripePacket &packet,
     for (size_t block_index = packet.blocks.size(); block_index-- > 0;) {
     const BlockDescriptor &block = packet.blocks[block_index];
         for (size_t lane = block.active_lane_count; lane-- > 0;) {
-      for (size_t m = (packet.row_count + kArrayDim - 1) / kArrayDim;
+            std::vector<uint16_t> row_ids;
+            for (const auto & group : block.groups) {
+                for (size_t l = 0; l < group.lane_positions.size(); ++l) {
+                    if (group.lane_positions[l] == lane) row_ids.assign(
+                        group.row_ids.begin() + group.row_offsets[l],
+                        group.row_ids.begin() + group.row_offsets[l + 1]);
+                }
+            }
+      for (size_t m = (row_ids.size() + kArrayDim - 1) / kArrayDim;
            m-- > 0;) {
                 for (size_t j = packet.j_padded / kArrayDim; j-- > 0;) {
                     std::array<OutputValue, kArrayDim * kArrayDim> values{};
           const size_t rows =
-              std::min(kArrayDim, packet.row_count - m * kArrayDim);
+              std::min(kArrayDim, row_ids.size() - m * kArrayDim);
           const size_t cols =
               std::min(kArrayDim, packet.logical_j - j * kArrayDim);
                     for (size_t row = 0; row < rows; ++row) {
             const size_t source =
                 block.output_value_offset + lane * block.lane_stride_values +
-                            (m * kArrayDim + row) * packet.j_padded + j * kArrayDim;
+                            row_ids[m * kArrayDim + row] * packet.j_padded + j * kArrayDim;
                         std::copy_n(compressed.values.data() + source, cols,
                                     values.data() + row * kArrayDim);
                     }
@@ -2297,17 +2305,30 @@ bool test_full_int32_compact_direct_agreement(size_t rows) {
            ok;
 
       const auto &block = packet->blocks.front();
-      const size_t group_rows =
-          align_up(block.active_lane_count * rows, kArrayDim);
+      std::array<size_t, kMaxNativeRadixLanes> active_rows{};
+      const auto radix = balanced_radix_contract(bits);
+      for (int32_t value : values) {
+          int64_t rest = value;
+          for (uint8_t lane = 0; lane < radix.lane_capacity; ++lane) {
+              int64_t digit = static_cast<uint64_t>(rest) & (radix.radix - 1);
+              if (digit > radix.digit_max) digit -= radix.radix;
+              active_rows[lane] += digit != 0 || lane == 0; // K31 contributes to lane 0.
+              rest = (rest - digit) / radix.radix;
+          }
+      }
+      size_t packed_rows = 0, physical_tiles = 0;
+      for (size_t count : active_rows) {
+          packed_rows += count;
+          physical_tiles += (count + kArrayDim - 1) / kArrayDim;
+      }
+      const size_t group_rows = align_up(packed_rows, kArrayDim);
             ok = check(packet->blocks.size() == 1 && block.groups.size() == 1 &&
                            metrics.stacked_i_tile_count == group_rows / kArrayDim &&
-                           metrics.physical_tile_count ==
-                         block.active_lane_count * align_up(rows, kArrayDim) /
-                             kArrayDim &&
+                           metrics.physical_tile_count == physical_tiles &&
                      metrics.block_padding_zeros ==
                          group_rows * (kArrayDim - 2) &&
                            metrics.row_padding_zeros ==
-                         (group_rows - block.active_lane_count * rows) *
+                         (group_rows - packed_rows) *
                              kArrayDim &&
                            packet->activation_value_count == group_rows * kArrayDim,
                  "group row padding drives payload size and dispatched tile "
@@ -2429,9 +2450,9 @@ bool test_compact_residual_metrics() {
                        metrics.array_dim == kArrayDim &&
                        metrics.original_rows_after_pruning == rows &&
                        metrics.lane_rows_before_pruning == 2 * contract.lane_capacity * rows &&
-                       metrics.lane_rows_after_pruning == 4 * rows &&
-                       metrics.group_rows_padded == 6 * kArrayDim,
-                   "lane pruning and group padding retain every original row") && ok;
+                       metrics.lane_rows_after_pruning == 6 &&
+                       metrics.group_rows_padded == 2 * kArrayDim,
+                   "row pruning retains only six active pairs and preserves original coordinates") && ok;
 #if LOG_CYCLE
         ok = check(metrics.active_original_rows_valid && metrics.active_original_rows == 2,
                    "cycle logging records original active rows") && ok;
@@ -2441,13 +2462,13 @@ bool test_compact_residual_metrics() {
 #endif
 
         const size_t first_k_tiles = align_up(19, kArrayDim) / kArrayDim;
-        const size_t issued_tiles = 4 * first_k_tiles + 2;
+        const size_t issued_tiles = first_k_tiles + 1;
         ok = check(metrics.active_blocks == 2 && metrics.active_lanes == 4 &&
                        metrics.compact_k_count == 21 && metrics.group_active_k_count == 21 &&
                        metrics.padded_k_count == (first_k_tiles + 1) * kArrayDim &&
                        metrics.group_padded_k_count == (first_k_tiles + 1) * kArrayDim &&
                        metrics.lane_group_count == 2 && metrics.matmul_call_count == first_k_tiles + 1 &&
-                       metrics.physical_tile_count == 8 &&
+                       metrics.physical_tile_count == 4 &&
                        metrics.baseline_stacked_i_tile_count == 6 * first_k_tiles + 2 &&
                        metrics.stacked_i_tile_count == issued_tiles,
                    "K-tail repeats count dispatched group tiles separately from logical output tiles") && ok;
@@ -2455,9 +2476,10 @@ bool test_compact_residual_metrics() {
                        metrics.useful_digit_macs == 23 * columns &&
                        metrics.issued_mac_capacity == issued_tiles * kArrayDim * kArrayDim * kArrayDim,
                    "source work, digit work and issued tile capacity have distinct MAC counts") && ok;
-        const size_t payload_bytes = (4 * first_k_tiles + 2) * kArrayDim * kArrayDim * bits / 8;
+        const size_t payload_bytes = issued_tiles * kArrayDim * kArrayDim * bits / 8;
         const size_t metadata_bytes = sizeof(StripePacket) + 2 * sizeof(BlockDescriptor) +
-            2 * sizeof(LaneGroupDescriptor) + 21 * sizeof(uint16_t) + 4 * sizeof(uint8_t);
+            2 * sizeof(LaneGroupDescriptor) + 21 * sizeof(uint16_t) + 4 * sizeof(uint8_t) +
+            6 * sizeof(uint16_t);
         ok = check(metrics.activation_payload_bytes == payload_bytes &&
                        metrics.metadata_host_bytes == metadata_bytes &&
                        metrics.packet_bytes == payload_bytes + metadata_bytes &&
@@ -2465,7 +2487,7 @@ bool test_compact_residual_metrics() {
                        metrics.block_scale_values_bytes == 2 * columns * sizeof(uint64_t) &&
                        metrics.correction_bytes == rows * columns * sizeof(int64_t) &&
                        metrics.logical_dot_result_bytes ==
-                           (3 * first_k_tiles + 1) * rows * columns * sizeof(int64_t) &&
+                           (4 * first_k_tiles + 2) * columns * sizeof(int64_t) &&
                        metrics.compressed_output_values == 0,
                    "packet storage, gathered INT32 weights and repeated dot outputs use explicit byte units") && ok;
         CompressedOutput compressed;
