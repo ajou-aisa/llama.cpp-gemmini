@@ -28,6 +28,45 @@ std::string work_fields(const Work &w) {
     require(w.provenance == "dense_main" || w.provenance == "residual", "invalid work provenance");
     require(!w.rmd_raw && !w.host_integer_block_multiply, "non-production residual semantics");
     require(!w.host_slot || *w.host_slot <= 1, "invalid target host slot");
+    if (w.provenance == "residual") {
+        require(w.scope == "residual_compact" && !w.original_block_id && w.original_k &&
+                !w.runs.empty() && w.row_map.size() == w.m && w.source_row_count &&
+                w.source_row_count <= UINT32_MAX && g.m <= UINT32_MAX &&
+                g.n <= UINT32_MAX && g.k <= UINT32_MAX,
+                "run-aware residual metadata required");
+        uint64_t cursor = 0;
+        uint64_t previous_block = 0;
+        for (size_t index = 0; index < w.runs.size(); ++index) {
+            const auto &run = w.runs[index];
+            uint32_t bits = run.original_k_mask;
+            uint32_t selected = 0;
+            while (bits) { ++selected; bits &= bits - 1; }
+            const uint64_t start = uint64_t(run.original_block_id) * 32;
+            const uint32_t available = start < *w.original_k
+                ? static_cast<uint32_t>(std::min<uint64_t>(32, *w.original_k - start)) : 0;
+            const uint32_t valid_mask = available == 32 ? UINT32_MAX :
+                                        available == 0 ? 0 : (uint32_t{1} << available) - 1;
+            require((index == 0 || run.original_block_id > previous_block) &&
+                    run.original_k_mask && !(run.original_k_mask & ~valid_mask) &&
+                    selected == run.compact_k_count && run.compact_k_begin == cursor,
+                    "invalid original block or compact run coverage");
+            previous_block = run.original_block_id;
+            cursor += run.compact_k_count;
+        }
+        require(cursor == w.geometry.k, "compact runs do not cover logical K");
+        uint64_t previous_row_key = 0;
+        for (size_t index = 0; index < w.row_map.size(); ++index) {
+            const auto &row = w.row_map[index];
+            const uint64_t key = uint64_t(row.lane_id) * w.source_row_count + row.source_row;
+            require(row.source_row < w.source_row_count &&
+                    row.lane_id < 32 / w.geometry.activation_bits + 1 &&
+                    (index == 0 || key > previous_row_key), "invalid global residual row map");
+            previous_row_key = key;
+        }
+    } else {
+        require(!w.original_k && w.runs.empty() && w.row_map.empty() &&
+                !w.original_block_id, "dense work cannot carry residual run metadata");
+    }
     if (w.scope == "stripe") {
         require(w.stripe_id && w.host_slot && *w.stripe_id == g.stripe_id && g.scope == IM2P_GEOMETRY_STRIPE,
                 "stripe identity/scope mismatch");
@@ -57,6 +96,23 @@ std::string work_fields(const Work &w) {
         << ",\"rmd_raw\":false,\"host_integer_block_multiply\":false,\"required_host_stage_ids\":[";
     for (size_t i = 0; i < w.required_host_stage_ids.size(); ++i)
         out << (i ? "," : "") << w.required_host_stage_ids[i];
+    out << "],\"original_k\":" << (w.original_k ? std::to_string(*w.original_k) : "null")
+        << ",\"residual_work_revision\":"
+        << (w.provenance == "residual" ? json_string("cross-block-run-aware-v1") : "null")
+        << ",\"runs\":[";
+    for (size_t i = 0; i < w.runs.size(); ++i) {
+        const auto &run = w.runs[i];
+        out << (i ? "," : "") << "{\"original_block_id\":" << run.original_block_id
+            << ",\"original_k_mask\":" << run.original_k_mask
+            << ",\"compact_k_begin\":" << run.compact_k_begin
+            << ",\"compact_k_count\":" << run.compact_k_count << '}';
+    }
+    out << "],\"row_map\":[";
+    for (size_t i = 0; i < w.row_map.size(); ++i) {
+        const auto &row = w.row_map[i];
+        out << (i ? "," : "") << "{\"source_row\":" << row.source_row
+            << ",\"lane_id\":" << row.lane_id << '}';
+    }
     out << ']';
     return out.str();
 }

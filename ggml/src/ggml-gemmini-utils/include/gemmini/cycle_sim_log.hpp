@@ -6,6 +6,7 @@
 #define GEMMINI_LOG_DEFAULT_NPU_TRACE_PATH "log/npu-cycle-trace.jsonl"
 
 #if CYCLE_SIM
+#include <im2p_compact_runs.h>
 #include <im2p_geometry.h>
 #include <gemmini/cpu_log_context.hpp>
 #include <gemmini/semantic.hpp>
@@ -58,11 +59,17 @@ struct Operation {
     std::string reason{};
     std::shared_ptr<const semantic::Context> semantic_context{};
 };
+struct RowIdentity {
+    uint32_t source_row = 0, lane_id = 0;
+};
 struct Work {
     im2p_production_geometry_v1_t geometry{};
     std::string provenance = "dense_main", scope = "full";
     uint64_t m = 0, row_begin = 0, row_count = 0;
     std::optional<uint64_t> stripe_id, host_slot, original_block_id;
+    std::optional<uint32_t> original_k;
+    std::vector<im2p_compact_run_t> runs;
+    std::vector<RowIdentity> row_map;
     uint64_t activation_stride_bytes = 0, weight_stride_bytes = 0;
     uint64_t output_stride_bytes = 0, scale_stride_elements = 0;
     uint32_t block_size = 32, vector_op = 5, output_domain = 2;

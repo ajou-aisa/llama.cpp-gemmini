@@ -102,6 +102,7 @@ ggml_add_backend_library(ggml-gemmini
                          quants/common/weight_reader.cpp
                          residual/direct/direct-executor.cpp
                          residual/rmd/rmd-builder.cpp
+                         residual/rmd/rmd-run-aware.cpp
                          residual/rmd/rmd-executor.cpp
                          residual/rmd/rmd-im2p-executor.cpp
                          residual/rmd/rmd-compose.cpp

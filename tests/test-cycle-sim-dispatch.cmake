@@ -4,7 +4,7 @@ file(MAKE_DIRECTORY "${log_dir}")
 execute_process(COMMAND "${CMAKE_COMMAND}" -E env "GEMMINI_LOG_DIR=${log_dir}"
     "${TEST_EXECUTABLE}" "${TEST_MODE}"
     RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
-message(STATUS "NPU trace fixture: ${log_dir}/npu-cycle-trace.jsonl")
+message(STATUS "Cycle-sim trace fixture: ${log_dir}/npu-cycle-trace.jsonl")
 if(NOT result EQUAL 0)
     message(FATAL_ERROR "${output}\n${error}")
 endif()

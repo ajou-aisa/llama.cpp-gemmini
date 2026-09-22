@@ -61,7 +61,7 @@ void Session::Impl::check() const {
 }
 void Session::Impl::emit(const char *kind, const std::string &fields) {
     check();
-    const std::string line = "{\"schema\":\"im2p-npu-cycle-trace\",\"version\":1,\"kind\":" +
+    const std::string line = "{\"schema\":\"im2p-npu-cycle-trace\",\"version\":2,\"kind\":" +
         json_string(kind) + ",\"sequence\":" + std::to_string(sequence++) +
         ",\"run_id\":\"run-0\",\"collection_run_id\":1,\"run_config_id\":" + json_string(info.run_config_id) +
         ",\"source_role\":" + json_string(semantic::source_name(semantic::Source::PotalCollection)) + fields + "}\n";
@@ -101,7 +101,8 @@ std::shared_ptr<Session> Session::start(const RunInfo &info) {
         ",\"prompt_tokens\":" + std::to_string(info.prompt_tokens) + ",\"requested_generated_tokens\":" +
         std::to_string(info.requested_generated_tokens) + ",\"producer_execution_kind\":\"CPU_FUNCTIONAL\"" +
         ",\"actual_rtl_acceptance_in_collection\":\"NOT_APPLICABLE\",\"collection_scope\":\"prompt_and_generation\",\"hardware_contract\":" +
-        info.hardware_contract_json + ",\"hardware_contract_sha256\":" + json_string(info.hardware_contract_sha256));
+        info.hardware_contract_json + ",\"hardware_contract_sha256\":" + json_string(info.hardware_contract_sha256) +
+        ",\"residual_work_revision\":\"cross-block-run-aware-v1\"");
     auto result = std::shared_ptr<Session>(new Session(std::move(impl)));
     active = result;
     return result;

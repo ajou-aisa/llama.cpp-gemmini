@@ -544,6 +544,31 @@ elseif(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
         message(FATAL_ERROR
             "IM2P cache manifest verification failed for ${GGML_GEMMINI_IM2P_ARTIFACT_ID}:\n${_GGML_GEMMINI_IM2P_MANIFEST_OUTPUT}${_GGML_GEMMINI_IM2P_MANIFEST_ERROR}")
     endif()
+    if(IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1")
+        file(READ "${GGML_GEMMINI_IM2P_MANIFEST}" _GGML_GEMMINI_IM2P_MANIFEST_JSON)
+        string(JSON _GGML_GEMMINI_IM2P_CONTRACT GET
+            "${_GGML_GEMMINI_IM2P_MANIFEST_JSON}" build_config hardware_lowering_contract)
+        foreach(_pair IN ITEMS "BANK_NUM=bank_count" "BANK_ROWS=bank_rows"
+                               "ACC_ROWS=accumulator_rows")
+            string(REPLACE "=" ";" _parts "${_pair}")
+            list(GET _parts 0 _macro)
+            list(GET _parts 1 _field)
+            string(JSON _resolved GET "${_GGML_GEMMINI_IM2P_CONTRACT}" facts memory "${_field}")
+            string(REGEX MATCHALL "#define[ \t]+${_macro}[ \t]+[0-9]+"
+                _matches "${_GGML_GEMMINI_PARAMS_CONTENT}")
+            list(LENGTH _matches _count)
+            if(NOT _count EQUAL 1 OR NOT _resolved MATCHES "^[1-9][0-9]*$")
+                message(FATAL_ERROR "Selected IM2P hardware memory contract lacks ${_macro}")
+            endif()
+            string(REGEX REPLACE "#define[ \t]+${_macro}[ \t]+[0-9]+"
+                "#define ${_macro} ${_resolved}" _GGML_GEMMINI_PARAMS_CONTENT
+                "${_GGML_GEMMINI_PARAMS_CONTENT}")
+        endforeach()
+        file(WRITE "${GGML_GEMMINI_GENERATED_CONFIG_DIR}/gemmini_params.h"
+            "${_GGML_GEMMINI_PARAMS_CONTENT}")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            "${GGML_GEMMINI_IM2P_MANIFEST}")
+    endif()
     set(GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE
         "${GGML_GEMMINI_IM2P_GENERATION}/libim2p_gemmini_frontend.a")
     set(GGML_GEMMINI_IM2P_SIM_ARCHIVE

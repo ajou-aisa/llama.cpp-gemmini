@@ -3,17 +3,22 @@
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.hpp"
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.hpp"
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-im2p-executor.hpp"
+#include "../ggml/src/ggml-gemmini/residual/rmd/rmd-run-aware.hpp"
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-args.h"
 #include "../ggml/src/ggml-gemmini/quants/act/exsia/exsia.hpp"
+#include "../ggml/src/ggml-gemmini/quants/act/block/types.hpp"
 #include "../ggml/src/ggml-gemmini/quants/common/weight_reader.hpp"
 
 #include <im2p_sim.h>
+#include <im2p_cpu_functional.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <string_view>
@@ -42,6 +47,132 @@ using Sim = std::unique_ptr<im2p_sim_t, SimDeleter>;
 
 bool hp1_backend() {
     return std::strcmp(im2p_sim_implementation(), "gemmini-hp1-integrated-v1") == 0;
+}
+
+bool run_aware_backend() {
+    return hp1_backend() ||
+        std::strcmp(im2p_sim_implementation(), "CPU_FUNCTIONAL") == 0;
+}
+
+struct ParityObservation {
+    im2p_matmul_desc_t descriptor{};
+    im2p_production_geometry_v1_t geometry{};
+    im2p_compact_runs_t run_view{};
+    std::vector<im2p_compact_run_t> runs;
+    std::vector<int8_t> activations;
+    std::vector<int8_t> weights;
+    std::vector<uint32_t> carriers;
+    std::vector<int64_t> output;
+    size_t calls = 0;
+    bool failed = false;
+};
+
+void capture_parity(ParityObservation &observation, const im2p_matmul_desc_t &descriptor,
+                    const im2p_production_geometry_v1_t &geometry,
+                    const im2p_compact_runs_t *run_view) {
+    if (!run_view || !descriptor.activations || !descriptor.provider.read_weight_i8 ||
+        !descriptor.provider.read_scale || descriptor.activation_storage_bytes != 1 ||
+        descriptor.weight_storage_bytes != 1) {
+        observation.failed = true;
+        return;
+    }
+    observation.descriptor = descriptor;
+    observation.geometry = geometry;
+    observation.run_view = *run_view;
+    observation.runs.assign(run_view->runs, run_view->runs + run_view->run_count);
+    observation.activations.resize(descriptor.m * descriptor.k);
+    observation.weights.resize(descriptor.k * descriptor.n);
+    observation.carriers.resize(run_view->run_count * descriptor.n);
+    const auto *activation_bytes = static_cast<const int8_t *>(descriptor.activations);
+    for (size_t row = 0; row < descriptor.m; ++row)
+        std::copy_n(activation_bytes + row * descriptor.activation_row_stride_bytes,
+                    descriptor.k, observation.activations.data() + row * descriptor.k);
+    for (size_t k = 0; k < descriptor.k; ++k)
+        if (descriptor.provider.read_weight_i8(descriptor.provider.context, k, 0,
+                                               descriptor.n, observation.weights.data() + k * descriptor.n) != IM2P_OK)
+            observation.failed = true;
+    for (size_t run = 0; run < run_view->run_count; ++run)
+        if (descriptor.provider.read_scale(descriptor.provider.context, run, 0,
+                                           descriptor.n, observation.carriers.data() + run * descriptor.n) != IM2P_OK)
+            observation.failed = true;
+    ++observation.calls;
+}
+
+#if defined(IM2P_CPU_FUNCTIONAL_TEST_HOOKS)
+void observe_parity(void *context, const im2p_matmul_desc_t &descriptor,
+                    const im2p_production_geometry_v1_t &geometry,
+                    const im2p_compact_runs_t *runs) noexcept {
+    auto &observation = *static_cast<ParityObservation *>(context);
+    try {
+        if (runs) capture_parity(observation, descriptor, geometry, runs);
+        else observation.failed = true;
+    } catch (...) { observation.failed = true; }
+}
+#endif
+
+struct ParityExecutorContext {
+    im2p_sim_t *sim;
+    ParityObservation *observation;
+    bool fail;
+};
+
+struct ParityProviderContext {
+    im2p_provider_t original;
+    ParityObservation *observation;
+};
+
+int parity_read_weight(void *opaque, size_t row, size_t column, size_t count, int8_t *out) {
+    const auto &provider = *static_cast<ParityProviderContext *>(opaque);
+    return provider.original.read_weight_i8(provider.original.context, row, column, count, out);
+}
+
+int parity_read_scale(void *opaque, size_t row, size_t column, size_t count, uint32_t *out) {
+    const auto &provider = *static_cast<ParityProviderContext *>(opaque);
+    return provider.original.read_scale(provider.original.context, row, column, count, out);
+}
+
+int parity_write_output(void *opaque, size_t block, size_t row, size_t column,
+                        size_t count, const int64_t *values, uint32_t domain) {
+    auto &provider = *static_cast<ParityProviderContext *>(opaque);
+    try {
+        if (block != 0 || row != 0 || column != 0 ||
+            count != provider.observation->descriptor.m * provider.observation->descriptor.n ||
+            domain != IM2P_OUTPUT_SCU_FINAL || !provider.observation->output.empty()) {
+            provider.observation->failed = true;
+            return IM2P_ERROR;
+        }
+        provider.observation->output.assign(values, values + count);
+    } catch (...) {
+        provider.observation->failed = true;
+        return IM2P_ERROR;
+    }
+    return provider.original.write_output(provider.original.context, block, row,
+                                          column, count, values, domain);
+}
+
+int execute_parity_runs(void *opaque, const im2p_matmul_desc_t *descriptor,
+                        const im2p_production_geometry_v1_t *geometry,
+                        const im2p_compact_runs_t *runs,
+                        im2p_work_stats_extended_t *stats) {
+    auto &context = *static_cast<ParityExecutorContext *>(opaque);
+    try { capture_parity(*context.observation, *descriptor, *geometry, runs); }
+    catch (...) { context.observation->failed = true; }
+    if (context.observation->failed) return IM2P_ERROR;
+    if (context.fail) return IM2P_ERROR;
+    ParityProviderContext provider{descriptor->provider, context.observation};
+    im2p_matmul_desc_t wrapped = *descriptor;
+    wrapped.provider = {&provider, parity_read_weight, nullptr,
+                        parity_read_scale, parity_write_output};
+    return im2p_execute_matmul_planned_runs(context.sim, &wrapped, geometry, runs, stats);
+}
+
+template <typename T>
+bool write_fixture_values(FILE *file, const char *name, const std::vector<T> &values) {
+    if (std::fprintf(file, "%s %zu\n", name, values.size()) < 0) return false;
+    for (size_t i = 0; i < values.size(); ++i)
+        if (std::fprintf(file, "%s%lld", i ? " " : "",
+                         static_cast<long long>(values[i])) < 0) return false;
+    return std::fputc('\n', file) != EOF;
 }
 
 std::vector<bool> provider_routes() {
@@ -138,7 +269,283 @@ struct Fixture {
         }
         packet = builder.finish();
     }
+
+    StripePacket remap_hp1_second_block(uint32_t second_block) {
+        const size_t blocks_per_row = static_cast<size_t>(second_block) + 1;
+        h1.assign(args.J * blocks_per_row, {});
+        hp1.assign(args.J * blocks_per_row, {});
+        for (size_t block_index = 0; block_index < hp1.size(); ++block_index) {
+            for (size_t k = 0; k < kBlockSize; ++k) {
+                const int32_t code =
+                    static_cast<int32_t>((block_index * 17 + k * 5) % 7) - 3;
+                set_code(block_index, k, code);
+            }
+            h1[block_index].c_b = 3;
+            h1[block_index].R = static_cast<uint16_t>(block_index + 1);
+            h1[block_index].s_rf = 0.25f;
+            hp1[block_index].m = static_cast<int16_t>(block_index + 1);
+            hp1[block_index].channel_scale = 0.25f;
+        }
+        args.K = blocks_per_row * kBlockSize;
+        args.native_block_count = hp1.size();
+        args.native_blocks_per_row = blocks_per_row;
+#if GGML_GEMMINI_WEIGHT_BITS == 4
+        args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q4_hp1;
+        args.q4_h1_blocks = nullptr;
+        args.q4_hp1_blocks = hp1.data();
+#elif GGML_GEMMINI_WEIGHT_BITS == 8
+        args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1;
+        args.q8_h1_blocks = nullptr;
+        args.q8_h1_block_count = 0;
+        args.q8_h1_rows = 0;
+        args.blocks_per_row = 0;
+        args.q8_hp1_blocks = hp1.data();
+        args.q8_hp1_block_count = hp1.size();
+        args.q8_hp1_blocks_per_row = blocks_per_row;
+#else
+        args.weight_format = ggml_gemmini_args_t::im2p_weight_format_t::q16_hp1;
+        args.q16_h1_blocks = nullptr;
+        args.q16_hp1_blocks = hp1.data();
+#endif
+        args.native_weight_bytes = hp1.size() * sizeof(hp1.front());
+        args.A.allocate(args.I, args.K, GGML_GEMMINI_ACTIVATION_BITS);
+        StripePacket mapped = *packet;
+        mapped.logical_k = args.K;
+        mapped.blocks[1].block_id = second_block;
+        mapped.blocks[1].global_k_begin = second_block * kBlockSize;
+        return mapped;
+    }
 };
+
+struct OriginalExpectedWork {
+    uint8_t operand_bits = 0;
+    size_t n = 0;
+    size_t k = 0;
+    size_t original_k = 0;
+    std::vector<im2p_compact_run_t> runs;
+    std::vector<std::vector<uint16_t>> local_k;
+    std::vector<RunAwareRow> rows;
+    std::vector<int8_t> activations;
+    std::vector<int8_t> weights;
+    std::vector<uint32_t> carriers;
+    std::vector<int64_t> output;
+};
+
+bool original_packet_digit(const StripePacket &packet, const BlockDescriptor &block,
+                           uint8_t lane_id, size_t source_row, uint16_t local_k,
+                           int8_t &digit) {
+    if (source_row >= packet.row_count || local_k >= 32) return false;
+    digit = 0;
+    bool found = false;
+    for (size_t position = 0; position < block.active_lane_count; ++position) {
+        if (block.lane_ids[position] != lane_id) continue;
+        for (const auto &group : block.groups) {
+            for (size_t group_lane = 0; group_lane < group.lane_positions.size(); ++group_lane) {
+                if (group.lane_positions[group_lane] != position) continue;
+                if (found) return false;
+                found = true;
+                const uint32_t bit = uint32_t{1} << local_k;
+                if (!(group.k_mask & bit)) continue;
+                const size_t rank = __builtin_popcount(group.k_mask & (bit - 1));
+                const size_t offset =
+                    (group_lane * packet.row_count + source_row) * group.padded_k_count + rank;
+                if (packet.digit_storage == DigitStorage::packed_signed_int4) {
+                    const size_t byte = group.activation_byte_offset + offset / 2;
+                    if (byte >= packet.stacked_activation.packed_int4.size()) return false;
+                    const uint8_t nibble =
+                        (packet.stacked_activation.packed_int4[byte] >> (4 * (offset % 2))) & 15;
+                    digit = static_cast<int8_t>(nibble < 8 ? nibble : int(nibble) - 16);
+                } else if (packet.digit_storage == DigitStorage::signed_int8) {
+                    const size_t index = group.activation_offset + offset;
+                    if (index >= packet.stacked_activation.signed_int8.size()) return false;
+                    digit = packet.stacked_activation.signed_int8[index];
+                } else {
+                    return false;
+                }
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+bool original_expected_work(const Fixture &fixture, const StripePacket &packet,
+                            OriginalExpectedWork &expected) {
+    expected = {};
+    expected.operand_bits = packet.digit_bits;
+    expected.n = packet.logical_j;
+    expected.original_k = packet.logical_k;
+    for (const auto &block : packet.blocks) {
+        uint32_t mask = 0;
+        for (const auto &group : block.groups) mask |= group.k_mask;
+        if (__builtin_popcount(mask) != block.compact_k_count ||
+            block.global_k_begin != block.block_id * 32) return false;
+        std::vector<uint16_t> local;
+        for (uint16_t k = 0; k < 32; ++k)
+            if (mask & (uint32_t{1} << k)) {
+                if (size_t(block.global_k_begin) + k >= packet.logical_k) return false;
+                local.push_back(k);
+            }
+        if (size_t(block.k_index_offset) + local.size() > packet.k_indices.size())
+            return false;
+        for (size_t k = 0; k < local.size(); ++k)
+            if (packet.k_indices[block.k_index_offset + k] != local[k]) return false;
+        expected.runs.push_back({block.block_id, mask,
+                                 static_cast<uint32_t>(expected.k),
+                                 static_cast<uint32_t>(local.size())});
+        expected.k += local.size();
+        expected.local_k.push_back(std::move(local));
+    }
+    for (uint8_t lane = 0; lane < packet.lane_capacity; ++lane) {
+        for (size_t row = 0; row < packet.row_count; ++row) {
+            bool active = false;
+            for (size_t run = 0; run < packet.blocks.size(); ++run)
+                for (uint16_t local : expected.local_k[run]) {
+                    int8_t digit = 0;
+                    if (!original_packet_digit(packet, packet.blocks[run], lane, row,
+                                               local, digit)) return false;
+                    active |= digit != 0;
+                }
+            if (active) expected.rows.push_back({lane, static_cast<uint32_t>(row)});
+        }
+    }
+    expected.activations.resize(expected.rows.size() * expected.k);
+    expected.weights.resize(expected.k * expected.n);
+    expected.carriers.resize(expected.runs.size() * expected.n);
+    for (size_t row = 0; row < expected.rows.size(); ++row)
+        for (size_t run = 0; run < expected.runs.size(); ++run)
+            for (size_t local = 0; local < expected.local_k[run].size(); ++local) {
+                int8_t digit = 0;
+                if (!original_packet_digit(packet, packet.blocks[run],
+                                           expected.rows[row].original_lane_id,
+                                           expected.rows[row].source_row,
+                                           expected.local_k[run][local], digit)) return false;
+                expected.activations[row * expected.k +
+                                     expected.runs[run].compact_k_begin + local] = digit;
+            }
+    for (size_t run = 0; run < expected.runs.size(); ++run) {
+        const size_t original_block = expected.runs[run].original_block_id;
+        for (size_t column = 0; column < expected.n; ++column) {
+            const size_t native = column * fixture.args.native_blocks_per_row + original_block;
+            if (native >= fixture.hp1.size()) return false;
+            const auto &block = fixture.hp1[native];
+            if (block.m < 0 && block.m != INT16_MIN) return false;
+            expected.carriers[run * expected.n + column] =
+                block.m == INT16_MIN ? 0x80000000u : static_cast<uint32_t>(block.m);
+            for (size_t local = 0; local < expected.local_k[run].size(); ++local) {
+                const size_t original_local_k = expected.local_k[run][local];
+#if GGML_GEMMINI_WEIGHT_BITS == 4
+                const uint8_t packed = block.qs[original_local_k % (kBlockSize / 2)];
+                const uint8_t nibble = (packed >> (original_local_k < kBlockSize / 2 ? 0 : 4)) & 15;
+                const int8_t code = static_cast<int8_t>(int(nibble) - 8);
+#else
+                const int8_t code = static_cast<int8_t>(block.qs[original_local_k]);
+#endif
+                expected.weights[(expected.runs[run].compact_k_begin + local) *
+                                 expected.n + column] = code;
+            }
+        }
+    }
+    const auto sat32 = [](int64_t value) {
+        return static_cast<int32_t>(std::clamp<int64_t>(value, INT32_MIN, INT32_MAX));
+    };
+    expected.output.resize(expected.rows.size() * expected.n);
+    for (size_t row = 0; row < expected.rows.size(); ++row)
+        for (size_t column = 0; column < expected.n; ++column) {
+            int32_t total = 0;
+            for (size_t run = 0; run < expected.runs.size(); ++run) {
+                int32_t fragment = 0;
+                for (size_t local = 0; local < expected.local_k[run].size(); ++local) {
+                    const size_t k = expected.runs[run].compact_k_begin + local;
+                    fragment += int32_t(expected.activations[row * expected.k + k]) *
+                                expected.weights[k * expected.n + column];
+                    if ((local + 1) % DIM == 0 || local + 1 == expected.local_k[run].size()) {
+                        const uint32_t carrier = expected.carriers[run * expected.n + column];
+                        const int32_t scaled = carrier == 0x80000000u || fragment == 0 ? 0 :
+                            carrier >= 32 ? (fragment < 0 ? INT32_MIN : INT32_MAX) :
+                            sat32(int64_t(fragment) * (int64_t{1} << carrier));
+                        total = sat32(int64_t(total) + scaled);
+                        fragment = 0;
+                    }
+                }
+            }
+            expected.output[row * expected.n + column] = total;
+        }
+    return true;
+}
+
+bool captured_work_matches(const OriginalExpectedWork &expected,
+                           const RunAwareRequest &request,
+                           const ParityObservation &observation) {
+    const auto &d = observation.descriptor;
+    const auto &g = observation.geometry;
+    if (request.m != expected.rows.size() || request.n != expected.n ||
+        request.k != expected.k || request.original_k != expected.original_k ||
+        request.operand_bits != expected.operand_bits ||
+        request.rows.size() != expected.rows.size() ||
+        request.runs.size() != expected.runs.size() ||
+        d.m != expected.rows.size() || d.n != expected.n || d.k != expected.k ||
+        d.activation_bits != expected.operand_bits ||
+        d.weight_bits != expected.operand_bits || d.dim != DIM ||
+        d.scale_total_k != expected.original_k ||
+        observation.run_view.original_k != expected.original_k ||
+        observation.run_view.run_count != expected.runs.size() ||
+        observation.runs.size() != expected.runs.size() ||
+        g.m != d.m || g.n != d.n || g.k != d.k || g.dim != DIM ||
+        g.activation_bits != expected.operand_bits ||
+        g.weight_bits != expected.operand_bits || g.scope != IM2P_GEOMETRY_FULL ||
+        g.tile_i_count != request.tile_i || g.tile_j_count != request.tile_j ||
+        g.tile_k_count != request.tile_k ||
+        request.activations != expected.activations ||
+        observation.activations != expected.activations ||
+        request.weights.size() != expected.weights.size() ||
+        observation.weights != expected.weights ||
+        request.carriers != expected.carriers ||
+        observation.carriers != expected.carriers ||
+        observation.output != expected.output) return false;
+    for (size_t row = 0; row < expected.rows.size(); ++row)
+        if (request.rows[row].source_row != expected.rows[row].source_row ||
+            request.rows[row].original_lane_id != expected.rows[row].original_lane_id)
+            return false;
+    for (size_t run = 0; run < expected.runs.size(); ++run) {
+        const auto &want = expected.runs[run];
+        const auto &actual = observation.runs[run];
+        const auto &built = request.runs[run];
+        if (actual.original_block_id != want.original_block_id ||
+            actual.original_k_mask != want.original_k_mask ||
+            actual.compact_k_begin != want.compact_k_begin ||
+            actual.compact_k_count != want.compact_k_count ||
+            built.original_block_id != want.original_block_id ||
+            built.union_k_mask != want.original_k_mask ||
+            built.compact_k_begin != want.compact_k_begin ||
+            built.compact_k_count != want.compact_k_count ||
+            built.original_local_k != expected.local_k[run]) return false;
+    }
+    for (size_t k = 0; k < expected.weights.size(); ++k)
+        if (request.weights[k] != expected.weights[k]) return false;
+    return true;
+}
+
+bool recomposed_output_matches(const StripePacket &packet,
+                               const OriginalExpectedWork &expected,
+                               const std::vector<OutputValue> &actual) {
+    if (actual.size() != packet.row_count * expected.n) return false;
+    std::vector<__int128> recomposed(actual.size());
+    for (size_t row = 0; row < expected.rows.size(); ++row) {
+        const auto &map = expected.rows[row];
+        if (map.source_row >= packet.row_count || map.original_lane_id >= packet.lane_capacity)
+            return false;
+        __int128 place = 1;
+        for (uint8_t lane = 0; lane < map.original_lane_id; ++lane)
+            place *= int64_t{1} << packet.digit_bits;
+        for (size_t column = 0; column < expected.n; ++column)
+            recomposed[map.source_row * expected.n + column] +=
+                static_cast<__int128>(expected.output[row * expected.n + column]) * place;
+    }
+    for (size_t i = 0; i < actual.size(); ++i)
+        if (recomposed[i] != actual[i]) return false;
+    return true;
+}
 
 bool unchanged(const CompressedOutput & output, const RmdExecutionMetrics & metrics) {
     return output.j_padded == 91 && output.values == std::vector<OutputValue>({7, -11}) &&
@@ -215,7 +622,8 @@ bool run_success() {
                   composed_values != nullptr && streamed_values != nullptr &&
                   streamed_values->values == composed_values->values,
               "typed provider streaming equals checked compact output plus compose") &&
-        check(streaming_metrics.im2p_dot_calls == actual_metrics.im2p_dot_calls &&
+        check(streaming_metrics.im2p_dot_calls ==
+                  (hp1_backend() ? 1 : actual_metrics.im2p_dot_calls) &&
                   streaming_metrics.im2p_stats.work_total_cycles() > 0 &&
                   streaming_metrics.ws_call_count == 0 &&
                   streaming_metrics.compressed_output_values == 0,
@@ -344,7 +752,11 @@ bool run_shared_preparation() {
                            "column and selected block preparation occur once per context")) return false;
             }
             const size_t validations = wreader::test_weight_reader_storage_validations();
-            if (!check(validations == (reuse ? 1 : stripes) && output == expected_output,
+            const size_t expected_validations =
+                use_hp1 && run_aware_backend()
+                    ? stripes + (reuse ? 1 : stripes)
+                    : (reuse ? 1 : stripes);
+            if (!check(validations == expected_validations && output == expected_output,
                        "shared stripes validate once and preserve exact FP32 output")) return false;
             std::array<float, stripes> original_output{7.0f, 7.0f};
             for (size_t row = 0; row < stripes; ++row) {
@@ -626,7 +1038,10 @@ bool run_group_rows() {
                 if (!check(status == RmdStatus::success && values != nullptr &&
                                values->values == expected,
                            "group rows match direct INT32 weighted residuals") ||
-                    !check(metrics.stacked_i_tile_count == expected_tiles,
+                    !check(use_hp1 && run_aware_backend()
+                               ? metrics.stacked_i_tile_count > 0 &&
+                                     metrics.im2p_dot_calls == 1
+                               : metrics.stacked_i_tile_count == expected_tiles,
                            "provider executes the compact group row tile count")) {
                     std::fprintf(stderr, "rows=%zu route=%s seed=%zu status=%s\n",
                                  rows, use_hp1 ? "HP1" : "H1", seed, rmd_status_message(status));
@@ -826,6 +1241,362 @@ bool run_hp1_exp_63() {
     return ok;
 }
 
+bool run_cross_block_one_work() {
+    if (!run_aware_backend()) return true;
+    Fixture fixture(true);
+    const StripePacket packet = fixture.remap_hp1_second_block(3);
+    Sim sim(im2p_sim_create());
+    Correction expected;
+    Correction correction = PreScaledFloat64Correction{{7.25, -11.5}};
+    RmdExecutionMetrics metrics{};
+    reset_im2p_provider_dot_attempts_for_test();
+    const RmdStatus oracle = execute_rmd_stripe_reference(
+        fixture.args, packet, expected);
+    const RmdStatus status = sim ? execute_rmd_stripe_im2p(
+        sim.get(), fixture.args, packet, correction, &metrics) :
+        RmdStatus::execution_failed;
+    const auto *expected_values = std::get_if<BlockScaledInt64Correction>(&expected);
+    const auto *actual_values = std::get_if<BlockScaledInt64Correction>(&correction);
+    const bool ok = check(packet.blocks.size() == 2 &&
+                              packet.blocks[0].block_id == 0 &&
+                              packet.blocks[1].block_id == 3,
+                          "fixture retains gapped original K32 blocks") &&
+        check(oracle == RmdStatus::success && expected_values && actual_values &&
+                  actual_values->values == expected_values->values,
+              "run ordinals preserve original block carriers") &&
+        check(status == RmdStatus::success, "cross-block residual execution succeeds") &&
+        check(metrics.im2p_dot_calls == 1 && im2p_provider_dot_attempts_for_test() == 1,
+              "one residual invocation selects one logical provider work");
+    if (ok) std::puts("IM2P_PROVIDER cross-block-one-work logical_calls=1 original_blocks=0,3 PASS");
+    return ok;
+}
+
+bool run_dispatch_parity(std::string_view case_name = "gap-0-3") {
+    if (!run_aware_backend()) return true;
+    const size_t rows = case_name == "one-run" || case_name == "radix-lane" ? 1 : Fixture::rows;
+    const size_t columns = case_name == "tail-mn" ? DIM + 1 : Fixture::columns;
+    Fixture fixture(true, 2, rows, columns);
+    StripePacket packet = fixture.remap_hp1_second_block(
+        case_name == "boundary-1-31" ? 31 : 3);
+    if (case_name == "gap-0-3-k22" || case_name == "gap-0-3-k37" ||
+        case_name == "one-run" || case_name == "radix-lane") {
+        RmdStripeBuilder builder;
+        builder.reset(19, 7, rows, fixture.args.K, columns,
+                      GGML_GEMMINI_ACTIVATION_BITS);
+        const size_t first_count = case_name == "gap-0-3-k22" ? 18 :
+                                   case_name == "gap-0-3-k37" ? 32 : 1;
+        for (size_t k = 0; k < first_count; ++k)
+            if (!builder.add_residual(k % rows, k,
+                                      case_name == "radix-lane"
+                                          ? (1 << GGML_GEMMINI_ACTIVATION_BITS) + 2 : 1)) return false;
+        if (case_name == "radix-lane" && !builder.add_residual(0, 1, 1)) return false;
+        if (case_name != "one-run" && case_name != "radix-lane") {
+            for (size_t k : {size_t{0}, size_t{1}, kBlockSize - 2, kBlockSize - 1})
+                if (!builder.add_residual((k + 3) % rows, 3 * kBlockSize + k, -1)) return false;
+            if (case_name == "gap-0-3-k37" &&
+                !builder.add_residual(5 % rows, 3 * kBlockSize + 2, -1)) return false;
+        }
+        const auto built = builder.finish();
+        if (!check(bool(built), "production fixture packet builds")) return false;
+        packet = *built;
+    }
+    if (case_name == "boundary-1-31") {
+        packet.blocks[0].block_id = 1;
+        packet.blocks[0].global_k_begin = kBlockSize;
+    }
+    Sim sim(im2p_sim_create());
+    if (!check(bool(sim), "parity simulator exists")) return false;
+    ParityObservation observation;
+    ParityExecutorContext context{sim.get(), &observation, false};
+    Im2pFullExecutor executor{};
+    executor.context = &context;
+    executor.execute_planned_runs = execute_parity_runs;
+    Correction correction;
+    RmdExecutionMetrics metrics{};
+#if defined(IM2P_CPU_FUNCTIONAL_TEST_HOOKS)
+    if (!hp1_backend()) im2p::cpu_functional::set_dispatch_observer(observe_parity, &observation);
+#endif
+    const RmdStatus status = execute_rmd_stripe_im2p(
+        sim.get(), fixture.args, packet, correction, &metrics,
+        hp1_backend() ? &executor : nullptr);
+#if defined(IM2P_CPU_FUNCTIONAL_TEST_HOOKS)
+    if (!hp1_backend()) im2p::cpu_functional::set_dispatch_observer(nullptr, nullptr);
+#endif
+    const auto *values = std::get_if<BlockScaledInt64Correction>(&correction);
+    Correction expected;
+    const RmdStatus reference_status = execute_rmd_stripe_reference(fixture.args, packet, expected);
+    const auto *reference_values = std::get_if<BlockScaledInt64Correction>(&expected);
+    const bool ok = check(status == RmdStatus::success &&
+                              reference_status == RmdStatus::success && values && reference_values &&
+                              (case_name != "gap-0-3" ||
+                               values->values == reference_values->values) &&
+                              metrics.im2p_dot_calls == 1,
+                          "parity dispatch matches reference") &&
+        check(!observation.failed && observation.calls == 1 &&
+                  observation.run_view.version == IM2P_COMPACT_RUNS_VERSION &&
+                  observation.runs.size() == packet.blocks.size(),
+              "one production run-aware dispatch retains original block owners");
+    if (!ok) return false;
+    for (size_t run = 0; run < observation.runs.size(); ++run)
+        if (!check(observation.runs[run].original_block_id == packet.blocks[run].block_id,
+                   "captured run owns the original packet block")) return false;
+
+    const char *log_dir = std::getenv("GEMMINI_LOG_DIR");
+    if (!check(log_dir && *log_dir, "GEMMINI_LOG_DIR is set")) return false;
+    const std::filesystem::path base(log_dir);
+    std::error_code error;
+    std::filesystem::create_directories(base, error);
+    if (!check(!error, "parity output directory exists")) return false;
+    const auto &d = observation.descriptor;
+    const auto &g = observation.geometry;
+    const auto &v = observation.run_view;
+    const std::string suffix = case_name == "gap-0-3" ? "" : "-" + std::string(case_name);
+    const std::string scalar_path = (base / ("rmd-im2p-dispatch" + suffix + ".txt")).string();
+    FILE *scalar = std::fopen(scalar_path.c_str(), "wb");
+    if (!check(scalar != nullptr, "parity scalar file opens")) return false;
+    std::fprintf(scalar, "descriptor %u %u %u %u %u %u %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu %u %u %llu\n",
+                 d.abi_version, d.activation_bits, d.activation_storage_bytes,
+                 d.weight_bits, d.weight_storage_bytes, d.dim, d.m, d.n, d.k,
+                 d.activation_row_stride_bytes, d.weight_row_stride_bytes,
+                 d.output_row_stride, d.tile_i_rows, d.tile_j_columns,
+                 d.block_size, d.scale_total_k, d.scale_row_stride,
+                 d.scale_column_offset, d.scale_valid_columns, d.scale_values_len,
+                 unsigned(d.vector_op), unsigned(d.output_domain),
+                 static_cast<unsigned long long>(d.work_context));
+    std::fprintf(scalar, "geometry %u %u %u %u %u %u %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
+                 g.version, g.struct_size, g.activation_bits, g.weight_bits, g.dim, g.scope,
+                 static_cast<unsigned long long>(g.m), static_cast<unsigned long long>(g.n),
+                 static_cast<unsigned long long>(g.k), static_cast<unsigned long long>(g.tile_i_count),
+                 static_cast<unsigned long long>(g.tile_j_count), static_cast<unsigned long long>(g.tile_k_count),
+                 static_cast<unsigned long long>(g.stripe_rows), static_cast<unsigned long long>(g.row_begin),
+                 static_cast<unsigned long long>(g.row_count), static_cast<unsigned long long>(g.stripe_id));
+    std::fprintf(scalar, "runs %u %u %u %zu\n", v.version, v.struct_size, v.original_k, v.run_count);
+    for (const auto &run : observation.runs)
+        std::fprintf(scalar, "run %u %u %u %u\n", run.original_block_id,
+                     run.original_k_mask, run.compact_k_begin, run.compact_k_count);
+    const bool scalar_ok = std::fclose(scalar) == 0;
+    const std::string binary_path = (base / ("rmd-im2p-output" + suffix + ".bin")).string();
+    FILE *binary = std::fopen(binary_path.c_str(), "wb");
+    if (!check(binary != nullptr, "parity binary file opens")) return false;
+    const bool write_ok = std::fwrite(values->values.data(), sizeof(OutputValue),
+                                     values->values.size(), binary) == values->values.size();
+    const bool binary_ok = std::fclose(binary) == 0 && write_ok;
+    if (!check(scalar_ok && binary_ok, "parity files are complete")) return false;
+    if (!hp1_backend()) return true;
+
+    OriginalExpectedWork original;
+    RunAwareRequest request;
+    if (!check(original_expected_work(fixture, packet, original) &&
+                   build_run_aware_request(fixture.args, packet, request) == RmdStatus::success &&
+                   captured_work_matches(original, request, observation),
+               "captured request matches original packet and native HP1 blocks")) return false;
+    if (case_name == "radix-lane") {
+        RunAwareRequest swapped = request;
+        std::swap(swapped.rows[0], swapped.rows[1]);
+        ParityObservation wrong_k = observation;
+        RunAwareRequest wrong_k_request = request;
+        std::swap(wrong_k_request.runs[0].original_local_k[0],
+                  wrong_k_request.runs[0].original_local_k[1]);
+        for (size_t row = 0; row < original.rows.size(); ++row) {
+            std::swap(wrong_k.activations[row * original.k],
+                      wrong_k.activations[row * original.k + 1]);
+            std::swap(wrong_k_request.activations[row * original.k],
+                      wrong_k_request.activations[row * original.k + 1]);
+        }
+        for (size_t column = 0; column < original.n; ++column) {
+            std::swap(wrong_k.weights[column], wrong_k.weights[original.n + column]);
+            std::swap(wrong_k_request.weights[column],
+                      wrong_k_request.weights[original.n + column]);
+        }
+        ParityObservation wrong_carrier = observation;
+        RunAwareRequest wrong_carrier_request = request;
+        std::swap(wrong_carrier.carriers[0], wrong_carrier.carriers[1]);
+        std::swap(wrong_carrier_request.carriers[0], wrong_carrier_request.carriers[1]);
+        if (!check(original.rows.size() == 2 &&
+                       original.rows[0].original_lane_id != original.rows[1].original_lane_id &&
+                       original.activations[0] != original.activations[original.k] &&
+                       original.output[0] != original.output[original.n] &&
+                       !captured_work_matches(original, swapped, observation),
+                   "oracle rejects a swapped radix row map")) return false;
+        if (!check(!captured_work_matches(original, wrong_k_request, wrong_k),
+                   "oracle rejects a swapped original K mapping")) return false;
+        if (!check(!captured_work_matches(original, wrong_carrier_request, wrong_carrier),
+                   "oracle rejects a swapped carrier mapping")) return false;
+    }
+    if (!check(recomposed_output_matches(packet, original, values->values),
+               "raw output and original radix lanes recompose final correction")) return false;
+
+    FILE *metadata = std::fopen(scalar_path.c_str(), "rb");
+    const std::string fixture_path = (base / ("rmd-run-work-" + std::string(case_name) + ".txt")).string();
+    FILE *work_file = std::fopen(fixture_path.c_str(), "wb");
+    if (!check(metadata && work_file, "run-work fixture files open")) {
+        if (metadata) std::fclose(metadata);
+        if (work_file) std::fclose(work_file);
+        return false;
+    }
+    bool fixture_ok = std::fputs("RMD_RUN_WORK_V1\n", work_file) >= 0;
+    char buffer[4096];
+    size_t count;
+    while (fixture_ok && (count = std::fread(buffer, 1, sizeof(buffer), metadata)) != 0)
+        fixture_ok = std::fwrite(buffer, 1, count, work_file) == count;
+    fixture_ok = fixture_ok && !std::ferror(metadata);
+    fixture_ok = std::fclose(metadata) == 0 && fixture_ok;
+    fixture_ok = std::fprintf(work_file, "ROW_MAP %zu\n", original.rows.size()) >= 0 && fixture_ok;
+    for (const auto &row : original.rows)
+        fixture_ok = std::fprintf(work_file, "%u %u\n", row.source_row,
+                                  unsigned(row.original_lane_id)) >= 0 && fixture_ok;
+    fixture_ok = write_fixture_values(work_file, "A", observation.activations) && fixture_ok;
+    fixture_ok = write_fixture_values(work_file, "B", observation.weights) && fixture_ok;
+    fixture_ok = write_fixture_values(work_file, "CARRIERS", observation.carriers) && fixture_ok;
+    fixture_ok = write_fixture_values(work_file, "OUTPUT", observation.output) && fixture_ok;
+    fixture_ok = std::fclose(work_file) == 0 && fixture_ok;
+    return check(fixture_ok, "run-work fixture is complete");
+}
+
+bool run_dispatch_parity_callback_failure() {
+    if (!hp1_backend()) return true;
+    Fixture fixture(true);
+    const StripePacket packet = fixture.remap_hp1_second_block(3);
+    Sim sim(im2p_sim_create());
+    ParityObservation observation;
+    ParityExecutorContext context{sim.get(), &observation, true};
+    Im2pFullExecutor executor{};
+    executor.context = &context;
+    executor.execute_planned_runs = execute_parity_runs;
+    Correction correction = PreScaledFloat64Correction{{7.25, -11.5}};
+    RmdExecutionMetrics metrics{};
+    metrics.packet_call_count = 73;
+    metrics.im2p_dot_calls = 79;
+    const RmdStatus status = sim ? execute_rmd_stripe_im2p(
+        sim.get(), fixture.args, packet, correction, &metrics, &executor) :
+        RmdStatus::execution_failed;
+    return check(status == RmdStatus::execution_failed && observation.calls == 1 &&
+                     unchanged(correction, metrics),
+                 "callback failure leaves correction and metrics unchanged");
+}
+
+bool run_sat32_cross_run() {
+    if (!run_aware_backend()) return true;
+    const auto sat32 = [](int64_t value) {
+        return static_cast<int32_t>(std::clamp<int64_t>(value, INT32_MIN, INT32_MAX));
+    };
+    for (const int sign : {-1, 1}) {
+        Fixture fixture(true, 31, 1, 3);
+        for (size_t column = 0; column < 3; ++column) {
+            fixture.set_code(column * 2, 0, sign);
+            fixture.set_code(column * 2 + 1, 0, sign);
+        }
+        RmdStripeBuilder builder;
+        builder.reset(31, 7, 1, Fixture::logical_k, 3,
+                      GGML_GEMMINI_ACTIVATION_BITS);
+        if (!builder.add_residual(0, 0, 1) ||
+            !builder.add_residual(0, kBlockSize, 1)) return false;
+        const auto packet = builder.finish();
+        Sim sim(im2p_sim_create());
+        Correction correction;
+        RmdExecutionMetrics metrics{};
+        reset_im2p_provider_dot_attempts_for_test();
+        const RmdStatus status = packet && sim ? execute_rmd_stripe_im2p(
+            sim.get(), fixture.args, *packet, correction, &metrics) :
+            RmdStatus::execution_failed;
+        const int32_t fragment = sat32(int64_t(sign) * (int64_t{1} << 31));
+        const int32_t expected = sat32(int64_t(fragment) + fragment);
+        const auto *values = std::get_if<BlockScaledInt64Correction>(&correction);
+        if (!check(packet && packet->blocks.size() == 2 &&
+                       packet->blocks[0].block_id == 0 &&
+                       packet->blocks[1].block_id == 1,
+                   "original events make two distinct run owners") ||
+            !check(expected != int64_t(fragment) + fragment,
+                   "oracle distinguishes host sum from Sat32 accumulation") ||
+            !check(status == RmdStatus::success && values &&
+                       values->values == std::vector<OutputValue>(3, expected) &&
+                       metrics.im2p_dot_calls == 1 &&
+                       im2p_provider_dot_attempts_for_test() == 1,
+                   "cross-run fragment saturation uses one signed32 accumulator"))
+            return false;
+    }
+    std::puts("IM2P_PROVIDER sat32-cross-run signs=-1,+1 logical_calls=1 PASS");
+    return true;
+}
+
+bool run_run_aware_fail_closed() {
+    if (!run_aware_backend()) return true;
+    Fixture fixture(true);
+    Correction correction = PreScaledFloat64Correction{{7.25, -11.5}};
+    RmdExecutionMetrics metrics{};
+    metrics.packet_call_count = 73;
+    metrics.im2p_dot_calls = 79;
+    reset_im2p_provider_dot_attempts_for_test();
+    const RmdStatus capability_status = fixture.packet ?
+        execute_rmd_stripe_im2p_missing_runs_for_test(
+            fixture.args, *fixture.packet, correction, &metrics) :
+        RmdStatus::execution_failed;
+    if (!check(capability_status == RmdStatus::unsupported_route &&
+                   unchanged(correction, metrics) &&
+                   im2p_provider_dot_attempts_for_test() == 0,
+               "missing planned-runs capability fails closed")) return false;
+
+    Sim sim(im2p_sim_create());
+    fixture.args.optrace_context =
+        std::make_shared<ggml::gemmini::optrace::Context>();
+    reset_im2p_provider_dot_attempts_for_test();
+    const RmdStatus trace_status = fixture.packet && sim ? execute_rmd_stripe_im2p(
+        sim.get(), fixture.args, *fixture.packet, correction, &metrics) :
+        RmdStatus::execution_failed;
+    const bool ok = check(trace_status == RmdStatus::unsupported_route &&
+                              unchanged(correction, metrics) &&
+                              im2p_provider_dot_attempts_for_test() == 0,
+                          "unrepresentable run-aware trace fails closed");
+    if (ok) std::puts("IM2P_PROVIDER run-aware-fail-closed capability=missing trace=unsupported PASS");
+    return ok;
+}
+
+bool run_activation_block_gate() {
+    Fixture fixture(true);
+    auto &metadata = fixture.args.act_quant.storage()
+                         .emplace<ggml::gemmini::quants::act::block::Meta>();
+    metadata.rows = fixture.args.activation_row_offset +
+                    fixture.packet->row_begin + fixture.packet->row_count;
+    metadata.cols = fixture.args.K;
+    metadata.scales.assign(metadata.rows *
+                               ((metadata.cols + kBlockSize - 1) / kBlockSize),
+                           1.0f);
+    Sim sim(im2p_sim_create());
+    Correction expected;
+    Correction actual;
+    const RmdStatus oracle = fixture.packet ? execute_rmd_stripe_reference(
+        fixture.args, *fixture.packet, expected) : RmdStatus::invalid_packet;
+    reset_im2p_provider_dot_attempts_for_test();
+    RmdExecutionMetrics metrics{};
+    const RmdStatus status = fixture.packet && sim ? execute_rmd_stripe_im2p(
+        sim.get(), fixture.args, *fixture.packet, actual, &metrics) :
+        RmdStatus::execution_failed;
+    const auto *expected_values =
+        std::get_if<FullyScaledFloat64Correction>(&expected);
+    const auto *actual_values =
+        std::get_if<FullyScaledFloat64Correction>(&actual);
+    if (oracle != RmdStatus::success || status != RmdStatus::success ||
+        !expected_values || !actual_values ||
+        actual_values->values != expected_values->values) {
+        std::fprintf(stderr,
+                     "activation-block detail oracle=%s status=%s expected-domain=%zu actual-domain=%zu expected-size=%zu actual-size=%zu\n",
+                     rmd_status_message(oracle), rmd_status_message(status),
+                     expected.index(), actual.index(),
+                     expected_values ? expected_values->values.size() : 0,
+                     actual_values ? actual_values->values.size() : 0);
+    }
+    const bool ok = check(oracle == RmdStatus::success &&
+                              status == RmdStatus::success &&
+                              expected_values && actual_values &&
+                              actual_values->values == expected_values->values,
+                          "activation block metadata keeps exact block-local correction") &&
+        check(metrics.im2p_dot_calls > 1 &&
+                  im2p_provider_dot_attempts_for_test() == metrics.im2p_dot_calls,
+              "activation block metadata bypasses packet-wide dispatch");
+    if (ok) std::puts("IM2P_PROVIDER activation-block-gate route=block-local PASS");
+    return ok;
+}
+
 ExsiaRouteRequest route(WeightFamily family, ResidualBackend backend) {
     return {true, GGML_GEMMINI_ACTIVATION_BITS, GGML_GEMMINI_WEIGHT_BITS,
             GGML_GEMMINI_ACTIVATION_BITS, GGML_GEMMINI_WEIGHT_BITS, true,
@@ -882,6 +1653,19 @@ int main(int argc, char ** argv) {
     if (selected == "all" || selected == "stats-overflow") ok = run_fault(Im2pProviderTestFault::stats_overflow, RmdStatus::overflow, "stats-overflow") && ok;
     if (selected == "all" || selected == "hp1-exp-62") ok = run_hp1_exp_62() && ok;
     if (selected == "all" || selected == "hp1-exp-63") ok = run_hp1_exp_63() && ok;
+    if (selected == "all" || selected == "cross-block-one-work") ok = run_cross_block_one_work() && ok;
+    if (selected == "dispatch-parity") ok = run_dispatch_parity() && ok;
+    if (selected == "production-oracle-mutations") ok = run_dispatch_parity("radix-lane") && ok;
+    if (selected == "production-fixtures") {
+        for (std::string_view case_name : {"gap-0-3", "gap-0-3-k22", "gap-0-3-k37",
+                                           "one-run", "boundary-1-31", "tail-mn",
+                                           "radix-lane"})
+            ok = run_dispatch_parity(case_name) && ok;
+    }
+    if (selected == "dispatch-parity-callback-failure") ok = run_dispatch_parity_callback_failure() && ok;
+    if (selected == "all" || selected == "sat32-cross-run") ok = run_sat32_cross_run() && ok;
+    if (selected == "all" || selected == "run-aware-fail-closed") ok = run_run_aware_fail_closed() && ok;
+    if (selected == "all" || selected == "activation-block-gate") ok = run_activation_block_gate() && ok;
     if (selected == "all" || selected == "malformed-packet") ok = run_malformed_packet() && ok;
     if (selected == "all" || selected == "shared-preparation") ok = run_shared_preparation() && ok;
     if (selected == "all" || selected == "packet-merge-contract") ok = run_packet_merge_contract() && ok;
@@ -890,7 +1674,7 @@ int main(int argc, char ** argv) {
     if (selected == "all" || selected == "native-code-edges") ok = run_native_code_edges() && ok;
     if (selected == "all" || selected == "route-matched" || selected == "route-mismatch" || selected == "h0-compact-rejection") ok = run_route(selected == "all" ? "route-matched" : selected) && ok;
 
-    constexpr std::array<std::string_view, 23> valid{{"all", "success", "provider-read-failure", "provider-write-failure", "provider-watchdog", "k-accumulation-overflow", "block-scale-overflow", "cancel-between-dots", "duplicate-output", "missing-output", "output-index", "stats-overflow", "hp1-exp-62", "hp1-exp-63", "malformed-packet", "shared-preparation", "packet-merge-contract", "int32-residuals", "group-rows", "native-code-edges", "route-matched", "route-mismatch", "h0-compact-rejection"}};
+    constexpr std::array<std::string_view, 31> valid{{"all", "success", "provider-read-failure", "provider-write-failure", "provider-watchdog", "k-accumulation-overflow", "block-scale-overflow", "cancel-between-dots", "duplicate-output", "missing-output", "output-index", "stats-overflow", "hp1-exp-62", "hp1-exp-63", "cross-block-one-work", "dispatch-parity", "production-fixtures", "production-oracle-mutations", "dispatch-parity-callback-failure", "sat32-cross-run", "run-aware-fail-closed", "activation-block-gate", "malformed-packet", "shared-preparation", "packet-merge-contract", "int32-residuals", "group-rows", "native-code-edges", "route-matched", "route-mismatch", "h0-compact-rejection"}};
     const bool is_valid = std::find(valid.begin(), valid.end(), selected) != valid.end() || selected == "h0-compact-rejection";
     if (!is_valid) {
         std::fprintf(stderr, "unsupported test case: %.*s\n", static_cast<int>(selected.size()), selected.data());

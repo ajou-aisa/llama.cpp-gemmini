@@ -15,6 +15,7 @@ struct Observation {
     uint32_t block_size, vector_op, output_domain;
 };
 std::vector<Observation> observations;
+std::vector<std::vector<im2p_compact_run_t>> observed_runs;
 bool observation_failed = false;
 bool inject_log_failure = false;
 std::unique_ptr<FileLimit> injected_limit;
@@ -28,17 +29,26 @@ void fail_float_publication(void *opaque) {
     injected_limit = std::make_unique<FileLimit>("1");
 }
 void fail_residual_publication(void *opaque) {
-    auto &values = *static_cast<std::vector<rmd::OutputValue> *>(opaque);
+    const auto *values = std::get_if<rmd::BlockScaledInt64Correction>(
+        static_cast<rmd::Correction *>(opaque));
     ++publication_count;
-    published_values_seen = std::all_of(values.begin(), values.end(), [](auto value) { return value == 31; });
+    published_values_seen = values && std::all_of(values->values.begin(), values->values.end(),
+        [](auto value) { return value == 31; });
     injected_limit = std::make_unique<FileLimit>("1");
 }
 void observe(void *, const im2p_matmul_desc_t &d,
-             const im2p_production_geometry_v1_t &g) noexcept {
+             const im2p_production_geometry_v1_t &g,
+             const im2p_compact_runs_t *runs) noexcept {
     try {
         observations.push_back({g, d.activation_row_stride_bytes, d.weight_row_stride_bytes,
             d.output_row_stride * sizeof(int32_t), d.scale_row_stride, d.work_context,
             static_cast<uint32_t>(d.block_size), d.vector_op, d.output_domain});
+        if (runs) {
+            if (runs->version != IM2P_COMPACT_RUNS_VERSION || !runs->run_count)
+                observation_failed = true;
+            else
+                observed_runs.emplace_back(runs->runs, runs->runs + runs->run_count);
+        }
         if (inject_log_failure && !injected_limit)
             injected_limit = std::make_unique<FileLimit>("1");
     } catch (...) { observation_failed = true; }
@@ -75,6 +85,7 @@ int main(int argc, char **argv) {
         const std::string mode = fail_publication ? requested.substr(13)
             : inject_log_failure ? requested.substr(5) : requested;
         require(mode == "full" || mode == "pipeline" || mode == "residual" ||
+                mode == "residual-runs" ||
                 mode == "large-k", "invalid mode");
 #if LOG_CYCLE
         require(ggml::gemmini::log::cycle.set_output_path("log/cycle-log.jsonl"),
@@ -82,7 +93,8 @@ int main(int argc, char **argv) {
 #endif
         Fixture fixture(mode == "pipeline" ? 129 : 1,
                         mode == "pipeline" ? 129 : 3,
-                        mode == "pipeline" ? 96 : mode == "large-k" ? 3072 : 32);
+                        mode == "pipeline" ? 96 : mode == "large-k" ? 3072 :
+                        mode == "residual-runs" ? 128 : 32);
         namespace cycle = ggml::gemmini::cycle_sim;
         namespace semantic = ggml::gemmini::semantic;
         auto metadata = semantic::Session::start(semantic::Source::PotalCollection,
@@ -125,53 +137,57 @@ int main(int argc, char **argv) {
             require(!result.status.ok(), "post-copy FULL provenance failure status");
             require(std::all_of(fixture.output.begin(), fixture.output.end(), [](float value) { return value == -1; }),
                     "post-copy FULL failure changed caller bytes");
-        } else if (fail_publication) {
-            std::vector<int8_t> activations(31, 1);
-            std::vector<int32_t> weights(31 * 3, 1);
-            std::vector<uint32_t> carriers(3, 0);
-            std::vector<rmd::OutputValue> output(3, -777);
-            rmd::detail::Im2pCompactDot dot{};
-            dot.operand_bits = GGML_GEMMINI_ACTIVATION_BITS;
-            dot.activations = activations.data(); dot.rows = 1; dot.columns = 3; dot.k = 31;
-            dot.activation_row_stride_bytes = 31; dot.weights = weights.data(); dot.weight_row_stride = 3;
-            dot.hp1_carriers = carriers.data(); dot.source_row_count = 1;
-            dot.cycle_sim_context = fixture.args.cycle_sim_context;
-            std::unique_ptr<im2p_sim_t, decltype(&im2p_sim_destroy)> sim(im2p_sim_create(), im2p_sim_destroy);
-            require(bool(sim), "publication residual engine");
-            rmd::detail::Im2pProviderStatsAggregate stats{};
-            im2p::gemmini::cycle_sim::set_publication_observer(fail_residual_publication, &output);
-            const auto result = rmd::detail::execute_im2p_compact_dot(sim.get(), dot, output.data(), 3, stats);
-            injected_limit.reset();
-            require(result == rmd::RmdStatus::execution_failed, "post-copy residual provenance failure status");
-            require(std::all_of(output.begin(), output.end(), [](auto value) { return value == -777; }),
-                    "post-copy residual failure changed caller bytes");
-        } else if (mode == "residual") {
+        } else if (mode == "residual" || mode == "residual-runs") {
             rmd::RmdStripeBuilder builder;
             builder.reset(0, 0, fixture.args.I, fixture.args.K, fixture.args.J,
                           GGML_GEMMINI_ACTIVATION_BITS);
-            for (size_t k = 0; k < 31; ++k) builder.add_residual(0, k, 1);
+            for (size_t k = 0; k < (mode == "residual-runs" ? 12 : 31); ++k)
+                builder.add_residual(0, k, 1);
+            if (mode == "residual-runs")
+                for (size_t k = 0; k < 10; ++k)
+                    builder.add_residual(0, 3 * rmd::kBlockSize + k, 1);
             const auto packet = builder.finish();
             require(bool(packet), "residual packet");
             std::unique_ptr<im2p_sim_t, decltype(&im2p_sim_destroy)> sim(
                 im2p_sim_create(), im2p_sim_destroy);
             require(bool(sim), "CPU-functional engine");
-            rmd::CompressedOutput expected, actual;
+            rmd::Correction expected;
+            const rmd::Correction sentinel =
+                rmd::BlockScaledInt64Correction{{-777, -777, -777}};
+            rmd::Correction actual = sentinel;
+            if (fail_publication)
+                im2p::gemmini::cycle_sim::set_publication_observer(
+                    fail_residual_publication, &actual);
             rmd::RmdExecutionMetrics metrics{};
             require(rmd::execute_rmd_stripe_reference(fixture.args, *packet, expected) ==
                     rmd::RmdStatus::success, "residual reference");
             const auto result = rmd::execute_rmd_stripe_im2p(sim.get(), fixture.args, *packet,
                                                            actual, &metrics);
             injected_limit.reset();
-            require(inject_log_failure ? result == rmd::RmdStatus::execution_failed
+            require((inject_log_failure || fail_publication)
+                                       ? result == rmd::RmdStatus::execution_failed
                                        : result == rmd::RmdStatus::success, "residual target dispatch");
-            if (inject_log_failure) {
-                require(actual.values.empty() && metrics.im2p_dot_calls == 0,
+            if (inject_log_failure || fail_publication) {
+                const auto *actual_values =
+                    std::get_if<rmd::BlockScaledInt64Correction>(&actual);
+                const auto *sentinel_values =
+                    std::get_if<rmd::BlockScaledInt64Correction>(&sentinel);
+                require(actual_values && sentinel_values &&
+                            actual_values->values == sentinel_values->values &&
+                            metrics.im2p_dot_calls == 0,
                         "failed residual provenance published output or metrics");
             } else {
-                require(actual.values == expected.values && actual.domain == expected.domain &&
-                        actual.j_padded == expected.j_padded, "residual numerical equality");
-                require(metrics.im2p_dot_calls == 1, "K31 must remain one logical NPU GEMM");
-                save_gemmini_parity_output(actual.values, static_cast<uint64_t>(actual.domain), actual.j_padded);
+                const auto *expected_values =
+                    std::get_if<rmd::BlockScaledInt64Correction>(&expected);
+                const auto *actual_values =
+                    std::get_if<rmd::BlockScaledInt64Correction>(&actual);
+                require(expected_values && actual_values &&
+                            actual_values->values == expected_values->values,
+                        "residual numerical equality");
+                require(metrics.im2p_dot_calls == 1,
+                        "one residual packet must remain one logical NPU GEMM");
+                save_gemmini_parity_output(actual_values->values,
+                                            IM2P_OUTPUT_SCU_FINAL, fixture.args.J);
             }
         } else {
             const auto result = mode == "pipeline"
@@ -193,6 +209,17 @@ int main(int argc, char **argv) {
                 fixture.args.activation_rows_per_stripe : 1;
         require(!observation_failed && observations.size() == expected_count,
                 "independent descriptor observer count");
+        if ((mode == "residual" || mode == "residual-runs") &&
+            !inject_log_failure && !fail_publication)
+            require(observed_runs.size() == 1 &&
+                    observed_runs[0].size() == (mode == "residual-runs" ? 2 : 1) &&
+                    observed_runs[0][0].compact_k_count ==
+                        (mode == "residual-runs" ? 12 : 31) &&
+                    (mode != "residual-runs" ||
+                     (observed_runs[0][1].original_block_id == 3 &&
+                      observed_runs[0][1].compact_k_begin == 12 &&
+                      observed_runs[0][1].compact_k_count == 10)),
+                    "run-aware residual observer lost original-block metadata");
         for (const auto &observation : observations) print_observation(observation);
         if (inject_log_failure || fail_publication) {
             bool failed = false;

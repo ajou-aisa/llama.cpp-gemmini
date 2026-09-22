@@ -1,4 +1,5 @@
 #include "rmd-im2p-executor.hpp"
+#include "rmd-run-aware.hpp"
 #include <gemmini/trace-context.hpp>
 #include <gemmini/log.hpp>
 #include "../../../../../common/json.hpp"
@@ -17,6 +18,7 @@
 #endif
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <new>
 #include <vector>
@@ -45,6 +47,148 @@ struct ProviderContext {
     bool fail_read = false;
     bool fail_write = false;
 };
+
+struct RunAwareProviderContext {
+  const RunAwareRequest *request = nullptr;
+  std::vector<OutputValue> staged;
+  size_t writes = 0;
+};
+
+int read_run_weight_i8(void *opaque, size_t row, size_t column, size_t count,
+                       int8_t *out) {
+  const auto *context = static_cast<const RunAwareProviderContext *>(opaque);
+  if (!context || !context->request || !out ||
+      row >= context->request->k || column > context->request->n ||
+      count > context->request->n - column)
+    return IM2P_ERROR;
+  const int32_t minimum = context->request->operand_bits == 4 ? -8 : -128;
+  const int32_t maximum = context->request->operand_bits == 4 ? 7 : 127;
+  const int32_t *source = context->request->weights.data() +
+                          row * context->request->n + column;
+  for (size_t index = 0; index < count; ++index) {
+    if (source[index] < minimum || source[index] > maximum)
+      return IM2P_INVALID_LAYOUT;
+    out[index] = static_cast<int8_t>(source[index]);
+  }
+  return IM2P_OK;
+}
+
+int read_run_scale(void *opaque, size_t run, size_t column, size_t count,
+                   uint32_t *out) {
+  const auto *context = static_cast<const RunAwareProviderContext *>(opaque);
+  if (!context || !context->request || !out ||
+      run >= context->request->runs.size() ||
+      column > context->request->n || count > context->request->n - column)
+    return IM2P_ERROR;
+  const uint32_t *source = context->request->carriers.data() +
+                           run * context->request->n + column;
+  for (size_t index = 0; index < count; ++index) {
+    if (!quants::hp1::valid_carrier(source[index]))
+      return IM2P_INVALID_LAYOUT;
+    out[index] = source[index];
+  }
+  return IM2P_OK;
+}
+
+int write_run_output(void *opaque, size_t block, size_t row, size_t column,
+                     size_t count, const int64_t *values,
+                     uint32_t output_domain) {
+  auto *context = static_cast<RunAwareProviderContext *>(opaque);
+  if (!context || !context->request || !values || context->writes != 0 ||
+      block != 0 || row != 0 || column != 0 ||
+      output_domain != IM2P_OUTPUT_SCU_FINAL ||
+      count != context->staged.size())
+    return IM2P_ERROR;
+  for (size_t index = 0; index < count; ++index)
+    if (values[index] < INT32_MIN || values[index] > INT32_MAX)
+      return IM2P_INVALID_LAYOUT;
+  std::copy_n(values, count, context->staged.begin());
+  context->writes = 1;
+  return IM2P_OK;
+}
+
+RmdStatus prepare_run_view(const RunAwareRequest &request,
+                           std::vector<im2p_compact_run_t> &entries) {
+  size_t activations = 0;
+  size_t weights = 0;
+  size_t carriers = 0;
+  if ((request.operand_bits != 4 && request.operand_bits != 8) ||
+      request.operand_bits != GGML_GEMMINI_ACTIVATION_BITS ||
+      request.operand_bits != GGML_GEMMINI_WEIGHT_BITS || !request.m ||
+      !request.n || !request.k || !request.original_k || request.runs.empty() ||
+      request.rows.size() != request.m || !request.source_row_count ||
+      !request.tile_i || !request.tile_j || !request.tile_k ||
+      request.m > UINT32_MAX || request.n > UINT32_MAX ||
+      request.k > UINT32_MAX || request.original_k > UINT32_MAX ||
+      request.m > SIZE_MAX / request.k ||
+      (activations = request.m * request.k,
+       request.k > SIZE_MAX / request.n) ||
+      (weights = request.k * request.n,
+       request.runs.size() > SIZE_MAX / request.n) ||
+      (carriers = request.runs.size() * request.n,
+       request.activations.size() != activations) ||
+      request.weights.size() != weights ||
+      request.carriers.size() != carriers)
+    return RmdStatus::invalid_arguments;
+
+  try {
+    entries.reserve(request.runs.size());
+  } catch (const std::bad_alloc &) {
+    return RmdStatus::allocation_failure;
+  }
+  uint64_t cursor = 0;
+  uint32_t previous_block = 0;
+  for (size_t index = 0; index < request.runs.size(); ++index) {
+    const RunAwareRun &run = request.runs[index];
+    uint32_t local_mask = 0;
+    uint16_t previous_local = 0;
+    for (size_t local_index = 0; local_index < run.original_local_k.size();
+         ++local_index) {
+      const uint16_t local_k = run.original_local_k[local_index];
+      if (local_k >= 32 || (local_index && local_k <= previous_local))
+        return RmdStatus::invalid_arguments;
+      local_mask |= uint32_t{1} << local_k;
+      previous_local = local_k;
+    }
+    const uint64_t original_begin = uint64_t{run.original_block_id} * 32;
+    if (!run.compact_k_count || run.compact_k_count > 32 ||
+        run.compact_k_begin != cursor ||
+        run.original_local_k.size() != run.compact_k_count ||
+        run.union_k_mask != local_mask || !run.union_k_mask ||
+        (index && run.original_block_id <= previous_block) ||
+        run.original_global_k_begin != original_begin ||
+        original_begin >= request.original_k ||
+        run.compact_k_begin > UINT32_MAX ||
+        run.compact_k_count > UINT32_MAX)
+      return RmdStatus::invalid_arguments;
+    for (const uint16_t local_k : run.original_local_k)
+      if (original_begin + local_k >= request.original_k)
+        return RmdStatus::invalid_arguments;
+    entries.push_back({run.original_block_id, run.union_k_mask,
+                       static_cast<uint32_t>(run.compact_k_begin),
+                       static_cast<uint32_t>(run.compact_k_count)});
+    cursor += run.compact_k_count;
+    previous_block = run.original_block_id;
+  }
+  if (cursor != request.k)
+    return RmdStatus::invalid_arguments;
+
+  uint64_t previous_row = 0;
+  const uint32_t lane_capacity = 32 / request.operand_bits + 1;
+  for (size_t index = 0; index < request.rows.size(); ++index) {
+    const RunAwareRow &row = request.rows[index];
+    if (row.source_row >= request.source_row_count ||
+        row.original_lane_id >= lane_capacity)
+      return RmdStatus::invalid_arguments;
+    const uint64_t key = uint64_t{row.original_lane_id} *
+                             request.source_row_count +
+                         row.source_row;
+    if (index && key <= previous_row)
+      return RmdStatus::invalid_arguments;
+    previous_row = key;
+  }
+  return RmdStatus::success;
+}
 
 int read_weight_i8(void *opaque, size_t row, size_t column, size_t count,
                    int8_t *out) {
@@ -321,6 +465,187 @@ int synthetic_execute(const im2p_matmul_desc_t *descriptor,
 
 } // namespace
 #endif
+
+RmdStatus execute_im2p_run_aware(
+    im2p_sim_t *sim, const Im2pRunAwareWork &work,
+    std::vector<OutputValue> &output, Im2pProviderStatsAggregate &aggregate,
+    const Im2pFullExecutor *executor) {
+#if CYCLE_SIM
+  struct CompletionGuard {
+    const cycle_sim::Context &context;
+    bool success = false;
+    ~CompletionGuard() {
+      if (context && !success)
+        context.session->record_failure(
+            "CPU-functional run-aware residual dispatch failed");
+    }
+  } completion{work.cycle_sim_context};
+#endif
+#if !defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) &&                       \
+    !defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+  (void)sim;
+  (void)work;
+  (void)output;
+  (void)aggregate;
+  (void)executor;
+  return RmdStatus::unsupported_route;
+#else
+  if (!work.request)
+    return RmdStatus::invalid_arguments;
+  if (work.trace_context)
+    return RmdStatus::unsupported_route;
+  if (executor ? executor->execute_planned_runs == nullptr : sim == nullptr)
+    return executor ? RmdStatus::unsupported_route
+                    : RmdStatus::invalid_arguments;
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+  if (!executor)
+    return RmdStatus::unsupported_route;
+#endif
+#if CYCLE_SIM
+  if ((work.cycle_sim_context && !work.cycle_sim_context.operation_id) ||
+      executor || std::strcmp(im2p_sim_implementation(), "CPU_FUNCTIONAL") != 0)
+    return RmdStatus::unsupported_route;
+#endif
+
+  const RunAwareRequest &request = *work.request;
+  std::vector<im2p_compact_run_t> run_entries;
+  const RmdStatus view_status = prepare_run_view(request, run_entries);
+  if (view_status != RmdStatus::success)
+    return view_status;
+  size_t output_count = 0;
+  if (__builtin_mul_overflow(request.m, request.n, &output_count))
+    return RmdStatus::overflow;
+
+  RunAwareProviderContext context;
+  context.request = &request;
+  try {
+    context.staged.resize(output_count);
+  } catch (const std::bad_alloc &) {
+    return RmdStatus::allocation_failure;
+  }
+
+  im2p_matmul_desc_t descriptor{};
+  descriptor.abi_version = IM2P_ABI_VERSION;
+  descriptor.activation_bits = request.operand_bits;
+  descriptor.activation_storage_bytes = 1;
+  descriptor.weight_bits = request.operand_bits;
+  descriptor.weight_storage_bytes = 1;
+  descriptor.dim = DIM;
+  descriptor.activations = request.activations.data();
+  descriptor.m = request.m;
+  descriptor.n = request.n;
+  descriptor.k = request.k;
+  descriptor.activation_row_stride_bytes = request.k;
+  descriptor.weight_row_stride_bytes = request.n;
+  descriptor.output_row_stride = request.n;
+  descriptor.tile_i_rows = std::min(request.m, static_cast<size_t>(DIM));
+  descriptor.tile_j_columns = std::min(request.n, static_cast<size_t>(DIM));
+  descriptor.block_size = 32;
+  descriptor.scale_total_k = request.original_k;
+  descriptor.scale_row_stride = request.n;
+  descriptor.scale_valid_columns = request.n;
+  descriptor.scale_values_len = request.carriers.size();
+  descriptor.vector_op = IM2P_VECTOR_LEFT_SHIFT;
+  descriptor.output_domain = IM2P_OUTPUT_SCU_FINAL;
+  descriptor.work_context = request.stripe_id;
+  descriptor.provider = {&context, read_run_weight_i8, nullptr, read_run_scale,
+                         write_run_output};
+
+  const im2p_production_geometry_v1_t geometry{
+      IM2P_PRODUCTION_GEOMETRY_VERSION,
+      sizeof(im2p_production_geometry_v1_t),
+      request.operand_bits,
+      request.operand_bits,
+      DIM,
+      IM2P_GEOMETRY_FULL,
+      request.m,
+      request.n,
+      request.k,
+      request.tile_i,
+      request.tile_j,
+      request.tile_k,
+      request.m,
+      0,
+      request.m,
+      0};
+  const im2p_compact_runs_t runs{IM2P_COMPACT_RUNS_VERSION,
+                                 sizeof(im2p_compact_runs_t),
+                                 static_cast<uint32_t>(request.original_k),
+                                 run_entries.size(), run_entries.data()};
+
+#if CYCLE_SIM
+  cycle_sim::Context cycle_context;
+  cycle_sim::Work selected_work;
+  try {
+    if (work.cycle_sim_context)
+      cycle_context = work.cycle_sim_context.session->new_dispatch(
+          work.cycle_sim_context);
+    selected_work = im2p::gemmini::cycle_sim::full(descriptor, geometry);
+    selected_work.provenance = "residual";
+    selected_work.scope = "residual_compact";
+    selected_work.stripe_id = request.stripe_id;
+    selected_work.original_k = static_cast<uint32_t>(request.original_k);
+    selected_work.runs = run_entries;
+    selected_work.row_map.reserve(request.rows.size());
+    for (const RunAwareRow &row : request.rows)
+      selected_work.row_map.push_back(
+          {row.source_row, row.original_lane_id});
+    selected_work.source_row_begin = request.source_row_begin;
+    selected_work.source_row_count = request.source_row_count;
+    selected_work.required_host_stage_ids = work.required_host_stage_ids;
+  } catch (const std::bad_alloc &) {
+    return RmdStatus::allocation_failure;
+  } catch (...) {
+    return RmdStatus::execution_failed;
+  }
+  cycle_sim::ScopedContext cycle_scope(cycle_context);
+  im2p::gemmini::cycle_sim::DispatchEvents dispatch_events(
+      cycle_context, &selected_work, cycle_sim::CallKind::ResidualCompact);
+  im2p::cpu_functional::TimingRegistration timing_registration(
+      dispatch_events.observer());
+#endif
+
+  im2p_work_stats_extended_t stats{};
+#if defined(GGML_GEMMINI_TESTING)
+  provider_dot_attempts.fetch_add(1, std::memory_order_relaxed);
+#endif
+  trace::ScopedRole residual_role(GEMMINI_TRACE_ROLE_RESIDUAL);
+  trace::CpuStage host_call(work.timing_identity.interval.layer,
+                            "rmd.device_host_call");
+  int provider_status = IM2P_ERROR;
+  if (executor)
+    provider_status = executor->execute_planned_runs(
+        executor->context, &descriptor, &geometry, &runs, &stats);
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+  else
+    provider_status = im2p_execute_matmul_planned_runs(
+        sim, &descriptor, &geometry, &runs, &stats);
+#endif
+  host_call.finish(provider_status == IM2P_OK);
+  if (provider_status != IM2P_OK)
+    return RmdStatus::execution_failed;
+#if CYCLE_SIM
+  if (cycle_context) {
+    try {
+      dispatch_events.complete();
+      cycle_context.session->ensure_healthy();
+    } catch (...) {
+      return RmdStatus::execution_failed;
+    }
+  }
+#endif
+  if (context.writes != 1)
+    return RmdStatus::invalid_packet;
+  const RmdStatus stats_status = aggregate_stats(stats, aggregate);
+  if (stats_status != RmdStatus::success)
+    return stats_status;
+  output.swap(context.staged);
+#if CYCLE_SIM
+  completion.success = true;
+#endif
+  return RmdStatus::success;
+#endif
+}
 
 RmdStatus execute_im2p_compact_dot(im2p_sim_t *sim, const Im2pCompactDot &dot,
                                    OutputValue *output,

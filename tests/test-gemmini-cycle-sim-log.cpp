@@ -104,6 +104,37 @@ int main(int argc, char **argv) {
     session->call_event(fence, CallStage::Fence);
     session->call_event(fence, CallStage::Continuation);
     assert(session->finish_operation(context));
+    int residual_node = 1;
+    Operation residual{"layer.1", "MUL_MAT", "GEMMINI", "F32", "Q8_HP1", 2, 2, 128, true};
+    residual.semantic_context = std::make_shared<ggml::gemmini::semantic::Context>(
+        ggml::gemmini::semantic::Context{{"prefill", {}, 0, 1},
+            ggml::gemmini::semantic::Source::PotalCollection, info.run_config_id});
+    const auto residual_context = session->register_operation(&residual_node, residual, phase);
+    const auto residual_dispatch = session->new_dispatch(residual_context);
+    const auto residual_call = session->call_begin(residual_dispatch, CallKind::ResidualCompact);
+    session->call_event(residual_call, CallStage::Invoke);
+    Work residual_work;
+    residual_work.geometry = {1, sizeof(im2p_production_geometry_v1_t), info.activation_bits,
+        info.weight_bits, info.dim, IM2P_GEOMETRY_FULL, 2, 2, 22, 1, 1, 2, 2, 0, 2, 0};
+    residual_work.provenance = "residual";
+    residual_work.scope = "residual_compact";
+    residual_work.m = residual_work.row_count = 2;
+    residual_work.original_k = 128;
+    residual_work.runs = {{0, 0xfff, 0, 12}, {3, 0x3ff, 12, 10}};
+    residual_work.row_map = {{0, 0}, {1, 1}};
+    residual_work.source_row_count = 2;
+    residual_work.activation_stride_bytes = 22;
+    residual_work.weight_stride_bytes = 2;
+    residual_work.output_stride_bytes = 8;
+    residual_work.scale_stride_elements = 2;
+    Work duplicate_block = residual_work;
+    duplicate_block.runs[1].original_block_id = 0;
+    rejects([&] { session->work(residual_call, duplicate_block); });
+    const auto residual_work_id = session->work(residual_call, residual_work);
+    assert(residual_work_id == 1);
+    session->call_event(residual_call, CallStage::CompleteRequired, {residual_work_id});
+    session->call_event(residual_call, CallStage::Continuation);
+    assert(session->finish_operation(residual_context));
     const auto decode = session->phase("decode", 0, 1);
     operation.actual_backend = "CPU";
     operation.target_eligible = false;
@@ -119,8 +150,12 @@ int main(int argc, char **argv) {
     std::ifstream input(path);
     const std::string data((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     assert(data.find("\"schema\":\"im2p-npu-cycle-trace\"") != std::string::npos);
-    assert(data.find("\"registered_operation_count\":2") != std::string::npos);
-    assert(data.find("\"call_count\":2") != std::string::npos);
+    assert(data.find("\"version\":2") != std::string::npos);
+    assert(data.find("\"residual_work_revision\":\"cross-block-run-aware-v1\"") != std::string::npos);
+    assert(data.find("\"registered_operation_count\":3") != std::string::npos);
+    assert(data.find("\"call_count\":3") != std::string::npos);
+    assert(data.find("\"original_block_id\":3,\"original_k_mask\":1023") != std::string::npos);
+    assert(data.find("\"row_map\":[{\"source_row\":0,\"lane_id\":0}") != std::string::npos);
     assert(data.find("\"host_stage_count\":2") != std::string::npos);
     assert(data.find("\"completed_host_stage_count\":2") != std::string::npos);
     assert(data.find("\"semantic_node_ordinal\":0") != std::string::npos);

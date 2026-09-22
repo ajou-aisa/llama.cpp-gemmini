@@ -64,7 +64,7 @@ if(CYCLE_SIM)
             "${IM2P_SIM_ROOT}/frontend/include" "${GEMMINI_SW_PATH}" "${GEMMINI_SW_PATH}/include")
         target_link_libraries(test-gemmini-cycle-sim-dispatch PRIVATE
             ggml-gemmini ggml-base ggml-gemmini-utils ggml-gemmini-cpu-functional)
-        foreach(mode IN ITEMS full pipeline residual large-k fail-full fail-residual
+        foreach(mode IN ITEMS full pipeline residual residual-runs large-k fail-full fail-residual
                               fail-publish-full fail-publish-residual)
             add_test(NAME test-gemmini-cycle-sim-dispatch-${mode} COMMAND "${CMAKE_COMMAND}"
                 "-DTEST_EXECUTABLE=$<TARGET_FILE:test-gemmini-cycle-sim-dispatch>"
@@ -91,6 +91,13 @@ if(TARGET ggml-gemmini AND TARGET ggml-cpu AND LLAMA_BUILD_TOOLS)
         "-DTEST_CYCLE_SIM=${CYCLE_SIM}" "-DTEST_LOG_CYCLE=${LOG_CYCLE}"
         "-DTEST_CPU_CYCLE_LOG=$<IF:$<BOOL:${GGML_CPU_CYCLE_LOG}>,1,0>"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/test-cycle-sim-build-contract.cmake")
+endif()
+if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND
+   IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1" AND NOT CYCLE_SIM)
+    add_test(NAME test-gemmini-numerical-memory-contract COMMAND "${CMAKE_COMMAND}"
+        "-DTEST_MANIFEST=${GGML_GEMMINI_IM2P_MANIFEST}"
+        "-DTEST_HEADER=${CMAKE_BINARY_DIR}/generated/gemmini_params.h"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-memory-contract.cmake")
 endif()
 
 function(llama_build source)
@@ -916,6 +923,23 @@ target_include_directories(test-gemmini-rmd-packet PRIVATE
 add_test(NAME test-gemmini-rmd-packet
     COMMAND $<TARGET_FILE:test-gemmini-rmd-packet>)
 
+add_executable(test-gemmini-rmd-run-aware
+    test-gemmini-rmd-run-aware.cpp)
+target_link_libraries(test-gemmini-rmd-run-aware PRIVATE
+    ggml-base ggml-gemmini ggml-gemmini-utils)
+target_compile_features(test-gemmini-rmd-run-aware PRIVATE cxx_std_17)
+target_compile_definitions(test-gemmini-rmd-run-aware PRIVATE
+    GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
+    GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE})
+target_include_directories(test-gemmini-rmd-run-aware PRIVATE
+    ../ggml/src
+    ../ggml/src/ggml-gemmini
+    ../ggml/src/ggml-gemmini/residual/rmd
+    ${GEMMINI_SW_PATH}
+    ${GEMMINI_SW_PATH}/include)
+add_test(NAME test-gemmini-rmd-run-aware
+    COMMAND $<TARGET_FILE:test-gemmini-rmd-run-aware>)
+
 add_executable(test-gemmini-rmd-capture
     test-gemmini-rmd-capture.cpp
     ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
@@ -1227,18 +1251,47 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
         ggml-gemmini ggml-base)
     target_compile_features(test-gemmini-rmd-im2p-provider PRIVATE cxx_std_17)
     target_compile_definitions(test-gemmini-rmd-im2p-provider PRIVATE
+        GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM=1
         GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
         GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE})
     target_include_directories(test-gemmini-rmd-im2p-provider PRIVATE
         ../ggml/src
         ../ggml/src/ggml-gemmini
         ${IM2P_SIM_ROOT}/sim/include
+        ${IM2P_SIM_ROOT}/frontend/include
         ${GEMMINI_SW_PATH}
         ${GEMMINI_SW_PATH}/include)
-    add_test(NAME test-gemmini-rmd-im2p-provider
-        COMMAND $<TARGET_FILE:test-gemmini-rmd-im2p-provider> --case success)
-    add_test(NAME test-gemmini-rmd-im2p-provider-failures
-        COMMAND $<TARGET_FILE:test-gemmini-rmd-im2p-provider> --case all)
+    if(TARGET ggml-gemmini-cpu-functional)
+        target_link_libraries(test-gemmini-rmd-im2p-provider PRIVATE ggml-gemmini-cpu-functional)
+    endif()
+    add_test(NAME test-gemmini-rmd-im2p-provider-dispatch-parity
+        COMMAND ${CMAKE_COMMAND} -E env
+            GEMMINI_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/rmd-im2p-dispatch-parity
+            $<TARGET_FILE:test-gemmini-rmd-im2p-provider> --case dispatch-parity)
+    if(IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1" AND NOT CYCLE_SIM)
+        add_test(NAME test-gemmini-rmd-im2p-provider-dispatch-parity-callback-failure
+            COMMAND $<TARGET_FILE:test-gemmini-rmd-im2p-provider>
+                --case dispatch-parity-callback-failure)
+        add_test(NAME test-gemmini-rmd-im2p-provider-production-fixtures
+            COMMAND ${CMAKE_COMMAND} -E env
+                GEMMINI_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/rmd-im2p-production-fixtures
+                $<TARGET_FILE:test-gemmini-rmd-im2p-provider> --case production-fixtures)
+        add_test(NAME test-gemmini-rmd-im2p-provider-production-oracle-mutations
+            COMMAND ${CMAKE_COMMAND} -E env
+                GEMMINI_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/rmd-im2p-production-oracle-mutations
+                $<TARGET_FILE:test-gemmini-rmd-im2p-provider> --case production-oracle-mutations)
+    endif()
+    if(CYCLE_SIM)
+        add_test(NAME test-gemmini-rmd-im2p-provider-run-aware-functional
+            COMMAND $<TARGET_FILE:test-gemmini-rmd-im2p-provider> --case cross-block-one-work)
+        add_test(NAME test-gemmini-rmd-im2p-provider-sat32-functional
+            COMMAND $<TARGET_FILE:test-gemmini-rmd-im2p-provider> --case sat32-cross-run)
+    else()
+        add_test(NAME test-gemmini-rmd-im2p-provider
+            COMMAND $<TARGET_FILE:test-gemmini-rmd-im2p-provider> --case success)
+        add_test(NAME test-gemmini-rmd-im2p-provider-failures
+            COMMAND $<TARGET_FILE:test-gemmini-rmd-im2p-provider> --case all)
+    endif()
 
     if (IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1" AND GGML_GEMMINI_ENABLE_RMD)
         add_executable(test-gemmini-optrace-dispatch test-gemmini-optrace-dispatch.cpp)

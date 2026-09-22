@@ -4,6 +4,7 @@
 #include "rmd-builder.hpp"
 #include "rmd-compose.hpp"
 #include "rmd-im2p-executor.hpp"
+#include "rmd-run-aware.hpp"
 #include "../direct/direct-types.hpp"
 
 #include "../../ggml-gemmini-args.h"
@@ -1551,6 +1552,293 @@ execute_block_correction(const ggml_gemmini_args_t &args,
     return RmdStatus::success;
 }
 
+static RmdStatus execute_rmd_stripe_im2p_run_aware(
+    im2p_sim_t *sim, const ggml_gemmini_args_t &args,
+    const StripePacket &packet, Correction &output,
+    RmdExecutionMetrics *metrics, const Im2pFullExecutor *executor) {
+#if !defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) &&                       \
+    !defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+  (void)sim;
+  (void)args;
+  (void)packet;
+  (void)output;
+  (void)metrics;
+  (void)executor;
+  return RmdStatus::unsupported_route;
+#else
+  if (args.optrace_context)
+    return RmdStatus::unsupported_route;
+
+  RmdExecutionMetrics staged_metrics{};
+  if (metrics)
+    staged_metrics.timing_identity = metrics->timing_identity;
+  staged_metrics.timing_identity.interval.layer = args.matmul_layer.c_str();
+  staged_metrics.timing_identity.identity_mask |= GEMMINI_CYCLE_HAS_STRIPE_ID;
+  staged_metrics.timing_identity.stripe_id = packet.stripe_id;
+  RmdExecutionMetrics *const measured = metrics ? &staged_metrics : nullptr;
+#if CYCLE_SIM && defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+  const auto event_context = args.cycle_sim_context;
+  std::vector<uint64_t> packet_work_ids;
+  im2p::gemmini::cycle_sim::WorkCollector packet_collector(packet_work_ids,
+                                                           true);
+  im2p::gemmini::cycle_sim::StageCall prepare_call(
+      event_context, cycle_sim::CallKind::ResidualPrepare);
+  im2p::gemmini::cycle_sim::HostStageScope cycle_preparation(
+      event_context, "im2p.residual_run_preparation", "POTAL_HOST",
+      "llama.cpp-gemmini",
+      "ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp:execute_rmd_stripe_im2p_run_aware",
+      args.matmul_layer.c_str(), {}, args.cycle_sim_host_dependencies, true);
+#endif
+  detail::RmdHostStageScope preparation(measured, RmdHostStage::preparation);
+  RunAwareRequest request;
+  const RmdStatus build_status = build_run_aware_request(args, packet, request);
+  if (build_status != RmdStatus::success)
+    return build_status;
+#if CYCLE_SIM && defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+  cycle_preparation.finish();
+  auto dispatch_dependencies = args.cycle_sim_host_dependencies;
+  if (cycle_preparation.id())
+    dispatch_dependencies.push_back(*cycle_preparation.id());
+  prepare_call.finish();
+#endif
+  preparation.finish();
+
+  detail::Im2pRunAwareWork work;
+  work.request = &request;
+  work.timing_identity = staged_metrics.timing_identity;
+  work.trace_context = args.optrace_context;
+  work.trace_layer = args.matmul_layer;
+#if CYCLE_SIM && defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+  work.cycle_sim_context = event_context;
+  work.required_host_stage_ids = std::move(dispatch_dependencies);
+  const size_t required_begin = im2p::gemmini::cycle_sim::work_count();
+#endif
+  std::vector<OutputValue> run_output;
+  detail::Im2pProviderStatsAggregate stats;
+  const RmdStatus dispatch_status = detail::execute_im2p_run_aware(
+      sim, work, run_output, stats, executor);
+  if (dispatch_status != RmdStatus::success)
+    return dispatch_status;
+
+  size_t value_count = 0;
+  if (__builtin_mul_overflow(packet.row_count, packet.logical_j,
+                             &value_count) ||
+      request.m > SIZE_MAX / request.n ||
+      run_output.size() != request.m * request.n)
+    return RmdStatus::overflow;
+  std::vector<__int128> wide;
+  BlockScaledInt64Correction final;
+  try {
+    wide.assign(value_count, __int128{0});
+    final.values.resize(value_count);
+  } catch (const std::bad_alloc &) {
+    return RmdStatus::allocation_failure;
+  } catch (const std::length_error &) {
+    return RmdStatus::overflow;
+  }
+
+#if CYCLE_SIM && defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+  im2p::gemmini::cycle_sim::StageCall recompose_call(
+      event_context, cycle_sim::CallKind::ResidualRecompose, required_begin);
+  im2p::gemmini::cycle_sim::HostStageScope cycle_recomposition(
+      event_context, "im2p.residual_radix_recomposition", "POTAL_HOST",
+      "llama.cpp-gemmini",
+      "ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp:execute_rmd_stripe_im2p_run_aware",
+      args.matmul_layer.c_str(),
+      im2p::gemmini::cycle_sim::work_ids_since(required_begin), {}, true);
+#endif
+  detail::RmdHostStageScope reconstruct(
+      measured, RmdHostStage::radix_reconstruct_combine);
+  const BalancedRadixContract radix =
+      balanced_radix_contract(packet.digit_bits);
+  for (size_t row_index = 0; row_index < request.rows.size(); ++row_index) {
+    const RunAwareRow &row = request.rows[row_index];
+    if (!radix.radix || row.original_lane_id >= radix.lane_capacity ||
+        row.source_row >= packet.row_count)
+      return RmdStatus::invalid_packet;
+    __int128 place = 1;
+    for (uint8_t lane = 0; lane < row.original_lane_id; ++lane)
+      if (__builtin_mul_overflow(place, static_cast<__int128>(radix.radix),
+                                 &place))
+        return RmdStatus::overflow;
+    for (size_t column = 0; column < request.n; ++column) {
+      __int128 contribution = run_output[row_index * request.n + column];
+      if (__builtin_mul_overflow(contribution, place, &contribution))
+        return RmdStatus::overflow;
+      __int128 &destination =
+          wide[static_cast<size_t>(row.source_row) * request.n + column];
+      if (__builtin_add_overflow(destination, contribution, &destination))
+        return RmdStatus::overflow;
+    }
+  }
+  for (size_t index = 0; index < value_count; ++index) {
+    if (wide[index] > std::numeric_limits<int64_t>::max() ||
+        wide[index] < std::numeric_limits<int64_t>::min())
+      return RmdStatus::overflow;
+    final.values[index] = static_cast<int64_t>(wide[index]);
+  }
+  reconstruct.finish();
+#if CYCLE_SIM && defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+  cycle_recomposition.finish();
+  recompose_call.finish();
+  if (event_context) {
+    try {
+      event_context.session->ensure_healthy();
+    } catch (...) {
+      return RmdStatus::execution_failed;
+    }
+  }
+#endif
+
+  collect_packet_metrics(packet, staged_metrics);
+  size_t gathered_values = 0;
+  size_t address_resolutions = 0;
+  size_t fragment_count = 0;
+  if (__builtin_mul_overflow(request.k, request.n, &gathered_values))
+    return RmdStatus::overflow;
+  for (const RunAwareRun &run : request.runs) {
+    const size_t fragments =
+        (run.compact_k_count + kArrayDim - 1) / kArrayDim;
+    size_t run_resolutions = 0;
+    if (__builtin_add_overflow(fragment_count, fragments, &fragment_count) ||
+        __builtin_mul_overflow(fragments, request.n, &run_resolutions) ||
+        __builtin_add_overflow(address_resolutions, run_resolutions,
+                               &address_resolutions))
+      return RmdStatus::overflow;
+  }
+  const size_t m_tiles = (request.m + kArrayDim - 1) / kArrayDim;
+  const size_t n_tiles = (request.n + kArrayDim - 1) / kArrayDim;
+  size_t physical_fragments = 0;
+  size_t mac_capacity = 0;
+  size_t dim_cube = 0;
+  if (__builtin_mul_overflow(m_tiles, n_tiles, &physical_fragments) ||
+      __builtin_mul_overflow(physical_fragments, fragment_count,
+                             &physical_fragments) ||
+      __builtin_mul_overflow(kArrayDim, kArrayDim, &dim_cube) ||
+      __builtin_mul_overflow(dim_cube, kArrayDim, &dim_cube) ||
+      __builtin_mul_overflow(physical_fragments, dim_cube, &mac_capacity))
+    return RmdStatus::overflow;
+  staged_metrics.packet_call_count = 1;
+  staged_metrics.matmul_call_count = 1;
+  staged_metrics.im2p_dot_calls = 1;
+  staged_metrics.lane_group_count = 0;
+  staged_metrics.stacked_i_tile_count = physical_fragments;
+  staged_metrics.issued_mac_capacity = mac_capacity;
+  staged_metrics.weight_values_gathered = gathered_values;
+  staged_metrics.gathered_weight_host_bytes =
+      gathered_values * sizeof(int32_t);
+  staged_metrics.weight_baseline_address_resolutions = gathered_values;
+  staged_metrics.weight_address_resolutions = address_resolutions;
+  staged_metrics.logical_dot_result_bytes =
+      run_output.size() * sizeof(OutputValue);
+  staged_metrics.block_scale_values_bytes =
+      request.carriers.size() * sizeof(uint32_t);
+  staged_metrics.correction_bytes = value_count * sizeof(OutputValue);
+  staged_metrics.compressed_output_values = 0;
+  staged_metrics.im2p_stats = stats.stats;
+
+  Correction staged_output = std::move(final);
+#if CYCLE_SIM && defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+  if (event_context) {
+    im2p::gemmini::cycle_sim::HostStageScope cycle_publication(
+        event_context, "im2p.residual_output_publish", "POTAL_HOST",
+        "llama.cpp-gemmini",
+        "ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp:execute_rmd_stripe_im2p_run_aware",
+        args.matmul_layer.c_str(),
+        im2p::gemmini::cycle_sim::work_ids_since(required_begin),
+        cycle_recomposition.id()
+            ? std::vector<uint64_t>{*cycle_recomposition.id()}
+            : std::vector<uint64_t>{}, true);
+    bool published = false;
+    try {
+      event_context.session->ensure_healthy();
+      output.swap(staged_output);
+      published = true;
+#if defined(IM2P_CPU_FUNCTIONAL_TEST_HOOKS)
+      if (im2p::gemmini::cycle_sim::publication_observer)
+        im2p::gemmini::cycle_sim::publication_observer(
+            im2p::gemmini::cycle_sim::publication_observer_context);
+#endif
+      cycle_publication.finish();
+      event_context.session->ensure_healthy();
+    } catch (...) {
+      if (published) output.swap(staged_output);
+      return RmdStatus::execution_failed;
+    }
+  } else {
+    output.swap(staged_output);
+  }
+#else
+  output.swap(staged_output);
+#endif
+  if (metrics)
+    *metrics = std::move(staged_metrics);
+  return RmdStatus::success;
+#endif
+}
+
+static RmdStatus execute_rmd_stripe_im2p_correction(
+    im2p_sim_t *sim, const ggml_gemmini_args_t &args,
+    const StripePacket &packet, Correction &output,
+    RmdExecutionMetrics *metrics, const wroute::WeightRoutePlan *shared_plan,
+    const Im2pFullExecutor *executor) {
+  const wroute::WeightRoutePlan plan =
+      shared_plan ? *shared_plan
+                  : wroute::resolve_weight_route_plan(
+                        args, wroute::WeightScaleInfoMode::ResidualHp1Scu);
+  const RmdStatus plan_status = compact_plan_status(args, plan);
+  if (plan_status != RmdStatus::success)
+    return plan_status;
+  const RmdStatus validation = validate_execution_request(args, packet);
+  if (validation != RmdStatus::success)
+    return validation;
+
+  // Activation-block metadata needs one scale per original K32 block, which a
+  // single saturated cross-run result cannot reconstruct.
+  if (std::holds_alternative<quants::act::block::Meta>(
+          args.act_quant.storage())) {
+    return execute_block_correction(
+        args, packet, output, metrics,
+        [&](CompressedOutput &compressed, RmdExecutionMetrics *staged) {
+          return execute_rmd_stripe_im2p_output(
+              sim, args, packet, compressed, staged, &plan, executor);
+        },
+        true);
+  }
+#if CYCLE_SIM || defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1) ||              \
+    defined(IM2P_FPGA_ARCH_GEMMINI_HP1)
+  constexpr bool linked_run_aware_backend = true;
+#else
+  constexpr bool linked_run_aware_backend = false;
+#endif
+  bool injected_run_aware_backend = false;
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) ||                        \
+    defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+  injected_run_aware_backend =
+      executor && executor->execute_planned_runs != nullptr;
+#else
+  (void)executor;
+#endif
+  const bool run_aware_backend =
+      linked_run_aware_backend || injected_run_aware_backend;
+  if (run_aware_backend && plan.route == wroute::WeightRouteKind::HP1 &&
+      plan.hp1_carriers &&
+      (packet.digit_bits == 4 || packet.digit_bits == 8) &&
+      packet.digit_bits == GGML_GEMMINI_ACTIVATION_BITS &&
+      plan.weight_bits == GGML_GEMMINI_WEIGHT_BITS &&
+      packet.digit_bits == plan.weight_bits) {
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) ||                        \
+    defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+    if (executor && !executor->execute_planned_runs)
+      return RmdStatus::unsupported_route;
+#endif
+    return execute_rmd_stripe_im2p_run_aware(sim, args, packet, output,
+                                             metrics, executor);
+  }
+  return execute_rmd_stripe_im2p_output(sim, args, packet, output, metrics,
+                                        &plan, executor);
+}
+
 RmdStatus execute_rmd_stripe_im2p(im2p_sim_t *sim,
                                   const ggml_gemmini_args_t &args,
                                   const StripePacket &packet,
@@ -1567,17 +1855,8 @@ RmdStatus execute_rmd_stripe_im2p(im2p_sim_t *sim,
                                   Correction &output,
                                   RmdExecutionMetrics *metrics,
                                   const Im2pFullExecutor *executor) {
-  if (std::holds_alternative<quants::act::block::Meta>(
-          args.act_quant.storage())) {
-    return execute_block_correction(
-        args, packet, output, metrics,
-        [&](CompressedOutput &compressed, RmdExecutionMetrics *staged) {
-          return execute_rmd_stripe_im2p_output(sim, args, packet, compressed,
-                                                staged, nullptr, executor);
-            }, true);
-    }
-  return execute_rmd_stripe_im2p_output(sim, args, packet, output, metrics,
-                                        nullptr, executor);
+  return execute_rmd_stripe_im2p_correction(
+      sim, args, packet, output, metrics, nullptr, executor);
 }
 
 template <typename Output>
@@ -1685,21 +1964,30 @@ RmdStatus execute_rmd_stripe_im2p_with_weights(im2p_sim_t *sim,
                                                Correction &correction,
                                                RmdWeightPreparation &weights,
                                                RmdExecutionMetrics *metrics) {
-  if (std::holds_alternative<quants::act::block::Meta>(
-          args.act_quant.storage())) {
-    return execute_block_correction(
-        args, packet, correction, metrics,
-        [&](CompressedOutput &compressed, RmdExecutionMetrics *staged) {
-                return execute_rmd_stripe_im2p_output(
-                    sim, args, packet, compressed, staged, &weights.route_plan(args));
-            }, true);
-    }
-  return execute_rmd_stripe_im2p_output(sim, args, packet, correction, metrics,
-                                        &weights.route_plan(args));
+  const auto &plan = weights.route_plan(args);
+  return execute_rmd_stripe_im2p_correction(
+      sim, args, packet, correction, metrics, &plan, nullptr);
 }
 } // namespace detail
 
 #if defined(GGML_GEMMINI_TESTING)
+RmdStatus execute_rmd_stripe_im2p_missing_runs_for_test(
+    const ggml_gemmini_args_t &args, const StripePacket &packet,
+    Correction &output, RmdExecutionMetrics *metrics) {
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) ||                        \
+    defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+  const Im2pFullExecutor missing;
+  return execute_rmd_stripe_im2p_correction(
+      nullptr, args, packet, output, metrics, nullptr, &missing);
+#else
+  (void)args;
+  (void)packet;
+  (void)output;
+  (void)metrics;
+  return RmdStatus::unsupported_route;
+#endif
+}
+
 template <typename Output>
 static RmdStatus
 execute_rmd_stripe_reference_output(const ggml_gemmini_args_t &args,
