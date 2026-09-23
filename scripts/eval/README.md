@@ -146,6 +146,36 @@ semantics and collection provenance, never invents missing edges. Optional
 synthetic scheduler. Without a validated clock and current service-boundary
 certificate, `result.json` lists missing certified inputs, TTFT/TPOT remain null,
 and no `reconstructed-result.json` is written.
+
+This is the complete diagnostic reconstruction argv for one bound repetition;
+replace each `/absolute/...` input with its existing artifact. SQLite IR and
+schedule are the default, so no storage flag is needed:
+
+```sh
+python3 -B scripts/eval/end_to_end.py --output /absolute/fresh-reconstruction-output reconstruct \
+  --im2p ../IM2P.sim \
+  --full-cpu-log /absolute/fullcpu/cpu-log.jsonl \
+  --full-cpu-graph /absolute/fullcpu/semantic-graph.json \
+  --full-cpu-provenance /absolute/fullcpu/provenance.json \
+  --potal-log /absolute/potal/cpu-log.jsonl \
+  --potal-graph /absolute/potal/semantic-graph.json \
+  --potal-provenance /absolute/potal/provenance.json \
+  --npu-trace /absolute/potal/npu-trace.jsonl \
+  --library /absolute/im2p/libim2p_cycle.so \
+  --cycle-certificate /absolute/im2p/cycle-certificate.json \
+  --run-aware-certificate /absolute/im2p/run-aware-certificate.json \
+  --application /absolute/potal/application.jsonl \
+  --lifecycle /absolute/potal/execution-lifecycle.json \
+  --diagnostic-phase-table /absolute/im2p/phase-table.json \
+  --diagnostic-frequency-hz 1000000000 --timeout 600
+```
+
+`--streaming-ir` remains an alias for the default. `--json-ir` selects the
+small/debug JSON bundle and schedule; it rejects more than 64 MiB of workload
+inputs before replay. Both modes preflight free space for a 256 MiB reserve plus
+eight times the workload input bytes. A timeout or failed command records its
+boundary in `failure.json` and does not publish a normal `result.json`.
+
 The current IM2P drained v1 certificate covers fixed two-work RTL fixtures only;
 it yields `DRAINED_FIXTURE_PARITY`, not production sequence admission. Supplying
 that certificate as `--service-certificate` still fails closed until a
@@ -173,9 +203,9 @@ a Jetson measurement nor a full paper campaign or quality PPL claim.
 
 `--lifecycle-sidecar` plus explicit `--worker-resources`, `--cpu-policy`, and
 `--sampler-resource` invokes the official producer-bound lifecycle builder after
-joining. `--streaming-ir` publishes bounded-memory SQLite IR. Adding both
+joining. Adding both
 `--diagnostic-phase-table /absolute/phase-table.json` and
 `--diagnostic-frequency-hz 1000000000` explicitly requests a synthetic schedule
 in `schedule.sqlite`; the numeric frequency is a diagnostic scenario, not a
-selected hardware clock. Without `--streaming-ir`, the same diagnostic path
-writes `schedule.json`. Neither path publishes target TTFT/TPOT.
+selected hardware clock. `--json-ir` writes `schedule.json` for small diagnostic
+inputs. Neither path publishes target TTFT/TPOT.
