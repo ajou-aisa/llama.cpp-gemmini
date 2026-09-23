@@ -1,11 +1,25 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
+import tempfile
 
-from eval_common import Record, require, sha256, write_json
+from application_results import load_measurement, load_potal_collection
+from certified_reconstruction import artifact_reference, reconstructed_row
+from eval_common import Json, Record, integer, read_json, require, sha256, write_json
+from scheduled_endpoints import prefill_dispatches, scheduled_application_result
+
+
+def write_rejection(output: Path, reason: str) -> None:
+    write_json(output / "result.json", {"schema": "potal-offline-evaluation", "version": 1,
+        "replay": "PASS", "three_source_join": "PASS", "execution_ir": "PASS",
+        "schedule": "NOT_READY_CERTIFICATION_REJECTED", "reason": reason,
+        "E2E_RECONSTRUCTION_READY": False, "TTFT": None, "TPOT": None,
+        "scope": "official offline dataset; certified inputs rejected"})
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -19,6 +33,13 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--worker-resources", type=Path, help="explicit CPU worker/resource scenario for lifecycle projection")
     parser.add_argument("--cpu-policy", choices=("THREAD_CPU_NS_GANG", "HOST_ELAPSED_NS_GANG"))
     parser.add_argument("--sampler-resource")
+    parser.add_argument("--service-certificate", type=Path, help="current official phase/state service proof")
+    parser.add_argument("--clock-selection", type=Path, help="validated operating-clock selection")
+    parser.add_argument("--profile", help="exact hardware profile shared by service and clock proof")
+    parser.add_argument("--potal-result", type=Path, help="native PoTal repetition result and endpoint binding")
+    parser.add_argument("--timing", type=Path, help="source-bound reference memory timing for service replay")
+    parser.add_argument("--initial-scratchpad-half", type=int, choices=(0, 1))
+    parser.add_argument("--initial-accumulator-half", type=int, choices=(0, 1))
     parser.add_argument("--streaming-ir", action="store_true", help="bounded-memory SQLite execution IR and optional diagnostic schedule")
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--diagnostic-phase-table", type=Path,
@@ -32,6 +53,10 @@ def reconstruct(args: argparse.Namespace) -> None:
     require(args.timeout > 0, "finite positive offline timeout required")
     require((args.diagnostic_phase_table is None) == (args.diagnostic_frequency_hz is None),
             "diagnostic schedule requires both phase table and explicit frequency")
+    certified = ("service_certificate", "clock_selection", "profile", "potal_result", "timing",
+                 "initial_scratchpad_half", "initial_accumulator_half")
+    require(args.diagnostic_phase_table is None or any(getattr(args, name) is None for name in certified),
+            "diagnostic phase table cannot participate in certified PoTal publication")
     if args.lifecycle_sidecar is not None:
         require(args.worker_resources is not None and args.cpu_policy is not None and args.sampler_resource,
                 "producer lifecycle projection requires explicit worker resources, CPU policy, and sampler resource")
@@ -39,9 +64,16 @@ def reconstruct(args: argparse.Namespace) -> None:
                    "potal_graph", "potal_provenance", "npu_trace", "library", "cycle_certificate",
                    "run_aware_certificate", "application")
     input_names += ("lifecycle",) if args.lifecycle is not None else ("lifecycle_sidecar", "worker_resources")
+    input_names += tuple(name for name in ("service_certificate", "clock_selection", "potal_result", "timing")
+                         if getattr(args, name) is not None)
     paths = {name: Path(getattr(args, name)).resolve(strict=True) for name in input_names}
     hashes = {name: sha256(path) for name, path in paths.items()}
     identities: Record = {name: {"path": str(path), "sha256": hashes[name]} for name, path in paths.items()}
+    identities["im2p"] = {"path": str(source)}
+    identities["scenario"] = {"profile": args.profile, "cpu_policy": args.cpu_policy,
+                              "sampler_resource": args.sampler_resource,
+                              "initial_scratchpad_half": args.initial_scratchpad_half,
+                              "initial_accumulator_half": args.initial_accumulator_half}
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     write_json(output / "input-bindings.json", identities)
@@ -66,7 +98,7 @@ def reconstruct(args: argparse.Namespace) -> None:
     for name in input_names[:6]:
         join.extend(("--" + name.replace("_", "-"), str(paths[name])))
     stage("join", join)
-    lifecycle_path = paths.get("lifecycle", output / "execution-lifecycle.json")
+    lifecycle_path = paths["lifecycle"] if args.lifecycle is not None else output / "execution-lifecycle.json"
     if args.lifecycle_sidecar is not None:
         stage("producer-lifecycle", ["sim.cycle.execution_lifecycle_cli", "--sidecar", str(paths["lifecycle_sidecar"]),
               "--semantic-graph", str(paths["potal_graph"]), "--provenance", str(paths["potal_provenance"]),
@@ -79,7 +111,36 @@ def reconstruct(args: argparse.Namespace) -> None:
           "--lifecycle", str(lifecycle_path), "--npu-results", str(npu), "--join-summary",
           str(join_summary), "--application", str(paths["application"]), "--output", str(bundle),
           *(["--streaming"] if args.streaming_ir else [])])
-    schedule_status = "NOT_RUN_MISSING_VALIDATED_CLOCK_AND_SERVICE_PROVIDER"
+    missing: list[Json] = [name for name in certified if getattr(args, name) is None]
+    schedule_status = "NOT_RUN_MISSING_CERTIFIED_INPUTS"
+    reconstructed: Record | None = None
+    if not missing:
+        try:
+            frequency = integer(read_json(paths["clock_selection"]), "selected_frequency_hz", 1)
+            schedule = output / ("reconstructed-schedule.sqlite" if args.streaming_ir else "reconstructed-schedule.json")
+            stage("certified-schedule", ["sim.cycle.execution_cli", "schedule", "--bundle", str(bundle),
+                  "--cycle-library", str(paths["library"]), "--npu-trace", str(paths["npu_trace"]),
+                  "--timing", str(paths["timing"]), "--initial-scratchpad-half", str(args.initial_scratchpad_half),
+                  "--initial-accumulator-half", str(args.initial_accumulator_half),
+                  "--service-certificate", str(paths["service_certificate"]),
+                  "--cycle-certificate", str(paths["cycle_certificate"]),
+                  "--run-aware-certificate", str(paths["run_aware_certificate"]),
+                  "--clock-selection", str(paths["clock_selection"]), "--profile", args.profile,
+                  "--frequency-hz", str(frequency), "--output", str(schedule)])
+            source_row = load_potal_collection(paths["potal_result"], paths["application"],
+                                               paths["potal_provenance"], join_summary)
+            metrics = scheduled_application_result(schedule, prefill_dispatches(read_json(lifecycle_path)))
+            proof: Record = {"schema": "potal-e2e-reconstruction-proof", "version": 1,
+                             "input_bindings": artifact_reference(output / "input-bindings.json"),
+                             "schedule": artifact_reference(schedule), "bundle": artifact_reference(bundle),
+                             "join_summary": artifact_reference(join_summary),
+                             "lifecycle": artifact_reference(lifecycle_path),
+                             "npu_results": artifact_reference(npu)}
+            reconstructed = reconstructed_row(source_row, metrics, proof)
+            schedule_status = "RECONSTRUCTED_CERTIFIED"
+        except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as error:
+            write_rejection(output, str(error))
+            raise
     if args.diagnostic_phase_table is not None:
         schedule = output / ("schedule.sqlite" if args.streaming_ir else "schedule.json")
         stage("synthetic-schedule", ["sim.cycle.execution_cli", "schedule", "--bundle", str(bundle),
@@ -88,8 +149,25 @@ def reconstruct(args: argparse.Namespace) -> None:
         schedule_status = "SYNTHETIC_ONLY"
     require(all(sha256(path) == hashes[name]
                 for name, path in paths.items()), "offline source inputs changed")
-    write_json(output / "result.json", {"schema": "potal-offline-evaluation", "version": 1,
+    if reconstructed is not None:
+        try:
+            with tempfile.TemporaryDirectory(prefix="candidate-run-", dir=output) as directory:
+                candidate = Path(directory) / "result.json"
+                write_json(candidate, reconstructed)
+                load_measurement(candidate)
+                os.link(candidate, output / "reconstructed-result.json")
+        except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as error:
+            write_rejection(output, str(error))
+            raise
+    status: Record = {"schema": "potal-offline-evaluation", "version": 1,
         "replay": "PASS", "three_source_join": "PASS", "execution_ir": "PASS",
         "execution_ir_format": "SQLITE" if args.streaming_ir else "JSON",
-        "schedule": schedule_status, "E2E_RECONSTRUCTION_READY": False,
-        "TTFT": None, "TPOT": None, "scope": "official offline dataset and optional synthetic schedule"})
+        "schedule": schedule_status, "missing_certified_inputs": missing,
+        "E2E_RECONSTRUCTION_READY": reconstructed is not None,
+        "TTFT": None if reconstructed is None else reconstructed["ttft_ns"],
+        "TPOT": None if reconstructed is None else reconstructed["tpot_ns"],
+        "reconstructed_result": None if reconstructed is None else artifact_reference(output / "reconstructed-result.json"),
+        "paper_campaign": "NOT_RUN",
+        "scope": "official one-run reconstruction" if reconstructed is not None
+                 else "official offline dataset and optional synthetic schedule"}
+    write_json(output / "result.json", status)

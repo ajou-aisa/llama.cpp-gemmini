@@ -14,6 +14,9 @@
 #include <gemmini/log.h>
 #include <gemmini/log.hpp>
 #include <gemmini/performance.hpp>
+#if CYCLE_SIM
+#include <gemmini/cycle_sim_log.hpp>
+#endif
 #if defined(__linux__) && defined(__aarch64__) && CYCLE_DETAIL
 #include <gemmini/log.h>
 #include "../../../../ggml-gemmini-utils/src/cycle_reader_internal.h"
@@ -2179,6 +2182,18 @@ namespace ggml::gemmini::quants::act::exsia
         [[maybe_unused]] const auto task_trace_origin = gemmini_trace_capture();
         const uint64_t run_id = next_exsia_run_id();
         meta.run_id = run_id;
+#if CYCLE_SIM
+        const auto record_producer = [&](cycle_sim::ProducerEventKind kind,
+                                         const StripePipelineSlot &slot,
+                                         const char *source_location) {
+            if (sink == nullptr || sink->on_ready == nullptr || !args.cycle_sim_context)
+                return true;
+            return args.cycle_sim_context.session->producer_event(args.cycle_sim_context,
+                {kind, run_id, slot.stripe_idx, slot.row_start, slot.row_end,
+                 slot.stripe_idx % EXSIA_PIPELINE_SLOT_COUNT,
+                 bool(slot.rmd_packet), bool(slot.direct_residual), source_location});
+        };
+#endif
         const char *force_recompute = std::getenv("GGML_GEMMINI_EXSIA_FORCE_RECOMPUTE");
         local_.set_force_recompute(force_recompute != nullptr && std::strcmp(force_recompute, "1") == 0);
 #if LOG_CYCLE
@@ -2624,6 +2639,10 @@ namespace ggml::gemmini::quants::act::exsia
                                 slot.acquire(s);
                                 slot.reset_for_stripe(s, row_start, row_end,
                                                      state_.K_padded, state_.blocks_per_row);
+#if CYCLE_SIM
+                                (void) record_producer(cycle_sim::ProducerEventKind::ExsiaWorkspaceAcquire,
+                                    slot, "ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp:prepare_slot_first");
+#endif
                                 local_workspace_.reset_for_stripe(
                                     s, row_start, row_end, state_.blocks_per_row);
                                 slot.mark_quantization_started(0, aggregate_now_ns());
@@ -2691,6 +2710,10 @@ namespace ggml::gemmini::quants::act::exsia
                                 slot.acquire(s);
                                 slot.reset_for_stripe(s, row_start, row_end,
                                                      state_.K_padded, state_.blocks_per_row);
+#if CYCLE_SIM
+                                (void) record_producer(cycle_sim::ProducerEventKind::ExsiaWorkspaceAcquire,
+                                    slot, "ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp:prepare_slot_next");
+#endif
                                 local_workspace_.reset_for_stripe(
                                     s, row_start, row_end, state_.blocks_per_row);
                                 slot.mark_quantization_started(0, aggregate_now_ns());
@@ -2758,6 +2781,10 @@ namespace ggml::gemmini::quants::act::exsia
                                 slot.acquire(s);
                                 slot.reset_for_stripe(s, row_start, row_end,
                                                      state_.K_padded, state_.blocks_per_row);
+#if CYCLE_SIM
+                                (void) record_producer(cycle_sim::ProducerEventKind::ExsiaWorkspaceAcquire,
+                                    slot, "ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp:prepare_slot_reuse");
+#endif
                                 local_workspace_.reset_for_stripe(
                                     s, row_start, row_end, state_.blocks_per_row);
                                 slot.mark_quantization_started(0, aggregate_now_ns());
@@ -3033,6 +3060,12 @@ namespace ggml::gemmini::quants::act::exsia
                                         else
                                         {
                                             slot.mark_folding_committed(aggregate_now_ns());
+#if CYCLE_SIM
+                                            (void) record_producer(cycle_sim::ProducerEventKind::ActivationRowsCommit,
+                                                slot, "ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp:folding_commit");
+                                            (void) record_producer(cycle_sim::ProducerEventKind::ResidualPacketSeal,
+                                                slot, "ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp:seal_stripe_packet");
+#endif
                                             if (!snapshot_validation_mask(s, slot.stripe.outlier_mask))
                                             {
                                                 record_failure(ExSIAState::FailureCode::ValidationSnapshotFailure, s);
@@ -3065,6 +3098,10 @@ namespace ggml::gemmini::quants::act::exsia
                                                 else
                                                 {
                                                 slot.release();
+#if CYCLE_SIM
+                                                (void) record_producer(cycle_sim::ProducerEventKind::ExsiaWorkspaceRelease,
+                                                    slot, "ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp:release_slot_after_sink");
+#endif
                                                 EXSIA_PROFILE_COLLECT(
                                                 if (!end_profile_interval(profile.stripe_total))
                                                 {
@@ -3119,6 +3156,10 @@ namespace ggml::gemmini::quants::act::exsia
             slot.acquire(s);
             slot.reset_for_stripe(s, row_start, row_end,
                                   state_.K_padded, state_.blocks_per_row);
+#if CYCLE_SIM
+            (void) record_producer(cycle_sim::ProducerEventKind::ExsiaWorkspaceAcquire,
+                slot, "ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp:prepare_slot_sequential");
+#endif
             local_workspace_.reset_for_stripe(s, row_start, row_end, state_.blocks_per_row);
             slot.mark_quantization_started(aggregate_now_tick(), aggregate_now_ns());
             StripeState &stripe = slot.stripe;
@@ -3428,6 +3469,12 @@ namespace ggml::gemmini::quants::act::exsia
                 return fail(ExSIAState::FailureCode::FoldingFailure, s);
             slot.mark_folding_committed(
                 aggregate_now_ns(), aggregate_now_tick());
+#if CYCLE_SIM
+            (void) record_producer(cycle_sim::ProducerEventKind::ActivationRowsCommit,
+                slot, "ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp:folding_commit_sequential");
+            (void) record_producer(cycle_sim::ProducerEventKind::ResidualPacketSeal,
+                slot, "ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp:seal_stripe_packet_sequential");
+#endif
 
             if (!snapshot_validation_mask(s, slot.stripe.outlier_mask))
                 return fail(ExSIAState::FailureCode::ValidationSnapshotFailure, s);
@@ -3447,6 +3494,10 @@ namespace ggml::gemmini::quants::act::exsia
                                      ))
                 return fail(ExSIAState::FailureCode::StripeReadySinkFailure, s);
             slot.release();
+#if CYCLE_SIM
+            (void) record_producer(cycle_sim::ProducerEventKind::ExsiaWorkspaceRelease,
+                slot, "ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp:release_slot_after_sink_sequential");
+#endif
             EXSIA_PROFILE_COLLECT(
             if (!end_profile_interval(profile.stripe_total))
                 return fail(ExSIAState::FailureCode::ProfileIntervalInvalid, s);

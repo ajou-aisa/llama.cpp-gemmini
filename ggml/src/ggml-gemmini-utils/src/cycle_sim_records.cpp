@@ -148,6 +148,28 @@ uint64_t Session::work(const Context &context, const Work &work) {
         ",\"hardware_contract_sha256\":" + json_string(impl_->info.hardware_contract_sha256));
     ++operation.works;
     impl_->work_operations.emplace(id, *context.operation_id);
+    impl_->pipeline_work_ids[*context.operation_id].push_back(id);
+    if (work.stripe_id)
+        impl_->stripe_all_work_ids[{*context.operation_id, *work.stripe_id}].push_back(id);
+    if (work.scope == "stripe") {
+        const auto key = std::make_tuple(*context.operation_id, work.work_context, *work.stripe_id);
+        require(impl_->stripe_work_ids.emplace(key, id).second, "duplicate producer stripe work");
+        require(impl_->dense_stripes.emplace(
+            std::make_pair(*context.operation_id, *work.stripe_id),
+            ProducerDenseStripe{id, *context.dispatch_id, work.row_begin,
+                                work.row_begin + work.row_count}).second,
+            "duplicate dense stripe work");
+        impl_->striped_operations.insert(*context.operation_id);
+    } else if (work.scope == "residual_compact" && work.stripe_id &&
+               impl_->striped_operations.count(*context.operation_id)) {
+        const auto dense = impl_->dense_stripes.find({*context.operation_id, *work.stripe_id});
+        require(dense != impl_->dense_stripes.end(), "residual work lacks source dense stripe");
+        const auto &source = dense->second;
+        impl_->residual_bindings[*context.operation_id].push_back(
+            {id, *context.call_id, *context.dispatch_id, source.work_id,
+             source.parent_id, *work.stripe_id, source.row_begin, source.row_end,
+             work.source_row_begin, work.source_row_count});
+    }
     call.own_work_ids.insert(id);
     return id;
 }
@@ -231,6 +253,11 @@ void Session::call_event(const Context &context, CallStage stage, const std::vec
         if (call.kind == CallKind::Stripe) require(call.stages.count(CallStage::Publish), "stripe publication missing");
         call.required_work_ids = required;
     }
+    if (stage == CallStage::Fence) {
+        require(!operation.fence_call_id, "duplicate operation fence");
+        operation.fence_call_id = *context.call_id;
+        operation.fence_required_work_ids = call.required_work_ids;
+    }
     if (stage == CallStage::Continuation) {
         if (call.kind == CallKind::Full || call.kind == CallKind::Stripe || call.kind == CallKind::ResidualCompact)
             require(call.own_work_ids.size() == 1 && call.stages.count(CallStage::CompleteRequired),
@@ -240,6 +267,8 @@ void Session::call_event(const Context &context, CallStage stage, const std::vec
     impl_->emit_call(context, stage, work_ids);
     call.stages.insert(stage);
     if (stage == CallStage::Continuation) {
+        if (call.kind == CallKind::ResidualMerge)
+            impl_->completed_residual_merge_calls.insert(*context.call_id);
         --operation.active_calls;
         impl_->calls.erase(*context.call_id);
     }

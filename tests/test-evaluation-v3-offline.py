@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse
 from contextlib import closing
 import gzip
 import hashlib
@@ -19,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 IM2P = ROOT.parent / 'IM2P.sim'
 sys.path.insert(0, str(ROOT / 'scripts/eval'))
 sys.path.insert(0, str(IM2P))
-from offline_pipeline import add_arguments, reconstruct
+from end_to_end import main
 from sim.tests.cycle.test_execution_cli import fixture_files
 
 
@@ -41,9 +40,6 @@ class StreamingPipelineTests(unittest.TestCase):
                 sampler_policy='SINGLE_CALLING_THREAD', resource='cpu:0', metric_policy='THREAD_CPU_NS_GANG',
                 expected_samples=1, steps=[dict(sample_index=0, logits_ready=['operation:b'], next_decode_entries=[])])
             (root / 'lifecycle.json').write_text(json.dumps(declaration))
-            parser = argparse.ArgumentParser()
-            parser.add_argument('--output', type=Path, required=True)
-            add_arguments(parser)
             arguments = ['--output', str(root / 'output'), '--im2p', str(IM2P),
                          '--lifecycle', str(root / 'lifecycle.json'), '--application', str(application),
                          '--streaming-ir', '--diagnostic-phase-table', str(root / 'phase.json'),
@@ -65,8 +61,9 @@ class StreamingPipelineTests(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 0)
                 return actual_run(command, **options)
 
-            with patch('offline_pipeline.subprocess.run', side_effect=fixture_upstream):
-                reconstruct(parser.parse_args(arguments))
+            with patch('offline_pipeline.subprocess.run', side_effect=fixture_upstream), \
+                 patch.object(sys, 'argv', ['end_to_end.py', *arguments[:2], 'reconstruct', *arguments[2:]]):
+                self.assertEqual(main(), 0)
             with closing(sqlite3.connect(root / 'output/schedule.sqlite')) as database:
                 value = database.execute('SELECT body FROM results WHERE identity=?', ('application:sample:0',)).fetchone()
                 self.assertEqual(json.loads(value[0])['result_ready_ns'], dict(numerator=15, denominator=1))
@@ -80,6 +77,7 @@ class StreamingPipelineTests(unittest.TestCase):
             self.assertFalse(result['E2E_RECONSTRUCTION_READY'])
             self.assertIsNone(result['TTFT'])
             self.assertIsNone(result['TPOT'])
+            self.assertFalse((root / 'output/reconstructed-result.json').exists())
 
 
 if __name__ == '__main__':

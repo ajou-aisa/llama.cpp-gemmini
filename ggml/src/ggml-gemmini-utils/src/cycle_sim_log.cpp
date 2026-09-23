@@ -3,6 +3,7 @@
 #include <gemmini/log.hpp>
 #include <cycle-sim-build-config.hpp>
 #include <gemmini/cycle_sim_context.h>
+#include <algorithm>
 #include <utility>
 
 namespace ggml::gemmini::cycle_sim {
@@ -139,7 +140,7 @@ Context Session::register_operation(const void *key, const Operation &operation,
             semantic_context.identity.decode_index == impl_->current_decode_index, "semantic run/phase/source mismatch");
     const uint64_t id = impl_->registered++;
     impl_->nodes[key] = id;
-    impl_->operations.emplace(id, OperationState{descriptor, phase_context.phase_id, 0, false});
+    impl_->operations.emplace(id, OperationState{descriptor, phase_context.phase_id, 0, {}, {}, {}, {}, false});
     return {shared_from_this(), phase_context.phase_id, id, {}, id, {}, {}, descriptor.semantic_context};
 }
 Context Session::find_operation(const void *key) {
@@ -159,10 +160,20 @@ Context Session::current_phase_context() {
 Context Session::new_dispatch(const Context &context) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     require(context.session.get() == this, "foreign operation context");
-    impl_->operation(context);
+    auto &operation = impl_->operation(context);
     Context result = context;
     result.dispatch_id = impl_->dispatches++;
+    if (!operation.parent_id) operation.parent_id = result.dispatch_id;
     impl_->dispatch_operations.emplace(*result.dispatch_id, *result.operation_id);
+    return result;
+}
+Context Session::dispatch_context(const Context &context) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    require(context.session.get() == this, "foreign dispatch lookup context");
+    const auto &operation = impl_->operation(context);
+    require(operation.parent_id.has_value(), "operation dispatch is not registered");
+    Context result = context;
+    result.dispatch_id = operation.parent_id;
     return result;
 }
 bool Session::finish_operation(const Context &context, bool success) {
@@ -198,6 +209,117 @@ void Session::record_failure(std::string_view reason) noexcept {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         if (impl_->failure.empty()) impl_->failure = reason;
     } catch (...) { std::terminate(); }
+}
+bool Session::producer_parent_geometry(const Context &context,
+                                       const im2p_production_geometry_v1_t &geometry) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        require(context.session.get() == this, "foreign producer parent context");
+        auto &operation = impl_->operation(context);
+        require(!operation.parent_geometry && geometry.version == IM2P_PRODUCTION_GEOMETRY_VERSION &&
+                geometry.struct_size == sizeof(geometry) && geometry.scope == IM2P_GEOMETRY_STREAM &&
+                geometry.row_begin == 0 && geometry.row_count == geometry.m &&
+                geometry.m == operation.descriptor.m && geometry.n == operation.descriptor.n &&
+                geometry.k == operation.descriptor.k && geometry.activation_bits == impl_->info.activation_bits &&
+                geometry.weight_bits == impl_->info.weight_bits && geometry.dim == impl_->info.dim &&
+                geometry.tile_i_count && geometry.tile_j_count && geometry.tile_k_count,
+                "invalid source parent geometry");
+        operation.parent_geometry = geometry;
+        return true;
+    } catch (const std::exception &error) {
+        record_failure(error.what());
+        return false;
+    } catch (...) {
+        record_failure("producer parent geometry failed");
+        return false;
+    }
+}
+bool Session::producer_event(const Context &context, ProducerEvent event) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        require(context.session.get() == this, "foreign producer context");
+        const auto &operation = impl_->operation(context);
+        require(event.row_begin < event.row_end &&
+                event.workspace_slot && *event.workspace_slot < 2,
+                "invalid producer stripe identity");
+        require(event.source_location.find(':') != std::string::npos &&
+                event.source_location.find("..") == std::string::npos &&
+                event.source_location.front() != '/',
+                "invalid producer source location");
+        const auto key = std::make_tuple(*context.operation_id, event.run_id, event.stripe_id);
+        if (event.kind == ProducerEventKind::ResidualHostMergeCompleted) {
+            require(event.call_id &&
+                    impl_->completed_residual_merge_calls.count(*event.call_id) &&
+                    impl_->call_operations.at(*event.call_id) == *context.operation_id,
+                    "residual merge call has not completed");
+            impl_->stripe_merge_call_ids[key].push_back(*event.call_id);
+        }
+        std::vector<uint64_t> required_work_ids, required_call_ids;
+        if (event.kind == ProducerEventKind::ResidualHostMergeCompleted)
+            required_call_ids.push_back(*event.call_id);
+        if (event.kind == ProducerEventKind::StreamWorkCompleted ||
+            event.kind == ProducerEventKind::ResidualCallbackCompleted ||
+            event.kind == ProducerEventKind::FrontendCapacityRelease) {
+            const auto work = impl_->stripe_all_work_ids.find({*context.operation_id, event.stripe_id});
+            require(work != impl_->stripe_all_work_ids.end() && !work->second.empty(),
+                    "producer release without selected stripe work");
+            required_work_ids = work->second;
+        }
+        if (event.kind == ProducerEventKind::ResidualCallbackCompleted ||
+            event.kind == ProducerEventKind::FrontendCapacityRelease) {
+            const auto calls = impl_->stripe_merge_call_ids.find(key);
+            if (calls != impl_->stripe_merge_call_ids.end()) required_call_ids = calls->second;
+            require((!event.rmd_packet && !event.direct_residual) || !required_call_ids.empty(),
+                    "residual release lacks completed merge call");
+        }
+        impl_->producer_records.push_back({std::move(event),
+            static_cast<uint64_t>(impl_->producer_records.size()), context.phase_id,
+            *context.operation_id, operation.parent_id, {},
+            std::move(required_work_ids), std::move(required_call_ids)});
+        return true;
+    } catch (const std::exception &error) {
+        record_failure(error.what());
+        return false;
+    } catch (...) {
+        record_failure("producer event failed");
+        return false;
+    }
+}
+std::vector<ProducerRecord> Session::producer_events() {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    require(impl_->finished, "producer snapshot before session finish");
+    auto records = impl_->producer_records;
+    for (auto &record : records) {
+        record.parent_id = impl_->operations.at(record.operation_id).parent_id;
+        const auto key = std::make_tuple(record.operation_id, record.event.run_id,
+                                         record.event.stripe_id);
+        const auto work = impl_->stripe_work_ids.find(key);
+        require(work != impl_->stripe_work_ids.end(), "producer stripe without selected dense work");
+        record.work_id = work->second;
+    }
+    return records;
+}
+std::vector<ProducerParent> Session::producer_parents() {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    require(impl_->finished, "producer parent snapshot before session finish");
+    require(impl_->pipeline_work_ids.size() == impl_->striped_operations.size(),
+            "mixed FULL and STRIPE_PIPELINE target work");
+    std::vector<ProducerParent> parents;
+    for (const auto operation_id : impl_->striped_operations) {
+        const auto &operation = impl_->operations.at(operation_id);
+        require(operation.parent_id && operation.parent_geometry && operation.fence_call_id,
+                "pipeline work without final parent geometry or fence");
+        const auto &work_ids = impl_->pipeline_work_ids.at(operation_id);
+        require(std::set<uint64_t>(work_ids.begin(), work_ids.end()) ==
+                    operation.fence_required_work_ids,
+                "pipeline fence omits parent work");
+        parents.push_back({operation_id, *operation.parent_id, *operation.fence_call_id,
+                           operation.phase_id, *operation.parent_geometry, work_ids,
+                           {operation.fence_required_work_ids.begin(),
+                            operation.fence_required_work_ids.end()},
+                           impl_->residual_bindings[operation_id]});
+    }
+    return parents;
 }
 void Session::finish(bool success, const std::string &reason) {
     std::lock_guard<std::mutex> lock(impl_->mutex);

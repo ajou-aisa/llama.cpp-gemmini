@@ -84,7 +84,7 @@ static int run(int argc, char ** argv) {
     metrics::Config metric_config;
 #endif
     std::string file, output, forced_file, workload = "METRIC_PREFILL_256";
-    int max_chunks = 1, first_chunk = 0;
+    int max_chunks = 1, first_chunk = 0, smoke_generated_tokens = 0;
     bool seed_set = false, temp_set = false, chunk_index_set = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -94,6 +94,7 @@ static int run(int argc, char ** argv) {
                 "  --batch-size N --ubatch-size N --threads N --threads-batch N\n"
                 "  --seed N --temp F --gpu-layers N --activation-output PATH --residual-output PATH\n"
                 "  --chunk-index N --forced-token-ids JSON --run-id ID --build-info\n"
+                "  --smoke-generated-tokens 1 (CYCLE_SIM diagnostic; never an E2E campaign)\n"
                 "Native non-strided WikiText chunks, no warmup. Defaults: one chunk, batch/ubatch 256,\n"
                 "one thread. E2E requires chunk-index0..9; fixed greedy seed1234/temp0, EOS stopping disabled.\n"
                 "Forced tokens are FullCPU cost-only; they are never reported as sampled output.");
@@ -121,6 +122,7 @@ static int run(int argc, char ** argv) {
             chunk_index_set = true;
         }
         else if (arg == "--max-chunks") max_chunks = value == "0" ? -1 : positive(value);
+        else if (arg == "--smoke-generated-tokens") smoke_generated_tokens = positive(value);
         else if (arg == "--batch-size") params.n_batch = positive(value);
         else if (arg == "--ubatch-size") params.n_ubatch = positive(value);
         else if (arg == "--threads") params.cpuparams.n_threads = positive(value);
@@ -156,6 +158,10 @@ static int run(int argc, char ** argv) {
     }
     const bool generation = workload == "E2E_GENERATION_256_128";
     const bool forced_cost_only = !forced_file.empty();
+    if (smoke_generated_tokens &&
+        (!CYCLE_SIM || !generation || forced_cost_only || smoke_generated_tokens != 1))
+        throw std::invalid_argument("smoke-generated-tokens requires CYCLE_SIM free generation and exactly 1 token");
+    const int generation_target = smoke_generated_tokens ? smoke_generated_tokens : 128;
     if (!generation && workload != "METRIC_PREFILL_256") throw std::invalid_argument("unknown workload");
     if (generation) {
         if (!chunk_index_set || first_chunk > 9 || max_chunks != 1) {
@@ -279,6 +285,8 @@ static int run(int argc, char ** argv) {
         {"eos_stopping", false}, {"eos_stop", false}, {"eos_logit_suppression", false},
         {"ignore_eos", params.sampling.ignore_eos}, {"vocab_size", llama_vocab_n_tokens(vocab)},
         {"execution_kind", execution_kind}, {"cost_only", forced_cost_only},
+        {"diagnostic_smoke", smoke_generated_tokens != 0},
+        {"requested_generated_tokens", generation ? generation_target : 0},
         {"trajectory_source", forced_cost_only ? json("POTAL") : json()},
         {"sampling_executed", generation && !forced_cost_only}, {"forced_token_ids_path", forced_file},
         {"gpu_layers_requested", params.n_gpu_layers}, {"placement_proof", "model_load_log"},
@@ -305,31 +313,38 @@ static int run(int argc, char ** argv) {
 #else
             if (setenv("GEMMINI_LOG_DIR", trace_dir.string().c_str(), 1) != 0) throw std::runtime_error("setenv failed");
 #endif
-            evaluation_trace trace(params, params.model.path, 256, generation ? 128 : 0, forced_cost_only);
+            evaluation_trace trace(params, params.model.path, 256,
+                                   generation ? generation_target : 0, forced_cost_only);
             std::vector<llama_token> prompt(tokens.begin() + chunk * 256, tokens.begin() + (chunk + 1) * 256);
             if (add_bos) prompt[0] = llama_vocab_bos(vocab);
             if (sampler) for (const auto token : prompt) common_sampler_accept(sampler.get(), token, false);
             trace.phase("prefill", prompt);
             std::vector<json> records;
-            for (int part = 0; part < plan.n_batches; ++part) {
-                common_evaluation_batch(batch, tokens, plan, selected_chunk, part, add_bos, llama_vocab_bos(vocab), mask);
-                records.push_back(batch_record(batch, chunk, part));
-            }
+            std::vector<std::pair<gemmini_cpu_sample, gemmini_cpu_sample>> prefill_times;
+            prefill_times.reserve(plan.n_batches);
             std::vector<uint64_t> endpoints;
             std::vector<llama_token> generated;
             std::vector<std::pair<gemmini_cpu_sample, gemmini_cpu_sample>> sampling_times;
-            endpoints.reserve(128);
-            generated.reserve(128);
-            sampling_times.reserve(128);
+            endpoints.reserve(generation_target);
+            generated.reserve(generation_target);
+            sampling_times.reserve(generation_target);
             int decode_calls = 0;
             bool eos = false;
             uint64_t logits_hash = UINT64_C(14695981039346656037);
             size_t logits_values = 0;
             common_log_pause(common_log_main());
             const uint64_t t0 = now_ns();
+            trace.request_start();
             for (int part = 0; part < plan.n_batches; ++part) {
+                const auto preparation_start = trace.pipeline_collection()
+                    ? gemmini_cpu_timing_read() : gemmini_cpu_sample{};
                 const int outputs = common_evaluation_batch(batch, tokens, plan, selected_chunk, part,
                         add_bos, llama_vocab_bos(vocab), mask);
+                if (trace.pipeline_collection()) {
+                    prefill_times.emplace_back(preparation_start, gemmini_cpu_timing_read());
+                }
+                records.push_back(batch_record(batch, chunk, part));
+                trace.prefill_batch_ready(part);
                 if (trace.decode(ctx, batch)) throw std::runtime_error("prefill decode failed");
                 if (!generation && outputs != 0) {
                     const size_t count = size_t(outputs) * llama_vocab_n_tokens(vocab);
@@ -337,7 +352,7 @@ static int run(int argc, char ** argv) {
                     logits_values += count;
                 }
             }
-            for (int sample = 0; generation && sample < 128; ++sample) {
+            for (int sample = 0; generation && sample < generation_target; ++sample) {
                 llama_token token;
                 if (forced_cost_only) {
                     token = forced_tokens[sample];
@@ -353,14 +368,16 @@ static int run(int argc, char ** argv) {
                 }
                 generated.push_back(token);
                 eos = eos || llama_vocab_is_eog(vocab, token);
-                if (sample == 127) break;
+                if (sample + 1 == generation_target) break;
                 common_batch_clear(batch);
                 common_batch_add(batch, token, 256 + sample, {0}, true);
                 trace.phase("decode", {token}, sample);
                 ++decode_calls;
                 if (trace.decode(ctx, batch)) throw std::runtime_error("generation decode failed");
             }
-            const bool complete = !generation || common_evaluation_generation_complete(generated.size(), decode_calls);
+            const bool complete = !generation || (smoke_generated_tokens
+                ? generated.size() == size_t(generation_target) && decode_calls + 1 == generation_target
+                : common_evaluation_generation_complete(generated.size(), decode_calls));
             common_log_resume(common_log_main());
             if (generation) {
                 logits_values = llama_vocab_n_tokens(vocab);
@@ -381,17 +398,30 @@ static int run(int argc, char ** argv) {
                 {"generated_tokens", generated}, {"samples", endpoints.size()}, {"actual_samples", endpoints.size()},
                 {"actual_sampler_calls", endpoints.size()}, {"forced_steps", forced_cost_only ? generated.size() : 0},
                 {"decode_calls", decode_calls}, {"execution_kind", execution_kind}, {"cost_only", forced_cost_only},
+                {"diagnostic_smoke", smoke_generated_tokens != 0},
+                {"requested_generated_tokens", generation ? generation_target : 0},
                 {"trajectory_source", forced_cost_only ? json("POTAL") : json()},
                 {"recipe_id", generation ? json(common_evaluation_e2e_recipe) : json()},
                 {"complete", complete}, {"eos", eos}, {"eos_seen", eos}, {"eos_stopping", false},
                 {"warmup", 0}, {"timing_source", "steady_clock"},
                 {"timing_unit", "ns"}, {"excludes_terminal_io", true},
                 {"source_role", source_role}}).dump() << '\n';
+            for (size_t part = 0; part < prefill_times.size(); ++part) {
+                const auto &timing = prefill_times[part];
+                json service = json::parse("{\"schema\":\"potal-application-cpu\"" +
+                    ggml::gemmini::cycle::serialize_cpu_timing_contract(timing.first, timing.second) + "}");
+                service.update({{"version", 2}, {"chunk_id", chunk}, {"stage", "prefill_batch_prepare"},
+                    {"batch_index", part}, {"dispatch_id", part},
+                    {"sample_index", nullptr}, {"token_id", nullptr},
+                    {"source_role", source_role}, {"phase", "prefill"}, {"decode_index", nullptr}});
+                application_cpu << service.dump() << '\n';
+            }
             for (size_t sample = 0; sample < sampling_times.size(); ++sample) {
                 const auto & timing = sampling_times[sample];
                 json service = json::parse("{\"schema\":\"potal-application-cpu\"" +
                     ggml::gemmini::cycle::serialize_cpu_timing_contract(timing.first, timing.second) + "}");
-                service.update({{"version", 1}, {"chunk_id", chunk}, {"stage", "sample_accept"},
+                service.update({{"version", trace.pipeline_collection() ? 2 : 1},
+                    {"chunk_id", chunk}, {"stage", "sample_accept"},
                     {"sample_index", sample}, {"token_id", generated[sample]}, {"source_role", source_role},
                     {"phase", sample == 0 ? "prefill" : "decode"},
                     {"decode_index", sample == 0 ? json() : json(sample - 1)}});

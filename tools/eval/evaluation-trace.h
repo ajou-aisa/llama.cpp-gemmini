@@ -13,6 +13,9 @@ public:
                      size_t prompt_count, size_t generated_count, bool forced_cost_only = false);
     void phase(const std::string & kind, const std::vector<llama_token> & tokens,
                std::optional<uint64_t> decode_index = {});
+    void request_start();
+    void prefill_batch_ready(uint64_t batch_index);
+    bool pipeline_collection() const noexcept { return pipeline_collection_; }
     int decode(llama_context * ctx, llama_batch batch);
     void sample_complete(uint64_t index, llama_token token);
     void forced_complete(uint64_t index, llama_token token);
@@ -20,6 +23,7 @@ public:
 private:
     std::shared_ptr<ggml::gemmini::semantic::Session> semantic_;
     std::unique_ptr<evaluation_lifecycle> lifecycle_;
+    bool pipeline_collection_ = false;
 #if CYCLE_SIM
     std::shared_ptr<ggml::gemmini::cycle_sim::Session> target_;
     ggml::gemmini::cycle_sim::Context context_;

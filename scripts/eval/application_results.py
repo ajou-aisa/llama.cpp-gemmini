@@ -8,6 +8,7 @@ import re
 from statistics import median
 
 from eval_common import Record, integer, read_json, record, records, require, sha256, text, validate_recipe
+from scheduled_endpoints import rational
 
 
 def integer_array(row: Record, name: str) -> list[int]:
@@ -22,10 +23,6 @@ def integer_array(row: Record, name: str) -> list[int]:
         if isinstance(value, int):
             result.append(value)
     return result
-
-
-def rational(value: Fraction) -> Record:
-    return {"numerator": value.numerator, "denominator": value.denominator}
 
 
 def application_result(row: Record) -> Record:
@@ -66,7 +63,9 @@ def aggregate_results(rows: list[Record]) -> Record:
                 for row in rows), "collection/replay is not an application latency measurement")
     require(all(row.get("role") not in {"potal", "fullcpu"} or row.get("measurement_kind") == "VALIDATED_RECONSTRUCTION"
                 for row in rows), "instrumented collection elapsed time is not target latency")
-    ttft = [Fraction(integer(row, "ttft_ns")) for row in rows]
+    ttft = [Fraction(integer(record(row["ttft_ns"]), "numerator"),
+                     integer(record(row["ttft_ns"]), "denominator", 1))
+            if isinstance(row.get("ttft_ns"), dict) else Fraction(integer(row, "ttft_ns")) for row in rows]
     tpot = [Fraction(integer(record(row.get("tpot_ns")), "numerator"),
                      integer(record(row.get("tpot_ns")), "denominator", 1)) for row in rows]
     return {"schema": "potal-e2e-aggregate", "version": 1, "repetitions": 10,
@@ -80,6 +79,61 @@ def validate_pair(full_cpu: Record, potal: Record) -> None:
     for key in ("host_id", "model_sha256", "dataset_sha256", "input_tokens_sha256",
                 "generated_tokens_sha256", "cpu_kernel_contract_sha256", "comparison_contract"):
         require(text(full_cpu, key) == text(potal, key), "FullCPU/PoTal pairing mismatch: " + key)
+
+
+def load_potal_collection(result_path: Path, service_path: Path, provenance_path: Path,
+                          join_path: Path) -> Record:
+    row = read_json(result_path)
+    require(row.get("schema") == "potal-e2e-run" and row.get("version") == 1 and
+            row.get("role") == "potal" and row.get("measurement_kind") == "COLLECTION_OBSERVATION_ONLY",
+            "certified result requires native PoTal collection")
+    endpoints_path = result_path.parent / "native/application.jsonl"
+    endpoints = list(records(endpoints_path))
+    require(len(endpoints) == 1 and endpoints[0].get("source_role") == "potal_collection",
+            "one native PoTal application trajectory required")
+    endpoint = endpoints[0]
+    measured = application_result(endpoint)
+    require(integer(row, "chunk_id") == integer(endpoint, "chunk_id") and
+            row.get("application_sha256") == sha256(endpoints_path) and
+            row.get("generated_tokens_sha256") == measured["generated_tokens_sha256"] and
+            row.get("collection_observation") == measured,
+            "PoTal result/application endpoint binding mismatch")
+    sampling = application_services(service_path, endpoint)
+    require(isinstance(sampling.get("prefill_prepare_samples"), int) and
+            integer(sampling, "prefill_prepare_samples", 1) >= 1,
+            "certified PoTal collection requires source-bound prefill preparation")
+    require(row.get("application_services") == sampling, "PoTal result/sampler service binding mismatch")
+    proof = read_json(provenance_path)
+    artifacts = record(proof.get("artifacts"))
+    require(proof.get("schema") == "im2p-collection-provenance" and proof.get("version") == 2 and
+            proof.get("source_role") == "POTAL_COLLECTION" and proof.get("collection_success") is True and
+            integer(proof, "actual_sampler_calls") == 128 and integer(proof, "decode_calls") == 127 and
+            integer(proof, "chunk_id") == integer(row, "chunk_id") and
+            proof.get("input_tokens_sha256") == row.get("input_tokens_sha256") and
+            proof.get("output_tokens_sha256") == row.get("generated_tokens_sha256") and
+            proof.get("recipe_id") == row.get("recipe_id") and
+            proof.get("model_sha256") == row.get("model_sha256") and
+            record(artifacts.get("application_endpoints")).get("sha256") == sha256(endpoints_path) and
+            record(artifacts.get("application_cpu")).get("sha256") == sha256(service_path) and
+            record(row.get("collection_provenance")).get("sha256") == sha256(provenance_path),
+            "PoTal native producer provenance binding mismatch")
+    join = read_json(join_path)
+    fingerprints = record(join.get("decode_token_fingerprint_matches"))
+    require(join.get("status") == "PASS" and join.get("scope") == "structural-three-source-reconstruction" and
+            join.get("model_sha256") == row.get("model_sha256") and
+            join.get("potal_provenance_sha256") == sha256(provenance_path) and
+            len(fingerprints) == 127 and all(value is True for value in fingerprints.values()),
+            "PoTal collection lacks complete official source join")
+    request = read_json(result_path.parent.parent / "request.json")
+    info = record(request.get("build_info"))
+    validate_recipe(info, "e2e")
+    require(info.get("backend") == "IM2P_SIM" and info.get("hp1") is True and
+            integer(info, "cycle_sim") == 1 and integer(info, "log_cycle") == 1 and
+            row.get("host_id") == record(request.get("host")).get("host_id") and
+            row.get("model_sha256") == request.get("model_sha256") and
+            row.get("dataset_sha256") == request.get("dataset_sha256"),
+            "PoTal collection request/build/host binding mismatch")
+    return row
 
 
 def cuda_placement(log: Path) -> Record:
@@ -99,6 +153,9 @@ def load_measurement(path: Path) -> Record:
     row = read_json(path)
     require(row.get("schema") == "potal-e2e-run" and row.get("version") == 1,
             "unsupported application result schema")
+    if row.get("role") == "potal" and row.get("measurement_kind") == "VALIDATED_RECONSTRUCTION":
+        from certified_reconstruction import load_reconstructed_measurement
+        return load_reconstructed_measurement(row)
     require(row.get("role") == "cuda" and row.get("measurement_kind") == "NATIVE_APPLICATION",
             "only bound native CUDA direct latency currently admitted; reconstructed publication requires service/clock proof")
     root = path.parent
@@ -124,9 +181,30 @@ def load_measurement(path: Path) -> Record:
 def application_services(path: Path, endpoint: Record) -> Record:
     services = list(records(path))
     tokens = integer_array(endpoint, "generated_tokens")
-    require(len(services) == len(tokens) == 128, "missing/extra application sampling service")
-    for index, row in enumerate(services):
-        require(row.get("schema") == "potal-application-cpu" and row.get("version") == 1
+    pipeline = bool(services) and endpoint.get("source_role") == "potal_collection" and services[0].get("version") == 2
+    prep = [row for row in services if row.get("stage") == "prefill_batch_prepare"] if pipeline else []
+    if pipeline:
+        require(bool(prep) and services[:len(prep)] == prep, "missing/late source-bound prefill preparation")
+        t0 = integer(endpoint, "t0_ns")
+        sample_times = integer_array(endpoint, "sample_accept_ns")
+        require(len(sample_times) == 128, "incomplete prefill application endpoints")
+        first_sample = sample_times[0]
+        previous_end = t0
+        for index, row in enumerate(prep):
+            require(row.get("schema") == "potal-application-cpu" and row.get("version") == 2 and
+                    row.get("source_role") == "potal_collection" and
+                    integer(row, "chunk_id") == integer(endpoint, "chunk_id") and
+                    integer(row, "batch_index") == integer(row, "dispatch_id") == index and
+                    row.get("sample_index") is None and row.get("token_id") is None and
+                    row.get("phase") == "prefill" and row.get("decode_index") is None and
+                    row.get("host_elapsed_valid") is True and
+                    previous_end <= integer(row, "host_start_ns") <= integer(row, "host_end_ns") <= first_sample,
+                    "invalid prefill preparation interval or identity")
+            previous_end = integer(row, "host_end_ns")
+    samples = services[len(prep):]
+    require(len(samples) == len(tokens) == 128, "missing/extra application sampling service")
+    for index, row in enumerate(samples):
+        require(row.get("schema") == "potal-application-cpu" and row.get("version") == (2 if pipeline else 1)
                 and row.get("stage") == "sample_accept", "unsupported application service schema/stage")
         require(integer(row, "sample_index") == index and integer(row, "token_id") == tokens[index],
                 "application service/token identity mismatch")
@@ -134,6 +212,7 @@ def application_services(path: Path, endpoint: Record) -> Record:
                 integer(row, "chunk_id") == integer(endpoint, "chunk_id"), "application service ownership mismatch")
         require(row.get("phase") == ("prefill" if index == 0 else "decode") and
                 row.get("decode_index") == (None if index == 0 else index - 1), "application phase mismatch")
+    for row in services:
         require(row.get("cpu_work_cycles_unit") == "cycle", "invalid CPU cycle unit")
         if row.get("host_elapsed_valid") is True:
             require(integer(row, "host_end_ns") - integer(row, "host_start_ns") == integer(row, "host_elapsed_ns"),
@@ -147,7 +226,10 @@ def application_services(path: Path, endpoint: Record) -> Record:
         else:
             require(row.get("cpu_work_cycles") is None and bool(row.get("cpu_work_cycles_reason")),
                     "invalid CPU work sample lacks reason")
-    return {"path": str(path), "sha256": sha256(path), "samples": len(services),
+    summary: Record = {"path": str(path), "sha256": sha256(path), "samples": len(samples),
             "duration_authority": "POTAL_APPLICATION_ONLY" if endpoint.get("source_role") == "potal_collection"
                                   else "NON_POTAL_REFERENCE_ONLY",
-            "host_valid_samples": sum(row.get("host_elapsed_valid") is True for row in services)}
+            "host_valid_samples": sum(row.get("host_elapsed_valid") is True for row in samples)}
+    if pipeline:
+        summary["prefill_prepare_samples"] = len(prep)
+    return summary

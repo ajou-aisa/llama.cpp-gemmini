@@ -4,6 +4,10 @@
 #include <gemmini/log.h>
 #include <stdexcept>
 
+#ifndef EVALUATION_MATMUL_MODE
+#define EVALUATION_MATMUL_MODE "FULL"
+#endif
+
 namespace semantic = ggml::gemmini::semantic;
 namespace log = ggml::gemmini::log;
 
@@ -41,9 +45,12 @@ evaluation_trace::evaluation_trace(const common_params & params, const std::stri
         {"execution_kind", forced_cost_only ? "FORCED_CPU_COST_ONLY" : generated_count ? "FREE_GENERATION" : "METRIC_PREFILL"},
         {"trajectory_source", forced_cost_only ? "POTAL" : "SELF_SAMPLED"}};
     semantic_ = semantic::Session::start(source, workload.dump(), producer.dump(), cpu_only);
+    pipeline_collection_ = generated_count != 0 && CYCLE_SIM &&
+        std::string(EVALUATION_MATMUL_MODE) == "STRIPE_PIPELINE";
     if (generated_count && semantic_)
         lifecycle_ = std::make_unique<evaluation_lifecycle>(CYCLE_SIM ? "potal_collection" : "full_cpu",
-                                                           LLAMA_COMMIT, generated_count, forced_cost_only);
+                                                           LLAMA_COMMIT, generated_count, forced_cost_only,
+                                                           pipeline_collection_);
 #else
     (void) params; (void) model_identity; (void) prompt_count; (void) generated_count;
 #endif
@@ -66,6 +73,16 @@ void evaluation_trace::phase(const std::string & kind, const std::vector<llama_t
 #if CYCLE_SIM
     if (target_) context_ = target_->phase(kind, decode_index, tokens.size());
 #endif
+}
+
+void evaluation_trace::request_start() {
+    if (lifecycle_ && pipeline_collection_)
+        lifecycle_->request_start(semantic_->completed_graph_count());
+}
+
+void evaluation_trace::prefill_batch_ready(uint64_t batch_index) {
+    if (lifecycle_ && pipeline_collection_)
+        lifecycle_->prefill_batch_ready(batch_index, semantic_->completed_graph_count());
 }
 
 int evaluation_trace::decode(llama_context * ctx, llama_batch batch) {
@@ -92,6 +109,10 @@ void evaluation_trace::forced_complete(uint64_t index, llama_token token) {
 }
 
 void evaluation_trace::finish(bool success) {
+#if CYCLE_SIM
+    if (target_) target_->finish(success);
+    if (target_ && lifecycle_ && pipeline_collection_) lifecycle_->pipeline_session(*target_);
+#endif
     if (lifecycle_) {
         const auto & events = lifecycle_->finish(success, semantic_->completed_graph_count());
         const auto path = log::resolve_output_path("log/execution-lifecycle.jsonl");
@@ -106,9 +127,6 @@ void evaluation_trace::finish(bool success) {
         if (std::fflush(file.get())) throw std::runtime_error("execution lifecycle flush failed");
     }
     if (semantic_) semantic_->finish(success);
-#if CYCLE_SIM
-    if (target_) target_->finish(success);
-#endif
 #if LOG_CYCLE
     if (!gemmini_log_cycle_flush() || !log::cycle.healthy())
         throw std::runtime_error("evaluation: CPU log flush failed");

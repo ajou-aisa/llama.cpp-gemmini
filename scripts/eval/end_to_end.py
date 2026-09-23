@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 
@@ -47,7 +48,7 @@ def main() -> int:
             from e2e_run import collect_runs
             collect_runs(args)
         return 0
-    except (EvaluationError, OSError, ValueError, subprocess.SubprocessError) as error:
+    except (EvaluationError, OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as error:
         print(f"evaluation failed: {error}", file=sys.stderr)
         return 1
 

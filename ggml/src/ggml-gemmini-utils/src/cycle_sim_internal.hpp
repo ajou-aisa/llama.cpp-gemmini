@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <set>
+#include <tuple>
 
 namespace ggml::gemmini::cycle_sim {
 std::string json_string(const std::string &value);
@@ -17,6 +18,10 @@ std::string semantic_fields(const Context &context);
 struct OperationState {
     Operation descriptor;
     uint64_t phase_id = 0, works = 0;
+    std::optional<uint64_t> parent_id;
+    std::optional<im2p_production_geometry_v1_t> parent_geometry;
+    std::optional<uint64_t> fence_call_id;
+    std::set<uint64_t> fence_required_work_ids;
     bool completed = false;
     uint64_t active_calls = 0;
     uint64_t active_host_stages = 0;
@@ -33,6 +38,9 @@ struct HostStageState {
     uint64_t operation_id, phase_id;
     std::optional<uint64_t> parent_id, call_id;
     bool complete = false;
+};
+struct ProducerDenseStripe {
+    uint64_t work_id, parent_id, row_begin, row_end;
 };
 struct Session::Impl {
     explicit Impl(RunInfo value) : info(std::move(value)) {}
@@ -51,7 +59,16 @@ struct Session::Impl {
     std::map<uint64_t, uint64_t> dispatch_operations;
     std::map<uint64_t, CallState> calls;
     std::map<uint64_t, uint64_t> call_operations;
+    std::set<uint64_t> completed_residual_merge_calls;
     std::map<uint64_t, uint64_t> work_operations;
+    std::map<std::tuple<uint64_t, uint64_t, uint64_t>, uint64_t> stripe_work_ids;
+    std::map<std::pair<uint64_t, uint64_t>, ProducerDenseStripe> dense_stripes;
+    std::map<uint64_t, std::vector<ProducerResidualBinding>> residual_bindings;
+    std::map<std::pair<uint64_t, uint64_t>, std::vector<uint64_t>> stripe_all_work_ids;
+    std::map<std::tuple<uint64_t, uint64_t, uint64_t>, std::vector<uint64_t>> stripe_merge_call_ids;
+    std::set<uint64_t> striped_operations;
+    std::map<uint64_t, std::vector<uint64_t>> pipeline_work_ids;
+    std::vector<ProducerRecord> producer_records;
     std::map<uint64_t, HostStageState> host_stages;
     PolicyQuery policy;
     std::string current_phase_kind;

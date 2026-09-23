@@ -1324,7 +1324,7 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
             COMMAND $<TARGET_FILE:test-gemmini-rmd-im2p-provider> --case all)
     endif()
 
-    if (IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1" AND GGML_GEMMINI_ENABLE_RMD)
+    if (IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1" AND GGML_GEMMINI_ENABLE_RMD AND NOT CYCLE_SIM)
         add_executable(test-gemmini-optrace-dispatch test-gemmini-optrace-dispatch.cpp)
         target_link_libraries(test-gemmini-optrace-dispatch PRIVATE
             ggml-gemmini ggml-base ggml-gemmini-utils)

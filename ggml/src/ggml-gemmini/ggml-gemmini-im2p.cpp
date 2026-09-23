@@ -1861,7 +1861,20 @@ public:
                 stripe_args, stage.data, event.row_begin, event.row_end, correction, nullptr, &metrics);
       merge.finish(status == rmd::RmdStatus::success);
 #if CYCLE_SIM
-      if (status == rmd::RmdStatus::success) merge_call.finish();
+      if (status == rmd::RmdStatus::success) {
+        merge_call.finish();
+        const auto call_context = cycle_sim::current_context();
+        if (stripe_args.cycle_sim_context &&
+            (!call_context.call_id || !stripe_args.cycle_sim_context.session->producer_event(
+                stripe_args.cycle_sim_context,
+                {cycle_sim::ProducerEventKind::ResidualHostMergeCompleted,
+                 event.run_id, event.stripe_id, event.row_begin, event.row_end,
+                 event.slot, bool(event.rmd_packet), bool(event.direct_residual),
+                 "ggml/src/ggml-gemmini/ggml-gemmini-im2p.cpp:apply_residual_merge",
+                 call_context.call_id})))
+          return to_frontend_status({Error::execution_failure,
+              "PIPELINE residual merge provenance failed", false});
+      }
 #endif
     }
     emit_rmd_workload(stripe_args, event, metrics, status);
@@ -2483,6 +2496,17 @@ start_exsia_stripe_pipeline(ggml_gemmini_args_t &args) noexcept {
         {}};
   }
   impl->run = std::move(started.run);
+#if CYCLE_SIM
+  if (args.cycle_sim_context) {
+    try {
+      impl->runtime_args.cycle_sim_context =
+          args.cycle_sim_context.session->dispatch_context(args.cycle_sim_context);
+    } catch (...) {
+      args.cycle_sim_context.session->record_failure("ExSIA pipeline dispatch context binding failed");
+      return {{Error::execution_failure, "ExSIA pipeline dispatch context binding failed", false}, {}};
+    }
+  }
+#endif
 #if defined(GGML_GEMMINI_TESTING)
   {
     std::lock_guard lock(test_mutex);

@@ -143,9 +143,33 @@ three-source join and execution-IR adapter. It requires `--application` for the
 measured PoTal sampling sidecar and explicit lifecycle
 semantics and collection provenance, never invents missing edges. Optional
 `--diagnostic-phase-table` plus `--diagnostic-frequency-hz` invokes only the
-synthetic scheduler. Until a validated clock and service-boundary provider are
-available, target TTFT/TPOT remain null and E2E reconstruction is NOT_READY.
-This does not claim a Jetson measurement, a full paper campaign, or quality PPL.
+synthetic scheduler. Without a validated clock and current service-boundary
+certificate, `result.json` lists missing certified inputs, TTFT/TPOT remain null,
+and no `reconstructed-result.json` is written.
+The current IM2P drained v1 certificate covers fixed two-work RTL fixtures only;
+it yields `DRAINED_FIXTURE_PARITY`, not production sequence admission. Supplying
+that certificate as `--service-certificate` still fails closed until a
+producer-generated same-instance sequence/phase certificate exists.
+Rejected certified inputs leave `NOT_READY_CERTIFICATION_REJECTED` scope status
+and a nonzero CLI exit. The diagnostic phase table cannot be combined with a
+complete certified publication request.
+
+For one certified PoTal repetition, supply `--service-certificate`,
+`--clock-selection`, `--profile`, `--timing`,
+`--initial-scratchpad-half`, `--initial-accumulator-half`, and
+`--potal-result` pointing at that repetition's native collection `result.json`,
+in addition to the existing replay, join, lifecycle, and `--application`
+arguments. The timing file and initial halves are explicit service scenario
+inputs; the NPU frequency comes only from the validated operating-clock file.
+The official scheduler and `verify-schedule` command check source, service,
+scenario, and clock bindings before publication. The standalone aggregate loader
+repeats that verification. `reconstructed-result.json` requires source-bound
+prefill preparation, uses scheduled `application:request:begin` before that
+preparation as t0, all 128 scheduled sample completions, and exact rational
+nanoseconds for TTFT and TPOT. Legacy sampler-only sidecars cannot publish.
+Ten distinct validated results are still
+needed for the median-of-ten aggregate. A single reconstructed run is neither
+a Jetson measurement nor a full paper campaign or quality PPL claim.
 
 `--lifecycle-sidecar` plus explicit `--worker-resources`, `--cpu-policy`, and
 `--sampler-resource` invokes the official producer-bound lifecycle builder after

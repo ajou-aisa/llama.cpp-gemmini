@@ -83,6 +83,40 @@ struct HostStage {
     std::vector<uint64_t> required_work_ids, required_host_stage_ids;
 };
 
+// These are observed producer ownership transitions, not target RTL events.
+enum class ProducerEventKind {
+    ExsiaWorkspaceAcquire, ActivationRowsCommit, ResidualPacketSeal,
+    FrontendCapacityAcquire, FrontendQueueEnqueue, FrontendQueueDequeue,
+    StreamWorkAccepted, StreamWorkCompleted, ResidualHostMergeCompleted,
+    ResidualCallbackCompleted,
+    FrontendCapacityRelease, ExsiaWorkspaceRelease,
+};
+struct ProducerEvent {
+    ProducerEventKind kind;
+    uint64_t run_id, stripe_id, row_begin, row_end;
+    std::optional<uint64_t> workspace_slot;
+    bool rmd_packet = false, direct_residual = false;
+    std::string source_location;
+    std::optional<uint64_t> call_id;
+};
+struct ProducerRecord {
+    ProducerEvent event;
+    uint64_t sequence, phase_id, operation_id;
+    std::optional<uint64_t> parent_id, work_id;
+    std::vector<uint64_t> required_work_ids, required_call_ids;
+};
+struct ProducerResidualBinding {
+    uint64_t work_id, call_id, child_parent_id, dense_work_id, dense_parent_id;
+    uint64_t stripe_id, row_begin, row_end, source_row_begin, source_row_count;
+};
+struct ProducerParent {
+    uint64_t operation_id, parent_id, fence_call_id;
+    uint64_t phase_id;
+    im2p_production_geometry_v1_t geometry{};
+    std::vector<uint64_t> work_ids, fence_required_work_ids;
+    std::vector<ProducerResidualBinding> residual_bindings;
+};
+
 enum class CallKind { Full, Stripe, Fence, ResidualPrepare, ResidualCompact, ResidualRecompose, ResidualMerge };
 enum class CallStage { Prepare, Invoke, CompleteRequired, Continuation, Publish, Fence };
 struct PolicyQuery {
@@ -99,6 +133,7 @@ public:
     Context register_operation(const void *node_key, const Operation &operation,
                                const Context &phase_context);
     Context new_dispatch(const Context &operation_context);
+    Context dispatch_context(const Context &operation_context);
     Context call_begin(const Context &context, CallKind kind);
     void call_event(const Context &context, CallStage stage,
                     const std::vector<uint64_t> &required_work_ids = {});
@@ -111,6 +146,11 @@ public:
     Context context_for(const void *node_key) { return find_operation(node_key); }
     bool finish_operation(const Context &context, bool success = true);
     uint64_t work(const Context &context, const Work &work);
+    bool producer_parent_geometry(const Context &context,
+                                  const im2p_production_geometry_v1_t &geometry) noexcept;
+    bool producer_event(const Context &context, ProducerEvent event) noexcept;
+    std::vector<ProducerRecord> producer_events();
+    std::vector<ProducerParent> producer_parents();
     void ensure_healthy();
     void finish(bool success = true, const std::string &reason = "");
     void record_failure(std::string_view reason) noexcept;
