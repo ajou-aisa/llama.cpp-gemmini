@@ -1330,6 +1330,9 @@ namespace ggml::gemmini::quants::act::exsia
         GGML_ASSERT(valid_count <= block_size);
         (void) local_row;
         (void) blk_idx;
+#if GGML_GEMMINI_ACT_QUANT_METRICS
+        scratch.actual_requantized = false;
+#endif
 
         if (valid_count == block_size)
         {
@@ -1504,6 +1507,9 @@ namespace ggml::gemmini::quants::act::exsia
                 const bool final_null_theta = blk.theta_b == neg_inf;
                 for (size_t i = 0; i < block_size; ++i)
                     q_out[i] = final_null_theta ? 0 : quantize_to_i32(x[i], blk.theta_b);
+#if GGML_GEMMINI_ACT_QUANT_METRICS
+                scratch.actual_requantized = true;
+#endif
 #if EXSIA_BRANCH_COUNTS_ENABLED
                 ++cycle_sample.replay_overwrite_count;
                 cycle_sample.p3_path = P3Path::Replay;
@@ -1697,6 +1703,9 @@ namespace ggml::gemmini::quants::act::exsia
                 const bool final_null_theta = blk.theta_b == neg_inf;
                 for (size_t i = 0; i < block_size; ++i)
                     q_out[i] = final_null_theta ? 0 : quantize_to_i32(blk.x[i], blk.theta_b);
+#if GGML_GEMMINI_ACT_QUANT_METRICS
+                scratch.actual_requantized = true;
+#endif
 #if EXSIA_BRANCH_COUNTS_ENABLED
                 ++cycle_sample.replay_overwrite_count;
                 cycle_sample.p3_path = P3Path::Replay;
@@ -1941,6 +1950,11 @@ namespace ggml::gemmini::quants::act::exsia
                             residual::TimedResidualCapture &rmd_builder)
     {
         const int16_t neg_inf = std::numeric_limits<int16_t>::min();
+#if GGML_GEMMINI_RESIDUAL_METRICS
+        if (args.evaluation_context)
+            args.evaluation_context->main_stripe(stripe_idx, stripe.row_start,
+                                                  stripe.row_count(), args.J, args.K);
+#endif
 #if EXSIA_STAGE_PROFILE_ENABLED
         stripe.selected_positions = 0;
         stripe.residual_nnz = 0;
@@ -2027,6 +2041,10 @@ namespace ggml::gemmini::quants::act::exsia
 
                     const bool outlier = col < args.K && stripe.outlier_mask.is_set(local_row, col);
                     const int32_t residual_i32 = outlier ? res : 0;
+#if GGML_GEMMINI_ACT_QUANT_METRICS
+                    if (col < args.K && args.evaluation_context)
+                        args.evaluation_context->position(r, col, outlier, residual_i32 != 0);
+#endif
 #if EXSIA_STAGE_PROFILE_ENABLED
                     stripe.selected_positions += outlier;
                     stripe.residual_nnz += residual_i32 != 0;
@@ -2281,6 +2299,11 @@ namespace ggml::gemmini::quants::act::exsia
         const float *src_data = ggml::gemmini::activation_data(A);
         if (!src_data)
             return fail(ExSIAState::FailureCode::InvalidInput);
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS
+        args.evaluation_context.reset();
+        if (const auto session = evaluation::active_session())
+            args.evaluation_context = session->invocation(args.matmul_layer, args.I, args.K, src_data);
+#endif
 
         size_t max_stripe_rows = std::min(args.I, rows_per_stripe);
         size_t max_stripe_elem_count = 0;
@@ -2390,6 +2413,9 @@ namespace ggml::gemmini::quants::act::exsia
             event.quantization_end_ns = slot.quantization_end_ns;
             event.rmd_packet = slot.rmd_packet;
             event.direct_residual = slot.direct_residual;
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS
+            event.evaluation_context = args.evaluation_context;
+#endif
             event.rmd_pack_ns = slot.rmd_pack_ns;
 #if CYCLE_SIM
             if (profile) event.cycle_sim_host_dependencies = profile_host_stage_ids(*profile);
@@ -2530,6 +2556,10 @@ namespace ggml::gemmini::quants::act::exsia
 
 #if EXSIA_BRANCH_COUNTS_ENABLED
             record_sample(stats, sample);
+#endif
+#if GGML_GEMMINI_ACT_QUANT_METRICS
+            if (scratch.actual_requantized && args.evaluation_context)
+                args.evaluation_context->requantized(row, block);
 #endif
             return true;
         };
@@ -3164,6 +3194,10 @@ namespace ggml::gemmini::quants::act::exsia
 #if EXSIA_BRANCH_COUNTS_ENABLED
                 record_sample(stats, sample);
 #endif
+#if GGML_GEMMINI_ACT_QUANT_METRICS
+                if (scratch.actual_requantized && args.evaluation_context)
+                    args.evaluation_context->requantized(r, b);
+#endif
                 return true;
             };
 
@@ -3456,6 +3490,10 @@ namespace ggml::gemmini::quants::act::exsia
 
 #if LOG_CYCLE
         run_timing.success = true;
+#endif
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS
+        if (args.evaluation_context)
+            args.evaluation_context->finish_activation();
 #endif
         return true;
     }

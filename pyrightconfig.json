@@ -9,6 +9,21 @@
   "disableBytesTypePromotions": false, // TODO: change once Python 3.12 is the minimum
   "executionEnvironments": [
     {
+      "root": "tests",
+      "extraPaths": ["scripts/eval", "../IM2P.sim"],
+      "pythonVersion": "3.11",
+    },
+    {
+      "root": "scripts/eval",
+      "extraPaths": ["scripts/eval", "../IM2P.sim"],
+      "pythonVersion": "3.11",
+    },
+    {
+      "root": "scripts",
+      "extraPaths": ["scripts"],
+      "pythonVersion": "3.9",
+    },
+    {
       // TODO: make this version override work correctly
       "root": "gguf-py",
       "pythonVersion": "3.8",

@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import shlex
 import sys
+from evaluation_build_options import validate_evaluation_options
 
 FPGA = {
     'GGML_GEMMINI': 'ON', 'GGML_GEMMINI_OPTION': 'WS',
@@ -148,9 +149,8 @@ def resolve(build_dir, platform, defaults, args, environment):
         effective['GGML_CPU_CYCLE_LOG'] = effective.get('LOG_CYCLE', '0')
         origin['GGML_CPU_CYCLE_LOG'] = 'derived-default:LOG_CYCLE'
     effective = {key: normalize(key, value) for key, value in effective.items()}
+    validate_evaluation_options(effective)
     cycle_sim = effective.get('CYCLE_SIM', '0')
-    if cycle_sim not in ('0', '1'):
-        raise BuildConfigurationError('CYCLE_SIM must be 0 or 1')
     backend = effective.get('GGML_GEMMINI_EXECUTION_BACKEND', 'HARDWARE')
     if cycle_sim == '1' and backend == 'FPGA_UART':
         raise BuildConfigurationError('CYCLE_SIM cannot use FPGA_UART')

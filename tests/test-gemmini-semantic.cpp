@@ -30,7 +30,9 @@ int main(int argc, char **argv) {
         auto session = semantic::Session::start(semantic::Source::FullCpu, "{}", "{}", true);
         rejected([&] { session->graph({}, "[]"); });
         session->phase("prefill", std::nullopt, tokens, 2);
+        assert(session->completed_graph_count() == 0);
         session->graph({{&first, "{\"op\":\"ADD\"}", false}, {&second, "{\"op\":\"ADD\"}", false}}, "[]");
+        rejected([&] { session->completed_graph_count(); });
         const auto a = semantic::context_for(&first), b = semantic::context_for(&second);
         assert(a->identity.node_ordinal == 0 && b->identity.node_ordinal == 1);
         assert(a->identity.graph_occurrence == 0 && b->identity.graph_occurrence == 0);
@@ -45,6 +47,7 @@ int main(int argc, char **argv) {
         assert(!semantic::current_context());
         session->execution(&first, run ? "CPU-split-a" : "CPU-combined", "ORDINARY_CPU", true);
         session->execution(&second, run ? "CPU-split-b" : "CPU-combined", "ORDINARY_CPU", true);
+        assert(session->completed_graph_count() == 1);
         rejected([&] { session->execution(&first, "CPU", "ORDINARY_CPU", true); });
         rejected([&] { session->phase("prefill", std::nullopt, tokens, 2); });
         session->phase("decode", 0, tokens, 1);

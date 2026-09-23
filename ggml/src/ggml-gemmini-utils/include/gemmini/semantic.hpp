@@ -46,6 +46,7 @@ public:
     void finish(bool success);
     void fail(std::string_view reason) noexcept;
     void ensure_healthy() const;
+    uint64_t completed_graph_count() const;
     Session(const Session &) = delete;
     Session &operator=(const Session &) = delete;
 private:

@@ -1731,6 +1731,9 @@ public:
     ggml_gemmini_args_t stripe_args;
     try {
       stripe_args = runtime_args;
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS
+      stripe_args.evaluation_context = event.evaluation_context;
+#endif
 #if CYCLE_SIM
       ::im2p::gemmini::cycle_sim::append_host_dependencies(
           stripe_args.cycle_sim_host_dependencies, event.cycle_sim_host_dependencies);

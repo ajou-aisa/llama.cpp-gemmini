@@ -1738,6 +1738,24 @@ static RmdStatus execute_rmd_stripe_im2p_run_aware(
   staged_metrics.im2p_stats = stats.stats;
 
   Correction staged_output = std::move(final);
+#if GGML_GEMMINI_RESIDUAL_METRICS
+  if (args.evaluation_context) {
+    try {
+      std::vector<evaluation::Run> runs;
+      std::vector<evaluation::Row> rows;
+      for (const auto &run : request.runs)
+        runs.push_back({run.original_block_id, run.union_k_mask,
+                        run.compact_k_begin, run.compact_k_count});
+      for (const auto &row : request.rows)
+        rows.push_back({row.original_lane_id, row.source_row});
+      args.evaluation_context->compact_work(packet.stripe_id, request.m, request.n,
+          request.k, request.original_k, request.tile_i, request.tile_j, request.tile_k,
+          runs, rows);
+    } catch (...) {
+      return RmdStatus::execution_failed;
+    }
+  }
+#endif
 #if CYCLE_SIM && defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
   if (event_context) {
     im2p::gemmini::cycle_sim::HostStageScope cycle_publication(

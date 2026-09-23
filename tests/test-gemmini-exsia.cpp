@@ -58,6 +58,127 @@ bool check(bool value, const char * message) {
 }
 
 #ifndef GEMMINI_EXSIA_WRITER_TEST_ONLY
+bool test_evaluation_metrics_observer(const std::filesystem::path &directory) {
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS
+    constexpr size_t rows = DIM + 1, columns = 65;
+    std::vector<float> source(rows * columns, 0.5f);
+    for (size_t row = 0; row + 1 < rows; ++row) {
+        source[row * columns] = 256.0f;
+        source[row * columns + 1] = 8.0f;
+        source[row * columns + 40] = -17.0f;
+    }
+    ggml_tensor tensor{};
+    tensor.type = GGML_TYPE_F32;
+    tensor.data = source.data();
+    ggml_gemmini_args_t baseline{}, observed{};
+    for (auto *args : {&baseline, &observed}) {
+        args->I = rows; args->J = 17; args->K = columns; args->sA = columns;
+        args->tile_I = 1; args->tile_J = 2; args->tile_K = 3;
+        args->activation_rows_per_stripe = DIM;
+        args->matmul_layer = "metric.observer";
+        args->residual_route = residual::ResidualRoute::ws_packet;
+        if (!args->A.allocate(rows, columns, GGML_GEMMINI_ACTIVATION_BITS)) return false;
+    }
+    quants::act::exsia::ExSIA first, second;
+    quants::act::exsia::Meta first_meta, second_meta;
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+    first.set_execution_mode(quants::act::exsia::ExSIAState::ExecutionMode::LocalParallel);
+    second.set_execution_mode(quants::act::exsia::ExSIAState::ExecutionMode::LocalParallel);
+#else
+    first.set_execution_mode(quants::act::exsia::ExSIAState::ExecutionMode::Sequential);
+    second.set_execution_mode(quants::act::exsia::ExSIAState::ExecutionMode::Sequential);
+#endif
+    if (!first.run(first_meta, &tensor, baseline)) return false;
+    if (!check(first_meta.rmd_packets.size() == 1,
+               "second real main stripe has no residual packet")) return false;
+    evaluation::Config config;
+    config.run_id = "actual-exsia-observer";
+    config.workload_id = "tail-65-two-stripes";
+#if GGML_GEMMINI_ACT_QUANT_METRICS
+    config.activation_path = (directory / "activation-quant-metrics.jsonl").string();
+#endif
+#if GGML_GEMMINI_RESIDUAL_METRICS
+    config.residual_path = (directory / "residual-path-metrics.jsonl").string();
+#endif
+    const auto session = evaluation::Session::start(config);
+    session->chunk(0);
+    if (!second.run(second_meta, &tensor, observed)) return false;
+    session->finish(true);
+    size_t observed_workers = 1;
+#if defined(GGML_GEMMINI_HAS_OPENMP)
+    for (const auto &stripe : second.state().local_parallel_observations)
+        observed_workers = std::max(observed_workers, stripe.observed_team_size);
+    if (!check(observed_workers > 1, "actual metrics run used multiple OpenMP workers")) return false;
+#endif
+    bool same = *baseline.A.bytes == *observed.A.bytes &&
+        first_meta.theta == second_meta.theta &&
+        first.state().residual == second.state().residual &&
+        first_meta.rmd_packets.size() == second_meta.rmd_packets.size() &&
+        baseline.tile_I == observed.tile_I && baseline.tile_J == observed.tile_J &&
+        baseline.tile_K == observed.tile_K;
+    for (size_t index = 0; same && index < first_meta.rmd_packets.size(); ++index) {
+        const auto &a = *first_meta.rmd_packets[index];
+        const auto &b = *second_meta.rmd_packets[index];
+        same = a.row_begin == b.row_begin && a.row_count == b.row_count &&
+            a.logical_j == b.logical_j && a.logical_k == b.logical_k &&
+            a.k_indices == b.k_indices && a.stacked_activation == b.stacked_activation &&
+            a.blocks.size() == b.blocks.size();
+        for (size_t block = 0; same && block < a.blocks.size(); ++block) {
+            const auto &x = a.blocks[block];
+            const auto &y = b.blocks[block];
+            same = x.block_id == y.block_id && x.compact_k_count == y.compact_k_count &&
+                x.active_lane_count == y.active_lane_count && x.lane_ids == y.lane_ids &&
+                x.lane_k_masks == y.lane_k_masks && x.groups.size() == y.groups.size();
+            for (size_t group = 0; same && group < x.groups.size(); ++group)
+                same = x.groups[group].k_mask == y.groups[group].k_mask &&
+                    x.groups[group].lane_positions == y.groups[group].lane_positions;
+        }
+    }
+    std::printf("EVALUATION_OBSERVER numerical=%s packet=%s tiles=1/2/3 positions=%zu workers=%zu\n",
+                same ? "PASS" : "FAIL", same ? "PASS" : "FAIL", rows * columns, observed_workers);
+    return check(same, "metrics observer preserves numerical and packet identity");
+#else
+    (void)directory;
+    return check(false, "observer test requires a compiled metric option");
+#endif
+}
+
+bool test_actual_requant_metric_branch() {
+#if GGML_GEMMINI_ACT_QUANT_METRICS
+    using namespace quants::act::exsia;
+    LocalStage stage;
+    Meta meta;
+    ExSIAState state;
+    state.B_size = 32;
+    StripeScratch scratch;
+    if (!scratch.prepare(32)) return false;
+    std::array<int32_t, 32> output{};
+    uint64_t mask_word = 0;
+    BlockMask mask(&mask_word, 32);
+    int16_t block_exp = 0;
+    const std::array<float, 7> changed{256, 8, 1, 1, 1, 1, 1};
+    const std::array<float, 7> same_scale{256, 2, 2, 2, 2, 2, 3};
+    for (bool forced : {false, true}) {
+        stage.set_force_recompute(forced);
+        for (bool actual : {false, true}) {
+            const auto &input = actual ? changed : same_scale;
+#if EXSIA_BRANCH_COUNTS_ENABLED
+            LocalBlockCycleSample sample;
+#endif
+            if (!stage.run_optimized(meta, state, input.data(), input.size(), 32,
+                    0, 0, scratch, mask, output.data(), block_exp
+#if EXSIA_BRANCH_COUNTS_ENABLED
+                    , sample
+#endif
+                    )) return false;
+            if (!check(scratch.actual_requantized == actual,
+                       "actual replay counted; same-scale and forced recompute excluded")) return false;
+        }
+    }
+#endif
+    return true;
+}
+
 bool test_meta_rho_invariant() {
     quants::act::exsia::Meta meta;
     const bool initialized =
@@ -2692,6 +2813,11 @@ bool test_compiled_width_rmd_suite() {
 }
 
 int main(int argc, char ** argv) {
+#ifndef GEMMINI_EXSIA_WRITER_TEST_ONLY
+    if (argc == 3 && std::string(argv[1]) == "--metrics-output")
+        return test_actual_requant_metric_branch() &&
+               test_evaluation_metrics_observer(argv[2]) ? 0 : 1;
+#endif
     if (argc >= 3 && std::string(argv[1]) == "--profile-output") {
         const bool invalid_parent = argc == 4 && std::string(argv[3]) == "--invalid-parent";
         return profile_output_routing(argv[2], invalid_parent) ? 0 : 1;

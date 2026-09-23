@@ -1,5 +1,6 @@
 #include "arg.h"
 #include "common.h"
+#include "evaluation-workload.h"
 #include "log.h"
 #include "llama.h"
 
@@ -469,7 +470,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     auto tim1 = std::chrono::high_resolution_clock::now();
     LOG_INF("%s: tokenizing the input ..\n", __func__);
 
-    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true);
+    std::vector<llama_token> tokens = common_evaluation_tokenize(ctx, params.prompt);
 
     auto tim2 = std::chrono::high_resolution_clock::now();
     LOG_INF("%s: tokenization took %g ms\n",__func__,1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count());
@@ -487,10 +488,9 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     std::vector<float> prob_history;
     prob_history.resize(tokens.size());
 
-    const int n_chunk_max = tokens.size() / n_ctx;
-
-    const int n_chunk = params.n_chunks < 0 ? n_chunk_max : std::min(params.n_chunks, n_chunk_max);
     const int n_batch = params.n_batch;
+    const auto workload = common_evaluation_plan(tokens.size(), n_ctx, n_batch, params.n_chunks);
+    const int n_chunk = workload.n_chunks;
 
     const int n_vocab = llama_vocab_n_tokens(vocab);
 
@@ -498,8 +498,8 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     double nll = 0.0;
     double nll2 = 0.0;
 
-    const int num_batches = (n_ctx + n_batch - 1) / n_batch;
-    const int n_seq = std::max(1, n_batch / n_ctx);
+    const int num_batches = workload.n_batches;
+    const int n_seq = workload.n_seq;
 
     GGML_ASSERT(n_batch < n_ctx || n_batch % n_ctx == 0);
     GGML_ASSERT(params.n_ctx == n_seq * n_ctx);
@@ -540,48 +540,16 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
     for (int i = 0; i < n_chunk; i += n_seq) {
         const int start =     i * n_ctx;
-        const int end   = start + n_ctx;
-
         const int n_seq_batch = std::min(n_seq, n_chunk - i);
 
         const auto t_start = std::chrono::high_resolution_clock::now();
 
         // clear the KV cache
-        llama_kv_self_clear(ctx);
+        common_evaluation_begin(ctx);
 
         for (int j = 0; j < num_batches; ++j) {
-            const int batch_start = start + j * n_batch;
-            const int batch_size  = std::min(end - batch_start, n_batch);
-
-            int n_outputs = 0;
-
-            batch.n_tokens = 0;
-            for (int seq = 0; seq < n_seq_batch; seq++) {
-                int seq_start = batch_start + seq*n_ctx;
-
-                // save original token and restore it after eval
-                const auto token_org = tokens[seq_start];
-
-                // add BOS token for the first batch of each chunk
-                if (add_bos && j == 0) {
-                    tokens[seq_start] = llama_vocab_bos(vocab);
-                }
-
-                for (int k = 0; k < batch_size; ++k) {
-                    const int idx = seq*n_ctx + k;
-                    batch.token   [idx]    = tokens[seq_start + k];
-                    batch.pos     [idx]    = j*n_batch + k;
-                    batch.n_seq_id[idx]    = 1;
-                    batch.seq_id  [idx][0] = seq;
-                    batch.logits  [idx]    = batch.pos[idx] >= first ? 1 : 0;
-
-                    n_outputs += batch.logits[idx] != 0;
-                }
-                batch.n_tokens += batch_size;
-
-                // restore the original token in case it was set to BOS
-                tokens[seq_start] = token_org;
-            }
+            const int n_outputs = common_evaluation_batch(batch, tokens, workload, i, j,
+                    add_bos, llama_vocab_bos(vocab), common_evaluation_mask::perplexity_half);
 
             if (llama_decode(ctx, batch)) {
                 LOG_INF("%s : failed to eval\n", __func__);

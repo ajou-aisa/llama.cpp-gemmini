@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "ggml-gemmini-config.hpp"
+#include <gemmini/evaluation_metrics.hpp>
 #if CYCLE_SIM
 #include <gemmini/cycle_sim_log.hpp>
 #endif
@@ -436,6 +437,9 @@ typedef struct ggml_gemmini_args_t {
     // Optional immutable driver provenance, explicitly owned by asynchronous
     // frontend/RMD work. No process-global phase and no allocation when off.
     std::shared_ptr<const ggml::gemmini::optrace::Context> optrace_context;
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS
+    std::shared_ptr<ggml::gemmini::evaluation::Invocation> evaluation_context;
+#endif
 #if CYCLE_SIM
     ggml::gemmini::cycle_sim::Context cycle_sim_context;
     std::vector<uint64_t> cycle_sim_host_dependencies;

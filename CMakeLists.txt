@@ -172,6 +172,19 @@ if (LLAMA_USE_SYSTEM_GGML)
 endif()
 
 # Gemmini compile-time switches (source of truth: root cache + build scripts).
+foreach(_metric IN ITEMS ACT_QUANT RESIDUAL)
+    set(GGML_GEMMINI_${_metric}_METRICS "0" CACHE STRING "Enable independent ${_metric} evaluation metrics (0|1)")
+    set_property(CACHE GGML_GEMMINI_${_metric}_METRICS PROPERTY STRINGS 0 1)
+    if(NOT GGML_GEMMINI_${_metric}_METRICS MATCHES "^[01]$")
+        message(FATAL_ERROR "GGML_GEMMINI_${_metric}_METRICS must be 0 or 1")
+    endif()
+    foreach(_flags IN ITEMS CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_DEBUG CMAKE_CXX_FLAGS_RELEASE
+            CMAKE_CXX_FLAGS_RELWITHDEBINFO CMAKE_CXX_FLAGS_MINSIZEREL)
+        if("${${_flags}}" MATCHES "(^|[ \t])[-/]DGGML_GEMMINI_${_metric}_METRICS([= \t]|$)")
+            message(FATAL_ERROR "Use GGML_GEMMINI_${_metric}_METRICS cache option, not ${_flags}")
+        endif()
+    endforeach()
+endforeach()
 set(CYCLE_SIM "0" CACHE STRING "Enable PoTal cycle-simulation trace collection (0|1)")
 set_property(CACHE CYCLE_SIM PROPERTY STRINGS 0 1)
 if(NOT CYCLE_SIM MATCHES "^[01]$")
@@ -1097,6 +1110,8 @@ if (NOT _GGML_GEMMINI_EXSIA_PROFILE_SCOPE_UPPER STREQUAL "OFF" AND NOT CYCLE_DET
 endif()
 
 set(GGML_GEMMINI_RUNTIME_COMPILE_DEFS
+    GGML_GEMMINI_ACT_QUANT_METRICS=${GGML_GEMMINI_ACT_QUANT_METRICS}
+    GGML_GEMMINI_RESIDUAL_METRICS=${GGML_GEMMINI_RESIDUAL_METRICS}
     CYCLE_SIM=${CYCLE_SIM}
     LOG_DEBUG=${LOG_DEBUG}
     LOG_CYCLE=${LOG_CYCLE}
@@ -1119,6 +1134,8 @@ if (LLAMA_BUILD_TESTS AND GGML_GEMMINI)
     list(APPEND GGML_GEMMINI_COMPILE_DEFS GGML_GEMMINI_TEST_OBSERVER=1)
 endif()
 set(GGML_GEMMINI_UTILS_COMPILE_DEFS
+    GGML_GEMMINI_ACT_QUANT_METRICS=${GGML_GEMMINI_ACT_QUANT_METRICS}
+    GGML_GEMMINI_RESIDUAL_METRICS=${GGML_GEMMINI_RESIDUAL_METRICS}
     LOG_DEBUG=${LOG_DEBUG}
     LOG_CYCLE=${LOG_CYCLE}
     CYCLE_DETAIL=${CYCLE_DETAIL})

@@ -19,6 +19,7 @@
 #include <gemmini/layer.hpp>
 #include <gemmini/cpu-timing.h>
 #include <gemmini/cpu_log_context.hpp>
+#include <gemmini/evaluation_metrics.hpp>
 #if CYCLE_SIM
 #include <gemmini/cycle_sim_log.hpp>
 #endif
@@ -272,6 +273,9 @@ namespace ggml::gemmini::quants::act::exsia
     {
         BlockState block;
         BitMask folding_inlier_mask;
+#if GGML_GEMMINI_ACT_QUANT_METRICS
+        bool actual_requantized = false;
+#endif
 #if EXSIA_VALIDATION
         struct ReferenceScratch
         {
@@ -397,6 +401,9 @@ namespace ggml::gemmini::quants::act::exsia
         // The packet owns its buffers, so it stays valid after the ExSIA slot is released.
         ggml::gemmini::rmd::StripePacketHandle rmd_packet;
         ggml::gemmini::residual::DirectStripePayloadHandle direct_residual;
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS
+        std::shared_ptr<evaluation::Invocation> evaluation_context;
+#endif
         uint64_t rmd_pack_ns = 0;
         uint64_t local_start_ns = 0;
         uint64_t local_end_ns = 0;

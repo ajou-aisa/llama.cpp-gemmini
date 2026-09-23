@@ -280,6 +280,37 @@ add_test(NAME test-build-arm64-cpu-detection
         -DTEST_SCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/../build-arm64.sh
         -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/build-arm64-cpu-detection
         -P ${CMAKE_CURRENT_SOURCE_DIR}/test-build-arm64-cpu-detection.cmake)
+add_test(NAME test-evaluation-build-options
+    COMMAND ${CMAKE_COMMAND} -DTEST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/..
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-evaluation-build-options.cmake)
+add_executable(test-evaluation-workload test-evaluation-workload.cpp)
+target_link_libraries(test-evaluation-workload PRIVATE common llama)
+target_compile_options(test-evaluation-workload PRIVATE $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)
+add_test(NAME test-evaluation-workload COMMAND test-evaluation-workload)
+add_executable(test-evaluation-trace test-evaluation-trace.cpp ../tools/eval/evaluation-trace.cpp)
+target_include_directories(test-evaluation-trace PRIVATE ../tools/eval)
+target_link_libraries(test-evaluation-trace PRIVATE common llama ggml-gemmini-utils)
+target_compile_definitions(test-evaluation-trace PRIVATE ${GGML_GEMMINI_RUNTIME_COMPILE_DEFS})
+target_compile_options(test-evaluation-trace PRIVATE $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)
+add_test(NAME test-evaluation-trace
+    COMMAND ${CMAKE_COMMAND} -DTEST_BINARY=$<TARGET_FILE:test-evaluation-trace>
+        -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-evaluation-metric-sink.cmake)
+add_executable(test-evaluation-lifecycle test-evaluation-lifecycle.cpp)
+target_include_directories(test-evaluation-lifecycle PRIVATE ../common)
+target_compile_features(test-evaluation-lifecycle PRIVATE cxx_std_17)
+target_compile_options(test-evaluation-lifecycle PRIVATE $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)
+add_test(NAME test-evaluation-lifecycle COMMAND test-evaluation-lifecycle)
+add_executable(test-gemmini-evaluation-metrics test-gemmini-evaluation-metrics.cpp)
+target_link_libraries(test-gemmini-evaluation-metrics PRIVATE ggml-gemmini-utils)
+target_compile_definitions(test-gemmini-evaluation-metrics PRIVATE
+    GGML_GEMMINI_ACT_QUANT_METRICS=${GGML_GEMMINI_ACT_QUANT_METRICS}
+    GGML_GEMMINI_RESIDUAL_METRICS=${GGML_GEMMINI_RESIDUAL_METRICS})
+target_compile_options(test-gemmini-evaluation-metrics PRIVATE $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)
+add_test(NAME test-gemmini-evaluation-metrics
+    COMMAND ${CMAKE_COMMAND} -DTEST_BINARY=$<TARGET_FILE:test-gemmini-evaluation-metrics>
+        -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-evaluation-metric-sink.cmake)
 add_test(NAME test-im2p-cache-build-scripts
     COMMAND ${CMAKE_COMMAND}
         -DTEST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/..
@@ -1501,3 +1532,6 @@ if (TARGET ggml-gemmini AND GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "FPGA_UART")
         ../ggml/src/ggml-gemmini ../ggml/src/ggml-gemmini-utils/include ../ggml/include)
     add_test(NAME test-gemmini-rmd-executor COMMAND $<TARGET_FILE:test-gemmini-rmd-executor>)
 endif()
+add_compile_definitions(
+    GGML_GEMMINI_ACT_QUANT_METRICS=${GGML_GEMMINI_ACT_QUANT_METRICS}
+    GGML_GEMMINI_RESIDUAL_METRICS=${GGML_GEMMINI_RESIDUAL_METRICS})

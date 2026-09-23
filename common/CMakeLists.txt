@@ -64,6 +64,8 @@ add_library(${TARGET} STATIC
     common.h
     console.cpp
     console.h
+    evaluation-workload.cpp
+    evaluation-workload.h
     json-schema-to-grammar.cpp
     json.hpp
     llguidance.cpp

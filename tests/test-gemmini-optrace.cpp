@@ -61,6 +61,18 @@ int main(int argc, char **argv) {
     assert(!trace::Session::start(nullptr, info()));
     assert(!trace::Session::start("", info()));
     assert(!trace::current_context());
+#if CYCLE_SIM
+    const auto forbidden = root / "functional-cannot-claim-production.jsonl";
+    bool rejected = false;
+    try {
+        trace::Session::start(forbidden.c_str(), info());
+    } catch (const std::runtime_error & error) {
+        rejected = std::string(error.what()) ==
+            "optrace: CPU-functional collection cannot claim production RTL acceptance";
+    }
+    assert(rejected && !std::filesystem::exists(forbidden));
+    return 0;
+#endif
     for (unsigned bits : {4u, 8u}) for (unsigned dim : {16u, 32u, 64u}) {
         const auto tag = std::to_string(bits) + "-" + std::to_string(dim);
         for (unsigned repeat = 0; repeat != 2; ++repeat) {

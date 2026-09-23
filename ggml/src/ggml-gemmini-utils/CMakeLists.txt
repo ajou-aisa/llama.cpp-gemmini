@@ -4,6 +4,7 @@ if(NOT DEFINED CYCLE_SIM)
     set(CYCLE_SIM 0)
 endif()
 add_library(ggml-gemmini-utils
+    src/evaluation_metrics.cpp
     src/debug.cpp
     src/cycle.cpp
     src/optrace.cpp
@@ -30,6 +31,12 @@ target_include_directories(ggml-gemmini-utils
 
 target_compile_features(ggml-gemmini-utils PUBLIC cxx_std_17)
 target_compile_definitions(ggml-gemmini-utils PRIVATE CYCLE_SIM=${CYCLE_SIM})
+if(GGML_GEMMINI_ACT_QUANT_METRICS OR GGML_GEMMINI_RESIDUAL_METRICS)
+    target_compile_definitions(ggml-gemmini-utils PRIVATE
+        GGML_GEMMINI_ACTIVATION_BITS=${GGML_GEMMINI_ACTIVATION_BITS}
+        GGML_GEMMINI_WEIGHT_BITS=${GGML_GEMMINI_WEIGHT_BITS}
+        GGML_GEMMINI_DIM=${GGML_GEMMINI_DIM})
+endif()
 set(_GEMMINI_SEMANTIC_CPU_ONLY_BUILD 0)
 if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "HARDWARE" AND
    (NOT GGML_GEMMINI OR GGML_GEMMINI_OPTION STREQUAL "CPU"))

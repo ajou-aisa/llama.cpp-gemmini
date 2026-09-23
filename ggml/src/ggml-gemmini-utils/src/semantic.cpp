@@ -184,6 +184,12 @@ void Session::execution(const void *node, const std::string &backend, const std:
     if (!success) impl_->failure = "backend execution failed";
 }
 void Session::ensure_healthy() const { std::lock_guard<std::mutex> lock(impl_->mutex); impl_->check(); }
+uint64_t Session::completed_graph_count() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->check();
+    require(impl_->expected == impl_->executed, "dispatch has incomplete graph nodes");
+    return impl_->graphs;
+}
 void Session::fail(std::string_view reason) noexcept {
     try { std::lock_guard<std::mutex> lock(impl_->mutex); if (impl_->failure.empty()) impl_->failure = reason; }
     catch (...) { std::terminate(); }
