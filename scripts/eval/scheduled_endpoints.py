@@ -1,11 +1,27 @@
 from __future__ import annotations
 
+import sqlite3
 from contextlib import closing
+from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
-import sqlite3
 
-from eval_common import Record, decode, integer, read_json, record, require, text
+from eval_common import (
+    Record,
+    decode,
+    integer,
+    read_json,
+    record,
+    require,
+    sha256,
+    text,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedStatefulSchedule:
+    schedule_sha256: str
+    service_binding: Record
 
 
 def rational(value: Fraction) -> Record:
@@ -33,7 +49,8 @@ def prefill_dispatches(lifecycle: Record) -> list[int]:
     return dispatches
 
 
-def scheduled_application_result(path: Path, prefill_ids: list[int]) -> Record:
+def scheduled_application_result(path: Path, prefill_ids: list[int],
+                                 verified: VerifiedStatefulSchedule | None = None) -> Record:
     require(bool(prefill_ids) and prefill_ids[0] == 0 and len(prefill_ids) == len(set(prefill_ids)),
             "explicit prefill dispatch coverage required")
     dispatch_nodes = {f"dispatch:{identity}:begin" for identity in prefill_ids}
@@ -47,7 +64,7 @@ def scheduled_application_result(path: Path, prefill_ids: list[int]) -> Record:
             manifest = database.execute("SELECT body FROM metadata WHERE key='manifest'").fetchone()
             require(manifest is not None, "missing official schedule manifest")
             header = decode(manifest[0])
-            require(header.get("schema") == "im2p-execution-schedule-sqlite" and header.get("version") == 1,
+            require(header.get("schema") == "im2p-execution-schedule-sqlite" and header.get("version") in (1, 2),
                     "unsupported official SQLite schedule")
             placeholders = ",".join("?" for _ in dispatch_nodes)
             selected = database.execute("SELECT identity,body FROM results WHERE identity='application:request:begin' "
@@ -58,14 +75,23 @@ def scheduled_application_result(path: Path, prefill_ids: list[int]) -> Record:
                     "SQLite schedule node identity/body mismatch")
     else:
         header = read_json(path)
-        require(header.get("schema") == "im2p-execution-schedule" and header.get("version") == 1,
+        require(header.get("schema") == "im2p-execution-schedule" and header.get("version") in (1, 2),
                 "unsupported official JSON schedule")
         raw_nodes = header.get("nodes")
         require(isinstance(raw_nodes, list), "missing official schedule nodes")
         rows = [record(raw) for raw in raw_nodes] if isinstance(raw_nodes, list) else []
-    require(header.get("scope") == "RECONSTRUCTED" and
-            header.get("service_validation_scope") == "CURRENT_CERTIFIED_SEQUENCE",
+    stateful = header.get("version") == 2
+    require(header.get("scope") == "RECONSTRUCTED" and header.get("service_validation_scope") ==
+            ("STATEFUL_SEQUENCE_PRODUCTION" if stateful else "CURRENT_CERTIFIED_SEQUENCE"),
             "current certified reconstructed schedule required")
+    if stateful:
+        require(isinstance(verified, VerifiedStatefulSchedule), "fresh verified stateful schedule required")
+        if verified is None:
+            raise ValueError("fresh verified stateful schedule required")
+        require(verified.schedule_sha256 == sha256(path) and
+                verified.service_binding == header.get("service_binding") and
+                verified.service_binding.get("scope") == "CURRENT_STATEFUL_SEQUENCE",
+                "verified stateful schedule binding mismatch")
     selected_rows: list[Record] = []
     for row in rows:
         identity = row.get("node_id")
@@ -87,6 +113,8 @@ def scheduled_application_result(path: Path, prefill_ids: list[int]) -> Record:
                 "invalid prefill preparation interval or dispatch ordering")
     require(all(a <= b for a, b in zip(samples, samples[1:])),
             "non-monotonic reconstructed application endpoints")
+    require(verified is None or verified.schedule_sha256 == sha256(path),
+            "verified stateful schedule changed during endpoint reduction")
     return {"ttft_ns": rational(samples[0] - start),
             "tpot_ns": rational((samples[-1] - samples[0]) / 127),
             "samples": 128, "decode_calls": 127}

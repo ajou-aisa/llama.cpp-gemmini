@@ -1278,6 +1278,14 @@ bool run_dispatch_parity(std::string_view case_name = "gap-0-3") {
     Fixture fixture(true, 2, rows, columns);
     StripePacket packet = fixture.remap_hp1_second_block(
         case_name == "boundary-1-31" ? 31 : 3);
+    if (case_name == "numeric-zero-first") {
+        for (size_t column = 0; column < columns; ++column) {
+            for (size_t k = 0; k < kBlockSize; ++k)
+                fixture.set_code(column * 4, k, 0);
+            fixture.hp1[column * 4].m = static_cast<int16_t>(column + 1);
+            fixture.hp1[column * 4 + 3].m = static_cast<int16_t>(column + 4);
+        }
+    }
     if (case_name == "gap-0-3-k22" || case_name == "gap-0-3-k37" ||
         case_name == "one-run" || case_name == "radix-lane") {
         RmdStripeBuilder builder;
@@ -1390,6 +1398,21 @@ bool run_dispatch_parity(std::string_view case_name = "gap-0-3") {
                    build_run_aware_request(fixture.args, packet, request) == RmdStatus::success &&
                    captured_work_matches(original, request, observation),
                "captured request matches original packet and native HP1 blocks")) return false;
+    if (case_name == "numeric-zero-first") {
+        if (!check(original.runs.size() == 2 &&
+                       original.runs[0].original_block_id == 0 &&
+                       original.runs[1].original_block_id == 3 &&
+                       original.carriers == std::vector<uint32_t>({1, 2, 3, 4, 5, 6}),
+                   "numeric fixture keeps distinct original-block column carriers")) return false;
+        const size_t first_weights = original.runs[0].compact_k_count * original.n;
+        if (!check(std::all_of(original.weights.begin(), original.weights.begin() + first_weights,
+                               [](int8_t code) { return code == 0; }) &&
+                       std::any_of(original.weights.begin() + first_weights, original.weights.end(),
+                                   [](int8_t code) { return code != 0; }) &&
+                       std::any_of(original.output.begin(), original.output.end(),
+                                   [](int64_t value) { return value != 0; }),
+                   "numeric fixture has zero first run and nonzero later output")) return false;
+    }
     if (case_name == "radix-lane") {
         RunAwareRequest swapped = request;
         std::swap(swapped.rows[0], swapped.rows[1]);
@@ -1448,7 +1471,7 @@ bool run_dispatch_parity(std::string_view case_name = "gap-0-3") {
     fixture_ok = write_fixture_values(work_file, "A", observation.activations) && fixture_ok;
     fixture_ok = write_fixture_values(work_file, "B", observation.weights) && fixture_ok;
     fixture_ok = write_fixture_values(work_file, "CARRIERS", observation.carriers) && fixture_ok;
-    fixture_ok = write_fixture_values(work_file, "OUTPUT", observation.output) && fixture_ok;
+    fixture_ok = write_fixture_values(work_file, "OUTPUT", original.output) && fixture_ok;
     fixture_ok = std::fclose(work_file) == 0 && fixture_ok;
     return check(fixture_ok, "run-work fixture is complete");
 }
@@ -1659,7 +1682,7 @@ int main(int argc, char ** argv) {
     if (selected == "production-fixtures") {
         for (std::string_view case_name : {"gap-0-3", "gap-0-3-k22", "gap-0-3-k37",
                                            "one-run", "boundary-1-31", "tail-mn",
-                                           "radix-lane"})
+                                           "radix-lane", "numeric-zero-first"})
             ok = run_dispatch_parity(case_name) && ok;
     }
     if (selected == "dispatch-parity-callback-failure") ok = run_dispatch_parity_callback_failure() && ok;

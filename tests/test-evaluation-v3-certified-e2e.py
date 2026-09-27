@@ -7,19 +7,28 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts/eval"))
 
-from application_results import (aggregate_results, application_result, application_services,
-                                 load_measurement, load_potal_collection)
-from certified_reconstruction import artifact_reference, reconstructed_row
+from application_results import (
+    aggregate_results,
+    application_result,
+    application_services,
+    load_measurement,
+    load_potal_collection,
+)
+from certified_reconstruction import (
+    artifact_reference,
+    consumer_sources,
+    reconstructed_row,
+)
 from eval_common import Record, sha256
 from scheduled_endpoints import scheduled_application_result
 
@@ -102,7 +111,8 @@ class CertifiedE2ETests(unittest.TestCase):
         completed = subprocess.run(command, capture_output=True, text=True, timeout=10)
         # Then a caller can supply all externally certified inputs.
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        for option in ("--service-certificate", "--clock-selection", "--profile", "--potal-result",
+        for option in ("--service-certificate", "--stateful-sequence-certificate", "--stateful-evidence-root",
+                       "--stateful-diagnostic", "--clock-selection", "--profile", "--potal-result",
                        "--timing", "--initial-scratchpad-half", "--initial-accumulator-half"):
             self.assertIn(option, completed.stdout)
 
@@ -249,6 +259,19 @@ class CertifiedE2ETests(unittest.TestCase):
             candidate = root / "forged-result.json"
             candidate.write_text(json.dumps(row))
             # When loading through the public reducer, then the official verifier rejects the fake proof.
+            with self.assertRaisesRegex(ValueError, "current fixed-policy post-route operating clock required"):
+                load_measurement(candidate)
+            inputs["stateful_sequence_certificate"] = inputs.pop("service_certificate")
+            inputs["stateful_evidence_root"] = {"path": str(root)}
+            inputs["consumer_sources"] = consumer_sources()
+            bindings.write_text(json.dumps(inputs))
+            schedule_row = json.loads(schedule.read_text())
+            schedule_row.update(version=2, service_validation_scope="STATEFUL_SEQUENCE_PRODUCTION",
+                                service_binding={"scope": "CURRENT_STATEFUL_SEQUENCE"})
+            schedule.write_text(json.dumps(schedule_row))
+            proof.update(input_bindings=artifact_reference(bindings), schedule=artifact_reference(schedule))
+            row["reconstruction"] = proof
+            candidate.write_text(json.dumps(row))
             with self.assertRaisesRegex(ValueError, "current fixed-policy post-route operating clock required"):
                 load_measurement(candidate)
 

@@ -10,7 +10,13 @@ import tempfile
 from pathlib import Path
 
 from application_results import load_measurement, load_potal_collection
-from certified_reconstruction import artifact_reference, reconstructed_row
+from certified_reconstruction import (
+    artifact_reference,
+    consumer_sources,
+    reconstructed_row,
+    service_arguments,
+    verify_official_schedule,
+)
 from eval_common import Json, Record, integer, read_json, require, sha256, write_json
 from scheduled_endpoints import prefill_dispatches, scheduled_application_result
 
@@ -37,7 +43,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--worker-resources", type=Path, help="explicit CPU worker/resource scenario for lifecycle projection")
     parser.add_argument("--cpu-policy", choices=("THREAD_CPU_NS_GANG", "HOST_ELAPSED_NS_GANG"))
     parser.add_argument("--sampler-resource")
-    parser.add_argument("--service-certificate", type=Path, help="current official phase/state service proof")
+    certificates = parser.add_mutually_exclusive_group()
+    certificates.add_argument("--service-certificate", type=Path, help="current official phase/state service proof")
+    certificates.add_argument("--stateful-sequence-certificate", type=Path, help="current typed stateful sequence proof")
+    parser.add_argument("--stateful-evidence-root", type=Path, help="root of hash-bound stateful certificate evidence")
     parser.add_argument("--clock-selection", type=Path, help="validated operating-clock selection")
     parser.add_argument("--profile", help="exact hardware profile shared by service and clock proof")
     parser.add_argument("--potal-result", type=Path, help="native PoTal repetition result and endpoint binding")
@@ -51,7 +60,9 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
                          help="JSON IR and schedule for small diagnostic inputs (64 MiB maximum)")
     parser.set_defaults(streaming_ir=True)
     parser.add_argument("--timeout", type=int, default=600)
-    parser.add_argument("--diagnostic-phase-table", type=Path,
+    diagnostic = parser.add_mutually_exclusive_group()
+    diagnostic.add_argument("--stateful-diagnostic", action="store_true", help="configured test clock only; never target latency")
+    diagnostic.add_argument("--diagnostic-phase-table", type=Path,
                         help="explicit SYNTHETIC_ONLY service table; never final target latency")
     parser.add_argument("--diagnostic-frequency-hz", type=int)
 
@@ -72,9 +83,17 @@ def _reconstruct(args: argparse.Namespace) -> None:
     source = args.im2p.resolve(strict=True)
     require((source / "sim/cycle/npu_trace.py").is_file(), "IM2P official replay entrypoint missing")
     require(args.timeout > 0, "finite positive offline timeout required")
-    require((args.diagnostic_phase_table is None) == (args.diagnostic_frequency_hz is None),
+    stateful = args.stateful_sequence_certificate is not None
+    require(stateful == (args.stateful_evidence_root is not None), "stateful certificate and evidence root required together")
+    require(not stateful or args.diagnostic_phase_table is None, "stateful certificate cannot use a synthetic phase table")
+    require(not args.stateful_diagnostic or (stateful and args.clock_selection is None),
+            "stateful diagnostic requires certificate and configured test clock only")
+    require((args.diagnostic_phase_table is not None or args.stateful_diagnostic) == (args.diagnostic_frequency_hz is not None),
             "diagnostic schedule requires both phase table and explicit frequency")
-    certified = ("service_certificate", "clock_selection", "profile", "potal_result", "timing",
+    require(not stateful or args.stateful_diagnostic,
+            "stateful publication NOT_READY: validated target-host/application admission is unavailable; "
+            "host observations and matching host_id do not prove target-host latency")
+    certified = ("stateful_sequence_certificate" if stateful else "service_certificate", "clock_selection", "profile", "potal_result", "timing",
                  "initial_scratchpad_half", "initial_accumulator_half")
     require(args.diagnostic_phase_table is None or any(getattr(args, name) is None for name in certified),
             "diagnostic phase table cannot participate in certified PoTal publication")
@@ -85,13 +104,13 @@ def _reconstruct(args: argparse.Namespace) -> None:
                    "potal_graph", "potal_provenance", "npu_trace", "library", "cycle_certificate",
                    "run_aware_certificate", "application")
     input_names += ("lifecycle",) if args.lifecycle is not None else ("lifecycle_sidecar", "worker_resources")
-    input_names += tuple(name for name in ("service_certificate", "clock_selection", "potal_result", "timing")
+    input_names += tuple(name for name in ("service_certificate", "stateful_sequence_certificate", "clock_selection", "potal_result", "timing")
                          if getattr(args, name) is not None)
     paths = {name: Path(getattr(args, name)).resolve(strict=True) for name in input_names}
     output = args.output.resolve()
     workload_bytes = sum(path.stat().st_size for name, path in paths.items()
                          if name not in ("library", "cycle_certificate", "run_aware_certificate",
-                                         "service_certificate", "clock_selection", "potal_result", "timing"))
+                                         "service_certificate", "stateful_sequence_certificate", "clock_selection", "potal_result", "timing"))
     required_free = DISK_RESERVE_BYTES + 8 * workload_bytes
     available_free = shutil.disk_usage(output).free
     reason = None
@@ -112,6 +131,11 @@ def _reconstruct(args: argparse.Namespace) -> None:
                               "sampler_resource": args.sampler_resource,
                               "initial_scratchpad_half": args.initial_scratchpad_half,
                               "initial_accumulator_half": args.initial_accumulator_half}
+    if stateful:
+        identities["consumer_sources"] = consumer_sources()
+        identities["stateful_evidence_root"] = {"path": str(args.stateful_evidence_root.resolve(strict=True))}
+        identities["scenario"].update(stateful_diagnostic=args.stateful_diagnostic,
+                                      diagnostic_frequency_hz=args.diagnostic_frequency_hz)
     write_json(output / "input-bindings.json", identities)
 
     def stage(name: str, arguments: list[str]) -> None:
@@ -170,18 +194,12 @@ def _reconstruct(args: argparse.Namespace) -> None:
         try:
             frequency = integer(read_json(paths["clock_selection"]), "selected_frequency_hz", 1)
             schedule = output / ("reconstructed-schedule.sqlite" if args.streaming_ir else "reconstructed-schedule.json")
-            stage("certified-schedule", ["sim.cycle.execution_cli", "schedule", "--bundle", str(bundle),
-                  "--cycle-library", str(paths["library"]), "--npu-trace", str(paths["npu_trace"]),
-                  "--timing", str(paths["timing"]), "--initial-scratchpad-half", str(args.initial_scratchpad_half),
-                  "--initial-accumulator-half", str(args.initial_accumulator_half),
-                  "--service-certificate", str(paths["service_certificate"]),
-                  "--cycle-certificate", str(paths["cycle_certificate"]),
-                  "--run-aware-certificate", str(paths["run_aware_certificate"]),
-                  "--clock-selection", str(paths["clock_selection"]), "--profile", args.profile,
+            stage("certified-schedule", ["sim.cycle.execution_cli", "schedule", "--bundle", str(bundle), *service_arguments(identities),
                   "--frequency-hz", str(frequency), "--output", str(schedule)])
+            verified = verify_official_schedule({"schedule": schedule, "bundle": bundle}, identities, source) if stateful else None
             source_row = load_potal_collection(paths["potal_result"], paths["application"],
                                                paths["potal_provenance"], join_summary)
-            metrics = scheduled_application_result(schedule, prefill_dispatches(read_json(lifecycle_path)))
+            metrics = scheduled_application_result(schedule, prefill_dispatches(read_json(lifecycle_path)), verified)
             proof: Record = {"schema": "potal-e2e-reconstruction-proof", "version": 1,
                              "input_bindings": artifact_reference(output / "input-bindings.json"),
                              "schedule": artifact_reference(schedule), "bundle": artifact_reference(bundle),
@@ -205,6 +223,12 @@ def _reconstruct(args: argparse.Namespace) -> None:
               "--phase-table", str(args.diagnostic_phase_table.resolve(strict=True)), "--frequency-hz",
               str(args.diagnostic_frequency_hz), "--synthetic", "--output", str(schedule)])
         schedule_status = "SYNTHETIC_ONLY"
+    if args.stateful_diagnostic:
+        schedule = output / ("stateful-diagnostic-schedule.sqlite" if args.streaming_ir else "stateful-diagnostic-schedule.json")
+        stage("stateful-diagnostic-schedule", ["sim.cycle.execution_cli", "schedule", "--bundle", str(bundle),
+              *service_arguments(identities), "--output", str(schedule)])
+        verify_official_schedule({"schedule": schedule, "bundle": bundle}, identities, source)
+        schedule_status = "STATEFUL_DIAGNOSTIC"
     require(all(sha256(path) == hashes[name]
                 for name, path in paths.items()), "offline source inputs changed")
     if reconstructed is not None:

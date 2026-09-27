@@ -176,6 +176,54 @@ inputs before replay. Both modes preflight free space for a 256 MiB reserve plus
 eight times the workload input bytes. A timeout or failed command records its
 boundary in `failure.json` and does not publish a normal `result.json`.
 
+### Stateful session options and current boundary
+
+The actual `end_to_end.py reconstruct --help` surface exposes
+`--stateful-sequence-certificate` as mutually exclusive with
+`--service-certificate`, plus `--stateful-evidence-root` and
+`--stateful-diagnostic`. Certificate and evidence root are required together.
+Stateful diagnostic mode also requires `--diagnostic-frequency-hz`, forbids
+`--clock-selection`, and is a configured test-clock schedule only. The existing
+`--cycle-certificate`, `--run-aware-certificate`, `--timing`, `--profile`,
+`--initial-scratchpad-half`, and `--initial-accumulator-half` inputs remain
+required by the underlying stateful provider. There is no `--all-profiles` or
+implicit stateful fallback option.
+
+The lower-level `execution_cli schedule` and `verify-schedule` surfaces use the
+same `--stateful-sequence-certificate`, `--stateful-evidence-root`, and
+`--stateful-diagnostic` options. They open one native session for the ordered
+trace, preserve request-availability, electrical-offer, accepted, result-ready,
+final-scale-release, and resource-ready epochs, and reject changed work/source
+bindings. Verification starts a fresh provider/session and recomputes JSON or
+SQLite results. SQLite remains the official wrapper default; `--json-ir` is the
+explicit small/debug path.
+
+Production stateful admission is typed and source-bound; a scope string or an
+exact-v2 drained certificate is insufficient. The official wrapper currently
+rejects stateful target result publication because validated
+target-host/application admission is unavailable. `--stateful-diagnostic`
+therefore produces only `STATEFUL_DIAGNOSTIC` schedule evidence and never
+TTFT/TPOT. Current NPU parent certificates do not replace target-host evidence.
+
+Current evidence is intentionally narrower: the actual GPT-2 run validated 3
+works from a 16-work subset. Work 3 reached tag peak 5, above the reviewed limit
+4, while row peak was 4. The first cold 374-work attempt also stopped after
+3 validated works at that boundary, without publishing a result; the second
+full attempt is `NOT_RUN`. The latest
+exploratory RTL attempt reached the unchanged 128 MiB queue-edge limit and
+produced no parity verdict. None of these observations authorizes a wider
+stateful domain or a completion marker.
+
+The separate diagnostic `sim.cycle.sequence_trace_cli watchdog` treats atomic
+publication of a validated `result.json` as its completion boundary. A fresh
+verifier checks `pending-result.json`; the publisher checks its inode, digest,
+and deadline before hard-linking it to the final name. The pending file remains
+available as evidence. Receipt emission or cleanup failures after publication
+are reported separately and do not revoke the published result. A receipt
+write failure is reported as JSON on stderr. Failures before atomic publication
+still leave the run incomplete; this contract does not authorize the official
+wrapper to publish production latency.
+
 The current IM2P drained v1 certificate covers fixed two-work RTL fixtures only;
 it yields `DRAINED_FIXTURE_PARITY`, not production sequence admission. Supplying
 that certificate as `--service-certificate` still fails closed until a

@@ -88,16 +88,19 @@ int main(int argc, char **argv) {
         const std::string mode = fail_publication ? requested.substr(13)
             : inject_log_failure ? requested.substr(5) : requested;
         require(mode == "full" || mode == "pipeline" || mode == "exsia-pipeline" ||
-                mode == "exsia-rmd-pipeline" || mode == "residual" ||
+                mode == "exsia-rmd-pipeline" || mode == "exsia-rmd-cross-parent" ||
+                mode == "residual" ||
                 mode == "residual-runs" ||
                 mode == "large-k", "invalid mode");
 #if LOG_CYCLE
         require(ggml::gemmini::log::cycle.set_output_path("log/cycle-log.jsonl"),
                 "existing CPU cycle-log path");
 #endif
-        const bool exsia_pipeline = mode == "exsia-pipeline" || mode == "exsia-rmd-pipeline";
-        Fixture fixture(exsia_pipeline ? 161 : mode == "pipeline" ? 129 : 1,
-                        exsia_pipeline ? 161 : mode == "pipeline" ? 129 : 3,
+        const bool cross_parent = mode == "exsia-rmd-cross-parent";
+        const bool rmd_pipeline = mode == "exsia-rmd-pipeline" || cross_parent;
+        const bool exsia_pipeline = mode == "exsia-pipeline" || rmd_pipeline;
+        Fixture fixture(cross_parent ? 321 : exsia_pipeline ? 161 : mode == "pipeline" ? 129 : 1,
+                        cross_parent ? 321 : exsia_pipeline ? 161 : mode == "pipeline" ? 129 : 3,
                         (mode == "pipeline" || exsia_pipeline) ? 96 : mode == "large-k" ? 3072 :
                         mode == "residual-runs" ? 128 : 32);
         namespace cycle = ggml::gemmini::cycle_sim;
@@ -152,6 +155,7 @@ int main(int argc, char **argv) {
         operation.target_eligible = true;
         operation.semantic_context = semantic::context_for(node);
         fixture.args.cycle_sim_context = session->register_operation(node, operation, phase);
+        const auto first_context = fixture.args.cycle_sim_context;
         cycle::ScopedContext scoped_context(fixture.args.cycle_sim_context);
         im2p::cpu_functional::set_dispatch_observer(observe, nullptr);
         if (fail_publication && mode == "full") {
@@ -221,7 +225,7 @@ int main(int argc, char **argv) {
             auto &producer_meta = fixture.args.act_quant.storage().emplace<
                 ggml::gemmini::quants::act::exsia::Meta>();
             std::vector<float> input(fixture.args.I * fixture.args.K, 1.0f);
-            if (mode == "exsia-rmd-pipeline") {
+            if (rmd_pipeline) {
                 for (size_t row = 0; row < fixture.args.activation_rows_per_stripe; ++row) {
                     input[row * fixture.args.K] = 256.0f;
                     input[row * fixture.args.K + 1] = 8.0f;
@@ -231,23 +235,46 @@ int main(int argc, char **argv) {
             ggml_tensor activation_tensor{};
             activation_tensor.type = GGML_TYPE_F32;
             activation_tensor.data = input.data();
-            auto started = ggml::gemmini::im2p_adapter::start_exsia_stripe_pipeline(fixture.args);
-            require(started.result.ok() && started.pipeline &&
-                    started.pipeline->install_sink().ok(), "ExSIA pipeline start");
-            ggml::gemmini::quants::act::exsia::ExSIA exsia;
-            exsia.set_execution_mode(ggml::gemmini::quants::act::exsia::ExSIAState::ExecutionMode::Sequential);
-            const bool quantized = exsia.run(producer_meta, &activation_tensor, fixture.args,
-                                            fixture.args.exsia_stripe_ready_sink);
-            const auto result = started.pipeline->finish(quantized);
-            require(result.result.ok(), result.result.message);
-            require(std::all_of(fixture.output.begin(), fixture.output.end(),
-                [&, column = size_t{0}](float value) mutable {
-                    const size_t row = column++ / fixture.args.J;
-                    return mode == "exsia-rmd-pipeline" &&
-                        row < fixture.args.activation_rows_per_stripe
-                        ? value > 0.0f && value != -1.0f
-                        : value == float(fixture.args.K);
-                }), "ExSIA numerical publication");
+            const auto execute_exsia = [&](auto &meta) {
+                auto started = ggml::gemmini::im2p_adapter::start_exsia_stripe_pipeline(fixture.args);
+                require(started.result.ok(), started.result.message);
+                require(started.pipeline && started.pipeline->install_sink().ok(),
+                        "ExSIA pipeline sink install");
+                ggml::gemmini::quants::act::exsia::ExSIA exsia;
+                exsia.set_execution_mode(ggml::gemmini::quants::act::exsia::ExSIAState::ExecutionMode::Sequential);
+                const bool quantized = exsia.run(meta, &activation_tensor, fixture.args,
+                                                fixture.args.exsia_stripe_ready_sink);
+                const auto result = started.pipeline->finish(quantized);
+                require(result.result.ok(), result.result.message);
+                require(std::all_of(fixture.output.begin(), fixture.output.end(),
+                    [&, column = size_t{0}](float value) mutable {
+                        const size_t row = column++ / fixture.args.J;
+                        return rmd_pipeline && row < fixture.args.activation_rows_per_stripe
+                            ? value > 0.0f && value != -1.0f
+                            : value == float(fixture.args.K);
+                    }), "ExSIA numerical publication");
+            };
+            execute_exsia(producer_meta);
+            if (cross_parent) {
+                const auto first_output = fixture.output;
+                metadata->execution(node, "Gemmini", "TARGET_NPU", true);
+                session->finish_operation(first_context);
+                semantic::capture_graph(graph);
+                operation.semantic_context = semantic::context_for(node);
+                fixture.args.cycle_sim_context = session->register_operation(node, operation, phase);
+                cycle::ScopedContext second_context(fixture.args.cycle_sim_context);
+                // Host-stage IDs from the fenced parent cannot belong to this operation.
+                fixture.args.cycle_sim_host_dependencies.clear();
+                std::fill(fixture.output.begin(), fixture.output.end(), -1.0f);
+                for (size_t row = 0; row < fixture.args.activation_rows_per_stripe; ++row)
+                    input[row * fixture.args.K] = 512.0f;
+                auto &second_meta = fixture.args.act_quant.storage().emplace<
+                    ggml::gemmini::quants::act::exsia::Meta>();
+                execute_exsia(second_meta);
+                require(fixture.output != first_output, "second ExSIA parent reused first numerical result");
+                metadata->execution(node, "Gemmini", "TARGET_NPU", true);
+                session->finish_operation(fixture.args.cycle_sim_context);
+            }
         } else {
             const auto result = mode == "pipeline"
                 ? ggml::gemmini::im2p_adapter::run_stripe_pipeline(fixture.args)
@@ -263,18 +290,25 @@ int main(int argc, char **argv) {
         }
         im2p::cpu_functional::set_dispatch_observer(nullptr, nullptr);
         im2p::gemmini::cycle_sim::set_publication_observer(nullptr, nullptr);
-        const auto expected_count = mode == "pipeline" || exsia_pipeline
+        const auto expected_count_per_parent = mode == "pipeline" || exsia_pipeline
             ? (fixture.args.I + fixture.args.activation_rows_per_stripe - 1) /
                 fixture.args.activation_rows_per_stripe : 1;
+        const auto expected_count = expected_count_per_parent * (cross_parent ? 2 : 1);
         const auto dense_observation_count = std::count_if(observations.begin(), observations.end(),
             [](const auto &observation) {
                 return observation.geometry.scope == IM2P_GEOMETRY_STRIPE;
             });
         require(!observation_failed &&
-                (mode == "exsia-rmd-pipeline"
+                (rmd_pipeline
                     ? dense_observation_count == expected_count && observations.size() > expected_count
                     : observations.size() == expected_count),
                 "independent descriptor observer count");
+        if (cross_parent)
+            require(std::any_of(observed_runs.begin(), observed_runs.end(), [](const auto &runs) {
+                        return runs.size() >= 2 && runs[0].original_block_id == 0 &&
+                            runs[1].original_block_id == 1 && runs[0].compact_k_count > 0 &&
+                            runs[1].compact_k_count > 0;
+                    }), "cross-parent producer lost two-run residual");
         if ((mode == "residual" || mode == "residual-runs") &&
             !inject_log_failure && !fail_publication)
             require(observed_runs.size() == 1 &&
@@ -300,26 +334,35 @@ int main(int argc, char **argv) {
             return 0;
         }
         session->ensure_healthy();
-        session->finish_operation(fixture.args.cycle_sim_context);
+        if (!cross_parent) session->finish_operation(fixture.args.cycle_sim_context);
         session->finish();
         if (mode == "pipeline" || exsia_pipeline) {
             const auto parents = session->producer_parents();
-            require(parents.size() == 1 && parents[0].geometry.scope == IM2P_GEOMETRY_STREAM &&
-                    parents[0].geometry.m == fixture.args.I &&
-                    parents[0].work_ids == parents[0].fence_required_work_ids &&
-                    parents[0].work_ids.size() >= expected_count,
-                    "pipeline parent final geometry and fence work set");
-            if (mode == "exsia-rmd-pipeline") {
-                require(!parents[0].residual_bindings.empty(), "run-aware residual child work missing");
-                for (const auto &binding : parents[0].residual_bindings)
-                    require(binding.dense_parent_id == parents[0].parent_id &&
-                            binding.child_parent_id != binding.dense_parent_id &&
-                            binding.stripe_id < expected_count &&
-                            binding.row_begin < binding.row_end &&
-                            std::find(parents[0].work_ids.begin(), parents[0].work_ids.end(),
-                                      binding.work_id) != parents[0].work_ids.end(),
-                            "residual work lacks exact dense stripe and fence binding");
+            require(parents.size() == (cross_parent ? 2u : 1u), "pipeline parent count");
+            for (const auto &parent : parents) {
+                require(parent.geometry.scope == IM2P_GEOMETRY_STREAM &&
+                        parent.geometry.m == fixture.args.I &&
+                        parent.work_ids == parent.fence_required_work_ids &&
+                        parent.work_ids.size() >= expected_count_per_parent,
+                        "pipeline parent final geometry and fence work set");
+                if (rmd_pipeline) {
+                    require(!parent.residual_bindings.empty(), "run-aware residual child work missing");
+                    for (const auto &binding : parent.residual_bindings)
+                        require(binding.dense_parent_id == parent.parent_id &&
+                                binding.child_parent_id != binding.dense_parent_id &&
+                                binding.stripe_id < expected_count_per_parent &&
+                                binding.row_begin < binding.row_end &&
+                                std::find(parent.work_ids.begin(), parent.work_ids.end(),
+                                          binding.work_id) != parent.work_ids.end(),
+                                "residual work lacks exact dense stripe and fence binding");
+                }
             }
+            if (cross_parent)
+                require(parents[0].operation_id != parents[1].operation_id &&
+                        parents[0].parent_id != parents[1].parent_id &&
+                        parents[0].fence_call_id < parents[1].fence_call_id &&
+                        parents[0].work_ids.back() < parents[1].work_ids.front(),
+                        "cross-parent work/fence identities are not ordered and distinct");
             const auto ownership = session->producer_events();
             const auto count = [&](cycle::ProducerEventKind kind) {
                 return std::count_if(ownership.begin(), ownership.end(), [&](const auto &event) {
@@ -340,33 +383,43 @@ int main(int argc, char **argv) {
                         count(cycle::ProducerEventKind::ExsiaWorkspaceRelease) == expected_count &&
                         count(cycle::ProducerEventKind::ResidualCallbackCompleted) == expected_count,
                         "ExSIA producer workspace and residual ownership transitions");
-            if (mode == "exsia-rmd-pipeline") {
-                const auto released = std::find_if(ownership.begin(), ownership.end(), [](const auto &event) {
-                    return event.event.kind == cycle::ProducerEventKind::FrontendCapacityRelease &&
-                        event.event.stripe_id == 0;
-                });
-                require(released != ownership.end() && released->event.rmd_packet &&
-                        released->required_work_ids.size() > 1 &&
-                        released->required_call_ids.size() == 1 &&
-                        count(cycle::ProducerEventKind::ResidualHostMergeCompleted) > 0,
-                        "residual capacity release requires actual compact work and merge call");
+            if (rmd_pipeline) {
+                for (const auto &parent : parents) {
+                    const auto released = std::find_if(ownership.begin(), ownership.end(), [&](const auto &event) {
+                        return event.operation_id == parent.operation_id &&
+                            event.event.kind == cycle::ProducerEventKind::FrontendCapacityRelease &&
+                            event.event.stripe_id == 0;
+                    });
+                    require(released != ownership.end() && released->event.rmd_packet &&
+                            released->required_work_ids.size() > 1 &&
+                            released->required_call_ids.size() == 1,
+                            "residual capacity release requires actual compact work and merge call");
+                }
+                require(count(cycle::ProducerEventKind::ResidualHostMergeCompleted) >= parents.size(),
+                        "residual merge call missing");
             }
             if (expected_count >= 3 && exsia_pipeline) {
-                const auto first_release = std::find_if(ownership.begin(), ownership.end(), [](const auto &event) {
-                    return event.event.kind == cycle::ProducerEventKind::ExsiaWorkspaceRelease &&
-                        event.event.stripe_id == 0;
-                });
-                const auto third_acquire = std::find_if(ownership.begin(), ownership.end(), [](const auto &event) {
-                    return event.event.kind == cycle::ProducerEventKind::ExsiaWorkspaceAcquire &&
-                        event.event.stripe_id == 2;
-                });
-                require(first_release != ownership.end() && third_acquire != ownership.end() &&
-                        first_release->sequence < third_acquire->sequence &&
-                        first_release->event.workspace_slot == third_acquire->event.workspace_slot,
-                        "ExSIA scratch slot zero reused only after source release");
+                for (const auto &parent : parents) {
+                    const auto first_release = std::find_if(ownership.begin(), ownership.end(), [&](const auto &event) {
+                        return event.operation_id == parent.operation_id &&
+                            event.event.kind == cycle::ProducerEventKind::ExsiaWorkspaceRelease &&
+                            event.event.stripe_id == 0;
+                    });
+                    const auto third_acquire = std::find_if(ownership.begin(), ownership.end(), [&](const auto &event) {
+                        return event.operation_id == parent.operation_id &&
+                            event.event.kind == cycle::ProducerEventKind::ExsiaWorkspaceAcquire &&
+                            event.event.stripe_id == 2;
+                    });
+                    require(first_release != ownership.end() && third_acquire != ownership.end() &&
+                            first_release->sequence < third_acquire->sequence &&
+                            first_release->event.workspace_slot == third_acquire->event.workspace_slot,
+                            "ExSIA scratch slot zero reused only after source release");
+                }
             }
             for (const auto &event : ownership) {
-                require(event.operation_id == fixture.args.cycle_sim_context.operation_id &&
+                require(std::any_of(parents.begin(), parents.end(), [&](const auto &parent) {
+                            return event.operation_id == parent.operation_id;
+                        }) &&
                         event.parent_id.has_value() && event.work_id.has_value() &&
                         event.event.workspace_slot == event.event.stripe_id % 2 &&
                         event.event.row_begin < event.event.row_end &&
@@ -374,7 +427,9 @@ int main(int argc, char **argv) {
                         "pipeline producer identity/source binding");
             }
         }
-        metadata->execution(node, "Gemmini", "TARGET_NPU", true);
+        if (!cross_parent) metadata->execution(node, "Gemmini", "TARGET_NPU", true);
+        if (cross_parent)
+            require(metadata->completed_graph_count() == 2, "cross-parent semantic graph count");
         if (exsia_pipeline) {
             evaluation_lifecycle lifecycle("potal_collection", source_commit, 1,
                                            false, true);
