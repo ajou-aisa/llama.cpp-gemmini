@@ -23,25 +23,27 @@ TARGETS: Final = ["llama-eval-workload", "test-evaluation-workload", "test-evalu
                  "test-gemmini-cycle-sim-log", "test-cycle-sim-coverage"]
 
 
-def command(argv: list[str], directory: Path, name: str, timeout: int = 1800) -> None:
+def command(argv: list[str], directory: Path, name: str, timeout: int = 1800, cwd: Path = REPO) -> None:
     """Run one bounded command, retaining its exact argv, output and exit status."""
     with (directory / (name + ".log")).open("x", encoding="utf-8") as log:
         try:
-            result = subprocess.run(argv, cwd=REPO, stdout=log, stderr=subprocess.STDOUT,
+            result = subprocess.run(argv, cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
                                     timeout=timeout, check=False)
         except subprocess.TimeoutExpired:
             write_json(directory / (name + ".json"), {"argv": list(argv), "exit_code": None,
                        "status": "TIMEOUT", "timeout_seconds": timeout})
             raise
-    write_json(directory / (name + ".json"), {"argv": list(argv), "cwd": str(REPO),
+    write_json(directory / (name + ".json"), {"argv": list(argv), "cwd": str(cwd),
                "exit_code": result.returncode})
     require(result.returncode == 0, "command failed: " + str(directory / (name + ".log")))
 
 
-def build(kind: str, precision: str, dim: int, output: Path, im2p: Path, jobs: int) -> Path:
+def build(kind: str, precision: str, dim: int, output: Path, im2p: Path, jobs: int,
+          matmul_mode: str = "FULL") -> Path:
     """Configure, compile and verify a new directory; never reuse a user's build cache."""
     require(kind in ("cycle", "activation", "residual", "scu"), "invalid measurement kind")
-    require(precision in ("a4w4", "a8w8") and dim in (16, 32, 64) and jobs > 0,
+    require(precision in ("a4w4", "a8w8") and dim in (16, 32, 64) and jobs > 0 and
+            matmul_mode in ("FULL", "STRIPE_PIPELINE") and (kind == "cycle" or matmul_mode == "FULL"),
             "invalid measurement build profile")
     output.mkdir(parents=True, exist_ok=False)
     producer_head = subprocess.check_output(["git", "-C", str(REPO), "rev-parse", "HEAD"], text=True).strip()
@@ -60,7 +62,7 @@ def build(kind: str, precision: str, dim: int, output: Path, im2p: Path, jobs: i
         "IM2P_SIM_ROOT": str(im2p), "GGML_GEMMINI_OPTION": "WS",
         "GGML_GEMMINI_ACTIVATION_QUANT": "EXSIA", "GGML_GEMMINI_BLOCK_SIZE": "32",
         "GGML_GEMMINI_ACTIVATION_BITS": str(bits), "GGML_GEMMINI_WEIGHT_BITS": str(bits),
-        "GGML_GEMMINI_DIM": str(dim), "GGML_GEMMINI_DEFAULT_MATMUL_MODE": "FULL",
+        "GGML_GEMMINI_DIM": str(dim), "GGML_GEMMINI_DEFAULT_MATMUL_MODE": matmul_mode,
         "GGML_GEMMINI_DEFAULT_RMD_BACKEND": "WS", "GGML_GEMMINI_ENABLE_RMD": "ON",
         "GGML_GEMMINI_ALLOW_RUNTIME_MATMUL_OVERRIDE": "OFF",
         "GGML_GEMMINI_ACT_METRICS": str(int(kind == "activation")),
@@ -82,8 +84,8 @@ def build(kind: str, precision: str, dim: int, output: Path, im2p: Path, jobs: i
     require(tuple(info.get(key) for key in ("activation_metrics", "residual_metrics", "scale_metrics"))
             == expected, "compiled collectors are not independent")
     require(info.get("dim") == dim and info.get("activation_bits") == bits and
-            info.get("weight_bits") == bits and info.get("cycle_sim") == 1,
-            "compiled build profile differs from request")
+            info.get("weight_bits") == bits and info.get("cycle_sim") == 1 and
+            info.get("matmul_mode") == matmul_mode, "compiled build profile differs from request")
     write_json(output / "build-info.json", info)
     write_json(output / "artifacts.json", artifact_snapshot(runner))
     write_json(output / "build-receipt.json", {"kind": kind, "options": dict(options),
