@@ -41,9 +41,12 @@ def command(argv: list[str], directory: Path, name: str, timeout: int = 1800, cw
 def build(kind: str, precision: str, dim: int, output: Path, im2p: Path, jobs: int,
           matmul_mode: str = "FULL") -> Path:
     """Configure, compile and verify a new directory; never reuse a user's build cache."""
-    require(kind in ("cycle", "activation", "residual", "scu"), "invalid measurement kind")
+    require(kind in ("cycle", "activation", "residual", "scu", "potal-host", "potal-host-nocpulog",
+                     "fullcpu-host"),
+            "invalid measurement kind")
     require(precision in ("a4w4", "a8w8") and dim in (16, 32, 64) and jobs > 0 and
-            matmul_mode in ("FULL", "STRIPE_PIPELINE") and (kind == "cycle" or matmul_mode == "FULL"),
+            matmul_mode in ("FULL", "STRIPE_PIPELINE") and
+            (kind in ("cycle", "potal-host", "potal-host-nocpulog") or matmul_mode == "FULL"),
             "invalid measurement build profile")
     output.mkdir(parents=True, exist_ok=False)
     producer_head = subprocess.check_output(["git", "-C", str(REPO), "rev-parse", "HEAD"], text=True).strip()
@@ -70,22 +73,44 @@ def build(kind: str, precision: str, dim: int, output: Path, im2p: Path, jobs: i
         "GGML_GEMMINI_RESIDUAL_METRICS": str(int(kind == "residual")),
         "GGML_GEMMINI_SCALE_METRICS": str(int(kind == "scu")),
     }
-    command(["cmake", "-S", str(REPO), "-B", str(output),
+    if kind.startswith("potal-host"):
+        options.update({"LOG_CYCLE": "1",
+                        "GGML_CPU_CYCLE_LOG": "OFF" if kind == "potal-host-nocpulog" else "ON"})
+    targets = list(TARGETS)
+    verify_filter = ("^(test-evaluation-(workload|trace|build-options|metric-framework)|"
+                     "test-gemmini-(evaluation-metrics|cycle-sim-log)|"
+                     "test-cycle-sim-(reader|coverage|build-contract))$")
+    if kind == "fullcpu-host":
+        for key in [name for name in options if name.startswith("IM2P_SIM")]:
+            del options[key]
+        options.update({"GGML_GEMMINI_OPTION": "CPU", "GGML_GEMMINI_EXECUTION_BACKEND": "HARDWARE",
+                        "GGML_GEMMINI_DEFAULT_RMD_BACKEND": "CPU", "CYCLE_SIM": "0",
+                        "LOG_CYCLE": "1", "GGML_CPU_CYCLE_LOG": "ON"})
+        targets = ["llama-eval-workload", "test-evaluation-workload", "test-evaluation-trace"]
+        verify_filter = "^test-evaluation-(workload|trace|build-options)$"
+    generator = ["-G", "Ninja"] if kind.startswith(("potal-host", "fullcpu-host")) else []
+    command(["cmake", "-S", str(REPO), "-B", str(output), *generator,
              *(f"-D{key}={value}" for key, value in options.items())], output, "configure")
-    command(["cmake", "--build", str(output), "--parallel", str(jobs), "--target", *TARGETS],
+    command(["cmake", "--build", str(output), "--parallel", str(jobs), "--target", *targets],
             output, "build")
-    command(["ctest", "--test-dir", str(output), "--output-on-failure", "-R",
-             ("^(test-evaluation-(workload|trace|build-options|metric-framework)|"
-             "test-gemmini-(evaluation-metrics|cycle-sim-log)|"
-             "test-cycle-sim-(reader|coverage|build-contract))$")], output, "verify")
+    command(["ctest", "--test-dir", str(output), "--output-on-failure", "-R", verify_filter],
+            output, "verify")
     runner = output / "bin/llama-eval-workload"
     info = compiled_info(runner)
     expected = (int(kind == "activation"), int(kind == "residual"), int(kind == "scu"))
     require(tuple(info.get(key) for key in ("activation_metrics", "residual_metrics", "scale_metrics"))
             == expected, "compiled collectors are not independent")
-    require(info.get("dim") == dim and info.get("activation_bits") == bits and
-            info.get("weight_bits") == bits and info.get("cycle_sim") == 1 and
-            info.get("matmul_mode") == matmul_mode, "compiled build profile differs from request")
+    if kind == "fullcpu-host":
+        require(info.get("cpu_only") is True and info.get("cycle_sim") == 0 and
+                info.get("log_cycle") == 1 and info.get("ggml_cpu_cycle_log") == 1,
+                "FullCPU host-timing build profile differs from request")
+    else:
+        require(info.get("dim") == dim and info.get("activation_bits") == bits and
+                info.get("weight_bits") == bits and info.get("cycle_sim") == 1 and
+                info.get("matmul_mode") == matmul_mode, "compiled build profile differs from request")
+        require(not kind.startswith("potal-host") or (info.get("log_cycle") == 1 and
+                info.get("ggml_cpu_cycle_log") == int(kind == "potal-host")),
+                "PoTal host-timing build requires LOG_CYCLE=1 and the requested CPU cycle instrumentation")
     write_json(output / "build-info.json", info)
     write_json(output / "artifacts.json", artifact_snapshot(runner))
     write_json(output / "build-receipt.json", {"kind": kind, "options": dict(options),
@@ -114,14 +139,17 @@ def snapshot(output: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--kind", choices=("cycle", "activation", "residual", "scu"), required=True)
+    parser.add_argument("--kind", choices=("cycle", "activation", "residual", "scu", "potal-host",
+                                           "potal-host-nocpulog", "fullcpu-host"), required=True)
+    parser.add_argument("--matmul-mode", choices=("FULL", "STRIPE_PIPELINE"), default="FULL")
     parser.add_argument("--precision", choices=("a4w4", "a8w8"), required=True)
     parser.add_argument("--dim", type=int, choices=(16, 32, 64), required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--im2p", type=Path, default=REPO.parent / "IM2P.sim")
     parser.add_argument("--jobs", type=int, default=4)
     args = parser.parse_args()
-    runner = build(args.kind, args.precision, args.dim, args.output.resolve(), args.im2p.resolve(), args.jobs)
+    runner = build(args.kind, args.precision, args.dim, args.output.resolve(), args.im2p.resolve(),
+                   args.jobs, args.matmul_mode)
     print(json.dumps({"runner": str(runner), "sha256": sha256(runner)}))
     return 0
 

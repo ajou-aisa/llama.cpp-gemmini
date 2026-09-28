@@ -36,6 +36,7 @@ TOTAL_KEYS: Final = ("dense_cycles", "residual_cycles", "scu_cycles", "load_cycl
                      "scale_cycles", "scu_active_cycles", "scu_idle_cycles", "scu_window_cycles",
                      "scale_request_count", "scale_response_count", "scale_lane_count", "scale_release_count",
                      "service_cycles", "resource_ready_cycles", "total_cycles")
+EVALUATION_PARENT_SCHEMAS: Final = ("stateful-full374-replay-v1", "im2p-actual-trace-certificate-v1")
 WINDOW_KEYS: Final = ("offered_cycle", "accepted_cycle", "result_ready_cycle", "final_scale_release_cycle",
                       "resource_ready_cycle")
 COUNTER_PAIRS: Final = (("scale_request_count", "scale_request_count"),
@@ -61,6 +62,27 @@ def reference_windows(path: Path) -> dict[int, Record]:
     return {integer(row, "work_id"): {key: row[key] for key in WINDOW_KEYS} for row in records(path)}
 
 
+def replay_windows(report: Path) -> dict[int, Record]:
+    document = read_json(report)
+    bound = record(document["records"])
+    path = Path(text(bound, "path"))
+    require(document.get("status") == "PASS" and sha256(path) == bound.get("sha256"),
+            "native replay reference is not a complete unchanged replay")
+    return {integer(row, "work_id"): {key: record(row["window"])[key] for key in WINDOW_KEYS} for row in records(path)}
+
+
+def cycle_manifest(trace: Path, document: Record, evaluation: bool) -> Record | None:
+    path = trace.parent / "cycle_manifest.json"
+    if not path.is_file():
+        require(not evaluation, "--evaluation requires cycle_manifest.json beside the trace")
+        return None
+    value = read_json(path)
+    require(value.get("trace_sha256") == sha256(trace) and value.get("producer_sha256") == document["producer_sha256"]
+            and all(value.get(key) == document[key] for key in ("model", "precision", "dim", "BK")),
+            "cycle manifest differs from trace or certificate")
+    return {"path": str(path), "sha256": sha256(path)}
+
+
 def run(args: argparse.Namespace) -> Path:
     im2p = args.im2p.resolve(strict=True)
     sys.path.insert(0, str(im2p))
@@ -82,17 +104,25 @@ def run(args: argparse.Namespace) -> Path:
             all(manifest.get(key) == document[key] for key in ("model", "precision", "dim", "BK")),
             "certificate-bound evaluation manifest changed")
     certificate_sha = sha256(certificate)
+    parent_schema = record(document["parent_certificate"]).get("schema")
+    require(not args.evaluation or parent_schema in EVALUATION_PARENT_SCHEMAS,
+            "synthetic producer certificates are regression-only; evaluation cycles need an actual-inference parent")
+    bound_cycle_manifest = cycle_manifest(trace, document, args.evaluation)
     write_json(output / "certificate-verification.json", {
         "status": "VERIFIED", "certificate": {"path": str(certificate), "sha256": certificate_sha},
         "state_domain_revision": document["state_domain_revision"], "equivalence": document["equivalence"],
-        "parent_certificate": document["parent_certificate"], "manifest_sha256": manifest_sha})
+        "parent_certificate": document["parent_certificate"], "manifest_sha256": manifest_sha,
+        "cycle_manifest": bound_cycle_manifest, "actual_inference_parent": parent_schema in EVALUATION_PARENT_SCHEMAS})
     context = context_from(record(document["evidence_context"]))
     library = context.shared_library
     identity: Record = {"model": document["model"], "precision": document["precision"], "dim": document["dim"],
                         "BK": document["BK"], "trace_sha256": sha256(trace), "certificate_sha256": certificate_sha,
                         "manifest_sha256": manifest_sha, "unit": "cycles", "cycle_count_is_not_latency_ms": True}
     metadata = trace_works(trace)
-    reference = reference_windows(args.reference_per_work.resolve(strict=True)) if args.reference_per_work else None
+    require(args.reference_per_work is None or args.reference_replay is None, "choose one window reference")
+    reference_path = args.reference_replay or args.reference_per_work
+    reference = (None if reference_path is None else replay_windows(reference_path.resolve(strict=True))
+                 if args.reference_replay is not None else reference_windows(reference_path.resolve(strict=True)))
     accounting = EventAccounting.for_library(library)
     totals: Record = {key: 0 for key in TOTAL_KEYS}
     works: list[Record] = []
@@ -142,8 +172,9 @@ def run(args: argparse.Namespace) -> Path:
             "SCU active/idle accounting does not conserve its windows")
     peaks: Record = {"tag_peak": max(integer(row, "tag_peak") for row in works),
                      "row_peak": max(integer(row, "row_peak") for row in works)}
-    parity: Record = {"reference": None if args.reference_per_work is None else
-                      {"path": str(args.reference_per_work.resolve()), "sha256": sha256(args.reference_per_work.resolve())},
+    parity: Record = {"reference": None if reference_path is None else
+                      {"path": str(reference_path.resolve()), "sha256": sha256(reference_path.resolve()),
+                       "kind": "native_replay_records" if args.reference_replay is not None else "per_work_cycle"},
                       "compared_fields": [key for key in WINDOW_KEYS], "works": len(works),
                       "mismatched_work_ids": mismatches,
                       "status": "NOT_RUN" if reference is None else "EXACT" if not mismatches and
@@ -164,6 +195,8 @@ def run(args: argparse.Namespace) -> Path:
         "work_count": len(works), "final_resource_cursor": final_cursor,
         "cycle_library": {"path": str(library), "sha256": sha256(library)},
         "workload_policy": "CERTIFIED_CYCLE_PREFILL_256_PLUS_1 (see producer-manifest.json)",
+        "cycle_manifest": bound_cycle_manifest, "certificate_parent_schema": parent_schema,
+        "actual_inference_parent": parent_schema in EVALUATION_PARENT_SCHEMAS,
         "totals": {key: totals[key] for key in ("dense_cycles", "residual_cycles", "scu_cycles", "load_cycles",
                                                 "store_cycles", "scale_cycles", "service_cycles",
                                                 "resource_ready_cycles")},
@@ -184,6 +217,10 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--reference-per-work", type=Path,
                         help="earlier per-work-cycle.jsonl whose windows must match exactly")
+    parser.add_argument("--reference-replay", type=Path,
+                        help="independent native replay report.json whose per-work windows must match exactly")
+    parser.add_argument("--evaluation", action="store_true",
+                        help="paper evaluation: actual-inference parent and matching cycle_manifest.json required")
     parser.add_argument("--im2p", type=Path, default=REPO.parent / "IM2P.sim")
     args = parser.parse_args()
     try:

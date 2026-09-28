@@ -17,8 +17,10 @@ evaluation_trace::evaluation_trace(const common_params & params, const std::stri
     if (prefill_cycle_trace && (!CYCLE_SIM || generated_count || forced_cost_only))
         throw std::invalid_argument("prefill cycle trace requires CYCLE_SIM and zero generation");
     if (forced_cost_only && (CYCLE_SIM || !LOG_CYCLE || !semantic::compiled_cpu_only_build() ||
-                            params.n_gpu_layers != 0 || prompt_count != 256 || generated_count != 128))
-        throw std::invalid_argument("forced cost-only trace requires CPU-only LOG_CYCLE build and 256+128 inputs");
+                            params.n_gpu_layers != 0 || prompt_count != 256 ||
+                            (generated_count != 128 && generated_count != 1)))
+        throw std::invalid_argument("forced cost-only trace requires CPU-only LOG_CYCLE build and 256+128 "
+                                    "(or 256+1 diagnostic smoke) inputs");
 #if LOG_CYCLE
     if (!log::cycle.set_output_path(GEMMINI_LOG_DEFAULT_CYCLE_PATH, true))
         throw std::runtime_error("evaluation: cannot create CPU cycle log");

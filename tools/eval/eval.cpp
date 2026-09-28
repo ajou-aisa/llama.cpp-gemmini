@@ -184,8 +184,10 @@ static int run(int argc, char ** argv) {
                        GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS))
         throw std::invalid_argument("cycle trace requires independent metrics-OFF CYCLE_SIM prefill build");
     if (smoke_generated_tokens &&
-        (!CYCLE_SIM || !generation || forced_cost_only || smoke_generated_tokens != 1))
-        throw std::invalid_argument("smoke-generated-tokens requires CYCLE_SIM free generation and exactly 1 token");
+        (!generation || smoke_generated_tokens != 1 ||
+         (forced_cost_only ? CYCLE_SIM != 0 : !CYCLE_SIM)))
+        throw std::invalid_argument("smoke-generated-tokens requires exactly 1 token in CYCLE_SIM free "
+                                    "generation or in a FullCPU forced cost-only replay");
     const int generation_target = smoke_generated_tokens ? smoke_generated_tokens : 128;
     if (!generation && workload != "METRIC_PREFILL_256") throw std::invalid_argument("unknown workload");
     if (generation) {
@@ -262,7 +264,8 @@ static int run(int argc, char ** argv) {
         std::ifstream forced_input(forced_file);
         if (!forced_input) throw std::runtime_error("cannot open forced token file");
         const auto ids = json::parse(forced_input);
-        if (!ids.is_array() || ids.size() != 128) throw std::invalid_argument("forced token JSON must be an array of128 IDs");
+        if (!ids.is_array() || ids.size() != size_t(generation_target))
+            throw std::invalid_argument("forced token JSON must be an array of exactly the generation-target IDs");
         for (const auto & entry : ids) {
             if (!entry.is_number_integer()) throw std::invalid_argument("forced token IDs must be integers");
             const int64_t id = entry.get<int64_t>();
@@ -270,7 +273,8 @@ static int run(int argc, char ** argv) {
             forced_tokens.push_back(llama_token(id));
         }
         common_evaluation_validate_forced(forced_tokens, llama_vocab_n_tokens(vocab),
-                !CYCLE_SIM && params.n_gpu_layers == 0 && ggml::gemmini::semantic::compiled_cpu_only_build());
+                !CYCLE_SIM && params.n_gpu_layers == 0 && ggml::gemmini::semantic::compiled_cpu_only_build(),
+                size_t(generation_target));
     }
     const auto tokens = common_evaluation_tokenize(ctx, text);
     const auto plan = common_evaluation_plan(tokens.size(), 256, params.n_batch, max_chunks, first_chunk);

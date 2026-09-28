@@ -24,6 +24,33 @@ from scheduled_endpoints import (
     scheduled_application_result,
 )
 
+PUBLICATION_GATE_ORDER = ("cost_ownership", "memory_interface_scenario", "provider",
+                          "application_host", "operating_clock")
+
+
+def stateful_publication_gate_codes(inputs: Record) -> list[str]:
+    from e2e_cost_ownership import validate_contract, validate_memory_structure
+
+    codes: list[str] = []
+    contracts = inputs.get("e2e_contracts")
+    if not isinstance(contracts, dict):
+        codes.append("NOT_READY_MISSING_COST_OWNERSHIP_CONTRACT")
+        codes.append("NOT_READY_MISSING_MEMORY_INTERFACE_SCENARIO")
+    else:
+        try:
+            validate_contract(read_json(bound_artifact(contracts.get("cost_ownership"))))
+        except ValueError:
+            codes.append("NOT_READY_INVALID_COST_OWNERSHIP_CONTRACT")
+        try:
+            validate_memory_structure(read_json(bound_artifact(contracts.get("memory_interface"))))
+        except ValueError:
+            codes.append("NOT_READY_MISSING_MEMORY_INTERFACE_SCENARIO")
+    if "stateful_sequence_certificate" not in inputs:
+        codes.append("NOT_READY_MISSING_PROVIDER_CERTIFICATE")
+    codes.append("NOT_READY_MISSING_TARGET_HOST_ADMISSION")
+    codes.append("NOT_READY_MISSING_OPERATING_CLOCK")
+    return codes
+
 
 def artifact_reference(path: Path) -> Record:
     source = path.resolve(strict=True)
@@ -156,8 +183,9 @@ def load_reconstructed_measurement(row: Record) -> Record:
     verified = verify_official_schedule(files, inputs, im2p)
     source = load_potal_collection(sources["potal_result"], sources["application"],
                                    sources["potal_provenance"], files["join_summary"])
-    require(not stateful, "stateful publication NOT_READY: validated target-host/application admission is unavailable; "
-                         "host observations and matching host_id do not prove target-host latency")
+    require(not stateful, "stateful publication NOT_READY: " +
+            "; ".join(stateful_publication_gate_codes(inputs)) +
+            "; host observations and matching host_id do not prove target-host latency")
     require(row == reconstructed_row(source, scheduled_application_result(files["schedule"],
                                                                           prefill_dispatches(lifecycle), verified), proof),
             "reconstructed result differs from bound official schedule/source")

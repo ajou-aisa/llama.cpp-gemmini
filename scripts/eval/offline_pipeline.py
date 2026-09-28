@@ -91,8 +91,9 @@ def _reconstruct(args: argparse.Namespace) -> None:
     require((args.diagnostic_phase_table is not None or args.stateful_diagnostic) == (args.diagnostic_frequency_hz is not None),
             "diagnostic schedule requires both phase table and explicit frequency")
     require(not stateful or args.stateful_diagnostic,
-            "stateful publication NOT_READY: validated target-host/application admission is unavailable; "
-            "host observations and matching host_id do not prove target-host latency")
+            "stateful publication NOT_READY: NOT_READY_MISSING_TARGET_HOST_ADMISSION; "
+            "NOT_READY_MISSING_OPERATING_CLOCK; host observations and matching host_id "
+            "do not prove target-host latency")
     certified = ("stateful_sequence_certificate" if stateful else "service_certificate", "clock_selection", "profile", "potal_result", "timing",
                  "initial_scratchpad_half", "initial_accumulator_half")
     require(args.diagnostic_phase_table is None or any(getattr(args, name) is None for name in certified),

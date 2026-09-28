@@ -15,6 +15,8 @@ import platform
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Final
 
@@ -44,10 +46,44 @@ WORKLOAD_POLICY: Final = ("CERTIFIED_CYCLE_PREFILL_256_PLUS_1:split=test:chunk=0
                           "output=last_token:sample=1:decode=0:seed=1234:temp=0:matmul=STRIPE_PIPELINE")
 METRIC_POLICY: Final = "METRIC_PREFILL_256:split=test:max_chunks=1:context=256:tail=drop:output=second_half"
 EXIT_REJECTED: Final = 3
+EVALUATION_PARENT_SCHEMAS: Final = ("stateful-full374-replay-v1", "im2p-actual-trace-certificate-v1")
+RECIPES: Final[dict[str, Record]] = {
+    "evaluation": {"schema": "im2p-cycle-trace-recipe-v1", "name": "evaluation", "dataset": "WikiText-2",
+                   "split": "test", "chunk_index": 0, "prompt_tokens": 256, "generation_tokens": 1,
+                   "decode_calls": 0, "workload": "E2E_GENERATION_256_128", "smoke_generated_tokens": 1,
+                   "output_mask": "last_token", "sampling": {"policy": "greedy", "temperature": 0, "seed": 1234},
+                   "batch": 256, "ubatch": 256, "threads": 1, "threads_batch": 1, "gpu_layers": 0,
+                   "matmul_mode": MATMUL_MODE, "metrics": "OFF"},
+}
+
+
+@dataclass(frozen=True, slots=True)
+class Layout:
+    label: str
+    work: Path
+    capture: Path
+    manifest: Path
+    certificate: Path
 
 
 def configuration_path(model: str, precision: str, dim: int) -> Path:
     return Path(MODELS[model][1]) / precision.upper() / f"DIM{dim}"
+
+
+def layout(root: Path, model: str, precision: str, dim: int, recipe: str | None) -> Layout:
+    if recipe is None:
+        relative = configuration_path(model, precision, dim)
+        work = root / "trace/evaluation-cycle" / relative
+        return Layout(str(relative), work, work / "capture", root / "manifest" / relative,
+                      root / "certificate" / relative)
+    relative = Path(model) / precision.lower() / f"dim{dim}"
+    capture = root / "traces" / relative
+    return Layout(str(relative), capture / "producer", capture, root / "manifests" / relative,
+                  root / "certificates" / relative)
+
+
+def canonical_sha256(value: Json) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def git_identity(repository: Path) -> Record:
@@ -84,7 +120,28 @@ def compress(raw: Path, target: Path) -> Record:
             restored.update(chunk)
     require(content.hexdigest() == restored.hexdigest() == sha256(raw), "compressed trace differs from native trace")
     return {"path": str(target), "sha256": sha256(target), "content_sha256": content.hexdigest(),
-            "content_bytes": raw.stat().st_size, "compression": "gzip:mtime=0:level=6:no-filename"}
+            "content_bytes": raw.stat().st_size, "compression": "gzip:mtime=0:level=6:no-filename",
+            "decompression_verification": {"status": "PASS", "restored_content_sha256": restored.hexdigest()}}
+
+
+def inference_argv(runner: Path, model: Path, dataset: Path, native: Path, seed: int, manifest: str,
+                   recipe: Record) -> list[str]:
+    sampling = record(recipe["sampling"])
+    argv = [str(runner), "--model", str(model), "--file", str(dataset), "--output-dir", str(native),
+            "--workload", text(recipe, "workload"), "--max-chunks", "1", "--chunk-index", str(recipe["chunk_index"])]
+    if recipe["smoke_generated_tokens"]:
+        argv += ["--smoke-generated-tokens", str(recipe["smoke_generated_tokens"])]
+    return argv + ["--seed", str(seed), "--temp", str(sampling["temperature"]),
+                   "--batch-size", str(recipe["batch"]), "--ubatch-size", str(recipe["ubatch"]),
+                   "--threads", str(recipe["threads"]), "--threads-batch", str(recipe["threads_batch"]),
+                   "--gpu-layers", str(recipe["gpu_layers"]), "--manifest-sha256", manifest]
+
+
+def top_checksums(directory: Path) -> None:
+    files = sorted(path for path in directory.iterdir() if path.is_file() and path.name != "SHA256SUMS")
+    with (directory / "SHA256SUMS").open("x", encoding="utf-8") as stream:
+        for path in files:
+            stream.write(sha256(path) + "  " + path.name + "\n")
 
 
 def prepared_runner(path: Path, precision: str, dim: int) -> Path:
@@ -102,7 +159,14 @@ def prepared_runner(path: Path, precision: str, dim: int) -> Path:
 
 def certify(args: argparse.Namespace, trace: Path, runner: Path, manifest: Path, directory: Path,
             im2p: Path) -> tuple[int, Record]:
-    directory.mkdir(parents=True, exist_ok=False)
+    if not args.parent and args.recipe is not None:
+        return 0, {"status": "PENDING_INDEPENDENT_CERTIFICATION", "certificate": None,
+                   "reason": "no equivalent certified corpus supplied; certify this trace independently",
+                   "cycle_execution": "NOT_RUN"}
+    directory.mkdir(parents=True, exist_ok=bool(args.certify_existing))
+    require(not any((directory / name).exists() for name in
+                    ("cycle_trace_certificate.json", "verification.json", "rejection.json")),
+            "refusing existing certification output in " + str(directory))
     attempts: list[Json] = []
     output = directory / "cycle_trace_certificate.json"
     for index, (parent, evidence_root) in enumerate(args.parent or []):
@@ -133,13 +197,46 @@ def certify(args: argparse.Namespace, trace: Path, runner: Path, manifest: Path,
     return EXIT_REJECTED, result
 
 
+def actual_parents_only(args: argparse.Namespace) -> bool:
+    pairs: list[list[str]] = args.parent or []
+    return all(read_json(Path(pair[0])).get("schema") in EVALUATION_PARENT_SCHEMAS for pair in pairs)
+
+
+def certify_existing(args: argparse.Namespace) -> int:
+    require(args.recipe is not None and args.campaign_root is not None and bool(args.parent),
+            "--certify-existing requires --recipe, --campaign-root and at least one --parent")
+    require(actual_parents_only(args),
+            "synthetic producer certificates are regression-only; paper cycles need an actual-inference parent")
+    paths = layout(args.campaign_root.resolve(strict=True), args.model, args.precision, args.dim, args.recipe)
+    producer = read_json(paths.capture / "producer-manifest.json")
+    trace = paths.capture / "trace.jsonl.gz"
+    require(sha256(trace) == record(producer["trace"]).get("sha256"), "captured trace changed since capture")
+    runner = Path(text(record(producer["producer"]), "path"))
+    require(sha256(runner) == record(producer["producer"]).get("sha256"), "producing runner changed since capture")
+    status, certification = certify(args, trace, runner, paths.capture / "evaluation-manifest.json",
+                                    paths.certificate, args.im2p.resolve(strict=True))
+    print(json.dumps({"configuration": paths.label, "certificate": certification["status"]}))
+    return status
+
+
 def capture(args: argparse.Namespace) -> int:
+    if args.certify_existing:
+        return certify_existing(args)
     clean_environment()
     require(0 <= args.seed < 4294967295 and args.timeout > 0 and args.jobs > 0, "invalid capture bounds")
-    root = args.campaign_root.resolve()
-    relative = configuration_path(args.model, args.precision, args.dim)
-    config = root / "trace/evaluation-cycle" / relative
+    definition = RECIPES[args.recipe or "evaluation"]
+    sampling = record(definition["sampling"])
+    require(args.recipe is None or args.seed == sampling["seed"], "evaluation recipe fixes its sampling seed")
+    require(args.campaign_root is not None or args.recipe is not None, "--campaign-root required without --recipe")
+    require(args.recipe is None or actual_parents_only(args),
+            "synthetic producer certificates are regression-only; paper cycles need an actual-inference parent")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    root = (args.campaign_root or REPO.parent / f"actual-cycle-campaign-{stamp}").resolve()
+    paths = layout(root, args.model, args.precision, args.dim, args.recipe)
+    require(not paths.capture.exists(), "refusing existing capture: " + str(paths.capture))
+    config, capture_dir = paths.work, paths.capture
     config.mkdir(parents=True, exist_ok=False)
+    capture_dir.mkdir(exist_ok=True)
     im2p = args.im2p.resolve(strict=True)
     bits = int(args.precision[1])
     model = (args.model_path or REPO / "models" / args.model / f"{args.model}.Q{bits}_HP1.gguf").resolve(strict=True)
@@ -157,34 +254,46 @@ def capture(args: argparse.Namespace) -> int:
     receipt_path = runner.parent.parent / "build-receipt.json"
     receipt = read_json(receipt_path)
     llama = git_identity(REPO)
-    capture_dir = config / "capture"
-    capture_dir.mkdir()
     manifest_path = capture_dir / "evaluation-manifest.json"
     write_json(manifest_path, {"model": MODELS[args.model][0], "dataset": "WikiText-2", "tokenizer_sha256": tokenizer,
                "chunk_policy": METRIC_POLICY, "precision": args.precision.upper(), "dim": args.dim, "BK": 32,
                "seed": args.seed, "git_sha": text(llama, "head")})
     manifest = Manifest.load(manifest_path)
-    shared = root / "manifest" / relative / "evaluation_manifest.json"
-    shared.parent.mkdir(parents=True, exist_ok=False)
+    paths.manifest.mkdir(parents=True, exist_ok=False)
+    shared = paths.manifest / "evaluation_manifest.json"
     shutil.copyfile(manifest_path, shared)
     require(sha256(shared) == manifest.sha256, "shared manifest copy differs")
     native = config / "native"
-    argv = [str(runner), "--model", str(model), "--file", str(dataset), "--output-dir", str(native),
-            "--workload", "E2E_GENERATION_256_128", "--max-chunks", "1", "--chunk-index", "0",
-            "--smoke-generated-tokens", "1", "--seed", str(args.seed), "--temp", "0", "--batch-size", "256",
-            "--ubatch-size", "256", "--threads", "1", "--threads-batch", "1", "--gpu-layers", "0",
-            "--manifest-sha256", manifest.sha256]
+    argv = inference_argv(runner, model, dataset, native, args.seed, manifest.sha256, definition)
     command(argv, config, "inference", args.timeout)
     workload = read_json(native / "workload.json")
     require(workload.get("complete") is True and workload.get("sampling_executed") is True and
-            workload.get("requested_generated_tokens") == 1 and workload.get("output_mask") == "last_token" and
-            workload.get("chunk_index") == 0 and workload.get("seed") == args.seed and
-            workload.get("context_tokens") == 256, "native workload differs from certified cycle recipe")
+            workload.get("requested_generated_tokens") == definition["generation_tokens"] and
+            workload.get("output_mask") == definition["output_mask"] and
+            workload.get("chunk_index") == definition["chunk_index"] and workload.get("seed") == args.seed and
+            workload.get("context_tokens") == definition["prompt_tokens"] and
+            workload.get("temperature") == sampling["temperature"],
+            "native workload differs from the selected cycle recipe")
     raw = native / "chunk-0/npu-cycle-trace.jsonl"
     trace_ref = compress(raw, capture_dir / "trace.jsonl.gz")
     raw.unlink()
     trace = capture_dir / "trace.jsonl.gz"
     options = record(receipt["options"])
+    recipe_sha = canonical_sha256(definition)
+    write_json(capture_dir / "recipe.json", {
+        "schema": "im2p-cycle-trace-recipe-binding-v1", "definition": definition, "recipe_sha256": recipe_sha,
+        "observed": {"prompt_tokens": workload.get("context_tokens"),
+                     "generation_tokens": workload.get("requested_generated_tokens"),
+                     "seed": workload.get("seed"), "temperature": workload.get("temperature"),
+                     "sampler_policy": workload.get("sampler_policy"), "output_mask": workload.get("output_mask"),
+                     "chunk_index": workload.get("chunk_index"), "tokenizer_sha256": tokenizer,
+                     "model_sha256": sha256(model), "producer_sha256": sha256(runner),
+                     "build_sha256": sha256(receipt_path)}})
+    write_json(capture_dir / "cycle_manifest.json", {
+        "model": MODELS[args.model][0], "precision": args.precision.upper(), "dim": args.dim, "BK": 32,
+        "trace_sha256": trace_ref["sha256"], "producer_sha256": sha256(runner),
+        "build_sha256": sha256(receipt_path), "tokenizer_sha256": tokenizer, "recipe_sha256": recipe_sha})
+    shutil.copyfile(capture_dir / "cycle_manifest.json", paths.manifest / "cycle_manifest.json")
     write_json(capture_dir / "producer-manifest.json", {
         "schema": "im2p-cycle-trace-producer-v1", "manifest_sha256": manifest.sha256,
         "producer": {"path": str(runner), "sha256": sha256(runner)},
@@ -193,7 +302,8 @@ def capture(args: argparse.Namespace) -> int:
                       "sha256": sha256(config / "inference.json")},
                       "log_sha256": sha256(config / "inference.log")},
         "workload": {"path": str(native / "workload.json"), "sha256": sha256(native / "workload.json")},
-        "workload_policy": WORKLOAD_POLICY, "trace": trace_ref,
+        "workload_policy": WORKLOAD_POLICY, "recipe": text(definition, "name"), "recipe_sha256": recipe_sha,
+        "trace": trace_ref,
         "native_trace_retained_as": "capture/trace.jsonl.gz (byte-exact content; raw copy removed for disk)",
         "model": {"path": str(model), "sha256": sha256(model)},
         "dataset": {"path": str(dataset), "sha256": sha256(dataset)},
@@ -213,14 +323,14 @@ def capture(args: argparse.Namespace) -> int:
                           "GGML_GEMMINI_BLOCK_SIZE", "GGML_GEMMINI_OPTION", "GGML_GEMMINI_ENABLE_RMD",
                           "GGML_GEMMINI_DEFAULT_RMD_BACKEND")},
         "host": {"python": sys.version, "platform": platform.platform()}})
-    checksums(capture_dir)
-    status, certification = certify(args, trace, runner, manifest_path,
-                                    root / "certificate" / relative, im2p)
+    top_checksums(capture_dir)
+    status, certification = certify(args, trace, runner, manifest_path, paths.certificate, im2p)
     write_json(config / "capture-status.json", {
-        "configuration": str(relative), "EVALUATION_CYCLE_TRACE_CAPTURE": "PASS",
+        "configuration": paths.label, "EVALUATION_CYCLE_TRACE_CAPTURE": "PASS",
         "trace_sha256": trace_ref["sha256"], "trace_content_sha256": trace_ref["content_sha256"],
-        "manifest_sha256": manifest.sha256, "certificate_status": certification["status"]})
-    print(json.dumps({"configuration": str(relative), "trace": str(trace),
+        "manifest_sha256": manifest.sha256, "cycle_manifest_sha256": sha256(capture_dir / "cycle_manifest.json"),
+        "recipe_sha256": recipe_sha, "certificate_status": certification["status"]})
+    print(json.dumps({"configuration": paths.label, "campaign_root": str(root), "trace": str(trace),
                       "certificate": certification["status"]}))
     return status
 
@@ -231,10 +341,15 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--model-path", type=Path)
     result.add_argument("--precision", type=str.lower, choices=("a4w4", "a8w8"), required=True)
     result.add_argument("--dim", type=int, choices=(16, 32, 64), required=True)
-    result.add_argument("--campaign-root", type=Path, required=True,
-                        help="evaluation-cycle-campaign-<timestamp> root; trace/, manifest/, certificate/ are created")
+    result.add_argument("--campaign-root", type=Path,
+                        help="campaign root; required without --recipe (legacy trace/, manifest/, certificate/ layout); "
+                             "with --recipe defaults to ../actual-cycle-campaign-<timestamp>")
+    result.add_argument("--recipe", choices=tuple(RECIPES),
+                        help="named inference recipe; writes traces/, manifests/, certificates/ <model>/<precision>/dim<n>")
     result.add_argument("--parent", nargs=2, action="append", metavar=("CERTIFICATE", "EVIDENCE_ROOT"),
                         help="independently certified corpus to test for exact equivalence (repeatable)")
+    result.add_argument("--certify-existing", action="store_true",
+                        help="certify an already captured --recipe trace against --parent corpora; no inference")
     result.add_argument("--dataset-manifest", type=Path)
     result.add_argument("--prepared-build", type=Path, help="verified cycle capture build directory to reuse")
     result.add_argument("--seed", type=int, default=1234)

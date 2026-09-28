@@ -37,10 +37,11 @@ common_params_sampling common_evaluation_e2e_sampling() {
     return params;
 }
 
-void common_evaluation_validate_forced(const std::vector<llama_token> & tokens, int n_vocab, bool full_cpu_source) {
-    if (!full_cpu_source || tokens.size() != 128 || n_vocab <= 0 ||
+void common_evaluation_validate_forced(const std::vector<llama_token> & tokens, int n_vocab, bool full_cpu_source,
+        size_t expected) {
+    if (!full_cpu_source || expected == 0 || tokens.size() != expected || n_vocab <= 0 ||
             std::any_of(tokens.begin(), tokens.end(), [n_vocab](llama_token id) { return id < 0 || id >= n_vocab; })) {
-        throw std::invalid_argument("forced trajectory requires FullCPU and exactly128 valid vocabulary token IDs");
+        throw std::invalid_argument("forced trajectory requires FullCPU and exactly the expected count of valid vocabulary token IDs");
     }
 }
 

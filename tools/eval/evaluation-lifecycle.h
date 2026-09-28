@@ -18,7 +18,8 @@ public:
     evaluation_lifecycle(const std::string & role, const std::string & source, uint64_t expected,
                          bool forced_cost_only = false, bool pipeline = false)
         : expected_(expected), forced_(forced_cost_only), pipeline_(pipeline) {
-        require(!forced_ || (role == "full_cpu" && expected == 128), "forced trajectory requires FullCPU and exactly 128 tokens");
+        require(!forced_ || (role == "full_cpu" && (expected == 128 || expected == 1)),
+                "forced trajectory requires FullCPU and exactly 128 tokens (or the 1-token diagnostic smoke)");
         require(!pipeline_ || (role == "potal_collection" && !forced_), "pipeline declaration requires PoTal free generation");
         nlohmann::json run = {{"source_role", role}, {"source_commit", source}, {"expected_samples", forced_ ? 0 : expected},
             {"execution_policy", "blocking-llama-decode-synchronize-v1"},

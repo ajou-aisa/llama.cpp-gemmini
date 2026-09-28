@@ -93,6 +93,44 @@ inside each work's accepted-to-resource-ready window; event counts must equal na
 SCU execution timing is separate from the SCU scale-alignment metric. Metric campaigns can bind the
 same manifest bytes with `--evaluation-manifest manifest/.../evaluation_manifest.json`.
 
+## Actual-inference evaluation cycles
+
+The paper recipe is `--recipe evaluation`: WikiText-2 test chunk0, 256 prompt tokens, one greedy
+sample (seed 1234, temperature 0), zero decode calls, STRIPE_PIPELINE, metrics OFF. It writes
+`traces/<model>/<precision>/dim<n>/` with `trace.jsonl.gz` (raw content SHA, compressed SHA and a
+decompression verification), `recipe.json`, `cycle_manifest.json` (model, precision, dim, BK, trace,
+producer, build, tokenizer and recipe SHA256), producer/evaluation manifests and source binding.
+
+```sh
+ROOT="/absolute/actual-cycle-campaign-$(date -u +%Y%m%dT%H%M%SZ)"
+python3 -B scripts/eval/actual_cycle_bundle.py init "$ROOT"
+scripts/eval/run_cycle_trace_capture.sh --model gpt2 --precision a8w8 --dim 32 --recipe evaluation \
+  --campaign-root "$ROOT"
+```
+
+Without an equivalent certified corpus the certificate stays `PENDING_INDEPENDENT_CERTIFICATION`.
+IM2P.sim `sim/tests/cycle/actual_trace_{stimulus,capture,compare,replay,milestone}.py` then produce
+independent evidence for that exact trace: RTL versus model on every probe-admissible work (at most
+4096 works, m/n/k <= 8192; `lm_head` stays native-only), two complete native replays with record
+parity, and per-edge versus boundary milestone parity. Reviewed evidence hashes are pinned in
+`sim/cycle/actual_trace_pins.py`; `sim.cycle.actual_trace_certificate build` then issues an
+`im2p-actual-trace-certificate-v1` whose finite state domain is exactly the RTL-observed tag/row range.
+The per-trace certificate follows through the unchanged admission path:
+
+```sh
+scripts/eval/run_cycle_trace_capture.sh --model gpt2 --precision a8w8 --dim 32 --recipe evaluation \
+  --campaign-root "$ROOT" --certify-existing --parent /absolute/actual_trace_certificate.json /absolute/evidence
+scripts/eval/run_cycle_campaign.sh --evaluation \
+  --trace "$ROOT/traces/gpt2/a8w8/dim32/trace.jsonl.gz" \
+  --certificate "$ROOT/certificates/gpt2/a8w8/dim32/cycle_trace_certificate.json" \
+  --reference-replay /absolute/evidence/replay-first/report.json --output "$ROOT/cycles/gpt2/a8w8/dim32"
+python3 -B scripts/eval/actual_cycle_bundle.py finalize "$ROOT"   # after regression/results.json
+```
+
+Recipe mode and `--evaluation` accept only real-inference parents (the full374 replay corpus or an
+actual-trace certificate); synthetic producer certificates remain regression-only.
+`--reference-replay` requires every per-work window to equal the independent native replay records.
+
 ## Legacy cycle replay adapter
 
 ```sh
@@ -169,4 +207,28 @@ pyright -p scripts/eval/campaign-pyright.json
 pyright -p evaluation/pyrightconfig.json
 uv run --no-project --offline --with ruff ruff check scripts/eval/campaign*.py scripts/eval/cycle_*.py evaluation
 git diff --check
+```
+
+## E2E cost ownership and integration prep
+
+`scripts/eval/e2e_cost_ownership.py build DIR` emits and validates three
+machine-readable contracts: `cost-ownership-contract.json` (every target stage
+carries exactly one authority among HOST_MEASURED, NPU_MODELED,
+EXCLUDED_WITH_REASON, UNMODELED, DIAGNOSTIC_ONLY; source files are hash-bound),
+`memory-interface-scenario.json` (REFERENCE_MEMORY semantics; actual DRAM stays
+unmodeled and unmeasured; interface transports stay UNMODELED until declared)
+and `cycle-accounting-definitions.json` (frozen field names with
+`definition_revision`, e.g. `scu_active_cycles` =
+`SCALE_PATH_FETCH_LANE_RELEASE_UNION_V1`, never "SCU ALU utilization").
+
+`scripts/eval/e2e_integration_prep.py` walks one certified actual trace through
+the unchanged stateful provider, derives `request_available` from declared
+host-stage dependencies (zero-duration; ordering evidence only, never latency),
+records `port_offer`/`accepted`/`result_ready`/`final_scale_release`/
+`resource_ready` per work, re-verifies in a fresh session and writes
+`stateful-e2e-integration-prep.json` with publication kept fail-closed
+(`NOT_READY_MISSING_TARGET_HOST_ADMISSION`, `NOT_READY_MISSING_OPERATING_CLOCK`).
+
+```sh
+python3 -B -m evaluation.tests.test_publication_gates
 ```

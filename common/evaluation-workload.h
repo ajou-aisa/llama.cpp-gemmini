@@ -25,7 +25,8 @@ std::vector<llama_token> common_evaluation_tokenize(const llama_context * ctx, c
 common_evaluation_layout common_evaluation_plan(size_t tokens, int n_ctx, int n_batch, int max_chunks,
         int first_chunk = 0);
 common_params_sampling common_evaluation_e2e_sampling();
-void common_evaluation_validate_forced(const std::vector<llama_token> & tokens, int n_vocab, bool full_cpu_source);
+void common_evaluation_validate_forced(const std::vector<llama_token> & tokens, int n_vocab, bool full_cpu_source,
+        size_t expected = 128);
 bool common_evaluation_generation_complete(size_t samples, int decode_calls);
 void common_evaluation_begin(llama_context * ctx);
 int common_evaluation_batch(llama_batch & batch, const std::vector<llama_token> & tokens,
