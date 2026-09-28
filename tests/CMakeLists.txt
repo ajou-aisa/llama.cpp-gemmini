@@ -280,6 +280,12 @@ add_test(NAME test-build-arm64-cpu-detection
         -DTEST_SCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/../build-arm64.sh
         -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/build-arm64-cpu-detection
         -P ${CMAKE_CURRENT_SOURCE_DIR}/test-build-arm64-cpu-detection.cmake)
+if(UNIX)
+    add_test(NAME test-gemmini-off-build
+        COMMAND ${CMAKE_COMMAND}
+            -DTEST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/..
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/test-gemmini-off-build.cmake)
+endif()
 add_test(NAME test-evaluation-build-options
     COMMAND ${CMAKE_COMMAND} -DTEST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/..
         -P ${CMAKE_CURRENT_SOURCE_DIR}/test-evaluation-build-options.cmake)

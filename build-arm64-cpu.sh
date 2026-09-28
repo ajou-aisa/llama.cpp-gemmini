@@ -128,6 +128,7 @@ cmake -B "$BUILD_DIR" -S "$SCRIPT_ROOT" \
   -DGGML_BACKEND_DL=ON \
   -DLLAMA_BUILD_TESTS=OFF \
   "${PLATFORM_CMAKE_ARGS[@]-}" \
+  -DGGML_GEMMINI=ON \
   "${IM2P_EFFECTIVE_CMAKE_ARGS[@]}"
 
 cmake --build "$BUILD_DIR" --target llama-cli llama-perplexity llama-quantize -j"${BUILD_JOBS_DEFAULT}"

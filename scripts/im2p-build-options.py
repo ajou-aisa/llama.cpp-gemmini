@@ -150,6 +150,11 @@ def resolve(build_dir, platform, defaults, args, environment):
         origin['GGML_CPU_CYCLE_LOG'] = 'derived-default:LOG_CYCLE'
     effective = {key: normalize(key, value) for key, value in effective.items()}
     validate_evaluation_options(effective)
+    if effective['GGML_GEMMINI'] == 'OFF':
+        effective.update(GGML_GEMMINI_EXECUTION_BACKEND='HARDWARE', IM2P_SIM_IMPLEMENTATION='', IM2P_FPGA_ARCH='')
+        origin.update({name: 'disabled:GGML_GEMMINI' for name in
+                       ('GGML_GEMMINI_EXECUTION_BACKEND', 'IM2P_SIM_IMPLEMENTATION', 'IM2P_FPGA_ARCH')})
+        return effective, origin, passthrough, dry_run
     cycle_sim = effective.get('CYCLE_SIM', '0')
     backend = effective.get('GGML_GEMMINI_EXECUTION_BACKEND', 'HARDWARE')
     if cycle_sim == '1' and backend == 'FPGA_UART':
@@ -244,7 +249,7 @@ def main():
     build_dir, platform, *rest = sys.argv[1:]
     split = rest.index('--')
     defaults = dict(item.split('=', 1) for item in rest[:split])
-    defaults.setdefault('GGML_GEMMINI', 'ON')
+    defaults.setdefault('GGML_GEMMINI', 'OFF' if platform == 'build-arm64.sh' else 'ON')
     try:
         effective, origin, passthrough, dry = resolve(build_dir, platform, defaults, rest[split + 1:], dict(os.environ))
     except ValueError as error:
@@ -255,9 +260,12 @@ def main():
                'provisioning': 'none; CPU-functional source build' if effective.get('CYCLE_SIM') == '1' else 'matching IM2P_SIM artifacts' if effective.get('GGML_GEMMINI_EXECUTION_BACKEND') == 'IM2P_SIM' else 'none; FPGA_UART uses physical external executor' if effective.get('GGML_GEMMINI_EXECUTION_BACKEND') == 'FPGA_UART' else 'none'}
     print('IM2P_EFFECTIVE_CONFIG=' + json.dumps(summary, sort_keys=True), file=sys.stderr)
     for name, value in effective.items():
-        if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name):
+        if name != 'GGML_GEMMINI' and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name):
             print(f'{name}_DEFAULT={shlex.quote(value)}')
-    cmake_args = passthrough + [f'-D{name}={value}' for name, value in sorted(effective.items()) if configurable(name)]
+    cmake_args = passthrough + [f'-D{name}={value}' for name, value in sorted(effective.items())
+                                if configurable(name) and name != 'GGML_GEMMINI']
+    if origin.get('GGML_GEMMINI') == 'environment':
+        cmake_args.append(f'-DGGML_GEMMINI={effective["GGML_GEMMINI"]}')
     print('IM2P_EFFECTIVE_CMAKE_ARGS=(' + ' '.join(map(shlex.quote, cmake_args)) + ')')
     print('IM2P_BUILD_DRY_RUN=' + ('1' if dry else '0'))
     return 0

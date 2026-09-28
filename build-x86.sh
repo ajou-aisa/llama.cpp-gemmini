@@ -93,6 +93,7 @@ cmake -B "$BUILD_DIR" -S "$SCRIPT_ROOT" \
   -U 'CMAKE_TOOLCHAIN_FILE' \
   -U 'CMAKE_PREFIX_PATH' \
   -U 'OpenMP_ROOT' \
+  -DGGML_GEMMINI=ON \
   "${IM2P_EFFECTIVE_CMAKE_ARGS[@]}"
 
 cmake --build "$BUILD_DIR" --target llama-cli llama-perplexity -j"${BUILD_JOBS_DEFAULT}"
