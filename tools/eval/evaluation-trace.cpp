@@ -9,7 +9,6 @@
 #endif
 
 namespace semantic = ggml::gemmini::semantic;
-namespace log = ggml::gemmini::log;
 
 evaluation_trace::evaluation_trace(const common_params & params, const std::string & model_identity,
                                  size_t prompt_count, size_t generated_count, bool forced_cost_only,
@@ -22,9 +21,9 @@ evaluation_trace::evaluation_trace(const common_params & params, const std::stri
         throw std::invalid_argument("forced cost-only trace requires CPU-only LOG_CYCLE build and 256+128 "
                                     "(or 256+1 diagnostic smoke) inputs");
 #if LOG_CYCLE
-    if (!log::cycle.set_output_path(GEMMINI_LOG_DEFAULT_CYCLE_PATH, true))
+    if (!ggml::gemmini::log::cycle.set_output_path(GEMMINI_LOG_DEFAULT_CYCLE_PATH, true))
         throw std::runtime_error("evaluation: cannot create CPU cycle log");
-    log::cycle.set_buffered(true);
+    ggml::gemmini::log::cycle.set_buffered(true);
 #endif
 #if LOG_CYCLE || CYCLE_SIM
     const auto cpu = [](const cpu_params & value) {
@@ -120,8 +119,9 @@ void evaluation_trace::finish(bool success) {
 #endif
     if (lifecycle_) {
         const auto & events = lifecycle_->finish(success, semantic_->completed_graph_count());
-        const auto path = log::resolve_output_path("log/execution-lifecycle.jsonl");
-        if (path.empty() || !log::prepare_output_parent(path)) throw std::runtime_error("unsafe lifecycle path");
+        const auto path = ggml::gemmini::log::resolve_output_path("log/execution-lifecycle.jsonl");
+        if (path.empty() || !ggml::gemmini::log::prepare_output_parent(path))
+            throw std::runtime_error("unsafe lifecycle path");
         std::unique_ptr<FILE, decltype(&std::fclose)> file(std::fopen(path.string().c_str(), "wx"), std::fclose);
         if (!file) throw std::runtime_error("cannot exclusively create execution lifecycle");
         for (const auto & event : events) {
@@ -133,7 +133,7 @@ void evaluation_trace::finish(bool success) {
     }
     if (semantic_) semantic_->finish(success);
 #if LOG_CYCLE
-    if (!gemmini_log_cycle_flush() || !log::cycle.healthy())
+    if (!gemmini_log_cycle_flush() || !ggml::gemmini::log::cycle.healthy())
         throw std::runtime_error("evaluation: CPU log flush failed");
 #endif
 }
