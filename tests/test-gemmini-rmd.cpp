@@ -321,9 +321,7 @@ bool test_width_native_compose_and_expand() {
          ok;
 
         StripePacket malformed_packet = *packet;
-        if (malformed_packet.digit_storage == DigitStorage::packed_signed_int4) {
-            malformed_packet.stacked_activation.packed_int4.pop_back();
-        } else if (malformed_packet.digit_storage == DigitStorage::signed_int8) {
+        if (malformed_packet.digit_storage == DigitStorage::signed_int8) {
             malformed_packet.stacked_activation.signed_int8.pop_back();
         } else {
             malformed_packet.stacked_activation.signed_int16.pop_back();
@@ -2476,7 +2474,8 @@ bool test_compact_residual_metrics() {
                        metrics.useful_digit_macs == 23 * columns &&
                        metrics.issued_mac_capacity == issued_tiles * kArrayDim * kArrayDim * kArrayDim,
                    "source work, digit work and issued tile capacity have distinct MAC counts") && ok;
-        const size_t payload_bytes = issued_tiles * kArrayDim * kArrayDim * bits / 8;
+        const size_t payload_bytes = issued_tiles * kArrayDim * kArrayDim *
+            (bits == 16 ? sizeof(int16_t) : sizeof(int8_t));
         const size_t metadata_bytes = sizeof(StripePacket) + 2 * sizeof(BlockDescriptor) +
             2 * sizeof(LaneGroupDescriptor) + 21 * sizeof(uint16_t) + 4 * sizeof(uint8_t) +
             6 * sizeof(uint16_t);
@@ -2852,6 +2851,20 @@ bool test_compact_failure_matrix() {
     }
 
 #if defined(GGML_GEMMINI_TESTING)
+    if constexpr (GGML_GEMMINI_ACTIVATION_BITS == 4) {
+        CompactOracleFixture a4_native(4, WeightFamily::H1);
+        if (!check(a4_native.valid, "A4 native rejection fixture builds")) return false;
+        CompressedOutput output = sentinel;
+        RmdExecutionMetrics metrics{};
+        ggml::gemmini::quants::wreader::test_reset_weight_reader_counters();
+        const auto status = rmd::execute_rmd_stripe_gemmini_for_test(
+            a4_native.args, *a4_native.packet, output, &metrics);
+        ok = check(status == RmdStatus::unsupported_route &&
+                       compressed_outputs_match(output, sentinel) &&
+                       metrics.ws_call_count == 0 && metrics.matmul_call_count == 0 &&
+                       ggml::gemmini::quants::wreader::test_weight_reader_code_address_resolutions() == 0,
+                   "A4 digits cannot enter an elem_t-addressed raw WS adapter") && ok;
+    }
     constexpr uint8_t mismatch_bits =
         GGML_GEMMINI_ACTIVATION_BITS == 16 ? uint8_t{8} : uint8_t{16};
     CompactOracleFixture mismatched_native(mismatch_bits, WeightFamily::H1);

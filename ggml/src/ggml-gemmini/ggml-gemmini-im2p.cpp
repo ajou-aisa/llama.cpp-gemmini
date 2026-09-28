@@ -482,13 +482,25 @@ static void device_diagnostics(Im2pExecutionTelemetry &record,
   record.provider_stats = stats;
   record.backend = "im2p_sim";
   record.clock_domain = residual ? "independent_rmd_simulator" : "dense_simulator";
-  record.numerical_contract = residual ? "signed_radix_dot" : "main_external";
-  const bool bypass = residual || args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_h0 ||
-      args.has_q8_channel_direct_read_contract() || args.has_q8_channel_dense_sidecar_contract();
-  record.vector_op = bypass ? IM2P_VECTOR_BYPASS : IM2P_VECTOR_EXTERNAL;
-  record.output_domain = bypass ? IM2P_OUTPUT_LEGACY_FINAL : IM2P_OUTPUT_LEGACY_BLOCK;
-  record.scale_mode = residual ? "bypass_radix_host_reconstruction" :
-      bypass ? "bypass_host_scale" : "external_block_scale";
+  if (stats.dense_descriptor_submitted) {
+    switch (static_cast<::im2p::gemmini::NumericalContract>(
+        stats.dense_numerical_contract)) {
+      case ::im2p::gemmini::NumericalContract::scu_final_integer:
+        record.numerical_contract = "scu_final_integer"; break;
+      case ::im2p::gemmini::NumericalContract::main_external:
+        record.numerical_contract = "main_external"; break;
+    }
+    record.vector_op = stats.dense_vector_op;
+    record.output_domain = stats.dense_output_domain;
+    switch (stats.dense_vector_op) {
+      case IM2P_VECTOR_BYPASS: record.scale_mode = "bypass"; break;
+      case IM2P_VECTOR_MULTIPLY: record.scale_mode = "multiply"; break;
+      case IM2P_VECTOR_SHIFT: record.scale_mode = "shift"; break;
+      case IM2P_VECTOR_EXTERNAL: record.scale_mode = "external"; break;
+      case IM2P_VECTOR_UNSIGNED_MULTIPLY: record.scale_mode = "unsigned_multiply"; break;
+      case IM2P_VECTOR_LEFT_SHIFT: record.scale_mode = "left_shift"; break;
+    }
+  }
   record.activation_bits = GGML_GEMMINI_ACTIVATION_BITS;
   record.weight_bits = GGML_GEMMINI_WEIGHT_BITS;
   record.dim = DIM;
@@ -525,6 +537,11 @@ Completion translate(const ::im2p::gemmini::FenceResult &result,
                      std::uint64_t expected_published_rows) noexcept {
   const auto &base = result.stats.base;
   Stats stats = translate_stats(result.stats);
+  stats.dense_descriptor_submitted = result.dense_descriptor_submitted;
+  stats.dense_vector_op = result.dense_vector_op;
+  stats.dense_output_domain = result.dense_output_domain;
+  stats.dense_numerical_contract =
+      static_cast<std::uint8_t>(result.dense_numerical_contract);
   Result translated = translate(result.status);
   if (!translated.ok()) {
     return {translated, stats};

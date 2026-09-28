@@ -2761,6 +2761,11 @@ bool run_stats_translation_contract() {
 
   ::im2p::gemmini::FenceResult source{};
   source.status = {};
+  source.dense_descriptor_submitted = true;
+  source.dense_vector_op = IM2P_VECTOR_LEFT_SHIFT;
+  source.dense_output_domain = IM2P_OUTPUT_SCU_FINAL;
+  source.dense_numerical_contract =
+      ::im2p::gemmini::NumericalContract::scu_final_integer;
   std::uint64_t value = 101;
 #define SET_RAW(field) source.stats.field = value++
   SET_RAW(base.work_total_cycles);
@@ -2913,6 +2918,13 @@ bool run_stats_translation_contract() {
   };
   bool ok = check(translated.result.ok(),
                   "sentinel statistics satisfy PIPELINE geometry");
+  ok = check(translated.stats.dense_descriptor_submitted &&
+                 translated.stats.dense_vector_op == IM2P_VECTOR_LEFT_SHIFT &&
+                 translated.stats.dense_output_domain == IM2P_OUTPUT_SCU_FINAL &&
+                 translated.stats.dense_numerical_contract ==
+                     static_cast<std::uint8_t>(
+                         ::im2p::gemmini::NumericalContract::scu_final_integer),
+             "submitted dense descriptor survives fence translation") && ok;
   ok = check(translated.semantic_completion_count == 1 &&
                  translated.rmd_dot_calls == 5 &&
                  translated.rmd_stats.rtl_work_total_cycles == 55 &&
@@ -2930,7 +2942,9 @@ bool run_stats_translation_contract() {
                  failed_translation.semantic_completion_count == 0 &&
                  failed_translation.rmd_dot_calls == 0 &&
                  failed_translation.rmd_stats.rtl_work_total_cycles == 0 &&
-                 failed_translation.stats.rtl_work_total_cycles == 101,
+                 failed_translation.stats.rtl_work_total_cycles == 101 &&
+                 failed_translation.stats.dense_descriptor_submitted &&
+                 failed_translation.stats.dense_vector_op == IM2P_VECTOR_LEFT_SHIFT,
              "failed translation preserves dense meaning but hides semantic RMD success") &&
        ok;
   for (std::size_t index = 0; index < actual.size(); ++index) {

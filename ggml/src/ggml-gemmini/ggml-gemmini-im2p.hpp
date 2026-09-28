@@ -78,6 +78,10 @@ struct Stats {
   std::uint64_t rtl_current_scheduler_group_completion_cycle = 0;
   std::uint64_t rtl_lookahead_ready_cycle = 0;
   std::uint64_t rtl_lookahead_start_cycle = 0;
+  bool dense_descriptor_submitted = false;
+  std::uint8_t dense_vector_op = 0;
+  std::uint8_t dense_output_domain = 0;
+  std::uint8_t dense_numerical_contract = 0;
 };
 
 struct Completion {

@@ -71,9 +71,11 @@ def load_hp1_profile(path, require_rmd: bool = False):
     if not profile.get('host_contract_source') or not isinstance(contract_hash, str) or \
             len(contract_hash) != 64 or any(character not in '0123456789abcdef' for character in contract_hash):
         raise BuildConfigurationError('GEMMINI_HP1 resolved profile host contract identity is invalid')
-    if require_rmd and (profile.get('rmd_raw') is not True or
-                        profile.get('rmd_numerical_revision') != 'rmd-raw-k32-cpu-compose-v1'):
-        raise BuildConfigurationError('GEMMINI_HP1 RMD ON requires the RMD_RAW manifest contract')
+    if require_rmd and (profile.get('rmd_enabled') is not True or
+                        profile.get('rmd_datapath') != 'NORMAL_HP1_SCALED' or
+                        profile.get('rmd_raw') is not False or
+                        profile.get('rmd_numerical_revision') != 'rmd-hp1-scu-sat32-radix-v1'):
+        raise BuildConfigurationError('GEMMINI_HP1 RMD ON requires the SCU-scaled RMD manifest contract')
     return profile
 
 

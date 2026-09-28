@@ -1,7 +1,5 @@
 #include "rmd-builder.hpp"
 
-#include "../../quants/common/weight_reader.hpp"
-
 #include <algorithm>
 #include <limits>
 #include <utility>
@@ -37,14 +35,7 @@ bool checked_activation_sizes(uint8_t digit_bits,
         !checked_mul(group_rows, padded_k_count, value_count)) {
         return false;
     }
-    if (digit_bits == 4) {
-        if (padded_k_count % 2 != 0) {
-            return false;
-        }
-        byte_count = value_count / 2;
-        return true;
-    }
-    if (digit_bits == 8) {
+    if (digit_bits == 4 || digit_bits == 8) {
         byte_count = value_count;
         return true;
     }
@@ -95,10 +86,6 @@ void choose_lane_partition(
     }
 }
 
-Int4Packing int4_packing_for_bits(uint8_t digit_bits) {
-    return digit_bits == 4 ? Int4Packing::adjacent_low_nibble_first : Int4Packing::none;
-}
-
 RmdStatus write_packet_digit(StripePacket & packet,
                              const LaneGroupDescriptor & group,
                              size_t lane_row,
@@ -112,26 +99,6 @@ RmdStatus write_packet_digit(StripePacket & packet,
     }
 
     size_t row_offset = 0;
-
-    if (packet.digit_storage == DigitStorage::packed_signed_int4) {
-        const size_t row_bytes = group.padded_k_count / 2;
-        size_t packed_index = 0;
-        uint8_t shift = 0;
-        if (!quants::wreader::native_mvin_q4_position(
-                group.padded_k_count, k, packed_index, shift) ||
-            !checked_mul(lane_row, row_bytes, row_offset) ||
-            !checked_add(group.activation_byte_offset, row_offset, row_offset) ||
-            !checked_add(row_offset, packed_index, row_offset) ||
-            row_offset >= packet.stacked_activation.packed_int4.size()) {
-            return RmdStatus::invalid_packet;
-        }
-        const uint8_t nibble = static_cast<uint8_t>(digit) & 0x0fu;
-        const uint8_t mask = static_cast<uint8_t>(0x0fu << shift);
-        uint8_t & packed = packet.stacked_activation.packed_int4[row_offset];
-        packed = static_cast<uint8_t>((packed & static_cast<uint8_t>(~mask)) |
-                                      static_cast<uint8_t>(nibble << shift));
-        return RmdStatus::success;
-    }
 
     if (!checked_mul(lane_row, group.padded_k_count, row_offset) ||
         !checked_add(group.activation_offset, row_offset, row_offset) ||
@@ -300,14 +267,7 @@ static RmdStatus read_group_digit(const StripePacket & packet,
         expected_value_end > packet.activation_value_count) {
         return RmdStatus::invalid_packet;
     }
-    if (packet.digit_storage == DigitStorage::packed_signed_int4) {
-        if (group.activation_offset % 2 != 0 ||
-            packet.activation_value_count % 2 != 0) {
-            return RmdStatus::invalid_packet;
-        }
-        mapped_byte_offset = group.activation_offset / 2;
-        packet_byte_count = packet.activation_value_count / 2;
-    } else if (packet.digit_storage == DigitStorage::signed_int8) {
+    if (packet.digit_storage == DigitStorage::signed_int8) {
         mapped_byte_offset = group.activation_offset;
         packet_byte_count = packet.activation_value_count;
     } else if (!checked_mul(group.activation_offset, sizeof(int16_t),
@@ -337,55 +297,33 @@ static RmdStatus read_group_digit(const StripePacket & packet,
     size_t row_offset = 0;
     int32_t staged = 0;
 
-    if (packet.digit_storage == DigitStorage::packed_signed_int4) {
-        const size_t row_bytes = group.padded_k_count / 2;
-        int8_t decoded = 0;
-        if (!checked_mul(lane_row, row_bytes, row_offset) ||
-            !checked_add(group.activation_byte_offset, row_offset, row_offset) ||
-            row_offset >= expected_byte_end ||
-            expected_byte_end > packet.stacked_activation.packed_int4.size() ||
-            packet.stacked_activation.packed_int4.size() != packet_byte_count ||
-            !packet.stacked_activation.signed_int8.empty() ||
-            !packet.stacked_activation.signed_int16.empty() ||
-            !quants::wreader::decode_native_mvin_q4(
-                packet.stacked_activation.packed_int4.data() + row_offset,
-                row_bytes, group.padded_k_count, k, decoded)) {
+    if (!checked_mul(lane_row, group.padded_k_count, row_offset) ||
+        !checked_add(group.activation_offset, row_offset, row_offset) ||
+        !checked_add(row_offset, k, row_offset) ||
+        row_offset >= expected_value_end) {
+        return RmdStatus::invalid_packet;
+    }
+    if (packet.digit_storage == DigitStorage::signed_int8) {
+        if (expected_value_end > packet.stacked_activation.signed_int8.size() ||
+            packet.stacked_activation.signed_int8.size() !=
+                packet.activation_value_count ||
+            !packet.stacked_activation.signed_int16.empty()) {
             return RmdStatus::invalid_packet;
         }
-        staged = decoded;
+        staged = packet.stacked_activation.signed_int8[row_offset];
+    } else if (packet.digit_storage == DigitStorage::signed_int16) {
+        if (group.activation_byte_offset % alignof(int16_t) != 0 ||
+            group.activation_byte_count % sizeof(int16_t) != 0 ||
+            expected_byte_end > packet_byte_count ||
+            expected_value_end > packet.stacked_activation.signed_int16.size() ||
+            packet.stacked_activation.signed_int16.size() !=
+                packet.activation_value_count ||
+            !packet.stacked_activation.signed_int8.empty()) {
+            return RmdStatus::invalid_packet;
+        }
+        staged = packet.stacked_activation.signed_int16[row_offset];
     } else {
-        if (!checked_mul(lane_row, group.padded_k_count, row_offset) ||
-            !checked_add(group.activation_offset, row_offset, row_offset) ||
-            !checked_add(row_offset, k, row_offset)) {
-            return RmdStatus::invalid_packet;
-        }
-        if (row_offset >= expected_value_end) {
-            return RmdStatus::invalid_packet;
-        }
-        if (packet.digit_storage == DigitStorage::signed_int8) {
-            if (expected_value_end > packet.stacked_activation.signed_int8.size() ||
-                packet.stacked_activation.signed_int8.size() !=
-                    packet.activation_value_count ||
-                !packet.stacked_activation.packed_int4.empty() ||
-                !packet.stacked_activation.signed_int16.empty()) {
-                return RmdStatus::invalid_packet;
-            }
-            staged = packet.stacked_activation.signed_int8[row_offset];
-        } else if (packet.digit_storage == DigitStorage::signed_int16) {
-            if (group.activation_byte_offset % alignof(int16_t) != 0 ||
-                group.activation_byte_count % sizeof(int16_t) != 0 ||
-                expected_byte_end > packet_byte_count ||
-                expected_value_end > packet.stacked_activation.signed_int16.size() ||
-                packet.stacked_activation.signed_int16.size() !=
-                    packet.activation_value_count ||
-                !packet.stacked_activation.packed_int4.empty() ||
-                !packet.stacked_activation.signed_int8.empty()) {
-                return RmdStatus::invalid_packet;
-            }
-            staged = packet.stacked_activation.signed_int16[row_offset];
-        } else {
-            return RmdStatus::invalid_packet;
-        }
+        return RmdStatus::invalid_packet;
     }
 
     if (staged < contract.digit_min || staged > contract.digit_max) {
@@ -403,7 +341,6 @@ RmdStatus read_packet_digit(const StripePacket & packet,
     if (packet.version != kPacketVersion || contract.radix == 0 ||
         packet.lane_capacity != contract.lane_capacity ||
         packet.digit_storage != digit_storage_for_bits(packet.digit_bits) ||
-        packet.int4_packing != int4_packing_for_bits(packet.digit_bits) ||
         packet.block_size != kBlockSize || packet.array_dim != kArrayDim) {
         return RmdStatus::invalid_packet;
     }
@@ -553,7 +490,6 @@ StripePacketHandle RmdStripeBuilder::finish() {
         packet->digit_bits = digit_bits_;
         packet->lane_capacity = contract.lane_capacity;
         packet->digit_storage = digit_storage_for_bits(digit_bits_);
-        packet->int4_packing = int4_packing_for_bits(digit_bits_);
         packet->stripe_id = stripe_id_;
         packet->row_begin = row_begin_;
         packet->row_count = row_count_;
@@ -746,9 +682,7 @@ StripePacketHandle RmdStripeBuilder::finish() {
         packet->activation_value_count = activation_value_cursor;
         packet->total_output_values = output_cursor;
         // Signed two's-complement Q4 and scalar padding both encode numeric zero.
-        if (packet->digit_storage == DigitStorage::packed_signed_int4) {
-            packet->stacked_activation.packed_int4.assign(activation_byte_cursor, 0x00u);
-        } else if (packet->digit_storage == DigitStorage::signed_int8) {
+        if (packet->digit_storage == DigitStorage::signed_int8) {
             packet->stacked_activation.signed_int8.assign(activation_value_cursor, 0);
         } else {
             packet->stacked_activation.signed_int16.assign(activation_value_cursor, 0);
@@ -938,7 +872,6 @@ RmdStatus validate_packet(const StripePacket & packet) {
     if (packet.version != kPacketVersion || contract.radix == 0 ||
         packet.lane_capacity != contract.lane_capacity ||
         packet.digit_storage != digit_storage_for_bits(packet.digit_bits) ||
-        packet.int4_packing != int4_packing_for_bits(packet.digit_bits) ||
         packet.block_size != kBlockSize || packet.array_dim != kArrayDim) {
         return RmdStatus::invalid_packet;
     }
@@ -1104,29 +1037,22 @@ RmdStatus validate_packet(const StripePacket & packet) {
         }
     }
 
-    const bool q4_payload =
-        packet.stacked_activation.packed_int4.size() == expected_activation_bytes &&
-        packet.stacked_activation.signed_int8.empty() &&
-        packet.stacked_activation.signed_int16.empty();
-    const bool q8_payload =
-        packet.stacked_activation.packed_int4.empty() &&
+    const bool byte_payload =
         packet.stacked_activation.signed_int8.size() == expected_activation_values &&
         packet.stacked_activation.signed_int16.empty() &&
         expected_activation_bytes == expected_activation_values;
     size_t expected_int16_bytes = 0;
     const bool int16_size_ok =
         checked_mul(expected_activation_values, sizeof(int16_t), expected_int16_bytes);
-    const bool q16_payload =
-        packet.stacked_activation.packed_int4.empty() &&
+    const bool int16_payload =
         packet.stacked_activation.signed_int8.empty() &&
         packet.stacked_activation.signed_int16.size() == expected_activation_values &&
         int16_size_ok && expected_activation_bytes == expected_int16_bytes;
     if (packet.k_indices.size() != expected_k_cursor ||
         packet.activation_value_count != expected_activation_values ||
         packet.total_output_values != expected_output ||
-        (packet.digit_storage == DigitStorage::packed_signed_int4 && !q4_payload) ||
-        (packet.digit_storage == DigitStorage::signed_int8 && !q8_payload) ||
-        (packet.digit_storage == DigitStorage::signed_int16 && !q16_payload)) {
+        (packet.digit_storage == DigitStorage::signed_int8 && !byte_payload) ||
+        (packet.digit_storage == DigitStorage::signed_int16 && !int16_payload)) {
         return RmdStatus::invalid_packet;
     }
 
@@ -1166,19 +1092,13 @@ RmdStatus validate_packet(const StripePacket & packet) {
                         row_k_mask |= bit;
                         return true;
                     };
-                    // Extents are validated above; every native bit pattern is a valid digit.
-                    if (packet.digit_storage == DigitStorage::packed_signed_int4) {
-                        const uint8_t * values = packet.stacked_activation.packed_int4.data() +
-                            group.activation_byte_offset + lane_row * (group.padded_k_count / 2);
-                        for (size_t k = 0; k < group.padded_k_count; ++k) {
-                            if (!record_digit(k, ((values[k / 2] >> (4 * (k % 2))) & 0x0f) != 0)) {
-                                return RmdStatus::invalid_packet;
-                            }
-                        }
-                    } else if (packet.digit_storage == DigitStorage::signed_int8) {
+                    if (packet.digit_storage == DigitStorage::signed_int8) {
                         const int8_t * values = packet.stacked_activation.signed_int8.data() +
                             group.activation_offset + lane_row * group.padded_k_count;
                         for (size_t k = 0; k < group.padded_k_count; ++k) {
+                            if (values[k] < contract.digit_min || values[k] > contract.digit_max) {
+                                return RmdStatus::invalid_packet;
+                            }
                             if (!record_digit(k, values[k] != 0)) return RmdStatus::invalid_packet;
                         }
                     } else {
@@ -1197,14 +1117,7 @@ RmdStatus validate_packet(const StripePacket & packet) {
         for (const LaneGroupDescriptor & group : block.groups) {
             const size_t real_values = group.row_ids.size() * group.padded_k_count;
             const auto nonzero = [](auto value) { return value != 0; };
-            if (packet.digit_storage == DigitStorage::packed_signed_int4) {
-                const auto begin = packet.stacked_activation.packed_int4.begin() +
-                    group.activation_byte_offset;
-                if (std::any_of(begin + real_values / 2,
-                                begin + group.activation_byte_count, nonzero)) {
-                    return RmdStatus::invalid_packet;
-                }
-            } else if (packet.digit_storage == DigitStorage::signed_int8) {
+            if (packet.digit_storage == DigitStorage::signed_int8) {
                 const auto begin = packet.stacked_activation.signed_int8.begin() +
                     group.activation_offset;
                 if (std::any_of(begin + real_values,

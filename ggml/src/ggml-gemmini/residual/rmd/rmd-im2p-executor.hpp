@@ -105,8 +105,8 @@ struct Im2pCompactDot {
     size_t columns = 0;
     size_t weight_row_stride = 0;
     size_t k = 0;
-    // One carrier per output column; nullptr selects the non-HP1 path.
-    const uint32_t *hp1_carriers = nullptr;
+    const uint32_t *scu_carriers = nullptr;
+    uint8_t vector_op = 0;
     gemmini_cycle_record_v2 timing_identity{};
     // Original weight-block identity shared by the provider and trace.
     uint32_t block_id = 0;

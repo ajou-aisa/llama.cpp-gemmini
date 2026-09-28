@@ -97,8 +97,8 @@ struct Im2pExecutionTelemetry {
     std::string clock_domain;
     std::string numerical_contract;
     std::string scale_mode;
-    std::uint8_t vector_op = 0;
-    std::uint8_t output_domain = 0;
+    std::optional<std::uint8_t> vector_op;
+    std::optional<std::uint8_t> output_domain;
 };
 
 struct RmdTelemetryRecord;

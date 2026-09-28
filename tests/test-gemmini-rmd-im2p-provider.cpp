@@ -31,6 +31,14 @@ using ggml::gemmini::im2p_adapter::PublicMode;
 using ggml::gemmini::im2p_adapter::ResidualBackend;
 using ggml::gemmini::im2p_adapter::WeightFamily;
 
+#if defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1)
+constexpr bool kDefaultHp1 = true;
+constexpr std::array<bool, 1> kSupportedRoutes{true};
+#else
+constexpr bool kDefaultHp1 = false;
+constexpr std::array<bool, 2> kSupportedRoutes{false, true};
+#endif
+
 bool check(bool condition, const char * message) {
     if (!condition) std::fprintf(stderr, "FAIL: %s\n", message);
     return condition;
@@ -77,7 +85,7 @@ struct Fixture {
 #endif
     }
 
-    explicit Fixture(bool use_hp1 = false, int16_t exponent = 2,
+    explicit Fixture(bool use_hp1 = kDefaultHp1, int16_t exponent = 2,
                      size_t row_count = rows, size_t column_count = columns,
                      size_t weight_seed = 0) : h1(column_count * 2), hp1(column_count * 2) {
         args.I = row_count;
@@ -133,6 +141,106 @@ struct Fixture {
     }
 };
 
+#if defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1)
+struct H1ScuProbe {
+    const Fixture *fixture = nullptr;
+    size_t calls = 0;
+    std::array<bool, 2> seen_blocks{};
+
+    static int execute(void *opaque, const im2p_matmul_desc_t *d,
+                       const im2p_production_geometry_v1_t *geometry,
+                       im2p_work_stats_extended_t *stats) {
+        auto &probe = *static_cast<H1ScuProbe *>(opaque);
+        if (!d || !geometry || !stats || !probe.fixture ||
+            d->vector_op != IM2P_VECTOR_UNSIGNED_MULTIPLY ||
+            d->output_domain != IM2P_OUTPUT_SCU_FINAL || d->block_size != 32 ||
+            d->activation_storage_bytes != 1 || d->weight_storage_bytes != 1 ||
+            d->work_context >= 2 || d->n > Fixture::columns || d->k > 32 ||
+            geometry->scope != IM2P_GEOMETRY_FULL ||
+            !d->provider.read_scale || !d->provider.read_weight_i8 ||
+            !d->provider.write_output) return IM2P_ERROR;
+        ++probe.calls;
+        probe.seen_blocks[d->work_context] = true;
+        std::array<uint32_t, Fixture::columns> carriers{};
+        for (size_t j = 0; j < d->n; ++j) {
+            if (d->provider.read_scale(d->provider.context, 0, j, 1,
+                                       &carriers[j]) != IM2P_OK) return IM2P_ERROR;
+            const auto &block = probe.fixture->h1[j * 2 + d->work_context];
+            if (carriers[j] != uint32_t(block.c_b) + block.R) return IM2P_ERROR;
+        }
+        for (size_t i = 0; i < d->m; ++i) {
+            std::array<int64_t, Fixture::columns> values{};
+            for (size_t k = 0; k < d->k; ++k) {
+                std::array<int8_t, Fixture::columns> weights{};
+                if (d->provider.read_weight_i8(d->provider.context, k, 0, d->n,
+                                               weights.data()) != IM2P_OK) return IM2P_ERROR;
+                const auto activation = static_cast<const int8_t *>(d->activations)[
+                    i * d->activation_row_stride_bytes + k];
+                for (size_t j = 0; j < d->n; ++j)
+                    values[j] += int64_t(activation) * weights[j];
+            }
+            for (size_t j = 0; j < d->n; ++j) values[j] *= carriers[j];
+            if (d->provider.write_output(d->provider.context, 0, i, 0, d->n,
+                                         values.data(), d->output_domain) != IM2P_OK)
+                return IM2P_ERROR;
+        }
+        stats->base.work_total_cycles = 1;
+        stats->base.output_write_requests = d->m;
+        stats->base.output_write_responses = d->m;
+        return IM2P_OK;
+    }
+};
+
+bool run_h1_scu_contract() {
+    Fixture fixture(false, 2, 1);
+    fixture.args.act_quant.storage().emplace<ggml::gemmini::quants::act::exsia::Meta>().theta = {-1};
+    RmdStripeBuilder builder;
+    builder.reset(19, 0, 1, Fixture::logical_k, Fixture::columns,
+                  GGML_GEMMINI_ACTIVATION_BITS);
+    if (!check(builder.add_residual(0, 1, 1) &&
+                   builder.add_residual(0, kBlockSize + 1, -1),
+               "H1 original K positions accepted")) return false;
+    fixture.packet = builder.finish();
+    if (!check(fixture.packet != nullptr, "H1 packet exists")) return false;
+    H1ScuProbe probe{&fixture};
+    Im2pFullExecutor executor{&probe, nullptr, H1ScuProbe::execute};
+    CompressedOutput expected;
+    CompressedOutput actual;
+    RmdExecutionMetrics metrics{};
+    const auto oracle = execute_rmd_stripe_reference(
+        fixture.args, *fixture.packet, expected);
+    const auto status = execute_rmd_stripe_im2p(
+        nullptr, fixture.args, *fixture.packet, actual, &metrics, &executor);
+    Correction integer;
+    const auto integer_status = status == RmdStatus::success
+        ? compose_rmd_output(*fixture.packet, actual, integer) : status;
+    const auto *integer_values = std::get_if<BlockScaledInt64Correction>(&integer);
+    std::array<float, Fixture::columns> final_values{};
+    const auto float_status = integer_status == RmdStatus::success
+        ? merge_rmd_correction_to(fixture.args, final_values.data(),
+                                  *fixture.packet, integer) : integer_status;
+    bool shared_scale_once = integer_values &&
+        integer_values->values.size() == final_values.size();
+    if (shared_scale_once)
+        for (size_t j = 0; j < integer_values->values.size(); ++j)
+            shared_scale_once &= final_values[j] ==
+                static_cast<float>(integer_values->values[j] * 0.125);
+    const bool ok = check(oracle == RmdStatus::success &&
+                          status == RmdStatus::success,
+                          "H1 compact work accepts SCU op4 descriptor") &&
+        check(probe.calls > 0 && probe.seen_blocks[0] && probe.seen_blocks[1] &&
+                  metrics.im2p_dot_calls == probe.calls && metrics.ws_call_count == 0,
+              "H1 uses both original block carriers through planned GEMM") &&
+        check(actual.domain == expected.domain && actual.values == expected.values,
+              "H1 SCU result applies integer block scale once") &&
+        check(integer_status == RmdStatus::success &&
+                  float_status == RmdStatus::success && shared_scale_once,
+              "H1 host compose applies activation and column scale once");
+    if (ok) std::puts("IM2P_PROVIDER h1-scu-contract op=4 domain=2 blocks=2 scale_once=1");
+    return ok;
+}
+#endif
+
 bool unchanged(const CompressedOutput & output, const RmdExecutionMetrics & metrics) {
     return output.j_padded == 91 && output.values == std::vector<OutputValue>({7, -11}) &&
            metrics.packet_call_count == 73 && metrics.im2p_dot_calls == 79 &&
@@ -148,8 +256,13 @@ bool unchanged(const Correction & correction, const RmdExecutionMetrics & metric
            metrics.ws_call_count == 0;
 }
 
-bool run_success() {
-    Fixture fixture;
+bool run_success(bool use_hp1 = kDefaultHp1) {
+    Fixture fixture(use_hp1);
+    if (use_hp1) {
+        for (size_t block = 0; block < fixture.hp1.size(); ++block) {
+            fixture.hp1[block].m = static_cast<int16_t>(block + 1);
+        }
+    }
     Sim sim(im2p_sim_create());
     CompressedOutput expected;
     CompressedOutput actual;
@@ -237,17 +350,17 @@ bool run_hp1_exp_62() {
         fixture.args, *fixture.packet, expected) : RmdStatus::invalid_packet;
     const RmdStatus status = fixture.packet && sim ? execute_rmd_stripe_im2p(
         sim.get(), fixture.args, *fixture.packet, actual, &metrics) : RmdStatus::execution_failed;
-    const auto beyond_i32 = std::find_if(actual.values.begin(), actual.values.end(),
-        [](int64_t value) { return value > std::numeric_limits<int32_t>::max() ||
-                                  value < std::numeric_limits<int32_t>::min(); });
+    const auto saturated = std::find_if(actual.values.begin(), actual.values.end(),
+        [](int64_t value) { return value == std::numeric_limits<int32_t>::max() ||
+                                  value == std::numeric_limits<int32_t>::min(); });
     const bool ok = check(oracle == RmdStatus::success && status == RmdStatus::success,
                           "HP1 exponent 62 executes") &&
         check(actual.values == expected.values, "HP1 exponent 62 matches oracle") &&
-        check(beyond_i32 != actual.values.end(), "provider preserves output beyond int32") &&
+        check(saturated != actual.values.end(), "SCU exponent 62 saturates at int32") &&
         check(metrics.im2p_dot_calls > 0 && metrics.ws_call_count == 0,
               "HP1 exponent 62 uses IM2P only");
-    if (ok) std::printf("IM2P_PROVIDER hp1-exp-62 status=success dot_calls=%zu beyond_i32=%lld ws_calls=0\n",
-                        metrics.im2p_dot_calls, static_cast<long long>(*beyond_i32));
+    if (ok) std::printf("IM2P_PROVIDER hp1-exp-62 status=success dot_calls=%zu saturated=%lld ws_calls=0\n",
+                        metrics.im2p_dot_calls, static_cast<long long>(*saturated));
     return ok;
 }
 
@@ -275,7 +388,7 @@ bool run_shared_preparation() {
     constexpr size_t stripes = 2;
     Sim sim(im2p_sim_create());
     if (!check(sim != nullptr, "shared preparation simulator exists")) return false;
-    for (const bool use_hp1 : {false, true}) {
+    for (const bool use_hp1 : kSupportedRoutes) {
         Fixture fixture(use_hp1, 2, stripes, 1);
         auto & args = fixture.args;
         args.act_quant.storage().emplace<exsia::Meta>().theta = {-1};
@@ -366,11 +479,11 @@ bool run_shared_preparation() {
                        output == sentinel && nonzero_count == 91,
                    "shared and original merge reject selected scale mismatch transactionally")) return false;
         if (use_hp1) {
-            invalid.hp1[1].m = 63;
+            invalid.hp1[1].m = -1;
             detail::RmdWeightPreparation overflow_weights;
             if (!check(detail::execute_rmd_stripe_im2p_with_weights(
                            sim.get(), invalid.args, *packets.front(), rejected, overflow_weights,
-                           &metrics) == RmdStatus::overflow && unchanged(rejected, metrics),
+                           &metrics) == RmdStatus::unsupported_route && unchanged(rejected, metrics),
                        "shared preparation invalid block scale preserves correction and metrics")) return false;
         }
     }
@@ -381,7 +494,7 @@ bool run_packet_merge_contract() {
     namespace adapter = ggml::gemmini::im2p_adapter;
     namespace exsia = ggml::gemmini::quants::act::exsia;
     for (const bool pipeline : {false, true}) {
-        for (const bool use_hp1 : {false, true}) {
+        for (const bool use_hp1 : kSupportedRoutes) {
             for (size_t probe = 0; probe < 5; ++probe) {
                 Fixture fixture(use_hp1);
                 auto & args = fixture.args;
@@ -433,6 +546,12 @@ bool run_packet_merge_contract() {
                 };
                 if (pipeline) {
                     auto started = adapter::start_exsia_stripe_pipeline(args);
+                    if (kDefaultHp1 && use_hp1 && !started.result.ok()) {
+                        if (!check(started.result.error == Error::invalid_contract &&
+                                       output == sentinel,
+                                   "HP1 pipeline rejects inconsistent shared column scale at start")) return false;
+                        continue;
+                    }
                     if (!check(started.result.ok() && started.pipeline->install_sink().ok(),
                                "packet merge PIPELINE starts")) return false;
                     completion = started.pipeline->finish(publish());
@@ -443,7 +562,7 @@ bool run_packet_merge_contract() {
                     completion = started.execution->finish(publish());
                 }
                 const auto counters = adapter::test_counters();
-                if (probe == 0) {
+                if (probe == 0 && (!kDefaultHp1 || !use_hp1)) {
                     std::array<float, Fixture::columns> expected{};
                     for (size_t j = 0; j < args.J; ++j) {
                         const int code = static_cast<int>((j * 2 * 17 + 5) % 7) - 3;
@@ -460,9 +579,16 @@ bool run_packet_merge_contract() {
                                      output[0], output[1], output[2], expected[0], expected[1], expected[2]);
                         return false;
                     }
-                } else if (!check(!completion.result.ok() && output == sentinel &&
+                } else if (probe == 0 && !check(!completion.result.ok() &&
+                                      completion.result.error == Error::invalid_contract &&
+                                      output == sentinel && counters.commit == 0 &&
+                                      counters.rmd_dot_calls == 0,
+                                  "HP1 frontend rejects inconsistent shared column scale")) {
+                    return false;
+                } else if (probe != 0 && !check(!completion.result.ok() && output == sentinel &&
                                       counters.commit == 0 &&
-                                      (probe == 1 ? completion.result.error == Error::unsupported_route
+                                      (probe == 1 && !kDefaultHp1 ?
+                                                  completion.result.error == Error::unsupported_route
                                                   : completion.result.error == Error::invalid_contract &&
                                                         counters.residual_executions == 0 &&
                                                         counters.provider_dot_attempts == 0),
@@ -475,7 +601,8 @@ bool run_packet_merge_contract() {
             }
         }
     }
-    std::puts("IM2P_PROVIDER packet-merge-contract modes=FULL,PIPELINE routes=H1,HP1 untouched=accepted touched=rejected rows=checked output=transactional");
+    std::printf("IM2P_PROVIDER packet-merge-contract modes=FULL,PIPELINE routes=%s untouched=%s touched=rejected rows=checked output=transactional\n",
+                kDefaultHp1 ? "HP1" : "H1,HP1", kDefaultHp1 ? "rejected" : "accepted");
     return true;
 }
 
@@ -487,7 +614,7 @@ bool run_int32_residuals() {
         {DIM, 1, int32_t{1} << 20},
         {DIM, kBlockSize, -(int32_t{1} << 20) - 1},
     }};
-    for (const bool use_hp1 : {false, true}) {
+    for (const bool use_hp1 : kSupportedRoutes) {
         Fixture fixture(use_hp1);
         RmdStripeBuilder builder;
         builder.reset(29, 0, Fixture::rows, Fixture::logical_k, Fixture::columns,
@@ -536,7 +663,8 @@ bool run_int32_residuals() {
             return false;
         }
     }
-    std::puts("IM2P_PROVIDER int32-residuals status=success routes=H1,HP1 carry_lane=retained");
+    std::printf("IM2P_PROVIDER int32-residuals status=success routes=%s carry_lane=retained\n",
+                kDefaultHp1 ? "HP1" : "H1,HP1");
     return true;
 }
 
@@ -546,7 +674,7 @@ bool run_group_rows() {
     Sim sim(im2p_sim_create());
     if (!check(sim != nullptr, "row-boundary provider simulator exists")) return false;
     for (const size_t rows : {size_t{1}, size_t{DIM - 1}, size_t{DIM}, size_t{DIM + 1}}) {
-        for (const bool use_hp1 : {false, true}) {
+        for (const bool use_hp1 : kSupportedRoutes) {
             for (const size_t seed : {size_t{0}, size_t{1}}) {
                 Fixture fixture(use_hp1, 2, rows, columns, seed);
                 std::vector<Event> events;
@@ -655,7 +783,7 @@ bool run_native_code_edges() {
     };
     Sim sim(im2p_sim_create());
     if (!check(sim != nullptr, "native-code edge simulator exists")) return false;
-    for (const bool use_hp1 : {false, true}) {
+    for (const bool use_hp1 : kSupportedRoutes) {
         Fixture fixture(use_hp1, 2, rows);
         for (size_t j = 0; j < Fixture::columns; ++j) {
             for (size_t block = 0; block < 2; ++block) {
@@ -770,9 +898,9 @@ bool run_fault(Im2pProviderTestFault fault, RmdStatus expected, const char * nam
     return ok;
 }
 
-bool run_hp1_exp_63() {
+bool run_hp1_invalid_carrier() {
     Fixture fixture(true, 2);
-    fixture.hp1.back().m = 63;
+    fixture.hp1.back().m = -1;
     Sim sim(im2p_sim_create());
     CompressedOutput output{CompressedOutput::Domain::block_scaled_int64, 91, {7, -11}};
     RmdExecutionMetrics metrics{};
@@ -781,11 +909,11 @@ bool run_hp1_exp_63() {
     ggml::gemmini::quants::wreader::test_reset_weight_reader_counters();
     const RmdStatus status = fixture.packet && sim ? execute_rmd_stripe_im2p(
         sim.get(), fixture.args, *fixture.packet, output, &metrics) : RmdStatus::execution_failed;
-    const bool ok = check(status == RmdStatus::overflow, "HP1 exponent 63 is typed overflow") &&
+    const bool ok = check(status == RmdStatus::unsupported_route, "negative HP1 carrier rejects") &&
         check(ggml::gemmini::quants::wreader::test_weight_reader_code_address_resolutions() == 0,
               "invalid final weight block scale rejects before any code gather") &&
         check(unchanged(output, metrics), "HP1 overflow is transactional");
-    if (ok) std::printf("IM2P_PROVIDER hp1-exp-63 status=overflow dot_calls=0 output_sentinel=unchanged metrics_sentinel=unchanged ws_calls=%zu\n",
+    if (ok) std::printf("IM2P_PROVIDER hp1-invalid-carrier status=unsupported_route dot_calls=0 output_sentinel=unchanged metrics_sentinel=unchanged ws_calls=%zu\n",
                         metrics.ws_call_count);
     return ok;
 }
@@ -799,8 +927,18 @@ ExsiaRouteRequest route(WeightFamily family, ResidualBackend backend) {
 bool run_route(std::string_view selected) {
     if (selected == "route-matched") {
         const auto result = ggml::gemmini::im2p_adapter::gate_route(
-            route(WeightFamily::h1, ResidualBackend::compact_ws));
-        const bool ok = check(result.ok(), "matched IM2P H1 compact route accepted");
+            route(kDefaultHp1 ? WeightFamily::hp1 : WeightFamily::h1,
+                  ResidualBackend::compact_ws));
+        bool ok = check(result.ok(), "matched IM2P compact route accepted");
+#if defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1)
+        Fixture h1(false);
+        Sim sim(im2p_sim_create());
+        CompressedOutput blocked;
+        ok = check(h1.packet && sim &&
+                       execute_rmd_stripe_im2p(sim.get(), h1.args, *h1.packet, blocked) ==
+                           RmdStatus::execution_failed,
+                   "HP1 simulator currently rejects submitted H1 op4") && ok;
+#endif
         if (ok) std::puts("IM2P_ROUTE matched compact_ws=accepted backend=IM2P_SIM");
         return ok;
     }
@@ -834,6 +972,10 @@ int main(int argc, char ** argv) {
 
     bool ok = true;
     if (selected == "all" || selected == "success") ok = run_success() && ok;
+    if (selected == "hp1-success") ok = run_success(true) && ok;
+#if defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1)
+    if (selected == "all" || selected == "h1-scu-contract") ok = run_h1_scu_contract() && ok;
+#endif
     if (selected == "all" || selected == "provider-read-failure") ok = run_fault(Im2pProviderTestFault::read_failure, RmdStatus::execution_failed, "provider-read-failure", 1, 1) && ok;
     if (selected == "all" || selected == "provider-write-failure") ok = run_fault(Im2pProviderTestFault::write_failure, RmdStatus::execution_failed, "provider-write-failure", 1, 1) && ok;
     if (selected == "all" || selected == "provider-watchdog") ok = run_fault(Im2pProviderTestFault::watchdog, RmdStatus::execution_failed, "provider-watchdog", 1, 1) && ok;
@@ -845,7 +987,7 @@ int main(int argc, char ** argv) {
     if (selected == "all" || selected == "output-index") ok = run_fault(Im2pProviderTestFault::output_index, RmdStatus::execution_failed, "output-index") && ok;
     if (selected == "all" || selected == "stats-overflow") ok = run_fault(Im2pProviderTestFault::stats_overflow, RmdStatus::overflow, "stats-overflow") && ok;
     if (selected == "all" || selected == "hp1-exp-62") ok = run_hp1_exp_62() && ok;
-    if (selected == "all" || selected == "hp1-exp-63") ok = run_hp1_exp_63() && ok;
+    if (selected == "all" || selected == "hp1-invalid-carrier") ok = run_hp1_invalid_carrier() && ok;
     if (selected == "all" || selected == "malformed-packet") ok = run_malformed_packet() && ok;
     if (selected == "all" || selected == "shared-preparation") ok = run_shared_preparation() && ok;
     if (selected == "all" || selected == "packet-merge-contract") ok = run_packet_merge_contract() && ok;
@@ -854,8 +996,8 @@ int main(int argc, char ** argv) {
     if (selected == "all" || selected == "native-code-edges") ok = run_native_code_edges() && ok;
     if (selected == "all" || selected == "route-matched" || selected == "route-mismatch" || selected == "h0-compact-rejection") ok = run_route(selected == "all" ? "route-matched" : selected) && ok;
 
-    constexpr std::array<std::string_view, 23> valid{{"all", "success", "provider-read-failure", "provider-write-failure", "provider-watchdog", "k-accumulation-overflow", "block-scale-overflow", "cancel-between-dots", "duplicate-output", "missing-output", "output-index", "stats-overflow", "hp1-exp-62", "hp1-exp-63", "malformed-packet", "shared-preparation", "packet-merge-contract", "int32-residuals", "group-rows", "native-code-edges", "route-matched", "route-mismatch", "h0-compact-rejection"}};
-    const bool is_valid = std::find(valid.begin(), valid.end(), selected) != valid.end() || selected == "h0-compact-rejection";
+    constexpr std::array<std::string_view, 25> valid{{"all", "success", "hp1-success", "h1-scu-contract", "provider-read-failure", "provider-write-failure", "provider-watchdog", "k-accumulation-overflow", "block-scale-overflow", "cancel-between-dots", "duplicate-output", "missing-output", "output-index", "stats-overflow", "hp1-exp-62", "hp1-invalid-carrier", "malformed-packet", "shared-preparation", "packet-merge-contract", "int32-residuals", "group-rows", "native-code-edges", "route-matched", "route-mismatch", "h0-compact-rejection"}};
+    const bool is_valid = std::find(valid.begin(), valid.end(), selected) != valid.end();
     if (!is_valid) {
         std::fprintf(stderr, "unsupported test case: %.*s\n", static_cast<int>(selected.size()), selected.data());
         return 2;
