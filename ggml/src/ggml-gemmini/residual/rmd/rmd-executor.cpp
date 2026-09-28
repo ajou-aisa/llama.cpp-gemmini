@@ -764,6 +764,8 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
 #endif
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) && !defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1)
   const bool legacy_external = Backend != CompactExecutorBackend::gemmini_ws &&
+                               (plan.route == wroute::WeightRouteKind::H1 ||
+                                plan.route == wroute::WeightRouteKind::HP1) &&
                                (packet.digit_bits == 4 || packet.digit_bits == 8);
 #else
   const bool legacy_external = false;

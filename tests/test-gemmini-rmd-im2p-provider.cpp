@@ -1189,6 +1189,36 @@ bool run_route(std::string_view selected) {
                        execute_rmd_stripe_im2p(sim.get(), h1.args, *h1.packet, blocked) ==
                            RmdStatus::execution_failed,
                    "HP1 simulator currently rejects submitted H1 op4") && ok;
+#elif GGML_GEMMINI_WEIGHT_BITS == 8
+        Fixture channel(false);
+        auto channel_args = channel.args;
+        std::vector<int8_t> channel_codes(channel_args.J * channel_args.K, 1);
+        std::vector<float> channel_scales(channel_args.J, 0.25f);
+        channel_args.weight_format =
+            ggml_gemmini_args_t::im2p_weight_format_t::q8_channel_dense_sidecar;
+        channel_args.B = channel_codes.data();
+        channel_args.sB = channel_args.K;
+        channel_args.weight_channel_scales = channel_scales.data();
+        channel_args.weight_channel_scale_count = channel_scales.size();
+        struct ChannelProbe { size_t calls = 0; uint8_t op = 255; uint8_t domain = 255; } probe;
+        const auto inspect = [](void *opaque, const im2p_matmul_desc_t *d,
+                                im2p_work_stats_extended_t *) -> int {
+            auto &p = *static_cast<ChannelProbe *>(opaque);
+            ++p.calls;
+            p.op = d->vector_op;
+            p.domain = d->output_domain;
+            return IM2P_ERROR;
+        };
+        Im2pFullExecutor executor{&probe, inspect, nullptr};
+        CompressedOutput channel_output;
+        const auto channel_status = channel.packet ? execute_rmd_stripe_im2p(
+            nullptr, channel_args, *channel.packet, channel_output, nullptr, &executor)
+                                                   : RmdStatus::invalid_packet;
+        ok = check(channel_args.has_q8_channel_dense_sidecar_contract() &&
+                       channel_status == RmdStatus::execution_failed &&
+                       probe.calls == 1 && probe.op == IM2P_VECTOR_BYPASS &&
+                       probe.domain == IM2P_OUTPUT_LEGACY_FINAL,
+                   "legacy Q8 channel RMD keeps dense op0 final domain") && ok;
 #endif
         if (ok) std::puts("IM2P_ROUTE matched compact_ws=accepted backend=IM2P_SIM");
         return ok;
