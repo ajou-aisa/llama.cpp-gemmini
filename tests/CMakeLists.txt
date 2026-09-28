@@ -769,6 +769,13 @@ if (NOT GGML_BACKEND_DL)
     if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "FPGA_UART")
         target_compile_definitions(test-gemmini-rmd PRIVATE
             GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART=1)
+    elseif (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
+        target_compile_definitions(test-gemmini-rmd PRIVATE
+            GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM=1)
+        if (IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1")
+            target_compile_definitions(test-gemmini-rmd PRIVATE
+                IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1=1)
+        endif()
     endif()
     target_include_directories(test-gemmini-rmd PRIVATE
         ../ggml/src
@@ -1120,18 +1127,30 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
         ggml-gemmini ggml-base)
     target_compile_features(test-gemmini-rmd-im2p-provider PRIVATE cxx_std_17)
     target_compile_definitions(test-gemmini-rmd-im2p-provider PRIVATE
+        GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM=1
         GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
         GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE})
+    if (IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1")
+        target_compile_definitions(test-gemmini-rmd-im2p-provider PRIVATE
+            IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1=1)
+    endif()
     target_include_directories(test-gemmini-rmd-im2p-provider PRIVATE
         ../ggml/src
         ../ggml/src/ggml-gemmini
+        ${IM2P_SIM_ROOT}/frontend/include
         ${IM2P_SIM_ROOT}/sim/include
+        ${IM2P_SIM_ROOT}/sim/common
         ${GEMMINI_SW_PATH}
         ${GEMMINI_SW_PATH}/include)
     add_test(NAME test-gemmini-rmd-im2p-provider
         COMMAND $<TARGET_FILE:test-gemmini-rmd-im2p-provider> --case success)
     add_test(NAME test-gemmini-rmd-im2p-provider-failures
         COMMAND $<TARGET_FILE:test-gemmini-rmd-im2p-provider> --case all)
+    if (IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1" AND
+        GGML_GEMMINI_WEIGHT_BITS LESS 16)
+        add_test(NAME test-gemmini-rmd-im2p-provider-hp1-success
+            COMMAND $<TARGET_FILE:test-gemmini-rmd-im2p-provider> --case hp1-success)
+    endif()
 
     add_executable(test-gemmini-rmd-backend-gate
         test-gemmini-rmd-backend-gate.cpp)

@@ -321,9 +321,7 @@ bool test_width_native_compose_and_expand() {
          ok;
 
         StripePacket malformed_packet = *packet;
-        if (malformed_packet.digit_storage == DigitStorage::packed_signed_int4) {
-            malformed_packet.stacked_activation.packed_int4.pop_back();
-        } else if (malformed_packet.digit_storage == DigitStorage::signed_int8) {
+        if (malformed_packet.digit_storage == DigitStorage::signed_int8) {
             malformed_packet.stacked_activation.signed_int8.pop_back();
         } else {
             malformed_packet.stacked_activation.signed_int16.pop_back();
@@ -2463,11 +2461,18 @@ bool test_compact_residual_metrics() {
 
         const size_t first_k_tiles = align_up(19, kArrayDim) / kArrayDim;
         const size_t issued_tiles = first_k_tiles + 1;
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) && !defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1)
+        const bool one_call_per_block = bits == 4 || bits == 8;
+#else
+        const bool one_call_per_block = false;
+#endif
+        const size_t expected_calls = one_call_per_block ? 2 : issued_tiles;
+        const size_t expected_dot_rows = one_call_per_block ? 6 : 4 * first_k_tiles + 2;
         ok = check(metrics.active_blocks == 2 && metrics.active_lanes == 4 &&
                        metrics.compact_k_count == 21 && metrics.group_active_k_count == 21 &&
                        metrics.padded_k_count == (first_k_tiles + 1) * kArrayDim &&
                        metrics.group_padded_k_count == (first_k_tiles + 1) * kArrayDim &&
-                       metrics.lane_group_count == 2 && metrics.matmul_call_count == first_k_tiles + 1 &&
+                       metrics.lane_group_count == 2 && metrics.matmul_call_count == expected_calls &&
                        metrics.physical_tile_count == 4 &&
                        metrics.baseline_stacked_i_tile_count == 6 * first_k_tiles + 2 &&
                        metrics.stacked_i_tile_count == issued_tiles,
@@ -2476,7 +2481,8 @@ bool test_compact_residual_metrics() {
                        metrics.useful_digit_macs == 23 * columns &&
                        metrics.issued_mac_capacity == issued_tiles * kArrayDim * kArrayDim * kArrayDim,
                    "source work, digit work and issued tile capacity have distinct MAC counts") && ok;
-        const size_t payload_bytes = issued_tiles * kArrayDim * kArrayDim * bits / 8;
+        const size_t payload_bytes = issued_tiles * kArrayDim * kArrayDim *
+            (bits == 16 ? sizeof(int16_t) : sizeof(int8_t));
         const size_t metadata_bytes = sizeof(StripePacket) + 2 * sizeof(BlockDescriptor) +
             2 * sizeof(LaneGroupDescriptor) + 21 * sizeof(uint16_t) + 4 * sizeof(uint8_t) +
             6 * sizeof(uint16_t);
@@ -2487,7 +2493,7 @@ bool test_compact_residual_metrics() {
                        metrics.block_scale_values_bytes == 2 * columns * sizeof(uint64_t) &&
                        metrics.correction_bytes == rows * columns * sizeof(int64_t) &&
                        metrics.logical_dot_result_bytes ==
-                           (4 * first_k_tiles + 2) * columns * sizeof(int64_t) &&
+                           expected_dot_rows * columns * sizeof(int64_t) &&
                        metrics.compressed_output_values == 0,
                    "packet storage, gathered INT32 weights and repeated dot outputs use explicit byte units") && ok;
         CompressedOutput compressed;
@@ -2852,6 +2858,20 @@ bool test_compact_failure_matrix() {
     }
 
 #if defined(GGML_GEMMINI_TESTING)
+    if constexpr (GGML_GEMMINI_ACTIVATION_BITS == 4) {
+        CompactOracleFixture a4_native(4, WeightFamily::H1);
+        if (!check(a4_native.valid, "A4 native rejection fixture builds")) return false;
+        CompressedOutput output = sentinel;
+        RmdExecutionMetrics metrics{};
+        ggml::gemmini::quants::wreader::test_reset_weight_reader_counters();
+        const auto status = rmd::execute_rmd_stripe_gemmini_for_test(
+            a4_native.args, *a4_native.packet, output, &metrics);
+        ok = check(status == RmdStatus::unsupported_route &&
+                       compressed_outputs_match(output, sentinel) &&
+                       metrics.ws_call_count == 0 && metrics.matmul_call_count == 0 &&
+                       ggml::gemmini::quants::wreader::test_weight_reader_code_address_resolutions() == 0,
+                   "A4 digits cannot enter an elem_t-addressed raw WS adapter") && ok;
+    }
     constexpr uint8_t mismatch_bits =
         GGML_GEMMINI_ACTIVATION_BITS == 16 ? uint8_t{8} : uint8_t{16};
     CompactOracleFixture mismatched_native(mismatch_bits, WeightFamily::H1);

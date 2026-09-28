@@ -36,8 +36,10 @@ function(write_profile path bits dim)
         "  \"scu\": \"hp1-left-shift\",\n"
         "  \"packing\": \"${packing}\",\n"
         "  \"numerical_revision\": \"hp1-fragment-sat32-v1\",\n"
-        "  \"rmd_raw\": true,\n"
-        "  \"rmd_numerical_revision\": \"rmd-raw-k32-cpu-compose-v1\",\n"
+        "  \"rmd_enabled\": true,\n"
+        "  \"rmd_datapath\": \"NORMAL_HP1_SCALED\",\n"
+        "  \"rmd_raw\": false,\n"
+        "  \"rmd_numerical_revision\": \"rmd-hp1-scu-sat32-radix-v1\",\n"
         "  \"memory\": {\"bank_count\": 4, \"bank_rows\": ${bank_rows}, "
         "\"accumulator_rows\": ${accumulator_rows}, \"scratchpad_row_bytes\": ${scratchpad_row_bytes}, "
         "\"accumulator_row_bytes\": ${accumulator_row_bytes}, \"scratchpad_total_bytes\": 262144, "
@@ -117,13 +119,13 @@ expect_contains("${legacy_output}" "GGML_GEMMINI_ENABLE_RMD_DEFAULT=ON")
 
 set(profile "${TEST_BINARY_ROOT}/a4w4-d16-hp1.json")
 file(READ "${profile}" dense_only_text)
-string(REPLACE "\"rmd_raw\": true" "\"rmd_raw\": false" dense_only_text "${dense_only_text}")
+string(REPLACE "\"rmd_enabled\": true" "\"rmd_enabled\": false" dense_only_text "${dense_only_text}")
 file(WRITE "${TEST_BINARY_ROOT}/dense-only.json" "${dense_only_text}")
 run_resolver(rmd-dense-only FALSE rmd_output
     -DIM2P_FPGA_ARCH=GEMMINI_HP1
     -DIM2P_GEMMINI_RESOLVED_PROFILE=${TEST_BINARY_ROOT}/dense-only.json
     -DGGML_GEMMINI_ENABLE_RMD=ON)
-expect_contains("${rmd_output}" "GEMMINI_HP1 RMD ON requires the RMD_RAW manifest contract")
+expect_contains("${rmd_output}" "GEMMINI_HP1 RMD ON requires the SCU-scaled RMD manifest contract")
 
 run_resolver(rmd-invalid FALSE rmd_output
     -DIM2P_FPGA_ARCH=GEMMINI_HP1

@@ -71,7 +71,7 @@ if(IM2P_FPGA_ARCH STREQUAL "GEMMINI_HP1")
         set(_fpga_packing signed-int8)
     endif()
     set(_fpga_identity
-        "ABI5;GEMMINI_HP1;HP1_ONLY;${IM2P_GEMMINI_PROFILE_ID};A${GGML_GEMMINI_ACTIVATION_BITS}/W${GGML_GEMMINI_WEIGHT_BITS}/D${GGML_GEMMINI_DIM};ACC32;block32;${_fpga_packing};hp1-fragment-sat32-v1;RMD_${GGML_GEMMINI_ENABLE_RMD};rmd-raw-k32-cpu-compose-v1\n")
+        "ABI5;GEMMINI_HP1;HP1_ONLY;${IM2P_GEMMINI_PROFILE_ID};A${GGML_GEMMINI_ACTIVATION_BITS}/W${GGML_GEMMINI_WEIGHT_BITS}/D${GGML_GEMMINI_DIM};ACC32;block32;${_fpga_packing};hp1-fragment-sat32-v1;RMD_${GGML_GEMMINI_ENABLE_RMD}\n")
 else()
     set(_fpga_identity "ABI5;IFR3;signed-scu-sat-v2;H1;domain2;IFR4;RTL_PLUGIN1;scu_final_integer;H1:op4,HP1:op5;domain2;explicit_main_external:domain1;A8/W8/D16;block32;RMD_${GGML_GEMMINI_ENABLE_RMD}\n")
 endif()

@@ -482,13 +482,6 @@ static void device_diagnostics(Im2pExecutionTelemetry &record,
   record.provider_stats = stats;
   record.backend = "im2p_sim";
   record.clock_domain = residual ? "independent_rmd_simulator" : "dense_simulator";
-  record.numerical_contract = residual ? "signed_radix_dot" : "main_external";
-  const bool bypass = residual || args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_h0 ||
-      args.has_q8_channel_direct_read_contract() || args.has_q8_channel_dense_sidecar_contract();
-  record.vector_op = bypass ? IM2P_VECTOR_BYPASS : IM2P_VECTOR_EXTERNAL;
-  record.output_domain = bypass ? IM2P_OUTPUT_LEGACY_FINAL : IM2P_OUTPUT_LEGACY_BLOCK;
-  record.scale_mode = residual ? "bypass_radix_host_reconstruction" :
-      bypass ? "bypass_host_scale" : "external_block_scale";
   record.activation_bits = GGML_GEMMINI_ACTIVATION_BITS;
   record.weight_bits = GGML_GEMMINI_WEIGHT_BITS;
   record.dim = DIM;
