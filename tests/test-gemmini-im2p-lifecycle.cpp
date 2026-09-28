@@ -544,18 +544,18 @@ bool test_stats_contract_failures() {
   full_source.stats.base.stripes_published = 1;
   full_source.stats.base.stripe_rows_published = 3;
   const Completion full =
-      translate(full_source, ::im2p::gemmini::Mode::full, 0, 0);
+      translate(full_source, {}, ::im2p::gemmini::Mode::full, 0, 0);
 
   auto pipeline_count_source = full_source;
   pipeline_count_source.stats.base.stripes_published = 2;
   const Completion pipeline_count = translate(
-      pipeline_count_source, ::im2p::gemmini::Mode::stripe_pipeline, 3, 3);
+      pipeline_count_source, {}, ::im2p::gemmini::Mode::stripe_pipeline, 3, 3);
 
   auto pipeline_rows_source = full_source;
   pipeline_rows_source.stats.base.stripes_published = 3;
   pipeline_rows_source.stats.base.stripe_rows_published = 2;
   const Completion pipeline_rows = translate(
-      pipeline_rows_source, ::im2p::gemmini::Mode::stripe_pipeline, 3, 3);
+      pipeline_rows_source, {}, ::im2p::gemmini::Mode::stripe_pipeline, 3, 3);
 
   const TestCounters counters = test_counters();
   const bool ok =
