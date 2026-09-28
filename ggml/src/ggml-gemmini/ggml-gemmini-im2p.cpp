@@ -483,15 +483,18 @@ static void device_diagnostics(Im2pExecutionTelemetry &record,
   record.backend = "im2p_sim";
   record.clock_domain = residual ? "independent_rmd_simulator" : "dense_simulator";
   if (stats.dense_descriptor_submitted) {
-    switch (static_cast<::im2p::gemmini::NumericalContract>(
-        stats.dense_numerical_contract)) {
-      case ::im2p::gemmini::NumericalContract::scu_final_integer:
-        record.numerical_contract = "scu_final_integer"; break;
-      case ::im2p::gemmini::NumericalContract::main_external:
-        record.numerical_contract = "main_external"; break;
-    }
     record.vector_op = stats.dense_vector_op;
     record.output_domain = stats.dense_output_domain;
+    if (stats.dense_output_domain == IM2P_OUTPUT_SCU_FINAL &&
+        (stats.dense_vector_op == IM2P_VECTOR_UNSIGNED_MULTIPLY ||
+         stats.dense_vector_op == IM2P_VECTOR_LEFT_SHIFT))
+      record.numerical_contract = "scu_final_integer";
+    else if (stats.dense_output_domain == IM2P_OUTPUT_LEGACY_BLOCK &&
+             stats.dense_vector_op == IM2P_VECTOR_EXTERNAL)
+      record.numerical_contract = "main_external";
+    else if (stats.dense_output_domain == IM2P_OUTPUT_LEGACY_FINAL &&
+             stats.dense_vector_op == IM2P_VECTOR_BYPASS)
+      record.numerical_contract = "legacy_bypass";
     switch (stats.dense_vector_op) {
       case IM2P_VECTOR_BYPASS: record.scale_mode = "bypass"; break;
       case IM2P_VECTOR_MULTIPLY: record.scale_mode = "multiply"; break;
@@ -532,16 +535,15 @@ static void emit_rmd_workload(const ggml_gemmini_args_t &args,
 }
 
 Completion translate(const ::im2p::gemmini::FenceResult &result,
+                     const ::im2p::gemmini::DenseDescriptorMetadata &descriptor,
                      ::im2p::gemmini::Mode mode,
                      std::uint64_t expected_publications,
                      std::uint64_t expected_published_rows) noexcept {
   const auto &base = result.stats.base;
   Stats stats = translate_stats(result.stats);
-  stats.dense_descriptor_submitted = result.dense_descriptor_submitted;
-  stats.dense_vector_op = result.dense_vector_op;
-  stats.dense_output_domain = result.dense_output_domain;
-  stats.dense_numerical_contract =
-      static_cast<std::uint8_t>(result.dense_numerical_contract);
+  stats.dense_descriptor_submitted = descriptor.submitted;
+  stats.dense_vector_op = descriptor.vector_op;
+  stats.dense_output_domain = descriptor.output_domain;
   Result translated = translate(result.status);
   if (!translated.ok()) {
     return {translated, stats};
@@ -1089,7 +1091,8 @@ Completion run_full(const ggml_gemmini_args_t &args) noexcept {
   fence.finish(fenced.status.ok());
   worker_timing.success = fenced.status.ok();
   Completion completion =
-      translate(fenced, ::im2p::gemmini::Mode::full, 0, 0);
+      translate(fenced, ::im2p::gemmini::dense_descriptor_metadata(*started.run),
+                ::im2p::gemmini::Mode::full, 0, 0);
 #if defined(GGML_GEMMINI_TESTING)
   if (failure == TestFailure::fence) {
     std::lock_guard lock(test_mutex);
@@ -1236,7 +1239,8 @@ Completion run_stripe_pipeline(const ggml_gemmini_args_t &args) noexcept {
   fence.finish(fenced.status.ok());
   worker_timing.success = fenced.status.ok();
   Completion completion = translate(
-      fenced, ::im2p::gemmini::Mode::stripe_pipeline,
+      fenced, ::im2p::gemmini::dense_descriptor_metadata(*started.run),
+      ::im2p::gemmini::Mode::stripe_pipeline,
       static_cast<std::uint64_t>(stripe_id),
       static_cast<std::uint64_t>(runtime_args.I));
 #if defined(GGML_GEMMINI_TESTING)
@@ -2229,7 +2233,8 @@ Completion ExsiaFullExecution::finish(bool quantization_succeeded) noexcept {
   fence.finish(fenced.status.ok());
   impl_->worker_timing.success = fenced.status.ok();
   Completion completion =
-      translate(fenced, ::im2p::gemmini::Mode::full, 0, 0);
+      translate(fenced, ::im2p::gemmini::dense_descriptor_metadata(*impl_->run),
+                ::im2p::gemmini::Mode::full, 0, 0);
   impl_->fenced = true;
 #if defined(GGML_GEMMINI_TESTING)
   if (failure == TestFailure::fence) {
@@ -2427,7 +2432,8 @@ Completion ExsiaStripePipeline::finish(bool quantization_succeeded) noexcept {
       1);
   impl_->rmd_weights.reset();
   Completion completion = translate(
-      fenced, ::im2p::gemmini::Mode::stripe_pipeline, expected_publications,
+      fenced, ::im2p::gemmini::dense_descriptor_metadata(*impl_->run),
+      ::im2p::gemmini::Mode::stripe_pipeline, expected_publications,
       static_cast<std::uint64_t>(impl_->runtime_args.I));
   impl_->fenced = true;
 #if defined(GGML_GEMMINI_TESTING)

@@ -84,7 +84,7 @@ static bool check_frontend_worker_summary() {
     json.append(buffer, count);
   log::cycle.set_output(stderr);
   std::fclose(output);
-#if LOG_CYCLE
+#if LOG_CYCLE && CYCLE_DETAIL
   const auto first = json.find("\"record_type\":\"CPU_WORK_SUMMARY\"");
   const auto second = json.find("\"record_type\":\"CPU_WORK_SUMMARY\"", first + 1);
   return enabled && first != std::string::npos && second != std::string::npos &&
@@ -98,6 +98,15 @@ static bool check_frontend_worker_summary() {
     json.find("\"start_tid\":" + std::to_string(cycle::host_thread_id())) == std::string::npos &&
     json.find("\"operation_success\":true") != std::string::npos &&
     json.find("\"operation_success\":false") != std::string::npos;
+#elif LOG_CYCLE
+  (void) worker_tid;
+  return enabled &&
+    json.find("\"op\":\"im2p.simulation_worker\"") != std::string::npos &&
+    json.find("\"kind\":\"segment\"") != std::string::npos &&
+    json.find("\"run_id\":42") != std::string::npos &&
+    json.find("\"ns_start\":") != std::string::npos &&
+    json.find("\"ns_end\":") != std::string::npos &&
+    json.find("\"record_type\":\"CPU_WORK_SUMMARY\"") == std::string::npos;
 #else
   (void) worker_tid;
   return !enabled && json.empty();
@@ -154,17 +163,39 @@ int main() {
   im2p_adapter::copy_staged_output(args, source);
   const auto copy_reads = cycle::read_count_for_test();
   bool ok = destination == std::vector<float>({1, -1, 2, -1, -1, 3, -1, 4});
+  const auto contract_for = [&](bool submitted, std::uint8_t op,
+                                std::uint8_t domain) {
+    im2p_adapter::Stats stats{};
+    stats.dense_descriptor_submitted = submitted;
+    stats.dense_vector_op = op;
+    stats.dense_output_domain = domain;
+    Im2pExecutionTelemetry telemetry{};
+    im2p_adapter::device_diagnostics(telemetry, args, stats);
+    return telemetry.numerical_contract;
+  };
+  ok = ok &&
+       contract_for(true, IM2P_VECTOR_LEFT_SHIFT, IM2P_OUTPUT_SCU_FINAL) ==
+           "scu_final_integer" &&
+       contract_for(true, IM2P_VECTOR_EXTERNAL, IM2P_OUTPUT_LEGACY_BLOCK) ==
+           "main_external" &&
+       contract_for(true, IM2P_VECTOR_BYPASS, IM2P_OUTPUT_LEGACY_FINAL) ==
+           "legacy_bypass" &&
+       contract_for(false, 0, 0).empty();
   quants::act::exsia::StripeReadyEvent event{};
   event.run_id = 0;
   event.stripe_id = 3;
   event.slot = 1;
   {
-    im2p_adapter::HostCpuInterval interval(args, "test.explicit_finish", &event);
+    im2p_adapter::HostCpuInterval interval(
+        args, "test.explicit_finish",
+        im2p_adapter::HostIntervalAccounting::cpu_work, &event);
     interval.finish();
     interval.finish();
   }
   {
-    im2p_adapter::HostCpuInterval interval(args, "test.partial_return", &event);
+    im2p_adapter::HostCpuInterval interval(
+        args, "test.partial_return",
+        im2p_adapter::HostIntervalAccounting::cpu_work, &event);
     // A return before the success boundary must not claim operation success.
   }
   std::fflush(output);
@@ -189,13 +220,20 @@ int main() {
        occurrences("\"stripe_id\":3") == 2 &&
        occurrences("\"slot\":1") == 2 &&
        occurrences("\"operation_success\":true") == 2 &&
-       occurrences("\"operation_success\":false") == 1 &&
+       occurrences("\"operation_success\":false") == 1;
+#if CYCLE_DETAIL
+  ok = ok &&
        occurrences("\"additive\":false") == 3 &&
        occurrences("\"host_timing\":{") == 3 &&
        occurrences("\"native_cycles\":{") == 3 &&
        occurrences("\"thread_cpu_timing\":{") == 3 &&
        occurrences("\"start_tid\":" + std::to_string(cycle::host_thread_id())) == 3 &&
        occurrences("\"end_tid\":" + std::to_string(cycle::host_thread_id())) == 3;
+#else
+  ok = ok && occurrences("\"ns_start\":") == 3 &&
+       occurrences("\"ns_end\":") == 3 &&
+       occurrences("\"tid\":") == 3;
+#endif
 #if !defined(__linux__) || !defined(__aarch64__)
   ok = ok && copy_reads == 2;
 #endif
@@ -2769,11 +2807,10 @@ bool run_stats_translation_contract() {
 
   ::im2p::gemmini::FenceResult source{};
   source.status = {};
-  source.dense_descriptor_submitted = true;
-  source.dense_vector_op = IM2P_VECTOR_LEFT_SHIFT;
-  source.dense_output_domain = IM2P_OUTPUT_SCU_FINAL;
-  source.dense_numerical_contract =
-      ::im2p::gemmini::NumericalContract::scu_final_integer;
+  ::im2p::gemmini::DenseDescriptorMetadata descriptor{};
+  descriptor.submitted = true;
+  descriptor.vector_op = IM2P_VECTOR_LEFT_SHIFT;
+  descriptor.output_domain = IM2P_OUTPUT_SCU_FINAL;
   std::uint64_t value = 101;
 #define SET_RAW(field) source.stats.field = value++
   SET_RAW(base.work_total_cycles);
@@ -2835,7 +2872,7 @@ bool run_stats_translation_contract() {
   source.rmd_stats.base.work_total_cycles = 55;
 
   const Completion translated = translate(
-      source, ::im2p::gemmini::Mode::stripe_pipeline,
+      source, descriptor, ::im2p::gemmini::Mode::stripe_pipeline,
       source.stats.base.stripes_published,
       source.stats.base.stripe_rows_published);
   const std::array<std::uint64_t, 41> actual = {
@@ -2928,10 +2965,7 @@ bool run_stats_translation_contract() {
                   "sentinel statistics satisfy PIPELINE geometry");
   ok = check(translated.stats.dense_descriptor_submitted &&
                  translated.stats.dense_vector_op == IM2P_VECTOR_LEFT_SHIFT &&
-                 translated.stats.dense_output_domain == IM2P_OUTPUT_SCU_FINAL &&
-                 translated.stats.dense_numerical_contract ==
-                     static_cast<std::uint8_t>(
-                         ::im2p::gemmini::NumericalContract::scu_final_integer),
+                 translated.stats.dense_output_domain == IM2P_OUTPUT_SCU_FINAL,
              "submitted dense descriptor survives fence translation") && ok;
   ok = check(translated.semantic_completion_count == 1 &&
                  translated.rmd_dot_calls == 5 &&
@@ -2943,7 +2977,7 @@ bool run_stats_translation_contract() {
   failed_source.status.code =
       ::im2p::gemmini::StatusCode::execution_failure;
   const Completion failed_translation = translate(
-      failed_source, ::im2p::gemmini::Mode::stripe_pipeline,
+      failed_source, descriptor, ::im2p::gemmini::Mode::stripe_pipeline,
       source.stats.base.stripes_published,
       source.stats.base.stripe_rows_published);
   ok = check(!failed_translation.result.ok() &&
@@ -2970,7 +3004,7 @@ bool run_stats_translation_contract() {
   full.stats.base.stripes_published = 0;
   full.stats.base.stripe_rows_published = 0;
   const Completion full_translated =
-      translate(full, ::im2p::gemmini::Mode::full, 0, 0);
+      translate(full, descriptor, ::im2p::gemmini::Mode::full, 0, 0);
   ok = check(full_translated.result.ok() &&
                  full_translated.stats.rtl_compute_cycles == 117 &&
                  full_translated.stats.rtl_completed_output_works == 123 &&
@@ -2983,19 +3017,19 @@ bool run_stats_translation_contract() {
   canonical_pipeline_source.stats.base.stripes_published = 3;
   canonical_pipeline_source.stats.base.stripe_rows_published = 33;
   const Completion canonical_pipeline = translate(
-      canonical_pipeline_source, ::im2p::gemmini::Mode::stripe_pipeline, 3,
+      canonical_pipeline_source, descriptor, ::im2p::gemmini::Mode::stripe_pipeline, 3,
       33);
   ok = check(canonical_pipeline.result.ok(),
              "PIPELINE accepts the canonical three-stripe 33-row geometry") &&
        ok;
   const Completion invalid_full =
-      translate(source, ::im2p::gemmini::Mode::full, 0, 0);
+      translate(source, descriptor, ::im2p::gemmini::Mode::full, 0, 0);
   const Completion invalid_pipeline_count = translate(
-      source, ::im2p::gemmini::Mode::stripe_pipeline,
+      source, descriptor, ::im2p::gemmini::Mode::stripe_pipeline,
       source.stats.base.stripes_published + 1,
       source.stats.base.stripe_rows_published);
   const Completion invalid_pipeline_rows = translate(
-      source, ::im2p::gemmini::Mode::stripe_pipeline,
+      source, descriptor, ::im2p::gemmini::Mode::stripe_pipeline,
       source.stats.base.stripes_published,
       source.stats.base.stripe_rows_published + 1);
   ok = check(invalid_full.result.error == Error::invalid_contract &&
