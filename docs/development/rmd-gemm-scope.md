@@ -9,10 +9,11 @@
   `IM2P_FPGA_ARCH=GEMMINI_HP1`을 대상으로 한다. `LEGACY_BSV`와
   `BSV_IFR4` 경로는 이 작업의 비교 기준이나 수정 대상이 아니다.
   RMD의 pruning, compact A/W 준비, 결과 복원 같은 호스트 작업은 계속 CPU에서 한다.
+- 핵심 변경은 **RMD A4 activation 패킷의 nibble packing 제거**다.
+  A4와 A8 activation은 dense frontend ABI처럼 모두 원소당 signed byte로
+  저장·전달한다. A4의 값 범위는 여전히 4비트 signed 범위다. 원본 Q4 weight의
+  nibble packing은 유지한다.
 - 대상 수치 profile은 지원되는 matched A4/W4 또는 A8/W8 HP1이다.
-  A4 activation은 dense와 같이 **원소당 signed byte**로 ABI에 전달한다.
-  원본 Q4 weight 저장의 nibble packing은 유지한다. RMD 전용 activation
-  nibble packet은 만들지 않는다.
 - Dense와 RMD의 HP1 GEMM은 같은 Gemmini/SCU 수치 계약을 따른다.
   Descriptor는 `IM2P_VECTOR_LEFT_SHIFT`(op 5),
   `IM2P_OUTPUT_SCU_FINAL`을 사용한다. 원본 HP1 block/column의 `m` carrier를
