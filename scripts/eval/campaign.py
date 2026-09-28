@@ -51,6 +51,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--im2p", type=Path, default=REPO.parent / "IM2P.sim")
     result.add_argument("--prepared-build", type=Path, help="explicit previously verified build_measurement.sh directory")
     result.add_argument("--workload-manifest", type=Path, help="optional exact native chunk identity from another metric")
+    result.add_argument("--evaluation-manifest", type=Path,
+                        help="shared v1 evaluation_manifest.json (e.g. from cycle trace capture); bytes are reused")
     result.add_argument("--trace-source", type=Path, help="existing actual-inference trace; omission captures a fresh prefill")
     result.add_argument("--source-provenance", type=Path, help="required for existing trace replay")
     result.add_argument("--certificate", type=Path, help="stateful production certificate admitting exact trace")
@@ -109,10 +111,21 @@ def run_campaign(args: argparse.Namespace) -> Path:
         producer_hash = text(record(original["build"]), "binary_sha256")
         policy = "CERTIFIED_SOURCE_PREFILL_256:split=test:chunk=0:output=last_token:sample=1:decode=0"
     manifest_path = output / "evaluation_manifest.json"
-    write_json(manifest_path, {"model": "GPT-2 124M" if args.model == "gpt2" else "Llama-3.2-1B",
-        "dataset": "WikiText-2", "tokenizer_sha256": tokenizer, "tokenizer_hash": tokenizer,
-        "precision": args.precision.upper(), "dim": args.dim, "DIM": args.dim, "BK": 32,
-        "seed": args.seed, "git_sha": head, "build_hash": producer_hash, "chunk_policy": policy})
+    model_name = "GPT-2 124M" if args.model == "gpt2" else "Llama-3.2-1B"
+    if args.evaluation_manifest is None:
+        write_json(manifest_path, {"model": model_name,
+            "dataset": "WikiText-2", "tokenizer_sha256": tokenizer, "tokenizer_hash": tokenizer,
+            "precision": args.precision.upper(), "dim": args.dim, "DIM": args.dim, "BK": 32,
+            "seed": args.seed, "git_sha": head, "build_hash": producer_hash, "chunk_policy": policy})
+    else:
+        require(args.kind != "cycle", "cycle campaigns bind the manifest through their trace certificate")
+        shared = read_json(args.evaluation_manifest.resolve(strict=True))
+        require(shared.get("model") == model_name and shared.get("tokenizer_sha256") == tokenizer and
+                shared.get("precision") == args.precision.upper() and shared.get("dim") == args.dim and
+                shared.get("seed") == args.seed and shared.get("git_sha") == head and
+                shared.get("chunk_policy") == policy, "shared evaluation manifest differs from this measurement")
+        with manifest_path.open("xb") as stream:
+            stream.write(args.evaluation_manifest.resolve(strict=True).read_bytes())
     manifest = Manifest.load(manifest_path)
     binding: Record = {"manifest_sha256": manifest.sha256, "kind": args.kind,
         "model_path": str(model), "model_sha256": sha256(model), "dataset_path": str(dataset),
