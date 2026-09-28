@@ -163,24 +163,6 @@ int main() {
   im2p_adapter::copy_staged_output(args, source);
   const auto copy_reads = cycle::read_count_for_test();
   bool ok = destination == std::vector<float>({1, -1, 2, -1, -1, 3, -1, 4});
-  const auto contract_for = [&](bool submitted, std::uint8_t op,
-                                std::uint8_t domain) {
-    im2p_adapter::Stats stats{};
-    stats.dense_descriptor_submitted = submitted;
-    stats.dense_vector_op = op;
-    stats.dense_output_domain = domain;
-    Im2pExecutionTelemetry telemetry{};
-    im2p_adapter::device_diagnostics(telemetry, args, stats);
-    return telemetry.numerical_contract;
-  };
-  ok = ok &&
-       contract_for(true, IM2P_VECTOR_LEFT_SHIFT, IM2P_OUTPUT_SCU_FINAL) ==
-           "scu_final_integer" &&
-       contract_for(true, IM2P_VECTOR_EXTERNAL, IM2P_OUTPUT_LEGACY_BLOCK) ==
-           "main_external" &&
-       contract_for(true, IM2P_VECTOR_BYPASS, IM2P_OUTPUT_LEGACY_FINAL) ==
-           "legacy_bypass" &&
-       contract_for(false, 0, 0).empty();
   quants::act::exsia::StripeReadyEvent event{};
   event.run_id = 0;
   event.stripe_id = 3;
@@ -2807,10 +2789,6 @@ bool run_stats_translation_contract() {
 
   ::im2p::gemmini::FenceResult source{};
   source.status = {};
-  ::im2p::gemmini::DenseDescriptorMetadata descriptor{};
-  descriptor.submitted = true;
-  descriptor.vector_op = IM2P_VECTOR_LEFT_SHIFT;
-  descriptor.output_domain = IM2P_OUTPUT_SCU_FINAL;
   std::uint64_t value = 101;
 #define SET_RAW(field) source.stats.field = value++
   SET_RAW(base.work_total_cycles);
@@ -2872,7 +2850,7 @@ bool run_stats_translation_contract() {
   source.rmd_stats.base.work_total_cycles = 55;
 
   const Completion translated = translate(
-      source, descriptor, ::im2p::gemmini::Mode::stripe_pipeline,
+      source, ::im2p::gemmini::Mode::stripe_pipeline,
       source.stats.base.stripes_published,
       source.stats.base.stripe_rows_published);
   const std::array<std::uint64_t, 41> actual = {
@@ -2963,10 +2941,6 @@ bool run_stats_translation_contract() {
   };
   bool ok = check(translated.result.ok(),
                   "sentinel statistics satisfy PIPELINE geometry");
-  ok = check(translated.stats.dense_descriptor_submitted &&
-                 translated.stats.dense_vector_op == IM2P_VECTOR_LEFT_SHIFT &&
-                 translated.stats.dense_output_domain == IM2P_OUTPUT_SCU_FINAL,
-             "submitted dense descriptor survives fence translation") && ok;
   ok = check(translated.semantic_completion_count == 1 &&
                  translated.rmd_dot_calls == 5 &&
                  translated.rmd_stats.rtl_work_total_cycles == 55 &&
@@ -2977,17 +2951,15 @@ bool run_stats_translation_contract() {
   failed_source.status.code =
       ::im2p::gemmini::StatusCode::execution_failure;
   const Completion failed_translation = translate(
-      failed_source, descriptor, ::im2p::gemmini::Mode::stripe_pipeline,
+      failed_source, ::im2p::gemmini::Mode::stripe_pipeline,
       source.stats.base.stripes_published,
       source.stats.base.stripe_rows_published);
   ok = check(!failed_translation.result.ok() &&
                  failed_translation.semantic_completion_count == 0 &&
                  failed_translation.rmd_dot_calls == 0 &&
                  failed_translation.rmd_stats.rtl_work_total_cycles == 0 &&
-                 failed_translation.stats.rtl_work_total_cycles == 101 &&
-                 failed_translation.stats.dense_descriptor_submitted &&
-                 failed_translation.stats.dense_vector_op == IM2P_VECTOR_LEFT_SHIFT,
-             "failed translation preserves dense meaning but hides semantic RMD success") &&
+                 failed_translation.stats.rtl_work_total_cycles == 101,
+             "failed translation preserves dense stats but hides semantic RMD success") &&
        ok;
   for (std::size_t index = 0; index < actual.size(); ++index) {
     ok = check(actual[index] == 101 + index,
@@ -3004,7 +2976,7 @@ bool run_stats_translation_contract() {
   full.stats.base.stripes_published = 0;
   full.stats.base.stripe_rows_published = 0;
   const Completion full_translated =
-      translate(full, descriptor, ::im2p::gemmini::Mode::full, 0, 0);
+      translate(full, ::im2p::gemmini::Mode::full, 0, 0);
   ok = check(full_translated.result.ok() &&
                  full_translated.stats.rtl_compute_cycles == 117 &&
                  full_translated.stats.rtl_completed_output_works == 123 &&
@@ -3017,19 +2989,19 @@ bool run_stats_translation_contract() {
   canonical_pipeline_source.stats.base.stripes_published = 3;
   canonical_pipeline_source.stats.base.stripe_rows_published = 33;
   const Completion canonical_pipeline = translate(
-      canonical_pipeline_source, descriptor, ::im2p::gemmini::Mode::stripe_pipeline, 3,
+      canonical_pipeline_source, ::im2p::gemmini::Mode::stripe_pipeline, 3,
       33);
   ok = check(canonical_pipeline.result.ok(),
              "PIPELINE accepts the canonical three-stripe 33-row geometry") &&
        ok;
   const Completion invalid_full =
-      translate(source, descriptor, ::im2p::gemmini::Mode::full, 0, 0);
+      translate(source, ::im2p::gemmini::Mode::full, 0, 0);
   const Completion invalid_pipeline_count = translate(
-      source, descriptor, ::im2p::gemmini::Mode::stripe_pipeline,
+      source, ::im2p::gemmini::Mode::stripe_pipeline,
       source.stats.base.stripes_published + 1,
       source.stats.base.stripe_rows_published);
   const Completion invalid_pipeline_rows = translate(
-      source, descriptor, ::im2p::gemmini::Mode::stripe_pipeline,
+      source, ::im2p::gemmini::Mode::stripe_pipeline,
       source.stats.base.stripes_published,
       source.stats.base.stripe_rows_published + 1);
   ok = check(invalid_full.result.error == Error::invalid_contract &&

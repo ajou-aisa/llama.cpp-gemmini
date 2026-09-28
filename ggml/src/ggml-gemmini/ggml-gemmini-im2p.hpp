@@ -11,7 +11,6 @@ namespace im2p::gemmini {
 enum class Mode : std::uint8_t;
 struct Status;
 struct FenceResult;
-struct DenseDescriptorMetadata;
 } // namespace im2p::gemmini
 
 namespace ggml::gemmini::im2p_adapter {
@@ -79,9 +78,6 @@ struct Stats {
   std::uint64_t rtl_current_scheduler_group_completion_cycle = 0;
   std::uint64_t rtl_lookahead_ready_cycle = 0;
   std::uint64_t rtl_lookahead_start_cycle = 0;
-  bool dense_descriptor_submitted = false;
-  std::uint8_t dense_vector_op = 0;
-  std::uint8_t dense_output_domain = 0;
 };
 
 struct Completion {
@@ -139,7 +135,6 @@ struct ExsiaRouteRequest {
 [[nodiscard]] Result translate(const ::im2p::gemmini::Status &status) noexcept;
 [[nodiscard]] Completion translate(
     const ::im2p::gemmini::FenceResult &result,
-    const ::im2p::gemmini::DenseDescriptorMetadata &descriptor,
     ::im2p::gemmini::Mode mode,
     std::uint64_t expected_publications,
     std::uint64_t expected_published_rows) noexcept;

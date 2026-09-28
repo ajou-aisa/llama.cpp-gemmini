@@ -730,7 +730,7 @@ bool residual_transport_fixtures(bool failure_selector) {
     success.rmd_dot_calls = 3;
     success.rmd_stats.base.work_total_cycles = 29;
     const auto translated = im2p_adapter::translate(
-        success, {}, ::im2p::gemmini::Mode::full, 0, 0);
+        success, ::im2p::gemmini::Mode::full, 0, 0);
     if (!expect(translated.result.ok() && translated.stats.rtl_work_total_cycles == 701 &&
                 translated.semantic_completion_count == 1 && translated.rmd_dot_calls == 3 &&
                 translated.rmd_stats.rtl_work_total_cycles == 29,
@@ -743,7 +743,7 @@ bool residual_transport_fixtures(bool failure_selector) {
     zero.rmd_dot_calls = 0;
     zero.rmd_stats = {};
     const auto zero_translated = im2p_adapter::translate(
-        zero, {}, ::im2p::gemmini::Mode::full, 0, 0);
+        zero, ::im2p::gemmini::Mode::full, 0, 0);
     if (!expect(zero_translated.result.ok() && zero_translated.rmd_dot_calls == 0 &&
                 zero_translated.rmd_stats.rtl_work_total_cycles == 0,
                 "H0 or empty residual transport reports zero simulator calls")) return false;
@@ -767,7 +767,7 @@ bool residual_transport_fixtures(bool failure_selector) {
     failed.status.code = ::im2p::gemmini::StatusCode::execution_failure;
     failed.status.message = "injected residual failure";
     const auto failed_translation = im2p_adapter::translate(
-        failed, {}, ::im2p::gemmini::Mode::full, 0, 0);
+        failed, ::im2p::gemmini::Mode::full, 0, 0);
     const auto failed_emit = im2p_adapter::emit_residual_stripe_timings(failed, args, 17);
 
     auto malformed = success;
