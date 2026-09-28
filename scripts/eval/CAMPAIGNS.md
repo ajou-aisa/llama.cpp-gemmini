@@ -55,10 +55,48 @@ denominators remain null. RES `radix_limb_count` sums radix counts per main stri
 pruning/compaction fields contain explicit removed counts and fractions. SCU
 delta is HP1 block-PoT-to-channel-anchor offset, not unavailable pre-PoT FP error.
 
-## Cycles and certification boundary
+## Cycle trace capture, certificate and campaign
 
 ```sh
-scripts/eval/run_cycle_campaign.sh --model gpt2 --precision a8w8 --dim 16 \
+ROOT="/absolute/evaluation-cycle-campaign-$(date -u +%Y%m%dT%H%M%SZ)"
+python3 -B scripts/eval/cycle_campaign_bundle.py init "$ROOT"
+scripts/eval/run_cycle_trace_capture.sh --model gpt2 --precision a8w8 --dim 16 --campaign-root "$ROOT" \
+  --parent /absolute/stateful-full374-current.json /absolute/tag6-evidence-root
+scripts/eval/run_cycle_campaign.sh \
+  --trace "$ROOT/trace/evaluation-cycle/GPT-2-124M/A8W8/DIM16/capture/trace.jsonl.gz" \
+  --certificate "$ROOT/certificate/GPT-2-124M/A8W8/DIM16/cycle_trace_certificate.json" \
+  --output "$ROOT/cycle/GPT-2-124M/A8W8/DIM16"
+python3 -B scripts/eval/cycle_campaign_bundle.py finalize "$ROOT"   # after regression/results.json
+```
+
+Capture configures a fresh metrics-OFF `CYCLE_SIM=1` `STRIPE_PIPELINE` build, runs actual
+inference (WikiText-2 test chunk0, 256 prefill tokens plus one greedy sample, seed 1234), and writes
+`trace/evaluation-cycle/<Model>/<Precision>/DIM<n>/capture/` with `trace.jsonl.gz` (byte-exact
+deterministic gzip of the native trace; content SHA recorded), `producer-manifest.json`,
+`evaluation-manifest.json` (also copied to `manifest/.../evaluation_manifest.json`),
+`source-binding.json` (git SHAs/diffs, compiler, build/metric/cycle options) and `SHA256SUMS`.
+It then builds `certificate/.../cycle_trace_certificate.json` with IM2P.sim
+`sim.cycle.cycle_trace_certificate`. A fresh trace is admitted only when its ordered NPU work
+descriptors (geometry, tile shape, compact runs, row map, work classes) equal a supplied,
+independently certified corpus that itself passes current `validate`/`admit`; it inherits that
+corpus's state-domain revision and offer policy. Otherwise `rejection.json` is written, the script
+exits 3 and no cycle run is possible. The certificate is re-verified by recomputation at every use.
+
+The campaign verifies the certificate, admits it through the unchanged
+`StatefulSequenceProvider` admission path, executes every work back-to-back in one session with
+passive native event recording, and writes `cycle-results.json`, `per-work-cycle.jsonl`,
+`scu-cycle-accounting.json`, `window-parity.json` and `SHA256SUMS`. `--reference-per-work` requires
+exact offered/accepted/result/final-scale/resource windows against an earlier replay. Load, store,
+scale and SCU cycles are unions of closed intervals of existing native events
+(ReadRequest/Response, WriteRequest/Completion, ScaleRequest/Response, ScaleLane, ScaleRelease)
+inside each work's accepted-to-resource-ready window; event counts must equal native counters.
+SCU execution timing is separate from the SCU scale-alignment metric. Metric campaigns can bind the
+same manifest bytes with `--evaluation-manifest manifest/.../evaluation_manifest.json`.
+
+## Legacy cycle replay adapter
+
+```sh
+python3 -B scripts/eval/campaign.py cycle --model gpt2 --precision a8w8 --dim 16 \
   --certificate /absolute/stateful-certificate.json \
   --evidence-root /absolute/existing-certified-evidence \
   --library /absolute/certified/libim2p_cycle_model.dylib \
@@ -89,15 +127,15 @@ Dense/residual cycles are result-ready minus accepted. Submission count is nativ
 planner loop/frame count; logical work count is separate. Traffic uses native
 request/response transactions, not guessed bytes. Resource cycles use the
 resource-ready minus offered interval. SCU drain tail is reported separately;
-the provider does **not** expose total SCU-active cycles, so `scu_cycles` is null
-with an explicit status. Prefill work is batch-attributed in `per-token-cycle.json`;
+this legacy adapter records no events, so its `scu_cycles` is null with an explicit
+status (use `run_cycle_campaign.sh` above for event-based SCU timing). Prefill work is batch-attributed in `per-token-cycle.json`;
 individual prefill-token cycles are not observable and remain null.
 
 **Cycle count != latency(ms).** No frequency conversion, TTFT/TPOT publication,
 Jetson, CUDA comparison, FPGA programming, synthesis or post-route work occurs.
 `E2E_RECONSTRUCTION_READY=NOT_READY`, `PAPER_CAMPAIGN_COMPLETE=NOT_RUN` remain fixed.
-The complete 12-configuration cycle campaign cannot be marked READY while exact
-trace admissions and total SCU cycle accounting are unavailable.
+A configuration produces cycle evidence only after its own production trace is admitted;
+configurations without an equivalent certified corpus stop at `rejection.json`.
 
 ## Twelve configurations
 
@@ -125,9 +163,10 @@ certificate for another model, seed, precision or DIM is rejected.
 
 ```sh
 python3 -B -m evaluation.tests.test_campaign
+python3 -B -m evaluation.tests.test_cycle_campaign
 python3 -B -m evaluation.tests.test_framework
 pyright -p scripts/eval/campaign-pyright.json
 pyright -p evaluation/pyrightconfig.json
-uv run --no-project --offline --with ruff ruff check scripts/eval/campaign*.py evaluation
+uv run --no-project --offline --with ruff ruff check scripts/eval/campaign*.py scripts/eval/cycle_*.py evaluation
 git diff --check
 ```

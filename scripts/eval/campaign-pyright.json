@@ -1,5 +1,6 @@
 {
-  "include": ["campaign.py", "campaign_build.py", "campaign_inputs.py", "campaign_metrics.py", "campaign_cycle.py", "campaign_stream.py", "campaign_verify.py"],
+  "include": ["campaign.py", "campaign_build.py", "campaign_inputs.py", "campaign_metrics.py", "campaign_cycle.py", "campaign_stream.py", "campaign_verify.py",
+              "cycle_accounting.py", "cycle_trace_capture.py", "cycle_campaign.py", "cycle_campaign_bundle.py"],
   "extraPaths": ["../..", ".", "../../../IM2P.sim"],
   "pythonVersion": "3.11",
   "typeCheckingMode": "strict",
