@@ -15,6 +15,9 @@
 #include <stdexcept>
 #include <tuple>
 #include <utility>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 namespace ggml::gemmini::evaluation {
 namespace {
@@ -121,8 +124,9 @@ std::shared_ptr<Session> Session::start(const Config &config) {
             "ACT metrics compiled out");
     require(GGML_GEMMINI_RESIDUAL_METRICS || config.residual_path.empty(),
             "RES metrics compiled out");
-    require(GGML_GEMMINI_SCALE_METRICS || config.scale_path.empty(), "SCALE metrics compiled out");
-    if (config.activation_path.empty() && config.residual_path.empty() && config.scale_path.empty()) return {};
+    require(GGML_GEMMINI_SCALE_METRICS || (config.scale_path.empty() && config.scale_fd < 0), "SCALE metrics compiled out");
+    require(config.scale_fd < 0 || config.scale_path.empty(), "SCALE path and descriptor are mutually exclusive");
+    if (config.activation_path.empty() && config.residual_path.empty() && config.scale_path.empty() && config.scale_fd < 0) return {};
     require(!config.run_id.empty() && !config.workload_id.empty(), "missing run/workload identity");
     require(config.manifest_sha256.size() == 64 &&
             config.manifest_sha256.find_first_not_of("0123456789abcdef") == std::string::npos,
@@ -150,6 +154,17 @@ std::shared_ptr<Session> Session::start(const Config &config) {
     impl->activation = open(config.activation_path, act);
     impl->residual = open(config.residual_path, res);
     impl->scale = open(config.scale_path, scale);
+    if (config.scale_fd >= 0) {
+#ifdef _WIN32
+        throw std::runtime_error("evaluation metrics: inherited SCALE descriptor requires POSIX");
+#else
+        const int fd = dup(config.scale_fd);
+        require(fd >= 0, "invalid inherited SCALE descriptor");
+        impl->scale = fdopen(fd, "w");
+        if (!impl->scale) close(fd);
+        require(impl->scale != nullptr, "cannot open inherited SCALE descriptor");
+#endif
+    }
     impl->emit(impl->activation, "RUN",
         text_field("definition_status", "CONFIRMED_BY_USER") +
         text_field("metric_revision", "act-original-fp-observer-v1") +

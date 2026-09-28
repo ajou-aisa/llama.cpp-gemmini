@@ -1,5 +1,6 @@
 """Logical compaction and physical run-padding metrics from producer observations."""
 
+from collections.abc import Iterator
 from pathlib import Path
 
 from evaluation.manifest import Manifest
@@ -37,7 +38,11 @@ def _fragments(row: Record, dim: int) -> int:
 
 
 def reduce(path: Path, manifest: Manifest) -> Record:
-    rows = metric_rows(path, "im2p-residual-path-metrics", manifest)
+    return summarize(metric_rows(path, "im2p-residual-path-metrics", manifest), path, manifest)
+
+
+def summarize(rows: Iterator[Record], path: Path, manifest: Manifest) -> Record:
+    """Reduce already validated observations, including a single layer's partition."""
     next(rows)
     mains: dict[tuple[int, int], Record] = {}
     radix_rows: dict[tuple[int, int], Record] = {}

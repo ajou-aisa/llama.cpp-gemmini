@@ -1,5 +1,6 @@
 """SCU offset observations; no timing or unavailable pre-quantization inference."""
 
+from collections.abc import Iterator
 from math import isfinite, ldexp
 from pathlib import Path
 
@@ -29,20 +30,31 @@ def _scale(row: Record, field: str) -> float:
 
 
 def reduce(path: Path, manifest: Manifest) -> Record:
-    rows = metric_rows(path, "im2p-scale-alignment-metrics", manifest)
+    return summarize(metric_rows(path, "im2p-scale-alignment-metrics", manifest), path, manifest)
+
+
+def summarize(rows: Iterator[Record], path: Path, manifest: Manifest) -> Record:
+    """Reduce already validated observations, including a single layer's partition."""
     header = next(rows)
     domain = text(header, "scale_domain")
     require(domain == "hp1_block_pot_to_channel_anchor", "unsupported/unbound scale domain")
     seen: set[tuple[int, str, int, int, int]] = set()
+    previous_invocation, alignment_count = -1, 0
     offset_sum, offset_max, updated, total = 0, 0, 0, 0
     for row in rows:
         require(row.get("kind") == "SCALE_ALIGNMENT", "unexpected SCU record")
         work_type = text(row, "work_type")
         require(work_type in ("DENSE", "RESIDUAL"), "unsupported SCU work type")
+        invocation = integer(row, "invocation_id")
+        require(invocation >= previous_invocation, "SCU invocation order regressed")
+        if invocation != previous_invocation:
+            seen.clear()
+            previous_invocation = invocation
         key = (integer(row, "invocation_id"), work_type, integer(row, "stripe_id"),
                integer(row, "column"), integer(row, "original_block"))
         require(key not in seen, "duplicate SCU coordinate")
         seen.add(key)
+        alignment_count += 1
         original, aligned = _scale(row, "original_weight_scale"), _scale(row, "aligned_pot_scale")
         offset = integer(row, "scu_shift_offset")
         require(offset <= 32767, "SCU offset exceeds carrier domain")
@@ -65,9 +77,9 @@ def reduce(path: Path, manifest: Manifest) -> Record:
         total += count
     require(bool(seen), "empty SCU observation stream")
     return {**summary(manifest, path, "scale-alignment"), "scale_domain": domain,
-            "avg_delta_w": ratio(offset_sum, len(seen)), "max_delta_w": offset_max,
+            "avg_delta_w": ratio(offset_sum, alignment_count), "max_delta_w": offset_max,
             "scu_update_fraction": ratio(updated, total), "delta_w_sum": offset_sum,
-            "alignment_count": len(seen), "updated_partial_sum_count": updated,
+            "alignment_count": alignment_count, "updated_partial_sum_count": updated,
             "avg_delta_w_weighting": "one_per_observed_work_stripe_column_original_block",
             "total_partial_sum_count": total,
             "update_definition": "partial_sums_requiring_nonzero_scu_shift",

@@ -1,7 +1,15 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
+  "dependentRequired": {
+    "build_hash": ["tokenizer_hash", "DIM"],
+    "tokenizer_hash": ["build_hash", "DIM"],
+    "DIM": ["build_hash", "tokenizer_hash"]
+  },
   "properties": {
+    "build_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "tokenizer_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "DIM": {"type": "integer", "enum": [16, 32, 64]},
     "BK": {
       "const": 32
     },

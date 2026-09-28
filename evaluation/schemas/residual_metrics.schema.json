@@ -2,6 +2,18 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
+    "radix_limb_count": {"type": "integer", "minimum": 0},
+    "radix_limb_count_aggregation": {"const": "sum_per_main_stripe"},
+    "zero_limb_pruning": {
+      "type": "object", "additionalProperties": false, "required": ["pruned_rows", "fraction"],
+      "properties": {"pruned_rows": {"type": "integer", "minimum": 0},
+        "fraction": {"type": ["number", "null"], "minimum": 0, "maximum": 1}}
+    },
+    "inactive_k_compaction": {
+      "type": "object", "additionalProperties": false, "required": ["removed_k", "fraction"],
+      "properties": {"removed_k": {"type": "integer", "minimum": 0},
+        "fraction": {"type": ["number", "null"], "minimum": 0, "maximum": 1}}
+    },
     "aggregation": {
       "const": "integer-sum-before-division"
     },

@@ -48,6 +48,8 @@ def parser_for(recipe: str) -> argparse.ArgumentParser:
     parser.add_argument("--ubatch-size", type=int, default=256)
     parser.add_argument("--max-chunks", type=int, default=0, help="0 means all complete native 256-token chunks")
     parser.add_argument("--timeout", type=int, default=600, help="finite collection timeout in seconds")
+    if recipe == "scale":
+        parser.add_argument("--gzip", action="store_true", help="stream exact SCU observations to gzip without a raw disk copy")
     if recipe == "residual":
         parser.add_argument("--accept-proposed-weighting", action="store_true",
                             help="record explicit use of proposed-v3-DTR-v1; does not change raw shapes")
@@ -100,16 +102,24 @@ def collect_metric(args: argparse.Namespace, recipe: str) -> tuple[Path, Record]
             "evaluation manifest changed before collection")
     filename = {"activation": "activation-quant-metrics.jsonl", "residual": "residual-path-metrics.jsonl",
                 "scale": "scale-alignment-metrics.jsonl"}[recipe]
+    compressed = recipe == "scale" and args.gzip
+    if compressed:
+        filename += ".gz"
     raw = output / filename
     command = [str(binary), "--model", str(model), "--file", str(dataset),
                "--output-dir", str(output / "native"), "--workload", "METRIC_PREFILL_256",
                "--max-chunks", str(args.max_chunks), "--threads", str(args.threads),
                "--threads-batch", str(args.threads_batch), "--batch-size", str(args.batch_size),
                "--ubatch-size", str(args.ubatch_size), "--run-id", output.name,
-               "--manifest-sha256", manifest.sha256, "--seed", str(manifest.seed),
-               "--" + recipe + "-output", str(raw)]
+               "--manifest-sha256", manifest.sha256, "--seed", str(manifest.seed)]
+    if not compressed:
+        command.extend(["--" + recipe + "-output", str(raw)])
     write_json(output / "request.json", {**identities, "recipe": recipe, "command": list(command)})
-    run(command, output, args.timeout)
+    if compressed:
+        from campaign_stream import run_compressed
+        run_compressed(command, output, raw, args.timeout)
+    else:
+        run(command, output, args.timeout)
     require(before == artifact_snapshot(binary) and identities["model_sha256"] == sha256(model)
             and identities["dataset_sha256"] == sha256(dataset), "collection inputs changed during execution")
     sinks = {"activation-quant-metrics.jsonl", "residual-path-metrics.jsonl", "scale-alignment-metrics.jsonl"}
@@ -183,7 +193,8 @@ def main(recipe: str) -> int:
                                "scale": "scale_alignment_metrics.json"}[recipe]
             os.link(summary_path, output / metric_filename)
         if args.reduce is None:
-            os.link(raw, output / ("counts.jsonl" if recipe == "activation" else "shapes.jsonl"))
+            os.link(raw, output / (("counts.jsonl" if recipe == "activation" else "shapes.jsonl") +
+                                  (".gz" if raw.suffix == ".gz" else "")))
         print(str(output))
         return 0
     except (EvaluationError, OSError, ValueError, subprocess.SubprocessError) as error:

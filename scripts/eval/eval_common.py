@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass
 import hashlib
+import gzip
 import json
 import os
 from pathlib import Path
@@ -64,7 +65,7 @@ def read_json(path: Path) -> Record:
 
 
 def records(path: Path) -> Iterator[Record]:
-    with path.open(encoding="utf-8") as stream:
+    with (gzip.open(path, "rt", encoding="utf-8") if path.suffix == ".gz" else path.open(encoding="utf-8")) as stream:
         for number, line in enumerate(stream, 1):
             require(bool(line.strip()), f"empty JSONL record at line {number}")
             yield decode(line)

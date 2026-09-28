@@ -1,0 +1,10 @@
+{
+  "include": ["campaign.py", "campaign_build.py", "campaign_inputs.py", "campaign_metrics.py", "campaign_cycle.py", "campaign_stream.py", "campaign_verify.py"],
+  "extraPaths": ["../..", ".", "../../../IM2P.sim"],
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "strict",
+  "executionEnvironments": [
+    {"root": "../../evaluation", "extraPaths": ["../..", "."]},
+    {"root": ".", "extraPaths": ["../..", ".", "../../../IM2P.sim"]}
+  ]
+}

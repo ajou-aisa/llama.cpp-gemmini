@@ -86,7 +86,8 @@ static int run(int argc, char ** argv) {
 #endif
     std::string file, output, forced_file, workload = "METRIC_PREFILL_256";
     int max_chunks = 1, first_chunk = 0, smoke_generated_tokens = 0;
-    bool seed_set = false, temp_set = false, chunk_index_set = false;
+    bool seed_set = false, temp_set = false, chunk_index_set = false, cycle_trace = false;
+    std::string evaluation_manifest_hash;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") {
@@ -95,6 +96,8 @@ static int run(int argc, char ** argv) {
                 "  --batch-size N --ubatch-size N --threads N --threads-batch N\n"
                 "  --seed N --temp F --gpu-layers N --activation-output PATH --residual-output PATH\n"
                 "  --scale-output PATH --manifest-sha256 SHA256 (validated evaluation manifest)\n"
+                "  --scale-output-fd N (POSIX inherited pipe, exclusive with scale-output)\n"
+                "  --cycle-trace (independent zero-generation prefill trace, metrics OFF)\n"
                 "  --chunk-index N --forced-token-ids JSON --run-id ID --build-info\n"
                 "  --smoke-generated-tokens 1 (CYCLE_SIM diagnostic; never an E2E campaign)\n"
                 "Native non-strided WikiText chunks, no warmup. Defaults: one chunk, batch/ubatch 256,\n"
@@ -103,6 +106,7 @@ static int run(int argc, char ** argv) {
             return 0;
         }
         if (arg == "--build-info") { std::puts(build_info().dump().c_str()); return 0; }
+        if (arg == "--cycle-trace") { cycle_trace = true; continue; }
         if (arg == "--activation-reference-candidate") {
             throw std::invalid_argument("obsolete ACT candidate policy; confirmed row-by-BK32 policy is mandatory");
         }
@@ -113,7 +117,7 @@ static int run(int argc, char ** argv) {
         if (arg == "--residual-output") throw std::invalid_argument("residual metrics are compiled out");
 #endif
 #if !GGML_GEMMINI_SCALE_METRICS
-        if (arg == "--scale-output") throw std::invalid_argument("scale metrics are compiled out");
+        if (arg == "--scale-output" || arg == "--scale-output-fd") throw std::invalid_argument("scale metrics are compiled out");
 #endif
         if (++i == argc) throw std::invalid_argument("missing value for " + arg);
         const std::string value = argv[i];
@@ -141,10 +145,17 @@ static int run(int argc, char ** argv) {
 #endif
 #if GGML_GEMMINI_SCALE_METRICS
         else if (arg == "--scale-output") metric_config.scale_path = value;
+        else if (arg == "--scale-output-fd") {
+            metric_config.scale_fd = positive(value);
+            if (metric_config.scale_fd < 3) throw std::invalid_argument("scale descriptor must be a dedicated pipe");
+        }
 #endif
+        else if (arg == "--manifest-sha256") {
+            evaluation_manifest_hash = value;
 #if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
-        else if (arg == "--manifest-sha256") metric_config.manifest_sha256 = value;
+            metric_config.manifest_sha256 = value;
 #endif
+        }
         else if (arg == "--run-id") {
 #if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
             metric_config.run_id = value;
@@ -169,6 +180,9 @@ static int run(int argc, char ** argv) {
     }
     const bool generation = workload == "E2E_GENERATION_256_128";
     const bool forced_cost_only = !forced_file.empty();
+    if (cycle_trace && (!CYCLE_SIM || generation || GGML_GEMMINI_ACT_QUANT_METRICS ||
+                       GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS))
+        throw std::invalid_argument("cycle trace requires independent metrics-OFF CYCLE_SIM prefill build");
     if (smoke_generated_tokens &&
         (!CYCLE_SIM || !generation || forced_cost_only || smoke_generated_tokens != 1))
         throw std::invalid_argument("smoke-generated-tokens requires CYCLE_SIM free generation and exactly 1 token");
@@ -276,6 +290,7 @@ static int run(int argc, char ** argv) {
     const std::string execution_kind = forced_cost_only ? "FORCED_CPU_COST_ONLY" :
         generation ? "FREE_GENERATION" : "METRIC_PREFILL";
     json result = {{"schema", "potal-native-workload"}, {"version", 1}, {"workload", workload},
+        {"manifest_sha256", evaluation_manifest_hash},
         {"model_path", params.model.path}, {"dataset_path", file}, {"tokens", tokens.size()},
         {"model_file_type", model_file_type}, {"model_description", description},
         {"model_parameters", llama_model_n_params(model)},
@@ -303,8 +318,8 @@ static int run(int argc, char ** argv) {
         {"sampling_executed", generation && !forced_cost_only}, {"forced_token_ids_path", forced_file},
         {"gpu_layers_requested", params.n_gpu_layers}, {"placement_proof", "model_load_log"},
         {"placement_verified", false}, {"source_role", source_role},
-        {"target_trace_collection_enabled", generation && CYCLE_SIM != 0},
-        {"target_trace_collection_reason", !generation ? "metric_statistics_only" :
+        {"target_trace_collection_enabled", (generation || cycle_trace) && CYCLE_SIM != 0},
+        {"target_trace_collection_reason", cycle_trace ? "independent_prefill_cycle_campaign" : !generation ? "metric_statistics_only" :
             CYCLE_SIM ? "generation_target_collection" : "cycle_sim_disabled"},
         {"build", build_info()}, {"chunks", json::array()}, {"complete", false}};
     manifest << result.dump(2) << '\n';
@@ -326,7 +341,7 @@ static int run(int argc, char ** argv) {
             if (setenv("GEMMINI_LOG_DIR", trace_dir.string().c_str(), 1) != 0) throw std::runtime_error("setenv failed");
 #endif
             evaluation_trace trace(params, params.model.path, 256,
-                                   generation ? generation_target : 0, forced_cost_only);
+                                   generation ? generation_target : 0, forced_cost_only, cycle_trace);
             std::vector<llama_token> prompt(tokens.begin() + chunk * 256, tokens.begin() + (chunk + 1) * 256);
             if (add_bos) prompt[0] = llama_vocab_bos(vocab);
             if (sampler) for (const auto token : prompt) common_sampler_accept(sampler.get(), token, false);

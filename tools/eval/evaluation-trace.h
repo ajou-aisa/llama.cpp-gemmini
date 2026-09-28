@@ -10,7 +10,8 @@
 class evaluation_trace {
 public:
     evaluation_trace(const common_params & params, const std::string & model_identity,
-                     size_t prompt_count, size_t generated_count, bool forced_cost_only = false);
+                     size_t prompt_count, size_t generated_count, bool forced_cost_only = false,
+                     bool prefill_cycle_trace = false);
     void phase(const std::string & kind, const std::vector<llama_token> & tokens,
                std::optional<uint64_t> decode_index = {});
     void request_start();

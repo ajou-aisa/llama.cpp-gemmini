@@ -12,7 +12,10 @@ namespace semantic = ggml::gemmini::semantic;
 namespace log = ggml::gemmini::log;
 
 evaluation_trace::evaluation_trace(const common_params & params, const std::string & model_identity,
-                                 size_t prompt_count, size_t generated_count, bool forced_cost_only) {
+                                 size_t prompt_count, size_t generated_count, bool forced_cost_only,
+                                 bool prefill_cycle_trace) {
+    if (prefill_cycle_trace && (!CYCLE_SIM || generated_count || forced_cost_only))
+        throw std::invalid_argument("prefill cycle trace requires CYCLE_SIM and zero generation");
     if (forced_cost_only && (CYCLE_SIM || !LOG_CYCLE || !semantic::compiled_cpu_only_build() ||
                             params.n_gpu_layers != 0 || prompt_count != 256 || generated_count != 128))
         throw std::invalid_argument("forced cost-only trace requires CPU-only LOG_CYCLE build and 256+128 inputs");
@@ -56,7 +59,7 @@ evaluation_trace::evaluation_trace(const common_params & params, const std::stri
 #endif
 #if CYCLE_SIM
     namespace cycle_sim = ggml::gemmini::cycle_sim;
-    if (generated_count) {
+    if (generated_count || prefill_cycle_trace) {
         target_ = cycle_sim::Session::start(cycle_sim::compiled_run_info(model_identity, prompt_count, generated_count));
         target_->set_policy_query({ggml_backend_dev_by_name("GEMMINI"), [](void * device, const void * node) {
             return device && ggml_backend_dev_supports_op(static_cast<ggml_backend_dev_t>(device),

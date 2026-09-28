@@ -23,7 +23,14 @@ class Manifest:
         value = decode(payload.decode("utf-8"))
         required = {"model", "dataset", "tokenizer_sha256", "chunk_policy", "precision",
                     "dim", "BK", "seed", "git_sha"}
-        require(set(value) == required, "manifest fields do not match evaluation manifest v1")
+        campaign = {"tokenizer_hash", "DIM", "build_hash"}
+        require(set(value) in (required, required | campaign),
+                "manifest fields do not match evaluation manifest v1 or campaign v2")
+        if "build_hash" in value:
+            require(value["tokenizer_hash"] == value["tokenizer_sha256"] and value["DIM"] == value["dim"],
+                    "campaign manifest aliases disagree")
+            require(re.fullmatch(r"[0-9a-f]{64}", text(value, "build_hash")) is not None,
+                    "invalid manifest build_hash")
         require(value["dataset"] == "WikiText-2", "unsupported manifest dataset")
         require(integer(value, "BK", 1) == 32, "manifest BK must be 32")
         require(integer(value, "dim") in (16, 32, 64), "unsupported manifest DIM")

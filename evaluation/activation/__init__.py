@@ -1,6 +1,6 @@
 """Signed original-FP, logical-row/BK32 activation metrics."""
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from math import fsum, isfinite, sqrt
 from pathlib import Path
 from typing import Final
@@ -60,7 +60,11 @@ def observed_counts(rows: Sequence[Sequence[float]], selected: Sequence[Sequence
 
 
 def reduce(path: Path, manifest: Manifest) -> Record:
-    rows = metric_rows(path, "im2p-activation-quant-metrics", manifest)
+    return summarize(metric_rows(path, "im2p-activation-quant-metrics", manifest), path, manifest)
+
+
+def summarize(rows: Iterator[Record], path: Path, manifest: Manifest) -> Record:
+    """Reduce already validated observations, including a single layer's partition."""
     header = next(rows)
     require(header.get("definition_status") == "CONFIRMED_BY_USER" and
             header.get("reference_revision") == REFERENCE, "unbound ACT reference definition")

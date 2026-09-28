@@ -25,6 +25,7 @@ namespace ggml::gemmini::evaluation {
 struct Config {
     std::string activation_path, residual_path, scale_path, run_id, workload_id;
     std::string manifest_sha256;
+    int scale_fd = -1;
     bool activation_reference_candidate = false;
 };
 struct Run {
