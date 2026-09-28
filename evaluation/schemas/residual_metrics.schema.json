@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "aggregation": {
+      "const": "integer-sum-before-division"
+    },
+    "compact_k": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "compact_works": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "dim": {
+      "enum": [
+        16,
+        32,
+        64
+      ],
+      "type": "integer"
+    },
+    "input_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "k_factor_denominator": {
+      "const": "sum_original_K_per_main_stripe"
+    },
+    "logical_main_macs": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "logical_ratio": {
+      "minimum": 0,
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "logical_residual_macs": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "main_stripes": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "manifest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "model": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "original_k": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "original_radix_rows": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "padded_ratio": {
+      "minimum": 0,
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "physical_main_macs": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "physical_residual_macs": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "precision": {
+      "enum": [
+        "A4W4",
+        "A8W8"
+      ]
+    },
+    "provenance": {
+      "type": "object"
+    },
+    "retained_k_factor": {
+      "minimum": 0,
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "retained_row_factor": {
+      "minimum": 0,
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "retained_rows": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "row_factor_denominator": {
+      "const": "pre_pruning_radix_expanded_rows"
+    },
+    "schema": {
+      "const": "potal-residual-metrics"
+    },
+    "undefined_ratio_policy": {
+      "const": "null"
+    },
+    "version": {
+      "const": 1
+    },
+    "zero_limb_pruned_count": {
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "model",
+    "precision",
+    "dim",
+    "manifest_sha256",
+    "schema",
+    "version",
+    "input_sha256",
+    "aggregation",
+    "undefined_ratio_policy",
+    "logical_ratio",
+    "padded_ratio",
+    "retained_row_factor",
+    "retained_k_factor",
+    "logical_main_macs",
+    "logical_residual_macs",
+    "physical_main_macs",
+    "physical_residual_macs",
+    "original_radix_rows",
+    "retained_rows",
+    "zero_limb_pruned_count",
+    "original_k",
+    "compact_k",
+    "main_stripes",
+    "compact_works",
+    "row_factor_denominator",
+    "k_factor_denominator"
+  ],
+  "title": "residual_metrics",
+  "type": "object"
+}

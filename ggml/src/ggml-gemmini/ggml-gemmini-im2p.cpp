@@ -1731,7 +1731,7 @@ public:
     ggml_gemmini_args_t stripe_args;
     try {
       stripe_args = runtime_args;
-#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
       stripe_args.evaluation_context = event.evaluation_context;
 #endif
 #if CYCLE_SIM

@@ -93,6 +93,7 @@ bool test_evaluation_metrics_observer(const std::filesystem::path &directory) {
                "second real main stripe has no residual packet")) return false;
     evaluation::Config config;
     config.run_id = "actual-exsia-observer";
+    config.manifest_sha256 = std::string(64, 'a');
     config.workload_id = "tail-65-two-stripes";
 #if GGML_GEMMINI_ACT_QUANT_METRICS
     config.activation_path = (directory / "activation-quant-metrics.jsonl").string();

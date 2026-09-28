@@ -7,6 +7,7 @@
 #include "types.hpp"
 
 #include "ggml-gemmini-args.h"
+#include "../../../ggml-gemmini-evaluation-observer.hpp"
 #include "../../common/tensor_util.hpp"
 
 #include <gemmini/cycle_reader.hpp>
@@ -1958,6 +1959,9 @@ namespace ggml::gemmini::quants::act::exsia
             args.evaluation_context->main_stripe(stripe_idx, stripe.row_start,
                                                   stripe.row_count(), args.J, args.K);
 #endif
+#if GGML_GEMMINI_SCALE_METRICS
+        evaluation::observe_dense_scu(args, stripe_idx, stripe.row_count());
+#endif
 #if EXSIA_STAGE_PROFILE_ENABLED
         stripe.selected_positions = 0;
         stripe.residual_nnz = 0;
@@ -2074,7 +2078,7 @@ namespace ggml::gemmini::quants::act::exsia
 
     // Seals the stripe's RMD packet and publishes the shared handle. Called once per
     // stripe, right after folding commits, by the thread that ran folding.
-    static bool seal_stripe_packet(Meta &meta, StripePipelineSlot &slot)
+    static bool seal_stripe_packet(Meta &meta, StripePipelineSlot &slot, const ggml_gemmini_args_t &args)
     {
 #if GGML_GEMMINI_ENABLE_RMD
         const residual::ResidualStripePayload payload = slot.rmd_builder.finish();
@@ -2092,6 +2096,16 @@ namespace ggml::gemmini::quants::act::exsia
         slot.rmd_packet.reset();
         slot.direct_residual.reset();
         slot.rmd_pack_ns = 0;
+#endif
+#if GGML_GEMMINI_RESIDUAL_METRICS
+        if (args.evaluation_context && args.evaluation_context->residual_enabled()) {
+            if (!GGML_GEMMINI_ENABLE_RMD || args.residual_route != residual::ResidualRoute::ws_packet)
+                throw std::runtime_error("evaluation metrics: RES requires producer RMD packet route");
+            args.evaluation_context->radix_stripe(slot.stripe_idx,
+                slot.rmd_packet ? slot.rmd_packet->required_planes : 0);
+        }
+#else
+        (void) args;
 #endif
         return true;
     }
@@ -2314,7 +2328,7 @@ namespace ggml::gemmini::quants::act::exsia
         const float *src_data = ggml::gemmini::activation_data(A);
         if (!src_data)
             return fail(ExSIAState::FailureCode::InvalidInput);
-#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
         args.evaluation_context.reset();
         if (const auto session = evaluation::active_session())
             args.evaluation_context = session->invocation(args.matmul_layer, args.I, args.K, src_data);
@@ -2428,7 +2442,7 @@ namespace ggml::gemmini::quants::act::exsia
             event.quantization_end_ns = slot.quantization_end_ns;
             event.rmd_packet = slot.rmd_packet;
             event.direct_residual = slot.direct_residual;
-#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
             event.evaluation_context = args.evaluation_context;
 #endif
             event.rmd_pack_ns = slot.rmd_pack_ns;
@@ -3052,7 +3066,7 @@ namespace ggml::gemmini::quants::act::exsia
                                             record_failure(ExSIAState::FailureCode::FoldingFailure, s);
                                             pipeline_ok.store(false, std::memory_order_relaxed);
                                         }
-                                        else if (!seal_stripe_packet(meta, slot))
+                                        else if (!seal_stripe_packet(meta, slot, args))
                                         {
                                             record_failure(ExSIAState::FailureCode::FoldingFailure, s);
                                             pipeline_ok.store(false, std::memory_order_relaxed);
@@ -3465,7 +3479,7 @@ namespace ggml::gemmini::quants::act::exsia
 
             // Seal the stripe packet and hand the shared handle to the metadata. Stripes
             // run in row order, so meta.rmd_packets stays ordered by row_begin.
-            if (!seal_stripe_packet(meta, slot))
+            if (!seal_stripe_packet(meta, slot, args))
                 return fail(ExSIAState::FailureCode::FoldingFailure, s);
             slot.mark_folding_committed(
                 aggregate_now_ns(), aggregate_now_tick());
@@ -3542,7 +3556,7 @@ namespace ggml::gemmini::quants::act::exsia
 #if LOG_CYCLE
         run_timing.success = true;
 #endif
-#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
         if (args.evaluation_context)
             args.evaluation_context->finish_activation();
 #endif

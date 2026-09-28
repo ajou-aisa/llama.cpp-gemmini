@@ -304,6 +304,7 @@ add_test(NAME test-evaluation-lifecycle COMMAND test-evaluation-lifecycle)
 add_executable(test-gemmini-evaluation-metrics test-gemmini-evaluation-metrics.cpp)
 target_link_libraries(test-gemmini-evaluation-metrics PRIVATE ggml-gemmini-utils)
 target_compile_definitions(test-gemmini-evaluation-metrics PRIVATE
+    GGML_GEMMINI_SCALE_METRICS=${GGML_GEMMINI_SCALE_METRICS}
     GGML_GEMMINI_ACT_QUANT_METRICS=${GGML_GEMMINI_ACT_QUANT_METRICS}
     GGML_GEMMINI_RESIDUAL_METRICS=${GGML_GEMMINI_RESIDUAL_METRICS})
 target_compile_options(test-gemmini-evaluation-metrics PRIVATE $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)
@@ -381,6 +382,12 @@ add_test(NAME test-gemmini-trace-context COMMAND $<TARGET_FILE:test-gemmini-trac
 
 find_package(Python3 3.9 COMPONENTS Interpreter QUIET)
 if (Python3_Interpreter_FOUND)
+    if(Python3_VERSION VERSION_GREATER_EQUAL "3.11")
+        add_test(NAME test-evaluation-metric-framework
+            COMMAND ${Python3_EXECUTABLE} -B -m evaluation.tests.test_framework)
+        set_tests_properties(test-evaluation-metric-framework PROPERTIES
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/..")
+    endif()
     add_test(NAME test-host-overlap
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-host-overlap.py)
     add_test(NAME test-residual-profile
@@ -971,6 +978,20 @@ target_include_directories(test-gemmini-rmd-run-aware PRIVATE
 add_test(NAME test-gemmini-rmd-run-aware
     COMMAND $<TARGET_FILE:test-gemmini-rmd-run-aware>)
 
+if((GGML_GEMMINI_ACT_QUANT_METRICS OR GGML_GEMMINI_RESIDUAL_METRICS OR GGML_GEMMINI_SCALE_METRICS)
+   AND GGML_GEMMINI_ENABLE_RMD AND GGML_GEMMINI_ACTIVATION_BITS MATCHES "^(4|8)$")
+    add_executable(test-gemmini-evaluation-observer test-gemmini-evaluation-observer.cpp)
+    target_link_libraries(test-gemmini-evaluation-observer PRIVATE ggml-base ggml-gemmini ggml-gemmini-utils)
+    target_compile_features(test-gemmini-evaluation-observer PRIVATE cxx_std_17)
+    target_compile_definitions(test-gemmini-evaluation-observer PRIVATE ${GGML_GEMMINI_RUNTIME_COMPILE_DEFS})
+    target_compile_options(test-gemmini-evaluation-observer PRIVATE $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)
+    target_include_directories(test-gemmini-evaluation-observer PRIVATE ../ggml/src ../ggml/src/ggml-gemmini
+        ${GEMMINI_SW_PATH} ${GEMMINI_SW_PATH}/include)
+    add_test(NAME test-gemmini-evaluation-observer
+        COMMAND ${CMAKE_COMMAND} -DTEST_BINARY=$<TARGET_FILE:test-gemmini-evaluation-observer>
+            -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR} -P ${CMAKE_CURRENT_SOURCE_DIR}/test-evaluation-metric-sink.cmake)
+endif()
+
 add_executable(test-gemmini-rmd-capture
     test-gemmini-rmd-capture.cpp
     ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
@@ -1533,5 +1554,6 @@ if (TARGET ggml-gemmini AND GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "FPGA_UART")
     add_test(NAME test-gemmini-rmd-executor COMMAND $<TARGET_FILE:test-gemmini-rmd-executor>)
 endif()
 add_compile_definitions(
+    GGML_GEMMINI_SCALE_METRICS=${GGML_GEMMINI_SCALE_METRICS}
     GGML_GEMMINI_ACT_QUANT_METRICS=${GGML_GEMMINI_ACT_QUANT_METRICS}
     GGML_GEMMINI_RESIDUAL_METRICS=${GGML_GEMMINI_RESIDUAL_METRICS})

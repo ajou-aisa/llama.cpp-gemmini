@@ -31,7 +31,7 @@ target_include_directories(ggml-gemmini-utils
 
 target_compile_features(ggml-gemmini-utils PUBLIC cxx_std_17)
 target_compile_definitions(ggml-gemmini-utils PRIVATE CYCLE_SIM=${CYCLE_SIM})
-if(GGML_GEMMINI_ACT_QUANT_METRICS OR GGML_GEMMINI_RESIDUAL_METRICS)
+if(GGML_GEMMINI_ACT_QUANT_METRICS OR GGML_GEMMINI_RESIDUAL_METRICS OR GGML_GEMMINI_SCALE_METRICS)
     target_compile_definitions(ggml-gemmini-utils PRIVATE
         GGML_GEMMINI_ACTIVATION_BITS=${GGML_GEMMINI_ACTIVATION_BITS}
         GGML_GEMMINI_WEIGHT_BITS=${GGML_GEMMINI_WEIGHT_BITS}

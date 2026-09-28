@@ -401,7 +401,7 @@ namespace ggml::gemmini::quants::act::exsia
         // The packet owns its buffers, so it stays valid after the ExSIA slot is released.
         ggml::gemmini::rmd::StripePacketHandle rmd_packet;
         ggml::gemmini::residual::DirectStripePayloadHandle direct_residual;
-#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
         std::shared_ptr<evaluation::Invocation> evaluation_context;
 #endif
         uint64_t rmd_pack_ns = 0;

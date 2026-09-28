@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "aggregation": {
+      "const": "integer-sum-before-division"
+    },
+    "dim": {
+      "enum": [
+        16,
+        32,
+        64
+      ],
+      "type": "integer"
+    },
+    "eligible_logical_blocks": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "fp_fraction": {
+      "maximum": 1,
+      "minimum": 0,
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "fp_selected": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "input_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "intersection": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "jaccard": {
+      "maximum": 1,
+      "minimum": 0,
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "manifest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "model": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "p3_requantization_events": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "potal_selected": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "precision": {
+      "enum": [
+        "A4W4",
+        "A8W8"
+      ]
+    },
+    "provenance": {
+      "type": "object"
+    },
+    "recall": {
+      "maximum": 1,
+      "minimum": 0,
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "reference_revision": {
+      "const": "signed-row-original-bk32-population-2sigma-v1"
+    },
+    "requant_ratio": {
+      "maximum": 1,
+      "minimum": 0,
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "residual_fraction": {
+      "maximum": 1,
+      "minimum": 0,
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "residual_nnz": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "schema": {
+      "const": "potal-activation-metrics"
+    },
+    "undefined_ratio_policy": {
+      "const": "null"
+    },
+    "union": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "unique_actual_requantized_blocks": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "valid_positions": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "version": {
+      "const": 1
+    }
+  },
+  "required": [
+    "model",
+    "precision",
+    "dim",
+    "manifest_sha256",
+    "schema",
+    "version",
+    "input_sha256",
+    "aggregation",
+    "undefined_ratio_policy",
+    "valid_positions",
+    "fp_selected",
+    "potal_selected",
+    "intersection",
+    "union",
+    "residual_nnz",
+    "eligible_logical_blocks",
+    "unique_actual_requantized_blocks",
+    "p3_requantization_events",
+    "reference_revision",
+    "recall",
+    "jaccard",
+    "fp_fraction",
+    "residual_fraction",
+    "requant_ratio"
+  ],
+  "title": "activation_metrics",
+  "type": "object"
+}

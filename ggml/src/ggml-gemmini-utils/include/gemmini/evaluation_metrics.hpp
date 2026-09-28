@@ -7,16 +7,24 @@
 #include <vector>
 
 #ifndef GGML_GEMMINI_ACT_QUANT_METRICS
+#ifdef GGML_GEMMINI_ACT_METRICS
+#define GGML_GEMMINI_ACT_QUANT_METRICS GGML_GEMMINI_ACT_METRICS
+#else
 #define GGML_GEMMINI_ACT_QUANT_METRICS 0
+#endif
 #endif
 #ifndef GGML_GEMMINI_RESIDUAL_METRICS
 #define GGML_GEMMINI_RESIDUAL_METRICS 0
+#endif
+#ifndef GGML_GEMMINI_SCALE_METRICS
+#define GGML_GEMMINI_SCALE_METRICS 0
 #endif
 
 namespace ggml::gemmini::evaluation {
 
 struct Config {
-    std::string activation_path, residual_path, run_id, workload_id;
+    std::string activation_path, residual_path, scale_path, run_id, workload_id;
+    std::string manifest_sha256;
     bool activation_reference_candidate = false;
 };
 struct Run {
@@ -53,9 +61,18 @@ public:
     void position(size_t row, size_t column, bool selected, bool residual_nonzero);
     void finish_activation();
     void main_stripe(size_t stripe, size_t row_begin, size_t m, size_t n, size_t k);
+    void radix_stripe(size_t stripe, size_t radix_limb_count);
+    bool scale_enabled() const;
+    bool residual_enabled() const;
     void compact_work(size_t stripe, size_t m, size_t n, size_t k, size_t original_k,
                       size_t tile_i, size_t tile_j, size_t tile_k,
-                      const std::vector<Run> &runs, const std::vector<Row> &rows);
+                      const std::vector<Run> &runs, const std::vector<Row> &rows,
+                      size_t radix_limb_count = 0, size_t physical_fragments = 0);
+    void scale_alignment(size_t stripe, const char *work_type, size_t column,
+                         size_t original_block, double original_weight_scale,
+                         double aligned_pot_scale, uint32_t scu_shift_offset,
+                         uint64_t updated_partial_sum_count,
+                         uint64_t total_partial_sum_count, bool zero_weight = false);
     Invocation(const Invocation &) = delete;
     Invocation &operator=(const Invocation &) = delete;
 private:

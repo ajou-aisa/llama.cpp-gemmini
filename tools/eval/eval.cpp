@@ -24,6 +24,7 @@ namespace metrics = ggml::gemmini::evaluation;
 static json build_info() {
     return {{"schema", "potal-evaluation-build"}, {"version", 1},
         {"activation_metrics", GGML_GEMMINI_ACT_QUANT_METRICS},
+        {"scale_metrics", GGML_GEMMINI_SCALE_METRICS},
         {"residual_metrics", GGML_GEMMINI_RESIDUAL_METRICS}, {"cycle_sim", CYCLE_SIM},
         {"activation_bits", GGML_GEMMINI_ACTIVATION_BITS}, {"weight_bits", GGML_GEMMINI_WEIGHT_BITS},
         {"dim", GGML_GEMMINI_DIM}, {"backend", EVALUATION_BACKEND},
@@ -80,7 +81,7 @@ static int run(int argc, char ** argv) {
     params.warmup = false;
     params.sampling.seed = 0;
     params.sampling.temp = 0;
-#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
     metrics::Config metric_config;
 #endif
     std::string file, output, forced_file, workload = "METRIC_PREFILL_256";
@@ -93,6 +94,7 @@ static int run(int argc, char ** argv) {
                 "  --workload METRIC_PREFILL_256|E2E_GENERATION_256_128 --max-chunks N (0 = all)\n"
                 "  --batch-size N --ubatch-size N --threads N --threads-batch N\n"
                 "  --seed N --temp F --gpu-layers N --activation-output PATH --residual-output PATH\n"
+                "  --scale-output PATH --manifest-sha256 SHA256 (validated evaluation manifest)\n"
                 "  --chunk-index N --forced-token-ids JSON --run-id ID --build-info\n"
                 "  --smoke-generated-tokens 1 (CYCLE_SIM diagnostic; never an E2E campaign)\n"
                 "Native non-strided WikiText chunks, no warmup. Defaults: one chunk, batch/ubatch 256,\n"
@@ -109,6 +111,9 @@ static int run(int argc, char ** argv) {
 #endif
 #if !GGML_GEMMINI_RESIDUAL_METRICS
         if (arg == "--residual-output") throw std::invalid_argument("residual metrics are compiled out");
+#endif
+#if !GGML_GEMMINI_SCALE_METRICS
+        if (arg == "--scale-output") throw std::invalid_argument("scale metrics are compiled out");
 #endif
         if (++i == argc) throw std::invalid_argument("missing value for " + arg);
         const std::string value = argv[i];
@@ -134,8 +139,14 @@ static int run(int argc, char ** argv) {
 #if GGML_GEMMINI_RESIDUAL_METRICS
         else if (arg == "--residual-output") metric_config.residual_path = value;
 #endif
+#if GGML_GEMMINI_SCALE_METRICS
+        else if (arg == "--scale-output") metric_config.scale_path = value;
+#endif
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
+        else if (arg == "--manifest-sha256") metric_config.manifest_sha256 = value;
+#endif
         else if (arg == "--run-id") {
-#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
             metric_config.run_id = value;
 #endif
         }
@@ -178,8 +189,8 @@ static int run(int argc, char ** argv) {
                 !ggml::gemmini::semantic::compiled_cpu_only_build())) {
         throw std::invalid_argument("forced trajectory requires verified FullCPU cost-only build with LOG_CYCLE=1");
     }
-    if (generation && (GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS)) {
-        throw std::invalid_argument("E2E requires ACT_QUANT_METRICS=0 and RESIDUAL_METRICS=0");
+    if (generation && (GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS)) {
+        throw std::invalid_argument("E2E requires ACT_QUANT_METRICS=0, RESIDUAL_METRICS=0 and SCALE_METRICS=0");
     }
     if (params.n_gpu_layers != 0 && !EVALUATION_CUDA) throw std::invalid_argument("CUDA is not compiled in");
     if (params.model.path.empty() || file.empty() || output.empty()) {
@@ -188,8 +199,9 @@ static int run(int argc, char ** argv) {
     if (params.n_batch > 256 || params.n_ubatch > params.n_batch) {
         throw std::invalid_argument("runner requires 1 <= ubatch <= batch <= 256 (one sequence per chunk)");
     }
-#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS
-    if (generation && (!metric_config.activation_path.empty() || !metric_config.residual_path.empty())) {
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
+    if (generation && (!metric_config.activation_path.empty() || !metric_config.residual_path.empty() ||
+                       !metric_config.scale_path.empty())) {
         throw std::invalid_argument("metric collection requires METRIC_PREFILL_256");
     }
 #endif
@@ -253,7 +265,7 @@ static int run(int argc, char ** argv) {
     const std::string source_role = CYCLE_SIM ? "potal_collection" :
         EVALUATION_CUDA && params.n_gpu_layers != 0 ? "cuda" :
         ggml::gemmini::semantic::compiled_cpu_only_build() ? "full_cpu" : "unsupported";
-#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
     metric_config.workload_id = workload;
     auto metric_session = metrics::Session::start(metric_config);
 #endif
@@ -303,7 +315,7 @@ static int run(int argc, char ** argv) {
             const int chunk = plan.first_chunk + selected_chunk;
             common_evaluation_begin(ctx);
             if (sampler) common_sampler_reset(sampler.get());
-#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
             if (metric_session) metric_session->chunk(chunk);
 #endif
             const auto trace_dir = std::filesystem::path(output) / ("chunk-" + std::to_string(chunk));
@@ -427,17 +439,17 @@ static int run(int argc, char ** argv) {
                     {"decode_index", sample == 0 ? json() : json(sample - 1)}});
                 application_cpu << service.dump() << '\n';
             }
-#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
             if (metric_session) metric_session->ensure_healthy();
 #endif
         }
-#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
         if (metric_session) metric_session->finish(success);
 #endif
     } catch (...) {
         common_log_resume(common_log_main());
         llama_batch_free(batch);
-#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
         if (metric_session) metric_session->finish(false);
 #endif
         throw;

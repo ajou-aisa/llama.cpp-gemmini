@@ -1,0 +1,7 @@
+{
+  "include": [".", "../scripts/eval/metric_run.py", "../scripts/eval/scale_alignment_metrics.py"],
+  "exclude": ["**/__pycache__"],
+  "extraPaths": ["..", "../scripts/eval"],
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "strict"
+}

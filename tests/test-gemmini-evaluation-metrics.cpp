@@ -28,6 +28,7 @@ static void reference_case(const std::filesystem::path &directory, const std::st
                            uint64_t expected_fp, bool complete = true) {
     evaluation::Config config;
     config.run_id = name;
+    config.manifest_sha256 = std::string(64, 'a');
     config.workload_id = "signed-row-original-block-test";
     config.activation_path = (directory / (name + ".jsonl")).string();
     auto session = evaluation::Session::start(config);
@@ -104,7 +105,16 @@ int main(int argc, char **argv) {
     std::filesystem::create_directories(directory);
     evaluation::Config config;
     config.run_id = "test-run";
+    config.manifest_sha256 = std::string(64, 'a');
     config.workload_id = "test-workload";
+#if !GGML_GEMMINI_SCALE_METRICS
+    config.scale_path = (directory / "compiled-out-scale.jsonl").string();
+    rejects([&] { evaluation::Session::start(config); });
+    assert(!std::filesystem::exists(config.scale_path));
+    config.scale_path.clear();
+#else
+    config.scale_path = (directory / "scale-alignment-metrics.jsonl").string();
+#endif
 #if !GGML_GEMMINI_ACT_QUANT_METRICS
     config.activation_path = (directory / "compiled-out-act.jsonl").string();
     rejects([&] { evaluation::Session::start(config); });
@@ -123,12 +133,25 @@ int main(int argc, char **argv) {
 #if GGML_GEMMINI_RESIDUAL_METRICS
     config.residual_path = (directory / "residual-path-metrics.jsonl").string();
 #endif
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
+    auto invalid = config;
+    invalid.manifest_sha256.clear();
+    rejects([&] { evaluation::Session::start(invalid); });
+#endif
     auto session = evaluation::Session::start(config);
-#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
     assert(session);
     session->chunk(4);
     const float values[] = {-100, 0, 0, 0, 0, 0, 0, 100, 0, 0, 0, 0, 0, 0, 0, 0};
     auto invocation = session->invocation("layer", 2, 8, values);
+#if GGML_GEMMINI_SCALE_METRICS
+    invocation->scale_alignment(0, "DENSE", 0, 0, 8.0, 0.5, 4, 2, 2);
+    invocation->scale_alignment(0, "DENSE", 1, 0, 0.5, 0.5, 0, 0, 2);
+    invocation->scale_alignment(0, "DENSE", 2, 0, 0, 0.5, 0, 0, 2, true);
+    rejects([&] { invocation->scale_alignment(0, "DENSE", 0, 0, 8.0, 0.5, 4, 2, 2); });
+    rejects([&] { invocation->scale_alignment(0, "DENSE", 0, 0, 8, 0.5, 3, 2, 2); });
+    rejects([&] { invocation->scale_alignment(0, "DENSE", 0, 0, 8, 0.5, 4, 1, 2); });
+#endif
 #if GGML_GEMMINI_ACT_QUANT_METRICS
     std::thread worker([&] {
         invocation->requantized(0, 0);
@@ -144,14 +167,25 @@ int main(int argc, char **argv) {
 #if GGML_GEMMINI_RESIDUAL_METRICS
     invocation->main_stripe(0, 0, 1, 3, 8);
     invocation->main_stripe(1, 1, 1, 5, 8);
+    invocation->radix_stripe(0, 2);
+    invocation->radix_stripe(1, 0);
     invocation->compact_work(0, 1, 3, 2, 8, 1, 1, 1,
-        {{0, 3, 0, 2}}, {{0, 0}});
+        {{0, 3, 0, 2}}, {{0, 0}}, 2, 1);
     rejects([&] { invocation->main_stripe(0, 0, 1, 3, 8); });
     rejects([&] { invocation->compact_work(0, 1, 3, 2, 8, 1, 1, 1,
         {{0, 3, 0, 2}}, {{0, 0}}); });
 #endif
     invocation->finish_activation();
     session->finish(true);
+#if GGML_GEMMINI_SCALE_METRICS
+    const auto scale = read(config.scale_path);
+    assert(scale.find("\"manifest_sha256\":\"" + config.manifest_sha256 + "\"") != std::string::npos);
+    assert(scale.find("\"original_weight_scale\":8") != std::string::npos);
+    assert(scale.find("\"aligned_pot_scale\":0.5") != std::string::npos);
+    assert(scale.find("\"scu_shift_offset\":4") != std::string::npos);
+    assert(scale.find("\"updated_partial_sum_count\":2") != std::string::npos);
+    assert(scale.find("\"zero_weight\":true") != std::string::npos);
+#endif
     rejects([&] { session->chunk(5); });
 #if GGML_GEMMINI_ACT_QUANT_METRICS
     const auto act = read(config.activation_path);
@@ -172,6 +206,8 @@ int main(int argc, char **argv) {
     assert(res.find("COMPACT_WORK") != std::string::npos);
     assert(res.find("fp_selected") == std::string::npos);
     assert(res.find("original_k_mask") != std::string::npos);
+    assert(res.find("\"radix_limb_count\":2") != std::string::npos);
+    assert(res.find("\"zero_limb_pruned_count\":1") != std::string::npos);
 #else
     assert(!std::filesystem::exists(directory / "residual-path-metrics.jsonl"));
 #endif

@@ -437,7 +437,7 @@ typedef struct ggml_gemmini_args_t {
     // Optional immutable driver provenance, explicitly owned by asynchronous
     // frontend/RMD work. No process-global phase and no allocation when off.
     std::shared_ptr<const ggml::gemmini::optrace::Context> optrace_context;
-#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
     std::shared_ptr<ggml::gemmini::evaluation::Invocation> evaluation_context;
 #endif
 #if CYCLE_SIM

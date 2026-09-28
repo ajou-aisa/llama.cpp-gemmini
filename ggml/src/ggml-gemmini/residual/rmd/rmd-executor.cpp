@@ -8,6 +8,7 @@
 #include "../direct/direct-types.hpp"
 
 #include "../../ggml-gemmini-args.h"
+#include "../../ggml-gemmini-evaluation-observer.hpp"
 
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
 #include <im2p_sim.h>
@@ -1750,7 +1751,19 @@ static RmdStatus execute_rmd_stripe_im2p_run_aware(
         rows.push_back({row.original_lane_id, row.source_row});
       args.evaluation_context->compact_work(packet.stripe_id, request.m, request.n,
           request.k, request.original_k, request.tile_i, request.tile_j, request.tile_k,
-          runs, rows);
+          runs, rows, packet.required_planes, physical_fragments);
+    } catch (...) {
+      return RmdStatus::execution_failed;
+    }
+  }
+#endif
+#if GGML_GEMMINI_SCALE_METRICS
+  if (args.evaluation_context && args.evaluation_context->scale_enabled()) {
+    try {
+      const auto plan = wroute::resolve_weight_route_plan(args, wroute::WeightScaleInfoMode::ResidualHp1Scu);
+      for (const auto &run : request.runs)
+        evaluation::observe_scu_block(args, plan, packet.stripe_id, "RESIDUAL",
+            run.original_block_id, request.m, (run.compact_k_count + kArrayDim - 1) / kArrayDim);
     } catch (...) {
       return RmdStatus::execution_failed;
     }
