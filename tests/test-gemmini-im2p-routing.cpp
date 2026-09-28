@@ -901,15 +901,23 @@ bool run_exsia_publication_boundary() {
                "each callback observes only its committed theta prefix and an uncommitted next stripe") &&
          check(residual_handle_contract, residual_handle_message) &&
 #if LOG_CYCLE
+#if CYCLE_DETAIL
          check(trace.events[0].folding_commit_ns != 0 &&
                    trace.events[0].folding_commit_ns <= trace.events[1].folding_commit_ns &&
-                   trace.events[1].folding_commit_ns <= trace.events[2].folding_commit_ns &&
-                   trace.events[0].quantization_end >= trace.events[0].quantization_start &&
+                   trace.events[1].folding_commit_ns <= trace.events[2].folding_commit_ns,
+               "detailed logging records ordered folding commit timestamps") &&
+#else
+         check(trace.events[0].folding_commit_ns == 0 &&
+                   trace.events[1].folding_commit_ns == 0 &&
+                   trace.events[2].folding_commit_ns == 0,
+               "compact logging omits detailed folding commit timestamps") &&
+#endif
+         check(trace.events[0].quantization_end >= trace.events[0].quantization_start &&
                    trace.events[1].quantization_end >= trace.events[1].quantization_start &&
                    trace.events[2].quantization_end >= trace.events[2].quantization_start &&
                    trace.events[2].quantization_end - trace.events[2].quantization_start > 0 &&
                    ggml::gemmini::cycle::read_count_for_test() != 0,
-               "enabled per-stripe quantization intervals and folding commits are instrumented") &&
+               "enabled per-stripe quantization intervals are instrumented") &&
 #else
          check(trace.events[0].folding_commit_ns == 0 &&
                    trace.events[1].folding_commit_ns == 0 &&
