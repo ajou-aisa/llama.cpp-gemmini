@@ -2461,11 +2461,18 @@ bool test_compact_residual_metrics() {
 
         const size_t first_k_tiles = align_up(19, kArrayDim) / kArrayDim;
         const size_t issued_tiles = first_k_tiles + 1;
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) && !defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1)
+        const bool one_call_per_block = bits == 4 || bits == 8;
+#else
+        const bool one_call_per_block = false;
+#endif
+        const size_t expected_calls = one_call_per_block ? 2 : issued_tiles;
+        const size_t expected_dot_rows = one_call_per_block ? 6 : 4 * first_k_tiles + 2;
         ok = check(metrics.active_blocks == 2 && metrics.active_lanes == 4 &&
                        metrics.compact_k_count == 21 && metrics.group_active_k_count == 21 &&
                        metrics.padded_k_count == (first_k_tiles + 1) * kArrayDim &&
                        metrics.group_padded_k_count == (first_k_tiles + 1) * kArrayDim &&
-                       metrics.lane_group_count == 2 && metrics.matmul_call_count == first_k_tiles + 1 &&
+                       metrics.lane_group_count == 2 && metrics.matmul_call_count == expected_calls &&
                        metrics.physical_tile_count == 4 &&
                        metrics.baseline_stacked_i_tile_count == 6 * first_k_tiles + 2 &&
                        metrics.stacked_i_tile_count == issued_tiles,
@@ -2486,7 +2493,7 @@ bool test_compact_residual_metrics() {
                        metrics.block_scale_values_bytes == 2 * columns * sizeof(uint64_t) &&
                        metrics.correction_bytes == rows * columns * sizeof(int64_t) &&
                        metrics.logical_dot_result_bytes ==
-                           (4 * first_k_tiles + 2) * columns * sizeof(int64_t) &&
+                           expected_dot_rows * columns * sizeof(int64_t) &&
                        metrics.compressed_output_values == 0,
                    "packet storage, gathered INT32 weights and repeated dot outputs use explicit byte units") && ok;
         CompressedOutput compressed;

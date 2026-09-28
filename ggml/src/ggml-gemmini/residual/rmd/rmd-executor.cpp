@@ -762,7 +762,14 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
 #else
   const bool h1_scu = false;
 #endif
-  const bool scu_final = plan.hp1_carriers || h1_scu;
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) && !defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1)
+  const bool legacy_external = Backend != CompactExecutorBackend::gemmini_ws &&
+                               (packet.digit_bits == 4 || packet.digit_bits == 8);
+#else
+  const bool legacy_external = false;
+#endif
+  const bool scu_final = !legacy_external && (plan.hp1_carriers || h1_scu);
+  const bool single_compact_call = scu_final || legacy_external;
   if (scu_final && (packet.digit_bits != 4 && packet.digit_bits != 8))
     return RmdStatus::unsupported_route;
   if constexpr (Backend == CompactExecutorBackend::gemmini_ws) {
@@ -835,11 +842,11 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
         if constexpr (Backend == CompactExecutorBackend::gemmini_ws) {
             ws_values.assign(max_stacked_rows * kArrayDim, acc_t{0});
         } else if constexpr (Backend == CompactExecutorBackend::im2p_sim) {
-            if (!scu_final) im2p_values.assign(max_stacked_rows * kArrayDim, OutputValue{0});
+            if (!single_compact_call) im2p_values.assign(max_stacked_rows * kArrayDim, OutputValue{0});
         }
+        if (single_compact_call) compact_weights.resize(kBlockSize * kArrayDim);
         if (scu_final) {
             scu_carriers.resize(kArrayDim);
-            compact_weights.resize(kBlockSize * kArrayDim);
         } else {
             block_scales.assign(kArrayDim, uint64_t{0});
         }
@@ -912,7 +919,7 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
         std::fill_n(stacked_values.begin(), stacked_value_count,
                     OutputValue{0});
 
-        if (scu_final) {
+        if (single_compact_call) {
           const size_t compact_k = group_k_counts[group_index];
           const size_t logical_rows =
               group.row_ids.size();
@@ -950,9 +957,11 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
                 valid_cols,
                 kArrayDim,
                 compact_k,
-                scu_carriers.data()};
+                scu_final ? scu_carriers.data() : nullptr};
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) || defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
-            dot.vector_op = h1_scu ? IM2P_VECTOR_UNSIGNED_MULTIPLY : IM2P_VECTOR_LEFT_SHIFT;
+            dot.vector_op = !scu_final ? IM2P_VECTOR_EXTERNAL
+                                      : h1_scu ? IM2P_VECTOR_UNSIGNED_MULTIPLY
+                                               : IM2P_VECTOR_LEFT_SHIFT;
 #endif
             dot.timing_identity = staged_metrics.timing_identity;
             dot.block_id = block.block_id;
@@ -982,6 +991,14 @@ RmdStatus execute_rmd_stripe_impl(const ggml_gemmini_args_t & args,
             const size_t fragment_k = std::min(kArrayDim, kBlockSize);
             for (size_t row = 0; row < logical_rows; ++row) {
               for (size_t col = 0; col < valid_cols; ++col) {
+                if (!scu_final) {
+                  int64_t raw = 0;
+                  for (size_t k = 0; k < compact_k; ++k)
+                    raw += int64_t(digit(row, k)) *
+                           compact_weights[k * kArrayDim + col];
+                  stacked_values[row * kArrayDim + col] = raw;
+                  continue;
+                }
                 int32_t acc = 0;
                 for (size_t base = 0; base < compact_k; base += fragment_k) {
                   int64_t partial = 0;

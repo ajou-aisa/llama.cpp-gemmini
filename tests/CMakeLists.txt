@@ -772,6 +772,10 @@ if (NOT GGML_BACKEND_DL)
     elseif (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
         target_compile_definitions(test-gemmini-rmd PRIVATE
             GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM=1)
+        if (IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1")
+            target_compile_definitions(test-gemmini-rmd PRIVATE
+                IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1=1)
+        endif()
     endif()
     target_include_directories(test-gemmini-rmd PRIVATE
         ../ggml/src
@@ -1133,7 +1137,9 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
     target_include_directories(test-gemmini-rmd-im2p-provider PRIVATE
         ../ggml/src
         ../ggml/src/ggml-gemmini
+        ${IM2P_SIM_ROOT}/frontend/include
         ${IM2P_SIM_ROOT}/sim/include
+        ${IM2P_SIM_ROOT}/sim/common
         ${GEMMINI_SW_PATH}
         ${GEMMINI_SW_PATH}/include)
     add_test(NAME test-gemmini-rmd-im2p-provider
