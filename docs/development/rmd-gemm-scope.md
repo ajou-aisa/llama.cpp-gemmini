@@ -25,8 +25,12 @@
 순서**와 실제 Gemmini 실행을 확인한다. H1의 op 4 미지원이나 H0의 CPU-direct
 경로를 해결하는 것은 이 작업의 완료 조건이 아니다.
 
-Compaction 최적화의 기존/신규 비교 방법은
-[RMD compaction A/B 실행](rmd-compaction-ab.md)에 기록한다.
+ExSIA의 A4/A8 WS packet은 bitmap compaction으로 생성한다. Residual을 받는
+즉시 limb로 분해하고, 0이 아닌 digit과 row/K 정보를 기록한다. 마지막에
+nonzero bitmap을 읽어 row/K를 압축한 signed-byte packet을 만든다. 원본
+weight block 식별자와 limb 지수, packet ABI는 유지한다. CPU direct에는
+packet compaction이 없으며, 일반 quantizer와 A16, packet slicing은 기존
+`RmdStripeBuilder`를 사용한다.
 
 ## 소스 확인 기록 (2026-09-28)
 
