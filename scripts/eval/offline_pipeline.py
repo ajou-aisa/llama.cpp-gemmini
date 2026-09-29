@@ -13,12 +13,14 @@ from application_results import load_measurement, load_potal_collection
 from certified_reconstruction import (
     artifact_reference,
     consumer_sources,
+    publication_workload,
     reconstructed_row,
     service_arguments,
     verify_official_schedule,
 )
-from eval_common import Json, Record, integer, read_json, require, sha256, write_json
+from eval_common import Json, Record, integer, read_json, require, sha256, text, write_json
 from scheduled_endpoints import prefill_dispatches, scheduled_application_result
+from target_admission import publication_readiness
 
 JSON_INPUT_LIMIT_BYTES = 64 * 1024 * 1024
 DISK_RESERVE_BYTES = 256 * 1024 * 1024
@@ -62,6 +64,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
                          help="JSON IR and schedule for small diagnostic inputs (64 MiB maximum)")
     parser.set_defaults(streaming_ir=True)
     parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument("--target-host-timing", type=Path, help="admitted target-host CPU timing (publication gate)")
+    parser.add_argument("--target-interface-cost", type=Path, help="admitted target interface cost (publication gate)")
+    parser.add_argument("--replay-workers", type=int,
+                        help="FAST_EVALUATION: parallel memo replay, byte-identical to the certified serial replay")
+    parser.add_argument("--storage-factor", type=int, default=8,
+                        help="free space required before replay, in multiples of workload bytes")
     diagnostic = parser.add_mutually_exclusive_group()
     diagnostic.add_argument("--stateful-diagnostic", action="store_true", help="configured test clock only; never target latency")
     diagnostic.add_argument("--diagnostic-phase-table", type=Path,
@@ -85,6 +93,10 @@ def _reconstruct(args: argparse.Namespace) -> None:
     source = args.im2p.resolve(strict=True)
     require((source / "sim/cycle/npu_trace.py").is_file(), "IM2P official replay entrypoint missing")
     require(args.timeout > 0, "finite positive offline timeout required")
+    workers = getattr(args, "replay_workers", None)
+    storage_factor = getattr(args, "storage_factor", 8)
+    require(workers is None or workers > 0, "positive replay worker count required")
+    require(storage_factor >= 2, "storage factor below two (input snapshots plus outputs)")
     stateful = args.stateful_sequence_certificate is not None
     require(stateful == (args.stateful_evidence_root is not None), "stateful certificate and evidence root required together")
     require(not stateful or args.diagnostic_phase_table is None, "stateful certificate cannot use a synthetic phase table")
@@ -108,14 +120,15 @@ def _reconstruct(args: argparse.Namespace) -> None:
                    "run_aware_certificate", "application")
     input_names += ("lifecycle",) if args.lifecycle is not None else ("lifecycle_sidecar", "worker_resources")
     input_names += tuple(name for name in ("service_certificate", "stateful_sequence_certificate", "clock_selection", "potal_result", "timing",
-                                           "transition_certificate")
-                         if getattr(args, name) is not None)
+                                           "transition_certificate", "target_host_timing", "target_interface_cost")
+                         if getattr(args, name, None) is not None)
     paths = {name: Path(getattr(args, name)).resolve(strict=True) for name in input_names}
     output = args.output.resolve()
     workload_bytes = sum(path.stat().st_size for name, path in paths.items()
                          if name not in ("library", "cycle_certificate", "run_aware_certificate", "transition_certificate",
-                                         "service_certificate", "stateful_sequence_certificate", "clock_selection", "potal_result", "timing"))
-    required_free = DISK_RESERVE_BYTES + 8 * workload_bytes
+                                         "service_certificate", "stateful_sequence_certificate", "clock_selection", "potal_result", "timing",
+                                         "target_host_timing", "target_interface_cost"))
+    required_free = DISK_RESERVE_BYTES + storage_factor * workload_bytes
     available_free = shutil.disk_usage(output).free
     reason = None
     if not args.streaming_ir and workload_bytes > JSON_INPUT_LIMIT_BYTES:
@@ -172,7 +185,8 @@ def _reconstruct(args: argparse.Namespace) -> None:
     if "transition_certificate" in paths:
         artifacts += ["--transition-certificate", str(paths["transition_certificate"])]
     npu = output / "npu-cycle-result.jsonl"
-    stage("replay", ["sim.cycle.npu_trace", str(paths["npu_trace"]), *artifacts,
+    replay = ["sim.cycle.npu_trace"] if workers is None else ["sim.cycle.evaluation_replay", "--workers", str(workers)]
+    stage("replay", [*replay, str(paths["npu_trace"]), *artifacts,
                      "--output", str(npu), "--summary", str(output / "npu-summary.json")])
     dataset, join_summary = output / "dataset.jsonl.gz", output / "join-summary.json"
     join = ["sim.cycle.reconstruct", *artifacts, "--npu-trace", str(paths["npu_trace"]),
@@ -196,6 +210,7 @@ def _reconstruct(args: argparse.Namespace) -> None:
     missing: list[Json] = [name for name in certified if getattr(args, name) is None]
     schedule_status = "NOT_RUN_MISSING_CERTIFIED_INPUTS"
     reconstructed: Record | None = None
+    source_row: Record = {}
     if not missing:
         try:
             frequency = integer(read_json(paths["clock_selection"]), "selected_frequency_hz", 1)
@@ -242,7 +257,7 @@ def _reconstruct(args: argparse.Namespace) -> None:
             with tempfile.TemporaryDirectory(prefix="candidate-run-", dir=output) as directory:
                 candidate = Path(directory) / "result.json"
                 write_json(candidate, reconstructed)
-                load_measurement(candidate)
+                load_measurement(candidate, publication=False)
                 os.link(candidate, output / "reconstructed-result.json")
         except (OSError, sqlite3.Error, subprocess.SubprocessError) as error:
             if not (output / "failure.json").exists():
@@ -253,13 +268,19 @@ def _reconstruct(args: argparse.Namespace) -> None:
             if not (output / "failure.json").exists():
                 write_rejection(output, str(error))
             raise
+    host_ids = {text(source_row, "host_id")} if source_row else set()
+    readiness = publication_readiness(identities, publication_workload(source_row, identities), host_ids,
+                                      reconstructed is not None, source)
+    published = reconstructed if reconstructed is not None and readiness["TARGET_LATENCY_READY"] is True else None
     status: Record = {"schema": "potal-offline-evaluation", "version": 1,
         "replay": "PASS", "three_source_join": "PASS", "execution_ir": "PASS",
+        "replay_mode": "CERTIFIED_SERIAL" if workers is None else "FAST_EVALUATION_PARALLEL",
         "execution_ir_format": "SQLITE" if args.streaming_ir else "JSON",
         "schedule": schedule_status, "missing_certified_inputs": missing,
         "E2E_RECONSTRUCTION_READY": reconstructed is not None,
-        "TTFT": None if reconstructed is None else reconstructed["ttft_ns"],
-        "TPOT": None if reconstructed is None else reconstructed["tpot_ns"],
+        "TARGET_LATENCY_READY": published is not None, "publication": readiness,
+        "TTFT": None if published is None else published["ttft_ns"],
+        "TPOT": None if published is None else published["tpot_ns"],
         "reconstructed_result": None if reconstructed is None else artifact_reference(output / "reconstructed-result.json"),
         "paper_campaign": "NOT_RUN",
         "scope": "official one-run reconstruction" if reconstructed is not None

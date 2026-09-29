@@ -149,13 +149,14 @@ def cuda_placement(log: Path) -> Record:
             "publication_status": "OBSERVATION_ONLY_PLACEMENT_INCOMPLETE"}
 
 
-def load_measurement(path: Path) -> Record:
+def load_measurement(path: Path, publication: bool = True) -> Record:
+    """publication=False verifies a reconstruction only; publication also requires every target gate."""
     row = read_json(path)
     require(row.get("schema") == "potal-e2e-run" and row.get("version") == 1,
             "unsupported application result schema")
     if row.get("role") == "potal" and row.get("measurement_kind") == "VALIDATED_RECONSTRUCTION":
         from certified_reconstruction import load_reconstructed_measurement
-        return load_reconstructed_measurement(row)
+        return load_reconstructed_measurement(row, publication)
     require(row.get("role") == "cuda" and row.get("measurement_kind") == "NATIVE_APPLICATION",
             "only bound native CUDA direct latency currently admitted; reconstructed publication requires service/clock proof")
     root = path.parent

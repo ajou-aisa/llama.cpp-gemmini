@@ -257,3 +257,44 @@ joining. Adding both
 in `schedule.sqlite`; the numeric frequency is a diagnostic scenario, not a
 selected hardware clock. `--json-ir` writes `schedule.json` for small diagnostic
 inputs. Neither path publishes target TTFT/TPOT.
+
+## One-command cycle evaluation
+
+```sh
+python3 -B scripts/eval/run_cycle_evaluation.py \
+  --model models/gpt2/gpt2.Q8_HP1.gguf --prompt-file wikitext-2-raw/wiki.test.raw \
+  --prompt-tokens 256 --generate 128 --precision a8w8 --dim 32 \
+  --certificates certificate-set.json --output runs/gpt2-a8w8-d32
+```
+
+The runner detects the host (`--dry-run [--system Linux --machine x86_64]`
+prints the plan without building), builds the cycle model, PoTal, FullCPU and
+`llama-perplexity` through `campaign_build.py` (the only CMake option source;
+platforms differ only in `platform_profile()`), caches builds by
+source/configuration/toolchain identity, and requires the fresh cycle library
+to equal the certified CURRENT library named by the certificate set
+(`im2p-evaluation-certificate-set` v1: `cycle_library_sha256` plus base,
+run-aware and transition certificate path/sha256). It collects one PoTal and
+one forced FullCPU 256+128 run, reconstructs through `end_to_end.py
+reconstruct --replay-workers N` (FAST_EVALUATION replay, byte-identical to the
+certified serial replay), schedules the official IR with an isolated-service
+`SYNTHETIC_ONLY` phase table, and writes:
+
+- `timeline/timeline.jsonl`: one row per scheduled CPU worker interval, NPU
+  work and request/token event, placed where the scheduler put them (overlap,
+  idle gaps and order are kept). The axis is NPU cycles at the schedule clock:
+  the configured 1 GHz test clock unless `--clock-selection` gives a validated
+  operating clock; `*_ns` and `npu_ms` stay null without one. CPU rows carry
+  measured development-host ns, `target_cpu_cycles = null`.
+- `performance.json`: TTFT/TPOT computed from the timeline only. NPU cycles are
+  READY; CPU/interface/E2E values stay null with explicit readiness, and the
+  schedule-axis values are reported separately as `diagnostic_schedule`.
+- `metrics.json`: bounded (`--ppl-chunks`, 0 = all) WikiText-2 perplexity from
+  a build with the same semantic options as PoTal and the same model/text.
+- `manifest.json`, `provenance.json`, `build/*.json`, `SHA256SUMS`; large raw
+  logs, the IR and the schedule are hashed and removed unless `--keep-raw`.
+
+Publication stays fail closed: a `VALIDATED_RECONSTRUCTION` keeps its
+`target_latency` marker, and `load_measurement` publishes only when the
+operating-clock, target-host, target-interface, workload-identity and
+reconstruction gates of `target_admission.py` all pass.

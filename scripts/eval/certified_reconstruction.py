@@ -132,15 +132,34 @@ def verify_official_schedule(files: dict[str, Path], inputs: Record, im2p: Path)
 
 
 def reconstructed_row(source: Record, result: Record, proof: Record) -> Record:
+    """A validated reconstruction keeps the collection's target_latency deficiency marker; see publication_row."""
     row = dict(source)
-    row.pop("target_latency", None)
     row.update(result)
     row.update(measurement_kind="VALIDATED_RECONSTRUCTION", scope="OFFICIAL_RECONSTRUCTED_APPLICATION",
                reconstruction=proof)
     return row
 
 
-def load_reconstructed_measurement(row: Record) -> Record:
+def publication_workload(source: Record, inputs: Record) -> Record:
+    return {"model_sha256": source.get("model_sha256"), "input_tokens_sha256": source.get("input_tokens_sha256"),
+            "generated_tokens_sha256": source.get("generated_tokens_sha256"),
+            "profile": record(inputs.get("scenario")).get("profile")}
+
+
+def publication_row(row: Record, readiness: Record) -> Record:
+    """Target latency is published only when every gate passed; the reconstruction alone never suffices."""
+    require(readiness.get("TARGET_LATENCY_READY") is True,
+            "service publication NOT_READY: " + "; ".join(str(code) for code in list_value(readiness.get("codes"))))
+    published = dict(row)
+    published.update(target_latency="TARGET_LATENCY_READY", publication=readiness)
+    return published
+
+
+def list_value(value: Json) -> list[Json]:
+    return value if isinstance(value, list) else []
+
+
+def load_reconstructed_measurement(row: Record, publication: bool = True) -> Record:
     proof = record(row.get("reconstruction"))
     require(proof.get("schema") == "potal-e2e-reconstruction-proof" and proof.get("version") == 1,
             "unsupported PoTal reconstruction proof")
@@ -192,4 +211,9 @@ def load_reconstructed_measurement(row: Record) -> Record:
     require(all(bound_artifact(proof.get(name)) == path for name, path in files.items()) and
             all(bound_artifact(inputs.get(name)) == path for name, path in sources.items()),
             "reconstruction source changed during verification")
-    return row
+    if not publication:
+        return row
+    from target_admission import publication_readiness
+    readiness = publication_readiness(inputs, publication_workload(source, inputs), {text(source, "host_id")},
+                                      True, im2p)
+    return publication_row(row, readiness)

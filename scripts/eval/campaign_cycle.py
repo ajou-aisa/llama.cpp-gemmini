@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from typing import Final
 
-from campaign_build import command
+from campaign_build import build_cycle_model, command
 from eval_common import (
     Record,
     integer,
@@ -49,15 +49,7 @@ def context_from(certificate: Path, root: Path) -> EvidenceContext:
 
 
 def native_build(im2p: Path, output: Path, jobs: int) -> Path:
-    output.mkdir()
-    command(["cmake", "-S", str(im2p / "sim/cycle"), "-B", str(output),
-             "-DCMAKE_BUILD_TYPE=Release"], output, "configure")
-    command(["cmake", "--build", str(output), "--parallel", str(jobs)], output, "build")
-    command(["ctest", "--test-dir", str(output), "--output-on-failure"], output, "verify")
-    candidates = [output / name for name in ("libim2p_cycle_model.dylib", "libim2p_cycle_model.so")]
-    found = [path for path in candidates if path.is_file()]
-    require(len(found) == 1, "cycle shared library missing")
-    return found[0]
+    return Path(text(record(build_cycle_model(output, im2p, jobs)["library"]), "path"))
 
 
 def collect(args: argparse.Namespace, runner: Path, model: Path, dataset: Path,

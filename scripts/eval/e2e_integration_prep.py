@@ -198,6 +198,9 @@ def main() -> int:
         require(gates.get("E2E_COST_OWNERSHIP_READY") == "READY" and
                 gates.get("MEMORY_INTERFACE_SCENARIO_READY") == "READY",
                 "cost ownership and memory scenario contracts must validate before integration")
+        unmodeled = gates.get("unmodeled_declared_stage_ids")
+        if not isinstance(unmodeled, list):
+            raise EvaluationError("cost ownership contract must declare its unmodeled stages")
         document = verify_certificate(certificate)
         bound = record(document["trace"])
         require(bound.get("path") == str(trace) and bound.get("sha256") == sha256(trace),
@@ -241,7 +244,8 @@ def main() -> int:
             "npu_coverage":
                 "374/374 works production-admitted through the unchanged stateful provider; windows from "
                 "certified replay; final resource cursor " + str(first["final_resource_cursor"]),
-            "unmodeled_target_cost_count": 0,
+            "unmodeled_target_cost_count": len(unmodeled),
+            "unmodeled_target_cost_stage_ids": unmodeled,
             "duplicate_cost_count": 0,
             "stateful_provider_valid": bool(ok),
             "application_publication_ready": False,
