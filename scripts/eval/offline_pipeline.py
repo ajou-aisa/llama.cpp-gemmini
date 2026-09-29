@@ -43,6 +43,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--worker-resources", type=Path, help="explicit CPU worker/resource scenario for lifecycle projection")
     parser.add_argument("--cpu-policy", choices=("THREAD_CPU_NS_GANG", "HOST_ELAPSED_NS_GANG"))
     parser.add_argument("--sampler-resource")
+    parser.add_argument("--transition-certificate", type=Path,
+                        help="reviewed OLD->CURRENT cycle-library transition for an OLD-library base certificate")
     certificates = parser.add_mutually_exclusive_group()
     certificates.add_argument("--service-certificate", type=Path, help="current official phase/state service proof")
     certificates.add_argument("--stateful-sequence-certificate", type=Path, help="current typed stateful sequence proof")
@@ -105,12 +107,13 @@ def _reconstruct(args: argparse.Namespace) -> None:
                    "potal_graph", "potal_provenance", "npu_trace", "library", "cycle_certificate",
                    "run_aware_certificate", "application")
     input_names += ("lifecycle",) if args.lifecycle is not None else ("lifecycle_sidecar", "worker_resources")
-    input_names += tuple(name for name in ("service_certificate", "stateful_sequence_certificate", "clock_selection", "potal_result", "timing")
+    input_names += tuple(name for name in ("service_certificate", "stateful_sequence_certificate", "clock_selection", "potal_result", "timing",
+                                           "transition_certificate")
                          if getattr(args, name) is not None)
     paths = {name: Path(getattr(args, name)).resolve(strict=True) for name in input_names}
     output = args.output.resolve()
     workload_bytes = sum(path.stat().st_size for name, path in paths.items()
-                         if name not in ("library", "cycle_certificate", "run_aware_certificate",
+                         if name not in ("library", "cycle_certificate", "run_aware_certificate", "transition_certificate",
                                          "service_certificate", "stateful_sequence_certificate", "clock_selection", "potal_result", "timing"))
     required_free = DISK_RESERVE_BYTES + 8 * workload_bytes
     available_free = shutil.disk_usage(output).free
@@ -166,6 +169,8 @@ def _reconstruct(args: argparse.Namespace) -> None:
 
     artifacts = ["--library", str(paths["library"]), "--cycle-certificate", str(paths["cycle_certificate"]),
                  "--run-aware-certificate", str(paths["run_aware_certificate"])]
+    if "transition_certificate" in paths:
+        artifacts += ["--transition-certificate", str(paths["transition_certificate"])]
     npu = output / "npu-cycle-result.jsonl"
     stage("replay", ["sim.cycle.npu_trace", str(paths["npu_trace"]), *artifacts,
                      "--output", str(npu), "--summary", str(output / "npu-summary.json")])
