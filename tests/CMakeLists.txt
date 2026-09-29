@@ -334,6 +334,7 @@ target_sources(${_GGML_GEMMINI_DEQUANT_FP_TARGET} PRIVATE
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
     ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-bitmap-builder.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
     ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
@@ -377,6 +378,7 @@ add_executable(test-gemmini-act-quant-i32-saturation
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
     ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-bitmap-builder.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
     ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
@@ -413,6 +415,7 @@ add_executable(test-gemmini-block-quant
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
     ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-bitmap-builder.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
     ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
@@ -488,6 +491,7 @@ add_executable(test-gemmini-exsia
     ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
     ../ggml/src/ggml-gemmini/residual/direct/direct-executor.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-bitmap-builder.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-reference.cpp
@@ -585,6 +589,7 @@ foreach(_worker_count IN ITEMS 3 4)
         ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
         ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
         ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+        ../ggml/src/ggml-gemmini/residual/rmd/rmd-bitmap-builder.cpp
         ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
         ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
         ../ggml/src/ggml-gemmini/residual/rmd/rmd-reference.cpp
@@ -682,6 +687,13 @@ set_tests_properties(gemmini_exsia_all gemmini_exsia_direct_executor PROPERTIES
     ENVIRONMENT "OMP_DYNAMIC=FALSE;OMP_NUM_THREADS=3;OMP_THREAD_LIMIT=3"
     TIMEOUT 30)
 unset(_GGML_GEMMINI_EXSIA_CASES)
+if (GGML_GEMMINI_ENABLE_RMD AND NOT _GGML_GEMMINI_ACTIVATION_BITS_VALUE EQUAL 16)
+    foreach(_compaction legacy bitmap)
+        add_test(NAME gemmini_exsia_packet_${_compaction}
+            COMMAND ${CMAKE_COMMAND} -E env GGML_GEMMINI_RMD_COMPACTION=${_compaction}
+                $<TARGET_FILE:test-gemmini-exsia> --case=packet-capture)
+    endforeach()
+endif()
 add_test(NAME gemmini_exsia_unknown_case
     COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=unknown)
 set_tests_properties(gemmini_exsia_unknown_case PROPERTIES WILL_FAIL TRUE)
@@ -691,6 +703,7 @@ add_executable(test-gemmini-exsia-writer
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
     ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-bitmap-builder.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
     ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
@@ -817,10 +830,26 @@ target_include_directories(test-gemmini-rmd-packet PRIVATE
 add_test(NAME test-gemmini-rmd-packet
     COMMAND $<TARGET_FILE:test-gemmini-rmd-packet>)
 
+foreach(_bitmap_log IN ITEMS 0 1)
+    add_executable(test-gemmini-rmd-bitmap-log${_bitmap_log}
+        test-gemmini-rmd-bitmap.cpp
+        ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+        ../ggml/src/ggml-gemmini/residual/rmd/rmd-bitmap-builder.cpp)
+    target_compile_features(test-gemmini-rmd-bitmap-log${_bitmap_log} PRIVATE cxx_std_17)
+    target_compile_definitions(test-gemmini-rmd-bitmap-log${_bitmap_log} PRIVATE LOG_CYCLE=${_bitmap_log})
+    target_include_directories(test-gemmini-rmd-bitmap-log${_bitmap_log} PRIVATE
+        ../ggml/src ${TEST_GEMMINI_EXSIA_SW_PATH}
+        ${TEST_GEMMINI_EXSIA_SW_PATH}/include
+        ${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini-rocc-tests/include)
+    add_test(NAME test-gemmini-rmd-bitmap-log${_bitmap_log}
+        COMMAND $<TARGET_FILE:test-gemmini-rmd-bitmap-log${_bitmap_log}>)
+endforeach()
+
 add_executable(test-gemmini-rmd-capture
     test-gemmini-rmd-capture.cpp
     ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
-    ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp)
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-bitmap-builder.cpp)
 target_link_libraries(test-gemmini-rmd-capture PRIVATE
     ggml-base ggml-gemmini-utils)
 target_compile_features(test-gemmini-rmd-capture PRIVATE cxx_std_17)
@@ -1205,6 +1234,7 @@ add_executable(gemmini-quant-dispatch-smoke
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
     ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-bitmap-builder.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
     ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp

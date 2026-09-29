@@ -25,6 +25,9 @@
 순서**와 실제 Gemmini 실행을 확인한다. H1의 op 4 미지원이나 H0의 CPU-direct
 경로를 해결하는 것은 이 작업의 완료 조건이 아니다.
 
+Compaction 최적화의 기존/신규 비교 방법은
+[RMD compaction A/B 실행](rmd-compaction-ab.md)에 기록한다.
+
 ## 소스 확인 기록 (2026-09-28)
 
 `IM2P.sim`의 `gemmini` 브랜치를 `fa33e5d`까지 갱신했다. 직전 커밋 이후의

@@ -1884,7 +1884,8 @@ namespace ggml::gemmini::quants::act::exsia
         stripe.residual_nnz = 0;
 #endif
 #if GGML_GEMMINI_ENABLE_RMD
-        rmd_builder.reset(stripe_idx, stripe.row_start, stripe.row_count(), args.K, args.J);
+        rmd_builder.reset(stripe_idx, stripe.row_start, stripe.row_count(), args.K, args.J,
+                          &stripe.outlier_mask.words, state.K_padded);
 #else
         (void) rmd_builder;
 #endif
@@ -2244,9 +2245,23 @@ namespace ggml::gemmini::quants::act::exsia
         release_vector(state_.block_exp);
         state_.residual.assign(padded_elem_count, 0);
 
+        bool bitmap_compaction = false;
+#if GGML_GEMMINI_ENABLE_RMD
+        bitmap_compaction = GGML_GEMMINI_ACTIVATION_BITS != 16;
+        if (const char *mode = std::getenv("GGML_GEMMINI_RMD_COMPACTION")) {
+            if (std::strcmp(mode, "legacy") == 0) bitmap_compaction = false;
+            else if (std::strcmp(mode, "bitmap") == 0 && GGML_GEMMINI_ACTIVATION_BITS != 16)
+                bitmap_compaction = true;
+            else {
+                std::fprintf(stderr, "gemmini: invalid GGML_GEMMINI_RMD_COMPACTION='%s' (legacy or bitmap; bitmap requires A4/A8)\n", mode);
+                return fail(ExSIAState::FailureCode::InvalidInput);
+            }
+        }
+#endif
+
         for (StripePipelineSlot &slot : pipeline_slots_)
         {
-            slot.rmd_builder.select(args.residual_route);
+            slot.rmd_builder.select(args.residual_route, bitmap_compaction);
             slot.rmd_builder.set_context(run_id, layer);
             if (!slot.prepare(max_stripe_elem_count, max_stripe_block_count,
                               max_stripe_rows, state_.K_padded, state_.B_size))
@@ -2254,6 +2269,17 @@ namespace ggml::gemmini::quants::act::exsia
         }
         if (!local_workspace_.prepare(max_stripe_block_count, state_.B_size))
             return fail(ExSIAState::FailureCode::InvalidInput);
+
+#if GGML_GEMMINI_ENABLE_RMD
+        const unsigned capture_kind = args.residual_route == residual::ResidualRoute::cpu_direct
+            ? 0 : bitmap_compaction ? 2 : 1;
+        static std::atomic<unsigned> reported_capture_kinds{0};
+        if ((reported_capture_kinds.fetch_or(1u << capture_kind, std::memory_order_relaxed) &
+             (1u << capture_kind)) == 0) {
+            const char *names[] = {"cpu_direct (compaction unused)", "ws_packet compaction=legacy", "ws_packet compaction=bitmap"};
+            std::fprintf(stderr, "gemmini: ExSIA RMD capture=%s\n", names[capture_kind]);
+        }
+#endif
 
         // state_.stripe carries per-stripe row metadata only; the workspace owns the live
         // mask/scratch. (Validation builds additionally snapshot each mask below.)
