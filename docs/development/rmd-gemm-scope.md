@@ -25,6 +25,13 @@
 순서**와 실제 Gemmini 실행을 확인한다. H1의 op 4 미지원이나 H0의 CPU-direct
 경로를 해결하는 것은 이 작업의 완료 조건이 아니다.
 
+ExSIA의 A4/A8 WS packet은 bitmap compaction으로 생성한다. Residual을 받는
+즉시 limb로 분해하고, 0이 아닌 digit과 row/K 정보를 기록한다. 마지막에
+nonzero bitmap을 읽어 row/K를 압축한 signed-byte packet을 만든다. 원본
+weight block 식별자와 limb 지수, packet ABI는 유지한다. CPU direct에는
+packet compaction이 없으며, 일반 quantizer와 A16, packet slicing은 기존
+`RmdStripeBuilder`를 사용한다.
+
 ## 소스 확인 기록 (2026-09-28)
 
 `IM2P.sim`의 `gemmini` 브랜치를 `fa33e5d`까지 갱신했다. 직전 커밋 이후의

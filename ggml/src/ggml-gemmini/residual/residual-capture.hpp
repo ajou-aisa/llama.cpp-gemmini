@@ -2,6 +2,7 @@
 
 #include "direct/direct-builder.hpp"
 #include "rmd/rmd-builder.hpp"
+#include "rmd/rmd-bitmap-builder.hpp"
 #include <gemmini/cycle_reader.hpp>
 
 #if defined(__linux__) && defined(__aarch64__) && CYCLE_DETAIL
@@ -57,17 +58,31 @@ public:
     }
 
     void reset(size_t stripe_id, size_t row_begin, size_t row_count,
-               size_t logical_k, size_t logical_j) {
+               size_t logical_k, size_t logical_j,
+               const std::vector<uint64_t> *selection = nullptr, size_t stride = 0) {
         stripe_id_ = stripe_id;
-        std::visit([&](auto &sink) {
-            sink.reset(stripe_id, row_begin, row_count, logical_k, logical_j);
-        }, sink_);
+        if (!holds_cpu_sink() && selection && GGML_GEMMINI_ACTIVATION_BITS != 16) {
+            if (!uses_bitmap()) sink_.emplace<rmd::RmdBitmapBuilder>();
+            std::get<rmd::RmdBitmapBuilder>(sink_).reset(
+                stripe_id, row_begin, row_count, logical_k, logical_j,
+                GGML_GEMMINI_ACTIVATION_BITS, *selection, stride);
+            return;
+        }
+        if (auto *cpu = std::get_if<DirectStripeBuilder>(&sink_)) {
+            cpu->reset(stripe_id, row_begin, row_count, logical_k, logical_j);
+        } else {
+            if (uses_bitmap()) sink_.emplace<rmd::RmdStripeBuilder>();
+            std::get<rmd::RmdStripeBuilder>(sink_).reset(
+                stripe_id, row_begin, row_count, logical_k, logical_j);
+        }
     }
 
     bool add_residual(size_t local_row, size_t original_k, int32_t residual) {
-        return std::visit([&](auto &sink) {
-            return sink.add_residual(local_row, original_k, residual);
-        }, sink_);
+        if (auto *bitmap = std::get_if<rmd::RmdBitmapBuilder>(&sink_))
+            return bitmap->emit(local_row, original_k, residual);
+        if (auto *cpu = std::get_if<DirectStripeBuilder>(&sink_))
+            return cpu->add_residual(local_row, original_k, residual);
+        return std::get<rmd::RmdStripeBuilder>(sink_).add_residual(local_row, original_k, residual);
     }
 
     bool empty() const {
@@ -99,6 +114,8 @@ public:
 #endif
         if (auto *cpu = std::get_if<DirectStripeBuilder>(&sink_)) {
             result.direct = cpu->finish();
+        } else if (auto *bitmap = std::get_if<rmd::RmdBitmapBuilder>(&sink_)) {
+            result.packet = bitmap->finish();
         } else {
             result.packet = std::get<rmd::RmdStripeBuilder>(sink_).finish();
         }
@@ -137,10 +154,11 @@ public:
     }
 
     bool holds_cpu_sink() const { return std::holds_alternative<DirectStripeBuilder>(sink_); }
-    bool holds_ws_sink() const { return std::holds_alternative<rmd::RmdStripeBuilder>(sink_); }
+    bool holds_ws_sink() const { return !holds_cpu_sink(); }
+    bool uses_bitmap() const { return std::holds_alternative<rmd::RmdBitmapBuilder>(sink_); }
 
 private:
-    using Sink = std::variant<DirectStripeBuilder, rmd::RmdStripeBuilder>;
+    using Sink = std::variant<DirectStripeBuilder, rmd::RmdStripeBuilder, rmd::RmdBitmapBuilder>;
     Sink sink_;
     size_t stripe_id_ = 0;
     std::optional<uint64_t> run_id_;
