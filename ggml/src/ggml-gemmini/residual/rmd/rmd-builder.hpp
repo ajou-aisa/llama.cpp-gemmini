@@ -6,9 +6,8 @@
 
 namespace ggml::gemmini::rmd {
 
-// Incremental packet builder. ExSIA Stripe Folding calls add_residual() the moment a
-// final residual value exists, so no INT32 residual plane or outlier list is ever
-// materialised for the compensation path.
+// Packet builder for unordered residual input and A16. ExSIA A4/A8 uses
+// RmdBitmapBuilder with its ordered selection metadata.
 class RmdStripeBuilder {
 public:
     RmdStripeBuilder() = default;

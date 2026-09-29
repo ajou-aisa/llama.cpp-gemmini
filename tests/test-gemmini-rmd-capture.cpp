@@ -77,7 +77,7 @@ bool empty_capture_performs_zero_reads() {
 bool bitmap_capture_routes_and_validates() {
 #if GGML_GEMMINI_ACTIVATION_BITS != 16
     residual::TimedResidualCapture capture;
-    capture.select(residual::ResidualRoute::ws_packet, true);
+    capture.select(residual::ResidualRoute::ws_packet);
     std::vector<uint64_t> mask(2, 0);
     mask[0] = uint64_t{1} << 2;
     mask[1] = uint64_t{1} << 33;
@@ -96,18 +96,19 @@ bool bitmap_capture_routes_and_validates() {
                    actual.packet->stacked_activation == expected->stacked_activation,
                "bitmap finish preserves the packet ABI")) return false;
     capture.reset(0, 0, 1, 64, 17);
-    if (!check(capture.status() == ggml::gemmini::rmd::RmdStatus::invalid_arguments,
-               "bitmap reset requires selection metadata")) return false;
-    capture.select(residual::ResidualRoute::cpu_direct, true);
-    capture.reset(0, 0, 1, 64, 17);
+    if (!check(!capture.uses_bitmap() && capture.add_residual(0, 3, 1) &&
+                   capture.add_residual(0, 1, 2) && capture.finish().packet,
+               "generic input without a selection mask retains unordered ingestion")) return false;
+    capture.select(residual::ResidualRoute::cpu_direct);
+    capture.reset(0, 0, 1, 64, 17, &mask, 64);
     if (!check(!capture.uses_bitmap() && capture.holds_cpu_sink() &&
                    capture.add_residual(0, 3, 1) && capture.finish().direct,
                "CPU direct selection never invokes compaction")) return false;
-    capture.select(residual::ResidualRoute::ws_packet, false);
-    capture.reset(0, 0, 1, 64, 17);
-    return check(!capture.uses_bitmap() && capture.add_residual(0, 3, 1) &&
-                     capture.add_residual(0, 1, 2) && capture.finish().packet,
-                 "legacy selection retains unordered ingestion");
+    capture.select(residual::ResidualRoute::ws_packet);
+    capture.reset(0, 0, 1, 64, 17, &mask, 64);
+    return check(capture.uses_bitmap() && capture.add_residual(0, 2, 1) &&
+                     capture.finish().packet,
+                 "selection metadata restores bitmap compaction after CPU reuse");
 #else
     return true;
 #endif

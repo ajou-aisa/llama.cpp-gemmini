@@ -500,10 +500,22 @@ bool test_exsia_packet_capture() {
             }
         }
     }
-    return check(packet_count > 1 && meta.direct_residuals.empty(),
-                 "real ExSIA uses packets across reused stripe slots") &&
-        check(std::equal(restored.begin(), restored.end(), state.residual.begin(), state.residual.end()),
-              "packet reconstruction equals ExSIA selected residual plane");
+    if (!check(packet_count > 1 && meta.direct_residuals.empty(),
+               "real ExSIA uses packets across reused stripe slots")) return false;
+    if (!check(std::equal(restored.begin(), restored.end(), state.residual.begin(), state.residual.end()),
+               "packet reconstruction equals ExSIA selected residual plane")) return false;
+    args.residual_route = residual::ResidualRoute::cpu_direct;
+    if (!check(exsia.run(meta, &tensor, args) && meta.rmd_packets.empty() &&
+                   !meta.direct_residuals.empty(),
+               "reused ExSIA switches every WS slot to CPU direct")) return false;
+    args.residual_route = residual::ResidualRoute::ws_packet;
+    if (!check(exsia.run(meta, &tensor, args) && meta.direct_residuals.empty() &&
+                   !meta.rmd_packets.empty(),
+               "reused ExSIA switches CPU slots back to WS packets")) return false;
+    std::fill(source.begin(), source.end(), 0.0f);
+    return check(exsia.run(meta, &tensor, args) && meta.direct_residuals.empty() &&
+                     meta.rmd_packets.empty(),
+                 "empty run publishes no residuals from reused slots");
 #else
     return true;
 #endif

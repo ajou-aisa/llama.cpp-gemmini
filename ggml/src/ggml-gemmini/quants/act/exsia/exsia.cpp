@@ -1974,8 +1974,6 @@ namespace ggml::gemmini::quants::act::exsia
                     GGML_ASSERT(global_idx < residual.size());
                     residual[global_idx] = residual_i32;
 
-                    // Balanced radix-256 decomposition happens the moment the final
-                    // residual exists; no residual list survives this loop.
 #if GGML_GEMMINI_ENABLE_RMD
                     if (outlier && residual_i32 != 0 &&
                         !rmd_builder.add_residual(local_row, col, residual_i32))
@@ -2245,23 +2243,9 @@ namespace ggml::gemmini::quants::act::exsia
         release_vector(state_.block_exp);
         state_.residual.assign(padded_elem_count, 0);
 
-        bool bitmap_compaction = false;
-#if GGML_GEMMINI_ENABLE_RMD
-        bitmap_compaction = GGML_GEMMINI_ACTIVATION_BITS != 16;
-        if (const char *mode = std::getenv("GGML_GEMMINI_RMD_COMPACTION")) {
-            if (std::strcmp(mode, "legacy") == 0) bitmap_compaction = false;
-            else if (std::strcmp(mode, "bitmap") == 0 && GGML_GEMMINI_ACTIVATION_BITS != 16)
-                bitmap_compaction = true;
-            else {
-                std::fprintf(stderr, "gemmini: invalid GGML_GEMMINI_RMD_COMPACTION='%s' (legacy or bitmap; bitmap requires A4/A8)\n", mode);
-                return fail(ExSIAState::FailureCode::InvalidInput);
-            }
-        }
-#endif
-
         for (StripePipelineSlot &slot : pipeline_slots_)
         {
-            slot.rmd_builder.select(args.residual_route, bitmap_compaction);
+            slot.rmd_builder.select(args.residual_route);
             slot.rmd_builder.set_context(run_id, layer);
             if (!slot.prepare(max_stripe_elem_count, max_stripe_block_count,
                               max_stripe_rows, state_.K_padded, state_.B_size))
@@ -2272,11 +2256,11 @@ namespace ggml::gemmini::quants::act::exsia
 
 #if GGML_GEMMINI_ENABLE_RMD
         const unsigned capture_kind = args.residual_route == residual::ResidualRoute::cpu_direct
-            ? 0 : bitmap_compaction ? 2 : 1;
+            ? 0 : GGML_GEMMINI_ACTIVATION_BITS == 16 ? 1 : 2;
         static std::atomic<unsigned> reported_capture_kinds{0};
         if ((reported_capture_kinds.fetch_or(1u << capture_kind, std::memory_order_relaxed) &
              (1u << capture_kind)) == 0) {
-            const char *names[] = {"cpu_direct (compaction unused)", "ws_packet compaction=legacy", "ws_packet compaction=bitmap"};
+            const char *names[] = {"cpu_direct (compaction unused)", "ws_packet compaction=a16", "ws_packet compaction=bitmap"};
             std::fprintf(stderr, "gemmini: ExSIA RMD capture=%s\n", names[capture_kind]);
         }
 #endif

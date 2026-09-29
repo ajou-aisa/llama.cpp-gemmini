@@ -687,13 +687,6 @@ set_tests_properties(gemmini_exsia_all gemmini_exsia_direct_executor PROPERTIES
     ENVIRONMENT "OMP_DYNAMIC=FALSE;OMP_NUM_THREADS=3;OMP_THREAD_LIMIT=3"
     TIMEOUT 30)
 unset(_GGML_GEMMINI_EXSIA_CASES)
-if (GGML_GEMMINI_ENABLE_RMD AND NOT _GGML_GEMMINI_ACTIVATION_BITS_VALUE EQUAL 16)
-    foreach(_compaction legacy bitmap)
-        add_test(NAME gemmini_exsia_packet_${_compaction}
-            COMMAND ${CMAKE_COMMAND} -E env GGML_GEMMINI_RMD_COMPACTION=${_compaction}
-                $<TARGET_FILE:test-gemmini-exsia> --case=packet-capture)
-    endforeach()
-endif()
 add_test(NAME gemmini_exsia_unknown_case
     COMMAND $<TARGET_FILE:test-gemmini-exsia> --case=unknown)
 set_tests_properties(gemmini_exsia_unknown_case PROPERTIES WILL_FAIL TRUE)
@@ -797,18 +790,6 @@ if (NOT GGML_BACKEND_DL)
         ${GEMMINI_SW_PATH}
         ${GEMMINI_SW_PATH}/include)
     add_test(NAME test-gemmini-rmd COMMAND $<TARGET_FILE:test-gemmini-rmd>)
-    add_test(NAME test-gemmini-rmd-direct-happy
-        COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=direct-happy)
-    add_test(NAME test-gemmini-rmd-direct-failure
-        COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=direct-failure)
-    add_test(NAME test-gemmini-rmd-compact-happy
-        COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=compact-happy)
-    add_test(NAME test-gemmini-rmd-compact-failure
-        COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=compact-failure)
-    add_test(NAME test-gemmini-rmd-radix-happy
-        COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=radix-happy)
-    add_test(NAME test-gemmini-rmd-radix-failure
-        COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=radix-failure)
 endif()
 
 add_executable(test-gemmini-rmd-packet
@@ -1296,6 +1277,8 @@ set(_GEMMINI_REGISTERED_TEST_EXECUTABLES
 if (TARGET ggml-gemmini)
 list(APPEND _GEMMINI_REGISTERED_TEST_EXECUTABLES
     test-gemmini-rmd-capture
+    test-gemmini-rmd-bitmap-log0
+    test-gemmini-rmd-bitmap-log1
     test-gemmini-act-quant-i32-saturation
     test-gemmini-exsia
     test-gemmini-exsia-writer
