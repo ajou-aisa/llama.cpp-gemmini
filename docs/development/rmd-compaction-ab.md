@@ -1,4 +1,4 @@
-# RMD compaction 기존/최적화 비교
+# RMD compaction 채택 및 비교
 
 같은 빌드에서 `GGML_GEMMINI_RMD_COMPACTION`만 바꿔 실행한다.
 
@@ -10,6 +10,29 @@
 A4/A8의 기본값은 `bitmap`. A16은 기존 `legacy`를 유지하며 `bitmap`을
 명시하면 실패한다. 알 수 없는 옵션도 실패한다. CPU direct 경로에는
 compaction이 없으므로 이 옵션으로 성능을 비교할 수 없다.
+
+## 채택 근거: Jetson Nano CPU 준비 실험
+
+A4/W4 RMD의 WS packet compaction 방법으로 `bitmap`을 채택한다. Nano에서
+CPU 추론을 유지하면서 동일 residual로 WS packet까지 만드는 임시 측정 코드
+(`de530e2a0877c1ef43d5215eaf1c34004b43800d`)를 사용했다. GPT-2
+`Q4_HP1`에서 `legacy`와 `bitmap`을 번갈아 3회씩, 두 묶음으로 실행했다.
+모든 성공 실행은 같은 Git SHA와 모델을 사용했고, 각각 384개 stripe를 기록했다.
+모델 경로 오류로 종료된 최초 1회는 제외했다. 원본 로그 묶음은
+`rmd-cpu-results-v2.tar.gz`이다.
+
+| 실행당 384개 stripe 시간 합계의 3회 중앙값 | 첫 묶음 legacy → bitmap | 둘째 묶음 legacy → bitmap |
+| --- | ---: | ---: |
+| `exsia.folding_and_pack` host 시간 | 138.2 → 113.1 ms (18.2% 감소) | 149.7 → 117.7 ms (21.4% 감소) |
+| `rmd.cpu_compaction.finish` host 시간 | 44.4 → 34.1 ms (23.1% 감소) | 46.9 → 35.1 ms (25.3% 감소) |
+
+두 묶음의 성공 실행 12개에서 생성 출력과 stripe별 packet 작업량이 같았다.
+`exsia.folding_and_pack`에는 folding, CPU direct capture, packet 생성·검증이
+함께 들어간다. `finish`는 그 구간에 포함되므로 두 시간을 더하지 않는다.
+전체 추론은 양쪽 모두 약 32~33초였다. Nano의 native CPU cycle event는
+`unavailable_event`로 무효였고, 이 CPU 실험에서는 RTL/SCU cycle을
+측정하지 않았다. 따라서 채택 근거는 host 준비 시간 감소이며 하드웨어
+cycle 감소는 아직 확인되지 않았다.
 
 ## 알고리즘과 동일성
 
