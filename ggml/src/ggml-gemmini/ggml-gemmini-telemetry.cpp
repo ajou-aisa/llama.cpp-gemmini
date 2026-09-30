@@ -34,6 +34,8 @@ std::string serialize_matmul_cpu_interval(log::CycleRecord record,
         result.tid = sample.tid;
         result.thread_cpu_ns = sample.thread_cpu_ns;
         result.thread_cpu_valid = sample.thread_cpu_valid;
+        result.cpu_core = sample.cpu_core;
+        result.cpu_core_valid = sample.cpu_core >= 0 ? 1 : 0;
 #if defined(__linux__) && defined(__aarch64__)
         result.counter = sample.native.value;
         result.native_valid = sample.collected && sample.native.valid;

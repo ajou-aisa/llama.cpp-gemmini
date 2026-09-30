@@ -497,6 +497,8 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     int count = 0;
     double nll = 0.0;
     double nll2 = 0.0;
+    // Per-chunk NLL/token deltas, printed after the loop as exact machine-readable corpus totals.
+    std::vector<std::pair<double, int>> chunk_nll;
 
     const int num_batches = workload.n_batches;
     const int n_seq = workload.n_seq;
@@ -585,11 +587,13 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
                         tokens_data, n_ctx - 1 - first,
                         workers, log_probs, nll, nll2);
             } else {
+                const double nll_before = nll;
                 process_logits(n_vocab, all_logits,
                         tokens_data, n_ctx - 1 - first,
                         workers, nll, nll2,
                         logit_history.data() + start + seq*n_ctx + first,
                         prob_history.data()  + start + seq*n_ctx + first);
+                chunk_nll.emplace_back(nll - nll_before, n_ctx - first - 1);
             }
             count += n_ctx - first - 1;
 
@@ -609,6 +613,12 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
         logits.clear();
     }
     LOG("\n");
+
+    for (size_t i = 0; i < chunk_nll.size(); ++i) {
+        LOG_INF("PPL_CHUNK index=%zu nll=%.17g scored_tokens=%d\n", i, chunk_nll[i].first, chunk_nll[i].second);
+    }
+    LOG_INF("PPL_TOTALS total_nll=%.17g total_scored_tokens=%d chunks=%zu corpus_ppl=%.17g\n",
+            nll, count, chunk_nll.size(), std::exp(nll / count));
 
     nll2 /= count;
     nll /= count;

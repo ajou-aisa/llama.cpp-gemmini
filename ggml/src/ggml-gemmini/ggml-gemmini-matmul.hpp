@@ -9,6 +9,9 @@
 #include "residual/rmd/rmd-executor.hpp"
 
 #include <array>
+#if defined(__linux__)
+#include <sched.h>
+#endif
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
@@ -255,6 +258,8 @@ struct MatmulCpuSample {
     uint64_t thread_cpu_ns = 0;
     bool thread_cpu_valid = false;
     gemmini_trace_context trace{};
+    // Observed Linux CPU (sched_getcpu) right after the counter read; -1 when unavailable.
+    int32_t cpu_core = -1;
 };
 
 inline MatmulCpuSample read_matmul_cpu_sample() {
@@ -271,6 +276,9 @@ inline MatmulCpuSample read_matmul_cpu_sample() {
     result.value = result.native.value;
 #else
     result.value = cycle::read();
+#endif
+#if defined(__linux__)
+    result.cpu_core = sched_getcpu();
 #endif
 #if CYCLE_DETAIL
     const auto host = cycle::read_host_sample();

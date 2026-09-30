@@ -86,7 +86,10 @@ if [[ "$GGML_GEMMINI_EXSIA_PROFILE_SCOPE_DEFAULT" != "OFF" && "$CYCLE_DETAIL_DEF
 fi
 
 PLATFORM_CMAKE_ARGS=()
+# Metal exists only on macOS; other hosts (e.g. Linux aarch64) build the CPU backend.
+GGML_METAL_PLATFORM=OFF
 if [[ "$(uname -s)" == "Darwin" ]]; then
+  GGML_METAL_PLATFORM=ON
   if command -v brew >/dev/null 2>&1; then
     BREW_BIN="$(command -v brew)"
   elif [[ -x /opt/homebrew/bin/brew ]]; then
@@ -124,7 +127,7 @@ cmake -B "$BUILD_DIR" -S "$SCRIPT_ROOT" \
   -U 'CMAKE_PREFIX_PATH' \
   -U 'OpenMP_ROOT' \
   -DGGML_GEMMINI=OFF \
-  -DGGML_METAL=ON \
+  -DGGML_METAL="${GGML_METAL_PLATFORM}" \
   -DGGML_BLAS=OFF \
   -DGGML_BACKEND_DL=ON \
   -DLLAMA_BUILD_TESTS=OFF \

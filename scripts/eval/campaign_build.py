@@ -42,6 +42,7 @@ NON_SEMANTIC: Final = frozenset({"LOG_CYCLE", "GGML_CPU_CYCLE_LOG", "CYCLE_DETAI
                                  "IM2P_SIM_ROOT", "CMAKE_EXPORT_COMPILE_COMMANDS"})
 CYCLE_MODEL_OPTIONS: Final = {"CMAKE_BUILD_TYPE": "Release", "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"}
 SOURCE_REPOS: Final = ("llama.cpp-gemmini", "IM2P.sim", "RISC-V-DynDNN-gemmini-include")
+INCLUDE_REPO: Final = REPO.parent / "RISC-V-DynDNN-gemmini-include"
 
 
 def command(argv: list[str], directory: Path, name: str, timeout: int = 1800, cwd: Path = REPO) -> None:
@@ -208,8 +209,40 @@ def repository_state(repo: Path) -> Record:
             "tracked_clean": not diff, "tracked_diff_sha256": hashlib.sha256(diff).hexdigest()}
 
 
+def include_headers(repo: Path = INCLUDE_REPO) -> Record:
+    """Every header on the CMake include path of the Gemmini include repo (top level, then include/), hashed.
+
+    Git HEAD and the tracked diff miss untracked or ignored headers, so the header bytes themselves are part of
+    the source identity and therefore of every llama build cache key."""
+    rows: Record = {str(path.relative_to(repo)): sha256(path)
+                    for directory in (repo, repo / "include") for path in sorted(directory.glob("*.h"))}
+    require("gemmini.h" in rows and "gemmini_params.h" in rows, "Gemmini include repo lacks gemmini.h/gemmini_params.h")
+    return rows
+
+
 def source_state() -> Record:
-    return {name: repository_state(REPO.parent / name) for name in SOURCE_REPOS}
+    state: Record = {name: repository_state(REPO.parent / name) for name in SOURCE_REPOS}
+    record(state["RISC-V-DynDNN-gemmini-include"])["headers"] = include_headers()
+    return state
+
+
+def include_closure(build_dir: Path, repo: Path = INCLUDE_REPO) -> Record:
+    """Include-repo headers the compiler actually read, hashed; empty when none were read.
+
+    Ninja keeps compiler dependencies in its deps log; Makefile builds keep the compiler depfiles (*.o.d)."""
+    tokens: list[str] = []
+    if (build_dir / "build.ninja").is_file():
+        done = subprocess.run(["ninja", "-C", str(build_dir), "-t", "deps"], capture_output=True, text=True, check=False)
+        require(done.returncode == 0, "ninja deps log unavailable: " + str(build_dir))
+        tokens = [line.strip() for line in done.stdout.splitlines() if line.startswith("    ")]
+    else:
+        depfiles = sorted(build_dir.rglob("*.o.d"))
+        require(bool(depfiles), "compiler dependency files missing: " + str(build_dir))
+        for depfile in depfiles:
+            tokens.extend(depfile.read_text().replace("\\\n", " ").split(":", 1)[1].split())
+    root = repo.resolve()
+    used = {(build_dir / token).resolve() for token in tokens}
+    return {str(path.relative_to(root)): sha256(path) for path in sorted(used) if path.is_relative_to(root)}
 
 
 def build(kind: str, precision: str, dim: int, output: Path, im2p: Path, jobs: int,
@@ -245,28 +278,38 @@ def build(kind: str, precision: str, dim: int, output: Path, im2p: Path, jobs: i
     write_json(output / "build-info.json", info)
     write_json(output / "artifacts.json", artifact_snapshot(runner))
     extras: Record = {name: sha256(output / "bin" / name) for name in extra_targets}
+    headers = include_closure(output)
+    require("gemmini.h" in headers, "GGML_GEMMINI build did not read the include-repo gemmini.h")
     write_json(output / "build-receipt.json", {"kind": kind, "options": plan.record()["options"],
                "runner_sha256": sha256(runner), "verification": "PASS", "producer_git_sha": producer_head,
                "producer_diff_sha256": hashlib.sha256(source_diff).hexdigest(),
                "semantic_options_sha256": plan.semantic_options_sha256, "platform": host.record(),
-               "toolchain": toolchain(), "sources": source_state(), "extra_targets": extras})
+               "toolchain": toolchain(), "sources": source_state(), "extra_targets": extras,
+               "include_repo_closure": headers})
     return runner
 
 
 def source_closure(build_dir: Path, root: Path) -> Record:
     """Project files named by the compiler depfiles of the cycle-model objects, hashed; system headers counted."""
     project: set[Path] = set()
+    external: set[Path] = set()
     system = 0
+    include = INCLUDE_REPO.resolve()
     for depfile in sorted((build_dir / "CMakeFiles/im2p_cycle_objects.dir").rglob("*.o.d")):
         for token in depfile.read_text().replace("\\\n", " ").split(":", 1)[1].split():
             path = (build_dir / token).resolve()
             if path.is_relative_to(root):
                 project.add(path)
+            elif path.is_relative_to(include):
+                external.add(path)
             else:
                 system += 1
     require(bool(project), "cycle-model dependency files missing")
-    return {"files": {str(path.relative_to(root)): sha256(path) for path in sorted(project)},
-            "system_header_references": system}
+    # The cycle-model cache key names only IM2P.sim; an include-repo header in the closure would make it stale.
+    require(not external, "cycle model reads Gemmini include-repo headers: " + ", ".join(map(str, sorted(external))))
+    files: Record = {str(path.relative_to(root)): sha256(path) for path in sorted(project)}
+    return {"files": files, "closure_sha256": digest(files), "system_header_references": system,
+            "include_repo_dependency": "NONE"}
 
 
 def build_cycle_model(output: Path, im2p: Path, jobs: int) -> Record:

@@ -21,6 +21,9 @@
 #include <variant>
 #include <utility>
 #include <sys/stat.h>
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
 #if defined(__linux__)
 #include <sys/syscall.h>
@@ -1119,6 +1122,11 @@ extern "C" gemmini_cpu_sample gemmini_cpu_timing_read(void) {
     result.native_reason = static_cast<uint8_t>(native.reason);
     result.native_source = GEMMINI_CPU_COUNTER_THREAD_PERF;
 #endif
+#if defined(__linux__)
+    const int core = sched_getcpu();
+    result.cpu_core = core;
+    result.cpu_core_valid = core >= 0 ? 1 : 0;
+#endif
 #endif
     return result;
 }
@@ -1298,14 +1306,30 @@ std::string serialize_cpu_timing_contract(const gemmini_cpu_sample &start,
     const bool host_valid = start.tid != 0 && end.tid != 0 && end.ns >= start.ns;
     const char *host_reason = host_valid ? nullptr :
         start.tid == 0 || end.tid == 0 ? "missing_thread_id" : "counter_regression";
+    // Observed host cores at both endpoints; a migration is reported, never attributed to one core.
+    const auto core_json = [](const gemmini_cpu_sample &sample) {
+        return sample.cpu_core_valid ? std::to_string(sample.cpu_core) : std::string("null");
+    };
+    const bool cores_valid = same_thread && start.cpu_core_valid && end.cpu_core_valid;
+    const char *sample_reason = nullptr;
+#if defined(__linux__) && defined(__aarch64__)
+    if (!cycles_valid && (!start.native_valid || !end.native_valid)) {
+        sample_reason = ggml::gemmini::cycle::reason_name(static_cast<ggml::gemmini::cycle::NativeCycleReason>(
+            !start.native_valid ? start.native_reason : end.native_reason));
+    }
+#endif
     return std::string(",\"cpu_work_cycles\":") +
         (cycles_valid ? std::to_string(end.counter - start.counter) : "null") +
         ",\"cpu_work_cycles_valid\":" + (cycles_valid ? "true" : "false") +
-        ",\"cpu_work_cycles_source\":" +
-            (start.native_source == GEMMINI_CPU_COUNTER_THREAD_PERF &&
-             end.native_source == GEMMINI_CPU_COUNTER_THREAD_PERF ? "\"linux_perf_cpu_cycles\"" : "null") +
+        // Timing contract: an invalid sample names no source (its reason says why), even when perf was the source.
+        ",\"cpu_work_cycles_source\":" + (cycles_valid ? "\"linux_perf_cpu_cycles\"" : "null") +
         ",\"cpu_work_cycles_unit\":\"cycle\",\"cpu_work_cycles_reason\":" +
             cpu_json_string(cycles_reason) +
+        ",\"cpu_work_cycles_sample_reason\":" + cpu_json_string(sample_reason) +
+        // PERF_COUNT_HW_CPU_CYCLES with exclude_kernel=0 (cycle_reader_aarch64): user + kernel cycles.
+        ",\"cpu_work_cycles_scope\":" + (cycles_valid ? "\"user+kernel\"" : "null") +
+        ",\"host_cpu_core_start\":" + core_json(start) + ",\"host_cpu_core_end\":" + core_json(end) +
+        ",\"cpu_migrated\":" + (cores_valid ? (start.cpu_core != end.cpu_core ? "true" : "false") : "null") +
         ",\"thread_cpu_ns\":" + (thread_valid ? std::to_string(end.thread_cpu_ns - start.thread_cpu_ns) : "null") +
         ",\"thread_cpu_valid\":" + (thread_valid ? "true" : "false") +
         ",\"thread_cpu_reason\":" + cpu_json_string(thread_reason) +
