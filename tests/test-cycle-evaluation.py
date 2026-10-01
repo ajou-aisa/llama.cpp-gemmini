@@ -733,6 +733,7 @@ def test_schedule_sinks_give_one_result_with_or_without_timeline(tmp_path: Path)
     write_timeline(reference, timeline_rows(schedule, bundle, results, Axis(1_000_000_000, False)))
     expected = performance(reference, 2, None, "NANO_LOCAL_VALIDATED", 1_000_000_000)
     outcomes = []
+    created: list[tuple[int, int]] = []
     for timeline in (None, tmp_path / "in-pass.jsonl"):
         sinks = ScheduleSinks(results, Axis(1_000_000_000, False), 2, "NANO_LOCAL_VALIDATED", timeline)
         with sqlite3.connect(schedule) as out, sqlite3.connect(bundle) as ir:
@@ -744,9 +745,13 @@ def test_schedule_sinks_give_one_result_with_or_without_timeline(tmp_path: Path)
                               None, json.loads(body))
         sinks.close()
         outcomes.append(sinks.accumulator.result())
+        created.append((sinks.row_objects_created, sinks.written))
     # Then: the timeline switch changes only what is written, and the in-pass rows are the exported timeline.
     assert outcomes[0] == outcomes[1] == expected
     assert (tmp_path / "in-pass.jsonl").read_bytes() == reference.read_bytes()
+    # And: performance-only creates and writes no timeline row object at all.
+    rows = len(reference.read_text().splitlines())
+    assert created == [(0, 0), (rows, rows)]
 
 
 def test_e2e_endpoints_keep_clock_domains_apart_and_counters_beyond_32_bits() -> None:

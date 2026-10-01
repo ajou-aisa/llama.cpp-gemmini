@@ -21,7 +21,7 @@ from contextlib import closing
 from fractions import Fraction
 from pathlib import Path
 from statistics import median
-from typing import Final
+from typing import Final, Protocol
 
 from eval_common import Json, Record, integer, record, records, require, sha256, text
 
@@ -177,46 +177,44 @@ def npu_works(npu_results: Path) -> dict[int, Record]:
     return {integer(row, "sequence"): row for row in records(npu_results)}
 
 
-def node_rows(ordinal: int, identity: str, scheduled: Record, kind: str, node: Record, works: dict[int, Record],
-              axis: Axis) -> Iterator[Record]:
-    """Timeline rows of one scheduled node: its CPU worker intervals, its NPU work and its application endpoints.
+class NodeSink(Protocol):
+    """What one scheduled node contributes, in schedule order: endpoints and service intervals (ns rationals)."""
 
-    The single row builder: the scheduler's in-pass sinks (performance, timeline) and the export from a preserved
-    schedule both call it with the node's stored schedule row and IR node fields."""
+    def request_start(self, ordinal: int, identity: str, at_ns: Fraction) -> None: ...
+
+    def npu(self, ordinal: int, identity: str, node: Record, work: Record, scheduled: Record, token: int, phase: str,
+            decode_index: int | None, accepted_ns: Fraction, result_ns: Fraction, resource_ns: Fraction,
+            cycles: int) -> None: ...
+
+    def cpu(self, ordinal: int, identity: str, kind: str, node: Record, sample: Record, measurement: Record,
+            token: int, phase: str, decode_index: int | None, begin_ns: Fraction, end_ns: Fraction) -> None: ...
+
+    def token_ready(self, ordinal: int, identity: str, token: int, at_ns: Fraction) -> None: ...
+
+
+def visit_node(ordinal: int, identity: str, scheduled: Record, kind: str, node: Record, works: dict[int, Record],
+               axis: Axis, sink: NodeSink) -> None:
+    """One scheduled node: its request-start endpoint, NPU work, CPU worker intervals and token-ready endpoint.
+
+    The single interpretation of a stored schedule row: the timeline row builder, the in-pass performance sink and
+    the export from a preserved schedule all go through it."""
     require(scheduled.get("node_id") == identity == node.get("node_id"), "schedule/IR node identity mismatch")
     accepted, result, resource = (rational(scheduled.get(name)) for name in
                                   ("accepted_ns", "result_ready_ns", "resource_ready_ns"))
     if identity == "application:request:begin":
-        event: Record = {"seq": ordinal, "row_type": "event", "kind": "event", "event": "request_start",
-                         "node_id": identity, "token_index": None}
-        axis.place(event, result, result)
-        yield event
+        sink.request_start(ordinal, identity, result)
     if kind in STRUCTURAL:
         return
     phase, decode_index = phase_of(text(node, "phase"))
     token = (int(identity.rsplit(":", 1)[1]) if identity.startswith("application:sample:")
              else token_of(phase, decode_index))
-    common: Record = {"seq": ordinal, "row_type": "interval", "node_id": identity,
-                      "operation_id": node.get("operation_id"), "phase": phase,
-                      "decode_index": decode_index, "token_index": token}
     if kind == "NPU":
         work = works[int(identity.removeprefix("npu:"))]
         cycles = integer(record(work.get("modeled")), "total_cycles", 1)
         accepted_cycle = scheduled.get("accepted_cycle")
         require(isinstance(accepted_cycle, int) and axis.cycles(accepted) == accepted_cycle and
                 axis.cycles(resource) - accepted_cycle == cycles, "NPU row differs from its isolated service")
-        row: Record = {**common, "kind": "npu", "source": "cycle-sim", "resource": "npu:0",
-                       "resource_class": "NPU", "scheduler_lane": None, "host_thread_id": None,
-                       "host_cpu_core": None, "host_cpu_core_start": None, "host_cpu_core_end": None,
-                       "cpu_migrated": None, "target_cpu_core": None,
-                       "work_id": work.get("work_id"), "op": work.get("operation"),
-                       "layer": work.get("layer"), "evidence_id": scheduled.get("evidence_id"),
-                       "npu_cycles": cycles, "npu_ms": None,
-                       "result_ready_cycle": number(axis.cycles(result)),
-                       "timing_source": NPU_TIMING_SOURCE.get(str(work.get("cycle_model_validation")),
-                                                              "CYCLE_SIM_ISOLATED_UNADMITTED")}
-        axis.place(row, accepted, resource)
-        yield row
+        sink.npu(ordinal, identity, node, work, scheduled, token, phase, decode_index, accepted, result, resource, cycles)
         return
     require(kind in ("CPU", "APPLICATION_CPU"), "unsupported scheduled node kind " + str(kind))
     workers = scheduled.get("worker_intervals")
@@ -224,33 +222,83 @@ def node_rows(ordinal: int, identity: str, scheduled: Record, kind: str, node: R
     for worker in workers if isinstance(workers, list) else []:
         sample = record(worker)
         measurement = record(sample.get("measurement"))
+        sink.cpu(ordinal, identity, kind, node, sample, measurement, token, phase, decode_index, accepted,
+                 accepted + rational(sample.get("duration_ns")))
+    if identity.startswith("application:sample:"):
+        sink.token_ready(ordinal, identity, token, result)
+
+
+class RowBuilder:
+    """The timeline rows (dicts) of the visited nodes, exactly as timeline.jsonl stores them."""
+
+    def __init__(self, axis: Axis) -> None:
+        self.axis = axis
+        self.rows: list[Record] = []
+        self.created = 0
+
+    def _place(self, row: Record, start_ns: Fraction, end_ns: Fraction) -> None:
+        self.axis.place(row, start_ns, end_ns)
+        self.rows.append(row)
+        self.created += 1
+
+    def request_start(self, ordinal: int, identity: str, at_ns: Fraction) -> None:
+        self._place({"seq": ordinal, "row_type": "event", "kind": "event", "event": "request_start",
+                     "node_id": identity, "token_index": None}, at_ns, at_ns)
+
+    def npu(self, ordinal: int, identity: str, node: Record, work: Record, scheduled: Record, token: int, phase: str,
+            decode_index: int | None, accepted_ns: Fraction, result_ns: Fraction, resource_ns: Fraction,
+            cycles: int) -> None:
+        self._place({"seq": ordinal, "row_type": "interval", "node_id": identity,
+                     "operation_id": node.get("operation_id"), "phase": phase,
+                     "decode_index": decode_index, "token_index": token,
+                     "kind": "npu", "source": "cycle-sim", "resource": "npu:0",
+                     "resource_class": "NPU", "scheduler_lane": None, "host_thread_id": None,
+                     "host_cpu_core": None, "host_cpu_core_start": None, "host_cpu_core_end": None,
+                     "cpu_migrated": None, "target_cpu_core": None,
+                     "work_id": work.get("work_id"), "op": work.get("operation"),
+                     "layer": work.get("layer"), "evidence_id": scheduled.get("evidence_id"),
+                     "npu_cycles": cycles, "npu_ms": None,
+                     "result_ready_cycle": number(self.axis.cycles(result_ns)),
+                     "timing_source": NPU_TIMING_SOURCE.get(str(work.get("cycle_model_validation")),
+                                                            "CYCLE_SIM_ISOLATED_UNADMITTED")}, accepted_ns, resource_ns)
+
+    def cpu(self, ordinal: int, identity: str, kind: str, node: Record, sample: Record, measurement: Record,
+            token: int, phase: str, decode_index: int | None, begin_ns: Fraction, end_ns: Fraction) -> None:
         # `resource` is a synthetic scheduler lane, never a CPU core. The observed Linux core is recorded
         # only when the collector measured it; no target core mapping exists yet.
-        cpu: Record = {**common, "kind": "cpu", "source": cpu_source(kind, text(sample, "resource")),
-                       "resource": sample.get("resource"), "tid": measurement.get("thread_id"),
-                       "resource_class": "SYNTHETIC_SCHEDULER_LANE", "scheduler_lane": sample.get("resource"),
-                       "host_thread_id": measurement.get("thread_id"),
-                       **host_cores(measurement), "target_cpu_core": None,
-                       "cpu_cycles": measurement.get("cpu_work_cycles")
-                       if measurement.get("cpu_work_cycles_valid") is True else None,
-                       "cpu_cycles_valid": measurement.get("cpu_work_cycles_valid"),
-                       "cpu_cycle_source": measurement.get("cpu_work_cycles_source"),
-                       "cpu_cycle_scope": measurement.get("cpu_work_cycles_scope"),
-                       "worker_id": sample.get("worker_id"),
-                       "op": measurement.get("stage") or measurement.get("op"),
-                       "layer": measurement.get("layer"), "source_line": measurement.get("source_line"),
-                       "host_elapsed_ns": measurement.get("host_elapsed_ns"),
-                       "host_thread_cpu_ns": measurement.get("thread_cpu_ns")
-                       if measurement.get("thread_cpu_valid") is True else None,
-                       "target_cpu_cycles": None, "target_cpu_ms": None,
-                       "timing_source": "HOST_MEASURED_DEVELOPMENT"}
-        axis.place(cpu, accepted, accepted + rational(sample.get("duration_ns")))
-        yield cpu
-    if identity.startswith("application:sample:"):
-        ready: Record = {"seq": ordinal, "row_type": "event", "kind": "event", "event": "token_ready",
-                         "node_id": identity, "token_index": token}
-        axis.place(ready, result, result)
-        yield ready
+        self._place({"seq": ordinal, "row_type": "interval", "node_id": identity,
+                     "operation_id": node.get("operation_id"), "phase": phase,
+                     "decode_index": decode_index, "token_index": token,
+                     "kind": "cpu", "source": cpu_source(kind, text(sample, "resource")),
+                     "resource": sample.get("resource"), "tid": measurement.get("thread_id"),
+                     "resource_class": "SYNTHETIC_SCHEDULER_LANE", "scheduler_lane": sample.get("resource"),
+                     "host_thread_id": measurement.get("thread_id"),
+                     **host_cores(measurement), "target_cpu_core": None,
+                     "cpu_cycles": measurement.get("cpu_work_cycles")
+                     if measurement.get("cpu_work_cycles_valid") is True else None,
+                     "cpu_cycles_valid": measurement.get("cpu_work_cycles_valid"),
+                     "cpu_cycle_source": measurement.get("cpu_work_cycles_source"),
+                     "cpu_cycle_scope": measurement.get("cpu_work_cycles_scope"),
+                     "worker_id": sample.get("worker_id"),
+                     "op": measurement.get("stage") or measurement.get("op"),
+                     "layer": measurement.get("layer"), "source_line": measurement.get("source_line"),
+                     "host_elapsed_ns": measurement.get("host_elapsed_ns"),
+                     "host_thread_cpu_ns": measurement.get("thread_cpu_ns")
+                     if measurement.get("thread_cpu_valid") is True else None,
+                     "target_cpu_cycles": None, "target_cpu_ms": None,
+                     "timing_source": "HOST_MEASURED_DEVELOPMENT"}, begin_ns, end_ns)
+
+    def token_ready(self, ordinal: int, identity: str, token: int, at_ns: Fraction) -> None:
+        self._place({"seq": ordinal, "row_type": "event", "kind": "event", "event": "token_ready",
+                     "node_id": identity, "token_index": token}, at_ns, at_ns)
+
+
+def node_rows(ordinal: int, identity: str, scheduled: Record, kind: str, node: Record, works: dict[int, Record],
+              axis: Axis) -> Iterator[Record]:
+    """Timeline rows of one scheduled node (visit_node through the row builder)."""
+    builder = RowBuilder(axis)
+    visit_node(ordinal, identity, scheduled, kind, node, works, axis, builder)
+    yield from builder.rows
 
 
 def timeline_rows(schedule: Path, bundle: Path, npu_results: Path, axis: Axis) -> Iterator[Record]:
@@ -332,34 +380,52 @@ class PerformanceAccumulator:
         self.windows: dict[int, tuple[Fraction, Fraction]] = {}
         self.order_violations = 0
 
+    # Typed core (schedule-axis cycles as exact rationals); `add` and the in-pass sink both feed it.
+    def request_start(self, begin: Fraction) -> None:
+        require(self.start is None, "duplicate request start")
+        self.start = begin
+
+    def token_ready(self, token: int, begin: Fraction) -> None:
+        self.ready[token] = begin
+
+    def npu_interval(self, token: int, begin: Fraction, end: Fraction, cycles: int) -> None:
+        if self.npu_spans and begin < self.npu_spans[-1][1]:
+            self.order_violations += 1
+        self.npu_spans.append((begin, end))
+        self.npu[token] = self.npu.get(token, Fraction(0)) + cycles
+        low, high = self.windows.get(token, (begin, end))
+        self.windows[token] = (min(low, begin), max(high, end))
+
+    def cpu_interval(self, token: int, begin: Fraction, end: Fraction, host_elapsed_ns: int,
+                     host_thread_cpu_ns: int | None, cpu_cycles: int | None) -> None:
+        """cpu_cycles is the PMU count when the row's cycles are valid, else None (counted as an invalid row)."""
+        self.cpu_spans.append((begin, end))
+        self.host[token] = self.host.get(token, 0) + host_elapsed_ns
+        if host_thread_cpu_ns is not None:
+            self.thread_cpu[token] = self.thread_cpu.get(token, 0) + host_thread_cpu_ns
+        tally = self.cycle_rows.setdefault(token, [0, 0])
+        if cpu_cycles is not None:
+            self.cycles[token] = self.cycles.get(token, 0) + cpu_cycles
+            tally[0] += 1
+        else:
+            tally[1] += 1
+
     def add(self, row: Record) -> None:
+        """A timeline.jsonl row (start/end already on the schedule axis as numbers)."""
         begin, end = Fraction(row["start_cycle"]), Fraction(row["end_cycle"])  # type: ignore[arg-type]
         if row["kind"] == "event":
             if row["event"] == "request_start":
-                require(self.start is None, "duplicate request start")
-                self.start = begin
+                self.request_start(begin)
             else:
-                self.ready[integer(row, "token_index")] = begin
+                self.token_ready(integer(row, "token_index"), begin)
             return
         token = integer(row, "token_index")
         if row["kind"] == "npu":
-            if self.npu_spans and begin < self.npu_spans[-1][1]:
-                self.order_violations += 1
-            self.npu_spans.append((begin, end))
-            self.npu[token] = self.npu.get(token, Fraction(0)) + integer(row, "npu_cycles")
-            low, high = self.windows.get(token, (begin, end))
-            self.windows[token] = (min(low, begin), max(high, end))
+            self.npu_interval(token, begin, end, integer(row, "npu_cycles"))
         else:
-            self.cpu_spans.append((begin, end))
-            self.host[token] = self.host.get(token, 0) + integer(row, "host_elapsed_ns")
-            if row.get("host_thread_cpu_ns") is not None:
-                self.thread_cpu[token] = self.thread_cpu.get(token, 0) + integer(row, "host_thread_cpu_ns")
-            tally = self.cycle_rows.setdefault(token, [0, 0])
-            if row.get("cpu_cycles_valid") is True:
-                self.cycles[token] = self.cycles.get(token, 0) + integer(row, "cpu_cycles")
-                tally[0] += 1
-            else:
-                tally[1] += 1
+            self.cpu_interval(token, begin, end, integer(row, "host_elapsed_ns"),
+                              integer(row, "host_thread_cpu_ns") if row.get("host_thread_cpu_ns") is not None else None,
+                              integer(row, "cpu_cycles") if row.get("cpu_cycles_valid") is True else None)
 
     def result(self) -> tuple[Record, Record]:
         generated, clock_hz, start, ready = self.generated, self.clock_hz, self.start, self.ready
@@ -501,6 +567,37 @@ class PerformanceAccumulator:
                               "TTFT = t1 - t0; TPOT_i = t(i+1) - t(i); mean TPOT = (tN - t1) / (N - 1)",
                 "target": {"e2e_cycles": None, "e2e_ms": None, "npu_ms": None, "publication_ready": False,
                            "reason": "no admitted target CPU timing, interface cost or operating clock"}}}
+
+
+class AccumulatorSink:
+    """Feeds the accumulator straight from visited nodes: the same axis placement as a stored row (a schedule-axis
+    value goes through `number` and back, exactly as timeline.jsonl would carry it), no row objects."""
+
+    def __init__(self, accumulator: PerformanceAccumulator, axis: Axis) -> None:
+        self.accumulator, self.axis = accumulator, axis
+
+    def _cycles(self, at_ns: Fraction) -> Fraction:
+        return Fraction(number(self.axis.cycles(at_ns)))
+
+    def request_start(self, ordinal: int, identity: str, at_ns: Fraction) -> None:
+        self.accumulator.request_start(self._cycles(at_ns))
+
+    def npu(self, ordinal: int, identity: str, node: Record, work: Record, scheduled: Record, token: int, phase: str,
+            decode_index: int | None, accepted_ns: Fraction, result_ns: Fraction, resource_ns: Fraction,
+            cycles: int) -> None:
+        self.accumulator.npu_interval(token, self._cycles(accepted_ns), self._cycles(resource_ns), cycles)
+
+    def cpu(self, ordinal: int, identity: str, kind: str, node: Record, sample: Record, measurement: Record,
+            token: int, phase: str, decode_index: int | None, begin_ns: Fraction, end_ns: Fraction) -> None:
+        thread = measurement.get("thread_cpu_ns") if measurement.get("thread_cpu_valid") is True else None
+        cycles = measurement.get("cpu_work_cycles") if measurement.get("cpu_work_cycles_valid") is True else None
+        self.accumulator.cpu_interval(token, self._cycles(begin_ns), self._cycles(end_ns),
+                                      integer(measurement, "host_elapsed_ns"),
+                                      integer(measurement, "thread_cpu_ns") if thread is not None else None,
+                                      integer(measurement, "cpu_work_cycles") if cycles is not None else None)
+
+    def token_ready(self, ordinal: int, identity: str, token: int, at_ns: Fraction) -> None:
+        self.accumulator.token_ready(token, self._cycles(at_ns))
 
 
 def performance(timeline: Path, generated: int, clock_hz: int | None, validation: str = "CURRENT_CERTIFIED",
