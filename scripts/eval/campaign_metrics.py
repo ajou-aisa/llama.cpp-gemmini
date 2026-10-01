@@ -5,13 +5,19 @@ import json
 from contextlib import ExitStack
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TextIO
+from typing import Final, TextIO
 
 from eval_common import Json, Record, integer, ratio, records, require, text, write_json
 
 from evaluation import activation, residual, weight_alignment
 from evaluation.manifest import Manifest
 from evaluation.reducer import metric_rows
+
+
+# (aggregate summary, per-layer summary) file names of each metric kind.
+OUTPUT_FILENAMES: Final = {"activation": ("activation_metrics.json", "layer_activation_metrics.json"),
+                           "residual": ("residual_metrics.json", "layer_residual_metrics.json"),
+                           "scu": ("scale_alignment_metrics.json", "layer_scale_metrics.json")}
 
 
 def residual_extensions(row: Record, radix_count: int) -> Record:
@@ -66,10 +72,7 @@ def outputs(kind: str, raw: Path, manifest: Manifest, output: Path,
         aggregate = residual_extensions(aggregate, radix_count)
         write_json(output / "compact-shape-summary.json", {**manifest.identity(), "stripes": shapes,
                    "raw_runs_and_row_maps": str(raw), "input_sha256": aggregate["input_sha256"]})
-    filenames = {"activation": ("activation_metrics.json", "layer_activation_metrics.json"),
-                 "residual": ("residual_metrics.json", "layer_residual_metrics.json"),
-                 "scu": ("scale_alignment_metrics.json", "layer_scale_metrics.json")}
-    summary_name, layer_name = filenames[kind]
+    summary_name, layer_name = OUTPUT_FILENAMES[kind]
     write_json(output / summary_name, aggregate)
     write_json(output / layer_name, {**manifest.identity(), "input_sha256": aggregate["input_sha256"],
                "aggregation": "integer-sum-before-division", "layers": layers})

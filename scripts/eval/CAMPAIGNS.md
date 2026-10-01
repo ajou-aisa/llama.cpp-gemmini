@@ -1,5 +1,9 @@
 # Independent measurement campaigns
 
+Metric campaigns (activation, residual, SCU) and the certification-only cycle campaigns. The canonical entry point
+for metrics is `scripts/eval/run_measurement.py metric activation|residual|scu` (see `README.md` for the three
+measurement domains: performance, timeline, metric); the shell wrappers below are equivalent and stay supported.
+
 Each command configures a fresh CMake build, compiles the native llama backend,
 runs focused cycle/metric CTests, executes native inference, validates the metric
 stream and layer coverage, and writes bound JSON plus SHA256SUMS. Requires Python
@@ -10,10 +14,16 @@ headers and historical evidence are not modified. Existing outputs are refused.
 Run from the llama checkout:
 
 ```sh
-scripts/eval/run_activation_metrics.sh --model gpt2 --precision a8w8 --dim 16 --output /absolute/fresh/activation-results
-scripts/eval/run_residual_metrics.sh --model gpt2 --precision a8w8 --dim 16 --output /absolute/fresh/residual-results
-scripts/eval/run_scu_metrics.sh --model gpt2 --precision a8w8 --dim 16 --output /absolute/fresh/scale-results
+python3 scripts/eval/run_measurement.py metric activation --model gpt2 --precision a8w8 --dim 16 --output /absolute/fresh/activation-results
+python3 scripts/eval/run_measurement.py metric residual --model gpt2 --precision a8w8 --dim 16 --output /absolute/fresh/residual-results
+python3 scripts/eval/run_measurement.py metric scu --model gpt2 --precision a8w8 --dim 16 --output /absolute/fresh/scale-results
+# equivalent: scripts/eval/run_activation_metrics.sh | run_residual_metrics.sh | run_scu_metrics.sh with the same options
 ```
+
+Without `--output` the wrapper writes to `runs/metrics/<kind>/<utc>-<model>-<precision>-d<dim>`. Every run also
+carries the uniform names `summary.json`, `layers.json`, `request.json` and `raw.jsonl[.gz]` (hard links to the
+metric-specific files), and `--model-manifest MANIFEST.json` records the frozen model identity that performance
+runs reference.
 
 Default is one 256-token chunk. `--max-chunks 0` selects every complete test chunk.
 Tokenization uses the model's native tokenizer, removes one final LF, replaces

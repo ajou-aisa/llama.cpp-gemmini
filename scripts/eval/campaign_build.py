@@ -41,6 +41,13 @@ MACHINES: Final = {"amd64": "x86_64", "x86_64": "x86_64", "arm64": "arm64", "aar
 NON_SEMANTIC: Final = frozenset({"LOG_CYCLE", "GGML_CPU_CYCLE_LOG", "CYCLE_DETAIL", "LOG_DEBUG",
                                  "IM2P_SIM_ROOT", "CMAKE_EXPORT_COMPILE_COMMANDS"})
 CYCLE_MODEL_OPTIONS: Final = {"CMAKE_BUILD_TYPE": "Release", "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"}
+# Metric sinks: metric kind -> (CMake cache option, llama-eval-workload --build-info key). A metric build compiles in
+# exactly its own sink; every other kind (performance PoTal/FullCPU, cycle) compiles all three out.
+# GGML_GEMMINI_ACT_QUANT_METRICS is the compile definition CMake derives from GGML_GEMMINI_ACT_METRICS; it is always
+# passed as 0 so that only the cache option above selects the activation sink.
+METRIC_SINKS: Final = {"activation": ("GGML_GEMMINI_ACT_METRICS", "activation_metrics"),
+                       "residual": ("GGML_GEMMINI_RESIDUAL_METRICS", "residual_metrics"),
+                       "scu": ("GGML_GEMMINI_SCALE_METRICS", "scale_metrics")}
 SOURCE_REPOS: Final = ("llama.cpp-gemmini", "IM2P.sim", "RISC-V-DynDNN-gemmini-include")
 INCLUDE_REPO: Final = REPO.parent / "RISC-V-DynDNN-gemmini-include"
 
@@ -146,10 +153,8 @@ def llama_plan(kind: str, precision: str, dim: int, im2p: Path, matmul_mode: str
         "GGML_GEMMINI_DIM": str(dim), "GGML_GEMMINI_DEFAULT_MATMUL_MODE": matmul_mode,
         "GGML_GEMMINI_DEFAULT_RMD_BACKEND": "WS", "GGML_GEMMINI_ENABLE_RMD": "ON",
         "GGML_GEMMINI_ALLOW_RUNTIME_MATMUL_OVERRIDE": "OFF",
-        "GGML_GEMMINI_ACT_METRICS": str(int(kind == "activation")),
         "GGML_GEMMINI_ACT_QUANT_METRICS": "0",
-        "GGML_GEMMINI_RESIDUAL_METRICS": str(int(kind == "residual")),
-        "GGML_GEMMINI_SCALE_METRICS": str(int(kind == "scu")),
+        **{option: str(int(kind == metric)) for metric, (option, _) in METRIC_SINKS.items()},
     }
     if kind.startswith("potal-host"):
         options.update({"LOG_CYCLE": "1",
@@ -261,9 +266,8 @@ def build(kind: str, precision: str, dim: int, output: Path, im2p: Path, jobs: i
     runner = output / "bin/llama-eval-workload"
     info = compiled_info(runner)
     bits = 4 if precision == "a4w4" else 8
-    expected = (int(kind == "activation"), int(kind == "residual"), int(kind == "scu"))
-    require(tuple(info.get(key) for key in ("activation_metrics", "residual_metrics", "scale_metrics"))
-            == expected, "compiled collectors are not independent")
+    require(all(info.get(key) == int(kind == metric) for metric, (_, key) in METRIC_SINKS.items()),
+            "compiled collectors are not independent")
     if kind == "fullcpu-host":
         require(info.get("cpu_only") is True and info.get("cycle_sim") == 0 and
                 info.get("log_cycle") == 1 and info.get("ggml_cpu_cycle_log") == 1,

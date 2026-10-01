@@ -5,8 +5,15 @@
 # ///
 # How to run: python3 -B scripts/eval/run_cycle_evaluation.py --model M.gguf --prompt-file wiki.test.raw \
 #   --prompt-tokens 256 --generate 128 --precision a8w8 --dim 32 --certificates certificate-set.json --output DIR
-"""One-command cycle evaluation: host detection, cached builds, PoTal/FullCPU workload, FAST_EVALUATION replay,
-official join/lifecycle/IR, SYNTHETIC schedule timeline, TTFT/TPOT with timing ownership, quality metrics.
+"""Performance runs and timeline exports (one mode per invocation; `run_measurement.py` is the user-facing entry
+point).
+
+  --run performance  host detection, cached builds, PoTal/FullCPU collection (or a reused one), NPU replay,
+                     join/lifecycle/IR, one SYNTHETIC scheduling pass with TTFT/TPOT and CPU/NPU components,
+                     optional timeline. Never runs the activation/residual/SCU metrics.
+  --run timeline     timeline export from a completed run's stored schedule; nothing is collected or scheduled.
+
+Activation, residual and SCU metrics are a different domain: `campaign.py activation|residual|scu`.
 
 Nothing here certifies anything: certified inputs (cycle library identity, base/run-aware/transition
 certificates) are admitted by the unchanged official stages. NPU wall time exists only with a validated
@@ -17,9 +24,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
-import math
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -94,6 +99,14 @@ T = TypeVar("T")
 
 def reference(path: Path) -> Record:
     return {"path": str(path), "sha256": sha256(path), "bytes": path.stat().st_size}
+
+
+def checksums(root: Path, known: dict[Path, str] | None = None) -> None:
+    """SHA256SUMS over every file of a finished run directory; `known` holds digests that were already computed."""
+    known = known or {}
+    files = sorted(path for path in root.rglob("*") if path.is_file() and path.name != "SHA256SUMS")
+    (root / "SHA256SUMS").write_text("".join(f"{known.get(path) or sha256(path)}  {path.relative_to(root)}\n"
+                                             for path in files))
 
 
 def workload_mode(args: argparse.Namespace) -> Record:
@@ -294,7 +307,8 @@ def gguf_identity(model: Path) -> Record:
             "quantization": str(gguf.LlamaFileType(file_type).name)}
 
 
-def build_all(args: argparse.Namespace, run: Run, quality: bool, collect: bool = True) -> Record:
+def build_all(args: argparse.Namespace, run: Run, collect: bool = True) -> Record:
+    """Performance builds only: the cycle model and, for a fresh collection, PoTal and FullCPU (metric flags off)."""
     cache = args.build_cache.resolve()
     builds: Record = {}
     (run.root / "build").mkdir()
@@ -315,17 +329,11 @@ def build_all(args: argparse.Namespace, run: Run, quality: bool, collect: bool =
                                  "certified_identity_match": False, "local_validation_match": True}
     kinds: list[tuple[str, str, str, tuple[str, ...]]] = ([("potal", "potal-host", "STRIPE_PIPELINE", ()),
                                                            ("fullcpu", "fullcpu-host", "FULL", ())] if collect else [])
-    if quality:
-        kinds.append(("metrics", "cycle", "STRIPE_PIPELINE", ("llama-perplexity",)))
     for name, kind, matmul, extra in kinds:
         path, hit = run.step("build-" + name, lambda kind=kind, matmul=matmul, extra=extra: cached_llama_build(
             cache, kind, args.precision, args.dim, IM2P, args.jobs, matmul, extra))
         builds[name] = {"path": str(path), "cache_hit": hit, "receipt": read_json(path / "build-receipt.json"),
                         "build_info": read_json(path / "build-info.json")}
-    if quality:
-        semantic = {name: record(record(builds[name]).get("receipt")).get("semantic_options_sha256")
-                    for name in ("potal", "metrics")}
-        require(len(set(semantic.values())) == 1, "metrics build semantic configuration differs from PoTal")
     for name, value in builds.items():
         write_json(run.root / "build" / (name + ".json"), value)
     return builds
@@ -702,16 +710,20 @@ def export_timeline(args: argparse.Namespace) -> int:
             Path(text(record(inputs["schedule"]), "path")), Path(text(record(inputs["bundle"]), "path")),
             Path(text(record(inputs["npu_results"]), "path")), axis)))
         write_json(root / "timeline-rows.json", {"rows": count})
+        exported = reference(timeline)
         write_json(root / "export.json", {
             "schema": "potal-timeline-export", "version": 1, "format": "jsonl", "rows": count,
-            "timeline": reference(timeline), "source_run": str(source), "source_manifest": reference(source / "manifest.json"),
+            "timeline": exported, "source_run": str(source), "source_manifest": reference(source / "manifest.json"),
             "source_workload": manifest.get("workload"), "source_validation": manifest.get("validation"),
             "inputs": inputs, "axis": {"frequency_hz": axis.frequency_hz, "validated": axis.validated},
             "code": stage_code("timeline"),
-            "not_run": ["collection", "NPU replay", "join/lifecycle/IR", "scheduling", "performance", "PPL"],
+            "not_run": ["collection", "NPU replay", "join/lifecycle/IR", "scheduling", "performance",
+                        "metrics (activation/residual/SCU)"],
             "reuse": "TIMELINE_EXPORT_FROM_STORED_SCHEDULE"})
-        run.markers.update({"TIMELINE_EXPORT_ONLY": "PASS", "PERFORMANCE_RUN": "NOT_RUN", "METRICS_AUTOMATION_RUN": "NOT_RUN"})
+        run.markers.update({"MEASUREMENT_DOMAIN": "timeline", "TIMELINE_EXPORT_ONLY": "PASS", **NOT_RUN_DOMAINS,
+                            "PERFORMANCE_RUN": "NOT_RUN"})
         run.write("PASS")
+        checksums(root, {timeline: text(exported, "sha256")})
         print(json.dumps({"output": str(root), "rows": count, "source_run": str(source)}, sort_keys=True))
         return 0
     except (EvaluationError, OSError, ValueError) as error:
@@ -719,70 +731,6 @@ def export_timeline(args: argparse.Namespace) -> int:
             run.stages.append({"stage": "runner", "status": "FAILED", "reason": str(error)})
         run.write("FAILED")
         print(f"timeline export failed: {error}", file=sys.stderr)
-        return 1
-
-
-def build_metrics(args: argparse.Namespace, run: Run) -> Record:
-    """Only the metric runner build (llama-perplexity); no cycle library, PoTal or FullCPU build."""
-    (run.root / "build").mkdir()
-    path, hit = run.step("build-metrics", lambda: cached_llama_build(
-        args.build_cache.resolve(), "cycle", args.precision, args.dim, IM2P, args.jobs, "STRIPE_PIPELINE",
-        ("llama-perplexity",)))
-    metrics: Record = {"path": str(path), "cache_hit": hit, "receipt": read_json(path / "build-receipt.json"),
-                       "build_info": read_json(path / "build-info.json")}
-    write_json(run.root / "build" / "metrics.json", metrics)
-    return {"metrics": metrics}
-
-
-def metrics_run(args: argparse.Namespace) -> int:
-    """--run metrics: build and run only the quality metric (PPL). No cycle library, PMU, collection, replay,
-    schedule or performance timeline."""
-    require(args.metric == "ppl", "--run metrics requires --metric ppl")
-    manifest_path: Path | None = args.model_manifest
-    output: Path | None = args.output
-    require(manifest_path is not None and output is not None, "--run metrics requires --model-manifest and --output")
-    require(args.reuse_collection is None and args.from_run is None and args.timeline == "none",
-            "--run metrics takes no collection, source run or timeline")
-    assert manifest_path is not None and output is not None
-    manifest = read_json(manifest_path.resolve(strict=True))
-    quantization = "Q8_HP1" if args.precision == "a8w8" else "Q4_HP1"
-    args.model = (args.model or Path(text(record(record(manifest.get("quantized")).get(quantization)), "path"))).resolve(strict=True)
-    args.prompt_file = (args.prompt_file or REPO / "wikitext-2-raw/wiki.test.raw").resolve(strict=True)
-    if args.ppl_chunks is None:
-        args.ppl_chunks = 64
-    root = output.resolve()
-    root.mkdir(parents=True, exist_ok=False)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run = Run(root, {"schema": "im2p-cycle-evaluation-run", "version": 1, "started_utc": stamp, "argv": list(sys.argv),
-                     "mode": "metrics", "profile": args.profile, "metric": args.metric})
-    run.write("RUNNING")
-    try:
-        model = run.step("model-validation", lambda: gguf_identity(args.model))
-        model["manifest"] = run.step("model-manifest", lambda: model_entry(args.model_manifest, args.model))
-        dataset = {"path": str(args.prompt_file), "sha256": sha256(args.prompt_file), "bytes": args.prompt_file.stat().st_size}
-        builds = build_metrics(args, run)
-        metric = perplexity(args, run, builds, model, dataset)
-        performance_plan = llama_plan("potal-host", args.precision, args.dim, IM2P, "STRIPE_PIPELINE")
-        write_json(root / "metrics.json", {
-            "schema": "im2p-cycle-evaluation-metrics", "version": 1, "metrics": [metric],
-            "shared_identity": {"model_sha256": model["sha256"], "model_manifest": model.get("manifest"),
-                                "dataset": dataset},
-            "build_correspondence": {
-                "metrics_semantic_options_sha256": metric["semantic_options_sha256"],
-                "performance_potal_semantic_options_sha256": performance_plan.semantic_options_sha256,
-                "equal": metric["semantic_options_sha256"] == performance_plan.semantic_options_sha256,
-                "note": "the metric runner is the functional Gemmini/IM2P_SIM build with llama-perplexity; the "
-                        "performance PoTal build adds cycle logging. Purpose-specific options are recorded, not "
-                        "assumed equal"}})
-        run.markers.update({"METRICS_AUTOMATION_RUN": "PASS", "PERFORMANCE_RUN": "NOT_RUN"})
-        run.write("PASS")
-        print(json.dumps({"output": str(root), "metric": metric["name"], "value": metric["value"]}, sort_keys=True))
-        return 0
-    except (EvaluationError, OSError, ValueError, subprocess.SubprocessError) as error:
-        if not run.stages or record(run.stages[-1]).get("status") != "FAILED":
-            run.stages.append({"stage": "runner", "status": "FAILED", "reason": str(error)})
-        run.write("FAILED")
-        print(f"metrics run failed: {error}", file=sys.stderr)
         return 1
 
 
@@ -836,67 +784,6 @@ def reused_collection(args: argparse.Namespace) -> tuple[Path, Path, Record]:
     return potal, fullcpu, {**lineage, "pmu_contract": provenance.get("pmu_contract"), "host": provenance.get("host")}
 
 
-def ppl_config(chunks: int) -> Record:
-    return {"context": 256, "batch": 256, "threads": 1, "chunks": chunks, "seed": 1234,
-            "mask": "second half of each 256-token context (native perplexity_half)"}
-
-
-def quality_identity(model: Path, dataset: Path, expected_model: Record, expected_dataset: Record) -> None:
-    """Quality metrics must use the exact model and text that produced the performance run."""
-    require(sha256(model) == expected_model.get("sha256"), "quality model differs from the performance model")
-    require(sha256(dataset) == expected_dataset.get("sha256"), "quality dataset differs from the performance dataset")
-
-
-def perplexity(args: argparse.Namespace, run: Run, builds: Record, model: Record, dataset: Record) -> Record:
-    metrics = record(builds["metrics"])
-    binary = Path(text(metrics, "path")) / "bin/llama-perplexity"
-    quality_identity(args.model, args.prompt_file, model, dataset)
-    config = ppl_config(args.ppl_chunks)
-    argv = [str(binary), "-m", str(args.model), "-f", str(args.prompt_file), "-c", "256", "-b", "256",
-            "-t", "1", "--chunks", str(args.ppl_chunks if args.ppl_chunks > 0 else -1), "-s", "1234"]
-    log = run.root / "metrics" / "perplexity.log"
-    log.parent.mkdir()
-    run.step("quality-perplexity", lambda: call(argv, log, run.root, args.timeout * 4))
-    output = log.read_text(errors="replace")
-    final = re.findall(r"Final estimate: PPL = ([0-9.]+) \+/- ([0-9.]+)", output)
-    chunks = re.findall(r"calculating perplexity over (\d+) chunks", output)
-    require(len(final) == 1 and len(chunks) == 1, "perplexity output lacks one final estimate")
-    corpus = corpus_perplexity(output, int(chunks[0]), float(final[0][0]))
-    quality_identity(args.model, args.prompt_file, model, dataset)
-    return {"name": "perplexity", "value": corpus["corpus_ppl"], "uncertainty": float(final[0][1]), "unit": "PPL",
-            "corpus": corpus, "final_estimate_line": {"ppl": float(final[0][0]), "uncertainty": float(final[0][1])},
-            "workload": {"dataset": dataset, "split": "test", "context_tokens": 256,
-                         "chunks_evaluated": int(chunks[0]),
-                         "coverage": "FULL_COMPLETE_CHUNKS" if args.ppl_chunks <= 0 else "BOUNDED_CHUNK_SUBSET"},
-            "model": model, "model_manifest": model.get("manifest"),
-            "runner": {"path": str(binary), "sha256": sha256(binary)},
-            "build_receipt": reference(Path(text(metrics, "path")) / "build-receipt.json"),
-            "semantic_options_sha256": record(metrics.get("receipt")).get("semantic_options_sha256"),
-            "config": config, "config_sha256": sha256_text(json.dumps(config, sort_keys=True)),
-            "argv": list(argv), "log": reference(log)}
-
-
-def corpus_perplexity(output: str, chunks: int, printed_ppl: float) -> Record:
-    """Corpus PPL = exp(total NLL / total scored tokens) from the runner's exact totals, never a chunk mean."""
-    totals = re.findall(r"PPL_TOTALS total_nll=(\S+) total_scored_tokens=(\d+) chunks=(\d+) corpus_ppl=(\S+)", output)
-    rows = re.findall(r"PPL_CHUNK index=(\d+) nll=(\S+) scored_tokens=(\d+)", output)
-    require(len(totals) == 1, "perplexity runner lacks exact NLL totals (PPL_TOTALS)")
-    total_nll, scored, count = float(totals[0][0]), int(totals[0][1]), int(totals[0][2])
-    per_chunk: list[Json] = [{"index": int(index), "nll": float(nll), "scored_tokens": int(tokens),
-                              "chunk_ppl": math.exp(float(nll) / int(tokens))} for index, nll, tokens in rows]
-    require(count == chunks == len(per_chunk) and [record(row)["index"] for row in per_chunk] == list(range(count)),
-            "perplexity chunk diagnostics are incomplete")
-    require(sum(integer(record(row), "scored_tokens") for row in per_chunk) == scored > 0,
-            "perplexity scored-token total differs from its chunks")
-    require(math.isclose(sum(float(str(record(row)["nll"])) for row in per_chunk), total_nll, rel_tol=1e-9),
-            "perplexity NLL total differs from its chunks")
-    corpus_ppl = math.exp(total_nll / scored)
-    require(abs(corpus_ppl - printed_ppl) <= 5e-4 * max(1.0, printed_ppl), "corpus PPL differs from the runner estimate")
-    return {"definition": "exp(total_nll / total_scored_tokens)", "corpus_ppl": corpus_ppl, "total_nll": total_nll,
-            "total_scored_tokens": scored, "chunks": count, "chunk_diagnostics": per_chunk,
-            "chunk_ppl_mean_is_not_the_metric": True}
-
-
 def sha256_text(value: str) -> str:
     import hashlib
     return hashlib.sha256(value.encode()).hexdigest()
@@ -912,10 +799,16 @@ def cross_check(result: Record, summary: Record, generated: int = GENERATED) -> 
     return checks
 
 
+RUN_MODES: Final = ("performance", "timeline")
+# The other measurement domain, which a performance or timeline run never executes (activation/residual/SCU metrics
+# live in campaign.py).
+NOT_RUN_DOMAINS: Final = {"HARDWARE_METRICS_RUN": "NOT_RUN"}
+
+
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--model", type=Path, help="GGUF model (performance); metrics defaults to the manifest model")
-    parser.add_argument("--prompt-file", type=Path, help="WikiText-2 raw test text (native recipe; metrics default)")
+    parser.add_argument("--model", type=Path, help="GGUF model (performance)")
+    parser.add_argument("--prompt-file", type=Path, help="WikiText-2 raw test text (native recipe)")
     parser.add_argument("--prompt-tokens", type=int, default=256)
     parser.add_argument("--generate", type=int, default=GENERATED)
     parser.add_argument("--precision", choices=("a4w4", "a8w8"), default="a8w8")
@@ -930,14 +823,13 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--smoke", action="store_true",
                         help="SMOKE_256P1 connectivity workload (256 prompt + 1 token); never a full evaluation")
     parser.add_argument("--output", type=Path, help="fresh run directory; default runs/<utc>-<model>-<config>")
-    parser.add_argument("--run", default="performance", choices=("performance", "timeline", "metrics"),
+    parser.add_argument("--run", default="performance", choices=RUN_MODES,
                         help="performance: TTFT/TPOT and CPU/NPU components (default); timeline: export a timeline "
-                             "from a completed run's stored schedule; metrics: PPL only (no replay/schedule)")
+                             "from a completed run's stored schedule")
     parser.add_argument("--timeline", choices=("none", "compact"), default="none",
                         help="performance: also write timeline.jsonl from the same scheduling pass (compact)")
     parser.add_argument("--from-run", type=Path, help="timeline: completed performance run whose schedule is exported")
     parser.add_argument("--format", choices=("jsonl",), default="jsonl", help="timeline export format")
-    parser.add_argument("--metric", choices=("ppl",), help="metrics: metric to evaluate")
     parser.add_argument("--npu-task-cache", help="persistent per-work NPU answer cache (default <stage-cache>/"
                                                  "npu-tasks.sqlite; 'none' disables)")
     parser.add_argument("--clock-selection", type=Path, help="validated operating clock; enables NPU ms")
@@ -955,7 +847,6 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--stop-after", choices=OFFLINE_STAGES, help="end the run after this offline stage")
     parser.add_argument("--storage-factor", type=int, default=3,
                         help="offline preflight free-space multiple of workload bytes (certified CLI default 8)")
-    parser.add_argument("--ppl-chunks", type=int, help="bounded PPL chunks; 0 evaluates all (default 64, smoke 2)")
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--reconstruct-timeout", type=int, default=36000)
     parser.add_argument("--keep-raw", action="store_true", help="keep cycle logs, traces, IR and schedule")
@@ -975,19 +866,18 @@ def plan(args: argparse.Namespace) -> Record:
     cache = args.build_cache
     builds: Record = {"cycle-model": argv_json(cycle_model_argv(cache / "cycle-model", IM2P, args.jobs, host))}
     kinds: list[tuple[str, str, str, tuple[str, ...]]] = [
-        ("potal", "potal-host", "STRIPE_PIPELINE", ()), ("fullcpu", "fullcpu-host", "FULL", ()),
-        ("metrics", "cycle", "STRIPE_PIPELINE", ("llama-perplexity",))]
+        ("potal", "potal-host", "STRIPE_PIPELINE", ()), ("fullcpu", "fullcpu-host", "FULL", ())]
     for name, kind, matmul, extra in kinds:
         build = llama_plan(kind, args.precision, args.dim, IM2P, matmul, extra)
         builds[name] = {"semantic_options_sha256": build.semantic_options_sha256,
                         "argv": argv_json(llama_argv(build, cache / name, args.jobs, host))}
     return {"platform": host.record(), "output": str(output), "profile": args.profile, "builds": builds,
+            "build_domains": {"performance": ["cycle-model", "potal", "fullcpu"], "timeline": []},
             "stages": {"performance": ["detect", "build-cycle-model", "build-potal", "build-fullcpu", "collect-potal",
                                        "collect-fullcpu", "worker-scenario", "replay", "join", "producer-lifecycle",
                                        "execution-ir", "schedule (+performance accumulator, +timeline if compact)",
                                        "timeline (--timeline compact only)", "performance", "provenance"],
-                       "timeline": ["stored-schedule", "timeline-export"],
-                       "metrics": ["model-validation", "model-manifest", "build-metrics", "quality-perplexity"]},
+                       "timeline": ["stored-schedule", "timeline-export"]},
             "schedule_clock": {"hz": CONFIGURED_TEST_CLOCK_HZ, "status": "DIAGNOSTIC_CONFIGURED_TEST_CLOCK"}}
 
 
@@ -999,24 +889,23 @@ def main() -> int:
         print(json.dumps(plan(args), indent=2, sort_keys=True))
         return 0
     runners: dict[str, Callable[[argparse.Namespace], int]] = {
-        "performance": performance_run, "timeline": export_timeline, "metrics": metrics_run}
+        "performance": performance_run, "timeline": export_timeline}
     return runners[args.run](args)
 
 
 def performance_run(args: argparse.Namespace) -> int:
     """--run performance: collection (or a reused one), offline replay/join/lifecycle/IR, one scheduling pass with the
-    performance accumulator (+ timeline rows with --timeline compact). Never builds or runs the quality metrics."""
+    performance accumulator (+ timeline rows with --timeline compact). Never builds or runs the activation/residual/
+    SCU metrics."""
     model_path: Path | None = args.model
     prompt_path: Path | None = args.prompt_file
     require(model_path is not None and prompt_path is not None, "--run performance requires --model and --prompt-file")
     assert model_path is not None and prompt_path is not None
-    require(args.from_run is None and args.metric is None, "--from-run/--metric belong to --run timeline/metrics")
+    require(args.from_run is None, "--from-run belongs to --run timeline")
     require(args.prompt_tokens == 256 and args.generate == GENERATED,
             "only the native E2E_GENERATION_256_128 recipe (256 prompt + 128 generated) is implemented; "
             "use --smoke for the separate 256+1 connectivity workload")
     args.generated = 1 if args.smoke else GENERATED
-    if args.ppl_chunks is None:
-        args.ppl_chunks = 2 if args.smoke else 64
     args.model, args.prompt_file = model_path.resolve(strict=True), prompt_path.resolve(strict=True)
     certificate_set: Record | None = None
     if args.validation_mode == "certified":
@@ -1072,7 +961,7 @@ def performance_run(args: argparse.Namespace) -> int:
                                               "model": model, "dataset": dataset, "certificates": certificate_set,
                                               "validation": validation, "workload": workload_mode(args),
                                               "pmu_contract": pmu, "collection_reuse": reuse})
-        builds = build_all(args, run, False, collect=reuse is None)
+        builds = build_all(args, run, collect=reuse is None)
         cycle_library = Path(text(record(record(record(builds["cycle-model"]).get("receipt")).get("library")), "path"))
         cache = StageCache((args.stage_cache or root / "stage-cache").resolve())
         if reuse is None:
@@ -1158,14 +1047,14 @@ def performance_run(args: argparse.Namespace) -> int:
         (root / "provenance.json").write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n")
         run.markers.update({"ONE_COMMAND_EVALUATION_READY": "READY",
                             "TIMELINE_LOG_READY": "READY" if count is not None else "NOT_REQUESTED",
-                            "FAST_CYCLE_EVALUATION_RUN": "PASS", "METRICS_AUTOMATION_RUN": "NOT_RUN",
+                            "FAST_CYCLE_EVALUATION_RUN": "PASS", "MEASUREMENT_DOMAIN": "performance",
+                            **NOT_RUN_DOMAINS,
                             "VALIDATION_MODE": VALIDATION[args.validation_mode], "PUBLICATION_CERTIFIED": "false",
                             "WORKLOAD_MODE": text(workload_mode(args), "workload_mode"),
                             "TPOT_READY": "NOT_APPLICABLE" if args.generated == 1 else "NPU_CYCLES_ONLY",
                             **instrumentation_markers(timing, result, args.generated)})
         run.write("PASS")
-        sums = sorted(path for path in root.rglob("*") if path.is_file() and path.name != "SHA256SUMS")
-        (root / "SHA256SUMS").write_text("".join(f"{sha256(path)}  {path.relative_to(root)}\n" for path in sums))
+        checksums(root)
         print(json.dumps({"output": str(root), "markers": run.markers,
                           "ttft_npu_cycles": record(result["ttft"]).get("npu_cycles"),
                           "npu_tpot_cycles": record(result["tpot"]).get("npu_tpot_cycles")}, sort_keys=True))

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import subprocess
 import sys
@@ -33,8 +34,7 @@ from campaign_build import (
 from certified_reconstruction import publication_row, reconstructed_row
 from e2e_timeline import Axis, pack_lanes, performance, timeline_rows, write_timeline
 from eval_common import EvaluationError, Json, Record, sha256, write_json
-from run_cycle_evaluation import (corpus_perplexity, instrumentation_markers, pmu_contract, ppl_config,
-                                  quality_identity, timing_validity)
+from run_cycle_evaluation import instrumentation_markers, pmu_contract, timing_validity
 
 IM2P = ROOT.parent / "IM2P.sim"
 KINDS = (("potal-host", "STRIPE_PIPELINE", ()), ("fullcpu-host", "FULL", ()), ("cycle", "STRIPE_PIPELINE", ("llama-perplexity",)))
@@ -61,13 +61,14 @@ def test_unsupported_host_and_semantic_platform_options_are_rejected() -> None:
         with_platform(llama_plan("cycle", "a8w8", 32, IM2P, "STRIPE_PIPELINE").options, forged)
 
 
-def test_quality_build_shares_potal_semantics_but_fullcpu_does_not() -> None:
+def test_extra_target_build_shares_potal_semantics_but_fullcpu_does_not() -> None:
     potal = llama_plan("potal-host", "a8w8", 32, IM2P, "STRIPE_PIPELINE")
-    quality = llama_plan("cycle", "a8w8", 32, IM2P, "STRIPE_PIPELINE", ("llama-perplexity",))
+    extra = llama_plan("cycle", "a8w8", 32, IM2P, "STRIPE_PIPELINE", ("llama-perplexity",))
     fullcpu = llama_plan("fullcpu-host", "a8w8", 32, IM2P)
-    assert potal.semantic_options_sha256 == quality.semantic_options_sha256
+    # An extra CMake target and the cycle-log instrumentation are not semantic options.
+    assert potal.semantic_options_sha256 == extra.semantic_options_sha256
     assert fullcpu.semantic_options_sha256 != potal.semantic_options_sha256
-    assert "llama-perplexity" in quality.targets
+    assert "llama-perplexity" in extra.targets
 
 
 def test_linux_dry_run_generates_the_same_semantic_plan() -> None:
@@ -271,55 +272,6 @@ def test_reconstruction_keeps_the_target_latency_deficiency_marker() -> None:
                             {"ttft_ns": 1}, {"schema": "proof"})
     assert row["measurement_kind"] == "VALIDATED_RECONSTRUCTION"
     assert row["target_latency"].startswith("NOT_READY")
-
-
-# Metrics
-
-def test_quality_config_is_deterministic_and_bound_to_the_performance_inputs(tmp_path: Path) -> None:
-    assert ppl_config(64) == ppl_config(64) and ppl_config(64) != ppl_config(0)
-    model, dataset, other = tmp_path / "m.gguf", tmp_path / "d.raw", tmp_path / "o.raw"
-    for path, text in ((model, "model"), (dataset, "text"), (other, "other")):
-        path.write_text(text)
-    expected_model, expected_dataset = {"sha256": sha256(model)}, {"sha256": sha256(dataset)}
-    quality_identity(model, dataset, expected_model, expected_dataset)
-    with pytest.raises(EvaluationError, match="quality model differs"):
-        quality_identity(other, dataset, expected_model, expected_dataset)
-    with pytest.raises(EvaluationError, match="quality dataset differs"):
-        quality_identity(model, other, expected_model, expected_dataset)
-
-
-def ppl_log(chunks: list[tuple[float, int]], totals: tuple[float, int, int] | None = None) -> str:
-    lines = [f"PPL_CHUNK index={index} nll={nll!r} scored_tokens={tokens}" for index, (nll, tokens) in enumerate(chunks)]
-    nll, tokens, count = totals or (sum(row[0] for row in chunks), sum(row[1] for row in chunks), len(chunks))
-    lines.append(f"PPL_TOTALS total_nll={nll!r} total_scored_tokens={tokens} chunks={count} corpus_ppl=0")
-    return "\n".join(lines) + "\n"
-
-
-def test_corpus_ppl_is_total_nll_over_total_tokens_not_a_chunk_mean() -> None:
-    # Given two chunks whose chunk-PPL mean differs from the corpus PPL.
-    chunks = [(518.73191937587944, 127), (445.82493741648591, 127)]
-    import math
-    expected = math.exp(964.55685679236535 / 254)
-    # When the runner output is parsed.
-    corpus = corpus_perplexity(ppl_log(chunks), 2, round(expected, 4))
-    # Then the metric is the corpus value and the chunk diagnostics are kept separately.
-    assert corpus["corpus_ppl"] == pytest.approx(expected, rel=1e-12)
-    assert corpus["total_scored_tokens"] == 254 and len(corpus["chunk_diagnostics"]) == 2
-    mean = sum(math.exp(nll / tokens) for nll, tokens in chunks) / 2
-    assert abs(mean - corpus["corpus_ppl"]) > 0.1
-
-
-@pytest.mark.parametrize("output, reason", [
-    ("Final estimate: PPL = 1.0 +/- 0.1\n", "exact NLL totals"),
-    (ppl_log([(100.0, 127)], (100.0, 127, 2)), "chunk diagnostics are incomplete"),
-    (ppl_log([(100.0, 127), (90.0, 127)], (190.0, 250, 2)), "scored-token total"),
-    (ppl_log([(100.0, 127), (90.0, 127)], (191.0, 254, 2)), "NLL total"),
-])
-def test_corpus_ppl_rejects_missing_or_inconsistent_totals(output: str, reason: str) -> None:
-    import math
-    chunks = 2 if "chunks=2" in output else 1
-    with pytest.raises(EvaluationError, match=reason):
-        corpus_perplexity(output, chunks, math.exp(190.0 / 254))
 
 
 def test_build_identity_binds_the_include_repo_header_bytes(tmp_path: Path) -> None:
@@ -587,7 +539,7 @@ def test_hash_memo_rehashes_when_the_file_changes(tmp_path: Path) -> None:
 
 
 
-# Execution modes (performance / timeline export / metrics) and the shared schedule engine
+# Execution modes (performance / timeline export) and the shared schedule engine
 
 def completed_run(root: Path) -> tuple[Path, tuple[Path, Path, Path]]:
     """A completed performance run whose stored schedule, IR and NPU results live in stage-cache entries."""
@@ -620,8 +572,8 @@ def forbidden(*names: str):  # type: ignore[no-untyped-def]
     return stack
 
 
-PIPELINE = ("run_schedule", "reconstruct_local", "reconstruct", "collect", "build_all", "pmu_contract", "perplexity",
-            "build_metrics", "cached_cycle_model", "cached_llama_build")
+PIPELINE = ("run_schedule", "reconstruct_local", "reconstruct", "collect", "build_all", "pmu_contract",
+            "cached_cycle_model", "cached_llama_build")
 
 
 def test_timeline_export_reads_only_the_stored_schedule(tmp_path: Path) -> None:
@@ -638,6 +590,14 @@ def test_timeline_export_reads_only_the_stored_schedule(tmp_path: Path) -> None:
     assert code == 0 and (tmp_path / "export/timeline.jsonl").read_bytes() == expected.read_bytes()
     export = json.loads((tmp_path / "export/export.json").read_text())
     assert export["reuse"] == "TIMELINE_EXPORT_FROM_STORED_SCHEDULE" and "scheduling" in export["not_run"]
+    assert json.loads((tmp_path / "export/manifest.json").read_text())["markers"] == {
+        "MEASUREMENT_DOMAIN": "timeline", "TIMELINE_EXPORT_ONLY": "PASS", "PERFORMANCE_RUN": "NOT_RUN",
+        "HARDWARE_METRICS_RUN": "NOT_RUN"}
+    # And: the export directory is sealed like every other run directory.
+    sums = dict(reversed(line.split("  ", 1)) for line in (tmp_path / "export/SHA256SUMS").read_text().splitlines())
+    assert set(sums) == {"export.json", "manifest.json", "timeline-rows.json", "timeline.jsonl"}
+    assert sums["timeline.jsonl"] == export["timeline"]["sha256"]
+    assert all(sha256(tmp_path / "export" / name) == value for name, value in sums.items())
     # And: a changed or missing stored schedule fails instead of being recomputed.
     stored = tmp_path / "cache/schedule/schedule.sqlite"
     stored.chmod(0o644)
@@ -653,33 +613,23 @@ def test_timeline_export_reads_only_the_stored_schedule(tmp_path: Path) -> None:
     assert "is gone" in json.loads((tmp_path / "e3/manifest.json").read_text())["stages"][-1]["reason"]
 
 
-def test_metrics_run_builds_and_runs_only_the_metric(tmp_path: Path) -> None:
-    import argparse
-
+def test_engine_modes_are_performance_and_timeline_only(capsys: pytest.CaptureFixture[str]) -> None:
     import run_cycle_evaluation as runner
-    model, dataset, manifest = tmp_path / "model.gguf", tmp_path / "wiki.test.raw", tmp_path / "manifest.json"
-    model.write_bytes(b"gguf")
-    dataset.write_text("text")
-    write_json(manifest, {"quantized": {"Q8_HP1": {"path": str(model)}}})
-    calls: list[str] = []
-    metric: Record = {"name": "perplexity", "value": 12.5, "semantic_options_sha256": "metric-options"}
-    args = argparse.Namespace(metric="ppl", model_manifest=manifest, output=tmp_path / "metrics", reuse_collection=None,
-                              from_run=None, timeline="none", precision="a8w8", dim=32, model=None, prompt_file=dataset,
-                              ppl_chunks=None, profile="a8w8-d32-hp1")
-    with forbidden(*(name for name in PIPELINE if name not in ("perplexity", "build_metrics"))), \
-            patch.object(runner, "gguf_identity", return_value={"sha256": "model"}), \
-            patch.object(runner, "model_entry", return_value={"entry": "Q8_HP1"}), \
-            patch.object(runner, "build_metrics", side_effect=lambda *_: calls.append("build-metrics") or {"metrics": {}}), \
-            patch.object(runner, "perplexity", side_effect=lambda *_: calls.append("perplexity") or metric):
-        assert runner.metrics_run(args) == 0
-    # Then: only the metric runner was built and run; no cycle library, collection, replay or schedule.
-    assert calls == ["build-metrics", "perplexity"]
-    result = json.loads((tmp_path / "metrics/metrics.json").read_text())
-    assert result["metrics"] == [metric] and result["build_correspondence"]["equal"] is False
-    assert json.loads((tmp_path / "metrics/manifest.json").read_text())["markers"]["PERFORMANCE_RUN"] == "NOT_RUN"
+    assert runner.RUN_MODES == ("performance", "timeline")
+    for mode in ("metrics", "quality", "perplexity"):
+        with patch.object(sys, "argv", ["run_cycle_evaluation.py", "--run", mode]), pytest.raises(SystemExit):
+            runner.arguments()
+        assert "invalid choice" in capsys.readouterr().err
+    # The help names only the two modes and nothing of perplexity.
+    with patch.object(sys, "argv", ["run_cycle_evaluation.py", "--help"]), pytest.raises(SystemExit):
+        runner.arguments()
+    shown = capsys.readouterr().out
+    assert "{performance,timeline}" in shown and not re.search(r"\b(perplexity|ppl|quality)\b", shown.lower())
+    # And: no perplexity code path is left in the engine.
+    assert not [name for name in dir(runner) if re.search(r"perplexity|(^|_)ppl(_|$)|quality", name.lower())]
 
 
-def test_performance_builds_never_include_the_metric_runner(tmp_path: Path) -> None:
+def test_performance_builds_only_the_collection_builds(tmp_path: Path) -> None:
     import argparse
 
     import run_cycle_evaluation as runner
@@ -707,20 +657,86 @@ def test_performance_builds_never_include_the_metric_runner(tmp_path: Path) -> N
                 patch.object(runner, "admitted_cycle_model", return_value=(library, True)), \
                 patch.object(runner, "cached_llama_build", side_effect=llama), \
                 patch("sim.cycle.local_validation.admit_library", return_value=({}, "NANO_LOCAL_VALIDATED")):
-            builds = runner.build_all(args, run, False, collect=collect_now)
-        assert kinds == expected and "metrics" not in builds
+            builds = runner.build_all(args, run, collect=collect_now)
+        # Then: only the collection builds (metric sinks off); never a metric kind or an extra target.
+        assert kinds == expected and set(builds) == {"cycle-model", *("potal", "fullcpu")[:len(expected)]}
+
+
+@pytest.mark.parametrize("timeline", ["none", "compact"])
+def test_performance_run_writes_a_timeline_only_on_request(tmp_path: Path, timeline: str) -> None:
+    import argparse
+
+    import run_cycle_evaluation as runner
+    model, dataset, receipt, manifest = (tmp_path / name for name in ("m.gguf", "wiki.raw", "receipt.json", "manifest.json"))
+    for path in (model, dataset, receipt, manifest):
+        path.write_text(path.name)
+    replay = tmp_path / "replay"
+    replay.mkdir()
+    write_json(replay / "schedule-performance.json", {"result": {"ttft": {"npu_cycles": 7}, "tpot": {}},
+                                                      "checks": {"status": "PASS"}, "rows": 3})
+    write_json(replay / "npu-summary.json", {})
+    write_json(replay / "result.json", {"replay_mode": "LOCAL"})
+    pending: list[Path | None] = []
+
+    def scheduled(*call: object) -> Path:
+        pending.append(call[5])  # type: ignore[arg-type]
+        return replay / "schedule.sqlite"
+
+    def exported(*call: object) -> int:
+        (call[7] / "timeline.jsonl").write_text("rows")  # type: ignore[operator]
+        return 3
+    args = argparse.Namespace(
+        model=model, prompt_file=dataset, from_run=None, prompt_tokens=256, generate=128, smoke=True,
+        validation_mode="nano-local", certificates=None, local_validation=receipt,
+        model_manifest=manifest, output=tmp_path / "run", profile="a8w8-d32-hp1", reuse_collection=tmp_path,
+        stage_cache=None, keep_raw=True, clock_selection=None, target_host_timing=None, target_interface_cost=None,
+        timeline=timeline, precision="a8w8", dim=32)
+    reuse: Record = {"model_sha256": "model", "pmu_contract": {"status": "READY"}, "source_run": "collection"}
+    builds: Record = {"cycle-model": {"receipt": {"library": {"path": str(tmp_path / "lib.so")}}}}
+    with forbidden("export_timeline", "collect", "pmu_contract", "cached_llama_build", "cached_cycle_model"), \
+            patch.object(runner, "clean_environment"), patch.object(runner, "host_facts", return_value={}), \
+            patch.object(runner, "toolchain", return_value={}), patch.object(runner, "source_state", return_value={}), \
+            patch.object(runner, "gguf_identity", return_value={"sha256": "model"}), \
+            patch.object(runner, "model_entry", return_value={"artifact": "Q8_HP1"}), \
+            patch.object(runner, "reused_collection", return_value=(tmp_path, tmp_path, reuse)), \
+            patch.object(runner, "build_all", return_value=builds), \
+            patch.object(runner, "reconstruct_local", return_value=replay), \
+            patch.object(runner, "collection_identity", return_value={
+                "input_tokens_sha256": "i", "generated_tokens_sha256": "g", "host_id": "h"}), \
+            patch.object(runner, "timing_validity", return_value={}), \
+            patch.object(runner, "schedule", side_effect=scheduled), \
+            patch.object(runner, "timeline_stage", side_effect=exported) as timeline_stage, \
+            patch.object(runner, "cross_check", return_value={}), \
+            patch.object(runner, "publication_readiness", return_value={
+                "clock_ready": False, "target_host_ready": False, "target_interface_ready": False}), \
+            patch.object(runner, "execution_record", return_value={}), \
+            patch.object(runner, "instrumentation_markers", return_value={}):
+        assert runner.performance_run(args) == 0
+    root = tmp_path / "run"
+    markers = json.loads((root / "manifest.json").read_text())["markers"]
+    # Then: the run is a performance run only, whatever the timeline switch.
+    assert markers["MEASUREMENT_DOMAIN"] == "performance" and markers["HARDWARE_METRICS_RUN"] == "NOT_RUN"
+    assert set(markers) >= {"FAST_CYCLE_EVALUATION_RUN", "TIMELINE_LOG_READY", "VALIDATION_MODE"}
+    assert not [name for name in markers if "QUALITY" in name or "METRICS_AUTOMATION" in name]
+    assert (root / "performance.json").is_file() and not (root / "metrics.json").exists()
+    if timeline == "none":
+        # And: no timeline sink was given to the scheduling pass and no timeline file or directory exists.
+        assert pending == [None] and not timeline_stage.called and not (root / "timeline").exists()
+        assert markers["TIMELINE_LOG_READY"] == "NOT_REQUESTED"
+        assert not [line for line in (root / "SHA256SUMS").read_text().splitlines() if "timeline" in line.split("  ")[1]]
+    else:
+        assert pending == [root / "timeline/in-pass-timeline.jsonl.partial"] and timeline_stage.call_count == 1
+        assert markers["TIMELINE_LOG_READY"] == "READY" and (root / "timeline/summary.json").is_file()
 
 
 def test_run_mode_dispatches_to_exactly_one_runner() -> None:
     import run_cycle_evaluation as runner
-    for mode, target in (("performance", "performance_run"), ("timeline", "export_timeline"), ("metrics", "metrics_run")):
+    for mode, target in (("performance", "performance_run"), ("timeline", "export_timeline")):
         with patch.object(runner, "performance_run", return_value=0) as performance_run, \
                 patch.object(runner, "export_timeline", return_value=0) as export_timeline, \
-                patch.object(runner, "metrics_run", return_value=0) as metrics_run, \
                 patch.object(sys, "argv", ["run_cycle_evaluation.py", "--run", mode]):
             assert runner.main() == 0
-        called = {"performance_run": performance_run.called, "export_timeline": export_timeline.called,
-                  "metrics_run": metrics_run.called}
+        called = {"performance_run": performance_run.called, "export_timeline": export_timeline.called}
         assert [name for name, value in called.items() if value] == [target]
 
 

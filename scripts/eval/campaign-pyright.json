@@ -17,7 +17,10 @@
     "run_stateful_integration_smoke.py",
     "e2e_timeline.py",
     "target_admission.py",
-    "run_cycle_evaluation.py"
+    "run_cycle_evaluation.py",
+    "measurement_domains.py",
+    "measurement_identity.py",
+    "run_measurement.py"
   ],
   "extraPaths": [
     "../..",

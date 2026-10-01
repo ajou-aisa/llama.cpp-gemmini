@@ -1,5 +1,8 @@
 # Independent evaluation metrics
 
+Metrics are the activation (ACT), residual (RES) and SCU measurements. Canonical campaign entry:
+`python3 scripts/eval/run_measurement.py metric activation|residual|scu` (see `scripts/eval/README.md`).
+
 ACT, RES and SCU collection/reduction is separate from the cycle provider. This
 package imports no cycle model, calls no cycle estimator, and produces no latency,
 frequency, PPL, CUDA, Jetson or FPGA measurement. Default inference metric switches

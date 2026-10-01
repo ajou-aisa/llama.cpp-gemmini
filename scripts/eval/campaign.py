@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -29,14 +30,17 @@ from eval_common import (
 )
 
 sys.path.insert(0, str(REPO))
-from campaign_metrics import outputs
+from campaign_metrics import OUTPUT_FILENAMES, outputs
 from metric_run import collect_metric, parser_for, validate_metric_recipe
+from model_manifest import model_entry
 
 from evaluation.manifest import Manifest
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description="Independent build/run/manifest/evidence measurement; no PPL or latency.")
+    result = argparse.ArgumentParser(description="Metrics (activation, residual, scu): independent build, run, manifest "
+                                                 "and evidence; no performance run and no timeline. `cycle` is the "
+                                                 "legacy certified replay adapter.")
     result.add_argument("kind", choices=("cycle", "activation", "residual", "scu"))
     result.add_argument("--model", choices=("gpt2", "llama3.2-1B"), required=True)
     result.add_argument("--model-path", type=Path)
@@ -53,6 +57,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--workload-manifest", type=Path, help="optional exact native chunk identity from another metric")
     result.add_argument("--evaluation-manifest", type=Path,
                         help="shared v1 evaluation_manifest.json (e.g. from cycle trace capture); bytes are reused")
+    result.add_argument("--model-manifest", type=Path,
+                        help="frozen model manifest (model_manifest.py): records the shared model identity that "
+                             "performance runs reference; the model must be one of its artifacts")
     result.add_argument("--trace-source", type=Path, help="existing actual-inference trace; omission captures a fresh prefill")
     result.add_argument("--source-provenance", type=Path, help="required for existing trace replay")
     result.add_argument("--certificate", type=Path, help="stateful production certificate admitting exact trace")
@@ -66,6 +73,16 @@ def expected_layers(architecture: str, blocks: int) -> set[str]:
     mlp = ("up_proj", "down_proj") if architecture == "gpt2" else ("up_proj", "gate_proj", "down_proj")
     return {"lm_head"} | {f"blk.{index}.{group}.{role}" for index in range(blocks)
                           for group, roles in (("attn", attention), ("mlp", mlp)) for role in roles}
+
+
+def canonical_aliases(output: Path, kind: str, raw: Path) -> None:
+    """Uniform names of every metric run (hard links, so SHA256SUMS covers them): summary.json, layers.json,
+    request.json and raw.jsonl[.gz] next to the metric-specific file names."""
+    summary, layers = OUTPUT_FILENAMES[kind]
+    os.link(output / summary, output / "summary.json")
+    os.link(output / layers, output / "layers.json")
+    os.link(output / "collection/request.json", output / "request.json")
+    os.link(raw, output / ("raw.jsonl" + (".gz" if raw.suffix == ".gz" else "")))
 
 
 def run_campaign(args: argparse.Namespace) -> Path:
@@ -134,7 +151,10 @@ def run_campaign(args: argparse.Namespace) -> Path:
         "build_receipt_sha256": sha256(runner.parent.parent / "build-receipt.json"),
         "command": [sys.executable, *sys.argv], "scope": "ONE_CHUNK_SMOKE" if args.max_chunks == 1 else
         "ALL_COMPLETE_CHUNKS" if args.max_chunks == 0 else "BOUNDED_CHUNKS",
-        "E2E_RECONSTRUCTION_READY": "NOT_READY", "PAPER_CAMPAIGN_COMPLETE": "NOT_RUN"}
+        "E2E_RECONSTRUCTION_READY": "NOT_READY", "PAPER_CAMPAIGN_COMPLETE": "NOT_RUN",
+        "measurement_domain": "legacy-cycle-replay" if args.kind == "cycle" else "metric",
+        # Same frozen model identity as the performance runs; the instrumentation build stays its own.
+        "model_manifest": model_entry(args.model_manifest, model) if args.model_manifest is not None else None}
     if args.kind == "cycle":
         options: Record = {key: str(getattr(args, key)) if getattr(args, key) is not None else None
             for key in ("trace_source", "source_provenance", "certificate", "evidence_root", "library")}
@@ -168,6 +188,7 @@ def run_campaign(args: argparse.Namespace) -> Path:
         require(isinstance(raw_chunks, list), "native chunks missing")
         chunks: set[int] = {integer(record(row), "chunk_id") for row in raw_chunks} if isinstance(raw_chunks, list) else set()
         outputs(args.kind, raw, manifest, output, expected_layers(architecture, blocks), chunks)
+        canonical_aliases(output, args.kind, raw)
         binding["native_workload_identity"] = collected["native_workload_identity"]
         binding["layer_count"] = len(expected_layers(architecture, blocks))
         binding["lm_head_included"] = True
