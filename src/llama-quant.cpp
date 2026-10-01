@@ -263,8 +263,6 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
     const bool is_token_embedding_weight = name == tn(LLM_TENSOR_TOKEN_EMBD, "weight");
     const bool is_output_weight =
         name == tn(LLM_TENSOR_OUTPUT, "weight") || (!qs.has_output && is_token_embedding_weight);
-    const ggml_type gemmini_q4_tensor_type = llama_quantize_gemmini_q4_default_tensor_type(
-        ftype, qs.params->pure, is_output_weight, is_token_embedding_weight);
 
     auto use_more_bits = [](int i_layer, int n_layers) -> bool {
         return i_layer < n_layers/8 || i_layer >= 7*n_layers/8 || (i_layer - n_layers/8)%3 == 2;
@@ -291,8 +289,6 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
     if (is_output_weight) {
         if (qs.params->output_tensor_type < GGML_TYPE_COUNT) {
             new_type = qs.params->output_tensor_type;
-        } else if (gemmini_q4_tensor_type < GGML_TYPE_COUNT) {
-            new_type = gemmini_q4_tensor_type;
         } else {
             const int64_t nx = tensor->ne[0];
             const int64_t qk_k = ggml_blck_size(new_type);
@@ -315,8 +311,6 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
     } else if (is_token_embedding_weight) {
         if (qs.params->token_embedding_type < GGML_TYPE_COUNT) {
             new_type = qs.params->token_embedding_type;
-        } else if (gemmini_q4_tensor_type < GGML_TYPE_COUNT) {
-            new_type = gemmini_q4_tensor_type;
         } else {
             if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS ||
                 ftype == LLAMA_FTYPE_MOSTLY_IQ1_S   || ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
