@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 from typing import Final
 
-from campaign_build import METRIC_SINKS
+from campaign_build import COMBINED, METRIC_SINKS
 from eval_common import EvaluationError, Json, Record, read_json, require
 
 SHARED: Final = ("model_sha256", "model_manifest_sha256", "model_artifact", "architecture", "quantization",
@@ -113,7 +113,8 @@ def run_identity(run: Path) -> Record:
         row = performance(run)
     else:
         manifest = optional(run / "manifest.json")
-        require(manifest.get("kind") in METRIC_SINKS, "not a finished performance, timeline or metric run: " + str(run))
+        require(manifest.get("kind") in (*METRIC_SINKS, COMBINED),
+                "not a finished performance, timeline or metric run: " + str(run))
         row = metric(run, manifest)
     return {"run": str(run), **row}
 

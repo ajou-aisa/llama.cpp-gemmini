@@ -3,8 +3,9 @@
 Metric campaigns (activation, residual, SCU) and the certification-only cycle campaigns. The canonical entry point
 for metrics is `scripts/eval/run_measurement.py metric activation|residual|scu` (see `README.md` for the three
 measurement domains: performance, timeline, metric); the shell wrappers below are equivalent and stay supported.
-`run_measurement.py metric all` runs these three over models × precisions × DIMs with shared builds and writes one
-aggregate summary (README "Metric sweep"); it adds no metric of its own.
+`run_measurement.py metric all` runs these three over models × precisions × DIMs, by default from one combined forward
+per configuration with parallel chunk shards, and writes one aggregate summary (README "Metric sweep"); it adds no
+metric of its own.
 
 Each command configures a fresh CMake build, compiles the native llama backend,
 runs focused cycle/metric CTests, executes native inference, validates the metric

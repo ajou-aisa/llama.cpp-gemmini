@@ -1,6 +1,6 @@
 """Strict native stream boundary shared by ACT, RES and SCU reducers."""
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 from evaluation.manifest import Manifest
@@ -52,6 +52,34 @@ def metric_rows(path: Path, schema: str, manifest: Manifest) -> Iterator[Record]
             observed += 1
             yield row
     require(ended, "missing successful metric RUN_END")
+
+
+def shard_rows(paths: list[Path], rows: Callable[[Path], Iterator[Record]]) -> Iterator[Record]:
+    """Chunk-disjoint shard streams of one run as one validated stream for the unchanged reducers.
+
+    Each shard is validated on its own by `rows`; the first shard's RUN header is kept and every other header must
+    equal it except for its own sequence and run id. Invocation ids restart at 0 in every shard process, so each
+    shard's ids move past the previous shards' to stay unique; nothing else is changed. The reducers then sum the
+    same integers they would sum over one unsharded stream."""
+    header: Record | None = None
+    offset = 0
+    for path in paths:
+        stream = rows(path)
+        first = next(stream)
+        if header is None:
+            header = first
+            yield first
+        require({key: value for key, value in first.items() if key not in ("sequence", "run_id")} ==
+                {key: value for key, value in header.items() if key not in ("sequence", "run_id")},
+                "metric shard RUN headers differ")
+        count = 0
+        for row in stream:
+            if "invocation_id" in row:
+                invocation = integer(row, "invocation_id")
+                count = max(count, invocation + 1)
+                row = {**row, "invocation_id": invocation + offset}
+            yield row
+        offset += count
 
 
 def _prepend(first: Record, iterator: Iterator[Record]) -> Iterator[Record]:

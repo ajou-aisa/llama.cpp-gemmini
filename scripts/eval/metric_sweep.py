@@ -7,15 +7,17 @@
 """metric all: activation, residual and SCU over models x precisions x DIMs, aggregated (orchestration only).
 
   run_measurement.py metric all [--models gpt2,llama3.2-1B] [--precisions a4w4,a8w8] [--dims 16,32,64]
-                                [--max-chunks 0] [--seed 1234] [--output DIR]
+                                [--max-chunks 0] [--seed 1234] [--workers N] [--threads N] [--output DIR]
   run_measurement.py metric all --resume SWEEP_DIR     continue with the recorded matrix and options
   run_measurement.py metric all --dry-run              print the plan; nothing is built or run
 
-Every metric run is an unchanged `campaign.py KIND` process with its own run directory. One prepared build per metric
-kind x precision x DIM (campaign_build.cached_llama_build) serves both models. Per configuration the activation run is
-the workload anchor: residual and SCU receive its evaluation_manifest.json and workload-binding.json. The sweep then
-only reads the finished runs: it checks their shared identity (and the chunk population across DIMs) and writes
-metric-summary.json, metric-summary.csv and the stdout tables. It defines no fourth metric and changes none.
+Combined collection (default): per configuration one `campaign.py metrics-all` process; one build per precision x
+DIM with all three metric sinks serves both models, the runner's chunk population is split into --workers contiguous
+shards that run in parallel, and the unchanged reducers reduce the shard streams as one stream. Separate collection
+(--collection separate): one unchanged `campaign.py KIND` run per metric kind, the activation run being the workload
+anchor of residual and SCU. Either way the sweep only reads the finished runs: it checks their shared identity (and
+the chunk population across DIMs) and writes metric-summary.json, metric-summary.csv and the stdout tables. It
+defines no fourth metric and changes none.
 """
 from __future__ import annotations
 
@@ -24,11 +26,12 @@ import csv
 import shlex
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-from campaign_build import METRIC_SINKS, REPO, cached_llama_build, llama_plan
+from campaign_build import COMBINED, METRIC_SINKS, REPO, cached_llama_build, llama_plan
 from campaign_verify import verify
 from eval_common import (
     EvaluationError,
@@ -84,18 +87,27 @@ class Sweep:
     im2p: str
     build_cache: str
     scu_mode: str = "aggregate"
+    collection: str = "combined"  # combined: one forward per configuration; separate: one per metric kind
+    threads: int = 1
+    threads_batch: int = 1
 
     def configurations(self) -> list[Config]:
         return [(model, precision, dim) for model in self.models for precision in self.precisions for dim in self.dims]
 
+    def collections(self) -> tuple[str, ...]:
+        """The native collections of one configuration: one combined forward, or one per metric kind."""
+        return (COMBINED,) if self.collection == "combined" else KINDS
+
     def builds(self) -> list[Build]:
-        return [(kind, precision, dim) for kind in KINDS for precision in self.precisions for dim in self.dims]
+        return [(kind, precision, dim) for kind in self.collections() for precision in self.precisions
+                for dim in self.dims]
 
     def record(self) -> Record:
         return {"schema": REQUEST, "version": 1, "models": list(self.models), "precisions": list(self.precisions),
                 "dims": list(self.dims), "max_chunks": self.max_chunks, "seed": self.seed,
                 "dataset_manifest": self.dataset_manifest, "im2p": self.im2p, "build_cache": self.build_cache,
-                "scu_mode": self.scu_mode}
+                "scu_mode": self.scu_mode, "collection": self.collection, "threads": self.threads,
+                "threads_batch": self.threads_batch}
 
 
 def subset(given: str | None, allowed: tuple[str, ...], option: str) -> tuple[str, ...]:
@@ -122,14 +134,18 @@ def recorded(root: Path) -> Sweep:
                  tuple(int(dim) for dim in subset(lists["dims"], DIMS, "dims")), integer(value, "max_chunks"),
                  integer(value, "seed"), dataset if isinstance(dataset, str) else None, text(value, "im2p"),
                  text(value, "build_cache"),
-                 str(value.get("scu_mode", "detailed")))  # sweeps recorded before SCU modes were detailed
+                 # Sweeps recorded before SCU modes and combined collection: detailed, separate, one thread.
+                 str(value.get("scu_mode", "detailed")), str(value.get("collection", "separate")),
+                 integer(value, "threads", 1) if "threads" in value else 1,
+                 integer(value, "threads_batch", 1) if "threads_batch" in value else 1)
 
 
 def resolve(args: argparse.Namespace) -> tuple[Sweep, Path | None]:
     """(sweep, its directory); --resume takes everything that defines results from the recorded sweep."""
     if args.resume is not None:
         given = [option for option in ("models", "precisions", "dims", "max_chunks", "seed", "dataset_manifest",
-                                        "im2p", "build_cache", "scu_mode") if getattr(args, option) is not None]
+                                        "im2p", "build_cache", "scu_mode", "collection", "threads", "threads_batch")
+                 if getattr(args, option) is not None]
         require(not given, "--resume uses the recorded matrix and options; remove --" +
                 ", --".join(option.replace("_", "-") for option in given))
         root = args.resume.resolve(strict=True)
@@ -139,8 +155,14 @@ def resolve(args: argparse.Namespace) -> tuple[Sweep, Path | None]:
                   0 if args.max_chunks is None else args.max_chunks, 1234 if args.seed is None else args.seed,
                   str(args.dataset_manifest.resolve(strict=True)) if args.dataset_manifest is not None else None,
                   str((args.im2p or REPO.parent / "IM2P.sim").resolve(strict=True)),
-                  str((args.build_cache or Path("runs/.build-cache")).resolve()), args.scu_mode or "aggregate")
+                  str((args.build_cache or Path("runs/.build-cache")).resolve()), args.scu_mode or "aggregate",
+                  args.collection or "combined", args.threads or 1, args.threads_batch or args.threads or 1)
     require(sweep.max_chunks >= 0 and 0 <= sweep.seed < 4294967295, "invalid --max-chunks or --seed")
+    require(sweep.threads > 0 and sweep.threads_batch > 0, "invalid --threads or --threads-batch")
+    require(sweep.collection == "separate" or sweep.scu_mode == "aggregate",
+            "the combined collection collects aggregate SCU; detailed SCU needs --collection separate")
+    require(sweep.collection == "combined" or (sweep.threads, sweep.threads_batch) == (1, 1),
+            "--threads and --threads-batch apply to the combined collection")
     # One detailed SCU chunk is ~25M records / ~330 MB (GPT-2 A8W8 DIM 32); the full corpus is ~1118 chunks.
     require(sweep.scu_mode == "aggregate" or sweep.max_chunks != 0 or args.allow_large_raw_scu,
             "Refusing full-corpus detailed SCU collection. Use --scu-mode aggregate or explicitly acknowledge "
@@ -156,13 +178,16 @@ def build_name(kind: str, precision: str, dim: int) -> str:
     return f"{kind}-{precision}-d{dim}"
 
 
-def campaign_argv(sweep: Sweep, config: Config, kind: str, build: str, anchor: str | None, timeout: int) -> list[str]:
-    """The campaign.py command line of one metric run, without its --output."""
+def campaign_argv(sweep: Sweep, config: Config, kind: str, build: str, anchor: str | None, timeout: int,
+                  workers: int = 1) -> list[str]:
+    """The campaign.py command line of one collection (a metric kind, or the combined one), without its --output."""
     model, precision, dim = config
     argv = [kind, "--model", model, "--precision", precision, "--dim", str(dim), "--max-chunks", str(sweep.max_chunks),
             "--seed", str(sweep.seed), "--timeout", str(timeout), "--im2p", sweep.im2p, "--prepared-build", build]
-    if kind == "scu":
+    if kind in ("scu", COMBINED):
         argv += ["--scu-mode", sweep.scu_mode]
+    if kind == COMBINED:
+        argv += ["--workers", str(workers), "--threads", str(sweep.threads), "--threads-batch", str(sweep.threads_batch)]
     if sweep.dataset_manifest is not None:
         argv += ["--dataset-manifest", sweep.dataset_manifest]
     if anchor is not None:  # the activation run's exact manifest bytes and native chunk identity
@@ -171,11 +196,16 @@ def campaign_argv(sweep: Sweep, config: Config, kind: str, build: str, anchor: s
     return argv
 
 
-def dry_run(sweep: Sweep, root: Path | None, timeout: int) -> str:
+def dry_run(sweep: Sweep, root: Path | None, timeout: int, workers: int = 1) -> str:
     base = str(root) if root is not None else "OUTPUT"
     configurations = sweep.configurations()
+    collections = len(configurations) * len(sweep.collections())
     lines = ["metric all: dry run (nothing is built or run)", f"{len(configurations)} configurations",
-             f"{len(configurations) * len(KINDS)} metric runs", f"{len(sweep.builds())} build configurations",
+             f"{len(configurations) * len(KINDS)} metric runs" + ("" if sweep.collection == "separate" else
+                                                                  f" from {collections} combined collections"),
+             f"{len(sweep.builds())} build configurations",
+             f"collection = {sweep.collection}" + ("" if sweep.collection == "separate" else
+                f" (threads = {sweep.threads}, threads_batch = {sweep.threads_batch}, workers = {workers})"),
              "models = " + ", ".join(sweep.models), "precisions = " + ", ".join(sweep.precisions),
              "DIMs = " + ", ".join(map(str, sweep.dims)), f"max_chunks = {sweep.max_chunks}" +
              (" (all complete chunks)" if sweep.max_chunks == 0 else ""), f"seed = {sweep.seed}",
@@ -188,9 +218,9 @@ def dry_run(sweep: Sweep, root: Path | None, timeout: int) -> str:
     for config in configurations:
         model, precision, dim = config
         cell = f"{base}/{model}/{precision}/d{dim}"
-        for kind in KINDS:
+        for kind in sweep.collections():
             argv = campaign_argv(sweep, config, kind, f"{base}/builds/{build_name(kind, precision, dim)}",
-                                 None if kind == "activation" else f"{cell}/activation", timeout)
+                                 None if kind in ("activation", COMBINED) else f"{cell}/activation", timeout, workers)
             lines.append("  " + shlex.join([*argv, "--output", f"{cell}/{kind}"]))
     return "\n".join(lines)
 
@@ -199,8 +229,10 @@ def failure(model: str | None, precision: str, dim: int, stage: str, error: obje
     return {"model": model, "precision": precision, "dim": dim, "stage": stage, "error": str(error)}
 
 
-def prepare_builds(root: Path, sweep: Sweep, jobs: int, failures: list[Record], keep_going: bool) -> dict[Build, Path]:
-    """One verified build per metric kind x precision x DIM from the build authority's cache, linked from builds/.
+def prepare_builds(root: Path, sweep: Sweep, jobs: int, failures: list[Record], keep_going: bool,
+                   timing: Record) -> dict[Build, Path]:
+    """One verified build per collection kind x precision x DIM from the build authority's cache, linked from
+    builds/; `timing` receives each build's seconds and cache hit.
 
     Both models use the same build; a resumed sweep must resolve every build to the one it started with."""
     prepared: dict[Build, Path] = {}
@@ -209,7 +241,9 @@ def prepare_builds(root: Path, sweep: Sweep, jobs: int, failures: list[Record], 
         kind, precision, dim = build
         link = root / "builds" / build_name(kind, precision, dim)
         try:
+            started = time.monotonic()
             path, hit = cached_llama_build(Path(sweep.build_cache), kind, precision, dim, Path(sweep.im2p), jobs)
+            timing[link.name] = {"seconds": round(time.monotonic() - started, 3), "cache_hit": hit}
             if link.is_symlink():
                 require(link.resolve() == path.resolve(),
                         f"{link.name} resolves to another build than this sweep started with (sources changed?)")
@@ -253,6 +287,9 @@ def metric_run(cell: Path, kind: str, argv: list[str], label: str) -> Path:
             verify(path)
             progress(f"{label}: reused {path}")
             return path
+    unfinished = attempts[-1] / "collection" if attempts else None
+    if argv[0] == COMBINED and unfinished is not None and unfinished.is_dir():
+        argv = [*argv, "--reuse-shards", str(unfinished)]  # its finished shards are linked, not run again
     progress(f"{label}: running {output}")
     campaign(argv, output)
     progress(f"{label}: PASS")
@@ -283,8 +320,10 @@ def configuration(root: Path, sweep: Sweep, config: Config, runs: dict[str, Path
     """One aggregate row from the three finished runs of a configuration, after checking that they share one model,
     configuration and native workload (their builds differ by design and are only recorded)."""
     model, precision, dim = config
+    combined = sweep.collection == "combined"
     identities = {kind: run_identity(run) for kind, run in runs.items()}
-    require(all(identities[kind]["measurement"] == kind for kind in KINDS), "run directory of another metric kind")
+    require(all(identities[kind]["measurement"] == (COMBINED if combined else kind) for kind in KINDS),
+            "run directory of another collection kind")
     comparison = compare(list(identities.values()))
     require(comparison["same_model_and_configuration"] is True,
             "metric runs differ in shared identity: " + ", ".join(record(comparison["differing"])))
@@ -297,15 +336,17 @@ def configuration(root: Path, sweep: Sweep, config: Config, runs: dict[str, Path
             f"{model} {precision} d{dim} (seed {sweep.seed}, max_chunks {sweep.max_chunks})")
     builds_used: Record = {}
     for kind in KINDS:
-        prepared = builds[(kind, precision, dim)]
+        built = COMBINED if combined else kind
+        prepared = builds[(built, precision, dim)]
         runner = Path(text(read_json(runs[kind] / "manifest.json"), "runner"))
         require(runner.parent.parent == prepared.resolve(), f"{kind} run did not use the sweep's build {prepared.name}")
-        build = record(record(identities[kind]["builds"])[kind])
+        build = record(record(identities[kind]["builds"])[built])
         builds_used[kind] = {"name": prepared.name, "path": str(prepared.resolve()),
                              "build_receipt_sha256": build["build_receipt_sha256"],
                              "runner_sha256": build["binary_sha256"],
                              "semantic_options_sha256": build["semantic_options_sha256"]}
-    summaries = {kind: read_json(runs[kind] / "summary.json") for kind in KINDS}
+    results = {kind: runs[kind] / kind if combined else runs[kind] for kind in KINDS}  # each metric's summary.json
+    summaries = {kind: read_json(results[kind] / "summary.json") for kind in KINDS}
     require(all(isinstance(summaries["scu"].get(population), dict) for population in SCU_POPULATIONS),
             "SCU summary has no dense/residual/overall split (reduced before the split; run scu again): " +
             str(runs["scu"]))
@@ -316,9 +357,21 @@ def configuration(root: Path, sweep: Sweep, config: Config, runs: dict[str, Path
             "SCU run was reduced by another SCU reducer source")
     scu: Record = {"collection_mode": mode, **{population: fields(record(summaries["scu"][population]), SCU,
                                                                   "SCU " + population) for population in SCU_POPULATIONS}}
+    collection: Record = {"mode": sweep.collection}
+    if combined:  # what a reused combined run must share with this sweep besides the build
+        sources = binding.get("collector_sha256")
+        require(isinstance(sources, dict) and all(sha256(REPO / name) == value for name, value in sources.items()) and
+                binding.get("reducer_sha256") == {kind: sha256(REPO / "evaluation" / module / "__init__.py") for
+                kind, module in (("activation", "activation"), ("residual", "residual"), ("scu", "weight_alignment"))},
+                "combined run was collected or reduced by other collector/reducer sources")
+        require((binding.get("threads"), binding.get("threads_batch")) == (sweep.threads, sweep.threads_batch),
+                "combined run used other thread settings")
+        shards = read_json(runs["scu"] / "collection/shards.json").get("shards")
+        collection.update({"threads": sweep.threads, "threads_batch": sweep.threads_batch,
+                           "workers": binding.get("workers"), "timing": binding.get("timing"), "shards": shards})
     return {"model": model, "precision": precision, "dim": dim, "shared_identity": anchor, "builds": builds_used,
-            "runs": {kind: str(runs[kind].relative_to(root)) for kind in KINDS},
-            "summary_sha256": {kind: sha256(runs[kind] / "summary.json") for kind in KINDS},
+            "collection": collection, "runs": {kind: str(results[kind].relative_to(root)) for kind in KINDS},
+            "summary_sha256": {kind: sha256(results[kind] / "summary.json") for kind in KINDS},
             "activation": fields(summaries["activation"], ACTIVATION, "activation summary"), "scu": scu,
             "residual": fields(summaries["residual"], RESIDUAL, "residual summary")}
 
@@ -332,10 +385,11 @@ def same_workload_across_dims(previous: list[Record], row: Record) -> None:
     require(not differing, f"DIM {row['dim']} workload differs from DIM {previous[0]['dim']} in: " + ", ".join(differing))
 
 
-def execute(root: Path, sweep: Sweep, args: argparse.Namespace) -> tuple[list[Record], list[Record], list[Record]]:
+def execute(root: Path, sweep: Sweep, args: argparse.Namespace,
+            timing: Record) -> tuple[list[Record], list[Record], list[Record]]:
     """(passing configurations, failures, workload identity per model and precision); fail-fast unless keep_going."""
     failures: list[Record] = []
-    builds = prepare_builds(root, sweep, args.jobs, failures, args.keep_going)
+    builds = prepare_builds(root, sweep, args.jobs, failures, args.keep_going, timing)
     passed: list[Record] = []
     groups: dict[tuple[str, str], list[Record]] = {}
     configurations = sweep.configurations()
@@ -345,7 +399,18 @@ def execute(root: Path, sweep: Sweep, args: argparse.Namespace) -> tuple[list[Re
         model, precision, dim = config
         cell = root / model / precision / f"d{dim}"
         runs: dict[str, Path] = {}
-        for offset, kind in enumerate(KINDS, 1):
+        if sweep.collection == "combined":
+            label = f"[{index + 1}/{len(configurations)}] {model} {precision} d{dim} {COMBINED}"
+            build = builds.get((COMBINED, precision, dim))
+            try:
+                require(build is not None, "build failed")
+                run = metric_run(cell, COMBINED, campaign_argv(sweep, config, COMBINED, str(build), None,
+                                                               args.timeout, args.workers), label)
+                runs = dict.fromkeys(KINDS, run)
+            except (EvaluationError, OSError, ValueError, subprocess.SubprocessError) as error:
+                failures.append(failure(*config, COMBINED, error))
+                progress(f"{label}: FAILED {error}")
+        for offset, kind in enumerate(KINDS if sweep.collection == "separate" else (), 1):
             step = f"[{index * len(KINDS) + offset}/{len(configurations) * len(KINDS)}]"
             label = f"{step} {model} {precision} d{dim} {kind}"
             build = builds.get((kind, precision, dim))
@@ -433,6 +498,13 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--build-cache", type=Path, help="campaign_build cache (default runs/.build-cache)")
     result.add_argument("--scu-mode", choices=("aggregate", "detailed"),
                         help="SCU collection: aggregate (default; integer sums) or detailed (every coordinate)")
+    result.add_argument("--collection", choices=("combined", "separate"),
+                        help="combined (default): activation, residual and SCU from one forward of one build per "
+                             "precision x DIM; separate: one build and run per metric kind (the individual paths)")
+    result.add_argument("--threads", type=int, help="combined: runner threads per shard (default 1; recorded)")
+    result.add_argument("--threads-batch", type=int, help="combined: runner batch threads (default --threads; recorded)")
+    result.add_argument("--workers", type=int, default=1,
+                        help="combined: parallel contiguous chunk shards per configuration, merged exactly (default 1)")
     result.add_argument("--allow-large-raw-scu", action="store_true",
                         help="accept detailed SCU collection of the full corpus (hundreds of GB of raw output)")
     target = result.add_mutually_exclusive_group()
@@ -454,13 +526,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         sweep, root = resolve(args)
+        require(args.workers > 0, "invalid --workers")
         if args.dry_run:
-            print(dry_run(sweep, root, args.timeout))
+            print(dry_run(sweep, root, args.timeout, args.workers))
             return 0
         if root is None:
             raise EvaluationError("--output DIR or --resume SWEEP_DIR is required")
-        progress(dry_run(sweep, root, args.timeout).split("\n\n", 1)[0].replace("dry run (nothing is built or run)",
-                                                                             "preflight"))
+        progress(dry_run(sweep, root, args.timeout, args.workers).split("\n\n", 1)[0].replace(
+            "dry run (nothing is built or run)", "preflight"))
         clean_environment()
         if args.resume is None:
             require(not root.exists(), f"sweep directory exists: {root} (continue it with --resume)")
@@ -468,7 +541,8 @@ def main(argv: list[str] | None = None) -> int:
             write_json(root / "manifest.json", {**sweep.record(), "command": [sys.executable, *sys.argv]})
         else:
             retire(root)
-        passed, failures, identity = execute(root, sweep, args)
+        build_timing: Record = {}
+        passed, failures, identity = execute(root, sweep, args, build_timing)
         complete = not failures and len(passed) == len(sweep.configurations())
         summary: Record = {
             "schema": "potal-metric-sweep", "version": 1, "status": "PASS" if complete else "FAILED",
@@ -476,7 +550,10 @@ def main(argv: list[str] | None = None) -> int:
             "max_chunks": sweep.max_chunks, "seed": sweep.seed,
             "counts": {"configurations": len(sweep.configurations()),
                        "metric_runs": len(sweep.configurations()) * len(KINDS), "builds": len(sweep.builds()),
+                       "native_collections": len(sweep.configurations()) * len(sweep.collections()),
                        "passed_configurations": len(passed)},
+            "collection": {"mode": sweep.collection, "threads": sweep.threads, "threads_batch": sweep.threads_batch,
+                           "workers": args.workers}, "build_timing": build_timing,
             "configurations": [*passed], "failures": [*failures], "dim_identity": [*identity],
             "csv": "metric-summary.csv", "aggregation": "copied from each run's summary.json; nothing recomputed"}
         write_json(root / "metric-summary.json", summary)

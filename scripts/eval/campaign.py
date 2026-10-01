@@ -10,10 +10,11 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from campaign_build import REPO, build, command
+from campaign_build import COMBINED, METRIC_SINKS, REPO, build, command
 from campaign_inputs import checksums, dataset_input, model_metadata
 from eval_common import (
     EvaluationError,
@@ -31,7 +32,12 @@ from eval_common import (
 
 sys.path.insert(0, str(REPO))
 from campaign_metrics import OUTPUT_FILENAMES, outputs
-from metric_run import collect_metric, parser_for, validate_metric_recipe
+from metric_run import (
+    collect_combined,
+    collect_metric,
+    parser_for,
+    validate_metric_recipe,
+)
 from metric_table import run_table
 from model_manifest import model_entry
 
@@ -42,7 +48,9 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Metrics (activation, residual, scu): independent build, run, manifest "
                                                  "and evidence; no performance run and no timeline. `cycle` is the "
                                                  "legacy certified replay adapter.")
-    result.add_argument("kind", choices=("cycle", "activation", "residual", "scu"))
+    result.add_argument("kind", choices=("cycle", "activation", "residual", "scu", COMBINED),
+                        help=f"{COMBINED}: activation, residual and aggregate SCU from one forward of one combined "
+                             "build (the collection of `metric all`; not a fourth metric)")
     result.add_argument("--model", choices=("gpt2", "llama3.2-1B"), required=True)
     result.add_argument("--model-path", type=Path)
     result.add_argument("--precision", type=str.lower, choices=("a4w4", "a8w8"), required=True)
@@ -55,6 +63,12 @@ def parser() -> argparse.ArgumentParser:
                              "per-coordinate validation in the producer and streams integer sums per chunk/layer/"
                              "work type (same summary, far smaller raw)")
     result.add_argument("--seed", type=int, default=1234)
+    result.add_argument("--workers", type=int, help=f"{COMBINED} only: parallel contiguous chunk shards (default 1)")
+    result.add_argument("--threads", type=int, help=f"{COMBINED} only: runner threads per shard (default 1)")
+    result.add_argument("--threads-batch", type=int, help=f"{COMBINED} only: runner batch threads (default --threads)")
+    result.add_argument("--reuse-shards", type=Path,
+                        help=f"{COMBINED} only: collection/ of an unfinished attempt; its finished, valid shards of "
+                             "this exact plan are hard-linked instead of run again")
     result.add_argument("--jobs", type=int, default=4)
     result.add_argument("--timeout", type=int, default=1800)
     result.add_argument("--im2p", type=Path, default=REPO.parent / "IM2P.sim")
@@ -99,7 +113,13 @@ def run_campaign(args: argparse.Namespace) -> Path:
     else:
         require(all(value is None for value in (args.trace_source, args.source_provenance, args.certificate,
                 args.evidence_root, args.library)), "metric campaigns do not accept cycle-provider inputs")
-    require(args.scu_mode is None or args.kind == "scu", "--scu-mode applies to scu only")
+    require(args.scu_mode is None or args.kind == "scu" or (args.kind == COMBINED and args.scu_mode == "aggregate"),
+            f"--scu-mode applies to scu ({COMBINED} collects aggregate SCU only)")
+    require(args.kind == COMBINED or (args.workers, args.threads, args.threads_batch, args.reuse_shards) ==
+            (None, None, None, None), f"--workers, --threads, --threads-batch and --reuse-shards apply to {COMBINED} only")
+    require(args.kind != COMBINED or (args.workload_manifest, args.evaluation_manifest) == (None, None),
+            f"{COMBINED} collects its three metrics from one workload; no shared manifests")
+    started = time.monotonic()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     output = (args.output or REPO.parent / ("evaluation-campaign-" + stamp) / args.kind).resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -178,6 +198,37 @@ def run_campaign(args: argparse.Namespace) -> Path:
             checksums(output)
             raise
         binding = read_json(output / "cycle-binding.json")
+    elif args.kind == COMBINED:
+        threads = args.threads or 1
+        raws, collected = collect_combined(runner, model, dataset, manifest_path, output / "collection", args.max_chunks,
+                                           args.workers or 1, threads, args.threads_batch or threads, args.timeout,
+                                           args.reuse_shards.resolve(strict=True) if args.reuse_shards else None)
+        workload = record(collected["workload"])
+        raw_chunks = workload["chunks"]
+        chunks = {integer(record(row), "chunk_id") for row in raw_chunks} if isinstance(raw_chunks, list) else set()
+        layers = expected_layers(architecture, blocks)
+        timing: Record = {"native_collection": collected["native_seconds"]}
+        for kind in METRIC_SINKS:  # the unchanged reducers, each over the joined shard streams of its own sink
+            reduce_started = time.monotonic()
+            (output / kind).mkdir()
+            outputs(kind, output / "collection/shards.json", manifest, output / kind, layers, chunks, shards=raws[kind])
+            summary, layer_name = OUTPUT_FILENAMES[kind]
+            os.link(output / kind / summary, output / kind / "summary.json")
+            os.link(output / kind / layer_name, output / kind / "layers.json")
+            timing[kind + "_reduce"] = round(time.monotonic() - reduce_started, 3)
+        timing["total"] = round(time.monotonic() - started, 3)
+        sources = ("scripts/eval/campaign.py", "scripts/eval/metric_run.py", "scripts/eval/campaign_metrics.py",
+                   "evaluation/reducer/__init__.py")
+        binding.update({"kinds": list(METRIC_SINKS), "native_workload_identity": collected["native_workload_identity"],
+                        "layer_count": len(layers), "lm_head_included": True, "scu_collection_mode": "aggregate",
+                        "scu_reducer_sha256": sha256(REPO / "evaluation/weight_alignment/__init__.py"),
+                        "reducer_sha256": {kind: sha256(REPO / "evaluation" / module / "__init__.py") for kind, module in
+                                           (("activation", "activation"), ("residual", "residual"),
+                                            ("scu", "weight_alignment"))},
+                        "collector_sha256": {source: sha256(REPO / source) for source in sources},
+                        "threads": threads, "threads_batch": args.threads_batch or threads,
+                        "workers": collected["workers"], "reused_shards": collected["reused_shards"],
+                        "timing": timing})
     else:
         recipe = "scale" if args.kind == "scu" else args.kind
         validate_metric_recipe(info, recipe)
@@ -213,8 +264,9 @@ def main() -> int:
     try:
         output = run_campaign(args)
         print(output)
-        if args.kind != "cycle":  # stdout stays the run directory; the one-row result table goes to stderr
-            print(run_table(args.kind, output), file=sys.stderr)
+        for kind in (METRIC_SINKS if args.kind == COMBINED else (args.kind,) if args.kind != "cycle" else ()):
+            # stdout stays the run directory; the one-row result tables go to stderr
+            print(run_table(kind, output / kind if args.kind == COMBINED else output, output), file=sys.stderr)
         return 0
     except (EvaluationError, OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"campaign failed: {error}", file=sys.stderr)

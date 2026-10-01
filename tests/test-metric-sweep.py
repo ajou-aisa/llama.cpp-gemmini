@@ -27,6 +27,10 @@ from campaign_inputs import checksums
 from eval_common import EvaluationError, read_json, sha256, write_json
 
 REDUCER = sha256(ROOT / "evaluation/weight_alignment/__init__.py")
+REDUCERS = {kind: sha256(ROOT / "evaluation" / module / "__init__.py")
+            for kind, module in (("activation", "activation"), ("residual", "residual"), ("scu", "weight_alignment"))}
+COLLECTOR = {name: sha256(ROOT / name) for name in ("scripts/eval/campaign.py", "scripts/eval/metric_run.py",
+                                                    "scripts/eval/campaign_metrics.py", "evaluation/reducer/__init__.py")}
 
 STAMP = "20260101T000000Z"
 MODELS, PRECISIONS, DIMS = ("gpt2", "llama3.2-1B"), ("a4w4", "a8w8"), (16, 32, 64)
@@ -100,6 +104,43 @@ def write_run(output: Path, kind: str, options: dict[str, str], chunk_ids: list[
     checksums(output)
 
 
+def write_combined_run(output: Path, options: dict[str, str], chunk_ids: list[int]) -> None:
+    """A finished `campaign.py metrics-all` run: one collection, one manifest, one summary per metric kind."""
+    model, precision, dim = options["--model"], options["--precision"], int(options["--dim"])
+    bits = 4 if precision == "a4w4" else 8
+    (output / "collection").mkdir(parents=True)
+    manifest = output / "evaluation_manifest.json"
+    write_json(manifest, {"model": DISPLAY[model], "dataset": "WikiText-2", "tokenizer_sha256": "t-" + model,
+                          "precision": precision.upper(), "dim": dim, "BK": 32, "seed": int(options["--seed"]),
+                          "git_sha": "g" * 40, "chunk_policy": f"max_chunks={options['--max-chunks']}"})
+    digest = sha256(manifest)
+    identity = f"{model}:" + ",".join(map(str, chunk_ids))
+    write_json(output / "collection/workload-binding.json", {
+        "model_sha256": f"m-{model}-{precision}", "dataset_sha256": "d", "split": "test", "manifest_sha256": digest,
+        "native_workload_identity": identity, "requested_max_chunks": int(options["--max-chunks"]),
+        "workload": {"chunks": [{"chunk_id": chunk} for chunk in chunk_ids]}})
+    workers = int(options["--workers"])
+    write_json(output / "collection/shards.json", {"manifest_sha256": digest, "shards": [
+        {"first_chunk": index, "chunks": 1, "wall_seconds": 1.0} for index in range(workers)]})
+    for kind in ("activation", "residual", "scu"):
+        (output / kind).mkdir()
+        write_json(output / kind / "summary.json", {"manifest_sha256": digest, **values(kind, model, precision, dim)})
+    prepared = Path(options["--prepared-build"]).resolve()
+    runner = prepared / "bin/llama-eval-workload"
+    write_json(output / "manifest.json", {
+        "kind": "metrics-all", "manifest_sha256": digest, "model_sha256": f"m-{model}-{precision}",
+        "dataset_sha256": "d", "runner": str(runner), "build_hash": sha256(runner),
+        "build_receipt_sha256": sha256(prepared / "build-receipt.json"),
+        "build_info": {"activation_bits": bits, "weight_bits": bits, "dim": dim, "block_size": 32,
+                       **dict.fromkeys(SINK.values(), 1)},
+        "model_manifest": None, "native_workload_identity": identity, "measurement_domain": "metric",
+        "kinds": ["activation", "residual", "scu"], "scu_collection_mode": options["--scu-mode"],
+        "scu_reducer_sha256": REDUCER, "reducer_sha256": REDUCERS, "collector_sha256": COLLECTOR,
+        "threads": int(options["--threads"]), "threads_batch": int(options["--threads-batch"]), "workers": workers,
+        "timing": {"native_collection": 1.0}})
+    checksums(output)
+
+
 class Fakes:
     """The build cache and the campaign.py processes the sweep starts, replaced by synthetic directories."""
 
@@ -131,7 +172,10 @@ class Fakes:
         if key in self.fail:  # a campaign that stopped after creating its run directory
             (output / "collection").mkdir(parents=True)
             return subprocess.CompletedProcess(command, 1, "", "campaign failed: native collection failed\n")
-        write_run(output, kind, options, self.chunks.get(key, [0, 3]))
+        if kind == "metrics-all":
+            write_combined_run(output, options, self.chunks.get(key, [0, 3]))
+        else:
+            write_run(output, kind, options, self.chunks.get(key, [0, 3]))
         return subprocess.CompletedProcess(command, 0, f"{output}\n", "")
 
 
@@ -143,8 +187,10 @@ def fakes(monkeypatch: pytest.MonkeyPatch) -> Fakes:
     return value
 
 
-def sweep(tmp_path: Path, *argv: str) -> int:
-    return metric_sweep.main([*argv, "--im2p", str(tmp_path), "--build-cache", str(tmp_path / "cache")])
+def sweep(tmp_path: Path, *argv: str, collection: str = "separate") -> int:
+    """`metric all` on the fakes; the separate collection (one run per metric kind) unless asked otherwise."""
+    return metric_sweep.main([*argv, "--im2p", str(tmp_path), "--build-cache", str(tmp_path / "cache"),
+                              "--collection", collection])
 
 
 def table(output: str, title: str) -> list[list[str]]:
@@ -197,7 +243,8 @@ def test_full_matrix_shares_builds_and_aggregates_every_configuration(
     summary = read_json(root / "metric-summary.json")
     rows = summary["configurations"]
     assert summary["status"] == "PASS" and summary["failures"] == [] and len(rows) == 12
-    assert summary["counts"] == {"configurations": 12, "metric_runs": 36, "builds": 18, "passed_configurations": 12}
+    assert summary["counts"] == {"configurations": 12, "metric_runs": 36, "builds": 18, "native_collections": 36,
+                                 "passed_configurations": 12}
     assert [(row["model"], row["precision"], row["dim"]) for row in rows] == configs
     # Both models use the same prepared build of a metric/precision/DIM; every build is recorded per configuration.
     used: dict[tuple[str, str, int], set[str]] = {}
@@ -464,3 +511,243 @@ def test_resume_never_reuses_an_scu_run_of_another_mode_or_reducer(tmp_path: Pat
     write_json(binding, value)
     with pytest.raises(EvaluationError, match="another SCU reducer source"):
         metric_sweep.configuration(root, metric_sweep.recorded(root), ("gpt2", "a8w8", 16), runs, builds)
+
+
+# Combined collection: one forward per configuration (metrics-all build), exact shard merge
+
+def test_combined_collection_is_one_forward_per_configuration(
+        tmp_path: Path, fakes: Fakes, capsys: pytest.CaptureFixture[str]) -> None:
+    root = tmp_path / "combined"
+    assert sweep(tmp_path, "--output", str(root), "--threads", "4", "--workers", "2", collection="combined") == 0
+    configs = [(model, precision, dim) for model in MODELS for precision in PRECISIONS for dim in DIMS]
+    # 12 native collections, each producing all three metrics; 6 combined builds shared by both models.
+    assert [(call[2], call[4], int(call[6]), call[0]) for call in fakes.calls] == [
+        (*config, "metrics-all") for config in configs]
+    options = [dict(zip(call[1::2], call[2::2])) for call in fakes.calls]
+    assert {(o["--workers"], o["--threads"], o["--threads-batch"], o["--scu-mode"]) for o in options} == {
+        ("2", "4", "4", "aggregate")}
+    assert len(fakes.builds) == len(set(fakes.builds)) == 6 and {kind for kind, _, _ in fakes.builds} == {"metrics-all"}
+    summary = read_json(root / "metric-summary.json")
+    assert summary["status"] == "PASS" and summary["counts"] == {
+        "configurations": 12, "metric_runs": 36, "builds": 6, "native_collections": 12, "passed_configurations": 12}
+    assert summary["collection"] == {"mode": "combined", "threads": 4, "threads_batch": 4, "workers": 2}
+    first = summary["configurations"][0]
+    assert first["runs"] == {kind: f"gpt2/a4w4/d16/metrics-all/{kind}" for kind in ("activation", "residual", "scu")}
+    assert first["builds"]["activation"] == first["builds"]["residual"] == first["builds"]["scu"]
+    assert first["builds"]["scu"]["name"] == "metrics-all-a4w4-d16"
+    assert (first["collection"]["mode"], first["collection"]["threads"], first["collection"]["workers"]) == (
+        "combined", 4, 2) and len(first["collection"]["shards"]) == 2
+    combined_tables = capsys.readouterr().out
+    # The same metric values, CSV bytes and tables as the separate collection.
+    separate = tmp_path / "separate"
+    assert sweep(tmp_path, "--output", str(separate)) == 0
+    assert (root / "metric-summary.csv").read_bytes() == (separate / "metric-summary.csv").read_bytes()
+    other = read_json(separate / "metric-summary.json")["configurations"]
+    assert [{kind: row[kind] for kind in ("activation", "residual", "scu")} for row in summary["configurations"]] == [
+        {kind: row[kind] for kind in ("activation", "residual", "scu")} for row in other]
+    separate_tables = capsys.readouterr().out
+    for title in ("Activation Adaptation", "SCU Weight-Scale Alignment — Dense", "Residual Overhead"):
+        assert table(combined_tables, title) == table(separate_tables, title)
+    assert sweep(tmp_path, "--dry-run", "--threads", "4", "--workers", "2", collection="combined") == 0
+    plan = capsys.readouterr().out
+    for line in ("36 metric runs from 12 combined collections", "6 build configurations",
+                 "collection = combined (threads = 4, threads_batch = 4, workers = 2)"):
+        assert line + "\n" in plan
+    assert len([line for line in plan.splitlines() if line.startswith("  metrics-all --model")]) == 12
+
+
+def test_combined_collection_guards(tmp_path: Path, fakes: Fakes) -> None:
+    # Detailed SCU only exists in the separate collection; thread settings only in the combined one.
+    assert sweep(tmp_path, "--output", str(tmp_path / "detailed"), "--scu-mode", "detailed", "--max-chunks", "1",
+                 collection="combined") == 1
+    assert sweep(tmp_path, "--output", str(tmp_path / "threads"), "--threads", "4") == 1
+    assert sweep(tmp_path, "--output", str(tmp_path / "workers"), "--workers", "0", collection="combined") == 1
+    assert not any((tmp_path / name).exists() for name in ("detailed", "threads", "workers")) and fakes.calls == []
+
+
+def test_resume_reuses_a_combined_run_only_with_its_threads_and_sources(tmp_path: Path, fakes: Fakes) -> None:
+    root = tmp_path / "s"
+    assert sweep(tmp_path, "--output", str(root), "--models", "gpt2", "--precisions", "a8w8", "--dims", "32",
+                 "--threads", "2", collection="combined") == 0
+    recorded = metric_sweep.recorded(root)
+    assert (recorded.collection, recorded.threads, recorded.threads_batch) == ("combined", 2, 2)
+    assert metric_sweep.main(["--resume", str(root), "--threads", "4"]) == 1  # recorded, not overridable
+    run = root / "gpt2/a8w8/d32/metrics-all"
+    runs = dict.fromkeys(("activation", "residual", "scu"), run)
+    builds = {("metrics-all", "a8w8", 32): root / "builds/metrics-all-a8w8-d32"}
+    assert metric_sweep.configuration(root, recorded, ("gpt2", "a8w8", 32), runs, builds)["collection"]["threads"] == 2
+    binding = read_json(run / "manifest.json")
+    for change, reason in (({"threads": 8}, "other thread settings"),
+                           ({"collector_sha256": {**COLLECTOR, "scripts/eval/metric_run.py": "0" * 64}},
+                            "other collector/reducer sources")):
+        (run / "manifest.json").unlink()
+        write_json(run / "manifest.json", {**binding, **change})
+        with pytest.raises(EvaluationError, match=reason):
+            metric_sweep.configuration(root, recorded, ("gpt2", "a8w8", 32), runs, builds)
+
+
+def test_shard_plan_and_workload_merge() -> None:
+    import metric_run
+    # Contiguous shards cover every selected chunk exactly once; sizes differ by at most one.
+    assert metric_run.shard_plan(1118, 4) == [(0, 280), (280, 280), (560, 279), (839, 279)]
+    for selected, workers in ((1, 4), (32, 1), (32, 3), (1129, 6), (7, 7)):
+        shards = metric_run.shard_plan(selected, workers)
+        chunks = [chunk for first, count in shards for chunk in range(first, first + count)]
+        assert chunks == list(range(selected)) and len(shards) == min(selected, workers)
+        assert max(count for _, count in shards) - min(count for _, count in shards) <= 1
+    with pytest.raises(EvaluationError):
+        metric_run.shard_plan(0, 2)
+    # Shard workloads join into one workload only when every run field agrees.
+    def shard(first: int, count: int, **change: object) -> dict[str, object]:
+        return {"workload": "METRIC_PREFILL_256", "threads": 4, "tokens": 9000, "first_chunk": first,
+                "selected_chunks": count, "chunks": [{"chunk_id": chunk} for chunk in range(first, first + count)],
+                **change}
+    merged = metric_run.merge_workloads([shard(0, 2), shard(2, 1)])
+    assert (merged["first_chunk"], merged["selected_chunks"], [row["chunk_id"] for row in merged["chunks"]]) == (
+        0, 3, [0, 1, 2])
+    with pytest.raises(EvaluationError, match="different workloads"):
+        metric_run.merge_workloads([shard(0, 2), shard(2, 1, threads=8)])
+
+
+FAKE_RUNNER = r'''
+import json, os, sys
+from pathlib import Path
+argv = sys.argv[1:]
+if argv == ["--build-info"]:
+    print(json.dumps({"schema": "potal-evaluation-build", "version": 1, "activation_metrics": 1, "residual_metrics": 1,
+                      "scale_metrics": 1, "cycle_sim": 1, "backend": "IM2P_SIM", "hp1": True, "gemmini": 1,
+                      "gemmini_option": "WS", "activation_bits": 8, "weight_bits": 8, "dim": 64,
+                      "activation_mode": "EXSIA", "block_size": 32, "rmd_enabled": 1, "rmd_backend": "WS"}))
+    sys.exit(0)
+plan = "--plan-only" in argv
+values = [value for value in argv if value != "--plan-only"]
+options = dict(zip(values[::2], values[1::2]))
+total = int(os.environ["FAKE_CHUNKS"])
+if plan:
+    selected = total if options["--max-chunks"] == "0" else min(total, int(options["--max-chunks"]))
+    print(json.dumps({"schema": "potal-native-chunk-plan", "version": 1, "tokens": total * 256, "complete_chunks": total,
+                      "selected_chunks": selected, "first_chunk": 0, "dropped_tail_tokens": 0, "context_tokens": 256}))
+    sys.exit(0)
+first, count = int(options["--first-chunk"]), int(options["--max-chunks"])
+if str(first) in os.environ.get("FAKE_FAIL", "").split(","):
+    sys.exit(3)
+common = {"version": 1, "run_id": options["--run-id"], "workload_id": "METRIC_PREFILL_256",
+          "manifest_sha256": options["--manifest-sha256"], "precision": "A8W8", "dim": 64}
+def stream(path, schema, run, rows, end):
+    lines = [{**common, "schema": schema, "kind": "RUN", **run}]
+    lines += [{**common, "schema": schema, **row} for row in rows]
+    lines.append({**common, "schema": schema, "kind": "RUN_END", "success": True, **end})
+    Path(path).write_text("".join(json.dumps({**row, "sequence": index}) + "\n" for index, row in enumerate(lines)))
+chunks = list(range(first, first + count))
+counts = []
+for local, chunk in enumerate(chunks):
+    fp, selected, both = 1 + chunk % 3, 2 + chunk % 2, 1
+    counts.append({"kind": "COUNTS", "chunk_id": chunk, "invocation_id": local, "layer": "lm_head", "m": 1, "k": 64,
+                   "valid_positions": 64, "finite_positions": 64, "nonfinite_positions": 0, "reference_complete": True,
+                   "reference_invalid_reason": None, "fp_selected": fp, "potal_selected": selected,
+                   "intersection": both, "union": fp + selected - both, "residual_nnz": chunk % 2,
+                   "eligible_logical_blocks": 2, "unique_actual_requantized_blocks": 1, "p3_requantization_events": 2})
+stream(options["--activation-output"], "im2p-activation-quant-metrics",
+       {"definition_status": "CONFIRMED_BY_USER", "reference_revision": "signed-row-original-bk32-population-2sigma-v1"},
+       counts, {"invocation_count": count, "observation_count": count, "reference_complete": True})
+residual = []
+for local, chunk in enumerate(chunks):
+    at = {"chunk_id": chunk, "invocation_id": local, "layer": "lm_head", "stripe_id": 0}
+    residual += [{**at, "kind": "MAIN_STRIPE", "row_begin": 0, "row_count": 2, "m": 2, "n": 16, "k": 64,
+                  "physical_fragments": 2},
+                 {**at, "kind": "RADIX_STRIPE", "radix_limb_count": 2, "original_rows": 4, "original_radix_rows": 4,
+                  "main_original_rows": 2, "original_k": 64},
+                 {**at, "kind": "COMPACT_WORK", "m": 3, "n": 16, "k": 4, "original_k": 64, "source_row_begin": 0,
+                  "source_row_count": 2, "tile_i_count": 1, "tile_j_count": 1, "tile_k_count": 1, "radix_limb_count": 2,
+                  "original_rows": 4, "retained_rows": 3, "zero_limb_pruned_count": 1, "retained_k": 4, "compact_k": 4,
+                  "physical_fragments": 2,
+                  "runs": [{"original_block_id": 0, "original_k_mask": 3, "compact_k_begin": 0, "compact_k_count": 2},
+                           {"original_block_id": 1, "original_k_mask": 5, "compact_k_begin": 2, "compact_k_count": 2}],
+                  "row_map": [{"original_lane_id": 0, "source_row": 0}, {"original_lane_id": 0, "source_row": 1},
+                              {"original_lane_id": 1, "source_row": 0}]}]
+stream(options["--residual-output"], "im2p-residual-path-metrics", {}, residual,
+       {"invocation_count": count, "observation_count": len(residual)})
+scale = []
+for chunk in chunks:
+    for work, offset in (("DENSE", chunk % 4), ("RESIDUAL", 1 + chunk % 2)):
+        scale.append({"kind": "AGGREGATE", "chunk_id": chunk, "layer": "lm_head", "work_type": work,
+                      "delta_w_sum": 2 * offset, "max_delta_w": offset, "alignment_count": 2,
+                      "updated_partial_sum_count": 8 if offset else 0, "total_partial_sum_count": 8,
+                      "zero_weight_count": 0})
+stream(options["--scale-output"], "im2p-scale-alignment-aggregate",
+       {"scale_domain": "hp1_block_pot_to_channel_anchor", "collection_mode": "aggregate"}, scale,
+       {"invocation_count": count, "observation_count": len(scale), "alignment_count": 4 * count,
+        "scale_invocation_count": count})
+native = Path(options["--output-dir"])
+native.mkdir()
+(native / "workload.json").write_text(json.dumps({
+    "workload": "METRIC_PREFILL_256", "complete": True, "output_mask": "second_half", "seed": int(options["--seed"]),
+    "context_tokens": 256, "tokens": total * 256, "complete_chunks": total, "selected_chunks": count,
+    "first_chunk": first, "dropped_tail_tokens": 0, "batch": 256, "ubatch": 256, "threads": int(options["--threads"]),
+    "threads_batch": int(options["--threads-batch"]), "add_special": True, "parse_special": False,
+    "trailing_lf_removed": True, "add_bos": False, "bos_token": 1, "bos_policy": "replace_chunk_first",
+    "kv_policy": "clear_per_chunk",
+    "chunks": [{"chunk_id": chunk, "token_offset": chunk * 256, "input_tokens": [chunk], "complete": True}
+               for chunk in chunks]}))
+'''
+
+
+def test_combined_collection_shards_merge_exactly_and_resume_finished_shards(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import metric_run
+    from campaign_metrics import outputs
+
+    from evaluation.manifest import Manifest
+    runner = tmp_path / "bin/llama-eval-workload"
+    runner.parent.mkdir()
+    runner.write_text(f"#!{sys.executable}\n" + FAKE_RUNNER)
+    runner.chmod(0o755)
+    model, dataset = tmp_path / "model.gguf", tmp_path / "wiki.test.raw"
+    model.write_bytes(b"model")
+    dataset.write_bytes(b"dataset")
+    manifest_path = tmp_path / "evaluation_manifest.json"
+    write_json(manifest_path, {"model": "GPT-2 124M", "dataset": "WikiText-2", "tokenizer_sha256": "1" * 64,
+                               "chunk_policy": metric_run.chunk_policy(0), "precision": "A8W8", "dim": 64, "BK": 32,
+                               "seed": 1234, "git_sha": "2" * 40})
+    manifest = Manifest.load(manifest_path)
+    monkeypatch.setenv("FAKE_CHUNKS", "7")
+
+    def collect(name: str, workers: int, reuse: Path | None = None) -> tuple[Path, dict[str, object]]:
+        root = tmp_path / name
+        raws, binding = metric_run.collect_combined(runner, model, dataset, manifest_path, root / "collection", 0,
+                                                    workers, 2, 2, 60, reuse)
+        chunks = set(range(7))
+        for kind in ("activation", "residual", "scu"):
+            (root / kind).mkdir()
+            outputs(kind, root / "collection/shards.json", manifest, root / kind, {"lm_head"}, chunks,
+                    shards=raws[kind])
+        return root, binding
+
+    def results(root: Path) -> dict[str, object]:
+        names = {"activation": "activation_metrics.json", "residual": "residual_metrics.json",
+                 "scu": "scale_alignment_metrics.json"}
+        return {kind: {key: value for key, value in read_json(root / kind / name).items() if key != "input_sha256"}
+                for kind, name in names.items()}
+
+    single, binding = collect("one", 1)
+    assert binding["workers"] == 1 and binding["workload"]["selected_chunks"] == 7
+    for workers in (3, 7, 9):  # 9 workers still make 7 one-chunk shards
+        sharded, other = collect(f"w{workers}", workers)
+        assert results(sharded) == results(single), workers
+        assert other["native_workload_identity"] == binding["native_workload_identity"]
+        assert len(read_json(sharded / "collection/shards.json")["shards"]) == min(workers, 7)
+    # A failed shard fails the collection; a retry links the finished shards and runs only the failed one.
+    monkeypatch.setenv("FAKE_FAIL", "0")
+    with pytest.raises(EvaluationError, match="native combined collection failed"):
+        collect("failed", 3)
+    monkeypatch.setenv("FAKE_FAIL", "")
+    resumed, binding = collect("resumed", 3, tmp_path / "failed/collection")
+    assert sorted(binding["reused_shards"]) == ["shard-001", "shard-002"] and results(resumed) == results(single)
+    assert (resumed / "collection/shard-001/activation-quant-metrics.jsonl").samefile(
+        tmp_path / "failed/collection/shard-001/activation-quant-metrics.jsonl")
+    # Another shard plan, or a damaged stream, is never reused.
+    assert collect("replanned", 2, tmp_path / "failed/collection")[1]["reused_shards"] == {}
+    damaged = tmp_path / "failed/collection/shard-002/residual-path-metrics.jsonl"
+    damaged.write_text("\n".join(damaged.read_text().splitlines()[:-1]) + "\n")
+    _, binding = collect("damaged", 3, tmp_path / "failed/collection")
+    assert sorted(binding["reused_shards"]) == ["shard-001"]

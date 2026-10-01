@@ -87,6 +87,7 @@ static int run(int argc, char ** argv) {
     std::string file, output, forced_file, workload = "METRIC_PREFILL_256";
     int max_chunks = 1, first_chunk = 0, smoke_generated_tokens = 0;
     bool seed_set = false, temp_set = false, chunk_index_set = false, cycle_trace = false;
+    bool first_chunk_set = false, plan_only = false;
     std::string evaluation_manifest_hash;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -101,6 +102,8 @@ static int run(int argc, char ** argv) {
                 "    per chunk/layer/work type after the same per-coordinate validation)\n"
                 "  --cycle-trace (independent zero-generation prefill trace, metrics OFF)\n"
                 "  --chunk-index N --forced-token-ids JSON --run-id ID --build-info\n"
+                "  --first-chunk N (METRIC_PREFILL_256 shard: first selected chunk; --max-chunks counts from it)\n"
+                "  --plan-only (METRIC_PREFILL_256: print the native chunk plan as JSON and exit; no output)\n"
                 "  --smoke-generated-tokens 1 (CYCLE_SIM diagnostic; never an E2E campaign)\n"
                 "Native non-strided WikiText chunks, no warmup. Defaults: one chunk, batch/ubatch 256,\n"
                 "one thread. E2E requires chunk-index0..9; fixed greedy seed1234/temp0, EOS stopping disabled.\n"
@@ -109,6 +112,7 @@ static int run(int argc, char ** argv) {
         }
         if (arg == "--build-info") { std::puts(build_info().dump().c_str()); return 0; }
         if (arg == "--cycle-trace") { cycle_trace = true; continue; }
+        if (arg == "--plan-only") { plan_only = true; continue; }
         if (arg == "--activation-reference-candidate") {
             throw std::invalid_argument("obsolete ACT candidate policy; confirmed row-by-BK32 policy is mandatory");
         }
@@ -132,6 +136,10 @@ static int run(int argc, char ** argv) {
         else if (arg == "--chunk-index") {
             first_chunk = value == "0" ? 0 : positive(value);
             chunk_index_set = true;
+        }
+        else if (arg == "--first-chunk") {
+            first_chunk = value == "0" ? 0 : positive(value);
+            first_chunk_set = true;
         }
         else if (arg == "--max-chunks") max_chunks = value == "0" ? -1 : positive(value);
         else if (arg == "--smoke-generated-tokens") smoke_generated_tokens = positive(value);
@@ -197,15 +205,19 @@ static int run(int argc, char ** argv) {
                                     "generation or in a FullCPU forced cost-only replay");
     const int generation_target = smoke_generated_tokens ? smoke_generated_tokens : 128;
     if (!generation && workload != "METRIC_PREFILL_256") throw std::invalid_argument("unknown workload");
+    if (chunk_index_set && first_chunk_set) throw std::invalid_argument("--chunk-index and --first-chunk are exclusive");
+    if (plan_only && (generation || cycle_trace || forced_cost_only))
+        throw std::invalid_argument("--plan-only describes the METRIC_PREFILL_256 chunk plan");
     if (generation) {
-        if (!chunk_index_set || first_chunk > 9 || max_chunks != 1) {
+        if (!chunk_index_set || first_chunk_set || first_chunk > 9 || max_chunks != 1) {
             throw std::invalid_argument("E2E requires --chunk-index0..9 and --max-chunks1");
         }
         if ((seed_set && params.sampling.seed != 1234) || (temp_set && params.sampling.temp != 0)) {
             throw std::invalid_argument("E2E recipe requires seed1234 and temperature0");
         }
         params.sampling = common_evaluation_e2e_sampling();
-    } else if (first_chunk != 0 || forced_cost_only) {
+    } else if ((chunk_index_set && first_chunk != 0) || forced_cost_only) {
+        // A metric workload selects a contiguous chunk range only through --first-chunk (independent shards).
         throw std::invalid_argument("chunk selection and forced tokens require E2E workload");
     }
     if (forced_cost_only && (CYCLE_SIM || !LOG_CYCLE || params.n_gpu_layers != 0 ||
@@ -216,7 +228,7 @@ static int run(int argc, char ** argv) {
         throw std::invalid_argument("E2E requires ACT_QUANT_METRICS=0, RESIDUAL_METRICS=0 and SCALE_METRICS=0");
     }
     if (params.n_gpu_layers != 0 && !EVALUATION_CUDA) throw std::invalid_argument("CUDA is not compiled in");
-    if (params.model.path.empty() || file.empty() || output.empty()) {
+    if (params.model.path.empty() || file.empty() || (output.empty() && !plan_only)) {
         throw std::invalid_argument("--model, --file and --output-dir are required");
     }
     if (params.n_batch > 256 || params.n_ubatch > params.n_batch) {
@@ -234,14 +246,17 @@ static int run(int argc, char ** argv) {
     if (!input.eof() && input.fail()) throw std::runtime_error("dataset read failed");
     const bool trimmed_lf = !text.empty() && text.back() == '\n';
     if (trimmed_lf) text.pop_back();
-    const auto parent = std::filesystem::path(output).parent_path();
-    if (!parent.empty()) std::filesystem::create_directories(parent);
-    if (!std::filesystem::create_directory(output)) throw std::runtime_error("output directory already exists");
-    std::ofstream manifest(std::filesystem::path(output) / "workload.json");
-    std::ofstream batches(std::filesystem::path(output) / "batches.jsonl");
-    std::ofstream application(std::filesystem::path(output) / "application.jsonl");
-    std::ofstream application_cpu(std::filesystem::path(output) / "application-cpu.jsonl");
-    if (!manifest || !batches || !application || !application_cpu) throw std::runtime_error("cannot open output files");
+    std::ofstream manifest, batches, application, application_cpu;
+    if (!plan_only) {
+        const auto parent = std::filesystem::path(output).parent_path();
+        if (!parent.empty()) std::filesystem::create_directories(parent);
+        if (!std::filesystem::create_directory(output)) throw std::runtime_error("output directory already exists");
+        manifest.open(std::filesystem::path(output) / "workload.json");
+        batches.open(std::filesystem::path(output) / "batches.jsonl");
+        application.open(std::filesystem::path(output) / "application.jsonl");
+        application_cpu.open(std::filesystem::path(output) / "application-cpu.jsonl");
+        if (!manifest || !batches || !application || !application_cpu) throw std::runtime_error("cannot open output files");
+    }
     params.n_ctx = generation ? 384 : 256;
     params.n_parallel = 1;
     common_init();
@@ -285,6 +300,13 @@ static int run(int argc, char ** argv) {
     }
     const auto tokens = common_evaluation_tokenize(ctx, text);
     const auto plan = common_evaluation_plan(tokens.size(), 256, params.n_batch, max_chunks, first_chunk);
+    if (plan_only) {
+        std::puts(json({{"schema", "potal-native-chunk-plan"}, {"version", 1}, {"tokens", tokens.size()},
+            {"complete_chunks", plan.total_chunks}, {"selected_chunks", plan.n_chunks},
+            {"first_chunk", plan.first_chunk}, {"dropped_tail_tokens", plan.tail_tokens},
+            {"context_tokens", 256}}).dump().c_str());
+        return 0;
+    }
     const bool add_bos = llama_vocab_get_add_bos(vocab);
     const auto mask = generation ? common_evaluation_mask::generation_last : common_evaluation_mask::perplexity_half;
     const std::string source_role = CYCLE_SIM ? "potal_collection" :

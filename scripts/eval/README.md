@@ -126,6 +126,9 @@ python3 scripts/eval/run_measurement.py metric all \
   --dims 16,32,64 \
   --max-chunks 0
 
+# Same, collected with 16 parallel chunk shards per configuration (identical results, see "Combined collection")
+python3 scripts/eval/run_measurement.py metric all --workers 16
+
 # Smoke subset, the plan only, and an interrupted sweep
 python3 scripts/eval/run_measurement.py metric all --models gpt2 --precisions a8w8 --dims 32 --max-chunks 1
 python3 scripts/eval/run_measurement.py metric all --dry-run
@@ -133,21 +136,40 @@ python3 scripts/eval/run_measurement.py metric all --resume runs/metrics/sweep-<
 ```
 
 `metric all` is an orchestration layer. It does not define a fourth metric and does not change individual metric
-semantics: every run is an unchanged `campaign.py activation|residual|scu` process with its own run directory, and the
-sweep only reads finished runs (`metric_sweep.py`).
+semantics: it runs `campaign.py` and only reads finished runs (`metric_sweep.py`). The individual
+`metric activation|residual|scu` paths are unchanged and remain the reference.
 
-- Builds: one per metric kind × precision × DIM (18 for the full matrix) from `campaign_build.cached_llama_build`
-  (`--build-cache`, default `runs/.build-cache`), passed as `campaign.py --prepared-build`; GPT-2 and Llama use the
-  same build. `<sweep>/builds/` links them, and a resumed sweep must resolve to the same builds.
-- Workload: in each configuration (model × precision × DIM) the activation run is the anchor; residual and SCU get its
-  `evaluation_manifest.json` (`--evaluation-manifest`) and `collection/workload-binding.json` (`--workload-manifest`).
-  The sweep then requires the same model, dataset, tokenizer, precision, DIM, seed, chunk policy, native workload
-  identity and chunk IDs in the three runs (`measurement_identity` plus the workload files), and the same native
-  workload and chunk IDs across the DIMs of one model and precision. Builds differ by design; each configuration
-  records the build receipt, runner and semantic-options SHA-256 it used.
-- Output (`runs/metrics/sweep-<utc>`): `manifest.json` (the recorded matrix and options), `builds/`,
-  `<model>/<precision>/d<dim>/{activation,residual,scu}/` (unchanged campaign run directories, `<kind>.campaign.log`
-  next to each), `metric-summary.json` and `metric-summary.csv`.
+- Combined collection (default, `--collection combined`): per configuration (model × precision × DIM) one
+  `campaign.py metrics-all` run collects activation, residual and aggregate SCU from one forward of one build with all
+  three metric sinks (`metrics-all`, otherwise the options of the individual metric builds: 6 builds for the full
+  matrix, shared by both models). The runner's chunk population (`llama-eval-workload --plan-only`) is split into
+  `--workers` contiguous shards (`--first-chunk`/`--max-chunks`) that run as parallel processes in
+  `collection/shard-NNN/`; each shard is validated like a single collection, the shard workloads must agree in every
+  run field and cover the population exactly once, and the unchanged reducers reduce each metric's shard streams as
+  one stream (`evaluation.reducer.shard_rows`: per-shard stream validation, invocation ids moved past the previous
+  shards'), so every integer sum, ratio and layer summary equals the unsharded result. `--threads`/`--threads-batch`
+  set the runner threads per shard (recorded; part of the native workload identity). `manifest.json` records the
+  threads, workers, shards, collector and reducer SHA-256 and the stage timing (`native_collection`,
+  `<kind>_reduce`, `total`); `collection/shards.json` the per-shard wall seconds and peak RSS.
+- Separate collection (`--collection separate`): one build per metric kind × precision × DIM (18) and one
+  `campaign.py activation|residual|scu` run per metric; the activation run is the workload anchor whose
+  `evaluation_manifest.json` (`--evaluation-manifest`) and `collection/workload-binding.json` (`--workload-manifest`)
+  residual and SCU reuse. Detailed SCU (`--scu-mode detailed`) exists only here.
+- Choosing `--workers`/`--threads`: measured on an 18-core Apple M5 Pro (GPT-2 A8W8 DIM 32, 32 chunks), a metric
+  process uses about one core whatever `--threads` is (threads 1..16: 315-329 s), while shards scale: 1/2/4/8/16
+  workers took 324/171/93/52/32 s, and 16 to 24 workers saturate the host (72 chunks: 77/75/75 s). Peak RSS per
+  shard process is about 1.2 GB for GPT-2 and 4-5 GB for Llama-3.2-1B, so the useful worker count is bounded by
+  cores and by free memory.
+- Builds come from `campaign_build.cached_llama_build` (`--build-cache`, default `runs/.build-cache`) and are passed as
+  `campaign.py --prepared-build`; `<sweep>/builds/` links them, and a resumed sweep must resolve to the same builds.
+- Identity: the sweep requires the same model, dataset, tokenizer, precision, DIM, seed, chunk policy, native workload
+  identity and chunk IDs for the three metrics of a configuration (`measurement_identity` plus the workload files),
+  and the same native workload and chunk IDs across the DIMs of one model and precision. Each configuration records
+  the build receipt, runner and semantic-options SHA-256 it used.
+- Output (`runs/metrics/sweep-<utc>`): `manifest.json` (the recorded matrix and options), `builds/`, per configuration
+  `<model>/<precision>/d<dim>/metrics-all/` (combined: `collection/`, `activation/`, `residual/`, `scu/`) or
+  `{activation,residual,scu}/` (separate), with `<run>.campaign.log` next to each run, then `metric-summary.json` and
+  `metric-summary.csv`.
 - `metric-summary.json` (`potal-metric-sweep`): status, matrix, counts, one entry per passing configuration (shared
   identity, builds, runs, activation fields with their counts, SCU `dense`/`residual`/`overall`, residual fields),
   the failures and the workload identity per model and precision. `metric-summary.csv`: one row per passing
@@ -158,9 +180,12 @@ sweep only reads finished runs (`metric_sweep.py`).
 - Failures: a failed build, metric run or identity check makes the sweep `FAILED` (exit 1) and is listed. The default
   stops at the first failure; `--keep-going` runs every configuration and prints a failed-configuration table. A
   failed configuration never enters the tables, the CSV or the configuration list.
-- `--resume DIR` keeps the recorded matrix and options. A complete run (`SHA256SUMS`) is verified with
-  `campaign_verify` and reused; an incomplete run stays untouched and its metric runs again in `<kind>.retry-N`; a
-  complete run that fails verification stops the sweep. Earlier summaries are kept as `metric-summary.attempt-N.*`.
+- `--resume DIR` keeps the recorded matrix and options (`--workers` may change). A complete run (`SHA256SUMS`) is
+  verified with `campaign_verify` and reused when its threads, collector and reducer SHA-256 still match; an
+  incomplete run stays untouched and runs again in `<run>.retry-N`, where a combined run hard-links every finished
+  shard of the same plan whose command exited 0 and whose streams pass validation (`campaign.py --reuse-shards`)
+  and runs only the rest; a complete run that fails verification stops the sweep. Earlier summaries are kept as
+  `metric-summary.attempt-N.*`.
 - SCU collection mode (`--scu-mode`, default `aggregate` for `metric all`; `metric scu` keeps `detailed` unless
   `--scu-mode aggregate` is given). `detailed` streams one `SCALE_ALIGNMENT` record per (invocation, work type,
   stripe, column, original block): about 25M records / 330 MB per GPT-2 A8W8 DIM 32 chunk. `aggregate` runs the same
@@ -171,7 +196,8 @@ sweep only reads finished runs (`metric_sweep.py`).
   when its `scu_collection_mode` and `scu_reducer_sha256` match; the summary records `scu.collection_mode`.
 - `--dry-run` prints the counts, the builds with their `semantic_options_sha256` and every `campaign.py` command;
   a real run prints the same preflight header first.
-  `--timeout` is passed to every `campaign.py` run (its per-command limit, default 1800 s).
+  `--timeout` is passed to every `campaign.py` run; for a combined run it bounds the parallel shard processes
+  together (default 1800 s).
 
 ## Dependency matrix
 
@@ -229,11 +255,11 @@ are not admitted by any runner):
 <!-- BEGIN GENERATED build-scripts -->
 | Script | Caller | Build kinds | Semantic options | Platform options | Output | Status |
 |---|---|---|---|---|---|---|
-| `scripts/eval/campaign_build.py` | all measurement scripts; CLI through build_measurement.sh | `cycle`, `activation`, `residual`, `scu`, `potal-host`, `potal-host-nocpulog`, `fullcpu-host`, `cycle-model` | defined here and nowhere else: `llama_plan()`, `METRIC_SINKS`, `CYCLE_MODEL_OPTIONS` | `platform_profile()`: library suffix, binary format, install name; adds no CMake option today and may never add a semantic one (`with_platform`) | build directory with configure/build/verify logs, `build-info.json`, `artifacts.json`, `build-receipt.json`; `cached_*` entries under `--build-cache` | ACTIVE (authority) |
+| `scripts/eval/campaign_build.py` | all measurement scripts; CLI through build_measurement.sh | `cycle`, `activation`, `residual`, `scu`, `metrics-all` (all three sinks, `metric all`), `potal-host`, `potal-host-nocpulog`, `fullcpu-host`, `cycle-model` | defined here and nowhere else: `llama_plan()`, `METRIC_SINKS`, `CYCLE_MODEL_OPTIONS` | `platform_profile()`: library suffix, binary format, install name; adds no CMake option today and may never add a semantic one (`with_platform`) | build directory with configure/build/verify logs, `build-info.json`, `artifacts.json`, `build-receipt.json`; `cached_*` entries under `--build-cache` | ACTIVE (authority) |
 | `scripts/eval/build_measurement.sh` | user | same kinds (`--kind`, `--dry-run`) | from campaign_build.py | from campaign_build.py | `--output DIR` | ACTIVE (wrapper) |
 | `scripts/eval/run_cycle_evaluation.py` | run_measurement.py performance, timeline | performance: `cycle-model`, `potal-host` (STRIPE_PIPELINE), `fullcpu-host` (FULL); timeline: none | none of its own: `--precision`, `--dim` select the `llama_plan()` profile | from campaign_build.py | `--build-cache/<kind>-<identity>`; per-build summary in `<run>/build/*.json` | ACTIVE |
 | `scripts/eval/campaign.py` | run_measurement.py metric KIND, run_*_metrics.sh | `activation`, `residual`, `scu` (FULL); `cycle` only for its legacy adapter | none of its own: `--precision`, `--dim` select the `llama_plan()` profile | from campaign_build.py | `<output>/build` (fresh) or a verified `--prepared-build` | ACTIVE |
-| `scripts/eval/metric_sweep.py` | run_measurement.py metric all | `activation`, `residual`, `scu` (FULL), one per precision x DIM, shared by both models | none of its own: `--precisions`, `--dims` select the `llama_plan()` profiles | from campaign_build.py | `--build-cache/<kind>-<identity>` (`cached_llama_build`), linked from `<sweep>/builds/`; passed to `campaign.py --prepared-build` | ACTIVE |
+| `scripts/eval/metric_sweep.py` | run_measurement.py metric all | `metrics-all` (FULL), one per precision x DIM shared by both models; with `--collection separate` `activation`, `residual`, `scu` each | none of its own: `--precisions`, `--dims` select the `llama_plan()` profiles | from campaign_build.py | `--build-cache/<kind>-<identity>` (`cached_llama_build`), linked from `<sweep>/builds/`; passed to `campaign.py --prepared-build` | ACTIVE |
 | `scripts/eval/cycle_trace_capture.py` | run_cycle_trace_capture.sh | `cycle` (STRIPE_PIPELINE) | none of its own | from campaign_build.py | `<config>/build` or `--prepared-build` | CERTIFICATION_ONLY |
 | `scripts/eval/campaign_cycle.py` | campaign.py cycle | `cycle-model` | `CYCLE_MODEL_OPTIONS` | from campaign_build.py | `<output>/cycle-library-build` | CERTIFICATION_ONLY (legacy adapter) |
 | build-arm64.sh, build-arm64-cpu.sh, build-arm64-fpga-uart.sh, build-x86.sh, build-riscv.sh | developer | none (developer builds, not a measurement kind) | own environment defaults resolved by `scripts/im2p-build-options.py`; they differ from every measurement profile (backend, DIM, bits, OpenMP, runtime matmul override) | host and toolchain specific (native flags, OpenMP, cross toolchain) | `build-arm64/`, `build-arm64-cpu/`, `build-arm64-fpga-uart/`, `build-x86/`, `build-riscv[-static]/`; no receipt | DEBUG/RESEARCH (never admitted by a runner) |
@@ -362,7 +388,7 @@ exactly where the scheduler placed them.
 | `residual_path_metrics.py` | WRAPPER | standalone residual collect/reduce with a prepared runner | user (advanced) |
 | `scale_alignment_metrics.py` | WRAPPER | standalone SCU collect/reduce with a prepared runner | user (advanced) |
 | `measurement_domains.py` | INTERNAL | domain definitions for the wrapper, README tables and tests | run_measurement.py |
-| `metric_sweep.py` | INTERNAL | `metric all`: unchanged `campaign.py` runs over models x precisions x DIMs (one build per metric/precision/DIM, activation as workload anchor), identity checks and the aggregate JSON/CSV/tables; computes no metric | run_measurement.py |
+| `metric_sweep.py` | INTERNAL | `metric all`: `campaign.py metrics-all` (one forward, all three sinks, chunk shards) or separate metric runs over models x precisions x DIMs, identity checks and the aggregate JSON/CSV/tables; computes no metric | run_measurement.py |
 | `metric_table.py` | INTERNAL | deterministic stdout tables of metric summaries (display only) | metric_sweep.py, campaign.py |
 | `measurement_identity.py` | INTERNAL | read-only shared identity of finished runs (`run_measurement.py identity RUN...`) | run_measurement.py |
 | `campaign_build.py` | INTERNAL | the build authority: every CMake option of every measurement build, receipts, build cache | run_cycle_evaluation.py, campaign.py, cycle scripts |

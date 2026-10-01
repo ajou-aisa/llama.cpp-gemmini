@@ -189,8 +189,8 @@ SCRIPTS: Final[tuple[tuple[str, str, str, str], ...]] = (
     ("measurement_domains.py", "INTERNAL", "domain definitions for the wrapper, README tables and tests",
      "run_measurement.py"),
     ("metric_sweep.py", "INTERNAL",
-     ("`metric all`: unchanged `campaign.py` runs over models x precisions x DIMs (one build per metric/precision/"
-      "DIM, activation as workload anchor), identity checks and the aggregate JSON/CSV/tables; computes no metric"),
+     ("`metric all`: `campaign.py metrics-all` (one forward, all three sinks, chunk shards) or separate metric runs "
+      "over models x precisions x DIMs, identity checks and the aggregate JSON/CSV/tables; computes no metric"),
      "run_measurement.py"),
     ("metric_table.py", "INTERNAL", "deterministic stdout tables of metric summaries (display only)",
      "metric_sweep.py, campaign.py"),
@@ -263,7 +263,8 @@ BUILD_SCRIPT_FIELDS: Final = ("script", "caller", "build_kinds", "semantic_optio
                               "status")
 BUILD_SCRIPTS: Final[tuple[tuple[str, str, str, str, str, str, str], ...]] = (
     ("scripts/eval/campaign_build.py", "all measurement scripts; CLI through build_measurement.sh",
-     "`cycle`, `activation`, `residual`, `scu`, `potal-host`, `potal-host-nocpulog`, `fullcpu-host`, `cycle-model`",
+     ("`cycle`, `activation`, `residual`, `scu`, `metrics-all` (all three sinks, `metric all`), `potal-host`, "
+      "`potal-host-nocpulog`, `fullcpu-host`, `cycle-model`"),
      "defined here and nowhere else: `llama_plan()`, `METRIC_SINKS`, `CYCLE_MODEL_OPTIONS`",
      ("`platform_profile()`: library suffix, binary format, install name; adds no CMake option today and may never "
       "add a semantic one (`with_platform`)"),
@@ -281,7 +282,8 @@ BUILD_SCRIPTS: Final[tuple[tuple[str, str, str, str, str, str, str], ...]] = (
      "none of its own: `--precision`, `--dim` select the `llama_plan()` profile", "from campaign_build.py",
      "`<output>/build` (fresh) or a verified `--prepared-build`", "ACTIVE"),
     ("scripts/eval/metric_sweep.py", "run_measurement.py metric all",
-     "`activation`, `residual`, `scu` (FULL), one per precision x DIM, shared by both models",
+     ("`metrics-all` (FULL), one per precision x DIM shared by both models; with `--collection separate` "
+      "`activation`, `residual`, `scu` each"),
      "none of its own: `--precisions`, `--dims` select the `llama_plan()` profiles", "from campaign_build.py",
      ("`--build-cache/<kind>-<identity>` (`cached_llama_build`), linked from `<sweep>/builds/`; passed to "
       "`campaign.py --prepared-build`"), "ACTIVE"),

@@ -48,6 +48,9 @@ CYCLE_MODEL_OPTIONS: Final = {"CMAKE_BUILD_TYPE": "Release", "CMAKE_EXPORT_COMPI
 METRIC_SINKS: Final = {"activation": ("GGML_GEMMINI_ACT_METRICS", "activation_metrics"),
                        "residual": ("GGML_GEMMINI_RESIDUAL_METRICS", "residual_metrics"),
                        "scu": ("GGML_GEMMINI_SCALE_METRICS", "scale_metrics")}
+# The combined collection profile of `metric all`: all three metric sinks in one build and one forward. It is a build
+# kind, not a fourth metric; every other option equals the individual metric builds.
+COMBINED: Final = "metrics-all"
 SOURCE_REPOS: Final = ("llama.cpp-gemmini", "IM2P.sim", "RISC-V-DynDNN-gemmini-include")
 INCLUDE_REPO: Final = REPO.parent / "RISC-V-DynDNN-gemmini-include"
 
@@ -131,7 +134,7 @@ class LlamaPlan:
 def llama_plan(kind: str, precision: str, dim: int, im2p: Path, matmul_mode: str = "FULL",
                extra_targets: tuple[str, ...] = ()) -> LlamaPlan:
     """Options, targets and verification filter of one llama build kind; platform independent."""
-    require(kind in ("cycle", "activation", "residual", "scu", "potal-host", "potal-host-nocpulog",
+    require(kind in ("cycle", "activation", "residual", "scu", COMBINED, "potal-host", "potal-host-nocpulog",
                      "fullcpu-host"),
             "invalid measurement kind")
     require(precision in ("a4w4", "a8w8") and dim in (16, 32, 64) and
@@ -154,7 +157,7 @@ def llama_plan(kind: str, precision: str, dim: int, im2p: Path, matmul_mode: str
         "GGML_GEMMINI_DEFAULT_RMD_BACKEND": "WS", "GGML_GEMMINI_ENABLE_RMD": "ON",
         "GGML_GEMMINI_ALLOW_RUNTIME_MATMUL_OVERRIDE": "OFF",
         "GGML_GEMMINI_ACT_QUANT_METRICS": "0",
-        **{option: str(int(kind == metric)) for metric, (option, _) in METRIC_SINKS.items()},
+        **{option: str(int(kind in (metric, COMBINED))) for metric, (option, _) in METRIC_SINKS.items()},
     }
     if kind.startswith("potal-host"):
         options.update({"LOG_CYCLE": "1",
@@ -266,7 +269,7 @@ def build(kind: str, precision: str, dim: int, output: Path, im2p: Path, jobs: i
     runner = output / "bin/llama-eval-workload"
     info = compiled_info(runner)
     bits = 4 if precision == "a4w4" else 8
-    require(all(info.get(key) == int(kind == metric) for metric, (_, key) in METRIC_SINKS.items()),
+    require(all(info.get(key) == int(kind in (metric, COMBINED)) for metric, (_, key) in METRIC_SINKS.items()),
             "compiled collectors are not independent")
     if kind == "fullcpu-host":
         require(info.get("cpu_only") is True and info.get("cycle_sim") == 0 and
@@ -404,7 +407,7 @@ def snapshot(output: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--kind", choices=("cycle", "activation", "residual", "scu", "potal-host",
+    parser.add_argument("--kind", choices=("cycle", "activation", "residual", "scu", COMBINED, "potal-host",
                                            "potal-host-nocpulog", "fullcpu-host", "cycle-model"), required=True)
     parser.add_argument("--matmul-mode", choices=("FULL", "STRIPE_PIPELINE"), default="FULL")
     parser.add_argument("--precision", choices=("a4w4", "a8w8"))

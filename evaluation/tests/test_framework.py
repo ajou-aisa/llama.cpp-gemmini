@@ -17,6 +17,7 @@ from evaluation.manifest import Manifest
 from evaluation.tests.test_collection import collection
 from evaluation.tests.test_edges import edges
 from evaluation.tests.test_scale_breakdown import scale_aggregate, scale_breakdown
+from evaluation.tests.test_shards import shards
 from scripts.eval.eval_common import (
     EvaluationError,
     Record,
@@ -137,6 +138,7 @@ def smoke(root: Path) -> None:
     edges(root, manifest)
     scale_breakdown(root, manifest)
     scale_aggregate(root, manifest)
+    shards(root, manifest)
     collection(root)
 
 
@@ -180,7 +182,7 @@ def main() -> None:
     else:
         smoke(args.output.resolve())
     print("PASS: ACT signed BK32, integer aggregation, RES run padding, SCU offsets, SCU dense/residual split, "
-          "SCU aggregate parity, manifest/stream rejection, CLI")
+          "SCU aggregate parity, exact shard merge, manifest/stream rejection, CLI")
 
 
 if __name__ == "__main__":

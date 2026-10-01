@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
+from collections.abc import Iterator
 from contextlib import ExitStack
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -11,7 +12,7 @@ from eval_common import Json, Record, integer, ratio, records, require, text, wr
 
 from evaluation import activation, residual, weight_alignment
 from evaluation.manifest import Manifest
-from evaluation.reducer import metric_rows
+from evaluation.reducer import metric_rows, shard_rows
 
 
 # (aggregate summary, per-layer summary) file names of each metric kind.
@@ -29,11 +30,20 @@ def residual_extensions(row: Record, radix_count: int) -> Record:
 
 
 def outputs(kind: str, raw: Path, manifest: Manifest, output: Path,
-            expected_layers: set[str], expected_chunks: set[int]) -> None:
+            expected_layers: set[str], expected_chunks: set[int], shards: list[Path] | None = None) -> None:
+    """Aggregate and per-layer summaries of one stream, or of chunk-disjoint `shards` reduced as one stream (`raw` is
+    then the shard index whose bytes bind every shard stream; it is the summaries' input)."""
     reducer = {"activation": activation, "residual": residual, "scu": weight_alignment}[kind]
     schemas = {"activation": "im2p-activation-quant-metrics", "residual": "im2p-residual-path-metrics",
                "scu": "im2p-scale-alignment-metrics"}
-    aggregate = reducer.reduce(raw, manifest)
+
+    def stream_of(path: Path) -> Iterator[Record]:
+        return weight_alignment.rows(path, manifest) if kind == "scu" else metric_rows(path, schemas[kind], manifest)
+
+    def stream() -> Iterator[Record]:
+        return shard_rows(shards, stream_of) if shards else stream_of(raw)
+
+    aggregate = reducer.summarize(stream(), raw, manifest)
     layers: list[Json] = []
     shapes: list[Json] = []
     radix_count = 0
@@ -41,7 +51,7 @@ def outputs(kind: str, raw: Path, manifest: Manifest, output: Path,
     coverage: dict[int, set[str]] = {}
     with TemporaryDirectory(prefix="campaign-layers-") as directory, ExitStack() as stack:
         files: dict[str, tuple[Path, TextIO]] = {}
-        rows = weight_alignment.rows(raw, manifest) if kind == "scu" else metric_rows(raw, schemas[kind], manifest)
+        rows = stream()
         header = next(rows)
         for row in rows:
             layer = text(row, "layer")

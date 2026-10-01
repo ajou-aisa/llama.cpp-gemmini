@@ -66,9 +66,10 @@ def metric_table(kind: str, entries: Sequence[Entry], plain: bool = False, varia
     return render(f"{title} — {variant}" if variant else title, [*KEYS, *(name for name, _, _ in columns)], rows, plain)
 
 
-def run_table(kind: str, run: Path) -> str:
-    """A finished metric run as a one-row plain table (SCU: its dense population, the paper default)."""
-    summary, manifest = read_json(run / "summary.json"), read_json(run / "evaluation_manifest.json")
+def run_table(kind: str, summaries: Path, run: Path) -> str:
+    """One metric of a finished run (`summaries` holds its summary.json) as a one-row plain table; SCU shows its dense
+    population, the paper default."""
+    summary, manifest = read_json(summaries / "summary.json"), read_json(run / "evaluation_manifest.json")
     values = record(summary["dense"]) if kind == "scu" else summary
     return metric_table(kind, [(text(manifest, "model"), text(manifest, "precision"), integer(manifest, "dim"), values)],
                         plain=True, variant="Dense" if kind == "scu" else "")
