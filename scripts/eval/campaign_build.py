@@ -163,8 +163,10 @@ def llama_plan(kind: str, precision: str, dim: int, im2p: Path, matmul_mode: str
         options.update({"LOG_CYCLE": "1",
                         "GGML_CPU_CYCLE_LOG": "OFF" if kind == "potal-host-nocpulog" else "ON"})
     targets = list(TARGETS)
-    verify_filter = ("^(test-evaluation-(workload|trace|build-options|metric-framework)|"
-                     "test-gemmini-(evaluation-metrics|cycle-sim-log)|"
+    if kind == COMBINED:  # the metric-only terminal lm_head is verified in the build that runs it
+        targets.append("test-gemmini-metric-terminal-elision")
+    verify_filter = ("^(test-evaluation-(workload|trace|build-options|metric-framework|terminal-lm-head)|"
+                     "test-gemmini-(evaluation-metrics|cycle-sim-log|metric-terminal-elision)|"
                      "test-cycle-sim-(reader|coverage|build-contract))$")
     if kind == "fullcpu-host":
         for key in [name for name in options if name.startswith("IM2P_SIM")]:

@@ -133,6 +133,7 @@ struct Session::Impl {
     // Aggregate SCU mode: the invocations of the current chunk, plus run totals.
     std::vector<std::shared_ptr<ScaleAccumulator>> scale_open;
     uint64_t scale_alignments = 0, scale_invocations = 0;
+    uint64_t terminal_elisions = 0;
     bool chunk_set = false, finished = false, reference_complete = true;
     std::string failure;
     ~Impl() {
@@ -245,6 +246,8 @@ std::shared_ptr<Session> Session::start(const Config &config) {
     require(config.scale_fd < 0 || config.scale_path.empty(), "SCALE path and descriptor are mutually exclusive");
     if (config.activation_path.empty() && config.residual_path.empty() && config.scale_path.empty() && config.scale_fd < 0) return {};
     require(!config.run_id.empty() && !config.workload_id.empty(), "missing run/workload identity");
+    require(!config.terminal_lm_head_metrics_only || config.workload_id == "METRIC_PREFILL_256",
+            "terminal lm_head elision is limited to the METRIC_PREFILL_256 metric workload");
     require(config.manifest_sha256.size() == 64 &&
             config.manifest_sha256.find_first_not_of("0123456789abcdef") == std::string::npos,
             "validated manifest SHA256 required");
@@ -365,6 +368,17 @@ std::shared_ptr<Invocation> Session::invocation(const std::string &layer, size_t
 void Session::ensure_healthy() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->check();
+}
+bool Session::terminal_lm_head_metrics_only() const { return impl_->config.terminal_lm_head_metrics_only; }
+void Session::terminal_lm_head_elided() {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->check();
+    require(impl_->config.terminal_lm_head_metrics_only, "terminal lm_head elided outside a metric-only session");
+    ++impl_->terminal_elisions;
+}
+uint64_t Session::terminal_lm_head_elisions() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->terminal_elisions;
 }
 void Session::finish(bool success) {
     std::lock_guard<std::mutex> lock(impl_->mutex);

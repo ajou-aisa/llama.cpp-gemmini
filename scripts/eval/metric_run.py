@@ -165,6 +165,17 @@ COMBINED_SINKS: Final = {"activation": ("--activation-output", "activation-quant
                          "scu": ("--scale-output", "scale-alignment-aggregate.jsonl")}
 # The native workload fields a shard owns; every other field is identical in all shards of one collection.
 SHARD_FIELDS: Final = ("first_chunk", "selected_chunks", "chunks")
+# How the combined collection runs the terminal lm_head. "metrics-only" observes it completely (activation, residual,
+# SCU) but never computes its numerical result, the logits, which no metric and no later layer reads.
+TERMINAL_LM_HEAD_MODES: Final = ("full", "metrics-only")
+
+
+def metric_execution(terminal_lm_head: str) -> Record:
+    """Provenance of how the terminal lm_head was run; part of a combined run's binding and reuse identity."""
+    elided = terminal_lm_head == "metrics-only"
+    return {"terminal_lm_head": terminal_lm_head, "lm_head_observation": "full",
+            "lm_head_numerical_gemm": "elided" if elided else "executed", "logits_materialized": not elided,
+            **({"reason": "terminal output not consumed by the metric-only prefill"} if elided else {})}
 STREAM_SCHEMAS: Final = {"activation": "im2p-activation-quant-metrics", "residual": "im2p-residual-path-metrics"}
 
 
@@ -283,12 +294,14 @@ def merge_workloads(workloads: list[Record]) -> Record:
 
 def collect_combined(binary: Path, model: Path, dataset: Path, manifest_path: Path, output: Path, max_chunks: int,
                      workers: int, threads: int, threads_batch: int, timeout: int,
-                     reuse: Path | None = None) -> tuple[dict[str, list[Path]], Record]:
+                     reuse: Path | None = None, terminal_lm_head: str = "full") -> tuple[dict[str, list[Path]], Record]:
     """Activation, residual and aggregate SCU from one forward: the runner's chunk population split into contiguous
     shards that run as parallel processes with every sink on, each validated like a single collection, then joined
     into one workload binding. `reuse` is the collection of an earlier unfinished attempt whose finished shards are
-    linked instead of run again. Returns the shard streams of each metric kind and that binding."""
+    linked instead of run again; a shard of the other terminal lm_head mode never is (its command differs).
+    Returns the shard streams of each metric kind and that binding."""
     require(max_chunks >= 0 and min(workers, threads, threads_batch, timeout) > 0, "invalid combined collection")
+    require(terminal_lm_head in TERMINAL_LM_HEAD_MODES, "invalid terminal lm_head mode")
     binary, model, dataset = (path.resolve(strict=True) for path in (binary, model, dataset))
     clean_environment()
     info = compiled_info(binary)
@@ -318,7 +331,7 @@ def collect_combined(binary: Path, model: Path, dataset: Path, manifest_path: Pa
                 "--workload", "METRIC_PREFILL_256", "--first-chunk", str(first), "--max-chunks", str(count),
                 "--threads", str(threads), "--threads-batch", str(threads_batch), "--batch-size", "256",
                 "--ubatch-size", "256", "--run-id", directory.name, "--manifest-sha256", manifest.sha256,
-                "--seed", str(manifest.seed), "--scale-mode", "aggregate"]
+                "--seed", str(manifest.seed), "--scale-mode", "aggregate", "--terminal-lm-head", terminal_lm_head]
         for option, filename in COMBINED_SINKS.values():
             argv.extend([option, str(directory / filename)])
         planned.append((argv, directory))
@@ -361,6 +374,15 @@ def collect_combined(binary: Path, model: Path, dataset: Path, manifest_path: Pa
                 "metric shard chunk coverage differs from its plan: " + directory.name)
         require((integer(workload, "threads", 1), integer(workload, "threads_batch", 1)) == (threads, threads_batch),
                 "metric shard thread settings differ from the request")
+        # The logits of a metrics-only shard were never computed: by intent, once per chunk's lm_head.
+        elided = terminal_lm_head == "metrics-only"
+        require(workload.get("terminal_lm_head") == terminal_lm_head and
+                workload.get("lm_head_numerical_execution") is (not elided) and
+                workload.get("logits_materialized") is (not elided) and
+                all((record(row).get("logits_materialized") is False and
+                     integer(record(row), "lm_head_numerical_elisions") >= 1) if elided else
+                    "lm_head_numerical_elisions" not in record(row) for row in rows),
+                "metric shard terminal lm_head execution differs from the request: " + directory.name)
         workloads.append(workload)
     merged = merge_workloads(workloads)
     rows = merged["chunks"]
@@ -380,6 +402,7 @@ def collect_combined(binary: Path, model: Path, dataset: Path, manifest_path: Pa
                        "coverage": "FULL_COMPLETE_CHUNKS" if max_chunks == 0 else "BOUNDED_CHUNK_SUBSET",
                        "requested_max_chunks": max_chunks, "threads": threads, "threads_batch": threads_batch,
                        "workers": len(shards), "native_seconds": native_seconds,
+                       "metric_execution": metric_execution(terminal_lm_head),
                        "reused_shards": {directory.name: source for directory, source in reused.items()}})
     write_json(output / "workload-binding.json", identities)
     return {kind: [directory / name for _, directory in planned] for kind, (_, name) in COMBINED_SINKS.items()}, identities

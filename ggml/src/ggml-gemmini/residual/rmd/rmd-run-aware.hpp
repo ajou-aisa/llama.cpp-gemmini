@@ -84,5 +84,10 @@ RmdStatus build_run_aware_request(const ggml_gemmini_args_t &args,
 RmdStatus build_run_aware_request(const ggml_gemmini_args_t &args,
                                   const StripePacket &packet,
                                   RunAwareRequest &out);
+// The same request without operands: runs, active rows, M/N/K and tiling are exactly those of
+// build_run_aware_request, while activations, weights and carriers stay empty. Transactional like it.
+RmdStatus build_run_aware_geometry(const ggml_gemmini_args_t &args,
+                                   const StripePacket &packet,
+                                   RunAwareRequest &out);
 
 } // namespace ggml::gemmini::rmd

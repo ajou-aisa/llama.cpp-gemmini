@@ -1553,6 +1553,71 @@ execute_block_correction(const ggml_gemmini_args_t &args,
     return RmdStatus::success;
 }
 
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) ||                        \
+    defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
+// DIM-padded physical fragments of a run-aware request: M tiles x N tiles x the compact-K fragments of its runs.
+static RmdStatus run_aware_physical_fragments(const RunAwareRequest &request,
+                                              size_t &fragment_count,
+                                              size_t &physical_fragments) {
+  fragment_count = 0;
+  for (const RunAwareRun &run : request.runs)
+    if (__builtin_add_overflow(fragment_count,
+                               (run.compact_k_count + kArrayDim - 1) / kArrayDim,
+                               &fragment_count))
+      return RmdStatus::overflow;
+  const size_t m_tiles = (request.m + kArrayDim - 1) / kArrayDim;
+  const size_t n_tiles = (request.n + kArrayDim - 1) / kArrayDim;
+  if (__builtin_mul_overflow(m_tiles, n_tiles, &physical_fragments) ||
+      __builtin_mul_overflow(physical_fragments, fragment_count,
+                             &physical_fragments))
+    return RmdStatus::overflow;
+  return RmdStatus::success;
+}
+
+// Evaluation observations of one run-aware residual packet: its compact work and its residual SCU alignments.
+// Both read the request geometry only, never its operands or the GEMM result.
+static RmdStatus observe_run_aware_packet(const ggml_gemmini_args_t &args,
+                                          const StripePacket &packet,
+                                          const RunAwareRequest &request,
+                                          size_t physical_fragments) {
+#if GGML_GEMMINI_RESIDUAL_METRICS
+  if (args.evaluation_context) {
+    try {
+      std::vector<evaluation::Run> runs;
+      std::vector<evaluation::Row> rows;
+      for (const auto &run : request.runs)
+        runs.push_back({run.original_block_id, run.union_k_mask,
+                        run.compact_k_begin, run.compact_k_count});
+      for (const auto &row : request.rows)
+        rows.push_back({row.original_lane_id, row.source_row});
+      args.evaluation_context->compact_work(packet.stripe_id, request.m, request.n,
+          request.k, request.original_k, request.tile_i, request.tile_j, request.tile_k,
+          runs, rows, packet.required_planes, physical_fragments);
+    } catch (...) {
+      return RmdStatus::execution_failed;
+    }
+  }
+#endif
+#if GGML_GEMMINI_SCALE_METRICS
+  if (args.evaluation_context && args.evaluation_context->scale_enabled()) {
+    try {
+      const auto plan = wroute::resolve_weight_route_plan(args, wroute::WeightScaleInfoMode::ResidualHp1Scu);
+      for (const auto &run : request.runs)
+        evaluation::observe_scu_block(args, plan, packet.stripe_id, evaluation::ScaleWorkType::Residual,
+            run.original_block_id, request.m, (run.compact_k_count + kArrayDim - 1) / kArrayDim);
+    } catch (...) {
+      return RmdStatus::execution_failed;
+    }
+  }
+#endif
+  (void)args;
+  (void)packet;
+  (void)request;
+  (void)physical_fragments;
+  return RmdStatus::success;
+}
+#endif
+
 static RmdStatus execute_rmd_stripe_im2p_run_aware(
     im2p_sim_t *sim, const ggml_gemmini_args_t &args,
     const StripePacket &packet, Correction &output,
@@ -1695,27 +1760,22 @@ static RmdStatus execute_rmd_stripe_im2p_run_aware(
   size_t gathered_values = 0;
   size_t address_resolutions = 0;
   size_t fragment_count = 0;
-  if (__builtin_mul_overflow(request.k, request.n, &gathered_values))
+  size_t physical_fragments = 0;
+  if (__builtin_mul_overflow(request.k, request.n, &gathered_values) ||
+      run_aware_physical_fragments(request, fragment_count,
+                                   physical_fragments) != RmdStatus::success)
     return RmdStatus::overflow;
   for (const RunAwareRun &run : request.runs) {
-    const size_t fragments =
-        (run.compact_k_count + kArrayDim - 1) / kArrayDim;
     size_t run_resolutions = 0;
-    if (__builtin_add_overflow(fragment_count, fragments, &fragment_count) ||
-        __builtin_mul_overflow(fragments, request.n, &run_resolutions) ||
+    if (__builtin_mul_overflow((run.compact_k_count + kArrayDim - 1) / kArrayDim,
+                               request.n, &run_resolutions) ||
         __builtin_add_overflow(address_resolutions, run_resolutions,
                                &address_resolutions))
       return RmdStatus::overflow;
   }
-  const size_t m_tiles = (request.m + kArrayDim - 1) / kArrayDim;
-  const size_t n_tiles = (request.n + kArrayDim - 1) / kArrayDim;
-  size_t physical_fragments = 0;
   size_t mac_capacity = 0;
   size_t dim_cube = 0;
-  if (__builtin_mul_overflow(m_tiles, n_tiles, &physical_fragments) ||
-      __builtin_mul_overflow(physical_fragments, fragment_count,
-                             &physical_fragments) ||
-      __builtin_mul_overflow(kArrayDim, kArrayDim, &dim_cube) ||
+  if (__builtin_mul_overflow(kArrayDim, kArrayDim, &dim_cube) ||
       __builtin_mul_overflow(dim_cube, kArrayDim, &dim_cube) ||
       __builtin_mul_overflow(physical_fragments, dim_cube, &mac_capacity))
     return RmdStatus::overflow;
@@ -1739,36 +1799,10 @@ static RmdStatus execute_rmd_stripe_im2p_run_aware(
   staged_metrics.im2p_stats = stats.stats;
 
   Correction staged_output = std::move(final);
-#if GGML_GEMMINI_RESIDUAL_METRICS
-  if (args.evaluation_context) {
-    try {
-      std::vector<evaluation::Run> runs;
-      std::vector<evaluation::Row> rows;
-      for (const auto &run : request.runs)
-        runs.push_back({run.original_block_id, run.union_k_mask,
-                        run.compact_k_begin, run.compact_k_count});
-      for (const auto &row : request.rows)
-        rows.push_back({row.original_lane_id, row.source_row});
-      args.evaluation_context->compact_work(packet.stripe_id, request.m, request.n,
-          request.k, request.original_k, request.tile_i, request.tile_j, request.tile_k,
-          runs, rows, packet.required_planes, physical_fragments);
-    } catch (...) {
-      return RmdStatus::execution_failed;
-    }
-  }
-#endif
-#if GGML_GEMMINI_SCALE_METRICS
-  if (args.evaluation_context && args.evaluation_context->scale_enabled()) {
-    try {
-      const auto plan = wroute::resolve_weight_route_plan(args, wroute::WeightScaleInfoMode::ResidualHp1Scu);
-      for (const auto &run : request.runs)
-        evaluation::observe_scu_block(args, plan, packet.stripe_id, evaluation::ScaleWorkType::Residual,
-            run.original_block_id, request.m, (run.compact_k_count + kArrayDim - 1) / kArrayDim);
-    } catch (...) {
-      return RmdStatus::execution_failed;
-    }
-  }
-#endif
+  const RmdStatus observed =
+      observe_run_aware_packet(args, packet, request, physical_fragments);
+  if (observed != RmdStatus::success)
+    return observed;
 #if CYCLE_SIM && defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
   if (event_context) {
     im2p::gemmini::cycle_sim::HostStageScope cycle_publication(
@@ -1998,6 +2032,44 @@ RmdStatus execute_rmd_stripe_im2p_with_weights(im2p_sim_t *sim,
   const auto &plan = weights.route_plan(args);
   return execute_rmd_stripe_im2p_correction(
       sim, args, packet, correction, metrics, &plan, nullptr);
+}
+
+RmdStatus observe_rmd_stripe_im2p(const ggml_gemmini_args_t &args,
+                                  const StripePacket &packet) {
+#if (defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM) ||                       \
+     defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)) &&                     \
+    (CYCLE_SIM || defined(IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1) ||              \
+     defined(IM2P_FPGA_ARCH_GEMMINI_HP1))
+  // The gates under which execute_rmd_stripe_im2p_correction takes the run-aware route.
+  const wroute::WeightRoutePlan plan = wroute::resolve_weight_route_plan(
+      args, wroute::WeightScaleInfoMode::ResidualHp1Scu);
+  RmdStatus status = compact_plan_status(args, plan);
+  if (status == RmdStatus::success)
+    status = validate_execution_request(args, packet);
+  if (status != RmdStatus::success)
+    return status;
+  if (args.optrace_context ||
+      std::holds_alternative<quants::act::block::Meta>(args.act_quant.storage()) ||
+      plan.route != wroute::WeightRouteKind::HP1 || !plan.hp1_carriers ||
+      (packet.digit_bits != 4 && packet.digit_bits != 8) ||
+      packet.digit_bits != GGML_GEMMINI_ACTIVATION_BITS ||
+      plan.weight_bits != GGML_GEMMINI_WEIGHT_BITS ||
+      packet.digit_bits != plan.weight_bits)
+    return RmdStatus::unsupported_route;
+  RunAwareRequest request;
+  size_t fragment_count = 0;
+  size_t physical_fragments = 0;
+  status = build_run_aware_geometry(args, packet, request);
+  if (status == RmdStatus::success)
+    status = run_aware_physical_fragments(request, fragment_count, physical_fragments);
+  if (status != RmdStatus::success)
+    return status;
+  return observe_run_aware_packet(args, packet, request, physical_fragments);
+#else
+  (void)args;
+  (void)packet;
+  return RmdStatus::unsupported_route;
+#endif
 }
 } // namespace detail
 

@@ -19,3 +19,9 @@ target_compile_definitions(llama-eval-workload PRIVATE
     EVALUATION_GEMMINI=$<BOOL:${GGML_GEMMINI}>)
 target_link_libraries(llama-eval-workload PRIVATE common llama ggml-gemmini-utils)
 install(TARGETS llama-eval-workload RUNTIME)
+if(LLAMA_BUILD_TESTS)
+    add_test(NAME test-evaluation-terminal-lm-head
+        COMMAND ${CMAKE_COMMAND} -DRUNNER=$<TARGET_FILE:llama-eval-workload>
+            -DTEST_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/test-evaluation-terminal-lm-head
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/test-terminal-lm-head.cmake)
+endif()

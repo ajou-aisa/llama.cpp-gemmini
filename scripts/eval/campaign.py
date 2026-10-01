@@ -33,8 +33,10 @@ from eval_common import (
 sys.path.insert(0, str(REPO))
 from campaign_metrics import OUTPUT_FILENAMES, outputs
 from metric_run import (
+    TERMINAL_LM_HEAD_MODES,
     collect_combined,
     collect_metric,
+    metric_execution,
     parser_for,
     validate_metric_recipe,
 )
@@ -69,6 +71,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--reuse-shards", type=Path,
                         help=f"{COMBINED} only: collection/ of an unfinished attempt; its finished, valid shards of "
                              "this exact plan are hard-linked instead of run again")
+    result.add_argument("--terminal-lm-head", choices=TERMINAL_LM_HEAD_MODES,
+                        help=f"{COMBINED} only (default full): metrics-only observes the terminal lm_head completely "
+                             "but never computes its logits, which no metric and no later layer reads")
     result.add_argument("--jobs", type=int, default=4)
     result.add_argument("--timeout", type=int, default=1800)
     result.add_argument("--im2p", type=Path, default=REPO.parent / "IM2P.sim")
@@ -115,8 +120,9 @@ def run_campaign(args: argparse.Namespace) -> Path:
                 args.evidence_root, args.library)), "metric campaigns do not accept cycle-provider inputs")
     require(args.scu_mode is None or args.kind == "scu" or (args.kind == COMBINED and args.scu_mode == "aggregate"),
             f"--scu-mode applies to scu ({COMBINED} collects aggregate SCU only)")
-    require(args.kind == COMBINED or (args.workers, args.threads, args.threads_batch, args.reuse_shards) ==
-            (None, None, None, None), f"--workers, --threads, --threads-batch and --reuse-shards apply to {COMBINED} only")
+    require(args.kind == COMBINED or (args.workers, args.threads, args.threads_batch, args.reuse_shards,
+                                      args.terminal_lm_head) == (None, None, None, None, None),
+            f"--workers, --threads, --threads-batch, --reuse-shards and --terminal-lm-head apply to {COMBINED} only")
     require(args.kind != COMBINED or (args.workload_manifest, args.evaluation_manifest) == (None, None),
             f"{COMBINED} collects its three metrics from one workload; no shared manifests")
     started = time.monotonic()
@@ -200,9 +206,11 @@ def run_campaign(args: argparse.Namespace) -> Path:
         binding = read_json(output / "cycle-binding.json")
     elif args.kind == COMBINED:
         threads = args.threads or 1
+        terminal = args.terminal_lm_head or "full"
         raws, collected = collect_combined(runner, model, dataset, manifest_path, output / "collection", args.max_chunks,
                                            args.workers or 1, threads, args.threads_batch or threads, args.timeout,
-                                           args.reuse_shards.resolve(strict=True) if args.reuse_shards else None)
+                                           args.reuse_shards.resolve(strict=True) if args.reuse_shards else None,
+                                           terminal)
         workload = record(collected["workload"])
         raw_chunks = workload["chunks"]
         chunks = {integer(record(row), "chunk_id") for row in raw_chunks} if isinstance(raw_chunks, list) else set()
@@ -228,7 +236,7 @@ def run_campaign(args: argparse.Namespace) -> Path:
                         "collector_sha256": {source: sha256(REPO / source) for source in sources},
                         "threads": threads, "threads_batch": args.threads_batch or threads,
                         "workers": collected["workers"], "reused_shards": collected["reused_shards"],
-                        "timing": timing})
+                        "metric_execution": metric_execution(terminal), "timing": timing})
     else:
         recipe = "scale" if args.kind == "scu" else args.kind
         validate_metric_recipe(info, recipe)

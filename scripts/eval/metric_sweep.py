@@ -13,7 +13,9 @@
 
 Combined collection (default): per configuration one `campaign.py metrics-all` process; one build per precision x
 DIM with all three metric sinks serves both models, the runner's chunk population is split into --workers contiguous
-shards that run in parallel, and the unchanged reducers reduce the shard streams as one stream. Separate collection
+shards that run in parallel, and the unchanged reducers reduce the shard streams as one stream. By default the
+combined collection runs the terminal lm_head metrics-only (--terminal-lm-head): observed completely, its logits never
+computed; --terminal-lm-head full computes them as before. Separate collection
 (--collection separate): one unchanged `campaign.py KIND` run per metric kind, the activation run being the workload
 anchor of residual and SCU. Either way the sweep only reads the finished runs: it checks their shared identity (and
 the chunk population across DIMs) and writes metric-summary.json, metric-summary.csv and the stdout tables. It
@@ -90,6 +92,7 @@ class Sweep:
     collection: str = "combined"  # combined: one forward per configuration; separate: one per metric kind
     threads: int = 1
     threads_batch: int = 1
+    terminal_lm_head: str = "full"  # combined: "metrics-only" observes the lm_head but never computes the logits
 
     def configurations(self) -> list[Config]:
         return [(model, precision, dim) for model in self.models for precision in self.precisions for dim in self.dims]
@@ -107,7 +110,7 @@ class Sweep:
                 "dims": list(self.dims), "max_chunks": self.max_chunks, "seed": self.seed,
                 "dataset_manifest": self.dataset_manifest, "im2p": self.im2p, "build_cache": self.build_cache,
                 "scu_mode": self.scu_mode, "collection": self.collection, "threads": self.threads,
-                "threads_batch": self.threads_batch}
+                "threads_batch": self.threads_batch, "terminal_lm_head": self.terminal_lm_head}
 
 
 def subset(given: str | None, allowed: tuple[str, ...], option: str) -> tuple[str, ...]:
@@ -134,17 +137,20 @@ def recorded(root: Path) -> Sweep:
                  tuple(int(dim) for dim in subset(lists["dims"], DIMS, "dims")), integer(value, "max_chunks"),
                  integer(value, "seed"), dataset if isinstance(dataset, str) else None, text(value, "im2p"),
                  text(value, "build_cache"),
-                 # Sweeps recorded before SCU modes and combined collection: detailed, separate, one thread.
+                 # Sweeps recorded before SCU modes, combined collection and terminal modes: detailed, separate, one
+                 # thread, the lm_head computed in full.
                  str(value.get("scu_mode", "detailed")), str(value.get("collection", "separate")),
                  integer(value, "threads", 1) if "threads" in value else 1,
-                 integer(value, "threads_batch", 1) if "threads_batch" in value else 1)
+                 integer(value, "threads_batch", 1) if "threads_batch" in value else 1,
+                 str(value.get("terminal_lm_head", "full")))
 
 
 def resolve(args: argparse.Namespace) -> tuple[Sweep, Path | None]:
     """(sweep, its directory); --resume takes everything that defines results from the recorded sweep."""
     if args.resume is not None:
         given = [option for option in ("models", "precisions", "dims", "max_chunks", "seed", "dataset_manifest",
-                                        "im2p", "build_cache", "scu_mode", "collection", "threads", "threads_batch")
+                                        "im2p", "build_cache", "scu_mode", "collection", "threads", "threads_batch",
+                                        "terminal_lm_head")
                  if getattr(args, option) is not None]
         require(not given, "--resume uses the recorded matrix and options; remove --" +
                 ", --".join(option.replace("_", "-") for option in given))
@@ -156,13 +162,16 @@ def resolve(args: argparse.Namespace) -> tuple[Sweep, Path | None]:
                   str(args.dataset_manifest.resolve(strict=True)) if args.dataset_manifest is not None else None,
                   str((args.im2p or REPO.parent / "IM2P.sim").resolve(strict=True)),
                   str((args.build_cache or Path("runs/.build-cache")).resolve()), args.scu_mode or "aggregate",
-                  args.collection or "combined", args.threads or 1, args.threads_batch or args.threads or 1)
+                  args.collection or "combined", args.threads or 1, args.threads_batch or args.threads or 1,
+                  args.terminal_lm_head or ("full" if args.collection == "separate" else "metrics-only"))
     require(sweep.max_chunks >= 0 and 0 <= sweep.seed < 4294967295, "invalid --max-chunks or --seed")
     require(sweep.threads > 0 and sweep.threads_batch > 0, "invalid --threads or --threads-batch")
     require(sweep.collection == "separate" or sweep.scu_mode == "aggregate",
             "the combined collection collects aggregate SCU; detailed SCU needs --collection separate")
     require(sweep.collection == "combined" or (sweep.threads, sweep.threads_batch) == (1, 1),
             "--threads and --threads-batch apply to the combined collection")
+    require(sweep.collection == "combined" or sweep.terminal_lm_head == "full",
+            "--terminal-lm-head metrics-only applies to the combined collection")
     # One detailed SCU chunk is ~25M records / ~330 MB (GPT-2 A8W8 DIM 32); the full corpus is ~1118 chunks.
     require(sweep.scu_mode == "aggregate" or sweep.max_chunks != 0 or args.allow_large_raw_scu,
             "Refusing full-corpus detailed SCU collection. Use --scu-mode aggregate or explicitly acknowledge "
@@ -187,7 +196,8 @@ def campaign_argv(sweep: Sweep, config: Config, kind: str, build: str, anchor: s
     if kind in ("scu", COMBINED):
         argv += ["--scu-mode", sweep.scu_mode]
     if kind == COMBINED:
-        argv += ["--workers", str(workers), "--threads", str(sweep.threads), "--threads-batch", str(sweep.threads_batch)]
+        argv += ["--workers", str(workers), "--threads", str(sweep.threads), "--threads-batch", str(sweep.threads_batch),
+                 "--terminal-lm-head", sweep.terminal_lm_head]
     if sweep.dataset_manifest is not None:
         argv += ["--dataset-manifest", sweep.dataset_manifest]
     if anchor is not None:  # the activation run's exact manifest bytes and native chunk identity
@@ -205,7 +215,8 @@ def dry_run(sweep: Sweep, root: Path | None, timeout: int, workers: int = 1) -> 
                                                                   f" from {collections} combined collections"),
              f"{len(sweep.builds())} build configurations",
              f"collection = {sweep.collection}" + ("" if sweep.collection == "separate" else
-                f" (threads = {sweep.threads}, threads_batch = {sweep.threads_batch}, workers = {workers})"),
+                f" (threads = {sweep.threads}, threads_batch = {sweep.threads_batch}, workers = {workers}, "
+                f"terminal lm_head = {sweep.terminal_lm_head})"),
              "models = " + ", ".join(sweep.models), "precisions = " + ", ".join(sweep.precisions),
              "DIMs = " + ", ".join(map(str, sweep.dims)), f"max_chunks = {sweep.max_chunks}" +
              (" (all complete chunks)" if sweep.max_chunks == 0 else ""), f"seed = {sweep.seed}",
@@ -366,9 +377,14 @@ def configuration(root: Path, sweep: Sweep, config: Config, runs: dict[str, Path
                 "combined run was collected or reduced by other collector/reducer sources")
         require((binding.get("threads"), binding.get("threads_batch")) == (sweep.threads, sweep.threads_batch),
                 "combined run used other thread settings")
+        # Runs collected before terminal modes computed the lm_head in full.
+        execution = binding.get("metric_execution") or {"terminal_lm_head": "full"}
+        require(isinstance(execution, dict) and execution.get("terminal_lm_head") == sweep.terminal_lm_head,
+                f"combined run ran the terminal lm_head in another mode than {sweep.terminal_lm_head}")
         shards = read_json(runs["scu"] / "collection/shards.json").get("shards")
         collection.update({"threads": sweep.threads, "threads_batch": sweep.threads_batch,
-                           "workers": binding.get("workers"), "timing": binding.get("timing"), "shards": shards})
+                           "workers": binding.get("workers"), "metric_execution": execution,
+                           "timing": binding.get("timing"), "shards": shards})
     return {"model": model, "precision": precision, "dim": dim, "shared_identity": anchor, "builds": builds_used,
             "collection": collection, "runs": {kind: str(results[kind].relative_to(root)) for kind in KINDS},
             "summary_sha256": {kind: sha256(results[kind] / "summary.json") for kind in KINDS},
@@ -505,6 +521,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--threads-batch", type=int, help="combined: runner batch threads (default --threads; recorded)")
     result.add_argument("--workers", type=int, default=1,
                         help="combined: parallel contiguous chunk shards per configuration, merged exactly (default 1)")
+    result.add_argument("--terminal-lm-head", choices=("metrics-only", "full"),
+                        help="combined (default metrics-only): observe the terminal lm_head completely without "
+                             "computing its logits, which no metric reads; full computes them (recorded)")
     result.add_argument("--allow-large-raw-scu", action="store_true",
                         help="accept detailed SCU collection of the full corpus (hundreds of GB of raw output)")
     target = result.add_mutually_exclusive_group()
@@ -553,7 +572,8 @@ def main(argv: list[str] | None = None) -> int:
                        "native_collections": len(sweep.configurations()) * len(sweep.collections()),
                        "passed_configurations": len(passed)},
             "collection": {"mode": sweep.collection, "threads": sweep.threads, "threads_batch": sweep.threads_batch,
-                           "workers": args.workers}, "build_timing": build_timing,
+                           "workers": args.workers, "terminal_lm_head": sweep.terminal_lm_head},
+            "build_timing": build_timing,
             "configurations": [*passed], "failures": [*failures], "dim_identity": [*identity],
             "csv": "metric-summary.csv", "aggregation": "copied from each run's summary.json; nothing recomputed"}
         write_json(root / "metric-summary.json", summary)

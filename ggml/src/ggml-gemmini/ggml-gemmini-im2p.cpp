@@ -1418,10 +1418,13 @@ static WeightFamily concrete_weight_family(
 
 // FULL owns this synchronous post-fence path. Unlike the compatibility matmul
 // facade, it keeps one compact simulator alive across every canonical packet.
+// `observe_only` (evaluation only, metric-only terminal lm_head): the same canonical stripes, but each residual
+// packet is only observed; no simulator, no residual GEMM and no output exist.
 static Result apply_captured_rmd_full(
     const ggml_gemmini_args_t &runtime_args, float *output_data,
     size_t output_elements, const std::vector<CapturedExsiaStripe> &captured,
-    ::im2p::gemmini::ResidualStripeStats &result_stats) noexcept {
+    ::im2p::gemmini::ResidualStripeStats &result_stats,
+    bool observe_only = false) noexcept {
 #if CYCLE_SIM
   std::vector<uint64_t> packet_work_ids;
   ::im2p::gemmini::cycle_sim::WorkCollector packet_collector(packet_work_ids, true);
@@ -1444,8 +1447,8 @@ static Result apply_captured_rmd_full(
     rmd_args = std::make_unique<ggml_gemmini_args_t>(runtime_args);
     rmd_args->f_out = output_data;
     size_t output_extent = 0;
-    if (!checked_output_extent(*rmd_args, output_extent) ||
-        output_extent > output_elements) {
+    if (!observe_only && (!checked_output_extent(*rmd_args, output_extent) ||
+                          output_extent > output_elements)) {
       return {Error::invalid_contract,
               "FULL RMD staging does not cover the output layout", false};
     }
@@ -1512,7 +1515,7 @@ static Result apply_captured_rmd_full(
     }
   };
   std::unique_ptr<im2p_sim_t, SimulatorDeleter> simulator;
-  if (has_packet) {
+  if (has_packet && !observe_only) {
 #if defined(GGML_GEMMINI_TESTING)
     if (failure == TestFailure::simulator_create) {
       return {Error::out_of_memory,
@@ -1543,6 +1546,18 @@ static Result apply_captured_rmd_full(
     const size_t required_begin = ::im2p::gemmini::cycle_sim::work_count();
 #endif
     const auto &event = captured_stripe->event;
+    if (observe_only) {
+      if (event.direct_residual != nullptr)
+        return {Error::unsupported_route,
+                "metric-only lm_head observes packet residuals only", false};
+      if (event.rmd_packet != nullptr) {
+        const rmd::RmdStatus observed =
+            rmd::detail::observe_rmd_stripe_im2p(*rmd_args, *event.rmd_packet);
+        if (observed != rmd::RmdStatus::success)
+          return from_rmd_status(observed);
+      }
+      continue;
+    }
     rmd::Correction correction = rmd::BlockScaledInt64Correction{};
     rmd::RmdExecutionMetrics metrics{};
 #if LOG_CYCLE
@@ -2098,7 +2113,11 @@ class ExsiaFullExecution::Impl {
 public:
   explicit Impl(ggml_gemmini_args_t &source)
       : args(source), runtime_args(source), worker_timing(source),
-        sink{this, &Impl::on_ready} {}
+        sink{this, &Impl::on_ready} {
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
+    metric_terminal_only = source.metric_terminal_only;
+#endif
+  }
 
   ~Impl() {
     if (args.exsia_stripe_ready_sink == &sink) {
@@ -2214,6 +2233,8 @@ public:
   bool sink_installed = false;
   bool fenced = false;
   bool finished = false;
+  // Evaluation only: observe this terminal lm_head, never compute or write its output.
+  bool metric_terminal_only = false;
 };
 
 ExsiaFullExecution::ExsiaFullExecution(std::unique_ptr<Impl> impl) noexcept
@@ -2258,7 +2279,8 @@ start_exsia_full_execution(ggml_gemmini_args_t &args) noexcept {
   std::unique_ptr<ExsiaFullExecution::Impl> impl;
   try {
     impl = std::make_unique<ExsiaFullExecution::Impl>(args);
-    impl->staged_output.assign(output_extent, 0.0f);
+    if (!impl->metric_terminal_only)  // a metric-only lm_head has no output to stage
+      impl->staged_output.assign(output_extent, 0.0f);
     impl->captured.reserve(geometry.stripe_count);
   } catch (const std::bad_alloc &) {
     return {{Error::out_of_memory,
@@ -2295,6 +2317,34 @@ Completion ExsiaFullExecution::finish(bool quantization_succeeded) noexcept {
   if (!quantization_succeeded) {
     return {{Error::execution_failure, "ExSIA quantization failed", false}, {}};
   }
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
+  if (impl_->metric_terminal_only) {
+    // Evaluation only, metric-only terminal lm_head. Quantization above observed the activation, its main and
+    // radix stripes and the dense SCU alignments; each residual packet is observed here from its run-aware
+    // geometry. The main GEMM, the residual GEMM, their reconstruction and the output (the logits) are not
+    // executed: no metric and no later layer reads them.
+    if (!impl_->args.evaluation_context)
+      return {{Error::invalid_state, "metric-only lm_head without a metric invocation", false}, {}};
+    ::im2p::gemmini::ResidualStripeStats observed_stats{};
+    const Result observed = apply_captured_rmd_full(
+        impl_->args, nullptr, 0, impl_->captured, observed_stats, true);
+    if (!observed.ok())
+      return {observed, {}};
+    try {
+      const auto session = evaluation::active_session();
+      if (!session)
+        return {{Error::invalid_state, "metric-only lm_head without a metric session", false}, {}};
+      session->terminal_lm_head_elided();
+    } catch (...) {
+      return {{Error::execution_failure, "metric-only lm_head elision not recorded", false}, {}};
+    }
+    Completion completion{};
+    completion.semantic_completion_count = impl_->captured.size();
+    if (!impl_->captured.empty())
+      completion.run_id = impl_->captured.front().event.run_id;
+    return completion;
+  }
+#endif
 
   HostCpuInterval preparation(impl_->args, "im2p.host_input_preparation", HostIntervalAccounting::cpu_work);
   impl_->runtime_args = impl_->args;

@@ -151,15 +151,29 @@ semantics: it runs `campaign.py` and only reads finished runs (`metric_sweep.py`
   set the runner threads per shard (recorded; part of the native workload identity). `manifest.json` records the
   threads, workers, shards, collector and reducer SHA-256 and the stage timing (`native_collection`,
   `<kind>_reduce`, `total`); `collection/shards.json` the per-shard wall seconds and peak RSS.
+- Terminal lm_head (`--terminal-lm-head metrics-only|full`, combined collection only; default `metrics-only` for
+  `metric all`, `full` for `campaign.py metrics-all`). Metric-only prefills execute all transformer layers
+  numerically. For the terminal lm_head, the runner performs the complete PoTal quantization, residual-construction
+  and SCU-alignment observation path, but omits the final numerical main/residual GEMMs because the resulting logits
+  are not consumed by any metric or subsequent layer: the lm_head is included in all reported metrics, its numerical
+  logits are not materialized. The runner allows this only for a `METRIC_PREFILL_256` collection with metric sinks
+  on the IM2P_SIM ExSIA FULL WS route, and fails a chunk unless exactly its logits-producing lm_head was elided;
+  `workload.json` records `terminal_lm_head`, `logits_materialized: false`, a null `logits_fingerprint` and
+  `lm_head_numerical_elisions` per chunk, and `manifest.json` records `metric_execution`. Every activation, residual
+  and SCU record equals `--terminal-lm-head full` byte for byte. The mode is recorded in the sweep and part of the
+  resume identity: a resumed sweep keeps it, and runs or shards of the other mode are never reused.
 - Separate collection (`--collection separate`): one build per metric kind × precision × DIM (18) and one
   `campaign.py activation|residual|scu` run per metric; the activation run is the workload anchor whose
   `evaluation_manifest.json` (`--evaluation-manifest`) and `collection/workload-binding.json` (`--workload-manifest`)
   residual and SCU reuse. Detailed SCU (`--scu-mode detailed`) exists only here.
 - Choosing `--workers`/`--threads`: measured on an 18-core Apple M5 Pro (GPT-2 A8W8 DIM 32, 32 chunks), a metric
   process uses about one core whatever `--threads` is (threads 1..16: 315-329 s), while shards scale: 1/2/4/8/16
-  workers took 324/171/93/52/32 s, and 16 to 24 workers saturate the host (72 chunks: 77/75/75 s). Peak RSS per
-  shard process is about 1.2 GB for GPT-2 and 4-5 GB for Llama-3.2-1B, so the useful worker count is bounded by
-  cores and by free memory.
+  workers took 324/171/93/52/32 s, and 16 to 24 workers saturate the host (72 chunks: 77/75/75 s). With the
+  lm_head computed in full, a Llama-3.2-1B shard peaks at 4-5 GB RSS (about 3.5 GB private, most of it the lm_head
+  GEMM buffers) and 8 workers already raise macOS memory pressure on a 48 GB host; with `--terminal-lm-head
+  metrics-only` a shard peaks at about 2.5 GB RSS (about 1 GB private; the GGUF mapping is shared), and Llama A8W8
+  DIM 32 over 48 chunks took 400/351/305/262 s with 7/8/10/12 workers without memory pressure or swap. The useful
+  worker count is bounded by cores and by free memory.
 - Builds come from `campaign_build.cached_llama_build` (`--build-cache`, default `runs/.build-cache`) and are passed as
   `campaign.py --prepared-build`; `<sweep>/builds/` links them, and a resumed sweep must resolve to the same builds.
 - Identity: the sweep requires the same model, dataset, tokenizer, precision, DIM, seed, chunk policy, native workload

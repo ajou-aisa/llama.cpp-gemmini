@@ -996,6 +996,18 @@ if((GGML_GEMMINI_ACT_QUANT_METRICS OR GGML_GEMMINI_RESIDUAL_METRICS OR GGML_GEMM
     add_test(NAME test-gemmini-evaluation-observer
         COMMAND ${CMAKE_COMMAND} -DTEST_BINARY=$<TARGET_FILE:test-gemmini-evaluation-observer>
             -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR} -P ${CMAKE_CURRENT_SOURCE_DIR}/test-evaluation-metric-sink.cmake)
+    if (GGML_GEMMINI_ACT_QUANT_METRICS AND GGML_GEMMINI_RESIDUAL_METRICS AND GGML_GEMMINI_SCALE_METRICS AND
+        GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
+        add_executable(test-gemmini-metric-terminal-elision test-gemmini-metric-terminal-elision.cpp)
+        target_link_libraries(test-gemmini-metric-terminal-elision PRIVATE ggml-base ggml-gemmini ggml-gemmini-utils)
+        target_compile_features(test-gemmini-metric-terminal-elision PRIVATE cxx_std_17)
+        target_compile_definitions(test-gemmini-metric-terminal-elision PRIVATE ${GGML_GEMMINI_RUNTIME_COMPILE_DEFS})
+        target_include_directories(test-gemmini-metric-terminal-elision PRIVATE ../ggml/src ../ggml/src/ggml-gemmini
+            ${IM2P_SIM_ROOT}/frontend/include ${IM2P_SIM_ROOT}/sim/include ${GEMMINI_SW_PATH} ${GEMMINI_SW_PATH}/include)
+        add_test(NAME test-gemmini-metric-terminal-elision
+            COMMAND $<TARGET_FILE:test-gemmini-metric-terminal-elision>
+                ${CMAKE_CURRENT_BINARY_DIR}/test-gemmini-metric-terminal-elision-output)
+    endif()
 endif()
 
 add_executable(test-gemmini-rmd-capture

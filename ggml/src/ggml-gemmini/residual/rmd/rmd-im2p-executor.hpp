@@ -103,6 +103,10 @@ RmdStatus execute_rmd_stripe_im2p_with_weights(
     im2p_sim_t *sim, const ggml_gemmini_args_t &args,
     const StripePacket &packet, Correction &correction,
     RmdWeightPreparation &weights, RmdExecutionMetrics *metrics = nullptr);
+// Evaluation only: the compact-work and residual SCU observations of one run-aware HP1 packet, from its
+// geometry alone. No operand is materialized and no residual GEMM runs.
+RmdStatus observe_rmd_stripe_im2p(const ggml_gemmini_args_t &args,
+                                  const StripePacket &packet);
 
 struct Im2pProviderStatsAggregate {
     RmdProviderStats stats{};

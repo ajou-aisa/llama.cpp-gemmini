@@ -310,6 +310,21 @@ namespace
         return layer;
     }
 
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
+    // Evaluation only: the lm_head of a metric-only session whose output is the graph's logits ("result_output",
+    // or "result_output-N"), which no later layer reads.
+    bool metric_terminal_only(const std::string &layer, const char *output) {
+        constexpr std::string_view logits = "result_output";
+        const std::string_view name = output ? output : "";
+        const std::string_view suffix = name.substr(std::min(name.size(), logits.size()));
+        const bool terminal = name.compare(0, logits.size(), logits) == 0 && (suffix.empty() ||
+            (suffix.size() > 1 && suffix[0] == '-' && suffix.find_first_not_of("0123456789", 1) == std::string_view::npos));
+        if (layer != "lm_head" || !terminal) return false;
+        const auto session = ggml::gemmini::evaluation::active_session();
+        return session && session->terminal_lm_head_metrics_only();
+    }
+#endif
+
     bool log_prepare_q8_0_rows_for_q8_h1_fail(const char * reason, const ggml_tensor * src, int64_t row = -1) {
         const int64_t ne0 = src ? src->ne[0] : -1;
         const int64_t ne1 = src ? src->ne[1] : -1;
@@ -1406,6 +1421,9 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.model_arch = ctx->model_arch.c_str();
     args.matmul_layer = resolve_backend_matmul_layer(
         ctx->model_arch, src0->name, src1->name, dst->name);
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
+    args.metric_terminal_only = metric_terminal_only(args.matmul_layer, dst->name);
+#endif
     if (auto trace = ggml::gemmini::optrace::current_context())
         args.optrace_context =
             std::make_shared<const ggml::gemmini::optrace::Context>(std::move(trace));
@@ -1693,6 +1711,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     const bool facade_full_dispatch =
         (full_requested || decode_full_dispatch) && !im2p_non_exsia &&
         !im2p_exsia && !fpga_dense;
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
+    if (args.metric_terminal_only && !(im2p_exsia && full_requested))
+        GGML_ABORT("Gemmini metric-only terminal lm_head requires the IM2P ExSIA FULL route");
+#endif
     const size_t pipeline_job_capacity = matmul_options.job_capacity;
     if (pipeline_requested && !exsia_pipeline_supported && !im2p_non_exsia && !fpga_dense) {
       ggml::gemmini::log::debug(

@@ -62,76 +62,101 @@ RmdStatus build_run_aware_request(const ggml_gemmini_args_t &args,
     return build_run_aware_request(args, *packet, out);
 }
 
-RmdStatus build_run_aware_request(const ggml_gemmini_args_t &args,
-                                  const StripePacket &packet,
-                                  RunAwareRequest &out) {
+namespace {
+
+// Validated route, runs, active rows, M/N/K and the production WS tiling of a packet: everything of its
+// request except the operands. `plan` is the HP1 weight route the operands are read through.
+RmdStatus build_geometry(const ggml_gemmini_args_t &args, const StripePacket &packet,
+                         wroute::WeightRoutePlan &plan, RunAwareRequest &staged) {
     if (validate_packet(packet) != RmdStatus::success)
         return RmdStatus::invalid_packet;
     if (args.J != packet.logical_j || args.K != packet.logical_k)
         return RmdStatus::invalid_arguments;
 
-    const wroute::WeightRoutePlan plan = wroute::resolve_weight_route_plan(
-        args, wroute::WeightScaleInfoMode::ResidualHp1Scu);
+    plan = wroute::resolve_weight_route_plan(args, wroute::WeightScaleInfoMode::ResidualHp1Scu);
     if (!plan.valid) return map_plan_status(plan);
     if (!plan.hp1_carriers || plan.route != wroute::WeightRouteKind::HP1)
         return RmdStatus::unsupported_route;
 
+    staged.operand_bits = packet.digit_bits;
+    staged.n = packet.logical_j;
+    staged.original_k = packet.logical_k;
+    staged.stripe_id = packet.stripe_id;
+    staged.source_row_begin = packet.row_begin;
+    staged.source_row_count = packet.row_count;
+    staged.runs.reserve(packet.blocks.size());
+
+    size_t compact_k = 0;
+    for (const BlockDescriptor &block : packet.blocks) {
+        RunAwareRun run;
+        run.original_block_id = block.block_id;
+        run.original_global_k_begin = block.global_k_begin;
+        run.compact_k_begin = compact_k;
+        run.compact_k_count = block.compact_k_count;
+        run.original_local_k.reserve(block.compact_k_count);
+        for (size_t index = 0; index < block.compact_k_count; ++index) {
+            const uint16_t local_k = packet.k_indices[block.k_index_offset + index];
+            run.original_local_k.push_back(local_k);
+            run.union_k_mask |= uint32_t{1} << local_k;
+        }
+        if (!checked_add(compact_k, block.compact_k_count, compact_k))
+            return RmdStatus::overflow;
+        staged.runs.push_back(std::move(run));
+    }
+    staged.k = compact_k;
+    if (staged.k == 0) return RmdStatus::invalid_packet;
+
+    if (packet.row_count > std::numeric_limits<uint32_t>::max())
+        return RmdStatus::overflow;
+    for (uint8_t lane_id = 0; lane_id < packet.lane_capacity; ++lane_id) {
+        for (size_t row = 0; row < packet.row_count; ++row) {
+            bool active = false;
+            for (const BlockDescriptor &block : packet.blocks) {
+                uint8_t position = 0;
+                if (!find_block_lane(block, lane_id, position)) continue;
+                for (size_t k = 0; k < block.compact_k_count; ++k) {
+                    int32_t digit = 0;
+                    const RmdStatus status = read_packet_digit(
+                        packet, block, position, row, k, digit);
+                    if (status != RmdStatus::success) return status;
+                    if (digit != 0) {
+                        active = true;
+                        break;
+                    }
+                }
+                if (active) break;
+            }
+            if (active)
+                staged.rows.push_back({lane_id, static_cast<uint32_t>(row)});
+        }
+    }
+    staged.m = staged.rows.size();
+    if (staged.m == 0) return RmdStatus::invalid_packet;
+
+    // Shape is final here. This is the sole tiling call of a request.
+    ggml_gemmini_args_t selected{};
+    selected.I = staged.m;
+    selected.J = staged.n;
+    selected.K = staged.k;
+    ggml::gemmini::gemmini_set_tile_ws(&selected);
+    if (selected.tile_I == 0 || selected.tile_J == 0 || selected.tile_K == 0)
+        return RmdStatus::overflow;
+    staged.tile_i = selected.tile_I;
+    staged.tile_j = selected.tile_J;
+    staged.tile_k = selected.tile_K;
+    return RmdStatus::success;
+}
+
+} // namespace
+
+RmdStatus build_run_aware_request(const ggml_gemmini_args_t &args,
+                                  const StripePacket &packet,
+                                  RunAwareRequest &out) {
     try {
         RunAwareRequest staged;
-        staged.operand_bits = packet.digit_bits;
-        staged.n = packet.logical_j;
-        staged.original_k = packet.logical_k;
-        staged.stripe_id = packet.stripe_id;
-        staged.source_row_begin = packet.row_begin;
-        staged.source_row_count = packet.row_count;
-        staged.runs.reserve(packet.blocks.size());
-
-        size_t compact_k = 0;
-        for (const BlockDescriptor &block : packet.blocks) {
-            RunAwareRun run;
-            run.original_block_id = block.block_id;
-            run.original_global_k_begin = block.global_k_begin;
-            run.compact_k_begin = compact_k;
-            run.compact_k_count = block.compact_k_count;
-            run.original_local_k.reserve(block.compact_k_count);
-            for (size_t index = 0; index < block.compact_k_count; ++index) {
-                const uint16_t local_k = packet.k_indices[block.k_index_offset + index];
-                run.original_local_k.push_back(local_k);
-                run.union_k_mask |= uint32_t{1} << local_k;
-            }
-            if (!checked_add(compact_k, block.compact_k_count, compact_k))
-                return RmdStatus::overflow;
-            staged.runs.push_back(std::move(run));
-        }
-        staged.k = compact_k;
-        if (staged.k == 0) return RmdStatus::invalid_packet;
-
-        if (packet.row_count > std::numeric_limits<uint32_t>::max())
-            return RmdStatus::overflow;
-        for (uint8_t lane_id = 0; lane_id < packet.lane_capacity; ++lane_id) {
-            for (size_t row = 0; row < packet.row_count; ++row) {
-                bool active = false;
-                for (const BlockDescriptor &block : packet.blocks) {
-                    uint8_t position = 0;
-                    if (!find_block_lane(block, lane_id, position)) continue;
-                    for (size_t k = 0; k < block.compact_k_count; ++k) {
-                        int32_t digit = 0;
-                        const RmdStatus status = read_packet_digit(
-                            packet, block, position, row, k, digit);
-                        if (status != RmdStatus::success) return status;
-                        if (digit != 0) {
-                            active = true;
-                            break;
-                        }
-                    }
-                    if (active) break;
-                }
-                if (active)
-                    staged.rows.push_back({lane_id, static_cast<uint32_t>(row)});
-            }
-        }
-        staged.m = staged.rows.size();
-        if (staged.m == 0) return RmdStatus::invalid_packet;
+        wroute::WeightRoutePlan plan;
+        const RmdStatus geometry = build_geometry(args, packet, plan, staged);
+        if (geometry != RmdStatus::success) return geometry;
 
         size_t activation_count = 0;
         size_t weight_count = 0;
@@ -201,18 +226,23 @@ RmdStatus build_run_aware_request(const ggml_gemmini_args_t &args,
             }
         }
 
-        // Shape is final here. This is the sole tiling call in the builder.
-        ggml_gemmini_args_t selected{};
-        selected.I = staged.m;
-        selected.J = staged.n;
-        selected.K = staged.k;
-        ggml::gemmini::gemmini_set_tile_ws(&selected);
-        if (selected.tile_I == 0 || selected.tile_J == 0 || selected.tile_K == 0)
-            return RmdStatus::overflow;
-        staged.tile_i = selected.tile_I;
-        staged.tile_j = selected.tile_J;
-        staged.tile_k = selected.tile_K;
+        out = std::move(staged);
+        return RmdStatus::success;
+    } catch (const std::bad_alloc &) {
+        return RmdStatus::allocation_failure;
+    } catch (const std::length_error &) {
+        return RmdStatus::overflow;
+    }
+}
 
+RmdStatus build_run_aware_geometry(const ggml_gemmini_args_t &args,
+                                   const StripePacket &packet,
+                                   RunAwareRequest &out) {
+    try {
+        RunAwareRequest staged;
+        wroute::WeightRoutePlan plan;
+        const RmdStatus geometry = build_geometry(args, packet, plan, staged);
+        if (geometry != RmdStatus::success) return geometry;
         out = std::move(staged);
         return RmdStatus::success;
     } catch (const std::bad_alloc &) {

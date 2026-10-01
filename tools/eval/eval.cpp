@@ -87,7 +87,7 @@ static int run(int argc, char ** argv) {
     std::string file, output, forced_file, workload = "METRIC_PREFILL_256";
     int max_chunks = 1, first_chunk = 0, smoke_generated_tokens = 0;
     bool seed_set = false, temp_set = false, chunk_index_set = false, cycle_trace = false;
-    bool first_chunk_set = false, plan_only = false;
+    bool first_chunk_set = false, plan_only = false, terminal_metrics_only = false;
     std::string evaluation_manifest_hash;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -104,6 +104,8 @@ static int run(int argc, char ** argv) {
                 "  --chunk-index N --forced-token-ids JSON --run-id ID --build-info\n"
                 "  --first-chunk N (METRIC_PREFILL_256 shard: first selected chunk; --max-chunks counts from it)\n"
                 "  --plan-only (METRIC_PREFILL_256: print the native chunk plan as JSON and exit; no output)\n"
+                "  --terminal-lm-head full|metrics-only (METRIC_PREFILL_256 metric collection: metrics-only observes\n"
+                "    the terminal lm_head completely but never computes its logits; default full)\n"
                 "  --smoke-generated-tokens 1 (CYCLE_SIM diagnostic; never an E2E campaign)\n"
                 "Native non-strided WikiText chunks, no warmup. Defaults: one chunk, batch/ubatch 256,\n"
                 "one thread. E2E requires chunk-index0..9; fixed greedy seed1234/temp0, EOS stopping disabled.\n"
@@ -142,6 +144,10 @@ static int run(int argc, char ** argv) {
             first_chunk_set = true;
         }
         else if (arg == "--max-chunks") max_chunks = value == "0" ? -1 : positive(value);
+        else if (arg == "--terminal-lm-head") {
+            if (value != "full" && value != "metrics-only") throw std::invalid_argument("--terminal-lm-head full|metrics-only");
+            terminal_metrics_only = value == "metrics-only";
+        }
         else if (arg == "--smoke-generated-tokens") smoke_generated_tokens = positive(value);
         else if (arg == "--batch-size") params.n_batch = positive(value);
         else if (arg == "--ubatch-size") params.n_ubatch = positive(value);
@@ -208,6 +214,22 @@ static int run(int argc, char ** argv) {
     if (chunk_index_set && first_chunk_set) throw std::invalid_argument("--chunk-index and --first-chunk are exclusive");
     if (plan_only && (generation || cycle_trace || forced_cost_only))
         throw std::invalid_argument("--plan-only describes the METRIC_PREFILL_256 chunk plan");
+    // Evaluation only: the logits of a metric-only prefill are read by no metric, so the terminal lm_head may stop
+    // after its observations. Never for generation, cycle traces, forced replays or builds without metrics.
+    if (terminal_metrics_only) {
+        const json build = build_info();
+        if (workload != "METRIC_PREFILL_256" || generation || cycle_trace || forced_cost_only ||
+            !(GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS))
+            throw std::invalid_argument("--terminal-lm-head metrics-only is limited to a METRIC_PREFILL_256 metric collection");
+        if (build["backend"] != "IM2P_SIM" || build["activation_mode"] != "EXSIA" ||
+            build["matmul_mode"] != "FULL" || build["rmd_backend"] != "WS")
+            throw std::invalid_argument("--terminal-lm-head metrics-only requires the IM2P_SIM ExSIA FULL WS route");
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
+        if (metric_config.activation_path.empty() && metric_config.residual_path.empty() &&
+            metric_config.scale_path.empty() && metric_config.scale_fd < 0)
+            throw std::invalid_argument("--terminal-lm-head metrics-only requires a metric sink");
+#endif
+    }
     if (generation) {
         if (!chunk_index_set || first_chunk_set || first_chunk > 9 || max_chunks != 1) {
             throw std::invalid_argument("E2E requires --chunk-index0..9 and --max-chunks1");
@@ -314,6 +336,7 @@ static int run(int argc, char ** argv) {
         ggml::gemmini::semantic::compiled_cpu_only_build() ? "full_cpu" : "unsupported";
 #if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
     metric_config.workload_id = workload;
+    metric_config.terminal_lm_head_metrics_only = terminal_metrics_only;
     auto metric_session = metrics::Session::start(metric_config);
 #endif
     std::unique_ptr<common_sampler, decltype(&common_sampler_free)> sampler(
@@ -355,6 +378,11 @@ static int run(int argc, char ** argv) {
         {"target_trace_collection_reason", cycle_trace ? "independent_prefill_cycle_campaign" : !generation ? "metric_statistics_only" :
             CYCLE_SIM ? "generation_target_collection" : "cycle_sim_disabled"},
         {"build", build_info()}, {"chunks", json::array()}, {"complete", false}};
+    if (!generation) {
+        result["terminal_lm_head"] = terminal_metrics_only ? "metrics-only" : "full";
+        result["lm_head_numerical_execution"] = !terminal_metrics_only;
+        result["logits_materialized"] = !terminal_metrics_only;
+    }
     manifest << result.dump(2) << '\n';
     manifest.flush();
     bool success = true;
@@ -392,6 +420,10 @@ static int run(int argc, char ** argv) {
             bool eos = false;
             uint64_t logits_hash = UINT64_C(14695981039346656037);
             size_t logits_values = 0;
+            uint64_t logits_decodes = 0;
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
+            const uint64_t elisions_before = metric_session ? metric_session->terminal_lm_head_elisions() : 0;
+#endif
             common_log_pause(common_log_main());
             const uint64_t t0 = now_ns();
             trace.request_start();
@@ -407,9 +439,12 @@ static int run(int argc, char ** argv) {
                 trace.prefill_batch_ready(part);
                 if (trace.decode(ctx, batch)) throw std::runtime_error("prefill decode failed");
                 if (!generation && outputs != 0) {
-                    const size_t count = size_t(outputs) * llama_vocab_n_tokens(vocab);
-                    fingerprint_logits(logits_hash, llama_get_logits(ctx), count);
-                    logits_values += count;
+                    ++logits_decodes;
+                    if (!terminal_metrics_only) {  // metrics-only: the lm_head never produced these logits
+                        const size_t count = size_t(outputs) * llama_vocab_n_tokens(vocab);
+                        fingerprint_logits(logits_hash, llama_get_logits(ctx), count);
+                        logits_values += count;
+                    }
                 }
             }
             for (int sample = 0; generation && sample < generation_target; ++sample) {
@@ -445,6 +480,13 @@ static int run(int argc, char ** argv) {
             }
             char fingerprint[17];
             std::snprintf(fingerprint, sizeof(fingerprint), "%016llx", static_cast<unsigned long long>(logits_hash));
+            uint64_t elided = 0;
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
+            // Every logits-producing decode elided its lm_head in metrics-only mode, and none did otherwise.
+            elided = metric_session ? metric_session->terminal_lm_head_elisions() - elisions_before : 0;
+#endif
+            if (elided != (terminal_metrics_only ? logits_decodes : 0))
+                throw std::runtime_error("terminal lm_head elision does not match the requested mode");
             success = success && complete;
             trace.finish(complete);
             for (const auto & record : records) batches << record.dump() << '\n';
@@ -453,6 +495,14 @@ static int run(int argc, char ** argv) {
                 {"logits_fingerprint", fingerprint}, {"logits_fingerprint_algorithm", "fnv1a64_native_float_bytes_diagnostic"},
                 {"logits_values", logits_values}, {"logits_scope", forced_cost_only ? "last_decode_output" :
                     generation ? "last_sample_input" : "all_requested_prefill"}});
+            if (terminal_metrics_only) {  // intentional: observed lm_head, logits never computed
+                auto &row = result["chunks"].back();
+                row["logits_fingerprint"] = nullptr;
+                row["logits_fingerprint_algorithm"] = nullptr;
+                row["logits_scope"] = "not_materialized_metric_only";
+                row["logits_materialized"] = false;
+                row["lm_head_numerical_elisions"] = elided;
+            }
             application << json({{"schema", "potal-application-endpoints"}, {"version", 1},
                 {"chunk_id", chunk}, {"workload", workload}, {"t0_ns", t0}, {"sample_accept_ns", endpoints},
                 {"generated_tokens", generated}, {"samples", endpoints.size()}, {"actual_samples", endpoints.size()},

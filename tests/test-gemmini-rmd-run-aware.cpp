@@ -168,12 +168,32 @@ int main() {
                    long_request.activations[long_request.k + 17] == -1,
                "K>32 crosses original block boundary without a logical gap") && ok;
 
+    // The geometry-only request (metric-only observation) is the request without its operands.
+    RunAwareRequest geometry;
+    RunAwareRequest operandless = request;
+    operandless.activations.clear();
+    operandless.weights.clear();
+    operandless.carriers.clear();
+    ok = check(build_run_aware_geometry(args, *packet, geometry) == RmdStatus::success &&
+                   geometry == operandless,
+               "geometry-only request equals the request without operands") && ok;
+    RunAwareRequest long_geometry;
+    long_request.activations.clear();
+    long_request.weights.clear();
+    long_request.carriers.clear();
+    ok = check(build_run_aware_geometry(args, *long_packet, long_geometry) == RmdStatus::success &&
+                   long_geometry == long_request,
+               "geometry-only request across a block boundary") && ok;
+
     RunAwareRequest sentinel = request;
     StripePacket malformed = *packet;
     malformed.blocks[1].block_id = 1;
     ok = check(build_run_aware_request(args, malformed, request) ==
                    RmdStatus::invalid_packet && request == sentinel,
                "malformed packet rejection is transactional") && ok;
+    ok = check(build_run_aware_geometry(args, malformed, geometry) ==
+                   RmdStatus::invalid_packet && geometry == operandless,
+               "malformed packet geometry rejection is transactional") && ok;
 
     RunAwareRequest empty = sentinel;
     ok = check(build_run_aware_request(args, StripePacketHandle{}, empty) ==

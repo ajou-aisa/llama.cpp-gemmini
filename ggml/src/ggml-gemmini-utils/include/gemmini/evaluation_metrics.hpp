@@ -30,6 +30,9 @@ struct Config {
     // (chunk, layer, work type) instead of one SCALE_ALIGNMENT record per coordinate.
     bool scale_aggregate = false;
     bool activation_reference_candidate = false;
+    // Evaluation only, METRIC_PREFILL_256: the terminal lm_head is observed completely (activation, residual, SCU)
+    // but its numerical result, the logits, is never computed; no metric and no later layer consumes it.
+    bool terminal_lm_head_metrics_only = false;
 };
 struct Run {
     uint32_t original_block_id, original_k_mask;
@@ -50,6 +53,10 @@ public:
                                           size_t k, const float *original);
     void finish(bool success);
     void ensure_healthy() const;
+    bool terminal_lm_head_metrics_only() const;
+    // Records one terminal lm_head whose observations completed and whose numerical execution was elided.
+    void terminal_lm_head_elided();
+    uint64_t terminal_lm_head_elisions() const;
     Session(const Session &) = delete;
     Session &operator=(const Session &) = delete;
 private:

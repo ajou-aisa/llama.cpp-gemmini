@@ -439,6 +439,9 @@ typedef struct ggml_gemmini_args_t {
     std::shared_ptr<const ggml::gemmini::optrace::Context> optrace_context;
 #if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
     std::shared_ptr<ggml::gemmini::evaluation::Invocation> evaluation_context;
+    // Evaluation only: the terminal lm_head of a metric-only session. Every observation runs; the numerical
+    // GEMMs, their reconstruction and the output (the logits) do not.
+    bool metric_terminal_only = false;
 #endif
 #if CYCLE_SIM
     ggml::gemmini::cycle_sim::Context cycle_sim_context;

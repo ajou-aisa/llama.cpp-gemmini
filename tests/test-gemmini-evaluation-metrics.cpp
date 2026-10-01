@@ -303,6 +303,36 @@ static void scale_coordinate_cases(const std::filesystem::path &directory) {
         }
     }
 }
+// Metric-only terminal lm_head: only a METRIC_PREFILL_256 session may elide it, and each elision is recorded.
+static void terminal_lm_head_cases(const std::filesystem::path &directory) {
+    auto config = scale_config(directory, "terminal-generation");
+    config.workload_id = "E2E_GENERATION_256_128";
+    config.terminal_lm_head_metrics_only = true;
+    rejects([&] { evaluation::Session::start(config); }, "limited to the METRIC_PREFILL_256");
+    assert(!std::filesystem::exists(config.scale_path));
+    config = scale_config(directory, "terminal-full");
+    config.workload_id = "METRIC_PREFILL_256";
+    auto full = evaluation::Session::start(config);
+    assert(!full->terminal_lm_head_metrics_only());
+    rejects([&] { full->terminal_lm_head_elided(); }, "outside a metric-only session");
+    full->finish(true);
+    full.reset();
+    config = scale_config(directory, "terminal-metrics-only");
+    config.workload_id = "METRIC_PREFILL_256";
+    config.terminal_lm_head_metrics_only = true;
+    auto session = evaluation::Session::start(config);
+    assert(session->terminal_lm_head_metrics_only() && session->terminal_lm_head_elisions() == 0);
+    session->chunk(0);
+    session->terminal_lm_head_elided();
+    session->terminal_lm_head_elided();
+    assert(session->terminal_lm_head_elisions() == 2);
+    session->finish(true);
+    rejects([&] { session->terminal_lm_head_elided(); }, "session already finished");
+    session.reset();
+    // Elision leaves the metric stream exactly as the observations made it.
+    const auto stream = read(config.scale_path);
+    assert(stream.find("elid") == std::string::npos && stream.find("logits") == std::string::npos);
+}
 // An invocation whose quantization never completed is never merged: it rejects the chunk boundary of a
 // successful run and is left out of a failed one.
 static void scale_incomplete_cases(const std::filesystem::path &directory) {
@@ -454,6 +484,7 @@ int main(int argc, char **argv) {
     scale_mutation_cases(directory);
     scale_coordinate_cases(directory);
     scale_concurrency_case(directory);
+    terminal_lm_head_cases(directory);
     scale_incomplete_cases(directory);
 #endif
 #else
