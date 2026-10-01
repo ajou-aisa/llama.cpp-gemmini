@@ -25,6 +25,10 @@ CAMPAIGN: Final = "campaign.py"
 # The official domains (the wrapper's commands) and the metric subtypes; nothing else is a measurement domain.
 DOMAINS: Final = ("performance", "timeline", "metric")
 METRIC_KINDS: Final = tuple(METRIC_SINKS)  # activation, residual, scu
+# `metric all` runs the three metric kinds over a model x precision x DIM matrix and aggregates them; it is an
+# orchestration layer (its own delegate), not a fourth metric kind and not a measurement row below.
+METRIC_ALL: Final = "all"
+SWEEP: Final = "metric_sweep.py"
 TERMINOLOGY: Final = {"performance": ("Performance", "TTFT / TPOT / CPU-NPU timing"),
                       "timeline": ("Timeline", "optional/export view of the stored scheduling result"),
                       "metric": ("Metrics", "activation / residual / SCU")}
@@ -158,7 +162,9 @@ MEASUREMENTS: Final[dict[str, Measurement]] = {
         "scu",
         "scale / block alignment statistics of the SCU path (HP1 block-PoT to channel-anchor shifts, partial-sum "
         "update fraction)",
-        "scale-alignment-metrics.jsonl.gz", "scale_alignment_metrics.json", "layer_scale_metrics.json"),
+        "scale-alignment-metrics.jsonl.gz", "scale_alignment_metrics.json", "layer_scale_metrics.json",
+        (("with `--scu-mode aggregate`: collection/scale-alignment-aggregate.jsonl and raw.jsonl instead of the "
+          "gzip observations"),)),
 }
 
 # Every file of scripts/eval (and the build scripts next to it): (script, status, role, called by).
@@ -182,6 +188,12 @@ SCRIPTS: Final[tuple[tuple[str, str, str, str], ...]] = (
      "user (advanced)"),
     ("measurement_domains.py", "INTERNAL", "domain definitions for the wrapper, README tables and tests",
      "run_measurement.py"),
+    ("metric_sweep.py", "INTERNAL",
+     ("`metric all`: unchanged `campaign.py` runs over models x precisions x DIMs (one build per metric/precision/"
+      "DIM, activation as workload anchor), identity checks and the aggregate JSON/CSV/tables; computes no metric"),
+     "run_measurement.py"),
+    ("metric_table.py", "INTERNAL", "deterministic stdout tables of metric summaries (display only)",
+     "metric_sweep.py, campaign.py"),
     ("measurement_identity.py", "INTERNAL",
      "read-only shared identity of finished runs (`run_measurement.py identity RUN...`)", "run_measurement.py"),
     ("campaign_build.py", "INTERNAL",
@@ -268,6 +280,11 @@ BUILD_SCRIPTS: Final[tuple[tuple[str, str, str, str, str, str, str], ...]] = (
      "`activation`, `residual`, `scu` (FULL); `cycle` only for its legacy adapter",
      "none of its own: `--precision`, `--dim` select the `llama_plan()` profile", "from campaign_build.py",
      "`<output>/build` (fresh) or a verified `--prepared-build`", "ACTIVE"),
+    ("scripts/eval/metric_sweep.py", "run_measurement.py metric all",
+     "`activation`, `residual`, `scu` (FULL), one per precision x DIM, shared by both models",
+     "none of its own: `--precisions`, `--dims` select the `llama_plan()` profiles", "from campaign_build.py",
+     ("`--build-cache/<kind>-<identity>` (`cached_llama_build`), linked from `<sweep>/builds/`; passed to "
+      "`campaign.py --prepared-build`"), "ACTIVE"),
     ("scripts/eval/cycle_trace_capture.py", "run_cycle_trace_capture.sh", "`cycle` (STRIPE_PIPELINE)",
      "none of its own", "from campaign_build.py", "`<config>/build` or `--prepared-build`", "CERTIFICATION_ONLY"),
     ("scripts/eval/campaign_cycle.py", "campaign.py cycle", "`cycle-model`", "`CYCLE_MODEL_OPTIONS`",

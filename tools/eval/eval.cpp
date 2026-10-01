@@ -97,6 +97,8 @@ static int run(int argc, char ** argv) {
                 "  --seed N --temp F --gpu-layers N --activation-output PATH --residual-output PATH\n"
                 "  --scale-output PATH --manifest-sha256 SHA256 (validated evaluation manifest)\n"
                 "  --scale-output-fd N (POSIX inherited pipe, exclusive with scale-output)\n"
+                "  --scale-mode detailed|aggregate (SCU: one record per coordinate, default; or integer sums\n"
+                "    per chunk/layer/work type after the same per-coordinate validation)\n"
                 "  --cycle-trace (independent zero-generation prefill trace, metrics OFF)\n"
                 "  --chunk-index N --forced-token-ids JSON --run-id ID --build-info\n"
                 "  --smoke-generated-tokens 1 (CYCLE_SIM diagnostic; never an E2E campaign)\n"
@@ -117,7 +119,8 @@ static int run(int argc, char ** argv) {
         if (arg == "--residual-output") throw std::invalid_argument("residual metrics are compiled out");
 #endif
 #if !GGML_GEMMINI_SCALE_METRICS
-        if (arg == "--scale-output" || arg == "--scale-output-fd") throw std::invalid_argument("scale metrics are compiled out");
+        if (arg == "--scale-output" || arg == "--scale-output-fd" || arg == "--scale-mode")
+            throw std::invalid_argument("scale metrics are compiled out");
 #endif
         if (++i == argc) throw std::invalid_argument("missing value for " + arg);
         const std::string value = argv[i];
@@ -148,6 +151,10 @@ static int run(int argc, char ** argv) {
         else if (arg == "--scale-output-fd") {
             metric_config.scale_fd = positive(value);
             if (metric_config.scale_fd < 3) throw std::invalid_argument("scale descriptor must be a dedicated pipe");
+        }
+        else if (arg == "--scale-mode") {
+            if (value != "detailed" && value != "aggregate") throw std::invalid_argument("--scale-mode detailed|aggregate");
+            metric_config.scale_aggregate = value == "aggregate";
         }
 #endif
         else if (arg == "--manifest-sha256") {

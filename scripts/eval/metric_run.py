@@ -50,6 +50,9 @@ def parser_for(recipe: str) -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=int, default=600, help="finite collection timeout in seconds")
     if recipe == "scale":
         parser.add_argument("--gzip", action="store_true", help="stream exact SCU observations to gzip without a raw disk copy")
+        parser.add_argument("--scale-mode", choices=("detailed", "aggregate"), default="detailed",
+                            help="detailed: one record per SCU coordinate; aggregate: producer-validated integer "
+                                 "sums per chunk/layer/work type (same summary)")
     if recipe == "residual":
         parser.add_argument("--accept-proposed-weighting", action="store_true",
                             help="record explicit use of proposed-v3-DTR-v1; does not change raw shapes")
@@ -100,8 +103,10 @@ def collect_metric(args: argparse.Namespace, recipe: str) -> tuple[Path, Record]
         target.write(manifest_path.read_bytes())
     require(sha256(output / "evaluation_manifest.json") == manifest.sha256,
             "evaluation manifest changed before collection")
+    aggregate = recipe == "scale" and args.scale_mode == "aggregate"
+    require(not (aggregate and args.gzip), "aggregate SCU output is small; --gzip is for detailed observations")
     filename = {"activation": "activation-quant-metrics.jsonl", "residual": "residual-path-metrics.jsonl",
-                "scale": "scale-alignment-metrics.jsonl"}[recipe]
+                "scale": "scale-alignment-aggregate.jsonl" if aggregate else "scale-alignment-metrics.jsonl"}[recipe]
     compressed = recipe == "scale" and args.gzip
     if compressed:
         filename += ".gz"
@@ -114,6 +119,8 @@ def collect_metric(args: argparse.Namespace, recipe: str) -> tuple[Path, Record]
                "--manifest-sha256", manifest.sha256, "--seed", str(manifest.seed)]
     if not compressed:
         command.extend(["--" + recipe + "-output", str(raw)])
+    if aggregate:
+        command.extend(["--scale-mode", "aggregate"])
     write_json(output / "request.json", {**identities, "recipe": recipe, "command": list(command)})
     if compressed:
         from campaign_stream import run_compressed
@@ -122,7 +129,8 @@ def collect_metric(args: argparse.Namespace, recipe: str) -> tuple[Path, Record]
         run(command, output, args.timeout)
     require(before == artifact_snapshot(binary) and identities["model_sha256"] == sha256(model)
             and identities["dataset_sha256"] == sha256(dataset), "collection inputs changed during execution")
-    sinks = {"activation-quant-metrics.jsonl", "residual-path-metrics.jsonl", "scale-alignment-metrics.jsonl"}
+    sinks = {"activation-quant-metrics.jsonl", "residual-path-metrics.jsonl", "scale-alignment-metrics.jsonl",
+             "scale-alignment-aggregate.jsonl"}
     require(raw.is_file() and not any((output / other).exists() for other in sinks - {filename}),
             "dedicated metric sink isolation failed")
     require(sha256(manifest_path) == manifest.sha256, "evaluation manifest changed during collection")

@@ -32,6 +32,7 @@ from eval_common import (
 sys.path.insert(0, str(REPO))
 from campaign_metrics import OUTPUT_FILENAMES, outputs
 from metric_run import collect_metric, parser_for, validate_metric_recipe
+from metric_table import run_table
 from model_manifest import model_entry
 
 from evaluation.manifest import Manifest
@@ -49,6 +50,10 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--dataset-manifest", type=Path)
     result.add_argument("--output", type=Path)
     result.add_argument("--max-chunks", type=int, default=1, help="1: smoke; 0: all complete WikiText-2 test chunks")
+    result.add_argument("--scu-mode", choices=("detailed", "aggregate"),
+                        help="scu only: detailed (default) streams every SCU coordinate; aggregate keeps the same "
+                             "per-coordinate validation in the producer and streams integer sums per chunk/layer/"
+                             "work type (same summary, far smaller raw)")
     result.add_argument("--seed", type=int, default=1234)
     result.add_argument("--jobs", type=int, default=4)
     result.add_argument("--timeout", type=int, default=1800)
@@ -94,6 +99,7 @@ def run_campaign(args: argparse.Namespace) -> Path:
     else:
         require(all(value is None for value in (args.trace_source, args.source_provenance, args.certificate,
                 args.evidence_root, args.library)), "metric campaigns do not accept cycle-provider inputs")
+    require(args.scu_mode is None or args.kind == "scu", "--scu-mode applies to scu only")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     output = (args.output or REPO.parent / ("evaluation-campaign-" + stamp) / args.kind).resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -181,7 +187,7 @@ def run_campaign(args: argparse.Namespace) -> Path:
         if args.workload_manifest:
             argv.extend(["--workload-manifest", str(args.workload_manifest)])
         if recipe == "scale":
-            argv.append("--gzip")
+            argv.extend(["--scale-mode", "aggregate"] if args.scu_mode == "aggregate" else ["--gzip"])
         raw, collected = collect_metric(parser_for(recipe).parse_args(argv), recipe)
         workload = record(collected["workload"])
         raw_chunks = workload["chunks"]
@@ -192,6 +198,9 @@ def run_campaign(args: argparse.Namespace) -> Path:
         binding["native_workload_identity"] = collected["native_workload_identity"]
         binding["layer_count"] = len(expected_layers(architecture, blocks))
         binding["lm_head_included"] = True
+        if args.kind == "scu":  # what a resumed sweep must match before it reuses this run
+            binding["scu_collection_mode"] = args.scu_mode or "detailed"
+            binding["scu_reducer_sha256"] = sha256(REPO / "evaluation/weight_alignment/__init__.py")
     require(binding["model_sha256"] == sha256(model) and binding["dataset_sha256"] == sha256(dataset) and
             binding["build_hash"] == sha256(runner), "campaign inputs changed")
     write_json(output / "manifest.json", binding)
@@ -202,7 +211,10 @@ def run_campaign(args: argparse.Namespace) -> Path:
 def main() -> int:
     args = parser().parse_args()
     try:
-        print(run_campaign(args))
+        output = run_campaign(args)
+        print(output)
+        if args.kind != "cycle":  # stdout stays the run directory; the one-row result table goes to stderr
+            print(run_table(args.kind, output), file=sys.stderr)
         return 0
     except (EvaluationError, OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"campaign failed: {error}", file=sys.stderr)

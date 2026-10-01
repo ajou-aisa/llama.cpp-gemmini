@@ -9,13 +9,15 @@
   run_measurement.py performance [options]                 TTFT/TPOT, CPU-NPU timing (+ --timeline compact)
   run_measurement.py timeline --from-run RUN [options]     export view of a completed run's stored schedule
   run_measurement.py metric activation|residual|scu [...]  activation / residual / SCU metrics
+  run_measurement.py metric all [...]                      the three metrics over models x precisions x DIMs,
+                                                           aggregated (orchestration, not a fourth metric)
 
   run_measurement.py identity RUN [RUN ...]                shared model/configuration identity of finished runs
   run_measurement.py describe [--json | --markdown SECTION | --update-readme]
 
 This file only selects the delegate script and a default output directory; every option after the domain is passed
 through unchanged (`run_measurement.py performance --help` shows the delegate's options). All logic stays in
-run_cycle_evaluation.py (performance, timeline) and campaign.py (metric).
+run_cycle_evaluation.py (performance, timeline), campaign.py (metric) and metric_sweep.py (metric all).
 """
 from __future__ import annotations
 
@@ -28,8 +30,10 @@ from pathlib import Path
 from measurement_domains import (
     DOMAINS,
     EVAL,
+    METRIC_ALL,
     METRIC_KINDS,
     SECTIONS,
+    SWEEP,
     description,
     markdown,
     measurement,
@@ -69,6 +73,8 @@ def default_output(command: tuple[str, ...], arguments: list[str], stamp: str) -
     if command == ("timeline",):
         source = Path(option(arguments, "--from-run", "run") or "run").name
         return Path("runs/timeline") / f"{stamp}-{source}"
+    if command == ("metric", METRIC_ALL):
+        return Path("runs/metrics") / f"sweep-{stamp}"
     model = option(arguments, "--model", "model")
     return Path("runs/metrics") / command[1] / f"{stamp}-{model}-{precision}-d{dim}"
 
@@ -76,11 +82,11 @@ def default_output(command: tuple[str, ...], arguments: list[str], stamp: str) -
 def delegate(argv: list[str], stamp: str | None = None) -> tuple[Path, list[str]]:
     """(delegate script, its argument list) for `run_measurement.py ARGV`; no logic beyond the selection."""
     if not argv or argv[0] not in DOMAINS:
-        raise UsageError("choose a domain: performance, timeline, metric activation|residual|scu "
+        raise UsageError("choose a domain: performance, timeline, metric activation|residual|scu|all "
                          "(or identity, describe)")
     if argv[0] == "metric":
-        if len(argv) < 2 or argv[1] not in METRIC_KINDS:
-            raise UsageError("metric requires one of: " + ", ".join(METRIC_KINDS) +
+        if len(argv) < 2 or argv[1] not in (*METRIC_KINDS, METRIC_ALL):
+            raise UsageError("metric requires one of: " + ", ".join((*METRIC_KINDS, METRIC_ALL)) +
                              " (the legacy cycle replay adapter is `campaign.py cycle`)")
         command, rest = (argv[0], argv[1]), argv[2:]
     else:
@@ -90,11 +96,11 @@ def delegate(argv: list[str], stamp: str | None = None) -> tuple[Path, list[str]
         raise UsageError(f"{' '.join(command)} selects the mode; remove {', '.join(chosen)}")
     if command == ("timeline",) and not present(rest, "--from-run") and not present(rest, "--help") and "-h" not in rest:
         raise UsageError("timeline requires --from-run COMPLETED_PERFORMANCE_RUN")
-    _, row = measurement(command)
-    script, *fixed = row.delegate
+    script, *fixed = (SWEEP,) if command == ("metric", METRIC_ALL) else measurement(command)[1].delegate
     arguments = [*fixed, *rest]
-    helping = present(rest, "--help") or "-h" in rest or present(rest, "--dry-run")
-    if not present(rest, "--output") and not helping:
+    # Help and dry runs write nothing; a resumed sweep writes into its recorded directory.
+    unwritten = present(rest, "--help") or "-h" in rest or present(rest, "--dry-run") or present(rest, "--resume")
+    if not present(rest, "--output") and not unwritten:
         moment = stamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         arguments += ["--output", str(default_output(command, rest, moment))]
     return EVAL / script, arguments

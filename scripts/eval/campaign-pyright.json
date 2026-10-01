@@ -20,6 +20,8 @@
     "run_cycle_evaluation.py",
     "measurement_domains.py",
     "measurement_identity.py",
+    "metric_sweep.py",
+    "metric_table.py",
     "run_measurement.py"
   ],
   "extraPaths": [

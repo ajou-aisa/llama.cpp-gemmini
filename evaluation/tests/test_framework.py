@@ -16,6 +16,7 @@ from evaluation import activation, residual, weight_alignment
 from evaluation.manifest import Manifest
 from evaluation.tests.test_collection import collection
 from evaluation.tests.test_edges import edges
+from evaluation.tests.test_scale_breakdown import scale_aggregate, scale_breakdown
 from scripts.eval.eval_common import (
     EvaluationError,
     Record,
@@ -134,6 +135,8 @@ def smoke(root: Path) -> None:
         assert read_json(root / "outputs" / filename)["manifest_sha256"] == manifest.sha256
     malformed(root, manifest)
     edges(root, manifest)
+    scale_breakdown(root, manifest)
+    scale_aggregate(root, manifest)
     collection(root)
 
 
@@ -176,7 +179,8 @@ def main() -> None:
             smoke(Path(directory))
     else:
         smoke(args.output.resolve())
-    print("PASS: ACT signed BK32, integer aggregation, RES run padding, SCU offsets, manifest/stream rejection, CLI")
+    print("PASS: ACT signed BK32, integer aggregation, RES run padding, SCU offsets, SCU dense/residual split, "
+          "SCU aggregate parity, manifest/stream rejection, CLI")
 
 
 if __name__ == "__main__":

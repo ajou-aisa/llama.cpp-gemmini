@@ -26,6 +26,9 @@ struct Config {
     std::string activation_path, residual_path, scale_path, run_id, workload_id;
     std::string manifest_sha256;
     int scale_fd = -1;
+    // SCU aggregate mode: the same per-coordinate validation, but one integer AGGREGATE record per
+    // (chunk, layer, work type) instead of one SCALE_ALIGNMENT record per coordinate.
+    bool scale_aggregate = false;
     bool activation_reference_candidate = false;
 };
 struct Run {

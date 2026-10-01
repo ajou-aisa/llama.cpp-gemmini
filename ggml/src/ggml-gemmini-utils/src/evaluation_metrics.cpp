@@ -56,6 +56,11 @@ struct Session::Impl {
     mutable std::mutex mutex;
     uint64_t chunk = 0, next_invocation = 0, next_record = 0, completed_quantization = 0;
     uint64_t activation_observations = 0, residual_observations = 0, scale_observations = 0;
+    // Aggregate SCU mode: integer sums of the current chunk per (layer, work type), plus run totals.
+    struct ScaleSums { uint64_t delta_w_sum = 0, max_delta_w = 0, alignment_count = 0,
+                       updated_partial_sum_count = 0, total_partial_sum_count = 0, zero_weight_count = 0; };
+    std::map<std::pair<std::string, std::string>, ScaleSums> scale_sums;
+    uint64_t scale_alignments = 0, scale_invocations = 0;
     bool chunk_set = false, finished = false, reference_complete = true;
     std::string failure;
     ~Impl() {
@@ -72,7 +77,8 @@ struct Session::Impl {
         if (!file) return;
         const std::string schema = file == activation
             ? "im2p-activation-quant-metrics" : file == residual
-                ? "im2p-residual-path-metrics" : "im2p-scale-alignment-metrics";
+                ? "im2p-residual-path-metrics" : config.scale_aggregate
+                    ? "im2p-scale-alignment-aggregate" : "im2p-scale-alignment-metrics";
         const auto line = "{\"schema\":" + semantic::quote(schema) +
             ",\"version\":1" + text_field("kind", kind) +
             field("sequence", next_record++) + text_field("run_id", config.run_id) +
@@ -86,6 +92,16 @@ struct Session::Impl {
             ++(file == activation ? activation_observations :
                file == residual ? residual_observations : scale_observations);
     }
+    void flush_scale_sums() {
+        for (const auto &[key, sums] : scale_sums)
+            emit(scale, "AGGREGATE", field("chunk_id", chunk) + text_field("layer", key.first) +
+                text_field("work_type", key.second) + field("delta_w_sum", sums.delta_w_sum) +
+                field("max_delta_w", sums.max_delta_w) + field("alignment_count", sums.alignment_count) +
+                field("updated_partial_sum_count", sums.updated_partial_sum_count) +
+                field("total_partial_sum_count", sums.total_partial_sum_count) +
+                field("zero_weight_count", sums.zero_weight_count));
+        scale_sums.clear();
+    }
 };
 struct Invocation::Impl {
     std::shared_ptr<Session> session;
@@ -98,6 +114,7 @@ struct Invocation::Impl {
     std::set<size_t> compact_stripes;
     std::set<size_t> radix_stripes;
     std::set<std::tuple<std::string, size_t, size_t, size_t>> scale_coordinates;
+    std::string layer;
     uint64_t finite = 0, fp_count = 0, selected = 0, intersection = 0, residual = 0;
     uint64_t requant_events = 0, observed_count = 0;
     bool activation_finished = false, reference_complete = false;
@@ -179,7 +196,8 @@ std::shared_ptr<Session> Session::start(const Config &config) {
         text_field("weighting_revision", "integer-count-mac-capacity-v1"));
     impl->emit(impl->scale, "RUN", text_field("metric_revision", "hp1-scu-offset-v1") +
         text_field("scale_domain", "hp1_block_pot_to_channel_anchor") +
-        text_field("update_definition", "partial_sums_requiring_nonzero_scu_shift"));
+        text_field("update_definition", "partial_sums_requiring_nonzero_scu_shift") +
+        (config.scale_aggregate ? text_field("collection_mode", "aggregate") : std::string()));
     auto session = std::shared_ptr<Session>(new Session(std::move(impl)));
     active = session;
     return session;
@@ -188,6 +206,7 @@ void Session::chunk(uint64_t chunk) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->check();
     require(!impl_->chunk_set || chunk > impl_->chunk, "non-increasing chunk identity");
+    impl_->flush_scale_sums();  // aggregates of the previous chunk; empty in detailed mode
     impl_->chunk = chunk;
     impl_->chunk_set = true;
 }
@@ -200,6 +219,7 @@ std::shared_ptr<Invocation> Session::invocation(const std::string &layer, size_t
     data->session = shared_from_this();
     data->m = m;
     data->k = k;
+    data->layer = layer;
     data->identity = field("chunk_id", impl_->chunk) +
         field("invocation_id", impl_->next_invocation++) + text_field("layer", layer);
     if (const auto semantic_context = semantic::current_context())
@@ -252,7 +272,14 @@ void Session::finish(bool success) {
         ",\"reference_complete\":" + (impl_->reference_complete ? "true" : "false") +
         field("observation_count", impl_->activation_observations));
     impl_->emit(impl_->residual, "RUN_END", fields + field("observation_count", impl_->residual_observations));
-    impl_->emit(impl_->scale, "RUN_END", fields + field("observation_count", impl_->scale_observations));
+    if (impl_->config.scale_aggregate) {
+        impl_->flush_scale_sums();
+        impl_->emit(impl_->scale, "RUN_END", fields + field("observation_count", impl_->scale_observations) +
+            field("alignment_count", impl_->scale_alignments) +
+            field("scale_invocation_count", impl_->scale_invocations));
+    } else {
+        impl_->emit(impl_->scale, "RUN_END", fields + field("observation_count", impl_->scale_observations));
+    }
     impl_->finished = true;
 }
 void Invocation::requantized(size_t row, size_t block) {
@@ -456,9 +483,23 @@ void Invocation::scale_alignment(size_t stripe, const char *work_type, size_t co
                 std::ldexp(aligned_pot_scale, scu_shift_offset) == original_weight_scale &&
                 updated_partial_sum_count == (scu_shift_offset ? total_partial_sum_count : 0),
             "SCU scale/offset/count mismatch");
+    const bool first = impl_->scale_coordinates.empty();
     require(impl_->scale_coordinates.emplace(work_type, stripe, column, original_block).second,
             "duplicate SCU alignment coordinate");
     std::lock_guard<std::mutex> session_lock(session.mutex);
+    if (session.config.scale_aggregate) {
+        session.check();
+        auto &sums = session.scale_sums[{impl_->layer, work_type}];
+        sums.delta_w_sum += scu_shift_offset;
+        sums.max_delta_w = std::max<uint64_t>(sums.max_delta_w, scu_shift_offset);
+        ++sums.alignment_count;
+        sums.updated_partial_sum_count += updated_partial_sum_count;
+        sums.total_partial_sum_count += total_partial_sum_count;
+        sums.zero_weight_count += zero_weight;
+        ++session.scale_alignments;
+        session.scale_invocations += first;
+        return;
+    }
     session.emit(session.scale, "SCALE_ALIGNMENT", impl_->identity + field("stripe_id", stripe) +
         text_field("work_type", work_type) + field("column", column) +
         field("original_block", original_block) + real_field("original_weight_scale", original_weight_scale) +

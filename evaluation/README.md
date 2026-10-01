@@ -104,6 +104,15 @@ standalone observer/reducer smoke requires no cycle library or timing call.
   block)` once. Partial-sum update fraction weights actual emitted partial-sum
   counts; an update means a required nonzero SCU shift, not a claim that its
   numerical value changed. Zero-weight records have zero offset and zero updates.
+  The same aggregation is also reported per producer `work_type`: `dense`, `residual` and their union `overall`,
+  each from its own integer sums (`delta_w_sum`, `alignment_count`, `updated_partial_sum_count`,
+  `total_partial_sum_count`) before division; an empty work type has null average, maximum and fraction. The
+  top-level `avg_delta_w`, `max_delta_w` and `scu_update_fraction` stay the `overall` values.
+  The producer can instead aggregate (`llama-eval-workload --scale-mode aggregate`): it validates every coordinate as
+  above (duplicates per invocation included) and emits one `AGGREGATE` record per (chunk, layer, work type) with
+  `delta_w_sum`, `max_delta_w`, `alignment_count`, `updated_partial_sum_count`, `total_partial_sum_count` and
+  `zero_weight_count` (schema `im2p-scale-alignment-aggregate`; `RUN_END` adds the total `alignment_count` and
+  `scale_invocation_count`). The reducer reads either stream and returns the same summary.
   The GGUF lacks the pre-PoT FP scale; outputs explicitly declare
   `pre_pot_fp_scale_available=false`. This is not a reconstructed FP-to-PoT error.
 

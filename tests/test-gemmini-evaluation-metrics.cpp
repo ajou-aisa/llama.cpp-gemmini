@@ -1,6 +1,7 @@
 #include <gemmini/evaluation_metrics.hpp>
 
 #include <cassert>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -96,6 +97,66 @@ static void confirmed_reference_cases(const std::filesystem::path &directory) {
     obsolete.activation_reference_candidate = true;
     rejects([&] { evaluation::Session::start(obsolete); });
     assert(!std::filesystem::exists(obsolete.activation_path));
+}
+#endif
+
+#if GGML_GEMMINI_SCALE_METRICS
+// One SCU workload (2 chunks, 2 layers, 3 invocations, both work types, zero weight) in a given mode.
+static std::string scale_workload(const std::filesystem::path &directory, const std::string &mode) {
+    evaluation::Config config;
+    config.run_id = "scale-" + mode;
+    config.workload_id = "scale-workload";
+    config.manifest_sha256 = std::string(64, 'b');
+    config.scale_path = (directory / ("scale-" + mode + ".jsonl")).string();
+    config.scale_aggregate = mode == "aggregate";
+    auto session = evaluation::Session::start(config);
+    session->chunk(0);
+    auto first = session->invocation("blk.0", 1, 64, nullptr);
+    first->scale_alignment(0, "DENSE", 0, 0, 8.0, 0.5, 4, 3, 3);
+    first->scale_alignment(0, "DENSE", 1, 1, 0.5, 0.5, 0, 0, 5);
+    first->scale_alignment(0, "RESIDUAL", 0, 0, 2.0, 0.5, 2, 7, 7);    // same coordinate, other work type
+    first->scale_alignment(0, "RESIDUAL", 1, 0, 0, 0.5, 0, 0, 11, true);
+    rejects([&] { first->scale_alignment(0, "DENSE", 0, 0, 8.0, 0.5, 4, 3, 3); });       // duplicate
+    rejects([&] { first->scale_alignment(0, "DENSE", 2, 0, 8.0, 0.5, 3, 3, 3); });       // scale/offset
+    rejects([&] { first->scale_alignment(0, "DENSE", 3, 0, 8.0, 0.5, 4, 2, 3); });       // update count
+    rejects([&] { first->scale_alignment(0, "DENSE", 4, 0, NAN, 0.5, 0, 0, 3); });       // nonfinite
+    rejects([&] { first->scale_alignment(0, "DENSE", 5, 0, 0, 0.5, 1, 0, 3, true); });   // zero weight
+    rejects([&] { first->scale_alignment(0, "OTHER", 6, 0, 0.5, 0.5, 0, 0, 3); });       // work type
+    first->finish_activation();
+    auto second = session->invocation("blk.1", 1, 32, nullptr);
+    second->scale_alignment(0, "DENSE", 0, 0, 32.0, 0.25, 7, 2, 2);
+    second->finish_activation();
+    session->chunk(1);
+    auto third = session->invocation("blk.0", 1, 32, nullptr);
+    third->scale_alignment(1, "DENSE", 0, 0, 1.0, 0.25, 2, 4, 4);
+    third->finish_activation();
+    session->finish(true);
+    first.reset(); second.reset(); third.reset(); session.reset();
+    return read(config.scale_path);
+}
+static void scale_aggregate_cases(const std::filesystem::path &directory) {
+    const auto detailed = scale_workload(directory, "detailed");
+    assert(detailed.find("\"kind\":\"AGGREGATE\"") == std::string::npos);
+    assert(detailed.find("\"kind\":\"SCALE_ALIGNMENT\"") != std::string::npos);
+    const auto aggregate = scale_workload(directory, "aggregate");
+    assert(aggregate.find("SCALE_ALIGNMENT") == std::string::npos);
+    assert(aggregate.find("\"schema\":\"im2p-scale-alignment-aggregate\"") != std::string::npos);
+    assert(aggregate.find("\"collection_mode\":\"aggregate\"") != std::string::npos);
+    const auto has = [&](const std::string &fields) { return aggregate.find(fields) != std::string::npos; };
+    // Integer sums per (chunk, layer, work type); DENSE and RESIDUAL apart; zero weight counted, never updated.
+    assert(has("\"chunk_id\":0,\"layer\":\"blk.0\",\"work_type\":\"DENSE\",\"delta_w_sum\":4,\"max_delta_w\":4,"
+               "\"alignment_count\":2,\"updated_partial_sum_count\":3,\"total_partial_sum_count\":8,"
+               "\"zero_weight_count\":0}"));
+    assert(has("\"chunk_id\":0,\"layer\":\"blk.0\",\"work_type\":\"RESIDUAL\",\"delta_w_sum\":2,\"max_delta_w\":2,"
+               "\"alignment_count\":2,\"updated_partial_sum_count\":7,\"total_partial_sum_count\":18,"
+               "\"zero_weight_count\":1}"));
+    assert(has("\"chunk_id\":0,\"layer\":\"blk.1\",\"work_type\":\"DENSE\",\"delta_w_sum\":7,\"max_delta_w\":7,"
+               "\"alignment_count\":1,\"updated_partial_sum_count\":2,\"total_partial_sum_count\":2,"
+               "\"zero_weight_count\":0}"));
+    assert(has("\"chunk_id\":1,\"layer\":\"blk.0\",\"work_type\":\"DENSE\",\"delta_w_sum\":2,\"max_delta_w\":2,"
+               "\"alignment_count\":1,\"updated_partial_sum_count\":4,\"total_partial_sum_count\":4,"
+               "\"zero_weight_count\":0}"));
+    assert(has("\"observation_count\":4,\"alignment_count\":6,\"scale_invocation_count\":3}"));
 }
 #endif
 
@@ -216,6 +277,9 @@ int main(int argc, char **argv) {
     rejects([&] { evaluation::Session::start(config); });
 #if GGML_GEMMINI_ACT_QUANT_METRICS
     confirmed_reference_cases(directory);
+#endif
+#if GGML_GEMMINI_SCALE_METRICS
+    scale_aggregate_cases(directory);
 #endif
 #else
     assert(!session);

@@ -9,6 +9,7 @@ not collect metrics and a metric run does not replay or schedule.
 | **Performance** | `performance` | TTFT / TPOT / CPU-NPU timing: CPU hardware cycles and host timing, NPU simulated cycles, CPU/NPU pipelining reconstruction | `run_cycle_evaluation.py --run performance` |
 | **Timeline** | `timeline` | optional/export view of the stored scheduling result (overlap, idle gaps, token boundaries, core provenance): written by the same scheduling pass or exported later | `--timeline compact`, `run_cycle_evaluation.py --run timeline` |
 | **Metrics** | `metric activation\|residual\|scu` | activation / residual / SCU | `campaign.py activation\|residual\|scu` |
+| | `metric all` | the three metrics over models × precisions × DIMs, aggregated (orchestration, not a fourth metric) | `metric_sweep.py` |
 
 ```text
 run_measurement.py
@@ -17,7 +18,8 @@ run_measurement.py
 └── metric
     ├── activation
     ├── residual
-    └── scu
+    ├── scu
+    └── all          orchestration of the three over a matrix (see "Metric sweep")
 ```
 
 "Metrics" always means activation, residual and SCU. Perplexity/model-quality evaluation is intentionally outside
@@ -104,11 +106,72 @@ python3 scripts/eval/run_measurement.py metric scu \
 - Does not run: TTFT/TPOT, NPU cycle replay, scheduling, timeline; the other two metric sinks.
 - Inputs: HP1 GGUF model (`--model gpt2|llama3.2-1B` or `--model-path`), WikiText-2 test text (`--dataset-manifest`), IM2P.sim checkout (functional backend sources).
 - Cache / reuse: `--prepared-build`, `--evaluation-manifest`, `--workload-manifest` (same native chunks across metrics).
-- Outputs (default `runs/metrics/scu/<utc>-<model>-<precision>-d<dim>`): manifest.json, request.json, evaluation_manifest.json, dataset_manifest.json, build/, collection/scale-alignment-metrics.jsonl.gz, raw.jsonl.gz, scale_alignment_metrics.json (= summary.json), layer_scale_metrics.json (= layers.json), SHA256SUMS.
+- Outputs (default `runs/metrics/scu/<utc>-<model>-<precision>-d<dim>`): manifest.json, request.json, evaluation_manifest.json, dataset_manifest.json, build/, collection/scale-alignment-metrics.jsonl.gz, raw.jsonl.gz, scale_alignment_metrics.json (= summary.json), layer_scale_metrics.json (= layers.json), with `--scu-mode aggregate`: collection/scale-alignment-aggregate.jsonl and raw.jsonl instead of the gzip observations, SHA256SUMS.
 <!-- END GENERATED commands -->
 
 The former entry points stay valid: `run_activation_metrics.sh`, `run_residual_metrics.sh`, `run_scu_metrics.sh`
-(`campaign.py KIND`) and `run_cycle_evaluation.py` itself.
+(`campaign.py KIND`) and `run_cycle_evaluation.py` itself. `campaign.py` still prints only its run directory on
+stdout; the one-row result table of a metric run goes to stderr.
+
+### Metric sweep (`metric all`)
+
+```bash
+# One metric
+python3 scripts/eval/run_measurement.py metric activation --model gpt2 --precision a8w8 --dim 32 --max-chunks 1
+
+# Full paper metric sweep (these are the defaults: `metric all` alone runs this matrix)
+python3 scripts/eval/run_measurement.py metric all \
+  --models gpt2,llama3.2-1B \
+  --precisions a4w4,a8w8 \
+  --dims 16,32,64 \
+  --max-chunks 0
+
+# Smoke subset, the plan only, and an interrupted sweep
+python3 scripts/eval/run_measurement.py metric all --models gpt2 --precisions a8w8 --dims 32 --max-chunks 1
+python3 scripts/eval/run_measurement.py metric all --dry-run
+python3 scripts/eval/run_measurement.py metric all --resume runs/metrics/sweep-<utc>
+```
+
+`metric all` is an orchestration layer. It does not define a fourth metric and does not change individual metric
+semantics: every run is an unchanged `campaign.py activation|residual|scu` process with its own run directory, and the
+sweep only reads finished runs (`metric_sweep.py`).
+
+- Builds: one per metric kind × precision × DIM (18 for the full matrix) from `campaign_build.cached_llama_build`
+  (`--build-cache`, default `runs/.build-cache`), passed as `campaign.py --prepared-build`; GPT-2 and Llama use the
+  same build. `<sweep>/builds/` links them, and a resumed sweep must resolve to the same builds.
+- Workload: in each configuration (model × precision × DIM) the activation run is the anchor; residual and SCU get its
+  `evaluation_manifest.json` (`--evaluation-manifest`) and `collection/workload-binding.json` (`--workload-manifest`).
+  The sweep then requires the same model, dataset, tokenizer, precision, DIM, seed, chunk policy, native workload
+  identity and chunk IDs in the three runs (`measurement_identity` plus the workload files), and the same native
+  workload and chunk IDs across the DIMs of one model and precision. Builds differ by design; each configuration
+  records the build receipt, runner and semantic-options SHA-256 it used.
+- Output (`runs/metrics/sweep-<utc>`): `manifest.json` (the recorded matrix and options), `builds/`,
+  `<model>/<precision>/d<dim>/{activation,residual,scu}/` (unchanged campaign run directories, `<kind>.campaign.log`
+  next to each), `metric-summary.json` and `metric-summary.csv`.
+- `metric-summary.json` (`potal-metric-sweep`): status, matrix, counts, one entry per passing configuration (shared
+  identity, builds, runs, activation fields with their counts, SCU `dense`/`residual`/`overall`, residual fields),
+  the failures and the workload identity per model and precision. `metric-summary.csv`: one row per passing
+  configuration with the paper columns. Every value is copied from a run's `summary.json`; nothing is recomputed.
+- stdout: the Activation Adaptation, SCU Weight-Scale Alignment (dense; `--scu-breakdown all` adds residual and
+  overall) and Residual Overhead tables, ordered by model, precision and DIM; `--plain` prints ASCII columns. The
+  tables are for reading; exact values are in the JSON/CSV.
+- Failures: a failed build, metric run or identity check makes the sweep `FAILED` (exit 1) and is listed. The default
+  stops at the first failure; `--keep-going` runs every configuration and prints a failed-configuration table. A
+  failed configuration never enters the tables, the CSV or the configuration list.
+- `--resume DIR` keeps the recorded matrix and options. A complete run (`SHA256SUMS`) is verified with
+  `campaign_verify` and reused; an incomplete run stays untouched and its metric runs again in `<kind>.retry-N`; a
+  complete run that fails verification stops the sweep. Earlier summaries are kept as `metric-summary.attempt-N.*`.
+- SCU collection mode (`--scu-mode`, default `aggregate` for `metric all`; `metric scu` keeps `detailed` unless
+  `--scu-mode aggregate` is given). `detailed` streams one `SCALE_ALIGNMENT` record per (invocation, work type,
+  stripe, column, original block): about 25M records / 330 MB per GPT-2 A8W8 DIM 32 chunk. `aggregate` runs the same
+  per-coordinate checks in the producer (scale/offset/update consistency, finite scales, duplicate coordinates per
+  invocation) and streams only integer sums per (chunk, layer, work type) (`im2p-scale-alignment-aggregate`); the
+  reducer turns both into the same summary, so ratios and the paper columns are identical. `metric all` refuses
+  detailed SCU with `--max-chunks 0` unless `--allow-large-raw-scu` is given. A resumed sweep reuses an SCU run only
+  when its `scu_collection_mode` and `scu_reducer_sha256` match; the summary records `scu.collection_mode`.
+- `--dry-run` prints the counts, the builds with their `semantic_options_sha256` and every `campaign.py` command;
+  a real run prints the same preflight header first.
+  `--timeout` is passed to every `campaign.py` run (its per-command limit, default 1800 s).
 
 ## Dependency matrix
 
@@ -170,6 +233,7 @@ are not admitted by any runner):
 | `scripts/eval/build_measurement.sh` | user | same kinds (`--kind`, `--dry-run`) | from campaign_build.py | from campaign_build.py | `--output DIR` | ACTIVE (wrapper) |
 | `scripts/eval/run_cycle_evaluation.py` | run_measurement.py performance, timeline | performance: `cycle-model`, `potal-host` (STRIPE_PIPELINE), `fullcpu-host` (FULL); timeline: none | none of its own: `--precision`, `--dim` select the `llama_plan()` profile | from campaign_build.py | `--build-cache/<kind>-<identity>`; per-build summary in `<run>/build/*.json` | ACTIVE |
 | `scripts/eval/campaign.py` | run_measurement.py metric KIND, run_*_metrics.sh | `activation`, `residual`, `scu` (FULL); `cycle` only for its legacy adapter | none of its own: `--precision`, `--dim` select the `llama_plan()` profile | from campaign_build.py | `<output>/build` (fresh) or a verified `--prepared-build` | ACTIVE |
+| `scripts/eval/metric_sweep.py` | run_measurement.py metric all | `activation`, `residual`, `scu` (FULL), one per precision x DIM, shared by both models | none of its own: `--precisions`, `--dims` select the `llama_plan()` profiles | from campaign_build.py | `--build-cache/<kind>-<identity>` (`cached_llama_build`), linked from `<sweep>/builds/`; passed to `campaign.py --prepared-build` | ACTIVE |
 | `scripts/eval/cycle_trace_capture.py` | run_cycle_trace_capture.sh | `cycle` (STRIPE_PIPELINE) | none of its own | from campaign_build.py | `<config>/build` or `--prepared-build` | CERTIFICATION_ONLY |
 | `scripts/eval/campaign_cycle.py` | campaign.py cycle | `cycle-model` | `CYCLE_MODEL_OPTIONS` | from campaign_build.py | `<output>/cycle-library-build` | CERTIFICATION_ONLY (legacy adapter) |
 | build-arm64.sh, build-arm64-cpu.sh, build-arm64-fpga-uart.sh, build-x86.sh, build-riscv.sh | developer | none (developer builds, not a measurement kind) | own environment defaults resolved by `scripts/im2p-build-options.py`; they differ from every measurement profile (backend, DIM, bits, OpenMP, runtime matmul override) | host and toolchain specific (native flags, OpenMP, cross toolchain) | `build-arm64/`, `build-arm64-cpu/`, `build-arm64-fpga-uart/`, `build-x86/`, `build-riscv[-static]/`; no receipt | DEBUG/RESEARCH (never admitted by a runner) |
@@ -184,7 +248,7 @@ are not admitted by any runner):
 | timeline | `runs/timeline/<utc>-<source run name>` | `manifest.json`<br>`timeline.jsonl`<br>`timeline-rows.json`<br>`export.json`<br>`SHA256SUMS` |
 | activation | `runs/metrics/activation/<utc>-<model>-<precision>-d<dim>` | `manifest.json`<br>`request.json`<br>`evaluation_manifest.json`<br>`dataset_manifest.json`<br>`build/`<br>`collection/activation-quant-metrics.jsonl`<br>`raw.jsonl`<br>activation_metrics.json (= summary.json)<br>layer_activation_metrics.json (= layers.json)<br>`SHA256SUMS` |
 | residual | `runs/metrics/residual/<utc>-<model>-<precision>-d<dim>` | `manifest.json`<br>`request.json`<br>`evaluation_manifest.json`<br>`dataset_manifest.json`<br>`build/`<br>`collection/residual-path-metrics.jsonl`<br>`raw.jsonl`<br>residual_metrics.json (= summary.json)<br>layer_residual_metrics.json (= layers.json)<br>`compact-shape-summary.json`<br>`SHA256SUMS` |
-| scu | `runs/metrics/scu/<utc>-<model>-<precision>-d<dim>` | `manifest.json`<br>`request.json`<br>`evaluation_manifest.json`<br>`dataset_manifest.json`<br>`build/`<br>`collection/scale-alignment-metrics.jsonl.gz`<br>`raw.jsonl.gz`<br>scale_alignment_metrics.json (= summary.json)<br>layer_scale_metrics.json (= layers.json)<br>`SHA256SUMS` |
+| scu | `runs/metrics/scu/<utc>-<model>-<precision>-d<dim>` | `manifest.json`<br>`request.json`<br>`evaluation_manifest.json`<br>`dataset_manifest.json`<br>`build/`<br>`collection/scale-alignment-metrics.jsonl.gz`<br>`raw.jsonl.gz`<br>scale_alignment_metrics.json (= summary.json)<br>layer_scale_metrics.json (= layers.json)<br>with `--scu-mode aggregate`: collection/scale-alignment-aggregate.jsonl and raw.jsonl instead of the gzip observations<br>`SHA256SUMS` |
 <!-- END GENERATED outputs -->
 
 - Every run directory is new (existing directories are refused) and ends with `SHA256SUMS` over its files.
@@ -298,6 +362,8 @@ exactly where the scheduler placed them.
 | `residual_path_metrics.py` | WRAPPER | standalone residual collect/reduce with a prepared runner | user (advanced) |
 | `scale_alignment_metrics.py` | WRAPPER | standalone SCU collect/reduce with a prepared runner | user (advanced) |
 | `measurement_domains.py` | INTERNAL | domain definitions for the wrapper, README tables and tests | run_measurement.py |
+| `metric_sweep.py` | INTERNAL | `metric all`: unchanged `campaign.py` runs over models x precisions x DIMs (one build per metric/precision/DIM, activation as workload anchor), identity checks and the aggregate JSON/CSV/tables; computes no metric | run_measurement.py |
+| `metric_table.py` | INTERNAL | deterministic stdout tables of metric summaries (display only) | metric_sweep.py, campaign.py |
 | `measurement_identity.py` | INTERNAL | read-only shared identity of finished runs (`run_measurement.py identity RUN...`) | run_measurement.py |
 | `campaign_build.py` | INTERNAL | the build authority: every CMake option of every measurement build, receipts, build cache | run_cycle_evaluation.py, campaign.py, cycle scripts |
 | `metric_run.py` | INTERNAL | native metric collection with sink isolation; body of the standalone reducers | campaign.py, *_metrics.py |
@@ -352,6 +418,10 @@ run_measurement.py
  |     |- campaign_inputs.py, model_manifest.py
  |     |- metric_run.py -> llama-eval-workload METRIC_PREFILL_256, campaign_stream.py (SCU gzip)
  |     `- campaign_metrics.py -> evaluation/ reducers
+ |- metric all -> metric_sweep.py      campaign.py per model x precision x DIM; reads and aggregates the runs
+ |     |- campaign_build.py            cached_llama_build: one build per metric/precision/DIM for both models
+ |     |- campaign_verify.py, measurement_identity.py   resume verification, shared identity
+ |     `- metric_table.py              stdout tables (also campaign.py's one-row table)
  |- identity RUN... -> measurement_identity.py   reads finished runs of any domain; measures nothing
  `- describe -> measurement_domains.py           the definitions behind this file's generated tables
 ```
@@ -367,7 +437,7 @@ needs `--reduce`; the `cycle` kind of `campaign.py` together with `campaign_cycl
 ## Verification
 
 ```sh
-python3 -B -m pytest -q tests/test-measurement-domains.py tests/test-cycle-evaluation.py
+python3 -B -m pytest -q tests/test-measurement-domains.py tests/test-metric-sweep.py tests/test-cycle-evaluation.py
 python3 -B -m evaluation.tests.test_campaign && python3 -B -m evaluation.tests.test_framework
 python3 -B scripts/eval/run_measurement.py describe --update-readme
 ```

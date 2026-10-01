@@ -1,4 +1,59 @@
 {
+  "$defs": {
+    "work_type_population": {
+      "additionalProperties": false,
+      "properties": {
+        "alignment_count": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "avg_delta_w": {
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "delta_w_sum": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_delta_w": {
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "scu_update_fraction": {
+          "maximum": 1,
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "total_partial_sum_count": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "updated_partial_sum_count": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "delta_w_sum",
+        "alignment_count",
+        "updated_partial_sum_count",
+        "total_partial_sum_count",
+        "avg_delta_w",
+        "max_delta_w",
+        "scu_update_fraction"
+      ],
+      "type": "object"
+    }
+  },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
@@ -22,6 +77,9 @@
     "delta_w_sum": {
       "minimum": 0,
       "type": "integer"
+    },
+    "dense": {
+      "$ref": "#/$defs/work_type_population"
     },
     "dim": {
       "enum": [
@@ -47,6 +105,9 @@
       "minLength": 1,
       "type": "string"
     },
+    "overall": {
+      "$ref": "#/$defs/work_type_population"
+    },
     "pre_pot_fp_scale_available": {
       "const": false
     },
@@ -58,6 +119,9 @@
     },
     "provenance": {
       "type": "object"
+    },
+    "residual": {
+      "$ref": "#/$defs/work_type_population"
     },
     "scale_domain": {
       "const": "hp1_block_pot_to_channel_anchor"
@@ -111,7 +175,10 @@
     "avg_delta_w_weighting",
     "total_partial_sum_count",
     "update_definition",
-    "pre_pot_fp_scale_available"
+    "pre_pot_fp_scale_available",
+    "dense",
+    "overall",
+    "residual"
   ],
   "title": "scale_alignment_metrics",
   "type": "object"

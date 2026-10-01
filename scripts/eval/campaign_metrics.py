@@ -41,7 +41,7 @@ def outputs(kind: str, raw: Path, manifest: Manifest, output: Path,
     coverage: dict[int, set[str]] = {}
     with TemporaryDirectory(prefix="campaign-layers-") as directory, ExitStack() as stack:
         files: dict[str, tuple[Path, TextIO]] = {}
-        rows = metric_rows(raw, schemas[kind], manifest)
+        rows = weight_alignment.rows(raw, manifest) if kind == "scu" else metric_rows(raw, schemas[kind], manifest)
         header = next(rows)
         for row in rows:
             layer = text(row, "layer")
