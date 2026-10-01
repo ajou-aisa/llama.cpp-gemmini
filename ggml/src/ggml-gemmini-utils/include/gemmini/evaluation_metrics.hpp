@@ -38,6 +38,8 @@ struct Run {
 struct Row {
     uint32_t original_lane_id, source_row;
 };
+// SCU work type of one alignment; its JSON name ("DENSE", "RESIDUAL") is written only at emission.
+enum class ScaleWorkType : uint8_t { Dense = 0, Residual = 1 };
 class Invocation;
 class Session : public std::enable_shared_from_this<Session> {
 public:
@@ -72,7 +74,7 @@ public:
                       size_t tile_i, size_t tile_j, size_t tile_k,
                       const std::vector<Run> &runs, const std::vector<Row> &rows,
                       size_t radix_limb_count = 0, size_t physical_fragments = 0);
-    void scale_alignment(size_t stripe, const char *work_type, size_t column,
+    void scale_alignment(size_t stripe, ScaleWorkType work_type, size_t column,
                          size_t original_block, double original_weight_scale,
                          double aligned_pot_scale, uint32_t scu_shift_offset,
                          uint64_t updated_partial_sum_count,

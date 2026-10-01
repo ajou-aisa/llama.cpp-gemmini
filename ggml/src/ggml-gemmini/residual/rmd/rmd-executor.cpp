@@ -1762,7 +1762,7 @@ static RmdStatus execute_rmd_stripe_im2p_run_aware(
     try {
       const auto plan = wroute::resolve_weight_route_plan(args, wroute::WeightScaleInfoMode::ResidualHp1Scu);
       for (const auto &run : request.runs)
-        evaluation::observe_scu_block(args, plan, packet.stripe_id, "RESIDUAL",
+        evaluation::observe_scu_block(args, plan, packet.stripe_id, evaluation::ScaleWorkType::Residual,
             run.original_block_id, request.m, (run.compact_k_count + kArrayDim - 1) / kArrayDim);
     } catch (...) {
       return RmdStatus::execution_failed;

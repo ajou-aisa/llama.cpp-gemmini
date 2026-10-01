@@ -3,6 +3,7 @@
 #include <gemmini/semantic.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <iomanip>
@@ -14,6 +15,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #ifndef _WIN32
 #include <unistd.h>
@@ -23,8 +25,11 @@ namespace ggml::gemmini::evaluation {
 namespace {
 std::mutex active_mutex;
 std::weak_ptr<Session> active;
-void require(bool condition, const char *message) {
-    if (!condition) throw std::runtime_error(std::string("evaluation metrics: ") + message);
+[[noreturn]] void fail(const char *message) {
+    throw std::runtime_error(std::string("evaluation metrics: ") + message);
+}
+inline void require(bool condition, const char *message) {
+    if (!condition) fail(message);
 }
 std::string field(const char *name, uint64_t value) {
     return ",\"" + std::string(name) + "\":" + std::to_string(value);
@@ -40,6 +45,75 @@ std::string real_field(const char *name, double value) {
     return stream.str();
 }
 #endif
+// SCU sums are integer sufficient statistics: every addition is checked, an overflow fails instead of wrapping.
+void add(uint64_t &sum, uint64_t value) {
+    require(value <= std::numeric_limits<uint64_t>::max() - sum, "SCU aggregate overflow");
+    sum += value;
+}
+struct ScaleSums {
+    uint64_t delta_w_sum = 0, max_delta_w = 0, alignment_count = 0,
+             updated_partial_sum_count = 0, total_partial_sum_count = 0, zero_weight_count = 0;
+    void merge(const ScaleSums &other) {
+        add(delta_w_sum, other.delta_w_sum);
+        max_delta_w = std::max(max_delta_w, other.max_delta_w);
+        add(alignment_count, other.alignment_count);
+        add(updated_partial_sum_count, other.updated_partial_sum_count);
+        add(total_partial_sum_count, other.total_partial_sum_count);
+        add(zero_weight_count, other.zero_weight_count);
+    }
+};
+const char *work_type_name(size_t type) {
+    return type == static_cast<size_t>(ScaleWorkType::Dense) ? "DENSE" : "RESIDUAL";
+}
+// The SCU coordinates (work type, stripe, original block, column) an invocation has seen: one exact column bitmap
+// per (work type, stripe, original block) row, bit index == column. The producer visits a row's columns in order,
+// so a coordinate is one bit test-and-set; columns from kBitmapColumns up go to an exact ordered set instead.
+class ScaleCoordinates {
+public:
+    bool insert(ScaleWorkType type, size_t stripe, size_t original_block, size_t column) {
+        if (column >= kBitmapColumns) return wide_.emplace(type, stripe, original_block, column).second;
+        const Row key{type, stripe, original_block};
+        if (!row_ || !(key == key_)) {
+            row_ = &rows_[key];  // stable: unordered_map never moves its values
+            key_ = key;
+        }
+        const size_t word = column / 64;
+        if (word >= row_->size()) row_->resize(word + 1);
+        const uint64_t bit = uint64_t{1} << (column % 64);
+        if ((*row_)[word] & bit) return false;
+        (*row_)[word] |= bit;
+        return true;
+    }
+private:
+    static constexpr size_t kBitmapColumns = size_t{1} << 20;
+    struct Row {
+        ScaleWorkType type;
+        size_t stripe, original_block;
+        bool operator==(const Row &other) const {
+            return type == other.type && stripe == other.stripe && original_block == other.original_block;
+        }
+    };
+    struct RowHash {
+        size_t operator()(const Row &row) const noexcept {
+            return std::hash<size_t>{}((row.stripe * 0x9e3779b97f4a7c15ULL) ^
+                                       (row.original_block << 1 | static_cast<uint8_t>(row.type)));
+        }
+    };
+    std::unordered_map<Row, std::vector<uint64_t>, RowHash> rows_;
+    Row key_{};
+    std::vector<uint64_t> *row_ = nullptr;
+    std::set<std::tuple<ScaleWorkType, size_t, size_t, size_t>> wide_;
+};
+// Aggregate SCU mode: the integer sums of one invocation, merged into its chunk's AGGREGATE records exactly once,
+// at the chunk boundary that follows it (Session::chunk/finish): residual SCU work runs after the invocation's
+// quantization completes, so the chunk boundary is the first point every SCU alignment of the invocation precedes.
+struct ScaleAccumulator {
+    std::mutex mutex;  // the invocation's SCU lock: guards sums, merged and the invocation's coordinate set
+    std::string layer;
+    std::array<ScaleSums, 2> sums;  // by ScaleWorkType
+    bool merged = false;
+    bool quantized = false;  // guarded by the session mutex, set with the session's completed quantization count
+};
 std::string profile_fields() {
 #if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
     return text_field("precision", "A" + std::to_string(GGML_GEMMINI_ACTIVATION_BITS) +
@@ -56,10 +130,8 @@ struct Session::Impl {
     mutable std::mutex mutex;
     uint64_t chunk = 0, next_invocation = 0, next_record = 0, completed_quantization = 0;
     uint64_t activation_observations = 0, residual_observations = 0, scale_observations = 0;
-    // Aggregate SCU mode: integer sums of the current chunk per (layer, work type), plus run totals.
-    struct ScaleSums { uint64_t delta_w_sum = 0, max_delta_w = 0, alignment_count = 0,
-                       updated_partial_sum_count = 0, total_partial_sum_count = 0, zero_weight_count = 0; };
-    std::map<std::pair<std::string, std::string>, ScaleSums> scale_sums;
+    // Aggregate SCU mode: the invocations of the current chunk, plus run totals.
+    std::vector<std::shared_ptr<ScaleAccumulator>> scale_open;
     uint64_t scale_alignments = 0, scale_invocations = 0;
     bool chunk_set = false, finished = false, reference_complete = true;
     std::string failure;
@@ -92,15 +164,43 @@ struct Session::Impl {
             ++(file == activation ? activation_observations :
                file == residual ? residual_observations : scale_observations);
     }
-    void flush_scale_sums() {
-        for (const auto &[key, sums] : scale_sums)
-            emit(scale, "AGGREGATE", field("chunk_id", chunk) + text_field("layer", key.first) +
-                text_field("work_type", key.second) + field("delta_w_sum", sums.delta_w_sum) +
-                field("max_delta_w", sums.max_delta_w) + field("alignment_count", sums.alignment_count) +
-                field("updated_partial_sum_count", sums.updated_partial_sum_count) +
-                field("total_partial_sum_count", sums.total_partial_sum_count) +
-                field("zero_weight_count", sums.zero_weight_count));
-        scale_sums.clear();
+    // Seal and merge every invocation of the closing chunk exactly once, then emit one AGGREGATE per observed
+    // (layer, work type), ordered by layer, then DENSE before RESIDUAL. An invocation whose quantization never
+    // completed is incomplete: it rejects the boundary of a successful run and is left out of a failed one.
+    void flush_scale_sums(bool success) {
+        const auto invocations = std::move(scale_open);
+        scale_open.clear();
+        std::map<std::string, std::array<ScaleSums, 2>> layers;
+        uint64_t alignments = 0, observed = 0;
+        bool incomplete = false;
+        for (const auto &invocation : invocations) {
+            std::lock_guard<std::mutex> lock(invocation->mutex);
+            require(!invocation->merged, "duplicate SCU invocation merge");
+            invocation->merged = true;
+            if (!invocation->quantized) {
+                incomplete = true;
+                continue;
+            }
+            for (size_t type = 0; type < invocation->sums.size(); ++type)
+                if (invocation->sums[type].alignment_count)
+                    layers[invocation->layer][type].merge(invocation->sums[type]);
+            add(alignments, invocation->sums[0].alignment_count);
+            add(alignments, invocation->sums[1].alignment_count);
+            observed += invocation->sums[0].alignment_count || invocation->sums[1].alignment_count;
+        }
+        require(!success || !incomplete, "SCU aggregate of an incomplete invocation");
+        add(scale_alignments, alignments);
+        scale_invocations += observed;
+        for (const auto &[layer, sums] : layers)
+            for (size_t type = 0; type < sums.size(); ++type)
+                if (sums[type].alignment_count)
+                    emit(scale, "AGGREGATE", field("chunk_id", chunk) + text_field("layer", layer) +
+                        text_field("work_type", work_type_name(type)) + field("delta_w_sum", sums[type].delta_w_sum) +
+                        field("max_delta_w", sums[type].max_delta_w) +
+                        field("alignment_count", sums[type].alignment_count) +
+                        field("updated_partial_sum_count", sums[type].updated_partial_sum_count) +
+                        field("total_partial_sum_count", sums[type].total_partial_sum_count) +
+                        field("zero_weight_count", sums[type].zero_weight_count));
     }
 };
 struct Invocation::Impl {
@@ -113,8 +213,8 @@ struct Invocation::Impl {
     std::map<size_t, std::pair<size_t, size_t>> stripes;
     std::set<size_t> compact_stripes;
     std::set<size_t> radix_stripes;
-    std::set<std::tuple<std::string, size_t, size_t, size_t>> scale_coordinates;
-    std::string layer;
+    ScaleCoordinates scale_coordinates;
+    std::shared_ptr<ScaleAccumulator> scale;  // aggregate SCU mode only
     uint64_t finite = 0, fp_count = 0, selected = 0, intersection = 0, residual = 0;
     uint64_t requant_events = 0, observed_count = 0;
     bool activation_finished = false, reference_complete = false;
@@ -206,7 +306,7 @@ void Session::chunk(uint64_t chunk) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->check();
     require(!impl_->chunk_set || chunk > impl_->chunk, "non-increasing chunk identity");
-    impl_->flush_scale_sums();  // aggregates of the previous chunk; empty in detailed mode
+    impl_->flush_scale_sums(true);  // aggregates of the previous chunk; empty in detailed mode
     impl_->chunk = chunk;
     impl_->chunk_set = true;
 }
@@ -219,7 +319,11 @@ std::shared_ptr<Invocation> Session::invocation(const std::string &layer, size_t
     data->session = shared_from_this();
     data->m = m;
     data->k = k;
-    data->layer = layer;
+    if (impl_->scale && impl_->config.scale_aggregate) {
+        data->scale = std::make_shared<ScaleAccumulator>();
+        data->scale->layer = layer;
+        impl_->scale_open.push_back(data->scale);
+    }
     data->identity = field("chunk_id", impl_->chunk) +
         field("invocation_id", impl_->next_invocation++) + text_field("layer", layer);
     if (const auto semantic_context = semantic::current_context())
@@ -273,7 +377,7 @@ void Session::finish(bool success) {
         field("observation_count", impl_->activation_observations));
     impl_->emit(impl_->residual, "RUN_END", fields + field("observation_count", impl_->residual_observations));
     if (impl_->config.scale_aggregate) {
-        impl_->flush_scale_sums();
+        impl_->flush_scale_sums(success);
         impl_->emit(impl_->scale, "RUN_END", fields + field("observation_count", impl_->scale_observations) +
             field("alignment_count", impl_->scale_alignments) +
             field("scale_invocation_count", impl_->scale_invocations));
@@ -358,6 +462,7 @@ void Invocation::finish_activation() {
     impl_->activation_finished = true;
     std::lock_guard<std::mutex> session_lock(session.mutex);
     ++session.completed_quantization;
+    if (impl_->scale) impl_->scale->quantized = true;
 }
 void Invocation::main_stripe(size_t stripe, size_t begin, size_t m, size_t n, size_t k) {
 #if GGML_GEMMINI_RESIDUAL_METRICS
@@ -463,16 +568,18 @@ void Invocation::compact_work(size_t stripe, size_t m, size_t n, size_t k, size_
 #endif
 }
 
-void Invocation::scale_alignment(size_t stripe, const char *work_type, size_t column,
+void Invocation::scale_alignment(size_t stripe, ScaleWorkType work_type, size_t column,
                                   size_t original_block, double original_weight_scale,
                                   double aligned_pot_scale, uint32_t scu_shift_offset,
                                   uint64_t updated_partial_sum_count,
                                   uint64_t total_partial_sum_count, bool zero_weight) {
 #if GGML_GEMMINI_SCALE_METRICS
-    std::lock_guard<std::mutex> lock(impl_->mutex);
     auto &session = *impl_->session->impl_;
     if (!session.scale) return;
-    require(work_type && (std::string(work_type) == "DENSE" || std::string(work_type) == "RESIDUAL") &&
+    // Aggregate mode takes only the invocation's SCU lock; detailed mode the invocation lock, then the session's.
+    std::lock_guard<std::mutex> lock(impl_->scale ? impl_->scale->mutex : impl_->mutex);
+    require(!impl_->scale || !impl_->scale->merged, "SCU alignment after its chunk aggregate");
+    require((work_type == ScaleWorkType::Dense || work_type == ScaleWorkType::Residual) &&
             std::isfinite(original_weight_scale) && std::isfinite(aligned_pot_scale) &&
             total_partial_sum_count && updated_partial_sum_count <= total_partial_sum_count &&
             original_block <= (impl_->k - 1) / 32 && scu_shift_offset <= 32767,
@@ -483,25 +590,19 @@ void Invocation::scale_alignment(size_t stripe, const char *work_type, size_t co
                 std::ldexp(aligned_pot_scale, scu_shift_offset) == original_weight_scale &&
                 updated_partial_sum_count == (scu_shift_offset ? total_partial_sum_count : 0),
             "SCU scale/offset/count mismatch");
-    const bool first = impl_->scale_coordinates.empty();
-    require(impl_->scale_coordinates.emplace(work_type, stripe, column, original_block).second,
+    require(impl_->scale_coordinates.insert(work_type, stripe, original_block, column),
             "duplicate SCU alignment coordinate");
-    std::lock_guard<std::mutex> session_lock(session.mutex);
-    if (session.config.scale_aggregate) {
-        session.check();
-        auto &sums = session.scale_sums[{impl_->layer, work_type}];
-        sums.delta_w_sum += scu_shift_offset;
-        sums.max_delta_w = std::max<uint64_t>(sums.max_delta_w, scu_shift_offset);
-        ++sums.alignment_count;
-        sums.updated_partial_sum_count += updated_partial_sum_count;
-        sums.total_partial_sum_count += total_partial_sum_count;
-        sums.zero_weight_count += zero_weight;
-        ++session.scale_alignments;
-        session.scale_invocations += first;
+    if (impl_->scale) {
+        auto &sums = impl_->scale->sums[static_cast<size_t>(work_type)];
+        auto next = sums;  // checked as a whole: an overflowing alignment changes no sum
+        next.merge({scu_shift_offset, scu_shift_offset, 1, updated_partial_sum_count, total_partial_sum_count,
+                    zero_weight});
+        sums = next;
         return;
     }
+    std::lock_guard<std::mutex> session_lock(session.mutex);
     session.emit(session.scale, "SCALE_ALIGNMENT", impl_->identity + field("stripe_id", stripe) +
-        text_field("work_type", work_type) + field("column", column) +
+        text_field("work_type", work_type_name(static_cast<size_t>(work_type))) + field("column", column) +
         field("original_block", original_block) + real_field("original_weight_scale", original_weight_scale) +
         real_field("aligned_pot_scale", aligned_pot_scale) + field("scu_shift_offset", scu_shift_offset) +
         field("updated_partial_sum_count", updated_partial_sum_count) +

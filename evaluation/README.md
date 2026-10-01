@@ -112,7 +112,10 @@ standalone observer/reducer smoke requires no cycle library or timing call.
   above (duplicates per invocation included) and emits one `AGGREGATE` record per (chunk, layer, work type) with
   `delta_w_sum`, `max_delta_w`, `alignment_count`, `updated_partial_sum_count`, `total_partial_sum_count` and
   `zero_weight_count` (schema `im2p-scale-alignment-aggregate`; `RUN_END` adds the total `alignment_count` and
-  `scale_invocation_count`). The reducer reads either stream and returns the same summary.
+  `scale_invocation_count`). The reducer reads either stream and returns the same summary. Each invocation sums its
+  own coordinates and joins its chunk's records once, at the next chunk boundary; an SCU alignment after that
+  boundary, an invocation still incomplete there, or a sum overflowing 64 bits fails the run instead of being
+  attributed elsewhere or wrapping.
   The GGUF lacks the pre-PoT FP scale; outputs explicitly declare
   `pre_pot_fp_scale_available=false`. This is not a reconstructed FP-to-PoT error.
 

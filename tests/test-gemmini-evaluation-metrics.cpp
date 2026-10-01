@@ -1,15 +1,21 @@
 #include <gemmini/evaluation_metrics.hpp>
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <random>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <limits>
+#include <tuple>
 
 namespace evaluation = ggml::gemmini::evaluation;
+constexpr auto DENSE = evaluation::ScaleWorkType::Dense;
+constexpr auto RESIDUAL = evaluation::ScaleWorkType::Residual;
 
 static std::string read(const std::filesystem::path &path) {
     std::ifstream input(path);
@@ -17,9 +23,11 @@ static std::string read(const std::filesystem::path &path) {
 }
 
 template<typename Callback>
-static void rejects(Callback callback) {
+static void rejects(Callback callback, const char *reason = "") {
     bool rejected = false;
-    try { callback(); } catch (const std::runtime_error &) { rejected = true; }
+    try { callback(); } catch (const std::runtime_error &error) {
+        rejected = std::string(error.what()).find(reason) != std::string::npos;
+    }
     assert(rejected);
 }
 
@@ -112,23 +120,23 @@ static std::string scale_workload(const std::filesystem::path &directory, const 
     auto session = evaluation::Session::start(config);
     session->chunk(0);
     auto first = session->invocation("blk.0", 1, 64, nullptr);
-    first->scale_alignment(0, "DENSE", 0, 0, 8.0, 0.5, 4, 3, 3);
-    first->scale_alignment(0, "DENSE", 1, 1, 0.5, 0.5, 0, 0, 5);
-    first->scale_alignment(0, "RESIDUAL", 0, 0, 2.0, 0.5, 2, 7, 7);    // same coordinate, other work type
-    first->scale_alignment(0, "RESIDUAL", 1, 0, 0, 0.5, 0, 0, 11, true);
-    rejects([&] { first->scale_alignment(0, "DENSE", 0, 0, 8.0, 0.5, 4, 3, 3); });       // duplicate
-    rejects([&] { first->scale_alignment(0, "DENSE", 2, 0, 8.0, 0.5, 3, 3, 3); });       // scale/offset
-    rejects([&] { first->scale_alignment(0, "DENSE", 3, 0, 8.0, 0.5, 4, 2, 3); });       // update count
-    rejects([&] { first->scale_alignment(0, "DENSE", 4, 0, NAN, 0.5, 0, 0, 3); });       // nonfinite
-    rejects([&] { first->scale_alignment(0, "DENSE", 5, 0, 0, 0.5, 1, 0, 3, true); });   // zero weight
-    rejects([&] { first->scale_alignment(0, "OTHER", 6, 0, 0.5, 0.5, 0, 0, 3); });       // work type
+    first->scale_alignment(0, DENSE, 0, 0, 8.0, 0.5, 4, 3, 3);
+    first->scale_alignment(0, DENSE, 1, 1, 0.5, 0.5, 0, 0, 5);
+    first->scale_alignment(0, RESIDUAL, 0, 0, 2.0, 0.5, 2, 7, 7);    // same coordinate, other work type
+    first->scale_alignment(0, RESIDUAL, 1, 0, 0, 0.5, 0, 0, 11, true);
+    rejects([&] { first->scale_alignment(0, DENSE, 0, 0, 8.0, 0.5, 4, 3, 3); });       // duplicate
+    rejects([&] { first->scale_alignment(0, DENSE, 2, 0, 8.0, 0.5, 3, 3, 3); });       // scale/offset
+    rejects([&] { first->scale_alignment(0, DENSE, 3, 0, 8.0, 0.5, 4, 2, 3); });       // update count
+    rejects([&] { first->scale_alignment(0, DENSE, 4, 0, NAN, 0.5, 0, 0, 3); });       // nonfinite
+    rejects([&] { first->scale_alignment(0, DENSE, 5, 0, 0, 0.5, 1, 0, 3, true); });   // zero weight
+    rejects([&] { first->scale_alignment(0, static_cast<evaluation::ScaleWorkType>(2), 6, 0, 0.5, 0.5, 0, 0, 3); });       // work type
     first->finish_activation();
     auto second = session->invocation("blk.1", 1, 32, nullptr);
-    second->scale_alignment(0, "DENSE", 0, 0, 32.0, 0.25, 7, 2, 2);
+    second->scale_alignment(0, DENSE, 0, 0, 32.0, 0.25, 7, 2, 2);
     second->finish_activation();
     session->chunk(1);
     auto third = session->invocation("blk.0", 1, 32, nullptr);
-    third->scale_alignment(1, "DENSE", 0, 0, 1.0, 0.25, 2, 4, 4);
+    third->scale_alignment(1, DENSE, 0, 0, 1.0, 0.25, 2, 4, 4);
     third->finish_activation();
     session->finish(true);
     first.reset(); second.reset(); third.reset(); session.reset();
@@ -157,6 +165,169 @@ static void scale_aggregate_cases(const std::filesystem::path &directory) {
                "\"alignment_count\":1,\"updated_partial_sum_count\":4,\"total_partial_sum_count\":4,"
                "\"zero_weight_count\":0}"));
     assert(has("\"observation_count\":4,\"alignment_count\":6,\"scale_invocation_count\":3}"));
+}
+static evaluation::Config scale_config(const std::filesystem::path &directory, const std::string &name) {
+    evaluation::Config config;
+    config.run_id = name;
+    config.workload_id = "scale-mutations";
+    config.manifest_sha256 = std::string(64, 'c');
+    config.scale_path = (directory / (name + ".jsonl")).string();
+    config.scale_aggregate = true;
+    return config;
+}
+// Every invalid alignment still rejects in aggregate mode; coordinates differ by work type, stripe, column or block.
+static void scale_mutation_cases(const std::filesystem::path &directory) {
+    const auto config = scale_config(directory, "scale-mutations");
+    auto session = evaluation::Session::start(config);
+    session->chunk(0);
+    auto invocation = session->invocation("blk.0", 1, 64, nullptr);
+    invocation->scale_alignment(0, DENSE, 0, 0, 8.0, 0.5, 4, 3, 3);
+    rejects([&] { invocation->scale_alignment(0, DENSE, 0, 0, 8.0, 0.5, 4, 3, 3); },
+            "duplicate SCU alignment coordinate");
+    invocation->scale_alignment(0, RESIDUAL, 0, 0, 8.0, 0.5, 4, 3, 3);   // same coordinate, other work type
+    invocation->scale_alignment(1, DENSE, 0, 0, 8.0, 0.5, 4, 3, 3);      // other stripe
+    invocation->scale_alignment(0, DENSE, 1, 0, 8.0, 0.5, 4, 3, 3);      // other column
+    invocation->scale_alignment(0, DENSE, 0, 1, 8.0, 0.5, 4, 3, 3);      // other original block
+    const auto invalid = [&](auto callback) { rejects(callback, "invalid SCU alignment record"); };
+    invalid([&] { invocation->scale_alignment(0, static_cast<evaluation::ScaleWorkType>(2), 2, 0, 8.0, 0.5, 4, 3, 3); });
+    invalid([&] { invocation->scale_alignment(0, DENSE, 2, 0, 8.0, 0.5, 32768, 3, 3); });   // shift beyond SCU range
+    invalid([&] { invocation->scale_alignment(0, DENSE, 2, 0, 8.0, 0.5, 4, 4, 3); });       // updated > total
+    invalid([&] { invocation->scale_alignment(0, DENSE, 2, 0, 8.0, 0.5, 4, 0, 0); });       // no partial sums
+    invalid([&] { invocation->scale_alignment(0, DENSE, 2, 2, 8.0, 0.5, 4, 3, 3); });       // block beyond K
+    invalid([&] { invocation->scale_alignment(0, DENSE, 2, 0, INFINITY, 0.5, 4, 3, 3); }); // nonfinite
+    const auto mismatch = [&](auto callback) { rejects(callback, "SCU scale/offset/count mismatch"); };
+    mismatch([&] { invocation->scale_alignment(0, DENSE, 2, 0, 0, 0.5, 1, 0, 3, true); });    // zero weight, shift
+    mismatch([&] { invocation->scale_alignment(0, DENSE, 2, 0, 8.0, 0.5, 3, 3, 3); });        // inconsistent scale
+    mismatch([&] { invocation->scale_alignment(0, DENSE, 2, 0, 8.0, 0.5, 4, 0, 3); });        // shifted, not updated
+    mismatch([&] { invocation->scale_alignment(0, DENSE, 2, 0, 0.5, 0.5, 0, 3, 3); });        // updated, not shifted
+    invocation->finish_activation();
+    rejects([&] { invocation->finish_activation(); }, "duplicate quantization completion");
+    // A sum that would wrap rejects and leaves the sums as they were.
+    auto wide = session->invocation("blk.1", 1, 32, nullptr);
+    wide->scale_alignment(0, DENSE, 0, 0, 0.5, 0.5, 0, 0, UINT64_MAX);
+    rejects([&] { wide->scale_alignment(0, DENSE, 1, 0, 0.5, 0.5, 0, 0, 1); }, "SCU aggregate overflow");
+    wide->finish_activation();
+    session->chunk(1);
+    // An invocation's sums are merged once at its chunk boundary; nothing joins them afterwards.
+    rejects([&] { invocation->scale_alignment(0, DENSE, 3, 0, 8.0, 0.5, 4, 3, 3); },
+            "SCU alignment after its chunk aggregate");
+    session->finish(true);
+    rejects([&] { session->finish(true); }, "session already finished");
+    invocation.reset(); wide.reset(); session.reset();
+    const auto data = read(config.scale_path);
+    const auto has = [&](const std::string &fields) { return data.find(fields) != std::string::npos; };
+    assert(has("\"chunk_id\":0,\"layer\":\"blk.0\",\"work_type\":\"DENSE\",\"delta_w_sum\":16,\"max_delta_w\":4,"
+               "\"alignment_count\":4,\"updated_partial_sum_count\":12,\"total_partial_sum_count\":12,"
+               "\"zero_weight_count\":0}"));
+    assert(has("\"chunk_id\":0,\"layer\":\"blk.0\",\"work_type\":\"RESIDUAL\",\"delta_w_sum\":4,\"max_delta_w\":4,"
+               "\"alignment_count\":1,\"updated_partial_sum_count\":3,\"total_partial_sum_count\":3,"
+               "\"zero_weight_count\":0}"));
+    assert(has("\"chunk_id\":0,\"layer\":\"blk.1\",\"work_type\":\"DENSE\",\"delta_w_sum\":0,\"max_delta_w\":0,"
+               "\"alignment_count\":1,\"updated_partial_sum_count\":0,"
+               "\"total_partial_sum_count\":18446744073709551615,\"zero_weight_count\":0}"));
+    assert(has("\"success\":true,\"invocation_count\":2,\"observation_count\":3,\"alignment_count\":6,"
+               "\"scale_invocation_count\":2}"));
+    assert(data.find("\"chunk_id\":1") == std::string::npos);
+}
+// Concurrent producers of one invocation (stripe workers) under the invocation's SCU lock: each coordinate counted once.
+static void scale_concurrency_case(const std::filesystem::path &directory) {
+    const auto config = scale_config(directory, "scale-concurrent");
+    auto session = evaluation::Session::start(config);
+    session->chunk(0);
+    auto invocation = session->invocation("blk.0", 1, 64, nullptr);
+    std::vector<std::thread> workers;
+    for (size_t stripe = 0; stripe < 4; ++stripe)
+        workers.emplace_back([&, stripe] {
+            for (size_t column = 0; column < 1000; ++column) {
+                invocation->scale_alignment(stripe, DENSE, column, 0, 8.0, 0.5, 4, 3, 3);
+                invocation->scale_alignment(stripe, RESIDUAL, column, 1, 0, 0.5, 0, 0, 2, true);
+            }
+        });
+    for (auto &worker : workers) worker.join();
+    invocation->finish_activation();
+    session->finish(true);
+    invocation.reset(); session.reset();
+    const auto data = read(config.scale_path);
+    assert(data.find("\"work_type\":\"DENSE\",\"delta_w_sum\":16000,\"max_delta_w\":4,\"alignment_count\":4000,"
+                     "\"updated_partial_sum_count\":12000,\"total_partial_sum_count\":12000,\"zero_weight_count\":0}") !=
+           std::string::npos);
+    assert(data.find("\"work_type\":\"RESIDUAL\",\"delta_w_sum\":0,\"max_delta_w\":0,\"alignment_count\":4000,"
+                     "\"updated_partial_sum_count\":0,\"total_partial_sum_count\":8000,\"zero_weight_count\":4000}") !=
+           std::string::npos);
+}
+// Duplicate detection is exact on a grid with bitmap-word, bitmap-range and size_t edges: in any order, in both
+// modes, each coordinate is accepted once and rejected as a duplicate the second time.
+static void scale_coordinate_cases(const std::filesystem::path &directory) {
+    using Coordinate = std::tuple<evaluation::ScaleWorkType, size_t, size_t, size_t>;  // type, stripe, block, column
+    const size_t wide = size_t{1} << 20, top = std::numeric_limits<size_t>::max();
+    std::vector<Coordinate> grid;
+    for (const auto type : {DENSE, RESIDUAL})
+        for (const size_t stripe : {size_t{0}, size_t{1}, top})
+            for (const size_t block : {size_t{0}, size_t{1}})
+                for (const size_t column : {size_t{0}, size_t{1}, size_t{63}, size_t{64}, size_t{65}, size_t{127},
+                                            size_t{128}, wide - 1, wide, wide + 1, top / 2, top})
+                    grid.emplace_back(type, stripe, block, column);
+    for (const bool aggregate : {true, false}) {
+        auto config = scale_config(directory, aggregate ? "scale-grid-aggregate" : "scale-grid-detailed");
+        config.scale_aggregate = aggregate;
+        auto session = evaluation::Session::start(config);
+        session->chunk(0);
+        auto invocation = session->invocation("blk.0", 1, 64, nullptr);
+        auto order = grid;
+        order.insert(order.end(), grid.begin(), grid.end());
+        std::shuffle(order.begin(), order.end(), std::mt19937(aggregate ? 7 : 11));
+        std::set<Coordinate> seen;
+        for (const auto &coordinate : order) {
+            const auto align = [&] {
+                invocation->scale_alignment(std::get<1>(coordinate), std::get<0>(coordinate), std::get<3>(coordinate),
+                                            std::get<2>(coordinate), 8.0, 0.5, 4, 3, 3);
+            };
+            if (seen.insert(coordinate).second) align();
+            else rejects(align, "duplicate SCU alignment coordinate");
+        }
+        invocation->finish_activation();
+        session->finish(true);
+        invocation.reset(); session.reset();
+        const auto data = read(config.scale_path);
+        const auto half = std::to_string(grid.size() / 2);
+        if (aggregate) {
+            for (const char *type : {"DENSE", "RESIDUAL"})
+                assert(data.find(std::string("\"work_type\":\"") + type + "\",\"delta_w_sum\":" +
+                                 std::to_string(grid.size() / 2 * 4) + ",\"max_delta_w\":4,\"alignment_count\":" + half +
+                                 ",") != std::string::npos);
+            assert(data.find("\"alignment_count\":" + std::to_string(grid.size()) + ",\"scale_invocation_count\":1}") !=
+                   std::string::npos);
+        } else {
+            assert(data.find("\"observation_count\":" + std::to_string(grid.size()) + "}") != std::string::npos);
+            assert(data.find("\"column\":" + std::to_string(top)) != std::string::npos);
+        }
+    }
+}
+// An invocation whose quantization never completed is never merged: it rejects the chunk boundary of a
+// successful run and is left out of a failed one.
+static void scale_incomplete_cases(const std::filesystem::path &directory) {
+    for (const bool boundary : {true, false}) {
+        const auto config = scale_config(directory, boundary ? "scale-incomplete-chunk" : "scale-incomplete-failed");
+        auto session = evaluation::Session::start(config);
+        session->chunk(0);
+        auto complete = session->invocation("blk.0", 1, 32, nullptr);
+        complete->scale_alignment(0, DENSE, 0, 0, 8.0, 0.5, 4, 2, 2);
+        complete->finish_activation();
+        auto partial = session->invocation("blk.1", 1, 32, nullptr);
+        partial->scale_alignment(0, DENSE, 0, 0, 1.0, 0.25, 2, 4, 4);
+        if (boundary) rejects([&] { session->chunk(1); }, "SCU aggregate of an incomplete invocation");
+        else rejects([&] { session->finish(true); }, "incomplete invocation coverage");
+        session->finish(false);
+        rejects([&] { partial->scale_alignment(0, DENSE, 1, 0, 1.0, 0.25, 2, 4, 4); },
+                "SCU alignment after its chunk aggregate");
+        complete.reset(); partial.reset(); session.reset();
+        const auto data = read(config.scale_path);
+        assert(data.find("\"layer\":\"blk.1\"") == std::string::npos);
+        assert((data.find("\"layer\":\"blk.0\"") != std::string::npos) == !boundary);
+        assert(data.find("\"success\":false") != std::string::npos);
+        assert(data.find(boundary ? "\"alignment_count\":0,\"scale_invocation_count\":0}"
+                                  : "\"alignment_count\":1,\"scale_invocation_count\":1}") != std::string::npos);
+    }
 }
 #endif
 
@@ -206,12 +377,12 @@ int main(int argc, char **argv) {
     const float values[] = {-100, 0, 0, 0, 0, 0, 0, 100, 0, 0, 0, 0, 0, 0, 0, 0};
     auto invocation = session->invocation("layer", 2, 8, values);
 #if GGML_GEMMINI_SCALE_METRICS
-    invocation->scale_alignment(0, "DENSE", 0, 0, 8.0, 0.5, 4, 2, 2);
-    invocation->scale_alignment(0, "DENSE", 1, 0, 0.5, 0.5, 0, 0, 2);
-    invocation->scale_alignment(0, "DENSE", 2, 0, 0, 0.5, 0, 0, 2, true);
-    rejects([&] { invocation->scale_alignment(0, "DENSE", 0, 0, 8.0, 0.5, 4, 2, 2); });
-    rejects([&] { invocation->scale_alignment(0, "DENSE", 0, 0, 8, 0.5, 3, 2, 2); });
-    rejects([&] { invocation->scale_alignment(0, "DENSE", 0, 0, 8, 0.5, 4, 1, 2); });
+    invocation->scale_alignment(0, DENSE, 0, 0, 8.0, 0.5, 4, 2, 2);
+    invocation->scale_alignment(0, DENSE, 1, 0, 0.5, 0.5, 0, 0, 2);
+    invocation->scale_alignment(0, DENSE, 2, 0, 0, 0.5, 0, 0, 2, true);
+    rejects([&] { invocation->scale_alignment(0, DENSE, 0, 0, 8.0, 0.5, 4, 2, 2); });
+    rejects([&] { invocation->scale_alignment(0, DENSE, 0, 0, 8, 0.5, 3, 2, 2); });
+    rejects([&] { invocation->scale_alignment(0, DENSE, 0, 0, 8, 0.5, 4, 1, 2); });
 #endif
 #if GGML_GEMMINI_ACT_QUANT_METRICS
     std::thread worker([&] {
@@ -280,6 +451,10 @@ int main(int argc, char **argv) {
 #endif
 #if GGML_GEMMINI_SCALE_METRICS
     scale_aggregate_cases(directory);
+    scale_mutation_cases(directory);
+    scale_coordinate_cases(directory);
+    scale_concurrency_case(directory);
+    scale_incomplete_cases(directory);
 #endif
 #else
     assert(!session);

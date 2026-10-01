@@ -12,7 +12,7 @@ namespace ggml::gemmini::evaluation {
 #if GGML_GEMMINI_SCALE_METRICS
 inline void observe_scu_block(const ggml_gemmini_args_t &args,
                               const quants::wroute::WeightRoutePlan &plan,
-                              size_t stripe, const char *work_type, size_t block,
+                              size_t stripe, ScaleWorkType work_type, size_t block,
                               size_t rows, size_t fragments) {
     if (!args.evaluation_context || !args.evaluation_context->scale_enabled()) return;
     if (!plan.valid || !plan.hp1_carriers)
@@ -37,7 +37,7 @@ inline void observe_dense_scu(const ggml_gemmini_args_t &args, size_t stripe, si
         args, quants::wroute::WeightScaleInfoMode::ResidualHp1Scu);
     for (size_t begin = 0; begin < args.K; begin += 32) {
         const size_t valid_k = std::min(size_t{32}, args.K - begin);
-        observe_scu_block(args, plan, stripe, "DENSE", begin / 32, rows,
+        observe_scu_block(args, plan, stripe, ScaleWorkType::Dense, begin / 32, rows,
             (valid_k + DIM - 1) / DIM);
     }
 }

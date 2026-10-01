@@ -93,7 +93,7 @@ int main(int argc, char **argv) {
 #if GGML_GEMMINI_SCALE_METRICS
             const auto plan = quants::wroute::resolve_weight_route_plan(
                 observed, quants::wroute::WeightScaleInfoMode::ResidualHp1Scu);
-            evaluation::observe_scu_block(observed, plan, packet->stripe_id, "RESIDUAL",
+            evaluation::observe_scu_block(observed, plan, packet->stripe_id, evaluation::ScaleWorkType::Residual,
                 run.original_block_id, request.m, (run.compact_k_count + DIM - 1) / DIM);
 #endif
         }
