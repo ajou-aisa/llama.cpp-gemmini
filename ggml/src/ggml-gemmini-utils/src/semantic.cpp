@@ -3,6 +3,7 @@
 #include <gemmini/cpu_log_context.hpp>
 #include <gemmini/log.hpp>
 #include <cstdio>
+#include <cstdlib>
 #include <iomanip>
 #include <mutex>
 #include <sstream>
@@ -101,7 +102,10 @@ std::shared_ptr<Session> Session::start(Source source, const std::string &worklo
     impl->cpu_only_build = cpu_only_build;
     const auto path = log::resolve_output_path("log/semantic-graph.jsonl");
     require(!path.empty() && log::prepare_output_parent(path), "unsafe metadata path");
-    impl->file = std::fopen(path.string().c_str(), "wx");
+    // Default CWD/output/log is shared by ad-hoc runs that already truncate the cycle log, so
+    // replace the previous graph there; an explicit GEMMINI_LOG_DIR keeps one run per directory.
+    const char *log_dir = std::getenv("GEMMINI_LOG_DIR");
+    impl->file = std::fopen(path.string().c_str(), log_dir && *log_dir ? "wx" : "w");
     require(impl->file != nullptr, "cannot exclusively create semantic-graph.jsonl");
     impl->emit("RUN", ",\"source_role\":" + quote(source_name(source)) +
         ",\"run_config_id\":\"workload-0\",\"workload\":" + workload + ",\"producer\":" + producer +
