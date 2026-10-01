@@ -175,6 +175,12 @@ void quantize_row_q4_h1_ref(const float * GGML_RESTRICT x, block_q4_h1 * GGML_RE
     finalize_q4_h1_scale_range(y, nb, min_s, max_s);
 }
 
+// PoTal block scale rule for n-bit HP1 data: theta = ilogb(amax) - rho, rho = n - 2.
+// Q4_HP1: rho = 2 (Q8_HP1 uses 6, Q16_HP1 uses 14; same table in src/llama-quant.cpp).
+static inline int q4_hp1_block_exponent(float amax) {
+    return ilogbf(amax) - 2;
+}
+
 static bool quantize_q4_hp1_input_valid(const float * x, int64_t k) {
     for (int64_t i = 0; i < k; ++i) {
         if (!isfinite(x[i])) {
@@ -188,7 +194,7 @@ static bool quantize_q4_hp1_input_valid(const float * x, int64_t k) {
         for (int j = 0; j < QK4_HP; ++j) {
             amax = MAX(amax, fabsf(x[i*QK4_HP + j]));
         }
-        if (amax > 0.0f && ldexpf(1.0f, (int) roundf(log2f(amax / 7.0f))) == 0.0f) {
+        if (amax > 0.0f && ldexpf(1.0f, q4_hp1_block_exponent(amax)) == 0.0f) {
             return false;
         }
     }
@@ -209,7 +215,7 @@ bool quantize_row_q4_hp1_ref(const float * GGML_RESTRICT x, block_q4_hp1 * GGML_
             amax = MAX(amax, fabsf(x[i*QK4_HP + j]));
         }
         if (amax > 0.0f) {
-            const float block_scale = ldexpf(1.0f, (int) roundf(log2f(amax / 7.0f)));
+            const float block_scale = ldexpf(1.0f, q4_hp1_block_exponent(amax));
             channel_scale = channel_set ? MIN(channel_scale, block_scale) : block_scale;
             channel_set = true;
         }
@@ -228,7 +234,7 @@ bool quantize_row_q4_hp1_ref(const float * GGML_RESTRICT x, block_q4_hp1 * GGML_
             continue;
         }
 
-        const int block_exponent = (int) roundf(log2f(amax / 7.0f));
+        const int block_exponent = q4_hp1_block_exponent(amax);
         const float block_scale = ldexpf(1.0f, block_exponent);
         y[i].m = (int16_t) (block_exponent - channel_exponent);
         for (int j = 0; j < QK4_HP/2; ++j) {
