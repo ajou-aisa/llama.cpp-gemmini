@@ -28,7 +28,7 @@ struct PhysicalTile {
     uint32_t packet_block_index = 0;
     uint8_t lane_position = 0;
     uint8_t lane_id = 0;
-    uint32_t m_tile = 0;
+    uint32_t m_tile = 0; // tile within this lane's packed nonzero rows
     uint32_t j_tile = 0;
     uint16_t valid_rows = 0;
     uint16_t valid_cols = 0;
@@ -56,7 +56,6 @@ private:
     std::vector<__int128> correction_values_;
     std::vector<uint8_t> seen_;
     std::vector<size_t> tile_offset_;   // per block: index of its first tile slot
-    size_t m_tiles_ = 0;
     size_t j_tiles_ = 0;
     size_t expected_ = 0;
     size_t submitted_ = 0;

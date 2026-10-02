@@ -102,6 +102,7 @@ ggml_add_backend_library(ggml-gemmini
                          quants/common/weight_reader.cpp
                          residual/direct/direct-executor.cpp
                          residual/rmd/rmd-builder.cpp
+                         residual/rmd/rmd-bitmap-builder.cpp
                          residual/rmd/rmd-run-aware.cpp
                          residual/rmd/rmd-executor.cpp
                          residual/rmd/rmd-im2p-executor.cpp
@@ -323,6 +324,7 @@ elseif (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
     target_compile_definitions(ggml-gemmini-im2p-frontend-testing PRIVATE
       ${GGML_GEMMINI_COMPILE_DEFS}
       IM2P_GEMMINI_FRONTEND_TESTING=1
+      IM2P_PRODUCTION_TRACE_ENABLED=0
       IM2P_GEMMINI_FRONTEND_EXPECTED_DIM=${GGML_GEMMINI_DIM}
       IM2P_GEMMINI_FRONTEND_ACTIVATION_BITS=${GGML_GEMMINI_ACTIVATION_BITS})
     ggml_gemmini_apply_profile_compile_definitions(ggml-gemmini-im2p-frontend-testing)

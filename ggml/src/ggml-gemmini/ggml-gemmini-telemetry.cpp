@@ -365,10 +365,12 @@ void device_diagnostics(std::ostringstream & out, const Im2pExecutionTelemetry &
     out << ",\"device\":{\"additive\":false,\"counter_bits\":64";
     string_field(out, "backend", record.backend);
     string_field(out, "clock_domain", record.clock_domain);
-    string_field(out, "numerical_contract", record.numerical_contract);
-    string_field(out, "scale_mode", record.scale_mode);
-    field(out, "vector_op", record.vector_op);
-    field(out, "output_domain", record.output_domain);
+    if (!record.numerical_contract.empty())
+        string_field(out, "numerical_contract", record.numerical_contract);
+    if (!record.scale_mode.empty())
+        string_field(out, "scale_mode", record.scale_mode);
+    if (record.vector_op) field(out, "vector_op", *record.vector_op);
+    if (record.output_domain) field(out, "output_domain", *record.output_domain);
     field(out, "activation_bits", record.activation_bits);
     field(out, "weight_bits", record.weight_bits);
     field(out, "dim", record.dim);

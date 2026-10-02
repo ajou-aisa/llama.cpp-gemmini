@@ -488,6 +488,7 @@ target_sources(${_GGML_GEMMINI_DEQUANT_FP_TARGET} PRIVATE
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
     ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-bitmap-builder.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
     ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
@@ -531,6 +532,7 @@ add_executable(test-gemmini-act-quant-i32-saturation
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
     ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-bitmap-builder.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
     ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
@@ -567,6 +569,7 @@ add_executable(test-gemmini-block-quant
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
     ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-bitmap-builder.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
     ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
@@ -642,6 +645,7 @@ add_executable(test-gemmini-exsia
     ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
     ../ggml/src/ggml-gemmini/residual/direct/direct-executor.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-bitmap-builder.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-reference.cpp
@@ -740,6 +744,7 @@ foreach(_worker_count IN ITEMS 3 4)
         ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
         ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
         ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+        ../ggml/src/ggml-gemmini/residual/rmd/rmd-bitmap-builder.cpp
         ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
         ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
         ../ggml/src/ggml-gemmini/residual/rmd/rmd-reference.cpp
@@ -848,6 +853,7 @@ add_executable(test-gemmini-exsia-writer
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
     ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-bitmap-builder.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
     ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
@@ -926,6 +932,13 @@ if (NOT GGML_BACKEND_DL)
     if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "FPGA_UART")
         target_compile_definitions(test-gemmini-rmd PRIVATE
             GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART=1)
+    elseif (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
+        target_compile_definitions(test-gemmini-rmd PRIVATE
+            GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM=1)
+        if (IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1")
+            target_compile_definitions(test-gemmini-rmd PRIVATE
+                IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1=1)
+        endif()
     endif()
     target_include_directories(test-gemmini-rmd PRIVATE
         ../ggml/src
@@ -934,18 +947,6 @@ if (NOT GGML_BACKEND_DL)
         ${GEMMINI_SW_PATH}
         ${GEMMINI_SW_PATH}/include)
     add_test(NAME test-gemmini-rmd COMMAND $<TARGET_FILE:test-gemmini-rmd>)
-    add_test(NAME test-gemmini-rmd-direct-happy
-        COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=direct-happy)
-    add_test(NAME test-gemmini-rmd-direct-failure
-        COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=direct-failure)
-    add_test(NAME test-gemmini-rmd-compact-happy
-        COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=compact-happy)
-    add_test(NAME test-gemmini-rmd-compact-failure
-        COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=compact-failure)
-    add_test(NAME test-gemmini-rmd-radix-happy
-        COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=radix-happy)
-    add_test(NAME test-gemmini-rmd-radix-failure
-        COMMAND $<TARGET_FILE:test-gemmini-rmd> --case=radix-failure)
 endif()
 
 add_executable(test-gemmini-rmd-packet
@@ -966,6 +967,21 @@ target_include_directories(test-gemmini-rmd-packet PRIVATE
     ${GEMMINI_SW_PATH}/include)
 add_test(NAME test-gemmini-rmd-packet
     COMMAND $<TARGET_FILE:test-gemmini-rmd-packet>)
+
+foreach(_bitmap_log IN ITEMS 0 1)
+    add_executable(test-gemmini-rmd-bitmap-log${_bitmap_log}
+        test-gemmini-rmd-bitmap.cpp
+        ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+        ../ggml/src/ggml-gemmini/residual/rmd/rmd-bitmap-builder.cpp)
+    target_compile_features(test-gemmini-rmd-bitmap-log${_bitmap_log} PRIVATE cxx_std_17)
+    target_compile_definitions(test-gemmini-rmd-bitmap-log${_bitmap_log} PRIVATE LOG_CYCLE=${_bitmap_log})
+    target_include_directories(test-gemmini-rmd-bitmap-log${_bitmap_log} PRIVATE
+        ../ggml/src ${TEST_GEMMINI_EXSIA_SW_PATH}
+        ${TEST_GEMMINI_EXSIA_SW_PATH}/include
+        ${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini-rocc-tests/include)
+    add_test(NAME test-gemmini-rmd-bitmap-log${_bitmap_log}
+        COMMAND $<TARGET_FILE:test-gemmini-rmd-bitmap-log${_bitmap_log}>)
+endforeach()
 
 add_executable(test-gemmini-rmd-run-aware
     test-gemmini-rmd-run-aware.cpp)
@@ -1013,7 +1029,8 @@ endif()
 add_executable(test-gemmini-rmd-capture
     test-gemmini-rmd-capture.cpp
     ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
-    ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp)
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-bitmap-builder.cpp)
 target_link_libraries(test-gemmini-rmd-capture PRIVATE
     ggml-base ggml-gemmini-utils)
 target_compile_features(test-gemmini-rmd-capture PRIVATE cxx_std_17)
@@ -1324,11 +1341,16 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
         GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM=1
         GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
         GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE})
+    if (IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1")
+        target_compile_definitions(test-gemmini-rmd-im2p-provider PRIVATE
+            IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1=1)
+    endif()
     target_include_directories(test-gemmini-rmd-im2p-provider PRIVATE
         ../ggml/src
         ../ggml/src/ggml-gemmini
-        ${IM2P_SIM_ROOT}/sim/include
         ${IM2P_SIM_ROOT}/frontend/include
+        ${IM2P_SIM_ROOT}/sim/include
+        ${IM2P_SIM_ROOT}/sim/common
         ${GEMMINI_SW_PATH}
         ${GEMMINI_SW_PATH}/include)
     if(TARGET ggml-gemmini-cpu-functional)
@@ -1361,6 +1383,11 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
             COMMAND $<TARGET_FILE:test-gemmini-rmd-im2p-provider> --case success)
         add_test(NAME test-gemmini-rmd-im2p-provider-failures
             COMMAND $<TARGET_FILE:test-gemmini-rmd-im2p-provider> --case all)
+        if (IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1" AND
+            GGML_GEMMINI_WEIGHT_BITS LESS 16)
+            add_test(NAME test-gemmini-rmd-im2p-provider-hp1-success
+                COMMAND $<TARGET_FILE:test-gemmini-rmd-im2p-provider> --case hp1-success)
+        endif()
     endif()
 
     if (IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1" AND GGML_GEMMINI_ENABLE_RMD AND NOT CYCLE_SIM)
@@ -1435,6 +1462,7 @@ add_executable(gemmini-quant-dispatch-smoke
     ../ggml/src/ggml-gemmini/quants/common/dequant.cpp
     ../ggml/src/ggml-gemmini/quants/common/weight_reader.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.cpp
+    ../ggml/src/ggml-gemmini/residual/rmd/rmd-bitmap-builder.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.cpp
     ../ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp
     ../ggml/src/ggml-gemmini/quants/act/dispatch.cpp
@@ -1496,6 +1524,8 @@ set(_GEMMINI_REGISTERED_TEST_EXECUTABLES
 if (TARGET ggml-gemmini)
 list(APPEND _GEMMINI_REGISTERED_TEST_EXECUTABLES
     test-gemmini-rmd-capture
+    test-gemmini-rmd-bitmap-log0
+    test-gemmini-rmd-bitmap-log1
     test-gemmini-act-quant-i32-saturation
     test-gemmini-exsia
     test-gemmini-exsia-writer

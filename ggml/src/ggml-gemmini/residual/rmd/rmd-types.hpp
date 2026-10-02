@@ -37,26 +37,16 @@ static_assert(
     kBlockSize % kArrayDim == 0 || kArrayDim % kBlockSize == 0,
               "Gemmini DIM and native weight scale group must divide one another");
 
-constexpr uint32_t kPacketVersion = 5;
+constexpr uint32_t kPacketVersion = 7;
 
-// The compact RMD packet stores adjacent logical Q4 digits low nibble first as
-// signed two's-complement INT4. IM2P model weights remain GGUF split-half,
-// offset-binary Q4 and are decoded by the frontend before scalar simulation.
 enum class DigitStorage : uint8_t {
     invalid = 0,
-    packed_signed_int4 = 1,
-    signed_int8 = 2,
-    signed_int16 = 3,
-};
-
-enum class Int4Packing : uint8_t {
-    none = 0,
-    adjacent_low_nibble_first = 1,
+    signed_int8 = 1,
+    signed_int16 = 2,
 };
 
 constexpr DigitStorage digit_storage_for_bits(uint8_t digit_bits) {
-  return digit_bits == 4    ? DigitStorage::packed_signed_int4
-         : digit_bits == 8  ? DigitStorage::signed_int8
+  return digit_bits == 4 || digit_bits == 8 ? DigitStorage::signed_int8
          : digit_bits == 16 ? DigitStorage::signed_int16
                             : DigitStorage::invalid;
 }
@@ -110,9 +100,11 @@ inline size_t align_up(size_t value, size_t alignment) {
 }
 
 struct LaneGroupDescriptor {
-  // Input lanes use row_count rows each, followed by one group tail padded to
-  // DIM.
+    // Only nonzero (lane, original row) pairs are stored, then one DIM-padded tail.
+    // row_offsets bounds each lane's sorted slice of row_ids (both group-local).
     std::vector<uint8_t> lane_positions;
+    std::array<uint32_t, kMaxNativeRadixLanes + 1> row_offsets{};
+    std::vector<uint16_t> row_ids;
     uint32_t k_mask = 0; // original block-local K, shared by the group's lanes
     uint16_t padded_k_count = 0;
     uint32_t activation_offset = 0;
@@ -148,16 +140,13 @@ struct BlockDescriptor {
 };
 
 // Exactly one member is populated according to StripePacket::digit_storage.
-// INT16 values live in a typed vector so their alignment is guaranteed. The
 struct ActivationPayload {
-    std::vector<uint8_t> packed_int4;
     std::vector<int8_t> signed_int8;
     std::vector<int16_t> signed_int16;
 
   friend bool operator==(const ActivationPayload &left,
                          const ActivationPayload &right) {
-        return left.packed_int4 == right.packed_int4 &&
-            left.signed_int8 == right.signed_int8 &&
+        return left.signed_int8 == right.signed_int8 &&
             left.signed_int16 == right.signed_int16;
     }
 
@@ -174,7 +163,6 @@ struct StripePacket {
     uint8_t digit_bits = 8;
     uint8_t lane_capacity = 5;
     DigitStorage digit_storage = DigitStorage::signed_int8;
-    Int4Packing int4_packing = Int4Packing::none;
 
     size_t stripe_id = 0;
     size_t row_begin = 0;
@@ -188,8 +176,8 @@ struct StripePacket {
 
     std::vector<BlockDescriptor> blocks;
     std::vector<uint16_t> k_indices; // block-local K, ascending inside each block
-  // block / group / group lane / real row / group K; zero padding only at each
-  // group tail
+    // block / group / group lane / active original row / group K;
+    // zero row padding only at each group tail.
     ActivationPayload stacked_activation;
     size_t activation_value_count = 0; // decoded values, including DIM padding
     size_t residual_event_count = 0;   // nonzero source residuals before radix expansion

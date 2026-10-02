@@ -28,13 +28,20 @@ bool provider_diagnostic_fixtures() {
     Im2pExecutionTelemetry device;
     device.backend = "im2p_sim";
     device.clock_domain = "dense_simulator";
-    device.numerical_contract = "main_external";
-    device.scale_mode = "external_block_scale";
     auto &stats = device.provider_stats.emplace();
     stats.rtl_work_total_cycles = device.rtl_work_total_cycles = UINT64_C(9007199254740993);
     stats.rtl_scale_wait_cycles = 17;
     stats.rtl_same_block_scale_hits = 23;
     const auto simulator = serialize_cycle_telemetry(device);
+    device.numerical_contract = "scu_final_integer";
+    device.scale_mode = "left_shift";
+    device.vector_op = 5;
+    device.output_domain = 2;
+    const auto observed = serialize_cycle_telemetry(device);
+    device.numerical_contract.clear();
+    device.scale_mode.clear();
+    device.vector_op.reset();
+    device.output_domain.reset();
     device.backend = "im2p_uart_test";
     device.counter_coverage = Im2pExecutionTelemetry::CounterCoverage::fpga_basic;
     const auto uart4 = serialize_cycle_telemetry(device);
@@ -70,6 +77,12 @@ bool provider_diagnostic_fixtures() {
     if (std::getenv("GEMMINI_TELEMETRY_PRINT_ALL"))
         std::printf("%s\n%s\n%s\n%s\n", simulator.c_str(), uart4.c_str(), empty.c_str(), nonzero.c_str());
     return expect(simulator.find("\"rtl_work_total_cycles\":9007199254740993") != std::string::npos &&
+                  simulator.find("\"vector_op\"") == std::string::npos &&
+                  simulator.find("\"output_domain\"") == std::string::npos &&
+                  simulator.find("\"numerical_contract\"") == std::string::npos &&
+                  simulator.find("\"scale_mode\"") == std::string::npos &&
+                  observed.find("\"vector_op\":5,\"output_domain\":2") != std::string::npos &&
+                  observed.find("\"numerical_contract\":\"scu_final_integer\"") != std::string::npos &&
                   simulator.find("\"rtl_scale_wait_cycles\":17") != std::string::npos &&
                   simulator.find("\"rtl_same_block_scale_hits\":23") != std::string::npos &&
                   simulator.find("\"counter_semantics\":\"independent_observations\"") != std::string::npos,

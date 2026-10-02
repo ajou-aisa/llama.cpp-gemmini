@@ -132,7 +132,8 @@ int main(int argc, char **argv) {
             dot.activations = activations.data(); dot.rows = 1;
             dot.activation_row_stride_bytes = 31;
             dot.weights = weights.data(); dot.columns = 3; dot.weight_row_stride = 3;
-            dot.k = 31; dot.hp1_carriers = carriers.data();
+            dot.k = 31; dot.scu_carriers = carriers.data();
+            dot.vector_op = IM2P_VECTOR_LEFT_SHIFT;
             dot.trace_context = fixture.args.optrace_context;
             dot.trace_layer = fixture.args.matmul_layer;
             dot.source_row_count = 1;

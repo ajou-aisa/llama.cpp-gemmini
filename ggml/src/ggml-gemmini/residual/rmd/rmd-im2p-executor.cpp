@@ -233,19 +233,34 @@ int read_weight_i16(void *opaque, size_t row, size_t column, size_t count,
     return 0;
 }
 
-int read_hp1_scale(void *opaque, size_t block, size_t column, size_t count,
+bool valid_scu_carrier(uint8_t op, uint32_t carrier) {
+  return op == IM2P_VECTOR_UNSIGNED_MULTIPLY ? carrier <= 65790u
+         : op == IM2P_VECTOR_LEFT_SHIFT && quants::hp1::valid_carrier(carrier);
+}
+
+int read_scu_scale(void *opaque, size_t block, size_t column, size_t count,
                    uint32_t *out) {
   const auto *context = static_cast<const ProviderContext *>(opaque);
   if (!context || !context->dot || !out || context->fail_read || block != 0 ||
-      !context->dot->hp1_carriers || column > context->dot->columns ||
+      !context->dot->scu_carriers || column > context->dot->columns ||
       count > context->dot->columns - column)
     return IM2P_ERROR;
   for (size_t j = 0; j < count; ++j) {
-    const auto carrier = context->dot->hp1_carriers[column + j];
-    if (!quants::hp1::valid_carrier(carrier))
+    const auto carrier = context->dot->scu_carriers[column + j];
+    if (!valid_scu_carrier(context->dot->vector_op, carrier))
       return IM2P_INVALID_LAYOUT;
     out[j] = carrier;
   }
+  return IM2P_OK;
+}
+
+int read_external_scale(void *opaque, size_t block, size_t column, size_t count,
+                        uint32_t *out) {
+  const auto *context = static_cast<const ProviderContext *>(opaque);
+  if (!context || !context->dot || !out || context->fail_read || block != 0 ||
+      column > context->dot->columns || count > context->dot->columns - column)
+    return IM2P_ERROR;
+  std::fill_n(out, count, uint32_t{1});
   return IM2P_OK;
 }
 
@@ -254,9 +269,11 @@ int write_output(void *opaque, size_t block, size_t row, size_t column,
   auto *context = static_cast<ProviderContext *>(opaque);
     if (context == nullptr || context->dot == nullptr || values == nullptr ||
       context->fail_write ||
-      output_domain != (context->dot->hp1_carriers
+      output_domain != (context->dot->scu_carriers
                             ? IM2P_OUTPUT_SCU_FINAL
-                            : IM2P_OUTPUT_LEGACY_FINAL) ||
+                            : context->dot->vector_op == IM2P_VECTOR_EXTERNAL
+                                  ? IM2P_OUTPUT_LEGACY_BLOCK
+                                  : IM2P_OUTPUT_LEGACY_FINAL) ||
       block != 0 || row >= context->dot->rows ||
       column > context->dot->columns ||
       count > context->dot->columns - column) {
@@ -265,7 +282,7 @@ int write_output(void *opaque, size_t block, size_t row, size_t column,
     for (size_t index = 0; index < count; ++index) {
         const size_t logical = row * context->dot->columns + column + index;
     if (logical >= context->seen.size() || context->seen[logical] != 0 ||
-        (context->dot->hp1_carriers &&
+        (context->dot->scu_carriers &&
          (values[index] < INT32_MIN || values[index] > INT32_MAX))) {
             return -1;
         }
@@ -398,12 +415,13 @@ int synthetic_execute(const im2p_matmul_desc_t *descriptor,
             int64_t sum = 0;
       int32_t scaled_acc = 0;
       uint32_t carrier = 0;
-      const bool scaled = descriptor->vector_op == IM2P_VECTOR_LEFT_SHIFT;
+      const bool scaled = descriptor->vector_op == IM2P_VECTOR_UNSIGNED_MULTIPLY ||
+                          descriptor->vector_op == IM2P_VECTOR_LEFT_SHIFT;
       if (scaled &&
           (!descriptor->provider.read_scale ||
            descriptor->provider.read_scale(descriptor->provider.context, 0, j,
                                            1, &carrier) != IM2P_OK ||
-           !quants::hp1::valid_carrier(carrier)))
+           !valid_scu_carrier(descriptor->vector_op, carrier)))
         return IM2P_ERROR;
             for (size_t k = 0; k < descriptor->k; ++k) {
                 if (descriptor->weight_bits == 16) {
@@ -429,8 +447,9 @@ int synthetic_execute(const im2p_matmul_desc_t *descriptor,
                        k + 1 == descriptor->k)) {
           if (sum < INT32_MIN || sum > INT32_MAX)
             return IM2P_ERROR;
-          const auto q =
-              quants::hp1::apply_validated(static_cast<int32_t>(sum), carrier);
+          const auto q = descriptor->vector_op == IM2P_VECTOR_UNSIGNED_MULTIPLY
+              ? quants::hp1::sat32(sum * carrier)
+              : quants::hp1::apply_validated(static_cast<int32_t>(sum), carrier);
           scaled_acc = k < std::min<size_t>(DIM, 32)
                            ? q
                            : quants::hp1::accumulate(scaled_acc, q);
@@ -695,15 +714,21 @@ RmdStatus execute_im2p_compact_dot(im2p_sim_t *sim, const Im2pCompactDot &dot,
     if (executor == nullptr || fault != Im2pProviderTestFault::none)
         return RmdStatus::unsupported_route;
 #endif
-  const bool scaled = dot.hp1_carriers != nullptr;
+  const bool scaled = dot.vector_op == IM2P_VECTOR_UNSIGNED_MULTIPLY ||
+                      dot.vector_op == IM2P_VECTOR_LEFT_SHIFT;
+  const bool external = dot.vector_op == IM2P_VECTOR_EXTERNAL;
+  if ((scaled && dot.scu_carriers == nullptr) ||
+      (!scaled && (dot.scu_carriers != nullptr ||
+                   (!external && dot.vector_op != IM2P_VECTOR_BYPASS))))
+    return RmdStatus::invalid_arguments;
 #if CYCLE_SIM
   if (dot.trace_context || (dot.cycle_sim_context &&
-      (!dot.cycle_sim_context.operation_id || !scaled || executor ||
+      (!dot.cycle_sim_context.operation_id || dot.vector_op != IM2P_VECTOR_LEFT_SHIFT || executor ||
        fault != Im2pProviderTestFault::none)))
     return RmdStatus::unsupported_route;
 #endif
   if (dot.trace_context &&
-      (!*dot.trace_context || !scaled || executor ||
+      (!*dot.trace_context || dot.vector_op != IM2P_VECTOR_LEFT_SHIFT || executor ||
        fault != Im2pProviderTestFault::none))
     return RmdStatus::unsupported_route;
   if (scaled &&
@@ -715,7 +740,7 @@ RmdStatus execute_im2p_compact_dot(im2p_sim_t *sim, const Im2pCompactDot &dot,
     return RmdStatus::unsupported_route;
   if (scaled)
     for (size_t j = 0; j < dot.columns; ++j)
-      if (!quants::hp1::valid_carrier(dot.hp1_carriers[j]))
+      if (!valid_scu_carrier(dot.vector_op, dot.scu_carriers[j]))
         return RmdStatus::invalid_arguments;
   if (dot.rows > SIZE_MAX / dot.columns ||
       dot.rows > SIZE_MAX / output_row_stride ||
@@ -739,9 +764,6 @@ RmdStatus execute_im2p_compact_dot(im2p_sim_t *sim, const Im2pCompactDot &dot,
     im2p_matmul_desc_t descriptor{};
     descriptor.abi_version = IM2P_ABI_VERSION;
     descriptor.activation_bits = dot.operand_bits;
-  // A4 is already unpacked to signed bytes by the caller; A16 uses two bytes
-  // per digit. Preserve the caller's byte stride so padded native rows need no
-  // repacking here.
     descriptor.activation_storage_bytes = dot.operand_bits == 16 ? 2 : 1;
     descriptor.weight_bits = dot.operand_bits;
     descriptor.weight_storage_bytes = dot.operand_bits == 16 ? 2 : 1;
@@ -759,20 +781,22 @@ RmdStatus execute_im2p_compact_dot(im2p_sim_t *sim, const Im2pCompactDot &dot,
     descriptor.output_row_stride = output_row_stride;
     descriptor.tile_i_rows = std::min(dot.rows, static_cast<size_t>(DIM));
     descriptor.tile_j_columns = std::min(dot.columns, static_cast<size_t>(DIM));
-  descriptor.block_size = scaled ? 32 : 1;
-  descriptor.vector_op = scaled ? IM2P_VECTOR_LEFT_SHIFT : IM2P_VECTOR_BYPASS;
+  descriptor.block_size = scaled || external ? 32 : 1;
+  descriptor.vector_op = dot.vector_op;
   descriptor.output_domain =
-      scaled ? IM2P_OUTPUT_SCU_FINAL : IM2P_OUTPUT_LEGACY_FINAL;
-  descriptor.scale_total_k = scaled ? dot.k : 0;
-  descriptor.scale_row_stride = scaled ? dot.columns : 0;
-  descriptor.scale_valid_columns = scaled ? dot.columns : 0;
+      scaled ? IM2P_OUTPUT_SCU_FINAL
+             : external ? IM2P_OUTPUT_LEGACY_BLOCK : IM2P_OUTPUT_LEGACY_FINAL;
+  descriptor.scale_total_k = scaled || external ? dot.k : 0;
+  descriptor.scale_row_stride = scaled || external ? dot.columns : 0;
+  descriptor.scale_valid_columns = scaled || external ? dot.columns : 0;
   descriptor.work_context = dot.block_id;
     descriptor.provider.context = &context;
   descriptor.provider.read_weight_i8 =
       dot.operand_bits == 16 ? nullptr : read_weight_i8;
   descriptor.provider.read_weight_i16 =
       dot.operand_bits == 16 ? read_weight_i16 : nullptr;
-  descriptor.provider.read_scale = scaled ? read_hp1_scale : nullptr;
+  descriptor.provider.read_scale =
+      scaled ? read_scu_scale : external ? read_external_scale : nullptr;
     descriptor.provider.write_output = write_output;
 
   im2p_production_geometry_v1_t geometry{};
@@ -893,7 +917,8 @@ RmdStatus execute_im2p_compact_dot(im2p_sim_t *sim, const Im2pCompactDot &dot,
             {"block_id",dot.block_id},{"lane_group",dot.lane_group},
             {"k_offset",dot.k_offset},{"column_offset",dot.column_offset},
             {"m",dot.rows},{"n",dot.columns},{"k",dot.k},{"operand_bits",dot.operand_bits},
-            {"raw_cycles",stats.base.work_total_cycles},
+            {"vector_op",descriptor.vector_op},{"output_domain",descriptor.output_domain},
+            {"raw_cycles",counter_valid ? Json(stats.base.work_total_cycles) : Json()},
             {"cycles",counter_valid ? Json(stats.base.work_total_cycles) : Json()},
             {"valid",counter_valid},
             {"reason",counter_valid ? Json() : Json(real_provider ? "provider_did_not_complete" : "synthetic_test_provider")},
@@ -901,7 +926,7 @@ RmdStatus execute_im2p_compact_dot(im2p_sim_t *sim, const Im2pCompactDot &dot,
             {"provider_status",provider_status}};
         // Keep each observed hardware counter separately. They overlap by
         // definition and are never added to manufacture a total cycle count.
-        record["counters"] = {{"compute_cycles",stats.base.compute_cycles},
+        record["counters"] = counter_valid ? Json{{"compute_cycles",stats.base.compute_cycles},
             {"activation_wait_cycles",stats.base.activation_wait_cycles},
             {"weight_wait_cycles",stats.base.weight_wait_cycles},
             {"scale_wait_cycles",stats.base.scale_wait_cycles},
@@ -910,7 +935,7 @@ RmdStatus execute_im2p_compact_dot(im2p_sim_t *sim, const Im2pCompactDot &dot,
             {"activation_read_requests",stats.base.activation_read_requests},
             {"weight_read_requests",stats.base.weight_read_requests},
             {"output_write_requests",stats.base.output_write_requests},
-            {"output_write_responses",stats.base.output_write_responses}};
+            {"output_write_responses",stats.base.output_write_responses}} : Json();
         log::cycle.write_json(record.dump());
     } catch (...) { log::cycle.report_failure("RMD device segment"); }
 #endif

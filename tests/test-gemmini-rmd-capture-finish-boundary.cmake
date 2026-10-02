@@ -78,16 +78,18 @@ string(FIND "${finish_body}" "if (empty()) return result;" empty_return)
 string(FIND "${finish_body}" "finish_start = cycle::read_sample();" sample_start)
 string(FIND "${finish_body}" "const uint64_t start = cycle::timestamp_ns();" ns_start)
 string(FIND "${finish_body}" "result.direct = cpu->finish();" direct_finish)
+string(FIND "${finish_body}" "result.packet = bitmap->finish();" bitmap_finish)
 string(FIND "${finish_body}" "result.packet = std::get<rmd::RmdStripeBuilder>(sink_).finish();" packet_finish)
 string(FIND "${finish_body}" "const uint64_t end = cycle::timestamp_ns();" ns_end)
 string(FIND "${finish_body}" "finish_end = cycle::read_sample();" sample_end)
 string(FIND "${finish_body}" "cycle::evaluate_interval(finish_start, finish_end)" evaluation)
 string(FIND "${finish_body}" "gemmini_log_cycle_record_v2_checked_internal" logger)
 if(empty_return EQUAL -1 OR sample_start EQUAL -1 OR ns_start EQUAL -1 OR
-   direct_finish EQUAL -1 OR packet_finish EQUAL -1 OR ns_end EQUAL -1 OR
+   direct_finish EQUAL -1 OR bitmap_finish EQUAL -1 OR packet_finish EQUAL -1 OR ns_end EQUAL -1 OR
    sample_end EQUAL -1 OR evaluation EQUAL -1 OR logger EQUAL -1 OR
    NOT empty_return LESS ns_start OR NOT ns_start LESS sample_start OR
    NOT sample_start LESS direct_finish OR NOT sample_start LESS packet_finish OR
+   NOT sample_start LESS bitmap_finish OR NOT bitmap_finish LESS sample_end OR
    NOT direct_finish LESS sample_end OR NOT packet_finish LESS sample_end OR
    NOT sample_end LESS evaluation OR NOT evaluation LESS logger OR
    NOT logger LESS ns_end)

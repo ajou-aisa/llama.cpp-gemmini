@@ -1967,7 +1967,8 @@ namespace ggml::gemmini::quants::act::exsia
         stripe.residual_nnz = 0;
 #endif
 #if GGML_GEMMINI_ENABLE_RMD
-        rmd_builder.reset(stripe_idx, stripe.row_start, stripe.row_count(), args.K, args.J);
+        rmd_builder.reset(stripe_idx, stripe.row_start, stripe.row_count(), args.K, args.J,
+                          &stripe.outlier_mask.words, state.K_padded);
 #else
         (void) rmd_builder;
 #endif
@@ -2060,8 +2061,6 @@ namespace ggml::gemmini::quants::act::exsia
                     GGML_ASSERT(global_idx < residual.size());
                     residual[global_idx] = residual_i32;
 
-                    // Balanced radix-256 decomposition happens the moment the final
-                    // residual exists; no residual list survives this loop.
 #if GGML_GEMMINI_ENABLE_RMD
                     if (outlier && residual_i32 != 0 &&
                         !rmd_builder.add_residual(local_row, col, residual_i32))
@@ -2368,6 +2367,17 @@ namespace ggml::gemmini::quants::act::exsia
         }
         if (!local_workspace_.prepare(max_stripe_block_count, state_.B_size))
             return fail(ExSIAState::FailureCode::InvalidInput);
+
+#if GGML_GEMMINI_ENABLE_RMD
+        const unsigned capture_kind = args.residual_route == residual::ResidualRoute::cpu_direct
+            ? 0 : GGML_GEMMINI_ACTIVATION_BITS == 16 ? 1 : 2;
+        static std::atomic<unsigned> reported_capture_kinds{0};
+        if ((reported_capture_kinds.fetch_or(1u << capture_kind, std::memory_order_relaxed) &
+             (1u << capture_kind)) == 0) {
+            const char *names[] = {"cpu_direct (compaction unused)", "ws_packet compaction=a16", "ws_packet compaction=bitmap"};
+            std::fprintf(stderr, "gemmini: ExSIA RMD capture=%s\n", names[capture_kind]);
+        }
+#endif
 
         // state_.stripe carries per-stripe row metadata only; the workspace owns the live
         // mask/scratch. (Validation builds additionally snapshot each mask below.)

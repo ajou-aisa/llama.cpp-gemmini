@@ -576,6 +576,73 @@ bool test_cpu_direct_residual_dequantization() {
               "dequantization rejects residual addition overflow atomically");
 }
 
+bool test_exsia_packet_capture() {
+#if GGML_GEMMINI_ENABLE_RMD && GGML_GEMMINI_ACTIVATION_BITS != 16
+    constexpr size_t rows = 2 * DIM + 1, k = 65;
+    std::vector<float> source(rows * k, 0.5f);
+    for (size_t row = 0; row < rows; ++row) {
+        source[row * k + row % k] = row % 2 ? -4096.0f : 2048.0f;
+        source[row * k + 64] = 32.0f;
+    }
+    ggml_tensor tensor{};
+    tensor.type = GGML_TYPE_F32;
+    tensor.data = source.data();
+    ggml_gemmini_args_t args{};
+    args.I = rows; args.J = 17; args.K = k; args.sA = k;
+    args.tile_I = 1; args.tile_J = 2; args.tile_K = 5;
+    args.activation_rows_per_stripe = DIM;
+    args.residual_route = residual::ResidualRoute::ws_packet;
+    if (!args.A.allocate(rows, k, GGML_GEMMINI_ACTIVATION_BITS)) return false;
+    quants::act::exsia::Meta meta;
+    quants::act::exsia::ExSIA exsia;
+    exsia.set_execution_mode(quants::act::exsia::ExSIAState::ExecutionMode::Sequential);
+    if (!check(exsia.run(meta, &tensor, args), "ExSIA WS packet capture succeeds")) return false;
+    const auto &state = exsia.state();
+    std::vector<int64_t> restored(rows * state.K_padded, 0);
+    size_t packet_count = 0;
+    for (const auto &packet : meta.rmd_packets) {
+        if (!packet) continue;
+        ++packet_count;
+        if (!check(rmd::validate_packet(*packet) == rmd::RmdStatus::success,
+                   "ExSIA publishes valid compact packet")) return false;
+        for (const auto &block : packet->blocks) for (const auto &group : block.groups) {
+            for (size_t lane = 0; lane < group.lane_positions.size(); ++lane) {
+                const size_t original_lane = block.lane_ids[group.lane_positions[lane]];
+                const int64_t scale = int64_t{1} << (packet->digit_bits * original_lane);
+                for (size_t row = group.row_offsets[lane]; row < group.row_offsets[lane + 1]; ++row) {
+                    size_t compact_k = 0;
+                    for (size_t col = 0; col < 32; ++col) {
+                        if (!(group.k_mask & (uint32_t{1} << col))) continue;
+                        const int8_t digit = packet->stacked_activation.signed_int8.at(
+                            group.activation_offset + row * group.padded_k_count + compact_k++);
+                        restored.at((packet->row_begin + group.row_ids.at(row)) * state.K_padded +
+                                    block.global_k_begin + col) += digit * scale;
+                    }
+                }
+            }
+        }
+    }
+    if (!check(packet_count > 1 && meta.direct_residuals.empty(),
+               "real ExSIA uses packets across reused stripe slots")) return false;
+    if (!check(std::equal(restored.begin(), restored.end(), state.residual.begin(), state.residual.end()),
+               "packet reconstruction equals ExSIA selected residual plane")) return false;
+    args.residual_route = residual::ResidualRoute::cpu_direct;
+    if (!check(exsia.run(meta, &tensor, args) && meta.rmd_packets.empty() &&
+                   !meta.direct_residuals.empty(),
+               "reused ExSIA switches every WS slot to CPU direct")) return false;
+    args.residual_route = residual::ResidualRoute::ws_packet;
+    if (!check(exsia.run(meta, &tensor, args) && meta.direct_residuals.empty() &&
+                   !meta.rmd_packets.empty(),
+               "reused ExSIA switches CPU slots back to WS packets")) return false;
+    std::fill(source.begin(), source.end(), 0.0f);
+    return check(exsia.run(meta, &tensor, args) && meta.direct_residuals.empty() &&
+                     meta.rmd_packets.empty(),
+                 "empty run publishes no residuals from reused slots");
+#else
+    return true;
+#endif
+}
+
 bool test_exsia_baseline() {
     elem_t activation = 3;
     elem_t weight = 4;
@@ -777,6 +844,7 @@ bool test_rmd_cpu_ws_routes() {
         return metadata_equal && std::equal(a.groups.begin(), a.groups.end(),
             b.groups.begin(), b.groups.end(), [](const auto & left, const auto & right) {
                 return left.lane_positions == right.lane_positions &&
+                    left.row_offsets == right.row_offsets && left.row_ids == right.row_ids &&
                     left.k_mask == right.k_mask && left.padded_k_count == right.padded_k_count &&
                     left.activation_offset == right.activation_offset &&
                     left.activation_byte_offset == right.activation_byte_offset &&
@@ -2886,7 +2954,7 @@ int main(int argc, char ** argv) {
         case_name == "rmd-direct-parity" || case_name == "direct-executor" ||
         case_name == "rmd-gather" || case_name == "stripe-geometry" ||
         case_name == "meta-rho" || case_name == "non-outlier-clipping" ||
-        case_name == "non-exsia-capture-context";
+        case_name == "non-exsia-capture-context" || case_name == "packet-capture";
     if (!known) {
         std::fprintf(stderr, "unknown case: %s\n", case_name.c_str());
         return 2;
@@ -2895,12 +2963,13 @@ int main(int argc, char ** argv) {
     std::printf("TEST_CASE_BEGIN name=%s\n", case_name.c_str());
     const bool ok =
         (case_name == "all" && test_meta_rho_invariant() && test_non_exsia_capture_context() &&
-         test_non_outlier_clipping_policy() &&
+         test_non_outlier_clipping_policy() && test_exsia_packet_capture() &&
          test_exsia_baseline() && test_dispatch_modes() &&
          test_compiled_width_rmd_suite() && test_direct_cpu_executor() &&
          test_activation_stripe_geometry_contract() &&
          test_cpu_direct_residual_dequantization()) ||
         (case_name == "baseline" && test_exsia_baseline()) ||
+        (case_name == "packet-capture" && test_exsia_packet_capture()) ||
         (case_name == "dispatch" && test_dispatch_modes()) ||
         (case_name == "rmd-routes" && test_rmd_cpu_ws_routes()) ||
         (case_name == "q8-srmd-software-ws" && test_q8_srmd_software_ws_routing()) ||

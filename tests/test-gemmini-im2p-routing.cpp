@@ -114,7 +114,13 @@ static bool check_frontend_worker_summary() {
       count("\"run_id\":42") == 1 &&
       json.find("\"thread_id\":" + std::to_string(worker_tid)) != std::string::npos &&
       json.find("\"thread_id\":" + std::to_string(cycle::host_thread_id())) == std::string::npos &&
-      json.find("CPU_WORK_SUMMARY") == std::string::npos;
+      json.find("CPU_WORK_SUMMARY") == std::string::npos &&
+      json.find("\"op\":\"im2p.simulation_worker\"") != std::string::npos &&
+      json.find("\"kind\":\"segment\"") != std::string::npos &&
+      json.find("\"run_id\":42") != std::string::npos &&
+      json.find("\"ns_start\":") != std::string::npos &&
+      json.find("\"ns_end\":") != std::string::npos &&
+      json.find("\"record_type\":\"CPU_WORK_SUMMARY\"") == std::string::npos;
 #else
   (void) worker_tid;
   return !enabled && json.empty();
@@ -181,13 +187,15 @@ int main() {
   event.stripe_id = 3;
   event.slot = 1;
   {
-    im2p_adapter::HostCpuInterval interval(args, "test.explicit_finish",
+    im2p_adapter::HostCpuInterval interval(
+        args, "test.explicit_finish",
         im2p_adapter::HostIntervalAccounting::cpu_work, &event);
     interval.finish();
     interval.finish();
   }
   {
-    im2p_adapter::HostCpuInterval interval(args, "test.partial_return",
+    im2p_adapter::HostCpuInterval interval(
+        args, "test.partial_return",
         im2p_adapter::HostIntervalAccounting::cpu_work, &event);
     // A return before the success boundary must not claim operation success.
   }
@@ -240,7 +248,10 @@ int main() {
        occurrences("\"thread_id\":" + std::to_string(cycle::host_thread_id())) == (CYCLE_SIM ? 2 : 3) &&
        occurrences("\"host_timing\":{") == 0 &&
        occurrences("\"native_cycles\":{") == 0 &&
-       occurrences("\"thread_cpu_timing\":{") == 0;
+       occurrences("\"thread_cpu_timing\":{") == 0 &&
+       occurrences("\"ns_start\":") == (CYCLE_SIM ? 2 : 3) &&
+       occurrences("\"ns_end\":") == (CYCLE_SIM ? 2 : 3) &&
+       occurrences("\"tid\":") == (CYCLE_SIM ? 2 : 3);
 #endif
 #if !defined(__linux__) || !defined(__aarch64__)
   ok = ok && copy_reads == (CYCLE_SIM ? 0 : 2);
@@ -950,15 +961,23 @@ bool run_exsia_publication_boundary() {
                "each callback observes only its committed theta prefix and an uncommitted next stripe") &&
          check(residual_handle_contract, residual_handle_message) &&
 #if LOG_CYCLE
+#if CYCLE_DETAIL
          check(trace.events[0].folding_commit_ns != 0 &&
                    trace.events[0].folding_commit_ns <= trace.events[1].folding_commit_ns &&
-                   trace.events[1].folding_commit_ns <= trace.events[2].folding_commit_ns &&
-                   trace.events[0].quantization_end >= trace.events[0].quantization_start &&
+                   trace.events[1].folding_commit_ns <= trace.events[2].folding_commit_ns,
+               "detailed logging records ordered folding commit timestamps") &&
+#else
+         check(trace.events[0].folding_commit_ns == 0 &&
+                   trace.events[1].folding_commit_ns == 0 &&
+                   trace.events[2].folding_commit_ns == 0,
+               "compact logging omits detailed folding commit timestamps") &&
+#endif
+         check(trace.events[0].quantization_end >= trace.events[0].quantization_start &&
                    trace.events[1].quantization_end >= trace.events[1].quantization_start &&
                    trace.events[2].quantization_end >= trace.events[2].quantization_start &&
                    trace.events[2].quantization_end - trace.events[2].quantization_start > 0 &&
                    ggml::gemmini::cycle::read_count_for_test() != 0,
-               "enabled per-stripe quantization intervals and folding commits are instrumented") &&
+               "enabled per-stripe quantization intervals are instrumented") &&
 #else
          check(trace.events[0].folding_commit_ns == 0 &&
                    trace.events[1].folding_commit_ns == 0 &&
@@ -2980,7 +2999,7 @@ bool run_stats_translation_contract() {
                  failed_translation.rmd_dot_calls == 0 &&
                  failed_translation.rmd_stats.rtl_work_total_cycles == 0 &&
                  failed_translation.stats.rtl_work_total_cycles == 101,
-             "failed translation preserves dense meaning but hides semantic RMD success") &&
+             "failed translation preserves dense stats but hides semantic RMD success") &&
        ok;
   for (std::size_t index = 0; index < actual.size(); ++index) {
     ok = check(actual[index] == 101 + index,

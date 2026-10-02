@@ -12,32 +12,6 @@
 
 namespace ggml::gemmini::quants::wreader {
 
-bool native_mvin_q4_position(size_t logical_count, size_t index,
-                             size_t &byte_index, uint8_t &shift) noexcept {
-  if (logical_count == 0 || logical_count % 2 != 0 || index >= logical_count)
-    return false;
-  byte_index = index / 2;
-  shift = static_cast<uint8_t>((index % 2) * 4);
-  return true;
-}
-
-bool decode_native_mvin_q4(const uint8_t *packed, size_t packed_size,
-                           size_t logical_count, size_t index,
-                           int8_t &value) noexcept {
-  size_t byte_index = 0;
-  uint8_t shift = 0;
-  if (packed == nullptr ||
-      !native_mvin_q4_position(logical_count, index, byte_index, shift) ||
-      byte_index >= packed_size) {
-    return false;
-  }
-  const uint8_t nibble =
-      static_cast<uint8_t>((packed[byte_index] >> shift) & 0x0fu);
-  value = static_cast<int8_t>(nibble < 8 ? nibble
-                                         : static_cast<int32_t>(nibble) - 16);
-  return true;
-}
-
 namespace {
 
 using Format = ggml_gemmini_args_t::im2p_weight_format_t;
