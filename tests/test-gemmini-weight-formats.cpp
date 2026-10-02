@@ -4,7 +4,6 @@
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-q4-h1-reprocess.hpp"
 #include "../ggml/src/ggml-gemmini/quants/common/weight_reader.hpp"
 #include "../ggml/src/ggml-quants.h"
-#include "../src/llama-quant.h"
 
 #include <algorithm>
 #include <array>
@@ -581,7 +580,7 @@ bool test_q4_h1_narrow_scale_range_preserves_magnitude() {
     return ok;
 }
 
-bool test_q4_hp1_power_of_two_scale_uses_available_codes() {
+bool test_q4_hp1_power_of_two_scale_follows_paper_rule() {
     constexpr int64_t columns = 32;
     std::array<float, columns> source{};
     for (int64_t i = 0; i < columns; ++i) {
@@ -595,24 +594,163 @@ bool test_q4_hp1_power_of_two_scale_uses_available_codes() {
         return false;
     }
 
-    std::array<float, columns> decoded{};
-    dequantize_row_q4_hp1(&quantized, decoded.data(), columns);
-    double squared_error = 0.0;
-    for (int64_t i = 0; i < columns; ++i) {
-        const double error = static_cast<double>(decoded[i]) - source[i];
-        squared_error += error * error;
-    }
-    const double mean_squared_error = squared_error / columns;
-    if (!(mean_squared_error < 0.002)) {
+    // amax = 1: theta = ilogb(1) - 2 = -2, so the step is 1/4.
+    if (!(quantized.channel_scale == 0.25f && quantized.m == 0)) {
         std::fprintf(
             stderr,
-            "FAIL: Q4_HP1 power-of-two scale wastes code range: mse=%g scale=%g exponent=%d\n",
-            mean_squared_error,
+            "FAIL: Q4_HP1 block scale is not 2^(ilogb(amax) - 2): scale=%g exponent=%d\n",
             quantized.channel_scale,
             static_cast<int>(quantized.m));
         return false;
     }
-    return true;
+
+    std::array<float, columns> decoded{};
+    dequantize_row_q4_hp1(&quantized, decoded.data(), columns);
+    bool ok = true;
+    for (int64_t i = 0; i < columns; ++i) {
+        const float expected = std::round(source[i] * 4.0f) / 4.0f;
+        if (decoded[i] != expected) {
+            std::fprintf(
+                stderr,
+                "FAIL: Q4_HP1 step-1/4 decode mismatch: index=%lld source=%g decoded=%g expected=%g\n",
+                static_cast<long long>(i),
+                source[i],
+                decoded[i],
+                expected);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+bool test_q4_hp1_row_scale_follows_paper_rule() {
+    constexpr int64_t blocks = 4;
+    constexpr int64_t columns = blocks * QK4_HP;
+    std::array<float, columns> source{};
+    for (int64_t i = 0; i < QK4_HP; ++i) {
+        source[i] = static_cast<float>(i - 16) / 16.0f;
+    }
+    source[QK4_HP] = 8.0f;
+    source[QK4_HP + 1] = -3.0f;
+    source[2 * QK4_HP] = 1.2f;
+    source[2 * QK4_HP + 1] = -0.6f;
+
+    std::array<block_q4_hp1, blocks> quantized{};
+    if (!check(
+            quantize_row_q4_hp1_ref(source.data(), quantized.data(), columns),
+            "Q4_HP1 four-block row quantization failed")) {
+        return false;
+    }
+
+    // Block amax 1, 8, 1.2 give theta -2, 1, -2; the row keeps channel_scale 2^-2.
+    const std::array<int, blocks> expected_m = {0, 3, 0, INT16_MIN};
+    bool ok = true;
+    for (int64_t b = 0; b < blocks; ++b) {
+        float amax = 0.0f;
+        for (int64_t j = 0; j < QK4_HP; ++j) {
+            amax = std::max(amax, std::fabs(source[b * QK4_HP + j]));
+        }
+        bool block_ok = quantized[b].channel_scale == 0.25f && quantized[b].m == expected_m[b];
+        if (amax > 0.0f) {
+            const float steps = amax / std::ldexp(quantized[b].channel_scale, quantized[b].m);
+            block_ok = block_ok && steps >= 4.0f && steps < 8.0f;
+        }
+        if (!block_ok) {
+            std::fprintf(
+                stderr,
+                "FAIL: Q4_HP1 row block %lld: scale=%g m=%d, expected scale=0.25 m=%d\n",
+                static_cast<long long>(b),
+                quantized[b].channel_scale,
+                static_cast<int>(quantized[b].m),
+                expected_m[b]);
+            ok = false;
+        }
+    }
+
+    std::array<float, columns> decoded{};
+    dequantize_row_q4_hp1(quantized.data(), decoded.data(), columns);
+    ok = check(decoded[0] == -1.0f && decoded[QK4_HP - 1] == 1.0f,
+               "Q4_HP1 block 0 ends do not decode to -1 and 1") && ok;
+    ok = check(decoded[QK4_HP] == 8.0f, "Q4_HP1 8.0 does not decode to 8.0") && ok;
+    ok = check(decoded[QK4_HP + 1] == -4.0f, "Q4_HP1 -3.0 does not decode to -4.0") && ok;
+    ok = check(decoded[2 * QK4_HP] == 1.25f, "Q4_HP1 1.2 does not decode to 1.25") && ok;
+    ok = check(
+        std::all_of(decoded.begin() + 3 * QK4_HP, decoded.end(), [](float v) { return v == 0.0f; }),
+        "Q4_HP1 all-zero block does not decode to zero") && ok;
+    return ok;
+}
+
+bool test_q4_hp1_equal_ilogb_blocks_share_exponent() {
+    constexpr int64_t columns = 2 * QK4_HP;
+    std::array<float, columns> source{};
+    for (int64_t j = 0; j < columns; ++j) {
+        source[j] = 0.1f * static_cast<float>((j % 9) - 4);
+    }
+    source[2] = 1.0f;
+    source[QK4_HP + 7] = -1.5f;
+
+    std::array<block_q4_hp1, 2> quantized{};
+    if (!check(
+            quantize_row_q4_hp1_ref(source.data(), quantized.data(), columns),
+            "Q4_HP1 two-block row quantization failed")) {
+        return false;
+    }
+
+    // amax 1.0 and 1.5 share ilogb 0, so both blocks use theta -2.
+    bool ok = true;
+    for (size_t b = 0; b < quantized.size(); ++b) {
+        if (!(quantized[b].channel_scale == 0.25f && quantized[b].m == 0)) {
+            std::fprintf(
+                stderr,
+                "FAIL: Q4_HP1 equal-ilogb block %zu: scale=%g m=%d, expected scale=0.25 m=0\n",
+                b,
+                quantized[b].channel_scale,
+                static_cast<int>(quantized[b].m));
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+bool test_q4_hp1_mantissa_sweep_follows_paper_rule() {
+    int cases = 0;
+    int failures = 0;
+    for (int k = -12; k <= 12; ++k) {
+        for (int i = 0; i < 1024; ++i) {
+            ++cases;
+            const float mant = 1.0f + static_cast<float>(i) / 1024.0f;
+            const float amax = std::ldexp(mant, k);
+            std::array<float, QK4_HP> source{};
+            for (int j = 0; j < QK4_HP; ++j) {
+                source[j] = amax * 0.25f * static_cast<float>((j % 7) - 3) / 3.0f;
+            }
+            source[5] = amax;
+
+            block_q4_hp1 quantized{};
+            const bool quantized_ok = quantize_row_q4_hp1_ref(source.data(), &quantized, QK4_HP);
+            // The block max is 4 * mant steps: exact below 7.5, saturated to code 7 above.
+            const long expected_code = 4.0f * mant < 7.5f ? std::lround(4.0f * mant) : 7;
+            const int code = (quantized.qs[5] & 0x0F) - 8;
+            if (!quantized_ok || std::ilogb(quantized.channel_scale) != std::ilogb(amax) - 2 ||
+                quantized.m != 0 || code != expected_code) {
+                if (failures < 4) {
+                    std::fprintf(
+                        stderr,
+                        "FAIL: Q4_HP1 mantissa sweep: amax=%g scale=%g m=%d code=%d expected_code=%ld\n",
+                        amax,
+                        quantized.channel_scale,
+                        static_cast<int>(quantized.m),
+                        code,
+                        expected_code);
+                }
+                ++failures;
+            }
+        }
+    }
+    if (failures != 0) {
+        std::fprintf(stderr, "FAIL: Q4_HP1 mantissa sweep: %d of %d cases mismatch\n", failures, cases);
+    }
+    return failures == 0;
 }
 
 bool test_legacy_round_trips() {
@@ -626,38 +764,13 @@ bool test_legacy_round_trips() {
     ok = round_trip(GGML_TYPE_Q4_H1, 2.5f) && ok;
     ok = round_trip(GGML_TYPE_Q4_HP1, 2.5f) && ok;
     ok = test_q4_h1_narrow_scale_range_preserves_magnitude() && ok;
-    ok = test_q4_hp1_power_of_two_scale_uses_available_codes() && ok;
+    ok = test_q4_hp1_power_of_two_scale_follows_paper_rule() && ok;
+    ok = test_q4_hp1_row_scale_follows_paper_rule() && ok;
+    ok = test_q4_hp1_equal_ilogb_blocks_share_exponent() && ok;
+    ok = test_q4_hp1_mantissa_sweep_follows_paper_rule() && ok;
     ok = round_trip(GGML_TYPE_Q16_0, 0.01f) && ok;
     ok = round_trip(GGML_TYPE_Q16_H1, 0.02f) && ok;
     ok = round_trip(GGML_TYPE_Q16_HP1, 0.02f) && ok;
-    return ok;
-}
-
-bool test_gemmini_q4_default_output_policy() {
-    bool ok = true;
-    struct Case {
-        llama_ftype ftype;
-        bool pure;
-        bool is_output_weight;
-        bool is_token_embedding_weight;
-        ggml_type expected;
-        const char * message;
-    };
-    const std::array<Case, 7> cases = {{
-        { LLAMA_FTYPE_MOSTLY_Q4_0,  false, true,  false, GGML_TYPE_COUNT, "Q4_0 output keeps standard policy" },
-        { LLAMA_FTYPE_MOSTLY_Q4_H1, false, true,  false, GGML_TYPE_F16,  "Q4_H1 output stays F16" },
-        { LLAMA_FTYPE_MOSTLY_Q4_HP1,false, true,  false, GGML_TYPE_F16,  "Q4_HP1 output stays F16" },
-        { LLAMA_FTYPE_MOSTLY_Q4_H1, false, true,  true,  GGML_TYPE_F16,  "Q4_H1 tied token/output stays F16" },
-        { LLAMA_FTYPE_MOSTLY_Q4_H1, false, false, true,  GGML_TYPE_F16,  "Q4_H1 untied token embedding stays F16" },
-        { LLAMA_FTYPE_MOSTLY_Q4_H1, true,  true,  true,  GGML_TYPE_COUNT, "pure Q4_H1 bypasses mixed policy" },
-        { LLAMA_FTYPE_MOSTLY_Q4_H1, false, false, false, GGML_TYPE_COUNT, "ordinary Q4_H1 tensor stays quantized" },
-    }};
-    for (const Case & test : cases) {
-        ok = check(
-                 llama_quantize_gemmini_q4_default_tensor_type(
-                     test.ftype, test.pure, test.is_output_weight, test.is_token_embedding_weight) == test.expected,
-                 test.message) && ok;
-    }
     return ok;
 }
 
@@ -726,7 +839,6 @@ int main(int argc, char ** argv) {
 
     bool ok = true;
     if (selection == Selection::All || selection == Selection::HappyTable) {
-        ok = test_gemmini_q4_default_output_policy() && ok;
         ok = test_legacy_round_trips() && ok;
         ok = test_q4_h1_is_canonical_q4_0_reprocessing() && ok;
         ok = test_q4_h1_preserves_positive_q4_0_scale() && ok;

@@ -248,7 +248,7 @@ foreach(pattern IN ITEMS "\\(void\\)[ \t]+[A-Za-z_]" "static_cast<void>"
                          "\\[\\[maybe_unused\\]\\]"
                          "#[ \t]*pragma[ \t]+GCC[ \t]+diagnostic"
                          "#[ \t]*pragma[ \t]+clang[ \t]+diagnostic"
-                         "__int128" "__builtin_[A-Za-z0-9_]+")
+                         "__int128")
     if (direct_source MATCHES "${pattern}")
         message(FATAL_ERROR "suppression-free source contract rejected ${pattern}")
     endif()

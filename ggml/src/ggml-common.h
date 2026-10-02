@@ -73,7 +73,11 @@ typedef sycl::half2 ggml_half2;
 
 #if defined(GGML_COMMON_DECL)
 
+#if defined(GGML_COMMON_DECL_METAL)
+#define offsetof(type, member) __builtin_offsetof(type, member)
+#else
 #include <stddef.h>
+#endif
 
 #ifndef __cplusplus
 #ifndef static_assert

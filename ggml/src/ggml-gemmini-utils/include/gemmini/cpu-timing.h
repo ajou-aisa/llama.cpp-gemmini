@@ -18,6 +18,9 @@ typedef struct gemmini_cpu_sample {
     uint64_t counter, owner_token, generation;
     uint8_t thread_cpu_valid, native_valid, native_reason, native_source;
     gemmini_trace_context trace;
+    // Observed Linux CPU (sched_getcpu) right after the counter read; cpu_core_valid=0 when unavailable.
+    int32_t cpu_core;
+    uint8_t cpu_core_valid;
 } gemmini_cpu_sample;
 
 typedef struct gemmini_cpu_totals {

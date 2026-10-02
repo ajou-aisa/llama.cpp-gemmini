@@ -99,6 +99,12 @@ int main(int argc, char ** argv) {
 
     const std::string output = read_file(selected);
     const auto default_path = root / "work/output/log/cycle-log.jsonl";
+#if defined(EXPECT_CPU_CYCLE_LOG) && (!EXPECT_CPU_CYCLE_LOG || !EXPECT_LOG_CYCLE)
+    if (!output.empty() || std::filesystem::exists(selected) != bool(EXPECT_LOG_CYCLE) ||
+        std::filesystem::exists(default_path) ||
+        std::filesystem::exists(root / "work/output/log/npu-cycle-trace.jsonl")) return 9;
+#else
+#if CYCLE_DETAIL
     if (output.find("\"version\":2") == std::string::npos ||
         output.find("\"op\":\"cpu.add\"") == std::string::npos ||
         output.find("\"layer\":\"blk.7.attn_norm\"") == std::string::npos ||
@@ -138,12 +144,19 @@ int main(int argc, char ** argv) {
             const auto & wall = record.at("host_timing");
             const auto & cpu = record.at("thread_cpu_timing");
             const auto & native = record.at("native_cycles");
-            if (record.at("record_type") != "CPU_INTERVAL" || record.at("additive") != false ||
+            if (record.at("record_type") != "CYCLE_INTERVAL" || record.at("additive") != false ||
+                !record.contains("start") || !record.contains("end") ||
+                !record.contains("delta") || !record.contains("valid") ||
                 wall.at("valid") != true || wall.at("start_tid") != wall.at("end_tid") ||
                 wall.at("start_ns").get<uint64_t>() > wall.at("end_ns").get<uint64_t>() ||
                 wall.at("duration_ns").get<uint64_t>() !=
                     wall.at("end_ns").get<uint64_t>() - wall.at("start_ns").get<uint64_t>() ||
                 native.at("delta").is_null() == native.at("valid").get<bool>()) return 24;
+            if (record.at("valid").get<bool>()) {
+                if (record.at("start").get<uint64_t>() > record.at("end").get<uint64_t>() ||
+                    record.at("delta").get<uint64_t>() != record.at("end").get<uint64_t>() -
+                        record.at("start").get<uint64_t>()) return 24;
+            } else if (!record.at("delta").is_null() || !record.contains("reason")) return 24;
 #if defined(__APPLE__) || defined(__linux__)
             if (cpu.at("valid") != true || cpu.at("duration_ns").get<uint64_t>() !=
                     cpu.at("end_ns").get<uint64_t>() - cpu.at("start_ns").get<uint64_t>()) return 25;
@@ -213,6 +226,17 @@ int main(int argc, char ** argv) {
         if (!totals.at("cycles").is_null() || totals.at("cycles_reason") != "not_thread_cpu_counter") return 21;
 #endif
     }
+#else
+    if (output.find("\"kind\":\"cpu\"") == std::string::npos ||
+        output.find("\"op\":\"cpu.add\"") == std::string::npos ||
+        output.find("\"layer\":\"blk.7.attn_norm\"") == std::string::npos ||
+        output.find("\"node_id\":0") == std::string::npos ||
+        output.find("\"worker_id\":0") == std::string::npos ||
+        output.find("\"duration_role\":\"OBSERVATION_ONLY\"") == std::string::npos ||
+        output.find("\"exclusion_reason\":\"outside_collection\"") == std::string::npos ||
+        std::filesystem::exists(default_path)) return 9;
+#endif
+#endif
     if (!preserve) std::filesystem::remove_all(root, error);
     return error ? 10 : 0;
 }

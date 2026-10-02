@@ -4,6 +4,8 @@
 #include <atomic>
 #include <chrono>
 
+#define GEMMINI_CYCLE_READER_ENABLED (LOG_CYCLE || CYCLE_SIM)
+
 #if defined(__APPLE__) && defined(__aarch64__)
 #include <mach/mach_time.h>
 #endif
@@ -88,7 +90,7 @@ namespace ggml::gemmini::cycle
 
     static inline uint64_t read()
     {
-#if !LOG_CYCLE
+#if !GEMMINI_CYCLE_READER_ENABLED
         return 0;
 #else
         read_count.fetch_add(1, std::memory_order_relaxed);
@@ -115,7 +117,7 @@ namespace ggml::gemmini::cycle
 
     static inline uint64_t timestamp_ns()
     {
-#if !LOG_CYCLE
+#if !GEMMINI_CYCLE_READER_ENABLED
         return 0;
 #else
         read_count.fetch_add(1, std::memory_order_relaxed);

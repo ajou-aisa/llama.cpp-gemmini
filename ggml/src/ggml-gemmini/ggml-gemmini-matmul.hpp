@@ -9,6 +9,9 @@
 #include "residual/rmd/rmd-executor.hpp"
 
 #include <array>
+#if defined(__linux__)
+#include <sched.h>
+#endif
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
@@ -26,6 +29,7 @@
 
 #include <gemmini/cycle_reader.hpp>
 #include <gemmini/host-timing.hpp>
+#include <gemmini/cpu_log_context.hpp>
 
 #if !defined(GGML_GEMMINI_CONFIG_HAS_ACTIVATION_QUANT)
 namespace ggml::gemmini::config {
@@ -244,6 +248,8 @@ struct MatmulCpuInterval {
 struct MatmulCpuSample {
     uint64_t value = 0;
     bool collected = false;
+    log::CpuExclusionSnapshot exclusion{};
+    log::CpuCorrelation correlation{};
 #if defined(__linux__) && defined(__aarch64__)
     cycle::NativeCycleSample native;
 #endif
@@ -252,10 +258,16 @@ struct MatmulCpuSample {
     uint64_t thread_cpu_ns = 0;
     bool thread_cpu_valid = false;
     gemmini_trace_context trace{};
+    // Observed Linux CPU (sched_getcpu) right after the counter read; -1 when unavailable.
+    int32_t cpu_core = -1;
 };
 
 inline MatmulCpuSample read_matmul_cpu_sample() {
     MatmulCpuSample result;
+    result.exclusion = log::capture_cpu_exclusion();
+#if LOG_CYCLE || CYCLE_SIM
+    result.correlation = log::current_cpu_correlation();
+#endif
 #if LOG_CYCLE
     result.collected = true;
     result.trace = gemmini_trace_capture();
@@ -264,6 +276,9 @@ inline MatmulCpuSample read_matmul_cpu_sample() {
     result.value = result.native.value;
 #else
     result.value = cycle::read();
+#endif
+#if defined(__linux__)
+    result.cpu_core = sched_getcpu();
 #endif
 #if CYCLE_DETAIL
     const auto host = cycle::read_host_sample();
@@ -283,6 +298,8 @@ inline MatmulCpuInterval evaluate_matmul_cpu_interval(
         const MatmulCpuSample & start, const MatmulCpuSample & end,
         bool same_task = true) {
     if (!start.collected || !end.collected) return {};
+    if (const char *excluded = log::cpu_exclusion_since(start.exclusion))
+        return MatmulCpuInterval::unavailable(excluded);
     if (start.trace.task_id && end.trace.task_id && start.trace.task_id != end.trace.task_id)
         return MatmulCpuInterval::unavailable("structurally_cross_task");
 #if defined(__linux__) && defined(__aarch64__)

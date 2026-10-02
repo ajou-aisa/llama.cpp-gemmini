@@ -7,6 +7,7 @@
 #include "../ggml/src/ggml-gemmini/quants/act/exsia/exsia.hpp"
 #include <gemmini/cycle_reader.hpp>
 #include <gemmini/log.hpp>
+#include <gemmini/semantic.hpp>
 #include "../ggml/src/ggml-gemmini/residual/residual-capture.hpp"
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-builder.hpp"
 #include <atomic>
@@ -175,8 +176,16 @@ bool cpu_identity_projection_regression() {
     MatmulJobMetrics manual;
     manual.cpu_identity_mask = GEMMINI_CYCLE_HAS_STRIPE_ID;
     manual.stripe_id = 3;
+#if CYCLE_DETAIL
     ok = expect(projected(&manual).find("\"run_id\":null,\"stripe_id\":3,\"slot\":null") != std::string::npos,
                 "manual capture has an actual stripe but no invented run or slot") && ok;
+#else
+    const auto manual_json = projected(&manual);
+    ok = expect(manual_json.find("\"stripe_id\":3") != std::string::npos &&
+                    manual_json.find("\"run_id\"") == std::string::npos &&
+                    manual_json.find("\"slot\"") == std::string::npos,
+                "manual capture has an actual stripe but no invented run or slot") && ok;
+#endif
     zero.run_id = 91;
     ok = expect(projected(&zero).find("\"run_id\":91,\"stripe_id\":3,\"slot\":0") != std::string::npos,
                 "present nonzero run identity survives the same projection") && ok;
@@ -185,14 +194,29 @@ bool cpu_identity_projection_regression() {
     for (uint64_t run_id : {uint64_t{0}, uint64_t{91}}) {
         meta.run_id = run_id;
         const auto full = projected(nullptr, matmul_cpu_run_id(args));
+#if CYCLE_DETAIL
         ok = expect(full.find("\"run_id\":" + std::to_string(run_id) +
                               ",\"stripe_id\":null,\"slot\":null") != std::string::npos,
                     "FULL uses optional metadata run only, including zero") && ok;
+#else
+        ok = expect(full.find("\"run_id\":" + std::to_string(run_id)) != std::string::npos &&
+                        full.find("\"stripe_id\"") == std::string::npos &&
+                        full.find("\"slot\"") == std::string::npos,
+                    "FULL uses optional metadata run only, including zero") && ok;
+#endif
     }
     meta.run_id.reset();
+#if CYCLE_DETAIL
     ok = expect(projected(nullptr, matmul_cpu_run_id(args)).find(
                     "\"run_id\":null,\"stripe_id\":null,\"slot\":null") != std::string::npos,
                 "absent ExSIA run metadata stays absent") && ok;
+#else
+    const auto absent_json = projected(nullptr, matmul_cpu_run_id(args));
+    ok = expect(absent_json.find("\"run_id\"") == std::string::npos &&
+                    absent_json.find("\"stripe_id\"") == std::string::npos &&
+                    absent_json.find("\"slot\"") == std::string::npos,
+                "absent ExSIA run metadata stays absent") && ok;
+#endif
     args.act_quant.storage().emplace<quants::act::tensor::Meta>();
     ok = expect(!matmul_cpu_run_id(args).has_value(), "non-ExSIA metadata invents no run") && ok;
     quants::act::exsia::StripeReadyEvent event{};
@@ -327,11 +351,19 @@ bool aggregate_serializer_fixtures() {
         "{\"schema\":\"gemmini.cycle\",\"version\":2,\"record_type\":\"CYCLE_INTERVAL\","
         "\"source\":\"host_tick\",\"unit\":\"tick\",\"op\":\"dense\",\"layer\":\"ffn\\\"norm\","
         "\"run_id\":null,\"stripe_id\":null,\"slot\":null,\"node_id\":null,\"worker_id\":null,"
-        "\"start\":10,\"end\":34,\"delta\":24,\"valid\":true}";
+        "\"start\":10,\"end\":34,\"delta\":24,\"valid\":true,\"interval_class\":\"DIAGNOSTIC\""
+#if CYCLE_SIM
+        ",\"cpu_service\":true"
+#endif
+        ",\"duration_role\":\"OBSERVATION_ONLY\",\"exclusion_reason\":\"outside_collection\"}";
 #else
     const std::string expected_interval =
         "{\"op\":\"dense\",\"kind\":\"cycle\",\"layer\":\"ffn\\\"norm\","
-        "\"start\":10,\"end\":34,\"delta\":24,\"valid\":true}";
+        "\"start\":10,\"end\":34,\"delta\":24,\"valid\":true,\"interval_class\":\"DIAGNOSTIC\""
+#if CYCLE_SIM
+        ",\"cpu_service\":true"
+#endif
+        ",\"duration_role\":\"OBSERVATION_ONLY\",\"exclusion_reason\":\"outside_collection\"}";
 #endif
 
     WsLoopTelemetry ws{};
@@ -492,7 +524,14 @@ bool aggregate_serializer_fixtures() {
         cycle::serialize_host_timing(12, 30, 61, 61) + ",\"residual_backend\":" +
         cycle::serialize_host_timing(32, 38, 61, 61) + ",\"compose\":" +
         cycle::serialize_host_timing(40, 44, 61, 61) + ",\"finalize\":" +
-        cycle::serialize_host_timing(44, 48, 61, 61) + "},\"valid\":true}";
+        cycle::serialize_host_timing(44, 48, 61, 61) + "},\"valid\":true"
+#if CYCLE_SIM
+        ",\"cpu_service\":false,\"cpu_service_exclusion\":\"nonadditive_summary\""
+#endif
+#if LOG_CYCLE || CYCLE_SIM
+        ",\"duration_role\":\"OBSERVATION_ONLY\",\"exclusion_reason\":\"outside_collection\""
+#endif
+        "}";
 
     if (std::getenv("GEMMINI_TELEMETRY_PRINT_ALL") != nullptr) {
         std::printf("%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n", interval_json.c_str(), ws_json.c_str(),
@@ -762,6 +801,7 @@ bool residual_transport_fixtures(bool failure_selector) {
     if (!expect(log::cycle.set_output_path(path.c_str(), true), "RMD failure sink setup")) return false;
 #endif
     const auto emitted = im2p_adapter::emit_residual_stripe_timings(success, args, 17);
+    const std::string successful_output = read_file(path);
 
     auto failed = success;
     failed.status.code = ::im2p::gemmini::StatusCode::execution_failure;
@@ -776,10 +816,10 @@ bool residual_transport_fixtures(bool failure_selector) {
         im2p_adapter::emit_residual_stripe_timings(malformed, args, 17);
     log::cycle.set_output(stderr);
     const std::string output = read_file(path);
-#if LOG_CYCLE
-    const bool row_count_ok = count_occurrences(output, "IM2P_RMD_STRIPE_TELEMETRY") == 1;
+#if LOG_CYCLE && !CYCLE_SIM
+    const bool row_count_ok = count_occurrences(successful_output, "IM2P_RMD_STRIPE_TELEMETRY") == 1;
 #else
-    const bool row_count_ok = output.empty();
+    const bool row_count_ok = successful_output.empty();
 #endif
     const bool ok = expect(emitted.ok(), "successful semantic telemetry emits") &&
         expect(!failed_emit.ok() && !failed_translation.result.ok() &&
@@ -788,7 +828,8 @@ bool residual_transport_fixtures(bool failure_selector) {
                    failed_translation.rmd_stats.rtl_work_total_cycles == 0,
                "failed residual result exposes no successful semantic aggregate") &&
         expect(!malformed_emit.ok(), "malformed RMD aggregate fails closed") &&
-        expect(row_count_ok, "failed and malformed residual telemetry emit no rows");
+        expect(row_count_ok, "only numerical RTL builds emit successful residual timing rows") &&
+        expect(output == successful_output, "failed and malformed residual telemetry emit no rows");
     if (failure_selector) {
         if (!json.empty()) std::printf("%s\n", json.c_str());
         std::printf("RMD_RESIDUAL_FAILURE sink=%s dense_cycles=%llu "

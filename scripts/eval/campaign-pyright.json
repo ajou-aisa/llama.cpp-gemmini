@@ -1,0 +1,51 @@
+{
+  "include": [
+    "campaign.py",
+    "campaign_build.py",
+    "campaign_inputs.py",
+    "campaign_metrics.py",
+    "campaign_cycle.py",
+    "campaign_stream.py",
+    "campaign_verify.py",
+    "cycle_accounting.py",
+    "cycle_trace_capture.py",
+    "cycle_campaign.py",
+    "cycle_campaign_bundle.py",
+    "actual_cycle_bundle.py",
+    "e2e_cost_ownership.py",
+    "e2e_integration_prep.py",
+    "run_stateful_integration_smoke.py",
+    "e2e_timeline.py",
+    "target_admission.py",
+    "run_cycle_evaluation.py",
+    "measurement_domains.py",
+    "measurement_identity.py",
+    "metric_sweep.py",
+    "metric_table.py",
+    "run_measurement.py"
+  ],
+  "extraPaths": [
+    "../..",
+    ".",
+    "../../../IM2P.sim"
+  ],
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "strict",
+  "executionEnvironments": [
+    {
+      "root": "../../evaluation",
+      "extraPaths": [
+        "../..",
+        "."
+      ]
+    },
+    {
+      "root": ".",
+      "extraPaths": [
+        "../..",
+        ".",
+        "../../../IM2P.sim"
+      ]
+    }
+  ]
+}

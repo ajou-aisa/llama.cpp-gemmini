@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "chunk_id": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "compact_k": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "dim": {
+      "enum": [
+        16,
+        32,
+        64
+      ],
+      "type": "integer"
+    },
+    "fp_selected": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "intersection": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "invocation_count": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "invocation_id": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "kind": {
+      "enum": [
+        "RUN",
+        "RUN_END",
+        "COUNTS",
+        "MAIN_STRIPE",
+        "RADIX_STRIPE",
+        "COMPACT_WORK",
+        "SCALE_ALIGNMENT"
+      ]
+    },
+    "manifest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "observation_count": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "original_k": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "original_rows": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "physical_fragments": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "potal_selected": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "precision": {
+      "enum": [
+        "A4W4",
+        "A8W8"
+      ]
+    },
+    "radix_limb_count": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "retained_rows": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "run_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "schema": {
+      "enum": [
+        "im2p-activation-quant-metrics",
+        "im2p-residual-path-metrics",
+        "im2p-scale-alignment-metrics"
+      ]
+    },
+    "scu_shift_offset": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "sequence": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "stripe_id": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "total_partial_sum_count": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "union": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "updated_partial_sum_count": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "version": {
+      "const": 1
+    },
+    "workload_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "zero_limb_pruned_count": {
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema",
+    "version",
+    "kind",
+    "sequence",
+    "manifest_sha256",
+    "run_id",
+    "workload_id",
+    "precision",
+    "dim"
+  ],
+  "title": "native_metric_record",
+  "type": "object"
+}

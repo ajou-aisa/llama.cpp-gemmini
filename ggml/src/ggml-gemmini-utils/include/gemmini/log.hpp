@@ -30,6 +30,8 @@
 
 #include "log.h"
 #include "cpu-timing.h"
+#include "cpu_log_context.hpp"
+#include "host-timing.hpp"
 
 #include <atomic>
 #include <cstdarg>
@@ -132,6 +134,9 @@ namespace ggml::gemmini::log
         uint64_t tid_start = 0;
         uint64_t tid_end = 0;
         bool host_timing_valid = false;
+        const char *cpu_service_exclusion = nullptr;
+        cycle::TimingIntervalClass timing_interval_class = cycle::TimingIntervalClass::diagnostic;
+        CpuCorrelation correlation{};
     };
 
     struct WsCycleRecord
@@ -176,6 +181,9 @@ namespace ggml::gemmini::log
                                                const char *reason,
                                                const char *sample_reason = nullptr);
     std::string serialize_ws_cycle_record(const WsCycleRecord &record);
+    std::string serialize_cpu_service_metadata(const char *operation,
+        const char *exclusion = nullptr, CpuCorrelation correlation = current_cpu_correlation(),
+        cycle::TimingIntervalClass interval_class = cycle::TimingIntervalClass::diagnostic);
 
     struct CycleWriteTiming
     {
@@ -257,7 +265,8 @@ namespace ggml::gemmini::log
         void write_cpu(const gemmini_cycle_record_v2 &identity,
                        const gemmini_cpu_sample &start, const gemmini_cpu_sample &end,
                        std::optional<bool> operation_success = {}, bool raw_segment = false,
-                       bool structural_envelope = false);
+                       bool structural_envelope = false,
+                       cycle::TimingIntervalClass interval_class = cycle::TimingIntervalClass::per_worker_cpu_work);
         void write_measurement(const performance::Measurement &measurement);
         void report_failure(const char * operation) noexcept;
 

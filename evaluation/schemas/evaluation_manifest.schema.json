@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "dependentRequired": {
+    "build_hash": ["tokenizer_hash", "DIM"],
+    "tokenizer_hash": ["build_hash", "DIM"],
+    "DIM": ["build_hash", "tokenizer_hash"]
+  },
+  "properties": {
+    "build_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "tokenizer_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "DIM": {"type": "integer", "enum": [16, 32, 64]},
+    "BK": {
+      "const": 32
+    },
+    "chunk_policy": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "dataset": {
+      "const": "WikiText-2"
+    },
+    "dim": {
+      "enum": [
+        16,
+        32,
+        64
+      ],
+      "type": "integer"
+    },
+    "git_sha": {
+      "pattern": "^[0-9a-f]{40}$",
+      "type": "string"
+    },
+    "model": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "precision": {
+      "enum": [
+        "A4W4",
+        "A8W8"
+      ]
+    },
+    "seed": {
+      "maximum": 4294967294,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "tokenizer_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "model",
+    "dataset",
+    "tokenizer_sha256",
+    "chunk_policy",
+    "precision",
+    "dim",
+    "BK",
+    "seed",
+    "git_sha"
+  ],
+  "title": "evaluation_manifest",
+  "type": "object"
+}

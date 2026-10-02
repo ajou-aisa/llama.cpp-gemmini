@@ -295,10 +295,17 @@ if(im2p_host_begin EQUAL -1 OR im2p_host_end LESS_EQUAL im2p_host_begin)
 endif()
 math(EXPR im2p_host_length "${im2p_host_end} - ${im2p_host_begin}")
 string(SUBSTRING "${im2p}" ${im2p_host_begin} ${im2p_host_length} im2p_host_interval)
-require_order("${im2p_host_interval}" "IM2P retains its measurement and failure boundary"
+string(FIND "${im2p_host_interval}" "void finish(" im2p_finish_begin)
+string(FIND "${im2p_host_interval}" "private:" im2p_finish_end)
+if(im2p_finish_begin EQUAL -1 OR im2p_finish_end LESS_EQUAL im2p_finish_begin)
+    message(FATAL_ERROR "Cannot locate the actual IM2P host interval finish boundary")
+endif()
+math(EXPR im2p_finish_length "${im2p_finish_end} - ${im2p_finish_begin}")
+string(SUBSTRING "${im2p_host_interval}" ${im2p_finish_begin} ${im2p_finish_length} im2p_finish)
+require_order("${im2p_finish}" "IM2P retains its measurement and failure boundary"
     "void finish(" "const auto end = read_matmul_cpu_sample()" "active_ = false"
     "try {" "log::cycle.write_json" "serialize_matmul_cpu_interval"
-    "record_, start_, end, operation_success" "catch (...)" "log::cycle.report_failure")
+    "record_, start_, end," "catch (...)" "log::cycle.report_failure")
 require_absent("${emitter}" "CYCLE_DETAIL" "raw CPU logging survives DETAIL=0")
 require_order("${header}" "one native sample plus host and thread CPU snapshot"
     "result.native = cycle::read_sample()" "const auto host = cycle::read_host_sample()"

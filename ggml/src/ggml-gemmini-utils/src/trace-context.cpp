@@ -257,7 +257,9 @@ void CpuStage::finish(bool success) noexcept {
     // Native ownership and timing validity are independent of operation outcome.
     try {
         log::cycle.write_cpu(identity, start_, end, success, true,
-            scope_ == Scope::envelope);
+            scope_ == Scope::envelope,
+            scope_ == Scope::envelope ? cycle::TimingIntervalClass::structural
+                                      : cycle::TimingIntervalClass::diagnostic);
     } catch (...) { log::cycle.report_failure("operator stage"); }
 #else
     (void)success;

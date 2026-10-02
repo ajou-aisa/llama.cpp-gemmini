@@ -1,0 +1,185 @@
+{
+  "$defs": {
+    "work_type_population": {
+      "additionalProperties": false,
+      "properties": {
+        "alignment_count": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "avg_delta_w": {
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "delta_w_sum": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_delta_w": {
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "scu_update_fraction": {
+          "maximum": 1,
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "total_partial_sum_count": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "updated_partial_sum_count": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "delta_w_sum",
+        "alignment_count",
+        "updated_partial_sum_count",
+        "total_partial_sum_count",
+        "avg_delta_w",
+        "max_delta_w",
+        "scu_update_fraction"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "aggregation": {
+      "const": "integer-sum-before-division"
+    },
+    "alignment_count": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "avg_delta_w": {
+      "minimum": 0,
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "avg_delta_w_weighting": {
+      "const": "one_per_observed_work_stripe_column_original_block"
+    },
+    "delta_w_sum": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "dense": {
+      "$ref": "#/$defs/work_type_population"
+    },
+    "dim": {
+      "enum": [
+        16,
+        32,
+        64
+      ],
+      "type": "integer"
+    },
+    "input_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "manifest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "max_delta_w": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "model": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "overall": {
+      "$ref": "#/$defs/work_type_population"
+    },
+    "pre_pot_fp_scale_available": {
+      "const": false
+    },
+    "precision": {
+      "enum": [
+        "A4W4",
+        "A8W8"
+      ]
+    },
+    "provenance": {
+      "type": "object"
+    },
+    "residual": {
+      "$ref": "#/$defs/work_type_population"
+    },
+    "scale_domain": {
+      "const": "hp1_block_pot_to_channel_anchor"
+    },
+    "schema": {
+      "const": "potal-scale-alignment-metrics"
+    },
+    "scu_update_fraction": {
+      "maximum": 1,
+      "minimum": 0,
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "total_partial_sum_count": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "undefined_ratio_policy": {
+      "const": "null"
+    },
+    "update_definition": {
+      "const": "partial_sums_requiring_nonzero_scu_shift"
+    },
+    "updated_partial_sum_count": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "version": {
+      "const": 1
+    }
+  },
+  "required": [
+    "model",
+    "precision",
+    "dim",
+    "manifest_sha256",
+    "schema",
+    "version",
+    "input_sha256",
+    "aggregation",
+    "undefined_ratio_policy",
+    "scale_domain",
+    "avg_delta_w",
+    "max_delta_w",
+    "scu_update_fraction",
+    "delta_w_sum",
+    "alignment_count",
+    "updated_partial_sum_count",
+    "avg_delta_w_weighting",
+    "total_partial_sum_count",
+    "update_definition",
+    "pre_pot_fp_scale_available",
+    "dense",
+    "overall",
+    "residual"
+  ],
+  "title": "scale_alignment_metrics",
+  "type": "object"
+}

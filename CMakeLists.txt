@@ -172,6 +172,27 @@ if (LLAMA_USE_SYSTEM_GGML)
 endif()
 
 # Gemmini compile-time switches (source of truth: root cache + build scripts).
+foreach(_metric IN ITEMS ACT ACT_QUANT RESIDUAL SCALE)
+    set(GGML_GEMMINI_${_metric}_METRICS "0" CACHE STRING "Enable independent ${_metric} evaluation metrics (0|1)")
+    set_property(CACHE GGML_GEMMINI_${_metric}_METRICS PROPERTY STRINGS 0 1)
+    if(NOT GGML_GEMMINI_${_metric}_METRICS MATCHES "^[01]$")
+        message(FATAL_ERROR "GGML_GEMMINI_${_metric}_METRICS must be 0 or 1")
+    endif()
+    foreach(_flags IN ITEMS CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_DEBUG CMAKE_CXX_FLAGS_RELEASE
+            CMAKE_CXX_FLAGS_RELWITHDEBINFO CMAKE_CXX_FLAGS_MINSIZEREL)
+        if("${${_flags}}" MATCHES "(^|[ \t])[-/]DGGML_GEMMINI_${_metric}_METRICS([= \t]|$)")
+            message(FATAL_ERROR "Use GGML_GEMMINI_${_metric}_METRICS cache option, not ${_flags}")
+        endif()
+    endforeach()
+endforeach()
+if(GGML_GEMMINI_ACT_METRICS)
+    set(GGML_GEMMINI_ACT_QUANT_METRICS 1)
+endif()
+set(CYCLE_SIM "0" CACHE STRING "Enable PoTal cycle-simulation trace collection (0|1)")
+set_property(CACHE CYCLE_SIM PROPERTY STRINGS 0 1)
+if(NOT CYCLE_SIM MATCHES "^[01]$")
+    message(FATAL_ERROR "CYCLE_SIM must be 0 or 1, got '${CYCLE_SIM}'")
+endif()
 set(GGML_GEMMINI_PRINT_TILE "0" CACHE STRING "Gemmini PRINT_TILE macro (0|1)")
 set_property(CACHE GGML_GEMMINI_PRINT_TILE PROPERTY STRINGS 0 1)
 set(GGML_GEMMINI_OPTION "CPU" CACHE STRING "Gemmini OPTION macro (CPU|OS|WS)")
@@ -278,6 +299,9 @@ set(_GGML_GEMMINI_WEIGHT_BITS_VALUE "${GGML_GEMMINI_WEIGHT_BITS}")
 set(GGML_GEMMINI_EXECUTION_BACKEND "HARDWARE" CACHE STRING
     "Gemmini execution backend: HARDWARE, IM2P_SIM, or FPGA_UART")
 set_property(CACHE GGML_GEMMINI_EXECUTION_BACKEND PROPERTY STRINGS HARDWARE IM2P_SIM FPGA_UART)
+if(CYCLE_SIM AND GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "FPGA_UART")
+    message(FATAL_ERROR "CYCLE_SIM cannot use FPGA_UART")
+endif()
 if(NOT GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "HARDWARE" AND
    NOT GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND
    NOT GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "FPGA_UART")
@@ -310,12 +334,18 @@ if(NOT GGML_GEMMINI_ACTIVATION_BITS STREQUAL
         "Gemmini requires matched activation and weight widths")
 endif()
 set(IM2P_SIM_ROOT "" CACHE PATH "Path to the IM2P.sim source and isolated build artifacts")
+set(IM2P_SIM_BUILD_DIR "" CACHE PATH
+    "Optional isolated IM2P managed-cache build root (default: IM2P_SIM_ROOT/build)")
 set(IM2P_SIM_IMPLEMENTATION "" CACHE STRING
     "IM2P simulator implementation: LEGACY_BSV or GEMMINI_HP1")
 set_property(CACHE IM2P_SIM_IMPLEMENTATION PROPERTY STRINGS LEGACY_BSV GEMMINI_HP1)
 if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND
    IM2P_SIM_IMPLEMENTATION STREQUAL "")
-    set(IM2P_SIM_IMPLEMENTATION "LEGACY_BSV")
+    if(CYCLE_SIM)
+        set(IM2P_SIM_IMPLEMENTATION "GEMMINI_HP1")
+    else()
+        set(IM2P_SIM_IMPLEMENTATION "LEGACY_BSV")
+    endif()
 endif()
 if(NOT GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND
    NOT IM2P_SIM_IMPLEMENTATION STREQUAL "")
@@ -364,7 +394,7 @@ if(GGML_GEMMINI)
             "Gemmini parameter header does not define a numeric DIM")
     endif()
     set(_GGML_GEMMINI_PHYSICAL_DIM "${CMAKE_MATCH_1}")
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv" AND NOT CYCLE_SIM)
         if(NOT _GGML_GEMMINI_PHYSICAL_DIM STREQUAL "${GGML_GEMMINI_DIM}")
             message(FATAL_ERROR
                 "Physical Gemmini DIM mismatch: hardware header reports ${_GGML_GEMMINI_PHYSICAL_DIM}, build requests ${GGML_GEMMINI_DIM}")
@@ -406,7 +436,53 @@ if(GGML_GEMMINI)
     include_directories(BEFORE "${GGML_GEMMINI_GENERATED_CONFIG_DIR}")
 endif()
 
-if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
+if(CYCLE_SIM)
+    if(IM2P_SIM_ROOT STREQUAL "")
+        get_filename_component(IM2P_SIM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../IM2P.sim" ABSOLUTE)
+    endif()
+    if(NOT EXISTS "${IM2P_SIM_ROOT}/frontend/src/im2p_cpu_functional.cpp")
+        message(FATAL_ERROR "CYCLE_SIM requires the IM2P CPU-functional frontend sources")
+    endif()
+    if(NOT GGML_GEMMINI_ACTIVATION_BITS MATCHES "^(4|8)$" OR
+       NOT GGML_GEMMINI_BLOCK_SIZE STREQUAL "32" OR
+       (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND
+        NOT IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1"))
+        message(FATAL_ERROR "CYCLE_SIM requires an A4W4/A8W8 block32 GEMMINI_HP1 target")
+    endif()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(_CYCLE_SIM_GENERATED "${CMAKE_BINARY_DIR}/cycle-sim-generated")
+    set(_CYCLE_SIM_GENERATE
+        "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/cycle-sim-build-info.py"
+        --sim "${IM2P_SIM_ROOT}" --llama "${CMAKE_CURRENT_SOURCE_DIR}"
+        --bits "${GGML_GEMMINI_ACTIVATION_BITS}" --dim "${GGML_GEMMINI_DIM}"
+        --out "${_CYCLE_SIM_GENERATED}")
+    execute_process(COMMAND ${_CYCLE_SIM_GENERATE}
+        RESULT_VARIABLE _CYCLE_SIM_GENERATE_RESULT)
+    if(NOT _CYCLE_SIM_GENERATE_RESULT EQUAL 0)
+        message(FATAL_ERROR "CYCLE_SIM hardware contract generation failed")
+    endif()
+    include("${_CYCLE_SIM_GENERATED}/cycle-sim-target.cmake")
+    if(GGML_GEMMINI)
+        set(_CYCLE_SIM_PARAM_BANK_NUM "${IM2P_CYCLE_SIM_BANK_COUNT}")
+        set(_CYCLE_SIM_PARAM_BANK_ROWS "${IM2P_CYCLE_SIM_BANK_ROWS}")
+        set(_CYCLE_SIM_PARAM_ACC_ROWS "${IM2P_CYCLE_SIM_ACCUMULATOR_ROWS}")
+        foreach(_macro IN ITEMS BANK_NUM BANK_ROWS ACC_ROWS)
+            set(_pattern "#define[ \t]+${_macro}[ \t]+[0-9]+")
+            string(REGEX MATCHALL "${_pattern}" _matches "${_GGML_GEMMINI_PARAMS_CONTENT}")
+            list(LENGTH _matches _count)
+            if(NOT _count EQUAL 1)
+                message(FATAL_ERROR "CYCLE_SIM requires one numeric ${_macro} in the selected parameter header")
+            endif()
+            string(REGEX REPLACE "${_pattern}" "#define ${_macro} ${_CYCLE_SIM_PARAM_${_macro}}"
+                _GGML_GEMMINI_PARAMS_CONTENT "${_GGML_GEMMINI_PARAMS_CONTENT}")
+        endforeach()
+        file(WRITE "${GGML_GEMMINI_GENERATED_CONFIG_DIR}/gemmini_params.h"
+            "${_GGML_GEMMINI_PARAMS_CONTENT}")
+    endif()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/cycle-sim-build-info.py"
+        ${IM2P_CYCLE_SIM_CONFIGURE_INPUTS})
+elseif(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
     if(IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1")
         set(_GGML_GEMMINI_IM2P_EXPECTED_IMPLEMENTATION
             "gemmini-hp1-integrated-v1")
@@ -431,8 +507,16 @@ if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
 
     set(GGML_GEMMINI_IM2P_ARTIFACT_ID
         "a${GGML_GEMMINI_ACTIVATION_BITS}-w${GGML_GEMMINI_WEIGHT_BITS}-d${GGML_GEMMINI_DIM}")
+    # Keep provenance experiments outside the production selected generation.
+    # The existing cache verifier and containment checks remain mandatory.
+    if(IM2P_SIM_BUILD_DIR STREQUAL "")
+        set(_GGML_GEMMINI_IM2P_BUILD_DIR "${IM2P_SIM_ROOT}/build")
+    else()
+        get_filename_component(_GGML_GEMMINI_IM2P_BUILD_DIR
+            "${IM2P_SIM_BUILD_DIR}" ABSOLUTE)
+    endif()
     set(_GGML_GEMMINI_IM2P_CURRENT
-        "${IM2P_SIM_ROOT}/build/selected/${IM2P_SIM_IMPLEMENTATION}/${GGML_GEMMINI_IM2P_ARTIFACT_ID}/current")
+        "${_GGML_GEMMINI_IM2P_BUILD_DIR}/selected/${IM2P_SIM_IMPLEMENTATION}/${GGML_GEMMINI_IM2P_ARTIFACT_ID}/current")
     if(NOT IS_SYMLINK "${_GGML_GEMMINI_IM2P_CURRENT}")
         message(FATAL_ERROR
             "Missing atomic IM2P selected generation: ${_GGML_GEMMINI_IM2P_CURRENT}")
@@ -440,7 +524,7 @@ if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
     get_filename_component(GGML_GEMMINI_IM2P_GENERATION
         "${_GGML_GEMMINI_IM2P_CURRENT}" REALPATH)
     get_filename_component(_GGML_GEMMINI_IM2P_GENERATION_ROOT
-        "${IM2P_SIM_ROOT}/build/selected/${IM2P_SIM_IMPLEMENTATION}/${GGML_GEMMINI_IM2P_ARTIFACT_ID}/generations"
+        "${_GGML_GEMMINI_IM2P_BUILD_DIR}/selected/${IM2P_SIM_IMPLEMENTATION}/${GGML_GEMMINI_IM2P_ARTIFACT_ID}/generations"
         REALPATH)
     string(FIND "${GGML_GEMMINI_IM2P_GENERATION}/"
         "${_GGML_GEMMINI_IM2P_GENERATION_ROOT}/"
@@ -475,6 +559,31 @@ if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
     if(NOT _GGML_GEMMINI_IM2P_MANIFEST_RESULT EQUAL 0)
         message(FATAL_ERROR
             "IM2P cache manifest verification failed for ${GGML_GEMMINI_IM2P_ARTIFACT_ID}:\n${_GGML_GEMMINI_IM2P_MANIFEST_OUTPUT}${_GGML_GEMMINI_IM2P_MANIFEST_ERROR}")
+    endif()
+    if(IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1")
+        file(READ "${GGML_GEMMINI_IM2P_MANIFEST}" _GGML_GEMMINI_IM2P_MANIFEST_JSON)
+        string(JSON _GGML_GEMMINI_IM2P_CONTRACT GET
+            "${_GGML_GEMMINI_IM2P_MANIFEST_JSON}" build_config hardware_lowering_contract)
+        foreach(_pair IN ITEMS "BANK_NUM=bank_count" "BANK_ROWS=bank_rows"
+                               "ACC_ROWS=accumulator_rows")
+            string(REPLACE "=" ";" _parts "${_pair}")
+            list(GET _parts 0 _macro)
+            list(GET _parts 1 _field)
+            string(JSON _resolved GET "${_GGML_GEMMINI_IM2P_CONTRACT}" facts memory "${_field}")
+            string(REGEX MATCHALL "#define[ \t]+${_macro}[ \t]+[0-9]+"
+                _matches "${_GGML_GEMMINI_PARAMS_CONTENT}")
+            list(LENGTH _matches _count)
+            if(NOT _count EQUAL 1 OR NOT _resolved MATCHES "^[1-9][0-9]*$")
+                message(FATAL_ERROR "Selected IM2P hardware memory contract lacks ${_macro}")
+            endif()
+            string(REGEX REPLACE "#define[ \t]+${_macro}[ \t]+[0-9]+"
+                "#define ${_macro} ${_resolved}" _GGML_GEMMINI_PARAMS_CONTENT
+                "${_GGML_GEMMINI_PARAMS_CONTENT}")
+        endforeach()
+        file(WRITE "${GGML_GEMMINI_GENERATED_CONFIG_DIR}/gemmini_params.h"
+            "${_GGML_GEMMINI_PARAMS_CONTENT}")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            "${GGML_GEMMINI_IM2P_MANIFEST}")
     endif()
     set(GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE
         "${GGML_GEMMINI_IM2P_GENERATION}/libim2p_gemmini_frontend.a")
@@ -559,6 +668,7 @@ int main() {
         "${CMAKE_CURRENT_SOURCE_DIR}/ggml/include"
         "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src"
         "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-gemmini-utils/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/common"
         "${GEMMINI_SW_PATH}"
         "${GEMMINI_SW_PATH}/include"
         "${IM2P_SIM_ROOT}/frontend/include"
@@ -568,7 +678,13 @@ int main() {
     try_run(_GGML_GEMMINI_IM2P_PAIR_PROBE_RESULT
         _GGML_GEMMINI_IM2P_PAIR_PROBE_COMPILED
         "${CMAKE_CURRENT_BINARY_DIR}/im2p-frontend-pair-probe"
-        "${_GGML_GEMMINI_IM2P_PAIR_PROBE_SOURCE}"
+        SOURCES
+            "${_GGML_GEMMINI_IM2P_PAIR_PROBE_SOURCE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-gemmini-utils/src/optrace.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-gemmini-utils/src/debug.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-gemmini-utils/src/cycle.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-gemmini-utils/src/performance.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-gemmini-utils/src/trace-context.cpp"
         CMAKE_FLAGS
             "-DCMAKE_CXX_STANDARD=20"
             "-DCMAKE_CXX_STANDARD_REQUIRED=ON"
@@ -953,7 +1069,11 @@ set(GGML_GEMMINI_COMPILE_DEFS
     GGML_GEMMINI_WEIGHT_BITS=${_GGML_GEMMINI_WEIGHT_BITS_VALUE}
     GGML_GEMMINI_CONFIGURED_DIM=${GGML_GEMMINI_DIM}
 )
-if(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
+if(CYCLE_SIM AND _GGML_GEMMINI_OPTION_UPPER STREQUAL "WS")
+    list(APPEND GGML_GEMMINI_COMPILE_DEFS
+        GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM=1
+        IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1=1)
+elseif(GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
     list(APPEND GGML_GEMMINI_COMPILE_DEFS GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM=1)
     if(IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1")
         list(APPEND GGML_GEMMINI_COMPILE_DEFS IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1=1)
@@ -993,6 +1113,11 @@ if (NOT _GGML_GEMMINI_EXSIA_PROFILE_SCOPE_UPPER STREQUAL "OFF" AND NOT CYCLE_DET
 endif()
 
 set(GGML_GEMMINI_RUNTIME_COMPILE_DEFS
+    GGML_GEMMINI_ACT_METRICS=${GGML_GEMMINI_ACT_QUANT_METRICS}
+    GGML_GEMMINI_SCALE_METRICS=${GGML_GEMMINI_SCALE_METRICS}
+    GGML_GEMMINI_ACT_QUANT_METRICS=${GGML_GEMMINI_ACT_QUANT_METRICS}
+    GGML_GEMMINI_RESIDUAL_METRICS=${GGML_GEMMINI_RESIDUAL_METRICS}
+    CYCLE_SIM=${CYCLE_SIM}
     LOG_DEBUG=${LOG_DEBUG}
     LOG_CYCLE=${LOG_CYCLE}
     LOG_DUMP=${LOG_DUMP}
@@ -1014,6 +1139,10 @@ if (LLAMA_BUILD_TESTS AND GGML_GEMMINI)
     list(APPEND GGML_GEMMINI_COMPILE_DEFS GGML_GEMMINI_TEST_OBSERVER=1)
 endif()
 set(GGML_GEMMINI_UTILS_COMPILE_DEFS
+    GGML_GEMMINI_ACT_METRICS=${GGML_GEMMINI_ACT_QUANT_METRICS}
+    GGML_GEMMINI_SCALE_METRICS=${GGML_GEMMINI_SCALE_METRICS}
+    GGML_GEMMINI_ACT_QUANT_METRICS=${GGML_GEMMINI_ACT_QUANT_METRICS}
+    GGML_GEMMINI_RESIDUAL_METRICS=${GGML_GEMMINI_RESIDUAL_METRICS}
     LOG_DEBUG=${LOG_DEBUG}
     LOG_CYCLE=${LOG_CYCLE}
     CYCLE_DETAIL=${CYCLE_DETAIL})

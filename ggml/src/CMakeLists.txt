@@ -1,6 +1,13 @@
 include(CheckCXXCompilerFlag)
 include("../cmake/common.cmake")
 
+if(NOT DEFINED CYCLE_SIM)
+    set(CYCLE_SIM 0)
+endif()
+if(NOT DEFINED LOG_CYCLE)
+    set(LOG_CYCLE 0)
+endif()
+
 add_compile_definitions(GGML_SCHED_MAX_COPIES=${GGML_SCHED_MAX_COPIES})
 
 # enable libstdc++ assertions for debug builds
@@ -252,14 +259,16 @@ endfunction()
 
 function(ggml_add_backend backend)
     string(TOUPPER "GGML_${backend}" backend_id)
+    string(TOLOWER "ggml-${backend}" backend_target)
     if (${backend_id})
-        string(TOLOWER "ggml-${backend}" backend_target)
         add_subdirectory(${backend_target})
         message(STATUS "Including ${backend} backend")
         if (NOT GGML_BACKEND_DL)
             string(TOUPPER "GGML_USE_${backend}" backend_use)
             target_compile_definitions(ggml PUBLIC ${backend_use})
         endif()
+    elseif(GGML_BACKEND_DL)
+        file(REMOVE "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${CMAKE_SHARED_MODULE_PREFIX}${backend_target}${CMAKE_SHARED_MODULE_SUFFIX}")
     endif()
 endfunction()
 
@@ -282,6 +291,10 @@ function(ggml_add_cpu_backend_variant tag_name)
 endfunction()
 
 add_subdirectory(ggml-gemmini-utils)
+target_compile_definitions(ggml-base PRIVATE CYCLE_SIM=${CYCLE_SIM} LOG_CYCLE=${LOG_CYCLE})
+if(LOG_CYCLE OR CYCLE_SIM)
+    target_link_libraries(ggml-base PRIVATE ggml-gemmini-utils)
+endif()
 
 ggml_add_backend(CPU)
 

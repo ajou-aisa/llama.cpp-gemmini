@@ -62,9 +62,12 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ${GEMMINI_SW_PATH}/gemmini-rocc-tests
         ${GEMMINI_SW_PATH}/gemmini-rocc-tests/include
         ${GEMMINI_SW_PATH}/rocc-software/src)
-    target_compile_definitions(${GGML_CPU_NAME} PRIVATE CYCLE_LOG=$<IF:$<BOOL:${GGML_CPU_CYCLE_LOG}>,1,0>)
+    target_compile_definitions(${GGML_CPU_NAME} PRIVATE
+        CYCLE_SIM=${CYCLE_SIM}
+        LOG_CYCLE=${LOG_CYCLE}
+        CYCLE_LOG=$<IF:$<BOOL:${GGML_CPU_CYCLE_LOG}>,1,0>)
 
-    if (GGML_CPU_CYCLE_LOG)
+    if (LOG_CYCLE OR GGML_CPU_CYCLE_LOG OR CYCLE_SIM)
         target_link_libraries(${GGML_CPU_NAME} PRIVATE ggml-gemmini-utils)
     endif()
 

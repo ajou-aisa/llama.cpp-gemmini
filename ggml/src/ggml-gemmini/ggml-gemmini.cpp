@@ -28,7 +28,11 @@
 #include "ggml-quants.h"
 
 #include <gemmini/log.hpp>
+#include <gemmini/optrace.hpp>
 #include <gemmini/performance.hpp>
+#if LOG_CYCLE || CYCLE_SIM
+#include <gemmini/semantic.hpp>
+#endif
 #if LOG_CYCLE
 #include "../../../common/json.hpp"
 #endif
@@ -305,6 +309,21 @@ namespace
         }
         return layer;
     }
+
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
+    // Evaluation only: the lm_head of a metric-only session whose output is the graph's logits ("result_output",
+    // or "result_output-N"), which no later layer reads.
+    bool metric_terminal_only(const std::string &layer, const char *output) {
+        constexpr std::string_view logits = "result_output";
+        const std::string_view name = output ? output : "";
+        const std::string_view suffix = name.substr(std::min(name.size(), logits.size()));
+        const bool terminal = name.compare(0, logits.size(), logits) == 0 && (suffix.empty() ||
+            (suffix.size() > 1 && suffix[0] == '-' && suffix.find_first_not_of("0123456789", 1) == std::string_view::npos));
+        if (layer != "lm_head" || !terminal) return false;
+        const auto session = ggml::gemmini::evaluation::active_session();
+        return session && session->terminal_lm_head_metrics_only();
+    }
+#endif
 
     bool log_prepare_q8_0_rows_for_q8_h1_fail(const char * reason, const ggml_tensor * src, int64_t row = -1) {
         const int64_t ne0 = src ? src->ne[0] : -1;
@@ -1402,6 +1421,15 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     args.model_arch = ctx->model_arch.c_str();
     args.matmul_layer = resolve_backend_matmul_layer(
         ctx->model_arch, src0->name, src1->name, dst->name);
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
+    args.metric_terminal_only = metric_terminal_only(args.matmul_layer, dst->name);
+#endif
+    if (auto trace = ggml::gemmini::optrace::current_context())
+        args.optrace_context =
+            std::make_shared<const ggml::gemmini::optrace::Context>(std::move(trace));
+#if CYCLE_SIM
+    args.cycle_sim_context = ggml::gemmini::cycle_sim::context_for(dst);
+#endif
     const char * layer = args.matmul_layer.c_str();
     ggml::gemmini::log::debug(layer, "ggml_backend_gemmini_mul_mat called");
 
@@ -1683,6 +1711,10 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
     const bool facade_full_dispatch =
         (full_requested || decode_full_dispatch) && !im2p_non_exsia &&
         !im2p_exsia && !fpga_dense;
+#if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
+    if (args.metric_terminal_only && !(im2p_exsia && full_requested))
+        GGML_ABORT("Gemmini metric-only terminal lm_head requires the IM2P ExSIA FULL route");
+#endif
     const size_t pipeline_job_capacity = matmul_options.job_capacity;
     if (pipeline_requested && !exsia_pipeline_supported && !im2p_non_exsia && !fpga_dense) {
       ggml::gemmini::log::debug(
@@ -2821,6 +2853,9 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
     for (int i = 0; i < cgraph->n_nodes; i++)
     {
         struct ggml_tensor *node = cgraph->nodes[i];
+#if LOG_CYCLE || CYCLE_SIM
+        ggml::gemmini::semantic::ScopedNode semantic_scope(node, 1);
+#endif
         ggml::gemmini::trace::ScopedContext operator_context(gemmini_trace_operator(
             graph_trace, graph_id, graph_id + 1 + static_cast<uint64_t>(i),
             static_cast<uint64_t>(i), ggml_op_name(node->op), 0, 1, 1));
@@ -2844,7 +2879,14 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
                               (long long)node->src[0]->ne[1], (long long)node->src[0]->ne[0]);
             }
 #endif
+#if CYCLE_SIM
+            const auto cycle_sim_context = ggml::gemmini::cycle_sim::context_for(node);
+            ggml::gemmini::cycle_sim::ScopedContext cycle_sim_scope(cycle_sim_context);
+#endif
             ggml_backend_gemmini_mul_mat(ctx, node);
+#if CYCLE_SIM
+            if (cycle_sim_context) cycle_sim_context.session->ensure_healthy();
+#endif
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_FPGA_UART)
             if (fpga_dispatch_failed) { operator_dispatch.finish(false); ++fpga_failed; return GGML_STATUS_FAILED; }
 #endif
