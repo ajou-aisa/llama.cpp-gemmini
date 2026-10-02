@@ -245,7 +245,8 @@ def prepare_builds(root: Path, sweep: Sweep, jobs: int, failures: list[Record], 
     """One verified build per collection kind x precision x DIM from the build authority's cache, linked from
     builds/; `timing` receives each build's seconds and cache hit.
 
-    Both models use the same build; a resumed sweep must resolve every build to the one it started with."""
+    Both models use the same build. A resumed sweep keeps the builds it linked, the exact verified runners its
+    earlier configurations used, even after the sources moved on (a commit or merge): nothing is rebuilt or mixed."""
     prepared: dict[Build, Path] = {}
     (root / "builds").mkdir(exist_ok=True)
     for build in sweep.builds():
@@ -253,15 +254,19 @@ def prepare_builds(root: Path, sweep: Sweep, jobs: int, failures: list[Record], 
         link = root / "builds" / build_name(kind, precision, dim)
         try:
             started = time.monotonic()
-            path, hit = cached_llama_build(Path(sweep.build_cache), kind, precision, dim, Path(sweep.im2p), jobs)
-            timing[link.name] = {"seconds": round(time.monotonic() - started, 3), "cache_hit": hit}
             if link.is_symlink():
-                require(link.resolve() == path.resolve(),
-                        f"{link.name} resolves to another build than this sweep started with (sources changed?)")
+                path, state = link.resolve(strict=True), "recorded"
+                receipt = read_json(path / "build-receipt.json")
+                require(receipt.get("kind") == kind and receipt.get("verification") == "PASS" and
+                        receipt.get("runner_sha256") == sha256(path / "bin/llama-eval-workload"),
+                        f"{link.name} no longer holds the verified build this sweep started with")
             else:
+                path, hit = cached_llama_build(Path(sweep.build_cache), kind, precision, dim, Path(sweep.im2p), jobs)
                 link.symlink_to(path.resolve(), target_is_directory=True)
+                state = "cache hit" if hit else "built"
+            timing[link.name] = {"seconds": round(time.monotonic() - started, 3), "cache_hit": state != "built"}
             prepared[build] = link
-            progress(f"build {link.name}: {'cache hit' if hit else 'built'} {path.resolve()}")
+            progress(f"build {link.name}: {state} {path.resolve()}")
         except (EvaluationError, OSError, ValueError, subprocess.SubprocessError) as error:
             failures.append(failure(None, precision, dim, "build " + kind, error))
             progress(f"build {link.name}: FAILED {error}")

@@ -175,7 +175,8 @@ semantics: it runs `campaign.py` and only reads finished runs (`metric_sweep.py`
   DIM 32 over 48 chunks took 400/351/305/262 s with 7/8/10/12 workers without memory pressure or swap. The useful
   worker count is bounded by cores and by free memory.
 - Builds come from `campaign_build.cached_llama_build` (`--build-cache`, default `runs/.build-cache`) and are passed as
-  `campaign.py --prepared-build`; `<sweep>/builds/` links them, and a resumed sweep must resolve to the same builds.
+  `campaign.py --prepared-build`; `<sweep>/builds/` links them. A resumed sweep runs on exactly those linked builds
+  (receipt and runner SHA-256 checked again), so a commit or merge after the start neither rebuilds nor mixes them.
 - Identity: the sweep requires the same model, dataset, tokenizer, precision, DIM, seed, chunk policy, native workload
   identity and chunk IDs for the three metrics of a configuration (`measurement_identity` plus the workload files),
   and the same native workload and chunk IDs across the DIMs of one model and precision. Each configuration records

@@ -151,9 +151,10 @@ class Fakes:
         self.calls: list[list[str]] = []
         self.fail: set[Key] = set()
         self.chunks: dict[Key, list[int]] = {}
+        self.sources = ""  # a later source state (commit, merge) resolves every profile to another build
 
     def build(self, cache: Path, kind: str, precision: str, dim: int, im2p: Path, jobs: int) -> tuple[Path, bool]:
-        path = cache / f"{kind}-{precision}-d{dim}"
+        path = cache / f"{kind}-{precision}-d{dim}{self.sources}"
         if path.exists():
             return path, True
         self.builds.append((kind, precision, dim))
@@ -430,6 +431,30 @@ def test_resume_rejects_a_corrupt_complete_run(tmp_path: Path, fakes: Fakes) -> 
     assert fakes.calls == [] and not (root / "gpt2/a8w8/d16/residual.retry-1").exists()
     [failure] = read_json(root / "metric-summary.json")["failures"]
     assert (failure["dim"], failure["stage"]) == (16, "residual") and "artifact hash changed: summary.json" in failure["error"]
+
+
+def test_resume_keeps_its_builds_after_the_sources_change(tmp_path: Path, fakes: Fakes) -> None:
+    root = tmp_path / "s"
+    fakes.fail.add(("gpt2", "a8w8", 32, "metrics-all"))
+    assert sweep(tmp_path, "--output", str(root), "--models", "gpt2", "--precisions", "a8w8", "--dims", "16,32",
+                 collection="combined") == 1
+    started = {link.name: link.resolve() for link in (root / "builds").iterdir()}
+    # A commit or merge after the start: the build cache now resolves these profiles to other builds.
+    fakes.sources = "-merged"
+    fakes.fail.clear()
+    fakes.builds.clear()
+    fakes.calls.clear()
+    runner = started["metrics-all-a8w8-d32"] / "bin/llama-eval-workload"
+    original = runner.read_text()
+    runner.write_text("changed after its receipt")
+    assert metric_sweep.main(["--resume", str(root)]) == 1  # a recorded build that changed is refused, not replaced
+    [failure] = read_json(root / "metric-summary.json")["failures"]
+    assert failure["stage"] == "build metrics-all" and "no longer holds the verified build" in failure["error"]
+    runner.write_text(original)
+    assert metric_sweep.main(["--resume", str(root)]) == 0
+    assert fakes.builds == [] and {link.name: link.resolve() for link in (root / "builds").iterdir()} == started
+    [call] = fakes.calls  # only the unfinished configuration runs, on the build the sweep started with
+    assert Path(call[call.index("--prepared-build") + 1]).resolve() == started["metrics-all-a8w8-d32"]
 
 
 def test_reused_scu_run_without_the_split_is_refused(tmp_path: Path, fakes: Fakes) -> None:
