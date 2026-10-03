@@ -109,6 +109,29 @@ bool native_h1()
     return report("native_h1", status, output, 32.0 * 0.5 - 32.0 * 2.0 * 10.0);
 }
 
+bool native_q8_h0()
+{
+    float output = 777.0f;
+    ggml_gemmini_args_t args{};
+    initialize_args(args, &output);
+    if (!initialize_activation(args)) {
+        return false;
+    }
+    initialize_metadata(args, 1, {1.0f, 10.0f});
+
+    std::array<block_q8_0, 2> weights{};
+    std::fill(std::begin(weights[0].qs), std::end(weights[0].qs), int8_t{1});
+    std::fill(std::begin(weights[1].qs), std::end(weights[1].qs), int8_t{-1});
+    weights[0].d = ggml_fp32_to_fp16(0.5f);
+    weights[1].d = ggml_fp32_to_fp16(2.0f);
+    args.weight_format = Format::q8_h0;
+    args.B_blocks = weights.data();
+    args.native_weight_bytes = sizeof(weights);
+
+    const MatmulStatus status = run(args);
+    return report("native_q8_h0", status, output, 32.0 * 0.5 - 32.0 * 2.0 * 10.0);
+}
+
 bool native_hp1_slice()
 {
     float output = 777.0f;
@@ -332,7 +355,7 @@ bool native_q4(Format format, const char * scenario)
 int main()
 {
 #if GGML_GEMMINI_ACTIVATION_BITS == 8 && GGML_GEMMINI_WEIGHT_BITS == 8
-    return native_h1() && native_hp1_slice() && external_unpacked_h1() &&
+    return native_h1() && native_q8_h0() && native_hp1_slice() && external_unpacked_h1() &&
             baseline_scalar_bias() &&
             baseline_channel() && invalid_metadata_is_atomic() ?
         0 : 1;

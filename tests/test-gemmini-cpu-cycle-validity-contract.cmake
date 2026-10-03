@@ -167,17 +167,15 @@ set(expected_gemmini_labels
     gemmini.activation_buffer_preparation
     gemmini.quantize_activation
     gemmini.prepare_dense_i8_weight
-    gemmini.convert_q4_0_to_q4_h1
-    gemmini.convert_q8_0_to_q8_h1
     gemmini.prepare_weight
     gemmini.output_preparation)
 string(REGEX MATCHALL
     "log_outer_cpu_interval\\(args,[^;]*\"gemmini\\.[a-zA-Z0-9_]+\"[^;]*\\)"
     gemmini_records "${gemmini_source}")
 list(LENGTH gemmini_records gemmini_record_count)
-if(NOT gemmini_record_count EQUAL 9)
+if(NOT gemmini_record_count EQUAL 7)
     message(FATAL_ERROR
-        "Gemmini native interval count: expected 9, got ${gemmini_record_count}")
+        "Gemmini native interval count: expected 7, got ${gemmini_record_count}")
 endif()
 
 foreach(token IN ITEMS "overlaps_rtl=true" "excluded_from_cycle_sink=true")
@@ -210,8 +208,6 @@ set(required_gemmini_operations
     "args.transpose_B = (TRANSPOSE_B != 0)"
     "ggml::gemmini::gemmini_set_tile_ws(&args)"
     "ggml::gemmini::quants::quantize_activation(src1, args)"
-    "ggml::gemmini::prepare_q4_0_rows_for_q4_h1("
-    "ggml::gemmini::prepare_q8_0_rows_for_q8_h1("
     "pipeline_stripe_telemetry(layer, profile)"
     "ggml::gemmini::evaluate_matmul_cpu_interval("
     "rmd_telemetry_invocation_start, rmd_telemetry_invocation_end)")
