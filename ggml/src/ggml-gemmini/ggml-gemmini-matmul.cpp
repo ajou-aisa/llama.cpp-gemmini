@@ -887,6 +887,19 @@ MatMulStatus execute_dense(ggml_gemmini_args_t &args, std::optional<uint64_t> st
         return MatMulStatus::success;
     }
     test_detail::observe_dense_dispatch();
+    // GGUF Q4_0/Q8_0 blocks as stored (H0): block x block, then dequantize, on
+    // the CPU im2p path. Dense-B q8_h0 keeps the baseline route below.
+    if (args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q4_h0 ||
+        (args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_h0 &&
+         args.B_blocks != nullptr)) {
+        if (args.tiled_matmul_type != CPU) {
+            return MatMulStatus::unsupported;
+        }
+        test_detail::observe_backend_dispatch(true);
+        return tiled_matmul_auto_im2p(&args) == DenseMatmulStatus::success
+            ? MatMulStatus::success
+            : MatMulStatus::invalid_contract;
+    }
     if (quants::wroute::is_native_matched_width_format(args)) {
         if (args.tiled_matmul_type != CPU) {
             return MatMulStatus::unsupported;
@@ -1626,6 +1639,11 @@ MatMulResult MatMul::run_dense(bool transactional) {
         case ggml_gemmini_args_t::im2p_weight_format_t::q16_h1:
         case ggml_gemmini_args_t::im2p_weight_format_t::q16_hp1:
             if (!args().has_native_matched_width_contract()) {
+                return { MatMulStatus::invalid_contract, MatMulCapability::unsupported };
+            }
+            break;
+        case ggml_gemmini_args_t::im2p_weight_format_t::q8_h0:
+            if (args().B_blocks != nullptr && !args().has_q8_h0_contract()) {
                 return { MatMulStatus::invalid_contract, MatMulCapability::unsupported };
             }
             break;

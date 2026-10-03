@@ -27,6 +27,7 @@ constexpr ggml_type H0_TYPE = GGML_TYPE_Q4_0;
 constexpr ggml_type H1_TYPE = GGML_TYPE_Q4_H1;
 constexpr int64_t H1_BLOCK_SIZE = QK4_0;
 #elif GGML_GEMMINI_WEIGHT_BITS == 8
+constexpr ggml_type H0_TYPE = GGML_TYPE_Q8_0;
 constexpr ggml_type H1_TYPE = GGML_TYPE_Q8_H1;
 constexpr ggml_type H2_TYPE = GGML_TYPE_Q8_H2;
 constexpr int64_t H1_BLOCK_SIZE = QK8_0;
@@ -93,6 +94,10 @@ std::vector<uint8_t> quantize_weights(ggml_type type, const std::vector<float> &
     if (type == H0_TYPE) {
         written = quantize_q4_0(values.data(), encoded.data(), J, K, nullptr);
     } else
+#elif GGML_GEMMINI_WEIGHT_BITS == 8
+    if (type == H0_TYPE) {
+        written = quantize_q8_0(values.data(), encoded.data(), J, K, nullptr);
+    } else
 #endif
     if (type == H1_TYPE) {
 #if GGML_GEMMINI_WEIGHT_BITS == 4
@@ -124,6 +129,13 @@ std::vector<float> scalar_dequantize_weights(ggml_type type, const std::vector<u
         if (type == H0_TYPE) {
             dequantize_row_q4_0(
                 reinterpret_cast<const block_q4_0 *>(row_data),
+                decoded.data() + row * K,
+                K);
+        } else
+#elif GGML_GEMMINI_WEIGHT_BITS == 8
+        if (type == H0_TYPE) {
+            dequantize_row_q8_0(
+                reinterpret_cast<const block_q8_0 *>(row_data),
                 decoded.data() + row * K,
                 K);
         } else
@@ -398,7 +410,8 @@ int main(int argc, char ** argv) {
             return h0_ok && h1_ok;
 #elif GGML_GEMMINI_WEIGHT_BITS == 8
             const bool h2_ok = run_valid_case(backend, GGML_TYPE_Q8_H2);
-            return h1_ok && h2_ok;
+            const bool h0_ok = run_valid_case(backend, H0_TYPE);
+            return h1_ok && h2_ok && h0_ok;
 #else
             return h1_ok;
 #endif

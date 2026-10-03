@@ -733,6 +733,17 @@ typedef struct ggml_gemmini_args_t {
                reinterpret_cast<uintptr_t>(blocks) % alignment == 0;
     }
 
+    // GGUF Q8_0 blocks used as stored (H0): fp16 d is the floating block scale.
+    inline bool has_q8_h0_contract() const {
+        return weight_format == im2p_weight_format_t::q8_h0 &&
+               B_blocks != nullptr && J != 0 && K != 0 && K % QK8_0 == 0 &&
+               blocks_K == K / QK8_0 && blocks_J == J &&
+               J <= std::numeric_limits<size_t>::max() / blocks_K &&
+               J * blocks_K <= std::numeric_limits<size_t>::max() / sizeof(block_q8_0) &&
+               native_weight_bytes >= J * blocks_K * sizeof(block_q8_0) &&
+               reinterpret_cast<uintptr_t>(B_blocks) % alignof(block_q8_0) == 0;
+    }
+
     inline bool has_q8_h1_im2p_contract() const {
         if (weight_format != im2p_weight_format_t::q8_h1 ||
             q8_h1_blocks == nullptr || J == 0 || K == 0 ||

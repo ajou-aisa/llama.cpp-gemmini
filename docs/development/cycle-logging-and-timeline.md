@@ -338,7 +338,7 @@ Structural envelopes are declared by the call site. The logger does not infer th
 
 ### 5.2 Gemmini outer host stages
 
-The Gemmini host path has a contract for these nine outer CPU intervals:
+The Gemmini host path has a contract for these seven outer CPU intervals:
 
 ```text
 gemmini.prepare_args
@@ -346,8 +346,6 @@ gemmini.select_tile
 gemmini.activation_buffer_preparation
 gemmini.quantize_activation
 gemmini.prepare_dense_i8_weight
-gemmini.convert_q4_0_to_q4_h1
-gemmini.convert_q8_0_to_q8_h1
 gemmini.prepare_weight
 gemmini.output_preparation
 ```

@@ -558,12 +558,14 @@ std::vector<uint8_t> make_weights() {
   return encoded;
 #elif GGML_GEMMINI_ACTIVATION_QUANT == 0 || GGML_GEMMINI_ACTIVATION_QUANT == 3
   constexpr size_t blocks_per_row = K / QK8_0;
-  std::vector<uint8_t> encoded(J * blocks_per_row * sizeof(block_q8_0));
-  auto *blocks = reinterpret_cast<block_q8_0 *>(encoded.data());
+  std::vector<uint8_t> encoded(J * blocks_per_row * sizeof(block_q8_h1));
+  auto *blocks = reinterpret_cast<block_q8_h1 *>(encoded.data());
   for (int64_t j = 0; j < J; ++j) {
     for (size_t block_index = 0; block_index < blocks_per_row; ++block_index) {
-      block_q8_0 &block = blocks[j * blocks_per_row + block_index];
-      block.d = ggml_fp32_to_fp16(0.125f * static_cast<float>(j + 1));
+      block_q8_h1 &block = blocks[j * blocks_per_row + block_index];
+      block.s_rf = 0.125f * static_cast<float>(j + 1);
+      block.c_b = static_cast<uint8_t>(block_index + 1);
+      block.R = 1;
       for (int k = 0; k < QK8_0; ++k) {
         block.qs[k] = static_cast<int8_t>(
             (5 * j + static_cast<int>(block_index) + k) % 13 - 6);
@@ -726,16 +728,15 @@ bool scalar_oracle(const std::vector<float> &activations,
   }
 #elif GGML_GEMMINI_ACTIVATION_QUANT == 0 || GGML_GEMMINI_ACTIVATION_QUANT == 3
   constexpr size_t blocks_per_row = K / QK8_0;
-  const auto *blocks = reinterpret_cast<const block_q8_0 *>(weights.data());
+  const auto *blocks = reinterpret_cast<const block_q8_h1 *>(weights.data());
   for (int64_t i = 0; i < rows; ++i) {
     for (int64_t j = 0; j < J; ++j) {
       for (int64_t k = 0; k < K; ++k) {
-        const block_q8_0 &block =
+        const block_q8_h1 &block =
             blocks[j * blocks_per_row + static_cast<size_t>(k) / QK8_0];
-        const float weight =
-            ggml_fp16_to_fp32(block.d) *
-            static_cast<float>(block.qs[static_cast<size_t>(k) % QK8_0]);
-        expected[i * J + j] += decoded[i * K + k] * weight;
+        const float factor = block.s_rf * (block.c_b + block.R);
+        expected[i * J + j] += decoded[i * K + k] *
+                               block.qs[static_cast<size_t>(k) % QK8_0] * factor;
       }
     }
   }
@@ -794,7 +795,7 @@ struct GraphCase {
     ggml_tensor *mismatched_weight =
         ggml_new_tensor_2d(context, GGML_TYPE_Q4_H1, K, J);
 #elif GGML_GEMMINI_ACTIVATION_QUANT == 0 || GGML_GEMMINI_ACTIVATION_QUANT == 3
-    ggml_tensor *weight = ggml_new_tensor_2d(context, GGML_TYPE_Q8_0, K, J);
+    ggml_tensor *weight = ggml_new_tensor_2d(context, GGML_TYPE_Q8_H1, K, J);
 #else
     ggml_tensor *weight =
         ggml_new_tensor_2d(context, GGML_TYPE_Q8_CHANNEL, K, J);
