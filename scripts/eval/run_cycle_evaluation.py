@@ -31,6 +31,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime, timezone
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable, Final, TypeVar
 
@@ -45,7 +46,7 @@ from campaign_build import (
     source_state,
     toolchain,
 )
-from e2e_timeline import Axis, isolated_phase_table, timeline_rows, worker_scenario, write_timeline
+from e2e_timeline import Axis, isolated_phase_table, ms, timeline_rows, worker_scenario, write_timeline
 from eval_common import (
     EvaluationError,
     Json,
@@ -202,6 +203,79 @@ def instrumentation_markers(timing: Record, result: Record, generated: int) -> R
         "TPOT_NPU_COMPONENT_READY": "NOT_APPLICABLE" if generated == 1 else
             ready(part(result.get("tpot")).get("npu_tpot_cycles") is not None)}
     return markers
+
+
+def performance_summary(root: Path, markers: Record, document: Record) -> Record:
+    """Final stdout of a performance run: CPU, NPU and scheduled E2E side by side, read from performance.json.
+
+    Nothing is recomputed: CPU service (host PMU cycles, host ns) and NPU service (cycle model) stay in their own
+    clock domains and are never added; E2E is the scheduled request/token-ready endpoint difference of the same
+    scheduling pass that produced the overlap checks. Only the per-token CPU rows are reduced to a mean, and the
+    schedule-axis cycles get a ms value under the schedule clock, labelled with that clock's status."""
+    def part(value: Json) -> Record:
+        return record(value) if isinstance(value, dict) else {}
+
+    def mean(rows: list[Record], key: str) -> tuple[float | None, str]:
+        """Mean over the decode intervals; null when an interval has no valid value (never counted as zero)."""
+        values = [row.get(key) for row in rows]
+        missing = sum(1 for value in values if not isinstance(value, (int, float)))
+        if not rows:
+            return None, "NOT_APPLICABLE: no decode interval"
+        if missing:
+            return None, f"UNAVAILABLE: {missing} of {len(rows)} decode intervals lack a valid value"
+        return sum(value for value in values if isinstance(value, (int, float))) / len(rows), "VALID"
+
+    def axis_ms(cycles: Json, validated: Json) -> float | None:
+        """The accumulator's ms under a validated clock, else the schedule-clock conversion (diagnostic status)."""
+        if isinstance(validated, (int, float)):
+            return validated
+        if not isinstance(cycles, (int, float)) or not isinstance(hz, int) or hz <= 0:
+            return None
+        return ms(Fraction(cycles), hz)
+    ttft, tpot, e2e = part(document.get("ttft")), part(document.get("tpot")), part(document.get("e2e"))
+    components, checks = part(document.get("components")), part(document.get("timeline_checks"))
+    clock, measured = part(document.get("clock")), part(ttft.get("cpu_measured"))
+    hz, status = clock.get("schedule_clock_hz"), clock.get("status")
+    per_token = tpot.get("cpu_measured_per_token")
+    rows = [part(row) for row in per_token] if isinstance(per_token, list) else []
+    cycles_mean, cycles_status = mean(rows, "cpu_service_cycles")
+    elapsed_mean, _ = mean(rows, "cpu_host_elapsed_ms")
+    thread_mean, thread_status = mean(rows, "cpu_thread_ms")
+    return {
+        "output": str(root), "markers": markers,
+        # Legacy top-level keys, kept as compatibility aliases of ttft.npu_service_cycles / tpot.npu_service_cycles_mean.
+        "ttft_npu_cycles": ttft.get("npu_cycles"), "npu_tpot_cycles": tpot.get("npu_tpot_cycles"),
+        "ttft": {"cpu_service_cycles": measured.get("cpu_service_cycles"),
+                 "cpu_host_elapsed_ms": measured.get("cpu_host_elapsed_ms"),
+                 "cpu_thread_ms": measured.get("cpu_thread_ms"),
+                 "npu_service_cycles": ttft.get("npu_cycles"),
+                 "npu_service_breakdown": ttft.get("npu_service_breakdown"),
+                 "scheduled_e2e_cycles": e2e.get("ttft"),
+                 "scheduled_e2e_ms": axis_ms(e2e.get("ttft"), e2e.get("ttft_ms")),
+                 "scheduled_e2e_ms_status": status},
+        "tpot": {"intervals": tpot.get("intervals"),
+                 "cpu_service_cycles_mean": cycles_mean, "cpu_service_cycles_mean_status": cycles_status,
+                 "cpu_host_elapsed_ms_mean": elapsed_mean,
+                 "cpu_thread_ms_mean": thread_mean, "cpu_thread_ms_mean_status": thread_status,
+                 "npu_service_cycles_mean": tpot.get("npu_tpot_cycles"),
+                 "npu_service_breakdown_mean": tpot.get("npu_service_breakdown_mean"),
+                 "scheduled_e2e_cycles_mean": e2e.get("mean_tpot"),
+                 "scheduled_e2e_ms_mean": axis_ms(e2e.get("mean_tpot"), e2e.get("mean_tpot_ms")),
+                 "scheduled_e2e_ms_status": status},
+        "overlap": {key: checks.get(key) for key in (
+            "cpu_npu_overlap_cycles", "cpu_busy_union_cycles", "npu_busy_cycles", "npu_idle_cycles_in_request",
+            "request_span_cycles")},
+        "measurement": {
+            "cpu_collection": part(document.get("execution")).get("cpu_measurement"),
+            "cpu_clock_domain": part(components.get("cpu")).get("clock_domain"),
+            "npu_clock_domain": part(components.get("npu")).get("clock_domain"),
+            "cpu_timing_scope": "HOST_MEASURED on the collection host; target CPU timing admission is separate",
+            "schedule_scope": part(document.get("timing_model")).get("schedule_scope"),
+            "schedule_clock_hz": hz,
+            "e2e_definition": "scheduled request/token-ready endpoints; CPU/NPU overlap preserved; "
+                              "never CPU cycles + NPU cycles",
+            "publication_ready": markers.get("PUBLICATION_E2E_MS_READY") == "READY" and
+                                 part(document.get("publication")).get("TARGET_LATENCY_READY") is True}}
 
 
 def timing_validity(collection: Path, pmu_required: bool) -> Record:
@@ -1026,7 +1100,7 @@ def performance_run(args: argparse.Namespace) -> int:
             "TARGET_CPU_TIMING_READY": "READY" if readiness["target_host_ready"] else "NOT_READY",
             "TARGET_INTERFACE_COST_READY": "READY" if readiness["target_interface_ready"] else "NOT_READY",
             "PUBLICATION_E2E_MS_READY": "NOT_READY"})
-        write_json(root / "performance.json", {
+        document: Record = {
             "schema": "im2p-cycle-evaluation-performance", "version": 1, "workload": {
                 "model": model, "dataset": dataset, **workload_mode(args),
                 "chunk_id": 0, "profile": args.profile,
@@ -1039,7 +1113,8 @@ def performance_run(args: argparse.Namespace) -> int:
                                  "validation_scope": summary.get("validation_scope"),
                                  "cycle_library_sha256": summary.get("cycle_library_sha256")},
             "publication": readiness, "offline_pipeline": reference(replay / "result.json"),
-            "execution": execution_record(args, reuse, replay, run.cache)})
+            "execution": execution_record(args, reuse, replay, run.cache)}
+        write_json(root / "performance.json", document)
         if not args.keep_raw:
             discard(run, [replay / "execution.sqlite", schedule_path], removed)
         provenance = read_json(root / "provenance.json")
@@ -1055,9 +1130,7 @@ def performance_run(args: argparse.Namespace) -> int:
                             **instrumentation_markers(timing, result, args.generated)})
         run.write("PASS")
         checksums(root)
-        print(json.dumps({"output": str(root), "markers": run.markers,
-                          "ttft_npu_cycles": record(result["ttft"]).get("npu_cycles"),
-                          "npu_tpot_cycles": record(result["tpot"]).get("npu_tpot_cycles")}, sort_keys=True))
+        print(json.dumps(performance_summary(root, run.markers, document), sort_keys=True))
         return 0
     except StopAfter as stop:
         run.markers.update({"STOPPED_AFTER": str(stop), "ONE_COMMAND_EVALUATION_READY": "NOT_READY",

@@ -140,8 +140,10 @@ def fixture(root: Path, npu1_accept: int = 130, tokens: int = 2,
             out.execute("INSERT INTO results VALUES(?,?,?)", (identity, ordinal, json.dumps({"node_id": identity, **body})))
     authority = {} if validation is None else {"cycle_model_validation": validation}
     results.write_text("".join(json.dumps({"sequence": index, "work_id": index, "layer": "blk.0", "operation": "MUL_MAT",
+                                           "provenance": provenance, "scope": scope,
                                            "modeled": {"total_cycles": cycles}, **authority}) + "\n"
-                               for index, cycles in ((0, 100), (1, 50))))
+                               for index, cycles, provenance, scope in ((0, 100, "dense_main", "stripe"),
+                                                                        (1, 50, "residual", "residual_compact"))))
     return schedule, bundle, results
 
 
@@ -663,7 +665,8 @@ def test_performance_builds_only_the_collection_builds(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("timeline", ["none", "compact"])
-def test_performance_run_writes_a_timeline_only_on_request(tmp_path: Path, timeline: str) -> None:
+def test_performance_run_writes_a_timeline_only_on_request(tmp_path: Path, timeline: str,
+                                                           capsys: pytest.CaptureFixture[str]) -> None:
     import argparse
 
     import run_cycle_evaluation as runner
@@ -709,11 +712,21 @@ def test_performance_run_writes_a_timeline_only_on_request(tmp_path: Path, timel
             patch.object(runner, "cross_check", return_value={}), \
             patch.object(runner, "publication_readiness", return_value={
                 "clock_ready": False, "target_host_ready": False, "target_interface_ready": False}), \
-            patch.object(runner, "execution_record", return_value={}), \
             patch.object(runner, "instrumentation_markers", return_value={}):
         assert runner.performance_run(args) == 0
     root = tmp_path / "run"
     markers = json.loads((root / "manifest.json").read_text())["markers"]
+    # Then: stdout is the component/E2E summary of performance.json, and a reused collection is named as reused.
+    shown = json.loads(capsys.readouterr().out)
+    assert set(shown) == {"output", "markers", "ttft_npu_cycles", "npu_tpot_cycles", "ttft", "tpot", "overlap",
+                          "measurement"}
+    assert shown["output"] == str(root) and shown["markers"] == markers
+    assert shown["ttft"]["npu_service_cycles"] == 7 and shown["ttft"]["scheduled_e2e_cycles"] is None
+    # And: the legacy top-level keys are aliases of the structured NPU values; an absent source stays null, not zero.
+    assert shown["ttft_npu_cycles"] == 7
+    assert shown["npu_tpot_cycles"] is None and shown["tpot"]["npu_service_cycles_mean"] is None
+    assert shown["measurement"]["cpu_collection"] == "REUSED_COLLECTION"
+    assert shown["measurement"]["publication_ready"] is False and markers["PUBLICATION_E2E_MS_READY"] == "NOT_READY"
     # Then: the run is a performance run only, whatever the timeline switch.
     assert markers["MEASUREMENT_DOMAIN"] == "performance" and markers["HARDWARE_METRICS_RUN"] == "NOT_RUN"
     assert set(markers) >= {"FAST_CYCLE_EVALUATION_RUN", "TIMELINE_LOG_READY", "VALIDATION_MODE"}
@@ -764,6 +777,12 @@ def test_schedule_sinks_give_one_result_with_or_without_timeline(tmp_path: Path)
         created.append((sinks.row_objects_created, sinks.written))
     # Then: the timeline switch changes only what is written, and the in-pass rows are the exported timeline.
     assert outcomes[0] == outcomes[1] == expected
+    # And: the stored-timeline and in-pass paths attribute the same works to the same categories.
+    result = outcomes[0][0]
+    assert result["ttft"]["npu_service_breakdown"]["main_gemm_cycles"] == 100
+    assert result["ttft"]["npu_service_breakdown"]["status"] == "COMPLETE"
+    assert result["tpot"]["npu_service_breakdown_per_token"][0]["residual_gemm_cycles"] == 50
+    assert result["npu_service_by_layer"]["tpot_decode_sum"]["blk.0"]["residual_gemm_cycles"] == 50
     assert (tmp_path / "in-pass.jsonl").read_bytes() == reference.read_bytes()
     # And: performance-only creates and writes no timeline row object at all.
     rows = len(reference.read_text().splitlines())
@@ -807,3 +826,255 @@ def test_a_new_clock_reschedules_instead_of_rescaling(tmp_path: Path) -> None:
     keys = {digest(runner.schedule_identity(cache, bundle, npu, axis, 128, "NANO_LOCAL_VALIDATED"))
             for axis in (Axis(1_000_000_000, False), Axis(1_000_000_000, True), Axis(250_000_000, True))}
     assert len(keys) == 3
+
+
+# Performance stdout: CPU, NPU and overlap-aware scheduled E2E (never CPU cycles + NPU cycles)
+
+HZ = 1_000_000_000
+NOT_READY_MARKERS: Record = {"OPERATING_CLOCK_READY": "NOT_READY", "TARGET_CPU_TIMING_READY": "NOT_READY",
+                             "TARGET_INTERFACE_COST_READY": "NOT_READY", "PUBLICATION_E2E_MS_READY": "NOT_READY"}
+
+
+def event(name: str, at: int, token: int | None = None) -> Record:
+    return {"kind": "event", "event": name, "token_index": token, "start_cycle": at, "end_cycle": at}
+
+
+def cpu_row(token: int, start: int, end: int, cycles: int | None = None, thread: int | None = None) -> Record:
+    """A CPU service on the schedule axis; its PMU cycles (host clock domain) are deliberately not its duration."""
+    return {"kind": "cpu", "token_index": token, "start_cycle": start, "end_cycle": end,
+            "host_elapsed_ns": end - start, "host_thread_cpu_ns": thread, "cpu_cycles_valid": cycles is not None,
+            "cpu_cycles": cycles}
+
+
+def npu_row(token: int, start: int, end: int, provenance: str | None = "dense_main", scope: str | None = "stripe",
+            layer: str = "blk.0") -> Record:
+    return {"kind": "npu", "token_index": token, "start_cycle": start, "end_cycle": end, "npu_cycles": end - start,
+            "npu_provenance": provenance, "npu_scope": scope, "layer": layer}
+
+
+def summarized(rows: list[Record], generated: int, validated_hz: int | None = None, reuse: Record | None = None,
+               markers: Record | None = None, publication: Record | None = None) -> tuple[Record, Record]:
+    """(stdout summary, performance.json document) of one accumulator pass, assembled as performance_run does."""
+    import argparse
+
+    import run_cycle_evaluation as runner
+    from e2e_timeline import PerformanceAccumulator
+    accumulator = PerformanceAccumulator(generated, validated_hz, "NANO_LOCAL_VALIDATED", validated_hz or HZ)
+    for row in rows:
+        accumulator.add(row)
+    result, checks = accumulator.result()
+    document: Record = {
+        **result, "timeline_checks": checks,
+        "clock": {"schedule_clock_hz": validated_hz or HZ,
+                  "status": "VALIDATED_OPERATING_CLOCK" if validated_hz else "DIAGNOSTIC_CONFIGURED_TEST_CLOCK"},
+        "publication": publication or {"TARGET_LATENCY_READY": False},
+        "execution": runner.execution_record(argparse.Namespace(timeline="none"), reuse, Path("/nonexistent"), [])}
+    untouched = json.dumps(document, sort_keys=True)
+    summary = runner.performance_summary(Path("/run"), markers or dict(NOT_READY_MARKERS), document)
+    assert json.dumps(document, sort_keys=True) == untouched  # the summary only reads performance.json
+    # The legacy stdout keys are compatibility aliases of the structured NPU values and of performance.json.
+    assert set(summary) >= {"ttft", "tpot", "overlap", "measurement"}
+    assert summary["ttft_npu_cycles"] == summary["ttft"]["npu_service_cycles"] == document["ttft"]["npu_cycles"]
+    assert summary["ttft"]["npu_service_breakdown"] == document["ttft"]["npu_service_breakdown"]
+    assert summary["tpot"]["npu_service_breakdown_mean"] == document["tpot"]["npu_service_breakdown_mean"]
+    assert summary["npu_tpot_cycles"] == summary["tpot"]["npu_service_cycles_mean"] == document["tpot"]["npu_tpot_cycles"]
+    return summary, document
+
+
+@pytest.mark.parametrize("cpu, npu, overlap, service_sum", [
+    ((0, 10), (10, 30), 0, 30),   # A: no overlap
+    ((0, 20), (10, 30), 10, 40),  # B: partial overlap
+    ((0, 30), (10, 20), 10, 40),  # C: NPU fully inside the CPU work
+])
+def test_scheduled_e2e_is_the_endpoint_span_not_the_service_sum(cpu: tuple[int, int], npu: tuple[int, int],
+                                                                overlap: int, service_sum: int) -> None:
+    summary, _ = summarized([event("request_start", 0), cpu_row(0, *cpu, cycles=7_000), npu_row(0, *npu),
+                             event("token_ready", 30, 0)], 1)
+    shown = summary["overlap"]
+    assert (cpu[1] - cpu[0]) + (npu[1] - npu[0]) == service_sum
+    # Then: E2E is request -> token 0 ready on the schedule axis; overlapped work is not counted twice.
+    assert summary["ttft"]["scheduled_e2e_cycles"] == 30 == shown["request_span_cycles"]
+    assert shown["cpu_npu_overlap_cycles"] == overlap
+    assert shown["cpu_busy_union_cycles"] == cpu[1] - cpu[0] and shown["npu_busy_cycles"] == npu[1] - npu[0]
+    assert shown["npu_idle_cycles_in_request"] == 30 - (npu[1] - npu[0])
+    # And: neither component, nor the PMU count, nor any sum of them is reported as E2E.
+    assert summary["ttft"]["cpu_service_cycles"] == 7_000 and summary["ttft"]["npu_service_cycles"] == npu[1] - npu[0]
+    assert summary["ttft"]["scheduled_e2e_cycles"] != 7_000 + summary["ttft"]["npu_service_cycles"]
+    assert summary["ttft_npu_cycles"] == npu[1] - npu[0]
+    # And: the NPU main/residual split is service attribution only; it leaves the scheduled E2E at 30.
+    split = summary["ttft"]["npu_service_breakdown"]
+    assert split["main_gemm_cycles"] == split["total_cycles"] == npu[1] - npu[0] and split["status"] == "COMPLETE"
+    # And: one generated token has no TPOT; its means are null with a reason, never zero.
+    assert summary["npu_tpot_cycles"] is None
+    assert summary["tpot"]["scheduled_e2e_cycles_mean"] is None and summary["tpot"]["cpu_service_cycles_mean"] is None
+    assert summary["tpot"]["cpu_service_cycles_mean_status"].startswith("NOT_APPLICABLE")
+
+
+DECODE: list[Record] = [
+    event("request_start", 0), cpu_row(0, 0, 20, cycles=900, thread=15), npu_row(0, 10, 30), event("token_ready", 30, 0),
+    cpu_row(1, 30, 45, cycles=300, thread=10), npu_row(1, 35, 50), event("token_ready", 50, 1),
+    cpu_row(2, 50, 75, cycles=500, thread=20), npu_row(2, 60, 90), event("token_ready", 95, 2),
+    cpu_row(3, 95, 100, cycles=100, thread=3), npu_row(3, 100, 110), event("token_ready", 110, 3)]
+
+
+def test_summary_tpot_is_the_token_ready_difference_and_cpu_means_stay_in_their_domain() -> None:
+    summary, document = summarized(DECODE, 4)
+    ready = document["e2e"]["endpoints"]["token_ready"]
+    # Test D: TPOT_i = ready_i - ready_(i-1); the reported mean is (t_last - t_0) / intervals.
+    assert ready == [30, 50, 95, 110] and document["e2e"]["tpot_intervals"] == [20, 45, 15]
+    assert summary["tpot"]["scheduled_e2e_cycles_mean"] == pytest.approx((110 - 30) / 3)
+    assert summary["tpot"]["scheduled_e2e_cycles_mean"] == document["e2e"]["mean_tpot"]
+    assert summary["ttft"]["scheduled_e2e_cycles"] == 30 and summary["tpot"]["intervals"] == 3
+    # And: NPU and CPU means are the per-interval service means of performance.json, each in its own domain.
+    assert summary["tpot"]["npu_service_cycles_mean"] == document["tpot"]["npu_tpot_cycles"] == pytest.approx(55 / 3)
+    assert summary["ttft_npu_cycles"] == 20 and summary["npu_tpot_cycles"] == document["tpot"]["npu_tpot_cycles"]
+    assert summary["tpot"]["cpu_service_cycles_mean"] == pytest.approx(300) and \
+        summary["tpot"]["cpu_service_cycles_mean_status"] == "VALID"
+    assert summary["tpot"]["cpu_host_elapsed_ms_mean"] == pytest.approx(45 / 3 / 1e6)
+    assert summary["tpot"]["cpu_thread_ms_mean"] == pytest.approx(33 / 3 / 1e6)
+    # Test E: PMU cycles pass through unconverted; CPU ms come from host ns, never PMU cycles over the NPU clock.
+    assert summary["ttft"]["cpu_service_cycles"] == 900 == document["ttft"]["cpu_measured"]["cpu_service_cycles"]
+    assert summary["ttft"]["cpu_host_elapsed_ms"] == pytest.approx(20 / 1e6) != pytest.approx(900 * 1000 / HZ)
+    assert summary["ttft"]["cpu_thread_ms"] == pytest.approx(15 / 1e6)
+    assert summary["measurement"]["cpu_clock_domain"].startswith("HOST_CPU_PMU")
+    assert summary["measurement"]["npu_clock_domain"] == "NPU cycle model"
+    numbers = {value for block in ("ttft", "tpot", "overlap") for value in summary[block].values()
+               if isinstance(value, (int, float))}
+    for cpu_cycles, npu_cycles in ((900, 20), (300, 55 / 3), (1800, 75)):
+        assert not [value for value in numbers if value == pytest.approx(cpu_cycles + npu_cycles)]
+    assert "never CPU cycles + NPU cycles" in summary["measurement"]["e2e_definition"]
+    assert summary["measurement"]["schedule_scope"] == "SYNTHETIC_RECONSTRUCTION"
+
+
+def test_summary_cpu_means_are_null_when_a_decode_interval_lacks_valid_values() -> None:
+    rows = [dict(row) for row in DECODE]
+    rows[7].update(cpu_cycles_valid=False, cpu_cycles=None, host_thread_cpu_ns=None)  # token 2 CPU row
+    summary, _ = summarized(rows, 4)
+    tpot = summary["tpot"]
+    # Then: an invalid PMU / thread-time interval is not averaged as zero.
+    assert tpot["cpu_service_cycles_mean"] is None and tpot["cpu_thread_ms_mean"] is None
+    assert tpot["cpu_service_cycles_mean_status"] == tpot["cpu_thread_ms_mean_status"] == \
+        "UNAVAILABLE: 1 of 3 decode intervals lack a valid value"
+    # And: host elapsed time, NPU service and the scheduled E2E are unaffected.
+    assert tpot["cpu_host_elapsed_ms_mean"] == pytest.approx(45 / 3 / 1e6)
+    assert tpot["scheduled_e2e_cycles_mean"] == pytest.approx(80 / 3) and summary["ttft"]["cpu_service_cycles"] == 900
+
+
+def test_summary_ms_is_diagnostic_without_a_validated_clock_and_publication_stays_closed() -> None:
+    # Test F: no clock selection -> the ms value is the schedule-clock conversion, labelled diagnostic.
+    summary, document = summarized(DECODE, 4)
+    assert document["e2e"]["ttft_ms"] is None and document["e2e"]["target"]["e2e_ms"] is None
+    for block, cycles, ms_key in (("ttft", "scheduled_e2e_cycles", "scheduled_e2e_ms"),
+                                  ("tpot", "scheduled_e2e_cycles_mean", "scheduled_e2e_ms_mean")):
+        assert summary[block]["scheduled_e2e_ms_status"] == "DIAGNOSTIC_CONFIGURED_TEST_CLOCK"
+        assert summary[block][ms_key] == pytest.approx(summary[block][cycles] * 1000 / HZ)
+    assert summary["measurement"]["schedule_clock_hz"] == HZ and summary["measurement"]["publication_ready"] is False
+    assert summary["measurement"]["cpu_collection"] == "FRESH_COLLECTION"
+    # And: TARGET_CPU_TIMING_READY=NOT_READY is target admission; the host CPU measurement is still reported.
+    assert summary["markers"]["TARGET_CPU_TIMING_READY"] == "NOT_READY" and summary["ttft"]["cpu_service_cycles"] == 900
+    assert "target CPU timing admission is separate" in summary["measurement"]["cpu_timing_scope"]
+    # Test G: a validated operating clock converts with that clock; the other gates still hold publication closed.
+    clocked, document = summarized(DECODE, 4, validated_hz=250_000_000, reuse={"source_run": "old"},
+                                   markers={**NOT_READY_MARKERS, "OPERATING_CLOCK_READY": "READY"})
+    assert clocked["ttft"]["scheduled_e2e_ms_status"] == clocked["tpot"]["scheduled_e2e_ms_status"] == \
+        "VALIDATED_OPERATING_CLOCK"
+    assert clocked["ttft"]["scheduled_e2e_ms"] == document["e2e"]["ttft_ms"] == pytest.approx(30 * 1000 / 250_000_000)
+    assert clocked["tpot"]["scheduled_e2e_ms_mean"] == document["e2e"]["mean_tpot_ms"]
+    assert clocked["measurement"]["publication_ready"] is False
+    assert clocked["measurement"]["cpu_collection"] == "REUSED_COLLECTION"
+    # And: the marker alone or the gates alone never open publication.
+    for markers, gates in (({**NOT_READY_MARKERS, "PUBLICATION_E2E_MS_READY": "READY"}, {"TARGET_LATENCY_READY": False}),
+                           (dict(NOT_READY_MARKERS), {"TARGET_LATENCY_READY": True})):
+        closed, _ = summarized(DECODE, 4, validated_hz=250_000_000, markers=markers, publication=gates)
+        assert closed["measurement"]["publication_ready"] is False
+
+
+# NPU service attribution: main / residual / other GEMM work (producer provenance only)
+
+def test_npu_category_uses_only_the_producer_provenance_and_scope() -> None:
+    from e2e_timeline import npu_category
+    assert npu_category("dense_main", "stripe") == npu_category("dense_main", "full") == "MAIN_GEMM"
+    assert npu_category("residual", "residual_compact") == "RESIDUAL_GEMM"
+    # Missing or inconsistent provenance is UNCLASSIFIED, never main.
+    for provenance, scope in ((None, None), ("dense_main", None), ("dense_main", "residual_compact"),
+                              ("residual", "stripe"), ("rmd", "residual_compact"), ("", "")):
+        assert npu_category(provenance, scope) == "UNCLASSIFIED"
+
+
+def attribution() -> tuple[Record, Record]:
+    """Token 0: main 100 + residual 40 + other 10; token 1: main 80 + residual 20; token 2: main 90."""
+    from fractions import Fraction
+
+    from e2e_timeline import PerformanceAccumulator
+    accumulator = PerformanceAccumulator(3, None, "NANO_LOCAL_VALIDATED", HZ)
+    accumulator.request_start(Fraction(0))
+    at = 0
+    for token, works in enumerate(((("MAIN_GEMM", 100, "L0"), ("RESIDUAL_GEMM", 40, "L0"), ("OTHER_NPU", 10, "L1")),
+                                   (("MAIN_GEMM", 80, "L0"), ("RESIDUAL_GEMM", 20, "L0")),
+                                   (("MAIN_GEMM", 90, "L0"),))):
+        for category, cycles, layer in works:
+            accumulator.npu_interval(token, Fraction(at), Fraction(at + cycles), cycles, category, layer)
+            at += cycles
+        accumulator.token_ready(token, Fraction(at))
+    return accumulator.result()
+
+
+def test_npu_service_splits_into_main_residual_and_other_exactly() -> None:
+    result, checks = attribution()
+    ttft = result["ttft"]["npu_service_breakdown"]
+    assert checks["status"] == "PASS"
+    assert (ttft["main_gemm_cycles"], ttft["residual_gemm_cycles"], ttft["other_npu_cycles"]) == (100, 40, 10)
+    assert ttft["total_cycles"] == ttft["classified_total_cycles"] == result["ttft"]["npu_cycles"] == 150
+    assert ttft["status"] == "COMPLETE" and ttft["unclassified_npu_cycles"] == 0
+    assert ttft["residual_main_cycle_ratio"] == pytest.approx(0.4)
+    per_token = result["tpot"]["npu_service_breakdown_per_token"]
+    assert [(row["main_gemm_cycles"], row["residual_gemm_cycles"], row["other_npu_cycles"], row["total_cycles"])
+            for row in per_token] == [(80, 20, 0, 100), (90, 0, 0, 90)]
+    # A residual-free token has real zero residual work, not null.
+    assert per_token[1]["residual_gemm_cycles"] == 0 and per_token[1]["residual_main_cycle_ratio"] == 0
+    assert [row["total_cycles"] for row in per_token] == result["tpot"]["per_token_npu_cycles"]
+    mean = result["tpot"]["npu_service_breakdown_mean"]
+    assert (mean["main_gemm_cycles"], mean["residual_gemm_cycles"], mean["other_npu_cycles"],
+            mean["total_cycles"]) == (85, 10, 0, 95)
+    assert mean["total_cycles"] == result["tpot"]["npu_tpot_cycles"] and mean["intervals"] == 2
+    assert mean["status"] == "COMPLETE" and mean["residual_main_cycle_ratio"] == pytest.approx(10 / 85)
+    assert mean["main_gemm_cycles"] + mean["residual_gemm_cycles"] + mean["other_npu_cycles"] == mean["total_cycles"]
+    # And: the existing totals and endpoints are the ones without attribution.
+    assert result["e2e"]["ttft"] == 150 and result["e2e"]["tpot_intervals"] == [100, 90]
+
+
+def test_npu_service_by_layer_aggregates_the_same_classified_works() -> None:
+    result, _ = attribution()
+    layers = result["npu_service_by_layer"]
+    assert layers["ttft"]["L0"] == {"main_gemm_cycles": 100, "residual_gemm_cycles": 40, "other_npu_cycles": 0,
+                                    "unclassified_npu_cycles": 0, "total_cycles": 140,
+                                    "residual_main_cycle_ratio": pytest.approx(0.4)}
+    assert layers["ttft"]["L1"]["other_npu_cycles"] == 10 and layers["ttft"]["L1"]["residual_main_cycle_ratio"] is None
+    assert layers["tpot_decode_sum"] == {"L0": {"main_gemm_cycles": 170, "residual_gemm_cycles": 20,
+                                                "other_npu_cycles": 0, "unclassified_npu_cycles": 0,
+                                                "total_cycles": 190,
+                                                "residual_main_cycle_ratio": pytest.approx(20 / 170)}}
+    assert sum(row["total_cycles"] for row in layers["ttft"].values()) == result["ttft"]["npu_cycles"]
+
+
+def test_unknown_npu_provenance_is_incomplete_and_never_main() -> None:
+    rows = [event("request_start", 0), npu_row(0, 0, 60), npu_row(0, 60, 80, provenance=None, scope=None),
+            event("token_ready", 80, 0), npu_row(1, 80, 100, provenance="residual", scope="stripe"),
+            event("token_ready", 100, 1)]
+    summary, document = summarized(rows, 2)
+    ttft = document["ttft"]["npu_service_breakdown"]
+    assert (ttft["main_gemm_cycles"], ttft["unclassified_npu_cycles"], ttft["classified_total_cycles"]) == (60, 20, 60)
+    assert ttft["status"].startswith("INCOMPLETE") and ttft["total_cycles"] == document["ttft"]["npu_cycles"] == 80
+    mean = document["tpot"]["npu_service_breakdown_mean"]
+    assert mean["main_gemm_cycles"] == mean["residual_gemm_cycles"] == 0 and mean["unclassified_npu_cycles"] == 20
+    assert mean["status"].startswith("INCOMPLETE")
+    # And: the total NPU service and its legacy aliases stay available.
+    assert summary["ttft_npu_cycles"] == 80 and summary["npu_tpot_cycles"] == 20
+    assert summary["ttft"]["npu_service_breakdown"]["status"].startswith("INCOMPLETE")
+
+
+def test_single_token_has_no_tpot_attribution() -> None:
+    _, document = summarized([event("request_start", 0), npu_row(0, 0, 10), event("token_ready", 10, 0)], 1)
+    assert document["tpot"]["npu_service_breakdown_per_token"] == []
+    assert document["tpot"]["npu_service_breakdown_mean"] is None
+    assert document["npu_service_by_layer"]["tpot_decode_sum"] == {}

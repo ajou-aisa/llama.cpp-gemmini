@@ -301,6 +301,20 @@ are not admitted by any runner):
   TTFT, 127 TPOT intervals), `components` (CPU and NPU sums per clock domain, never added), `timing_model`,
   `timeline_checks`, `publication` and `execution` (fresh or reused collection, NPU task-cache counters, stage
   cache hits). Target E2E values stay null without clock, interface and target-host evidence.
+- A performance run ends with one stdout JSON read from `performance.json`: `ttft` and `tpot` (host CPU service
+  PMU cycles / host elapsed ms / thread ms, NPU service cycles, `scheduled_e2e_cycles` and its ms under the
+  schedule clock with `scheduled_e2e_ms_status`), `overlap` (the `timeline_checks` interval values) and
+  `measurement` (fresh or reused CPU collection, clock domains, `publication_ready`). `scheduled_e2e_*` is the
+  request/token-ready endpoint difference of the schedule, never CPU cycles + NPU cycles; under
+  `DIAGNOSTIC_CONFIGURED_TEST_CLOCK` the ms value is diagnostic, not target latency. The top-level
+  `ttft_npu_cycles` and `npu_tpot_cycles` are compatibility aliases of `ttft.npu_service_cycles` and
+  `tpot.npu_service_cycles_mean` (NPU service only, not E2E).
+- `ttft.npu_service_breakdown`, `tpot.npu_service_breakdown_per_token` / `npu_service_breakdown_mean` and
+  `npu_service_by_layer` split the same NPU service cycles into `main_gemm_cycles` (`dense_main` work),
+  `residual_gemm_cycles` (`residual`/`residual_compact` NPU work only; host residual preparation is CPU work),
+  `other_npu_cycles` and `unclassified_npu_cycles` (missing or inconsistent provenance; status `INCOMPLETE`, never
+  counted as main). Timeline NPU rows carry `npu_provenance`, `npu_scope` and `npu_category`. Service-work
+  attribution only, never an E2E value.
 - Metric runs keep their metric-specific file names and add the uniform hard-link names `summary.json`,
   `layers.json`, `request.json` and `raw.jsonl[.gz]`; `campaign_verify.py DIR` re-checks the manifest binding and
   `SHA256SUMS`. Residual adds `compact-shape-summary.json`; SCU raw observations are gzip only.

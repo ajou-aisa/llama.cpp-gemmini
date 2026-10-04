@@ -30,6 +30,12 @@ THREAD = re.compile(rb'"thread_id":(\d+)')
 EXECUTION = re.compile(rb'"host_execution_id":"([^"]+)"')
 SPAN = re.compile(rb'"host_start_ns":(\d+),"host_end_ns":(\d+)')
 WORKER = re.compile(rb'"worker_id":(\d+)')
+# NPU service categories. Only the producer's (provenance, scope) pair classifies a work (cycle_sim_records.cpp
+# work_fields and IM2P npu_trace_schema admit exactly these two pairs); layer names, geometry and order never do.
+NPU_CATEGORIES: Final = {("dense_main", "full"): "MAIN_GEMM", ("dense_main", "stripe"): "MAIN_GEMM",
+                         ("residual", "residual_compact"): "RESIDUAL_GEMM"}
+NPU_PARTS: Final = (("MAIN_GEMM", "main_gemm_cycles"), ("RESIDUAL_GEMM", "residual_gemm_cycles"),
+                    ("OTHER_NPU", "other_npu_cycles"), ("UNCLASSIFIED", "unclassified_npu_cycles"))
 STRUCTURAL: Final = frozenset({"OP_ENTER", "OP_EXIT", "BARRIER", "PUBLISH", "FUNCTIONAL_EMULATION", "WAIT", "EXCLUDED"})
 # NPU cycle authority of the admitted replay results; a host-local validation is never labelled certified.
 NPU_TIMING_SOURCE: Final = {"CURRENT_CERTIFIED": "CYCLE_SIM_ISOLATED_CERTIFIED",
@@ -173,6 +179,14 @@ def host_cores(measurement: Record) -> Record:
             "host_cpu_core_start": start, "host_cpu_core_end": end, "cpu_migrated": measurement.get("cpu_migrated")}
 
 
+def npu_category(provenance: Json, scope: Json) -> str:
+    """MAIN_GEMM / RESIDUAL_GEMM of one NPU work from its producer provenance and scope; anything else is
+    UNCLASSIFIED (never folded into main). OTHER_NPU names known non-GEMM NPU work; the current producer emits none.
+    Host residual preparation/reconstruction is CPU work and never reaches this function."""
+    return NPU_CATEGORIES.get((provenance, scope), "UNCLASSIFIED") if isinstance(provenance, str) and \
+        isinstance(scope, str) else "UNCLASSIFIED"
+
+
 def npu_works(npu_results: Path) -> dict[int, Record]:
     return {integer(row, "sequence"): row for row in records(npu_results)}
 
@@ -257,6 +271,8 @@ class RowBuilder:
                      "cpu_migrated": None, "target_cpu_core": None,
                      "work_id": work.get("work_id"), "op": work.get("operation"),
                      "layer": work.get("layer"), "evidence_id": scheduled.get("evidence_id"),
+                     "npu_provenance": work.get("provenance"), "npu_scope": work.get("scope"),
+                     "npu_category": npu_category(work.get("provenance"), work.get("scope")),
                      "npu_cycles": cycles, "npu_ms": None,
                      "result_ready_cycle": number(self.axis.cycles(result_ns)),
                      "timing_source": NPU_TIMING_SOURCE.get(str(work.get("cycle_model_validation")),
@@ -371,6 +387,8 @@ class PerformanceAccumulator:
         self.start: Fraction | None = None
         self.ready: dict[int, Fraction] = {}
         self.npu: dict[int, Fraction] = {}
+        self.npu_parts: dict[int, dict[str, int]] = {}
+        self.layer_parts: dict[str, dict[int, dict[str, int]]] = {}
         self.host: dict[int, int] = {}
         self.thread_cpu: dict[int, int] = {}
         self.cycles: dict[int, int] = {}
@@ -388,11 +406,18 @@ class PerformanceAccumulator:
     def token_ready(self, token: int, begin: Fraction) -> None:
         self.ready[token] = begin
 
-    def npu_interval(self, token: int, begin: Fraction, end: Fraction, cycles: int) -> None:
+    def npu_interval(self, token: int, begin: Fraction, end: Fraction, cycles: int, category: str = "UNCLASSIFIED",
+                     layer: Json = None) -> None:
+        """category comes from `npu_category`; the same cycles feed the total, the category and the layer once."""
         if self.npu_spans and begin < self.npu_spans[-1][1]:
             self.order_violations += 1
         self.npu_spans.append((begin, end))
         self.npu[token] = self.npu.get(token, Fraction(0)) + cycles
+        parts = self.npu_parts.setdefault(token, {})
+        parts[category] = parts.get(category, 0) + cycles
+        by_token = self.layer_parts.setdefault(layer if isinstance(layer, str) and layer else "UNKNOWN_LAYER", {})
+        layer_token = by_token.setdefault(token, {})
+        layer_token[category] = layer_token.get(category, 0) + cycles
         low, high = self.windows.get(token, (begin, end))
         self.windows[token] = (min(low, begin), max(high, end))
 
@@ -421,7 +446,8 @@ class PerformanceAccumulator:
             return
         token = integer(row, "token_index")
         if row["kind"] == "npu":
-            self.npu_interval(token, begin, end, integer(row, "npu_cycles"))
+            self.npu_interval(token, begin, end, integer(row, "npu_cycles"),
+                              npu_category(row.get("npu_provenance"), row.get("npu_scope")), row.get("layer"))
         else:
             self.cpu_interval(token, begin, end, integer(row, "host_elapsed_ns"),
                               integer(row, "host_thread_cpu_ns") if row.get("host_thread_cpu_ns") is not None else None,
@@ -514,7 +540,58 @@ class PerformanceAccumulator:
                                    "e2e_tpot_cycles": "NOT_APPLICABLE"})
             record(result["diagnostic_schedule"])["tpot_axis_cycles_stats"] = None
         result.update(self.separated(ready, intervals))
+        self.attributed(result)
         return result, checks
+
+    def attributed(self, result: Record) -> None:
+        """Main/residual/other NPU service attribution of the same works, tokens and cycles as the NPU totals.
+
+        Service-work accounting per clock domain only: never an E2E value and never added to CPU cycles."""
+        generated = self.generated
+        decode = list(range(1, generated))
+
+        def split(parts: dict[str, int]) -> Record:
+            row: Record = {name: parts.get(category, 0) for category, name in NPU_PARTS}
+            main, residual = parts.get("MAIN_GEMM", 0), parts.get("RESIDUAL_GEMM", 0)
+            row["total_cycles"] = sum(parts.values())
+            row["residual_main_cycle_ratio"] = residual / main if main else None
+            return row
+
+        def merged_parts(tokens: list[int], source: dict[int, dict[str, int]]) -> dict[str, int]:
+            total: dict[str, int] = {}
+            for token in tokens:
+                for category, cycles in source.get(token, {}).items():
+                    total[category] = total.get(category, 0) + cycles
+            return total
+
+        def status(parts: dict[str, int]) -> str:
+            return "INCOMPLETE: unclassified NPU work" if parts.get("UNCLASSIFIED", 0) else "COMPLETE"
+        ttft_parts = self.npu_parts.get(0, {})
+        ttft = split(ttft_parts)
+        classified = ttft["main_gemm_cycles"] + ttft["residual_gemm_cycles"] + ttft["other_npu_cycles"]
+        record(result["ttft"])["npu_service_breakdown"] = {**ttft, "classified_total_cycles": classified,
+                                                           "status": status(ttft_parts)}
+        per_token = [split(self.npu_parts.get(token, {})) for token in decode]
+        decode_parts = merged_parts(decode, self.npu_parts)
+        tpot = record(result["tpot"])
+        tpot["npu_service_breakdown_per_token"] = per_token
+        if per_token:
+            means: Record = {name: number(Fraction(sum(integer(row, name) for row in per_token), len(per_token)))
+                             for name in (*(name for _, name in NPU_PARTS), "total_cycles")}
+            main_mean, residual_mean = means["main_gemm_cycles"], means["residual_gemm_cycles"]
+            means["residual_main_cycle_ratio"] = residual_mean / main_mean if main_mean else None
+            tpot["npu_service_breakdown_mean"] = {**means, "intervals": len(per_token), "status": status(decode_parts)}
+        else:
+            tpot["npu_service_breakdown_mean"] = None
+        result["npu_service_by_layer"] = {
+            "scope": "NPU service-work accounting per work layer identity; not an E2E timeline",
+            "classification": "producer provenance/scope: dense_main/full|stripe -> MAIN_GEMM, "
+                              "residual/residual_compact -> RESIDUAL_GEMM, else UNCLASSIFIED",
+            "ttft": {layer: split(by_token.get(0, {})) for layer, by_token in sorted(self.layer_parts.items())
+                     if 0 in by_token},
+            "tpot_decode_sum": {layer: split(merged_parts(decode, by_token))
+                                for layer, by_token in sorted(self.layer_parts.items())
+                                if any(token in by_token for token in decode)}}
 
     def separated(self, ready: dict[int, Fraction], intervals: list[Fraction]) -> Record:
         """Timing-model identity, clock-domain-separated CPU/NPU components and E2E endpoints (never CPU+NPU sums)."""
@@ -585,7 +662,8 @@ class AccumulatorSink:
     def npu(self, ordinal: int, identity: str, node: Record, work: Record, scheduled: Record, token: int, phase: str,
             decode_index: int | None, accepted_ns: Fraction, result_ns: Fraction, resource_ns: Fraction,
             cycles: int) -> None:
-        self.accumulator.npu_interval(token, self._cycles(accepted_ns), self._cycles(resource_ns), cycles)
+        self.accumulator.npu_interval(token, self._cycles(accepted_ns), self._cycles(resource_ns), cycles,
+                                      npu_category(work.get("provenance"), work.get("scope")), work.get("layer"))
 
     def cpu(self, ordinal: int, identity: str, kind: str, node: Record, sample: Record, measurement: Record,
             token: int, phase: str, decode_index: int | None, begin_ns: Fraction, end_ns: Fraction) -> None:
