@@ -30,6 +30,8 @@ def main() -> int:
     collect.add_argument("--role", choices=("fullcpu", "fullcpu-cost-only", "potal", "cuda"), required=True)
     collect.add_argument("--paired-potal", type=Path, help="completed PoTal collection root supplying forced CPU cost-only token trajectories")
     collect.add_argument("--repetitions", type=int, default=10, help="1..10 actual runs; fewer than ten is smoke only")
+    collect.add_argument("--cuda-no-kv-offload", action="store_true",
+                         help="CUDA only: keep KV cache and internal KQV attention on CPU")
     collect.add_argument("--timeout", type=int, default=600)
     aggregate = sub.add_parser("aggregate", help="median of ten real per-run results, never replay duplicates")
     aggregate.add_argument("--result", type=Path, action="append", required=True)

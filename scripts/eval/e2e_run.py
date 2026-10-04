@@ -60,6 +60,9 @@ def collect_runs(args: argparse.Namespace) -> None:
     info = compiled_info(binary)
     validate_recipe(info, "e2e")
     role = args.role
+    cuda_no_kv_offload = bool(getattr(args, "cuda_no_kv_offload", False))
+    require(not cuda_no_kv_offload or role == "cuda",
+            "--cuda-no-kv-offload is valid only with --role cuda")
     require(role not in ("fullcpu", "fullcpu-cost-only") or (info.get("cpu_only") is True and integer(info, "cycle_sim") == 0),
             "FullCPU requires CPU-only CYCLE_SIM=0 artifact")
     require(role != "potal" or (integer(info, "cycle_sim") == 1 and info.get("backend") == "IM2P_SIM" and
@@ -90,8 +93,12 @@ def collect_runs(args: argparse.Namespace) -> None:
         identities["artifacts"] = before
     write_json(output / "request.json", identities)
     results: list[Record] = []
-    comparison = hashlib.sha256(json.dumps({"model": identities["model_sha256"],
-        "dataset": identities["dataset_sha256"], "settings": settings}, sort_keys=True).encode()).hexdigest()
+    comparison_fields = {"model": identities["model_sha256"],
+        "dataset": identities["dataset_sha256"], "settings": settings}
+    if role == "cuda":
+        comparison_fields["cuda_no_kv_offload"] = cuda_no_kv_offload
+    comparison = hashlib.sha256(json.dumps(
+        comparison_fields, sort_keys=True).encode()).hexdigest()
     for repetition in range(args.repetitions):
         destination = output / f"repetition-{repetition:02d}"
         destination.mkdir()
@@ -110,6 +117,8 @@ def collect_runs(args: argparse.Namespace) -> None:
             command.extend(("--forced-token-ids", str(forced)))
         if role == "cuda":
             command.extend(("--gpu-layers", "-1"))
+            if cuda_no_kv_offload:
+                command.append("--no-kv-offload")
         native_collection = None
         if native_build is not None:
             from sim.cycle.collection_native import start_native_collection
@@ -140,6 +149,11 @@ def collect_runs(args: argparse.Namespace) -> None:
             sampling = application_services(destination / "native/application-cpu.jsonl", application[0])
         workload = read_json(destination / "native/workload.json")
         validate_native_recipe(workload)
+        if role == "cuda":
+            require(workload.get("no_kv_offload") is cuda_no_kv_offload,
+                    "CUDA KQV/KV offload policy differs from requested mode")
+            require(workload.get("kqv_offload") is (not cuda_no_kv_offload),
+                    "CUDA KQV offload provenance differs from requested mode")
         require(workload.get("complete") is True and workload.get("output_mask") == "last_token",
                 "incomplete or PPL-masked E2E workload")
         raw_chunks = workload.get("chunks")
@@ -178,6 +192,12 @@ def collect_runs(args: argparse.Namespace) -> None:
             result.update(measured)
         if role == "cuda":
             result["actual_placement"] = cuda_placement(destination / "process.log")
+            result["cuda_kqv_offload"] = not cuda_no_kv_offload
+            result["cuda_attention_scope"] = (
+                "KQV_AND_KV_CACHE_ON_CPU"
+                if cuda_no_kv_offload else
+                "FULL_KQV_OFFLOAD"
+            )
             result["arithmetic_matching"] = "PRACTICAL_REFERENCE_NOT_A4W4_A8W8_MATCHED"
         write_json(destination / "result.json", result)
         results.append(result)

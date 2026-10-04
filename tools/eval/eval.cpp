@@ -1,4 +1,5 @@
 #include "common.h"
+#include "ggml-backend.h"
 #include "evaluation-workload.h"
 #include "evaluation-trace.h"
 #include "json.hpp"
@@ -115,6 +116,10 @@ static int run(int argc, char ** argv) {
         if (arg == "--build-info") { std::puts(build_info().dump().c_str()); return 0; }
         if (arg == "--cycle-trace") { cycle_trace = true; continue; }
         if (arg == "--plan-only") { plan_only = true; continue; }
+        if (arg == "--no-kv-offload") {
+            params.no_kv_offload = true;
+            continue;
+        }
         if (arg == "--activation-reference-candidate") {
             throw std::invalid_argument("obsolete ACT candidate policy; confirmed row-by-BK32 policy is mandatory");
         }
@@ -153,7 +158,9 @@ static int run(int argc, char ** argv) {
         else if (arg == "--ubatch-size") params.n_ubatch = positive(value);
         else if (arg == "--threads") params.cpuparams.n_threads = positive(value);
         else if (arg == "--threads-batch") params.cpuparams_batch.n_threads = positive(value);
-        else if (arg == "--gpu-layers") params.n_gpu_layers = value == "-1" ? -1 : value == "0" ? 0 : positive(value);
+        else if (arg == "--gpu-layers") params.n_gpu_layers =
+            value == "-1" ? std::numeric_limits<int>::max() :
+            value == "0" ? 0 : positive(value);
 #if GGML_GEMMINI_ACT_QUANT_METRICS
         else if (arg == "--activation-output") metric_config.activation_path = value;
 #endif
@@ -281,6 +288,11 @@ static int run(int argc, char ** argv) {
     }
     params.n_ctx = generation ? 384 : 256;
     params.n_parallel = 1;
+
+#if EVALUATION_CUDA
+    ggml_backend_load_all();
+#endif
+
     common_init();
     llama_backend_init();
     auto initialized = common_init_from_params(params);
@@ -372,7 +384,10 @@ static int run(int argc, char ** argv) {
         {"requested_generated_tokens", generation ? generation_target : 0},
         {"trajectory_source", forced_cost_only ? json("POTAL") : json()},
         {"sampling_executed", generation && !forced_cost_only}, {"forced_token_ids_path", forced_file},
-        {"gpu_layers_requested", params.n_gpu_layers}, {"placement_proof", "model_load_log"},
+        {"gpu_layers_requested", params.n_gpu_layers},
+        {"no_kv_offload", params.no_kv_offload},
+        {"kqv_offload", !params.no_kv_offload},
+        {"placement_proof", "model_load_log"},
         {"placement_verified", false}, {"source_role", source_role},
         {"target_trace_collection_enabled", (generation || cycle_trace) && CYCLE_SIM != 0},
         {"target_trace_collection_reason", cycle_trace ? "independent_prefill_cycle_campaign" : !generation ? "metric_statistics_only" :
