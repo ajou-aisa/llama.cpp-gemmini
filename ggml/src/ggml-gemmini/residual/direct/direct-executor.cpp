@@ -33,42 +33,49 @@ namespace ggml::gemmini::residual {
 namespace {
 
 namespace wreader = quants::wreader;
-namespace wroute = quants::wroute;
+namespace wroute  = quants::wroute;
 
 constexpr size_t kJTile = 16;
 
-#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) ||                                                \
     (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
 struct CpuSample {
-    uint64_t value = 0;
-    bool valid = false;
-    uint64_t owner = 0;
-    uint64_t generation = 0;
-    DirectCpuTileReason reason = DirectCpuTileReason::unavailable_event;
-    DirectCpuTileSource source = DirectCpuTileSource::perf_cpu_cycles;
+    uint64_t            value      = 0;
+    bool                valid      = false;
+    uint64_t            owner      = 0;
+    uint64_t            generation = 0;
+    DirectCpuTileReason reason     = DirectCpuTileReason::unavailable_event;
+    DirectCpuTileSource source     = DirectCpuTileSource::perf_cpu_cycles;
 };
 
 struct CpuInterval {
-    uint64_t value = 0;
-    bool valid = false;
-    DirectCpuTileReason reason = DirectCpuTileReason::invalid_start;
+    uint64_t            value         = 0;
+    bool                valid         = false;
+    DirectCpuTileReason reason        = DirectCpuTileReason::invalid_start;
     DirectCpuTileReason sample_reason = DirectCpuTileReason::none;
 };
 
 #if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
 CpuSample read_cpu_sample(const testing::DirectExecutionTestHooks * hooks,
-                          testing::DirectCpuSamplePoint point,
-                          size_t tile_index) {
+                          testing::DirectCpuSamplePoint             point,
+                          size_t                                    tile_index) {
     if (hooks != nullptr && hooks->sample_reader != nullptr) {
         const auto sample = hooks->sample_reader(point, tile_index, hooks->context);
-        return {sample.value, sample.valid, sample.owner, sample.generation,
-                sample.reason, sample.source};
+        return {sample.value,
+                sample.valid,
+                sample.owner,
+                sample.generation,
+                sample.reason,
+                sample.source};
     }
     return {};
 }
 #else
 CpuSample read_cpu_sample(const gemmini_cpu_sample & sample) {
-    return {sample.counter, sample.native_valid != 0, sample.owner_token, sample.generation,
+    return {sample.counter,
+            sample.native_valid != 0,
+            sample.owner_token,
+            sample.generation,
             static_cast<DirectCpuTileReason>(sample.native_reason),
             DirectCpuTileSource::perf_cpu_cycles};
 }
@@ -76,14 +83,21 @@ CpuSample read_cpu_sample(const gemmini_cpu_sample & sample) {
 
 CpuInterval cpu_interval(const CpuSample & start, const CpuSample & end) {
 #if CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__)
-    const cycle::NativeCycleSample native_start{
-        start.value, start.valid, static_cast<cycle::NativeCycleReason>(start.reason),
-        cycle::NativeCycleSource::perf_cpu_cycles, start.owner, start.generation};
-    const cycle::NativeCycleSample native_end{
-        end.value, end.valid, static_cast<cycle::NativeCycleReason>(end.reason),
-        cycle::NativeCycleSource::perf_cpu_cycles, end.owner, end.generation};
-    const cycle::NativeCycleDelta delta = cycle::evaluate_interval(native_start, native_end);
-    return {delta.value, delta.valid,
+    const cycle::NativeCycleSample native_start{start.value,
+                                                start.valid,
+                                                static_cast<cycle::NativeCycleReason>(start.reason),
+                                                cycle::NativeCycleSource::perf_cpu_cycles,
+                                                start.owner,
+                                                start.generation};
+    const cycle::NativeCycleSample native_end{end.value,
+                                              end.valid,
+                                              static_cast<cycle::NativeCycleReason>(end.reason),
+                                              cycle::NativeCycleSource::perf_cpu_cycles,
+                                              end.owner,
+                                              end.generation};
+    const cycle::NativeCycleDelta  delta = cycle::evaluate_interval(native_start, native_end);
+    return {delta.value,
+            delta.valid,
             static_cast<DirectCpuTileReason>(delta.reason),
             static_cast<DirectCpuTileReason>(delta.sample_reason)};
 #else
@@ -92,19 +106,15 @@ CpuInterval cpu_interval(const CpuSample & start, const CpuSample & end) {
     if (!end.valid)
         return {0, false, DirectCpuTileReason::invalid_end, end.reason};
     if (start.source != end.source)
-        return {0, false, DirectCpuTileReason::source_mismatch,
-                DirectCpuTileReason::none};
+        return {0, false, DirectCpuTileReason::source_mismatch, DirectCpuTileReason::none};
     if (start.owner != end.owner)
-        return {0, false, DirectCpuTileReason::event_owner_mismatch,
-                DirectCpuTileReason::none};
+        return {0, false, DirectCpuTileReason::event_owner_mismatch, DirectCpuTileReason::none};
     if (start.generation != end.generation)
-        return {0, false, DirectCpuTileReason::event_generation_mismatch,
-                DirectCpuTileReason::none};
+        return {
+            0, false, DirectCpuTileReason::event_generation_mismatch, DirectCpuTileReason::none};
     if (end.value < start.value)
-        return {0, false, DirectCpuTileReason::counter_regression,
-                DirectCpuTileReason::none};
-    return {end.value - start.value, true, DirectCpuTileReason::none,
-            DirectCpuTileReason::none};
+        return {0, false, DirectCpuTileReason::counter_regression, DirectCpuTileReason::none};
+    return {end.value - start.value, true, DirectCpuTileReason::none, DirectCpuTileReason::none};
 #endif
 }
 
@@ -147,28 +157,32 @@ bool checked_multiply(int64_t lhs, int64_t rhs, int64_t & result) {
 }
 
 bool checked_size_product(size_t lhs, size_t rhs, size_t & result) {
-    if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs) return false;
+    if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs)
+        return false;
     result = lhs * rhs;
     return true;
 }
 
 bool dense_route_is_addressable(const wroute::WeightRoutePlan & plan,
-                                size_t k_count, size_t j_count) {
-    if (plan.native_weight_blocks) return true;
-    if (plan.weight_stride == 0) return false;
-    const bool column_major = plan.layout == wroute::WeightLayout::JxK_ColMajor;
-    const size_t major_count = column_major ? j_count : k_count;
-    const size_t minor_count = column_major ? k_count : j_count;
-    if (plan.weight_stride < minor_count) return false;
+                                size_t                          k_count,
+                                size_t                          j_count) {
+    if (plan.native_weight_blocks)
+        return true;
+    if (plan.weight_stride == 0)
+        return false;
+    const bool   column_major = plan.layout == wroute::WeightLayout::JxK_ColMajor;
+    const size_t major_count  = column_major ? j_count : k_count;
+    const size_t minor_count  = column_major ? k_count : j_count;
+    if (plan.weight_stride < minor_count)
+        return false;
     size_t major_offset = 0;
     return checked_size_product(major_count - 1, plan.weight_stride, major_offset) &&
-        minor_count - 1 <= std::numeric_limits<size_t>::max() - major_offset;
+           minor_count - 1 <= std::numeric_limits<size_t>::max() - major_offset;
 }
 
 bool uses_reader_scale(const wroute::WeightRoutePlan & plan) {
-    return plan.route == wroute::WeightRouteKind::H0 ||
-        plan.route == wroute::WeightRouteKind::H1 ||
-        plan.route == wroute::WeightRouteKind::HP1;
+    return plan.route == wroute::WeightRouteKind::H0 || plan.route == wroute::WeightRouteKind::H1 ||
+           plan.route == wroute::WeightRouteKind::HP1;
 }
 
 bool finite_double(double value) {
@@ -179,30 +193,31 @@ bool finite_double(double value) {
 }
 
 rmd::RmdStatus reader_failure(wreader::WeightReaderStatus status) {
-    return status == wreader::WeightReaderStatus::ScaleOverflow ?
-        rmd::RmdStatus::overflow : rmd::RmdStatus::execution_failed;
+    return status == wreader::WeightReaderStatus::ScaleOverflow ? rmd::RmdStatus::overflow
+                                                                : rmd::RmdStatus::execution_failed;
 }
 
-}
+} // namespace
 
 #if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
-static rmd::RmdStatus execute_direct_stripe_impl(
-    const ggml_gemmini_args_t & args,
-    const DirectStripePayload & payload,
-    rmd::DirectOutput & correction,
-    DirectExecutionMetrics * metrics,
-    const testing::DirectExecutionTestHooks * hooks) {
+static rmd::RmdStatus execute_direct_stripe_impl(const ggml_gemmini_args_t & args,
+                                                 const DirectStripePayload & payload,
+                                                 rmd::DirectOutput &         correction,
+                                                 DirectExecutionMetrics *    metrics,
+                                                 const testing::DirectExecutionTestHooks * hooks) {
 #else
 rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
                                      const DirectStripePayload & payload,
-                                     rmd::DirectOutput & correction,
-                                     DirectExecutionMetrics * metrics) {
+                                     rmd::DirectOutput &         correction,
+                                     DirectExecutionMetrics *    metrics) {
 #endif
 #if LOG_CYCLE
-    detail::DirectHostProfile profile(payload, args.matmul_layer,
-        metrics != nullptr ? metrics->run_id : std::nullopt
+    detail::DirectHostProfile profile(payload,
+                                      args.matmul_layer,
+                                      metrics != nullptr ? metrics->run_id : std::nullopt
 #if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
-        , hooks == nullptr || !hooks->disable_host_profile
+                                      ,
+                                      hooks == nullptr || !hooks->disable_host_profile
 #endif
     );
 #endif
@@ -211,8 +226,8 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
     if (args.K != payload.logical_k || args.J != payload.logical_j)
         return rmd::RmdStatus::invalid_arguments;
 
-    const wroute::WeightRoutePlan plan = wroute::resolve_weight_route_plan(
-        args, wroute::WeightScaleInfoMode::Residual);
+    const wroute::WeightRoutePlan plan =
+        wroute::resolve_weight_route_plan(args, wroute::WeightScaleInfoMode::Residual);
     if (!plan.valid) {
         if (wreader::validate(args, plan) == wreader::WeightReaderStatus::ScaleOverflow)
             return rmd::RmdStatus::overflow;
@@ -223,25 +238,23 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
         return rmd::RmdStatus::unsupported_route;
     }
 
-    const bool floating_block =
-        plan.scale_domain == wroute::WeightScaleDomain::FloatingBlock;
+    const bool floating_block = plan.scale_domain == wroute::WeightScaleDomain::FloatingBlock;
     const bool integer_block =
         plan.scale_domain == wroute::WeightScaleDomain::IntegerBlockTimesColumn;
-    const bool fully_scaled = std::holds_alternative<quants::act::block::Meta>(
-        args.act_quant.storage());
+    const bool fully_scaled =
+        std::holds_alternative<quants::act::block::Meta>(args.act_quant.storage());
     if ((floating_block && plan.route != wroute::WeightRouteKind::H0) ||
-        (!floating_block && (!integer_block ||
-         !wroute::route_supports_integer_block_scale(plan)))) {
+        (!floating_block &&
+         (!integer_block || !wroute::route_supports_integer_block_scale(plan)))) {
         return rmd::RmdStatus::unsupported_route;
     }
     if (!wroute::route_covers_k(plan, payload.logical_k) ||
         !dense_route_is_addressable(plan, payload.logical_k, payload.logical_j)) {
         return rmd::RmdStatus::unsupported_route;
     }
-    const bool native_q8_route = plan.native_weight_blocks &&
-        plan.weight_bits == 8 &&
-        (plan.route == wroute::WeightRouteKind::H1 ||
-         plan.route == wroute::WeightRouteKind::HP1);
+    const bool native_q8_route =
+        plan.native_weight_blocks && plan.weight_bits == 8 &&
+        (plan.route == wroute::WeightRouteKind::H1 || plan.route == wroute::WeightRouteKind::HP1);
 
     size_t output_count = 0;
     if (!checked_size_product(payload.row_count, payload.logical_j, output_count))
@@ -251,20 +264,19 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
     profile.next_phase(1);
 #endif
     size_t metadata_row_begin = 0;
-    size_t metadata_row_end = 0;
+    size_t metadata_row_end   = 0;
     if (fully_scaled &&
-        (__builtin_add_overflow(args.activation_row_offset, payload.row_begin,
-                               &metadata_row_begin) ||
-        __builtin_add_overflow(metadata_row_begin, payload.row_count,
-                               &metadata_row_end))) {
+        (__builtin_add_overflow(
+             args.activation_row_offset, payload.row_begin, &metadata_row_begin) ||
+         __builtin_add_overflow(metadata_row_begin, payload.row_count, &metadata_row_end))) {
         return rmd::RmdStatus::overflow;
     }
-    const quants::act::ActivationMetadataView metadata(
-        args, metadata_row_begin, metadata_row_end);
-    if (fully_scaled && !metadata.valid()) return rmd::RmdStatus::invalid_arguments;
+    const quants::act::ActivationMetadataView metadata(args, metadata_row_begin, metadata_row_end);
+    if (fully_scaled && !metadata.valid())
+        return rmd::RmdStatus::invalid_arguments;
 
     std::vector<rmd::OutputValue> staged_integer;
-    std::vector<double> staged_floating;
+    std::vector<double>           staged_floating;
     if ((!fully_scaled && integer_block && output_count > staged_integer.max_size()) ||
         ((fully_scaled || floating_block) && output_count > staged_floating.max_size())) {
         return rmd::RmdStatus::allocation_failure;
@@ -279,28 +291,28 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
         return rmd::RmdStatus::allocation_failure;
     }
 
-    const size_t j_tile_count =
-        (payload.logical_j + kJTile - 1) / kJTile;
+    const size_t j_tile_count = (payload.logical_j + kJTile - 1) / kJTile;
 #if LOG_CYCLE && CYCLE_DETAIL
     profile.prepare(j_tile_count,
 #if defined(GGML_GEMMINI_HAS_OPENMP)
-        j_tile_count > 1 ? static_cast<size_t>(omp_get_max_threads()) : 1
+                    j_tile_count > 1 ? static_cast<size_t>(omp_get_max_threads()) : 1
 #else
-        1
+                    1
 #endif
     );
 #endif
     std::vector<rmd::RmdStatus> tile_status;
-    std::vector<size_t> tile_native_q8_values;
-#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
+    std::vector<size_t>         tile_native_q8_values;
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) ||                                                \
     (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
     std::vector<DirectCpuTileRecord> tile_cpu_records;
-    const std::optional<uint64_t> direct_run_id = metrics != nullptr ? metrics->run_id : std::nullopt;
+    const std::optional<uint64_t>    direct_run_id =
+        metrics != nullptr ? metrics->run_id : std::nullopt;
 #endif
     try {
         tile_status.assign(j_tile_count, rmd::RmdStatus::success);
         tile_native_q8_values.assign(j_tile_count, 0);
-#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) ||                                                \
     (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
         tile_cpu_records.assign(j_tile_count, DirectCpuTileRecord{});
 #endif
@@ -313,9 +325,10 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
     auto execute_j_tile = [&](size_t tile_index) {
 #if LOG_CYCLE
         const auto tile_cpu_start = gemmini_cpu_timing_read();
-        const auto tile_identity = profile.identity("rmd_direct_j_tile_interval", direct_worker_id(), tile_index);
+        const auto tile_identity =
+            profile.identity("rmd_direct_j_tile_interval", direct_worker_id(), tile_index);
 #endif
-#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) ||                                                \
     (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
         const CpuSample tile_start =
 #if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
@@ -327,27 +340,29 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
 #if LOG_CYCLE && CYCLE_DETAIL
         if (profile.ready) {
             profile.tiles[tile_index].worker_id = direct_worker_id();
-            profile.tiles[tile_index].j_begin = tile_index * kJTile;
-            profile.tiles[tile_index].j_end = std::min(payload.logical_j, (tile_index + 1) * kJTile);
+            profile.tiles[tile_index].j_begin   = tile_index * kJTile;
+            profile.tiles[tile_index].j_end =
+                std::min(payload.logical_j, (tile_index + 1) * kJTile);
             profile.tiles[tile_index].compute.start = tile_cpu_start;
         }
 #endif
         const rmd::RmdStatus status = [&] {
-            const size_t j_begin = tile_index * kJTile;
-            const size_t tile_j = std::min(kJTile, payload.logical_j - j_begin);
-            size_t & native_q8_values = tile_native_q8_values[tile_index];
-            size_t event_index = 0;
+            const size_t j_begin          = tile_index * kJTile;
+            const size_t tile_j           = std::min(kJTile, payload.logical_j - j_begin);
+            size_t &     native_q8_values = tile_native_q8_values[tile_index];
+            size_t       event_index      = 0;
             while (event_index < payload.events.size()) {
 #if LOG_CYCLE && CYCLE_DETAIL
-                detail::DirectStageProbe stage_probe(profile.ready && profile.deep_profile ?
-                    &profile.tiles[tile_index].stages : nullptr, &tile_identity);
+                detail::DirectStageProbe stage_probe(profile.ready && profile.deep_profile
+                                                         ? &profile.tiles[tile_index].stages
+                                                         : nullptr,
+                                                     &tile_identity);
 #endif
-                const ResidualEvent & first = payload.events[event_index];
-                const size_t row = first.local_row;
-                const size_t block_id = first.original_k / rmd::kBlockSize;
-                float activation_scale = 1.0f;
-                if (fully_scaled &&
-                    !metadata.scale(row, first.original_k, activation_scale)) {
+                const ResidualEvent & first            = payload.events[event_index];
+                const size_t          row              = first.local_row;
+                const size_t          block_id         = first.original_k / rmd::kBlockSize;
+                float                 activation_scale = 1.0f;
+                if (fully_scaled && !metadata.scale(row, first.original_k, activation_scale)) {
                     return rmd::RmdStatus::invalid_arguments;
                 }
                 size_t span_end = event_index + 1;
@@ -364,15 +379,16 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
                 for (size_t local_j = 0; local_j < tile_j; ++local_j) {
                     const size_t j = j_begin + local_j;
                     for (size_t index = event_index; index < span_end; ++index) {
-                        const ResidualEvent & event = payload.events[index];
-                        const wreader::WeightCodeResult code = wreader::read_code_validated(
-                            args, plan, j, event.original_k);
-                        if (!code.ok()) return reader_failure(code.status);
+                        const ResidualEvent &           event = payload.events[index];
+                        const wreader::WeightCodeResult code =
+                            wreader::read_code_validated(args, plan, j, event.original_k);
+                        if (!code.ok())
+                            return reader_failure(code.status);
                         // A block has at most 32 signed INT16 codes and INT32
                         // residuals, so its complete dot product fits in INT64.
-                        block_sum[local_j] +=
-                            static_cast<int64_t>(event.residual) * code.value;
-                        if (native_q8_route) ++native_q8_values;
+                        block_sum[local_j] += static_cast<int64_t>(event.residual) * code.value;
+                        if (native_q8_route)
+                            ++native_q8_values;
                     }
                 }
 
@@ -380,11 +396,12 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
                 stage_probe.next(2);
 #endif
                 for (size_t local_j = 0; local_j < tile_j; ++local_j) {
-                    const size_t j = j_begin + local_j;
+                    const size_t               j = j_begin + local_j;
                     wreader::WeightScaleResult scale{};
                     if (uses_reader_scale(plan)) {
                         scale = wreader::read_scale_validated(args, plan, j, block_id);
-                        if (!scale.ok()) return reader_failure(scale.status);
+                        if (!scale.ok())
+                            return reader_failure(scale.status);
                     } else {
                         scale.status = wreader::WeightReaderStatus::Success;
                         scale.domain = plan.scale_domain;
@@ -405,14 +422,13 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
                                 return rmd::RmdStatus::overflow;
                             }
                             int64_t integer_scaled = 0;
-                            if (!checked_multiply(
-                                    block_sum[local_j],
-                                    static_cast<int64_t>(scale.integer_block_scale),
-                                    integer_scaled)) {
+                            if (!checked_multiply(block_sum[local_j],
+                                                  static_cast<int64_t>(scale.integer_block_scale),
+                                                  integer_scaled)) {
                                 return rmd::RmdStatus::overflow;
                             }
                             scaled = static_cast<double>(integer_scaled) *
-                                static_cast<double>(scale.column_scale);
+                                     static_cast<double>(scale.column_scale);
                         }
                         if (fully_scaled) {
                             scaled *= static_cast<double>(activation_scale);
@@ -427,10 +443,11 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
                             return rmd::RmdStatus::overflow;
                         }
                         int64_t scaled = 0;
-                        if (!checked_multiply(
-                                block_sum[local_j],
-                                static_cast<int64_t>(scale.integer_block_scale), scaled) ||
-                            !checked_add(staged_integer[output_index], scaled,
+                        if (!checked_multiply(block_sum[local_j],
+                                              static_cast<int64_t>(scale.integer_block_scale),
+                                              scaled) ||
+                            !checked_add(staged_integer[output_index],
+                                         scaled,
                                          staged_integer[output_index])) {
                             return rmd::RmdStatus::overflow;
                         }
@@ -443,35 +460,37 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
 #if LOG_CYCLE
         const auto tile_cpu_end = gemmini_cpu_timing_read();
 #if CYCLE_DETAIL
-        if (profile.ready) profile.tiles[tile_index].compute.end = tile_cpu_end;
+        if (profile.ready)
+            profile.tiles[tile_index].compute.end = tile_cpu_end;
 #endif
         gemmini_cpu_timing_record(&tile_identity, &tile_cpu_start, &tile_cpu_end);
 #endif
-#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) ||                                                \
     (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
 #if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
-            const CpuSample tile_end = read_cpu_sample(hooks,
-                testing::DirectCpuSamplePoint::tile_end, tile_index);
+        const CpuSample tile_end =
+            read_cpu_sample(hooks, testing::DirectCpuSamplePoint::tile_end, tile_index);
 #else
-            const CpuSample tile_end = read_cpu_sample(tile_cpu_end);
+        const CpuSample tile_end = read_cpu_sample(tile_cpu_end);
 #endif
-            const CpuInterval interval = cpu_interval(tile_start, tile_end);
-            DirectCpuTileRecord & record = tile_cpu_records[tile_index];
-            record.run_id = direct_run_id;
-            record.stripe_id = payload.stripe_id;
-            record.worker_id = direct_worker_id();
-            record.tile_index = tile_index;
-            record.j_begin = tile_index * kJTile;
-            record.j_end = std::min(payload.logical_j, record.j_begin + kJTile);
-            record.start_cycle = tile_start.value;
-            record.end_cycle = tile_end.value;
-            if (interval.valid) record.delta_cycles = interval.value;
-            record.valid = interval.valid;
-            record.reason = interval.reason;
-            record.sample_reason = interval.sample_reason;
-            record.source = tile_start.source;
-            record.owner_event_token = tile_start.owner;
-            record.generation = tile_start.generation;
+        const CpuInterval     interval = cpu_interval(tile_start, tile_end);
+        DirectCpuTileRecord & record   = tile_cpu_records[tile_index];
+        record.run_id                  = direct_run_id;
+        record.stripe_id               = payload.stripe_id;
+        record.worker_id               = direct_worker_id();
+        record.tile_index              = tile_index;
+        record.j_begin                 = tile_index * kJTile;
+        record.j_end                   = std::min(payload.logical_j, record.j_begin + kJTile);
+        record.start_cycle             = tile_start.value;
+        record.end_cycle               = tile_end.value;
+        if (interval.valid)
+            record.delta_cycles = interval.value;
+        record.valid             = interval.valid;
+        record.reason            = interval.reason;
+        record.sample_reason     = interval.sample_reason;
+        record.source            = tile_start.source;
+        record.owner_event_token = tile_start.owner;
+        record.generation        = tile_start.generation;
 #endif
         return status;
     };
@@ -481,11 +500,12 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
 #endif
     const auto direct_task_origin = gemmini_trace_capture();
 #if defined(GGML_GEMMINI_HAS_OPENMP)
-#pragma omp parallel if(j_tile_count > 1)
+#pragma omp parallel if (j_tile_count > 1)
 #endif
     {
         trace::ScopedContext direct_task(direct_task_origin, true);
-        trace::CpuStage task_lifetime(args.matmul_layer.c_str(), "task.host_work", trace::CpuStage::Scope::envelope);
+        trace::CpuStage      task_lifetime(
+            args.matmul_layer.c_str(), "task.host_work", trace::CpuStage::Scope::envelope);
         trace::ScopedRole residual_role(GEMMINI_TRACE_ROLE_RESIDUAL);
 #if LOG_CYCLE
         const auto worker_cpu_start = gemmini_cpu_timing_read();
@@ -493,21 +513,20 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
 #if LOG_CYCLE && CYCLE_DETAIL
         const size_t worker_id = direct_worker_id();
         if (profile.ready) {
-            profile.workers[worker_id].active = true;
+            profile.workers[worker_id].active     = true;
             profile.workers[worker_id].work.start = worker_cpu_start;
         }
 #endif
 #if defined(GGML_GEMMINI_HAS_OPENMP)
 #pragma omp for schedule(static) nowait
 #endif
-        for (std::ptrdiff_t tile_index = 0;
-             tile_index < static_cast<std::ptrdiff_t>(j_tile_count);
+        for (std::ptrdiff_t tile_index = 0; tile_index < static_cast<std::ptrdiff_t>(j_tile_count);
              ++tile_index) {
             tile_status[static_cast<size_t>(tile_index)] =
                 execute_j_tile(static_cast<size_t>(tile_index));
         }
 #if LOG_CYCLE
-        const auto worker_cpu_end = gemmini_cpu_timing_read();
+        const auto         worker_cpu_end = gemmini_cpu_timing_read();
         gemmini_cpu_totals worker_cpu{};
         gemmini_cpu_timing_add(&worker_cpu, &worker_cpu_start, &worker_cpu_end);
         const auto worker_identity = profile.identity("rmd.cpu_direct.worker", direct_worker_id());
@@ -515,7 +534,7 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
 #endif
 #if LOG_CYCLE && CYCLE_DETAIL
         if (profile.ready) {
-            auto & worker = profile.workers[worker_id];
+            auto & worker   = profile.workers[worker_id];
             worker.work.end = worker_cpu_end;
 #if defined(GGML_GEMMINI_HAS_OPENMP)
             worker.barrier.start = worker.work.end;
@@ -523,7 +542,8 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
         }
 #if defined(GGML_GEMMINI_HAS_OPENMP)
 #pragma omp barrier
-        if (profile.ready) profile.workers[worker_id].barrier.end = gemmini_cpu_timing_read();
+        if (profile.ready)
+            profile.workers[worker_id].barrier.end = gemmini_cpu_timing_read();
 #endif
 #endif
     }
@@ -538,19 +558,20 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
         native_q8_values += tile_native_q8_values[tile_index];
     }
 
-    rmd::DirectOutput staged_output = fully_scaled ?
-        rmd::DirectOutput(rmd::FullyScaledFloat64Correction{std::move(staged_floating)}) :
-        floating_block ?
-            rmd::DirectOutput(rmd::PreScaledFloat64Correction{std::move(staged_floating)}) :
-            rmd::DirectOutput(rmd::BlockScaledInt64Correction{std::move(staged_integer)});
+    rmd::DirectOutput staged_output =
+        fully_scaled
+            ? rmd::DirectOutput(rmd::FullyScaledFloat64Correction{std::move(staged_floating)})
+        : floating_block
+            ? rmd::DirectOutput(rmd::PreScaledFloat64Correction{std::move(staged_floating)})
+            : rmd::DirectOutput(rmd::BlockScaledInt64Correction{std::move(staged_integer)});
     correction.swap(staged_output);
 
     if (metrics != nullptr) {
-        metrics->event_count = payload.events.size();
-        metrics->call_count = 1;
+        metrics->event_count      = payload.events.size();
+        metrics->call_count       = 1;
         metrics->native_q8_values = native_q8_values;
-        metrics->j_tile_count = j_tile_count;
-#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) || \
+        metrics->j_tile_count     = j_tile_count;
+#if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING) ||                                                \
     (CYCLE_DETAIL && defined(__linux__) && defined(__aarch64__))
         metrics->cpu_tiles = std::move(tile_cpu_records);
 #endif
@@ -564,19 +585,18 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
 #if defined(GGML_GEMMINI_DIRECT_METRICS_TESTING)
 rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
                                      const DirectStripePayload & payload,
-                                     rmd::DirectOutput & correction,
-                                     DirectExecutionMetrics * metrics) {
+                                     rmd::DirectOutput &         correction,
+                                     DirectExecutionMetrics *    metrics) {
     return execute_direct_stripe_impl(args, payload, correction, metrics, nullptr);
 }
 
-rmd::RmdStatus execute_direct_stripe(
-    const ggml_gemmini_args_t & args,
-    const DirectStripePayload & payload,
-    rmd::DirectOutput & correction,
-    DirectExecutionMetrics * metrics,
-    const testing::DirectExecutionTestHooks & hooks) {
+rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t &               args,
+                                     const DirectStripePayload &               payload,
+                                     rmd::DirectOutput &                       correction,
+                                     DirectExecutionMetrics *                  metrics,
+                                     const testing::DirectExecutionTestHooks & hooks) {
     return execute_direct_stripe_impl(args, payload, correction, metrics, &hooks);
 }
 #endif
 
-}
+} // namespace ggml::gemmini::residual

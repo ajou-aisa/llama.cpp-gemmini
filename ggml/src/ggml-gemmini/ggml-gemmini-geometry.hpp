@@ -25,18 +25,18 @@ struct GemminiOuterCounts {
 
 struct GemminiGeometryInput {
     GemminiLogicalShape shape;
-    GemminiTileFactors tiles;
-    size_t array_dim;
+    GemminiTileFactors  tiles;
+    size_t              array_dim;
 };
 
 struct GemminiGeometry {
     GemminiLogicalShape shape{};
-    GemminiTileFactors tiles{};
-    GemminiOuterCounts outer{};
-    size_t stripe_rows = 0;
-    size_t stripe_count = 0;
-    size_t final_rows = 0;
-    size_t ws_inner_calls = 0;
+    GemminiTileFactors  tiles{};
+    GemminiOuterCounts  outer{};
+    size_t              stripe_rows    = 0;
+    size_t              stripe_count   = 0;
+    size_t              final_rows     = 0;
+    size_t              ws_inner_calls = 0;
 };
 
 enum class GemminiGeometryError {
@@ -48,10 +48,12 @@ enum class GemminiGeometryError {
 };
 
 struct GemminiGeometryResult {
-    GemminiGeometry geometry{};
+    GemminiGeometry      geometry{};
     GemminiGeometryError error = GemminiGeometryError::none;
 
-    constexpr bool ok() const { return error == GemminiGeometryError::none; }
+    constexpr bool ok() const {
+        return error == GemminiGeometryError::none;
+    }
 };
 
 namespace geometry_detail {
@@ -95,7 +97,7 @@ constexpr GemminiGeometryResult make_gemmini_geometry(GemminiGeometryInput input
         geometry_detail::ceil_div(input.shape.j, tile_j_rows),
         geometry_detail::ceil_div(input.shape.k, tile_k_rows),
     };
-    size_t ij_calls = 0;
+    size_t ij_calls       = 0;
     size_t ws_inner_calls = 0;
     if (!geometry_detail::checked_multiply(outer.i, outer.j, ij_calls) ||
         !geometry_detail::checked_multiply(ij_calls, outer.k, ws_inner_calls)) {
@@ -103,8 +105,13 @@ constexpr GemminiGeometryResult make_gemmini_geometry(GemminiGeometryInput input
     }
 
     const size_t remainder = input.shape.i % tile_i_rows;
-    return {{input.shape, input.tiles, outer, tile_i_rows, outer.i,
-             remainder == 0 ? tile_i_rows : remainder, ws_inner_calls},
+    return {{input.shape,
+             input.tiles,
+             outer,
+             tile_i_rows,
+             outer.i,
+             remainder == 0 ? tile_i_rows : remainder,
+             ws_inner_calls},
             GemminiGeometryError::none};
 }
 

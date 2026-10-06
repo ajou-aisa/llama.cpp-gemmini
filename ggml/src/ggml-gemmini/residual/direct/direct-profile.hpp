@@ -37,43 +37,47 @@ struct DirectHostSpan {
 };
 
 struct DirectHostTile {
-    size_t worker_id = 0;
-    size_t j_begin = 0;
-    size_t j_end = 0;
-    DirectHostSpan compute;
-    DirectHostSpan logging;
-    log::CycleWriteTiming writes{};
+    size_t                           worker_id = 0;
+    size_t                           j_begin   = 0;
+    size_t                           j_end     = 0;
+    DirectHostSpan                   compute;
+    DirectHostSpan                   logging;
+    log::CycleWriteTiming            writes{};
     std::array<DirectStageTotals, 3> stages{};
 };
 
 struct DirectHostWorker {
-    bool active = false;
+    bool           active = false;
     DirectHostSpan work;
     DirectHostSpan barrier;
 };
 
 class DirectHostProfile {
-public:
-    DirectHostProfile(const DirectStripePayload & payload, const std::string & layer,
-                      std::optional<uint64_t> run_id, bool enabled = true) noexcept :
-        payload_(payload), layer_(layer), run_id_(run_id), enabled_(enabled) {
-        phases_[0].start = gemmini_cpu_timing_read();
+  public:
+    DirectHostProfile(const DirectStripePayload & payload,
+                      const std::string &         layer,
+                      std::optional<uint64_t>     run_id,
+                      bool                        enabled = true) noexcept
+        : payload_(payload), layer_(layer), run_id_(run_id), enabled_(enabled) {
+        phases_[0].start  = gemmini_cpu_timing_read();
         const char * deep = std::getenv("GGML_GEMMINI_RESIDUAL_DEEP_PROFILE");
-        deep_profile = enabled_ && deep != nullptr && std::strcmp(deep, "1") == 0;
+        deep_profile      = enabled_ && deep != nullptr && std::strcmp(deep, "1") == 0;
     }
 
     ~DirectHostProfile() noexcept {
-        const auto end = gemmini_cpu_timing_read();
+        const auto end      = gemmini_cpu_timing_read();
         phases_[phase_].end = end;
-        constexpr std::array<const char *, 4> names{
-            "rmd.cpu_direct.validation", "rmd.cpu_direct.preparation",
-            "rmd.cpu_direct.parallel", "rmd.cpu_direct.finalization"};
+        constexpr std::array<const char *, 4> names{"rmd.cpu_direct.validation",
+                                                    "rmd.cpu_direct.preparation",
+                                                    "rmd.cpu_direct.parallel",
+                                                    "rmd.cpu_direct.finalization"};
         for (size_t phase = 0; phase <= phase_; ++phase) {
             const auto record = identity(names[phase], caller_worker_id());
             gemmini_cpu_timing_record(&record, &phases_[phase].start, &phases_[phase].end);
         }
 #if CYCLE_DETAIL
-        if (!enabled_) return;
+        if (!enabled_)
+            return;
         try {
             // Serialization and the sidecar write are outside all measured spans.
             log::cycle.write_json(serialize(end));
@@ -84,32 +88,41 @@ public:
     }
 
     void next_phase(size_t phase) noexcept {
-        const auto sample = gemmini_cpu_timing_read();
-        phases_[phase_].end = sample;
+        const auto sample    = gemmini_cpu_timing_read();
+        phases_[phase_].end  = sample;
         phases_[phase].start = sample;
-        phase_ = phase;
+        phase_               = phase;
     }
 
-    gemmini_cycle_record_v2 identity(const char *op, uint64_t worker_id,
-                                     uint64_t node_id = UINT64_MAX) const noexcept {
+    gemmini_cycle_record_v2
+    identity(const char * op, uint64_t worker_id, uint64_t node_id = UINT64_MAX) const noexcept {
         const std::optional<uint64_t> direct_run_id = run_id_;
         uint32_t identity_mask = GEMMINI_CYCLE_HAS_STRIPE_ID | GEMMINI_CYCLE_HAS_WORKER_ID;
-        if (direct_run_id.has_value()) identity_mask |= GEMMINI_CYCLE_HAS_RUN_ID;
-        if (node_id != UINT64_MAX) identity_mask |= GEMMINI_CYCLE_HAS_NODE_ID;
+        if (direct_run_id.has_value())
+            identity_mask |= GEMMINI_CYCLE_HAS_RUN_ID;
+        if (node_id != UINT64_MAX)
+            identity_mask |= GEMMINI_CYCLE_HAS_NODE_ID;
         return {{layer_.empty() ? nullptr : layer_.c_str(), op, 0, 0, nullptr, 0, nullptr},
-            identity_mask, direct_run_id.value_or(0), payload_.stripe_id, 0, node_id, worker_id};
+                identity_mask,
+                direct_run_id.value_or(0),
+                payload_.stripe_id,
+                0,
+                node_id,
+                worker_id};
     }
 
     void prepare(size_t tile_count, size_t worker_count) noexcept {
-        if (!enabled_) return;
+        if (!enabled_)
+            return;
         j_tile_count_ = tile_count;
         for (size_t index = 0; index < payload_.events.size(); ++index) {
             const auto & event = payload_.events[index];
-            const bool new_row = index == 0 ||
-                payload_.events[index - 1].local_row != event.local_row;
-            if (new_row) ++active_rows_;
+            const bool   new_row =
+                index == 0 || payload_.events[index - 1].local_row != event.local_row;
+            if (new_row)
+                ++active_rows_;
             if (new_row || payload_.events[index - 1].original_k / rmd::kBlockSize !=
-                           event.original_k / rmd::kBlockSize) {
+                               event.original_k / rmd::kBlockSize) {
                 ++active_row_blocks_;
             }
         }
@@ -125,13 +138,13 @@ public:
         }
     }
 
-    bool ready = false;
-    bool success = false;
-    bool deep_profile = false;
-    std::vector<DirectHostTile> tiles;
+    bool                          ready        = false;
+    bool                          success      = false;
+    bool                          deep_profile = false;
+    std::vector<DirectHostTile>   tiles;
     std::vector<DirectHostWorker> workers;
 
-private:
+  private:
     static uint64_t caller_worker_id() noexcept {
 #if defined(GGML_GEMMINI_HAS_OPENMP)
         return static_cast<uint64_t>(omp_get_thread_num());
@@ -157,13 +170,16 @@ private:
 
     std::string serialize(const gemmini_cpu_sample & end) const {
         const DirectHostSpan total{phases_[0].start, end};
-        const bool valid = success && ready && total.start.tid != 0 &&
-            total.start.tid == end.tid && end.ns >= total.start.ns;
+        const bool valid = success && ready && total.start.tid != 0 && total.start.tid == end.tid &&
+                           end.ns >= total.start.ns;
         std::ostringstream out;
         out << "{\"schema\":\"gemmini.cycle\",\"version\":2,"
             << "\"record_type\":\"RESIDUAL_HOST_PROFILE\",\"source\":\"steady_clock\","
             << "\"unit\":\"nanosecond\",\"op\":\"rmd.cpu_direct.profile\",\"layer\":";
-        if (layer_.empty()) out << "null"; else quote(out, layer_);
+        if (layer_.empty())
+            out << "null";
+        else
+            quote(out, layer_);
         out << ",\"run_id\":" << (run_id_ ? std::to_string(*run_id_) : "null")
             << ",\"stripe_id\":" << payload_.stripe_id
             << ",\"slot\":null,\"node_id\":null,\"worker_id\":null,\"valid\":"
@@ -174,28 +190,26 @@ private:
             << ",\"active_rows\":" << (workload_valid_ ? std::to_string(active_rows_) : "null")
             << ",\"active_row_blocks\":"
             << (workload_valid_ ? std::to_string(active_row_blocks_) : "null")
-            << ",\"row_begin\":" << payload_.row_begin
-            << ",\"row_count\":" << payload_.row_count
-            << ",\"logical_j\":" << payload_.logical_j
-            << ",\"logical_k\":" << payload_.logical_k
+            << ",\"row_begin\":" << payload_.row_begin << ",\"row_count\":" << payload_.row_count
+            << ",\"logical_j\":" << payload_.logical_j << ",\"logical_k\":" << payload_.logical_k
             << ",\"j_tile_count\":" << (workload_valid_ ? std::to_string(j_tile_count_) : "null")
             << "},\"phases\":{";
         constexpr std::array<const char *, 4> names{
             "validation", "preparation", "parallel", "finalization"};
         for (size_t index = 0; index < phases_.size(); ++index) {
-            if (index != 0) out << ',';
-            out << '"' << names[index] << "\":{\"host_timing\":"
-                << phases_[index].host_json() << ",\"thread_cpu_timing\":"
-                << phases_[index].cpu_json() << '}';
+            if (index != 0)
+                out << ',';
+            out << '"' << names[index] << "\":{\"host_timing\":" << phases_[index].host_json()
+                << ",\"thread_cpu_timing\":" << phases_[index].cpu_json() << '}';
         }
         out << "},\"tiles\":[";
         for (size_t index = 0; index < tiles.size(); ++index) {
-            const auto & tile = tiles[index];
-            const bool log_valid = tile.writes.calls != 0 && tile.writes.valid;
-            if (index != 0) out << ',';
+            const auto & tile      = tiles[index];
+            const bool   log_valid = tile.writes.calls != 0 && tile.writes.valid;
+            if (index != 0)
+                out << ',';
             out << "{\"node_id\":" << index << ",\"worker_id\":" << tile.worker_id
-                << ",\"j_begin\":" << tile.j_begin
-                << ",\"j_end\":" << tile.j_end
+                << ",\"j_begin\":" << tile.j_begin << ",\"j_end\":" << tile.j_end
                 << ",\"host_timing\":" << tile.compute.host_json()
                 << ",\"thread_cpu_timing\":" << tile.compute.cpu_json()
                 << ",\"log_host_timing\":" << tile.logging.host_json()
@@ -210,7 +224,8 @@ private:
                     "event_scan", "weight_dot", "scale_apply"};
                 out << ",\"stages\":{";
                 for (size_t stage = 0; stage < stage_names.size(); ++stage) {
-                    if (stage != 0) out << ',';
+                    if (stage != 0)
+                        out << ',';
                     out << '"' << stage_names[stage] << "\":";
                     tile.stages[stage].write_json(out);
                 }
@@ -222,8 +237,10 @@ private:
         bool first = true;
         for (size_t index = 0; index < workers.size(); ++index) {
             const auto & worker = workers[index];
-            if (!worker.active) continue;
-            if (!first) out << ',';
+            if (!worker.active)
+                continue;
+            if (!first)
+                out << ',';
             first = false;
             out << "{\"worker_id\":" << index << ",\"tid\":"
                 << (worker.work.start.tid != 0 ? std::to_string(worker.work.start.tid) : "null")
@@ -236,16 +253,16 @@ private:
         return out.str();
     }
 
-    const DirectStripePayload & payload_;
-    const std::string & layer_;
-    std::optional<uint64_t> run_id_;
-    bool enabled_;
-    bool workload_valid_ = false;
-    size_t phase_ = 0;
-    size_t active_rows_ = 0;
-    size_t active_row_blocks_ = 0;
-    size_t j_tile_count_ = 0;
+    const DirectStripePayload &   payload_;
+    const std::string &           layer_;
+    std::optional<uint64_t>       run_id_;
+    bool                          enabled_;
+    bool                          workload_valid_    = false;
+    size_t                        phase_             = 0;
+    size_t                        active_rows_       = 0;
+    size_t                        active_row_blocks_ = 0;
+    size_t                        j_tile_count_      = 0;
     std::array<DirectHostSpan, 4> phases_{};
 };
 
-}
+} // namespace ggml::gemmini::residual::detail

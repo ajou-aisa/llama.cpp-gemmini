@@ -72,9 +72,12 @@ def main() -> None:
     from scripts.gemmini_replay_contract import runtime_binding
     hardware, runtime = runtime_binding(a.runtime_manifest.resolve(), f'a{a.bits}w{a.bits}-d{a.dim}-hp1')
     commits={};digests={};inputs={}
-    for name,root in (('llama.cpp-gemmini',a.llama),('IM2P.sim',a.sim),('headers',a.headers)):
-        commits[name],digests[name],inputs[name]=identity(root.resolve(),name)
+    roots = {'llama.cpp-gemmini': a.llama.resolve(), 'IM2P.sim': a.sim.resolve(),
+             'headers': a.headers.resolve()}
+    for name,root in roots.items():
+        commits[name],digests[name],inputs[name]=identity(root,name)
     values={'source_commits':commits,'source_worktree_sha256':digests,
+            'source_roots': {name: str(root) for name, root in roots.items()},
             'profile':f'a{a.bits}w{a.bits}-d{a.dim}-hp1',
             'mode':a.mode,'rmd':a.rmd,'rmd_backend':a.rmd_backend,
             'hardware_contract': hardware, 'runtime_artifact': runtime,

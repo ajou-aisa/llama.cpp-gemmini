@@ -9,6 +9,92 @@ cd llama.cpp
 
 The following sections describe how to build with different backends and options.
 
+## Gemmini developer builds
+
+This fork provides `build-x86.sh`, `build-arm64.sh`, `build-arm64-cpu.sh`, and
+`build-riscv.sh`. FPGA support and its dedicated wrapper are retired. The x86
+wrapper visibly defaults to `IM2P_SIM` / `GEMMINI_HP1`, WS, A8/W8/D16, ExSIA,
+`STRIPE_PIPELINE`, and RMD enabled with WS residuals. Developer builds are distinct
+from the receipt-verified [measurement builds](../scripts/eval/README.md).
+
+Each wrapper visibly declares applicable defaults from the 52 managed CMake
+options, plus its platform policy. `scripts/im2p-build-options.py`
+resolves them in this order: command-line `-DNAME[:TYPE]=value`, `NAME` environment,
+`NAME_DEFAULT` environment, then the script default. It preserves an explicit
+CMake type and emits one effective definition per option. Inspect the resolved
+options, their origins, and paths without provisioning or building:
+
+```bash
+./build-x86.sh --dry-run
+./build-arm64-cpu.sh --dry-run -DLOG_CYCLE:STRING=0
+```
+
+`BUILD_DIR`, `BUILD_JOBS`, `IM2P_ARTIFACT_SET`, and `IM2P_CACHE_JOBS` are shell
+controls; `-DBUILD_DIR=...` does not set the wrapper output directory. Set shell
+controls in the environment; ARM also uses `APPLE_SILICON_ARCH` and `LIBOMP_PREFIX`.
+The common host resolver uses the effective backend,
+geometry, simulator root, and build directory when selecting SDK artifacts.
+CMake consumes resolved `GEMMINI_SW_PATH` and simulator paths and validates the
+active backend's requirements. An explicit invalid SDK path fails when that
+backend is active; disabling Gemmini does not require its hardware include tree.
+
+`CYCLE_SIM=1` selects CPU-functional execution. It is not evidence of physical
+hardware support. The `GEMMINI_HP1` route rejects H1 weights when `CYCLE_SIM=0`;
+selecting HP1 or enabling RMD does not remove that guard.
+
+### Component and lifetime boundaries
+
+- `ggml-gemmini.cpp` owns backend entry points; `ops.cpp` owns operation setup and
+  dispatch. `matmul/options.*` resolves options, `types.hpp` carries value/status
+  types, `dense.*` owns dense computation, and `execution.*` owns stripe jobs and
+  their collector.
+- ExSIA's `exsia-event.hpp` carries publication data, `exsia-state.hpp` owns slot
+  state, and `exsia-profile.*` owns individual profile intervals. `local.*` and
+  `folding.*` implement their stages; `exsia.cpp` coordinates runtime scheduling.
+  A residual packet owns its buffers and survives slot release. Borrowed inputs
+  must remain valid through their consumer's completion. Folding seals residual
+  data and commits metadata before the stripe-ready callback publishes the event.
+- `im2p/route.*` owns route eligibility and status/metadata translation;
+  `ggml-gemmini-im2p.cpp` owns frontend runs, fences, and output publication.
+  Jobs retain their input leases through the fence; cancellation and failure
+  paths join or drain outstanding work and release slots exactly once. Successful
+  completion and validation precede caller-output publication.
+- `ggml-gemmini-utils` owns observation: captured identity, native and host timing,
+  serialization, and dump phases. Observation failures do not manufacture valid
+  counters or successful run termination. CPU and accelerator clock domains stay
+  separate.
+
+### Focused validation
+
+Configure with `LLAMA_BUILD_TESTS=ON`. For a linked Gemmini build, build the
+registered executables and inspect the inventory before running selected cases:
+
+```bash
+cmake --build build --target gemmini-test-executables -j2
+ctest --test-dir build --show-only=json-v1 > build/test-inventory.json
+ctest --test-dir build --output-on-failure --no-tests=error -R 'gemmini'
+```
+
+Registration depends on options and backend availability; compare the inventory
+with the intended configuration and require zero skipped cases. The source
+contracts (CPU cycle validity, weight-reader callers, direct metrics, ExSIA
+profiles, telemetry clock gates, matmul boundaries, and profiled domains) check
+architecture. They do not replace numerical, lifecycle, failure, and output tests.
+SDK ABI/configuration fixtures likewise do not establish simulator execution.
+
+`test-gemmini-dump-phase` requires Gemmini enabled, `GGML_BACKEND_DL=OFF`,
+`GGML_GEMMINI_OPTION=CPU`, `GGML_GEMMINI_COMPUTE_TYPE=FLOAT`,
+`GGML_GEMMINI_DEQUANT_FP_TEST=OFF`, and `LOG_DUMP=1`. On Unix,
+`LOG_DUMP_SCALE=1` additionally registers `test-gemmini-dump-output`, which invokes
+the same executable with `--outputs`. Exercise both `LOG_CYCLE=0` with
+`CYCLE_DETAIL=0` and `LOG_CYCLE=1` with `CYCLE_DETAIL=1`; compact logging
+(`LOG_CYCLE=1`, `CYCLE_DETAIL=0`) is supplemental. `CYCLE_SIM` independently
+selects CPU-functional execution and does not disable cycle logging. Run the
+dump tests with
+`ctest --test-dir build --output-on-failure --no-tests=error -R '^test-gemmini-dump-(phase|output)$'`.
+Host compilation, including a Linux-labelled cross configuration driven by an
+Apple host compiler, does not qualify Linux PMU behavior or physical RISC-V/FPGA.
+
 ## CPU Build
 
 Build llama.cpp using `CMake`:

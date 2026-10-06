@@ -124,12 +124,7 @@ llama_context::llama_context(
     if (!hparams.vocab_only) {
         // GPU backends
         for (auto * dev : model.devices) {
-            // FPGA_UART can also be selected explicitly with --device GEMMINI.
-            // Preserve the same quantizer model identity as the ACCEL path below.
-            const bool fpga_uart = ggml_backend_reg_get_proc_address(
-                ggml_backend_dev_backend_reg(dev), "ggml_gemmini_fpga_stats_v1") != nullptr;
-            const std::string fpga_model_arch = fpga_uart ? model.arch_name() : "";
-            ggml_backend_t backend = ggml_backend_dev_init(dev, fpga_uart ? fpga_model_arch.c_str() : nullptr);
+            ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
             if (backend == nullptr) {
                 throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
             }
@@ -146,11 +141,6 @@ llama_context::llama_context(
                     continue;
                 }
                 const bool is_gemmini = std::strcmp(ggml_backend_dev_name(dev), "GEMMINI") == 0;
-                if (is_gemmini && ggml_backend_reg_get_proc_address(
-                        ggml_backend_dev_backend_reg(dev), "ggml_gemmini_fpga_stats_v1") &&
-                    std::find(model.devices.begin(), model.devices.end(), dev) != model.devices.end()) {
-                    continue; // Explicit FPGA device was already initialized above.
-                }
                 if (prefer_gemmini && ((pass == 0) != is_gemmini)) {
                     continue;
                 }

@@ -7,6 +7,7 @@ for pair in frontend-full:full full:adapter-full compact:compact; do
     control=${pair%:*}
     failure=${pair#*:}
     "$binary" "$control" "$output/$control.jsonl"
+    grep -Eq '"kind":"run_end".*"work_count":[1-9][0-9]*' "$output/$control.jsonl"
     cutoff=$(LC_ALL=C awk '
         /"kind":"parent_end"/ { print bytes; found = 1; exit }
         { bytes += length($0) + 1 }

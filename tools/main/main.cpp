@@ -1411,32 +1411,32 @@ int main(int argc, char ** argv) {
 
     common_sampler_free(smpl);
 
-    bool fpga_execution_ok = common_fpga_execution_check();
+    bool execution_ok = true;
 #if LOG_CYCLE || CYCLE_SIM
     if (semantic_trace) {
-        try { semantic_trace->finish(fpga_execution_ok); }
+        try { semantic_trace->finish(execution_ok); }
         catch (const std::exception &error) {
             LOG_ERR("semantic metadata: %s\n", error.what());
-            fpga_execution_ok = false;
+            execution_ok = false;
         }
     }
 #endif
 #if CYCLE_SIM
     try {
-        functional_trace->finish(fpga_execution_ok,
-            fpga_execution_ok ? "" : "backend execution failed");
+        functional_trace->finish(execution_ok,
+            execution_ok ? "" : "backend execution failed");
     } catch (const std::exception &error) {
         LOG_ERR("cycle-sim: %s\n", error.what());
-        fpga_execution_ok = false;
+        execution_ok = false;
     }
 #endif
     if (production_trace) {
         try {
-            production_trace->finish(fpga_execution_ok,
-                fpga_execution_ok ? "" : "backend execution failed");
+            production_trace->finish(execution_ok,
+                execution_ok ? "" : "backend execution failed");
         } catch (const std::exception & error) {
             LOG_ERR("optrace: %s\n", error.what());
-            fpga_execution_ok = false;
+            execution_ok = false;
         }
     }
     llama_backend_free();
@@ -1444,5 +1444,5 @@ int main(int argc, char ** argv) {
     ggml_threadpool_free_fn(threadpool);
     ggml_threadpool_free_fn(threadpool_batch);
 
-    return fpga_execution_ok ? 0 : 1;
+    return execution_ok ? 0 : 1;
 }

@@ -11,12 +11,13 @@ if(NOT DEFINED PROJECT_ROOT)
     get_filename_component(direct_source_dir "${DIRECT_SOURCE}" DIRECTORY)
     get_filename_component(PROJECT_ROOT "${direct_source_dir}/../../../../.." ABSOLUTE)
 endif()
-set(matmul_source_path
-    "${PROJECT_ROOT}/ggml/src/ggml-gemmini/ggml-gemmini-matmul.cpp")
-if(NOT EXISTS "${matmul_source_path}")
-    message(FATAL_ERROR "MatMul production source is unavailable")
-endif()
-file(READ "${matmul_source_path}" matmul_source)
+foreach(required IN ITEMS DENSE_SOURCE EXECUTION_SOURCE)
+    if(NOT DEFINED ${required} OR NOT EXISTS "${${required}}")
+        message(FATAL_ERROR "${required} production source is required")
+    endif()
+endforeach()
+file(READ "${DENSE_SOURCE}" dense_source)
+file(READ "${EXECUTION_SOURCE}" execution_source)
 
 function(require_count text regex expected label)
     string(REGEX MATCHALL "${regex}" matches "${text}")
@@ -92,20 +93,32 @@ if(NOT DEFINED SEMANTIC_CASE OR SEMANTIC_CASE STREQUAL "F1a")
     if(direct_source MATCHES "next_direct_run_id")
         message(FATAL_ERROR "F1a: unavailable run identity must not be fabricated")
     endif()
-    string(FIND "${matmul_source}" "MatMulResult MatMul::run_full()" run_full_begin)
-    string(FIND "${matmul_source}" "MatMulStatus MatMul::begin_stripes()" run_full_end)
+    string(FIND "${dense_source}" "MatMulResult MatMul::run_full()" run_full_begin)
+    string(FIND "${dense_source}" "MatMulStatus MatMul::begin_stripes()" run_full_end)
     if(run_full_begin EQUAL -1 OR run_full_end EQUAL -1 OR
        run_full_end LESS run_full_begin)
         message(FATAL_ERROR "F1a: bounded MatMul::run_full body is unavailable")
     endif()
     math(EXPR run_full_length "${run_full_end} - ${run_full_begin}")
-    string(SUBSTRING "${matmul_source}" ${run_full_begin} ${run_full_length} run_full_body)
-    string(FIND "${run_full_body}"
-        "residual::execute_direct_stripe(args(), *payload, correction"
-        run_full_direct_call)
-    if(run_full_direct_call EQUAL -1)
+    string(SUBSTRING "${dense_source}" ${run_full_begin} ${run_full_length} run_full_body)
+    string(REGEX MATCH
+        "residual::execute_direct_stripe\\([ \t\r\n]*args\\(\\),[ \t\r\n]*\\*payload,[ \t\r\n]*correction"
+        run_full_direct_call "${run_full_body}")
+    if(run_full_direct_call STREQUAL "")
         message(FATAL_ERROR
             "F1a: MatMul::run_full null-metrics direct execution must remain covered")
+    endif()
+
+    string(FIND "${execution_source}" "MatmulStatus execute_rmd_stripe(" stripe_begin)
+    string(FIND "${execution_source}" "MatmulStatus compose_rmd_stripe(" stripe_end)
+    if(stripe_begin EQUAL -1 OR stripe_end LESS_EQUAL stripe_begin)
+        message(FATAL_ERROR "F1a: bounded stripe residual execution is unavailable")
+    endif()
+    math(EXPR stripe_length "${stripe_end} - ${stripe_begin}")
+    string(SUBSTRING "${execution_source}" ${stripe_begin} ${stripe_length} stripe_body)
+    string(FIND "${stripe_body}" "residual::execute_direct_stripe(" stripe_direct_call)
+    if(stripe_direct_call EQUAL -1)
+        message(FATAL_ERROR "F1a: stripe direct execution must remain covered")
     endif()
 
     string(FIND "${direct_profile}" "uint64_t identity_mask" wide_identity_mask)
@@ -129,7 +142,8 @@ if(NOT DEFINED SEMANTIC_CASE OR SEMANTIC_CASE STREQUAL "F1a")
     string(FIND "${identity_block}" "GEMMINI_CYCLE_HAS_WORKER_ID" worker_identity)
     string(FIND "${identity_block}" "if (direct_run_id.has_value())" conditional_run)
     string(FIND "${identity_block}" "GEMMINI_CYCLE_HAS_RUN_ID" run_identity)
-    string(FIND "${identity_block}" "identity_mask, direct_run_id.value_or(0)" direct_identity_use)
+    string(REGEX REPLACE "[ \t\r\n]" "" identity_compact "${identity_block}")
+    string(FIND "${identity_compact}" "identity_mask,direct_run_id.value_or(0)" direct_identity_use)
     string(FIND "${identity_block}" "layer_.c_str()" layer_identity)
     if(layer_identity EQUAL -1 OR stripe_identity EQUAL -1 OR node_identity EQUAL -1 OR worker_identity EQUAL -1 OR
        conditional_run EQUAL -1 OR run_identity EQUAL -1 OR direct_identity_use EQUAL -1 OR
@@ -179,11 +193,11 @@ if (NOT direct_header MATCHES
     "std::vector<DirectCpuTileRecord>[ \t\r\n]+cpu_tiles")
     message(FATAL_ERROR "J-tile records must use a dynamic vector")
 endif()
-if(NOT direct_source MATCHES "record\\.worker_id = direct_worker_id\\(\\)" OR
+if(NOT direct_source MATCHES "record\\.worker_id[ \t]*=[ \t]*direct_worker_id\\(\\)" OR
    NOT direct_source MATCHES "omp_get_thread_num\\(\\)")
     message(FATAL_ERROR "published worker_id must come from the executing worker")
 endif()
-if(direct_source MATCHES "record\\.worker_id = [0-9]+")
+if(direct_source MATCHES "record\\.worker_id[ \t]*=[ \t]*[0-9]+")
     message(FATAL_ERROR "published worker_id must not be a constant")
 endif()
 if (direct_header MATCHES
@@ -230,16 +244,20 @@ if(NOT blanket_unavailable_reason EQUAL -1)
 endif()
 foreach(token IN ITEMS "struct DirectExecutionTestHooks" "DirectCpuSampleReader sample_reader"
                        "void * context")
-    string(FIND "${direct_header}" "${token}" found)
+    string(REGEX REPLACE "[ \t\r\n]" "" header_compact "${direct_header}")
+    string(REGEX REPLACE "[ \t\r\n]" "" token_compact "${token}")
+    string(FIND "${header_compact}" "${token_compact}" found)
     if (found EQUAL -1)
         message(FATAL_ERROR "missing test-only hook token ${token}")
     endif()
 endforeach()
-string(REGEX MATCH
-    "target_compile_definitions\\(test-gemmini-exsia PRIVATE[^)]*EXSIA_VALIDATION=1\\)"
-    test_defs "${test_cmake}")
-if (test_defs STREQUAL "" OR NOT test_defs MATCHES
-    "GGML_GEMMINI_DIRECT_METRICS_TESTING=1")
+if(NOT DEFINED TEST_TARGET_CONTRACT OR NOT EXISTS "${TEST_TARGET_CONTRACT}")
+    message(FATAL_ERROR "Configured Gemmini test target contract is required")
+endif()
+include("${TEST_TARGET_CONTRACT}")
+if(NOT "EXSIA_VALIDATION=1" IN_LIST test-gemmini-exsia_DEFINITIONS OR
+   NOT "GGML_GEMMINI_DIRECT_METRICS_TESTING=1" IN_LIST test-gemmini-exsia_DEFINITIONS OR
+   test-gemmini-exsia_INTERFACE MATCHES "GGML_GEMMINI_DIRECT_METRICS_TESTING")
     message(FATAL_ERROR "direct sampling seam must be exact-target private")
 endif()
 

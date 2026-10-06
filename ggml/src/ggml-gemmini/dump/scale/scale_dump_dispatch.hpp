@@ -12,21 +12,19 @@
 #endif
 #endif
 
-namespace ggml::gemmini::log::scale
-{
+namespace ggml::gemmini::log::scale {
 #if GGML_GEMMINI_SCALE_DUMP_GROUP_MODE == GGML_GEMMINI_SCALE_DUMP_GROUP_MODE_BLOCK
-    using GroupDumpConfig = config::Block;
+using GroupDumpConfig = config::Block;
 #elif GGML_GEMMINI_SCALE_DUMP_GROUP_MODE == GGML_GEMMINI_SCALE_DUMP_GROUP_MODE_TILE
-    using GroupDumpConfig = config::Tile;
+using GroupDumpConfig = config::Tile;
 #elif GGML_GEMMINI_SCALE_DUMP_GROUP_MODE == GGML_GEMMINI_SCALE_DUMP_GROUP_MODE_TENSOR
-    using GroupDumpConfig = config::Tensor;
+using GroupDumpConfig = config::Tensor;
 #else
-    using GroupDumpConfig = config::Auto;
+using GroupDumpConfig = config::Auto;
 #endif
 
-    DumpResult dump_scale_groups(
-        LogTarget target,
-        const DumpMeta &meta,
-        const ScaleTableView &view,
-        const GroupDumpConfig &cfg);
+DumpResult dump_scale_groups(LogTarget               target,
+                             const DumpMeta &        meta,
+                             const ScaleTableView &  view,
+                             const GroupDumpConfig & cfg);
 } // namespace ggml::gemmini::log::scale

@@ -1,5 +1,35 @@
 #!/bin/bash
 
+im2p_host_jobs() {
+  if [[ "$(uname -s)" == Darwin ]]; then
+    sysctl -n hw.logicalcpu
+  elif command -v nproc >/dev/null 2>&1; then
+    nproc
+  else
+    getconf _NPROCESSORS_ONLN
+  fi
+}
+
+im2p_host_libomp_prefix() {
+  local brew_bin prefix
+  brew_bin=$(command -v brew || true)
+  for prefix in "${brew_bin%/bin/brew}" /opt/homebrew /usr/local; do
+    if [[ -n "$prefix" && -d "$prefix/opt/libomp" ]]; then
+      printf '%s\n' "$prefix/opt/libomp"
+      return
+    fi
+  done
+}
+
+im2p_configure_build() {
+  local build_dir=$1
+  shift
+  cmake -B "$build_dir" -S "$SCRIPT_ROOT" \
+    -U 'GGML_*' -U 'IM2P_*' -U 'LLAMA_*' -U 'LOG_*' -U 'CYCLE_*' \
+    -U 'BUILD_SHARED_LIBS' -U 'CMAKE_TOOLCHAIN_FILE' \
+    -U 'CMAKE_PREFIX_PATH' -U 'OpenMP_ROOT' "$@"
+}
+
 # Shared provisioning for native host builds. Callers define the selected
 # frontend identity; this helper only chooses how much of the cache to warm.
 im2p_provision_host_artifacts() {
@@ -11,18 +41,18 @@ im2p_provision_host_artifacts() {
   local dim=$6
   local block_size=$7
   local implementation=${8:-LEGACY_BSV}
-  local artifact_set=${IM2P_ARTIFACT_SET:-SELECTED}
+  local artifact_set=$IM2P_ARTIFACT_SET_DEFAULT
   local cache_jobs
   local target
 
   case "$artifact_set" in
     SELECTED)
       target=gemmini-frontend-real-lib
-      cache_jobs=${IM2P_CACHE_JOBS:-$default_jobs}
+      cache_jobs=$IM2P_CACHE_JOBS_DEFAULT
       ;;
     ALL_MATCHED)
       target=gemmini-frontend-real-lib-all
-      cache_jobs=${IM2P_CACHE_JOBS:-1}
+      cache_jobs=$IM2P_CACHE_JOBS_DEFAULT
       ;;
     *)
       printf '%s\n' \
@@ -45,6 +75,7 @@ im2p_provision_host_artifacts() {
   sim_root_abs="$(cd "$sim_root" && pwd)"
   local make_args=(
     IM2P_CACHE_JOBS="$cache_jobs" \
+    BUILD_DIR="${IM2P_SIM_BUILD_DIR_DEFAULT:-$sim_root_abs/build}" \
     GEMMINI_ROOT="$gemmini_root" \
     IM2P_SIM_IMPLEMENTATION="$implementation" \
     IM2P_ACTIVATION_BITS="$activation_bits" \
@@ -69,25 +100,7 @@ im2p_resolve_build_options() {
     [[ "$name" == *_DEFAULT ]] || continue
     defaults+=("${name%_DEFAULT}=${!name}")
   done < <(compgen -A variable)
-  resolved="$(python3 "$SCRIPT_ROOT/scripts/im2p-build-options.py" \
+  resolved="$(python3 -B "$SCRIPT_ROOT/scripts/im2p-build-options.py" \
     "$build_dir" "$platform" "${defaults[@]}" -- "$@")" || return $?
   eval "$resolved"
-  if [[ "$GGML_GEMMINI_EXECUTION_BACKEND_DEFAULT" == FPGA_UART &&
-        -n "${GGML_GEMMINI_FPGA_SIM_MANIFEST_DEFAULT:-}" ]]; then
-    printf '%s\n' \
-      'GGML_GEMMINI_FPGA_SIM_MANIFEST is invalid for FPGA_UART; physical external executor uses no simulator archive' >&2
-    return 2
-  fi
-  if [[ "$GGML_GEMMINI_EXECUTION_BACKEND_DEFAULT" == FPGA_UART &&
-        "$IM2P_BUILD_DRY_RUN" != 1 && "$(uname -s)" == Linux ]]; then
-    local machine
-    machine="$(uname -m)"
-    case "$platform:$machine" in
-      build-x86.sh:x86_64|build-arm64.sh:aarch64|build-arm64.sh:arm64|build-arm64-cpu.sh:aarch64|build-arm64-cpu.sh:arm64) ;;
-      *)
-        printf 'FPGA_UART native script/host mismatch: %s on %s; use the matching script or direct CMake with target artifacts\n' "$platform" "$machine" >&2
-        return 2
-        ;;
-    esac
-  fi
 }

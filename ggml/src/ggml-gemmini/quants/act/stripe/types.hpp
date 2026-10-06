@@ -4,13 +4,11 @@
 
 #include <vector>
 
-namespace ggml::gemmini::quants::act::stripe
-{
+namespace ggml::gemmini::quants::act::stripe {
 
-struct Meta
-{
+struct Meta {
     std::vector<float> scales;
-    RmdPacketList rmd_packets;
+    RmdPacketList      rmd_packets;
     DirectResidualList direct_residuals;
 
     inline void reset() {
@@ -20,4 +18,4 @@ struct Meta
     }
 };
 
-}
+} // namespace ggml::gemmini::quants::act::stripe

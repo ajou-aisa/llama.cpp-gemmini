@@ -1,10 +1,19 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <cmath>
 #include <limits>
 
 namespace ggml::gemmini {
+
+inline bool checked_mul_size(size_t lhs, size_t rhs, size_t & out) {
+    if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs)
+        return false;
+
+    out = lhs * rhs;
+    return true;
+}
 
 inline float apply_activation_exponent(float value, int16_t e_t, int16_t m) {
     if (e_t == std::numeric_limits<int16_t>::min())
@@ -17,4 +26,4 @@ inline float apply_activation_exponent(float value, int16_t e_t, int16_t m) {
     return std::scalbn(value, shift);
 }
 
-}
+} // namespace ggml::gemmini

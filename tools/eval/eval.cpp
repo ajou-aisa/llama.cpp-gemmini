@@ -574,7 +574,6 @@ static int run(int argc, char ** argv) {
     manifest << result.dump(2) << '\n';
     manifest.close(); batches.close(); application.close(); application_cpu.close();
     if (!manifest || !batches || !application || !application_cpu) throw std::runtime_error("output write failed");
-    if (!common_fpga_execution_check()) throw std::runtime_error("backend execution failed");
     return success ? 0 : 2;
 }
 

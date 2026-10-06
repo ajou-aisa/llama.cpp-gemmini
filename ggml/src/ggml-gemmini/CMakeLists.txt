@@ -3,358 +3,289 @@ include(CheckCXXSourceCompiles)
 
 set(RISCV_TOOL_PATH $ENV{RISCV})
 if (NOT DEFINED GEMMINI_SW_PATH OR GEMMINI_SW_PATH STREQUAL "")
-  if (DEFINED ENV{GEM_HOME} AND NOT "$ENV{GEM_HOME}" STREQUAL "")
-    set(GEMMINI_SW_PATH $ENV{GEM_HOME})
-  else()
-    # Local fallback for x86 CPU builds: repo root + ../RISC-V-DynDNN-gemmini-include
-    get_filename_component(LLAMA_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
-    set(GEMMINI_SW_PATH "${LLAMA_ROOT}/../RISC-V-DynDNN-gemmini-include")
-  endif()
+    message(FATAL_ERROR "GEMMINI_SW_PATH must be resolved before adding the Gemmini backend")
 endif()
 if (NOT EXISTS "${GEMMINI_SW_PATH}/gemmini.h"
-    AND NOT EXISTS "${GEMMINI_SW_PATH}/include/gemmini.h"
-    AND NOT EXISTS "${GEMMINI_SW_PATH}/gemmini-rocc-tests/include/gemmini.h")
-  get_filename_component(LLAMA_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
-  set(GEMMINI_SW_PATH "${LLAMA_ROOT}/../RISC-V-DynDNN-gemmini-include")
+        AND NOT EXISTS "${GEMMINI_SW_PATH}/include/gemmini.h")
+    message(FATAL_ERROR "Invalid resolved GEMMINI_SW_PATH='${GEMMINI_SW_PATH}'")
 endif()
 
 if (NOT DEFINED GGML_GEMMINI_ENABLE_OPENMP)
-  set(GGML_GEMMINI_ENABLE_OPENMP OFF)
+    set(GGML_GEMMINI_ENABLE_OPENMP OFF)
 endif()
 if (NOT DEFINED GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE)
-  set(GGML_GEMMINI_EXSIA_PROFILE_SCOPE "OFF" CACHE STRING "ExSIA profile scope (OFF, TIMELINE, STAGE)")
-  set_property(CACHE GGML_GEMMINI_EXSIA_PROFILE_SCOPE PROPERTY STRINGS OFF TIMELINE STAGE)
-  string(TOUPPER "${GGML_GEMMINI_EXSIA_PROFILE_SCOPE}" _GGML_GEMMINI_EXSIA_PROFILE_SCOPE_UPPER)
-  if (_GGML_GEMMINI_EXSIA_PROFILE_SCOPE_UPPER STREQUAL "OFF")
-    set(GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE 0)
-  elseif (_GGML_GEMMINI_EXSIA_PROFILE_SCOPE_UPPER STREQUAL "TIMELINE")
-    set(GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE 1)
-  elseif (_GGML_GEMMINI_EXSIA_PROFILE_SCOPE_UPPER STREQUAL "STAGE")
-    set(GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE 2)
-  else()
-    message(FATAL_ERROR "GGML_GEMMINI_EXSIA_PROFILE_SCOPE must be OFF, TIMELINE, or STAGE, got '${GGML_GEMMINI_EXSIA_PROFILE_SCOPE}'")
-  endif()
+    set(GGML_GEMMINI_EXSIA_PROFILE_SCOPE "OFF" CACHE STRING "ExSIA profile scope (OFF, TIMELINE, STAGE)")
+    set_property(CACHE GGML_GEMMINI_EXSIA_PROFILE_SCOPE PROPERTY STRINGS OFF TIMELINE STAGE)
+    string(TOUPPER "${GGML_GEMMINI_EXSIA_PROFILE_SCOPE}" _GGML_GEMMINI_EXSIA_PROFILE_SCOPE_UPPER)
+    if (_GGML_GEMMINI_EXSIA_PROFILE_SCOPE_UPPER STREQUAL "OFF")
+        set(GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE 0)
+    elseif (_GGML_GEMMINI_EXSIA_PROFILE_SCOPE_UPPER STREQUAL "TIMELINE")
+        set(GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE 1)
+    elseif (_GGML_GEMMINI_EXSIA_PROFILE_SCOPE_UPPER STREQUAL "STAGE")
+        set(GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE 2)
+    else()
+        message(FATAL_ERROR "GGML_GEMMINI_EXSIA_PROFILE_SCOPE must be OFF, TIMELINE, or STAGE, got '${GGML_GEMMINI_EXSIA_PROFILE_SCOPE}'")
+    endif()
 endif()
 
 set(GEMMINI_COMMON_FLAGS
-  -fno-common
-  # -fno-tree-loop-distribute-patterns
-  -ffast-math
+    -fno-common
+    # -fno-tree-loop-distribute-patterns
+    -ffast-math
 )
 
 set(GEMMINI_RISCV_FLAGS
-  -std=gnu99
-  -fno-tree-loop-distribute-patterns 
-  -fno-builtin-printf
-  -march=rv64gc
-  -Wa,-march=rv64gc
+    -std=gnu99
+    -fno-tree-loop-distribute-patterns
+    -fno-builtin-printf
+    -march=rv64gc
+    -Wa,-march=rv64gc
 )
 
 function(ggml_gemmini_apply_profile_compile_definitions target)
-  target_compile_definitions(${target} PRIVATE
-    EXSIA_VALIDATION=0
-    GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE}
-    CYCLE_DETAIL=${CYCLE_DETAIL}
-    LOG_CYCLE=${LOG_CYCLE})
+    target_compile_definitions(${target} PRIVATE
+        EXSIA_VALIDATION=0
+        GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE}
+        CYCLE_DETAIL=${CYCLE_DETAIL}
+        LOG_CYCLE=${LOG_CYCLE})
 endfunction()
 
 function(ggml_gemmini_assert_profile_compile_definitions target)
-  get_target_property(_definitions ${target} COMPILE_DEFINITIONS)
-  foreach(_expected IN ITEMS
-      EXSIA_VALIDATION=0
-      GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE}
-      CYCLE_DETAIL=${CYCLE_DETAIL}
-      LOG_CYCLE=${LOG_CYCLE})
-    string(REGEX REPLACE "=.*$" "" _key "${_expected}")
-    set(_actual)
-    foreach(_definition IN LISTS _definitions)
-      if(_definition MATCHES "^${_key}(=|$)")
-        list(APPEND _actual "${_definition}")
-      endif()
+    get_target_property(_definitions ${target} COMPILE_DEFINITIONS)
+    foreach(_expected IN ITEMS
+            EXSIA_VALIDATION=0
+            GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE}
+            CYCLE_DETAIL=${CYCLE_DETAIL}
+            LOG_CYCLE=${LOG_CYCLE})
+        string(REGEX REPLACE "=.*$" "" _key "${_expected}")
+        set(_actual)
+        foreach(_definition IN LISTS _definitions)
+            if(_definition MATCHES "^${_key}(=|$)")
+                list(APPEND _actual "${_definition}")
+            endif()
+        endforeach()
+        list(REMOVE_DUPLICATES _actual)
+        if(NOT _actual STREQUAL _expected)
+            string(JOIN "," _actual_text ${_actual})
+            message(FATAL_ERROR
+                "GEMMINI_PROFILE_CONTRACT target=${target} definition=${_key} expected=${_expected} actual=${_actual_text}")
+        endif()
     endforeach()
-    list(REMOVE_DUPLICATES _actual)
-    if(NOT _actual STREQUAL _expected)
-      string(JOIN "," _actual_text ${_actual})
-      message(FATAL_ERROR
-        "GEMMINI_PROFILE_CONTRACT target=${target} definition=${_key} expected=${_expected} actual=${_actual_text}")
-    endif()
-  endforeach()
 endfunction()
 
-ggml_add_backend_library(ggml-gemmini
-                          ggml-gemmini.cpp
-                          ggml-gemmini-buffer.cpp
-                          ggml-gemmini-geometry.hpp
-                          ggml-gemmini-matmul.cpp
-                          ggml-gemmini-telemetry.cpp
-                          ggml-gemmini-q8-h1-artifact.cpp
-                          ggml-gemmini-q8-h1-artifact-reader.cpp
-                            quants/act/dispatch.cpp
-                            quants/act/quantize.cpp
-                            quants/act/block/block.cpp
-                            quants/act/exsia/exsia.cpp
-                         quants/act/tensor/tensor.cpp
-                         quants/act/stripe/stripe.cpp
-                         quants/act/token/token.cpp
-                         quants/weight/quantize_Q8_H1.cpp
-                         quants/common/fp16_util.cpp
-                         quants/common/dequant.cpp
-                         quants/common/weight_reader.cpp
-                         residual/direct/direct-executor.cpp
-                         residual/rmd/rmd-builder.cpp
-                         residual/rmd/rmd-bitmap-builder.cpp
-                         residual/rmd/rmd-run-aware.cpp
-                         residual/rmd/rmd-executor.cpp
-                         residual/rmd/rmd-im2p-executor.cpp
-                         residual/rmd/rmd-compose.cpp
-                         residual/rmd/rmd-reference.cpp
-                         dump/dump_common.cpp
-                         dump/dump_tensor.cpp
-                         dump/scale/scale_dump_block.cpp
-                         dump/scale/scale_dump_dispatch.cpp
-                         dump/scale/scale_dump_stub.cpp
-                        )
+set(GGML_GEMMINI_SOURCES
+    ggml-gemmini.cpp
+    ops.cpp
+    ggml-gemmini-buffer.cpp
+    ggml-gemmini-geometry.hpp
+    matmul/dense.cpp
+    matmul/execution.cpp
+    matmul/options.cpp
+    ggml-gemmini-telemetry.cpp
+    quants/act/dispatch.cpp
+    quants/act/quantize.cpp
+    quants/act/block/block.cpp
+    quants/act/exsia/exsia.cpp
+    quants/act/exsia/exsia-profile.cpp
+    quants/act/exsia/local.cpp
+    quants/act/exsia/folding.cpp
+    quants/act/tensor/tensor.cpp
+    quants/act/stripe/stripe.cpp
+    quants/act/token/token.cpp
+    quants/common/fp16_util.cpp
+    quants/common/dequant.cpp
+    quants/common/weight_reader.cpp
+    residual/direct/direct-executor.cpp
+    residual/rmd/rmd-builder.cpp
+    residual/rmd/rmd-bitmap-builder.cpp
+    residual/rmd/rmd-run-aware.cpp
+    residual/rmd/rmd-executor.cpp
+    residual/rmd/rmd-im2p-executor.cpp
+    residual/rmd/rmd-compose.cpp
+    residual/rmd/rmd-reference.cpp
+    dump/dump_common.cpp
+    dump/dump_tensor.cpp
+    dump/scale/scale_dump_block.cpp
+    dump/scale/scale_dump_dispatch.cpp
+    dump/scale/scale_dump_stub.cpp
+)
+ggml_add_backend_library(ggml-gemmini ${GGML_GEMMINI_SOURCES})
 
 target_compile_features(ggml-gemmini PRIVATE cxx_std_17)
-target_compile_definitions(ggml-gemmini PRIVATE
-  GGML_GEMMINI_MATMUL_IMPLEMENTATION)
 ggml_gemmini_apply_profile_compile_definitions(ggml-gemmini)
 ggml_gemmini_assert_profile_compile_definitions(ggml-gemmini)
 if (LLAMA_BUILD_TESTS AND NOT GGML_BACKEND_DL)
-  target_compile_definitions(ggml-gemmini PUBLIC
-    GGML_GEMMINI_TESTING=1
-    GGML_GEMMINI_TEST_OBSERVER=1)
+    target_compile_definitions(ggml-gemmini PUBLIC
+        GGML_GEMMINI_TESTING=1
+        GGML_GEMMINI_TEST_OBSERVER=1)
 endif()
 
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
-  target_compile_options(ggml-gemmini PRIVATE ${GEMMINI_COMMON_FLAGS} ${GEMMINI_RISCV_FLAGS})
+    target_compile_options(ggml-gemmini PRIVATE ${GEMMINI_COMMON_FLAGS} ${GEMMINI_RISCV_FLAGS})
 else()
-  message(STATUS "GEMMINI: building on ${CMAKE_SYSTEM_PROCESSOR}, skipping RISC-V specific flags")
-  target_compile_options(ggml-gemmini PRIVATE ${GEMMINI_COMMON_FLAGS})
+    message(STATUS "GEMMINI: building on ${CMAKE_SYSTEM_PROCESSOR}, skipping RISC-V specific flags")
+    target_compile_options(ggml-gemmini PRIVATE ${GEMMINI_COMMON_FLAGS})
 endif()
 
 if (DEFINED GGML_GEMMINI_COMPILE_DEFS AND NOT "${GGML_GEMMINI_COMPILE_DEFS}" STREQUAL "")
-  target_compile_definitions(ggml-gemmini PRIVATE ${GGML_GEMMINI_COMPILE_DEFS})
+    target_compile_definitions(ggml-gemmini PRIVATE ${GGML_GEMMINI_COMPILE_DEFS})
 else()
-  # Standalone/subdir safety fallback with legacy defaults.
-  target_compile_definitions(ggml-gemmini PRIVATE
-    PRINT_TILE=0
-    OPTION=CPU
-    FULL_C=1
-    LOW_D=0
-    TRANSPOSE_B=1
-  )
+    # Standalone/subdir safety fallback with legacy defaults.
+    target_compile_definitions(ggml-gemmini PRIVATE
+        PRINT_TILE=0
+        OPTION=CPU
+        FULL_C=1
+        LOW_D=0
+        TRANSPOSE_B=1
+    )
 endif()
 
 target_include_directories(ggml-gemmini PUBLIC
-  ${GGML_GEMMINI_GENERATED_CONFIG_DIR}
-  ${CMAKE_CURRENT_LIST_DIR}
-  ${CMAKE_CURRENT_LIST_DIR}/../../include
-  ${CMAKE_CURRENT_LIST_DIR}/../ggml-gemmini-utils/include
-  ${GEMMINI_SW_PATH}
-  ${GEMMINI_SW_PATH}/include
+    ${GGML_GEMMINI_GENERATED_CONFIG_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}/../../include
+    ${CMAKE_CURRENT_LIST_DIR}/../ggml-gemmini-utils/include
+    ${GEMMINI_SW_PATH}
+    ${GEMMINI_SW_PATH}/include
 )
 target_include_directories(ggml-gemmini PRIVATE
-  ${CMAKE_CURRENT_LIST_DIR}/quants
-  ${CMAKE_CURRENT_LIST_DIR}/quants/act
-  ${CMAKE_CURRENT_LIST_DIR}/quants/act/exsia
-  ${CMAKE_CURRENT_LIST_DIR}/quants/act/stripe
-  ${CMAKE_CURRENT_LIST_DIR}/quants/act/token
-  ${CMAKE_CURRENT_LIST_DIR}/quants/common
-  ${CMAKE_CURRENT_LIST_DIR}/residual/rmd
-  ${CMAKE_CURRENT_LIST_DIR}/quants/view
-  ${CMAKE_CURRENT_LIST_DIR}/quants/weight
-  ${CMAKE_CURRENT_LIST_DIR}/dump
-  ${CMAKE_CURRENT_LIST_DIR}/dump/scale
-  ${RISCV_TOOL_PATH}/sysroot/include
-  ${GEMMINI_SW_PATH}/gemmini-rocc-tests
-  ${GEMMINI_SW_PATH}/gemmini-rocc-tests/include
-  ${GEMMINI_SW_PATH}/rocc-software/src
+    ${CMAKE_CURRENT_LIST_DIR}/quants
+    ${CMAKE_CURRENT_LIST_DIR}/quants/act
+    ${CMAKE_CURRENT_LIST_DIR}/quants/act/exsia
+    ${CMAKE_CURRENT_LIST_DIR}/quants/act/stripe
+    ${CMAKE_CURRENT_LIST_DIR}/quants/act/token
+    ${CMAKE_CURRENT_LIST_DIR}/quants/common
+    ${CMAKE_CURRENT_LIST_DIR}/residual/rmd
+    ${CMAKE_CURRENT_LIST_DIR}/quants/view
+    ${CMAKE_CURRENT_LIST_DIR}/quants/weight
+    ${CMAKE_CURRENT_LIST_DIR}/dump
+    ${CMAKE_CURRENT_LIST_DIR}/dump/scale
+    ${RISCV_TOOL_PATH}/sysroot/include
+    ${GEMMINI_SW_PATH}/gemmini-rocc-tests
+    ${GEMMINI_SW_PATH}/gemmini-rocc-tests/include
+    ${GEMMINI_SW_PATH}/rocc-software/src
 )
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
-    CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
-  target_include_directories(ggml-gemmini PRIVATE
-    ${CMAKE_CURRENT_LIST_DIR}/../ggml-gemmini-utils/src)
+        CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    target_include_directories(ggml-gemmini PRIVATE
+        ${CMAKE_CURRENT_LIST_DIR}/../ggml-gemmini-utils/src)
 endif()
 
 target_link_libraries(ggml-gemmini PRIVATE
-  ggml-gemmini-utils
+    ggml-gemmini-utils
 )
 
-if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "FPGA_UART")
-  # The frontend is built with the selected headers. There is no stale C++
-  # Options/args ABI from a separately compiled frontend archive.
-  add_library(ggml-gemmini-fpga-frontend STATIC
-    "${IM2P_SIM_ROOT}/frontend/src/im2p_gemmini_frontend.cpp")
-  set_target_properties(ggml-gemmini-fpga-frontend PROPERTIES POSITION_INDEPENDENT_CODE ON)
-  target_compile_features(ggml-gemmini-fpga-frontend PRIVATE cxx_std_20)
-  target_compile_options(ggml-gemmini-fpga-frontend PRIVATE -O2 -fno-fast-math)
-  target_compile_definitions(ggml-gemmini-fpga-frontend PRIVATE
-    ${GGML_GEMMINI_COMPILE_DEFS}
-    IM2P_GEMMINI_EXTERNAL_EXECUTOR_ONLY=1)
-  if(IM2P_FPGA_ARCH STREQUAL "GEMMINI_HP1")
-    target_compile_definitions(ggml-gemmini-fpga-frontend PRIVATE
-      IM2P_GEMMINI_FRONTEND_EXPECTED_DIM=${GGML_GEMMINI_DIM}
-      IM2P_GEMMINI_FRONTEND_ACTIVATION_BITS=${GGML_GEMMINI_ACTIVATION_BITS}
-      IM2P_FPGA_ARCH_GEMMINI_HP1=1)
-  else()
-    target_compile_definitions(ggml-gemmini-fpga-frontend PRIVATE
-      IM2P_GEMMINI_FRONTEND_EXPECTED_DIM=16
-      IM2P_GEMMINI_FRONTEND_ACTIVATION_BITS=8)
-  endif()
-  target_include_directories(ggml-gemmini-fpga-frontend PRIVATE
-    "${IM2P_SIM_ROOT}/frontend/include" "${IM2P_SIM_ROOT}/sim/include"
-    "${GGML_GEMMINI_GENERATED_CONFIG_DIR}" "${CMAKE_CURRENT_LIST_DIR}"
-    "${CMAKE_CURRENT_LIST_DIR}/../../include" "${CMAKE_CURRENT_LIST_DIR}/.."
-    "${CMAKE_CURRENT_LIST_DIR}/../ggml-gemmini-utils/include" "${GEMMINI_SW_PATH}")
-
-  if(IM2P_FPGA_ARCH STREQUAL "GEMMINI_HP1")
-    target_sources(ggml-gemmini PRIVATE
-      "${GGML_GEMMINI_FPGA_SOURCE_DIR}/ggml-gemmini-fpga.cpp"
-      "${GGML_GEMMINI_FPGA_SOURCE_DIR}/rmd.cpp"
-      "${GGML_GEMMINI_FPGA_SOURCE_DIR}/uart.cpp")
-  else()
-    target_sources(ggml-gemmini PRIVATE
-      "${GGML_GEMMINI_FPGA_SOURCE_DIR}/ggml-gemmini-fpga.cpp"
-      "${GGML_GEMMINI_FPGA_SOURCE_DIR}/uart.cpp"
-      "${GGML_GEMMINI_FPGA_SOURCE_DIR}/window_uart.cpp")
-  endif()
-  target_compile_features(ggml-gemmini PRIVATE cxx_std_20)
-  if(IM2P_FPGA_ARCH STREQUAL "GEMMINI_HP1")
-    target_compile_definitions(ggml-gemmini PRIVATE
-      IM2P_FPGA_ARCH_GEMMINI_HP1=1
-      IM2P_FPGA_PROFILE_ID="${IM2P_GEMMINI_PROFILE_ID}"
-      IM2P_FPGA_BUILD_ID="${GGML_GEMMINI_FPGA_BUILD_ID}")
-  else()
-    target_compile_definitions(ggml-gemmini PRIVATE
-      IM2P_FPGA_PROTOCOL_VERSION=3 IM2P_FPGA_BUILD_ID="${GGML_GEMMINI_FPGA_BUILD_ID}")
-  endif()
-  if (DEFINED IM2P_FPGA_DEFAULT_DEVICE AND NOT IM2P_FPGA_DEFAULT_DEVICE STREQUAL "")
-    target_compile_definitions(ggml-gemmini PRIVATE
-      IM2P_FPGA_DEFAULT_DEVICE="${IM2P_FPGA_DEFAULT_DEVICE}")
-  endif()
-  target_include_directories(ggml-gemmini PRIVATE
-    "${GGML_GEMMINI_FPGA_SOURCE_DIR}"
-    "${IM2P_SIM_ROOT}/frontend/include" "${IM2P_SIM_ROOT}/sim/include")
-  target_link_libraries(ggml-gemmini PRIVATE
-    ggml-gemmini-fpga-frontend
-    Threads::Threads ${CMAKE_DL_LIBS} m)
-  # A module with unresolved imports is not a deployable backend.
-  target_link_options(ggml-gemmini PRIVATE -Wl,--no-undefined
-    "-Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/ggml-gemmini.map")
-endif()
-
 if(CYCLE_SIM AND GGML_GEMMINI_OPTION STREQUAL "WS")
-  find_package(Threads REQUIRED)
-  add_library(ggml-gemmini-cpu-functional STATIC
-    "${IM2P_SIM_ROOT}/frontend/src/im2p_gemmini_frontend.cpp"
-    "${IM2P_SIM_ROOT}/frontend/src/im2p_cpu_functional.cpp"
-    "${IM2P_SIM_ROOT}/frontend/src/im2p_cpu_functional_compute.cpp")
-  set_target_properties(ggml-gemmini-cpu-functional PROPERTIES POSITION_INDEPENDENT_CODE ON)
-  target_compile_features(ggml-gemmini-cpu-functional PRIVATE cxx_std_20)
-  target_compile_options(ggml-gemmini-cpu-functional PRIVATE -O2 -fno-fast-math)
-  target_compile_definitions(ggml-gemmini-cpu-functional PRIVATE
-    ${GGML_GEMMINI_COMPILE_DEFS}
-    IM2P_GEMMINI_FRONTEND_EXPECTED_DIM=${GGML_GEMMINI_DIM}
-    IM2P_GEMMINI_FRONTEND_ACTIVATION_BITS=${GGML_GEMMINI_ACTIVATION_BITS}
-    IM2P_ACTIVATION_BITS=${GGML_GEMMINI_ACTIVATION_BITS}
-    IM2P_WEIGHT_BITS=${GGML_GEMMINI_WEIGHT_BITS}
-    IM2P_DIM=${GGML_GEMMINI_DIM}
-    IM2P_ACCUMULATOR_ROWS=${IM2P_CYCLE_SIM_ACCUMULATOR_ROWS}
-    IM2P_PARTIAL_BITS=${IM2P_CYCLE_SIM_PARTIAL_BITS}
-    IM2P_GEMMINI_BANK_COUNT=${IM2P_CYCLE_SIM_BANK_COUNT}
-    IM2P_GEMMINI_BANK_ROWS=${IM2P_CYCLE_SIM_BANK_ROWS})
-  if(LLAMA_BUILD_TESTS AND NOT GGML_BACKEND_DL)
-    target_compile_definitions(ggml-gemmini-cpu-functional PRIVATE IM2P_GEMMINI_FRONTEND_TESTING=1)
-    target_compile_definitions(ggml-gemmini-cpu-functional PUBLIC IM2P_CPU_FUNCTIONAL_TEST_HOOKS=1)
-    target_include_directories(ggml-gemmini PRIVATE "${IM2P_SIM_ROOT}/frontend/tests")
-  endif()
-  target_include_directories(ggml-gemmini-cpu-functional PRIVATE
-    "${IM2P_SIM_ROOT}/frontend/include" "${IM2P_SIM_ROOT}/sim/include"
-    "${GGML_GEMMINI_GENERATED_CONFIG_DIR}" "${CMAKE_CURRENT_LIST_DIR}"
-    "${CMAKE_CURRENT_LIST_DIR}/../../include" "${CMAKE_CURRENT_LIST_DIR}/.."
-    "${GEMMINI_SW_PATH}")
-  target_link_libraries(ggml-gemmini-cpu-functional PRIVATE ggml-gemmini-utils Threads::Threads)
-  target_sources(ggml-gemmini PRIVATE ggml-gemmini-im2p.cpp)
-  target_include_directories(ggml-gemmini PRIVATE
-    "${IM2P_SIM_ROOT}/frontend/include" "${IM2P_SIM_ROOT}/sim/include")
-  target_link_libraries(ggml-gemmini PRIVATE ggml-gemmini-cpu-functional Threads::Threads)
-elseif (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
-  foreach(_IM2P_REQUIRED_VAR IN ITEMS
-          IM2P_SIM_ROOT GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE GGML_GEMMINI_IM2P_SIM_ARCHIVE)
-    if (NOT DEFINED ${_IM2P_REQUIRED_VAR} OR "${${_IM2P_REQUIRED_VAR}}" STREQUAL "")
-      message(FATAL_ERROR "Missing validated IM2P build-contract variable ${_IM2P_REQUIRED_VAR}")
+    find_package(Threads REQUIRED)
+    add_library(ggml-gemmini-cpu-functional STATIC
+        "${IM2P_SIM_ROOT}/frontend/src/im2p_gemmini_frontend.cpp"
+        "${IM2P_SIM_ROOT}/frontend/src/im2p_cpu_functional.cpp"
+        "${IM2P_SIM_ROOT}/frontend/src/im2p_cpu_functional_compute.cpp")
+    set_target_properties(ggml-gemmini-cpu-functional PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_compile_features(ggml-gemmini-cpu-functional PRIVATE cxx_std_20)
+    target_compile_options(ggml-gemmini-cpu-functional PRIVATE -O2 -fno-fast-math)
+    target_compile_definitions(ggml-gemmini-cpu-functional PRIVATE
+        ${GGML_GEMMINI_COMPILE_DEFS}
+        IM2P_GEMMINI_FRONTEND_EXPECTED_DIM=${GGML_GEMMINI_DIM}
+        IM2P_GEMMINI_FRONTEND_ACTIVATION_BITS=${GGML_GEMMINI_ACTIVATION_BITS}
+        IM2P_ACTIVATION_BITS=${GGML_GEMMINI_ACTIVATION_BITS}
+        IM2P_WEIGHT_BITS=${GGML_GEMMINI_WEIGHT_BITS}
+        IM2P_DIM=${GGML_GEMMINI_DIM}
+        IM2P_ACCUMULATOR_ROWS=${IM2P_CYCLE_SIM_ACCUMULATOR_ROWS}
+        IM2P_PARTIAL_BITS=${IM2P_CYCLE_SIM_PARTIAL_BITS}
+        IM2P_GEMMINI_BANK_COUNT=${IM2P_CYCLE_SIM_BANK_COUNT}
+        IM2P_GEMMINI_BANK_ROWS=${IM2P_CYCLE_SIM_BANK_ROWS})
+    if(LLAMA_BUILD_TESTS AND NOT GGML_BACKEND_DL)
+        target_compile_definitions(ggml-gemmini-cpu-functional PRIVATE IM2P_GEMMINI_FRONTEND_TESTING=1)
+        target_compile_definitions(ggml-gemmini-cpu-functional PUBLIC IM2P_CPU_FUNCTIONAL_TEST_HOOKS=1)
+        target_include_directories(ggml-gemmini PRIVATE "${IM2P_SIM_ROOT}/frontend/tests")
     endif()
-  endforeach()
-
-  add_custom_target(ggml-gemmini-im2p-verify
-    COMMAND "${Python3_EXECUTABLE}"
-      "${_GGML_GEMMINI_IM2P_CACHE_VERIFIER}" verify
-      --manifest "${GGML_GEMMINI_IM2P_MANIFEST}"
-      --expected-identity "${GGML_GEMMINI_IM2P_ARTIFACT_ID}"
-      --expected-implementation "${IM2P_SIM_IMPLEMENTATION}"
-      --expected-block-size "${GGML_GEMMINI_BLOCK_SIZE}"
-      --expected-platform "${CMAKE_SYSTEM_NAME}"
-      --expected-platform-release "${CMAKE_SYSTEM_VERSION}"
-      --expected-arch "${CMAKE_SYSTEM_PROCESSOR}"
-      --artifact-kind selected
-    VERBATIM)
-  add_dependencies(ggml-gemmini ggml-gemmini-im2p-verify)
-
-  add_library(ggml-gemmini-im2p-frontend STATIC IMPORTED GLOBAL)
-  set_target_properties(ggml-gemmini-im2p-frontend PROPERTIES
-    IMPORTED_LOCATION "${GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE}")
-  add_library(ggml-gemmini-im2p-simulator STATIC IMPORTED GLOBAL)
-  set_target_properties(ggml-gemmini-im2p-simulator PROPERTIES
-    IMPORTED_LOCATION "${GGML_GEMMINI_IM2P_SIM_ARCHIVE}")
-
-  find_package(Threads REQUIRED)
-  target_sources(ggml-gemmini PRIVATE ggml-gemmini-im2p.cpp)
-  set(_IM2P_FRONTEND_TARGET ggml-gemmini-im2p-frontend)
-  if (LLAMA_BUILD_TESTS AND NOT GGML_BACKEND_DL)
+    target_include_directories(ggml-gemmini-cpu-functional PRIVATE
+        "${IM2P_SIM_ROOT}/frontend/include" "${IM2P_SIM_ROOT}/sim/include"
+        "${GGML_GEMMINI_GENERATED_CONFIG_DIR}" "${CMAKE_CURRENT_LIST_DIR}"
+        "${CMAKE_CURRENT_LIST_DIR}/../../include" "${CMAKE_CURRENT_LIST_DIR}/.."
+        "${GEMMINI_SW_PATH}")
+    target_link_libraries(ggml-gemmini-cpu-functional PRIVATE ggml-gemmini-utils Threads::Threads)
+    target_sources(ggml-gemmini PRIVATE ggml-gemmini-im2p.cpp im2p/route.cpp)
     target_include_directories(ggml-gemmini PRIVATE
-      "${IM2P_SIM_ROOT}/frontend/tests")
-    # Match the separate testing archive in IM2P's frontend Makefile.
-    add_library(ggml-gemmini-im2p-frontend-testing STATIC
-      "${IM2P_SIM_ROOT}/frontend/src/im2p_gemmini_frontend.cpp")
-    set_target_properties(ggml-gemmini-im2p-frontend-testing PROPERTIES
-      POSITION_INDEPENDENT_CODE ON)
-    target_compile_features(ggml-gemmini-im2p-frontend-testing PRIVATE cxx_std_20)
-    target_compile_options(ggml-gemmini-im2p-frontend-testing PRIVATE -O2 -fno-fast-math)
-    target_compile_definitions(ggml-gemmini-im2p-frontend-testing PRIVATE
-      ${GGML_GEMMINI_COMPILE_DEFS}
-      IM2P_GEMMINI_FRONTEND_TESTING=1
-      IM2P_PRODUCTION_TRACE_ENABLED=0
-      IM2P_GEMMINI_FRONTEND_EXPECTED_DIM=${GGML_GEMMINI_DIM}
-      IM2P_GEMMINI_FRONTEND_ACTIVATION_BITS=${GGML_GEMMINI_ACTIVATION_BITS})
-    ggml_gemmini_apply_profile_compile_definitions(ggml-gemmini-im2p-frontend-testing)
-    ggml_gemmini_assert_profile_compile_definitions(ggml-gemmini-im2p-frontend-testing)
-    target_include_directories(ggml-gemmini-im2p-frontend-testing PRIVATE
-      "${IM2P_SIM_ROOT}/frontend/include" "${IM2P_SIM_ROOT}/sim/include"
-      "${GGML_GEMMINI_GENERATED_CONFIG_DIR}" "${CMAKE_CURRENT_LIST_DIR}"
-      "${CMAKE_CURRENT_LIST_DIR}/../../include" "${CMAKE_CURRENT_LIST_DIR}/.."
-      "${CMAKE_CURRENT_LIST_DIR}/../ggml-gemmini-utils/include" "${GEMMINI_SW_PATH}")
-    target_link_libraries(ggml-gemmini-im2p-frontend-testing PRIVATE Threads::Threads)
-    set(_IM2P_FRONTEND_TARGET ggml-gemmini-im2p-frontend-testing)
-  endif()
-  target_include_directories(ggml-gemmini PRIVATE
-    "${IM2P_SIM_ROOT}/frontend/include"
-    "${IM2P_SIM_ROOT}/sim/include")
-  # Static-library order is intentional: the frontend consumes the C ABI from
-  # the simulator archive, and neither archive is present in HARDWARE builds.
-  target_link_libraries(ggml-gemmini PRIVATE
-    ${_IM2P_FRONTEND_TARGET}
-    ggml-gemmini-im2p-simulator
-    Threads::Threads
-    ${CMAKE_DL_LIBS})
+        "${IM2P_SIM_ROOT}/frontend/include" "${IM2P_SIM_ROOT}/sim/include")
+    target_link_libraries(ggml-gemmini PRIVATE ggml-gemmini-cpu-functional Threads::Threads)
+elseif (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
+    foreach(_IM2P_REQUIRED_VAR IN ITEMS
+                    IM2P_SIM_ROOT GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE GGML_GEMMINI_IM2P_SIM_ARCHIVE)
+        if (NOT DEFINED ${_IM2P_REQUIRED_VAR} OR "${${_IM2P_REQUIRED_VAR}}" STREQUAL "")
+            message(FATAL_ERROR "Missing validated IM2P build-contract variable ${_IM2P_REQUIRED_VAR}")
+        endif()
+    endforeach()
+
+    add_custom_target(ggml-gemmini-im2p-verify
+        COMMAND "${Python3_EXECUTABLE}"
+            "${_GGML_GEMMINI_IM2P_CACHE_VERIFIER}" verify
+            --manifest "${GGML_GEMMINI_IM2P_MANIFEST}"
+            --expected-identity "${GGML_GEMMINI_IM2P_ARTIFACT_ID}"
+            --expected-implementation "${IM2P_SIM_IMPLEMENTATION}"
+            --expected-block-size "${GGML_GEMMINI_BLOCK_SIZE}"
+            --expected-platform "${CMAKE_SYSTEM_NAME}"
+            --expected-platform-release "${CMAKE_SYSTEM_VERSION}"
+            --expected-arch "${CMAKE_SYSTEM_PROCESSOR}"
+            --artifact-kind selected
+        VERBATIM)
+    add_dependencies(ggml-gemmini ggml-gemmini-im2p-verify)
+
+    add_library(ggml-gemmini-im2p-frontend STATIC IMPORTED GLOBAL)
+    set_target_properties(ggml-gemmini-im2p-frontend PROPERTIES
+        IMPORTED_LOCATION "${GGML_GEMMINI_IM2P_FRONTEND_ARCHIVE}")
+    add_library(ggml-gemmini-im2p-simulator STATIC IMPORTED GLOBAL)
+    set_target_properties(ggml-gemmini-im2p-simulator PROPERTIES
+        IMPORTED_LOCATION "${GGML_GEMMINI_IM2P_SIM_ARCHIVE}")
+
+    find_package(Threads REQUIRED)
+    target_sources(ggml-gemmini PRIVATE ggml-gemmini-im2p.cpp im2p/route.cpp)
+    set(_IM2P_FRONTEND_TARGET ggml-gemmini-im2p-frontend)
+    if (LLAMA_BUILD_TESTS AND NOT GGML_BACKEND_DL)
+        target_include_directories(ggml-gemmini PRIVATE
+            "${IM2P_SIM_ROOT}/frontend/tests")
+        # Match the separate testing archive in IM2P's frontend Makefile.
+        add_library(ggml-gemmini-im2p-frontend-testing STATIC
+            "${IM2P_SIM_ROOT}/frontend/src/im2p_gemmini_frontend.cpp")
+        set_target_properties(ggml-gemmini-im2p-frontend-testing PROPERTIES
+            POSITION_INDEPENDENT_CODE ON)
+        target_compile_features(ggml-gemmini-im2p-frontend-testing PRIVATE cxx_std_20)
+        target_compile_options(ggml-gemmini-im2p-frontend-testing PRIVATE -O2 -fno-fast-math)
+        target_compile_definitions(ggml-gemmini-im2p-frontend-testing PRIVATE
+            ${GGML_GEMMINI_COMPILE_DEFS}
+            IM2P_GEMMINI_FRONTEND_TESTING=1
+            IM2P_PRODUCTION_TRACE_ENABLED=1
+            IM2P_GEMMINI_FRONTEND_EXPECTED_DIM=${GGML_GEMMINI_DIM}
+            IM2P_GEMMINI_FRONTEND_ACTIVATION_BITS=${GGML_GEMMINI_ACTIVATION_BITS})
+        ggml_gemmini_apply_profile_compile_definitions(ggml-gemmini-im2p-frontend-testing)
+        ggml_gemmini_assert_profile_compile_definitions(ggml-gemmini-im2p-frontend-testing)
+        target_include_directories(ggml-gemmini-im2p-frontend-testing PRIVATE
+            "${IM2P_SIM_ROOT}/frontend/include" "${IM2P_SIM_ROOT}/sim/include"
+            "${GGML_GEMMINI_GENERATED_CONFIG_DIR}" "${CMAKE_CURRENT_LIST_DIR}"
+            "${CMAKE_CURRENT_LIST_DIR}/../../include" "${CMAKE_CURRENT_LIST_DIR}/.."
+            "${CMAKE_CURRENT_LIST_DIR}/../ggml-gemmini-utils/include" "${GEMMINI_SW_PATH}")
+        target_link_libraries(ggml-gemmini-im2p-frontend-testing PRIVATE ggml-gemmini-utils Threads::Threads)
+        set(_IM2P_FRONTEND_TARGET ggml-gemmini-im2p-frontend-testing)
+    endif()
+    target_include_directories(ggml-gemmini PRIVATE
+        "${IM2P_SIM_ROOT}/frontend/include"
+        "${IM2P_SIM_ROOT}/sim/include")
+    # Static-library order is intentional: the frontend consumes the C ABI from
+    # the simulator archive, and neither archive is present in HARDWARE builds.
+    target_link_libraries(ggml-gemmini PRIVATE
+        ${_IM2P_FRONTEND_TARGET}
+        ggml-gemmini-im2p-simulator
+        Threads::Threads
+        ${CMAKE_DL_LIBS})
 endif()
 
 if (GGML_GEMMINI_ENABLE_OPENMP)
-  find_package(OpenMP)
-  if (OpenMP_FOUND)
-    set(CMAKE_REQUIRED_FLAGS "${OpenMP_CXX_FLAGS}")
-    set(CMAKE_REQUIRED_LIBRARIES OpenMP::OpenMP_CXX)
-    check_cxx_source_compiles("#include <omp.h>
+    find_package(OpenMP)
+    if (OpenMP_FOUND)
+        set(CMAKE_REQUIRED_FLAGS "${OpenMP_CXX_FLAGS}")
+        set(CMAKE_REQUIRED_LIBRARIES OpenMP::OpenMP_CXX)
+        check_cxx_source_compiles("#include <omp.h>
 int main() {
   int storage[8] = {0};
   int * token = storage;
@@ -373,14 +304,14 @@ int main() {
   }
   return token[2] == 2 ? 0 : 1;
 }" GGML_GEMMINI_OPENMP_TASK_DEPEND_COMPILES)
-    unset(CMAKE_REQUIRED_FLAGS)
-    unset(CMAKE_REQUIRED_LIBRARIES)
-    if (NOT GGML_GEMMINI_OPENMP_TASK_DEPEND_COMPILES)
-      message(FATAL_ERROR "GGML_GEMMINI_ENABLE_OPENMP requires OpenMP task depend support")
+        unset(CMAKE_REQUIRED_FLAGS)
+        unset(CMAKE_REQUIRED_LIBRARIES)
+        if (NOT GGML_GEMMINI_OPENMP_TASK_DEPEND_COMPILES)
+            message(FATAL_ERROR "GGML_GEMMINI_ENABLE_OPENMP requires OpenMP task depend support")
+        endif()
+        target_link_libraries(ggml-gemmini PRIVATE OpenMP::OpenMP_CXX)
+        target_compile_definitions(ggml-gemmini PRIVATE GGML_GEMMINI_HAS_OPENMP)
+    else()
+        message(FATAL_ERROR "GGML_GEMMINI_ENABLE_OPENMP=ON but OpenMP was not found; ExSIA OpenMP pipeline is BLOCKED")
     endif()
-    target_link_libraries(ggml-gemmini PRIVATE OpenMP::OpenMP_CXX)
-    target_compile_definitions(ggml-gemmini PRIVATE GGML_GEMMINI_HAS_OPENMP)
-  else()
-    message(FATAL_ERROR "GGML_GEMMINI_ENABLE_OPENMP=ON but OpenMP was not found; ExSIA OpenMP pipeline is BLOCKED")
-  endif()
 endif()

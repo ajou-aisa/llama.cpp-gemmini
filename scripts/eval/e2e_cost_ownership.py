@@ -110,7 +110,7 @@ def wait(stage_id: str, name: str, location: str, source_file: str,
 
 def stages() -> list[Record]:
     rows: list[Record] = [
-        stage("weight.model_load", "one-time GGUF model load and Q8_H1/HP1 native weight binding",
+        stage("weight.model_load", "one-time GGUF model load and Q8_0/HP1 native weight binding",
               "llama.cpp-gemmini", "ggml/src/ggml-gemmini/ggml-gemmini.cpp:weight buffer preparation",
               "EXCLUDED_WITH_REASON", "none", "outside traced RUN; no per-inference stage declared",
               "not_applicable", False, "ONE_TIME_SETUP", "before REQUEST_START",

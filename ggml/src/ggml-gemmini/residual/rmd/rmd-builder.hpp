@@ -9,51 +9,59 @@ namespace ggml::gemmini::rmd {
 // Packet builder for unordered residual input and A16. ExSIA A4/A8 uses
 // RmdBitmapBuilder with its ordered selection metadata.
 class RmdStripeBuilder {
-public:
+  public:
     RmdStripeBuilder() = default;
 
-    void reset(size_t stripe_id, size_t row_begin, size_t row_count,
-               size_t logical_k, size_t logical_j);
-    void reset(size_t stripe_id, size_t row_begin, size_t row_count,
-               size_t logical_k, size_t logical_j, uint8_t digit_bits);
+    void
+    reset(size_t stripe_id, size_t row_begin, size_t row_count, size_t logical_k, size_t logical_j);
+    void reset(size_t  stripe_id,
+               size_t  row_begin,
+               size_t  row_count,
+               size_t  logical_k,
+               size_t  logical_j,
+               uint8_t digit_bits);
 
     bool add_residual(size_t local_row, size_t original_k, int32_t residual);
 
-    bool empty() const { return entries_.empty(); }
-    RmdStatus status() const { return status_; }
+    bool empty() const {
+        return entries_.empty();
+    }
+    RmdStatus status() const {
+        return status_;
+    }
 
     // Returns nullptr when the stripe carries no residual or the builder failed.
     StripePacketHandle finish();
 
-private:
+  private:
     struct DigitEntry {
         uint32_t block_id;
         uint32_t local_row;
         uint16_t block_local_k;
-        uint8_t lane;
-        int32_t digit;
+        uint8_t  lane;
+        int32_t  digit;
     };
 
     struct BlockAccum {
         static_assert(kBlockSize <= 32, "block-local K mask must fit uint32_t");
-        uint32_t k_mask = 0;
+        uint32_t                                   k_mask = 0;
         std::array<uint32_t, kMaxNativeRadixLanes> lane_k_masks{};
-        uint16_t lane_mask = 0;
+        uint16_t                                   lane_mask = 0;
         std::vector<uint16_t> row_lane_masks; // original row -> nonzero limb bits
     };
 
-    RmdStatus status_ = RmdStatus::success;
-    size_t stripe_id_ = 0;
-    size_t row_begin_ = 0;
-    size_t row_count_ = 0;
-    size_t logical_k_ = 0;
-    size_t logical_j_ = 0;
-    uint8_t digit_bits_ = 8;
-    size_t residual_event_count_ = 0;
-    int32_t residual_min_ = 0;
-    int32_t residual_max_ = 0;
-    uint8_t required_planes_ = 0;
-    std::vector<DigitEntry> entries_;
+    RmdStatus                      status_               = RmdStatus::success;
+    size_t                         stripe_id_            = 0;
+    size_t                         row_begin_            = 0;
+    size_t                         row_count_            = 0;
+    size_t                         logical_k_            = 0;
+    size_t                         logical_j_            = 0;
+    uint8_t                        digit_bits_           = 8;
+    size_t                         residual_event_count_ = 0;
+    int32_t                        residual_min_         = 0;
+    int32_t                        residual_max_         = 0;
+    uint8_t                        required_planes_      = 0;
+    std::vector<DigitEntry>        entries_;
     std::map<uint32_t, BlockAccum> blocks_;
 };
 
@@ -62,20 +70,20 @@ private:
 RmdStatus validate_packet(const StripePacket & packet);
 
 // Reads one decoded signed digit. On failure, `digit` is unchanged.
-RmdStatus read_packet_digit(const StripePacket & packet,
+RmdStatus read_packet_digit(const StripePacket &    packet,
                             const BlockDescriptor & block,
-                            uint8_t lane_position,
-                            size_t row,
-                            size_t k,
-                            int32_t & digit);
+                            uint8_t                 lane_position,
+                            size_t                  row,
+                            size_t                  k,
+                            int32_t &               digit);
 
 // Rebuilds a packet restricted to [row_begin, row_end) out of one or more packets that
 // may use a different stripe granularity. Used by the sequential stripe mode, where the
 // matmul row slicing does not have to match the ExSIA stripe slicing.
 StripePacketHandle slice_packets(const std::vector<StripePacketHandle> & packets,
-                                 size_t row_begin,
-                                 size_t row_end,
-                                 size_t stripe_id,
-                                 RmdStatus & status);
+                                 size_t                                  row_begin,
+                                 size_t                                  row_end,
+                                 size_t                                  stripe_id,
+                                 RmdStatus &                             status);
 
-}
+} // namespace ggml::gemmini::rmd

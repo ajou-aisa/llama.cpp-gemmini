@@ -7,9 +7,9 @@ struct ggml_gemmini_args_t;
 namespace ggml::gemmini::rmd {
 
 struct ReferenceResidual {
-  uint32_t local_row;
-  uint32_t k; // original K
-  int32_t residual;
+    uint32_t local_row;
+    uint32_t k; // original K
+    int32_t  residual;
 };
 
 // Independent HP1 numerical oracle over validated packet grouping/order. It
@@ -23,16 +23,16 @@ RmdStatus reference_hp1_packet_correction(const ggml_gemmini_args_t &,
 // Direct wide residual matmul in the block-scaled INT64 domain, without any
 // radix decomposition. It intentionally remains separate from HP1 NPU
 // semantics.
-RmdStatus
-reference_direct_correction(const ggml_gemmini_args_t &args, size_t row_count,
-                            const std::vector<ReferenceResidual> &residuals,
-                            std::vector<OutputValue> &correction);
+RmdStatus reference_direct_correction(const ggml_gemmini_args_t &            args,
+                                      size_t                                 row_count,
+                                      const std::vector<ReferenceResidual> & residuals,
+                                      std::vector<OutputValue> &             correction);
 
 // HP1 A4/A8 uses the hardware-equivalent fragment oracle. Other explicit
 // reference routes retain their historical decomposition-only semantics.
-RmdStatus
-reference_rmd_correction(const ggml_gemmini_args_t &args, size_t row_count,
-                         const std::vector<ReferenceResidual> &residuals,
-                         std::vector<OutputValue> &correction);
+RmdStatus reference_rmd_correction(const ggml_gemmini_args_t &            args,
+                                   size_t                                 row_count,
+                                   const std::vector<ReferenceResidual> & residuals,
+                                   std::vector<OutputValue> &             correction);
 
 } // namespace ggml::gemmini::rmd
