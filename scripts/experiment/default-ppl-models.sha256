@@ -1,0 +1,8 @@
+63172a928875d3e4b0ba43adfdd3535e1b8af0d2af805ec577c316e024bcbd9a  models/default/gpt2.Q4_0.gguf
+184e01e203452c97fb676c752998cce7842cfa1cdd32a22e09a40a73d0e3586f  models/default/gpt2.Q4_HP1.gguf
+e4a8c240a456a40ca54499a4c36a049792de598c29da3252cead613b11f8195e  models/default/gpt2.Q8_0.gguf
+cf23a45e4db23736d7d1f67ab42018803a198cfcb01db36daca69ff56bdbc7d4  models/default/gpt2.Q8_HP1.gguf
+91af22b54e6ecb6079c45bca9431affaea1dcccb7b7168f91384d565249c813c  models/default/llama3.2-1B.Q4_0.gguf
+a81449177a5e59ff0d2cec732d4d7990ef4a3faaedee61d55e35970266be9d35  models/default/llama3.2-1B.Q4_HP1.gguf
+5a55aa0c60466661e26ad461b766ff923bde212ec4f5f8838765e1e8fbbb640f  models/default/llama3.2-1B.Q8_0.gguf
+283846f41922078ad91825b271e110592cfc6dbc649219e79d96460c90e56fe7  models/default/llama3.2-1B.Q8_HP1.gguf
