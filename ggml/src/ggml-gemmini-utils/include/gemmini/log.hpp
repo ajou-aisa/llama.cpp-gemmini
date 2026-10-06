@@ -44,7 +44,12 @@
 #include <string_view>
 #include <vector>
 
-namespace ggml::gemmini::performance { struct Measurement; }
+namespace ggml::gemmini::performance {
+struct Measurement;
+}
+namespace ggml::gemmini::log {
+struct ProfileRows;
+}
 
 #ifndef LOG_DEBUG
 #define LOG_DEBUG 0
@@ -59,290 +64,307 @@ namespace ggml::gemmini::performance { struct Measurement; }
 #define LOG_DETAIL CYCLE_DETAIL
 #endif
 
-namespace ggml::gemmini::log
-{
-    struct LogTarget
-    {
-        const char *path;
-    };
+namespace ggml::gemmini::log {
+struct LogTarget {
+    const char * path;
+};
 
-    LogTarget file(const char *path);
+LogTarget file(const char * path);
 
-    // Resolves null/empty or traversing relative paths to empty, preserves absolute paths,
-    // and confines every accepted relative path below GEMMINI_LOG_DIR or CWD/output/log.
-    std::filesystem::path resolve_output_path(const char *path);
-    bool prepare_output_parent(const std::filesystem::path &path);
+// Resolves null/empty or traversing relative paths to empty, preserves absolute paths,
+// and confines every accepted relative path below GEMMINI_LOG_DIR or CWD/output/log.
+std::filesystem::path resolve_output_path(const char * path);
+bool                  prepare_output_parent(const std::filesystem::path & path);
 
-    bool truncate_file(const char *path);
+bool truncate_file(const char * path);
 
-    struct DefaultOutputSetupResult
-    {
-        bool debug;
-        bool cycle;
-    };
+struct DefaultOutputSetupResult {
+    bool debug;
+    bool cycle;
+};
 
-    DefaultOutputSetupResult setup_default_outputs();
+DefaultOutputSetupResult setup_default_outputs();
 
-    class Log
-    {
-    public:
-        explicit Log(FILE *out = stderr);
-        Log(const Log &) = delete;
-        Log &operator=(const Log &) = delete;
-        virtual ~Log();
+class Log {
+  public:
+    explicit Log(FILE * out = stderr);
+    Log(const Log &)             = delete;
+    Log & operator=(const Log &) = delete;
+    virtual ~Log();
 
-        void set_output(FILE *out);
+    void set_output(FILE * out);
 
-        bool set_output_path(const char *path);
+    bool set_output_path(const char * path);
 
-        bool has_explicit_output() const;
+    bool has_explicit_output() const;
 
-    protected:
-        void set_output_unlocked(FILE *out);
-        bool set_output_path_unlocked(const char *path, bool truncate, const char **failure = nullptr);
-        FILE *select_output_unlocked(const char *path, bool *owns) const;
-        void close_owned_unlocked();
-        void disable_output_unlocked();
-        bool owns_output_unlocked() const { return owns_; }
-
-        FILE *out_;
-
-    private:
-        bool owns_;
-        bool has_explicit_output_ = false;
-    };
-
-    struct CycleRecord
-    {
-        const char *layer = nullptr;
-        const char *op = nullptr;
-        uint64_t start = 0;
-        uint64_t end = 0;
-        const char *file = nullptr;
-        int line = 0;
-        const char *func = nullptr;
-        const char *source = nullptr;
-        const char *unit = nullptr;
-        uint32_t identity_mask = 0;
-        uint64_t run_id = 0;
-        uint64_t stripe_id = 0;
-        uint64_t slot = 0;
-        uint64_t node_id = 0;
-        uint64_t worker_id = 0;
-        uint64_t ns_start = 0;
-        uint64_t ns_end = 0;
-        uint64_t tid_start = 0;
-        uint64_t tid_end = 0;
-        bool host_timing_valid = false;
-        const char *cpu_service_exclusion = nullptr;
-        cycle::TimingIntervalClass timing_interval_class = cycle::TimingIntervalClass::diagnostic;
-        CpuCorrelation correlation{};
-    };
-
-    struct WsCycleRecord
-    {
-        uint64_t containing_interval_cycles = 0;
-        uint32_t load_occupancy_cycles = 0;
-        uint32_t execute_occupancy_cycles = 0;
-        uint32_t store_occupancy_cycles = 0;
-        uint32_t loop_occupancy_cycles = 0;
-        uint64_t problem_i = 0;
-        uint64_t problem_j = 0;
-        uint64_t problem_k = 0;
-        uint64_t tile_i = 0;
-        uint64_t tile_j = 0;
-        uint64_t tile_k = 0;
-        uint64_t gemmini_outer_i = 0;
-        uint64_t gemmini_outer_j = 0;
-        uint64_t gemmini_outer_k = 0;
-        uint64_t ws_inner_calls = 0;
-        gemmini_cycle_record_v2 identity{};
-        const char *domain = "gemmini_hw_unknown";
-        const char *containing_interval_source = nullptr;
-    };
-
-    class ScopedWsCycleIdentity
-    {
-    public:
-        ScopedWsCycleIdentity(gemmini_cycle_record_v2 identity, const char *domain) noexcept;
-        ~ScopedWsCycleIdentity() noexcept;
-        ScopedWsCycleIdentity(const ScopedWsCycleIdentity &) = delete;
-        ScopedWsCycleIdentity &operator=(const ScopedWsCycleIdentity &) = delete;
-
-        const gemmini_cycle_record_v2 identity;
-        const char *const domain;
-
-    private:
-        const ScopedWsCycleIdentity *previous_;
-    };
-
-    std::string serialize_cycle_record(const CycleRecord &record);
-    std::string serialize_checked_cycle_record(const CycleRecord &record, bool valid,
-                                               const char *reason,
-                                               const char *sample_reason = nullptr);
-    std::string serialize_ws_cycle_record(const WsCycleRecord &record);
-    std::string serialize_cpu_service_metadata(const char *operation,
-        const char *exclusion = nullptr, CpuCorrelation correlation = current_cpu_correlation(),
-        cycle::TimingIntervalClass interval_class = cycle::TimingIntervalClass::diagnostic);
-
-    struct CycleWriteTiming
-    {
-        uint64_t calls = 0;
-        uint64_t mutex_wait_ns = 0;
-        uint64_t io_ns = 0;
-        bool valid = true;
-    };
-
-    // Measures emit attempts in the innermost scope; missing or failed output is invalid.
-    class ScopedCycleWriteTiming
-    {
-    public:
-        explicit ScopedCycleWriteTiming(CycleWriteTiming &timing) noexcept;
-        ~ScopedCycleWriteTiming() noexcept;
-        ScopedCycleWriteTiming(const ScopedCycleWriteTiming &) = delete;
-        ScopedCycleWriteTiming &operator=(const ScopedCycleWriteTiming &) = delete;
-
-    private:
-        CycleWriteTiming &timing_;
-        CycleWriteTiming *previous_;
-        uint64_t initial_calls_;
-        int initial_exceptions_;
-    };
-
-    class DebugLog : public Log
-    {
-    public:
-        explicit DebugLog(FILE *out = stderr);
-        bool set_output_path(const char *path, bool truncate = false);
-
-        void operator()(const char *fmt, ...);
-        void operator()(const char *file, int line, const char *func, const char *fmt, ...);
-        void operator()(LogTarget target, const char *fmt, ...);
-        void operator()(LogTarget target, const char *file, int line, const char *func, const char *fmt, ...);
-        void operator()(const char *layer, const char *fmt, ...);
-        void operator()(LogTarget target, const char *layer, const char *fmt, ...);
-
-        void v(const char *fmt, va_list ap);
-        void v_layer(const char *layer, const char *fmt, va_list ap);
-        void v_loc(const char *file, int line, const char *func, const char *fmt, va_list ap);
-        void v_target(LogTarget target, const char *fmt, va_list ap);
-        void v_target_layer(LogTarget target, const char *layer, const char *fmt, va_list ap);
-        void v_target_loc(LogTarget target, const char *file, int line, const char *func,
-                          const char *fmt, va_list ap);
-
-    private:
-        void vwrite(FILE *out, const char *file, int line, const char *func, const char *fmt, va_list ap);
-        void vwrite_layer_fmt(FILE *out, const char *file, int line, const char *func, const char *layer, const char *fmt, va_list ap);
-    };
-
-    class HardwareCounterLease
-    {
-    public:
-        HardwareCounterLease();
-        ~HardwareCounterLease();
-        HardwareCounterLease(const HardwareCounterLease &) = delete;
-        HardwareCounterLease &operator=(const HardwareCounterLease &) = delete;
-    };
-
-    class CycleLog : public Log
-    {
-    public:
-        explicit CycleLog(FILE *out = stderr) : Log(out) {}
-        ~CycleLog() override;
-        void set_output(FILE *out);
-        bool set_output_path(const char *path, bool truncate = false);
-        // Opt in to bounded worker buffers for owned regular files.
-        void set_buffered(bool buffered);
-        // Drain worker-local queues into the stdio stream without forcing fflush().
-        bool drain();
-        // Drain pending records and flush the stdio stream to the backing file.
-        bool flush();
-        bool healthy() const;
-        std::filesystem::path output_path() const;
-
-        void write(const CycleRecord &record);
-        void write_json(std::string_view json_record);
-        void write_cpu(const gemmini_cycle_record_v2 &identity,
-                       const gemmini_cpu_sample &start, const gemmini_cpu_sample &end,
-                       std::optional<bool> operation_success = {}, bool raw_segment = false,
-                       bool structural_envelope = false,
-                       cycle::TimingIntervalClass interval_class = cycle::TimingIntervalClass::per_worker_cpu_work);
-        void write_measurement(const performance::Measurement &measurement);
-        void report_failure(const char * operation) noexcept;
-
-        void operator()(const char *layer, const char *op,
-                        uint64_t start, uint64_t end);
-        void operator()(const char *file, int line, const char *func, const char *layer, const char *op,
-                        uint64_t start, uint64_t end);
-        void operator()(LogTarget target, const char *layer, const char *op,
-                        uint64_t start, uint64_t end);
-        void operator()(LogTarget target, const char *file, int line, const char *func, const char *layer, const char *op,
-                        uint64_t start, uint64_t end);
-
-        void cycle(const char *layer, const char *op,
-                   uint64_t start, uint64_t end);
-
-    private:
-        struct Entry;
-        struct WorkerBuffer;
-        void submit(Entry entry, const char *path = nullptr);
-        bool enqueue(Entry &entry);
-        void emit(const char *path, const std::string &json);
-        bool emit_unlocked(const char *path, const std::string &json, CycleWriteTiming *timing = nullptr);
-        bool drain_worker_unlocked(WorkerBuffer &worker);
-        bool drain_unlocked();
-        void update_queue_enabled_unlocked();
-        bool flush_unlocked();
-        void warn_once_unlocked(const char *operation);
-
-        bool buffered_ = false;
-        bool regular_output_ = false;
-        bool disabled_ = false;
-        bool warned_ = false;
-        bool lost_records_ = false;
-        std::atomic<bool> queue_enabled_{false};
-        std::filesystem::path output_path_;
-        std::vector<WorkerBuffer *> workers_;
-    };
-
-    namespace testing
-    {
-        enum class LogFault
-        {
-            none,
-            open,
-            write,
-            flush,
-            replacement,
-            allocation,
-            filesystem,
-            format,
-            mutex,
-        };
-
-        enum class TargetWriteKind
-        {
-            plain,
-            layer,
-            location,
-        };
-
-        using TargetLockHook = void (*)(TargetWriteKind kind, void *user_data);
-        void set_target_lock_hook(TargetLockHook hook, void *user_data);
-        void clear_target_lock_hook();
-        void set_log_fault(LogFault fault);
-        void clear_log_fault();
-        std::string serialize_linux_aarch64_scalar_cycle_record_for_test(const CycleRecord & record);
+  protected:
+    void set_output_unlocked(FILE * out);
+    bool
+    set_output_path_unlocked(const char * path, bool truncate, const char ** failure = nullptr);
+    FILE * select_output_unlocked(const char * path, bool * owns) const;
+    void   close_owned_unlocked();
+    void   disable_output_unlocked();
+    bool   owns_output_unlocked() const {
+        return owns_;
     }
 
-    namespace detail
-    {
-        std::mutex &output_mutex();
-        bool consume_fault(testing::LogFault expected);
-        void invoke_target_lock_hook(testing::TargetWriteKind kind);
-    }
+    FILE * out_;
 
-    extern DebugLog debug;
-    extern CycleLog cycle;
+  private:
+    bool owns_;
+    bool has_explicit_output_ = false;
+};
+
+struct CycleRecord {
+    const char *               layer                 = nullptr;
+    const char *               op                    = nullptr;
+    uint64_t                   start                 = 0;
+    uint64_t                   end                   = 0;
+    const char *               file                  = nullptr;
+    int                        line                  = 0;
+    const char *               func                  = nullptr;
+    const char *               source                = nullptr;
+    const char *               unit                  = nullptr;
+    uint32_t                   identity_mask         = 0;
+    uint64_t                   run_id                = 0;
+    uint64_t                   stripe_id             = 0;
+    uint64_t                   slot                  = 0;
+    uint64_t                   node_id               = 0;
+    uint64_t                   worker_id             = 0;
+    uint64_t                   ns_start              = 0;
+    uint64_t                   ns_end                = 0;
+    uint64_t                   tid_start             = 0;
+    uint64_t                   tid_end               = 0;
+    bool                       host_timing_valid     = false;
+    const char *               cpu_service_exclusion = nullptr;
+    cycle::TimingIntervalClass timing_interval_class = cycle::TimingIntervalClass::diagnostic;
+    CpuCorrelation             correlation{};
+};
+
+struct WsCycleRecord {
+    uint64_t                containing_interval_cycles = 0;
+    uint32_t                load_occupancy_cycles      = 0;
+    uint32_t                execute_occupancy_cycles   = 0;
+    uint32_t                store_occupancy_cycles     = 0;
+    uint32_t                loop_occupancy_cycles      = 0;
+    uint64_t                problem_i                  = 0;
+    uint64_t                problem_j                  = 0;
+    uint64_t                problem_k                  = 0;
+    uint64_t                tile_i                     = 0;
+    uint64_t                tile_j                     = 0;
+    uint64_t                tile_k                     = 0;
+    uint64_t                gemmini_outer_i            = 0;
+    uint64_t                gemmini_outer_j            = 0;
+    uint64_t                gemmini_outer_k            = 0;
+    uint64_t                ws_inner_calls             = 0;
+    gemmini_cycle_record_v2 identity{};
+    const char *            domain                     = "gemmini_hw_unknown";
+    const char *            containing_interval_source = nullptr;
+};
+
+class ScopedWsCycleIdentity {
+  public:
+    ScopedWsCycleIdentity(gemmini_cycle_record_v2 identity, const char * domain) noexcept;
+    ~ScopedWsCycleIdentity() noexcept;
+    ScopedWsCycleIdentity(const ScopedWsCycleIdentity &)             = delete;
+    ScopedWsCycleIdentity & operator=(const ScopedWsCycleIdentity &) = delete;
+
+    const gemmini_cycle_record_v2 identity;
+    const char * const            domain;
+
+  private:
+    const ScopedWsCycleIdentity * previous_;
+};
+
+std::string serialize_cycle_record(const CycleRecord & record);
+std::string serialize_checked_cycle_record(const CycleRecord & record,
+                                           bool                valid,
+                                           const char *        reason,
+                                           const char *        sample_reason = nullptr);
+std::string serialize_ws_cycle_record(const WsCycleRecord & record);
+std::string serialize_cpu_service_metadata(
+    const char *               operation,
+    const char *               exclusion      = nullptr,
+    CpuCorrelation             correlation    = current_cpu_correlation(),
+    cycle::TimingIntervalClass interval_class = cycle::TimingIntervalClass::diagnostic);
+
+struct CycleWriteTiming {
+    uint64_t calls         = 0;
+    uint64_t mutex_wait_ns = 0;
+    uint64_t io_ns         = 0;
+    bool     valid         = true;
+};
+
+// Measures emit attempts in the innermost scope; missing or failed output is invalid.
+class ScopedCycleWriteTiming {
+  public:
+    explicit ScopedCycleWriteTiming(CycleWriteTiming & timing) noexcept;
+    ~ScopedCycleWriteTiming() noexcept;
+    ScopedCycleWriteTiming(const ScopedCycleWriteTiming &)             = delete;
+    ScopedCycleWriteTiming & operator=(const ScopedCycleWriteTiming &) = delete;
+
+  private:
+    CycleWriteTiming & timing_;
+    CycleWriteTiming * previous_;
+    uint64_t           initial_calls_;
+    int                initial_exceptions_;
+};
+
+class DebugLog : public Log {
+  public:
+    explicit DebugLog(FILE * out = stderr);
+    bool set_output_path(const char * path, bool truncate = false);
+
+    void operator()(const char * fmt, ...);
+    void operator()(const char * file, int line, const char * func, const char * fmt, ...);
+    void operator()(LogTarget target, const char * fmt, ...);
+    void operator()(
+        LogTarget target, const char * file, int line, const char * func, const char * fmt, ...);
+    void operator()(const char * layer, const char * fmt, ...);
+    void operator()(LogTarget target, const char * layer, const char * fmt, ...);
+
+    void v(const char * fmt, va_list ap);
+    void v_layer(const char * layer, const char * fmt, va_list ap);
+    void v_loc(const char * file, int line, const char * func, const char * fmt, va_list ap);
+    void v_target(LogTarget target, const char * fmt, va_list ap);
+    void v_target_layer(LogTarget target, const char * layer, const char * fmt, va_list ap);
+    void v_target_loc(LogTarget    target,
+                      const char * file,
+                      int          line,
+                      const char * func,
+                      const char * fmt,
+                      va_list      ap);
+
+  private:
+    void vwrite(
+        FILE * out, const char * file, int line, const char * func, const char * fmt, va_list ap);
+    void vwrite_layer_fmt(FILE *       out,
+                          const char * file,
+                          int          line,
+                          const char * func,
+                          const char * layer,
+                          const char * fmt,
+                          va_list      ap);
+};
+
+class HardwareCounterLease {
+  public:
+    HardwareCounterLease();
+    ~HardwareCounterLease();
+    HardwareCounterLease(const HardwareCounterLease &)             = delete;
+    HardwareCounterLease & operator=(const HardwareCounterLease &) = delete;
+};
+
+class CycleLog : public Log {
+  public:
+    explicit CycleLog(FILE * out = stderr) : Log(out) {}
+    ~CycleLog() override;
+    void set_output(FILE * out);
+    bool set_output_path(const char * path, bool truncate = false);
+    // Opt in to bounded worker buffers for owned regular files.
+    void set_buffered(bool buffered);
+    // Drain worker-local queues into the stdio stream without forcing fflush().
+    bool drain();
+    // Drain pending records and flush the stdio stream to the backing file.
+    bool                  flush();
+    bool                  healthy() const;
+    std::filesystem::path output_path() const;
+
+    void write(const CycleRecord & record);
+    void write_json(std::string_view json_record);
+    void write_decorated(std::string_view json_record);
+    void write_profile(ProfileRows records, gemmini_trace_context origin);
+    void write_cpu(const gemmini_cycle_record_v2 & identity,
+                   const gemmini_cpu_sample &      start,
+                   const gemmini_cpu_sample &      end,
+                   std::optional<bool>             operation_success   = {},
+                   bool                            raw_segment         = false,
+                   bool                            structural_envelope = false,
+                   cycle::TimingIntervalClass      interval_class =
+                       cycle::TimingIntervalClass::per_worker_cpu_work);
+    void write_measurement(const performance::Measurement & measurement);
+    void report_failure(const char * operation) noexcept;
+
+    void operator()(const char * layer, const char * op, uint64_t start, uint64_t end);
+    void operator()(const char * file,
+                    int          line,
+                    const char * func,
+                    const char * layer,
+                    const char * op,
+                    uint64_t     start,
+                    uint64_t     end);
+    void
+    operator()(LogTarget target, const char * layer, const char * op, uint64_t start, uint64_t end);
+    void operator()(LogTarget    target,
+                    const char * file,
+                    int          line,
+                    const char * func,
+                    const char * layer,
+                    const char * op,
+                    uint64_t     start,
+                    uint64_t     end);
+
+    void cycle(const char * layer, const char * op, uint64_t start, uint64_t end);
+
+  private:
+    struct Entry;
+    struct WorkerBuffer;
+    void submit(Entry entry, const char * path = nullptr);
+    bool enqueue(Entry & entry);
+    void emit(const char * path, const std::string & json);
+    bool
+    emit_unlocked(const char * path, const std::string & json, CycleWriteTiming * timing = nullptr);
+    bool drain_worker_unlocked(WorkerBuffer & worker);
+    bool drain_unlocked();
+    void update_queue_enabled_unlocked();
+    bool flush_unlocked();
+    void warn_once_unlocked(const char * operation);
+
+    bool                        buffered_       = false;
+    bool                        regular_output_ = false;
+    bool                        disabled_       = false;
+    bool                        warned_         = false;
+    bool                        lost_records_   = false;
+    std::atomic<bool>           queue_enabled_{false};
+    std::filesystem::path       output_path_;
+    std::vector<WorkerBuffer *> workers_;
+};
+
+namespace testing {
+enum class LogFault {
+    none,
+    open,
+    write,
+    flush,
+    replacement,
+    allocation,
+    filesystem,
+    format,
+    mutex,
+};
+
+enum class TargetWriteKind {
+    plain,
+    layer,
+    location,
+};
+
+using TargetLockHook = void (*)(TargetWriteKind kind, void * user_data);
+void        set_target_lock_hook(TargetLockHook hook, void * user_data);
+void        clear_target_lock_hook();
+void        set_log_fault(LogFault fault);
+void        clear_log_fault();
+std::string serialize_linux_aarch64_scalar_cycle_record_for_test(const CycleRecord & record);
+} // namespace testing
+
+namespace detail {
+std::mutex & output_mutex();
+bool         consume_fault(testing::LogFault expected);
+void         invoke_target_lock_hook(testing::TargetWriteKind kind);
+} // namespace detail
+
+extern DebugLog debug;
+extern CycleLog cycle;
 
 } // namespace ggml::gemmini::log

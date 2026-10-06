@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +26,34 @@ using namespace ggml::gemmini;
 
 static_assert(std::is_same_v<decltype(ggml_gemmini_args_t::matmul_layer), std::string>,
               "matmul_layer must be owned string storage");
+static_assert(std::is_same_v<MatmulOptions, MatmulOptionOverrides>);
+static_assert(!std::is_aggregate_v<ResolvedMatmulOptions>);
+static_assert(
+    std::is_same_v<decltype(prepare_execution(std::declval<const ggml_gemmini_args_t &>())),
+                   MatmulExecution>);
+static_assert(std::is_same_v<decltype(prepare_execution(std::declval<ggml_gemmini_args_t *>())),
+                             MatmulExecution>);
+static_assert(std::is_same_v<decltype(prepare_execution(std::declval<const ggml_gemmini_args_t &>(),
+                                                        std::declval<ResolvedMatmulOptions>())),
+                             MatmulExecution>);
+static_assert(std::is_same_v<decltype(prepare_execution(std::declval<ggml_gemmini_args_t *>(),
+                                                        std::declval<MatmulOptionOverrides>())),
+                             MatmulExecution>);
+static_assert(
+    std::is_same_v<decltype(prepare_execution(std::declval<ggml_gemmini_args_t &>(),
+                                              std::declval<const ResolvedMatmulOptions &>(),
+                                              std::declval<MatmulExecution &>())),
+                   MatmulStatus>);
+static_assert(
+    std::is_same_v<decltype(prepare_execution(std::declval<ggml_gemmini_args_t &>(),
+                                              std::declval<const MatmulOptionOverrides &>(),
+                                              std::declval<MatmulExecution &>())),
+                   MatmulStatus>);
+static_assert(
+    std::is_same_v<decltype(matmul(std::declval<ggml_gemmini_args_t &>())), MatmulStatus>);
+static_assert(std::is_same_v<decltype(matmul(std::declval<const ggml_gemmini_args_t &>(),
+                                             std::declval<ResolvedMatmulOptions>())),
+                             MatmulStatus>);
 
 bool check(bool condition, const char * message) {
     if (!condition) {
@@ -33,23 +62,27 @@ bool check(bool condition, const char * message) {
     return condition;
 }
 
+#if defined(GGML_GEMMINI_OPTIONS_TEST_BACKEND)
 struct SemanticLayerObservations {
-    std::array<size_t, 6> counts{};
+    std::array<size_t, 6>      counts{};
     std::array<std::string, 6> layers{};
 };
 
 int semantic_layer_mutation_site = -1;
 
 bool observe_semantic_layer(TestSemanticLayerSite site, const char * layer, void * user_data) {
-    auto & observations = *static_cast<SemanticLayerObservations *>(user_data);
-    const size_t index = static_cast<size_t>(site);
+    auto &       observations = *static_cast<SemanticLayerObservations *>(user_data);
+    const size_t index        = static_cast<size_t>(site);
     if (index < observations.counts.size()) {
         ++observations.counts[index];
         observations.layers[index] = semantic_layer_mutation_site == static_cast<int>(index)
-            ? "wrong.constant" : (layer != nullptr ? layer : "");
+                                         ? "wrong.constant"
+                                         : (layer != nullptr ? layer : "");
     }
     return site != TestSemanticLayerSite::fp_facade;
 }
+
+#endif
 
 void clear_environment() {
     unsetenv("GEMMINI_MATMUL_MODE");
@@ -57,38 +90,39 @@ void clear_environment() {
     unsetenv("GEMMINI_RMD_BACKEND");
 }
 
+#if defined(GGML_GEMMINI_OPTIONS_TEST_BACKEND)
 bool test_owned_matmul_layer_lifetime() {
-    const std::string expected = "blk.15.mlp.down_proj.semantic-layer-owned-beyond-sso";
+    const std::string   expected = "blk.15.mlp.down_proj.semantic-layer-owned-beyond-sso";
     ggml_gemmini_args_t copied;
     ggml_gemmini_args_t moved;
     {
         ggml_gemmini_args_t source;
         {
             std::string semantic_layer = expected;
-            source.matmul_layer = semantic_layer;
+            source.matmul_layer        = semantic_layer;
         }
         copied = source;
-        moved = std::move(source);
+        moved  = std::move(source);
     }
 
-    const auto pipeline = ggml::gemmini::detail::pipeline_stripe_telemetry(
-        copied.matmul_layer.c_str(), {});
+    const auto pipeline =
+        ggml::gemmini::detail::pipeline_stripe_telemetry(copied.matmul_layer.c_str(), {});
     return check(copied.matmul_layer == expected,
                  "copied args own semantic layer after source destruction") &&
-        check(moved.matmul_layer == expected,
-              "moved args own semantic layer after source destruction") &&
-        check(pipeline.layer == expected,
-              "pipeline summary owns byte-identical semantic layer");
+           check(moved.matmul_layer == expected,
+                 "moved args own semantic layer after source destruction") &&
+           check(pipeline.layer == expected, "pipeline summary owns byte-identical semantic layer");
 }
 
 bool test_quantization_and_exsia_semantic_layer_seam() {
     ggml_gemmini_args_t args{};
     args.matmul_layer = "blk.15.mlp.down_proj";
-    int capture[2]{};
+    int       capture[2]{};
     const int saved_stderr = dup(STDERR_FILENO);
     if (!check(saved_stderr >= 0 && pipe(capture) == 0,
                "quantization semantic seam capture opens")) {
-        if (saved_stderr >= 0) close(saved_stderr);
+        if (saved_stderr >= 0)
+            close(saved_stderr);
         return false;
     }
     std::fflush(stderr);
@@ -98,21 +132,22 @@ bool test_quantization_and_exsia_semantic_layer_seam() {
     std::fflush(stderr);
     dup2(saved_stderr, STDERR_FILENO);
     close(saved_stderr);
-    char captured[2048]{};
+    char          captured[2048]{};
     const ssize_t count = read(capture[0], captured, sizeof(captured) - 1);
     close(capture[0]);
-    if (count > 0) captured[count] = '\0';
+    if (count > 0)
+        captured[count] = '\0';
 
     return check(!quantized, "malformed quantization input keeps failure behavior") &&
-        check(args.matmul_layer == "blk.15.mlp.down_proj",
-              "ExSIA keeps owned semantic layer unchanged") &&
-        check(std::strstr(captured, "\"layer\":\"blk.15.mlp.down_proj\"") != nullptr,
-              "quantization failure emits byte-identical semantic layer");
+           check(args.matmul_layer == "blk.15.mlp.down_proj",
+                 "ExSIA keeps owned semantic layer unchanged") &&
+           check(std::strstr(captured, "\"layer\":\"blk.15.mlp.down_proj\"") != nullptr,
+                 "quantization failure emits byte-identical semantic layer");
 }
 
 bool test_backend_semantic_resolution_and_dedupe() {
     ggml::gemmini::test_reset_unclassified_matmul_diagnostics();
-    constexpr size_t thread_count = 16;
+    constexpr size_t         thread_count = 16;
     std::vector<std::string> labels(thread_count);
     std::vector<std::thread> threads;
     threads.reserve(thread_count);
@@ -122,53 +157,63 @@ bool test_backend_semantic_resolution_and_dedupe() {
                 "unknown", "bad weight/", "input", "consumer");
         });
     }
-    for (std::thread & thread : threads) thread.join();
+    for (std::thread & thread : threads)
+        thread.join();
 
     bool ok = true;
     for (const std::string & label : labels) {
         ok = check(label == "unclassified.bad_weight_",
-                   "concurrent malformed setup keeps bounded fallback") && ok;
+                   "concurrent malformed setup keeps bounded fallback") &&
+             ok;
     }
     ok = check(ggml::gemmini::test_unclassified_matmul_diagnostic_count() == 1,
-               "concurrent duplicate fallback emits one diagnostic") && ok;
+               "concurrent duplicate fallback emits one diagnostic") &&
+         ok;
     const std::string canonical = ggml::gemmini::test_resolve_backend_matmul_layer(
         "llama", "blk.15.ffn_down.weight", "ffn", "consumer");
     ok = check(canonical == "blk.15.mlp.down_proj",
-               "backend setup resolves trusted semantic tuple once") && ok;
+               "backend setup resolves trusted semantic tuple once") &&
+         ok;
     ok = check(ggml::gemmini::test_unclassified_matmul_diagnostic_count() == 1,
-               "canonical setup emits no fallback diagnostic") && ok;
-    (void) ggml::gemmini::test_resolve_backend_matmul_layer(
+               "canonical setup emits no fallback diagnostic") &&
+         ok;
+    (void)ggml::gemmini::test_resolve_backend_matmul_layer(
         "unknown", "bad weight/", "input", "second-consumer");
     ok = check(ggml::gemmini::test_unclassified_matmul_diagnostic_count() == 2,
-               "different consumer emits one additional diagnostic") && ok;
+               "different consumer emits one additional diagnostic") &&
+         ok;
 
     ggml::gemmini::test_reset_unclassified_matmul_diagnostics();
     for (size_t index = 0; index < 96; ++index) {
-        (void) ggml::gemmini::test_resolve_backend_matmul_layer(
+        (void)ggml::gemmini::test_resolve_backend_matmul_layer(
             "unknown", "bad weight/" + std::to_string(index), "input", "consumer");
     }
     ok = check(ggml::gemmini::test_unclassified_matmul_diagnostic_count() == 96,
-                "every unique fallback tuple emits one diagnostic") && ok;
+               "every unique fallback tuple emits one diagnostic") &&
+         ok;
     for (size_t index = 0; index < 96; ++index) {
-        (void) ggml::gemmini::test_resolve_backend_matmul_layer(
+        (void)ggml::gemmini::test_resolve_backend_matmul_layer(
             "unknown", "bad weight/" + std::to_string(index), "input", "consumer");
     }
     ok = check(ggml::gemmini::test_unclassified_matmul_diagnostic_count() == 96,
-                "duplicate fallback tuples emit no second diagnostic") && ok;
+               "duplicate fallback tuples emit no second diagnostic") &&
+         ok;
     ggml::gemmini::test_reset_unclassified_matmul_diagnostics();
     return ok;
 }
 
+#endif
+
 bool test_args_layout_extension() {
     ggml_gemmini_args_t args;
-    const auto * base = reinterpret_cast<const uint8_t *>(&args);
-    const auto offset = [base](const auto * member) {
+    const auto *        base   = reinterpret_cast<const uint8_t *>(&args);
+    const auto          offset = [base](const auto * member) {
         return static_cast<size_t>(reinterpret_cast<const uint8_t *>(member) - base);
     };
     const auto follows = [&](const auto * previous, const auto * member) {
-        using Previous = std::remove_cv_t<std::remove_reference_t<decltype(*previous)>>;
-        using Member = std::remove_cv_t<std::remove_reference_t<decltype(*member)>>;
-        const size_t end = offset(previous) + sizeof(Previous);
+        using Previous         = std::remove_cv_t<std::remove_reference_t<decltype(*previous)>>;
+        using Member           = std::remove_cv_t<std::remove_reference_t<decltype(*member)>>;
+        const size_t end       = offset(previous) + sizeof(Previous);
         const size_t alignment = alignof(Member);
         return offset(member) == (end + alignment - 1) / alignment * alignment;
     };
@@ -179,21 +224,22 @@ bool test_args_layout_extension() {
     // by CMake's frontend-pair probe; this test checks the append-only tail here.
     return check(follows(&args.native_blocks_per_row, &args.native_weight_bytes),
                  "native weight extent immediately follows its block geometry") &&
-        check(follows(&args.f_out, &args.col_stride_f_out),
-              "column stride immediately follows the output buffer") &&
-        check(follows(&args.col_stride_f_out, &args.stride_f_out),
-              "row stride immediately follows column stride") &&
-        check(follows(&args.model_arch, &args.tile_I),
-              "tile geometry immediately follows model architecture") &&
-        check(offset(&args.matmul_layer) >= offset(&args.tile_K) + sizeof(args.tile_K),
-              "owned semantic layer remains after the existing transport fields") &&
-        check(sizeof(args) >= offset(&args.matmul_layer) + sizeof(args.matmul_layer),
-              "args contains the complete owned semantic layer");
+           check(follows(&args.f_out, &args.col_stride_f_out),
+                 "column stride immediately follows the output buffer") &&
+           check(follows(&args.col_stride_f_out, &args.stride_f_out),
+                 "row stride immediately follows column stride") &&
+           check(follows(&args.model_arch, &args.tile_I),
+                 "tile geometry immediately follows model architecture") &&
+           check(offset(&args.matmul_layer) >= offset(&args.tile_K) + sizeof(args.tile_K),
+                 "owned semantic layer remains after the existing transport fields") &&
+           check(sizeof(args) >= offset(&args.matmul_layer) + sizeof(args.matmul_layer),
+                 "args contains the complete owned semantic layer");
 }
 
+#if defined(GGML_GEMMINI_OPTIONS_TEST_BACKEND)
 ggml_gemmini_args_t make_args(std::vector<elem_t> & activation,
                               std::vector<elem_t> & weights,
-                              std::vector<float> & output) {
+                              std::vector<float> &  output) {
     ggml_gemmini_args_t args{};
     args.I = 3;
     args.J = 2;
@@ -202,30 +248,29 @@ ggml_gemmini_args_t make_args(std::vector<elem_t> & activation,
     for (size_t i = 0; i < args.I * args.K; ++i) {
         args.A.set(i / args.K, i % args.K, activation[i]);
     }
-    args.B = weights.data();
-    args.sA = args.K;
-    args.sB = args.J;
-    args.f_out = output.data();
-    args.col_stride_f_out = 1;
-    args.stride_f_out = args.J;
-    args.weight_i8_scale_active = true;
-    args.weight_scale = 1.0f;
-    args.tiled_matmul_type = CPU;
+    args.B                                                              = weights.data();
+    args.sA                                                             = args.K;
+    args.sB                                                             = args.J;
+    args.f_out                                                          = output.data();
+    args.col_stride_f_out                                               = 1;
+    args.stride_f_out                                                   = args.J;
+    args.weight_i8_scale_active                                         = true;
+    args.weight_scale                                                   = 1.0f;
+    args.tiled_matmul_type                                              = CPU;
     args.act_quant.storage().emplace<quants::act::tensor::Meta>().scale = 1.0f;
     return args;
 }
 
 bool test_staged_exsia_host_pipeline_semantic_layer() {
-    constexpr size_t stripe_rows = DIM;
-    constexpr size_t rows = 2 * stripe_rows + 1;
-    constexpr size_t columns = 2;
-    constexpr size_t depth = 2 * DIM;
-    const std::string semantic_layer =
-        "blk.15.mlp.down_proj.host-pipeline-lifetime-beyond-sso";
+    constexpr size_t   stripe_rows    = DIM;
+    constexpr size_t   rows           = 2 * stripe_rows + 1;
+    constexpr size_t   columns        = 2;
+    constexpr size_t   depth          = 2 * DIM;
+    const std::string  semantic_layer = "blk.15.mlp.down_proj.host-pipeline-lifetime-beyond-sso";
     std::vector<float> activations(rows * depth);
     std::fill(activations.begin(), activations.end(), 1.0f);
     std::vector<elem_t> weights(depth * columns, elem_t{1});
-    std::vector<float> output(rows * columns, 0.0f);
+    std::vector<float>  output(rows * columns, 0.0f);
 
     ggml_init_params params{
         ggml_tensor_overhead() * 2 + activations.size() * sizeof(float) + 1024,
@@ -236,33 +281,31 @@ bool test_staged_exsia_host_pipeline_semantic_layer() {
     if (!check(context != nullptr, "host pipeline activation context initializes")) {
         return false;
     }
-    ggml_tensor * activation =
-        ggml_new_tensor_2d(context, GGML_TYPE_F32, depth, rows);
-    std::memcpy(activation->data, activations.data(),
-                activations.size() * sizeof(float));
+    ggml_tensor * activation = ggml_new_tensor_2d(context, GGML_TYPE_F32, depth, rows);
+    std::memcpy(activation->data, activations.data(), activations.size() * sizeof(float));
 
     ggml_gemmini_args_t args{};
     {
         std::string source = semantic_layer;
-        args.matmul_layer = source;
+        args.matmul_layer  = source;
     }
-    args.I = rows;
-    args.J = columns;
-    args.K = depth;
-    args.sA = depth;
-    args.sB = columns;
-    args.B = weights.data();
-    args.f_out = output.data();
-    args.col_stride_f_out = 1;
-    args.stride_f_out = columns;
-    args.tiled_matmul_type = CPU;
-    args.tile_I = 1;
-    args.tile_J = 1;
-    args.tile_K = 2;
+    args.I                          = rows;
+    args.J                          = columns;
+    args.K                          = depth;
+    args.sA                         = depth;
+    args.sB                         = columns;
+    args.B                          = weights.data();
+    args.f_out                      = output.data();
+    args.col_stride_f_out           = 1;
+    args.stride_f_out               = columns;
+    args.tiled_matmul_type          = CPU;
+    args.tile_I                     = 1;
+    args.tile_J                     = 1;
+    args.tile_K                     = 2;
     args.activation_rows_per_stripe = stripe_rows;
-    args.residual_route = residual::ResidualRoute::cpu_direct;
-    args.weight_i8_scale_active = true;
-    args.weight_scale = 1.0f;
+    args.residual_route             = residual::ResidualRoute::cpu_direct;
+    args.weight_i8_scale_active     = true;
+    args.weight_scale               = 1.0f;
     if (!args.A.allocate(rows, depth, 8)) {
         ggml_free(context);
         return check(false, "host pipeline activation storage allocates");
@@ -270,12 +313,11 @@ bool test_staged_exsia_host_pipeline_semantic_layer() {
     args.act_quant.storage().emplace<quants::act::exsia::Meta>();
 
     ResolvedMatmulOptions options{};
-    options.mode = MatmulInvocationMode::stripe_pipeline;
+    options.mode         = MatmulInvocationMode::stripe_pipeline;
     options.job_capacity = 3;
-    options.rmd_backend = RmdBackend::cpu_direct;
-    options.profiling = true;
-    auto execution = prepare_execution(
-        static_cast<const ggml_gemmini_args_t &>(args), options);
+    options.rmd_backend  = RmdBackend::cpu_direct;
+    options.profiling    = true;
+    auto execution = prepare_execution(static_cast<const ggml_gemmini_args_t &>(args), options);
     MatmulStripeCollector collector(3);
     if (!check(execution.status().ok() && collector.start(execution),
                "real staged ExSIA host pipeline starts")) {
@@ -284,24 +326,21 @@ bool test_staged_exsia_host_pipeline_semantic_layer() {
     }
 
     ggml_gemmini_args_t quant_args = args;
-    args.matmul_layer = "mutated.after.staged-execution-copy";
-    auto & meta = std::get<quants::act::exsia::Meta>(
-        quant_args.act_quant.storage());
+    args.matmul_layer              = "mutated.after.staged-execution-copy";
+    auto & meta = std::get<quants::act::exsia::Meta>(quant_args.act_quant.storage());
     quants::act::exsia::ExSIA exsia;
-    exsia.set_execution_mode(
-        quants::act::exsia::ExSIAState::ExecutionMode::Sequential);
+    exsia.set_execution_mode(quants::act::exsia::ExSIAState::ExecutionMode::Sequential);
     SemanticLayerObservations observations;
     set_test_semantic_layer_observer(observe_semantic_layer, &observations);
 
-    FILE * capture = std::tmpfile();
+    FILE *    capture      = std::tmpfile();
     const int saved_stderr = dup(STDERR_FILENO);
-    bool capture_ok = capture != nullptr && saved_stderr >= 0;
+    bool      capture_ok   = capture != nullptr && saved_stderr >= 0;
     if (capture_ok) {
         std::fflush(stderr);
         capture_ok = dup2(fileno(capture), STDERR_FILENO) >= 0;
     }
-    const bool quantized = capture_ok && exsia.run(
-        meta, activation, quant_args, collector.sink());
+    const bool quantized = capture_ok && exsia.run(meta, activation, quant_args, collector.sink());
     const MatmulStatus collected = collector.finish();
     const MatmulStatus completed = finish_execution(execution);
     std::fflush(stderr);
@@ -315,8 +354,7 @@ bool test_staged_exsia_host_pipeline_semantic_layer() {
     if (capture != nullptr) {
         std::rewind(capture);
         char chunk[1024];
-        while (const size_t count =
-                   std::fread(chunk, 1, sizeof(chunk), capture)) {
+        while (const size_t count = std::fread(chunk, 1, sizeof(chunk), capture)) {
             debug_output.append(chunk, count);
         }
         std::fclose(capture);
@@ -325,95 +363,90 @@ bool test_staged_exsia_host_pipeline_semantic_layer() {
 
     const auto profiles = collector.profiles();
     if (!quantized || !collected.ok() || !completed.ok()) {
-        std::fprintf(stderr,
-                     "host pipeline capture: %s quantized=%d collector=%u/%s completed=%u/%s profiles=%zu\n",
-                     debug_output.c_str(), quantized ? 1 : 0,
-                     static_cast<unsigned>(collected.code), collected.message,
-                     static_cast<unsigned>(completed.code),
-                     completed.message, profiles.size());
+        std::fprintf(
+            stderr,
+            "host pipeline capture: %s quantized=%d collector=%u/%s completed=%u/%s profiles=%zu\n",
+            debug_output.c_str(),
+            quantized ? 1 : 0,
+            static_cast<unsigned>(collected.code),
+            collected.message,
+            static_cast<unsigned>(completed.code),
+            completed.message,
+            profiles.size());
     }
     std::vector<PipelineStripeTelemetry> summaries;
     summaries.reserve(profiles.size());
     for (const auto & profile : profiles) {
-        summaries.push_back(detail::pipeline_stripe_telemetry(
-            semantic_layer.c_str(), profile));
+        summaries.push_back(detail::pipeline_stripe_telemetry(semantic_layer.c_str(), profile));
     }
-    const bool canonical_ranges = profiles.size() == 3 &&
-        profiles[0].row_begin == 0 &&
-        profiles[0].row_end == stripe_rows &&
-        profiles[1].row_begin == stripe_rows &&
-        profiles[1].row_end == 2 * stripe_rows &&
-        profiles[2].row_begin == 2 * stripe_rows &&
-        profiles[2].row_end == rows;
-    const size_t exact_summaries = static_cast<size_t>(std::count_if(
-        summaries.begin(), summaries.end(), [&](const auto & summary) {
+    const bool canonical_ranges =
+        profiles.size() == 3 && profiles[0].row_begin == 0 && profiles[0].row_end == stripe_rows &&
+        profiles[1].row_begin == stripe_rows && profiles[1].row_end == 2 * stripe_rows &&
+        profiles[2].row_begin == 2 * stripe_rows && profiles[2].row_end == rows;
+    const size_t exact_summaries = static_cast<size_t>(
+        std::count_if(summaries.begin(), summaries.end(), [&](const auto & summary) {
             return summary.layer == semantic_layer;
         }));
     const size_t physical_site =
         static_cast<size_t>(TestSemanticLayerSite::physical_baseline_dense);
     return check(capture_ok && quantized,
                  "real ExSIA quantization publishes staged host stripes") &&
-        check(collected.ok() && completed.ok(),
-              "real staged ExSIA host pipeline completes") &&
-        check(profiles.size() == 3 &&
-                  observations.counts[physical_site] == 3 &&
-                  summaries.size() == 3,
-              "host pipeline completes exactly three profiles, physical observations, and summaries") &&
-        check(canonical_ranges,
-              "host pipeline profile rows follow configured DIM") &&
-        check(observations.layers[physical_site] == semantic_layer,
-              "host pipeline physical dispatch keeps byte-identical layer") &&
-        check(debug_output.find("\"layer\":\"" + semantic_layer + "\"") !=
-                  std::string::npos,
-              "host pipeline quantization log keeps byte-identical layer") &&
-        check(exact_summaries == 3,
-              "all three actual host pipeline summaries keep byte-identical layer");
+           check(collected.ok() && completed.ok(), "real staged ExSIA host pipeline completes") &&
+           check(profiles.size() == 3 && observations.counts[physical_site] == 3 &&
+                     summaries.size() == 3,
+                 "host pipeline completes exactly three profiles, physical observations, and "
+                 "summaries") &&
+           check(canonical_ranges, "host pipeline profile rows follow configured DIM") &&
+           check(observations.layers[physical_site] == semantic_layer,
+                 "host pipeline physical dispatch keeps byte-identical layer") &&
+           check(debug_output.find("\"layer\":\"" + semantic_layer + "\"") != std::string::npos,
+                 "host pipeline quantization log keeps byte-identical layer") &&
+           check(exact_summaries == 3,
+                 "all three actual host pipeline summaries keep byte-identical layer");
 }
 
 bool test_staged_exsia_by_value_preserves_producer_metadata() {
     constexpr size_t stripe_rows = DIM;
-    constexpr size_t rows = 2 * stripe_rows + 1;
+    constexpr size_t rows        = 2 * stripe_rows + 1;
 
     std::vector<float> activations(rows);
     for (size_t row = 0; row < rows; ++row) {
-        activations[row] = row < stripe_rows ? 1.0f
-            : row < 2 * stripe_rows ? 2.0f : 4.0f;
+        activations[row] = row < stripe_rows ? 1.0f : row < 2 * stripe_rows ? 2.0f : 4.0f;
     }
     ggml_tensor activation{};
     activation.type = GGML_TYPE_F32;
     activation.data = activations.data();
 
     std::vector<elem_t> weights = {elem_t{1}};
-    std::vector<float> staged_output(rows, 0.0f);
+    std::vector<float>  staged_output(rows, 0.0f);
     ggml_gemmini_args_t args{};
-    args.I = rows;
-    args.J = 1;
-    args.K = 1;
-    args.sA = 1;
-    args.sB = 1;
-    args.B = weights.data();
-    args.f_out = staged_output.data();
-    args.col_stride_f_out = 1;
-    args.stride_f_out = 1;
-    args.tiled_matmul_type = CPU;
-    args.tile_I = 1;
-    args.tile_J = 1;
-    args.tile_K = 1;
+    args.I                          = rows;
+    args.J                          = 1;
+    args.K                          = 1;
+    args.sA                         = 1;
+    args.sB                         = 1;
+    args.B                          = weights.data();
+    args.f_out                      = staged_output.data();
+    args.col_stride_f_out           = 1;
+    args.stride_f_out               = 1;
+    args.tiled_matmul_type          = CPU;
+    args.tile_I                     = 1;
+    args.tile_J                     = 1;
+    args.tile_K                     = 1;
     args.activation_rows_per_stripe = stripe_rows;
-    args.residual_route = residual::ResidualRoute::cpu_direct;
-    args.weight_i8_scale_active = true;
-    args.weight_scale = 1.0f;
+    args.residual_route             = residual::ResidualRoute::cpu_direct;
+    args.weight_i8_scale_active     = true;
+    args.weight_scale               = 1.0f;
     if (!args.A.allocate(rows, 1, 8)) {
         return check(false, "staged metadata activation storage allocates");
     }
     args.act_quant.storage().emplace<quants::act::exsia::Meta>();
 
     ResolvedMatmulOptions options{};
-    options.mode = MatmulInvocationMode::stripe_pipeline;
+    options.mode         = MatmulInvocationMode::stripe_pipeline;
     options.job_capacity = 3;
-    options.rmd_backend = RmdBackend::cpu_direct;
-    auto execution = prepare_execution(
-        static_cast<const ggml_gemmini_args_t &>(args), options);
+    options.rmd_backend  = RmdBackend::cpu_direct;
+    auto execution = prepare_execution(static_cast<const ggml_gemmini_args_t &>(args), options);
     MatmulStripeCollector collector(3);
     if (!check(execution.status().ok() && collector.start(execution),
                "by-value staged metadata pipeline starts")) {
@@ -421,67 +454,244 @@ bool test_staged_exsia_by_value_preserves_producer_metadata() {
     }
 
     ggml_gemmini_args_t producer_args = args;
-    auto & producer_meta = std::get<quants::act::exsia::Meta>(
-        producer_args.act_quant.storage());
+    auto & producer_meta = std::get<quants::act::exsia::Meta>(producer_args.act_quant.storage());
     quants::act::exsia::ExSIA exsia;
-    exsia.set_execution_mode(
-        quants::act::exsia::ExSIAState::ExecutionMode::Sequential);
-    const bool quantized =
-        exsia.run(producer_meta, &activation, producer_args, collector.sink());
+    exsia.set_execution_mode(quants::act::exsia::ExSIAState::ExecutionMode::Sequential);
+    const bool quantized = exsia.run(producer_meta, &activation, producer_args, collector.sink());
     const MatmulStatus collected = collector.finish();
     const MatmulStatus completed = finish_execution(execution);
 
-    std::vector<float> full_output(rows, 0.0f);
+    std::vector<float>  full_output(rows, 0.0f);
     ggml_gemmini_args_t full_args = producer_args;
-    full_args.f_out = full_output.data();
-    MatMul full_facade(std::move(full_args));
+    full_args.f_out               = full_output.data();
+    MatMul             full_facade(std::move(full_args));
     const MatMulResult full = full_facade.run_full();
 
-    return check(quantized &&
-                     producer_meta.theta ==
-                         std::vector<int16_t>({-6, -5, -4}),
+    return check(quantized && producer_meta.theta == std::vector<int16_t>({-6, -5, -4}),
                  "producer publishes three distinct stripe theta values") &&
-        check(collected.ok() && completed.ok(),
-              "staged metadata pipeline completes") &&
-        check(full.status == MatMulStatus::success,
-              "FULL metadata reference completes") &&
-        check(full_output == activations,
-              "FULL produces exact power-of-two reference values") &&
-        check(staged_output == full_output,
-              "by-value staged output matches FULL producer metadata");
+           check(collected.ok() && completed.ok(), "staged metadata pipeline completes") &&
+           check(full.status == MatMulStatus::success, "FULL metadata reference completes") &&
+           check(full_output == activations, "FULL produces exact power-of-two reference values") &&
+           check(staged_output == full_output,
+                 "by-value staged output matches FULL producer metadata");
+}
+
+bool test_live_borrowed_exsia_snapshot([[maybe_unused]] bool cancel) {
+#if GGML_GEMMINI_ACTIVATION_BITS == 8 && GGML_GEMMINI_WEIGHT_BITS == 8 && GGML_GEMMINI_ENABLE_RMD
+    constexpr size_t   rows     = DIM + 1;
+    constexpr size_t   depth    = 32;
+    constexpr size_t   stride   = 3;
+    constexpr float    sentinel = -19.0f;
+    std::vector<float> input(rows * depth, 1.0f);
+    for (size_t row = 0; row < rows; ++row)
+        input[row * depth] = 64.0f;
+    ggml_tensor tensor{};
+    tensor.type  = GGML_TYPE_F32;
+    tensor.data  = input.data();
+    tensor.ne[0] = depth;
+    tensor.ne[1] = rows;
+    tensor.ne[2] = tensor.ne[3] = 1;
+    tensor.nb[0]                = sizeof(float);
+    tensor.nb[1]                = depth * sizeof(float);
+
+    block_q8_hp1 weight{};
+    std::fill(std::begin(weight.qs), std::end(weight.qs), int8_t{1});
+    weight.m             = 0;
+    weight.channel_scale = 1.0f;
+    std::vector<float>  output((rows - 1) * stride + 1, sentinel);
+    ggml_gemmini_args_t args{};
+    args.I  = rows;
+    args.J  = 1;
+    args.K  = depth;
+    args.sA = args.sB      = depth;
+    args.f_out             = output.data();
+    args.stride_f_out      = stride;
+    args.col_stride_f_out  = 1;
+    args.tiled_matmul_type = CPU;
+    args.tile_I = args.tile_J = args.tile_K = 1;
+    args.activation_rows_per_stripe         = DIM;
+    args.transpose_B                        = true;
+    args.residual_route                     = residual::ResidualRoute::cpu_direct;
+    args.weight_format                      = ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1;
+    args.q8_hp1_blocks                      = &weight;
+    args.q8_hp1_block_count = args.q8_hp1_blocks_per_row = 1;
+    args.native_weight_bytes                             = sizeof(weight);
+    args.blocks_per_row = args.blocks_I = args.blocks_J = args.blocks_K = 1;
+    args.block_size_k                                                   = depth;
+    args.matmul_layer = "live.borrowed.exsia.snapshot.beyond-small-string-storage";
+    if (!check(args.A.allocate(rows, depth, 8), "live pipeline input backing allocates"))
+        return false;
+    std::weak_ptr<std::vector<uint8_t>> backing            = args.A.bytes;
+    const long                          initial_references = backing.use_count();
+    ResolvedMatmulOptions               options{};
+    options.mode         = MatmulInvocationMode::stripe_pipeline;
+    options.job_capacity = 2;
+    options.rmd_backend  = RmdBackend::cpu_direct;
+    bool passed          = true;
+    {
+        auto                  execution = prepare_execution(&args, options);
+        MatmulStripeCollector collector(2);
+        collector.test_pause_dense_before_execute();
+        if (!check(execution.status().ok() && collector.start(execution),
+                   "borrowed NoneMeta pipeline starts before the publisher"))
+            return false;
+        passed = check(backing.use_count() > initial_references,
+                       "startup retains stable input backing before publication") &&
+                 passed;
+        struct Publisher {
+            MatmulStripeCollector * collector;
+            ggml_gemmini_args_t *   args;
+            size_t                  callbacks          = 0;
+            size_t                  first_capacity     = 0;
+            bool                    paused             = false;
+            bool                    expanded           = false;
+            bool                    nonempty_residuals = true;
+        } publisher{&collector, &args};
+        quants::act::exsia::StripeReadySink sink{
+            &publisher, [](void * context, const quants::act::exsia::StripeReadyEvent & event) {
+                auto & state             = *static_cast<Publisher *>(context);
+                state.nonempty_residuals = state.nonempty_residuals &&
+                                           event.direct_residual != nullptr &&
+                                           !event.direct_residual->events.empty();
+                const auto * target      = state.collector->sink();
+                if (!target->on_ready(target->user_data, event))
+                    return false;
+                ++state.callbacks;
+                const auto & meta =
+                    std::get<quants::act::exsia::Meta>(state.args->act_quant.storage());
+                if (state.callbacks == 1) {
+                    const auto deadline =
+                        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                    while (state.collector->test_in_flight() == 0 &&
+                           std::chrono::steady_clock::now() < deadline)
+                        std::this_thread::yield();
+                    state.paused         = state.collector->test_in_flight() == 1;
+                    state.first_capacity = meta.direct_residuals.capacity();
+                    return state.paused && meta.direct_residuals.size() == 1;
+                }
+                state.expanded = meta.direct_residuals.size() == 2 &&
+                                 meta.direct_residuals.capacity() > state.first_capacity;
+                return true;
+            }};
+        auto & meta = args.act_quant.storage().emplace<quants::act::exsia::Meta>();
+        meta.direct_residuals.reserve(1);
+        quants::act::exsia::ExSIA quantizer;
+        quantizer.set_execution_mode(quants::act::exsia::ExSIAState::ExecutionMode::Sequential);
+        const bool published    = quantizer.run(meta, &tensor, args, &sink);
+        const bool before_drain = std::all_of(
+            output.begin(), output.end(), [](float value) { return value == sentinel; });
+        if (cancel)
+            (void)collector.cancel();
+        const auto collected     = collector.finish();
+        const bool before_commit = std::all_of(
+            output.begin(), output.end(), [](float value) { return value == sentinel; });
+        const auto completed = finish_execution(execution);
+        const auto state     = collector.snapshot();
+        passed = check(published && publisher.callbacks == 2 && publisher.paused &&
+                           publisher.expanded && publisher.nonempty_residuals,
+                       "real publisher expands residual handles after the first paused capture") &&
+                 passed;
+        passed = check(before_drain && before_commit,
+                       "pending NoneMeta startup never exposes staged output early") &&
+                 passed;
+        passed = check(state.in_flight == 0 && state.pending == 0 && !state.running &&
+                           args.f_out == output.data(),
+                       "drain releases slots and restores the borrowed output pointer") &&
+                 passed;
+        if (cancel) {
+            passed = check(collected.code == MatmulStatusCode::cancelled &&
+                               completed.code == MatmulStatusCode::cancelled &&
+                               std::all_of(output.begin(),
+                                           output.end(),
+                                           [](float value) { return value == sentinel; }),
+                           "cancelled publication preserves every destination sentinel") &&
+                     passed;
+        } else {
+            passed = check(collected.ok() && completed.ok() && collector.profiles().size() == 2,
+                           "both real published stripes complete once") &&
+                     passed;
+        }
+        std::printf("LIVE_BORROWED_EXSIA cancel=%d callbacks=%zu paused=%d expanded=%d "
+                    "residuals=%d slots=%zu\n",
+                    cancel,
+                    publisher.callbacks,
+                    publisher.paused,
+                    publisher.expanded,
+                    publisher.nonempty_residuals,
+                    state.in_flight);
+    }
+    passed = check(backing.use_count() == initial_references,
+                   "execution destruction releases its input snapshot") &&
+             passed;
+    if (!cancel) {
+        std::vector<float> full(output.size(), sentinel);
+        auto               full_args = args;
+        full_args.f_out              = full.data();
+        options.mode                 = MatmulInvocationMode::full;
+        const auto full_status       = matmul(full_args, options);
+        bool       exact             = output == full;
+        for (size_t index = 0; index < output.size(); ++index)
+            exact = exact && output[index] == (index % stride == 0 ? 95.0f : sentinel);
+        passed = check(full_status.ok() && exact,
+                       "live residual pipeline equals FULL and literal scalar oracle with "
+                       "untouched holes") &&
+                 passed;
+    }
+
+    args.act_quant.storage().emplace<quants::act::exsia::Meta>();
+    std::fill(output.begin(), output.end(), sentinel);
+    options.mode = MatmulInvocationMode::stripe_pipeline;
+    test_reset_matmul_counters();
+    {
+        auto                  execution = prepare_execution(&args, options);
+        MatmulStripeCollector collector(2);
+        collector.test_inject_thread_start_failure();
+        const bool started = collector.start(execution);
+        const auto counts  = test_matmul_counters();
+        passed = check(!started && !execution.status().ok() && args.f_out == output.data() &&
+                           backing.use_count() == initial_references &&
+                           counts.execution_constructions == 1 && counts.dense_dispatches == 0 &&
+                           counts.residual_dispatches == 0 &&
+                           std::all_of(output.begin(),
+                                       output.end(),
+                                       [](float value) { return value == sentinel; }),
+                       "startup failure releases the snapshot and restores the active output "
+                       "transaction") &&
+                 passed;
+    }
+    return passed;
+#else
+    return true;
+#endif
 }
 
 bool test_non_exsia_pipeline_rejection() {
-    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
-    std::vector<elem_t> weights = { 1, -1, 2, 3 };
-    std::vector<float> output(6, 0.0f);
-    auto args = make_args(activation, weights, output);
-    args.matmul_layer =
-        "blk.15.mlp.down_proj.non-exsia-rejection-beyond-sso";
+    std::vector<elem_t> activation = {1, 2, 3, 4, 5, 6};
+    std::vector<elem_t> weights    = {1, -1, 2, 3};
+    std::vector<float>  output(6, 0.0f);
+    auto                args = make_args(activation, weights, output);
+    args.matmul_layer        = "blk.15.mlp.down_proj.non-exsia-rejection-beyond-sso";
     ResolvedMatmulOptions options{};
-    options.mode = MatmulInvocationMode::stripe_pipeline;
+    options.mode         = MatmulInvocationMode::stripe_pipeline;
     options.job_capacity = 2;
-    options.rmd_backend = RmdBackend::cpu_direct;
-    auto execution = prepare_execution(
-        static_cast<const ggml_gemmini_args_t &>(args), options);
-    return check(execution.status().code ==
-                     MatmulStatusCode::unsupported_invocation,
+    options.rmd_backend  = RmdBackend::cpu_direct;
+    auto execution = prepare_execution(static_cast<const ggml_gemmini_args_t &>(args), options);
+    return check(execution.status().code == MatmulStatusCode::unsupported_invocation,
                  "non-ExSIA stripe pipeline keeps unsupported-route status") &&
-        check(std::strcmp(execution.status().message,
-                          "stripe pipeline requires an ExSIA live producer route") == 0,
-              "non-ExSIA stripe pipeline keeps its rejection detail");
+           check(std::strcmp(execution.status().message,
+                             "stripe pipeline requires an ExSIA live producer route") == 0,
+                 "non-ExSIA stripe pipeline keeps its rejection detail");
 }
 
 bool test_owned_route_object_lifetimes() {
-    const std::string semantic_layer =
-        "blk.15.mlp.down_proj.route-object-lifetime-beyond-sso";
-    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
-    std::vector<elem_t> weights = { 1, -1, 2, 3 };
-    std::vector<float> output(6, 0.0f);
+    const std::string   semantic_layer = "blk.15.mlp.down_proj.route-object-lifetime-beyond-sso";
+    std::vector<elem_t> activation     = {1, 2, 3, 4, 5, 6};
+    std::vector<elem_t> weights        = {1, -1, 2, 3};
+    std::vector<float>  output(6, 0.0f);
 
     auto facade_args = make_args(activation, weights, output);
     {
-        std::string source = semantic_layer;
+        std::string source       = semantic_layer;
         facade_args.matmul_layer = source;
     }
     MatMul facade(facade_args);
@@ -494,39 +704,90 @@ bool test_owned_route_object_lifetimes() {
     std::fill(output.begin(), output.end(), 0.0f);
     auto execution_args = make_args(activation, weights, output);
     {
-        std::string source = semantic_layer;
+        std::string source          = semantic_layer;
         execution_args.matmul_layer = source;
     }
     ResolvedMatmulOptions options{};
-    options.mode = MatmulInvocationMode::full;
+    options.mode        = MatmulInvocationMode::full;
     options.rmd_backend = RmdBackend::cpu_direct;
-    auto execution = prepare_execution(
-        static_cast<const ggml_gemmini_args_t &>(execution_args), options);
+    auto execution =
+        prepare_execution(static_cast<const ggml_gemmini_args_t &>(execution_args), options);
     execution_args.matmul_layer = "mutated.after.execution.copy";
     SemanticLayerObservations execution_observations;
-    set_test_semantic_layer_observer(observe_semantic_layer,
-                                     &execution_observations);
+    set_test_semantic_layer_observer(observe_semantic_layer, &execution_observations);
     const auto execution_status = execute_full(execution);
     set_test_semantic_layer_observer(nullptr, nullptr);
 
     return check(facade_result.status == MatMulStatus::success,
                  "owned MatMul completes after source mutation") &&
-        check(facade_observations.layers[5] == semantic_layer,
-              "MatMul owns the non-SSO layer through physical completion") &&
-        check(execution_status.ok(),
-              "value-owned MatmulExecution completes after source mutation") &&
-        check(execution_observations.layers[5] == semantic_layer,
-              "MatmulExecution owns the non-SSO layer through physical completion");
+           check(facade_observations.layers[5] == semantic_layer,
+                 "MatMul owns the non-SSO layer through physical completion") &&
+           check(execution_status.ok(),
+                 "value-owned MatmulExecution completes after source mutation") &&
+           check(execution_observations.layers[5] == semantic_layer,
+                 "MatmulExecution owns the non-SSO layer through physical completion");
+}
+
+bool test_execution_admission_and_moves() {
+    ResolvedMatmulOptions invalid{};
+    invalid.mode          = MatmulInvocationMode::stripe_pipeline;
+    invalid.job_capacity  = 0;
+    invalid.dense_threads = 2;
+    test_reset_matmul_counters();
+    auto null_execution = prepare_execution(static_cast<ggml_gemmini_args_t *>(nullptr), invalid);
+    if (!check(null_execution.status().code == MatmulStatusCode::invalid_argument &&
+                   std::string_view(null_execution.status().message) == "null execution args" &&
+                   test_matmul_counters().execution_constructions == 1 &&
+                   test_matmul_counters().allocation_attempts == 0,
+               "null admission precedes geometry/options and observes one construction"))
+        return false;
+
+    std::vector<elem_t>      activation = {1, 2, 3, 4, 5, 6};
+    std::vector<elem_t>      weights    = {1, -1, 2, 3};
+    const std::vector<float> expected   = {-1.0f, 8.0f, -1.0f, 18.0f, -1.0f, 28.0f};
+    for (const bool borrowed : {false, true}) {
+        std::vector<float> output(6, 79.0f);
+        auto               args = make_args(activation, weights, output);
+        args.I = args.J = args.K = std::numeric_limits<size_t>::max();
+        args.tile_I = args.tile_J = args.tile_K = 1;
+        test_reset_matmul_counters();
+        auto rejected =
+            borrowed ? prepare_execution(&args, invalid)
+                     : prepare_execution(static_cast<const ggml_gemmini_args_t &>(args), invalid);
+        if (!check(rejected.status().code == MatmulStatusCode::invalid_contract &&
+                       test_matmul_counters().execution_constructions == 1 &&
+                       test_matmul_counters().allocation_attempts == 0 &&
+                       output == std::vector<float>(6, 79.0f) && args.f_out == output.data(),
+                   "both ownership paths reject geometry before competing option failures"))
+            return false;
+
+        args = make_args(activation, weights, output);
+        ResolvedMatmulOptions full{};
+        full.mode        = MatmulInvocationMode::full;
+        full.rmd_backend = RmdBackend::cpu_direct;
+        test_reset_matmul_counters();
+        auto prepared =
+            borrowed ? prepare_execution(&args, full)
+                     : prepare_execution(static_cast<const ggml_gemmini_args_t &>(args), full);
+        MatmulExecution moved(std::move(prepared));
+        MatmulExecution assigned;
+        assigned = std::move(moved);
+        if (!check(
+                execute_full(assigned).ok() && output == expected && args.f_out == output.data() &&
+                    test_matmul_counters().execution_constructions == 1,
+                "owned/borrowed execution moves preserve output, pointers and construction count"))
+            return false;
+    }
+    return true;
 }
 
 bool test_all_physical_semantic_layer_sites() {
-    const std::string semantic_layer =
-        "blk.15.mlp.down_proj.semantic-layer-observer-beyond-sso";
-    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
-    std::vector<elem_t> weights = { 1, -1, 2, 3 };
-    std::vector<float> output(6, 0.0f);
-    auto args = make_args(activation, weights, output);
-    args.matmul_layer = semantic_layer;
+    const std::string   semantic_layer = "blk.15.mlp.down_proj.semantic-layer-observer-beyond-sso";
+    std::vector<elem_t> activation     = {1, 2, 3, 4, 5, 6};
+    std::vector<elem_t> weights        = {1, -1, 2, 3};
+    std::vector<float>  output(6, 0.0f);
+    auto                args = make_args(activation, weights, output);
+    args.matmul_layer        = semantic_layer;
 
     SemanticLayerObservations observations;
     set_test_semantic_layer_observer(observe_semantic_layer, &observations);
@@ -536,12 +797,15 @@ bool test_all_physical_semantic_layer_sites() {
     bool ok = check(probed, "all physical semantic layer sites are exercised");
     for (size_t site = 1; site < observations.counts.size(); ++site) {
         ok = check(observations.counts[site] == 1,
-                   "physical semantic site is observed exactly once") && ok;
+                   "physical semantic site is observed exactly once") &&
+             ok;
         ok = check(observations.layers[site] == semantic_layer,
-                   "physical semantic site receives byte-identical owned layer") && ok;
+                   "physical semantic site receives byte-identical owned layer") &&
+             ok;
     }
     return check(observations.counts[0] == 0,
-                 "physical-only probe does not exercise FP facade seam") && ok;
+                 "physical-only probe does not exercise FP facade seam") &&
+           ok;
 }
 
 bool test_physical_null_args_contract() {
@@ -550,54 +814,55 @@ bool test_physical_null_args_contract() {
 }
 
 bool test_fp_facade_semantic_layer_forwarding() {
-    const std::string semantic_layer =
-        "blk.15.attn.q_proj.fp-facade-forwarding-beyond-sso";
+    const std::string         semantic_layer = "blk.15.attn.q_proj.fp-facade-forwarding-beyond-sso";
     SemanticLayerObservations observations;
     set_test_semantic_layer_observer(observe_semantic_layer, &observations);
     const bool probed = test_probe_fp_facade_layer(semantic_layer);
     set_test_semantic_layer_observer(nullptr, nullptr);
 
     return check(probed, "FP facade probe succeeds") &&
-        check(observations.counts[0] == 1,
-              "FP facade-owned args are observed exactly once") &&
-        check(observations.layers[0] == semantic_layer,
-              "caller semantic layer reaches FP facade physical observation byte-identically");
+           check(observations.counts[0] == 1, "FP facade-owned args are observed exactly once") &&
+           check(observations.layers[0] == semantic_layer,
+                 "caller semantic layer reaches FP facade physical observation byte-identically");
 }
 
 bool test_physical_semantic_layer_seam() {
-    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
-    std::vector<elem_t> weights = { 1, -1, 2, 3 };
-    std::vector<float> output(6, 0.0f);
-    auto args = make_args(activation, weights, output);
-    args.matmul_layer = "blk.15.mlp.down_proj";
+    std::vector<elem_t> activation = {1, 2, 3, 4, 5, 6};
+    std::vector<elem_t> weights    = {1, -1, 2, 3};
+    std::vector<float>  output(6, 0.0f);
+    auto                args = make_args(activation, weights, output);
+    args.matmul_layer        = "blk.15.mlp.down_proj";
 
-    int capture[2]{};
+    int       capture[2]{};
     const int saved_stderr = dup(STDERR_FILENO);
-    if (!check(saved_stderr >= 0 && pipe(capture) == 0,
-               "physical semantic seam capture opens")) {
-        if (saved_stderr >= 0) close(saved_stderr);
+    if (!check(saved_stderr >= 0 && pipe(capture) == 0, "physical semantic seam capture opens")) {
+        if (saved_stderr >= 0)
+            close(saved_stderr);
         return false;
     }
     std::fflush(stderr);
     dup2(capture[1], STDERR_FILENO);
     close(capture[1]);
     ggml::gemmini::MatMul facade(args);
-    const auto result = facade.run_full();
+    const auto            result = facade.run_full();
     std::fflush(stderr);
     dup2(saved_stderr, STDERR_FILENO);
     close(saved_stderr);
-    char captured[2048]{};
+    char          captured[2048]{};
     const ssize_t count = read(capture[0], captured, sizeof(captured) - 1);
     close(capture[0]);
-    if (count > 0) captured[count] = '\0';
+    if (count > 0)
+        captured[count] = '\0';
 
-    const std::vector<float> expected = { -1.0f, 8.0f, -1.0f, 18.0f, -1.0f, 28.0f };
+    const std::vector<float> expected = {-1.0f, 8.0f, -1.0f, 18.0f, -1.0f, 28.0f};
     return check(result.status == ggml::gemmini::MatMulStatus::success,
                  "physical semantic seam numeric route succeeds") &&
-        check(output == expected, "physical semantic seam preserves quantized numeric output") &&
-        check(std::strstr(captured, "\"layer\":\"blk.15.mlp.down_proj\"") != nullptr,
-              "physical setup receives byte-identical semantic layer");
+           check(output == expected, "physical semantic seam preserves quantized numeric output") &&
+           check(std::strstr(captured, "\"layer\":\"blk.15.mlp.down_proj\"") != nullptr,
+                 "physical setup receives byte-identical semantic layer");
 }
+
+#endif
 
 bool test_generated_config_contract() {
     const bool valid_default_mode =
@@ -612,34 +877,37 @@ bool test_generated_config_contract() {
     const auto defaults = resolve_matmul_options();
 
     return check(valid_default_mode, "generated default matmul mode value") &&
-        check(config::DEFAULT_STRIPE_JOB_CAPACITY > 0, "generated job capacity") &&
-        check(stripe_default_requires_support, "stripe default requires stripe support") &&
-        check(pipeline_default_requires_support, "pipeline default requires pipeline support") &&
-        check(defaults.ok(), "generated defaults resolve") &&
-        check(defaults.options.mode == static_cast<MatmulInvocationMode>(config::DEFAULT_MATMUL_MODE),
-              "resolved default mode matches generated config") &&
-        check(defaults.options.job_capacity == config::DEFAULT_STRIPE_JOB_CAPACITY,
-              "resolved job capacity matches generated config") &&
-        check(config::DEFAULT_RMD_BACKEND == static_cast<int>(RmdBackend::cpu_direct) ||
-                  config::DEFAULT_RMD_BACKEND == static_cast<int>(RmdBackend::gemmini_ws_compact),
-              "generated RMD backend default is valid") &&
-        check(defaults.options.rmd_backend == static_cast<RmdBackend>(config::DEFAULT_RMD_BACKEND),
-              "resolved RMD backend matches generated default") &&
-        check(defaults.rmd_backend_source == MatmulOptionSource::build_default,
-              "default RMD backend source is build default");
+           check(config::DEFAULT_STRIPE_JOB_CAPACITY > 0, "generated job capacity") &&
+           check(stripe_default_requires_support, "stripe default requires stripe support") &&
+           check(pipeline_default_requires_support, "pipeline default requires pipeline support") &&
+           check(defaults.ok(), "generated defaults resolve") &&
+           check(defaults.options.mode ==
+                     static_cast<MatmulInvocationMode>(config::DEFAULT_MATMUL_MODE),
+                 "resolved default mode matches generated config") &&
+           check(defaults.options.job_capacity == config::DEFAULT_STRIPE_JOB_CAPACITY,
+                 "resolved job capacity matches generated config") &&
+           check(config::DEFAULT_RMD_BACKEND == static_cast<int>(RmdBackend::cpu_direct) ||
+                     config::DEFAULT_RMD_BACKEND ==
+                         static_cast<int>(RmdBackend::gemmini_ws_compact),
+                 "generated RMD backend default is valid") &&
+           check(defaults.options.rmd_backend ==
+                     static_cast<RmdBackend>(config::DEFAULT_RMD_BACKEND),
+                 "resolved RMD backend matches generated default") &&
+           check(defaults.rmd_backend_source == MatmulOptionSource::build_default,
+                 "default RMD backend source is build default");
 }
 
 bool test_checked_geometry_contract() {
     constexpr GemminiTileFactors tiles{5, 5, 48};
-    constexpr size_t array_dim = 16;
+    constexpr size_t             array_dim = 16;
     struct Fixture {
         GemminiLogicalShape shape;
-        GemminiOuterCounts outer;
-        size_t ws_inner_calls;
+        GemminiOuterCounts  outer;
+        size_t              ws_inner_calls;
     };
     constexpr Fixture gpt2[] = {
         {{256, 2304, 768}, {4, 29, 1}, 116},
-        {{256, 768, 768},  {4, 10, 1}, 40},
+        {{256, 768, 768}, {4, 10, 1}, 40},
         {{256, 3072, 768}, {4, 39, 1}, 156},
         {{256, 768, 3072}, {4, 10, 4}, 160},
     };
@@ -654,8 +922,7 @@ bool test_checked_geometry_contract() {
                        result.geometry.outer.j == fixture.outer.j &&
                        result.geometry.outer.k == fixture.outer.k,
                    "GPT-2 outer counts are pinned") ||
-            !check(result.geometry.stripe_rows == 80 &&
-                       result.geometry.stripe_count == 4 &&
+            !check(result.geometry.stripe_rows == 80 && result.geometry.stripe_count == 4 &&
                        result.geometry.final_rows == 16,
                    "logical stripes are 80,80,80,16") ||
             !check(result.geometry.ws_inner_calls == fixture.ws_inner_calls,
@@ -667,21 +934,24 @@ bool test_checked_geometry_contract() {
     const auto zero_tile = make_gemmini_geometry({{256, 768, 768}, {0, 5, 48}, array_dim});
     const auto tile_product_overflow = make_gemmini_geometry(
         {{256, 768, 768}, {std::numeric_limits<size_t>::max(), 5, 48}, array_dim});
-    const auto call_product_overflow = make_gemmini_geometry(
-        {{std::numeric_limits<size_t>::max(), std::numeric_limits<size_t>::max(),
-          std::numeric_limits<size_t>::max()}, {1, 1, 1}, 1});
+    const auto call_product_overflow = make_gemmini_geometry({{std::numeric_limits<size_t>::max(),
+                                                               std::numeric_limits<size_t>::max(),
+                                                               std::numeric_limits<size_t>::max()},
+                                                              {1, 1, 1},
+                                                              1});
     return check(zero_tile.error == GemminiGeometryError::zero_tile_factor,
                  "zero tile factor has typed rejection") &&
-        check(tile_product_overflow.error == GemminiGeometryError::overflow,
-              "tile-row product overflow has typed rejection") &&
-        check(call_product_overflow.error == GemminiGeometryError::overflow,
-              "WS inner-call product overflow has typed rejection");
+           check(tile_product_overflow.error == GemminiGeometryError::overflow,
+                 "tile-row product overflow has typed rejection") &&
+           check(call_product_overflow.error == GemminiGeometryError::overflow,
+                 "WS inner-call product overflow has typed rejection");
 }
 
 bool test_precedence() {
     clear_environment();
     const auto defaults = resolve_matmul_options();
-    if (!check(defaults.ok() && defaults.options.job_capacity == config::DEFAULT_STRIPE_JOB_CAPACITY,
+    if (!check(defaults.ok() &&
+                   defaults.options.job_capacity == config::DEFAULT_STRIPE_JOB_CAPACITY,
                "generated build defaults")) {
         return false;
     }
@@ -700,10 +970,11 @@ bool test_precedence() {
     }
 
     MatmulOptionOverrides explicit_options{};
-    explicit_options.mode = config::ENABLE_STRIPE_MATMUL && config::ENABLE_STRIPE_PIPELINE
-        ? MatmulInvocationMode::stripe_pipeline : MatmulInvocationMode::full;
+    explicit_options.mode         = config::ENABLE_STRIPE_MATMUL && config::ENABLE_STRIPE_PIPELINE
+                                        ? MatmulInvocationMode::stripe_pipeline
+                                        : MatmulInvocationMode::full;
     explicit_options.job_capacity = 6;
-    explicit_options.rmd_backend = RmdBackend::cpu_direct;
+    explicit_options.rmd_backend  = RmdBackend::cpu_direct;
     setenv("GEMMINI_RMD_BACKEND", "DEC", 1);
     const auto explicit_result = resolve_matmul_options(explicit_options);
     clear_environment();
@@ -716,36 +987,38 @@ bool test_precedence() {
 
 bool test_invalid_environment() {
     struct InvalidEnvironment {
-        const char * name;
-        const char * value;
+        const char *       name;
+        const char *       value;
         MatmulOptionsError error;
     };
     const InvalidEnvironment cases[] = {
-        { "GEMMINI_MATMUL_MODE", "AUTO", MatmulOptionsError::invalid_mode },
-        { "GEMMINI_MATMUL_MODE", "full", MatmulOptionsError::invalid_mode },
-        { "GEMMINI_MATMUL_MODE", "STRIPE_SEQUENTIAL", MatmulOptionsError::invalid_mode },
-        { "GEMMINI_STRIPE_JOB_CAPACITY", "+2", MatmulOptionsError::invalid_job_capacity },
-        { "GEMMINI_STRIPE_JOB_CAPACITY", "0", MatmulOptionsError::invalid_job_capacity },
-        { "GEMMINI_RMD_BACKEND", "", MatmulOptionsError::invalid_rmd_backend },
-        { "GEMMINI_RMD_BACKEND", "cpu", MatmulOptionsError::invalid_rmd_backend },
-        { "GEMMINI_RMD_BACKEND", " CPU", MatmulOptionsError::invalid_rmd_backend },
-        { "GEMMINI_RMD_BACKEND", "WS ", MatmulOptionsError::invalid_rmd_backend },
-        { "GEMMINI_RMD_BACKEND", "0", MatmulOptionsError::invalid_rmd_backend },
-        { "GEMMINI_RMD_BACKEND", "AUTO", MatmulOptionsError::invalid_rmd_backend },
-        { "GEMMINI_RMD_BACKEND", "INHERIT", MatmulOptionsError::invalid_rmd_backend },
-        { "GEMMINI_RMD_BACKEND", "OS", MatmulOptionsError::invalid_rmd_backend },
-        { "GEMMINI_RMD_BACKEND", "DEC", MatmulOptionsError::invalid_rmd_backend },
+        {"GEMMINI_MATMUL_MODE", "AUTO", MatmulOptionsError::invalid_mode},
+        {"GEMMINI_MATMUL_MODE", "full", MatmulOptionsError::invalid_mode},
+        {"GEMMINI_MATMUL_MODE", "STRIPE_SEQUENTIAL", MatmulOptionsError::invalid_mode},
+        {"GEMMINI_STRIPE_JOB_CAPACITY", "+2", MatmulOptionsError::invalid_job_capacity},
+        {"GEMMINI_STRIPE_JOB_CAPACITY", "0", MatmulOptionsError::invalid_job_capacity},
+        {"GEMMINI_RMD_BACKEND", "", MatmulOptionsError::invalid_rmd_backend},
+        {"GEMMINI_RMD_BACKEND", "cpu", MatmulOptionsError::invalid_rmd_backend},
+        {"GEMMINI_RMD_BACKEND", " CPU", MatmulOptionsError::invalid_rmd_backend},
+        {"GEMMINI_RMD_BACKEND", "WS ", MatmulOptionsError::invalid_rmd_backend},
+        {"GEMMINI_RMD_BACKEND", "0", MatmulOptionsError::invalid_rmd_backend},
+        {"GEMMINI_RMD_BACKEND", "AUTO", MatmulOptionsError::invalid_rmd_backend},
+        {"GEMMINI_RMD_BACKEND", "INHERIT", MatmulOptionsError::invalid_rmd_backend},
+        {"GEMMINI_RMD_BACKEND", "OS", MatmulOptionsError::invalid_rmd_backend},
+        {"GEMMINI_RMD_BACKEND", "DEC", MatmulOptionsError::invalid_rmd_backend},
     };
     for (const auto & invalid : cases) {
         clear_environment();
         setenv(invalid.name, invalid.value, 1);
         const auto result = resolve_matmul_options();
         if (config::ALLOW_RUNTIME_MATMUL_OVERRIDE) {
-            if (!check(!result.ok() && result.error == invalid.error, "invalid environment rejected")) {
+            if (!check(!result.ok() && result.error == invalid.error,
+                       "invalid environment rejected")) {
                 return false;
             }
         } else if (std::strcmp(invalid.name, "GEMMINI_RMD_BACKEND") == 0) {
-            if (!check(!result.ok() && result.error == MatmulOptionsError::runtime_override_disabled,
+            if (!check(!result.ok() &&
+                           result.error == MatmulOptionsError::runtime_override_disabled,
                        "disabled RMD runtime override rejected")) {
                 return false;
             }
@@ -760,50 +1033,84 @@ bool test_invalid_environment() {
 bool test_invalid_explicit_rmd_backend() {
     MatmulOptionOverrides options{};
     options.rmd_backend = static_cast<RmdBackend>(2);
-    const auto result = resolve_matmul_options(options);
+    const auto result   = resolve_matmul_options(options);
     return check(!result.ok() && result.error == MatmulOptionsError::invalid_rmd_backend,
                  "invalid explicit RMD backend rejected");
 }
 
 bool test_invalid_explicit_mode() {
     MatmulOptionOverrides options{};
-    options.mode = static_cast<MatmulInvocationMode>(2);
+    options.mode      = static_cast<MatmulInvocationMode>(2);
     const auto result = resolve_matmul_options(options);
     return check(!result.ok() && result.error == MatmulOptionsError::invalid_mode,
                  "invalid explicit matmul mode rejected");
 }
 
+bool test_parser_boundaries_and_error_order() {
+    clear_environment();
+    size_t value = 0;
+    for (const char * text : {"", "0", "+2", "-1", " 2", "2 ", "2x", "18446744073709551616"}) {
+        if (!check(!parse_positive_size(text, value), "invalid positive size is rejected"))
+            return false;
+    }
+    const auto maximum = std::to_string(std::numeric_limits<size_t>::max());
+    if (!check(parse_positive_size(maximum, value) && value == std::numeric_limits<size_t>::max(),
+               "size_t maximum parses without overflow"))
+        return false;
+    MatmulOptionOverrides options{};
+    options.mode         = static_cast<MatmulInvocationMode>(255);
+    options.rmd_backend  = static_cast<RmdBackend>(255);
+    options.job_capacity = 0;
+    if (!check(resolve_matmul_options(options).error == MatmulOptionsError::invalid_job_capacity,
+               "explicit capacity validation precedes backend and mode"))
+        return false;
+    options.job_capacity = 2;
+    if (!check(resolve_matmul_options(options).error == MatmulOptionsError::invalid_rmd_backend,
+               "explicit backend validation precedes mode"))
+        return false;
+    options.rmd_backend = RmdBackend::cpu_direct;
+    if (!check(resolve_matmul_options(options).error == MatmulOptionsError::invalid_mode,
+               "invalid explicit mode retains its error"))
+        return false;
+    options.mode      = MatmulInvocationMode::stripe_pipeline;
+    const auto result = resolve_matmul_options(options);
+    return check(result.error == (config::ENABLE_STRIPE_MATMUL && config::ENABLE_STRIPE_PIPELINE
+                                      ? MatmulOptionsError::none
+                                      : MatmulOptionsError::disabled_mode),
+                 "pipeline resolution respects the build gate");
+}
+
 #if defined(GGML_GEMMINI_OPTIONS_TEST_BACKEND)
 bool test_execution_route_propagation() {
-    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6 };
-    std::vector<elem_t> weights = { 1, -1, 2, 3 };
-    std::vector<float> output(6, 0.0f);
-    auto args = make_args(activation, weights, output);
+    std::vector<elem_t>       activation = {1, 2, 3, 4, 5, 6};
+    std::vector<elem_t>       weights    = {1, -1, 2, 3};
+    std::vector<float>        output(6, 0.0f);
+    auto                      args       = make_args(activation, weights, output);
     const tiled_matmul_type_t main_route = args.tiled_matmul_type;
-    ResolvedMatmulOptions options{};
-    options.mode = MatmulInvocationMode::full;
-    options.rmd_backend = RmdBackend::cpu_direct;
-    auto execution = prepare_execution(&args, options);
-    const bool cpu = check(execution.status().ok() &&
-                               args.residual_route == residual::ResidualRoute::cpu_direct,
-                           "resolved CPU backend reaches execution residual sink") &&
+    ResolvedMatmulOptions     options{};
+    options.mode         = MatmulInvocationMode::full;
+    options.rmd_backend  = RmdBackend::cpu_direct;
+    auto       execution = prepare_execution(&args, options);
+    const bool cpu =
+        check(execution.status().ok() && args.residual_route == residual::ResidualRoute::cpu_direct,
+              "resolved CPU backend reaches execution residual sink") &&
         check(args.tiled_matmul_type == main_route,
               "CPU residual selection preserves main backend");
 
     options.rmd_backend = RmdBackend::gemmini_ws_compact;
-    auto ws_execution = prepare_execution(&args, options);
+    auto ws_execution   = prepare_execution(&args, options);
 #if defined(__riscv) || defined(GGML_GEMMINI_TESTING)
-    const bool ws = check(ws_execution.status().ok(),
-                          "WS backend is available on target or testing host");
+    const bool ws =
+        check(ws_execution.status().ok(), "WS backend is available on target or testing host");
 #else
     const bool ws = check(ws_execution.status().code == MatmulStatusCode::unsupported_backend,
                           "WS backend preflights as unavailable on production host");
 #endif
     return cpu && ws &&
-        check(args.residual_route == residual::ResidualRoute::ws_packet,
-              "resolved WS backend reaches execution residual sink") &&
-        check(args.tiled_matmul_type == main_route,
-              "WS residual selection preserves main backend");
+           check(args.residual_route == residual::ResidualRoute::ws_packet,
+                 "resolved WS backend reaches execution residual sink") &&
+           check(args.tiled_matmul_type == main_route,
+                 "WS residual selection preserves main backend");
 }
 #endif
 
@@ -822,16 +1129,16 @@ bool test_disabled_runtime_rmd_environment() {
 
 #if defined(GGML_GEMMINI_OPTIONS_TEST_BACKEND)
 bool test_disabled_mode_status_contract() {
-    std::vector<elem_t> activation = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
-    std::vector<elem_t> weights = { 1, -1, 2, 3 };
-    std::vector<float> output(12, 0.0f);
-    bool passed = true;
+    std::vector<elem_t> activation = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    std::vector<elem_t> weights    = {1, -1, 2, 3};
+    std::vector<float>  output(12, 0.0f);
+    bool                passed = true;
 
     if (!config::ENABLE_STRIPE_MATMUL || !config::ENABLE_STRIPE_PIPELINE) {
         auto args = make_args(activation, weights, output);
-        args.I = 6;
-        args.K = 1;
-        args.sA = 1;
+        args.I    = 6;
+        args.K    = 1;
+        args.sA   = 1;
         activation.resize(args.I * args.K, 1);
         args.A.allocate(args.I, args.K, 8);
         for (size_t i = 0; i < args.I * args.K; ++i) {
@@ -841,76 +1148,89 @@ bool test_disabled_mode_status_contract() {
         meta.theta.assign(args.I, 0);
 
         MatmulOptionOverrides options{};
-        options.mode = MatmulInvocationMode::stripe_pipeline;
+        options.mode          = MatmulInvocationMode::stripe_pipeline;
         const auto resolution = resolve_matmul_options(options);
-        const auto execution = prepare_execution(args, options);
+        const auto execution  = prepare_execution(args, options);
         passed = check(!resolution.ok() && resolution.error == MatmulOptionsError::disabled_mode,
-                       "disabled stripe pipeline resolves as disabled mode") && passed;
+                       "disabled stripe pipeline resolves as disabled mode") &&
+                 passed;
         passed = check(execution.status().code == MatmulStatusCode::unsupported_invocation,
-                       "disabled stripe pipeline maps to unsupported invocation") && passed;
+                       "disabled stripe pipeline maps to unsupported invocation") &&
+                 passed;
     }
 
     return passed;
 }
 #endif
 
-}
+} // namespace
 
 int main(int argc, char ** argv) {
+#if defined(GGML_GEMMINI_OPTIONS_TEST_BACKEND)
     if (argc == 2 && std::strcmp(argv[1], "--staged-exsia-pipeline") == 0) {
         const bool passed = test_staged_exsia_host_pipeline_semantic_layer() &&
-            test_staged_exsia_by_value_preserves_producer_metadata();
+                            test_staged_exsia_by_value_preserves_producer_metadata();
         return passed ? 0 : 1;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--live-borrowed-exsia") == 0) {
+        return test_live_borrowed_exsia_snapshot(false) && test_live_borrowed_exsia_snapshot(true)
+                   ? 0
+                   : 1;
+    }
     if (argc == 3 && std::strcmp(argv[1], "--semantic-layer-wrong-constant") == 0) {
-        char * end = nullptr;
+        char *     end  = nullptr;
         const long site = std::strtol(argv[2], &end, 10);
-        if (end == argv[2] || *end != '\0' || site < 0 || site > 5) return 2;
-        semantic_layer_mutation_site = static_cast<int>(site);
-        const bool unexpectedly_passed = site == 0
-            ? test_fp_facade_semantic_layer_forwarding()
-            : test_all_physical_semantic_layer_sites();
-        semantic_layer_mutation_site = -1;
+        if (end == argv[2] || *end != '\0' || site < 0 || site > 5)
+            return 2;
+        semantic_layer_mutation_site   = static_cast<int>(site);
+        const bool unexpectedly_passed = site == 0 ? test_fp_facade_semantic_layer_forwarding()
+                                                   : test_all_physical_semantic_layer_sites();
+        semantic_layer_mutation_site   = -1;
         return unexpectedly_passed ? 0 : 1;
     }
+#endif
     if (argc == 2 && std::strcmp(argv[1], "--geometry-fixture") == 0) {
-        if (!test_checked_geometry_contract()) return 1;
+        if (!test_checked_geometry_contract())
+            return 1;
         const auto result = make_gemmini_geometry({{256, 2304, 768}, {5, 5, 48}, 16});
-        std::printf("GEOMETRY stripe_rows=%zu stripe_count=%zu final_rows=%zu outer=%zu/%zu/%zu ws_inner_calls=%zu rows=80,80,80,16\n",
-                    result.geometry.stripe_rows, result.geometry.stripe_count,
-                    result.geometry.final_rows, result.geometry.outer.i,
-                    result.geometry.outer.j, result.geometry.outer.k,
+        std::printf("GEOMETRY stripe_rows=%zu stripe_count=%zu final_rows=%zu outer=%zu/%zu/%zu "
+                    "ws_inner_calls=%zu rows=80,80,80,16\n",
+                    result.geometry.stripe_rows,
+                    result.geometry.stripe_count,
+                    result.geometry.final_rows,
+                    result.geometry.outer.i,
+                    result.geometry.outer.j,
+                    result.geometry.outer.k,
                     result.geometry.ws_inner_calls);
         return 0;
     }
     if (argc == 2 && std::strcmp(argv[1], "--invalid-geometry-probe") == 0) {
-        const auto zero = make_gemmini_geometry({{256, 768, 768}, {0, 5, 48}, 16});
+        const auto zero     = make_gemmini_geometry({{256, 768, 768}, {0, 5, 48}, 16});
         const auto overflow = make_gemmini_geometry(
             {{256, 768, 768}, {std::numeric_limits<size_t>::max(), 5, 48}, 16});
         const bool ok = zero.error == GemminiGeometryError::zero_tile_factor &&
-            overflow.error == GemminiGeometryError::overflow;
+                        overflow.error == GemminiGeometryError::overflow;
         std::printf("INVALID_GEOMETRY zero_tile=%d overflow=%d allocations=0\n",
-                    static_cast<int>(zero.error), static_cast<int>(overflow.error));
+                    static_cast<int>(zero.error),
+                    static_cast<int>(overflow.error));
         return ok ? 0 : 1;
     }
-    const bool ok = test_checked_geometry_contract() &&
+    const bool ok =
+        test_checked_geometry_contract() &&
+#if defined(GGML_GEMMINI_OPTIONS_TEST_BACKEND)
         test_staged_exsia_host_pipeline_semantic_layer() &&
         test_staged_exsia_by_value_preserves_producer_metadata() &&
-        test_owned_matmul_layer_lifetime() &&
-        test_non_exsia_pipeline_rejection() &&
-        test_owned_route_object_lifetimes() &&
-        test_all_physical_semantic_layer_sites() &&
-        test_physical_null_args_contract() &&
-        test_fp_facade_semantic_layer_forwarding() &&
-        test_physical_semantic_layer_seam() &&
+        test_live_borrowed_exsia_snapshot(false) && test_live_borrowed_exsia_snapshot(true) &&
+        test_owned_matmul_layer_lifetime() && test_non_exsia_pipeline_rejection() &&
+        test_owned_route_object_lifetimes() && test_execution_admission_and_moves() &&
+        test_all_physical_semantic_layer_sites() && test_physical_null_args_contract() &&
+        test_fp_facade_semantic_layer_forwarding() && test_physical_semantic_layer_seam() &&
         test_quantization_and_exsia_semantic_layer_seam() &&
         test_backend_semantic_resolution_and_dedupe() &&
-        test_args_layout_extension() &&
-        test_generated_config_contract() &&
-        test_precedence() &&
-        test_invalid_environment() &&
-        test_invalid_explicit_rmd_backend() &&
-        test_invalid_explicit_mode() &&
+#endif
+        test_args_layout_extension() && test_generated_config_contract() && test_precedence() &&
+        test_invalid_environment() && test_invalid_explicit_rmd_backend() &&
+        test_invalid_explicit_mode() && test_parser_boundaries_and_error_order() &&
         test_disabled_runtime_rmd_environment()
 #if defined(GGML_GEMMINI_OPTIONS_TEST_BACKEND)
         && test_execution_route_propagation()

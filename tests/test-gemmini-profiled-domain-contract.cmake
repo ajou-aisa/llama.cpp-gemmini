@@ -1,33 +1,57 @@
-foreach(required IN ITEMS MATMUL_SOURCE MATMUL_HEADER MATMUL_TELEMETRY
-                          GEMMINI_ENTRY_SOURCE GEMMINI_SOURCE_ROOT)
+foreach(required IN ITEMS DENSE_SOURCE EXECUTION_SOURCE TYPES_HEADER DENSE_HEADER EXECUTION_HEADER MATMUL_HEADER MATMUL_TELEMETRY
+                          GEMMINI_ENTRY_SOURCE OPS_SOURCE GEMMINI_SOURCE_ROOT)
     if(NOT DEFINED ${required})
         message(FATAL_ERROR "${required} is required")
     endif()
 endforeach()
 
-file(READ "${MATMUL_SOURCE}" matmul)
+file(READ "${DENSE_SOURCE}" dense_source)
+file(READ "${EXECUTION_SOURCE}" execution_source)
+file(READ "${TYPES_HEADER}" types_header)
+file(READ "${DENSE_HEADER}" dense_header)
+file(READ "${EXECUTION_HEADER}" execution_header)
 file(READ "${MATMUL_HEADER}" matmul_header)
 file(READ "${MATMUL_TELEMETRY}" transport)
 file(READ "${GEMMINI_ENTRY_SOURCE}" gemmini_entry)
-file(READ "${GEMMINI_SOURCE_ROOT}/quants/act/exsia/exsia.hpp" exsia_header)
+file(READ "${OPS_SOURCE}" gemmini_ops)
+file(READ "${GEMMINI_SOURCE_ROOT}/quants/act/exsia/exsia-event.hpp" exsia_event)
+file(READ "${GEMMINI_SOURCE_ROOT}/quants/act/exsia/exsia-profile.cpp" exsia_profile)
 file(READ "${GEMMINI_SOURCE_ROOT}/quants/act/exsia/exsia.cpp" exsia_source)
 file(READ "${GEMMINI_SOURCE_ROOT}/ggml-gemmini-telemetry.cpp" telemetry_source)
 
-string(FIND "${transport}"
-    "std::string serialize_cycle_telemetry(const PipelineStripeTelemetry & record)"
-    pipeline_serializer_begin)
-if(pipeline_serializer_begin EQUAL -1)
-    message(FATAL_ERROR "PIPELINE_STRIPE_SUMMARY serializer is unavailable")
-endif()
-string(SUBSTRING "${transport}" ${pipeline_serializer_begin} -1 pipeline_serializer_tail)
-string(FIND "${pipeline_serializer_tail}" "\n#endif\n}" pipeline_serializer_end)
-if(pipeline_serializer_end EQUAL -1)
-    message(FATAL_ERROR "PIPELINE_STRIPE_SUMMARY serializer end is unavailable")
-endif()
-math(EXPR pipeline_serializer_length "${pipeline_serializer_end} + 8")
-string(SUBSTRING "${pipeline_serializer_tail}" 0 ${pipeline_serializer_length} pipeline_serializer)
+# Typed emission and the raw compatibility wrapper share this serializer body.
+function(extract_serializer output source record_type)
+    string(REGEX MATCH
+        "static[ \t\r\n]+std::string[ \t\r\n]+serialize_cycle_telemetry_impl[ \t\r\n]*\\([ \t\r\n]*const[ \t\r\n]+${record_type}[ \t\r\n]*&[ \t\r\n]*record[ \t\r\n]*,[^)]*\\)[ \t\r\n]*\\{"
+        signature "${source}")
+    if(signature STREQUAL "")
+        message(FATAL_ERROR "${record_type} serializer is unavailable")
+    endif()
+    string(FIND "${source}" "${signature}" begin)
+    string(SUBSTRING "${source}" ${begin} -1 tail)
+    string(REGEX MATCH "#[ \t]*endif[ \t\r\n]*\\}" ending "${tail}")
+    if(ending STREQUAL "")
+        message(FATAL_ERROR "${record_type} serializer end is unavailable")
+    endif()
+    string(FIND "${tail}" "${ending}" end)
+    string(LENGTH "${ending}" ending_length)
+    math(EXPR length "${end} + ${ending_length}")
+    string(SUBSTRING "${tail}" 0 ${length} body)
+    string(REGEX MATCH
+        "std::string[ \t\r\n]+serialize_cycle_telemetry[ \t\r\n]*\\([ \t\r\n]*const[ \t\r\n]+${record_type}[ \t\r\n]*&[ \t\r\n]*record[ \t\r\n]*\\)[ \t\r\n]*\\{[ \t\r\n]*return[ \t\r\n]+serialize_cycle_telemetry_impl[ \t\r\n]*\\([ \t\r\n]*record[ \t\r\n]*,[ \t\r\n]*\\{[ \t\r\n]*\\}[ \t\r\n]*\\)[ \t\r\n]*;[ \t\r\n]*\\}"
+        wrapper "${source}")
+    if(wrapper STREQUAL "")
+        message(FATAL_ERROR "${record_type} raw wrapper must delegate to its serializer")
+    endif()
+    set(${output} "${body}" PARENT_SCOPE)
+endfunction()
+
+extract_serializer(pipeline_serializer "${transport}" PipelineStripeTelemetry)
 
 function(require_absent text token label)
+    string(REGEX REPLACE "\"[ \t\r\n]+\"" "" text "${text}")
+    string(REGEX REPLACE "[ \t\r\n]" "" text "${text}")
+    string(REGEX REPLACE "[ \t\r\n]" "" token "${token}")
     string(FIND "${text}" "${token}" position)
     if(NOT position EQUAL -1)
         message(FATAL_ERROR "${label}: unexpected ${token}")
@@ -35,6 +59,9 @@ function(require_absent text token label)
 endfunction()
 
 function(require_present text token label)
+    string(REGEX REPLACE "\"[ \t\r\n]+\"" "" text "${text}")
+    string(REGEX REPLACE "[ \t\r\n]" "" text "${text}")
+    string(REGEX REPLACE "[ \t\r\n]" "" token "${token}")
     string(FIND "${text}" "${token}" position)
     if(position EQUAL -1)
         message(FATAL_ERROR "${label}: missing ${token}")
@@ -54,7 +81,7 @@ endfunction()
 # in StripeReadyEvent/capture/apply. Existing nanosecond transport is retained.
 if(NOT DEFINED SEMANTIC_CASE OR SEMANTIC_CASE STREQUAL "F2")
     string(REGEX MATCH "struct StripeReadyEvent[^}]*\\};" ready_event
-                 "${exsia_header}")
+                 "${exsia_event}")
     if(ready_event STREQUAL "")
         message(FATAL_ERROR "F2: StripeReadyEvent is unavailable")
     endif()
@@ -62,18 +89,18 @@ if(NOT DEFINED SEMANTIC_CASE OR SEMANTIC_CASE STREQUAL "F2")
                               folding_start_cycle folding_end_cycle)
         require_absent("${ready_event}" "${endpoint}"
             "F2: cross-task native endpoint transport")
-        require_absent("${matmul}" "event.${endpoint}"
+        require_absent("${execution_source}" "event.${endpoint}"
             "F2: unchecked cross-task collector arithmetic")
         require_absent("${exsia_source}" "event.${endpoint} ="
             "F2: duplicate raw native consumer")
     endforeach()
     foreach(legacy IN ITEMS local_start_ns local_end_ns folding_start_ns folding_end_ns)
         require_present("${ready_event}" "${legacy}" "F2: legacy ns transport")
-        require_present("${matmul}" "event.${legacy}" "F2: legacy ns collector")
+        require_present("${execution_source}" "event.${legacy}" "F2: legacy ns collector")
     endforeach()
     foreach(structural_token IN ITEMS "exsia.local" "exsia.stripe_total"
                                       "checked_profile_interval(interval, !pipeline_cross_task)")
-        require_present("${exsia_source}" "${structural_token}"
+        require_present("${exsia_profile}" "${structural_token}"
             "F2: producer-side structural unavailability")
     endforeach()
 endif()
@@ -82,17 +109,7 @@ endif()
 # and ends in its dependent post task. It retains only the monotonic ns timeline;
 # no scalar or native cycle endpoints may cross that structural task boundary.
 if(NOT DEFINED SEMANTIC_CASE OR SEMANTIC_CASE STREQUAL "F4")
-    string(FIND "${telemetry_source}"
-        "std::string serialize_cycle_telemetry(const QuantizationStripeTelemetry & record)"
-        quant_begin)
-    string(FIND "${telemetry_source}"
-        "std::string serialize_cycle_telemetry(const RmdTelemetryRecord & record)"
-        quant_end)
-    if(quant_begin EQUAL -1 OR quant_end EQUAL -1 OR quant_end LESS quant_begin)
-        message(FATAL_ERROR "F4: quantization scalar serializer is unavailable")
-    endif()
-    math(EXPR quant_length "${quant_end} - ${quant_begin}")
-    string(SUBSTRING "${telemetry_source}" ${quant_begin} ${quant_length} quant_serializer)
+    extract_serializer(quant_serializer "${telemetry_source}" QuantizationStripeTelemetry)
     foreach(required IN ITEMS
             "null_field(out, \"start\")"
             "null_field(out, \"end\")"
@@ -128,6 +145,11 @@ endif()
 # The canonical pipeline record is the origin/develop nanosecond schema. These
 # names are forbidden there; standalone J-tile, Compose, Finalize, and
 # capture_finish records are deliberately not matched by this list.
+foreach(token IN ITEMS
+        "\\\"source\\\":\\\"steady_clock\\\"" "\\\"unit\\\":\\\"nanosecond\\\""
+        "\"nonadditive_summary\"")
+    require_present("${pipeline_serializer}" "${token}" "canonical pipeline clock domain")
+endforeach()
 foreach(name IN ITEMS
         execution_route cpu_work_source cpu_work_unit accelerator
         npu_dispatch npu_wait rtl_cycles physical_provider_identity
@@ -149,10 +171,13 @@ foreach(token IN ITEMS
         aggregate_profiled_stripe_cpu_work finalize_profiled_cpu_work
         cpu_work_interval direct_cpu_work select_rmd_cpu_work
         aggregate_quantize_profile checked_sum)
-    require_absent("${matmul}" "${token}" "matmul aggregate removal")
+    foreach(owner IN ITEMS dense_source execution_source types_header dense_header execution_header)
+        require_absent("${${owner}}" "${token}" "matmul aggregate removal in ${owner}")
+    endforeach()
     require_absent("${matmul_header}" "${token}" "matmul model removal")
     require_absent("${transport}" "${token}" "pipeline aggregate removal")
     require_absent("${gemmini_entry}" "${token}" "entry aggregate removal")
+    require_absent("${gemmini_ops}" "${token}" "operation aggregate removal")
 endforeach()
 
 # Named RMD/Quantize/PostFold totals are outside the approved detail boundary

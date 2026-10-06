@@ -3,7 +3,6 @@
 
 #include "../../../ggml-gemmini-telemetry.hpp"
 #include "../../../residual/rmd/rmd-compose.hpp"
-#include "exsia_shift.hpp"
 #include "types.hpp"
 
 #include "ggml-gemmini-args.h"
@@ -54,10 +53,6 @@
 #define EXSIA_VALIDATION 0
 #endif
 
-#if CYCLE_DETAIL && !LOG_CYCLE
-#error "CYCLE_DETAIL requires LOG_CYCLE"
-#endif
-
 #if EXSIA_PROFILE_COLLECTION_ENABLED
 #define EXSIA_PROFILE_COLLECT(...) __VA_ARGS__
 #else
@@ -71,2846 +66,978 @@
 #endif
 
 #if EXSIA_BRANCH_COUNTS_ENABLED
-#define EXSIA_STATS_PARAMETER , StripeCycleStats &stats
+#define EXSIA_STATS_PARAMETER , StripeCycleStats & stats
 #define EXSIA_STATS_ARGUMENT(stats) , stats
 #else
 #define EXSIA_STATS_PARAMETER
 #define EXSIA_STATS_ARGUMENT(stats)
 #endif
 
-#if GGML_GEMMINI_EXSIA_PROFILE_SCOPE_VALUE != 0 && !CYCLE_DETAIL
-#error "ExSIA profiling requires CYCLE_DETAIL"
-#endif
-
-#if EXSIA_VALIDATION && !EXSIA_BRANCH_COUNTS_ENABLED
-#error "EXSIA_VALIDATION requires P3 branch counts"
-#endif
-
-namespace ggml::gemmini::quants::act::exsia
-{
-    static_assert(GGML_GEMMINI_EXSIA_SIGMA > 0, "GGML_GEMMINI_EXSIA_SIGMA must be positive");
-
-    namespace
-    {
-        template <typename T>
-        void release_vector(std::vector<T> &values)
-        {
-            std::vector<T>().swap(values);
-        }
-
-        bool checked_mul_size(size_t lhs, size_t rhs, size_t &out)
-        {
-            if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs)
-                return false;
-
-            out = lhs * rhs;
-            return true;
-        }
-
-        bool checked_add_size(size_t lhs, size_t rhs, size_t &out)
-        {
-            if (lhs > std::numeric_limits<size_t>::max() - rhs)
-                return false;
-
-            out = lhs + rhs;
-            return true;
-        }
-
-        bool checked_round_up_multiple(size_t value, size_t multiple, size_t &out)
-        {
-            if (multiple == 0)
-                return false;
-
-            size_t adjusted = 0;
-            if (!checked_add_size(value, multiple - 1, adjusted))
-                return false;
-
-            out = (adjusted / multiple) * multiple;
-            return true;
-        }
-
-        static inline int16_t exp_to_theta(int16_t e, int16_t rho)
-        {
-            const int16_t neg_inf = std::numeric_limits<int16_t>::min();
-
-            if (e == neg_inf)
-                return neg_inf;
-
-            return static_cast<int16_t>(static_cast<int>(e) - static_cast<int>(rho));
-        }
-
-        static inline int32_t quantize_to_i32(float x, int16_t theta)
-        {
-            const int16_t neg_inf = std::numeric_limits<int16_t>::min();
-
-            if (theta == neg_inf || !std::isfinite(x))
-                return 0;
-
-            const double scaled = std::ldexp(static_cast<double>(x), -static_cast<int>(theta));
-
-            if (!std::isfinite(scaled))
-                return scaled < 0.0
-                           ? std::numeric_limits<int32_t>::min()
-                           : std::numeric_limits<int32_t>::max();
-
-            const double min_i32 = static_cast<double>(std::numeric_limits<int32_t>::min());
-            const double max_i32 = static_cast<double>(std::numeric_limits<int32_t>::max());
-
-            if (scaled <= min_i32)
-                return std::numeric_limits<int32_t>::min();
-            if (scaled >= max_i32)
-                return std::numeric_limits<int32_t>::max();
-
-            return static_cast<int32_t>(std::lrint(scaled));
-        }
-
-        static inline int64_t magnitude_i32(int32_t value) noexcept
-        {
-            const int64_t widened = static_cast<int64_t>(value);
-            return widened < 0 ? -widened : widened;
-        }
-
-#if EXSIA_VALIDATION
-        std::atomic<size_t> validation_block_top2_exp_rescan_counter{0};
-#endif
-
-#if EXSIA_PROFILE_LOG_ENABLED
-        static inline std::filesystem::path cycle_detail_log_path()
-        {
-            const char *path = std::getenv("GGML_GEMMINI_CYCLE_DETAIL_LOG");
-            return ggml::gemmini::log::resolve_output_path(
-                path && path[0] ? path : GEMMINI_LOG_DEFAULT_EXSIA_DETAIL_PATH);
-        }
-
-        struct ProfileConfig
-        {
-            std::string log_path;
-            std::string requested_path;
-            std::string inference_context = performance::log_context();
-            std::string execution_id = cycle::host_execution_id();
-            bool setup_ok = false;
-        };
-
-        static std::once_flag profile_log_init_once;
-        static bool profile_log_setup_ok = false;
-
-        ProfileConfig compile_profile_config()
-        {
-            ProfileConfig config;
-            if (const char *path = std::getenv("GGML_GEMMINI_CYCLE_DETAIL_LOG"); path && path[0])
-                config.requested_path = path;
-            config.log_path = cycle_detail_log_path().string();
-            std::call_once(profile_log_init_once, [&config] {
-                const std::filesystem::path requested(config.requested_path);
-                std::error_code ec;
-                if (requested.is_relative() && !requested.parent_path().empty())
-                {
-                    const std::filesystem::file_status status =
-                        std::filesystem::status(requested.parent_path(), ec);
-                    if ((ec && ec != std::errc::no_such_file_or_directory) ||
-                        (std::filesystem::exists(status) &&
-                         !std::filesystem::is_directory(status)))
-                        return;
-                }
-                const std::filesystem::path path(config.log_path);
-                if (!ggml::gemmini::log::prepare_output_parent(path))
-                    return;
-                std::ofstream file(path, std::ios::out | std::ios::trunc);
-                profile_log_setup_ok = file.good();
-            });
-            config.setup_ok = profile_log_setup_ok;
-            return config;
-        }
-#endif
-
-        uint64_t aggregate_now_ns()
-        {
-#if LOG_CYCLE && CYCLE_DETAIL
-            return ggml::gemmini::cycle::timestamp_ns();
-#else
-            return 0;
-#endif
-        }
-
-        uint64_t aggregate_now_tick()
-        {
-#if LOG_CYCLE
-            return ggml::gemmini::cycle::read();
-#else
-            return 0;
-#endif
-        }
-
-#if LOG_CYCLE
-        uint64_t cpu_worker_id()
-        {
-#if defined(GGML_GEMMINI_HAS_OPENMP)
-            return static_cast<uint64_t>(omp_get_thread_num());
-#else
-            return 0;
-#endif
-        }
-
-        gemmini_cycle_record_v2 cpu_identity(const char *layer, uint64_t run_id,
-                                             const char *op, uint64_t stripe = UINT64_MAX,
-                                             uint64_t node = UINT64_MAX)
-        {
-            gemmini_cycle_record_v2 identity{};
-            identity.interval.layer = layer;
-            identity.interval.op = op;
-            identity.identity_mask = GEMMINI_CYCLE_HAS_RUN_ID | GEMMINI_CYCLE_HAS_WORKER_ID;
-            identity.run_id = run_id;
-            identity.worker_id = cpu_worker_id();
-            if (stripe != UINT64_MAX) {
-                identity.identity_mask |= GEMMINI_CYCLE_HAS_STRIPE_ID | GEMMINI_CYCLE_HAS_SLOT;
-                identity.stripe_id = stripe;
-                identity.slot = stripe % EXSIA_PIPELINE_SLOT_COUNT;
-            }
-            if (node != UINT64_MAX) {
-                identity.identity_mask |= GEMMINI_CYCLE_HAS_NODE_ID;
-                identity.node_id = node;
-            }
-            return identity;
-        }
-#endif
-
-        class CpuWallInterval
-        {
-#if LOG_CYCLE
-            gemmini_cycle_record_v2 identity_{};
-            gemmini_cpu_sample start_{};
-#endif
-
-        public:
-            CpuWallInterval(const char *layer, uint64_t run_id, const char *op,
-                            uint64_t stripe = UINT64_MAX, uint64_t node = UINT64_MAX)
-            {
-#if LOG_CYCLE
-                identity_ = cpu_identity(layer, run_id, op, stripe, node);
-#else
-                (void) layer; (void) run_id; (void) op; (void) stripe; (void) node;
-#endif
-                resume();
-            }
-
-            void pause()
-            {
-#if LOG_CYCLE
-                if (start_.ns != 0) {
-                    const auto end = gemmini_cpu_timing_read();
-                    performance::record_cpu_wall(start_.ns, end.ns);
-                    gemmini_cpu_timing_record(&identity_, &start_, &end);
-                    start_ = {};
-                }
-#endif
-            }
-
-            void resume()
-            {
-#if LOG_CYCLE
-                start_ = gemmini_cpu_timing_read();
-#endif
-            }
-            void next(const char *op)
-            {
-                pause();
-#if LOG_CYCLE
-                identity_.interval.op = op;
-#else
-                (void) op;
-#endif
-                resume();
-            }
-            ~CpuWallInterval() { pause(); }
-        };
-
-#if EXSIA_PROFILE_COLLECTION_ENABLED
-#if !defined(__linux__) || !defined(__aarch64__)
-        uint64_t profile_now()
-        {
-            return ggml::gemmini::cycle::read();
-        }
-#endif
-
-        uint64_t profile_now_ns()
-        {
-            return aggregate_now_ns();
-        }
-
-        uint64_t profile_thread_id()
-        {
-#if defined(GGML_GEMMINI_HAS_OPENMP)
-            return omp_in_parallel() ? static_cast<uint64_t>(omp_get_thread_num()) : 0;
-#else
-            return 0;
-#endif
-        }
-
-        void start_profile_interval(ProfileInterval &interval,
-                [[maybe_unused]] const ggml_gemmini_args_t *args = nullptr,
-                [[maybe_unused]] const char *operation = nullptr,
-                [[maybe_unused]] uint64_t stripe_id = UINT64_MAX,
-                [[maybe_unused]] std::vector<uint64_t> dependencies = {})
-        {
-#if CYCLE_SIM
-            if (args && operation && args->cycle_sim_context) {
-                dependencies.insert(dependencies.end(), args->cycle_sim_host_dependencies.begin(),
-                                    args->cycle_sim_host_dependencies.end());
-                interval.host_stage = args->cycle_sim_context.session->host_stage_begin(
-                    args->cycle_sim_context, {operation, "POTAL_HOST", "llama.cpp-gemmini",
-                        "ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp:ExSIA::run", {}, std::move(dependencies)});
-                const cycle_sim::ScopedContext scope(interval.host_stage);
-                interval.correlation = log::current_cpu_correlation();
-                interval.correlation.worker_count = 1;
-                interval.host_operation = operation;
-                interval.host_layer = args->matmul_layer;
-                interval.stripe_id = stripe_id;
-#if LOG_CYCLE
-                interval.host_start_sample = gemmini_cpu_timing_read();
-#endif
-            }
-#endif
-            interval.valid = true;
-            interval.start_thread_id = profile_thread_id();
-            interval.start_tid = ggml::gemmini::cycle::host_thread_id();
-#if defined(__linux__) && defined(__aarch64__)
-            interval.start_sample = ggml::gemmini::cycle::read_sample();
-            interval.start = interval.start_sample.value;
-#else
-            interval.start = profile_now();
-#endif
-            interval.start_ns = profile_now_ns();
-        }
-
-        [[maybe_unused]] std::vector<uint64_t> profile_host_stage_ids(const StripeProfileRecord &profile)
-        {
-            std::vector<uint64_t> result;
-#if CYCLE_SIM
-            const auto add = [&](const ProfileInterval &interval) {
-                if (interval.host_stage.host_stage_id) result.push_back(*interval.host_stage.host_stage_id);
-            };
-            add(profile.local);
-            for (const auto &group : profile.local_groups) add(group);
-            add(profile.mask_assembly);
-            add(profile.exponent_reduction);
-            add(profile.folding);
-#else
-            (void) profile;
-#endif
-            return result;
-        }
-
-        bool end_profile_interval(ProfileInterval &interval)
-        {
-            assert(interval.valid);
-            if (!interval.valid)
-                return false;
-#if defined(__linux__) && defined(__aarch64__)
-            interval.end_sample = ggml::gemmini::cycle::read_sample();
-            interval.end = interval.end_sample.value;
-#else
-            interval.end = profile_now();
-#endif
-            interval.end_ns = profile_now_ns();
-            interval.end_tid = ggml::gemmini::cycle::host_thread_id();
-            interval.end_thread_id = profile_thread_id();
-#if CYCLE_SIM
-            if (interval.host_stage) {
-#if LOG_CYCLE
-                const cycle_sim::ScopedContext scope(interval.host_stage);
-                const auto host_end_sample = gemmini_cpu_timing_read();
-                gemmini_cycle_record_v2 record{};
-                record.interval.layer = interval.host_layer.c_str();
-                record.interval.op = interval.host_operation;
-                record.identity_mask = GEMMINI_CYCLE_HAS_WORKER_ID;
-                record.worker_id = 0;
-                if (interval.stripe_id != UINT64_MAX) {
-                    record.identity_mask |= GEMMINI_CYCLE_HAS_STRIPE_ID;
-                    record.stripe_id = interval.stripe_id;
-                }
-                log::cycle.write_cpu(record, interval.host_start_sample, host_end_sample,
-                    true, false, false, cycle::TimingIntervalClass::canonical_additive);
-#endif
-                interval.host_stage.session->host_stage_end(interval.host_stage);
-            }
-#endif
-#if defined(__linux__) && defined(__aarch64__)
-            return true;
-#else
-            return interval.end >= interval.start;
-#endif
-        }
-#endif
-
-#if LOG_CYCLE
-        void write_json_string(std::ostream &out, const std::string &value)
-        {
-            out.put('"');
-            for (const char character : value)
-            {
-                switch (character)
-                {
-                case '\\': out << "\\\\"; break;
-                case '"': out << "\\\""; break;
-                case '\n': out << "\\n"; break;
-                case '\r': out << "\\r"; break;
-                case '\t': out << "\\t"; break;
-                default:
-                    if (static_cast<unsigned char>(character) < 0x20) {
-                        const char hex[] = "0123456789abcdef";
-                        out << "\\u00" << hex[(character >> 4) & 0xf] << hex[character & 0xf];
-                    } else {
-                        out.put(character);
-                    }
-                    break;
-                }
-            }
-            out.put('"');
-        }
-
-        struct ExsiaRunTiming
-        {
-            const char *layer;
-            uint64_t run_id;
-            gemmini_cpu_sample start = gemmini_cpu_timing_read();
-            std::array<gemmini_cpu_totals, EXSIA_OMP_THREAD_COUNT> worker_cpu{};
-            uint64_t handoff_ns = 0;
-            uint64_t wait_ns = 0;
-            uint64_t handoff_calls = 0;
-            uint64_t wait_measured_calls = 0;
-            bool success = false;
-
-            void submission(const StripeReadyEvent &event, const gemmini_cpu_sample &begin,
-                            const gemmini_cpu_sample &end, bool accepted)
-            {
-                const uint64_t elapsed = end.ns - begin.ns;
-                const bool measured = event.submission_wait_ns.has_value() &&
-                    *event.submission_wait_ns <= elapsed;
-                ++handoff_calls;
-                handoff_ns += elapsed;
-                if (measured) {
-                    ++wait_measured_calls;
-                    wait_ns += *event.submission_wait_ns;
-                }
-                const auto identity = cpu_identity(layer, run_id, "exsia.submission_callback", event.stripe_id);
-                gemmini_cpu_timing_record(&identity, &begin, &end);
-#if CYCLE_DETAIL
-                log::CycleRecord record{};
-                record.layer = layer;
-                record.op = "exsia.stripe_submission";
-                record.source = "steady_clock";
-                record.unit = "nanosecond";
-                record.start = begin.ns;
-                record.end = end.ns;
-                record.identity_mask = GEMMINI_CYCLE_HAS_RUN_ID | GEMMINI_CYCLE_HAS_STRIPE_ID;
-                record.identity_mask |= GEMMINI_CYCLE_HAS_SLOT;
-                record.run_id = run_id;
-                record.stripe_id = event.stripe_id;
-                record.slot = event.slot;
-                std::string json = log::serialize_cycle_record(record);
-                json.insert(json.rfind('}'),
-                    std::string(",\"additive\":false,\"operation_success\":") +
-                    (accepted ? "true" : "false") + ",\"host_timing\":" +
-                    cycle::serialize_host_timing(begin.ns, end.ns, begin.tid, end.tid) +
-                    ",\"submission_wait_ns\":" +
-                    (measured ? std::to_string(*event.submission_wait_ns) : "null") +
-                    ",\"handoff_nonwait_ns\":" +
-                    (measured ? std::to_string(elapsed - *event.submission_wait_ns) : "null"));
-                log::cycle.write_json(json);
-#else
-                (void) accepted;
-#endif
-            }
-
-            ~ExsiaRunTiming()
-            {
-                const auto end = gemmini_cpu_timing_read();
-                const auto identity = cpu_identity(layer, run_id, "exsia.run.caller");
-                gemmini_cpu_timing_record(&identity, &start, &end);
-#if CYCLE_DETAIL
-                gemmini_cpu_totals cpu_workers{};
-                gemmini_cpu_timing_add(&cpu_workers, &start, &end);
-                for (const auto &worker : worker_cpu)
-                    gemmini_cpu_timing_merge(&cpu_workers, &worker);
-                const uint64_t elapsed = end.ns - start.ns;
-                const bool complete = handoff_calls == wait_measured_calls;
-                std::ostringstream out;
-                out << "{\"schema\":\"gemmini.cycle\",\"version\":2,"
-                    << "\"record_type\":\"EXSIA_RUN_SUMMARY\",\"op\":\"exsia.run.summary\","
-                    << "\"source\":\"steady_clock\",\"unit\":\"nanosecond\",\"layer\":";
-                write_json_string(out, layer);
-                out << ",\"run_id\":" << run_id
-                    << ",\"host_timing\":" << cycle::serialize_host_timing(
-                        start.ns, end.ns, start.tid, end.tid)
-                    << ",\"cpu_workers\":" << cycle::serialize_cpu_totals(cpu_workers)
-                    << ",\"run_wall_ns\":" << elapsed
-                    << ",\"handoff_wall_ns\":" << handoff_ns
-                    << ",\"outside_handoff_wall_ns\":" << elapsed - handoff_ns
-                    << ",\"submission_wait_ns\":" << (complete ? std::to_string(wait_ns) : "null")
-                    << ",\"handoff_nonwait_ns\":"
-                    << (complete ? std::to_string(handoff_ns - wait_ns) : "null")
-                    << ",\"handoff_calls\":" << handoff_calls
-                    << ",\"wait_measured_calls\":" << wait_measured_calls
-                    << ",\"operation_success\":" << (success ? "true" : "false")
-                    << ",\"valid\":true,\"additive\":false}";
-                log::cycle.write_json(out.str());
-#endif
-            }
-        };
-#endif
-
-    }
-
-#if EXSIA_PROFILE_COLLECTION_ENABLED
-    ProfileCycleValue checked_profile_interval(
-        const ProfileInterval &interval, bool structurally_same_owner_eligible) noexcept
-    {
-        if (!interval.valid)
-            return {{}, ProfileCycleStatus::missing_component
-#if defined(__linux__) && defined(__aarch64__)
-                    , ggml::gemmini::cycle::NativeCycleReason::none
-#endif
-            };
-#if defined(__linux__) && defined(__aarch64__)
-        const ggml::gemmini::cycle::NativeCycleDelta delta =
-            ggml::gemmini::cycle::evaluate_interval(
-                interval.start_sample, interval.end_sample,
-                structurally_same_owner_eligible);
-        if (delta.valid)
-            return {delta.value, ProfileCycleStatus::complete, delta.sample_reason};
-        ProfileCycleStatus status = ProfileCycleStatus::counter_regression;
-        switch (delta.reason)
-        {
-        case ggml::gemmini::cycle::NativeCycleReason::invalid_start:
-            status = ProfileCycleStatus::invalid_start;
-            break;
-        case ggml::gemmini::cycle::NativeCycleReason::invalid_end:
-            status = ProfileCycleStatus::invalid_end;
-            break;
-        case ggml::gemmini::cycle::NativeCycleReason::source_mismatch:
-            status = ProfileCycleStatus::source_mismatch;
-            break;
-        case ggml::gemmini::cycle::NativeCycleReason::event_owner_mismatch:
-            status = ProfileCycleStatus::event_owner_mismatch;
-            break;
-        case ggml::gemmini::cycle::NativeCycleReason::event_generation_mismatch:
-            status = ProfileCycleStatus::event_generation_mismatch;
-            break;
-        case ggml::gemmini::cycle::NativeCycleReason::structurally_cross_task:
-            status = ProfileCycleStatus::structurally_cross_task;
-            break;
-        case ggml::gemmini::cycle::NativeCycleReason::counter_regression:
-            status = ProfileCycleStatus::counter_regression;
-            break;
-        case ggml::gemmini::cycle::NativeCycleReason::none:
-        case ggml::gemmini::cycle::NativeCycleReason::unavailable_event:
-        case ggml::gemmini::cycle::NativeCycleReason::unavailable_direct_mapping:
-        case ggml::gemmini::cycle::NativeCycleReason::multiplexed:
-        case ggml::gemmini::cycle::NativeCycleReason::seqlock_exhausted:
-            break;
-        }
-        return {{}, status, delta.sample_reason};
-#else
-        if (!structurally_same_owner_eligible)
-            return {{}, ProfileCycleStatus::structurally_cross_task};
-        if (interval.end < interval.start)
-            return {{}, ProfileCycleStatus::counter_regression};
-        return {interval.end - interval.start, ProfileCycleStatus::complete};
-#endif
-    }
-
-#endif
-
-#if EXSIA_STAGE_PROFILE_ENABLED
-#if defined(__linux__) && defined(__aarch64__)
-#define EXSIA_STAGE_CYCLE_READ() ggml::gemmini::cycle::read_sample()
-#else
-#define EXSIA_STAGE_CYCLE_READ() ggml::gemmini::cycle::read()
-#endif
-#else
-#define EXSIA_STAGE_CYCLE_READ() static_cast<uint64_t>(0)
-#endif
-
-#if EXSIA_STAGE_PROFILE_ENABLED && defined(__linux__) && defined(__aarch64__)
-    namespace
-    {
-        void record_stage_cycles(
-            LocalBlockCycleSample &sample,
-            const std::array<ggml::gemmini::cycle::NativeCycleSample, 5> &endpoints)
-        {
-            sample.stage_endpoints = endpoints;
-            for (size_t stage = 0; stage < sample.stage_intervals.size(); ++stage)
-            {
-                ProfileInterval interval{};
-                interval.valid = true;
-                interval.start_sample = endpoints[stage];
-                interval.end_sample = endpoints[stage + 1];
-                sample.stage_intervals[stage] = checked_profile_interval(interval);
-            }
-            sample.p0 = sample.stage_intervals[0].cycles.value_or(0);
-            sample.p1 = sample.stage_intervals[1].cycles.value_or(0);
-            sample.p2 = sample.stage_intervals[2].cycles.value_or(0);
-            sample.p3 = sample.stage_intervals[3].cycles.value_or(0);
-        }
-    }
-#endif
-
-#if EXSIA_PROFILE_LOG_ENABLED
-    namespace
-    {
-        static inline bool profile_interval_valid(const ProfileInterval &interval)
-        {
-#if defined(__linux__) && defined(__aarch64__)
-            return interval.valid;
-#else
-            return interval.valid && interval.end >= interval.start;
-#endif
-        }
-
-        static const char *profile_cycle_status_name(ProfileCycleStatus status)
-        {
-            switch (status)
-            {
-            case ProfileCycleStatus::complete: return "complete";
-            case ProfileCycleStatus::missing_component: return "missing_component";
-            case ProfileCycleStatus::invalid_start: return "invalid_start";
-            case ProfileCycleStatus::invalid_end: return "invalid_end";
-            case ProfileCycleStatus::source_mismatch: return "source_mismatch";
-            case ProfileCycleStatus::event_owner_mismatch: return "event_owner_mismatch";
-            case ProfileCycleStatus::event_generation_mismatch: return "event_generation_mismatch";
-            case ProfileCycleStatus::structurally_cross_task: return "structurally_cross_task";
-            case ProfileCycleStatus::counter_regression: return "counter_regression";
-            case ProfileCycleStatus::sum_overflow: return "sum_overflow";
-            }
-            return "missing_component";
-        }
-
-        static inline size_t expected_profile_team_size(const char *mode)
-        {
-            return std::strcmp(mode, "Sequential") == 0 ? 1 : EXSIA_OMP_THREAD_COUNT;
-        }
-
-        static inline void write_nullable_json_string(std::ostream &out, const char *value)
-        {
-            if (value == nullptr || *value == '\0')
-                out << "null";
-            else
-                write_json_string(out, value);
-        }
-
-        static inline void write_timeline_event(std::ostream &out,
-                                                const char *layer,
-                                                uint64_t run_id,
-                                                const char *mode,
-                                                size_t stripe_idx,
-                                                const char *op,
-                                                const ProfileInterval &interval,
-                                                size_t team_size,
-                                                const size_t *worker_id)
-        {
-            out << "{\"schema\":\"gemmini.cycle\",\"version\":2,"
-                << "\"record_type\":\"TIMELINE\",\"op\":";
-            write_json_string(out, op);
-            out << ",\"layer\":";
-            write_nullable_json_string(out, layer);
-            out << ",\"run_id\":" << run_id << ",\"mode\":";
-            write_json_string(out, mode);
-            out << ",\"stripe_id\":" << stripe_idx
-                << ",\"slot\":" << stripe_idx % EXSIA_PIPELINE_SLOT_COUNT
-                << ",\"node_id\":null,\"worker_id\":";
-            if (worker_id == nullptr) out << "null"; else out << *worker_id;
-            const bool pipeline_cross_task =
-                std::strcmp(mode, "LocalFoldingPipeline") == 0 &&
-                (std::strcmp(op, "exsia.local") == 0 ||
-                 std::strcmp(op, "exsia.stripe_total") == 0);
-            const ProfileCycleValue checked =
-                checked_profile_interval(interval, !pipeline_cross_task);
-            out << ",\"start\":" << interval.start << ",\"end\":" << interval.end
-                << ",\"start_thread_id\":" << interval.start_thread_id
-                << ",\"end_thread_id\":" << interval.end_thread_id
-                << ",\"host_timing\":" << ggml::gemmini::cycle::serialize_host_timing(
-                    interval.start_ns, interval.end_ns, interval.start_tid, interval.end_tid)
-                << ",\"clock_mode\":";
-            write_json_string(out, ggml::gemmini::cycle::clock_mode());
-            out << ",\"units\":";
-            write_json_string(out, ggml::gemmini::cycle::units());
-            out << ",\"source\":";
-            write_json_string(out, kNativeCycleSource);
-            out << ",\"unit\":";
-            write_json_string(out, kNativeCycleUnit);
-            out << ",\"timer_resolution\":" << ggml::gemmini::cycle::resolution()
-                << ",\"team_size\":" << team_size << ",\"elapsed\":";
-            const char *excluded = ggml::gemmini::log::cpu_service_exclusion(op);
-            if (checked.cycles.has_value() && !excluded) out << *checked.cycles; else out << "null";
-            out << ",\"cycle_status\":";
-            write_json_string(out, profile_cycle_status_name(checked.status));
-#if defined(__linux__) && defined(__aarch64__)
-            out << ",\"sample_reason\":";
-            write_json_string(out, ggml::gemmini::cycle::reason_name(checked.sample_reason));
-#endif
-            out << ggml::gemmini::log::serialize_cpu_service_metadata(op, excluded) << "}\n";
-        }
-
-        static inline void write_timeline_run_event(std::ostream &out,
-                                                    const char *layer,
-                                                    uint64_t run_id,
-                                                    const char *mode,
-                                                     const ProfileInterval &interval,
-                                                     size_t team_size)
-        {
-            out << "{\"schema\":\"gemmini.cycle\",\"version\":2,"
-                << "\"record_type\":\"TIMELINE\",\"op\":\"exsia.run_total\",\"layer\":";
-            write_nullable_json_string(out, layer);
-            out << ",\"run_id\":" << run_id << ",\"mode\":";
-            write_json_string(out, mode);
-            const ProfileCycleValue checked = checked_profile_interval(interval);
-            out << ",\"stripe_id\":null,\"slot\":null,\"node_id\":null,\"worker_id\":null"
-                << ",\"start\":" << interval.start << ",\"end\":" << interval.end
-                << ",\"start_thread_id\":" << interval.start_thread_id
-                << ",\"end_thread_id\":" << interval.end_thread_id
-                << ",\"host_timing\":" << ggml::gemmini::cycle::serialize_host_timing(
-                    interval.start_ns, interval.end_ns, interval.start_tid, interval.end_tid)
-                << ",\"clock_mode\":";
-            write_json_string(out, ggml::gemmini::cycle::clock_mode());
-            out << ",\"units\":";
-            write_json_string(out, ggml::gemmini::cycle::units());
-            out << ",\"source\":";
-            write_json_string(out, kNativeCycleSource);
-            out << ",\"unit\":";
-            write_json_string(out, kNativeCycleUnit);
-            out << ",\"timer_resolution\":" << ggml::gemmini::cycle::resolution()
-                << ",\"team_size\":" << team_size << ",\"elapsed\":";
-            const char *excluded = ggml::gemmini::log::cpu_service_exclusion("exsia.run_total");
-            if (checked.cycles.has_value() && !excluded) out << *checked.cycles; else out << "null";
-            out << ",\"cycle_status\":";
-            write_json_string(out, profile_cycle_status_name(checked.status));
-#if defined(__linux__) && defined(__aarch64__)
-            out << ",\"sample_reason\":";
-            write_json_string(out, ggml::gemmini::cycle::reason_name(checked.sample_reason));
-#endif
-            out << ggml::gemmini::log::serialize_cpu_service_metadata("exsia.run_total", excluded) << "}\n";
-        }
-
-#if EXSIA_STAGE_PROFILE_ENABLED
-        static inline void write_stage_metric(std::ostream &out,
-                                              const char *layer,
-                                              uint64_t run_id,
-                                              const char *mode,
-                                              size_t stripe_idx,
-                                              const char *suffix,
-                                              uint64_t value,
-                                              ProfileCycleStatus status,
-                                              const char *value_units,
-                                              size_t team_size,
-                                              const StageCycleStats *stats = nullptr)
-        {
-            if (stats != nullptr && std::strcmp(value_units, "count") != 0)
-                status = stats->cycle_status();
-            out << "{\"schema\":\"gemmini.cycle\",\"version\":2,"
-                << "\"record_type\":\"STAGE\",\"op\":\"exsia.stage_metric\",\"layer\":";
-            write_nullable_json_string(out, layer);
-            out << ",\"run_id\":" << run_id << ",\"mode\":";
-            write_json_string(out, mode);
-            out << ",\"stripe_id\":" << stripe_idx
-                << ",\"slot\":" << stripe_idx % EXSIA_PIPELINE_SLOT_COUNT
-                << ",\"node_id\":null,\"worker_id\":null,\"metric\":";
-            write_json_string(out, suffix);
-            out << ",\"value\":";
-            if (status == ProfileCycleStatus::complete) out << value; else out << "null";
-            out << ",\"value_units\":";
-            write_json_string(out, value_units);
-            out << ",\"source\":";
-            write_json_string(out, kNativeCycleSource);
-            out << ",\"unit\":";
-            write_json_string(out, std::strcmp(value_units, "count") == 0 ? "count" : kNativeCycleUnit);
-            out << ",\"team_size\":" << team_size << ",\"cycle_status\":";
-            write_json_string(out, profile_cycle_status_name(status));
-            if (stats != nullptr)
-            {
-                out << ",\"total_count\":" << stats->total_count
-                    << ",\"valid_count\":" << stats->count
-                    << ",\"invalid_count\":" << stats->total_count - stats->count;
-#if defined(__linux__) && defined(__aarch64__)
-                out << ",\"sample_reason\":";
-                write_json_string(out, ggml::gemmini::cycle::reason_name(stats->sample_reason));
-#endif
-            }
-            out << ggml::gemmini::log::serialize_cpu_service_metadata("exsia.stage_metric") << "}\n";
-        }
-#endif
-
-        static std::mutex profile_flush_mutex;
-
-        static inline ExSIAState::FailureCode flush_profile(const ProfileConfig &config,
-                                                            const char *layer,
-                                                            uint64_t run_id,
-                                                            const char *mode,
-                                                            const std::vector<StripeProfileRecord> &profiles,
-                                                            const ProfileInterval &run_interval,
-                                                            const ExSIAState &state)
-        {
-            std::ostringstream trace;
-            const size_t expected_team_size = expected_profile_team_size(mode);
-            const bool sequential = std::strcmp(mode, "Sequential") == 0;
-
-            for (const StripeProfileRecord &profile : profiles)
-            {
-                if (!profile_interval_valid(profile.local) ||
-                    !profile_interval_valid(profile.mask_assembly) ||
-                    !profile_interval_valid(profile.exponent_reduction) ||
-                    !profile_interval_valid(profile.folding) ||
-                    !profile_interval_valid(profile.stripe_total) ||
-                    profile.team_size != expected_team_size)
-                    return ExSIAState::FailureCode::ProfileIntervalInvalid;
-                write_timeline_event(trace, layer, run_id, mode, profile.stripe_idx,
-                                     "exsia.local", profile.local, profile.team_size, nullptr);
-                if (!sequential)
-                {
-                    for (size_t group = 0; group < profile.local_groups.size(); ++group)
-                    {
-                        const ProfileInterval &interval = profile.local_groups[group];
-                        if (!profile_interval_valid(interval))
-                            return ExSIAState::FailureCode::ProfileIntervalInvalid;
-                        write_timeline_event(trace, layer, run_id, mode, profile.stripe_idx,
-                                             "exsia.local_group", interval, profile.team_size,
-                                             &group);
-                    }
-                }
-                write_timeline_event(trace, layer, run_id, mode, profile.stripe_idx,
-                                     "exsia.mask_assembly",
-                                     profile.mask_assembly, profile.team_size, nullptr);
-                write_timeline_event(trace, layer, run_id, mode, profile.stripe_idx,
-                                     "exsia.exponent_reduction",
-                                     profile.exponent_reduction, profile.team_size, nullptr);
-                write_timeline_event(trace, layer, run_id, mode, profile.stripe_idx,
-                                     "exsia.folding", profile.folding, profile.team_size, nullptr);
-                write_timeline_event(trace, layer, run_id, mode, profile.stripe_idx,
-                                     "exsia.stripe_total", profile.stripe_total, profile.team_size,
-                                     nullptr);
-#if EXSIA_STAGE_PROFILE_ENABLED
-                const uint64_t blocks = profile.stats.p3_bypass_no_int_count +
-                    profile.stats.p3_bypass_same_scale_count + profile.stats.p3_replay_count;
-                const uint64_t logical = (profile.row_end - profile.row_start) * state.K_logical;
-                const uint64_t padded = (profile.row_end - profile.row_start) * state.K_padded;
-                trace << "{\"schema\":\"gemmini.cycle\",\"version\":2,"
-                      << "\"record_type\":\"EXSIA_WORKLOAD\",\"op\":\"exsia.workload\",\"layer\":";
-                write_nullable_json_string(trace, layer);
-                trace << ",\"run_id\":" << run_id << ",\"stripe_id\":" << profile.stripe_idx
-                      << ",\"slot\":" << profile.stripe_idx % EXSIA_PIPELINE_SLOT_COUNT
-                      << ",\"mode\":";
-                write_json_string(trace, mode);
-                trace << ",\"row_begin\":" << profile.row_start << ",\"row_end\":" << profile.row_end
-                      << ",\"logical_elements\":" << logical << ",\"padded_elements\":" << padded
-                      << ",\"padding_elements\":" << padded - logical
-                      << ",\"processed_blocks\":" << blocks
-                      << ",\"reused_blocks\":" << blocks - profile.stats.p3_replay_count - profile.stats.forced_recompute_count
-                      << ",\"regenerated_blocks\":" << profile.stats.p3_replay_count + profile.stats.forced_recompute_count
-                      << ",\"forced_recomputed_blocks\":" << profile.stats.forced_recompute_count
-                      << ",\"selected_positions\":" << profile.selected_positions
-                      << ",\"residual_nnz\":" << profile.residual_nnz
-                      << ",\"host_timing\":" << cycle::serialize_host_timing(
-                          profile.stripe_total.start_ns, profile.stripe_total.end_ns,
-                          profile.stripe_total.start_tid, profile.stripe_total.end_tid)
-                      << ",\"source\":\"host_observation\",\"unit\":\"count\",\"valid\":true}\n";
-                const StageCycleStats *stages[] = {
-                    &profile.stats.p0,
-                    &profile.stats.p1,
-                    &profile.stats.p2,
-                    &profile.stats.p3,
-                };
-                for (size_t stage = 0; stage < 4; ++stage)
-                {
-#if defined(__linux__) && defined(__aarch64__)
-                    const StageCycleStats *checked_stats = stages[stage];
-#else
-                    const StageCycleStats *checked_stats = nullptr;
-#endif
-                    char suffix[48];
-                    std::snprintf(suffix, sizeof(suffix), "local.p%zu.sum", stage);
-                    write_stage_metric(trace, layer, run_id, mode, profile.stripe_idx,
-                                       suffix, stages[stage]->sum, ProfileCycleStatus::complete,
-                                       ggml::gemmini::cycle::units(), profile.team_size, checked_stats);
-                    std::snprintf(suffix, sizeof(suffix), "local.p%zu.count", stage);
-                    write_stage_metric(trace, layer, run_id, mode, profile.stripe_idx,
-                                       suffix, stages[stage]->count, ProfileCycleStatus::complete,
-                                       "count", profile.team_size, checked_stats);
-                    std::snprintf(suffix, sizeof(suffix), "local.p%zu.max", stage);
-                    write_stage_metric(trace, layer, run_id, mode, profile.stripe_idx,
-                                       suffix, stages[stage]->max, ProfileCycleStatus::complete,
-                                       ggml::gemmini::cycle::units(), profile.team_size, checked_stats);
-                }
-                write_stage_metric(trace, layer, run_id, mode, profile.stripe_idx,
-                                    "local.p3.bypass_no_int.count",
-                                    profile.stats.p3_bypass_no_int_count,
-                                    ProfileCycleStatus::complete, "count", profile.team_size);
-                write_stage_metric(trace, layer, run_id, mode, profile.stripe_idx,
-                                    "local.p3.bypass_same_scale.count",
-                                    profile.stats.p3_bypass_same_scale_count,
-                                    ProfileCycleStatus::complete, "count", profile.team_size);
-                write_stage_metric(trace, layer, run_id, mode, profile.stripe_idx,
-                                    "local.p3.replay.count",
-                                    profile.stats.p3_replay_count,
-                                    ProfileCycleStatus::complete, "count", profile.team_size);
-#endif
-            }
-            if (!profile_interval_valid(run_interval))
-                return ExSIAState::FailureCode::ProfileIntervalInvalid;
-            const size_t run_team_size = profiles.empty() ? expected_team_size : profiles.front().team_size;
-            write_timeline_run_event(trace, layer, run_id, mode, run_interval, run_team_size);
-
-            (void) state;
-            std::string serialized = trace.str();
-            const std::string context = ",\"execution_id\":\"" + config.execution_id +
-                "\",\"inference_context\":" +
-                (config.inference_context.empty() ? "null" : config.inference_context);
-            for (size_t end = serialized.find('\n'); end != std::string::npos;
-                 end = serialized.find('\n', end + context.size() + 1))
-                serialized.insert(end - 1, context);
-            log::cycle.write_json(serialized);
-
-            std::lock_guard<std::mutex> lock(profile_flush_mutex);
-            if (!ggml::gemmini::log::prepare_output_parent(config.log_path))
-                return ExSIAState::FailureCode::ProfileFlushFailure;
-            std::ofstream file(config.log_path, std::ios::app);
-            if (!file)
-                return ExSIAState::FailureCode::ProfileFlushFailure;
-            file << serialized;
-            file.flush();
-            return file ? ExSIAState::FailureCode::None : ExSIAState::FailureCode::ProfileFlushFailure;
-        }
-    }
-#endif
-
-#if EXSIA_VALIDATION && EXSIA_STAGE_PROFILE_ENABLED && EXSIA_PROFILE_LOG_ENABLED
-    std::string serialize_stage_sum_for_test(const StageCycleStats &stats)
-    {
-        std::ostringstream out;
-        write_stage_metric(out, "test-layer", 0, "Sequential", 0, "local.p0.sum",
-                           stats.sum, ProfileCycleStatus::complete,
-                           ggml::gemmini::cycle::units(), 1, &stats);
-        return out.str();
-    }
-#endif
-
-    uint64_t next_exsia_run_id()
-    {
-        static std::atomic<uint64_t> next{0};
-        return next.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    std::array<ExSIAState::ExecutionModeAvailability, 3> execution_mode_availability()
-    {
-        using Mode = ExSIAState::ExecutionMode;
+namespace ggml::gemmini::quants::act::exsia {
+using namespace detail;
+
+namespace {
+template <typename T> void release_vector(std::vector<T> & values) {
+    std::vector<T>().swap(values);
+}
+
+bool checked_mul_size(size_t lhs, size_t rhs, size_t & out) {
+    if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs)
+        return false;
+
+    out = lhs * rhs;
+    return true;
+}
+
+bool checked_add_size(size_t lhs, size_t rhs, size_t & out) {
+    if (lhs > std::numeric_limits<size_t>::max() - rhs)
+        return false;
+
+    out = lhs + rhs;
+    return true;
+}
+
+bool checked_round_up_multiple(size_t value, size_t multiple, size_t & out) {
+    if (multiple == 0)
+        return false;
+
+    size_t adjusted = 0;
+    if (!checked_add_size(value, multiple - 1, adjusted))
+        return false;
+
+    out = (adjusted / multiple) * multiple;
+    return true;
+}
+
+} // namespace
+
+uint64_t next_exsia_run_id() {
+    static std::atomic<uint64_t> next{0};
+    return next.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::array<ExSIAState::ExecutionModeAvailability, 3> execution_mode_availability() {
+    using Mode = ExSIAState::ExecutionMode;
 
 #if defined(GGML_GEMMINI_HAS_OPENMP)
-        constexpr const char * local_parallel_reason = "fixed four-task OpenMP Local stage";
-        constexpr const char * pipeline_reason = "two-slot OpenMP Local/Folding pipeline";
+    constexpr const char * local_parallel_reason = "fixed four-task OpenMP Local stage";
+    constexpr const char * pipeline_reason       = "two-slot OpenMP Local/Folding pipeline";
 #else
-        constexpr const char * local_parallel_reason = "OpenMP unavailable";
-        constexpr const char * pipeline_reason = "OpenMP unavailable";
+    constexpr const char * local_parallel_reason = "OpenMP unavailable";
+    constexpr const char * pipeline_reason       = "OpenMP unavailable";
 #endif
 
-        return {{
-            {Mode::Sequential, "Sequential", true, "RUNNABLE", "default execution mode"},
+    return {{
+        {Mode::Sequential, "Sequential", true, "RUNNABLE", "default execution mode"},
 #if defined(GGML_GEMMINI_HAS_OPENMP)
-            {Mode::LocalParallel, "LocalParallel", true, "RUNNABLE", local_parallel_reason},
+        {Mode::LocalParallel, "LocalParallel", true, "RUNNABLE", local_parallel_reason},
 #else
-            {Mode::LocalParallel, "LocalParallel", false, "BLOCKED", local_parallel_reason},
+        {Mode::LocalParallel, "LocalParallel", false, "BLOCKED", local_parallel_reason},
 #endif
 #if defined(GGML_GEMMINI_HAS_OPENMP)
-            {Mode::LocalFoldingPipeline, "LocalFoldingPipeline", true, "RUNNABLE", pipeline_reason},
+        {Mode::LocalFoldingPipeline, "LocalFoldingPipeline", true, "RUNNABLE", pipeline_reason},
 #else
-            {Mode::LocalFoldingPipeline, "LocalFoldingPipeline", false, "BLOCKED", pipeline_reason},
+        {Mode::LocalFoldingPipeline, "LocalFoldingPipeline", false, "BLOCKED", pipeline_reason},
 #endif
-        }};
-    }
+    }};
+}
 
-    int16_t ExpScanner::unbiased_exp(const float &x)
-    {
-        if (x == 0.f || !std::isfinite(x))
-            return std::numeric_limits<int16_t>::min();
+namespace {
+bool assemble_stripe_mask(StripePipelineSlot & slot, const ExSIAState & state) {
+    StripeState & stripe             = slot.stripe;
+    const size_t  active_block_count = stripe.row_count() * state.blocks_per_row;
+    if (stripe.outlier_mask.rows != stripe.row_count() ||
+        stripe.outlier_mask.cols != state.K_padded || slot.active_block_count != active_block_count)
+        return false;
 
-        return static_cast<int16_t>(std::ilogb(std::abs(x)));
-    }
-
-    void ExpScanner::scan_top2_exp(const std::vector<float> &x,
-                                   BlockState &blk)
-    {
-        const size_t n = x.size();
-        GGML_ASSERT(blk.e.size() >= n);
-        blk.reset();
-        blk.blk_size = n;
-        for (size_t i = 0; i < n; ++i)
-        {
-            int16_t exp = unbiased_exp(x[i]);
-            blk.e[i] = exp;
-            if (exp > blk.e1)
-            {
-                blk.e2 = blk.e1;
-                blk.e1 = exp;
-            }
-            else if (exp < blk.e1 && exp > blk.e2)
-                blk.e2 = exp;
-        }
-    }
-
-    void ExpScanner::scan_top2_exp(const float *x, size_t count, BlockState &blk)
-    {
-        GGML_ASSERT(x != nullptr);
-        GGML_ASSERT(blk.e.size() >= count);
-        blk.reset();
-        blk.blk_size = count;
-        for (size_t i = 0; i < count; ++i)
-        {
-            const int16_t exp = unbiased_exp(x[i]);
-            blk.e[i] = exp;
-            if (exp > blk.e1)
-            {
-                blk.e2 = blk.e1;
-                blk.e1 = exp;
-            }
-            else if (exp < blk.e1 && exp > blk.e2)
-                blk.e2 = exp;
-        }
-    }
-
-    void ExpScanner::update_block_top2_exp(const BlockMask &mask, BlockState &blk)
-    {
-#if EXSIA_VALIDATION
-        validation_block_top2_exp_rescan_counter.fetch_add(1, std::memory_order_relaxed);
-#endif
-        blk.e1 = std::numeric_limits<int16_t>::min();
-        blk.e2 = std::numeric_limits<int16_t>::min();
-
-        const size_t n = blk.blk_size;
-        for (size_t i = 0; i < n; ++i)
-        {
-            if (mask.is_set(i))
+    stripe.outlier_mask.clear_active_bits();
+    for (size_t block = 0; block < active_block_count; ++block) {
+        const size_t    local_row  = block / state.blocks_per_row;
+        const size_t    blk_idx    = block % state.blocks_per_row;
+        const BlockMask block_mask = slot.block_mask(block, state.B_size);
+        for (size_t i = 0; i < block_mask.bit_count; ++i) {
+            const size_t global_col = blk_idx * state.B_size + i;
+            if (global_col >= state.K_logical || !block_mask.is_set(i))
                 continue;
 
-            const int16_t exp = blk.e[i];
-            if (exp > blk.e1)
-            {
-                blk.e2 = blk.e1;
-                blk.e1 = exp;
-            }
-            else if (exp < blk.e1 && exp > blk.e2)
-                blk.e2 = exp;
+            const size_t mask_idx = local_row * stripe.outlier_mask.cols + global_col;
+            stripe.outlier_mask.words[mask_idx / 64] |= uint64_t{1} << (mask_idx % 64);
         }
     }
 
-#if EXSIA_VALIDATION
-    void reset_validation_block_top2_exp_rescan_count()
-    {
-        validation_block_top2_exp_rescan_counter.store(0, std::memory_order_relaxed);
-    }
-
-    size_t validation_block_top2_exp_rescan_count()
-    {
-        return validation_block_top2_exp_rescan_counter.load(std::memory_order_relaxed);
-    }
-#endif
-
-    void ExpScanner::update_stripe_top2_exp(StripeState &stripe, int16_t exp)
-    {
-        if (exp > stripe.e1)
-        {
-            stripe.e2 = stripe.e1;
-            stripe.e1 = exp;
-        }
-        else if (exp < stripe.e1 && exp > stripe.e2)
-            stripe.e2 = exp;
-    }
-
-    void OutlierMarker::mark_outlier(StripeState &stripe,
-                                     size_t row,
-                                     size_t blk_idx,
-                                     size_t blk_size,
-                                     const BitMask &d_mask) const
-    {
-        size_t n = blk_size;
-        const size_t local_row = stripe.local_row(row);
-        for (size_t i = 0; i < n; ++i)
-        {
-            size_t col = blk_idx * n + i;
-            if (d_mask.is_set(0, i))
-                stripe.outlier_mask.set(local_row, col);
-        }
-    }
-
-    std::vector<int32_t> WideQuantizer::quantize_block(const std::vector<float> &x,
-                                                       int16_t theta_b)
-    {
-        std::vector<int32_t> q(x.size());
-        quantize_block(x, theta_b, q);
-        return q;
-    }
-
-    void WideQuantizer::quantize_block(const std::vector<float> &x,
-                                       int16_t theta_b,
-                                       std::vector<int32_t> &q) const
-    {
-        GGML_ASSERT(q.size() >= x.size());
-        const bool null_theta = theta_b == std::numeric_limits<int16_t>::min();
-        for (size_t i = 0; i < x.size(); ++i)
-            q[i] = null_theta ? 0 : quantize_to_i32(x[i], theta_b);
-    }
-
-    std::tuple<std::vector<int32_t>, __int128_t, __int128_t>
-    WideQuantizer::quantize_block(const std::vector<float> &x,
-                                  size_t row,
-                                  size_t col_offset,
-                                  const BitMask &mask,
-                                  int16_t theta_b)
-    {
-        std::vector<int32_t> q(x.size());
-        __int128_t S = 0;
-        __int128_t SS = 0;
-        quantize_block(x, row, col_offset, mask, theta_b, q, S, SS);
-        return {q, S, SS};
-    }
-
-    void WideQuantizer::quantize_block(const std::vector<float> &x,
-                                        size_t row,
-                                       size_t col_offset,
-                                       const BitMask &mask,
-                                       int16_t theta_b,
-                                       std::vector<int32_t> &q,
-                                       __int128_t &S,
-                                       __int128_t &SS) const
-    {
-        const size_t n = x.size();
-        GGML_ASSERT(q.size() >= n);
-
-        S = 0;
-        SS = 0;
-        const bool use_mask = mask.rows != 0 && mask.cols != 0;
-        const bool null_theta = theta_b == std::numeric_limits<int16_t>::min();
-        for (size_t i = 0; i < n; ++i)
-        {
-            size_t col = col_offset + i;
-            const int32_t tmp = null_theta ? 0 : quantize_to_i32(x[i], theta_b);
-            q[i] = tmp;
-            if (!use_mask || !mask.is_set(row, col))
-            {
-                const __int128_t magnitude = static_cast<__int128_t>(magnitude_i32(tmp));
-                S += magnitude;
-                SS += magnitude * magnitude;
-            }
-        }
-    }
-
-    void WideQuantizer::quantize_block(const std::vector<float> &x,
-                                        const BlockMask &mask,
-                                        int16_t theta_b,
-                                        std::vector<int32_t> &q,
-                                        __int128_t &S,
-                                        __int128_t &SS) const
-    {
-        const size_t n = x.size();
-        GGML_ASSERT(q.size() >= n);
-        GGML_ASSERT(mask.bit_count >= n);
-
-        S = 0;
-        SS = 0;
-        const bool null_theta = theta_b == std::numeric_limits<int16_t>::min();
-        for (size_t i = 0; i < n; ++i)
-        {
-            const int32_t tmp = null_theta ? 0 : quantize_to_i32(x[i], theta_b);
-            q[i] = tmp;
-            if (!mask.is_set(i))
-            {
-                const __int128_t magnitude = static_cast<__int128_t>(magnitude_i32(tmp));
-                S += magnitude;
-                SS += magnitude * magnitude;
-            }
-        }
-    }
-
-    void WideQuantizer::quantize_block(const float *x,
-                                        size_t count,
-                                        const BlockMask &mask,
-                                        int16_t theta_b,
-                                        std::vector<int32_t> &q,
-                                        __int128_t &S,
-                                        __int128_t &SS) const
-    {
-        GGML_ASSERT(x != nullptr);
-        GGML_ASSERT(q.size() >= count);
-        GGML_ASSERT(mask.bit_count >= count);
-
-        S = 0;
-        SS = 0;
-        const bool null_theta = theta_b == std::numeric_limits<int16_t>::min();
-        for (size_t i = 0; i < count; ++i)
-        {
-            const int32_t tmp = null_theta ? 0 : quantize_to_i32(x[i], theta_b);
-            q[i] = tmp;
-            if (!mask.is_set(i))
-            {
-                const __int128_t magnitude = static_cast<__int128_t>(magnitude_i32(tmp));
-                S += magnitude;
-                SS += magnitude * magnitude;
-            }
-        }
-    }
-
-    void WideQuantizer::quantize_block(const float *x,
-                                        size_t count,
-                                        int16_t theta_b,
-                                        std::vector<int32_t> &q) const
-    {
-        GGML_ASSERT(x != nullptr);
-        GGML_ASSERT(q.size() >= count);
-        const bool null_theta = theta_b == std::numeric_limits<int16_t>::min();
-        for (size_t i = 0; i < count; ++i)
-            q[i] = null_theta ? 0 : quantize_to_i32(x[i], theta_b);
-    }
-
-    SigmaDetector::SigmaContext SigmaDetector::prepare(__int128_t S, __int128_t SS, size_t N) const
-    {
-        SigmaContext context;
-        context.n = static_cast<__int128_t>(N);
-        context.S = S;
-        if (N == 0)
-            return context;
-
-        const __int128_t variance_numer = context.n * SS - S * S;
-        if (variance_numer <= 0)
-            return context;
-
-        const __int128_t tau = GGML_GEMMINI_EXSIA_SIGMA;
-        context.threshold = tau * tau * variance_numer;
-        context.valid = true;
-        return context;
-    }
-
-    bool SigmaDetector::detect(int32_t q, const SigmaContext &context) const
-    {
-        if (!context.valid)
-            return false;
-
-        const __int128_t centered = context.n * static_cast<__int128_t>(magnitude_i32(q)) - context.S;
-        return centered > 0 && centered * centered > context.threshold;
-    }
-
-    bool SigmaDetector::detect_sigma(int32_t q, __int128_t S, __int128_t SS, size_t N)
-    {
-        return detect(q, prepare(S, SS, N));
-    }
-
-    std::pair<int32_t, int32_t> ResidualClipper::clip_with_residual(int32_t q)
-    {
-        const int32_t qmax = config::GGML_GEMMINI_ACTIVATION_QMAX;
-        const int32_t qmin = config::GGML_GEMMINI_ACTIVATION_QMIN;
-        int32_t clipped = q > qmax ? qmax : (q < qmin ? qmin : q);
-        int32_t res = q - clipped;
-        return {clipped, res};
-    }
-
-
-    bool LocalStage::run_optimized(
-        Meta &meta,
-        ExSIAState &state,
-        const float *x,
-        size_t valid_count,
-        size_t block_size,
-        size_t local_row,
-        size_t blk_idx,
-        StripeScratch &scratch,
-        BlockMask &block_mask,
-        int32_t *q_out,
-        int16_t &block_exp_out
-#if EXSIA_BRANCH_COUNTS_ENABLED
-        ,
-        LocalBlockCycleSample &cycle_sample)
-#else
-        )
-#endif
-    {
-        GGML_ASSERT(x != nullptr);
-        GGML_ASSERT(q_out != nullptr);
-        GGML_ASSERT(block_size == state.B_size);
-        GGML_ASSERT(valid_count <= block_size);
-        (void) local_row;
-        (void) blk_idx;
-#if GGML_GEMMINI_ACT_QUANT_METRICS
-        scratch.actual_requantized = false;
-#endif
-
-        if (valid_count == block_size)
-        {
-            return run_optimized_full(meta, x, block_size, scratch, block_mask, q_out, block_exp_out
-#if EXSIA_BRANCH_COUNTS_ENABLED
-                                      , cycle_sample
-#endif
-            );
-        }
-        return run_optimized_partial(meta, x, valid_count, block_size, scratch, block_mask,
-                                     q_out, block_exp_out
-#if EXSIA_BRANCH_COUNTS_ENABLED
-                                     , cycle_sample
-#endif
-        );
-    }
-
-    bool LocalStage::run_optimized_full(
-        Meta &meta,
-        const float *x,
-        size_t block_size,
-        StripeScratch &scratch,
-        BlockMask &block_mask,
-        int32_t *q_out,
-        int16_t &block_exp_out
-#if EXSIA_BRANCH_COUNTS_ENABLED
-        ,
-        LocalBlockCycleSample &cycle_sample)
-#else
-        )
-#endif
-    {
-#if EXSIA_BRANCH_COUNTS_ENABLED
-        cycle_sample = LocalBlockCycleSample{};
-#endif
-
-        GGML_ASSERT(x != nullptr);
-        GGML_ASSERT(q_out != nullptr);
-        BlockState &blk = scratch.block;
-        const int16_t neg_inf = std::numeric_limits<int16_t>::min();
-        __int128_t S = 0;
-        __int128_t SS = 0;
-        size_t unmasked_count = 0;
-        bool has_int_outlier = false;
-        int16_t final_exp = neg_inf;
-        int16_t e_pre = neg_inf;
-        int16_t theta_pre = neg_inf;
-#if EXSIA_STAGE_PROFILE_ENABLED
-#if defined(__linux__) && defined(__aarch64__)
-        const auto t0 = EXSIA_STAGE_CYCLE_READ();
-#else
-        const uint64_t t0 = EXSIA_STAGE_CYCLE_READ();
-#endif
-#endif
-
-        blk.reset();
-        blk.blk_size = block_size;
-        block_mask.clear();
-        for (size_t i = 0; i < block_size; ++i)
-        {
-            const int16_t exp = unit_exp_.unbiased_exp(x[i]);
-            blk.e[i] = exp;
-            if (exp > blk.e1)
-            {
-                blk.e2 = blk.e1;
-                blk.e1 = exp;
-                block_mask.clear();
-                block_mask.set(i);
-            }
-            else if (exp == blk.e1 && exp != neg_inf)
-                block_mask.set(i);
-            else if (exp < blk.e1 && exp > blk.e2)
-                blk.e2 = exp;
-        }
-        const bool has_second_bucket = blk.e2 != neg_inf;
-        if (!has_second_bucket)
-            block_mask.clear();
-        e_pre = has_second_bucket ? blk.e2 : blk.e1;
-#if EXSIA_STAGE_PROFILE_ENABLED
-#if defined(__linux__) && defined(__aarch64__)
-        const auto t1 = EXSIA_STAGE_CYCLE_READ();
-#else
-        const uint64_t t1 = EXSIA_STAGE_CYCLE_READ();
-#endif
-#endif
-
-        theta_pre = exp_to_theta(e_pre, meta.rho);
-        const bool null_theta = theta_pre == neg_inf;
-        for (size_t i = 0; i < block_size; ++i)
-        {
-            const int32_t tmp = null_theta ? 0 : quantize_to_i32(x[i], theta_pre);
-            q_out[i] = tmp;
-            if (block_mask.is_set(i))
-                continue;
-
-            const __int128_t magnitude = static_cast<__int128_t>(magnitude_i32(tmp));
-            S += magnitude;
-            SS += magnitude * magnitude;
-            ++unmasked_count;
-        }
-#if EXSIA_VALIDATION
-        scratch.reference.p0_e1 = blk.e1;
-        scratch.reference.p0_e2 = blk.e2;
-        scratch.reference.p0_e_pre = e_pre;
-        std::copy_n(block_mask.words, BlockMask::word_count(block_size), scratch.reference.p0_top_mask_words.begin());
-        scratch.reference.p1_S = S;
-        scratch.reference.p1_SS = SS;
-        scratch.reference.p1_N = unmasked_count;
-#endif
-
-#if EXSIA_STAGE_PROFILE_ENABLED
-#if defined(__linux__) && defined(__aarch64__)
-        const auto t2 = EXSIA_STAGE_CYCLE_READ();
-#else
-        const uint64_t t2 = EXSIA_STAGE_CYCLE_READ();
-#endif
-#endif
-
-        const SigmaDetector::SigmaContext sigma_context = unit_sigma_.prepare(S, SS, unmasked_count);
-#if EXSIA_BRANCH_COUNTS_ENABLED
-        ++cycle_sample.sigma_context_prepare_count;
-#endif
-        for (size_t i = 0; i < block_size; ++i)
-        {
-            if (block_mask.is_set(i))
-                continue;
-
-            if (unit_sigma_.detect(q_out[i], sigma_context))
-            {
-                block_mask.set(i);
-                has_int_outlier = true;
-            }
-            else
-                final_exp = std::max(final_exp, blk.e[i]);
-        }
-#if EXSIA_BRANCH_COUNTS_ENABLED
-        cycle_sample.has_int_outlier = has_int_outlier;
-#endif
-#if EXSIA_VALIDATION
-        cycle_sample.final_remaining_exp = final_exp;
-#endif
-
-#if EXSIA_STAGE_PROFILE_ENABLED
-#if defined(__linux__) && defined(__aarch64__)
-        const auto t3 = EXSIA_STAGE_CYCLE_READ();
-#else
-        const uint64_t t3 = EXSIA_STAGE_CYCLE_READ();
-#endif
-#endif
-
-        if (!has_int_outlier)
-        {
-            blk.e_b = e_pre;
-            blk.theta_b = theta_pre;
-#if EXSIA_BRANCH_COUNTS_ENABLED
-            cycle_sample.p3_path = P3Path::BypassNoIntegerOutlier;
-#endif
-        }
-        else
-        {
-            blk.e_b = final_exp;
-            blk.theta_b = exp_to_theta(blk.e_b, meta.rho);
-
-            if (blk.theta_b == theta_pre)
-            {
-#if EXSIA_BRANCH_COUNTS_ENABLED
-                cycle_sample.p3_path = P3Path::BypassSameScale;
-#endif
-            }
-            else
-            {
-                const bool final_null_theta = blk.theta_b == neg_inf;
-                for (size_t i = 0; i < block_size; ++i)
-                    q_out[i] = final_null_theta ? 0 : quantize_to_i32(x[i], blk.theta_b);
-#if GGML_GEMMINI_ACT_QUANT_METRICS
-                scratch.actual_requantized = true;
-#endif
-#if EXSIA_BRANCH_COUNTS_ENABLED
-                ++cycle_sample.replay_overwrite_count;
-                cycle_sample.p3_path = P3Path::Replay;
-#endif
-            }
-        }
-
-        if (force_recompute_ && (!has_int_outlier || blk.theta_b == theta_pre))
-        {
-            for (size_t i = 0; i < block_size; ++i)
-                q_out[i] = quantize_to_i32(x[i], blk.theta_b);
-#if EXSIA_STAGE_PROFILE_ENABLED
-            ++cycle_sample.forced_recompute_count;
-#endif
-        }
-        block_exp_out = blk.e_b;
-#if EXSIA_BRANCH_COUNTS_ENABLED
-        ++cycle_sample.block_exp_commit_count;
-#endif
-
-#if EXSIA_STAGE_PROFILE_ENABLED
-#if defined(__linux__) && defined(__aarch64__)
-        const auto t4 = EXSIA_STAGE_CYCLE_READ();
-#else
-        const uint64_t t4 = EXSIA_STAGE_CYCLE_READ();
-#endif
-#if defined(__linux__) && defined(__aarch64__)
-        record_stage_cycles(cycle_sample, {t0, t1, t2, t3, t4});
-#else
-        cycle_sample.p0 = t1 >= t0 ? t1 - t0 : 0;
-        cycle_sample.p1 = t2 >= t1 ? t2 - t1 : 0;
-        cycle_sample.p2 = t3 >= t2 ? t3 - t2 : 0;
-        cycle_sample.p3 = t4 >= t3 ? t4 - t3 : 0;
-#endif
-#endif
-
-        return true;
-    }
-
-    bool LocalStage::run_optimized_partial(
-        Meta &meta,
-        const float *x,
-        size_t valid_count,
-        size_t block_size,
-        StripeScratch &scratch,
-        BlockMask &block_mask,
-        int32_t *q_out,
-        int16_t &block_exp_out
-#if EXSIA_BRANCH_COUNTS_ENABLED
-        ,
-        LocalBlockCycleSample &cycle_sample)
-#else
-        )
-#endif
-    {
-#if EXSIA_BRANCH_COUNTS_ENABLED
-        cycle_sample = LocalBlockCycleSample{};
-#endif
-        BlockState &blk = scratch.block;
-        const int16_t neg_inf = std::numeric_limits<int16_t>::min();
-        std::copy_n(x, valid_count, blk.x.begin());
-        std::fill(blk.x.begin() + valid_count, blk.x.begin() + block_size, 0.0f);
-        __int128_t S = 0;
-        __int128_t SS = 0;
-        size_t unmasked_count = 0;
-        bool has_int_outlier = false;
-        int16_t final_exp = neg_inf;
-        int16_t e_pre = neg_inf;
-        int16_t theta_pre = neg_inf;
-#if EXSIA_STAGE_PROFILE_ENABLED
-#if defined(__linux__) && defined(__aarch64__)
-        const auto t0 = EXSIA_STAGE_CYCLE_READ();
-#else
-        const uint64_t t0 = EXSIA_STAGE_CYCLE_READ();
-#endif
-#endif
-
-        blk.reset();
-        blk.blk_size = block_size;
-        block_mask.clear();
-        for (size_t i = 0; i < valid_count; ++i)
-        {
-            const int16_t exp = unit_exp_.unbiased_exp(blk.x[i]);
-            blk.e[i] = exp;
-            if (exp > blk.e1)
-            {
-                blk.e2 = blk.e1;
-                blk.e1 = exp;
-                block_mask.clear();
-                block_mask.set(i);
-            }
-            else if (exp == blk.e1 && exp != neg_inf)
-                block_mask.set(i);
-            else if (exp < blk.e1 && exp > blk.e2)
-                blk.e2 = exp;
-        }
-        std::fill(blk.e.begin() + valid_count, blk.e.begin() + block_size, neg_inf);
-        const bool has_second_bucket = blk.e2 != neg_inf;
-        if (!has_second_bucket)
-            block_mask.clear();
-        e_pre = has_second_bucket ? blk.e2 : blk.e1;
-#if EXSIA_STAGE_PROFILE_ENABLED
-#if defined(__linux__) && defined(__aarch64__)
-        const auto t1 = EXSIA_STAGE_CYCLE_READ();
-#else
-        const uint64_t t1 = EXSIA_STAGE_CYCLE_READ();
-#endif
-#endif
-
-        theta_pre = exp_to_theta(e_pre, meta.rho);
-        const bool null_theta = theta_pre == neg_inf;
-        for (size_t i = 0; i < block_size; ++i)
-        {
-            const int32_t tmp = null_theta ? 0 : quantize_to_i32(blk.x[i], theta_pre);
-            q_out[i] = tmp;
-            if (i >= valid_count || block_mask.is_set(i))
-                continue;
-
-            const __int128_t magnitude = static_cast<__int128_t>(magnitude_i32(tmp));
-            S += magnitude;
-            SS += magnitude * magnitude;
-            ++unmasked_count;
-        }
-#if EXSIA_VALIDATION
-        scratch.reference.p0_e1 = blk.e1;
-        scratch.reference.p0_e2 = blk.e2;
-        scratch.reference.p0_e_pre = e_pre;
-        std::copy_n(block_mask.words, BlockMask::word_count(block_size), scratch.reference.p0_top_mask_words.begin());
-        scratch.reference.p1_S = S;
-        scratch.reference.p1_SS = SS;
-        scratch.reference.p1_N = unmasked_count;
-#endif
-#if EXSIA_STAGE_PROFILE_ENABLED
-#if defined(__linux__) && defined(__aarch64__)
-        const auto t2 = EXSIA_STAGE_CYCLE_READ();
-#else
-        const uint64_t t2 = EXSIA_STAGE_CYCLE_READ();
-#endif
-#endif
-
-        const SigmaDetector::SigmaContext sigma_context = unit_sigma_.prepare(S, SS, unmasked_count);
-#if EXSIA_BRANCH_COUNTS_ENABLED
-        ++cycle_sample.sigma_context_prepare_count;
-#endif
-        for (size_t i = 0; i < valid_count; ++i)
-        {
-            if (block_mask.is_set(i))
-                continue;
-            if (unit_sigma_.detect(q_out[i], sigma_context))
-            {
-                block_mask.set(i);
-                has_int_outlier = true;
-            }
-            else
-                final_exp = std::max(final_exp, blk.e[i]);
-        }
-#if EXSIA_BRANCH_COUNTS_ENABLED
-        cycle_sample.has_int_outlier = has_int_outlier;
-#endif
-#if EXSIA_VALIDATION
-        cycle_sample.final_remaining_exp = final_exp;
-#endif
-#if EXSIA_STAGE_PROFILE_ENABLED
-#if defined(__linux__) && defined(__aarch64__)
-        const auto t3 = EXSIA_STAGE_CYCLE_READ();
-#else
-        const uint64_t t3 = EXSIA_STAGE_CYCLE_READ();
-#endif
-#endif
-
-        if (!has_int_outlier)
-        {
-            blk.e_b = e_pre;
-            blk.theta_b = theta_pre;
-#if EXSIA_BRANCH_COUNTS_ENABLED
-            cycle_sample.p3_path = P3Path::BypassNoIntegerOutlier;
-#endif
-        }
-        else
-        {
-            blk.e_b = final_exp;
-            blk.theta_b = exp_to_theta(blk.e_b, meta.rho);
-            if (blk.theta_b == theta_pre)
-            {
-#if EXSIA_BRANCH_COUNTS_ENABLED
-                cycle_sample.p3_path = P3Path::BypassSameScale;
-#endif
-            }
-            else
-            {
-                const bool final_null_theta = blk.theta_b == neg_inf;
-                for (size_t i = 0; i < block_size; ++i)
-                    q_out[i] = final_null_theta ? 0 : quantize_to_i32(blk.x[i], blk.theta_b);
-#if GGML_GEMMINI_ACT_QUANT_METRICS
-                scratch.actual_requantized = true;
-#endif
-#if EXSIA_BRANCH_COUNTS_ENABLED
-                ++cycle_sample.replay_overwrite_count;
-                cycle_sample.p3_path = P3Path::Replay;
-#endif
-            }
-        }
-
-        if (force_recompute_ && (!has_int_outlier || blk.theta_b == theta_pre))
-        {
-            for (size_t i = 0; i < block_size; ++i)
-                q_out[i] = quantize_to_i32(blk.x[i], blk.theta_b);
-#if EXSIA_STAGE_PROFILE_ENABLED
-            ++cycle_sample.forced_recompute_count;
-#endif
-        }
-        block_exp_out = blk.e_b;
-#if EXSIA_BRANCH_COUNTS_ENABLED
-        ++cycle_sample.block_exp_commit_count;
-#endif
-#if EXSIA_STAGE_PROFILE_ENABLED
-#if defined(__linux__) && defined(__aarch64__)
-        const auto t4 = EXSIA_STAGE_CYCLE_READ();
-#else
-        const uint64_t t4 = EXSIA_STAGE_CYCLE_READ();
-#endif
-#if defined(__linux__) && defined(__aarch64__)
-        record_stage_cycles(cycle_sample, {t0, t1, t2, t3, t4});
-#else
-        cycle_sample.p0 = t1 >= t0 ? t1 - t0 : 0;
-        cycle_sample.p1 = t2 >= t1 ? t2 - t1 : 0;
-        cycle_sample.p2 = t3 >= t2 ? t3 - t2 : 0;
-        cycle_sample.p3 = t4 >= t3 ? t4 - t3 : 0;
-#endif
-#endif
-        return true;
-    }
-
-#if EXSIA_VALIDATION
-    bool LocalStage::run_reference(
-        Meta &meta,
-        ExSIAState &state,
-        const std::vector<float> &x,
-        size_t local_row,
-        size_t blk_idx,
-        StripeScratch &scratch,
-        BlockMask &block_mask,
-        std::vector<int32_t> &stripe_q_wide,
-        std::vector<int16_t> &stripe_block_exp,
-        LocalBlockCycleSample &cycle_sample)
-    {
-        const size_t blk_size = state.B_size;
-        const size_t base = local_row * state.K_padded + blk_idx * blk_size;
-        cycle_sample = LocalBlockCycleSample{};
-
-        GGML_ASSERT(x.size() == blk_size);
-        BlockState &blk = scratch.block;
-        const int16_t neg_inf = std::numeric_limits<int16_t>::min();
-        bool has_second_bucket = false;
-        std::vector<int32_t> &q_tmp = scratch.reference.q_tmp;
-        std::vector<int32_t> &q_final = scratch.reference.q_final;
-        __int128_t S = 0;
-        __int128_t SS = 0;
-        size_t unmasked_count = 0;
-        bool has_int_outlier = false;
-        int16_t e_pre = neg_inf;
-        int16_t theta_pre = neg_inf;
-#if EXSIA_STAGE_PROFILE_ENABLED
-#if defined(__linux__) && defined(__aarch64__)
-        const auto t0 = EXSIA_STAGE_CYCLE_READ();
-#else
-        const uint64_t t0 = EXSIA_STAGE_CYCLE_READ();
-#endif
-#endif
-
-        unit_exp_.scan_top2_exp(x, blk);
-        has_second_bucket = (blk.e2 != neg_inf);
-        block_mask.clear();
-
-        if (has_second_bucket)
-        {
-            for (size_t i = 0; i < blk_size; ++i)
-            {
-                const size_t col = blk_idx * blk_size + i;
-                if (col < state.K_logical && blk.e[i] != neg_inf && blk.e[i] == blk.e1)
-                    block_mask.set(i);
-            }
-        }
-
-        e_pre = has_second_bucket ? blk.e2 : blk.e1;
-#if EXSIA_STAGE_PROFILE_ENABLED
-#if defined(__linux__) && defined(__aarch64__)
-        const auto t1 = EXSIA_STAGE_CYCLE_READ();
-#else
-        const uint64_t t1 = EXSIA_STAGE_CYCLE_READ();
-#endif
-#endif
-
-        theta_pre = exp_to_theta(e_pre, meta.rho);
-        unit_quant_.quantize_block(blk.x, block_mask, theta_pre, q_tmp, S, SS);
-
-        for (size_t i = 0; i < blk_size; ++i)
-        {
-            const size_t col = blk_idx * blk_size + i;
-            if (col < state.K_logical && !block_mask.is_set(i))
-                ++unmasked_count;
-        }
-
-#if EXSIA_STAGE_PROFILE_ENABLED
-#if defined(__linux__) && defined(__aarch64__)
-        const auto t2 = EXSIA_STAGE_CYCLE_READ();
-#else
-        const uint64_t t2 = EXSIA_STAGE_CYCLE_READ();
-#endif
-#endif
-
-        for (size_t i = 0; i < blk_size; ++i)
-        {
-            const size_t col = blk_idx * blk_size + i;
-            if (col >= state.K_logical || block_mask.is_set(i))
-                continue;
-
-            if (unit_sigma_.detect_sigma(q_tmp[i], S, SS, unmasked_count))
-            {
-                block_mask.set(i);
-                has_int_outlier = true;
-            }
-        }
-
-#if EXSIA_STAGE_PROFILE_ENABLED
-#if defined(__linux__) && defined(__aarch64__)
-        const auto t3 = EXSIA_STAGE_CYCLE_READ();
-#else
-        const uint64_t t3 = EXSIA_STAGE_CYCLE_READ();
-#endif
-#endif
-
-        if (!has_int_outlier)
-        {
-            blk.e_b = e_pre;
-            blk.theta_b = theta_pre;
-            std::copy_n(q_tmp.begin(), blk_size, q_final.begin());
-            cycle_sample.p3_path = P3Path::BypassNoIntegerOutlier;
-        }
-        else
-        {
-            unit_exp_.update_block_top2_exp(block_mask, blk);
-            blk.e_b = blk.e1;
-            blk.theta_b = exp_to_theta(blk.e_b, meta.rho);
-
-            if (blk.theta_b == theta_pre)
-            {
-                std::copy_n(q_tmp.begin(), blk_size, q_final.begin());
-                cycle_sample.p3_path = P3Path::BypassSameScale;
-            }
-            else
-            {
-                unit_quant_.quantize_block(blk.x, blk.theta_b, q_final);
-                cycle_sample.p3_path = P3Path::Replay;
-            }
-        }
-
-        GGML_ASSERT(stripe_q_wide.size() >= base + blk_size);
-        for (size_t i = 0; i < blk_size; ++i)
-            stripe_q_wide[base + i] = q_final[i];
-
-        const size_t block_exp_idx = local_row * state.blocks_per_row + blk_idx;
-        GGML_ASSERT(stripe_block_exp.size() > block_exp_idx);
-        stripe_block_exp[block_exp_idx] = blk.e_b;
-
-#if EXSIA_STAGE_PROFILE_ENABLED
-#if defined(__linux__) && defined(__aarch64__)
-        const auto t4 = EXSIA_STAGE_CYCLE_READ();
-#else
-        const uint64_t t4 = EXSIA_STAGE_CYCLE_READ();
-#endif
-#if defined(__linux__) && defined(__aarch64__)
-        record_stage_cycles(cycle_sample, {t0, t1, t2, t3, t4});
-#else
-        cycle_sample.p0 = t1 >= t0 ? t1 - t0 : 0;
-        cycle_sample.p1 = t2 >= t1 ? t2 - t1 : 0;
-        cycle_sample.p2 = t3 >= t2 ? t3 - t2 : 0;
-        cycle_sample.p3 = t4 >= t3 ? t4 - t3 : 0;
-#endif
-#endif
-
-        return true;
-    }
-#endif
-
-    namespace
-    {
-        bool assemble_stripe_mask(StripePipelineSlot &slot, const ExSIAState &state)
-        {
-            StripeState &stripe = slot.stripe;
-            const size_t active_block_count = stripe.row_count() * state.blocks_per_row;
-            if (stripe.outlier_mask.rows != stripe.row_count() ||
-                stripe.outlier_mask.cols != state.K_padded ||
-                slot.active_block_count != active_block_count)
-                return false;
-
-            stripe.outlier_mask.clear_active_bits();
-            for (size_t block = 0; block < active_block_count; ++block)
-            {
-                const size_t local_row = block / state.blocks_per_row;
-                const size_t blk_idx = block % state.blocks_per_row;
-                const BlockMask block_mask = slot.block_mask(block, state.B_size);
-                for (size_t i = 0; i < block_mask.bit_count; ++i)
-                {
-                    const size_t global_col = blk_idx * state.B_size + i;
-                    if (global_col >= state.K_logical || !block_mask.is_set(i))
-                        continue;
-
-                    const size_t mask_idx = local_row * stripe.outlier_mask.cols + global_col;
-                    stripe.outlier_mask.words[mask_idx / 64] |= uint64_t{1} << (mask_idx % 64);
-                }
-            }
-
-            return true;
-        }
-
-        void reduce_stripe_exponents(StripePipelineSlot &slot, size_t active_block_count)
-        {
-            StripeState &stripe = slot.stripe;
-            stripe.e1 = std::numeric_limits<int16_t>::min();
-            stripe.e2 = std::numeric_limits<int16_t>::min();
-
-            GGML_ASSERT(active_block_count <= slot.block_exp.size());
-            ExpScanner reducer;
-            for (size_t block = 0; block < active_block_count; ++block)
-                reducer.update_stripe_top2_exp(stripe, slot.block_exp[block]);
-        }
-    }
-
-    bool StripeFolding::run(Meta &meta,
-                            ExSIAState &state,
-                            StripeState &stripe,
-                            ggml_gemmini_args_t &args,
-                            size_t stripe_idx,
-                            const std::vector<int32_t> &stripe_q_wide,
-                            const std::vector<int16_t> &stripe_block_exp,
-                            std::vector<int32_t> &residual,
-                            residual::TimedResidualCapture &rmd_builder)
-    {
-        const int16_t neg_inf = std::numeric_limits<int16_t>::min();
-#if GGML_GEMMINI_RESIDUAL_METRICS
-        if (args.evaluation_context)
-            args.evaluation_context->main_stripe(stripe_idx, stripe.row_start,
-                                                  stripe.row_count(), args.J, args.K);
-#endif
-#if GGML_GEMMINI_SCALE_METRICS
-        evaluation::observe_dense_scu(args, stripe_idx, stripe.row_count());
-#endif
-#if EXSIA_STAGE_PROFILE_ENABLED
-        stripe.selected_positions = 0;
-        stripe.residual_nnz = 0;
-#endif
+    return true;
+}
+
+void reduce_stripe_exponents(StripePipelineSlot & slot, size_t active_block_count) {
+    StripeState & stripe = slot.stripe;
+    stripe.e1            = std::numeric_limits<int16_t>::min();
+    stripe.e2            = std::numeric_limits<int16_t>::min();
+
+    GGML_ASSERT(active_block_count <= slot.block_exp.size());
+    ExpScanner reducer;
+    for (size_t block = 0; block < active_block_count; ++block)
+        reducer.update_stripe_top2_exp(stripe, slot.block_exp[block]);
+}
+} // namespace
+
+// Seals the stripe's RMD packet and publishes the shared handle. Called once per
+// stripe, right after folding commits, by the thread that ran folding.
+static bool
+seal_stripe_packet(Meta & meta, StripePipelineSlot & slot, const ggml_gemmini_args_t & args) {
 #if GGML_GEMMINI_ENABLE_RMD
-        rmd_builder.reset(stripe_idx, stripe.row_start, stripe.row_count(), args.K, args.J,
-                          &stripe.outlier_mask.words, state.K_padded);
+    const residual::ResidualStripePayload payload = slot.rmd_builder.finish();
+    slot.rmd_packet                               = payload.packet;
+    slot.direct_residual                          = payload.direct;
+    slot.rmd_pack_ns                              = payload.capture_ns;
+    if (slot.rmd_builder.status() != rmd::RmdStatus::success)
+        return false;
+    if (slot.rmd_packet)
+        meta.rmd_packets.push_back(slot.rmd_packet);
+    if (slot.direct_residual)
+        meta.direct_residuals.push_back(slot.direct_residual);
 #else
-        (void) rmd_builder;
-#endif
-
-        if (stripe.e1 == neg_inf)
-        {
-            stripe.e_s = 0;
-            stripe.promote_top_block = false;
-        }
-        else if (stripe.e2 == neg_inf)
-        {
-            stripe.e_s = stripe.e1;
-            stripe.promote_top_block = false;
-        }
-        else
-        {
-            stripe.e_s = stripe.e2;
-            stripe.promote_top_block = true;
-        }
-
-        const int16_t theta_s = exp_to_theta(stripe.e_s, meta.rho);
-        GGML_ASSERT(stripe_idx < meta.theta.size());
-        meta.theta[stripe_idx] = theta_s;
-
-        GGML_ASSERT(args.A.valid());
-        GGML_ASSERT(state.B_size > 0);
-        GGML_ASSERT(state.K_padded >= args.K);
-        GGML_ASSERT(state.blocks_per_row == state.K_padded / state.B_size);
-        GGML_ASSERT(stripe.row_start <= stripe.row_end && stripe.row_end <= args.I);
-        GGML_ASSERT(stripe_q_wide.size() >= stripe.row_count() * state.K_padded);
-        GGML_ASSERT(stripe_block_exp.size() >= stripe.row_count() * state.blocks_per_row);
-        GGML_ASSERT(stripe.outlier_mask.rows == stripe.row_count());
-        GGML_ASSERT(stripe.outlier_mask.cols >= state.K_padded);
-        if (stripe.outlier_mask.rows != stripe.row_count() ||
-            stripe.outlier_mask.cols < state.K_padded)
-            return false;
-
-        // The slot owns this disjoint row range for both dense int8 and residual writes.
-        for (size_t r = stripe.row_start; r < stripe.row_end; ++r)
-        {
-            GGML_ASSERT(r < args.I);
-            const size_t local_row = stripe.local_row(r);
-
-            for (size_t b = 0; b < state.blocks_per_row; ++b)
-            {
-                const size_t block_offset = b * state.B_size;
-                const size_t block_exp_idx = local_row * state.blocks_per_row + b;
-                GGML_ASSERT(block_exp_idx < stripe_block_exp.size());
-
-                const int16_t block_exp = stripe_block_exp[block_exp_idx];
-                const int16_t delta_theta_b = block_exp == neg_inf || stripe.e_s == neg_inf
-                                                  ? 0
-                                                  : static_cast<int16_t>(block_exp - stripe.e_s);
-                if (stripe.promote_top_block && block_exp == stripe.e1)
-                {
-                    BitMask &block_inlier_mask = stripe.scratch.folding_inlier_mask;
-                    block_inlier_mask.clear_active_bits();
-
-                    for (size_t i = 0; i < state.B_size; ++i)
-                    {
-                        const size_t col = block_offset + i;
-                        if (col < args.K && !stripe.outlier_mask.is_set(local_row, col))
-                            block_inlier_mask.set(0, i);
-                    }
-                    unit_outlier_.mark_outlier(stripe, r, b, state.B_size, block_inlier_mask);
-                }
-
-                for (size_t i = 0; i < state.B_size; ++i)
-                {
-                    const size_t col = block_offset + i;
-                    const size_t padded_idx = local_row * state.K_padded + col;
-                    const int32_t q_shifted = detail::shift_q_i32(stripe_q_wide[padded_idx], delta_theta_b);
-                    const auto [q8, res] = unit_clip_.clip_with_residual(q_shifted);
-
-                    if (col < args.K)
-                        if (!args.A.set(r, col, q8))
-                            return false;
-
-                    const bool outlier = col < args.K && stripe.outlier_mask.is_set(local_row, col);
-                    const int32_t residual_i32 = outlier ? res : 0;
-#if GGML_GEMMINI_ACT_QUANT_METRICS
-                    if (col < args.K && args.evaluation_context)
-                        args.evaluation_context->position(r, col, outlier, residual_i32 != 0);
-#endif
-#if EXSIA_STAGE_PROFILE_ENABLED
-                    stripe.selected_positions += outlier;
-                    stripe.residual_nnz += residual_i32 != 0;
-#endif
-                    const size_t global_idx = r * state.K_padded + col;
-                    GGML_ASSERT(global_idx < residual.size());
-                    residual[global_idx] = residual_i32;
-
-#if GGML_GEMMINI_ENABLE_RMD
-                    if (outlier && residual_i32 != 0 &&
-                        !rmd_builder.add_residual(local_row, col, residual_i32))
-                    {
-                        return false;
-                    }
-#endif
-                }
-            }
-        }
-
-        return true;
-    }
-
-    // Seals the stripe's RMD packet and publishes the shared handle. Called once per
-    // stripe, right after folding commits, by the thread that ran folding.
-    static bool seal_stripe_packet(Meta &meta, StripePipelineSlot &slot, const ggml_gemmini_args_t &args)
-    {
-#if GGML_GEMMINI_ENABLE_RMD
-        const residual::ResidualStripePayload payload = slot.rmd_builder.finish();
-        slot.rmd_packet = payload.packet;
-        slot.direct_residual = payload.direct;
-        slot.rmd_pack_ns = payload.capture_ns;
-        if (slot.rmd_builder.status() != rmd::RmdStatus::success)
-            return false;
-        if (slot.rmd_packet)
-            meta.rmd_packets.push_back(slot.rmd_packet);
-        if (slot.direct_residual)
-            meta.direct_residuals.push_back(slot.direct_residual);
-#else
-        (void) meta;
-        slot.rmd_packet.reset();
-        slot.direct_residual.reset();
-        slot.rmd_pack_ns = 0;
+    (void)meta;
+    slot.rmd_packet.reset();
+    slot.direct_residual.reset();
+    slot.rmd_pack_ns = 0;
 #endif
 #if GGML_GEMMINI_RESIDUAL_METRICS
-        if (args.evaluation_context && args.evaluation_context->residual_enabled()) {
-            if (!GGML_GEMMINI_ENABLE_RMD || args.residual_route != residual::ResidualRoute::ws_packet)
-                throw std::runtime_error("evaluation metrics: RES requires producer RMD packet route");
-            args.evaluation_context->radix_stripe(slot.stripe_idx,
-                slot.rmd_packet ? slot.rmd_packet->required_planes : 0);
-        }
+    if (args.evaluation_context && args.evaluation_context->residual_enabled()) {
+        if (!GGML_GEMMINI_ENABLE_RMD || args.residual_route != residual::ResidualRoute::ws_packet)
+            throw std::runtime_error("evaluation metrics: RES requires producer RMD packet route");
+        args.evaluation_context->radix_stripe(
+            slot.stripe_idx, slot.rmd_packet ? slot.rmd_packet->required_planes : 0);
+    }
 #else
-        (void) args;
+    (void)args;
 #endif
-        return true;
+    return true;
+}
+
+const char * failure_code_name(ExSIAState::FailureCode code) noexcept {
+    switch (code) {
+    case ExSIAState::FailureCode::None:
+        return "None";
+    case ExSIAState::FailureCode::InvalidInput:
+        return "InvalidInput";
+    case ExSIAState::FailureCode::OpenMPUnavailable:
+        return "OpenMPUnavailable";
+    case ExSIAState::FailureCode::WrongTeamSize:
+        return "WrongTeamSize";
+    case ExSIAState::FailureCode::ExternalOpenMPRegionUnsupported:
+        return "ExternalOpenMPRegionUnsupported";
+    case ExSIAState::FailureCode::LocalBlockFailure:
+        return "LocalBlockFailure";
+    case ExSIAState::FailureCode::MaskAssemblyFailure:
+        return "MaskAssemblyFailure";
+    case ExSIAState::FailureCode::ExponentReductionFailure:
+        return "ExponentReductionFailure";
+    case ExSIAState::FailureCode::FoldingFailure:
+        return "FoldingFailure";
+    case ExSIAState::FailureCode::ValidationSnapshotFailure:
+        return "ValidationSnapshotFailure";
+    case ExSIAState::FailureCode::StripeReadySinkFailure:
+        return "StripeReadySinkFailure";
+    case ExSIAState::FailureCode::ProfileIntervalInvalid:
+        return "ProfileIntervalInvalid";
+    case ExSIAState::FailureCode::ProfileFlushFailure:
+        return "ProfileFlushFailure";
+    case ExSIAState::FailureCode::Exception:
+        return "Exception";
     }
+    return "Unknown";
+}
 
-    const char *failure_code_name(ExSIAState::FailureCode code) noexcept
-    {
-        switch (code)
-        {
-        case ExSIAState::FailureCode::None: return "None";
-        case ExSIAState::FailureCode::InvalidInput: return "InvalidInput";
-        case ExSIAState::FailureCode::OpenMPUnavailable: return "OpenMPUnavailable";
-        case ExSIAState::FailureCode::WrongTeamSize: return "WrongTeamSize";
-        case ExSIAState::FailureCode::ExternalOpenMPRegionUnsupported: return "ExternalOpenMPRegionUnsupported";
-        case ExSIAState::FailureCode::LocalBlockFailure: return "LocalBlockFailure";
-        case ExSIAState::FailureCode::MaskAssemblyFailure: return "MaskAssemblyFailure";
-        case ExSIAState::FailureCode::ExponentReductionFailure: return "ExponentReductionFailure";
-        case ExSIAState::FailureCode::FoldingFailure: return "FoldingFailure";
-        case ExSIAState::FailureCode::ValidationSnapshotFailure: return "ValidationSnapshotFailure";
-        case ExSIAState::FailureCode::StripeReadySinkFailure: return "StripeReadySinkFailure";
-        case ExSIAState::FailureCode::ProfileIntervalInvalid: return "ProfileIntervalInvalid";
-        case ExSIAState::FailureCode::ProfileFlushFailure: return "ProfileFlushFailure";
-        case ExSIAState::FailureCode::Exception: return "Exception";
-        }
-        return "Unknown";
+const char * failure_origin_name(ExSIAState::FailureCode code) noexcept {
+    switch (code) {
+    case ExSIAState::FailureCode::None:
+        return "none";
+    case ExSIAState::FailureCode::InvalidInput:
+    case ExSIAState::FailureCode::OpenMPUnavailable:
+    case ExSIAState::FailureCode::WrongTeamSize:
+    case ExSIAState::FailureCode::ExternalOpenMPRegionUnsupported:
+        return "exsia_setup";
+    case ExSIAState::FailureCode::LocalBlockFailure:
+    case ExSIAState::FailureCode::MaskAssemblyFailure:
+    case ExSIAState::FailureCode::ExponentReductionFailure:
+    case ExSIAState::FailureCode::FoldingFailure:
+        return "exsia_compute";
+    case ExSIAState::FailureCode::ValidationSnapshotFailure:
+    case ExSIAState::FailureCode::ProfileIntervalInvalid:
+    case ExSIAState::FailureCode::ProfileFlushFailure:
+        return "exsia_validation";
+    case ExSIAState::FailureCode::StripeReadySinkFailure:
+        return "downstream_sink";
+    case ExSIAState::FailureCode::Exception:
+        return "exception";
     }
+    return "unknown";
+}
 
-    const char *failure_origin_name(ExSIAState::FailureCode code) noexcept
-    {
-        switch (code)
-        {
-        case ExSIAState::FailureCode::None: return "none";
-        case ExSIAState::FailureCode::InvalidInput:
-        case ExSIAState::FailureCode::OpenMPUnavailable:
-        case ExSIAState::FailureCode::WrongTeamSize:
-        case ExSIAState::FailureCode::ExternalOpenMPRegionUnsupported:
-            return "exsia_setup";
-        case ExSIAState::FailureCode::LocalBlockFailure:
-        case ExSIAState::FailureCode::MaskAssemblyFailure:
-        case ExSIAState::FailureCode::ExponentReductionFailure:
-        case ExSIAState::FailureCode::FoldingFailure:
-            return "exsia_compute";
-        case ExSIAState::FailureCode::ValidationSnapshotFailure:
-        case ExSIAState::FailureCode::ProfileIntervalInvalid:
-        case ExSIAState::FailureCode::ProfileFlushFailure:
-            return "exsia_validation";
-        case ExSIAState::FailureCode::StripeReadySinkFailure:
-            return "downstream_sink";
-        case ExSIAState::FailureCode::Exception:
-            return "exception";
-        }
-        return "unknown";
+void ExSIA::reset_failure_state() {
+    first_failure_code_.store(ExSIAState::FailureCode::None, std::memory_order_relaxed);
+    first_failure_stripe_.store(ExSIAState::no_failure_stripe, std::memory_order_relaxed);
+}
+
+void ExSIA::record_failure(ExSIAState::FailureCode code, size_t stripe) {
+    if (code == ExSIAState::FailureCode::None)
+        return;
+
+    ExSIAState::FailureCode expected = ExSIAState::FailureCode::None;
+    if (first_failure_code_.compare_exchange_strong(
+            expected, code, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        first_failure_stripe_.store(stripe, std::memory_order_release);
     }
+}
 
-    void ExSIA::reset_failure_state()
-    {
-        first_failure_code_.store(ExSIAState::FailureCode::None, std::memory_order_relaxed);
-        first_failure_stripe_.store(ExSIAState::no_failure_stripe, std::memory_order_relaxed);
-    }
+bool ExSIA::run(Meta & meta, const ggml_tensor * A, ggml_gemmini_args_t & args) {
+    return run(meta, A, args, nullptr);
+}
 
-    void ExSIA::record_failure(ExSIAState::FailureCode code, size_t stripe)
-    {
-        if (code == ExSIAState::FailureCode::None)
-            return;
-
-        ExSIAState::FailureCode expected = ExSIAState::FailureCode::None;
-        if (first_failure_code_.compare_exchange_strong(
-                expected, code, std::memory_order_acq_rel, std::memory_order_relaxed))
-        {
-            first_failure_stripe_.store(stripe, std::memory_order_release);
-        }
-    }
-
-    bool ExSIA::run(
-        Meta &meta,
-        const ggml_tensor *A,
-        ggml_gemmini_args_t &args)
-    {
-        return run(meta, A, args, nullptr);
-    }
-
-    bool ExSIA::run(
-        Meta &meta,
-        const ggml_tensor *A,
-        ggml_gemmini_args_t &args,
-        const StripeReadySink *sink)
-    {
-        const char * layer = args.matmul_layer.c_str();
-        [[maybe_unused]] const auto task_trace_origin = gemmini_trace_capture();
-        const uint64_t run_id = next_exsia_run_id();
-        meta.run_id = run_id;
+bool ExSIA::run(Meta &                  meta,
+                const ggml_tensor *     A,
+                ggml_gemmini_args_t &   args,
+                const StripeReadySink * sink) {
+    const char *                layer             = args.matmul_layer.c_str();
+    [[maybe_unused]] const auto task_trace_origin = gemmini_trace_capture();
+    const uint64_t              run_id            = next_exsia_run_id();
+    meta.run_id                                   = run_id;
 #if CYCLE_SIM
-        const auto record_producer = [&](cycle_sim::ProducerEventKind kind,
-                                         const StripePipelineSlot &slot,
-                                         const char *source_location) {
-            if (sink == nullptr || sink->on_ready == nullptr || !args.cycle_sim_context)
-                return true;
-            return args.cycle_sim_context.session->producer_event(args.cycle_sim_context,
-                {kind, run_id, slot.stripe_idx, slot.row_start, slot.row_end,
-                 slot.stripe_idx % EXSIA_PIPELINE_SLOT_COUNT,
-                 bool(slot.rmd_packet), bool(slot.direct_residual), source_location});
-        };
+    const auto record_producer = [&](cycle_sim::ProducerEventKind kind,
+                                     const StripePipelineSlot &   slot,
+                                     const char *                 source_location) {
+        if (sink == nullptr || sink->on_ready == nullptr || !args.cycle_sim_context)
+            return true;
+        return args.cycle_sim_context.session->producer_event(
+            args.cycle_sim_context,
+            {kind,
+             run_id,
+             slot.stripe_idx,
+             slot.row_start,
+             slot.row_end,
+             slot.stripe_idx % EXSIA_PIPELINE_SLOT_COUNT,
+             bool(slot.rmd_packet),
+             bool(slot.direct_residual),
+             source_location});
+    };
 #endif
-        const char *force_recompute = std::getenv("GGML_GEMMINI_EXSIA_FORCE_RECOMPUTE");
-        local_.set_force_recompute(force_recompute != nullptr && std::strcmp(force_recompute, "1") == 0);
+    const char * force_recompute = std::getenv("GGML_GEMMINI_EXSIA_FORCE_RECOMPUTE");
+    local_.set_force_recompute(force_recompute != nullptr &&
+                               std::strcmp(force_recompute, "1") == 0);
 #if LOG_CYCLE
-        ExsiaRunTiming run_timing{layer, run_id};
+    ExsiaRunTiming run_timing{layer, run_id};
 #endif
-        CpuWallInterval run_cpu_wall(layer, run_id, "exsia.run.cpu");
-        EXSIA_PROFILE_LOG(
-        run_cpu_wall.pause();
-        const ProfileConfig profile_config = compile_profile_config();
-        run_cpu_wall.resume();
-        )
-        EXSIA_PROFILE_COLLECT(
-        ProfileInterval run_profile;
-        start_profile_interval(run_profile);
-        )
-        EXSIA_PROFILE_LOG(
-        const char *mode = requested_mode_ == ExSIAState::ExecutionMode::Sequential
-                               ? "Sequential"
-                               : requested_mode_ == ExSIAState::ExecutionMode::LocalParallel
-                                     ? "LocalParallel"
-                                     : "LocalFoldingPipeline";
-        )
-        const int16_t invalid_theta = std::numeric_limits<int16_t>::min();
-        // Global outputs are args.A (dense quantized), state_.residual, meta.theta, meta.rmd_packets.
-        size_t logical_elem_count = 0;
-        const bool logical_elem_count_ok = checked_mul_size(args.I, args.K, logical_elem_count);
-        reset_failure_state();
-        ggml::gemmini::GemminiGeometry geometry;
-        if (!args.activation_quant_geometry_matches(geometry))
-        {
-            record_failure(ExSIAState::FailureCode::InvalidInput,
-                           ExSIAState::no_failure_stripe);
-            for (StripePipelineSlot &slot : pipeline_slots_)
-                slot.reset_for_run();
-            local_workspace_.reset_for_run();
-            meta.reset();
-            meta.rho = config::GGML_GEMMINI_ACTIVATION_RHO;
-            state_ = ExSIAState{};
-            state_.mode = requested_mode_;
-            state_.run_id = run_id;
-            state_.failure_code = ExSIAState::FailureCode::InvalidInput;
-            state_.failure_stripe = ExSIAState::no_failure_stripe;
-            return false;
-        }
-        const auto fail = [&](ExSIAState::FailureCode code = ExSIAState::FailureCode::Exception,
-                              size_t stripe = ExSIAState::no_failure_stripe) {
-            record_failure(code, stripe);
-            const ExSIAState::FailureCode failure_code = first_failure_code_.load(
-                std::memory_order_acquire);
-            const size_t failure_stripe = first_failure_stripe_.load(std::memory_order_acquire);
-            if (args.A.valid() && logical_elem_count_ok)
-                args.A.zero_fill();
-
-            for (StripePipelineSlot &slot : pipeline_slots_)
-                slot.reset_for_run();
-            local_workspace_.reset_for_run();
-            meta.reset();
-            meta.rho = config::GGML_GEMMINI_ACTIVATION_RHO;
-#if EXSIA_VALIDATION && EXSIA_PROFILE_COLLECTION_ENABLED
-            const ExSIAState::ProfileSnapshot profile_snapshot = state_.profile_snapshot;
-#endif
-            state_ = ExSIAState{};
-            state_.mode = requested_mode_;
-            state_.run_id = run_id;
-            state_.failure_code = failure_code;
-            state_.failure_stripe = failure_stripe;
-#if EXSIA_VALIDATION && EXSIA_PROFILE_COLLECTION_ENABLED
-            state_.profile_snapshot = profile_snapshot;
-#endif
-            return false;
-        };
-        EXSIA_PROFILE_LOG(
-        if (!profile_config.setup_ok)
-            return fail(ExSIAState::FailureCode::ProfileFlushFailure);
-        )
-
-        meta.rho = config::GGML_GEMMINI_ACTIVATION_RHO;
-        meta.sigma = GGML_GEMMINI_EXSIA_SIGMA;
-        for (StripePipelineSlot &slot : pipeline_slots_)
+    CpuWallInterval run_cpu_wall(layer, run_id, "exsia.run.cpu");
+    EXSIA_PROFILE_LOG(run_cpu_wall.pause();
+                      const ProfileConfig profile_config = compile_profile_config();
+                      run_cpu_wall.resume();)
+    EXSIA_PROFILE_COLLECT(ProfileInterval run_profile; start_profile_interval(run_profile);)
+    EXSIA_PROFILE_LOG(const char * mode =
+                          requested_mode_ == ExSIAState::ExecutionMode::Sequential ? "Sequential"
+                          : requested_mode_ == ExSIAState::ExecutionMode::LocalParallel
+                              ? "LocalParallel"
+                              : "LocalFoldingPipeline";)
+    const int16_t invalid_theta = std::numeric_limits<int16_t>::min();
+    // Global outputs are args.A (dense quantized), state_.residual, meta.theta, meta.rmd_packets.
+    size_t     logical_elem_count    = 0;
+    const bool logical_elem_count_ok = checked_mul_size(args.I, args.K, logical_elem_count);
+    reset_failure_state();
+    ggml::gemmini::GemminiGeometry geometry;
+    if (!args.activation_quant_geometry_matches(geometry)) {
+        record_failure(ExSIAState::FailureCode::InvalidInput, ExSIAState::no_failure_stripe);
+        for (StripePipelineSlot & slot : pipeline_slots_)
             slot.reset_for_run();
         local_workspace_.reset_for_run();
-        state_ = ExSIAState{};
-        state_.mode = requested_mode_;
-        state_.run_id = run_id;
+        meta.reset();
+        meta.rho              = config::GGML_GEMMINI_ACTIVATION_RHO;
+        state_                = ExSIAState{};
+        state_.mode           = requested_mode_;
+        state_.run_id         = run_id;
+        state_.failure_code   = ExSIAState::FailureCode::InvalidInput;
+        state_.failure_stripe = ExSIAState::no_failure_stripe;
+        return false;
+    }
+    const auto fail = [&](ExSIAState::FailureCode code   = ExSIAState::FailureCode::Exception,
+                          size_t                  stripe = ExSIAState::no_failure_stripe) {
+        record_failure(code, stripe);
+        const ExSIAState::FailureCode failure_code =
+            first_failure_code_.load(std::memory_order_acquire);
+        const size_t failure_stripe = first_failure_stripe_.load(std::memory_order_acquire);
+        if (args.A.valid() && logical_elem_count_ok)
+            args.A.zero_fill();
+
+        for (StripePipelineSlot & slot : pipeline_slots_)
+            slot.reset_for_run();
+        local_workspace_.reset_for_run();
+        meta.reset();
+        meta.rho = config::GGML_GEMMINI_ACTIVATION_RHO;
+#if EXSIA_VALIDATION && EXSIA_PROFILE_COLLECTION_ENABLED
+        const ExSIAState::ProfileSnapshot profile_snapshot = state_.profile_snapshot;
+#endif
+        state_                = ExSIAState{};
+        state_.mode           = requested_mode_;
+        state_.run_id         = run_id;
+        state_.failure_code   = failure_code;
+        state_.failure_stripe = failure_stripe;
+#if EXSIA_VALIDATION && EXSIA_PROFILE_COLLECTION_ENABLED
+        state_.profile_snapshot = profile_snapshot;
+#endif
+        return false;
+    };
+    EXSIA_PROFILE_LOG(
+        if (!profile_config.setup_ok) return fail(ExSIAState::FailureCode::ProfileFlushFailure);)
+
+    meta.rho   = config::GGML_GEMMINI_ACTIVATION_RHO;
+    meta.sigma = GGML_GEMMINI_EXSIA_SIGMA;
+    for (StripePipelineSlot & slot : pipeline_slots_)
+        slot.reset_for_run();
+    local_workspace_.reset_for_run();
+    state_        = ExSIAState{};
+    state_.mode   = requested_mode_;
+    state_.run_id = run_id;
 #if !defined(GGML_GEMMINI_HAS_OPENMP)
-        if (state_.mode == ExSIAState::ExecutionMode::LocalParallel ||
-            state_.mode == ExSIAState::ExecutionMode::LocalFoldingPipeline)
-            return fail(ExSIAState::FailureCode::OpenMPUnavailable);
+    if (state_.mode == ExSIAState::ExecutionMode::LocalParallel ||
+        state_.mode == ExSIAState::ExecutionMode::LocalFoldingPipeline)
+        return fail(ExSIAState::FailureCode::OpenMPUnavailable);
 #endif
-        if (state_.mode != ExSIAState::ExecutionMode::Sequential &&
-            state_.mode != ExSIAState::ExecutionMode::LocalParallel &&
-            state_.mode != ExSIAState::ExecutionMode::LocalFoldingPipeline)
-        {
-            return fail(ExSIAState::FailureCode::InvalidInput);
-        }
+    if (state_.mode != ExSIAState::ExecutionMode::Sequential &&
+        state_.mode != ExSIAState::ExecutionMode::LocalParallel &&
+        state_.mode != ExSIAState::ExecutionMode::LocalFoldingPipeline) {
+        return fail(ExSIAState::FailureCode::InvalidInput);
+    }
 #if defined(GGML_GEMMINI_HAS_OPENMP)
-        if ((state_.mode == ExSIAState::ExecutionMode::LocalParallel ||
-             state_.mode == ExSIAState::ExecutionMode::LocalFoldingPipeline) &&
-            (omp_in_parallel() || omp_get_active_level() > 0))
-        {
-            return fail(ExSIAState::FailureCode::ExternalOpenMPRegionUnsupported);
-        }
+    if ((state_.mode == ExSIAState::ExecutionMode::LocalParallel ||
+         state_.mode == ExSIAState::ExecutionMode::LocalFoldingPipeline) &&
+        (omp_in_parallel() || omp_get_active_level() > 0)) {
+        return fail(ExSIAState::FailureCode::ExternalOpenMPRegionUnsupported);
+    }
 #endif
-        state_.B_size = BLOCK_SIZE;
-        state_.K_logical = args.K;
-        if (!args.A.valid() ||
-            args.I == 0 || args.K == 0 ||
-            !logical_elem_count_ok ||
-            !checked_round_up_multiple(args.K, state_.B_size, state_.K_padded))
-        {
-            return fail(ExSIAState::FailureCode::InvalidInput);
-        }
+    state_.B_size    = BLOCK_SIZE;
+    state_.K_logical = args.K;
+    if (!args.A.valid() || args.I == 0 || args.K == 0 || !logical_elem_count_ok ||
+        !checked_round_up_multiple(args.K, state_.B_size, state_.K_padded)) {
+        return fail(ExSIAState::FailureCode::InvalidInput);
+    }
 
-        state_.blocks_per_row = state_.K_padded / state_.B_size;
+    state_.blocks_per_row = state_.K_padded / state_.B_size;
 
-        const size_t rows_per_stripe = geometry.stripe_rows;
-        const size_t num_stripes = geometry.stripe_count;
-        const float *src_data = ggml::gemmini::activation_data(A);
-        if (!src_data)
-            return fail(ExSIAState::FailureCode::InvalidInput);
+    const size_t  rows_per_stripe = geometry.stripe_rows;
+    const size_t  num_stripes     = geometry.stripe_count;
+    const float * src_data        = ggml::gemmini::activation_data(A);
+    if (!src_data)
+        return fail(ExSIAState::FailureCode::InvalidInput);
 #if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
-        args.evaluation_context.reset();
-        if (const auto session = evaluation::active_session())
-            args.evaluation_context = session->invocation(args.matmul_layer, args.I, args.K, src_data);
+    args.evaluation_context.reset();
+    if (const auto session = evaluation::active_session())
+        args.evaluation_context = session->invocation(args.matmul_layer, args.I, args.K, src_data);
 #endif
 
-        size_t max_stripe_rows = std::min(args.I, rows_per_stripe);
-        size_t max_stripe_elem_count = 0;
-        size_t max_stripe_block_count = 0;
-        if (!checked_mul_size(max_stripe_rows, state_.K_padded, max_stripe_elem_count) ||
-            !checked_mul_size(max_stripe_rows, state_.blocks_per_row, max_stripe_block_count))
-        {
+    size_t max_stripe_rows        = std::min(args.I, rows_per_stripe);
+    size_t max_stripe_elem_count  = 0;
+    size_t max_stripe_block_count = 0;
+    if (!checked_mul_size(max_stripe_rows, state_.K_padded, max_stripe_elem_count) ||
+        !checked_mul_size(max_stripe_rows, state_.blocks_per_row, max_stripe_block_count)) {
+        return fail(ExSIAState::FailureCode::InvalidInput);
+    }
+
+    meta.theta.assign(num_stripes, invalid_theta);
+    meta.rmd_packets.clear();
+    meta.direct_residuals.clear();
+
+    // Dense residual matrix is a global output, sized to the full padded activation.
+    // Each stripe writes its own disjoint global row range (K_padded stride).
+    size_t padded_elem_count = 0;
+    if (!checked_mul_size(args.I, state_.K_padded, padded_elem_count))
+        return fail(ExSIAState::FailureCode::InvalidInput);
+
+    release_vector(state_.x_f32);
+    release_vector(state_.q_wide);
+    release_vector(state_.block_exp);
+    state_.residual.assign(padded_elem_count, 0);
+
+    for (StripePipelineSlot & slot : pipeline_slots_) {
+        slot.rmd_builder.select(args.residual_route);
+        slot.rmd_builder.set_context(run_id, layer);
+        if (!slot.prepare(max_stripe_elem_count,
+                          max_stripe_block_count,
+                          max_stripe_rows,
+                          state_.K_padded,
+                          state_.B_size))
             return fail(ExSIAState::FailureCode::InvalidInput);
-        }
-
-        meta.theta.assign(num_stripes, invalid_theta);
-        meta.rmd_packets.clear();
-        meta.direct_residuals.clear();
-
-        // Dense residual matrix is a global output, sized to the full padded activation.
-        // Each stripe writes its own disjoint global row range (K_padded stride).
-        size_t padded_elem_count = 0;
-        if (!checked_mul_size(args.I, state_.K_padded, padded_elem_count))
-            return fail(ExSIAState::FailureCode::InvalidInput);
-
-        release_vector(state_.x_f32);
-        release_vector(state_.q_wide);
-        release_vector(state_.block_exp);
-        state_.residual.assign(padded_elem_count, 0);
-
-        for (StripePipelineSlot &slot : pipeline_slots_)
-        {
-            slot.rmd_builder.select(args.residual_route);
-            slot.rmd_builder.set_context(run_id, layer);
-            if (!slot.prepare(max_stripe_elem_count, max_stripe_block_count,
-                              max_stripe_rows, state_.K_padded, state_.B_size))
-                return fail(ExSIAState::FailureCode::InvalidInput);
-        }
-        if (!local_workspace_.prepare(max_stripe_block_count, state_.B_size))
-            return fail(ExSIAState::FailureCode::InvalidInput);
+    }
+    if (!local_workspace_.prepare(max_stripe_block_count, state_.B_size))
+        return fail(ExSIAState::FailureCode::InvalidInput);
 
 #if GGML_GEMMINI_ENABLE_RMD
-        const unsigned capture_kind = args.residual_route == residual::ResidualRoute::cpu_direct
-            ? 0 : GGML_GEMMINI_ACTIVATION_BITS == 16 ? 1 : 2;
-        static std::atomic<unsigned> reported_capture_kinds{0};
-        if ((reported_capture_kinds.fetch_or(1u << capture_kind, std::memory_order_relaxed) &
-             (1u << capture_kind)) == 0) {
-            const char *names[] = {"cpu_direct (compaction unused)", "ws_packet compaction=a16", "ws_packet compaction=bitmap"};
-            std::fprintf(stderr, "gemmini: ExSIA RMD capture=%s\n", names[capture_kind]);
-        }
+    const unsigned capture_kind = args.residual_route == residual::ResidualRoute::cpu_direct ? 0
+                                  : GGML_GEMMINI_ACTIVATION_BITS == 16                       ? 1
+                                                                                             : 2;
+    static std::atomic<unsigned> reported_capture_kinds{0};
+    if ((reported_capture_kinds.fetch_or(1u << capture_kind, std::memory_order_relaxed) &
+         (1u << capture_kind)) == 0) {
+        const char * names[] = {"cpu_direct (compaction unused)",
+                                "ws_packet compaction=a16",
+                                "ws_packet compaction=bitmap"};
+        std::fprintf(stderr, "gemmini: ExSIA RMD capture=%s\n", names[capture_kind]);
+    }
 #endif
 
-        // state_.stripe carries per-stripe row metadata only; the workspace owns the live
-        // mask/scratch. (Validation builds additionally snapshot each mask below.)
-        state_.stripe.assign(num_stripes, StripeState{});
+    // state_.stripe carries per-stripe row metadata only; the workspace owns the live
+    // mask/scratch. (Validation builds additionally snapshot each mask below.)
+    state_.stripe.assign(num_stripes, StripeState{});
 #if EXSIA_OBSERVATION_ENABLED
-        if (state_.mode == ExSIAState::ExecutionMode::LocalParallel ||
-            state_.mode == ExSIAState::ExecutionMode::LocalFoldingPipeline)
-            state_.local_parallel_observations.resize(num_stripes);
+    if (state_.mode == ExSIAState::ExecutionMode::LocalParallel ||
+        state_.mode == ExSIAState::ExecutionMode::LocalFoldingPipeline)
+        state_.local_parallel_observations.resize(num_stripes);
 #endif
-        for (size_t s = 0; s < num_stripes; ++s)
-        {
-            StripeState &meta_stripe = state_.stripe[s];
-            meta_stripe.row_start = s * rows_per_stripe;
-            meta_stripe.row_end = std::min((s + 1) * rows_per_stripe, args.I);
+    for (size_t s = 0; s < num_stripes; ++s) {
+        StripeState & meta_stripe = state_.stripe[s];
+        meta_stripe.row_start     = s * rows_per_stripe;
+        meta_stripe.row_end       = std::min((s + 1) * rows_per_stripe, args.I);
 #if EXSIA_VALIDATION
-            if (!meta_stripe.outlier_mask.prepare(meta_stripe.row_count(), state_.K_padded))
-                return fail(ExSIAState::FailureCode::ValidationSnapshotFailure, s);
+        if (!meta_stripe.outlier_mask.prepare(meta_stripe.row_count(), state_.K_padded))
+            return fail(ExSIAState::FailureCode::ValidationSnapshotFailure, s);
 #endif
-        }
+    }
 
-        const auto snapshot_validation_mask = [&](size_t stripe_idx, const BitMask &mask) {
+    const auto snapshot_validation_mask = [&](size_t stripe_idx, const BitMask & mask) {
 #if EXSIA_VALIDATION
-            BitMask &snapshot = state_.stripe[stripe_idx].outlier_mask;
-            const size_t word_count = mask.active_word_count();
-            if (snapshot.words.size() < word_count)
-                return false;
-            snapshot.rows = mask.rows;
-            snapshot.cols = mask.cols;
-            std::copy_n(mask.words.begin(), word_count, snapshot.words.begin());
+        BitMask &    snapshot   = state_.stripe[stripe_idx].outlier_mask;
+        const size_t word_count = mask.active_word_count();
+        if (snapshot.words.size() < word_count)
+            return false;
+        snapshot.rows = mask.rows;
+        snapshot.cols = mask.cols;
+        std::copy_n(mask.words.begin(), word_count, snapshot.words.begin());
 #else
-            (void) stripe_idx;
-            (void) mask;
+        (void)stripe_idx;
+        (void)mask;
 #endif
-            return true;
-        };
-        const auto notify_stripe_ready = [&](StripePipelineSlot &slot, uint64_t run_id,
-                                             bool measure_stripe_ready_handoff,
-                                             CpuWallInterval &cpu_wall
+        return true;
+    };
+    const auto notify_stripe_ready = [&](StripePipelineSlot & slot,
+                                         uint64_t             run_id,
+                                         bool                 measure_stripe_ready_handoff,
+                                         CpuWallInterval &    cpu_wall
 #if EXSIA_PROFILE_COLLECTION_ENABLED
-                                             , StripeProfileRecord *profile
+                                         ,
+                                         StripeProfileRecord * profile
 #endif
-                                             ) {
-            (void) measure_stripe_ready_handoff;
+                                     ) {
+        (void)measure_stripe_ready_handoff;
 #if EXSIA_STAGE_PROFILE_ENABLED
-            profile->selected_positions = slot.stripe.selected_positions;
-            profile->residual_nnz = slot.stripe.residual_nnz;
+        profile->selected_positions = slot.stripe.selected_positions;
+        profile->residual_nnz       = slot.stripe.residual_nnz;
 #endif
-            if (sink == nullptr || sink->on_ready == nullptr)
-                return true;
+        if (sink == nullptr || sink->on_ready == nullptr)
+            return true;
 
-            StripeReadyEvent event{};
-            event.run_id = run_id;
-            event.stripe_id = slot.stripe_idx;
-            event.slot = slot.stripe_idx % EXSIA_PIPELINE_SLOT_COUNT;
-            event.row_begin = slot.row_start;
-            event.row_end = slot.row_end;
-            const int16_t theta =
-                meta.resolve_stripe_theta(static_cast<int>(slot.stripe_idx));
-            if (theta == std::numeric_limits<int16_t>::min())
-            {
-                ggml::gemmini::log::debug(
-                    layer,
-                    "[exsia] stripe ready handoff failed run_id=%llu stripe=%zu reason=missing_theta",
-                    static_cast<unsigned long long>(run_id), slot.stripe_idx);
-                return false;
-            }
-            event.activation_metadata =
-                StripeMetadataSnapshot{meta.e_s, meta.rho, meta.sigma, theta};
-            event.quantization_start = slot.quantization_start;
-            event.quantization_end = slot.quantization_end;
-            event.quantization_start_ns = slot.quantization_start_ns;
-            event.quantization_end_ns = slot.quantization_end_ns;
-            event.rmd_packet = slot.rmd_packet;
-            event.direct_residual = slot.direct_residual;
+        StripeReadyEvent event{};
+        event.run_id        = run_id;
+        event.stripe_id     = slot.stripe_idx;
+        event.slot          = slot.stripe_idx % EXSIA_PIPELINE_SLOT_COUNT;
+        event.row_begin     = slot.row_start;
+        event.row_end       = slot.row_end;
+        const int16_t theta = meta.resolve_stripe_theta(static_cast<int>(slot.stripe_idx));
+        if (theta == std::numeric_limits<int16_t>::min()) {
+            ggml::gemmini::log::debug(
+                layer,
+                "[exsia] stripe ready handoff failed run_id=%llu stripe=%zu reason=missing_theta",
+                static_cast<unsigned long long>(run_id),
+                slot.stripe_idx);
+            return false;
+        }
+        event.activation_metadata   = StripeMetadataSnapshot{meta.e_s, meta.rho, meta.sigma, theta};
+        event.quantization_start    = slot.quantization_start;
+        event.quantization_end      = slot.quantization_end;
+        event.quantization_start_ns = slot.quantization_start_ns;
+        event.quantization_end_ns   = slot.quantization_end_ns;
+        event.rmd_packet            = slot.rmd_packet;
+        event.direct_residual       = slot.direct_residual;
 #if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
-            event.evaluation_context = args.evaluation_context;
+        event.evaluation_context = args.evaluation_context;
 #endif
-            event.rmd_pack_ns = slot.rmd_pack_ns;
+        event.rmd_pack_ns = slot.rmd_pack_ns;
 #if CYCLE_SIM
-            if (profile) event.cycle_sim_host_dependencies = profile_host_stage_ids(*profile);
+        if (profile)
+            event.cycle_sim_host_dependencies = profile_host_stage_ids(*profile);
 #endif
 #if EXSIA_PROFILE_COLLECTION_ENABLED
-            if (profile != nullptr) {
-                event.local_start_ns = profile->local.start_ns;
-                event.local_end_ns = profile->local.end_ns;
-                event.folding_start_ns = profile->folding.start_ns;
-                event.folding_end_ns = profile->folding.end_ns;
-                event.mask_assembly_start_ns = profile->mask_assembly.start_ns;
-                event.mask_assembly_end_ns = profile->mask_assembly.end_ns;
-                event.exponent_reduction_start_ns = profile->exponent_reduction.start_ns;
-                event.exponent_reduction_end_ns = profile->exponent_reduction.end_ns;
-            }
+        if (profile != nullptr) {
+            event.local_start_ns              = profile->local.start_ns;
+            event.local_end_ns                = profile->local.end_ns;
+            event.folding_start_ns            = profile->folding.start_ns;
+            event.folding_end_ns              = profile->folding.end_ns;
+            event.mask_assembly_start_ns      = profile->mask_assembly.start_ns;
+            event.mask_assembly_end_ns        = profile->mask_assembly.end_ns;
+            event.exponent_reduction_start_ns = profile->exponent_reduction.start_ns;
+            event.exponent_reduction_end_ns   = profile->exponent_reduction.end_ns;
+        }
 #endif
-            event.folding_commit_ns = slot.folding_commit_ns;
-            cpu_wall.pause();
+        event.folding_commit_ns = slot.folding_commit_ns;
+        cpu_wall.pause();
 #if LOG_CYCLE
-            event.collect_submission_timing = true;
-            const auto submission_start = gemmini_cpu_timing_read();
+        event.collect_submission_timing = true;
+        const auto submission_start     = gemmini_cpu_timing_read();
 #endif
 #if defined(__linux__) && defined(__aarch64__) && CYCLE_DETAIL
-            ggml::gemmini::cycle::NativeCycleSample stripe_ready_handoff_start{};
-            if (measure_stripe_ready_handoff)
-                stripe_ready_handoff_start = ggml::gemmini::cycle::read_sample();
+        ggml::gemmini::cycle::NativeCycleSample stripe_ready_handoff_start{};
+        if (measure_stripe_ready_handoff)
+            stripe_ready_handoff_start = ggml::gemmini::cycle::read_sample();
 #endif
-            const bool accepted = sink->on_ready(
-                sink->user_data,
-                event);
-            if (!accepted)
-            {
-                ggml::gemmini::log::debug(
-                    layer,
-                    "[exsia] stripe ready handoff failed run_id=%llu stripe=%zu reason=sink_rejected",
-                    static_cast<unsigned long long>(run_id), slot.stripe_idx);
-            }
+        const bool accepted = sink->on_ready(sink->user_data, event);
+        if (!accepted) {
+            ggml::gemmini::log::debug(
+                layer,
+                "[exsia] stripe ready handoff failed run_id=%llu stripe=%zu reason=sink_rejected",
+                static_cast<unsigned long long>(run_id),
+                slot.stripe_idx);
+        }
 #if defined(__linux__) && defined(__aarch64__) && CYCLE_DETAIL
-            if (measure_stripe_ready_handoff)
-            {
-                const auto stripe_ready_handoff_end = ggml::gemmini::cycle::read_sample();
+        if (measure_stripe_ready_handoff) {
+            const auto stripe_ready_handoff_end = ggml::gemmini::cycle::read_sample();
 #if LOG_CYCLE
-                run_timing.submission(event, submission_start, gemmini_cpu_timing_read(), accepted);
+            run_timing.submission(event, submission_start, gemmini_cpu_timing_read(), accepted);
 #endif
-                const gemmini_native_cycle_sample_internal stripe_ready_handoff_start_sample{
-                    stripe_ready_handoff_start.value,
-                    static_cast<uint8_t>(stripe_ready_handoff_start.valid),
-                    static_cast<uint8_t>(stripe_ready_handoff_start.reason),
-                    GEMMINI_NATIVE_CYCLE_SOURCE_LINUX_PERF_CPU_CYCLES,
-                    stripe_ready_handoff_start.owner_event_token,
-                    stripe_ready_handoff_start.generation};
-                const gemmini_native_cycle_sample_internal stripe_ready_handoff_end_sample{
-                    stripe_ready_handoff_end.value,
-                    static_cast<uint8_t>(stripe_ready_handoff_end.valid),
-                    static_cast<uint8_t>(stripe_ready_handoff_end.reason),
-                    GEMMINI_NATIVE_CYCLE_SOURCE_LINUX_PERF_CPU_CYCLES,
-                    stripe_ready_handoff_end.owner_event_token,
-                    stripe_ready_handoff_end.generation};
-                const gemmini_cycle_record_v2 stripe_ready_handoff_record{
-                    {layer, "exsia.stripe_ready_handoff",
-                     stripe_ready_handoff_start.value,
-                     stripe_ready_handoff_end.value,
-                     nullptr, 0, nullptr},
-                    GEMMINI_CYCLE_HAS_RUN_ID | GEMMINI_CYCLE_HAS_STRIPE_ID |
-                        GEMMINI_CYCLE_HAS_SLOT,
-                    event.run_id, event.stripe_id, event.slot, 0, 0};
-                gemmini_log_cycle_record_v2_checked_internal(
-                    &stripe_ready_handoff_record, &stripe_ready_handoff_start_sample,
-                    &stripe_ready_handoff_end_sample, 1);
-            }
+            const gemmini_native_cycle_sample_internal stripe_ready_handoff_start_sample{
+                stripe_ready_handoff_start.value,
+                static_cast<uint8_t>(stripe_ready_handoff_start.valid),
+                static_cast<uint8_t>(stripe_ready_handoff_start.reason),
+                GEMMINI_NATIVE_CYCLE_SOURCE_LINUX_PERF_CPU_CYCLES,
+                stripe_ready_handoff_start.owner_event_token,
+                stripe_ready_handoff_start.generation};
+            const gemmini_native_cycle_sample_internal stripe_ready_handoff_end_sample{
+                stripe_ready_handoff_end.value,
+                static_cast<uint8_t>(stripe_ready_handoff_end.valid),
+                static_cast<uint8_t>(stripe_ready_handoff_end.reason),
+                GEMMINI_NATIVE_CYCLE_SOURCE_LINUX_PERF_CPU_CYCLES,
+                stripe_ready_handoff_end.owner_event_token,
+                stripe_ready_handoff_end.generation};
+            const gemmini_cycle_record_v2 stripe_ready_handoff_record{
+                {layer,
+                 "exsia.stripe_ready_handoff",
+                 stripe_ready_handoff_start.value,
+                 stripe_ready_handoff_end.value,
+                 nullptr,
+                 0,
+                 nullptr},
+                GEMMINI_CYCLE_HAS_RUN_ID | GEMMINI_CYCLE_HAS_STRIPE_ID | GEMMINI_CYCLE_HAS_SLOT,
+                event.run_id,
+                event.stripe_id,
+                event.slot,
+                0,
+                0};
+            gemmini_log_cycle_record_v2_checked_internal(&stripe_ready_handoff_record,
+                                                         &stripe_ready_handoff_start_sample,
+                                                         &stripe_ready_handoff_end_sample,
+                                                         1);
+        }
 #endif
 #if LOG_CYCLE
 #if defined(__linux__) && defined(__aarch64__) && CYCLE_DETAIL
-            if (!measure_stripe_ready_handoff)
+        if (!measure_stripe_ready_handoff)
 #endif
-                run_timing.submission(event, submission_start, gemmini_cpu_timing_read(), accepted);
+            run_timing.submission(event, submission_start, gemmini_cpu_timing_read(), accepted);
 #endif
-            cpu_wall.resume();
-            return accepted;
-        };
+        cpu_wall.resume();
+        return accepted;
+    };
 #if defined(GGML_GEMMINI_HAS_OPENMP)
 #if EXSIA_BRANCH_COUNTS_ENABLED
-        const auto record_sample = [](StripeCycleStats &stats,
-                                      const LocalBlockCycleSample &sample) {
+    const auto record_sample = [](StripeCycleStats & stats, const LocalBlockCycleSample & sample) {
 #if EXSIA_STAGE_PROFILE_ENABLED
 #if defined(__linux__) && defined(__aarch64__)
-            stats.p0.add(sample.stage_intervals[0]);
-            stats.p1.add(sample.stage_intervals[1]);
-            stats.p2.add(sample.stage_intervals[2]);
-            stats.p3.add(sample.stage_intervals[3]);
+        stats.p0.add(sample.stage_intervals[0]);
+        stats.p1.add(sample.stage_intervals[1]);
+        stats.p2.add(sample.stage_intervals[2]);
+        stats.p3.add(sample.stage_intervals[3]);
 #else
-            stats.p0.add(sample.p0);
-            stats.p1.add(sample.p1);
-            stats.p2.add(sample.p2);
-            stats.p3.add(sample.p3);
+        stats.p0.add(sample.p0);
+        stats.p1.add(sample.p1);
+        stats.p2.add(sample.p2);
+        stats.p3.add(sample.p3);
 #endif
-            stats.forced_recompute_count += sample.forced_recompute_count;
+        stats.forced_recompute_count += sample.forced_recompute_count;
 #endif
-            switch (sample.p3_path)
-            {
-            case P3Path::BypassNoIntegerOutlier:
-                ++stats.p3_bypass_no_int_count;
-                break;
-            case P3Path::BypassSameScale:
-                ++stats.p3_bypass_same_scale_count;
-                break;
-            case P3Path::Replay:
-                ++stats.p3_replay_count;
-                break;
-            }
-        };
+        switch (sample.p3_path) {
+        case P3Path::BypassNoIntegerOutlier:
+            ++stats.p3_bypass_no_int_count;
+            break;
+        case P3Path::BypassSameScale:
+            ++stats.p3_bypass_same_scale_count;
+            break;
+        case P3Path::Replay:
+            ++stats.p3_replay_count;
+            break;
+        }
+    };
 #endif
-        const auto run_local_block = [&](StripePipelineSlot &slot,
-                                         StripeScratch &scratch,
-                                         size_t row,
-                                         size_t block EXSIA_STATS_PARAMETER) {
+    const auto run_local_block = [&](StripePipelineSlot & slot,
+                                     StripeScratch &      scratch,
+                                     size_t               row,
+                                     size_t block         EXSIA_STATS_PARAMETER) {
 #if EXSIA_BRANCH_COUNTS_ENABLED
-            LocalBlockCycleSample sample;
+        LocalBlockCycleSample sample;
 #endif
-            const size_t col_offset = block * state_.B_size;
-            GGML_ASSERT(col_offset < args.K);
-            const size_t valid_count = std::min(state_.B_size, args.K - col_offset);
-            const size_t local_row = slot.stripe.local_row(row);
-            const size_t block_base = local_row * state_.K_padded + col_offset;
-            const size_t block_exp_idx = local_row * state_.blocks_per_row + block;
-            GGML_ASSERT(slot.q_wide.size() >= block_base + state_.B_size);
-            GGML_ASSERT(block_exp_idx < slot.block_exp.size());
-            BlockMask block_mask = slot.block_mask(
-                local_row * state_.blocks_per_row + block, state_.B_size);
-            if (!local_.run_optimized(meta, state_, src_data + row * args.K + col_offset,
-                             valid_count, state_.B_size, local_row, block, scratch, block_mask,
-                             slot.q_wide.data() + block_base, slot.block_exp[block_exp_idx]
+        const size_t col_offset = block * state_.B_size;
+        GGML_ASSERT(col_offset < args.K);
+        const size_t valid_count   = std::min(state_.B_size, args.K - col_offset);
+        const size_t local_row     = slot.stripe.local_row(row);
+        const size_t block_base    = local_row * state_.K_padded + col_offset;
+        const size_t block_exp_idx = local_row * state_.blocks_per_row + block;
+        GGML_ASSERT(slot.q_wide.size() >= block_base + state_.B_size);
+        GGML_ASSERT(block_exp_idx < slot.block_exp.size());
+        BlockMask block_mask =
+            slot.block_mask(local_row * state_.blocks_per_row + block, state_.B_size);
+        if (!local_.run_optimized(meta,
+                                  state_,
+                                  src_data + row * args.K + col_offset,
+                                  valid_count,
+                                  state_.B_size,
+                                  local_row,
+                                  block,
+                                  scratch,
+                                  block_mask,
+                                  slot.q_wide.data() + block_base,
+                                  slot.block_exp[block_exp_idx]
 #if EXSIA_BRANCH_COUNTS_ENABLED
-                             , sample
+                                  ,
+                                  sample
 #endif
-                             ))
-                return false;
+                                  ))
+            return false;
 
 #if EXSIA_BRANCH_COUNTS_ENABLED
-            record_sample(stats, sample);
+        record_sample(stats, sample);
 #endif
 #if GGML_GEMMINI_ACT_QUANT_METRICS
-            if (scratch.actual_requantized && args.evaluation_context)
-                args.evaluation_context->requantized(row, block);
+        if (scratch.actual_requantized && args.evaluation_context)
+            args.evaluation_context->requantized(row, block);
 #endif
-            return true;
-        };
+        return true;
+    };
 #endif
 
-        EXSIA_PROFILE_COLLECT(
-        std::vector<StripeProfileRecord> stripe_profiles(num_stripes);
-        )
-        if (state_.mode == ExSIAState::ExecutionMode::LocalFoldingPipeline)
-        {
+    EXSIA_PROFILE_COLLECT(std::vector<StripeProfileRecord> stripe_profiles(num_stripes);)
+    if (state_.mode == ExSIAState::ExecutionMode::LocalFoldingPipeline) {
 #if defined(GGML_GEMMINI_HAS_OPENMP)
-            std::vector<uint8_t> prepared_storage(num_stripes);
-            std::vector<uint8_t> worker_done_storage(num_stripes * EXSIA_LOCAL_WORKER_COUNT);
-            std::vector<uint8_t> local_sealed_storage(num_stripes);
-            std::vector<uint8_t> slot_released_storage(num_stripes);
-            [[maybe_unused]] uint8_t *prepared = prepared_storage.data();
-            [[maybe_unused]] uint8_t *worker_done = worker_done_storage.data();
-            [[maybe_unused]] uint8_t *local_sealed = local_sealed_storage.data();
-            [[maybe_unused]] uint8_t *slot_released = slot_released_storage.data();
-            [[maybe_unused]] uint8_t post_chain = 0;
-            std::atomic<bool> pipeline_ok{true};
-            run_cpu_wall.pause();
+        std::vector<uint8_t>       prepared_storage(num_stripes);
+        std::vector<uint8_t>       worker_done_storage(num_stripes * EXSIA_LOCAL_WORKER_COUNT);
+        std::vector<uint8_t>       local_sealed_storage(num_stripes);
+        std::vector<uint8_t>       slot_released_storage(num_stripes);
+        [[maybe_unused]] uint8_t * prepared      = prepared_storage.data();
+        [[maybe_unused]] uint8_t * worker_done   = worker_done_storage.data();
+        [[maybe_unused]] uint8_t * local_sealed  = local_sealed_storage.data();
+        [[maybe_unused]] uint8_t * slot_released = slot_released_storage.data();
+        [[maybe_unused]] uint8_t   post_chain    = 0;
+        std::atomic<bool>          pipeline_ok{true};
+        run_cpu_wall.pause();
 #if LOG_CYCLE
-            // Task bodies are measured below; OpenMP scheduling outside them is not.
-            performance::incomplete_cpu_wall("exsia_task_scheduler_cpu_wall_unmeasured");
+        // Task bodies are measured below; OpenMP scheduling outside them is not.
+        performance::incomplete_cpu_wall("exsia_task_scheduler_cpu_wall_unmeasured");
 #endif
 #pragma omp parallel num_threads(EXSIA_OMP_THREAD_COUNT)
-            {
-                trace::ScopedContext team_context(task_trace_origin, true);
-                trace::CpuStage team_lifetime(layer, "task.host_work", trace::CpuStage::Scope::envelope);
+        {
+            trace::ScopedContext team_context(task_trace_origin, true);
+            trace::CpuStage      team_lifetime(
+                layer, "task.host_work", trace::CpuStage::Scope::envelope);
 #if LOG_CYCLE
-                const bool collect_worker_cpu = cycle::host_thread_id() != run_timing.start.tid;
-                const auto worker_start = collect_worker_cpu ? gemmini_cpu_timing_read() : gemmini_cpu_sample{};
+            const bool collect_worker_cpu = cycle::host_thread_id() != run_timing.start.tid;
+            const auto worker_start =
+                collect_worker_cpu ? gemmini_cpu_timing_read() : gemmini_cpu_sample{};
 #endif
 #pragma omp single
-                {
-                    const size_t observed_team_size = static_cast<size_t>(omp_get_num_threads());
-                    if (observed_team_size != EXSIA_OMP_THREAD_COUNT)
-                    {
-                        record_failure(ExSIAState::FailureCode::WrongTeamSize);
-                        pipeline_ok.store(false, std::memory_order_relaxed);
-                    }
+            {
+                const size_t observed_team_size = static_cast<size_t>(omp_get_num_threads());
+                if (observed_team_size != EXSIA_OMP_THREAD_COUNT) {
+                    record_failure(ExSIAState::FailureCode::WrongTeamSize);
+                    pipeline_ok.store(false, std::memory_order_relaxed);
+                }
 #pragma omp taskgroup
-                    {
-                    for (size_t s = 0; s < num_stripes; ++s)
-                    {
-                        const size_t slot_idx = s % EXSIA_PIPELINE_SLOT_COUNT;
+                {
+                    for (size_t s = 0; s < num_stripes; ++s) {
+                        const size_t slot_idx  = s % EXSIA_PIPELINE_SLOT_COUNT;
                         const size_t row_start = s * rows_per_stripe;
-                        const size_t row_end = std::min((s + 1) * rows_per_stripe, args.I);
-                        if (s == 0)
-                        {
-#pragma omp task depend(out : prepared[s]) firstprivate(s, slot_idx, row_start, row_end, observed_team_size)
+                        const size_t row_end   = std::min((s + 1) * rows_per_stripe, args.I);
+                        if (s == 0) {
+#pragma omp task depend(out : prepared[s])                                                         \
+    firstprivate(s, slot_idx, row_start, row_end, observed_team_size)
                             {
                                 trace::ScopedContext task_context(task_trace_origin, true);
-                                trace::CpuStage task_lifetime(layer, "task.host_work", trace::CpuStage::Scope::envelope);
+                                trace::CpuStage      task_lifetime(
+                                    layer, "task.host_work", trace::CpuStage::Scope::envelope);
                                 CpuWallInterval task_cpu_wall(layer, run_id, "exsia.prepare", s);
-                                try
-                                {
-                                if (pipeline_ok.load(std::memory_order_relaxed))
-                                {
-                                StripePipelineSlot &slot = pipeline_slots_[slot_idx];
-                                slot.acquire(s);
-                                slot.reset_for_stripe(s, row_start, row_end,
-                                                     state_.K_padded, state_.blocks_per_row);
+                                try {
+                                    if (pipeline_ok.load(std::memory_order_relaxed)) {
+                                        StripePipelineSlot & slot = pipeline_slots_[slot_idx];
+                                        slot.acquire(s);
+                                        slot.reset_for_stripe(s,
+                                                              row_start,
+                                                              row_end,
+                                                              state_.K_padded,
+                                                              state_.blocks_per_row);
 #if CYCLE_SIM
-                                (void) record_producer(cycle_sim::ProducerEventKind::ExsiaWorkspaceAcquire,
-                                    slot, "ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp:prepare_slot_first");
+                                        (void)record_producer(
+                                            cycle_sim::ProducerEventKind::ExsiaWorkspaceAcquire,
+                                            slot,
+                                            "ggml/src/ggml-gemmini/quants/act/exsia/"
+                                            "exsia.cpp:prepare_slot_first");
 #endif
-                                local_workspace_.reset_for_stripe(
-                                    s, row_start, row_end, state_.blocks_per_row);
-                                slot.mark_quantization_started(0, aggregate_now_ns());
+                                        local_workspace_.reset_for_stripe(
+                                            s, row_start, row_end, state_.blocks_per_row);
+                                        slot.mark_quantization_started(0, aggregate_now_ns());
 #if EXSIA_OBSERVATION_ENABLED
-                                LocalParallelStripeObservation &observation =
-                                    state_.local_parallel_observations[s];
-                                observation = LocalParallelStripeObservation{};
-                                observation.stripe_idx = s;
-                                observation.observed_team_size = observed_team_size;
-                                observation.scheduled_task_count = EXSIA_LOCAL_WORKER_COUNT;
-                                const size_t total_blocks =
-                                    slot.stripe.row_count() * state_.blocks_per_row;
-                                const size_t expected_blocks_per_task =
-                                    total_blocks / EXSIA_LOCAL_WORKER_COUNT +
-                                    (total_blocks % EXSIA_LOCAL_WORKER_COUNT != 0 ? 1 : 0);
-                                for (size_t task_id = 0;
-                                     task_id < EXSIA_LOCAL_WORKER_COUNT; ++task_id)
-                                {
-                                    const LocalWorkerContext &worker =
-                                        local_workspace_.workers[task_id];
-                                    LocalParallelTaskRecord &record = observation.tasks[task_id];
-                                    record.task_id = task_id;
-                                    record.row_start = worker.row_start;
-                                    record.row_end = worker.row_end;
-                                    record.block_start = worker.block_start;
-                                    record.block_end = worker.block_end;
-                                    record.populated_block_count =
-                                        worker.block_end - worker.block_start;
-                                    record.empty = record.populated_block_count == 0;
-                                    record.short_task = !record.empty &&
-                                        record.populated_block_count < expected_blocks_per_task;
-                                }
+                                        LocalParallelStripeObservation & observation =
+                                            state_.local_parallel_observations[s];
+                                        observation            = LocalParallelStripeObservation{};
+                                        observation.stripe_idx = s;
+                                        observation.observed_team_size   = observed_team_size;
+                                        observation.scheduled_task_count = EXSIA_LOCAL_WORKER_COUNT;
+                                        const size_t total_blocks =
+                                            slot.stripe.row_count() * state_.blocks_per_row;
+                                        const size_t expected_blocks_per_task =
+                                            total_blocks / EXSIA_LOCAL_WORKER_COUNT +
+                                            (total_blocks % EXSIA_LOCAL_WORKER_COUNT != 0 ? 1 : 0);
+                                        for (size_t task_id = 0; task_id < EXSIA_LOCAL_WORKER_COUNT;
+                                             ++task_id) {
+                                            const LocalWorkerContext & worker =
+                                                local_workspace_.workers[task_id];
+                                            LocalParallelTaskRecord & record =
+                                                observation.tasks[task_id];
+                                            record.task_id     = task_id;
+                                            record.row_start   = worker.row_start;
+                                            record.row_end     = worker.row_end;
+                                            record.block_start = worker.block_start;
+                                            record.block_end   = worker.block_end;
+                                            record.populated_block_count =
+                                                worker.block_end - worker.block_start;
+                                            record.empty = record.populated_block_count == 0;
+                                            record.short_task =
+                                                !record.empty && record.populated_block_count <
+                                                                     expected_blocks_per_task;
+                                        }
 #endif
-                                 EXSIA_PROFILE_COLLECT(
-                                 StripeProfileRecord &profile = stripe_profiles[s];
-                                 profile = StripeProfileRecord{};
-                                 profile.stripe_idx = s;
-                                 profile.row_start = row_start;
-                                 profile.row_end = row_end;
-                                 profile.team_size = observed_team_size;
-                                 start_profile_interval(profile.stripe_total);
-                                 start_profile_interval(profile.local);
-                                 )
-                                 }
-                                }
-                                catch (...)
-                                {
+                                        EXSIA_PROFILE_COLLECT(
+                                            StripeProfileRecord & profile = stripe_profiles[s];
+                                            profile                       = StripeProfileRecord{};
+                                            profile.stripe_idx            = s;
+                                            profile.row_start             = row_start;
+                                            profile.row_end               = row_end;
+                                            profile.team_size             = observed_team_size;
+                                            start_profile_interval(profile.stripe_total);
+                                            start_profile_interval(profile.local);)
+                                    }
+                                } catch (...) {
                                     record_failure(ExSIAState::FailureCode::Exception, s);
                                     pipeline_ok.store(false, std::memory_order_relaxed);
                                 }
                             }
-                        }
-                        else if (s == 1)
-                        {
-#pragma omp task depend(in : local_sealed[s - 1]) depend(out : prepared[s]) firstprivate(s, slot_idx, row_start, row_end, observed_team_size)
+                        } else if (s == 1) {
+#pragma omp task depend(in : local_sealed[s - 1]) depend(out : prepared[s])                        \
+    firstprivate(s, slot_idx, row_start, row_end, observed_team_size)
                             {
                                 trace::ScopedContext task_context(task_trace_origin, true);
-                                trace::CpuStage task_lifetime(layer, "task.host_work", trace::CpuStage::Scope::envelope);
+                                trace::CpuStage      task_lifetime(
+                                    layer, "task.host_work", trace::CpuStage::Scope::envelope);
                                 CpuWallInterval task_cpu_wall(layer, run_id, "exsia.prepare", s);
-                                try
-                                {
-                                if (pipeline_ok.load(std::memory_order_relaxed))
-                                {
-                                StripePipelineSlot &slot = pipeline_slots_[slot_idx];
-                                slot.acquire(s);
-                                slot.reset_for_stripe(s, row_start, row_end,
-                                                     state_.K_padded, state_.blocks_per_row);
+                                try {
+                                    if (pipeline_ok.load(std::memory_order_relaxed)) {
+                                        StripePipelineSlot & slot = pipeline_slots_[slot_idx];
+                                        slot.acquire(s);
+                                        slot.reset_for_stripe(s,
+                                                              row_start,
+                                                              row_end,
+                                                              state_.K_padded,
+                                                              state_.blocks_per_row);
 #if CYCLE_SIM
-                                (void) record_producer(cycle_sim::ProducerEventKind::ExsiaWorkspaceAcquire,
-                                    slot, "ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp:prepare_slot_next");
+                                        (void)record_producer(
+                                            cycle_sim::ProducerEventKind::ExsiaWorkspaceAcquire,
+                                            slot,
+                                            "ggml/src/ggml-gemmini/quants/act/exsia/"
+                                            "exsia.cpp:prepare_slot_next");
 #endif
-                                local_workspace_.reset_for_stripe(
-                                    s, row_start, row_end, state_.blocks_per_row);
-                                slot.mark_quantization_started(0, aggregate_now_ns());
+                                        local_workspace_.reset_for_stripe(
+                                            s, row_start, row_end, state_.blocks_per_row);
+                                        slot.mark_quantization_started(0, aggregate_now_ns());
 #if EXSIA_OBSERVATION_ENABLED
-                                LocalParallelStripeObservation &observation =
-                                    state_.local_parallel_observations[s];
-                                observation = LocalParallelStripeObservation{};
-                                observation.stripe_idx = s;
-                                observation.observed_team_size = observed_team_size;
-                                observation.scheduled_task_count = EXSIA_LOCAL_WORKER_COUNT;
-                                const size_t total_blocks =
-                                    slot.stripe.row_count() * state_.blocks_per_row;
-                                const size_t expected_blocks_per_task =
-                                    total_blocks / EXSIA_LOCAL_WORKER_COUNT +
-                                    (total_blocks % EXSIA_LOCAL_WORKER_COUNT != 0 ? 1 : 0);
-                                for (size_t task_id = 0;
-                                     task_id < EXSIA_LOCAL_WORKER_COUNT; ++task_id)
-                                {
-                                    const LocalWorkerContext &worker =
-                                        local_workspace_.workers[task_id];
-                                    LocalParallelTaskRecord &record = observation.tasks[task_id];
-                                    record.task_id = task_id;
-                                    record.row_start = worker.row_start;
-                                    record.row_end = worker.row_end;
-                                    record.block_start = worker.block_start;
-                                    record.block_end = worker.block_end;
-                                    record.populated_block_count =
-                                        worker.block_end - worker.block_start;
-                                    record.empty = record.populated_block_count == 0;
-                                    record.short_task = !record.empty &&
-                                        record.populated_block_count < expected_blocks_per_task;
-                                }
+                                        LocalParallelStripeObservation & observation =
+                                            state_.local_parallel_observations[s];
+                                        observation            = LocalParallelStripeObservation{};
+                                        observation.stripe_idx = s;
+                                        observation.observed_team_size   = observed_team_size;
+                                        observation.scheduled_task_count = EXSIA_LOCAL_WORKER_COUNT;
+                                        const size_t total_blocks =
+                                            slot.stripe.row_count() * state_.blocks_per_row;
+                                        const size_t expected_blocks_per_task =
+                                            total_blocks / EXSIA_LOCAL_WORKER_COUNT +
+                                            (total_blocks % EXSIA_LOCAL_WORKER_COUNT != 0 ? 1 : 0);
+                                        for (size_t task_id = 0; task_id < EXSIA_LOCAL_WORKER_COUNT;
+                                             ++task_id) {
+                                            const LocalWorkerContext & worker =
+                                                local_workspace_.workers[task_id];
+                                            LocalParallelTaskRecord & record =
+                                                observation.tasks[task_id];
+                                            record.task_id     = task_id;
+                                            record.row_start   = worker.row_start;
+                                            record.row_end     = worker.row_end;
+                                            record.block_start = worker.block_start;
+                                            record.block_end   = worker.block_end;
+                                            record.populated_block_count =
+                                                worker.block_end - worker.block_start;
+                                            record.empty = record.populated_block_count == 0;
+                                            record.short_task =
+                                                !record.empty && record.populated_block_count <
+                                                                     expected_blocks_per_task;
+                                        }
 #endif
-                                 EXSIA_PROFILE_COLLECT(
-                                 StripeProfileRecord &profile = stripe_profiles[s];
-                                 profile = StripeProfileRecord{};
-                                 profile.stripe_idx = s;
-                                 profile.row_start = row_start;
-                                 profile.row_end = row_end;
-                                 profile.team_size = observed_team_size;
-                                 start_profile_interval(profile.stripe_total);
-                                 start_profile_interval(profile.local);
-                                 )
-                                 }
-                                }
-                                catch (...)
-                                {
+                                        EXSIA_PROFILE_COLLECT(
+                                            StripeProfileRecord & profile = stripe_profiles[s];
+                                            profile                       = StripeProfileRecord{};
+                                            profile.stripe_idx            = s;
+                                            profile.row_start             = row_start;
+                                            profile.row_end               = row_end;
+                                            profile.team_size             = observed_team_size;
+                                            start_profile_interval(profile.stripe_total);
+                                            start_profile_interval(profile.local);)
+                                    }
+                                } catch (...) {
                                     record_failure(ExSIAState::FailureCode::Exception, s);
                                     pipeline_ok.store(false, std::memory_order_relaxed);
                                 }
                             }
-                        }
-                        else
-                        {
-#pragma omp task depend(in : local_sealed[s - 1], slot_released[s - 2]) depend(out : prepared[s]) firstprivate(s, slot_idx, row_start, row_end, observed_team_size)
+                        } else {
+#pragma omp task depend(in : local_sealed[s - 1], slot_released[s - 2]) depend(out : prepared[s])  \
+    firstprivate(s, slot_idx, row_start, row_end, observed_team_size)
                             {
                                 trace::ScopedContext task_context(task_trace_origin, true);
-                                trace::CpuStage task_lifetime(layer, "task.host_work", trace::CpuStage::Scope::envelope);
+                                trace::CpuStage      task_lifetime(
+                                    layer, "task.host_work", trace::CpuStage::Scope::envelope);
                                 CpuWallInterval task_cpu_wall(layer, run_id, "exsia.prepare", s);
-                                try
-                                {
-                                if (pipeline_ok.load(std::memory_order_relaxed))
-                                {
-                                StripePipelineSlot &slot = pipeline_slots_[slot_idx];
-                                slot.acquire(s);
-                                slot.reset_for_stripe(s, row_start, row_end,
-                                                     state_.K_padded, state_.blocks_per_row);
+                                try {
+                                    if (pipeline_ok.load(std::memory_order_relaxed)) {
+                                        StripePipelineSlot & slot = pipeline_slots_[slot_idx];
+                                        slot.acquire(s);
+                                        slot.reset_for_stripe(s,
+                                                              row_start,
+                                                              row_end,
+                                                              state_.K_padded,
+                                                              state_.blocks_per_row);
 #if CYCLE_SIM
-                                (void) record_producer(cycle_sim::ProducerEventKind::ExsiaWorkspaceAcquire,
-                                    slot, "ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp:prepare_slot_reuse");
+                                        (void)record_producer(
+                                            cycle_sim::ProducerEventKind::ExsiaWorkspaceAcquire,
+                                            slot,
+                                            "ggml/src/ggml-gemmini/quants/act/exsia/"
+                                            "exsia.cpp:prepare_slot_reuse");
 #endif
-                                local_workspace_.reset_for_stripe(
-                                    s, row_start, row_end, state_.blocks_per_row);
-                                slot.mark_quantization_started(0, aggregate_now_ns());
+                                        local_workspace_.reset_for_stripe(
+                                            s, row_start, row_end, state_.blocks_per_row);
+                                        slot.mark_quantization_started(0, aggregate_now_ns());
 #if EXSIA_OBSERVATION_ENABLED
-                                LocalParallelStripeObservation &observation =
-                                    state_.local_parallel_observations[s];
-                                observation = LocalParallelStripeObservation{};
-                                observation.stripe_idx = s;
-                                observation.observed_team_size = observed_team_size;
-                                observation.scheduled_task_count = EXSIA_LOCAL_WORKER_COUNT;
-                                const size_t total_blocks =
-                                    slot.stripe.row_count() * state_.blocks_per_row;
-                                const size_t expected_blocks_per_task =
-                                    total_blocks / EXSIA_LOCAL_WORKER_COUNT +
-                                    (total_blocks % EXSIA_LOCAL_WORKER_COUNT != 0 ? 1 : 0);
-                                for (size_t task_id = 0;
-                                     task_id < EXSIA_LOCAL_WORKER_COUNT; ++task_id)
-                                {
-                                    const LocalWorkerContext &worker =
-                                        local_workspace_.workers[task_id];
-                                    LocalParallelTaskRecord &record = observation.tasks[task_id];
-                                    record.task_id = task_id;
-                                    record.row_start = worker.row_start;
-                                    record.row_end = worker.row_end;
-                                    record.block_start = worker.block_start;
-                                    record.block_end = worker.block_end;
-                                    record.populated_block_count =
-                                        worker.block_end - worker.block_start;
-                                    record.empty = record.populated_block_count == 0;
-                                    record.short_task = !record.empty &&
-                                        record.populated_block_count < expected_blocks_per_task;
-                                }
+                                        LocalParallelStripeObservation & observation =
+                                            state_.local_parallel_observations[s];
+                                        observation            = LocalParallelStripeObservation{};
+                                        observation.stripe_idx = s;
+                                        observation.observed_team_size   = observed_team_size;
+                                        observation.scheduled_task_count = EXSIA_LOCAL_WORKER_COUNT;
+                                        const size_t total_blocks =
+                                            slot.stripe.row_count() * state_.blocks_per_row;
+                                        const size_t expected_blocks_per_task =
+                                            total_blocks / EXSIA_LOCAL_WORKER_COUNT +
+                                            (total_blocks % EXSIA_LOCAL_WORKER_COUNT != 0 ? 1 : 0);
+                                        for (size_t task_id = 0; task_id < EXSIA_LOCAL_WORKER_COUNT;
+                                             ++task_id) {
+                                            const LocalWorkerContext & worker =
+                                                local_workspace_.workers[task_id];
+                                            LocalParallelTaskRecord & record =
+                                                observation.tasks[task_id];
+                                            record.task_id     = task_id;
+                                            record.row_start   = worker.row_start;
+                                            record.row_end     = worker.row_end;
+                                            record.block_start = worker.block_start;
+                                            record.block_end   = worker.block_end;
+                                            record.populated_block_count =
+                                                worker.block_end - worker.block_start;
+                                            record.empty = record.populated_block_count == 0;
+                                            record.short_task =
+                                                !record.empty && record.populated_block_count <
+                                                                     expected_blocks_per_task;
+                                        }
 #endif
-                                 EXSIA_PROFILE_COLLECT(
-                                 StripeProfileRecord &profile = stripe_profiles[s];
-                                 profile = StripeProfileRecord{};
-                                 profile.stripe_idx = s;
-                                 profile.row_start = row_start;
-                                 profile.row_end = row_end;
-                                 profile.team_size = observed_team_size;
-                                 start_profile_interval(profile.stripe_total);
-                                 start_profile_interval(profile.local);
-                                 )
-                                 }
-                                }
-                                catch (...)
-                                {
+                                        EXSIA_PROFILE_COLLECT(
+                                            StripeProfileRecord & profile = stripe_profiles[s];
+                                            profile                       = StripeProfileRecord{};
+                                            profile.stripe_idx            = s;
+                                            profile.row_start             = row_start;
+                                            profile.row_end               = row_end;
+                                            profile.team_size             = observed_team_size;
+                                            start_profile_interval(profile.stripe_total);
+                                            start_profile_interval(profile.local);)
+                                    }
+                                } catch (...) {
                                     record_failure(ExSIAState::FailureCode::Exception, s);
                                     pipeline_ok.store(false, std::memory_order_relaxed);
                                 }
                             }
                         }
 
-                        for (size_t task_id = 0; task_id < EXSIA_LOCAL_WORKER_COUNT; ++task_id)
-                        {
-#pragma omp task depend(in : prepared[s]) depend(out : worker_done[s * EXSIA_LOCAL_WORKER_COUNT + task_id]) firstprivate(s, slot_idx, task_id)
+                        for (size_t task_id = 0; task_id < EXSIA_LOCAL_WORKER_COUNT; ++task_id) {
+#pragma omp task depend(in : prepared[s])                                                          \
+    depend(out : worker_done[s * EXSIA_LOCAL_WORKER_COUNT + task_id])                              \
+    firstprivate(s, slot_idx, task_id)
                             {
                                 trace::ScopedContext task_context(task_trace_origin, true);
-                                trace::CpuStage task_lifetime(layer, "task.host_work", trace::CpuStage::Scope::envelope);
-                                CpuWallInterval task_cpu_wall(layer, run_id, "exsia.local", s, task_id);
-                                try
-                                {
-                                if (pipeline_ok.load(std::memory_order_relaxed))
-                                {
-                                StripePipelineSlot &slot = pipeline_slots_[slot_idx];
-                                LocalWorkerContext &worker = local_workspace_.workers[task_id];
-                                LocalTaskRuntime &task_runtime = local_workspace_.local_tasks[task_id];
-                                EXSIA_PROFILE_COLLECT(
-                                StripeProfileRecord &profile = stripe_profiles[s];
-                                start_profile_interval(profile.local_groups[task_id], &args, "exsia.local_group", s);
-                                )
-                                bool ok = true;
-                                for (size_t block = worker.block_start;
-                                     block < worker.block_end; ++block)
-                                {
-                                    const size_t local_row = block / state_.blocks_per_row;
-                                    const size_t block_idx = block % state_.blocks_per_row;
-                                    const size_t global_row = slot.stripe.row_start + local_row;
-                                    if (!run_local_block(slot, worker.scratch, global_row, block_idx
+                                trace::CpuStage      task_lifetime(
+                                    layer, "task.host_work", trace::CpuStage::Scope::envelope);
+                                CpuWallInterval task_cpu_wall(
+                                    layer, run_id, "exsia.local", s, task_id);
+                                try {
+                                    if (pipeline_ok.load(std::memory_order_relaxed)) {
+                                        StripePipelineSlot & slot = pipeline_slots_[slot_idx];
+                                        LocalWorkerContext & worker =
+                                            local_workspace_.workers[task_id];
+                                        LocalTaskRuntime & task_runtime =
+                                            local_workspace_.local_tasks[task_id];
+                                        EXSIA_PROFILE_COLLECT(
+                                            StripeProfileRecord & profile = stripe_profiles[s];
+                                            start_profile_interval(profile.local_groups[task_id],
+                                                                   &args,
+                                                                   "exsia.local_group",
+                                                                   s);)
+                                        bool ok = true;
+                                        for (size_t block = worker.block_start;
+                                             block < worker.block_end;
+                                             ++block) {
+                                            const size_t local_row = block / state_.blocks_per_row;
+                                            const size_t block_idx = block % state_.blocks_per_row;
+                                            const size_t global_row =
+                                                slot.stripe.row_start + local_row;
+                                            if (!run_local_block(slot,
+                                                                 worker.scratch,
+                                                                 global_row,
+                                                                 block_idx
 #if EXSIA_BRANCH_COUNTS_ENABLED
-                                                         , task_runtime.cycle_stats
+                                                                 ,
+                                                                 task_runtime.cycle_stats
 #endif
-                                                         ))
-                                    {
-                                        record_failure(ExSIAState::FailureCode::LocalBlockFailure, s);
-                                        pipeline_ok.store(false, std::memory_order_relaxed);
-                                        ok = false;
-                                        break;
+                                                                 )) {
+                                                record_failure(
+                                                    ExSIAState::FailureCode::LocalBlockFailure, s);
+                                                pipeline_ok.store(false, std::memory_order_relaxed);
+                                                ok = false;
+                                                break;
+                                            }
+                                        }
+                                        task_runtime.completed = ok;
+                                        EXSIA_PROFILE_COLLECT(
+                                            if (!end_profile_interval(
+                                                    profile.local_groups[task_id])) {
+                                                record_failure(
+                                                    ExSIAState::FailureCode::ProfileIntervalInvalid,
+                                                    s);
+                                                pipeline_ok.store(false, std::memory_order_relaxed);
+                                            })
                                     }
-                                }
-                                task_runtime.completed = ok;
-                                EXSIA_PROFILE_COLLECT(
-                                if (!end_profile_interval(profile.local_groups[task_id]))
-                                {
-                                    record_failure(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
-                                    pipeline_ok.store(false, std::memory_order_relaxed);
-                                }
-                                )
-                                }
-                                }
-                                catch (...)
-                                {
+                                } catch (...) {
                                     record_failure(ExSIAState::FailureCode::Exception, s);
                                     pipeline_ok.store(false, std::memory_order_relaxed);
                                 }
@@ -2918,289 +1045,327 @@ namespace ggml::gemmini::quants::act::exsia
                         }
 
 #if GGML_GEMMINI_EXSIA_LOCAL_WORKERS == 3
-#pragma omp task depend(in : worker_done[s * EXSIA_LOCAL_WORKER_COUNT], worker_done[s * EXSIA_LOCAL_WORKER_COUNT + 1], worker_done[s * EXSIA_LOCAL_WORKER_COUNT + 2]) depend(out : local_sealed[s]) firstprivate(s, slot_idx)
+#pragma omp task depend(in : worker_done[s * EXSIA_LOCAL_WORKER_COUNT],                            \
+                            worker_done[s * EXSIA_LOCAL_WORKER_COUNT + 1],                         \
+                            worker_done[s * EXSIA_LOCAL_WORKER_COUNT + 2])                         \
+    depend(out : local_sealed[s]) firstprivate(s, slot_idx)
 #elif GGML_GEMMINI_EXSIA_LOCAL_WORKERS == 4
-#pragma omp task depend(in : worker_done[s * EXSIA_LOCAL_WORKER_COUNT], worker_done[s * EXSIA_LOCAL_WORKER_COUNT + 1], worker_done[s * EXSIA_LOCAL_WORKER_COUNT + 2], worker_done[s * EXSIA_LOCAL_WORKER_COUNT + 3]) depend(out : local_sealed[s]) firstprivate(s, slot_idx)
+#pragma omp task depend(in : worker_done[s * EXSIA_LOCAL_WORKER_COUNT],                            \
+                            worker_done[s * EXSIA_LOCAL_WORKER_COUNT + 1],                         \
+                            worker_done[s * EXSIA_LOCAL_WORKER_COUNT + 2],                         \
+                            worker_done[s * EXSIA_LOCAL_WORKER_COUNT + 3])                         \
+    depend(out : local_sealed[s]) firstprivate(s, slot_idx)
 #else
 #error "Unsupported ExSIA local worker count"
 #endif
                         {
                             trace::ScopedContext task_context(task_trace_origin, true);
-                            trace::CpuStage task_lifetime(layer, "task.host_work", trace::CpuStage::Scope::envelope);
+                            trace::CpuStage      task_lifetime(
+                                layer, "task.host_work", trace::CpuStage::Scope::envelope);
                             CpuWallInterval task_cpu_wall(layer, run_id, "exsia.local_seal", s);
-                            try
-                            {
-                            if (pipeline_ok.load(std::memory_order_relaxed))
-                            {
-                            StripePipelineSlot &slot = pipeline_slots_[slot_idx];
-                            (void) slot;
+                            try {
+                                if (pipeline_ok.load(std::memory_order_relaxed)) {
+                                    StripePipelineSlot & slot = pipeline_slots_[slot_idx];
+                                    (void)slot;
 #if EXSIA_OBSERVATION_ENABLED
-                            LocalParallelStripeObservation &observation =
-                                state_.local_parallel_observations[s];
+                                    LocalParallelStripeObservation & observation =
+                                        state_.local_parallel_observations[s];
 #endif
 #if EXSIA_BRANCH_COUNTS_ENABLED
-                            slot.cycle_stats.reset();
+                                    slot.cycle_stats.reset();
 #endif
-                            bool ok = true;
-                            for (size_t task_id = 0; task_id < EXSIA_LOCAL_WORKER_COUNT; ++task_id)
-                            {
-                                const LocalTaskRuntime &task_runtime = local_workspace_.local_tasks[task_id];
+                                    bool ok = true;
+                                    for (size_t task_id = 0; task_id < EXSIA_LOCAL_WORKER_COUNT;
+                                         ++task_id) {
+                                        const LocalTaskRuntime & task_runtime =
+                                            local_workspace_.local_tasks[task_id];
 #if EXSIA_OBSERVATION_ENABLED
-                                observation.completed_task_count += task_runtime.completed ? 1 : 0;
-                                observation.tasks[task_id].completed = task_runtime.completed;
+                                        observation.completed_task_count +=
+                                            task_runtime.completed ? 1 : 0;
+                                        observation.tasks[task_id].completed =
+                                            task_runtime.completed;
 #endif
-                                ok = ok && task_runtime.completed;
+                                        ok = ok && task_runtime.completed;
 #if EXSIA_BRANCH_COUNTS_ENABLED
-                                const StripeCycleStats &task_stats = task_runtime.cycle_stats;
+                                        const StripeCycleStats & task_stats =
+                                            task_runtime.cycle_stats;
 #if EXSIA_STAGE_PROFILE_ENABLED
 #if defined(__linux__) && defined(__aarch64__)
-                                slot.cycle_stats.p0.merge(task_stats.p0);
-                                slot.cycle_stats.p1.merge(task_stats.p1);
-                                slot.cycle_stats.p2.merge(task_stats.p2);
-                                slot.cycle_stats.p3.merge(task_stats.p3);
+                                        slot.cycle_stats.p0.merge(task_stats.p0);
+                                        slot.cycle_stats.p1.merge(task_stats.p1);
+                                        slot.cycle_stats.p2.merge(task_stats.p2);
+                                        slot.cycle_stats.p3.merge(task_stats.p3);
 #else
-                                slot.cycle_stats.p0.sum += task_stats.p0.sum;
-                                slot.cycle_stats.p0.max = std::max(slot.cycle_stats.p0.max, task_stats.p0.max);
-                                slot.cycle_stats.p0.count += task_stats.p0.count;
-                                slot.cycle_stats.p1.sum += task_stats.p1.sum;
-                                slot.cycle_stats.p1.max = std::max(slot.cycle_stats.p1.max, task_stats.p1.max);
-                                slot.cycle_stats.p1.count += task_stats.p1.count;
-                                slot.cycle_stats.p2.sum += task_stats.p2.sum;
-                                slot.cycle_stats.p2.max = std::max(slot.cycle_stats.p2.max, task_stats.p2.max);
-                                slot.cycle_stats.p2.count += task_stats.p2.count;
-                                slot.cycle_stats.p3.sum += task_stats.p3.sum;
-                                slot.cycle_stats.p3.max = std::max(slot.cycle_stats.p3.max, task_stats.p3.max);
-                                slot.cycle_stats.p3.count += task_stats.p3.count;
+                                        slot.cycle_stats.p0.sum += task_stats.p0.sum;
+                                        slot.cycle_stats.p0.max =
+                                            std::max(slot.cycle_stats.p0.max, task_stats.p0.max);
+                                        slot.cycle_stats.p0.count += task_stats.p0.count;
+                                        slot.cycle_stats.p1.sum += task_stats.p1.sum;
+                                        slot.cycle_stats.p1.max =
+                                            std::max(slot.cycle_stats.p1.max, task_stats.p1.max);
+                                        slot.cycle_stats.p1.count += task_stats.p1.count;
+                                        slot.cycle_stats.p2.sum += task_stats.p2.sum;
+                                        slot.cycle_stats.p2.max =
+                                            std::max(slot.cycle_stats.p2.max, task_stats.p2.max);
+                                        slot.cycle_stats.p2.count += task_stats.p2.count;
+                                        slot.cycle_stats.p3.sum += task_stats.p3.sum;
+                                        slot.cycle_stats.p3.max =
+                                            std::max(slot.cycle_stats.p3.max, task_stats.p3.max);
+                                        slot.cycle_stats.p3.count += task_stats.p3.count;
 #endif
-                                slot.cycle_stats.forced_recompute_count += task_stats.forced_recompute_count;
+                                        slot.cycle_stats.forced_recompute_count +=
+                                            task_stats.forced_recompute_count;
 #endif
-                                slot.cycle_stats.p3_bypass_no_int_count += task_stats.p3_bypass_no_int_count;
-                                slot.cycle_stats.p3_bypass_same_scale_count += task_stats.p3_bypass_same_scale_count;
-                                slot.cycle_stats.p3_replay_count += task_stats.p3_replay_count;
+                                        slot.cycle_stats.p3_bypass_no_int_count +=
+                                            task_stats.p3_bypass_no_int_count;
+                                        slot.cycle_stats.p3_bypass_same_scale_count +=
+                                            task_stats.p3_bypass_same_scale_count;
+                                        slot.cycle_stats.p3_replay_count +=
+                                            task_stats.p3_replay_count;
 #endif
-                            }
-                            if (!ok)
-                            {
-                                record_failure(ExSIAState::FailureCode::LocalBlockFailure, s);
-                                pipeline_ok.store(false, std::memory_order_relaxed);
-                            }
-                            else
-                            {
+                                    }
+                                    if (!ok) {
+                                        record_failure(ExSIAState::FailureCode::LocalBlockFailure,
+                                                       s);
+                                        pipeline_ok.store(false, std::memory_order_relaxed);
+                                    } else {
 #if EXSIA_VALIDATION
-                                state_.validation_p3_branch_counts[0] += slot.cycle_stats.p3_bypass_no_int_count;
-                                state_.validation_p3_branch_counts[1] += slot.cycle_stats.p3_bypass_same_scale_count;
-                                state_.validation_p3_branch_counts[2] += slot.cycle_stats.p3_replay_count;
+                                        state_.validation_p3_branch_counts[0] +=
+                                            slot.cycle_stats.p3_bypass_no_int_count;
+                                        state_.validation_p3_branch_counts[1] +=
+                                            slot.cycle_stats.p3_bypass_same_scale_count;
+                                        state_.validation_p3_branch_counts[2] +=
+                                            slot.cycle_stats.p3_replay_count;
 #endif
 #if EXSIA_PROFILE_COLLECTION_ENABLED
-                                StripeProfileRecord &profile = stripe_profiles[s];
+                                        StripeProfileRecord & profile = stripe_profiles[s];
 #if EXSIA_STAGE_PROFILE_ENABLED
-                                profile.stats = slot.cycle_stats;
+                                        profile.stats = slot.cycle_stats;
 #endif
-                                // local_total ends at the worker join, before Mask Assembly,
-                                // Exponent Reduction, and Folding.
-                                if (!end_profile_interval(profile.local))
-                                {
-                                    record_failure(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
-                                    pipeline_ok.store(false, std::memory_order_relaxed);
+                                        // local_total ends at the worker join, before Mask
+                                        // Assembly, Exponent Reduction, and Folding.
+                                        if (!end_profile_interval(profile.local)) {
+                                            record_failure(
+                                                ExSIAState::FailureCode::ProfileIntervalInvalid, s);
+                                            pipeline_ok.store(false, std::memory_order_relaxed);
+                                        }
+#endif
+                                    }
                                 }
-#endif
-                            }
-                            }
-                            }
-                            catch (...)
-                            {
+                            } catch (...) {
                                 record_failure(ExSIAState::FailureCode::Exception, s);
                                 pipeline_ok.store(false, std::memory_order_relaxed);
                             }
                         }
 
-#pragma omp task depend(in : local_sealed[s]) depend(inout : post_chain) depend(out : slot_released[s]) firstprivate(s, slot_idx)
+#pragma omp task depend(in : local_sealed[s]) depend(inout : post_chain)                           \
+    depend(out : slot_released[s]) firstprivate(s, slot_idx)
                         {
                             trace::ScopedContext task_context(task_trace_origin, true);
-                            trace::CpuStage task_lifetime(layer, "task.host_work", trace::CpuStage::Scope::envelope);
+                            trace::CpuStage      task_lifetime(
+                                layer, "task.host_work", trace::CpuStage::Scope::envelope);
                             CpuWallInterval task_cpu_wall(layer, run_id, "exsia.mask_assembly", s);
-                            try
-                            {
-                            if (pipeline_ok.load(std::memory_order_relaxed))
-                            {
-                                StripePipelineSlot &slot = pipeline_slots_[slot_idx];
-                                const size_t active_block_count =
-                                    slot.stripe.row_count() * state_.blocks_per_row;
-                                EXSIA_PROFILE_COLLECT(
-                                StripeProfileRecord &profile = stripe_profiles[s];
-                                start_profile_interval(profile.mask_assembly, &args, "exsia.mask_assembly", s,
-                                                       profile_host_stage_ids(profile));
-                                )
-                                const bool assembled = assemble_stripe_mask(slot, state_);
-                                EXSIA_PROFILE_COLLECT(
-                                if (!end_profile_interval(profile.mask_assembly))
-                                {
-                                    record_failure(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
-                                    pipeline_ok.store(false, std::memory_order_relaxed);
-                                }
-                                )
-                                if (!pipeline_ok.load(std::memory_order_relaxed))
-                                {
-                                }
-                                else if (!assembled)
-                                {
-                                    record_failure(ExSIAState::FailureCode::MaskAssemblyFailure, s);
-                                    pipeline_ok.store(false, std::memory_order_relaxed);
-                                }
-                                else if (active_block_count > slot.block_exp.size())
-                                {
-                                    record_failure(ExSIAState::FailureCode::ExponentReductionFailure, s);
-                                    pipeline_ok.store(false, std::memory_order_relaxed);
-                                }
-                                else
-                                {
-                                    task_cpu_wall.next("exsia.exponent_reduction");
-                                    EXSIA_PROFILE_COLLECT(start_profile_interval(profile.exponent_reduction);)
-                                    reduce_stripe_exponents(slot, active_block_count);
+                            try {
+                                if (pipeline_ok.load(std::memory_order_relaxed)) {
+                                    StripePipelineSlot & slot = pipeline_slots_[slot_idx];
+                                    const size_t         active_block_count =
+                                        slot.stripe.row_count() * state_.blocks_per_row;
                                     EXSIA_PROFILE_COLLECT(
-                                    if (!end_profile_interval(profile.exponent_reduction))
-                                    {
-                                        record_failure(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
+                                        StripeProfileRecord & profile = stripe_profiles[s];
+                                        start_profile_interval(profile.mask_assembly,
+                                                               &args,
+                                                               "exsia.mask_assembly",
+                                                               s,
+                                                               profile_host_stage_ids(profile));)
+                                    const bool assembled = assemble_stripe_mask(slot, state_);
+                                    EXSIA_PROFILE_COLLECT(
+                                        if (!end_profile_interval(profile.mask_assembly)) {
+                                            record_failure(
+                                                ExSIAState::FailureCode::ProfileIntervalInvalid, s);
+                                            pipeline_ok.store(false, std::memory_order_relaxed);
+                                        })
+                                    if (!pipeline_ok.load(std::memory_order_relaxed)) {
+                                    } else if (!assembled) {
+                                        record_failure(ExSIAState::FailureCode::MaskAssemblyFailure,
+                                                       s);
                                         pipeline_ok.store(false, std::memory_order_relaxed);
-                                    }
-                                    )
-                                    slot.mark_local_filled();
-                                    if (pipeline_ok.load(std::memory_order_relaxed))
-                                    {
-                                        task_cpu_wall.next("exsia.folding_and_pack");
-                                        EXSIA_PROFILE_COLLECT(start_profile_interval(profile.folding);)
-                                        if (!folding_.run(meta, state_, slot.stripe, args, s,
-                                                          slot.q_wide, slot.block_exp,
-                                                          state_.residual, slot.rmd_builder))
-                                        {
-                                            record_failure(ExSIAState::FailureCode::FoldingFailure, s);
+                                    } else if (active_block_count > slot.block_exp.size()) {
+                                        record_failure(
+                                            ExSIAState::FailureCode::ExponentReductionFailure, s);
+                                        pipeline_ok.store(false, std::memory_order_relaxed);
+                                    } else {
+                                        task_cpu_wall.next("exsia.exponent_reduction");
+                                        EXSIA_PROFILE_COLLECT(
+                                            start_profile_interval(profile.exponent_reduction);)
+                                        reduce_stripe_exponents(slot, active_block_count);
+                                        EXSIA_PROFILE_COLLECT(if (!end_profile_interval(
+                                                                      profile.exponent_reduction)) {
+                                            record_failure(
+                                                ExSIAState::FailureCode::ProfileIntervalInvalid, s);
                                             pipeline_ok.store(false, std::memory_order_relaxed);
-                                        }
-                                        else if (!seal_stripe_packet(meta, slot, args))
-                                        {
-                                            record_failure(ExSIAState::FailureCode::FoldingFailure, s);
-                                            pipeline_ok.store(false, std::memory_order_relaxed);
-                                        }
-                                        else
-                                        {
-                                            slot.mark_folding_committed(aggregate_now_ns());
-#if CYCLE_SIM
-                                            (void) record_producer(cycle_sim::ProducerEventKind::ActivationRowsCommit,
-                                                slot, "ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp:folding_commit");
-                                            (void) record_producer(cycle_sim::ProducerEventKind::ResidualPacketSeal,
-                                                slot, "ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp:seal_stripe_packet");
-#endif
-                                            if (!snapshot_validation_mask(s, slot.stripe.outlier_mask))
-                                            {
-                                                record_failure(ExSIAState::FailureCode::ValidationSnapshotFailure, s);
+                                        })
+                                        slot.mark_local_filled();
+                                        if (pipeline_ok.load(std::memory_order_relaxed)) {
+                                            task_cpu_wall.next("exsia.folding_and_pack");
+                                            EXSIA_PROFILE_COLLECT(
+                                                start_profile_interval(profile.folding);)
+                                            if (!folding_.run(meta,
+                                                              state_,
+                                                              slot.stripe,
+                                                              args,
+                                                              s,
+                                                              slot.q_wide,
+                                                              slot.block_exp,
+                                                              state_.residual,
+                                                              slot.rmd_builder)) {
+                                                record_failure(
+                                                    ExSIAState::FailureCode::FoldingFailure, s);
                                                 pipeline_ok.store(false, std::memory_order_relaxed);
-                                            }
-                                            else
-                                            {
-                                                EXSIA_PROFILE_COLLECT(
-                                                if (!end_profile_interval(profile.folding))
-                                                {
-                                                    record_failure(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
-                                                    pipeline_ok.store(false, std::memory_order_relaxed);
-                                                }
-                                                )
-                                                bool stripe_ready_accepted = true;
-                                                task_cpu_wall.next("exsia.publish");
-                                                if (pipeline_ok.load(std::memory_order_relaxed))
-                                                {
-                                                    stripe_ready_accepted = notify_stripe_ready(slot, run_id, true, task_cpu_wall
-#if EXSIA_PROFILE_COLLECTION_ENABLED
-                                                                                               , &profile
-#endif
-                                                                                               );
-                                                }
-                                                if (!stripe_ready_accepted)
-                                                {
-                                                    record_failure(ExSIAState::FailureCode::StripeReadySinkFailure, s);
-                                                    pipeline_ok.store(false, std::memory_order_relaxed);
-                                                }
-                                                else
-                                                {
-                                                slot.release();
+                                            } else if (!seal_stripe_packet(meta, slot, args)) {
+                                                record_failure(
+                                                    ExSIAState::FailureCode::FoldingFailure, s);
+                                                pipeline_ok.store(false, std::memory_order_relaxed);
+                                            } else {
+                                                slot.mark_folding_committed(aggregate_now_ns());
 #if CYCLE_SIM
-                                                (void) record_producer(cycle_sim::ProducerEventKind::ExsiaWorkspaceRelease,
-                                                    slot, "ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp:release_slot_after_sink");
+                                                (void)record_producer(
+                                                    cycle_sim::ProducerEventKind::
+                                                        ActivationRowsCommit,
+                                                    slot,
+                                                    "ggml/src/ggml-gemmini/quants/act/exsia/"
+                                                    "exsia.cpp:folding_commit");
+                                                (void)record_producer(
+                                                    cycle_sim::ProducerEventKind::
+                                                        ResidualPacketSeal,
+                                                    slot,
+                                                    "ggml/src/ggml-gemmini/quants/act/exsia/"
+                                                    "exsia.cpp:seal_stripe_packet");
 #endif
-                                                EXSIA_PROFILE_COLLECT(
-                                                if (!end_profile_interval(profile.stripe_total))
-                                                {
-                                                    record_failure(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
-                                                    pipeline_ok.store(false, std::memory_order_relaxed);
-                                                }
-                                                )
+                                                if (!snapshot_validation_mask(
+                                                        s, slot.stripe.outlier_mask)) {
+                                                    record_failure(ExSIAState::FailureCode::
+                                                                       ValidationSnapshotFailure,
+                                                                   s);
+                                                    pipeline_ok.store(false,
+                                                                      std::memory_order_relaxed);
+                                                } else {
+                                                    EXSIA_PROFILE_COLLECT(
+                                                        if (!end_profile_interval(
+                                                                profile.folding)) {
+                                                            record_failure(
+                                                                ExSIAState::FailureCode::
+                                                                    ProfileIntervalInvalid,
+                                                                s);
+                                                            pipeline_ok.store(
+                                                                false, std::memory_order_relaxed);
+                                                        })
+                                                    bool stripe_ready_accepted = true;
+                                                    task_cpu_wall.next("exsia.publish");
+                                                    if (pipeline_ok.load(
+                                                            std::memory_order_relaxed)) {
+                                                        stripe_ready_accepted =
+                                                            notify_stripe_ready(slot,
+                                                                                run_id,
+                                                                                true,
+                                                                                task_cpu_wall
+#if EXSIA_PROFILE_COLLECTION_ENABLED
+                                                                                ,
+                                                                                &profile
+#endif
+                                                            );
+                                                    }
+                                                    if (!stripe_ready_accepted) {
+                                                        record_failure(ExSIAState::FailureCode::
+                                                                           StripeReadySinkFailure,
+                                                                       s);
+                                                        pipeline_ok.store(
+                                                            false, std::memory_order_relaxed);
+                                                    } else {
+                                                        slot.release();
+#if CYCLE_SIM
+                                                        (void)record_producer(
+                                                            cycle_sim::ProducerEventKind::
+                                                                ExsiaWorkspaceRelease,
+                                                            slot,
+                                                            "ggml/src/ggml-gemmini/quants/act/"
+                                                            "exsia/"
+                                                            "exsia.cpp:release_slot_after_sink");
+#endif
+                                                        EXSIA_PROFILE_COLLECT(
+                                                            if (!end_profile_interval(
+                                                                    profile.stripe_total)) {
+                                                                record_failure(
+                                                                    ExSIAState::FailureCode::
+                                                                        ProfileIntervalInvalid,
+                                                                    s);
+                                                                pipeline_ok.store(
+                                                                    false,
+                                                                    std::memory_order_relaxed);
+                                                            })
+                                                    }
                                                 }
                                             }
                                         }
                                     }
                                 }
-                            }
-                            }
-                            catch (...)
-                            {
+                            } catch (...) {
                                 record_failure(ExSIAState::FailureCode::Exception, s);
                                 pipeline_ok.store(false, std::memory_order_relaxed);
                             }
                         }
                     }
-                    }
                 }
-#if LOG_CYCLE
-                // The single barrier joins all tasks; the final parallel barrier is excluded.
-                if (collect_worker_cpu)
-                {
-                    const auto worker_end = gemmini_cpu_timing_read();
-                    gemmini_cpu_timing_add(&run_timing.worker_cpu[omp_get_thread_num()],
-                                           &worker_start, &worker_end);
-                    const auto identity = cpu_identity(layer, run_id, "exsia.worker");
-                    gemmini_cpu_timing_record(&identity, &worker_start, &worker_end);
-                }
-#endif
             }
-            run_cpu_wall.resume();
-            if (!pipeline_ok.load(std::memory_order_relaxed))
-                return fail();
-#else
-            return fail(ExSIAState::FailureCode::OpenMPUnavailable);
+#if LOG_CYCLE
+            // The single barrier joins all tasks; the final parallel barrier is excluded.
+            if (collect_worker_cpu) {
+                const auto worker_end = gemmini_cpu_timing_read();
+                gemmini_cpu_timing_add(
+                    &run_timing.worker_cpu[omp_get_thread_num()], &worker_start, &worker_end);
+                const auto identity = cpu_identity(layer, run_id, "exsia.worker");
+                gemmini_cpu_timing_record(&identity, &worker_start, &worker_end);
+            }
 #endif
         }
-        else
-        {
+        run_cpu_wall.resume();
+        if (!pipeline_ok.load(std::memory_order_relaxed))
+            return fail();
+#else
+        return fail(ExSIAState::FailureCode::OpenMPUnavailable);
+#endif
+    } else {
         run_cpu_wall.pause();
-        for (size_t s = 0; s < num_stripes; ++s)
-        {
-            CpuWallInterval stripe_cpu_wall(layer, run_id, "exsia.prepare", s);
-            const size_t row_start = s * rows_per_stripe;
-            const size_t row_end = std::min((s + 1) * rows_per_stripe, args.I);
-            StripePipelineSlot &slot = pipeline_slots_[s % EXSIA_PIPELINE_SLOT_COUNT];
+        for (size_t s = 0; s < num_stripes; ++s) {
+            CpuWallInterval      stripe_cpu_wall(layer, run_id, "exsia.prepare", s);
+            const size_t         row_start = s * rows_per_stripe;
+            const size_t         row_end   = std::min((s + 1) * rows_per_stripe, args.I);
+            StripePipelineSlot & slot      = pipeline_slots_[s % EXSIA_PIPELINE_SLOT_COUNT];
             slot.acquire(s);
-            slot.reset_for_stripe(s, row_start, row_end,
-                                  state_.K_padded, state_.blocks_per_row);
+            slot.reset_for_stripe(s, row_start, row_end, state_.K_padded, state_.blocks_per_row);
 #if CYCLE_SIM
-            (void) record_producer(cycle_sim::ProducerEventKind::ExsiaWorkspaceAcquire,
-                slot, "ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp:prepare_slot_sequential");
+            (void)record_producer(
+                cycle_sim::ProducerEventKind::ExsiaWorkspaceAcquire,
+                slot,
+                "ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp:prepare_slot_sequential");
 #endif
             local_workspace_.reset_for_stripe(s, row_start, row_end, state_.blocks_per_row);
             slot.mark_quantization_started(aggregate_now_tick(), aggregate_now_ns());
-            StripeState &stripe = slot.stripe;
+            StripeState & stripe = slot.stripe;
             EXSIA_PROFILE_COLLECT(
-            StripeProfileRecord &profile = stripe_profiles[s];
-            profile = StripeProfileRecord{};
-            profile.stripe_idx = s;
-            profile.row_start = row_start;
-            profile.row_end = row_end;
-            profile.team_size = 1;
-            start_profile_interval(profile.stripe_total);
-            start_profile_interval(profile.local,
-                requested_mode_ == ExSIAState::ExecutionMode::Sequential ? &args : nullptr, "exsia.local", s);
-            )
+                StripeProfileRecord & profile = stripe_profiles[s]; profile = StripeProfileRecord{};
+                profile.stripe_idx                                          = s;
+                profile.row_start                                           = row_start;
+                profile.row_end                                             = row_end;
+                profile.team_size                                           = 1;
+                start_profile_interval(profile.stripe_total);
+                start_profile_interval(
+                    profile.local,
+                    requested_mode_ == ExSIAState::ExecutionMode::Sequential ? &args : nullptr,
+                    "exsia.local",
+                    s);)
 #if EXSIA_BRANCH_COUNTS_ENABLED
-            const auto record_sample = [](StripeCycleStats &stats,
-                                          const LocalBlockCycleSample &sample) {
+            const auto record_sample = [](StripeCycleStats &            stats,
+                                          const LocalBlockCycleSample & sample) {
 #if EXSIA_STAGE_PROFILE_ENABLED
 #if defined(__linux__) && defined(__aarch64__)
                 stats.p0.add(sample.stage_intervals[0]);
@@ -3215,8 +1380,7 @@ namespace ggml::gemmini::quants::act::exsia
 #endif
                 stats.forced_recompute_count += sample.forced_recompute_count;
 #endif
-                switch (sample.p3_path)
-                {
+                switch (sample.p3_path) {
                 case P3Path::BypassNoIntegerOutlier:
                     ++stats.p3_bypass_no_int_count;
                     break;
@@ -3229,140 +1393,156 @@ namespace ggml::gemmini::quants::act::exsia
                 }
             };
 #endif
-            const auto run_local_block = [&](StripeScratch &scratch,
-                                             size_t r,
-                                             size_t b EXSIA_STATS_PARAMETER) {
+            const auto run_local_block =
+                [&](StripeScratch & scratch, size_t r, size_t b EXSIA_STATS_PARAMETER) {
 #if EXSIA_BRANCH_COUNTS_ENABLED
-                LocalBlockCycleSample sample;
+                    LocalBlockCycleSample sample;
 #endif
-                const size_t col_offset = b * state_.B_size;
-                GGML_ASSERT(col_offset < args.K);
-                const size_t valid_count = std::min(state_.B_size, args.K - col_offset);
-                const size_t local_row = stripe.local_row(r);
-                const size_t block_base = local_row * state_.K_padded + col_offset;
-                const size_t block_exp_idx = local_row * state_.blocks_per_row + b;
-                GGML_ASSERT(slot.q_wide.size() >= block_base + state_.B_size);
-                GGML_ASSERT(block_exp_idx < slot.block_exp.size());
-                BlockMask block_mask = slot.block_mask(
-                    local_row * state_.blocks_per_row + b, state_.B_size);
-                if (!local_.run_optimized(meta, state_, src_data + r * args.K + col_offset,
-                                 valid_count, state_.B_size, local_row, b, scratch, block_mask,
-                                 slot.q_wide.data() + block_base, slot.block_exp[block_exp_idx]
+                    const size_t col_offset = b * state_.B_size;
+                    GGML_ASSERT(col_offset < args.K);
+                    const size_t valid_count   = std::min(state_.B_size, args.K - col_offset);
+                    const size_t local_row     = stripe.local_row(r);
+                    const size_t block_base    = local_row * state_.K_padded + col_offset;
+                    const size_t block_exp_idx = local_row * state_.blocks_per_row + b;
+                    GGML_ASSERT(slot.q_wide.size() >= block_base + state_.B_size);
+                    GGML_ASSERT(block_exp_idx < slot.block_exp.size());
+                    BlockMask block_mask =
+                        slot.block_mask(local_row * state_.blocks_per_row + b, state_.B_size);
+                    if (!local_.run_optimized(meta,
+                                              state_,
+                                              src_data + r * args.K + col_offset,
+                                              valid_count,
+                                              state_.B_size,
+                                              local_row,
+                                              b,
+                                              scratch,
+                                              block_mask,
+                                              slot.q_wide.data() + block_base,
+                                              slot.block_exp[block_exp_idx]
 #if EXSIA_BRANCH_COUNTS_ENABLED
-                                 , sample
+                                              ,
+                                              sample
 #endif
-                                 ))
-                {
-                    return false;
-                }
+                                              )) {
+                        return false;
+                    }
 
 #if EXSIA_BRANCH_COUNTS_ENABLED
-                record_sample(stats, sample);
+                    record_sample(stats, sample);
 #endif
 #if GGML_GEMMINI_ACT_QUANT_METRICS
-                if (scratch.actual_requantized && args.evaluation_context)
-                    args.evaluation_context->requantized(r, b);
+                    if (scratch.actual_requantized && args.evaluation_context)
+                        args.evaluation_context->requantized(r, b);
 #endif
-                return true;
-            };
+                    return true;
+                };
 
             stripe_cpu_wall.next("exsia.local");
-            if (state_.mode == ExSIAState::ExecutionMode::LocalParallel)
-            {
+            if (state_.mode == ExSIAState::ExecutionMode::LocalParallel) {
 #if defined(GGML_GEMMINI_HAS_OPENMP)
 #if EXSIA_OBSERVATION_ENABLED
-                LocalParallelStripeObservation &observation = state_.local_parallel_observations[s];
-                observation = LocalParallelStripeObservation{};
-                observation.stripe_idx = s;
+                LocalParallelStripeObservation & observation =
+                    state_.local_parallel_observations[s];
+                observation                      = LocalParallelStripeObservation{};
+                observation.stripe_idx           = s;
                 observation.scheduled_task_count = EXSIA_LOCAL_WORKER_COUNT;
-                const size_t total_blocks = stripe.row_count() * state_.blocks_per_row;
+                const size_t total_blocks        = stripe.row_count() * state_.blocks_per_row;
                 const size_t expected_blocks_per_task =
                     total_blocks / EXSIA_LOCAL_WORKER_COUNT +
                     (total_blocks % EXSIA_LOCAL_WORKER_COUNT != 0 ? 1 : 0);
-                for (size_t task_id = 0; task_id < EXSIA_LOCAL_WORKER_COUNT; ++task_id)
-                {
-                    const LocalWorkerContext &worker = local_workspace_.workers[task_id];
-                    LocalParallelTaskRecord &record = observation.tasks[task_id];
-                    record.task_id = task_id;
-                    record.row_start = worker.row_start;
-                    record.row_end = worker.row_end;
-                    record.block_start = worker.block_start;
-                    record.block_end = worker.block_end;
-                    record.populated_block_count = worker.block_end - worker.block_start;
-                    record.empty = record.populated_block_count == 0;
-                    record.short_task = !record.empty &&
-                                        record.populated_block_count < expected_blocks_per_task;
+                for (size_t task_id = 0; task_id < EXSIA_LOCAL_WORKER_COUNT; ++task_id) {
+                    const LocalWorkerContext & worker = local_workspace_.workers[task_id];
+                    LocalParallelTaskRecord &  record = observation.tasks[task_id];
+                    record.task_id                    = task_id;
+                    record.row_start                  = worker.row_start;
+                    record.row_end                    = worker.row_end;
+                    record.block_start                = worker.block_start;
+                    record.block_end                  = worker.block_end;
+                    record.populated_block_count      = worker.block_end - worker.block_start;
+                    record.empty                      = record.populated_block_count == 0;
+                    record.short_task =
+                        !record.empty && record.populated_block_count < expected_blocks_per_task;
                 }
 #endif
 
                 std::atomic<bool> local_parallel_ok{true};
-                size_t observed_team_size = 0;
+                size_t            observed_team_size = 0;
 #pragma omp parallel num_threads(EXSIA_OMP_THREAD_COUNT)
                 {
                     trace::ScopedContext team_context(task_trace_origin, true);
-                    trace::CpuStage team_lifetime(layer, "task.host_work", trace::CpuStage::Scope::envelope);
+                    trace::CpuStage      team_lifetime(
+                        layer, "task.host_work", trace::CpuStage::Scope::envelope);
 #if LOG_CYCLE
                     const bool collect_worker_cpu = cycle::host_thread_id() != run_timing.start.tid;
-                    const auto worker_start = collect_worker_cpu ? gemmini_cpu_timing_read() : gemmini_cpu_sample{};
+                    const auto worker_start =
+                        collect_worker_cpu ? gemmini_cpu_timing_read() : gemmini_cpu_sample{};
 #endif
 #pragma omp single
                     {
 #if EXSIA_OBSERVATION_ENABLED
                         observation.observed_team_size = static_cast<size_t>(omp_get_num_threads());
-                        observed_team_size = observation.observed_team_size;
+                        observed_team_size             = observation.observed_team_size;
 #else
                         observed_team_size = static_cast<size_t>(omp_get_num_threads());
 #endif
-                        if (observed_team_size != EXSIA_OMP_THREAD_COUNT)
-                        {
+                        if (observed_team_size != EXSIA_OMP_THREAD_COUNT) {
                             record_failure(ExSIAState::FailureCode::WrongTeamSize, s);
                             local_parallel_ok.store(false, std::memory_order_relaxed);
                         }
-                        for (size_t task_id = 0; task_id < EXSIA_LOCAL_WORKER_COUNT; ++task_id)
-                        {
+                        for (size_t task_id = 0; task_id < EXSIA_LOCAL_WORKER_COUNT; ++task_id) {
 #pragma omp task firstprivate(task_id)
                             {
                                 trace::ScopedContext task_context(task_trace_origin, true);
-                                trace::CpuStage task_lifetime(layer, "task.host_work", trace::CpuStage::Scope::envelope);
-                                CpuWallInterval task_cpu_wall(layer, run_id, "exsia.local", s, task_id);
-                                try
-                                {
-                                if (local_parallel_ok.load(std::memory_order_relaxed))
-                                {
-                                LocalWorkerContext &worker = local_workspace_.workers[task_id];
-                                LocalTaskRuntime &task_runtime = local_workspace_.local_tasks[task_id];
-                                EXSIA_PROFILE_COLLECT(start_profile_interval(profile.local_groups[task_id], &args, "exsia.local_group", s);)
-                                bool ok = true;
-                                for (size_t block = worker.block_start;
-                                     block < worker.block_end; ++block)
-                                {
-                                    const size_t local_row = block / state_.blocks_per_row;
-                                    const size_t block_idx = block % state_.blocks_per_row;
-                                    const size_t global_row = stripe.row_start + local_row;
-                                    if (!run_local_block(worker.scratch, global_row, block_idx
+                                trace::CpuStage      task_lifetime(
+                                    layer, "task.host_work", trace::CpuStage::Scope::envelope);
+                                CpuWallInterval task_cpu_wall(
+                                    layer, run_id, "exsia.local", s, task_id);
+                                try {
+                                    if (local_parallel_ok.load(std::memory_order_relaxed)) {
+                                        LocalWorkerContext & worker =
+                                            local_workspace_.workers[task_id];
+                                        LocalTaskRuntime & task_runtime =
+                                            local_workspace_.local_tasks[task_id];
+                                        EXSIA_PROFILE_COLLECT(
+                                            start_profile_interval(profile.local_groups[task_id],
+                                                                   &args,
+                                                                   "exsia.local_group",
+                                                                   s);)
+                                        bool ok = true;
+                                        for (size_t block = worker.block_start;
+                                             block < worker.block_end;
+                                             ++block) {
+                                            const size_t local_row  = block / state_.blocks_per_row;
+                                            const size_t block_idx  = block % state_.blocks_per_row;
+                                            const size_t global_row = stripe.row_start + local_row;
+                                            if (!run_local_block(worker.scratch,
+                                                                 global_row,
+                                                                 block_idx
 #if EXSIA_BRANCH_COUNTS_ENABLED
-                                                         , task_runtime.cycle_stats
+                                                                 ,
+                                                                 task_runtime.cycle_stats
 #endif
-                                                         ))
-                                    {
-                                        record_failure(ExSIAState::FailureCode::LocalBlockFailure, s);
-                                        local_parallel_ok.store(false, std::memory_order_relaxed);
-                                        ok = false;
-                                        break;
+                                                                 )) {
+                                                record_failure(
+                                                    ExSIAState::FailureCode::LocalBlockFailure, s);
+                                                local_parallel_ok.store(false,
+                                                                        std::memory_order_relaxed);
+                                                ok = false;
+                                                break;
+                                            }
+                                        }
+                                        task_runtime.completed = ok;
+                                        EXSIA_PROFILE_COLLECT(
+                                            if (!end_profile_interval(
+                                                    profile.local_groups[task_id])) {
+                                                record_failure(
+                                                    ExSIAState::FailureCode::ProfileIntervalInvalid,
+                                                    s);
+                                                local_parallel_ok.store(false,
+                                                                        std::memory_order_relaxed);
+                                            })
                                     }
-                                }
-                                task_runtime.completed = ok;
-                                EXSIA_PROFILE_COLLECT(
-                                if (!end_profile_interval(profile.local_groups[task_id]))
-                                {
-                                    record_failure(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
-                                    local_parallel_ok.store(false, std::memory_order_relaxed);
-                                }
-                                )
-                                }
-                                }
-                                catch (...)
-                                {
+                                } catch (...) {
                                     record_failure(ExSIAState::FailureCode::Exception, s);
                                     local_parallel_ok.store(false, std::memory_order_relaxed);
                                 }
@@ -3375,11 +1555,11 @@ namespace ggml::gemmini::quants::act::exsia
                     }
 #if LOG_CYCLE
                     // Sample after the single barrier, before the final parallel barrier.
-                    if (collect_worker_cpu)
-                    {
+                    if (collect_worker_cpu) {
                         const auto worker_end = gemmini_cpu_timing_read();
                         gemmini_cpu_timing_add(&run_timing.worker_cpu[omp_get_thread_num()],
-                                               &worker_start, &worker_end);
+                                               &worker_start,
+                                               &worker_end);
                         const auto identity = cpu_identity(layer, run_id, "exsia.worker", s);
                         gemmini_cpu_timing_record(&identity, &worker_start, &worker_end);
                     }
@@ -3394,9 +1574,8 @@ namespace ggml::gemmini::quants::act::exsia
 #if EXSIA_BRANCH_COUNTS_ENABLED
                 slot.cycle_stats.reset();
 #endif
-                for (size_t task_id = 0; task_id < EXSIA_LOCAL_WORKER_COUNT; ++task_id)
-                {
-                    const LocalTaskRuntime &task_runtime = local_workspace_.local_tasks[task_id];
+                for (size_t task_id = 0; task_id < EXSIA_LOCAL_WORKER_COUNT; ++task_id) {
+                    const LocalTaskRuntime & task_runtime = local_workspace_.local_tasks[task_id];
 #if EXSIA_OBSERVATION_ENABLED
                     observation.completed_task_count += task_runtime.completed ? 1 : 0;
                     observation.tasks[task_id].completed = task_runtime.completed;
@@ -3405,7 +1584,7 @@ namespace ggml::gemmini::quants::act::exsia
                         return fail();
 
 #if EXSIA_BRANCH_COUNTS_ENABLED
-                    const StripeCycleStats &task_stats = task_runtime.cycle_stats;
+                    const StripeCycleStats & task_stats = task_runtime.cycle_stats;
 #if EXSIA_STAGE_PROFILE_ENABLED
 #if defined(__linux__) && defined(__aarch64__)
                     slot.cycle_stats.p0.merge(task_stats.p0);
@@ -3429,22 +1608,19 @@ namespace ggml::gemmini::quants::act::exsia
                     slot.cycle_stats.forced_recompute_count += task_stats.forced_recompute_count;
 #endif
                     slot.cycle_stats.p3_bypass_no_int_count += task_stats.p3_bypass_no_int_count;
-                    slot.cycle_stats.p3_bypass_same_scale_count += task_stats.p3_bypass_same_scale_count;
+                    slot.cycle_stats.p3_bypass_same_scale_count +=
+                        task_stats.p3_bypass_same_scale_count;
                     slot.cycle_stats.p3_replay_count += task_stats.p3_replay_count;
 #endif
                 }
 #else
                 return fail(ExSIAState::FailureCode::OpenMPUnavailable);
 #endif
-            }
-            else
-            {
-                for (size_t r = stripe.row_start; r < stripe.row_end; ++r)
-                {
-                    for (size_t b = 0; b < state_.blocks_per_row; ++b)
-                    {
-                        if (!run_local_block(stripe.scratch, r, b
-                                             EXSIA_STATS_ARGUMENT(slot.cycle_stats)))
+            } else {
+                for (size_t r = stripe.row_start; r < stripe.row_end; ++r) {
+                    for (size_t b = 0; b < state_.blocks_per_row; ++b) {
+                        if (!run_local_block(
+                                stripe.scratch, r, b EXSIA_STATS_ARGUMENT(slot.cycle_stats)))
                             return fail(ExSIAState::FailureCode::LocalBlockFailure, s);
                     }
                 }
@@ -3454,19 +1630,16 @@ namespace ggml::gemmini::quants::act::exsia
             state_.validation_p3_branch_counts[1] += slot.cycle_stats.p3_bypass_same_scale_count;
             state_.validation_p3_branch_counts[2] += slot.cycle_stats.p3_replay_count;
 #endif
-            // local_total ends after Local and before Mask Assembly, Exponent Reduction, and Folding.
-            EXSIA_PROFILE_COLLECT(
-            if (!end_profile_interval(profile.local))
-                return fail(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
-            )
+            // local_total ends after Local and before Mask Assembly, Exponent Reduction, and
+            // Folding.
+            EXSIA_PROFILE_COLLECT(if (!end_profile_interval(profile.local)) return fail(
+                                      ExSIAState::FailureCode::ProfileIntervalInvalid, s);)
             const size_t active_block_count = stripe.row_count() * state_.blocks_per_row;
             stripe_cpu_wall.next("exsia.mask_assembly");
             EXSIA_PROFILE_COLLECT(start_profile_interval(profile.mask_assembly);)
             const bool assembled = assemble_stripe_mask(slot, state_);
-            EXSIA_PROFILE_COLLECT(
-            if (!end_profile_interval(profile.mask_assembly))
-                return fail(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
-            )
+            EXSIA_PROFILE_COLLECT(if (!end_profile_interval(profile.mask_assembly)) return fail(
+                                      ExSIAState::FailureCode::ProfileIntervalInvalid, s);)
             if (!assembled)
                 return fail(ExSIAState::FailureCode::MaskAssemblyFailure, s);
             if (active_block_count > slot.block_exp.size())
@@ -3475,283 +1648,249 @@ namespace ggml::gemmini::quants::act::exsia
             EXSIA_PROFILE_COLLECT(start_profile_interval(profile.exponent_reduction);)
             reduce_stripe_exponents(slot, active_block_count);
             EXSIA_PROFILE_COLLECT(
-            if (!end_profile_interval(profile.exponent_reduction))
-                return fail(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
-            )
+                if (!end_profile_interval(profile.exponent_reduction)) return fail(
+                    ExSIAState::FailureCode::ProfileIntervalInvalid, s);)
             slot.mark_local_filled();
             stripe_cpu_wall.next("exsia.folding_and_pack");
             EXSIA_PROFILE_COLLECT(start_profile_interval(profile.folding);)
 
-            if (!folding_.run(meta, state_, stripe, args, s,
-                               slot.q_wide, slot.block_exp,
-                               state_.residual, slot.rmd_builder))
+            if (!folding_.run(meta,
+                              state_,
+                              stripe,
+                              args,
+                              s,
+                              slot.q_wide,
+                              slot.block_exp,
+                              state_.residual,
+                              slot.rmd_builder))
                 return fail(ExSIAState::FailureCode::FoldingFailure, s);
 
             // Seal the stripe packet and hand the shared handle to the metadata. Stripes
             // run in row order, so meta.rmd_packets stays ordered by row_begin.
             if (!seal_stripe_packet(meta, slot, args))
                 return fail(ExSIAState::FailureCode::FoldingFailure, s);
-            slot.mark_folding_committed(
-                aggregate_now_ns(), aggregate_now_tick());
+            slot.mark_folding_committed(aggregate_now_ns(), aggregate_now_tick());
 #if CYCLE_SIM
-            (void) record_producer(cycle_sim::ProducerEventKind::ActivationRowsCommit,
-                slot, "ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp:folding_commit_sequential");
-            (void) record_producer(cycle_sim::ProducerEventKind::ResidualPacketSeal,
-                slot, "ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp:seal_stripe_packet_sequential");
+            (void)record_producer(
+                cycle_sim::ProducerEventKind::ActivationRowsCommit,
+                slot,
+                "ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp:folding_commit_sequential");
+            (void)record_producer(
+                cycle_sim::ProducerEventKind::ResidualPacketSeal,
+                slot,
+                "ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp:seal_stripe_packet_sequential");
 #endif
 
             if (!snapshot_validation_mask(s, slot.stripe.outlier_mask))
                 return fail(ExSIAState::FailureCode::ValidationSnapshotFailure, s);
 
-            EXSIA_PROFILE_COLLECT(
-            if (!end_profile_interval(profile.folding))
-                return fail(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
-            )
+            EXSIA_PROFILE_COLLECT(if (!end_profile_interval(profile.folding)) return fail(
+                                      ExSIAState::FailureCode::ProfileIntervalInvalid, s);)
 #if EXSIA_STAGE_PROFILE_ENABLED
             profile.stats = slot.cycle_stats;
 #endif
             stripe_cpu_wall.next("exsia.publish");
-            if (!notify_stripe_ready(slot, run_id, true, stripe_cpu_wall
+            if (!notify_stripe_ready(slot,
+                                     run_id,
+                                     true,
+                                     stripe_cpu_wall
 #if EXSIA_PROFILE_COLLECTION_ENABLED
-                                     , &profile
+                                     ,
+                                     &profile
 #endif
                                      ))
                 return fail(ExSIAState::FailureCode::StripeReadySinkFailure, s);
             slot.release();
 #if CYCLE_SIM
-            (void) record_producer(cycle_sim::ProducerEventKind::ExsiaWorkspaceRelease,
-                slot, "ggml/src/ggml-gemmini/quants/act/exsia/exsia.cpp:release_slot_after_sink_sequential");
+            (void)record_producer(cycle_sim::ProducerEventKind::ExsiaWorkspaceRelease,
+                                  slot,
+                                  "ggml/src/ggml-gemmini/quants/act/exsia/"
+                                  "exsia.cpp:release_slot_after_sink_sequential");
 #endif
-            EXSIA_PROFILE_COLLECT(
-            if (!end_profile_interval(profile.stripe_total))
-                return fail(ExSIAState::FailureCode::ProfileIntervalInvalid, s);
-            )
+            EXSIA_PROFILE_COLLECT(if (!end_profile_interval(profile.stripe_total)) return fail(
+                                      ExSIAState::FailureCode::ProfileIntervalInvalid, s);)
         }
         run_cpu_wall.resume();
-        }
+    }
 
 #if EXSIA_PROFILE_COLLECTION_ENABLED
-        if (!end_profile_interval(run_profile))
-            return fail(ExSIAState::FailureCode::ProfileIntervalInvalid);
+    if (!end_profile_interval(run_profile))
+        return fail(ExSIAState::FailureCode::ProfileIntervalInvalid);
 #if CYCLE_SIM
-        for (const auto &profile : stripe_profiles) {
-            const auto dependencies = profile_host_stage_ids(profile);
-            args.cycle_sim_host_dependencies.insert(args.cycle_sim_host_dependencies.end(),
-                                                   dependencies.begin(), dependencies.end());
-        }
+    for (const auto & profile : stripe_profiles) {
+        const auto dependencies = profile_host_stage_ids(profile);
+        args.cycle_sim_host_dependencies.insert(
+            args.cycle_sim_host_dependencies.end(), dependencies.begin(), dependencies.end());
+    }
 #endif
 #if EXSIA_VALIDATION
-        state_.profile_snapshot.run_id = run_id;
-        state_.profile_snapshot.mode = state_.mode;
-        state_.profile_snapshot.run = run_profile;
-        state_.profile_snapshot.stripes = stripe_profiles;
+    state_.profile_snapshot.run_id  = run_id;
+    state_.profile_snapshot.mode    = state_.mode;
+    state_.profile_snapshot.run     = run_profile;
+    state_.profile_snapshot.stripes = stripe_profiles;
 #endif
 #endif
-        run_cpu_wall.pause();
-        EXSIA_PROFILE_LOG(
-        const ExSIAState::FailureCode profile_failure = flush_profile(
-            profile_config, layer, run_id, mode, stripe_profiles, run_profile, state_);
-        if (profile_failure != ExSIAState::FailureCode::None)
-            return fail(profile_failure);
-        )
-        ggml::gemmini::log::debug(
-            layer,
-            "[exsia] I=%zu K=%zu stripes=%zu tau=%d rmd_packets=%zu",
-            args.I,
-            args.K,
-            num_stripes,
-            meta.sigma,
-            meta.rmd_packets.size());
+    run_cpu_wall.pause();
+    EXSIA_PROFILE_LOG(
+        const ExSIAState::FailureCode profile_failure = flush_profile(profile_config,
+                                                                      layer,
+                                                                      run_id,
+                                                                      mode,
+                                                                      stripe_profiles,
+                                                                      run_profile,
+                                                                      state_.K_logical,
+                                                                      state_.K_padded);
+        if (profile_failure != ExSIAState::FailureCode::None) return fail(profile_failure);)
+    ggml::gemmini::log::debug(layer,
+                              "[exsia] I=%zu K=%zu stripes=%zu tau=%d rmd_packets=%zu",
+                              args.I,
+                              args.K,
+                              num_stripes,
+                              meta.sigma,
+                              meta.rmd_packets.size());
 
 #if LOG_CYCLE
-        run_timing.success = true;
+    run_timing.success = true;
 #endif
 #if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
-        if (args.evaluation_context)
-            args.evaluation_context->finish_activation();
+    if (args.evaluation_context)
+        args.evaluation_context->finish_activation();
 #endif
-        return true;
-    }
-
-    bool dequantize_activation(
-        float *dst,
-        size_t dst_row_stride,
-        size_t dst_col_stride,
-        size_t rows,
-        size_t cols,
-        const ggml_gemmini_args_t &args)
-    {
-        const auto run = [&]() -> bool
-        {
-            if (!args.A.valid() || !dst || args.I == 0 || args.K == 0 ||
-                dst_row_stride == 0 || dst_col_stride == 0 ||
-                rows == 0 || cols == 0)
-            {
-                return false;
-            }
-
-            const auto *meta_ptr = std::get_if<Meta>(&args.act_quant.storage());
-            if (!meta_ptr)
-            {
-                return false;
-            }
-            const Meta &meta = *meta_ptr;
-
-            if (args.sA != 0 && args.sA != args.K)
-            {
-                return false;
-            }
-
-            const size_t src_row_stride = args.K;
-            const size_t row_count = std::min(rows, args.I);
-            const size_t col_count = std::min(cols, args.K);
-            const size_t max_size = std::numeric_limits<size_t>::max();
-            if (row_count != 0 && col_count > max_size / row_count)
-            {
-                return false;
-            }
-            if (args.activation_row_offset > max_size - row_count)
-            {
-                return false;
-            }
-            const size_t global_row_begin = args.activation_row_offset;
-            const size_t global_row_end = global_row_begin + row_count;
-
-            size_t rows_per_stripe = args.activation_rows_per_stripe;
-            if (rows_per_stripe == 0)
-            {
-                const auto geometry = args.activation_quant_geometry();
-                if (!geometry.ok())
-                {
-                    return false;
-                }
-                rows_per_stripe = geometry.geometry.stripe_rows;
-            }
-            if (rows_per_stripe == 0 || meta.theta.empty())
-            {
-                return false;
-            }
-
-            std::vector<int32_t> residuals;
-            rmd::RmdStatus residual_status = rmd::RmdStatus::success;
-            if (args.residual_route == residual::ResidualRoute::cpu_direct)
-            {
-                if (!meta.rmd_packets.empty())
-                {
-                    return false;
-                }
-                residual_status = residual::expand_direct_payloads_to_plane(
-                    meta.direct_residuals,
-                    global_row_begin,
-                    global_row_end,
-                    args.K,
-                    args.J,
-                    col_count,
-                    residuals);
-            }
-            else
-            {
-                if (!meta.direct_residuals.empty())
-                {
-                    return false;
-                }
-                residual_status = rmd::expand_packets_to_plane(
-                    meta.rmd_packets,
-                    global_row_begin,
-                    global_row_end,
-                    col_count,
-                    residuals);
-            }
-            if (residual_status != rmd::RmdStatus::success ||
-                residuals.size() != row_count * col_count)
-            {
-                return false;
-            }
-
-            std::vector<float> staged;
-            try
-            {
-                staged.resize(row_count * col_count);
-            }
-            catch (const std::bad_alloc &)
-            {
-                return false;
-            }
-            catch (const std::length_error &)
-            {
-                return false;
-            }
-            const int16_t invalid_theta = std::numeric_limits<int16_t>::min();
-            for (size_t row = 0; row < row_count; ++row)
-            {
-                const size_t global_row = global_row_begin + row;
-                const size_t stripe_idx = global_row / rows_per_stripe;
-                const int16_t theta = meta.resolve_stripe_theta(static_cast<int>(stripe_idx));
-                if (theta == invalid_theta)
-                {
-                    return false;
-                }
-
-                for (size_t col = 0; col < col_count; ++col)
-                {
-                    if ((row != 0 && src_row_stride > max_size / row) ||
-                        (row != 0 && dst_row_stride > max_size / row) ||
-                        (col != 0 && dst_col_stride > max_size / col))
-                    {
-                        return false;
-                    }
-
-                    const size_t src_row_offset = row * src_row_stride;
-                    if (src_row_offset > max_size - col)
-                    {
-                        return false;
-                    }
-
-                    int32_t q_int = 0;
-                    if (__builtin_add_overflow(
-                            args.A.get(row, col),
-                            residuals[row * col_count + col],
-                            &q_int))
-                    {
-                        return false;
-                    }
-                    const float value =
-                        std::ldexp(static_cast<float>(q_int), theta);
-                    if (!std::isfinite(value))
-                    {
-                        return false;
-                    }
-                    staged[row * col_count + col] = value;
-                }
-            }
-
-            if ((row_count > 1 &&
-                 dst_row_stride > max_size / (row_count - 1)) ||
-                (col_count > 1 &&
-                 dst_col_stride > max_size / (col_count - 1)))
-            {
-                return false;
-            }
-            const size_t last_row_offset =
-                (row_count - 1) * dst_row_stride;
-            const size_t last_col_offset =
-                (col_count - 1) * dst_col_stride;
-            if (last_row_offset > max_size - last_col_offset)
-            {
-                return false;
-            }
-            for (size_t row = 0; row < row_count; ++row)
-            {
-                for (size_t col = 0; col < col_count; ++col)
-                {
-                    dst[row * dst_row_stride + col * dst_col_stride] =
-                        staged[row * col_count + col];
-                }
-            }
-            return true;
-        };
-
-        return run();
-    }
-
+    return true;
 }
+
+bool dequantize_activation(float *                     dst,
+                           size_t                      dst_row_stride,
+                           size_t                      dst_col_stride,
+                           size_t                      rows,
+                           size_t                      cols,
+                           const ggml_gemmini_args_t & args) {
+    const auto run = [&]() -> bool {
+        if (!args.A.valid() || !dst || args.I == 0 || args.K == 0 || dst_row_stride == 0 ||
+            dst_col_stride == 0 || rows == 0 || cols == 0) {
+            return false;
+        }
+
+        const auto * meta_ptr = std::get_if<Meta>(&args.act_quant.storage());
+        if (!meta_ptr) {
+            return false;
+        }
+        const Meta & meta = *meta_ptr;
+
+        if (args.sA != 0 && args.sA != args.K) {
+            return false;
+        }
+
+        const size_t src_row_stride = args.K;
+        const size_t row_count      = std::min(rows, args.I);
+        const size_t col_count      = std::min(cols, args.K);
+        const size_t max_size       = std::numeric_limits<size_t>::max();
+        if (row_count != 0 && col_count > max_size / row_count) {
+            return false;
+        }
+        if (args.activation_row_offset > max_size - row_count) {
+            return false;
+        }
+        const size_t global_row_begin = args.activation_row_offset;
+        const size_t global_row_end   = global_row_begin + row_count;
+
+        size_t rows_per_stripe = args.activation_rows_per_stripe;
+        if (rows_per_stripe == 0) {
+            const auto geometry = args.activation_quant_geometry();
+            if (!geometry.ok()) {
+                return false;
+            }
+            rows_per_stripe = geometry.geometry.stripe_rows;
+        }
+        if (rows_per_stripe == 0 || meta.theta.empty()) {
+            return false;
+        }
+
+        std::vector<int32_t> residuals;
+        rmd::RmdStatus       residual_status = rmd::RmdStatus::success;
+        if (args.residual_route == residual::ResidualRoute::cpu_direct) {
+            if (!meta.rmd_packets.empty()) {
+                return false;
+            }
+            residual_status = residual::expand_direct_payloads_to_plane(meta.direct_residuals,
+                                                                        global_row_begin,
+                                                                        global_row_end,
+                                                                        args.K,
+                                                                        args.J,
+                                                                        col_count,
+                                                                        residuals);
+        } else {
+            if (!meta.direct_residuals.empty()) {
+                return false;
+            }
+            residual_status = rmd::expand_packets_to_plane(
+                meta.rmd_packets, global_row_begin, global_row_end, col_count, residuals);
+        }
+        if (residual_status != rmd::RmdStatus::success ||
+            residuals.size() != row_count * col_count) {
+            return false;
+        }
+
+        std::vector<float> staged;
+        try {
+            staged.resize(row_count * col_count);
+        } catch (const std::bad_alloc &) {
+            return false;
+        } catch (const std::length_error &) {
+            return false;
+        }
+        const int16_t invalid_theta = std::numeric_limits<int16_t>::min();
+        for (size_t row = 0; row < row_count; ++row) {
+            const size_t  global_row = global_row_begin + row;
+            const size_t  stripe_idx = global_row / rows_per_stripe;
+            const int16_t theta      = meta.resolve_stripe_theta(static_cast<int>(stripe_idx));
+            if (theta == invalid_theta) {
+                return false;
+            }
+
+            for (size_t col = 0; col < col_count; ++col) {
+                if ((row != 0 && src_row_stride > max_size / row) ||
+                    (row != 0 && dst_row_stride > max_size / row) ||
+                    (col != 0 && dst_col_stride > max_size / col)) {
+                    return false;
+                }
+
+                const size_t src_row_offset = row * src_row_stride;
+                if (src_row_offset > max_size - col) {
+                    return false;
+                }
+
+                int32_t q_int = 0;
+                if (__builtin_add_overflow(
+                        args.A.get(row, col), residuals[row * col_count + col], &q_int)) {
+                    return false;
+                }
+                const float value = std::ldexp(static_cast<float>(q_int), theta);
+                if (!std::isfinite(value)) {
+                    return false;
+                }
+                staged[row * col_count + col] = value;
+            }
+        }
+
+        if ((row_count > 1 && dst_row_stride > max_size / (row_count - 1)) ||
+            (col_count > 1 && dst_col_stride > max_size / (col_count - 1))) {
+            return false;
+        }
+        const size_t last_row_offset = (row_count - 1) * dst_row_stride;
+        const size_t last_col_offset = (col_count - 1) * dst_col_stride;
+        if (last_row_offset > max_size - last_col_offset) {
+            return false;
+        }
+        for (size_t row = 0; row < row_count; ++row) {
+            for (size_t col = 0; col < col_count; ++col) {
+                dst[row * dst_row_stride + col * dst_col_stride] = staged[row * col_count + col];
+            }
+        }
+        return true;
+    };
+
+    return run();
+}
+
+} // namespace ggml::gemmini::quants::act::exsia

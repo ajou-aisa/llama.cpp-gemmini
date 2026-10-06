@@ -39,7 +39,7 @@ PLATFORMS: Final = frozenset({("Darwin", "arm64"), ("Darwin", "x86_64"), ("Linux
 MACHINES: Final = {"amd64": "x86_64", "x86_64": "x86_64", "arm64": "arm64", "aarch64": "aarch64"}
 # Instrumentation and locations do not change numerics or cycle semantics; everything else is semantic.
 NON_SEMANTIC: Final = frozenset({"LOG_CYCLE", "GGML_CPU_CYCLE_LOG", "CYCLE_DETAIL", "LOG_DEBUG",
-                                 "IM2P_SIM_ROOT", "CMAKE_EXPORT_COMPILE_COMMANDS"})
+                                 "IM2P_SIM_ROOT", "GEMMINI_SW_PATH", "CMAKE_EXPORT_COMPILE_COMMANDS"})
 CYCLE_MODEL_OPTIONS: Final = {"CMAKE_BUILD_TYPE": "Release", "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"}
 # Metric sinks: metric kind -> (CMake cache option, llama-eval-workload --build-info key). A metric build compiles in
 # exactly its own sink; every other kind (performance PoTal/FullCPU, cycle) compiles all three out.
@@ -150,7 +150,8 @@ def llama_plan(kind: str, precision: str, dim: int, im2p: Path, matmul_mode: str
         "GGML_OPENMP": "OFF", "CYCLE_SIM": "1", "LOG_CYCLE": "0", "LOG_DEBUG": "0",
         "CYCLE_DETAIL": "0", "GGML_CPU_CYCLE_LOG": "OFF", "GGML_BACKEND_DL": "OFF",
         "GGML_GEMMINI_EXECUTION_BACKEND": "IM2P_SIM", "IM2P_SIM_IMPLEMENTATION": "GEMMINI_HP1",
-        "IM2P_SIM_ROOT": str(im2p), "GGML_GEMMINI_OPTION": "WS",
+        "IM2P_SIM_ROOT": str(im2p.resolve()), "GEMMINI_SW_PATH": str(INCLUDE_REPO.resolve()),
+        "GGML_GEMMINI_OPTION": "WS",
         "GGML_GEMMINI_ACTIVATION_QUANT": "EXSIA", "GGML_GEMMINI_BLOCK_SIZE": "32",
         "GGML_GEMMINI_ACTIVATION_BITS": str(bits), "GGML_GEMMINI_WEIGHT_BITS": str(bits),
         "GGML_GEMMINI_DIM": str(dim), "GGML_GEMMINI_DEFAULT_MATMUL_MODE": matmul_mode,
@@ -230,8 +231,12 @@ def include_headers(repo: Path = INCLUDE_REPO) -> Record:
     return rows
 
 
-def source_state() -> Record:
-    state: Record = {name: repository_state(REPO.parent / name) for name in SOURCE_REPOS}
+def source_state(im2p: Path | None = REPO.parent / "IM2P.sim") -> Record:
+    roots = {"llama.cpp-gemmini": REPO, "RISC-V-DynDNN-gemmini-include": INCLUDE_REPO}
+    if im2p is not None:
+        roots["IM2P.sim"] = im2p
+    state: Record = {name: {**repository_state(root), "root": str(root.resolve())}
+                     for name, root in roots.items()}
     record(state["RISC-V-DynDNN-gemmini-include"])["headers"] = include_headers()
     return state
 
@@ -293,7 +298,7 @@ def build(kind: str, precision: str, dim: int, output: Path, im2p: Path, jobs: i
                "runner_sha256": sha256(runner), "verification": "PASS", "producer_git_sha": producer_head,
                "producer_diff_sha256": hashlib.sha256(source_diff).hexdigest(),
                "semantic_options_sha256": plan.semantic_options_sha256, "platform": host.record(),
-               "toolchain": toolchain(), "sources": source_state(), "extra_targets": extras,
+               "toolchain": toolchain(), "sources": source_state(im2p if "IM2P_SIM_ROOT" in plan.options else None), "extra_targets": extras,
                "include_repo_closure": headers})
     return runner
 
@@ -368,7 +373,7 @@ def cached_llama_build(cache: Path, kind: str, precision: str, dim: int, im2p: P
                        matmul_mode: str = "FULL", extra_targets: tuple[str, ...] = ()) -> tuple[Path, bool]:
     plan = llama_plan(kind, precision, dim, im2p, matmul_mode, extra_targets)
     identity: Record = {"build": "llama", "plan": plan.record(), "platform": platform_profile().record(),
-                        "toolchain": toolchain(), "sources": source_state()}
+                        "toolchain": toolchain(), "sources": source_state(im2p if "IM2P_SIM_ROOT" in plan.options else None)}
     path, hit = cached(cache, kind, identity,
                        lambda output: build(kind, precision, dim, output, im2p, jobs, matmul_mode, extra_targets))
     receipt = read_json(path / "build-receipt.json")

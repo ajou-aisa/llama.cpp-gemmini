@@ -3,10 +3,8 @@
 #include <cstdio>
 
 namespace ggml::gemmini::log::dump_detail {
-const char *dump_phase_to_string(DumpPhase phase)
-{
-    switch (phase)
-    {
+const char * dump_phase_to_string(DumpPhase phase) {
+    switch (phase) {
     case DumpPhase::prefill:
         return "prefill";
     case DumpPhase::decode:
@@ -17,16 +15,13 @@ const char *dump_phase_to_string(DumpPhase phase)
     }
 }
 
-void write_json_escaped(FILE *out, const char *s)
-{
+void write_json_escaped(FILE * out, const char * s) {
     if (!out || !s)
         return;
 
-    for (const unsigned char *p = reinterpret_cast<const unsigned char *>(s); *p; ++p)
-    {
+    for (const unsigned char * p = reinterpret_cast<const unsigned char *>(s); *p; ++p) {
         const unsigned char c = *p;
-        switch (c)
-        {
+        switch (c) {
         case '\\':
             std::fwrite("\\\\", 1, 2, out);
             break;
@@ -49,14 +44,13 @@ void write_json_escaped(FILE *out, const char *s)
             std::fwrite("\\t", 1, 2, out);
             break;
         default:
-            if (c < 0x20)
-            {
-                char buf[7];
-                const int len = std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned int>(c));
+            if (c < 0x20) {
+                char      buf[7];
+                const int len =
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned int>(c));
                 if (len > 0)
                     std::fwrite(buf, 1, static_cast<size_t>(len), out);
-            }
-            else
+            } else
                 std::fputc(static_cast<int>(c), out);
             break;
         }

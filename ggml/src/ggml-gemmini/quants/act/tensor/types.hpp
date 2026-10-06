@@ -4,13 +4,11 @@
 
 #include <vector>
 
-namespace ggml::gemmini::quants::act::tensor
-{
+namespace ggml::gemmini::quants::act::tensor {
 
-struct Meta
-{
-    float scale = 1.0f;
-    RmdPacketList rmd_packets;
+struct Meta {
+    float              scale = 1.0f;
+    RmdPacketList      rmd_packets;
     DirectResidualList direct_residuals;
 
     inline void reset() {
@@ -20,4 +18,4 @@ struct Meta
     }
 };
 
-}
+} // namespace ggml::gemmini::quants::act::tensor

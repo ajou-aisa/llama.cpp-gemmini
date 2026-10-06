@@ -5,9 +5,8 @@
 
 - Weight 형식은 **HP1**만 사용한다. H1과 H0는 이 작업의 입력이나 검증 대상이 아니다.
 - GEMM 실행 backend는 **Gemmini(Chisel)** 하나다. 시뮬레이션은
-  `IM2P_SIM_IMPLEMENTATION=GEMMINI_HP1`, FPGA 빌드는
-  `IM2P_FPGA_ARCH=GEMMINI_HP1`을 대상으로 한다. `LEGACY_BSV`와
-  `BSV_IFR4` 경로는 이 작업의 비교 기준이나 수정 대상이 아니다.
+  `IM2P_SIM_IMPLEMENTATION=GEMMINI_HP1`을 대상으로 한다. FPGA 지원은 폐기했다.
+  `LEGACY_BSV` 경로는 이 작업의 비교 기준이나 수정 대상이 아니다.
   RMD의 pruning, compact A/W 준비, 결과 복원 같은 호스트 작업은 계속 CPU에서 한다.
 - 핵심 변경은 **RMD A4 activation 패킷의 nibble packing 제거**다.
   A4와 A8 activation은 dense frontend ABI처럼 모두 원소당 signed byte로

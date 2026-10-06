@@ -19,6 +19,7 @@ printf 'make:%s\n' "$*" >> "$CONTRACT_LOG"
 ]=])
 file(WRITE "${test_root}/bin/cmake" [=[#!/bin/bash
 printf 'cmake:%s\n' "$*" >> "$CONTRACT_LOG"
+printf 'cmake-arg:%s\n' "$@" >> "$CONTRACT_LOG"
 ]=])
 execute_process(
     COMMAND chmod +x "${test_root}/bin/make" "${test_root}/bin/cmake")
@@ -34,6 +35,7 @@ function(run_host_all_matched script)
             "IM2P_CACHE_JOBS=3"
             "IM2P_SIM_ROOT=${TEST_IM2P_ROOT}"
             "IM2P_ARTIFACT_SET=ALL_MATCHED"
+            "GGML_GEMMINI=ON"
             "GGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM"
             "GGML_GEMMINI_OPTION=WS"
             bash "${TEST_SOURCE_DIR}/${script}"
@@ -86,6 +88,7 @@ execute_process(
         "BUILD_JOBS=7"
         "IM2P_SIM_ROOT=${TEST_IM2P_ROOT}"
         "IM2P_ARTIFACT_SET=ALL_MATCHED"
+        "GGML_GEMMINI=ON"
         "GGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM"
         "GGML_GEMMINI_OPTION=WS"
         bash "${TEST_SOURCE_DIR}/build-x86.sh"
@@ -114,6 +117,7 @@ function(run_host_selected script)
             "BUILD_DIR=${test_root}/${script}-selected-build"
             "BUILD_JOBS=4"
             "IM2P_SIM_ROOT=${TEST_IM2P_ROOT}"
+            "GGML_GEMMINI=ON"
             "GGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM"
             "GGML_GEMMINI_OPTION=WS"
             bash "${TEST_SOURCE_DIR}/${script}"
@@ -146,22 +150,217 @@ endfunction()
 run_host_selected(build-arm64.sh)
 run_host_selected(build-x86.sh)
 
-# A reused host build directory may carry CPU/HARDWARE defaults. The ARM64
-# simulator script owns its lane defaults unless an environment or -D override
-# explicitly selects another option/backend.
+foreach(scenario IN ITEMS default-environment ordinary-environment)
+    set(control_log "${test_root}/controls-${scenario}.log")
+    set(control_env IM2P_ARTIFACT_SET_DEFAULT=ALL_MATCHED IM2P_CACHE_JOBS_DEFAULT=3)
+    set(expected_target gemmini-frontend-real-lib-all)
+    set(expected_jobs 3)
+    if(scenario STREQUAL "ordinary-environment")
+        list(APPEND control_env IM2P_ARTIFACT_SET=SELECTED IM2P_CACHE_JOBS=2)
+        set(expected_target gemmini-frontend-real-lib)
+        set(expected_jobs 2)
+    endif()
+    execute_process(COMMAND env -i "PATH=${test_root}/bin:$ENV{PATH}"
+        "CONTRACT_LOG=${control_log}" "BUILD_DIR=${test_root}/controls-${scenario}-build"
+        BUILD_JOBS=4 "IM2P_SIM_ROOT=${TEST_IM2P_ROOT}" ${control_env}
+        bash "${TEST_SOURCE_DIR}/build-x86.sh"
+        RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+    if(NOT result EQUAL 0)
+        message(FATAL_ERROR "Resolved shell controls failed ${scenario}: ${output}\n${error}")
+    endif()
+    file(READ "${control_log}" commands)
+    if(NOT commands MATCHES "make:-C ${TEST_IM2P_ROOT} -j${expected_jobs} IM2P_CACHE_JOBS=${expected_jobs} [^\n]* ${expected_target}\n")
+        message(FATAL_ERROR "Incorrect shell control precedence for ${scenario}: ${commands}")
+    endif()
+endforeach()
+
+foreach(script IN ITEMS build-arm64.sh build-arm64-cpu.sh build-x86.sh build-riscv.sh)
+    set(dry_log "${test_root}/${script}-dry.log")
+    execute_process(COMMAND "${CMAKE_COMMAND}" -E env
+        "PATH=${test_root}/bin:$ENV{PATH}" "CONTRACT_LOG=${dry_log}"
+        "BUILD_DIR=${test_root}/dry-build" "BUILD_JOBS=1"
+        bash "${TEST_SOURCE_DIR}/${script}" --dry-run
+        WORKING_DIRECTORY "${TEST_SOURCE_DIR}"
+        RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+    if(NOT rc EQUAL 0 OR EXISTS "${dry_log}")
+        message(FATAL_ERROR "${script} dry-run must succeed without provisioning: ${stdout}\n${stderr}")
+    endif()
+    if(script STREQUAL "build-x86.sh")
+        string(REGEX MATCH "IM2P_EFFECTIVE_CONFIG=([^\n]+)" summary "${stderr}")
+        set(config "${CMAKE_MATCH_1}")
+        foreach(pair IN ITEMS
+                "GGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM"
+                "IM2P_SIM_IMPLEMENTATION=GEMMINI_HP1"
+                "GGML_GEMMINI_OPTION=WS" "GGML_GEMMINI_ENABLE_RMD=ON"
+                "GGML_GEMMINI_ACTIVATION_BITS=8" "GGML_GEMMINI_WEIGHT_BITS=8"
+                "GGML_GEMMINI_DIM=16" "GGML_GEMMINI_DEFAULT_RMD_BACKEND=WS"
+                "GGML_GEMMINI_DEFAULT_MATMUL_MODE=STRIPE_PIPELINE")
+            string(REPLACE "=" ";" fields "${pair}")
+            list(GET fields 0 key)
+            list(GET fields 1 expected)
+            string(JSON actual GET "${config}" effective "${key}")
+            if(NOT actual STREQUAL expected)
+                message(FATAL_ERROR "x86 default ${key}=${actual}; expected ${expected}")
+            endif()
+        endforeach()
+    endif()
+    foreach(enabled IN ITEMS ON OFF)
+        foreach(source IN ITEMS environment typed-cli)
+            set(reject_log "${test_root}/${script}-${enabled}-${source}.log")
+            set(reject_env "GGML_GEMMINI_EXECUTION_BACKEND=FPGA_UART")
+            set(reject_cli)
+            if(source STREQUAL "typed-cli")
+                set(reject_env "GGML_GEMMINI_EXECUTION_BACKEND=HARDWARE")
+                set(reject_cli -DGGML_GEMMINI_EXECUTION_BACKEND:STRING=FPGA_UART)
+            endif()
+            execute_process(COMMAND "${CMAKE_COMMAND}" -E env
+                "PATH=${test_root}/bin:$ENV{PATH}" "CONTRACT_LOG=${reject_log}"
+                "BUILD_DIR=${test_root}/reject-build" "BUILD_JOBS=1"
+                "GGML_GEMMINI=${enabled}" ${reject_env}
+                bash "${TEST_SOURCE_DIR}/${script}" ${reject_cli}
+                WORKING_DIRECTORY "${TEST_SOURCE_DIR}"
+                RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+            if(rc EQUAL 0 OR EXISTS "${reject_log}" OR
+               NOT stderr MATCHES "FPGA_UART is deprecated and unsupported")
+                message(FATAL_ERROR "${script}/${enabled}/${source} must reject before provisioning: ${stdout}\n${stderr}")
+            endif()
+        endforeach()
+    endforeach()
+endforeach()
+
+foreach(script IN ITEMS build-arm64.sh build-arm64-cpu.sh build-x86.sh build-riscv.sh)
+    set(argv_log "${test_root}/${script}-argv.log")
+    set(argv_build "${test_root}/${script}-argv-build")
+    execute_process(COMMAND env -i "PATH=${test_root}/bin:$ENV{PATH}"
+        "CONTRACT_LOG=${argv_log}" "BUILD_DIR=${argv_build}" BUILD_JOBS=2
+        GGML_GEMMINI=OFF GGML_GEMMINI_DIM_DEFAULT=16 GGML_GEMMINI_DIM=32
+        LOG_DEBUG_DEFAULT=1 LOG_DEBUG=0
+        bash "${TEST_SOURCE_DIR}/${script}"
+        -DLOG_DEBUG:BOOL=0 -DLOG_DEBUG:STRING=1 -DIM2P_DIM:STRING=64
+        -DUPSTREAM_OPTION:STRING=first "-DUPSTREAM_OPTION:PATH=last value"
+        -DBUILD_DIR:PATH=cmake-only -DBUILD_JOBS:STRING=99 -Wno-dev
+        RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+    if(NOT result EQUAL 0)
+        message(FATAL_ERROR "${script} final argv failed: ${output}\n${error}")
+    endif()
+    file(STRINGS "${argv_log}" argv_rows REGEX "^cmake-arg:")
+    set(keys)
+    foreach(row IN LISTS argv_rows)
+        if(row MATCHES "^cmake-arg:-D([^:=]+)(:[^=]+)?=")
+            set(key "${CMAKE_MATCH_1}")
+            if(key IN_LIST keys)
+                message(FATAL_ERROR "${script} sent duplicate ${key}: ${argv_rows}")
+            endif()
+            list(APPEND keys "${key}")
+        endif()
+    endforeach()
+    foreach(argument IN ITEMS -DLOG_DEBUG:STRING=1 -DGGML_GEMMINI_DIM:STRING=64
+            "-DUPSTREAM_OPTION:PATH=last value" -DBUILD_DIR:PATH=cmake-only
+            -DBUILD_JOBS:STRING=99 -Wno-dev)
+        if(NOT "cmake-arg:${argument}" IN_LIST argv_rows)
+            message(FATAL_ERROR "${script} lost final argument ${argument}: ${argv_rows}")
+        endif()
+    endforeach()
+    file(READ "${argv_log}" commands)
+    if(commands MATCHES "(^|\n)make:" OR NOT commands MATCHES "cmake:-B ${argv_build} " OR
+       NOT commands MATCHES "cmake:--build ${argv_build} [^\n]* -j2")
+        message(FATAL_ERROR "${script} reinterpreted CMake -D shell-control names: ${commands}")
+    endif()
+    foreach(control IN ITEMS IM2P_CACHE_JOBS IM2P_ARTIFACT_SET APPLE_SILICON_ARCH LIBOMP_PREFIX)
+        if(control IN_LIST keys)
+            message(FATAL_ERROR "${script} emitted shell control ${control} as a cache option")
+        endif()
+    endforeach()
+    foreach(invalid IN ITEMS -DGGML_GEMMINI_SCALE_METRICS=2 -DGGML_GEMMINI_ACT_METRICS=ON
+            -DGGML_GEMMINI_EXSIA_PROFILE_SCOPE=BAD "-DCYCLE_DETAIL=1;-DLOG_CYCLE=0"
+            "-DIM2P_DIM=32;-DGGML_GEMMINI_DIM=64")
+        set(reject_log "${test_root}/${script}-invalid-options.log")
+        execute_process(COMMAND env -i "PATH=${test_root}/bin:$ENV{PATH}"
+            "CONTRACT_LOG=${reject_log}" "BUILD_DIR=${argv_build}" BUILD_JOBS=2
+            GGML_GEMMINI=OFF bash "${TEST_SOURCE_DIR}/${script}" ${invalid}
+            RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+        if(result EQUAL 0 OR EXISTS "${reject_log}")
+            message(FATAL_ERROR "${script} admitted ${invalid} before configure: ${output}\n${error}")
+        endif()
+    endforeach()
+endforeach()
+
+execute_process(COMMAND env -i "PATH=${test_root}/bin:$ENV{PATH}"
+    "CONTRACT_LOG=${test_root}/static-dry.log" "BUILD_DIR=${test_root}/static-dry-build"
+    BUILD_JOBS=2 bash "${TEST_SOURCE_DIR}/build-riscv.sh" static --dry-run
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+if(NOT result EQUAL 0 OR EXISTS "${test_root}/static-dry.log" OR EXISTS "${test_root}/static-dry-build")
+    message(FATAL_ERROR "RISC-V static dry-run invoked configure: ${output}\n${error}")
+endif()
+string(REGEX MATCH "IM2P_EFFECTIVE_CONFIG=([^\n]+)" summary "${error}")
+set(config "${CMAKE_MATCH_1}")
+foreach(pair IN ITEMS CMAKE_BUILD_TYPE=DEBUG BUILD_SHARED_LIBS=OFF GGML_NATIVE=OFF GGML_OPENMP=OFF)
+    string(REPLACE "=" ";" fields "${pair}")
+    list(GET fields 0 key)
+    list(GET fields 1 expected)
+    string(JSON actual GET "${config}" effective "${key}")
+    if(NOT actual STREQUAL expected)
+        message(FATAL_ERROR "Static policy ${key}=${actual}; expected ${expected}")
+    endif()
+endforeach()
+
+# Make has a file-owned BUILD_DIR assignment, so an environment override alone
+# is insufficient. Provisioning and configure must receive the same path.
+foreach(cache_source IN ITEMS fallback environment typed-cli)
+    set(cache_log "${test_root}/cache-${cache_source}.log")
+    set(cache_env)
+    set(cache_cli)
+    set(expected_cache "${TEST_IM2P_ROOT}/build")
+    if(NOT cache_source STREQUAL "fallback")
+        set(expected_cache "${test_root}/cache-${cache_source}")
+        list(APPEND cache_env "IM2P_SIM_BUILD_DIR=${expected_cache}")
+    endif()
+    if(cache_source STREQUAL "typed-cli")
+        set(expected_cache "${test_root}/cache-cli-selected")
+        list(APPEND cache_cli "-DIM2P_SIM_BUILD_DIR:PATH=${expected_cache}")
+    endif()
+    execute_process(COMMAND "${CMAKE_COMMAND}" -E env
+        "PATH=${test_root}/bin:$ENV{PATH}" "CONTRACT_LOG=${cache_log}"
+        "BUILD_DIR=${test_root}/cache-${cache_source}-build" "BUILD_JOBS=1"
+        "IM2P_SIM_ROOT=${TEST_IM2P_ROOT}"
+        "GGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM"
+        ${cache_env} bash "${TEST_SOURCE_DIR}/build-x86.sh" ${cache_cli}
+        WORKING_DIRECTORY "${TEST_SOURCE_DIR}"
+        RESULT_VARIABLE cache_rc OUTPUT_VARIABLE cache_out ERROR_VARIABLE cache_err)
+    if(NOT cache_rc EQUAL 0)
+        message(FATAL_ERROR "Cache ${cache_source} failed: ${cache_out}\n${cache_err}")
+    endif()
+    file(READ "${cache_log}" cache_commands)
+    set(cache_cmake_type "")
+    if(cache_source STREQUAL "typed-cli")
+        set(cache_cmake_type ":PATH")
+    endif()
+    foreach(required IN ITEMS " BUILD_DIR=${expected_cache} " "-DIM2P_SIM_BUILD_DIR${cache_cmake_type}=${expected_cache}")
+        string(FIND "${cache_commands}" "${required}" cache_at)
+        if(cache_at EQUAL -1)
+            message(FATAL_ERROR "Make/configure cache mismatch (${cache_source}): ${cache_commands}")
+        endif()
+    endforeach()
+    if(NOT cache_source STREQUAL "fallback" AND cache_commands MATCHES " BUILD_DIR=${TEST_IM2P_ROOT}/build ")
+        message(FATAL_ERROR "Explicit cache must never write the sibling build cache")
+    endif()
+endforeach()
+
+# A reused host build directory must not override the ARM64 script defaults.
 set(stale_root "${test_root}/arm64-stale-cache")
 file(MAKE_DIRECTORY "${stale_root}")
 file(WRITE "${stale_root}/CMakeCache.txt"
-    "GGML_GEMMINI_OPTION:STRING=CPU\n"
-    "GGML_GEMMINI_EXECUTION_BACKEND:STRING=HARDWARE\n"
+    "GGML_GEMMINI:BOOL=ON\n"
+    "GGML_GEMMINI_OPTION:STRING=WS\n"
+    "GGML_GEMMINI_EXECUTION_BACKEND:STRING=IM2P_SIM\n"
     "CMAKE_TOOLCHAIN_FILE:FILEPATH=/stale/toolchain.cmake\n"
     "CMAKE_PREFIX_PATH:PATH=/stale/prefix\n"
     "OpenMP_ROOT:PATH=/stale/openmp\n"
     "CMAKE_BUILD_TYPE:STRING=Debug\n"
-    "GGML_GEMMINI_DEFAULT_RMD_BACKEND:STRING=CPU\n"
+    "GGML_GEMMINI_DEFAULT_RMD_BACKEND:STRING=WS\n"
     "GGML_GEMMINI_ENABLE_RMD:BOOL=OFF\n"
-    "LOG_DEBUG:STRING=0\n"
-    "LOG_CYCLE:STRING=0\n")
+    "LOG_DEBUG:STRING=1\n"
+    "LOG_CYCLE:STRING=1\n")
 set(stale_log "${test_root}/build-arm64-stale-cache.log")
 execute_process(
     COMMAND "${CMAKE_COMMAND}" -E env
@@ -177,9 +376,12 @@ execute_process(
     ERROR_VARIABLE stale_stderr)
 if(NOT stale_rc EQUAL 0)
     message(FATAL_ERROR
-        "build-arm64.sh stale CPU/HARDWARE cache recovery failed:\n${stale_stdout}\n${stale_stderr}")
+        "build-arm64.sh stale simulator cache recovery failed:\n${stale_stdout}\n${stale_stderr}")
 endif()
 file(READ "${stale_log}" stale_commands)
+if(stale_commands MATCHES "(^|\n)make:")
+    message(FATAL_ERROR "build-arm64.sh defaults must not provision a stale simulator cache")
+endif()
 foreach(stale_arg IN ITEMS
         "-U GGML_*"
         "-U IM2P_*"
@@ -190,15 +392,15 @@ foreach(stale_arg IN ITEMS
         "-U CMAKE_TOOLCHAIN_FILE"
         "-U CMAKE_PREFIX_PATH"
         "-U OpenMP_ROOT"
-        "-DGGML_GEMMINI_OPTION=WS"
-        "-DGGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM"
-        "-DIM2P_SIM_IMPLEMENTATION=GEMMINI_HP1"
+        "-DGGML_GEMMINI=OFF"
+        "-DGGML_GEMMINI_OPTION=CPU"
+        "-DGGML_GEMMINI_EXECUTION_BACKEND=HARDWARE"
+        "-DIM2P_SIM_IMPLEMENTATION="
         "-DCMAKE_BUILD_TYPE=Release"
-        "-DGGML_GEMMINI_DEFAULT_RMD_BACKEND=WS"
+        "-DGGML_GEMMINI_DEFAULT_RMD_BACKEND=CPU"
         "-DGGML_GEMMINI_ENABLE_RMD=ON"
-        "-DLOG_DEBUG=1"
-        "-DLOG_CYCLE=1"
-        "IM2P_SIM_IMPLEMENTATION=GEMMINI_HP1")
+        "-DLOG_DEBUG=0"
+        "-DLOG_CYCLE=0")
     string(FIND "${stale_commands}" "${stale_arg}" stale_arg_at)
     if(stale_arg_at EQUAL -1)
         message(FATAL_ERROR
@@ -214,6 +416,7 @@ execute_process(
         "BUILD_JOBS=1"
         "IM2P_CACHE_JOBS=0"
         "IM2P_SIM_ROOT=${TEST_IM2P_ROOT}"
+        "GGML_GEMMINI=ON"
         "GGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM"
         "GGML_GEMMINI_OPTION=WS"
         bash "${TEST_SOURCE_DIR}/build-x86.sh"
@@ -258,9 +461,9 @@ if(NOT direct_cargo_at EQUAL -1)
     message(FATAL_ERROR "Host provisioning must delegate to Make, not Cargo")
 endif()
 
-file(READ "${TEST_SOURCE_DIR}/CMakeLists.txt" root_cmake)
+file(READ "${TEST_SOURCE_DIR}/cmake/ggml-gemmini-im2p.cmake" root_cmake)
 string(FIND "${root_cmake}"
-    [=[/build/selected/${IM2P_SIM_IMPLEMENTATION}/${GGML_GEMMINI_IM2P_ARTIFACT_ID}/current]=]
+    [=[${_GGML_GEMMINI_IM2P_BUILD_DIR}/selected/${IM2P_SIM_IMPLEMENTATION}/${GGML_GEMMINI_IM2P_ARTIFACT_ID}/current]=]
     manifest_at)
 string(FIND "${root_cmake}"
     [=[GGML_GEMMINI_IM2P_GENERATION]=] generation_at)
@@ -272,7 +475,7 @@ string(FIND "${root_cmake}"
     [=[COMMAND "${Python3_EXECUTABLE}"]=] verify_command_at)
 string(FIND "${root_cmake}" "COMMAND python3" bare_python_at)
 string(FIND "${root_cmake}"
-    "try_run(_GGML_GEMMINI_IM2P_PROBE_RESULT" first_probe_at)
+    "try_run(_GGML_GEMMINI_IM2P_PAIR_PROBE_RESULT" first_probe_at)
 if(manifest_at EQUAL -1 OR generation_at EQUAL -1 OR realpath_at EQUAL -1 OR
    verifier_at EQUAL -1 OR
    python_find_at EQUAL -1 OR verify_command_at EQUAL -1 OR
@@ -298,7 +501,8 @@ foreach(expected_verifier_arg IN ITEMS
 endforeach()
 string(FIND "${root_cmake}" "im2p_sim_implementation()" simulator_implementation_at)
 string(FIND "${root_cmake}" "gemmini-hp1-integrated-v1" hp1_implementation_at)
-string(FIND "${root_cmake}" "IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1=1" simulator_hp1_define_at)
+file(READ "${TEST_SOURCE_DIR}/cmake/ggml-gemmini-config.cmake" config_cmake)
+string(FIND "${config_cmake}" "IM2P_SIM_IMPLEMENTATION_GEMMINI_HP1=1" simulator_hp1_define_at)
 if(simulator_implementation_at EQUAL -1 OR hp1_implementation_at EQUAL -1)
     message(FATAL_ERROR "CMake must validate selected IM2P simulator implementation identity")
 endif()

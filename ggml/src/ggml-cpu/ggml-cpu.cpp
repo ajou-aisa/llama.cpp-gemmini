@@ -417,7 +417,6 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     switch (op->op) {
         case GGML_OP_CPY:
             return
-                op->type != GGML_TYPE_Q4_H1   &&
                 op->type != GGML_TYPE_Q4_HP1  &&
                 op->type != GGML_TYPE_Q8_HP1  &&
                 op->type != GGML_TYPE_Q8_HP2  &&
@@ -432,9 +431,7 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 op->type != GGML_TYPE_IQ1_S   &&
                 op->type != GGML_TYPE_IQ1_M; // missing type_traits.from_float
         case GGML_OP_MUL_MAT:
-            return src0->type != GGML_TYPE_Q4_H1  &&
-                   src0->type != GGML_TYPE_Q4_HP1 &&
-                   src0->type != GGML_TYPE_Q8_H1  &&
+            return src0->type != GGML_TYPE_Q4_HP1 &&
                    src0->type != GGML_TYPE_Q8_H2  &&
                    src0->type != GGML_TYPE_Q8_HP1 &&
                    src0->type != GGML_TYPE_Q8_HP2 &&

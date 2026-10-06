@@ -277,8 +277,16 @@ are not admitted by any runner):
 | `scripts/eval/metric_sweep.py` | run_measurement.py metric all | `metrics-all` (FULL), one per precision x DIM shared by both models; with `--collection separate` `activation`, `residual`, `scu` each | none of its own: `--precisions`, `--dims` select the `llama_plan()` profiles | from campaign_build.py | `--build-cache/<kind>-<identity>` (`cached_llama_build`), linked from `<sweep>/builds/`; passed to `campaign.py --prepared-build` | ACTIVE |
 | `scripts/eval/cycle_trace_capture.py` | run_cycle_trace_capture.sh | `cycle` (STRIPE_PIPELINE) | none of its own | from campaign_build.py | `<config>/build` or `--prepared-build` | CERTIFICATION_ONLY |
 | `scripts/eval/campaign_cycle.py` | campaign.py cycle | `cycle-model` | `CYCLE_MODEL_OPTIONS` | from campaign_build.py | `<output>/cycle-library-build` | CERTIFICATION_ONLY (legacy adapter) |
-| build-arm64.sh, build-arm64-cpu.sh, build-arm64-fpga-uart.sh, build-x86.sh, build-riscv.sh | developer | none (developer builds, not a measurement kind) | own environment defaults resolved by `scripts/im2p-build-options.py`; they differ from every measurement profile (backend, DIM, bits, OpenMP, runtime matmul override) | host and toolchain specific (native flags, OpenMP, cross toolchain) | `build-arm64/`, `build-arm64-cpu/`, `build-arm64-fpga-uart/`, `build-x86/`, `build-riscv[-static]/`; no receipt | DEBUG/RESEARCH (never admitted by a runner) |
+| build-arm64.sh, build-arm64-cpu.sh, build-x86.sh, build-riscv.sh | developer | none (developer builds, not a measurement kind) | own environment defaults resolved by `scripts/im2p-build-options.py`; they differ from every measurement profile (backend, DIM, bits, OpenMP, runtime matmul override) | host and toolchain specific (native flags, OpenMP, cross toolchain) | `build-arm64/`, `build-arm64-cpu/`, `build-x86/`, `build-riscv[-static]/`; no receipt | DEBUG/RESEARCH (never admitted by a runner) |
+
 <!-- END GENERATED build-scripts -->
+
+FPGA support and its dedicated wrapper are retired. `build-x86.sh` now declares
+`IM2P_SIM` + `GEMMINI_HP1`, WS, A8/W8/D16, RMD ON with WS residuals, and
+`STRIPE_PIPELINE` as its visible defaults.
+
+See [Gemmini developer builds](../../docs/build.md#gemmini-developer-builds) for
+wrapper precedence, resolved SDK paths, component lifetimes, and focused tests.
 
 ## Outputs
 
@@ -453,7 +461,7 @@ exactly where the scheduler placed them.
 | `cycle_campaign_bundle.py` | CERTIFICATION_ONLY | evaluation-cycle campaign bundle | user |
 | `actual_cycle_bundle.py` | CERTIFICATION_ONLY | actual-cycle campaign bundle | user |
 | `cycle_accounting.py` | CERTIFICATION_ONLY | cycle accounting definitions | cycle_campaign.py |
-| build-arm64.sh, build-arm64-cpu.sh, build-arm64-fpga-uart.sh, build-x86.sh, build-riscv.sh | DEBUG/RESEARCH | developer builds with their own option defaults; never a measurement build | developer |
+| build-arm64.sh, build-arm64-cpu.sh, build-x86.sh, build-riscv.sh | DEBUG/RESEARCH | developer builds with their own option defaults; never a measurement build | developer |
 | scripts/experiment/, scripts/utils/ | DEBUG/RESEARCH | cycle matrix experiments and log rendering helpers | developer |
 | evaluation/ (python -m evaluation) | INTERNAL | ACT/RES/SCU reducers, schemas and manifest type | campaign_metrics.py, metric_run.py |
 <!-- END GENERATED scripts -->

@@ -17,13 +17,13 @@
 namespace {
 
 namespace wreader = ggml::gemmini::quants::wreader;
-namespace wroute = ggml::gemmini::quants::wroute;
+namespace wroute  = ggml::gemmini::quants::wroute;
 
-using Format = ggml_gemmini_args_t::im2p_weight_format_t;
+using Format       = ggml_gemmini_args_t::im2p_weight_format_t;
 using ReaderStatus = wreader::WeightReaderStatus;
-using Route = wroute::WeightRouteKind;
-using RouteStatus = wroute::WeightRouteStatus;
-using ScaleDomain = wroute::WeightScaleDomain;
+using Route        = wroute::WeightRouteKind;
+using RouteStatus  = wroute::WeightRouteStatus;
+using ScaleDomain  = wroute::WeightScaleDomain;
 
 bool check(bool condition, const char * message) {
     if (!condition) {
@@ -41,27 +41,26 @@ float max_abs_error(const std::vector<float> & lhs, const std::vector<float> & r
 }
 
 bool round_trip(enum ggml_type type, float error_limit) {
-    constexpr int64_t rows = 2;
-    constexpr int64_t columns = 64;
+    constexpr int64_t  rows    = 2;
+    constexpr int64_t  columns = 64;
     std::vector<float> source(rows * columns);
     for (int64_t i = 0; i < rows * columns; ++i) {
         source[i] = std::sin(static_cast<float>(i) * 0.17f) * 9.0f +
                     std::cos(static_cast<float>(i) * 0.031f);
     }
-    source[0] = 0.0f;
+    source[0]  = 0.0f;
     source[17] = -12.0f;
     source[63] = 11.5f;
 
-    const size_t row_size = ggml_row_size(type, columns);
+    const size_t         row_size = ggml_row_size(type, columns);
     std::vector<uint8_t> quantized(rows * row_size);
-    const size_t written = ggml_quantize_chunk(
-        type, source.data(), quantized.data(), 0, rows, columns, nullptr);
+    const size_t         written =
+        ggml_quantize_chunk(type, source.data(), quantized.data(), 0, rows, columns, nullptr);
     if (!check(written == quantized.size(), "quantized byte count mismatch")) {
         return false;
     }
-    if (!check(
-            ggml_validate_row_data(type, quantized.data(), quantized.size()),
-            "quantized row validation failed")) {
+    if (!check(ggml_validate_row_data(type, quantized.data(), quantized.size()),
+               "quantized row validation failed")) {
         return false;
     }
 
@@ -73,14 +72,11 @@ bool round_trip(enum ggml_type type, float error_limit) {
     std::vector<float> decoded(source.size());
     for (int64_t row = 0; row < rows; ++row) {
         traits->to_float(
-            quantized.data() + row * row_size,
-            decoded.data() + row * columns,
-            columns);
+            quantized.data() + row * row_size, decoded.data() + row * columns, columns);
     }
 
-    return check(
-        max_abs_error(source, decoded) <= error_limit,
-        "round-trip error exceeded format limit");
+    return check(max_abs_error(source, decoded) <= error_limit,
+                 "round-trip error exceeded format limit");
 }
 
 enum class Family : uint8_t {
@@ -91,121 +87,96 @@ enum class Family : uint8_t {
 
 struct ReaderFixture {
     ggml_gemmini_args_t args{};
-    block_q4_h0 q4_h0{};
-    block_q4_h1 q4_h1{};
-    block_q4_hp1 q4_hp1{};
-    block_q8_0 q8_h0{};
-    block_q8_h1 q8_h1{};
-    block_q8_hp1 q8_hp1{};
-    block_q16_h0 q16_h0{};
-    block_q16_h1 q16_h1{};
-    block_q16_hp1 q16_hp1{};
+    block_q4_h0         q4_h0{};
+    block_q4_hp1        q4_hp1{};
+    block_q8_0          q8_h0{};
+    block_q8_hp1        q8_hp1{};
+    block_q16_h0        q16_h0{};
+    block_q16_h1        q16_h1{};
+    block_q16_hp1       q16_hp1{};
 
     ReaderFixture(uint8_t bits, Family family) {
-        args.J = 1;
-        args.K = 32;
-        args.block_size_k = 32;
-        args.native_block_count = 1;
+        args.J                     = 1;
+        args.K                     = 32;
+        args.block_size_k          = 32;
+        args.native_block_count    = 1;
         args.native_blocks_per_row = 1;
 
         std::fill(std::begin(q4_h0.qs), std::end(q4_h0.qs), uint8_t{0x88});
-        std::fill(std::begin(q4_h1.qs), std::end(q4_h1.qs), uint8_t{0x88});
         std::fill(std::begin(q4_hp1.qs), std::end(q4_hp1.qs), uint8_t{0x88});
-        q4_h0.qs[0] = 0x80;
-        q4_h1.qs[0] = 0x80;
-        q4_hp1.qs[0] = 0x80;
-        q4_h0.qs[15] = 0xf1;
-        q4_h1.qs[15] = 0xf1;
+        q4_h0.qs[0]   = 0x80;
+        q4_hp1.qs[0]  = 0x80;
+        q4_h0.qs[15]  = 0xf1;
         q4_hp1.qs[15] = 0xf1;
 
-        q8_h0.qs[0] = std::numeric_limits<int8_t>::min();
-        q8_h0.qs[16] = 0;
-        q8_h0.qs[31] = std::numeric_limits<int8_t>::max();
-        q8_h1.qs[0] = std::numeric_limits<int8_t>::min();
-        q8_h1.qs[16] = 0;
-        q8_h1.qs[31] = std::numeric_limits<int8_t>::max();
-        q8_hp1.qs[0] = std::numeric_limits<int8_t>::min();
+        q8_h0.qs[0]   = std::numeric_limits<int8_t>::min();
+        q8_h0.qs[16]  = 0;
+        q8_h0.qs[31]  = std::numeric_limits<int8_t>::max();
+        q8_hp1.qs[0]  = std::numeric_limits<int8_t>::min();
         q8_hp1.qs[16] = 0;
         q8_hp1.qs[31] = std::numeric_limits<int8_t>::max();
 
-        q16_h0.qs[0] = std::numeric_limits<int16_t>::min();
-        q16_h0.qs[16] = 0;
-        q16_h0.qs[31] = std::numeric_limits<int16_t>::max();
-        q16_h1.qs[0] = std::numeric_limits<int16_t>::min();
-        q16_h1.qs[16] = 0;
-        q16_h1.qs[31] = std::numeric_limits<int16_t>::max();
-        q16_hp1.qs[0] = std::numeric_limits<int16_t>::min();
+        q16_h0.qs[0]   = std::numeric_limits<int16_t>::min();
+        q16_h0.qs[16]  = 0;
+        q16_h0.qs[31]  = std::numeric_limits<int16_t>::max();
+        q16_h1.qs[0]   = std::numeric_limits<int16_t>::min();
+        q16_h1.qs[16]  = 0;
+        q16_h1.qs[31]  = std::numeric_limits<int16_t>::max();
+        q16_hp1.qs[0]  = std::numeric_limits<int16_t>::min();
         q16_hp1.qs[16] = 0;
         q16_hp1.qs[31] = std::numeric_limits<int16_t>::max();
 
-        q4_h0.d = ggml_fp32_to_fp16(0.375f);
-        q8_h0.d = ggml_fp32_to_fp16(0.375f);
+        q4_h0.d  = ggml_fp32_to_fp16(0.375f);
+        q8_h0.d  = ggml_fp32_to_fp16(0.375f);
         q16_h0.d = ggml_fp32_to_fp16(0.375f);
 
-        q4_h1.c_b = 3;
-        q4_h1.R = 4;
-        q4_h1.s_rf = 0.25f;
-        q8_h1.c_b = 3;
-        q8_h1.R = 4;
-        q8_h1.s_rf = 0.25f;
-        q16_h1.c_b = 3;
-        q16_h1.R = 4;
+        q16_h1.c_b  = 3;
+        q16_h1.R    = 4;
         q16_h1.s_rf = 0.25f;
 
-        q4_hp1.m = 3;
-        q4_hp1.channel_scale = 0.5f;
-        q8_hp1.m = 3;
-        q8_hp1.channel_scale = 0.5f;
-        q16_hp1.m = 3;
+        q4_hp1.m              = 3;
+        q4_hp1.channel_scale  = 0.5f;
+        q8_hp1.m              = 3;
+        q8_hp1.channel_scale  = 0.5f;
+        q16_hp1.m             = 3;
         q16_hp1.channel_scale = 0.5f;
 
         if (bits == 4) {
             if (family == Family::H0) {
-                args.weight_format = Format::q4_h0;
-                args.q4_h0_blocks = &q4_h0;
+                args.weight_format       = Format::q4_h0;
+                args.q4_h0_blocks        = &q4_h0;
                 args.native_weight_bytes = sizeof(q4_h0);
-            } else if (family == Family::H1) {
-                args.weight_format = Format::q4_h1;
-                args.q4_h1_blocks = &q4_h1;
-                args.native_weight_bytes = sizeof(q4_h1);
             } else {
-                args.weight_format = Format::q4_hp1;
-                args.q4_hp1_blocks = &q4_hp1;
+                args.weight_format       = Format::q4_hp1;
+                args.q4_hp1_blocks       = &q4_hp1;
                 args.native_weight_bytes = sizeof(q4_hp1);
             }
         } else if (bits == 8) {
             if (family == Family::H0) {
-                args.weight_format = Format::q8_h0;
-                args.B_blocks = &q8_h0;
-                args.blocks_J = 1;
-                args.blocks_K = 1;
+                args.weight_format       = Format::q8_h0;
+                args.B_blocks            = &q8_h0;
+                args.blocks_J            = 1;
+                args.blocks_K            = 1;
                 args.native_weight_bytes = sizeof(q8_h0);
-            } else if (family == Family::H1) {
-                args.weight_format = Format::q8_h1;
-                args.q8_h1_blocks = &q8_h1;
-                args.q8_h1_block_count = 1;
-                args.q8_h1_rows = 1;
-                args.blocks_per_row = 1;
-                args.native_weight_bytes = sizeof(q8_h1);
             } else {
-                args.weight_format = Format::q8_hp1;
-                args.q8_hp1_blocks = &q8_hp1;
-                args.q8_hp1_block_count = 1;
+                args.weight_format         = Format::q8_hp1;
+                args.q8_hp1_blocks         = &q8_hp1;
+                args.q8_hp1_block_count    = 1;
                 args.q8_hp1_blocks_per_row = 1;
-                args.native_weight_bytes = sizeof(q8_hp1);
+                args.native_weight_bytes   = sizeof(q8_hp1);
             }
         } else {
             if (family == Family::H0) {
-                args.weight_format = Format::q16_h0;
-                args.q16_h0_blocks = &q16_h0;
+                args.weight_format       = Format::q16_h0;
+                args.q16_h0_blocks       = &q16_h0;
                 args.native_weight_bytes = sizeof(q16_h0);
             } else if (family == Family::H1) {
-                args.weight_format = Format::q16_h1;
-                args.q16_h1_blocks = &q16_h1;
+                args.weight_format       = Format::q16_h1;
+                args.q16_h1_blocks       = &q16_h1;
                 args.native_weight_bytes = sizeof(q16_h1);
             } else {
-                args.weight_format = Format::q16_hp1;
-                args.q16_hp1_blocks = &q16_hp1;
+                args.weight_format       = Format::q16_hp1;
+                args.q16_hp1_blocks      = &q16_hp1;
                 args.native_weight_bytes = sizeof(q16_hp1);
             }
         }
@@ -217,36 +188,57 @@ struct ReaderFixture {
 };
 
 struct HappyCase {
-    uint8_t bits;
-    Family family;
-    Route route;
+    uint8_t     bits;
+    Family      family;
+    Route       route;
     ScaleDomain scale_domain;
-    int32_t minimum;
-    int32_t maximum;
-    uint64_t integer_scale;
-    float column_scale;
-    float floating_scale;
+    int32_t     minimum;
+    int32_t     maximum;
+    uint64_t    integer_scale;
+    float       column_scale;
+    float       floating_scale;
 };
 
 bool test_reader_happy_table() {
-    constexpr std::array<HappyCase, 9> cases = {{
-        {4,  Family::H0,  Route::H0,  ScaleDomain::FloatingBlock,            -8,     7, 1, 1.0f, 0.375f},
-        {4,  Family::H1,  Route::H1,  ScaleDomain::IntegerBlockTimesColumn,  -8,     7, 7, 0.25f, 1.0f},
-        {4,  Family::HP1, Route::HP1, ScaleDomain::IntegerBlockTimesColumn,  -8,     7, 8, 0.5f,  1.0f},
-        {8,  Family::H0,  Route::H0,  ScaleDomain::FloatingBlock,          -128,   127, 1, 1.0f, 0.375f},
-        {8,  Family::H1,  Route::H1,  ScaleDomain::IntegerBlockTimesColumn,-128,   127, 7, 0.25f, 1.0f},
-        {8,  Family::HP1, Route::HP1, ScaleDomain::IntegerBlockTimesColumn,-128,   127, 8, 0.5f,  1.0f},
-        {16, Family::H0,  Route::H0,  ScaleDomain::FloatingBlock,        -32768, 32767, 1, 1.0f, 0.375f},
-        {16, Family::H1,  Route::H1,  ScaleDomain::IntegerBlockTimesColumn,-32768, 32767, 7, 0.25f, 1.0f},
-        {16, Family::HP1, Route::HP1, ScaleDomain::IntegerBlockTimesColumn,-32768, 32767, 8, 0.5f,  1.0f},
+    constexpr std::array<HappyCase, 7> cases = {{
+        {4, Family::H0, Route::H0, ScaleDomain::FloatingBlock, -8, 7, 1, 1.0f, 0.375f},
+        {4, Family::HP1, Route::HP1, ScaleDomain::IntegerBlockTimesColumn, -8, 7, 8, 0.5f, 1.0f},
+        {8, Family::H0, Route::H0, ScaleDomain::FloatingBlock, -128, 127, 1, 1.0f, 0.375f},
+        {8,
+         Family::HP1,
+         Route::HP1,
+         ScaleDomain::IntegerBlockTimesColumn,
+         -128,
+         127,
+         8,
+         0.5f,
+         1.0f},
+        {16, Family::H0, Route::H0, ScaleDomain::FloatingBlock, -32768, 32767, 1, 1.0f, 0.375f},
+        {16,
+         Family::H1,
+         Route::H1,
+         ScaleDomain::IntegerBlockTimesColumn,
+         -32768,
+         32767,
+         7,
+         0.25f,
+         1.0f},
+        {16,
+         Family::HP1,
+         Route::HP1,
+         ScaleDomain::IntegerBlockTimesColumn,
+         -32768,
+         32767,
+         8,
+         0.5f,
+         1.0f},
     }};
 
     bool ok = true;
     for (const HappyCase & test : cases) {
-        ReaderFixture fixture(test.bits, test.family);
+        ReaderFixture                 fixture(test.bits, test.family);
         const wroute::WeightRoutePlan plan = fixture.resolve();
-        if (!check(plan.valid && plan.status == RouteStatus::Success,
-                   "happy route resolves") ||
+        if (!check(plan.valid && plan.status == RouteStatus::Success, "happy route resolves") ||
             !check(plan.route == test.route, "route family is width-independent") ||
             !check(plan.weight_bits == test.bits, "route records explicit weight width") ||
             !check(plan.scale_domain == test.scale_domain, "route records scale domain") ||
@@ -257,42 +249,48 @@ bool test_reader_happy_table() {
             continue;
         }
 
-        const std::array<size_t, 3> positions = {0, 16, 31};
-        const std::array<int32_t, 3> expected = {test.minimum, 0, test.maximum};
+        const std::array<size_t, 3>  positions = {0, 16, 31};
+        const std::array<int32_t, 3> expected  = {test.minimum, 0, test.maximum};
         for (size_t i = 0; i < positions.size(); ++i) {
             const wreader::WeightCodeResult code =
                 wreader::read_code(fixture.args, plan, 0, positions[i]);
             ok = check(code.status == ReaderStatus::Success && code.value == expected[i],
-                       "signed min/zero/max code decodes") && ok;
+                       "signed min/zero/max code decodes") &&
+                 ok;
         }
         if (test.bits == 4) {
             const wreader::WeightCodeResult split_half_low =
                 wreader::read_code(fixture.args, plan, 0, 15);
-            ok = check(
-                split_half_low.status == ReaderStatus::Success &&
-                    split_half_low.value == -7,
-                "Q4 split-half low nibble decodes logical K=15") && ok;
+            ok = check(split_half_low.status == ReaderStatus::Success && split_half_low.value == -7,
+                       "Q4 split-half low nibble decodes logical K=15") &&
+                 ok;
         }
 
-        const wreader::WeightScaleResult scale =
-            wreader::read_scale(fixture.args, plan, 0, 0);
+        const wreader::WeightScaleResult scale = wreader::read_scale(fixture.args, plan, 0, 0);
         ok = check(scale.status == ReaderStatus::Success, "scale metadata reads") && ok;
         ok = check(scale.domain == test.scale_domain, "reader preserves scale domain") && ok;
         ok = check(scale.integer_block_scale == test.integer_scale,
-                   "integer block factor matches fixture") && ok;
-        ok = check(scale.column_scale == test.column_scale,
-                   "column float factor matches fixture") && ok;
+                   "integer block factor matches fixture") &&
+             ok;
+        ok =
+            check(scale.column_scale == test.column_scale, "column float factor matches fixture") &&
+            ok;
         ok = check(scale.floating_block_scale == test.floating_scale,
-                   "floating block scale matches fixture") && ok;
+                   "floating block scale matches fixture") &&
+             ok;
 
-        const float expected_effective = test.scale_domain == ScaleDomain::FloatingBlock ?
-            test.floating_scale : static_cast<float>(test.integer_scale) * test.column_scale;
+        const float expected_effective =
+            test.scale_domain == ScaleDomain::FloatingBlock
+                ? test.floating_scale
+                : static_cast<float>(test.integer_scale) * test.column_scale;
         ok = check(wroute::route_weight_scale(plan, fixture.args, 0, 0) == expected_effective,
-                   "effective scale matches independent factorization") && ok;
-        ok = check(
-            wroute::weight_route_status(plan, wroute::WeightExecutionPath::Compact) ==
-                (test.family == Family::H0 ? RouteStatus::UnsupportedExecution : RouteStatus::Success),
-            "family exposes the expected compact capability") && ok;
+                   "effective scale matches independent factorization") &&
+             ok;
+        ok = check(wroute::weight_route_status(plan, wroute::WeightExecutionPath::Compact) ==
+                       (test.family == Family::H0 ? RouteStatus::UnsupportedExecution
+                                                  : RouteStatus::Success),
+                   "family exposes the expected compact capability") &&
+             ok;
     }
     return ok;
 }
@@ -300,8 +298,7 @@ bool test_reader_happy_table() {
 bool test_q4_h0_matches_canonical_dequantization() {
     ReaderFixture fixture(4, Family::H0);
     for (size_t i = 0; i < std::size(fixture.q4_h0.qs); ++i) {
-        fixture.q4_h0.qs[i] =
-            static_cast<uint8_t>(i | ((15 - i) << 4));
+        fixture.q4_h0.qs[i] = static_cast<uint8_t>(i | ((15 - i) << 4));
     }
 
     std::array<float, QK4_0> canonical{};
@@ -315,17 +312,13 @@ bool test_q4_h0_matches_canonical_dequantization() {
 
     bool ok = true;
     for (size_t k = 0; k < canonical.size(); ++k) {
-        const wreader::WeightCodeResult code =
-            wreader::read_code(fixture.args, plan, 0, k);
-        const wreader::WeightScaleResult scale =
-            wreader::read_scale(fixture.args, plan, 0, 0);
-        const float decoded =
-            static_cast<float>(code.value) * scale.floating_block_scale;
-        ok = check(
-                 code.status == ReaderStatus::Success &&
-                     scale.status == ReaderStatus::Success &&
-                     decoded == canonical[k],
-                 "Q4_H0 reader matches canonical Q4_0 dequantization") && ok;
+        const wreader::WeightCodeResult  code  = wreader::read_code(fixture.args, plan, 0, k);
+        const wreader::WeightScaleResult scale = wreader::read_scale(fixture.args, plan, 0, 0);
+        const float decoded = static_cast<float>(code.value) * scale.floating_block_scale;
+        ok = check(code.status == ReaderStatus::Success && scale.status == ReaderStatus::Success &&
+                       decoded == canonical[k],
+                   "Q4_H0 reader matches canonical Q4_0 dequantization") &&
+             ok;
     }
     return ok;
 }
@@ -333,218 +326,140 @@ bool test_q4_h0_matches_canonical_dequantization() {
 bool test_reader_failure_table() {
     bool ok = true;
 
-    ReaderFixture missing_extent(8, Family::H1);
+    ReaderFixture missing_extent(16, Family::H1);
     missing_extent.args.native_weight_bytes = 0;
-    wroute::WeightRoutePlan plan = missing_extent.resolve();
+    wroute::WeightRoutePlan plan            = missing_extent.resolve();
     ok = check(!plan.valid && plan.status == RouteStatus::InvalidMetadata,
-               "zero native byte extent rejects before reader dispatch") && ok;
+               "zero native byte extent rejects before reader dispatch") &&
+         ok;
 
-    ReaderFixture truncated_q4(4, Family::H1);
-    truncated_q4.args.native_weight_bytes = sizeof(block_q4_h1) - 1;
-    plan = truncated_q4.resolve();
+    ReaderFixture truncated_q4(4, Family::HP1);
+    truncated_q4.args.native_weight_bytes = sizeof(block_q4_hp1) - 1;
+    plan                                  = truncated_q4.resolve();
     ok = check(!plan.valid && plan.status == RouteStatus::InvalidMetadata,
-               "truncated Q4 block is typed invalid metadata") && ok;
+               "truncated Q4 block is typed invalid metadata") &&
+         ok;
 
     ReaderFixture missing_q16_scale(16, Family::H1);
     missing_q16_scale.args.native_weight_bytes = offsetof(block_q16_h1, s_rf);
-    plan = missing_q16_scale.resolve();
+    plan                                       = missing_q16_scale.resolve();
     ok = check(!plan.valid && plan.status == RouteStatus::InvalidMetadata,
-               "Q16 block missing its scale is typed invalid metadata") && ok;
+               "Q16 block missing its scale is typed invalid metadata") &&
+         ok;
 
     ReaderFixture negative_hp1(8, Family::HP1);
     negative_hp1.q8_hp1.m = -1;
-    plan = negative_hp1.resolve();
-    ok = check(!plan.valid && plan.status == RouteStatus::InvalidMetadata,
-               "negative HP1 exponent is typed invalid metadata") && ok;
+    plan                  = negative_hp1.resolve();
+    ok                    = check(!plan.valid && plan.status == RouteStatus::InvalidMetadata,
+                                  "negative HP1 exponent is typed invalid metadata") &&
+                            ok;
 
     ReaderFixture overflowing_hp1(16, Family::HP1);
     overflowing_hp1.q16_hp1.m = 63;
-    plan = overflowing_hp1.resolve();
-    ok = check(!plan.valid && plan.status == RouteStatus::InvalidMetadata,
-               "overflowing HP1 exponent is typed invalid metadata") && ok;
+    plan                      = overflowing_hp1.resolve();
+    ok                        = check(!plan.valid && plan.status == RouteStatus::InvalidMetadata,
+                                      "overflowing HP1 exponent is typed invalid metadata") &&
+                                ok;
 
-    ReaderFixture bad_padding(4, Family::H1);
-    bad_padding.q4_h1.padding[0] = 1;
-    plan = bad_padding.resolve();
+    ReaderFixture bad_padding(16, Family::H1);
+    bad_padding.q16_h1.padding[0] = 1;
+    plan                          = bad_padding.resolve();
     ok = check(!plan.valid && plan.status == RouteStatus::InvalidMetadata,
-               "nonzero H1 padding is typed invalid metadata") && ok;
+               "nonzero H1 padding is typed invalid metadata") &&
+         ok;
 
     ReaderFixture missing_blocks(16, Family::H0);
     missing_blocks.args.q16_h0_blocks = nullptr;
-    plan = missing_blocks.resolve();
+    plan                              = missing_blocks.resolve();
     ok = check(!plan.valid && plan.status == RouteStatus::InvalidMetadata,
-               "missing native blocks are typed invalid metadata") && ok;
+               "missing native blocks are typed invalid metadata") &&
+         ok;
 
-    ReaderFixture nan_scale(8, Family::H1);
-    uint32_t nan_bits = 0x7fc00000u;
-    std::memcpy(&nan_scale.q8_h1.s_rf, &nan_bits, sizeof(nan_bits));
+    ReaderFixture nan_scale(16, Family::H1);
+    uint32_t      nan_bits = 0x7fc00000u;
+    std::memcpy(&nan_scale.q16_h1.s_rf, &nan_bits, sizeof(nan_bits));
     plan = nan_scale.resolve();
-    ok = check(!plan.valid && plan.status == RouteStatus::InvalidMetadata,
-               "non-finite H1 column scale is typed invalid metadata") && ok;
+    ok   = check(!plan.valid && plan.status == RouteStatus::InvalidMetadata,
+                 "non-finite H1 column scale is typed invalid metadata") &&
+           ok;
 
     ReaderFixture bounded_reader(4, Family::H0);
     plan = bounded_reader.resolve();
-    ok = check(wreader::read_code(bounded_reader.args, plan, 1, 0).status ==
-                   ReaderStatus::InvalidArguments &&
-               wreader::read_code(bounded_reader.args, plan, 0, 32).status ==
-                   ReaderStatus::InvalidArguments,
-               "reader rejects row and K bounds without touching storage") && ok;
+    ok   = check(wreader::read_code(bounded_reader.args, plan, 1, 0).status ==
+                         ReaderStatus::InvalidArguments &&
+                     wreader::read_code(bounded_reader.args, plan, 0, 32).status ==
+                         ReaderStatus::InvalidArguments,
+                 "reader rejects row and K bounds without touching storage") &&
+           ok;
 
     ReaderFixture overflow_shape(4, Family::H0);
-    overflow_shape.args.J = std::numeric_limits<size_t>::max();
-    overflow_shape.args.K = 64;
+    overflow_shape.args.J                     = std::numeric_limits<size_t>::max();
+    overflow_shape.args.K                     = 64;
     overflow_shape.args.native_blocks_per_row = 2;
-    overflow_shape.args.native_block_count = std::numeric_limits<size_t>::max();
-    overflow_shape.args.native_weight_bytes = 0;
-    plan = overflow_shape.resolve();
+    overflow_shape.args.native_block_count    = std::numeric_limits<size_t>::max();
+    overflow_shape.args.native_weight_bytes   = 0;
+    plan                                      = overflow_shape.resolve();
     ok = check(!plan.valid && plan.status == RouteStatus::InvalidMetadata,
-               "overflowing block geometry is typed invalid metadata") && ok;
+               "overflowing block geometry is typed invalid metadata") &&
+         ok;
 
     for (uint8_t bits : {uint8_t{4}, uint8_t{8}, uint8_t{16}}) {
         ReaderFixture h0(bits, Family::H0);
         plan = h0.resolve();
-        ok = check(
-            wroute::weight_route_status(plan, wroute::WeightExecutionPath::Compact) ==
-                RouteStatus::UnsupportedExecution,
-            "H0 compact request is typed unsupported") && ok;
+        ok   = check(wroute::weight_route_status(plan, wroute::WeightExecutionPath::Compact) ==
+                         RouteStatus::UnsupportedExecution,
+                     "H0 compact request is typed unsupported") &&
+               ok;
     }
 
-    block_q8_h2 h2{};
+    block_q8_h2         h2{};
     ggml_gemmini_args_t h2_args{};
-    h2_args.J = 1;
-    h2_args.K = 32;
-    h2_args.weight_format = Format::q8_h2;
-    h2_args.q8_h2_blocks = &h2;
-    h2_args.q8_h2_block_count = 1;
+    h2_args.J                    = 1;
+    h2_args.K                    = 32;
+    h2_args.weight_format        = Format::q8_h2;
+    h2_args.q8_h2_blocks         = &h2;
+    h2_args.q8_h2_block_count    = 1;
     h2_args.q8_h2_blocks_per_row = 1;
     plan = wroute::resolve_weight_route_plan(h2_args, wroute::WeightScaleInfoMode::Residual);
-    ok = check(!plan.valid && plan.status == RouteStatus::UnsupportedFormat,
-               "H2 is a typed unsupported family") && ok;
+    ok   = check(!plan.valid && plan.status == RouteStatus::UnsupportedFormat,
+                 "H2 is a typed unsupported family") &&
+           ok;
 
-    block_q8_hp2 hp2{};
+    block_q8_hp2        hp2{};
     ggml_gemmini_args_t hp2_args{};
-    hp2_args.J = 1;
-    hp2_args.K = 32;
-    hp2_args.weight_format = Format::q8_hp2;
-    hp2_args.q8_hp2_blocks = &hp2;
-    hp2_args.q8_hp2_block_count = 1;
+    hp2_args.J                     = 1;
+    hp2_args.K                     = 32;
+    hp2_args.weight_format         = Format::q8_hp2;
+    hp2_args.q8_hp2_blocks         = &hp2;
+    hp2_args.q8_hp2_block_count    = 1;
     hp2_args.q8_hp2_blocks_per_row = 1;
     plan = wroute::resolve_weight_route_plan(hp2_args, wroute::WeightScaleInfoMode::Residual);
-    ok = check(!plan.valid && plan.status == RouteStatus::UnsupportedFormat,
-               "HP2 is a typed unsupported family") && ok;
+    ok   = check(!plan.valid && plan.status == RouteStatus::UnsupportedFormat,
+                 "HP2 is a typed unsupported family") &&
+           ok;
 
-    return ok;
-}
-
-bool test_q4_h1_preserves_positive_q4_0_scale() {
-    block_q4_0 source{};
-    source.d = ggml_fp32_to_fp16(0.25f);
-    for (size_t i = 0; i < std::size(source.qs); ++i) {
-        source.qs[i] = static_cast<uint8_t>(i | ((15 - i) << 4));
-    }
-
-    block_q4_h1 converted{};
-    if (!check(
-            reprocess_row_q4_0_to_q4_h1_ref(&source, &converted, QK4_0),
-            "positive-scale Q4_0 block reprocessing succeeds")) {
-        return false;
-    }
-
-    std::array<float, QK4_0> canonical{};
-    std::array<float, QK4_0> reprocessed{};
-    dequantize_row_q4_0(&source, canonical.data(), QK4_0);
-    dequantize_row_q4_h1(&converted, reprocessed.data(), QK4_0);
-    return check(
-        std::memcmp(canonical.data(), reprocessed.data(), sizeof(canonical)) == 0,
-        "positive-scale Q4_0 values survive Q4_H1 reprocessing exactly");
-}
-
-bool test_q4_h1_flips_negative_q4_0_scale_codes() {
-    block_q4_0 source{};
-    source.d = ggml_fp32_to_fp16(-0.25f);
-    for (size_t i = 0; i < std::size(source.qs); ++i) {
-        source.qs[i] = static_cast<uint8_t>(i | ((15 - i) << 4));
-    }
-
-    block_q4_h1 converted{};
-    if (!check(
-            reprocess_row_q4_0_to_q4_h1_ref(&source, &converted, QK4_0),
-            "negative-scale Q4_0 block reprocessing succeeds")) {
-        return false;
-    }
-
-    std::array<float, QK4_0> canonical{};
-    std::array<float, QK4_0> reprocessed{};
-    dequantize_row_q4_0(&source, canonical.data(), QK4_0);
-    dequantize_row_q4_h1(&converted, reprocessed.data(), QK4_0);
-    bool ok = true;
-    for (size_t i = 0; i < canonical.size(); ++i) {
-        const uint8_t packed = source.qs[i % (QK4_0 / 2)];
-        const uint8_t code = i < QK4_0 / 2 ? packed & 0x0f : packed >> 4;
-        const float expected = code == 0 ? 1.75f : canonical[i];
-        ok = check(
-                 reprocessed[i] == expected,
-                 "negative-scale Q4_0 conversion changes only unrepresentable +8 code") &&
-             ok;
-    }
-    return ok;
-}
-
-bool test_q4_h1_narrow_scale_range_preserves_magnitude() {
-    constexpr int64_t columns = 64;
-    std::array<float, columns> source{};
-    for (int64_t i = 0; i < columns; ++i) {
-        const float block_max = i < 32 ? 1.0f : 1.001f;
-        source[i] = block_max * static_cast<float>((i % 17) - 8) / 8.0f;
-    }
-
-    std::array<block_q4_0, 2> canonical{};
-    quantize_row_q4_0_ref(source.data(), canonical.data(), columns);
-
-    std::array<block_q4_h1, 2> quantized{};
-    quantize_row_q4_h1_ref(source.data(), quantized.data(), columns);
-
-    bool ok = true;
-    for (size_t i = 0; i < quantized.size(); ++i) {
-        const float source_scale = ggml_fp16_to_fp32(canonical[i].d);
-        const float expected = std::fabs(source_scale);
-        const float actual =
-            quantized[i].s_rf * (static_cast<float>(quantized[i].R) + quantized[i].c_b);
-        if (!(std::fabs(actual - expected) <= expected * 0.01f)) {
-            std::fprintf(
-                stderr,
-                "FAIL: Q4_H1 narrow scale range collapsed: block=%zu expected=%g actual=%g R=%u\n",
-                i,
-                expected,
-                actual,
-                static_cast<unsigned>(quantized[i].R));
-            ok = false;
-        }
-    }
     return ok;
 }
 
 bool test_q4_hp1_power_of_two_scale_follows_paper_rule() {
-    constexpr int64_t columns = 32;
+    constexpr int64_t          columns = 32;
     std::array<float, columns> source{};
     for (int64_t i = 0; i < columns; ++i) {
         source[i] = static_cast<float>(i - 16) / 16.0f;
     }
 
     block_q4_hp1 quantized{};
-    if (!check(
-            quantize_row_q4_hp1_ref(source.data(), &quantized, columns),
-            "Q4_HP1 distributed-row quantization failed")) {
+    if (!check(quantize_row_q4_hp1_ref(source.data(), &quantized, columns),
+               "Q4_HP1 distributed-row quantization failed")) {
         return false;
     }
 
     // amax = 1: theta = ilogb(1) - 2 = -2, so the step is 1/4.
     if (!(quantized.channel_scale == 0.25f && quantized.m == 0)) {
-        std::fprintf(
-            stderr,
-            "FAIL: Q4_HP1 block scale is not 2^(ilogb(amax) - 2): scale=%g exponent=%d\n",
-            quantized.channel_scale,
-            static_cast<int>(quantized.m));
+        std::fprintf(stderr,
+                     "FAIL: Q4_HP1 block scale is not 2^(ilogb(amax) - 2): scale=%g exponent=%d\n",
+                     quantized.channel_scale,
+                     static_cast<int>(quantized.m));
         return false;
     }
 
@@ -554,13 +469,13 @@ bool test_q4_hp1_power_of_two_scale_follows_paper_rule() {
     for (int64_t i = 0; i < columns; ++i) {
         const float expected = std::round(source[i] * 4.0f) / 4.0f;
         if (decoded[i] != expected) {
-            std::fprintf(
-                stderr,
-                "FAIL: Q4_HP1 step-1/4 decode mismatch: index=%lld source=%g decoded=%g expected=%g\n",
-                static_cast<long long>(i),
-                source[i],
-                decoded[i],
-                expected);
+            std::fprintf(stderr,
+                         "FAIL: Q4_HP1 step-1/4 decode mismatch: index=%lld source=%g decoded=%g "
+                         "expected=%g\n",
+                         static_cast<long long>(i),
+                         source[i],
+                         decoded[i],
+                         expected);
             ok = false;
         }
     }
@@ -568,27 +483,26 @@ bool test_q4_hp1_power_of_two_scale_follows_paper_rule() {
 }
 
 bool test_q4_hp1_row_scale_follows_paper_rule() {
-    constexpr int64_t blocks = 4;
-    constexpr int64_t columns = blocks * QK4_HP;
+    constexpr int64_t          blocks  = 4;
+    constexpr int64_t          columns = blocks * QK4_HP;
     std::array<float, columns> source{};
     for (int64_t i = 0; i < QK4_HP; ++i) {
         source[i] = static_cast<float>(i - 16) / 16.0f;
     }
-    source[QK4_HP] = 8.0f;
-    source[QK4_HP + 1] = -3.0f;
-    source[2 * QK4_HP] = 1.2f;
+    source[QK4_HP]         = 8.0f;
+    source[QK4_HP + 1]     = -3.0f;
+    source[2 * QK4_HP]     = 1.2f;
     source[2 * QK4_HP + 1] = -0.6f;
 
     std::array<block_q4_hp1, blocks> quantized{};
-    if (!check(
-            quantize_row_q4_hp1_ref(source.data(), quantized.data(), columns),
-            "Q4_HP1 four-block row quantization failed")) {
+    if (!check(quantize_row_q4_hp1_ref(source.data(), quantized.data(), columns),
+               "Q4_HP1 four-block row quantization failed")) {
         return false;
     }
 
     // Block amax 1, 8, 1.2 give theta -2, 1, -2; the row keeps channel_scale 2^-2.
     const std::array<int, blocks> expected_m = {0, 3, 0, INT16_MIN};
-    bool ok = true;
+    bool                          ok         = true;
     for (int64_t b = 0; b < blocks; ++b) {
         float amax = 0.0f;
         for (int64_t j = 0; j < QK4_HP; ++j) {
@@ -597,16 +511,15 @@ bool test_q4_hp1_row_scale_follows_paper_rule() {
         bool block_ok = quantized[b].channel_scale == 0.25f && quantized[b].m == expected_m[b];
         if (amax > 0.0f) {
             const float steps = amax / std::ldexp(quantized[b].channel_scale, quantized[b].m);
-            block_ok = block_ok && steps >= 4.0f && steps < 8.0f;
+            block_ok          = block_ok && steps >= 4.0f && steps < 8.0f;
         }
         if (!block_ok) {
-            std::fprintf(
-                stderr,
-                "FAIL: Q4_HP1 row block %lld: scale=%g m=%d, expected scale=0.25 m=%d\n",
-                static_cast<long long>(b),
-                quantized[b].channel_scale,
-                static_cast<int>(quantized[b].m),
-                expected_m[b]);
+            std::fprintf(stderr,
+                         "FAIL: Q4_HP1 row block %lld: scale=%g m=%d, expected scale=0.25 m=%d\n",
+                         static_cast<long long>(b),
+                         quantized[b].channel_scale,
+                         static_cast<int>(quantized[b].m),
+                         expected_m[b]);
             ok = false;
         }
     }
@@ -614,29 +527,30 @@ bool test_q4_hp1_row_scale_follows_paper_rule() {
     std::array<float, columns> decoded{};
     dequantize_row_q4_hp1(quantized.data(), decoded.data(), columns);
     ok = check(decoded[0] == -1.0f && decoded[QK4_HP - 1] == 1.0f,
-               "Q4_HP1 block 0 ends do not decode to -1 and 1") && ok;
+               "Q4_HP1 block 0 ends do not decode to -1 and 1") &&
+         ok;
     ok = check(decoded[QK4_HP] == 8.0f, "Q4_HP1 8.0 does not decode to 8.0") && ok;
     ok = check(decoded[QK4_HP + 1] == -4.0f, "Q4_HP1 -3.0 does not decode to -4.0") && ok;
     ok = check(decoded[2 * QK4_HP] == 1.25f, "Q4_HP1 1.2 does not decode to 1.25") && ok;
-    ok = check(
-        std::all_of(decoded.begin() + 3 * QK4_HP, decoded.end(), [](float v) { return v == 0.0f; }),
-        "Q4_HP1 all-zero block does not decode to zero") && ok;
+    ok = check(std::all_of(
+                   decoded.begin() + 3 * QK4_HP, decoded.end(), [](float v) { return v == 0.0f; }),
+               "Q4_HP1 all-zero block does not decode to zero") &&
+         ok;
     return ok;
 }
 
 bool test_q4_hp1_equal_ilogb_blocks_share_exponent() {
-    constexpr int64_t columns = 2 * QK4_HP;
+    constexpr int64_t          columns = 2 * QK4_HP;
     std::array<float, columns> source{};
     for (int64_t j = 0; j < columns; ++j) {
         source[j] = 0.1f * static_cast<float>((j % 9) - 4);
     }
-    source[2] = 1.0f;
+    source[2]          = 1.0f;
     source[QK4_HP + 7] = -1.5f;
 
     std::array<block_q4_hp1, 2> quantized{};
-    if (!check(
-            quantize_row_q4_hp1_ref(source.data(), quantized.data(), columns),
-            "Q4_HP1 two-block row quantization failed")) {
+    if (!check(quantize_row_q4_hp1_ref(source.data(), quantized.data(), columns),
+               "Q4_HP1 two-block row quantization failed")) {
         return false;
     }
 
@@ -657,13 +571,13 @@ bool test_q4_hp1_equal_ilogb_blocks_share_exponent() {
 }
 
 bool test_q4_hp1_mantissa_sweep_follows_paper_rule() {
-    int cases = 0;
+    int cases    = 0;
     int failures = 0;
     for (int k = -12; k <= 12; ++k) {
         for (int i = 0; i < 1024; ++i) {
             ++cases;
-            const float mant = 1.0f + static_cast<float>(i) / 1024.0f;
-            const float amax = std::ldexp(mant, k);
+            const float               mant = 1.0f + static_cast<float>(i) / 1024.0f;
+            const float               amax = std::ldexp(mant, k);
             std::array<float, QK4_HP> source{};
             for (int j = 0; j < QK4_HP; ++j) {
                 source[j] = amax * 0.25f * static_cast<float>((j % 7) - 3) / 3.0f;
@@ -671,43 +585,41 @@ bool test_q4_hp1_mantissa_sweep_follows_paper_rule() {
             source[5] = amax;
 
             block_q4_hp1 quantized{};
-            const bool quantized_ok = quantize_row_q4_hp1_ref(source.data(), &quantized, QK4_HP);
+            const bool   quantized_ok = quantize_row_q4_hp1_ref(source.data(), &quantized, QK4_HP);
             // The block max is 4 * mant steps: exact below 7.5, saturated to code 7 above.
             const long expected_code = 4.0f * mant < 7.5f ? std::lround(4.0f * mant) : 7;
-            const int code = (quantized.qs[5] & 0x0F) - 8;
+            const int  code          = (quantized.qs[5] & 0x0F) - 8;
             if (!quantized_ok || std::ilogb(quantized.channel_scale) != std::ilogb(amax) - 2 ||
                 quantized.m != 0 || code != expected_code) {
                 if (failures < 4) {
-                    std::fprintf(
-                        stderr,
-                        "FAIL: Q4_HP1 mantissa sweep: amax=%g scale=%g m=%d code=%d expected_code=%ld\n",
-                        amax,
-                        quantized.channel_scale,
-                        static_cast<int>(quantized.m),
-                        code,
-                        expected_code);
+                    std::fprintf(stderr,
+                                 "FAIL: Q4_HP1 mantissa sweep: amax=%g scale=%g m=%d code=%d "
+                                 "expected_code=%ld\n",
+                                 amax,
+                                 quantized.channel_scale,
+                                 static_cast<int>(quantized.m),
+                                 code,
+                                 expected_code);
                 }
                 ++failures;
             }
         }
     }
     if (failures != 0) {
-        std::fprintf(stderr, "FAIL: Q4_HP1 mantissa sweep: %d of %d cases mismatch\n", failures, cases);
+        std::fprintf(
+            stderr, "FAIL: Q4_HP1 mantissa sweep: %d of %d cases mismatch\n", failures, cases);
     }
     return failures == 0;
 }
 
 bool test_legacy_round_trips() {
     bool ok = true;
-    ok = check(ggml_blck_size(GGML_TYPE_Q4_H1) == 32, "Q4_H1 block size") && ok;
-    ok = check(ggml_blck_size(GGML_TYPE_Q4_HP1) == 32, "Q4_HP1 block size") && ok;
-    ok = check(ggml_blck_size(GGML_TYPE_Q16_0) == 32, "Q16_0 block size") && ok;
-    ok = check(ggml_blck_size(GGML_TYPE_Q16_H1) == 32, "Q16_H1 block size") && ok;
-    ok = check(ggml_blck_size(GGML_TYPE_Q16_HP1) == 32, "Q16_HP1 block size") && ok;
+    ok      = check(ggml_blck_size(GGML_TYPE_Q4_HP1) == 32, "Q4_HP1 block size") && ok;
+    ok      = check(ggml_blck_size(GGML_TYPE_Q16_0) == 32, "Q16_0 block size") && ok;
+    ok      = check(ggml_blck_size(GGML_TYPE_Q16_H1) == 32, "Q16_H1 block size") && ok;
+    ok      = check(ggml_blck_size(GGML_TYPE_Q16_HP1) == 32, "Q16_HP1 block size") && ok;
 
-    ok = round_trip(GGML_TYPE_Q4_H1, 2.5f) && ok;
     ok = round_trip(GGML_TYPE_Q4_HP1, 2.5f) && ok;
-    ok = test_q4_h1_narrow_scale_range_preserves_magnitude() && ok;
     ok = test_q4_hp1_power_of_two_scale_follows_paper_rule() && ok;
     ok = test_q4_hp1_row_scale_follows_paper_rule() && ok;
     ok = test_q4_hp1_equal_ilogb_blocks_share_exponent() && ok;
@@ -730,16 +642,16 @@ bool test_q4_hp1_loader_contract() {
         return false;
     }
 
-    ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_HP1, 32, 2);
+    ggml_tensor * weight     = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_HP1, 32, 2);
     ggml_tensor * activation = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 1);
-    ggml_tensor * op = ggml_mul_mat(ctx, weight, activation);
+    ggml_tensor * op         = ggml_mul_mat(ctx, weight, activation);
 
-    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(ggml_backend_gemmini_reg(), 0);
+    ggml_backend_dev_t    dev = ggml_backend_reg_dev_get(ggml_backend_gemmini_reg(), 0);
     ggml_backend_buffer_t buffer =
         ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(dev), 0);
-    weight->buffer = buffer;
+    weight->buffer       = buffer;
     const bool supported = ggml_backend_dev_supports_op(dev, op);
-    weight->buffer = nullptr;
+    weight->buffer       = nullptr;
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
 
@@ -777,15 +689,14 @@ Selection parse_selection(int argc, char ** argv) {
 int main(int argc, char ** argv) {
     const Selection selection = parse_selection(argc, argv);
     if (selection == Selection::Invalid) {
-        std::fputs("usage: gemmini_weight_formats [--case=happy-table|--case=failure-table]\n", stderr);
+        std::fputs("usage: gemmini_weight_formats [--case=happy-table|--case=failure-table]\n",
+                   stderr);
         return 2;
     }
 
     bool ok = true;
     if (selection == Selection::All || selection == Selection::HappyTable) {
         ok = test_legacy_round_trips() && ok;
-        ok = test_q4_h1_preserves_positive_q4_0_scale() && ok;
-        ok = test_q4_h1_flips_negative_q4_0_scale_codes() && ok;
         ok = test_q4_hp1_loader_contract() && ok;
         ok = test_reader_happy_table() && ok;
         ok = test_q4_h0_matches_canonical_dequantization() && ok;
@@ -794,11 +705,11 @@ int main(int argc, char ** argv) {
         ok = test_reader_failure_table() && ok;
     }
     if (ok) {
-        const char *message = selection == Selection::All ?
-            "PASS: residual weight happy and failure tables" :
-            (selection == Selection::FailureTable ?
-                "PASS: residual weight failure table" :
-                "PASS: residual weight happy table");
+        const char * message =
+            selection == Selection::All
+                ? "PASS: residual weight happy and failure tables"
+                : (selection == Selection::FailureTable ? "PASS: residual weight failure table"
+                                                        : "PASS: residual weight happy table");
         std::puts(message);
     }
     return ok ? 0 : 1;

@@ -1,15 +1,20 @@
-if(NOT DEFINED MATMUL_SOURCE)
-    message(FATAL_ERROR "MATMUL_SOURCE is required")
-endif()
-file(READ "${MATMUL_SOURCE}" source)
-get_filename_component(gemmini_source_dir "${MATMUL_SOURCE}" DIRECTORY)
-set(log_capi_source "${gemmini_source_dir}/../ggml-gemmini-utils/src/log-capi.cpp")
-set(cycle_source
-    "${gemmini_source_dir}/../ggml-gemmini-utils/src/cycle.cpp")
-file(READ "${log_capi_source}" log_capi)
-file(READ "${cycle_source}" cycle_source_text)
+foreach(required IN ITEMS DENSE_SOURCE EXECUTION_SOURCE TYPES_HEADER EXECUTION_HEADER
+                          MATMUL_TELEMETRY GEMMINI_SOURCE_ROOT GEMMINI_UTILS_ROOT)
+    if(NOT DEFINED ${required})
+        message(FATAL_ERROR "${required} is required")
+    endif()
+endforeach()
+file(READ "${DENSE_SOURCE}" dense_source)
+file(READ "${EXECUTION_SOURCE}" execution_source)
+file(READ "${TYPES_HEADER}" types_header)
+file(READ "${EXECUTION_HEADER}" execution_header)
+file(READ "${MATMUL_TELEMETRY}" telemetry_source)
+set(gemmini_source_dir "${GEMMINI_SOURCE_ROOT}")
+file(READ "${GEMMINI_UTILS_ROOT}/src/log-capi.cpp" log_capi)
+file(READ "${GEMMINI_UTILS_ROOT}/src/cycle.cpp" cycle_source_text)
 
-function(extract_between output begin_marker end_marker)
+function(extract_between output owner begin_marker end_marker)
+    set(source "${${owner}}")
     string(FIND "${source}" "${begin_marker}" begin)
     string(FIND "${source}" "${end_marker}" end)
     if(begin EQUAL -1 OR end EQUAL -1 OR end LESS_EQUAL begin)
@@ -21,6 +26,8 @@ function(extract_between output begin_marker end_marker)
 endfunction()
 
 function(require_count value needle expected label)
+    string(REGEX REPLACE "[ \t\r\n]" "" value "${value}")
+    string(REGEX REPLACE "[ \t\r\n]" "" needle "${needle}")
     set(rest "${value}")
     set(count 0)
     while(1)
@@ -39,8 +46,10 @@ function(require_count value needle expected label)
 endfunction()
 
 function(require_order value label)
+    string(REGEX REPLACE "[ \t\r\n]" "" value "${value}")
     set(previous -1)
     foreach(token IN LISTS ARGN)
+        string(REGEX REPLACE "[ \t\r\n]" "" token "${token}")
         string(FIND "${value}" "${token}" position)
         if(position EQUAL -1 OR (NOT previous EQUAL -1 AND NOT previous LESS position))
             message(FATAL_ERROR "${label}: ordering failed at ${token}")
@@ -50,6 +59,8 @@ function(require_order value label)
 endfunction()
 
 function(require_absent value token label)
+    string(REGEX REPLACE "[ \t\r\n]" "" value "${value}")
+    string(REGEX REPLACE "[ \t\r\n]" "" token "${token}")
     string(FIND "${value}" "${token}" position)
     if(NOT position EQUAL -1)
         message(FATAL_ERROR "${label}: unexpected ${token}")
@@ -57,6 +68,8 @@ function(require_absent value token label)
 endfunction()
 
 function(require_token value token label)
+    string(REGEX REPLACE "[ \t\r\n]" "" value "${value}")
+    string(REGEX REPLACE "[ \t\r\n]" "" token "${token}")
     string(FIND "${value}" "${token}" position)
     if(position EQUAL -1)
         message(FATAL_ERROR "${label}: missing ${token}")
@@ -93,11 +106,11 @@ function(require_run_only_checked_pair value operation target label)
     endforeach()
 endfunction()
 
-extract_between(commit "void MatMul::commit_output_transaction" "void MatMul::discard_output_transaction")
-extract_between(run_full "MatMulResult MatMul::run_full" "MatMulStatus MatMul::begin_stripes")
-extract_between(finish_stripes "MatMulStatus MatMul::finish_stripes" "MatMulCapability MatMul::stripe_capability")
-extract_between(compose "MatmulStatus compose_rmd_stripe" "MatmulStatus finalize_stripe")
-extract_between(finalize "MatmulStatus finalize_stripe" "MatmulStatus finish_execution")
+extract_between(commit dense_source "void MatMul::commit_output_transaction" "void MatMul::discard_output_transaction")
+extract_between(run_full dense_source "MatMulResult MatMul::run_full" "MatMulStatus MatMul::begin_stripes")
+extract_between(finish_stripes dense_source "MatMulStatus MatMul::finish_stripes" "MatMulCapability MatMul::stripe_capability")
+extract_between(compose execution_source "MatmulStatus compose_rmd_stripe" "MatmulStatus finalize_stripe")
+extract_between(finalize execution_source "MatmulStatus finalize_stripe" "MatmulStatus finish_execution")
 
 foreach(token IN ITEMS "serialize_checked_cycle_record" "delta.valid"
                        "reason_name(delta.reason)" "interval.op")
@@ -136,9 +149,9 @@ require_absent("${finalize}" "\"rmd_merge_cycles\""
 
 # U14 and U15 retain the origin/develop direct finite checks. Native reads
 # belong to the shared sample reader, never a second callsite-only pair.
-require_count("${source}" "\"matmul_finite_output_validate_cycles\"" 0
+require_count("${dense_source}" "\"matmul_finite_output_validate_cycles\"" 0
     "U14/U15 finite validation label/site count")
-require_count("${source}" "if (!finite_output(args()))" 2
+require_count("${dense_source}" "if (!finite_output(args()))" 2
     "U14/U15 direct finite validation count")
 require_count("${run_full}" "cycle::read_sample()" 0
     "run_full never duplicates shared native reads")
@@ -178,12 +191,18 @@ require_order("${commit}" "U16 success-only commit boundary"
     "commit_end = read_matmul_cpu_sample()" "emit_matmul_cpu_interval"
     "args().f_out = output_destination_")
 require_absent("${commit}" "CYCLE_DETAIL" "U16 raw intervals survive DETAIL=0")
-require_count("${source}" "\"rmd_merge_cycles\"" 1 "exact U12 label/site count")
-require_count("${source}" "\"matmul_output_commit_cycles\"" 1
+require_count("${dense_source}" "\"rmd_merge_cycles\"" 1 "exact U12 label/site count")
+require_count("${dense_source}" "\"matmul_output_commit_cycles\"" 1
     "exact U16 label/site count")
+foreach(token IN ITEMS "\"matmul_finite_output_validate_cycles\"" "if (!finite_output(args()))"
+                       "\"rmd_merge_cycles\"" "\"matmul_output_commit_cycles\"")
+    require_absent("${execution_source}" "${token}" "numerical-only boundary is not duplicated in execution")
+endforeach()
 
-require_absent("${source}" "rmd::CompressedOutput" "production stages final corrections")
-require_absent("${source}" "rmd::compose_rmd_output" "composition is fused into executor")
+foreach(owner IN ITEMS dense_source execution_source)
+    require_absent("${${owner}}" "rmd::CompressedOutput" "production stages final corrections")
+    require_absent("${${owner}}" "rmd::compose_rmd_output" "composition is fused into executor")
+endforeach()
 require_absent("${compose}" "cycle::read_sample()" "lifecycle completion has no synthetic Compose pair")
 require_absent("${compose}" "emit_matmul_cpu_interval" "fused Compose belongs to backend interval")
 require_order("${compose}" "Compose requires a published correction even for empty packets"
@@ -231,11 +250,11 @@ require_token("${finalize}" "finalize_start, finalize_end, merge_failure.ok(), &
 require_absent("${finalize}" "#if LOG_CYCLE && CYCLE_DETAIL"
     "Finalize raw intervals survive DETAIL=0")
 
-extract_between(dense "MatmulStatus execute_dense_stripe" "MatmulStatus accept_external_dense_completion")
-extract_between(external "MatmulStatus accept_external_dense_completion" "MatmulStatus execute_rmd_stripe")
-extract_between(residual "MatmulStatus execute_rmd_stripe" "MatmulStatus compose_rmd_stripe")
-extract_between(capture "bool MatmulStripeCollector::on_ready" "MatmulStripeJob::MatmulStripeJob")
-extract_between(worker "void MatmulStripeCollector::worker_loop" "const quants::act::exsia::StripeReadySink * MatmulStripeCollector::sink")
+extract_between(dense execution_source "MatmulStatus execute_dense_stripe" "MatmulStatus accept_external_dense_completion")
+extract_between(external execution_source "MatmulStatus accept_external_dense_completion" "MatmulStatus execute_rmd_stripe")
+extract_between(residual execution_source "MatmulStatus execute_rmd_stripe" "MatmulStatus compose_rmd_stripe")
+extract_between(capture execution_source "bool MatmulStripeCollector::on_ready" "MatmulStripeJob::MatmulStripeJob")
+extract_between(worker execution_source "void MatmulStripeCollector::worker_loop" "MatmulStripeCollector::sink")
 require_order("${dense}" "Dense samples exactly its facade host call"
     "dense_start = read_matmul_cpu_sample()" "facade_.run_staged_stripe"
     "dense_end = read_matmul_cpu_sample()" "to_public_status")
@@ -269,27 +288,35 @@ foreach(pair IN ITEMS merge)
     require_token("${run_full}" "${pair}_start = read_matmul_cpu_sample()" "FULL packet ${pair} start")
     require_token("${run_full}" "${pair}_end = read_matmul_cpu_sample()" "FULL packet ${pair} end")
 endforeach()
-file(READ "${gemmini_source_dir}/ggml-gemmini-matmul.hpp" header)
-require_token("${header}" "bool rmd_correction_ready_ = false" "new jobs have no published correction")
-require_token("${source}" "rmd_correction_ready_(other.rmd_correction_ready_)" "move construction preserves readiness")
-require_token("${source}" "rmd_correction_ready_ = other.rmd_correction_ready_" "move assignment preserves readiness")
-require_order("${header}" "reader collection gate"
+require_token("${execution_header}" "bool rmd_correction_ready_ = false" "new jobs have no published correction")
+require_token("${execution_source}" "rmd_correction_ready_(other.rmd_correction_ready_)" "move construction preserves readiness")
+require_token("${execution_source}" "rmd_correction_ready_ = other.rmd_correction_ready_" "move assignment preserves readiness")
+require_order("${types_header}" "reader collection gate"
     "inline MatmulCpuSample read_matmul_cpu_sample()" "#if LOG_CYCLE"
     "result.collected = true" "result.native = cycle::read_sample()")
-extract_between(emitter "void emit_matmul_cpu_interval" "class ProofHash64")
-require_order("${emitter}" "nonthrowing CPU telemetry boundary"
-    "noexcept" "#if LOG_CYCLE" "try {" "project_matmul_cpu_identity"
-    "log::cycle.write_json" "serialize_matmul_cpu_interval" "catch (...)"
+extract_between(emitter telemetry_source "void emit_matmul_cpu_interval" "void emit_rmd_stripe_metrics")
+string(REGEX REPLACE "[ \t\r\n]" "" emitter_compact "${emitter}")
+require_order("${emitter_compact}" "nonthrowing CPU telemetry boundary"
+    "noexcept" "#ifLOG_CYCLE" "try{" "project_matmul_cpu_identity"
+    "log::cycle.write_decorated" "serialize_matmul_cpu_interval" "catch(...)"
     "log::cycle.report_failure")
 file(READ "${gemmini_source_dir}/ggml-gemmini-im2p.cpp" im2p)
-require_absent("${im2p}" "rmd::CompressedOutput" "IM2P stages final corrections")
-require_absent("${im2p}" "rmd::compose_rmd_output" "IM2P reconstruction belongs to backend interval")
+file(READ "${gemmini_source_dir}/im2p/route.cpp" im2p_route)
+foreach(owner IN ITEMS im2p im2p_route)
+    require_absent("${${owner}}" "rmd::CompressedOutput" "IM2P stages final corrections")
+    require_absent("${${owner}}" "rmd::compose_rmd_output" "IM2P reconstruction belongs to backend interval")
+endforeach()
+foreach(projection IN ITEMS "Result translate(" "Completion translate("
+                            "Result gate_route(" "translate_stats("
+                            "validate_stripe_timings(" "validate_residual_stripe_timings(")
+    require_token("${im2p_route}" "${projection}" "pure IM2P projection owner")
+endforeach()
 require_count("${im2p}" "if (failure == TestFailure::compose)" 2
     "FULL and PIPELINE preserve compose failure injection before merge")
 # Restrict this assertion to HostCpuInterval: unrelated upstream callbacks may
 # contain their own try/catch before this class in the translation unit.
 string(FIND "${im2p}" "class HostCpuInterval {" im2p_host_begin)
-string(FIND "${im2p}" "::im2p::gemmini::Status to_frontend_status" im2p_host_end)
+string(FIND "${im2p}" "bool checked_output_extent(" im2p_host_end)
 if(im2p_host_begin EQUAL -1 OR im2p_host_end LESS_EQUAL im2p_host_begin)
     message(FATAL_ERROR "Cannot locate the actual IM2P host interval class")
 endif()
@@ -302,12 +329,14 @@ if(im2p_finish_begin EQUAL -1 OR im2p_finish_end LESS_EQUAL im2p_finish_begin)
 endif()
 math(EXPR im2p_finish_length "${im2p_finish_end} - ${im2p_finish_begin}")
 string(SUBSTRING "${im2p_host_interval}" ${im2p_finish_begin} ${im2p_finish_length} im2p_finish)
-require_order("${im2p_finish}" "IM2P retains its measurement and failure boundary"
-    "void finish(" "const auto end = read_matmul_cpu_sample()" "active_ = false"
-    "try {" "log::cycle.write_json" "serialize_matmul_cpu_interval"
-    "record_, start_, end," "catch (...)" "log::cycle.report_failure")
+string(REGEX REPLACE "[ \t\r\n]" "" im2p_finish_compact "${im2p_finish}")
+require_order("${im2p_finish_compact}" "IM2P retains its measurement and failure boundary"
+    "voidfinish(" "noexcept" "#ifLOG_CYCLE" "if(!active_)return"
+    "constautoend=read_matmul_cpu_sample()" "active_=false"
+    "try{" "log::cycle.write_decorated" "serialize_matmul_cpu_interval"
+    "record_,start_,end," "catch(...)" "log::cycle.report_failure")
 require_absent("${emitter}" "CYCLE_DETAIL" "raw CPU logging survives DETAIL=0")
-require_order("${header}" "one native sample plus host and thread CPU snapshot"
+require_order("${types_header}" "one native sample plus host and thread CPU snapshot"
     "result.native = cycle::read_sample()" "const auto host = cycle::read_host_sample()"
     "result.ns = host.ns" "result.tid = host.tid"
     "result.thread_cpu_ns = host.thread_cpu_ns" "result.thread_cpu_valid = host.thread_cpu_valid")

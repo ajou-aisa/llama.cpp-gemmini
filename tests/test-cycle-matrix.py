@@ -108,8 +108,8 @@ class MatrixTests(unittest.TestCase):
     def test_ambiguous_model_fails(self):
         subdir = self.root / "duplicate"
         subdir.mkdir()
-        (subdir / "gpt2.Q8_H1.gguf").write_bytes(b"GGUF-fixture")
-        case = M.input_cases(self.config, self.root, ["gpt2"], [8], ["H1"])[0]
+        (subdir / "gpt2.Q8_0.gguf").write_bytes(b"GGUF-fixture")
+        case = M.input_cases(self.config, self.root, ["gpt2"], [8], ["0"])[0]
         self.assertEqual(case["status"], "failed")
         self.assertIn("found 2", case["errors"][0])
 

@@ -18,7 +18,6 @@ foreach(_file IN LISTS _production_files)
             "read_weight_code"
             "bool[ \t\r\n]+weight_code[ \t\r\n]*\\("
             "block[ \t\r\n]*->[ \t\r\n]*qs"
-            "q8_h1_block[ \t\r\n]*\\("
             "q8_hp1_block[ \t\r\n]*\\(")
         string(REGEX MATCH "${_duplicate_pattern}" _duplicate "${_source}")
         if(NOT _duplicate STREQUAL "")

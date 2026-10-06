@@ -922,14 +922,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         }
     }
 
-    // Inspect the final selection so --device and --gpu-layers are order independent.
-    // The FPGA accelerator reports no GPU, but still honors explicit layer placement.
-    const bool explicit_fpga = std::any_of(params.devices.begin(), params.devices.end(),
-        [](ggml_backend_dev_t dev) {
-            return dev != nullptr && ggml_backend_reg_get_proc_address(
-                ggml_backend_dev_backend_reg(dev), "ggml_gemmini_fpga_stats_v1") != nullptr;
-        });
-    if (params.n_gpu_layers != -1 && !llama_supports_gpu_offload() && !explicit_fpga) {
+    if (params.n_gpu_layers != -1 && !llama_supports_gpu_offload()) {
         fprintf(stderr, "warning: no usable GPU found, --gpu-layers option will be ignored\n");
         fprintf(stderr, "warning: one possible reason is that llama.cpp was compiled without GPU support\n");
         fprintf(stderr, "warning: consult docs/build.md for compilation instructions\n");

@@ -154,7 +154,8 @@ static void helper_write(FILE * file, const void * data, const size_t nbytes) {
     GGML_ASSERT(fwrite(data, 1, nbytes, file) == nbytes);
 }
 
-static FILE * get_handcrafted_file(const unsigned int seed, const enum handcrafted_file_type hft, const int extra_bytes = 0) {
+static FILE * get_handcrafted_file(const unsigned int seed, const enum handcrafted_file_type hft, const int extra_bytes = 0,
+                                  const int serialized_type = -1) {
     FILE * file = tmpfile();
 
     if (!file) {
@@ -185,6 +186,9 @@ static FILE * get_handcrafted_file(const unsigned int seed, const enum handcraft
     std::vector<tensor_config_t> tensor_configs;
     if (hft >= offset_has_tensors) {
         tensor_configs = get_tensor_configs(rng);
+    }
+    if (serialized_type >= 0) {
+        tensor_configs = {{GGML_TYPE_F32, {32, 1, 1, 1}}};
     }
 
     if (hft == HANDCRAFTED_HEADER_BAD_N_TENSORS) {
@@ -367,7 +371,8 @@ static FILE * get_handcrafted_file(const unsigned int seed, const enum handcraft
         }
 
         {
-            const int32_t type32 = hft == HANDCRAFTED_TENSORS_BAD_TYPE ? GGML_TYPE_COUNT : int32_t(type);
+            const int32_t type32 = serialized_type >= 0 ? serialized_type :
+                hft == HANDCRAFTED_TENSORS_BAD_TYPE ? GGML_TYPE_COUNT : int32_t(type);
             helper_write(file, type32);
         }
 
@@ -1287,14 +1292,53 @@ static std::pair<int, int> test_gguf_set_kv(ggml_backend_dev_t dev, const unsign
 }
 
 static void print_usage() {
-    printf("usage: test-gguf [seed]\n");
+    printf("usage: test-gguf [seed | --retired-types]\n");
     printf("  if no seed is unspecified then a random seed is used\n");
+}
+
+static int test_retired_types() {
+    static_assert(GGML_TYPE_Q4_0 == 2 && GGML_TYPE_Q8_0 == 8 && GGML_TYPE_Q8_H2 == 40 &&
+                  GGML_TYPE_Q8_HP1 == 41 && GGML_TYPE_Q8_HP2 == 42 && GGML_TYPE_Q8_CHANNEL == 43 &&
+                  GGML_TYPE_Q4_HP1 == 45 && GGML_TYPE_Q16_0 == 46 && GGML_TYPE_Q16_H1 == 47 &&
+                  GGML_TYPE_Q16_HP1 == 48 && GGML_TYPE_COUNT == 49, "serialized type IDs changed");
+    bool ok = true;
+    for (const int id : {39, 44, 0, 8}) {
+        const bool retired = id == 39 || id == 44;
+        const ggml_type type = static_cast<ggml_type>(id);
+        const bool traits_ok = !retired || (ggml_blck_size(type) == 0 && ggml_type_size(type) == 0 &&
+                                            ggml_type_name(type) != nullptr);
+        printf("type=%d zero-size tombstone: %s\n", id, traits_ok ? "OK" : "FAIL");
+        ok &= traits_ok;
+        for (const bool only_meta : {true, false}) {
+            FILE * file = get_handcrafted_file(0, HANDCRAFTED_DATA_SUCCESS, 0, id);
+            GGML_ASSERT(file);
+            ggml_context * ctx = nullptr;
+            const gguf_init_params params = {false, only_meta ? nullptr : &ctx};
+            gguf_context * gguf_ctx = gguf_init_from_file_impl(file, params);
+            const bool parsed_ok = retired ? gguf_ctx == nullptr && ctx == nullptr :
+                gguf_ctx != nullptr && gguf_get_n_tensors(gguf_ctx) == 1 &&
+                gguf_get_tensor_type(gguf_ctx, 0) == type &&
+                (only_meta || (ctx != nullptr && ggml_get_tensor(ctx, "my_tensor_0")->data != nullptr));
+            printf("type=%d only_meta=%s expected=%s: %s\n", id, only_meta ? "yes" : "no",
+                   retired ? "rejected" : "accepted", parsed_ok ? "OK" : "FAIL");
+            ok &= parsed_ok;
+            ggml_free(ctx);
+            if (gguf_ctx) {
+                gguf_free(gguf_ctx);
+            }
+            fclose(file);
+        }
+    }
+    return ok ? 0 : 1;
 }
 
 int main(int argc, char ** argv) {
     if (argc > 2) {
         print_usage();
         return 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--retired-types") {
+        return test_retired_types();
     }
 
     std::random_device rd;

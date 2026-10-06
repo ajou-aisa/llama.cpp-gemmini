@@ -180,21 +180,6 @@ typedef struct {
 static_assert(sizeof(block_q4_0) == sizeof(ggml_half) + QK4_0 / 2, "wrong q4_0 block size/padding");
 typedef block_q4_0 block_q4_h0;
 
-// Direct-reader Q4_H1 block: decoded_q[i] * s_rf * (c_b + R).
-typedef struct {
-    uint8_t  qs[QK4_0 / 2]; // same low-half/high-half mapping as block_q4_0
-    uint8_t  c_b;
-    uint8_t  padding[3];
-    float    s_rf;
-    uint16_t R;
-    uint8_t  tail_padding[2];
-} block_q4_h1;
-static_assert(offsetof(block_q4_h1, qs) == 0, "wrong q4_h1 qs offset");
-static_assert(offsetof(block_q4_h1, c_b) == QK4_0 / 2, "wrong q4_h1 c_b offset");
-static_assert(offsetof(block_q4_h1, s_rf) == 20, "wrong q4_h1 s_rf offset");
-static_assert(offsetof(block_q4_h1, R) == 24, "wrong q4_h1 R offset");
-static_assert(sizeof(block_q4_h1) == 28, "wrong q4_h1 block size/padding");
-
 #define QK4_HP QK4_0
 typedef struct {
     uint8_t  qs[QK4_HP / 2]; // same low-half/high-half mapping as block_q4_0
@@ -248,19 +233,6 @@ typedef struct {
     int8_t  qs[QK8_0]; // quants
 } block_q8_0;
 static_assert(sizeof(block_q8_0) == sizeof(ggml_half) + QK8_0, "wrong q8_0 block size/padding");
-
-// Direct-reader Q8_H1 block: q[i] * s_rf * (c_b + R).
-typedef struct {
-    int8_t   qs[QK8_0];
-    uint8_t  c_b;
-    float    s_rf;
-    uint16_t R;
-} block_q8_h1;
-static_assert(offsetof(block_q8_h1, qs) == 0, "wrong q8_h1 qs offset");
-static_assert(offsetof(block_q8_h1, c_b) == QK8_0, "wrong q8_h1 c_b offset");
-static_assert(offsetof(block_q8_h1, s_rf) == 36, "wrong q8_h1 s_rf offset");
-static_assert(offsetof(block_q8_h1, R) == 40, "wrong q8_h1 R offset");
-static_assert(sizeof(block_q8_h1) == 44, "wrong q8_h1 block size/padding");
 
 #define QK8_H2 32
 typedef struct {

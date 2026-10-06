@@ -1,10 +1,16 @@
-if(NOT DEFINED CPU_SOURCE OR NOT DEFINED CPU_CMAKE OR NOT DEFINED GEMMINI_SOURCE)
-    message(FATAL_ERROR "CPU_SOURCE, CPU_CMAKE, and GEMMINI_SOURCE are required")
-endif()
+foreach(required IN ITEMS CPU_SOURCE CPU_CMAKE GEMMINI_SOURCE OPS_SOURCE
+                          IM2P_ROUTE_SOURCE IM2P_ROUTE_HEADER)
+    if(NOT DEFINED ${required})
+        message(FATAL_ERROR "${required} is required")
+    endif()
+endforeach()
 
 file(READ "${CPU_SOURCE}" cpu_source)
 file(READ "${CPU_CMAKE}" cpu_cmake)
-file(READ "${GEMMINI_SOURCE}" gemmini_source)
+file(READ "${GEMMINI_SOURCE}" gemmini_entry)
+file(READ "${OPS_SOURCE}" ops_source)
+file(READ "${IM2P_ROUTE_SOURCE}" route_source)
+file(READ "${IM2P_ROUTE_HEADER}" route_header)
 
 function(require_cpu_count regex expected description)
     string(REGEX MATCHALL "${regex}" matches "${cpu_source}")
@@ -15,7 +21,8 @@ function(require_cpu_count regex expected description)
 endfunction()
 
 function(require_gemmini_count regex expected description)
-    string(REGEX MATCHALL "${regex}" matches "${gemmini_source}")
+    string(REGEX REPLACE "[ \t]+" " " ops_source "${ops_source}")
+    string(REGEX MATCHALL "${regex}" matches "${ops_source}")
     list(LENGTH matches actual)
     if(NOT actual EQUAL expected)
         message(FATAL_ERROR "${description}: expected ${expected}, got ${actual}")
@@ -170,8 +177,8 @@ set(expected_gemmini_labels
     gemmini.prepare_weight
     gemmini.output_preparation)
 string(REGEX MATCHALL
-    "log_outer_cpu_interval\\(args,[^;]*\"gemmini\\.[a-zA-Z0-9_]+\"[^;]*\\)"
-    gemmini_records "${gemmini_source}")
+    "log_outer_cpu_interval\\([ \t\r\n]*args,[^;]*\"gemmini\\.[a-zA-Z0-9_]+\"[^;]*\\)"
+    gemmini_records "${ops_source}")
 list(LENGTH gemmini_records gemmini_record_count)
 if(NOT gemmini_record_count EQUAL 7)
     message(FATAL_ERROR
@@ -179,17 +186,21 @@ if(NOT gemmini_record_count EQUAL 7)
 endif()
 
 foreach(token IN ITEMS "overlaps_rtl=true" "excluded_from_cycle_sink=true")
-    string(FIND "${gemmini_source}" "${token}" overlap_token)
-    if(NOT overlap_token EQUAL -1)
-        message(FATAL_ERROR "Gemmini must preserve timestamps without asserting overlap: ${token}")
-    endif()
+    foreach(owner IN ITEMS gemmini_entry ops_source)
+        string(FIND "${${owner}}" "${token}" overlap_token)
+        if(NOT overlap_token EQUAL -1)
+            message(FATAL_ERROR "Gemmini must preserve timestamps without asserting overlap: ${token} in ${owner}")
+        endif()
+    endforeach()
 endforeach()
 foreach(token IN ITEMS "gemmini_cpu_timing_add(&totals, &start, &end)"
                        "cycle::serialize_cpu_native(start, end)"
                        "cycle::serialize_host_timing(start.ns, end.ns, start.tid, end.tid)"
                        "matmul_invocation_id" "MATMUL_CONFIGURATION"
                        "quantize_start, quantize_end, false, result")
-    string(FIND "${gemmini_source}" "${token}" required_token)
+    string(REGEX REPLACE "[ \t\r\n]" "" ops_compact "${ops_source}")
+    string(REGEX REPLACE "[ \t\r\n]" "" token_compact "${token}")
+    string(FIND "${ops_compact}" "${token_compact}" required_token)
     if(required_token EQUAL -1)
         message(FATAL_ERROR "Gemmini native context/endpoint contract missing ${token}")
     endif()
@@ -212,7 +223,8 @@ set(required_gemmini_operations
     "ggml::gemmini::evaluate_matmul_cpu_interval("
     "rmd_telemetry_invocation_start, rmd_telemetry_invocation_end)")
 foreach(operation IN LISTS required_gemmini_operations)
-    string(FIND "${gemmini_source}" "${operation}" operation_pos)
+    string(REGEX REPLACE "[ \t\r\n]" "" operation_compact "${operation}")
+    string(FIND "${ops_compact}" "${operation_compact}" operation_pos)
     if(operation_pos EQUAL -1)
         message(FATAL_ERROR
             "Gemmini scalar boundary source operation changed or disappeared: ${operation}")
@@ -233,10 +245,30 @@ set(forbidden_gemmini_tokens
     "invocation_reason"
     "CpuWork")
 foreach(token IN LISTS forbidden_gemmini_tokens)
-    string(FIND "${gemmini_source}" "${token}" token_pos)
+    foreach(owner IN ITEMS gemmini_entry ops_source)
+        string(FIND "${${owner}}" "${token}" token_pos)
+        if(NOT token_pos EQUAL -1)
+            message(FATAL_ERROR
+                "ggml-gemmini retains forbidden native/canonical cycle plumbing: ${token} in ${owner}")
+        endif()
+    endforeach()
+endforeach()
+
+if(gemmini_entry MATCHES "ggml::gemmini::cycle::read\\(\\)")
+    message(FATAL_ERROR "Gemmini entry must not introduce unowned scalar cycle endpoints")
+endif()
+foreach(token IN ITEMS "read_matmul_cpu_sample(" "gemmini_cpu_timing_read("
+                       "emit_matmul_cpu_interval(" "log::cycle.write" ".fence("
+                       "start_full(" "start_pipeline(")
+    string(FIND "${route_source}" "${token}" token_pos)
     if(NOT token_pos EQUAL -1)
-        message(FATAL_ERROR
-            "ggml-gemmini retains forbidden native/canonical cycle plumbing: ${token}")
+        message(FATAL_ERROR "Pure IM2P projection must not execute runtime/timer/emit calls: ${token}")
+    endif()
+endforeach()
+foreach(token IN ITEMS "im2p_gemmini_frontend.hpp" "im2p_geometry.h" "im2p_compact_runs.h")
+    string(FIND "${route_header}" "${token}" token_pos)
+    if(NOT token_pos EQUAL -1)
+        message(FATAL_ERROR "Pure IM2P public route contract must not include SDK implementation headers: ${token}")
     endif()
 endforeach()
 

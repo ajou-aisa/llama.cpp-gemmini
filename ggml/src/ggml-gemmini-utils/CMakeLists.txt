@@ -85,7 +85,7 @@ if (NOT CYCLE_SIM AND GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND
     set(_OPTRACE_GENERATE
         "${Python3_EXECUTABLE}" "${_OPTRACE_LLAMA_ROOT}/scripts/optrace-build-info.py"
         --llama "${_OPTRACE_LLAMA_ROOT}" --sim "${IM2P_SIM_ROOT}"
-        --headers "${_OPTRACE_LLAMA_ROOT}/../RISC-V-DynDNN-gemmini-include"
+        --headers "${GEMMINI_SW_PATH}"
         --out "${_OPTRACE_GENERATED}"
         --runtime-manifest "${GGML_GEMMINI_IM2P_MANIFEST}"
         --bits "${GGML_GEMMINI_ACTIVATION_BITS}" --dim "${GGML_GEMMINI_DIM}"

@@ -2037,8 +2037,7 @@ int main(int argc, char ** argv) {
     LOG("\n");
     llama_perf_context_print(ctx);
 
-    const bool fpga_execution_ok = common_fpga_execution_check();
     llama_backend_free();
 
-    return evaluation_ok && fpga_execution_ok ? 0 : 1;
+    return evaluation_ok ? 0 : 1;
 }

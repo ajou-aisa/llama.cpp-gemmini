@@ -1,7 +1,6 @@
 #include "llama-quant.h"
 
 #include "llama-impl.h"
-#include "llama-gemmini-q8_h1.h"
 #include "llama-model.h"
 #include "llama-model-loader.h"
 
@@ -37,7 +36,6 @@ struct tensor_quantization {
     ggml_type quant = GGML_TYPE_COUNT;
 };
 
-static const char * const GEMMINI_Q8_H1_ARTIFACT_ENV = "LLAMA_GEMMINI_Q8_H1_ARTIFACT";
 
 static bool llama_validate_quantized_rows(enum ggml_type type, const void * data, size_t size, int64_t nrows, int64_t n_per_row) {
     if (type != GGML_TYPE_Q8_CHANNEL) {
@@ -301,8 +299,8 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
                      ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
                 new_type = GGML_TYPE_Q5_K;
             }
-            else if (new_type != GGML_TYPE_Q4_H1 && new_type != GGML_TYPE_Q4_HP1 &&
-                     new_type != GGML_TYPE_Q8_0 && new_type != GGML_TYPE_Q8_H1 && new_type != GGML_TYPE_Q8_H2 &&
+            else if (new_type != GGML_TYPE_Q4_HP1 &&
+                     new_type != GGML_TYPE_Q8_0 && new_type != GGML_TYPE_Q8_H2 &&
                      new_type != GGML_TYPE_Q8_HP1 && new_type != GGML_TYPE_Q8_HP2 && new_type != GGML_TYPE_Q8_CHANNEL &&
                      new_type != GGML_TYPE_Q16_0 && new_type != GGML_TYPE_Q16_H1 && new_type != GGML_TYPE_Q16_HP1) {
                 new_type = GGML_TYPE_Q6_K;
@@ -619,20 +617,14 @@ static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * 
 static void llama_model_quantize_impl(const std::string & fname_inp, const std::string & fname_out, const llama_model_quantize_params * params) {
     ggml_type default_type;
     llama_ftype ftype = params->ftype;
-    const char * gemmini_q8_h1_artifact = std::getenv(GEMMINI_Q8_H1_ARTIFACT_ENV);
-    if (gemmini_q8_h1_artifact && params->ftype != LLAMA_FTYPE_MOSTLY_Q8_0) {
-        throw std::runtime_error("--gemmini-q8-h1-artifact requires Q8_0 output");
-    }
 
     switch (params->ftype) {
         case LLAMA_FTYPE_MOSTLY_Q4_0: default_type = GGML_TYPE_Q4_0; break;
-        case LLAMA_FTYPE_MOSTLY_Q4_H1: default_type = GGML_TYPE_Q4_H1; break;
         case LLAMA_FTYPE_MOSTLY_Q4_HP1: default_type = GGML_TYPE_Q4_HP1; break;
         case LLAMA_FTYPE_MOSTLY_Q4_1: default_type = GGML_TYPE_Q4_1; break;
         case LLAMA_FTYPE_MOSTLY_Q5_0: default_type = GGML_TYPE_Q5_0; break;
         case LLAMA_FTYPE_MOSTLY_Q5_1: default_type = GGML_TYPE_Q5_1; break;
         case LLAMA_FTYPE_MOSTLY_Q8_0: default_type = GGML_TYPE_Q8_0; break;
-        case LLAMA_FTYPE_MOSTLY_Q8_H1: default_type = GGML_TYPE_Q8_H1; break;
         case LLAMA_FTYPE_MOSTLY_Q8_H2: default_type = GGML_TYPE_Q8_H2; break;
         case LLAMA_FTYPE_MOSTLY_Q8_HP1: default_type = GGML_TYPE_Q8_HP1; break;
         case LLAMA_FTYPE_MOSTLY_Q8_HP2: default_type = GGML_TYPE_Q8_HP2; break;
@@ -802,39 +794,6 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         GGML_ASSERT((qs.n_attention_wv == n_attn_layer) && "n_attention_wv is unexpected");
     }
 
-    if (default_type == GGML_TYPE_Q8_H1 && !params->only_copy) {
-        const int64_t q8_h1_block_size = ggml_blck_size(GGML_TYPE_Q8_H1);
-        for (const auto * it : tensors) {
-            const ggml_tensor * tensor = it->tensor;
-            const std::string name = ggml_get_name(tensor);
-            bool quantize = name.rfind("weight") == name.size() - 6;
-            quantize &= ggml_n_dims(tensor) >= 2;
-            quantize &= name.find("_norm.weight") == std::string::npos;
-            quantize &= params->quantize_output_tensor || name != "output.weight";
-            quantize &= name.find("ffn_gate_inp.weight") == std::string::npos;
-            quantize &= name != LLM_TN(model.arch)(LLM_TENSOR_POS_EMBD,    "weight");
-            quantize &= name != LLM_TN(model.arch)(LLM_TENSOR_TOKEN_TYPES, "weight");
-            quantize &= name.find("ssm_conv1d.weight") == std::string::npos;
-            quantize &= name.find("time_mix_first.weight") == std::string::npos;
-            quantize &= name.find("time_mix_w0.weight") == std::string::npos;
-            quantize &= name.find("time_mix_w1.weight") == std::string::npos;
-            quantize &= name.find("time_mix_w2.weight") == std::string::npos;
-            quantize &= name.find("time_mix_v0.weight") == std::string::npos;
-            quantize &= name.find("time_mix_v1.weight") == std::string::npos;
-            quantize &= name.find("time_mix_v2.weight") == std::string::npos;
-            quantize &= name.find("time_mix_a0.weight") == std::string::npos;
-            quantize &= name.find("time_mix_a1.weight") == std::string::npos;
-            quantize &= name.find("time_mix_g1.weight") == std::string::npos;
-            quantize &= name.find("time_mix_g2.weight") == std::string::npos;
-            quantize &= name.find("time_mix_decay_w1.weight") == std::string::npos;
-            quantize &= name.find("time_mix_decay_w2.weight") == std::string::npos;
-            quantize &= name.find("time_mix_lerp_fused.weight") == std::string::npos;
-            quantize &= name.find("attn_rel_b.weight") == std::string::npos;
-            if (quantize && tensor->ne[0] % q8_h1_block_size != 0) {
-                throw std::runtime_error(format("Q8_H1 requires tensor %s width %" PRId64 " to be divisible by %" PRId64, tensor->name, tensor->ne[0], q8_h1_block_size));
-            }
-        }
-    }
     if (default_type == GGML_TYPE_Q8_H2 && !params->only_copy) {
         const int64_t q8_h2_block_size = ggml_blck_size(GGML_TYPE_Q8_H2);
         for (const auto * it : tensors) {
@@ -859,7 +818,6 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     std::vector<no_init<uint8_t>> read_data;
     std::vector<no_init<uint8_t>> work;
     std::vector<no_init<float>> f32_conv_buf;
-    gemmini_q8_h1_artifact_writer q8_h1_artifact(gemmini_q8_h1_artifact);
 
     uint16_t n_split = 1;
 
@@ -1173,16 +1131,11 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         GGML_ASSERT(gguf_get_tensor_size(ctx_outs[cur_split].get(), gguf_find_tensor(ctx_outs[cur_split].get(), name.c_str())) == new_size);
         gguf_set_tensor_data(ctx_outs[cur_split].get(), name.c_str(), new_data);
 
-        if (gemmini_q8_h1_artifact && new_type == GGML_TYPE_Q8_0) {
-            q8_h1_artifact.add_tensor(name, tensor, new_data);
-        }
-
         // write tensor data + padding
         write_bytes(fout, new_data, new_size);
         zeros(fout, GGML_PAD(new_size, align) - new_size);
     }
     close_ofstream();
-    q8_h1_artifact.finish();
 
     auto replace_file = [](const std::string & from, const std::string & to) {
 #if defined(_WIN32)
