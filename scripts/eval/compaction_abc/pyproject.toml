@@ -1,0 +1,23 @@
+[tool.basedpyright]
+typeCheckingMode = "all"
+pythonVersion = "3.12"
+include = ["summarize.py", "summarize_cached.py", "fill_cycles.py", "label_phases.py"]
+# Exhaustive assert_never arms are required; the checker already proves them unreachable.
+reportUnnecessaryComparison = false
+reportUnreachable = false
+# Adjacent strings keep generated Markdown readable in the source.
+reportImplicitStringConcatenation = false
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+lint.select = ["ALL"]
+lint.ignore = ["COM812", "ISC001", "D203", "D213", "CPY001"]
+# Typer resolves Path annotations at runtime. Long Korean Markdown is output data.
+lint.per-file-ignores."*.py" = ["TC003", "E501"]
+# This CLI reduces fixed paired records and writes the two artifacts in one pass.
+lint.per-file-ignores."summarize.py" = ["PLR0915"]
+# Explicit local binary argument, no shell; RTK is the user-required command wrapper.
+lint.per-file-ignores."fill_cycles.py" = ["S603", "S607"]
+lint.allowed-confusables = ["×"]
+lint.isort.known-first-party = ["summarize"]

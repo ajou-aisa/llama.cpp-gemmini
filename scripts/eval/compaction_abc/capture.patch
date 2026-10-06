@@ -1,0 +1,32 @@
+--- a/ggml/src/ggml-gemmini/residual/direct/direct-executor.cpp
++++ b/ggml/src/ggml-gemmini/residual/direct/direct-executor.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "direct-builder.hpp"
+ #include "../../ggml-gemmini-args.h"
++#include "ablation-capture.hpp"
+ #include "../../quants/act/dispatch.hpp"
+ #include "../../quants/common/weight_reader.hpp"
+ #include "../../quants/common/weight_route.hpp"
+@@ -211,6 +212,8 @@
+     if (args.K != payload.logical_k || args.J != payload.logical_j)
+         return rmd::RmdStatus::invalid_arguments;
+ 
++    ablation_dump(args, payload);
++
+     const wroute::WeightRoutePlan plan = wroute::resolve_weight_route_plan(
+         args, wroute::WeightScaleInfoMode::Residual);
+     if (!plan.valid) {
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,5 +1,10 @@
+ cmake_minimum_required(VERSION 3.14) # for add_link_options and implicit target directories.
+ project("llama.cpp" C CXX)
++
++# Standalone ablation target supplied only to this isolated evaluation copy.
++if(DEFINED ABC_SOURCE)
++    cmake_language(DEFER CALL include "${ABC_SOURCE}/benchmark.cmake")
++endif()
+ include(CheckIncludeFileCXX)
+ 
+ #set(CMAKE_WARN_DEPRECATED YES)
