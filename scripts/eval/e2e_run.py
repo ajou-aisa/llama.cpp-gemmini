@@ -12,6 +12,7 @@ from application_results import application_result, application_services, cuda_p
 from eval_common import (Record, artifact_snapshot, clean_environment, compiled_info, integer,
     read_json, record, records, require, run, sha256, validate_recipe, write_json)
 from evaluation_host import host_facts
+from metal_results import metal_placement, validate_metal_build
 
 
 def settings_contract(settings: Record) -> None:
@@ -60,14 +61,20 @@ def collect_runs(args: argparse.Namespace) -> None:
     info = compiled_info(binary)
     validate_recipe(info, "e2e")
     role = args.role
+    direct_gpu = role in ("cuda", "metal-quantized")
     cuda_no_kv_offload = bool(getattr(args, "cuda_no_kv_offload", False))
+    metal_no_kv_offload = bool(getattr(args, "metal_no_kv_offload", False))
     require(not cuda_no_kv_offload or role == "cuda",
             "--cuda-no-kv-offload is valid only with --role cuda")
+    require(not metal_no_kv_offload or role == "metal-quantized",
+            "--metal-no-kv-offload is valid only with --role metal-quantized")
+    if role == "metal-quantized":
+        validate_metal_build(info)
     require(role not in ("fullcpu", "fullcpu-cost-only") or (info.get("cpu_only") is True and integer(info, "cycle_sim") == 0),
             "FullCPU requires CPU-only CYCLE_SIM=0 artifact")
     require(role != "potal" or (integer(info, "cycle_sim") == 1 and info.get("backend") == "IM2P_SIM" and
                                info.get("hp1") is True), "PoTal requires CPU-functional CYCLE_SIM=1 HP1 artifact")
-    require(role == "cuda" or integer(info, "log_cycle") == 1, "FullCPU/PoTal sources require existing CPU cycle log")
+    require(direct_gpu or integer(info, "log_cycle") == 1, "FullCPU/PoTal sources require existing CPU cycle log")
     require(role != "cuda" or (info.get("cuda_evaluation_supported") is True and integer(info, "cuda") == 1
                               and integer(info, "cycle_sim") == 0), "CUDA native runner capability unavailable")
     require(role != "cuda" or (integer(info, "log_cycle") == 0 and integer(info, "ggml_cpu_cycle_log") == 0),
@@ -83,7 +90,7 @@ def collect_runs(args: argparse.Namespace) -> None:
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     native_build = None
-    if role != "cuda":
+    if not direct_gpu:
         require(args.im2p is not None, "FullCPU/PoTal collection requires --im2p for official native provenance")
         sys.path.insert(0, str(args.im2p.resolve(strict=True)))
         from sim.cycle.collection_native import prepare_native_build
@@ -97,6 +104,10 @@ def collect_runs(args: argparse.Namespace) -> None:
         "dataset": identities["dataset_sha256"], "settings": settings}
     if role == "cuda":
         comparison_fields["cuda_no_kv_offload"] = cuda_no_kv_offload
+    if role == "metal-quantized":
+        comparison_fields["metal_no_kv_offload"] = metal_no_kv_offload
+        comparison_fields["metal_arithmetic_profile"] = {key: info[key] for key in
+            ("activation_bits", "weight_bits", "dim", "activation_mode", "rmd_enabled")}
     comparison = hashlib.sha256(json.dumps(
         comparison_fields, sort_keys=True).encode()).hexdigest()
     for repetition in range(args.repetitions):
@@ -115,9 +126,9 @@ def collect_runs(args: argparse.Namespace) -> None:
             forced = prepare_forced_tokens(args.paired_potal / f"repetition-{repetition:02d}", destination,
                                            {**identities, "chunk_id": repetition})
             command.extend(("--forced-token-ids", str(forced)))
-        if role == "cuda":
+        if direct_gpu:
             command.extend(("--gpu-layers", "-1"))
-            if cuda_no_kv_offload:
+            if cuda_no_kv_offload or metal_no_kv_offload:
                 command.append("--no-kv-offload")
         native_collection = None
         if native_build is not None:
@@ -136,7 +147,7 @@ def collect_runs(args: argparse.Namespace) -> None:
         require(before == artifact_snapshot(binary), "native artifacts changed between actual repetitions")
         application = list(records(destination / "native/application.jsonl"))
         require(len(application) == 1, "one mapped prompt required per repetition")
-        require(application[0].get("source_role") == {"fullcpu": "full_cpu", "fullcpu-cost-only": "full_cpu", "potal": "potal_collection", "cuda": "cuda"}[role],
+        require(application[0].get("source_role") == {"fullcpu": "full_cpu", "fullcpu-cost-only": "full_cpu", "potal": "potal_collection", "cuda": "cuda", "metal-quantized": "metal_quantized"}[role],
                 "native application source role mismatch")
         if role == "fullcpu-cost-only":
             from paired_inputs import forced_result
@@ -149,11 +160,12 @@ def collect_runs(args: argparse.Namespace) -> None:
             sampling = application_services(destination / "native/application-cpu.jsonl", application[0])
         workload = read_json(destination / "native/workload.json")
         validate_native_recipe(workload)
-        if role == "cuda":
-            require(workload.get("no_kv_offload") is cuda_no_kv_offload,
-                    "CUDA KQV/KV offload policy differs from requested mode")
-            require(workload.get("kqv_offload") is (not cuda_no_kv_offload),
-                    "CUDA KQV offload provenance differs from requested mode")
+        if direct_gpu:
+            no_kv_offload = cuda_no_kv_offload or metal_no_kv_offload
+            require(workload.get("no_kv_offload") is no_kv_offload,
+                    "GPU KQV/KV offload policy differs from requested mode")
+            require(workload.get("kqv_offload") is (not no_kv_offload),
+                    "GPU KQV offload provenance differs from requested mode")
         require(workload.get("complete") is True and workload.get("output_mask") == "last_token",
                 "incomplete or PPL-masked E2E workload")
         raw_chunks = workload.get("chunks")
@@ -184,8 +196,8 @@ def collect_runs(args: argparse.Namespace) -> None:
             "tokenizer_identity": {"model_sha256": identities["model_sha256"],
                 "vocab_size": workload.get("vocab_size"), "add_special": workload.get("add_special"),
                 "parse_special": workload.get("parse_special"), "bos_policy": workload.get("bos_policy")},
-            "measurement_kind": "NATIVE_APPLICATION" if role == "cuda" else "COLLECTION_OBSERVATION_ONLY"}
-        if role != "cuda":
+            "measurement_kind": "NATIVE_APPLICATION" if direct_gpu else "COLLECTION_OBSERVATION_ONLY"}
+        if not direct_gpu:
             result["collection_observation"] = measured
             result["target_latency"] = "NOT_READY_REQUIRES_CERTIFIED_REPLAY_JOIN_CLOCK_AND_SERVICE_PROOF"
         else:
@@ -199,6 +211,12 @@ def collect_runs(args: argparse.Namespace) -> None:
                 "FULL_KQV_OFFLOAD"
             )
             result["arithmetic_matching"] = "PRACTICAL_REFERENCE_NOT_A4W4_A8W8_MATCHED"
+        if role == "metal-quantized":
+            result["actual_placement"] = dict(metal_placement(
+                destination / "native/metal-quantized.json", destination / "process.log", info))
+            result["metal_kqv_offload"] = not metal_no_kv_offload
+            result["metal_attention_scope"] = "KQV_AND_KV_CACHE_ON_CPU" if metal_no_kv_offload else "FULL_KQV_OFFLOAD"
+            result["arithmetic_matching"] = "CUSTOM_INTEGER_MATMUL_CPU_PRODUCER_GPU_RESTORATION"
         write_json(destination / "result.json", result)
         results.append(result)
     require(identities["model_sha256"] == sha256(model) and identities["dataset_sha256"] == sha256(dataset)

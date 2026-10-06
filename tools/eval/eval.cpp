@@ -18,6 +18,9 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#if EVALUATION_METAL_QUANTIZED
+#include "evaluation-metal.hpp"
+#endif
 
 using json = nlohmann::ordered_json;
 namespace metrics = ggml::gemmini::evaluation;
@@ -30,6 +33,9 @@ static json build_info() {
         {"activation_bits", GGML_GEMMINI_ACTIVATION_BITS}, {"weight_bits", GGML_GEMMINI_WEIGHT_BITS},
         {"dim", GGML_GEMMINI_DIM}, {"backend", EVALUATION_BACKEND},
         {"gemmini_option", EVALUATION_GEMMINI_OPTION}, {"cuda", EVALUATION_CUDA},
+        {"metal", EVALUATION_METAL}, {"metal_quantized", EVALUATION_METAL_QUANTIZED},
+        {"metal_quantized_evaluation_supported", EVALUATION_METAL_QUANTIZED != 0},
+        {"quantization_producer", EVALUATION_METAL_QUANTIZED ? json("cpu") : json()},
         {"gemmini", EVALUATION_GEMMINI}, {"cuda_evaluation_supported", EVALUATION_CUDA != 0},
         {"activation_mode", EVALUATION_ACTIVATION_MODE}, {"block_size", EVALUATION_BLOCK_SIZE},
         {"rmd_enabled", GGML_GEMMINI_ENABLE_RMD}, {"rmd_backend", EVALUATION_RMD_BACKEND},
@@ -107,7 +113,7 @@ static int run(int argc, char ** argv) {
                 "  --plan-only (METRIC_PREFILL_256: print the native chunk plan as JSON and exit; no output)\n"
                 "  --terminal-lm-head full|metrics-only (METRIC_PREFILL_256 metric collection: metrics-only observes\n"
                 "    the terminal lm_head completely but never computes its logits; default full)\n"
-                "  --smoke-generated-tokens 1 (CYCLE_SIM diagnostic; never an E2E campaign)\n"
+                "  --smoke-generated-tokens N (CYCLE_SIM: 1; Metal quantized: 1..128; diagnostic only)\n"
                 "Native non-strided WikiText chunks, no warmup. Defaults: one chunk, batch/ubatch 256,\n"
                 "one thread. E2E requires chunk-index0..9; fixed greedy seed1234/temp0, EOS stopping disabled.\n"
                 "Forced tokens are FullCPU cost-only; they are never reported as sampled output.");
@@ -211,11 +217,12 @@ static int run(int argc, char ** argv) {
     if (cycle_trace && (!CYCLE_SIM || generation || GGML_GEMMINI_ACT_QUANT_METRICS ||
                        GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS))
         throw std::invalid_argument("cycle trace requires independent metrics-OFF CYCLE_SIM prefill build");
-    if (smoke_generated_tokens &&
-        (!generation || smoke_generated_tokens != 1 ||
-         (forced_cost_only ? CYCLE_SIM != 0 : !CYCLE_SIM)))
-        throw std::invalid_argument("smoke-generated-tokens requires exactly 1 token in CYCLE_SIM free "
-                                    "generation or in a FullCPU forced cost-only replay");
+    const bool metal_smoke = EVALUATION_METAL_QUANTIZED && params.n_gpu_layers != 0 &&
+        !forced_cost_only && smoke_generated_tokens <= 128;
+    if (smoke_generated_tokens && (!generation || (!metal_smoke &&
+        (smoke_generated_tokens != 1 || (forced_cost_only ? CYCLE_SIM != 0 : !CYCLE_SIM)))))
+        throw std::invalid_argument("smoke-generated-tokens requires CYCLE_SIM/forced CPU token1 "
+                                    "or Metal quantized tokens1..128");
     const int generation_target = smoke_generated_tokens ? smoke_generated_tokens : 128;
     if (!generation && workload != "METRIC_PREFILL_256") throw std::invalid_argument("unknown workload");
     if (chunk_index_set && first_chunk_set) throw std::invalid_argument("--chunk-index and --first-chunk are exclusive");
@@ -256,7 +263,8 @@ static int run(int argc, char ** argv) {
     if (generation && (GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS)) {
         throw std::invalid_argument("E2E requires ACT_QUANT_METRICS=0, RESIDUAL_METRICS=0 and SCALE_METRICS=0");
     }
-    if (params.n_gpu_layers != 0 && !EVALUATION_CUDA) throw std::invalid_argument("CUDA is not compiled in");
+    if (params.n_gpu_layers != 0 && !EVALUATION_CUDA && !EVALUATION_METAL)
+        throw std::invalid_argument("no CUDA or Metal backend is compiled in");
     if (params.model.path.empty() || file.empty() || (output.empty() && !plan_only)) {
         throw std::invalid_argument("--model, --file and --output-dir are required");
     }
@@ -289,8 +297,16 @@ static int run(int argc, char ** argv) {
     params.n_ctx = generation ? 384 : 256;
     params.n_parallel = 1;
 
-#if EVALUATION_CUDA
+#if EVALUATION_CUDA || EVALUATION_METAL
     ggml_backend_load_all();
+#endif
+#if EVALUATION_METAL_QUANTIZED
+    evaluation_metal metal;
+    if (params.n_gpu_layers != 0) {
+        metal.initialize();
+        params.cb_eval = evaluation_metal::observe;
+        params.cb_eval_user_data = &metal;
+    }
 #endif
 
     common_init();
@@ -309,9 +325,16 @@ static int run(int argc, char ** argv) {
         model_file_type = value;
     }
     llama_model_desc(model, description, sizeof(description));
-    if (params.n_gpu_layers != 0 && model_file_type != LLAMA_FTYPE_MOSTLY_Q4_0 &&
+    if (params.n_gpu_layers != 0 && EVALUATION_METAL_QUANTIZED) {
+        const bool exsia = std::string(EVALUATION_ACTIVATION_MODE) == "EXSIA";
+        const int expected = exsia ?
+            (GGML_GEMMINI_WEIGHT_BITS == 4 ? LLAMA_FTYPE_MOSTLY_Q4_HP1 : LLAMA_FTYPE_MOSTLY_Q8_HP1) :
+            (GGML_GEMMINI_WEIGHT_BITS == 4 ? LLAMA_FTYPE_MOSTLY_Q4_0 : LLAMA_FTYPE_MOSTLY_Q8_0);
+        if (model_file_type != expected)
+            throw std::invalid_argument("Metal quantized model file type does not match compiled bit width and activation mode");
+    } else if (params.n_gpu_layers != 0 && model_file_type != LLAMA_FTYPE_MOSTLY_Q4_0 &&
             model_file_type != LLAMA_FTYPE_MOSTLY_Q8_0) {
-        throw std::invalid_argument("CUDA reference requires actual Q4_0 or Q8_0 general.file_type metadata");
+        throw std::invalid_argument("native GPU reference requires actual Q4_0 or Q8_0 general.file_type metadata");
     }
     const auto * vocab = llama_model_get_vocab(model);
     if (llama_vocab_get_add_eos(vocab)) throw std::runtime_error("native PPL requires add_eos=false");
@@ -344,7 +367,9 @@ static int run(int argc, char ** argv) {
     const bool add_bos = llama_vocab_get_add_bos(vocab);
     const auto mask = generation ? common_evaluation_mask::generation_last : common_evaluation_mask::perplexity_half;
     const std::string source_role = CYCLE_SIM ? "potal_collection" :
+        EVALUATION_METAL_QUANTIZED && params.n_gpu_layers != 0 ? "metal_quantized" :
         EVALUATION_CUDA && params.n_gpu_layers != 0 ? "cuda" :
+        EVALUATION_METAL && params.n_gpu_layers != 0 ? "metal_reference" :
         ggml::gemmini::semantic::compiled_cpu_only_build() ? "full_cpu" : "unsupported";
 #if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
     metric_config.workload_id = workload;
@@ -401,6 +426,9 @@ static int run(int argc, char ** argv) {
     manifest << result.dump(2) << '\n';
     manifest.flush();
     bool success = true;
+#if EVALUATION_METAL_QUANTIZED
+    if (params.n_gpu_layers != 0) metal.begin();
+#endif
     try {
         for (int selected_chunk = 0; selected_chunk < plan.n_chunks; ++selected_chunk) {
             const int chunk = plan.first_chunk + selected_chunk;
@@ -422,6 +450,9 @@ static int run(int argc, char ** argv) {
             if (add_bos) prompt[0] = llama_vocab_bos(vocab);
             if (sampler) for (const auto token : prompt) common_sampler_accept(sampler.get(), token, false);
             trace.phase("prefill", prompt);
+#if EVALUATION_METAL_QUANTIZED
+            metal.decoding = false;
+#endif
             std::vector<json> records;
             std::vector<std::pair<gemmini_cpu_sample, gemmini_cpu_sample>> prefill_times;
             prefill_times.reserve(plan.n_batches);
@@ -482,6 +513,9 @@ static int run(int argc, char ** argv) {
                 common_batch_clear(batch);
                 common_batch_add(batch, token, 256 + sample, {0}, true);
                 trace.phase("decode", {token}, sample);
+#if EVALUATION_METAL_QUANTIZED
+                metal.decoding = true;
+#endif
                 ++decode_calls;
                 if (trace.decode(ctx, batch)) throw std::runtime_error("generation decode failed");
             }
@@ -568,6 +602,19 @@ static int run(int argc, char ** argv) {
         throw;
     }
     llama_batch_free(batch);
+#if EVALUATION_METAL_QUANTIZED
+    if (params.n_gpu_layers != 0) {
+        const auto evidence = metal.evidence(success);
+        std::ofstream proof(std::filesystem::path(output) / "metal-quantized.json");
+        proof << evidence.dump(2) << '\n';
+        proof.close();
+        if (!proof) throw std::runtime_error("Metal execution proof write failed");
+        result["placement_proof"] = "metal-quantized.json";
+        result["placement_verified"] = evidence.at("placement_verified");
+        if (!evidence.at("placement_verified").get<bool>())
+            throw std::runtime_error("Metal quantized execution coverage incomplete or fallback detected");
+    }
+#endif
     result["complete"] = success;
     manifest.close();
     manifest.open(std::filesystem::path(output) / "workload.json", std::ios::trunc);

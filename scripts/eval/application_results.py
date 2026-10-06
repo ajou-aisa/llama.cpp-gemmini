@@ -31,6 +31,7 @@ def application_result(row: Record) -> Record:
     require(row.get("workload") == "E2E_GENERATION_256_128" and row.get("complete") is True,
             "incomplete or wrong application workload")
     require(row.get("cost_only") is not True, "forced CPU cost collection is not free generation")
+    require(row.get("diagnostic_smoke") is not True, "diagnostic smoke is not a full application measurement")
     require(integer(row, "samples") == 128 and integer(row, "decode_calls") == 127,
             "application requires 128 actual samples and 127 decode calls")
     require(integer(row, "warmup") == 0 and row.get("excludes_terminal_io") is True,
@@ -157,18 +158,31 @@ def load_measurement(path: Path, publication: bool = True) -> Record:
     if row.get("role") == "potal" and row.get("measurement_kind") == "VALIDATED_RECONSTRUCTION":
         from certified_reconstruction import load_reconstructed_measurement
         return load_reconstructed_measurement(row, publication)
-    require(row.get("role") == "cuda" and row.get("measurement_kind") == "NATIVE_APPLICATION",
-            "only bound native CUDA direct latency currently admitted; reconstructed publication requires service/clock proof")
+    require(row.get("role") in ("cuda", "metal-quantized") and row.get("measurement_kind") == "NATIVE_APPLICATION",
+            "only bound native GPU direct latency admitted; reconstructed publication requires service/clock proof")
     root = path.parent
     endpoint_path = root / "native/application.jsonl"
     require(row.get("application_sha256") == sha256(endpoint_path), "application result/source hash mismatch")
     endpoints = list(records(endpoint_path))
-    require(len(endpoints) == 1 and endpoints[0].get("source_role") == "cuda", "wrong application source")
+    source = "metal_quantized" if row.get("role") == "metal-quantized" else "cuda"
+    require(len(endpoints) == 1 and endpoints[0].get("source_role") == source, "wrong application source")
     measured = application_result(endpoints[0])
     require(all(row.get(key) == value for key, value in measured.items()), "application result differs from measured endpoints")
     request = read_json(root.parent / "request.json")
     info = record(request.get("build_info"))
     validate_recipe(info, "e2e")
+    if row.get("role") == "metal-quantized":
+        from metal_results import metal_placement
+        placement = dict(metal_placement(root / "native/metal-quantized.json", root / "process.log", info))
+        require(row.get("host_id") == record(request.get("host")).get("host_id"), "result host binding mismatch")
+        require(row.get("actual_placement") == placement, "Metal execution result binding mismatch")
+        require(row.get("workload_sha256") == sha256(root / "native/workload.json"), "Metal workload hash mismatch")
+        workload = read_json(root / "native/workload.json")
+        require(workload.get("complete") is True and workload.get("placement_verified") is True and
+                workload.get("source_role") == "metal_quantized" and workload.get("build") == info,
+                "Metal native workload/profile binding mismatch")
+        require(row.get("metal_kqv_offload") is workload.get("kqv_offload"), "Metal KQV policy binding mismatch")
+        return row
     require(info.get("cuda") == 1 and info.get("cycle_sim") == 0 and info.get("log_cycle") == 0
             and info.get("ggml_cpu_cycle_log") == 0, "direct latency artifact contains instrumentation")
     require(row.get("host_id") == record(request.get("host")).get("host_id"), "result host binding mismatch")

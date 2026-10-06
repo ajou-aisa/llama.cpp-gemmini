@@ -3,6 +3,9 @@
 #import "ggml-impl.h"
 #import "ggml-backend-impl.h"
 #import "ggml-metal-impl.h"
+#if defined(GGML_METAL_QUANTIZED)
+#import "ggml-metal-quantized.h"
+#endif
 
 #import <Foundation/Foundation.h>
 
@@ -1597,6 +1600,21 @@ static bool ggml_metal_supports_op(const struct ggml_backend_metal_device_contex
     const bool has_simdgroup_mm        = ctx_dev->has_simdgroup_mm;
     const bool has_simdgroup_reduction = ctx_dev->has_simdgroup_reduction;
     const bool use_bfloat              = ctx_dev->use_bfloat;
+
+#if defined(GGML_METAL_QUANTIZED)
+    if (op->src[0] != NULL) {
+        const enum ggml_type weight_type = op->src[0]->type;
+        const bool custom_weight = weight_type == GGML_TYPE_Q4_0 || weight_type == GGML_TYPE_Q8_0 ||
+            weight_type == GGML_TYPE_Q4_HP1 || weight_type == GGML_TYPE_Q8_HP1;
+        if ((op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) && custom_weight) {
+            return op->op == GGML_OP_MUL_MAT && ggml_metal_quantized_supports_op(op);
+        }
+        if (weight_type == GGML_TYPE_Q16_0 || weight_type == GGML_TYPE_Q16_HP1 ||
+            ((weight_type == GGML_TYPE_Q4_HP1 || weight_type == GGML_TYPE_Q8_HP1) && op->op == GGML_OP_GET_ROWS)) {
+            return false;
+        }
+    }
+#endif
 
     if (!use_bfloat) {
         for (size_t i = 0, n = 3; i < n; ++i) {
@@ -5090,7 +5108,7 @@ static bool ggml_metal_encode_node(
     return true;
 }
 
-static enum ggml_status ggml_metal_graph_compute(
+static enum ggml_status ggml_metal_graph_compute_native(
             ggml_backend_t   backend,
         struct ggml_cgraph * gf) {
     struct ggml_backend_metal_context        * ctx     = backend->context;
@@ -5221,6 +5239,57 @@ static enum ggml_status ggml_metal_graph_compute(
     }
 
     return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_metal_graph_compute(
+            ggml_backend_t   backend,
+        struct ggml_cgraph * gf) {
+#if defined(GGML_METAL_QUANTIZED)
+    struct ggml_backend_metal_context * ctx = backend->context;
+    ctx->gf = gf;
+    int begin = 0;
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        struct ggml_tensor * node = gf->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT || node->src[0] == NULL) {
+            continue;
+        }
+        const enum ggml_type type = node->src[0]->type;
+        if (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q8_0 &&
+            type != GGML_TYPE_Q4_HP1 && type != GGML_TYPE_Q8_HP1) {
+            continue;
+        }
+        // The CPU producer reads shared activation memory only after preceding
+        // Metal commands complete. Each custom call owns its payload to completion.
+        if (begin < i) {
+            struct ggml_cgraph segment = ggml_graph_view(gf, begin, i);
+            const enum ggml_status status = ggml_metal_graph_compute_native(backend, &segment);
+            ctx->gf = gf;
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+        }
+        if (ctx->abort_callback && ctx->abort_callback(ctx->abort_callback_data)) {
+            return GGML_STATUS_ABORTED;
+        }
+        const enum ggml_status status = ggml_metal_quantized_compute(node);
+        if (status != GGML_STATUS_SUCCESS) {
+            GGML_LOG_ERROR("%s: custom quantized matmul '%s' failed: %s\n",
+                __func__, node->name, ggml_metal_quantized_last_error());
+            return status;
+        }
+        begin = i + 1;
+    }
+    if (begin == gf->n_nodes) {
+        return GGML_STATUS_SUCCESS;
+    }
+    if (begin > 0) {
+        struct ggml_cgraph segment = ggml_graph_view(gf, begin, gf->n_nodes);
+        const enum ggml_status status = ggml_metal_graph_compute_native(backend, &segment);
+        ctx->gf = gf;
+        return status;
+    }
+#endif
+    return ggml_metal_graph_compute_native(backend, gf);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -5545,6 +5614,9 @@ static void ggml_backend_metal_free(ggml_backend_t backend) {
 
     ggml_backend_metal_device_rel(ctx_dev);
     ggml_metal_free(ctx);
+#ifdef GGML_METAL_QUANTIZED
+    ggml_metal_quantized_clear_weight_cache();
+#endif
 
     free(backend);
 }
@@ -5940,6 +6012,14 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
     }
+#if defined(GGML_METAL_QUANTIZED)
+    if (strcmp(name, "ggml_metal_quantized_get_stats") == 0) {
+        return (void *)ggml_metal_quantized_get_stats;
+    }
+    if (strcmp(name, "ggml_metal_quantized_reset_stats") == 0) {
+        return (void *)ggml_metal_quantized_reset_stats;
+    }
+#endif
 
     return NULL;
 

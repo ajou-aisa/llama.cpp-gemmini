@@ -116,6 +116,37 @@ ggml_add_backend_library(ggml-gemmini
                         )
 
 target_compile_features(ggml-gemmini PRIVATE cxx_std_17)
+if (GGML_GEMMINI_METAL_CPU_EXACT)
+  enable_language(OBJCXX)
+  set(_cpu_exact_dir "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-metal")
+  file(READ "${_cpu_exact_dir}/ggml-metal-cpu-exact.metal" _cpu_exact_shader)
+  file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ggml-metal-cpu-exact-source.inc" CONTENT
+      "static const char ggml_metal_cpu_exact_source[] = R\"CPU_EXACT(\n${_cpu_exact_shader}\n)CPU_EXACT\";\n")
+  file(READ "${_cpu_exact_dir}/ggml-metal-cpu-exact-int.metal" _cpu_exact_int_shader)
+  file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ggml-metal-cpu-exact-int-source.inc" CONTENT
+      "static const char ggml_metal_cpu_exact_int_source[] = R\"CPU_EXACT(\n${_cpu_exact_int_shader}\n)CPU_EXACT\";\n")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+      "${_cpu_exact_dir}/ggml-metal-cpu-exact.metal" "${_cpu_exact_dir}/ggml-metal-cpu-exact-int.metal")
+  add_library(ggml-gemmini-metal-cpu-exact STATIC
+      "${_cpu_exact_dir}/ggml-metal-cpu-exact.mm"
+      "${_cpu_exact_dir}/ggml-metal-cpu-exact-int.mm")
+  target_compile_features(ggml-gemmini-metal-cpu-exact PRIVATE cxx_std_17)
+  target_compile_options(ggml-gemmini-metal-cpu-exact PRIVATE -fno-fast-math -ffp-contract=off)
+  set_source_files_properties("${_cpu_exact_dir}/ggml-metal-cpu-exact-int.mm" PROPERTIES
+      COMPILE_OPTIONS "-fobjc-arc")
+  target_include_directories(ggml-gemmini-metal-cpu-exact PRIVATE
+      "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
+  set_target_properties(ggml-gemmini-metal-cpu-exact PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  find_library(_cpu_exact_metal Metal REQUIRED)
+  find_library(_cpu_exact_foundation Foundation REQUIRED)
+  target_link_libraries(ggml-gemmini-metal-cpu-exact PRIVATE ${_cpu_exact_metal} ${_cpu_exact_foundation})
+  target_link_libraries(ggml-gemmini PRIVATE ggml-gemmini-metal-cpu-exact)
+  target_link_options(ggml-gemmini PRIVATE "LINKER:-force_load,$<TARGET_FILE:ggml-gemmini-metal-cpu-exact>")
+  target_compile_definitions(ggml-gemmini PUBLIC GGML_GEMMINI_METAL_CPU_EXACT=1)
+  target_include_directories(ggml-gemmini PRIVATE "${_cpu_exact_dir}")
+  file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/cpu-exact-build.txt" CONTENT
+      "compiler=${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}\ncompiler_path=${CMAKE_CXX_COMPILER}\ngemmini_sw_path=${GEMMINI_SW_PATH}\n")
+endif()
 target_compile_definitions(ggml-gemmini PRIVATE
   GGML_GEMMINI_MATMUL_IMPLEMENTATION)
 ggml_gemmini_apply_profile_compile_definitions(ggml-gemmini)

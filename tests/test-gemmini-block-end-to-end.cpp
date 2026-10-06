@@ -147,7 +147,7 @@ int weight_code(size_t column, size_t block) {
     return static_cast<int>(column % 3 + 1) * (block % 2 == 0 ? 1 : -1);
 }
 
-std::vector<uint8_t> make_weights(size_t cols, size_t columns) {
+std::vector<uint8_t> make_weights(size_t cols, size_t columns, [[maybe_unused]] bool negative_q4_scale) {
     std::vector<uint8_t> encoded(columns * ggml_row_size(kWeightType, cols));
     const size_t blocks = cols / kGroup;
 #if GGML_GEMMINI_WEIGHT_BITS == 4
@@ -155,8 +155,8 @@ std::vector<uint8_t> make_weights(size_t cols, size_t columns) {
     for (size_t column = 0; column < columns; ++column) {
         for (size_t block = 0; block < blocks; ++block) {
             block_q4_0 & encoded_block = data[column * blocks + block];
-            encoded_block.d = ggml_fp32_to_fp16(1.0f);
-            const uint8_t code = static_cast<uint8_t>(weight_code(column, block) + 8);
+            encoded_block.d = ggml_fp32_to_fp16(negative_q4_scale ? -0.25f : 1.0f);
+            const uint8_t code = negative_q4_scale ? 0 : static_cast<uint8_t>(weight_code(column, block) + 8);
             std::memset(encoded_block.qs, static_cast<int>(code | (code << 4)), sizeof(encoded_block.qs));
         }
     }
@@ -184,15 +184,18 @@ std::vector<uint8_t> make_weights(size_t cols, size_t columns) {
     return encoded;
 }
 
-float scalar_dot(const Reconstruction & activation, size_t row, size_t column, size_t cols) {
+float scalar_dot(const Reconstruction & activation, size_t row, size_t column, size_t cols,
+                 bool negative_q4_scale) {
     float total = 0.0f;
     for (size_t k = 0; k < cols; ++k) {
-        total += activation.values[row * cols + k] * weight_code(column, k / kGroup);
+        // Stored Q4_0 code -8 with d=-0.25 represents +2 without H1 clipping.
+        const float weight = negative_q4_scale ? 2.0f : static_cast<float>(weight_code(column, k / kGroup));
+        total += activation.values[row * cols + k] * weight;
     }
     return total;
 }
 
-bool run_happy_case(ggml_backend_t backend, size_t rows, size_t cols) {
+bool run_happy_case(ggml_backend_t backend, size_t rows, size_t cols, bool negative_q4_scale = false) {
     ggml_init_params params{ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true};
     ggml_context * ctx = ggml_init(params);
     if (!check(ctx != nullptr, "context initializes")) return false;
@@ -209,8 +212,9 @@ bool run_happy_case(ggml_backend_t backend, size_t rows, size_t cols) {
         return false;
     }
 
-    const std::vector<float> source = make_activation(rows, cols);
-    const std::vector<uint8_t> weights_data = make_weights(cols, kColumns);
+    const std::vector<float> source = negative_q4_scale
+        ? std::vector<float>(rows * cols, 1.0f) : make_activation(rows, cols);
+    const std::vector<uint8_t> weights_data = make_weights(cols, kColumns, negative_q4_scale);
     const Reconstruction expected_activation = scalar_reconstruct(source, rows, cols);
     ggml_backend_tensor_set(weights, weights_data.data(), 0, weights_data.size());
     ggml_backend_tensor_set(activation, source.data(), 0, source.size() * sizeof(float));
@@ -228,7 +232,7 @@ bool run_happy_case(ggml_backend_t backend, size_t rows, size_t cols) {
         float max_rel = 0.0f;
         for (size_t row = 0; row < rows; ++row) {
             for (size_t column = 0; column < kColumns; ++column) {
-                const float expected = scalar_dot(expected_activation, row, column, cols);
+                const float expected = scalar_dot(expected_activation, row, column, cols, negative_q4_scale);
                 const float observed = actual[row * kColumns + column];
                 const float error = std::fabs(observed - expected);
                 max_abs = std::max(max_abs, error);
@@ -240,6 +244,10 @@ bool run_happy_case(ggml_backend_t backend, size_t rows, size_t cols) {
         std::printf("BLOCK_E2E backend=%s rows=%zu J=%zu K=%zu outliers=%zu max_abs=%g max_rel=%g %s\n",
                     ggml_backend_name(backend), rows, kColumns, cols, expected_activation.outliers,
                     max_abs, max_rel, ok ? "PASS" : "FAIL");
+        if (negative_q4_scale) {
+            std::printf("BLOCK_E2E_NEGATIVE_Q4_SCALE actual=%.9g expected=64 %s\n",
+                        static_cast<double>(actual.front()), ok ? "PASS" : "FAIL");
+        }
     }
 
     ggml_backend_buffer_free(buffer);
@@ -372,9 +380,12 @@ int main(int argc, char ** argv) {
     ggml_backend_t backend = ggml_backend_init_by_name("GEMMINI", "llama");
     if (!check(backend != nullptr && std::strcmp(ggml_backend_name(backend), "GEMMINI") == 0,
                "public GEMMINI backend is selected")) return 1;
-    const bool ok = run_happy_case(backend, 1, 32) &&
+    bool ok = run_happy_case(backend, 1, 32) &&
         run_happy_case(backend, static_cast<size_t>(DIM) + 1, 64) &&
         run_happy_case(backend, 2, 96);
+#if GGML_GEMMINI_WEIGHT_BITS == 4
+    ok = run_happy_case(backend, 1, 32, true) && ok;
+#endif
     ggml_backend_free(backend);
     if (cycle_path != nullptr) ggml::gemmini::log::cycle.set_output(stderr);
     return ok && (cycle_path == nullptr || verify_cycle_log(

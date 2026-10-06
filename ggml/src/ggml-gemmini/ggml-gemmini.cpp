@@ -19,6 +19,10 @@
 #include <tuple>
 #include "ggml-impl.h"
 #include "ggml-gemmini.h"
+#if defined(GGML_GEMMINI_METAL_CPU_EXACT)
+#include "ggml-metal-cpu-exact.h"
+#include "ggml-metal-cpu-exact-int.h"
+#endif
 #include "ggml-gemmini-config.hpp"
 #include "ggml-gemmini-buffer.hpp"
 #include "ggml-gemmini-q8-h1-artifact.hpp"
@@ -36,6 +40,7 @@
 #endif
 #include "dump/dump_tensor.hpp"
 
+#include <gemmini_params.h>
 #include <gemmini.h>
 #include "ggml-gemmini-args.h"
 #include "ggml-gemmini-matmul.hpp"
@@ -1252,6 +1257,18 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
 
     if constexpr (ggml::gemmini::config::CURRENT_COMPUTE_TYPE == ggml::gemmini::config::ComputeType::FLOAT &&
                   !ggml::gemmini::config::DEQUANT_FP_TEST) {
+#if defined(GGML_GEMMINI_METAL_CPU_EXACT)
+        if (ggml_metal_cpu_exact_int_enabled() &&
+            (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0)) {
+            std::vector<float> src0_f32(jk_count);
+            ggml_get_type_traits(src0->type)->to_float(src0->data, src0_f32.data(), jk_count);
+            if (!ggml_metal_cpu_exact_float(I, J, K, static_cast<const float *>(src1->data),
+                                          src0_f32.data(), static_cast<float *>(dst->data))) {
+                GGML_ABORT("CPU-equivalent Metal FLOAT failed: %s", ggml_metal_cpu_exact_last_error());
+            }
+            return;
+        }
+#endif
         if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) {
             std::vector<float> src0_f32;
             const float *src0_f = (const float *)src0->data;
@@ -2257,7 +2274,7 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
       ggml::gemmini::MatMul facade(args);
       const auto facade_result = facade.run_full();
       if (facade_result.status != ggml::gemmini::MatMulStatus::success) {
-        GGML_ABORT("Gemmini full facade execution failed");
+        GGML_ABORT("Gemmini full facade execution failed: status=%d", static_cast<int>(facade_result.status));
       }
     }
 

@@ -35,6 +35,8 @@ execute_process(
 set(contract_log "${TEST_ROOT}/commands.log")
 execute_process(
     COMMAND "${CMAKE_COMMAND}" -E env
+        --unset=GGML_CUDA --unset=GGML_METAL
+        --unset=GGML_CUDA_DEFAULT --unset=GGML_METAL_DEFAULT
         "PATH=${TEST_ROOT}/bin:$ENV{PATH}"
         "CONTRACT_LOG=${contract_log}"
         "BUILD_DIR=${TEST_ROOT}/build"
@@ -59,3 +61,9 @@ if(build_at EQUAL -1)
     message(FATAL_ERROR
         "build-arm64.sh did not use the detected Linux CPU count:\n${commands}")
 endif()
+foreach(expected IN ITEMS "-DGGML_CUDA=ON" "-DGGML_METAL=OFF")
+    string(FIND "${commands}" "${expected}" backend_at)
+    if(backend_at EQUAL -1)
+        message(FATAL_ERROR "Linux ARM64 backend default missing ${expected}:\n${commands}")
+    endif()
+endforeach()

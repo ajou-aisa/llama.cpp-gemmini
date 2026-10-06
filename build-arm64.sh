@@ -69,6 +69,13 @@ GGML_GEMMINI_EXSIA_DEFAULT_MODE_DEFAULT=${GGML_GEMMINI_EXSIA_DEFAULT_MODE:-LOCAL
 GGML_GEMMINI_EXSIA_LOCAL_WORKERS_DEFAULT=${GGML_GEMMINI_EXSIA_LOCAL_WORKERS:-3} # 3 | 4
 GGML_GEMMINI_EXSIA_PROFILE_SCOPE_DEFAULT=${GGML_GEMMINI_EXSIA_PROFILE_SCOPE:-OFF} # OFF | TIMELINE | STAGE
 BREW_BIN=""
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  GGML_CUDA_DEFAULT=${GGML_CUDA_DEFAULT:-OFF}
+  GGML_METAL_DEFAULT=${GGML_METAL_DEFAULT:-ON}
+else
+  GGML_CUDA_DEFAULT=${GGML_CUDA_DEFAULT:-ON}
+  GGML_METAL_DEFAULT=${GGML_METAL_DEFAULT:-OFF}
+fi
 
 im2p_resolve_build_options "$BUILD_DIR" "${0##*/}" "$@"
 if [[ "$IM2P_BUILD_DRY_RUN" == 1 ]]; then
@@ -86,10 +93,7 @@ if [[ "$GGML_GEMMINI_EXSIA_PROFILE_SCOPE_DEFAULT" != "OFF" && "$CYCLE_DETAIL_DEF
 fi
 
 PLATFORM_CMAKE_ARGS=()
-# Metal exists only on macOS; other hosts (e.g. Linux aarch64) build the CPU backend.
-GGML_METAL_PLATFORM=OFF
 if [[ "$(uname -s)" == "Darwin" ]]; then
-  GGML_METAL_PLATFORM=ON
   if command -v brew >/dev/null 2>&1; then
     BREW_BIN="$(command -v brew)"
   elif [[ -x /opt/homebrew/bin/brew ]]; then
@@ -127,8 +131,6 @@ cmake -B "$BUILD_DIR" -S "$SCRIPT_ROOT" \
   -U 'CMAKE_PREFIX_PATH' \
   -U 'OpenMP_ROOT' \
   -DGGML_GEMMINI=OFF \
-  -DGGML_CUDA=ON \
-  -DGGML_METAL="${GGML_METAL_PLATFORM}" \
   -DGGML_BLAS=OFF \
   -DGGML_BACKEND_DL=ON \
   -DLLAMA_BUILD_TESTS=OFF \

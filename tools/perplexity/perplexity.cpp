@@ -3,6 +3,12 @@
 #include "evaluation-workload.h"
 #include "log.h"
 #include "llama.h"
+#if defined(PERPLEXITY_METAL_QUANTIZED)
+#include "perplexity-metal.hpp"
+#endif
+#if defined(PERPLEXITY_METAL_CPU_EXACT)
+#include "perplexity-metal-cpu-exact.hpp"
+#endif
 
 #include <chrono>
 #include <algorithm>
@@ -28,6 +34,7 @@ struct results_perplexity {
     double                   ppl_value;
     std::vector<float>       logits;
     std::vector<float>       probs;
+    int                      evaluated_tokens = 0;
 };
 
 struct results_log_softmax {
@@ -436,7 +443,7 @@ static results_perplexity perplexity_v2(llama_context * ctx, const common_params
     }
     LOG("\n");
 
-    return {tokens, std::exp(nll / count), logit_history, prob_history};
+    return {tokens, std::exp(nll / count), logit_history, prob_history, count};
 }
 
 static results_perplexity perplexity(llama_context * ctx, const common_params & params, const int32_t n_ctx) {
@@ -633,7 +640,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
     llama_batch_free(batch);
 
-    return {tokens, ppl, logit_history, prob_history};
+    return {tokens, ppl, logit_history, prob_history, count};
 }
 
 static bool decode_helper(llama_context * ctx, llama_batch & batch, std::vector<float> & batch_logits, int n_batch, int n_vocab) {
@@ -1995,6 +2002,26 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
+#if defined(PERPLEXITY_METAL_QUANTIZED)
+    perplexity_metal_guard metal_guard;
+    try {
+        metal_guard.install(params);
+    } catch (const std::exception & error) {
+        LOG_ERR("%s: Metal quantized coverage guard initialization failed: %s\n", __func__, error.what());
+        return 1;
+    }
+#endif
+
+#if defined(PERPLEXITY_METAL_CPU_EXACT)
+    perplexity_metal_cpu_exact_guard cpu_exact_guard;
+    try {
+        cpu_exact_guard.install(params);
+    } catch (const std::exception & error) {
+        LOG_ERR("%s: %s\n", __func__, error.what());
+        return 1;
+    }
+#endif
+
     // load the model and apply lora adapter, if any
     common_init_result llama_init = common_init_from_params(params);
 
@@ -2032,13 +2059,31 @@ int main(int argc, char ** argv) {
     } else {
         results = perplexity(ctx, params, n_ctx);
         evaluation_ok = results.ppl_value >= 0;
+#if defined(PERPLEXITY_METAL_QUANTIZED)
+        if (metal_guard.active) {
+            metal_guard.evaluated_tokens = results.evaluated_tokens;
+            evaluation_ok = results.evaluated_tokens > 0 && std::isfinite(results.ppl_value) && results.ppl_value > 0;
+        }
+#endif
     }
 
     LOG("\n");
     llama_perf_context_print(ctx);
 
     const bool fpga_execution_ok = common_fpga_execution_check();
+#if defined(PERPLEXITY_METAL_QUANTIZED)
+    const bool metal_execution_ok = metal_guard.finish(evaluation_ok && fpga_execution_ok);
+    if (!metal_execution_ok) LOG_ERR("%s: Metal quantized coverage incomplete or CPU fallback detected\n", __func__);
+#else
+    const bool metal_execution_ok = true;
+#endif
+#if defined(PERPLEXITY_METAL_CPU_EXACT)
+    const bool cpu_exact_ok = cpu_exact_guard.finish(evaluation_ok && fpga_execution_ok,
+                                                    results.evaluated_tokens);
+#else
+    const bool cpu_exact_ok = true;
+#endif
     llama_backend_free();
 
-    return evaluation_ok && fpga_execution_ok ? 0 : 1;
+    return evaluation_ok && fpga_execution_ok && metal_execution_ok && cpu_exact_ok ? 0 : 1;
 }

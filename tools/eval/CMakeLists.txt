@@ -2,6 +2,9 @@ set(EVALUATION_HP1 0)
 if(CYCLE_SIM OR IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1" OR IM2P_FPGA_ARCH STREQUAL "GEMMINI_HP1")
     set(EVALUATION_HP1 1)
 endif()
+if(GGML_METAL_QUANTIZED AND GGML_GEMMINI_ACTIVATION_QUANT STREQUAL "EXSIA")
+    set(EVALUATION_HP1 1)
+endif()
 add_executable(llama-eval-workload eval.cpp evaluation-trace.cpp)
 target_compile_features(llama-eval-workload PRIVATE cxx_std_17)
 target_compile_definitions(llama-eval-workload PRIVATE
@@ -15,9 +18,14 @@ target_compile_definitions(llama-eval-workload PRIVATE
     EVALUATION_MATMUL_MODE="${GGML_GEMMINI_DEFAULT_MATMUL_MODE}"
     EVALUATION_HP1=${EVALUATION_HP1}
     EVALUATION_CUDA=$<BOOL:${GGML_CUDA}>
+    EVALUATION_METAL=$<BOOL:${GGML_METAL}>
+    EVALUATION_METAL_QUANTIZED=$<BOOL:${GGML_METAL_QUANTIZED}>
     EVALUATION_CPU_CYCLE_LOG=$<BOOL:${GGML_CPU_CYCLE_LOG}>
     EVALUATION_GEMMINI=$<BOOL:${GGML_GEMMINI}>)
 target_link_libraries(llama-eval-workload PRIVATE common llama ggml-gemmini-utils)
+if(GGML_METAL_QUANTIZED)
+    target_include_directories(llama-eval-workload PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
+endif()
 install(TARGETS llama-eval-workload RUNTIME)
 if(LLAMA_BUILD_TESTS)
     add_test(NAME test-evaluation-terminal-lm-head

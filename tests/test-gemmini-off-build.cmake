@@ -33,6 +33,31 @@ expect_gemmini(build-arm64-cpu.sh OFF -DGGML_GEMMINI=OFF)
 expect_gemmini(build-x86.sh OFF -DGGML_GEMMINI=OFF)
 expect_gemmini(build-riscv.sh OFF -DGGML_GEMMINI=OFF)
 
+function(expect_arm64_backends expected_cuda expected_metal)
+    execute_process(
+        COMMAND env -u GGML_CUDA -u GGML_METAL -u GGML_CUDA_DEFAULT -u GGML_METAL_DEFAULT
+            BUILD_JOBS=1 bash "${TEST_SOURCE_DIR}/build-arm64.sh" --dry-run ${ARGN}
+        RESULT_VARIABLE result
+        ERROR_VARIABLE error)
+    if(NOT result EQUAL 0)
+        message(FATAL_ERROR "ARM64 backend resolution failed: ${error}")
+    endif()
+    string(REGEX MATCH "IM2P_EFFECTIVE_CONFIG=([^\n]+)" summary "${error}")
+    string(JSON cuda GET "${CMAKE_MATCH_1}" effective GGML_CUDA)
+    string(JSON metal GET "${CMAKE_MATCH_1}" effective GGML_METAL)
+    if(NOT cuda STREQUAL expected_cuda OR NOT metal STREQUAL expected_metal)
+        message(FATAL_ERROR "Expected CUDA=${expected_cuda}/Metal=${expected_metal}: ${summary}")
+    endif()
+endfunction()
+
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin")
+    expect_arm64_backends(OFF ON)
+else()
+    expect_arm64_backends(ON OFF)
+endif()
+expect_arm64_backends(ON OFF -DGGML_CUDA:BOOL=ON -DGGML_METAL:BOOL=OFF)
+expect_arm64_backends(OFF ON -DGGML_CUDA=OFF -DGGML_METAL=ON)
+
 string(RANDOM LENGTH 8 ALPHABET 0123456789abcdef suffix)
 set(build_dir "${CMAKE_CURRENT_BINARY_DIR}/gemmini-off-${suffix}")
 set(stale_backend "${build_dir}/bin/libggml-gemmini.so")

@@ -14,6 +14,24 @@ target_link_libraries(ggml-metal PRIVATE
                       ${METALKIT_FRAMEWORK}
                       )
 
+if (GGML_METAL_QUANTIZED)
+    set_source_files_properties(ggml-metal.m PROPERTIES LANGUAGE OBJC)
+    include(quantized-producer.cmake)
+    ggml_metal_add_quantized_producer(ggml-metal)
+    target_sources(ggml-metal PRIVATE ggml-metal-quantized.mm)
+    target_compile_definitions(ggml-metal PRIVATE GGML_METAL_QUANTIZED=1)
+    target_compile_features(ggml-metal PRIVATE cxx_std_17)
+    set_source_files_properties(ggml-metal-quantized.mm PROPERTIES
+        COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        ggml-metal-soft-f64.h ggml-metal-quantized.metal)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/ggml-metal-soft-f64.h" _quantized_fp64)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/ggml-metal-quantized.metal" _quantized_shader)
+    file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ggml-metal-quantized-source.inc" CONTENT
+        "static const char ggml_metal_quantized_source[] = R\"MQ_SOURCE(\n${_quantized_fp64}\n${_quantized_shader}\n)MQ_SOURCE\";\n")
+    target_include_directories(ggml-metal PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+endif()
+
 if (GGML_METAL_NDEBUG)
     add_compile_definitions(GGML_METAL_NDEBUG)
 endif()

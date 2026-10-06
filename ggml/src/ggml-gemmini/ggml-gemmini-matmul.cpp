@@ -2,6 +2,9 @@
 #define GGML_GEMMINI_MATMUL_IMPLEMENTATION 1
 #include "ggml-gemmini-matmul.hpp"
 #include "quants/common/weight_reader.hpp"
+#if defined(GGML_GEMMINI_METAL_CPU_EXACT)
+#include "../ggml-metal/ggml-metal-cpu-exact-int.h"
+#endif
 
 #include <gemmini/log.hpp>
 #include <gemmini/cycle_reader.hpp>
@@ -494,7 +497,7 @@ baseline_activation_quant_t baseline_activation_for(const ggml_gemmini_args_t & 
     return baseline_activation_quant_t::EXSIA;
 }
 
-MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
+MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args, bool stored_block = false, bool legacy_hp1 = false) {
     using namespace quants::wreader;
     using namespace quants::wroute;
 
@@ -521,13 +524,22 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
     if (args.tile_I == 0 || args.tile_J == 0 || args.tile_K == 0) {
         gemmini_set_tile_ws(&args);
     }
-    if (args.tile_I == 0 || args.tile_J == 0 ||
+    if (args.tile_I == 0 || args.tile_J == 0 || args.tile_K == 0 ||
         args.tile_I > std::numeric_limits<size_t>::max() / DIM ||
-        args.tile_J > std::numeric_limits<size_t>::max() / DIM) {
+        args.tile_J > std::numeric_limits<size_t>::max() / DIM ||
+        args.tile_K > std::numeric_limits<size_t>::max() / DIM) {
         return MatMulStatus::invalid_contract;
     }
-    const size_t rows_per_tile = args.tile_I * DIM;
-    const size_t columns_per_tile = args.tile_J * DIM;
+    bool metal_raw_dot = false;
+#if defined(GGML_GEMMINI_METAL_CPU_EXACT)
+    metal_raw_dot = ggml_metal_cpu_exact_int_enabled();
+    if (metal_raw_dot && (args.A.bits != 4 && args.A.bits != 8)) {
+        return MatMulStatus::unsupported;
+    }
+#endif
+    const size_t rows_per_tile = metal_raw_dot ? 128 : args.tile_I * DIM;
+    const size_t columns_per_tile = metal_raw_dot ? 128 : args.tile_J * DIM;
+    const size_t metal_fragment = (stored_block || legacy_hp1) && (args.tile_K * DIM) % 32 != 0 ? 16 : 32;
     const size_t row_tile_count =
         args.I / rows_per_tile + static_cast<size_t>(args.I % rows_per_tile != 0);
     const size_t column_tile_count =
@@ -552,6 +564,12 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
     }
     const bool block_activation =
         std::holds_alternative<quants::act::block::Meta>(args.act_quant.storage());
+    if (stored_block && !block_activation) {
+        return MatMulStatus::invalid_contract;
+    }
+    if (legacy_hp1 && !std::holds_alternative<quants::act::exsia::Meta>(args.act_quant.storage())) {
+        return MatMulStatus::invalid_contract;
+    }
 
     std::vector<float> activation_scales;
     try {
@@ -562,13 +580,19 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
         return MatMulStatus::invalid_arguments;
     }
     for (size_t row = 0; row < activation_scales.size(); ++row) {
-        if (!activation_meta.scale(row, activation_scales[row])) {
+        if (legacy_hp1) {
+            const auto & meta = std::get<quants::act::exsia::Meta>(args.act_quant.storage());
+            const int16_t theta = meta.resolve_stripe_theta(static_cast<int>(row / (args.tile_I * DIM)));
+            if (theta == INT16_MIN) return MatMulStatus::invalid_contract;
+            activation_scales[row] = gemmini_detail::apply_activation_exponent(1.0f, theta, 0);
+        } else if (!activation_meta.scale(row, activation_scales[row])) {
             return MatMulStatus::invalid_contract;
         }
     }
 
     const size_t bias_stride = args.sD != 0 ? args.sD : args.J;
-    if (args.D != nullptr) {
+    const bool apply_bias = args.D != nullptr && !stored_block && !legacy_hp1;
+    if (apply_bias) {
         if (!args.repeating_bias && args.I > 1 &&
             bias_stride >
                 (std::numeric_limits<size_t>::max() - (args.J - 1)) /
@@ -608,6 +632,9 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
         std::vector<int32_t> weight_codes;
         std::vector<double> weight_scales;
         std::vector<double> accumulations;
+        std::vector<int32_t> metal_activation;
+        std::vector<int32_t> metal_weight;
+        std::vector<int32_t> metal_dots;
     };
     const size_t max_rows_in_tile = std::min(rows_per_tile, args.I);
     const size_t max_columns_in_tile = std::min(columns_per_tile, args.J);
@@ -641,6 +668,17 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
             scratch.weight_scales.resize(max_columns_in_tile);
             scratch.accumulations.resize(
                 max_rows_in_tile * max_columns_in_tile);
+            if (metal_raw_dot) {
+                constexpr size_t max_elements = 16 * 1024 * 1024;
+                if (block_size != 32 || args.K > max_elements / max_rows_in_tile ||
+                    args.K > max_elements / max_columns_in_tile ||
+                    (args.K + metal_fragment - 1) / metal_fragment > max_elements / max_rows_in_tile / max_columns_in_tile) {
+                    return MatMulStatus::invalid_contract;
+                }
+                scratch.metal_activation.resize(max_rows_in_tile * args.K);
+                scratch.metal_weight.resize(max_columns_in_tile * args.K);
+                scratch.metal_dots.resize(max_rows_in_tile * max_columns_in_tile * ((args.K + metal_fragment - 1) / metal_fragment));
+            }
         }
     } catch (const std::bad_alloc &) {
         return MatMulStatus::invalid_arguments;
@@ -670,6 +708,28 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
             scratch.accumulations.begin(),
             row_count * column_count, 0.0);
 
+#if defined(GGML_GEMMINI_METAL_CPU_EXACT)
+        if (metal_raw_dot) {
+            for (size_t row = 0; row < row_count; ++row) {
+                for (size_t k = 0; k < args.K; ++k) {
+                    scratch.metal_activation[row * args.K + k] = args.A.get(row_begin + row, k);
+                }
+            }
+            for (size_t column = 0; column < column_count; ++column) {
+                for (size_t k = 0; k < args.K; ++k) {
+                    const auto code = read_code_validated(args, plan, column_begin + column, k);
+                    if (!code.ok()) { execution_valid.store(false); return; }
+                    scratch.metal_weight[column * args.K + k] = code.value;
+                }
+            }
+            if (!ggml_metal_cpu_exact_int_dot(scratch.metal_activation.data(), scratch.metal_weight.data(),
+                    row_count, column_count, args.K, metal_fragment, scratch.metal_dots.data())) {
+                execution_valid.store(false);
+                return;
+            }
+        }
+#endif
+
         for (size_t block_begin = 0; block_begin < args.K;) {
             const size_t block_index = block_begin / block_size;
             const size_t weight_block_end =
@@ -682,13 +742,23 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
                           block_begin % quants::act::block::kGroupSize,
                       args.K - block_begin)
                 : weight_block_end;
-            const size_t block_count =
+            size_t block_count =
                 std::min(weight_block_end, activation_block_end) - block_begin;
+            if (stored_block || legacy_hp1) {
+                block_count = std::min(block_count, args.tile_K * DIM - block_begin % (args.tile_K * DIM));
+            }
             bool tile_valid = true;
 
             for (size_t local_column = 0;
                  local_column < column_count; ++local_column) {
                 const size_t column = column_begin + local_column;
+                if (legacy_hp1) {
+                    const block_q8_hp1 * block = args.q8_hp1_block(column, block_index);
+                    if (block == nullptr) { tile_valid = false; break; }
+                    scratch.weight_scales[local_column] = block->m == INT16_MIN ? 0.0 :
+                        static_cast<double>(gemmini_ldexp_fast_pos(block->channel_scale, block->m));
+                    continue;
+                }
                 const WeightScaleResult scale =
                     read_scale_validated(args, plan, column, block_index);
                 if (!scale.ok()) {
@@ -711,7 +781,7 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
                 int32_t * decoded =
                     scratch.weight_codes.data() +
                     local_column * block_size;
-                for (size_t local_k = 0; local_k < block_count; ++local_k) {
+                for (size_t local_k = 0; !metal_raw_dot && local_k < block_count; ++local_k) {
                     const WeightCodeResult code = read_code_validated(
                         args, plan, column, block_begin + local_k);
                     if (!code.ok()) {
@@ -733,7 +803,7 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
                 int32_t * decoded =
                     scratch.activation_codes.data() +
                     local_row * block_size;
-                for (size_t local_k = 0; local_k < block_count; ++local_k) {
+                for (size_t local_k = 0; !metal_raw_dot && local_k < block_count; ++local_k) {
                     decoded[local_k] =
                         args.A.get(row_begin + local_row, block_begin + local_k);
                 }
@@ -756,17 +826,29 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
                         scratch.weight_codes.data() +
                         local_column * block_size;
                     int64_t block_dot = 0;
-                    for (size_t local_k = 0;
-                         local_k < block_count; ++local_k) {
-                        block_dot += static_cast<int64_t>(activation[local_k]) *
-                            static_cast<int64_t>(weight[local_k]);
+                    if (metal_raw_dot) {
+                        for (size_t offset = 0; offset < block_count; offset += metal_fragment) {
+                            block_dot += scratch.metal_dots[((block_begin + offset) / metal_fragment * row_count + local_row) * column_count + local_column];
+                        }
+                    } else {
+                        for (size_t local_k = 0;
+                             local_k < block_count; ++local_k) {
+                            block_dot += static_cast<int64_t>(activation[local_k]) *
+                                static_cast<int64_t>(weight[local_k]);
+                        }
                     }
                     test_detail::observe_native_integer_block_dot();
-                    scratch.accumulations[
-                        local_row * column_count + local_column] +=
-                        static_cast<double>(block_dot) *
-                        scratch.weight_scales[local_column] *
-                        static_cast<double>(activation_scale);
+                    if (stored_block) {
+                        scratch.accumulations[local_row * column_count + local_column] +=
+                            static_cast<double>(block_dot) *
+                            (scratch.weight_scales[local_column] * static_cast<double>(activation_scale));
+                    } else {
+                        scratch.accumulations[
+                            local_row * column_count + local_column] +=
+                            static_cast<double>(block_dot) *
+                            scratch.weight_scales[local_column] *
+                            static_cast<double>(activation_scale);
+                    }
                     test_detail::observe_native_post_dot_scale();
                 }
             }
@@ -784,7 +866,7 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args) {
                 if (!block_activation) {
                     value *= static_cast<double>(activation_scales[row]);
                 }
-                if (args.D != nullptr) {
+                if (apply_bias) {
                     const size_t bias_row = args.repeating_bias ? 0 : row;
                     const size_t bias_index =
                         bias_row * bias_stride + column;
@@ -896,6 +978,11 @@ MatMulStatus execute_dense(ggml_gemmini_args_t &args, std::optional<uint64_t> st
             return MatMulStatus::unsupported;
         }
         test_detail::observe_backend_dispatch(true);
+#if defined(GGML_GEMMINI_METAL_CPU_EXACT)
+        if (ggml_metal_cpu_exact_int_enabled()) {
+            return execute_native_matched_int_dense(args, true);
+        }
+#endif
         return tiled_matmul_auto_im2p(&args) == DenseMatmulStatus::success
             ? MatMulStatus::success
             : MatMulStatus::invalid_contract;
@@ -907,6 +994,13 @@ MatMulStatus execute_dense(ggml_gemmini_args_t &args, std::optional<uint64_t> st
         test_detail::observe_backend_dispatch(true);
         return execute_native_matched_int_dense(args);
     }
+#if defined(GGML_GEMMINI_METAL_CPU_EXACT)
+    if (ggml_metal_cpu_exact_int_enabled() && args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1) {
+        if (args.tiled_matmul_type != CPU) return MatMulStatus::unsupported;
+        test_detail::observe_backend_dispatch(true);
+        return execute_native_matched_int_dense(args, false, true);
+    }
+#endif
     test_detail::observe_backend_dispatch(args.tiled_matmul_type == CPU);
     if (uses_baseline_channel_route(args)) {
         tiled_matmul_auto_baseline(&args, baseline_activation_for(args),

@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.14) # for add_link_options and implicit target directories.
 project("llama.cpp" C CXX)
+if (APPLE AND GGML_METAL_QUANTIZED)
+    enable_language(OBJC)
+    enable_language(OBJCXX)
+endif()
 include(CheckIncludeFileCXX)
 
 #set(CMAKE_WARN_DEPRECATED YES)

@@ -1,6 +1,40 @@
 llama_add_compile_flags()
 add_compile_definitions(GGML_GEMMINI_BLOCK_SIZE=${_GGML_GEMMINI_BLOCK_SIZE_VALUE})
 
+if (GGML_METAL_QUANTIZED)
+    if (GGML_BACKEND_DL)
+        message(FATAL_ERROR "Metal quantized correctness tests require directly linked backends; configure GGML_BACKEND_DL=OFF")
+    endif()
+    add_executable(test-metal-quantized test-metal-quantized.cpp)
+    target_compile_features(test-metal-quantized PRIVATE cxx_std_17)
+    target_compile_options(test-metal-quantized PRIVATE -fno-fast-math -ffp-contract=off)
+    target_include_directories(test-metal-quantized PRIVATE ../ggml/src/ggml-metal ../ggml/src)
+    target_link_libraries(test-metal-quantized PRIVATE ggml ggml-metal ggml-metal-quantized-producer)
+    add_test(NAME test-metal-quantized COMMAND test-metal-quantized)
+    add_executable(test-metal-quantized-model test-metal-quantized-model.cpp)
+    target_compile_features(test-metal-quantized-model PRIVATE cxx_std_17)
+    target_compile_options(test-metal-quantized-model PRIVATE -fno-fast-math -ffp-contract=off)
+    target_link_libraries(test-metal-quantized-model PRIVATE llama ggml ggml-metal ggml-metal-quantized-producer)
+    add_executable(benchmark-metal-quantized benchmark-metal-quantized.cpp)
+    target_compile_features(benchmark-metal-quantized PRIVATE cxx_std_17)
+    target_compile_options(benchmark-metal-quantized PRIVATE -fno-fast-math -ffp-contract=off)
+    target_link_libraries(benchmark-metal-quantized PRIVATE ggml ggml-metal ggml-metal-quantized-producer)
+    add_executable(test-metal-weight-cache test-metal-weight-cache.cpp)
+    target_compile_features(test-metal-weight-cache PRIVATE cxx_std_17)
+    target_compile_options(test-metal-weight-cache PRIVATE -fno-fast-math -ffp-contract=off)
+    target_link_libraries(test-metal-weight-cache PRIVATE ggml-base ggml-metal-quantized-producer)
+    add_test(NAME test-metal-weight-cache COMMAND test-metal-weight-cache)
+    add_executable(test-metal-soft-f64 test-metal-soft-f64.mm test-metal-soft-f64-oracle.cpp)
+    target_compile_features(test-metal-soft-f64 PRIVATE cxx_std_17)
+    target_compile_options(test-metal-soft-f64 PRIVATE -fno-fast-math -ffp-contract=off)
+    target_compile_definitions(test-metal-soft-f64 PRIVATE
+        GGML_METAL_SOFT_F64_HEADER_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal/ggml-metal-soft-f64.h")
+    target_link_libraries(test-metal-soft-f64 PRIVATE "-framework Foundation" "-framework Metal")
+    add_test(NAME test-metal-soft-f64 COMMAND test-metal-soft-f64)
+    set_tests_properties(test-metal-soft-f64 PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+include(metal-provider-oracle.cmake)
+
 add_executable(test-cycle-sim-reader test-cycle-sim-reader.cpp)
 target_compile_definitions(test-cycle-sim-reader PRIVATE LOG_CYCLE=${LOG_CYCLE} CYCLE_SIM=${CYCLE_SIM})
 target_link_libraries(test-cycle-sim-reader PRIVATE ggml-gemmini-utils)
@@ -1605,3 +1639,35 @@ add_compile_definitions(
     GGML_GEMMINI_SCALE_METRICS=${GGML_GEMMINI_SCALE_METRICS}
     GGML_GEMMINI_ACT_QUANT_METRICS=${GGML_GEMMINI_ACT_QUANT_METRICS}
     GGML_GEMMINI_RESIDUAL_METRICS=${GGML_GEMMINI_RESIDUAL_METRICS})
+if (GGML_GEMMINI_METAL_CPU_EXACT)
+    add_executable(test-metal-cpu-exact-float test-metal-cpu-exact-float.cpp)
+    target_compile_features(test-metal-cpu-exact-float PRIVATE cxx_std_17)
+    target_compile_definitions(test-metal-cpu-exact-float PRIVATE ${GGML_GEMMINI_COMPILE_DEFS})
+    target_include_directories(test-metal-cpu-exact-float PRIVATE
+        ../ggml/src/ggml-metal ../ggml/src/ggml-gemmini ../ggml/src)
+    target_link_libraries(test-metal-cpu-exact-float PRIVATE
+        ggml-gemmini ggml-gemmini-metal-cpu-exact ggml-base ggml-gemmini-utils)
+    add_test(NAME test-metal-cpu-exact-float COMMAND test-metal-cpu-exact-float)
+    add_executable(test-metal-cpu-exact-int test-metal-cpu-exact-int.cpp)
+    target_compile_features(test-metal-cpu-exact-int PRIVATE cxx_std_17)
+    target_compile_definitions(test-metal-cpu-exact-int PRIVATE ${GGML_GEMMINI_COMPILE_DEFS})
+    target_include_directories(test-metal-cpu-exact-int PRIVATE
+        ../ggml/src/ggml-metal ../ggml/src/ggml-gemmini ../ggml/src)
+    target_link_libraries(test-metal-cpu-exact-int PRIVATE
+        ggml-gemmini ggml-gemmini-metal-cpu-exact ggml-base ggml-gemmini-utils)
+    add_test(NAME test-metal-cpu-exact-int COMMAND test-metal-cpu-exact-int)
+    add_executable(test-metal-cpu-exact-graph test-metal-cpu-exact-graph.cpp)
+    target_compile_features(test-metal-cpu-exact-graph PRIVATE cxx_std_17)
+    target_compile_definitions(test-metal-cpu-exact-graph PRIVATE
+        ${GGML_GEMMINI_COMPILE_DEFS}
+        TEST_CPU_EXACT_FLOAT=$<STREQUAL:${GGML_GEMMINI_COMPUTE_TYPE},FLOAT>
+        TEST_CPU_EXACT_HP1=$<STREQUAL:${GGML_GEMMINI_ACTIVATION_QUANT},EXSIA>
+        EVALUATION_EXACT_COMPUTE="${GGML_GEMMINI_COMPUTE_TYPE}"
+        EVALUATION_EXACT_ACTIVATION="${GGML_GEMMINI_ACTIVATION_QUANT}"
+        EVALUATION_EXACT_BITS=${GGML_GEMMINI_ACTIVATION_BITS}
+        EVALUATION_EXACT_DIM=${GGML_GEMMINI_DIM})
+    target_include_directories(test-metal-cpu-exact-graph PRIVATE
+        ../ggml/src/ggml-metal ../ggml/src)
+    target_link_libraries(test-metal-cpu-exact-graph PRIVATE common ggml ggml-gemmini ggml-cpu ggml-base)
+    add_test(NAME test-metal-cpu-exact-graph COMMAND test-metal-cpu-exact-graph)
+endif()
