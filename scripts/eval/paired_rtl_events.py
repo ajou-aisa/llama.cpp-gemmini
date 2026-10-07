@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # How to run:
 #   python3 -B scripts/eval/paired_rtl_events.py capture --build-root HOST_TEST_OUT [...] --out OBSERVE_DIR
-#   python3 -B scripts/eval/paired_rtl_events.py diff --base OBSERVE_V0 --candidate OBSERVE_P1 \
-#       [--candidate-physical-acc-rows PROFILE=ROWS ...] --out report.json
+#   python3 -B scripts/eval/paired_rtl_events.py diff --base OBSERVE_BASE --candidate OBSERVE_CANDIDATE \
+#       [--base-physical-acc-rows PROFILE=ROWS ...] [--candidate-physical-acc-rows PROFILE=ROWS ...] --out report.json
 #   python3 -B scripts/eval/paired_rtl_events.py selftest
 """Passive RTL event capture and slot-normalized V0/P1 comparison for the paired-microtile P1 regression.
 
@@ -12,8 +12,10 @@ passing profile of a gemmini_build host-test root. It reads no corpus authority 
 diff requires identical captured corpora and identical events.csv rows per profile. The only rewrite is the ACC row
 of store_dma addresses (and of load_dma addresses whose ACC bit is set): LoopMatmul rotates output slots by
 max_acc_addr/2, so a larger physical accumulator moves slot 1. The row maps to row - slot*(physical/2) +
-slot*(compat/2) with slot = row >= physical/2, where physical is that of the build being decoded; the address bits
-above the row field are compared unchanged.
+slot*(compat/2) with slot = row >= physical/2, where physical is that of the build being decoded (compat unless
+given per side); the address bits above the row field are compared unchanged. Rows that never moved normalize to the
+same values, so a side decoded with physical != compat must also show at least one store at row >= physical/2, or the
+profile is TABLE_NOT_EXERCISED.
 """
 from __future__ import annotations
 
@@ -43,23 +45,37 @@ def address_bits(rows: int) -> int:
     return max(1, (rows - 1).bit_length())
 
 
-def normalize_address(raw: int, scratchpad_rows: int, compat_rows: int, physical_rows: int) -> str:
+def split_address(raw: int, scratchpad_rows: int, physical_rows: int) -> tuple[int, int]:
     bits = max(address_bits(scratchpad_rows), address_bits(physical_rows))
     row = raw & ((1 << bits) - 1)
     require(row < physical_rows, f"ACC row {row} outside {physical_rows} physical rows")
+    return raw >> bits, row
+
+
+def normalize_address(raw: int, scratchpad_rows: int, compat_rows: int, physical_rows: int) -> str:
+    high, row = split_address(raw, scratchpad_rows, physical_rows)
     slot = int(row >= physical_rows // 2)
-    return f"acc:{raw >> bits:x}:{row - slot * (physical_rows // 2) + slot * (compat_rows // 2)}"
+    return f"acc:{high:x}:{row - slot * (physical_rows // 2) + slot * (compat_rows // 2)}"
+
+
+def acc_event(row: list[str]) -> bool:
+    return len(row) == 6 and row[0].isdigit() and (
+        row[2] == "store_dma" or (row[2] == "load_dma" and int(row[3]) & ACC_BIT != 0))
 
 
 def normalize_rows(rows: list[list[str]], meta: dict[str, Any], physical_rows: int) -> list[list[str]]:
     result = []
     for row in rows:
-        if len(row) == 6 and row[0].isdigit() and (
-                row[2] == "store_dma" or (row[2] == "load_dma" and int(row[3]) & ACC_BIT)):
+        if acc_event(row):
             row = [*row[:3], normalize_address(int(row[3]), meta["scratchpad_rows"], meta["compat_acc_rows"],
                                                physical_rows), *row[4:]]
         result.append(row)
     return result
+
+
+def slot1_stores(rows: list[list[str]], meta: dict[str, Any], physical_rows: int) -> int:
+    return sum(1 for row in rows if acc_event(row) and row[2] == "store_dma"
+               and split_address(int(row[3]), meta["scratchpad_rows"], physical_rows)[1] >= physical_rows // 2)
 
 
 def compare_rows(base: list[list[str]], candidate: list[list[str]]) -> dict[str, Any]:
@@ -76,6 +92,22 @@ def compare_rows(base: list[list[str]], candidate: list[list[str]]) -> dict[str,
             "candidate": candidate[difference] if difference < len(candidate) else None,
         }
     return report
+
+
+def compare_profile(base_rows: list[list[str]], base_meta: dict[str, Any], base_physical: int,
+                    candidate_rows: list[list[str]], candidate_meta: dict[str, Any], candidate_physical: int,
+                    corpus_equal: bool) -> dict[str, Any]:
+    events = compare_rows(normalize_rows(base_rows, base_meta, base_physical),
+                          normalize_rows(candidate_rows, candidate_meta, candidate_physical))
+    sides = ((base_rows, base_meta, base_physical), (candidate_rows, candidate_meta, candidate_physical))
+    slot1 = [slot1_stores(rows, meta, physical) for rows, meta, physical in sides]
+    exercised = all(physical == meta["compat_acc_rows"] or count > 0
+                    for (_, meta, physical), count in zip(sides, slot1))
+    same_layout = all(base_meta[key] == candidate_meta[key] for key in ("compat_acc_rows", "scratchpad_rows"))
+    status = ("TABLE_NOT_EXERCISED" if not exercised else
+              "IDENTICAL" if corpus_equal and events["identical"] and same_layout else "DIFFERENT")
+    return {"status": status, "corpus_identical": corpus_equal, "compat_layout_identical": same_layout,
+            "events": events, "physical_acc_rows": [base_physical, candidate_physical], "slot1_stores": slot1}
 
 
 def capture(build_roots: list[Path], out: Path, im2p: Path) -> None:
@@ -107,7 +139,8 @@ def read_rows(path: Path) -> list[list[str]]:
         return [row for row in csv.reader(stream) if row]
 
 
-def diff(base: Path, candidate: Path, physical: dict[str, int], out: Path) -> bool:
+def diff(base: Path, candidate: Path, base_physical: dict[str, int], candidate_physical: dict[str, int],
+         out: Path) -> bool:
     profiles = sorted(path.name for path in base.iterdir() if (path / "capture-meta.json").is_file())
     require(bool(profiles), f"no captured profiles under {base}")
     report: dict[str, Any] = {"base": str(base), "candidate": str(candidate), "profiles": {}}
@@ -117,22 +150,14 @@ def diff(base: Path, candidate: Path, physical: dict[str, int], out: Path) -> bo
             report["profiles"][name] = {"status": "MISSING_CANDIDATE"}
             continue
         right_meta = json.loads((candidate / name / "capture-meta.json").read_text())
-        candidate_rows = physical[name] if name in physical else int(right_meta["compat_acc_rows"])
         corpus_equal = (json.loads((base / name / "captured-corpus.json").read_text())
                         == json.loads((candidate / name / "captured-corpus.json").read_text()))
-        rows = compare_rows(
-            normalize_rows(read_rows(base / name / "capture" / "events.csv"), left_meta,
-                           left_meta["compat_acc_rows"]),
-            normalize_rows(read_rows(candidate / name / "capture" / "events.csv"), right_meta,
-                           candidate_rows))
-        same_layout = all(left_meta[key] == right_meta[key] for key in ("compat_acc_rows", "scratchpad_rows"))
-        identical = corpus_equal and rows["identical"] and same_layout
-        report["profiles"][name] = {
-            "status": "IDENTICAL" if identical else "DIFFERENT", "corpus_identical": corpus_equal,
-            "compat_layout_identical": same_layout, "events": rows,
-            "candidate_physical_acc_rows": candidate_rows,
-        }
-    unused = sorted(set(physical) - set(profiles))
+        report["profiles"][name] = compare_profile(
+            read_rows(base / name / "capture" / "events.csv"), left_meta,
+            base_physical.get(name, int(left_meta["compat_acc_rows"])),
+            read_rows(candidate / name / "capture" / "events.csv"), right_meta,
+            candidate_physical.get(name, int(right_meta["compat_acc_rows"])), corpus_equal)
+    unused = sorted((set(base_physical) | set(candidate_physical)) - set(profiles))
     require(not unused, f"physical rows given for uncaptured profiles: {unused}")
     report["status"] = "PASS" if all(item["status"] == "IDENTICAL" for item in report["profiles"].values()) else "FAIL"
     out.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
@@ -159,6 +184,18 @@ def selftest() -> None:
     report = compare_rows(normalize_rows(base, meta, compat), normalize_rows(late, meta, physical))
     assert not report["identical"] and report["first_difference"]["index"] == 1
     assert not compare_rows(base, base[:-1])["identical"]
+    # A base captured after the table applied must be decoded with its physical rows, not compat.
+    try:
+        normalize_rows(moved, meta, compat)
+        raise AssertionError("slot-1 rows of a physical capture decoded as compat")
+    except SystemExit:
+        pass
+    both = compare_profile(moved, meta, physical, moved, meta, physical, True)
+    assert both["status"] == "IDENTICAL" and both["slot1_stores"] == [1, 1], both
+    # Rows that never moved normalize identically, so a side that claims physical rows must show slot 1 there.
+    unmoved = compare_profile(base, meta, compat, base, meta, physical, True)
+    assert unmoved["events"]["identical"] and unmoved["status"] == "TABLE_NOT_EXERCISED", unmoved
+    assert compare_profile(base, meta, compat, moved, meta, physical, True)["status"] == "IDENTICAL"
     print("selftest ok")
 
 
@@ -172,8 +209,8 @@ def main() -> int:
     diff_parser = commands.add_parser("diff")
     diff_parser.add_argument("--base", type=Path, required=True)
     diff_parser.add_argument("--candidate", type=Path, required=True)
-    diff_parser.add_argument("--candidate-physical-acc-rows", action="append", default=[],
-                             metavar="PROFILE=ROWS")
+    for side in ("base", "candidate"):
+        diff_parser.add_argument(f"--{side}-physical-acc-rows", action="append", default=[], metavar="PROFILE=ROWS")
     diff_parser.add_argument("--out", type=Path, required=True)
     commands.add_parser("selftest")
     arguments = parser.parse_args()
@@ -183,12 +220,15 @@ def main() -> int:
     if arguments.command == "capture":
         capture([root.resolve() for root in arguments.build_root], arguments.out.resolve(), arguments.im2p.resolve())
         return 0
-    physical = {}
-    for item in arguments.candidate_physical_acc_rows:
-        name, _, rows = item.partition("=")
-        require(bool(name) and rows.isdigit() and int(rows) > 0, f"bad PROFILE=ROWS: {item}")
-        physical[name] = int(rows)
-    return 0 if diff(arguments.base.resolve(), arguments.candidate.resolve(), physical, arguments.out) else 1
+    physical: dict[str, dict[str, int]] = {"base": {}, "candidate": {}}
+    for side, items in (("base", arguments.base_physical_acc_rows),
+                        ("candidate", arguments.candidate_physical_acc_rows)):
+        for item in items:
+            name, _, rows = item.partition("=")
+            require(bool(name) and rows.isdigit() and int(rows) > 0, f"bad PROFILE=ROWS: {item}")
+            physical[side][name] = int(rows)
+    return 0 if diff(arguments.base.resolve(), arguments.candidate.resolve(), physical["base"],
+                     physical["candidate"], arguments.out) else 1
 
 
 if __name__ == "__main__":
