@@ -180,7 +180,10 @@ if(CYCLE_SIM AND GGML_GEMMINI_OPTION STREQUAL "WS")
     add_library(ggml-gemmini-cpu-functional STATIC
         "${IM2P_SIM_ROOT}/frontend/src/im2p_gemmini_frontend.cpp"
         "${IM2P_SIM_ROOT}/frontend/src/im2p_cpu_functional.cpp"
-        "${IM2P_SIM_ROOT}/frontend/src/im2p_cpu_functional_compute.cpp")
+        "${IM2P_SIM_ROOT}/frontend/src/im2p_cpu_functional_compute.cpp"
+        # The CPU-functional paired companion is admitted with the runtime's own planner.
+        "${IM2P_SIM_ROOT}/sim/common/gemmini_schedule.cpp"
+        "${IM2P_SIM_ROOT}/sim/common/gemmini_paired_schedule.cpp")
     set_target_properties(ggml-gemmini-cpu-functional PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_features(ggml-gemmini-cpu-functional PRIVATE cxx_std_20)
     target_compile_options(ggml-gemmini-cpu-functional PRIVATE -O2 -fno-fast-math)
