@@ -131,14 +131,16 @@ bool residual_backend_available(RmdBackend backend) {
         false;
 #endif
     return backend == RmdBackend::cpu_direct ||
-           (backend == RmdBackend::gemmini_ws_compact &&
+           ((backend == RmdBackend::gemmini_ws_compact ||
+             backend == RmdBackend::gemmini_ws_paired) &&
             rmd::compact_rmd_backend_available(false, im2p_build));
 #endif
 }
 
 residual::ResidualRoute residual_route_for(RmdBackend backend) {
-    return backend == RmdBackend::cpu_direct ? residual::ResidualRoute::cpu_direct
-                                             : residual::ResidualRoute::ws_packet;
+    return backend == RmdBackend::cpu_direct       ? residual::ResidualRoute::cpu_direct
+           : backend == RmdBackend::gemmini_ws_paired ? residual::ResidualRoute::ws_paired
+                                                      : residual::ResidualRoute::ws_packet;
 }
 
 MatmulStatus validate_exsia_residual_route(const ggml_gemmini_args_t &   args,
@@ -154,7 +156,7 @@ MatmulStatus validate_exsia_residual_route(const ggml_gemmini_args_t &   args,
                            MatMulCapability::unsupported);
     }
     const bool h0 = format == Format::q4_h0 || format == Format::q8_h0 || format == Format::q16_h0;
-    if (h0 && options.rmd_backend == RmdBackend::gemmini_ws_compact) {
+    if (h0 && options.rmd_backend != RmdBackend::cpu_direct) {
         return make_status(MatmulStatusCode::unsupported_route,
                            "H0 ExSIA requires CPU-direct residual execution",
                            MatMulCapability::unsupported);
@@ -1517,7 +1519,7 @@ MatmulStripeJob capture_stripe(MatmulExecution &                   execution,
         status = invalid_contract("overlapping stripe");
     } else if ((execution.options_.rmd_backend == RmdBackend::cpu_direct &&
                 rmd_packet != nullptr) ||
-               (execution.options_.rmd_backend == RmdBackend::gemmini_ws_compact &&
+               (execution.options_.rmd_backend != RmdBackend::cpu_direct &&
                 direct_residual != nullptr) ||
                (direct_residual != nullptr && rmd_packet != nullptr)) {
         status = invalid_contract("residual payload does not match selected backend");
@@ -2117,6 +2119,8 @@ MatmulStatus execute_post_fold_pipeline(const ggml_gemmini_args_t & args,
     options.job_capacity      = 1;
     options.rmd_backend       = args.residual_route == residual::ResidualRoute::cpu_direct
                                     ? RmdBackend::cpu_direct
+                                : args.residual_route == residual::ResidualRoute::ws_paired
+                                    ? RmdBackend::gemmini_ws_paired
                                     : RmdBackend::gemmini_ws_compact;
     MatmulExecution execution = prepare_execution(args, options);
     if (!execution.status()) {

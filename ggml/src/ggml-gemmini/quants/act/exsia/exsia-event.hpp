@@ -16,6 +16,12 @@
 namespace ggml::gemmini::evaluation {
 class Invocation;
 }
+namespace ggml::gemmini::rmd {
+struct RunAwareRequest;
+}
+namespace im2p::gemmini {
+struct PairedCompanion;
+}
 
 namespace ggml::gemmini::quants::act::exsia {
 struct StripeMetadataSnapshot {
@@ -40,6 +46,12 @@ struct StripeReadyEvent {
     // The packet owns its buffers, so it stays valid after the ExSIA slot is released.
     ggml::gemmini::rmd::StripePacketHandle             rmd_packet;
     ggml::gemmini::residual::DirectStripePayloadHandle direct_residual;
+    // P6.2 (paired residual route): the packet's compact residual as a paired companion and the
+    // run-aware geometry (rows, runs) its output is recomposed with. Both are shared with the
+    // frontend's in-flight copy of this event; the frontend decides and records acceptance at
+    // publication and the runtime fills the companion output at the stripe's completion.
+    std::shared_ptr<im2p::gemmini::PairedCompanion>            paired_companion;
+    std::shared_ptr<const ggml::gemmini::rmd::RunAwareRequest> paired_request;
 #if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS || GGML_GEMMINI_SCALE_METRICS
     std::shared_ptr<evaluation::Invocation> evaluation_context;
 #endif

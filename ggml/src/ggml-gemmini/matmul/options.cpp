@@ -47,6 +47,8 @@ MatmulOptionsResolution resolve_matmul_options(const MatmulOptionOverrides & exp
                     result.options.rmd_backend = RmdBackend::cpu_direct;
                 } else if (backend == "WS") {
                     result.options.rmd_backend = RmdBackend::gemmini_ws_compact;
+                } else if (backend == "WS_PAIRED") {
+                    result.options.rmd_backend = RmdBackend::gemmini_ws_paired;
                 } else {
                     result.error = MatmulOptionsError::invalid_rmd_backend;
                     return result;
@@ -72,7 +74,8 @@ MatmulOptionsResolution resolve_matmul_options(const MatmulOptionOverrides & exp
         return result;
     }
     if (result.options.rmd_backend != RmdBackend::cpu_direct &&
-        result.options.rmd_backend != RmdBackend::gemmini_ws_compact) {
+        result.options.rmd_backend != RmdBackend::gemmini_ws_compact &&
+        result.options.rmd_backend != RmdBackend::gemmini_ws_paired) {
         result.error = MatmulOptionsError::invalid_rmd_backend;
         return result;
     }

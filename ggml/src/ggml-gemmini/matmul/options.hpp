@@ -17,6 +17,9 @@ enum class MatmulInvocationMode {
 enum class RmdBackend : uint8_t {
     cpu_direct,
     gemmini_ws_compact,
+    // P6.2: WS compact plus the paired-microtile companion (PAIR_LOOP_TAIL) on the ExSIA
+    // stripe pipeline; a companion the runtime cannot pair takes the compact path.
+    gemmini_ws_paired,
 };
 
 enum class MatmulOptionSource : uint8_t {

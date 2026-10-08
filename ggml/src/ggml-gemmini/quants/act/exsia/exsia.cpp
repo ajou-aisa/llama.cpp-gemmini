@@ -203,7 +203,7 @@ seal_stripe_packet(Meta & meta, StripePipelineSlot & slot, const ggml_gemmini_ar
 #endif
 #if GGML_GEMMINI_RESIDUAL_METRICS
     if (args.evaluation_context && args.evaluation_context->residual_enabled()) {
-        if (!GGML_GEMMINI_ENABLE_RMD || args.residual_route != residual::ResidualRoute::ws_packet)
+        if (!GGML_GEMMINI_ENABLE_RMD || args.residual_route == residual::ResidualRoute::cpu_direct)
             throw std::runtime_error("evaluation metrics: RES requires producer RMD packet route");
         args.evaluation_context->radix_stripe(
             slot.stripe_idx, slot.rmd_packet ? slot.rmd_packet->required_planes : 0);

@@ -88,5 +88,11 @@ RmdStatus build_run_aware_request(const ggml_gemmini_args_t & args,
 RmdStatus build_run_aware_geometry(const ggml_gemmini_args_t & args,
                                    const StripePacket &        packet,
                                    RunAwareRequest &           out);
+// The request with its activations only (P6.2 paired companion): rows, runs, M/N/K and tiling as
+// build_run_aware_request, activations filled, weights and carriers left empty because the paired
+// companion indexes the stream's own resident W and scales through its runs. Transactional like it.
+RmdStatus build_run_aware_activations(const ggml_gemmini_args_t & args,
+                                      const StripePacket &        packet,
+                                      RunAwareRequest &           out);
 
 } // namespace ggml::gemmini::rmd

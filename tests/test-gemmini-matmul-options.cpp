@@ -969,6 +969,16 @@ bool test_precedence() {
         return false;
     }
 
+    setenv("GEMMINI_RMD_BACKEND", "WS_PAIRED", 1);
+    const auto paired_environment = resolve_matmul_options();
+    if (config::ALLOW_RUNTIME_MATMUL_OVERRIDE &&
+        !check(paired_environment.ok() &&
+                   paired_environment.options.rmd_backend == RmdBackend::gemmini_ws_paired &&
+                   paired_environment.rmd_backend_source == MatmulOptionSource::environment,
+               "WS_PAIRED selects the paired-companion WS backend")) {
+        return false;
+    }
+
     MatmulOptionOverrides explicit_options{};
     explicit_options.mode         = config::ENABLE_STRIPE_MATMUL && config::ENABLE_STRIPE_PIPELINE
                                         ? MatmulInvocationMode::stripe_pipeline
@@ -1032,7 +1042,8 @@ bool test_invalid_environment() {
 
 bool test_invalid_explicit_rmd_backend() {
     MatmulOptionOverrides options{};
-    options.rmd_backend = static_cast<RmdBackend>(2);
+    // 0 CPU, 1 WS, 2 WS_PAIRED are the backends; the first value past them is invalid.
+    options.rmd_backend = static_cast<RmdBackend>(3);
     const auto result   = resolve_matmul_options(options);
     return check(!result.ok() && result.error == MatmulOptionsError::invalid_rmd_backend,
                  "invalid explicit RMD backend rejected");

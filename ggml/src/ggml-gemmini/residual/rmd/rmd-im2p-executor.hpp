@@ -105,6 +105,19 @@ RmdStatus execute_rmd_stripe_im2p_with_weights(im2p_sim_t *                sim,
                                                Correction &                correction,
                                                RmdWeightPreparation &      weights,
                                                RmdExecutionMetrics *       metrics = nullptr);
+// P6.2 paired companion: the packet's residual GEMM already ran inside Main's stripe work and
+// `companion_output` holds its SCU-final int32 result ([request.m, request.n], the run-aware
+// geometry `request` of build_run_aware_activations). Recomposes it into `correction` exactly as
+// execute_rmd_stripe_im2p_with_weights does after its own dispatch; no simulator call, no residual
+// work, no weight gather. Transactional on `correction`.
+RmdStatus execute_rmd_stripe_paired_with_weights(const ggml_gemmini_args_t & args,
+                                                 const StripePacket &        packet,
+                                                 const RunAwareRequest &     request,
+                                                 const int32_t *             companion_output,
+                                                 size_t                      companion_values,
+                                                 Correction &                correction,
+                                                 RmdWeightPreparation &      weights,
+                                                 RmdExecutionMetrics *       metrics = nullptr);
 // Evaluation only: the compact-work and residual SCU observations of one run-aware HP1 packet, from
 // its geometry alone. No operand is materialized and no residual GEMM runs.
 RmdStatus observe_rmd_stripe_im2p(const ggml_gemmini_args_t & args, const StripePacket & packet);

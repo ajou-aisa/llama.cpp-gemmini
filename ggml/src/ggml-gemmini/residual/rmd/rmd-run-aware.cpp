@@ -156,6 +156,37 @@ RmdStatus build_geometry(const ggml_gemmini_args_t & args,
     return RmdStatus::success;
 }
 
+// The request's [m, k] signed-byte activations from the packet digits of its active rows.
+RmdStatus fill_activations(const StripePacket & packet, RunAwareRequest & staged) {
+    size_t activation_count = 0;
+    if (!checked_mul(staged.m, staged.k, activation_count) ||
+        activation_count > staged.activations.max_size())
+        return RmdStatus::overflow;
+    staged.activations.assign(activation_count, 0);
+    for (size_t row_index = 0; row_index < staged.rows.size(); ++row_index) {
+        const RunAwareRow & row = staged.rows[row_index];
+        for (size_t run_index = 0; run_index < staged.runs.size(); ++run_index) {
+            const BlockDescriptor & block    = packet.blocks[run_index];
+            uint8_t                 position = 0;
+            if (!find_block_lane(block, row.original_lane_id, position))
+                continue;
+            for (size_t k = 0; k < block.compact_k_count; ++k) {
+                int32_t         digit = 0;
+                const RmdStatus status =
+                    read_packet_digit(packet, block, position, row.source_row, k, digit);
+                if (status != RmdStatus::success)
+                    return status;
+                if (digit < std::numeric_limits<int8_t>::min() ||
+                    digit > std::numeric_limits<int8_t>::max())
+                    return RmdStatus::overflow;
+                staged.activations[row_index * staged.k + staged.runs[run_index].compact_k_begin + k] =
+                    static_cast<int8_t>(digit);
+            }
+        }
+    }
+    return RmdStatus::success;
+}
+
 } // namespace
 
 RmdStatus build_run_aware_request(const ggml_gemmini_args_t & args,
@@ -168,43 +199,19 @@ RmdStatus build_run_aware_request(const ggml_gemmini_args_t & args,
         if (geometry != RmdStatus::success)
             return geometry;
 
-        size_t activation_count = 0;
-        size_t weight_count     = 0;
-        size_t carrier_count    = 0;
-        if (!checked_mul(staged.m, staged.k, activation_count) ||
-            !checked_mul(staged.k, staged.n, weight_count) ||
+        size_t weight_count  = 0;
+        size_t carrier_count = 0;
+        if (!checked_mul(staged.k, staged.n, weight_count) ||
             !checked_mul(staged.runs.size(), staged.n, carrier_count) ||
-            activation_count > staged.activations.max_size() ||
             weight_count > staged.weights.max_size() ||
             carrier_count > staged.carriers.max_size()) {
             return RmdStatus::overflow;
         }
-        staged.activations.assign(activation_count, 0);
+        const RmdStatus activations = fill_activations(packet, staged);
+        if (activations != RmdStatus::success)
+            return activations;
         staged.weights.assign(weight_count, 0);
         staged.carriers.resize(carrier_count);
-
-        for (size_t row_index = 0; row_index < staged.rows.size(); ++row_index) {
-            const RunAwareRow & row = staged.rows[row_index];
-            for (size_t run_index = 0; run_index < staged.runs.size(); ++run_index) {
-                const BlockDescriptor & block    = packet.blocks[run_index];
-                uint8_t                 position = 0;
-                if (!find_block_lane(block, row.original_lane_id, position))
-                    continue;
-                for (size_t k = 0; k < block.compact_k_count; ++k) {
-                    int32_t         digit = 0;
-                    const RmdStatus status =
-                        read_packet_digit(packet, block, position, row.source_row, k, digit);
-                    if (status != RmdStatus::success)
-                        return status;
-                    if (digit < std::numeric_limits<int8_t>::min() ||
-                        digit > std::numeric_limits<int8_t>::max())
-                        return RmdStatus::overflow;
-                    staged.activations[row_index * staged.k +
-                                       staged.runs[run_index].compact_k_begin + k] =
-                        static_cast<int8_t>(digit);
-                }
-            }
-        }
 
         std::array<int32_t, DIM * DIM> tile{};
         for (size_t run_index = 0; run_index < staged.runs.size(); ++run_index) {
@@ -261,6 +268,27 @@ RmdStatus build_run_aware_geometry(const ggml_gemmini_args_t & args,
         const RmdStatus         geometry = build_geometry(args, packet, plan, staged);
         if (geometry != RmdStatus::success)
             return geometry;
+        out = std::move(staged);
+        return RmdStatus::success;
+    } catch (const std::bad_alloc &) {
+        return RmdStatus::allocation_failure;
+    } catch (const std::length_error &) {
+        return RmdStatus::overflow;
+    }
+}
+
+RmdStatus build_run_aware_activations(const ggml_gemmini_args_t & args,
+                                      const StripePacket &        packet,
+                                      RunAwareRequest &           out) {
+    try {
+        RunAwareRequest         staged;
+        wroute::WeightRoutePlan plan;
+        const RmdStatus         geometry = build_geometry(args, packet, plan, staged);
+        if (geometry != RmdStatus::success)
+            return geometry;
+        const RmdStatus activations = fill_activations(packet, staged);
+        if (activations != RmdStatus::success)
+            return activations;
         out = std::move(staged);
         return RmdStatus::success;
     } catch (const std::bad_alloc &) {

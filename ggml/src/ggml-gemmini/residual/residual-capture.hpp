@@ -21,6 +21,8 @@ namespace ggml::gemmini::residual {
 enum class ResidualRoute : uint8_t {
     cpu_direct,
     ws_packet,
+    // ws_packet published as a paired-microtile companion when the runtime admits it (P6.2).
+    ws_paired,
 };
 
 struct ResidualStripePayload {

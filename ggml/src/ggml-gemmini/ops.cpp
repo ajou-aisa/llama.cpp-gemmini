@@ -1237,7 +1237,7 @@ void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context * ctx,
     constexpr bool im2p_non_exsia = false;
 #endif
 #if !defined(__riscv) && !defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
-    if (matmul_options.rmd_backend == ggml::gemmini::RmdBackend::gemmini_ws_compact) {
+    if (matmul_options.rmd_backend != ggml::gemmini::RmdBackend::cpu_direct) {
         ggml::gemmini::log::debug(layer, "[matmul.rmd] status=unsupported_backend backend=WS");
         GGML_ABORT("Gemmini unsupported_backend: RMD WS is unavailable on this host");
     }
@@ -1284,6 +1284,8 @@ void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context * ctx,
     args.tiled_matmul_type = OPTION;
     args.residual_route    = matmul_options.rmd_backend == ggml::gemmini::RmdBackend::cpu_direct
                                  ? ggml::gemmini::residual::ResidualRoute::cpu_direct
+                             : matmul_options.rmd_backend == ggml::gemmini::RmdBackend::gemmini_ws_paired
+                                 ? ggml::gemmini::residual::ResidualRoute::ws_paired
                                  : ggml::gemmini::residual::ResidualRoute::ws_packet;
 
     /* _____ 3. Gemmini용 stride _____ */

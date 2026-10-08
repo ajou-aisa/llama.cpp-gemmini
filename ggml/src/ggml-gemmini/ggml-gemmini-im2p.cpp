@@ -16,6 +16,7 @@
 #include "residual/direct/direct-executor.hpp"
 #include "residual/rmd/rmd-compose.hpp"
 #include "residual/rmd/rmd-im2p-executor.hpp"
+#include "residual/rmd/rmd-run-aware.hpp"
 #include <im2p_sim.h>
 #include <gemmini/host-timing.hpp>
 #include <gemmini/log.hpp>
@@ -447,7 +448,14 @@ static void emit_rmd_workload(const ggml_gemmini_args_t &                  args,
     record.slot      = event.slot;
     record.row_begin = event.row_begin;
     record.row_end   = event.row_end;
-    record.backend = event.rmd_packet ? "im2p_sim" : event.direct_residual ? "cpu_direct" : "none";
+    record.backend = event.rmd_packet
+                         ? (event.paired_companion &&
+                                    event.paired_companion->state ==
+                                        ::im2p::gemmini::PairedCompanion::State::accepted
+                                ? "im2p_paired"
+                                : "im2p_sim")
+                     : event.direct_residual ? "cpu_direct"
+                                             : "none";
     record.success = status == rmd::RmdStatus::success;
     if (!record.success)
         record.reason = rmd::rmd_status_message(status);
@@ -1465,6 +1473,29 @@ class ExsiaStripePipeline::Impl {
             status = residual::execute_direct_stripe(
                 stripe_args, *event.direct_residual, correction, &direct_metrics);
             backend.finish(status == rmd::RmdStatus::success);
+        } else if (event.rmd_packet != nullptr && event.paired_companion != nullptr &&
+                   event.paired_companion->state ==
+                       ::im2p::gemmini::PairedCompanion::State::accepted) {
+            // P6.2: the companion ran inside Main's stripe work and its SCU-final int32 output
+            // is complete at this completion; only the host recomposition remains.
+            HostCpuInterval backend(stripe_args,
+                                    "im2p.residual_paired_recomposition",
+                                    HostIntervalAccounting::cpu_work,
+                                    &event);
+            const auto & companion = *event.paired_companion;
+            status = event.paired_request == nullptr
+                         ? rmd::RmdStatus::invalid_packet
+                         : rmd::detail::execute_rmd_stripe_paired_with_weights(
+                               stripe_args,
+                               *event.rmd_packet,
+                               *event.paired_request,
+                               companion.output.data(),
+                               companion.output.size(),
+                               correction,
+                               *rmd_weights,
+                               &metrics);
+            shared_weights = true;
+            backend.finish(status == rmd::RmdStatus::success);
         } else if (event.rmd_packet != nullptr) {
             HostCpuInterval backend(stripe_args,
                                     "im2p.residual_simulator_host_call",
@@ -1505,8 +1536,17 @@ class ExsiaStripePipeline::Impl {
 #endif
         if (status == rmd::RmdStatus::success && !no_residual) {
 #if CYCLE_SIM
+            // The merge requires the residual work of this callback: the residual child for the
+            // compact path, Main's stripe work (the callback continuation) for an accepted
+            // paired companion.
+            const bool paired_merge =
+                event.paired_companion != nullptr &&
+                event.paired_companion->state == ::im2p::gemmini::PairedCompanion::State::accepted;
+            const std::vector<uint64_t> merge_required =
+                paired_merge ? ::im2p::gemmini::cycle_sim::continuation_work_ids()
+                             : ::im2p::gemmini::cycle_sim::work_ids_since(required_begin);
             ::im2p::gemmini::cycle_sim::StageCall merge_call(
-                stripe_args.cycle_sim_context, cycle_sim::CallKind::ResidualMerge, required_begin);
+                stripe_args.cycle_sim_context, cycle_sim::CallKind::ResidualMerge, merge_required);
 #endif
             HostCpuInterval merge(stripe_args,
                                   "im2p.output_correction_apply",
@@ -1582,6 +1622,42 @@ class ExsiaStripePipeline::Impl {
         return {};
     }
 
+    // The stripe's companion from its packet: run-aware activations and runs, with W and the
+    // block scales left to the stream's resident operands (indexed through the runs). A packet
+    // the run-aware route cannot carry gets a companion that is already rejected
+    // (RUN_AWARE_UNSUPPORTED, no buffers): the residual takes the compact path and the request
+    // stays visible in the NPU trace.
+    void attach_paired_companion(quants::act::exsia::StripeReadyEvent & event) {
+        auto request = std::make_shared<rmd::RunAwareRequest>();
+        if (rmd::build_run_aware_activations(runtime_args, *event.rmd_packet, *request) !=
+            rmd::RmdStatus::success) {
+            auto rejected   = std::make_shared<::im2p::gemmini::PairedCompanion>();
+            rejected->n     = runtime_args.J;
+            rejected->state = ::im2p::gemmini::PairedCompanion::State::rejected;
+            rejected->fallback_reason =
+                ::im2p::gemmini::PairedCompanion::FallbackReason::run_aware_unsupported;
+            event.paired_companion = std::move(rejected);
+            return;
+        }
+        auto companion         = std::make_shared<::im2p::gemmini::PairedCompanion>();
+        companion->rows        = request->m;
+        companion->compact_k   = request->k;
+        companion->n           = request->n;
+        companion->activations = std::move(request->activations);
+        companion->runs.reserve(request->runs.size());
+        for (const auto & run : request->runs) {
+            if (run.compact_k_begin > std::numeric_limits<uint32_t>::max() ||
+                run.compact_k_count > std::numeric_limits<uint32_t>::max())
+                return;
+            companion->runs.push_back({run.original_block_id,
+                                       run.union_k_mask,
+                                       static_cast<uint32_t>(run.compact_k_begin),
+                                       static_cast<uint32_t>(run.compact_k_count)});
+        }
+        event.paired_companion = std::move(companion);
+        event.paired_request   = std::move(request);
+    }
+
     bool publish(const quants::act::exsia::StripeReadyEvent & event) noexcept {
         worker_timing.run_id = event.run_id;
 #if defined(GGML_GEMMINI_TESTING)
@@ -1623,8 +1699,37 @@ class ExsiaStripePipeline::Impl {
                            false};
             return false;
         }
+        capture.finish();
+        // P6.2: on the paired route the packet's compact residual is offered with this stripe
+        // as a companion. Its preparation (run-aware activations and runs, no W or carriers)
+        // is real host work; a packet the run-aware route cannot carry leaves the event without
+        // a companion and takes the compact path in the residual callback.
+        const quants::act::exsia::StripeReadyEvent * publication = &event;
+        quants::act::exsia::StripeReadyEvent         paired_event;
+        if (residual_mode == ::im2p::gemmini::ResidualStageMode::im2p_paired &&
+            event.rmd_packet != nullptr) {
+            HostCpuInterval preparation(args,
+                                        "im2p.paired_companion_preparation",
+                                        HostIntervalAccounting::cpu_work,
+                                        &event);
+            try {
+                paired_event = event;
+                attach_paired_companion(paired_event);
+            } catch (const std::bad_alloc &) {
+                sink_result = {
+                    Error::out_of_memory, "failed to prepare the paired residual companion", false};
+                return false;
+            } catch (...) {
+                sink_result = {Error::execution_failure,
+                               "failed to prepare the paired residual companion",
+                               false};
+                return false;
+            }
+            publication = &paired_event;
+            preparation.finish();
+        }
         try {
-            published.push_back({event, theta});
+            published.push_back({*publication, theta});
         } catch (const std::bad_alloc &) {
             sink_result = {Error::out_of_memory, "failed to retain published ExSIA stripe", false};
             return false;
@@ -1633,12 +1738,11 @@ class ExsiaStripePipeline::Impl {
                 Error::execution_failure, "failed to retain published ExSIA stripe", false};
             return false;
         }
-        capture.finish();
         HostCpuInterval submit(args,
                                "im2p.stripe_submit_host_call",
                                HostIntervalAccounting::excluded_from_cpu_work,
                                &event);
-        const auto      status = submit_final_geometry(*run, runtime_args, event, {true, theta});
+        const auto status = submit_final_geometry(*run, runtime_args, *publication, {true, theta});
         submit.finish(status.ok());
         if (!status.ok()) {
             published.pop_back();
@@ -2155,7 +2259,9 @@ ExsiaStripePipelineStart start_exsia_stripe_pipeline(ggml_gemmini_args_t & args)
 
     impl->runtime_args.f_out                   = impl->staged_output.data();
     impl->runtime_args.exsia_stripe_ready_sink = nullptr;
-    impl->residual_mode = args.residual_route == residual::ResidualRoute::ws_packet
+    impl->residual_mode = args.residual_route == residual::ResidualRoute::ws_paired
+                              ? ::im2p::gemmini::ResidualStageMode::im2p_paired
+                          : args.residual_route == residual::ResidualRoute::ws_packet
                               ? ::im2p::gemmini::ResidualStageMode::im2p_compact
                               : ::im2p::gemmini::ResidualStageMode::host_direct;
 #if defined(GGML_GEMMINI_TESTING)

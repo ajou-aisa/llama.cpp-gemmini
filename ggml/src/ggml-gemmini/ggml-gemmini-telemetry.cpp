@@ -459,7 +459,9 @@ void project_matmul_cpu_identity(log::CycleRecord &       record,
 namespace {
 void         json_string(std::ostringstream & out, std::string_view value);
 const char * telemetry_backend_name(RmdBackend backend) {
-    return backend == RmdBackend::cpu_direct ? "cpu_direct" : "gemmini_ws_compact";
+    return backend == RmdBackend::cpu_direct       ? "cpu_direct"
+           : backend == RmdBackend::gemmini_ws_paired ? "gemmini_ws_paired"
+                                                      : "gemmini_ws_compact";
 }
 const char * telemetry_clock_source() {
 #ifdef __riscv

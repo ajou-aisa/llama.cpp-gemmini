@@ -10,6 +10,10 @@
 #include "../src/llama-semantic-graph.hpp"
 #include "gemmini-parity-output.hpp"
 #include <cstdlib>
+#include <fstream>
+#include <set>
+#include <map>
+#include <optional>
 
 namespace {
 struct Observation {
@@ -77,6 +81,110 @@ void print_observation(const Observation &o) {
 }
 }
 
+// P6.2 record-level checks on the dedicated NPU trace (trace version 3). In the paired parent every
+// stripe carries a residual and a requested companion: an admitted one runs inside the stripe work
+// (no residual child, its RESIDUAL_MERGE requires exactly that work); one the library refused
+// (CAPACITY_NONFIT) leaves a planned stripe whose residual is child work bound to it, merged after
+// that child. Both outcomes must occur. The compact parent records no companion and binds one
+// child per residual stripe.
+void verify_paired_trace(const ggml::gemmini::cycle_sim::ProducerParent &compact,
+                         const ggml::gemmini::cycle_sim::ProducerParent &paired,
+                         size_t stripes) {
+    const auto path = ggml::gemmini::log::resolve_output_path(GEMMINI_LOG_DEFAULT_NPU_TRACE_PATH);
+    std::ifstream stream(path);
+    require(stream.is_open(), "paired trace file");
+    struct Stripe {
+        std::optional<uint64_t> work;
+        std::optional<bool> admitted;
+        std::string reason;
+        std::set<uint64_t> children;
+        size_t merges = 0;
+    };
+    std::map<uint64_t, Stripe> mine, theirs;
+    std::vector<std::vector<uint64_t>> merges;
+    for (std::string line; std::getline(stream, line);) {
+        if (line.empty()) continue;
+        const auto record = nlohmann::json::parse(line);
+        const std::string kind = record.value("kind", "");
+        if (kind == "NPU_WORK") {
+            require(record.value("version", 0) == 3, "paired trace must be version 3");
+            const uint64_t operation = record.at("operation_id").get<uint64_t>();
+            if (operation != paired.operation_id && operation != compact.operation_id) continue;
+            auto &table = operation == paired.operation_id ? mine : theirs;
+            const auto stripe = record.at("stripe_id").get<uint64_t>();
+            const std::string scope = record.at("scope").get<std::string>();
+            const auto work = record.at("work_id").get<uint64_t>();
+            if (scope == "residual_compact") {
+                require(record.at("paired").is_null(), "residual child carries companion facts");
+                table[stripe].children.insert(work);
+                continue;
+            }
+            require(scope == "stripe", "unexpected pipeline work scope");
+            table[stripe].work = work;
+            const auto &facts = record.at("paired");
+            if (facts.is_null()) continue;
+            require(operation == paired.operation_id, "compact route recorded a companion");
+            const bool admitted = facts.at("admitted").get<bool>();
+            require(facts.at("revision") == "pair-loop-tail-v1" && facts.at("requested") == true &&
+                    facts.at("route") == (admitted ? "PAIR_LOOP_TAIL" : "COMPACT_FALLBACK") &&
+                    (admitted ? facts.at("fallback_reason").is_null()
+                              : facts.at("fallback_reason") == "CAPACITY_NONFIT") &&
+                    facts.at("residual_rows").get<uint64_t>() > 0 && !facts.at("runs").empty() &&
+                    facts.at("capacity").at("accumulator_rows").get<uint64_t>() > 0,
+                    "paired companion facts");
+            table[stripe].admitted = admitted;
+            table[stripe].reason = admitted ? "" : facts.at("fallback_reason").get<std::string>();
+        } else if (kind == "NPU_CALL" && record.at("operation_id").get<uint64_t>() == paired.operation_id &&
+                   record.value("call_kind", "") == "RESIDUAL_MERGE" &&
+                   record.value("stage", "") == "COMPLETE_REQUIRED") {
+            merges.push_back(record.at("required_work_ids").get<std::vector<uint64_t>>());
+        }
+    }
+    size_t admitted = 0, rejected = 0, children = 0;
+    for (const auto &required : merges) {
+        bool owned = false;
+        for (auto &[index, stripe] : mine) {
+            const std::set<uint64_t> set(required.begin(), required.end());
+            if ((stripe.admitted == true && set == std::set<uint64_t>{*stripe.work}) ||
+                (stripe.admitted == false && !set.empty() && set == stripe.children)) {
+                ++stripe.merges;
+                owned = true;
+            }
+        }
+        require(owned, "residual merge requires neither an admitted stripe work nor a fallback child");
+    }
+    std::map<uint64_t, size_t> bound;
+    for (const auto &binding : paired.residual_bindings) ++bound[binding.stripe_id];
+    for (const auto &[index, stripe] : mine) {
+        require(stripe.work && stripe.admitted.has_value() && stripe.merges == 1,
+                "paired parent stripe lacks its companion facts or merge");
+        if (*stripe.admitted) {
+            ++admitted;
+            require(stripe.children.empty() && !bound.count(index),
+                    "admitted paired stripe owns a residual child work");
+        } else {
+            ++rejected;
+            children += stripe.children.size();
+            require(!stripe.children.empty() && bound[index] == stripe.children.size(),
+                    "fallback stripe lacks its bound residual child work");
+        }
+    }
+    require(mine.size() == stripes && admitted >= 1 && rejected >= 1 &&
+            paired.work_ids.size() == stripes + children,
+            "paired parent must mix admitted and fallback stripes with exact work identities");
+    size_t compact_children = 0;
+    for (const auto &[index, stripe] : theirs) {
+        require(stripe.work && !stripe.admitted.has_value() && !stripe.children.empty(),
+                "compact parent stripe lacks its residual child work");
+        compact_children += stripe.children.size();
+    }
+    require(theirs.size() == stripes && compact.residual_bindings.size() == compact_children,
+            "compact parent binds one child per residual stripe");
+    std::printf("PAIRED_TRACE_PASS stripes=%zu admitted=%zu fallback_capacity_nonfit=%zu "
+                "fallback_children=%zu compact_children=%zu merges=%zu\n", stripes, admitted, rejected,
+                children, compact_children, merges.size());
+}
+
 int main(int argc, char **argv) {
     try {
         require(argc == 2, "dispatch mode required");
@@ -89,6 +197,7 @@ int main(int argc, char **argv) {
             : inject_log_failure ? requested.substr(5) : requested;
         require(mode == "full" || mode == "pipeline" || mode == "exsia-pipeline" ||
                 mode == "exsia-rmd-pipeline" || mode == "exsia-rmd-cross-parent" ||
+                mode == "exsia-paired-pipeline" ||
                 mode == "residual" ||
                 mode == "residual-runs" ||
                 mode == "large-k", "invalid mode");
@@ -97,7 +206,12 @@ int main(int argc, char **argv) {
                 "existing CPU cycle-log path");
 #endif
         const bool cross_parent = mode == "exsia-rmd-cross-parent";
-        const bool rmd_pipeline = mode == "exsia-rmd-pipeline" || cross_parent;
+        // P6.2: the same stripes run first on the compact route, then on the paired route
+        // (second parent, same input); outputs must be bit-exact and the paired parent must
+        // carry its residual inside Main's stripe work without a residual child.
+        const bool paired_pipeline = mode == "exsia-paired-pipeline";
+        const bool two_parents = cross_parent || paired_pipeline;
+        const bool rmd_pipeline = mode == "exsia-rmd-pipeline" || two_parents;
         const bool exsia_pipeline = mode == "exsia-pipeline" || rmd_pipeline;
         Fixture fixture(cross_parent ? 321 : exsia_pipeline ? 161 : mode == "pipeline" ? 129 : 1,
                         cross_parent ? 321 : exsia_pipeline ? 161 : mode == "pipeline" ? 129 : 3,
@@ -225,12 +339,20 @@ int main(int argc, char **argv) {
             auto &producer_meta = fixture.args.act_quant.storage().emplace<
                 ggml::gemmini::quants::act::exsia::Meta>();
             std::vector<float> input(fixture.args.I * fixture.args.K, 1.0f);
-            if (rmd_pipeline) {
-                for (size_t row = 0; row < fixture.args.activation_rows_per_stripe; ++row) {
-                    input[row * fixture.args.K] = 256.0f;
-                    input[row * fixture.args.K + 1] = 8.0f;
-                    input[row * fixture.args.K + 40] = -17.0f;
-                }
+            // Rows carrying outliers (residual rows). The paired mode puts them in every stripe and
+            // makes stripe 1's residual three radix lanes wide, so its companion cannot fit the
+            // accumulator slot beside Main while those of stripes 0 and 2 do.
+            const size_t stripe_rows = fixture.args.activation_rows_per_stripe;
+            const auto outlier_row = [&](size_t row) {
+                return rmd_pipeline && (row < stripe_rows ||
+                                        (paired_pipeline && row < fixture.args.I));
+            };
+            for (size_t row = 0; row < fixture.args.I; ++row) {
+                if (!outlier_row(row)) continue;
+                const bool wide = paired_pipeline && row >= stripe_rows && row < 2 * stripe_rows;
+                input[row * fixture.args.K] = wide ? 4096.0f : 256.0f;
+                input[row * fixture.args.K + 1] = 8.0f;
+                input[row * fixture.args.K + 40] = -17.0f;
             }
             ggml_tensor activation_tensor{};
             activation_tensor.type = GGML_TYPE_F32;
@@ -249,13 +371,12 @@ int main(int argc, char **argv) {
                 require(std::all_of(fixture.output.begin(), fixture.output.end(),
                     [&, column = size_t{0}](float value) mutable {
                         const size_t row = column++ / fixture.args.J;
-                        return rmd_pipeline && row < fixture.args.activation_rows_per_stripe
-                            ? value > 0.0f && value != -1.0f
-                            : value == float(fixture.args.K);
+                        return outlier_row(row) ? value > 0.0f && value != -1.0f
+                                                : value == float(fixture.args.K);
                     }), "ExSIA numerical publication");
             };
             execute_exsia(producer_meta);
-            if (cross_parent) {
+            if (two_parents) {
                 const auto first_output = fixture.output;
                 metadata->execution(node, "Gemmini", "TARGET_NPU", true);
                 session->finish_operation(first_context);
@@ -266,12 +387,19 @@ int main(int argc, char **argv) {
                 // Host-stage IDs from the fenced parent cannot belong to this operation.
                 fixture.args.cycle_sim_host_dependencies.clear();
                 std::fill(fixture.output.begin(), fixture.output.end(), -1.0f);
-                for (size_t row = 0; row < fixture.args.activation_rows_per_stripe; ++row)
-                    input[row * fixture.args.K] = 512.0f;
+                if (cross_parent)
+                    for (size_t row = 0; row < fixture.args.activation_rows_per_stripe; ++row)
+                        input[row * fixture.args.K] = 512.0f;
+                else
+                    fixture.args.residual_route = ggml::gemmini::residual::ResidualRoute::ws_paired;
                 auto &second_meta = fixture.args.act_quant.storage().emplace<
                     ggml::gemmini::quants::act::exsia::Meta>();
                 execute_exsia(second_meta);
-                require(fixture.output != first_output, "second ExSIA parent reused first numerical result");
+                if (cross_parent)
+                    require(fixture.output != first_output, "second ExSIA parent reused first numerical result");
+                else
+                    require(fixture.output == first_output,
+                            "paired route output differs from the compact route");
                 metadata->execution(node, "Gemmini", "TARGET_NPU", true);
                 session->finish_operation(fixture.args.cycle_sim_context);
             }
@@ -293,7 +421,7 @@ int main(int argc, char **argv) {
         const auto expected_count_per_parent = mode == "pipeline" || exsia_pipeline
             ? (fixture.args.I + fixture.args.activation_rows_per_stripe - 1) /
                 fixture.args.activation_rows_per_stripe : 1;
-        const auto expected_count = expected_count_per_parent * (cross_parent ? 2 : 1);
+        const auto expected_count = expected_count_per_parent * (two_parents ? 2 : 1);
         const auto dense_observation_count = std::count_if(observations.begin(), observations.end(),
             [](const auto &observation) {
                 return observation.geometry.scope == IM2P_GEOMETRY_STRIPE;
@@ -334,18 +462,24 @@ int main(int argc, char **argv) {
             return 0;
         }
         session->ensure_healthy();
-        if (!cross_parent) session->finish_operation(fixture.args.cycle_sim_context);
+        if (!two_parents) session->finish_operation(fixture.args.cycle_sim_context);
         session->finish();
         if (mode == "pipeline" || exsia_pipeline) {
             const auto parents = session->producer_parents();
-            require(parents.size() == (cross_parent ? 2u : 1u), "pipeline parent count");
+            require(parents.size() == (two_parents ? 2u : 1u), "pipeline parent count");
             for (const auto &parent : parents) {
                 require(parent.geometry.scope == IM2P_GEOMETRY_STREAM &&
                         parent.geometry.m == fixture.args.I &&
                         parent.work_ids == parent.fence_required_work_ids &&
                         parent.work_ids.size() >= expected_count_per_parent,
                         "pipeline parent final geometry and fence work set");
-                if (rmd_pipeline) {
+                const bool paired_parent = paired_pipeline && &parent == &parents.back();
+                if (paired_parent) {
+                    // Admitted stripes own no child; the fallback stripe's children are checked
+                    // against the trace in verify_paired_trace.
+                    require(parent.work_ids.size() >= expected_count_per_parent,
+                            "paired parent stripe works");
+                } else if (rmd_pipeline) {
                     require(!parent.residual_bindings.empty(), "run-aware residual child work missing");
                     for (const auto &binding : parent.residual_bindings)
                         require(binding.dense_parent_id == parent.parent_id &&
@@ -357,12 +491,13 @@ int main(int argc, char **argv) {
                                 "residual work lacks exact dense stripe and fence binding");
                 }
             }
-            if (cross_parent)
+            if (two_parents)
                 require(parents[0].operation_id != parents[1].operation_id &&
                         parents[0].parent_id != parents[1].parent_id &&
                         parents[0].fence_call_id < parents[1].fence_call_id &&
                         parents[0].work_ids.back() < parents[1].work_ids.front(),
                         "cross-parent work/fence identities are not ordered and distinct");
+            if (paired_pipeline) verify_paired_trace(parents[0], parents[1], expected_count_per_parent);
             const auto ownership = session->producer_events();
             const auto count = [&](cycle::ProducerEventKind kind) {
                 return std::count_if(ownership.begin(), ownership.end(), [&](const auto &event) {
@@ -385,15 +520,26 @@ int main(int argc, char **argv) {
                         "ExSIA producer workspace and residual ownership transitions");
             if (rmd_pipeline) {
                 for (const auto &parent : parents) {
-                    const auto released = std::find_if(ownership.begin(), ownership.end(), [&](const auto &event) {
-                        return event.operation_id == parent.operation_id &&
-                            event.event.kind == cycle::ProducerEventKind::FrontendCapacityRelease &&
-                            event.event.stripe_id == 0;
-                    });
-                    require(released != ownership.end() && released->event.rmd_packet &&
-                            released->required_work_ids.size() > 1 &&
-                            released->required_call_ids.size() == 1,
-                            "residual capacity release requires actual compact work and merge call");
+                    // A residual stripe's release requires its dense work, every residual child
+                    // bound to it (none for an admitted paired companion) and its merge call.
+                    const bool paired_parent = paired_pipeline && &parent == &parents.back();
+                    const size_t checked = paired_pipeline ? expected_count_per_parent : 1;
+                    for (size_t stripe = 0; stripe < checked; ++stripe) {
+                        const auto released = std::find_if(ownership.begin(), ownership.end(),
+                            [&](const auto &event) {
+                                return event.operation_id == parent.operation_id &&
+                                    event.event.kind == cycle::ProducerEventKind::FrontendCapacityRelease &&
+                                    event.event.stripe_id == stripe;
+                            });
+                        const auto children = static_cast<size_t>(std::count_if(
+                            parent.residual_bindings.begin(), parent.residual_bindings.end(),
+                            [&](const auto &binding) { return binding.stripe_id == stripe; }));
+                        require(released != ownership.end() && released->event.rmd_packet &&
+                                (paired_parent || children > 0) &&
+                                released->required_work_ids.size() == 1 + children &&
+                                released->required_call_ids.size() == 1,
+                                "residual capacity release requires actual compact work and merge call");
+                    }
                 }
                 require(count(cycle::ProducerEventKind::ResidualHostMergeCompleted) >= parents.size(),
                         "residual merge call missing");
@@ -427,7 +573,7 @@ int main(int argc, char **argv) {
                         "pipeline producer identity/source binding");
             }
         }
-        if (!cross_parent) metadata->execution(node, "Gemmini", "TARGET_NPU", true);
+        if (!two_parents) metadata->execution(node, "Gemmini", "TARGET_NPU", true);
         if (cross_parent)
             require(metadata->completed_graph_count() == 2, "cross-parent semantic graph count");
         if (exsia_pipeline) {
