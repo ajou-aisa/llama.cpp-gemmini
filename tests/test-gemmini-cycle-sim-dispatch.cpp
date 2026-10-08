@@ -86,7 +86,7 @@ void print_observation(const Observation &o) {
 // (no residual child, its RESIDUAL_MERGE requires exactly that work); one that fell back
 // (CAPACITY_NONFIT: the library refused the pair; RUN_AWARE_UNSUPPORTED: the producer could not
 // build it, no rows or runs recorded) leaves a planned stripe whose residual is child work bound to
-// it, merged after that child. Admitted and fallback stripes must both occur. The compact parent
+// it, merged after that child. Admitted and CAPACITY_NONFIT stripes must both occur. The compact parent
 // records no companion and binds one child per residual stripe. unsupported_stripe0: stripe 0 must
 // be the RUN_AWARE_UNSUPPORTED fallback; otherwise that reason must not occur.
 void verify_paired_trace(const ggml::gemmini::cycle_sim::ProducerParent &compact,
@@ -182,7 +182,7 @@ void verify_paired_trace(const ggml::gemmini::cycle_sim::ProducerParent &compact
                                       unsupported == 1
                                 : unsupported == 0,
             "RUN_AWARE_UNSUPPORTED fallback on the wrong stripes");
-    require(mine.size() == stripes && admitted >= 1 && rejected >= 1 &&
+    require(mine.size() == stripes && admitted >= 1 && rejected - unsupported >= 1 &&
             paired.work_ids.size() == stripes + children,
             "paired parent must mix admitted and fallback stripes with exact work identities");
     size_t compact_children = 0;
@@ -378,19 +378,24 @@ int main(int argc, char **argv) {
             auto &producer_meta = fixture.args.act_quant.storage().emplace<
                 ggml::gemmini::quants::act::exsia::Meta>();
             std::vector<float> input(fixture.args.I * fixture.args.K, 1.0f);
-            // Rows carrying outliers (residual rows). The paired mode puts them in every stripe and
-            // makes stripe 1's residual three radix lanes wide, so its companion cannot fit the
-            // accumulator slot beside Main while those of stripes 0 and 2 do.
+            // Rows carrying outliers (residual rows). The paired mode gives every stripe a residual:
+            // the first row of each stripe carries a narrow outlier (one residual row group, whose
+            // companion fits the accumulator slot beside Main on every profile), and every row of
+            // stripe 1 carries outliers spanning four radix lanes of block 0 (three for 8-bit digits),
+            // so stripe 1's companion cannot fit on any profile.
             const size_t stripe_rows = fixture.args.activation_rows_per_stripe;
+            const auto wide_row = [&](size_t row) {
+                return paired_pipeline && row >= stripe_rows && row < 2 * stripe_rows;
+            };
             const auto outlier_row = [&](size_t row) {
-                return rmd_pipeline && (row < stripe_rows ||
-                                        (paired_pipeline && row < fixture.args.I));
+                if (!rmd_pipeline || row >= fixture.args.I) return false;
+                return paired_pipeline ? row % stripe_rows == 0 || wide_row(row) : row < stripe_rows;
             };
             for (size_t row = 0; row < fixture.args.I; ++row) {
                 if (!outlier_row(row)) continue;
-                const bool wide = paired_pipeline && row >= stripe_rows && row < 2 * stripe_rows;
-                input[row * fixture.args.K] = wide ? 4096.0f : 256.0f;
+                input[row * fixture.args.K] = wide_row(row) ? 4096.0f : 256.0f;
                 input[row * fixture.args.K + 1] = 8.0f;
+                if (wide_row(row)) input[row * fixture.args.K + 2] = 256.0f;
                 input[row * fixture.args.K + 40] = -17.0f;
             }
             ggml_tensor activation_tensor{};
