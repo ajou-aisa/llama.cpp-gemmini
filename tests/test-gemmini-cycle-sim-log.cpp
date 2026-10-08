@@ -150,7 +150,10 @@ int main(int argc, char **argv) {
     std::ifstream input(path);
     const std::string data((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     assert(data.find("\"schema\":\"im2p-npu-cycle-trace\"") != std::string::npos);
-    assert(data.find("\"version\":2") != std::string::npos);
+    // Version 3 (P6.2) adds NPU_WORK "paired"; works without a companion record it as null.
+    assert(data.find("\"version\":3") != std::string::npos);
+    assert(data.find("\"version\":2") == std::string::npos);
+    assert(data.find("\"paired\":null") != std::string::npos);
     assert(data.find("\"residual_work_revision\":\"cross-block-run-aware-v1\"") != std::string::npos);
     assert(data.find("\"registered_operation_count\":3") != std::string::npos);
     assert(data.find("\"call_count\":3") != std::string::npos);

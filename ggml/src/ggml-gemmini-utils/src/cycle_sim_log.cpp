@@ -62,7 +62,7 @@ void Session::Impl::check() const {
 }
 void Session::Impl::emit(const char *kind, const std::string &fields) {
     check();
-    const std::string line = "{\"schema\":\"im2p-npu-cycle-trace\",\"version\":2,\"kind\":" +
+    const std::string line = "{\"schema\":\"im2p-npu-cycle-trace\",\"version\":3,\"kind\":" +
         json_string(kind) + ",\"sequence\":" + std::to_string(sequence++) +
         ",\"run_id\":\"run-0\",\"collection_run_id\":1,\"run_config_id\":" + json_string(info.run_config_id) +
         ",\"source_role\":" + json_string(semantic::source_name(semantic::Source::PotalCollection)) + fields + "}\n";

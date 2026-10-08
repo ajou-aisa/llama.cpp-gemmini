@@ -41,6 +41,7 @@ struct HostStageState {
 };
 struct ProducerDenseStripe {
     uint64_t work_id, parent_id, row_begin, row_end;
+    bool paired_admitted = false;
 };
 struct Session::Impl {
     explicit Impl(RunInfo value) : info(std::move(value)) {}

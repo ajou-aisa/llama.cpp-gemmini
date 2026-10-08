@@ -62,6 +62,21 @@ struct Operation {
 struct RowIdentity {
     uint32_t source_row = 0, lane_id = 0;
 };
+// P6.2: a paired-microtile companion requested for this stripe (PAIR_LOOP_TAIL). When admitted,
+// the stripe's compact residual (residual_rows x compact_k over runs, original K = the work's K)
+// runs with Main as this one work and no residual work exists for it. When not admitted, the
+// stripe ran on the planned path and its residual is a separate compact work; fallback_reason is
+// CAPACITY_NONFIT (the library's planner refused the pair) or RUN_AWARE_UNSUPPORTED (the producer
+// could not build the companion; rows, compact_k and runs are then empty). capacity_* is the
+// library's admission basis.
+struct PairedFacts {
+    std::string revision = "pair-loop-tail-v1";
+    bool admitted = true;
+    std::string fallback_reason;
+    uint64_t residual_rows = 0, compact_k = 0;
+    std::vector<im2p_compact_run_t> runs;
+    uint64_t capacity_accumulator_rows = 0, capacity_work_entries = 0, capacity_scratchpad_rows = 0;
+};
 struct Work {
     im2p_production_geometry_v1_t geometry{};
     std::string provenance = "dense_main", scope = "full";
@@ -77,6 +92,7 @@ struct Work {
     uint64_t column_begin = 0, group_index = 0;
     bool rmd_raw = false, host_integer_block_multiply = false;
     std::vector<uint64_t> required_host_stage_ids;
+    std::optional<PairedFacts> paired;
 };
 struct HostStage {
     std::string stage_name, execution_class, source_owner, source_location;

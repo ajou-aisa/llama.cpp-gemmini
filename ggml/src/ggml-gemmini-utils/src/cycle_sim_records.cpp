@@ -67,6 +67,40 @@ std::string work_fields(const Work &w) {
         require(!w.original_k && w.runs.empty() && w.row_map.empty() &&
                 !w.original_block_id, "dense work cannot carry residual run metadata");
     }
+    if (w.paired) {
+        // A requested companion (P6.2, PAIR_LOOP_TAIL): admitted = one stream work for Main and
+        // its residual; not admitted = planned stripe plus a separate residual compact work.
+        const auto &p = *w.paired;
+        require(w.provenance == "dense_main" && w.scope == "stripe" && p.revision == "pair-loop-tail-v1" &&
+                g.k <= UINT32_MAX &&
+                p.capacity_accumulator_rows && p.capacity_work_entries && p.capacity_scratchpad_rows,
+                "paired companion facts required");
+        const bool built = p.residual_rows && p.compact_k && !p.runs.empty();
+        require(p.admitted ? p.fallback_reason.empty() && built
+                           : (p.fallback_reason == "CAPACITY_NONFIT" && built) ||
+                             (p.fallback_reason == "RUN_AWARE_UNSUPPORTED" && !p.residual_rows &&
+                              !p.compact_k && p.runs.empty()),
+                "paired companion admission outcome");
+        uint64_t cursor = 0;
+        uint64_t previous_block = 0;
+        for (size_t index = 0; index < p.runs.size(); ++index) {
+            const auto &run = p.runs[index];
+            uint32_t bits = run.original_k_mask;
+            uint32_t selected = 0;
+            while (bits) { ++selected; bits &= bits - 1; }
+            const uint64_t start = uint64_t(run.original_block_id) * 32;
+            const uint32_t available = start < g.k ? static_cast<uint32_t>(std::min<uint64_t>(32, g.k - start)) : 0;
+            const uint32_t valid_mask = available == 32 ? UINT32_MAX :
+                                        available == 0 ? 0 : (uint32_t{1} << available) - 1;
+            require((index == 0 || run.original_block_id > previous_block) &&
+                    run.original_k_mask && !(run.original_k_mask & ~valid_mask) &&
+                    selected == run.compact_k_count && run.compact_k_begin == cursor,
+                    "invalid paired companion run coverage");
+            previous_block = run.original_block_id;
+            cursor += run.compact_k_count;
+        }
+        require(cursor == p.compact_k, "paired companion runs do not cover compact K");
+    }
     if (w.scope == "stripe") {
         require(w.stripe_id && w.host_slot && *w.stripe_id == g.stripe_id && g.scope == IM2P_GEOMETRY_STRIPE,
                 "stripe identity/scope mismatch");
@@ -113,7 +147,28 @@ std::string work_fields(const Work &w) {
         out << (i ? "," : "") << "{\"source_row\":" << row.source_row
             << ",\"lane_id\":" << row.lane_id << '}';
     }
-    out << ']';
+    out << "],\"paired\":";
+    if (!w.paired) {
+        out << "null";
+    } else {
+        const auto &p = *w.paired;
+        out << "{\"revision\":" << json_string(p.revision) << ",\"requested\":true,\"admitted\":"
+            << (p.admitted ? "true" : "false") << ",\"route\":"
+            << json_string(p.admitted ? "PAIR_LOOP_TAIL" : "COMPACT_FALLBACK") << ",\"fallback_reason\":"
+            << (p.admitted ? std::string("null") : json_string(p.fallback_reason))
+            << ",\"residual_rows\":" << p.residual_rows
+            << ",\"compact_k\":" << p.compact_k << ",\"capacity\":{\"accumulator_rows\":"
+            << p.capacity_accumulator_rows << ",\"work_entries\":" << p.capacity_work_entries
+            << ",\"scratchpad_rows\":" << p.capacity_scratchpad_rows << "},\"runs\":[";
+        for (size_t i = 0; i < p.runs.size(); ++i) {
+            const auto &run = p.runs[i];
+            out << (i ? "," : "") << "{\"original_block_id\":" << run.original_block_id
+                << ",\"original_k_mask\":" << run.original_k_mask
+                << ",\"compact_k_begin\":" << run.compact_k_begin
+                << ",\"compact_k_count\":" << run.compact_k_count << '}';
+        }
+        out << "]}";
+    }
     return out.str();
 }
 uint64_t Session::work(const Context &context, const Work &work) {
@@ -157,7 +212,8 @@ uint64_t Session::work(const Context &context, const Work &work) {
         require(impl_->dense_stripes.emplace(
             std::make_pair(*context.operation_id, *work.stripe_id),
             ProducerDenseStripe{id, *context.dispatch_id, work.row_begin,
-                                work.row_begin + work.row_count}).second,
+                                work.row_begin + work.row_count,
+                                work.paired && work.paired->admitted}).second,
             "duplicate dense stripe work");
         impl_->striped_operations.insert(*context.operation_id);
     } else if (work.scope == "residual_compact" && work.stripe_id &&
@@ -165,6 +221,8 @@ uint64_t Session::work(const Context &context, const Work &work) {
         const auto dense = impl_->dense_stripes.find({*context.operation_id, *work.stripe_id});
         require(dense != impl_->dense_stripes.end(), "residual work lacks source dense stripe");
         const auto &source = dense->second;
+        // Its residual ran inside the stripe work: a child would count the residual twice.
+        require(!source.paired_admitted, "admitted paired stripe cannot own a residual child work");
         impl_->residual_bindings[*context.operation_id].push_back(
             {id, *context.call_id, *context.dispatch_id, source.work_id,
              source.parent_id, *work.stripe_id, source.row_begin, source.row_end,
