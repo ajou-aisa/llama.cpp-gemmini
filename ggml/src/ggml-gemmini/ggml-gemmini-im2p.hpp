@@ -116,6 +116,10 @@ enum class TestFailure : std::uint8_t {
     simulator_create,
     collector_allocation,
     collector_capture,
+    // P6.2 paired route: stripe 0's companion build reports a valid packet the run-aware route
+    // cannot carry (unsupported_route), or a malformed packet (invalid_packet).
+    paired_run_aware_unsupported,
+    paired_malformed_packet,
 };
 
 enum class TestRuntimeArgsSite : std::uint8_t {

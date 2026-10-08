@@ -1623,22 +1623,35 @@ class ExsiaStripePipeline::Impl {
     }
 
     // The stripe's companion from its packet: run-aware activations and runs, with W and the
-    // block scales left to the stream's resident operands (indexed through the runs). A packet
-    // the run-aware route cannot carry gets a companion that is already rejected
-    // (RUN_AWARE_UNSUPPORTED, no buffers): the residual takes the compact path and the request
-    // stays visible in the NPU trace.
-    void attach_paired_companion(quants::act::exsia::StripeReadyEvent & event) {
-        auto request = std::make_shared<rmd::RunAwareRequest>();
-        if (rmd::build_run_aware_activations(runtime_args, *event.rmd_packet, *request) !=
-            rmd::RmdStatus::success) {
+    // block scales left to the stream's resident operands (indexed through the runs).
+    // A valid packet the run-aware route cannot carry (unsupported_route) gets a companion that
+    // is already rejected (RUN_AWARE_UNSUPPORTED, no buffers) before anything is published: the
+    // residual takes the compact path and the request stays visible in the NPU trace. Any other
+    // failure is a malformed packet: returns false and the publication is refused.
+    bool attach_paired_companion(quants::act::exsia::StripeReadyEvent & event) {
+        auto           request = std::make_shared<rmd::RunAwareRequest>();
+        rmd::RmdStatus status =
+            rmd::build_run_aware_activations(runtime_args, *event.rmd_packet, *request);
+#if defined(GGML_GEMMINI_TESTING)
+        {
+            std::lock_guard lock(test_mutex);
+            if (event.stripe_id == 0 && injected_failure == TestFailure::paired_run_aware_unsupported)
+                status = rmd::RmdStatus::unsupported_route;
+            if (event.stripe_id == 0 && injected_failure == TestFailure::paired_malformed_packet)
+                status = rmd::RmdStatus::invalid_packet;
+        }
+#endif
+        if (status == rmd::RmdStatus::unsupported_route) {
             auto rejected   = std::make_shared<::im2p::gemmini::PairedCompanion>();
             rejected->n     = runtime_args.J;
             rejected->state = ::im2p::gemmini::PairedCompanion::State::rejected;
             rejected->fallback_reason =
                 ::im2p::gemmini::PairedCompanion::FallbackReason::run_aware_unsupported;
             event.paired_companion = std::move(rejected);
-            return;
+            return true;
         }
+        if (status != rmd::RmdStatus::success)
+            return false;
         auto companion         = std::make_shared<::im2p::gemmini::PairedCompanion>();
         companion->rows        = request->m;
         companion->compact_k   = request->k;
@@ -1648,7 +1661,7 @@ class ExsiaStripePipeline::Impl {
         for (const auto & run : request->runs) {
             if (run.compact_k_begin > std::numeric_limits<uint32_t>::max() ||
                 run.compact_k_count > std::numeric_limits<uint32_t>::max())
-                return;
+                return false;
             companion->runs.push_back({run.original_block_id,
                                        run.union_k_mask,
                                        static_cast<uint32_t>(run.compact_k_begin),
@@ -1656,6 +1669,7 @@ class ExsiaStripePipeline::Impl {
         }
         event.paired_companion = std::move(companion);
         event.paired_request   = std::move(request);
+        return true;
     }
 
     bool publish(const quants::act::exsia::StripeReadyEvent & event) noexcept {
@@ -1712,9 +1726,10 @@ class ExsiaStripePipeline::Impl {
                                         "im2p.paired_companion_preparation",
                                         HostIntervalAccounting::cpu_work,
                                         &event);
+            bool attached = false;
             try {
                 paired_event = event;
-                attach_paired_companion(paired_event);
+                attached     = attach_paired_companion(paired_event);
             } catch (const std::bad_alloc &) {
                 sink_result = {
                     Error::out_of_memory, "failed to prepare the paired residual companion", false};
@@ -1722,6 +1737,13 @@ class ExsiaStripePipeline::Impl {
             } catch (...) {
                 sink_result = {Error::execution_failure,
                                "failed to prepare the paired residual companion",
+                               false};
+                return false;
+            }
+            if (!attached) {
+                // Malformed packet: refuse the publication; nothing of this stripe is published.
+                sink_result = {Error::invalid_contract,
+                               "malformed residual packet refused for its paired companion",
                                false};
                 return false;
             }

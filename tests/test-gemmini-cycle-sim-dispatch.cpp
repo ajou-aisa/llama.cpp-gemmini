@@ -83,13 +83,15 @@ void print_observation(const Observation &o) {
 
 // P6.2 record-level checks on the dedicated NPU trace (trace version 3). In the paired parent every
 // stripe carries a residual and a requested companion: an admitted one runs inside the stripe work
-// (no residual child, its RESIDUAL_MERGE requires exactly that work); one the library refused
-// (CAPACITY_NONFIT) leaves a planned stripe whose residual is child work bound to it, merged after
-// that child. Both outcomes must occur. The compact parent records no companion and binds one
-// child per residual stripe.
+// (no residual child, its RESIDUAL_MERGE requires exactly that work); one that fell back
+// (CAPACITY_NONFIT: the library refused the pair; RUN_AWARE_UNSUPPORTED: the producer could not
+// build it, no rows or runs recorded) leaves a planned stripe whose residual is child work bound to
+// it, merged after that child. Admitted and fallback stripes must both occur. The compact parent
+// records no companion and binds one child per residual stripe. unsupported_stripe0: stripe 0 must
+// be the RUN_AWARE_UNSUPPORTED fallback; otherwise that reason must not occur.
 void verify_paired_trace(const ggml::gemmini::cycle_sim::ProducerParent &compact,
                          const ggml::gemmini::cycle_sim::ProducerParent &paired,
-                         size_t stripes) {
+                         size_t stripes, bool unsupported_stripe0) {
     const auto path = ggml::gemmini::log::resolve_output_path(GEMMINI_LOG_DEFAULT_NPU_TRACE_PATH);
     std::ifstream stream(path);
     require(stream.is_open(), "paired trace file");
@@ -120,16 +122,22 @@ void verify_paired_trace(const ggml::gemmini::cycle_sim::ProducerParent &compact
                 continue;
             }
             require(scope == "stripe", "unexpected pipeline work scope");
+            // An accepted stripe executed twice would show a second stripe work.
+            require(!table[stripe].work, "duplicate stripe work");
             table[stripe].work = work;
             const auto &facts = record.at("paired");
             if (facts.is_null()) continue;
             require(operation == paired.operation_id, "compact route recorded a companion");
             const bool admitted = facts.at("admitted").get<bool>();
+            const std::string reason = admitted ? "" : facts.at("fallback_reason").get<std::string>();
+            const bool unbuilt = reason == "RUN_AWARE_UNSUPPORTED";
             require(facts.at("revision") == "pair-loop-tail-v1" && facts.at("requested") == true &&
                     facts.at("route") == (admitted ? "PAIR_LOOP_TAIL" : "COMPACT_FALLBACK") &&
                     (admitted ? facts.at("fallback_reason").is_null()
-                              : facts.at("fallback_reason") == "CAPACITY_NONFIT") &&
-                    facts.at("residual_rows").get<uint64_t>() > 0 && !facts.at("runs").empty() &&
+                              : reason == "CAPACITY_NONFIT" || unbuilt) &&
+                    (unbuilt ? facts.at("residual_rows").get<uint64_t>() == 0 &&
+                                   facts.at("compact_k").get<uint64_t>() == 0 && facts.at("runs").empty()
+                             : facts.at("residual_rows").get<uint64_t>() > 0 && !facts.at("runs").empty()) &&
                     facts.at("capacity").at("accumulator_rows").get<uint64_t>() > 0,
                     "paired companion facts");
             table[stripe].admitted = admitted;
@@ -140,7 +148,7 @@ void verify_paired_trace(const ggml::gemmini::cycle_sim::ProducerParent &compact
             merges.push_back(record.at("required_work_ids").get<std::vector<uint64_t>>());
         }
     }
-    size_t admitted = 0, rejected = 0, children = 0;
+    size_t admitted = 0, rejected = 0, children = 0, unsupported = 0;
     for (const auto &required : merges) {
         bool owned = false;
         for (auto &[index, stripe] : mine) {
@@ -164,11 +172,16 @@ void verify_paired_trace(const ggml::gemmini::cycle_sim::ProducerParent &compact
                     "admitted paired stripe owns a residual child work");
         } else {
             ++rejected;
+            unsupported += stripe.reason == "RUN_AWARE_UNSUPPORTED";
             children += stripe.children.size();
             require(!stripe.children.empty() && bound[index] == stripe.children.size(),
                     "fallback stripe lacks its bound residual child work");
         }
     }
+    require(unsupported_stripe0 ? mine.count(0) && mine.at(0).reason == "RUN_AWARE_UNSUPPORTED" &&
+                                      unsupported == 1
+                                : unsupported == 0,
+            "RUN_AWARE_UNSUPPORTED fallback on the wrong stripes");
     require(mine.size() == stripes && admitted >= 1 && rejected >= 1 &&
             paired.work_ids.size() == stripes + children,
             "paired parent must mix admitted and fallback stripes with exact work identities");
@@ -181,8 +194,27 @@ void verify_paired_trace(const ggml::gemmini::cycle_sim::ProducerParent &compact
     require(theirs.size() == stripes && compact.residual_bindings.size() == compact_children,
             "compact parent binds one child per residual stripe");
     std::printf("PAIRED_TRACE_PASS stripes=%zu admitted=%zu fallback_capacity_nonfit=%zu "
-                "fallback_children=%zu compact_children=%zu merges=%zu\n", stripes, admitted, rejected,
-                children, compact_children, merges.size());
+                "fallback_run_aware_unsupported=%zu fallback_children=%zu compact_children=%zu merges=%zu\n",
+                stripes, admitted, rejected - unsupported, unsupported, children, compact_children,
+                merges.size());
+}
+
+// P6.2 malformed companion: the refused publication leaves no NPU work, call or companion of the
+// operation in the trace.
+size_t operation_npu_records(uint64_t operation) {
+    const auto path = ggml::gemmini::log::resolve_output_path(GEMMINI_LOG_DEFAULT_NPU_TRACE_PATH);
+    std::ifstream stream(path);
+    require(stream.is_open(), "paired trace file");
+    size_t count = 0;
+    for (std::string line; std::getline(stream, line);) {
+        if (line.empty()) continue;
+        const auto record = nlohmann::json::parse(line);
+        const std::string kind = record.value("kind", "");
+        if ((kind == "NPU_WORK" || kind == "NPU_CALL") && record.contains("operation_id") &&
+            record.at("operation_id").get<uint64_t>() == operation)
+            ++count;
+    }
+    return count;
 }
 
 int main(int argc, char **argv) {
@@ -197,7 +229,8 @@ int main(int argc, char **argv) {
             : inject_log_failure ? requested.substr(5) : requested;
         require(mode == "full" || mode == "pipeline" || mode == "exsia-pipeline" ||
                 mode == "exsia-rmd-pipeline" || mode == "exsia-rmd-cross-parent" ||
-                mode == "exsia-paired-pipeline" ||
+                mode == "exsia-paired-pipeline" || mode == "exsia-paired-unsupported" ||
+                mode == "exsia-paired-malformed" ||
                 mode == "residual" ||
                 mode == "residual-runs" ||
                 mode == "large-k", "invalid mode");
@@ -209,7 +242,13 @@ int main(int argc, char **argv) {
         // P6.2: the same stripes run first on the compact route, then on the paired route
         // (second parent, same input); outputs must be bit-exact and the paired parent must
         // carry its residual inside Main's stripe work without a residual child.
-        const bool paired_pipeline = mode == "exsia-paired-pipeline";
+        // exsia-paired-unsupported: stripe 0's companion is valid but unsupported by the run-aware
+        // route (injected), so it falls back before publication. exsia-paired-malformed: stripe 0's
+        // packet is malformed (injected), so the paired parent's publication is refused.
+        const bool paired_unsupported = mode == "exsia-paired-unsupported";
+        const bool paired_malformed = mode == "exsia-paired-malformed";
+        const bool paired_pipeline =
+            mode == "exsia-paired-pipeline" || paired_unsupported || paired_malformed;
         const bool two_parents = cross_parent || paired_pipeline;
         const bool rmd_pipeline = mode == "exsia-rmd-pipeline" || two_parents;
         const bool exsia_pipeline = mode == "exsia-pipeline" || rmd_pipeline;
@@ -392,9 +431,41 @@ int main(int argc, char **argv) {
                         input[row * fixture.args.K] = 512.0f;
                 else
                     fixture.args.residual_route = ggml::gemmini::residual::ResidualRoute::ws_paired;
+                namespace adapter = ggml::gemmini::im2p_adapter;
+                if (paired_unsupported)
+                    adapter::test_inject_failure(adapter::TestFailure::paired_run_aware_unsupported);
+                if (paired_malformed)
+                    adapter::test_inject_failure(adapter::TestFailure::paired_malformed_packet);
                 auto &second_meta = fixture.args.act_quant.storage().emplace<
                     ggml::gemmini::quants::act::exsia::Meta>();
+                if (paired_malformed) {
+                    auto started = adapter::start_exsia_stripe_pipeline(fixture.args);
+                    require(started.result.ok() && started.pipeline && started.pipeline->install_sink().ok(),
+                            "malformed-mode pipeline start");
+                    ggml::gemmini::quants::act::exsia::ExSIA exsia;
+                    exsia.set_execution_mode(ggml::gemmini::quants::act::exsia::ExSIAState::ExecutionMode::Sequential);
+                    const bool quantized = exsia.run(second_meta, &activation_tensor, fixture.args,
+                                                    fixture.args.exsia_stripe_ready_sink);
+                    const auto result = started.pipeline->finish(quantized);
+                    adapter::test_inject_failure(adapter::TestFailure::none);
+                    require(!result.result.ok() && std::string(result.result.message) ==
+                                "malformed residual packet refused for its paired companion",
+                            "malformed paired companion must refuse the publication");
+                    require(std::all_of(fixture.output.begin(), fixture.output.end(),
+                                        [](float value) { return value == -1.0f; }),
+                            "refused paired publication changed the caller output");
+                    const auto operation = *fixture.args.cycle_sim_context.operation_id;
+                    const size_t records = operation_npu_records(operation);
+                    require(records == 0, "refused paired publication left NPU work or calls");
+                    std::printf("PAIRED_MALFORMED_PASS refused=1 output_untouched=1 npu_records=%zu "
+                                "compact_parent=PASS\n", records);
+                    std::printf("CPU_FUNCTIONAL_DISPATCH_PASS mode=%s numerical=PASS "
+                                "actual_rtl_acceptance=NOT_APPLICABLE\n", mode.c_str());
+                    return 0;
+                }
                 execute_exsia(second_meta);
+                if (paired_unsupported)
+                    adapter::test_inject_failure(adapter::TestFailure::none);
                 if (cross_parent)
                     require(fixture.output != first_output, "second ExSIA parent reused first numerical result");
                 else
@@ -497,7 +568,8 @@ int main(int argc, char **argv) {
                         parents[0].fence_call_id < parents[1].fence_call_id &&
                         parents[0].work_ids.back() < parents[1].work_ids.front(),
                         "cross-parent work/fence identities are not ordered and distinct");
-            if (paired_pipeline) verify_paired_trace(parents[0], parents[1], expected_count_per_parent);
+            if (paired_pipeline)
+                verify_paired_trace(parents[0], parents[1], expected_count_per_parent, paired_unsupported);
             const auto ownership = session->producer_events();
             const auto count = [&](cycle::ProducerEventKind kind) {
                 return std::count_if(ownership.begin(), ownership.end(), [&](const auto &event) {
