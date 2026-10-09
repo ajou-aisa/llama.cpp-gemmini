@@ -132,14 +132,19 @@ class LlamaPlan:
 
 
 def llama_plan(kind: str, precision: str, dim: int, im2p: Path, matmul_mode: str = "FULL",
-               extra_targets: tuple[str, ...] = ()) -> LlamaPlan:
-    """Options, targets and verification filter of one llama build kind; platform independent."""
+               extra_targets: tuple[str, ...] = (), rmd_backend: str = "WS") -> LlamaPlan:
+    """Options, targets and verification filter of one llama build kind; platform independent.
+
+    `rmd_backend` is the compiled residual route of the NPU builds: WS (compact residual work, the default) or
+    WS_PAIRED (PAIR_LOOP_TAIL companions); the FullCPU build always runs its residual on the CPU."""
     require(kind in ("cycle", "activation", "residual", "scu", COMBINED, "potal-host", "potal-host-nocpulog",
                      "fullcpu-host"),
             "invalid measurement kind")
     require(precision in ("a4w4", "a8w8") and dim in (16, 32, 64) and
             matmul_mode in ("FULL", "STRIPE_PIPELINE") and
-            (kind in ("cycle", "potal-host", "potal-host-nocpulog") or matmul_mode == "FULL"),
+            (kind in ("cycle", "potal-host", "potal-host-nocpulog") or matmul_mode == "FULL") and
+            (rmd_backend == "WS" or (rmd_backend == "WS_PAIRED" and kind in ("cycle", "potal-host",
+                                                                          "potal-host-nocpulog"))),
             "invalid measurement build profile")
     bits = 4 if precision == "a4w4" else 8
     options = {
@@ -155,7 +160,7 @@ def llama_plan(kind: str, precision: str, dim: int, im2p: Path, matmul_mode: str
         "GGML_GEMMINI_ACTIVATION_QUANT": "EXSIA", "GGML_GEMMINI_BLOCK_SIZE": "32",
         "GGML_GEMMINI_ACTIVATION_BITS": str(bits), "GGML_GEMMINI_WEIGHT_BITS": str(bits),
         "GGML_GEMMINI_DIM": str(dim), "GGML_GEMMINI_DEFAULT_MATMUL_MODE": matmul_mode,
-        "GGML_GEMMINI_DEFAULT_RMD_BACKEND": "WS", "GGML_GEMMINI_ENABLE_RMD": "ON",
+        "GGML_GEMMINI_DEFAULT_RMD_BACKEND": rmd_backend, "GGML_GEMMINI_ENABLE_RMD": "ON",
         "GGML_GEMMINI_ALLOW_RUNTIME_MATMUL_OVERRIDE": "OFF",
         "GGML_GEMMINI_ACT_QUANT_METRICS": "0",
         **{option: str(int(kind in (metric, COMBINED))) for metric, (option, _) in METRIC_SINKS.items()},
@@ -261,9 +266,9 @@ def include_closure(build_dir: Path, repo: Path = INCLUDE_REPO) -> Record:
 
 
 def build(kind: str, precision: str, dim: int, output: Path, im2p: Path, jobs: int,
-          matmul_mode: str = "FULL", extra_targets: tuple[str, ...] = ()) -> Path:
+          matmul_mode: str = "FULL", extra_targets: tuple[str, ...] = (), rmd_backend: str = "WS") -> Path:
     """Configure, compile and verify a new directory; never reuse a user's build cache."""
-    plan = llama_plan(kind, precision, dim, im2p, matmul_mode, extra_targets)
+    plan = llama_plan(kind, precision, dim, im2p, matmul_mode, extra_targets, rmd_backend)
     require(jobs > 0, "invalid measurement build profile")
     host = platform_profile()
     output.mkdir(parents=True, exist_ok=False)
@@ -285,7 +290,8 @@ def build(kind: str, precision: str, dim: int, output: Path, im2p: Path, jobs: i
     else:
         require(info.get("dim") == dim and info.get("activation_bits") == bits and
                 info.get("weight_bits") == bits and info.get("cycle_sim") == 1 and
-                info.get("matmul_mode") == matmul_mode, "compiled build profile differs from request")
+                info.get("matmul_mode") == matmul_mode and info.get("rmd_backend") == rmd_backend,
+                "compiled build profile differs from request")
         require(not kind.startswith("potal-host") or (info.get("log_cycle") == 1 and
                 info.get("ggml_cpu_cycle_log") == int(kind == "potal-host")),
                 "PoTal host-timing build requires LOG_CYCLE=1 and the requested CPU cycle instrumentation")
@@ -370,12 +376,14 @@ def cached(cache: Path, name: str, identity: Record, make: Callable[[Path], obje
 
 
 def cached_llama_build(cache: Path, kind: str, precision: str, dim: int, im2p: Path, jobs: int,
-                       matmul_mode: str = "FULL", extra_targets: tuple[str, ...] = ()) -> tuple[Path, bool]:
-    plan = llama_plan(kind, precision, dim, im2p, matmul_mode, extra_targets)
+                       matmul_mode: str = "FULL", extra_targets: tuple[str, ...] = (),
+                       rmd_backend: str = "WS") -> tuple[Path, bool]:
+    plan = llama_plan(kind, precision, dim, im2p, matmul_mode, extra_targets, rmd_backend)
     identity: Record = {"build": "llama", "plan": plan.record(), "platform": platform_profile().record(),
                         "toolchain": toolchain(), "sources": source_state(im2p if "IM2P_SIM_ROOT" in plan.options else None)}
     path, hit = cached(cache, kind, identity,
-                       lambda output: build(kind, precision, dim, output, im2p, jobs, matmul_mode, extra_targets))
+                       lambda output: build(kind, precision, dim, output, im2p, jobs, matmul_mode, extra_targets,
+                                            rmd_backend))
     receipt = read_json(path / "build-receipt.json")
     extras = record(receipt.get("extra_targets"))
     require(sha256(path / "bin/llama-eval-workload") == receipt.get("runner_sha256") and

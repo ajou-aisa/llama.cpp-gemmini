@@ -111,11 +111,14 @@ def checksums(root: Path, known: dict[Path, str] | None = None) -> None:
 
 
 def workload_mode(args: argparse.Namespace) -> Record:
-    """SMOKE_256P1 is a separate connectivity workload; the 256+128 evaluation contract is unchanged."""
+    """SMOKE_256P1 is a separate connectivity workload; the 256+128 evaluation contract is unchanged. A WS_PAIRED
+    PoTal residual route is recorded; the default WS route keeps the record unchanged."""
+    route = {"rmd_backend": args.rmd_backend} if args.rmd_backend != "WS" else {}
     if args.smoke:
-        return {"workload_mode": "SMOKE_256P1", "prompt_tokens": 256, "generated_tokens": 1, "full_evaluation": False}
+        return {"workload_mode": "SMOKE_256P1", "prompt_tokens": 256, "generated_tokens": 1, "full_evaluation": False,
+                **route}
     return {"workload_mode": "E2E_GENERATION_256_128", "prompt_tokens": 256, "generated_tokens": GENERATED,
-            "full_evaluation": True}
+            "full_evaluation": True, **route}
 
 
 # Jetson/Linux aarch64 CPU intervals come from the per-thread PMU reader (ggml-gemmini-utils cycle_reader_aarch64):
@@ -404,8 +407,10 @@ def build_all(args: argparse.Namespace, run: Run, collect: bool = True) -> Recor
     kinds: list[tuple[str, str, str, tuple[str, ...]]] = ([("potal", "potal-host", "STRIPE_PIPELINE", ()),
                                                            ("fullcpu", "fullcpu-host", "FULL", ())] if collect else [])
     for name, kind, matmul, extra in kinds:
-        path, hit = run.step("build-" + name, lambda kind=kind, matmul=matmul, extra=extra: cached_llama_build(
-            cache, kind, args.precision, args.dim, IM2P, args.jobs, matmul, extra))
+        backend = args.rmd_backend if name == "potal" else "WS"
+        path, hit = run.step("build-" + name, lambda kind=kind, matmul=matmul, extra=extra, backend=backend:
+                             cached_llama_build(cache, kind, args.precision, args.dim, IM2P, args.jobs, matmul, extra,
+                                                backend))
         builds[name] = {"path": str(path), "cache_hit": hit, "receipt": read_json(path / "build-receipt.json"),
                         "build_info": read_json(path / "build-info.json")}
     for name, value in builds.items():
@@ -887,6 +892,8 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--generate", type=int, default=GENERATED)
     parser.add_argument("--precision", choices=("a4w4", "a8w8"), default="a8w8")
     parser.add_argument("--dim", type=int, choices=(16, 32, 64), default=32)
+    parser.add_argument("--rmd-backend", choices=("WS", "WS_PAIRED"), default="WS",
+                        help="compiled PoTal residual route: WS compact residual work or WS_PAIRED companions")
     parser.add_argument("--certificates", type=Path, default=os.environ.get("IM2P_CERTIFICATE_SET"),
                         help="certificate set JSON (or IM2P_CERTIFICATE_SET); --validation-mode certified")
     parser.add_argument("--validation-mode", choices=tuple(VALIDATION), default="certified",
@@ -942,7 +949,8 @@ def plan(args: argparse.Namespace) -> Record:
     kinds: list[tuple[str, str, str, tuple[str, ...]]] = [
         ("potal", "potal-host", "STRIPE_PIPELINE", ()), ("fullcpu", "fullcpu-host", "FULL", ())]
     for name, kind, matmul, extra in kinds:
-        build = llama_plan(kind, args.precision, args.dim, IM2P, matmul, extra)
+        build = llama_plan(kind, args.precision, args.dim, IM2P, matmul, extra,
+                           args.rmd_backend if name == "potal" else "WS")
         builds[name] = {"semantic_options_sha256": build.semantic_options_sha256,
                         "argv": argv_json(llama_argv(build, cache / name, args.jobs, host))}
     return {"platform": host.record(), "output": str(output), "profile": args.profile, "builds": builds,
@@ -1043,7 +1051,8 @@ def performance_run(args: argparse.Namespace) -> int:
             write_json(settings, SETTINGS)
             potal, fullcpu = collect(args, run, builds, settings)
             potal_info = compiled_info(Path(text(record(builds["potal"]), "path")) / "bin/llama-eval-workload")
-            require(potal_info.get("hp1") is True and potal_info.get("backend") == "IM2P_SIM",
+            require(potal_info.get("hp1") is True and potal_info.get("backend") == "IM2P_SIM" and
+                    potal_info.get("rmd_backend") == args.rmd_backend,
                     "PoTal build is not IM2P_SIM HP1")
         replay = (reconstruct(args, run, potal, fullcpu, cycle_library) if args.validation_mode == "certified"
                   else reconstruct_local(args, run, potal, fullcpu, cycle_library, cache))

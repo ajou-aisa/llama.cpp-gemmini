@@ -71,6 +71,20 @@ def test_extra_target_build_shares_potal_semantics_but_fullcpu_does_not() -> Non
     assert "llama-perplexity" in extra.targets
 
 
+def test_potal_rmd_backend_selects_the_paired_route_only_for_npu_builds() -> None:
+    # Given the default and the WS_PAIRED PoTal plans.
+    ws = llama_plan("potal-host", "a8w8", 32, IM2P, "STRIPE_PIPELINE")
+    paired = llama_plan("potal-host", "a8w8", 32, IM2P, "STRIPE_PIPELINE", rmd_backend="WS_PAIRED")
+    # Then the default stays WS, WS_PAIRED is a semantic option of its own, and only NPU builds may take it.
+    assert ws.options["GGML_GEMMINI_DEFAULT_RMD_BACKEND"] == "WS"
+    assert paired.options["GGML_GEMMINI_DEFAULT_RMD_BACKEND"] == "WS_PAIRED"
+    assert paired.semantic_options_sha256 != ws.semantic_options_sha256
+    for kind, backend in (("fullcpu-host", "WS_PAIRED"), ("potal-host", "CPU")):
+        with pytest.raises(EvaluationError, match="invalid measurement build profile"):
+            llama_plan(kind, "a8w8", 32, IM2P, "STRIPE_PIPELINE" if kind == "potal-host" else "FULL",
+                       rmd_backend=backend)
+
+
 def test_linux_dry_run_generates_the_same_semantic_plan() -> None:
     plans = {}
     for system, machine in (("Darwin", "arm64"), ("Linux", "x86_64"), ("Linux", "aarch64")):
@@ -650,7 +664,8 @@ def test_performance_builds_only_the_collection_builds(tmp_path: Path) -> None:
             write_json(path / name, {"kind": kind}) if not (path / name).exists() else None
         return path, True
     args = argparse.Namespace(build_cache=tmp_path / "build-cache", jobs=1, validation_mode="nano-local",
-                              local_validation=tmp_path / "receipt.json", precision="a8w8", dim=32)
+                              local_validation=tmp_path / "receipt.json", precision="a8w8", dim=32,
+                              rmd_backend="WS")
     for collect_now, expected in ((True, ["potal-host", "fullcpu-host"]), (False, [])):
         kinds.clear()
         run = runner.Run(tmp_path / f"run-{collect_now}", {})
@@ -693,7 +708,7 @@ def test_performance_run_writes_a_timeline_only_on_request(tmp_path: Path, timel
         validation_mode="nano-local", certificates=None, local_validation=receipt,
         model_manifest=manifest, output=tmp_path / "run", profile="a8w8-d32-hp1", reuse_collection=tmp_path,
         stage_cache=None, keep_raw=True, clock_selection=None, target_host_timing=None, target_interface_cost=None,
-        timeline=timeline, precision="a8w8", dim=32)
+        timeline=timeline, precision="a8w8", dim=32, rmd_backend="WS")
     reuse: Record = {"model_sha256": "model", "pmu_contract": {"status": "READY"}, "source_run": "collection"}
     builds: Record = {"cycle-model": {"receipt": {"library": {"path": str(tmp_path / "lib.so")}}}}
     with forbidden("export_timeline", "collect", "pmu_contract", "cached_llama_build", "cached_cycle_model"), \
