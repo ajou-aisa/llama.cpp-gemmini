@@ -72,6 +72,20 @@ if(CYCLE_SIM)
                 "-DTEST_PYTHON=${Python3_EXECUTABLE}"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/test-cycle-sim-dispatch.cmake")
         endforeach()
+        # ExSIA stripe-pipeline modes (compact route and the paired companion routes). They need
+        # the PoTal host-stage log (cycle-log.jsonl), so they exist only where LOG_CYCLE is on.
+        # The driver binds the fixture to the llama and IM2P.sim checkouts it was built from.
+        if(LOG_CYCLE)
+            foreach(mode IN ITEMS exsia-rmd-pipeline exsia-paired-pipeline exsia-paired-unsupported
+                                  exsia-paired-malformed)
+                add_test(NAME test-gemmini-cycle-sim-dispatch-${mode} COMMAND "${CMAKE_COMMAND}"
+                    "-DTEST_EXECUTABLE=$<TARGET_FILE:test-gemmini-cycle-sim-dispatch>"
+                    "-DTEST_MODE=${mode}" "-DTEST_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+                    "-DTEST_PYTHON=${Python3_EXECUTABLE}"
+                    "-DTEST_SOURCE_ROOTS=${PROJECT_SOURCE_DIR}|${IM2P_SIM_ROOT}"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/test-cycle-sim-dispatch.cmake")
+            endforeach()
+        endif()
         add_executable(test-cpu-functional-contract "${IM2P_SIM_ROOT}/frontend/tests/cpu_functional_contract.cpp")
         target_compile_features(test-cpu-functional-contract PRIVATE cxx_std_17)
         target_compile_options(test-cpu-functional-contract PRIVATE -UNDEBUG)
