@@ -2070,11 +2070,12 @@ static RmdStatus execute_rmd_stripe_im2p_correction(im2p_sim_t *                
                                                     const StripePacket &            packet,
                                                     Correction &                    output,
                                                     RmdExecutionMetrics *           metrics,
-                                                    const wroute::WeightRoutePlan * shared_plan,
+                                                    detail::RmdWeightPreparation *  weights,
                                                     const Im2pFullExecutor *        executor) {
 #if CYCLE_SIM && defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
     // Route plan and request validation of a compact residual: the same work the paired route
-    // measures in im2p.residual_paired_setup.
+    // measures in im2p.residual_paired_setup, including the operation's first route-plan
+    // resolution.
     const uint64_t                           validation_probe = probe::now();
     im2p::gemmini::cycle_sim::HostStageScope cycle_validation(
         args.cycle_sim_context,
@@ -2089,8 +2090,8 @@ static RmdStatus execute_rmd_stripe_im2p_correction(im2p_sim_t *                
     probe::add(probe::Part::instrumentation, validation_probe);
 #endif
     const wroute::WeightRoutePlan plan =
-        shared_plan
-            ? *shared_plan
+        weights
+            ? weights->route_plan(args)
             : wroute::resolve_weight_route_plan(args, wroute::WeightScaleInfoMode::ResidualHp1Scu);
     const RmdStatus plan_status = compact_plan_status(args, plan);
     if (plan_status != RmdStatus::success)
@@ -2268,9 +2269,8 @@ RmdStatus execute_rmd_stripe_im2p_with_weights(im2p_sim_t *                sim,
                                                Correction &                correction,
                                                RmdWeightPreparation &      weights,
                                                RmdExecutionMetrics *       metrics) {
-    const auto & plan = weights.route_plan(args);
     return execute_rmd_stripe_im2p_correction(
-        sim, args, packet, correction, metrics, &plan, nullptr);
+        sim, args, packet, correction, metrics, &weights, nullptr);
 }
 
 RmdStatus execute_rmd_stripe_paired_with_weights(const ggml_gemmini_args_t & args,
