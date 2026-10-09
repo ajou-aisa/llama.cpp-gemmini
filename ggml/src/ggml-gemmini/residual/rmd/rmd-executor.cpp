@@ -2188,6 +2188,23 @@ RmdStatus execute_rmd_stripe_paired_with_weights(const ggml_gemmini_args_t & arg
 #else
     if (args.optrace_context)
         return RmdStatus::unsupported_route;
+#if CYCLE_SIM
+    // The host work of this completion is measured by four disjoint canonical stages: setup,
+    // radix recomposition, finalize and publication. The frontend's
+    // im2p.residual_paired_recomposition interval only spans them, so setup carries that
+    // interval's former host dependencies.
+    const auto                               event_context = args.cycle_sim_context;
+    im2p::gemmini::cycle_sim::HostStageScope cycle_setup(
+        event_context,
+        "im2p.residual_paired_setup",
+        "POTAL_HOST",
+        "llama.cpp-gemmini",
+        "ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp:execute_rmd_stripe_paired_with_weights",
+        args.matmul_layer.c_str(),
+        {},
+        args.cycle_sim_host_dependencies,
+        true);
+#endif
     const auto &    plan        = weights.route_plan(args);
     const RmdStatus plan_status = compact_plan_status(args, plan);
     if (plan_status != RmdStatus::success)
@@ -2228,9 +2245,9 @@ RmdStatus execute_rmd_stripe_paired_with_weights(const ggml_gemmini_args_t & arg
         return RmdStatus::overflow;
     }
 #if CYCLE_SIM
+    cycle_setup.finish();
     // The companion ran inside Main's stream work, which the frontend names as this callback's
     // continuation: the recomposition depends on that work and declares no residual work.
-    const auto                               event_context = args.cycle_sim_context;
     const auto                               required_work =
         im2p::gemmini::cycle_sim::continuation_work_ids();
     im2p::gemmini::cycle_sim::StageCall      recompose_call(
@@ -2261,6 +2278,17 @@ RmdStatus execute_rmd_stripe_paired_with_weights(const ggml_gemmini_args_t & arg
             return RmdStatus::execution_failed;
         }
     }
+    im2p::gemmini::cycle_sim::HostStageScope cycle_finalize(
+        event_context,
+        "im2p.residual_paired_finalize",
+        "POTAL_HOST",
+        "llama.cpp-gemmini",
+        "ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp:execute_rmd_stripe_paired_with_weights",
+        args.matmul_layer.c_str(),
+        required_work,
+        cycle_recomposition.id() ? std::vector<uint64_t>{*cycle_recomposition.id()}
+                                 : std::vector<uint64_t>{},
+        true);
 #endif
 
     collect_packet_metrics(packet, staged_metrics);
@@ -2291,7 +2319,12 @@ RmdStatus execute_rmd_stripe_paired_with_weights(const ggml_gemmini_args_t & arg
     staged_metrics.correction_bytes                    = value_count * sizeof(OutputValue);
     staged_metrics.compressed_output_values            = 0;
 
-    Correction      staged_output = std::move(final);
+    Correction staged_output = std::move(final);
+    // The recomposition scratch is released inside the finalize stage, not after publication.
+    std::vector<__int128>().swap(wide);
+#if CYCLE_SIM
+    cycle_finalize.finish();
+#endif
     const RmdStatus observed = observe_run_aware_packet(args, packet, request, physical_fragments);
     if (observed != RmdStatus::success)
         return observed;

@@ -215,9 +215,12 @@ void rtl_debug_log_callback(void *, const char * message, size_t length) noexcep
 
 // Same-caller CPU cost, not simulator-worker totals. Explicit finish excludes
 // subsequent status/telemetry handling; destruction preserves partial costs.
+// diagnostic_parent spans canonical PoTal host stages that carry its whole cost: it declares no
+// host stage of its own and is recorded as a non-additive summary, so no canonical interval nests.
 enum class HostIntervalAccounting : uint8_t {
     cpu_work,
     excluded_from_cpu_work,
+    diagnostic_parent,
 };
 
 class HostCpuInterval {
@@ -233,6 +236,8 @@ class HostCpuInterval {
         record_.unit   = kNativeCycleUnit;
         record_.timing_interval_class = cpu_work_ ? cycle::TimingIntervalClass::per_worker_cpu_work
                                                   : cycle::TimingIntervalClass::non_additive;
+        if (accounting == HostIntervalAccounting::diagnostic_parent)
+            record_.cpu_service_exclusion = "nonadditive_summary";
         if (const auto * metadata =
                 std::get_if<quants::act::exsia::Meta>(&args.act_quant.storage());
             metadata != nullptr && metadata->run_id.has_value()) {
@@ -252,7 +257,8 @@ class HostCpuInterval {
             record_.slot      = event->slot;
         }
 #if CYCLE_SIM
-        if (args.cycle_sim_context && log::cpu_service_exclusion(operation) == nullptr &&
+        if (accounting != HostIntervalAccounting::diagnostic_parent && args.cycle_sim_context &&
+            log::cpu_service_exclusion(operation) == nullptr &&
             std::strcmp(operation, "im2p.output_buffer_copy") != 0 &&
             std::strcmp(operation, "im2p.output_authorize_host_call") != 0 &&
             std::strcmp(operation, "im2p.residual_simulator_setup_host_call") != 0) {
@@ -1477,10 +1483,12 @@ class ExsiaStripePipeline::Impl {
                    event.paired_companion->state ==
                        ::im2p::gemmini::PairedCompanion::State::accepted) {
             // P6.2: the companion ran inside Main's stripe work and its SCU-final int32 output
-            // is complete at this completion; only the host recomposition remains.
+            // is complete at this completion; only the host recomposition remains. Its cost is
+            // measured by the disjoint canonical stages of execute_rmd_stripe_paired_with_weights
+            // (setup, radix recomposition, finalize, publication); this interval only spans them.
             HostCpuInterval backend(stripe_args,
                                     "im2p.residual_paired_recomposition",
-                                    HostIntervalAccounting::cpu_work,
+                                    HostIntervalAccounting::diagnostic_parent,
                                     &event);
             const auto & companion = *event.paired_companion;
             status = event.paired_request == nullptr
