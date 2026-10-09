@@ -933,7 +933,8 @@ std::string serialize_residual_completion_probe(std::string_view parent_op,
     field(out, "slot", slot);
     null_field(out, "node_id");
     null_field(out, "worker_id");
-    field(out, "thread_id", cycle::host_thread_id());
+    // Not "thread_id": readers treat a row naming a thread as a host-timed interval with a span.
+    field(out, "completion_thread_id", cycle::host_thread_id());
     field(out, "instrumentation_ns", ns[0]);
     field(out, "instrumentation_calls", calls[0]);
     field(out, "dispatch_host_ns", ns[1]);

@@ -63,7 +63,8 @@ def run(cycle: list[dict[str, object]]) -> subprocess.CompletedProcess[str]:
     with tempfile.TemporaryDirectory() as directory:
         paths = [Path(directory) / name for name in ("npu-cycle-trace.jsonl", "cycle-log.jsonl")]
         for path, records in zip(paths, (trace, cycle)):
-            path.write_text("".join(json.dumps(r) + "\n" for r in records))
+            # Compact separators, as the producer writes them (readers match fields with regular expressions).
+            path.write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in records))
         return subprocess.run([sys.executable, "-B", str(CHECKER), *map(str, paths)],
                               capture_output=True, text=True, check=False)
 
@@ -121,6 +122,9 @@ def checker_cases() -> None:
            False, "compact residual host work is not carried by its canonical stages")
     expect("missing completion probe", paired(probes=0), False, "one completion probe per residual completion")
     expect("extra completion probe", ws(probes=2), False, "one completion probe per residual completion")
+    spanless = paired()
+    spanless[-1]["thread_id"] = 7  # a row naming a thread without a host span breaks the E2E timeline reader
+    expect("probe row naming a thread without a span", spanless, False, "not readable by the E2E timeline reader")
     missing = paired()
     del missing[2]["host_start_ns"]
     expect("missing host timestamp", missing, False, "lacks a host interval")

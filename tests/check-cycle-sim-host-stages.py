@@ -21,6 +21,18 @@ WS_STAGES = ("im2p.residual_request_validation", "im2p.residual_run_preparation"
 PROBE = "HOST_COMPLETION_PROBE"
 
 
+def timeline_rows(path: Path) -> int:
+    """The E2E timeline reader's rule (scripts/eval/e2e_timeline.py thread_lifetimes): every row naming a
+    thread carries a host execution and span, so every record this log adds stays readable downstream."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts/eval"))
+    from e2e_timeline import thread_lifetimes  # noqa: E402
+
+    try:
+        return len(thread_lifetimes(path))
+    except Exception as error:  # EvaluationError and friends
+        raise ValueError(f"cycle log is not readable by the E2E timeline reader: {error}") from error
+
+
 def rows(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text().splitlines() if line]
 
@@ -151,6 +163,7 @@ def main() -> int:
     threads = check_additive(canonical)
     found = check_containers(cycle, canonical)
     probes = check_probes(cycle, found)
+    timeline_rows(cycle_path)
     print(f"POTAL_CANONICAL_HOST_INTERVALS_PASS count={len(expected)} additive_threads={threads} "
           f"paired_parents={found.get(PAIRED_PARENT, 0)} ws_run_aware={found.get('ws_run_aware', 0)} "
           f"completion_probes={probes}")
