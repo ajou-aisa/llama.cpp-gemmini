@@ -428,6 +428,8 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-host-overlap.py)
     add_test(NAME test-cycle-sim-host-stage-additivity
         COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test-cycle-sim-host-stage-additivity.py)
+    add_test(NAME test-raw-logits-compare
+        COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test-raw-logits-compare.py)
     add_test(NAME test-residual-profile
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-residual-profile.py)
     add_test(NAME test-cycle-timeline

@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 # How to run: python3 -B tests/test-cycle-sim-host-stage-additivity.py
-"""P6.3 S5.3 producer regression: canonical PoTal host intervals stay additive.
+"""PoTal host-stage regression: canonical host intervals stay additive and both residual routes carry their host
+work in canonical stages.
 
-check-cycle-sim-host-stages.py (the checker every cycle-sim dispatch fixture runs) must accept the paired layout
-(non-additive im2p.residual_paired_recomposition parent over disjoint canonical setup, radix recomposition,
-finalize and publication stages) and the WS compact layout, and reject nested or overlapping canonical intervals
-(the pre-fix paired layout), a canonical paired parent, a paired parent whose cost lacks a canonical stage, and
-double measurement. The IM2P.sim consumer check (reconstruct_cpu CpuIndex.validate_potal_host_additivity), which
-this change does not touch, must still reject a nested canonical interval and accept disjoint ones."""
+check-cycle-sim-host-stages.py (run by every cycle-sim dispatch fixture and by the smoke collector) must accept
+the paired layout (non-additive im2p.residual_paired_recomposition over disjoint setup, radix recomposition,
+finalize, publication and release) and the compact run-aware layout (excluded simulator envelope over request
+validation, run preparation, recomposition setup, radix recomposition, finalize, publication and release, with
+other canonical stages allowed between them), with one completion probe per residual completion. It must reject
+nested or overlapping canonical intervals (the pre-fix paired layout), double counting, a canonical parent, a
+missing or misplaced stage on either route, a duplicate publication, a missing completion probe, a missing host
+timestamp and an inconsistent host clock. The IM2P.sim consumer check (reconstruct_cpu
+CpuIndex.validate_potal_host_additivity), which is not modified, must still reject a nested canonical interval."""
 from __future__ import annotations
 
 import json
@@ -21,26 +25,37 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 CHECKER = ROOT / "tests/check-cycle-sim-host-stages.py"
 IM2P = Path(os.environ.get("IM2P_SIM_ROOT", ROOT.parent / "IM2P.sim"))
-PARENT = "im2p.residual_paired_recomposition"
-SETUP, RADIX = "im2p.residual_paired_setup", "im2p.residual_radix_recomposition"
-FINALIZE, PUBLISH = "im2p.residual_paired_finalize", "im2p.residual_output_publish"
+PARENT, ENVELOPE = "im2p.residual_paired_recomposition", "im2p.residual_simulator_host_call"
+SETUP, RADIX, FINALIZE = "im2p.residual_paired_setup", "im2p.residual_radix_recomposition", "im2p.residual_paired_finalize"
+PUBLISH, RELEASE = "im2p.residual_output_publish", "im2p.residual_release"
+VALIDATION, PREPARATION = "im2p.residual_request_validation", "im2p.residual_run_preparation"
+WS_SETUP, WS_FINALIZE = "im2p.residual_recomposition_setup", "im2p.residual_recomposition_finalize"
+_ids = iter(range(1, 10**6))
 
 
-def canonical(identity: int, op: str, start: int, end: int, thread: int = 7) -> dict[str, object]:
-    return {"record_type": "CYCLE_INTERVAL", "op": op, "duration_role": "POTAL_HOST", "host_stage_id": identity,
-            "interval_class": "CANONICAL_ADDITIVE", "additive": True, "cpu_service": True,
-            "operation_success": True, "host_execution_id": "e", "thread_id": thread,
-            "host_start_ns": start, "host_end_ns": end}
+def canonical(op: str, start: int, end: int, thread: int = 7, identity: int | None = None) -> dict[str, object]:
+    return {"record_type": "CYCLE_INTERVAL", "op": op, "duration_role": "POTAL_HOST",
+            "host_stage_id": identity if identity is not None else next(_ids), "interval_class": "CANONICAL_ADDITIVE",
+            "additive": True, "cpu_service": True, "operation_success": True, "host_execution_id": "e",
+            "thread_id": thread, "host_start_ns": start, "host_end_ns": end, "host_elapsed_ns": end - start,
+            "host_elapsed_valid": True}
 
 
-def observation(op: str, start: int, end: int, interval_class: str = "NON_ADDITIVE") -> dict[str, object]:
+def container(op: str, start: int, end: int, interval_class: str = "NON_ADDITIVE") -> dict[str, object]:
     return {"record_type": "CYCLE_INTERVAL", "op": op, "duration_role": "OBSERVATION_ONLY", "host_stage_id": None,
             "interval_class": interval_class, "additive": False, "cpu_service": False, "operation_success": True,
             "host_execution_id": "e", "thread_id": 7, "host_start_ns": start, "host_end_ns": end}
 
 
+def probe(parent_op: str) -> dict[str, object]:
+    return {"record_type": "HOST_COMPLETION_PROBE", "op": "im2p.residual_completion_probe", "parent_op": parent_op,
+            "additive": False, "duration_role": "OBSERVATION_ONLY", "host_stage_id": None, "instrumentation_ns": 5,
+            "instrumentation_calls": 9, "dispatch_host_ns": 0, "dispatch_host_calls": 0, "emulation_ns": 0,
+            "emulation_calls": 0}
+
+
 def run(cycle: list[dict[str, object]]) -> subprocess.CompletedProcess[str]:
-    declared = {r["host_stage_id"]: r["op"] for r in cycle if r["duration_role"] == "POTAL_HOST"}
+    declared = {r["host_stage_id"]: r["op"] for r in cycle if r.get("duration_role") == "POTAL_HOST"}
     trace = [{"kind": "HOST_STAGE", "execution_class": "POTAL_HOST", "event": event, "status": "success",
               "host_stage_id": identity, "stage_name": op}
              for identity, op in declared.items() for event in ("BEGIN", "END")]
@@ -62,40 +77,58 @@ def expect(name: str, cycle: list[dict[str, object]], passes: bool, detail: str 
     print(f"ok {name}: {(result.stdout or result.stderr).strip().splitlines()[-1]}")
 
 
-def paired(stages: list[tuple[int, str, int, int]], parent: dict[str, object] | None = None) -> list[dict[str, object]]:
-    return [parent or observation(PARENT, 100, 200), *(canonical(*stage) for stage in stages)]
+PAIRED = [(SETUP, 101, 110), (RADIX, 112, 150), (FINALIZE, 152, 160), (PUBLISH, 162, 170), (RELEASE, 172, 180)]
+WS = [(VALIDATION, 201, 205), (PREPARATION, 206, 240), ("im2p.output_reconstruction", 250, 252),
+      (WS_SETUP, 260, 262), (RADIX, 263, 290), (WS_FINALIZE, 291, 292), (PUBLISH, 293, 294), (RELEASE, 295, 297)]
 
 
-FIXED = [(1, SETUP, 101, 110), (2, RADIX, 112, 150), (3, FINALIZE, 152, 160), (4, PUBLISH, 162, 170)]
+def paired(stages=PAIRED, parent: dict[str, object] | None = None, probes: int = 1) -> list[dict[str, object]]:
+    return [parent or container(PARENT, 100, 190), *(canonical(*s) for s in stages), *[probe(PARENT)] * probes]
+
+
+def ws(stages=WS, probes: int = 1) -> list[dict[str, object]]:
+    return [container(ENVELOPE, 200, 300, "FUNCTIONAL_EMULATION"), *(canonical(*s) for s in stages),
+            *[probe(ENVELOPE)] * probes]
 
 
 def checker_cases() -> None:
-    expect("paired layout: non-additive parent over four disjoint canonical stages", paired(FIXED), True)
+    expect("paired: non-additive parent over five disjoint canonical stages", paired(), True)
+    expect("WS: envelope over the run-aware stages, other canonical stages between them", ws(), True)
+    expect("both routes in one log", paired() + ws(), True)
     expect("touching canonical intervals are disjoint",
-           paired([(1, SETUP, 101, 112), (2, RADIX, 112, 150), (3, FINALIZE, 150, 160), (4, PUBLISH, 160, 170)]),
-           True)
-    expect("WS layout: wait envelope observation over canonical recomposition and publication",
-           [canonical(1, "im2p.residual_run_preparation", 80, 95),
-            observation("im2p.residual_simulator_host_call", 96, 200, "FUNCTIONAL_EMULATION"),
-            canonical(2, RADIX, 150, 160), canonical(3, PUBLISH, 161, 170)], True)
-    expect("overlap on different threads is not a nesting",
-           [canonical(1, RADIX, 100, 150, thread=7), canonical(2, PUBLISH, 120, 170, thread=8)], True)
+           paired([(SETUP, 101, 112), (RADIX, 112, 150), (FINALIZE, 150, 160), (PUBLISH, 160, 170),
+                   (RELEASE, 170, 180)]), True)
+    expect("overlap on different threads is concurrency, not nesting",
+           [canonical(RADIX, 100, 150, thread=7), canonical(PUBLISH, 120, 170, thread=8)], True)
     expect("pre-fix paired layout: canonical parent nests radix and publication",
-           [canonical(9, PARENT, 100, 200), canonical(2, RADIX, 112, 150), canonical(4, PUBLISH, 162, 170)],
+           [canonical(PARENT, 100, 200), canonical(RADIX, 112, 150), canonical(PUBLISH, 162, 170)],
            False, "canonical PoTal host intervals overlap on one thread")
     expect("double counting: setup overlaps radix recomposition",
-           paired([(1, SETUP, 101, 120), (2, RADIX, 115, 150), (3, FINALIZE, 152, 160), (4, PUBLISH, 162, 170)]),
-           False, "canonical PoTal host intervals overlap on one thread")
-    expect("paired parent marked canonical", paired(FIXED, canonical(9, PARENT, 100, 200, thread=8)),
-           False, "paired recomposition must be a non-additive diagnostic parent")
-    expect("host cost omission: no finalize stage inside the parent",
-           paired([(1, SETUP, 101, 110), (2, RADIX, 112, 150), (4, PUBLISH, 162, 170)]),
+           paired([(SETUP, 101, 120), (RADIX, 115, 150), (FINALIZE, 152, 160), (PUBLISH, 162, 170),
+                   (RELEASE, 172, 180)]), False, "canonical PoTal host intervals overlap on one thread")
+    expect("paired parent marked canonical", paired(parent=canonical(PARENT, 100, 190, thread=8)),
+           False, "must be a non-additive interval around canonical stages")
+    expect("paired: missing release (scratch release outside the measured stages)", paired(PAIRED[:-1]),
            False, "paired recomposition host cost is not carried by its canonical stages")
-    expect("host cost omission: setup outside the parent",
-           paired([(1, SETUP, 90, 99), (2, RADIX, 112, 150), (3, FINALIZE, 152, 160), (4, PUBLISH, 162, 170)]),
-           False, "paired recomposition host cost is not carried by its canonical stages")
-    duplicate = paired(FIXED)
-    duplicate.append(canonical(2, RADIX, 180, 190))
+    expect("paired: setup outside the parent",
+           paired([(SETUP, 90, 99), *PAIRED[1:]]), False, "paired recomposition host cost is not carried")
+    expect("WS: missing request validation", ws([s for s in WS if s[0] != VALIDATION]),
+           False, "compact residual host work is not carried by its canonical stages")
+    expect("WS: finalize after publication",
+           ws([*WS[:5], (PUBLISH, 291, 292), (WS_FINALIZE, 293, 294), WS[7]]),
+           False, "compact residual host work is not carried by its canonical stages")
+    expect("WS: duplicate publication", ws([*WS[:7], (PUBLISH, 295, 296), (RELEASE, 297, 298)]),
+           False, "compact residual host work is not carried by its canonical stages")
+    expect("missing completion probe", paired(probes=0), False, "one completion probe per residual completion")
+    expect("extra completion probe", ws(probes=2), False, "one completion probe per residual completion")
+    missing = paired()
+    del missing[2]["host_start_ns"]
+    expect("missing host timestamp", missing, False, "lacks a host interval")
+    clock = paired()
+    clock[2]["host_elapsed_ns"] = 9_000  # not host_end_ns - host_start_ns: another unit or clock
+    expect("inconsistent host clock", clock, False, "inconsistent host clock")
+    duplicate = paired()
+    duplicate.append(canonical(RADIX, 182, 185, identity=int(str(duplicate[2]["host_stage_id"]))))
     expect("duplicate canonical measurement of one stage", duplicate, False, "duplicate canonical PoTal host measurement")
 
 

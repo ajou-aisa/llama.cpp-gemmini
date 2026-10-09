@@ -19,6 +19,7 @@
 #include "../../quants/common/hp1_scu.hpp"
 #include "../../quants/common/weight_reader.hpp"
 #include "../../quants/common/weight_route.hpp"
+#include "rmd-host-probe.hpp"
 
 #include <gemmini.h>
 
@@ -1804,6 +1805,7 @@ static RmdStatus execute_rmd_stripe_im2p_run_aware(im2p_sim_t *                s
     staged_metrics.timing_identity.stripe_id = packet.stripe_id;
     RmdExecutionMetrics * const measured     = metrics ? &staged_metrics : nullptr;
 #if CYCLE_SIM && defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    const uint64_t                           prepare_probe = probe::now();
     const auto                               event_context = args.cycle_sim_context;
     std::vector<uint64_t>                    packet_work_ids;
     im2p::gemmini::cycle_sim::WorkCollector  packet_collector(packet_work_ids, true);
@@ -1819,6 +1821,7 @@ static RmdStatus execute_rmd_stripe_im2p_run_aware(im2p_sim_t *                s
         {},
         args.cycle_sim_host_dependencies,
         true);
+    probe::add(probe::Part::instrumentation, prepare_probe);
 #endif
     detail::RmdHostStageScope preparation(measured, RmdHostStage::preparation);
     RunAwareRequest           request;
@@ -1826,14 +1829,21 @@ static RmdStatus execute_rmd_stripe_im2p_run_aware(im2p_sim_t *                s
     if (build_status != RmdStatus::success)
         return build_status;
 #if CYCLE_SIM && defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    const uint64_t prepared_probe = probe::now();
     cycle_preparation.finish();
     auto dispatch_dependencies = args.cycle_sim_host_dependencies;
     if (cycle_preparation.id())
         dispatch_dependencies.push_back(*cycle_preparation.id());
     prepare_call.finish();
-#endif
     preparation.finish();
+    probe::add(probe::Part::instrumentation, prepared_probe);
+#else
+    preparation.finish();
+#endif
 
+#if CYCLE_SIM && defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    const uint64_t work_probe = probe::now();
+#endif
     detail::Im2pRunAwareWork work;
     work.request         = &request;
     work.timing_identity = staged_metrics.timing_identity;
@@ -1843,6 +1853,7 @@ static RmdStatus execute_rmd_stripe_im2p_run_aware(im2p_sim_t *                s
     work.cycle_sim_context       = event_context;
     work.required_host_stage_ids = std::move(dispatch_dependencies);
     const size_t required_begin  = im2p::gemmini::cycle_sim::work_count();
+    probe::add(probe::Part::dispatch_host, work_probe);
 #endif
     std::vector<OutputValue>           run_output;
     detail::Im2pProviderStatsAggregate stats;
@@ -1851,6 +1862,21 @@ static RmdStatus execute_rmd_stripe_im2p_run_aware(im2p_sim_t *                s
     if (dispatch_status != RmdStatus::success)
         return dispatch_status;
 
+#if CYCLE_SIM && defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    // Recomposition buffers: the allocation the paired route measures in im2p.residual_paired_setup.
+    const uint64_t                           setup_probe = probe::now();
+    im2p::gemmini::cycle_sim::HostStageScope cycle_setup(
+        event_context,
+        "im2p.residual_recomposition_setup",
+        "POTAL_HOST",
+        "llama.cpp-gemmini",
+        "ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp:execute_rmd_stripe_im2p_run_aware",
+        args.matmul_layer.c_str(),
+        im2p::gemmini::cycle_sim::work_ids_since(required_begin),
+        {},
+        true);
+    probe::add(probe::Part::instrumentation, setup_probe);
+#endif
     size_t value_count = 0;
     if (__builtin_mul_overflow(packet.row_count, packet.logical_j, &value_count) ||
         request.m > SIZE_MAX / request.n || run_output.size() != request.m * request.n)
@@ -1867,6 +1893,8 @@ static RmdStatus execute_rmd_stripe_im2p_run_aware(im2p_sim_t *                s
     }
 
 #if CYCLE_SIM && defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    const uint64_t recompose_probe = probe::now();
+    cycle_setup.finish();
     im2p::gemmini::cycle_sim::StageCall recompose_call(
         event_context, cycle_sim::CallKind::ResidualRecompose, required_begin);
     im2p::gemmini::cycle_sim::HostStageScope cycle_recomposition(
@@ -1879,6 +1907,7 @@ static RmdStatus execute_rmd_stripe_im2p_run_aware(im2p_sim_t *                s
         im2p::gemmini::cycle_sim::work_ids_since(required_begin),
         {},
         true);
+    probe::add(probe::Part::instrumentation, recompose_probe);
 #endif
     detail::RmdHostStageScope reconstruct(measured, RmdHostStage::radix_reconstruct_combine);
     const RmdStatus recomposed = recompose_run_aware_rows(packet, request, run_output.data(), wide, final);
@@ -1886,6 +1915,7 @@ static RmdStatus execute_rmd_stripe_im2p_run_aware(im2p_sim_t *                s
         return recomposed;
     reconstruct.finish();
 #if CYCLE_SIM && defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    const uint64_t recomposed_probe = probe::now();
     cycle_recomposition.finish();
     recompose_call.finish();
     if (event_context) {
@@ -1895,6 +1925,19 @@ static RmdStatus execute_rmd_stripe_im2p_run_aware(im2p_sim_t *                s
             return RmdStatus::execution_failed;
         }
     }
+    // Packet metrics: the work the paired route measures in im2p.residual_paired_finalize.
+    im2p::gemmini::cycle_sim::HostStageScope cycle_finalize(
+        event_context,
+        "im2p.residual_recomposition_finalize",
+        "POTAL_HOST",
+        "llama.cpp-gemmini",
+        "ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp:execute_rmd_stripe_im2p_run_aware",
+        args.matmul_layer.c_str(),
+        im2p::gemmini::cycle_sim::work_ids_since(required_begin),
+        cycle_recomposition.id() ? std::vector<uint64_t>{*cycle_recomposition.id()}
+                                 : std::vector<uint64_t>{},
+        true);
+    probe::add(probe::Part::instrumentation, recomposed_probe);
 #endif
 
     collect_packet_metrics(packet, staged_metrics);
@@ -1935,12 +1978,24 @@ static RmdStatus execute_rmd_stripe_im2p_run_aware(im2p_sim_t *                s
     staged_metrics.compressed_output_values            = 0;
     staged_metrics.im2p_stats                          = stats.stats;
 
-    Correction      staged_output = std::move(final);
+    Correction staged_output = std::move(final);
+#if CYCLE_SIM && defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    {
+        probe::Timer timer(probe::Part::instrumentation);
+        cycle_finalize.finish();
+    }
+    const uint64_t observe_probe = probe::now();
+#endif
     const RmdStatus observed = observe_run_aware_packet(args, packet, request, physical_fragments);
+#if CYCLE_SIM && defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    probe::add(probe::Part::instrumentation, observe_probe);
+#endif
     if (observed != RmdStatus::success)
         return observed;
 #if CYCLE_SIM && defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    std::vector<uint64_t> publication_ids;
     if (event_context) {
+        const uint64_t                           publication_probe = probe::now();
         im2p::gemmini::cycle_sim::HostStageScope cycle_publication(
             event_context,
             "im2p.residual_output_publish",
@@ -1952,6 +2007,7 @@ static RmdStatus execute_rmd_stripe_im2p_run_aware(im2p_sim_t *                s
             cycle_recomposition.id() ? std::vector<uint64_t>{*cycle_recomposition.id()}
                                      : std::vector<uint64_t>{},
             true);
+        probe::add(probe::Part::instrumentation, publication_probe);
         bool published = false;
         try {
             event_context.session->ensure_healthy();
@@ -1962,8 +2018,12 @@ static RmdStatus execute_rmd_stripe_im2p_run_aware(im2p_sim_t *                s
                 im2p::gemmini::cycle_sim::publication_observer(
                     im2p::gemmini::cycle_sim::publication_observer_context);
 #endif
+            const uint64_t published_probe = probe::now();
             cycle_publication.finish();
             event_context.session->ensure_healthy();
+            if (cycle_publication.id())
+                publication_ids.push_back(*cycle_publication.id());
+            probe::add(probe::Part::instrumentation, published_probe);
         } catch (...) {
             if (published)
                 output.swap(staged_output);
@@ -1972,11 +2032,35 @@ static RmdStatus execute_rmd_stripe_im2p_run_aware(im2p_sim_t *                s
     } else {
         output.swap(staged_output);
     }
+    // Metrics hand-off and the release of this callback's request (compact activations, W and
+    // carriers), dispatch output and recomposition scratch: the same buffers at the same point as
+    // before (the end of this function, after publication), released explicitly in a measured stage.
+    const uint64_t                           release_probe = probe::now();
+    im2p::gemmini::cycle_sim::HostStageScope cycle_release(
+        event_context,
+        "im2p.residual_release",
+        "POTAL_HOST",
+        "llama.cpp-gemmini",
+        "ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp:execute_rmd_stripe_im2p_run_aware",
+        args.matmul_layer.c_str(),
+        im2p::gemmini::cycle_sim::work_ids_since(required_begin),
+        publication_ids,
+        true);
+    probe::add(probe::Part::instrumentation, release_probe);
 #else
     output.swap(staged_output);
 #endif
     if (metrics)
         *metrics = std::move(staged_metrics);
+    request = RunAwareRequest{};
+    std::vector<OutputValue>().swap(run_output);
+    std::vector<__int128>().swap(wide);
+#if CYCLE_SIM && defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    {
+        probe::Timer timer(probe::Part::instrumentation);
+        cycle_release.finish();
+    }
+#endif
     return RmdStatus::success;
 #endif
 }
@@ -1988,6 +2072,22 @@ static RmdStatus execute_rmd_stripe_im2p_correction(im2p_sim_t *                
                                                     RmdExecutionMetrics *           metrics,
                                                     const wroute::WeightRoutePlan * shared_plan,
                                                     const Im2pFullExecutor *        executor) {
+#if CYCLE_SIM && defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    // Route plan and request validation of a compact residual: the same work the paired route
+    // measures in im2p.residual_paired_setup.
+    const uint64_t                           validation_probe = probe::now();
+    im2p::gemmini::cycle_sim::HostStageScope cycle_validation(
+        args.cycle_sim_context,
+        "im2p.residual_request_validation",
+        "POTAL_HOST",
+        "llama.cpp-gemmini",
+        "ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp:execute_rmd_stripe_im2p_correction",
+        args.matmul_layer.c_str(),
+        {},
+        args.cycle_sim_host_dependencies,
+        true);
+    probe::add(probe::Part::instrumentation, validation_probe);
+#endif
     const wroute::WeightRoutePlan plan =
         shared_plan
             ? *shared_plan
@@ -1998,6 +2098,12 @@ static RmdStatus execute_rmd_stripe_im2p_correction(im2p_sim_t *                
     const RmdStatus validation = validate_execution_request(args, packet);
     if (validation != RmdStatus::success)
         return validation;
+#if CYCLE_SIM && defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    {
+        probe::Timer timer(probe::Part::instrumentation);
+        cycle_validation.finish();
+    }
+#endif
 
     // Activation-block metadata needs one scale per original K32 block, which a
     // single saturated cross-run result cannot reconstruct.
@@ -2189,10 +2295,11 @@ RmdStatus execute_rmd_stripe_paired_with_weights(const ggml_gemmini_args_t & arg
     if (args.optrace_context)
         return RmdStatus::unsupported_route;
 #if CYCLE_SIM
-    // The host work of this completion is measured by four disjoint canonical stages: setup,
-    // radix recomposition, finalize and publication. The frontend's
+    // The host work of this completion is measured by five disjoint canonical stages: setup,
+    // radix recomposition, finalize, publication and release. The frontend's
     // im2p.residual_paired_recomposition interval only spans them, so setup carries that
     // interval's former host dependencies.
+    const uint64_t                           setup_probe   = probe::now();
     const auto                               event_context = args.cycle_sim_context;
     im2p::gemmini::cycle_sim::HostStageScope cycle_setup(
         event_context,
@@ -2204,6 +2311,7 @@ RmdStatus execute_rmd_stripe_paired_with_weights(const ggml_gemmini_args_t & arg
         {},
         args.cycle_sim_host_dependencies,
         true);
+    probe::add(probe::Part::instrumentation, setup_probe);
 #endif
     const auto &    plan        = weights.route_plan(args);
     const RmdStatus plan_status = compact_plan_status(args, plan);
@@ -2245,6 +2353,7 @@ RmdStatus execute_rmd_stripe_paired_with_weights(const ggml_gemmini_args_t & arg
         return RmdStatus::overflow;
     }
 #if CYCLE_SIM
+    const uint64_t recompose_probe = probe::now();
     cycle_setup.finish();
     // The companion ran inside Main's stream work, which the frontend names as this callback's
     // continuation: the recomposition depends on that work and declares no residual work.
@@ -2262,6 +2371,7 @@ RmdStatus execute_rmd_stripe_paired_with_weights(const ggml_gemmini_args_t & arg
         required_work,
         {},
         true);
+    probe::add(probe::Part::instrumentation, recompose_probe);
 #endif
     detail::RmdHostStageScope reconstruct(measured, RmdHostStage::radix_reconstruct_combine);
     const RmdStatus recomposed = recompose_run_aware_rows(packet, request, companion_output, wide, final);
@@ -2269,6 +2379,7 @@ RmdStatus execute_rmd_stripe_paired_with_weights(const ggml_gemmini_args_t & arg
         return recomposed;
     reconstruct.finish();
 #if CYCLE_SIM
+    const uint64_t recomposed_probe = probe::now();
     cycle_recomposition.finish();
     recompose_call.finish();
     if (event_context) {
@@ -2289,6 +2400,7 @@ RmdStatus execute_rmd_stripe_paired_with_weights(const ggml_gemmini_args_t & arg
         cycle_recomposition.id() ? std::vector<uint64_t>{*cycle_recomposition.id()}
                                  : std::vector<uint64_t>{},
         true);
+    probe::add(probe::Part::instrumentation, recomposed_probe);
 #endif
 
     collect_packet_metrics(packet, staged_metrics);
@@ -2320,16 +2432,23 @@ RmdStatus execute_rmd_stripe_paired_with_weights(const ggml_gemmini_args_t & arg
     staged_metrics.compressed_output_values            = 0;
 
     Correction staged_output = std::move(final);
-    // The recomposition scratch is released inside the finalize stage, not after publication.
-    std::vector<__int128>().swap(wide);
 #if CYCLE_SIM
-    cycle_finalize.finish();
+    {
+        probe::Timer timer(probe::Part::instrumentation);
+        cycle_finalize.finish();
+    }
+    const uint64_t observe_probe = probe::now();
 #endif
     const RmdStatus observed = observe_run_aware_packet(args, packet, request, physical_fragments);
+#if CYCLE_SIM
+    probe::add(probe::Part::instrumentation, observe_probe);
+#endif
     if (observed != RmdStatus::success)
         return observed;
 #if CYCLE_SIM
+    std::vector<uint64_t> publication_ids;
     if (event_context) {
+        const uint64_t                           publication_probe = probe::now();
         im2p::gemmini::cycle_sim::HostStageScope cycle_publication(
             event_context,
             "im2p.residual_output_publish",
@@ -2341,13 +2460,18 @@ RmdStatus execute_rmd_stripe_paired_with_weights(const ggml_gemmini_args_t & arg
             cycle_recomposition.id() ? std::vector<uint64_t>{*cycle_recomposition.id()}
                                      : std::vector<uint64_t>{},
             true);
+        probe::add(probe::Part::instrumentation, publication_probe);
         bool published = false;
         try {
             event_context.session->ensure_healthy();
             output.swap(staged_output);
             published = true;
+            const uint64_t published_probe = probe::now();
             cycle_publication.finish();
             event_context.session->ensure_healthy();
+            if (cycle_publication.id())
+                publication_ids.push_back(*cycle_publication.id());
+            probe::add(probe::Part::instrumentation, published_probe);
         } catch (...) {
             if (published)
                 output.swap(staged_output);
@@ -2356,11 +2480,33 @@ RmdStatus execute_rmd_stripe_paired_with_weights(const ggml_gemmini_args_t & arg
     } else {
         output.swap(staged_output);
     }
+    // Metrics hand-off and the release of the recomposition scratch: the same buffer at the same
+    // point as before (the end of this function, after publication), released explicitly in a
+    // measured stage. The companion's own buffers live with the published stripe, not here.
+    const uint64_t                           release_probe = probe::now();
+    im2p::gemmini::cycle_sim::HostStageScope cycle_release(
+        event_context,
+        "im2p.residual_release",
+        "POTAL_HOST",
+        "llama.cpp-gemmini",
+        "ggml/src/ggml-gemmini/residual/rmd/rmd-executor.cpp:execute_rmd_stripe_paired_with_weights",
+        args.matmul_layer.c_str(),
+        required_work,
+        publication_ids,
+        true);
+    probe::add(probe::Part::instrumentation, release_probe);
 #else
     output.swap(staged_output);
 #endif
     if (metrics)
         *metrics = std::move(staged_metrics);
+    std::vector<__int128>().swap(wide);
+#if CYCLE_SIM
+    {
+        probe::Timer timer(probe::Part::instrumentation);
+        cycle_release.finish();
+    }
+#endif
     return RmdStatus::success;
 #endif
 }

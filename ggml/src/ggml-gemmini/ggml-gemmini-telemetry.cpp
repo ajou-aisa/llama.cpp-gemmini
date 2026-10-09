@@ -901,6 +901,58 @@ std::string serialize_im2p_debug_detail(const Im2pExecutionTelemetry & record) {
 
 } // namespace
 
+std::string serialize_residual_completion_probe(std::string_view parent_op,
+                                                const char *     layer,
+                                                uint64_t         run_id,
+                                                uint64_t         stripe_id,
+                                                uint64_t         slot,
+                                                const uint64_t (&ns)[3],
+                                                const uint64_t (&calls)[3],
+                                                uint64_t         emulation_begin_ns,
+                                                uint64_t         emulation_end_ns) {
+#if !LOG_CYCLE
+    (void)parent_op;
+    (void)layer;
+    (void)run_id;
+    (void)stripe_id;
+    (void)slot;
+    (void)ns;
+    (void)calls;
+    (void)emulation_begin_ns;
+    (void)emulation_end_ns;
+    return {};
+#else
+    std::ostringstream out;
+    prefix(out, "HOST_COMPLETION_PROBE", "timeline_clock", "nanosecond");
+    string_field(out, "execution_id", cycle::host_execution_id());
+    string_field(out, "op", "im2p.residual_completion_probe");
+    string_field(out, "parent_op", parent_op);
+    nullable_string_field(out, "layer", layer ? layer : "");
+    field(out, "run_id", run_id);
+    field(out, "stripe_id", stripe_id);
+    field(out, "slot", slot);
+    null_field(out, "node_id");
+    null_field(out, "worker_id");
+    field(out, "thread_id", cycle::host_thread_id());
+    field(out, "instrumentation_ns", ns[0]);
+    field(out, "instrumentation_calls", calls[0]);
+    field(out, "dispatch_host_ns", ns[1]);
+    field(out, "dispatch_host_calls", calls[1]);
+    field(out, "emulation_ns", ns[2]);
+    field(out, "emulation_calls", calls[2]);
+    if (calls[2] != 0) {
+        field(out, "emulation_begin_ns", emulation_begin_ns);
+        field(out, "emulation_end_ns", emulation_end_ns);
+    } else {
+        null_field(out, "emulation_begin_ns");
+        null_field(out, "emulation_end_ns");
+    }
+    out << ",\"additive\":false,\"cpu_service\":false,\"duration_role\":\"OBSERVATION_ONLY\","
+           "\"host_stage_id\":null}";
+    return out.str();
+#endif
+}
+
 static std::string serialize_cycle_telemetry_impl(const CycleIntervalTelemetry & record,
                                                   const std::string &            tail) {
 #if !LOG_CYCLE

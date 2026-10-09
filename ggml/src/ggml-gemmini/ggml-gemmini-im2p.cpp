@@ -17,6 +17,7 @@
 #include "residual/rmd/rmd-compose.hpp"
 #include "residual/rmd/rmd-im2p-executor.hpp"
 #include "residual/rmd/rmd-run-aware.hpp"
+#include "residual/rmd/rmd-host-probe.hpp"
 #include <im2p_sim.h>
 #include <gemmini/host-timing.hpp>
 #include <gemmini/log.hpp>
@@ -324,6 +325,40 @@ class HostCpuInterval {
     std::unique_ptr<::im2p::gemmini::cycle_sim::HostStageScope> host_stage_;
 #endif
 };
+
+// One HOST_COMPLETION_PROBE record per residual completion (residual/rmd/rmd-host-probe.hpp),
+// written after the completion's outer interval has ended so that it measures none of its own writes.
+void emit_completion_probe(const ggml_gemmini_args_t & args,
+                           uint64_t                    run_id,
+                           uint64_t                    stripe_id,
+                           uint64_t                    slot,
+                           const char *                parent_op) noexcept {
+#if CYCLE_SIM && LOG_CYCLE
+    const auto totals = rmd::probe::take();
+    if (!args.cycle_sim_context)
+        return;
+    try {
+        log::cycle.write_json(serialize_residual_completion_probe(
+            parent_op,
+            args.matmul_layer.empty() ? nullptr : args.matmul_layer.c_str(),
+            run_id,
+            stripe_id,
+            slot,
+            totals.ns,
+            totals.calls,
+            totals.emulation_begin,
+            totals.emulation_end));
+    } catch (...) {
+        log::cycle.report_failure("residual completion probe");
+    }
+#else
+    (void)args;
+    (void)run_id;
+    (void)stripe_id;
+    (void)slot;
+    (void)parent_op;
+#endif
+}
 
 Result cycle_sim_health(const ggml_gemmini_args_t & args) noexcept {
 #if CYCLE_SIM
@@ -667,12 +702,15 @@ static Result apply_baseline_rmd_full(const ggml_gemmini_args_t &            run
 #if CYCLE_SIM
             const size_t required_begin = ::im2p::gemmini::cycle_sim::work_count();
 #endif
+            (void)rmd::probe::take(); // this completion's probe totals start here
             HostCpuInterval      backend(runtime_args,
                                          "im2p.residual_simulator_host_call",
                                          HostIntervalAccounting::excluded_from_cpu_work);
             const rmd::RmdStatus executed = rmd::detail::execute_rmd_stripe_im2p_with_weights(
                 simulator.get(), runtime_args, *packet, correction, weights, &metrics);
             backend.finish(executed == rmd::RmdStatus::success);
+            emit_completion_probe(
+                runtime_args, 0, packet->stripe_id, 0, "im2p.residual_simulator_host_call");
             if (executed != rmd::RmdStatus::success)
                 return from_rmd_status(executed);
 #if defined(GGML_GEMMINI_TESTING)
@@ -1210,6 +1248,7 @@ static Result apply_captured_rmd_full(const ggml_gemmini_args_t &              r
                 event.row_end - event.row_begin;
         }
         direct_metrics.run_id = event.run_id;
+        (void)rmd::probe::take(); // this completion's probe totals start here
         if (event.direct_residual != nullptr) {
 #if LOG_CYCLE
             HostCpuInterval observation(*rmd_args,
@@ -1248,6 +1287,8 @@ static Result apply_captured_rmd_full(const ggml_gemmini_args_t &              r
                 shared_weights = true;
             }
             backend.finish(status == rmd::RmdStatus::success);
+            emit_completion_probe(
+                *rmd_args, event.run_id, event.stripe_id, event.slot, "im2p.residual_simulator_host_call");
         }
         if (status != rmd::RmdStatus::success) {
             emit_rmd_workload(*rmd_args, event, metrics, status);
@@ -1463,6 +1504,7 @@ class ExsiaStripePipeline::Impl {
                 event.row_end - event.row_begin;
         }
         direct_metrics.run_id = event.run_id;
+        (void)rmd::probe::take(); // this completion's probe totals start here
         if (event.direct_residual != nullptr) {
 #if LOG_CYCLE
             HostCpuInterval observation(stripe_args,
@@ -1504,6 +1546,8 @@ class ExsiaStripePipeline::Impl {
                                &metrics);
             shared_weights = true;
             backend.finish(status == rmd::RmdStatus::success);
+            emit_completion_probe(
+                stripe_args, event.run_id, event.stripe_id, event.slot, "im2p.residual_paired_recomposition");
         } else if (event.rmd_packet != nullptr) {
             HostCpuInterval backend(stripe_args,
                                     "im2p.residual_simulator_host_call",
@@ -1525,6 +1569,8 @@ class ExsiaStripePipeline::Impl {
                 shared_weights = true;
             }
             backend.finish(status == rmd::RmdStatus::success);
+            emit_completion_probe(
+                stripe_args, event.run_id, event.stripe_id, event.slot, "im2p.residual_simulator_host_call");
         }
         if (status != rmd::RmdStatus::success) {
             emit_rmd_workload(stripe_args, event, metrics, status);

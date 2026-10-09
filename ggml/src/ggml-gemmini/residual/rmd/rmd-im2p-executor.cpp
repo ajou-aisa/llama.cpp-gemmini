@@ -1,5 +1,6 @@
 #include "rmd-im2p-executor.hpp"
 #include "rmd-run-aware.hpp"
+#include "rmd-host-probe.hpp"
 #include <gemmini/trace-context.hpp>
 #include "../../../ggml-gemmini-utils/src/trace-metadata.hpp"
 #include <gemmini/log.hpp>
@@ -501,7 +502,9 @@ RmdStatus execute_im2p_run_aware(im2p_sim_t *                 sim,
         return RmdStatus::unsupported_route;
 #endif
 
-    const RunAwareRequest &         request = *work.request;
+    // Host preparation of the residual NPU dispatch (excluded with the NPU dispatch envelope).
+    const uint64_t                  dispatch_probe = probe::now();
+    const RunAwareRequest &         request        = *work.request;
     std::vector<im2p_compact_run_t> run_entries;
     const RmdStatus                 view_status = prepare_run_view(request, run_entries);
     if (view_status != RmdStatus::success)
@@ -565,8 +568,10 @@ RmdStatus execute_im2p_run_aware(im2p_sim_t *                 sim,
                                              static_cast<uint32_t>(request.original_k),
                                              run_entries.size(),
                                              run_entries.data()};
+    probe::add(probe::Part::dispatch_host, dispatch_probe);
 
 #if CYCLE_SIM
+    const uint64_t     declaration_probe = probe::now();
     cycle_sim::Context cycle_context;
     cycle_sim::Work    selected_work;
     try {
@@ -593,8 +598,10 @@ RmdStatus execute_im2p_run_aware(im2p_sim_t *                 sim,
     im2p::gemmini::cycle_sim::DispatchEvents dispatch_events(
         cycle_context, &selected_work, cycle_sim::CallKind::ResidualCompact);
     im2p::cpu_functional::TimingRegistration timing_registration(dispatch_events.observer());
+    probe::add(probe::Part::instrumentation, declaration_probe);
 #endif
 
+    const uint64_t             trace_probe = probe::now();
     im2p_work_stats_extended_t stats{};
 #if defined(GGML_GEMMINI_TESTING)
     provider_dot_attempts.fetch_add(1, std::memory_order_relaxed);
@@ -602,12 +609,16 @@ RmdStatus execute_im2p_run_aware(im2p_sim_t *                 sim,
     trace::ScopedRole residual_role(GEMMINI_TRACE_ROLE_RESIDUAL);
     trace::CpuStage   host_call(work.timing_identity.interval.layer, "rmd.device_host_call");
     int               provider_status = IM2P_ERROR;
+    probe::add(probe::Part::instrumentation, trace_probe);
+    const uint64_t emulation_probe = probe::now();
     if (executor)
         provider_status = executor->execute_planned_runs(
             executor->context, &descriptor, &geometry, &runs, &stats);
     else
         provider_status =
             im2p_execute_matmul_planned_runs(sim, &descriptor, &geometry, &runs, &stats);
+    probe::add(probe::Part::emulation, emulation_probe);
+    const uint64_t completion_probe = probe::now();
     host_call.finish(provider_status == IM2P_OK);
     if (provider_status != IM2P_OK)
         return RmdStatus::execution_failed;
@@ -621,12 +632,15 @@ RmdStatus execute_im2p_run_aware(im2p_sim_t *                 sim,
         }
     }
 #endif
+    probe::add(probe::Part::instrumentation, completion_probe);
+    const uint64_t handoff_probe = probe::now();
     if (context.writes != 1)
         return RmdStatus::invalid_packet;
     const RmdStatus stats_status = aggregate_stats(stats, aggregate);
     if (stats_status != RmdStatus::success)
         return stats_status;
     output.swap(context.staged);
+    probe::add(probe::Part::dispatch_host, handoff_probe);
 #if CYCLE_SIM
     completion.success = true;
 #endif

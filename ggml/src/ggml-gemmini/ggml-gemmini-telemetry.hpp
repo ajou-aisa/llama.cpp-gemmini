@@ -212,6 +212,18 @@ std::string serialize_matmul_cpu_interval(log::CycleRecord          record,
                                           bool                      operation_success,
                                           const MatmulCpuInterval * explicit_interval = nullptr);
 
+// One non-additive HOST_COMPLETION_PROBE telemetry record per residual completion: the probe totals of
+// residual/rmd/rmd-host-probe.hpp (instrumentation, dispatch_host, emulation) on the timeline clock.
+std::string serialize_residual_completion_probe(std::string_view parent_op,
+                                                const char *     layer,
+                                                uint64_t         run_id,
+                                                uint64_t         stripe_id,
+                                                uint64_t         slot,
+                                                const uint64_t (&ns)[3],
+                                                const uint64_t (&calls)[3],
+                                                uint64_t         emulation_begin_ns,
+                                                uint64_t         emulation_end_ns);
+
 // Stable pure seams: Todo 10 can consume records without parsing log prose.
 std::string             serialize_rmd_telemetry(const RmdTelemetryRecord & record);
 RmdTelemetryCheckResult check_rmd_telemetry(const RmdTelemetryRecord & record,
