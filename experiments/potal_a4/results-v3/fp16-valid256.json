@@ -1,0 +1,80 @@
+{
+  "scope": "CPU NumPy policy experiment with materialized int8 compact packets; not native Gemmini execution or timing",
+  "mode": {
+    "name": "weights_only",
+    "linear": null,
+    "attention": false,
+    "p_rows": 0,
+    "p_bits": 8,
+    "upper_limbs": 8
+  },
+  "model": "/Users/chan/Projects/AISA/llama.cpp-gemmini/models/gpt2.fp16.gguf",
+  "model_sha256": "5bd663a1e1d303f9404dd2edd92e4e3ca3e24bcf80d19c655880f0e455c8f4df",
+  "tokens_sha256": "29f3061bd3207fb4d66b4fb93822c42dd7c72990672fc871ee1583106e512dbf",
+  "context": 256,
+  "chunks": 1,
+  "scored_tokens": 127,
+  "nll_sums": [
+    377.229080470866
+  ],
+  "ppl": 19.49791857722315,
+  "top1_accuracy": 0.4409448818897638,
+  "seconds": 2.996514375001425,
+  "peak_rss_bytes": 874889216,
+  "loaded_model_peak_rss_bytes": 874889216,
+  "rss_units": "bytes on macOS; total process high-water mark, not native buffer savings",
+  "metrics": {
+    "linear": {
+      "calls": 0,
+      "values": 0,
+      "main_bytes": 0,
+      "digit_bytes": 0,
+      "metadata_bytes": 0,
+      "useful_digits": 0,
+      "main_fragments": 0,
+      "upper_fragments": 0,
+      "saturated": 0,
+      "error_squared": 0,
+      "source_squared": 0,
+      "zero_rows": 0,
+      "row_sum_error": 0,
+      "max_operand_bytes": 0
+    },
+    "q": {
+      "calls": 0,
+      "values": 0,
+      "main_bytes": 0,
+      "digit_bytes": 0,
+      "metadata_bytes": 0,
+      "useful_digits": 0,
+      "main_fragments": 0,
+      "upper_fragments": 0,
+      "saturated": 0,
+      "error_squared": 0,
+      "source_squared": 0,
+      "zero_rows": 0,
+      "row_sum_error": 0,
+      "max_operand_bytes": 0
+    },
+    "p": {
+      "calls": 0,
+      "values": 0,
+      "main_bytes": 0,
+      "digit_bytes": 0,
+      "metadata_bytes": 0,
+      "useful_digits": 0,
+      "main_fragments": 0,
+      "upper_fragments": 0,
+      "saturated": 0,
+      "error_squared": 0,
+      "source_squared": 0,
+      "zero_rows": 0,
+      "row_sum_error": 0,
+      "max_operand_bytes": 0
+    },
+    "stationary_bytes": 0,
+    "k_main_fragments": 0,
+    "k_upper_fragments": 0
+  },
+  "numpy": "1.26.4"
+}

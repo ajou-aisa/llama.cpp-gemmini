@@ -1,0 +1,2 @@
+integer packet roundtrips: 141076
+PASS: int32 digits, shift boundaries, tails, zero, +8 linear and causal P failure/recovery

@@ -1,0 +1,8 @@
+{
+  "native_decoder": "/Users/chan/Projects/AISA/llama.cpp-gemmini/build-cpu-only-audit/bin/libggml-base.dylib",
+  "library_sha256": "be742c45fa708893a8eb5d825192b6d6eaab21eb1401d7986d98a79170848c2b",
+  "model_sha256": "a5da4eacdb13197248bac7aea0a9d6e934004d393994833acd70b9d5ef610f1f",
+  "compared_weights": 193536,
+  "tensors": 48,
+  "bitwise_equal": true
+}

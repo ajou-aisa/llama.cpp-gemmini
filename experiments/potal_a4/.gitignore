@@ -1,0 +1,10 @@
+__pycache__/
+results*/*.npz
+results*/*.i32
+results*/*.log
+!results-v3/verify.log
+!results-v3/ctest.log
+!results-v3/code-check.log
+!results-v3/native-q4-valid256.log
+results/
+results-v2/

@@ -1,0 +1,7 @@
+{
+  "source": "/Users/chan/Projects/AISA/llama.cpp-gemmini/wikitext-2-raw/wiki.test.raw",
+  "source_sha256": "173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08",
+  "tokenizer_sha256": "8414cab924d8b9b33013f0d221c5862f365ee9be39c5c2bfae8a5a9e970478a6",
+  "total_tokens": 286221,
+  "saved_tokens": 8192
+}
