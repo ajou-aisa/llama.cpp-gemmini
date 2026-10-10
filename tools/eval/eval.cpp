@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -60,21 +61,24 @@ static void fingerprint_logits(uint64_t & hash, const float * logits, size_t cou
     }
 }
 
-// The fingerprinted logits row as raw FP32 bytes (native byte order, token-id order), for direct
-// byte comparison across routes; written after the timed request, the same way on every route.
-static json dump_logits(const std::filesystem::path & directory, const float * logits, size_t count,
-                        const char * scope) {
+// The logits row of every sampled step as raw FP32 bytes (native byte order; step-major, then token id), for
+// direct byte comparison across routes. Each row is copied from llama_get_logits_ith(ctx, -1) just before the
+// step's token is chosen, outside the measured sampler interval; the file is written after the timed request,
+// the same way on every route. The last row is the one logits_fingerprint hashes.
+static json dump_logits(const std::filesystem::path & directory, const std::vector<float> & logits, size_t steps,
+                        size_t vocab, const char * scope) {
     const auto path = directory / "logits-f32.bin";
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    out.write(reinterpret_cast<const char *>(logits), std::streamsize(count * sizeof(float)));
+    out.write(reinterpret_cast<const char *>(logits.data()), std::streamsize(logits.size() * sizeof(float)));
     out.close();
     if (!out) throw std::runtime_error("raw logits dump failed: " + path.string());
     const uint16_t probe = 1;
     const bool little = *reinterpret_cast<const unsigned char *>(&probe) == 1;
-    return {{"file", path.filename().string()}, {"bytes", count * sizeof(float)}, {"values", count},
-        {"dtype", "float32"}, {"byte_order", little ? "little" : "big"}, {"shape", json::array({count})},
-        {"order", "token_id"}, {"scope", scope},
-        {"capture", "llama_get_logits_ith(ctx, -1) after the request, the bytes of logits_fingerprint"}};
+    return {{"file", path.filename().string()}, {"bytes", logits.size() * sizeof(float)}, {"values", logits.size()},
+        {"dtype", "float32"}, {"byte_order", little ? "little" : "big"}, {"shape", json::array({steps, vocab})},
+        {"order", "step,token_id"}, {"scope", scope},
+        {"capture", "llama_get_logits_ith(ctx, -1) before each step's token is chosen; the last row is the bytes of "
+                    "logits_fingerprint"}};
 }
 
 static json batch_record(const llama_batch & batch, int chunk, int part) {
@@ -450,6 +454,10 @@ static int run(int argc, char ** argv) {
             sampling_times.reserve(generation_target);
             int decode_calls = 0;
             bool eos = false;
+            const size_t vocab_size = size_t(llama_vocab_n_tokens(vocab));
+            const bool dump_steps = generation && !terminal_metrics_only;
+            std::vector<float> step_logits;
+            if (dump_steps) step_logits.reserve(size_t(generation_target) * vocab_size);
             uint64_t logits_hash = UINT64_C(14695981039346656037);
             size_t logits_values = 0;
             uint64_t logits_decodes = 0;
@@ -480,6 +488,10 @@ static int run(int argc, char ** argv) {
                 }
             }
             for (int sample = 0; generation && sample < generation_target; ++sample) {
+                if (dump_steps) {
+                    const float * row = llama_get_logits_ith(ctx, -1);
+                    step_logits.insert(step_logits.end(), row, row + vocab_size);
+                }
                 llama_token token;
                 if (forced_cost_only) {
                     token = forced_tokens[sample];
@@ -508,11 +520,17 @@ static int run(int argc, char ** argv) {
             common_log_resume(common_log_main());
             json logits_dump;
             if (generation) {
-                logits_values = llama_vocab_n_tokens(vocab);
+                logits_values = vocab_size;
                 fingerprint_logits(logits_hash, llama_get_logits_ith(ctx, -1), logits_values);
-                if (!terminal_metrics_only)
-                    logits_dump = dump_logits(trace_dir, llama_get_logits_ith(ctx, -1), logits_values,
-                                              forced_cost_only ? "last_decode_output" : "last_sample_input");
+                if (dump_steps) {
+                    const size_t steps = step_logits.size() / vocab_size;
+                    if (steps != generated.size() || steps == 0 ||
+                        std::memcmp(step_logits.data() + (steps - 1) * vocab_size, llama_get_logits_ith(ctx, -1),
+                                    vocab_size * sizeof(float)) != 0)
+                        throw std::runtime_error("per-step logits do not end with the fingerprinted row");
+                    logits_dump = dump_logits(trace_dir, step_logits, steps, vocab_size,
+                                              forced_cost_only ? "every_decode_output" : "every_sample_input");
+                }
             }
             char fingerprint[17];
             std::snprintf(fingerprint, sizeof(fingerprint), "%016llx", static_cast<unsigned long long>(logits_hash));
