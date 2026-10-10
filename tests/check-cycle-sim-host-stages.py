@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import bisect
 from collections import Counter, defaultdict
 import json
 from pathlib import Path
@@ -19,6 +20,17 @@ WS_STAGES = ("im2p.residual_request_validation", "im2p.residual_run_preparation"
              "im2p.residual_recomposition_setup", "im2p.residual_radix_recomposition",
              "im2p.residual_recomposition_finalize", "im2p.residual_output_publish", "im2p.residual_release")
 PROBE = "HOST_COMPLETION_PROBE"
+PROBE_COUNTERS = ("instrumentation_ns", "instrumentation_calls", "dispatch_host_ns", "dispatch_host_calls",
+                  "emulation_ns", "emulation_calls")
+# The fields of a container interval that check_containers reads; nothing else is kept.
+CONTAINER_FIELDS = ("op", "duration_role", "cpu_service", "interval_class", "additive", "operation_success",
+                    "host_execution_id", "thread_id", "host_start_ns", "host_end_ns", "host_elapsed_ns",
+                    "host_elapsed_valid")
+
+# The logs are streamed: memory holds one record plus the canonical intervals and stage identities (a full
+# E2E PoTal log has millions of rows). Failures keep the order of a reader that parses every line of a file
+# before checking it: a malformed line anywhere in a file is reported before a failed check of that file, and
+# the first failed check (in file order, then the post-file checks in a fixed order) is the one reported.
 
 
 def timeline_rows(path: Path) -> int:
@@ -33,8 +45,13 @@ def timeline_rows(path: Path) -> int:
         raise ValueError(f"cycle log is not readable by the E2E timeline reader: {error}") from error
 
 
-def rows(path: Path) -> list[dict[str, object]]:
-    return [json.loads(line) for line in path.read_text().splitlines() if line]
+def rows(path: Path):
+    """The records of a JSON-lines file in order, one at a time: the lines of str.splitlines(), empty ones skipped."""
+    with path.open() as stream:
+        for physical in stream:
+            for line in physical.splitlines():
+                if line:
+                    yield json.loads(line)
 
 
 def host_interval(record: dict[str, object]) -> tuple[str, int, int, int]:
@@ -49,28 +66,49 @@ def host_interval(record: dict[str, object]) -> tuple[str, int, int, int]:
     raise ValueError(f"PoTal host measurement lacks a host interval: {record.get('op')}")
 
 
-def check_additive(canonical: list[tuple[str, int, int, int, str]]) -> int:
-    """Canonical host costs are summed, so within one host execution and thread they must be disjoint:
-    the rule IM2P.sim reconstruct_cpu (validate_potal_host_additivity) applies at the join."""
-    threads: dict[tuple[str, int], list[tuple[int, int, str]]] = defaultdict(list)
+Threads = dict[tuple[str, int], list[tuple[int, int, str]]]
+
+
+def thread_index(canonical: list[tuple[str, int, int, int, str]]) -> tuple[Threads, list[tuple[str, int]]]:
+    """Per (host execution, thread): its canonical intervals sorted by (start, end, op); and the threads that have
+    a positive-length interval, in the order of their first one."""
+    threads: Threads = defaultdict(list)
+    positive: dict[tuple[str, int], None] = {}
     for execution, thread, start, end, op in canonical:
+        threads[(execution, thread)].append((start, end, op))
         if end > start:
-            threads[(execution, thread)].append((start, end, op))
+            positive.setdefault((execution, thread))
     for spans in threads.values():
         spans.sort()
+    return threads, list(positive)
+
+
+def check_additive(threads: Threads, order: list[tuple[str, int]]) -> int:
+    """Canonical host costs are summed, so within one host execution and thread they must be disjoint:
+    the rule IM2P.sim reconstruct_cpu (validate_potal_host_additivity) applies at the join."""
+    for key in order:
         prior_end, prior_op = None, None
-        for start, end, op in spans:
+        for start, end, op in threads[key]:
+            if end <= start:
+                continue
             if prior_end is not None and start < prior_end:
                 raise ValueError(f"canonical PoTal host intervals overlap on one thread: {op} starts inside {prior_op}")
             if prior_end is None or end > prior_end:
                 prior_end, prior_op = end, op
-    return len(threads)
+    return len(order)
 
 
-def inside(canonical: list[tuple[str, int, int, int, str]], container: dict[str, object]) -> list[str]:
+def inside(threads: Threads, container: dict[str, object]) -> list[str]:
+    """Canonical stages of the container's thread with start <= s and e <= end, ordered by (s, e, op)."""
     execution, thread, start, end = host_interval(container)
-    return [op for _, _, op in sorted((s, e, op) for x, t, s, e, op in canonical
-                                     if (x, t) == (execution, thread) and start <= s and e <= end)]
+    spans = threads.get((execution, thread), [])
+    i = bisect.bisect_left(spans, (start,))
+    ops = []
+    while i < len(spans) and spans[i][0] <= end:
+        if spans[i][1] <= end:
+            ops.append(spans[i][2])
+        i += 1
+    return ops
 
 
 def subsequence_once(ops: list[str], stages: tuple[str, ...]) -> bool:
@@ -79,19 +117,17 @@ def subsequence_once(ops: list[str], stages: tuple[str, ...]) -> bool:
     return all(counts[stage] == 1 for stage in stages) and tuple(order) == stages
 
 
-def check_containers(cycle: list[dict[str, object]], canonical: list[tuple[str, int, int, int, str]]) -> dict[str, int]:
+def check_containers(containers: list[dict[str, object]], threads: Threads) -> dict[str, int]:
     found = Counter()
-    for record in cycle:
+    for record in containers:
         op = record.get("op")
-        if record.get("record_type") != "CYCLE_INTERVAL" or op not in (PAIRED_PARENT, WS_ENVELOPE):
-            continue
         if (record.get("duration_role") != "OBSERVATION_ONLY" or record.get("cpu_service") is not False or
                 record.get("interval_class") == "CANONICAL_ADDITIVE" or record.get("additive") is True):
             raise ValueError(f"{op} must be a non-additive interval around canonical stages")
         found[str(op)] += 1
         if record.get("operation_success") is not True:
             continue
-        ops = inside(canonical, record)
+        ops = inside(threads, record)
         if op == PAIRED_PARENT:
             if tuple(ops) != PAIRED_STAGES:
                 raise ValueError("paired recomposition host cost is not carried by its canonical stages: " + ",".join(ops))
@@ -103,20 +139,18 @@ def check_containers(cycle: list[dict[str, object]], canonical: list[tuple[str, 
     return found
 
 
-def check_probes(cycle: list[dict[str, object]], found: dict[str, int]) -> int:
-    probes = [r for r in cycle if r.get("record_type") == PROBE]
-    for record in probes:
-        if (record.get("additive") is not False or record.get("duration_role") != "OBSERVATION_ONLY" or
-                record.get("host_stage_id") is not None or
-                not all(isinstance(value := record.get(k), int) and value >= 0 for k in
-                        ("instrumentation_ns", "instrumentation_calls", "dispatch_host_ns", "dispatch_host_calls",
-                         "emulation_ns", "emulation_calls"))):
-            raise ValueError("invalid residual completion probe")
-    per_parent = Counter(r.get("parent_op") for r in probes)
+def valid_probe(record: dict[str, object]) -> bool:
+    return (record.get("additive") is False and record.get("duration_role") == "OBSERVATION_ONLY" and
+            record.get("host_stage_id") is None and
+            all(isinstance(value := record.get(k), int) and value >= 0 for k in PROBE_COUNTERS))
+
+
+def check_probes(invalid: bool, per_parent: Counter, found: dict[str, int]) -> None:
+    if invalid:
+        raise ValueError("invalid residual completion probe")
     if any(found.get(op, 0) != per_parent.get(op, 0) for op in (PAIRED_PARENT, WS_ENVELOPE)):
         raise ValueError(f"one completion probe per residual completion required: intervals {dict(found)}, "
                          f"probes {dict(per_parent)}")
-    return len(probes)
 
 
 def main() -> int:
@@ -124,49 +158,74 @@ def main() -> int:
     expected: dict[int, str] = {}
     completed: set[int] = set()
     run_success = False
+    failure: Exception | None = None
     for record in rows(trace):
-        if record.get("kind") == "RUN_END":
-            run_success = record.get("status") == "success"
-        if record.get("kind") != "HOST_STAGE" or record.get("execution_class") != "POTAL_HOST":
+        if failure is not None:
             continue
-        identity = record.get("host_stage_id")
-        stage = record.get("stage_name")
-        if not isinstance(identity, int) or not isinstance(stage, str):
-            raise ValueError("invalid PoTal host-stage identity")
-        if record.get("event") == "BEGIN":
-            if identity in expected:
-                raise ValueError("duplicate PoTal host-stage declaration")
-            expected[identity] = stage
-        elif record.get("event") == "END" and record.get("status") == "success":
-            completed.add(identity)
-    measured: dict[int, str] = {}
-    cycle = rows(cycle_path)
+        try:
+            if record.get("kind") == "RUN_END":
+                run_success = record.get("status") == "success"
+            if record.get("kind") != "HOST_STAGE" or record.get("execution_class") != "POTAL_HOST":
+                continue
+            identity = record.get("host_stage_id")
+            stage = record.get("stage_name")
+            if not isinstance(identity, int) or not isinstance(stage, str):
+                raise ValueError("invalid PoTal host-stage identity")
+            if record.get("event") == "BEGIN":
+                if identity in expected:
+                    raise ValueError("duplicate PoTal host-stage declaration")
+                expected[identity] = sys.intern(stage)
+            elif record.get("event") == "END" and record.get("status") == "success":
+                completed.add(identity)
+        except Exception as error:  # noqa: BLE001 - reported once the whole file has parsed
+            failure = error
+    if failure is not None:
+        raise failure
+    # Every stored measurement names its declared stage, so the measured map equals the declared one exactly
+    # when their identity sets are equal.
+    measured: set[int] = set()
     canonical: list[tuple[str, int, int, int, str]] = []
-    for record in cycle:
-        if record.get("duration_role") != "POTAL_HOST":
+    containers: list[dict[str, object]] = []
+    per_parent: Counter = Counter()
+    invalid_probe = False
+    for record in rows(cycle_path):
+        if failure is not None:
             continue
-        identity = record.get("host_stage_id")
-        stage = record.get("op")
-        if (not isinstance(identity, int) or not isinstance(stage, str) or
-                record.get("interval_class") != "CANONICAL_ADDITIVE"):
-            raise ValueError("invalid canonical PoTal host measurement")
-        if "additive" in record and record["additive"] is not True:
-            raise ValueError("canonical PoTal host measurement is non-additive")
-        if identity in measured:
-            raise ValueError("duplicate canonical PoTal host measurement")
-        if identity not in expected or expected[identity] != stage:
-            raise ValueError("undeclared or mismatched canonical PoTal host measurement")
-        measured[identity] = stage
-        canonical.append((*host_interval(record), stage))
-    if run_success and (set(expected) != completed or expected != measured):
+        try:
+            if record.get("duration_role") == "POTAL_HOST":
+                identity = record.get("host_stage_id")
+                stage = record.get("op")
+                if (not isinstance(identity, int) or not isinstance(stage, str) or
+                        record.get("interval_class") != "CANONICAL_ADDITIVE"):
+                    raise ValueError("invalid canonical PoTal host measurement")
+                if "additive" in record and record["additive"] is not True:
+                    raise ValueError("canonical PoTal host measurement is non-additive")
+                if identity in measured:
+                    raise ValueError("duplicate canonical PoTal host measurement")
+                if identity not in expected or expected[identity] != stage:
+                    raise ValueError("undeclared or mismatched canonical PoTal host measurement")
+                measured.add(identity)
+                execution, thread, start, end = host_interval(record)
+                canonical.append((sys.intern(execution), thread, start, end, expected[identity]))
+            if record.get("record_type") == "CYCLE_INTERVAL" and record.get("op") in (PAIRED_PARENT, WS_ENVELOPE):
+                containers.append({key: record[key] for key in CONTAINER_FIELDS if key in record})
+            if record.get("record_type") == PROBE:
+                per_parent[record.get("parent_op")] += 1
+                invalid_probe = invalid_probe or not valid_probe(record)
+        except Exception as error:  # noqa: BLE001 - reported once the whole file has parsed
+            failure = error
+    if failure is not None:
+        raise failure
+    if run_success and (set(expected) != completed or set(expected) != measured):
         raise ValueError("PoTal host declaration/completion/measurement mismatch")
-    threads = check_additive(canonical)
-    found = check_containers(cycle, canonical)
-    probes = check_probes(cycle, found)
+    threads, order = thread_index(canonical)
+    additive_threads = check_additive(threads, order)
+    found = check_containers(containers, threads)
+    check_probes(invalid_probe, per_parent, found)
     timeline_rows(cycle_path)
-    print(f"POTAL_CANONICAL_HOST_INTERVALS_PASS count={len(expected)} additive_threads={threads} "
+    print(f"POTAL_CANONICAL_HOST_INTERVALS_PASS count={len(expected)} additive_threads={additive_threads} "
           f"paired_parents={found.get(PAIRED_PARENT, 0)} ws_run_aware={found.get('ws_run_aware', 0)} "
-          f"completion_probes={probes}")
+          f"completion_probes={sum(per_parent.values())}")
     return 0
 
 

@@ -10,7 +10,8 @@ validation, run preparation, recomposition setup, radix recomposition, finalize,
 other canonical stages allowed between them), with one completion probe per residual completion. It must reject
 nested or overlapping canonical intervals (the pre-fix paired layout), double counting, a canonical parent, a
 missing or misplaced stage on either route, a duplicate publication, a missing completion probe, a missing host
-timestamp and an inconsistent host clock. The IM2P.sim consumer check (reconstruct_cpu
+timestamp and an inconsistent host clock. The checker streams the logs and must keep the failure order of a reader that
+parses a whole file before checking it. The IM2P.sim consumer check (reconstruct_cpu
 CpuIndex.validate_potal_host_additivity), which is not modified, must still reject a nested canonical interval."""
 from __future__ import annotations
 
@@ -54,7 +55,7 @@ def probe(parent_op: str) -> dict[str, object]:
             "emulation_calls": 0}
 
 
-def run(cycle: list[dict[str, object]]) -> subprocess.CompletedProcess[str]:
+def run(cycle: list[dict[str, object]], raw_cycle: str = "") -> subprocess.CompletedProcess[str]:
     declared = {r["host_stage_id"]: r["op"] for r in cycle if r.get("duration_role") == "POTAL_HOST"}
     trace = [{"kind": "HOST_STAGE", "execution_class": "POTAL_HOST", "event": event, "status": "success",
               "host_stage_id": identity, "stage_name": op}
@@ -62,15 +63,15 @@ def run(cycle: list[dict[str, object]]) -> subprocess.CompletedProcess[str]:
     trace.append({"kind": "RUN_END", "status": "success"})
     with tempfile.TemporaryDirectory() as directory:
         paths = [Path(directory) / name for name in ("npu-cycle-trace.jsonl", "cycle-log.jsonl")]
-        for path, records in zip(paths, (trace, cycle)):
+        for path, records, raw in zip(paths, (trace, cycle), ("", raw_cycle)):
             # Compact separators, as the producer writes them (readers match fields with regular expressions).
-            path.write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in records))
+            path.write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in records) + raw)
         return subprocess.run([sys.executable, "-B", str(CHECKER), *map(str, paths)],
                               capture_output=True, text=True, check=False)
 
 
-def expect(name: str, cycle: list[dict[str, object]], passes: bool, detail: str = "") -> None:
-    result = run(cycle)
+def expect(name: str, cycle: list[dict[str, object]], passes: bool, detail: str = "", raw_cycle: str = "") -> None:
+    result = run(cycle, raw_cycle)
     ok = (result.returncode == 0 and "POTAL_CANONICAL_HOST_INTERVALS_PASS" in result.stdout) if passes else \
         (result.returncode != 0 and detail in result.stderr)
     if not ok:
@@ -134,6 +135,18 @@ def checker_cases() -> None:
     duplicate = paired()
     duplicate.append(canonical(RADIX, 182, 185, identity=int(str(duplicate[2]["host_stage_id"]))))
     expect("duplicate canonical measurement of one stage", duplicate, False, "duplicate canonical PoTal host measurement")
+    # The checker streams the logs; it keeps the failure order of a reader that parses a whole file first.
+    late = paired()
+    late[2]["host_end_ns"] = 1
+    expect("a malformed line after a failed check is reported first", late, False, "JSONDecodeError",
+           raw_cycle='{"broken": \n')
+    expect("overlaps on two threads: the thread with the first positive interval is reported",
+           [canonical("a.zero", 5, 5, thread=2), canonical("b.one", 10, 20, thread=1), canonical("b.two", 15, 25, thread=1),
+            canonical("a.one", 30, 40, thread=2), canonical("a.two", 35, 45, thread=2)],
+           False, "b.two starts inside b.one")
+    expect("zero-length canonical intervals do not count as overlaps",
+           [*paired(), canonical("im2p.output_reconstruction", 50, 50, thread=9),
+            canonical("im2p.output_reconstruction", 60, 60, thread=9)], True)
 
 
 def consumer_cases() -> None:
