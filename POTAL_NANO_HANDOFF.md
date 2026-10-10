@@ -20,6 +20,8 @@
 3. [상세 구현 계획](experiments/potal_a4/IMPLEMENTATION_PLAN.md). 10개 제품 구현 항목은 미완료다. 새 테스트 이름과 A4NKS 옵션은 계획이며 현재 사용할 수 있다는 뜻이 아니다.
 4. [공간·정확도 결과](experiments/potal_a4/RESULTS.md), [attention limb·보정 비용](experiments/potal_a4/ATTENTION_PROFILE.md), [실험 실행 방법](experiments/potal_a4/README.md).
 
+**대화 세션도 이 브랜치에 포함했다.** [세션 복원 방법](experiments/potal_a4/session/README.md)에 따라 nano에서 `codex resume`으로 이어 열 수 있다. [대화 원문](experiments/potal_a4/session/CONVERSATION.md)에는 처음 제공한 전체 코드와 이후 결정·실험 설명이 들어 있다. 원본과 충돌하지 않도록 복원용 세션 ID는 `5d07d5b8-15f4-5d29-a2d5-01e2398bb920`로 분리했다.
+
 ## 반드시 유지할 결정
 
 최신 조건은 **처음 제공된 selective-linear + a4nks 대비 정확도가 떨어지면 안 된다**는 것이다. FP32 대비 양자화 손실까지 없애라는 조건과는 구분한다. 정책 이름은 `potal-a4-preserve-v1`이다.
