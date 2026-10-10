@@ -10,23 +10,25 @@ usage() {
         '--from starts at that case in the default order; an interrupted case restarts from chunk 1.' \
         '--build-dir requires one --case; normal execution uses that build without reconfiguration.' \
         'Only SHA-256 verified models/default GGUFs are allowed; model overrides are forbidden.' \
-        'Original CPU graph with Metal dense computation: RTN-W FP32, RTN-WA/PoTal integer dots.' \
-        'Activation production, floating scale restoration and residual stay on the original CPU path.'
+        'CPU-equivalent Metal dense/attention matmuls and indexed HP1 residual with checked shifts.' \
+        'Activation production, dense floating scale restoration and attention softmax remain on CPU.'
 }
 fail() { printf '%s\n' "$*" >&2; exit 2; }
 root=$(cd -- "$(rtk proxy dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
 cd -- "$root"
 source "$root/scripts/experiment/ppl-original-models.sh"
-selected=all; start_case=; output=; override=; context=512; chunks=-1; dry=0; prepare=0
+selected=all; start_case=; output=; override=; build_root=; context=512; chunks=-1; dry=0; prepare=0; rtn_only=0
 while (( $# )); do
     case "$1" in
         --help|-h) usage; exit 0 ;;
         --dry-run) dry=1; shift; continue ;;
         --prepare) prepare=1; shift; continue ;;
-        --case|--from|--output|--build-dir|--context|--chunks)
+        --rtn-only) rtn_only=1; shift; continue ;;
+        --case|--from|--output|--build-dir|--build-root|--context|--chunks)
             [[ $# -ge 2 ]] || fail "Missing value: $1"
             case "$1" in
                 --case) selected=$2 ;; --from) start_case=$2 ;; --output) output=$2 ;; --build-dir) override=$2 ;;
+                --build-root) build_root=$2 ;;
                 --context) context=$2 ;; --chunks) chunks=$2 ;;
             esac
             shift 2 ;;
@@ -40,6 +42,7 @@ done
 [[ $(rtk proxy uname -s) == Darwin ]] || fail 'macOS Metal is required.'
 cases=()
 for method in rtnw rtnwa potal; do
+    [[ $method != potal || $rtn_only == 0 ]] || continue
     for family in gpt2 llama; do
         for bits in 4 8; do
             dims=(16); [[ $method != potal ]] || dims=(16 32 64)
@@ -69,13 +72,20 @@ profile() {
         bits=${suffix:5:1}; dim=${suffix##*-d}; activation=EXSIA; rmd=ON; method=PoTal; stripe=ON; matmul=STRIPE_PIPELINE
     elif [[ $suffix == rtnw[48] ]]; then compute=FLOAT; method=RTN-W; fi
     build="$root/.omo/metal-cpu-exact/quality-$suffix"
+    [[ -z $build_root ]] || build="$build_root/quality-$suffix"
     build=${override:-$build}
     quant="Q${bits}_0"
     [[ $method != PoTal ]] || quant="Q${bits}_HP1"
     ppl_original_model "$root" "$family" "$quant"
     model=$original_model
     [[ $quant != Q4_0 ]] || q6_head=1
-    command=(env OMP_NUM_THREADS=4 OMP_DYNAMIC=FALSE GGML_GEMMINI_METAL_CPU_EXACT=1 "GGML_GEMMINI_METAL_CPU_EXACT_Q6_HEAD=$q6_head")
+    activation_fp16=0
+    [[ $compute != FLOAT ]] || activation_fp16=${GGML_GEMMINI_METAL_ACTIVATION_FP16:-0}
+    [[ $activation_fp16 == 0 || $activation_fp16 == 1 ]] || fail 'FP16 activation flag must be 0 or 1.'
+    command=(env OMP_NUM_THREADS=4 OMP_DYNAMIC=FALSE GGML_GEMMINI_METAL_CPU_EXACT=1 "GGML_GEMMINI_METAL_CPU_EXACT_Q6_HEAD=$q6_head" "GGML_GEMMINI_METAL_ACTIVATION_FP16=$activation_fp16")
+    if [[ $compute == FLOAT || $method == PoTal ]]; then
+        command+=(OMP_WAIT_POLICY=PASSIVE KMP_BLOCKTIME=0)
+    fi
     command+=("$build/bin/llama-perplexity"
         --model "$model" --file "$dataset" --ctx-size "$context" --batch-size "$context" --ubatch-size "$context"
         --chunks "$chunks" --threads 4 --threads-batch 4 --gpu-layers 0 --cache-type-k f16 --cache-type-v f16 --seed 42 --no-warmup)
@@ -144,7 +154,7 @@ for id in "${cases[@]}"; do
     profile "$id"; result="$output/$id"
     rtk proxy mkdir -- "$result"
     print_command > "$result/command.txt"
-    printf 'original_q6_k_cpu_head=%s\nmodel=%s\n' "$q6_head" "$model" > "$result/head-policy.txt"
+    printf 'original_q6_k_head=%s\nactivation_fp16=%s\nmodel=%s\n' "$q6_head" "$activation_fp16" "$model" > "$result/head-policy.txt"
     rtk proxy cp -- "$build/CMakeCache.txt" "$result/CMakeCache.txt"
     rtk proxy cp -- "$build/compile_commands.json" "$result/compile_commands.json"
     rtk proxy cp -- "$build/ggml/src/ggml-gemmini/cpu-exact-build.txt" "$result/cpu-exact-build.txt"
@@ -161,9 +171,9 @@ for id in "${cases[@]}"; do
     rtk proxy /usr/bin/time -p "${command[@]}" 2>&1 | rtk proxy tee "$result/ppl.log" || status=$?
     printf '%s\n' "$status" > "$result/exit-status.txt"
     (( status == 0 )) || { printf 'Failed %s: exit %s\n' "$id" "$status" >&2; exit "$status"; }
-    rtk proxy python3 - "$result" "$method" "$family" "$bits" "$dim" "$context" "$chunks" "$q6_head" <<'PY' > "$result/result.tsv"
+    rtk proxy python3 - "$result" "$method" "$family" "$bits" "$dim" "$context" "$chunks" "$q6_head" "$activation_fp16" <<'PY' > "$result/result.tsv"
 import json, math, pathlib, re, sys
-directory, method, model, bits, dim, context, requested, q6_head = sys.argv[1:]
+directory, method, model, bits, dim, context, requested, q6_head, activation_fp16 = sys.argv[1:]
 bits, dim, context, requested = map(int, (bits, dim, context, requested))
 text = (pathlib.Path(directory) / 'ppl.log').read_text()
 def require(condition, message):
@@ -183,16 +193,22 @@ records = re.findall(r'^METAL_CPU_EXACT_PROOF (.*)$', text, re.M)
 require(len(records) == 1, 'expected one CPU-exact Metal execution proof')
 p = json.loads(records[0])
 mode, compute = ('EXSIA' if method == 'PoTal' else 'BLOCK'), ('FLOAT' if method == 'RTN-W' else 'INT')
-integers = ('version', 'bits', 'dim', 'scored_tokens', 'observed_matmuls', 'verified_matmuls', 'float_gpu_calls', 'integer_gpu_launches')
+integers = ('version', 'bits', 'dim', 'scored_tokens', 'observed_matmuls', 'verified_matmuls', 'float_gpu_calls', 'integer_gpu_launches', 'residual_gpu_launches', 'attention_gpu_calls', 'observed_attention_matmuls', 'verified_attention_matmuls')
 require(all(type(p.get(k)) is int and p[k] >= 0 for k in integers), 'invalid proof counters')
-require(p.get('schema') == 'metal-cpu-exact-ppl' and p['version'] == 1 and p.get('graph') == 'original_cpu', 'proof schema/graph')
+require(p.get('schema') == 'metal-cpu-exact-ppl' and p['version'] == 2 and p.get('graph') == 'cpu_equivalent_metal', 'proof schema/graph')
 require(p.get('complete') is True and p['scored_tokens'] == tokens, 'incomplete proof/token count')
 require(p['bits'] == bits and p['dim'] == dim and p.get('activation') == mode and p.get('compute') == compute, 'proof profile')
 require(p['observed_matmuls'] > 0 and p['observed_matmuls'] == p['verified_matmuls'], 'CPU fallback/missing GPU matmul')
+require(p['observed_attention_matmuls'] == p['verified_attention_matmuls'] == p['attention_gpu_calls'] == 2 * (12 if model == 'gpt2' else 16) * n, 'missing GPU attention matmul')
+require(p['residual_gpu_launches'] > 0 if method == 'PoTal' else p['residual_gpu_launches'] == 0, 'residual GPU route')
 if q6_head == '1':
-    require(type(p.get('cpu_q6_head_matmuls')) is int and p['cpu_q6_head_matmuls'] == n, 'missing original Q6_K CPU head execution')
+    if activation_fp16 == '1':
+        require(p.get('gpu_q6_head_matmuls') == n and p.get('cpu_q6_head_matmuls') == 0, 'missing FP16 activation Q6_K GPU head')
+    else:
+        require(type(p.get('cpu_q6_head_matmuls')) is int and p['cpu_q6_head_matmuls'] == n, 'missing original Q6_K CPU head execution')
 else:
     require(p.get('cpu_q6_head_matmuls', 0) == 0, 'unexpected Q6_K CPU head')
+require(p.get('activation_fp16', False) == (activation_fp16 == '1'), 'activation FP16 contract')
 require((p['float_gpu_calls'] > 0 and p['integer_gpu_launches'] == 0) if compute == 'FLOAT' else (p['integer_gpu_launches'] > 0 and p['float_gpu_calls'] == 0), 'GPU kernel family')
 (pathlib.Path(directory) / 'metal-cpu-exact-proof.json').write_text(json.dumps(p, indent=2) + '\n')
 elapsed = re.findall(r'^real\s+([0-9.]+)$', text, re.M)
