@@ -1,0 +1,9 @@
+{
+  "experiments/potal_a4/results-attention-profile/context512.json": "a83f3a6d894fd95a3e24c843c021362d85fd64bfb0297ad52aab8743b559a547",
+  "experiments/potal_a4/results-attention-profile/context128.json": "955dedd87d036105ff06154f5f4f0d22dc923db9197463ecbec62418b2130f8d",
+  "experiments/potal_a4/results-attention-profile/context1024.json": "df8f8bbcd50155a72c9ecab4a1a55598808ae2978bcbd7d4eab122db69b700d2",
+  "/Users/chan/Projects/AISA/worktrees/potal-attn/experiments/potal_a4/profile_gemm.py": "b4d92e75359f00aef692939737204b97267cfcde33a9daaf31ffbec562d48102",
+  "/Users/chan/Projects/AISA/worktrees/potal-attn/experiments/potal_a4/profile_report.py": "d4107bcb56c18074d82e7cf38c5b5d8b0c60d4078ce89ebd472e3d7ba8543dfc",
+  "/Users/chan/Projects/AISA/worktrees/potal-attn/experiments/potal_a4/profile_ops.py": "94f9996238ef1c0ff11665f228487311066d7a6f252208de45d684e36ca78a05",
+  "/Users/chan/Projects/AISA/worktrees/potal-attn/experiments/potal_a4/profile_attention.py": "87ff6522988c16e162cd6b1ccb8c9923eede29514e36cc1122d948a0fcae852c"
+}
