@@ -1,5 +1,7 @@
 # PoTal A4 제한 조건 실험
 
+Nano / Gemmini IM2P에서 이어갈 때는 저장소 루트의 [POTAL_NANO_HANDOFF.md](../../POTAL_NANO_HANDOFF.md)를 먼저 읽는다. [원래 알고리즘](ORIGINAL_SPEC.md)과 [전체 구현 계획](IMPLEMENTATION_PLAN.md)도 이 브랜치에 보관했다.
+
 이 디렉터리는 `hotfix/potal-attn`의 **실험 구현**이다. CPU에서 선형·Q direct-limb 정책과 K/P/V 양자화를 적용한 GPT-2 forward를 실행하고, 저장 버퍼와 정확도를 비교한다. 제품의 Gemmini attention dispatch와 fused upper-digit API는 아직 연결하지 않았다.
 
 실측 결론은 [RESULTS.md](RESULTS.md), 조건별 원자료는 [results-v3](results-v3/)에 있다.
