@@ -167,6 +167,13 @@ def collect_runs(args: argparse.Namespace) -> None:
         if native_collection is not None:
             from sim.cycle.collection_native import finish_native_collection
             provenance = finish_native_collection(native_collection)
+        validation = None
+        if role == "potal":
+            # Host stages, NPU trace structure and the paired lifecycle, before any replay consumes the logs.
+            from check_e2e_collection import validate_collection
+            validation = validate_collection(Path(str(record(chunks[0]).get("trace_dir"))),
+                                             args.im2p.resolve(strict=True))
+            write_json(destination / "collection-validation.json", validation)
         result: Record = {"schema": "potal-e2e-run", "version": 1, "repetition": repetition,
             "measurement_id": str(uuid.uuid4()), "role": role, "host_id": host["host_id"],
             "chunk_id": repetition,
@@ -177,6 +184,10 @@ def collect_runs(args: argparse.Namespace) -> None:
             "application_sha256": sha256(destination / "native/application.jsonl"),
             "application_services": sampling,
             "collection_provenance": None if provenance is None else {"path": str(provenance), "sha256": sha256(provenance)},
+            "collection_validation": None if validation is None else {
+                "path": str(destination / "collection-validation.json"),
+                "sha256": sha256(destination / "collection-validation.json"),
+                "host_stages": validation["host_stages"], "lifecycle": validation["lifecycle"]},
             "host_observations": {"before_sha256": sha256(destination / "host-before.json"),
                                   "after_sha256": sha256(destination / "host-after.json")},
             "workload_sha256": sha256(destination / "native/workload.json"),

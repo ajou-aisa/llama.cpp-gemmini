@@ -111,4 +111,30 @@ file(WRITE "${log_dir}/host-stages.log" "${host_output}${host_error}")
 if(NOT host_result EQUAL 0)
     finish(FAIL "${host_output}\n${host_error}")
 endif()
+if(TEST_MODE MATCHES "^exsia-")
+    # The full E2E collector's validation (host stages, IM2P.sim NPU trace structure, paired lifecycle) on
+    # the fixture's real producer logs. The malformed fixture refuses a publication, which it must reject.
+    list(GET source_roots 1 im2p_root)
+    execute_process(COMMAND "${TEST_PYTHON}" -B
+        "${CMAKE_CURRENT_LIST_DIR}/../scripts/eval/check_e2e_collection.py" --im2p "${im2p_root}" "${log_dir}"
+        RESULT_VARIABLE collection_result OUTPUT_VARIABLE collection_output ERROR_VARIABLE collection_error)
+    file(WRITE "${log_dir}/e2e-collection.log" "${collection_output}${collection_error}")
+    if(TEST_MODE STREQUAL "exsia-paired-malformed")
+        if(collection_result EQUAL 0 OR
+           NOT collection_error MATCHES "NPU trace validation failed: npu-trace: host stage did not complete successfully")
+            finish(FAIL "refused publication not rejected by the E2E collection validation\n${collection_output}\n${collection_error}")
+        endif()
+    elseif(NOT collection_result EQUAL 0 OR NOT collection_output MATCHES "^E2E_COLLECTION_VALIDATION_PASS ")
+        finish(FAIL "${collection_output}\n${collection_error}")
+    endif()
+    if(TEST_MODE STREQUAL "exsia-paired-pipeline")
+        execute_process(COMMAND "${TEST_PYTHON}" -B
+            "${CMAKE_CURRENT_LIST_DIR}/test-e2e-collection-validation.py" --im2p "${im2p_root}" "${log_dir}"
+            RESULT_VARIABLE mutation_result OUTPUT_VARIABLE mutation_output ERROR_VARIABLE mutation_error)
+        file(WRITE "${log_dir}/e2e-collection-mutations.log" "${mutation_output}${mutation_error}")
+        if(NOT mutation_result EQUAL 0 OR NOT mutation_output MATCHES "E2E_COLLECTION_VALIDATION_MUTATIONS_PASS")
+            finish(FAIL "${mutation_output}\n${mutation_error}")
+        endif()
+    endif()
+endif()
 finish(PASS "")
