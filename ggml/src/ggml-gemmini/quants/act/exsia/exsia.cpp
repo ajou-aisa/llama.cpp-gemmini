@@ -1287,6 +1287,11 @@ namespace ggml::gemmini::quants::act::exsia
 
     bool SigmaDetector::detect(int32_t q, const SigmaContext &context) const
     {
+#if defined(GGML_GEMMINI_EXSIA_OUTLIER_SELECTION) && !GGML_GEMMINI_EXSIA_OUTLIER_SELECTION
+        (void) q;
+        (void) context;
+        return false;
+#endif
         if (!context.valid)
             return false;
 

@@ -2,6 +2,29 @@
 using namespace metal;
 
 struct cpu_exact_shape { ulong m, n, k, software; };
+struct attention_shape { ulong m, n, k, w_heads, x_heads, w_batches, x_batches; };
+
+kernel void cpu_exact_attention(device const half * x [[buffer(0)]],
+    device const half * w [[buffer(1)]], device float * output [[buffer(2)]],
+    constant attention_shape & s [[buffer(3)]], uint3 pos [[thread_position_in_grid]]) {
+    if (pos.x >= s.n || pos.y >= s.m || pos.z >= s.x_heads*s.x_batches) return;
+    const ulong head=pos.z%s.x_heads, batch=pos.z/s.x_heads;
+    const ulong wh=head/(s.x_heads/s.w_heads)+(batch/(s.x_batches/s.w_batches))*s.w_heads;
+    const ulong xi=(ulong(pos.z)*s.m+pos.y)*s.k, wi=(wh*s.n+pos.x)*s.k;
+    half4 sums[8] = {};
+    for (ulong k=0;k<s.k;k+=32) {
+        for (uint lane=0;lane<8;++lane) {
+            const ulong offset=k+lane*4;
+            sums[lane]=fma(half4(x[xi+offset],x[xi+offset+1],x[xi+offset+2],x[xi+offset+3]),
+                           half4(w[wi+offset],w[wi+offset+1],w[wi+offset+2],w[wi+offset+3]),sums[lane]);
+        }
+    }
+    // Match the CPU's four FP16x8 accumulators and its FP32 horizontal reduction.
+    const half4 low=(sums[0]+sums[4])+(sums[2]+sums[6]);
+    const half4 high=(sums[1]+sums[5])+(sums[3]+sums[7]);
+    const float4 sum=float4(low)+float4(high);
+    output[(ulong(pos.z)*s.m+pos.y)*s.n+pos.x]=(sum.x+sum.y)+(sum.z+sum.w);
+}
 
 ulong fp32_shift_jam(ulong value, uint shift) {
     if (shift == 0) { return value; }

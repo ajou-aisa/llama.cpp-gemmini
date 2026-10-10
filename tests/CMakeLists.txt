@@ -1639,6 +1639,25 @@ add_compile_definitions(
     GGML_GEMMINI_SCALE_METRICS=${GGML_GEMMINI_SCALE_METRICS}
     GGML_GEMMINI_ACT_QUANT_METRICS=${GGML_GEMMINI_ACT_QUANT_METRICS}
     GGML_GEMMINI_RESIDUAL_METRICS=${GGML_GEMMINI_RESIDUAL_METRICS})
+if (GGML_GEMMINI_CUDA_CPU_EXACT)
+    foreach(_kind int graph)
+        set(_target test-cuda-cpu-exact-${_kind})
+        add_executable(${_target} test-metal-cpu-exact-${_kind}.cpp)
+        target_compile_features(${_target} PRIVATE cxx_std_17)
+        target_compile_definitions(${_target} PRIVATE ${GGML_GEMMINI_COMPILE_DEFS}
+            TEST_CPU_EXACT_FLOAT=0
+            TEST_CPU_EXACT_HP1=$<STREQUAL:${GGML_GEMMINI_ACTIVATION_QUANT},EXSIA>
+            EVALUATION_EXACT_COMPUTE="${GGML_GEMMINI_COMPUTE_TYPE}"
+            EVALUATION_EXACT_ACTIVATION="${GGML_GEMMINI_ACTIVATION_QUANT}"
+            EVALUATION_EXACT_BITS=${GGML_GEMMINI_ACTIVATION_BITS}
+            EVALUATION_EXACT_DIM=${GGML_GEMMINI_DIM})
+        target_include_directories(${_target} PRIVATE ../ggml/src/ggml-gemmini ../ggml/src)
+        target_link_libraries(${_target} PRIVATE common ggml ggml-gemmini
+            ggml-gemmini-cuda-cpu-exact ggml-cpu ggml-base ggml-gemmini-utils)
+        add_test(NAME ${_target} COMMAND ${_target})
+    endforeach()
+endif()
+
 if (GGML_GEMMINI_METAL_CPU_EXACT)
     add_executable(test-metal-cpu-exact-float test-metal-cpu-exact-float.cpp)
     target_compile_features(test-metal-cpu-exact-float PRIVATE cxx_std_17)

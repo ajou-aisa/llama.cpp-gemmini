@@ -116,6 +116,22 @@ ggml_add_backend_library(ggml-gemmini
                         )
 
 target_compile_features(ggml-gemmini PRIVATE cxx_std_17)
+if (GGML_GEMMINI_CUDA_CPU_EXACT)
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  add_library(ggml-gemmini-cuda-cpu-exact STATIC
+      ../ggml-cuda/cpu-exact/ggml-cuda-cpu-exact.cu)
+  set_target_properties(ggml-gemmini-cuda-cpu-exact PROPERTIES
+      POSITION_INDEPENDENT_CODE ON CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+  target_compile_options(ggml-gemmini-cuda-cpu-exact PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:--ftz=false;--fmad=false;--prec-div=true;--prec-sqrt=true>)
+  target_include_directories(ggml-gemmini-cuda-cpu-exact PRIVATE ../../include ..)
+  target_link_libraries(ggml-gemmini-cuda-cpu-exact PUBLIC CUDA::cudart ggml-base)
+  target_link_libraries(ggml-gemmini PRIVATE ggml-gemmini-cuda-cpu-exact)
+  target_compile_definitions(ggml-gemmini PUBLIC GGML_GEMMINI_CUDA_CPU_EXACT=1)
+  file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/cpu-exact-build.txt" CONTENT
+      "compiler=${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}\ncuda_compiler=${CMAKE_CUDA_COMPILER_VERSION}\ngemmini_sw_path=${GEMMINI_SW_PATH}\n")
+endif()
 if (GGML_GEMMINI_METAL_CPU_EXACT)
   enable_language(OBJCXX)
   set(_cpu_exact_dir "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-metal")

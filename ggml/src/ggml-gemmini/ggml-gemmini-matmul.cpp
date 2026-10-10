@@ -2,8 +2,8 @@
 #define GGML_GEMMINI_MATMUL_IMPLEMENTATION 1
 #include "ggml-gemmini-matmul.hpp"
 #include "quants/common/weight_reader.hpp"
-#if defined(GGML_GEMMINI_METAL_CPU_EXACT)
-#include "../ggml-metal/ggml-metal-cpu-exact-int.h"
+#if defined(GGML_GEMMINI_METAL_CPU_EXACT) || defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+#include "ggml-gpu-cpu-exact.hpp"
 #endif
 
 #include <gemmini/log.hpp>
@@ -531,15 +531,26 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args, bool s
         return MatMulStatus::invalid_contract;
     }
     bool metal_raw_dot = false;
-#if defined(GGML_GEMMINI_METAL_CPU_EXACT)
-    metal_raw_dot = ggml_metal_cpu_exact_int_enabled();
+#if defined(GGML_GEMMINI_METAL_CPU_EXACT) || defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+    metal_raw_dot = gemmini_gpu::enabled();
     if (metal_raw_dot && (args.A.bits != 4 && args.A.bits != 8)) {
         return MatMulStatus::unsupported;
     }
 #endif
     const size_t rows_per_tile = metal_raw_dot ? 128 : args.tile_I * DIM;
-    const size_t columns_per_tile = metal_raw_dot ? 128 : args.tile_J * DIM;
     const size_t metal_fragment = (stored_block || legacy_hp1) && (args.tile_K * DIM) % 32 != 0 ? 16 : 32;
+    size_t columns_per_tile = args.tile_J * DIM;
+#if defined(GGML_GEMMINI_METAL_CPU_EXACT) || defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+    if (metal_raw_dot) {
+        constexpr size_t max_elements = 16 * 1024 * 1024;
+        const size_t fragments = args.K / metal_fragment + size_t(args.K % metal_fragment != 0);
+        const size_t rows = std::min(rows_per_tile,args.I);
+        // Batch more independent columns; K fragments and each output's accumulation order stay fixed.
+        columns_per_tile = std::min({gemmini_gpu::max_columns,max_elements / args.K,
+                                     max_elements / rows / fragments});
+        if (columns_per_tile == 0) return MatMulStatus::invalid_contract;
+    }
+#endif
     const size_t row_tile_count =
         args.I / rows_per_tile + static_cast<size_t>(args.I % rows_per_tile != 0);
     const size_t column_tile_count =
@@ -708,22 +719,31 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args, bool s
             scratch.accumulations.begin(),
             row_count * column_count, 0.0);
 
-#if defined(GGML_GEMMINI_METAL_CPU_EXACT)
+#if defined(GGML_GEMMINI_METAL_CPU_EXACT) || defined(GGML_GEMMINI_CUDA_CPU_EXACT)
         if (metal_raw_dot) {
             for (size_t row = 0; row < row_count; ++row) {
                 for (size_t k = 0; k < args.K; ++k) {
                     scratch.metal_activation[row * args.K + k] = args.A.get(row_begin + row, k);
                 }
             }
-            for (size_t column = 0; column < column_count; ++column) {
+            const bool packed_hp1=plan.route==WeightRouteKind::HP1 && args.K%32==0 &&
+                (plan.weight_bits==4 ? args.native_blocks_per_row : args.q8_hp1_blocks_per_row)==args.K/32;
+            for (size_t column = 0; !packed_hp1 && column < column_count; ++column) {
                 for (size_t k = 0; k < args.K; ++k) {
                     const auto code = read_code_validated(args, plan, column_begin + column, k);
                     if (!code.ok()) { execution_valid.store(false); return; }
                     scratch.metal_weight[column * args.K + k] = code.value;
                 }
             }
-            if (!ggml_metal_cpu_exact_int_dot(scratch.metal_activation.data(), scratch.metal_weight.data(),
-                    row_count, column_count, args.K, metal_fragment, scratch.metal_dots.data())) {
+            const void * packed=plan.weight_bits==4
+                ? static_cast<const void *>(args.q4_hp1_blocks ? args.q4_hp1_blocks+column_begin*(args.K/32) : nullptr)
+                : static_cast<const void *>(args.q8_hp1_blocks ? args.q8_hp1_blocks+column_begin*(args.K/32) : nullptr);
+            const bool success=packed_hp1
+                ? gemmini_gpu::hp1_dot(scratch.metal_activation.data(),packed,plan.weight_bits,
+                    row_count,column_count,args.K,metal_fragment,scratch.metal_dots.data())
+                : gemmini_gpu::int_dot(scratch.metal_activation.data(),scratch.metal_weight.data(),
+                    row_count,column_count,args.K,metal_fragment,scratch.metal_dots.data());
+            if (!success) {
                 execution_valid.store(false);
                 return;
             }
@@ -978,8 +998,8 @@ MatMulStatus execute_dense(ggml_gemmini_args_t &args, std::optional<uint64_t> st
             return MatMulStatus::unsupported;
         }
         test_detail::observe_backend_dispatch(true);
-#if defined(GGML_GEMMINI_METAL_CPU_EXACT)
-        if (ggml_metal_cpu_exact_int_enabled()) {
+#if defined(GGML_GEMMINI_METAL_CPU_EXACT) || defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+        if (gemmini_gpu::enabled()) {
             return execute_native_matched_int_dense(args, true);
         }
 #endif
@@ -994,8 +1014,8 @@ MatMulStatus execute_dense(ggml_gemmini_args_t &args, std::optional<uint64_t> st
         test_detail::observe_backend_dispatch(true);
         return execute_native_matched_int_dense(args);
     }
-#if defined(GGML_GEMMINI_METAL_CPU_EXACT)
-    if (ggml_metal_cpu_exact_int_enabled() && args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1) {
+#if defined(GGML_GEMMINI_METAL_CPU_EXACT) || defined(GGML_GEMMINI_CUDA_CPU_EXACT)
+    if (gemmini_gpu::enabled() && args.weight_format == ggml_gemmini_args_t::im2p_weight_format_t::q8_hp1) {
         if (args.tiled_matmul_type != CPU) return MatMulStatus::unsupported;
         test_detail::observe_backend_dispatch(true);
         return execute_native_matched_int_dense(args, false, true);

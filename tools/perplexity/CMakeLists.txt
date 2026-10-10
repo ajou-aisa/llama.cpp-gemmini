@@ -3,7 +3,7 @@ add_executable(${TARGET} perplexity.cpp)
 install(TARGETS ${TARGET} RUNTIME)
 target_link_libraries(${TARGET} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
-if(GGML_GEMMINI_METAL_CPU_EXACT)
+if(GGML_GEMMINI_METAL_CPU_EXACT OR GGML_GEMMINI_CUDA_CPU_EXACT)
     target_link_libraries(${TARGET} PRIVATE ggml-gemmini)
     target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
     target_compile_definitions(${TARGET} PRIVATE PERPLEXITY_METAL_CPU_EXACT=1

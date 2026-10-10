@@ -183,6 +183,23 @@ option(GGML_KOMPUTE                         "ggml: use Kompute"                 
 option(GGML_METAL                           "ggml: use Metal"                                 ${GGML_METAL_DEFAULT})
 option(GGML_METAL_QUANTIZED                 "ggml: exact block/HP1 Metal integer matmul with CPU activation producer" OFF)
 option(GGML_GEMMINI_METAL_CPU_EXACT         "ggml: Metal dense compute inside the original Gemmini CPU graph" OFF)
+option(GGML_GEMMINI_CUDA_CPU_EXACT          "ggml: CUDA A4/A8 compute inside the original Gemmini CPU graph" OFF)
+if (GGML_GEMMINI_CUDA_CPU_EXACT)
+    if (NOT GGML_GEMMINI OR GGML_GEMMINI_METAL_CPU_EXACT OR GGML_METAL OR GGML_METAL_QUANTIZED OR GGML_CUDA OR GGML_BACKEND_DL)
+        message(FATAL_ERROR "CPU-equivalent CUDA requires GGML_GEMMINI=ON and other GPU backends and BACKEND_DL=OFF")
+    endif()
+    if (NOT GGML_GEMMINI_OPTION STREQUAL "CPU" OR CYCLE_SIM OR
+        NOT GGML_GEMMINI_COMPUTE_TYPE STREQUAL "INT" OR
+        NOT GGML_GEMMINI_ACTIVATION_BITS MATCHES "^(4|8)$" OR
+        NOT GGML_GEMMINI_ACTIVATION_BITS STREQUAL GGML_GEMMINI_WEIGHT_BITS)
+        message(FATAL_ERROR "CPU-equivalent CUDA supports CPU, CYCLE_SIM=OFF and matched INT A4W4/A8W8 profiles")
+    endif()
+    if (NOT GGML_GEMMINI_ACTIVATION_QUANT MATCHES "^(BLOCK|EXSIA)$" OR
+        NOT GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "HARDWARE" OR GGML_GEMMINI_DEQUANT_FP_TEST OR
+        (GGML_GEMMINI_ACTIVATION_QUANT STREQUAL "BLOCK" AND GGML_GEMMINI_ENABLE_RMD))
+        message(FATAL_ERROR "CPU-equivalent CUDA requires the CPU-direct BLOCK (RMD OFF) or EXSIA profile, HARDWARE dispatch and DEQUANT_FP_TEST=OFF")
+    endif()
+endif()
 if (GGML_GEMMINI_METAL_CPU_EXACT)
     if (NOT APPLE OR NOT GGML_GEMMINI OR GGML_METAL OR GGML_METAL_QUANTIZED OR GGML_BACKEND_DL)
         message(FATAL_ERROR "CPU-equivalent Metal requires macOS, GGML_GEMMINI=ON, GGML_METAL=OFF, GGML_METAL_QUANTIZED=OFF and GGML_BACKEND_DL=OFF")
