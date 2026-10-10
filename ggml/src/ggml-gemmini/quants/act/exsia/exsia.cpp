@@ -1334,6 +1334,24 @@ namespace ggml::gemmini::quants::act::exsia
         GGML_ASSERT(valid_count <= block_size);
         (void) local_row;
         (void) blk_idx;
+#if !GGML_GEMMINI_EXSIA_OUTLIER_SELECTION
+        block_mask.clear();
+        scratch.block.reset();
+        scratch.block.blk_size = block_size;
+        block_exp_out = std::numeric_limits<int16_t>::min();
+        for (size_t i = 0; i < valid_count; ++i)
+            block_exp_out = std::max(block_exp_out, unit_exp_.unbiased_exp(x[i]));
+        const int16_t theta = exp_to_theta(block_exp_out, meta.rho);
+        for (size_t i = 0; i < block_size; ++i)
+            q_out[i] = i < valid_count && theta != std::numeric_limits<int16_t>::min()
+                ? quantize_to_i32(x[i], theta) : 0;
+        scratch.block.e_b = block_exp_out;
+        scratch.block.theta_b = theta;
+#if EXSIA_BRANCH_COUNTS_ENABLED
+        cycle_sample = LocalBlockCycleSample{};
+#endif
+        return true;
+#endif
 #if GGML_GEMMINI_ACT_QUANT_METRICS
         scratch.actual_requantized = false;
 #endif
@@ -1978,7 +1996,7 @@ namespace ggml::gemmini::quants::act::exsia
             stripe.e_s = 0;
             stripe.promote_top_block = false;
         }
-        else if (stripe.e2 == neg_inf)
+        else if (stripe.e2 == neg_inf || !GGML_GEMMINI_EXSIA_OUTLIER_SELECTION)
         {
             stripe.e_s = stripe.e1;
             stripe.promote_top_block = false;

@@ -6,6 +6,9 @@
 #include "../../quants/act/dispatch.hpp"
 #include "../../quants/common/weight_reader.hpp"
 #include "../../quants/common/weight_route.hpp"
+#if defined(GGML_GEMMINI_METAL_CPU_EXACT)
+#include "../../../ggml-metal/ggml-metal-cpu-exact-int.h"
+#endif
 #include <gemmini/cpu-timing.h>
 #include <gemmini/log.h>
 #if LOG_CYCLE
@@ -241,7 +244,13 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
     const bool native_q8_route = plan.native_weight_blocks &&
         plan.weight_bits == 8 &&
         (plan.route == wroute::WeightRouteKind::H1 ||
-         plan.route == wroute::WeightRouteKind::HP1);
+          plan.route == wroute::WeightRouteKind::HP1);
+    bool gather_native_codes = false;
+#if defined(GGML_GEMMINI_METAL_CPU_EXACT)
+    gather_native_codes = ggml_metal_cpu_exact_int_enabled() && DIM >= kJTile &&
+        plan.native_weight_blocks && (plan.weight_bits == 4 || plan.weight_bits == 8) &&
+        (plan.route == wroute::WeightRouteKind::H1 || plan.route == wroute::WeightRouteKind::HP1);
+#endif
 
     size_t output_count = 0;
     if (!checked_size_product(payload.row_count, payload.logical_j, output_count))
@@ -279,6 +288,44 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
         return rmd::RmdStatus::allocation_failure;
     }
 
+#if defined(GGML_GEMMINI_METAL_CPU_EXACT)
+    if (ggml_metal_cpu_exact_int_enabled() && !fully_scaled && plan.native_weight_blocks &&
+        plan.route == wroute::WeightRouteKind::HP1 && (plan.weight_bits == 4 || plan.weight_bits == 8) &&
+        args.K % 32 == 0) {
+        const size_t stride = plan.weight_bits == 4 ? args.native_blocks_per_row : args.q8_hp1_blocks_per_row;
+        if (stride != args.K / 32 || payload.events.size() > UINT32_MAX ||
+            payload.row_count >= UINT32_MAX || payload.logical_k > UINT32_MAX)
+            return rmd::RmdStatus::invalid_arguments;
+        std::vector<uint32_t> row_offsets;
+        std::vector<ggml_metal_residual_event> events;
+        try {
+            row_offsets.assign(payload.row_count + 1,0);
+            events.reserve(payload.events.size());
+            for (const auto & event : payload.events) {
+                ++row_offsets[event.local_row + 1];
+                events.push_back({uint32_t(event.original_k),event.residual});
+            }
+            for (size_t row = 1; row < row_offsets.size(); ++row) row_offsets[row] += row_offsets[row-1];
+        } catch (const std::bad_alloc &) { return rmd::RmdStatus::allocation_failure; }
+        const void * weights = plan.weight_bits == 4 ? static_cast<const void *>(args.q4_hp1_blocks)
+                                                     : static_cast<const void *>(args.q8_hp1_blocks);
+        const size_t weight_bytes = plan.weight_bits == 4 ? args.native_weight_bytes
+                                                         : args.q8_hp1_block_count * sizeof(block_q8_hp1);
+        const auto status = ggml_metal_cpu_exact_hp1_residual(weights,weight_bytes,plan.weight_bits,
+            payload.row_count,payload.logical_j,payload.logical_k,row_offsets.data(),events.data(),events.size(),
+            staged_integer.data());
+        if (status != ggml_metal_residual_status::success)
+            return status == ggml_metal_residual_status::overflow ? rmd::RmdStatus::overflow : rmd::RmdStatus::execution_failed;
+        rmd::DirectOutput staged_output = rmd::BlockScaledInt64Correction{std::move(staged_integer)};
+        correction.swap(staged_output);
+        if (metrics) {
+            metrics->event_count = payload.events.size(); metrics->call_count = 1;
+            metrics->native_q8_values = native_q8_route ? payload.events.size()*payload.logical_j : 0;
+            metrics->j_tile_count = 0; metrics->cpu_tiles.clear();
+        }
+        return rmd::RmdStatus::success;
+    }
+#endif
     const size_t j_tile_count =
         (payload.logical_j + kJTile - 1) / kJTile;
 #if LOG_CYCLE && CYCLE_DETAIL
@@ -361,18 +408,39 @@ rmd::RmdStatus execute_direct_stripe(const ggml_gemmini_args_t & args,
                 stage_probe.next(1);
 #endif
                 std::array<int64_t, kJTile> block_sum{};
-                for (size_t local_j = 0; local_j < tile_j; ++local_j) {
-                    const size_t j = j_begin + local_j;
-                    for (size_t index = event_index; index < span_end; ++index) {
-                        const ResidualEvent & event = payload.events[index];
-                        const wreader::WeightCodeResult code = wreader::read_code_validated(
-                            args, plan, j, event.original_k);
-                        if (!code.ok()) return reader_failure(code.status);
-                        // A block has at most 32 signed INT16 codes and INT32
-                        // residuals, so its complete dot product fits in INT64.
-                        block_sum[local_j] +=
-                            static_cast<int64_t>(event.residual) * code.value;
-                        if (native_q8_route) ++native_q8_values;
+                if (gather_native_codes) {
+                    std::array<uint16_t, DIM> local_k{};
+                    std::array<int32_t, DIM * DIM> codes{};
+                    for (size_t begin = event_index; begin < span_end; begin += DIM) {
+                        const size_t selected = std::min(size_t(DIM), span_end - begin);
+                        for (size_t index = 0; index < selected; ++index)
+                            local_k[index] = payload.events[begin + index].original_k % rmd::kBlockSize;
+                        size_t resolutions = 0;
+                        const auto status = wreader::read_code_tile_validated(
+                            args, plan, block_id, local_k.data(), selected, j_begin, tile_j,
+                            codes.data(), resolutions);
+                        if (status != wreader::WeightReaderStatus::Success) return reader_failure(status);
+                        for (size_t index = 0; index < selected; ++index) {
+                            const int64_t residual = payload.events[begin + index].residual;
+                            for (size_t local_j = 0; local_j < tile_j; ++local_j)
+                                block_sum[local_j] += residual * codes[index * DIM + local_j];
+                        }
+                        if (native_q8_route) native_q8_values += selected * tile_j;
+                    }
+                } else {
+                    for (size_t local_j = 0; local_j < tile_j; ++local_j) {
+                        const size_t j = j_begin + local_j;
+                        for (size_t index = event_index; index < span_end; ++index) {
+                            const ResidualEvent & event = payload.events[index];
+                            const wreader::WeightCodeResult code = wreader::read_code_validated(
+                                args, plan, j, event.original_k);
+                            if (!code.ok()) return reader_failure(code.status);
+                            // A block has at most 32 signed INT16 codes and INT32
+                            // residuals, so its complete dot product fits in INT64.
+                            block_sum[local_j] +=
+                                static_cast<int64_t>(event.residual) * code.value;
+                            if (native_q8_route) ++native_q8_values;
+                        }
                     }
                 }
 

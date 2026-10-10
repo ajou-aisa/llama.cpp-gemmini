@@ -1640,6 +1640,13 @@ add_compile_definitions(
     GGML_GEMMINI_ACT_QUANT_METRICS=${GGML_GEMMINI_ACT_QUANT_METRICS}
     GGML_GEMMINI_RESIDUAL_METRICS=${GGML_GEMMINI_RESIDUAL_METRICS})
 if (GGML_GEMMINI_METAL_CPU_EXACT)
+    add_executable(test-metal-ablation test-metal-ablation.cpp)
+    target_compile_features(test-metal-ablation PRIVATE cxx_std_17)
+    target_compile_definitions(test-metal-ablation PRIVATE ${GGML_GEMMINI_COMPILE_DEFS})
+    target_include_directories(test-metal-ablation PRIVATE
+        ../ggml/src/ggml-metal ../ggml/src/ggml-gemmini ../ggml/src)
+    target_link_libraries(test-metal-ablation PRIVATE ggml-gemmini ggml-gemmini-metal-cpu-exact ggml ggml-base ggml-gemmini-utils)
+    add_test(NAME test-metal-ablation COMMAND test-metal-ablation)
     add_executable(test-metal-cpu-exact-float test-metal-cpu-exact-float.cpp)
     target_compile_features(test-metal-cpu-exact-float PRIVATE cxx_std_17)
     target_compile_definitions(test-metal-cpu-exact-float PRIVATE ${GGML_GEMMINI_COMPILE_DEFS})
@@ -1665,7 +1672,9 @@ if (GGML_GEMMINI_METAL_CPU_EXACT)
         EVALUATION_EXACT_COMPUTE="${GGML_GEMMINI_COMPUTE_TYPE}"
         EVALUATION_EXACT_ACTIVATION="${GGML_GEMMINI_ACTIVATION_QUANT}"
         EVALUATION_EXACT_BITS=${GGML_GEMMINI_ACTIVATION_BITS}
-        EVALUATION_EXACT_DIM=${GGML_GEMMINI_DIM})
+        EVALUATION_EXACT_DIM=${GGML_GEMMINI_DIM}
+        EVALUATION_EXACT_SELECTION=$<BOOL:${GGML_GEMMINI_EXSIA_OUTLIER_SELECTION}>
+        EVALUATION_EXACT_RMD=$<BOOL:${GGML_GEMMINI_ENABLE_RMD}>)
     target_include_directories(test-metal-cpu-exact-graph PRIVATE
         ../ggml/src/ggml-metal ../ggml/src)
     target_link_libraries(test-metal-cpu-exact-graph PRIVATE common ggml ggml-gemmini ggml-cpu ggml-base)

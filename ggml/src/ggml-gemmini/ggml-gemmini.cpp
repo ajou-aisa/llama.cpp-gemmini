@@ -51,6 +51,7 @@
 #include "ggml-gemmini-im2p.hpp"
 #endif
 #include "quants/act/quantize.hpp"
+#include "quants/act/block/block.hpp"
 #include "quants/weight/quantize_Q8_H1.hpp"
 #include "quants/weight/unpack_Q8_0.hpp"
 //#include "quantization/ggml-gemmini-quantize.h"
@@ -74,6 +75,76 @@
 
 namespace
 {
+#if defined(GGML_GEMMINI_METAL_CPU_EXACT)
+    bool gemmini_q6_block_supported(const ggml_tensor * op) {
+        const char * enabled=std::getenv("GGML_GEMMINI_METAL_CPU_EXACT_Q6_HEAD");
+        const auto * w=op->src[0];
+        const auto * x=op->src[1];
+        return enabled && std::strcmp(enabled,"1")==0 &&
+            ggml::gemmini::config::CURRENT_COMPUTE_TYPE==ggml::gemmini::config::ComputeType::INT &&
+            ggml::gemmini::config::CURRENT_ACTIVATION_QUANT==ggml::gemmini::config::ActivationQuantAlgo::BLOCK &&
+            !GGML_GEMMINI_ENABLE_RMD && w && x && w->type==GGML_TYPE_Q6_K && x->type==GGML_TYPE_F32 &&
+            op->type==GGML_TYPE_F32 && w->ne[0]>0 && w->ne[0]%256==0 && w->ne[1]>0 &&
+            w->ne[0]==x->ne[0] && w->ne[2]==1 && w->ne[3]==1 && x->ne[2]==1 && x->ne[3]==1 &&
+            ggml_is_contiguous(w) && ggml_is_contiguous(x) && ggml_is_contiguous(op) &&
+            (std::strcmp(w->name,"output.weight")==0 || std::strcmp(w->name,"token_embd.weight")==0);
+    }
+
+    bool gemmini_q6_block_matmul(const ggml_tensor * x, const ggml_tensor * w, float * output) {
+        using namespace ggml::gemmini;
+        const size_t rows=ggml_nrows(x), columns=w->ne[1], k=w->ne[0], fragments=k/16;
+        if (!rows || !columns || !k || k%256 || rows>SIZE_MAX/columns || !x->data || !w->data || !output) return false;
+        ggml_gemmini_args_t args{};
+        args.I=rows; args.J=columns; args.K=k; args.sA=k;
+        args.tile_I=1; args.tile_J=1; args.tile_K=2; args.activation_rows_per_stripe=DIM;
+        args.residual_route=residual::ResidualRoute::cpu_direct;
+        if (!args.A.allocate(rows,k,GGML_GEMMINI_ACTIVATION_BITS)) return false;
+        auto & meta=args.act_quant.storage().emplace<quants::act::block::Meta>();
+        if (!quants::act::block::quantize(x,args)) return false;
+        std::vector<float> staged(rows*columns);
+        const auto * weights=static_cast<const block_q6_K *>(w->data);
+        for (size_t row_begin=0;row_begin<rows;row_begin+=128) {
+            const size_t m=std::min(size_t(128),rows-row_begin);
+            std::vector<int32_t> activation(m*k);
+            for (size_t r=0;r<m;++r) for (size_t t=0;t<k;++t) activation[r*k+t]=args.A.get(row_begin+r,t);
+            for (size_t col_begin=0;col_begin<columns;col_begin+=GGML_METAL_CPU_EXACT_MAX_COLUMNS) {
+                const size_t n=std::min(GGML_METAL_CPU_EXACT_MAX_COLUMNS,columns-col_begin);
+                std::vector<int32_t> dots(fragments*m*n);
+                const auto * tile=weights+col_begin*(k/256);
+                if (ggml_metal_cpu_exact_int_enabled()) {
+                    if (!ggml_metal_cpu_exact_q6_dot(activation.data(),tile,m,n,k,dots.data())) return false;
+                } else {
+                    for (size_t b=0;b<fragments;++b) for (size_t r=0;r<m;++r) for (size_t c=0;c<n;++c) {
+                        const auto & block=tile[c*(k/256)+b/16];
+                        int32_t dot=0;
+                        for (size_t t=b*16;t<(b+1)*16;++t) {
+                            const size_t local=t%256, half=local/128, quarter=(local%128)/32, l=local%32;
+                            const int code=int(((block.ql[half*64+(quarter%2)*32+l]>>(quarter>=2 ? 4 : 0))&15) |
+                                (((block.qh[half*32+l]>>(2*quarter))&3)<<4))-32;
+                            dot+=activation[r*k+t]*code;
+                        }
+                        dots[(b*m+r)*n+c]=dot;
+                    }
+                }
+                std::vector<double> sums(m*n,0.0), scales(n);
+                for (size_t b=0;b<fragments;++b) {
+                    for (size_t c=0;c<n;++c) {
+                        const auto & block=tile[c*(k/256)+b/16];
+                        scales[c]=double(ggml_fp16_to_fp32(block.d))*block.scales[b%16];
+                        if (!std::isfinite(scales[c])) return false;
+                    }
+                    for (size_t r=0;r<m;++r) {
+                        const double scale=meta.scales[(row_begin+r)*(k/32)+b/2];
+                        for (size_t c=0;c<n;++c) sums[r*n+c]+=double(dots[(b*m+r)*n+c])*scales[c]*scale;
+                    }
+                }
+                for (size_t r=0;r<m;++r) for (size_t c=0;c<n;++c) staged[(row_begin+r)*columns+col_begin+c]=float(sums[r*n+c]);
+            }
+        }
+        std::memcpy(output,staged.data(),staged.size()*sizeof(float));
+        return true;
+    }
+#endif
     constexpr bool gemmini_hp1_native_weight_supported(
             ggml_type type,
             int activation_bits = GGML_GEMMINI_ACTIVATION_BITS,
@@ -193,6 +264,12 @@ namespace
     }
 
     bool gemmini_is_extended_dequant_weight_type(ggml_type type) {
+#if defined(GGML_GEMMINI_METAL_CPU_EXACT)
+        if (type == GGML_TYPE_Q6_K && ggml_metal_cpu_exact_activation_fp16_enabled() &&
+            ggml::gemmini::config::CURRENT_COMPUTE_TYPE == ggml::gemmini::config::ComputeType::FLOAT) {
+            return true;
+        }
+#endif
         return type == GGML_TYPE_Q4_0 ||
                type == GGML_TYPE_Q4_H1 ||
                type == GGML_TYPE_Q4_HP1 ||
@@ -1255,15 +1332,21 @@ static void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context *ctx,
             (long long) dst->ne[2], (long long) dst->ne[3],
             (long long) ggml_nrows(src1));
 
+#if defined(GGML_GEMMINI_METAL_CPU_EXACT)
+    if (gemmini_q6_block_supported(dst)) {
+        if (!gemmini_q6_block_matmul(src1,src0,static_cast<float *>(dst->data)))
+            GGML_ABORT("Q6_K head with RTN activation failed");
+        return;
+    }
+#endif
     if constexpr (ggml::gemmini::config::CURRENT_COMPUTE_TYPE == ggml::gemmini::config::ComputeType::FLOAT &&
                   !ggml::gemmini::config::DEQUANT_FP_TEST) {
 #if defined(GGML_GEMMINI_METAL_CPU_EXACT)
         if (ggml_metal_cpu_exact_int_enabled() &&
-            (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0)) {
-            std::vector<float> src0_f32(jk_count);
-            ggml_get_type_traits(src0->type)->to_float(src0->data, src0_f32.data(), jk_count);
-            if (!ggml_metal_cpu_exact_float(I, J, K, static_cast<const float *>(src1->data),
-                                          src0_f32.data(), static_cast<float *>(dst->data))) {
+            (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0 ||
+             (src0->type == GGML_TYPE_Q6_K && ggml_metal_cpu_exact_activation_fp16_enabled()))) {
+            if (!ggml_metal_cpu_exact_float_quantized(I, J, K, static_cast<const float *>(src1->data),
+                                                    src0, static_cast<float *>(dst->data))) {
                 GGML_ABORT("CPU-equivalent Metal FLOAT failed: %s", ggml_metal_cpu_exact_last_error());
             }
             return;
@@ -2559,6 +2642,15 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
             ggml_backend_gemmini_get_rows_q8_channel(node->src[0], node->src[1], node);
             break;
         case GGML_OP_MUL_MAT: {
+#if defined(GGML_GEMMINI_METAL_CPU_EXACT)
+            if (ggml_metal_cpu_exact_attention_supported(node)) {
+                if (!ggml_metal_cpu_exact_attention(node)) {
+                    GGML_LOG_ERROR("Metal attention failed: %s\n",ggml_metal_cpu_exact_last_error());
+                    return GGML_STATUS_FAILED;
+                }
+                break;
+            }
+#endif
 #if LOG_DUMP
             const int32_t node_idx = node->ne[0] > 0 ? static_cast<int32_t>(node->ne[0]) : 1;
             ggml::gemmini::log::dump_set_node_idx(node_idx);
@@ -2782,6 +2874,9 @@ static bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_MUL_MAT:
         {
+#if defined(GGML_GEMMINI_METAL_CPU_EXACT)
+            if (ggml_metal_cpu_exact_attention_supported(op) || gemmini_q6_block_supported(op)) return true;
+#endif
             if (ggml_is_empty(op)) {
                 return true;
             }

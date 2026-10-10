@@ -12,6 +12,8 @@
 #include <cstring>
 #include <stdexcept>
 #include <vector>
+#include <cmath>
+#include <chrono>
 
 static void require(bool condition, const char * message) {
     if (!condition) { throw std::runtime_error(message); }
@@ -64,7 +66,7 @@ static void fixture(ggml_type type, size_t rows, bool negative=false, head_case 
     const bool q6=scenario != head_case::f16 && scenario != head_case::missing_q6;
     const bool optin=scenario != head_case::f16 && scenario != head_case::q6_optout;
     const bool reject=scenario == head_case::q6_optout || scenario == head_case::q6_wrong_weight ||
-                      scenario == head_case::q6_wrong_result || scenario == head_case::missing_q6;
+                      scenario == head_case::q6_wrong_result || scenario == head_case::missing_q6 || q6;
     const size_t n=q6 ? 256 : 32;
     if (optin) {
         require(setenv("GGML_GEMMINI_METAL_CPU_EXACT_Q6_HEAD","1",1)==0,"Head environment update failed");
@@ -219,8 +221,75 @@ static void hp1_missing_gpu_proof(ggml_type type) {
     std::printf("PASS HP1 proof callback rejects missing GPU execution\n");
 }
 
+static void attention_fixture(size_t k, size_t rows, size_t columns, int scenario) {
+    ggml_context * ctx=ggml_init({16<<20,nullptr,false});
+    require(ctx != nullptr,"Attention context failed");
+    ggml_backend_t cpu=ggml_backend_cpu_init(), metal=ggml_backend_gemmini_init();
+    require(cpu && metal,"Attention backends failed");
+    ggml_backend_cpu_set_n_threads(cpu,4);
+    auto * wb=ggml_new_tensor_4d(ctx,GGML_TYPE_F16,k,columns+2,2,1);
+    auto * xb=ggml_new_tensor_4d(ctx,GGML_TYPE_F32,k,rows+3,4,2);
+    auto * w=ggml_view_4d(ctx,wb,k,columns,2,1,wb->nb[1],wb->nb[2],wb->nb[3],wb->nb[1]);
+    auto * x=ggml_view_4d(ctx,xb,k,rows,4,2,xb->nb[1],xb->nb[2],xb->nb[3],xb->nb[1]);
+    auto * result=ggml_mul_mat(ctx,w,x);
+    ggml_mul_mat_set_prec(result,GGML_PREC_F32);
+    ggml_set_name(result,"attention.fixture");
+    for (int64_t i=0;i<ggml_nelements(wb);++i) {
+        float value=float(int((i*53)%257)-128)/113.0f;
+        if (scenario==1) value=std::ldexp(value,-18);
+        if (scenario==2) value=std::ldexp(value,int(i%21)-15);
+        static_cast<ggml_fp16_t *>(wb->data)[i]=ggml_fp32_to_fp16(value);
+    }
+    for (int64_t i=0;i<ggml_nelements(xb);++i) {
+        float value=float(int((i*71)%257)-128)/139.0f;
+        if (scenario==2) value=std::ldexp(value,int(i%19)-12);
+        static_cast<float *>(xb->data)[i]=value;
+    }
+    auto * graph=ggml_new_graph_custom(ctx,64,false);
+    ggml_build_forward_expand(graph,result);
+    require(setenv("GGML_GEMMINI_METAL_CPU_EXACT","0",1)==0,"Attention CPU env failed");
+    require(!ggml_metal_cpu_exact_attention_supported(result),"Attention enabled during CPU reference");
+    const auto start=std::chrono::steady_clock::now();
+    require(ggml_backend_graph_compute(cpu,graph)==GGML_STATUS_SUCCESS,"Attention CPU failed");
+    const auto middle=std::chrono::steady_clock::now();
+    std::vector<uint8_t> expected(ggml_nbytes(result));
+    std::memcpy(expected.data(),result->data,expected.size());
+    require(setenv("GGML_GEMMINI_METAL_CPU_EXACT","1",1)==0,"Attention GPU env failed");
+    require(ggml_backend_supports_op(metal,result),"Attention GPU admission failed");
+    if (k==64 && rows==1 && scenario==0) {
+        common_params params; params.n_gpu_layers=0; params.warmup=false;
+        perplexity_metal_cpu_exact_guard guard;
+        guard.install(params);
+        require(params.cb_eval(result,true,params.cb_eval_user_data),"Attention proof did not request observation");
+        require(!params.cb_eval(result,false,params.cb_eval_user_data) && guard.failed,
+                "Attention proof accepted missing GPU execution");
+    }
+    const uint64_t before=ggml_metal_cpu_exact_attention_calls();
+    require(ggml_backend_graph_compute(metal,graph)==GGML_STATUS_SUCCESS,"Attention Metal failed");
+    const auto end=std::chrono::steady_clock::now();
+    require(ggml_metal_cpu_exact_attention_calls()==before+1,"Attention did not execute on GPU");
+    if (std::memcmp(expected.data(),result->data,expected.size())) {
+        for (size_t i=0;i<expected.size()/4;++i) {
+            uint32_t a,b; std::memcpy(&a,expected.data()+i*4,4); std::memcpy(&b,static_cast<char *>(result->data)+i*4,4);
+            if (a!=b) { std::fprintf(stderr,"Attention mismatch k=%zu scenario=%d index=%zu cpu=%08x gpu=%08x\n",k,scenario,i,a,b); break; }
+        }
+        throw std::runtime_error("Attention CPU/Metal bitwise mismatch");
+    }
+    std::printf("PASS attention k=%zu rows=%zu columns=%zu scenario=%d strided GQA broadcast bitwise cpu_ms=%.3f gpu_ms=%.3f\n",
+        k,rows,columns,scenario,std::chrono::duration<double,std::milli>(middle-start).count(),
+        std::chrono::duration<double,std::milli>(end-middle).count());
+    ggml_backend_free(cpu); ggml_backend_free(metal); ggml_free(ctx);
+}
+
 int main() {
     try {
+        for (int scenario=0;scenario<3;++scenario) {
+            attention_fixture(64,1,19,scenario);
+            attention_fixture(128,7,37,scenario);
+            attention_fixture(512,7,19,scenario);
+        }
+        attention_fixture(64,512,512,0);
+        attention_fixture(512,512,64,0);
         std::vector<ggml_type> types;
         if (TEST_CPU_EXACT_FLOAT) { types={GGML_TYPE_Q4_0,GGML_TYPE_Q8_0}; }
         else if (TEST_CPU_EXACT_HP1) { types={GGML_GEMMINI_ACTIVATION_BITS == 4 ? GGML_TYPE_Q4_HP1 : GGML_TYPE_Q8_HP1}; }

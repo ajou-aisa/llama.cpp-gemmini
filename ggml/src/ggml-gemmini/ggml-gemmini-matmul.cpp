@@ -538,8 +538,19 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args, bool s
     }
 #endif
     const size_t rows_per_tile = metal_raw_dot ? 128 : args.tile_I * DIM;
-    const size_t columns_per_tile = metal_raw_dot ? 128 : args.tile_J * DIM;
     const size_t metal_fragment = (stored_block || legacy_hp1) && (args.tile_K * DIM) % 32 != 0 ? 16 : 32;
+    size_t columns_per_tile = args.tile_J * DIM;
+#if defined(GGML_GEMMINI_METAL_CPU_EXACT)
+    if (metal_raw_dot) {
+        constexpr size_t max_elements = 16 * 1024 * 1024;
+        const size_t fragments = args.K / metal_fragment + size_t(args.K % metal_fragment != 0);
+        const size_t rows = std::min(rows_per_tile,args.I);
+        // Batch more independent columns; K fragments and each output's accumulation order stay fixed.
+        columns_per_tile = std::min({GGML_METAL_CPU_EXACT_MAX_COLUMNS,max_elements / args.K,
+                                     max_elements / rows / fragments});
+        if (columns_per_tile == 0) return MatMulStatus::invalid_contract;
+    }
+#endif
     const size_t row_tile_count =
         args.I / rows_per_tile + static_cast<size_t>(args.I % rows_per_tile != 0);
     const size_t column_tile_count =
@@ -715,15 +726,31 @@ MatMulStatus execute_native_matched_int_dense(ggml_gemmini_args_t & args, bool s
                     scratch.metal_activation[row * args.K + k] = args.A.get(row_begin + row, k);
                 }
             }
-            for (size_t column = 0; column < column_count; ++column) {
+            const bool packed_hp1=plan.route==WeightRouteKind::HP1 && args.K%32==0 &&
+                (plan.weight_bits==4 ? args.native_blocks_per_row : args.q8_hp1_blocks_per_row)==args.K/32;
+            const bool packed_block=stored_block && args.K%32==0;
+            for (size_t column = 0; !packed_hp1 && !packed_block && column < column_count; ++column) {
                 for (size_t k = 0; k < args.K; ++k) {
                     const auto code = read_code_validated(args, plan, column_begin + column, k);
                     if (!code.ok()) { execution_valid.store(false); return; }
                     scratch.metal_weight[column * args.K + k] = code.value;
                 }
             }
-            if (!ggml_metal_cpu_exact_int_dot(scratch.metal_activation.data(), scratch.metal_weight.data(),
-                    row_count, column_count, args.K, metal_fragment, scratch.metal_dots.data())) {
+            const void * packed=plan.weight_bits==4
+                ? static_cast<const void *>(args.q4_hp1_blocks ? args.q4_hp1_blocks+column_begin*(args.K/32) : nullptr)
+                : static_cast<const void *>(args.q8_hp1_blocks ? args.q8_hp1_blocks+column_begin*(args.K/32) : nullptr);
+            const void * stored=plan.weight_bits==4
+                ? static_cast<const void *>(args.q4_h0_blocks ? args.q4_h0_blocks+column_begin*(args.K/32) : nullptr)
+                : static_cast<const void *>(args.B_blocks ? args.B_blocks+column_begin*(args.K/32) : nullptr);
+            const bool success=packed_block
+                ? ggml_metal_cpu_exact_block_dot(scratch.metal_activation.data(),stored,plan.weight_bits,
+                    row_count,column_count,args.K,metal_fragment,scratch.metal_dots.data())
+                : packed_hp1
+                ? ggml_metal_cpu_exact_hp1_dot(scratch.metal_activation.data(),packed,plan.weight_bits,
+                    row_count,column_count,args.K,metal_fragment,scratch.metal_dots.data())
+                : ggml_metal_cpu_exact_int_dot(scratch.metal_activation.data(),scratch.metal_weight.data(),
+                    row_count,column_count,args.K,metal_fragment,scratch.metal_dots.data());
+            if (!success) {
                 execution_valid.store(false);
                 return;
             }
