@@ -1,0 +1,16 @@
+Internal ctest changing into directory: /home/dyndnn/Projects/llama.cpp-gemmini/build-potal-outlier-after
+Test project /home/dyndnn/Projects/llama.cpp-gemmini/build-potal-outlier-after
+    Start 61: gemmini_exsia_all
+1/5 Test #61: gemmini_exsia_all ....................   Passed    0.03 sec
+    Start 62: gemmini_exsia_baseline
+2/5 Test #62: gemmini_exsia_baseline ...............   Passed    0.02 sec
+    Start 63: gemmini_exsia_dispatch
+3/5 Test #63: gemmini_exsia_dispatch ...............   Passed    0.02 sec
+    Start 65: gemmini_exsia_stripe_geometry
+4/5 Test #65: gemmini_exsia_stripe_geometry ........   Passed    0.02 sec
+    Start 67: gemmini_exsia_a4_source_zero_sigma
+5/5 Test #67: gemmini_exsia_a4_source_zero_sigma ...   Passed    0.02 sec
+
+100% tests passed, 0 tests failed out of 5
+
+Total Test time (real) =   0.13 sec

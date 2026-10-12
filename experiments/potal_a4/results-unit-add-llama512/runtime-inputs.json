@@ -1,0 +1,39 @@
+{
+  "dependencies_sha256": {
+    "build-potal-unit-add/libpotal-native-replay.so": "59facbabf1ae4bb1d131d73e251b7a98cef960f5b72fa40c0b4b4b671a6d1e0a",
+    "build-potal-unit-add-omp/bin/libggml.so": "970db70fbff10342e5b4207540bb537c07ebdb2f395e33779afd5f9d31c78ac8",
+    "build-potal-unit-add-omp/bin/libggml-gemmini.so": "47eac9a17d1540beffda514a4ed2b465aa1667805d43e0012f5f885cbf7c9507",
+    "build-potal-unit-add-omp/bin/libllama.so": "bdcd45a701e8de664e90fa1836ffe4f3937ce32c21c34f394fb2a68fb32344d3",
+    "build-potal-unit-add-omp/bin/libggml-cpu.so": "2636d994c9943aabb7628053bc6e491539403aa6a6582f730a3309d84237af4f",
+    "build-potal-unit-add-omp/bin/libggml-base.so": "08ae9616cfebef843ee04e342a9977ea5200ca743383b44f7b6c52392f93c821",
+    "build-potal-unit-add-omp/bin/libggml-gemmini-utils.so": "df53a533d3b2416efb36c925bb27643de78660772be7b2737b735edf92f7b855",
+    "build-potal-unit-add-omp/CMakeCache.txt": "52e2054e01c7866cc19f73a2e5308e4fa388a4046ba65034142e94ed5397d90b"
+  },
+  "OMP_NUM_THREADS": 6,
+  "OPENBLAS_NUM_THREADS": 2,
+  "native_ggml_threads": 4,
+  "source_sha256": {
+    "experiments/potal_a4/prepare.py": "ca981c8e0836c08341cc42322da831fb2a77cd44664be1178638de0856e8b8be",
+    "experiments/potal_a4/verify.py": "a6e87c1901d0c225fce77265ad1afb9c8c704a49912d4a2a6ab11a79c59b4115",
+    "experiments/potal_a4/matrix.py": "a41c935a3b6bf8ce2b4c4da5ee0cac4da8ad99784486c22a5cba3e663de597d3",
+    "experiments/potal_a4/attention.py": "d6305e210f51acc1da82617f9e9766d82fc40074bbda04063b1a7392af9bfdff",
+    "experiments/potal_a4/native_model.cpp": "388efedcdd83d47a9f0416bfb07064cdc11bdc5a8917b90d1590ea361f71f415",
+    "experiments/potal_a4/profile_report.py": "22bec0112d7d5fb9e228d0bf27ba6d65b373fbebc7a8aa173cceda73f5f52fe5",
+    "experiments/potal_a4/native_measure.py": "349b84df12d43f85ae233c00b8ddd47666d26d8f9caf09ca2b946651f9c01e62",
+    "experiments/potal_a4/packet.py": "a82bac62f891ac782634e26804ea404141a8f0c99b45e8c5c2fe55a7c17eabbb",
+    "experiments/potal_a4/stream.py": "c3ad50459ed834393bb1c309bff41d6f54a74c433d07bce0b653bb196b0bd9ff",
+    "experiments/potal_a4/model.py": "bfb3b44188b0f48fd793b79e5f9f69c5bb020b04127297bc9564a7cd14949e7f",
+    "experiments/potal_a4/profile_ops.py": "94f9996238ef1c0ff11665f228487311066d7a6f252208de45d684e36ca78a05",
+    "experiments/potal_a4/metrics.py": "5bf657681aadfa72291fc60a0a9eb1556842fddc77e7587995b612558615f087",
+    "experiments/potal_a4/native_probe.cpp": "133f19e629ca8e9d92d7f2049a7be5120af39ff5373cb1057486192e36e112a4",
+    "experiments/potal_a4/stress.py": "76b2cbad4a7e895c33d32bcc254b41d089eb5f7b813b72d7eea4d721cb16fa52",
+    "experiments/potal_a4/report.py": "92b8fda21ccb020a85ad672f3672843fc3b74748695dfaba6cecaa536252a309",
+    "experiments/potal_a4/run.py": "448230db7ce158e78e7747b0db654571e56715ad82f6cb800e26d6674f6054f5",
+    "experiments/potal_a4/im2p_raw_probe.cpp": "83c402bccba5b9c290f243a6e0b745adf020c8d705389b35a726e44e8c89a024",
+    "experiments/potal_a4/types.py": "0341e49a9cfa4ce8e7d5034020fcb987cc44af3982bba3d883841f1d5a365f93",
+    "experiments/potal_a4/profile_gemm.py": "d73c0f5365036c40edd329f435aa36bb7194b1da7a411d5c1449696e0b4f619e",
+    "experiments/potal_a4/profile_attention.py": "87ff6522988c16e162cd6b1ccb8c9923eede29514e36cc1122d948a0fcae852c",
+    "experiments/potal_a4/weight_check.py": "4774c37f0a3848ae2aa8ae1634008563e8f2a8c73af871a38f3e7f68f708e5a1"
+  },
+  "log": "/tmp/potal-unit-add-llama512.log"
+}

@@ -1,0 +1,151 @@
+make: Entering directory '/home/dyndnn/Projects/IM2P.sim'
+cmake -S sim/cycle -B "/tmp/potal-nano-cycle-model" -DCMAKE_BUILD_TYPE=Release
+-- The C compiler identification is GNU 13.3.0
+-- The CXX compiler identification is GNU 13.3.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE  
+-- Configuring done (1.0s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/potal-nano-cycle-model
+cmake --build "/tmp/potal-nano-cycle-model" --parallel 2
+gmake[1]: Entering directory '/tmp/potal-nano-cycle-model'
+gmake[2]: Entering directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Entering directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Leaving directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Entering directory '/tmp/potal-nano-cycle-model'
+[  3%] Building CXX object CMakeFiles/im2p_cycle_objects.dir/home/dyndnn/Projects/IM2P.sim/sim/common/gemmini_schedule.cpp.o
+[  7%] Building CXX object CMakeFiles/im2p_cycle_objects.dir/scheduled_work.cpp.o
+[ 11%] Building CXX object CMakeFiles/im2p_cycle_objects.dir/control_engine.cpp.o
+[ 15%] Building CXX object CMakeFiles/im2p_cycle_objects.dir/execute_engine.cpp.o
+[ 19%] Building CXX object CMakeFiles/im2p_cycle_objects.dir/c_api.cpp.o
+[ 23%] Building CXX object CMakeFiles/im2p_cycle_objects.dir/sequence_c_api.cpp.o
+gmake[3]: Leaving directory '/tmp/potal-nano-cycle-model'
+[ 23%] Built target im2p_cycle_objects
+gmake[3]: Entering directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Entering directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Leaving directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Entering directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Leaving directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Entering directory '/tmp/potal-nano-cycle-model'
+[ 26%] Linking CXX static library libim2p_cycle_model.a
+[ 30%] Linking CXX shared library libim2p_cycle_model.so
+gmake[3]: Leaving directory '/tmp/potal-nano-cycle-model'
+[ 30%] Built target im2p_cycle_model_shared
+gmake[3]: Leaving directory '/tmp/potal-nano-cycle-model'
+[ 30%] Built target im2p_cycle_model
+gmake[3]: Entering directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Entering directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Leaving directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Leaving directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Entering directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Entering directory '/tmp/potal-nano-cycle-model'
+[ 38%] Building CXX object CMakeFiles/im2p_cycle_unit.dir/home/dyndnn/Projects/IM2P.sim/sim/tests/cycle/test_cycle_model.cpp.o
+[ 38%] Building CXX object CMakeFiles/im2p_cycle_probe.dir/home/dyndnn/Projects/IM2P.sim/sim/tests/cycle/probe.cpp.o
+[ 42%] Linking CXX executable im2p_cycle_probe
+gmake[3]: Leaving directory '/tmp/potal-nano-cycle-model'
+[ 42%] Built target im2p_cycle_probe
+gmake[3]: Entering directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Leaving directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Entering directory '/tmp/potal-nano-cycle-model'
+[ 46%] Building C object CMakeFiles/im2p_cycle_c_abi.dir/home/dyndnn/Projects/IM2P.sim/sim/tests/cycle/test_c_api.c.o
+[ 50%] Linking CXX executable im2p_cycle_c_abi
+gmake[3]: Leaving directory '/tmp/potal-nano-cycle-model'
+[ 50%] Built target im2p_cycle_c_abi
+gmake[3]: Entering directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Leaving directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Entering directory '/tmp/potal-nano-cycle-model'
+[ 53%] Building CXX object CMakeFiles/im2p_cycle_runs.dir/home/dyndnn/Projects/IM2P.sim/sim/tests/cycle/test_run_aware_cycle.cpp.o
+[ 57%] Linking CXX executable im2p_cycle_runs
+gmake[3]: Leaving directory '/tmp/potal-nano-cycle-model'
+[ 57%] Built target im2p_cycle_runs
+gmake[3]: Entering directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Leaving directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Entering directory '/tmp/potal-nano-cycle-model'
+[ 61%] Building CXX object CMakeFiles/im2p_cycle_service.dir/home/dyndnn/Projects/IM2P.sim/sim/tests/cycle/test_service_model.cpp.o
+[ 65%] Linking CXX executable im2p_cycle_unit
+gmake[3]: Leaving directory '/tmp/potal-nano-cycle-model'
+[ 65%] Built target im2p_cycle_unit
+gmake[3]: Entering directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Leaving directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Entering directory '/tmp/potal-nano-cycle-model'
+[ 69%] Building CXX object CMakeFiles/im2p_cycle_sequence_core.dir/home/dyndnn/Projects/IM2P.sim/sim/tests/cycle/test_sequence_session.cpp.o
+[ 73%] Linking CXX executable im2p_cycle_service
+gmake[3]: Leaving directory '/tmp/potal-nano-cycle-model'
+[ 73%] Built target im2p_cycle_service
+gmake[3]: Entering directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Leaving directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Entering directory '/tmp/potal-nano-cycle-model'
+[ 76%] Building C object CMakeFiles/im2p_cycle_sequence_abi.dir/home/dyndnn/Projects/IM2P.sim/sim/tests/cycle/test_sequence_c_api.c.o
+[ 80%] Linking CXX executable im2p_cycle_sequence_abi
+gmake[3]: Leaving directory '/tmp/potal-nano-cycle-model'
+[ 80%] Built target im2p_cycle_sequence_abi
+gmake[3]: Entering directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Leaving directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Entering directory '/tmp/potal-nano-cycle-model'
+[ 84%] Building CXX object CMakeFiles/im2p_cycle_sequence_abi_cpp.dir/home/dyndnn/Projects/IM2P.sim/sim/tests/cycle/test_sequence_c_api.cpp.o
+[ 88%] Linking CXX executable im2p_cycle_sequence_core
+gmake[3]: Leaving directory '/tmp/potal-nano-cycle-model'
+[ 88%] Built target im2p_cycle_sequence_core
+gmake[3]: Entering directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Leaving directory '/tmp/potal-nano-cycle-model'
+gmake[3]: Entering directory '/tmp/potal-nano-cycle-model'
+[ 92%] Building CXX object CMakeFiles/im2p_cycle_sequence_milestone.dir/home/dyndnn/Projects/IM2P.sim/sim/tests/cycle/test_sequence_milestone.cpp.o
+[ 96%] Linking CXX executable im2p_cycle_sequence_abi_cpp
+gmake[3]: Leaving directory '/tmp/potal-nano-cycle-model'
+[ 96%] Built target im2p_cycle_sequence_abi_cpp
+[100%] Linking CXX executable im2p_cycle_sequence_milestone
+gmake[3]: Leaving directory '/tmp/potal-nano-cycle-model'
+[100%] Built target im2p_cycle_sequence_milestone
+gmake[2]: Leaving directory '/tmp/potal-nano-cycle-model'
+gmake[1]: Leaving directory '/tmp/potal-nano-cycle-model'
+ctest --test-dir "/tmp/potal-nano-cycle-model" --output-on-failure
+Internal ctest changing into directory: /tmp/potal-nano-cycle-model
+Test project /tmp/potal-nano-cycle-model
+      Start  1: cycle_model_unit
+ 1/16 Test  #1: cycle_model_unit ............................   Passed    8.90 sec
+      Start  2: cycle_model_c_abi
+ 2/16 Test  #2: cycle_model_c_abi ...........................   Passed    0.02 sec
+      Start  3: cycle_model_runs
+ 3/16 Test  #3: cycle_model_runs ............................   Passed    0.01 sec
+      Start  4: cycle_model_service
+ 4/16 Test  #4: cycle_model_service .........................   Passed    0.02 sec
+      Start  5: cycle_model_sequence_core
+ 5/16 Test  #5: cycle_model_sequence_core ...................   Passed    0.14 sec
+      Start  6: cycle_model_sequence_idle_core
+ 6/16 Test  #6: cycle_model_sequence_idle_core ..............   Passed    0.14 sec
+      Start  7: cycle_model_sequence_retired
+ 7/16 Test  #7: cycle_model_sequence_retired ................   Passed    0.14 sec
+      Start  8: cycle_model_sequence_event_source_request
+ 8/16 Test  #8: cycle_model_sequence_event_source_request ...   Passed    0.01 sec
+      Start  9: cycle_model_sequence_event_source_output
+ 9/16 Test  #9: cycle_model_sequence_event_source_output ....   Passed    0.01 sec
+      Start 10: cycle_model_sequence_event_source_control
+10/16 Test #10: cycle_model_sequence_event_source_control ...   Passed    0.01 sec
+      Start 11: cycle_model_sequence_abi
+11/16 Test #11: cycle_model_sequence_abi ....................   Passed    0.10 sec
+      Start 12: cycle_model_sequence_idle_abi
+12/16 Test #12: cycle_model_sequence_idle_abi ...............   Passed    0.10 sec
+      Start 13: cycle_model_sequence_offer
+13/16 Test #13: cycle_model_sequence_offer ..................   Passed    0.10 sec
+      Start 14: cycle_model_sequence_edge
+14/16 Test #14: cycle_model_sequence_edge ...................   Passed    0.10 sec
+      Start 15: cycle_model_sequence_abi_cpp
+15/16 Test #15: cycle_model_sequence_abi_cpp ................   Passed    0.01 sec
+      Start 16: cycle_model_sequence_milestone
+16/16 Test #16: cycle_model_sequence_milestone ..............   Passed    0.03 sec
+
+100% tests passed, 0 tests failed out of 16
+
+Total Test time (real) =   9.83 sec
+make: Leaving directory '/home/dyndnn/Projects/IM2P.sim'

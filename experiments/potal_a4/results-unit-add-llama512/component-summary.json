@@ -1,0 +1,107 @@
+{
+  "aggregation": "For each capture/mode take median of five warmed GEMM times, then sum across captures; quantization excluded, copies/sync/host SCU included",
+  "groups": {
+    "qk": {
+      "capture_count": 15,
+      "modes": {
+        "dense": {
+          "sum_median_ns": 830983973,
+          "median_capture_repeat_range_pct": 1.0765417043772358
+        },
+        "sparse_multiply": {
+          "sum_median_ns": 735404917,
+          "median_capture_repeat_range_pct": 1.7802673037259802
+        },
+        "sparse_unit_add": {
+          "sum_median_ns": 733685622,
+          "median_capture_repeat_range_pct": 0.7476615642778167
+        },
+        "cuda_dense": {
+          "sum_median_ns": 911831391,
+          "median_capture_repeat_range_pct": 1.8989421385271155
+        }
+      },
+      "unit_time_reduction_vs_dense_pct": 11.70881198210546,
+      "unit_time_reduction_vs_sparse_control_pct": 0.23378889102532163,
+      "cuda_time_increase_vs_dense_pct": 9.729118806964031
+    },
+    "pv": {
+      "capture_count": 15,
+      "modes": {
+        "dense": {
+          "sum_median_ns": 339360738,
+          "median_capture_repeat_range_pct": 2.2040654677739298
+        },
+        "sparse_multiply": {
+          "sum_median_ns": 336154861,
+          "median_capture_repeat_range_pct": 2.8580079892737786
+        },
+        "sparse_unit_add": {
+          "sum_median_ns": 333380103,
+          "median_capture_repeat_range_pct": 2.0223425687198855
+        },
+        "cuda_dense": {
+          "sum_median_ns": 607668711,
+          "median_capture_repeat_range_pct": 5.356799953379035
+        }
+      },
+      "unit_time_reduction_vs_dense_pct": 1.762323784196862,
+      "unit_time_reduction_vs_sparse_control_pct": 0.8254403912963171,
+      "cuda_time_increase_vs_dense_pct": 79.06276211598762
+    },
+    "all": {
+      "capture_count": 30,
+      "modes": {
+        "dense": {
+          "sum_median_ns": 1170344711,
+          "median_capture_repeat_range_pct": 1.5300364168622056
+        },
+        "sparse_multiply": {
+          "sum_median_ns": 1071559778,
+          "median_capture_repeat_range_pct": 2.230277687335633
+        },
+        "sparse_unit_add": {
+          "sum_median_ns": 1067065725,
+          "median_capture_repeat_range_pct": 1.3119922091526346
+        },
+        "cuda_dense": {
+          "sum_median_ns": 1519500102,
+          "median_capture_repeat_range_pct": 3.724186250320817
+        }
+      },
+      "unit_time_reduction_vs_dense_pct": 8.824663795998477,
+      "unit_time_reduction_vs_sparse_control_pct": 0.41939358795156645,
+      "cuda_time_increase_vs_dense_pct": 29.833551407402403
+    }
+  },
+  "diagnostic_dense_replay": {
+    "wall_ns": 2631520546741,
+    "tracked_attention_fraction": 0.24867537885213667,
+    "raw_dot_kernel_fraction": 0.053070729350358864,
+    "raw_dot_call_fraction_including_conversion": 0.09278593556732413,
+    "limitation": "Native floating attention still executes in replay; no production end-to-end speedup inference"
+  },
+  "source_reports_sha256": {
+    "report.json": "4192ca4295aca4ab426d5e39cfc52784576b7fef278b0ca9b2c5c0a3ed04427d",
+    "chunks.jsonl": "26050409b18b3121ba8c00f0e7387fcc775570caa3cdc6a2b2654febabaf8def",
+    "cuda-component-timing.json": "e0f2f14adc49f4cfea0c309fae956f96cf80278e3983478c89cd2f10151d0e15",
+    "rtl-raw.json": "023df62ea23c7e81a0f9140d0f951d554c87f9191649663fd4edbc7fb31b8451"
+  },
+  "timing_selection": "Use cuda-component-timing.json for CPU and CUDA performance. Original report.json component timings overlapped CUDA functional work; numerical/PPL evidence remains valid.",
+  "cuda_identity": "Orin (nvgpu), 595.78, 8.7",
+  "decisions": [
+    "No digit dropping: paired 10-chunk CPU PPL, packets, logits and token NLL are bitwise equal",
+    "Per-dot CUDA path is an experimental baseline only; do not adopt as default based on these slower timings",
+    "Unit specialization alone has insufficient speed evidence over sparse-multiply control",
+    "Current Gemmini raw fixed-shape MAC timing is unchanged by unit coefficients"
+  ],
+  "shared_runner_refactor_regression": {
+    "context": 32,
+    "chunks": 1,
+    "smoke_only": true,
+    "packet_attention_logits_token_nll_bitwise_equal_to_previous_smoke": true,
+    "old_records_sha256": "658c617b6883c12030579c512b0b177829a14abad16d095562298db843c3d3ff",
+    "new_records_sha256": "cb4f0cfd107789d646ae89df85627bfadedb16b13b813be15e67be171a402e70"
+  },
+  "full_10_chunk_executed_runner_archive_sha256": "349b84df12d43f85ae233c00b8ddd47666d26d8f9caf09ca2b946651f9c01e62"
+}

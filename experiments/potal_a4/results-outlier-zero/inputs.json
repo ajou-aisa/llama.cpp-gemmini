@@ -1,0 +1,24 @@
+{
+  "baseline_commit": "f588ad4bb280147a152c0d23f624526fff64d45a",
+  "context": 512,
+  "chunks": 10,
+  "threads": 4,
+  "batch": 512,
+  "ubatch": 512,
+  "route": "Gemmini product backend, OPTION=CPU, RMD=CPU, A4/W4 DIM32 BK32; CPU attention",
+  "generated_geometry": {"bank_count": 4, "bank_rows": 4096, "accumulator_rows": 1024},
+  "source_zero_exclusion_decision": "adopted by user after the paired 10-chunk review",
+  "scope": "zero-population policy comparison; not full a4nks, original ACC512 geometry or RTL parity",
+  "argv_common": ["-m", "models/gpt2-base/gpt2.Q4_HP1.gguf", "-f", "wikitext-2-raw/wiki.test.raw", "-c", "512", "-b", "512", "-ub", "512", "-t", "4", "-tb", "4", "--chunks", "10", "-ngl", "0"],
+  "environment": {"OMP_NUM_THREADS": "4", "LD_LIBRARY_PATH": "the respective before/after build bin directory"},
+  "hashes": {
+    "models/gpt2-base/gpt2.Q4_HP1.gguf": "a5da4eacdb13197248bac7aea0a9d6e934004d393994833acd70b9d5ef610f1f",
+    "wikitext-2-raw/wiki.test.raw": "173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08",
+    "build-potal-outlier-before/bin/llama-perplexity": "033d813e7ceff74dc7857878e5cc136299a4c24e71471c76de399ca271c736bc",
+    "build-potal-outlier-before/bin/libggml-gemmini.so": "c94f12129ff66fa5dbbcafe0d3854319e2b22f75f85158e030698f9dc170cb50",
+    "build-potal-outlier-after/bin/llama-perplexity": "033d813e7ceff74dc7857878e5cc136299a4c24e71471c76de399ca271c736bc",
+    "build-potal-outlier-after/bin/libggml-gemmini.so": "70cd0c2387ab81a8f4762bcc624c45eedf58b4fa200a8d2139fbdaa64e1f01e4"
+  },
+  "before_local_cpp_sha256": "32cbc1cc153f5030194815835d97bef2d3b1d5e5ffcd823bf85dbf7f2923dfa8",
+  "after_local_cpp_sha256": "6c21681b82c32544ad33aed707052ff9aa1b1d3d6574780b3687b130ab2cc0b8"
+}

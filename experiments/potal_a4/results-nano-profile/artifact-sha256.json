@@ -1,0 +1,7 @@
+{
+  "experiments/potal_a4/results-nano-profile/context512.json": "7aab5752b04d05da2323605d39ef0ba5c23d22cf11067a50f5880aba3f9a57b2",
+  "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/profile_report.py": "22bec0112d7d5fb9e228d0bf27ba6d65b373fbebc7a8aa173cceda73f5f52fe5",
+  "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/profile_ops.py": "94f9996238ef1c0ff11665f228487311066d7a6f252208de45d684e36ca78a05",
+  "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/profile_gemm.py": "b4d92e75359f00aef692939737204b97267cfcde33a9daaf31ffbec562d48102",
+  "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/profile_attention.py": "87ff6522988c16e162cd6b1ccb8c9923eede29514e36cc1122d948a0fcae852c"
+}

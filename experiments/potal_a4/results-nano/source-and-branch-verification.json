@@ -1,0 +1,17 @@
+{
+  "root_head": "f588ad4bb280147a152c0d23f624526fff64d45a",
+  "origin_develop": "3b2eaa3cb6f7adc36094b7f78662141825cc4ef4",
+  "local_develop": "e5eb928e80382cbc89d8ae1d7953d502ffd3632d",
+  "product_committed_equals_origin_develop": true,
+  "product_working_tree_unchanged": true,
+  "original_im2p_head": "5da6a4cf0d1da38211b14cacf409bb1abc8d458a",
+  "compatible_im2p_head": "20b82f058aa8b0e69c48d1d00790d8e19eaa6f66",
+  "source_sha256": {
+    "tests/potal_a4_reference.py": "4cfbda21c7daa4b9cebfa5ac352b259ce1f82685e2e479a33f9995794533517b",
+    "tests/test-potal-a4-reference.py": "9e584df3bf50aee94204884a4d8d9e8c94e09c31f9323e4e9a02ba9d7a453932",
+    "experiments/potal_a4/im2p_raw_probe.cpp": "4df6f4ca398558f3086437b405f61835b218d7db7adfd1d1f1e7983cbe1397df",
+    "experiments/potal_a4/run.py": "448230db7ce158e78e7747b0db654571e56715ad82f6cb800e26d6674f6054f5",
+    "experiments/potal_a4/native_probe.cpp": "133f19e629ca8e9d92d7f2049a7be5120af39ff5373cb1057486192e36e112a4",
+    "experiments/potal_a4/CMakeLists.txt": "2cf712ba80b773ab420de79b92f03234f729268c653d2493a809df9132253571"
+  }
+}

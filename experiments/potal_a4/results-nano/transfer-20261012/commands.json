@@ -1,0 +1,91 @@
+{
+  "scope": "Selected literal shell commands recovered from recorded historical tool invocations; not rerun during transfer.",
+  "cwd": "/home/dyndnn/Projects/llama.cpp-gemmini",
+  "notes": [
+    "Absolute paths are the original Nano paths. Change output paths before any later replay.",
+    "Initial configure and later retry are retained; a command alone is not a success certificate. See result and validation logs.",
+    "The current native_measure.py contains the later CUDA/shared-helper extraction; the 10-chunk executed runner is separately preserved as native_measure.executed.py."
+  ],
+  "commands": [
+    {
+      "timestamp": "2026-10-10T14:35:53.856Z",
+      "cmd": "ctest --test-dir build-potal-probes --output-on-failure > experiments/potal_a4/results-nano/ctest.log; python3 -m experiments.potal_a4.native_measure build-potal-probes/potal-native-probe experiments/potal_a4/results-nano/native-packets.json > experiments/potal_a4/results-nano/native-measure.log; python3 tests/test-potal-a4-reference.py > experiments/potal_a4/results-nano/reference.log 2>&1; find build-potal-hp1-diagnostic -type f -maxdepth 4 -print"
+    },
+    {
+      "timestamp": "2026-10-10T15:00:55.650Z",
+      "cmd": "git -C /home/dyndnn/Projects/IM2P.sim worktree add --detach /tmp/potal-nano-im2p-compatible 20b82f058aa8b0e69c48d1d00790d8e19eaa6f66; env PATH=/home/dyndnn/util/circt-firtool-1.62.0/build/bin:/home/dyndnn/util/verilator-5.050/bin:/home/dyndnn/.cargo/bin:/usr/local/bin:/usr/bin:/bin CHISEL_FIRTOOL_PATH=/home/dyndnn/util/circt-firtool-1.62.0/build/bin IM2P_GEMMINI_WORK_ROOT=/home/dyndnn/aisa-lab/build/im2p-gemmini make -C /tmp/potal-nano-im2p-compatible -j2 BUILD_DIR=/tmp/potal-nano-hp1-matched GEMMINI_ROOT=/home/dyndnn/Projects/llama.cpp-gemmini GEMMINI_PARAMS_ROOT=/home/dyndnn/Projects/RISC-V-DynDNN-gemmini-include/include IM2P_CACHE_JOBS=2 IM2P_SIM_IMPLEMENTATION=GEMMINI_HP1 IM2P_ACTIVATION_BITS=4 IM2P_WEIGHT_BITS=4 IM2P_DIM=32 GEMMINI_FRONTEND_ACTIVATION_BITS=4 GEMMINI_FRONTEND_WEIGHT_BITS=4 GEMMINI_FRONTEND_DIM=32 GEMMINI_FRONTEND_BLOCK_SIZE=32 gemmini-frontend-real-lib > /tmp/potal-nano-hp1-matched-build.log 2>&1"
+    },
+    {
+      "timestamp": "2026-10-10T15:30:11.136Z",
+      "cmd": "cmake -S . -B build-potal-outlier-before -DCMAKE_BUILD_TYPE=Release -DGGML_GEMMINI=ON -DGGML_GEMMINI_OPTION=CPU -DGGML_GEMMINI_EXECUTION_BACKEND=HARDWARE -DGGML_GEMMINI_DEFAULT_RMD_BACKEND=CPU -DGGML_GEMMINI_ACTIVATION_BITS=4 -DGGML_GEMMINI_WEIGHT_BITS=4 -DGGML_GEMMINI_DIM=32 -DGGML_GEMMINI_BLOCK_SIZE=32 -DGEMMINI_SW_PATH=/home/dyndnn/Projects/RISC-V-DynDNN-gemmini-include -DGGML_CUDA=OFF -DGGML_BACKEND_DL=OFF -DLLAMA_BUILD_COMMON=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF -DCYCLE_SIM=0 > /tmp/potal-outlier-before-config.log 2>&1 && cmake --build build-potal-outlier-before --target llama-perplexity test-gemmini-exsia -j2 > /tmp/potal-outlier-before-build.log 2>&1"
+    },
+    {
+      "timestamp": "2026-10-10T15:30:46.611Z",
+      "cmd": "cmake -S . -B build-potal-outlier-before -DLLAMA_CURL=OFF > /tmp/potal-outlier-before-config.log 2>&1 && cmake --build build-potal-outlier-before --target llama-perplexity test-gemmini-exsia -j2 > /tmp/potal-outlier-before-build.log 2>&1"
+    },
+    {
+      "timestamp": "2026-10-10T16:06:27.614Z",
+      "cmd": "env LD_LIBRARY_PATH=/home/dyndnn/Projects/llama.cpp-gemmini/build-potal-outlier-before/bin OMP_NUM_THREADS=4 build-potal-outlier-before/bin/llama-perplexity -m models/gpt2-base/gpt2.Q4_HP1.gguf -f wikitext-2-raw/wiki.test.raw -c 512 -b 512 -ub 512 -t 4 -tb 4 --chunks 10 -ngl 0 > experiments/potal_a4/results-outlier-zero/before.log 2>&1"
+    },
+    {
+      "timestamp": "2026-10-10T16:28:55.890Z",
+      "cmd": "cmake -S . -B build-potal-outlier-after -DCMAKE_BUILD_TYPE=Release -DGGML_GEMMINI=ON -DGGML_GEMMINI_OPTION=CPU -DGGML_GEMMINI_EXECUTION_BACKEND=HARDWARE -DGGML_GEMMINI_DEFAULT_RMD_BACKEND=CPU -DGGML_GEMMINI_ACTIVATION_BITS=4 -DGGML_GEMMINI_WEIGHT_BITS=4 -DGGML_GEMMINI_DIM=32 -DGGML_GEMMINI_BLOCK_SIZE=32 -DGEMMINI_SW_PATH=/home/dyndnn/Projects/RISC-V-DynDNN-gemmini-include -DGGML_CUDA=OFF -DGGML_BACKEND_DL=OFF -DLLAMA_BUILD_COMMON=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_CURL=OFF -DCYCLE_SIM=0 > /tmp/potal-outlier-after-config.log 2>&1 && cmake --build build-potal-outlier-after --target llama-perplexity test-gemmini-exsia -j2 > /tmp/potal-outlier-after-build.log 2>&1"
+    },
+    {
+      "timestamp": "2026-10-10T16:38:00.255Z",
+      "cmd": "tail -3 /tmp/potal-outlier-after-build.log; if test -x build-potal-outlier-after/bin/llama-perplexity; then env LD_LIBRARY_PATH=/home/dyndnn/Projects/llama.cpp-gemmini/build-potal-outlier-after/bin OMP_NUM_THREADS=4 build-potal-outlier-after/bin/llama-perplexity -m models/gpt2-base/gpt2.Q4_HP1.gguf -f wikitext-2-raw/wiki.test.raw -c 512 -b 512 -ub 512 -t 4 -tb 4 --chunks 10 -ngl 0 > experiments/potal_a4/results-outlier-zero/after.log 2>&1; fi"
+    },
+    {
+      "timestamp": "2026-10-10T16:40:40.260Z",
+      "cmd": "cmake --build build-potal-outlier-after --target test-gemmini-exsia -j2 > /tmp/potal-outlier-test-build.log 2>&1 && build-potal-outlier-after/bin/test-gemmini-exsia --case=a4-source-zero-sigma > experiments/potal_a4/results-outlier-zero/regression-after.log 2>&1 && ctest --test-dir build-potal-outlier-after -R '^gemmini_exsia_(all|baseline|dispatch|stripe_geometry|a4_source_zero_sigma)$' --output-on-failure > experiments/potal_a4/results-outlier-zero/ctest-after.log 2>&1"
+    },
+    {
+      "timestamp": "2026-10-11T11:34:20.216Z",
+      "cmd": "build-potal-outlier-after/bin/llama-quantize --leave-output-tensor --token-embedding-type f16 models/llama3.2-1B/llama3.2-1b-f16.gguf models/llama3.2-1B/llama3.2-1B.Q4_HP1.gguf Q4_HP1 4 > /tmp/potal-llama-quantize.log 2>&1"
+    },
+    {
+      "timestamp": "2026-10-11T11:34:20.216Z",
+      "cmd": "env PYTHONPATH=gguf-py:. OPENBLAS_NUM_THREADS=2 /tmp/potal-nano-venv/bin/python -m experiments.potal_a4.native_measure attention build-potal-unit-add/libpotal-native-replay.so models/gpt2-base/gpt2.Q4_HP1.gguf wikitext-2-raw/wiki.test.raw 32 1 experiments/potal_a4/results-unit-add-smoke > /tmp/potal-unit-add-smoke.log 2>&1"
+    },
+    {
+      "timestamp": "2026-10-11T11:34:44.650Z",
+      "cmd": "cmake -S experiments/potal_a4 -B build-potal-unit-add -DIM2P_SIM_ROOT=/tmp/potal-nano-im2p-compatible -DIM2P_SELECTED_GENERATION=/tmp/potal-nano-hp1-matched/selected/GEMMINI_HP1/a4-w4-d32/current"
+    },
+    {
+      "timestamp": "2026-10-11T11:35:35.207Z",
+      "cmd": "cmake --build build-potal-unit-add --target potal-im2p-raw-probe -j 2"
+    },
+    {
+      "timestamp": "2026-10-11T11:35:35.207Z",
+      "cmd": "env PYTHONPATH=gguf-py:. OPENBLAS_NUM_THREADS=2 /tmp/potal-nano-venv/bin/python -m experiments.potal_a4.native_measure attention build-potal-unit-add/libpotal-native-replay.so models/llama3.2-1B/llama3.2-1B.Q4_HP1.gguf wikitext-2-raw/wiki.test.raw 32 1 experiments/potal_a4/results-unit-add-llama-smoke > /tmp/potal-unit-add-llama-smoke.log 2>&1"
+    },
+    {
+      "timestamp": "2026-10-11T12:04:18.547Z",
+      "cmd": "env PYTHONPATH=gguf-py:. OPENBLAS_NUM_THREADS=2 OMP_NUM_THREADS=6 /tmp/potal-nano-venv/bin/python -m experiments.potal_a4.native_measure attention build-potal-unit-add/libpotal-native-replay.so models/llama3.2-1B/llama3.2-1B.Q4_HP1.gguf wikitext-2-raw/wiki.test.raw 32 1 experiments/potal_a4/results-unit-add-llama-omp-smoke > /tmp/potal-unit-add-llama-omp-smoke.log 2>&1"
+    },
+    {
+      "timestamp": "2026-10-11T12:09:37.991Z",
+      "cmd": "cmake --build build-potal-unit-add --target potal-im2p-raw-probe -j 2"
+    },
+    {
+      "timestamp": "2026-10-11T12:10:06.269Z",
+      "cmd": "env PYTHONPATH=gguf-py:. OPENBLAS_NUM_THREADS=2 OMP_NUM_THREADS=6 /tmp/potal-nano-venv/bin/python -m experiments.potal_a4.native_measure attention build-potal-unit-add/libpotal-native-replay.so models/llama3.2-1B/llama3.2-1B.Q4_HP1.gguf wikitext-2-raw/wiki.test.raw 512 10 experiments/potal_a4/results-unit-add-llama512 > /tmp/potal-unit-add-llama512.log 2>&1"
+    },
+    {
+      "timestamp": "2026-10-11T12:10:06.269Z",
+      "cmd": "build-potal-unit-add/potal-im2p-raw-probe > /tmp/potal-unit-add-im2p-provider.log 2>&1"
+    },
+    {
+      "timestamp": "2026-10-11T12:14:18.040Z",
+      "cmd": "ctest --test-dir build-potal-unit-add -R 'potal-im2p-real-raw|potal-arithmetic-reference' --output-on-failure > /tmp/potal-unit-add-gates.log 2>&1"
+    },
+    {
+      "timestamp": "2026-10-11T13:47:09.915Z",
+      "cmd": "env PYTHONPATH=gguf-py:. OPENBLAS_NUM_THREADS=2 OMP_NUM_THREADS=6 /tmp/potal-nano-venv/bin/python -m experiments.potal_a4.native_measure cuda build-potal-unit-add/libpotal-native-replay.so experiments/potal_a4/results-unit-add-llama512 experiments/potal_a4/results-unit-add-llama512/cuda-component-timing.json > /tmp/potal-cuda-component.log 2>&1"
+    },
+    {
+      "timestamp": "2026-10-11T13:48:20.129Z",
+      "cmd": "env PYTHONPATH=gguf-py:. OPENBLAS_NUM_THREADS=2 OMP_NUM_THREADS=6 /tmp/potal-nano-venv/bin/python -m experiments.potal_a4.native_measure attention build-potal-unit-add/libpotal-native-replay.so models/llama3.2-1B/llama3.2-1B.Q4_HP1.gguf wikitext-2-raw/wiki.test.raw 32 1 experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke > /tmp/potal-cuda-refactor-smoke.log 2>&1"
+    }
+  ]
+}

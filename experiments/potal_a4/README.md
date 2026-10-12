@@ -2,6 +2,21 @@
 
 Nano / Gemmini IM2P에서 이어갈 때는 저장소 루트의 [POTAL_NANO_HANDOFF.md](../../POTAL_NANO_HANDOFF.md)를 먼저 읽는다. [원래 알고리즘](ORIGINAL_SPEC.md)과 [전체 구현 계획](IMPLEMENTATION_PLAN.md)도 이 브랜치에 보관했다.
 
+현재 nano 상태는 [NANO_PROGRESS.md](NANO_PROGRESS.md), 요구사항별 남은 검증은
+[명세-작업 대응표](IMPLEMENTATION_PLAN.md#specification-to-work-audit)에 있다.
+**A4 source-zero 제외는 사용자 채택 완료**이며, 새 전후 PPL 비교는 **10 chunks**다.
+[제품 zero-only 결과](results-outlier-zero/comparison.json)는 CPU main/RMD·FP attention·ACC1024
+조건으로 40.18882947→40.20531900이다. 아래 Mac/8-chunk 실험 기록과 직접 비교하지 않는다.
+IM2P archive 빌드·manifest·링크와 실제 raw 정수곱 15건은 통과했다. 제품 a4nks
+통합은 별도 미완료 항목이다. 일반 nibble과 0/±1 입력의 32×32×32 곱은 모두
+492 RTL cycles였다. [실측 근거](results-unit-add-llama512/rtl-raw.json)를 참조한다.
+
+2026-10-12 로컬 이관의 파일 목록·실행 명령·의존성/해시 기록은
+[transfer-20261012](results-nano/transfer-20261012/)에 있다. Git에 없는 capture·토큰·대용량
+로그의 압축 경로와 SHA256은 [archive.json](results-nano/transfer-20261012/archive.json)을
+확인한다. QK 완전 마스킹 타일 생략은 다음 구현 대상으로 조사만 완료했으며,
+현재 snapshot에는 구현이나 전후 측정이 없다.
+
 이 디렉터리는 `hotfix/potal-attn`의 **실험 구현**이다. CPU에서 선형·Q direct-limb 정책과 K/P/V 양자화를 적용한 GPT-2 forward를 실행하고, 저장 버퍼와 정확도를 비교한다. 제품의 Gemmini attention dispatch와 fused upper-digit API는 아직 연결하지 않았다.
 
 실측 결론은 [RESULTS.md](RESULTS.md), 조건별 원자료는 [results-v3](results-v3/)에 있다.
@@ -28,6 +43,62 @@ Python 경로는 실제 int8 main/compact digit 배열을 할당하며 `nbytes`�
 Native probe에는 기존 scalar emitter로 연결하는 bridge가 남아 있다. `u-d0`가 int32를 벗어나면 명시적으로 실패한다. 따라서 전체 int32 범위의 fused emitter 완성이나 준비시간 최적화를 주장하지 않는다. Python packet roundtrip은 INT32_MIN/MAX와 9-digit carry까지 별도로 검사한다.
 
 ## 재현
+
+Nano의 상위 lane ±1 덧셈 후보는 기존 native 모델과 실험 정수 GEMM을 연결하여
+검증한다. `native_model.cpp`의 evaluation callback이 QK/PV 출력을 교체하고,
+`native_measure.py attention`이 원본·후보의 packet/scale/attention/logits/token-NLL을
+비트 단위로 비교한다. 기존 native FP QK/PV도 실행되므로 전체 replay 시간은
+제품 backend 속도로 해석하지 않는다. 정확도 비교 후 저장된 실제 텐서에서
+dense, sparse-multiply, sparse-unit-add 세 CPU 경로를 각각 측정한다.
+
+```sh
+cmake -S experiments/potal_a4 -B build-potal-unit-add -DCMAKE_BUILD_TYPE=Release -DLLAMA_LIB_DIR=/home/dyndnn/Projects/llama.cpp-gemmini/build-potal-unit-add-omp/bin
+cmake --build build-potal-unit-add --target potal-native-replay -j2
+env PYTHONPATH=gguf-py:. OPENBLAS_NUM_THREADS=2 OMP_NUM_THREADS=6 /tmp/potal-nano-venv/bin/python -m experiments.potal_a4.native_measure attention build-potal-unit-add/libpotal-native-replay.so models/llama3.2-1B/llama3.2-1B.Q4_HP1.gguf wikitext-2-raw/wiki.test.raw 512 10 experiments/potal_a4/results-unit-add-new
+```
+
+이 명령은 기존 A4 CPU 기능 빌드의 Gemmini OpenMP 옵션을 켠
+`build-potal-unit-add-omp`를 사용한다. 선형 경로의 현재 geometry를 유지하므로
+원문 전체 선형 구현의 인증은 아니다. attention에는 원문 `(4,4096,512)` stripe를
+사용한다. 실제 측정의 라이브러리·설정·소스 해시는
+[runtime-inputs.json](results-unit-add-llama512/runtime-inputs.json)에 고정했다.
+Llama context512 ×10의 전후 PPL은 모두 **21.486062983190273**이다.
+모든 packet/scale/attention/logits/token-NLL이 비트 단위로 같다.
+[전체 정확도 결과](results-unit-add-llama512/report.json)와 실제 실행 당시의
+`native_measure.executed.py`를 보관했다. 선형 경로는 기존 native 구현이므로
+이 결과를 원문 전체 선형 구현의 인증으로 확대하지 않는다.
+
+추가 CUDA 요청은 기존 측정 진입점과 정수 GEMM을 재사용한다. cuBLAS의
+int8→int32 곱에 원래 signed nibble 값을 넣고, 기존 host SCU 및 P zero-point
+보정을 유지한다. 기존 양자화 정책을 바꾸거나 별도 모델 forward를 만들지 않는다.
+
+```sh
+env PYTHONPATH=gguf-py:. OPENBLAS_NUM_THREADS=2 OMP_NUM_THREADS=6 /tmp/potal-nano-venv/bin/python -m experiments.potal_a4.native_measure cuda build-potal-unit-add/libpotal-native-replay.so experiments/potal_a4/results-unit-add-llama512 experiments/potal_a4/results-unit-add-llama512/cuda-new.json
+```
+
+Orin SM8.7에서 실제 Llama QK 15개·PV 15개를 비교했다. 각 사례·방식별 warmup
+1회 후 5회 중앙값을 합산한 시간이다. 공통 양자화 준비는 제외하고, padding,
+형 변환, host/device 복사, 동기화, host 정수 누산과 zero point는 포함한다.
+
+| 실행 방식 | QK 15개 | PV 15개 | 합계 |
+| --- | ---: | ---: | ---: |
+| CPU dense | 830.984 ms | 339.361 ms | 1170.345 ms |
+| CPU 상위 lane 0 생략 | 735.405 ms | 336.155 ms | 1071.560 ms |
+| CPU 0 생략 + ±1 덧셈 | 733.686 ms | 333.380 ms | 1067.066 ms |
+| CUDA 개별 K32 정수곱 | 911.831 ms | 607.669 ms | 1519.500 ms |
+
+CUDA는 이 구성에서 29.83% 느리므로 기본 실행으로 채택하지 않는다. 정확도는
+84개 독립 정수곱 검사와 전체 30개 attention 결과 모두 비트 단위로 같다.
+CPU unit 처리만의 추가 이득은 sparse-multiply 대비 0.42%로 반복 변동보다
+작다. 기존 Gemmini raw MAC도 unit 값이라고 빨라지지 않는다. 결과와 제한은
+[집계](results-unit-add-llama512/component-summary.json),
+[반복별 원자료](results-unit-add-llama512/cuda-component-timing.json)에 있다.
+최초 `report.json`의 CPU 구성요소 측정은 CUDA 기능 검사와 일부 겹쳤으므로
+성능 비교에는 새 원자료를 사용한다. PPL/비트 동일성 결과에는 영향이 없다.
+이 측정은 전체 CUDA 모델 실행이나 Gemmini latency가 아니다. GPU에 중간값을
+유지하며 여러 곱셈·SCU를 묶는 구성의 효과는 아직 측정하지 않았다.
+
+아래는 이전 Mac 실험의 재현 기록이다.
 
 작업 디렉터리: `/Users/chan/Projects/AISA/worktrees/potal-attn`. Python은 기존 환경을 사용한다. 결과 경로는 새 디렉터리여야 하며 기존 결과를 덮어쓰거나 완료된 것처럼 재사용하지 않는다.
 

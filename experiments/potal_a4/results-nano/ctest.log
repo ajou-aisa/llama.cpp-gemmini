@@ -1,0 +1,16 @@
+Internal ctest changing into directory: /home/dyndnn/Projects/llama.cpp-gemmini/build-potal-probes
+Test project /home/dyndnn/Projects/llama.cpp-gemmini/build-potal-probes
+    Start 1: potal-arithmetic-reference
+1/5 Test #1: potal-arithmetic-reference .......   Passed    0.21 sec
+    Start 2: bitmap-log0
+2/5 Test #2: bitmap-log0 ......................   Passed    0.06 sec
+    Start 3: bitmap-log1
+3/5 Test #3: bitmap-log1 ......................   Passed    0.07 sec
+    Start 4: native-direct-sparse
+4/5 Test #4: native-direct-sparse .............   Passed    0.01 sec
+    Start 5: native-clipped-dense
+5/5 Test #5: native-clipped-dense .............   Passed    0.00 sec
+
+100% tests passed, 0 tests failed out of 5
+
+Total Test time (real) =   0.35 sec

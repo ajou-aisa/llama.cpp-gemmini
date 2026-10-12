@@ -1,0 +1,412 @@
+{
+  "scope": "Independent mask-domain arithmetic on 15 saved Llama PV heads and analytical overlap counts on 30 QK/PV heads; no integrated skip dispatch or speedup claim",
+  "tile_dim": 32,
+  "captures": [
+    {
+      "capture": "pv-l0-h0.npz",
+      "counts": {
+        "after_future_tile_skip_products": 11736320,
+        "target_products_after_future_tile_skip": 234752,
+        "zero_products_after_future_tile_skip": 231936,
+        "unit_products_after_future_tile_skip": 2816,
+        "nonunit_products_after_future_tile_skip": 0
+      },
+      "mask_check": {
+        "future_nonzero_P": 0,
+        "wrong_compensation_max_abs": 2.91015625,
+        "correct_compensation_max_abs": 0.0,
+        "correct_compensation_bitwise_equal": true
+      }
+    },
+    {
+      "capture": "pv-l0-h16.npz",
+      "counts": {
+        "after_future_tile_skip_products": 11023168,
+        "target_products_after_future_tile_skip": 869184,
+        "zero_products_after_future_tile_skip": 850112,
+        "unit_products_after_future_tile_skip": 19072,
+        "nonunit_products_after_future_tile_skip": 0
+      },
+      "mask_check": {
+        "future_nonzero_P": 0,
+        "wrong_compensation_max_abs": 2.28515625,
+        "correct_compensation_max_abs": 0.0,
+        "correct_compensation_bitwise_equal": true
+      }
+    },
+    {
+      "capture": "pv-l0-h31.npz",
+      "counts": {
+        "after_future_tile_skip_products": 9041152,
+        "target_products_after_future_tile_skip": 60672,
+        "zero_products_after_future_tile_skip": 34816,
+        "unit_products_after_future_tile_skip": 25856,
+        "nonunit_products_after_future_tile_skip": 0
+      },
+      "mask_check": {
+        "future_nonzero_P": 0,
+        "wrong_compensation_max_abs": 14.1640625,
+        "correct_compensation_max_abs": 0.0,
+        "correct_compensation_bitwise_equal": true
+      }
+    },
+    {
+      "capture": "pv-l11-h0.npz",
+      "counts": {
+        "after_future_tile_skip_products": 9165504,
+        "target_products_after_future_tile_skip": 111296,
+        "zero_products_after_future_tile_skip": 87360,
+        "unit_products_after_future_tile_skip": 23936,
+        "nonunit_products_after_future_tile_skip": 0
+      },
+      "mask_check": {
+        "future_nonzero_P": 0,
+        "wrong_compensation_max_abs": 16.3984375,
+        "correct_compensation_max_abs": 0.0,
+        "correct_compensation_bitwise_equal": true
+      }
+    },
+    {
+      "capture": "pv-l11-h16.npz",
+      "counts": {
+        "after_future_tile_skip_products": 11299392,
+        "target_products_after_future_tile_skip": 940608,
+        "zero_products_after_future_tile_skip": 921152,
+        "unit_products_after_future_tile_skip": 19456,
+        "nonunit_products_after_future_tile_skip": 0
+      },
+      "mask_check": {
+        "future_nonzero_P": 0,
+        "wrong_compensation_max_abs": 5.6640625,
+        "correct_compensation_max_abs": 0.0,
+        "correct_compensation_bitwise_equal": true
+      }
+    },
+    {
+      "capture": "pv-l11-h31.npz",
+      "counts": {
+        "after_future_tile_skip_products": 12258688,
+        "target_products_after_future_tile_skip": 1252736,
+        "zero_products_after_future_tile_skip": 1234752,
+        "unit_products_after_future_tile_skip": 17984,
+        "nonunit_products_after_future_tile_skip": 0
+      },
+      "mask_check": {
+        "future_nonzero_P": 0,
+        "wrong_compensation_max_abs": 25.015625,
+        "correct_compensation_max_abs": 0.0,
+        "correct_compensation_bitwise_equal": true
+      }
+    },
+    {
+      "capture": "pv-l15-h0.npz",
+      "counts": {
+        "after_future_tile_skip_products": 11865216,
+        "target_products_after_future_tile_skip": 521344,
+        "zero_products_after_future_tile_skip": 514560,
+        "unit_products_after_future_tile_skip": 6784,
+        "nonunit_products_after_future_tile_skip": 0
+      },
+      "mask_check": {
+        "future_nonzero_P": 0,
+        "wrong_compensation_max_abs": 10.4453125,
+        "correct_compensation_max_abs": 0.0,
+        "correct_compensation_bitwise_equal": true
+      }
+    },
+    {
+      "capture": "pv-l15-h16.npz",
+      "counts": {
+        "after_future_tile_skip_products": 9887936,
+        "target_products_after_future_tile_skip": 440512,
+        "zero_products_after_future_tile_skip": 418112,
+        "unit_products_after_future_tile_skip": 22400,
+        "nonunit_products_after_future_tile_skip": 0
+      },
+      "mask_check": {
+        "future_nonzero_P": 0,
+        "wrong_compensation_max_abs": 12.265625,
+        "correct_compensation_max_abs": 0.0,
+        "correct_compensation_bitwise_equal": true
+      }
+    },
+    {
+      "capture": "pv-l15-h31.npz",
+      "counts": {
+        "after_future_tile_skip_products": 9840384,
+        "target_products_after_future_tile_skip": 417536,
+        "zero_products_after_future_tile_skip": 394624,
+        "unit_products_after_future_tile_skip": 22912,
+        "nonunit_products_after_future_tile_skip": 0
+      },
+      "mask_check": {
+        "future_nonzero_P": 0,
+        "wrong_compensation_max_abs": 11.296875,
+        "correct_compensation_max_abs": 0.0,
+        "correct_compensation_bitwise_equal": true
+      }
+    },
+    {
+      "capture": "pv-l5-h0.npz",
+      "counts": {
+        "after_future_tile_skip_products": 9378816,
+        "target_products_after_future_tile_skip": 56320,
+        "zero_products_after_future_tile_skip": 52032,
+        "unit_products_after_future_tile_skip": 4288,
+        "nonunit_products_after_future_tile_skip": 0
+      },
+      "mask_check": {
+        "future_nonzero_P": 0,
+        "wrong_compensation_max_abs": 18.40625,
+        "correct_compensation_max_abs": 0.0,
+        "correct_compensation_bitwise_equal": true
+      }
+    },
+    {
+      "capture": "pv-l5-h16.npz",
+      "counts": {
+        "after_future_tile_skip_products": 11158656,
+        "target_products_after_future_tile_skip": 99456,
+        "zero_products_after_future_tile_skip": 97856,
+        "unit_products_after_future_tile_skip": 1600,
+        "nonunit_products_after_future_tile_skip": 0
+      },
+      "mask_check": {
+        "future_nonzero_P": 0,
+        "wrong_compensation_max_abs": 12.1484375,
+        "correct_compensation_max_abs": 0.0,
+        "correct_compensation_bitwise_equal": true
+      }
+    },
+    {
+      "capture": "pv-l5-h31.npz",
+      "counts": {
+        "after_future_tile_skip_products": 12131648,
+        "target_products_after_future_tile_skip": 1152320,
+        "zero_products_after_future_tile_skip": 1136000,
+        "unit_products_after_future_tile_skip": 16320,
+        "nonunit_products_after_future_tile_skip": 0
+      },
+      "mask_check": {
+        "future_nonzero_P": 0,
+        "wrong_compensation_max_abs": 15.390625,
+        "correct_compensation_max_abs": 0.0,
+        "correct_compensation_bitwise_equal": true
+      }
+    },
+    {
+      "capture": "pv-l8-h0.npz",
+      "counts": {
+        "after_future_tile_skip_products": 10116480,
+        "target_products_after_future_tile_skip": 310656,
+        "zero_products_after_future_tile_skip": 300672,
+        "unit_products_after_future_tile_skip": 9984,
+        "nonunit_products_after_future_tile_skip": 0
+      },
+      "mask_check": {
+        "future_nonzero_P": 0,
+        "wrong_compensation_max_abs": 5.75,
+        "correct_compensation_max_abs": 0.0,
+        "correct_compensation_bitwise_equal": true
+      }
+    },
+    {
+      "capture": "pv-l8-h16.npz",
+      "counts": {
+        "after_future_tile_skip_products": 13037376,
+        "target_products_after_future_tile_skip": 1451840,
+        "zero_products_after_future_tile_skip": 1434048,
+        "unit_products_after_future_tile_skip": 17792,
+        "nonunit_products_after_future_tile_skip": 0
+      },
+      "mask_check": {
+        "future_nonzero_P": 0,
+        "wrong_compensation_max_abs": 29.828125,
+        "correct_compensation_max_abs": 0.0,
+        "correct_compensation_bitwise_equal": true
+      }
+    },
+    {
+      "capture": "pv-l8-h31.npz",
+      "counts": {
+        "after_future_tile_skip_products": 11067008,
+        "target_products_after_future_tile_skip": 391744,
+        "zero_products_after_future_tile_skip": 385728,
+        "unit_products_after_future_tile_skip": 6016,
+        "nonunit_products_after_future_tile_skip": 0
+      },
+      "mask_check": {
+        "future_nonzero_P": 0,
+        "wrong_compensation_max_abs": 18.265625,
+        "correct_compensation_max_abs": 0.0,
+        "correct_compensation_bitwise_equal": true
+      }
+    },
+    {
+      "capture": "qk-l0-h0.npz",
+      "counts": {
+        "after_future_tile_skip_products": 53473280,
+        "target_products_after_future_tile_skip": 17821696,
+        "zero_products_after_future_tile_skip": 16313856,
+        "unit_products_after_future_tile_skip": 1366336,
+        "nonunit_products_after_future_tile_skip": 141504
+      }
+    },
+    {
+      "capture": "qk-l0-h16.npz",
+      "counts": {
+        "after_future_tile_skip_products": 53432320,
+        "target_products_after_future_tile_skip": 17780736,
+        "zero_products_after_future_tile_skip": 16246464,
+        "unit_products_after_future_tile_skip": 1366528,
+        "nonunit_products_after_future_tile_skip": 167744
+      }
+    },
+    {
+      "capture": "qk-l0-h31.npz",
+      "counts": {
+        "after_future_tile_skip_products": 53473280,
+        "target_products_after_future_tile_skip": 17821696,
+        "zero_products_after_future_tile_skip": 16498560,
+        "unit_products_after_future_tile_skip": 1323136,
+        "nonunit_products_after_future_tile_skip": 0
+      }
+    },
+    {
+      "capture": "qk-l11-h0.npz",
+      "counts": {
+        "after_future_tile_skip_products": 53473280,
+        "target_products_after_future_tile_skip": 17821696,
+        "zero_products_after_future_tile_skip": 17089920,
+        "unit_products_after_future_tile_skip": 720832,
+        "nonunit_products_after_future_tile_skip": 10944
+      }
+    },
+    {
+      "capture": "qk-l11-h16.npz",
+      "counts": {
+        "after_future_tile_skip_products": 53473280,
+        "target_products_after_future_tile_skip": 17821696,
+        "zero_products_after_future_tile_skip": 14842176,
+        "unit_products_after_future_tile_skip": 2701056,
+        "nonunit_products_after_future_tile_skip": 278464
+      }
+    },
+    {
+      "capture": "qk-l11-h31.npz",
+      "counts": {
+        "after_future_tile_skip_products": 53473280,
+        "target_products_after_future_tile_skip": 17821696,
+        "zero_products_after_future_tile_skip": 15334400,
+        "unit_products_after_future_tile_skip": 2208832,
+        "nonunit_products_after_future_tile_skip": 278464
+      }
+    },
+    {
+      "capture": "qk-l15-h0.npz",
+      "counts": {
+        "after_future_tile_skip_products": 53473280,
+        "target_products_after_future_tile_skip": 17821696,
+        "zero_products_after_future_tile_skip": 15777152,
+        "unit_products_after_future_tile_skip": 1813248,
+        "nonunit_products_after_future_tile_skip": 231296
+      }
+    },
+    {
+      "capture": "qk-l15-h16.npz",
+      "counts": {
+        "after_future_tile_skip_products": 53444608,
+        "target_products_after_future_tile_skip": 18503680,
+        "zero_products_after_future_tile_skip": 17417536,
+        "unit_products_after_future_tile_skip": 723328,
+        "nonunit_products_after_future_tile_skip": 362816
+      }
+    },
+    {
+      "capture": "qk-l15-h31.npz",
+      "counts": {
+        "after_future_tile_skip_products": 53473280,
+        "target_products_after_future_tile_skip": 17821696,
+        "zero_products_after_future_tile_skip": 16617536,
+        "unit_products_after_future_tile_skip": 926848,
+        "nonunit_products_after_future_tile_skip": 277312
+      }
+    },
+    {
+      "capture": "qk-l5-h0.npz",
+      "counts": {
+        "after_future_tile_skip_products": 53473280,
+        "target_products_after_future_tile_skip": 17821696,
+        "zero_products_after_future_tile_skip": 16012160,
+        "unit_products_after_future_tile_skip": 1533568,
+        "nonunit_products_after_future_tile_skip": 275968
+      }
+    },
+    {
+      "capture": "qk-l5-h16.npz",
+      "counts": {
+        "after_future_tile_skip_products": 53473280,
+        "target_products_after_future_tile_skip": 17821696,
+        "zero_products_after_future_tile_skip": 14655936,
+        "unit_products_after_future_tile_skip": 2884736,
+        "nonunit_products_after_future_tile_skip": 281024
+      }
+    },
+    {
+      "capture": "qk-l5-h31.npz",
+      "counts": {
+        "after_future_tile_skip_products": 53473280,
+        "target_products_after_future_tile_skip": 17821696,
+        "zero_products_after_future_tile_skip": 16089664,
+        "unit_products_after_future_tile_skip": 1453568,
+        "nonunit_products_after_future_tile_skip": 278464
+      }
+    },
+    {
+      "capture": "qk-l8-h0.npz",
+      "counts": {
+        "after_future_tile_skip_products": 53473280,
+        "target_products_after_future_tile_skip": 17821696,
+        "zero_products_after_future_tile_skip": 16197760,
+        "unit_products_after_future_tile_skip": 1560640,
+        "nonunit_products_after_future_tile_skip": 63296
+      }
+    },
+    {
+      "capture": "qk-l8-h16.npz",
+      "counts": {
+        "after_future_tile_skip_products": 53473280,
+        "target_products_after_future_tile_skip": 17821696,
+        "zero_products_after_future_tile_skip": 14291648,
+        "unit_products_after_future_tile_skip": 3528832,
+        "nonunit_products_after_future_tile_skip": 1216
+      }
+    },
+    {
+      "capture": "qk-l8-h31.npz",
+      "counts": {
+        "after_future_tile_skip_products": 53473280,
+        "target_products_after_future_tile_skip": 17821696,
+        "zero_products_after_future_tile_skip": 15774464,
+        "unit_products_after_future_tile_skip": 2025536,
+        "nonunit_products_after_future_tile_skip": 21696
+      }
+    }
+  ],
+  "totals": {
+    "qk": {
+      "after_future_tile_skip_products": 802029568,
+      "target_products_after_future_tile_skip": 267966464,
+      "zero_products_after_future_tile_skip": 239159232,
+      "unit_products_after_future_tile_skip": 26137024,
+      "nonunit_products_after_future_tile_skip": 2670208
+    },
+    "pv": {
+      "after_future_tile_skip_products": 163007744,
+      "target_products_after_future_tile_skip": 8310976,
+      "zero_products_after_future_tile_skip": 8093760,
+      "unit_products_after_future_tile_skip": 217216,
+      "nonunit_products_after_future_tile_skip": 0
+    }
+  }
+}

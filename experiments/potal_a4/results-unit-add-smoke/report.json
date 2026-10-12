@@ -1,0 +1,5372 @@
+{
+  "scope": "Native model with experimental QK/PV output replacement; exact PoTal attention, CPU component timing only",
+  "limitations": [
+    "Original native floating dots still execute; replay wall time is not integrated backend latency",
+    "CPU timings do not predict Gemmini cycles, transfers, overlap, or full-model speedup",
+    "Native existing linear path/geometry is retained; this does not certify original-spec linear integration"
+  ],
+  "candidate": "Only upper lanes >=2: skip zero, add/subtract +/-1, multiply every other digit exactly",
+  "model": "/home/dyndnn/Projects/llama.cpp-gemmini/models/gpt2-base/gpt2.Q4_HP1.gguf",
+  "model_sha256": "a5da4eacdb13197248bac7aea0a9d6e934004d393994833acd70b9d5ef610f1f",
+  "text": "/home/dyndnn/Projects/llama.cpp-gemmini/wikitext-2-raw/wiki.test.raw",
+  "text_sha256": "173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08",
+  "library": "/home/dyndnn/Projects/llama.cpp-gemmini/build-potal-unit-add/libpotal-native-replay.so",
+  "library_sha256": "5d73f72749fb71260dcb0952be369017075386e1013a94e4afa65ea5263dabf1",
+  "tokens_sha256": "1296a64b32b9da2d9a8101abe85e99359aced2b8c29167c229b6a4a71259377e",
+  "context": 32,
+  "chunks": 1,
+  "scored_tokens": 15,
+  "primitive_checks": 36,
+  "attention_geometry": {
+    "banks": 4,
+    "bank_rows": 4096,
+    "acc_rows": 512,
+    "dim": 32
+  },
+  "bitwise_packet_scale_attention_logits_and_token_nll": true,
+  "ppl": {
+    "dense": 160.3905952887376,
+    "sparse_unit_add": 160.3905952887376
+  },
+  "observations": {
+    "qk": {
+      "heads": 144,
+      "values": 294912,
+      "main_fragments": 288,
+      "upper_fragments_one_pass": 576
+    },
+    "pv": {
+      "heads": 144,
+      "values": 147456,
+      "main_fragments": 288,
+      "upper_fragments_one_pass": 544
+    }
+  },
+  "digit_histograms": {
+    "qk": {
+      "1": {
+        "-8": 12359,
+        "-7": 12639,
+        "-6": 13756,
+        "-5": 15348,
+        "-4": 17597,
+        "-3": 19672,
+        "-2": 22478,
+        "-1": 25448,
+        "0": 27491,
+        "1": 25807,
+        "2": 22830,
+        "3": 20261,
+        "4": 17448,
+        "5": 15415,
+        "6": 13730,
+        "7": 12633
+      },
+      "2": {
+        "-2": 733,
+        "-1": 20259,
+        "0": 238297,
+        "1": 26385,
+        "2": 606,
+        "-3": 53,
+        "3": 52,
+        "4": 10,
+        "-4": 4,
+        "5": 1
+      }
+    },
+    "pv": {
+      "1": {
+        "-8": 219,
+        "0": 136558,
+        "1": 2684,
+        "2": 964,
+        "3": 598,
+        "4": 626,
+        "6": 708,
+        "7": 924,
+        "5": 623
+      },
+      "2": {
+        "0": 6789,
+        "1": 219
+      }
+    }
+  },
+  "shapes": [
+    [
+      "pv",
+      [
+        12,
+        32,
+        32
+      ],
+      [
+        12,
+        64,
+        32
+      ],
+      [
+        12,
+        32,
+        64
+      ]
+    ],
+    [
+      "qk",
+      [
+        12,
+        32,
+        64
+      ],
+      [
+        12,
+        32,
+        64
+      ],
+      [
+        12,
+        32,
+        32
+      ]
+    ]
+  ],
+  "platform": "Linux-6.8.12-1021-tegra-aarch64-with-glibc2.39",
+  "numpy": "1.26.4",
+  "native_threads": 4,
+  "cpu_dot_threads": 1,
+  "peak_rss_bytes": 267251712,
+  "component_timings": [
+    {
+      "capture": "qk-l0-h0.npz",
+      "sha256": "efd8131899ca603f3679eb33cfaddc1638dabb47740a309ab24cf909e9c31659",
+      "bitwise_integer_gemm": true,
+      "runs": [
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 1,
+          "gemm_ns": 1527633,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 448,
+            "main_or_upper1_dot_ns": 76993,
+            "main_or_upper1_call_ns": 587637,
+            "upper2plus_pack_ns": 22528,
+            "upper2plus_dot_ns": 17666,
+            "upper2plus_call_ns": 298026
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 1,
+          "gemm_ns": 1577939,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 76996,
+            "main_or_upper1_call_ns": 627924,
+            "upper2plus_pack_ns": 22434,
+            "upper2plus_dot_ns": 12896,
+            "upper2plus_call_ns": 294025
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "dense",
+          "repeat": 1,
+          "gemm_ns": 1559154,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 448,
+            "main_or_upper1_dot_ns": 81922,
+            "main_or_upper1_call_ns": 600086,
+            "upper2plus_pack_ns": 256,
+            "upper2plus_dot_ns": 43171,
+            "upper2plus_call_ns": 316618
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 2,
+          "gemm_ns": 1846971,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 79937,
+            "main_or_upper1_call_ns": 888766,
+            "upper2plus_pack_ns": 352,
+            "upper2plus_dot_ns": 39874,
+            "upper2plus_call_ns": 297322
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 2,
+          "gemm_ns": 1507601,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 77444,
+            "main_or_upper1_call_ns": 576659,
+            "upper2plus_pack_ns": 26401,
+            "upper2plus_dot_ns": 13056,
+            "upper2plus_call_ns": 286794
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 2,
+          "gemm_ns": 1495536,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 448,
+            "main_or_upper1_dot_ns": 77122,
+            "main_or_upper1_call_ns": 574610,
+            "upper2plus_pack_ns": 22368,
+            "upper2plus_dot_ns": 17920,
+            "upper2plus_call_ns": 284745
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 3,
+          "gemm_ns": 1558802,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 77475,
+            "main_or_upper1_call_ns": 581331,
+            "upper2plus_pack_ns": 23233,
+            "upper2plus_dot_ns": 19936,
+            "upper2plus_call_ns": 321483
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 3,
+          "gemm_ns": 1490000,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 78786,
+            "main_or_upper1_call_ns": 573458,
+            "upper2plus_pack_ns": 21088,
+            "upper2plus_dot_ns": 12897,
+            "upper2plus_call_ns": 278601
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "dense",
+          "repeat": 3,
+          "gemm_ns": 1481423,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 79843,
+            "main_or_upper1_call_ns": 571921,
+            "upper2plus_pack_ns": 288,
+            "upper2plus_dot_ns": 38499,
+            "upper2plus_call_ns": 281321
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 4,
+          "gemm_ns": 1662550,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 102659,
+            "main_or_upper1_call_ns": 650259,
+            "upper2plus_pack_ns": 224,
+            "upper2plus_dot_ns": 41920,
+            "upper2plus_call_ns": 310985
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 4,
+          "gemm_ns": 1519728,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 76388,
+            "main_or_upper1_call_ns": 576242,
+            "upper2plus_pack_ns": 25793,
+            "upper2plus_dot_ns": 14657,
+            "upper2plus_call_ns": 301801
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 4,
+          "gemm_ns": 1771449,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 480,
+            "main_or_upper1_dot_ns": 80484,
+            "main_or_upper1_call_ns": 599091,
+            "upper2plus_pack_ns": 24674,
+            "upper2plus_dot_ns": 19872,
+            "upper2plus_call_ns": 527248
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 5,
+          "gemm_ns": 1628469,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 448,
+            "main_or_upper1_dot_ns": 181478,
+            "main_or_upper1_call_ns": 689398,
+            "upper2plus_pack_ns": 23456,
+            "upper2plus_dot_ns": 18818,
+            "upper2plus_call_ns": 297001
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 5,
+          "gemm_ns": 1531345,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 640,
+            "main_or_upper1_dot_ns": 83940,
+            "main_or_upper1_call_ns": 597713,
+            "upper2plus_pack_ns": 23393,
+            "upper2plus_dot_ns": 15776,
+            "upper2plus_call_ns": 287016
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "dense",
+          "repeat": 5,
+          "gemm_ns": 1477967,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 76676,
+            "main_or_upper1_call_ns": 566098,
+            "upper2plus_pack_ns": 256,
+            "upper2plus_dot_ns": 38433,
+            "upper2plus_call_ns": 281001
+          },
+          "max_sparse_workspace_bytes": 0
+        }
+      ]
+    },
+    {
+      "capture": "qk-l0-h6.npz",
+      "sha256": "33a222ebc34a96c3a41db9474e100dd01c1aab002deee703f7874b5e7bb574eb",
+      "bitwise_integer_gemm": true,
+      "runs": [
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 1,
+          "gemm_ns": 1494384,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 75330,
+            "main_or_upper1_call_ns": 571283,
+            "upper2plus_pack_ns": 21633,
+            "upper2plus_dot_ns": 15744,
+            "upper2plus_call_ns": 283498
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 1,
+          "gemm_ns": 1788377,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 75810,
+            "main_or_upper1_call_ns": 829275,
+            "upper2plus_pack_ns": 22082,
+            "upper2plus_dot_ns": 12544,
+            "upper2plus_call_ns": 282057
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "dense",
+          "repeat": 1,
+          "gemm_ns": 1481488,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 480,
+            "main_or_upper1_dot_ns": 75682,
+            "main_or_upper1_call_ns": 565587,
+            "upper2plus_pack_ns": 160,
+            "upper2plus_dot_ns": 37921,
+            "upper2plus_call_ns": 283625
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 2,
+          "gemm_ns": 1475247,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 75491,
+            "main_or_upper1_call_ns": 566705,
+            "upper2plus_pack_ns": 288,
+            "upper2plus_dot_ns": 37665,
+            "upper2plus_call_ns": 283849
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 2,
+          "gemm_ns": 1502865,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 76226,
+            "main_or_upper1_call_ns": 572338,
+            "upper2plus_pack_ns": 23105,
+            "upper2plus_dot_ns": 12352,
+            "upper2plus_call_ns": 283177
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 2,
+          "gemm_ns": 1476015,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 448,
+            "main_or_upper1_dot_ns": 75809,
+            "main_or_upper1_call_ns": 562483,
+            "upper2plus_pack_ns": 21409,
+            "upper2plus_dot_ns": 16672,
+            "upper2plus_call_ns": 280938
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 3,
+          "gemm_ns": 1495184,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 640,
+            "main_or_upper1_dot_ns": 76453,
+            "main_or_upper1_call_ns": 564657,
+            "upper2plus_pack_ns": 20354,
+            "upper2plus_dot_ns": 15488,
+            "upper2plus_call_ns": 280808
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 3,
+          "gemm_ns": 1571858,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 640,
+            "main_or_upper1_dot_ns": 83201,
+            "main_or_upper1_call_ns": 605781,
+            "upper2plus_pack_ns": 21634,
+            "upper2plus_dot_ns": 13536,
+            "upper2plus_call_ns": 303370
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "dense",
+          "repeat": 3,
+          "gemm_ns": 1752089,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 75649,
+            "main_or_upper1_call_ns": 818363,
+            "upper2plus_pack_ns": 288,
+            "upper2plus_dot_ns": 37728,
+            "upper2plus_call_ns": 291689
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 4,
+          "gemm_ns": 1512944,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 75363,
+            "main_or_upper1_call_ns": 594035,
+            "upper2plus_pack_ns": 288,
+            "upper2plus_dot_ns": 37346,
+            "upper2plus_call_ns": 282697
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 4,
+          "gemm_ns": 1464079,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 75235,
+            "main_or_upper1_call_ns": 560689,
+            "upper2plus_pack_ns": 23168,
+            "upper2plus_dot_ns": 12353,
+            "upper2plus_call_ns": 278729
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 4,
+          "gemm_ns": 1471759,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 480,
+            "main_or_upper1_dot_ns": 75620,
+            "main_or_upper1_call_ns": 567697,
+            "upper2plus_pack_ns": 21474,
+            "upper2plus_dot_ns": 17056,
+            "upper2plus_call_ns": 282793
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 5,
+          "gemm_ns": 1623156,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 75619,
+            "main_or_upper1_call_ns": 574355,
+            "upper2plus_pack_ns": 22112,
+            "upper2plus_dot_ns": 15521,
+            "upper2plus_call_ns": 284265
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 5,
+          "gemm_ns": 1457359,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 75587,
+            "main_or_upper1_call_ns": 558610,
+            "upper2plus_pack_ns": 20256,
+            "upper2plus_dot_ns": 12256,
+            "upper2plus_call_ns": 274985
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "dense",
+          "repeat": 5,
+          "gemm_ns": 1517649,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 75426,
+            "main_or_upper1_call_ns": 597492,
+            "upper2plus_pack_ns": 288,
+            "upper2plus_dot_ns": 37730,
+            "upper2plus_call_ns": 290633
+          },
+          "max_sparse_workspace_bytes": 0
+        }
+      ]
+    },
+    {
+      "capture": "qk-l0-h11.npz",
+      "sha256": "1c8de310e1cd6feea742eb80fd6eaf6daf6eb1ddad962c91f46c6ea70ff5c08f",
+      "bitwise_integer_gemm": true,
+      "runs": [
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 1,
+          "gemm_ns": 1518865,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 640,
+            "main_or_upper1_dot_ns": 78178,
+            "main_or_upper1_call_ns": 573874,
+            "upper2plus_pack_ns": 20353,
+            "upper2plus_dot_ns": 14400,
+            "upper2plus_call_ns": 280682
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 1,
+          "gemm_ns": 1455535,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 76930,
+            "main_or_upper1_call_ns": 562065,
+            "upper2plus_pack_ns": 19040,
+            "upper2plus_dot_ns": 13152,
+            "upper2plus_call_ns": 270249
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "dense",
+          "repeat": 1,
+          "gemm_ns": 1493328,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 77314,
+            "main_or_upper1_call_ns": 585267,
+            "upper2plus_pack_ns": 256,
+            "upper2plus_dot_ns": 41795,
+            "upper2plus_call_ns": 280584
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 2,
+          "gemm_ns": 1454638,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 76482,
+            "main_or_upper1_call_ns": 558193,
+            "upper2plus_pack_ns": 192,
+            "upper2plus_dot_ns": 40739,
+            "upper2plus_call_ns": 277896
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 2,
+          "gemm_ns": 1447503,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 76259,
+            "main_or_upper1_call_ns": 555858,
+            "upper2plus_pack_ns": 22912,
+            "upper2plus_dot_ns": 12768,
+            "upper2plus_call_ns": 272427
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 2,
+          "gemm_ns": 1556114,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 84419,
+            "main_or_upper1_call_ns": 611697,
+            "upper2plus_pack_ns": 20736,
+            "upper2plus_dot_ns": 15168,
+            "upper2plus_call_ns": 294377
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 3,
+          "gemm_ns": 1790937,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 416,
+            "main_or_upper1_dot_ns": 84996,
+            "main_or_upper1_call_ns": 822905,
+            "upper2plus_pack_ns": 22146,
+            "upper2plus_dot_ns": 17440,
+            "upper2plus_call_ns": 294408
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 3,
+          "gemm_ns": 1490352,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 81667,
+            "main_or_upper1_call_ns": 569203,
+            "upper2plus_pack_ns": 19680,
+            "upper2plus_dot_ns": 15137,
+            "upper2plus_call_ns": 278409
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "dense",
+          "repeat": 3,
+          "gemm_ns": 1449903,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 77538,
+            "main_or_upper1_call_ns": 556753,
+            "upper2plus_pack_ns": 224,
+            "upper2plus_dot_ns": 38464,
+            "upper2plus_call_ns": 277322
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 4,
+          "gemm_ns": 1444430,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 76676,
+            "main_or_upper1_call_ns": 553392,
+            "upper2plus_pack_ns": 256,
+            "upper2plus_dot_ns": 38528,
+            "upper2plus_call_ns": 277320
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 4,
+          "gemm_ns": 1541233,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 81858,
+            "main_or_upper1_call_ns": 579412,
+            "upper2plus_pack_ns": 22210,
+            "upper2plus_dot_ns": 12960,
+            "upper2plus_call_ns": 281160
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 4,
+          "gemm_ns": 1463247,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 78241,
+            "main_or_upper1_call_ns": 564435,
+            "upper2plus_pack_ns": 19009,
+            "upper2plus_dot_ns": 15136,
+            "upper2plus_call_ns": 275625
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 5,
+          "gemm_ns": 1438927,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 76579,
+            "main_or_upper1_call_ns": 554420,
+            "upper2plus_pack_ns": 18144,
+            "upper2plus_dot_ns": 14240,
+            "upper2plus_call_ns": 268808
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 5,
+          "gemm_ns": 1501617,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 80866,
+            "main_or_upper1_call_ns": 596981,
+            "upper2plus_pack_ns": 17408,
+            "upper2plus_dot_ns": 12896,
+            "upper2plus_call_ns": 282089
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "dense",
+          "repeat": 5,
+          "gemm_ns": 1678997,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 640,
+            "main_or_upper1_dot_ns": 76706,
+            "main_or_upper1_call_ns": 559059,
+            "upper2plus_pack_ns": 256,
+            "upper2plus_dot_ns": 38528,
+            "upper2plus_call_ns": 498576
+          },
+          "max_sparse_workspace_bytes": 0
+        }
+      ]
+    },
+    {
+      "capture": "pv-l0-h0.npz",
+      "sha256": "e549d215c01a562089de39b522fe67dbd7ff8ecb06c577787e8f421ea5594d76",
+      "bitwise_integer_gemm": true,
+      "runs": [
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 1,
+          "gemm_ns": 482447,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 64,
+            "main_or_upper1_dot_ns": 22529,
+            "main_or_upper1_call_ns": 155556,
+            "upper2plus_pack_ns": 576,
+            "upper2plus_dot_ns": 352,
+            "upper2plus_call_ns": 62050
+          },
+          "max_sparse_workspace_bytes": 42
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 1,
+          "gemm_ns": 475151,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 192,
+            "main_or_upper1_dot_ns": 22528,
+            "main_or_upper1_call_ns": 154693,
+            "upper2plus_pack_ns": 608,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 61346
+          },
+          "max_sparse_workspace_bytes": 42
+        },
+        {
+          "mode": "dense",
+          "repeat": 1,
+          "gemm_ns": 475408,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 22562,
+            "main_or_upper1_call_ns": 155781,
+            "upper2plus_pack_ns": 96,
+            "upper2plus_dot_ns": 640,
+            "upper2plus_call_ns": 60578
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 2,
+          "gemm_ns": 469807,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 22625,
+            "main_or_upper1_call_ns": 151908,
+            "upper2plus_pack_ns": 96,
+            "upper2plus_dot_ns": 608,
+            "upper2plus_call_ns": 60994
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 2,
+          "gemm_ns": 469071,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 22433,
+            "main_or_upper1_call_ns": 153028,
+            "upper2plus_pack_ns": 576,
+            "upper2plus_dot_ns": 416,
+            "upper2plus_call_ns": 61954
+          },
+          "max_sparse_workspace_bytes": 42
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 2,
+          "gemm_ns": 470191,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 22368,
+            "main_or_upper1_call_ns": 153828,
+            "upper2plus_pack_ns": 448,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 61570
+          },
+          "max_sparse_workspace_bytes": 42
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 3,
+          "gemm_ns": 501616,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 37633,
+            "main_or_upper1_call_ns": 176454,
+            "upper2plus_pack_ns": 576,
+            "upper2plus_dot_ns": 352,
+            "upper2plus_call_ns": 64450
+          },
+          "max_sparse_workspace_bytes": 42
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 3,
+          "gemm_ns": 477903,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 22528,
+            "main_or_upper1_call_ns": 155878,
+            "upper2plus_pack_ns": 512,
+            "upper2plus_dot_ns": 320,
+            "upper2plus_call_ns": 62754
+          },
+          "max_sparse_workspace_bytes": 42
+        },
+        {
+          "mode": "dense",
+          "repeat": 3,
+          "gemm_ns": 466959,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 22433,
+            "main_or_upper1_call_ns": 153509,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 640,
+            "upper2plus_call_ns": 60450
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 4,
+          "gemm_ns": 465679,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 22305,
+            "main_or_upper1_call_ns": 150821,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 576,
+            "upper2plus_call_ns": 61186
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 4,
+          "gemm_ns": 470799,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 22337,
+            "main_or_upper1_call_ns": 153861,
+            "upper2plus_pack_ns": 576,
+            "upper2plus_dot_ns": 288,
+            "upper2plus_call_ns": 62946
+          },
+          "max_sparse_workspace_bytes": 42
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 4,
+          "gemm_ns": 469712,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 22498,
+            "main_or_upper1_call_ns": 153637,
+            "upper2plus_pack_ns": 576,
+            "upper2plus_dot_ns": 352,
+            "upper2plus_call_ns": 60770
+          },
+          "max_sparse_workspace_bytes": 42
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 5,
+          "gemm_ns": 469263,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 24034,
+            "main_or_upper1_call_ns": 154852,
+            "upper2plus_pack_ns": 672,
+            "upper2plus_dot_ns": 352,
+            "upper2plus_call_ns": 60194
+          },
+          "max_sparse_workspace_bytes": 42
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 5,
+          "gemm_ns": 465582,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 22402,
+            "main_or_upper1_call_ns": 152260,
+            "upper2plus_pack_ns": 512,
+            "upper2plus_dot_ns": 320,
+            "upper2plus_call_ns": 60898
+          },
+          "max_sparse_workspace_bytes": 42
+        },
+        {
+          "mode": "dense",
+          "repeat": 5,
+          "gemm_ns": 508657,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 23457,
+            "main_or_upper1_call_ns": 174118,
+            "upper2plus_pack_ns": 96,
+            "upper2plus_dot_ns": 608,
+            "upper2plus_call_ns": 74755
+          },
+          "max_sparse_workspace_bytes": 0
+        }
+      ]
+    },
+    {
+      "capture": "pv-l0-h6.npz",
+      "sha256": "e2e373a52ce9f044eccb84e49a33c5406a43deffc1f3c8b8f1eb73b28e3d6016",
+      "bitwise_integer_gemm": true,
+      "runs": [
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 1,
+          "gemm_ns": 488528,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 22850,
+            "main_or_upper1_call_ns": 160261,
+            "upper2plus_pack_ns": 640,
+            "upper2plus_dot_ns": 352,
+            "upper2plus_call_ns": 60674
+          },
+          "max_sparse_workspace_bytes": 36
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 1,
+          "gemm_ns": 486704,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 28928,
+            "main_or_upper1_call_ns": 162150,
+            "upper2plus_pack_ns": 704,
+            "upper2plus_dot_ns": 288,
+            "upper2plus_call_ns": 62050
+          },
+          "max_sparse_workspace_bytes": 36
+        },
+        {
+          "mode": "dense",
+          "repeat": 1,
+          "gemm_ns": 475215,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 22849,
+            "main_or_upper1_call_ns": 154852,
+            "upper2plus_pack_ns": 96,
+            "upper2plus_dot_ns": 576,
+            "upper2plus_call_ns": 60642
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 2,
+          "gemm_ns": 474575,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 22784,
+            "main_or_upper1_call_ns": 153381,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 512,
+            "upper2plus_call_ns": 61186
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 2,
+          "gemm_ns": 779993,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 192,
+            "main_or_upper1_dot_ns": 23136,
+            "main_or_upper1_call_ns": 447086,
+            "upper2plus_pack_ns": 608,
+            "upper2plus_dot_ns": 288,
+            "upper2plus_call_ns": 62882
+          },
+          "max_sparse_workspace_bytes": 36
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 2,
+          "gemm_ns": 482928,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 192,
+            "main_or_upper1_dot_ns": 22978,
+            "main_or_upper1_call_ns": 158597,
+            "upper2plus_pack_ns": 705,
+            "upper2plus_dot_ns": 416,
+            "upper2plus_call_ns": 61954
+          },
+          "max_sparse_workspace_bytes": 36
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 3,
+          "gemm_ns": 477327,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 22944,
+            "main_or_upper1_call_ns": 155973,
+            "upper2plus_pack_ns": 480,
+            "upper2plus_dot_ns": 416,
+            "upper2plus_call_ns": 62210
+          },
+          "max_sparse_workspace_bytes": 36
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 3,
+          "gemm_ns": 468815,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 22688,
+            "main_or_upper1_call_ns": 152102,
+            "upper2plus_pack_ns": 640,
+            "upper2plus_dot_ns": 320,
+            "upper2plus_call_ns": 60706
+          },
+          "max_sparse_workspace_bytes": 36
+        },
+        {
+          "mode": "dense",
+          "repeat": 3,
+          "gemm_ns": 470735,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 22880,
+            "main_or_upper1_call_ns": 156325,
+            "upper2plus_pack_ns": 96,
+            "upper2plus_dot_ns": 608,
+            "upper2plus_call_ns": 59330
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 4,
+          "gemm_ns": 472111,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 22977,
+            "main_or_upper1_call_ns": 152709,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 736,
+            "upper2plus_call_ns": 60770
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 4,
+          "gemm_ns": 473488,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 22754,
+            "main_or_upper1_call_ns": 154885,
+            "upper2plus_pack_ns": 512,
+            "upper2plus_dot_ns": 416,
+            "upper2plus_call_ns": 62082
+          },
+          "max_sparse_workspace_bytes": 36
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 4,
+          "gemm_ns": 509552,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 28674,
+            "main_or_upper1_call_ns": 183589,
+            "upper2plus_pack_ns": 608,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 65858
+          },
+          "max_sparse_workspace_bytes": 36
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 5,
+          "gemm_ns": 496784,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 224,
+            "main_or_upper1_dot_ns": 22784,
+            "main_or_upper1_call_ns": 155526,
+            "upper2plus_pack_ns": 608,
+            "upper2plus_dot_ns": 320,
+            "upper2plus_call_ns": 62786
+          },
+          "max_sparse_workspace_bytes": 36
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 5,
+          "gemm_ns": 477647,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 22688,
+            "main_or_upper1_call_ns": 155846,
+            "upper2plus_pack_ns": 576,
+            "upper2plus_dot_ns": 288,
+            "upper2plus_call_ns": 60385
+          },
+          "max_sparse_workspace_bytes": 36
+        },
+        {
+          "mode": "dense",
+          "repeat": 5,
+          "gemm_ns": 474127,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 22688,
+            "main_or_upper1_call_ns": 154533,
+            "upper2plus_pack_ns": 32,
+            "upper2plus_dot_ns": 480,
+            "upper2plus_call_ns": 62114
+          },
+          "max_sparse_workspace_bytes": 0
+        }
+      ]
+    },
+    {
+      "capture": "pv-l0-h11.npz",
+      "sha256": "a8c84148ce19f74d97baa8d39a78c5d0c6160dbff9e085074989bf900d67ad14",
+      "bitwise_integer_gemm": true,
+      "runs": [
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 1,
+          "gemm_ns": 476207,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 18401,
+            "main_or_upper1_call_ns": 152677,
+            "upper2plus_pack_ns": 672,
+            "upper2plus_dot_ns": 416,
+            "upper2plus_call_ns": 62146
+          },
+          "max_sparse_workspace_bytes": 24
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 1,
+          "gemm_ns": 513840,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 192,
+            "main_or_upper1_dot_ns": 18177,
+            "main_or_upper1_call_ns": 151364,
+            "upper2plus_pack_ns": 768,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 64226
+          },
+          "max_sparse_workspace_bytes": 24
+        },
+        {
+          "mode": "dense",
+          "repeat": 1,
+          "gemm_ns": 497936,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 18305,
+            "main_or_upper1_call_ns": 152804,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 480,
+            "upper2plus_call_ns": 63586
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 2,
+          "gemm_ns": 502832,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 18241,
+            "main_or_upper1_call_ns": 153732,
+            "upper2plus_pack_ns": 32,
+            "upper2plus_dot_ns": 672,
+            "upper2plus_call_ns": 61762
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 2,
+          "gemm_ns": 491120,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 21249,
+            "main_or_upper1_call_ns": 156102,
+            "upper2plus_pack_ns": 608,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 62274
+          },
+          "max_sparse_workspace_bytes": 24
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 2,
+          "gemm_ns": 470799,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 18177,
+            "main_or_upper1_call_ns": 152997,
+            "upper2plus_pack_ns": 480,
+            "upper2plus_dot_ns": 352,
+            "upper2plus_call_ns": 62274
+          },
+          "max_sparse_workspace_bytes": 24
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 3,
+          "gemm_ns": 483152,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 192,
+            "main_or_upper1_dot_ns": 18209,
+            "main_or_upper1_call_ns": 152165,
+            "upper2plus_pack_ns": 608,
+            "upper2plus_dot_ns": 352,
+            "upper2plus_call_ns": 74786
+          },
+          "max_sparse_workspace_bytes": 24
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 3,
+          "gemm_ns": 484239,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 20864,
+            "main_or_upper1_call_ns": 164550,
+            "upper2plus_pack_ns": 640,
+            "upper2plus_dot_ns": 352,
+            "upper2plus_call_ns": 62754
+          },
+          "max_sparse_workspace_bytes": 24
+        },
+        {
+          "mode": "dense",
+          "repeat": 3,
+          "gemm_ns": 461583,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 18241,
+            "main_or_upper1_call_ns": 149253,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 416,
+            "upper2plus_call_ns": 60737
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 4,
+          "gemm_ns": 493616,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 192,
+            "main_or_upper1_dot_ns": 18112,
+            "main_or_upper1_call_ns": 170855,
+            "upper2plus_pack_ns": 32,
+            "upper2plus_dot_ns": 544,
+            "upper2plus_call_ns": 61954
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 4,
+          "gemm_ns": 478448,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 18080,
+            "main_or_upper1_call_ns": 152677,
+            "upper2plus_pack_ns": 672,
+            "upper2plus_dot_ns": 320,
+            "upper2plus_call_ns": 73571
+          },
+          "max_sparse_workspace_bytes": 24
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 4,
+          "gemm_ns": 465999,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 21025,
+            "main_or_upper1_call_ns": 152516,
+            "upper2plus_pack_ns": 640,
+            "upper2plus_dot_ns": 352,
+            "upper2plus_call_ns": 61090
+          },
+          "max_sparse_workspace_bytes": 24
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 5,
+          "gemm_ns": 462702,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 161,
+            "main_or_upper1_dot_ns": 18145,
+            "main_or_upper1_call_ns": 149700,
+            "upper2plus_pack_ns": 640,
+            "upper2plus_dot_ns": 288,
+            "upper2plus_call_ns": 60962
+          },
+          "max_sparse_workspace_bytes": 24
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 5,
+          "gemm_ns": 462031,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 18145,
+            "main_or_upper1_call_ns": 152549,
+            "upper2plus_pack_ns": 416,
+            "upper2plus_dot_ns": 288,
+            "upper2plus_call_ns": 60161
+          },
+          "max_sparse_workspace_bytes": 24
+        },
+        {
+          "mode": "dense",
+          "repeat": 5,
+          "gemm_ns": 755128,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 21057,
+            "main_or_upper1_call_ns": 152997,
+            "upper2plus_pack_ns": 32,
+            "upper2plus_dot_ns": 448,
+            "upper2plus_call_ns": 328970
+          },
+          "max_sparse_workspace_bytes": 0
+        }
+      ]
+    },
+    {
+      "capture": "qk-l5-h0.npz",
+      "sha256": "0e182c21a943065d03e306cea6363df6ed4f14885245cb06af909d711e1174fd",
+      "bitwise_integer_gemm": true,
+      "runs": [
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 1,
+          "gemm_ns": 1578034,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 77763,
+            "main_or_upper1_call_ns": 590065,
+            "upper2plus_pack_ns": 27201,
+            "upper2plus_dot_ns": 19136,
+            "upper2plus_call_ns": 303434
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 1,
+          "gemm_ns": 1550545,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 75811,
+            "main_or_upper1_call_ns": 597714,
+            "upper2plus_pack_ns": 25440,
+            "upper2plus_dot_ns": 16161,
+            "upper2plus_call_ns": 297674
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "dense",
+          "repeat": 1,
+          "gemm_ns": 1573939,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 76132,
+            "main_or_upper1_call_ns": 592594,
+            "upper2plus_pack_ns": 288,
+            "upper2plus_dot_ns": 40673,
+            "upper2plus_call_ns": 327594
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 2,
+          "gemm_ns": 1565075,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 77573,
+            "main_or_upper1_call_ns": 603601,
+            "upper2plus_pack_ns": 224,
+            "upper2plus_dot_ns": 36706,
+            "upper2plus_call_ns": 306185
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 2,
+          "gemm_ns": 2176294,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 83777,
+            "main_or_upper1_call_ns": 648949,
+            "upper2plus_pack_ns": 30401,
+            "upper2plus_dot_ns": 16256,
+            "upper2plus_call_ns": 857820
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 2,
+          "gemm_ns": 1550162,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 641,
+            "main_or_upper1_dot_ns": 94531,
+            "main_or_upper1_call_ns": 602322,
+            "upper2plus_pack_ns": 27233,
+            "upper2plus_dot_ns": 21921,
+            "upper2plus_call_ns": 295018
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 3,
+          "gemm_ns": 1707319,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 640,
+            "main_or_upper1_dot_ns": 80357,
+            "main_or_upper1_call_ns": 732248,
+            "upper2plus_pack_ns": 25058,
+            "upper2plus_dot_ns": 19009,
+            "upper2plus_call_ns": 292521
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 3,
+          "gemm_ns": 1617300,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 92099,
+            "main_or_upper1_call_ns": 626356,
+            "upper2plus_pack_ns": 24033,
+            "upper2plus_dot_ns": 16449,
+            "upper2plus_call_ns": 308970
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "dense",
+          "repeat": 3,
+          "gemm_ns": 1780602,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 480,
+            "main_or_upper1_dot_ns": 85348,
+            "main_or_upper1_call_ns": 610578,
+            "upper2plus_pack_ns": 256,
+            "upper2plus_dot_ns": 39009,
+            "upper2plus_call_ns": 290410
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 4,
+          "gemm_ns": 1535537,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 545,
+            "main_or_upper1_dot_ns": 98883,
+            "main_or_upper1_call_ns": 604178,
+            "upper2plus_pack_ns": 320,
+            "upper2plus_dot_ns": 41697,
+            "upper2plus_call_ns": 288970
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 4,
+          "gemm_ns": 1493936,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 76066,
+            "main_or_upper1_call_ns": 572146,
+            "upper2plus_pack_ns": 29729,
+            "upper2plus_dot_ns": 14176,
+            "upper2plus_call_ns": 288553
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 4,
+          "gemm_ns": 1797018,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 192548,
+            "main_or_upper1_call_ns": 718647,
+            "upper2plus_pack_ns": 29984,
+            "upper2plus_dot_ns": 20993,
+            "upper2plus_call_ns": 318378
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 5,
+          "gemm_ns": 2031649,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 640,
+            "main_or_upper1_dot_ns": 160070,
+            "main_or_upper1_call_ns": 937212,
+            "upper2plus_pack_ns": 29570,
+            "upper2plus_dot_ns": 19104,
+            "upper2plus_call_ns": 396526
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 5,
+          "gemm_ns": 2070691,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 85698,
+            "main_or_upper1_call_ns": 763897,
+            "upper2plus_pack_ns": 29826,
+            "upper2plus_dot_ns": 120931,
+            "upper2plus_call_ns": 512721
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "dense",
+          "repeat": 5,
+          "gemm_ns": 1520336,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 75939,
+            "main_or_upper1_call_ns": 599250,
+            "upper2plus_pack_ns": 256,
+            "upper2plus_dot_ns": 39425,
+            "upper2plus_call_ns": 284584
+          },
+          "max_sparse_workspace_bytes": 0
+        }
+      ]
+    },
+    {
+      "capture": "qk-l5-h6.npz",
+      "sha256": "e2ba6f6d3fabbe34b7950c1fde22f3095250cd3c3bcc4a1d78a670a79443b3c7",
+      "bitwise_integer_gemm": true,
+      "runs": [
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 1,
+          "gemm_ns": 1548497,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 480,
+            "main_or_upper1_dot_ns": 77121,
+            "main_or_upper1_call_ns": 598289,
+            "upper2plus_pack_ns": 22529,
+            "upper2plus_dot_ns": 15712,
+            "upper2plus_call_ns": 296618
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 1,
+          "gemm_ns": 2022305,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 640,
+            "main_or_upper1_dot_ns": 76964,
+            "main_or_upper1_call_ns": 632082,
+            "upper2plus_pack_ns": 22912,
+            "upper2plus_dot_ns": 16833,
+            "upper2plus_call_ns": 682997
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "dense",
+          "repeat": 1,
+          "gemm_ns": 1499408,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 480,
+            "main_or_upper1_dot_ns": 76930,
+            "main_or_upper1_call_ns": 576595,
+            "upper2plus_pack_ns": 288,
+            "upper2plus_dot_ns": 37281,
+            "upper2plus_call_ns": 281833
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 2,
+          "gemm_ns": 1554194,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 704,
+            "main_or_upper1_dot_ns": 77122,
+            "main_or_upper1_call_ns": 582738,
+            "upper2plus_pack_ns": 288,
+            "upper2plus_dot_ns": 37376,
+            "upper2plus_call_ns": 315946
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 2,
+          "gemm_ns": 1492912,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 480,
+            "main_or_upper1_dot_ns": 77122,
+            "main_or_upper1_call_ns": 573972,
+            "upper2plus_pack_ns": 23968,
+            "upper2plus_dot_ns": 12737,
+            "upper2plus_call_ns": 286186
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 2,
+          "gemm_ns": 1526289,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 77186,
+            "main_or_upper1_call_ns": 587797,
+            "upper2plus_pack_ns": 22432,
+            "upper2plus_dot_ns": 16929,
+            "upper2plus_call_ns": 293834
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 3,
+          "gemm_ns": 1610388,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 76800,
+            "main_or_upper1_call_ns": 632342,
+            "upper2plus_pack_ns": 22336,
+            "upper2plus_dot_ns": 15457,
+            "upper2plus_call_ns": 307753
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 3,
+          "gemm_ns": 1552242,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 76931,
+            "main_or_upper1_call_ns": 611093,
+            "upper2plus_pack_ns": 20800,
+            "upper2plus_dot_ns": 13408,
+            "upper2plus_call_ns": 298635
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "dense",
+          "repeat": 3,
+          "gemm_ns": 1552722,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 76707,
+            "main_or_upper1_call_ns": 576337,
+            "upper2plus_pack_ns": 192,
+            "upper2plus_dot_ns": 37793,
+            "upper2plus_call_ns": 298890
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 4,
+          "gemm_ns": 1996128,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 77218,
+            "main_or_upper1_call_ns": 1039968,
+            "upper2plus_pack_ns": 256,
+            "upper2plus_dot_ns": 37633,
+            "upper2plus_call_ns": 301897
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 4,
+          "gemm_ns": 1519249,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 76962,
+            "main_or_upper1_call_ns": 590643,
+            "upper2plus_pack_ns": 24929,
+            "upper2plus_dot_ns": 12288,
+            "upper2plus_call_ns": 287240
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 4,
+          "gemm_ns": 1521809,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 77252,
+            "main_or_upper1_call_ns": 575154,
+            "upper2plus_pack_ns": 23425,
+            "upper2plus_dot_ns": 17152,
+            "upper2plus_call_ns": 290120
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 5,
+          "gemm_ns": 1471183,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 76644,
+            "main_or_upper1_call_ns": 567186,
+            "upper2plus_pack_ns": 22177,
+            "upper2plus_dot_ns": 16288,
+            "upper2plus_call_ns": 281481
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 5,
+          "gemm_ns": 1504592,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 77412,
+            "main_or_upper1_call_ns": 573106,
+            "upper2plus_pack_ns": 20321,
+            "upper2plus_dot_ns": 12129,
+            "upper2plus_call_ns": 284520
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "dense",
+          "repeat": 5,
+          "gemm_ns": 1474448,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 76833,
+            "main_or_upper1_call_ns": 568883,
+            "upper2plus_pack_ns": 352,
+            "upper2plus_dot_ns": 37378,
+            "upper2plus_call_ns": 281257
+          },
+          "max_sparse_workspace_bytes": 0
+        }
+      ]
+    },
+    {
+      "capture": "qk-l5-h11.npz",
+      "sha256": "f2c06ddbee244806a594a110d5db592709545ed1c76469e922def59d6b84b016",
+      "bitwise_integer_gemm": true,
+      "runs": [
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 1,
+          "gemm_ns": 1467695,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 79652,
+            "main_or_upper1_call_ns": 568754,
+            "upper2plus_pack_ns": 14944,
+            "upper2plus_dot_ns": 7713,
+            "upper2plus_call_ns": 265448
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 1,
+          "gemm_ns": 1519376,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 86914,
+            "main_or_upper1_call_ns": 588019,
+            "upper2plus_pack_ns": 13504,
+            "upper2plus_dot_ns": 7073,
+            "upper2plus_call_ns": 266473
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "dense",
+          "repeat": 1,
+          "gemm_ns": 1470448,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 75554,
+            "main_or_upper1_call_ns": 564373,
+            "upper2plus_pack_ns": 288,
+            "upper2plus_dot_ns": 40769,
+            "upper2plus_call_ns": 281416
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 2,
+          "gemm_ns": 1922461,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 640,
+            "main_or_upper1_dot_ns": 105318,
+            "main_or_upper1_call_ns": 979744,
+            "upper2plus_pack_ns": 352,
+            "upper2plus_dot_ns": 37474,
+            "upper2plus_call_ns": 287945
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 2,
+          "gemm_ns": 1533298,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 81827,
+            "main_or_upper1_call_ns": 584148,
+            "upper2plus_pack_ns": 15712,
+            "upper2plus_dot_ns": 6944,
+            "upper2plus_call_ns": 278122
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 2,
+          "gemm_ns": 1459822,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 78626,
+            "main_or_upper1_call_ns": 565905,
+            "upper2plus_pack_ns": 14113,
+            "upper2plus_dot_ns": 8544,
+            "upper2plus_call_ns": 263368
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 3,
+          "gemm_ns": 1558899,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 83554,
+            "main_or_upper1_call_ns": 616597,
+            "upper2plus_pack_ns": 14688,
+            "upper2plus_dot_ns": 8160,
+            "upper2plus_call_ns": 289290
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 3,
+          "gemm_ns": 1692278,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 672,
+            "main_or_upper1_dot_ns": 75906,
+            "main_or_upper1_call_ns": 566546,
+            "upper2plus_pack_ns": 13952,
+            "upper2plus_dot_ns": 7680,
+            "upper2plus_call_ns": 489521
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "dense",
+          "repeat": 3,
+          "gemm_ns": 1522417,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 83234,
+            "main_or_upper1_call_ns": 584947,
+            "upper2plus_pack_ns": 224,
+            "upper2plus_dot_ns": 44322,
+            "upper2plus_call_ns": 285480
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 4,
+          "gemm_ns": 1462831,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 76003,
+            "main_or_upper1_call_ns": 559891,
+            "upper2plus_pack_ns": 320,
+            "upper2plus_dot_ns": 36545,
+            "upper2plus_call_ns": 274824
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 4,
+          "gemm_ns": 1482927,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 448,
+            "main_or_upper1_dot_ns": 75395,
+            "main_or_upper1_call_ns": 564691,
+            "upper2plus_pack_ns": 15169,
+            "upper2plus_dot_ns": 7617,
+            "upper2plus_call_ns": 265320
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 4,
+          "gemm_ns": 1735992,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 81797,
+            "main_or_upper1_call_ns": 728439,
+            "upper2plus_pack_ns": 15744,
+            "upper2plus_dot_ns": 11200,
+            "upper2plus_call_ns": 277993
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 5,
+          "gemm_ns": 1455503,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 704,
+            "main_or_upper1_dot_ns": 75363,
+            "main_or_upper1_call_ns": 564689,
+            "upper2plus_pack_ns": 13504,
+            "upper2plus_dot_ns": 8224,
+            "upper2plus_call_ns": 261448
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 5,
+          "gemm_ns": 1494896,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 640,
+            "main_or_upper1_dot_ns": 75778,
+            "main_or_upper1_call_ns": 567795,
+            "upper2plus_pack_ns": 13345,
+            "upper2plus_dot_ns": 7072,
+            "upper2plus_call_ns": 263816
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "dense",
+          "repeat": 5,
+          "gemm_ns": 1692982,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 480,
+            "main_or_upper1_dot_ns": 104387,
+            "main_or_upper1_call_ns": 652437,
+            "upper2plus_pack_ns": 288,
+            "upper2plus_dot_ns": 45345,
+            "upper2plus_call_ns": 293739
+          },
+          "max_sparse_workspace_bytes": 0
+        }
+      ]
+    },
+    {
+      "capture": "pv-l5-h0.npz",
+      "sha256": "6450f1b016fdf5e88de5d7e2365497cc90618fbcbb8a95e765e78a5dd87f1b08",
+      "bitwise_integer_gemm": true,
+      "runs": [
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 1,
+          "gemm_ns": 496720,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 25793,
+            "main_or_upper1_call_ns": 160037,
+            "upper2plus_pack_ns": 640,
+            "upper2plus_dot_ns": 448,
+            "upper2plus_call_ns": 64642
+          },
+          "max_sparse_workspace_bytes": 92
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 1,
+          "gemm_ns": 481968,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 26144,
+            "main_or_upper1_call_ns": 157669,
+            "upper2plus_pack_ns": 544,
+            "upper2plus_dot_ns": 352,
+            "upper2plus_call_ns": 60674
+          },
+          "max_sparse_workspace_bytes": 92
+        },
+        {
+          "mode": "dense",
+          "repeat": 1,
+          "gemm_ns": 479887,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 192,
+            "main_or_upper1_dot_ns": 25377,
+            "main_or_upper1_call_ns": 156132,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 1056,
+            "upper2plus_call_ns": 62114
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 2,
+          "gemm_ns": 480368,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 25568,
+            "main_or_upper1_call_ns": 158950,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 960,
+            "upper2plus_call_ns": 61794
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 2,
+          "gemm_ns": 482479,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 25761,
+            "main_or_upper1_call_ns": 156836,
+            "upper2plus_pack_ns": 736,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 62370
+          },
+          "max_sparse_workspace_bytes": 92
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 2,
+          "gemm_ns": 478127,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 25568,
+            "main_or_upper1_call_ns": 156742,
+            "upper2plus_pack_ns": 672,
+            "upper2plus_dot_ns": 480,
+            "upper2plus_call_ns": 62786
+          },
+          "max_sparse_workspace_bytes": 92
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 3,
+          "gemm_ns": 532498,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 25634,
+            "main_or_upper1_call_ns": 157093,
+            "upper2plus_pack_ns": 672,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 63938
+          },
+          "max_sparse_workspace_bytes": 92
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 3,
+          "gemm_ns": 503632,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 25568,
+            "main_or_upper1_call_ns": 168358,
+            "upper2plus_pack_ns": 736,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 64578
+          },
+          "max_sparse_workspace_bytes": 92
+        },
+        {
+          "mode": "dense",
+          "repeat": 3,
+          "gemm_ns": 483279,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 25600,
+            "main_or_upper1_call_ns": 162054,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 928,
+            "upper2plus_call_ns": 60705
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 4,
+          "gemm_ns": 480656,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 25634,
+            "main_or_upper1_call_ns": 159461,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 896,
+            "upper2plus_call_ns": 61410
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 4,
+          "gemm_ns": 474959,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 25537,
+            "main_or_upper1_call_ns": 155396,
+            "upper2plus_pack_ns": 672,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 61218
+          },
+          "max_sparse_workspace_bytes": 92
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 4,
+          "gemm_ns": 475663,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 25664,
+            "main_or_upper1_call_ns": 155654,
+            "upper2plus_pack_ns": 576,
+            "upper2plus_dot_ns": 480,
+            "upper2plus_call_ns": 61698
+          },
+          "max_sparse_workspace_bytes": 92
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 5,
+          "gemm_ns": 479024,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 25857,
+            "main_or_upper1_call_ns": 158437,
+            "upper2plus_pack_ns": 672,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 62818
+          },
+          "max_sparse_workspace_bytes": 92
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 5,
+          "gemm_ns": 472815,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 25730,
+            "main_or_upper1_call_ns": 155300,
+            "upper2plus_pack_ns": 672,
+            "upper2plus_dot_ns": 448,
+            "upper2plus_call_ns": 61666
+          },
+          "max_sparse_workspace_bytes": 92
+        },
+        {
+          "mode": "dense",
+          "repeat": 5,
+          "gemm_ns": 561362,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 25568,
+            "main_or_upper1_call_ns": 164486,
+            "upper2plus_pack_ns": 96,
+            "upper2plus_dot_ns": 1024,
+            "upper2plus_call_ns": 80067
+          },
+          "max_sparse_workspace_bytes": 0
+        }
+      ]
+    },
+    {
+      "capture": "pv-l5-h6.npz",
+      "sha256": "837a0f791c2b85fb47ebc38bc57dbb956eb3e92f4c940e66c3d30e424a01fc9e",
+      "bitwise_integer_gemm": true,
+      "runs": [
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 1,
+          "gemm_ns": 494320,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 27553,
+            "main_or_upper1_call_ns": 164613,
+            "upper2plus_pack_ns": 576,
+            "upper2plus_dot_ns": 416,
+            "upper2plus_call_ns": 62722
+          },
+          "max_sparse_workspace_bytes": 56
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 1,
+          "gemm_ns": 487952,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 27552,
+            "main_or_upper1_call_ns": 160805,
+            "upper2plus_pack_ns": 736,
+            "upper2plus_dot_ns": 288,
+            "upper2plus_call_ns": 62530
+          },
+          "max_sparse_workspace_bytes": 56
+        },
+        {
+          "mode": "dense",
+          "repeat": 1,
+          "gemm_ns": 546385,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 28226,
+            "main_or_upper1_call_ns": 212614,
+            "upper2plus_pack_ns": 32,
+            "upper2plus_dot_ns": 736,
+            "upper2plus_call_ns": 64546
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 2,
+          "gemm_ns": 545394,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 37633,
+            "main_or_upper1_call_ns": 185606,
+            "upper2plus_pack_ns": 96,
+            "upper2plus_dot_ns": 736,
+            "upper2plus_call_ns": 64002
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 2,
+          "gemm_ns": 496368,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 192,
+            "main_or_upper1_dot_ns": 27360,
+            "main_or_upper1_call_ns": 162022,
+            "upper2plus_pack_ns": 640,
+            "upper2plus_dot_ns": 352,
+            "upper2plus_call_ns": 64578
+          },
+          "max_sparse_workspace_bytes": 56
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 2,
+          "gemm_ns": 493456,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 27392,
+            "main_or_upper1_call_ns": 163814,
+            "upper2plus_pack_ns": 672,
+            "upper2plus_dot_ns": 416,
+            "upper2plus_call_ns": 63234
+          },
+          "max_sparse_workspace_bytes": 56
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 3,
+          "gemm_ns": 488719,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 27392,
+            "main_or_upper1_call_ns": 161030,
+            "upper2plus_pack_ns": 576,
+            "upper2plus_dot_ns": 480,
+            "upper2plus_call_ns": 62626
+          },
+          "max_sparse_workspace_bytes": 56
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 3,
+          "gemm_ns": 779161,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 27809,
+            "main_or_upper1_call_ns": 447375,
+            "upper2plus_pack_ns": 544,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 63075
+          },
+          "max_sparse_workspace_bytes": 56
+        },
+        {
+          "mode": "dense",
+          "repeat": 3,
+          "gemm_ns": 493968,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 27489,
+            "main_or_upper1_call_ns": 162308,
+            "upper2plus_pack_ns": 96,
+            "upper2plus_dot_ns": 768,
+            "upper2plus_call_ns": 62914
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 4,
+          "gemm_ns": 495792,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 28705,
+            "main_or_upper1_call_ns": 164293,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 800,
+            "upper2plus_call_ns": 62978
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 4,
+          "gemm_ns": 529873,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 36194,
+            "main_or_upper1_call_ns": 173766,
+            "upper2plus_pack_ns": 672,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 64130
+          },
+          "max_sparse_workspace_bytes": 56
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 4,
+          "gemm_ns": 491984,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 27585,
+            "main_or_upper1_call_ns": 162725,
+            "upper2plus_pack_ns": 768,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 63938
+          },
+          "max_sparse_workspace_bytes": 56
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 5,
+          "gemm_ns": 485232,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 27425,
+            "main_or_upper1_call_ns": 161573,
+            "upper2plus_pack_ns": 704,
+            "upper2plus_dot_ns": 416,
+            "upper2plus_call_ns": 62914
+          },
+          "max_sparse_workspace_bytes": 56
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 5,
+          "gemm_ns": 484975,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 27328,
+            "main_or_upper1_call_ns": 161734,
+            "upper2plus_pack_ns": 736,
+            "upper2plus_dot_ns": 256,
+            "upper2plus_call_ns": 61986
+          },
+          "max_sparse_workspace_bytes": 56
+        },
+        {
+          "mode": "dense",
+          "repeat": 5,
+          "gemm_ns": 486832,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 27426,
+            "main_or_upper1_call_ns": 162469,
+            "upper2plus_pack_ns": 32,
+            "upper2plus_dot_ns": 832,
+            "upper2plus_call_ns": 62498
+          },
+          "max_sparse_workspace_bytes": 0
+        }
+      ]
+    },
+    {
+      "capture": "pv-l5-h11.npz",
+      "sha256": "27f7d06f046a361c5f3f5a540801efa24687abe46c1eeb96d9e20e5a27d24f20",
+      "bitwise_integer_gemm": true,
+      "runs": [
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 1,
+          "gemm_ns": 498672,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 24001,
+            "main_or_upper1_call_ns": 161669,
+            "upper2plus_pack_ns": 640,
+            "upper2plus_dot_ns": 480,
+            "upper2plus_call_ns": 63458
+          },
+          "max_sparse_workspace_bytes": 40
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 1,
+          "gemm_ns": 492208,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 192,
+            "main_or_upper1_dot_ns": 24034,
+            "main_or_upper1_call_ns": 160069,
+            "upper2plus_pack_ns": 608,
+            "upper2plus_dot_ns": 288,
+            "upper2plus_call_ns": 63778
+          },
+          "max_sparse_workspace_bytes": 40
+        },
+        {
+          "mode": "dense",
+          "repeat": 1,
+          "gemm_ns": 482960,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 192,
+            "main_or_upper1_dot_ns": 23808,
+            "main_or_upper1_call_ns": 157798,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 544,
+            "upper2plus_call_ns": 61314
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 2,
+          "gemm_ns": 480143,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 23745,
+            "main_or_upper1_call_ns": 156004,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 576,
+            "upper2plus_call_ns": 61634
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 2,
+          "gemm_ns": 479247,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 192,
+            "main_or_upper1_dot_ns": 23776,
+            "main_or_upper1_call_ns": 156038,
+            "upper2plus_pack_ns": 736,
+            "upper2plus_dot_ns": 256,
+            "upper2plus_call_ns": 61250
+          },
+          "max_sparse_workspace_bytes": 40
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 2,
+          "gemm_ns": 477808,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 192,
+            "main_or_upper1_dot_ns": 23778,
+            "main_or_upper1_call_ns": 154533,
+            "upper2plus_pack_ns": 769,
+            "upper2plus_dot_ns": 352,
+            "upper2plus_call_ns": 61442
+          },
+          "max_sparse_workspace_bytes": 40
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 3,
+          "gemm_ns": 478831,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 23776,
+            "main_or_upper1_call_ns": 156004,
+            "upper2plus_pack_ns": 736,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 61954
+          },
+          "max_sparse_workspace_bytes": 40
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 3,
+          "gemm_ns": 516561,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 192,
+            "main_or_upper1_dot_ns": 23969,
+            "main_or_upper1_call_ns": 187591,
+            "upper2plus_pack_ns": 640,
+            "upper2plus_dot_ns": 288,
+            "upper2plus_call_ns": 63490
+          },
+          "max_sparse_workspace_bytes": 40
+        },
+        {
+          "mode": "dense",
+          "repeat": 3,
+          "gemm_ns": 500848,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 23905,
+            "main_or_upper1_call_ns": 172357,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 576,
+            "upper2plus_call_ns": 62242
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 4,
+          "gemm_ns": 494928,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 23744,
+            "main_or_upper1_call_ns": 156486,
+            "upper2plus_pack_ns": 96,
+            "upper2plus_dot_ns": 576,
+            "upper2plus_call_ns": 60770
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 4,
+          "gemm_ns": 483599,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 23713,
+            "main_or_upper1_call_ns": 156452,
+            "upper2plus_pack_ns": 672,
+            "upper2plus_dot_ns": 288,
+            "upper2plus_call_ns": 62018
+          },
+          "max_sparse_workspace_bytes": 40
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 4,
+          "gemm_ns": 491792,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 23904,
+            "main_or_upper1_call_ns": 155397,
+            "upper2plus_pack_ns": 672,
+            "upper2plus_dot_ns": 352,
+            "upper2plus_call_ns": 74242
+          },
+          "max_sparse_workspace_bytes": 40
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 5,
+          "gemm_ns": 489168,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 24512,
+            "main_or_upper1_call_ns": 161029,
+            "upper2plus_pack_ns": 576,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 63202
+          },
+          "max_sparse_workspace_bytes": 40
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 5,
+          "gemm_ns": 679093,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 192,
+            "main_or_upper1_dot_ns": 24001,
+            "main_or_upper1_call_ns": 328906,
+            "upper2plus_pack_ns": 608,
+            "upper2plus_dot_ns": 416,
+            "upper2plus_call_ns": 70594
+          },
+          "max_sparse_workspace_bytes": 40
+        },
+        {
+          "mode": "dense",
+          "repeat": 5,
+          "gemm_ns": 557425,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 24000,
+            "main_or_upper1_call_ns": 198535,
+            "upper2plus_pack_ns": 96,
+            "upper2plus_dot_ns": 544,
+            "upper2plus_call_ns": 76802
+          },
+          "max_sparse_workspace_bytes": 0
+        }
+      ]
+    },
+    {
+      "capture": "qk-l8-h0.npz",
+      "sha256": "748f3e9bf767dfafe9c70f2333eda27dba0ba1236d43c6243bccee0094ab9d5d",
+      "bitwise_integer_gemm": true,
+      "runs": [
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 1,
+          "gemm_ns": 1767865,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 480,
+            "main_or_upper1_dot_ns": 79780,
+            "main_or_upper1_call_ns": 605074,
+            "upper2plus_pack_ns": 18592,
+            "upper2plus_dot_ns": 12929,
+            "upper2plus_call_ns": 298825
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 1,
+          "gemm_ns": 1470031,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 76674,
+            "main_or_upper1_call_ns": 568304,
+            "upper2plus_pack_ns": 16449,
+            "upper2plus_dot_ns": 9440,
+            "upper2plus_call_ns": 271497
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "dense",
+          "repeat": 1,
+          "gemm_ns": 1680150,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 87492,
+            "main_or_upper1_call_ns": 628850,
+            "upper2plus_pack_ns": 256,
+            "upper2plus_dot_ns": 40000,
+            "upper2plus_call_ns": 289673
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 2,
+          "gemm_ns": 1672790,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 82176,
+            "main_or_upper1_call_ns": 722297,
+            "upper2plus_pack_ns": 320,
+            "upper2plus_dot_ns": 37153,
+            "upper2plus_call_ns": 292266
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 2,
+          "gemm_ns": 1579251,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 80867,
+            "main_or_upper1_call_ns": 617268,
+            "upper2plus_pack_ns": 19328,
+            "upper2plus_dot_ns": 10176,
+            "upper2plus_call_ns": 317673
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 2,
+          "gemm_ns": 1770617,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 77185,
+            "main_or_upper1_call_ns": 846394,
+            "upper2plus_pack_ns": 18305,
+            "upper2plus_dot_ns": 12064,
+            "upper2plus_call_ns": 281513
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 3,
+          "gemm_ns": 1463855,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 78084,
+            "main_or_upper1_call_ns": 565811,
+            "upper2plus_pack_ns": 18016,
+            "upper2plus_dot_ns": 10113,
+            "upper2plus_call_ns": 270536
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 3,
+          "gemm_ns": 1763832,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 126627,
+            "main_or_upper1_call_ns": 692663,
+            "upper2plus_pack_ns": 18466,
+            "upper2plus_dot_ns": 11649,
+            "upper2plus_call_ns": 296266
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "dense",
+          "repeat": 3,
+          "gemm_ns": 1599124,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 81825,
+            "main_or_upper1_call_ns": 680885,
+            "upper2plus_pack_ns": 320,
+            "upper2plus_dot_ns": 37025,
+            "upper2plus_call_ns": 281513
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 4,
+          "gemm_ns": 1505392,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 82597,
+            "main_or_upper1_call_ns": 591379,
+            "upper2plus_pack_ns": 224,
+            "upper2plus_dot_ns": 36899,
+            "upper2plus_call_ns": 280424
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 4,
+          "gemm_ns": 1452623,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 80580,
+            "main_or_upper1_call_ns": 566321,
+            "upper2plus_pack_ns": 18464,
+            "upper2plus_dot_ns": 8672,
+            "upper2plus_call_ns": 269609
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 4,
+          "gemm_ns": 1440430,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 76802,
+            "main_or_upper1_call_ns": 557200,
+            "upper2plus_pack_ns": 16960,
+            "upper2plus_dot_ns": 10304,
+            "upper2plus_call_ns": 267404
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 5,
+          "gemm_ns": 1504368,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 81350,
+            "main_or_upper1_call_ns": 572592,
+            "upper2plus_pack_ns": 17376,
+            "upper2plus_dot_ns": 12097,
+            "upper2plus_call_ns": 294153
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 5,
+          "gemm_ns": 1691894,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 80384,
+            "main_or_upper1_call_ns": 567826,
+            "upper2plus_pack_ns": 17024,
+            "upper2plus_dot_ns": 10304,
+            "upper2plus_call_ns": 500752
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "dense",
+          "repeat": 5,
+          "gemm_ns": 1458095,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 77505,
+            "main_or_upper1_call_ns": 552242,
+            "upper2plus_pack_ns": 288,
+            "upper2plus_dot_ns": 37024,
+            "upper2plus_call_ns": 273032
+          },
+          "max_sparse_workspace_bytes": 0
+        }
+      ]
+    },
+    {
+      "capture": "qk-l8-h6.npz",
+      "sha256": "f170ccdb052a67dd1f44ac4979d2ff78d021be10a9278b2e49a73ae91f6bb6b2",
+      "bitwise_integer_gemm": true,
+      "runs": [
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 1,
+          "gemm_ns": 1500208,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 480,
+            "main_or_upper1_dot_ns": 77987,
+            "main_or_upper1_call_ns": 568945,
+            "upper2plus_pack_ns": 20097,
+            "upper2plus_dot_ns": 14752,
+            "upper2plus_call_ns": 299721
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 1,
+          "gemm_ns": 1464751,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 75553,
+            "main_or_upper1_call_ns": 566036,
+            "upper2plus_pack_ns": 17792,
+            "upper2plus_dot_ns": 9505,
+            "upper2plus_call_ns": 269897
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "dense",
+          "repeat": 1,
+          "gemm_ns": 1894877,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 89987,
+            "main_or_upper1_call_ns": 937023,
+            "upper2plus_pack_ns": 256,
+            "upper2plus_dot_ns": 42145,
+            "upper2plus_call_ns": 294411
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 2,
+          "gemm_ns": 1481680,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 75555,
+            "main_or_upper1_call_ns": 570354,
+            "upper2plus_pack_ns": 288,
+            "upper2plus_dot_ns": 38465,
+            "upper2plus_call_ns": 279209
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 2,
+          "gemm_ns": 1661621,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 640,
+            "main_or_upper1_dot_ns": 180294,
+            "main_or_upper1_call_ns": 713141,
+            "upper2plus_pack_ns": 21568,
+            "upper2plus_dot_ns": 10978,
+            "upper2plus_call_ns": 285864
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 2,
+          "gemm_ns": 1583251,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 640,
+            "main_or_upper1_dot_ns": 84865,
+            "main_or_upper1_call_ns": 590583,
+            "upper2plus_pack_ns": 20448,
+            "upper2plus_dot_ns": 13250,
+            "upper2plus_call_ns": 285833
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 3,
+          "gemm_ns": 1828411,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 176324,
+            "main_or_upper1_call_ns": 713239,
+            "upper2plus_pack_ns": 21345,
+            "upper2plus_dot_ns": 21505,
+            "upper2plus_call_ns": 326122
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 3,
+          "gemm_ns": 1546866,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 82369,
+            "main_or_upper1_call_ns": 585780,
+            "upper2plus_pack_ns": 20641,
+            "upper2plus_dot_ns": 11648,
+            "upper2plus_call_ns": 310826
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "dense",
+          "repeat": 3,
+          "gemm_ns": 1457134,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 75554,
+            "main_or_upper1_call_ns": 561073,
+            "upper2plus_pack_ns": 288,
+            "upper2plus_dot_ns": 36738,
+            "upper2plus_call_ns": 277096
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 4,
+          "gemm_ns": 1477744,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 75553,
+            "main_or_upper1_call_ns": 558770,
+            "upper2plus_pack_ns": 288,
+            "upper2plus_dot_ns": 41664,
+            "upper2plus_call_ns": 302221
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 4,
+          "gemm_ns": 1878172,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 79363,
+            "main_or_upper1_call_ns": 599955,
+            "upper2plus_pack_ns": 21730,
+            "upper2plus_dot_ns": 9344,
+            "upper2plus_call_ns": 640405
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 4,
+          "gemm_ns": 1462575,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 76899,
+            "main_or_upper1_call_ns": 562098,
+            "upper2plus_pack_ns": 19296,
+            "upper2plus_dot_ns": 12288,
+            "upper2plus_call_ns": 272489
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 5,
+          "gemm_ns": 1492560,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 80546,
+            "main_or_upper1_call_ns": 568723,
+            "upper2plus_pack_ns": 17504,
+            "upper2plus_dot_ns": 26369,
+            "upper2plus_call_ns": 293514
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 5,
+          "gemm_ns": 1489264,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 80257,
+            "main_or_upper1_call_ns": 574001,
+            "upper2plus_pack_ns": 16960,
+            "upper2plus_dot_ns": 9472,
+            "upper2plus_call_ns": 269737
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "dense",
+          "repeat": 5,
+          "gemm_ns": 1623892,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 78500,
+            "main_or_upper1_call_ns": 578385,
+            "upper2plus_pack_ns": 320,
+            "upper2plus_dot_ns": 40033,
+            "upper2plus_call_ns": 406286
+          },
+          "max_sparse_workspace_bytes": 0
+        }
+      ]
+    },
+    {
+      "capture": "qk-l8-h11.npz",
+      "sha256": "18c1d06c95f6a8d3253f1c8ea83896d3d4f4c3b5810c8680d120c1fd136ef660",
+      "bitwise_integer_gemm": true,
+      "runs": [
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 1,
+          "gemm_ns": 20623477,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 672,
+            "main_or_upper1_dot_ns": 84709,
+            "main_or_upper1_call_ns": 19269993,
+            "upper2plus_pack_ns": 24640,
+            "upper2plus_dot_ns": 14080,
+            "upper2plus_call_ns": 342829
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 1,
+          "gemm_ns": 1798457,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 91043,
+            "main_or_upper1_call_ns": 720823,
+            "upper2plus_pack_ns": 22176,
+            "upper2plus_dot_ns": 12448,
+            "upper2plus_call_ns": 316235
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "dense",
+          "repeat": 1,
+          "gemm_ns": 1590483,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 81920,
+            "main_or_upper1_call_ns": 611890,
+            "upper2plus_pack_ns": 320,
+            "upper2plus_dot_ns": 45057,
+            "upper2plus_call_ns": 306218
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 2,
+          "gemm_ns": 1594547,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 77248,
+            "main_or_upper1_call_ns": 601558,
+            "upper2plus_pack_ns": 256,
+            "upper2plus_dot_ns": 37441,
+            "upper2plus_call_ns": 307499
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 2,
+          "gemm_ns": 1555954,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 448,
+            "main_or_upper1_dot_ns": 76866,
+            "main_or_upper1_call_ns": 601237,
+            "upper2plus_pack_ns": 20674,
+            "upper2plus_dot_ns": 9889,
+            "upper2plus_call_ns": 290217
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 2,
+          "gemm_ns": 1550802,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 76800,
+            "main_or_upper1_call_ns": 596823,
+            "upper2plus_pack_ns": 19104,
+            "upper2plus_dot_ns": 12962,
+            "upper2plus_call_ns": 290281
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 3,
+          "gemm_ns": 1576371,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 91746,
+            "main_or_upper1_call_ns": 614964,
+            "upper2plus_pack_ns": 17792,
+            "upper2plus_dot_ns": 13344,
+            "upper2plus_call_ns": 297322
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 3,
+          "gemm_ns": 1775481,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 77188,
+            "main_or_upper1_call_ns": 816631,
+            "upper2plus_pack_ns": 18048,
+            "upper2plus_dot_ns": 10048,
+            "upper2plus_call_ns": 289098
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "dense",
+          "repeat": 3,
+          "gemm_ns": 1606355,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 76803,
+            "main_or_upper1_call_ns": 644276,
+            "upper2plus_pack_ns": 288,
+            "upper2plus_dot_ns": 37121,
+            "upper2plus_call_ns": 293673
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 4,
+          "gemm_ns": 1530801,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 672,
+            "main_or_upper1_dot_ns": 76675,
+            "main_or_upper1_call_ns": 590484,
+            "upper2plus_pack_ns": 288,
+            "upper2plus_dot_ns": 36994,
+            "upper2plus_call_ns": 289866
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 4,
+          "gemm_ns": 1533298,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 76673,
+            "main_or_upper1_call_ns": 589941,
+            "upper2plus_pack_ns": 20385,
+            "upper2plus_dot_ns": 9857,
+            "upper2plus_call_ns": 284681
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 4,
+          "gemm_ns": 1763000,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 77024,
+            "main_or_upper1_call_ns": 667447,
+            "upper2plus_pack_ns": 19296,
+            "upper2plus_dot_ns": 13760,
+            "upper2plus_call_ns": 288330
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 5,
+          "gemm_ns": 1519313,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 672,
+            "main_or_upper1_dot_ns": 77188,
+            "main_or_upper1_call_ns": 588658,
+            "upper2plus_pack_ns": 16960,
+            "upper2plus_dot_ns": 12482,
+            "upper2plus_call_ns": 281417
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 5,
+          "gemm_ns": 1593363,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 87328,
+            "main_or_upper1_call_ns": 610775,
+            "upper2plus_pack_ns": 17697,
+            "upper2plus_dot_ns": 13121,
+            "upper2plus_call_ns": 319306
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "dense",
+          "repeat": 5,
+          "gemm_ns": 1590771,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 76738,
+            "main_or_upper1_call_ns": 647701,
+            "upper2plus_pack_ns": 192,
+            "upper2plus_dot_ns": 37122,
+            "upper2plus_call_ns": 288201
+          },
+          "max_sparse_workspace_bytes": 0
+        }
+      ]
+    },
+    {
+      "capture": "pv-l8-h0.npz",
+      "sha256": "1593bf68b84f036543d02b34a768b9f3bf9eeb578c807f40494d84d9bee0fb97",
+      "bitwise_integer_gemm": true,
+      "runs": [
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 1,
+          "gemm_ns": 495888,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 19553,
+            "main_or_upper1_call_ns": 158661,
+            "upper2plus_pack_ns": 544,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 63874
+          },
+          "max_sparse_workspace_bytes": 22
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 1,
+          "gemm_ns": 492368,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 19713,
+            "main_or_upper1_call_ns": 157189,
+            "upper2plus_pack_ns": 480,
+            "upper2plus_dot_ns": 256,
+            "upper2plus_call_ns": 63842
+          },
+          "max_sparse_workspace_bytes": 22
+        },
+        {
+          "mode": "dense",
+          "repeat": 1,
+          "gemm_ns": 491728,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 19618,
+            "main_or_upper1_call_ns": 157477,
+            "upper2plus_pack_ns": 96,
+            "upper2plus_dot_ns": 480,
+            "upper2plus_call_ns": 62818
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 2,
+          "gemm_ns": 771417,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 19712,
+            "main_or_upper1_call_ns": 178469,
+            "upper2plus_pack_ns": 96,
+            "upper2plus_dot_ns": 416,
+            "upper2plus_call_ns": 68931
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 2,
+          "gemm_ns": 498704,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 19649,
+            "main_or_upper1_call_ns": 158597,
+            "upper2plus_pack_ns": 640,
+            "upper2plus_dot_ns": 288,
+            "upper2plus_call_ns": 63650
+          },
+          "max_sparse_workspace_bytes": 22
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 2,
+          "gemm_ns": 569330,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 192,
+            "main_or_upper1_dot_ns": 19617,
+            "main_or_upper1_call_ns": 170821,
+            "upper2plus_pack_ns": 640,
+            "upper2plus_dot_ns": 320,
+            "upper2plus_call_ns": 64546
+          },
+          "max_sparse_workspace_bytes": 22
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 3,
+          "gemm_ns": 493296,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 19681,
+            "main_or_upper1_call_ns": 159012,
+            "upper2plus_pack_ns": 672,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 63746
+          },
+          "max_sparse_workspace_bytes": 22
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 3,
+          "gemm_ns": 487024,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 19777,
+            "main_or_upper1_call_ns": 156837,
+            "upper2plus_pack_ns": 576,
+            "upper2plus_dot_ns": 288,
+            "upper2plus_call_ns": 61890
+          },
+          "max_sparse_workspace_bytes": 22
+        },
+        {
+          "mode": "dense",
+          "repeat": 3,
+          "gemm_ns": 493552,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 19873,
+            "main_or_upper1_call_ns": 158565,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 480,
+            "upper2plus_call_ns": 61730
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 4,
+          "gemm_ns": 479599,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 19520,
+            "main_or_upper1_call_ns": 152646,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 448,
+            "upper2plus_call_ns": 60738
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 4,
+          "gemm_ns": 478640,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 19554,
+            "main_or_upper1_call_ns": 152517,
+            "upper2plus_pack_ns": 576,
+            "upper2plus_dot_ns": 256,
+            "upper2plus_call_ns": 61730
+          },
+          "max_sparse_workspace_bytes": 22
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 4,
+          "gemm_ns": 478543,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 192,
+            "main_or_upper1_dot_ns": 19585,
+            "main_or_upper1_call_ns": 152932,
+            "upper2plus_pack_ns": 576,
+            "upper2plus_dot_ns": 416,
+            "upper2plus_call_ns": 62722
+          },
+          "max_sparse_workspace_bytes": 22
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 5,
+          "gemm_ns": 505456,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 19392,
+            "main_or_upper1_call_ns": 152646,
+            "upper2plus_pack_ns": 608,
+            "upper2plus_dot_ns": 512,
+            "upper2plus_call_ns": 67010
+          },
+          "max_sparse_workspace_bytes": 22
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 5,
+          "gemm_ns": 485424,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 19810,
+            "main_or_upper1_call_ns": 155461,
+            "upper2plus_pack_ns": 576,
+            "upper2plus_dot_ns": 288,
+            "upper2plus_call_ns": 62946
+          },
+          "max_sparse_workspace_bytes": 22
+        },
+        {
+          "mode": "dense",
+          "repeat": 5,
+          "gemm_ns": 475919,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 19616,
+            "main_or_upper1_call_ns": 151397,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 512,
+            "upper2plus_call_ns": 61282
+          },
+          "max_sparse_workspace_bytes": 0
+        }
+      ]
+    },
+    {
+      "capture": "pv-l8-h6.npz",
+      "sha256": "a20fd30b8296b39422a78d8337cc068dc335e5152dbcef120fc6ffbeb026669b",
+      "bitwise_integer_gemm": true,
+      "runs": [
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 1,
+          "gemm_ns": 493967,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 21024,
+            "main_or_upper1_call_ns": 160454,
+            "upper2plus_pack_ns": 640,
+            "upper2plus_dot_ns": 352,
+            "upper2plus_call_ns": 64739
+          },
+          "max_sparse_workspace_bytes": 28
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 1,
+          "gemm_ns": 807866,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 192,
+            "main_or_upper1_dot_ns": 21376,
+            "main_or_upper1_call_ns": 319467,
+            "upper2plus_pack_ns": 704,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 73730
+          },
+          "max_sparse_workspace_bytes": 28
+        },
+        {
+          "mode": "dense",
+          "repeat": 1,
+          "gemm_ns": 502800,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 21120,
+            "main_or_upper1_call_ns": 161285,
+            "upper2plus_pack_ns": 97,
+            "upper2plus_dot_ns": 512,
+            "upper2plus_call_ns": 64322
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 2,
+          "gemm_ns": 759384,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 21056,
+            "main_or_upper1_call_ns": 160101,
+            "upper2plus_pack_ns": 96,
+            "upper2plus_dot_ns": 544,
+            "upper2plus_call_ns": 318058
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 2,
+          "gemm_ns": 497360,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 21120,
+            "main_or_upper1_call_ns": 162246,
+            "upper2plus_pack_ns": 576,
+            "upper2plus_dot_ns": 224,
+            "upper2plus_call_ns": 62594
+          },
+          "max_sparse_workspace_bytes": 28
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 2,
+          "gemm_ns": 483824,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 21153,
+            "main_or_upper1_call_ns": 156388,
+            "upper2plus_pack_ns": 672,
+            "upper2plus_dot_ns": 352,
+            "upper2plus_call_ns": 62242
+          },
+          "max_sparse_workspace_bytes": 28
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 3,
+          "gemm_ns": 481776,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 21024,
+            "main_or_upper1_call_ns": 155653,
+            "upper2plus_pack_ns": 704,
+            "upper2plus_dot_ns": 320,
+            "upper2plus_call_ns": 61602
+          },
+          "max_sparse_workspace_bytes": 28
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 3,
+          "gemm_ns": 477199,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 21185,
+            "main_or_upper1_call_ns": 155748,
+            "upper2plus_pack_ns": 640,
+            "upper2plus_dot_ns": 320,
+            "upper2plus_call_ns": 60482
+          },
+          "max_sparse_workspace_bytes": 28
+        },
+        {
+          "mode": "dense",
+          "repeat": 3,
+          "gemm_ns": 507664,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 21152,
+            "main_or_upper1_call_ns": 157413,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 544,
+            "upper2plus_call_ns": 64642
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 4,
+          "gemm_ns": 483856,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 21185,
+            "main_or_upper1_call_ns": 155525,
+            "upper2plus_pack_ns": 32,
+            "upper2plus_dot_ns": 544,
+            "upper2plus_call_ns": 62978
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 4,
+          "gemm_ns": 479471,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 21088,
+            "main_or_upper1_call_ns": 154565,
+            "upper2plus_pack_ns": 608,
+            "upper2plus_dot_ns": 288,
+            "upper2plus_call_ns": 62818
+          },
+          "max_sparse_workspace_bytes": 28
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 4,
+          "gemm_ns": 476463,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 21153,
+            "main_or_upper1_call_ns": 154597,
+            "upper2plus_pack_ns": 608,
+            "upper2plus_dot_ns": 448,
+            "upper2plus_call_ns": 61762
+          },
+          "max_sparse_workspace_bytes": 28
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 5,
+          "gemm_ns": 475408,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 21122,
+            "main_or_upper1_call_ns": 152708,
+            "upper2plus_pack_ns": 448,
+            "upper2plus_dot_ns": 416,
+            "upper2plus_call_ns": 61986
+          },
+          "max_sparse_workspace_bytes": 28
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 5,
+          "gemm_ns": 480591,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 21024,
+            "main_or_upper1_call_ns": 153029,
+            "upper2plus_pack_ns": 704,
+            "upper2plus_dot_ns": 288,
+            "upper2plus_call_ns": 64098
+          },
+          "max_sparse_workspace_bytes": 28
+        },
+        {
+          "mode": "dense",
+          "repeat": 5,
+          "gemm_ns": 476720,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 21025,
+            "main_or_upper1_call_ns": 154437,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 512,
+            "upper2plus_call_ns": 61442
+          },
+          "max_sparse_workspace_bytes": 0
+        }
+      ]
+    },
+    {
+      "capture": "pv-l8-h11.npz",
+      "sha256": "2f55f968486a181d7fb527b9e522d23b3e8c9c90cf434b35814e08baa169636e",
+      "bitwise_integer_gemm": true,
+      "runs": [
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 1,
+          "gemm_ns": 502224,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 19264,
+            "main_or_upper1_call_ns": 170661,
+            "upper2plus_pack_ns": 736,
+            "upper2plus_dot_ns": 320,
+            "upper2plus_call_ns": 62850
+          },
+          "max_sparse_workspace_bytes": 20
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 1,
+          "gemm_ns": 495248,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 192,
+            "main_or_upper1_dot_ns": 19040,
+            "main_or_upper1_call_ns": 162438,
+            "upper2plus_pack_ns": 576,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 64386
+          },
+          "max_sparse_workspace_bytes": 20
+        },
+        {
+          "mode": "dense",
+          "repeat": 1,
+          "gemm_ns": 478287,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 19136,
+            "main_or_upper1_call_ns": 153285,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 416,
+            "upper2plus_call_ns": 61474
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 2,
+          "gemm_ns": 478160,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 19137,
+            "main_or_upper1_call_ns": 154213,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 448,
+            "upper2plus_call_ns": 62114
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 2,
+          "gemm_ns": 473423,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 19010,
+            "main_or_upper1_call_ns": 152324,
+            "upper2plus_pack_ns": 640,
+            "upper2plus_dot_ns": 320,
+            "upper2plus_call_ns": 62914
+          },
+          "max_sparse_workspace_bytes": 20
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 2,
+          "gemm_ns": 520080,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 19104,
+            "main_or_upper1_call_ns": 154725,
+            "upper2plus_pack_ns": 832,
+            "upper2plus_dot_ns": 320,
+            "upper2plus_call_ns": 68963
+          },
+          "max_sparse_workspace_bytes": 20
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 3,
+          "gemm_ns": 481359,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 19169,
+            "main_or_upper1_call_ns": 155204,
+            "upper2plus_pack_ns": 576,
+            "upper2plus_dot_ns": 320,
+            "upper2plus_call_ns": 64162
+          },
+          "max_sparse_workspace_bytes": 20
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 3,
+          "gemm_ns": 475983,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 19168,
+            "main_or_upper1_call_ns": 152230,
+            "upper2plus_pack_ns": 640,
+            "upper2plus_dot_ns": 320,
+            "upper2plus_call_ns": 64514
+          },
+          "max_sparse_workspace_bytes": 20
+        },
+        {
+          "mode": "dense",
+          "repeat": 3,
+          "gemm_ns": 476464,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 19105,
+            "main_or_upper1_call_ns": 153253,
+            "upper2plus_pack_ns": 32,
+            "upper2plus_dot_ns": 480,
+            "upper2plus_call_ns": 63650
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 4,
+          "gemm_ns": 475727,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 19169,
+            "main_or_upper1_call_ns": 154917,
+            "upper2plus_pack_ns": 96,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 62210
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 4,
+          "gemm_ns": 476399,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 19232,
+            "main_or_upper1_call_ns": 154565,
+            "upper2plus_pack_ns": 576,
+            "upper2plus_dot_ns": 352,
+            "upper2plus_call_ns": 63202
+          },
+          "max_sparse_workspace_bytes": 20
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 4,
+          "gemm_ns": 505360,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 192,
+            "main_or_upper1_dot_ns": 19040,
+            "main_or_upper1_call_ns": 152581,
+            "upper2plus_pack_ns": 640,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 62594
+          },
+          "max_sparse_workspace_bytes": 20
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 5,
+          "gemm_ns": 509681,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 19137,
+            "main_or_upper1_call_ns": 158660,
+            "upper2plus_pack_ns": 512,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 64834
+          },
+          "max_sparse_workspace_bytes": 20
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 5,
+          "gemm_ns": 508944,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 19072,
+            "main_or_upper1_call_ns": 183013,
+            "upper2plus_pack_ns": 608,
+            "upper2plus_dot_ns": 320,
+            "upper2plus_call_ns": 64610
+          },
+          "max_sparse_workspace_bytes": 20
+        },
+        {
+          "mode": "dense",
+          "repeat": 5,
+          "gemm_ns": 754712,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 19329,
+            "main_or_upper1_call_ns": 425903,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 448,
+            "upper2plus_call_ns": 61538
+          },
+          "max_sparse_workspace_bytes": 0
+        }
+      ]
+    },
+    {
+      "capture": "qk-l11-h0.npz",
+      "sha256": "4f5b621674c53de5857a591cdcfaabdb6d3c5d7a3f26aadc9383051da55f99a3",
+      "bitwise_integer_gemm": true,
+      "runs": [
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 1,
+          "gemm_ns": 1515089,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 76450,
+            "main_or_upper1_call_ns": 578260,
+            "upper2plus_pack_ns": 28800,
+            "upper2plus_dot_ns": 21377,
+            "upper2plus_call_ns": 300297
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 1,
+          "gemm_ns": 1647221,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 83938,
+            "main_or_upper1_call_ns": 610547,
+            "upper2plus_pack_ns": 29664,
+            "upper2plus_dot_ns": 14976,
+            "upper2plus_call_ns": 295721
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "dense",
+          "repeat": 1,
+          "gemm_ns": 1533969,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 83170,
+            "main_or_upper1_call_ns": 609106,
+            "upper2plus_pack_ns": 256,
+            "upper2plus_dot_ns": 39136,
+            "upper2plus_call_ns": 289610
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 2,
+          "gemm_ns": 1473871,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 76418,
+            "main_or_upper1_call_ns": 567985,
+            "upper2plus_pack_ns": 320,
+            "upper2plus_dot_ns": 38306,
+            "upper2plus_call_ns": 284329
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 2,
+          "gemm_ns": 1807738,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 78882,
+            "main_or_upper1_call_ns": 596468,
+            "upper2plus_pack_ns": 31330,
+            "upper2plus_dot_ns": 15104,
+            "upper2plus_call_ns": 561554
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 2,
+          "gemm_ns": 1509105,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 672,
+            "main_or_upper1_dot_ns": 77124,
+            "main_or_upper1_call_ns": 578834,
+            "upper2plus_pack_ns": 29249,
+            "upper2plus_dot_ns": 20193,
+            "upper2plus_call_ns": 293097
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 3,
+          "gemm_ns": 1582803,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 76194,
+            "main_or_upper1_call_ns": 571827,
+            "upper2plus_pack_ns": 27136,
+            "upper2plus_dot_ns": 20417,
+            "upper2plus_call_ns": 288362
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 3,
+          "gemm_ns": 1564754,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 82244,
+            "main_or_upper1_call_ns": 631922,
+            "upper2plus_pack_ns": 28096,
+            "upper2plus_dot_ns": 18305,
+            "upper2plus_call_ns": 289642
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "dense",
+          "repeat": 3,
+          "gemm_ns": 1460367,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 76291,
+            "main_or_upper1_call_ns": 560945,
+            "upper2plus_pack_ns": 288,
+            "upper2plus_dot_ns": 37920,
+            "upper2plus_call_ns": 277449
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 4,
+          "gemm_ns": 1684854,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 182246,
+            "main_or_upper1_call_ns": 721334,
+            "upper2plus_pack_ns": 288,
+            "upper2plus_dot_ns": 38209,
+            "upper2plus_call_ns": 292746
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 4,
+          "gemm_ns": 1550258,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 83777,
+            "main_or_upper1_call_ns": 598034,
+            "upper2plus_pack_ns": 31104,
+            "upper2plus_dot_ns": 15168,
+            "upper2plus_call_ns": 294187
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 4,
+          "gemm_ns": 1528593,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 448,
+            "main_or_upper1_dot_ns": 76706,
+            "main_or_upper1_call_ns": 572306,
+            "upper2plus_pack_ns": 30656,
+            "upper2plus_dot_ns": 24353,
+            "upper2plus_call_ns": 326923
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 5,
+          "gemm_ns": 1774649,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 672,
+            "main_or_upper1_dot_ns": 76675,
+            "main_or_upper1_call_ns": 840570,
+            "upper2plus_pack_ns": 30145,
+            "upper2plus_dot_ns": 21952,
+            "upper2plus_call_ns": 299403
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 5,
+          "gemm_ns": 1470287,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 76355,
+            "main_or_upper1_call_ns": 563409,
+            "upper2plus_pack_ns": 27777,
+            "upper2plus_dot_ns": 15105,
+            "upper2plus_call_ns": 283177
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "dense",
+          "repeat": 5,
+          "gemm_ns": 1504976,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 85122,
+            "main_or_upper1_call_ns": 578867,
+            "upper2plus_pack_ns": 320,
+            "upper2plus_dot_ns": 38017,
+            "upper2plus_call_ns": 281097
+          },
+          "max_sparse_workspace_bytes": 0
+        }
+      ]
+    },
+    {
+      "capture": "qk-l11-h6.npz",
+      "sha256": "f9ccb316f6c234fb77f230fe44150a938184491f7bbbbfddf8dc20aef34bf9f1",
+      "bitwise_integer_gemm": true,
+      "runs": [
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 1,
+          "gemm_ns": 1487760,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 76897,
+            "main_or_upper1_call_ns": 577490,
+            "upper2plus_pack_ns": 12864,
+            "upper2plus_dot_ns": 8096,
+            "upper2plus_call_ns": 274089
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 1,
+          "gemm_ns": 1828698,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 480,
+            "main_or_upper1_dot_ns": 79458,
+            "main_or_upper1_call_ns": 910238,
+            "upper2plus_pack_ns": 12512,
+            "upper2plus_dot_ns": 6560,
+            "upper2plus_call_ns": 271144
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "dense",
+          "repeat": 1,
+          "gemm_ns": 1508049,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 480,
+            "main_or_upper1_dot_ns": 76900,
+            "main_or_upper1_call_ns": 572466,
+            "upper2plus_pack_ns": 256,
+            "upper2plus_dot_ns": 38113,
+            "upper2plus_call_ns": 296682
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 2,
+          "gemm_ns": 1474127,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 75395,
+            "main_or_upper1_call_ns": 564593,
+            "upper2plus_pack_ns": 256,
+            "upper2plus_dot_ns": 36513,
+            "upper2plus_call_ns": 279433
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 2,
+          "gemm_ns": 1507345,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 448,
+            "main_or_upper1_dot_ns": 77761,
+            "main_or_upper1_call_ns": 570323,
+            "upper2plus_pack_ns": 13184,
+            "upper2plus_dot_ns": 6304,
+            "upper2plus_call_ns": 272265
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 2,
+          "gemm_ns": 1486063,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 78851,
+            "main_or_upper1_call_ns": 577362,
+            "upper2plus_pack_ns": 12193,
+            "upper2plus_dot_ns": 7712,
+            "upper2plus_call_ns": 268201
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 3,
+          "gemm_ns": 1460399,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 76097,
+            "main_or_upper1_call_ns": 569587,
+            "upper2plus_pack_ns": 11969,
+            "upper2plus_dot_ns": 7008,
+            "upper2plus_call_ns": 262216
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 3,
+          "gemm_ns": 1518449,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 88835,
+            "main_or_upper1_call_ns": 607124,
+            "upper2plus_pack_ns": 12513,
+            "upper2plus_dot_ns": 6336,
+            "upper2plus_call_ns": 262569
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "dense",
+          "repeat": 3,
+          "gemm_ns": 1517553,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 81507,
+            "main_or_upper1_call_ns": 591474,
+            "upper2plus_pack_ns": 224,
+            "upper2plus_dot_ns": 37633,
+            "upper2plus_call_ns": 278697
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 4,
+          "gemm_ns": 1742040,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 75268,
+            "main_or_upper1_call_ns": 563025,
+            "upper2plus_pack_ns": 288,
+            "upper2plus_dot_ns": 36545,
+            "upper2plus_call_ns": 528624
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 4,
+          "gemm_ns": 1475599,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 79365,
+            "main_or_upper1_call_ns": 579696,
+            "upper2plus_pack_ns": 14176,
+            "upper2plus_dot_ns": 6400,
+            "upper2plus_call_ns": 266568
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 4,
+          "gemm_ns": 1436622,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 75553,
+            "main_or_upper1_call_ns": 555922,
+            "upper2plus_pack_ns": 12803,
+            "upper2plus_dot_ns": 7744,
+            "upper2plus_call_ns": 260456
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 5,
+          "gemm_ns": 1812570,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 86400,
+            "main_or_upper1_call_ns": 600340,
+            "upper2plus_pack_ns": 12897,
+            "upper2plus_dot_ns": 8928,
+            "upper2plus_call_ns": 286505
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 5,
+          "gemm_ns": 1458607,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 75617,
+            "main_or_upper1_call_ns": 565044,
+            "upper2plus_pack_ns": 12481,
+            "upper2plus_dot_ns": 6113,
+            "upper2plus_call_ns": 263848
+          },
+          "max_sparse_workspace_bytes": 2112
+        },
+        {
+          "mode": "dense",
+          "repeat": 5,
+          "gemm_ns": 1443630,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 75459,
+            "main_or_upper1_call_ns": 556530,
+            "upper2plus_pack_ns": 192,
+            "upper2plus_dot_ns": 36416,
+            "upper2plus_call_ns": 273832
+          },
+          "max_sparse_workspace_bytes": 0
+        }
+      ]
+    },
+    {
+      "capture": "qk-l11-h11.npz",
+      "sha256": "911da65a2e062dc2f64d959955107c6d44802a16bca06bdf417f2968981c3d65",
+      "bitwise_integer_gemm": true,
+      "runs": [
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 1,
+          "gemm_ns": 1505456,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 76322,
+            "main_or_upper1_call_ns": 571059,
+            "upper2plus_pack_ns": 14209,
+            "upper2plus_dot_ns": 10304,
+            "upper2plus_call_ns": 273929
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 1,
+          "gemm_ns": 1627701,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 672,
+            "main_or_upper1_dot_ns": 80706,
+            "main_or_upper1_call_ns": 592309,
+            "upper2plus_pack_ns": 14082,
+            "upper2plus_dot_ns": 8128,
+            "upper2plus_call_ns": 272328
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "dense",
+          "repeat": 1,
+          "gemm_ns": 1555154,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 640,
+            "main_or_upper1_dot_ns": 75459,
+            "main_or_upper1_call_ns": 565457,
+            "upper2plus_pack_ns": 256,
+            "upper2plus_dot_ns": 99619,
+            "upper2plus_call_ns": 348171
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 2,
+          "gemm_ns": 1494576,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 77058,
+            "main_or_upper1_call_ns": 577715,
+            "upper2plus_pack_ns": 320,
+            "upper2plus_dot_ns": 37473,
+            "upper2plus_call_ns": 280842
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 2,
+          "gemm_ns": 1469295,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 448,
+            "main_or_upper1_dot_ns": 75684,
+            "main_or_upper1_call_ns": 568434,
+            "upper2plus_pack_ns": 15072,
+            "upper2plus_dot_ns": 7361,
+            "upper2plus_call_ns": 267305
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 2,
+          "gemm_ns": 1557010,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 576,
+            "main_or_upper1_dot_ns": 82305,
+            "main_or_upper1_call_ns": 631892,
+            "upper2plus_pack_ns": 14240,
+            "upper2plus_dot_ns": 8896,
+            "upper2plus_call_ns": 280585
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 3,
+          "gemm_ns": 1790010,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 480,
+            "main_or_upper1_dot_ns": 78787,
+            "main_or_upper1_call_ns": 852987,
+            "upper2plus_pack_ns": 14113,
+            "upper2plus_dot_ns": 9376,
+            "upper2plus_call_ns": 285321
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 3,
+          "gemm_ns": 1478447,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 640,
+            "main_or_upper1_dot_ns": 75074,
+            "main_or_upper1_call_ns": 562257,
+            "upper2plus_pack_ns": 13984,
+            "upper2plus_dot_ns": 7648,
+            "upper2plus_call_ns": 286153
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "dense",
+          "repeat": 3,
+          "gemm_ns": 1621364,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 79108,
+            "main_or_upper1_call_ns": 583570,
+            "upper2plus_pack_ns": 224,
+            "upper2plus_dot_ns": 42562,
+            "upper2plus_call_ns": 285097
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 4,
+          "gemm_ns": 1470575,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 640,
+            "main_or_upper1_dot_ns": 78337,
+            "main_or_upper1_call_ns": 564755,
+            "upper2plus_pack_ns": 320,
+            "upper2plus_dot_ns": 37633,
+            "upper2plus_call_ns": 278921
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 4,
+          "gemm_ns": 1489200,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 480,
+            "main_or_upper1_dot_ns": 78533,
+            "main_or_upper1_call_ns": 573681,
+            "upper2plus_pack_ns": 14816,
+            "upper2plus_dot_ns": 7456,
+            "upper2plus_call_ns": 285192
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 4,
+          "gemm_ns": 1453391,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 75523,
+            "main_or_upper1_call_ns": 561393,
+            "upper2plus_pack_ns": 13952,
+            "upper2plus_dot_ns": 8864,
+            "upper2plus_call_ns": 262858
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 5,
+          "gemm_ns": 1443054,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 544,
+            "main_or_upper1_dot_ns": 75235,
+            "main_or_upper1_call_ns": 557425,
+            "upper2plus_pack_ns": 13121,
+            "upper2plus_dot_ns": 8481,
+            "upper2plus_call_ns": 259112
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 5,
+          "gemm_ns": 1489424,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 608,
+            "main_or_upper1_dot_ns": 94724,
+            "main_or_upper1_call_ns": 588466,
+            "upper2plus_pack_ns": 13152,
+            "upper2plus_dot_ns": 7360,
+            "upper2plus_call_ns": 269193
+          },
+          "max_sparse_workspace_bytes": 2180
+        },
+        {
+          "mode": "dense",
+          "repeat": 5,
+          "gemm_ns": 1708631,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 512,
+            "main_or_upper1_dot_ns": 75684,
+            "main_or_upper1_call_ns": 801817,
+            "upper2plus_pack_ns": 288,
+            "upper2plus_dot_ns": 37569,
+            "upper2plus_call_ns": 280456
+          },
+          "max_sparse_workspace_bytes": 0
+        }
+      ]
+    },
+    {
+      "capture": "pv-l11-h0.npz",
+      "sha256": "ee6dd8fde8a0e563d5ada546e1bc69be70c258b7fb87264e033476650fdc13b0",
+      "bitwise_integer_gemm": true,
+      "runs": [
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 1,
+          "gemm_ns": 495312,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 21121,
+            "main_or_upper1_call_ns": 163077,
+            "upper2plus_pack_ns": 736,
+            "upper2plus_dot_ns": 448,
+            "upper2plus_call_ns": 65826
+          },
+          "max_sparse_workspace_bytes": 30
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 1,
+          "gemm_ns": 485264,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 64,
+            "main_or_upper1_dot_ns": 21184,
+            "main_or_upper1_call_ns": 157541,
+            "upper2plus_pack_ns": 800,
+            "upper2plus_dot_ns": 256,
+            "upper2plus_call_ns": 63202
+          },
+          "max_sparse_workspace_bytes": 30
+        },
+        {
+          "mode": "dense",
+          "repeat": 1,
+          "gemm_ns": 478863,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 20992,
+            "main_or_upper1_call_ns": 155429,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 512,
+            "upper2plus_call_ns": 61186
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 2,
+          "gemm_ns": 480432,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 21248,
+            "main_or_upper1_call_ns": 154725,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 512,
+            "upper2plus_call_ns": 61794
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 2,
+          "gemm_ns": 473615,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 21153,
+            "main_or_upper1_call_ns": 152516,
+            "upper2plus_pack_ns": 640,
+            "upper2plus_dot_ns": 320,
+            "upper2plus_call_ns": 60290
+          },
+          "max_sparse_workspace_bytes": 30
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 2,
+          "gemm_ns": 502608,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 20960,
+            "main_or_upper1_call_ns": 156101,
+            "upper2plus_pack_ns": 640,
+            "upper2plus_dot_ns": 352,
+            "upper2plus_call_ns": 62306
+          },
+          "max_sparse_workspace_bytes": 30
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 3,
+          "gemm_ns": 478255,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 20928,
+            "main_or_upper1_call_ns": 156805,
+            "upper2plus_pack_ns": 736,
+            "upper2plus_dot_ns": 288,
+            "upper2plus_call_ns": 61122
+          },
+          "max_sparse_workspace_bytes": 30
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 3,
+          "gemm_ns": 472944,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 21186,
+            "main_or_upper1_call_ns": 153093,
+            "upper2plus_pack_ns": 544,
+            "upper2plus_dot_ns": 288,
+            "upper2plus_call_ns": 59618
+          },
+          "max_sparse_workspace_bytes": 30
+        },
+        {
+          "mode": "dense",
+          "repeat": 3,
+          "gemm_ns": 470863,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 21121,
+            "main_or_upper1_call_ns": 154244,
+            "upper2plus_pack_ns": 96,
+            "upper2plus_dot_ns": 480,
+            "upper2plus_call_ns": 60418
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 4,
+          "gemm_ns": 473263,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 21120,
+            "main_or_upper1_call_ns": 155269,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 512,
+            "upper2plus_call_ns": 60706
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 4,
+          "gemm_ns": 491376,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 21056,
+            "main_or_upper1_call_ns": 153702,
+            "upper2plus_pack_ns": 608,
+            "upper2plus_dot_ns": 320,
+            "upper2plus_call_ns": 61346
+          },
+          "max_sparse_workspace_bytes": 30
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 4,
+          "gemm_ns": 482255,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 20928,
+            "main_or_upper1_call_ns": 156614,
+            "upper2plus_pack_ns": 704,
+            "upper2plus_dot_ns": 448,
+            "upper2plus_call_ns": 62914
+          },
+          "max_sparse_workspace_bytes": 30
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 5,
+          "gemm_ns": 468623,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 21057,
+            "main_or_upper1_call_ns": 152709,
+            "upper2plus_pack_ns": 704,
+            "upper2plus_dot_ns": 224,
+            "upper2plus_call_ns": 60994
+          },
+          "max_sparse_workspace_bytes": 30
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 5,
+          "gemm_ns": 497168,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 21216,
+            "main_or_upper1_call_ns": 174151,
+            "upper2plus_pack_ns": 640,
+            "upper2plus_dot_ns": 256,
+            "upper2plus_call_ns": 65795
+          },
+          "max_sparse_workspace_bytes": 30
+        },
+        {
+          "mode": "dense",
+          "repeat": 5,
+          "gemm_ns": 470512,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 192,
+            "main_or_upper1_dot_ns": 21089,
+            "main_or_upper1_call_ns": 152389,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 448,
+            "upper2plus_call_ns": 60322
+          },
+          "max_sparse_workspace_bytes": 0
+        }
+      ]
+    },
+    {
+      "capture": "pv-l11-h6.npz",
+      "sha256": "6748e8b0a1e7d438293ae6fed9823cd90e1e2863a1fc59dfa4c07797569cf0de",
+      "bitwise_integer_gemm": true,
+      "runs": [
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 1,
+          "gemm_ns": 584051,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 17089,
+            "main_or_upper1_call_ns": 161253,
+            "upper2plus_pack_ns": 512,
+            "upper2plus_dot_ns": 512,
+            "upper2plus_call_ns": 63042
+          },
+          "max_sparse_workspace_bytes": 16
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 1,
+          "gemm_ns": 487600,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 16864,
+            "main_or_upper1_call_ns": 154374,
+            "upper2plus_pack_ns": 608,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 64867
+          },
+          "max_sparse_workspace_bytes": 16
+        },
+        {
+          "mode": "dense",
+          "repeat": 1,
+          "gemm_ns": 555345,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 16832,
+            "main_or_upper1_call_ns": 211591,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 416,
+            "upper2plus_call_ns": 73826
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 2,
+          "gemm_ns": 637140,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 224,
+            "main_or_upper1_dot_ns": 16865,
+            "main_or_upper1_call_ns": 179590,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 352,
+            "upper2plus_call_ns": 76322
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 2,
+          "gemm_ns": 501104,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 16769,
+            "main_or_upper1_call_ns": 172006,
+            "upper2plus_pack_ns": 736,
+            "upper2plus_dot_ns": 320,
+            "upper2plus_call_ns": 63234
+          },
+          "max_sparse_workspace_bytes": 16
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 2,
+          "gemm_ns": 909501,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 17409,
+            "main_or_upper1_call_ns": 573138,
+            "upper2plus_pack_ns": 608,
+            "upper2plus_dot_ns": 576,
+            "upper2plus_call_ns": 63170
+          },
+          "max_sparse_workspace_bytes": 16
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 3,
+          "gemm_ns": 478383,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 97,
+            "main_or_upper1_dot_ns": 17088,
+            "main_or_upper1_call_ns": 153605,
+            "upper2plus_pack_ns": 640,
+            "upper2plus_dot_ns": 448,
+            "upper2plus_call_ns": 60354
+          },
+          "max_sparse_workspace_bytes": 16
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 3,
+          "gemm_ns": 465551,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 16928,
+            "main_or_upper1_call_ns": 148037,
+            "upper2plus_pack_ns": 640,
+            "upper2plus_dot_ns": 320,
+            "upper2plus_call_ns": 59778
+          },
+          "max_sparse_workspace_bytes": 16
+        },
+        {
+          "mode": "dense",
+          "repeat": 3,
+          "gemm_ns": 489872,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 16896,
+            "main_or_upper1_call_ns": 147109,
+            "upper2plus_pack_ns": 96,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 81923
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 4,
+          "gemm_ns": 469391,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 16897,
+            "main_or_upper1_call_ns": 148964,
+            "upper2plus_pack_ns": 96,
+            "upper2plus_dot_ns": 448,
+            "upper2plus_call_ns": 59714
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 4,
+          "gemm_ns": 467183,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 16769,
+            "main_or_upper1_call_ns": 147364,
+            "upper2plus_pack_ns": 608,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 61410
+          },
+          "max_sparse_workspace_bytes": 16
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 4,
+          "gemm_ns": 462959,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 96,
+            "main_or_upper1_dot_ns": 16802,
+            "main_or_upper1_call_ns": 145988,
+            "upper2plus_pack_ns": 544,
+            "upper2plus_dot_ns": 480,
+            "upper2plus_call_ns": 60546
+          },
+          "max_sparse_workspace_bytes": 16
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 5,
+          "gemm_ns": 458382,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 16737,
+            "main_or_upper1_call_ns": 146340,
+            "upper2plus_pack_ns": 512,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 59906
+          },
+          "max_sparse_workspace_bytes": 16
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 5,
+          "gemm_ns": 460111,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 192,
+            "main_or_upper1_dot_ns": 16832,
+            "main_or_upper1_call_ns": 145989,
+            "upper2plus_pack_ns": 608,
+            "upper2plus_dot_ns": 288,
+            "upper2plus_call_ns": 61026
+          },
+          "max_sparse_workspace_bytes": 16
+        },
+        {
+          "mode": "dense",
+          "repeat": 5,
+          "gemm_ns": 481583,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 16928,
+            "main_or_upper1_call_ns": 148709,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 416,
+            "upper2plus_call_ns": 59106
+          },
+          "max_sparse_workspace_bytes": 0
+        }
+      ]
+    },
+    {
+      "capture": "pv-l11-h11.npz",
+      "sha256": "df80332cb98012a12f90581e06e7ee47b7f36d42143bdb1cbbacae8576532273",
+      "bitwise_integer_gemm": true,
+      "runs": [
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 1,
+          "gemm_ns": 504176,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 21152,
+            "main_or_upper1_call_ns": 161958,
+            "upper2plus_pack_ns": 768,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 65346
+          },
+          "max_sparse_workspace_bytes": 52
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 1,
+          "gemm_ns": 498320,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 192,
+            "main_or_upper1_dot_ns": 21185,
+            "main_or_upper1_call_ns": 160101,
+            "upper2plus_pack_ns": 832,
+            "upper2plus_dot_ns": 576,
+            "upper2plus_call_ns": 63522
+          },
+          "max_sparse_workspace_bytes": 52
+        },
+        {
+          "mode": "dense",
+          "repeat": 1,
+          "gemm_ns": 490960,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 21152,
+            "main_or_upper1_call_ns": 159909,
+            "upper2plus_pack_ns": 96,
+            "upper2plus_dot_ns": 736,
+            "upper2plus_call_ns": 63394
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 2,
+          "gemm_ns": 484623,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 64,
+            "main_or_upper1_dot_ns": 21088,
+            "main_or_upper1_call_ns": 158374,
+            "upper2plus_pack_ns": 64,
+            "upper2plus_dot_ns": 640,
+            "upper2plus_call_ns": 62594
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 2,
+          "gemm_ns": 531602,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 20961,
+            "main_or_upper1_call_ns": 157028,
+            "upper2plus_pack_ns": 864,
+            "upper2plus_dot_ns": 480,
+            "upper2plus_call_ns": 69890
+          },
+          "max_sparse_workspace_bytes": 52
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 2,
+          "gemm_ns": 510576,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 21056,
+            "main_or_upper1_call_ns": 159526,
+            "upper2plus_pack_ns": 768,
+            "upper2plus_dot_ns": 576,
+            "upper2plus_call_ns": 67362
+          },
+          "max_sparse_workspace_bytes": 52
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 3,
+          "gemm_ns": 508721,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 21120,
+            "main_or_upper1_call_ns": 170855,
+            "upper2plus_pack_ns": 800,
+            "upper2plus_dot_ns": 576,
+            "upper2plus_call_ns": 75043
+          },
+          "max_sparse_workspace_bytes": 52
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 3,
+          "gemm_ns": 487503,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 20928,
+            "main_or_upper1_call_ns": 159430,
+            "upper2plus_pack_ns": 576,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 64290
+          },
+          "max_sparse_workspace_bytes": 52
+        },
+        {
+          "mode": "dense",
+          "repeat": 3,
+          "gemm_ns": 474448,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 20930,
+            "main_or_upper1_call_ns": 154405,
+            "upper2plus_pack_ns": 32,
+            "upper2plus_dot_ns": 608,
+            "upper2plus_call_ns": 61762
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "dense",
+          "repeat": 4,
+          "gemm_ns": 474319,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 21121,
+            "main_or_upper1_call_ns": 154596,
+            "upper2plus_pack_ns": 96,
+            "upper2plus_dot_ns": 608,
+            "upper2plus_call_ns": 62178
+          },
+          "max_sparse_workspace_bytes": 0
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 4,
+          "gemm_ns": 472335,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 21088,
+            "main_or_upper1_call_ns": 153957,
+            "upper2plus_pack_ns": 544,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 60706
+          },
+          "max_sparse_workspace_bytes": 52
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 4,
+          "gemm_ns": 476175,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 21024,
+            "main_or_upper1_call_ns": 154246,
+            "upper2plus_pack_ns": 608,
+            "upper2plus_dot_ns": 544,
+            "upper2plus_call_ns": 62882
+          },
+          "max_sparse_workspace_bytes": 52
+        },
+        {
+          "mode": "sparse_unit_add",
+          "repeat": 5,
+          "gemm_ns": 547058,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 21186,
+            "main_or_upper1_call_ns": 213895,
+            "upper2plus_pack_ns": 704,
+            "upper2plus_dot_ns": 384,
+            "upper2plus_call_ns": 62978
+          },
+          "max_sparse_workspace_bytes": 52
+        },
+        {
+          "mode": "sparse_multiply",
+          "repeat": 5,
+          "gemm_ns": 484752,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 160,
+            "main_or_upper1_dot_ns": 21088,
+            "main_or_upper1_call_ns": 156901,
+            "upper2plus_pack_ns": 704,
+            "upper2plus_dot_ns": 352,
+            "upper2plus_call_ns": 62722
+          },
+          "max_sparse_workspace_bytes": 52
+        },
+        {
+          "mode": "dense",
+          "repeat": 5,
+          "gemm_ns": 476303,
+          "kernel_times_ns": {
+            "main_or_upper1_pack_ns": 128,
+            "main_or_upper1_dot_ns": 20961,
+            "main_or_upper1_call_ns": 154212,
+            "upper2plus_pack_ns": 32,
+            "upper2plus_dot_ns": 704,
+            "upper2plus_call_ns": 62818
+          },
+          "max_sparse_workspace_bytes": 0
+        }
+      ]
+    }
+  ],
+  "source_sha256": {
+    "prepare.py": "ca981c8e0836c08341cc42322da831fb2a77cd44664be1178638de0856e8b8be",
+    "verify.py": "a6e87c1901d0c225fce77265ad1afb9c8c704a49912d4a2a6ab11a79c59b4115",
+    "matrix.py": "a41c935a3b6bf8ce2b4c4da5ee0cac4da8ad99784486c22a5cba3e663de597d3",
+    "attention.py": "d6305e210f51acc1da82617f9e9766d82fc40074bbda04063b1a7392af9bfdff",
+    "native_model.cpp": "388efedcdd83d47a9f0416bfb07064cdc11bdc5a8917b90d1590ea361f71f415",
+    "profile_report.py": "22bec0112d7d5fb9e228d0bf27ba6d65b373fbebc7a8aa173cceda73f5f52fe5",
+    "native_measure.py": "349b84df12d43f85ae233c00b8ddd47666d26d8f9caf09ca2b946651f9c01e62",
+    "packet.py": "a82bac62f891ac782634e26804ea404141a8f0c99b45e8c5c2fe55a7c17eabbb",
+    "stream.py": "c3ad50459ed834393bb1c309bff41d6f54a74c433d07bce0b653bb196b0bd9ff",
+    "model.py": "bfb3b44188b0f48fd793b79e5f9f69c5bb020b04127297bc9564a7cd14949e7f",
+    "profile_ops.py": "94f9996238ef1c0ff11665f228487311066d7a6f252208de45d684e36ca78a05",
+    "metrics.py": "5bf657681aadfa72291fc60a0a9eb1556842fddc77e7587995b612558615f087",
+    "native_probe.cpp": "133f19e629ca8e9d92d7f2049a7be5120af39ff5373cb1057486192e36e112a4",
+    "stress.py": "76b2cbad4a7e895c33d32bcc254b41d089eb5f7b813b72d7eea4d721cb16fa52",
+    "report.py": "92b8fda21ccb020a85ad672f3672843fc3b74748695dfaba6cecaa536252a309",
+    "run.py": "448230db7ce158e78e7747b0db654571e56715ad82f6cb800e26d6674f6054f5",
+    "im2p_raw_probe.cpp": "4df6f4ca398558f3086437b405f61835b218d7db7adfd1d1f1e7983cbe1397df",
+    "types.py": "0341e49a9cfa4ce8e7d5034020fcb987cc44af3982bba3d883841f1d5a365f93",
+    "profile_gemm.py": "d73c0f5365036c40edd329f435aa36bb7194b1da7a411d5c1449696e0b4f619e",
+    "profile_attention.py": "87ff6522988c16e162cd6b1ccb8c9923eede29514e36cc1122d948a0fcae852c",
+    "weight_check.py": "4774c37f0a3848ae2aa8ae1634008563e8f2a8c73af871a38f3e7f68f708e5a1"
+  }
+}

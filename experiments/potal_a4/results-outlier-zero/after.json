@@ -1,0 +1,57 @@
+{
+  "chunks": [
+    {
+      "index": 0,
+      "nll": 823.3909171882938,
+      "scored_tokens": 255
+    },
+    {
+      "index": 1,
+      "nll": 987.3891876873936,
+      "scored_tokens": 255
+    },
+    {
+      "index": 2,
+      "nll": 941.2669401402773,
+      "scored_tokens": 255
+    },
+    {
+      "index": 3,
+      "nll": 884.1194301254677,
+      "scored_tokens": 255
+    },
+    {
+      "index": 4,
+      "nll": 849.3856771182095,
+      "scored_tokens": 255
+    },
+    {
+      "index": 5,
+      "nll": 904.9239663303933,
+      "scored_tokens": 255
+    },
+    {
+      "index": 6,
+      "nll": 976.5798937790996,
+      "scored_tokens": 255
+    },
+    {
+      "index": 7,
+      "nll": 966.8906033100911,
+      "scored_tokens": 255
+    },
+    {
+      "index": 8,
+      "nll": 1095.1626792063234,
+      "scored_tokens": 255
+    },
+    {
+      "index": 9,
+      "nll": 990.5889208359295,
+      "scored_tokens": 255
+    }
+  ],
+  "ppl": 40.20531899910632,
+  "total_scored_tokens": 2550,
+  "prompt_eval_ms": 1215382.29
+}

@@ -1,0 +1,53 @@
+Start testing: Oct 11 21:14 KST
+----------------------------------------------------------
+1/6 Testing: potal-im2p-real-raw
+1/6 Test: potal-im2p-real-raw
+Command: "/home/dyndnn/Projects/llama.cpp-gemmini/build-potal-unit-add/potal-im2p-raw-probe"
+Directory: /home/dyndnn/Projects/llama.cpp-gemmini/build-potal-unit-add
+"potal-im2p-real-raw" start time: Oct 11 21:14 KST
+Output:
+----------------------------------------------------------
+{"scope":"real Gemmini HP1 raw op0; operator-only","m":1,"n":1,"k":1,"repeat":0,"activation_values":"signed_nibble","status":0,"integer_equal":true,"rtl_cycles":244,"host_execute_seconds":0.0658057}
+{"scope":"real Gemmini HP1 raw op0; operator-only","m":2,"n":3,"k":31,"repeat":0,"activation_values":"signed_nibble","status":0,"integer_equal":true,"rtl_cycles":252,"host_execute_seconds":0.132975}
+{"scope":"real Gemmini HP1 raw op0; operator-only","m":33,"n":35,"k":32,"repeat":0,"activation_values":"signed_nibble","status":0,"integer_equal":true,"rtl_cycles":1574,"host_execute_seconds":0.374605}
+{"scope":"real Gemmini HP1 raw op0; operator-only","m":32,"n":32,"k":32,"repeat":0,"activation_values":"signed_nibble","status":0,"integer_equal":true,"rtl_cycles":492,"host_execute_seconds":0.117735}
+{"scope":"real Gemmini HP1 raw op0; operator-only","m":32,"n":32,"k":32,"repeat":0,"activation_values":"zero_or_unit","status":0,"integer_equal":true,"rtl_cycles":492,"host_execute_seconds":0.182457}
+{"scope":"real Gemmini HP1 raw op0; operator-only","m":1,"n":1,"k":1,"repeat":1,"activation_values":"signed_nibble","status":0,"integer_equal":true,"rtl_cycles":244,"host_execute_seconds":0.0617973}
+{"scope":"real Gemmini HP1 raw op0; operator-only","m":2,"n":3,"k":31,"repeat":1,"activation_values":"signed_nibble","status":0,"integer_equal":true,"rtl_cycles":252,"host_execute_seconds":0.063737}
+{"scope":"real Gemmini HP1 raw op0; operator-only","m":33,"n":35,"k":32,"repeat":1,"activation_values":"signed_nibble","status":0,"integer_equal":true,"rtl_cycles":1574,"host_execute_seconds":0.504428}
+{"scope":"real Gemmini HP1 raw op0; operator-only","m":32,"n":32,"k":32,"repeat":1,"activation_values":"signed_nibble","status":0,"integer_equal":true,"rtl_cycles":492,"host_execute_seconds":0.123114}
+{"scope":"real Gemmini HP1 raw op0; operator-only","m":32,"n":32,"k":32,"repeat":1,"activation_values":"zero_or_unit","status":0,"integer_equal":true,"rtl_cycles":492,"host_execute_seconds":0.120391}
+{"scope":"real Gemmini HP1 raw op0; operator-only","m":1,"n":1,"k":1,"repeat":2,"activation_values":"signed_nibble","status":0,"integer_equal":true,"rtl_cycles":244,"host_execute_seconds":0.0658993}
+{"scope":"real Gemmini HP1 raw op0; operator-only","m":2,"n":3,"k":31,"repeat":2,"activation_values":"signed_nibble","status":0,"integer_equal":true,"rtl_cycles":252,"host_execute_seconds":0.0667122}
+{"scope":"real Gemmini HP1 raw op0; operator-only","m":33,"n":35,"k":32,"repeat":2,"activation_values":"signed_nibble","status":0,"integer_equal":true,"rtl_cycles":1574,"host_execute_seconds":0.43462}
+{"scope":"real Gemmini HP1 raw op0; operator-only","m":32,"n":32,"k":32,"repeat":2,"activation_values":"signed_nibble","status":0,"integer_equal":true,"rtl_cycles":492,"host_execute_seconds":0.120659}
+{"scope":"real Gemmini HP1 raw op0; operator-only","m":32,"n":32,"k":32,"repeat":2,"activation_values":"zero_or_unit","status":0,"integer_equal":true,"rtl_cycles":492,"host_execute_seconds":0.11926}
+<end of output>
+Test time =   2.71 sec
+----------------------------------------------------------
+Test Passed.
+"potal-im2p-real-raw" end time: Oct 11 21:14 KST
+"potal-im2p-real-raw" time elapsed: 00:00:02
+----------------------------------------------------------
+
+2/6 Testing: potal-arithmetic-reference
+2/6 Test: potal-arithmetic-reference
+Command: "/usr/bin/python3" "/home/dyndnn/Projects/llama.cpp-gemmini/tests/test-potal-a4-reference.py"
+Directory: /home/dyndnn/Projects/llama.cpp-gemmini/build-potal-unit-add
+"potal-arithmetic-reference" start time: Oct 11 21:14 KST
+Output:
+----------------------------------------------------------
+.......
+----------------------------------------------------------------------
+Ran 7 tests in 0.078s
+
+OK
+<end of output>
+Test time =   0.21 sec
+----------------------------------------------------------
+Test Passed.
+"potal-arithmetic-reference" end time: Oct 11 21:14 KST
+"potal-arithmetic-reference" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Oct 11 21:14 KST

@@ -1,0 +1,231 @@
+{
+  "scope": "cuBLAS int8->int32 raw dots with unchanged original host SCU; no new model forward or Gemmini timing claim",
+  "mode": "functional",
+  "cuda_api": "cublasGemmEx/CUBLAS_COMPUTE_32I",
+  "fragment_padding": 32,
+  "primitive_checks": 21,
+  "integer_and_published_bitwise": true,
+  "captures": [
+    {
+      "capture": "pv-l0-h0.npz",
+      "sha256": "3ebe0e4bd95d85853c4eb6e4a5f8e38817d96d599e483cd73f1d89e12ffce4cd",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "pv-l0-h16.npz",
+      "sha256": "8ccb262d8cc3bbd54fcf807f7fcf8cbf625dc56a8f72b9d005436eb88b3c3181",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "pv-l0-h31.npz",
+      "sha256": "5cf9a7060d9b9052c32839df04b8c37228430cd3c507f65e3fe02f2d3c439ef7",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "pv-l11-h0.npz",
+      "sha256": "3aa280d980e459eb1e0e70dc7eb06a315716cf67a7dc305dca0b34d322b9e6a1",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "pv-l11-h16.npz",
+      "sha256": "5a22fc628a276d1a387016a55ba37c4e5c6c7d04191bebb76a7157e7cb19d388",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "pv-l11-h31.npz",
+      "sha256": "550a6c34ba685dfca9a8d1f867d4582d5fcd81600b501011ab212bc26faa0e60",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "pv-l15-h0.npz",
+      "sha256": "f7bd34b11495c08bcd06aa76d68693777d3b85742d6ce9fb6fdd8c3f0c5f7dad",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "pv-l15-h16.npz",
+      "sha256": "3e5c9512fa76d7b366cd225bad764f9a462141cce1a175342431fc0ef6871d17",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "pv-l15-h31.npz",
+      "sha256": "1e8115600938e552572159c60c0949486881ac133c229ef3bbab885ed47bafb9",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "pv-l5-h0.npz",
+      "sha256": "6984acadb06593895ba1453fdfef2abe5c556d1b0b6f50e3053c4d85314c36f0",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "pv-l5-h16.npz",
+      "sha256": "9a6094da9bd4808a8f3112f8a0f6325b562b1f86d8e281d384a217f536ee38fd",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "pv-l5-h31.npz",
+      "sha256": "bf18d755bf9aaea65656b09fec55fd4065fb0ac83e3bdcc9ee076704bc8f2239",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "pv-l8-h0.npz",
+      "sha256": "10ce478d324342c597c6e6f6c527c8e3668a758304916f184d8d6196053c95d4",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "pv-l8-h16.npz",
+      "sha256": "cedf1f7fdff27bf47c6442002a365480670eb392136741488196b0aa48bffb02",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "pv-l8-h31.npz",
+      "sha256": "f536fbbeb7d4f01d090ccc304952569edec3489dcd5ed50c935f3e3bcaffaa8e",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "qk-l0-h0.npz",
+      "sha256": "05a6ba89dfeb5ff7dab3b4209f03d6f5361b738978b0f3481effab268a398e31",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "qk-l0-h16.npz",
+      "sha256": "0cbdae86ce8a4b9cd159c83c81932311b08c2e5016cbfdaa197c1e11cd3267fc",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "qk-l0-h31.npz",
+      "sha256": "39b5cf0ddb48cd0639ac10c2bf602516617919d00d26397c4d061a6e60b8babb",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "qk-l11-h0.npz",
+      "sha256": "c32b6198b6a28973751c5cd3c351718fd745fad6286723238e4e1a3c131d2aa3",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "qk-l11-h16.npz",
+      "sha256": "c975bfed8375af29b6b159b9e4b53b782bea08d6ccb45440def6c1e6a77644fc",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "qk-l11-h31.npz",
+      "sha256": "dc502ee915da2f5d5d3d53c96ff8e41a11056ca99c3663e6298f2fa027b7d306",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "qk-l15-h0.npz",
+      "sha256": "ee402e87660f130a24109486412ee20d59baa352c9e714c23eb5ae107d08dc30",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "qk-l15-h16.npz",
+      "sha256": "5de33716dc4c05b29df94c5c26792b866be6b34cf1581308953eae9f672b4d64",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "qk-l15-h31.npz",
+      "sha256": "58d9344e1a3eca019539a7636eb6ef59e66f3f2f467c7da59848d738b522db4c",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "qk-l5-h0.npz",
+      "sha256": "42acfc36d24745d9244adebb9f63ddafd61b3632e01d13b2a45a3eb7a32c9027",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "qk-l5-h16.npz",
+      "sha256": "c85a51e2b8d1f8c4cf83336c93a03281cbf714a4c8aa57b8680c13fe2a4a6fc5",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "qk-l5-h31.npz",
+      "sha256": "039ab692e203f9a0071977cc40a2982c6dba342b6f7d804f4416ce8d5c7137e3",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "qk-l8-h0.npz",
+      "sha256": "7092f5bcd63f4dad3125350a378438a4ddfd792104b6d8e2aaef242e45cd7940",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "qk-l8-h16.npz",
+      "sha256": "57dcc008c9a892eab0c896eb58c8824405ea53e35afe1e09d61be3491e3dee3c",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    },
+    {
+      "capture": "qk-l8-h31.npz",
+      "sha256": "c365cb5ae2f3508128af3142cf1974b7ae83ac2a94ba90c7af98dd5fef1df3ff",
+      "bitwise_float64_integer_gemm": true,
+      "published_float32_equal": true,
+      "runs": []
+    }
+  ],
+  "cuda_dot_calls": 3133,
+  "host_device_transfer_bytes": 276448256,
+  "retained_device_workspace_bytes": 256000,
+  "retained_host_workspace_bytes": 256000,
+  "limitations": [
+    "Timing includes padding, dtype conversion, host/device copies and synchronization",
+    "Quantization is common preparation excluded from GEMM timing",
+    "GPU buffers are retained by shape; first allocation and warmup are excluded from repeated timings",
+    "This does not accelerate or certify the existing native linear path"
+  ],
+  "script_sha256": "487b32432bd433a967b4b004fc5a1eb0cc02da1398c53cc125e9423c03c5785d"
+}

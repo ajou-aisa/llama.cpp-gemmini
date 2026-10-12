@@ -1,0 +1,10 @@
+Internal ctest changing into directory: /home/dyndnn/Projects/llama.cpp-gemmini/build-potal-unit-add
+Test project /home/dyndnn/Projects/llama.cpp-gemmini/build-potal-unit-add
+    Start 1: potal-im2p-real-raw
+1/2 Test #1: potal-im2p-real-raw ..............   Passed    2.71 sec
+    Start 2: potal-arithmetic-reference
+2/2 Test #2: potal-arithmetic-reference .......   Passed    0.21 sec
+
+100% tests passed, 0 tests failed out of 2
+
+Total Test time (real) =   2.93 sec

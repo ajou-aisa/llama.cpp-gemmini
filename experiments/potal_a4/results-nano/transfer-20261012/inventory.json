@@ -1,0 +1,3316 @@
+{
+  "created_at_utc": "2026-10-12T04:20:15.418518+00:00",
+  "entries": [
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano/ctest.log",
+      "archive_path": "workspace/experiments/potal_a4/results-nano/ctest.log",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 755,
+      "sha256": "d3900b26817ac99e4a042934cb4d22a8ae2b3e729dbb4582c5ea133fcc41449b"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano/cycle-build.log",
+      "archive_path": "workspace/experiments/potal_a4/results-nano/cycle-build.log",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 9113,
+      "sha256": "f1d82b2ee3315985ce8818faa9aaa7ff0ba1d2e9288186dea4a5f7c7ae737d7b"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano/cycle-scaled-smoke.json",
+      "archive_path": "workspace/experiments/potal_a4/results-nano/cycle-scaled-smoke.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 1523,
+      "sha256": "aedc881cad9d5e6bd0ce71492ed655b140623ed8216795003ee21207aaae0b66"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano/native-measure.log",
+      "archive_path": "workspace/experiments/potal_a4/results-nano/native-measure.log",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 8184,
+      "sha256": "ed56fe9b87e9eaa70c476155ef62e2aeff3ab849e889d67e2c12630e99023b25"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano/native-packets.json",
+      "archive_path": "workspace/experiments/potal_a4/results-nano/native-packets.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 9956,
+      "sha256": "dcc728645b70dc0220ed48b5b199ca1770cc684e180ef4b03a72bd223960bb42"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano/reference.log",
+      "archive_path": "workspace/experiments/potal_a4/results-nano/reference.log",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 105,
+      "sha256": "edeba64586ee9093bd5c9ad87261636bfc2c2356816129fbbd0030d8f923abf1"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano/source-and-branch-verification.json",
+      "archive_path": "workspace/experiments/potal_a4/results-nano/source-and-branch-verification.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 1098,
+      "sha256": "57cc9644cefb69d442e88720837ffeb2fc6a48de64ee5e7b2d57247a46690fa4"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano/verify.log",
+      "archive_path": "workspace/experiments/potal_a4/results-nano/verify.log",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 125,
+      "sha256": "39f9587f6a0f19f809d12f4116421fa95f99a16930c2fa057338e94a08215247"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano-baseline/run.log",
+      "archive_path": "workspace/experiments/potal_a4/results-nano-baseline/run.log",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 1006,
+      "sha256": "8ce72d6ecc09a1d28dededdd31591bd0ca316ff54937def3a485465615b70b2f"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano-baseline/test.i32",
+      "archive_path": "workspace/experiments/potal_a4/results-nano-baseline/test.i32",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 32768,
+      "sha256": "dcc85a53b4bef3c9bb5abe0295445930a2586833bc880abb225c7075560c5d1d"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano-baseline/test.json",
+      "archive_path": "workspace/experiments/potal_a4/results-nano-baseline/test.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 274,
+      "sha256": "4a81390ced0e2df93752852c9883c603654c0439b6b7f32d56d82cf369ace768"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano-baseline/test512-original_a4nks.chunk0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-nano-baseline/test512-original_a4nks.chunk0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 1468396,
+      "sha256": "df1a2dc8c02ffe84e3b9bae27e6fc75952f984c5cff649cf88ab48efcd28d6e5"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano-baseline/test512-original_a4nks.chunk1.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-nano-baseline/test512-original_a4nks.chunk1.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 1468434,
+      "sha256": "7b9690252a042891a12400a50315e2e2734643b640b32447f83827cf5956b524"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano-baseline/test512-original_a4nks.chunk2.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-nano-baseline/test512-original_a4nks.chunk2.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 1468262,
+      "sha256": "6e0120d4648d703e1e390127e301acb8d68cc808c71ed14a30d670ff159efcdc"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano-baseline/test512-original_a4nks.chunk3.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-nano-baseline/test512-original_a4nks.chunk3.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 1468466,
+      "sha256": "550575f60717557c357bfa55fccf9e2cca2ae86b4b07e40646206225459f13e8"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano-baseline/test512-original_a4nks.chunk4.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-nano-baseline/test512-original_a4nks.chunk4.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 1468175,
+      "sha256": "8c84064b26bbe9b0278df7acf05301d123c669578cc14bc211a4d83451cf28ba"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano-baseline/test512-original_a4nks.chunk5.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-nano-baseline/test512-original_a4nks.chunk5.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 1468547,
+      "sha256": "03cb5ba39bf29673ca3b7fa49e9338bba28ed2a84feedbba3a057ab0b8114d0a"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano-baseline/test512-original_a4nks.chunk6.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-nano-baseline/test512-original_a4nks.chunk6.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 1468304,
+      "sha256": "4bbe4f916a6884e702789b3dc540e0ef9232a9c49ee17e89a731ea96f634690e"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano-baseline/test512-original_a4nks.chunk7.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-nano-baseline/test512-original_a4nks.chunk7.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 1468207,
+      "sha256": "dcad03dc53d2da6f8d06170c36283ebcd5099bb3da8bbdf4a44927b36df3c15f"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano-baseline/test512-original_a4nks.json",
+      "archive_path": "workspace/experiments/potal_a4/results-nano-baseline/test512-original_a4nks.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 4264,
+      "sha256": "aada6a965f9bde8653d362341cf6192ed25d7838232583642c6b7360053decc8"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano-baseline/valid.i32",
+      "archive_path": "workspace/experiments/potal_a4/results-nano-baseline/valid.i32",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 32768,
+      "sha256": "29f3061bd3207fb4d66b4fb93822c42dd7c72990672fc871ee1583106e512dbf"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano-baseline/valid.json",
+      "archive_path": "workspace/experiments/potal_a4/results-nano-baseline/valid.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 275,
+      "sha256": "bc8860cd4fb6295a3f6d9a31fcf69afcf37489b85d9d7a2b426ff08880e24e82"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano-profile/MEASUREMENTS.md",
+      "archive_path": "workspace/experiments/potal_a4/results-nano-profile/MEASUREMENTS.md",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 2710,
+      "sha256": "7f0dbd8e254ce9c463140ff93465389b26e7dda387775bf588cd728627e9dc97"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano-profile/artifact-sha256.json",
+      "archive_path": "workspace/experiments/potal_a4/results-nano-profile/artifact-sha256.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 740,
+      "sha256": "44114d707f245363f62ee2c625fd68683b20375410de72a0f2cc8001ef9de965"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano-profile/context512.captures.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-nano-profile/context512.captures.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 52388689,
+      "sha256": "65e18c9c5170f59e1b9c453507a8ed79042b2cf4ce9015021b2db6500005b4ef"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano-profile/context512.json",
+      "archive_path": "workspace/experiments/potal_a4/results-nano-profile/context512.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 274655,
+      "sha256": "7aab5752b04d05da2323605d39ef0ba5c23d22cf11067a50f5880aba3f9a57b2"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano-profile/limbs.csv",
+      "archive_path": "workspace/experiments/potal_a4/results-nano-profile/limbs.csv",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 248,
+      "sha256": "64c51c367d508920e12fffc545d8d955b2cbdc51d87ff5509066bf37475ca19f"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano-profile/optimization-opportunities.json",
+      "archive_path": "workspace/experiments/potal_a4/results-nano-profile/optimization-opportunities.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 3416,
+      "sha256": "fba48752a4e74d93d9f1e8f49c6c28fe1b9d4af38a4a1ba415e7369925207d35"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-outlier-zero/after.json",
+      "archive_path": "workspace/experiments/potal_a4/results-outlier-zero/after.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 1013,
+      "sha256": "457c43355213da8a528a2206ede8a3992ef05d9f820cf923402b405cd3c1ef22"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-outlier-zero/after.log",
+      "archive_path": "workspace/experiments/potal_a4/results-outlier-zero/after.log",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 8238,
+      "sha256": "786aabffc423d7c22d98de5c2258022f3e3ccfd325509d9c6830283874c16d35"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-outlier-zero/before.json",
+      "archive_path": "workspace/experiments/potal_a4/results-outlier-zero/before.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 1008,
+      "sha256": "cbb93b4b1c2c3e3645db7f48ba9b330b7fceeecdcef5ad8c4527c13a8c01f83c"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-outlier-zero/before.log",
+      "archive_path": "workspace/experiments/potal_a4/results-outlier-zero/before.log",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 8238,
+      "sha256": "442d3c11870a7c3bb92ff72ffba7718b7a38b4f589e97c279d1e27ce83e5298e"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-outlier-zero/comparison.json",
+      "archive_path": "workspace/experiments/potal_a4/results-outlier-zero/comparison.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 465,
+      "sha256": "946847b509508ca8f8c4a8ad9f6c7f5ccdff5cbb321371aa009d5a77edae26c9"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-outlier-zero/ctest-after.log",
+      "archive_path": "workspace/experiments/potal_a4/results-outlier-zero/ctest-after.log",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 835,
+      "sha256": "0f8b2eb9f4db7245fb1f736a54726c776ac612a33a6cd0865cadf02802d50f1e"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-outlier-zero/inputs.json",
+      "archive_path": "workspace/experiments/potal_a4/results-outlier-zero/inputs.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 1748,
+      "sha256": "6842939868a8ff7216c27ebb42282d9393dfefde8748fd7ccd68c1b32708092b"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-outlier-zero/regression-after.log",
+      "archive_path": "workspace/experiments/potal_a4/results-outlier-zero/regression-after.log",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 74,
+      "sha256": "956383728877f7f2ebca71f592b779a565489a23546f018539286477f3139e3d"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/chunks.jsonl",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/chunks.jsonl",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 3657,
+      "sha256": "cb4f0cfd107789d646ae89df85627bfadedb16b13b813be15e67be171a402e70"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l0-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l0-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10760,
+      "sha256": "1dbe57708d4c6e4f1260734dfb5cf0b03cddadb9131bcf3a9044a318ab4478b5"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l0-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l0-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 9876,
+      "sha256": "30585a7503b0b596beebcb42b8852d68b5e2cbba9ce5cb163ad69a72bcad559b"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l0-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l0-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 7321,
+      "sha256": "d72e8165c762e481ad804e5104f70f45cb99f913a5fd9b66262d5c5f9c17e651"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l11-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l11-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10608,
+      "sha256": "5e88d89f5c2ef73c312aa1b504d21b2d63636e1a1feb1cee21a4d56363a76871"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l11-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l11-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10783,
+      "sha256": "83d10add600e03cebbb551001bf19ac7c471c9ed4026bc8c1a772feb7d1ec12a"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l11-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l11-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10842,
+      "sha256": "08753b8449180dc90b3ab59e7e1986cc83d84cd5334507427e0651d361a25185"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l15-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l15-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 11282,
+      "sha256": "37e0f3ebe4e8095c2b8fe8fcb168d40c114a5f7977c3791a0057e2e618ed6265"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l15-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l15-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10167,
+      "sha256": "5839945d801863ddd10f03939bfc399cbbe3d823def091d478306ededb7c9321"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l15-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l15-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10053,
+      "sha256": "5c5bceca8705cb19913040845b0f3c46300b72b48c57787cfe637abed688ad93"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l5-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l5-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10756,
+      "sha256": "e1e5dee9560ae4a93eb13921b4df7fe9de34bcced02fa4275aa296be61c0bd69"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l5-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l5-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 11075,
+      "sha256": "c92c21e7baf65c1ca5b73a9322782b58ba0961d857192434c139749f827ebc3e"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l5-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l5-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10968,
+      "sha256": "853aa8b7e5a4e909ee9a0966e5c16434120f70d7e08cd9db5c8a69dd59793985"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l8-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l8-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10801,
+      "sha256": "1834e81282d072069d89d9bb4b5369090bd5cae54d5f12724968b6ff8b234300"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l8-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l8-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 11494,
+      "sha256": "56bd1162f6014555870f7f8d9736874b8b2d0e442079cfd1331fd0e1aed52a29"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l8-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/pv-l8-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 11039,
+      "sha256": "73dc4d72fbbd81d162bc4895ebcfdd3ce5b8da020c91112d15e0c7f7ddd2e58f"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l0-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l0-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18669,
+      "sha256": "e93dff2eb9f462e65b6b6ae3f48cc1c078c587af913017c8e8e3d3cb22c5b044"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l0-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l0-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18663,
+      "sha256": "4902d719db732604f0e758304ad80283e4141607c61ab8cfc5456c7f7e9f77d2"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l0-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l0-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18826,
+      "sha256": "7d47d517d3bc1ae957821e7947692791f37c66d86034880e2af2986ed1f2b3d0"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l11-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l11-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18806,
+      "sha256": "a73420d3ded3852e606dc0b5e3e9435fc056859c8322b956021456e4b9dee23a"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l11-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l11-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18804,
+      "sha256": "7f7f4e928ed9291ca76fb74b2bb13d97b6dc98e6049db3b47b7480ef0b81e27f"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l11-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l11-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18736,
+      "sha256": "abb7b8a2228bea8203481bd3182917c73f17ab67b6969c254d3d4012d0a77cca"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l15-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l15-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18759,
+      "sha256": "333d1103b31263ed85487002094b912e392afe5f2ce89cbaa9525850e6b8ed63"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l15-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l15-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 19030,
+      "sha256": "0b556b20885c59e9d99ed2ded2fb41065d43658f470f82f27c183b6f22cc9a2b"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l15-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l15-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18990,
+      "sha256": "d0015aa8861476f9b9ac9da73717c0967d116ecffb11d7bccb5bb1d88fdea8ad"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l5-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l5-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18707,
+      "sha256": "0fad390dca8495fac9e7cd08f58e6ac0c1890ce9ae96caca5db1e4c5f2c3ffef"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l5-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l5-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18785,
+      "sha256": "e4260d8ac25aa50331558402d9db376b04aa18104606970d2f2fab07cad34594"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l5-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l5-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18740,
+      "sha256": "15b1803edf66429ff62982094e18570ce823c33bac7e3d1b459c04fd00d6429b"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l8-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l8-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18795,
+      "sha256": "15b7c079400efdd6a935026a22a68cddbadaf8932d6f2f6c16a882e514fd6917"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l8-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l8-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18891,
+      "sha256": "b3ac6188610427bce13ffb1c45cade27c6b55fdf998da98f6c8d4cbf782cae47"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l8-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/qk-l8-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18829,
+      "sha256": "26a98d75c1e4003613898a445aa14fb7e58f3cad046c373e237e3676d5b90949"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/report.json",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/report.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 211711,
+      "sha256": "ed467e3e18f45a8db0a6017fa0393d883ccdbafcecd9e447f934d0d2f489be2d"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/tokens.i32",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-cuda-refactor-smoke/tokens.i32",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 128,
+      "sha256": "a5b85034209f8c668234922eb41723d31f2aa4efe83b665d1cc27292457b1968"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/chunks.jsonl",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/chunks.jsonl",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 3657,
+      "sha256": "658c617b6883c12030579c512b0b177829a14abad16d095562298db843c3d3ff"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l0-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l0-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10760,
+      "sha256": "1dbe57708d4c6e4f1260734dfb5cf0b03cddadb9131bcf3a9044a318ab4478b5"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l0-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l0-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 9876,
+      "sha256": "30585a7503b0b596beebcb42b8852d68b5e2cbba9ce5cb163ad69a72bcad559b"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l0-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l0-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 7321,
+      "sha256": "d72e8165c762e481ad804e5104f70f45cb99f913a5fd9b66262d5c5f9c17e651"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l11-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l11-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10608,
+      "sha256": "5e88d89f5c2ef73c312aa1b504d21b2d63636e1a1feb1cee21a4d56363a76871"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l11-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l11-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10783,
+      "sha256": "83d10add600e03cebbb551001bf19ac7c471c9ed4026bc8c1a772feb7d1ec12a"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l11-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l11-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10842,
+      "sha256": "08753b8449180dc90b3ab59e7e1986cc83d84cd5334507427e0651d361a25185"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l15-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l15-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 11282,
+      "sha256": "37e0f3ebe4e8095c2b8fe8fcb168d40c114a5f7977c3791a0057e2e618ed6265"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l15-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l15-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10167,
+      "sha256": "5839945d801863ddd10f03939bfc399cbbe3d823def091d478306ededb7c9321"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l15-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l15-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10053,
+      "sha256": "5c5bceca8705cb19913040845b0f3c46300b72b48c57787cfe637abed688ad93"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l5-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l5-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10756,
+      "sha256": "e1e5dee9560ae4a93eb13921b4df7fe9de34bcced02fa4275aa296be61c0bd69"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l5-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l5-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 11075,
+      "sha256": "c92c21e7baf65c1ca5b73a9322782b58ba0961d857192434c139749f827ebc3e"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l5-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l5-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10968,
+      "sha256": "853aa8b7e5a4e909ee9a0966e5c16434120f70d7e08cd9db5c8a69dd59793985"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l8-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l8-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10801,
+      "sha256": "1834e81282d072069d89d9bb4b5369090bd5cae54d5f12724968b6ff8b234300"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l8-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l8-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 11494,
+      "sha256": "56bd1162f6014555870f7f8d9736874b8b2d0e442079cfd1331fd0e1aed52a29"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l8-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/pv-l8-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 11039,
+      "sha256": "73dc4d72fbbd81d162bc4895ebcfdd3ce5b8da020c91112d15e0c7f7ddd2e58f"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l0-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l0-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18669,
+      "sha256": "e93dff2eb9f462e65b6b6ae3f48cc1c078c587af913017c8e8e3d3cb22c5b044"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l0-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l0-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18663,
+      "sha256": "4902d719db732604f0e758304ad80283e4141607c61ab8cfc5456c7f7e9f77d2"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l0-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l0-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18826,
+      "sha256": "7d47d517d3bc1ae957821e7947692791f37c66d86034880e2af2986ed1f2b3d0"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l11-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l11-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18806,
+      "sha256": "a73420d3ded3852e606dc0b5e3e9435fc056859c8322b956021456e4b9dee23a"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l11-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l11-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18804,
+      "sha256": "7f7f4e928ed9291ca76fb74b2bb13d97b6dc98e6049db3b47b7480ef0b81e27f"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l11-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l11-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18736,
+      "sha256": "abb7b8a2228bea8203481bd3182917c73f17ab67b6969c254d3d4012d0a77cca"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l15-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l15-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18759,
+      "sha256": "333d1103b31263ed85487002094b912e392afe5f2ce89cbaa9525850e6b8ed63"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l15-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l15-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 19030,
+      "sha256": "0b556b20885c59e9d99ed2ded2fb41065d43658f470f82f27c183b6f22cc9a2b"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l15-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l15-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18990,
+      "sha256": "d0015aa8861476f9b9ac9da73717c0967d116ecffb11d7bccb5bb1d88fdea8ad"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l5-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l5-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18707,
+      "sha256": "0fad390dca8495fac9e7cd08f58e6ac0c1890ce9ae96caca5db1e4c5f2c3ffef"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l5-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l5-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18785,
+      "sha256": "e4260d8ac25aa50331558402d9db376b04aa18104606970d2f2fab07cad34594"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l5-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l5-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18740,
+      "sha256": "15b1803edf66429ff62982094e18570ce823c33bac7e3d1b459c04fd00d6429b"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l8-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l8-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18795,
+      "sha256": "15b7c079400efdd6a935026a22a68cddbadaf8932d6f2f6c16a882e514fd6917"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l8-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l8-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18891,
+      "sha256": "b3ac6188610427bce13ffb1c45cade27c6b55fdf998da98f6c8d4cbf782cae47"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l8-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/qk-l8-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18829,
+      "sha256": "26a98d75c1e4003613898a445aa14fb7e58f3cad046c373e237e3676d5b90949"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/report.json",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/report.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 211711,
+      "sha256": "c6ef48d954294a5454d9202aca3c167673db3df3b60ed50ecad6a15a1d6bd560"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-omp-smoke/tokens.i32",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-omp-smoke/tokens.i32",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 128,
+      "sha256": "a5b85034209f8c668234922eb41723d31f2aa4efe83b665d1cc27292457b1968"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/chunks.jsonl",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/chunks.jsonl",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 3659,
+      "sha256": "71d68f672571ae70b1ef3b58003fcf0dfd7342747a068f178b87d9b479f404cd"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/pv-l0-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/pv-l0-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10760,
+      "sha256": "1dbe57708d4c6e4f1260734dfb5cf0b03cddadb9131bcf3a9044a318ab4478b5"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/pv-l0-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/pv-l0-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 9876,
+      "sha256": "30585a7503b0b596beebcb42b8852d68b5e2cbba9ce5cb163ad69a72bcad559b"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/pv-l0-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/pv-l0-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 7321,
+      "sha256": "d72e8165c762e481ad804e5104f70f45cb99f913a5fd9b66262d5c5f9c17e651"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/pv-l11-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/pv-l11-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10608,
+      "sha256": "5e88d89f5c2ef73c312aa1b504d21b2d63636e1a1feb1cee21a4d56363a76871"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/pv-l11-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/pv-l11-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10783,
+      "sha256": "83d10add600e03cebbb551001bf19ac7c471c9ed4026bc8c1a772feb7d1ec12a"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/pv-l11-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/pv-l11-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10842,
+      "sha256": "08753b8449180dc90b3ab59e7e1986cc83d84cd5334507427e0651d361a25185"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/pv-l15-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/pv-l15-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 11282,
+      "sha256": "37e0f3ebe4e8095c2b8fe8fcb168d40c114a5f7977c3791a0057e2e618ed6265"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/pv-l15-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/pv-l15-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10167,
+      "sha256": "5839945d801863ddd10f03939bfc399cbbe3d823def091d478306ededb7c9321"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/pv-l15-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/pv-l15-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10053,
+      "sha256": "5c5bceca8705cb19913040845b0f3c46300b72b48c57787cfe637abed688ad93"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/pv-l5-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/pv-l5-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10756,
+      "sha256": "e1e5dee9560ae4a93eb13921b4df7fe9de34bcced02fa4275aa296be61c0bd69"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/pv-l5-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/pv-l5-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 11075,
+      "sha256": "c92c21e7baf65c1ca5b73a9322782b58ba0961d857192434c139749f827ebc3e"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/pv-l5-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/pv-l5-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10968,
+      "sha256": "853aa8b7e5a4e909ee9a0966e5c16434120f70d7e08cd9db5c8a69dd59793985"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/pv-l8-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/pv-l8-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 10801,
+      "sha256": "1834e81282d072069d89d9bb4b5369090bd5cae54d5f12724968b6ff8b234300"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/pv-l8-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/pv-l8-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 11494,
+      "sha256": "56bd1162f6014555870f7f8d9736874b8b2d0e442079cfd1331fd0e1aed52a29"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/pv-l8-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/pv-l8-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 11039,
+      "sha256": "73dc4d72fbbd81d162bc4895ebcfdd3ce5b8da020c91112d15e0c7f7ddd2e58f"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/qk-l0-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/qk-l0-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18669,
+      "sha256": "e93dff2eb9f462e65b6b6ae3f48cc1c078c587af913017c8e8e3d3cb22c5b044"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/qk-l0-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/qk-l0-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18663,
+      "sha256": "4902d719db732604f0e758304ad80283e4141607c61ab8cfc5456c7f7e9f77d2"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/qk-l0-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/qk-l0-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18826,
+      "sha256": "7d47d517d3bc1ae957821e7947692791f37c66d86034880e2af2986ed1f2b3d0"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/qk-l11-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/qk-l11-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18806,
+      "sha256": "a73420d3ded3852e606dc0b5e3e9435fc056859c8322b956021456e4b9dee23a"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/qk-l11-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/qk-l11-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18804,
+      "sha256": "7f7f4e928ed9291ca76fb74b2bb13d97b6dc98e6049db3b47b7480ef0b81e27f"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/qk-l11-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/qk-l11-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18736,
+      "sha256": "abb7b8a2228bea8203481bd3182917c73f17ab67b6969c254d3d4012d0a77cca"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/qk-l15-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/qk-l15-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18759,
+      "sha256": "333d1103b31263ed85487002094b912e392afe5f2ce89cbaa9525850e6b8ed63"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/qk-l15-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/qk-l15-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 19030,
+      "sha256": "0b556b20885c59e9d99ed2ded2fb41065d43658f470f82f27c183b6f22cc9a2b"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/qk-l15-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/qk-l15-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18990,
+      "sha256": "d0015aa8861476f9b9ac9da73717c0967d116ecffb11d7bccb5bb1d88fdea8ad"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/qk-l5-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/qk-l5-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18707,
+      "sha256": "0fad390dca8495fac9e7cd08f58e6ac0c1890ce9ae96caca5db1e4c5f2c3ffef"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/qk-l5-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/qk-l5-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18785,
+      "sha256": "e4260d8ac25aa50331558402d9db376b04aa18104606970d2f2fab07cad34594"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/qk-l5-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/qk-l5-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18740,
+      "sha256": "15b1803edf66429ff62982094e18570ce823c33bac7e3d1b459c04fd00d6429b"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/qk-l8-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/qk-l8-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18795,
+      "sha256": "15b7c079400efdd6a935026a22a68cddbadaf8932d6f2f6c16a882e514fd6917"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/qk-l8-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/qk-l8-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18891,
+      "sha256": "b3ac6188610427bce13ffb1c45cade27c6b55fdf998da98f6c8d4cbf782cae47"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/qk-l8-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/qk-l8-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18829,
+      "sha256": "26a98d75c1e4003613898a445aa14fb7e58f3cad046c373e237e3676d5b90949"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/report.json",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/report.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 211736,
+      "sha256": "ad78e8274d58dd5d99a14a75934f07fd2302c92f7276f7a9b20495ba84c03b77"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama-smoke/tokens.i32",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama-smoke/tokens.i32",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 128,
+      "sha256": "a5b85034209f8c668234922eb41723d31f2aa4efe83b665d1cc27292457b1968"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/build-profile.json",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/build-profile.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 4009,
+      "sha256": "8b85e97642d7c622b51700f37bd568d17790177aa85823aa4a35c5ec97f8cf58"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/candidate-work-counts.json",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/candidate-work-counts.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 30885,
+      "sha256": "dc09079e69124914887ed45fec3efc91dc6c240782b2f6eedba2a33dc012fbcc"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/chunks.jsonl",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/chunks.jsonl",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 132035,
+      "sha256": "26050409b18b3121ba8c00f0e7387fcc775570caa3cdc6a2b2654febabaf8def"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/component-summary.json",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/component-summary.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 4533,
+      "sha256": "4b02b166bbd813984f52d597913f9c9e64a8efa1454008210bc2808cd707ae4a"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/cuda-component-timing.json",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/cuda-component-timing.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 480971,
+      "sha256": "e0f2f14adc49f4cfea0c309fae956f96cf80278e3983478c89cd2f10151d0e15"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/cuda-functional.json",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/cuda-functional.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 7846,
+      "sha256": "59a3cc576b0d487e6483ba36118a8188582eeae791c9ed0518eb356d18e6e475"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/hardware-snapshot.json",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/hardware-snapshot.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 1721,
+      "sha256": "c4094927e8d9f08d407c2e9ce06d14989529ee3453a9913437ce8aa5c1424ff7"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/mask-domain-check.json",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/mask-domain-check.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 1198,
+      "sha256": "7ec30fbd5d96378b64d4e34b69ab116ba5cb9bacf58994fa3be228d9192b3a3a"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/mask-sample-check.json",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/mask-sample-check.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 14504,
+      "sha256": "f0badca074bbdbf0e994611367ae400b764d8055c78949e9ece227ddd7c68f31"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/native_measure.executed.py",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/native_measure.executed.py",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 14719,
+      "sha256": "349b84df12d43f85ae233c00b8ddd47666d26d8f9caf09ca2b946651f9c01e62"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/pv-l0-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/pv-l0-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 614459,
+      "sha256": "3ebe0e4bd95d85853c4eb6e4a5f8e38817d96d599e483cd73f1d89e12ffce4cd"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/pv-l0-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/pv-l0-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 592961,
+      "sha256": "8ccb262d8cc3bbd54fcf807f7fcf8cbf625dc56a8f72b9d005436eb88b3c3181"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/pv-l0-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/pv-l0-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 584476,
+      "sha256": "5cf9a7060d9b9052c32839df04b8c37228430cd3c507f65e3fe02f2d3c439ef7"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/pv-l11-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/pv-l11-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 614778,
+      "sha256": "3aa280d980e459eb1e0e70dc7eb06a315716cf67a7dc305dca0b34d322b9e6a1"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/pv-l11-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/pv-l11-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 623083,
+      "sha256": "5a22fc628a276d1a387016a55ba37c4e5c6c7d04191bebb76a7157e7cb19d388"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/pv-l11-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/pv-l11-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 625519,
+      "sha256": "550a6c34ba685dfca9a8d1f867d4582d5fcd81600b501011ab212bc26faa0e60"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/pv-l15-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/pv-l15-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 623234,
+      "sha256": "f7bd34b11495c08bcd06aa76d68693777d3b85742d6ce9fb6fdd8c3f0c5f7dad"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/pv-l15-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/pv-l15-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 620775,
+      "sha256": "3e5c9512fa76d7b366cd225bad764f9a462141cce1a175342431fc0ef6871d17"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/pv-l15-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/pv-l15-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 615030,
+      "sha256": "1e8115600938e552572159c60c0949486881ac133c229ef3bbab885ed47bafb9"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/pv-l5-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/pv-l5-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 617169,
+      "sha256": "6984acadb06593895ba1453fdfef2abe5c556d1b0b6f50e3053c4d85314c36f0"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/pv-l5-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/pv-l5-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 627714,
+      "sha256": "9a6094da9bd4808a8f3112f8a0f6325b562b1f86d8e281d384a217f536ee38fd"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/pv-l5-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/pv-l5-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 626268,
+      "sha256": "bf18d755bf9aaea65656b09fec55fd4065fb0ac83e3bdcc9ee076704bc8f2239"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/pv-l8-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/pv-l8-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 618036,
+      "sha256": "10ce478d324342c597c6e6f6c527c8e3668a758304916f184d8d6196053c95d4"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/pv-l8-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/pv-l8-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 633662,
+      "sha256": "cedf1f7fdff27bf47c6442002a365480670eb392136741488196b0aa48bffb02"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/pv-l8-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/pv-l8-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 627364,
+      "sha256": "f536fbbeb7d4f01d090ccc304952569edec3489dcd5ed50c935f3e3bcaffaa8e"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/qk-l0-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/qk-l0-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 982503,
+      "sha256": "05a6ba89dfeb5ff7dab3b4209f03d6f5361b738978b0f3481effab268a398e31"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/qk-l0-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/qk-l0-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 996613,
+      "sha256": "0cbdae86ce8a4b9cd159c83c81932311b08c2e5016cbfdaa197c1e11cd3267fc"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/qk-l0-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/qk-l0-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 1017815,
+      "sha256": "39b5cf0ddb48cd0639ac10c2bf602516617919d00d26397c4d061a6e60b8babb"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/qk-l11-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/qk-l11-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 972486,
+      "sha256": "c32b6198b6a28973751c5cd3c351718fd745fad6286723238e4e1a3c131d2aa3"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/qk-l11-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/qk-l11-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 998775,
+      "sha256": "c975bfed8375af29b6b159b9e4b53b782bea08d6ccb45440def6c1e6a77644fc"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/qk-l11-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/qk-l11-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 985585,
+      "sha256": "dc502ee915da2f5d5d3d53c96ff8e41a11056ca99c3663e6298f2fa027b7d306"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/qk-l15-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/qk-l15-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 997388,
+      "sha256": "ee402e87660f130a24109486412ee20d59baa352c9e714c23eb5ae107d08dc30"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/qk-l15-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/qk-l15-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 1008426,
+      "sha256": "5de33716dc4c05b29df94c5c26792b866be6b34cf1581308953eae9f672b4d64"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/qk-l15-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/qk-l15-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 1004354,
+      "sha256": "58d9344e1a3eca019539a7636eb6ef59e66f3f2f467c7da59848d738b522db4c"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/qk-l5-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/qk-l5-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 980067,
+      "sha256": "42acfc36d24745d9244adebb9f63ddafd61b3632e01d13b2a45a3eb7a32c9027"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/qk-l5-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/qk-l5-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 1006281,
+      "sha256": "c85a51e2b8d1f8c4cf83336c93a03281cbf714a4c8aa57b8680c13fe2a4a6fc5"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/qk-l5-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/qk-l5-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 981865,
+      "sha256": "039ab692e203f9a0071977cc40a2982c6dba342b6f7d804f4416ce8d5c7137e3"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/qk-l8-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/qk-l8-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 992805,
+      "sha256": "7092f5bcd63f4dad3125350a378438a4ddfd792104b6d8e2aaef242e45cd7940"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/qk-l8-h16.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/qk-l8-h16.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 996883,
+      "sha256": "57dcc008c9a892eab0c896eb58c8824405ea53e35afe1e09d61be3491e3dee3c"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/qk-l8-h31.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/qk-l8-h31.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 1001013,
+      "sha256": "c365cb5ae2f3508128af3142cf1974b7ae83ac2a94ba90c7af98dd5fef1df3ff"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/replay-source.diff",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/replay-source.diff",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 35021,
+      "sha256": "0c81fe0daa659db378253dbacb9a9f3059c7e78f20101b7b267542d34de456d1"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/report.json",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/report.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 217941,
+      "sha256": "4192ca4295aca4ab426d5e39cfc52784576b7fef278b0ca9b2c5c0a3ed04427d"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/rtl-raw.json",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/rtl-raw.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 4793,
+      "sha256": "023df62ea23c7e81a0f9140d0f951d554c87f9191649663fd4edbc7fb31b8451"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/runtime-inputs.json",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/runtime-inputs.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 3437,
+      "sha256": "f22163d8297ebb146dca1a6c1f1d06a52bf4a7d8a37548c72b29cf01f619f471"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-llama512/tokens.i32",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-llama512/tokens.i32",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 20480,
+      "sha256": "26cf9af96d1456e0288323a89ad87bfa5082ffec6075552218294bcd1d015bf5"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/chunks.jsonl",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/chunks.jsonl",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 3599,
+      "sha256": "1f284e5db303f8d8674735db067c19213dbf17889aa454b0556f158d03b8cec5"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/pv-l0-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/pv-l0-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 13894,
+      "sha256": "e549d215c01a562089de39b522fe67dbd7ff8ecb06c577787e8f421ea5594d76"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/pv-l0-h11.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/pv-l0-h11.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 13964,
+      "sha256": "a8c84148ce19f74d97baa8d39a78c5d0c6160dbff9e085074989bf900d67ad14"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/pv-l0-h6.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/pv-l0-h6.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 13930,
+      "sha256": "e2e373a52ce9f044eccb84e49a33c5406a43deffc1f3c8b8f1eb73b28e3d6016"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/pv-l11-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/pv-l11-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 13858,
+      "sha256": "ee6dd8fde8a0e563d5ada546e1bc69be70c258b7fb87264e033476650fdc13b0"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/pv-l11-h11.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/pv-l11-h11.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 13412,
+      "sha256": "df80332cb98012a12f90581e06e7ee47b7f36d42143bdb1cbbacae8576532273"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/pv-l11-h6.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/pv-l11-h6.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 12670,
+      "sha256": "6748e8b0a1e7d438293ae6fed9823cd90e1e2863a1fc59dfa4c07797569cf0de"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/pv-l5-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/pv-l5-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 13349,
+      "sha256": "6450f1b016fdf5e88de5d7e2365497cc90618fbcbb8a95e765e78a5dd87f1b08"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/pv-l5-h11.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/pv-l5-h11.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 13147,
+      "sha256": "27f7d06f046a361c5f3f5a540801efa24687abe46c1eeb96d9e20e5a27d24f20"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/pv-l5-h6.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/pv-l5-h6.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 13718,
+      "sha256": "837a0f791c2b85fb47ebc38bc57dbb956eb3e92f4c940e66c3d30e424a01fc9e"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/pv-l8-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/pv-l8-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 13137,
+      "sha256": "1593bf68b84f036543d02b34a768b9f3bf9eeb578c807f40494d84d9bee0fb97"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/pv-l8-h11.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/pv-l8-h11.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 13062,
+      "sha256": "2f55f968486a181d7fb527b9e522d23b3e8c9c90cf434b35814e08baa169636e"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/pv-l8-h6.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/pv-l8-h6.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 13037,
+      "sha256": "a20fd30b8296b39422a78d8337cc068dc335e5152dbcef120fc6ffbeb026669b"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/qk-l0-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/qk-l0-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18545,
+      "sha256": "efd8131899ca603f3679eb33cfaddc1638dabb47740a309ab24cf909e9c31659"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/qk-l0-h11.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/qk-l0-h11.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18589,
+      "sha256": "1c8de310e1cd6feea742eb80fd6eaf6daf6eb1ddad962c91f46c6ea70ff5c08f"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/qk-l0-h6.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/qk-l0-h6.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18675,
+      "sha256": "33a222ebc34a96c3a41db9474e100dd01c1aab002deee703f7874b5e7bb574eb"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/qk-l11-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/qk-l11-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18576,
+      "sha256": "4f5b621674c53de5857a591cdcfaabdb6d3c5d7a3f26aadc9383051da55f99a3"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/qk-l11-h11.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/qk-l11-h11.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18614,
+      "sha256": "911da65a2e062dc2f64d959955107c6d44802a16bca06bdf417f2968981c3d65"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/qk-l11-h6.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/qk-l11-h6.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18444,
+      "sha256": "f9ccb316f6c234fb77f230fe44150a938184491f7bbbbfddf8dc20aef34bf9f1"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/qk-l5-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/qk-l5-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18485,
+      "sha256": "0e182c21a943065d03e306cea6363df6ed4f14885245cb06af909d711e1174fd"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/qk-l5-h11.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/qk-l5-h11.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18243,
+      "sha256": "f2c06ddbee244806a594a110d5db592709545ed1c76469e922def59d6b84b016"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/qk-l5-h6.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/qk-l5-h6.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18374,
+      "sha256": "e2ba6f6d3fabbe34b7950c1fde22f3095250cd3c3bcc4a1d78a670a79443b3c7"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/qk-l8-h0.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/qk-l8-h0.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18231,
+      "sha256": "748f3e9bf767dfafe9c70f2333eda27dba0ba1236d43c6243bccee0094ab9d5d"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/qk-l8-h11.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/qk-l8-h11.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18139,
+      "sha256": "18c1d06c95f6a8d3253f1c8ea83896d3d4f4c3b5810c8680d120c1fd136ef660"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/qk-l8-h6.npz",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/qk-l8-h6.npz",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 18442,
+      "sha256": "f170ccdb052a67dd1f44ac4979d2ff78d021be10a9278b2e49a73ae91f6bb6b2"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/report.json",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/report.json",
+      "category": "current-potal-measurement",
+      "git": true,
+      "bytes": 170350,
+      "sha256": "68965000942652ec13c15b703c0c0603c45238370804bc48418c818755fda8fb"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-unit-add-smoke/tokens.i32",
+      "archive_path": "workspace/experiments/potal_a4/results-unit-add-smoke/tokens.i32",
+      "category": "current-potal-measurement",
+      "git": false,
+      "bytes": 128,
+      "sha256": "1296a64b32b9da2d9a8101abe85e99359aced2b8c29167c229b6a4a71259377e"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/fpga-debug-connection-01/device.txt",
+      "archive_path": "workspace/.parity/fpga-debug-connection-01/device.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 13,
+      "sha256": "239209629f268b59b7c438669d828e580d02a5682cfc3d4e6c2372bd2226e6c6"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/fpga-debug-connection-01/run.log",
+      "archive_path": "workspace/.parity/fpga-debug-connection-01/run.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 10064,
+      "sha256": "65082e8c9427a0dad0d2373deaa9fc9403e6b3e3a932c026e6787582b5bff2fb"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-cap-h1-01/all-hashes.txt",
+      "archive_path": "workspace/.parity/nano-cap-h1-01/all-hashes.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1109,
+      "sha256": "a3bb04426d49f322cb2811d5d1696f87089813a51c592b1918a4f0dd06aa81fa"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-cap-h1-01/final.json",
+      "archive_path": "workspace/.parity/nano-cap-h1-01/final.json",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1134,
+      "sha256": "ed67cb662b1a0496bc05d2222dc9bb066281f4ef4fa29487533927088f0358e5"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-cap-h1-01/h1.log",
+      "archive_path": "workspace/.parity/nano-cap-h1-01/h1.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 12313,
+      "sha256": "67e527f8b6a7424842bf67adbb0dc5f1033d390418116916a8c38d37ca95c120"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-cap-h1-01/preflight-hashes.txt",
+      "archive_path": "workspace/.parity/nano-cap-h1-01/preflight-hashes.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 525,
+      "sha256": "3fbf8efbb10d11191e5343897aa86f023e718474257673df0a6988f5ab61c250"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-cap-h1-01/standalone-cap.log",
+      "archive_path": "workspace/.parity/nano-cap-h1-01/standalone-cap.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 236,
+      "sha256": "166dafc6767c79046f753b8508171db62c536effc2e830cb1ad299fdc0778415"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-cap-h1-01/tiny-model/commands-to-test.json",
+      "archive_path": "workspace/.parity/nano-cap-h1-01/tiny-model/commands-to-test.json",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1794,
+      "sha256": "f6a27e5e77910de8d39e942a399d32299adcbaf84053db25fd0206e63dbc9572"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-cap-h1-01/tiny-model/commands.json",
+      "archive_path": "workspace/.parity/nano-cap-h1-01/tiny-model/commands.json",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1675,
+      "sha256": "7377894d775ca12af0bbfd596d5c57b27d864ae774aeba273b689df07a0bdfd5"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-cap-h1-01/tiny-model/compile.log",
+      "archive_path": "workspace/.parity/nano-cap-h1-01/tiny-model/compile.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-cap-h1-01/tiny-model/generate-f32.log",
+      "archive_path": "workspace/.parity/nano-cap-h1-01/tiny-model/generate-f32.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 134,
+      "sha256": "0a2569d16a1a289b867676d3e3cc820da0b5e7d0432e1bdc9c834c76de24c304"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-cap-h1-01/tiny-model/generate-h1.log",
+      "archive_path": "workspace/.parity/nano-cap-h1-01/tiny-model/generate-h1.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 144,
+      "sha256": "a4e4460251b7e9f361cf33d4cfe90629f3564e160dfed0281ca086191bdd622a"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-cap-h1-01/tiny-model/manifest.json",
+      "archive_path": "workspace/.parity/nano-cap-h1-01/tiny-model/manifest.json",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 2139,
+      "sha256": "0a774f0986f4d28be7ccfe421fabbfb9ad58d0f2eaefcd115b86023914b07bfa"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-cap-h1-01/tiny-model/ppl.txt",
+      "archive_path": "workspace/.parity/nano-cap-h1-01/tiny-model/ppl.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 255,
+      "sha256": "aac1aebc0ebf2ceae6f04fd4a0f8c5423edf279a0b836ba0b1a95012ebd5a88c"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-cap-h1-01/tiny-model/prompt.txt",
+      "archive_path": "workspace/.parity/nano-cap-h1-01/tiny-model/prompt.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 7,
+      "sha256": "f8ebfaf3d51f88b069c0339b7deddfabe1e1bd983605e88041fc82a08d567144"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-01/artifact-file.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-01/artifact-file.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1012,
+      "sha256": "ba14ded5d99f72a4dc4bc9f493116afdf336a889e2cb2334793d161abc71bfaf"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-01/artifact-ldd.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-01/artifact-ldd.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 2436,
+      "sha256": "233bf5835aeb53b22fa6240f6cce0fcfaa780ca838fac9f6a5d2068530a01006"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-01/build.log",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-01/build.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 548087,
+      "sha256": "582ae58eddddb2989a4b3d19636b37a0dcd3dd606ecef8481d296058f7063398"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-01/dependency-after.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-01/dependency-after.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 3301,
+      "sha256": "de0bdd2b909739a5d5eb57fcfab747890b7c26a9296c3b17c198001879ecbde6"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-01/dependency-before.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-01/dependency-before.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 4565,
+      "sha256": "383885eb5a39f1aaae7a7bc425f01b1fcfc8b031dc457aebce0e435f36feaae5"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-01/diff-stat.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-01/diff-stat.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 444,
+      "sha256": "0672bdafc472309c5f7d084c98f695222fb0eb814655ca099a26c755740a0ae8"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-01/dry-run.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-01/dry-run.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 3280,
+      "sha256": "c1cd257e48ae370ae4b479dccc914a038eb4fd353a65b840b9aa476abee27bee"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-01/final.json",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-01/final.json",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 632,
+      "sha256": "dd7850989c46a1bc163f8a9186c1f5794f9c0239fdb32f0eb1aeaef24f9643dc"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-01/git-state.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-01/git-state.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 286,
+      "sha256": "f7fa27adc0fe0bcf180807ef7b0345b2d605ecf75b7fc9b7e907470a1da45d6d"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-01/no-rtl-audit.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-01/no-rtl-audit.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 100,
+      "sha256": "b4559c3582d9794b030579660019799b62bcdf78a3c63d80709e3549663bb837"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-01/option-plumbing-regression.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-01/option-plumbing-regression.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-01/preflight.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-01/preflight.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 440,
+      "sha256": "5183c5e4aa81ec322f874f422cfb9981f2017031a826ffe9df7de8b3dd6e61d9"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-01/related-option-regressions.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-01/related-option-regressions.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 544,
+      "sha256": "f35a177de93e7aa803f530ce5da51cbaa5765e3b03c8ee8ca2b421c97a80ed4e"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-01/symbol-audit.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-01/symbol-audit.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 763,
+      "sha256": "a94a53f52447d46812a42d0d2f57b43be4083947c4a0f9791c5377a641bb68cb"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-01/tests.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-01/tests.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 3540,
+      "sha256": "8dbe9b43640359a6612c61823ccd82457e7f1b03d05659709bfae74129a9ec77"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-02/artifact-file.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-02/artifact-file.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 824,
+      "sha256": "5a5458409f7a45aee8bc824e6dccd5a7ada1162c60b187b0fcb0d64f9b1a74a5"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-02/artifact-ldd.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-02/artifact-ldd.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 2472,
+      "sha256": "a0733e8a4e03cc5956105cbef3080e9172397e08add7ae2797e158e9665d0b29"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-02/build.log",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-02/build.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 550507,
+      "sha256": "787b87dae4c76e5efb9015a83d73636d12f8a1581220048725c038eb17ffaff5"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-02/diff-stat.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-02/diff-stat.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 715,
+      "sha256": "362e17784d204f3619f6396e49784caa7ab80e9d355714f6a7fc3012102d3309"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-02/dry-run.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-02/dry-run.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 3279,
+      "sha256": "25bb387680fb5ad002546ec42336c45cebd4b23bf16758b67ab83cf3e429cee1"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-02/final.json",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-02/final.json",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 846,
+      "sha256": "0918803df6645eaadc40aa6dee112939ecda8dbe17ac98517862d9914622ccb8"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-02/no-rtl-audit.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-02/no-rtl-audit.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 100,
+      "sha256": "b4559c3582d9794b030579660019799b62bcdf78a3c63d80709e3549663bb837"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-02/preservation-tests.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-02/preservation-tests.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 129,
+      "sha256": "943c59ff1fd18808f8bb5c9d9a4eab484e4d502cb06025f7021035b7ee512194"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-02/symbol-audit.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-02/symbol-audit.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 272,
+      "sha256": "dad5f9d10d3cec03d441b6ec34ee5ea1d2ca012553866df12e09a79cb648aa92"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-02/tests.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-02/tests.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 3067,
+      "sha256": "8835c49790871beb6e0c784d14560ccd16672999062aafe681ff8aabd2d46040"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-03/artifact-audit.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-03/artifact-audit.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1457,
+      "sha256": "a574a4a947e5740a8b9faf5f4cb8f54dd3b3c3cfab312df380552a5393d23d89"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-03/artifact-sha256.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-03/artifact-sha256.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 331,
+      "sha256": "575529171400815fa958a77d2216c6800b202d344e06414e35729fda7ebd1620"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-03/build.log",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-03/build.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 550491,
+      "sha256": "27e14dfd42439423b2f1fd2e75d247f691b4dcdd17a3b457442964fca5439ba6"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-03/linkage-gate.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-03/linkage-gate.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 20,
+      "sha256": "dd9f8db2b0fb1b458d800ac4b3b05f506938daaff64016f87b32198b1d882472"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-03/no-rtl-audit.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-03/no-rtl-audit.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 100,
+      "sha256": "9d3922926e6610761808a370e14d9cf6d94bb2cd2c75b983f26472e189636e41"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-03/symbol-gate.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-03/symbol-gate.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 24,
+      "sha256": "1141b9a640dd445629807d678a1f40db2a58fb0641f00b98cc81a7aee13364aa"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-fpga-uart-build-03/symbols-full.txt",
+      "archive_path": "workspace/.parity/nano-fpga-uart-build-03/symbols-full.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 330282,
+      "sha256": "b851094d9e9c5c79e8c47b88e4c017ee65bdcc7e8c3292fa3b2250f877baa0f3"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-h1-evidence-01/build-observers.log",
+      "archive_path": "workspace/.parity/nano-h1-evidence-01/build-observers.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 72,
+      "sha256": "1c09a0b0e4d09750e3473d060032d719e0ef87ac87444eb11ae5feabbd6d96a4"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-h1-evidence-01/diff-stat.txt",
+      "archive_path": "workspace/.parity/nano-h1-evidence-01/diff-stat.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 686,
+      "sha256": "bbfc4d224cd7487ec862d6aaa0c8a3452a8958ebaf3ea5a354862d3d2889940f"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-h1-evidence-01/evidence-sha256.txt",
+      "archive_path": "workspace/.parity/nano-h1-evidence-01/evidence-sha256.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 220,
+      "sha256": "84a953acb2c14384ed42befbbb6df1a260a4adf9d694ea43312dcbe0f6374912"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-h1-evidence-01/final.json",
+      "archive_path": "workspace/.parity/nano-h1-evidence-01/final.json",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 892,
+      "sha256": "73a9dd6057c05e5b6286892a01775aa24f87aa2e43b2d13049085b7fe696e8da"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-h1-evidence-01/git-im2p-before.txt",
+      "archive_path": "workspace/.parity/nano-h1-evidence-01/git-im2p-before.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 42,
+      "sha256": "3b07e7556f966a8540372919426a1f5086beb79b16db4ea4a7635922e3e73bea"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-h1-evidence-01/git-llama-before.txt",
+      "archive_path": "workspace/.parity/nano-h1-evidence-01/git-llama-before.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 366,
+      "sha256": "fb560cb93470abe9dbd07ab4603cdb217b41547e74a50a47a06b1da874a3fb0f"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-h1-evidence-01/host-only-03.log",
+      "archive_path": "workspace/.parity/nano-h1-evidence-01/host-only-03.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1015,
+      "sha256": "feb6b04661a03b1afebcc679651e4b785274957cb6b5fe5ea81273772b60e382"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-h1-evidence-01/host-only-run-03.log",
+      "archive_path": "workspace/.parity/nano-h1-evidence-01/host-only-run-03.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1625,
+      "sha256": "e894762a133da13ec6d48246bb77da15f95d51943ccd161fec69f71b5eade7e2"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-h1-evidence-01/host-only-run.log",
+      "archive_path": "workspace/.parity/nano-h1-evidence-01/host-only-run.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1578,
+      "sha256": "0aee81f09ceef72133ae4e89aba508534769ab9d1f4afa684f4674bc9f3aeb89"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-h1-evidence-01/host-only.log",
+      "archive_path": "workspace/.parity/nano-h1-evidence-01/host-only.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 968,
+      "sha256": "f3f9283304495d370cf95f6ca9d107ced57ae9f6e0fdec7a55a3d5f4878514db"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-h1-evidence-01/metric-source-sha256.txt",
+      "archive_path": "workspace/.parity/nano-h1-evidence-01/metric-source-sha256.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 348,
+      "sha256": "35f0ac0b7f6764ffbd8317c69a97cc96c81742031ee54799cd73cd6435503e04"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-h1-evidence-01/observer-tools/commands.json",
+      "archive_path": "workspace/.parity/nano-h1-evidence-01/observer-tools/commands.json",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 2825,
+      "sha256": "4a6b057dce71dbf41f8387e8da673f9e9af37afead4e9b14ff4c53562461f6c9"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-h1-evidence-01/observer-tools/graph_dispatch.log",
+      "archive_path": "workspace/.parity/nano-h1-evidence-01/observer-tools/graph_dispatch.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-h1-evidence-01/observer-tools/runtime_probe.log",
+      "archive_path": "workspace/.parity/nano-h1-evidence-01/observer-tools/runtime_probe.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-h1-evidence-01/observer-tools/simulator_audit.log",
+      "archive_path": "workspace/.parity/nano-h1-evidence-01/observer-tools/simulator_audit.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-h1-evidence-01/observer-tools-03/commands.json",
+      "archive_path": "workspace/.parity/nano-h1-evidence-01/observer-tools-03/commands.json",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 2834,
+      "sha256": "ccda3d82413f0523e21239d6e77c5743b63b228b2807dc24ad746e1ed9388b13"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-h1-evidence-01/observer-tools-03/graph_dispatch.log",
+      "archive_path": "workspace/.parity/nano-h1-evidence-01/observer-tools-03/graph_dispatch.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-h1-evidence-01/observer-tools-03/runtime_probe.log",
+      "archive_path": "workspace/.parity/nano-h1-evidence-01/observer-tools-03/runtime_probe.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/.parity/nano-h1-evidence-01/observer-tools-03/simulator_audit.log",
+      "archive_path": "workspace/.parity/nano-h1-evidence-01/observer-tools-03/simulator_audit.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-1-20260929-052250/manifest.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-1-20260929-052250/manifest.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1447,
+      "sha256": "7e19b1339288fec73ccf38e2c2bbf87c005b8370bc76c5afb17019aa66a8e9f0"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-1-20260929-052250/raw/cycle-log.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-1-20260929-052250/raw/cycle-log.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 224352768,
+      "sha256": "b89ed7e9c2ded1af13528b9a00db724d11a099be068fcbd63caa9955778f902f"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-1-20260929-052250/raw/exsia-cycle-detail.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-1-20260929-052250/raw/exsia-cycle-detail.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 5631173,
+      "sha256": "4344da08b0a592bf38d8cdb62b7aafae68915e1547fd66ef55deff037f0efa08"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-1-20260929-052250/raw/stderr.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-1-20260929-052250/raw/stderr.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 13312,
+      "sha256": "96ac3a6a052b60a018e2463f0466eb1bde6f6fd18f6a30c2465847e5ec4a4ea2"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-1-20260929-052250/raw/stdout.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-1-20260929-052250/raw/stdout.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 39,
+      "sha256": "dd6299c53771567d602e11bb17430bce710cb5cb0f15b3eae1ccc024a12b26b6"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-1-20260929-054437/manifest.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-1-20260929-054437/manifest.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1447,
+      "sha256": "cffb78e5d6ad56350ae4e80e9e24ac84729e591b1601aaa014bfad546608d8ef"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-1-20260929-054437/raw/cycle-log.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-1-20260929-054437/raw/cycle-log.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 224349603,
+      "sha256": "07cc89973ede582ffd451861d64bf9494dc94daceb1ca08352899d9fbced37e4"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-1-20260929-054437/raw/exsia-cycle-detail.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-1-20260929-054437/raw/exsia-cycle-detail.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 5631180,
+      "sha256": "226f77143cdded52961be3b24a22c63c72bb374f4166884d8e152da886dd14d8"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-1-20260929-054437/raw/stderr.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-1-20260929-054437/raw/stderr.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 13312,
+      "sha256": "47d861b4f25cfb4c55e71faebe429356c2928729b5e43083e21ac2cf32e9900d"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-1-20260929-054437/raw/stdout.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-1-20260929-054437/raw/stdout.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 39,
+      "sha256": "dd6299c53771567d602e11bb17430bce710cb5cb0f15b3eae1ccc024a12b26b6"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-2-20260929-052355/manifest.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-2-20260929-052355/manifest.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1447,
+      "sha256": "b293769b556644b8fc4171f56427e528fd8b65c0f84780c612c500126b93932d"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-2-20260929-052355/raw/cycle-log.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-2-20260929-052355/raw/cycle-log.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 224351583,
+      "sha256": "59a01833639245b7d6e3598e4171c79d0f5337f6ee589a9839a5fffb5d257cc0"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-2-20260929-052355/raw/exsia-cycle-detail.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-2-20260929-052355/raw/exsia-cycle-detail.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 5631194,
+      "sha256": "cea2bcd99749f0ae13f70c8c3fd1d4c7272b1ea77a03bca596d090893b881a8e"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-2-20260929-052355/raw/stderr.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-2-20260929-052355/raw/stderr.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 13312,
+      "sha256": "5246669d7e069610c21549e814f59875117f545ce04161b450c1d0a45a9cab01"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-2-20260929-052355/raw/stdout.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-2-20260929-052355/raw/stdout.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 39,
+      "sha256": "dd6299c53771567d602e11bb17430bce710cb5cb0f15b3eae1ccc024a12b26b6"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-2-20260929-054542/manifest.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-2-20260929-054542/manifest.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1447,
+      "sha256": "6fe3a030df9fa7c128ed58ae4fb8859b9a29decb9acbe6eb7a48046b4365da84"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-2-20260929-054542/raw/cycle-log.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-2-20260929-054542/raw/cycle-log.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 224353722,
+      "sha256": "9478a5f90783a9caff7e2ccbc40a08ea2a12f515473b4e0e0f6109ac6b1c09d6"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-2-20260929-054542/raw/exsia-cycle-detail.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-2-20260929-054542/raw/exsia-cycle-detail.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 5631207,
+      "sha256": "faddb0c4acced93737971b5579c791357ff79427306c0180c1186ad7a08afa76"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-2-20260929-054542/raw/stderr.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-2-20260929-054542/raw/stderr.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 13312,
+      "sha256": "62002b81f3192d42789326d546d6aeeeafd12aa0f1fe1e02c7ccc3a53ef40731"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-2-20260929-054542/raw/stdout.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-2-20260929-054542/raw/stdout.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 39,
+      "sha256": "dd6299c53771567d602e11bb17430bce710cb5cb0f15b3eae1ccc024a12b26b6"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-3-20260929-052500/manifest.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-3-20260929-052500/manifest.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1447,
+      "sha256": "79149f97524f8e2df38a86b3a9d0bba663d46da9ba3aa58eea52a8b2dcc82dab"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-3-20260929-052500/raw/cycle-log.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-3-20260929-052500/raw/cycle-log.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 224353671,
+      "sha256": "3e7c3443fd621354feea8c3949ca4d0efc136046011354da6ef43644ca5355b4"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-3-20260929-052500/raw/exsia-cycle-detail.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-3-20260929-052500/raw/exsia-cycle-detail.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 5631171,
+      "sha256": "8925ffb98790d49f743b468d72f8914747bd5e6e712fd9c3fc37def193c92914"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-3-20260929-052500/raw/stderr.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-3-20260929-052500/raw/stderr.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 13312,
+      "sha256": "8c09329d5ae9d5056a3be5eb50f41d86a4bff5f778e792bcbe0e84a3cced232d"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-3-20260929-052500/raw/stdout.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-3-20260929-052500/raw/stdout.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 39,
+      "sha256": "dd6299c53771567d602e11bb17430bce710cb5cb0f15b3eae1ccc024a12b26b6"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-3-20260929-054648/manifest.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-3-20260929-054648/manifest.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1447,
+      "sha256": "e2c4232c5fb671dbad331d43b2ac359483cf931c787d239034524a16798d55d1"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-3-20260929-054648/raw/cycle-log.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-3-20260929-054648/raw/cycle-log.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 224351180,
+      "sha256": "4545a181383c1545061e85458619e4635c8de63848d2f3fe8729e3c7d302977b"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-3-20260929-054648/raw/exsia-cycle-detail.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-3-20260929-054648/raw/exsia-cycle-detail.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 5631196,
+      "sha256": "431a4537ce1c5d0c907b96ecb812bd8c932411ab27cade34f682d619e7389687"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-3-20260929-054648/raw/stderr.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-3-20260929-054648/raw/stderr.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 13312,
+      "sha256": "cb0a123d7ea4add54c59ac9bbc8f0472a42688e81df5e099372e37027e132154"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-bitmap-3-20260929-054648/raw/stdout.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-bitmap-3-20260929-054648/raw/stdout.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 39,
+      "sha256": "dd6299c53771567d602e11bb17430bce710cb5cb0f15b3eae1ccc024a12b26b6"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-1-20260929-051919/manifest.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-1-20260929-051919/manifest.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1399,
+      "sha256": "e002bf9b1b97b7054019cc9bc66dcb4a619c038679e17675e6a6ff26f2cbbf99"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-1-20260929-051919/raw/cycle-log.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-1-20260929-051919/raw/cycle-log.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-1-20260929-051919/raw/stderr.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-1-20260929-051919/raw/stderr.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1156,
+      "sha256": "a0c27e7ddacf49045c4a7dd86b7f00d1a7e045e923c5f1c67eec1bf59e1086a0"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-1-20260929-051919/raw/stdout.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-1-20260929-051919/raw/stdout.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-1-20260929-052217/manifest.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-1-20260929-052217/manifest.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1447,
+      "sha256": "9d30429192e8284b98d7d72e30c92047a234467be75dd0a809117933e4c57709"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-1-20260929-052217/raw/cycle-log.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-1-20260929-052217/raw/cycle-log.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 224355662,
+      "sha256": "a9e47cda091b0ce32853cd5db9bad50c7ccb9ba4579528a37966054552c5f925"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-1-20260929-052217/raw/exsia-cycle-detail.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-1-20260929-052217/raw/exsia-cycle-detail.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 5631270,
+      "sha256": "ca190664e435421e37684e9cde32d6baff9b70df632b1ce83661e70f2deba120"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-1-20260929-052217/raw/stderr.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-1-20260929-052217/raw/stderr.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 13312,
+      "sha256": "0e0f264ec2648ad6b7a519a05ceab92db70d37aca1cdc1036b07509c041b267a"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-1-20260929-052217/raw/stdout.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-1-20260929-052217/raw/stdout.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 39,
+      "sha256": "dd6299c53771567d602e11bb17430bce710cb5cb0f15b3eae1ccc024a12b26b6"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-1-20260929-054404/manifest.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-1-20260929-054404/manifest.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1447,
+      "sha256": "08ecca66437a24b153691769895e4c606cdf48515d5ddc1ab5b64097dd4d519b"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-1-20260929-054404/raw/cycle-log.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-1-20260929-054404/raw/cycle-log.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 224354436,
+      "sha256": "6ee4c010cd0b35c285860d259f1a582a285aacabe5276c533ecb5a6b0c26b23f"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-1-20260929-054404/raw/exsia-cycle-detail.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-1-20260929-054404/raw/exsia-cycle-detail.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 5631295,
+      "sha256": "a86cbf5de1cd14865e2a7810964e23ba2e965b421439c6a5590a58698b16dbf6"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-1-20260929-054404/raw/stderr.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-1-20260929-054404/raw/stderr.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 13312,
+      "sha256": "47e59776e0f1122f9a4e77361776e750eb125cb1f2bc270c910bbc91269c9f90"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-1-20260929-054404/raw/stdout.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-1-20260929-054404/raw/stdout.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 39,
+      "sha256": "dd6299c53771567d602e11bb17430bce710cb5cb0f15b3eae1ccc024a12b26b6"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-2-20260929-052322/manifest.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-2-20260929-052322/manifest.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1447,
+      "sha256": "85fa37672f251eda0ae286885f1ede719cea17e37c17ed70b0b4c485de776201"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-2-20260929-052322/raw/cycle-log.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-2-20260929-052322/raw/cycle-log.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 224352835,
+      "sha256": "c5282deb143819493fa0564a9a1b1c3d1e07e5bdce5db4ba8793ec7dead8f03b"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-2-20260929-052322/raw/exsia-cycle-detail.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-2-20260929-052322/raw/exsia-cycle-detail.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 5631280,
+      "sha256": "51c6e1f4f1c98e65f05ccfdce733623e0615b4896c2a6375966f5840b3729a38"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-2-20260929-052322/raw/stderr.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-2-20260929-052322/raw/stderr.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 13312,
+      "sha256": "5e27468c733d9b58f7533d9d92a614c197420429e5d3e413f170871f73849333"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-2-20260929-052322/raw/stdout.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-2-20260929-052322/raw/stdout.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 39,
+      "sha256": "dd6299c53771567d602e11bb17430bce710cb5cb0f15b3eae1ccc024a12b26b6"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-2-20260929-054510/manifest.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-2-20260929-054510/manifest.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1447,
+      "sha256": "fe07520feea004eeeaafba32272f8cb13e2988eede3e4f4b104170398cac5484"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-2-20260929-054510/raw/cycle-log.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-2-20260929-054510/raw/cycle-log.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 224349630,
+      "sha256": "bcdb57066dc36f374844b13f14b485d9ca8df5b584f7f1902f384e0c11f4ec2c"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-2-20260929-054510/raw/exsia-cycle-detail.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-2-20260929-054510/raw/exsia-cycle-detail.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 5631257,
+      "sha256": "b54edb9a9f4bebd379e3031018c70bad2b125ae0442c833af66326c8de8a9d2d"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-2-20260929-054510/raw/stderr.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-2-20260929-054510/raw/stderr.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 13312,
+      "sha256": "909d22de6c95f238dfe3445fc1fdf94fa36e446fc8294758689943f760fab6e0"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-2-20260929-054510/raw/stdout.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-2-20260929-054510/raw/stdout.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 39,
+      "sha256": "dd6299c53771567d602e11bb17430bce710cb5cb0f15b3eae1ccc024a12b26b6"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-3-20260929-052428/manifest.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-3-20260929-052428/manifest.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1447,
+      "sha256": "e715151b30e372d6a2f5b1e65ec081bbf29b1de64cb68b2a95eea65beccb2b43"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-3-20260929-052428/raw/cycle-log.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-3-20260929-052428/raw/cycle-log.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 224350879,
+      "sha256": "ed7547dbf98d05521c0411439a34c6550448d655b061406197e5ee6db043ba09"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-3-20260929-052428/raw/exsia-cycle-detail.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-3-20260929-052428/raw/exsia-cycle-detail.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 5631257,
+      "sha256": "951ec80104a9602bdb646dacf1ff1c5de7c15d7e469b1cf780d632046aa5c1d9"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-3-20260929-052428/raw/stderr.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-3-20260929-052428/raw/stderr.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 13312,
+      "sha256": "26ef25ed22633f1e6f6143ba58f29e011b8d9683c760ece360f25321dfb7d71e"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-3-20260929-052428/raw/stdout.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-3-20260929-052428/raw/stdout.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 39,
+      "sha256": "dd6299c53771567d602e11bb17430bce710cb5cb0f15b3eae1ccc024a12b26b6"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-3-20260929-054615/manifest.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-3-20260929-054615/manifest.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1447,
+      "sha256": "ffc1ce4b8a1683aca5fcd66a70e7f72b8255f01bdc4c447bd7d854c1978f8638"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-3-20260929-054615/raw/cycle-log.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-3-20260929-054615/raw/cycle-log.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 224355043,
+      "sha256": "d06b113fc71fe7df6c9d0c86215fc709487b05f7106c964dad589599d806d823"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-3-20260929-054615/raw/exsia-cycle-detail.jsonl",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-3-20260929-054615/raw/exsia-cycle-detail.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 5631238,
+      "sha256": "e57e5e95979545e6880e7626eadb1dcd77ec460480ba0d64f5fd44c6b6596276"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-3-20260929-054615/raw/stderr.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-3-20260929-054615/raw/stderr.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 13312,
+      "sha256": "197456a1bdcb6a5c396c5fd108faacba2e73106157bdfa5cbc94f817ab6d92f7"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/experiment/rmd-cpu-legacy-3-20260929-054615/raw/stdout.txt",
+      "archive_path": "workspace/output/experiment/rmd-cpu-legacy-3-20260929-054615/raw/stdout.txt",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 39,
+      "sha256": "dd6299c53771567d602e11bb17430bce710cb5cb0f15b3eae1ccc024a12b26b6"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/log/cycle-log.jsonl",
+      "archive_path": "workspace/output/log/cycle-log.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 128352653,
+      "sha256": "61e6ba192629ff345f27afad72a51a18ebb7e9552fb6c06b52a6170b1c9dec18"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/log/debug-log.jsonl",
+      "archive_path": "workspace/output/log/debug-log.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 124216,
+      "sha256": "41b488b69e2044959a341537a7bb1662e4b39123b647b845cdf776e8f2c1c4dd"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/output/log/exsia-cycle-detail.jsonl",
+      "archive_path": "workspace/output/log/exsia-cycle-detail.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 25202,
+      "sha256": "9a6af666ba898376b3f412621f89e6c4ced991ae851f2cfe9fa936f10ba5ba96"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/im2p-cache-build-scripts/build-arm64.sh-selected.log",
+      "archive_path": "workspace/im2p-cache-build-scripts/build-arm64.sh-selected.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1853,
+      "sha256": "34428ef81071ce0c4f21c310bc45b71310629cd113d9737d5c87c752a66dc755"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/im2p-cache-build-scripts/build-arm64.sh.log",
+      "archive_path": "workspace/im2p-cache-build-scripts/build-arm64.sh.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1891,
+      "sha256": "d36628e1cec9c7714afa33dd84a2dc02735e2bc12f757706ca9f40c742895da6"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/im2p-cache-build-scripts/build-x86-default-all.log",
+      "archive_path": "workspace/im2p-cache-build-scripts/build-x86-default-all.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1768,
+      "sha256": "20e2b0fd11b67ae3d516dd0d51cd2cf8e3396f997614fc9986c138096525278c"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/im2p-cache-build-scripts/build-x86.sh-selected.log",
+      "archive_path": "workspace/im2p-cache-build-scripts/build-x86.sh-selected.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1732,
+      "sha256": "706631618185a82fabd14039ff48ddd18b7a1bde61923bd24fa7fd4530324de7"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/im2p-cache-build-scripts/build-x86.sh.log",
+      "archive_path": "workspace/im2p-cache-build-scripts/build-x86.sh.log",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 1770,
+      "sha256": "5da17f8dd23972f7f4236cf7039995d2d97b76077da2aaeec9a7dc79d453cc70"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/cpu-cycle-20260902-153306.jsonl",
+      "archive_path": "workspace/cpu-cycle-20260902-153306.jsonl",
+      "category": "older-local-measurement-not-revalidated",
+      "git": false,
+      "bytes": 38031244,
+      "sha256": "3bc3fc6481fa455e5ef545d9988eb657e12b7c9eeeb3e2e1c03c31aa29cae672"
+    },
+    {
+      "source": "/tmp/potal-cuda-component.log",
+      "archive_path": "supplemental/tmp/potal-cuda-component.log",
+      "category": "historical-build-or-validation-log",
+      "git": false,
+      "bytes": 781,
+      "sha256": "6a4613ebc9be08a4331a1941898c1f54b38efa83080e119fc4f83cfd7d500985"
+    },
+    {
+      "source": "/tmp/potal-cuda-functional-dim32.log",
+      "archive_path": "supplemental/tmp/potal-cuda-functional-dim32.log",
+      "category": "historical-build-or-validation-log",
+      "git": false,
+      "bytes": 1700,
+      "sha256": "b04ba4d3a34bdcc5b5116e8e3cecf1d26a706c1daca0f722bc60c989e4201aa3"
+    },
+    {
+      "source": "/tmp/potal-cuda-functional-padded.log",
+      "archive_path": "supplemental/tmp/potal-cuda-functional-padded.log",
+      "category": "historical-build-or-validation-log",
+      "git": false,
+      "bytes": 542,
+      "sha256": "b763804bc5bfdf57b33dbeb24e9e986aeef5806b86689341a57bc5d95295279b"
+    },
+    {
+      "source": "/tmp/potal-cuda-functional-tn.log",
+      "archive_path": "supplemental/tmp/potal-cuda-functional-tn.log",
+      "category": "historical-build-or-validation-log",
+      "git": false,
+      "bytes": 539,
+      "sha256": "f2a56fe57a1dd87fb8c7b8ee79f379fb7a8b19c109b7323e5ec3cfc1718a089f"
+    },
+    {
+      "source": "/tmp/potal-cuda-functional.log",
+      "archive_path": "supplemental/tmp/potal-cuda-functional.log",
+      "category": "historical-build-or-validation-log",
+      "git": false,
+      "bytes": 539,
+      "sha256": "1d49c67b8a1148d9b94617cb0f471632c720999ec2bb4545a6dcfc12a374e109"
+    },
+    {
+      "source": "/tmp/potal-cuda-refactor-smoke.log",
+      "archive_path": "supplemental/tmp/potal-cuda-refactor-smoke.log",
+      "category": "historical-build-or-validation-log",
+      "git": false,
+      "bytes": 31528,
+      "sha256": "6cabca925a9ca15c7fc32e73753f17a8dd963bdf6faf0d9c12bf7dfd2ca65feb"
+    },
+    {
+      "source": "/tmp/potal-llama-quantize.log",
+      "archive_path": "supplemental/tmp/potal-llama-quantize.log",
+      "category": "historical-build-or-validation-log",
+      "git": false,
+      "bytes": 25668,
+      "sha256": "73e930b29d8fd037825183d6cc1ebb65edf2a6fdca5751f685ac8bc3e72a7d91"
+    },
+    {
+      "source": "/tmp/potal-nano-attention-profile.log",
+      "archive_path": "supplemental/tmp/potal-nano-attention-profile.log",
+      "category": "historical-build-or-validation-log",
+      "git": false,
+      "bytes": 516,
+      "sha256": "6e33677ec31305994bd2e47d4fa04b99c11cebde6b96ec10c272f594c2bb61e9"
+    },
+    {
+      "source": "/tmp/potal-nano-cycle-build.log",
+      "archive_path": "supplemental/tmp/potal-nano-cycle-build.log",
+      "category": "historical-build-or-validation-log",
+      "git": false,
+      "bytes": 9113,
+      "sha256": "f1d82b2ee3315985ce8818faa9aaa7ff0ba1d2e9288186dea4a5f7c7ae737d7b"
+    },
+    {
+      "source": "/tmp/potal-nano-hp1-matched-build.log",
+      "archive_path": "supplemental/tmp/potal-nano-hp1-matched-build.log",
+      "category": "historical-build-or-validation-log",
+      "git": false,
+      "bytes": 373497,
+      "sha256": "1e1a54954b2a80801e1431934673cd8f10745bb6224626e8bf76931da5baa538"
+    },
+    {
+      "source": "/tmp/potal-nano-im2p-build.log",
+      "archive_path": "supplemental/tmp/potal-nano-im2p-build.log",
+      "category": "historical-build-or-validation-log",
+      "git": false,
+      "bytes": 396372,
+      "sha256": "ed0acb9bdc5878b6ddbfd92450c1b246792101d260c15ce101fc12ca7e753f25"
+    },
+    {
+      "source": "/tmp/potal-outlier-after-build.log",
+      "archive_path": "supplemental/tmp/potal-outlier-after-build.log",
+      "category": "historical-build-or-validation-log",
+      "git": false,
+      "bytes": 1750330,
+      "sha256": "5b68d61844bdad92665bf77559ae42b59d791d7ae837f31116278295f394dd02"
+    },
+    {
+      "source": "/tmp/potal-outlier-after-config.log",
+      "archive_path": "supplemental/tmp/potal-outlier-after-config.log",
+      "category": "historical-build-or-validation-log",
+      "git": false,
+      "bytes": 2667,
+      "sha256": "388d042e42b99aebe7f376b5bc2820e12e9d787eb68efe1b5e1873e26359306b"
+    },
+    {
+      "source": "/tmp/potal-outlier-before-build.log",
+      "archive_path": "supplemental/tmp/potal-outlier-before-build.log",
+      "category": "historical-build-or-validation-log",
+      "git": false,
+      "bytes": 1752584,
+      "sha256": "15d84cac1b843f10426460579256dc81cbb7a18e4a4835eea62646e43b8b0d5f"
+    },
+    {
+      "source": "/tmp/potal-outlier-before-config.log",
+      "archive_path": "supplemental/tmp/potal-outlier-before-config.log",
+      "category": "historical-build-or-validation-log",
+      "git": false,
+      "bytes": 994,
+      "sha256": "52b9b60adeda1f6f4d27348a9c9287a3392d3e4cc7e112b1b5f5f79fd9e6861b"
+    },
+    {
+      "source": "/tmp/potal-outlier-test-build.log",
+      "archive_path": "supplemental/tmp/potal-outlier-test-build.log",
+      "category": "historical-build-or-validation-log",
+      "git": false,
+      "bytes": 169545,
+      "sha256": "a29af170e50997d24f032cf094b318ee18023904a284b5e9124b70dd07517bb9"
+    },
+    {
+      "source": "/tmp/potal-unit-add-gates.log",
+      "archive_path": "supplemental/tmp/potal-unit-add-gates.log",
+      "category": "historical-build-or-validation-log",
+      "git": false,
+      "bytes": 467,
+      "sha256": "6e607109dabe404d2a18aad87147f9dfe7ec45b156700479c7d7de91cccc86b7"
+    },
+    {
+      "source": "/tmp/potal-unit-add-im2p-provider.log",
+      "archive_path": "supplemental/tmp/potal-unit-add-im2p-provider.log",
+      "category": "historical-build-or-validation-log",
+      "git": false,
+      "bytes": 3006,
+      "sha256": "028f63bee275ae23077dce47872d454f423f9b61633c5ac43781886471fe85e4"
+    },
+    {
+      "source": "/tmp/potal-unit-add-im2p-raw.log",
+      "archive_path": "supplemental/tmp/potal-unit-add-im2p-raw.log",
+      "category": "historical-build-or-validation-log",
+      "git": false,
+      "bytes": 365,
+      "sha256": "1da0b713a74262da4e8d83bea14a03fe68fb44528ff502fa5bc6b9c9b888c545"
+    },
+    {
+      "source": "/tmp/potal-unit-add-llama-omp-smoke.log",
+      "archive_path": "supplemental/tmp/potal-unit-add-llama-omp-smoke.log",
+      "category": "historical-build-or-validation-log",
+      "git": false,
+      "bytes": 31518,
+      "sha256": "50a641ff7194d3ccfce9d73ec024d3fa15cd6621b1d96b6ddcb069db6ebe7e08"
+    },
+    {
+      "source": "/tmp/potal-unit-add-llama-smoke.log",
+      "archive_path": "supplemental/tmp/potal-unit-add-llama-smoke.log",
+      "category": "historical-build-or-validation-log",
+      "git": false,
+      "bytes": 31516,
+      "sha256": "6e192a563cfd29c4fc7f97abcbef20da57387b31b0dac46f7b759230cd330539"
+    },
+    {
+      "source": "/tmp/potal-unit-add-llama512.log",
+      "archive_path": "supplemental/tmp/potal-unit-add-llama512.log",
+      "category": "historical-build-or-validation-log",
+      "git": false,
+      "bytes": 33333,
+      "sha256": "202f71d1615572edd0c438f4a0f84046341429c95ef3fac0fecca7507b711c5f"
+    },
+    {
+      "source": "/tmp/potal-unit-add-omp-build.log",
+      "archive_path": "supplemental/tmp/potal-unit-add-omp-build.log",
+      "category": "historical-build-or-validation-log",
+      "git": false,
+      "bytes": 1040712,
+      "sha256": "1e42453e4978bc1f9446da82ba438ea6c31de911888782d3b2c585b7017d27a1"
+    },
+    {
+      "source": "/tmp/potal-unit-add-smoke.log",
+      "archive_path": "supplemental/tmp/potal-unit-add-smoke.log",
+      "category": "historical-build-or-validation-log",
+      "git": false,
+      "bytes": 9020,
+      "sha256": "cb6ff890a25c495c0539b0ca383a2426594e181f65eb0d4fc68914e8ee3145dd"
+    },
+    {
+      "source": "/tmp/potal-attention-opportunity-audit.json",
+      "archive_path": "supplemental/tmp/potal-attention-opportunity-audit.json",
+      "category": "historical-component-analysis",
+      "git": false,
+      "bytes": 2435,
+      "sha256": "7745a4b32c29cf69a731464c96150a52463652486434845f4ba3e93acb36a243"
+    },
+    {
+      "source": "/tmp/potal-attention-opportunity-audit.py",
+      "archive_path": "supplemental/tmp/potal-attention-opportunity-audit.py",
+      "category": "historical-component-analysis",
+      "git": false,
+      "bytes": 5712,
+      "sha256": "b74045dc799551afdfa7d81eff12b338d963b3851aa73f10cc29be51b695f2c5"
+    },
+    {
+      "source": "/tmp/potal-cuda-check.py",
+      "archive_path": "supplemental/tmp/potal-cuda-check.py",
+      "category": "historical-component-analysis",
+      "git": false,
+      "bytes": 8459,
+      "sha256": "487b32432bd433a967b4b004fc5a1eb0cc02da1398c53cc125e9423c03c5785d"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/build-potal-hp1-diagnostic/im2p_gemmini_hardware.h",
+      "archive_path": "supplemental/failed-hp1-diagnostic/im2p_gemmini_hardware.h",
+      "category": "failed-build-diagnostic-metadata",
+      "git": false,
+      "bytes": 580,
+      "sha256": "89d5d9119faf9233914b6596a743d5ff4adb8dcea88b7eab55db80f3e906ebe4"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/build-potal-hp1-diagnostic/logs/01.log",
+      "archive_path": "supplemental/failed-hp1-diagnostic/logs/01.log",
+      "category": "failed-build-diagnostic-metadata",
+      "git": false,
+      "bytes": 101,
+      "sha256": "b531022d0b67f77a953148d4578af1df599c9dbcda5de7468622c788afb8b543"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/build-potal-hp1-diagnostic/logs/02.log",
+      "archive_path": "supplemental/failed-hp1-diagnostic/logs/02.log",
+      "category": "failed-build-diagnostic-metadata",
+      "git": false,
+      "bytes": 28011,
+      "sha256": "9174cbe78117ab6035f1fa322a3333cd41c943759f9ab675be51175b90dca34a"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/build-potal-hp1-diagnostic/resolved-profile.json",
+      "archive_path": "supplemental/failed-hp1-diagnostic/resolved-profile.json",
+      "category": "failed-build-diagnostic-metadata",
+      "git": false,
+      "bytes": 1924,
+      "sha256": "8b0eb9b57242e8de5dec8db5746b632af2dec69027ae8cf83c1d48e893f69011"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/build-potal-hp1-diagnostic/result.json",
+      "archive_path": "supplemental/failed-hp1-diagnostic/result.json",
+      "category": "failed-build-diagnostic-metadata",
+      "git": false,
+      "bytes": 3553,
+      "sha256": "90fa2f8e73004784b1fe90109b75cafd06623e3079c34978ac20275a5ca60a53"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/build-potal-hp1-diagnostic/stage-rtl.json",
+      "archive_path": "supplemental/failed-hp1-diagnostic/stage-rtl.json",
+      "category": "failed-build-diagnostic-metadata",
+      "git": false,
+      "bytes": 3553,
+      "sha256": "90fa2f8e73004784b1fe90109b75cafd06623e3079c34978ac20275a5ca60a53"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/build-potal-hp1-diagnostic/tool-lock.json",
+      "archive_path": "supplemental/failed-hp1-diagnostic/tool-lock.json",
+      "category": "failed-build-diagnostic-metadata",
+      "git": false,
+      "bytes": 9901,
+      "sha256": "dc3c6863b89fff7b644fe76427533e60d4e296143f947ec8c0ee77d77784a5f1"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/build-potal-lab/CMakeCache.txt",
+      "archive_path": "supplemental/build-config/build-potal-lab/CMakeCache.txt",
+      "category": "build-configuration-metadata",
+      "git": false,
+      "bytes": 34841,
+      "sha256": "2e4c823f2843e52de4269d9120010edeca30880926c2ef307556bc8561698d80"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/build-potal-lab/generated/gemmini_params.h",
+      "archive_path": "supplemental/build-config/build-potal-lab/generated/gemmini_params.h",
+      "category": "build-configuration-metadata",
+      "git": false,
+      "bytes": 2686,
+      "sha256": "54a8a1dab9f97d8eb52f0e60fab0c22852b68e078eb8269e3fcacfaa77bf58c6"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/build-potal-probes/CMakeCache.txt",
+      "archive_path": "supplemental/build-config/build-potal-probes/CMakeCache.txt",
+      "category": "build-configuration-metadata",
+      "git": false,
+      "bytes": 13852,
+      "sha256": "27357838e0c0ad9ebf79d3c72427bad2d31d1426e8bcabf73b026a74bb6c6f06"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/build-potal-outlier-before/CMakeCache.txt",
+      "archive_path": "supplemental/build-config/build-potal-outlier-before/CMakeCache.txt",
+      "category": "build-configuration-metadata",
+      "git": false,
+      "bytes": 39518,
+      "sha256": "0ac4868df9cb9c54bdf21604066750392b066461f2bc0f430dbdffa2a71138ff"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/build-potal-outlier-before/generated/gemmini_params.h",
+      "archive_path": "supplemental/build-config/build-potal-outlier-before/generated/gemmini_params.h",
+      "category": "build-configuration-metadata",
+      "git": false,
+      "bytes": 2686,
+      "sha256": "54a8a1dab9f97d8eb52f0e60fab0c22852b68e078eb8269e3fcacfaa77bf58c6"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/build-potal-outlier-after/CMakeCache.txt",
+      "archive_path": "supplemental/build-config/build-potal-outlier-after/CMakeCache.txt",
+      "category": "build-configuration-metadata",
+      "git": false,
+      "bytes": 37725,
+      "sha256": "4521289f6050a98c6f816a877349041eae8190c5df49b0e44443c884d179a400"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/build-potal-outlier-after/generated/gemmini_params.h",
+      "archive_path": "supplemental/build-config/build-potal-outlier-after/generated/gemmini_params.h",
+      "category": "build-configuration-metadata",
+      "git": false,
+      "bytes": 2686,
+      "sha256": "54a8a1dab9f97d8eb52f0e60fab0c22852b68e078eb8269e3fcacfaa77bf58c6"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/build-potal-unit-add/CMakeCache.txt",
+      "archive_path": "supplemental/build-config/build-potal-unit-add/CMakeCache.txt",
+      "category": "build-configuration-metadata",
+      "git": false,
+      "bytes": 14102,
+      "sha256": "12a2a69d534b773c7d1b519a6d14bd9c001930b0b01c688a0782317856ef4dae"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/build-potal-unit-add-omp/CMakeCache.txt",
+      "archive_path": "supplemental/build-config/build-potal-unit-add-omp/CMakeCache.txt",
+      "category": "build-configuration-metadata",
+      "git": false,
+      "bytes": 36876,
+      "sha256": "52e2054e01c7866cc19f73a2e5308e4fa388a4046ba65034142e94ed5397d90b"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/build-potal-unit-add-omp/generated/gemmini_params.h",
+      "archive_path": "supplemental/build-config/build-potal-unit-add-omp/generated/gemmini_params.h",
+      "category": "build-configuration-metadata",
+      "git": false,
+      "bytes": 2686,
+      "sha256": "54a8a1dab9f97d8eb52f0e60fab0c22852b68e078eb8269e3fcacfaa77bf58c6"
+    },
+    {
+      "source": "/tmp/potal-nano-cycle-model/CMakeCache.txt",
+      "archive_path": "supplemental/build-config/potal-nano-cycle-model/CMakeCache.txt",
+      "category": "build-configuration-metadata",
+      "git": false,
+      "bytes": 14786,
+      "sha256": "6f2f3b186e81d852a56680a2d1bc5a9a885510c079f5df2c9bd0d0a73a1c9fd4"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/wikitext-2-raw/wiki.test.raw",
+      "archive_path": "workspace/wikitext-2-raw/wiki.test.raw",
+      "category": "input-text",
+      "git": false,
+      "bytes": 1290590,
+      "sha256": "173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano/transfer-20261012/commands.json",
+      "archive_path": "workspace/experiments/potal_a4/results-nano/transfer-20261012/commands.json",
+      "category": "transfer-metadata",
+      "git": true,
+      "bytes": 9345,
+      "sha256": "c128d82ab740be6aa1e675887ba73aa002eeed64b1b5aaa900baba2ed8486809"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano/transfer-20261012/im2p-real-lib.json",
+      "archive_path": "workspace/experiments/potal_a4/results-nano/transfer-20261012/im2p-real-lib.json",
+      "category": "transfer-metadata",
+      "git": true,
+      "bytes": 15904,
+      "sha256": "c7c486f761e0f06459998dbbb63097d8bb44902b52de3e0f952f162e5c605ac9"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano/transfer-20261012/llama-model-source.json",
+      "archive_path": "workspace/experiments/potal_a4/results-nano/transfer-20261012/llama-model-source.json",
+      "category": "transfer-metadata",
+      "git": true,
+      "bytes": 780,
+      "sha256": "a947620b11f41c885b4f054cac06d5576752b527fe79132877bebf7eb3ed3af0"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano/transfer-20261012/logs/ctest-cycle-model.log",
+      "archive_path": "workspace/experiments/potal_a4/results-nano/transfer-20261012/logs/ctest-cycle-model.log",
+      "category": "transfer-metadata",
+      "git": true,
+      "bytes": 19404,
+      "sha256": "5d336bbed1724b24f57e4012933224743f10f0e053473ec2ef0fcddbca7029e3"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano/transfer-20261012/logs/ctest-raw-and-reference.log",
+      "archive_path": "workspace/experiments/potal_a4/results-nano/transfer-20261012/logs/ctest-raw-and-reference.log",
+      "category": "transfer-metadata",
+      "git": true,
+      "bytes": 4495,
+      "sha256": "5d911073f67ac5673c24256c3a8e421bcae61dc83be657a15bdb21f8bfb98d73"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano/transfer-20261012/logs/potal-cuda-component.log",
+      "archive_path": "workspace/experiments/potal_a4/results-nano/transfer-20261012/logs/potal-cuda-component.log",
+      "category": "transfer-metadata",
+      "git": true,
+      "bytes": 781,
+      "sha256": "6a4613ebc9be08a4331a1941898c1f54b38efa83080e119fc4f83cfd7d500985"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano/transfer-20261012/logs/potal-cuda-functional-dim32.log",
+      "archive_path": "workspace/experiments/potal_a4/results-nano/transfer-20261012/logs/potal-cuda-functional-dim32.log",
+      "category": "transfer-metadata",
+      "git": true,
+      "bytes": 1700,
+      "sha256": "b04ba4d3a34bdcc5b5116e8e3cecf1d26a706c1daca0f722bc60c989e4201aa3"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano/transfer-20261012/logs/potal-cuda-refactor-smoke.log",
+      "archive_path": "workspace/experiments/potal_a4/results-nano/transfer-20261012/logs/potal-cuda-refactor-smoke.log",
+      "category": "transfer-metadata",
+      "git": true,
+      "bytes": 31528,
+      "sha256": "6cabca925a9ca15c7fc32e73753f17a8dd963bdf6faf0d9c12bf7dfd2ca65feb"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano/transfer-20261012/logs/potal-llama-quantize.log",
+      "archive_path": "workspace/experiments/potal_a4/results-nano/transfer-20261012/logs/potal-llama-quantize.log",
+      "category": "transfer-metadata",
+      "git": true,
+      "bytes": 25668,
+      "sha256": "73e930b29d8fd037825183d6cc1ebb65edf2a6fdca5751f685ac8bc3e72a7d91"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano/transfer-20261012/logs/potal-unit-add-gates.log",
+      "archive_path": "workspace/experiments/potal_a4/results-nano/transfer-20261012/logs/potal-unit-add-gates.log",
+      "category": "transfer-metadata",
+      "git": true,
+      "bytes": 467,
+      "sha256": "6e607109dabe404d2a18aad87147f9dfe7ec45b156700479c7d7de91cccc86b7"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano/transfer-20261012/logs/potal-unit-add-im2p-provider.log",
+      "archive_path": "workspace/experiments/potal_a4/results-nano/transfer-20261012/logs/potal-unit-add-im2p-provider.log",
+      "category": "transfer-metadata",
+      "git": true,
+      "bytes": 3006,
+      "sha256": "028f63bee275ae23077dce47872d454f423f9b61633c5ac43781886471fe85e4"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano/transfer-20261012/logs/potal-unit-add-llama-omp-smoke.log",
+      "archive_path": "workspace/experiments/potal_a4/results-nano/transfer-20261012/logs/potal-unit-add-llama-omp-smoke.log",
+      "category": "transfer-metadata",
+      "git": true,
+      "bytes": 31518,
+      "sha256": "50a641ff7194d3ccfce9d73ec024d3fa15cd6621b1d96b6ddcb069db6ebe7e08"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano/transfer-20261012/logs/potal-unit-add-llama-smoke.log",
+      "archive_path": "workspace/experiments/potal_a4/results-nano/transfer-20261012/logs/potal-unit-add-llama-smoke.log",
+      "category": "transfer-metadata",
+      "git": true,
+      "bytes": 31516,
+      "sha256": "6e192a563cfd29c4fc7f97abcbef20da57387b31b0dac46f7b759230cd330539"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano/transfer-20261012/logs/potal-unit-add-llama512.log",
+      "archive_path": "workspace/experiments/potal_a4/results-nano/transfer-20261012/logs/potal-unit-add-llama512.log",
+      "category": "transfer-metadata",
+      "git": true,
+      "bytes": 33333,
+      "sha256": "202f71d1615572edd0c438f4a0f84046341429c95ef3fac0fecca7507b711c5f"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano/transfer-20261012/logs/potal-unit-add-smoke.log",
+      "archive_path": "workspace/experiments/potal_a4/results-nano/transfer-20261012/logs/potal-unit-add-smoke.log",
+      "category": "transfer-metadata",
+      "git": true,
+      "bytes": 9020,
+      "sha256": "cb6ff890a25c495c0539b0ca383a2426594e181f65eb0d4fc68914e8ee3145dd"
+    },
+    {
+      "source": "/home/dyndnn/Projects/llama.cpp-gemmini/experiments/potal_a4/results-nano/transfer-20261012/provenance.json",
+      "archive_path": "workspace/experiments/potal_a4/results-nano/transfer-20261012/provenance.json",
+      "category": "transfer-metadata",
+      "git": true,
+      "bytes": 68623,
+      "sha256": "5d0a118663198eea570d61cf54ceaf87c3ae2bcf64538b92568df3ee5faa3e94"
+    }
+  ],
+  "summary": {
+    "current-potal-measurement": {
+      "files": 207,
+      "bytes": 92225254
+    },
+    "older-local-measurement-not-revalidated": {
+      "files": 139,
+      "bytes": 2928587549
+    },
+    "historical-build-or-validation-log": {
+      "files": 24,
+      "bytes": 5666852
+    },
+    "historical-component-analysis": {
+      "files": 3,
+      "bytes": 16606
+    },
+    "failed-build-diagnostic-metadata": {
+      "files": 7,
+      "bytes": 47623
+    },
+    "build-configuration-metadata": {
+      "files": 11,
+      "bytes": 202444
+    },
+    "input-text": {
+      "files": 1,
+      "bytes": 1290590
+    },
+    "transfer-metadata": {
+      "files": 16,
+      "bytes": 287088
+    }
+  },
+  "notes": [
+    "All archive paths are relative. workspace/ paths restore underneath the repository root.",
+    "supplemental/ contains historical logs/configuration/analysis helpers; these are evidence, not a supported alternate implementation.",
+    "Older September local logs are preserved separately by category and are not new PoTal validation.",
+    "The archive also duplicates the small current measurement files committed to Git for a self-contained measurement bundle.",
+    "inventory.json itself is embedded at archive root and is intentionally absent from its own checksummed entry list."
+  ],
+  "excluded_from_git": [
+    "All tensor captures (*.npz, *.npy), token dumps (*.i32), large historical cycle JSONL, and full build logs (in this archive).",
+    "models/gpt2-base/, models/llama3.2-1B/, model caches, build-*/ compiled files, IM2P artifact binaries/caches (not bundled).",
+    ".parity compiled binaries/libraries and miniature GGUFs; im2p-cache-build-scripts/bin generated mock commands (not bundled, left unchanged).",
+    "Raw Codex session logs and account configuration (not bundled)."
+  ]
+}

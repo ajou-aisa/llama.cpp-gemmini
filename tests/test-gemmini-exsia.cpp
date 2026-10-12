@@ -58,6 +58,66 @@ bool check(bool value, const char * message) {
     return value;
 }
 
+bool test_a4_source_zero_sigma() {
+#if GGML_GEMMINI_ACTIVATION_BITS == 4 && EXSIA_VALIDATION
+    using namespace quants::act::exsia;
+    for (size_t valid : {size_t{7}, size_t{32}}) {
+        for (bool all_zero : {false, true}) {
+            std::vector<float> input(32, 0.0f);
+            if (!all_zero) {
+                input[0] = 8.0f; // top bucket: excluded independently of zero handling
+                input[1] = 1.0f;
+                input[2] = 1.75f;
+                input[3] = 0.001f; // nonzero source rounded to zero must remain in U
+            }
+            Meta meta;
+            ExSIAState state;
+            state.B_size = 32;
+            state.K_logical = valid;
+            state.K_padded = 32;
+            state.blocks_per_row = 1;
+            LocalStage stage;
+            StripeScratch scratch;
+            if (!scratch.prepare(32))
+                return false;
+            uint64_t mask_word = 0;
+            BlockMask mask(&mask_word, 32);
+            std::array<int32_t, 32> output{};
+            int16_t exponent = 0;
+            LocalBlockCycleSample sample;
+            if (!stage.run_optimized(meta, state, input.data(), valid, 32, 0, 0,
+                                     scratch, mask, output.data(), exponent
+#if EXSIA_BRANCH_COUNTS_ENABLED
+                                     , sample
+#endif
+                                     ))
+                return false;
+            const size_t expected_count = all_zero ? 0 : 3;
+            if (!check(scratch.reference.p1_N == expected_count,
+                       "A4 sigma population excludes source zero, retains rounded zero") ||
+                !check(scratch.reference.p1_S == (all_zero ? 0 : 11) &&
+                       scratch.reference.p1_SS == (all_zero ? 0 : 65),
+                       "A4 sigma statistics match independent integer fixture") ||
+                !check(mask_word == (all_zero ? 0 : 1),
+                       "A4 sigma fixture selects only the top bucket"))
+                return false;
+            const uint64_t optimized_mask = mask_word;
+            std::vector<int32_t> reference(32);
+            std::vector<int16_t> reference_exp(1);
+            // The validation caller normally stages the source in block.x.
+            std::copy(input.begin(), input.end(), scratch.block.x.begin());
+            if (!stage.run_reference(meta, state, input, 0, 0, scratch, mask,
+                                     reference, reference_exp, sample) ||
+                !check(mask_word == optimized_mask && reference_exp[0] == exponent &&
+                       std::equal(reference.begin(), reference.end(), output.begin()),
+                       "A4 full/tail and reference zero handling agree"))
+                return false;
+        }
+    }
+#endif
+    return true;
+}
+
 #ifndef GEMMINI_EXSIA_WRITER_TEST_ONLY
 bool test_evaluation_metrics_observer(const std::filesystem::path & directory) {
 #if GGML_GEMMINI_ACT_QUANT_METRICS || GGML_GEMMINI_RESIDUAL_METRICS
@@ -3516,7 +3576,7 @@ int main(int argc, char ** argv) {
                        case_name == "hp1-srmd-software-ws" || case_name == "rmd-direct-parity" ||
                        case_name == "direct-executor" || case_name == "rmd-gather" ||
                        case_name == "stripe-geometry" || case_name == "meta-rho" ||
-                       case_name == "non-outlier-clipping" ||
+                       case_name == "non-outlier-clipping" || case_name == "a4-source-zero-sigma" ||
                        case_name == "non-exsia-capture-context" || case_name == "packet-capture";
     if (!known) {
         std::fprintf(stderr, "unknown case: %s\n", case_name.c_str());
@@ -3525,12 +3585,13 @@ int main(int argc, char ** argv) {
 
     std::printf("TEST_CASE_BEGIN name=%s\n", case_name.c_str());
     const bool ok =
-        (case_name == "all" && test_meta_rho_invariant() && test_non_exsia_capture_context() &&
+        (case_name == "all" && test_a4_source_zero_sigma() && test_meta_rho_invariant() && test_non_exsia_capture_context() &&
          test_non_outlier_clipping_policy() && test_exsia_packet_capture() &&
          test_exsia_baseline() && test_dispatch_modes() && test_compiled_width_rmd_suite() &&
          test_direct_cpu_executor() && test_activation_stripe_geometry_contract() &&
          test_cpu_direct_residual_dequantization()) ||
         (case_name == "baseline" && test_exsia_baseline()) ||
+        (case_name == "a4-source-zero-sigma" && test_a4_source_zero_sigma()) ||
         (case_name == "packet-capture" && test_exsia_packet_capture()) ||
         (case_name == "dispatch" && test_dispatch_modes()) ||
         (case_name == "rmd-routes" && test_rmd_cpu_ws_routes()) ||

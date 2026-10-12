@@ -1,5 +1,23 @@
 # PoTal attention: nano에서 Gemmini / IM2P 작업 이어가기
 
+## 최신 nano 결정과 상태
+
+이 문서의 이관 당시 기록에 앞서 [현재 진행 기록](experiments/potal_a4/NANO_PROGRESS.md)과
+[명세-작업 대응표](experiments/potal_a4/IMPLEMENTATION_PLAN.md#specification-to-work-audit)를 확인한다.
+
+- 사용자는 **A4 sigma 통계에서 원본 0을 제외하는 정책을 채택**했다. nonzero 원본이 qround 후 0이 되는 경우는 포함한다. Top/sigma와 D>0 보정 mask는 구분한다.
+- 새 전후 PPL 비교는 **10 chunks**로 고정한다. 현재 context512, WikiText-2 test 앞 5,120 input / 2,550 scored tokens다. 아래의 과거 8-chunk 숫자와 직접 비교하지 않는다.
+- 제품 zero-only 수정의 10-chunk PPL은 40.18882947→40.20531900, ExSIA 검사 5/5 통과다. 이 비교는 CPU main/RMD·FP attention·ACC_ROWS1024 조건이며 원문 a4nks/geometry 또는 Gemmini RTL 검증 완료가 아니다.
+- 호환 IM2P `20b82f0`의 A4/W4/DIM32 archive 빌드·manifest·native link와 provider raw-dot 15개 검사가 통과했다. 일반 pointer API가 scale 정보 없이 block size를 K로 바꾸는 문제를 확인해, 기존 제품과 같은 provider 경로로 probe를 맞췄다. 설치된 이전 checkout `5da6a4c`와 혼동하지 않는다. 제품 a4nks dispatch·전체 성능 검증은 별도로 남아 있다.
+- ±1 상위 digit의 덧셈 처리 후보는 Llama-3.2-1B Q4_HP1 context512·10-chunk에서 검증했다. 전후 PPL은 모두 **21.486062983190273**이며 packet/scale/attention/logits/token-NLL도 비트 단위로 같다. 다른 digit은 정확한 곱셈으로 보존했다. CPU에서 0 생략+unit 처리는 30개 attention 사례 합산 시간을 8.82% 줄였으나, 0만 생략하는 대조군 대비 unit 처리의 추가 이득은 0.42%로 반복 변동보다 작다. 현재 Gemmini raw 32×32×32는 일반 값·unit 값 모두 492 cycles다. 단순 unit 치환을 제품 기본값으로 채택할 성능 근거는 부족하다.
+- 사용자의 추가 요청으로 기존 `native_measure.py`에 cuBLAS 정수 CUDA 비교 경로를 연결했다. 84개 원시곱 검사 및 실제 attention 30개 사례 모두 정확히 같았다. 개별 K32 곱마다 복사·동기화하고 host SCU를 유지한 CUDA는 CPU 기본 경로보다 29.83% 느렸다. GPU 상주·묶음 실행·SCU 통합은 아직 실험하지 않았다. CPU/CUDA 성능 근거는 [component-summary.json](experiments/potal_a4/results-unit-add-llama512/component-summary.json)이다. 전체 모델 CUDA PPL 또는 Gemmini 가속 결과로 해석하지 않는다.
+- 다음 구현 대상으로 **QK의 실제 mask가 전부 -inf인 타일 생략**을 선택했다. 현재는 조사만 끝났으며 구현·전후 PPL·성능 측정은 미완료다. 원래 Q/K 양자화·stripe·residual 원본 행 번호를 유지하고, 생략한 score는 softmax가 안전하게 읽도록 처리해야 한다. PV 생략은 이번 범위에 포함하지 않는다. 상세 인수인계는 [QK 조사 기록](experiments/potal_a4/NANO_PROGRESS.md#qk-fully-masked-tile-skip-investigation--implementation-pending)에 있다.
+- 2026-10-12 이관 요청은 기존 변경과 증거를 **`work/potal-attn-im2p-nano`에 커밋하고 같은 원격 브랜치에 일반 push**하는 것이다. develop/hotfix 병합, reset, 기존 변경 폐기, 새 구현·실험은 하지 않는다. hotfix 이관은 이후 작업이다.
+- 전달 압축 파일은 `/home/dyndnn/Projects/llama.cpp-gemmini/output/potal-nano-transfer-20261012.tar.gz`이다(278,803,401 bytes). SHA256은 `458d8ec4eec37419d9615f3be02de8657fe30fa6555f7e5e3e2c305c608e3cc4`. 파일별 목록·해시, 실제 실행 명령, 의존성 commit·설정·artifact 경로는 [이관 증빙](experiments/potal_a4/results-nano/transfer-20261012/)에 있다. 대용량 capture·토큰·원시 로그는 압축 파일로 전달하며 모델·캐시·컴파일 산출물은 포함하지 않는다.
+- 수정 전에 [기존 구현·재사용 대응표](experiments/potal_a4/IMPLEMENTATION_PLAN.md#existing-implementation-and-reuse-audit)에서 담당 함수·호출자·테스트를 확인한다. 기존 ExSIA/RMD/matmul/provider/graph/계측을 우선 수정한다. 계획에 적혀 있던 새 파일·테스트 이름은 생성 의무가 아니며, 기존 코드로 충족되지 않는 책임을 확인한 경우에만 필요한 부분을 추가한다.
+
+이하의 실측 표는 이관 당시의 역사적 결과다. 제품 fused emitter·wide accumulator·a4nks graph의 미완료 상태는 여전히 유효하다.
+
 ## 이어받는 작업
 
 사용자는 `hotfix/potal-attn`을 원격에 보존하고, **그 브랜치에서 새 브랜치를 만들어 nano에서 지금까지의 논의를 이어가도록** 요청했다. 새 세션은 이 문서를 먼저 읽는다.
@@ -31,6 +49,7 @@
 - P: 원래 geometry stripe의 uint8, main `(q&15)-8`, upper digits `q-(q&15)`, zero point 8. Q와 동일한 양자화 방식이 아니다.
 - K: `[-128,119]`의 8비트 코드, signed nibble 두 패스. V: token block / channel별 4비트.
 - top exponent / strict 2-sigma / distinct E2, stripe scale, 원래 K block, mask와 FP softmax를 유지한다. FP KV 저장 형식도 유지한다.
+- Sigma 모집단은 source-nonzero이고 top을 제외한다. 고정 비율 선택이 아니며, 0의 D>0 보정 표시를 sigma outlier로 해석하지 않는다.
 - **줄일 대상은 dense int32 residual plane과 scalar 재분해·재수집 비용**이다. 필요한 limb를 버리지 않는다. 같은 코드와 패킹 조건이면 이 표현 최적화로 GEMM fragment가 줄어드는 것은 아니다.
 - 같은 weights/tokens/실행 경로에서 main, digits, support, scales, 복원값, logits, token별 NLL/PPL이 같아야 한다. 비슷한 평균 PPL만으로 통과시키지 않는다.
 
@@ -101,13 +120,13 @@ Python 3.11, NumPy 1.26.4, tokenizers 및 저장소 `gguf-py` 의존성을 확�
 ```sh
 rtk proxy python3.11 -m experiments.potal_a4.verify
 rtk proxy python3.11 -m experiments.potal_a4.prepare . experiments/potal_a4/results-nano
-rtk proxy env PYTHONPATH=gguf-py:. OPENBLAS_NUM_THREADS=2 python3.11 -m experiments.potal_a4.run models/gpt2.Q4_HP1.gguf experiments/potal_a4/results-nano/test.i32 512 8 original_a4nks experiments/potal_a4/results-nano/test512-original_a4nks.json
+rtk proxy env PYTHONPATH=gguf-py:. OPENBLAS_NUM_THREADS=2 python3.11 -m experiments.potal_a4.run models/gpt2-base/gpt2.Q4_HP1.gguf experiments/potal_a4/results-nano/test.i32 512 10 original_a4nks experiments/potal_a4/results-nano/test512-original_a4nks.json
 rtk proxy env PYTHONPATH=gguf-py:. OPENBLAS_NUM_THREADS=2 python3.11 -m experiments.potal_a4.profile_attention experiments/potal_a4/results-nano/test512-original_a4nks.json experiments/potal_a4/results-nano-profile/context512.json
 ```
 
 과거 JSON의 Mac 절대 경로는 측정 당시 출처다. 이를 덮어쓰지 말고 nano baseline을 새로 생성한다. Profiling은 baseline JSON 옆 `test.i32`, `.chunk0.npz`와 JSON의 model 경로를 읽는다. 역사적 `.npz`는 Git에 없으며 새 baseline으로 재생성할 수 있다. OS/BLAS가 다른 실행을 기존 Mac hidden과 bitwise 동일하다고 가정하지 않는다. 같은 nano 경로 안에서 baseline/변경 후 동등성을 검증한다.
 
-**메모리 측정 전 처리할 이식 항목:** `run.py`와 `native_probe.cpp`는 `ru_maxrss`를 macOS의 bytes로 기록한다. Nano에서 OS 단위를 확인하고 bytes로 정규화한 뒤 새 측정한다(Linux는 KiB). 과거 JSON의 의미를 바꾸지 말고 이 수정과 새 결과를 별도로 기록한다. `report.py`는 bytes를 전제로 한다. Native probe 빌드는 새 DIM32 generated header와 nano에서 빌드한 llama 라이브러리 경로도 필요하다.
+**메모리 단위 이식 완료:** nano에서 `run.py`와 `native_probe.cpp`의 Linux `ru_maxrss` KiB를 bytes로 정규화했다. Darwin의 bytes와 과거 JSON은 유지했다. 현재 결과는 [진행 기록](experiments/potal_a4/NANO_PROGRESS.md)을 참조한다. Native probe의 DIM32만으로 ACC_ROWS512 geometry 정합성을 주장하지 않는다.
 
 ## Gemmini / IM2P에서 할 일
 
@@ -119,8 +138,8 @@ rtk proxy env PYTHONPATH=gguf-py:. OPENBLAS_NUM_THREADS=2 python3.11 -m experime
 
 Geometry 주의: 실험의 논리 stripe는 `(banks,bank_rows,acc_rows)=(4,4096,512)`다. Mac probe의 generated header는 ACC_ROWS=1024였고 probe는 stripe=32로 고정했다. 이 결과로 hardware schedule parity를 주장하지 않았다. Nano의 실제 계약을 기록하고, 논리 quantization stripe와 물리 tile 차이가 정확도를 바꾸지 않도록 먼저 대조한다.
 
-`GGML_GEMMINI_ENABLE_A4NKS_ATTENTION`, `test-gemmini-potal-a4`, `test-gemmini-attention`은 새로 구현할 항목이다. 현재 CMake가 모르는 옵션을 전달하거나 기존 일반 inference가 동작했다는 이유만으로 a4nks 성공이라고 기록하지 않는다. KV/strided view/GQA와 single-token decode도 아직 검증하지 않았다.
+`GGML_GEMMINI_ENABLE_A4NKS_ATTENTION`은 아직 구현되지 않은 opt-in 계획이다. 과거 계획의 `test-gemmini-potal-a4`, `test-gemmini-attention` 이름 때문에 새 실행 파일을 만들지 말고, 재사용 대응표의 기존 테스트에 필요한 case를 반영한다. 현재 CMake가 모르는 옵션을 전달하거나 기존 일반 inference가 동작했다는 이유만으로 a4nks 성공이라고 기록하지 않는다. KV/strided view/GQA와 single-token decode도 아직 검증하지 않았다.
 
 ## 새 대화에 붙여넣을 요청
 
-> `work/potal-attn-im2p-nano`에서 이어서 작업하자. 먼저 `POTAL_NANO_HANDOFF.md`와 연결된 ORIGINAL_SPEC.md, IMPLEMENTATION_PLAN.md, RESULTS.md, ATTENTION_PROFILE.md를 읽어. Gemmini / IM2P를 nano에서 실제로 실행하고 limb·이상치 선택·packet 생성·compensation의 시간과 공간을 측정하려는 작업이다. 최신 조건은 원문 selective-linear+a4nks 대비 정확도 저하 금지다. Direct-all 선형, limb 제한, P 8행 실험은 채택하지 않았다. 현재 제품 attention 경로가 미완성임을 전제로 로컬 환경과 matched A4/W4/DIM32 artifact부터 확인하고, 계획의 원문 값 보존 direct emitter와 실제 QK/PV 통합을 이어가. 기존 실험 숫자는 Gemmini 지연시간으로 해석하지 말고, 같은 nano 경로에서 정확도 동등성과 실행 경로를 검증해.
+> `work/potal-attn-im2p-nano`에서 이어서 작업하자. 먼저 `POTAL_NANO_HANDOFF.md`와 연결된 ORIGINAL_SPEC.md, IMPLEMENTATION_PLAN.md, RESULTS.md, ATTENTION_PROFILE.md를 읽어. Gemmini / IM2P를 nano에서 실제로 실행하고 limb·이상치 선택·packet 생성·compensation의 시간과 공간을 측정하려는 작업이다. 최신 조건은 원문 selective-linear+a4nks 대비 정확도 저하 금지다. Direct-all 선형, limb 제한, P 8행 실험은 채택하지 않았다. 현재 제품 attention 경로가 미완성임을 전제로 로컬 환경과 matched A4/W4/DIM32 artifact부터 확인하고, 계획의 원문 값 보존 direct emitter와 실제 QK/PV 통합을 이어가. 수정 전에 재사용 대응표와 실제 호출자를 확인해서 기존 구현을 우선 수정하고 중복 구현을 추가하지 마. 원본 0 제외는 채택했고 전후 PPL은 10 chunks로 측정해. 기존 실험 숫자는 Gemmini 지연시간으로 해석하지 말고, 같은 nano 경로에서 정확도 동등성과 실행 경로를 검증해.

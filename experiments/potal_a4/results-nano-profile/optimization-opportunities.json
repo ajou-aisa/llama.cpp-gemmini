@@ -1,0 +1,105 @@
+{
+  "scope": "One saved GPT-2 context512 chunk, 144 heads; analytical counts, no native timing or PPL change",
+  "capture_sha256": "65e18c9c5170f59e1b9c453507a8ed79042b2cf4ce9015021b2db6500005b4ef",
+  "integer_upper_sum_parity": {
+    "heads": 9,
+    "stripe_sums": 108,
+    "scope": "Q and P upper sums before float publication; same digits/scales; main and zero point unchanged"
+  },
+  "totals": {
+    "q": {
+      "main_fragments": 73728,
+      "original_upper_fragments": 147456,
+      "nonzero_upper_digit_times_output_width": 2563935744,
+      "values": 4718592,
+      "nonzero_codes": 4685200,
+      "block_local_upper_fragments": 147168
+    },
+    "p": {
+      "main_fragments": 73728,
+      "original_upper_fragments": 44724,
+      "nonzero_upper_digit_times_output_width": 24798592,
+      "values": 37748736,
+      "nonzero_codes": 3473430,
+      "block_local_upper_fragments": 13782
+    }
+  },
+  "nonzero_digit_histograms": {
+    "q": {
+      "1": {
+        "-8": 189953,
+        "-7": 196628,
+        "-6": 212890,
+        "-5": 239954,
+        "-4": 277609,
+        "-3": 321112,
+        "-2": 365318,
+        "-1": 418178,
+        "1": 421239,
+        "2": 367912,
+        "3": 321973,
+        "4": 278892,
+        "5": 242556,
+        "6": 213683,
+        "7": 195574
+      },
+      "2": {
+        "-2": 7469,
+        "-1": 314685,
+        "1": 413050,
+        "2": 8494,
+        "-3": 375,
+        "3": 88,
+        "4": 53,
+        "5": 2
+      }
+    },
+    "p": {
+      "1": {
+        "-8": 5393,
+        "1": 187741,
+        "2": 62915,
+        "3": 33100,
+        "4": 21309,
+        "6": 11322,
+        "7": 8690,
+        "-3": 2163,
+        "5": 15181,
+        "-6": 3069,
+        "-4": 2207,
+        "-7": 3808,
+        "-5": 2504,
+        "-2": 2096,
+        "-1": 2370
+      },
+      "2": {
+        "1": 23610
+      }
+    }
+  },
+  "source_sha256": {
+    "experiments/potal_a4/profile_attention.py": "87ff6522988c16e162cd6b1ccb8c9923eede29514e36cc1122d948a0fcae852c",
+    "experiments/potal_a4/profile_ops.py": "94f9996238ef1c0ff11665f228487311066d7a6f252208de45d684e36ca78a05",
+    "experiments/potal_a4/profile_gemm.py": "b4d92e75359f00aef692939737204b97267cfcde33a9daaf31ffbec562d48102",
+    "experiments/potal_a4/packet.py": "a82bac62f891ac782634e26804ea404141a8f0c99b45e8c5c2fe55a7c17eabbb"
+  },
+  "causal_square_dim32_tile_bound": {
+    "full": 256,
+    "including_diagonal": 136,
+    "skipped": 120
+  },
+  "derived": {
+    "p_upper_reduction_pct": 69.18433056077274,
+    "p_total_reduction_pct": 26.121973457603076,
+    "p_old_matmul_x": 1.6066080729166665,
+    "p_candidate_matmul_x": 1.1869303385416667,
+    "q_candidate_matmul_x": 5.9921875,
+    "q_lane2_unit_fraction": 0.9778545476044589,
+    "p_nonzero_code_fraction": 0.09201447168986003
+  },
+  "candidate_formula": "sum_stripes sum_original_blocks ceil(active_lane_row_pairs_in_block/32) * ceil(N/32) * ceil(union_columns_in_block/32)",
+  "reuse": "RmdBitmapBuilder per-block groups/row_ids and rmd-executor compact-dot path already exist; preserve them in A4 attention integration. This is not a measured reduction from the current native product.",
+  "algorithm_change": false,
+  "schedule_change": "Compared with reference global stripe row union; nominal reference counts must remain separate from candidate physical counts.",
+  "analysis_script_sha256": "b74045dc799551afdfa7d81eff12b338d963b3851aa73f10cc29be51b695f2c5"
+}

@@ -1,0 +1,20 @@
+{
+  "repository": "am00r/Llama-3.2-1B-GGUF",
+  "revision": "8e3690a604735388daca0ca1d51f6c92e932e698",
+  "url": "https://huggingface.co/am00r/Llama-3.2-1B-GGUF/resolve/8e3690a604735388daca0ca1d51f6c92e932e698/llama3.2-1b-f16.gguf",
+  "path": "models/llama3.2-1B/llama3.2-1b-f16.gguf",
+  "sha256": "92cce0cbec5e029be0742a1dfff93254da3393ff4e47f5c07c6539de2dc445d8",
+  "bytes": 2479591584,
+  "hub_entry": {
+    "type": "file",
+    "oid": "d63f565f3e3068127d64b4b5491d3a2bc3ca984e",
+    "size": 2479591584,
+    "lfs": {
+      "oid": "92cce0cbec5e029be0742a1dfff93254da3393ff4e47f5c07c6539de2dc445d8",
+      "size": 2479591584,
+      "pointerSize": 135
+    },
+    "xetHash": "4fc9b63a617aa74c0386122e47719807b6e7435199d10f4feac25240d231a1c2",
+    "path": "llama3.2-1b-f16.gguf"
+  }
+}

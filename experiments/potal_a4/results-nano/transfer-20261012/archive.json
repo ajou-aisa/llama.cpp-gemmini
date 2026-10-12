@@ -1,0 +1,15 @@
+{
+  "archive_path": "/home/dyndnn/Projects/llama.cpp-gemmini/output/potal-nano-transfer-20261012.tar.gz",
+  "bytes": 278803401,
+  "sha256": "458d8ec4eec37419d9615f3be02de8657fe30fa6555f7e5e3e2c305c608e3cc4",
+  "members": 409,
+  "payload_bytes": 3028324006,
+  "all_member_sizes_and_sha256_verified": true,
+  "inventory": "inventory.json",
+  "layout": {
+    "workspace/": "Paths relative to the repository; restore here alongside the source commit.",
+    "supplemental/": "Historical logs, configurations, and analysis scripts. No compiled binaries."
+  },
+  "excluded": "Model weights, caches, compiled outputs, credentials and raw Codex sessions are not included.",
+  "scope": "Preservation only; no measurements were rerun."
+}

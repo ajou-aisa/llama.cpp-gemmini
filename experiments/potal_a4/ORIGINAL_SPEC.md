@@ -2,6 +2,18 @@
 
 Source: the user's initial implementation specification and accompanying NumPy `potal.py` pasted in this conversation. This transcription preserves the A-D arithmetic contract so continuation does not require the chat transcript. The [implementation plan](IMPLEMENTATION_PLAN.md) specifies finite-input boundaries, exact accumulation and the accepted representation optimization. The supplied `sf_tradeoff.py` / `attn_quant.py` dependencies were not available; parity with those external modules has not been established.
 
+The user supplied the same A-D specification and Python again during the nano
+review and explicitly **adopted source-zero exclusion**. This is no longer an
+undecided policy experiment. Current implementation evidence is in
+[NANO_PROGRESS.md](NANO_PROGRESS.md); a requirement below is not a completion claim.
+The original pasted text/code remains in [the transcript](session/CONVERSATION.md).
+
+The arithmetic below comes from the supplied specification. Direct digit emission,
+packet versioning, raw-dot/host-wide execution and GGML graph roles are implementation
+choices from the continuation plan. Finite-input validation, real tails and explicit
+GGML float publication are boundary/integration requirements; they must not be
+mistaken for additional quantization policies in the pasted algorithm.
+
 ## Constants and primitives
 
 `n=4`, signed PE codes `[-8,7]`, `BK=DIM=32`, `tau=2`, exact-zero exponent `NEG`, distinct stripe anchor rank `E2`. Linear uses `rho=2`; Q uses `rho=6` on the same 4-bit PEs.
@@ -42,6 +54,20 @@ q[k]  = qround(X[k], E-rho)
 out[k]= top[k] or sig[k]
 ```
 
+`sig` is the one-sided strict threshold `abs(q) > mean(abs(q)) + 2*std(abs(q))`
+over U, using population variance. It is not a fixed percentile or selection
+quota. Source zero is excluded; a nonzero source rounded to q=0 remains in U.
+`top`, `sig`, and the later `corr` have different meanings: a zero can satisfy
+`D>0` and thus be a correction candidate without being a statistical outlier or
+having any upper digit. Report their counts separately rather than interpreting
+the product's shared `outlier_mask` as a sigma-only mask.
+
+For finite inputs, rho=2/6 and BK<=32, every preliminary code in U satisfies
+`abs(q)<=2^(rho+1)` (at most 128). The sigma sums and squared comparisons therefore
+fit int64 under this contract; the native detector already uses `__int128`.
+No sigma-overflow defect has been demonstrated for these valid inputs. This is
+distinct from the actual int64 GEMM overflow boundary discussed below.
+
 For each stripe, select `e_s` as the second-largest distinct non-NEG block exponent E, or the last available if fewer exist. For each element of each block:
 
 ```text
@@ -73,6 +99,12 @@ Y = acc
 ```
 
 Weights are not re-quantized to make a comparison pass. The plan uses raw integer dots plus exact host scaling/merging because existing hardware SCU-final saturation does not implement the requested wide sum.
+
+The GGUF adapter must preserve every stored scale factor. For Q4_HP1 the decoded
+weight is `code * channel_scale * 2^m`; on a positive power-of-two channel scale,
+the spec exponent is `thetaW=m+ilogb(channel_scale)`, not m alone. Preserve the
+zero-block sentinel and the output-column association. Validate this mapping
+against the native decoder; never silently discard or round a stored scale.
 
 ## C. Attention per head (a4nks)
 
@@ -108,4 +140,6 @@ Sum stripe contributions. QK's second K pass is charged to additional/residual w
 - `INT32_MAX-lowdigit(INT32_MAX)=2^31` cannot be a signed int32 residual. Balanced representation needs digit positions 0..8; do not force the upper sum through a legacy scalar emitter.
 - The pasted int64 GEMM is not a general exact accumulator: exponent spread and cancellation can overflow it. The accepted plan uses checked int64 or exact host accumulation, then the specified F64->F32 conversion.
 - The pasted `verify()` supplies captured original P to `attention_head`, so that particular test does not validate recomputed QK->softmax->PV accuracy. Current CPU model experiments do recompute P, but use reconstructed FP32 matmul. Integer profiling is separate component replay.
+- The pasted `verify()` checks operand reconstructions and cost counters exactly, but its `close()` checks GEMM relative error `<1e-12`; the docstring is not a bitwise-GEMM certificate. It uses random stationary weights for linear verification, so actual checkpoint weights require a separate adapter test.
+- The pseudocode computes weighted `colsumV` once per head. The Python `gemm()` recomputes block sums inside each stripe; it proves the algebra on bounded fixtures, not that reuse or the stated add cost is implemented. Cost accounting also packs all lane-row pairs together while the Python GEMM loops execute lanes separately.
 - No native attention implementation, simulator parity, or external `sf_tradeoff`/`attn_quant` parity follows merely from the supplied file's docstring. See the handoff for observed checks and remaining work.

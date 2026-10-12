@@ -1,0 +1,154 @@
+{
+  "artifact_root": ".",
+  "artifacts": [
+    {
+      "path": "libim2p_gemmini_frontend.a",
+      "sha256": "82e6a2679ed3e89fc261e487402c2a567fe98458b9ab139c3a824717fde0d367",
+      "size": 197024
+    },
+    {
+      "path": "libim2p_sim.a",
+      "sha256": "4c8c69b9126adc7d62de5ab1cf364e16ec251f6dbc0ecf2744b0c27556f3a58d",
+      "size": 28208078
+    }
+  ],
+  "build_config": {
+    "builder": "",
+    "builder_sha256": "",
+    "cargo_encoded_rustflags": "",
+    "cargo_home": "/home/dyndnn/.cargo",
+    "chisel_firtool_path": "/home/dyndnn/util/circt-firtool-1.62.0/build/bin",
+    "deployment_target": "",
+    "env.ARFLAGS": "",
+    "env.CC": "",
+    "env.CFLAGS": "",
+    "env.CPPFLAGS": "",
+    "env.CXX": "",
+    "env.CXXFLAGS": "",
+    "env.LDFLAGS": "",
+    "env.RUSTC_WRAPPER": "",
+    "env.RUSTDOCFLAGS": "",
+    "gemmini_work_root": "/home/dyndnn/aisa-lab/build/im2p-gemmini",
+    "hardware_lowering_contract": "{\"facts\":{\"accumulator_bits\":32,\"activation_bits\":4,\"array_partial_bits\":13,\"block_size\":32,\"dim\":32,\"external_stride_units\":{\"activation\":\"bytes-unpacked-int8\",\"output\":\"bytes-signed32\",\"scale\":\"uint32-carrier-elements\",\"weight\":\"bytes-unpacked-int8\"},\"fixed_latencies\":{\"accumulator_latency\":2,\"scratchpad_read_delay\":4},\"fragment_limit\":32,\"lowering_revision\":\"explicit-production-geometry-v1-planner-blocks-v1\",\"memory\":{\"accumulator_row_bytes\":128,\"accumulator_rows\":512,\"accumulator_total_bytes\":65536,\"bank_count\":4,\"bank_rows\":4096,\"capacity_policy\":\"fixed-256kib-packed-sp-64kib-int32-acc-v1\",\"provenance_kind\":\"derived-packed-width\",\"provenance_reference\":\"alternate_d32_reference\",\"scratchpad_row_bytes\":16,\"scratchpad_total_bytes\":262144,\"tile_policy\":\"existing-gemmini-h-runtime\",\"ws_accumulator_rows_per_buffer\":256,\"ws_double_buffered\":true,\"ws_scratchpad_rows_per_buffer\":8192},\"numerical_revision\":\"hp1-fragment-sat32-v1\",\"packing\":\"signed-int4-low-nibble-first\",\"saturation_order\":\"fragment-local-Sat32-then-signed32-saturating-accumulator\",\"scale_entries\":256,\"scale_mapping_revision\":\"loop-local-physical-row-generation-release-v1\",\"scu\":\"hp1-left-shift\",\"tile_units\":\"DIM-counts\",\"weight_bits\":4},\"profile\":\"a4w4-d32-hp1\",\"schema\":\"im2p-hardware-lowering-contract\",\"sha256\":\"8cd40da4a431975aad250314e4d32cae3c07329cb24a35eed08e42e32b168825\",\"source_sha256\":{\"config/gemmini_host_memory_contracts/a4w4-d32-hp1.json\":\"bafacd54efc88575238f4d633112bdda1609394efaaba1fc0d8b12b61dd52cbb\",\"config/gemmini_hp1_profiles.json\":\"6bdd02b14b29fbab044bcebe6695a0f1a3836f9092a681c5fc25ef6b6564e433\",\"sim/backends/gemmini_hp1/geometry.cpp\":\"1303b754c43cc33a4a729fd028aa580bd19e4890751a3ca543d34a0aab820719\",\"sim/backends/gemmini_hp1/runtime.cpp\":\"bc0df3e74984a179d2b01b54725722fa1c6795ff9034b4bba365131fd0f88fbf\",\"sim/common/gemmini_schedule.cpp\":\"8caf828be22a0576001a890f641026ba4719d4e83d9eab17c95764204d86558c\",\"sim/common/gemmini_schedule.hpp\":\"8d22c30cc51ca182116191956074a3dcd0623908c070d030d38df42c70eb272f\",\"sim/include/im2p_geometry.h\":\"a66da7dc98242f0b00b2bfc09650fa70575c1c05b82c4cb331e416025b7146cb\",\"sim/include/im2p_sim.h\":\"a124181eb783c2c0618621b96dfa8fef49e350e09ada7bd97d7b70dce68cccea\",\"src/gemmini/control/src/main/scala/im2p/gemmini/ElaborateUpstreamWsControl.scala\":\"9ddcb0fa4a0c49e4fe12d2c82d2597d98b0e4bc63ddffd79f4a70e5d6af32fb2\",\"src/gemmini/control/src/main/scala/im2p/gemmini/ElaborateUpstreamWsHp1.scala\":\"0b637f25a9a0f4d3f5e3ac49cb4231e906f9ceed54ad9a2b54c986ee2720200d\",\"src/gemmini/control/src/main/scala/im2p/gemmini/HardwareContract.scala\":\"844e4ebb77ffdc285066b20e200d725820df81eba0a5e992a1b0944d2d4acea6\",\"src/gemmini/control/src/main/scala/im2p/gemmini/HostCommandBridge.scala\":\"153ded6d2126b12a5a3d05c30c891b3a285854067782fe23aaf1ed4343637da0\",\"src/gemmini/control/src/main/scala/im2p/gemmini/Hp1LoopMetadata.scala\":\"a453d7b719c1b2898822c81f41b2ead0651eba481a0731e341cb9d0a7cf6565b\",\"src/gemmini/control/src/main/scala/im2p/gemmini/ScaleBackingLoader.scala\":\"22694ee4dcaddd1a5454e6436c27d6bd45920f82aad760900f45aafe05fc01b3\",\"src/gemmini/control/src/main/scala/im2p/gemmini/UpstreamHp1Writeback.scala\":\"4132ce34e8ae5d9701d89f3e5dd6c399eface00e02904f974b9ca8fe1b5d07de\",\"src/gemmini/control/src/main/scala/im2p/gemmini/UpstreamWsConfig.scala\":\"6e30180ff97d5d49f27559debfd5cec8ad2ebdfad72214cb1f601529b293d24c\",\"src/gemmini/control/src/main/scala/im2p/gemmini/UpstreamWsControl.scala\":\"25f8ed2ca46028e56b5e32bfafc338198d82894428ec003e7b766dde952a7df7\",\"src/gemmini/control/src/main/scala/im2p/gemmini/UpstreamWsControlHarness.scala\":\"8434549db93394f0a10f319bd35f85f976bcccf07dfa7b03ae50d1b52cc3f050\",\"src/gemmini/control/src/main/scala/im2p/gemmini/UpstreamWsHp1Top.scala\":\"1d7ef6cae9d70bccc39ba046cda9bd43928f53bc358c4a0ea968f60d34d68b34\",\"src/gemmini/control/src/main/scala/im2p/gemmini/UpstreamWsMemory.scala\":\"0c6247a0e9354de61676b2fb6e0cdc0ecea461e0e140507d00633e1d562d67ae\",\"src/gemmini/patches/0001-packed-input-controller-bytes.patch\":\"e8efa47038164679bd1d71b659e597827cf25468201ceed51f5a9d34428b1ceb\",\"src/gemmini/patches/0002-loop-head-reset.patch\":\"a55b9ca7f93628f517e63087c647f7778db4c127fa3161b4b6b97c569e8ce8d3\",\"src/gemmini/src/main/scala/im2p/gemmini/BackingMemoryPort.scala\":\"8e9286f5db11a2b44cf265aabea0d537645ce365091b8e2039ec9da3cf4c8cea\",\"src/gemmini/src/main/scala/im2p/gemmini/Int4Packer.scala\":\"12064790a0d75963aeded0e79a24bf87a425acfc9df6617413bd2dac5da0f2c7\",\"src/gemmini/src/main/scala/im2p/gemmini/Int4Unpacker.scala\":\"ba6ddad8d18e5d9228284810b49310e1215feb38659e54b204d2defc89f41f28\",\"src/gemmini/src/main/scala/im2p/gemmini/MatmulCycleCounter.scala\":\"ff847661ea37b68168e6290b0d92b6eaacfdbba17e9d9f44fa26efbdf498e4b8\",\"src/gemmini/src/main/scala/im2p/gemmini/ResolvedProfile.scala\":\"7350d142a41af4c257a01b63d229d7e067ea0f639568eb8c01355417f3e4ffdc\",\"src/gemmini/src/main/scala/im2p/gemmini/SCU.scala\":\"3050e2731523951fbbea8776b9b4a6ef758c62027967588fd395e1346516f0ea\",\"src/gemmini/src/main/scala/im2p/gemmini/SatAccumulatorAdder.scala\":\"c76024799154268cef3e1d9c90a468a945e5d24346764b2bf333508ea9b4f8e5\",\"src/gemmini/src/main/scala/im2p/gemmini/ScaleMemory.scala\":\"236a664fb3f7fb959b50c4f1b8eaae4b7c9219c5803c323069fb2fd6b3bb45ab\",\"src/gemmini/src/main/scala/im2p/gemmini/ScaleProtocol.scala\":\"95104e809bde82d639418c9bf60f2f2cbe84705debce6bec1ef0820be98b0599\",\"src/gemmini/src/main/scala/im2p/gemmini/ScuCompletionTracker.scala\":\"7434878cdefa5dc9d4a968e2d5d7552434fbb981b316973a50c4f0d8f7ce6b45\",\"src/gemmini/src/main/scala/im2p/gemmini/ScuFragmentPlanner.scala\":\"822b6a59336696f28dc7237d982279ecb9dc4c41fe08fcd824b9c2188d9d556c\",\"src/gemmini/src/main/scala/im2p/gemmini/ScuWritebackQueue.scala\":\"3a952e9a0c1881a9f6083eb9eaa72b02d3a52b9bb9c73da502d0a8342d305c33\",\"src/gemmini/upstream/src/main/scala/gemmini/AccumulatorMem.scala\":\"09e710bdd7ec5c3a5e738d72433529583da29b5d50629447f2887535a06abd9b\",\"src/gemmini/upstream/src/main/scala/gemmini/Activation.scala\":\"9aec0433b8be1861a0e474f7fc13f9276c5344e60951da3b18eb8fbc41cc7c2b\",\"src/gemmini/upstream/src/main/scala/gemmini/Arithmetic.scala\":\"fbad802b6eea2276b7da4b4e891045c1f1243d5ef3ec22e67e31ffa1359b915b\",\"src/gemmini/upstream/src/main/scala/gemmini/Dataflow.scala\":\"e87024cf9357868ddeb013d0599e5f48fc709c224dbad3d1a64b56bbe2e7815f\",\"src/gemmini/upstream/src/main/scala/gemmini/GemminiConfigs.scala\":\"b4cebe69d5c54bb59f7ed1e67427f8686a4691f27e912bcbacc75ef8690d29bd\",\"src/gemmini/upstream/src/main/scala/gemmini/LoadController.scala\":\"82db47c2079b9ec4a02f550890411e96dec466858232db54992f870c6f5dd32d\",\"src/gemmini/upstream/src/main/scala/gemmini/LoopMatmul.scala\":\"23b37660adbe9d2ec590157e228048251777d3771480441f7eca4ecea3561716\",\"src/gemmini/upstream/src/main/scala/gemmini/Mesh.scala\":\"82e0ab80b78a71436437fb92aef3f6bfb82b89c3665c4ec5f8ea8b884cb799a1\",\"src/gemmini/upstream/src/main/scala/gemmini/MeshWithDelays.scala\":\"3a0bccc14cfd73f6de315e31d6c0f2595009edb98a84aadc48715e50150607b5\",\"src/gemmini/upstream/src/main/scala/gemmini/PE.scala\":\"3f9a86873d58614261edd7ec3b7125e40fda31d961823d9ad500a7d130d5614d\",\"src/gemmini/upstream/src/main/scala/gemmini/Scratchpad.scala\":\"e8c0f4ca334ce71d3fa321fa2b6c7e79aae01aa9454b9852132e696fbae8ae91\",\"src/gemmini/upstream/src/main/scala/gemmini/SharedExtMem.scala\":\"7ee395b0e906d2de6decc6ed9bbc0dfcd60a1791da8f6c1829c6482cd6d81619\",\"src/gemmini/upstream/src/main/scala/gemmini/Shifter.scala\":\"aaa70ce1c9c6872f717aa800b9d1dda5fc2b6f5b396ff9c960718ffda87b26ad\",\"src/gemmini/upstream/src/main/scala/gemmini/StoreController.scala\":\"e76e8799f7fe67a245894a32fa976fd371d6d508a9be3ab55838998e42c2ba6f\",\"src/gemmini/upstream/src/main/scala/gemmini/SyncMem.scala\":\"c118cdae6ceb96896c43c41281f85d7d3adfff9b0fc74e0413d9ed272c10af97\",\"src/gemmini/upstream/src/main/scala/gemmini/TagQueue.scala\":\"513c0b8aa5b813207919eee9916b3c27f4a5805f3c5a07f2acab04042671c0ae\",\"src/gemmini/upstream/src/main/scala/gemmini/Tile.scala\":\"28d3a0165876cf29e10799244c420cff835447e9ec2777006d0d693b581b7946\",\"src/gemmini/upstream/src/main/scala/gemmini/Transposer.scala\":\"69a1349d98d188e9fffe8acb4e108e6fbb56c8ef314956faa4bf22a23828e5e3\",\"src/gemmini/upstream/src/main/scala/gemmini/Util.scala\":\"e57a938f1d6a417d558ac7018ec34ce48e0cf0678c6dfd4ddca6c51fefbce20b\",\"src/gemmini/vendor-manifest.json\":\"0b54ca3e9e93df4e85e6452b04dca5506dffc4e8ff592b5ab9b8cf4e595256bc\"},\"version\":1}",
+    "implementation": "GEMMINI_HP1",
+    "java_home": "",
+    "runtime_execution_kind": "FRESH_BUILD",
+    "rustflags": "",
+    "sdkroot": ""
+  },
+  "cache_manifest": "/tmp/potal-nano-hp1-matched/cache/real-lib/GEMMINI_HP1/entries/b0cbb667402f362d78b6bec27398cf21d864b38aa406fd2a2e7c0dd3428bb529/real-lib.json",
+  "fingerprint": "b0cbb667402f362d78b6bec27398cf21d864b38aa406fd2a2e7c0dd3428bb529",
+  "identity": {
+    "accumulator_bits": 32,
+    "accumulator_rows": 512,
+    "activation_bits": 4,
+    "arch": "aarch64",
+    "block_size": 32,
+    "config_source_sha256": "091175baa1660ccb15702aca4a28d1a586aab52f460b78fa8495432b0ffb0fd9",
+    "dim": 32,
+    "generated_config_sha256": "441c10ee1e9d9a4b27435dcccac9599eaa35e83d8e08bee0a06cd00ad3011c31",
+    "id": "a4-w4-d32",
+    "implementation": "GEMMINI_HP1",
+    "logical_capacity_bytes": 65536,
+    "memory_backend": "column-banked-sync-bram",
+    "memory_latency_contract": "serialized-rmw-v1",
+    "memory_read_latency": 1,
+    "numerical_semantics_revision": "signed-scu-sat-v2",
+    "partial_bits": 32,
+    "platform": "Linux",
+    "platform_release": "6.8.12-1021-tegra",
+    "product_bits": 8,
+    "row_address_bits": 9,
+    "row_count_bits": 6,
+    "scale_carrier_bits": 32,
+    "scale_storage_bytes": 4,
+    "weight_bits": 4
+  },
+  "schema": "im2p-real-lib-cache-v5",
+  "toolchains": {
+    "ar": {
+      "command": "ar",
+      "executable": "/usr/bin/aarch64-linux-gnu-ar",
+      "executable_sha256": "f4583a612510e038dbc1ae8afb5eae5f0445c435bdd7c4c28e78acc7e757d2b1",
+      "inputs": [],
+      "version": "GNU ar (GNU Binutils for Ubuntu) 2.42\nCopyright (C) 2024 Free Software Foundation, Inc.\nThis program is free software; you may redistribute it under the terms of\nthe GNU General Public License version 3 or (at your option) any later version.\nThis program has absolutely no warranty."
+    },
+    "cargo": {
+      "command": "cargo",
+      "executable": "/home/dyndnn/.cargo/bin/rustup",
+      "executable_sha256": "9732d6c5e2a098d3521fca8145d826ae0aaa067ef2385ead08e6feac88fa5792",
+      "inputs": [],
+      "version": "warning: failed to connect to jobserver from environment variable `MAKEFLAGS=\"w -j2 --jobserver-auth=3,4 -- GEMMINI_FRONTEND_BLOCK_SIZE=32 GEMMINI_FRONTEND_DIM=32 GEMMINI_FRONTEND_WEIGHT_BITS=4 GEMMINI_FRONTEND_ACTIVATION_BITS=4 IM2P_DIM=32 IM2P_WEIGHT_BITS=4 IM2P_ACTIVATION_BITS=4 IM2P_SIM_IMPLEMENTATION=GEMMINI_HP1 IM2P_CACHE_JOBS=2 GEMMINI_PARAMS_ROOT=/home/dyndnn/Projects/RISC-V-DynDNN-gemmini-include/include GEMMINI_ROOT=/home/dyndnn/Projects/llama.cpp-gemmini BUILD_DIR=/tmp/potal-nano-hp1-matched\"`: cannot open file descriptor 3 from the jobserver environment variable value: Bad file descriptor (os error 9)\ncargo 1.98.0 (797e8a9bc 2026-08-05)"
+    },
+    "cxx": {
+      "command": "g++",
+      "executable": "/usr/bin/aarch64-linux-gnu-g++-13",
+      "executable_sha256": "fc02363794280f404c6ca6f5da1c8fe469be902e9de140d35d8573bb3393f53b",
+      "inputs": [],
+      "version": "g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\nCopyright (C) 2023 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+    },
+    "firtool": {
+      "command": "/home/dyndnn/util/circt-firtool-1.62.0/build/bin/firtool",
+      "executable": "/home/dyndnn/util/circt-firtool-1.62.0/build/bin/firtool",
+      "executable_sha256": "3d852cf533fe0651bc6d5b2ed66c1b0c1a6d63e5789425b937b1e6c498dd91e9",
+      "inputs": [],
+      "version": "LLVM (http://llvm.org/):\n  LLVM version 18.0.0git\n  Optimized build.\nCIRCT unknown git version"
+    },
+    "java": {
+      "command": "java",
+      "executable": "/usr/lib/jvm/java-17-openjdk-arm64/bin/java",
+      "executable_sha256": "dd71a8ee8ff317a7868580cdac2d0332a8c1424ee6be866a59c102bee3a0b7f4",
+      "inputs": [],
+      "version": "openjdk 17.0.20 2026-07-21\nOpenJDK Runtime Environment (build 17.0.20+8-1-24.04-Ubuntu)\nOpenJDK 64-Bit Server VM (build 17.0.20+8-1-24.04-Ubuntu, mixed mode, sharing)"
+    },
+    "make": {
+      "command": "make",
+      "executable": "/usr/bin/make",
+      "executable_sha256": "abbecc214fcadef6530d1cc137bde7ceb74cae3f6b992c7d10a8669a7314c7e0",
+      "inputs": [],
+      "version": "GNU Make 4.3\nBuilt for aarch64-unknown-linux-gnu\nCopyright (C) 1988-2020 Free Software Foundation, Inc.\nLicense GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>\nThis is free software: you are free to change and redistribute it.\nThere is NO WARRANTY, to the extent permitted by law."
+    },
+    "rustc": {
+      "command": "rustc",
+      "executable": "/home/dyndnn/.cargo/bin/rustup",
+      "executable_sha256": "9732d6c5e2a098d3521fca8145d826ae0aaa067ef2385ead08e6feac88fa5792",
+      "inputs": [],
+      "version": "rustc 1.98.0 (88d9e12ae 2026-08-18)"
+    },
+    "sbt": {
+      "command": "sbt",
+      "executable": "/usr/share/sbt/bin/sbt",
+      "executable_sha256": "357d1ebc5bba00464782ac53a57b5765dcd34509dd5073424fef6d50cbd96a2a",
+      "inputs": [],
+      "version": "sbt runner version: 2.0.8\n\n[info] sbt runner (sbt-the-shell-script) is a runner to run any declared version of sbt.\n[info] Actual version of the sbt is declared using project/build.properties for each build."
+    },
+    "verilator": {
+      "command": "/home/dyndnn/util/verilator-5.050/bin/verilator",
+      "executable": "/home/dyndnn/util/verilator-5.050/bin/verilator",
+      "executable_sha256": "fb2cc573b1055cf096c90e1efc9966fe56bdb4b265c83590cf2a49f7a0defcdf",
+      "inputs": [
+        {
+          "path": "verilated.cpp",
+          "sha256": "689d3f48fe0da03ec085c26b197e8a3f11cc88baa55c6d836845570511e7ab0f",
+          "size": 175665
+        },
+        {
+          "path": "verilated_threads.cpp",
+          "sha256": "fa179d4c223c110f6566837a55a522e7842b4ed68a33fd0bb910fc5be1df2ce3",
+          "size": 11082
+        },
+        {
+          "path": "verilated.h",
+          "sha256": "c0432fe7bbb2d4100583048a2ec52ec346441ca2cba5dde41f28d952d2b6d7c5",
+          "size": 50310
+        },
+        {
+          "path": "verilated_threads.h",
+          "sha256": "3246dad434cb75c92ac5b311cdb52b7d3314fa3f0ab6f1b3be7df0202ede6049",
+          "size": 9029
+        }
+      ],
+      "version": "Verilator 5.050 2026-07-01 rev v5.050"
+    }
+  }
+}

@@ -1,0 +1,61 @@
+{
+  "status": "PASS",
+  "classification": "cycle model result",
+  "profile": "a4w4-d32-hp1",
+  "timing_profile": "rtl-regression",
+  "value_free": true,
+  "resolved_hardware": {
+    "activation_bits": 4,
+    "weight_bits": 4,
+    "dim": 32,
+    "block_k": 32,
+    "accumulator_bits": 32,
+    "bank_count": 4,
+    "bank_rows": 4096,
+    "accumulator_rows": 512,
+    "scratchpad_row_bytes": 16,
+    "accumulator_row_bytes": 128,
+    "scratchpad_read_delay": 4,
+    "accumulator_latency": 2
+  },
+  "timing": {
+    "revision": 1,
+    "backing_read_delay": 3,
+    "even_read_id_delay": 13,
+    "scale_read_extra_delay": 17,
+    "backing_write_delay": 11,
+    "read_ready_period": 5,
+    "backing_cycle_offset": 5
+  },
+  "result": {
+    "start_cycle": 0,
+    "done_cycle": 331,
+    "total_cycles": 331,
+    "logical_work_count": 1,
+    "loop_count": 1,
+    "planner_loop_count": 1,
+    "fragment_count": 1,
+    "load_request_count": 34,
+    "load_response_count": 34,
+    "store_request_count": 2,
+    "store_response_count": 2,
+    "scale_request_count": 1,
+    "scale_response_count": 1,
+    "event_count": 0
+  },
+  "events": [],
+  "scope": "scaled HP1 cycle-model diagnostic; not a raw-op0 parity certificate or model latency",
+  "input": {
+    "profile": "a4w4-d32-hp1",
+    "request": {
+      "m": 2,
+      "n": 3,
+      "k": 32,
+      "tile_i": 1,
+      "tile_j": 1,
+      "tile_k": 1,
+      "submission": "planner-blocks"
+    }
+  },
+  "library_sha256": "b26347ebed6006de4f4948c32a777fc2277692419e97bdb8c0696fa50194550a"
+}

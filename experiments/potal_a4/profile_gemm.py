@@ -54,7 +54,7 @@ def checked_bound(stripes: tuple[Stripe, ...], stationary: Stationary, zero_poin
 
 
 def gemm(stripes: tuple[Stripe, ...], stationary: Stationary, role: str,
-         times: dict[str, int], zero_point: int = 0) -> np.ndarray:
+         times: dict[str, int], zero_point: int = 0, dot=None) -> np.ndarray:
     minimum = int(stationary.theta.min())
     width = stationary.values.shape[1]
     output = np.empty((sum(len(st.main) for st in stripes), width), dtype=np.float64)
@@ -75,7 +75,7 @@ def gemm(stripes: tuple[Stripe, ...], stationary: Stationary, role: str,
             for b in range(len(stationary.theta)):
                 start = perf_counter_ns()
                 block = slice(b * BK, (b + 1) * BK)
-                part = stripe.main[:, block] @ codes[block]
+                part = stripe.main[:, block] @ codes[block] if dot is None else dot(stripe.main[:, block], codes[block], 0)
                 start = mark(times, prefix + "_main_dot", start)
                 shifts = stationary.theta[b] + extra - minimum
                 acc += part << shifts
@@ -84,7 +84,7 @@ def gemm(stripes: tuple[Stripe, ...], stationary: Stationary, role: str,
                     cols = stripe.columns[b]
                     if len(cols):
                         start = perf_counter_ns()
-                        part = plane[:, cols] @ codes[cols]
+                        part = plane[:, cols] @ codes[cols] if dot is None else dot(plane[:, cols], codes[cols], lane)
                         start = mark(times, prefix + "_upper_dot", start)
                         acc[rows] += part << (shifts + 4 * lane)
                         mark(times, prefix + "_upper_merge", start)

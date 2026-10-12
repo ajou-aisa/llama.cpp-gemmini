@@ -1,0 +1,42 @@
+{
+  "scope": "Actual Llama layer0 head0 PV, DIM32 whole-future-tile omission; analytical exact float64 reconstruction check, not adopted backend change",
+  "capture_sha256": "3ebe0e4bd95d85853c4eb6e4a5f8e38817d96d599e483cd73f1d89e12ffce4cd",
+  "rows": 512,
+  "keys": 512,
+  "head_dim": 64,
+  "naive_skip_max_absolute_error": 2.91015625,
+  "matched_compensation_max_absolute_error": 0.0,
+  "matched_compensation_bitwise": true,
+  "skipped_p_entries": 122880,
+  "kept_key_range": "Up to end of query DIM32 tile, including masked entries inside diagonal tile",
+  "prefix_examples": [
+    {
+      "prefix": 0,
+      "queries": 512,
+      "score_entries": 262144,
+      "future_entries": 130816,
+      "future_percent": 49.90234375
+    },
+    {
+      "prefix": 4096,
+      "queries": 512,
+      "score_entries": 2359296,
+      "future_entries": 130816,
+      "future_percent": 5.544704861111112
+    },
+    {
+      "prefix": 1000,
+      "queries": 32,
+      "score_entries": 33024,
+      "future_entries": 496,
+      "future_percent": 1.501937984496124
+    },
+    {
+      "prefix": 1000,
+      "queries": 1,
+      "score_entries": 1001,
+      "future_entries": 0,
+      "future_percent": 0.0
+    }
+  ]
+}

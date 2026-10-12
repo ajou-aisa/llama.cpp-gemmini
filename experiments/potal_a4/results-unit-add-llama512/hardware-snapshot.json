@@ -1,0 +1,58 @@
+{
+  "observed_unix_time": 1791723183.459847,
+  "platform": "Linux-6.8.12-1021-tegra-aarch64-with-glibc2.39",
+  "scope": "Read-only hardware snapshot during accuracy replay; clocks are not fixed or normalized",
+  "device_model": "NVIDIA Jetson Orin Nano Engineering Reference Developer Kit Super",
+  "cpus": {
+    "cpu0": {
+      "scaling_driver": "tegra194",
+      "scaling_governor": "schedutil",
+      "scaling_cur_freq": "1344000",
+      "scaling_min_freq": "729600",
+      "scaling_max_freq": "1344000"
+    },
+    "cpu1": {
+      "scaling_driver": "tegra194",
+      "scaling_governor": "schedutil",
+      "scaling_cur_freq": "1344000",
+      "scaling_min_freq": "729600",
+      "scaling_max_freq": "1344000"
+    },
+    "cpu2": {
+      "scaling_driver": "tegra194",
+      "scaling_governor": "schedutil",
+      "scaling_cur_freq": "1344000",
+      "scaling_min_freq": "729600",
+      "scaling_max_freq": "1344000"
+    },
+    "cpu3": {
+      "scaling_driver": "tegra194",
+      "scaling_governor": "schedutil",
+      "scaling_cur_freq": "1344000",
+      "scaling_min_freq": "729600",
+      "scaling_max_freq": "1344000"
+    },
+    "cpu4": {
+      "scaling_driver": "tegra194",
+      "scaling_governor": "schedutil",
+      "scaling_cur_freq": "1344000",
+      "scaling_min_freq": "729600",
+      "scaling_max_freq": "1344000"
+    },
+    "cpu5": {
+      "scaling_driver": "tegra194",
+      "scaling_governor": "schedutil",
+      "scaling_cur_freq": "1344000",
+      "scaling_min_freq": "729600",
+      "scaling_max_freq": "1344000"
+    }
+  },
+  "thermal": {
+    "cpu-thermal": 51000,
+    "gpu-thermal": 50406,
+    "soc0-thermal": 50343,
+    "soc1-thermal": 51406,
+    "soc2-thermal": 49875,
+    "tj-thermal": 51406
+  }
+}

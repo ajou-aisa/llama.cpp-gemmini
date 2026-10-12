@@ -1,0 +1,3 @@
+context,role,values,lane1_nonzeros,lane2_nonzeros,lane1_rows,lane2_rows,main_fragments,upper_fragments,upper_packet_bytes
+512,q,4718592,4263471,744216,73728,73525,73728,147456,9437184
+512,p,37748736,363868,23610,71382,21993,73728,44724,22898688

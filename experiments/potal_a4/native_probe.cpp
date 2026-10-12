@@ -97,11 +97,18 @@ int main(int argc, char ** argv) {
         }
         rusage usage{};
         require(getrusage(RUSAGE_SELF, &usage) == 0, "getrusage");
+#if defined(__APPLE__)
+        const uint64_t peak_rss_bytes = static_cast<uint64_t>(usage.ru_maxrss);
+#elif defined(__linux__)
+        const uint64_t peak_rss_bytes = static_cast<uint64_t>(usage.ru_maxrss) * 1024;
+#else
+#error "Unsupported ru_maxrss units"
+#endif
         std::cout << "{\"mode\":\"" << mode << "\",\"fixture\":\"" << kind
                   << "\",\"rows\":" << rows << ",\"k\":" << k << ",\"dim\":" << DIM
                   << ",\"main_bytes\":" << rows * k << ",\"dense_residual_bytes\":" << dense.size() * sizeof(int32_t)
                   << ",\"packet_digit_bytes\":" << packet_bytes << ",\"packet_metadata_bytes\":" << metadata_bytes
-                  << ",\"digit_nnz\":" << nnz << ",\"peak_rss_bytes\":" << usage.ru_maxrss
+                  << ",\"digit_nnz\":" << nnz << ",\"peak_rss_bytes\":" << peak_rss_bytes
                   << ",\"seconds\":" << std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count()
                   << "}" << std::endl;
         return 0;

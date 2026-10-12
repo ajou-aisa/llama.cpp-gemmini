@@ -1,0 +1,9 @@
+{"mode": "original_a4nks", "context": 512, "chunk": 0, "ppl": 23.22630666573667, "seconds": 110.1489857728593}
+{"mode": "original_a4nks", "context": 512, "chunk": 1, "ppl": 46.21960499907242, "seconds": 211.50407704687677}
+{"mode": "original_a4nks", "context": 512, "chunk": 2, "ppl": 43.39853473383772, "seconds": 315.12386440695263}
+{"mode": "original_a4nks", "context": 512, "chunk": 3, "ppl": 31.398555469540533, "seconds": 418.771030214848}
+{"mode": "original_a4nks", "context": 512, "chunk": 4, "ppl": 26.607599730686644, "seconds": 519.9920504018664}
+{"mode": "original_a4nks", "context": 512, "chunk": 5, "ppl": 31.013046650583355, "seconds": 621.2947390798945}
+{"mode": "original_a4nks", "context": 512, "chunk": 6, "ppl": 45.85738514981678, "seconds": 722.612534704851}
+{"mode": "original_a4nks", "context": 512, "chunk": 7, "ppl": 44.332135757725354, "seconds": 823.5464726088103}
+{"complete": "experiments/potal_a4/results-nano-baseline/test512-original_a4nks.json", "ppl": 35.378030265292224}

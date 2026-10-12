@@ -47,13 +47,23 @@ def digest(path: Path) -> str:
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
+def peak_rss_bytes() -> int:
+    """Normalize getrusage's platform-specific high-water mark to bytes."""
+    raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        return int(raw)
+    if sys.platform.startswith("linux"):
+        return int(raw) * 1024
+    raise QuantError(f"Unsupported ru_maxrss units on {sys.platform}")
+
+
 def run(config: RunInput) -> None:
     started = time.perf_counter()
     tokens = np.fromfile(config.tokens, dtype="<i4")
     if len(tokens) < config.context * config.chunks:
         raise QuantError("Not enough token data")
     weights = Weights(config.model)
-    model_loaded_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    model_loaded_rss = peak_rss_bytes()
     forward = Forward(weights, config.mode)
     losses: list[float] = []
     correct: list[int] = []
@@ -82,9 +92,10 @@ def run(config: RunInput) -> None:
         "ppl": float(np.exp(sum(losses) / (scored * config.chunks))),
         "top1_accuracy": sum(correct) / (scored * config.chunks),
         "seconds": time.perf_counter() - started,
-        "peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        "peak_rss_bytes": peak_rss_bytes(),
         "loaded_model_peak_rss_bytes": model_loaded_rss,
-        "rss_units": "bytes on macOS; total process high-water mark, not native buffer savings",
+        "rss_units": "bytes; total process high-water mark, not native buffer savings",
+        "platform": sys.platform,
         "metrics": asdict(forward.metrics),
         "numpy": np.__version__,
         "head_rows_per_chunk": config.context // 2,

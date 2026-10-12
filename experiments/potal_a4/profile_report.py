@@ -27,14 +27,19 @@ GROUPS = {
 
 
 def main() -> None:
+    if len(sys.argv) < 2:
+        raise ValueError("Expected RESULT_DIRECTORY [CONTEXT ...]")
     root = Path(sys.argv[1])
+    contexts = tuple(int(value) for value in sys.argv[2:]) if len(sys.argv) > 2 else (128, 512, 1024)
+    if len(set(contexts)) != len(contexts) or any(context not in (128, 512, 1024) for context in contexts):
+        raise ValueError("Require distinct contexts from 128, 512, 1024")
     lines = ["# Attention limb and CPU component measurements", "",
              "Original selective-linear+a4nks policy; GPT-2, first WikiText-2 test chunk at each context.",
              "Counts cover all 12 layers × 12 heads. Timing covers layers 0/5/11 × heads 0/6/11, one warmup and five measured replays per head.",
              "Times are measured NumPy int64 CPU component work, not Gemmini time or full model latency. QK and PV integer sums are checked against reconstructed float64 operands.",
              "Reference-only FP QK/mask, reconstruction, unpacking, capture, checks and Python driver overhead are excluded from the component denominator.", ""]
     csv_rows = []
-    for context in (128, 512, 1024):
+    for context in contexts:
         data = json.loads((root / f"context{context}.json").read_text())
         records = data["records"]
         assert len(records) == 144 and data["hidden_bitwise_matches_baseline_chunk0"]
