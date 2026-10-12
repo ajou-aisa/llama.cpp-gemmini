@@ -14,3 +14,12 @@ gpt2/*
 #venv files
 
 .venv/*
+
+# Local generated files and model weights
+__pycache__/
+*.pyc
+*.gguf
+*.code-workspace
+tags
+/ggml/src/ggml-gemmini/log.txt
+/wikitext-2-raw-v1.zip
