@@ -1,5 +1,288 @@
 # Nano continuation
 
+## Local preparation for vanilla Gemmini QK/PV replay (2026-10-13)
+
+The user requested local code for remote execution, with vanilla QK/PV first and
+removable optimization experiments. `im2p_measure.py` defaults to no mask and
+prepares the existing quantization, BK/lane schedule, int8 buffers and independent
+NumPy references before executing. `--experiments` enables direct host wide
+accumulation and the existing QK-only mask plan. No upper-lane specialization or
+quantization change is introduced. PV retains the full zero-point domain.
+
+Reuse: the existing raw probe owns the real provider and strict numerical-runtime
+identity checks; it now also builds `potal-im2p-replay`. The existing CPU batch
+loop moved to `raw_batch.hpp`; CPU and Gemmini share its checked wide shifts,
+row scatter and publication-after-success contract. Prepared replay subclasses
+the existing descriptor packer rather than adding another packet format.
+Product activation main/residual and stacked RMD code were not edited here.
+
+Measurement is component-level: fresh runtime per variant/repetition; real RTL
+cycles and read/write/preload counters are collected over all raw requests.
+Preparation, native simulator wall time and reference/publication work are
+separate. The raw request sequence is the existing per-BK/per-lane profiling
+schedule, not certification of the product stacked RMD scheduler. No new NPU
+cross-request operand reuse, whole-model latency or new PPL result is claimed.
+
+Local evidence: rebuilt `potal-native-replay` and `potal-native-model`; CTest 7/7
+passed, including the shared batch failure-publication and >int32 accumulation
+cases. Added prepared-job checks cover row/K/output tails, repeated full/direct
+execution, all-masked QK and zero P. GPT-2 and Llama layer0/head0 QK/PV captures
+from `results-upper-compare-gpt2-10chunk` and `results-qk-batch-10chunk` passed exact
+NumPy int64 accumulation, reconstructed float64 and saved float32 comparisons.
+Both C++ preprocessor modes pass `c++ -std=c++17 -Wall -Wextra -Werror
+-fsyntax-only` using the actual IM2P headers. Python rule audit passed.
+
+For each sampled QK head, dense has 96 raw calls; the optional mask plan has
+192. Main fragments are 512 to 272 per K nibble pass. Thus extra request cost
+must remain in the RTL measurements, even after eliminating Python setup from
+the execution interval. Each sampled PV head has 108 raw calls; it remains dense.
+Full-partial and direct modes make identical raw calls and preserve exact values.
+
+The raw hardware probe now has 18 cases (old 15 plus three strided-buffer cases).
+These updated RTL cases and the new shared-library link/run have **not** run
+locally: there is no matching macOS A4/W4/DIM32/ACC512 numerical archive.
+Nano's recorded compatible source `20b82f0` exposes the same used ABI fields.
+Remote build and vanilla-first commands are in [README.md](README.md#gemmini-qkpv-원격-검사-vanilla-기본값).
+
+## Local common ExSIA source-zero policy (2026-10-13)
+
+The adopted source-zero population policy now applies to all supported ExSIA
+activation widths (4, 8 and 16). The earlier nano change had an A4-only compile
+condition. Both product callers still use the existing `LocalStage`; optimized
+full/tail and validation reference paths now use the same population. Original
+nonzero inputs that round to integer zero remain in the population.
+
+Git history places the A4-only guard in nano preservation commit
+`63e166da635bcbedaf9edb8cb84bd3e88851c3dc` (2026-10-12 13:26:38 +0900).
+Its implementation plan scoped changes to A4/a4nks and preserved legacy A8;
+that scope restriction had also been applied to the common population policy.
+The activation-width build option itself predates that patch and is retained.
+
+The optimized statistics loop reuses the exponent already stored in `blk.e`.
+A source zero writes `q_out[i] = 0` before skipping preliminary quantization and
+statistics. There is no new allocation, mask or scan. Three sum-only
+`WideQuantizer` overloads no longer test source zero: zero contributes nothing
+to S/SS, and those helpers do not count samples. The strict one-sided 2-sigma
+formula, top selection, output layout and PE operand representation are retained.
+The full product/test/config change is [source-zero.patch](results-source-zero-common/source-zero.patch).
+
+The existing source-zero fixture is generalized using `meta.rho`, not duplicated
+per width. Eight cases cover signed source zero, nonzero rounded zero, all-zero
+and singleton blocks, full BK32 blocks, one/seven-column tails and prefilled
+output storage. Independent expected count/S/SS/exponent/mask values are checked
+along with optimized/reference code equality. The initial generalized fixture
+passed on pre-fix A4 and failed on pre-fix A8. Final Release CTests pass A4 9/9
+with OpenMP OFF and 9/9 with ON, A8 14/14 and A16 9/9.
+
+Native GPT-2 WikiText-2 test, context512 x10, 5,120 input / 2,550 scored tokens:
+
+| Product configuration | Before PPL | After PPL | Delta |
+| --- | ---: | ---: | ---: |
+| A4/W4, existing source-zero exclusion | 40.563992429741681 | 40.563992429741752 | +7.1054e-14 |
+| A8/W8, source-zero exclusion newly applied | 29.357533546738331 | 29.356037576203310 | -0.001495970535021 |
+
+Both before/after runs completed all ten chunks. A4's maximum absolute
+per-chunk NLL delta is 1.819e-12; this does not claim bitwise logit or per-token
+identity. A8 has mixed-sign chunk deltas and a -0.00510% aggregate PPL change.
+Totals, chunk deltas and log hashes are in
+[comparison.json](results-source-zero-common/comparison.json).
+
+The pair explicitly selects `--device GEMMINI`, CPU main/RMD and FP attention,
+DIM/BK32, physical geometry `(4,4096,1024)`, four threads and sequential ExSIA.
+Within each width the model, token prefix, CMake cache and generated geometry
+hashes match. A4 uses Gemmini OpenMP ON, A8 OFF; compare before/after within a
+width. Earlier default-device BLAS probes and the differently configured A4
+OpenMP-OFF PPL probe are excluded and retained with reasons in
+[inputs.json](results-source-zero-common/inputs.json). PPL runs overlapped builds
+and other runs, so their times do not establish a speedup. This is not an a4nks
+attention or Gemmini/IM2P hardware measurement. A16 has functional coverage only.
+The previous nano A4 include/exclude experiment below remains a separate result.
+
+## Local native batching and direct accumulation (2026-10-12)
+
+The follow-up modifies the existing `native_model.cpp` raw CPU kernel,
+`profile_gemm.py` scheduler, `native_measure.py` replay/measurement runner and
+`verify.py`; it does not add a parallel attention implementation. A stripe is
+submitted once, with one descriptor for each original BK32 block, lane and K
+nibble pass. The descriptor retains the original row map and per-column shift.
+Native execution reuses the existing int8 x int8 -> int32 raw dot. It accumulates
+into private int64 storage using checked int128 scaling, and copies the result
+out only after all work succeeds. Int64 overflow is rejected, not saturated.
+Native input values must be signed nibbles stored in int8; a full folded Q code
+cannot be silently narrowed to int8. Prepared Python oracle arrays remain int64.
+
+The direct variant uses one reusable raw-region buffer instead of a full-width
+partial for every block/lane. A full-width native control is retained to measure
+that difference. Both batch variants move SCU into native code, so the first
+comparison includes packing/native-merge changes as well as reduced FFI calls.
+The original Q/K/P/V quantization, logical stripes, mask planning and weighted
+PV zero point are preserved. PV never skips masked tiles in this experiment.
+
+Release build and CTest pass **7/7**, including new batch checks for per-column
+and lane shifts, a result above int32, invalid rows/regions/overflow with unchanged
+published output, nibble-range validation, reordered residual rows, masks and
+PV zero-point cancellation. Llama-3.2-1B Q4_HP1, context512 x10, gives
+**13.801307254545433** in both dense and batch-direct modes (5,120 input / 2,550
+scored tokens). Packets, scales, valid QK, softmax, PV, logits and token NLL are
+exactly equal. All 10 dense records also match the previous QK experiment's
+dense records. Tail33, prefix31, decode1, cached suffix17 and packed-sequence34
+real graph scenarios all pass in both modes, including position/sequence mask
+checks. The new raw batch therefore has evidence beyond equal aggregate PPL.
+
+Apple M5 CPU component timing, 15 QK / 15 PV captures, one warmup and five
+rotated-order repeats; sum of per-capture medians, excluding common quantization:
+
+| Component | Dense ms | Existing QK skip ms | Native batch, full partial ms | Native batch, direct ms |
+| --- | ---: | ---: | ---: | ---: |
+| QK | 399.586459 | 397.461962 | 368.414042 | **326.162122** |
+| PV | **160.280377** | 161.176461 | 171.007750 | 175.863913 |
+
+QK direct accumulation reduces time **17.94%** against existing skip and
+**18.38%** against dense. Direct accumulation contributes a further **11.47%**
+against the full-partial batch. QK submissions fall from 2,880 to **120** per
+15 captures while the same 2,880 retained raw regions execute. Its DIM32 work
+counts also match the previous skip experiment exactly; batching itself does
+not remove additional MACs. All 15 QK captures improve against dense. PV time
+increases **9.72%** despite submissions falling 1,660 -> 60; 14/15 captures
+regress. Retain QK as the implementation candidate; do not enable PV batching
+by default. Product dispatch/defaults have not been changed.
+
+An earlier independent component run reaches the same directional result:
+QK existing skip 404.402 -> direct 319.964 ms; PV dense 161.413 -> direct
+173.078 ms. Dense versus unbatched skip varies between runs, so use within-run
+controls rather than mixing old and new medians. Final repeat sums for QK
+direct are 321.916..336.091 ms, versus dense 393.267..420.857 ms. These ranges
+use a different aggregation from the table's sum of per-capture medians.
+
+The full-partial batch initializes 188,612,608 bytes of full-width QK partials
+across the 15 captures; the direct variant removes those initializations.
+This is cumulative buffer work, not peak memory. Workspace counter definitions
+and both runs' raw measurements are in [EXECUTION.md](results-qk-batch-10chunk/EXECUTION.md)
+and [component-summary.json](results-qk-batch-10chunk/component-summary.json).
+The final [report.json](results-qk-batch-10chunk/report.json),
+[chunks.jsonl](results-qk-batch-10chunk/chunks.jsonl) and
+[mask-scenarios.json](results-qk-batch-10chunk/mask-scenarios.json) retain exact
+results and model/token/source/library identities. All measured Python/C++
+source and library hashes match the final working tree.
+
+Small-token QA took longer in the existing CPU linear route; a read-only
+[stack sample](results-qk-batch-10chunk/prefix-diagnostic.txt) locates active
+weight reads/native matched-width dense execution. It is not a QK batch timing.
+No product linear code was changed to speed up the checks.
+
+Remaining work is product StreamQuant/direct-limb and linear integration,
+arbitrary-width exact merge, actual raw Gemmini/IM2P submission, a4nks role/cache/
+GQA dispatch and hardware timing/coverage. The current batch is a CPU replay
+prototype; its timings establish neither accelerator cycles nor whole-model
+speedup. Mask-plan reuse and per-KV-head preparation reuse are separate possible
+follow-ups. See the existing implementation plan; its product tasks remain open.
+
+## Local continuation: QK masked tiles (2026-10-12)
+
+The active local test checkout is
+`/Users/chan/Projects/AISA/llama.cpp-gemmini/.worktrees/potal-qk-mask`, branch
+`work/potal-qk-mask-local`. The dirty parent `develop` checkout is preserved.
+Nano SSH authentication was unavailable, so 38 successful source-edit records
+from the previous session were replayed on `f588ad4`; all 18 recovered files
+matched the reconstructed contents byte-for-byte before this increment.
+That initial recovery excluded generated measurements. The user's nano commit
+`63e166da635bcbedaf9edb8cb84bd3e88851c3dc` has now been fetched and compared:
+all 13 execution/test/build files and `ORIGINAL_SPEC.md` match the recovery
+byte-for-byte. Four handoff documents gained transfer notes, now incorporated.
+The local test branch was fast-forwarded to this commit with its QK changes
+preserved. Git's 63 inventoried measurement files match their recorded hashes.
+The 20 local source/document files, 71 local result files and measured runtime
+hashes were checked after restoration. Only provenance/handoff text changed
+after that check; no numerical experiment was rerun for synchronization.
+The named pre-sync stash remains as a recovery copy. The separate transfer
+archive was not received: SCP still fails SSH authentication, so its payload
+has not been verified locally. See [nano-sync.json](results-qk-mask-10chunk/nano-sync.json)
+and [source-recovery.json](results-qk-mask-10chunk/source-recovery.json).
+
+The QK-only experiment extends existing owners:
+
+- `build_attn_mha` supplies the actual softmax mask as an optional QK dependency;
+  the replay ABI is version 2 and retains that dependency's lifetime.
+- `profile_gemm` skips a DIM32 row/key tile only when every mask entry is
+  negative infinity. Residual plans use original query-row IDs after compaction.
+  Both K nibble passes use the same mask. Original Q/K preparation, stripe
+  geometry, scales and digits are unchanged.
+- Skipped scores are published as finite zero before the existing FP softmax.
+  PV and its full weighted zero-point correction remain unchanged.
+- `native_measure qk-mask` compares the existing dense integer replay with the
+  candidate, including packet, scale, valid-QK, softmax, PV, logits and token-NLL
+  hashes. This reuses the native model/tokenizer/RoPE/GQA/linear path.
+
+The local Llama-3.2-1B Q4_HP1 checkpoint SHA256 is
+`d483ca08fdfd166b6afba4cf146ea865d51519a80cab01022f7ab71694bc63a5`.
+The paired context512 x10 result is **13.801307254545433** for both modes:
+5,120 input tokens, 2,550 scored tokens, and exact per-token/hash equality.
+These are local paired results, not a PPL improvement over the older nano model.
+Nano's model-file SHA256 is
+`48efffb2bd7b0f5fbd2414d536ff28d637145ac99c19f2f6c2a57f3239ee24e8`,
+different from the local file. The text and token hashes match exactly. The
+other local `models/default` Q4_HP1 file also has a different hash. No tensor-level
+equivalence between these model files has been established, and the absolute
+nano/local PPL values must not be interpreted as an optimization comparison.
+See [chunks.jsonl](results-qk-mask-10chunk/chunks.jsonl) and the pre-run
+[runtime-inputs.json](results-qk-mask-10chunk/runtime-inputs.json).
+
+Per K pass, QK main work falls from 2,621,440 to 1,392,640 DIM32 equivalents
+(46.875% removed), and upper work from 5,241,024 to 2,795,090. These count actual
+CPU replay submatmuls with DIM padding; they are not observed Gemmini submissions
+or the specification's pooled lane-row cost. K-high repeats both categories.
+The dense and candidate use the same ordinary integer CPU dot; unit-add is off.
+
+The context64 smoke also passes tail33, prefix31, single-token decode, a
+17-token cached suffix and two packed sequences. It checks the actual graph mask
+against absolute positions and sequence IDs, then compares both executions.
+The full run passes the same five native scenarios in both modes. Actual masks
+match the independent position/sequence check, and valid QK, softmax, PV and
+logits remain exact. Functional CTest passes 6/6, including the independent
+arithmetic oracle and QK causal/tail/row-map/finite-bias fixtures. Nearby ExSIA
+baseline, stripe-geometry and source-zero CTests pass 3/3; direct meta-rho and
+non-outlier-clipping cases also pass. Build and test logs remain under
+`build-potal-qk` and `build-potal-replay`.
+
+CPU timing uses Apple M5, 15 QK and 15 PV captures from chunk 0, one warmup and
+five alternating-order measurements per mode/capture. The table sums the
+per-capture medians. Common quantization/unpacking and softmax are excluded;
+mask classification/planning, packing/conversion, host SCU and finite-zero
+publication are included. No other experiment or build ran during these timings.
+
+| CPU replay component | Dense ms | QK-skip ms | Time change |
+| --- | ---: | ---: | ---: |
+| QK, 15 heads | 365.941457 | 403.154123 | +10.1690% |
+| PV, 15 heads, unchanged path | 162.060042 | 160.476208 | -0.9773% |
+| QK + PV, 30 heads | 528.001499 | 563.630331 | +6.7479% |
+
+QK repeat sums range from 373.183 to 379.774 ms for dense and from 402.836 to
+407.215 ms for the candidate. These are sums at each repeat index, a different
+aggregation from the sum of per-capture medians. PV's small difference is timing
+variation on identical code, not a PV optimization.
+
+For each capture's median QK run, native dot time totals 159.840 -> 95.886 ms,
+while native dot calls double from 1,440 to 2,880. Conversion/allocation/FFI time
+grows from 48.501 to 70.451 ms, and time outside dot calls from 157.541 to
+236.692 ms. The latter includes mask planning, slicing, SCU and publication; it
+must not all be attributed to mask classification. The lower MAC work is real,
+but these overheads outweigh it in the current CPU replay implementation.
+
+Keep the original candidate opt-in through `qk-mask`; this historical run alone
+does not support a CPU speedup. The batching follow-up is now recorded above.
+The numerical gate
+supports future Gemmini scheduling work but does not establish its performance.
+All measured source/library hashes still match the pre-run snapshot. See
+[report.json](results-qk-mask-10chunk/report.json),
+[mask-scenarios.json](results-qk-mask-10chunk/mask-scenarios.json) and
+[component-summary.json](results-qk-mask-10chunk/component-summary.json).
+
+Product a4nks dispatch remains incomplete. Original native FP QK/PV dots still
+run before replay replacement, so replay wall time is diagnostic. No new
+Gemmini/IM2P latency, CUDA latency, PV tile skip or full-model speedup is claimed.
+
+## Historical nano checkpoint
+
 This branch is the test workspace `work/potal-attn-im2p-nano`. On 2026-10-12 the
 user requested a commit and normal push of the existing work and evidence on
 this branch for local continuation. Do not merge into develop/hotfix, discard
@@ -25,7 +308,10 @@ attention dispatch and fused limb emission remain incomplete.
 The user explicitly adopted excluding source zero from the sigma population
 after reviewing the result below. Keep this change in future A4 baselines;
 it is no longer waiting for an adoption decision. A nonzero source that rounds
-to q=0 remains included. A8 is outside this change.
+to q=0 remains included. The original Nano patch covered A4 only. The user has
+since clarified that this population policy applies across supported ExSIA widths (A4/A8/A16);
+the A4-only implementation and test guards have been removed in the local worktree.
+Local validation is recorded separately from the historical Nano measurements below.
 
 `results-outlier-zero/` contains the paired native product measurements:
 
@@ -421,6 +707,10 @@ integrated Gemmini unit-add/causal-skip implementation is claimed.
 
 ## QK fully masked tile skip investigation — implementation pending
 
+This section preserves the nano checkpoint at `63e166d`. The local CPU replay
+implementation and measurements are recorded at the top of this document;
+product Gemmini/IM2P integration remains pending.
+
 This is the final investigation state before the 2026-10-12 transfer. The user
 selected **QK-only** omission of physical output tiles for which every actual
 mask entry is negative infinity. No implementation, new PPL pair or skip timing
@@ -554,3 +844,37 @@ build, test suite, PPL replay or performance experiment was started for transfer
 The experimental `.gitattributes` preserves this snapshot's raw measurement
 bytes, including CSV line endings and whitespace in logs/diff evidence. Source
 and handoff documents retain the normal whitespace checks.
+
+## 2026-10-13: upper-lane specialization closed; retain NPU execution
+
+The user excluded the zero/±1 specialization from adoption and selected NPU
+operand reuse and tile omission as the optimization direction. Existing
+activation main/residual generation, stacking, PE execution and accumulation
+must remain. No product execution code was changed in this comparison.
+
+Before that decision, the existing CPU runner completed GPT-2 context512 x10:
+dense and exact sparse-unit-add PPL both 34.50487565853101, with bitwise packet,
+scale, attention, softmax, logits and token-NLL equality. The historical Nano
+Llama x10 pair remains 21.486062983190273 both ways; it was rechecked from saved
+records, not rerun locally. New local component checks reused 24 GPT-2 and 30
+Llama captures and the existing quantization/GEMM/measurement helpers. All
+matched independent reconstructed float64 products and integer raw-dot results.
+Adding unit specialization to zero skipping did not establish an extra gain:
+the sums of per-capture medians were 424.513 -> 443.214 ms for GPT-2 and
+483.143 -> 490.183 ms for Llama. These are CPU measurements, not NPU cycles.
+
+Full x10 nonzero Q lane-2 digits were ±1 in 97.556% of GPT-2 and 92.235% of
+historical Nano Llama observations. K's high nibble was ±1 in only 43.151% and
+43.535% of the respective local saved-head samples. P lane 2 is exactly 0/+1
+for all 256 uint8 codes; V has one nibble pass. A deliberately lossy sign-only
+negative control changed valid QK outputs in both models. It was never used
+in the exact candidate or PPL replay.
+
+Evidence: [GPT-2 x10](results-upper-compare-gpt2-10chunk/report.json) and
+[comparison, histograms and individual timings](results-upper-comparison/comparison.json).
+The adjacent `compare.py` reuses the existing helpers and preserves the capture
+and source identities. Actual A4/W4/DIM32 NPU latency for this candidate was
+not measured. Further unit-specialization experiments are stopped. Reuse/tile
+work must preserve the original codes/scales and be assessed through actual
+NPU submissions, transfers and cycles; PV omission also requires a matching
+zero-point correction domain.

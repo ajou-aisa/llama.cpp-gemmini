@@ -1,11 +1,65 @@
 # PoTal attention: nano에서 Gemmini / IM2P 작업 이어가기
 
+## 최신 작업: vanilla QK/PV의 Gemmini 원격 검증 준비
+
+기존 raw Gemmini provider와 CPU 묶음 누산기를 재사용해 캡처 재생 코드를 준비했다.
+기본값은 masking 없는 QK/PV이며, `--experiments`로 직접 누적·QK 타일 생략을
+함께 비교한다. 모든 PE 입력은 기존 signed nibble/int8, 블록·lane 보정은 checked
+host int64다. 양자화·패킹·정답 생성은 실행 전에 준비한다.
+
+로컬 CPU 빌드/CTest 7개와 실제 GPT-2/Llama QK/PV 캡처 4개의 정확도 검사는 통과했다.
+새 Gemmini 공유 라이브러리의 실제 링크·실행과 RTL 측정은 원격에서 해야 한다.
+제품 attention dispatch·stacked RMD나 전체 모델 성능 인증은 별도다.
+실행 명령과 결과 필드는 [실험 README](experiments/potal_a4/README.md#gemmini-qkpv-원격-검사-vanilla-기본값)에 있다.
+
+## 최신 로컬 수정: ExSIA 공통 source-zero 정책
+
+기존 `LocalStage`의 full/tail/reference에서 A4 한정 조건을 제거해 A4·A8·A16에
+같은 정책을 적용했다. 기존 `blk.e`를 재사용하고 원본 0의 출력은 0으로 기록한다.
+비영 원본이 반올림 후 0이 되는 경우는 통계에 포함한다. 새 mask·배열·순회는 없다.
+Release 회귀 검사는 A4 OpenMP ON/OFF 각각 9/9, A8 14/14, A16 9/9 통과다.
+전후 10-chunk PPL 측정도 완료했다. 결과와 증빙은 [최신 진행 기록](experiments/potal_a4/NANO_PROGRESS.md#local-common-exsia-source-zero-policy-2026-10-13),
+전체 코드 변경은 [source-zero.patch](experiments/potal_a4/results-source-zero-common/source-zero.patch)에 있다.
+
+## 로컬 실험 결과: native 묶음 실행·직접 누적
+
+기존 실험 경로에 stripe 단위 native 제출과 유효 구간 직접 정수 누적을 연결했다.
+int8 signed nibble 입력, BK32별 scale, 모든 lane과 K 두 패스를 보존한다.
+Llama context512 ×10의 PPL은 전후 **13.801307254545433**으로 같고,
+packet·scale·유효 QK·softmax·PV·logits·토큰 NLL 및 추가 mask/cache 검사도 통과했다.
+QK 15개 CPU 사례는 기존 생략 **397.462→326.162 ms**, 제출은 **2,880→120회**다.
+PV는 **160.280→175.864 ms**로 느려져 동일한 묶음 적용을 기본값으로 채택하지 않는다.
+실제 Gemmini/IM2P dispatch·cycle 측정과 임의 범위 exact accumulator는 남아 있다.
+측정 조건·남은 작업은 [최신 진행 기록](experiments/potal_a4/NANO_PROGRESS.md),
+원자료는 [측정 요약](experiments/potal_a4/results-qk-batch-10chunk/component-summary.json)에 있다.
+
+## 로컬 재개: QK 완전 마스킹 타일 생략
+
+현재 로컬 작업 위치는 `.worktrees/potal-qk-mask`, 브랜치는
+`work/potal-qk-mask-local`이다. 기존 `develop` 작업은 보존했다. nano의
+`63e166da635bcbedaf9edb8cb84bd3e88851c3dc`를 받아 테스트 브랜치 기준으로 반영했다.
+복원한 코드·테스트·빌드 설정 13개와 원문 명세는 모두 원본과 일치했다.
+추가된 이관 문서·증빙을 반영하고 로컬 QK 변경과 측정 결과를 보존했다.
+별도 압축 파일은 SSH 인증 실패로 아직 받지 못했다. 대조 근거는
+[nano-sync.json](experiments/potal_a4/results-qk-mask-10chunk/nano-sync.json)에 있다.
+
+기존 graph/native replay/정수 GEMM에 실제 mask 전달과 QK 타일 생략을 연결했다.
+원래 stripe와 residual row ID를 유지하고, 완전히 `-inf`인 타일만 생략한다.
+PV와 zero-point 보정은 유지했다. 로컬 Llama context512 ×10에서 전후 PPL은
+**13.801307254545433으로 동일**하며 logits·softmax·토큰별 NLL도 같다.
+CPU 정수곱의 DIM32 환산 main 작업량은 46.875% 감소했다. 제품 Gemmini/IM2P
+가속 결과는 아니다. Apple M5의 QK 15개 사례 시간은 365.941→403.154 ms로
+10.17% 증가했으므로 CPU 기본값으로 채택하지 않는다. 순수 정수곱 시간은
+줄었지만 호출 수와 나머지 처리가 늘었다. 자세한 적용 범위와 근거는
+[로컬 진행 기록](experiments/potal_a4/NANO_PROGRESS.md#local-continuation-qk-masked-tiles-2026-10-12)에 있다.
+아래 nano 수치는 당시 환경·입력의 별도 결과다.
+
 ## 최신 nano 결정과 상태
 
 이 문서의 이관 당시 기록에 앞서 [현재 진행 기록](experiments/potal_a4/NANO_PROGRESS.md)과
 [명세-작업 대응표](experiments/potal_a4/IMPLEMENTATION_PLAN.md#specification-to-work-audit)를 확인한다.
 
-- 사용자는 **A4 sigma 통계에서 원본 0을 제외하는 정책을 채택**했다. nonzero 원본이 qround 후 0이 되는 경우는 포함한다. Top/sigma와 D>0 보정 mask는 구분한다.
+- 사용자는 **ExSIA 지원 비트 폭에 공통으로 sigma 통계에서 원본 0을 제외하는 정책을 채택**했다. nonzero 원본이 qround 후 0이 되는 경우는 포함한다. Top/sigma와 D>0 보정 mask는 구분한다. Nano의 A4 한정 조건은 공통 정책으로 정정한다.
 - 새 전후 PPL 비교는 **10 chunks**로 고정한다. 현재 context512, WikiText-2 test 앞 5,120 input / 2,550 scored tokens다. 아래의 과거 8-chunk 숫자와 직접 비교하지 않는다.
 - 제품 zero-only 수정의 10-chunk PPL은 40.18882947→40.20531900, ExSIA 검사 5/5 통과다. 이 비교는 CPU main/RMD·FP attention·ACC_ROWS1024 조건이며 원문 a4nks/geometry 또는 Gemmini RTL 검증 완료가 아니다.
 - 호환 IM2P `20b82f0`의 A4/W4/DIM32 archive 빌드·manifest·native link와 provider raw-dot 15개 검사가 통과했다. 일반 pointer API가 scale 정보 없이 block size를 K로 바꾸는 문제를 확인해, 기존 제품과 같은 provider 경로로 probe를 맞췄다. 설치된 이전 checkout `5da6a4c`와 혼동하지 않는다. 제품 a4nks dispatch·전체 성능 검증은 별도로 남아 있다.

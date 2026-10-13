@@ -1,0 +1,30 @@
+Read-only stack sample of the original dense replay during the 31-token prefix scenario.
+
+Command: rtk proxy sample 41866 1 1 -file /tmp/potal-qk-batch.sample.txt
+Sample timestamp: 2026-10-12 14:59:41.252 +0900
+Process launch: 2026-10-12 14:41:26.605 +0900
+OS: macOS 26.4 (25E246), ARM64
+Physical footprint: 1.3G; peak 1.6G (sample tool's metric, not an allocation comparison).
+The full sample remains at /tmp/potal-qk-batch.sample.txt on this host.
+
+Main-thread excerpt (725 samples):
+  potal_replay_step
+    replay_decode
+      llama_decode
+        llama_context::decode
+          llama_context::graph_compute
+            ggml_backend_sched_graph_compute_async
+              ggml_backend_gemmini_graph_compute
+                ggml_backend_gemmini_mul_mat
+                  MatMul::run_full
+                    MatMul::run_dense
+                      execute_dense
+                        execute_native_matched_int_dense (.omp_outlined)
+                          quants::wreader::read_code_validated
+
+Additional main-thread samples show residual::execute_direct_stripe and its
+weight readers. The active computation is in the existing product CPU linear
+route, not potal_replay_batch. This is a location sample, not a complete phase
+profile, a proof of the precise shape-dependent cause, or a hardware timing.
+The prefix subsequently completed with exact dense/batch trace, softmax and
+logit equality. No change to that product linear path was made in this test.

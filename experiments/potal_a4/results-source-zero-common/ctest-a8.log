@@ -1,0 +1,33 @@
+Test project /Users/chan/Projects/AISA/llama.cpp-gemmini/.worktrees/potal-qk-mask/build-exsia-zero-a8
+      Start 59: test-gemmini-exsia-profile-contract
+ 1/14 Test #59: test-gemmini-exsia-profile-contract .......   Passed    0.02 sec
+      Start 60: gemmini_exsia_all
+ 2/14 Test #60: gemmini_exsia_all .........................   Passed    1.51 sec
+      Start 61: gemmini_exsia_baseline
+ 3/14 Test #61: gemmini_exsia_baseline ....................   Passed    0.01 sec
+      Start 62: gemmini_exsia_dispatch
+ 4/14 Test #62: gemmini_exsia_dispatch ....................   Passed    0.01 sec
+      Start 63: gemmini_exsia_direct_executor
+ 5/14 Test #63: gemmini_exsia_direct_executor .............   Passed    0.01 sec
+      Start 64: gemmini_exsia_stripe_geometry
+ 6/14 Test #64: gemmini_exsia_stripe_geometry .............   Passed    0.01 sec
+      Start 65: gemmini_exsia_non_exsia_capture_context
+ 7/14 Test #65: gemmini_exsia_non_exsia_capture_context ...   Passed    0.01 sec
+      Start 66: gemmini_exsia_source_zero_sigma
+ 8/14 Test #66: gemmini_exsia_source_zero_sigma ...........   Passed    0.01 sec
+      Start 67: gemmini_exsia_rmd_routes
+ 9/14 Test #67: gemmini_exsia_rmd_routes ..................   Passed    0.01 sec
+      Start 68: gemmini_exsia_q8_srmd_software_ws
+10/14 Test #68: gemmini_exsia_q8_srmd_software_ws .........   Passed    0.01 sec
+      Start 69: gemmini_exsia_hp1_srmd_software_ws
+11/14 Test #69: gemmini_exsia_hp1_srmd_software_ws ........   Passed    0.01 sec
+      Start 70: gemmini_exsia_rmd_direct_parity
+12/14 Test #70: gemmini_exsia_rmd_direct_parity ...........   Passed    0.01 sec
+      Start 71: gemmini_exsia_rmd_gather
+13/14 Test #71: gemmini_exsia_rmd_gather ..................   Passed    0.01 sec
+      Start 72: gemmini_exsia_unknown_case
+14/14 Test #72: gemmini_exsia_unknown_case ................   Passed    0.00 sec
+
+100% tests passed, 0 tests failed out of 14
+
+Total Test time (real) =   1.70 sec

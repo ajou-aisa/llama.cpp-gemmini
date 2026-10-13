@@ -1,6 +1,7 @@
 results*/*.csv text eol=lf
 
-# Preserve Nano measurement evidence byte-for-byte, including original log spaces.
+# Preserve measurement evidence byte-for-byte, including original log spaces.
 results-nano*/** -text -whitespace
 results-outlier-zero/** -text -whitespace
 results-unit-add*/** -text -whitespace
+results-source-zero-common/** -text -whitespace

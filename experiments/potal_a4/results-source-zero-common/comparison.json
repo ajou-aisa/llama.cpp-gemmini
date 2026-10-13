@@ -1,0 +1,73 @@
+{
+  "status": "complete",
+  "model_family": "GPT-2",
+  "context": 512,
+  "chunks": 10,
+  "input_tokens": 5120,
+  "scored_tokens": 2550,
+  "scope": "Native Gemmini backend, CPU product main/RMD, FP attention, DIM/BK32, ACC_ROWS1024",
+  "inputs": "inputs.json",
+  "comparisons": {
+    "A4_W4": {
+      "status": "complete",
+      "baseline_policy": "Source zeros already excluded",
+      "before_log": "a4-before.log",
+      "after_log": "a4-after.log",
+      "before_log_sha256": "6d404faec81233e63a8a7fa9c07fc127ce1cba2f3ed416fe3464c57d8bd7e0e9",
+      "after_log_sha256": "bb42a5e2f33574cf437d43b87e8e3d39cc3d703508f3e4e330115fcc902b66ec",
+      "before_ppl": 40.563992429741681,
+      "after_ppl": 40.563992429741752,
+      "ppl_delta": 7.105427357601002e-14,
+      "ppl_relative_percent": 1.7516587820855803e-13,
+      "before_total_nll": 9442.3460071679528,
+      "after_total_nll": 9442.3460071679583,
+      "chunk_nll_deltas": [
+        1.1368683772161603e-13,
+        3.410605131648481e-13,
+        9.094947017729282e-13,
+        9.094947017729282e-13,
+        1.3642420526593924e-12,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.8189894035458565e-12
+      ],
+      "max_abs_chunk_nll_delta": 1.8189894035458565e-12,
+      "note": "Aggregate PPL agrees within 7.2e-14; no bitwise logit or per-token equality claim."
+    },
+    "A8_W8": {
+      "status": "complete",
+      "baseline_policy": "Source zeros included in sigma population",
+      "before_log": "a8-before.log",
+      "after_log": "a8-after.log",
+      "before_log_sha256": "a84e3228ce6d0bc519b398a0be052b1313bcba23e521b66c1bbfa2c46791fb62",
+      "after_log_sha256": "fa0d5a074bb35c751b2629a85987db38147b001fdffce4af5bd4c3c4f67d22da",
+      "before_ppl": 29.357533546738331,
+      "after_ppl": 29.356037576203310,
+      "ppl_delta": -0.0014959705350214847,
+      "ppl_relative_percent": -0.005095695565296184,
+      "before_total_nll": 8617.850442032257,
+      "after_total_nll": 8617.7204984845503,
+      "chunk_nll_deltas": [
+        -0.498168197691939,
+        0.5326365979999537,
+        -0.3649748325128712,
+        -0.26330136402657445,
+        -0.544411494250653,
+        -0.14247334556603164,
+        0.21767499010547908,
+        0.17536442140226427,
+        0.412279771865542,
+        0.345429904968114
+      ],
+      "max_abs_chunk_nll_delta": 0.544411494250653
+    }
+  },
+  "timing_claim": false,
+  "limitations": [
+    "PPL runs and builds overlapped; elapsed times are not a controlled performance comparison.",
+    "A16 has functional regression coverage only.",
+    "No a4nks attention, Gemmini RTL or IM2P timing measurement is claimed."
+  ]
+}

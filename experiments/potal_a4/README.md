@@ -2,10 +2,12 @@
 
 Nano / Gemmini IM2P에서 이어갈 때는 저장소 루트의 [POTAL_NANO_HANDOFF.md](../../POTAL_NANO_HANDOFF.md)를 먼저 읽는다. [원래 알고리즘](ORIGINAL_SPEC.md)과 [전체 구현 계획](IMPLEMENTATION_PLAN.md)도 이 브랜치에 보관했다.
 
-현재 nano 상태는 [NANO_PROGRESS.md](NANO_PROGRESS.md), 요구사항별 남은 검증은
+현재 진행 상태는 [NANO_PROGRESS.md](NANO_PROGRESS.md), 요구사항별 남은 검증은
 [명세-작업 대응표](IMPLEMENTATION_PLAN.md#specification-to-work-audit)에 있다.
-**A4 source-zero 제외는 사용자 채택 완료**이며, 새 전후 PPL 비교는 **10 chunks**다.
-[제품 zero-only 결과](results-outlier-zero/comparison.json)는 CPU main/RMD·FP attention·ACC1024
+**ExSIA 공통 source-zero 제외는 사용자 채택 완료**이며, 새 전후 PPL 비교는 **10 chunks**다.
+로컬 공통화는 A4·A8·A16의 기존 full/tail/reference를 수정했고 지원 폭별 회귀 검사를
+통과했다. [현재 코드 변경과 측정 증빙](results-source-zero-common/)을 참조한다.
+[과거 nano A4 zero-only 결과](results-outlier-zero/comparison.json)는 CPU main/RMD·FP attention·ACC1024
 조건으로 40.18882947→40.20531900이다. 아래 Mac/8-chunk 실험 기록과 직접 비교하지 않는다.
 IM2P archive 빌드·manifest·링크와 실제 raw 정수곱 15건은 통과했다. 제품 a4nks
 통합은 별도 미완료 항목이다. 일반 nibble과 0/±1 입력의 32×32×32 곱은 모두
@@ -15,7 +17,8 @@ IM2P archive 빌드·manifest·링크와 실제 raw 정수곱 15건은 통과했
 [transfer-20261012](results-nano/transfer-20261012/)에 있다. Git에 없는 capture·토큰·대용량
 로그의 압축 경로와 SHA256은 [archive.json](results-nano/transfer-20261012/archive.json)을
 확인한다. QK 완전 마스킹 타일 생략은 다음 구현 대상으로 조사만 완료했으며,
-현재 snapshot에는 구현이나 전후 측정이 없다.
+nano 커밋 `63e166d`에는 구현이나 전후 측정이 없다. 이후 로컬 QK 실험과
+원본 소스 대조 결과는 [NANO_PROGRESS.md](NANO_PROGRESS.md)의 최상단에 있다.
 
 이 디렉터리는 `hotfix/potal-attn`의 **실험 구현**이다. CPU에서 선형·Q direct-limb 정책과 K/P/V 양자화를 적용한 GPT-2 forward를 실행하고, 저장 버퍼와 정확도를 비교한다. 제품의 Gemmini attention dispatch와 fused upper-digit API는 아직 연결하지 않았다.
 
@@ -24,6 +27,68 @@ IM2P archive 빌드·manifest·링크와 실제 raw 정수곱 15건은 통과했
 원문 정책에서 attention의 limb 수, 이상치 선택, 패킷 생성, integer 보정 실행을 분리한 후속 실측은 [ATTENTION_PROFILE.md](ATTENTION_PROFILE.md)에 있다.
 
 최신 채택 조건은 **처음 제공된 selective-linear+a4nks 정책 대비 정확도 저하 금지**다. 원래 선형 corr/sat, Q 전체 보정, P 8비트와 원래 stripe, K/V 정책을 유지한다. Direct-all 선형, limb 제한, P 8행 분할은 채택하지 않은 실험으로 남긴다. 저장 최적화는 원래 유효 코드·scale·복원값을 정확히 보존하고, 동일 실행 조건의 logits/NLL/PPL까지 같아야 통과한다. 아래 측정은 이 제품 통과 조건을 완료한 증거가 아니다.
+
+## Gemmini QK/PV 원격 검사: vanilla 기본값
+
+전달 브랜치는 `work/potal-qk-mask-local`이다. 이 Git 스냅샷에는 아래 명령의
+GPT-2/Llama QK/PV 캡처 4개와 소스·측정 증빙을 포함하므로 별도 압축 전송 없이
+원격 검사를 시작할 수 있다. 모델, 빌드 산출물, IM2P 바이너리 및 과거 전체 캡처
+모음은 포함하지 않는다. 과거 보고서의 소스 해시는 해당 측정 당시 버전을 가리킨다.
+
+`im2p_measure.py`는 저장된 실제 QK/PV 텐서를 기존 `prepare_head`와 `profile_gemm`
+스케줄로 실행한다. 모델 재다운로드나 재캡처는 필요 없다. `im2p_raw_probe.cpp`의
+검증된 provider를 공유 라이브러리로 연결하며, 기존 CPU 묶음 실행의 정수 누산부는
+`raw_batch.hpp`로 옮겨 함께 쓴다. 제품 activation main/residual·stack 경로는 그대로다.
+
+기본 `vanilla`는 QK/PV의 모든 main·lane·K nibble pass를 실행하며 mask를 읽지 않는다.
+PE 입력은 signed nibble을 담은 int8 배열이다. K는 두 패스, V는 한 패스이며,
+raw int32 결과의 BK별·열별·lane별 shift와 합산은 checked int64 host 경로에 둔다.
+P의 zero point=8, colsum 및 broadcast도 원래 구현으로 검증한다.
+
+`--experiments`만 추가하면 `direct`와 QK 전용 `qk-mask`를 함께 실행한다.
+`direct`는 유효 구간의 raw 결과를 넓은 누산기에 바로 더한다. 동일한 raw 요청을
+유지하므로 그 자체의 RTL 곱셈 감소는 기대하지 않는다. `qk-mask`는 기존 실제
+mask와 원래 residual 행 번호를 사용하며 PV는 생략하지 않는다. 실험은 이 디렉터리의
+runner 옵션에만 있고 제품 dispatch에 들어가지 않는다.
+
+양자화·계획·int8 패킹·독립 정답은 측정 전에 준비한다. 보고서의 `gemmini.work_total_cycles`는
+실제 raw 요청들의 RTL cycle 합이며 적재·결과 저장 비용을 포함한다. Python/검증 시간과
+시뮬레이터의 host 실행 시간은 별도다. 이 cycle 합에는 host wide merge·PV 보정·FP softmax가
+포함되지 않으므로 전체 attention 지연시간이나 PPL 증거로 사용하지 않는다. 준비 비용도 별도
+기록하며, 아직 NPU 요청 간 가중치 상주 재사용을 추가하지 않았다. `weight_read_requests`는
+바이트 수가 아닌 요청 수다. 현재 per-BK/per-lane raw 검사는 제품 stacked RMD 스케줄의
+성능 인증이 아니다.
+
+Nano 저장소 루트에서 아래를 실행한다. 경로는 이전에 검증한 ABI5/A4/W4/DIM32/ACC512
+generation이다. 해당 `/tmp` 경로가 사라졌다면 [기존 빌드 기록](results-nano/transfer-20261012/commands.json)의
+호환 source/artifact를 먼저 복구한다. 다른 profile이나 CPU로 대체하지 않는다.
+
+```sh
+rtk proxy cmake -S experiments/potal_a4 -B build-potal-im2p-replay -DCMAKE_BUILD_TYPE=Release -DPython3_EXECUTABLE=/tmp/potal-nano-venv/bin/python -DIM2P_SIM_ROOT=/tmp/potal-nano-im2p-compatible -DIM2P_SELECTED_GENERATION=/tmp/potal-nano-hp1-matched/selected/GEMMINI_HP1/a4-w4-d32/current
+rtk proxy cmake --build build-potal-im2p-replay --target potal-im2p-raw-probe potal-im2p-replay -j2
+rtk proxy mkdir -p output
+rtk proxy build-potal-im2p-replay/potal-im2p-raw-probe > output/potal-im2p-raw.jsonl
+```
+
+Raw probe가 성공해야 진행한다. 기존 15건에 weight/output row stride 검사를 3건 더했다.
+다음은 모델별 layer0/head0, 원래 context512를 그대로 쓰는 vanilla QK/PV 4건이다.
+
+```sh
+rtk proxy env OPENBLAS_NUM_THREADS=1 /tmp/potal-nano-venv/bin/python -m experiments.potal_a4.im2p_measure build-potal-im2p-replay/libpotal-im2p-replay.so output/potal-im2p-vanilla.jsonl \
+  experiments/potal_a4/results-upper-compare-gpt2-10chunk/qk-l0-h0.npz \
+  experiments/potal_a4/results-upper-compare-gpt2-10chunk/pv-l0-h0.npz \
+  experiments/potal_a4/results-qk-batch-10chunk/qk-l0-h0.npz \
+  experiments/potal_a4/results-qk-batch-10chunk/pv-l0-h0.npz
+```
+
+Vanilla가 모두 통과한 다음 같은 캡처에 `--experiments --repeats 3`을 붙이고 출력 파일명을
+`output/potal-im2p-experiments.jsonl`로 바꿔 비교한다. 파일은 덮어쓰지 않는다.
+`start`에는 라이브러리·소스 해시와 runtime identity, `result`에는 캡처 해시·정수/출력 동등성·
+cycle·읽기/쓰기/호출 수가 남는다. 마지막 `complete`가 없는 실행은 미완료다.
+결과 전달 시 이 JSONL 파일들과 CMakeCache, 검증한 `real-lib.json`을 함께 가져온다.
+
+로컬에서는 CPU 빌드/CTest 7개, 준비된 GPT-2/Llama 캡처 4개의 정확한 재생 및
+IM2P executable/library 두 모드의 C++ 컴파일 검사를 통과했다. 원격 RTL 실행은 대기 중이다.
 
 ## 비교 범위
 
@@ -44,7 +109,59 @@ Native probe에는 기존 scalar emitter로 연결하는 bridge가 남아 있다
 
 ## 재현
 
-Nano의 상위 lane ±1 덧셈 후보는 기존 native 모델과 실험 정수 GEMM을 연결하여
+후속 native 묶음·직접 누적 비교는 같은 runner의 `qk-batch`로 실행한다.
+이 실험은 QK와 PV의 묶음 실행을 모두 검사하며, 마스킹 타일 생략은 QK에만
+적용한다. 기준 dense, 기존 QK 생략, native 묶음+전체 폭 partial, native 직접
+누적의 네 경로를 함께 측정한다. 제품 기본값 변경은 아니다.
+
+```sh
+rtk proxy cmake --build build-potal-replay -j 4
+rtk proxy ctest --test-dir build-potal-replay --output-on-failure
+rtk proxy env PYTHONPATH=gguf-py:. OMP_NUM_THREADS=6 OPENBLAS_NUM_THREADS=2 /Users/chan/Projects/AISA/llama.cpp-gemmini/.venv-convert311/bin/python -m experiments.potal_a4.native_measure qk-batch build-potal-replay/libpotal-native-replay.dylib /Users/chan/Projects/AISA/llama.cpp-gemmini/models/llama3.2-1B.Q4_HP1.gguf /Users/chan/Projects/AISA/llama.cpp-gemmini/wikitext-2-raw/wiki.test.raw 512 10 experiments/potal_a4/results-qk-batch-new
+```
+
+10-chunk PPL·logits·softmax는 동일하며 CTest 7/7과 실제 mask/cache 5개 시나리오가
+통과했다. QK 시간은 기존 생략보다 17.94% 줄었고, PV 시간은 dense보다 9.72% 늘었다.
+따라서 QK를 후속 구현 후보로 유지한다. 시간은 CPU 구성요소 측정이다.
+원자료와 명령은 [results-qk-batch-10chunk](results-qk-batch-10chunk/EXECUTION.md)에 있다.
+과거 30개 capture가 모두 남아 있는 로컬 폴더에서 같은 네 경로를 비교하려면
+아래를 사용한다. 이 전체 캡처 모음은 Git 전달 범위에 포함되지 않는다.
+
+```sh
+rtk proxy env OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 /Users/chan/Projects/AISA/llama.cpp-gemmini/.venv-convert311/bin/python -m experiments.potal_a4.native_measure batch-components build-potal-replay/libpotal-native-replay.dylib experiments/potal_a4/results-qk-mask-10chunk /tmp/potal-batch-components-new.json
+```
+
+QK 완전 마스킹 타일 생략은 기존 runner의 `qk-mask` 진입점으로 비교한다.
+현재 로컬 작업 디렉터리는 `.worktrees/potal-qk-mask`다. QK 노드에 실제 mask
+dependency를 추가한 llama 라이브러리와 replay 라이브러리(ABI 2)를 함께
+재빌드해야 한다. 이전 nano 라이브러리를 그대로 링크하면 이 계약을 충족하지 않는다.
+
+```sh
+rtk proxy cmake --build build-potal-qk --target llama -j4
+rtk proxy cmake --build build-potal-replay --target potal-native-replay -j4
+rtk proxy env PYTHONPATH=gguf-py:. OMP_NUM_THREADS=6 OPENBLAS_NUM_THREADS=2 /Users/chan/Projects/AISA/llama.cpp-gemmini/.venv-convert311/bin/python -m experiments.potal_a4.native_measure qk-mask build-potal-replay/libpotal-native-replay.dylib /Users/chan/Projects/AISA/llama.cpp-gemmini/models/llama3.2-1B.Q4_HP1.gguf /Users/chan/Projects/AISA/llama.cpp-gemmini/wikitext-2-raw/wiki.test.raw 512 10 experiments/potal_a4/results-qk-mask-new
+```
+
+이 명령은 기존에 configure한 로컬 A4/W4/DIM32 CPU 빌드를 사용한다. 설정과
+실행 소스/라이브러리 해시는 [runtime-inputs.json](results-qk-mask-10chunk/runtime-inputs.json),
+전후 10-chunk 원자료는 [chunks.jsonl](results-qk-mask-10chunk/chunks.jsonl)에 있다.
+K-low/high 모두 유효 QK 내적을 보존하며, softmax와 PV 및 logits/NLL을 비교한다.
+추가로 tail, prefix/decode, 여러 sequence의 실제 mask를 검사한다. 타일 판정과
+finite-zero 쓰기 비용을 포함한 CPU 구성요소 시간은 전체 모델 또는 Gemmini
+속도가 아니다. PV 생략은 구현하지 않는다.
+
+이 로컬 10-chunk 실행은 PPL 13.801307254545433으로 전후 동일했다. Apple M5에서
+QK 15개 사례의 중앙값 합은 365.941→403.154 ms로 오히려 10.17% 증가했다.
+곱셈량 감소와 실제 지연시간 감소를 구분해야 하므로 CPU 기본값으로 채택하지
+않는다. 반복별 범위, 정수곱/호출 비용 분리와 DIM32 작업량은
+[component-summary.json](results-qk-mask-10chunk/component-summary.json)에 있다.
+
+2026-10-13 결정: 상위 lane의 0·±1 특수처리는 채택 후보에서 제외한다.
+기존 activation main/residual의 생성·stack·PE 실행·누산을 유지하고,
+다음 검토는 NPU operand 재사용과 완전 마스킹 QK 타일 생략으로 제한한다.
+[추가 비교 기록](results-upper-comparison/comparison.json)은 CPU 실험 증빙으로 보존한다.
+
+아래는 채택에서 제외한 Nano 상위 lane ±1 덧셈 실험의 재현 기록이다. 기존 native 모델과 실험 정수 GEMM을 연결하여
 검증한다. `native_model.cpp`의 evaluation callback이 QK/PV 출력을 교체하고,
 `native_measure.py attention`이 원본·후보의 packet/scale/attention/logits/token-NLL을
 비트 단위로 비교한다. 기존 native FP QK/PV도 실행되므로 전체 replay 시간은

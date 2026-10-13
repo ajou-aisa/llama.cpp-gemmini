@@ -16,7 +16,7 @@ Portable continuation of the existing work plan, with the latest accuracy-preser
 **Risk:** High - 저장 표현을 바꾸면서 값, scale, 누적 순서가 달라지면 정확도 조건을 어길 수 있다. Packet 호환성, 넓은 누적, head/cache 배치를 함께 검증해야 한다.
 **Decisions to sanity-check:** 사용자의 최신 조건은 원문 명세 대비 정확도 저하 금지다. 선형의 selective 정책, Q의 전체 보정, 원래 stripe의 P 8비트 및 K/V 규칙을 유지한다. 이전 direct-all 선형 선택은 원문 값 보존 조건으로 대체한다. Limb 제한과 P 8행 세분화는 채택하지 않은 제약 실험이며 제품 기본값이 아니다. 준비 과정 절감과 GEMM 횟수 변화는 따로 측정한다. 새 attention은 기본 OFF이며 기존 FP cache·softmax·Flash/CPU 우선순위를 따른다.
 
-현재 상태: 과거 CPU 정책·packet 실험에 더해 nano에서 A4 source-zero 제외를 구현하고 전후 10-chunk PPL 및 ExSIA 회귀 검사를 완료했다. 사용자는 **0 제외를 채택**했다. 호환 IM2P A4/W4/DIM32 archive의 manifest·링크와 실제 raw 정수곱 15건도 통과했다. 제품 전체 동등성은 미검증이다. 상위 lane의 ±1 덧셈 후보는 기존 native 모델 callback으로 Llama context512 ×10에서 전후 PPL 21.486062983190273 및 모든 packet/logits/NLL의 비트 동일성을 확인했다. 단순 unit 처리의 추가 성능 근거는 부족하다. CUDA 개별 정수곱 비교는 실제 attention 30개에서 정확히 같았으나 CPU보다 29.83% 느렸다. 상세한 현재 증거와 제한은 [NANO_PROGRESS.md](NANO_PROGRESS.md)에 있다. 아래 10개 항목은 일부 준비 작업이 끝난 상태이며 전체 완료로 표시하지 않는다.
+현재 상태: 사용자가 채택한 **source-zero 제외를 A4·A8·A16 공통 ExSIA 정책으로 적용**했다. 기존 full/tail/reference와 테스트를 수정했으며 지원 폭별 회귀 검사, A4/A8 전후 10-chunk PPL 측정을 완료했다. 최신 결과와 과거 nano A4 한정 비교는 [NANO_PROGRESS.md](NANO_PROGRESS.md)에 구분해 기록했다. 호환 IM2P A4/W4/DIM32 archive의 manifest·링크와 실제 raw 정수곱 15건도 통과했다. 제품 전체 동등성은 미검증이다. 상위 lane의 ±1 덧셈 후보는 기존 native 모델 callback으로 Llama context512 ×10에서 전후 PPL 21.486062983190273 및 모든 packet/logits/NLL의 비트 동일성을 확인했다. 단순 unit 처리의 추가 성능 근거는 부족하다. CUDA 개별 정수곱 비교는 실제 attention 30개에서 정확히 같았으나 CPU보다 29.83% 느렸다. 아래 10개 항목은 일부 준비 작업이 끝난 상태이며 전체 완료로 표시하지 않는다.
 
 ---
 
@@ -24,7 +24,39 @@ Portable continuation of the existing work plan, with the latest accuracy-preser
 
 ## Latest user decisions and evidence boundaries
 
-- Source-zero exclusion is adopted: A4 sigma population is `~top && source!=0`.
+- 2026-10-13: Prepare local code for remote Gemmini QK/PV checks, vanilla without
+  masking by default. Reuse the raw provider and existing batch loop; keep direct
+  accumulation/QK skipping behind `--experiments`. Quantization, int8 packing and
+  oracles precede execution. The new replay passes local CPU parity checks but
+  awaits a matching real-runtime link/run on Nano. This does not complete product
+  stacked RMD/attention dispatch or establish a hardware speedup. See the
+  [vanilla-first runbook](README.md#gemmini-qkpv-원격-검사-vanilla-기본값).
+- 2026-10-13: Exclude the upper-lane zero/±1 specialization from adoption.
+  Preserve the existing activation main/residual generation, stacking, PE
+  execution and accumulation. The next optimization scope is **NPU operand
+  reuse and fully masked QK tile omission** at the attention caller. Inspect
+  existing reuse before adding anything; retain all signed-nibble int8 values,
+  original stripe geometry and block/lane scales. PV skipping still requires a
+  matching zero-point correction domain. Judge gains by actual NPU submissions,
+  transfers and cycles, not CPU scalar timing. The closed experiment is preserved
+  in [comparison.json](results-upper-comparison/comparison.json).
+- Local native batching/direct accumulation is now tested in the existing CPU
+  replay owners. It preserves block/column shifts and signed-nibble int8 raw
+  operands, with private checked int64 accumulation. Llama context512 x10 and
+  five real mask/cache scenarios are exact; CTest passes 7/7. QK time improves
+  17.94% versus unbatched skip, but PV batching regresses 9.72%. Keep QK as the
+  implementation candidate and leave PV batching opt-in for the experiment.
+  This informs tasks 5/7/9, but does not complete their arbitrary-wide arithmetic,
+  real PE submission or product dispatch requirements. See the latest section
+  of [NANO_PROGRESS.md](NANO_PROGRESS.md) and its recorded measurement scope.
+- Local QK tile skipping is implemented in the existing graph/replay/GEMM owners.
+  Actual masks and original residual row IDs select fully masked DIM32 tiles;
+  quantization and PV compensation are retained. Llama context512 x10 gives
+  exact valid-QK/softmax/logits/token-NLL parity, PPL 13.801307254545433 both ways.
+  CPU QK component time increases 10.17% despite lower dot work, so the candidate
+  stays opt-in. This is CPU replay evidence; product dispatch and IM2P timing tasks remain
+  unchecked. See the local section of [NANO_PROGRESS.md](NANO_PROGRESS.md).
+- Source-zero exclusion is adopted for all supported ExSIA widths (A4/A8/A16): sigma population is `~top && source!=0`.
   Keep source-nonzero rounded-to-zero entries. The old zero-inclusive population
   was a policy difference from the supplied contract, not a generally invalid
   statistical method. The 10-chunk result does not revoke the user's decision.
@@ -52,7 +84,9 @@ Portable continuation of the existing work plan, with the latest accuracy-preser
   change its legacy PPL; evaluate that change separately and then establish the
   aligned reference baseline. Do not confuse this accepted zero-policy change
   with permission to drop limbs or alter selective-linear/P/K/V rules.
-- Continue on `work/potal-attn-im2p-nano`. The 2026-10-12 transfer request
+- The nano snapshot is `work/potal-attn-im2p-nano` at `63e166d`; local QK work
+  continues on `work/potal-qk-mask-local` based on that verified commit.
+  The 2026-10-12 transfer request
   explicitly authorizes committing/pushing the existing work on that test
   branch, with no develop/hotfix merge or new implementation/experiment.
 - The next selected scope is fully masked **QK-only** tile skipping. Its mask,
@@ -74,7 +108,7 @@ those labels is evidence that product implementation already exists.
 | Constants and primitives | A4/W4 signed operands, BK=DIM32, tau2, NEG, half-even qround and half-away folding with int32 saturation | 1,4; primitive oracle exists, product rounding/large-right-shift work remains |
 | Logical stripe geometry | Compare the complete `stripe_rows(I,N,K,32,4)` growth rule at boundary shapes; `(4,4096,512)` and original E2 partitions | 1,3,4,8,9; CPU comparison currently uses ACC1024, so geometry gate is open |
 | A.1 exponent/top stage | Highest and second distinct exponents; top only with e2; preliminary q from e_pre | 1,4; existing product stage needs full oracle comparison |
-| A.1 sigma population | Exclude source zeros/top/padding, retain source-nonzero q=0; strict one-sided 2-sigma | 4; adopted zero-only patch and full/tail/reference fixture pass; arithmetic already uses `__int128` |
+| A.1 sigma population | Exclude source zeros/top/padding, retain source-nonzero q=0; strict one-sided 2-sigma | 4; shared A4/A8/A16 full/tail/reference policy and fixture pass; arithmetic already uses `__int128`; local evidence in `results-source-zero-common` |
 | A.1 final adaptation | Recompute E from non-top/non-sigma U if any sigma; otherwise e_pre; final q at E-rho | 1,4; explicit intermediate E/q comparison remains |
 | A.2 folding and A.3 selection | Distinct non-NEG E2; record D/u/out/corr separately; uncorrected +8 -> 7, corrected +8 preserved | 1,4; full native original-policy gate remains |
 | A residual layout | Lane0 zero in upper packets, every required lane retained, per-lane active rows and per-original-block union columns; DIM padding | 2,4,7; current product still clips main and captures scalar residuals |
@@ -157,9 +191,9 @@ tests remain the integration gate, so do not add another standalone raw probe.
 | IS-2 | Zero, tail, rounding, residual-width and accumulation boundaries are executable contracts. | The supplied Python contains reproduced boundary failures. |
 | IS-3 | Supported attention executes both QK and PV on Gemmini with existing FP softmax and masks. | Ordinary CPU fallback is not proof of a4nks execution. |
 | IS-4 | Fragment/add reports reconcile with executed work. | The reference counters describe a schedule that its NumPy loops do not implement. |
-| IS-5 | A8, FP alternatives, existing files and unrelated experiments retain their contracts. | Only A4/a4nks is requested. |
+| IS-5 | All ExSIA widths share the adopted source-zero policy. A8 storage/execution, FP alternatives and unrelated experiments retain their other contracts. | Source-zero population is common to A4/A8/A16; representation changes remain scoped to A4/a4nks. |
 | IS-6 | A4 emits upper limbs without a dense residual plane, scalar recapture, or a second decomposition; preparation and GEMM costs are measured separately. | Reducing RMD preparation does not guarantee fewer GEMM fragments. |
-| GAP-1 | A4 source-zero exclusion is now implemented/adopted; the product still clips the main digit and uses scalar residual capture. | Zero substep verified; complete tasks 2 and 4. |
+| GAP-1 | Source-zero exclusion is implemented/adopted for A4/A8/A16; the product still clips the main digit and uses scalar residual capture. | Zero substep verified; complete tasks 2 and 4. |
 | GAP-2 | Legacy scalar residual APIs cannot represent the +2^31 upper-limb sum. | Bypass scalar residual materialization with direct digit packets in task 2; do not widen the shared scalar corridor. |
 | GAP-3 | Python caps right shifts, overflows int64 and rejects BK tails. | Close with tasks 1 and 5. |
 | GAP-4 | Gemmini shared-weight dispatch rejects attention views/heads. | Close with tasks 3 and 9. |
@@ -186,9 +220,9 @@ tests remain the integration gate, so do not add another standalone raw probe.
 
 1. Finite float32 values define the quantization domain. Convert supported F16 views to F32 before these rules. Reject NaN/Inf in source operands before quantization or destination mutation; do not inherit the reference's NaN-to-INT32_MIN behavior. Final-format overflow is a separate conversion rule below.
 2. `eps(0)=NEG`; exclude NEG from distinct anchors; choose anchor 0 for an all-zero stripe. Sigma population uses source `x!=0`, not rounded `q!=0`; padding contributes no population entries. Use strict integer `>` and wide intermediates for the two-sigma test.
-   This policy is user-adopted and implemented for A4's full/tail/reference population paths. Top, sigma, D>0 correction and nonzero upper support are separate concepts; zero correction candidates need not generate work. Under BK32/rho2-or-6, preliminary magnitudes in U are bounded by 128, so sigma-int64 overflow is not an established defect. Keep the existing native `__int128` arithmetic.
+   This policy is user-adopted for all supported ExSIA full/tail/reference population paths. Reuse the existing source exponent sentinel to exclude zero; do not add a second population mask or scan. Top, sigma, D>0 correction and nonzero upper support are separate concepts; zero correction candidates need not generate work. Under BK32/rho2-or-6, preliminary magnitudes in U are bounded by 128, so sigma-int64 overflow is not an established defect. Keep the existing native `__int128` arithmetic.
 3. qround is half-even independent of ambient process rounding mode; fold right shifts are half-away. For int32 q, right shift 32 returns -1 only for INT32_MIN and zero otherwise; shifts >=33 return zero. Positive shifts saturate before any undefined native shift occurs.
-4. For linear folded int32 u, preserve the original correction predicate: `corr=out || D>0`, then `v=corr ? u : sat(u)`. Q always uses `v=u`. Compute balanced radix-16 digits of v once, write d0 to dense main and emit every nonzero d1..d8 directly. Since sat(u) lies in [-8,7], this exactly reproduces the original selective main and zero residual at uncorrected positions. Preserve top/sigma adaptation, E, stripe anchor and scale. Reuse `decompose_balanced_radix(v,4,...)` without materializing a scalar residual or dense residual plane. Never limit required limbs. Keep legacy A8 quantization and scalar capture unchanged. qround/folding int32 saturation and K/P/V clamps retain their original contracts.
+4. For linear folded int32 u, preserve the original correction predicate: `corr=out || D>0`, then `v=corr ? u : sat(u)`. Q always uses `v=u`. Compute balanced radix-16 digits of v once, write d0 to dense main and emit every nonzero d1..d8 directly. Since sat(u) lies in [-8,7], this exactly reproduces the original selective main and zero residual at uncorrected positions. Preserve top/sigma adaptation, E, stripe anchor and scale. Reuse `decompose_balanced_radix(v,4,...)` without materializing a scalar residual or dense residual plane. Never limit required limbs. Keep A8 width-specific quantization and scalar capture, with the shared source-zero population policy from item 2. qround/folding int32 saturation and K/P/V clamps retain their original contracts.
 5. Preserve the requested wide sum. Existing op5/SCU-final output has already lost saturation information and must not feed the new exact route. Use A4 raw integer fragments, then scale and merge on the host. Apply column exponent, stationary nibble shift and original residual lane shift after the raw dot. This is physical raw-PE execution plus host-wide merging, not a claim that the existing hardware SCU is wide.
 6. Use checked int64 accumulation when a bound proves every shift and addition fits. Otherwise use exact exponent-binned host accumulation, scoped to this dot-product operation: balanced radix-2^32 limbs and checked carry normalization. Apply every block/column exponent, nibble/lane weight and PV zero-point compensation before conversion. The reference GEMM result is the exact scaled sum rounded half-even to F64; publishing a GGML F32 tensor rounds that F64 value half-even to F32. This deliberately specifies exact->F64->F32, not direct exact->F32. Use gradual underflow with subnormals preserved, signed infinity on final-format overflow, the exact value's sign on underflow to zero, and +0 for exact cancellation. Conversion must not depend on ambient rounding or flush-to-zero state. The graph softmax consumes the published F32 S, including the existing graph's scale/mask. Do not add a general bigint dependency or silently fall back to saturated int32/double partial sums. The independent Python oracle uses Python integers. This slow path is required by finite-input overflow/cancellation counterexamples, not a performance feature.
 7. K codes are [-128,119], split into signed low/high nibbles with extra shifts 0/4. V uses per-channel token-BK32 A4 blocks. Zero blocks have zero codes and neutral stored exponent.
@@ -334,13 +368,13 @@ policy changes or delegate to agents. Three work phases close cohesive contracts
   QA failure: The same owners cover unknown hint, invalid GQA ratio, unsupported layouts and tags on non-MUL_MAT. CMake contract tests exercise incompatible profiles; evidence `.omo/evidence/potal-a4nks/task-03-config.log`.
 
 - [ ] 4. Fuse A4 StreamQuant folding with direct limb emission
-  Current evidence: A4 source-zero exclusion in optimized full/tail/reference paths is implemented, user-adopted and covered by the 5/5 ExSIA gate plus a 10-chunk comparison. Preserve it. Geometry, rounding/large shifts, low-digit main and fused packets remain open.
+  Current evidence: Shared A4/A8/A16 source-zero exclusion in optimized full/tail/reference paths is implemented and user-adopted. Release CTests pass A4 9/9 with OpenMP ON and OFF, A8 14/14 and A16 9/9; current 10-chunk PPL evidence is in NANO_PROGRESS.md and results-source-zero-common. Preserve the common policy. Geometry, rounding/large shifts, low-digit main and fused packets remain open.
   Recommended task executor category: deep-low - one coupled quantization contract across optimized/reference paths.
-  What to do / Must NOT do: Keep role-specific rho (linear=2, Q=6). Fix source-zero exclusion in full, partial and reference block paths; retain top/sigma adaptation, strict integer sigma and distinct E2 behavior. Linear computes v with its original corr/sat rule; Q uses v=u. Feed each effective v once to the digit helper; write d0 to main and emit all required upper digits. Give each A4 pipeline slot the task 2 bitmap builder; skip scalar capture and state_.residual allocation/writes, including CPU mode. Retain the metadata needed for original linear corr and enabled observers. Fix large negative shifts and define half-even qround without changing process-global rounding state. Gate all changes on the requested A4 policy; preserve A8's existing behavior and do not enable eight-bit PEs for Q.
+  What to do / Must NOT do: Keep role-specific rho (linear=2, Q=6). Fix source-zero exclusion in full, partial and reference block paths; retain top/sigma adaptation, strict integer sigma and distinct E2 behavior. Linear computes v with its original corr/sat rule; Q uses v=u. Feed each effective v once to the digit helper; write d0 to main and emit all required upper digits. Give each A4 pipeline slot the task 2 bitmap builder; skip scalar capture and state_.residual allocation/writes, including CPU mode. Retain the metadata needed for original linear corr and enabled observers. Fix large negative shifts and define half-even qround without changing process-global rounding state. Gate A4 representation changes on the requested policy; retain the shared source-zero population for all widths and do not enable eight-bit PEs for Q.
   Closes: GAP-1,GAP-3,GAP-8. Phase 2; depends 1,2; blocks 8,9.
   References: `ggml/src/ggml-gemmini/quants/act/exsia/local.cpp:29,256,342,528,710`; `exsia_shift.hpp:18`; `folding.cpp:27,68,127,145`; `exsia-state.hpp:291,590`; `exsia.cpp:171,415,456,692,1214,1411,1659,1809`; `ggml-gemmini-config.hpp:128`; `residual/residual-capture.hpp:93`; `tests/test-gemmini-exsia{,-profile}.cpp`; `tests/CMakeLists.txt:667,840`.
-  Acceptance criteria: All A4 implementations match the original-policy reference E/q/M/digits and stripe partitions for full/tail blocks. Upper packet lane0 is absent; corrected INT32_MAX reconstructs exactly. Unselected linear u=8 produces main 7 and no upper digit; corrected u=8 is preserved. q in [-8,7] emits only main. Allocation/capture instrumentation proves zero A4 dense-residual bytes and zero scalar residual events, including reused slots. A4 tests compare digit reconstruction/support instead of relying on the removed scalar plane. Fresh A8 zero-heavy and ambient-rounding regressions retain baseline codes/exponents/masks.
-  QA happy: Extend `test-gemmini-exsia` to compare fixtures for linear and Q policies, serial and available worker modes; retain its existing `a4-source-zero-sigma`, `stripe-geometry` and `non-outlier-clipping` cases. Evidence `.omo/evidence/potal-a4nks/task-04-stream.json`.
+  Acceptance criteria: All A4 implementations match the original-policy reference E/q/M/digits and stripe partitions for full/tail blocks. Upper packet lane0 is absent; corrected INT32_MAX reconstructs exactly. Unselected linear u=8 produces main 7 and no upper digit; corrected u=8 is preserved. q in [-8,7] emits only main. Allocation/capture instrumentation proves zero A4 dense-residual bytes and zero scalar residual events, including reused slots. A4 tests compare digit reconstruction/support instead of relying on the removed scalar plane. Fresh A8 zero-heavy regressions use the shared source-zero policy; representation changes must preserve that adopted baseline's codes/exponents/masks.
+  QA happy: Extend `test-gemmini-exsia` to compare fixtures for linear and Q policies, serial and available worker modes; retain its existing `source-zero-sigma`, `stripe-geometry` and `non-outlier-clipping` cases. The source-zero case runs at every supported width. Evidence `.omo/evidence/potal-a4nks/task-04-stream.json`.
   QA failure: Extend ExSIA / activation-i32 boundary tests to change the local test thread rounding mode and check invariant qround output, extreme exponent gaps and invalid finite-domain input; evidence `.omo/evidence/potal-a4nks/task-04-boundaries.json`.
 
 - [ ] 5. Execute raw A4 fragments and merge with exact wide arithmetic

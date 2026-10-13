@@ -1,0 +1,23 @@
+Test project /Users/chan/Projects/AISA/llama.cpp-gemmini/.worktrees/potal-qk-mask/build-exsia-zero-a4
+    Start 59: test-gemmini-exsia-profile-contract
+1/9 Test #59: test-gemmini-exsia-profile-contract .......   Passed    0.02 sec
+    Start 60: gemmini_exsia_all
+2/9 Test #60: gemmini_exsia_all .........................   Passed    0.61 sec
+    Start 61: gemmini_exsia_baseline
+3/9 Test #61: gemmini_exsia_baseline ....................   Passed    0.01 sec
+    Start 62: gemmini_exsia_dispatch
+4/9 Test #62: gemmini_exsia_dispatch ....................   Passed    0.02 sec
+    Start 63: gemmini_exsia_direct_executor
+5/9 Test #63: gemmini_exsia_direct_executor .............   Passed    0.01 sec
+    Start 64: gemmini_exsia_stripe_geometry
+6/9 Test #64: gemmini_exsia_stripe_geometry .............   Passed    0.01 sec
+    Start 65: gemmini_exsia_non_exsia_capture_context
+7/9 Test #65: gemmini_exsia_non_exsia_capture_context ...   Passed    0.01 sec
+    Start 66: gemmini_exsia_source_zero_sigma
+8/9 Test #66: gemmini_exsia_source_zero_sigma ...........   Passed    0.01 sec
+    Start 67: gemmini_exsia_unknown_case
+9/9 Test #67: gemmini_exsia_unknown_case ................   Passed    0.00 sec
+
+100% tests passed, 0 tests failed out of 9
+
+Total Test time (real) =   0.73 sec

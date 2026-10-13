@@ -1,0 +1,237 @@
+{
+  "ppl": {
+    "dense": 13.801307254545433,
+    "batch_direct": 13.801307254545433
+  },
+  "context": 512,
+  "chunks": 10,
+  "scored_tokens": 2550,
+  "model_sha256": "d483ca08fdfd166b6afba4cf146ea865d51519a80cab01022f7ab71694bc63a5",
+  "tokens_sha256": "26cf9af96d1456e0288323a89ad87bfa5082ffec6075552218294bcd1d015bf5",
+  "library_sha256": "c8de99d21dab2d0c10f8b011eb52b5d4d143cd32d38f03b6fde696128c8f64d0",
+  "source_and_library_match": true,
+  "qk_work_unchanged_from_previous_skip": true,
+  "component_totals": {
+    "qk": {
+      "dense": {
+        "median_sum_ms": 399.586459,
+        "ffi_submissions": 1440,
+        "native_dot_ms": 170.923204,
+        "max_reported_workspace_bytes": 0
+      },
+      "qk_mask_skip": {
+        "median_sum_ms": 397.46196199999997,
+        "ffi_submissions": 2880,
+        "native_dot_ms": 96.25142299999999,
+        "max_reported_workspace_bytes": 0
+      },
+      "batch_full_partial": {
+        "median_sum_ms": 368.41404199999994,
+        "ffi_submissions": 120,
+        "prepare_ms": 65.890537,
+        "validate_allocate_ms": 21.616292000000005,
+        "native_dot_ms": 99.39851100000001,
+        "merge_ms": 89.26074100000001,
+        "raw_dot_calls": 2880,
+        "full_partial_bytes": 188612608,
+        "tile_partial_bytes": 100495360,
+        "max_reported_workspace_bytes": 671136
+      },
+      "batch_direct": {
+        "median_sum_ms": 326.16212199999995,
+        "ffi_submissions": 120,
+        "prepare_ms": 62.73984299999999,
+        "validate_allocate_ms": 20.644122000000003,
+        "native_dot_ms": 99.75045399999999,
+        "merge_ms": 61.481646,
+        "raw_dot_calls": 2880,
+        "full_partial_bytes": 0,
+        "tile_partial_bytes": 100495360,
+        "max_reported_workspace_bytes": 605600
+      }
+    },
+    "pv": {
+      "dense": {
+        "median_sum_ms": 160.280377,
+        "ffi_submissions": 1660,
+        "native_dot_ms": 64.833518,
+        "max_reported_workspace_bytes": 0
+      },
+      "qk_mask_skip": {
+        "median_sum_ms": 161.176461,
+        "ffi_submissions": 1660,
+        "native_dot_ms": 66.18143400000001,
+        "max_reported_workspace_bytes": 0
+      },
+      "batch_full_partial": {
+        "median_sum_ms": 171.00775000000002,
+        "ffi_submissions": 60,
+        "prepare_ms": 53.285897,
+        "validate_allocate_ms": 5.868590000000001,
+        "native_dot_ms": 63.13305300000001,
+        "merge_ms": 22.775454999999997,
+        "raw_dot_calls": 1660,
+        "full_partial_bytes": 48221184,
+        "tile_partial_bytes": 48221184,
+        "max_reported_workspace_bytes": 288154
+      },
+      "batch_direct": {
+        "median_sum_ms": 175.863913,
+        "ffi_submissions": 60,
+        "prepare_ms": 54.897027,
+        "validate_allocate_ms": 5.574286,
+        "native_dot_ms": 66.278487,
+        "merge_ms": 24.573428000000007,
+        "raw_dot_calls": 1660,
+        "full_partial_bytes": 0,
+        "tile_partial_bytes": 48221184,
+        "max_reported_workspace_bytes": 288154
+      }
+    }
+  },
+  "repeat_sum_ranges_ms": {
+    "('qk', 'batch_direct')": [
+      321.91612499999997,
+      336.090666
+    ],
+    "('qk', 'dense')": [
+      393.26674799999995,
+      420.8567079999999
+    ],
+    "('qk', 'qk_mask_skip')": [
+      390.02779200000003,
+      415.562875
+    ],
+    "('qk', 'batch_full_partial')": [
+      353.36599700000005,
+      379.961457
+    ],
+    "('pv', 'batch_direct')": [
+      159.44454,
+      188.32396000000003
+    ],
+    "('pv', 'dense')": [
+      155.11912699999996,
+      172.31341600000005
+    ],
+    "('pv', 'qk_mask_skip')": [
+      149.915833,
+      167.514832
+    ],
+    "('pv', 'batch_full_partial')": [
+      159.15466600000002,
+      184.87578900000003
+    ]
+  },
+  "heads_direct_faster_than_dense": {
+    "qk": 15,
+    "pv": 1
+  },
+  "mask_scenarios": [
+    {
+      "scenario": "tail-prefill",
+      "mode": "dense",
+      "actual_mask_matches_positions_and_sequences": true
+    },
+    {
+      "scenario": "prefix",
+      "mode": "dense",
+      "actual_mask_matches_positions_and_sequences": true
+    },
+    {
+      "scenario": "decode",
+      "mode": "dense",
+      "actual_mask_matches_positions_and_sequences": true
+    },
+    {
+      "scenario": "cached-suffix",
+      "mode": "dense",
+      "actual_mask_matches_positions_and_sequences": true
+    },
+    {
+      "scenario": "packed-sequences",
+      "mode": "dense",
+      "actual_mask_matches_positions_and_sequences": true
+    },
+    {
+      "scenario": "tail-prefill",
+      "mode": "batch_direct",
+      "actual_mask_matches_positions_and_sequences": true
+    },
+    {
+      "scenario": "prefix",
+      "mode": "batch_direct",
+      "actual_mask_matches_positions_and_sequences": true
+    },
+    {
+      "scenario": "decode",
+      "mode": "batch_direct",
+      "actual_mask_matches_positions_and_sequences": true
+    },
+    {
+      "scenario": "cached-suffix",
+      "mode": "batch_direct",
+      "actual_mask_matches_positions_and_sequences": true
+    },
+    {
+      "scenario": "packed-sequences",
+      "mode": "batch_direct",
+      "actual_mask_matches_positions_and_sequences": true
+    }
+  ],
+  "qk_fragments": {
+    "dense": {
+      "qk_main_full": 2621440,
+      "qk_main_executed": 2621440,
+      "qk_main_dot_calls": 81920,
+      "qk_upper_full": 5241024,
+      "qk_upper_executed": 5241024,
+      "qk_upper_dot_calls": 163904,
+      "qk_hi_main_full": 2621440,
+      "qk_hi_main_executed": 2621440,
+      "qk_hi_main_dot_calls": 81920,
+      "qk_hi_upper_full": 5241024,
+      "qk_hi_upper_executed": 5241024,
+      "qk_hi_upper_dot_calls": 163904
+    },
+    "batch_direct": {
+      "qk_main_full": 2621440,
+      "qk_main_executed": 1392640,
+      "qk_main_skipped": 1228800,
+      "qk_main_dot_calls": 163840,
+      "qk_upper_full": 5241024,
+      "qk_upper_executed": 2795090,
+      "qk_upper_skipped": 2445934,
+      "qk_upper_dot_calls": 327564,
+      "qk_hi_main_full": 2621440,
+      "qk_hi_main_executed": 1392640,
+      "qk_hi_main_skipped": 1228800,
+      "qk_hi_main_dot_calls": 163840,
+      "qk_hi_upper_full": 5241024,
+      "qk_hi_upper_executed": 2795090,
+      "qk_hi_upper_skipped": 2445934,
+      "qk_hi_upper_dot_calls": 327564
+    }
+  },
+  "aggregation": "Sum of per-capture median GEMM durations: 15 QK and 15 PV heads; one warmup, five rotated-order repeats.",
+  "qk_direct_time_reduction_percent_vs_dense": 18.375081373816037,
+  "qk_direct_time_reduction_percent_vs_existing_skip": 17.938783284122174,
+  "qk_direct_time_reduction_percent_vs_batch_full_partial": 11.468596519999096,
+  "pv_direct_time_increase_percent_vs_dense": 9.722672414228239,
+  "numerical_parity_with_previous_dense_10_chunks": true,
+  "validation": {
+    "ctest_passed": 7,
+    "ctest_total": 7,
+    "real_mask_scenarios": 5,
+    "component_captures": 30
+  },
+  "recommendation": "Retain QK batching/direct accumulation as an opt-in implementation candidate; do not apply the same PV batching by default.",
+  "limitations": [
+    "CPU experimental replay, not Gemmini/IM2P cycles or integrated model latency.",
+    "Batched full-partial control also moves SCU to native code; its gain does not isolate FFI cost alone.",
+    "Prepared reference operands remain int64; native operands are int8 signed nibble codes.",
+    "Overflow beyond the supported int64 accumulator is rejected; arbitrary-width exact merge remains unimplemented.",
+    "Reported batch workspace is a buffer-size upper bound including repeated aliases, not process peak. Legacy values count sparse workspace only.",
+    "Quantization is excluded from component timing; classification, planning, packing, validation, native execution and publication are included."
+  ]
+}

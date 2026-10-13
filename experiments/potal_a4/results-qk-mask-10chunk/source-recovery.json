@@ -1,0 +1,83 @@
+{
+  "source": "Successful file-change records recovered from the prior local Codex session; not a transfer of the nano filesystem.",
+  "session": "01a12634-1e92-76c3-97ce-eef2358e2b98",
+  "base": "f588ad4bb280147a152c0d23f624526fff64d45a",
+  "successful_repo_file_edits": 38,
+  "recovered_files": [
+    {
+      "path": "experiments/potal_a4/native_probe.cpp",
+      "sha256": "133f19e629ca8e9d92d7f2049a7be5120af39ff5373cb1057486192e36e112a4"
+    },
+    {
+      "path": "experiments/potal_a4/run.py",
+      "sha256": "448230db7ce158e78e7747b0db654571e56715ad82f6cb800e26d6674f6054f5"
+    },
+    {
+      "path": "tests/test-potal-a4-reference.py",
+      "sha256": "9e584df3bf50aee94204884a4d8d9e8c94e09c31f9323e4e9a02ba9d7a453932"
+    },
+    {
+      "path": "tests/potal_a4_reference.py",
+      "sha256": "a02f5afc5cac756f091cafe7bff048e5be8db979e0bc7cffb15b100ce941d4a4"
+    },
+    {
+      "path": "experiments/potal_a4/CMakeLists.txt",
+      "sha256": "f030c61c0e9d8c3c99329c62f9fb605d8cf79349d81e74636d3d495c8dc7940b"
+    },
+    {
+      "path": "experiments/potal_a4/im2p_raw_probe.cpp",
+      "sha256": "83c402bccba5b9c290f243a6e0b745adf020c8d705389b35a726e44e8c89a024"
+    },
+    {
+      "path": "experiments/potal_a4/NANO_PROGRESS.md",
+      "sha256": "e7075bae98e8530a408875e769d3aadc25d07ac29e2c3f824afb28d0d2bc95ea"
+    },
+    {
+      "path": "experiments/potal_a4/profile_report.py",
+      "sha256": "22bec0112d7d5fb9e228d0bf27ba6d65b373fbebc7a8aa173cceda73f5f52fe5"
+    },
+    {
+      "path": "tests/test-gemmini-exsia.cpp",
+      "sha256": "3f03b2761fd49d966a217982576e564be2219b52b3794680ff9efb7af5e70b4d"
+    },
+    {
+      "path": "tests/CMakeLists.txt",
+      "sha256": "095ee7c443fbbde39ed52b5c12a34a41b60b2d68934f4f8d6270aa2a3b5ceed2"
+    },
+    {
+      "path": "ggml/src/ggml-gemmini/quants/act/exsia/local.cpp",
+      "sha256": "6c21681b82c32544ad33aed707052ff9aa1b1d3d6574780b3687b130ab2cc0b8"
+    },
+    {
+      "path": "experiments/potal_a4/ORIGINAL_SPEC.md",
+      "sha256": "231bf20a3d7a12eeaeae55bd80c9a50da4d0cad37c98727ba212575ea8a393e5"
+    },
+    {
+      "path": "experiments/potal_a4/IMPLEMENTATION_PLAN.md",
+      "sha256": "8abcbd351a45e76854ce7a5c590d1e5d99f3a7b689228ce0bdc24612ab6d8757"
+    },
+    {
+      "path": "POTAL_NANO_HANDOFF.md",
+      "sha256": "674272763a409f328d4188060845b534149d2f7328c043ed5a98d83d840405e3"
+    },
+    {
+      "path": "experiments/potal_a4/README.md",
+      "sha256": "5bc15ed89831531586305af5b8f27aec5f10d375723a85f95cb71db74b95263a"
+    },
+    {
+      "path": "experiments/potal_a4/profile_gemm.py",
+      "sha256": "d73c0f5365036c40edd329f435aa36bb7194b1da7a411d5c1449696e0b4f619e"
+    },
+    {
+      "path": "experiments/potal_a4/native_model.cpp",
+      "sha256": "388efedcdd83d47a9f0416bfb07064cdc11bdc5a8917b90d1590ea361f71f415"
+    },
+    {
+      "path": "experiments/potal_a4/native_measure.py",
+      "sha256": "83dd5fc3f1ec0fc5fa6c7b09a0629cee27099f2d264ebb6f68fab76f40b6b946"
+    }
+  ],
+  "validation": "All 18 reconstructed source/document files matched the applied recovery byte-for-byte before local QK work.",
+  "limitations": "The initial recovery excluded nano-generated results/captures. Commit 63e166d and its Git evidence have since been imported and verified in nano-sync.json; the separate transfer archive remains unavailable due to SSH authentication.",
+  "verified_nano_commit": "63e166da635bcbedaf9edb8cb84bd3e88851c3dc"
+}

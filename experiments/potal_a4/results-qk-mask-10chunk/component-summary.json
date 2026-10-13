@@ -1,0 +1,202 @@
+{
+  "scope": "Apple M5 CPU integer attention replay components; not Gemmini/IM2P or full-model speedup",
+  "model_sha256": "d483ca08fdfd166b6afba4cf146ea865d51519a80cab01022f7ab71694bc63a5",
+  "text_sha256": "173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08",
+  "tokens_sha256": "26cf9af96d1456e0288323a89ad87bfa5082ffec6075552218294bcd1d015bf5",
+  "report_sha256": "998152eae852ccd870b4cb94327956a36bd9c7a19aea0effab27cc36832bb312",
+  "context": 512,
+  "chunks": 10,
+  "scored_tokens": 2550,
+  "ppl": {
+    "dense": 13.801307254545433,
+    "qk_mask_skip": 13.801307254545433
+  },
+  "warmup_runs_per_mode_per_capture": 1,
+  "measured_runs_per_mode_per_capture": 5,
+  "unchanged_measured_sources_and_libraries": true,
+  "timing_includes": [
+    "mask classification for candidate QK",
+    "tile planning",
+    "native int8 conversion/packing/dot",
+    "host SCU merge and publication",
+    "finite-zero fill",
+    "PV colsum and zero point"
+  ],
+  "timing_excludes": [
+    "common quantization and packet unpacking",
+    "native model forward",
+    "softmax"
+  ],
+  "components": {
+    "qk": {
+      "captures": 15,
+      "dense": {
+        "sum_of_capture_medians_ms": 365.941457,
+        "summed_repeat_ms": [
+          379.180418,
+          375.017251,
+          379.36454,
+          379.773541,
+          373.183292
+        ],
+        "summed_repeat_min_max_ms": [
+          373.183292,
+          379.773541
+        ]
+      },
+      "qk_mask_skip": {
+        "sum_of_capture_medians_ms": 403.154123,
+        "summed_repeat_ms": [
+          404.560205,
+          404.584249,
+          402.836166,
+          407.21471,
+          405.104416
+        ],
+        "summed_repeat_min_max_ms": [
+          402.836166,
+          407.21471
+        ]
+      },
+      "reduction_percent": -10.169021653100096
+    },
+    "pv": {
+      "captures": 15,
+      "dense": {
+        "sum_of_capture_medians_ms": 162.060042,
+        "summed_repeat_ms": [
+          158.880793,
+          157.611125,
+          179.024291,
+          164.287042,
+          166.808127
+        ],
+        "summed_repeat_min_max_ms": [
+          157.611125,
+          179.024291
+        ]
+      },
+      "qk_mask_skip": {
+        "sum_of_capture_medians_ms": 160.476208,
+        "summed_repeat_ms": [
+          155.003166,
+          167.776291,
+          167.232834,
+          164.164456,
+          156.122332
+        ],
+        "summed_repeat_min_max_ms": [
+          155.003166,
+          167.776291
+        ]
+      },
+      "reduction_percent": 0.9773130874543345
+    },
+    "total": {
+      "captures": 30,
+      "dense": {
+        "sum_of_capture_medians_ms": 528.001499,
+        "summed_repeat_ms": [
+          538.061211,
+          532.628376,
+          558.388831,
+          544.060583,
+          539.991419
+        ],
+        "summed_repeat_min_max_ms": [
+          532.628376,
+          558.388831
+        ]
+      },
+      "qk_mask_skip": {
+        "sum_of_capture_medians_ms": 563.630331,
+        "summed_repeat_ms": [
+          559.563371,
+          572.36054,
+          570.069,
+          571.379166,
+          561.226748
+        ],
+        "summed_repeat_min_max_ms": [
+          559.563371,
+          572.36054
+        ]
+      },
+      "reduction_percent": -6.747865691191901
+    }
+  },
+  "qk_fragments": {
+    "qk_main": {
+      "dense": 2621440,
+      "executed": 1392640,
+      "reduction_percent": 46.875
+    },
+    "qk_upper": {
+      "dense": 5241024,
+      "executed": 2795090,
+      "reduction_percent": 46.669009720237874
+    },
+    "qk_hi_main": {
+      "dense": 2621440,
+      "executed": 1392640,
+      "reduction_percent": 46.875
+    },
+    "qk_hi_upper": {
+      "dense": 5241024,
+      "executed": 2795090,
+      "reduction_percent": 46.669009720237874
+    },
+    "total": {
+      "dense": 15724928,
+      "executed": 8375460,
+      "reduction_percent": 46.737689355398004
+    }
+  },
+  "fragment_scope": "Executed per-lane replay dots, DIM32 padded; separate from pooled specification upper fragments",
+  "mask_scenarios": [
+    {
+      "name": "tail-prefill",
+      "mask_matches_actual_positions_and_sequences": true,
+      "qk_main_skipped": 1024
+    },
+    {
+      "name": "prefix",
+      "mask_matches_actual_positions_and_sequences": true,
+      "qk_main_skipped": 0
+    },
+    {
+      "name": "decode",
+      "mask_matches_actual_positions_and_sequences": true,
+      "qk_main_skipped": 0
+    },
+    {
+      "name": "cached-suffix",
+      "mask_matches_actual_positions_and_sequences": true,
+      "qk_main_skipped": 0
+    },
+    {
+      "name": "packed-sequences",
+      "mask_matches_actual_positions_and_sequences": true,
+      "qk_main_skipped": 1024
+    }
+  ],
+  "qk_median_run_breakdown": {
+    "dense": {
+      "gemm_ms": 365.941457,
+      "native_dot_ms": 159.839934,
+      "native_pack_ms": 0.059160000000000004,
+      "ffi_conversion_allocation_ms": 48.500907999999995,
+      "outside_dot_call_ms": 157.541455,
+      "native_dot_calls": 1440
+    },
+    "qk_mask_skip": {
+      "gemm_ms": 403.154123,
+      "native_dot_ms": 95.8862,
+      "native_pack_ms": 0.12492699999999998,
+      "ffi_conversion_allocation_ms": 70.45061,
+      "outside_dot_call_ms": 236.69238599999997,
+      "native_dot_calls": 2880
+    }
+  },
+  "breakdown_scope": "Per capture, select the median GEMM run, then sum its non-overlapping timing categories. Outside-dot-call time includes slicing, masks, allocation, SCU and publication; it is not mask-only overhead."
+}

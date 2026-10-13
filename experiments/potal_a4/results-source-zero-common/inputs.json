@@ -1,0 +1,210 @@
+{
+  "host": "macOS-26.4-arm64-arm-64bit",
+  "base_commit": "63e166da635bcbedaf9edb8cb84bd3e88851c3dc",
+  "a4_only_zero_guard_introduced_in_commit": "63e166da635bcbedaf9edb8cb84bd3e88851c3dc",
+  "a4_only_zero_guard_commit_time": "2026-10-12T13:26:38+09:00",
+  "scope": "ExSIA source-zero policy, CPU product main/RMD and FP attention; A4/W4 and A8/W8",
+  "context": 512,
+  "chunks": 10,
+  "threads": 4,
+  "geometry": [
+    4,
+    4096,
+    1024
+  ],
+  "models": {
+    "4": "/Users/chan/Projects/AISA/llama.cpp-gemmini/models/gpt2.Q4_HP1.gguf",
+    "8": "/Users/chan/Projects/AISA/llama.cpp-gemmini/models/gpt2.Q8_HP1.gguf"
+  },
+  "builds": {
+    "4": "build-potal-qk",
+    "8": "build-exsia-zero-a8"
+  },
+  "before_sha256": {
+    "ggml/src/ggml-gemmini/quants/act/exsia/local.cpp": "6c21681b82c32544ad33aed707052ff9aa1b1d3d6574780b3687b130ab2cc0b8",
+    "tests/test-gemmini-exsia.cpp": "0014c9149979fdb991835f3dd55161bf6c2bf9490c569ae59fb9266f9618b57d",
+    "tests/CMakeLists.txt": "e07ea015718e912eb5374681cf73f6086de9175a027c01d6d32fb450ce14b517",
+    "src/llama-graph.cpp": "8cc3d6058e2dbd163d58ba304cf62483490c1e14ecb0f8b12112f4f0b24c32b5",
+    "wikitext-2-raw/wiki.test.raw": "173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08",
+    "/Users/chan/Projects/AISA/llama.cpp-gemmini/models/gpt2.Q4_HP1.gguf": "a5da4eacdb13197248bac7aea0a9d6e934004d393994833acd70b9d5ef610f1f",
+    "/Users/chan/Projects/AISA/llama.cpp-gemmini/models/gpt2.Q8_HP1.gguf": "cf23a45e4db23736d7d1f67ab42018803a198cfcb01db36daca69ff56bdbc7d4",
+    "build-potal-qk/bin/llama-perplexity": "7e1d255dd2f3e9a00597b9a6084ea7c2b4eeb389f5207155d3255bfe9d1da73d",
+    "build-potal-qk/bin/libggml-gemmini.dylib": "aa4e514b0778a5c2746579edd281b75e6a9dc8b56b5be2a1510ed882d34321e1",
+    "build-potal-qk/bin/libllama.dylib": "b4d02dca202f3277d2a56b59f12fcc9588880f7214b97820c44294f1acde50eb",
+    "build-potal-qk/CMakeCache.txt": "b47ea5aa7a0cd41ad8d7ec7a06522bf3272259ed6ebd2261971dba491186f43a",
+    "build-potal-qk/generated/gemmini_params.h": "54a8a1dab9f97d8eb52f0e60fab0c22852b68e078eb8269e3fcacfaa77bf58c6",
+    "build-exsia-zero-a8/bin/llama-perplexity": "256f20cbefb08a3028db96d745328507303bc23671f72058766eaf7582785a73",
+    "build-exsia-zero-a8/bin/libggml-gemmini.dylib": "7bc25abd4faf88cec35fc3d7c8ac358a395c0406cd7c01ebc889ac3f15ac3b15",
+    "build-exsia-zero-a8/bin/libllama.dylib": "a1c8789697e80a756728c7b331d782bc38f9778ad1b9fb36f59a7df0dd4041e6",
+    "build-exsia-zero-a8/CMakeCache.txt": "583bd215d67b0f8747ab10e745943d67e82c5a70996601f77ba717ebf3386ecf",
+    "build-exsia-zero-a8/generated/gemmini_params.h": "54a8a1dab9f97d8eb52f0e60fab0c22852b68e078eb8269e3fcacfaa77bf58c6"
+  },
+  "regression_before": {
+    "4": {
+      "exit_code": 0,
+      "stdout": "TEST_CASE_BEGIN name=source-zero-sigma\nPASS: case=source-zero-sigma\n"
+    },
+    "8": {
+      "exit_code": 1,
+      "stderr": "FAIL: sigma population excludes signed source zeros, retains rounded zero\n",
+      "stdout": "TEST_CASE_BEGIN name=source-zero-sigma\n"
+    }
+  },
+  "tokenization": {
+    "4": {
+      "argv": [
+        "rtk",
+        "proxy",
+        "build-exsia-zero-a8/bin/llama-tokenize",
+        "-m",
+        "/Users/chan/Projects/AISA/llama.cpp-gemmini/models/gpt2.Q4_HP1.gguf",
+        "-f",
+        "wikitext-2-raw/wiki.test.raw",
+        "--ids",
+        "--no-escape",
+        "--no-parse-special",
+        "--log-disable"
+      ],
+      "tokens_total": 286221,
+      "prefix_tokens": 5120,
+      "file": "a4-tokens.i32",
+      "sha256": "1d3d38a84fb54ffbc5b2af8bb6716351ac7f76a2621b603e141efb4a5a8488ba",
+      "scored_local_positions": [
+        256,
+        510
+      ],
+      "target_local_positions": [
+        257,
+        511
+      ],
+      "per_chunk_scored_tokens": 255
+    },
+    "8": {
+      "argv": [
+        "rtk",
+        "proxy",
+        "build-exsia-zero-a8/bin/llama-tokenize",
+        "-m",
+        "/Users/chan/Projects/AISA/llama.cpp-gemmini/models/gpt2.Q8_HP1.gguf",
+        "-f",
+        "wikitext-2-raw/wiki.test.raw",
+        "--ids",
+        "--no-escape",
+        "--no-parse-special",
+        "--log-disable"
+      ],
+      "tokens_total": 286221,
+      "prefix_tokens": 5120,
+      "file": "a8-tokens.i32",
+      "sha256": "1d3d38a84fb54ffbc5b2af8bb6716351ac7f76a2621b603e141efb4a5a8488ba",
+      "scored_local_positions": [
+        256,
+        510
+      ],
+      "target_local_positions": [
+        257,
+        511
+      ],
+      "per_chunk_scored_tokens": 255
+    }
+  },
+  "ppl_argv_tail": [
+    "--device",
+    "GEMMINI",
+    "-f",
+    "wikitext-2-raw/wiki.test.raw",
+    "-c",
+    "512",
+    "-b",
+    "512",
+    "-ub",
+    "512",
+    "-t",
+    "4",
+    "-tb",
+    "4",
+    "--chunks",
+    "10",
+    "-ngl",
+    "0"
+  ],
+  "environment": {
+    "OMP_NUM_THREADS": "4"
+  },
+  "excluded_runs": {
+    "a4-blas-probe.log": "No explicit device; BLAS captured matmuls instead of ExSIA",
+    "a8-blas-probe.log": "No explicit device; BLAS captured matmuls instead of ExSIA",
+    "a4-openmp-off-probe.log": "GGML_GEMMINI_ENABLE_OPENMP=OFF and LLAMA_CURL=ON differ from the A4 baseline (ON/OFF); excluded from the matched PPL pair"
+  },
+  "timing_use": "No latency claim: PPL runs and builds overlapped.",
+  "after_builds": {
+    "4": "build-potal-qk",
+    "8": "build-exsia-zero-a8",
+    "16": "build-exsia-zero-a16"
+  },
+  "current_source_sha256": {
+    "ggml/src/ggml-gemmini/quants/act/exsia/local.cpp": "b95ecb44a49d2fbeffd84e2525ab719bc349acd6cca986937d481c92ba5ca620",
+    "tests/test-gemmini-exsia.cpp": "8abd104d581dfe2dc996f50ffc787c1cf120ec1d85f442ce1f01a1f8a8ab65d4",
+    "tests/CMakeLists.txt": "e07ea015718e912eb5374681cf73f6086de9175a027c01d6d32fb450ce14b517"
+  },
+  "after_a8_sha256": {
+    "build-exsia-zero-a8/bin/llama-perplexity": "256f20cbefb08a3028db96d745328507303bc23671f72058766eaf7582785a73",
+    "build-exsia-zero-a8/bin/libllama.dylib": "a1c8789697e80a756728c7b331d782bc38f9778ad1b9fb36f59a7df0dd4041e6",
+    "build-exsia-zero-a8/bin/libggml-gemmini.dylib": "44c7b5d21376b1167b8adf8645e703d26368bce380000a4106141d4617debe63"
+  },
+  "after_a4_sha256": {
+    "build-potal-qk/bin/llama-perplexity": "7e1d255dd2f3e9a00597b9a6084ea7c2b4eeb389f5207155d3255bfe9d1da73d",
+    "build-potal-qk/bin/libggml-gemmini.dylib": "f04c42b401b3ece632bbe13939e3ece0b8e4bfd88b929037c24fc95613754d7e",
+    "build-potal-qk/bin/libllama.dylib": "b4d02dca202f3277d2a56b59f12fcc9588880f7214b97820c44294f1acde50eb"
+  },
+  "paired_configuration": {
+    "a4_cmake_cache_sha256_unchanged": true,
+    "a8_cmake_cache_sha256_unchanged": true,
+    "a4_a8_generated_geometry_sha256_unchanged": true,
+    "a4_gemmini_openmp": true,
+    "a8_gemmini_openmp": false,
+    "a4_before_artifacts_verified_after_completion": true
+  },
+  "regression_binary_sha256": {
+    "build-potal-qk/bin/test-gemmini-exsia": "d08ac94875846bddc613e16e99389f7365877236aad30e6bf5dcc76c704ea00c",
+    "build-exsia-zero-a4/bin/test-gemmini-exsia": "4a60c098708452becc04ea2ac5ebb31e9ddae130c5232152025846b7c3262d00",
+    "build-exsia-zero-a8/bin/test-gemmini-exsia": "c7e507165783dbd00c90f92fb3cf197988114af1b7ab50b4c447a8f18a60f0e9",
+    "build-exsia-zero-a16/bin/test-gemmini-exsia": "85320d955570582bb8ef0826eb7794ff1faa0eeda0f5d0579210188d59317bb0"
+  },
+  "source_patch_sha256": "92a9668346483dcb23e521323b6d3c1b04634043ab39712b6b1bd2bf4aafb99c",
+  "regression_after": {
+    "4": {
+      "passed": 9,
+      "failed": 0,
+      "log": "ctest-a4.log",
+      "sha256": "0906ced924865ca3f96a4d2d415896c09e4243de5951be22ddf1565eb092f63a",
+      "source_zero_fixture_cases": 8
+    },
+    "8": {
+      "passed": 14,
+      "failed": 0,
+      "log": "ctest-a8.log",
+      "sha256": "302703403c33c74f65b57c26e010307573aeb9b82aa7ec9be824e5f515603bb9",
+      "source_zero_fixture_cases": 8
+    },
+    "16": {
+      "passed": 9,
+      "failed": 0,
+      "log": "ctest-a16.log",
+      "sha256": "616caae51d9e8129282cbdf4b5ff9aa38b1296ef0f40017a2d383ddc30957365",
+      "source_zero_fixture_cases": 8
+    },
+    "4_openmp": {
+      "passed": 9,
+      "failed": 0,
+      "log": "ctest-a4-openmp.log",
+      "sha256": "7fbbce9a65fa8919524d076c68de328f936f4db351b9ea0c3c7db23b5402d13c",
+      "source_zero_fixture_cases": 8
+    }
+  },
+  "notes": [
+    "Regression-before used the first width-generalized fixture with 0.001f. The final fixture uses 2^-20 for A16 and also tests singleton/one-column and prefilled output cases.",
+    "Initial A4 after build had GGML_GEMMINI_ENABLE_OPENMP=OFF while baseline is ON. Its PPL is excluded from the matched pair; the final A4 measurement rebuilds the original build with its retained options. ctest-a4.log remains valid functional coverage of the OpenMP-OFF build.",
+    "Supported widths are 4,8,16; A16 receives functional regression coverage, paired PPL targets A4/A8."
+  ]
+}
