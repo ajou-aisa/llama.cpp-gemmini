@@ -24,12 +24,25 @@ void OutlierMarker::mark_outlier(StripeState &   stripe,
     }
 }
 
-std::pair<int32_t, int32_t> ResidualClipper::clip_with_residual(int32_t q) {
-    const int32_t qmax    = config::GGML_GEMMINI_ACTIVATION_QMAX;
-    const int32_t qmin    = config::GGML_GEMMINI_ACTIVATION_QMIN;
-    int32_t       clipped = q > qmax ? qmax : (q < qmin ? qmin : q);
-    int32_t       res     = q - clipped;
-    return {clipped, res};
+std::pair<int32_t, int32_t> ResidualClipper::clip_with_residual(int32_t q, bool decompose) {
+    constexpr int32_t qmax = config::GGML_GEMMINI_ACTIVATION_QMAX;
+    constexpr int32_t qmin = config::GGML_GEMMINI_ACTIVATION_QMIN;
+    const int32_t     sat  = q > qmax ? qmax : (q < qmin ? qmin : q);
+    if (!decompose)
+        return {sat, 0};
+    // u = sum_l L_l 2^(n l) with signed n-bit limbs. L0 is the balanced low digit, so it fits the
+    // dense operand, and u - L0 is a multiple of 2^n: the RMD builders see lane 0 == 0 and stack
+    // only L_{l>=1}.
+    constexpr uint32_t radix = uint32_t{1} << GGML_GEMMINI_ACTIVATION_BITS;
+    constexpr uint32_t half  = radix / 2;
+    const int32_t      l0  = static_cast<int32_t>((static_cast<uint32_t>(q) + half) & (radix - 1)) -
+                             static_cast<int32_t>(half);
+    const int64_t      res = static_cast<int64_t>(q) - l0;
+    // q in [INT32_MAX - half + 1, INT32_MAX] has a negative L0 that pushes u - L0 past INT32
+    // (shift_q_i32 saturates to INT32_MAX, so this is reachable); saturation is exact there too.
+    if (res > std::numeric_limits<int32_t>::max())
+        return {sat, q - sat};
+    return {l0, static_cast<int32_t>(res)};
 }
 
 bool StripeFolding::run(Meta &                           meta,
@@ -124,14 +137,15 @@ bool StripeFolding::run(Meta &                           meta,
                 const size_t  padded_idx = local_row * state.K_padded + col;
                 const int32_t q_shifted =
                     detail::shift_q_i32(stripe_q_wide[padded_idx], delta_theta_b);
-                const auto [q8, res] = unit_clip_.clip_with_residual(q_shifted);
+                const bool outlier = col < args.K && stripe.outlier_mask.is_set(local_row, col);
+                // Outliers and promoted top blocks keep their low limb in the dense operand and
+                // carry the higher limbs as residual; every other position saturates.
+                const auto [q8, residual_i32] = unit_clip_.clip_with_residual(q_shifted, outlier);
 
                 if (col < args.K)
                     if (!args.A.set(r, col, q8))
                         return false;
 
-                const bool    outlier = col < args.K && stripe.outlier_mask.is_set(local_row, col);
-                const int32_t residual_i32 = outlier ? res : 0;
 #if GGML_GEMMINI_ACT_QUANT_METRICS
                 if (col < args.K && args.evaluation_context)
                     args.evaluation_context->position(r, col, outlier, residual_i32 != 0);

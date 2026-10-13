@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <chrono>
 #include <charconv>
 #include <cstring>
@@ -376,6 +377,60 @@ bool capture_geometry_publication(void *                                       o
     trace.direct_handles += event.direct_residual != nullptr ? 1 : 0;
     trace.packet_handles += event.rmd_packet != nullptr ? 1 : 0;
     return true;
+}
+
+// Algorithm lines 11-13: an outlier's folded value u splits into signed n-bit limbs; L0 stays in
+// the dense operand and only u - L0 (a multiple of 2^n, so lane 0 is empty) becomes residual.
+bool test_outlier_limb_policy() {
+#if GGML_GEMMINI_ENABLE_RMD
+    constexpr size_t           columns = 32;
+    constexpr size_t           outlier = 5;
+    constexpr int32_t          radix   = int32_t{1} << GGML_GEMMINI_ACTIVATION_BITS;
+    std::array<float, columns> source{};
+    source.fill(1.0f);
+    source[outlier] = 301.0f;
+    ggml_tensor tensor{};
+    tensor.type = GGML_TYPE_F32;
+    tensor.data = source.data();
+
+    ggml_gemmini_args_t args{};
+    args.I                          = 1;
+    args.J                          = 1;
+    args.K                          = columns;
+    args.sA                         = columns;
+    args.tile_I                     = 1;
+    args.tile_J                     = 1;
+    args.tile_K                     = 1;
+    args.activation_rows_per_stripe = DIM;
+    args.residual_route             = residual::ResidualRoute::ws_packet;
+    if (!args.A.allocate(1, columns, GGML_GEMMINI_ACTIVATION_BITS))
+        return false;
+
+    quants::act::exsia::Meta  meta;
+    quants::act::exsia::ExSIA exsia;
+    if (!check(exsia.run(meta, &tensor, args) && !meta.theta.empty(),
+               "outlier limb run succeeds"))
+        return false;
+    const auto &  state    = exsia.state();
+    const int32_t low      = args.A.get(0, outlier);
+    const int32_t residual = state.residual.at(outlier);
+    const double  restored = std::ldexp(static_cast<double>(low) + residual, meta.theta.front());
+    bool          inliers_dense = true;
+    for (size_t column = 0; column < columns; ++column)
+        if (column != outlier)
+            inliers_dense = inliers_dense && state.residual.at(column) == 0;
+    bool lane0_free = !meta.rmd_packets.empty();
+    for (const auto & packet : meta.rmd_packets)
+        for (const auto & block : packet->blocks)
+            lane0_free = lane0_free && (block.active_lane_mask & 1u) == 0;
+    return check(residual != 0 && residual % radix == 0,
+                 "outlier keeps its low limb in the dense operand") &&
+           check(restored == 301.0, "low limb plus residual restores the folded outlier") &&
+           check(inliers_dense, "inliers carry no residual") &&
+           check(lane0_free, "residual packets never carry lane 0");
+#else
+    return true;
+#endif
 }
 
 bool test_activation_stripe_geometry_contract() {
@@ -3516,7 +3571,7 @@ int main(int argc, char ** argv) {
                        case_name == "hp1-srmd-software-ws" || case_name == "rmd-direct-parity" ||
                        case_name == "direct-executor" || case_name == "rmd-gather" ||
                        case_name == "stripe-geometry" || case_name == "meta-rho" ||
-                       case_name == "non-outlier-clipping" ||
+                       case_name == "non-outlier-clipping" || case_name == "outlier-limb" ||
                        case_name == "non-exsia-capture-context" || case_name == "packet-capture";
     if (!known) {
         std::fprintf(stderr, "unknown case: %s\n", case_name.c_str());
@@ -3526,8 +3581,9 @@ int main(int argc, char ** argv) {
     std::printf("TEST_CASE_BEGIN name=%s\n", case_name.c_str());
     const bool ok =
         (case_name == "all" && test_meta_rho_invariant() && test_non_exsia_capture_context() &&
-         test_non_outlier_clipping_policy() && test_exsia_packet_capture() &&
-         test_exsia_baseline() && test_dispatch_modes() && test_compiled_width_rmd_suite() &&
+         test_non_outlier_clipping_policy() && test_outlier_limb_policy() &&
+         test_exsia_packet_capture() && test_exsia_baseline() && test_dispatch_modes() &&
+         test_compiled_width_rmd_suite() &&
          test_direct_cpu_executor() && test_activation_stripe_geometry_contract() &&
          test_cpu_direct_residual_dequantization()) ||
         (case_name == "baseline" && test_exsia_baseline()) ||
@@ -3545,6 +3601,7 @@ int main(int argc, char ** argv) {
         (case_name == "meta-rho" && test_meta_rho_invariant()) ||
         (case_name == "non-exsia-capture-context" && test_non_exsia_capture_context()) ||
         (case_name == "non-outlier-clipping" && test_non_outlier_clipping_policy()) ||
+        (case_name == "outlier-limb" && test_outlier_limb_policy()) ||
         (case_name == "rmd-gather" && test_rmd_weight_gather());
     if (ok)
         std::printf("PASS: case=%s\n", case_name.c_str());

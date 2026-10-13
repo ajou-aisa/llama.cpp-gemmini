@@ -26,7 +26,10 @@ class OutlierMarker {
 
 class ResidualClipper {
   public:
-    std::pair<int32_t, int32_t> clip_with_residual(int32_t q);
+    // decompose == false: saturate to the activation range, residual is 0.
+    // decompose == true: split the folded value u into signed n-bit limbs and return
+    // {L0, u - L0}; the caller keeps L0 in the dense operand and stacks u - L0 as residual.
+    std::pair<int32_t, int32_t> clip_with_residual(int32_t q, bool decompose);
 };
 
 class StripeFolding {

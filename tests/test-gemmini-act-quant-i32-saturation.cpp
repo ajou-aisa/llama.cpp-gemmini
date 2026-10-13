@@ -93,13 +93,16 @@ static bool check_saturated_reconstruction(const char *                name,
                 residual += event.residual;
         }
     }
-    const int32_t clipped = expected < 0 ? ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_QMIN
-                                         : ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_QMAX;
-    if (args.A.get(0, outlier_k) != clipped ||
-        static_cast<int64_t>(clipped) + residual != expected) {
+    // ExSIA commits the outlier's low limb (or the saturated value where INT32_MAX leaves no
+    // room for a negative low limb); the other quantizers commit the saturated value. Either
+    // way the committed activation plus the residual payload restores the endpoint exactly.
+    const int32_t committed = args.A.get(0, outlier_k);
+    if (committed < ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_QMIN ||
+        committed > ggml::gemmini::config::GGML_GEMMINI_ACTIVATION_QMAX ||
+        static_cast<int64_t>(committed) + residual != expected) {
         std::fprintf(
             stderr,
-            "FAIL: %s clipped activation plus residual did not reconstruct INT32 endpoint\n",
+            "FAIL: %s committed activation plus residual did not reconstruct INT32 endpoint\n",
             name);
         return false;
     }
