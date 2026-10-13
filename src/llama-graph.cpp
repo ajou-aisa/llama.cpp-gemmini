@@ -1247,6 +1247,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     } else {
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
 
+        // QK scheduling needs the exact softmax mask and its graph lifetime.
+        // Dense MUL_MAT kernels ignore this optional dependency.
+        kq->src[2] = kq_mask;
+
         // note: this op tends to require high floating point range
         //       while for some models F16 is enough, for others it is not, so we default to F32 here
         ggml_mul_mat_set_prec(kq, GGML_PREC_F32);

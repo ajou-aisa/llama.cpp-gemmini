@@ -1,5 +1,6 @@
 #include "llama.h"
 #include "ggml-backend.h"
+#include "raw_batch.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -8,6 +9,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -22,7 +24,8 @@ static void require(bool condition, const char * message) {
 // Original floating-point dots still execute, so decode wall time is NOT a
 // measurement of an integrated optimized attention backend.
 using replay_hook = int (*)(int, int, const float *, const float *, float *,
-                            const int64_t *, const int64_t *, const int64_t *, void *);
+                            const int64_t *, const int64_t *, const int64_t *,
+                            const float *, const int64_t *, void *);
 
 static thread_local std::string replay_error;
 
@@ -70,9 +73,18 @@ static bool replay_callback(ggml_tensor * t, bool ask, void * opaque) {
         require(t->ne[3] == 1, "Replay currently requires one sequence");
         auto stationary = tensor_values(t->src[0]);
         auto streamed = tensor_values(t->src[1]);
+        const auto * mask = role == 0 ? t->src[2] : nullptr;
+        std::vector<float> mask_values;
+        if (role == 0) {
+            require(mask && mask->ne[0] == t->ne[0] && mask->ne[1] >= t->ne[1] &&
+                    mask->ne[2] == 1 && mask->ne[3] == 1,
+                    "QK replay requires the graph's broadcast softmax mask");
+            mask_values = tensor_values(mask);
+        }
         std::vector<float> output(ggml_nelements(t));
         require(session.hook(role, session.callbacks / 2, stationary.data(), streamed.data(), output.data(),
-                             t->src[0]->ne, t->src[1]->ne, t->ne, session.data) == 0,
+                             t->src[0]->ne, t->src[1]->ne, t->ne,
+                             mask ? mask_values.data() : nullptr, mask ? mask->ne : nullptr, session.data) == 0,
                 "Attention replay hook failed");
         ggml_backend_tensor_set(t, output.data(), 0, output.size()*sizeof(float));
         ++session.callbacks;
@@ -86,9 +98,13 @@ static bool replay_callback(ggml_tensor * t, bool ask, void * opaque) {
 
 extern "C" const char * potal_replay_error() { return replay_error.c_str(); }
 
-extern "C" void * potal_replay_open(const char * path, int count, int threads, replay_hook hook, void * data) {
+extern "C" int potal_replay_abi_version() { return 2; }
+
+extern "C" void * potal_replay_open(const char * path, int count, int threads, int max_sequences,
+                                    replay_hook hook, void * data) {
     try {
         require(count >= 32 && count <= 1024, "Context outside 32..1024");
+        require(max_sequences > 0 && max_sequences <= count, "Invalid sequence capacity");
         ggml_backend_load_all();
         llama_backend_init();
         auto session = std::make_unique<replay_session>();
@@ -100,6 +116,7 @@ extern "C" void * potal_replay_open(const char * path, int count, int threads, r
         session->data = data;
         auto cp = llama_context_default_params();
         cp.n_ctx = cp.n_batch = cp.n_ubatch = count;
+        cp.n_seq_max = max_sequences;
         cp.n_threads = cp.n_threads_batch = threads;
         cp.type_k = cp.type_v = GGML_TYPE_F32;
         cp.flash_attn = false;
@@ -126,21 +143,50 @@ extern "C" const float * potal_replay_logits(void * handle) {
     return llama_get_logits(static_cast<replay_session *>(handle)->context.get());
 }
 
-extern "C" int potal_replay_eval(void * handle, const int32_t * tokens, int count, double * nll) {
-    auto & session = *static_cast<replay_session *>(handle);
+static void replay_decode(replay_session & session, const int32_t * tokens, int count,
+                          const int32_t * positions, const int32_t * sequences,
+                          bool clear_kv, bool all_outputs) {
+    require(count > 0 && unsigned(count) <= llama_n_batch(session.context.get()), "Invalid batch size");
     auto batch = llama_batch_init(count, 0, 1);
     try {
         session.callbacks = 0;
         session.failed = false;
-        llama_kv_self_clear(session.context.get());
+        if (clear_kv) llama_kv_self_clear(session.context.get());
         batch.n_tokens = count;
         for (int i = 0; i < count; ++i) {
-            batch.token[i] = tokens[i]; batch.pos[i] = i; batch.n_seq_id[i] = 1;
-            batch.seq_id[i][0] = 0; batch.logits[i] = i >= count/2 && i < count-1;
+            batch.token[i] = tokens[i];
+            batch.pos[i] = positions ? positions[i] : i;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = sequences ? sequences[i] : 0;
+            batch.logits[i] = all_outputs || (i >= count/2 && i < count-1);
         }
         require(llama_decode(session.context.get(), batch) == 0 && !session.failed, "Replay decode failed");
         if (session.hook) require(session.callbacks == 2*llama_model_n_layer(session.model.get()),
                                   "Missing attention replay callbacks");
+    } catch (...) {
+        llama_batch_free(batch);
+        throw;
+    }
+    llama_batch_free(batch);
+}
+
+extern "C" int potal_replay_step(void * handle, const int32_t * tokens, const int32_t * positions,
+                                  const int32_t * sequences, int count, int clear_kv) {
+    auto & session = *static_cast<replay_session *>(handle);
+    try {
+        replay_decode(session, tokens, count, positions, sequences, clear_kv != 0, true);
+        return session.callbacks;
+    } catch (const std::exception & error) {
+        if (!session.failed) replay_error = error.what();
+        return -1;
+    }
+}
+
+extern "C" int potal_replay_eval(void * handle, const int32_t * tokens, int count, double * nll) {
+    auto & session = *static_cast<replay_session *>(handle);
+    try {
+        require(count >= 4, "PPL requires at least four tokens");
+        replay_decode(session, tokens, count, nullptr, nullptr, true, false);
         const int vocabulary = potal_replay_vocabulary(handle);
         for (int row = count/2; row < count-1; ++row) {
             const auto * logits = llama_get_logits_ith(session.context.get(), row);
@@ -150,12 +196,23 @@ extern "C" int potal_replay_eval(void * handle, const int32_t * tokens, int coun
             for (int col = 0; col < vocabulary; ++col) total += std::exp(double(logits[col])-maximum);
             nll[row-count/2] = std::log(total)+maximum-logits[tokens[row+1]];
         }
-        llama_batch_free(batch);
         return session.callbacks;
     } catch (const std::exception & error) {
         if (!session.failed) replay_error = error.what();
-        llama_batch_free(batch);
         return -1;
+    }
+}
+
+static void dense_raw_dot(const int8_t * a, const int8_t * b, int32_t * out,
+                          int m, int k, int n, int a_stride, int b_stride, int out_stride) {
+    for (int i = 0; i < m; ++i) {
+        auto * target = out + size_t(i)*out_stride;
+        std::fill(target, target+n, 0);
+        for (int r = 0; r < k; ++r) {
+            const int32_t value = a[size_t(i)*a_stride+r];
+            const auto * source = b + size_t(r)*b_stride;
+            for (int j = 0; j < n; ++j) target[j] += value*source[j];
+        }
     }
 }
 
@@ -180,16 +237,10 @@ extern "C" int potal_replay_dot(const int8_t * a, const int8_t * b, int32_t * ou
         row_start.push_back(entries.size());
     }
     auto packed = clock::now();
-    std::fill(out, out+size_t(m)*n, 0);
-    for (int i = 0; i < m; ++i) {
+    if (!mode) dense_raw_dot(a, b, out, m, k, n, k, n, n);
+    else for (int i = 0; i < m; ++i) {
         auto * target = out+size_t(i)*n;
-        if (!mode) {
-            for (int r = 0; r < k; ++r) {
-                const int32_t value = a[i*k+r];
-                const auto * source = b+size_t(r)*n;
-                for (int j = 0; j < n; ++j) target[j] += value*source[j];
-            }
-        } else {
+        std::fill(target, target+n, 0);
             for (uint32_t p = row_start[i]; p < row_start[i+1]; ++p) {
                 const auto * source = b+size_t(entries[p].column)*n;
                 const int32_t value = entries[p].value;
@@ -201,7 +252,6 @@ extern "C" int potal_replay_dot(const int8_t * a, const int8_t * b, int32_t * ou
                     for (int j = 0; j < n; ++j) target[j] += value*source[j];
                 }
             }
-        }
     }
     auto end = clock::now();
     stats[0] = std::chrono::duration_cast<std::chrono::nanoseconds>(packed-begin).count();
@@ -209,6 +259,21 @@ extern "C" int potal_replay_dot(const int8_t * a, const int8_t * b, int32_t * ou
     stats[2] = entries.size()*sizeof(entry)+row_start.size()*sizeof(uint32_t);
     stats[3] = entries.capacity()*sizeof(entry)+row_start.capacity()*sizeof(uint32_t);
     return 0;
+}
+
+extern "C" size_t potal_replay_work_size() { return sizeof(replay_work); }
+
+// Each work item is one original K block / lane / stationary pass. Scaling
+// remains outside the raw dot; even the benchmark's full-partial mode is wide.
+extern "C" int potal_replay_batch(const replay_work * work, int count, int rows, int columns,
+                                  int direct, int64_t * out, uint64_t * stats) {
+    try {
+        execute_replay_batch(work, count, rows, columns, direct, out, stats, dense_raw_dot);
+        return 0;
+    } catch (const std::exception & error) {
+        replay_error = error.what();
+        return -1;
+    }
 }
 
 #ifndef POTAL_NATIVE_LIBRARY
