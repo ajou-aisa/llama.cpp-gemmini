@@ -717,6 +717,41 @@ bool run_compact_dense_parity(bool hp1) {
                     dense_probe.domain);
     return ok;
 }
+
+bool run_dense_scu_stripe() {
+    if (!run_aware_backend()) return true;
+    Sim sim(im2p_sim_create());
+    if (!check(bool(sim), "SCU stripe simulator allocation")) return false;
+    std::array<int8_t, 2*96> activations{};
+    std::fill_n(activations.begin(), 65, int8_t{1});
+    std::fill_n(activations.begin()+96, 65, int8_t{-1});
+    std::array<int32_t, 65*3> weights;
+    weights.fill(1);
+    for (size_t k = 32; k < 64; ++k) weights[k*3+2] = -1;
+    const std::array<uint32_t, 9> carriers{0, 2, 0x80000000u, 1, 1, 30, 2, 0, 0};
+    detail::Im2pCompactDot dot;
+    dot.operand_bits = GGML_GEMMINI_ACTIVATION_BITS;
+    dot.activations = activations.data();
+    dot.rows = 2;
+    dot.activation_row_stride_bytes = 96;
+    dot.weights = weights.data();
+    dot.columns = 3;
+    dot.weight_row_stride = 3;
+    dot.k = 65;
+    dot.scu_carriers = carriers.data();
+    dot.vector_op = IM2P_VECTOR_LEFT_SHIFT;
+    std::array<int64_t, 6> output{};
+    detail::Im2pProviderStatsAggregate stats;
+    const auto status = detail::execute_im2p_compact_dot(sim.get(), dot, output.data(), 3, stats);
+    const std::array<int64_t, 6> expected{100, 193, int64_t(INT32_MIN)+1,
+                                         -100, -193, int64_t(INT32_MAX)-1};
+    const bool ok = check(status == RmdStatus::success && output == expected &&
+                              (!hp1_backend() || stats.stats.work_total_cycles() > 0),
+                          "whole stripe uses all three block/column carriers and saturated K accumulation");
+    if (ok) std::printf("IM2P_PROVIDER dense-scu-stripe k=65 op=5 raw_cycles=%llu\n",
+                         static_cast<unsigned long long>(stats.stats.work_total_cycles()));
+    return ok;
+}
 #endif
 
 bool original_packet_digit(const StripePacket &    packet,
@@ -2589,6 +2624,8 @@ int main(int argc, char ** argv) {
 #if GGML_GEMMINI_WEIGHT_BITS == 4 || GGML_GEMMINI_WEIGHT_BITS == 8
     if (selected == "all" || selected == "compact-dense-parity")
         ok = run_compact_dense_parity(true) && ok;
+    if (selected == "all" || selected == "dense-scu-stripe")
+        ok = run_dense_scu_stripe() && ok;
 #endif
     if (selected == "all" || selected == "provider-read-failure")
         ok = run_fault(Im2pProviderTestFault::read_failure,
@@ -2700,11 +2737,12 @@ int main(int argc, char ** argv) {
         selected == "h0-compact-rejection")
         ok = run_route(selected == "all" ? "route-matched" : selected) && ok;
 
-    constexpr std::array<std::string_view, 36> valid{{"all",
+    constexpr std::array<std::string_view, 37> valid{{"all",
                                                       "success",
                                                       "hp1-success",
                                                       "h1-scu-contract",
                                                       "compact-dense-parity",
+                                                      "dense-scu-stripe",
                                                       "provider-read-failure",
                                                       "provider-write-failure",
                                                       "provider-watchdog",

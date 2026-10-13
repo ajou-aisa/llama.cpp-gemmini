@@ -7,12 +7,29 @@
 INT, `CYCLE_SIM=0`이다. F32 Q/P와 F32/F16 K/V, GQA 및 strided cache view를
 지원한다. `--no-kv-offload`와 flash attention 경로는 이 기능을 사용하지 않는다.
 
+4D QK/PV 노드는 backend 안에서 batch/head별 2D 연산으로 나뉜다.
+GQA는 `kv_head = query_head / (Q_head수 / KV_head수)`로 대응하며,
+batch broadcast도 같은 방식이다. K/V 양자화는 KV batch/head마다 한 번 수행한다.
+아래 `verify --backend`는 서로 다른 KV batch와 MHA/GQA/MQA를 각각 별도 2D
+노드로 실행해 결과와 main/residual 호출·fragment 수를 대조한다.
+
 이 경로는 기존 ExSIA LocalStage(rho 6), WideQuantizer, RMD bitmap/stack,
-`execute_im2p_compact_dot`을 사용한다. main과 모든 residual은 signed nibble을
-int8에 담아 PE에 전달한다. K는 두 패스, V는 한 패스이며 BK/column/lane별
-보정은 raw dot 뒤 checked int64로 누적한다. PV의 weighted colsum은 KV head마다
-한 번 준비해 GQA query head에 재사용한다. int64 범위를 넘는 누적은 명시적으로
-실패하고 output을 게시하지 않는다. 임의 정밀도 fallback은 아직 없다.
+compact-dot 및 run-aware provider를 사용한다. main과 모든 residual은 signed
+nibble을 int8에 담아 PE에 전달한다. K는 두 패스, V는 한 패스다.
+
+stationary scale을 열별 기준 지수와 BK32별 비음수 offset으로 분해한다.
+main은 stripe 전체 K를 한 planned 요청으로 전달하고, residual은 기존 RMD의
+전역 `(lane,row)` stack 및 원래 K-block을 보존하는 run-aware 요청을 사용한다.
+두 요청 모두 `IM2P_VECTOR_LEFT_SHIFT` / `IM2P_OUTPUT_SCU_FINAL` 경로로 보내며,
+array 뒤 SCU가 block offset을 적용한 다음 INT32 accumulator가 K 방향으로
+누산한다. host는 그 결과에 lane/nibble radix와 최종 stripe/column scale을 적용한다.
+전부 0인 stationary block에는 기존 `zero_carrier`를 사용한다.
+
+PV의 weighted colsum은 KV batch/head마다 한 번 준비해 GQA query head에
+재사용한다. host INT64 범위를 넘으면 실패하고 output과 counter를 게시하지
+않는다. SCU와 accumulator의 INT32 포화는 실제 HP1 계약을 따른다. 따라서
+극단적인 지수 차이에서는 무한 범위 또는 INT64-only reference와 다를 수 있다.
+경계 테스트는 이 포화 순서를 별도로 검사한다.
 
 아래는 Nano의 기존 호환 source/artifact가 보존된 경우의 설정이다. IM2P의
 manifest·frontend ABI 검사를 통과해야 하며, cache가 없으면
@@ -30,7 +47,11 @@ rtk proxy cmake -S . -B build-potal-attention-hp1 -DCMAKE_BUILD_TYPE=Release \
   -DGGML_GEMMINI_DIM=32 -DGGML_GEMMINI_BLOCK_SIZE=32 \
   -DGGML_GEMMINI_ENABLE_A4NKS_ATTENTION=ON -DCYCLE_SIM=0 -DLOG_CYCLE=0 \
   -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF
-rtk proxy cmake --build build-potal-attention-hp1 --target llama test-gemmini-matmul -j2
+rtk proxy cmake --build build-potal-attention-hp1 \
+  --target llama test-gemmini-matmul test-gemmini-rmd-im2p-provider -j2
+rtk proxy ctest --test-dir build-potal-attention-hp1 \
+  -R '^(test-gemmini-attention|test-gemmini-rmd-im2p-provider-dense-scu-stripe)$' \
+  --output-on-failure
 rtk proxy /tmp/potal-nano-venv/bin/python -m experiments.potal_a4.verify \
   --backend build-potal-attention-hp1/bin/test-gemmini-matmul \
   --require-rtl --repeats 5 --report output/potal-backend-attention-rtl.json
@@ -43,11 +64,17 @@ rtk proxy /tmp/potal-nano-venv/bin/python -m experiments.potal_a4.verify \
 RTL cycle이며 host 양자화·누적 시간을 포함하지 않는다. 시뮬레이터 wall time을
 NPU latency로 해석하지 않는다. `--require-rtl`은 cycle이 0이면 실패한다.
 
-`main_dots`는 K의 두 dense nibble 패스를 모두 포함한 raw 호출 수다.
-fragment 집계에서는 명세대로 K-high를 residual에 넣는다. residual fragment는
-기존 RMD의 실제 블록별 stacked row/column 패딩으로 세므로, 명세 D의 stripe
-전체 합집합으로 계산한 reference 비용과 같다고 가정하지 않는다. `add_ops`는
-GQA에서 재사용한 실제 KV colsum과 각 query head의 zero-point broadcast를 센다.
+`main_dots`는 K의 두 dense nibble 패스를 모두 포함한 stripe 요청 수다.
+`residual_dots`는 nonempty residual stripe의 run-aware 요청 수다. K-block 수를
+곱하지 않는다. fragment 집계에서는 명세대로 K-high를 residual에 넣는다.
+residual은 stripe 전체의 활성 `(lane,row)` 합집합과 BK별 compact K를 DIM
+패딩하며, 독립 Python packet의 명세 D 비용과 대조한다. `add_ops`는 GQA에서
+재사용한 실제 KV colsum과 각 query head의 zero-point broadcast를 센다.
+
+현재 main과 residual은 별도 planned 요청이다. 논문의 K-tile별 main/residual
+교대 실행과 두 요청 사이 scratchpad weight 재사용은 아직 연결하지 않았다.
+시뮬레이터 수명은 기존처럼 QK/PV 노드 단위다. 이 항목들과 native QK tile skip은
+SCU 경로의 실제 RTL 검증 이후 최적화 대상으로 남는다.
 
 CPU 기능 검사는 같은 옵션에서 `OPTION=CPU`, `EXECUTION_BACKEND=HARDWARE`를
 사용하고 IM2P 옵션과 `--require-rtl`을 생략한다. 이때 `raw_cycles=0`이다.

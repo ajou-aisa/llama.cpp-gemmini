@@ -1750,9 +1750,35 @@ static bool test_attention() {
     }
     for (int64_t role : {0, 1}) {
         const std::array<int64_t, 10> shape{role, 64, 1, 1, 1, 1, 1, 1, 0, 0};
+        std::vector<float> weights(64), inputs(64, role == 0 ? 1.0f : 0.25f);
+        std::fill(weights.begin()+32, weights.end(), 0x1p40f);
+        std::vector<float> expected{std::ldexp(role == 0 ? 32.0f : 8.0f, 40)};
+        if (!attention_case(shape, weights, inputs, expected)) return false;
+    }
+    for (int64_t role : {0, 1}) {
+        const std::array<int64_t, 10> shape{role, 64, 1, 1, 1, 1, 1, 1, 0, 0};
         std::vector<float> weights(64, 0x1p-80f), inputs(64, 1.0f), expected(1);
         std::fill(weights.begin()+32, weights.end(), 0x1p80f);
-        if (!attention_case(shape, weights, inputs, expected, true)) return false;
+        if (role == 0) expected[0] = std::ldexp(float(INT32_MAX), -84);
+        if (!attention_case(shape, weights, inputs, expected, role == 1)) return false;
+    }
+    {
+        const std::array<int64_t, 10> shape{0, 96, 2, 1, 1, 1, 1, 1, 0, 0};
+        std::vector<float> weights(192), inputs(96, 65.0f/64.0f);
+        for (size_t j = 0; j < 2; ++j) {
+            std::fill_n(weights.begin()+j*96, 32, std::ldexp(1.0f, 24+20*j));
+            std::fill_n(weights.begin()+j*96+32, 32, -std::ldexp(1.0f, 24+20*j));
+            std::fill_n(weights.begin()+j*96+64, 32, std::ldexp(1.0f, 20*j));
+        }
+        const std::vector<float> expected{32.43359375f, std::ldexp(32.43359375f, 20)};
+        if (!attention_case(shape, weights, inputs, expected)) return false;
+    }
+    {
+        const std::array<int64_t, 10> shape{0, 160, 1, 1, 1, 1, 1, 1, 0, 0};
+        std::vector<float> weights(160, 0x1p21f), inputs(160, 1.0f), expected{67108896.0f};
+        std::fill(weights.begin()+96, weights.begin()+128, -0x1p21f);
+        std::fill(weights.begin()+128, weights.end(), 1.0f);
+        if (!attention_case(shape, weights, inputs, expected)) return false;
     }
     return true;
 }

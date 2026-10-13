@@ -13,7 +13,8 @@ struct AttentionMetrics {
 };
 
 bool attention_supported(const ggml_tensor * op);
-// Raw signed INT4 dots, then exact block/column/lane scaling on the host.
+// Signed INT4 GEMMs use the post-array SCU and INT32 accumulation across K;
+// the host applies only radix weights and the final stripe/column scale.
 // Both output and metrics are published only after the whole node succeeds.
 rmd::RmdStatus attention_execute(ggml_tensor * op, AttentionMetrics & metrics);
 

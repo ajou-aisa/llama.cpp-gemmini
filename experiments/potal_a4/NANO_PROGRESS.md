@@ -1,5 +1,100 @@
 # Nano continuation
 
+## Attention SCU stripe execution (2026-10-13)
+
+This replaces the per-BK raw-dot/host-scale execution described in the earlier
+native-backend entries below. Quantization, batch/head routing and projection
+execution are retained. Native QK/PV now submit signed nibble values through
+the existing IM2P `LEFT_SHIFT` / `SCU_FINAL` path. Column bases are the minimum
+nonzero stationary-block exponents; zero blocks use the existing zero carrier.
+The post-array SCU applies each original BK32/column offset before the INT32
+accumulator reduces K. Main and residual have separate accumulations. The host
+combines nibble/limb radix weights in checked INT64, adds the PV zero point and
+applies the final stripe/column scale.
+
+Main uses one planned full-K request per stripe/pass. Residual uses the existing
+run-aware request and its global `(lane,row)` stack. Its activation-only packing
+was extracted for runtime K/V; the existing projection request uses that same
+implementation. Compact runs retain original block IDs and local K coordinates.
+The provider scale callback now reads the complete `[ceil(K/32), N] carrier
+matrix. No new packet format, PE arithmetic, RTL or mask optimization was added.
+
+All 93 native CPU fixtures match independent reconstructed-operand FP64 outputs,
+including MHA/GQA/MQA batches, separate 2D nodes, F16/strided K/V, K tails, zero P
+and captured GPT-2/Llama heads. Calls, spec-D padded fragments and add counts
+also match independent packets. SCU boundary cases separately verify per-column
+factorization, zero-block carriers, shift saturation and accumulation saturation
+before the host radix merge. The attention/run-aware tests and four existing
+projection/ExSIA regression tests pass.
+
+The existing IM2P CPU-functional provider was built in an isolated output tree
+using Nano's compatible source `20b82f058aa8b0e69c48d1d00790d8e19eaa6f66`.
+Dense K65 with three carrier blocks, run-aware cross-block execution, cross-run
+INT32 saturation and dispatch parity all pass (4/4). This executes the real
+provider API/frontend but is **not RTL** and reports zero cycles. The local
+`5da6a4c` frontend build failed because it still references removed `q4_h1` /
+`q8_h1` types; neither that checkout nor this branch's weight API was modified
+to bypass the mismatch. The HP1 code paths also compile with cycle logging
+enabled against the compatible source headers.
+
+Paired Q4_HP1 model runs completed at context512 x10 (5,120 input / 2,550 scored
+tokens per model). Both the independent FP64 attention reference and the previous
+native raw-dot run match every chunk's logits hash and every token NLL exactly:
+
+| Model | Previous raw-dot PPL | SCU-contract CPU PPL | QK / PV nodes |
+| --- | ---: | ---: | ---: |
+| GPT-2 | 34.50487565853103 | 34.50487565853103 | 120 / 120 |
+| Llama-3.2-1B | 13.801307254545438 | 13.801307254545438 | 160 / 160 |
+
+These retain the existing product linear path and do not certify the separate
+original selective-linear integration. CPU PPL and provider validation are
+separate from actual RTL performance. PPL runs overlapped other validation work;
+their wall times must not be used as speed measurements. Provenance, hashes,
+per-chunk equality, provider tests and fixture counts are recorded in
+[scu-validation.json](results-backend-attention/scu-validation.json).
+
+Whole-stripe accumulation changes the residual padding trade-off. For each
+saved layer0/head0 T512/d64 capture:
+
+| Operation | Main requests before → after | Residual requests before → after | Residual fragments before → after |
+| --- | ---: | ---: | ---: |
+| GPT-2 / Llama QK | 32 → 16 | 32 → 16 | 2560 → 2560 |
+| GPT-2 PV | 64 → 4 | 22 → 4 | 64 → 160 |
+| Llama PV | 64 → 4 | 22 → 4 | 90 → 220 |
+
+Main fragments remain 512. The PV increase follows the spec-D global active-row
+union: rows absent in an individual block still occupy its stripe accumulator
+row. These are request/fragment counts, not a speedup. Main/residual remain
+separate requests; alternating them inside one K-tile and retaining its weights
+across the pair remain unimplemented. Simulator lifetime is still one QK/PV
+node. QK tile skipping is also still outside this vanilla native path.
+
+## Batch/head to 2D routing verification (2026-10-13)
+
+The existing native executor already slices QK/PV by batch and head before
+submitting 2D raw dots. Its mapping matches ggml MUL_MAT broadcasting:
+`kv_head = query_head / (query_heads / kv_heads)` and the same integer division
+for batches. Each stationary KV batch/head is quantized once, then reused for
+its query batch/head group. Quantization stripes are local to each head; tensor
+reads honor all four strides. This does not establish cross-request NPU
+scratchpad reuse.
+
+The existing `verify --backend` fixtures now cover distinct KV batches, MHA
+(3/3 heads, 2/2 batches), GQA (6/2 heads, 4/2 batches), and MQA (4/1 heads,
+2/2 batches). Each of these runs both as a strided 4D node and as separate
+contiguous 2D nodes, including F16 stationary values, multiple stripes and
+single-row inputs. All 93 fixture executions passed exact comparison with the
+independent per-head reference. Batched main/residual calls and fragments equal
+the separate-node sums; PV adds match one colsum per KV batch/head plus the
+per-query broadcast. Three existing attention/matmul CTests also passed.
+
+[batch-head-validation.json](results-backend-attention/batch-head-validation.json)
+records the executable hash, shapes, split-node groups, counts and node timings.
+This is one correctness run on the existing local CPU build from `3135e51a`;
+all raw cycles are zero, so it is not an RTL result or a speed comparison.
+Only the verification runner and documentation changed in this follow-up;
+native routing and model execution gained no extra checks or copies.
+
 ## Native model/backend QK/PV: local CPU validation (2026-10-13)
 
 The model now assigns both QK and PV to Gemmini when the opt-in

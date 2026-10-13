@@ -3,8 +3,10 @@
 #include "ggml-gemmini-matmul-config.hpp"
 #include "../quants/act/exsia/local.hpp"
 #include "../quants/act/exsia/exsia_shift.hpp"
+#include "../quants/common/hp1_scu.hpp"
 #include "../residual/rmd/rmd-bitmap-builder.hpp"
 #include "../residual/rmd/rmd-im2p-executor.hpp"
+#include "../residual/rmd/rmd-run-aware.hpp"
 
 #include <algorithm>
 #include <array>
@@ -61,7 +63,7 @@ void scaled_add(int64_t & accumulator, int64_t part, int shift) {
 
 size_t stripe_rows(size_t rows, size_t columns, size_t k) {
     // The quantization contract uses 4*4096 scratchpad rows and 512 accumulator rows,
-    // independently of the physical provider's tiling of each raw dot.
+    // independently of the physical provider's tiling of each SCU request.
     const size_t ip = rmd::align_up(rows, bk)/bk, jp = rmd::align_up(columns, bk)/bk;
     const size_t kp = rmd::align_up(k, bk)/bk;
     size_t i = std::min(ip, size_t{2}), j = std::min(jp, size_t{2}), b = std::min(kp, size_t{64});
@@ -76,32 +78,36 @@ size_t stripe_rows(size_t rows, size_t columns, size_t k) {
 
 struct Stationary {
     size_t k, n, kp;
-    int base = 0;
-    std::vector<int16_t> theta;
+    std::vector<int16_t> base;
+    std::vector<uint32_t> carriers;
     std::array<std::vector<int32_t>, 2> codes;
     std::vector<int64_t> colsum;
 };
 
 Stationary stationary(const ggml_tensor & t, size_t head, size_t batch, bool qk) {
-    Stationary w{size_t(t.ne[0]), size_t(t.ne[1]), rmd::align_up(size_t(t.ne[0]), bk), 0, {}, {}, {}};
-    w.theta.resize(w.kp/bk*w.n);
+    Stationary w{size_t(t.ne[0]), size_t(t.ne[1]), rmd::align_up(size_t(t.ne[0]), bk), {}, {}, {}, {}};
+    w.base.resize(w.n);
+    w.carriers.resize(w.kp/bk*w.n);
     w.codes[0].resize(w.kp*w.n);
     if (qk) w.codes[1].resize(w.kp*w.n);
     std::array<float, bk> values{};
     std::vector<int32_t> codes(bk);
+    std::vector<int16_t> theta(w.kp/bk);
     exsia::ExpScanner scanner;
     exsia::WideQuantizer quantizer;
-    for (size_t b = 0; b < w.kp/bk; ++b) {
-        const size_t valid = std::min(bk, w.k-b*bk);
-        for (size_t j = 0; j < w.n; ++j) {
+    for (size_t j = 0; j < w.n; ++j) {
+        w.base[j] = std::numeric_limits<int16_t>::max();
+        for (size_t b = 0; b < w.kp/bk; ++b) {
+            const size_t valid = std::min(bk, w.k-b*bk);
             int16_t e = neg;
             for (size_t k = 0; k < valid; ++k) {
                 values[k] = read_value(t, b*bk+k, j, head, batch);
                 e = std::max(e, scanner.unbiased_exp(values[k]));
             }
-            const int16_t theta = e == neg ? 0 : e - (qk ? 6 : 2);
-            w.theta[b*w.n+j] = theta;
-            quantizer.quantize_block(values.data(), valid, theta, codes);
+            theta[b] = e == neg ? neg : e - (qk ? 6 : 2);
+            if (e == neg) continue;
+            w.base[j] = std::min(w.base[j], theta[b]);
+            quantizer.quantize_block(values.data(), valid, theta[b], codes);
             for (size_t k = 0; k < valid; ++k) {
                 const int32_t code = std::clamp(codes[k], qk ? -128 : -8, qk ? 119 : 7);
                 const size_t index = (b*bk+k)*w.n+j;
@@ -109,15 +115,19 @@ Stationary stationary(const ggml_tensor & t, size_t head, size_t batch, bool qk)
                 if (qk) w.codes[1][index] = (code-w.codes[0][index])/16;
             }
         }
+        if (w.base[j] == std::numeric_limits<int16_t>::max()) w.base[j] = 0;
+        for (size_t b = 0; b < theta.size(); ++b)
+            require(quants::hp1::encode_carrier(theta[b] == neg ? neg : theta[b]-w.base[j],
+                                                w.carriers[b*w.n+j]));
     }
-    w.base = *std::min_element(w.theta.begin(), w.theta.end());
     if (!qk) {
         w.colsum.resize(w.n);
         for (size_t b = 0; b < w.kp/bk; ++b) {
             for (size_t j = 0; j < w.n; ++j) {
+                if (w.carriers[b*w.n+j] == quants::hp1::zero_carrier) continue;
                 int64_t sum = 0;
                 for (size_t k = 0; k < bk; ++k) sum += w.codes[0][(b*bk+k)*w.n+j];
-                scaled_add(w.colsum[j], sum, w.theta[b*w.n+j]-w.base);
+                scaled_add(w.colsum[j], sum, w.carriers[b*w.n+j]);
             }
         }
     }
@@ -208,11 +218,14 @@ StreamStripe stream(const ggml_tensor & t, size_t head, size_t batch, size_t beg
     return st;
 }
 
-struct RawDots {
+struct ScuGemm {
     rmd::detail::Im2pProviderStatsAggregate aggregate;
+    const char * layer;
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
     std::unique_ptr<im2p_sim_t, decltype(&im2p_sim_destroy)> sim{nullptr, im2p_sim_destroy};
-    RawDots() {
+#endif
+    explicit ScuGemm(const char * name) : layer(name) {
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
         require(im2p_sim_implementation() && std::strcmp(im2p_sim_implementation(), "gemmini-hp1-integrated-v1") == 0 &&
                 im2p_sim_abi_version() == IM2P_ABI_VERSION && im2p_sim_dim() == 32 &&
                 im2p_sim_activation_bits() == 4 && im2p_sim_weight_bits() == 4 &&
@@ -221,12 +234,35 @@ struct RawDots {
                 RmdStatus::unsupported_route);
         sim.reset(im2p_sim_create());
         require(bool(sim), RmdStatus::execution_failed);
+#endif
+    }
+#if !defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+    static void software(const int8_t * a, size_t rows, size_t stride, const int32_t * w,
+                         size_t n, size_t k, const uint32_t * carriers,
+                         std::vector<int64_t> & out, const std::vector<rmd::RunAwareRun> * runs = nullptr) {
+        out.resize(rows*n);
+        const size_t blocks = runs ? runs->size() : (k+bk-1)/bk;
+        for (size_t i = 0; i < rows; ++i)
+            for (size_t j = 0; j < n; ++j) {
+                int32_t acc = 0;
+                for (size_t b = 0; b < blocks; ++b) {
+                    const size_t begin = runs ? (*runs)[b].compact_k_begin : b*bk;
+                    const size_t count = runs ? (*runs)[b].compact_k_count : std::min(bk, k-begin);
+                    for (size_t c0 = 0; c0 < count; c0 += rmd::kArrayDim) {
+                        int32_t part = 0;
+                        for (size_t c = c0; c < std::min(count, c0+rmd::kArrayDim); ++c)
+                            part += int32_t(a[i*stride+begin+c])*w[(begin+c)*n+j];
+                        acc = quants::hp1::accumulate(acc, quants::hp1::apply_validated(part, carriers[b*n+j]));
+                    }
+                }
+                out[i*n+j] = acc;
+            }
     }
 #endif
     void run(const int8_t * a, size_t rows, size_t stride, const int32_t * w,
-             size_t n, size_t k, std::vector<int64_t> & out) {
-        out.resize(rows*n);
+             size_t n, size_t k, const uint32_t * carriers, size_t begin, std::vector<int64_t> & out) {
 #if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+        out.resize(rows*n);
         rmd::detail::Im2pCompactDot dot;
         dot.operand_bits = 4;
         dot.activations = a;
@@ -236,62 +272,82 @@ struct RawDots {
         dot.columns = n;
         dot.weight_row_stride = n;
         dot.k = k;
-        dot.vector_op = IM2P_VECTOR_BYPASS;
+        dot.scu_carriers = carriers;
+        dot.vector_op = IM2P_VECTOR_LEFT_SHIFT;
+        dot.trace_role = GEMMINI_TRACE_ROLE_DENSE;
+        dot.timing_identity.interval.layer = layer;
+        dot.timing_identity.identity_mask = GEMMINI_CYCLE_HAS_STRIPE_ID;
+        dot.timing_identity.stripe_id = begin;
+        dot.stripe_id = begin;
+        dot.source_row_begin = begin;
+        dot.source_row_count = rows;
         const auto status = rmd::detail::execute_im2p_compact_dot(sim.get(), dot, out.data(), n, aggregate);
         require(status == RmdStatus::success, status);
 #else
-        for (size_t i = 0; i < rows; ++i)
-            for (size_t j = 0; j < n; ++j) {
-                int64_t sum = 0;
-                for (size_t c = 0; c < k; ++c) sum += int32_t(a[i*stride+c])*w[c*n+j];
-                out[i*n+j] = sum;
-            }
+        (void)begin;
+        software(a, rows, stride, w, n, k, carriers, out);
+#endif
+    }
+    void run(const rmd::RunAwareRequest & request, std::vector<int64_t> & out) {
+#if defined(GGML_GEMMINI_EXECUTION_BACKEND_IM2P_SIM)
+        rmd::detail::Im2pRunAwareWork work;
+        work.request = &request;
+        work.timing_identity.interval.layer = layer;
+        work.timing_identity.identity_mask = GEMMINI_CYCLE_HAS_STRIPE_ID;
+        work.timing_identity.stripe_id = request.stripe_id;
+        const auto status = rmd::detail::execute_im2p_run_aware(sim.get(), work, out, aggregate);
+        require(status == RmdStatus::success, status);
+#else
+        software(request.activations.data(), request.m, request.k, request.weights.data(),
+                 request.n, request.k, request.carriers.data(), out, &request.runs);
 #endif
     }
 };
 
-void multiply(RawDots & raw, const StreamStripe & st, const Stationary & w, bool qk,
+void multiply(ScuGemm & scu, const StreamStripe & st, const Stationary & w, bool qk, size_t begin,
               float * output, AttentionMetrics & metrics) {
     std::vector<int64_t> acc(st.rows*w.n), part;
-    std::vector<int32_t> compact(bk*w.n);
-    auto merge = [&](size_t i, size_t source, size_t b, int extra) {
+    auto merge = [&](size_t i, size_t source, int shift) {
         for (size_t j = 0; j < w.n; ++j)
-            scaled_add(acc[i*w.n+j], part[source*w.n+j], w.theta[b*w.n+j]-w.base+extra);
+            scaled_add(acc[i*w.n+j], part[source*w.n+j], shift);
     };
     const uint64_t ntiles = (w.n+bk-1)/bk;
+    rmd::RunAwareRequest residual;
+    uint64_t residual_fragments = 0;
+    if (st.upper) {
+        const auto status = rmd::build_run_aware_activations(*st.upper, residual);
+        require(status == RmdStatus::success, status);
+        residual.weights.resize(residual.k*w.n);
+        residual.carriers.resize(residual.runs.size()*w.n);
+        for (size_t b = 0; b < residual.runs.size(); ++b) {
+            const auto & run = residual.runs[b];
+            std::copy_n(w.carriers.data()+run.original_block_id*w.n, w.n, residual.carriers.data()+b*w.n);
+            residual_fragments += (run.compact_k_count+bk-1)/bk;
+        }
+        residual_fragments *= ((residual.m+bk-1)/bk)*ntiles;
+    }
     for (size_t pass = 0; pass < (qk ? 2u : 1u); ++pass) {
-        for (size_t b = 0; b < w.kp/bk; ++b) {
-            raw.run(st.main.data()+b*bk, st.rows, st.kp, w.codes[pass].data()+b*bk*w.n, w.n, bk, part);
-            ++metrics.main_dots;
-            (pass ? metrics.residual_fragments : metrics.main_fragments) += ((st.rows+bk-1)/bk)*ntiles;
-            for (size_t i = 0; i < st.rows; ++i) merge(i, i, b, int(pass)*4);
-        }
+        scu.run(st.main.data(), st.rows, st.kp, w.codes[pass].data(), w.n, w.k,
+                w.carriers.data(), begin, part);
+        ++metrics.main_dots;
+        (pass ? metrics.residual_fragments : metrics.main_fragments) += ((st.rows+bk-1)/bk)*ntiles*(w.kp/bk);
+        for (size_t i = 0; i < st.rows; ++i) merge(i, i, int(pass)*4);
         if (!st.upper) continue;
-        for (const auto & block : st.upper->blocks) {
-            for (const auto & group : block.groups) {
-                std::fill(compact.begin(), compact.end(), 0);
-                size_t ck = 0;
-                for (size_t c = 0; c < bk; ++c) {
-                    if (!(group.k_mask & (uint32_t{1} << c))) continue;
-                    std::copy_n(w.codes[pass].data()+(block.global_k_begin+c)*w.n, w.n, compact.data()+ck*w.n);
-                    ++ck;
-                }
-                raw.run(st.upper->stacked_activation.signed_int8.data()+group.activation_offset,
-                        group.row_ids.size(), group.padded_k_count, compact.data(), w.n, group.padded_k_count, part);
-                ++metrics.residual_dots;
-                metrics.residual_fragments += ((group.row_ids.size()+bk-1)/bk)*ntiles;
-                for (size_t l = 0; l < group.lane_positions.size(); ++l) {
-                    const int shift = 4*(int(block.lane_ids[group.lane_positions[l]])+1+int(pass));
-                    for (size_t row = group.row_offsets[l]; row < group.row_offsets[l+1]; ++row)
-                        merge(group.row_ids[row], row, block.block_id, shift);
-                }
-            }
+        for (const auto & run : residual.runs) {
+            for (size_t c = 0; c < run.compact_k_count; ++c)
+                std::copy_n(w.codes[pass].data()+(run.original_global_k_begin+run.original_local_k[c])*w.n,
+                            w.n, residual.weights.data()+(run.compact_k_begin+c)*w.n);
         }
+        scu.run(residual, part);
+        ++metrics.residual_dots;
+        metrics.residual_fragments += residual_fragments;
+        for (size_t row = 0; row < residual.rows.size(); ++row)
+            merge(residual.rows[row].source_row, row, 4*(int(residual.rows[row].original_lane_id)+1+int(pass)));
     }
     for (size_t i = 0; i < st.rows; ++i)
         for (size_t j = 0; j < w.n; ++j) {
             if (!qk) scaled_add(acc[i*w.n+j], w.colsum[j], 3);
-            const float value = static_cast<float>(std::ldexp(static_cast<double>(acc[i*w.n+j]), st.scale+w.base));
+            const float value = static_cast<float>(std::ldexp(static_cast<double>(acc[i*w.n+j]), st.scale+w.base[j]));
             require(std::isfinite(value), RmdStatus::overflow);
             output[i*w.n+j] = value;
         }
@@ -317,7 +373,7 @@ rmd::RmdStatus attention_execute(ggml_tensor * op, AttentionMetrics & metrics) {
     if (!op->data || !op->src[0]->data || !op->src[1]->data) return RmdStatus::invalid_arguments;
     try {
         NearestRounding rounding;
-        RawDots raw;
+        ScuGemm scu(op->name);
         const auto & a = *op->src[0];
         const auto & b = *op->src[1];
         const bool qk = ggml_gemmini_get_attention_role(op) == GGML_GEMMINI_ATTENTION_QK;
@@ -333,10 +389,10 @@ rmd::RmdStatus attention_execute(ggml_tensor * op, AttentionMetrics & metrics) {
                     for (size_t head = ah*head_repeat; head < (ah+1)*head_repeat; ++head)
                         for (size_t begin = 0; begin < rows; begin += rs) {
                             const auto st = stream(b, head, batch, begin, std::min(rs, rows-begin), n, qk);
-                            multiply(raw, st, w, qk, staged.data()+((batch*b.ne[2]+head)*rows+begin)*n, pending);
+                            multiply(scu, st, w, qk, begin, staged.data()+((batch*b.ne[2]+head)*rows+begin)*n, pending);
                         }
             }
-        const auto stats_status = rmd::checked_accumulate_provider_stats(pending.provider, raw.aggregate.stats);
+        const auto stats_status = rmd::checked_accumulate_provider_stats(pending.provider, scu.aggregate.stats);
         require(stats_status == RmdStatus::success, stats_status);
         ++(qk ? pending.qk_nodes : pending.pv_nodes);
         std::memcpy(op->data, staged.data(), staged.size()*sizeof(float));

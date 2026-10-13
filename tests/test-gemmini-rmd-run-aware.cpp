@@ -148,6 +148,14 @@ int main() {
     ok = check(request.tile_i > 0 && request.tile_j > 0 && request.tile_k > 0,
                "final geometry was selected") && ok;
 
+    RunAwareRequest activations;
+    RunAwareRequest activation_only = request;
+    activation_only.weights.clear();
+    activation_only.carriers.clear();
+    ok = check(build_run_aware_activations(*packet, activations) == RmdStatus::success &&
+                   activations == activation_only,
+               "runtime stationary operands reuse the exact production row/K packing") && ok;
+
     RmdStripeBuilder long_builder;
     long_builder.reset(24, 0, kRows, kLogicalK, kColumns,
                        GGML_GEMMINI_ACTIVATION_BITS);
@@ -194,6 +202,9 @@ int main() {
     ok = check(build_run_aware_geometry(args, malformed, geometry) ==
                    RmdStatus::invalid_packet && geometry == operandless,
                "malformed packet geometry rejection is transactional") && ok;
+    ok = check(build_run_aware_activations(malformed, activations) == RmdStatus::invalid_packet &&
+                   activations == activation_only,
+               "malformed runtime operand packing is transactional") && ok;
 
     RunAwareRequest empty = sentinel;
     ok = check(build_run_aware_request(args, StripePacketHandle{}, empty) ==

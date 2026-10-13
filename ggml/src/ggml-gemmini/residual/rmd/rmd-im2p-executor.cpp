@@ -219,12 +219,13 @@ bool valid_scu_carrier(uint8_t op, uint32_t carrier) {
 
 int read_scu_scale(void * opaque, size_t block, size_t column, size_t count, uint32_t * out) {
     const auto * context = static_cast<const ProviderContext *>(opaque);
-    if (!context || !context->dot || !out || context->fail_read || block != 0 ||
+    if (!context || !context->dot || !out || context->fail_read ||
+        block > (context->dot->k - 1) / 32 ||
         !context->dot->scu_carriers || column > context->dot->columns ||
         count > context->dot->columns - column)
         return IM2P_ERROR;
     for (size_t j = 0; j < count; ++j) {
-        const auto carrier = context->dot->scu_carriers[column + j];
+        const auto carrier = context->dot->scu_carriers[block * context->dot->columns + column + j];
         if (!valid_scu_carrier(context->dot->vector_op, carrier))
             return IM2P_INVALID_LAYOUT;
         out[j] = carrier;
@@ -393,12 +394,13 @@ int synthetic_execute(const im2p_matmul_desc_t *   descriptor,
             uint32_t   carrier    = 0;
             const bool scaled     = descriptor->vector_op == IM2P_VECTOR_UNSIGNED_MULTIPLY ||
                                     descriptor->vector_op == IM2P_VECTOR_LEFT_SHIFT;
-            if (scaled && (!descriptor->provider.read_scale ||
-                           descriptor->provider.read_scale(
-                               descriptor->provider.context, 0, j, 1, &carrier) != IM2P_OK ||
-                           !valid_scu_carrier(descriptor->vector_op, carrier)))
-                return IM2P_ERROR;
             for (size_t k = 0; k < descriptor->k; ++k) {
+                if (scaled && k % 32 == 0 &&
+                    (!descriptor->provider.read_scale ||
+                     descriptor->provider.read_scale(descriptor->provider.context, k / 32, j, 1,
+                                                       &carrier) != IM2P_OK ||
+                     !valid_scu_carrier(descriptor->vector_op, carrier)))
+                    return IM2P_ERROR;
                 if (descriptor->weight_bits == 16) {
                     int16_t value = 0;
                     if (descriptor->provider.read_weight_i16(
@@ -692,20 +694,21 @@ RmdStatus execute_im2p_compact_dot(im2p_sim_t *                 sim,
     if (dot.trace_context && (!*dot.trace_context || dot.vector_op != IM2P_VECTOR_LEFT_SHIFT ||
                               executor || fault != Im2pProviderTestFault::none))
         return RmdStatus::unsupported_route;
-    if (scaled && ((dot.operand_bits != 4 && dot.operand_bits != 8) || dot.k > 32))
+    if (scaled && (dot.operand_bits != 4 && dot.operand_bits != 8))
         return RmdStatus::unsupported_route;
     if (scaled && executor && !executor->execute_planned)
         return RmdStatus::unsupported_route;
     if (!scaled && executor && !executor->execute)
         return RmdStatus::unsupported_route;
-    if (scaled)
-        for (size_t j = 0; j < dot.columns; ++j)
-            if (!valid_scu_carrier(dot.vector_op, dot.scu_carriers[j]))
-                return RmdStatus::invalid_arguments;
     if (dot.rows > SIZE_MAX / dot.columns || dot.rows > SIZE_MAX / output_row_stride ||
         dot.rows > SIZE_MAX / dot.activation_row_stride_bytes ||
         dot.k > SIZE_MAX / dot.weight_row_stride)
         return RmdStatus::overflow;
+    if (scaled)
+        for (size_t b = 0; b <= (dot.k - 1) / 32; ++b)
+            for (size_t j = 0; j < dot.columns; ++j)
+                if (!valid_scu_carrier(dot.vector_op, dot.scu_carriers[b * dot.columns + j]))
+                    return RmdStatus::invalid_arguments;
     ProviderContext          context{};
     std::vector<OutputValue> staged_values;
     context.dot               = &dot;
@@ -827,9 +830,10 @@ RmdStatus execute_im2p_compact_dot(im2p_sim_t *                 sim,
 #if defined(GGML_GEMMINI_TESTING)
     provider_dot_attempts.fetch_add(1, std::memory_order_relaxed);
 #endif
-    trace::ScopedRole residual_role(GEMMINI_TRACE_ROLE_RESIDUAL);
+    trace::ScopedRole role(dot.trace_role);
     const auto        device_origin = gemmini_trace_capture();
-    trace::CpuStage   host_call(dot.timing_identity.interval.layer, "rmd.device_host_call");
+    trace::CpuStage   host_call(dot.timing_identity.interval.layer,
+                               dot.trace_role == GEMMINI_TRACE_ROLE_DENSE ? "attention.device_host_call" : "rmd.device_host_call");
     int               provider_status = IM2P_ERROR;
     if (executor != nullptr) {
         if (fault != Im2pProviderTestFault::none)
@@ -857,7 +861,7 @@ RmdStatus execute_im2p_compact_dot(im2p_sim_t *                 sim,
             {"schema", "gemmini.cycle"},
             {"version", 2},
             {"record_type", "NPU_OPERATOR_SEGMENT"},
-            {"op", "rmd.matmul.execute"},
+            {"op", dot.trace_role == GEMMINI_TRACE_ROLE_DENSE ? "attention.main.execute" : "rmd.matmul.execute"},
             {"layer",
              dot.timing_identity.interval.layer ? Json(dot.timing_identity.interval.layer)
                                                 : Json()},

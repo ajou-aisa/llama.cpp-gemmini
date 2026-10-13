@@ -1437,6 +1437,12 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
         endif()
     endif()
 
+    if((CYCLE_SIM OR IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1") AND
+       GGML_GEMMINI_WEIGHT_BITS LESS 16)
+        add_test(NAME test-gemmini-rmd-im2p-provider-dense-scu-stripe
+            COMMAND $<TARGET_FILE:test-gemmini-rmd-im2p-provider> --case dense-scu-stripe)
+    endif()
+
     if (IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1" AND GGML_GEMMINI_ENABLE_RMD AND NOT CYCLE_SIM)
         add_executable(test-gemmini-optrace-dispatch test-gemmini-optrace-dispatch.cpp)
         target_link_libraries(test-gemmini-optrace-dispatch PRIVATE
