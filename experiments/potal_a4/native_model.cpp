@@ -1,6 +1,10 @@
 #include "llama.h"
 #include "ggml-backend.h"
 #include "raw_batch.hpp"
+#if POTAL_ENABLE_BACKEND_ATTENTION
+#include "ggml-gemmini.h"
+#include "llama-context.h"
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -59,7 +63,19 @@ struct replay_session {
     void * data = nullptr;
     int callbacks = 0;
     bool failed = false;
+    bool backend_attention = false;
 };
+
+#if POTAL_ENABLE_BACKEND_ATTENTION
+extern "C" int potal_backend_stats(void * handle, ggml_gemmini_attention_stats * stats) {
+    if (!handle || !stats) return -1;
+    const auto sched = static_cast<replay_session *>(handle)->context->get_sched();
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i)
+        if (ggml_backend_gemmini_get_attention_stats(ggml_backend_sched_get_backend(sched, i), stats)) return 0;
+    replay_error = "Gemmini backend absent from the model scheduler";
+    return -1;
+}
+#endif
 
 static bool replay_callback(ggml_tensor * t, bool ask, void * opaque) {
     auto & session = *static_cast<replay_session *>(opaque);
@@ -100,8 +116,8 @@ extern "C" const char * potal_replay_error() { return replay_error.c_str(); }
 
 extern "C" int potal_replay_abi_version() { return 2; }
 
-extern "C" void * potal_replay_open(const char * path, int count, int threads, int max_sequences,
-                                    replay_hook hook, void * data) {
+static void * replay_open(const char * path, int count, int threads, int max_sequences,
+                          replay_hook hook, void * data, bool backend_attention) {
     try {
         require(count >= 32 && count <= 1024, "Context outside 32..1024");
         require(max_sequences > 0 && max_sequences <= count, "Invalid sequence capacity");
@@ -114,19 +130,31 @@ extern "C" void * potal_replay_open(const char * path, int count, int threads, i
         require(bool(session->model), "Model load");
         session->hook = hook;
         session->data = data;
+        session->backend_attention = backend_attention;
         auto cp = llama_context_default_params();
         cp.n_ctx = cp.n_batch = cp.n_ubatch = count;
         cp.n_seq_max = max_sequences;
         cp.n_threads = cp.n_threads_batch = threads;
         cp.type_k = cp.type_v = GGML_TYPE_F32;
         cp.flash_attn = false;
-        cp.offload_kqv = false;
+        cp.offload_kqv = backend_attention;
         if (hook) { cp.cb_eval = replay_callback; cp.cb_eval_user_data = session.get(); }
         session->context.reset(llama_init_from_model(session->model.get(), cp));
         require(bool(session->context), "Context creation");
         return session.release();
     } catch (const std::exception & error) { replay_error = error.what(); return nullptr; }
 }
+
+extern "C" void * potal_replay_open(const char * path, int count, int threads, int max_sequences,
+                                    replay_hook hook, void * data) {
+    return replay_open(path, count, threads, max_sequences, hook, data, false);
+}
+
+#if POTAL_ENABLE_BACKEND_ATTENTION
+extern "C" void * potal_backend_open(const char * path, int count, int threads) {
+    return replay_open(path, count, threads, 1, nullptr, nullptr, true);
+}
+#endif
 
 extern "C" void potal_replay_close(void * handle) { delete static_cast<replay_session *>(handle); }
 
@@ -149,6 +177,11 @@ static void replay_decode(replay_session & session, const int32_t * tokens, int 
     require(count > 0 && unsigned(count) <= llama_n_batch(session.context.get()), "Invalid batch size");
     auto batch = llama_batch_init(count, 0, 1);
     try {
+#if POTAL_ENABLE_BACKEND_ATTENTION
+        ggml_gemmini_attention_stats before{};
+        if (session.backend_attention)
+            require(potal_backend_stats(&session, &before) == 0, "Gemmini backend required");
+#endif
         session.callbacks = 0;
         session.failed = false;
         if (clear_kv) llama_kv_self_clear(session.context.get());
@@ -161,6 +194,18 @@ static void replay_decode(replay_session & session, const int32_t * tokens, int 
             batch.logits[i] = all_outputs || (i >= count/2 && i < count-1);
         }
         require(llama_decode(session.context.get(), batch) == 0 && !session.failed, "Replay decode failed");
+#if POTAL_ENABLE_BACKEND_ATTENTION
+        if (session.backend_attention) {
+            ggml_gemmini_attention_stats after{};
+            require(potal_backend_stats(&session, &after) == 0, "Gemmini backend statistics missing");
+            const uint64_t layers = llama_model_n_layer(session.model.get());
+            if (after.qk_nodes-before.qk_nodes != layers || after.pv_nodes-before.pv_nodes != layers)
+                throw std::runtime_error("QK/PV did not execute through Gemmini for every layer: qk="+
+                    std::to_string(after.qk_nodes-before.qk_nodes)+" pv="+
+                    std::to_string(after.pv_nodes-before.pv_nodes)+" expected="+std::to_string(layers));
+            session.callbacks = int(2*layers);
+        }
+#endif
         if (session.hook) require(session.callbacks == 2*llama_model_n_layer(session.model.get()),
                                   "Missing attention replay callbacks");
     } catch (...) {

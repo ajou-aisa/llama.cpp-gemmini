@@ -1,6 +1,22 @@
 # PoTal attention: nano에서 Gemmini / IM2P 작업 이어가기
 
-## 최신 작업: vanilla QK/PV의 Gemmini 원격 검증 준비
+## 최신 작업: 모델의 vanilla QK/PV backend 연결
+
+`GGML_GEMMINI_ENABLE_A4NKS_ATTENTION=ON`으로 실제 모델의 QK와 PV를 Gemmini
+backend에 함께 배정하는 코드를 추가했다. 기존 ExSIA/WideQuantizer와 stacked
+RMD, raw IM2P provider를 재사용한다. 모든 signed nibble은 int8로 운반하고,
+BK·출력 column·lane별 scale은 raw dot 뒤 checked int64로 누적한다.
+PV의 weighted colsum은 KV head마다 한 번 계산해 GQA query head에서 재사용한다.
+
+로컬은 `OPTION=CPU` 기능 검사다. 양자화·패킹·정수곱·보정이 native backend에서
+실행되지만 실제 Gemmini RTL/NPU 실행은 아니며 `raw_cycles=0`이다. 실제 IM2P
+링크·실행·cycle 측정은 Nano에 남아 있다. 새 backend는 vanilla QK/PV이며,
+QK tile skip은 아래의 기존 standalone 실험에만 연결되어 있다.
+최신 정확도 결과는 [진행 기록](experiments/potal_a4/NANO_PROGRESS.md), Nano의
+빌드·node 측정·10-chunk 모델 비교 명령은
+[실험 README](experiments/potal_a4/README.md#실제-backend-qkpv-측정)에 있다.
+
+## 이전 업로드: vanilla QK/PV의 standalone Gemmini 재생
 
 기존 raw Gemmini provider와 CPU 묶음 누산기를 재사용해 캡처 재생 코드를 준비했다.
 기본값은 masking 없는 QK/PV이며, `--experiments`로 직접 누적·QK 타일 생략을
@@ -9,7 +25,7 @@ host int64다. 양자화·패킹·정답 생성은 실행 전에 준비한다.
 
 로컬 CPU 빌드/CTest 7개와 실제 GPT-2/Llama QK/PV 캡처 4개의 정확도 검사는 통과했다.
 새 Gemmini 공유 라이브러리의 실제 링크·실행과 RTL 측정은 원격에서 해야 한다.
-제품 attention dispatch·stacked RMD나 전체 모델 성능 인증은 별도다.
+이전 업로드에는 제품 attention dispatch가 없었다. 위의 후속 구현과 구분한다.
 실행 명령과 결과 필드는 [실험 README](experiments/potal_a4/README.md#gemmini-qkpv-원격-검사-vanilla-기본값)에 있다.
 
 ## 최신 로컬 수정: ExSIA 공통 source-zero 정책
@@ -70,7 +86,9 @@ CPU 정수곱의 DIM32 환산 main 작업량은 46.875% 감소했다. 제품 Gem
 - 전달 압축 파일은 `/home/dyndnn/Projects/llama.cpp-gemmini/output/potal-nano-transfer-20261012.tar.gz`이다(278,803,401 bytes). SHA256은 `458d8ec4eec37419d9615f3be02de8657fe30fa6555f7e5e3e2c305c608e3cc4`. 파일별 목록·해시, 실제 실행 명령, 의존성 commit·설정·artifact 경로는 [이관 증빙](experiments/potal_a4/results-nano/transfer-20261012/)에 있다. 대용량 capture·토큰·원시 로그는 압축 파일로 전달하며 모델·캐시·컴파일 산출물은 포함하지 않는다.
 - 수정 전에 [기존 구현·재사용 대응표](experiments/potal_a4/IMPLEMENTATION_PLAN.md#existing-implementation-and-reuse-audit)에서 담당 함수·호출자·테스트를 확인한다. 기존 ExSIA/RMD/matmul/provider/graph/계측을 우선 수정한다. 계획에 적혀 있던 새 파일·테스트 이름은 생성 의무가 아니며, 기존 코드로 충족되지 않는 책임을 확인한 경우에만 필요한 부분을 추가한다.
 
-이하의 실측 표는 이관 당시의 역사적 결과다. 제품 fused emitter·wide accumulator·a4nks graph의 미완료 상태는 여전히 유효하다.
+이하의 실측 표와 작업 목록은 이관 당시의 역사적 기록이다. 현재 backend 연결과
+검증 범위는 맨 위의 최신 작업을 기준으로 한다. 원문 선형 통합, fused emitter,
+임의 정밀도 accumulator와 실제 attention RTL 검증은 여전히 남아 있다.
 
 ## 이어받는 작업
 
@@ -192,7 +210,10 @@ rtk proxy env PYTHONPATH=gguf-py:. OPENBLAS_NUM_THREADS=2 python3.11 -m experime
 
 Geometry 주의: 실험의 논리 stripe는 `(banks,bank_rows,acc_rows)=(4,4096,512)`다. Mac probe의 generated header는 ACC_ROWS=1024였고 probe는 stripe=32로 고정했다. 이 결과로 hardware schedule parity를 주장하지 않았다. Nano의 실제 계약을 기록하고, 논리 quantization stripe와 물리 tile 차이가 정확도를 바꾸지 않도록 먼저 대조한다.
 
-`GGML_GEMMINI_ENABLE_A4NKS_ATTENTION`은 아직 구현되지 않은 opt-in 계획이다. 과거 계획의 `test-gemmini-potal-a4`, `test-gemmini-attention` 이름 때문에 새 실행 파일을 만들지 말고, 재사용 대응표의 기존 테스트에 필요한 case를 반영한다. 현재 CMake가 모르는 옵션을 전달하거나 기존 일반 inference가 동작했다는 이유만으로 a4nks 성공이라고 기록하지 않는다. KV/strided view/GQA와 single-token decode도 아직 검증하지 않았다.
+현재 `GGML_GEMMINI_ENABLE_A4NKS_ATTENTION`은 구현된 opt-in 옵션이다.
+기존 `test-gemmini-matmul`의 attention case를 확장했으며 새 실행 파일을 만들지
+않았다. KV/strided view/GQA와 1-row node 검사는 로컬 CPU에서 통과했다.
+실제 모델의 증분 KV decode 및 Nano RTL 검증까지 통과한 것으로 해석하지 않는다.
 
 ## 새 대화에 붙여넣을 요청
 

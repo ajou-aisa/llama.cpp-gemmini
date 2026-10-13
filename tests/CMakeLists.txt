@@ -1487,6 +1487,9 @@ if (NOT GGML_BACKEND_DL)
         GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
         LOG_CYCLE=${LOG_CYCLE} CYCLE_DETAIL=${CYCLE_DETAIL})
     add_test(NAME test-gemmini-matmul COMMAND $<TARGET_FILE:test-gemmini-matmul>)
+    if(GGML_GEMMINI_ENABLE_A4NKS_ATTENTION)
+        add_test(NAME test-gemmini-attention COMMAND $<TARGET_FILE:test-gemmini-matmul> --case=attention)
+    endif()
     add_test(
         NAME test-gemmini-matmul-finite-output
         COMMAND $<TARGET_FILE:test-gemmini-matmul> --case=finite-output)

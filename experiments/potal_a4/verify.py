@@ -7,8 +7,15 @@
 from __future__ import annotations
 
 from collections import Counter
+import argparse
 import ctypes as ct
+import hashlib
+import json
+from pathlib import Path
+import platform
+import subprocess
 import sys
+import tempfile
 
 import numpy as np
 
@@ -196,7 +203,88 @@ def check_native_batch(library: str) -> None:
     print("Prepared replay: reused int8 jobs, row/K/column tails, all-masked QK and zero P PASS (CPU provider)")
 
 
+def check_backend(executable: str, repeats: int = 1, report: Path | None = None, require_rtl: bool = False) -> None:
+    subprocess.run([executable, "--case=attention"], check=True)
+    rng = np.random.default_rng(782)
+    cases = []
+    for role in (0, 1):
+        for k, rows, n, half, interleaved in ((33, 35, 65, 0, 0), (65, 1, 7, 1, 1), (32, 67, 33, 0, 1)):
+            a = rng.normal(size=(1, 2, n, k)).astype(np.float32)
+            a *= np.exp2(rng.integers(-3, 4, (1, 2, n, 1))).astype(np.float32)
+            if half:
+                a = a.astype(np.float16).astype(np.float32)
+            b = (rng.normal(size=(2, 4, rows, k)).astype(np.float32) if role == 0 else
+                 rng.random((2, 4, rows, k), dtype=np.float32))
+            if rows > 1:
+                b[..., 0, :] = 0
+            result = np.empty((2, 4, rows, n), np.float32)
+            for batch in range(2):
+                for head in range(4):
+                    operand, _, weights = prepare_head(role, b[batch, head], a[0, head//2], {})
+                    result[batch, head] = operand.values.astype(np.float64) @ weights.values.astype(np.float64)
+            cases.append((f"random-{'qk' if role == 0 else 'pv'}-{k}-{rows}",
+                          (role, k, n, rows, 2, 4, 1, 2, half, interleaved), a, b, result))
+    a = np.ones((3, 33), np.float32)
+    b = np.ones((2, 33), np.float32)
+    b[:, 0] = [np.float32(2.0**120), -np.float32(2.0**120)]
+    operand, _, weights = prepare_head(0, b, a, {})
+    expected = (operand.values.astype(np.float64) @ weights.values.astype(np.float64)).astype(np.float32)
+    cases.append(("qk-int32-saturation-carry", (0, 33, 3, 2, 1, 1, 1, 1, 0, 0), a, b, expected))
+    base = Path(__file__).parent
+    for directory in ("results-upper-compare-gpt2-10chunk", "results-qk-batch-10chunk"):
+        for role, name in enumerate(("qk-l0-h0.npz", "pv-l0-h0.npz")):
+            with np.load(base/directory/name, allow_pickle=False) as saved:
+                a, b = saved["stationary"], saved["streamed"]
+                operand, _, weights = prepare_head(role, b, a, {})
+                expected = (operand.values.astype(np.float64) @ weights.values.astype(np.float64)).astype(np.float32)
+                if not np.array_equal(expected, saved["result"]):
+                    raise AssertionError(f"Saved reference changed: {directory}/{name}")
+                shape = (role, b.shape[1], a.shape[0], b.shape[0], 1, 1, 1, 1, 0, 0)
+                cases.append((f"{directory}/{name}", shape, a.copy(), b.copy(), expected))
+    records = []
+    with tempfile.TemporaryDirectory(prefix="potal-backend-") as directory:
+        fixture = Path(directory)/"attention.bin"
+        for name, shape, a, b, expected in cases:
+            with fixture.open("wb") as stream:
+                np.asarray(shape, dtype="<i8").tofile(stream)
+                for values in (a, b, expected):
+                    np.asarray(values, dtype="<f4").tofile(stream)
+            for repeat in range(repeats):
+                result = subprocess.run([executable, "--attention-fixture", str(fixture)], check=True,
+                                        capture_output=True, text=True)
+                line = next(line for line in result.stdout.splitlines() if line.startswith("ATTENTION "))
+                metrics = dict(field.split("=", 1) for field in line.split()[1:])
+                record = {"case": name, "shape": shape, "repeat": repeat, "equal": True,
+                          "role": metrics.pop("role"), **{key: int(value) for key, value in metrics.items()}}
+                if require_rtl and record["raw_cycles"] <= 0:
+                    raise AssertionError("RTL measurement requested but no actual Gemmini cycles were recorded")
+                records.append(record)
+                print(json.dumps(record), flush=True)
+    if report:
+        with report.open("x") as target:
+            json.dump({"scope": "Native Gemmini backend QK/PV nodes; vanilla, no masked tile skipping",
+                       "platform": platform.platform(), "executable": str(Path(executable).resolve()),
+                       "executable_sha256": hashlib.sha256(Path(executable).read_bytes()).hexdigest(),
+                       "require_rtl": require_rtl, "repeats": repeats,
+                       "host_ns": "Graph compute including native quantization, packing, provider creation/dots, wide merge and publication; fixture loading and oracle comparison excluded",
+                       "raw_cycles": "Real IM2P provider cycles; zero denotes CPU functional execution",
+                       "limitations": ["Host simulator wall time is not NPU latency", "Single layer/head captures do not measure full-model speed", "Each repeat creates a fresh backend"],
+                       "records": records}, target, indent=2)
+    print("PASS: native backend QK/PV vs independent reference, GQA/batches, F16/views, tails, zero P and captured GPT-2/Llama")
+
+
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "--backend":
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--backend", required=True)
+        parser.add_argument("--repeats", type=int, default=1)
+        parser.add_argument("--report", type=Path)
+        parser.add_argument("--require-rtl", action="store_true")
+        args = parser.parse_args()
+        if args.repeats < 1:
+            parser.error("repeats must be positive")
+        check_backend(args.backend, args.repeats, args.report, args.require_rtl)
+        return
     if len(sys.argv) == 3 and sys.argv[1] == "--native-batch":
         check_native_batch(sys.argv[2])
         return

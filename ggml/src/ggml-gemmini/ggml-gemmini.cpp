@@ -175,7 +175,16 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t       
             const auto cycle_sim_context = ggml::gemmini::cycle_sim::context_for(node);
             ggml::gemmini::cycle_sim::ScopedContext cycle_sim_scope(cycle_sim_context);
 #endif
-            ggml_backend_gemmini_mul_mat(ctx, node);
+            if (ggml_gemmini_get_attention_role(node) != GGML_GEMMINI_ATTENTION_NONE) {
+                const auto status = ggml::gemmini::attention_execute(node, ctx->attention);
+                if (status != ggml::gemmini::rmd::RmdStatus::success) {
+                    GGML_LOG_ERROR("Gemmini attention %s failed: %s\n", node->name,
+                                   ggml::gemmini::rmd::rmd_status_message(status));
+                    return GGML_STATUS_FAILED;
+                }
+            } else {
+                ggml_backend_gemmini_mul_mat(ctx, node);
+            }
 #if CYCLE_SIM
             if (cycle_sim_context)
                 cycle_sim_context.session->ensure_healthy();
@@ -259,6 +268,15 @@ ggml_backend_t ggml_backend_gemmini_init(void) {
     };
 
     return backend;
+}
+
+bool ggml_backend_gemmini_get_attention_stats(ggml_backend_t backend,
+                                             ggml_gemmini_attention_stats * stats) {
+    if (!backend || !stats || !ggml_guid_matches(backend->guid, ggml_backend_gemmini_guid())) return false;
+    const auto & m = static_cast<ggml_backend_gemmini_context *>(backend->context)->attention;
+    *stats = {m.qk_nodes, m.pv_nodes, m.main_dots, m.residual_dots,
+              m.main_fragments, m.residual_fragments, m.add_ops, m.provider.work_total_cycles()};
+    return true;
 }
 
 // bool ggml_backend_is_gemmini(ggml_backend_t backend) {

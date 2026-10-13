@@ -1,6 +1,7 @@
 #pragma once
 
 #define GGML_GEMMINI_CONFIG_HAS_ACTIVATION_QUANT 1
+#cmakedefine01 GGML_GEMMINI_ENABLE_A4NKS_ATTENTION
 
 #include <cstddef>
 

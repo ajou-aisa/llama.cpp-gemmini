@@ -1,5 +1,78 @@
 # Nano continuation
 
+## Native model/backend QK/PV: local CPU validation (2026-10-13)
+
+The model now assigns both QK and PV to Gemmini when the opt-in
+`GGML_GEMMINI_ENABLE_A4NKS_ATTENTION` is enabled. A support predicate alone was
+insufficient: the first model smoke test observed zero executed attention nodes.
+Explicit scheduler assignment fixed that; the measurement runner now requires
+one QK and one PV execution per layer on every chunk. Its backend path has no
+Python output-replacement callback. Flash attention and `--no-kv-offload` retain
+their existing routes.
+
+Native code reuses ExSIA LocalStage at rho 6, WideQuantizer, RmdBitmapBuilder and
+the raw IM2P compact-dot provider. Q/P upper digits use the existing stacked
+packet, with packet lane 0 representing original lane 1. This avoids an int32
+overflow for a positive saturated code without dropping the carry. The common
+right-shift helper now implements shifts of 32 or more without clamping to 31.
+All PE values remain signed nibbles transported in int8. BK/column/lane scales
+remain separate until checked int64 host accumulation; overflow fails before
+publishing output or counters. K/V and weighted V colsum are prepared once per
+KV head and reused across its GQA query heads. Projection main/residual flow is
+retained. No mask-based tile skipping is connected to this vanilla backend yet.
+
+Local Release configuration is A4/W4/DIM32/BK32, `OPTION=CPU`,
+`EXECUTION_BACKEND=HARDWARE`, `CYCLE_SIM=0`. These names do **not** mean NPU
+execution: raw dots run on the local CPU and all `raw_cycles` are zero.
+Attention quantization uses the specified logical `(4,4096,512)` geometry;
+the existing local physical header is `(4,4096,1024)`. Real IM2P admission requires
+the matched A4/W4/DIM32/ACC512 numerical provider.
+
+Paired Q4_HP1 model runs, context512 x10, 5,120 input / 2,550 scored tokens:
+
+| Model | Independent attention reference PPL | Native backend PPL | Executed QK / PV nodes |
+| --- | ---: | ---: | ---: |
+| GPT-2 | 34.50487565853103 | 34.50487565853103 | 120 / 120 |
+| Llama-3.2-1B | 13.801307254545438 | 13.801307254545438 | 160 / 160 |
+
+Every chunk's logits hash and every scored token NLL match exactly. Both sides
+use the same existing product linear path; this does not complete the separate
+original selective-linear integration. Reference callbacks reconstruct Q/K/P/V
+independently and multiply in FP64. Their elapsed time is not a speed baseline.
+The PPL runs overlapped checks/builds, so their wall times are diagnostic only.
+
+Validation passed: 3 attention/projection CTests, 7 existing experiment CTests,
+and ExSIA A4 9/9, A8 14/14, A16 9/9. Eleven backend fixtures passed five repeats
+each, including captured GPT-2/Llama QK/PV, GQA, batch broadcasting, strided F16
+views, tails, one-row input, zero P and int32 saturation/carry. The native test
+also verifies caller rounding restoration, nonfinite/overflow failure and
+atomic output publication. IM2P compilation passed a syntax-only check against
+local `5da6a4c` headers; this is not a link or numerical-runtime test.
+The `--require-rtl` negative check also passed: it rejected the CPU build with
+the expected zero-cycle error instead of emitting a successful RTL report.
+
+Local CPU node times below include native quantization, packing, provider work,
+wide merge and publication. Fixture loading and reference comparison are outside
+the interval. Five fresh-backend repeats ran after our PPL runs and builds; no
+warmup was used. These are component observations, not optimization speedups or
+predictions of NPU latency.
+
+| Layer 0, head 0, T512/d64 | Median ms | Min–max ms |
+| --- | ---: | ---: |
+| GPT-2 QK | 84.650 | 76.433–90.892 |
+| GPT-2 PV | 8.973 | 8.875–12.260 |
+| Llama QK | 63.205 | 57.034–87.054 |
+| Llama PV | 9.244 | 7.583–9.510 |
+
+[local-validation.json](results-backend-attention/local-validation.json) contains
+the source/model/configuration/binary hashes, test names, per-chunk equality and
+dispatch evidence, and all 55 component measurements. Nano build/run commands
+are in [README.md](README.md#실제-backend-qkpv-측정). Remaining work is the matched
+IM2P link/run and actual attention RTL measurement, followed by native QK tile
+skip/reuse comparisons. Arbitrary-precision accumulation and full-model
+incremental KV decode remain unverified. The previous standalone replay below
+is a separate measurement path, not the new model backend.
+
 ## Local preparation for vanilla Gemmini QK/PV replay (2026-10-13)
 
 The user requested local code for remote execution, with vanilla QK/PV first and

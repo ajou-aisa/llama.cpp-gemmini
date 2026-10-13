@@ -3,6 +3,8 @@
 
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-matmul.hpp"
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.hpp"
+#include "../ggml/src/ggml-gemmini/matmul/attention.hpp"
+#include "../ggml/src/ggml-gemmini/quants/act/exsia/exsia_shift.hpp"
 
 #include <algorithm>
 #include <array>
@@ -13,6 +15,10 @@
 #include <cstring>
 #include <cstdint>
 #include <limits>
+#include <cfenv>
+#include <chrono>
+#include <fstream>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -1655,7 +1661,119 @@ bool test_q16_pipeline_owns_args_snapshot() {
 
 } // namespace
 
+static bool attention_case(const std::array<int64_t, 10> & shape,
+                           const std::vector<float> & weights, const std::vector<float> & inputs,
+                           const std::vector<float> & expected, bool failure = false) {
+    const auto [role, k, n, rows, kh, qh, kbatches, qbatches, half, interleaved] = shape;
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(
+        ggml_init({size_t{64}*1024*1024, nullptr, false}), ggml_free);
+    if (!expect(bool(ctx), "attention context allocation")) return false;
+    auto operand = [&](ggml_type type, int64_t reduction, int64_t width, int64_t heads, int64_t batches) {
+        auto * tensor = ggml_new_tensor_4d(ctx.get(), type, reduction,
+                                          interleaved ? heads : width, interleaved ? width : heads, batches);
+        return interleaved ? ggml_permute(ctx.get(), tensor, 0, 2, 1, 3) : tensor;
+    };
+    auto * a = operand(half ? GGML_TYPE_F16 : GGML_TYPE_F32, k, n, kh, kbatches);
+    auto * b = operand(GGML_TYPE_F32, k, rows, qh, qbatches);
+    auto fill = [](ggml_tensor * t, const std::vector<float> & values) {
+        size_t index = 0;
+        for (int64_t batch = 0; batch < t->ne[3]; ++batch)
+            for (int64_t head = 0; head < t->ne[2]; ++head)
+                for (int64_t row = 0; row < t->ne[1]; ++row)
+                    for (int64_t c = 0; c < t->ne[0]; ++c) {
+                        char * out = static_cast<char *>(t->data)+batch*t->nb[3]+head*t->nb[2]+row*t->nb[1]+c*t->nb[0];
+                        const float value = values[index++];
+                        if (t->type == GGML_TYPE_F16) {
+                            const ggml_fp16_t f16 = ggml_fp32_to_fp16(value);
+                            std::memcpy(out, &f16, sizeof(f16));
+                        } else std::memcpy(out, &value, sizeof(value));
+                    }
+    };
+    fill(a, weights);
+    fill(b, inputs);
+    auto * out = ggml_mul_mat(ctx.get(), a, b);
+    ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+    const auto selected = role == 0 ? GGML_GEMMINI_ATTENTION_QK : GGML_GEMMINI_ATTENTION_PV;
+    ggml_gemmini_set_attention_role(out, selected);
+    if (!expect(out->op_params[0] == GGML_PREC_F32, "attention role overwrote precision")) return false;
+    std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> backend(ggml_backend_gemmini_init(), ggml_backend_free);
+    if (!expect(bool(backend) && ggml_backend_supports_op(backend.get(), out), "Gemmini rejected attention node")) return false;
+    auto * graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(graph, out);
+    auto * values = static_cast<float *>(out->data);
+    std::fill_n(values, ggml_nelements(out), 123.0f);
+    const int previous_rounding = std::fegetround();
+    std::fesetround(FE_UPWARD);
+    const auto started = std::chrono::steady_clock::now();
+    const auto status = ggml_backend_graph_compute(backend.get(), graph);
+    const auto host_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count();
+    const bool restored = std::fegetround() == FE_UPWARD;
+    std::fesetround(previous_rounding);
+    ggml_gemmini_attention_stats stats{};
+    if (!expect(restored && ggml_backend_gemmini_get_attention_stats(backend.get(), &stats), "rounding/stats contract")) return false;
+    if (failure) {
+        return expect(status == GGML_STATUS_FAILED && stats.qk_nodes == 0 && stats.pv_nodes == 0 &&
+                      std::all_of(values, values+ggml_nelements(out), [](float v) { return v == 123; }),
+                      "failed attention published partial values or metrics");
+    }
+    if (!expect(status == GGML_STATUS_SUCCESS, "attention graph compute failed")) return false;
+    if (!expect(stats.qk_nodes == (role == 0 ? 1u : 0u) && stats.pv_nodes == (role == 1 ? 1u : 0u) &&
+                stats.main_dots > 0, "attention bypassed backend executor")) return false;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        if (values[i] != expected[i]) {
+            std::fprintf(stderr, "attention mismatch at %zu: got %.9g expected %.9g\n", i, values[i], expected[i]);
+            return false;
+        }
+    }
+    std::printf("ATTENTION role=%s main_dots=%llu residual_dots=%llu main_fragments=%llu residual_fragments=%llu adds=%llu raw_cycles=%llu host_ns=%lld\n",
+                role == 0 ? "qk" : "pv", (unsigned long long)stats.main_dots, (unsigned long long)stats.residual_dots,
+                (unsigned long long)stats.main_fragments, (unsigned long long)stats.residual_fragments,
+                (unsigned long long)stats.add_ops, (unsigned long long)stats.raw_cycles, (long long)host_ns);
+    return true;
+}
+
+static bool test_attention() {
+    using ggml::gemmini::quants::act::exsia::detail::shift_q_i32;
+    if (!expect(shift_q_i32(INT32_MIN, -32) == -1 && shift_q_i32(INT32_MIN, -33) == 0 &&
+                shift_q_i32(INT32_MAX, -32) == 0 && shift_q_i32(-3, -1) == -2,
+                "wide right-shift boundaries")) return false;
+    for (int64_t role : {0, 1}) {
+        const std::array<int64_t, 10> shape{role, 33, 5, 3, 2, 4, 1, 2, 1, 1};
+        std::vector<float> weights(33*5*2, 1.0f), inputs(33*3*4*2, role == 0 ? 1.0f : 0.25f);
+        std::vector<float> expected(5*3*4*2, role == 0 ? 33.0f : 8.25f);
+        if (!attention_case(shape, weights, inputs, expected)) return false;
+        std::fill(inputs.begin(), inputs.end(), 0.0f);
+        std::fill(expected.begin(), expected.end(), 0.0f);
+        if (!attention_case(shape, weights, inputs, expected)) return false;
+        inputs.back() = std::numeric_limits<float>::quiet_NaN();
+        if (!attention_case(shape, weights, inputs, expected, true)) return false;
+    }
+    for (int64_t role : {0, 1}) {
+        const std::array<int64_t, 10> shape{role, 64, 1, 1, 1, 1, 1, 1, 0, 0};
+        std::vector<float> weights(64, 0x1p-80f), inputs(64, 1.0f), expected(1);
+        std::fill(weights.begin()+32, weights.end(), 0x1p80f);
+        if (!attention_case(shape, weights, inputs, expected, true)) return false;
+    }
+    return true;
+}
+
+static bool attention_fixture(const char * path) {
+    std::ifstream file(path, std::ios::binary);
+    std::array<int64_t, 10> shape{};
+    file.read(reinterpret_cast<char *>(shape.data()), sizeof(shape));
+    if (!file || !std::all_of(shape.begin()+1, shape.begin()+8, [](int64_t v) { return v > 0 && v <= 4096; })) return false;
+    std::vector<float> weights(size_t(shape[1]*shape[2]*shape[4]*shape[6]));
+    std::vector<float> inputs(size_t(shape[1]*shape[3]*shape[5]*shape[7]));
+    std::vector<float> expected(size_t(shape[2]*shape[3]*shape[5]*shape[7]));
+    for (auto * v : {&weights, &inputs, &expected})
+        file.read(reinterpret_cast<char *>(v->data()), std::streamsize(v->size()*sizeof(float)));
+    if (!file) return false;
+    return attention_case(shape, weights, inputs, expected);
+}
+
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--case=attention") return test_attention() ? 0 : 1;
+    if (argc == 3 && std::string(argv[1]) == "--attention-fixture") return attention_fixture(argv[2]) ? 0 : 1;
     if (argc == 2 && std::string(argv[1]) == "--case=hp1-native-admission") {
         return test_hp1_native_weight_admission() ? 0 : 1;
     }

@@ -1,5 +1,81 @@
 # PoTal A4 제한 조건 실험
 
+## 실제 backend QK/PV 측정
+
+`GGML_GEMMINI_ENABLE_A4NKS_ATTENTION=ON`은 모델의 QK와 PV를 Gemmini에 함께
+배정한다. 기본값은 OFF이며, 활성화 조건은 A4/W4/DIM32/BK32, sigma 2,
+INT, `CYCLE_SIM=0`이다. F32 Q/P와 F32/F16 K/V, GQA 및 strided cache view를
+지원한다. `--no-kv-offload`와 flash attention 경로는 이 기능을 사용하지 않는다.
+
+이 경로는 기존 ExSIA LocalStage(rho 6), WideQuantizer, RMD bitmap/stack,
+`execute_im2p_compact_dot`을 사용한다. main과 모든 residual은 signed nibble을
+int8에 담아 PE에 전달한다. K는 두 패스, V는 한 패스이며 BK/column/lane별
+보정은 raw dot 뒤 checked int64로 누적한다. PV의 weighted colsum은 KV head마다
+한 번 준비해 GQA query head에 재사용한다. int64 범위를 넘는 누적은 명시적으로
+실패하고 output을 게시하지 않는다. 임의 정밀도 fallback은 아직 없다.
+
+아래는 Nano의 기존 호환 source/artifact가 보존된 경우의 설정이다. IM2P의
+manifest·frontend ABI 검사를 통과해야 하며, cache가 없으면
+`results-nano/transfer-20261012/commands.json`의 빌드 기록부터 복구한다.
+설치된 다른 IM2P checkout이나 CPU functional library를 RTL 측정에 쓰지 않는다.
+
+```sh
+rtk proxy cmake -S . -B build-potal-attention-hp1 -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_GEMMINI=ON -DGGML_BACKEND_DL=OFF -DGGML_CUDA=OFF -DGGML_METAL=OFF \
+  -DGGML_GEMMINI_OPTION=WS -DGGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM \
+  -DIM2P_SIM_IMPLEMENTATION=GEMMINI_HP1 -DIM2P_SIM_ROOT=/tmp/potal-nano-im2p-compatible \
+  -DIM2P_SIM_BUILD_DIR=/tmp/potal-nano-hp1-matched \
+  -DGEMMINI_SW_PATH=/home/dyndnn/Projects/RISC-V-DynDNN-gemmini-include \
+  -DGGML_GEMMINI_ACTIVATION_BITS=4 -DGGML_GEMMINI_WEIGHT_BITS=4 \
+  -DGGML_GEMMINI_DIM=32 -DGGML_GEMMINI_BLOCK_SIZE=32 \
+  -DGGML_GEMMINI_ENABLE_A4NKS_ATTENTION=ON -DCYCLE_SIM=0 -DLOG_CYCLE=0 \
+  -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF
+rtk proxy cmake --build build-potal-attention-hp1 --target llama test-gemmini-matmul -j2
+rtk proxy /tmp/potal-nano-venv/bin/python -m experiments.potal_a4.verify \
+  --backend build-potal-attention-hp1/bin/test-gemmini-matmul \
+  --require-rtl --repeats 5 --report output/potal-backend-attention-rtl.json
+```
+
+측정은 vanilla QK/PV이다. 기존 `im2p_measure --experiments`의 mask/direct 실험과
+새 backend의 결과를 혼동하지 않는다. 새 backend에는 QK tile skip을 아직 옮기지
+않았다. `host_ns`는 native 양자화·패킹·provider 생성/실행·wide merge·출력 게시를
+포함하고 fixture 읽기와 정답 검사는 제외한다. `raw_cycles`는 실제 provider의
+RTL cycle이며 host 양자화·누적 시간을 포함하지 않는다. 시뮬레이터 wall time을
+NPU latency로 해석하지 않는다. `--require-rtl`은 cycle이 0이면 실패한다.
+
+`main_dots`는 K의 두 dense nibble 패스를 모두 포함한 raw 호출 수다.
+fragment 집계에서는 명세대로 K-high를 residual에 넣는다. residual fragment는
+기존 RMD의 실제 블록별 stacked row/column 패딩으로 세므로, 명세 D의 stripe
+전체 합집합으로 계산한 reference 비용과 같다고 가정하지 않는다. `add_ops`는
+GQA에서 재사용한 실제 KV colsum과 각 query head의 zero-point broadcast를 센다.
+
+CPU 기능 검사는 같은 옵션에서 `OPTION=CPU`, `EXECUTION_BACKEND=HARDWARE`를
+사용하고 IM2P 옵션과 `--require-rtl`을 생략한다. 이때 `raw_cycles=0`이다.
+
+모델 정확도 비교는 기존 native runner의 `backend-attention` 모드다. backend
+실행에는 Python output replacement callback이 없으며, 매 chunk마다 모든
+layer의 QK/PV가 실제 backend 카운터에 기록됐는지 확인한다. 별도 reference
+실행만 Python 재구성 피연산자/FP64 GEMM을 사용한다. 두 실행의 logits hash와
+모든 token NLL을 정확히 비교한다. reference의 callback 시간으로 speedup을
+계산하지 않는다.
+
+```sh
+rtk proxy cmake -S experiments/potal_a4 -B build-potal-attention-runner \
+  -DCMAKE_BUILD_TYPE=Release -DPOTAL_ENABLE_BACKEND_ATTENTION=ON \
+  -DLLAMA_LIB_DIR=/home/dyndnn/Projects/llama.cpp-gemmini/build-potal-attention-hp1/bin
+rtk proxy cmake --build build-potal-attention-runner --target potal-native-replay -j2
+rtk proxy /tmp/potal-nano-venv/bin/python -m experiments.potal_a4.native_measure backend-attention \
+  build-potal-attention-runner/libpotal-native-replay.so models/gpt2.Q4_HP1.gguf \
+  experiments/potal_a4/results-upper-compare-gpt2-10chunk/tokens.i32 \
+  output/potal-backend-gpt2-10chunk --context 512 --chunks 10 --require-rtl
+```
+
+Llama에는 `models/llama3.2-1B.Q4_HP1.gguf`와
+`experiments/potal_a4/results-qk-batch-10chunk/tokens.i32`를 사용한다. Nano의 실제
+모델 경로가 다르면 그 경로를 전달한다. 전체 모델 RTL 실행은 많은 cycle이
+필요하므로 먼저 위 backend fixture가 정확도·실행 admission을 통과해야 한다.
+현재 로컬 검증과 원격 미검증 범위는 [진행 기록](NANO_PROGRESS.md)에 기록한다.
+
 Nano / Gemmini IM2P에서 이어갈 때는 저장소 루트의 [POTAL_NANO_HANDOFF.md](../../POTAL_NANO_HANDOFF.md)를 먼저 읽는다. [원래 알고리즘](ORIGINAL_SPEC.md)과 [전체 구현 계획](IMPLEMENTATION_PLAN.md)도 이 브랜치에 보관했다.
 
 현재 진행 상태는 [NANO_PROGRESS.md](NANO_PROGRESS.md), 요구사항별 남은 검증은
@@ -9,8 +85,9 @@ Nano / Gemmini IM2P에서 이어갈 때는 저장소 루트의 [POTAL_NANO_HANDO
 통과했다. [현재 코드 변경과 측정 증빙](results-source-zero-common/)을 참조한다.
 [과거 nano A4 zero-only 결과](results-outlier-zero/comparison.json)는 CPU main/RMD·FP attention·ACC1024
 조건으로 40.18882947→40.20531900이다. 아래 Mac/8-chunk 실험 기록과 직접 비교하지 않는다.
-IM2P archive 빌드·manifest·링크와 실제 raw 정수곱 15건은 통과했다. 제품 a4nks
-통합은 별도 미완료 항목이다. 일반 nibble과 0/±1 입력의 32×32×32 곱은 모두
+IM2P archive 빌드·manifest·링크와 실제 raw 정수곱 15건은 과거 Nano에서 통과했다.
+현재 제품 a4nks 연결은 위의 opt-in 경로이며 attention RTL 검증은 남아 있다.
+일반 nibble과 0/±1 입력의 32×32×32 곱은 모두
 492 RTL cycles였다. [실측 근거](results-unit-add-llama512/rtl-raw.json)를 참조한다.
 
 2026-10-12 로컬 이관의 파일 목록·실행 명령·의존성/해시 기록은
@@ -20,7 +97,9 @@ IM2P archive 빌드·manifest·링크와 실제 raw 정수곱 15건은 통과했
 nano 커밋 `63e166d`에는 구현이나 전후 측정이 없다. 이후 로컬 QK 실험과
 원본 소스 대조 결과는 [NANO_PROGRESS.md](NANO_PROGRESS.md)의 최상단에 있다.
 
-이 디렉터리는 `hotfix/potal-attn`의 **실험 구현**이다. CPU에서 선형·Q direct-limb 정책과 K/P/V 양자화를 적용한 GPT-2 forward를 실행하고, 저장 버퍼와 정확도를 비교한다. 제품의 Gemmini attention dispatch와 fused upper-digit API는 아직 연결하지 않았다.
+이 디렉터리는 `hotfix/potal-attn`에서 시작해 현재 `work/potal-qk-mask-local`에
+보존된 실험과 검증 도구다. Python reference, standalone replay, 모델의 native
+backend 측정을 구분한다. 원문 선형 통합과 fused upper-digit API는 아직 남아 있다.
 
 실측 결론은 [RESULTS.md](RESULTS.md), 조건별 원자료는 [results-v3](results-v3/)에 있다.
 

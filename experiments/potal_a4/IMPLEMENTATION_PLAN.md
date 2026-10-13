@@ -1,5 +1,19 @@
 # PoTal A4NKS: nano / IM2P implementation plan
 
+## Current implementation checkpoint (2026-10-13)
+
+The opt-in native QK/PV backend is now implemented in `matmul/attention.cpp`.
+Graph construction marks and explicitly assigns both nodes to Gemmini; generic
+shared-weight admission alone did not prevent CPU scheduling. Q/P quantization
+reuses LocalStage/WideQuantizer, upper packets reuse RmdBitmapBuilder, and raw
+IM2P dots reuse execute_im2p_compact_dot. Existing projection main/residual flow
+is retained. QK mask skipping remains in the separate experiment, not this
+vanilla backend. Checked int64 accumulation rejects overflow atomically;
+arbitrary precision remains unfinished. This supersedes the older plan's blanket
+statement that no native attention dispatch exists, not its unfinished hardware
+validation. See [run commands](README.md#실제-backend-qkpv-측정) and
+[current evidence](NANO_PROGRESS.md) before implementing another owner.
+
 Portable continuation of the existing work plan, with the latest accuracy-preserving policy. Read [the handoff](../../POTAL_NANO_HANDOFF.md) first. Historical experiment snapshot: `hotfix/potal-attn` at `ba762b951ec267aa3abed6bab9e3466431416307`; continuation branch: `work/potal-attn-im2p-nano`. The unchecked product tasks below are still unfinished. [Original algorithm](ORIGINAL_SPEC.md) and [measured attention costs](ATTENTION_PROFILE.md) travel with this branch.
 
 ## TL;DR (For humans)
@@ -24,6 +38,11 @@ Portable continuation of the existing work plan, with the latest accuracy-preser
 
 ## Latest user decisions and evidence boundaries
 
+- 2026-10-13 follow-up: QK/PV must execute through the model's Gemmini backend,
+  not only standalone capture replay. The opt-in native implementation and
+  explicit graph assignment are present. Model runs verify both node counts per
+  layer against the independent reference. Local CPU execution does not establish
+  IM2P runtime compatibility or NPU speed; the Nano link/run is still required.
 - 2026-10-13: Prepare local code for remote Gemmini QK/PV checks, vanilla without
   masking by default. Reuse the raw provider and existing batch loop; keep direct
   accumulation/QK skipping behind `--experiments`. Quantization, int8 packing and

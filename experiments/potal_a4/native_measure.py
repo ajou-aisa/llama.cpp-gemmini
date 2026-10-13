@@ -656,7 +656,125 @@ def cuda_replay(args: list[str]) -> None:
         gpu.close()
 
 
+def backend_attention(args: list[str]) -> None:
+    import argparse
+    import hashlib
+    import platform
+
+    parser = argparse.ArgumentParser(description="Paired PoTal reference and actual model/backend attention")
+    parser.add_argument("library", type=Path)
+    parser.add_argument("model", type=Path)
+    parser.add_argument("tokens", type=Path)
+    parser.add_argument("output", type=Path)
+    parser.add_argument("--context", type=int, default=512)
+    parser.add_argument("--chunks", type=int, default=10)
+    parser.add_argument("--require-rtl", action="store_true")
+    options = parser.parse_args(args)
+    if options.context % 32 or not 32 <= options.context <= 1024 or options.chunks < 1:
+        parser.error("Require context in 32..1024, multiple of 32, and positive chunks")
+    tokens = np.fromfile(options.tokens, dtype=np.int32)
+    if tokens.size < options.context*options.chunks:
+        parser.error("Not enough saved tokens")
+    lib = ct.CDLL(str(options.library.resolve()))
+    fp, ip = ct.POINTER(ct.c_float), ct.POINTER(ct.c_int64)
+    hook_type = ct.CFUNCTYPE(ct.c_int, ct.c_int, ct.c_int, fp, fp, fp, ip, ip, ip, fp, ip, ct.c_void_p)
+    i32 = np.ctypeslib.ndpointer(dtype=np.int32, flags="C_CONTIGUOUS")
+    f64 = np.ctypeslib.ndpointer(dtype=np.float64, flags="C_CONTIGUOUS")
+    u64 = np.ctypeslib.ndpointer(dtype=np.uint64, flags="C_CONTIGUOUS")
+    lib.potal_replay_error.restype = ct.c_char_p
+    lib.potal_replay_open.argtypes = [ct.c_char_p, ct.c_int, ct.c_int, ct.c_int, hook_type, ct.c_void_p]
+    lib.potal_replay_open.restype = ct.c_void_p
+    lib.potal_backend_open.argtypes = [ct.c_char_p, ct.c_int, ct.c_int]
+    lib.potal_backend_open.restype = ct.c_void_p
+    lib.potal_backend_stats.argtypes = [ct.c_void_p, u64]
+    lib.potal_backend_stats.restype = ct.c_int
+    lib.potal_replay_close.argtypes = [ct.c_void_p]
+    lib.potal_replay_eval.argtypes = [ct.c_void_p, i32, ct.c_int, f64]
+    lib.potal_replay_eval.restype = ct.c_int
+    lib.potal_replay_vocabulary.argtypes = [ct.c_void_p]
+    lib.potal_replay_vocabulary.restype = ct.c_int
+    lib.potal_replay_logits.argtypes = [ct.c_void_p]
+    lib.potal_replay_logits.restype = fp
+    errors: list[str] = []
+
+    @hook_type
+    def reference(role, layer, a_ptr, b_ptr, out_ptr, a_shape, b_shape, out_shape, mask, mask_shape, data):
+        try:
+            a = np.ctypeslib.as_array(a_ptr, shape=(int(np.prod(a_shape[:4])),)).reshape(tuple(a_shape[:4])[::-1])
+            b = np.ctypeslib.as_array(b_ptr, shape=(int(np.prod(b_shape[:4])),)).reshape(tuple(b_shape[:4])[::-1])
+            out = np.ctypeslib.as_array(out_ptr, shape=(int(np.prod(out_shape[:4])),)).reshape(tuple(out_shape[:4])[::-1])
+            for batch in range(b.shape[0]):
+                for head in range(b.shape[1]):
+                    operand, _, weights = prepare_head(role, b[batch, head],
+                        a[batch//(b.shape[0]//a.shape[0]), head//(b.shape[1]//a.shape[1])], {})
+                    out[batch, head] = operand.values.astype(np.float64) @ weights.values.astype(np.float64)
+            return 0
+        except Exception as error:
+            errors.append(str(error))
+            return 1
+
+    def stats(handle) -> np.ndarray:
+        result = np.zeros(8, np.uint64)
+        if lib.potal_backend_stats(handle, result):
+            raise QuantError(lib.potal_replay_error().decode())
+        return result
+
+    options.output.mkdir(parents=True, exist_ok=False)
+    handles = []
+    records = []
+    try:
+        handles.append(lib.potal_replay_open(str(options.model.resolve()).encode(), options.context, 4, 1, reference, None))
+        handles.append(lib.potal_backend_open(str(options.model.resolve()).encode(), options.context, 4))
+        if not all(handles):
+            raise QuantError(lib.potal_replay_error().decode())
+        vocabulary = lib.potal_replay_vocabulary(handles[0])
+        for chunk in range(options.chunks):
+            pair = {}
+            for mode in (chunk % 2, 1-chunk % 2):
+                before = stats(handles[mode]) if mode else None
+                nll = np.empty(options.context//2-1, np.float64)
+                start = perf_counter_ns()
+                calls = lib.potal_replay_eval(handles[mode], tokens[chunk*options.context:(chunk+1)*options.context], options.context, nll)
+                elapsed = perf_counter_ns()-start
+                if calls < 0:
+                    raise QuantError(errors[-1] if errors else lib.potal_replay_error().decode())
+                logits = np.ctypeslib.as_array(lib.potal_replay_logits(handles[mode]), shape=(len(nll), vocabulary))
+                record = {"chunk": chunk, "mode": "backend" if mode else "reference", "nodes": calls,
+                          "nll": nll.tolist(), "ppl": float(np.exp(nll.mean())), "wall_ns": elapsed,
+                          "logits_sha256": hashlib.sha256(logits.tobytes()).hexdigest()}
+                if mode:
+                    delta = stats(handles[mode])-before
+                    record["backend"] = dict(zip(("qk_nodes", "pv_nodes", "main_dots", "residual_dots",
+                        "main_fragments", "residual_fragments", "add_ops", "raw_cycles"), map(int, delta)))
+                    if options.require_rtl and delta[-1] == 0:
+                        raise QuantError("No real Gemmini cycles recorded")
+                pair[mode] = record
+                records.append(record)
+                with (options.output/"chunks.jsonl").open("a") as target:
+                    target.write(json.dumps(record)+"\n")
+                print(json.dumps({k: v for k, v in record.items() if k != "nll"}), flush=True)
+            if pair[0]["nll"] != pair[1]["nll"] or pair[0]["logits_sha256"] != pair[1]["logits_sha256"]:
+                raise QuantError(f"Backend/reference model mismatch in chunk {chunk}")
+    finally:
+        for handle in handles:
+            if handle:
+                lib.potal_replay_close(handle)
+    with (options.output/"summary.json").open("x") as target:
+        json.dump({"scope": "Model QK/PV dispatched to Gemmini; paired reconstructed-operand FP64 reference",
+                   "platform": platform.platform(), "context": options.context, "chunks": options.chunks,
+                   "model": str(options.model.resolve()), "tokens_sha256": hashlib.sha256(tokens[:options.context*options.chunks].tobytes()).hexdigest(),
+                   "library_sha256": hashlib.sha256(options.library.read_bytes()).hexdigest(),
+                   "nll_and_logits_equal": True, "require_rtl": options.require_rtl,
+                   "ppl": {mode: float(np.exp(np.mean([v for record in records if record["mode"] == mode for v in record["nll"]])))
+                           for mode in ("reference", "backend")},
+                   "limitations": ["Reference uses output replacement and is an accuracy oracle, not a speed baseline",
+                                   "Host simulator wall time is not NPU latency; raw_cycles excludes host quantization and wide merge"]}, target, indent=2)
+
+
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "backend-attention":
+        backend_attention(sys.argv[2:])
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "batch-components":
         batch_components(sys.argv[2:])
         return
