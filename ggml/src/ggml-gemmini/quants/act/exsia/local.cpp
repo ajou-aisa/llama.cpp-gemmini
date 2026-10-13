@@ -185,8 +185,7 @@ void WideQuantizer::quantize_block(const std::vector<float> & x,
         size_t        col = col_offset + i;
         const int32_t tmp = null_theta ? 0 : quantize_to_i32(x[i], theta_b);
         q[i]              = tmp;
-        if ((!use_mask || !mask.is_set(row, col)) &&
-            (GGML_GEMMINI_ACTIVATION_BITS != 4 || x[i] != 0.0f)) {
+        if (!use_mask || !mask.is_set(row, col)) {
             const __int128_t magnitude = static_cast<__int128_t>(magnitude_i32(tmp));
             S += magnitude;
             SS += magnitude * magnitude;
@@ -210,7 +209,7 @@ void WideQuantizer::quantize_block(const std::vector<float> & x,
     for (size_t i = 0; i < n; ++i) {
         const int32_t tmp = null_theta ? 0 : quantize_to_i32(x[i], theta_b);
         q[i]              = tmp;
-        if (!mask.is_set(i) && (GGML_GEMMINI_ACTIVATION_BITS != 4 || x[i] != 0.0f)) {
+        if (!mask.is_set(i)) {
             const __int128_t magnitude = static_cast<__int128_t>(magnitude_i32(tmp));
             S += magnitude;
             SS += magnitude * magnitude;
@@ -235,7 +234,7 @@ void WideQuantizer::quantize_block(const float *          x,
     for (size_t i = 0; i < count; ++i) {
         const int32_t tmp = null_theta ? 0 : quantize_to_i32(x[i], theta_b);
         q[i]              = tmp;
-        if (!mask.is_set(i) && (GGML_GEMMINI_ACTIVATION_BITS != 4 || x[i] != 0.0f)) {
+        if (!mask.is_set(i)) {
             const __int128_t magnitude = static_cast<__int128_t>(magnitude_i32(tmp));
             S += magnitude;
             SS += magnitude * magnitude;
@@ -408,10 +407,14 @@ bool LocalStage::run_optimized_full(Meta &          meta,
     theta_pre             = exp_to_theta(e_pre, meta.rho);
     const bool null_theta = theta_pre == neg_inf;
     for (size_t i = 0; i < block_size; ++i) {
+        // Source zero is excluded; a nonzero source rounded to zero remains in U.
+        if (blk.e[i] == neg_inf) {
+            q_out[i] = 0;
+            continue;
+        }
         const int32_t tmp = null_theta ? 0 : quantize_to_i32(x[i], theta_pre);
         q_out[i]          = tmp;
-        // A4 uses source-nonzero samples, including nonzero values rounded to zero.
-        if (block_mask.is_set(i) || (GGML_GEMMINI_ACTIVATION_BITS == 4 && blk.e[i] == neg_inf))
+        if (block_mask.is_set(i))
             continue;
 
         const __int128_t magnitude = static_cast<__int128_t>(magnitude_i32(tmp));
@@ -444,7 +447,7 @@ bool LocalStage::run_optimized_full(Meta &          meta,
     ++cycle_sample.sigma_context_prepare_count;
 #endif
     for (size_t i = 0; i < block_size; ++i) {
-        if (block_mask.is_set(i) || (GGML_GEMMINI_ACTIVATION_BITS == 4 && blk.e[i] == neg_inf))
+        if (blk.e[i] == neg_inf || block_mask.is_set(i))
             continue;
 
         if (unit_sigma_.detect(q_out[i], sigma_context)) {
@@ -596,10 +599,13 @@ bool LocalStage::run_optimized_partial(Meta &          meta,
     theta_pre             = exp_to_theta(e_pre, meta.rho);
     const bool null_theta = theta_pre == neg_inf;
     for (size_t i = 0; i < block_size; ++i) {
+        if (i >= valid_count || blk.e[i] == neg_inf) {
+            q_out[i] = 0;
+            continue;
+        }
         const int32_t tmp = null_theta ? 0 : quantize_to_i32(blk.x[i], theta_pre);
         q_out[i]          = tmp;
-        if (i >= valid_count || block_mask.is_set(i) ||
-            (GGML_GEMMINI_ACTIVATION_BITS == 4 && blk.e[i] == neg_inf))
+        if (block_mask.is_set(i))
             continue;
 
         const __int128_t magnitude = static_cast<__int128_t>(magnitude_i32(tmp));
@@ -631,7 +637,7 @@ bool LocalStage::run_optimized_partial(Meta &          meta,
     ++cycle_sample.sigma_context_prepare_count;
 #endif
     for (size_t i = 0; i < valid_count; ++i) {
-        if (block_mask.is_set(i) || (GGML_GEMMINI_ACTIVATION_BITS == 4 && blk.e[i] == neg_inf))
+        if (blk.e[i] == neg_inf || block_mask.is_set(i))
             continue;
         if (unit_sigma_.detect(q_out[i], sigma_context)) {
             block_mask.set(i);
@@ -770,8 +776,7 @@ bool LocalStage::run_reference(Meta &                     meta,
 
     for (size_t i = 0; i < blk_size; ++i) {
         const size_t col = blk_idx * blk_size + i;
-        if (col < state.K_logical && !block_mask.is_set(i) &&
-            (GGML_GEMMINI_ACTIVATION_BITS != 4 || blk.e[i] != neg_inf))
+        if (col < state.K_logical && blk.e[i] != neg_inf && !block_mask.is_set(i))
             ++unmasked_count;
     }
 
@@ -785,8 +790,7 @@ bool LocalStage::run_reference(Meta &                     meta,
 
     for (size_t i = 0; i < blk_size; ++i) {
         const size_t col = blk_idx * blk_size + i;
-        if (col >= state.K_logical || block_mask.is_set(i) ||
-            (GGML_GEMMINI_ACTIVATION_BITS == 4 && blk.e[i] == neg_inf))
+        if (col >= state.K_logical || blk.e[i] == neg_inf || block_mask.is_set(i))
             continue;
 
         if (unit_sigma_.detect_sigma(q_tmp[i], S, SS, unmasked_count)) {

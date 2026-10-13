@@ -58,17 +58,21 @@ bool check(bool value, const char * message) {
     return value;
 }
 
-bool test_a4_source_zero_sigma() {
-#if GGML_GEMMINI_ACTIVATION_BITS == 4 && EXSIA_VALIDATION
+bool test_source_zero_sigma() {
+#if EXSIA_VALIDATION
     using namespace quants::act::exsia;
-    for (size_t valid : {size_t{7}, size_t{32}}) {
-        for (bool all_zero : {false, true}) {
-            std::vector<float> input(32, 0.0f);
-            if (!all_zero) {
-                input[0] = 8.0f; // top bucket: excluded independently of zero handling
+    for (size_t valid : {size_t{1}, size_t{7}, size_t{32}}) {
+        for (size_t nonzero : {size_t{0}, size_t{1}, size_t{4}}) {
+            if (nonzero > valid)
+                continue;
+            std::vector<float> input(32, -0.0f);
+            input[4] = 0.0f;
+            if (nonzero)
+                input[0] = 8.0f;
+            if (nonzero == 4) {
                 input[1] = 1.0f;
                 input[2] = 1.75f;
-                input[3] = 0.001f; // nonzero source rounded to zero must remain in U
+                input[3] = 0x1p-20f; // nonzero source rounded to zero must remain in U
             }
             Meta meta;
             ExSIAState state;
@@ -83,6 +87,7 @@ bool test_a4_source_zero_sigma() {
             uint64_t mask_word = 0;
             BlockMask mask(&mask_word, 32);
             std::array<int32_t, 32> output{};
+            output.fill(12345);
             int16_t exponent = 0;
             LocalBlockCycleSample sample;
             if (!stage.run_optimized(meta, state, input.data(), valid, 32, 0, 0,
@@ -92,14 +97,21 @@ bool test_a4_source_zero_sigma() {
 #endif
                                      ))
                 return false;
-            const size_t expected_count = all_zero ? 0 : 3;
+            const size_t expected_count = nonzero == 4 ? 3 : nonzero;
+            const int64_t q1 = int64_t{1} << meta.rho;
+            const int64_t q2 = 7 * q1 / 4;
+            const int64_t expected_sum = nonzero == 4 ? q1 + q2 : nonzero * q1;
+            const int64_t expected_ss = nonzero == 4 ? q1 * q1 + q2 * q2 : nonzero * q1 * q1;
+            const int16_t expected_exp = nonzero == 4 ? 0 : nonzero == 1 ? 3 :
+                std::numeric_limits<int16_t>::min();
             if (!check(scratch.reference.p1_N == expected_count,
-                       "A4 sigma population excludes source zero, retains rounded zero") ||
-                !check(scratch.reference.p1_S == (all_zero ? 0 : 11) &&
-                       scratch.reference.p1_SS == (all_zero ? 0 : 65),
-                       "A4 sigma statistics match independent integer fixture") ||
-                !check(mask_word == (all_zero ? 0 : 1),
-                       "A4 sigma fixture selects only the top bucket"))
+                       "sigma population excludes signed source zeros, retains rounded zero") ||
+                !check(scratch.reference.p1_S == expected_sum &&
+                       scratch.reference.p1_SS == expected_ss,
+                       "sigma statistics match independent integer fixture") ||
+                !check(mask_word == (nonzero == 4 ? 1 : 0) && exponent == expected_exp,
+                       "sigma fixture preserves singleton and selects only a distinct top bucket") ||
+                !check(output[3] == 0, "nonzero fixture source rounds to zero"))
                 return false;
             const uint64_t optimized_mask = mask_word;
             std::vector<int32_t> reference(32);
@@ -110,7 +122,7 @@ bool test_a4_source_zero_sigma() {
                                      reference, reference_exp, sample) ||
                 !check(mask_word == optimized_mask && reference_exp[0] == exponent &&
                        std::equal(reference.begin(), reference.end(), output.begin()),
-                       "A4 full/tail and reference zero handling agree"))
+                       "full/tail and reference zero handling agree"))
                 return false;
         }
     }
@@ -3576,7 +3588,7 @@ int main(int argc, char ** argv) {
                        case_name == "hp1-srmd-software-ws" || case_name == "rmd-direct-parity" ||
                        case_name == "direct-executor" || case_name == "rmd-gather" ||
                        case_name == "stripe-geometry" || case_name == "meta-rho" ||
-                       case_name == "non-outlier-clipping" || case_name == "a4-source-zero-sigma" ||
+                       case_name == "non-outlier-clipping" || case_name == "source-zero-sigma" ||
                        case_name == "non-exsia-capture-context" || case_name == "packet-capture";
     if (!known) {
         std::fprintf(stderr, "unknown case: %s\n", case_name.c_str());
@@ -3585,13 +3597,13 @@ int main(int argc, char ** argv) {
 
     std::printf("TEST_CASE_BEGIN name=%s\n", case_name.c_str());
     const bool ok =
-        (case_name == "all" && test_a4_source_zero_sigma() && test_meta_rho_invariant() && test_non_exsia_capture_context() &&
+        (case_name == "all" && test_source_zero_sigma() && test_meta_rho_invariant() && test_non_exsia_capture_context() &&
          test_non_outlier_clipping_policy() && test_exsia_packet_capture() &&
          test_exsia_baseline() && test_dispatch_modes() && test_compiled_width_rmd_suite() &&
          test_direct_cpu_executor() && test_activation_stripe_geometry_contract() &&
          test_cpu_direct_residual_dequantization()) ||
         (case_name == "baseline" && test_exsia_baseline()) ||
-        (case_name == "a4-source-zero-sigma" && test_a4_source_zero_sigma()) ||
+        (case_name == "source-zero-sigma" && test_source_zero_sigma()) ||
         (case_name == "packet-capture" && test_exsia_packet_capture()) ||
         (case_name == "dispatch" && test_dispatch_modes()) ||
         (case_name == "rmd-routes" && test_rmd_cpu_ws_routes()) ||
