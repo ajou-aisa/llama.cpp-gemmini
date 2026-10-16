@@ -43,6 +43,9 @@ if(LOG_CYCLE OR CYCLE_SIM)
 endif()
 
 target_link_libraries(llama PUBLIC ggml)
+if(GGML_GEMMINI_ENABLE_A4NKS_ATTENTION)
+    target_compile_definitions(llama PRIVATE GGML_GEMMINI_ENABLE_A4NKS_ATTENTION=1)
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

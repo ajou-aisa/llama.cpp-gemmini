@@ -3,9 +3,11 @@
 #include <string>
 
 #include "ggml-backend.h"
+#include "matmul/attention.hpp"
 
 struct ggml_backend_gemmini_context {
     std::string model_arch;
+    ggml::gemmini::AttentionMetrics attention;
 };
 
 void ggml_backend_gemmini_mul_mat(ggml_backend_gemmini_context * ctx, struct ggml_tensor * dst);

@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 #include <gemmini/optrace.hpp>
+#include <gemmini/trace-context.h>
 #if CYCLE_SIM
 #include <gemmini/cycle_sim_log.hpp>
 #endif
@@ -127,8 +128,10 @@ struct Im2pCompactDot {
     size_t                  columns                     = 0;
     size_t                  weight_row_stride           = 0;
     size_t                  k                           = 0;
-    const uint32_t *        scu_carriers                = nullptr;
+    const uint32_t *        scu_carriers                = nullptr; // [ceil(k/32), columns]
+    size_t                  scu_row_stride              = 0; // 0 uses columns
     uint8_t                 vector_op                   = 0;
+    uint8_t                 trace_role                  = GEMMINI_TRACE_ROLE_RESIDUAL;
     gemmini_cycle_record_v2 timing_identity{};
     // Original weight-block identity shared by the provider and trace.
     uint32_t block_id   = 0;
@@ -151,6 +154,13 @@ RmdStatus execute_im2p_compact_dot(im2p_sim_t *                 sim,
                                    Im2pProviderTestFault        fault = Im2pProviderTestFault::none,
                                    const Im2pFullExecutor *     executor = nullptr);
 
+RmdStatus execute_im2p_compact_dot(im2p_sim_t *                 sim,
+                                   const Im2pCompactDot &       dot,
+                                   std::vector<OutputValue> &   output,
+                                   Im2pProviderStatsAggregate & aggregate,
+                                   Im2pProviderTestFault        fault = Im2pProviderTestFault::none,
+                                   const Im2pFullExecutor *     executor = nullptr);
+
 // Executes one packet-owned cross-block request. `output` and `aggregate` are
 // unchanged unless the one-shot M*N callback and all collection obligations
 // complete successfully.
@@ -162,6 +172,11 @@ RmdStatus execute_im2p_run_aware(im2p_sim_t *                 sim,
 
 struct Im2pRunAwareWork {
     const RunAwareRequest *                                request = nullptr;
+    // Borrow original K-major operands for synchronous reads through request->runs.
+    const std::vector<int32_t> *                           original_weights = nullptr;
+    const std::vector<uint32_t> *                          original_carriers = nullptr;
+    size_t row_begin = 0, row_count = 0;       // 0 count uses the remaining rows
+    size_t column_begin = 0, column_count = 0; // views retain the request's K runs and strides
     gemmini_cycle_record_v2                                timing_identity{};
     std::shared_ptr<const ggml::gemmini::optrace::Context> trace_context{};
     std::string                                            trace_layer{};

@@ -2241,6 +2241,8 @@ bool ggml_backend_gemmini_device_supports_op(ggml_backend_dev_t         dev,
     }
 
     case GGML_OP_MUL_MAT: {
+        if (ggml_gemmini_get_attention_role(op) != GGML_GEMMINI_ATTENTION_NONE)
+            return ggml::gemmini::attention_supported(op);
         if (ggml_is_empty(op)) {
             return true;
         }

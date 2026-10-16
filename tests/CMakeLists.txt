@@ -1437,6 +1437,12 @@ if (GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM" AND NOT GGML_BACKEND_DL)
         endif()
     endif()
 
+    if((CYCLE_SIM OR IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1") AND
+       GGML_GEMMINI_WEIGHT_BITS LESS 16)
+        add_test(NAME test-gemmini-rmd-im2p-provider-dense-scu-stripe
+            COMMAND $<TARGET_FILE:test-gemmini-rmd-im2p-provider> --case dense-scu-stripe)
+    endif()
+
     if (IM2P_SIM_IMPLEMENTATION STREQUAL "GEMMINI_HP1" AND GGML_GEMMINI_ENABLE_RMD AND NOT CYCLE_SIM)
         add_executable(test-gemmini-optrace-dispatch test-gemmini-optrace-dispatch.cpp)
         target_link_libraries(test-gemmini-optrace-dispatch PRIVATE
@@ -1480,6 +1486,10 @@ if (NOT GGML_BACKEND_DL)
     # Dynamic backends are MODULE libraries and cannot be linked into a test.
     add_executable(test-gemmini-matmul test-gemmini-matmul.cpp)
     target_link_libraries(test-gemmini-matmul PRIVATE ggml-gemmini ggml-base ggml-gemmini-utils)
+    if(TARGET ggml-cpu)
+        target_link_libraries(test-gemmini-matmul PRIVATE ggml-cpu)
+        target_compile_definitions(test-gemmini-matmul PRIVATE GGML_GEMMINI_TEST_SOFTMAX=1)
+    endif()
     target_compile_features(test-gemmini-matmul PRIVATE cxx_std_17)
     target_compile_definitions(test-gemmini-matmul PRIVATE
         GGML_GEMMINI_ACTIVATION_BITS=${_GGML_GEMMINI_ACTIVATION_BITS_VALUE}
@@ -1487,6 +1497,10 @@ if (NOT GGML_BACKEND_DL)
         GGML_GEMMINI_ENABLE_RMD=${_GGML_GEMMINI_ENABLE_RMD_VALUE}
         LOG_CYCLE=${LOG_CYCLE} CYCLE_DETAIL=${CYCLE_DETAIL})
     add_test(NAME test-gemmini-matmul COMMAND $<TARGET_FILE:test-gemmini-matmul>)
+    if(GGML_GEMMINI_ENABLE_A4NKS_ATTENTION)
+        add_test(NAME test-gemmini-attention COMMAND $<TARGET_FILE:test-gemmini-matmul> --case=attention)
+        add_test(NAME test-gemmini-attention-mask COMMAND $<TARGET_FILE:test-gemmini-matmul> --case=attention-mask)
+    endif()
     add_test(
         NAME test-gemmini-matmul-finite-output
         COMMAND $<TARGET_FILE:test-gemmini-matmul> --case=finite-output)

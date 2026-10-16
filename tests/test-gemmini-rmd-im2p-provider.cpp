@@ -717,6 +717,69 @@ bool run_compact_dense_parity(bool hp1) {
                     dense_probe.domain);
     return ok;
 }
+
+bool run_dense_scu_stripe() {
+    if (!run_aware_backend()) return true;
+    Sim sim(im2p_sim_create());
+    if (!check(bool(sim), "SCU stripe simulator allocation")) return false;
+    std::array<int8_t, 2*96> activations{};
+    std::fill_n(activations.begin(), 65, int8_t{1});
+    std::fill_n(activations.begin()+96, 65, int8_t{-1});
+    std::array<int32_t, 65*3> weights;
+    weights.fill(1);
+    for (size_t k = 32; k < 64; ++k) weights[k*3+2] = -1;
+    const std::array<uint32_t, 9> carriers{0, 2, 0x80000000u, 1, 1, 30, 2, 0, 0};
+    detail::Im2pCompactDot dot;
+    dot.operand_bits = GGML_GEMMINI_ACTIVATION_BITS;
+    dot.activations = activations.data();
+    dot.rows = 2;
+    dot.activation_row_stride_bytes = 96;
+    dot.weights = weights.data();
+    dot.columns = 3;
+    dot.weight_row_stride = 3;
+    dot.k = 65;
+    dot.scu_carriers = carriers.data();
+    dot.vector_op = IM2P_VECTOR_LEFT_SHIFT;
+    std::array<int64_t, 6> output{};
+    detail::Im2pProviderStatsAggregate stats;
+    const auto status = detail::execute_im2p_compact_dot(sim.get(), dot, output.data(), 3, stats);
+    const std::array<int64_t, 6> expected{100, 193, int64_t(INT32_MIN)+1,
+                                         -100, -193, int64_t(INT32_MAX)-1};
+    bool ok = check(status == RmdStatus::success && output == expected &&
+                              (!hp1_backend() || stats.stats.work_total_cycles() > 0),
+                          "whole stripe uses all three block/column carriers and saturated K accumulation");
+    std::vector<int64_t> owned{123, -456};
+    detail::Im2pProviderStatsAggregate owned_stats;
+    ok = check(detail::execute_im2p_compact_dot(sim.get(), dot, owned, owned_stats) == RmdStatus::success &&
+                   owned == std::vector<int64_t>(expected.begin(), expected.end()) &&
+                   owned_stats.stats.work_total_cycles() == stats.stats.work_total_cycles(),
+               "owned output preserves SCU results and dispatch work") && ok;
+    for (const auto fault : {Im2pProviderTestFault::write_failure,
+                            Im2pProviderTestFault::missing_output,
+                            Im2pProviderTestFault::duplicate_output}) {
+        const auto saved = owned;
+        ok = check(detail::execute_im2p_compact_dot(sim.get(), dot, owned, owned_stats, fault) != RmdStatus::success &&
+                       owned == saved,
+                   "owned output is unchanged after incomplete or failed provider writes") && ok;
+    }
+    dot.activations = activations.data()+96;
+    dot.rows = 1;
+    dot.weights = weights.data()+1;
+    dot.columns = 2;
+    dot.scu_carriers = carriers.data()+1;
+    dot.scu_row_stride = 3;
+    std::array<int64_t, 3> view{7, 8, 9};
+    ok = check(detail::execute_im2p_compact_dot(sim.get(), dot, view.data(), 3, stats) == RmdStatus::success &&
+                   view == std::array<int64_t, 3>{expected[4], expected[5], 9},
+               "row/column view preserves separate weight, SCU and output strides") && ok;
+    dot.scu_row_stride = 1;
+    const auto before = view;
+    ok = check(detail::execute_im2p_compact_dot(sim.get(), dot, view.data(), 3, stats) == RmdStatus::invalid_arguments &&
+                   view == before, "invalid SCU stride cannot publish output") && ok;
+    if (ok) std::printf("IM2P_PROVIDER dense-scu-stripe k=65 op=5 raw_cycles=%llu\n",
+                         static_cast<unsigned long long>(stats.stats.work_total_cycles()));
+    return ok;
+}
 #endif
 
 bool original_packet_digit(const StripePacket &    packet,
@@ -2024,7 +2087,7 @@ bool run_cross_block_one_work() {
             : RmdStatus::execution_failed;
     const auto * expected_values = std::get_if<BlockScaledInt64Correction>(&expected);
     const auto * actual_values   = std::get_if<BlockScaledInt64Correction>(&correction);
-    const bool   ok =
+    bool   ok =
         check(packet.blocks.size() == 2 && packet.blocks[0].block_id == 0 &&
                   packet.blocks[1].block_id == 3,
               "fixture retains gapped original K32 blocks") &&
@@ -2034,6 +2097,78 @@ bool run_cross_block_one_work() {
         check(status == RmdStatus::success, "cross-block residual execution succeeds") &&
         check(metrics.im2p_dot_calls == 1 && im2p_provider_dot_attempts_for_test() == 1,
               "one residual invocation selects one logical provider work");
+    RunAwareRequest request;
+    detail::Im2pProviderStatsAggregate aggregate;
+    std::vector<int64_t> full, view{999};
+    detail::Im2pRunAwareWork work;
+    work.request = &request;
+    if (!check(build_run_aware_request(fixture.args, packet, request) == RmdStatus::success &&
+                   detail::execute_im2p_run_aware(sim.get(), work, full, aggregate) == RmdStatus::success,
+               "full residual request available for view comparison")) return false;
+    const auto full_stats = aggregate.stats;
+    work.row_begin = request.m-1;
+    work.row_count = 1;
+    work.column_begin = 1;
+    work.column_count = request.n-1;
+    ok = check(detail::execute_im2p_run_aware(sim.get(), work, view, aggregate) == RmdStatus::success &&
+                   view == std::vector<int64_t>(full.end()-request.n+1, full.end()),
+               "residual subview preserves gapped K runs and original column carriers") && ok;
+    work.row_count = 2;
+    const auto before = view;
+    ok = check(detail::execute_im2p_run_aware(sim.get(), work, view, aggregate) == RmdStatus::invalid_arguments &&
+                   view == before, "out-of-range residual view is transactional") && ok;
+    work.row_count = 1;
+    std::vector<int32_t> original_weights(request.original_k * request.n, INT32_MAX);
+    std::vector<uint32_t> original_carriers(((request.original_k - 1) / 32 + 1) * request.n, UINT32_MAX);
+    for (size_t b = 0; b < request.runs.size(); ++b) {
+        const auto & run = request.runs[b];
+        for (size_t column = 0; column < request.n; ++column) {
+            original_carriers[run.original_block_id * request.n + column] = request.carriers[b * request.n + column];
+            for (size_t k = 0; k < run.compact_k_count; ++k) {
+                const size_t original_k = run.original_global_k_begin + run.original_local_k[k];
+                original_weights[original_k * request.n + column] =
+                    request.weights[(run.compact_k_begin + k) * request.n + column];
+            }
+        }
+    }
+    request.weights.clear();
+    request.carriers.clear();
+    work.original_weights = &original_weights;
+    work.original_carriers = &original_carriers;
+    work.row_begin = work.row_count = work.column_begin = work.column_count = 0;
+    std::vector<int64_t> borrowed;
+    detail::Im2pProviderStatsAggregate borrowed_stats;
+    ok = check(detail::execute_im2p_run_aware(sim.get(), work, borrowed, borrowed_stats) == RmdStatus::success &&
+                   borrowed == full && borrowed_stats.stats.fields == full_stats.fields,
+               "borrowed full operands preserve materialized output and every provider work counter") && ok;
+    work.row_begin = request.m - 1;
+    work.row_count = 1;
+    work.column_begin = 1;
+    work.column_count = request.n - 1;
+    for (size_t k = 0; k < request.original_k; ++k)
+        original_weights[k * request.n] = INT32_MAX;
+    for (size_t b = 0; b < (request.original_k - 1) / 32 + 1; ++b)
+        original_carriers[b * request.n] = UINT32_MAX;
+    reset_im2p_provider_dot_attempts_for_test();
+    ok = check(detail::execute_im2p_run_aware(sim.get(), work, view, aggregate) == RmdStatus::success &&
+                   view == before && im2p_provider_dot_attempts_for_test() == 1,
+               "borrowed operands read only active original K and selected columns in one work") && ok;
+    work.original_carriers = nullptr;
+    ok = check(detail::execute_im2p_run_aware(sim.get(), work, view, aggregate) == RmdStatus::invalid_arguments &&
+                   view == before && im2p_provider_dot_attempts_for_test() == 1,
+               "missing borrowed carriers reject before dispatch without output changes") && ok;
+    work.original_carriers = &original_carriers;
+    original_weights.pop_back();
+    ok = check(detail::execute_im2p_run_aware(sim.get(), work, view, aggregate) == RmdStatus::invalid_arguments &&
+                   view == before && im2p_provider_dot_attempts_for_test() == 1,
+               "short original weight storage rejects before dispatch") && ok;
+    original_weights.push_back(INT32_MAX);
+    const auto & first_run = request.runs.front();
+    original_weights[(first_run.original_global_k_begin + first_run.original_local_k.front()) * request.n +
+                     work.column_begin] = INT32_MAX;
+    ok = check(detail::execute_im2p_run_aware(sim.get(), work, view, aggregate) == RmdStatus::execution_failed &&
+                   view == before,
+               "invalid active borrowed code fails without publishing a partial result") && ok;
     if (ok)
         std::puts("IM2P_PROVIDER cross-block-one-work logical_calls=1 original_blocks=0,3 PASS");
     return ok;
@@ -2589,6 +2724,8 @@ int main(int argc, char ** argv) {
 #if GGML_GEMMINI_WEIGHT_BITS == 4 || GGML_GEMMINI_WEIGHT_BITS == 8
     if (selected == "all" || selected == "compact-dense-parity")
         ok = run_compact_dense_parity(true) && ok;
+    if (selected == "all" || selected == "dense-scu-stripe")
+        ok = run_dense_scu_stripe() && ok;
 #endif
     if (selected == "all" || selected == "provider-read-failure")
         ok = run_fault(Im2pProviderTestFault::read_failure,
@@ -2700,11 +2837,12 @@ int main(int argc, char ** argv) {
         selected == "h0-compact-rejection")
         ok = run_route(selected == "all" ? "route-matched" : selected) && ok;
 
-    constexpr std::array<std::string_view, 36> valid{{"all",
+    constexpr std::array<std::string_view, 37> valid{{"all",
                                                       "success",
                                                       "hp1-success",
                                                       "h1-scu-contract",
                                                       "compact-dense-parity",
+                                                      "dense-scu-stripe",
                                                       "provider-read-failure",
                                                       "provider-write-failure",
                                                       "provider-watchdog",
