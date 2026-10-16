@@ -17,6 +17,8 @@ static inline int16_t exp_to_theta(int16_t e, int16_t rho) {
 static int32_t round_shift_right_i32(int32_t q, int shift) {
     if (shift <= 0)
         return q;
+    if (shift >= 32)
+        return shift == 32 && q == std::numeric_limits<int32_t>::min() ? -1 : 0;
 
     const int64_t x      = q;
     const int64_t offset = int64_t{1} << (shift - 1);
@@ -45,7 +47,7 @@ static inline int32_t shift_q_i32(int32_t q, int16_t delta_theta) {
     }
 
     if (delta_theta < 0) {
-        const int shift = std::min<int>(-delta_theta, 31);
+        const int shift = -static_cast<int>(delta_theta);
         return round_shift_right_i32(q, shift);
     }
 

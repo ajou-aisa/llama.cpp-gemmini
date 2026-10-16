@@ -17,7 +17,7 @@ wrapper visibly defaults to `IM2P_SIM` / `GEMMINI_HP1`, WS, A8/W8/D16, ExSIA,
 `STRIPE_PIPELINE`, and RMD enabled with WS residuals. Developer builds are distinct
 from the receipt-verified [measurement builds](../scripts/eval/README.md).
 
-Each wrapper visibly declares applicable defaults from the 52 managed CMake
+Each wrapper visibly declares applicable defaults from the managed CMake
 options, plus its platform policy. `scripts/im2p-build-options.py`
 resolves them in this order: command-line `-DNAME[:TYPE]=value`, `NAME` environment,
 `NAME_DEFAULT` environment, then the script default. It preserves an explicit
@@ -41,6 +41,54 @@ backend is active; disabling Gemmini does not require its hardware include tree.
 `CYCLE_SIM=1` selects CPU-functional execution. It is not evidence of physical
 hardware support. The `GEMMINI_HP1` route rejects H1 weights when `CYCLE_SIM=0`;
 selecting HP1 or enabling RMD does not remove that guard.
+
+### Optional PoTal attention quantization and offload
+
+`GGML_GEMMINI_ENABLE_A4NKS_ATTENTION` selects the PoTal Q/K/P/V quantization
+policy. `GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION` independently selects its Gemmini
+HP1 RTL executor. Both default to `OFF` in CMake and every build wrapper.
+
+| Quantization (`ENABLE`) | RTL execution (`OFFLOAD`) | Attention behavior |
+| --- | --- | --- |
+| OFF | OFF | Original floating-point attention graph |
+| ON | OFF | PoTal quantization with CPU integer SCU functional execution |
+| ON | ON | The same quantization with Gemmini HP1 RTL execution |
+| OFF | ON | Rejected at configuration time |
+
+Linear projection routing uses its existing settings. With quantization ON and
+offload OFF, attention uses the CPU executor even if linear layers use WS with
+HARDWARE or IM2P_SIM. CPU functional execution does not measure RTL cycles.
+The A4 attention policy quantizes Q/K/P/V at 8/8/8/4-bit precision; A8 uses
+16/16/16/8. Both execute signed PE-width digits, including two K passes and
+the P zero-point correction. This changes integer precision, not KV-cache storage.
+Use matched activation/weight widths, DIM32/BK32, INT, sigma 2, and `CYCLE_SIM=0`:
+
+```bash
+# Nano/native host with the matching IM2P Gemmini RTL artifacts.
+./build-arm64.sh \
+  -DGGML_GEMMINI_ENABLE_A4NKS_ATTENTION=ON \
+  -DGGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION=ON \
+  -DGGML_GEMMINI_ACTIVATION_BITS=8 -DGGML_GEMMINI_WEIGHT_BITS=8 \
+  -DGGML_GEMMINI_DIM=32 \
+  -DGGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM -DGGML_GEMMINI_OPTION=WS \
+  -DIM2P_SIM_IMPLEMENTATION=GEMMINI_HP1 -DIM2P_SIM_ROOT=/path/to/IM2P.sim
+```
+
+The same `-D` options work with direct CMake. The wrappers also accept environment
+overrides; `--dry-run` prints the resolved settings without building. RTL offload
+requires `GGML_GEMMINI_OPTION=WS`, `GGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM`, and
+`IM2P_SIM_IMPLEMENTATION=GEMMINI_HP1`. Physical RISC-V attention offload is not
+supported. Quantization requires `GGML_GEMMINI=ON`, including CPU execution.
+
+At runtime, leave flash attention disabled and KV offloading enabled.
+`--no-kv-offload` bypasses the PoTal policy and selects the existing attention
+path even when quantization is enabled. Set both build options to `OFF` to
+omit PoTal attention dispatch.
+`GGML_GEMMINI_QK_SCHEDULE=full|tile` selects the runtime QK schedule; the default
+is `full`. Both schedules execute the same main and residual digit GEMMs.
+`full` computes every key region; `tile` skips only completely masked QK tiles.
+The softmax mask is applied for both schedules. PV always computes its full
+reduction, including the P zero-point correction.
 
 ### Component and lifetime boundaries
 

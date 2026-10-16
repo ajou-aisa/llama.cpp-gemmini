@@ -29,7 +29,8 @@ def normalize(name: str, value: str) -> str:
         if value.upper() in ('OFF', 'NO', 'FALSE', 'N', '0', '', 'IGNORE', 'NOTFOUND') or value.upper().endswith('-NOTFOUND'):
             return '0'
         return '1'
-    if name in ('GGML_GEMMINI', 'GGML_GEMMINI_ENABLE_RMD', 'GGML_GEMMINI_DEQUANT_FP_TEST'):
+    if name in ('GGML_GEMMINI', 'GGML_GEMMINI_ENABLE_RMD', 'GGML_GEMMINI_DEQUANT_FP_TEST',
+                'GGML_GEMMINI_ENABLE_A4NKS_ATTENTION', 'GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION'):
         if value.upper() in ('ON', 'YES', 'TRUE', '1'):
             return 'ON'
         if value.upper() in ('OFF', 'NO', 'FALSE', '0'):
@@ -97,7 +98,13 @@ def resolve(build_dir: str, platform: str, defaults: Mapping[str, str],
     backend = effective.get('GGML_GEMMINI_EXECUTION_BACKEND', 'HARDWARE')
     if backend == 'FPGA_UART':
         raise BuildConfigurationError('FPGA_UART is deprecated and unsupported; use HARDWARE or IM2P_SIM')
+    attention_enabled = effective.get('GGML_GEMMINI_ENABLE_A4NKS_ATTENTION') == 'ON'
+    attention_offload = effective.get('GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION') == 'ON'
+    if attention_offload and not attention_enabled:
+        raise BuildConfigurationError('PoTal attention offload requires GGML_GEMMINI_ENABLE_A4NKS_ATTENTION=ON')
     if effective['GGML_GEMMINI'] == 'OFF':
+        if attention_enabled:
+            raise BuildConfigurationError('PoTal attention quantization requires GGML_GEMMINI=ON')
         effective.update(GGML_GEMMINI_EXECUTION_BACKEND='HARDWARE', IM2P_SIM_IMPLEMENTATION='')
         origin.update({name: 'disabled:GGML_GEMMINI' for name in
                        ('GGML_GEMMINI_EXECUTION_BACKEND', 'IM2P_SIM_IMPLEMENTATION')})
@@ -126,6 +133,17 @@ def resolve(build_dir: str, platform: str, defaults: Mapping[str, str],
     option = effective.get('GGML_GEMMINI_OPTION', 'CPU').upper()
     if option not in ('CPU', 'WS') or (option == 'CPU' and backend != 'HARDWARE'):
         raise BuildConfigurationError(f'Illegal Gemmini option/backend combination: {option}+{backend}')
+    if attention_enabled:
+        bits = effective.get('GGML_GEMMINI_ACTIVATION_BITS', '8')
+        if (bits not in ('4', '8') or effective.get('GGML_GEMMINI_WEIGHT_BITS', '8') != bits
+                or effective.get('GGML_GEMMINI_DIM', '16') != '32'
+                or effective.get('GGML_GEMMINI_BLOCK_SIZE', '32') != '32'
+                or effective.get('GGML_GEMMINI_EXSIA_SIGMA', '2') != '2'
+                or effective.get('GGML_GEMMINI_COMPUTE_TYPE', 'INT').upper() != 'INT'
+                or cycle_sim != '0'):
+            raise BuildConfigurationError('PoTal attention requires INT A4W4/A8W8, DIM32/BK32, sigma=2, CYCLE_SIM=0')
+        if attention_offload and (option != 'WS' or backend != 'IM2P_SIM' or implementation != 'GEMMINI_HP1'):
+            raise BuildConfigurationError('PoTal attention offload requires WS+IM2P_SIM+GEMMINI_HP1')
     return effective, origin, cli_types, passthrough, dry_run
 
 

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <limits>
+#include <algorithm>
 
 namespace ggml::gemmini {
 
@@ -45,6 +46,7 @@ enum class GemminiGeometryError {
     zero_array_dimension,
     zero_tile_factor,
     overflow,
+    unsupported_operand_width,
 };
 
 struct GemminiGeometryResult {
@@ -113,6 +115,40 @@ constexpr GemminiGeometryResult make_gemmini_geometry(GemminiGeometryInput input
              remainder == 0 ? tile_i_rows : remainder,
              ws_inner_calls},
             GemminiGeometryError::none};
+}
+
+constexpr GemminiGeometryResult make_potal_geometry(GemminiLogicalShape shape, unsigned bits) {
+    if (bits != 4 && bits != 8)
+        return {{}, GemminiGeometryError::unsupported_operand_width};
+    if (shape.i == 0 || shape.j == 0 || shape.k == 0)
+        return {{}, GemminiGeometryError::zero_dimension};
+    // Original DIM32 quantization profile: 4 banks, 4096/2048 rows, 512 accumulator rows.
+    constexpr size_t dim = 32, acc = 512 / 2;
+    const size_t spad = 32768 / bits;
+    const size_t ip = geometry_detail::ceil_div(shape.i, dim);
+    const size_t jp = geometry_detail::ceil_div(shape.j, dim);
+    const size_t kp = geometry_detail::ceil_div(shape.k, dim);
+    GemminiTileFactors tiles{std::min(ip, size_t{2}), std::min(jp, size_t{2}),
+                             std::min(kp, spad / (4 * dim))};
+    for (;;) {
+        bool grew = false;
+        if (tiles.j < jp && (tiles.i + tiles.j + 1) * tiles.k * dim <= spad &&
+            tiles.i * (tiles.j + 1) * dim <= acc) {
+            ++tiles.j;
+            grew = true;
+        }
+        if (tiles.i < ip && (tiles.i + 1 + tiles.j) * tiles.k * dim <= spad &&
+            (tiles.i + 1) * tiles.j * dim <= acc) {
+            ++tiles.i;
+            grew = true;
+        }
+        if (tiles.k < kp && (tiles.i + tiles.j) * (tiles.k + 1) * dim <= spad) {
+            ++tiles.k;
+            grew = true;
+        }
+        if (!grew)
+            return make_gemmini_geometry({shape, tiles, dim});
+    }
 }
 
 } // namespace ggml::gemmini

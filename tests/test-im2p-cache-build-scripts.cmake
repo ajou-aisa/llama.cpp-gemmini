@@ -185,6 +185,14 @@ foreach(script IN ITEMS build-arm64.sh build-arm64-cpu.sh build-x86.sh build-ris
     if(NOT rc EQUAL 0 OR EXISTS "${dry_log}")
         message(FATAL_ERROR "${script} dry-run must succeed without provisioning: ${stdout}\n${stderr}")
     endif()
+    string(REGEX MATCH "IM2P_EFFECTIVE_CONFIG=([^\n]+)" summary "${stderr}")
+    set(config "${CMAKE_MATCH_1}")
+    foreach(flag IN ITEMS ENABLE OFFLOAD)
+        string(JSON attention GET "${config}" effective "GGML_GEMMINI_${flag}_A4NKS_ATTENTION")
+        if(NOT attention STREQUAL "OFF")
+            message(FATAL_ERROR "${script} must explicitly disable attention ${flag} by default")
+        endif()
+    endforeach()
     if(script STREQUAL "build-x86.sh")
         string(REGEX MATCH "IM2P_EFFECTIVE_CONFIG=([^\n]+)" summary "${stderr}")
         set(config "${CMAKE_MATCH_1}")
@@ -223,6 +231,124 @@ foreach(script IN ITEMS build-arm64.sh build-arm64-cpu.sh build-x86.sh build-ris
             if(rc EQUAL 0 OR EXISTS "${reject_log}" OR
                NOT stderr MATCHES "FPGA_UART is deprecated and unsupported")
                 message(FATAL_ERROR "${script}/${enabled}/${source} must reject before provisioning: ${stdout}\n${stderr}")
+            endif()
+        endforeach()
+    endforeach()
+endforeach()
+
+foreach(script IN ITEMS build-arm64.sh build-arm64-cpu.sh build-x86.sh build-riscv.sh)
+    foreach(bits IN ITEMS 4 8)
+        foreach(source IN ITEMS environment command-line)
+            set(attention_args)
+            set(expected ON)
+            if(source STREQUAL "command-line")
+                set(attention_args -DGGML_GEMMINI_ENABLE_A4NKS_ATTENTION:BOOL=OFF)
+                set(expected OFF)
+            endif()
+            set(log "${test_root}/${script}-attention-${bits}-${source}.log")
+            execute_process(COMMAND env -i "PATH=${test_root}/bin:$ENV{PATH}"
+                "CONTRACT_LOG=${log}" "BUILD_DIR=${test_root}/attention-build" BUILD_JOBS=1
+                GGML_GEMMINI_ENABLE_A4NKS_ATTENTION=ON
+                GGML_GEMMINI_EXECUTION_BACKEND=HARDWARE GGML_GEMMINI_OPTION=CPU
+                GGML_GEMMINI_DIM=32 "GGML_GEMMINI_ACTIVATION_BITS=${bits}"
+                "GGML_GEMMINI_WEIGHT_BITS=${bits}"
+                bash "${TEST_SOURCE_DIR}/${script}" ${attention_args}
+                RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+            if(NOT result EQUAL 0)
+                message(FATAL_ERROR "${script} attention option failed: ${output}\n${error}")
+            endif()
+            string(REGEX MATCH "IM2P_EFFECTIVE_CONFIG=([^\n]+)" summary "${error}")
+            string(JSON enabled GET "${CMAKE_MATCH_1}" effective GGML_GEMMINI_ENABLE_A4NKS_ATTENTION)
+            file(READ "${log}" commands)
+            if(NOT enabled STREQUAL expected OR NOT commands MATCHES
+               "cmake-arg:-DGGML_GEMMINI_ENABLE_A4NKS_ATTENTION(:BOOL)?=${expected}\n")
+                message(FATAL_ERROR "${script} lost attention option ${source}: ${commands}")
+            endif()
+        endforeach()
+    endforeach()
+    foreach(invalid IN ITEMS -DGGML_GEMMINI=OFF -DGGML_GEMMINI_DIM=64 -DCYCLE_SIM=1
+            -DGGML_GEMMINI_ACTIVATION_BITS=4 -DGGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION=ON)
+        set(log "${test_root}/${script}-attention-invalid.log")
+        execute_process(COMMAND env -i "PATH=${test_root}/bin:$ENV{PATH}"
+            "CONTRACT_LOG=${log}" "BUILD_DIR=${test_root}/attention-build" BUILD_JOBS=1
+            GGML_GEMMINI_ENABLE_A4NKS_ATTENTION=ON GGML_GEMMINI_DIM=32
+            GGML_GEMMINI_ACTIVATION_BITS=8 GGML_GEMMINI_WEIGHT_BITS=8
+            GGML_GEMMINI_EXECUTION_BACKEND=HARDWARE GGML_GEMMINI_OPTION=CPU
+            bash "${TEST_SOURCE_DIR}/${script}" ${invalid}
+            RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+        if(result EQUAL 0 OR EXISTS "${log}")
+            message(FATAL_ERROR "${script} admitted invalid attention settings before configure: ${output}\n${error}")
+        endif()
+    endforeach()
+endforeach()
+
+foreach(script IN ITEMS build-arm64.sh build-arm64-cpu.sh build-x86.sh build-riscv.sh)
+    foreach(bits IN ITEMS 4 8)
+        foreach(scenario IN ITEMS quant-ws-hardware quant-ws-hp1 rtl-hp1 rtl-disabled-cli
+                offload-only rtl-cpu rtl-hardware rtl-legacy)
+            set(backend IM2P_SIM)
+            set(implementation GEMMINI_HP1)
+            set(option WS)
+            set(quant ON)
+            set(offload ON)
+            set(expected_offload ON)
+            set(valid TRUE)
+            set(attention_args)
+            if(scenario MATCHES "hardware|cpu|offload-only")
+                set(backend HARDWARE)
+            endif()
+            if(scenario MATCHES "^quant-")
+                set(offload OFF)
+                set(expected_offload OFF)
+            elseif(scenario STREQUAL "rtl-disabled-cli")
+                set(attention_args -DGGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION:BOOL=OFF)
+                set(expected_offload OFF)
+            elseif(scenario STREQUAL "offload-only")
+                set(quant OFF)
+                set(valid FALSE)
+            elseif(scenario STREQUAL "rtl-cpu")
+                set(option CPU)
+                set(valid FALSE)
+            elseif(scenario STREQUAL "rtl-hardware")
+                set(valid FALSE)
+            elseif(scenario STREQUAL "rtl-legacy")
+                set(implementation LEGACY_BSV)
+                set(valid FALSE)
+            endif()
+            if(script STREQUAL "build-riscv.sh" AND backend STREQUAL "IM2P_SIM")
+                set(valid FALSE)
+            endif()
+            set(sim_args)
+            if(backend STREQUAL "IM2P_SIM")
+                set(sim_args "IM2P_SIM_IMPLEMENTATION=${implementation}")
+            endif()
+            set(log "${test_root}/${script}-policy-${bits}-${scenario}.log")
+            execute_process(COMMAND env -i "PATH=${test_root}/bin:$ENV{PATH}"
+                "CONTRACT_LOG=${log}" "BUILD_DIR=${test_root}/attention-build" BUILD_JOBS=1
+                "IM2P_SIM_ROOT=${TEST_IM2P_ROOT}" ${sim_args}
+                "GGML_GEMMINI_ENABLE_A4NKS_ATTENTION=${quant}"
+                "GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION=${offload}"
+                "GGML_GEMMINI_EXECUTION_BACKEND=${backend}" "GGML_GEMMINI_OPTION=${option}"
+                GGML_GEMMINI_DIM=32 "GGML_GEMMINI_ACTIVATION_BITS=${bits}"
+                "GGML_GEMMINI_WEIGHT_BITS=${bits}"
+                bash "${TEST_SOURCE_DIR}/${script}" ${attention_args}
+                RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+            file(WRITE "${log}.result" "exit=${result}\n${output}\n${error}")
+            if(valid)
+                if(NOT result EQUAL 0)
+                    message(FATAL_ERROR "${script}/${bits}/${scenario} failed: ${output}\n${error}")
+                endif()
+                string(REGEX MATCH "IM2P_EFFECTIVE_CONFIG=([^\n]+)" summary "${error}")
+                set(config "${CMAKE_MATCH_1}")
+                string(JSON enabled GET "${config}" effective GGML_GEMMINI_ENABLE_A4NKS_ATTENTION)
+                string(JSON offloaded GET "${config}" effective GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION)
+                file(READ "${log}" commands)
+                if(NOT enabled STREQUAL "ON" OR NOT offloaded STREQUAL expected_offload OR
+                   NOT commands MATCHES "cmake-arg:-DGGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION(:BOOL)?=${expected_offload}\n")
+                    message(FATAL_ERROR "${script}/${bits}/${scenario} lost the independent policy/offload settings")
+                endif()
+            elseif(result EQUAL 0 OR EXISTS "${log}")
+                message(FATAL_ERROR "${script}/${bits}/${scenario} must reject before configure: ${output}\n${error}")
             endif()
         endforeach()
     endforeach()
@@ -350,7 +476,9 @@ endforeach()
 set(stale_root "${test_root}/arm64-stale-cache")
 file(MAKE_DIRECTORY "${stale_root}")
 file(WRITE "${stale_root}/CMakeCache.txt"
-    "GGML_GEMMINI:BOOL=ON\n"
+    "GGML_GEMMINI:BOOL=OFF\n"
+    "GGML_GEMMINI_ENABLE_A4NKS_ATTENTION:BOOL=ON\n"
+    "GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION:BOOL=ON\n"
     "GGML_GEMMINI_OPTION:STRING=WS\n"
     "GGML_GEMMINI_EXECUTION_BACKEND:STRING=IM2P_SIM\n"
     "CMAKE_TOOLCHAIN_FILE:FILEPATH=/stale/toolchain.cmake\n"
@@ -392,7 +520,9 @@ foreach(stale_arg IN ITEMS
         "-U CMAKE_TOOLCHAIN_FILE"
         "-U CMAKE_PREFIX_PATH"
         "-U OpenMP_ROOT"
-        "-DGGML_GEMMINI=OFF"
+        "-DGGML_GEMMINI=ON"
+        "-DGGML_GEMMINI_ENABLE_A4NKS_ATTENTION=OFF"
+        "-DGGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION=OFF"
         "-DGGML_GEMMINI_OPTION=CPU"
         "-DGGML_GEMMINI_EXECUTION_BACKEND=HARDWARE"
         "-DIM2P_SIM_IMPLEMENTATION="

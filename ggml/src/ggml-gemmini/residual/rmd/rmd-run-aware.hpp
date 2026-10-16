@@ -82,6 +82,9 @@ RmdStatus build_run_aware_request(const ggml_gemmini_args_t & args,
 RmdStatus build_run_aware_request(const ggml_gemmini_args_t & args,
                                   const StripePacket &        packet,
                                   RunAwareRequest &           out);
+// Shared row/K compaction for runtime stationary operands. Weights and carriers
+// remain empty; the caller fills them using the original coordinates in runs.
+RmdStatus build_run_aware_activations(const StripePacket & packet, RunAwareRequest & out);
 // The same request without operands: runs, active rows, M/N/K and tiling are exactly those of
 // build_run_aware_request, while activations, weights and carriers stay empty. Transactional like
 // it.

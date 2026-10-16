@@ -81,6 +81,7 @@ set(GGML_GEMMINI_SOURCES
     matmul/dense.cpp
     matmul/execution.cpp
     matmul/options.cpp
+    matmul/attention.cpp
     ggml-gemmini-telemetry.cpp
     quants/act/dispatch.cpp
     quants/act/quantize.cpp
@@ -110,6 +111,7 @@ set(GGML_GEMMINI_SOURCES
     dump/scale/scale_dump_stub.cpp
 )
 ggml_add_backend_library(ggml-gemmini ${GGML_GEMMINI_SOURCES})
+set_source_files_properties(matmul/attention.cpp PROPERTIES COMPILE_OPTIONS "-fno-fast-math")
 
 target_compile_features(ggml-gemmini PRIVATE cxx_std_17)
 ggml_gemmini_apply_profile_compile_definitions(ggml-gemmini)

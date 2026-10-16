@@ -3,6 +3,9 @@
 
 #include "../ggml/src/ggml-gemmini/ggml-gemmini-matmul.hpp"
 #include "../ggml/src/ggml-gemmini/residual/rmd/rmd-compose.hpp"
+#include "../ggml/src/ggml-gemmini/matmul/attention.hpp"
+#include "../ggml/src/ggml-gemmini/quants/act/exsia/exsia_shift.hpp"
+#include "ggml-cpu.h"
 
 #include <algorithm>
 #include <array>
@@ -13,6 +16,10 @@
 #include <cstring>
 #include <cstdint>
 #include <limits>
+#include <cfenv>
+#include <chrono>
+#include <fstream>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -1655,7 +1662,306 @@ bool test_q16_pipeline_owns_args_snapshot() {
 
 } // namespace
 
+static bool attention_case(const std::array<int64_t, 10> & shape,
+                           const std::vector<float> & weights, const std::vector<float> & inputs,
+                           const std::vector<float> & expected, bool failure = false,
+                           const std::vector<float> & mask_values = {}, bool mask_half = false,
+                           ggml_gemmini_attention_stats * observed = nullptr) {
+    const auto [role, k, n, rows, kh, qh, kbatches, qbatches, half, interleaved] = shape;
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(
+        ggml_init({size_t{64}*1024*1024, nullptr, false}), ggml_free);
+    if (!expect(bool(ctx), "attention context allocation")) return false;
+    auto operand = [&, interleaved = shape[9]](ggml_type type, int64_t reduction, int64_t width, int64_t heads, int64_t batches) {
+        auto * tensor = ggml_new_tensor_4d(ctx.get(), type, reduction,
+                                          interleaved ? heads : width, interleaved ? width : heads, batches);
+        return interleaved ? ggml_permute(ctx.get(), tensor, 0, 2, 1, 3) : tensor;
+    };
+    auto * a = operand(half ? GGML_TYPE_F16 : GGML_TYPE_F32, k, n, kh, kbatches);
+    auto * b = operand(GGML_TYPE_F32, k, rows, qh, qbatches);
+    auto fill = [](ggml_tensor * t, const std::vector<float> & values) {
+        size_t index = 0;
+        for (int64_t batch = 0; batch < t->ne[3]; ++batch)
+            for (int64_t head = 0; head < t->ne[2]; ++head)
+                for (int64_t row = 0; row < t->ne[1]; ++row)
+                    for (int64_t c = 0; c < t->ne[0]; ++c) {
+                        char * out = static_cast<char *>(t->data)+batch*t->nb[3]+head*t->nb[2]+row*t->nb[1]+c*t->nb[0];
+                        const float value = values[index++];
+                        if (t->type == GGML_TYPE_F16) {
+                            const ggml_fp16_t f16 = ggml_fp32_to_fp16(value);
+                            std::memcpy(out, &f16, sizeof(f16));
+                        } else std::memcpy(out, &value, sizeof(value));
+                    }
+    };
+    fill(a, weights);
+    fill(b, inputs);
+    auto * out = ggml_mul_mat(ctx.get(), a, b);
+    ggml_tensor * mask = nullptr;
+    if (!mask_values.empty()) {
+        mask = ggml_new_tensor_2d(ctx.get(), mask_half ? GGML_TYPE_F16 : GGML_TYPE_F32, n, rows+7);
+        std::vector<float> padded = mask_values;
+        padded.resize(size_t((rows+7)*n), std::numeric_limits<float>::quiet_NaN());
+        fill(mask, padded);
+        out->src[2] = mask;
+    }
+    ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+    const auto selected = role == 0 ? GGML_GEMMINI_ATTENTION_QK : GGML_GEMMINI_ATTENTION_PV;
+    ggml_gemmini_set_attention_role(out, selected);
+    if (!expect(out->op_params[0] == GGML_PREC_F32, "attention role overwrote precision")) return false;
+    std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> backend(ggml_backend_gemmini_init(), ggml_backend_free);
+    if (!expect(bool(backend) && ggml_backend_supports_op(backend.get(), out), "Gemmini rejected attention node")) return false;
+    auto * graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(graph, out);
+    auto * values = static_cast<float *>(out->data);
+    std::fill_n(values, ggml_nelements(out), 123.0f);
+    const int previous_rounding = std::fegetround();
+    std::fesetround(FE_UPWARD);
+    const auto started = std::chrono::steady_clock::now();
+    const auto status = ggml_backend_graph_compute(backend.get(), graph);
+    const auto host_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count();
+    const bool restored = std::fegetround() == FE_UPWARD;
+    std::fesetround(previous_rounding);
+    ggml_gemmini_attention_stats stats{};
+    if (!expect(restored && ggml_backend_gemmini_get_attention_stats(backend.get(), &stats), "rounding/stats contract")) return false;
+    if (failure) {
+        return expect(status == GGML_STATUS_FAILED && stats.qk_nodes == 0 && stats.pv_nodes == 0 &&
+                      std::all_of(values, values+ggml_nelements(out), [](float v) { return v == 123; }),
+                      "failed attention published partial values or metrics");
+    }
+    if (!expect(status == GGML_STATUS_SUCCESS, "attention graph compute failed")) return false;
+    if (!expect(stats.qk_nodes == (role == 0 ? 1u : 0u) && stats.pv_nodes == (role == 1 ? 1u : 0u) &&
+                (stats.main_dots > 0 || !mask_values.empty()), "attention bypassed backend executor")) return false;
+    if (observed) *observed = stats;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        if (!mask_values.empty() && mask_values[i % mask_values.size()] == -INFINITY) continue;
+        if (values[i] != expected[i]) {
+            std::fprintf(stderr, "attention mismatch at %zu: got %.9g expected %.9g\n", i, values[i], expected[i]);
+            return false;
+        }
+    }
+#if GGML_GEMMINI_TEST_SOFTMAX
+    if (mask) {
+        bool any_empty_row = false;
+        for (int64_t row = 0; row < rows; ++row)
+            any_empty_row |= std::all_of(mask_values.begin()+row*n, mask_values.begin()+(row+1)*n,
+                                         [](float v) { return v == -INFINITY; });
+        if (any_empty_row) {
+            if (!stats.main_dots && !expect(std::all_of(values, values+expected.size(),
+                                                       [](float v) { return v == 0; }),
+                                            "all-masked QK publishes zero without device work")) return false;
+        } else {
+            auto * reference = ggml_dup_tensor(ctx.get(), out);
+            auto * actual = ggml_dup_tensor(ctx.get(), out);
+            std::memcpy(reference->data, expected.data(), expected.size()*sizeof(float));
+            std::memcpy(actual->data, values, expected.size()*sizeof(float));
+            auto * reference_p = ggml_soft_max_ext(ctx.get(), reference, mask, 0.125f, 0.5f);
+            auto * actual_p = ggml_soft_max_ext(ctx.get(), actual, mask, 0.125f, 0.5f);
+            auto * softmax = ggml_new_graph(ctx.get());
+            ggml_build_forward_expand(softmax, reference_p);
+            ggml_build_forward_expand(softmax, actual_p);
+            std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> cpu(ggml_backend_cpu_init(), ggml_backend_free);
+            if (!expect(cpu && ggml_backend_graph_compute(cpu.get(), softmax) == GGML_STATUS_SUCCESS &&
+                        std::memcmp(reference_p->data, actual_p->data, expected.size()*sizeof(float)) == 0,
+                        "masked QK preserves actual ggml softmax bitwise")) return false;
+        }
+    }
+#endif
+    std::printf("ATTENTION role=%s main_dots=%llu residual_dots=%llu main_fragments=%llu residual_fragments=%llu adds=%llu raw_cycles=%llu host_ns=%lld\n",
+                role == 0 ? "qk" : "pv", (unsigned long long)stats.main_dots, (unsigned long long)stats.residual_dots,
+                (unsigned long long)stats.main_fragments, (unsigned long long)stats.residual_fragments,
+                (unsigned long long)stats.add_ops, (unsigned long long)stats.raw_cycles, (long long)host_ns);
+    return true;
+}
+
+static bool test_attention_mask() {
+    const char * saved = std::getenv("GGML_GEMMINI_QK_SCHEDULE");
+    const std::string previous = saved ? saved : "";
+    bool ok = true;
+    for (int kind = 0; kind < 7 && ok; ++kind) {
+        const int64_t rows = kind == 0 ? 512 : kind == 1 ? 1 : 65;
+        const int64_t n = kind == 0 ? 512 : 129, k = 65;
+        const int64_t heads = kind == 0 ? 1 : 4, kv_heads = kind == 0 ? 1 : 2;
+        const int64_t batches = kind == 0 ? 1 : 2;
+        std::vector<float> weights(size_t(k*n*kv_heads)), inputs(size_t(k*rows*heads*batches));
+        for (int64_t h = 0; h < kv_heads; ++h)
+            for (int64_t j = 0; j < n; ++j)
+                for (int64_t c = 0; c < k; ++c) {
+                    const int code = c%32 == 0 ? (GGML_GEMMINI_ACTIVATION_BITS == 4 ? 119 : 127) :
+                                     int((c*7+j*13+h*5)%219)-109;
+                    weights[size_t((h*n+j)*k+c)] = std::ldexp(float(code), int(c/32+j%4)-7);
+                }
+        for (int64_t batch = 0; batch < batches; ++batch)
+            for (int64_t h = 0; h < heads; ++h)
+                for (int64_t i = 0; i < rows; ++i)
+                    for (int64_t c = 0; c < k; ++c) {
+                        float value = float((c*11+i*3+h+batch)%97-48)/64;
+                        if (c == (i%2)*32 && i%5) value = std::ldexp(i%2 ? 1.0f : -1.0f, int(i%3)*4+4);
+                        if (i%13 == 0) value = 0;
+                        inputs[size_t(((batch*heads+h)*rows+i)*k+c)] = value;
+                    }
+        std::vector<float> expected(size_t(rows*n*heads*batches));
+        for (int64_t batch = 0; batch < batches; ++batch)
+            for (int64_t h = 0; h < heads; ++h)
+                for (int64_t i = 0; i < rows; ++i)
+                    for (int64_t j = 0; j < n; ++j) {
+                        double sum = 0;
+                        for (int64_t c = 0; c < k; ++c)
+                            sum += double(inputs[size_t(((batch*heads+h)*rows+i)*k+c)]) *
+                                   weights[size_t(((h/(heads/kv_heads))*n+j)*k+c)];
+                        expected[size_t(((batch*heads+h)*rows+i)*n+j)] = float(sum);
+                    }
+        std::vector<float> mask(size_t(rows*n));
+        for (int64_t i = 0; i < rows; ++i)
+            for (int64_t j = 0; j < n; ++j) {
+                bool blocked = false;
+                if (kind == 0) blocked = j > i;
+                if (kind == 1) blocked = j >= 97;
+                if (kind == 2) blocked = j > i+32 || j+31 < i+32;
+                if (kind == 3) blocked = (j/32)%2 != (i/17)%2 || j%32 > (i*11)%32;
+                if (kind == 4) blocked = true;
+                if (kind == 6) blocked = j > i+1;
+                mask[size_t(i*n+j)] = blocked ? -INFINITY : kind == 5 ? -10000.0f : 0.0f;
+            }
+        const std::array<int64_t, 10> shape{0, k, n, rows, kv_heads, heads, 1, batches, 1, 1};
+        std::array<ggml_gemmini_attention_stats, 2> stats{};
+        const std::array<const char *, 2> modes{"full", "tile"};
+        for (size_t mode = 0; mode < modes.size() && ok; ++mode) {
+            setenv("GGML_GEMMINI_QK_SCHEDULE", modes[mode], 1);
+            ok = attention_case(shape, weights, inputs, expected, false, mask, kind%2 != 0, &stats[mode]);
+            std::printf("QK_MASK bits=%d kind=%d schedule=%s main=%llu residual=%llu calls=%llu cycles=%llu\n",
+                        GGML_GEMMINI_ACTIVATION_BITS, kind, modes[mode],
+                        (unsigned long long)stats[mode].main_fragments,
+                        (unsigned long long)stats[mode].residual_fragments,
+                        (unsigned long long)(stats[mode].main_dots+stats[mode].residual_dots),
+                        (unsigned long long)stats[mode].raw_cycles);
+        }
+        if (ok && kind == 0)
+            ok = expect(stats[1].main_fragments < stats[0].main_fragments,
+                        "tile schedule skips masked work compared with full");
+        if (ok && kind == 4)
+            ok = expect(stats[1].main_dots == 0 && stats[1].residual_dots == 0,
+                        "all masked: neither K pass nor any residual lane submits work");
+        if (ok && kind == 5)
+            ok = expect(stats[0].main_dots == stats[1].main_dots &&
+                        stats[0].residual_dots == stats[1].residual_dots,
+                        "finite bias retains full work and grouping");
+    }
+    for (const char * invalid : {"invalid", "vanilla", "reuse"}) {
+        if (!ok) break;
+        setenv("GGML_GEMMINI_QK_SCHEDULE", invalid, 1);
+        ok = attention_case({0, 32, 1, 1, 1, 1, 1, 1, 0, 0}, std::vector<float>(32, 1),
+                            std::vector<float>(32, 1), {32}, true);
+    }
+    if (saved) setenv("GGML_GEMMINI_QK_SCHEDULE", previous.c_str(), 1);
+    else unsetenv("GGML_GEMMINI_QK_SCHEDULE");
+    return ok;
+}
+
+static bool test_attention() {
+    using ggml::gemmini::quants::act::exsia::detail::shift_q_i32;
+    if (!expect(shift_q_i32(INT32_MIN, -32) == -1 && shift_q_i32(INT32_MIN, -33) == 0 &&
+                shift_q_i32(INT32_MAX, -32) == 0 && shift_q_i32(-3, -1) == -2,
+                "wide right-shift boundaries")) return false;
+    {
+        constexpr int rho = 2 * GGML_GEMMINI_ACTIVATION_BITS - 2;
+        const float base = std::ldexp(1.25f, rho);
+        std::vector<float> weights(96, 1.0f), inputs(96, 5.0f);
+        std::fill_n(inputs.begin()+32, 32, 2.5f);
+        for (size_t c = 64; c < 96; ++c)
+            inputs[c] = std::ldexp(base + (c % 2 ? 1.4f : 0.6f), -rho);
+        const float expected = 280.0f + std::ldexp(64.0f, -rho);
+        if (!attention_case({0, 96, 1, 1, 1, 1, 1, 1, 0, 0}, weights, inputs, {expected}))
+            return false;
+    }
+    {
+        std::vector<float> weights(33, 1), inputs(66, 1);
+        inputs[0] = 0x1p120f;
+        inputs[33] = -0x1p120f;
+        const float limit = std::ldexp(1.0f, 33-2*GGML_GEMMINI_ACTIVATION_BITS);
+        if (!attention_case({0, 33, 1, 2, 1, 1, 1, 1, 0, 0}, weights, inputs,
+                            {limit+32, -limit+32})) return false;
+    }
+    for (int64_t role : {0, 1}) {
+        const std::array<int64_t, 10> shape{role, 33, 5, 3, 2, 4, 1, 2, 1, 1};
+        std::vector<float> weights(33*5*2, 1.0f), inputs(33*3*4*2, role == 0 ? 1.0f : 0.25f);
+        std::vector<float> expected(5*3*4*2, role == 0 ? 33.0f : 8.25f);
+        if (!attention_case(shape, weights, inputs, expected)) return false;
+        std::fill(inputs.begin(), inputs.end(), 0.0f);
+        std::fill(expected.begin(), expected.end(), 0.0f);
+        if (!attention_case(shape, weights, inputs, expected)) return false;
+        inputs.back() = std::numeric_limits<float>::quiet_NaN();
+        if (!attention_case(shape, weights, inputs, expected, true)) return false;
+    }
+    for (int64_t role : {0, 1}) {
+        const std::array<int64_t, 10> shape{role, 64, 1, 1, 1, 1, 1, 1, 0, 0};
+        std::vector<float> weights(64), inputs(64, role == 0 ? 1.0f : 0.25f);
+        std::fill(weights.begin()+32, weights.end(), 0x1p40f);
+        std::vector<float> expected{std::ldexp(role == 0 ? 32.0f : 8.0f, 40)};
+        if (!attention_case(shape, weights, inputs, expected)) return false;
+    }
+    for (int64_t role : {0, 1}) {
+        const std::array<int64_t, 10> shape{role, 64, 1, 1, 1, 1, 1, 1, 0, 0};
+        std::vector<float> weights(64, 0x1p-80f), inputs(64, 1.0f), expected(1);
+        std::fill(weights.begin()+32, weights.end(), 0x1p80f);
+        if (role == 0) expected[0] = std::ldexp(float(INT32_MAX), GGML_GEMMINI_ACTIVATION_BITS == 4 ? -84 : -92);
+        if (!attention_case(shape, weights, inputs, expected, role == 1)) return false;
+    }
+    {
+        const std::array<int64_t, 10> shape{0, 96, 2, 1, 1, 1, 1, 1, 0, 0};
+        std::vector<float> weights(192), inputs(96, 65.0f/64.0f);
+        for (size_t j = 0; j < 2; ++j) {
+            std::fill_n(weights.begin()+j*96, 32, std::ldexp(1.0f, 24+20*j));
+            std::fill_n(weights.begin()+j*96+32, 32, -std::ldexp(1.0f, 24+20*j));
+            std::fill_n(weights.begin()+j*96+64, 32, std::ldexp(1.0f, 20*j));
+        }
+        const float value = GGML_GEMMINI_ACTIVATION_BITS == 4 ? 32.43359375f : 133119.0f/4096;
+        const std::vector<float> expected{value, std::ldexp(value, 20)};
+        if (!attention_case(shape, weights, inputs, expected)) return false;
+    }
+    {
+        const std::array<int64_t, 10> shape{0, 160, 1, 1, 1, 1, 1, 1, 0, 0};
+        std::vector<float> weights(160, 0x1p21f), inputs(160, 1.0f);
+        const std::vector<float> expected{GGML_GEMMINI_ACTIVATION_BITS == 4 ? 67108896.0f : 131071.0f/4096};
+        std::fill(weights.begin()+96, weights.begin()+128, -0x1p21f);
+        std::fill(weights.begin()+128, weights.end(), 1.0f);
+        if (!attention_case(shape, weights, inputs, expected)) return false;
+    }
+    if (GGML_GEMMINI_ACTIVATION_BITS == 8) {
+        const std::array<int64_t, 10> shape{1, 256, 5, 256, 1, 1, 1, 1, 0, 0};
+        std::vector<float> weights(256*5), inputs(256*256), expected(256*5);
+        for (size_t j = 0; j < 5; ++j)
+            for (size_t c = 0; c < 256; ++c)
+                weights[j*256+c] = (c%32 == 0 ? 127.0f : float(int((c*11+j)%255)-127))/64;
+        for (size_t i = 0; i < 256; ++i) {
+            for (size_t c = 0; c < 256; ++c) inputs[i*256+c] = float(i*256+c)/65536;
+            for (size_t j = 0; j < 5; ++j) {
+                double sum = 0;
+                for (size_t c = 0; c < 256; ++c) sum += double(inputs[i*256+c])*weights[j*256+c];
+                expected[i*5+j] = float(sum);
+            }
+        }
+        if (!attention_case(shape, weights, inputs, expected)) return false;
+    }
+    return true;
+}
+
+static bool attention_fixture(const char * path) {
+    std::ifstream file(path, std::ios::binary);
+    std::array<int64_t, 10> shape{};
+    file.read(reinterpret_cast<char *>(shape.data()), sizeof(shape));
+    if (!file || !std::all_of(shape.begin()+1, shape.begin()+8, [](int64_t v) { return v > 0 && v <= 4096; })) return false;
+    std::vector<float> weights(size_t(shape[1]*shape[2]*shape[4]*shape[6]));
+    std::vector<float> inputs(size_t(shape[1]*shape[3]*shape[5]*shape[7]));
+    std::vector<float> expected(size_t(shape[2]*shape[3]*shape[5]*shape[7]));
+    for (auto * v : {&weights, &inputs, &expected})
+        file.read(reinterpret_cast<char *>(v->data()), std::streamsize(v->size()*sizeof(float)));
+    if (!file) return false;
+    return attention_case(shape, weights, inputs, expected);
+}
+
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--case=attention-mask") return test_attention_mask() ? 0 : 1;
+    if (argc == 2 && std::string(argv[1]) == "--case=attention") return test_attention() ? 0 : 1;
+    if (argc == 3 && std::string(argv[1]) == "--attention-fixture") return attention_fixture(argv[2]) ? 0 : 1;
     if (argc == 2 && std::string(argv[1]) == "--case=hp1-native-admission") {
         return test_hp1_native_weight_admission() ? 0 : 1;
     }
