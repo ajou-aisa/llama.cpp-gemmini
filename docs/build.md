@@ -84,8 +84,11 @@ At runtime, leave flash attention disabled and KV offloading enabled.
 `--no-kv-offload` bypasses the PoTal policy and selects the existing attention
 path even when quantization is enabled. Set both build options to `OFF` to
 omit PoTal attention dispatch.
-`GGML_GEMMINI_QK_SCHEDULE=vanilla|tile|reuse` selects the runtime QK schedule;
-the default is `vanilla`. The softmax mask is applied for every schedule.
+`GGML_GEMMINI_QK_SCHEDULE=full|tile` selects the runtime QK schedule; the default
+is `full`. Both schedules execute the same main and residual digit GEMMs.
+`full` computes every key region; `tile` skips only completely masked QK tiles.
+The softmax mask is applied for both schedules. PV always computes its full
+reduction, including the P zero-point correction.
 
 ### Component and lifetime boundaries
 

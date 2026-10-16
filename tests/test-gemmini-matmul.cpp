@@ -1822,8 +1822,8 @@ static bool test_attention_mask() {
                 mask[size_t(i*n+j)] = blocked ? -INFINITY : kind == 5 ? -10000.0f : 0.0f;
             }
         const std::array<int64_t, 10> shape{0, k, n, rows, kv_heads, heads, 1, batches, 1, 1};
-        std::array<ggml_gemmini_attention_stats, 3> stats{};
-        const std::array<const char *, 3> modes{"vanilla", "tile", "reuse"};
+        std::array<ggml_gemmini_attention_stats, 2> stats{};
+        const std::array<const char *, 2> modes{"full", "tile"};
         for (size_t mode = 0; mode < modes.size() && ok; ++mode) {
             setenv("GGML_GEMMINI_QK_SCHEDULE", modes[mode], 1);
             ok = attention_case(shape, weights, inputs, expected, false, mask, kind%2 != 0, &stats[mode]);
@@ -1835,21 +1835,19 @@ static bool test_attention_mask() {
                         (unsigned long long)stats[mode].raw_cycles);
         }
         if (ok && kind == 0)
-            ok = expect(stats[1].main_fragments < stats[2].main_fragments &&
-                        stats[2].main_fragments < stats[0].main_fragments &&
-                        stats[2].main_dots < stats[1].main_dots,
-                        "fine tiles skip more while reuse preserves larger main row groups");
+            ok = expect(stats[1].main_fragments < stats[0].main_fragments,
+                        "tile schedule skips masked work compared with full");
         if (ok && kind == 4)
-            ok = expect(stats[1].main_dots == 0 && stats[1].residual_dots == 0 &&
-                        stats[2].main_dots == 0 && stats[2].residual_dots == 0,
+            ok = expect(stats[1].main_dots == 0 && stats[1].residual_dots == 0,
                         "all masked: neither K pass nor any residual lane submits work");
         if (ok && kind == 5)
-            ok = expect(stats[0].main_dots == stats[1].main_dots && stats[0].main_dots == stats[2].main_dots &&
-                        stats[0].residual_dots == stats[1].residual_dots && stats[0].residual_dots == stats[2].residual_dots,
-                        "finite bias retains vanilla work and grouping");
+            ok = expect(stats[0].main_dots == stats[1].main_dots &&
+                        stats[0].residual_dots == stats[1].residual_dots,
+                        "finite bias retains full work and grouping");
     }
-    if (ok) {
-        setenv("GGML_GEMMINI_QK_SCHEDULE", "invalid", 1);
+    for (const char * invalid : {"invalid", "vanilla", "reuse"}) {
+        if (!ok) break;
+        setenv("GGML_GEMMINI_QK_SCHEDULE", invalid, 1);
         ok = attention_case({0, 32, 1, 1, 1, 1, 1, 1, 0, 0}, std::vector<float>(32, 1),
                             std::vector<float>(32, 1), {32}, true);
     }

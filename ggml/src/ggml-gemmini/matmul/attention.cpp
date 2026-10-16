@@ -1,8 +1,7 @@
 #include "attention.hpp"
 
 #include "ggml-gemmini-matmul-config.hpp"
-#include "../ggml-gemmini-args.h"
-#include <gemmini.h>
+#include "../ggml-gemmini-geometry.hpp"
 #include "../quants/act/exsia/local.hpp"
 #include "../quants/act/exsia/exsia_shift.hpp"
 #include "../quants/common/hp1_scu.hpp"
@@ -216,14 +215,13 @@ StreamStripe stream(const ggml_tensor & t, size_t head, size_t batch, size_t beg
     return st;
 }
 
-enum class QkSchedule { vanilla, tile, reuse };
+enum class QkSchedule { full, tile };
 
 QkSchedule qk_schedule() {
     const char * value = std::getenv("GGML_GEMMINI_QK_SCHEDULE");
-    if (!value || !*value || std::strcmp(value, "vanilla") == 0) return QkSchedule::vanilla;
-    if (std::strcmp(value, "tile") == 0) return QkSchedule::tile;
-    require(std::strcmp(value, "reuse") == 0);
-    return QkSchedule::reuse;
+    if (!value || !*value || std::strcmp(value, "full") == 0) return QkSchedule::full;
+    require(std::strcmp(value, "tile") == 0);
+    return QkSchedule::tile;
 }
 
 struct QkMask {
@@ -231,7 +229,7 @@ struct QkMask {
     std::vector<uint8_t> live;
 
     QkMask(const ggml_tensor * mask, size_t rows, size_t columns, QkSchedule schedule) {
-        if (!mask || schedule == QkSchedule::vanilla) return;
+        if (!mask || schedule == QkSchedule::full) return;
         require(mask->data && (mask->type == GGML_TYPE_F32 || mask->type == GGML_TYPE_F16) &&
                 ggml_is_contiguous(mask) && ggml_is_matrix(mask) &&
                 size_t(mask->ne[0]) == columns && size_t(mask->ne[1]) >= rows);
@@ -387,7 +385,7 @@ struct ScuGemm {
 };
 
 void multiply(ScuGemm & scu, const StreamStripe & st, const Stationary & w, bool qk, size_t begin,
-              const QkMask & mask, QkSchedule schedule, float * output, AttentionMetrics & metrics) {
+              const QkMask & mask, float * output, AttentionMetrics & metrics) {
     std::vector<int64_t> acc(st.rows*w.n), part;
     auto merge = [&](size_t i, size_t source, int shift, const QkRegion & region) {
         for (size_t j = 0; j < region.columns; ++j)
@@ -397,17 +395,7 @@ void multiply(ScuGemm & scu, const StreamStripe & st, const Stationary & w, bool
     uint64_t residual_k_fragments = 0;
     std::vector<QkRegion> main_regions, residual_regions;
     if (!mask.live.empty()) {
-        size_t main_rows = rmd::kArrayDim;
-        if (schedule == QkSchedule::reuse) {
-            ggml_gemmini_args_t selected{};
-            selected.I = st.rows;
-            selected.J = w.n;
-            selected.K = w.k;
-            gemmini_set_tile_ws(&selected);
-            main_rows = selected.tile_I*rmd::kArrayDim;
-        }
-        require(main_rows);
-        main_regions = qk_regions(mask, begin, st.rows, w.n, main_rows);
+        main_regions = qk_regions(mask, begin, st.rows, w.n, rmd::kArrayDim);
     }
     if (st.upper && (mask.live.empty() || !main_regions.empty())) {
         const auto status = rmd::build_run_aware_activations(*st.upper, residual);
@@ -415,10 +403,7 @@ void multiply(ScuGemm & scu, const StreamStripe & st, const Stationary & w, bool
         for (const auto & run : residual.runs)
             residual_k_fragments += (run.compact_k_count+rmd::kArrayDim-1)/rmd::kArrayDim;
         if (!mask.live.empty()) {
-            const size_t residual_rows = schedule == QkSchedule::reuse
-                ? residual.tile_i*rmd::kArrayDim : rmd::kArrayDim;
-            require(residual_rows);
-            residual_regions = qk_regions(mask, begin, residual.m, w.n, residual_rows, &residual.rows);
+            residual_regions = qk_regions(mask, begin, residual.m, w.n, rmd::kArrayDim, &residual.rows);
         }
     }
     for (size_t pass = 0; pass < (w.codes[1].empty() ? 1u : 2u); ++pass) {
@@ -480,7 +465,7 @@ rmd::RmdStatus attention_execute(ggml_tensor * op, AttentionMetrics & metrics) {
         const auto & b = *op->src[1];
         const bool qk = ggml_gemmini_get_attention_role(op) == GGML_GEMMINI_ATTENTION_QK;
         const size_t rows = b.ne[1], n = a.ne[1], rs = stripe_rows(rows, n, b.ne[0]);
-        const auto schedule = qk ? qk_schedule() : QkSchedule::vanilla;
+        const auto schedule = qk ? qk_schedule() : QkSchedule::full;
         const QkMask mask(qk ? op->src[2] : nullptr, rows, n, schedule);
         const size_t head_repeat = b.ne[2]/a.ne[2], batch_repeat = b.ne[3]/a.ne[3];
         std::vector<float> staged(size_t(ggml_nelements(op)));
@@ -493,7 +478,7 @@ rmd::RmdStatus attention_execute(ggml_tensor * op, AttentionMetrics & metrics) {
                     for (size_t head = ah*head_repeat; head < (ah+1)*head_repeat; ++head)
                         for (size_t begin = 0; begin < rows; begin += rs) {
                             const auto st = stream(b, head, batch, begin, std::min(rs, rows-begin), n, qk);
-                            multiply(scu, st, w, qk, begin, mask, schedule,
+                            multiply(scu, st, w, qk, begin, mask,
                                      staged.data()+((batch*b.ne[2]+head)*rows+begin)*n, pending);
                         }
             }
