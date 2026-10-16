@@ -20,7 +20,7 @@ SHELL_CONTROLS: Final = frozenset((
 
 def configurable(name: str) -> bool:
     return name not in SHELL_CONTROLS and (
-        name.startswith(('GGML_', 'IM2P_', 'LOG_', 'CYCLE_', 'CMAKE_', 'LLAMA_'))
+        name.startswith(('GGML_', 'IM2P_', 'LOG_', 'CYCLE_', 'CMAKE_', 'LLAMA_', 'POTAL_'))
         or name in ('BUILD_SHARED_LIBS', 'OpenMP_ROOT', 'GEMMINI_SW_PATH'))
 
 
@@ -30,7 +30,8 @@ def normalize(name: str, value: str) -> str:
             return '0'
         return '1'
     if name in ('GGML_GEMMINI', 'GGML_GEMMINI_ENABLE_RMD', 'GGML_GEMMINI_DEQUANT_FP_TEST',
-                'GGML_GEMMINI_ENABLE_A4NKS_ATTENTION', 'GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION'):
+                'GGML_GEMMINI_ENABLE_A4NKS_ATTENTION', 'GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION',
+                'POTAL_API_ONLY'):
         if value.upper() in ('ON', 'YES', 'TRUE', '1'):
             return 'ON'
         if value.upper() in ('OFF', 'NO', 'FALSE', '0'):

@@ -11,6 +11,9 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ||
   printf '%s\n' 'GGML_GEMMINI_DIM=16|32|64 must match the physical Gemmini header.'
   printf '%s\n' 'GGML_GEMMINI_ENABLE_A4NKS_ATTENTION=ON enables PoTal Q/K/P/V quantization; default OFF.'
   printf '%s\n' 'GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION=ON additionally requires native WS+IM2P_SIM+GEMMINI_HP1; default OFF.'
+  printf '%s\n' 'PoTal API only: -DGGML_GEMMINI=OFF -DPOTAL_API_ONLY=ON -DPOTAL_EXPECTED_DIM=16|32|64'
+  printf '%s\n' '  -DPOTAL_HW_PARAMS:FILEPATH=/abs/gemmini_potal*_params.h [-DPOTAL_HW_CONFIG=<Chipyard config>]'
+  printf '%s\n' '  builds potal-api, potal-api-test and (DIM16) potal-api-smoke instead of llama-cli.'
   exit 0
 fi
 
@@ -110,4 +113,9 @@ if [[ "$IM2P_BUILD_DRY_RUN" == 1 ]]; then
 fi
 
 im2p_configure_build "$BUILD_DIR" "${IM2P_EFFECTIVE_CMAKE_ARGS[@]}"
-cmake --build "$BUILD_DIR" --target llama-cli -j"${BUILD_JOBS_DEFAULT}"
+if [[ "${POTAL_API_ONLY_DEFAULT:-OFF}" == ON ]]; then
+  # API-only configure defines only the PoTal targets.
+  cmake --build "$BUILD_DIR" -j"${BUILD_JOBS_DEFAULT}"
+else
+  cmake --build "$BUILD_DIR" --target llama-cli -j"${BUILD_JOBS_DEFAULT}"
+fi

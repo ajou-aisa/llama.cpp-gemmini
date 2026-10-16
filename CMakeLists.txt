@@ -161,6 +161,20 @@ if (LLAMA_USE_SYSTEM_GGML)
     add_library(ggml ALIAS ggml::ggml)
 endif()
 
+# Standalone PoTal RoCC API: configure only ggml/src/ggml-potal (no ggml/llama,
+# no Gemmini software tree). See ggml/src/ggml-potal/README.md.
+option(POTAL_API_ONLY "Configure only the standalone PoTal RoCC API and its tests" OFF)
+if (POTAL_API_ONLY)
+    if (GGML_GEMMINI)
+        message(FATAL_ERROR "POTAL_API_ONLY=ON requires GGML_GEMMINI=OFF")
+    endif()
+    enable_testing()
+    add_subdirectory(ggml/src/ggml-potal)
+    return()
+elseif (DEFINED POTAL_HW_PARAMS OR DEFINED POTAL_EXPECTED_DIM)
+    message(FATAL_ERROR "POTAL_HW_PARAMS/POTAL_EXPECTED_DIM are used only with POTAL_API_ONLY=ON")
+endif()
+
 set(_GGML_GEMMINI_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 set(_GGML_GEMMINI_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}")
 set(_GGML_GEMMINI_TOP_BINARY_DIR "${CMAKE_BINARY_DIR}")

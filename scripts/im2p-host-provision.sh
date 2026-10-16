@@ -25,7 +25,7 @@ im2p_configure_build() {
   local build_dir=$1
   shift
   cmake -B "$build_dir" -S "$SCRIPT_ROOT" \
-    -U 'GGML_*' -U 'IM2P_*' -U 'LLAMA_*' -U 'LOG_*' -U 'CYCLE_*' \
+    -U 'GGML_*' -U 'IM2P_*' -U 'LLAMA_*' -U 'LOG_*' -U 'CYCLE_*' -U 'POTAL_*' \
     -U 'BUILD_SHARED_LIBS' -U 'CMAKE_TOOLCHAIN_FILE' \
     -U 'CMAKE_PREFIX_PATH' -U 'OpenMP_ROOT' "$@"
 }
