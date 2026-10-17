@@ -1,19 +1,24 @@
 #!/bin/bash
-
 set -euo pipefail
+
 SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/im2p-host-provision.sh
 source "$SCRIPT_ROOT/scripts/im2p-host-provision.sh"
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ||
       "${2:-}" == "-h" || "${2:-}" == "--help" ]]; then
   printf 'Usage: %s [static] [--dry-run] [-DNAME[:TYPE]=value ...]\n' "${0##*/}"
-  printf '%s\n' 'Environment overrides: BUILD_DIR, GGML_*.'
+  printf '%s\n' 'Environment overrides: BUILD_DIR, BUILD_JOBS, GGML_*, IM2P_*.'
   printf '%s\n' 'GGML_GEMMINI_DIM=16|32|64 must match the physical Gemmini header.'
   printf '%s\n' 'GGML_GEMMINI_ENABLE_A4NKS_ATTENTION=ON enables PoTal Q/K/P/V quantization; default OFF.'
   printf '%s\n' 'GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION=ON additionally requires native WS+IM2P_SIM+GEMMINI_HP1; default OFF.'
   printf '%s\n' 'PoTal API only: -DGGML_GEMMINI=OFF -DPOTAL_API_ONLY=ON -DPOTAL_EXPECTED_DIM=16|32|64'
   printf '%s\n' '  -DPOTAL_HW_PARAMS:FILEPATH=/abs/gemmini_potal*_params.h [-DPOTAL_HW_CONFIG=<Chipyard config>]'
-  printf '%s\n' '  builds potal-api, potal-api-test and (DIM16) potal-api-smoke instead of llama-cli.'
+  printf '%s\n' '  builds potal-api, potal-api-test and (DIM16) potal-api-smoke, potal-multicore-smoke instead of llama-cli.'
+  printf '%s\n' '  -DPOTAL_ENABLE_OPENMP=ON adds --mode=openmp to potal-multicore-smoke (needs libgomp.so.1 on target).'
+  printf '%s\n' 'GGML PoTal backend: -DGGML_GEMMINI=OFF -DGGML_POTAL=ON -DPOTAL_EXPECTED_DIM=16 -DGGML_BACKEND_DL=OFF'
+  printf '%s\n' '  -DPOTAL_HW_PARAMS:FILEPATH=/abs/gemmini_potal_params.h builds the potal-api tests,'
+  printf '%s\n' '  potal-ggml-unit-test and potal-ggml-smoke (libggml-potal), then llama-cli.'
   exit 0
 fi
 
@@ -29,20 +34,26 @@ BUILD_JOBS_DEFAULT=${BUILD_JOBS:-${BUILD_JOBS_DEFAULT:-$(im2p_host_jobs)}}
 IM2P_ARTIFACT_SET_DEFAULT=${IM2P_ARTIFACT_SET_DEFAULT:-SELECTED}
 IM2P_CACHE_JOBS_DEFAULT=${IM2P_CACHE_JOBS_DEFAULT:-}
 
-# Backend and platform policy.
+# Backends: ON | OFF; override with -DGGML_<NAME>=ON|OFF or GGML_<NAME>=ON|OFF.
+GGML_CPU_DEFAULT=${GGML_CPU_DEFAULT:-ON}
 GGML_GEMMINI_DEFAULT=${GGML_GEMMINI_DEFAULT:-ON}
+GGML_POTAL_DEFAULT=${GGML_POTAL_DEFAULT:-OFF}
+GGML_METAL_DEFAULT=${GGML_METAL_DEFAULT:-OFF}
+GGML_CUDA_DEFAULT=${GGML_CUDA_DEFAULT:-OFF}
+GGML_BLAS_DEFAULT=${GGML_BLAS_DEFAULT:-OFF}
+GGML_VULKAN_DEFAULT=${GGML_VULKAN_DEFAULT:-OFF}
+GGML_OPENCL_DEFAULT=${GGML_OPENCL_DEFAULT:-OFF}
+GGML_RPC_DEFAULT=${GGML_RPC_DEFAULT:-OFF}
+GGML_BACKEND_DL_DEFAULT=${GGML_BACKEND_DL_DEFAULT:-OFF}
+
+# Gemmini backend and platform policy.
 GGML_GEMMINI_EXECUTION_BACKEND_DEFAULT=${GGML_GEMMINI_EXECUTION_BACKEND_DEFAULT:-HARDWARE}
 GGML_GEMMINI_OPTION_DEFAULT=${GGML_GEMMINI_OPTION_DEFAULT:-WS}
-GEMMINI_SW_PATH_DEFAULT=${GEMMINI_SW_PATH_DEFAULT:-"$SCRIPT_ROOT/../RISC-V-DynDNN-gemmini-include"}
 GGML_NATIVE_DEFAULT=${GGML_NATIVE_DEFAULT:-OFF}
 GGML_OPENMP_DEFAULT=${GGML_OPENMP_DEFAULT:-OFF}
 GGML_GEMMINI_ENABLE_OPENMP_DEFAULT=${GGML_GEMMINI_ENABLE_OPENMP_DEFAULT:-ON}
-GGML_CUDA_DEFAULT=${GGML_CUDA_DEFAULT:-OFF}
-GGML_BACKEND_DL_DEFAULT=${GGML_BACKEND_DL_DEFAULT:-OFF}
 LLAMA_BUILD_TESTS_DEFAULT=${LLAMA_BUILD_TESTS_DEFAULT:-ON}
 LLAMA_CURL_DEFAULT=${LLAMA_CURL_DEFAULT:-OFF}
-GGML_METAL_DEFAULT=${GGML_METAL_DEFAULT:-OFF}
-GGML_BLAS_DEFAULT=${GGML_BLAS_DEFAULT:-OFF}
 CMAKE_TOOLCHAIN_FILE_DEFAULT=${CMAKE_TOOLCHAIN_FILE_DEFAULT:-"$SCRIPT_ROOT/cmake/$target.cmake"}
 if [[ "$target" == riscv-static ]]; then
   CMAKE_BUILD_TYPE_DEFAULT=${CMAKE_BUILD_TYPE_DEFAULT:-DEBUG}
@@ -116,6 +127,11 @@ im2p_configure_build "$BUILD_DIR" "${IM2P_EFFECTIVE_CMAKE_ARGS[@]}"
 if [[ "${POTAL_API_ONLY_DEFAULT:-OFF}" == ON ]]; then
   # API-only configure defines only the PoTal targets.
   cmake --build "$BUILD_DIR" -j"${BUILD_JOBS_DEFAULT}"
+elif [[ "${GGML_POTAL_DEFAULT:-OFF}" == ON ]]; then
+  # PoTal tests first, so they exist even if llama-cli does not link.
+  cmake --build "$BUILD_DIR" --target potal-api-test potal-api-smoke potal-multicore-smoke \
+    potal-ggml-unit-test potal-ggml-smoke -j"${BUILD_JOBS_DEFAULT}"
+  cmake --build "$BUILD_DIR" --target llama-cli -j"${BUILD_JOBS_DEFAULT}"
 else
   cmake --build "$BUILD_DIR" --target llama-cli -j"${BUILD_JOBS_DEFAULT}"
 fi

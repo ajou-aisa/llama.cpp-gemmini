@@ -318,6 +318,7 @@ elseif (GGML_CPU)
 endif()
 
 ggml_add_backend(GEMMINI)
+ggml_add_backend(POTAL)
 ggml_add_backend(BLAS)
 ggml_add_backend(CANN)
 ggml_add_backend(CUDA)

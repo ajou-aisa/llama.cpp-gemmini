@@ -1,10 +1,15 @@
-# PoTal minimal RoCC API
+# PoTal minimal RoCC API and GGML backend
 
-Standalone C11 API for the PoTal SCU hardware (Gemmini-derived, Sat32 ACC).
-It is configured only with `POTAL_API_ONLY=ON` and does not use `gemmini.h`,
+Standalone C11 API for the PoTal SCU hardware (Gemmini-derived, Sat32 ACC),
+and the `POTAL` GGML backend built on it. Neither uses `gemmini.h`,
 `xcustom.h`, `GEMMINI_SW_PATH`, `RISC-V-DynDNN-gemmini-include` or `IM2P.sim`.
-The existing Gemmini backend and `llama-cli` builds are unchanged when
-`POTAL_API_ONLY` is OFF.
+
+| Configuration | Result |
+|---|---|
+| `POTAL_API_ONLY=ON`, `GGML_GEMMINI=OFF` | only `potal-api` and its tests; ggml/llama are not configured |
+| `GGML_POTAL=ON`, `POTAL_API_ONLY=OFF`, `GGML_GEMMINI=OFF` | ggml/llama plus the `ggml-potal` backend and all PoTal tests |
+| `GGML_POTAL=OFF`, `POTAL_API_ONLY=OFF` | the existing ggml/llama build (CPU or Gemmini backend), unchanged |
+| `GGML_POTAL=ON` with `GGML_GEMMINI=ON` or with `POTAL_API_ONLY=ON` | configure error |
 
 | File | Role |
 |---|---|
@@ -13,6 +18,12 @@ The existing Gemmini backend and `llama-cli` builds are unchanged when
 | `potal.c` | Validation, encoding, hardware calls; cross-checks the original header |
 | `tests/potal-api-test.c` | Host/target packing and validation test (`potal-api-test`) |
 | `tests/potal-api-smoke.c` | DIM16 hardware test (`potal-api-smoke`) |
+| `../../include/ggml-potal.h` | GGML backend API: init/reg, reject reasons, counters |
+| `ggml-potal.cpp` | Backend, device and registry; `supports_op`, `graph_compute` |
+| `matmul/pack.{hpp,cpp}` | GGML MUL_MAT <-> PoTal GEMM contract, A/B packing, C -> F32 |
+| `matmul/execution.{hpp,cpp}` | hart-0 issuer thread: TLB flush, scale write, issue, fence, release |
+| `tests/potal-ggml-unit-test.cpp` | Hardware-free backend test (`potal-ggml-unit-test`) |
+| `tests/potal-ggml-smoke.cpp` | FireSim GGML MUL_MAT hardware test (`potal-ggml-smoke`) |
 | `../../../cmake/potal-hw-params.cmake` | Hardware header validation (single implementation) |
 | `../../../scripts/potal-hw-params-test.sh` | Configure-level positive/negative header tests |
 | `../../../scripts/potal-build-baremetal.sh` | Bare-metal ELF of the smoke test |
@@ -50,8 +61,9 @@ the RTL revision or the Sat32 configuration; record those with
 Editing the selected header re-runs validation on the next build
 (`configure_file` dependency). Build scripts clear `POTAL_*` cache entries on
 every configure (`-U 'POTAL_*'`); each build dir has its own generated copy.
-Setting `POTAL_HW_PARAMS`/`POTAL_EXPECTED_DIM` without `POTAL_API_ONLY=ON` is a
-configure error.
+Setting `POTAL_HW_PARAMS`/`POTAL_EXPECTED_DIM` without `POTAL_API_ONLY=ON` or
+`GGML_POTAL=ON` is a configure error. Both modes run the same
+`potal_configure_hw_params()` and write the same `<build>/generated/` files.
 
 ## API summary
 
@@ -66,6 +78,7 @@ nothing was issued.
 | `potal_scale_write(slot, gen, col, carrier)` | validates, then SCALE_WRITE (funct 23); returns hw status |
 | `potal_scale_release(slot, gen, col)` | SCALE_RELEASE (24); hw holds it until older work drains |
 | `potal_fence()` | POTAL_FENCE (25); `POTAL_OK` = older GEMMs done, C stores drained |
+| `potal_tlb_flush()` | FLUSH (7, rs1=0 flush+retry); `POTAL_OK` = issued; `ERR_BUSY` if a GEMM is unfenced |
 | `potal_gemm_ws_check(&g)` | argument -> capacity -> validated-scope checks |
 | `potal_gemm_ws_scale_slot(&g, k_block, n_tile, &slot)` | `base + k_block * J + n_tile` |
 | `potal_gemm_ws_encode(&g, &program)` | CONFIG_LD A/B, CONFIG_EX, CONFIG_ST, LOOP_WS 9..13, LOOP_WS 8 |
@@ -73,6 +86,13 @@ nothing was issued.
 
 Rules:
 
+- Per process, before the first GEMM: `potal_tlb_flush()` then
+  `potal_fence()`, both `POTAL_OK`. The accelerator TLB is not flushed on
+  Linux context switches, so a new process could otherwise reuse a stale
+  translation (observed: C left at its initial value). FLUSH has no response;
+  it travels in the same in-order raw command queue as FENCE and is consumed
+  at the unrolled command queue, which FENCE requires to be empty
+  (`Controller.scala`), so the fence completing implies the flush was applied.
 - Write every scale `slot = potal_gemm_ws_scale_slot(...)` for all `DIM`
   columns with the GEMM's generation before issuing.
 - After `potal_gemm_ws_issue`, do not read C or modify/free A, B, C until
@@ -92,7 +112,143 @@ Rules:
   the existing backend does; page pinning and explicit cache maintenance are
   not provided.
 - Non-RISC-V builds validate and then return `POTAL_ERR_NO_HARDWARE`.
-- Not thread-safe; single core.
+- Not thread-safe. Exactly one thread, pinned to the Linux CPU whose
+  `/proc/cpuinfo` `hart` is 0 (the hart the PoTal RoCC is attached to), may
+  issue commands. Other CPUs raise an illegal-instruction trap on custom-3.
+- One process at a time. Back-to-back processes are covered by the per-process
+  TLB flush; concurrent processes sharing the accelerator are not supported
+  (scale slots, TLB and in-flight GEMMs are global hardware state).
+
+## Multicore smoke (`potal-multicore-smoke`, RISC-V Linux, DIM16)
+
+One issuer pthread pins itself to the hart-0 CPU (found from
+`/proc/cpuinfo`; never assumed) and is the only thread issuing RoCC commands:
+TLB flush, fence, then `--iterations` GEMMs (alternating K16/K32, scale slots
+from 128). CPU workers each pin themselves to a different other allowed online
+CPU and run INT8 quantize + INT32 dot-product work units; checksums are
+recomputed serially after join. The main thread never narrows its own
+affinity, so workers do not inherit the issuer CPU.
+
+```
+--mode=pthread|openmp   worker pool (openmp needs -DPOTAL_ENABLE_OPENMP=ON)
+--workers=N             default: OMP_NUM_THREADS (openmp), else all non-hart0 CPUs
+--iterations=N          GEMMs, default 4
+--work-units=N          units per worker, default 4000
+--verbose               worker progress lines
+```
+
+Worker count precedence: `--workers` > `OMP_NUM_THREADS` (openmp mode only) >
+available CPUs. In openmp mode the team is created with `num_threads(N)` and
+must have exactly N threads; each OpenMP thread pins itself explicitly, so
+`OMP_PROC_BIND`/`OMP_PLACES`/`GOMP_CPU_AFFINITY` are logged and overridden.
+`--mode=openmp` in a build without OpenMP fails (exit 2); it never falls back.
+
+Results (separate):
+
+| Line | Meaning |
+|---|---|
+| `CPU_MULTICORE_VERIFIED` | every worker: affinity = its own CPU, all periodic `sched_getcpu()` samples on it, not the hart-0 CPU, all CPUs distinct, full progress, checksum = reference |
+| `POTAL_GEMM_VERIFIED` | flush/fence OK and every GEMM equals the int64 golden model |
+| `CPU_POTAL_OVERLAP_OBSERVED` / `_NOT_OBSERVED` | summed worker progress increased between the return of a verified GEMM issue and the return of its FENCE |
+
+`POTAL_MULTICORE_SMOKE PASS` (exit 0) requires the first two. Overlap is
+reported only; if not observed, raise `--work-units` and/or `--iterations`.
+Times are guest `CLOCK_MONOTONIC` seconds from process start and
+`CLOCK_THREAD_CPUTIME_ID`; they are not FPGA host time and not a speedup
+measurement. Do not run the whole program under `taskset -c <one cpu>`: the
+workers would have no other CPU and the test fails by design.
+
+OpenMP build: `-DPOTAL_ENABLE_OPENMP=ON` runs `find_package(OpenMP C REQUIRED)`
+with the RISC-V toolchain (configure fails if it cannot compile and link) and
+links only `potal-multicore-smoke`; it is independent of `GGML_OPENMP` /
+`GGML_GEMMINI_ENABLE_OPENMP`. The dynamic build needs `libgomp.so.1` in the
+guest rootfs (toolchain sysroot `lib/libgomp.so.1`).
+
+## GGML backend (`GGML_POTAL=ON`)
+
+Device `POTAL` (type ACCEL, statically registered before CPU; `GGML_BACKEND_DL`
+is not supported). It executes exactly one op in hardware:
+
+| | GGML | PoTal (`potal.h`) |
+|---|---|---|
+| weights | `src0` I8, `ne = {K, N}`, row n = K values | `B = src0^T`, int8 `[K][N]` |
+| activations | `src1` I8, `ne = {K, M}`, row m = K values | `A = src1`, int8 `[M][K]` |
+| result | `dst` F32, `ne = {N, M}`, `dst[m][n] = sum_k src1[m][k] * src0[n][k]` | `C` int32 `[M][N]`, converted to F32 |
+| shape | 2-D, `M = N = 16`, `K = 16` or `32`, contiguous, host memory | one DIM16 output tile |
+| scales | none in a plain `GGML_OP_MUL_MAT` | every carrier `0` (x1) in one scale block |
+
+With x1 carriers `|C| <= 32 * 128 * 128 < 2^24`, so the INT32 result is the
+exact integer dot product and exact in F32. No scale is invented and F32
+inputs are never quantized: F32/F16/quantized MUL_MAT, other shapes,
+batches, transposed/permuted/strided operands, `op_params[1..]` tags
+(attention roles) and every other op (bias ADD, SOFT_MAX, FLASH_ATTN_EXT, ...)
+are rejected by `supports_op` with a reason (`ggml_potal_reject_name()`);
+`ggml_backend_sched` then places supported ones on the CPU backend. Metadata
+view ops (NONE/RESHAPE/VIEW/PERMUTE/TRANSPOSE) of host tensors are accepted
+and are no-ops. The default buffer type is the CPU (host) buffer type; the
+backend copies operands into its own DMA staging buffers.
+
+`graph_compute` first checks every node; a node outside the contract fails
+the graph with `GGML_STATUS_FAILED` before any hardware command (no CPU
+fallback inside the backend, no abort). A failed node's F32 `dst` is set to
+NaN, so stale or partial data is never presented as a result.
+
+Execution of one node (`matmul/execution.cpp`):
+
+```
+graph_compute thread: pack src1 -> A[16][K], src0 -> B[K][16]   (pack_us)
+  -> process-wide issuer thread (created on the first request):
+       once: find the hart-0 CPU in /proc/cpuinfo, pin + verify affinity,
+             potal_tlb_flush() -> potal_fence()            [POTAL_ISSUER] [POTAL_TLB]
+       copy A/B into static DMA staging buffers (lda 32, ldb 16), C <- sentinel
+       potal_scale_write(slot 192, generation 1..255, 16 columns, carrier 0)
+       potal_gemm_ws_issue()  (passes_per_block = K/16)   dispatch=HARDWARE
+       potal_fence()                                      fence_status
+       copy C out, potal_scale_release() x16, check no C element kept the sentinel
+graph_compute thread: C int32 -> dst F32                  (unpack_us)
+```
+
+- Only the issuer thread issues PoTal commands; the caller's thread and
+  affinity are untouched. Requests are serialized (one at a time).
+- The staging buffers live for the whole process, use the smoke-test layout
+  and are touched only by the issuer while no GEMM is in flight.
+- Scale slot 192 is not used by `potal-api-smoke` (0..41) or
+  `potal-multicore-smoke` (128..129).
+- Software rejections before any command (`potal_gemm_ws_check`) fail only the
+  node. Any failure after a command was sent (scale write, issue, fence,
+  release, C not written) disables the issuer for the rest of the process:
+  buffers and slots of a possibly unfinished GEMM are never reused.
+- One process at a time, as for the API. Off RISC-V the request is validated
+  by `potal_gemm_ws_issue()` and fails with `POTAL_ERR_NO_HARDWARE`.
+
+Logs (GGML log, INFO unless noted): `[POTAL_BACKEND] registered`,
+`device_init`, per node `node=... op=MUL_MAT src0_type=i8 ... M N K`,
+`[POTAL_MATMUL] pack_A_bytes/pack_B_bytes`, `scale_base/generation`,
+`dispatch=HARDWARE issue_status=POTAL_OK` (printed only after the issue
+returned `POTAL_OK`), `fence_status=POTAL_OK`, `scale_release=POTAL_OK`,
+`output_type=F32`, `[POTAL_BACKEND] hw_gemm_count`; errors as
+`dispatch=FAILED stage=... status=...`; `supports_op` decisions for MUL_MAT at
+DEBUG. `ggml_backend_potal_get_stats()` returns per-backend counters (nodes,
+hardware requests, issued, fenced, completed, failed, last status/slot/
+generation), cumulative pack/stage/scale/issue/fence/unpack times, device-wide
+`supports_op` answers by reason and the issuer CPU/tid. Times are guest
+`CLOCK_MONOTONIC`, not FPGA cycles or array utilization, and say nothing about
+GGML inference speed.
+
+Tests:
+
+| Binary | Runs on | Checks | Final line |
+|---|---|---|---|
+| `potal-ggml-unit-test` | host and target, no accelerator access | registry/GUID/props, `supports_op` table with reasons and counters, packing against a CPU-backend F32 MUL_MAT golden, refusal before hardware, off-RISC-V `POTAL_ERR_NO_HARDWARE` with NaN dst, scheduler placement POTAL vs CPU | `POTAL_GGML_UNIT_TEST PASS` |
+| `potal-ggml-smoke` | FireSim (RISC-V Linux) | `ggml_mul_mat` graphs on the POTAL backend: K16 and K32, 3 patterns each, plus POTAL + CPU scheduler; per GEMM `GGML_BACKEND=POTAL`, `DISPATCH=HARDWARE`, `POTAL_GEMM_ISSUED`, `POTAL_FENCE_PASS` (from backend counters), `GGML_MUL_MAT_NUMERICAL_PASS` (all 256 outputs vs int64 golden); issuer CPU maps to hart 0; main thread affinity unchanged | `POTAL_GGML_SMOKE PASS` |
+
+`potal-ggml-smoke [--case=k16|k32|sched|all] [--verbose]`; `--verbose` adds
+GGML DEBUG lines. Exit 0 pass, 1 fail, 2 usage/environment error.
+
+Not implemented: GGML quantization metadata and PoTal shared/column scales,
+other shapes and multi-tile GEMM, F32/F16/quantized MUL_MAT, Stripe/Paired
+execution, DIM32/64, dynamic backend loading, concurrent processes, full
+model inference (llama-cli links, but no model tensor matches the contract).
 
 ## Commands
 
@@ -110,11 +266,36 @@ ctest --test-dir build-potal-host --output-on-failure
 # Configure-level header tests; negative cases pass only when configure fails
 scripts/potal-hw-params-test.sh   # expects "POTAL_HW_PARAMS_TEST PASS"
 
-# RISC-V Linux cross build (bin/potal-api-test, bin/potal-api-smoke)
+# RISC-V Linux cross build (bin/potal-api-test, bin/potal-api-smoke,
+# bin/potal-multicore-smoke; add -DPOTAL_ENABLE_OPENMP=ON for --mode=openmp)
 BUILD_DIR=build-potal-d16 ./build-riscv.sh -DGGML_GEMMINI=OFF -DPOTAL_API_ONLY=ON \
   -DPOTAL_EXPECTED_DIM=16 -DPOTAL_HW_PARAMS:FILEPATH="$PARAMS/gemmini_potal_params.h" \
   -DPOTAL_HW_CONFIG=PoTalSat32GemminiRocketConfig
 
+# Guest (FireSim Linux): back-to-back processes, each flushes the TLB itself
+./potal-api-smoke; ./potal-api-smoke
+./potal-multicore-smoke --mode=pthread --workers=3 --iterations=4 --verbose
+OMP_NUM_THREADS=3 OMP_DYNAMIC=FALSE OMP_PROC_BIND=FALSE OMP_DISPLAY_ENV=TRUE \
+  ./potal-multicore-smoke --mode=openmp --iterations=4 --verbose
+
 # Bare-metal ELF (needs riscv64-unknown-elf-gcc: source chipyard env.sh)
 scripts/potal-build-baremetal.sh build-potal-host
+
+# GGML backend, host (expects "POTAL_GGML_UNIT_TEST PASS")
+cmake -S . -B build-potal-ggml-host -DGGML_GEMMINI=OFF -DGGML_POTAL=ON -DGGML_BACKEND_DL=OFF \
+  -DLLAMA_CURL=OFF -DPOTAL_EXPECTED_DIM=16 -DPOTAL_HW_PARAMS:FILEPATH="$PARAMS/gemmini_potal_params.h"
+cmake --build build-potal-ggml-host --target potal-ggml-unit-test potal-api-test -j
+build-potal-ggml-host/bin/potal-ggml-unit-test
+
+# GGML backend, RISC-V Linux cross build (bin/potal-ggml-smoke, bin/potal-ggml-unit-test,
+# the potal-api tests, bin/libggml*.so, then bin/llama-cli)
+BUILD_DIR=build-potal-ggml-d16 GGML_GEMMINI_DEFAULT=OFF ./build-riscv.sh -DGGML_GEMMINI=OFF \
+  -DGGML_POTAL=ON -DPOTAL_API_ONLY=OFF -DPOTAL_EXPECTED_DIM=16 \
+  -DPOTAL_HW_PARAMS:FILEPATH="$PARAMS/gemmini_potal_params.h" -DGGML_BACKEND_DL=OFF
+
+# Guest (FireSim Linux): copy potal-ggml-smoke with libggml.so, libggml-base.so,
+# libggml-cpu.so and libggml-potal.so (RPATH is $ORIGIN, or set LD_LIBRARY_PATH)
+./potal-ggml-smoke --case=k16 --verbose
+./potal-ggml-smoke --case=k32 --verbose
+./potal-ggml-smoke --case=sched
 ```

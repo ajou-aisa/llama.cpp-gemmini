@@ -17,7 +17,9 @@
  * accelerator, never when the work is done. Only potal_fence() returning
  * POTAL_OK means previously issued GEMMs finished and their C stores drained.
  *
- * Not thread-safe: one thread per process may use this API.
+ * Not thread-safe: one thread per process may use this API, and on a
+ * multi-hart Linux system it must be pinned to the CPU of the hart the PoTal
+ * RoCC is attached to (see tests/potal-multicore-smoke.c).
  */
 #ifndef POTAL_H
 #define POTAL_H
@@ -161,6 +163,24 @@ potal_status potal_scale_release(uint32_t slot, uint32_t generation, uint32_t co
 
 /* POTAL_FENCE: blocks until all older PoTal/Gemmini work and stores drained. */
 potal_status potal_fence(void);
+
+/*
+ * FLUSH(rs1 = 0, flush and retry): invalidate the accelerator-side DMA TLB.
+ * Call once per process before the first GEMM, from the thread that owns the
+ * accelerator, so no translation cached by an earlier process is reused.
+ *
+ * POTAL_OK means issued, not completed. FLUSH has no response; follow it with
+ * potal_fence(): FLUSH and FENCE share the in-order raw command queue and
+ * FENCE only answers after the unrolled command queue is empty, so a
+ * POTAL_OK fence implies the TLB flush was applied.
+ *
+ *   potal_tlb_flush() == POTAL_OK  ->  potal_fence() == POTAL_OK  ->  GEMMs
+ *
+ * Returns POTAL_ERR_BUSY if a GEMM was issued and not yet fenced (flushing
+ * under in-flight DMA is not supported). Does not make concurrent use of one
+ * accelerator by several processes safe.
+ */
+potal_status potal_tlb_flush(void);
 
 /*
  * Issue one GEMM (CONFIG + LOOP_WS sequence). POTAL_OK means issued, not

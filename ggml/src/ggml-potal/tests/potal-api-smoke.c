@@ -179,6 +179,7 @@ static void run_gemm(const char *name, int k, uint32_t base, uint32_t generation
 
     expect("GEMM issue", potal_gemm_ws_issue(&g), POTAL_OK);
     expect("GEMM issue while in flight", potal_gemm_ws_issue(&g), POTAL_ERR_BUSY);
+    expect("TLB flush while in flight", potal_tlb_flush(), POTAL_ERR_BUSY);
     expect("GEMM fence", potal_fence(), POTAL_OK);
 
     for (int i = 0; i < DIM; ++i) {
@@ -212,8 +213,14 @@ static void run_gemm(const char *name, int k, uint32_t base, uint32_t generation
 }
 
 int main(void) {
-    printf("POTAL_API_SMOKE starting DIM=%u params_sha256=%s\n", (unsigned)potal_hw_dim(),
-           potal_hw_params_sha256());
+    printf("POTAL_API_SMOKE starting DIM=%u params_sha256=%s\n",
+           (unsigned)potal_hw_dim(), potal_hw_params_sha256());
+
+    /* New process: drop accelerator TLB entries left by earlier processes. */
+    expect("startup TLB flush issue", potal_tlb_flush(), POTAL_OK);
+    printf("POTAL_TLB_FLUSH issued\n");
+    expect("startup TLB flush fence", potal_fence(), POTAL_OK);
+    printf("POTAL_TLB_FLUSH fence completed\n");
 
     test_scale_control();
     printf("PASS A scale control\n");

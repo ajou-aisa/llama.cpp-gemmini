@@ -31,7 +31,7 @@ def normalize(name: str, value: str) -> str:
         return '1'
     if name in ('GGML_GEMMINI', 'GGML_GEMMINI_ENABLE_RMD', 'GGML_GEMMINI_DEQUANT_FP_TEST',
                 'GGML_GEMMINI_ENABLE_A4NKS_ATTENTION', 'GGML_GEMMINI_OFFLOAD_A4NKS_ATTENTION',
-                'POTAL_API_ONLY'):
+                'POTAL_API_ONLY', 'GGML_POTAL'):
         if value.upper() in ('ON', 'YES', 'TRUE', '1'):
             return 'ON'
         if value.upper() in ('OFF', 'NO', 'FALSE', '0'):

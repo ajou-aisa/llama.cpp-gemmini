@@ -161,26 +161,49 @@ if (LLAMA_USE_SYSTEM_GGML)
     add_library(ggml ALIAS ggml::ggml)
 endif()
 
-# Standalone PoTal RoCC API: configure only ggml/src/ggml-potal (no ggml/llama,
-# no Gemmini software tree). See ggml/src/ggml-potal/README.md.
+# PoTal (see ggml/src/ggml-potal/README.md):
+#   POTAL_API_ONLY=ON configures only the standalone RoCC API in
+#   ggml/src/ggml-potal (no ggml/llama, no Gemmini software tree);
+#   GGML_POTAL=ON adds the ggml-potal backend to the full ggml/llama build.
+# Both validate POTAL_HW_PARAMS with cmake/potal-hw-params.cmake.
 option(POTAL_API_ONLY "Configure only the standalone PoTal RoCC API and its tests" OFF)
 if (POTAL_API_ONLY)
     if (GGML_GEMMINI)
         message(FATAL_ERROR "POTAL_API_ONLY=ON requires GGML_GEMMINI=OFF")
     endif()
+    if (GGML_POTAL)
+        message(FATAL_ERROR "POTAL_API_ONLY=ON configures the API only; the GGML backend needs POTAL_API_ONLY=OFF with GGML_POTAL=ON")
+    endif()
     enable_testing()
     add_subdirectory(ggml/src/ggml-potal)
     return()
+elseif (GGML_POTAL)
+    if (GGML_GEMMINI)
+        message(FATAL_ERROR "GGML_POTAL=ON requires GGML_GEMMINI=OFF: both backends drive the same RoCC custom-3 accelerator")
+    endif()
 elseif (DEFINED POTAL_HW_PARAMS OR DEFINED POTAL_EXPECTED_DIM)
-    message(FATAL_ERROR "POTAL_HW_PARAMS/POTAL_EXPECTED_DIM are used only with POTAL_API_ONLY=ON")
+    message(FATAL_ERROR "POTAL_HW_PARAMS/POTAL_EXPECTED_DIM are used only with POTAL_API_ONLY=ON or GGML_POTAL=ON")
 endif()
 
 set(_GGML_GEMMINI_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 set(_GGML_GEMMINI_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}")
 set(_GGML_GEMMINI_TOP_BINARY_DIR "${CMAKE_BINARY_DIR}")
+# The option and config modules also feed shared targets (ggml-gemmini-utils,
+# ggml-cpu, llama) and keep their defaults in every build.
 include(cmake/ggml-gemmini-options.cmake)
-include(cmake/ggml-gemmini-geometry.cmake)
-include(cmake/ggml-gemmini-im2p.cmake)
+if (GGML_POTAL)
+    # The PoTal backend uses only POTAL_HW_PARAMS: no Gemmini software tree
+    # (GEMMINI_SW_PATH header search) and no IM2P.sim. The config module needs
+    # just the generated-config directory the geometry module would create.
+    if (CYCLE_SIM OR GGML_GEMMINI_EXECUTION_BACKEND STREQUAL "IM2P_SIM")
+        message(FATAL_ERROR "GGML_POTAL=ON does not support CYCLE_SIM=1 or GGML_GEMMINI_EXECUTION_BACKEND=IM2P_SIM")
+    endif()
+    set(GGML_GEMMINI_GENERATED_CONFIG_DIR "${_GGML_GEMMINI_BINARY_DIR}/generated")
+    file(MAKE_DIRECTORY "${GGML_GEMMINI_GENERATED_CONFIG_DIR}")
+else()
+    include(cmake/ggml-gemmini-geometry.cmake)
+    include(cmake/ggml-gemmini-im2p.cmake)
+endif()
 include(cmake/ggml-gemmini-config.cmake)
 
 # ---- ggml build ----

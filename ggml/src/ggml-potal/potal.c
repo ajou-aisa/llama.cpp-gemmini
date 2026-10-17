@@ -293,6 +293,14 @@ potal_status potal_fence(void) {
     return status;
 }
 
+potal_status potal_tlb_flush(void) {
+    if (gemm_in_flight) {
+        return POTAL_ERR_BUSY;
+    }
+    potal_rocc_flush(0, 0);
+    return POTAL_OK;
+}
+
 potal_status potal_gemm_ws_issue(const potal_gemm_ws *g) {
     potal_gemm_ws_program p;
     const potal_status status = potal_gemm_ws_encode(g, &p);
@@ -339,6 +347,10 @@ potal_status potal_scale_release(uint32_t slot, uint32_t generation, uint32_t co
 }
 
 potal_status potal_fence(void) {
+    return POTAL_ERR_NO_HARDWARE;
+}
+
+potal_status potal_tlb_flush(void) {
     return POTAL_ERR_NO_HARDWARE;
 }
 

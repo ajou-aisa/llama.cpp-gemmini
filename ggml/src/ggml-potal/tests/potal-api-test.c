@@ -262,6 +262,7 @@ static void test_host_has_no_hardware(void) {
     check_status("host release invalid", potal_scale_release(256, 0, 0), POTAL_ERR_INVALID_ARGUMENT);
     check_status("host release valid", potal_scale_release(0, 0, 0), POTAL_ERR_NO_HARDWARE);
     check_status("host fence", potal_fence(), POTAL_ERR_NO_HARDWARE);
+    check_status("host tlb flush", potal_tlb_flush(), POTAL_ERR_NO_HARDWARE);
     g.a = NULL;
     check_status("host issue invalid", potal_gemm_ws_issue(&g), POTAL_ERR_INVALID_ARGUMENT);
 #if POTAL_HW_DIM == 16

@@ -28,6 +28,7 @@
 
 /* funct7 values (GemminiISA.scala). */
 #define POTAL_FUNCT_CONFIG                    0
+#define POTAL_FUNCT_FLUSH                     7
 #define POTAL_FUNCT_LOOP_WS                   8
 #define POTAL_FUNCT_LOOP_WS_CONFIG_BOUNDS     9
 #define POTAL_FUNCT_LOOP_WS_CONFIG_ADDRS_AB   10
@@ -75,6 +76,15 @@ static inline uint64_t potal_rocc_fence(uint64_t rs1, uint64_t rs2) {
     uint64_t rd;
     POTAL_ROCC_R_R_R(POTAL_FUNCT_FENCE, rd, rs1, rs2);
     return rd;
+}
+
+/*
+ * FLUSH (Controller.scala): rs1[0] = 0 flush+retry, 1 flush+skip; xd = 0.
+ * Travels in order with GEMM commands and fires the accelerator TLB sfence
+ * when it reaches the unrolled command queue; no response.
+ */
+static inline void potal_rocc_flush(uint64_t rs1, uint64_t rs2) {
+    POTAL_ROCC_0_R_R(POTAL_FUNCT_FLUSH, rs1, rs2);
 }
 
 static inline void potal_rocc_config(uint64_t rs1, uint64_t rs2) {
