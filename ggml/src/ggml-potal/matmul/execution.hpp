@@ -6,7 +6,9 @@
 // and custom-3 traps on every other hart.
 
 #include "potal.h"
+#include "tiling.hpp"
 
+#include <cstddef>
 #include <cstdint>
 
 namespace ggml::potal {
@@ -36,6 +38,33 @@ struct gemm_report {
     double       fence_s = 0;
 };
 
+// One general GEMM through potal_tiled_matmul_auto() on DMA-ready operands:
+// C[m][n] = PoTal(A[m][k], B[k][n], carriers[k/block_k][n]) (see dense.hpp).
+// The buffers must stay untouched until the report returns; after a fatal
+// report they must never be freed (the hardware may still access them).
+struct tiled_job {
+    size_t           m, n, k;
+    const int8_t *   a;
+    size_t           lda;
+    const int8_t *   b;
+    size_t           ldb;
+    const uint32_t * carriers;
+    size_t           cstride;
+    uint32_t         block_k;
+    int32_t *        c;
+    size_t           ldc;
+};
+
+struct tiled_report {
+    bool            ok     = false;
+    bool            fatal  = false;
+    potal_status    status = POTAL_OK;
+    const char *    stage  = nullptr;
+    const char *    detail = nullptr; // issuer failure reason, if any
+    potal_tile_plan plan;
+    potal_ws_report work;             // this job only: counts and guest seconds
+};
+
 struct issuer_info {
     bool ready = false;
     int  cpu   = -1;
@@ -46,6 +75,10 @@ struct issuer_info {
 // the first call) and waits for it. Off RISC-V, validates the request the
 // issuer would send and reports POTAL_ERR_NO_HARDWARE; nothing succeeds.
 gemm_report run_gemm(const gemm_job & job);
+
+// Same issuer; off RISC-V the tiled path stops at its first hardware command
+// with POTAL_ERR_NO_HARDWARE.
+tiled_report run_tiled(const tiled_job & job);
 
 issuer_info get_issuer_info();
 

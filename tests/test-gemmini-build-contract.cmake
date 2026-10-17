@@ -413,7 +413,7 @@ function(make_matching_fake_im2p_root out_var)
         set(params_dir "${root}/params/${artifact_id}")
         file(MAKE_DIRECTORY "${params_dir}")
         file(READ
-            "${TEST_SOURCE_DIR}/../RISC-V-DynDNN-gemmini-include/gemmini_params.h"
+            "${TEST_GEMMINI_SW_PATH}/gemmini_params.h"
             params_content)
         string(REGEX REPLACE "#define DIM [0-9]+"
             "#define DIM ${dim}" params_content "${params_content}")
@@ -461,7 +461,7 @@ function(make_matching_fake_im2p_root out_var)
                 -I "${TEST_SOURCE_DIR}/ggml/include"
                 -I "${TEST_SOURCE_DIR}/ggml/src"
                 -I "${params_dir}"
-                -I "${TEST_SOURCE_DIR}/../RISC-V-DynDNN-gemmini-include/include"
+                -I "${TEST_GEMMINI_SW_PATH}/include"
                 -c "${frontend_source}" -o "${frontend_object}"
             RESULT_VARIABLE frontend_rc ERROR_VARIABLE frontend_stderr)
         if(NOT frontend_rc EQUAL 0)

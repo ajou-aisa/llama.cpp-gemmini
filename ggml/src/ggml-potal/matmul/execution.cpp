@@ -20,6 +20,7 @@
 #    include <chrono>
 #    include <condition_variable>
 #    include <cstdio>
+#    include <functional>
 #    include <mutex>
 #    include <string>
 #    include <system_error>
@@ -62,6 +63,46 @@ potal_gemm_ws make_request(uint32_t k, uint32_t generation) {
     g.passes_per_block = k / DIM; // one scale block: the x1 carriers cover all of K
     g.flags            = 0;
     return g;
+}
+
+// Work counters of a session between two snapshots; status/stage/fatal are the current ones.
+potal_ws_report work_since(const potal_ws_report & now, const potal_ws_report & before) {
+    potal_ws_report d = now;
+    d.invocations     = now.invocations - before.invocations;
+    d.validated_gemms = now.validated_gemms - before.validated_gemms;
+    d.fences          = now.fences - before.fences;
+    d.scale_writes    = now.scale_writes - before.scale_writes;
+    d.scale_releases  = now.scale_releases - before.scale_releases;
+    d.scale_s         = now.scale_s - before.scale_s;
+    d.issue_s         = now.issue_s - before.issue_s;
+    d.fence_s         = now.fence_s - before.fence_s;
+    return d;
+}
+
+// potal_tiled_matmul_auto() with the only request the PoTal path implements:
+// WS, int8 A/B, int32 C, no D, no activation, identity scale factors.
+tiled_report tiled_matmul(const tiled_job & job, potal_ws_session & session) {
+    tiled_report r;
+    const potal_ws_report before = session.report;
+    session.report.status        = POTAL_OK;
+    session.report.stage         = nullptr;
+    const potal_scale_operand scales = { job.carriers, job.cstride, job.block_k };
+    r.status = potal_tiled_matmul_auto(job.m, job.n, job.k,
+                                       job.a, job.b, nullptr, job.c,
+                                       job.lda, job.ldb, 0, job.ldc,
+                                       POTAL_MVIN_SCALE_IDENTITY, POTAL_MVIN_SCALE_IDENTITY, 0,
+                                       POTAL_NO_ACTIVATION, POTAL_ACC_SCALE_IDENTITY, 0,
+                                       /* repeating_bias */ false,
+                                       /* transpose_A */ false, /* transpose_B */ false,
+                                       /* full_C */ true, /* low_D */ false,
+                                       /* weightA */ 0,
+                                       POTAL_WS,
+                                       scales, session, &r.plan);
+    r.work  = work_since(session.report, before);
+    r.stage = session.report.stage;
+    r.fatal = session.report.fatal;
+    r.ok    = r.status == POTAL_OK;
+    return r;
 }
 
 #if defined(__riscv)
@@ -146,33 +187,43 @@ void release_columns(uint32_t slot, uint32_t generation, uint32_t columns) {
     }
 }
 
+// Work run on the issuer thread. Returns true when it left the accelerator in
+// an unknown state; `why` and `status` then describe it and the issuer
+// disables itself for the rest of the process.
+using issuer_task = std::function<bool(std::string & why, potal_status & status)>;
+
 class issuer {
   public:
     void start();
-    gemm_report run(const gemm_job & job);
-    issuer_info info();
+    // false: the issuer is disabled and the task did not run.
+    bool         run(const issuer_task & task);
+    issuer_info  info();
+    const char * failure_text(potal_status * status); // stable once the issuer is disabled
+
+    // Issuer thread only (called from tasks).
+    gemm_report  execute(const gemm_job & job);
+    tiled_report execute_tiled(const tiled_job & job);
 
   private:
-    void        main_loop();
-    bool        bring_up();
-    gemm_report execute(const gemm_job & job);
+    void main_loop();
+    bool bring_up();
 
     std::mutex              submit_mutex; // one request at a time
     std::mutex              mutex;        // guards the members below
     std::condition_variable cv;
 
     enum class state { starting, ready, failed };
-    state            st      = state::starting;
-    const gemm_job * pending = nullptr;
-    bool             done    = false;
-    gemm_report      result;
-    std::string      failure; // set once, when st becomes failed
-    potal_status     failure_status = POTAL_OK;
+    state               st      = state::starting;
+    const issuer_task * pending = nullptr;
+    bool                done    = false;
+    std::string         failure; // set once, when st becomes failed
+    potal_status        failure_status = POTAL_OK;
 
     // Owned by the issuer thread; published when st leaves `starting`.
-    int      cpu        = -1;
-    long     tid        = -1;
-    uint32_t generation = 0;
+    int cpu = -1;
+    long tid = -1;
+    // Scale generations and work counters of every PoTal command of the process.
+    potal_ws_session session = { &potal_hw_ops(), 0, {} };
 };
 
 void issuer::start() {
@@ -187,24 +238,25 @@ void issuer::start() {
     }
 }
 
-gemm_report issuer::run(const gemm_job & job) {
+bool issuer::run(const issuer_task & task) {
     std::lock_guard<std::mutex>  one_request(submit_mutex);
     std::unique_lock<std::mutex> lock(mutex);
     cv.wait(lock, [this] { return st != state::starting; });
     if (st == state::failed) {
-        gemm_report r;
-        r.fatal  = true;
-        r.status = failure_status;
-        r.stage  = "issuer_disabled";
-        r.detail = failure.c_str();
-        return r;
+        return false;
     }
-    pending = &job;
+    pending = &task;
     done    = false;
     cv.notify_all();
     cv.wait(lock, [this] { return done; });
     pending = nullptr;
-    return result;
+    return true;
+}
+
+const char * issuer::failure_text(potal_status * status) {
+    std::lock_guard<std::mutex> lock(mutex);
+    *status = failure_status;
+    return st == state::failed ? failure.c_str() : nullptr;
 }
 
 issuer_info issuer::info() {
@@ -226,22 +278,25 @@ void issuer::main_loop() {
     cv.notify_all();
     while (st == state::ready) {
         cv.wait(lock, [this] { return pending != nullptr && !done; });
-        const gemm_job * job = pending;
+        const issuer_task * task = pending;
         lock.unlock();
-        gemm_report r = execute(*job);
+        std::string  why;
+        potal_status status = POTAL_OK;
+        const bool   fatal  = (*task)(why, status);
         lock.lock();
-        if (r.fatal) {
-            failure = r.status == POTAL_OK ? std::string(r.stage) :
-                                             std::string(r.stage) + ": POTAL_" + potal_status_name(r.status);
-            failure_status = r.status;
+        if (fatal) {
+            failure        = why;
+            failure_status = status;
             st             = state::failed;
-            r.detail       = failure.c_str();
             GGML_LOG_ERROR("[POTAL_ISSUER] disabled for this process after %s\n", failure.c_str());
         }
-        result = r;
-        done   = true;
+        done = true;
         cv.notify_all();
     }
+}
+
+std::string failure_of(const char * stage, potal_status status) {
+    return status == POTAL_OK ? std::string(stage) : std::string(stage) + ": POTAL_" + potal_status_name(status);
 }
 
 // Affinity before the first RoCC command, then the per-process TLB flush.
@@ -281,8 +336,8 @@ bool issuer::bring_up() {
 // Identity-carrier GEMM: Scale WRITE -> LOOP_WS -> FENCE -> C readback -> Scale RELEASE.
 gemm_report issuer::execute(const gemm_job & job) {
     gemm_report r;
-    r.generation          = generation % POTAL_GENERATION_MAX + 1; // 1..255
-    generation            = r.generation;
+    r.generation          = session.generation % POTAL_GENERATION_MAX + 1; // 1..255
+    session.generation    = r.generation;
     const potal_gemm_ws g = make_request(job.k, r.generation);
 
     // Software checks first: nothing reaches the accelerator when they fail.
@@ -378,6 +433,17 @@ gemm_report issuer::execute(const gemm_job & job) {
     return r;
 }
 
+// Tiled GEMM on the issuer: every invocation is Scale WRITE -> LOOP_WS -> FENCE -> RELEASE.
+tiled_report issuer::execute_tiled(const tiled_job & job) {
+    if (sched_getcpu() != cpu) {
+        tiled_report r;
+        r.stage = "affinity"; // custom-3 would trap off hart 0
+        r.fatal = true;
+        return r;
+    }
+    return tiled_matmul(job, session);
+}
+
 std::mutex g_issuer_mutex;
 issuer *   g_issuer = nullptr; // created by the first request; leaked because its thread is detached
 
@@ -396,7 +462,26 @@ issuer & get_issuer() {
 
 gemm_report run_gemm(const gemm_job & job) {
 #if defined(__riscv)
-    return get_issuer().run(job);
+    issuer &    iss = get_issuer();
+    gemm_report r;
+    const bool  ran = iss.run([&](std::string & why, potal_status & status) {
+        r = iss.execute(job);
+        if (r.fatal) {
+            why    = failure_of(r.stage, r.status);
+            status = r.status;
+        }
+        return r.fatal;
+    });
+    if (!ran) {
+        r        = gemm_report{};
+        r.fatal  = true;
+        r.stage  = "issuer_disabled";
+        r.detail = iss.failure_text(&r.status);
+    } else if (r.fatal) {
+        potal_status ignored;
+        r.detail = iss.failure_text(&ignored);
+    }
+    return r;
 #else
     // No accelerator: the API validates the exact request the issuer would
     // send, then potal_gemm_ws_issue() reports POTAL_ERR_NO_HARDWARE.
@@ -405,6 +490,36 @@ gemm_report run_gemm(const gemm_job & job) {
     r.status              = potal_gemm_ws_issue(&g);
     r.stage               = "issue";
     return r;
+#endif
+}
+
+tiled_report run_tiled(const tiled_job & job) {
+#if defined(__riscv)
+    issuer &     iss = get_issuer();
+    tiled_report r;
+    const bool   ran = iss.run([&](std::string & why, potal_status & status) {
+        r = iss.execute_tiled(job);
+        if (r.fatal) {
+            why    = failure_of(r.stage, r.status);
+            status = r.status;
+        }
+        return r.fatal;
+    });
+    if (!ran) {
+        r        = tiled_report{};
+        r.fatal  = true;
+        r.stage  = "issuer_disabled";
+        r.detail = iss.failure_text(&r.status);
+    } else if (r.fatal) {
+        potal_status ignored;
+        r.detail = iss.failure_text(&ignored);
+    }
+    return r;
+#else
+    // No accelerator: validation runs, the first hardware command reports
+    // POTAL_ERR_NO_HARDWARE. A fresh session keeps host calls independent.
+    potal_ws_session session = { &potal_hw_ops(), 0, {} };
+    return tiled_matmul(job, session);
 #endif
 }
 

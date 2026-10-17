@@ -29,10 +29,7 @@ struct mul_mat_shape {
     int64_t k;
 };
 
-// supports_op contract for any op.
-ggml_potal_reject check_op(const ggml_tensor * op);
-
-// MUL_MAT contract. require_data additionally demands allocated src/dst data
+// I8 MUL_MAT contract (ops.hpp check_op dispatches here for non-HP1 weights). require_data additionally demands allocated src/dst data
 // (graph_compute). On success fills *shape when it is not null.
 ggml_potal_reject check_mul_mat(const ggml_tensor * op, bool require_data, mul_mat_shape * shape);
 

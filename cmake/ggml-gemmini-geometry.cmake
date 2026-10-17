@@ -1,6 +1,9 @@
-# Gemmini include path (needed for gemmini_params.h in ggml-gemmini-args.h)
+# Gemmini include path (needed for gemmini_params.h in ggml-gemmini-args.h).
+# There is no default location: the build is PoTal-centric (GGML_POTAL needs
+# no Gemmini headers) and the Gemmini SDK headers are not part of this tree.
+# Only GGML_GEMMINI=ON reads an explicitly given -DGEMMINI_SW_PATH.
 if (NOT DEFINED GEMMINI_SW_PATH OR GEMMINI_SW_PATH STREQUAL "")
-    get_filename_component(GEMMINI_SW_PATH "${_GGML_GEMMINI_SOURCE_DIR}/../RISC-V-DynDNN-gemmini-include" ABSOLUTE)
+    unset(GEMMINI_SW_PATH)
 elseif(GGML_GEMMINI AND NOT EXISTS "${GEMMINI_SW_PATH}/gemmini.h" AND
        NOT EXISTS "${GEMMINI_SW_PATH}/include/gemmini.h")
     message(FATAL_ERROR "Invalid explicit GEMMINI_SW_PATH='${GEMMINI_SW_PATH}': Gemmini include tree not found")
@@ -16,7 +19,8 @@ set(GGML_GEMMINI_GENERATED_CONFIG_DIR "${_GGML_GEMMINI_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${GGML_GEMMINI_GENERATED_CONFIG_DIR}")
 if(GGML_GEMMINI)
     if(NOT GEMMINI_SW_PATH)
-        message(FATAL_ERROR "GGML_GEMMINI requires the Gemmini include tree")
+        message(FATAL_ERROR "GGML_GEMMINI=ON requires an explicit -DGEMMINI_SW_PATH=<Gemmini include tree> "
+                            "(no default location); the PoTal build is -DGGML_GEMMINI=OFF -DGGML_POTAL=ON")
     endif()
     set(_GGML_GEMMINI_PARAMS_SOURCE "${GEMMINI_SW_PATH}/gemmini_params.h")
     if(NOT EXISTS "${_GGML_GEMMINI_PARAMS_SOURCE}")

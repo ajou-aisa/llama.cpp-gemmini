@@ -8,22 +8,6 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     endif()
 
     ggml_add_backend_library(${GGML_CPU_NAME})
-    # L12-L23: added by zerogod
-    if (NOT DEFINED GEMMINI_SW_PATH OR GEMMINI_SW_PATH STREQUAL "")
-        if (DEFINED ENV{GEM_HOME} AND NOT "$ENV{GEM_HOME}" STREQUAL "")
-            set(GEMMINI_SW_PATH $ENV{GEM_HOME})
-        else()
-            get_filename_component(LLAMA_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
-            set(GEMMINI_SW_PATH "${LLAMA_ROOT}/../RISC-V-DynDNN-gemmini-include")
-        endif()
-    endif()
-    if (NOT EXISTS "${GEMMINI_SW_PATH}/gemmini.h"
-        AND NOT EXISTS "${GEMMINI_SW_PATH}/include/gemmini.h"
-        AND NOT EXISTS "${GEMMINI_SW_PATH}/gemmini-rocc-tests/include/gemmini.h")
-        get_filename_component(LLAMA_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
-        set(GEMMINI_SW_PATH "${LLAMA_ROOT}/../RISC-V-DynDNN-gemmini-include")
-    endif()
-
     list (APPEND GGML_CPU_SOURCES
         ggml-cpu/ggml-cpu.c
         ggml-cpu/ggml-cpu.cpp
@@ -53,15 +37,10 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         )
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
-    # L55-L63: added by zerogod
+    # added by zerogod; no Gemmini SDK header path (ggml-cpu includes none)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu
         ${CMAKE_CURRENT_SOURCE_DIR}/ggml-gemmini-utils/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/ggml-gemmini
-        ${GEMMINI_SW_PATH}
-        ${GEMMINI_SW_PATH}/include
-        ${GEMMINI_SW_PATH}/gemmini-rocc-tests
-        ${GEMMINI_SW_PATH}/gemmini-rocc-tests/include
-        ${GEMMINI_SW_PATH}/rocc-software/src)
+        ${CMAKE_CURRENT_SOURCE_DIR}/ggml-gemmini)
     target_compile_definitions(${GGML_CPU_NAME} PRIVATE
         CYCLE_SIM=${CYCLE_SIM}
         LOG_CYCLE=${LOG_CYCLE}

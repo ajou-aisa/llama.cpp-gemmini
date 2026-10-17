@@ -22,22 +22,6 @@ bool in_host_memory(const ggml_tensor * t) {
 
 } // namespace
 
-ggml_potal_reject check_op(const ggml_tensor * op) {
-    switch (op->op) {
-        case GGML_OP_NONE:
-        case GGML_OP_RESHAPE:
-        case GGML_OP_VIEW:
-        case GGML_OP_PERMUTE:
-        case GGML_OP_TRANSPOSE:
-            // Metadata only: graph_compute leaves the data where it is.
-            return in_host_memory(op) ? GGML_POTAL_REJECT_NONE : GGML_POTAL_REJECT_MEMORY;
-        case GGML_OP_MUL_MAT:
-            return check_mul_mat(op, false, nullptr);
-        default:
-            return GGML_POTAL_REJECT_OP;
-    }
-}
-
 ggml_potal_reject check_mul_mat(const ggml_tensor * op, bool require_data, mul_mat_shape * shape) {
     const ggml_tensor * w = op->src[0];
     const ggml_tensor * x = op->src[1];

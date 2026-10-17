@@ -1,5 +1,6 @@
-// PoTal GGML backend: GGML_OP_MUL_MAT (I8 x I8 -> F32, M = N = 16, K = 16 or 32)
-// through the PoTal RoCC API (potal.h). See README.md and ggml-potal.h.
+// PoTal GGML backend: backend, device and registry. Op validation and dispatch
+// live in ops.cpp (GGML_OP_MUL_MAT through the PoTal RoCC API, potal.h).
+// See README.md and ggml-potal.h.
 
 #include "ggml-potal.h"
 
@@ -7,32 +8,21 @@
 #include "ggml-impl.h"
 #include "matmul/execution.hpp"
 #include "matmul/pack.hpp"
+#include "ops.hpp"
 #include "potal.h"
 
+#include <gemmini/log.hpp>
+
 #include <atomic>
-#include <chrono>
 #include <cstdio>
 
 namespace {
 
-using clock_type = std::chrono::steady_clock;
-
-struct potal_context {
-    ggml_backend_potal_stats stats = {};
-};
+using potal_context = ggml::potal::backend_state;
 
 // supports_op is a device call without a backend instance: device-wide counters.
 std::atomic<uint64_t> g_supports_accepted{ 0 };
 std::atomic<uint64_t> g_supports_rejected[GGML_POTAL_REJECT_COUNT];
-
-double seconds_since(clock_type::time_point t0) {
-    return std::chrono::duration<double>(clock_type::now() - t0).count();
-}
-
-bool is_view_op(ggml_op op) {
-    return op == GGML_OP_NONE || op == GGML_OP_RESHAPE || op == GGML_OP_VIEW || op == GGML_OP_PERMUTE ||
-           op == GGML_OP_TRANSPOSE;
-}
 
 const char * type_name_of(const ggml_tensor * t) {
     return t != nullptr ? ggml_type_name(t->type) : "-";
@@ -52,59 +42,22 @@ const char * potal_get_name(ggml_backend_t backend) {
 }
 
 void potal_free(ggml_backend_t backend) {
+    // End-of-run evidence for tools (llama-cli) that do not read the stats API.
+    const ggml_backend_potal_stats & st = static_cast<const potal_context *>(backend->context)->stats;
+    GGML_LOG_INFO("[POTAL] summary i8_completed=%llu i8_failed=%llu hp1_nodes=%llu hp1_completed=%llu "
+                  "hp1_failed=%llu invocations=%llu validated_api=%llu fences=%llu scale_writes=%llu "
+                  "scale_releases=%llu zero_carriers=%llu cpu_fallback_mul_mat_answers=%llu "
+                  "act_quant_s=%.3f weight_pack_s=%.3f scale_s=%.3f issue_s=%.3f fence_s=%.3f reconstruct_s=%.3f\n",
+                  (unsigned long long) st.gemm_completed, (unsigned long long) st.gemm_failed,
+                  (unsigned long long) st.hp1_nodes, (unsigned long long) st.hp1_completed,
+                  (unsigned long long) st.hp1_failed, (unsigned long long) st.tiled_invocations,
+                  (unsigned long long) st.tiled_validated, (unsigned long long) st.tiled_fences,
+                  (unsigned long long) st.scale_writes, (unsigned long long) st.scale_releases,
+                  (unsigned long long) st.zero_carriers,
+                  (unsigned long long) ggml::potal::supports_mul_mat_rejected(), st.act_quant_s, st.weight_pack_s,
+                  st.scale_s, st.issue_s, st.fence_s, st.reconstruct_s);
     delete static_cast<potal_context *>(backend->context);
     delete backend;
-}
-
-// One validated MUL_MAT node: pack -> PoTal issuer (hardware) -> INT32 -> F32.
-ggml_status potal_mul_mat(potal_context & ctx, ggml_tensor * node, const ggml::potal::mul_mat_shape & s) {
-    using namespace ggml::potal;
-    ggml_backend_potal_stats & st = ctx.stats;
-    st.mul_mat_nodes++;
-    GGML_LOG_INFO("[POTAL_BACKEND] node=%s op=MUL_MAT src0_type=%s src1_type=%s dst_type=%s M=%lld N=%lld K=%lld\n",
-                  node->name, type_name_of(node->src[0]), type_name_of(node->src[1]), type_name_of(node),
-                  (long long) s.m, (long long) s.n, (long long) s.k);
-
-    int8_t  a[TILE * K_MAX];
-    int8_t  b[K_MAX * TILE];
-    int32_t c[TILE * TILE];
-
-    auto t = clock_type::now();
-    pack_a(node->src[1], s, a);
-    pack_b(node->src[0], s, b);
-    const double pack_s = seconds_since(t);
-    st.pack_s += pack_s;
-    GGML_LOG_INFO("[POTAL_MATMUL] pack_A_bytes=%lld pack_B_bytes=%lld pack_us=%.1f\n", (long long) (s.m * s.k),
-                  (long long) (s.k * s.n), pack_s * 1e6);
-
-    st.hw_requests++;
-    const gemm_report r = run_gemm({ a, b, static_cast<uint32_t>(s.k), c });
-    st.gemm_issued += r.issued ? 1 : 0;
-    st.gemm_fenced += r.fenced ? 1 : 0;
-    st.last_status     = r.status;
-    st.last_scale_slot = r.scale_slot;
-    st.last_generation = r.generation;
-    st.stage_s += r.stage_s;
-    st.scale_s += r.scale_s;
-    st.issue_s += r.issue_s;
-    st.fence_s += r.fence_s;
-    if (!r.ok) {
-        st.gemm_failed++;
-        poison_dst(node);
-        GGML_LOG_ERROR("[POTAL_MATMUL] node=%s dispatch=FAILED stage=%s status=POTAL_%s%s%s; dst set to NaN\n",
-                       node->name, r.stage, potal_status_name(r.status), r.detail ? " detail=" : "",
-                       r.detail ? r.detail : "");
-        return GGML_STATUS_FAILED;
-    }
-
-    t = clock_type::now();
-    unpack_c(c, s, node);
-    const double unpack_s = seconds_since(t);
-    st.unpack_s += unpack_s;
-    st.gemm_completed++;
-    GGML_LOG_INFO("[POTAL_MATMUL] output_type=F32 unpack_us=%.1f\n", unpack_s * 1e6);
-    GGML_LOG_INFO("[POTAL_BACKEND] hw_gemm_count=%llu\n", (unsigned long long) st.gemm_completed);
-    return GGML_STATUS_SUCCESS;
 }
 
 ggml_status potal_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -113,13 +66,8 @@ ggml_status potal_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     // Refuse the whole graph before any hardware work if one node is outside
     // the contract (only a direct caller can get here; the scheduler asks supports_op).
     for (int i = 0; i < cgraph->n_nodes; ++i) {
-        ggml_tensor * node = cgraph->nodes[i];
-        if (is_view_op(node->op)) {
-            continue;
-        }
-        const ggml_potal_reject reason = node->op == GGML_OP_MUL_MAT ?
-                                             ggml::potal::check_mul_mat(node, true, nullptr) :
-                                             GGML_POTAL_REJECT_OP;
+        ggml_tensor *           node   = cgraph->nodes[i];
+        const ggml_potal_reject reason = ggml::potal::check_compute(node);
         if (reason != GGML_POTAL_REJECT_NONE) {
             ctx.stats.rejected_nodes++;
             ggml::potal::poison_dst(node);
@@ -134,9 +82,7 @@ ggml_status potal_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
         if (node->op != GGML_OP_MUL_MAT) {
             continue; // view ops: metadata only, the data is already in place
         }
-        ggml::potal::mul_mat_shape s = {};
-        ggml::potal::check_mul_mat(node, true, &s); // passed in the loop above
-        const ggml_status status = potal_mul_mat(ctx, node, s);
+        const ggml_status status = ggml::potal::compute_mul_mat(ctx, node, i); // passed the loop above
         if (status != GGML_STATUS_SUCCESS) {
             return status;
         }
@@ -172,8 +118,8 @@ const char * potal_device_get_description(ggml_backend_dev_t dev) {
     static char description[192];
     static const int written = std::snprintf(
         description, sizeof(description),
-        "PoTal A8W8 WS Sat32 DIM%u RoCC custom-3 on hart 0: MUL_MAT I8 x I8 -> F32 (INT32 ACC, x1 carriers), "
-        "M=N=16, K=16|32",
+        "PoTal A8W8 WS Sat32 DIM%u RoCC custom-3 on hart 0: MUL_MAT I8 x I8 -> F32 (x1 carriers, M=N=16, "
+        "K=16|32); F32 x Q8_HP1 -> F32 (TENSOR act quant, HP1 SCU carriers, tiled, no compensation)",
         (unsigned) potal_hw_dim());
     GGML_UNUSED(written);
     return description;
@@ -205,8 +151,10 @@ void potal_device_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * pro
 
 ggml_backend_t potal_device_init_backend(ggml_backend_dev_t dev, const char * params) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(params);
-    return ggml_backend_potal_init();
+    ggml_backend_t backend = ggml_backend_potal_init();
+    // llama passes the model architecture, as to the Gemmini backend (layer names).
+    static_cast<potal_context *>(backend->context)->model_arch = params ? params : "";
+    return backend;
 }
 
 // Tensors stay in ordinary host memory; the backend packs them into its own
@@ -225,6 +173,7 @@ bool potal_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
         g_supports_rejected[reason].fetch_add(1, std::memory_order_relaxed);
     }
     if (op->op == GGML_OP_MUL_MAT) {
+        ggml::potal::note_supports_mul_mat(op, reason);
         GGML_LOG_DEBUG("[POTAL_BACKEND] supports_op op=MUL_MAT name=%s result=%d reason=%s src0_type=%s "
                        "src1_type=%s ne0=%lld ne1=%lld K=%lld\n",
                        op->name, reason == GGML_POTAL_REJECT_NONE, ggml_potal_reject_name(reason),
@@ -291,6 +240,16 @@ const ggml_backend_reg_i potal_reg_i = {
 ggml_backend_t ggml_backend_potal_init(void) {
     GGML_LOG_INFO("[POTAL_BACKEND] device_init dim=%u precision=A8W8 params_sha256=%s\n", (unsigned) potal_hw_dim(),
                   potal_hw_params_sha256());
+    // Same default outputs as the Gemmini backend (GEMMINI_LOG_DIR), unless a tool set them.
+    static const bool outputs = [] {
+        const auto result = ggml::gemmini::log::setup_default_outputs();
+        if (!result.cycle || !result.debug) {
+            GGML_LOG_WARN("[POTAL_BACKEND] default log outputs: cycle=%d debug=%d\n", result.cycle ? 1 : 0,
+                          result.debug ? 1 : 0);
+        }
+        return true;
+    }();
+    GGML_UNUSED(outputs);
     return new ggml_backend{
         /* .guid      = */ potal_guid(),
         /* .interface = */ potal_backend_i,
@@ -345,5 +304,6 @@ bool ggml_backend_potal_get_stats(ggml_backend_t backend, ggml_backend_potal_sta
     stats->issuer_ready                   = issuer.ready;
     stats->issuer_cpu                     = issuer.cpu;
     stats->issuer_tid                     = issuer.tid;
+    stats->supports_mul_mat_rejected      = ggml::potal::supports_mul_mat_rejected();
     return true;
 }

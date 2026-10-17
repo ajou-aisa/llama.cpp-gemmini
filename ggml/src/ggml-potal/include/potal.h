@@ -77,7 +77,10 @@ int potal_carrier_is_valid(uint32_t carrier);
 potal_status potal_scale_key_encode(uint32_t slot, uint32_t generation,
                                     uint32_t column, uint64_t *rs1);
 
-/* Flags requesting LOOP_WS features; all are currently unsupported. */
+/*
+ * Flags requesting LOOP_WS features. potal_gemm_ws accepts none of them;
+ * potal_loop_ws accepts POTAL_GEMM_ACCUMULATE only.
+ */
 #define POTAL_GEMM_A_TRANSPOSE 0x1u
 #define POTAL_GEMM_B_TRANSPOSE 0x2u
 #define POTAL_GEMM_BIAS        0x4u /* D operand */
@@ -148,6 +151,56 @@ potal_status potal_gemm_ws_scale_slot(const potal_gemm_ws *gemm, uint32_t k_bloc
 /* potal_gemm_ws_check() followed by command encoding. */
 potal_status potal_gemm_ws_encode(const potal_gemm_ws *gemm, potal_gemm_ws_program *program);
 
+/*
+ * One general LOOP_WS invocation: the unit a tiler (sp_tiled_matmul_ws)
+ * issues. Same command sequence and encoder as potal_gemm_ws, plus the
+ * LoopMatmul fields potal_gemm_ws pins: tile counts, last-tile padding,
+ * accumulation into the ACC and an optional C store.
+ *
+ *   A: int8,  (i_tiles*DIM - pad_i) rows x (k_tiles*DIM - pad_k) cols, lda
+ *   B: int8,  (k_tiles*DIM - pad_k) rows x (j_tiles*DIM - pad_j) cols, ldb
+ *   C: int32, (i_tiles*DIM - pad_i) rows x (j_tiles*DIM - pad_j) cols, ldc,
+ *      or NULL: no C store and the ACC half is kept for the next K chunk
+ *
+ * flags == POTAL_GEMM_ACCUMULATE: K pass 0 adds into the ACC (ex_accumulate,
+ * not a first contribution); flags == 0: K pass 0 overwrites it. Each K pass
+ * p is scaled per output column by slot
+ * scale_base + (p / passes_per_block) * j_tiles + j_tile (LoopMatmul order);
+ * padded columns of the last J tile read no scale.
+ *
+ * NOT VALIDATED ON HARDWARE beyond the potal_gemm_ws scope: multiple I/J
+ * tiles, padding, accumulation across invocations and C == NULL are encoded
+ * from the RTL (LoopMatmul/PoTalWriteback) but have not passed a FireSim test.
+ * A/B tile origins must be DIM-byte aligned and C POTAL_HW_DIM*4-byte aligned.
+ */
+typedef struct potal_loop_ws {
+    const int8_t *a;
+    const int8_t *b;
+    int32_t      *c;
+    size_t        lda;
+    size_t        ldb;
+    size_t        ldc;
+    uint32_t      i_tiles;          /* DIM-row tiles of A and C */
+    uint32_t      j_tiles;          /* DIM-column tiles of B and C */
+    uint32_t      k_tiles;          /* DIM-wide K passes; multiple of passes_per_block */
+    uint32_t      pad_i;            /* rows missing from the last I tile, < DIM */
+    uint32_t      pad_j;            /* columns missing from the last J tile, < DIM */
+    uint32_t      pad_k;            /* K elements missing from the last pass, < DIM */
+    uint32_t      scale_base;
+    uint32_t      scale_generation;
+    uint32_t      passes_per_block;
+    uint32_t      flags;            /* 0 or POTAL_GEMM_ACCUMULATE */
+} potal_loop_ws;
+
+/*
+ * Validate one invocation: argument errors, then capacity (scale window,
+ * work IDs, per-loop SPAD/ACC half), then unsupported flags.
+ */
+potal_status potal_loop_ws_check(const potal_loop_ws *loop);
+
+/* potal_loop_ws_check() followed by command encoding. */
+potal_status potal_loop_ws_encode(const potal_loop_ws *loop, potal_gemm_ws_program *program);
+
 /* ---- Hardware operations (RISC-V only; host builds return NO_HARDWARE) -- */
 
 /* SCALE_WRITE. Returns the hardware status (POTAL_OK or POTAL_HW_*). */
@@ -187,6 +240,12 @@ potal_status potal_tlb_flush(void);
  * finished. Returns POTAL_ERR_BUSY if a previous GEMM was not fenced.
  */
 potal_status potal_gemm_ws_issue(const potal_gemm_ws *gemm);
+
+/*
+ * Issue one LOOP_WS invocation through the same issue path as
+ * potal_gemm_ws_issue(). POTAL_OK means issued; ERR_BUSY if not fenced.
+ */
+potal_status potal_loop_ws_issue(const potal_loop_ws *loop);
 
 #ifdef __cplusplus
 }

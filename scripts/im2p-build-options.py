@@ -21,7 +21,7 @@ SHELL_CONTROLS: Final = frozenset((
 def configurable(name: str) -> bool:
     return name not in SHELL_CONTROLS and (
         name.startswith(('GGML_', 'IM2P_', 'LOG_', 'CYCLE_', 'CMAKE_', 'LLAMA_', 'POTAL_'))
-        or name in ('BUILD_SHARED_LIBS', 'OpenMP_ROOT', 'GEMMINI_SW_PATH'))
+        or name in ('BUILD_SHARED_LIBS', 'OpenMP_ROOT'))
 
 
 def normalize(name: str, value: str) -> str:
@@ -85,6 +85,13 @@ def resolve(build_dir: str, platform: str, defaults: Mapping[str, str],
         origin['GGML_GEMMINI_ACT_QUANT_METRICS'] = 'enabled:GGML_GEMMINI_ACT_METRICS'
     if 'GGML_GEMMINI' not in effective:
         raise BuildConfigurationError('The build script must declare GGML_GEMMINI explicitly')
+    # A script's default PoTal parameter header belongs to a PoTal configure
+    # only; CMake rejects POTAL_HW_PARAMS/POTAL_EXPECTED_DIM otherwise.
+    if effective.get('GGML_POTAL') != 'ON' and effective.get('POTAL_API_ONLY') != 'ON':
+        for name in ('POTAL_HW_PARAMS', 'POTAL_EXPECTED_DIM'):
+            if origin.get(name) == 'script-default':
+                del effective[name]
+                origin[name] = 'dropped:PoTal disabled'
     if platform != 'build-riscv.sh' and effective.get('CMAKE_TOOLCHAIN_FILE'):
         raise BuildConfigurationError('Native build scripts do not provision cross toolchains; use direct CMake with explicit target artifacts')
     if effective.get('CYCLE_DETAIL') == '1' and effective.get('LOG_CYCLE') != '1':

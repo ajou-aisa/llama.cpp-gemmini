@@ -11,6 +11,7 @@
  */
 #include <inttypes.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "potal.h"
 #include "potal_hw_params.h"
@@ -253,6 +254,100 @@ static void test_gemm_invalid(void) {
 }
 #endif
 
+/* potal_loop_ws: the general LOOP_WS invocation of the tiling layer. */
+static potal_loop_ws two_by_three_loop(void) {
+    const uint32_t d = POTAL_HW_DIM;
+    potal_loop_ws l = {
+        .a = FAKE_A, .b = FAKE_B, .c = FAKE_C,
+        .lda = 4 * d, .ldb = 3 * d, .ldc = 3 * d,
+        .i_tiles = 2, .j_tiles = 3, .k_tiles = 4,
+        .pad_i = 0, .pad_j = 0, .pad_k = 0,
+        .scale_base = 10, .scale_generation = 7, .passes_per_block = 2,
+        .flags = 0,
+    };
+    return l;
+}
+
+static void test_loop_ws(void) {
+    const uint32_t d = POTAL_HW_DIM;
+    potal_gemm_ws_program p;
+    potal_loop_ws l = two_by_three_loop();
+
+    check_status("loop 2x3x4 ok", potal_loop_ws_encode(&l, &p), POTAL_OK);
+    check_u64("loop bounds rs1 (no pad)", p.bounds.rs1, 0);
+    check_u64("loop bounds rs2", p.bounds.rs2, (4ull << 32) | (3ull << 16) | 2ull);
+    check_u64("loop addrs_dc rs2", p.addrs_dc.rs2, 0x30000);
+    check_u64("loop loop_ws ex_accumulate 0", p.loop_ws.rs1 & 1, 0);
+    check_u64("loop loop_ws full_C", (p.loop_ws.rs1 >> 1) & 1, 1);
+    check_u64("loop loop_ws enable", (p.loop_ws.rs1 >> 20) & 1, 1);
+    check_u64("loop loop_ws base", (p.loop_ws.rs1 >> 21) & 0xFFFF, 10);
+    check_u64("loop loop_ws generation", (p.loop_ws.rs1 >> 37) & 0xFF, 7);
+    check_u64("loop loop_ws ppb", (p.loop_ws.rs1 >> 45) & 0xFFFF, 2);
+
+    /* Last-tile padding goes to BOUNDS rs1 [15:0]/[31:16]/[47:32]. */
+    l.pad_i = 3; l.pad_j = d - 1; l.pad_k = 5; l.ldb = 3 * d - (d - 1); l.ldc = l.ldb;
+    check_status("loop padded ok", potal_loop_ws_encode(&l, &p), POTAL_OK);
+    check_u64("loop bounds rs1 pads", p.bounds.rs1, (5ull << 32) | ((uint64_t)(d - 1) << 16) | 3ull);
+    l = two_by_three_loop(); l.pad_j = d;
+    check_status("loop pad_j == DIM", potal_loop_ws_check(&l), POTAL_ERR_INVALID_ARGUMENT);
+    l = two_by_three_loop(); l.pad_k = 1; l.lda = 4 * d - 2;
+    check_status("loop lda < padded K", potal_loop_ws_check(&l), POTAL_ERR_INVALID_ARGUMENT);
+
+    /* Intermediate K chunk: accumulate, no C store (C = 0 keeps the ACC half). */
+    l = two_by_three_loop(); l.c = NULL; l.ldc = 0; l.flags = POTAL_GEMM_ACCUMULATE;
+    check_status("loop C NULL accumulate ok", potal_loop_ws_encode(&l, &p), POTAL_OK);
+    check_u64("loop addrs_dc rs2 C NULL", p.addrs_dc.rs2, 0);
+    check_u64("loop loop_ws ex_accumulate 1", p.loop_ws.rs1 & 1, 1);
+
+    /* Tile origins: DIM-byte A/B, DIM*4-byte C; NULL A/B never allowed. */
+    l = two_by_three_loop(); l.a = (const int8_t *)(uintptr_t)(0x10000 + d);
+    check_status("loop A at a DIM offset ok", potal_loop_ws_check(&l), POTAL_OK);
+    l = two_by_three_loop(); l.a = (const int8_t *)(uintptr_t)(0x10000 + 1);
+    check_status("loop A misaligned", potal_loop_ws_check(&l), POTAL_ERR_INVALID_ARGUMENT);
+    l = two_by_three_loop(); l.b = NULL;
+    check_status("loop B NULL", potal_loop_ws_check(&l), POTAL_ERR_INVALID_ARGUMENT);
+    l = two_by_three_loop(); l.c = (int32_t *)(uintptr_t)(0x30000 + d);
+    check_status("loop C misaligned", potal_loop_ws_check(&l), POTAL_ERR_INVALID_ARGUMENT);
+    l = two_by_three_loop(); l.passes_per_block = 3;
+    check_status("loop K tiles not multiple of ppb", potal_loop_ws_check(&l), POTAL_ERR_INVALID_ARGUMENT);
+
+    /* Capacity: scale window (blocks * J), work IDs, ACC half. */
+    l = two_by_three_loop(); l.scale_base = 251; /* 2 blocks * 3 = 6 > 5 */
+    check_status("loop scale window", potal_loop_ws_check(&l), POTAL_ERR_CAPACITY);
+    l.scale_base = 250;
+    check_status("loop scale window edge", potal_loop_ws_check(&l), POTAL_OK);
+    l = two_by_three_loop();
+    l.i_tiles = (POTAL_HW_ACC_ROWS / 2) / d + 1; l.j_tiles = 1; l.ldb = d; l.ldc = d;
+    check_status("loop ACC half", potal_loop_ws_check(&l), POTAL_ERR_CAPACITY);
+
+    l = two_by_three_loop(); l.flags = POTAL_GEMM_BIAS;
+    check_status("loop bias unsupported", potal_loop_ws_check(&l), POTAL_ERR_UNSUPPORTED);
+    l = two_by_three_loop(); l.flags = POTAL_GEMM_A_TRANSPOSE;
+    check_status("loop transpose unsupported", potal_loop_ws_check(&l), POTAL_ERR_UNSUPPORTED);
+    check_status("loop null", potal_loop_ws_check(NULL), POTAL_ERR_INVALID_ARGUMENT);
+
+#if POTAL_HW_DIM == 16
+    /* The validated GEMM and its single-invocation loop encode identically. */
+    potal_gemm_ws_program pg;
+    potal_gemm_ws g = k32_gemm();
+    potal_loop_ws lg = {
+        .a = g.a, .b = g.b, .c = g.c, .lda = g.lda, .ldb = g.ldb, .ldc = g.ldc,
+        .i_tiles = 1, .j_tiles = 1, .k_tiles = 2,
+        .scale_base = g.scale_base, .scale_generation = g.scale_generation,
+        .passes_per_block = g.passes_per_block, .flags = 0,
+    };
+    check_status("gemm encode for comparison", potal_gemm_ws_encode(&g, &pg), POTAL_OK);
+    check_status("loop encode for comparison", potal_loop_ws_encode(&lg, &p), POTAL_OK);
+    check_u64("gemm == loop program bytes", memcmp(&pg, &p, sizeof(p)) == 0, 1);
+#endif
+#if !defined(__riscv)
+    l = two_by_three_loop();
+    check_status("host loop issue valid", potal_loop_ws_issue(&l), POTAL_ERR_NO_HARDWARE);
+    l.a = NULL;
+    check_status("host loop issue invalid", potal_loop_ws_issue(&l), POTAL_ERR_INVALID_ARGUMENT);
+#endif
+}
+
 #if !defined(__riscv)
 static void test_host_has_no_hardware(void) {
     potal_gemm_ws g = k32_gemm();
@@ -281,6 +376,7 @@ int main(void) {
     test_carrier();
     test_gemm_encode_d16();
     test_gemm_invalid();
+    test_loop_ws();
 #if !defined(__riscv)
     test_host_has_no_hardware();
 #endif

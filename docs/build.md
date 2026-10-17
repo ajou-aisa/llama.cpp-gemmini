@@ -34,9 +34,10 @@ controls; `-DBUILD_DIR=...` does not set the wrapper output directory. Set shell
 controls in the environment; ARM also uses `APPLE_SILICON_ARCH` and `LIBOMP_PREFIX`.
 The common host resolver uses the effective backend,
 geometry, simulator root, and build directory when selecting SDK artifacts.
-CMake consumes resolved `GEMMINI_SW_PATH` and simulator paths and validates the
-active backend's requirements. An explicit invalid SDK path fails when that
-backend is active; disabling Gemmini does not require its hardware include tree.
+CMake consumes the resolved simulator paths and validates the active backend's
+requirements. There is no default Gemmini header location: the PoTal build
+(`GGML_POTAL=ON`, `GGML_GEMMINI=OFF`) needs no Gemmini headers, and
+`GGML_GEMMINI=ON` requires an explicit `-DGEMMINI_SW_PATH=<include tree>`.
 
 `CYCLE_SIM=1` selects CPU-functional execution. It is not evidence of physical
 hardware support. The `GEMMINI_HP1` route rejects H1 weights when `CYCLE_SIM=0`;

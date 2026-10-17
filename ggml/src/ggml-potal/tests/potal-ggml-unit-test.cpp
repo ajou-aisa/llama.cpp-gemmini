@@ -21,6 +21,7 @@
 #include "ggml-cpp.h"
 #include "ggml-potal.h"
 #include "matmul/pack.hpp"
+#include "ops.hpp"
 #include "potal.h"
 
 #include <algorithm>

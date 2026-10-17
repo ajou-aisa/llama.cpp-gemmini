@@ -46,7 +46,7 @@ _Static_assert(sizeof(acc_t) == 4 && (acc_t)-1 < 0, "PoTal API requires signed 3
 #define LOOP_WS_PASSES_SHIFT         45 /* [60:45] */
 #define LOOP_WS_FIELD16_MAX          0xFFFFu
 
-/* LOOP_WS_CONFIG_BOUNDS: 16-bit I/J/K iterators at [15:0]/[31:16]/[47:32]. */
+/* LOOP_WS_CONFIG_BOUNDS: 16-bit I/J/K iterators (rs2) and pads (rs1) at [15:0]/[31:16]/[47:32]. */
 #define BOUNDS_J_SHIFT 16
 #define BOUNDS_K_SHIFT 32
 
@@ -220,6 +220,49 @@ static uint64_t config_ld_rs1(uint64_t state_id) {
            (state_id << CONFIG_LD_STATE_SHIFT) | CONFIG_LD;
 }
 
+/*
+ * The single CONFIG + LOOP_WS encoder of both request types. The caller has
+ * validated every field; potal_gemm_ws passes zero padding, no accumulation
+ * and a non-NULL C.
+ */
+static void encode_program(const potal_loop_ws *l, potal_gemm_ws_program *p) {
+    /* 1. Gemmini execution config: mvin strides in bytes, WS, INT32 mvout. */
+    p->config_ld_a = cmd(config_ld_rs1(0), l->lda * sizeof(int8_t));
+    p->config_ld_b = cmd(config_ld_rs1(1), l->ldb * sizeof(int8_t));
+    p->config_ex   = cmd(((uint64_t)1 << CONFIG_EX_A_STRIDE_SHIFT) | CONFIG_EX_WS | CONFIG_EX,
+                         (uint64_t)1 << CONFIG_EX_C_STRIDE_SHIFT);
+    p->config_st   = cmd(CONFIG_ST, l->ldc * sizeof(int32_t));
+
+    /* 2. LOOP_WS bounds and pads, addresses (no D; C 0 = no store), strides in elements. */
+    p->bounds     = cmd(((uint64_t)l->pad_k << BOUNDS_K_SHIFT) | ((uint64_t)l->pad_j << BOUNDS_J_SHIFT) | l->pad_i,
+                        ((uint64_t)l->k_tiles << BOUNDS_K_SHIFT) | ((uint64_t)l->j_tiles << BOUNDS_J_SHIFT) |
+                            l->i_tiles);
+    p->addrs_ab   = cmd((uint64_t)(uintptr_t)l->a, (uint64_t)(uintptr_t)l->b);
+    p->addrs_dc   = cmd(0, (uint64_t)(uintptr_t)l->c);
+    p->strides_ab = cmd(l->lda, l->ldb);
+    p->strides_dc = cmd(0, l->ldc);
+
+    /* 3. PoTal scale metadata on LOOP_WS; full_C, optional ex_accumulate, no act/transpose. */
+    p->loop_ws = cmd(((l->flags & POTAL_GEMM_ACCUMULATE) ? 1u : 0u) |
+                     ((uint64_t)1 << LOOP_WS_FULL_C_SHIFT) |
+                     ((uint64_t)1 << LOOP_WS_POTAL_ENABLE_SHIFT) |
+                     ((uint64_t)l->scale_base << LOOP_WS_SCALE_BASE_SHIFT) |
+                     ((uint64_t)l->scale_generation << LOOP_WS_GENERATION_SHIFT) |
+                     ((uint64_t)l->passes_per_block << LOOP_WS_PASSES_SHIFT),
+                     0);
+}
+
+/* A validated potal_gemm_ws as the equivalent single LOOP_WS invocation. */
+static potal_loop_ws gemm_as_loop(const potal_gemm_ws *g) {
+    potal_loop_ws l = {
+        g->a, g->b, g->c, g->lda, g->ldb, g->ldc,
+        g->m / POTAL_HW_DIM, g->n / POTAL_HW_DIM, g->k / POTAL_HW_DIM,
+        0, 0, 0,
+        g->scale_base, g->scale_generation, g->passes_per_block, 0,
+    };
+    return l;
+}
+
 potal_status potal_gemm_ws_encode(const potal_gemm_ws *g, potal_gemm_ws_program *p) {
     if (p == NULL) {
         return POTAL_ERR_INVALID_ARGUMENT;
@@ -228,31 +271,89 @@ potal_status potal_gemm_ws_encode(const potal_gemm_ws *g, potal_gemm_ws_program 
     if (status != POTAL_OK) {
         return status;
     }
-    const uint64_t i_tiles = g->m / POTAL_HW_DIM;
-    const uint64_t j_tiles = g->n / POTAL_HW_DIM;
-    const uint64_t k_tiles = g->k / POTAL_HW_DIM;
+    const potal_loop_ws l = gemm_as_loop(g);
+    encode_program(&l, p);
+    return POTAL_OK;
+}
 
-    /* 1. Gemmini execution config: mvin strides in bytes, WS, INT32 mvout. */
-    p->config_ld_a = cmd(config_ld_rs1(0), g->lda * sizeof(int8_t));
-    p->config_ld_b = cmd(config_ld_rs1(1), g->ldb * sizeof(int8_t));
-    p->config_ex   = cmd(((uint64_t)1 << CONFIG_EX_A_STRIDE_SHIFT) | CONFIG_EX_WS | CONFIG_EX,
-                         (uint64_t)1 << CONFIG_EX_C_STRIDE_SHIFT);
-    p->config_st   = cmd(CONFIG_ST, g->ldc * sizeof(int32_t));
+/* Tile-origin pointer: non-NULL, `align`-byte aligned, extent within the 32-bit DRAM offset. */
+static int tile_pointer_ok(const void *p, uint64_t extent, uint64_t align) {
+    const uintptr_t addr = (uintptr_t)p;
+    return p != NULL && addr % align == 0 &&
+           extent != 0 && extent <= DRAM_OFFSET_LIMIT &&
+           (uint64_t)addr <= UINT64_MAX - extent;
+}
 
-    /* 2. LOOP_WS bounds (no padding), addresses (no D), strides in elements. */
-    p->bounds     = cmd(0, (k_tiles << BOUNDS_K_SHIFT) | (j_tiles << BOUNDS_J_SHIFT) | i_tiles);
-    p->addrs_ab   = cmd((uint64_t)(uintptr_t)g->a, (uint64_t)(uintptr_t)g->b);
-    p->addrs_dc   = cmd(0, (uint64_t)(uintptr_t)g->c);
-    p->strides_ab = cmd(g->lda, g->ldb);
-    p->strides_dc = cmd(0, g->ldc);
+potal_status potal_loop_ws_check(const potal_loop_ws *l) {
+    if (l == NULL) {
+        return POTAL_ERR_INVALID_ARGUMENT;
+    }
+    const uint64_t dim = POTAL_HW_DIM;
+    if (l->i_tiles == 0 || l->j_tiles == 0 || l->k_tiles == 0 ||
+        l->i_tiles > LOOP_WS_FIELD16_MAX || l->j_tiles > LOOP_WS_FIELD16_MAX ||
+        l->k_tiles > LOOP_WS_FIELD16_MAX ||
+        /* LoopMatmul asserts every pad < block_size with PoTal enabled. */
+        l->pad_i >= dim || l->pad_j >= dim || l->pad_k >= dim ||
+        l->scale_generation > POTAL_GENERATION_MAX ||
+        l->passes_per_block == 0 || l->passes_per_block > LOOP_WS_FIELD16_MAX ||
+        /* The block counter restarts with every LOOP_WS: keep scale blocks whole. */
+        l->k_tiles % l->passes_per_block != 0) {
+        return POTAL_ERR_INVALID_ARGUMENT;
+    }
 
-    /* 3. PoTal scale metadata on LOOP_WS; full_C, no accumulate/act/transpose. */
-    p->loop_ws = cmd(((uint64_t)1 << LOOP_WS_FULL_C_SHIFT) |
-                     ((uint64_t)1 << LOOP_WS_POTAL_ENABLE_SHIFT) |
-                     ((uint64_t)g->scale_base << LOOP_WS_SCALE_BASE_SHIFT) |
-                     ((uint64_t)g->scale_generation << LOOP_WS_GENERATION_SHIFT) |
-                     ((uint64_t)g->passes_per_block << LOOP_WS_PASSES_SHIFT),
-                     0);
+    const uint64_t m = (uint64_t)l->i_tiles * dim - l->pad_i;
+    const uint64_t n = (uint64_t)l->j_tiles * dim - l->pad_j;
+    const uint64_t k = (uint64_t)l->k_tiles * dim - l->pad_k;
+    if (l->lda < k || l->ldb < n || (l->c != NULL && l->ldc < n) ||
+        /* CONFIG_ST carries the C row stride in bytes in rs2[31:0]. */
+        l->ldc > UINT32_MAX / sizeof(int32_t)) {
+        return POTAL_ERR_INVALID_ARGUMENT;
+    }
+    const uint64_t a_bytes = matrix_extent(m, k, l->lda, sizeof(int8_t));
+    const uint64_t b_bytes = matrix_extent(k, n, l->ldb, sizeof(int8_t));
+    if (!tile_pointer_ok(l->a, a_bytes, dim * sizeof(int8_t)) ||
+        !tile_pointer_ok(l->b, b_bytes, dim * sizeof(int8_t))) {
+        return POTAL_ERR_INVALID_ARGUMENT;
+    }
+    if (l->c != NULL) {
+        const uint64_t c_bytes = matrix_extent(m, n, l->ldc, sizeof(int32_t));
+        if (!tile_pointer_ok(l->c, c_bytes, dim * sizeof(int32_t)) ||
+            ranges_overlap((uintptr_t)l->c, c_bytes, (uintptr_t)l->a, a_bytes) ||
+            ranges_overlap((uintptr_t)l->c, c_bytes, (uintptr_t)l->b, b_bytes)) {
+            return POTAL_ERR_INVALID_ARGUMENT;
+        }
+    }
+
+    /* Same capacity rules as potal_gemm_ws_check(), on this invocation's tiles. */
+    const uint64_t scale_blocks = l->k_tiles / l->passes_per_block;
+    if (l->scale_base >= POTAL_SCALE_ENTRIES ||
+        scale_blocks * l->j_tiles > POTAL_SCALE_ENTRIES - l->scale_base) {
+        return POTAL_ERR_CAPACITY;
+    }
+    const uint64_t spad_rows = (uint64_t)POTAL_HW_BANK_NUM * POTAL_HW_BANK_ROWS / CONCURRENT_LOOPS;
+    const uint64_t acc_rows  = (uint64_t)POTAL_HW_ACC_ROWS / CONCURRENT_LOOPS;
+    const uint64_t i_tiles = l->i_tiles, j_tiles = l->j_tiles, k_tiles = l->k_tiles;
+    if (i_tiles * j_tiles > POTAL_WORK_IDS_PER_LOOP ||
+        (i_tiles * k_tiles + k_tiles * j_tiles) * dim > spad_rows ||
+        i_tiles * j_tiles * dim > acc_rows) {
+        return POTAL_ERR_CAPACITY;
+    }
+
+    if ((l->flags & ~POTAL_GEMM_ACCUMULATE) != 0) {
+        return POTAL_ERR_UNSUPPORTED;
+    }
+    return POTAL_OK;
+}
+
+potal_status potal_loop_ws_encode(const potal_loop_ws *l, potal_gemm_ws_program *p) {
+    if (p == NULL) {
+        return POTAL_ERR_INVALID_ARGUMENT;
+    }
+    const potal_status status = potal_loop_ws_check(l);
+    if (status != POTAL_OK) {
+        return status;
+    }
+    encode_program(l, p);
     return POTAL_OK;
 }
 
@@ -301,12 +402,9 @@ potal_status potal_tlb_flush(void) {
     return POTAL_OK;
 }
 
-potal_status potal_gemm_ws_issue(const potal_gemm_ws *g) {
-    potal_gemm_ws_program p;
-    const potal_status status = potal_gemm_ws_encode(g, &p);
-    if (status != POTAL_OK) {
-        return status;
-    }
+/* The single RoCC issue sequence of potal_gemm_ws_issue() and potal_loop_ws_issue(). */
+static potal_status issue_program(const potal_gemm_ws_program *program) {
+    const potal_gemm_ws_program p = *program;
     if (gemm_in_flight) {
         return POTAL_ERR_BUSY;
     }
@@ -324,6 +422,18 @@ potal_status potal_gemm_ws_issue(const potal_gemm_ws *g) {
     potal_rocc_loop_ws(p.loop_ws.rs1, p.loop_ws.rs2);
     gemm_in_flight = 1;
     return POTAL_OK;
+}
+
+potal_status potal_gemm_ws_issue(const potal_gemm_ws *g) {
+    potal_gemm_ws_program p;
+    const potal_status status = potal_gemm_ws_encode(g, &p);
+    return status != POTAL_OK ? status : issue_program(&p);
+}
+
+potal_status potal_loop_ws_issue(const potal_loop_ws *l) {
+    potal_gemm_ws_program p;
+    const potal_status status = potal_loop_ws_encode(l, &p);
+    return status != POTAL_OK ? status : issue_program(&p);
 }
 
 #else /* !__riscv: validate, then report that no accelerator exists. */
@@ -357,6 +467,12 @@ potal_status potal_tlb_flush(void) {
 potal_status potal_gemm_ws_issue(const potal_gemm_ws *g) {
     potal_gemm_ws_program p;
     const potal_status status = potal_gemm_ws_encode(g, &p);
+    return status != POTAL_OK ? status : POTAL_ERR_NO_HARDWARE;
+}
+
+potal_status potal_loop_ws_issue(const potal_loop_ws *l) {
+    potal_gemm_ws_program p;
+    const potal_status status = potal_loop_ws_encode(l, &p);
     return status != POTAL_OK ? status : POTAL_ERR_NO_HARDWARE;
 }
 

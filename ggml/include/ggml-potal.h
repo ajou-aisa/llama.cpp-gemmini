@@ -9,10 +9,15 @@ extern "C" {
 
 // PoTal RoCC backend (A8W8 WS Sat32, DIM16, accelerator attached to hart 0).
 //
-// Executes only GGML_OP_MUL_MAT with src0 (weights, ne = {K, N}) and src1
-// (activations, ne = {K, M}) of type GGML_TYPE_I8, 2-D, contiguous, in host
-// memory, M = N = 16 and K = 16 or 32. dst is F32 and receives the exact INT32
-// dot products: every PoTal scale carrier is x1, no scale is invented.
+// Executes GGML_OP_MUL_MAT with src0 (weights, ne = {K, N}) and src1
+// (activations, ne = {K, M}), 2-D and in host memory, in two forms:
+//   - src0 and src1 GGML_TYPE_I8, contiguous, M = N = 16, K = 16 or 32: one
+//     validated GEMM, every scale carrier x1; dst gets the exact INT32 sums.
+//   - src0 GGML_TYPE_Q8_HP1 and src1 GGML_TYPE_F32, both contiguous (no
+//     row gaps), any M, N and K % 32 == 0: per-tensor INT8 activation
+//     quantization, HP1 exponents as SCU carriers, Gemmini-compatible tiling
+//     (potal_tiled_matmul_auto), dst = C * activation_scale * channel_scale.
+//     No error compensation.
 // Metadata-only view ops are accepted; every other op is rejected by
 // supports_op, so ggml_backend_sched places it on another backend.
 // graph_compute never computes on the CPU: a request it cannot run in hardware
@@ -31,8 +36,8 @@ enum ggml_potal_reject {
     GGML_POTAL_REJECT_NONE = 0,  // supported
     GGML_POTAL_REJECT_OP,        // neither MUL_MAT nor a metadata-only view op
     GGML_POTAL_REJECT_OP_PARAMS, // MUL_MAT tagged beyond op_params[0] (e.g. an attention role)
-    GGML_POTAL_REJECT_TYPE,      // src0/src1 not I8, or dst not F32
-    GGML_POTAL_REJECT_SHAPE,     // not 2-D M = N = 16 with K = 16 or 32
+    GGML_POTAL_REJECT_TYPE,      // neither I8 x I8 nor Q8_HP1 weights x F32 activations, or dst not F32
+    GGML_POTAL_REJECT_SHAPE,     // not 2-D; I8: not M = N = 16 with K = 16 or 32
     GGML_POTAL_REJECT_LAYOUT,    // not contiguous (transposed, permuted, strided)
     GGML_POTAL_REJECT_MEMORY,    // not in host memory, or unallocated at compute time
     GGML_POTAL_REJECT_COUNT,
@@ -68,6 +73,25 @@ struct ggml_backend_potal_stats {
     bool     issuer_ready;    // pinned to the hart-0 CPU, TLB flushed and fenced
     int      issuer_cpu;      // Linux CPU whose /proc/cpuinfo hart is 0, -1 if not ready
     long     issuer_tid;      // -1 if not ready
+
+    // Q8_HP1 x F32 tiled path (hw_requests, scale_s, issue_s, fence_s and
+    // last_status above include it).
+    uint64_t hp1_nodes;          // HP1 MUL_MAT nodes accepted by graph_compute
+    uint64_t hp1_completed;      // dst reconstructed from fenced hardware C
+    uint64_t hp1_failed;         // dst set to NaN
+    uint64_t tiled_invocations;  // LOOP_WS invocations issued
+    uint64_t tiled_validated;    // of which through the validated potal_gemm_ws_issue()
+    uint64_t tiled_fences;       // POTAL_FENCE == POTAL_OK, one per invocation
+    uint64_t scale_writes;       // SCALE_WRITE == POTAL_OK
+    uint64_t scale_releases;     // SCALE_RELEASE == POTAL_OK
+    uint64_t zero_carriers;      // HP1 blocks with m = INT16_MIN
+    double   act_quant_s;        // per-tensor activation quantization
+    double   weight_pack_s;      // HP1 validation and B/carrier/scale unpacking
+    double   reconstruct_s;      // C -> F32
+
+    // Device-wide MUL_MAT supports_op rejections: each such node runs on
+    // another backend (CPU fallback). The scheduler asks repeatedly per node.
+    uint64_t supports_mul_mat_rejected;
 };
 
 GGML_BACKEND_API bool ggml_backend_potal_get_stats(ggml_backend_t backend, struct ggml_backend_potal_stats * stats);

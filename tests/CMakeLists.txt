@@ -649,15 +649,8 @@ endif()
 
 endif()
 
-set(TEST_GEMMINI_EXSIA_SW_PATH "")
-if (DEFINED GEMMINI_SW_PATH AND NOT GEMMINI_SW_PATH STREQUAL "")
-    set(TEST_GEMMINI_EXSIA_SW_PATH "${GEMMINI_SW_PATH}")
-elseif (DEFINED ENV{GEM_HOME} AND NOT "$ENV{GEM_HOME}" STREQUAL "")
-    set(TEST_GEMMINI_EXSIA_SW_PATH "$ENV{GEM_HOME}")
-else()
-    get_filename_component(_test_gemmini_llama_root "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
-    set(TEST_GEMMINI_EXSIA_SW_PATH "${_test_gemmini_llama_root}/../RISC-V-DynDNN-gemmini-include")
-endif()
+# GEMMINI_SW_PATH was given explicitly and validated (cmake/ggml-gemmini-geometry.cmake).
+set(TEST_GEMMINI_EXSIA_SW_PATH "${GEMMINI_SW_PATH}")
 if (NOT EXISTS "${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini.h"
     AND NOT EXISTS "${TEST_GEMMINI_EXSIA_SW_PATH}/include/gemmini.h"
     AND NOT EXISTS "${TEST_GEMMINI_EXSIA_SW_PATH}/gemmini-rocc-tests/include/gemmini.h")
@@ -1267,6 +1260,7 @@ if (EXISTS "${CMAKE_COMMAND}" AND EXISTS "${LLAMA_TEST_SOURCE_DIR}/CMakeLists.tx
             -DTEST_AR=${CMAKE_AR}
             -DTEST_REAL_IM2P_ROOT=${TEST_REAL_IM2P_ROOT}
             -DTEST_SOURCE_DIR=${LLAMA_TEST_SOURCE_DIR}
+            -DTEST_GEMMINI_SW_PATH=${GEMMINI_SW_PATH}
             -DTEST_BINARY_ROOT=${CMAKE_CURRENT_BINARY_DIR}/gemmini-build-contract
             -DTEST_GENERATOR=${CMAKE_GENERATOR}
             -DTEST_GENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM}

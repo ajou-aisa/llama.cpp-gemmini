@@ -59,9 +59,8 @@ if(NOT result EQUAL 0)
     message(FATAL_ERROR "Default Gemmini OFF wrapper must configure without an SDK: ${output}\n${error}")
 endif()
 file(READ "${off_build}/CMakeCache.txt" off_cache)
-if(NOT off_cache MATCHES "GGML_GEMMINI:[^=]+=OFF" OR
-   NOT off_cache MATCHES "GEMMINI_SW_PATH:[^=]+=.*sdk-absent/llama/../RISC-V-DynDNN-gemmini-include")
-    message(FATAL_ERROR "OFF wrapper must retain its declared missing header path and backend selection")
+if(NOT off_cache MATCHES "GGML_GEMMINI:[^=]+=OFF" OR off_cache MATCHES "GEMMINI_SW_PATH:")
+    message(FATAL_ERROR "OFF wrapper must keep its backend selection and pass no Gemmini header path")
 endif()
 if(EXISTS "${run_root}/sdk-absent/RISC-V-DynDNN-gemmini-include" OR
    EXISTS "${run_root}/sdk-absent/IM2P.sim" OR EXISTS "${run_root}/provision.log" OR
